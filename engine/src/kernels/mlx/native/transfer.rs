@@ -312,6 +312,70 @@ impl Context {
         Ok(())
     }
 
+    /// Submits the graph of several resident outputs without waiting for the GPU (packet
+    /// NATIVE-OPS-1): one `mlx_vector_array`, one `mlx_async_eval`, no synchronization. A later
+    /// `evaluate`, `readback`, or any other synchronization completes it.
+    ///
+    /// An async submission is NOT a completed synchronization, so it never flushes the retire
+    /// list: retired arrays free after the next completed synchronization as before. The
+    /// evaluation synchronization counter counts only `mlx_synchronize` calls, and this method
+    /// makes none, so it adds no count and no timing entry; the graph encoding that runs on the
+    /// calling thread inside `mlx_async_eval` is part of this call's own wall time and no timing
+    /// slot records it. The retire-cap flush keeps its own synchronization, so a cap exceeded
+    /// while only async evaluations ran still completes that synchronization before it frees. A
+    /// failure follows the `evaluate` rules: `Backend` with label `evaluate`, and the adapter
+    /// becomes terminal.
+    pub(in crate::kernels::mlx) fn evaluate_async(
+        &mut self,
+        outputs: &[&ExecutionTensor],
+    ) -> Result<(), EngError> {
+        let _dispatch = DispatchGuard::enter();
+        self.check_ready()?;
+        let state = self.state.as_ref().unwrap();
+        if outputs.is_empty() {
+            return Err(EngError::BadRequest(
+                "evaluate needs at least one output".into(),
+            ));
+        }
+        if outputs
+            .iter()
+            .any(|output| output.owner_key() != state.owner)
+        {
+            return Err(EngError::BadRequest(
+                "execution tensor belongs to another native owner".into(),
+            ));
+        }
+        clear_message();
+        let vector = unsafe { ffi::mlx_vector_array_new() };
+        if vector.ctx.is_null() {
+            mark_failed();
+            return Err(failure("evaluate"));
+        }
+        let mut result = Ok(());
+        for output in outputs {
+            if result.is_ok() {
+                result = check(
+                    unsafe {
+                        ffi::mlx_vector_array_append_value(vector, output.storage.native_array())
+                    },
+                    "evaluate",
+                );
+            }
+        }
+        if result.is_ok() {
+            result = check(unsafe { ffi::mlx_async_eval(vector) }, "evaluate");
+        }
+        if let Err(error) = result {
+            mark_failed();
+            return Err(error);
+        }
+        if unsafe { ffi::mlx_vector_array_free(vector) } != 0 {
+            mark_failed();
+            return Err(failure("evaluate"));
+        }
+        Ok(())
+    }
+
     /// Imports several host tensors with one synchronization (decision 0039).
     pub(in crate::kernels::mlx) fn import_many(
         &mut self,

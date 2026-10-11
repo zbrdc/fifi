@@ -86,6 +86,11 @@ unsafe extern "C" {
     pub(super) fn mlx_set_cache_limit(previous: *mut usize, limit: usize) -> i32;
     #[link_name = "inference_mlx_eval"]
     pub(super) fn mlx_eval(outputs: mlx_vector_array) -> i32;
+    /// Submits the graph of `outputs` without waiting (packet NATIVE-OPS-1). The submission takes
+    /// part in no selection of the qualification hooks — it fills no output array — so it consumes
+    /// no operation-fault slot; only the un-counted submission fault of the shim applies.
+    #[link_name = "inference_mlx_async_eval"]
+    pub(super) fn mlx_async_eval(outputs: mlx_vector_array) -> i32;
     #[link_name = "inference_mlx_quantized_matmul"]
     pub(super) fn mlx_quantized_matmul(
         result: *mut mlx_array,
@@ -344,6 +349,19 @@ unsafe extern "C" {
         rank: usize,
         stream: mlx_stream,
     ) -> i32;
+    /// `mlx_slice_update` for a target that the caller consumed (packet NATIVE-OPS-1): the node
+    /// keeps the target array alive, so the adapter releases its own handle right after the call.
+    #[link_name = "inference_mlx_kv_append"]
+    pub(super) fn mlx_kv_append(
+        result: *mut mlx_array,
+        target: mlx_array,
+        update: mlx_array,
+        start: *const i32,
+        stop: *const i32,
+        strides: *const i32,
+        rank: usize,
+        stream: mlx_stream,
+    ) -> i32;
     #[link_name = "inference_mlx_concatenate_axis"]
     pub(super) fn mlx_concatenate_axis(
         result: *mut mlx_array,
@@ -435,6 +453,20 @@ unsafe extern "C" {
         queries: mlx_array,
         keys: mlx_array,
         values: mlx_array,
+        scale: f32,
+        causal: bool,
+        stream: mlx_stream,
+    ) -> i32;
+    /// Grouped attention over the first `len` positions of capacity buffers (packet NATIVE-OPS-1):
+    /// the shim builds the two `mlx_slice` prefix views with no `mlx_contiguous` and runs the fused
+    /// attention on them.
+    #[link_name = "inference_mlx_grouped_attention_prefix"]
+    pub(super) fn mlx_grouped_attention_prefix(
+        result: *mut mlx_array,
+        queries: mlx_array,
+        keys: mlx_array,
+        values: mlx_array,
+        len: i32,
         scale: f32,
         causal: bool,
         stream: mlx_stream,

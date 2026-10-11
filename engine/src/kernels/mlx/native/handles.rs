@@ -359,6 +359,15 @@ impl Resident {
         self.array.as_ref().unwrap().0
     }
 
+    /// Takes the native handle out of this resident without freeing or retiring it (packet
+    /// NATIVE-OPS-1, `kv_append`). The caller owns the taken handle and releases it once, right
+    /// after the consuming graph node is built: the node holds the array alive until the GPU
+    /// completes, so the retire list never needs it. A later drop of this resident retires
+    /// nothing.
+    pub(super) fn take_array(&mut self) -> Option<Array> {
+        self.array.take()
+    }
+
     pub(crate) fn dtype(&self) -> Dtype {
         self.dtype
     }

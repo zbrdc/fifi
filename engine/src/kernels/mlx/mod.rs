@@ -413,6 +413,28 @@ impl MlxKernels {
         timing::timed(timing::Kind::Evaluate, || self.context.evaluate(outputs))
     }
 
+    /// Submits the graph of several resident outputs without waiting for the GPU (packet
+    /// NATIVE-OPS-1). A later `evaluate`, `readback`, or any other synchronization completes it;
+    /// a read of a pending output blocks until then.
+    ///
+    /// An async submission is not a completed synchronization: it never flushes the retire list
+    /// (retired arrays free after the next completed synchronization, as before) and it adds no
+    /// evaluation synchronization count or timing entry, because the counter and the timing
+    /// slots count only synchronizing calls and this method synchronizes nothing. The graph
+    /// encoding that `mlx_async_eval` performs on the calling thread is part of this call's own
+    /// wall time and no timing slot records it, so per-kind timings undercount the real cost of
+    /// a token whose graphs are submitted here. The 64 MB retire-cap flush keeps its own
+    /// synchronization, so a cap exceeded while only async evaluations ran still completes that
+    /// synchronization before it frees. CPU-side inputs (host staging buffers, page arenas)
+    /// may still be read by the GPU after this call returns, so a caller must not recycle or
+    /// mutate them before the next completed synchronization. The checks and the failure rules
+    /// are those of `evaluate`: an empty slice or a foreign owner is `BadRequest` before any
+    /// native call, and a native failure is `Backend` with label `evaluate` and makes the adapter
+    /// terminal.
+    pub fn evaluate_async(&mut self, outputs: &[&ExecutionTensor]) -> Result<(), EngError> {
+        self.context.evaluate_async(outputs)
+    }
+
     pub fn import_packed(
         &mut self,
         weight: &PackedWeight,
@@ -712,6 +734,34 @@ impl MlxKernels {
         self.context.slice_update(target, update, start)
     }
 
+    /// `slice_update` that consumes `target` (packet NATIVE-OPS-1): the update is written at
+    /// `start` and the result keeps the dtype and shape of `target`. The adapter releases its own
+    /// native handle of `target` right after the lazy node is built, so the node holds the only
+    /// owner of the target's buffer when the graph runs and MLX donates the buffer, writing the
+    /// rows in place instead of copying the whole capacity. Pass the only handle of `target`: a
+    /// caller that keeps a `share()` loses the in-place donation but stays correct.
+    ///
+    /// That release is the one exception to decision 0039 item 1 ("no resident releases without
+    /// GPU completion", a user decision of 2026-10-08), approved by the user on 2026-10-11: a
+    /// consuming `kv_append` hands the KV buffer to the lazy graph node, the resident's own
+    /// reference moves into the graph, and MLX frees the buffer only after the GPU is done with
+    /// the graph. Every other drop keeps the retire list.
+    ///
+    /// The target and the update are F32 residents of this adapter, or BF16 after `allow_bf16`,
+    /// and share one dtype. A validation failure returns `BadRequest` before the first native
+    /// call and frees the consumed handle once through the retire list; the adapter stays usable.
+    /// A native failure follows the resident rule and makes the adapter terminal; a failed
+    /// release of the taken handle is terminal (decision 0022) and returns `Backend` with label
+    /// `kv append`.
+    pub fn kv_append(
+        &mut self,
+        target: ExecutionTensor,
+        update: &ExecutionTensor,
+        start: &[u32],
+    ) -> Result<ExecutionTensor, EngError> {
+        self.context.kv_append(target, update, start)
+    }
+
     /// Joins `parts` along `axis` in order. Returns an unevaluated F32 resident.
     pub fn concatenate(
         &mut self,
@@ -841,6 +891,26 @@ impl MlxKernels {
     ) -> Result<ExecutionTensor, EngError> {
         self.context
             .grouped_attention(queries, keys, values, scale, causal)
+    }
+
+    /// Runs scaled dot-product attention over the first `len` positions of capacity buffers
+    /// (packet NATIVE-OPS-1). `queries` is `[B, QH, Tq, D]`; `keys` and `values` are capacity
+    /// buffers `[B, KVH, CAP, D]` with `QH` a multiple of `KVH` and `1 <= len <= CAP`. The prefix
+    /// is an MLX `slice` view with no `mlx_contiguous`, so the capacity buffer is read in place
+    /// and the prefix is never copied. With `causal` and `Tq > 1` the mask mode string is the one
+    /// of `grouped_attention`, so the causal mask aligns to the last key of the prefix. The
+    /// output is the query shape, F32, or BF16 after `allow_bf16` as `grouped_attention` returns.
+    pub fn grouped_attention_prefix(
+        &mut self,
+        queries: &ExecutionTensor,
+        keys: &ExecutionTensor,
+        values: &ExecutionTensor,
+        len: u32,
+        scale: f32,
+        causal: bool,
+    ) -> Result<ExecutionTensor, EngError> {
+        self.context
+            .grouped_attention_prefix(queries, keys, values, len, scale, causal)
     }
 
     /// Runs the gated delta rule of mlx-lm 0.31.0 as one Metal kernel over `T` tokens

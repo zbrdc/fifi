@@ -7,11 +7,13 @@
 //! temporary array drops while the owner is still healthy, and `Array::drop` retains it instead.
 //! Validation failures return `BadRequest` before the first native call and change nothing.
 
+use std::rc::Rc;
+
 use super::super::{QuantArgs, ResidentPackedWeight, bad_request, matrix_shape, quant_args};
 use super::{
     Context, State, ffi,
-    guard::{DispatchGuard, check, clear_message, failure, mark_failed},
-    handles::{Array, native_byte_len, native_dtype},
+    guard::{DispatchGuard, check, clear_message, failure, has_failed, mark_failed},
+    handles::{Array, Resident, native_byte_len, native_dtype},
 };
 use crate::{
     EngError,
@@ -437,6 +439,141 @@ impl Context {
             )
         })?;
         Ok(promoting_elementwise_result(state, output, layout))
+    }
+
+    /// `grouped_attention_prefix` (packet NATIVE-OPS-1): attention over the first `len` positions
+    /// of capacity buffers. The shim builds the two `mlx_slice` views with no `mlx_contiguous`
+    /// and runs the fused attention on them, so the prefix is never copied. The causal mask mode
+    /// string is the one of `grouped_attention`, so the mask aligns to the last key of the prefix.
+    pub(in crate::kernels::mlx) fn grouped_attention_prefix(
+        &mut self,
+        queries: &ExecutionTensor,
+        keys: &ExecutionTensor,
+        values: &ExecutionTensor,
+        len: u32,
+        scale: f32,
+        causal: bool,
+    ) -> Result<ExecutionTensor, EngError> {
+        let label = "grouped attention prefix";
+        let _dispatch = DispatchGuard::enter();
+        self.check_ready()?;
+        let state = self.state.as_mut().unwrap();
+        check_owner(label, state, queries)?;
+        check_owner(label, state, keys)?;
+        check_owner(label, state, values)?;
+        shape::float_operands(
+            label,
+            state.allow_bf16,
+            &[queries.dtype(), keys.dtype(), values.dtype()],
+        )?;
+        check_positive(label, "scale", scale)?;
+        let layout =
+            shape::attention_prefix(label, queries.shape(), keys.shape(), values.shape(), len)?;
+        let native_len = native_ints(label, &[len])?[0];
+        let _inputs = [queries.share(), keys.share(), values.share()];
+        clear_message();
+        let stream = state.stream.0;
+        let expected = ExpectedOutput {
+            operation: label,
+            stream,
+            shape: &layout.shape,
+            byte_len: layout.byte_len,
+            dtype: Dtype::F32,
+            promotes: true,
+        };
+        let output = dispatch_contiguous(&expected, |slot| unsafe {
+            ffi::mlx_grouped_attention_prefix(
+                slot,
+                queries.storage.native_array(),
+                keys.storage.native_array(),
+                values.storage.native_array(),
+                native_len,
+                scale,
+                causal,
+                stream,
+            )
+        })?;
+        Ok(promoting_elementwise_result(state, output, layout))
+    }
+
+    /// `kv_append` (packet NATIVE-OPS-1): `slice_update` that consumes `target`. The lazy node
+    /// must hold the only owner of the target's buffer when the graph runs, so MLX donates the
+    /// buffer and writes the rows in place. The adapter releases its own native handle of the
+    /// target right after the node is built, outside the retire list: a retired entry would keep
+    /// a second owner of the buffer until the next synchronization, and MLX would copy the whole
+    /// capacity instead. The node holds the array until the GPU completes, so the release is as
+    /// safe as a retire-list entry. A caller that keeps a `share()` of `target` loses the donation
+    /// but stays correct. The result keeps the dtype and shape of `target`. A failed release of
+    /// the taken handle is terminal (decision 0022) and this call reports it as `Backend` with
+    /// label `kv append`, as `evaluate` reports a failed vector release.
+    pub(in crate::kernels::mlx) fn kv_append(
+        &mut self,
+        mut target: ExecutionTensor,
+        update: &ExecutionTensor,
+        start: &[u32],
+    ) -> Result<ExecutionTensor, EngError> {
+        let label = "kv append";
+        let _dispatch = DispatchGuard::enter();
+        self.check_ready()?;
+        let state = self.state.as_mut().unwrap();
+        check_owner(label, state, &target)?;
+        check_owner(label, state, update)?;
+        shape::float_operands(label, state.allow_bf16, &[target.dtype(), update.dtype()])?;
+        if target.dtype() != update.dtype() {
+            return Err(EngError::BadRequest(format!(
+                "{label}: target and update dtypes differ"
+            )));
+        }
+        let dtype = target.dtype();
+        let (layout, stop) = shape::slice_update(label, target.shape(), update.shape(), start)?;
+        // The layout counts 4-byte elements, which is exact for F32 and halves for BF16.
+        let byte_len = layout.byte_len / Dtype::F32.byte_width() * dtype.byte_width();
+        let native_start = native_ints(label, start)?;
+        let native_stop = native_ints(label, &stop)?;
+        let strides = vec![1_i32; start.len()];
+        // The consuming rule: the adapter keeps no `share()` of `target` and retires nothing of
+        // it. Only `update` holds the usual input share for the duration of the call.
+        let _input = update.share();
+        clear_message();
+        let stream = state.stream.0;
+        let expected = ExpectedOutput {
+            operation: label,
+            stream,
+            shape: &layout.shape,
+            byte_len,
+            dtype,
+            promotes: false,
+        };
+        let mut output = Array::null();
+        let built = produce(&mut output, label, |slot| unsafe {
+            ffi::mlx_kv_append(
+                slot,
+                target.storage.native_array(),
+                update.storage.native_array(),
+                native_start.as_ptr(),
+                native_stop.as_ptr(),
+                strides.as_ptr(),
+                strides.len(),
+                stream,
+            )
+        });
+        // The failure path keeps the resident rule: `complete` marks the owner failed before any
+        // temporary drops, so the consumed target retains its array (decision 0022) and the
+        // adapter is terminal.
+        expected.complete(&output, built)?;
+        // The node is built and holds its own reference to the target array. Release the
+        // adapter's own handle once, now: the wrapper drop runs `mlx_array_free`, the refcount
+        // stays above zero through the graph node, and MLX can donate the buffer at evaluation.
+        // With a caller-held `share()` the take finds no exclusive resident, the handle retires
+        // with the last share as usual, and only the donation is lost.
+        drop(Rc::get_mut(&mut target.storage).and_then(Resident::take_array));
+        // A failed release marks the owner terminal inside the drop (decision 0022). Report it
+        // here, as the neighbors report a failed temporary release, instead of returning `Ok`
+        // from an adapter that rejects all further work.
+        if has_failed() {
+            return Err(failure(label));
+        }
+        Ok(state.resident(output, dtype, layout.shape, byte_len))
     }
 
     pub(in crate::kernels::mlx) fn concatenate(

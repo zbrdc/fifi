@@ -8,9 +8,9 @@
 //! | `ffi.rs` | Foreign declarations and the empty array handle. |
 //! | `guard.rs` | Dispatch lock, terminal-failure flag, error capture, and the adapter lease. |
 //! | `handles.rs` | Owning wrappers for devices, streams, and arrays, and the resident storage. |
-//! | `transfer.rs` | Import of host tensors and readback of resident tensors. |
+//! | `transfer.rs` | Import of host tensors, readback of resident tensors, and the blocking and asynchronous evaluation of resident graphs. |
 //! | `host.rs` | Completed-host operations that return host bytes. |
-//! | `resident_ops.rs` | Resident `qmm`, `mm`, elementwise operations, `rms_norm`, `rope`, and the gated delta kernel (decision 0050). |
+//! | `resident_ops.rs` | Resident `qmm`, `mm`, the elementwise methods, `rms_norm`, `rope`, the gated delta kernel (decision 0050), the consuming `kv_append`, and the prefix attention (packet NATIVE-OPS-1). |
 //! | `attention.rs` | The resident dense-attention caller. |
 //! | `pages.rs` | Caller-owned host pages and their in-place import (decision 0041). |
 //!

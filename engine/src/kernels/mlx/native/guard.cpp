@@ -265,6 +265,37 @@ extern "C" int inference_mlx_eval(mlx_vector_array outputs) noexcept {
   return mlx_eval(outputs);
 }
 
+// One-shot submission fault (packet NATIVE-OPS-1 fix1): `INFERENCE_MLX_FAIL_ASYNC_EVAL=1` fails
+// the next `mlx_async_eval` without calling it. Uncounted, like a release fault, because the
+// submission takes part in no selection (see `inference_mlx_async_eval` below).
+#ifdef INFERENCE_NATIVE_FAULT_QUALIFICATION
+static bool fail_async_eval_once() noexcept {
+  static std::atomic_bool failed_once{false};
+  const char* fault = std::getenv("INFERENCE_MLX_FAIL_ASYNC_EVAL");
+  return fault != nullptr && fault[0] == '1' && fault[1] == '\0' &&
+         !failed_once.exchange(true, std::memory_order_relaxed);
+}
+#endif
+
+// Asynchronous evaluation (packet NATIVE-OPS-1): `mlx_async_eval` submits the graph of the
+// outputs and returns without waiting. The submission cannot run through the selection of
+// `run_selected_operation`: it fills no output array, so the null fault has no output to report
+// and the mismatch fault has no result to reshape, and the selection counts resident operation
+// calls, which an evaluation is not (the blocking `inference_mlx_eval` takes part in no selection
+// either). The submission therefore consumes no selection slot, and a counted fault aimed at the
+// selected operation after an `evaluate_async` call reaches that operation unconsumed
+// (native-failure test `evaluate_async_consumes_no_operation_fault_slot`). Only the un-counted
+// submission fault above applies to it. A submitted graph holds its arrays, so the caller may
+// release its handles; a later evaluation, readback, or synchronization completes the work.
+extern "C" int inference_mlx_async_eval(const mlx_vector_array outputs) noexcept {
+#ifdef INFERENCE_NATIVE_FAULT_QUALIFICATION
+  if (fail_async_eval_once()) {
+    return 1;
+  }
+#endif
+  return mlx_async_eval(outputs);
+}
+
 extern "C" int inference_mlx_quantized_matmul(
     mlx_array* result, mlx_array activation, mlx_array weight, mlx_array scales,
     mlx_array biases, bool transpose, mlx_optional_int group_size,
@@ -593,7 +624,7 @@ extern "C" int inference_mlx_rope_scaled(
   });
 }
 
-// Grouped-query scaled dot-product attention with no mask array and no sinks.
+// Grouped-query attention with no mask array and no sinks.
 extern "C" int inference_mlx_grouped_attention(
     mlx_array* result, mlx_array queries, mlx_array keys, mlx_array values, float scale,
     bool causal, mlx_stream stream) noexcept {
@@ -601,6 +632,42 @@ extern "C" int inference_mlx_grouped_attention(
     return mlx_fast_scaled_dot_product_attention(
         result, queries, keys, values, scale, causal ? "causal" : "",
         mlx_array{nullptr}, mlx_array{nullptr}, false, stream);
+  });
+}
+
+// Grouped-query attention over the first `len` positions of capacity buffers (packet
+// NATIVE-OPS-1). The key and value prefixes are `mlx_slice` views and are NOT made contiguous:
+// the fused attention reads the capacity buffer through the view, so no copy of the prefix is
+// built. The mask mode string follows `inference_mlx_grouped_attention`, so "causal" aligns the
+// mask to the last key of the prefix. The slice views are freed on every path; the lazy graph
+// holds what it needs.
+extern "C" int inference_mlx_grouped_attention_prefix(
+    mlx_array* result, mlx_array queries, mlx_array keys, mlx_array values, int len, float scale,
+    bool causal, mlx_stream stream) noexcept {
+  return run_selected_operation(result, stream, [&] {
+    const int* key_shape = mlx_array_shape(keys);
+    const int* value_shape = mlx_array_shape(values);
+    if (key_shape == nullptr || value_shape == nullptr) return 1;
+    const int start[4] = {0, 0, 0, 0};
+    const int key_stop[4] = {key_shape[0], key_shape[1], len, key_shape[3]};
+    const int value_stop[4] = {value_shape[0], value_shape[1], len, value_shape[3]};
+    const int strides[4] = {1, 1, 1, 1};
+    mlx_array key_prefix{nullptr};
+    mlx_array value_prefix{nullptr};
+    int status =
+        mlx_slice(&key_prefix, keys, start, 4, key_stop, 4, strides, 4, stream);
+    if (status == 0) {
+      status = mlx_slice(&value_prefix, values, start, 4, value_stop, 4, strides, 4, stream);
+    }
+    if (status == 0) {
+      status = mlx_fast_scaled_dot_product_attention(
+          result, queries, key_prefix, value_prefix, scale, causal ? "causal" : "",
+          mlx_array{nullptr}, mlx_array{nullptr}, false, stream);
+    }
+    const int free_keys = mlx_array_free(key_prefix);
+    const int free_values = mlx_array_free(value_prefix);
+    if (status != 0) return status;
+    return free_keys != 0 ? free_keys : free_values;
   });
 }
 
@@ -671,6 +738,19 @@ extern "C" int inference_mlx_slice(
 }
 
 extern "C" int inference_mlx_slice_update(
+    mlx_array* result, mlx_array target, mlx_array update, const int* start,
+    const int* stop, const int* strides, size_t rank, mlx_stream stream) noexcept {
+  return run_selected_operation(result, stream, [&] {
+    return mlx_slice_update(result, target, update, start, rank, stop, rank,
+                            strides, rank, stream);
+  });
+}
+
+// `mlx_slice_update` for a target that the caller consumed (packet NATIVE-OPS-1). The call is the
+// same native operation; the caller releases its own handle of the target right after this
+// returns, so the lazy node is the only owner of the target buffer at evaluation time and MLX
+// donates the buffer and writes the rows in place instead of copying the capacity.
+extern "C" int inference_mlx_kv_append(
     mlx_array* result, mlx_array target, mlx_array update, const int* start,
     const int* stop, const int* strides, size_t rank, mlx_stream stream) noexcept {
   return run_selected_operation(result, stream, [&] {

@@ -8,6 +8,7 @@ use crate::{
     kernels::elementwise::{
         AxisRule, ElementwiseLayout, bad_request, broadcast_shape, check_shape, output_bytes,
     },
+    tensor::Dtype,
 };
 
 /// Reduction over `axis`. `keep_dims` keeps the axis with size 1; otherwise the axis is removed.
@@ -366,6 +367,47 @@ pub(crate) fn attention(
     layout(operation, queries.to_vec())
 }
 
+/// Prefix attention (packet NATIVE-OPS-1): attention of `queries` `[B, Hq, Tq, D]` over the first
+/// `len` positions of the capacity buffers `keys` and `values` `[B, Hkv, CAP, D]`. The head
+/// grouping and the other checks are those of `attention`; `len` must be at least one and at most
+/// the capacity. The output is the query shape.
+pub(crate) fn attention_prefix(
+    operation: &'static str,
+    queries: &[u32],
+    keys: &[u32],
+    values: &[u32],
+    len: u32,
+) -> Result<ElementwiseLayout, EngError> {
+    let layout = attention(operation, queries, keys, values)?;
+    // `attention` has rejected every keys shape that is not rank four, so axis two exists; the
+    // fallback keeps the len check meaningful instead of an unreachable branch.
+    let capacity = keys.get(2).copied().unwrap_or(0);
+    if len == 0 || len > capacity {
+        return Err(bad_request(
+            operation,
+            "len must be at least one and at most the capacity",
+        ));
+    }
+    Ok(layout)
+}
+
+/// The dtype rule shared by `kv_append` and `grouped_attention_prefix` (packet NATIVE-OPS-1):
+/// every operand is F32, or BF16 after `allow_bf16` opens the resident float operations to BF16.
+/// The rejection text matches `check_operand` of the native adapter.
+pub(crate) fn float_operands(
+    operation: &'static str,
+    allow_bf16: bool,
+    dtypes: &[Dtype],
+) -> Result<(), EngError> {
+    for &dtype in dtypes {
+        let accepted = dtype == Dtype::F32 || (allow_bf16 && dtype == Dtype::Bf16);
+        if !accepted {
+            return Err(bad_request(operation, "input dtype must be F32"));
+        }
+    }
+    Ok(())
+}
+
 fn axis_index(operation: &'static str, axis: u32, rank: usize) -> Result<usize, EngError> {
     usize::try_from(axis)
         .ok()
@@ -384,10 +426,11 @@ fn layout(operation: &'static str, shape: Vec<u32>) -> Result<ElementwiseLayout,
 #[cfg(test)]
 mod tests {
     use super::{
-        attention, concatenate, dequantize, expand_dims, gather_qmm, last_axis, matmul, reduce,
-        repeat, reshape, rope, slice, slice_update, sort, take, take_along_axis, transpose,
+        attention, attention_prefix, concatenate, dequantize, expand_dims, float_operands,
+        gather_qmm, last_axis, matmul, reduce, repeat, reshape, rope, slice, slice_update, sort,
+        take, take_along_axis, transpose,
     };
-    use crate::EngError;
+    use crate::{EngError, tensor::Dtype};
     fn rejects(result: Result<super::ElementwiseLayout, EngError>, text: &str) {
         match result {
             Err(EngError::BadRequest(message)) => {
@@ -398,6 +441,16 @@ mod tests {
                 "expected BadRequest containing {text:?}, got shape {:?}",
                 layout.shape
             ),
+        }
+    }
+
+    fn rejects_unit(result: Result<(), EngError>, text: &str) {
+        match result {
+            Err(EngError::BadRequest(message)) => {
+                assert!(message.contains(text), "message: {message}")
+            }
+            Err(other) => panic!("expected BadRequest containing {text:?}, got {other:?}"),
+            Ok(()) => panic!("expected BadRequest containing {text:?}, got Ok"),
         }
     }
 
@@ -824,6 +877,105 @@ mod tests {
                 &[1, 2, 5, 4],
             ),
             "queries must have rank four",
+        );
+    }
+
+    #[test]
+    fn attention_prefix_layout_bounds_len_by_the_capacity() {
+        // Queries [1, 16, 1, 64] over capacity buffers [1, 2, 8, 64]: the output is the query
+        // shape, 16 heads times 64 values of 4 bytes.
+        let layout = attention_prefix(
+            "grouped attention prefix",
+            &[1, 16, 1, 64],
+            &[1, 2, 8, 64],
+            &[1, 2, 8, 64],
+            5,
+        )
+        .unwrap();
+        assert_eq!(layout.shape, [1, 16, 1, 64]);
+        assert_eq!(layout.byte_len, 4096);
+
+        // The full capacity is allowed.
+        assert!(
+            attention_prefix(
+                "grouped attention prefix",
+                &[1, 16, 1, 64],
+                &[1, 2, 8, 64],
+                &[1, 2, 8, 64],
+                8,
+            )
+            .is_ok()
+        );
+
+        rejects(
+            attention_prefix(
+                "grouped attention prefix",
+                &[1, 16, 1, 64],
+                &[1, 2, 8, 64],
+                &[1, 2, 8, 64],
+                0,
+            ),
+            "len must be at least one",
+        );
+        rejects(
+            attention_prefix(
+                "grouped attention prefix",
+                &[1, 16, 1, 64],
+                &[1, 2, 8, 64],
+                &[1, 2, 8, 64],
+                9,
+            ),
+            "len must be at least one",
+        );
+        // A value head count that 16 query heads cannot share.
+        rejects(
+            attention_prefix(
+                "grouped attention prefix",
+                &[1, 16, 1, 64],
+                &[1, 5, 8, 64],
+                &[1, 5, 8, 64],
+                5,
+            ),
+            "query heads must be a multiple of key heads",
+        );
+        // The rank check of the shared attention rule.
+        rejects(
+            attention_prefix(
+                "grouped attention prefix",
+                &[1, 16, 1, 64],
+                &[1, 2, 8],
+                &[1, 2, 8],
+                5,
+            ),
+            "keys must have rank four",
+        );
+    }
+
+    #[test]
+    fn prefix_float_operands_follow_the_bf16_switch() {
+        // F32 passes with the switch off, and BF16 passes only after `allow_bf16`.
+        assert!(float_operands("kv append", false, &[Dtype::F32, Dtype::F32]).is_ok());
+        assert!(float_operands("grouped attention prefix", false, &[Dtype::F32; 3]).is_ok());
+        assert!(float_operands("kv append", true, &[Dtype::F32, Dtype::Bf16]).is_ok());
+        assert!(float_operands("grouped attention prefix", true, &[Dtype::Bf16; 3]).is_ok());
+        // An empty operand list holds no dtype to reject.
+        assert!(float_operands("kv append", false, &[]).is_ok());
+
+        rejects_unit(
+            float_operands("kv append", false, &[Dtype::F32, Dtype::Bf16]),
+            "input dtype must be F32",
+        );
+        rejects_unit(
+            float_operands(
+                "grouped attention prefix",
+                false,
+                &[Dtype::U32, Dtype::F32, Dtype::F32],
+            ),
+            "input dtype must be F32",
+        );
+        rejects_unit(
+            float_operands("kv append", true, &[Dtype::F16, Dtype::F16]),
+            "input dtype must be F32",
         );
     }
 }
