@@ -1,0 +1,335 @@
+--- a/src/ggml-cuda/common.cuh
++++ b/src/ggml-cuda/common.cuh
+@@ -6,8 +6,6 @@
+ 
+ #include <cstdint>
+ #include <cstdlib>
+-#include <memory>
+-#include <mutex>
+ 
+ #if defined(GGML_USE_HIP)
+ #define GGML_COMMON_DECL_HIP
+@@ -28,17 +26,10 @@
+ #include <cfloat>
+ #include <cstdio>
+ #include <string>
+-#include <unordered_map>
+ #include <utility>
+ #include <vector>
+ 
+-#if defined(GGML_USE_HIP)
+-#include "vendors/hip.h"
+-#elif defined(GGML_USE_MUSA)
+-#include "vendors/musa.h"
+-#else
+ #include "vendors/cuda.h"
+-#endif // defined(GGML_USE_HIP)
+ 
+ #define STRINGIZE_IMPL(...) #__VA_ARGS__
+ #define STRINGIZE(...) STRINGIZE_IMPL(__VA_ARGS__)
+@@ -186,19 +177,6 @@
+ 
+ #define MATRIX_ROW_PADDING 512 // last row of quant. matrices is a multiple of this to avoid out-of-bounds memory accesses
+ 
+-[[noreturn]]
+-void ggml_cuda_error(const char * stmt, const char * func, const char * file, int line, const char * msg);
+-
+-#define CUDA_CHECK_GEN(err, success, error_fn)                                      \
+-     do {                                                                           \
+-        auto err_ = (err);                                                          \
+-        if (err_ != (success)) {                                                    \
+-            ggml_cuda_error(#err, __func__, __FILE__, __LINE__, error_fn(err_));    \
+-        }                                                                           \
+-    } while (0)
+-
+-#define CUDA_CHECK(err) CUDA_CHECK_GEN(err, cudaSuccess, cudaGetErrorString)
+-
+ // V-2: the MMQ entry points return their errors. FIFI_TRY returns a failed CUDA status to the caller;
+ // FIFI_REQUIRE returns cudaErrorInvalidValue when an argument precondition does not hold. Both are only
+ // for functions that return cudaError_t.
+@@ -218,42 +196,6 @@
+     } while (0)
+ 
+ 
+-#if CUDART_VERSION >= 12000 || defined(GGML_USE_MUSA)
+-    static const char * cublas_get_error_str(const cublasStatus_t err) {
+-        return cublasGetStatusString(err);
+-    }
+-#else
+-    static const char * cublas_get_error_str(const cublasStatus_t err) {
+-        switch (err) {
+-            case CUBLAS_STATUS_SUCCESS: return "CUBLAS_STATUS_SUCCESS";
+-            case CUBLAS_STATUS_NOT_INITIALIZED: return "CUBLAS_STATUS_NOT_INITIALIZED";
+-            case CUBLAS_STATUS_ALLOC_FAILED: return "CUBLAS_STATUS_ALLOC_FAILED";
+-            case CUBLAS_STATUS_INVALID_VALUE: return "CUBLAS_STATUS_INVALID_VALUE";
+-            case CUBLAS_STATUS_ARCH_MISMATCH: return "CUBLAS_STATUS_ARCH_MISMATCH";
+-            case CUBLAS_STATUS_MAPPING_ERROR: return "CUBLAS_STATUS_MAPPING_ERROR";
+-            case CUBLAS_STATUS_EXECUTION_FAILED: return "CUBLAS_STATUS_EXECUTION_FAILED";
+-            case CUBLAS_STATUS_INTERNAL_ERROR: return "CUBLAS_STATUS_INTERNAL_ERROR";
+-            case CUBLAS_STATUS_NOT_SUPPORTED: return "CUBLAS_STATUS_NOT_SUPPORTED";
+-            default: return "unknown error";
+-        }
+-    }
+-#endif // CUDART_VERSION >= 12000
+-
+-#define CUBLAS_CHECK(err) CUDA_CHECK_GEN(err, CUBLAS_STATUS_SUCCESS, cublas_get_error_str)
+-
+-#ifdef GGML_USE_NCCL
+-#define NCCL_CHECK(err) CUDA_CHECK_GEN(err, ncclSuccess, ncclGetErrorString)
+-#endif // GGML_USE_NCCL
+-
+-#if !defined(GGML_USE_HIP) && !defined(GGML_CUDA_NO_VMM)
+-static const char * cu_get_error_str(CUresult err) {
+-    const char * err_str;
+-    cuGetErrorString(err, &err_str);
+-    return err_str;
+-}
+-#define CU_CHECK(err) CUDA_CHECK_GEN(err, CUDA_SUCCESS, cu_get_error_str)
+-#endif
+-
+ // V-3b: shared_memory_limit_raised is process-global. It is written only by the thread that owns the device context
+ // (decision 0047 thread confinement), so it takes no lock; the attribute it guards is idempotent, so a repeated set is harmless.
+ #if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
+@@ -337,13 +279,13 @@
+         (GGML_CUDA_CC_IS_MTHREADS(cc) && fp16_available(cc));
+ }
+ 
+-// To be used for feature selection of external libraries, e.g. cuBLAS.
++// To be used for feature selection of external libraries.
+ static bool fast_fp16_hardware_available(const int cc) {
+     return (GGML_CUDA_CC_IS_NVIDIA(cc) && cc >= GGML_CUDA_CC_PASCAL && cc != 610) || GGML_CUDA_CC_IS_AMD(cc) ||
+         (GGML_CUDA_CC_IS_MTHREADS(cc) && cc >= GGML_CUDA_CC_QY2);
+ }
+ 
+-// To be used for feature selection of external libraries, e.g. cuBLAS.
++// To be used for feature selection of external libraries.
+ static bool fp16_mma_hardware_available(const int cc) {
+     return (GGML_CUDA_CC_IS_NVIDIA(cc) && cc >= GGML_CUDA_CC_VOLTA) ||
+         GGML_CUDA_CC_IS_CDNA(cc) || GGML_CUDA_CC_IS_RDNA3(cc) || GGML_CUDA_CC_IS_RDNA4(cc) ||
+@@ -1208,9 +1150,6 @@
+     return cudaSuccess;
+ }
+ 
+-// V-3b: still declared because the PDL text below uses it; V-3c switches that text off and V-4 deletes both.
+-int ggml_cuda_get_device();
+-
+ struct ggml_cuda_kernel_launch_params {
+     dim3 block_nums;
+     dim3 block_dims;
+@@ -1226,87 +1165,6 @@
+         : block_nums(block_nums_), block_dims(block_dims_), shmem((size_t)shmem_), stream(stream_) {}
+ };
+ 
+-#if defined(GGML_CUDA_USE_PDL)
+-struct ggml_cuda_pdl_config {
+-    cudaLaunchAttribute attr;
+-    cudaLaunchConfig_t  cfg;
+-
+-    ggml_cuda_pdl_config(const ggml_cuda_kernel_launch_params & params) {
+-        attr.id = cudaLaunchAttributeProgrammaticStreamSerialization;
+-        attr.val.programmaticStreamSerializationAllowed = 1;
+-
+-        cfg = {};
+-        cfg.gridDim          = params.block_nums;
+-        cfg.blockDim         = params.block_dims;
+-        cfg.dynamicSmemBytes = params.shmem;
+-        cfg.stream           = params.stream;
+-        cfg.attrs            = &attr;
+-        cfg.numAttrs         = 1;
+-    }
+-
+-    // Delete due to &attr
+-    ggml_cuda_pdl_config(const ggml_cuda_pdl_config&) = delete;
+-    ggml_cuda_pdl_config& operator=(const ggml_cuda_pdl_config&) = delete;
+-    ggml_cuda_pdl_config& operator=(ggml_cuda_pdl_config&&) = delete;
+-
+-};
+-
+-static bool ggml_cuda_kernel_can_use_pdl(const void * kernel) {
+-    const int device = ggml_cuda_get_device();
+-
+-    struct cache_key {
+-        int          device;
+-        const void * kernel;
+-
+-        bool operator==(const cache_key & other) const { return device == other.device && kernel == other.kernel; }
+-    };
+-
+-    struct cache_key_hash {
+-        // MurmurHash3 mixing function for better hash distribution (vs. just std::hash which in some implementations simply returns the identity)
+-        static size_t hash_mix(size_t x) {
+-            std::uint64_t       y = x;
+-            const std::uint64_t m = 0xe9846af9b1a615d;
+-
+-            y ^= y >> 32;
+-            y *= m;
+-            y ^= y >> 32;
+-            y *= m;
+-            y ^= y >> 28;
+-
+-            return static_cast<size_t>(y);
+-        }
+-
+-        size_t operator()(const cache_key & key) const {
+-            // Use a nonzero seed to avoid mapping all-zero keys to zero
+-            size_t h = 42;
+-            h        = hash_mix(h + key.device);
+-            h        = hash_mix(h + reinterpret_cast<size_t>(key.kernel));
+-            return h;
+-        }
+-    };
+-
+-    static std::mutex                                          cache_mutex;
+-    static std::unordered_map<cache_key, bool, cache_key_hash> cache;
+-
+-    const cache_key             key = { device, kernel };
+-    std::lock_guard<std::mutex> lock(cache_mutex);
+-    const auto                  it = cache.find(key);
+-    if (it != cache.end()) {
+-        return it->second;
+-    }
+-
+-    cudaFuncAttributes attr = {};
+-    CUDA_CHECK(cudaFuncGetAttributes(&attr, kernel));
+-
+-    // PDL device-side primitives are emitted only for PTX versions >= 90.
+-    // We have to guard on a loaded kernel's PTX version so a kernel forward-JIT'ed
+-    // from pre-Hopper PTX to a Hopper-or-newer GPU does not opt into PDL.
+-    const bool can_use_pdl = attr.ptxVersion >= 90;
+-    cache.emplace(key, can_use_pdl);
+-    return can_use_pdl;
+-}
+-
+-#endif //defined(GGML_CUDA_USE_PDL)
+ 
+ // PDL and __restrict__ need to be mutually exclusive, see https://github.com/ggml-org/llama.cpp/pull/24030
+ # if (defined(GGML_CUDA_USE_PDL) && defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= GGML_CUDA_CC_HOPPER)
+@@ -1317,19 +1175,6 @@
+ 
+ template<typename Kernel, typename... Args>
+ static __inline__ cudaError_t ggml_cuda_kernel_launch(Kernel kernel, const ggml_cuda_kernel_launch_params & launch_params, Args&&... args) {
+-#if defined(GGML_CUDA_USE_PDL)
+-
+-    static const bool env_pdl_enabled = []() {
+-        const char * env = getenv("GGML_CUDA_PDL");
+-        return env == nullptr || std::atoi(env) != 0;
+-    }();
+-
+-    if (env_pdl_enabled && ggml_cuda_kernel_can_use_pdl(reinterpret_cast<const void *>(kernel))) {
+-        auto pdl_cfg = ggml_cuda_pdl_config(launch_params);
+-
+-        return cudaLaunchKernelEx(&pdl_cfg.cfg, kernel, std::forward<Args>(args)... );
+-    }
+-#endif //defined(GGML_CUDA_USE_PDL)
+ 
+     kernel<<<launch_params.block_nums, launch_params.block_dims, launch_params.shmem, launch_params.stream>>>(std::forward<Args>(args)... );
+     return cudaGetLastError();
+--- a/src/ggml-cuda/mmq.cuh
++++ b/src/ggml-cuda/mmq.cuh
+@@ -213,78 +213,26 @@
+         return ggml_cuda_mmq_config((type_), (nthreads_), (occupancy_), (I_), (J_), (sram_layout_), (K_vram_), (stream_k_), (fallback_)); \
+     }                                                                                                                                     \
+ 
+-#include "mmq-config-pascal-older.cuh"
+ #include "mmq-config-pascal-dp4a.cuh"
+ #include "mmq-config-ampere.cuh"
+-#include "mmq-config-blackwell.cuh"
+-
+-#include "mmq-config-gcn.cuh"
+-#include "mmq-config-cdna.cuh"
+-#include "mmq-config-rdna2.cuh"
+-#include "mmq-config-rdna3.cuh"
+-#include "mmq-config-rdna3-5.cuh"
+-#include "mmq-config-rdna4.cuh"
+ 
+ #undef CASE
+ 
++// V-4: the engine builds sm_72 and sm_86 only. Both are at least Volta and take the ampere table (sm_72 runs the
++// dp4a code path with it); the pascal-dp4a table is the fall-through for a device below Volta.
+ static __host__ ggml_cuda_mmq_config ggml_cuda_mmq_get_config(const ggml_type type, const int J, const bool fallback, const int cc) {
+-    if (GGML_CUDA_CC_IS_AMD(cc)) {
+-        if (GGML_CUDA_CC_IS_GCN(cc)) {
+-            return ggml_cuda_mmq_get_config_gcn(type, J, fallback);
+-        }
+-        if (GGML_CUDA_CC_IS_CDNA(cc)) {
+-            return ggml_cuda_mmq_get_config_cdna(type, J, fallback);
+-        }
+-        if (GGML_CUDA_CC_IS_RDNA4(cc)) {
+-            return ggml_cuda_mmq_get_config_rdna4(type, J, fallback);
+-        }
+-        if (GGML_CUDA_CC_IS_RDNA3_5(cc)) {
+-            return ggml_cuda_mmq_get_config_rdna3_5(type, J, fallback);
+-        }
+-        if (GGML_CUDA_CC_IS_RDNA3(cc)) {  // covers RDNA 3.0
+-            return ggml_cuda_mmq_get_config_rdna3(type, J, fallback);
+-        }
+-        return ggml_cuda_mmq_get_config_rdna2(type, J, fallback);
+-    }
+-    if (blackwell_mma_available(cc)) {
+-        return ggml_cuda_mmq_get_config_blackwell(type, J, fallback);
+-    }
+     if (ggml_cuda_highest_compiled_arch(cc) >= GGML_CUDA_CC_VOLTA) {
+         return ggml_cuda_mmq_get_config_ampere(type, J, fallback);
+     }
+-    if (ggml_cuda_highest_compiled_arch(cc) >= GGML_CUDA_CC_DP4A) {
+-        return ggml_cuda_mmq_get_config_pascal_dp4a(type, J, fallback);
+-    }
+-    return ggml_cuda_mmq_get_config_pascal_older(type, J, fallback);
++    return ggml_cuda_mmq_get_config_pascal_dp4a(type, J, fallback);
+ }
+ 
+ static constexpr __device__ ggml_cuda_mmq_config ggml_cuda_mmq_get_config(ggml_type type, int J, bool fallback) {
+-#ifdef GGML_USE_HIP
+-#ifdef GCN
+-    return ggml_cuda_mmq_get_config_gcn(type, J, fallback);
+-#elif defined(CDNA)
+-    return ggml_cuda_mmq_get_config_cdna(type, J, fallback);
+-#elif defined(RDNA4)
+-    return ggml_cuda_mmq_get_config_rdna4(type, J, fallback);
+-#elif defined(RDNA3_5)
+-    return ggml_cuda_mmq_get_config_rdna3_5(type, J, fallback);
+-#elif defined(RDNA3)
+-    return ggml_cuda_mmq_get_config_rdna3(type, J, fallback);
+-#else
+-    return ggml_cuda_mmq_get_config_rdna2(type, J, fallback);
+-#endif // CDNA
+-#else
+-#ifdef BLACKWELL_MMA_AVAILABLE
+-    return ggml_cuda_mmq_get_config_blackwell(type, J, fallback);
+-#elif __CUDA_ARCH__ >= GGML_CUDA_CC_VOLTA
++#if __CUDA_ARCH__ >= GGML_CUDA_CC_VOLTA
+     return ggml_cuda_mmq_get_config_ampere(type, J, fallback);
+-#elif __CUDA_ARCH__ >= GGML_CUDA_CC_DP4A
+-    return ggml_cuda_mmq_get_config_pascal_dp4a(type, J, fallback);
+ #else
+-    return ggml_cuda_mmq_get_config_pascal_older(type, J, fallback);
+-#endif // BLACKWELL_MMA_AVAILABLE
+-#endif // GGML_USE_HIP
+-    GGML_UNUSED_VARS(type, J, fallback);
++    return ggml_cuda_mmq_get_config_pascal_dp4a(type, J, fallback);
++#endif // __CUDA_ARCH__ >= GGML_CUDA_CC_VOLTA
+ }
+ 
+ static __host__ int ggml_cuda_mmq_get_type(const ggml_type type, const int J, const bool fallback, const int cc) {
+--- a/src/ggml-cuda/vendors/cuda.h
++++ b/src/ggml-cuda/vendors/cuda.h
+@@ -2,7 +2,6 @@
+ 
+ #include <cuda_runtime.h>
+ #include <cuda.h>
+-#include <cublas_v2.h>
+ #include <cuda_bf16.h>
+ #include <cuda_fp16.h>
+ 
+@@ -18,11 +17,3 @@
+ #if CUDART_VERSION >= 12080
+ #include <cuda_fp4.h>
+ #endif // CUDART_VERSION >= 12080
+-
+-#if CUDART_VERSION < 11020
+-#define CU_DEVICE_ATTRIBUTE_VIRTUAL_MEMORY_MANAGEMENT_SUPPORTED CU_DEVICE_ATTRIBUTE_VIRTUAL_ADDRESS_MANAGEMENT_SUPPORTED
+-#define CUBLAS_TF32_TENSOR_OP_MATH CUBLAS_TENSOR_OP_MATH
+-#define CUBLAS_COMPUTE_16F CUDA_R_16F
+-#define CUBLAS_COMPUTE_32F CUDA_R_32F
+-#define cublasComputeType_t cudaDataType_t
+-#endif // CUDART_VERSION < 11020

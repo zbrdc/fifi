@@ -86,7 +86,7 @@ impl FileTensor {
     }
 }
 
-/// One valid file of `spec`: F32 for the host tensors, Q8_0 for the tiled ones.
+/// One valid file of `spec`: F32 for the F32 device tensors, Q8_0 for the tiled ones.
 fn file_tensors(spec: &FamilySpec) -> Vec<FileTensor> {
     let inventory =
         Inventory::for_spec(spec).unwrap_or_else(|error| panic!("fixture inventory: {error:?}"));
@@ -95,7 +95,7 @@ fn file_tensors(spec: &FamilySpec) -> Vec<FileTensor> {
         .iter()
         .map(|tensor| {
             let ty = match tensor.path() {
-                TensorPath::HostF32 => GgufType::F32,
+                TensorPath::DeviceF32 => GgufType::F32,
                 TensorPath::DeviceTiled => GgufType::Q80,
             };
             FileTensor::new(&tensor.name, ty, tensor.dims.clone())
@@ -157,7 +157,7 @@ fn rejection(result: Result<GgufModel, EngError>) -> String {
 }
 
 #[test]
-fn a_two_layer_file_opens_and_reads_its_host_tensors_back_bit_exact() {
+fn a_two_layer_file_opens_and_reads_its_f32_tensors_back_bit_exact() {
     let spec = TWO_LAYER_SPEC;
     let kvs = metadata("qwen35moe", spec_counts(&spec));
     let mut tensors = file_tensors(&spec);
@@ -192,7 +192,7 @@ fn a_two_layer_file_opens_and_reads_its_host_tensors_back_bit_exact() {
         .unwrap_or_else(|error| panic!("the two-layer fixture must open: {error:?}"));
     assert_eq!(model.path(), path.as_path());
     assert_eq!(model.plan().count(TensorPath::DeviceTiled), 23);
-    assert_eq!(model.plan().count(TensorPath::HostF32), 15);
+    assert_eq!(model.plan().count(TensorPath::DeviceF32), 15);
     assert_eq!(model.plan().tensors().count(), 38);
     let mut entries = model.plan().tensors();
     assert_eq!(
@@ -203,20 +203,25 @@ fn a_two_layer_file_opens_and_reads_its_host_tensors_back_bit_exact() {
         entries.last(),
         Some(("output.weight", TensorPath::DeviceTiled))
     );
-    let tiled = model.plan().tiled_names();
-    assert_eq!(tiled.len(), 23);
-    assert!(tiled.contains(&"blk.1.attn_q.weight"));
-    assert!(!tiled.contains(&"blk.0.attn_norm.weight"));
+    let device = model.plan().device_names();
+    let listed: Vec<&str> = model.plan().tensors().map(|(name, _)| name).collect();
+    assert_eq!(
+        device, listed,
+        "every plan tensor goes to the device, in plan order"
+    );
+    assert_eq!(device.len(), 38);
+    assert!(device.contains(&"blk.1.attn_q.weight"));
+    assert!(device.contains(&"blk.0.attn_norm.weight"));
     let values: u64 = expected.values().map(Vec::len).sum::<usize>() as u64;
-    assert_eq!(model.plan().source_bytes(TensorPath::HostF32), 4 * values);
+    assert_eq!(model.plan().source_bytes(TensorPath::DeviceF32), 4 * values);
     let host = model
         .read_host_f32()
-        .unwrap_or_else(|error| panic!("read the host tensors: {error:?}"));
-    assert_eq!(host.len(), expected.len(), "exactly the host tensors");
+        .unwrap_or_else(|error| panic!("read the F32 tensors: {error:?}"));
+    assert_eq!(host.len(), expected.len(), "exactly the F32 tensors");
     for (name, want) in &expected {
         let got = host
             .get(name)
-            .unwrap_or_else(|| panic!("tensor {name} is not a host tensor"));
+            .unwrap_or_else(|| panic!("tensor {name} is not an F32 tensor"));
         let got_bits: Vec<u32> = got.iter().map(|value| value.to_bits()).collect();
         let want_bits: Vec<u32> = want.iter().map(|value| value.to_bits()).collect();
         assert_eq!(got_bits, want_bits, "tensor {name} values differ");
@@ -485,7 +490,7 @@ fn a_missing_count_key_fails_the_open_naming_the_key() {
 }
 
 #[test]
-fn a_host_tensor_with_wrong_dims_fails_the_open_naming_the_tensor() {
+fn an_f32_tensor_with_wrong_dims_fails_the_open_naming_the_tensor() {
     let spec = TWO_LAYER_SPEC;
     let kvs = metadata("qwen35moe", spec_counts(&spec));
     let mut tensors = file_tensors(&spec);

@@ -14,12 +14,24 @@ pub(crate) const TILE_COLS: u64 = 256;
 /// `kern::kMaxK`: the longest row the vendored matmul accepts.
 pub(crate) const MAX_COLS: u64 = 32768;
 /// Bytes of one tile: `kTileVecs` of `mma884::Q4_K`, `mma884::Q6_K` and
-/// `mma884::Q8_0` times 16. Q4_K and Q8_0 tiles hold the same bytes as their
-/// ggml blocks; Q6_K tiles add precomputed fp16 scales and are larger than the
-/// ggml blocks.
+/// `mma884::Q8_0` times 16. Q4_K, Q8_0 and Q5_0 tiles hold the same bytes as
+/// their ggml blocks; Q6_K tiles add precomputed fp16 scales and are larger
+/// than the ggml blocks. A Q5_0 tile is 8 rows of 128 values (4 blocks of 22
+/// bytes per row) and is built on the host, not by the vendored repack.
 const Q4K_TILE_BYTES: u64 = 72 * 16;
 const Q6K_TILE_BYTES: u64 = 112 * 16;
 const Q8_0_TILE_BYTES: u64 = 136 * 16;
+const Q5_0_TILE_BYTES: u64 = 44 * 16;
+/// Values per row of one Q5_0 tile.
+const Q5_0_TILE_COLS: u64 = 128;
+
+/// Values per row of one tile of `ty`.
+fn tile_cols(ty: GgufType) -> u64 {
+    match ty {
+        GgufType::Q50 => Q5_0_TILE_COLS,
+        _ => TILE_COLS,
+    }
+}
 
 /// Device memory one load needs, in bytes.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -33,10 +45,11 @@ pub(crate) struct Demand {
 /// Device bytes of the tensor `name` after upload.
 ///
 /// `dims` is in GGUF order: `dims[0]` is the row length, the product of the
-/// rest is the row count. Q4_K, Q6_K and Q8_0 are stored as tiles, so their row
-/// length must be a multiple of 256 and at most 32768, and their row count a
-/// multiple of 8. F32 and F16 are stored as read. Any other type, or a shape
-/// the tiles cannot hold, fails with `EngError::Checkpoint` naming the tensor.
+/// rest is the row count. Q4_K, Q6_K, Q8_0 and Q5_0 are stored as tiles, so
+/// their row length must be a multiple of the tile columns (256, or 128 for
+/// Q5_0) and at most 32768, and their row count a multiple of 8. F32 and F16
+/// are stored as read. Any other type, or a shape the tiles cannot hold, fails
+/// with `EngError::Checkpoint` naming the tensor.
 pub(crate) fn device_bytes(name: &str, ty: GgufType, dims: &[u64]) -> Result<u64, EngError> {
     let overflow = || EngError::MemoryPlan(format!("tensor {name}: device size overflows u64"));
     let (&cols, rest) = dims
@@ -53,6 +66,7 @@ pub(crate) fn device_bytes(name: &str, ty: GgufType, dims: &[u64]) -> Result<u64
         GgufType::Q4K => Q4K_TILE_BYTES,
         GgufType::Q6K => Q6K_TILE_BYTES,
         GgufType::Q80 => Q8_0_TILE_BYTES,
+        GgufType::Q50 => Q5_0_TILE_BYTES,
         other => {
             return Err(EngError::Checkpoint(format!(
                 "tensor {name} has type {other:?}, which the CUDA backend does not load"
@@ -61,21 +75,22 @@ pub(crate) fn device_bytes(name: &str, ty: GgufType, dims: &[u64]) -> Result<u64
     };
     check_tile_shape(name, ty, rows, cols)?;
     (rows / TILE_ROWS)
-        .checked_mul(cols / TILE_COLS)
+        .checked_mul(cols / tile_cols(ty))
         .and_then(|tiles| tiles.checked_mul(tile_bytes))
         .ok_or_else(overflow)
 }
 
 fn check_tile_shape(name: &str, ty: GgufType, rows: u64, cols: u64) -> Result<(), EngError> {
+    let tile_cols = tile_cols(ty);
     if rows == 0
         || !rows.is_multiple_of(TILE_ROWS)
         || cols == 0
-        || !cols.is_multiple_of(TILE_COLS)
+        || !cols.is_multiple_of(tile_cols)
         || cols > MAX_COLS
     {
         return Err(EngError::Checkpoint(format!(
             "tensor {name} ({ty:?}) has {rows} rows of {cols}; the CUDA tiles need rows a \
-             multiple of {TILE_ROWS} and a row length that is a multiple of {TILE_COLS} up \
+             multiple of {TILE_ROWS} and a row length that is a multiple of {tile_cols} up \
              to {MAX_COLS}"
         )));
     }
@@ -154,6 +169,31 @@ mod tests {
         assert_eq!(device_bytes("w", GgufType::Q80, &[512, 16]), Ok(4 * 2176));
         // An expert stack [k, n, experts] counts all rows.
         assert_eq!(device_bytes("e", GgufType::Q4K, &[256, 8, 3]), Ok(3 * 1152));
+    }
+
+    #[test]
+    fn device_bytes_of_a_q5_0_tensor_equal_its_source_bytes_and_have_no_padding() {
+        // Mellum ffn_down_exps: K = 896 is 28 blocks of 22 bytes per row.
+        assert_eq!(
+            device_bytes("e", GgufType::Q50, &[896, 2304, 64]),
+            Ok(28 * 22 * 2304 * 64)
+        );
+        assert_eq!(
+            device_bytes("e", GgufType::Q50, &[896, 2304, 64]),
+            Ok(90_832_896)
+        );
+        assert_eq!(device_bytes("w", GgufType::Q50, &[128, 8]), Ok(704));
+        // The 14 Mellum ffn_down_exps tensors.
+        let total: u64 = (0..14)
+            .map(|_| device_bytes("e", GgufType::Q50, &[896, 2304, 64]).expect("fits"))
+            .sum();
+        assert_eq!(total, 1_271_660_544);
+        for dims in [[864, 8], [128, 12]] {
+            assert!(matches!(
+                device_bytes("w", GgufType::Q50, &dims),
+                Err(EngError::Checkpoint(message)) if message.contains("multiple of 128")
+            ));
+        }
     }
 
     #[test]

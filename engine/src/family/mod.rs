@@ -22,7 +22,7 @@ pub mod quantization;
     dead_code,
     reason = "decision 0046 draft: the Q36 host reference serves later packets; until they land only tests and the Mac reference run call it"
 )]
-pub(crate) mod qwen36;
+pub mod qwen36;
 pub mod recurrent;
 pub mod route;
 #[allow(

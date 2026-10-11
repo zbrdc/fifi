@@ -232,3 +232,27 @@ fn scalar_formats_decode_known_values() {
     let v = dequantize(GgufType::F32, &1.5f32.to_le_bytes()).unwrap();
     assert_eq!(v, vec![1.5]);
 }
+
+#[test]
+fn q5_0_decodes_a_hand_computed_block() {
+    // d = 2.0; qh bits 0, 16 and 31 set; qs[j] = j | ((15 - j) << 4).
+    let mut block = vec![0x00, 0x40, 0x01, 0x00, 0x01, 0x80];
+    block.extend((0u8..16).map(|j| j | ((15 - j) << 4)));
+    let v = dequantize(GgufType::Q50, &block).unwrap();
+    let expect: [f32; 32] = [
+        0.0, -30.0, -28.0, -26.0, -24.0, -22.0, -20.0, -18.0, -16.0, -14.0, -12.0, -10.0, -8.0,
+        -6.0, -4.0, -2.0, 30.0, -4.0, -6.0, -8.0, -10.0, -12.0, -14.0, -16.0, -18.0, -20.0, -22.0,
+        -24.0, -26.0, -28.0, -30.0, 0.0,
+    ];
+    let got: Vec<u32> = v.iter().map(|x| x.to_bits()).collect();
+    let want: Vec<u32> = expect.iter().map(|x| x.to_bits()).collect();
+    assert_eq!(got, want);
+}
+
+#[test]
+fn q5_0_all_zero_block_decodes_to_negative_zero_bits() {
+    // -16 * +0.0 is -0.0: a zero padding block is not +0.0 in a float reference.
+    let v = dequantize(GgufType::Q50, &[0u8; 22]).unwrap();
+    assert_eq!(v.len(), 32);
+    assert!(v.iter().all(|x| x.to_bits() == 0x8000_0000), "{v:?}");
+}

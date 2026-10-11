@@ -84,6 +84,28 @@ fn q8_0(b: &[u8], y: &mut [f32]) {
     }
 }
 
+/// Q5_0: `d`, the 32 high bits `qh` and 16 bytes of low nibbles. Element `j`
+/// (0..16) takes the low nibble of `qs[j]`, element `j + 16` the high nibble;
+/// bit `i` of `qh` is the fifth bit of element `i`. The quant is `(0..32) - 16`.
+///
+/// The product is `q * d` in that order, as the oracle writes `x0 * d`: with
+/// `d = +0.0` and `q = -16` the result is `-0.0`, and the order fixes the sign
+/// of a NaN `d`.
+fn q5_0(b: &[u8], y: &mut [f32]) {
+    let d = rd_f16(b, 0);
+    let qh = rd_u32(b, 2);
+    let qs = &b[6..22];
+    for (j, &byte) in qs.iter().enumerate() {
+        // The masks keep the fifth bit at 0 or 16, so the values fit an i32.
+        let low_bit = i32::from((qh >> j) & 1 == 1) << 4;
+        let high_bit = i32::from((qh >> (j + 16)) & 1 == 1) << 4;
+        let low = i32::from(byte & 0x0f) | low_bit;
+        let high = i32::from(byte >> 4) | high_bit;
+        y[j] = (low - 16) as f32 * d;
+        y[j + 16] = (high - 16) as f32 * d;
+    }
+}
+
 /// Unpacks the 6-bit scale and minimum with index `j` (0..8) of a K-quant block.
 fn scale_min_k4(j: usize, q: &[u8]) -> (u8, u8) {
     if j < 4 {
@@ -299,6 +321,7 @@ fn plan(ty: GgufType, src_len: usize) -> Result<(Decoder, usize, usize, usize), 
     let decode: Decoder = match ty {
         GgufType::Q20 => q2_0,
         GgufType::Q4K => q4_k,
+        GgufType::Q50 => q5_0,
         GgufType::Q5K => q5_k,
         GgufType::Q6K => q6_k,
         GgufType::Q80 => q8_0,

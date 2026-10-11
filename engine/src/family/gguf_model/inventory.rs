@@ -15,8 +15,8 @@ use crate::{
 pub enum TensorPath {
     /// Quantized matrix that the CUDA projector tiles on the device.
     DeviceTiled,
-    /// Small F32 tensor that stays on the host.
-    HostF32,
+    /// Small F32 tensor that the CUDA loader uploads as a raw device copy (decision 0047 A1).
+    DeviceF32,
 }
 
 /// The role a GGUF tensor plays in the model.
@@ -84,9 +84,9 @@ const DELTA_ROLES: [Role; 9] = [
     Role::SsmNorm,
 ];
 // The CUDA projector tiles only Q4_K, Q6_K and Q8_0. F16 and Q5_K are allowed nowhere: a tiled
-// tensor in either type has no tile kernel, and every other tensor is read as F32 on the host.
+// tensor in either type has no tile kernel, and every other tensor is uploaded as raw F32.
 const TILED_TYPES: [GgufType; 3] = [GgufType::Q4K, GgufType::Q6K, GgufType::Q80];
-const HOST_TYPES: [GgufType; 1] = [GgufType::F32];
+const RAW_TYPES: [GgufType; 1] = [GgufType::F32];
 
 impl Role {
     /// Whole tensor name for the three global roles, else the part after `blk.N.`.
@@ -140,7 +140,7 @@ impl Role {
                 | Role::SsmDtBias
                 | Role::SsmNorm
         ) {
-            TensorPath::HostF32
+            TensorPath::DeviceF32
         } else {
             TensorPath::DeviceTiled
         }
@@ -149,7 +149,7 @@ impl Role {
     fn allowed_types(self) -> &'static [GgufType] {
         match self.path() {
             TensorPath::DeviceTiled => &TILED_TYPES,
-            TensorPath::HostF32 => &HOST_TYPES,
+            TensorPath::DeviceF32 => &RAW_TYPES,
         }
     }
 

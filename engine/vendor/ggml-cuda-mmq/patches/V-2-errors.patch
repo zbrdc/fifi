@@ -1,0 +1,594 @@
+--- a/src/ggml-cuda/common.cuh
++++ b/src/ggml-cuda/common.cuh
+@@ -200,6 +200,24 @@
+ 
+ #define CUDA_CHECK(err) CUDA_CHECK_GEN(err, cudaSuccess, cudaGetErrorString)
+ 
++// V-2: the MMQ entry points return their errors. FIFI_TRY returns a failed CUDA status to the caller;
++// FIFI_REQUIRE returns cudaErrorInvalidValue when an argument precondition does not hold. Both are only
++// for functions that return cudaError_t.
++#define FIFI_TRY(expr)                                                 \
++    do {                                                               \
++        const cudaError_t fifi_status_ = (expr);                       \
++        if (fifi_status_ != cudaSuccess) {                             \
++            return fifi_status_;                                       \
++        }                                                              \
++    } while (0)
++
++#define FIFI_REQUIRE(cond)                                             \
++    do {                                                               \
++        if (!(cond)) {                                                 \
++            return cudaErrorInvalidValue;                              \
++        }                                                              \
++    } while (0)
++
+ 
+ #if CUDART_VERSION >= 12000 || defined(GGML_USE_MUSA)
+     static const char * cublas_get_error_str(const cublasStatus_t err) {
+@@ -243,7 +261,7 @@
+             static bool shared_memory_limit_raised[GGML_CUDA_MAX_DEVICES] = { false };                         \
+             const int   id                                                = ggml_cuda_get_device();            \
+             if (!shared_memory_limit_raised[id]) {                                                             \
+-                CUDA_CHECK(cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, nbytes)); \
++                FIFI_TRY(cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, nbytes));   \
+                 shared_memory_limit_raised[id] = true;                                                         \
+             }                                                                                                  \
+         } while (0)
+@@ -374,7 +392,9 @@
+ 
+ // Checks whether the tensor's base data pointer and higher-dimensional strides are byte-aligned to `alignment` bytes.
+ static bool ggml_cuda_is_aligned(const ggml_tensor * tensor, const size_t alignment) {
+-    GGML_ASSERT(tensor != nullptr);
++    if (tensor == nullptr) {
++        return false;
++    }
+     return (reinterpret_cast<uintptr_t>(tensor->data) % alignment) == 0 &&
+            tensor->nb[1] % alignment == 0 &&
+            tensor->nb[2] % alignment == 0 &&
+@@ -403,31 +423,25 @@
+ }
+ 
+ 
+-[[noreturn]]
++// V-2: a kernel built for an architecture without a code path used to print and trap. Both are on the abort
++// gate, so the function now does nothing: the kernel returns and its outputs stay as they were. That is safe
++// only because the host refuses every launch for an architecture the objects were not built for: the typed
++// guard fifi_check_device of patch V-3b (KUBDAN-MSG-39 Q3). The device does not reach this function behind it.
++// The two FP4 quantize entries, the only other way to a NO_DEVICE_CODE kernel, refuse with cudaErrorNotSupported.
+ static __device__ void no_device_code(
+     const char * file_name, const int line, const char * function_name, const int arch, const char * arch_list) {
+-
+-#if defined(GGML_USE_HIP)
+-    printf("%s:%d: ERROR: HIP kernel %s has no device code compatible with HIP arch %d.\n",
+-           file_name, line, function_name, arch);
++    GGML_UNUSED(file_name);
++    GGML_UNUSED(line);
++    GGML_UNUSED(function_name);
++    GGML_UNUSED(arch);
+     GGML_UNUSED(arch_list);
+-#else
+-    printf("%s:%d: ERROR: CUDA kernel %s has no device code compatible with CUDA arch %d. ggml-cuda.cu was compiled for: %s\n",
+-           file_name, line, function_name, arch, arch_list);
+-#endif // defined(GGML_USE_HIP)
+-    __trap();
+-
+     GGML_UNUSED(no_device_code); // suppress unused function warning
+-
+-#if defined(GGML_USE_MUSA)
+-    __builtin_unreachable();
+-#endif // defined(GGML_USE_MUSA)
+ }
+ 
+ #ifdef __CUDA_ARCH__
+ #define NO_DEVICE_CODE no_device_code(__FILE__, __LINE__, __FUNCTION__, __CUDA_ARCH__, STRINGIZE(__CUDA_ARCH_LIST__))
+ #else
+-#define NO_DEVICE_CODE //GGML_ABORT("NO_DEVICE_CODE not valid in host code.")
++#define NO_DEVICE_CODE
+ #endif // __CUDA_ARCH__
+ 
+ // The compiler is always able to unroll loops if they contain continue expressions.
+@@ -642,7 +656,6 @@
+     val                           = block_reduce_policy<reduce_method_t, T>::reduce(val);
+     const unsigned int block_size = block_size_template == 0 ? blockDim.x : block_size_template;
+     if (block_size > WARP_SIZE) {
+-        assert((block_size <= 1024) && (block_size % WARP_SIZE) == 0);
+         const int warp_id = threadIdx.x / WARP_SIZE;
+         const int lane_id = threadIdx.x % WARP_SIZE;
+         if (lane_id == 0) {
+@@ -916,10 +929,13 @@
+ // and a shift:
+ //
+ // n/d = (mulhi(n, mp) + n) >> L;
+-static const uint3 init_fastdiv_values(uint64_t d_64) {
+-    GGML_ASSERT(d_64 != 0);
+-    GGML_ASSERT(d_64 <= std::numeric_limits<uint32_t>::max());
++//
++// V-2: the divisor must satisfy fifi_fastdiv_valid(d_64); the launch functions check that before they call this.
++static bool fifi_fastdiv_valid(uint64_t d_64) {
++    return d_64 != 0 && d_64 <= std::numeric_limits<uint32_t>::max();
++}
+ 
++static const uint3 init_fastdiv_values(uint64_t d_64) {
+     uint32_t d = (uint32_t)d_64;
+ 
+     // compute L = ceil(log2(d));
+@@ -1690,7 +1706,7 @@
+ # endif // defined(GGML_CUDA_USE_PDL) && defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= GGML_CUDA_CC_HOPPER
+ 
+ template<typename Kernel, typename... Args>
+-static __inline__ void ggml_cuda_kernel_launch(Kernel kernel, const ggml_cuda_kernel_launch_params & launch_params, Args&&... args) {
++static __inline__ cudaError_t ggml_cuda_kernel_launch(Kernel kernel, const ggml_cuda_kernel_launch_params & launch_params, Args&&... args) {
+ #if defined(GGML_CUDA_USE_PDL)
+ 
+     static const bool env_pdl_enabled = []() {
+@@ -1701,11 +1717,10 @@
+     if (env_pdl_enabled && ggml_cuda_kernel_can_use_pdl(reinterpret_cast<const void *>(kernel))) {
+         auto pdl_cfg = ggml_cuda_pdl_config(launch_params);
+ 
+-        CUDA_CHECK(cudaLaunchKernelEx(&pdl_cfg.cfg, kernel, std::forward<Args>(args)... ));
+-        return;
++        return cudaLaunchKernelEx(&pdl_cfg.cfg, kernel, std::forward<Args>(args)... );
+     }
+ #endif //defined(GGML_CUDA_USE_PDL)
+ 
+     kernel<<<launch_params.block_nums, launch_params.block_dims, launch_params.shmem, launch_params.stream>>>(std::forward<Args>(args)... );
+-    CUDA_CHECK(cudaGetLastError());
++    return cudaGetLastError();
+ }
+--- a/src/ggml-cuda/mmid.cu
++++ b/src/ggml-cuda/mmid.cu
+@@ -130,11 +130,11 @@
+ }
+ 
+ template <int n_expert_used_template>
+-static void launch_mm_ids_helper(
++static cudaError_t launch_mm_ids_helper(
+         const int32_t * __restrict__ ids, int32_t * __restrict__ ids_src1, int32_t * __restrict__ ids_dst, int32_t * __restrict__ expert_bounds,
+         const int n_experts, const int n_tokens, const int n_expert_used_var, const int nchannels_y, const int si1, const int sis1, const bool write_inverse, cudaStream_t stream) {
+-    GGML_ASSERT(n_tokens          < (1 << 22) && "too few bits in mm_ids_helper_store");
+-    GGML_ASSERT(n_expert_used_var < (1 << 10) && "too few bits in mm_ids_helper_store");
++    FIFI_REQUIRE(n_tokens          < (1 << 22)); // mm_ids_helper_store has too few bits otherwise
++    FIFI_REQUIRE(n_expert_used_var < (1 << 10));
+ 
+     const int id = ggml_cuda_get_device();
+     const int warp_size = ggml_cuda_info().devices[id].warp_size;
+@@ -144,38 +144,31 @@
+     const dim3 num_blocks(n_experts, 1, 1);
+     const dim3 block_size(warp_size, 1, 1);
+     const size_t nbytes_shared = n_tokens*sizeof(mm_ids_helper_store);
+-    GGML_ASSERT(nbytes_shared <= smpbo);
++    FIFI_REQUIRE(nbytes_shared <= smpbo);
+     mm_ids_helper<n_expert_used_template><<<num_blocks, block_size, nbytes_shared, stream>>>
+         (ids, ids_src1, ids_dst, expert_bounds, n_tokens, n_expert_used_var, nchannels_y, si1, sis1, write_inverse);
++    return cudaGetLastError();
+ }
+ 
+-void ggml_cuda_launch_mm_ids_helper(
++cudaError_t ggml_cuda_launch_mm_ids_helper(
+         const int32_t * __restrict__ ids, int32_t * __restrict__ ids_src1, int32_t * __restrict__ ids_dst, int32_t * __restrict__ expert_bounds,
+         const int n_experts, const int n_tokens, const int n_expert_used, const int nchannels_y, const int si1, const int sis1, const bool write_inverse, cudaStream_t stream) {
+     switch (n_expert_used) {
+         case  2:
+-            launch_mm_ids_helper< 2>(ids, ids_src1, ids_dst, expert_bounds, n_experts, n_tokens, n_expert_used, nchannels_y, si1, sis1, write_inverse, stream);
+-            break;
++            return launch_mm_ids_helper< 2>(ids, ids_src1, ids_dst, expert_bounds, n_experts, n_tokens, n_expert_used, nchannels_y, si1, sis1, write_inverse, stream);
+         case  4:
+-            launch_mm_ids_helper< 4>(ids, ids_src1, ids_dst, expert_bounds, n_experts, n_tokens, n_expert_used, nchannels_y, si1, sis1, write_inverse, stream);
+-            break;
++            return launch_mm_ids_helper< 4>(ids, ids_src1, ids_dst, expert_bounds, n_experts, n_tokens, n_expert_used, nchannels_y, si1, sis1, write_inverse, stream);
+         case  6:
+-            launch_mm_ids_helper< 6>(ids, ids_src1, ids_dst, expert_bounds, n_experts, n_tokens, n_expert_used, nchannels_y, si1, sis1, write_inverse, stream);
+-            break;
++            return launch_mm_ids_helper< 6>(ids, ids_src1, ids_dst, expert_bounds, n_experts, n_tokens, n_expert_used, nchannels_y, si1, sis1, write_inverse, stream);
+         case  8:
+-            launch_mm_ids_helper< 8>(ids, ids_src1, ids_dst, expert_bounds, n_experts, n_tokens, n_expert_used, nchannels_y, si1, sis1, write_inverse, stream);
+-            break;
++            return launch_mm_ids_helper< 8>(ids, ids_src1, ids_dst, expert_bounds, n_experts, n_tokens, n_expert_used, nchannels_y, si1, sis1, write_inverse, stream);
+         case 10:
+-            launch_mm_ids_helper<10>(ids, ids_src1, ids_dst, expert_bounds, n_experts, n_tokens, n_expert_used, nchannels_y, si1, sis1, write_inverse, stream);
+-            break;
++            return launch_mm_ids_helper<10>(ids, ids_src1, ids_dst, expert_bounds, n_experts, n_tokens, n_expert_used, nchannels_y, si1, sis1, write_inverse, stream);
+         case 16:
+-            launch_mm_ids_helper<16>(ids, ids_src1, ids_dst, expert_bounds, n_experts, n_tokens, n_expert_used, nchannels_y, si1, sis1, write_inverse, stream);
+-            break;
++            return launch_mm_ids_helper<16>(ids, ids_src1, ids_dst, expert_bounds, n_experts, n_tokens, n_expert_used, nchannels_y, si1, sis1, write_inverse, stream);
+         case 32:
+-            launch_mm_ids_helper<32>(ids, ids_src1, ids_dst, expert_bounds, n_experts, n_tokens, n_expert_used, nchannels_y, si1, sis1, write_inverse, stream);
+-            break;
++            return launch_mm_ids_helper<32>(ids, ids_src1, ids_dst, expert_bounds, n_experts, n_tokens, n_expert_used, nchannels_y, si1, sis1, write_inverse, stream);
+         default:
+-            launch_mm_ids_helper< 0>(ids, ids_src1, ids_dst, expert_bounds, n_experts, n_tokens, n_expert_used, nchannels_y, si1, sis1, write_inverse, stream);
+-            break;
++            return launch_mm_ids_helper< 0>(ids, ids_src1, ids_dst, expert_bounds, n_experts, n_tokens, n_expert_used, nchannels_y, si1, sis1, write_inverse, stream);
+     }
+ }
+--- a/src/ggml-cuda/mmid.cuh
++++ b/src/ggml-cuda/mmid.cuh
+@@ -1,5 +1,5 @@
+ #pragma once
+ 
+-void ggml_cuda_launch_mm_ids_helper(
++cudaError_t ggml_cuda_launch_mm_ids_helper(
+         const int32_t * ids, int32_t * ids_src1, int32_t * ids_dst, int32_t * expert_bounds,
+         int n_experts, int n_tokens, int n_expert_used, int nchannels_y, int si1, int sis1, bool write_inverse, cudaStream_t stream);
+--- a/src/ggml-cuda/mmq.cuh
++++ b/src/ggml-cuda/mmq.cuh
+@@ -19,6 +19,7 @@
+     MMQ_Q8_1_DS_LAYOUT_D4,
+     MMQ_Q8_1_DS_LAYOUT_DS4,
+     MMQ_Q8_1_DS_LAYOUT_D2S6,
++    MMQ_Q8_1_DS_LAYOUT_INVALID, // V-2: the type has no MMQ layout; callers return cudaErrorInvalidValue
+ };
+ 
+ static constexpr int QK8_1_MMQ  = 4*QK8_1;
+@@ -95,8 +96,7 @@
+         case GGML_TYPE_IQ4_NL:
+             return MMQ_Q8_1_DS_LAYOUT_D4;
+         default:
+-            GGML_ABORT("fatal error");
+-            break;
++            return MMQ_Q8_1_DS_LAYOUT_INVALID;
+     }
+ }
+ 
+@@ -1393,14 +1393,14 @@
+ }
+ 
+ template <ggml_type type, int J, bool fallback>
+-static void launch_mul_mat_q(ggml_backend_cuda_context & ctx, const mmq_args & args, cudaStream_t stream) {
++static cudaError_t launch_mul_mat_q(ggml_backend_cuda_context & ctx, const mmq_args & args, cudaStream_t stream) {
+     const int id = ggml_cuda_get_device();
+     const int cc = ggml_cuda_info().devices[id].cc;
+     const int nsm = ggml_cuda_info().devices[id].nsm;
+     const int warp_size = ggml_cuda_info().devices[id].warp_size;
+ 
+     const ggml_cuda_mmq_config config = ggml_cuda_mmq_get_config(type, J, fallback, cc);
+-    GGML_ASSERT(config.nthreads % warp_size == 0);
++    FIFI_REQUIRE(config.nthreads % warp_size == 0);
+     const int nwarps = config.nthreads / warp_size;
+     const int nbytes_shared = mmq_get_nbytes_shared(config, cc);
+ 
+@@ -1414,8 +1414,11 @@
+     const int ntzw = args.nchannels_y * args.nsamples_y;
+     const dim3 block_nums_xy_tiling(nty, ntx, ntzw);
+ 
+-    GGML_ASSERT(args.nchannels_y % args.nchannels_x == 0);
+-    GGML_ASSERT(args.nsamples_y  % args.nsamples_x  == 0);
++    FIFI_REQUIRE(args.nchannels_x > 0 && args.nsamples_x > 0 && args.nchannels_y > 0 && args.nsamples_y > 0);
++    FIFI_REQUIRE(args.nchannels_y % args.nchannels_x == 0);
++    FIFI_REQUIRE(args.nsamples_y  % args.nsamples_x  == 0);
++    FIFI_REQUIRE(fifi_fastdiv_valid(args.ncols_x / ggml_cuda_type_traits<type>::qk) && fifi_fastdiv_valid(ntx) &&
++                 fifi_fastdiv_valid(args.nchannels_y) && fifi_fastdiv_valid(args.nsamples_y));
+     const int channel_ratio = args.nchannels_y / args.nchannels_x;
+     const int sample_ratio  = args.nsamples_y  / args.nsamples_x;
+ 
+@@ -1433,7 +1436,7 @@
+              channel_ratio_fd, nchannels_y_fd, args.stride_channel_x, args.stride_channel_y, args.stride_channel_dst,
+              sample_ratio_fd, nsamples_y_fd, args.stride_sample_x, args.stride_sample_y, args.stride_sample_dst,
+              ntx_fd);
+-        return;
++        return cudaGetLastError();
+     }
+ 
+     // For the stream-k kernel it is possible to run it with tiling by setting the number of CUDA blocks equal to the number of tiles.
+@@ -1443,7 +1446,7 @@
+     const int tiles_efficiency_percent = 100 * ntiles_dst / (nsm*tiles_nwaves);
+     const dim3 block_nums_stream_k(GGML_CUDA_CC_IS_NVIDIA(cc) && tiles_efficiency_percent >= 90 ? ntiles_dst : nsm, 1, 1);
+ 
+-    GGML_ASSERT(ntiles_dst * blocks_per_ne00_fd.z < (1 << 30)); // Assert that variable kbc will not overflow.
++    FIFI_REQUIRE(ntiles_dst * blocks_per_ne00_fd.z < (1 << 30)); // variable kbc must not overflow
+ 
+     const bool fixup_needed = ntiles_dst % block_nums_stream_k.x != 0;
+ 
+@@ -1464,18 +1467,19 @@
+          ntx_fd);
+ 
+     if (!fixup_needed) {
+-        return;
++        return cudaGetLastError();
+     }
+ 
+-    CUDA_CHECK(cudaGetLastError());
++    FIFI_TRY(cudaGetLastError());
+     mul_mat_q_stream_k_fixup<type, J, fallback><<<block_nums_fixup, block_dims_fixup, 0, stream>>>
+         (args.ids_dst, args.expert_bounds, args.dst, tmp_fixup.ptr, blocks_per_ne00_fd, args.nrows_x, args.ncols_dst,
+          args.nrows_dst, nchannels_y_fd, args.stride_channel_dst, nsamples_y_fd, args.stride_sample_dst,
+          ntx_fd);
++    return cudaGetLastError();
+ }
+ 
+ template <ggml_type type, bool fallback>
+-void mul_mat_q_switch_J(ggml_backend_cuda_context & ctx, const mmq_args & args, cudaStream_t stream) {
++cudaError_t mul_mat_q_switch_J(ggml_backend_cuda_context & ctx, const mmq_args & args, cudaStream_t stream) {
+     const int    id    = ggml_cuda_get_device();
+     const int    cc    = ggml_cuda_info().devices[id].cc;
+     const size_t smpbo = ggml_cuda_info().devices[id].smpbo;
+@@ -1503,73 +1507,55 @@
+ 
+     switch (J_best) {
+         case   8:
+-            launch_mul_mat_q<type,   8, fallback>(ctx, args, stream);
+-            break;
++            return launch_mul_mat_q<type, 8, fallback>(ctx, args, stream);
+         case  16:
+-            launch_mul_mat_q<type,  16, fallback>(ctx, args, stream);
+-            break;
++            return launch_mul_mat_q<type, 16, fallback>(ctx, args, stream);
+         case  24:
+-            launch_mul_mat_q<type,  24, fallback>(ctx, args, stream);
+-            break;
++            return launch_mul_mat_q<type, 24, fallback>(ctx, args, stream);
+         case  32:
+-            launch_mul_mat_q<type,  32, fallback>(ctx, args, stream);
+-            break;
++            return launch_mul_mat_q<type, 32, fallback>(ctx, args, stream);
+         case  40:
+-            launch_mul_mat_q<type,  40, fallback>(ctx, args, stream);
+-            break;
++            return launch_mul_mat_q<type, 40, fallback>(ctx, args, stream);
+         case  48:
+-            launch_mul_mat_q<type,  48, fallback>(ctx, args, stream);
+-            break;
++            return launch_mul_mat_q<type, 48, fallback>(ctx, args, stream);
+         case  56:
+-            launch_mul_mat_q<type,  56, fallback>(ctx, args, stream);
+-            break;
++            return launch_mul_mat_q<type, 56, fallback>(ctx, args, stream);
+         case  64:
+-            launch_mul_mat_q<type,  64, fallback>(ctx, args, stream);
+-            break;
++            return launch_mul_mat_q<type, 64, fallback>(ctx, args, stream);
+         case  72:
+-            launch_mul_mat_q<type,  72, fallback>(ctx, args, stream);
+-            break;
++            return launch_mul_mat_q<type, 72, fallback>(ctx, args, stream);
+         case  80:
+-            launch_mul_mat_q<type,  80, fallback>(ctx, args, stream);
+-            break;
++            return launch_mul_mat_q<type, 80, fallback>(ctx, args, stream);
+         case  88:
+-            launch_mul_mat_q<type,  88, fallback>(ctx, args, stream);
+-            break;
++            return launch_mul_mat_q<type, 88, fallback>(ctx, args, stream);
+         case  96:
+-            launch_mul_mat_q<type,  96, fallback>(ctx, args, stream);
+-            break;
++            return launch_mul_mat_q<type, 96, fallback>(ctx, args, stream);
+         case 104:
+-            launch_mul_mat_q<type, 104, fallback>(ctx, args, stream);
+-            break;
++            return launch_mul_mat_q<type, 104, fallback>(ctx, args, stream);
+         case 112:
+-            launch_mul_mat_q<type, 112, fallback>(ctx, args, stream);
+-            break;
++            return launch_mul_mat_q<type, 112, fallback>(ctx, args, stream);
+         case 120:
+-            launch_mul_mat_q<type, 120, fallback>(ctx, args, stream);
+-            break;
++            return launch_mul_mat_q<type, 120, fallback>(ctx, args, stream);
+         case 128:
+-            launch_mul_mat_q<type, 128, fallback>(ctx, args, stream);
+-            break;
+-        default:
+-            fprintf(stderr, "J_best=%d\n", J_best);
+-            GGML_ABORT("fatal error");
+-            break;
++            return launch_mul_mat_q<type, 128, fallback>(ctx, args, stream);
++        default: // no tile width fits the shared memory of this device
++            return cudaErrorInvalidValue;
+     }
+ }
+ 
+ template <ggml_type type>
+-void mul_mat_q_case(ggml_backend_cuda_context & ctx, const mmq_args & args, cudaStream_t stream) {
++cudaError_t mul_mat_q_case(ggml_backend_cuda_context & ctx, const mmq_args & args, cudaStream_t stream) {
+     if (args.nrows_x % 128 == 0) {
+         constexpr bool fallback = false;
+-        mul_mat_q_switch_J<type, fallback>(ctx, args, stream);
++        return mul_mat_q_switch_J<type, fallback>(ctx, args, stream);
+     } else {
+         constexpr bool fallback = true;
+-        mul_mat_q_switch_J<type, fallback>(ctx, args, stream);
++        return mul_mat_q_switch_J<type, fallback>(ctx, args, stream);
+     }
+ }
+ 
+ #define DECL_MMQ_CASE(type)                                                        \
+-    template void mul_mat_q_case<type>(ggml_backend_cuda_context & ctx, const mmq_args & args, cudaStream_t stream) \
++    template cudaError_t mul_mat_q_case<type>(ggml_backend_cuda_context & ctx, const mmq_args & args, cudaStream_t stream) \
+ 
+ extern DECL_MMQ_CASE(GGML_TYPE_Q1_0);
+ extern DECL_MMQ_CASE(GGML_TYPE_Q2_0);
+--- a/src/ggml-cuda/quantize.cu
++++ b/src/ggml-cuda/quantize.cu
+@@ -555,12 +555,13 @@
+     GGML_UNUSED(n_expert_used);
+ }
+ 
+-void quantize_row_q8_1_cuda(
++cudaError_t quantize_row_q8_1_cuda(
+         const float * x, const int32_t * ids, void * vy, const ggml_type type_src0,
+         const int64_t ne00, const int64_t s01, const int64_t s02, const int64_t s03,
+         const int64_t ne0, const int64_t ne1, const int64_t ne2, const int64_t ne3, cudaStream_t stream) {
+-    GGML_ASSERT(!ids);
+-    GGML_ASSERT(ne0 % QK8_1 == 0);
++    FIFI_REQUIRE(!ids);
++    FIFI_REQUIRE(ne0 % QK8_1 == 0);
++    FIFI_REQUIRE(fifi_fastdiv_valid(ne2));
+ 
+     const uint3 ne2_fastdiv = init_fastdiv_values(ne2);
+ 
+@@ -568,16 +569,16 @@
+     const dim3 num_blocks(block_num_x, ne1, ne2*ne3);
+     const dim3 block_size(CUDA_QUANTIZE_BLOCK_SIZE, 1, 1);
+     const ggml_cuda_kernel_launch_params launch_params = ggml_cuda_kernel_launch_params(num_blocks, block_size, 0, stream);
+-    ggml_cuda_kernel_launch(quantize_q8_1, launch_params, x, vy, ne00, s01, s02, s03, ne0, ne1, ne2_fastdiv);
+     GGML_UNUSED(type_src0);
++    return ggml_cuda_kernel_launch(quantize_q8_1, launch_params, x, vy, ne00, s01, s02, s03, ne0, ne1, ne2_fastdiv);
+ }
+ 
+-void quantize_mmq_q8_1_cuda(
++cudaError_t quantize_mmq_q8_1_cuda(
+         const float * x, const int32_t * ids, void * vy, const ggml_type type_src0,
+         const int64_t ne00, const int64_t s01, const int64_t s02, const int64_t s03,
+         const int64_t ne0, const int64_t ne1, const int64_t ne2, const int64_t ne3, cudaStream_t stream) {
+-    GGML_ASSERT(ne00 % 4 == 0);
+-    GGML_ASSERT(ne0 % QK8_1_MMQ == 0);
++    FIFI_REQUIRE(ne00 % 4 == 0);
++    FIFI_REQUIRE(ne0 % QK8_1_MMQ == 0);
+ 
+     // ne1 tends to assume the highest values, therefore use it as the "x" dimension of the CUDA grid:
+     const int64_t block_num_y = (ne0 + 4*CUDA_QUANTIZE_BLOCK_SIZE_MMQ - 1) / (4*CUDA_QUANTIZE_BLOCK_SIZE_MMQ);
+@@ -597,18 +598,18 @@
+                 <<<num_blocks, block_size, 0, stream>>>(x, ids, vy, ne00, s01, s02, s03, ne0, ne1, ne2, /*n_expert_used=*/0);
+             break;
+         default:
+-            GGML_ABORT("fatal error");
+-            break;
++            return cudaErrorInvalidValue;
+     }
++    return cudaGetLastError();
+ }
+ 
+ // scatter=true reuses the quant kernel: grid over tokens, ids = inverse map (token slot -> compact row)
+-void quantize_scatter_mmq_q8_1_cuda(
++cudaError_t quantize_scatter_mmq_q8_1_cuda(
+         const float * x, const int32_t * ids_src1_inv, void * vy, const ggml_type type_src0,
+         const int64_t ne00, const int64_t stride_token, const int64_t ne0,
+         const int64_t n_tokens, const int64_t nrows_dst, const int n_expert_used, cudaStream_t stream) {
+-    GGML_ASSERT(ne00 % 4 == 0);
+-    GGML_ASSERT(ne0 % QK8_1_MMQ == 0);
++    FIFI_REQUIRE(ne00 % 4 == 0);
++    FIFI_REQUIRE(ne0 % QK8_1_MMQ == 0);
+ 
+     const int64_t block_num_y = (ne0 + 4*CUDA_QUANTIZE_BLOCK_SIZE_MMQ - 1) / (4*CUDA_QUANTIZE_BLOCK_SIZE_MMQ);
+     const dim3 num_blocks(n_tokens, block_num_y, 1);
+@@ -627,20 +628,23 @@
+                 x, ids_src1_inv, vy, ne00, /*s01=*/0, /*s02=*/stride_token, /*s03=*/0, ne0, /*ne1=*/(int) nrows_dst, /*ne2=*/1, n_expert_used);
+             break;
+         default:
+-            GGML_ABORT("fatal error");
+-            break;
++            return cudaErrorInvalidValue;
+     }
++    return cudaGetLastError();
+ }
+ 
+ // scatter=true reuses the quant kernels: grid over tokens, ids = inverse map (token slot -> compact row)
+-void quantize_scatter_mmq_fp4_cuda(
++cudaError_t quantize_scatter_mmq_fp4_cuda(
+         const float * x, const int32_t * ids_src1_inv, void * vy, float * scale, const ggml_type type_src0, const bool use_aligned_float8,
+         const int64_t ne00, const int64_t stride_token, const int64_t ne0,
+         const int64_t n_tokens, const int64_t nrows_dst, const int n_expert_used, cudaStream_t stream) {
+-    GGML_ASSERT(ne0 > 0);
++    if (type_src0 == GGML_TYPE_MXFP4 || type_src0 == GGML_TYPE_NVFP4) {
++        return cudaErrorNotSupported; // V-2: FP4 quantization needs Blackwell; its kernels are empty stubs on sm_72 and sm_86
++    }
++    FIFI_REQUIRE(ne0 > 0);
+     if (type_src0 == GGML_TYPE_NVFP4) {
+-        GGML_ASSERT(scale);
+-        GGML_ASSERT(ne00 % QK_NVFP4 == 0);
++        FIFI_REQUIRE(scale);
++        FIFI_REQUIRE(ne00 % QK_NVFP4 == 0);
+         const dim3 block_size(CUDA_QUANTIZE_BLOCK_SIZE_MMQ, 1, 1);
+         const dim3 num_blocks(n_tokens, 1, 1);
+         if (use_aligned_float8) {
+@@ -651,7 +655,7 @@
+                 x, ids_src1_inv, vy, scale, ne00, /*s01=*/0, /*s02=*/stride_token, /*s03=*/0, ne0, /*ne1=*/nrows_dst, /*ne2=*/1, n_expert_used);
+         }
+     } else {
+-        GGML_ASSERT(type_src0 == GGML_TYPE_MXFP4);
++        FIFI_REQUIRE(type_src0 == GGML_TYPE_MXFP4);
+         constexpr int nwarps = 8;
+         constexpr int vals_per_block = nwarps * 2 * QK_MXFP4;
+         const int64_t block_num_y = (ne0 + vals_per_block - 1) / vals_per_block;
+@@ -660,18 +664,22 @@
+         quantize_mmq_mxfp4<true><<<num_blocks, block_size, 0, stream>>>(
+             x, ids_src1_inv, vy, ne00, /*s01=*/0, /*s02=*/stride_token, /*s03=*/0, ne0, /*ne1=*/(int) nrows_dst, /*ne2=*/1, n_expert_used);
+     }
++    return cudaGetLastError();
+ }
+ 
+-void quantize_mmq_fp4_cuda(
++cudaError_t quantize_mmq_fp4_cuda(
+         const float * x, const int32_t * ids, void * vy, float * scale, const ggml_type type_src0, const bool use_aligned_float8,
+         const int64_t ne00, const int64_t s01, const int64_t s02, const int64_t s03,
+         const int64_t ne0, const int64_t ne1, const int64_t ne2, const int64_t ne3, cudaStream_t stream) {
+-    GGML_ASSERT(type_src0 == GGML_TYPE_MXFP4 || type_src0 == GGML_TYPE_NVFP4);
+-    GGML_ASSERT(ne0 > 0);
++    if (type_src0 == GGML_TYPE_MXFP4 || type_src0 == GGML_TYPE_NVFP4) {
++        return cudaErrorNotSupported; // V-2: FP4 quantization needs Blackwell; its kernels are empty stubs on sm_72 and sm_86
++    }
++    FIFI_REQUIRE(type_src0 == GGML_TYPE_MXFP4 || type_src0 == GGML_TYPE_NVFP4);
++    FIFI_REQUIRE(ne0 > 0);
+ 
+     if (type_src0 == GGML_TYPE_NVFP4) {
+-        GGML_ASSERT(scale);
+-        GGML_ASSERT(ne00 % QK_NVFP4 == 0);
++        FIFI_REQUIRE(scale);
++        FIFI_REQUIRE(ne00 % QK_NVFP4 == 0);
+         const dim3 block_size(CUDA_QUANTIZE_BLOCK_SIZE_MMQ, 1, 1);
+         const dim3 num_blocks(ne1, ne2 * ne3, 1);
+         if (use_aligned_float8) {
+@@ -682,7 +690,7 @@
+                 x, ids, vy, scale, ne00, s01, s02, s03, ne0, ne1, ne2, /*n_expert_used=*/0);
+         }
+     } else {
+-        GGML_ASSERT(ne0 % (2 * QK_MXFP4) == 0);
++        FIFI_REQUIRE(ne0 % (2 * QK_MXFP4) == 0);
+ 
+         constexpr int nwarps = 8;
+         constexpr int vals_per_warp  = 2 * QK_MXFP4;
+@@ -694,4 +702,5 @@
+ 
+         quantize_mmq_mxfp4<false><<<num_blocks, block_size, 0, stream>>>(x, ids, vy, ne00, s01, s02, s03, ne0, ne1, ne2, /*n_expert_used=*/0);
+     }
++    return cudaGetLastError();
+ }
+--- a/src/ggml-cuda/quantize.cuh
++++ b/src/ggml-cuda/quantize.cuh
+@@ -11,22 +11,22 @@
+ static_assert(MATRIX_ROW_PADDING %    CUDA_QUANTIZE_BLOCK_SIZE      == 0, "Risk of out-of-bounds access.");
+ static_assert(MATRIX_ROW_PADDING % (4*CUDA_QUANTIZE_BLOCK_SIZE_MMQ) == 0, "Risk of out-of-bounds access.");
+ 
+-typedef void (*quantize_cuda_t)(
++typedef cudaError_t (*quantize_cuda_t)(
+         const float * x, const int32_t * ids, void * vy,
+         ggml_type type_src0, int64_t ne00, int64_t s01, int64_t s02, int64_t s03,
+         int64_t ne0, int64_t ne1, int64_t ne2, int64_t ne3, cudaStream_t stream);
+ 
+-void quantize_row_q8_1_cuda(
++cudaError_t quantize_row_q8_1_cuda(
+         const float * x, const int32_t * ids, void * vy,
+         ggml_type type_src0, int64_t ne00, int64_t s01, int64_t s02, int64_t s03,
+         int64_t ne0, int64_t ne1, int64_t ne2, int64_t ne3, cudaStream_t stream);
+ 
+-void quantize_mmq_q8_1_cuda(
++cudaError_t quantize_mmq_q8_1_cuda(
+         const float * x, const int32_t * ids, void * vy,
+         ggml_type type_src0, int64_t ne00, int64_t s01, int64_t s02, int64_t s03,
+         int64_t ne0, int64_t ne1, int64_t ne2, int64_t ne3, cudaStream_t stream);
+ 
+-void quantize_mmq_fp4_cuda(const float *   x,
++cudaError_t quantize_mmq_fp4_cuda(const float *   x,
+                              const int32_t * ids,
+                              void *          vy,
+                              float *         scale,
+@@ -43,7 +43,7 @@
+                              cudaStream_t    stream);
+ 
+ // quantize each token once and scatter the block to its compact rows (via the inverse map)
+-void quantize_scatter_mmq_fp4_cuda(const float *   x,
++cudaError_t quantize_scatter_mmq_fp4_cuda(const float *   x,
+                                    const int32_t * ids_src1_inv,
+                                    void *          vy,
+                                    float *         scale,
+@@ -57,7 +57,7 @@
+                                    int             n_expert_used,
+                                    cudaStream_t    stream);
+ 
+-void quantize_scatter_mmq_q8_1_cuda(const float *   x,
++cudaError_t quantize_scatter_mmq_q8_1_cuda(const float *   x,
+                                     const int32_t * ids_src1_inv,
+                                     void *          vy,
+                                     ggml_type       type_src0,

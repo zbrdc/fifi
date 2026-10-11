@@ -18,14 +18,17 @@ use std::{
 };
 
 use super::tests::{
-    Layout, NMSE_BOUND, Rng, SEED, argmax, assert_same_bytes, assert_scale_words, decode_q4k,
-    decode_q8_0, device_present, download_tiles, meminfo_kb, normalized_mse, q6_quants_from_tiles,
-    q6_quants_of_source, tiled_of, weight_of,
+    Layout, NMSE_BOUND, Rng, SEED, argmax, assert_raw_f32_bytes, assert_same_bytes,
+    assert_scale_words, decode_q4k, decode_q5_0, decode_q8_0, device_present, download_tiles,
+    f16_value, meminfo_kb, normalized_mse, q6_quants_from_tiles, q6_quants_of_source, tiled_of,
+    weight_of,
 };
 use super::*;
 use crate::family::gguf_model::{GgufModel, TensorPath, open_qwen3_6_35b_a3b};
 use crate::family::project::{DenseProjector, DenseWeight};
-use crate::weights::{dequantize, sha256_hex};
+use crate::kernels::cuda::resident::matmul_expert::{ExpertCall, ExpertSelect, ExpertStack};
+use crate::kernels::cuda::{CudaContext, MatmulIo, PackCall, TiledWeight};
+use crate::weights::{GgufLimits, dequantize, sha256_hex};
 
 const MODEL_VAR: &str = "INFERENCE_CUDA_MODEL_GGUF";
 const HEADER_VAR: &str = "INFERENCE_CUDA_MODEL_GGUF_HEADER_SHA256";
@@ -35,10 +38,13 @@ const MEASURE_START_VAR: &str = "INFERENCE_CUDA_MEASURE_MODEL_GGUF_START";
 
 /// The tensor counts and sizes of the Q4_K_M file, in the order of the plan.
 const TILED_COUNT: usize = 432;
-const HOST_COUNT: usize = 301;
+const F32_COUNT: usize = 301;
 const TILED_SOURCE_BYTES: u64 = 20_319_723_520;
-const HOST_SOURCE_BYTES: u64 = 88_852_992;
-const DEVICE_BYTES: usize = 20_347_535_360;
+const F32_SOURCE_BYTES: u64 = 88_852_992;
+const TILED_DEVICE_BYTES: usize = 20_347_535_360;
+/// The tiles plus the F32 tensors, which upload as read (decision 0047 A1).
+const DEVICE_BYTES: usize = 20_436_388_352;
+const _: () = assert!(TILED_DEVICE_BYTES + F32_SOURCE_BYTES as usize == DEVICE_BYTES);
 /// Rows dequantized and multiplied at a time by the dense reference.
 const REFERENCE_CHUNK_ROWS: usize = 4096;
 /// A real tensor above this NMSE is reported before the packet goes on.
@@ -145,32 +151,59 @@ fn live_after_drop(projector: &CudaProjector, start: usize, what: &str) {
 fn assert_plan_totals(model: &GgufModel) {
     let plan = model.plan();
     println!(
-        "PLAN device_tiled={} host_f32={} tiled_source_bytes={} host_source_bytes={}",
+        "PLAN device_tiled={} device_f32={} tiled_source_bytes={} f32_source_bytes={}",
         plan.count(TensorPath::DeviceTiled),
-        plan.count(TensorPath::HostF32),
+        plan.count(TensorPath::DeviceF32),
         plan.source_bytes(TensorPath::DeviceTiled),
-        plan.source_bytes(TensorPath::HostF32)
+        plan.source_bytes(TensorPath::DeviceF32)
     );
     assert_eq!(plan.count(TensorPath::DeviceTiled), TILED_COUNT);
-    assert_eq!(plan.count(TensorPath::HostF32), HOST_COUNT);
+    assert_eq!(plan.count(TensorPath::DeviceF32), F32_COUNT);
     assert_eq!(
         plan.source_bytes(TensorPath::DeviceTiled),
         TILED_SOURCE_BYTES
     );
-    assert_eq!(plan.source_bytes(TensorPath::HostF32), HOST_SOURCE_BYTES);
+    assert_eq!(plan.source_bytes(TensorPath::DeviceF32), F32_SOURCE_BYTES);
+}
+
+/// Every plan tensor is on the device in the form its path names, and every F32 tensor holds
+/// the bytes of the oracle copy `read_host_f32` returns.
+fn assert_kinds_and_f32_bytes(projector: &CudaProjector, model: &GgufModel, device: &CudaWeights) {
+    for (name, path) in model.plan().tensors() {
+        match (path, device.get(name)) {
+            (TensorPath::DeviceTiled, Some(CudaWeight::Tiled { .. }))
+            | (
+                TensorPath::DeviceF32,
+                Some(CudaWeight::Raw {
+                    ty: GgufType::F32, ..
+                }),
+            ) => {}
+            (path, found) => panic!(
+                "{name}: the plan says {path:?}, the load holds {}",
+                found.map_or("nothing", |_| "the other kind")
+            ),
+        }
+    }
+    let oracle = model.read_host_f32().expect("read the oracle F32 tensors");
+    assert_eq!(oracle.len(), F32_COUNT, "oracle tensors");
+    for (name, want) in &oracle {
+        let want: Vec<u8> = want.iter().flat_map(|value| value.to_le_bytes()).collect();
+        assert_raw_f32_bytes(projector, device, name, &want);
+    }
 }
 
 fn assert_loaded_totals(projector: &CudaProjector, loaded: &LoadedModel, start: usize) {
-    assert_eq!(loaded.device.len(), TILED_COUNT, "device tensors");
+    assert_eq!(
+        loaded.device.len(),
+        TILED_COUNT + F32_COUNT,
+        "device tensors"
+    );
     assert_eq!(loaded.device.device_bytes(), DEVICE_BYTES, "device bytes");
     assert_eq!(
         projector.live_bytes() - start,
         DEVICE_BYTES,
         "live bytes added by the load"
     );
-    let host_floats: usize = loaded.host.values().map(Vec::len).sum();
-    assert_eq!(loaded.host.len(), HOST_COUNT, "host tensors");
-    assert_eq!(host_floats as u64 * 4, HOST_SOURCE_BYTES, "host F32 bytes");
     let times = loaded.device.times();
     assert!(times.scan > Duration::ZERO, "the scale scan took no time");
     assert!(times.upload > Duration::ZERO, "the upload took no time");
@@ -194,12 +227,12 @@ fn the_whole_model_loads_and_the_counts_match_the_header() {
         .expect("load the whole model");
     let load_secs = began.elapsed().as_secs_f64();
     assert_loaded_totals(&projector, &loaded, start);
+    assert_kinds_and_f32_bytes(&projector, &model, &loaded.device);
     let times = loaded.device.times();
     let (scan, upload) = (times.scan.as_secs_f64(), times.upload.as_secs_f64());
     println!(
-        "LOAD tensors={} host_tensors={} device_bytes={} live_bytes_delta={} host_bytes={HOST_SOURCE_BYTES}",
+        "LOAD tensors={} f32_tensors={F32_COUNT} device_bytes={} live_bytes_delta={} f32_bytes={F32_SOURCE_BYTES}",
         loaded.device.len(),
-        loaded.host.len(),
         loaded.device.device_bytes(),
         projector.live_bytes() - start
     );
@@ -239,6 +272,12 @@ fn a_refused_whole_model_load_leaves_the_live_bytes_unchanged_and_the_next_load_
     match projector.load_model(&model, refused) {
         Err(EngError::MemoryPlan(text)) => {
             assert!(text.contains("cuda admission"), "refusal text: {text}");
+            println!("REFUSAL {text}");
+            // The admission sum is the tiles plus the F32 tensors (decision 0047 A1).
+            assert!(
+                text.contains(&format!("(tensors {DEVICE_BYTES},")),
+                "refusal text: {text}"
+            );
         }
         Err(other) => panic!("expected MemoryPlan, got {other:?}"),
         Ok(_) => panic!("a headroom of 2^62 bytes was admitted"),
@@ -657,6 +696,252 @@ fn four_real_tensors_have_bit_exact_tiles() {
     }
 }
 
+const MELLUM_VAR: &str = "INFERENCE_CUDA_MODEL_GGUF_MELLUM";
+/// Device bytes of the 14 Mellum `ffn_down_exps` tensors (Q5_0, K = 896).
+const MELLUM_Q5_0_DEVICE_BYTES: u64 = 1_271_660_544;
+
+#[test]
+#[ignore = "real file: needs INFERENCE_CUDA_MODEL_GGUF_MELLUM and a device"]
+fn four_mellum_q5_0_tensors_have_bit_exact_tiles() {
+    const NAME: &str = "four_mellum_q5_0_tensors_have_bit_exact_tiles";
+    let Some(path) = env_path(MELLUM_VAR) else {
+        println!("SKIPPED {NAME}: {MELLUM_VAR} unset");
+        return;
+    };
+    if !device_present(NAME) {
+        return;
+    }
+    let limits = GgufLimits {
+        max_header_bytes: 1 << 26,
+        max_tensor_bytes: 1 << 30,
+    };
+    let weights = GgufWeights::open(&path, limits, None)
+        .unwrap_or_else(|error| panic!("open {}: {error:?}", path.display()));
+    let q5_0_bytes: u64 = weights
+        .header()
+        .tensors()
+        .iter()
+        .filter(|tensor| tensor.ggml_type() == GgufType::Q50)
+        .map(|tensor| plan::device_bytes(tensor.name(), GgufType::Q50, tensor.dims()))
+        .sum::<Result<u64, EngError>>()
+        .expect("every Q5_0 tensor fits the tiles");
+    assert_eq!(q5_0_bytes, MELLUM_Q5_0_DEVICE_BYTES);
+    let projector = CudaProjector::new().expect("create the CUDA projector");
+    for layer in [3, 4, 21, 22] {
+        let name = format!("blk.{layer}.ffn_down_exps.weight");
+        q5_0_bit_exact_case(&projector, &weights, &name);
+    }
+}
+
+fn q5_0_bit_exact_case(projector: &CudaProjector, weights: &GgufWeights, name: &str) {
+    let tensor = weights
+        .header()
+        .tensor(name)
+        .expect("tensor is in the file");
+    assert_eq!(tensor.ggml_type(), GgufType::Q50, "{name}: type");
+    let dims = tensor.dims();
+    let k = usize::try_from(dims[0]).expect("k fits usize");
+    let n_rows = usize::try_from(dims[1..].iter().product::<u64>()).expect("rows fit usize");
+    let start = projector.live_bytes();
+    let loaded = projector
+        .load(weights, &[name], LoadOptions::default())
+        .expect("load the tensor");
+    let tiles = download_tiles(projector, tiled_of(&loaded, name));
+    let (_, source) = weights.read_tensor(name).expect("read the source");
+    let decoded = decode_q5_0(&tiles, Layout::q5_0(n_rows, k / 128));
+    assert_same_bytes(name, &decoded, &source);
+    assert_dequantized_bits_equal(name, GgufType::Q50, k, [&decoded, &source]);
+    println!(
+        "T1 {name} type=Q50 rows={n_rows} k={k} tile_bytes={} bit exact",
+        tiles.len()
+    );
+    drop(loaded);
+    live_after_drop(projector, start, name);
+}
+
+/// Bytes of the fixed fragment-order `xf` buffer a launch of at most 16 tokens uses.
+const XF_FRAGMENT: usize = 1_048_592;
+/// Bytes of one Q5_0 block.
+const Q5_0_BLOCK: usize = 22;
+/// `16 |d|` stays inside the fp16 range (65504) up to this `|d|`.
+const MAX_Q5_0_SCALE: f32 = 4094.0;
+
+/// The Q5_0 `ffn_down_exps` tensors of the file: `(name, largest |d| as fp16 bits)`, read on the
+/// host only. A finite fp16 orders by its magnitude bits, so the largest bits are the largest `|d|`.
+fn q5_0_scale_maxima(weights: &GgufWeights) -> Vec<(String, u16)> {
+    let names: Vec<String> = weights
+        .header()
+        .tensors()
+        .iter()
+        .filter(|tensor| tensor.ggml_type() == GgufType::Q50)
+        .map(|tensor| tensor.name().to_owned())
+        .collect();
+    names
+        .into_iter()
+        .map(|name| {
+            let (_, source) = weights.read_tensor(&name).expect("read the Q5_0 tensor");
+            let top = source
+                .as_chunks::<Q5_0_BLOCK>()
+                .0
+                .iter()
+                .map(|block| u16::from_le_bytes([block[0], block[1]]) & 0x7fff)
+                .max()
+                .expect("a tensor has blocks");
+            (name, top)
+        })
+        .collect()
+}
+
+/// The expert matmul of `expert` as the resident step queues it: the x rows zero-padded to the
+/// 256 grid and packed on a stream, the id on the device, then a wait and a read of `y`.
+fn expert_on_stream(
+    context: &CudaContext,
+    stack: &TiledWeight,
+    experts: usize,
+    expert: i32,
+    x: &[f32],
+) -> Vec<f32> {
+    let (k, rows) = (stack.k(), stack.n_rows() / experts);
+    let k_x = k.next_multiple_of(256);
+    let tokens = x.len() / k;
+    let mut staged = Vec::with_capacity(tokens * k_x);
+    for token in x.chunks_exact(k) {
+        staged.extend_from_slice(token);
+        staged.resize(staged.len() + (k_x - k), 0.0);
+    }
+    let bytes = |values: &[f32]| -> Vec<u8> {
+        values
+            .iter()
+            .flat_map(|value| value.to_le_bytes())
+            .collect()
+    };
+    let stream = context.stream().expect("stream");
+    let x_buffer = context.upload(&bytes(&staged)).expect("upload x");
+    let xf = context.upload(&vec![0xAA; XF_FRAGMENT]).expect("upload xf");
+    let y_bytes = tokens * rows * 4;
+    let y = context.upload(&vec![0xFF; y_bytes]).expect("upload y");
+    let ids = context
+        .upload(&expert.to_le_bytes())
+        .expect("upload the id");
+    let pack = PackCall {
+        x: x_buffer.range(0, staged.len() * 4).expect("x range"),
+        xf: xf.range(0, XF_FRAGMENT).expect("xf range"),
+        m: tokens,
+        k: k_x,
+    };
+    context.pack(&stream, pack).expect("queue the pack");
+    let call = ExpertCall {
+        stack: ExpertStack {
+            weight: stack,
+            experts,
+        },
+        select: ExpertSelect {
+            ids: ids.range(0, 4).expect("ids range"),
+            slot: 0,
+            count: experts,
+        },
+        io: MatmulIo {
+            xf: xf.range(0, XF_FRAGMENT).expect("xf range"),
+            y: y.range(0, y_bytes).expect("y range"),
+            m: tokens,
+        },
+    };
+    context
+        .matmul_expert(&stream, call)
+        .expect("queue the expert");
+    stream.synchronize().expect("drain the stream");
+    let mut out = vec![0u8; y_bytes];
+    context.download(&y, &mut out).expect("download y");
+    out.as_chunks::<4>()
+        .0
+        .iter()
+        .map(|chunk| f32::from_le_bytes(*chunk))
+        .collect()
+}
+
+#[test]
+#[ignore = "real file: needs INFERENCE_CUDA_MODEL_GGUF_MELLUM and a device"]
+fn mellum_q5_0_down_experts_match_the_cpu_reference() {
+    const NAME: &str = "mellum_q5_0_down_experts_match_the_cpu_reference";
+    let Some(path) = env_path(MELLUM_VAR) else {
+        println!("SKIPPED {NAME}: {MELLUM_VAR} unset");
+        return;
+    };
+    if !device_present(NAME) {
+        return;
+    }
+    let limits = GgufLimits {
+        max_header_bytes: 1 << 26,
+        max_tensor_bytes: 1 << 30,
+    };
+    let weights = GgufWeights::open(&path, limits, None)
+        .unwrap_or_else(|error| panic!("open {}: {error:?}", path.display()));
+    // The kernel leaves the fp16 range for |d| > 4094 (no kernel guard); the load checks it too.
+    let maxima = q5_0_scale_maxima(&weights);
+    let (widest, top) = maxima
+        .iter()
+        .max_by_key(|(_, bits)| *bits)
+        .expect("the file has Q5_0 tensors");
+    println!(
+        "Q5_0 scales: {} tensors, max |d| = {} in {widest}",
+        maxima.len(),
+        f16_value(*top)
+    );
+    assert!(
+        *top < 0x7c00 && f16_value(*top) <= MAX_Q5_0_SCALE,
+        "max |d| in {widest}"
+    );
+    let projector = CudaProjector::new().expect("create the CUDA projector");
+    let mut rng = Rng(SEED ^ 0x5d);
+    let mut tally = Tally::default();
+    for layer in [3, 22] {
+        let name = format!("blk.{layer}.ffn_down_exps.weight");
+        let start = projector.live_bytes();
+        let loaded = projector
+            .load(&weights, &[&name], LoadOptions::default())
+            .expect("load the stack");
+        let experts = stack_experts(weight_of(&loaded, &name));
+        for expert in [0u32, 17, 63] {
+            let case = Case {
+                name: name.clone(),
+                expert: Some(expert),
+            };
+            let source = source_of(&weights, &case);
+            let tiled = tiled_of(&loaded, &name);
+            for tokens in [1usize, 8] {
+                let x: Vec<f32> = (0..tokens * source.k).map(|_| rng.unit()).collect();
+                let first = expert as usize * source.rows;
+                let dense = projector
+                    .context
+                    .linear_rows(tiled, first, source.rows, &x)
+                    .expect("linear_rows");
+                let on_stream =
+                    expert_on_stream(&projector.context, tiled, experts, expert.cast_signed(), &x);
+                let reference = reference_outputs(&weights, &source, &x);
+                let labelled = |path: &str| Source {
+                    name: source.name.clone(),
+                    label: format!("{} {path}", source.label),
+                    ..source
+                };
+                check_projection(&labelled("dense"), &dense, &reference, &mut tally);
+                check_projection(&labelled("expert"), &on_stream, &reference, &mut tally);
+                // Equal only while both paths use the same mma884 fragment and reduction order; a
+                // failure is a defect of the kernel, never a reason to widen a bound.
+                let bits = |values: &[f32]| values.iter().map(|v| v.to_bits()).collect::<Vec<_>>();
+                assert_eq!(
+                    bits(&dense),
+                    bits(&on_stream),
+                    "{} m={tokens}: dense against expert",
+                    source.label
+                );
+            }
+        }
+        drop(loaded);
+        live_after_drop(&projector, start, &name);
+    }
+    tally.print();
+}
+
 /// The number on one `Key: <n> kB` line, or `None` when the line is missing or
 /// has no number (`NvMapMemUsed` exists on Jetson only).
 fn meminfo_optional_kb(text: &str, key: &str) -> Option<u64> {
@@ -859,11 +1144,23 @@ fn the_work_bytes_of_the_m17_output_call_are_x_xf_and_y() {
     assert_eq!(linear_work_bytes(17, 2048, 248_320), 17_094_656);
 }
 
-/// The stage split needs the host read and the device load apart, so this test
-/// does not call `load_model`. It makes the same two calls in the same order
-/// (`read_host_f32`, then `load` of the plan's tiled names), which is
-/// equivalence by reading, not by test: a change to `load_model` alone is not
-/// caught here. The whole-model test checks the results of `load_model`.
+const MEASURE_HEADROOM_VAR: &str = "INFERENCE_CUDA_MEASURE_MODEL_GGUF_HEADROOM_BYTES";
+
+/// INFERENCE_CUDA_MEASURE_MODEL_GGUF_HEADROOM_BYTES: the headroom the load admits
+/// with, in bytes. Unset means 0; anything that is not a `u64` fails the run.
+fn measure_headroom_bytes() -> u64 {
+    match std::env::var(MEASURE_HEADROOM_VAR) {
+        Err(std::env::VarError::NotPresent) => 0,
+        Ok(text) => text
+            .parse()
+            .unwrap_or_else(|_| panic!("{MEASURE_HEADROOM_VAR} must be a u64, got {text:?}")),
+        Err(error) => panic!("{MEASURE_HEADROOM_VAR}: {error}"),
+    }
+}
+
+/// One `load_model` between the `after_open` and `after_load` stages. The F32 tensors are
+/// inside that load since decision 0047 A1, so `U`, `free_after_load` and `alloc_overhead`
+/// of the summary line are the numbers to compare with the run before A1.
 #[test]
 #[ignore = "real file: needs INFERENCE_CUDA_MEASURE_MODEL_GGUF and a device with 20 GiB free"]
 fn measure_model_load_headroom() {
@@ -884,21 +1181,28 @@ fn measure_model_load_headroom() {
     let model = open_qwen3_6_35b_a3b(&path, None)
         .unwrap_or_else(|error| panic!("open {}: {error:?}", path.display()));
     meter.stage("after_open");
-    let host = model.read_host_f32().expect("read the host tensors");
-    meter.stage("after_host");
     let options = LoadOptions {
+        reserve: Reserve {
+            headroom: measure_headroom_bytes(),
+            ..Reserve::default()
+        },
         drop_page_cache: drops.then_some(&file),
-        ..options_without_headroom()
     };
     let device = projector
-        .load(&model.weights, &model.plan().tiled_names(), options)
-        .expect("load the tiled tensors");
+        .load_model(&model, options)
+        .expect("load the whole model")
+        .device;
+    println!(
+        "POLICY integrated={} oom_retries={}",
+        projector.integrated(),
+        projector.oom_retries()
+    );
     let loaded = meter.stage("after_load");
     assert_eq!(loaded.live_bytes - start.live_bytes, device.device_bytes());
     assert_eq!(device.device_bytes(), DEVICE_BYTES, "device bytes");
     let work_bytes = largest_projection(&projector, &device);
     meter.stage("after_linear");
-    drop((device, host));
+    drop(device);
     let released = meter.stage("after_release");
     assert_eq!(
         released.live_bytes, start.live_bytes,

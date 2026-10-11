@@ -1,14 +1,19 @@
 //! Raw FFI to the CUDA adapter in `native/smoke.cu` and `native/projector.cu`.
 //!
-//! This is the only file in the CUDA module that may contain `unsafe`. Its
-//! functions are private to the CUDA module. Each one checks every length and
-//! shape the native side relies on for memory safety before the native call.
-//! Callers hold the dispatch guard (`super::guard`) around every call.
+//! `unsafe` and `extern "C"` live only in this file and its child modules
+//! (`native/resident.rs`, `native/device_info.rs`), per decision 0047. Each
+//! child module starts with a doc that lists its safety invariants. Functions here are private to the CUDA
+//! module. Each one checks every length and shape the native side relies on for
+//! memory safety before the native call. Callers hold the dispatch guard
+//! (`super::guard`) around every call.
 
 #![allow(unsafe_code)]
 
 use std::ffi::{CStr, c_char, c_int, c_void};
 use std::ptr::NonNull;
+
+pub(super) mod device_info;
+pub(super) mod resident;
 
 /// Matches `INFERENCE_CUDA_OK` in `native/abi.h`.
 pub(super) const STATUS_OK: c_int = 0;
@@ -24,7 +29,7 @@ pub(super) const STAGE_SYNCHRONIZE: c_int = 4;
 
 /// Rows and columns of one tile of the vendored `mma884` layout.
 pub(super) const TILE_ROWS: usize = 8;
-const TILE_COLS: usize = 256;
+pub(super) const TILE_COLS: usize = 256;
 /// `kern::kMaxK`: the longest row and the largest batch the matmul accepts.
 pub(super) const MAX_DIM: usize = 32768;
 
@@ -49,6 +54,9 @@ pub(super) enum TiledType {
     Q4K,
     Q6K,
     Q80,
+    /// Built on the host by `context::tile_q5_0`; the matmul is the own kernel of
+    /// `native/resident/matmul_q5_0.cu` (MEL-C1b), not a vendored one.
+    Q50,
 }
 
 impl TiledType {
@@ -58,6 +66,29 @@ impl TiledType {
             Self::Q4K => 12,
             Self::Q6K => 14,
             Self::Q80 => 8,
+            // Passed only to `inference_cuda_linear_ws`; the vendored repack and matmul entries
+            // refuse it, and `repack` below refuses it before the call.
+            Self::Q50 => 6,
+        }
+    }
+
+    /// Values per row of one tile: 256 for the vendored tiles, 128 for Q5_0
+    /// (its K = 896 rows are not a multiple of 256).
+    pub(super) fn tile_cols(self) -> usize {
+        match self {
+            Self::Q50 => 128,
+            Self::Q4K | Self::Q6K | Self::Q80 => TILE_COLS,
+        }
+    }
+
+    /// Source bytes of one row inside one tile: the ggml blocks of
+    /// [`Self::tile_cols`] values.
+    pub(super) fn row_tile_bytes(self) -> usize {
+        match self {
+            Self::Q4K => 144,
+            Self::Q6K => 210,
+            Self::Q80 => 8 * 34,
+            Self::Q50 => 4 * 22,
         }
     }
 
@@ -68,15 +99,18 @@ impl TiledType {
             Self::Q4K => 144,
             Self::Q6K => 210,
             Self::Q80 => 8 * 34,
+            Self::Q50 => 8 * 22,
         }
     }
 
-    /// `mma884::{Q4_K,Q6_K,Q8_0}::kTileVecs`: 16-byte vectors per 8 x 256 tile.
+    /// 16-byte vectors per tile: `mma884::{Q4_K,Q6_K,Q8_0}::kTileVecs` for the
+    /// 8 x 256 tiles, 44 (704 bytes) for the 8 x 128 Q5_0 tile.
     pub(super) fn tile_vecs(self) -> usize {
         match self {
             Self::Q4K => 72,
             Self::Q6K => 112,
             Self::Q80 => 136,
+            Self::Q50 => 44,
         }
     }
 }
@@ -96,21 +130,21 @@ impl Tiled {
             && self.n_rows.is_multiple_of(TILE_ROWS)
             && c_int::try_from(self.n_rows).is_ok()
             && self.k > 0
-            && self.k.is_multiple_of(TILE_COLS)
+            && self.k.is_multiple_of(self.ty.tile_cols())
             && self.k <= MAX_DIM
     }
 
     /// Bytes of the ggml blocks the shape holds, or `None` on overflow.
     pub(super) fn source_bytes(&self) -> Option<usize> {
         self.n_rows
-            .checked_mul(self.k / TILE_COLS)?
-            .checked_mul(self.ty.bytes_per_256())
+            .checked_mul(self.k / self.ty.tile_cols())?
+            .checked_mul(self.ty.row_tile_bytes())
     }
 
     /// Tile vectors of the repacked shape, or `None` on overflow.
     pub(super) fn tile_vecs(&self) -> Option<usize> {
         (self.n_rows / TILE_ROWS)
-            .checked_mul(self.k / TILE_COLS)?
+            .checked_mul(self.k / self.ty.tile_cols())?
             .checked_mul(self.ty.tile_vecs())
     }
 
@@ -160,6 +194,18 @@ impl TileVec {
         // the slice covers `16 * len` initialized bytes for its lifetime.
         unsafe {
             std::slice::from_raw_parts(vecs.as_ptr().cast::<u8>(), std::mem::size_of_val(vecs))
+        }
+    }
+
+    /// Views tile vectors as their bytes, writable.
+    pub(super) fn as_bytes_mut(vecs: &mut [Self]) -> &mut [u8] {
+        // SAFETY: as in `as_bytes`; the exclusive borrow of `vecs` passes to
+        // the returned slice, and every byte pattern is a valid `[u8; 16]`.
+        unsafe {
+            std::slice::from_raw_parts_mut(
+                vecs.as_mut_ptr().cast::<u8>(),
+                std::mem::size_of_val(vecs),
+            )
         }
     }
 }
@@ -496,14 +542,50 @@ pub(super) fn drop_page_cache(
     }
 }
 
+/// `kern::kMaxTokens`: up to this many tokens the matmul reads a fragment-order `xf`.
+const FRAGMENT_TOKENS: usize = 16;
+/// `kern::xf_vecs() * sizeof(uint4)`: the fixed size of a fragment-order `xf`.
+const XF_FRAGMENT_BYTES: usize = 65_537 * 16;
+
+/// Bytes of the fp16 input buffer `xf` for `tokens` tokens of `k` values: the
+/// fixed fragment-order buffer up to 16 tokens, else row-major halves. This is
+/// the one owner of the rule on the Rust side; the adapter repeats it in
+/// `linear_needs` (`native/projector.cu`) and a test pins that they agree.
+/// Returns `None` when the byte count overflows.
+pub(crate) fn xf_bytes(tokens: usize, k: usize) -> Option<usize> {
+    if tokens <= FRAGMENT_TOKENS {
+        return Some(XF_FRAGMENT_BYTES);
+    }
+    tokens.checked_mul(k)?.checked_mul(size_of::<u16>())
+}
+
+/// Bytes of the f32 input `x` and of `xf` for a pack of `tokens` tokens of `k`
+/// values, or `None` on overflow.
+pub(super) fn pack_bytes(tokens: usize, k: usize) -> Option<(usize, usize)> {
+    let x = tokens.checked_mul(k)?.checked_mul(size_of::<f32>())?;
+    Some((x, xf_bytes(tokens, k)?))
+}
+
+/// Values per token row that the activation regions of a call hold. A Q5_0 weight (K = 896 is no
+/// multiple of 256) reads the vendored fragment-order `xf` of a row rounded up to the 256 grid,
+/// whose tail is zero (MEL-C1b, kernel contract); every other type uses its own `k`. Pass this
+/// width, not `tiled.k`, to [`activation_bytes`] and to the pack of a Q5_0 call.
+pub(super) fn activation_k(ty: TiledType, k: usize) -> usize {
+    match ty {
+        TiledType::Q50 => k.checked_next_multiple_of(TILE_COLS).unwrap_or(k),
+        TiledType::Q4K | TiledType::Q6K | TiledType::Q80 => k,
+    }
+}
+
 /// The bytes the x, xf and y regions of a call with `tokens` tokens need.
-/// Host only: the adapter owns the xf size rule. Returns the native status
-/// for a shape the matmul cannot run.
+/// Host only. The adapter checks the shape and sizes x and y; `xf` comes from
+/// [`xf_bytes`]. Returns the native status for a shape the matmul cannot run.
 pub(super) fn activation_bytes(
     n_rows: usize,
     k: usize,
     tokens: usize,
 ) -> Result<Activations, c_int> {
+    let xf = xf_bytes(tokens, k).ok_or(STATUS_INVALID_ARGUMENT)?;
     let (Ok(n_rows), Ok(k), Ok(m)) = (
         c_int::try_from(n_rows),
         c_int::try_from(k),
@@ -517,7 +599,9 @@ pub(super) fn activation_bytes(
     let status =
         unsafe { workspace_bytes_raw(m, k, n_rows, &mut bytes.x, &mut bytes.xf, &mut bytes.y) };
     if status == STATUS_OK {
-        Ok(bytes)
+        // The adapter repeats the rule `xf_bytes` owns; a drift shows in debug builds.
+        debug_assert_eq!(bytes.xf, xf, "the adapter and xf_bytes disagree on xf");
+        Ok(Activations { xf, ..bytes })
     } else {
         Err(status)
     }
@@ -640,6 +724,10 @@ pub(super) fn free(device: RawDevice) -> Result<(), DeviceFailure> {
 /// `src` must hold exactly the blocks of the shape and `dst` exactly its tile
 /// vectors. Returns the native status on failure; no CUDA call is made.
 pub(super) fn repack(tiled: Tiled, src: &[u8], dst: &mut [TileVec]) -> Result<(), c_int> {
+    // The vendored repack has no Q5_0 entry; `context::tile_q5_0` repacks it on the host.
+    if tiled.ty == TiledType::Q50 {
+        return Err(STATUS_INVALID_ARGUMENT);
+    }
     let (n_rows, k) = tiled.native_dims().ok_or(STATUS_INVALID_ARGUMENT)?;
     if tiled.source_bytes() != Some(src.len()) || tiled.tile_vecs() != Some(dst.len()) {
         return Err(STATUS_INVALID_ARGUMENT);
@@ -673,6 +761,10 @@ pub(super) fn repack(tiled: Tiled, src: &[u8], dst: &mut [TileVec]) -> Result<()
 /// a multiple of 16 bytes, because the matmul reads 16-byte vectors, and the
 /// tiles of `tiled` must end inside the allocation. The regions of `work` must
 /// hold the call (see [`Work`]); otherwise the call fails before the adapter.
+///
+/// A Q5_0 weight takes at most `MAX_DENSE_TOKENS` (16) tokens: the adapter refuses more, and a
+/// native refusal latches the backend terminal, so the caller (`context::token_count`) must
+/// have refused it as a `BadRequest` first. Debug builds assert the precondition.
 pub(super) fn linear(
     tiled: Tiled,
     weight: DeviceView<'_>,
@@ -683,6 +775,10 @@ pub(super) fn linear(
     let (n_rows, k) = tiled.native_dims().ok_or_else(invalid_argument)?;
     let tokens = x.len() / tiled.k;
     let m = c_int::try_from(tokens).map_err(|_| invalid_argument())?;
+    debug_assert!(
+        tiled.ty != TiledType::Q50 || tokens <= resident::matmul_q5_0::MAX_DENSE_TOKENS,
+        "a Q5_0 linear takes at most 16 tokens; context::token_count refuses more first"
+    );
     let tile_bytes = tiled.tile_vecs().and_then(|vecs| vecs.checked_mul(16));
     let in_range = tile_bytes
         .and_then(|bytes| bytes.checked_add(weight.offset))
@@ -695,7 +791,8 @@ pub(super) fn linear(
     if !shapes_match {
         return Err(invalid_argument());
     }
-    let need = activation_bytes(tiled.n_rows, tiled.k, tokens).map_err(|_| invalid_argument())?;
+    let need = activation_bytes(tiled.n_rows, activation_k(tiled.ty, tiled.k), tokens)
+        .map_err(|_| invalid_argument())?;
     let workspace = workspace_raw(&work, need).ok_or_else(invalid_argument)?;
     let mut stage = STAGE_NONE;
     // SAFETY: the checks above keep the `weight.offset` bytes before the tiles
@@ -1016,6 +1113,54 @@ mod tests {
                 Err(STATUS_INVALID_ARGUMENT),
                 "{n_rows} x {k} x {tokens}"
             );
+        }
+    }
+
+    #[test]
+    fn xf_bytes_is_one_fixed_buffer_up_to_sixteen_tokens_then_row_major_halves() {
+        assert_eq!(xf_bytes(1, 256), Some(1_048_592));
+        assert_eq!(xf_bytes(16, 32768), Some(1_048_592), "sixteen: still fixed");
+        assert_eq!(xf_bytes(17, 256), Some(8_704), "seventeen: 17 * 256 halves");
+        assert_eq!(xf_bytes(17, 32768), Some(1_114_112));
+        assert_eq!(xf_bytes(usize::MAX, 2), None, "the byte count overflows");
+        assert_eq!(pack_bytes(17, 256), Some((17_408, 8_704)));
+        assert_eq!(pack_bytes(usize::MAX, 2), None);
+    }
+
+    /// Host only: a Q5_0 call sizes its activation regions on the 256 grid (the xf of K = 896 is
+    /// 1024 wide with a zero tail), and no other type changes width.
+    #[test]
+    fn q5_0_activation_width_rounds_to_the_256_grid() {
+        assert_eq!(activation_k(TiledType::Q50, 896), 1024);
+        assert_eq!(activation_k(TiledType::Q50, 128), 256);
+        assert_eq!(activation_k(TiledType::Q50, 1024), 1024);
+        for ty in [TiledType::Q4K, TiledType::Q6K, TiledType::Q80] {
+            assert_eq!(activation_k(ty, 896), 896, "{ty:?}");
+            assert_eq!(activation_k(ty, 256), 256, "{ty:?}");
+        }
+    }
+
+    /// Host only: the adapter's query touches no device. The Rust rule and the C
+    /// rule it repeats must give the same bytes, because `pack` zeroes the size
+    /// the C rule gives while the callers check a range against `xf_bytes`.
+    #[test]
+    fn the_rust_xf_rule_agrees_with_the_adapter() {
+        for tokens in [1usize, 2, 15, 16, 17, 18, 64, 32768] {
+            for k in [256usize, 4096, 32768] {
+                let (m, c_k) = (
+                    c_int::try_from(tokens).expect("small"),
+                    c_int::try_from(k).expect("small"),
+                );
+                let mut bytes = Activations::default();
+                // SAFETY: the three out pointers address live, writable usize
+                // values for the call; the call touches no device.
+                let status = unsafe {
+                    workspace_bytes_raw(m, c_k, 8, &mut bytes.x, &mut bytes.xf, &mut bytes.y)
+                };
+                assert_eq!(status, STATUS_OK, "{tokens} tokens, k {k}");
+                assert_eq!(Some(bytes.xf), xf_bytes(tokens, k), "{tokens} x {k}");
+                assert_eq!(Some((bytes.x, bytes.xf)), pack_bytes(tokens, k));
+            }
         }
     }
 

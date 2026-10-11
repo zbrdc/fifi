@@ -22,12 +22,13 @@ use crate::EngError;
 
 /// Tensor types the CUDA path loads. Q4_K, Q6_K and Q8_0 hold the matrices; F32
 /// and F16 hold norms and small tables.
-const SUPPORTED_TYPES: [GgufType; 5] = [
+const SUPPORTED_TYPES: [GgufType; 6] = [
     GgufType::F32,
     GgufType::F16,
     GgufType::Q4K,
     GgufType::Q6K,
     GgufType::Q80,
+    GgufType::Q50,
 ];
 
 /// Size limits checked before anything large is allocated.
@@ -83,6 +84,13 @@ impl GgufWeights {
 
     pub(crate) fn header(&self) -> &GgufHeader {
         &self.header
+    }
+
+    /// The open checkpoint file. The CUDA loader drops its page cache; the handle
+    /// is read-only.
+    #[cfg(all(feature = "native-cuda", target_os = "linux"))]
+    pub(crate) fn file(&self) -> &File {
+        &self.file
     }
 
     /// Reads one tensor's raw payload into a new buffer of exactly its length.
@@ -331,6 +339,21 @@ mod tests {
                 assert!(same, "{name}[{i}]: {got:?} != {want:?}");
             }
         }
+    }
+
+    #[test]
+    fn a_q5_0_tensor_opens_and_reads_back_its_blocks() {
+        // Two blocks of 22 bytes with distinct bytes.
+        let blocks: Vec<u8> = (0..44u8)
+            .map(|i| i.wrapping_mul(5).wrapping_add(1))
+            .collect();
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = write(&dir, &gguf(&[], &[entry("q5", GgufType::Q50, &blocks)]));
+        let weights = GgufWeights::open(&path, LIMITS, None).expect("Q5_0 opens");
+        let (ty, bytes) = weights.read_tensor("q5").expect("read");
+        assert_eq!(ty, GgufType::Q50);
+        assert_eq!(bytes, blocks);
+        assert_eq!(dequantize(ty, &bytes).expect("decode").len(), 64);
     }
 
     #[test]

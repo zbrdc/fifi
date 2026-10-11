@@ -1,0 +1,179 @@
+//! The launches of one decode token as DATA (decision 0047, packet RD-9d): the order in which the
+//! resident step queues its kernels, written once so the CPU tests can check it against the phase
+//! table of `step_plan.rs`. Pure host code.
+//!
+//! One token is: `step_begin`, the embedding, for every layer the mixer block (RD-9b) and the MoE
+//! block (RD-9c), the final norm, the `lm_head` projection, `argmax`, `step_advance`. The device
+//! runner executes the list op by op; the same list is what a graph capture records (RD-11a), so
+//! eager and captured runs share one order.
+//!
+//! # The residual stream
+//!
+//! Two buffers alternate. The embedding writes `ResidA`. Layer `l` reads the residual from
+//! `resid_in(l)`; its mixer block adds its output into that buffer in place; its MoE block writes
+//! the layer output into `resid_out(l)`, the other buffer, which is `resid_in(l + 1)`. The final
+//! norm reads `final_resid`.
+//!
+//! # Poisoned step words
+//!
+//! The words `pos`, `kv_len` and `kv_slot` are read by a fixed set of kernels
+//! ([`POS_WORD_READERS`]). Each range-checks the word before it touches memory and has a merged
+//! test that runs the poisoned word (the poison-consumer rule of the stage 1 plan). This packet
+//! adds no reader: the embedding reads `token_id` only, and its own bad-id path (NaN row and
+//! status mask 4) belongs to RD-4c.
+//!
+//! Design guidance only, no code copied.
+
+use super::step_plan::{Phase, Slot, writes_status};
+use crate::family::AttentionKind;
+
+/// One launch group of the token.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum StepOp {
+    /// `step_begin`: clears `status`, flags an invalid step state with mask 4.
+    Begin,
+    /// RD-4c: the embedding row of `token_id` into `ResidA`.
+    Embed,
+    /// RD-9b `run_block` of the layer: residual to the MoE input.
+    Mixer(usize),
+    /// RD-9c `run_moe_block` of the layer: MoE input to the layer output.
+    Moe(usize),
+    /// RD-4a: the output norm of the last residual, packed for `lm_head`.
+    FinalNorm,
+    /// The vendored Q6_K projection into the logits row.
+    LmHead,
+    /// RD-4d: greedy argmax, the result pair, the LAST status writer.
+    Argmax,
+    /// RD-4d: `pos`, `kv_len` and `kv_slot` move on by one; the last kernel.
+    Advance,
+}
+
+/// The ops of one token for a model of `layers` layers, in queue order.
+pub(super) fn token_ops(layers: usize) -> Vec<StepOp> {
+    let mut ops = vec![StepOp::Begin, StepOp::Embed];
+    for layer in 0..layers {
+        ops.push(StepOp::Mixer(layer));
+        ops.push(StepOp::Moe(layer));
+    }
+    ops.extend([
+        StepOp::FinalNorm,
+        StepOp::LmHead,
+        StepOp::Argmax,
+        StepOp::Advance,
+    ]);
+    ops
+}
+
+impl StepOp {
+    /// The phases of `step_plan.rs` the op runs through, in order. A mixer block runs the phases
+    /// of its layer kind.
+    pub(super) fn phases(self, kind: AttentionKind) -> Vec<Phase> {
+        match self {
+            Self::Begin => vec![Phase::StepBegin],
+            Self::Embed => vec![Phase::Embed],
+            Self::Mixer(_) if kind == AttentionKind::DeltaNet => vec![
+                Phase::MixPack,
+                Phase::DeltaIn,
+                Phase::DeltaConv,
+                Phase::DeltaRule,
+                Phase::DeltaPack,
+                Phase::DeltaOut,
+                Phase::AddNorm,
+            ],
+            Self::Mixer(_) => vec![
+                Phase::MixPack,
+                Phase::AttnIn,
+                Phase::AttnPrep,
+                Phase::AttnCore,
+                Phase::AttnPack,
+                Phase::AttnOut,
+                Phase::AddNorm,
+            ],
+            Self::Moe(_) => vec![
+                Phase::Route,
+                Phase::GateUp,
+                Phase::Swiglu,
+                Phase::Down,
+                Phase::Combine,
+            ],
+            Self::FinalNorm => vec![Phase::FinalNorm],
+            Self::LmHead => vec![Phase::LmHead],
+            Self::Argmax => vec![Phase::Argmax],
+            Self::Advance => vec![Phase::Advance],
+        }
+    }
+
+    /// Whether any kernel of the op writes the status word, from `step_plan.rs`'s table.
+    pub(super) fn writes_status(self, kind: AttentionKind) -> bool {
+        self.phases(kind).into_iter().any(writes_status)
+    }
+
+    /// The layer of a mixer or MoE op.
+    pub(super) fn layer(self) -> Option<usize> {
+        match self {
+            Self::Mixer(layer) | Self::Moe(layer) => Some(layer),
+            _ => None,
+        }
+    }
+}
+
+/// The buffer layer `layer` reads its residual from (the embedding wrote layer 0's).
+pub(super) fn resid_in(layer: usize) -> Slot {
+    if layer.is_multiple_of(2) {
+        Slot::ResidA
+    } else {
+        Slot::ResidB
+    }
+}
+
+/// The buffer the MoE block of `layer` writes the layer output into.
+pub(super) fn resid_out(layer: usize) -> Slot {
+    resid_in(layer + 1)
+}
+
+/// The buffer the final norm reads after `layers` layers.
+pub(super) fn final_resid(layers: usize) -> Slot {
+    match layers.checked_sub(1) {
+        Some(last) => resid_out(last),
+        None => Slot::ResidA,
+    }
+}
+
+/// One kernel that reads or writes a step word of the position family, and the merged test that
+/// runs it on a poisoned word.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) struct PosReader {
+    pub(super) kernel: &'static str,
+    pub(super) words: &'static str,
+    /// Repository path of the test file, relative to `engine/src/kernels/cuda/resident/`.
+    pub(super) test_file: &'static str,
+    pub(super) test: &'static str,
+}
+
+/// Every kernel of the step that touches `pos`, `kv_len` or `kv_slot`.
+pub(super) const POS_WORD_READERS: [PosReader; 4] = [
+    PosReader {
+        kernel: "step_begin",
+        words: "pos kv_len kv_slot",
+        test_file: "step_params/tests.rs",
+        test: "step_begin_clears_the_status_and_flags_a_bad_state",
+    },
+    PosReader {
+        kernel: "attn_prep",
+        words: "pos",
+        test_file: "attn_prep/tests.rs",
+        test: "a_poisoned_position_word_writes_nothing_and_reports_mask_4",
+    },
+    PosReader {
+        kernel: "attn_decode",
+        words: "kv_len",
+        test_file: "attn_decode/tests.rs",
+        test: "attn_decode_marks_an_invalid_kv_len_with_nan",
+    },
+    PosReader {
+        kernel: "step_advance",
+        words: "pos kv_len kv_slot",
+        test_file: "step_params/tests.rs",
+        test: "step_advance_adds_m_and_keeps_kv_len_one_ahead",
+    },
+];

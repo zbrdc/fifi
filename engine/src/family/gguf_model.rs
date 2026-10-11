@@ -13,7 +13,8 @@ use std::{
     path::{Path, PathBuf},
 };
 
-use self::inventory::{ExpectedTensor, Inventory};
+use self::inventory::ExpectedTensor;
+pub(crate) use self::inventory::Inventory;
 use super::{FamilySpec, QWEN3_6_35B_A3B};
 use crate::{
     EngError,
@@ -24,6 +25,8 @@ mod inventory;
 #[cfg(test)]
 mod tests;
 
+#[cfg(all(feature = "native-cuda", target_os = "linux"))]
+pub(crate) use inventory::Role;
 pub use inventory::TensorPath;
 
 /// `general.architecture` of the llama.cpp conversion of Qwen3.6-35B-A3B.
@@ -70,11 +73,12 @@ impl GgufModel {
         &self.path
     }
 
-    /// Reads every `HostF32` tensor of the plan; F32 is copied as is.
+    /// Reads every `DeviceF32` tensor of the plan to the host; F32 is copied as is. This is the
+    /// oracle copy of the tensors that also sit on the device; the CUDA load does not call it.
     pub fn read_host_f32(&self) -> Result<HashMap<String, Vec<f32>>, EngError> {
         let mut host = HashMap::new();
         for (name, path) in self.plan.tensors() {
-            if path != TensorPath::HostF32 {
+            if path != TensorPath::DeviceF32 {
                 continue;
             }
             let (ty, bytes) = self.weights.read_tensor(name)?;
@@ -114,11 +118,10 @@ impl ModelPlan {
             .sum()
     }
 
-    /// Names of the `DeviceTiled` tensors, in inventory order.
-    pub fn tiled_names(&self) -> Vec<&str> {
+    /// Names of every tensor of the plan, in inventory order: each one goes to the device.
+    pub fn device_names(&self) -> Vec<&str> {
         self.tensors
             .iter()
-            .filter(|tensor| tensor.path == TensorPath::DeviceTiled)
             .map(|tensor| tensor.name.as_str())
             .collect()
     }

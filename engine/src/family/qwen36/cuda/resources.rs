@@ -1,0 +1,315 @@
+//! What the resident step owns for a session and the weights it resolves beyond the mixers
+//! (decision 0047, packet RD-9d): the arena of one row, the layer table, the shapes of the MoE,
+//! embedding and head weights, and the lookups that turn them into typed weights.
+//!
+//! The shapes are pure host arithmetic from `StepDims` (no model number is written here) and are
+//! tested on the CPU. The lookups read `CudaWeights` and are covered by the scratch device run.
+//!
+//! One row only: the MoE block takes `m = 1` (lane C, RD-9c C-L7), so the plan, the arena and every
+//! launch of the step are made for [`STEP_ROWS`] row.
+//!
+//! Design guidance only, no code copied.
+
+use super::{
+    dims::{StepDims, StepOptions},
+    layer_table::LayerTable,
+    mixer_geometry::{DenseSpec, MixerGeometry, check_dense},
+    moe::{MoeDims, MoeLayerWeights},
+    step_plan::{KernelScratch, StepPlan},
+};
+use crate::{
+    EngError,
+    family::{
+        gguf_model::{Inventory, Role},
+        project::cuda::{CudaWeight, CudaWeights},
+    },
+    kernels::cuda::{
+        CudaContext, DeviceArena, DeviceBuffer, TiledWeight, resident::matmul_expert::ExpertStack,
+    },
+    weights::GgufType,
+};
+
+/// Rows of one decode step: the MoE block takes one row.
+pub(super) const STEP_ROWS: usize = 1;
+const F32: usize = size_of::<f32>();
+
+/// The bytes of `values` f32 values, refused (not wrapped) when the byte count overflows a
+/// `usize`: an unchecked `values * F32` would wrap and silently match a wrapped size.
+pub(super) fn f32_bytes(values: usize) -> Result<usize, EngError> {
+    values
+        .checked_mul(F32)
+        .ok_or_else(|| EngError::BadRequest(format!("{values} f32 values do not fit a byte count")))
+}
+
+/// The shape of a stacked expert weight: `experts` matrices of `rows` rows of `k` values.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) struct StackSpec {
+    pub(super) experts: usize,
+    pub(super) rows: usize,
+    pub(super) k: usize,
+}
+
+/// The shapes of the weights the MoE block reads.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) struct MoeSpecs {
+    /// f32 values of `ffn_gate_inp` and of `ffn_gate_inp_shexp`.
+    pub(super) router_values: usize,
+    pub(super) shexp_values: usize,
+    pub(super) gate: StackSpec,
+    pub(super) up: StackSpec,
+    pub(super) down: StackSpec,
+    pub(super) shared_gate: DenseSpec,
+    pub(super) shared_up: DenseSpec,
+    pub(super) shared_down: DenseSpec,
+}
+
+impl MoeSpecs {
+    pub(super) fn new(dims: &StepDims) -> Result<Self, EngError> {
+        let (h, m) = (dims.shape.hidden, &dims.shape.moe);
+        let router_values = m.experts.checked_mul(h).ok_or_else(|| {
+            EngError::Checkpoint("moe specs: the router size overflows".to_owned())
+        })?;
+        let stack = |rows, k| StackSpec {
+            experts: m.experts,
+            rows,
+            k,
+        };
+        let dense = |role, rows, k| DenseSpec { role, rows, k };
+        Ok(Self {
+            router_values,
+            shexp_values: h,
+            gate: stack(m.inter, h),
+            up: stack(m.inter, h),
+            down: stack(h, m.inter),
+            shared_gate: dense(Role::FfnGateShexp, m.shared_inter, h),
+            shared_up: dense(Role::FfnUpShexp, m.shared_inter, h),
+            shared_down: dense(Role::FfnDownShexp, h, m.shared_inter),
+        })
+    }
+}
+
+/// The dimensions RD-9c's block takes, from the layout record, for the one row of the step.
+pub(super) fn moe_dims(dims: &StepDims) -> MoeDims {
+    MoeDims::new(dims, STEP_ROWS)
+}
+
+/// Refuses a stacked weight whose rows, length or stack depth differ from `want`. `have` is the
+/// tile's total rows, its `k` and its stack depth.
+pub(super) fn check_stack(
+    name: &str,
+    have: (usize, usize, Option<usize>),
+    want: &StackSpec,
+) -> Result<(), EngError> {
+    let (rows, k, experts) = have;
+    let total = want.experts.checked_mul(want.rows);
+    if experts != Some(want.experts) || Some(rows) != total || k != want.k {
+        return Err(EngError::Checkpoint(format!(
+            "moe weights: {name} is {rows} rows of {k} (stack {experts:?}), the step needs {} experts of {} rows of {}",
+            want.experts, want.rows, want.k
+        )));
+    }
+    Ok(())
+}
+
+/// The shapes of the embedding table, the output head and the output norm.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) struct GlobalSpecs {
+    pub(super) embed: DenseSpec,
+    pub(super) head: DenseSpec,
+    /// f32 values of `output_norm`.
+    pub(super) norm_values: usize,
+}
+
+impl GlobalSpecs {
+    pub(super) fn new(dims: &StepDims) -> Self {
+        let (h, v) = (dims.shape.hidden, dims.shape.vocab);
+        Self {
+            embed: DenseSpec {
+                role: Role::TokenEmbd,
+                rows: v,
+                k: h,
+            },
+            head: DenseSpec {
+                role: Role::Output,
+                rows: v,
+                k: h,
+            },
+            norm_values: h,
+        }
+    }
+}
+
+/// The GGUF names of the three tensors that belong to no layer.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) struct GlobalNames {
+    pub(super) embed: String,
+    pub(super) head: String,
+    pub(super) norm: String,
+}
+
+impl GlobalNames {
+    pub(super) fn new(inventory: &Inventory) -> Result<Self, EngError> {
+        let find = |role: Role| {
+            inventory
+                .tensors()
+                .iter()
+                .find(|t| t.role == role)
+                .map(|t| t.name.clone())
+                .ok_or_else(|| EngError::Checkpoint(format!("the inventory has no {role:?}")))
+        };
+        Ok(Self {
+            embed: find(Role::TokenEmbd)?,
+            head: find(Role::Output)?,
+            norm: find(Role::OutputNorm)?,
+        })
+    }
+}
+
+/// Refuses the session options stage 1 cannot run before anything is planned or allocated.
+/// `forked_experts` makes the plan allocate one `XfDown` slot per routed expert
+/// (`step_plan.rs`), while the step launches the single `Slot::XfDown(0)` pack of the unforked
+/// plan: accepting it would silently compute a wrong result. Per-expert `XfDown` slots are a
+/// stage-2 item (stage 1b, branch streams), so the option is refused with a typed error.
+pub(super) fn check_stage1_options(options: &StepOptions) -> Result<(), EngError> {
+    if options.forked_experts {
+        return Err(EngError::BadRequest(
+            "forked_experts is refused in stage 1: the step launches the single XfDown pack, \
+             and per-expert XfDown slots are a stage-2 item"
+                .to_owned(),
+        ));
+    }
+    Ok(())
+}
+
+/// Everything a session builds once and the step borrows.
+pub(super) struct StepResources {
+    pub(super) dims: StepDims,
+    pub(super) plan: StepPlan,
+    pub(super) arena: DeviceArena,
+    pub(super) table: LayerTable,
+    pub(super) geometry: MixerGeometry,
+    pub(super) names: GlobalNames,
+}
+
+impl StepResources {
+    /// Plans one row, allocates the arena and builds the lookups. Allocation happens here and
+    /// never inside a token.
+    pub(super) fn new(
+        context: &CudaContext,
+        dims: StepDims,
+        inventory: &Inventory,
+        options: &StepOptions,
+    ) -> Result<Self, EngError> {
+        check_stage1_options(options)?;
+        let scratch = KernelScratch::for_dims(&dims, STEP_ROWS)?;
+        let plan = StepPlan::new(&dims, STEP_ROWS, options, &scratch)?;
+        let arena = context.arena(&plan.arena_tensors())?;
+        let table = LayerTable::new(&dims, inventory)?;
+        let geometry = MixerGeometry::new(&dims)?;
+        let names = GlobalNames::new(inventory)?;
+        Ok(Self {
+            dims,
+            plan,
+            arena,
+            table,
+            geometry,
+            names,
+        })
+    }
+}
+
+fn tiled<'w>(
+    weights: &'w CudaWeights,
+    name: &str,
+) -> Result<(&'w TiledWeight, Option<usize>), EngError> {
+    match weights.get(name) {
+        Some(CudaWeight::Tiled {
+            weight, experts, ..
+        }) => Ok((weight, *experts)),
+        _ => Err(EngError::Checkpoint(format!(
+            "step weights: {name} is not a tiled tensor"
+        ))),
+    }
+}
+
+fn raw_buffer<'w>(
+    weights: &'w CudaWeights,
+    name: &str,
+    values: usize,
+) -> Result<&'w DeviceBuffer, EngError> {
+    let bytes = f32_bytes(values)?;
+    match weights.get(name) {
+        Some(CudaWeight::Raw { ty, buffer, .. })
+            if *ty == GgufType::F32 && buffer.bytes() == bytes =>
+        {
+            Ok(buffer)
+        }
+        _ => Err(EngError::Checkpoint(format!(
+            "step weights: {name} is not a raw f32 tensor of {values} values"
+        ))),
+    }
+}
+
+fn dense<'w>(
+    weights: &'w CudaWeights,
+    name: &str,
+    want: &DenseSpec,
+) -> Result<&'w TiledWeight, EngError> {
+    let (weight, experts) = tiled(weights, name)?;
+    check_dense(name, (weight.n_rows(), weight.k(), experts), want)?;
+    Ok(weight)
+}
+
+fn stack<'w>(
+    weights: &'w CudaWeights,
+    name: &str,
+    want: &StackSpec,
+) -> Result<ExpertStack<'w>, EngError> {
+    let (weight, experts) = tiled(weights, name)?;
+    check_stack(name, (weight.n_rows(), weight.k(), experts), want)?;
+    Ok(ExpertStack {
+        weight,
+        experts: want.experts,
+    })
+}
+
+/// The MoE weights of `layer`, shapes checked against `specs`.
+pub(super) fn moe_layer_weights<'w>(
+    table: &LayerTable,
+    weights: &'w CudaWeights,
+    specs: &MoeSpecs,
+    layer: usize,
+) -> Result<MoeLayerWeights<'w>, EngError> {
+    let name = |role| table.name(layer, role);
+    Ok(MoeLayerWeights {
+        router: raw_buffer(weights, name(Role::FfnGateInp)?, specs.router_values)?,
+        router_shared: raw_buffer(weights, name(Role::FfnGateInpShexp)?, specs.shexp_values)?,
+        gate: stack(weights, name(Role::FfnGateExps)?, &specs.gate)?,
+        up: stack(weights, name(Role::FfnUpExps)?, &specs.up)?,
+        down: stack(weights, name(Role::FfnDownExps)?, &specs.down)?,
+        shared_gate: dense(weights, name(Role::FfnGateShexp)?, &specs.shared_gate)?,
+        shared_up: dense(weights, name(Role::FfnUpShexp)?, &specs.shared_up)?,
+        shared_down: dense(weights, name(Role::FfnDownShexp)?, &specs.shared_down)?,
+    })
+}
+
+/// The embedding table, the output head and the output norm.
+pub(super) struct GlobalWeights<'w> {
+    pub(super) embed: &'w TiledWeight,
+    pub(super) head: &'w TiledWeight,
+    pub(super) output_norm: &'w DeviceBuffer,
+}
+
+impl<'w> GlobalWeights<'w> {
+    pub(super) fn new(
+        names: &GlobalNames,
+        specs: &GlobalSpecs,
+        weights: &'w CudaWeights,
+    ) -> Result<Self, EngError> {
+        Ok(Self {
+            embed: dense(weights, &names.embed, &specs.embed)?,
+            head: dense(weights, &names.head, &specs.head)?,
+            output_norm: raw_buffer(weights, &names.norm, specs.norm_values)?,
+        })
+    }
+}

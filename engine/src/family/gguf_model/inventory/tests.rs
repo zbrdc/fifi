@@ -267,7 +267,7 @@ fn the_qwen3_6_inventory_matches_the_28_role_table_of_the_real_header() {
             ty.name()
         );
         assert_eq!(
-            tensor.path() == TensorPath::HostF32,
+            tensor.path() == TensorPath::DeviceF32,
             ty == GgufType::F32,
             "tensor {name} path"
         );
@@ -275,16 +275,17 @@ fn the_qwen3_6_inventory_matches_the_28_role_table_of_the_real_header() {
 }
 
 #[test]
-fn the_qwen3_6_inventory_has_432_tiled_and_301_host_tensors_with_the_real_byte_totals() {
-    // The device total 20,347,535,360 B (Q6_K tiles are larger than their source) needs
+fn the_qwen3_6_inventory_has_432_tiled_and_301_f32_device_tensors_with_the_real_byte_totals() {
+    // The tiled device total 20,347,535,360 B (Q6_K tiles are larger than their source) needs
     // `kernels::cuda::plan::device_bytes`, which is CUDA-only, so the real-file test of
-    // packet 5 asserts it.
+    // packet 5 asserts it. An F32 tensor uploads as read, so its device bytes are the
+    // source bytes below and the device total is 20,436,388,352 B (decision 0047 A1).
     let inventory = qwen_inventory();
     let mut tiled = 0u32;
-    let mut host = 0u32;
+    let mut f32_count = 0u32;
     let mut tiled_by_type: HashMap<GgufType, u32> = HashMap::new();
     let mut tiled_bytes = 0u64;
-    let mut host_bytes = 0u64;
+    let mut f32_bytes = 0u64;
     for (name, ty, _) in real_entries() {
         let tensor = inventory
             .get(&name)
@@ -297,12 +298,12 @@ fn the_qwen3_6_inventory_has_432_tiled_and_301_host_tensors_with_the_real_byte_t
             tiled_bytes += bytes;
             *tiled_by_type.entry(ty).or_default() += 1;
         } else {
-            host += 1;
-            host_bytes += bytes;
+            f32_count += 1;
+            f32_bytes += bytes;
         }
     }
     assert_eq!(tiled, 432, "tiled tensors");
-    assert_eq!(host, 301, "host tensors");
+    assert_eq!(f32_count, 301, "F32 device tensors");
     assert_eq!(
         tiled_by_type.get(&GgufType::Q80).copied().unwrap_or(0),
         310,
@@ -319,7 +320,7 @@ fn the_qwen3_6_inventory_has_432_tiled_and_301_host_tensors_with_the_real_byte_t
         "Q6_K tiled tensors"
     );
     assert_eq!(tiled_bytes, 20_319_723_520, "tiled source bytes");
-    assert_eq!(host_bytes, 88_852_992, "host bytes");
+    assert_eq!(f32_bytes, 88_852_992, "F32 device bytes");
 }
 
 #[test]
@@ -377,13 +378,13 @@ fn a_two_layer_spec_lists_its_38_tensors_in_layer_order_with_dims_from_the_spec_
         .iter()
         .filter(|tensor| tensor.path() == TensorPath::DeviceTiled)
         .count();
-    let host = inventory
+    let f32_count = inventory
         .tensors()
         .iter()
-        .filter(|tensor| tensor.path() == TensorPath::HostF32)
+        .filter(|tensor| tensor.path() == TensorPath::DeviceF32)
         .count();
     assert_eq!(tiled, 23, "tiled tensors");
-    assert_eq!(host, 15, "host tensors");
+    assert_eq!(f32_count, 15, "F32 device tensors");
 }
 
 #[test]
@@ -421,7 +422,7 @@ fn a_wider_kv_group_changes_only_the_kv_projection_dims() {
 }
 
 #[test]
-fn tiled_roles_allow_only_q4_k_q6_k_and_q8_0_and_host_roles_only_f32() {
+fn tiled_roles_allow_only_q4_k_q6_k_and_q8_0_and_f32_roles_only_f32() {
     let inventory = Inventory::for_spec(&TWO_LAYER_SPEC)
         .unwrap_or_else(|error| panic!("two-layer inventory: {error:?}"));
     for tensor in inventory.tensors() {
@@ -432,7 +433,7 @@ fn tiled_roles_allow_only_q4_k_q6_k_and_q8_0_and_host_roles_only_f32() {
                 "tensor {}",
                 tensor.name
             ),
-            TensorPath::HostF32 => assert_eq!(
+            TensorPath::DeviceF32 => assert_eq!(
                 tensor.allowed_types(),
                 &[GgufType::F32],
                 "tensor {}",

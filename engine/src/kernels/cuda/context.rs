@@ -13,6 +13,10 @@
 //! Every public operation first reports a terminal failure as `Backend`
 //! `execute`, then validates its input, then enters the dispatch guard.
 //!
+//! A capture window (`graph`) lets only launch-only calls through: while one is open on the
+//! thread, every call above that copies synchronously, allocates or synchronizes is refused
+//! with `BadRequest` before any native call, and a drop is deferred until the window closes.
+//!
 //! A tiled upload stages the host in whole 8-row groups: one chunk of source
 //! blocks read from the caller plus one chunk of repacked tiles, each of at
 //! most the chunk limit ([`CHUNK_LIMIT`] in production) however large the
@@ -23,14 +27,17 @@
 //! Every context owns one activation workspace (see `workspace`): the device
 //! regions that a linear call reads its input from and writes its output to.
 //! It is allocated with the context and grown, never shrunk, by a larger call,
-//! so a call allocates and frees no device memory.
+//! so a call allocates and frees no device memory. The caller sizes it with an
+//! `Admission` and says whether a larger call may grow it; a `DeviceArena`
+//! serves what the workspace refuses, and an `ArenaHold` keeps the workspace from
+//! being replaced while a graph uses it.
 
 use std::{
     cell::RefCell,
     ffi::c_int,
     marker::PhantomData,
     rc::Rc,
-    sync::atomic::{AtomicUsize, Ordering},
+    sync::atomic::{AtomicU64, AtomicUsize, Ordering},
 };
 
 use super::{
@@ -38,11 +45,12 @@ use super::{
     guard::{DispatchGuard, Lease},
     memory_info_operation,
     native::{self, Activations, DeviceFailure, RawDevice, TILE_ROWS, TileVec, Tiled, TiledType},
-    native_error, require_device, stage_operation,
+    native_error, require_device,
 };
 use crate::EngError;
+use crate::kernels::cuda::native::resident::matmul_q5_0::MAX_DENSE_TOKENS;
 use crate::weights::GgufType;
-use workspace::{Workspace, default_caps};
+use workspace::Workspace;
 
 /// Adapter leases held in this process.
 static SLOTS: AtomicUsize = AtomicUsize::new(0);
@@ -52,6 +60,60 @@ static SLOTS: AtomicUsize = AtomicUsize::new(0);
 /// with the host heap and page cache and cannot show a leak. Tests read this
 /// count instead. A buffer skipped after a terminal failure stays counted.
 static LIVE_BYTES: AtomicUsize = AtomicUsize::new(0);
+
+/// Live streams of this process. Like [`LIVE_BYTES`], an owner skipped after a
+/// terminal failure stays counted.
+#[cfg_attr(
+    not(test),
+    expect(dead_code, reason = "staged for RD-9a (decision 0047)")
+)]
+static LIVE_STREAMS: AtomicUsize = AtomicUsize::new(0);
+
+/// Live events of this process. An owner skipped after a terminal failure stays
+/// counted.
+#[cfg_attr(
+    not(test),
+    expect(dead_code, reason = "staged for RD-9a (decision 0047)")
+)]
+static LIVE_EVENTS: AtomicUsize = AtomicUsize::new(0);
+
+/// Bytes of pinned host memory held by live owners of this process. An owner
+/// skipped after a terminal failure stays counted.
+#[cfg_attr(
+    not(test),
+    expect(dead_code, reason = "staged for RD-9a (decision 0047)")
+)]
+static LIVE_PINNED: AtomicUsize = AtomicUsize::new(0);
+
+/// The last stream id handed out. Ids start at 1, so 0 names no stream.
+#[cfg_attr(
+    not(test),
+    expect(dead_code, reason = "staged for RD-9a (decision 0047)")
+)]
+static STREAM_IDS: AtomicU64 = AtomicU64::new(0);
+
+/// Live executable graphs of this process. An owner skipped after a terminal
+/// failure stays counted.
+#[cfg_attr(
+    not(test),
+    expect(dead_code, reason = "staged for RD-9a (decision 0047)")
+)]
+static LIVE_GRAPHS: AtomicUsize = AtomicUsize::new(0);
+
+/// Native destroy calls made by streams, events, pinned words and graphs. Incremented
+/// right before the call, so a test proves that a terminal `Drop` makes none.
+#[cfg(test)]
+static DESTROY_CALLS: AtomicUsize = AtomicUsize::new(0);
+
+/// The live resident owners of the process, for tests.
+#[cfg(test)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct OwnerCounts {
+    pub(crate) streams: usize,
+    pub(crate) events: usize,
+    pub(crate) pinned: usize,
+    pub(crate) graphs: usize,
+}
 
 /// The largest buffer of repacked tiles held on the host at once, and so also
 /// the largest chunk of source blocks (a repacked group is never smaller than
@@ -90,6 +152,8 @@ pub(crate) type BlockReader<'a> = &'a mut dyn FnMut(usize, &mut [u8]) -> Result<
 pub(crate) struct CudaContext {
     lease: Rc<Lease>,
     workspace: RefCell<Workspace>,
+    /// Whether a call larger than the workspace may grow it.
+    growth: Growth,
     /// Workspace allocations made, the first one included; tests compare it.
     #[cfg(test)]
     workspace_allocations: std::cell::Cell<usize>,
@@ -110,22 +174,35 @@ pub(crate) struct TiledWeight {
 }
 
 impl CudaContext {
-    /// Takes one adapter lease and allocates the default workspace. Returns
-    /// `Backend` when no device is present, when two leases are already held, or
-    /// after a terminal failure, and `MemoryPlan` when the device cannot hold the
+    /// Takes one adapter lease and allocates the workspace that `admission` sizes.
+    /// Returns `BadRequest` for an admission the adapter would reject, `Backend`
+    /// when no device is present, when two leases are already held, or after a
+    /// terminal failure, and `MemoryPlan` when the device cannot hold the
     /// workspace (the lease is released again).
-    pub(crate) fn new() -> Result<Self, EngError> {
-        Self::with_workspace(default_caps()?)
+    pub(crate) fn with_admission(admission: &Admission) -> Result<Self, EngError> {
+        Self::build(admission.caps()?, admission.growth)
     }
 
-    /// Like [`Self::new`], with a workspace of the given sizes.
+    /// A context sized for the served model (`served_admission`), for the tests.
+    #[cfg(test)]
+    pub(crate) fn new() -> Result<Self, EngError> {
+        Self::with_admission(&crate::family::project::cuda::served_admission())
+    }
+
+    /// Like [`Self::new`], with a growable workspace of the given sizes.
+    #[cfg(test)]
     fn with_workspace(caps: Activations) -> Result<Self, EngError> {
+        Self::build(caps, Growth::Unbounded)
+    }
+
+    fn build(caps: Activations, growth: Growth) -> Result<Self, EngError> {
         require_device(super::device_count()?)?;
         let lease = Lease::acquire(&SLOTS, &TERMINAL)?;
         let workspace = Workspace::allocate(&lease, caps)?;
         Ok(Self {
             lease,
             workspace: RefCell::new(workspace),
+            growth,
             #[cfg(test)]
             workspace_allocations: std::cell::Cell::new(1),
             _thread_confined: PhantomData,
@@ -139,6 +216,7 @@ impl CudaContext {
 
     /// Reports free and total device memory.
     pub(crate) fn memory_info(&self) -> Result<MemoryInfo, EngError> {
+        graph::ensure_closed("a memory query")?;
         let _dispatch = self.enter()?;
         let (free, total) = native::memory_info()
             .map_err(|status| native_error(&TERMINAL, memory_info_operation(status), status))?;
@@ -150,6 +228,24 @@ impl CudaContext {
     #[cfg(test)]
     pub(crate) fn live_bytes(&self) -> usize {
         LIVE_BYTES.load(Ordering::Acquire)
+    }
+
+    /// Live streams, events and pinned bytes of every context in the process.
+    /// The counts are process-global, so tests compare them before and after.
+    #[cfg(test)]
+    pub(crate) fn live_owners(&self) -> OwnerCounts {
+        OwnerCounts {
+            streams: LIVE_STREAMS.load(Ordering::Acquire),
+            events: LIVE_EVENTS.load(Ordering::Acquire),
+            pinned: LIVE_PINNED.load(Ordering::Acquire),
+            graphs: LIVE_GRAPHS.load(Ordering::Acquire),
+        }
+    }
+
+    /// Native destroy calls made so far by streams, events, pinned words and graphs.
+    #[cfg(test)]
+    pub(crate) fn destroy_calls(&self) -> usize {
+        DESTROY_CALLS.load(Ordering::Acquire)
     }
 
     /// Workspace allocations made so far, the first one included.
@@ -168,6 +264,7 @@ impl CudaContext {
     /// `BadRequest`, because the device holds no zero-length allocation.
     pub(crate) fn upload(&self, bytes: &[u8]) -> Result<DeviceBuffer, EngError> {
         self.ensure_usable()?;
+        graph::ensure_closed("an upload")?;
         if bytes.is_empty() {
             return Err(EngError::BadRequest("cuda upload of zero bytes".to_owned()));
         }
@@ -181,6 +278,7 @@ impl CudaContext {
     #[cfg(test)]
     pub(crate) fn download(&self, buffer: &DeviceBuffer, out: &mut [u8]) -> Result<(), EngError> {
         self.ensure_usable()?;
+        graph::ensure_closed("a download")?;
         let raw = self.owned(buffer)?;
         if out.is_empty() || out.len() > raw.bytes() {
             return Err(EngError::BadRequest(format!(
@@ -193,7 +291,7 @@ impl CudaContext {
         native::download(raw, out).map_err(device_error)
     }
 
-    /// Reads a Q4_K, Q6_K or Q8_0 tensor through `read` in chunks of whole
+    /// Reads a Q4_K, Q6_K, Q8_0 or Q5_0 tensor through `read` in chunks of whole
     /// 8-row groups, repacks each chunk on the host and uploads its tiles.
     ///
     /// A chunk holds as many groups as fit in `chunk_limit` tile bytes, and
@@ -214,6 +312,7 @@ impl CudaContext {
         read: BlockReader<'_>,
     ) -> Result<TiledWeight, EngError> {
         self.ensure_usable()?;
+        graph::ensure_closed("a tiled upload")?;
         let tiled = checked_tiled(tensor)?;
         let tile_bytes = tiled
             .tile_vecs()
@@ -259,11 +358,13 @@ impl CudaContext {
         x: &[f32],
     ) -> Result<Vec<f32>, EngError> {
         self.ensure_usable()?;
+        graph::ensure_closed("a blocking linear call")?;
         let raw = self.owned(&weight.buffer)?;
         let (view, offset) = row_range(weight.tiled, first, rows)?;
         let tokens = token_count(view, x.len())?;
         let mut y = host_floats(tokens * view.n_rows)?;
-        let need = native::activation_bytes(view.n_rows, view.k, tokens)
+        let k_x = native::activation_k(view.ty, view.k);
+        let need = native::activation_bytes(view.n_rows, k_x, tokens)
             .map_err(|status| native_error(&TERMINAL, ADAPTER_OPERATION, status))?;
         let _dispatch = self.enter()?;
         let mut workspace = self
@@ -305,7 +406,7 @@ impl CudaContext {
             let src = &mut source[..part.groups() * plan.group_src];
             read(first * plan.group_src, src)?;
             let vecs = &mut staging[..part.groups() * plan.group_vecs()];
-            native::repack(part, src, vecs).map_err(|status| repack_error(name, status))?;
+            repack_chunk(name, part, src, vecs)?;
             let _dispatch = self.enter()?;
             native::upload_at(raw, first * plan.group_bytes, TileVec::as_bytes(vecs))
                 .map_err(device_error)?;
@@ -350,6 +451,7 @@ impl DeviceBuffer {
 
     /// Allocates `bytes` of uninitialized device memory on the adapter of `lease`.
     fn allocate(lease: &Rc<Lease>, bytes: usize) -> Result<Self, EngError> {
+        graph::ensure_closed("an allocation")?;
         let _dispatch = enter_dispatch()?;
         let raw = native::alloc(bytes).map_err(device_error)?;
         Ok(Self::from_raw(lease, raw))
@@ -368,22 +470,27 @@ impl DeviceBuffer {
 
 impl Drop for DeviceBuffer {
     fn drop(&mut self) {
-        let Some(raw) = self.raw.take() else {
-            return;
-        };
-        let _dispatch = DispatchGuard::enter(&TERMINAL);
-        // The context may be poisoned after a terminal failure. `RawDevice` has
-        // no `Drop`, so skipping `free` leaves the memory to the process exit.
-        if TERMINAL.load(Ordering::Acquire) {
-            return;
+        if let Some(raw) = self.raw.take() {
+            // The free synchronizes the device, which a capture window forbids.
+            graph::run_or_defer(move || release_buffer(raw));
         }
-        let bytes = raw.bytes();
-        match native::free(raw) {
-            Ok(()) => {
-                LIVE_BYTES.fetch_sub(bytes, Ordering::AcqRel);
-            }
-            Err(_) => TERMINAL.store(true, Ordering::Release),
+    }
+}
+
+/// Frees one allocation under decision 0022, for `Drop` and for the frees a capture window kept.
+fn release_buffer(raw: RawDevice) {
+    let _dispatch = DispatchGuard::enter(&TERMINAL);
+    // The context may be poisoned after a terminal failure. `RawDevice` has
+    // no `Drop`, so skipping `free` leaves the memory to the process exit.
+    if TERMINAL.load(Ordering::Acquire) {
+        return;
+    }
+    let bytes = raw.bytes();
+    match native::free(raw) {
+        Ok(()) => {
+            LIVE_BYTES.fetch_sub(bytes, Ordering::AcqRel);
         }
+        Err(_) => TERMINAL.store(true, Ordering::Release),
     }
 }
 
@@ -429,7 +536,7 @@ pub(crate) fn drop_page_cache(file: &std::fs::File, offset: u64, len: u64) -> Re
 
 /// Maps a failed device call to the error of its stage.
 fn device_error(failure: DeviceFailure) -> EngError {
-    native_error(&TERMINAL, stage_operation(failure.stage), failure.status)
+    native_error(&TERMINAL, graph::operation_of(&failure), failure.status)
 }
 
 /// A nested borrow of the workspace; no code path takes one today.
@@ -489,6 +596,7 @@ fn checked_tiled(tensor: QuantTensor<'_>) -> Result<Tiled, EngError> {
         GgufType::Q4K => TiledType::Q4K,
         GgufType::Q6K => TiledType::Q6K,
         GgufType::Q80 => TiledType::Q80,
+        GgufType::Q50 => TiledType::Q50,
         other => {
             return Err(EngError::Checkpoint(format!(
                 "tensor {} has type {other:?}, which the CUDA matmul does not execute",
@@ -581,6 +689,35 @@ pub(crate) fn check_q8_0_scales(
     Ok(())
 }
 
+/// Bytes of one Q5_0 block: an fp16 `d`, four `qh` bytes and 16 `qs` bytes.
+const Q5_0_BLOCK_BYTES: usize = 22;
+/// Largest `|q5 - 16|` of a Q5_0 quant (`q5` is 0..=31).
+const Q5_0_MAX_QUANT: f32 = 16.0;
+
+/// Rejects a Q5_0 tensor whose `(q5 - 16) * d` would leave the fp16 range when the device
+/// dequantizes it (MEL-C1b, B-L4): `16 |d| > 65504`, or a NaN or infinite `d`. The quants are
+/// unconstrained, so the bound is on `d` alone (`|d| <= 4094`). `CudaProjector::load` runs it
+/// for every Q5_0 tensor before the first upload.
+///
+/// `blocks` may be one chunk of the tensor that starts at block `first_block`; the error names
+/// the block by its index from the start of the tensor.
+pub(crate) fn check_q5_0_scales(
+    name: &str,
+    first_block: usize,
+    blocks: &[u8],
+) -> Result<(), EngError> {
+    for (offset, block) in blocks.as_chunks::<Q5_0_BLOCK_BYTES>().0.iter().enumerate() {
+        let index = first_block + offset;
+        let d = f16_to_f32(u16::from_le_bytes([block[0], block[1]]));
+        if !d.is_finite() || d.abs() * Q5_0_MAX_QUANT > F16_MAX {
+            return Err(EngError::Checkpoint(format!(
+                "tensor {name} block {index}: Q5_0 scale {d} times quant {Q5_0_MAX_QUANT} exceeds the fp16 range"
+            )));
+        }
+    }
+    Ok(())
+}
+
 /// Decodes an IEEE binary16 value. `gguf_dequant` keeps its own private copy;
 /// this one feeds the range check above and the tile checks of the tests.
 pub(crate) fn f16_to_f32(bits: u16) -> f32 {
@@ -594,6 +731,21 @@ pub(crate) fn f16_to_f32(bits: u16) -> f32 {
         _ => (1.0 + mantissa / 1024.0) * 2.0_f32.powi(exponent - 15),
     };
     sign * magnitude
+}
+
+/// Repacks one chunk of whole groups into `staging`. Q5_0 is a host byte
+/// permutation; the other types go through the vendored repack. A future
+/// repack-time conversion (MEL-C2) is a new arm here, never a decode-path branch.
+fn repack_chunk(
+    name: &str,
+    part: Tiled,
+    src: &[u8],
+    staging: &mut [TileVec],
+) -> Result<(), EngError> {
+    if part.ty == TiledType::Q50 {
+        return tile_q5_0::pack_q5_0(src, part.k, TileVec::as_bytes_mut(staging));
+    }
+    native::repack(part, src, staging).map_err(|status| repack_error(name, status))
 }
 
 /// A repack failure is an adapter rejection or exception, which is terminal
@@ -659,8 +811,22 @@ fn row_range(tiled: Tiled, first: usize, rows: usize) -> Result<(Tiled, usize), 
     ))
 }
 
+/// `BadRequest` unless a Q5_0 weight is asked for 1 to 16 tokens, the most its decode kernel takes.
+/// Raised in Rust before any native call, because a native rejection latches the backend
+/// terminal. Other types are unaffected. Prefill on a Q5_0 weight waits for the MMQ read patch (V-5b).
+fn check_q5_0_tokens(ty: TiledType, tokens: usize) -> Result<(), EngError> {
+    if ty == TiledType::Q50 && !(1..=MAX_DENSE_TOKENS).contains(&tokens) {
+        return Err(EngError::BadRequest(format!(
+            "the CUDA Q5_0 decode matmul takes 1 to {MAX_DENSE_TOKENS} tokens, got {tokens}; \
+             prefill is V-5b"
+        )));
+    }
+    Ok(())
+}
+
 fn token_count(tiled: Tiled, values: usize) -> Result<usize, EngError> {
     let tokens = values / tiled.k;
+    check_q5_0_tokens(tiled.ty, tokens)?;
     if tokens == 0 || tokens * tiled.k != values || tokens > native::MAX_DIM {
         return Err(EngError::BadRequest(format!(
             "cuda linear input has {values} values; the weight takes 1 to {} tokens of {}",
@@ -682,7 +848,24 @@ fn host_floats(len: usize) -> Result<Vec<f32>, EngError> {
     Ok(out)
 }
 
+mod buffer_io;
+mod device_arena;
+mod graph;
+mod launch;
+mod pinned;
+mod range;
+mod stream;
+mod tile_q5_0;
 mod workspace;
+
+pub(crate) use device_arena::{ArenaHold, DeviceArena};
+pub(crate) use graph::{CapturePlan, GraphExec};
+pub(in crate::kernels::cuda) use launch::{Claim, require_apart, require_fit};
+pub(crate) use launch::{MatmulIo, PackCall, Projection};
+pub(crate) use pinned::{PinnedWord, WordValue};
+pub(crate) use range::DeviceRange;
+pub(crate) use stream::{DeviceEvent, DeviceStream};
+pub(crate) use workspace::{Admission, Growth, WorkspaceShape};
 
 #[cfg(test)]
 mod tests;

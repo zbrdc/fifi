@@ -4,7 +4,8 @@
 //! `#[cfg(all(feature = "native-cuda", target_os = "linux"))]`, the same gate
 //! that `build.rs` and `tests/cuda_smoke.rs` use. Packet 1 covers smoke
 //! operations only: device count and f32 vector add. Raw native calls live in
-//! `native`, the only file here that allows `unsafe`.
+//! `native` and its child modules, the only Rust files here that contain `unsafe`
+//! or `extern "C"` (decision 0047).
 //!
 //! Failure rule: `cudaErrorMemoryAllocation` at the allocate stage is a
 //! `MemoryPlan` error and leaves the module usable. A host with no device is a
@@ -26,6 +27,27 @@
 //!
 //! P6-workbuf: each `CudaContext` owns one activation workspace planned by
 //! `arena::plan_arena`, so a linear call allocates no device memory.
+//!
+//! RD-2a (decision 0047): `context` adds non-blocking streams, timing-free events
+//! and a pinned result word, and the launch-only `pack` and `matmul` entries on a
+//! stream; `native/resident.rs` holds their raw calls. Nothing outside the tests
+//! calls them until the resident step (RD-9a), which also takes the arena planner
+//! (`plan_arena`) and the `xf` size rule (`xf_bytes`) re-exported here.
+//!
+//! RD-2c (decision 0047): `context` adds `allocate` and the stream-ordered ranged
+//! reads and writes of a buffer, a generic `DeviceArena` with checked views and the
+//! `ArenaHold` that keeps the workspace from being replaced under a graph. The
+//! caller sizes the workspace with an `Admission`; the model's numbers are not here.
+//!
+//! RD-2d (decision 0047): `context` adds the capture window, executable graphs (`GraphExec`), the
+//! refusal of every non-capturable call inside a window and deferred drops; `native/resident/graph.rs`
+//! holds the raw calls. The operation name `cuda capture` names a capture refusal on the closed list
+//! (the seven `cudaErrorStreamCapture*` statuses 900 to 906, and an allocation failure when the
+//! capture is instantiated); such a refusal leaves the stream clean and the backend usable. Every
+//! other status stays terminal.
+//!
+//! `resident` holds the safe wrappers of the stage 1 kernels, one file per kernel (RD-2p). Its doc
+//! says how to add one.
 
 mod arena;
 mod context;
@@ -34,10 +56,29 @@ mod fault;
 mod guard;
 mod native;
 pub(crate) mod plan;
+pub(crate) mod resident;
+#[cfg(test)]
+mod testkit;
 
 pub(crate) use context::{
-    CHUNK_LIMIT, CudaContext, DeviceBuffer, MemoryInfo, QuantTensor, TiledWeight, check_q6k_scales,
-    check_q8_0_scales, drop_page_cache,
+    Admission, CHUNK_LIMIT, CudaContext, DeviceBuffer, Growth, MemoryInfo, QuantTensor,
+    TiledWeight, WorkspaceShape, check_q5_0_scales, check_q6k_scales, check_q8_0_scales,
+    drop_page_cache,
+};
+#[cfg_attr(
+    not(test),
+    expect(
+        unused_imports,
+        reason = "staged for RD-9a (decision 0047): the resident step is the first user"
+    )
+)]
+pub(crate) use context::{
+    ArenaHold, CapturePlan, DeviceArena, DeviceEvent, DeviceRange, DeviceStream, GraphExec,
+    MatmulIo, PackCall, PinnedWord, Projection, WordValue,
+};
+pub(crate) use {
+    arena::{ArenaPlan, ArenaTensor, plan_arena},
+    native::xf_bytes,
 };
 
 use std::ffi::c_int;
@@ -52,6 +93,7 @@ const COPY_OPERATION: &str = "cuda copy";
 const LAUNCH_OPERATION: &str = "cuda launch";
 const SYNCHRONIZE_OPERATION: &str = "cuda synchronize";
 const ADAPTER_OPERATION: &str = "cuda adapter";
+const CAPTURE_OPERATION: &str = "cuda capture";
 const EXECUTE_OPERATION: &str = "execute";
 
 /// `cudaErrorMemoryAllocation` from `cuda_runtime_api.h`.
@@ -69,6 +111,17 @@ pub fn device_count() -> Result<usize, EngError> {
     let count = native::device_count()
         .map_err(|status| native_error(&TERMINAL, count_operation(status), status))?;
     usable_device_count(count)
+}
+
+/// Whether the first device shares memory with the host (a Jetson), from
+/// `cudaDevAttrIntegrated`. Callers hold a context, so a device exists; a
+/// terminal backend refuses the query like every other call.
+pub(crate) fn device_is_integrated() -> Result<bool, EngError> {
+    ensure_usable(&TERMINAL)?;
+    let _dispatch = guard::DispatchGuard::enter(&TERMINAL);
+    ensure_usable(&TERMINAL)?;
+    native::device_info::device_integrated()
+        .map_err(|status| native_error(&TERMINAL, count_operation(status), status))
 }
 
 /// Adds two `f32` slices element by element on the first CUDA device.
@@ -113,6 +166,7 @@ fn stage_operation(stage: c_int) -> &'static str {
         native::STAGE_COPY => COPY_OPERATION,
         native::STAGE_LAUNCH => LAUNCH_OPERATION,
         native::STAGE_SYNCHRONIZE => SYNCHRONIZE_OPERATION,
+        native::resident::graph::STAGE_CAPTURE => CAPTURE_OPERATION,
         _ => ADAPTER_OPERATION,
     }
 }
@@ -175,8 +229,21 @@ fn native_error(terminal: &AtomicBool, operation: &'static str, status: c_int) -
     if operation == ALLOCATE_OPERATION && status == CUDA_ERROR_MEMORY_ALLOCATION {
         return EngError::MemoryPlan(format!("{operation}: {message}"));
     }
+    if operation == CAPTURE_OPERATION && is_capture_status(status) {
+        return EngError::Backend { operation, message };
+    }
     terminal.store(true, Ordering::Release);
     EngError::Backend { operation, message }
+}
+
+/// The seven `cudaErrorStreamCapture*` statuses (REPLY-30 item 1, decision 0047). The one definition
+/// of the closed list: [`is_capture_status`] and the capture window both use it.
+const CAPTURE_STATUSES: std::ops::RangeInclusive<c_int> = 900..=906;
+
+/// The closed list of capture statuses that do not latch the backend: [`CAPTURE_STATUSES`], and an
+/// allocation failure at the capture stage (instantiate).
+fn is_capture_status(status: c_int) -> bool {
+    CAPTURE_STATUSES.contains(&status) || status == CUDA_ERROR_MEMORY_ALLOCATION
 }
 
 #[cfg(test)]

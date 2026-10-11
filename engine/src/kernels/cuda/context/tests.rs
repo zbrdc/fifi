@@ -494,6 +494,91 @@ fn row_range_offsets_whole_groups_by_their_tile_bytes() {
 }
 
 #[test]
+fn row_range_resolves_a_q5_0_weight_to_its_group_offset() {
+    // A stack of 4 experts of 2304 rows, K = 896: a group is 7 tiles of 704 bytes, and expert 3
+    // starts at row 8 * 288 * 3.
+    let stack = Tiled {
+        ty: TiledType::Q50,
+        n_rows: 4 * 2304,
+        k: 896,
+    };
+    let first = 8 * 288 * 3;
+    let (view, offset) = row_range(stack, first, 2304).expect("expert 3");
+    assert_eq!((view.n_rows, view.k, view.ty), (2304, 896, TiledType::Q50));
+    assert_eq!(offset, (first / 8) * 28 / 4 * 704);
+    let (whole, offset) = row_range(stack, 0, 4 * 2304).expect("the whole stack");
+    assert_eq!((whole.n_rows, offset), (4 * 2304, 0));
+    for (first, rows) in [(4, 8), (0, 12), (0, 0), (2304 * 3, 2305)] {
+        assert_error(
+            row_range(stack, first, rows),
+            "BadRequest",
+            "are not whole 8-row groups",
+        );
+    }
+}
+
+#[test]
+fn q5_0_token_limit_is_16_and_refused_before_native() {
+    let q5_0 = Tiled {
+        ty: TiledType::Q50,
+        n_rows: 8,
+        k: 896,
+    };
+    for tokens in [1, 16] {
+        assert_eq!(
+            token_count(q5_0, tokens * 896).expect("within the limit"),
+            tokens
+        );
+    }
+    for tokens in [0, 17, 32] {
+        assert_error(
+            token_count(q5_0, tokens * 896),
+            "BadRequest",
+            "takes 1 to 16 tokens",
+        );
+    }
+    // The other types keep their limit: 17 tokens is a gemm batch.
+    let q4k = Tiled {
+        ty: TiledType::Q4K,
+        n_rows: 8,
+        k: 256,
+    };
+    assert_eq!(token_count(q4k, 17 * 256).expect("17 tokens"), 17);
+    check_q5_0_tokens(TiledType::Q4K, 17).expect("not a Q5_0 weight");
+    check_q5_0_tokens(TiledType::Q50, 16).expect("sixteen tokens");
+}
+
+/// A Q5_0 block with fp16 `d` and quants that do not matter to the range check.
+fn q5_0_block(d_bits: u16) -> Vec<u8> {
+    let mut block = vec![0xFFu8; 22];
+    block[0..2].copy_from_slice(&d_bits.to_le_bytes());
+    block
+}
+
+#[test]
+fn check_q5_0_scales_accepts_d_up_to_4094_and_rejects_the_rest_and_names_the_block() {
+    // 0x6bff is 4094 and 4094 * 16 = 65504 exactly: the boundary of the fp16 maximum. Negative d
+    // and zero pass too.
+    for d_bits in [0x6bffu16, 0xebff, 0x0000, 0x3c00] {
+        check_q5_0_scales("w", 0, &q5_0_block(d_bits)).expect("within the fp16 range");
+    }
+    // 0x6c00 is 4096 and 4096 * 16 = 65536 is past it. The error names the block from the start.
+    let blocks = [q5_0_block(0x6bff), q5_0_block(0x6c00)].concat();
+    assert_error(
+        check_q5_0_scales("w", 5, &blocks),
+        "Checkpoint",
+        "tensor w block 6: Q5_0 scale 4096 times quant 16 exceeds the fp16 range",
+    );
+    for d_bits in [0x7e00u16, 0x7c00, 0xfc00] {
+        assert_error(
+            check_q5_0_scales("w", 0, &q5_0_block(d_bits)),
+            "Checkpoint",
+            "exceeds the fp16 range",
+        );
+    }
+}
+
+#[test]
 fn row_range_rejects_partial_empty_and_overlong_ranges() {
     let q4k = Tiled {
         ty: TiledType::Q4K,
@@ -514,4 +599,145 @@ fn row_range_rejects_partial_empty_and_overlong_ranges() {
             "whole 8-row groups of a weight with 32 rows",
         );
     }
+}
+
+const Q5_0_BLOCK_BYTES: usize = 22;
+const Q5_0_TILE_BYTES: usize = 704;
+
+/// Source offset of tile byte `at` of tile `tile` (of `k / 128` per group) in
+/// group `group`, derived from the tile diagram alone: the region of `at`
+/// names the field, and the block `b = 4 * row + j` names the source block.
+/// Independent of `pack_q5_0`, which walks the source instead.
+fn q5_0_source_offset(group: usize, tile: usize, at: usize, k: usize) -> usize {
+    let (field_start, region_start, width) = match at {
+        0..64 => (0, 0, 2),
+        64..192 => (2, 64, 4),
+        _ => (6, 192, 16),
+    };
+    let b = (at - region_start) / width;
+    let byte = (at - region_start) % width;
+    let (row, j) = (b / 4, b % 4);
+    let block = (group * 8 + row) * (k / 32) + tile * 4 + j;
+    block * Q5_0_BLOCK_BYTES + field_start + byte
+}
+
+/// Tiles of `src` built from the offset table; for every group, tile and byte.
+fn q5_0_tiles_by_table(src: &[u8], k: usize) -> Vec<u8> {
+    let groups = src.len() / (8 * (k / 32) * Q5_0_BLOCK_BYTES);
+    let mut tiles = Vec::new();
+    for group in 0..groups {
+        for tile in 0..k / 128 {
+            tiles
+                .extend((0..Q5_0_TILE_BYTES).map(|at| src[q5_0_source_offset(group, tile, at, k)]));
+        }
+    }
+    tiles
+}
+
+/// Distinct bytes per position, the block number in `d`, so a misplaced field
+/// or block is visible. Special blocks: all-ones `qh` with a NaN `d`, and a
+/// subnormal `d`.
+fn q5_0_patterned(rows: usize, k: usize) -> Vec<u8> {
+    let blocks = rows * (k / 32);
+    let mut src: Vec<u8> = (0..blocks * Q5_0_BLOCK_BYTES)
+        .map(|idx| (idx * 7 + 3) as u8)
+        .collect();
+    for block in 0..blocks {
+        src[block * Q5_0_BLOCK_BYTES..][..2].copy_from_slice(&(block as u16).to_le_bytes());
+    }
+    src[..2].copy_from_slice(&0x7e00u16.to_le_bytes());
+    src[2..6].fill(0xff);
+    src[Q5_0_BLOCK_BYTES..][..2].copy_from_slice(&0x0001u16.to_le_bytes());
+    src
+}
+
+#[test]
+fn pack_q5_0_places_every_field_at_its_tile_offset() {
+    for (rows, k) in [(16, 896), (16, 128), (8, 384)] {
+        let src = q5_0_patterned(rows, k);
+        let mut tiles = vec![0u8; src.len()];
+        tile_q5_0::pack_q5_0(&src, k, &mut tiles).expect("whole groups");
+        assert_eq!(tiles, q5_0_tiles_by_table(&src, k), "{rows} x {k}");
+    }
+}
+
+#[test]
+fn pack_q5_0_is_a_permutation_of_the_source_bytes() {
+    for (rows, k) in [(16, 896), (16, 128)] {
+        let src = q5_0_patterned(rows, k);
+        let mut tiles = vec![0u8; src.len()];
+        tile_q5_0::pack_q5_0(&src, k, &mut tiles).expect("whole groups");
+        assert_eq!(tiles.len(), src.len());
+        let (mut sorted_src, mut sorted_tiles) = (src.clone(), tiles.clone());
+        sorted_src.sort_unstable();
+        sorted_tiles.sort_unstable();
+        assert_eq!(sorted_src, sorted_tiles, "{rows} x {k}: byte multiset");
+        // The inverse map: each tile byte goes back to its source offset.
+        let mut back = vec![0u8; src.len()];
+        let per_group = (k / 128) * Q5_0_TILE_BYTES;
+        for (index, &byte) in tiles.iter().enumerate() {
+            let (group, in_group) = (index / per_group, index % per_group);
+            let (tile, at) = (in_group / Q5_0_TILE_BYTES, in_group % Q5_0_TILE_BYTES);
+            back[q5_0_source_offset(group, tile, at, k)] = byte;
+        }
+        assert_eq!(back, src, "{rows} x {k}: inverse");
+    }
+}
+
+#[test]
+fn pack_q5_0_rejects_a_length_that_is_not_whole_groups() {
+    // One group of K = 128 is 8 * 4 * 22 = 704 bytes.
+    let src = vec![1u8; 704];
+    let cases: [(usize, usize, usize); 4] = [
+        (703, 128, 703),
+        (704, 128, 703),
+        (704, 128, 705),
+        (704, 100, 704),
+    ];
+    for (src_len, k, dst_len) in cases {
+        let mut dst = vec![0xaau8; dst_len];
+        let result = tile_q5_0::pack_q5_0(&src[..src_len.min(704)], k, &mut dst);
+        assert_error(result, "Checkpoint", "Q5_0 tile repack");
+        assert!(dst.iter().all(|&byte| byte == 0xaa), "dst touched");
+    }
+    let mut dst = vec![0xaau8; 1408];
+    assert_error(
+        tile_q5_0::pack_q5_0(&vec![1u8; 1408 + 22], 128, &mut dst),
+        "Checkpoint",
+        "not whole groups",
+    );
+}
+
+#[test]
+fn checked_tiled_accepts_q5_0_at_k_896_and_refuses_k_off_the_128_grid() {
+    let tensor = |n_rows, k, source_len| QuantTensor {
+        name: "w",
+        ty: GgufType::Q50,
+        n_rows,
+        k,
+        source_len,
+    };
+    let tiled = checked_tiled(tensor(8, 896, 8 * 28 * 22)).expect("K = 896 is 7 tiles");
+    assert_eq!(
+        tiled,
+        Tiled {
+            ty: TiledType::Q50,
+            n_rows: 8,
+            k: 896
+        }
+    );
+    assert_eq!(tiled.tile_vecs(), Some(7 * 44));
+    assert_eq!(tiled.group_bytes(), Some(7 * 704));
+    for (n_rows, k) in [(8, 864), (8, 900), (8, 0), (12, 896)] {
+        assert_error(
+            checked_tiled(tensor(n_rows, k, 0)),
+            "Checkpoint",
+            "which the CUDA tiles cannot hold",
+        );
+    }
+    assert_error(
+        checked_tiled(tensor(8, 896, 8 * 28 * 22 + 1)),
+        "Checkpoint",
+        "bytes of blocks",
+    );
 }

@@ -7,7 +7,8 @@
 //! offset that no tensor live at the same time already covers.
 //!
 //! The planner is pure arithmetic and calls no CUDA function, so it runs and
-//! is tested on any host. Its owner is `context::workspace`.
+//! is tested on any host. Its owner is `context::workspace`; the types and the
+//! planner are re-exported from `kernels::cuda` for the resident step (RD-9a).
 
 use std::cmp::Reverse;
 
@@ -19,13 +20,13 @@ pub(super) const ARENA_ALIGN: usize = 256;
 
 /// One tensor of an arena: its size and the steps in which it is live.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(super) struct ArenaTensor {
+pub(crate) struct ArenaTensor {
     /// Size in bytes; never 0.
-    pub(super) bytes: usize,
+    pub(crate) bytes: usize,
     /// First step in which the tensor is live.
-    pub(super) first: usize,
+    pub(crate) first: usize,
     /// Last step in which the tensor is live; not before `first`.
-    pub(super) last: usize,
+    pub(crate) last: usize,
 }
 
 impl ArenaTensor {
@@ -36,17 +37,17 @@ impl ArenaTensor {
 
 /// Where each tensor lives, in input order, and the bytes the arena needs.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(super) struct ArenaPlan {
-    pub(super) offsets: Vec<usize>,
+pub(crate) struct ArenaPlan {
+    pub(crate) offsets: Vec<usize>,
     /// The end of the highest tensor; 0 for no tensors.
-    pub(super) total: usize,
+    pub(crate) total: usize,
 }
 
 /// Plans `tensors` into one arena.
 ///
 /// Returns `BadRequest` for a tensor of 0 bytes or one that ends before it
 /// starts, and `MemoryPlan` when an offset or the total overflows `usize`.
-pub(super) fn plan_arena(tensors: &[ArenaTensor]) -> Result<ArenaPlan, EngError> {
+pub(crate) fn plan_arena(tensors: &[ArenaTensor]) -> Result<ArenaPlan, EngError> {
     for (index, tensor) in tensors.iter().enumerate() {
         if tensor.bytes == 0 || tensor.first > tensor.last {
             return Err(EngError::BadRequest(format!(

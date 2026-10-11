@@ -406,3 +406,131 @@ fn dropping_a_context_returns_its_workspace_bytes_also_after_growth() {
     }
     assert_eq!(anchor.live_bytes(), before);
 }
+
+/// One shape of 16 rows of `K` values.
+fn shape(n_rows: usize, k: usize, tokens: usize) -> WorkspaceShape {
+    WorkspaceShape { n_rows, k, tokens }
+}
+
+fn assert_bad_shape(shapes: Vec<WorkspaceShape>, case: &str) {
+    let admission = Admission {
+        shapes,
+        growth: Growth::Unbounded,
+    };
+    assert!(
+        matches!(admission.caps(), Err(EngError::BadRequest(_))),
+        "{case}: expected a BadRequest"
+    );
+    assert!(
+        !TERMINAL.load(std::sync::atomic::Ordering::Acquire),
+        "{case}: a refused shape must not latch the backend"
+    );
+}
+
+#[test]
+fn admission_caps_are_the_union_of_the_shapes_and_bad_shapes_are_refused() {
+    // One shape is wide with one token (large y), the other narrow with many tokens
+    // (large x): the union takes the larger of each region.
+    let wide = native::activation_bytes(1024, K, 1).expect("wide sizes");
+    let long = native::activation_bytes(16, K, 40).expect("long sizes");
+    assert!(
+        wide.y > long.y && long.x > wide.x,
+        "the shapes must each win a region"
+    );
+    let admission = Admission {
+        shapes: vec![shape(1024, K, 1), shape(16, K, 40)],
+        growth: Growth::Fixed,
+    };
+    let caps = admission.caps().expect("caps of two shapes");
+    assert_eq!(caps.x, wide.x.max(long.x));
+    assert_eq!(caps.xf, wide.xf.max(long.xf));
+    assert_eq!(caps.y, wide.y.max(long.y));
+
+    let served = crate::family::project::cuda::served_admission();
+    assert_eq!(
+        served.caps().expect("served sizes"),
+        Activations {
+            x: 348_160,
+            xf: 1_048_592,
+            y: 16_885_760
+        }
+    );
+
+    assert_bad_shape(Vec::new(), "no shapes");
+    assert_bad_shape(vec![shape(16, 100, 1)], "k = 100");
+    assert_bad_shape(vec![shape(12, K, 1)], "n_rows = 12");
+    assert_bad_shape(vec![shape(16, K, 0)], "tokens = 0");
+    assert_bad_shape(
+        vec![shape(16, K, native::MAX_DIM + 1)],
+        "tokens past MAX_DIM",
+    );
+    assert_bad_shape(vec![shape(16, native::MAX_DIM + 256, 1)], "k past MAX_DIM");
+    assert_bad_shape(vec![shape(0, K, 1)], "n_rows = 0");
+    assert_bad_shape(
+        vec![shape(16, K, 1), shape(16, 100, 1)],
+        "a bad shape after a good one",
+    );
+}
+
+#[test]
+fn a_fixed_workspace_refuses_a_larger_call_and_stays_unchanged() {
+    if !device_present("a_fixed_workspace_refuses_a_larger_call_and_stays_unchanged") {
+        return;
+    }
+    let admission = Admission {
+        shapes: vec![shape(16, K, 1)],
+        growth: Growth::Fixed,
+    };
+    let ctx = CudaContext::with_admission(&admission).expect("fixed context");
+    let weight = upload_q8(&ctx, 16, K);
+    assert_linear(&ctx, &weight, 16, 1);
+    let (allocations, bytes, live) = (
+        ctx.workspace_allocations(),
+        ctx.workspace_bytes(),
+        ctx.live_bytes(),
+    );
+
+    // 17 tokens need 17,408 bytes of x, and the workspace holds 1,024.
+    let x = input(17, K);
+    let Err(EngError::MemoryPlan(message)) = ctx.linear(&weight, &x) else {
+        panic!("a larger call on a fixed workspace must be MemoryPlan");
+    };
+    assert!(
+        message.contains("fixed"),
+        "the message names the policy: {message}"
+    );
+    assert_eq!(ctx.workspace_allocations(), allocations);
+    assert_eq!(ctx.workspace_bytes(), bytes);
+    assert_eq!(ctx.live_bytes(), live);
+    ctx.ensure_usable()
+        .expect("the refusal does not latch the backend");
+    assert_linear(&ctx, &weight, 16, 1);
+    assert_eq!(ctx.workspace_allocations(), allocations);
+}
+
+#[test]
+fn a_held_workspace_refuses_to_grow_until_the_hold_is_released() {
+    if !device_present("a_held_workspace_refuses_to_grow_until_the_hold_is_released") {
+        return;
+    }
+    let ctx = CudaContext::with_workspace(small_caps()).expect("context with a small workspace");
+    let narrow = upload_q8(&ctx, 16, K);
+    let wide = upload_q8(&ctx, 1024, K);
+    let hold = ctx.workspace_hold().expect("hold");
+    assert_linear(&ctx, &narrow, 16, 1);
+    let (allocations, bytes) = (ctx.workspace_allocations(), ctx.workspace_bytes());
+
+    let Err(EngError::BadRequest(message)) = ctx.linear(&wide, &input(1, K)) else {
+        panic!("a grow under a hold must be BadRequest");
+    };
+    assert!(message.contains("retire, never free"), "{message}");
+    assert_eq!(ctx.workspace_allocations(), allocations);
+    assert_eq!(ctx.workspace_bytes(), bytes);
+    ctx.ensure_usable()
+        .expect("the refusal does not latch the backend");
+    assert_linear(&ctx, &narrow, 16, 1);
+
+    drop(hold);
+    assert_linear(&ctx, &wide, 1024, 1);
+    assert_eq!(ctx.workspace_allocations(), allocations + 1);
+}

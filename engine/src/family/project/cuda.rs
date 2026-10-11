@@ -19,24 +19,35 @@
 //! Uploaded weights are freed in reverse load order, also when a load fails
 //! midway.
 //!
-//! [`CudaProjector::load_model`] loads a whole [`GgufModel`]: the tiled
-//! tensors of its plan go to the device and its F32 tensors stay on the host.
+//! [`CudaProjector::load_model`] loads a whole [`GgufModel`]: every tensor of
+//! its plan goes to the device, the tiled ones as tiles and the F32 ones as
+//! raw copies (decision 0047 A1).
+//!
+//! On an integrated GPU (Jetson) the device memory is system RAM, so a load
+//! also evicts the model file before admission and after the scale scan, drops
+//! each tensor's pages after its upload even when the caller passed no file,
+//! and retries one tensor's upload at most twice after a device out-of-memory.
+//! A discrete GPU keeps the caller's options and never retries. See
+//! `load_policy` for the rules and the ownership argument.
 //!
 //! Every operation first reports a terminal backend failure as `Backend`
 //! `execute`, then validates its input as `BadRequest`.
 
 use std::{
+    cell::Cell,
     collections::HashMap,
     fs::File,
     time::{Duration, Instant},
 };
 
+use self::load_policy::{LoadPolicy, evict_model, recover, retry_on_oom};
 use super::Projector;
 use crate::{
     EngError,
     family::gguf_model::GgufModel,
     kernels::cuda::{
-        self, CHUNK_LIMIT, CudaContext, DeviceBuffer, MemoryInfo, QuantTensor, TiledWeight, plan,
+        self, Admission, CHUNK_LIMIT, CudaContext, DeviceBuffer, Growth, MemoryInfo, QuantTensor,
+        TiledWeight, WorkspaceShape, plan,
     },
     weights::{GgufTensor, GgufType, GgufWeights},
 };
@@ -136,10 +147,41 @@ impl Drop for CudaWeights {
 
 /// A whole model after [`CudaProjector::load_model`].
 pub(crate) struct LoadedModel {
-    /// The tiled tensors of the plan, on the device.
+    /// All tensors of the plan, on the device.
     pub(crate) device: CudaWeights,
-    /// The F32 tensors of the plan, by name.
-    pub(crate) host: HashMap<String, Vec<f32>>,
+}
+
+/// What [`CudaProjector::transfer`] works from, after the checks and the
+/// admission of a load.
+struct LoadPlan<'a> {
+    tensors: Vec<(&'a GgufTensor, u64)>,
+    index: HashMap<String, usize>,
+    policy: LoadPolicy,
+    drop_file: Option<&'a File>,
+}
+
+/// Tokens of the largest call the default workspace holds without growing: the
+/// smallest row-major call (one more than the 16 tokens of the fragment-order
+/// buffer).
+const SERVED_TOKENS: usize = 17;
+/// Longest input row of the surveyed Qwen3.6-35B-A3B Q8_0 shapes.
+const SERVED_K: usize = 5120;
+/// Output rows of `output.weight` of Qwen3.6-35B-A3B.
+const SERVED_ROWS: usize = 248_320;
+
+/// The workspace sizes of this model, from P6-workbuf: the larger of a one-token
+/// and a `SERVED_TOKENS`-token call at the widest shape. The kernel wrappers take
+/// an [`Admission`] and know no model.
+pub(crate) fn served_admission() -> Admission {
+    let widest = |tokens| WorkspaceShape {
+        n_rows: SERVED_ROWS,
+        k: SERVED_K,
+        tokens,
+    };
+    Admission {
+        shapes: vec![widest(1), widest(SERVED_TOKENS)],
+        growth: Growth::Unbounded,
+    }
 }
 
 /// Runs the projections of one forward step on the first CUDA device.
@@ -147,14 +189,21 @@ pub(crate) struct CudaProjector {
     context: CudaContext,
     /// Tile bytes per upload chunk, and the size of a scan chunk.
     chunk_limit: usize,
+    /// Whether the device shares memory with the host (a Jetson); it selects
+    /// the [`LoadPolicy`] of every load.
+    integrated: bool,
+    /// Device out-of-memory retries over all loads of this projector.
+    oom_retries: Cell<u32>,
 }
 
 impl CudaProjector {
     /// Takes one of the two process adapter leases.
     pub(crate) fn new() -> Result<Self, EngError> {
         Ok(Self {
-            context: CudaContext::new()?,
+            context: CudaContext::with_admission(&served_admission())?,
             chunk_limit: CHUNK_LIMIT,
+            integrated: cuda::device_is_integrated()?,
+            oom_retries: Cell::new(0),
         })
     }
 
@@ -167,8 +216,32 @@ impl CudaProjector {
         }
     }
 
+    /// Forces the integrated or discrete load policy, so the policy logic runs
+    /// on either kind of device.
+    #[cfg(test)]
+    pub(crate) fn with_integrated(self, integrated: bool) -> Self {
+        Self { integrated, ..self }
+    }
+
+    /// Whether loads use the integrated-GPU policy.
+    #[cfg(test)]
+    pub(crate) fn integrated(&self) -> bool {
+        self.integrated
+    }
+
+    /// Device out-of-memory retries made by all loads of this projector.
+    pub(crate) fn oom_retries(&self) -> u32 {
+        self.oom_retries.get()
+    }
+
     pub(crate) fn memory_info(&self) -> Result<MemoryInfo, EngError> {
         self.context.memory_info()
+    }
+
+    /// The CUDA context that this projector's weights live on. The resident step (decision
+    /// 0047, RD-9a) is built from it and a `&CudaWeights`, so both share one adapter lease.
+    pub(crate) fn context(&self) -> &CudaContext {
+        &self.context
     }
 
     /// Device bytes held by live buffers in the process; see
@@ -186,6 +259,10 @@ impl CudaProjector {
     /// range fails without any upload, as does a demand above free memory
     /// (`MemoryPlan`). The scale error names the tensor and the block index
     /// from the start of the tensor, wherever its chunk lies.
+    ///
+    /// On an integrated GPU the load also evicts the model file before
+    /// admission, forces the per-tensor page-cache drop and retries a tensor's
+    /// upload after a device out-of-memory; see `load_policy`.
     pub(crate) fn load(
         &self,
         weights: &GgufWeights,
@@ -202,10 +279,48 @@ impl CudaProjector {
             .iter()
             .try_fold(0u64, |sum, &(_, bytes)| sum.checked_add(bytes))
             .ok_or_else(|| EngError::MemoryPlan("cuda admission: tensors overflow u64".into()))?;
+        let policy = LoadPolicy::for_device(self.integrated);
+        // Before admission: the free figure of an integrated GPU counts cache as
+        // free, so evicting first lets the allocator find that memory.
+        if policy.evict_file {
+            evict_model(weights.file())?;
+        }
         self.admit(total, options.reserve)?;
+        let drop_file = policy.drop_file(weights.file(), options.drop_page_cache);
+        self.transfer(
+            weights,
+            LoadPlan {
+                tensors,
+                index,
+                policy,
+                drop_file,
+            },
+        )
+    }
+
+    /// Scans, then uploads the planned tensors. Tests call it to reach the upload
+    /// loop with a tensor that admission would refuse.
+    ///
+    /// Ownership: a tensor joins `loaded` only after its upload returned `Ok`.
+    /// Any `?` drops `loaded`, which frees its tensors in reverse load order
+    /// (decision 0022). A failed attempt owns nothing and leaves the live byte
+    /// count unchanged, so a retry starts from the same state. No retry runs
+    /// after a terminal latch, because the attempt then returns `Backend`
+    /// `execute`, which is never retried.
+    fn transfer(&self, weights: &GgufWeights, plan: LoadPlan<'_>) -> Result<CudaWeights, EngError> {
+        let LoadPlan {
+            tensors,
+            index,
+            policy,
+            drop_file,
+        } = plan;
         let scan_began = Instant::now();
         check_scale_ranges(weights, &tensors, self.chunk_limit)?;
         let scan = scan_began.elapsed();
+        // The scan read every Q6_K and Q8_0 tensor once and refilled the cache.
+        if policy.evict_file {
+            evict_model(weights.file())?;
+        }
         let mut loaded = CudaWeights {
             weights: Vec::with_capacity(tensors.len()),
             index,
@@ -213,8 +328,14 @@ impl CudaProjector {
         };
         let upload_began = Instant::now();
         for (tensor, _) in tensors {
-            loaded.weights.push(self.upload(weights, tensor)?);
-            if let Some(file) = options.drop_page_cache {
+            let weight = retry_on_oom(
+                &policy,
+                &self.oom_retries,
+                || self.upload(weights, tensor),
+                || recover(weights.file(), policy.retry_pause),
+            )?;
+            loaded.weights.push(weight);
+            if let Some(file) = drop_file {
                 cuda::drop_page_cache(file, tensor.abs_offset(), tensor.byte_len())?;
             }
         }
@@ -225,22 +346,21 @@ impl CudaProjector {
         Ok(loaded)
     }
 
-    /// Loads the tiled tensors of `model` onto the device and reads its F32
-    /// tensors to the host.
+    /// Loads every tensor of `model` onto the device: the tiled tensors as
+    /// tiles, the F32 tensors as raw copies.
     ///
-    /// The host tensors are read first: a bad one fails the call after about
-    /// 89 MB of reads and before the first device byte is admitted or
-    /// uploaded. The device load then follows [`Self::load`], so the caller's
-    /// `options` carry the reserve and the file whose page cache is dropped.
+    /// This is one [`Self::load`] of the plan's names in inventory order, so
+    /// the caller's `options` carry the reserve and the file whose page cache
+    /// is dropped, admission counts the F32 bytes with the tiles, and a
+    /// failure after any upload frees what was uploaded.
     pub(crate) fn load_model(
         &self,
         model: &GgufModel,
         options: LoadOptions<'_>,
     ) -> Result<LoadedModel, EngError> {
-        let host = model.read_host_f32()?;
-        let names = model.plan().tiled_names();
+        let names = model.plan().device_names();
         let device = self.load(&model.weights, &names, options)?;
-        Ok(LoadedModel { device, host })
+        Ok(LoadedModel { device })
     }
 
     fn admit(&self, tensors: u64, reserve: Reserve) -> Result<(), EngError> {
@@ -257,7 +377,7 @@ impl CudaProjector {
     fn upload(&self, weights: &GgufWeights, tensor: &GgufTensor) -> Result<CudaWeight, EngError> {
         let name = tensor.name();
         match tensor.ggml_type() {
-            ty @ (GgufType::Q4K | GgufType::Q6K | GgufType::Q80) => {
+            ty @ (GgufType::Q4K | GgufType::Q6K | GgufType::Q80 | GgufType::Q50) => {
                 let (n_rows, k) = matrix_shape(tensor)?;
                 let experts = stack_depth(tensor)?;
                 let source_len = usize::try_from(tensor.byte_len()).map_err(|_| {
@@ -413,7 +533,7 @@ fn planned<'w>(weights: &'w GgufWeights, name: &str) -> Result<(&'w GgufTensor, 
     if let &[_, out, _] = tensor.dims()
         && matches!(
             tensor.ggml_type(),
-            GgufType::Q4K | GgufType::Q6K | GgufType::Q80
+            GgufType::Q4K | GgufType::Q6K | GgufType::Q80 | GgufType::Q50
         )
         && !out.is_multiple_of(plan::TILE_ROWS)
     {
@@ -425,7 +545,7 @@ fn planned<'w>(weights: &'w GgufWeights, name: &str) -> Result<(&'w GgufTensor, 
     Ok((tensor, bytes))
 }
 
-/// Rejects a Q6_K or Q8_0 tensor whose scales overflow fp16 before the first
+/// Rejects a Q6_K, Q8_0 or Q5_0 tensor whose scales overflow fp16 before the first
 /// upload. This reads each such tensor once more than the upload does, one
 /// tensor and one chunk of whole blocks at a time, so host memory stays at
 /// one chunk of at most `chunk_limit` bytes.
@@ -438,6 +558,7 @@ fn check_scale_ranges(
         let check = match tensor.ggml_type() {
             GgufType::Q6K => cuda::check_q6k_scales,
             GgufType::Q80 => cuda::check_q8_0_scales,
+            GgufType::Q50 => cuda::check_q5_0_scales,
             _ => continue,
         };
         scan_blocks(weights, tensor, chunk_limit, check)?;
@@ -506,6 +627,7 @@ fn matrix_shape(tensor: &GgufTensor) -> Result<(usize, usize), EngError> {
     Ok((n_rows, k))
 }
 
+mod load_policy;
 #[cfg(test)]
 mod model_tests;
 #[cfg(test)]

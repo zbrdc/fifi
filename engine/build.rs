@@ -50,16 +50,51 @@ fn main() {
     build.compile("inference_mlx_guard");
 }
 
-const CUDA_SOURCES: [&str; 5] = [
+/// CUDA sources of the adapter, one path per line. The order is the member order of the
+/// archive, so a new entry goes at the end. A resident kernel packet adds its
+/// `native/resident/<n>.cu` here (recipe: the doc of `kernels::cuda::resident`).
+const CUDA_SOURCES: &[&str] = &[
     "src/kernels/cuda/native/smoke.cu",
     "src/kernels/cuda/native/projector.cu",
+    "src/kernels/cuda/native/stream.cu",
     "vendor/xavier-qwen/src/kernels.cu",
     "vendor/xavier-qwen/src/ops.cu",
     "vendor/xavier-qwen/src/repack.cu",
+    "src/kernels/cuda/native/device_info.cu",
+    "src/kernels/cuda/native/resident/matmul_expert.cu",
+    "src/kernels/cuda/native/resident/attn_decode.cu",
+    "src/kernels/cuda/native/resident/step_params.cu",
+    "src/kernels/cuda/native/resident/router.cu",
+    "src/kernels/cuda/native/resident/attn_prep.cu",
+    "src/kernels/cuda/native/resident/matmul_q5_0.cu",
+    "src/kernels/cuda/native/resident/graph.cu",
+    "src/kernels/cuda/native/resident/gdn_delta.cu",
+    "src/kernels/cuda/native/resident/gdn_conv.cu",
+    "src/kernels/cuda/native/resident/embed.cu",
+    "src/kernels/cuda/native/resident/moe_combine.cu",
+    "src/kernels/cuda/native/resident/swiglu_pack.cu",
+    "src/kernels/cuda/native/resident/add_norm_pack.cu",
 ];
-const CUDA_HEADERS: [&str; 8] = [
+/// Headers whose change reruns the build, one path per line, alphabetical. A resident kernel
+/// adds its `native/resident/<n>.h` here.
+const CUDA_HEADERS: &[&str] = &[
     "src/kernels/cuda/native/abi.h",
+    "src/kernels/cuda/native/abi_device.h",
+    "src/kernels/cuda/native/abi_resident.h",
     "src/kernels/cuda/native/device.h",
+    "src/kernels/cuda/native/resident/add_norm_pack.h",
+    "src/kernels/cuda/native/resident/attn_decode.h",
+    "src/kernels/cuda/native/resident/attn_prep.h",
+    "src/kernels/cuda/native/resident/embed.h",
+    "src/kernels/cuda/native/resident/gdn_conv.h",
+    "src/kernels/cuda/native/resident/gdn_delta.h",
+    "src/kernels/cuda/native/resident/graph.h",
+    "src/kernels/cuda/native/resident/matmul_expert.h",
+    "src/kernels/cuda/native/resident/matmul_q5_0.h",
+    "src/kernels/cuda/native/resident/moe_combine.h",
+    "src/kernels/cuda/native/resident/router.h",
+    "src/kernels/cuda/native/resident/step_params.h",
+    "src/kernels/cuda/native/resident/swiglu_pack.h",
     "vendor/xavier-qwen/src/frag_layout.cuh",
     "vendor/xavier-qwen/src/gemm.cuh",
     "vendor/xavier-qwen/src/kernels.h",

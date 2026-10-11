@@ -147,7 +147,20 @@ __global__ void attn_prep_k(AttnArgs a) {
   constexpr int D = kHeadDim;
   __shared__ float x[D];
   int head = blockIdx.x, t = blockIdx.y, d = threadIdx.x;
-  int pos = (a.pos_dev ? *a.pos_dev : a.pos0) + t;
+  // Poison guard (RD-8a): the position word is read from the device and may hold the -1 of a
+  // saturated step. Test it, in 64 bits, against the cache rows before any memory access. The
+  // answer is the same for every block of the launch (while no other stream writes the word), so
+  // the early return below is block uniform and happens before the first barrier. A refused launch
+  // writes no KV row, ORs status_bits into status_dev (one thread, integer atomic) and sets q to
+  // NaN so that the attention that reads it cannot yield a plausible value.
+  long long first = a.pos_dev ? *a.pos_dev : a.pos0;
+  if (first < 0 || first + a.m > a.rows) {
+    if (a.status_dev && blockIdx.x == 0 && blockIdx.y == 0 && threadIdx.x == 0)
+      atomicOr(a.status_dev, a.status_bits);
+    if (head < a.n_head) a.q[((size_t)t * a.n_head + head) * D + d] = __int_as_float(0x7fc00000);
+    return;
+  }
+  int pos = (int)first + t;
   const float* p = a.proj + (size_t)t * a.ld;
   int kv_base = a.n_head * 2 * D;
   if (head >= a.n_head + a.n_kv_head) {

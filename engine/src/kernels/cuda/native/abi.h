@@ -93,7 +93,9 @@ int inference_cuda_free(void *device, int *out_stage);
 int inference_cuda_drop_page_cache(int fd, long long offset, long long len,
                                    int *out_errno);
 
-/* GGML type codes the tiled weight functions accept. */
+/* GGML type codes the tiled weight functions accept. Q5_0 is accepted only by
+ * inference_cuda_linear_ws (MEL-C1b); its tiles are built on the host, not by repack. */
+#define INFERENCE_CUDA_TYPE_Q5_0 6
 #define INFERENCE_CUDA_TYPE_Q8_0 8
 #define INFERENCE_CUDA_TYPE_Q4_K 12
 #define INFERENCE_CUDA_TYPE_Q6_K 14
@@ -136,7 +138,11 @@ int inference_cuda_linear_workspace_bytes(int m, int k, int n_rows, size_t *out_
  * fp16 and products are summed in fp32. x holds m * k floats and y
  * m * n_rows floats, both host memory; workspace holds the device scratch and
  * is not freed or retained. Nothing is allocated or freed. The call copies x
- * in, packs, multiplies, waits for the device, and copies y back. */
+ * in, packs, multiplies, waits for the device, and copies y back.
+ * Q5_0 (type 6, MEL-C1b): k is a multiple of 128, m is at most 16, and the
+ * workspace is sized by inference_cuda_linear_workspace_bytes for k rounded
+ * up to a multiple of 256 (x holds m rows of that width); the call zeroes the
+ * tail of each staged row. */
 int inference_cuda_linear_ws(int ggml_type, const void *weight, int n_rows, int k,
                              const float *x, int m, float *y,
                              const inference_cuda_workspace *workspace, int *out_stage);

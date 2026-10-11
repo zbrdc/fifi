@@ -6,6 +6,7 @@
 //! reproduces exactly. Each device test is skipped when no device is visible;
 //! INFERENCE_CUDA_REQUIRE_DEVICE turns that skip into a failure.
 
+use super::load_policy::{OOM_RETRIES, is_device_out_of_memory, tests::resident_bytes};
 use super::*;
 use crate::family::project::{DenseProjector, DenseWeight};
 use crate::kernels::cuda::device_count;
@@ -270,7 +271,7 @@ pub(super) fn device_present(test: &str) -> bool {
 
 /// fp16 bits -> f32 from the fields, so the scale checks do not rely on the
 /// production decoder they are meant to check. Every fp16 value is exact in f32.
-fn f16_value(bits: u16) -> f32 {
+pub(super) fn f16_value(bits: u16) -> f32 {
     let sign = if (bits & 0x8000) != 0 { -1.0 } else { 1.0 };
     let exponent = i32::from((bits >> 10) & 0x1f);
     let fraction = bits & 0x3ff;
@@ -1049,6 +1050,37 @@ fn headroom_beyond_free_memory_fails_admission_and_the_backend_still_loads() {
     );
 }
 
+/// The F32 payload of the tensor `norm` of the fixtures: distinct values, so a shifted or
+/// zeroed upload differs.
+fn norm_bytes() -> Vec<u8> {
+    (0..N_ROWS * K)
+        .flat_map(|i| (i as f32 / 64.0).to_le_bytes())
+        .collect()
+}
+
+/// Requires `name` to be a raw F32 tensor whose device bytes equal `want`.
+pub(super) fn assert_raw_f32_bytes(
+    projector: &CudaProjector,
+    loaded: &CudaWeights,
+    name: &str,
+    want: &[u8],
+) {
+    let CudaWeight::Raw {
+        ty: GgufType::F32,
+        buffer,
+        ..
+    } = weight_of(loaded, name)
+    else {
+        panic!("{name} did not load as a raw F32 tensor");
+    };
+    let mut device = vec![0u8; buffer.bytes()];
+    projector
+        .context
+        .download(buffer, &mut device)
+        .expect("download the raw tensor");
+    assert_same_bytes(name, &device, want);
+}
+
 #[test]
 fn raw_tensors_load_as_raw_and_linear_rejects_them_without_breaking_the_backend() {
     const NAME: &str =
@@ -1063,28 +1095,20 @@ fn raw_tensors_load_as_raw_and_linear_rejects_them_without_breaking_the_backend(
         K,
         dequantize(GgufType::Q4K, &source).expect("dequantize"),
     );
-    let norm: Vec<u8> = (0..N_ROWS * K)
-        .flat_map(|i| (i as f32 / 64.0).to_le_bytes())
-        .collect();
+    let norm = norm_bytes();
     let half: Vec<u8> = (0..N_ROWS * K)
         .flat_map(|_| 0x3c00u16.to_le_bytes())
         .collect();
     let (_dir, weights) = open_fixture(&[
         weight_entry("w", GgufType::Q4K, (N_ROWS, K), source),
-        weight_entry("norm", GgufType::F32, (N_ROWS, K), norm),
+        weight_entry("norm", GgufType::F32, (N_ROWS, K), norm.clone()),
         weight_entry("half", GgufType::F16, (N_ROWS, K), half),
     ]);
     let mut projector = CudaProjector::new().expect("create the CUDA projector");
     let loaded = projector
         .load(&weights, &["w", "norm", "half"], LoadOptions::default())
         .expect("load the mixed weights");
-    assert!(matches!(
-        loaded.get("norm"),
-        Some(CudaWeight::Raw {
-            ty: GgufType::F32,
-            ..
-        })
-    ));
+    assert_raw_f32_bytes(&projector, &loaded, "norm", &norm);
     assert!(matches!(
         loaded.get("half"),
         Some(CudaWeight::Raw {
@@ -1552,7 +1576,8 @@ fn pipe_file() -> File {
     File::from(std::os::fd::OwnedFd::from(reader))
 }
 
-/// A Q4_K tensor `big` of [`UNWIND_ROWS`] rows and a small Q4_K tensor `w`.
+/// A Q4_K tensor `big` of [`UNWIND_ROWS`] rows, a small Q4_K tensor `w` and a small F32
+/// tensor `norm`, in that file order.
 fn big_and_small_fixture() -> Fixture {
     let mut rng = Rng(SEED);
     let big = q4k_blocks(&mut rng, UNWIND_ROWS * UNWIND_K / BLOCK_VALUES);
@@ -1565,6 +1590,7 @@ fn big_and_small_fixture() -> Fixture {
     let (dir, weights) = open_fixture(&[
         weight_entry("big", GgufType::Q4K, (UNWIND_ROWS, UNWIND_K), big),
         weight_entry("w", GgufType::Q4K, (N_ROWS, K), small),
+        weight_entry("norm", GgufType::F32, (N_ROWS, K), norm_bytes()),
     ]);
     Fixture {
         _dir: dir,
@@ -1645,6 +1671,77 @@ fn a_load_that_fails_after_an_upload_frees_it_and_stays_usable() {
         after.saturating_sub(before)
     );
     assert_loads_and_runs_after(&mut projector, &fixture, "q4k after a failed load");
+}
+
+#[test]
+fn a_load_that_fails_after_a_raw_upload_frees_it_and_stays_usable() {
+    const NAME: &str = "a_load_that_fails_after_a_raw_upload_frees_it_and_stays_usable";
+    if !device_present(NAME) {
+        return;
+    }
+    let fixture = big_and_small_fixture();
+    let mut projector = CudaProjector::new().expect("create the CUDA projector");
+    let before = projector.live_bytes();
+    {
+        let loaded = projector
+            .load(&fixture.weights, &["norm"], LoadOptions::default())
+            .expect("load norm alone");
+        assert_eq!(loaded.device_bytes(), N_ROWS * K * 4, "raw F32 bytes");
+        assert_eq!(
+            projector.live_bytes() - before,
+            loaded.device_bytes(),
+            "the live count must hold exactly the raw tensor"
+        );
+    }
+    assert_eq!(projector.live_bytes(), before, "dropping the load freed it");
+    // The pipe fails the page-cache drop right after the first upload, which
+    // is the raw tensor here: it is already owned by the load when that fails.
+    let pipe = pipe_file();
+    let options = LoadOptions {
+        drop_page_cache: Some(&pipe),
+        ..LoadOptions::default()
+    };
+    let text = error_text(projector.load(&fixture.weights, &["norm", "big", "w"], options));
+    assert!(
+        text.starts_with("Backend") && text.contains("posix_fadvise") && text.contains("errno 29"),
+        "expected the ESPIPE page-cache failure, got {text}"
+    );
+    let after = projector.live_bytes();
+    assert_eq!(
+        after,
+        before,
+        "the failed load leaked {} device bytes",
+        after.saturating_sub(before)
+    );
+    assert_loads_and_runs_after(&mut projector, &fixture, "q4k after a failed raw load");
+}
+
+#[test]
+fn the_admission_sum_of_a_load_includes_its_raw_f32_bytes() {
+    const NAME: &str = "the_admission_sum_of_a_load_includes_its_raw_f32_bytes";
+    if !device_present(NAME) {
+        return;
+    }
+    let fixture = big_and_small_fixture();
+    let projector = CudaProjector::new().expect("create the CUDA projector");
+    let before = projector.live_bytes();
+    let tiled = (UNWIND_ROWS / TILE_ROWS) * (UNWIND_K / BLOCK_VALUES) * Q4K_TILE_BYTES
+        + (N_ROWS / TILE_ROWS) * BLOCKS_PER_ROW * Q4K_TILE_BYTES;
+    let raw = N_ROWS * K * 4;
+    let refused = LoadOptions {
+        reserve: Reserve {
+            headroom: u64::MAX / 2,
+            ..Reserve::default()
+        },
+        ..LoadOptions::default()
+    };
+    let names = ["big", "w", "norm"];
+    let text = error_text(projector.load(&fixture.weights, &names, refused));
+    assert!(
+        text.contains(&format!("(tensors {},", tiled + raw)),
+        "the sum must be the tiles plus the raw bytes ({tiled} + {raw}), got {text}"
+    );
+    assert_eq!(projector.live_bytes(), before, "a refusal uploads nothing");
 }
 
 #[test]
@@ -2850,4 +2947,669 @@ fn meminfo_kb_reads_only_the_named_line() {
     assert_eq!(meminfo_kb(text, "MemFree"), 1000);
     assert_eq!(meminfo_kb(text, "MemAvailable"), 2000);
     assert_eq!(meminfo_kb(text, "Cached"), 300);
+}
+
+// LD-1: the load policy of an integrated GPU.
+
+/// Residency at or below which a file counts as evicted. `posix_fadvise(DONTNEED)`
+/// drops whole pages inside the range only, so a page shared by two tensors, or
+/// holding the header, survives a per-tensor drop.
+const EVICTED_MAX: u64 = 8 * 4096;
+/// Residency allowed after a load that read tensors and dropped each range.
+/// Sequential reads leave a readahead tail past the last range: 512 KiB were
+/// measured on the Xavier (`read_ahead_kb` 128). A load that skipped the drop
+/// leaves the whole tensor data, 14 MiB or more in these fixtures.
+const LOAD_RESIDUAL_MAX: u64 = 2 << 20;
+/// Rows of the Q6_K tensor of the scan test: 3.4 MB of source, well above any
+/// readahead tail, so only the second eviction can clear it.
+const SCAN_Q6_ROWS: usize = 8192;
+
+fn fixture_path(fixture: &Fixture) -> PathBuf {
+    fixture._dir.path().join("fixture.gguf")
+}
+
+/// Reads the whole file so the page cache holds it.
+fn warm(path: &Path) {
+    std::fs::read(path).expect("read the fixture file");
+}
+
+/// True when the filesystem of `path` honours `posix_fadvise(DONTNEED)` and
+/// `fincore` can see it. Otherwise prints why the test cannot judge residency
+/// and returns false: a skip is never a pass (see `SKIPPED` in the logs).
+fn droppable(path: &Path, name: &str) -> bool {
+    let file = File::open(path).expect("open the fixture file");
+    // Dirty pages survive the call, so write the fixture out first.
+    file.sync_all().expect("sync the fixture file");
+    warm(path);
+    match resident_bytes(path) {
+        Some(bytes) if bytes > EVICTED_MAX => {}
+        other => {
+            println!("SKIPPED {name}: fincore shows {other:?} bytes after reading the file");
+            return false;
+        }
+    }
+    cuda::drop_page_cache(&file, 0, 0).expect("drop the fixture from the page cache");
+    match resident_bytes(path) {
+        Some(bytes) if bytes <= EVICTED_MAX => true,
+        other => {
+            println!("SKIPPED {name}: the filesystem keeps {other:?} bytes after posix_fadvise");
+            false
+        }
+    }
+}
+
+/// Prints `SKIPPED` and returns true on an integrated device, where a request
+/// above the device total is shared RAM and is not run.
+fn skip_if_integrated(name: &str) -> bool {
+    let integrated = cuda::device_is_integrated().expect("query the integrated attribute");
+    if integrated {
+        println!("SKIPPED {name}: integrated device, an oversized request is shared RAM");
+    }
+    integrated
+}
+
+/// Rows of 32768 Q4_K values whose tiles need more than `device_total` plus
+/// 1 GiB, a whole number of 8-row groups.
+fn oversized_rows(device_total: usize) -> usize {
+    let row_tile_bytes = CHUNK_BLOCKS_PER_ROW * Q4K_TILE_BYTES / TILE_ROWS;
+    ((device_total + (1 << 30)) / row_tile_bytes + 1).next_multiple_of(TILE_ROWS)
+}
+
+fn oversized_quant(name: &str, rows: usize) -> QuantTensor<'_> {
+    QuantTensor {
+        name,
+        ty: GgufType::Q4K,
+        n_rows: rows,
+        k: CHUNK_K,
+        source_len: rows * CHUNK_BLOCKS_PER_ROW * Q4K_BLOCK_BYTES,
+    }
+}
+
+/// A GGUF with a small Q4_K `w` and, last, a Q4_K `huge` whose tiles exceed the
+/// device. `huge` is a sparse file hole: the file is extended to the end of its
+/// range and nothing is ever read from it.
+fn sparse_oom_fixture(device_total: usize) -> (tempfile::TempDir, GgufWeights) {
+    let rows = oversized_rows(device_total);
+    let mut rng = Rng(SEED);
+    let small = q4k_blocks(&mut rng, N_ROWS * BLOCKS_PER_ROW);
+    let entries = [
+        weight_entry("w", GgufType::Q4K, (N_ROWS, K), small),
+        weight_entry("huge", GgufType::Q4K, (rows, CHUNK_K), Vec::new()),
+    ];
+    let dir = tempfile::tempdir().expect("create the fixture directory");
+    let path = dir.path().join("fixture.gguf");
+    let bytes = gguf_bytes(&entries);
+    std::fs::write(&path, &bytes).expect("write the sparse fixture");
+    let huge_bytes = oversized_quant("huge", rows).source_len as u64;
+    std::fs::OpenOptions::new()
+        .write(true)
+        .open(&path)
+        .expect("reopen the sparse fixture")
+        .set_len(bytes.len() as u64 + huge_bytes)
+        .expect("extend the sparse fixture");
+    let weights = GgufWeights::open(&path, MEASURE_LIMITS, None).expect("open the sparse fixture");
+    (dir, weights)
+}
+
+fn expect_error<T>(result: Result<T, EngError>) -> EngError {
+    match result {
+        Ok(_) => panic!("expected an error, got Ok"),
+        Err(error) => error,
+    }
+}
+
+/// `names` as the plan `load` hands to `transfer`, without admission.
+fn plan_of<'a>(
+    weights: &'a GgufWeights,
+    names: &[&str],
+    policy: LoadPolicy,
+    drop_file: Option<&'a File>,
+) -> LoadPlan<'a> {
+    let tensors = names
+        .iter()
+        .map(|name| planned(weights, name))
+        .collect::<Result<Vec<_>, _>>()
+        .expect("plan the tensors");
+    LoadPlan {
+        tensors,
+        index: load_index(names).expect("index the names"),
+        policy,
+        drop_file,
+    }
+}
+
+#[test]
+fn a_real_device_allocation_failure_is_retried_and_the_next_attempt_can_succeed() {
+    const NAME: &str =
+        "a_real_device_allocation_failure_is_retried_and_the_next_attempt_can_succeed";
+    if !device_present(NAME) || skip_if_integrated(NAME) {
+        return;
+    }
+    let mut rng = Rng(SEED);
+    let source = q4k_blocks(&mut rng, N_ROWS * BLOCKS_PER_ROW);
+    let fixture = Fixture::new(GgufType::Q4K, source.clone());
+    let mut projector = CudaProjector::new().expect("create the CUDA projector");
+    let total = projector.memory_info().expect("query device memory").total;
+    let huge = oversized_quant("huge", oversized_rows(total));
+    let small = QuantTensor {
+        name: "w",
+        ty: GgufType::Q4K,
+        n_rows: N_ROWS,
+        k: K,
+        source_len: source.len(),
+    };
+    let policy = LoadPolicy {
+        retry_pause: Duration::ZERO,
+        ..LoadPolicy::INTEGRATED
+    };
+    let retries = Cell::new(0);
+    let before = projector.live_bytes();
+    let (mut calls, mut betweens) = (0, 0);
+    let mut live_at_entry = Vec::new();
+    let mut first_was_retriable = false;
+    let uploaded = retry_on_oom(
+        &policy,
+        &retries,
+        || {
+            live_at_entry.push(projector.live_bytes());
+            calls += 1;
+            if calls > 1 {
+                let mut read = |at: usize, buf: &mut [u8]| -> Result<(), EngError> {
+                    buf.copy_from_slice(&source[at..at + buf.len()]);
+                    Ok(())
+                };
+                return projector
+                    .context
+                    .upload_tiled(small, CHUNK_LIMIT, &mut read);
+            }
+            let mut never = |_: usize, _: &mut [u8]| -> Result<(), EngError> {
+                panic!("the reader of the oversized tensor must not run")
+            };
+            let outcome = projector
+                .context
+                .upload_tiled(huge, CHUNK_LIMIT, &mut never);
+            let error = expect_error(outcome);
+            first_was_retriable = is_device_out_of_memory(&error);
+            Err(error)
+        },
+        || {
+            betweens += 1;
+            Ok(())
+        },
+    )
+    .expect("the second attempt uploads the small tensor");
+    // The classifier is pinned to the real error text of the driver refusal.
+    assert!(
+        first_was_retriable,
+        "the real refusal is not classified as retriable"
+    );
+    assert_eq!((calls, betweens, retries.get()), (2, 1, 1));
+    assert_eq!(
+        live_at_entry,
+        [before, before],
+        "the failed attempt left device bytes"
+    );
+    let tile_bytes = N_ROWS / TILE_ROWS * BLOCKS_PER_ROW * Q4K_TILE_BYTES;
+    assert_eq!(uploaded.buffer().bytes(), tile_bytes);
+    assert_eq!(projector.live_bytes() - before, tile_bytes);
+    drop(uploaded);
+    assert_eq!(projector.live_bytes(), before);
+    assert_loads_and_runs_after(&mut projector, &fixture, "q4k after a retried attempt");
+}
+
+/// Shared body of L2 and L3: `w` uploads, `huge` is refused by the device with
+/// `retries` retries first, and everything is freed again.
+fn assert_persistent_refusal(name: &str, integrated: bool, retries: u32) {
+    if !device_present(name) || skip_if_integrated(name) {
+        return;
+    }
+    let mut projector = CudaProjector::new()
+        .expect("create the CUDA projector")
+        .with_integrated(integrated);
+    let total = projector.memory_info().expect("query device memory").total;
+    let (_dir, weights) = sparse_oom_fixture(total);
+    let policy = LoadPolicy {
+        retry_pause: Duration::ZERO,
+        ..LoadPolicy::for_device(integrated)
+    };
+    let before = projector.live_bytes();
+    let plan = plan_of(&weights, &["w", "huge"], policy, None);
+    let error = expect_error(projector.transfer(&weights, plan));
+    assert!(is_device_out_of_memory(&error), "got {error:?}");
+    assert_eq!(
+        projector.live_bytes(),
+        before,
+        "w was not freed by the unwind"
+    );
+    assert_eq!(projector.oom_retries(), retries);
+    let fixture = Fixture::new(
+        GgufType::Q4K,
+        q4k_blocks(&mut Rng(SEED), N_ROWS * BLOCKS_PER_ROW),
+    );
+    assert_loads_and_runs_after(&mut projector, &fixture, "q4k after a refused tensor");
+}
+
+#[test]
+fn a_persistent_allocation_failure_on_an_integrated_policy_retries_twice_and_frees_everything() {
+    assert_persistent_refusal(
+        "a_persistent_allocation_failure_on_an_integrated_policy_retries_twice_and_frees_everything",
+        true,
+        OOM_RETRIES,
+    );
+}
+
+#[test]
+fn a_persistent_allocation_failure_on_a_discrete_policy_is_not_retried() {
+    assert_persistent_refusal(
+        "a_persistent_allocation_failure_on_a_discrete_policy_is_not_retried",
+        false,
+        0,
+    );
+}
+
+#[test]
+fn an_integrated_load_evicts_the_file_before_admission() {
+    const NAME: &str = "an_integrated_load_evicts_the_file_before_admission";
+    if !device_present(NAME) {
+        return;
+    }
+    for integrated in [true, false] {
+        let fixture = big_and_small_fixture();
+        let path = fixture_path(&fixture);
+        if !droppable(&path, NAME) {
+            return;
+        }
+        warm(&path);
+        assert!(resident_bytes(&path).is_some_and(|bytes| bytes > EVICTED_MAX));
+        let projector = CudaProjector::new()
+            .expect("create the CUDA projector")
+            .with_integrated(integrated);
+        let options = LoadOptions {
+            reserve: Reserve {
+                headroom: u64::MAX / 2,
+                ..Reserve::default()
+            },
+            drop_page_cache: None,
+        };
+        assert_error(
+            projector.load(&fixture.weights, &["w"], options),
+            "MemoryPlan",
+            "cuda admission",
+        );
+        let resident = resident_bytes(&path).expect("fincore after the refused load");
+        assert_eq!(
+            resident <= EVICTED_MAX,
+            integrated,
+            "integrated={integrated}: {resident} bytes resident after the refusal"
+        );
+    }
+}
+
+#[test]
+fn an_integrated_load_drops_each_tensor_when_the_caller_passes_no_file() {
+    const NAME: &str = "an_integrated_load_drops_each_tensor_when_the_caller_passes_no_file";
+    if !device_present(NAME) {
+        return;
+    }
+    for integrated in [true, false] {
+        let fixture = big_and_small_fixture();
+        let path = fixture_path(&fixture);
+        if !droppable(&path, NAME) {
+            return;
+        }
+        warm(&path);
+        let projector = CudaProjector::new()
+            .expect("create the CUDA projector")
+            .with_integrated(integrated);
+        let loaded = projector
+            .load(&fixture.weights, &["big", "w"], LoadOptions::default())
+            .expect("load big and w");
+        drop(loaded);
+        let resident = resident_bytes(&path).expect("fincore after the load");
+        let length = std::fs::metadata(&path).expect("fixture length").len();
+        if integrated {
+            assert!(
+                resident <= LOAD_RESIDUAL_MAX,
+                "{resident} bytes resident after the load"
+            );
+            assert_eq!(projector.oom_retries(), 0);
+        } else {
+            // Control: a discrete policy keeps the caller's choice, here no drop.
+            assert!(
+                resident >= length / 2,
+                "{resident} of {length} bytes resident"
+            );
+        }
+    }
+}
+
+#[test]
+fn a_callers_file_wins_over_the_forced_drop() {
+    const NAME: &str = "a_callers_file_wins_over_the_forced_drop";
+    if !device_present(NAME) {
+        return;
+    }
+    let fixture = big_and_small_fixture();
+    let projector = CudaProjector::new()
+        .expect("create the CUDA projector")
+        .with_integrated(true);
+    let before = projector.live_bytes();
+    let pipe = pipe_file();
+    let options = LoadOptions {
+        drop_page_cache: Some(&pipe),
+        ..LoadOptions::default()
+    };
+    let text = error_text(projector.load(&fixture.weights, &["big", "w"], options));
+    assert!(
+        text.starts_with("Backend") && text.contains("cuda adapter"),
+        "expected a non-terminal Backend cuda adapter error, got {text}"
+    );
+    assert!(
+        text.contains("posix_fadvise") && text.contains("errno 29"),
+        "the error must carry the status and ESPIPE, got {text}"
+    );
+    assert_eq!(
+        projector.live_bytes(),
+        before,
+        "the failed load leaked device bytes"
+    );
+}
+
+#[test]
+fn an_integrated_load_evicts_again_after_the_scale_scan() {
+    const NAME: &str = "an_integrated_load_evicts_again_after_the_scale_scan";
+    if !device_present(NAME) {
+        return;
+    }
+    let mut rng = Rng(SEED);
+    let (dir, weights) = open_fixture(&[
+        weight_entry(
+            "w",
+            GgufType::Q4K,
+            (N_ROWS, K),
+            q4k_blocks(&mut rng, N_ROWS * BLOCKS_PER_ROW),
+        ),
+        weight_entry(
+            "q6",
+            GgufType::Q6K,
+            (SCAN_Q6_ROWS, K),
+            q6k_blocks(&mut rng, SCAN_Q6_ROWS * BLOCKS_PER_ROW),
+        ),
+    ]);
+    let path = dir.path().join("fixture.gguf");
+    if !droppable(&path, NAME) {
+        return;
+    }
+    warm(&path);
+    let projector = CudaProjector::new()
+        .expect("create the CUDA projector")
+        .with_integrated(true);
+    // The pipe fails the drop right after `w`: the failure point is the first
+    // upload, so the scan of `q6` and both evictions have run by then.
+    let pipe = pipe_file();
+    let options = LoadOptions {
+        drop_page_cache: Some(&pipe),
+        ..LoadOptions::default()
+    };
+    let text = error_text(projector.load(&weights, &["w", "q6"], options));
+    assert!(
+        text.contains("posix_fadvise") && text.contains("errno 29"),
+        "the load must fail at the pipe drop, got {text}"
+    );
+    // The scan read the 3.4 MB of `q6` back into the cache. Only the second
+    // eviction removes them; what is left is `w` and a readahead tail.
+    let resident = resident_bytes(&path).expect("fincore after the failed load");
+    assert!(
+        resident < 1 << 20,
+        "{resident} bytes resident after the failed load"
+    );
+}
+
+const Q5_0_BLOCK_BYTES: usize = 22;
+/// One Q5_0 tile: 8 rows of 128 values, 44 sixteen-byte vectors.
+const Q5_0_TILE_BYTES: usize = 44 * 16;
+/// Values per row of a Q5_0 tile, and Mellum's `ffn_down_exps` row length.
+const Q5_0_TILE_COLS: usize = 128;
+const Q5_0_K: usize = 896;
+
+impl Layout {
+    /// Q5_0 in 128-value units: the four 22-byte blocks of one row and tile
+    /// column are contiguous in the source, so they act as one 88-byte block.
+    pub(super) fn q5_0(n_rows: usize, tiles_per_row: usize) -> Self {
+        Self {
+            block_bytes: 4 * Q5_0_BLOCK_BYTES,
+            tile_bytes: Q5_0_TILE_BYTES,
+            n_rows,
+            blocks_per_row: tiles_per_row,
+        }
+    }
+}
+
+/// The Q5_0 source bytes rebuilt from the device tiles. Written from the tile
+/// diagram of `tile_q5_0.rs`, walking the destination (source) blocks.
+pub(super) fn decode_q5_0(tiles: &[u8], layout: Layout) -> Vec<u8> {
+    let mut source = vec![0u8; layout.block_count() * layout.block_bytes];
+    for row in 0..layout.n_rows {
+        for column in 0..layout.blocks_per_row {
+            let tile = &tiles[layout.tile_range(row, column)];
+            let out = &mut source[layout.block_range(row, column)];
+            for (j, block) in out
+                .as_chunks_mut::<Q5_0_BLOCK_BYTES>()
+                .0
+                .iter_mut()
+                .enumerate()
+            {
+                let b = 4 * (row % TILE_ROWS) + j;
+                block[..2].copy_from_slice(&tile[2 * b..2 * b + 2]);
+                block[2..6].copy_from_slice(&tile[64 + 4 * b..64 + 4 * b + 4]);
+                block[6..].copy_from_slice(&tile[192 + 16 * b..192 + 16 * b + 16]);
+            }
+        }
+    }
+    source
+}
+
+/// Q5_0 blocks: a small fp16 `d`, then random `qh` and `qs` bytes.
+fn q5_0_blocks(rng: &mut Rng, blocks: usize) -> Vec<u8> {
+    let mut out = Vec::with_capacity(blocks * Q5_0_BLOCK_BYTES);
+    for _ in 0..blocks {
+        out.extend_from_slice(&small_f16(rng));
+        out.extend((0..Q5_0_BLOCK_BYTES - 2).map(|_| rng.byte()));
+    }
+    out
+}
+
+/// Loads a Q5_0 tensor `w` of `n_rows` x 896 under `chunk_limit` and checks
+/// that its tiles decode to the source bytes and dequantize to the same bits.
+fn q5_0_round_trip(n_rows: usize, chunk_limit: usize, label: &str) {
+    let mut rng = Rng(SEED ^ 5);
+    let blocks_per_row = Q5_0_K / 32;
+    let source = q5_0_blocks(&mut rng, n_rows * blocks_per_row);
+    let (_dir, weights) = open_fixture(&[weight_entry(
+        "w",
+        GgufType::Q50,
+        (n_rows, Q5_0_K),
+        source.clone(),
+    )]);
+    let projector = CudaProjector::new()
+        .expect("create the CUDA projector")
+        .with_chunk_limit(chunk_limit);
+    let before = projector.live_bytes();
+    let loaded = projector
+        .load(&weights, &["w"], LoadOptions::default())
+        .expect("load the Q5_0 weight");
+    let weight = tiled_of(&loaded, "w");
+    let tiles = download_tiles(&projector, weight);
+    assert_eq!(weight.n_rows(), n_rows);
+    assert_eq!(tiles.len(), source.len(), "{label}: no padding bytes");
+    assert_eq!(projector.live_bytes() - before, source.len(), "{label}");
+    let layout = Layout::q5_0(n_rows, Q5_0_K / Q5_0_TILE_COLS);
+    let decoded = decode_q5_0(&tiles, layout);
+    assert_same_bytes(label, &decoded, &source);
+    let from_device = dequantize(GgufType::Q50, &decoded).expect("dequantize the decoded tiles");
+    let from_source = dequantize(GgufType::Q50, &source).expect("dequantize the source");
+    assert_bits_equal(label, &from_device, &from_source);
+    println!("T1 {label}: {} tile bytes equal the source", tiles.len());
+}
+
+#[test]
+fn q5_0_tiles_decode_to_source_bytes_and_dequantize_bit_exact() {
+    const NAME: &str = "q5_0_tiles_decode_to_source_bytes_and_dequantize_bit_exact";
+    if !device_present(NAME) {
+        return;
+    }
+    q5_0_round_trip(16, CHUNK_BYTES, "q5_0 16 x 896");
+}
+
+#[test]
+fn q5_0_tiles_spanning_two_upload_chunks_decode_bit_exactly() {
+    const NAME: &str = "q5_0_tiles_spanning_two_upload_chunks_decode_bit_exactly";
+    if !device_present(NAME) {
+        return;
+    }
+    // One group of K = 896 is 7 tiles of 704 bytes: a limit of one group gives
+    // three chunks for 24 rows.
+    q5_0_round_trip(24, 7 * Q5_0_TILE_BYTES, "q5_0 24 x 896 in 3 chunks");
+}
+
+/// `x · Wᵀ` of the Q5_0 `source` rows (`k` values each) per token of `x`, summed in f64 from the
+/// exactly dequantized weights. The activations of the tests below are exact in fp16, so the
+/// device's fp16 conversion of x changes nothing in the reference.
+fn q5_0_reference(source: &[u8], k: usize, x: &[f32]) -> Vec<f32> {
+    let weights = dequantize(GgufType::Q50, source).expect("dequantize the Q5_0 source");
+    let mut out = Vec::new();
+    for token in x.chunks_exact(k) {
+        for row in weights.chunks_exact(k) {
+            let sum: f64 = row
+                .iter()
+                .zip(token)
+                .map(|(w, x)| f64::from(*w) * f64::from(*x))
+                .sum();
+            out.push(sum as f32);
+        }
+    }
+    out
+}
+
+/// Per-token T3 gate for `rows` outputs: the NMSE within the bound, and the argmax from 64 rows.
+fn assert_rows_match(label: &str, device: &[f32], reference: &[f32], rows: usize) {
+    assert_eq!(device.len(), reference.len(), "{label}: output length");
+    let mut worst = 0.0f64;
+    for (token, (got, want)) in device
+        .chunks_exact(rows)
+        .zip(reference.chunks_exact(rows))
+        .enumerate()
+    {
+        let nmse = normalized_mse(got, want);
+        assert!(
+            nmse <= NMSE_BOUND,
+            "{label}: token {token} NMSE {nmse:e} exceeds the bound {NMSE_BOUND:e}"
+        );
+        if rows >= 64 {
+            assert_eq!(argmax(got), argmax(want), "{label}: token {token} argmax");
+        }
+        worst = worst.max(nmse);
+    }
+    println!(
+        "T3 {label}: max NMSE {worst:.3e} over {} tokens (bound {NMSE_BOUND:e})",
+        device.len() / rows
+    );
+}
+
+/// Tokens of integers in [-4, 4] over eighths: exact in fp16.
+fn exact_fp16_input(tokens: usize, k: usize) -> Vec<f32> {
+    (0..tokens * k)
+        .map(|i| ((i * 7 + i / k) % 17) as f32 / 4.0 - 2.0)
+        .collect()
+}
+
+#[test]
+fn a_q5_0_weight_runs_through_linear_and_the_guard_is_gone() {
+    const NAME: &str = "a_q5_0_weight_runs_through_linear_and_the_guard_is_gone";
+    if !device_present(NAME) {
+        return;
+    }
+    let mut rng = Rng(SEED ^ 6);
+    let source = q5_0_blocks(&mut rng, N_ROWS * (Q5_0_K / 32));
+    let (_dir, weights) = open_fixture(&[weight_entry(
+        "q5",
+        GgufType::Q50,
+        (N_ROWS, Q5_0_K),
+        source.clone(),
+    )]);
+    let mut projector = CudaProjector::new().expect("create the CUDA projector");
+    let loaded = projector
+        .load(&weights, &["q5"], LoadOptions::default())
+        .expect("load the Q5_0 weight");
+    // One token through the trait: the whole weight.
+    let x = exact_fp16_input(1, Q5_0_K);
+    let device = projector
+        .linear(weight_of(&loaded, "q5"), &x)
+        .expect("linear, one token");
+    assert_rows_match(
+        "q5_0 linear 64 x 896 m=1",
+        &device,
+        &q5_0_reference(&source, Q5_0_K, &x),
+        N_ROWS,
+    );
+    // Nine tokens against rows 8..16 through the context, as an expert read does.
+    let x9 = exact_fp16_input(9, Q5_0_K);
+    let tiled = tiled_of(&loaded, "q5");
+    let device = projector
+        .context
+        .linear_rows(tiled, 8, 8, &x9)
+        .expect("linear_rows, nine tokens");
+    let row_bytes = Q5_0_K / 32 * Q5_0_BLOCK_BYTES;
+    let reference = q5_0_reference(&source[8 * row_bytes..16 * row_bytes], Q5_0_K, &x9);
+    assert_rows_match("q5_0 linear_rows 8..16 m=9", &device, &reference, 8);
+    // Seventeen tokens are refused in Rust before any native call.
+    let x17 = exact_fp16_input(17, Q5_0_K);
+    assert_error(
+        projector.context.linear_rows(tiled, 0, N_ROWS, &x17),
+        "BadRequest",
+        "16 tokens",
+    );
+    drop(loaded);
+    let fixture = big_and_small_fixture();
+    assert_loads_and_runs_after(&mut projector, &fixture, "after a refused Q5_0 matmul");
+}
+
+#[test]
+fn a_q5_0_tensor_with_a_scale_past_the_fp16_range_fails_the_load_before_any_upload() {
+    const NAME: &str =
+        "a_q5_0_tensor_with_a_scale_past_the_fp16_range_fails_the_load_before_any_upload";
+    if !device_present(NAME) {
+        return;
+    }
+    let mut rng = Rng(SEED ^ 7);
+    let mut source = q5_0_blocks(&mut rng, 8 * (Q5_0_K / 32));
+    // Block 3: d = 4096 (0x6c00), and 16 * 4096 is past the fp16 maximum 65504.
+    source[3 * Q5_0_BLOCK_BYTES..3 * Q5_0_BLOCK_BYTES + 2]
+        .copy_from_slice(&0x6c00u16.to_le_bytes());
+    let (_dir, weights) = open_fixture(&[weight_entry("q5", GgufType::Q50, (8, Q5_0_K), source)]);
+    let projector = CudaProjector::new().expect("create the CUDA projector");
+    let before = projector.live_bytes();
+    let result = projector.load(&weights, &["q5"], LoadOptions::default());
+    assert_eq!(projector.live_bytes(), before, "the refused load uploaded");
+    assert_error(
+        result,
+        "Checkpoint",
+        "tensor q5 block 3: Q5_0 scale 4096 times quant 16 exceeds the fp16 range",
+    );
+}
+
+#[test]
+fn a_q5_0_tensor_with_k_off_the_grid_fails_the_load_before_any_upload() {
+    const NAME: &str = "a_q5_0_tensor_with_k_off_the_grid_fails_the_load_before_any_upload";
+    if !device_present(NAME) {
+        return;
+    }
+    // 864 = 27 blocks: a whole number of blocks but not of 128-value tiles.
+    let payload = vec![0u8; 8 * 27 * Q5_0_BLOCK_BYTES];
+    let (_dir, weights) = open_fixture(&[weight_entry("q5", GgufType::Q50, (8, 864), payload)]);
+    let projector = CudaProjector::new().expect("create the CUDA projector");
+    let before = projector.live_bytes();
+    let result = projector.load(&weights, &["q5"], LoadOptions::default());
+    assert_eq!(projector.live_bytes(), before, "the refused load uploaded");
+    assert_error(result, "Checkpoint", "tensor q5 (Q50) has 8 rows of 864");
 }

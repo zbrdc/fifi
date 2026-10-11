@@ -1,0 +1,73 @@
+//! Unit tests of the read-back plan and the mode switches (test seam U13). CPU only.
+use super::{
+    readback::{ReadStep, ReadbackPlan, check_mode, eager_report, parse_sync_each},
+    run_report::CaptureOutcome,
+};
+
+/// The Qwen3.6 head width. The test pins the byte count; the code derives it from the shape.
+const VOCAB: usize = 248_320;
+
+#[test]
+fn sync_each_reads_zero_one_or_nothing() {
+    for off in [None, Some(""), Some("0")] {
+        assert!(!parse_sync_each(off).expect("off"), "{off:?}");
+    }
+    assert!(parse_sync_each(Some("1")).expect("on"));
+    for bad in ["2", "yes", "true", " 1", "01"] {
+        assert!(parse_sync_each(Some(bad)).is_err(), "{bad:?}");
+    }
+}
+
+#[test]
+fn the_debug_mode_and_a_capture_exclude_each_other() {
+    assert!(check_mode(true, true).is_err());
+    for (sync_each, capture) in [(false, false), (true, false), (false, true)] {
+        assert!(
+            check_mode(sync_each, capture).is_ok(),
+            "{sync_each} {capture}"
+        );
+    }
+}
+
+#[test]
+fn the_read_back_queues_and_records_before_any_blocking_read() {
+    let with = ReadbackPlan::new(VOCAB, true).expect("plan");
+    assert_eq!(
+        with.steps(),
+        [
+            ReadStep::QueuePairCopy,
+            ReadStep::RecordEvent,
+            ReadStep::ReadLogits,
+            ReadStep::ReadPair
+        ]
+    );
+    let without = ReadbackPlan::new(VOCAB, false).expect("plan");
+    assert_eq!(
+        without.steps(),
+        [
+            ReadStep::QueuePairCopy,
+            ReadStep::RecordEvent,
+            ReadStep::ReadPair
+        ]
+    );
+    assert_eq!((with.blocking_waits(), without.blocking_waits()), (1, 1));
+}
+
+#[test]
+fn the_logits_row_is_four_bytes_a_value_and_checked() {
+    let plan = ReadbackPlan::new(VOCAB, true).expect("plan");
+    assert_eq!(plan.logits_bytes, Some(993_280));
+    assert_eq!(
+        ReadbackPlan::new(VOCAB, false).expect("plan").logits_bytes,
+        None
+    );
+    assert!(ReadbackPlan::new(0, true).is_err());
+    assert!(ReadbackPlan::new(usize::MAX / 2, true).is_err());
+}
+
+#[test]
+fn an_eager_token_reports_one_wait_and_one_start_block_write() {
+    let report = eager_report(&ReadbackPlan::new(VOCAB, true).expect("plan"));
+    assert_eq!(report.capture, CaptureOutcome::Eager);
+    assert_eq!((report.syncs, report.host_writes), (1, 1));
+}

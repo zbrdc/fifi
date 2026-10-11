@@ -23,9 +23,11 @@ use std::process::{Command, Output};
 use std::sync::atomic::Ordering;
 
 use super::guard::DispatchGuard;
+use super::native::resident::graph::{fault_null_write_launch, fault_null_write_warm};
 use super::native::{self, DeviceFailure};
 use super::{
-    CHUNK_LIMIT, CudaContext, DeviceBuffer, QuantTensor, TERMINAL, native_error, stage_operation,
+    CHUNK_LIMIT, CapturePlan, CudaContext, DeviceBuffer, DeviceEvent, DeviceStream, MatmulIo,
+    PackCall, PinnedWord, Projection, QuantTensor, TERMINAL, native_error, stage_operation,
 };
 use crate::EngError;
 use crate::family::project::Projector;
@@ -34,6 +36,8 @@ use crate::weights::GgufType;
 
 const CHILD_ENV: &str = "INFERENCE_CUDA_FAULT_CHILD";
 const CHILD_TEST: &str = "kernels::cuda::fault::fault_child_latches_terminal";
+const DESTROY_CHILD_TEST: &str = "kernels::cuda::fault::failed_destroy_child_latches_terminal";
+const REPLAY_CHILD_TEST: &str = "kernels::cuda::fault::fault_replay_child_latches_terminal";
 const TERMINAL_MESSAGE: &str = "CUDA backend is terminal after an earlier native failure";
 /// `cudaErrorIllegalAddress`, the status a null-pointer write reports at synchronize.
 const CUDA_ERROR_ILLEGAL_ADDRESS: c_int = 700;
@@ -57,18 +61,51 @@ fn device_present(test: &str) -> bool {
     false
 }
 
+/// The resident owners made while the device is healthy: later calls on them must
+/// be refused, and their drops must make no native call.
+struct Owners {
+    stream: DeviceStream,
+    event: DeviceEvent,
+    word: PinnedWord,
+    launch: LaunchBuffers,
+}
+
+/// The device buffers of one valid token-sized pack and matmul, made while the device is healthy.
+struct LaunchBuffers {
+    x: DeviceBuffer,
+    xf: DeviceBuffer,
+    y: DeviceBuffer,
+}
+
+impl Owners {
+    fn new(ctx: &CudaContext) -> Self {
+        Self {
+            stream: ctx.stream().expect("stream before the fault"),
+            event: ctx.event().expect("event before the fault"),
+            word: ctx.pinned_word().expect("pinned word before the fault"),
+            launch: LaunchBuffers {
+                x: ctx.upload(&[0u8; 1024]).expect("x before the fault"),
+                xf: ctx
+                    .upload(&vec![0u8; 1_048_592])
+                    .expect("xf before the fault"),
+                y: ctx.upload(&[0u8; 64]).expect("y before the fault"),
+            },
+        }
+    }
+}
+
 /// Maps a device failure exactly as the production calls do, so the child test
 /// checks the same operation names and terminal latch.
 fn backend_error(failure: DeviceFailure) -> EngError {
     native_error(&TERMINAL, stage_operation(failure.stage), failure.status)
 }
 
-/// Runs the child test in a fresh process. The device flag passes through the
-/// inherited environment.
-fn run_child() -> Output {
+/// Runs the child test `test` in a fresh process. The device flag passes through
+/// the inherited environment.
+fn run_child(test: &str) -> Output {
     let exe = std::env::current_exe().expect("test binary path");
     Command::new(exe)
-        .args(["--exact", CHILD_TEST, "--test-threads=1", "--nocapture"])
+        .args(["--exact", test, "--test-threads=1", "--nocapture"])
         .env(CHILD_ENV, "1")
         .output()
         .expect("spawn fault child")
@@ -79,7 +116,28 @@ fn fault_latches_terminal_in_child_process() {
     if !device_present("fault_latches_terminal_in_child_process") {
         return;
     }
-    let output = run_child();
+    assert_child_finishes(CHILD_TEST);
+}
+
+#[test]
+fn a_failed_destroy_latches_terminal_in_child_process() {
+    if !device_present("a_failed_destroy_latches_terminal_in_child_process") {
+        return;
+    }
+    assert_child_finishes(DESTROY_CHILD_TEST);
+}
+
+#[test]
+fn fault_replay_latches_terminal_in_child_process() {
+    if !device_present("fault_replay_latches_terminal_in_child_process") {
+        return;
+    }
+    assert_child_finishes(REPLAY_CHILD_TEST);
+}
+
+/// Runs the child `test` and checks that it exited cleanly and printed its marker.
+fn assert_child_finishes(test: &str) {
+    let output = run_child(test);
     let stdout = String::from_utf8_lossy(&output.stdout);
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(
@@ -91,6 +149,119 @@ fn fault_latches_terminal_in_child_process() {
         stdout.contains("fault child: done"),
         "fault child did not finish\nstdout:\n{stdout}"
     );
+}
+
+/// The failed-destroy half of decision 0022. The fault is not mapped through
+/// `backend_error`, so the latch is still clear when the owners drop: the first
+/// destroy runs, fails at its synchronize and latches, and the rest are skipped.
+/// The stream is the first field of `Owners`, so it is the one dropped first.
+/// That the C destroy then frees nothing is not observable here; the test pins
+/// the Rust half (one attempt, the latch, the counts left as they were).
+#[test]
+fn failed_destroy_child_latches_terminal() {
+    if !std::env::var(CHILD_ENV).is_ok_and(|value| value == "1") {
+        println!("SKIPPED failed_destroy_child_latches_terminal: not a fault child");
+        return;
+    }
+    let ctx = CudaContext::new().expect("context before the fault");
+    let owners = Owners::new(&ctx);
+    let live = ctx.live_owners();
+    let attempts = ctx.destroy_calls();
+    {
+        let _dispatch = DispatchGuard::enter(&TERMINAL);
+        let failure = native::fault_illegal_address().expect_err("illegal address must fault");
+        assert_eq!(failure.status, CUDA_ERROR_ILLEGAL_ADDRESS);
+    }
+    assert!(
+        !TERMINAL.load(Ordering::Acquire),
+        "the fault was not mapped, so the latch is still clear"
+    );
+    drop(owners);
+    assert!(
+        TERMINAL.load(Ordering::Acquire),
+        "a failed destroy latches terminal"
+    );
+    assert_eq!(
+        ctx.destroy_calls(),
+        attempts + 1,
+        "one failed destroy, then every other owner is skipped"
+    );
+    assert_eq!(ctx.live_owners(), live, "no owner released its count");
+    println!("fault child: done");
+}
+
+/// A fault inside a replayed graph surfaces at the next synchronize, latches the backend, and the
+/// graph is then skipped by its drop: no native destroy and the live count stays (decision 0022).
+#[test]
+fn fault_replay_child_latches_terminal() {
+    if !std::env::var(CHILD_ENV).is_ok_and(|value| value == "1") {
+        println!("SKIPPED fault_replay_child_latches_terminal: not a fault child");
+        return;
+    }
+    let ctx = CudaContext::new().expect("context before the fault");
+    let owners = Owners::new(&ctx);
+    let stream = &owners.stream;
+    // The kernel's module loads at its first launch, which a capture forbids: load it disarmed.
+    ctx.launch_on(stream, fault_null_write_warm)
+        .expect("disarmed warm-up launch");
+    stream.synchronize().expect("drain the warm-up");
+    let plan = CapturePlan {
+        pins: &[],
+        holds: Vec::new(),
+    };
+    let (graph, ()) = ctx
+        .capture(stream, plan, || {
+            ctx.launch_on(stream, fault_null_write_launch)
+        })
+        .expect("capture of the faulting kernel");
+    graph.launch(stream).expect("the replay is only queued");
+    let error = stream
+        .synchronize()
+        .expect_err("the replay faults at the synchronize");
+    assert_eq!(
+        error,
+        EngError::Backend {
+            operation: "cuda synchronize",
+            message: ILLEGAL_ADDRESS_MESSAGE.to_owned(),
+        }
+    );
+    assert!(TERMINAL.load(Ordering::Acquire), "a replay fault latches");
+    refuse_after_replay_fault(&ctx, &owners);
+    let (attempts, live) = (ctx.destroy_calls(), ctx.live_owners());
+    assert_eq!(live.graphs, 1, "the graph is counted");
+    drop(graph);
+    drop(owners);
+    assert_eq!(
+        ctx.destroy_calls(),
+        attempts,
+        "no native destroy after the latch"
+    );
+    assert_eq!(ctx.live_owners(), live, "skipped owners stay counted");
+    drop(ctx);
+    println!("fault child: done");
+}
+
+/// A pack and a capture with valid arguments are refused by the latch alone.
+fn refuse_after_replay_fault(ctx: &CudaContext, owners: &Owners) {
+    let buffers = &owners.launch;
+    let pack = PackCall {
+        x: buffers.x.range(0, 1024).expect("x range"),
+        xf: buffers.xf.range(0, 1_048_592).expect("xf range"),
+        m: 1,
+        k: 256,
+    };
+    let error = ctx
+        .pack(&owners.stream, pack)
+        .expect_err("terminal context refuses pack");
+    assert_eq!(error, terminal_error());
+    let plan = CapturePlan {
+        pins: &[],
+        holds: Vec::new(),
+    };
+    let Err(error) = ctx.capture(&owners.stream, plan, || Ok(())) else {
+        panic!("terminal context must refuse a capture");
+    };
+    assert_eq!(error, terminal_error());
 }
 
 #[test]
@@ -124,13 +295,16 @@ fn fault_child_latches_terminal() {
             .expect("tiled weight before the fault"),
         experts: Some(2),
     };
+    let owners = Owners::new(&ctx);
     // The second of the two process leases, taken before the latch refuses it.
     let mut projector = CudaProjector::new().expect("projector before the fault");
 
     trigger_illegal_address();
     trigger_vendor_launch();
     refuse_later_calls(&ctx, &mut projector, &stack);
-    drop_after_terminal(buffer, stack, ctx);
+    refuse_resident_calls(&ctx, &owners);
+    refuse_launches(&ctx, &owners, &stack);
+    drop_after_terminal(buffer, stack, owners, ctx);
     drop(projector);
     println!("fault child: done");
 }
@@ -215,10 +389,82 @@ fn refuse_later_calls(ctx: &CudaContext, projector: &mut CudaProjector, stack: &
     assert_eq!(error, terminal_error());
 }
 
-/// Dropping a buffer after the latch must neither panic nor free device memory.
-fn drop_after_terminal(buffer: DeviceBuffer, stack: CudaWeight, ctx: CudaContext) {
+/// The streams, events and pinned word made before the fault refuse every call.
+fn refuse_resident_calls(ctx: &CudaContext, owners: &Owners) {
+    let error = owners
+        .stream
+        .synchronize()
+        .expect_err("terminal stream refuses synchronize");
+    assert_eq!(error, terminal_error());
+    let error = owners
+        .stream
+        .record(&owners.event)
+        .expect_err("terminal stream refuses record");
+    assert_eq!(error, terminal_error());
+    let error = owners
+        .event
+        .synchronize()
+        .expect_err("terminal event refuses synchronize");
+    assert_eq!(error, terminal_error());
+    let error = owners
+        .word
+        .read_after(&owners.event)
+        .expect_err("terminal word refuses read_after");
+    assert_eq!(error, terminal_error());
+    let Err(error) = ctx.stream() else {
+        panic!("terminal context must refuse a new stream");
+    };
+    assert_eq!(error, terminal_error());
+}
+
+/// A pack and a matmul with valid ranges and a valid stream are refused by the
+/// latch alone, before any argument check could reach the native layer.
+fn refuse_launches(ctx: &CudaContext, owners: &Owners, stack: &CudaWeight) {
+    let CudaWeight::Tiled { weight, .. } = stack else {
+        panic!("the fault child builds a tiled stack");
+    };
+    let buffers = &owners.launch;
+    let xf = buffers.xf.range(0, 1_048_592).expect("xf range");
+    let pack = PackCall {
+        x: buffers.x.range(0, 1024).expect("x range"),
+        xf,
+        m: 1,
+        k: 256,
+    };
+    let error = ctx
+        .pack(&owners.stream, pack)
+        .expect_err("terminal context refuses pack");
+    assert_eq!(error, terminal_error());
+    let projection = Projection {
+        weight,
+        first_row: 0,
+        rows: 8,
+    };
+    let io = MatmulIo {
+        xf,
+        y: buffers.y.range(0, 32).expect("y range"),
+        m: 1,
+    };
+    let error = ctx
+        .matmul(&owners.stream, projection, io)
+        .expect_err("terminal context refuses matmul");
+    assert_eq!(error, terminal_error());
+}
+
+/// Dropping owners after the latch must neither panic nor make a native
+/// destroy or free call, and each skipped owner stays counted.
+fn drop_after_terminal(buffer: DeviceBuffer, stack: CudaWeight, owners: Owners, ctx: CudaContext) {
+    let attempts = ctx.destroy_calls();
+    let live = ctx.live_owners();
     drop(buffer);
     drop(stack);
+    drop(owners);
+    assert_eq!(
+        ctx.destroy_calls(),
+        attempts,
+        "no native destroy after the latch"
+    );
+    assert_eq!(ctx.live_owners(), live, "skipped owners stay counted");
     assert!(
         TERMINAL.load(Ordering::Acquire),
         "drop must not clear terminal"

@@ -14,6 +14,7 @@
 #include <fcntl.h>
 
 #include "abi.h"
+#include "abi_resident.h"
 
 #ifdef INFERENCE_CUDA_FAULT_QUALIFICATION
 #include <atomic>
@@ -46,6 +47,7 @@ cudaError_t counted_free(void *ptr) {
 #include "device.h"
 #include "kernels.h"
 #include "repack.h"
+#include "resident/matmul_q5_0.h"
 
 namespace {
 
@@ -61,15 +63,31 @@ bool tiled_shape(int n_rows, int k) {
     return n_rows > 0 && n_rows % 8 == 0 && k > 0 && k % 256 == 0 && k <= kMaxDim;
 }
 
+/* ggml type code of a call; Q5_0 (MEL-C1b) has its own kernel and is not a vendored GgmlType. */
 struct LinearCall {
-    GgmlType type;
+    int ggml_type;
     const uint4 *weight;
     int n_rows;
     int k;
+    /* Values per row of the staged x and the packed xf: k rounded up to the 256 grid for Q5_0
+     * (K = 896 is not a multiple of 256), whose tail is zero; k itself for the vendored types. */
+    int k_x;
     const float *x;
     int m;
     float *y;
 };
+
+bool is_q5_0(int ggml_type) { return ggml_type == INFERENCE_CUDA_TYPE_Q5_0; }
+
+int padded_k(int ggml_type, int k) { return is_q5_0(ggml_type) ? (k + 255) / 256 * 256 : k; }
+
+/* The type and shape rule of inference_cuda_linear_ws. */
+bool linear_shape_ok(int ggml_type, int n_rows, int k, int m) {
+    if (is_q5_0(ggml_type)) {
+        return inference_cuda_q5_0_shape_ok(m, n_rows, k, 0) == INFERENCE_CUDA_OK;
+    }
+    return tiled_type(ggml_type) && tiled_shape(n_rows, k) && m >= 1 && m <= kMaxDim;
+}
 
 struct Needs {
     size_t x;
@@ -108,20 +126,38 @@ bool workspace_usable(const inference_cuda_workspace &ws, const Needs &need) {
     return true;
 }
 
+/* Copies the host x (m rows of k floats) into the device staging of m rows of k_x floats. The
+ * Q5_0 tail of every row (k..k_x-1) is zeroed first: the staged row is what the pack reads. */
+cudaError_t stage_x(const LinearCall &call, const inference_cuda_workspace &ws, const Needs &need) {
+    if (call.k_x == call.k) {
+        return cudaMemcpy(ws.x, call.x, need.x, cudaMemcpyHostToDevice);
+    }
+    cudaError_t err = cudaMemset(ws.x, 0, need.x);
+    if (err != cudaSuccess) return err;
+    return cudaMemcpy2D(ws.x, (size_t)call.k_x * sizeof(float), call.x,
+                        (size_t)call.k * sizeof(float), (size_t)call.k * sizeof(float),
+                        (size_t)call.m, cudaMemcpyHostToDevice);
+}
+
+cudaError_t matmul_of(const LinearCall &call, const inference_cuda_workspace &ws) {
+    if (is_q5_0(call.ggml_type)) {
+        return q5_0::matmul(call.m, call.weight, (const uint4 *)ws.xf, (float *)ws.y, call.n_rows,
+                            call.n_rows, call.k, NULL);
+    }
+    return kern::matmul((GgmlType)call.ggml_type, call.m, call.weight, (const uint4 *)ws.xf,
+                        (float *)ws.y, call.n_rows, call.n_rows, call.k);
+}
+
 void run_linear(const LinearCall &call, const inference_cuda_workspace &ws, const Needs &need,
                 Failure &failure) {
-    failure.record(cudaMemcpy(ws.x, call.x, need.x, cudaMemcpyHostToDevice),
-                   INFERENCE_CUDA_STAGE_COPY);
+    failure.record(stage_x(call, ws, need), INFERENCE_CUDA_STAGE_COPY);
     // Padding tokens of the fragment-order buffer read its zeroed tail.
     if (failure.ok())
         failure.record(cudaMemset(ws.xf, 0, need.xf), INFERENCE_CUDA_STAGE_COPY);
     if (failure.ok())
-        failure.record(kern::pack_f32((const float *)ws.x, call.m, call.k, (uint4 *)ws.xf),
+        failure.record(kern::pack_f32((const float *)ws.x, call.m, call.k_x, (uint4 *)ws.xf),
                        INFERENCE_CUDA_STAGE_LAUNCH);
-    if (failure.ok())
-        failure.record(kern::matmul(call.type, call.m, call.weight, (const uint4 *)ws.xf,
-                                    (float *)ws.y, call.n_rows, call.n_rows, call.k),
-                       INFERENCE_CUDA_STAGE_LAUNCH);
+    if (failure.ok()) failure.record(matmul_of(call, ws), INFERENCE_CUDA_STAGE_LAUNCH);
     failure.record(cudaDeviceSynchronize(), INFERENCE_CUDA_STAGE_SYNCHRONIZE);
     if (failure.ok())
         failure.record(cudaMemcpy(call.y, ws.y, need.y, cudaMemcpyDeviceToHost),
@@ -337,22 +373,85 @@ extern "C" int inference_cuda_linear_ws(int ggml_type, const void *weight, int n
     try {
         report_stage(out_stage, INFERENCE_CUDA_STAGE_NONE);
         if (weight == NULL || x == NULL || y == NULL || workspace == NULL ||
-            !tiled_type(ggml_type) || !tiled_shape(n_rows, k) || m < 1 || m > kMaxDim) {
+            !linear_shape_ok(ggml_type, n_rows, k, m)) {
             return INFERENCE_CUDA_INVALID_ARGUMENT;
         }
         // The matmul reads uint4 tiles, so an offset view must stay 16-byte aligned.
         if ((uintptr_t)weight % sizeof(uint4) != 0) {
             return INFERENCE_CUDA_INVALID_ARGUMENT;
         }
-        const Needs need = linear_needs(m, k, n_rows);
+        const int k_x = padded_k(ggml_type, k);
+        const Needs need = linear_needs(m, k_x, n_rows);
         if (!workspace_usable(*workspace, need)) {
             return INFERENCE_CUDA_INVALID_ARGUMENT;
         }
         (void)cudaGetLastError();
         Failure failure;
-        LinearCall call = {(GgmlType)ggml_type, (const uint4 *)weight, n_rows, k, x, m, y};
+        LinearCall call = {ggml_type, (const uint4 *)weight, n_rows, k, k_x, x, m, y};
         run_linear(call, *workspace, need, failure);
         (void)cudaGetLastError();
+        report_stage(out_stage, failure.stage);
+        return (int)failure.err;
+    } catch (...) {
+        return INFERENCE_CUDA_NATIVE_EXCEPTION;
+    }
+}
+
+extern "C" int inference_cuda_pack_launch(const float *x_dev, int m, int k, void *xf_dev,
+                                          void *stream, int *out_stage) {
+    try {
+        report_stage(out_stage, INFERENCE_CUDA_STAGE_NONE);
+        if (x_dev == NULL || xf_dev == NULL || stream == NULL || m < 1 || m > kMaxDim || k < 1 ||
+            k > kMaxDim || k % 256 != 0 || !aligned(xf_dev, sizeof(uint4)) ||
+            !aligned(x_dev, sizeof(float))) {
+            return INFERENCE_CUDA_INVALID_ARGUMENT;
+        }
+        // The memset below writes the whole xf, so an x that overlapped it would be clobbered.
+        const Needs need = linear_needs(m, k, 0);
+        if (!apart(x_dev, need.x, xf_dev, need.xf)) {
+            return INFERENCE_CUDA_INVALID_ARGUMENT;
+        }
+        Failure failure;
+        cudaStream_t launch_stream = (cudaStream_t)stream;
+        // Fragment order is a fixed-size buffer whose padding positions the matmul reads.
+        if (m <= kern::kMaxTokens) {
+            failure.record(cudaMemsetAsync(xf_dev, 0, need.xf, launch_stream),
+                           INFERENCE_CUDA_STAGE_LAUNCH);
+        }
+        if (failure.ok()) {
+            failure.record(kern::pack_f32(x_dev, m, k, (uint4 *)xf_dev, launch_stream),
+                           INFERENCE_CUDA_STAGE_LAUNCH);
+        }
+        report_stage(out_stage, failure.stage);
+        return (int)failure.err;
+    } catch (...) {
+        return INFERENCE_CUDA_NATIVE_EXCEPTION;
+    }
+}
+
+extern "C" int inference_cuda_matmul_launch(int ggml_type, int m, const void *weight,
+                                            const void *xf_dev, float *y_dev, int ldy, int n_rows,
+                                            int k, void *stream, int *out_stage) {
+    try {
+        report_stage(out_stage, INFERENCE_CUDA_STAGE_NONE);
+        if (weight == NULL || xf_dev == NULL || y_dev == NULL || stream == NULL ||
+            !tiled_type(ggml_type) || !tiled_shape(n_rows, k) || m < 1 || m > kMaxDim ||
+            ldy < n_rows || !aligned(weight, sizeof(uint4)) || !aligned(xf_dev, sizeof(uint4)) ||
+            !aligned(y_dev, sizeof(float))) {
+            return INFERENCE_CUDA_INVALID_ARGUMENT;
+        }
+        // y is written (the split-K memset and the kernel) while the weight and xf are read.
+        const Needs need = linear_needs(m, k, n_rows);
+        const size_t weight_bytes = tiled_vecs((GgmlType)ggml_type, n_rows, k) * sizeof(uint4);
+        if (!apart(y_dev, need.y, xf_dev, need.xf) || !apart(y_dev, need.y, weight, weight_bytes) ||
+            !apart(xf_dev, need.xf, weight, weight_bytes)) {
+            return INFERENCE_CUDA_INVALID_ARGUMENT;
+        }
+        Failure failure;
+        failure.record(kern::matmul((GgmlType)ggml_type, m, (const uint4 *)weight,
+                                    (const uint4 *)xf_dev, y_dev, ldy, n_rows, k,
+                                    (cudaStream_t)stream),
+                       INFERENCE_CUDA_STAGE_LAUNCH);
         report_stage(out_stage, failure.stage);
         return (int)failure.err;
     } catch (...) {

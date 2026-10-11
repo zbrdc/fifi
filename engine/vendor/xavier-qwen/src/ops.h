@@ -68,7 +68,7 @@ cudaError_t gated_delta(const DeltaArgs& a, cudaStream_t stream = nullptr);
 
 // Attention preparation for one layer (attn_prep): Q/K RMSNorm, NEOX rope on the first n_rot dims,
 // KV cache write. It reads proj, ld, n_head, n_kv_head, n_rot, q_norm, k_norm, eps, rope_base,
-// k_cache, v_cache, q, pos_dev, pos0 and m; the other fields belong to the attention kernels.
+// k_cache, v_cache, rows, status_dev, status_bits, q, pos_dev, pos0 and m; the other fields belong to the attention kernels.
 struct AttnArgs {
   const float* proj;  // [m][ld]: per q head [q 256 | gate 256], then k, then v
   int ld, n_head, n_kv_head, n_rot;
@@ -84,6 +84,12 @@ struct AttnArgs {
   // Null, or a device word holding the position of token 0 (replaces pos0). The kernel reads it
   // when it runs, so one captured graph serves every position.
   const int* pos_dev = nullptr;
+  // Rows of k_cache and v_cache. The kernel writes KV rows only when 0 <= position and
+  // position + m <= rows; otherwise it writes no KV row and sets q to NaN. Zero refuses every launch.
+  int rows = 0;
+  // Null, or a device word that receives status_bits (integer OR, one thread) when a launch is refused.
+  int* status_dev = nullptr;
+  int status_bits = 0;
 };
 cudaError_t attn_prep(const AttnArgs& a, cudaStream_t stream = nullptr);
 
