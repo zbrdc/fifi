@@ -6,6 +6,7 @@
 //! synchronization and no page pool, because every expert stays resident for the life of the engine.
 //! The embedding table stays in the checkpoint; the token start reads one row per token.
 
+use super::super::settings::{Activation, scale_pairing_error};
 use super::layout::{
     ExpertPlan, neg_exp, router_transposed, scalar_gate, split_conv, widen_stack_scales,
     with_f32_scales,
@@ -21,7 +22,7 @@ use crate::{
         },
     },
     kernels::{HostPages, MlxKernels, PackedPages, PackedWeight, PageRange, ResidentPackedWeight},
-    tensor::{ExecutionTensor, Tensor},
+    tensor::{Dtype, ExecutionTensor, Tensor},
     weights::StreamedCheckpoint,
 };
 
@@ -434,9 +435,9 @@ impl ResidentWeights {
         Self::import_with(kernels, ckpt, host, true)
     }
 
-    /// Like `import`, with the scales and biases kept as stored (BF16). This is the comparison
-    /// form of the F32 default: qualification tests only.
-    #[cfg(all(test, feature = "native-fault-qualification"))]
+    /// Like `import`, with the scales and biases kept as stored (BF16). The BF16 half of the one
+    /// activation lever of packet Q36-BF16-a: the decoder constructor picks it for BF16
+    /// activations, and `ensure_scale_pairing` refuses any other pairing.
     pub(super) fn import_bf16_scales(
         kernels: &mut MlxKernels,
         ckpt: &StreamedCheckpoint,
@@ -490,6 +491,56 @@ impl ResidentWeights {
         })
     }
 
+    /// Converts the layer norms to `dtype` and evaluates them once (packet Q36-BF16-a): the input
+    /// and post-attention norm of every layer and the query and key norm of every attention layer
+    /// (100 tensors on the real model). One synchronization. The checkpoint stores these weights
+    /// in BF16, so the conversion from the F32 copies loses nothing. The final norm, the DeltaNet
+    /// weights, the router, and the shared gate stay F32. On error the weights may hold a mix, and
+    /// the caller drops the decoder.
+    pub(super) fn convert_norms(
+        &mut self,
+        kernels: &mut MlxKernels,
+        dtype: Dtype,
+    ) -> Result<(), EngError> {
+        let mut slots: Vec<&mut ExecutionTensor> = Vec::new();
+        for layer in &mut self.layers {
+            slots.push(&mut layer.input_norm);
+            slots.push(&mut layer.post_norm);
+            if let RMixer::Attn(a) = &mut layer.mixer {
+                slots.push(&mut a.q_norm);
+                slots.push(&mut a.k_norm);
+            }
+        }
+        let converted = slots
+            .iter()
+            .map(|slot| kernels.cast(slot, dtype))
+            .collect::<Result<Vec<_>, _>>()?;
+        let refs: Vec<&ExecutionTensor> = converted.iter().collect();
+        kernels.evaluate(&refs)?;
+        for (slot, tensor) in slots.into_iter().zip(converted) {
+            *slot = tensor;
+        }
+        Ok(())
+    }
+
+    /// Checks the scale pairing of packet Q36-BF16-a: every scale and bias of every packed weight
+    /// must have the dtype that matches `activation` (862 parts over 431 packed weights on the
+    /// real model). `settings::scale_pairing_error` owns the rule; a mismatched pair returns
+    /// `BadRequest` before the constructor changes anything else.
+    pub(super) fn ensure_scale_pairing(&self, activation: Activation) -> Result<(), EngError> {
+        let census = self.scale_census();
+        match scale_pairing_error(
+            census.weights,
+            census.f32_parts,
+            census.bf16_parts,
+            census.other_parts,
+            activation,
+        ) {
+            Some(message) => Err(EngError::BadRequest(message)),
+            None => Ok(()),
+        }
+    }
+
     /// Resident bytes of all weights and constants, from the tensors' own sizes. The expert stacks
     /// are included once.
     pub(super) fn byte_len(&self) -> Result<u64, EngError> {
@@ -519,9 +570,7 @@ impl ResidentWeights {
     }
 
     /// Counts the packed weights and the dtypes of their scale and bias tensors.
-    #[cfg(test)]
     pub(super) fn scale_census(&self) -> ScaleCensus {
-        use crate::tensor::Dtype;
         let mut census = ScaleCensus::default();
         let mut visit = |weight: &ResidentPackedWeight| {
             census.weights += 1;
@@ -561,7 +610,6 @@ impl ResidentWeights {
 }
 
 /// The packed weights of a model and the dtypes of their scale and bias tensors.
-#[cfg(test)]
 #[derive(Debug, Default, PartialEq, Eq)]
 pub(super) struct ScaleCensus {
     /// Packed weights, expert stacks included.
@@ -758,7 +806,6 @@ mod tests {
         assert_scale_census(&w, true);
     }
 
-    #[cfg(feature = "native-fault-qualification")]
     #[test]
     fn the_bf16_comparison_import_keeps_the_stored_scales_and_biases() {
         let _serial = crate::native_test_lock();
@@ -1151,6 +1198,25 @@ mod tests {
                 serde_json::to_vec_pretty(&report).unwrap(),
             )
             .unwrap();
+        }
+        // Packet Q36-BF16-a, the 337,920 B reconciliation: the totals above count the norms as
+        // imported (F32). The product BF16 constructor converts the 100 norm tensors (40 input
+        // and 40 post norms of 2048, 10 query and 10 key norms of 256: 168,960 elements) to BF16,
+        // which saves 337,920 B: 19,286,886,924 - 337,920 = 19,286,549,004 B, the `weights_bytes`
+        // that the BF16 tool-forward log reported. One extra synchronization converts them.
+        if !f32_scales {
+            // The product constructor turns the BF16 convert on before `convert_norms`
+            // (`ResidentDecoder::new_paired`); without it `cast` refuses the BF16 output with
+            // `convert: output dtype must be F32 or an allowed BF16`.
+            kernels.allow_bf16(true);
+            let mut w = w;
+            w.convert_norms(&mut kernels, crate::tensor::Dtype::Bf16)
+                .unwrap();
+            assert_eq!(
+                w.byte_len().unwrap(),
+                19_286_549_004,
+                "the product BF16 decoder counts the converted norms"
+            );
         }
     }
 }

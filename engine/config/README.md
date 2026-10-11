@@ -1,8 +1,20 @@
 # Engine configs
 
 `qwen36-mac-studio-36gb.json` is the `enginesrv` config for the Qwen3.6-35B-A3B stepping stone on the 36 GB Mac Studio.
-It turns chunked prefill on.
+It states `activation_dtype: "bf16"` (the default), so until slice Q36-BF16-b makes the chunk path dtype aware it plans no chunk: the executor's prefill plan admits none, every prompt token runs as one step with the 16-token (`NO_BUDGET_PIECE`) worker piece, and the start-up line names the temporary rule (`no chunk planned while activation_dtype is bf16 ... until slice Q36-BF16-b`).
+The chunked prefill that decision 0046 A4 turned on returns for this file when slice Q36-BF16-b lands (or now, with `activation_dtype: "f32"`); the budget and reserve members below are what it needs, and they stay.
 The file leaves `prefill_chunk` absent, so the default of 256 applies.
+
+## Activation dtype
+
+The `qwen36.activation_dtype` member (packet Q36-BF16-a, decision 0046 A6) selects the decode
+activation dtype: `bf16` or `f32`. The default is `bf16`, and this file states it explicitly.
+The member is one lever: `bf16` keeps the stored BF16 scales and biases and converts the layer
+norms, `f32` keeps the F32 widening of Q36-G0, and the engine refuses any other pairing at load.
+The key-value cache, the DeltaNet state, the router, and the logits stay F32 in both modes.
+While the chunked prefill runs F32 activations only (until slice Q36-BF16-b), a `bf16` engine
+plans no chunk and serves prompts one token at a time; the start-up line says so.
+With `bf16` the resident weights are 19,286,549,004 bytes against 21,420,001,804 with `f32`.
 
 ## Numbers
 
@@ -26,9 +38,8 @@ The rule is `Q36Settings::check_prefix_reuse_cap` in `engine/src/family/qwen36/s
 
 ## Evidence
 
-One X32 smoke trial on the 36 GB Mac Studio admitted 32,010 tokens at chunk 256.
-Swap stayed flat against a baseline of about 1.0 GB already in use.
-It is one trial and not a bound.
+The E10/E11 numbers are F32 measurements, taken before `activation_dtype` existed: one X32 smoke trial on the 36 GB Mac Studio admitted 32,010 tokens at chunk 256 (decision 0046 item 5c and A4), with swap flat against a baseline of about 1.0 GB already in use.
+It is one trial and not a bound, and it does not describe the shipped `bf16` entry, which plans no chunk until slice Q36-BF16-b.
 
 ## Use
 

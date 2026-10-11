@@ -112,6 +112,10 @@ pub(super) struct Consts {
     pub(super) qk_eps: ExecutionTensor,
     /// `sqrt(key_dim)`: the extra divisor of the DeltaNet query.
     pub(super) sqrt_kd: ExecutionTensor,
+    /// The dtype of the decode activations (packet Q36-BF16-a): the hidden state between blocks,
+    /// the inputs of the quantized matmuls, and the converted layer norms. `F32` at import; the
+    /// decoder constructor sets `Bf16` for a BF16 engine, and nothing mutates it afterwards.
+    pub(super) act: Dtype,
 }
 
 impl Consts {
@@ -129,6 +133,7 @@ impl Consts {
             zero: next()?,
             qk_eps: next()?,
             sqrt_kd: next()?,
+            act: Dtype::F32,
         })
     }
     /// Adds the constants' bytes to `total`.
@@ -144,6 +149,25 @@ impl Consts {
 pub(super) struct Ctx<'k> {
     pub(super) kernels: &'k mut MlxKernels,
     pub(super) consts: &'k Consts,
+}
+
+/// Converts `x` to `dtype`. A tensor that has `dtype` already is shared and makes no native call, so
+/// a step with F32 activations builds the same graph as before packet Q36-BF16-a.
+pub(super) fn cast_to(
+    ctx: &mut Ctx<'_>,
+    x: &ExecutionTensor,
+    dtype: Dtype,
+) -> Result<ExecutionTensor, EngError> {
+    if x.dtype() == dtype {
+        return Ok(x.share());
+    }
+    ctx.kernels.cast(x, dtype)
+}
+
+/// Converts `x` to the activation dtype of the step (`Consts::act`).
+pub(super) fn to_act(ctx: &mut Ctx<'_>, x: &ExecutionTensor) -> Result<ExecutionTensor, EngError> {
+    let act = ctx.consts.act;
+    cast_to(ctx, x, act)
 }
 
 /// Returns `x · Wᵀ` as `[1, out]`. `x` may have any shape with `in` elements. `qmm` takes only `[1, in]`.

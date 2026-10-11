@@ -11,6 +11,15 @@
 //!   cargo test --release --features native-mlx,native-fault-qualification --lib \
 //!   family::qwen36::resident::parity -- --ignored --nocapture
 //! ```
+//!
+//! `Q36_ACTIVATION=bf16` (packet Q36-BF16-a) runs the decode activations in BF16 through the
+//! product `activation_dtype` lever: the stored BF16 scales and the converted norms. Unset or `f32`
+//! is the F32 control above and its gates are unchanged. With BF16 the 0.99999 per-layer rule of
+//! decision 0046 item 4 stays report-only, but the run asserts its floor (fix5 of packet
+//! Q36-BF16-a): no cosine is NaN, the minimum layer cosine is at least 0.95, and it does not
+//! regress by more than 0.01 from the d1 value 0.9799 without a recorded decision - a
+//! report-only result is not allowed to ratchet. The report names the dtype in
+//! `activation_dtype`.
 
 use sha2::{Digest, Sha256};
 
@@ -18,7 +27,12 @@ use super::decoder::StepMode;
 use super::real::{env_path, open, rss_kb};
 use super::scale_knob::{hash_f32s, new_decoder};
 use crate::{
-    family::{qwen36::host_load::HostWeights, spec::QWEN3_6_35B_A3B},
+    family::{
+        qwen36::host_load::HostWeights,
+        qwen36::settings::{Activation, activation_name},
+        route::keeps_floored_anchor,
+        spec::QWEN3_6_35B_A3B,
+    },
     kernels::MlxKernels,
 };
 
@@ -35,6 +49,14 @@ pub(super) const CONFIG_SHA256: &str =
 
 /// The gate of decision 0046 item 4.
 const MIN_COSINE: f64 = 0.99999;
+/// The floor of the BF16 run's minimum per-layer cosine (fix5 of packet Q36-BF16-a; decision
+/// 0046 A6): 0.95, below the 0.9799 that the d1 BF16 run observed (evidence 9dec1b7c).
+const BF16_LAYER_COSINE_FLOOR: f64 = 0.95;
+/// The d1 BF16 minimum layer cosine (evidence 9dec1b7c): the no-ratchet anchor of the floor.
+const D1_BF16_MIN_LAYER_COSINE: f64 = 0.9799;
+/// The largest regression below the d1 minimum that the floor allows without a recorded
+/// decision (fix5 of packet Q36-BF16-a).
+const BF16_LAYER_COSINE_REGRESSION: f64 = 0.01;
 
 /// True for a finite cosine at or above the gate. A NaN fails.
 pub(super) fn passes(cosine: f64) -> bool {
@@ -151,7 +173,7 @@ fn real_checkpoint_matches_the_host_reference() {
     kernels.reset_peak_memory().unwrap();
     let started = std::time::Instant::now();
     let host = HostWeights::load(&real.ckpt, &QWEN3_6_35B_A3B, &real.config).unwrap();
-    let (mut decoder, scale_storage) = new_decoder(kernels, &real.ckpt, host, 256);
+    let (mut decoder, act) = new_decoder(kernels, &real.ckpt, host, 256);
     let load_seconds = started.elapsed().as_secs_f64();
     let mut state = decoder.zero_state().unwrap();
 
@@ -216,6 +238,14 @@ fn real_checkpoint_matches_the_host_reference() {
         ));
     }
     let stats = decoder.kernels.memory_stats().unwrap();
+    // Packet Q36-BF16-a: the agreement numbers that a BF16 run reports beside the gate.
+    let top5_overlap = got_top5.iter().filter(|id| want_top5.contains(id)).count();
+    let greedy_equal_prefix = tokens
+        .iter()
+        .zip(&greedy)
+        .take_while(|(a, b)| a == b)
+        .count();
+    let greedy_equal_positions = tokens.iter().zip(&greedy).filter(|(a, b)| a == b).count();
     // JSON has no NaN: a NaN cosine appears as null, and `nan_layer_cosines` counts the NaN rows.
     let report = serde_json::json!({
         "min_layer_cosine": min_cos, "nan_layer_cosines": nan_cosines, "logits_cosine": logits_cos, "top5": got_top5,
@@ -223,9 +253,13 @@ fn real_checkpoint_matches_the_host_reference() {
         "load_seconds": load_seconds, "step_seconds": seconds,
         "mlx_active": stats.active, "mlx_peak": stats.peak, "rss_kb": rss_kb(),
         "kv_charge_bytes": decoder.budget.used(), "state_bytes": state.byte_len().unwrap(),
-        "scale_storage": scale_storage,
+        "activation_dtype": activation_name(act),
         "layers_sha256": format!("{:x}", layers_hash.finalize()),
         "logits_sha256": logits_hash,
+        "reference_top5": want_top5,
+        "top5_overlap": top5_overlap, "reference_greedy_ids": greedy,
+        "greedy_equal_prefix": greedy_equal_prefix,
+        "greedy_equal_positions": greedy_equal_positions,
     });
     println!("{}", serde_json::to_string_pretty(&report).unwrap());
     if let Some(out) = &out_dir {
@@ -236,5 +270,20 @@ fn real_checkpoint_matches_the_host_reference() {
         )
         .unwrap();
     }
-    assert!(failures.is_empty(), "parity gate failed: {failures:#?}");
+    if act == Activation::F32 {
+        assert!(failures.is_empty(), "parity gate failed: {failures:#?}");
+    } else {
+        assert_eq!(nan_cosines, 0, "a NaN cosine is a broken run, not a result");
+        assert!(
+            keeps_floored_anchor(
+                min_cos,
+                BF16_LAYER_COSINE_FLOOR,
+                D1_BF16_MIN_LAYER_COSINE,
+                BF16_LAYER_COSINE_REGRESSION
+            ),
+            "BF16 parity floor: min layer cosine {min_cos} is under 0.95 or regresses more than \
+             0.01 below the d1 value 0.9799 without a recorded decision"
+        );
+        println!("measurement run: {} gate misses recorded", failures.len());
+    }
 }

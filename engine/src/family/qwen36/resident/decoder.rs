@@ -3,6 +3,7 @@
 //! `ResidentDecoder` runs one token per `step` in a `StepMode`. It owns the adapter and the weights.
 //! It holds no session: the caller owns each `ResidentState` and passes it to `step`.
 
+use super::super::settings::Activation;
 use super::moe::Routing;
 use super::prefill;
 use super::state::{ResidentSnapshot, ResidentState};
@@ -10,7 +11,7 @@ use super::step;
 use super::weights::ResidentWeights;
 use crate::{
     EngError, family::qwen36::host_load::HostWeights, kernels::MlxKernels, sched::SessionBudget,
-    weights::StreamedCheckpoint,
+    tensor::Dtype, weights::StreamedCheckpoint,
 };
 
 /// What one step computes and reads back.
@@ -37,6 +38,11 @@ pub(super) struct StepResult {
     pub(super) layer_out: Option<Vec<Vec<f32>>>,
     /// The experts of each layer in rank order, `top_k` per layer. `Record` only.
     pub(super) routes: Option<Vec<Vec<u32>>>,
+    /// The router probability row `[experts]` behind each recorded host route, the oracle of the
+    /// near-tie rule of the route-parity gate (fix3 of packet Q36-BF16-a; decision 0046 A6).
+    /// `Record` with `Routing::Host` only: the row is already on the host there, so recording it
+    /// adds no synchronization.
+    pub(super) probs: Option<Vec<Vec<f32>>>,
 }
 
 /// The default context limit of decision 0046 item 6.
@@ -87,17 +93,83 @@ impl<'c> ResidentDecoder<'c> {
         Ok(Self::with_weights(kernels, ckpt, weights, context_limit))
     }
 
-    /// Like `new`, with every scale and bias kept as stored (BF16; see
-    /// `ResidentWeights::import_bf16_scales`). Qualification tests only.
-    #[cfg(all(test, feature = "native-fault-qualification"))]
-    pub(super) fn new_bf16_scales(
+    /// Builds the decoder for `activation` (packet Q36-BF16-a), the one setting that pairs the
+    /// scale storage with the activation dtype. `Activation::F32` is the qualification
+    /// control and equals `new`. `Activation::Bf16` keeps the stored BF16 scales and biases, then
+    /// lets the adapter take BF16 operands, converts the 100 layer norms to BF16 with one
+    /// synchronization, and sets `Consts::act`; the key-value cache, the DeltaNet state and ring,
+    /// the router, the final norm, and the logits stay F32. `ensure_scale_pairing` refuses a
+    /// mismatched scale pair before any of that. `prefill` refuses a decoder that holds BF16
+    /// activations (the chunk path is F32 only until slice Q36-BF16-b).
+    ///
+    /// The head keeps an F32 activation over BF16 scales (packet Q36-BF16-a, documented, not
+    /// changed): the final norm promotes the BF16 hidden state against the F32 final-norm weight,
+    /// so the `lm_head` qmm runs F32 over the stored BF16 scales, and MLX casts the scales per
+    /// token (about 64 MB of temporaries). A speed-table row for the Mac run; slice Q36-BF16-b
+    /// revisits the head.
+    pub(super) fn new_with_activation(
+        kernels: MlxKernels,
+        ckpt: &'c StreamedCheckpoint,
+        host: HostWeights,
+        context_limit: u32,
+        activation: Activation,
+    ) -> Result<Self, EngError> {
+        // The product path: the scale import follows the activation, so the census always matches.
+        Self::new_paired(
+            kernels,
+            ckpt,
+            host,
+            context_limit,
+            activation,
+            activation == Activation::F32,
+        )
+    }
+
+    /// The test form of `new_with_activation` (packet Q36-BF16-a fix): the scale import follows the
+    /// `Q36_SCALE_DTYPE` knob instead of `activation`, which is the only way to drive the
+    /// mismatched pair that `ensure_scale_pairing` refuses, because the product constructor
+    /// cannot build it.
+    #[cfg(test)]
+    pub(super) fn new_with_scale_override(
+        kernels: MlxKernels,
+        ckpt: &'c StreamedCheckpoint,
+        host: HostWeights,
+        context_limit: u32,
+        activation: Activation,
+    ) -> Result<Self, EngError> {
+        Self::new_paired(
+            kernels,
+            ckpt,
+            host,
+            context_limit,
+            activation,
+            super::scale_knob::scales_f32_requested(),
+        )
+    }
+
+    /// The one constructor body: it imports the scales in the `f32_scales` form, then refuses a
+    /// pair that does not match `activation` before anything else changes.
+    fn new_paired(
         mut kernels: MlxKernels,
         ckpt: &'c StreamedCheckpoint,
         host: HostWeights,
         context_limit: u32,
+        activation: Activation,
+        f32_scales: bool,
     ) -> Result<Self, EngError> {
+        let act = activation.dtype();
         kernels.set_retire_cap(DECODE_RETIRE_CAP)?;
-        let weights = ResidentWeights::import_bf16_scales(&mut kernels, ckpt, host)?;
+        let mut weights = if f32_scales {
+            ResidentWeights::import(&mut kernels, ckpt, host)?
+        } else {
+            ResidentWeights::import_bf16_scales(&mut kernels, ckpt, host)?
+        };
+        weights.ensure_scale_pairing(activation)?;
+        if act == Dtype::Bf16 {
+            kernels.allow_bf16(true);
+            weights.convert_norms(&mut kernels, Dtype::Bf16)?;
+            weights.consts.act = Dtype::Bf16;
+        }
         Ok(Self::with_weights(kernels, ckpt, weights, context_limit))
     }
 
@@ -209,5 +281,180 @@ impl<'c> ResidentDecoder<'c> {
         mode: StepMode,
     ) -> Result<StepResult, EngError> {
         prefill::step::prefill(self, state, tokens, mode)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::family::qwen36::host_load::HostWeights;
+    use crate::family::qwen36::tiny::{self, TINY_GQA};
+    use crate::kernels::MlxKernels;
+
+    /// The host load of the four-layer tiny model.
+    fn host(ckpt: &StreamedCheckpoint) -> HostWeights {
+        HostWeights::load(ckpt, &TINY_GQA, &tiny::config(&TINY_GQA)).unwrap()
+    }
+
+    /// The BF16 constructor of packet Q36-BF16-a keeps the stored BF16 scales and biases, converts
+    /// the 100-shaped norm set (here 8 layer norms and 4 head norms) to BF16, and holds `Bf16` as
+    /// the activation dtype. The F32 constructor widens every scale and bias and keeps the norms
+    /// F32. The two censuses have the same shape (43 packed weights of 2 parts each), so a wiring
+    /// that imports F32 scales for BF16 activations shows here as an F32 part or a construction
+    /// refusal from `ensure_scale_pairing`.
+    #[test]
+    fn the_activation_dtype_pairs_the_scales_and_converts_the_norms() {
+        let _serial = crate::native_test_lock();
+        let ckpt = tiny::checkpoint(&TINY_GQA);
+        let f32 =
+            ResidentDecoder::new(MlxKernels::try_new().unwrap(), &ckpt, host(&ckpt), 1024).unwrap();
+        let bf16 = ResidentDecoder::new_with_activation(
+            MlxKernels::try_new().unwrap(),
+            &ckpt,
+            host(&ckpt),
+            1024,
+            Activation::Bf16,
+        )
+        .unwrap();
+        assert_eq!(f32.weights.consts.act, Dtype::F32, "the F32 control");
+        assert_eq!(
+            bf16.weights.consts.act,
+            Dtype::Bf16,
+            "the activation dtype is set"
+        );
+        let (f32, bf16) = (f32.weights.scale_census(), bf16.weights.scale_census());
+        assert_eq!(
+            (f32.weights, f32.f32_parts, f32.bf16_parts, f32.other_parts),
+            (43, 86, 0, 0),
+            "the F32 import widens every scale and bias"
+        );
+        assert_eq!(
+            (
+                bf16.weights,
+                bf16.f32_parts,
+                bf16.bf16_parts,
+                bf16.other_parts
+            ),
+            (43, 0, 86, 0),
+            "the BF16 import keeps every scale and bias as stored"
+        );
+    }
+
+    /// The norms of the BF16 decoder are BF16 (they are stored BF16 in the checkpoint, so the
+    /// conversion loses nothing) and the final norm stays F32. A missing `convert_norms` leaves
+    /// the input norms F32 and the dtype guard of the step fires.
+    #[test]
+    fn the_bf16_constructor_converts_the_norms_and_keeps_the_final_norm_f32() {
+        let _serial = crate::native_test_lock();
+        let ckpt = tiny::checkpoint(&TINY_GQA);
+        let decoder = ResidentDecoder::new_with_activation(
+            MlxKernels::try_new().unwrap(),
+            &ckpt,
+            host(&ckpt),
+            1024,
+            Activation::Bf16,
+        )
+        .unwrap();
+        assert_eq!(
+            decoder.weights.final_norm.dtype(),
+            Dtype::F32,
+            "the final norm stays F32"
+        );
+        let (mut layer_norms, mut head_norms) = (0usize, 0usize);
+        for layer in &decoder.weights.layers {
+            assert_eq!(layer.input_norm.dtype(), Dtype::Bf16, "an input norm");
+            assert_eq!(layer.post_norm.dtype(), Dtype::Bf16, "a post norm");
+            layer_norms += 2;
+            if let super::super::weights::RMixer::Attn(a) = &layer.mixer {
+                assert_eq!(a.q_norm.dtype(), Dtype::Bf16, "a query norm");
+                assert_eq!(a.k_norm.dtype(), Dtype::Bf16, "a key norm");
+                head_norms += 2;
+            }
+        }
+        assert_eq!(
+            (layer_norms, head_norms),
+            (8, 4),
+            "every norm of the fixture"
+        );
+    }
+
+    /// The pairing refusal of `ensure_scale_pairing`, driven through the `Q36_SCALE_DTYPE` test
+    /// knob (packet Q36-BF16-a fix): the knob picks the scale import independently of the
+    /// activation, which is the only way to build the mismatched pair, because the product
+    /// constructor cannot. `std::env::set_var` is denied outside the kernels modules, so each
+    /// direction runs in a child process that carries the knob, as the rebind tests of the
+    /// kernels adapter do; the child asserts the refusal text and the parent requires its pass.
+    #[test]
+    fn the_constructor_refuses_the_mismatched_scale_pair_from_the_knob() {
+        const CHILD: &str = "INFERENCE_Q36_PAIRING_CHILD";
+        // One mismatch direction: the knob value and the activation it must refuse.
+        struct Mismatch {
+            knob: (&'static str, &'static str),
+            activation: Activation,
+            want: &'static str,
+        }
+        let rows = [
+            Mismatch {
+                // BF16 scales under an `f32` activation: the 31.6 tok/s trap that Q36-G0 closed.
+                knob: ("Q36_SCALE_DTYPE", "bf16"),
+                activation: Activation::F32,
+                want: "activation_dtype f32 needs F32 scales and biases; the census holds \
+                       43 packed weights with 0 F32, 86 BF16, and 0 other parts",
+            },
+            Mismatch {
+                // F32 scales under a `bf16` activation: every qmm would promote back to F32.
+                knob: ("Q36_SCALE_DTYPE", "f32"),
+                activation: Activation::Bf16,
+                want: "activation_dtype bf16 needs BF16 scales and biases; the census holds \
+                       43 packed weights with 86 F32, 0 BF16, and 0 other parts",
+            },
+        ];
+        if let Some(which) = std::env::var_os(CHILD) {
+            // The child: its knob is already in the environment; build and refuse.
+            let row = match which.to_str() {
+                Some("f32") => &rows[1],
+                _ => &rows[0],
+            };
+            let ckpt = tiny::checkpoint(&TINY_GQA);
+            let refused = ResidentDecoder::new_with_scale_override(
+                MlxKernels::try_new().unwrap(),
+                &ckpt,
+                host(&ckpt),
+                1024,
+                row.activation,
+            );
+            assert!(
+                matches!(&refused, Err(EngError::BadRequest(m)) if m == row.want),
+                "the mismatched pair must refuse with the census, got {:?}",
+                refused.err()
+            );
+            return;
+        }
+        let _serial = crate::native_test_lock();
+        let path = module_path!().split_once("::").unwrap().1;
+        for row in &rows {
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    &format!(
+                        "{path}::the_constructor_refuses_the_mismatched_scale_pair_from_the_knob"
+                    ),
+                    "--nocapture",
+                ])
+                .env(CHILD, row.knob.1)
+                .env(row.knob.0, row.knob.1)
+                .output()
+                .unwrap();
+            let captured = format!(
+                "{}{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            assert!(
+                output.status.success() && captured.contains("1 passed"),
+                "the {} direction must refuse in the child: {captured}",
+                row.knob.1
+            );
+        }
     }
 }

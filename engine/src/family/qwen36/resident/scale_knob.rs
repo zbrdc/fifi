@@ -1,26 +1,30 @@
-//! Test support for the scale storage of the Q36 resident weights (lever Q36-G0).
+//! Test support for the activation dtype of the Q36 resident decoder (packet Q36-BF16-a).
 //!
-//! The default stores the scales and biases of the packed weights as F32. MLX casts BF16 scales
-//! and biases to the F32 of the activation on every call of `qmm` and `gather_qmm`, and an F32
-//! operand skips that cast. BF16 widens to F32 without loss, so the products do not change. The
-//! knob selects the old BF16 storage for a comparison run. A Q36 result never satisfies Phase 0B
-//! or Phase 1B.
+//! The product lever is the `activation_dtype` setting of the engine entry (`settings.rs`): `bf16`
+//! keeps the stored BF16 scales and biases and runs BF16 activations with converted norms, `f32`
+//! keeps the G0 widening, and the decoder constructor refuses any other pairing. The ignored
+//! real-checkpoint runs have no engine entry, so this file reads the same lever from one knob and
+//! builds the decoder through the product constructor. A Q36 result never satisfies Phase 0B or
+//! Phase 1B.
 //!
 //! | Variable | Values | Default |
 //! | --- | --- | --- |
-//! | `Q36_SCALE_DTYPE` | `f32` widens the stored scales and biases at import, `bf16` keeps them as stored | `f32` |
+//! | `Q36_ACTIVATION` | `f32` is the qualification control, `bf16` builds the BF16 decoder | `f32` |
 //!
-//! `bf16` needs the `native-fault-qualification` feature. Any other set value fails the test. The
-//! knob applies to the real-checkpoint tests of `parity`, `route_parity` (both tests), and
-//! `weights` (the load test). Each report carries the dtype, the census of the scale and bias
-//! tensors, and the resident bytes after the load.
+//! Any other set value fails the test. The knob applies to the real-checkpoint tests of `parity`
+//! and `route_parity` (both tests). The weights load test keeps `Q36_SCALE_DTYPE`, the older knob
+//! that selects the scale import alone, because it measures both import forms at the weights level;
+//! as a decoder pairing that combination is refused.
 
 use sha2::{Digest, Sha256};
 
 use super::decoder::ResidentDecoder;
-use super::real::rss_kb;
+use super::real::{activation_from_env, rss_kb};
 use crate::{
-    family::qwen36::host_load::HostWeights, kernels::MlxKernels, weights::StreamedCheckpoint,
+    family::qwen36::host_load::HostWeights,
+    family::qwen36::settings::{Activation, activation_name},
+    kernels::MlxKernels,
+    weights::StreamedCheckpoint,
 };
 
 /// The packed weights of the 35B model: the head, 30 x 5 DeltaNet, 10 x 4 attention, and 40 x 6
@@ -28,42 +32,34 @@ use crate::{
 const PACKED_WEIGHTS: u64 = 431;
 
 /// Reads `Q36_SCALE_DTYPE`: unset or `f32` is true, `bf16` is false, any other value panics. The
-/// BF16 storage exists only with the `native-fault-qualification` feature.
+/// knob selects the scale import of the weights load test only (see the module doc).
 pub(super) fn scales_f32_requested() -> bool {
     match std::env::var("Q36_SCALE_DTYPE") {
         Err(std::env::VarError::NotPresent) => true,
         Ok(value) if value == "f32" => true,
-        #[cfg(feature = "native-fault-qualification")]
         Ok(value) if value == "bf16" => false,
-        #[cfg(not(feature = "native-fault-qualification"))]
-        Ok(value) if value == "bf16" => {
-            panic!("Q36_SCALE_DTYPE=bf16 needs the native-fault-qualification feature")
-        }
         other => panic!("Q36_SCALE_DTYPE must be unset, f32, or bf16, got {other:?}"),
     }
 }
 
-/// Builds the decoder that `Q36_SCALE_DTYPE` asks for and checks the dtype of every scale and
-/// bias tensor: 862 tensors in 431 packed weights, all F32 (default) or all BF16. Returns the
-/// decoder and a report object with the dtype, the census, and the memory after the load.
+/// Builds the decoder that `Q36_ACTIVATION` asks for, through the product constructor, and checks
+/// the dtype of every scale and bias tensor: 862 tensors in 431 packed weights, all F32 (control)
+/// or all BF16. Returns the decoder and the activation it holds, for the report.
 pub(super) fn new_decoder<'c>(
     kernels: MlxKernels,
     ckpt: &'c StreamedCheckpoint,
     host: HostWeights,
     context_limit: u32,
-) -> (ResidentDecoder<'c>, serde_json::Value) {
-    let f32_scales = scales_f32_requested();
-    #[cfg(feature = "native-fault-qualification")]
-    let decoder = if f32_scales {
-        ResidentDecoder::new(kernels, ckpt, host, context_limit)
-    } else {
-        ResidentDecoder::new_bf16_scales(kernels, ckpt, host, context_limit)
-    }
-    .unwrap();
-    #[cfg(not(feature = "native-fault-qualification"))]
-    let decoder = ResidentDecoder::new(kernels, ckpt, host, context_limit).unwrap();
+) -> (ResidentDecoder<'c>, Activation) {
+    let activation = activation_from_env();
+    let decoder =
+        ResidentDecoder::new_with_activation(kernels, ckpt, host, context_limit, activation)
+            .unwrap();
     let census = decoder.weights.scale_census();
-    let (want_f32, want_bf16) = if f32_scales { (862, 0) } else { (0, 862) };
+    let (want_f32, want_bf16) = match activation {
+        Activation::F32 => (862, 0),
+        Activation::Bf16 => (0, 862),
+    };
     assert_eq!(
         (
             census.weights,
@@ -72,10 +68,18 @@ pub(super) fn new_decoder<'c>(
             census.other_parts
         ),
         (PACKED_WEIGHTS, want_f32, want_bf16, 0),
-        "scale and bias dtypes do not follow Q36_SCALE_DTYPE"
+        "scale and bias dtypes do not follow Q36_ACTIVATION"
+    );
+    assert_eq!(
+        decoder.weights.consts.act,
+        match activation {
+            Activation::F32 => crate::tensor::Dtype::F32,
+            Activation::Bf16 => crate::tensor::Dtype::Bf16,
+        },
+        "the decoder holds the activation dtype"
     );
     let report = serde_json::json!({
-        "dtype": if f32_scales { "f32" } else { "bf16" },
+        "activation_dtype": activation_name(activation),
         "packed_weights": census.weights,
         "f32_parts": census.f32_parts, "bf16_parts": census.bf16_parts,
         "resident_bytes": decoder.weights.byte_len().unwrap(),
@@ -83,7 +87,8 @@ pub(super) fn new_decoder<'c>(
         "mlx_active_after_load": decoder.kernels.memory_stats().unwrap().active,
         "rss_kb_after_load": rss_kb(),
     });
-    (decoder, report)
+    println!("{}", serde_json::to_string_pretty(&report).unwrap());
+    (decoder, activation)
 }
 
 /// Adds the little-endian bytes of `values` to `hasher`.

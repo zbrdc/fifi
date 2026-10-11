@@ -8,13 +8,13 @@
 //!
 //! The step only builds lazy graph nodes. It never reads back or evaluates (decision 0039 item 2).
 
-use super::ops::{Ctx, dim, linear};
+use super::ops::{Ctx, cast_to, dim, linear, to_act};
 use super::weights::RDelta;
 use crate::{
     EngError,
     family::qwen36::host::HostShape,
     kernels::{BinaryOp, MlxKernels, ReduceOp, UnaryOp},
-    tensor::ExecutionTensor,
+    tensor::{Dtype, ExecutionTensor},
 };
 
 /// Output and replacement state of one resident DeltaNet step. Every tensor is lazy.
@@ -81,6 +81,10 @@ pub(super) fn step(
     let z = linear(ctx, &w.z, x)?;
     let bb = linear(ctx, &w.b, x)?;
     let aa = linear(ctx, &w.a, x)?;
+    // Packet Q36-BF16-a: the recurrence, its state, and the convolution ring stay F32. `u`, `z`,
+    // and `aa` meet an F32 weight or state first and promote on their own. `bb` feeds a sigmoid
+    // alone and the gated delta kernel takes F32 `beta`, so it converts here.
+    let bb = cast_to(ctx, &bb, Dtype::F32)?;
     let consts = ctx.consts;
     let m = &mut *ctx.kernels;
     let u = m.reshape(&u, &[cd])?;
@@ -95,8 +99,10 @@ pub(super) fn step(
     let ring_next = if taps > 1 {
         let kept = m.slice(ring, &[0, 1], &[cd, taps])?;
         m.concatenate(&[&kept, &column], 1)?
-    } else {
+    } else if column.dtype() == Dtype::F32 {
         column
+    } else {
+        m.cast(&column, Dtype::F32)?
     };
     // Split y into q, k, v.
     let q = m.slice(&y, &[0], &[kw])?;
@@ -132,6 +138,8 @@ pub(super) fn step(
     let z = m.reshape(&z, &[vh, vd])?;
     let gate = m.silu(&z)?;
     let o = m.binary(BinaryOp::Mul, &normed, &gate)?;
+    // The gated norm and the gate promote to F32; the out-projection takes the activation dtype.
+    let o = to_act(ctx, &o)?;
     let out = linear(ctx, &w.out, &o)?;
     Ok(DeltaStep {
         out,

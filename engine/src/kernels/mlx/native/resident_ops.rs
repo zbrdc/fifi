@@ -57,7 +57,7 @@ impl Context {
             "SiLU",
             &ElementwiseInputs {
                 owners_match: x.owner_key() == state.owner,
-                dtypes_f32: x.dtype() == Dtype::F32,
+                dtypes_f32: state.accepts_float(x.dtype()),
                 shape: x.shape(),
                 other_shape: None,
             },
@@ -66,10 +66,10 @@ impl Context {
         let _input = x.share();
         clear_message();
         let stream = state.stream.0;
-        let output = dispatch_elementwise("SiLU", &layout, stream, |output| unsafe {
+        let output = dispatch_promoting_elementwise("SiLU", &layout, stream, |output| unsafe {
             ffi::mlx_silu(output, x.storage.native_array(), stream)
         })?;
-        Ok(elementwise_result(state, output, layout))
+        Ok(promoting_elementwise_result(state, output, layout))
     }
 
     pub(in crate::kernels::mlx) fn softmax(
@@ -83,7 +83,7 @@ impl Context {
             "softmax",
             &ElementwiseInputs {
                 owners_match: x.owner_key() == state.owner,
-                dtypes_f32: x.dtype() == Dtype::F32,
+                dtypes_f32: state.accepts_float(x.dtype()),
                 shape: x.shape(),
                 other_shape: None,
             },
@@ -92,10 +92,10 @@ impl Context {
         let _input = x.share();
         clear_message();
         let stream = state.stream.0;
-        let output = dispatch_elementwise("softmax", &layout, stream, |output| unsafe {
+        let output = dispatch_promoting_elementwise("softmax", &layout, stream, |output| unsafe {
             ffi::mlx_softmax(output, x.storage.native_array(), true, stream)
         })?;
-        Ok(elementwise_result(state, output, layout))
+        Ok(promoting_elementwise_result(state, output, layout))
     }
 
     pub(in crate::kernels::mlx) fn add(
@@ -135,7 +135,7 @@ impl Context {
             label,
             &ElementwiseInputs {
                 owners_match: x.owner_key() == state.owner,
-                dtypes_f32: x.dtype() == Dtype::F32,
+                dtypes_f32: state.accepts_float(x.dtype()),
                 shape: x.shape(),
                 other_shape: None,
             },
@@ -144,10 +144,10 @@ impl Context {
         let _input = x.share();
         clear_message();
         let stream = state.stream.0;
-        let output = dispatch_elementwise(label, &layout, stream, |output| unsafe {
+        let output = dispatch_promoting_elementwise(label, &layout, stream, |output| unsafe {
             native(output, x.storage.native_array(), stream)
         })?;
-        Ok(elementwise_result(state, output, layout))
+        Ok(promoting_elementwise_result(state, output, layout))
     }
 
     pub(in crate::kernels::mlx) fn binary(
@@ -170,14 +170,14 @@ impl Context {
         let layout = elementwise::validate_broadcast(
             label,
             a.owner_key() == state.owner && b.owner_key() == state.owner,
-            a.dtype() == Dtype::F32 && b.dtype() == Dtype::F32,
+            state.accepts_float(a.dtype()) && state.accepts_float(b.dtype()),
             a.shape(),
             b.shape(),
         )?;
         let _inputs = [a.share(), b.share()];
         clear_message();
         let stream = state.stream.0;
-        let output = dispatch_elementwise(label, &layout, stream, |output| unsafe {
+        let output = dispatch_promoting_elementwise(label, &layout, stream, |output| unsafe {
             native(
                 output,
                 a.storage.native_array(),
@@ -185,7 +185,7 @@ impl Context {
                 stream,
             )
         })?;
-        Ok(elementwise_result(state, output, layout))
+        Ok(promoting_elementwise_result(state, output, layout))
     }
 
     pub(in crate::kernels::mlx) fn reduce(
@@ -209,7 +209,7 @@ impl Context {
         let _input = x.share();
         clear_message();
         let stream = state.stream.0;
-        let output = dispatch_elementwise(label, &layout, stream, |output| unsafe {
+        let output = dispatch_promoting_elementwise(label, &layout, stream, |output| unsafe {
             native(
                 output,
                 x.storage.native_array(),
@@ -218,7 +218,7 @@ impl Context {
                 stream,
             )
         })?;
-        Ok(elementwise_result(state, output, layout))
+        Ok(promoting_elementwise_result(state, output, layout))
     }
 
     pub(in crate::kernels::mlx) fn reshape(
@@ -236,7 +236,7 @@ impl Context {
         let _input = x.share();
         clear_message();
         let stream = state.stream.0;
-        let output = dispatch_elementwise(label, &layout, stream, |output| unsafe {
+        let output = dispatch_promoting_elementwise(label, &layout, stream, |output| unsafe {
             ffi::mlx_reshape(
                 output,
                 x.storage.native_array(),
@@ -245,7 +245,7 @@ impl Context {
                 stream,
             )
         })?;
-        Ok(elementwise_result(state, output, layout))
+        Ok(promoting_elementwise_result(state, output, layout))
     }
 
     pub(in crate::kernels::mlx) fn transpose(
@@ -269,6 +269,7 @@ impl Context {
             shape: &layout.shape,
             byte_len: layout.byte_len,
             dtype: Dtype::F32,
+            promotes: true,
         };
         let output = dispatch_contiguous(&expected, |slot| unsafe {
             ffi::mlx_transpose_axes(
@@ -279,7 +280,7 @@ impl Context {
                 stream,
             )
         })?;
-        Ok(elementwise_result(state, output, layout))
+        Ok(promoting_elementwise_result(state, output, layout))
     }
 
     pub(in crate::kernels::mlx) fn expand_dims(
@@ -297,10 +298,10 @@ impl Context {
         let _input = x.share();
         clear_message();
         let stream = state.stream.0;
-        let output = dispatch_elementwise(label, &layout, stream, |output| unsafe {
+        let output = dispatch_promoting_elementwise(label, &layout, stream, |output| unsafe {
             ffi::mlx_expand_dims(output, x.storage.native_array(), native_axis, stream)
         })?;
-        Ok(elementwise_result(state, output, layout))
+        Ok(promoting_elementwise_result(state, output, layout))
     }
 
     pub(in crate::kernels::mlx) fn repeat(
@@ -327,11 +328,12 @@ impl Context {
             shape: &layout.shape,
             byte_len: layout.byte_len,
             dtype: Dtype::F32,
+            promotes: true,
         };
         let output = dispatch_contiguous(&expected, |slot| unsafe {
             ffi::mlx_repeat_axis(slot, x.storage.native_array(), native[0], native[1], stream)
         })?;
-        Ok(elementwise_result(state, output, layout))
+        Ok(promoting_elementwise_result(state, output, layout))
     }
 
     pub(in crate::kernels::mlx) fn slice(
@@ -345,13 +347,15 @@ impl Context {
         self.check_ready()?;
         let state = self.state.as_mut().unwrap();
         check_owner(label, state, x)?;
-        if !matches!(x.dtype(), Dtype::F32 | Dtype::U32) {
+        if !(state.accepts_float(x.dtype()) || x.dtype() == Dtype::U32) {
             return Err(EngError::BadRequest(format!(
                 "{label}: input dtype must be F32 or U32"
             )));
         }
         let dtype = x.dtype();
         let layout = shape::slice(label, x.shape(), start, stop)?;
+        // The layout counts 4-byte elements, which is exact for F32 and U32 and halves for BF16.
+        let byte_len = layout.byte_len / Dtype::F32.byte_width() * dtype.byte_width();
         let (native_start, native_stop) = (native_ints(label, start)?, native_ints(label, stop)?);
         let strides = vec![1_i32; start.len()];
         let _input = x.share();
@@ -361,8 +365,9 @@ impl Context {
             operation: label,
             stream,
             shape: &layout.shape,
-            byte_len: layout.byte_len,
+            byte_len,
             dtype,
+            promotes: false,
         };
         let output = dispatch_contiguous(&expected, |slot| unsafe {
             ffi::mlx_slice(
@@ -375,7 +380,7 @@ impl Context {
                 stream,
             )
         })?;
-        Ok(state.resident(output, dtype, layout.shape, layout.byte_len))
+        Ok(state.resident(output, dtype, layout.shape, byte_len))
     }
 
     pub(in crate::kernels::mlx) fn slice_update(
@@ -397,7 +402,7 @@ impl Context {
         let _inputs = [target.share(), update.share()];
         clear_message();
         let stream = state.stream.0;
-        let output = dispatch_elementwise(label, &layout, stream, |output| unsafe {
+        let output = dispatch_promoting_elementwise(label, &layout, stream, |output| unsafe {
             ffi::mlx_slice_update(
                 output,
                 target.storage.native_array(),
@@ -409,7 +414,7 @@ impl Context {
                 stream,
             )
         })?;
-        Ok(elementwise_result(state, output, layout))
+        Ok(promoting_elementwise_result(state, output, layout))
     }
 
     pub(in crate::kernels::mlx) fn concatenate(
@@ -434,10 +439,10 @@ impl Context {
             .collect();
         clear_message();
         let stream = state.stream.0;
-        let output = dispatch_elementwise(label, &layout, stream, |output| unsafe {
+        let output = dispatch_promoting_elementwise(label, &layout, stream, |output| unsafe {
             ffi::mlx_concatenate_axis(output, handles.as_ptr(), handles.len(), native_axis, stream)
         })?;
-        Ok(elementwise_result(state, output, layout))
+        Ok(promoting_elementwise_result(state, output, layout))
     }
 
     pub(in crate::kernels::mlx) fn argmax(
@@ -518,6 +523,38 @@ impl Context {
         Ok(elementwise_result(state, output, layout))
     }
 
+    /// Converts a float resident to F32 or BF16 with the shim of `u32_to_f32` (packet Q36-BF16-a).
+    /// The input and the target must be F32, or BF16 after `Context::allow_bf16`.
+    pub(in crate::kernels::mlx) fn cast(
+        &mut self,
+        x: &ExecutionTensor,
+        dtype: Dtype,
+    ) -> Result<ExecutionTensor, EngError> {
+        let label = "convert";
+        let _dispatch = DispatchGuard::enter();
+        self.check_ready()?;
+        let state = self.state.as_mut().unwrap();
+        check_operand(label, state, x)?;
+        if !state.accepts_float(dtype) {
+            return Err(EngError::BadRequest(format!(
+                "{label}: output dtype must be F32 or an allowed BF16"
+            )));
+        }
+        let layout = shape::last_axis(label, x.shape())?;
+        let converted = ElementwiseLayout {
+            byte_len: layout.byte_len / Dtype::F32.byte_width() * dtype.byte_width(),
+            shape: layout.shape,
+        };
+        let _input = x.share();
+        clear_message();
+        let stream = state.stream.0;
+        let target = native_dtype(dtype);
+        let output = dispatch_typed(label, &converted, dtype, stream, |output| unsafe {
+            ffi::mlx_resident_astype(output, x.storage.native_array(), target, stream)
+        })?;
+        Ok(state.resident(output, dtype, converted.shape, converted.byte_len))
+    }
+
     pub(in crate::kernels::mlx) fn take(
         &mut self,
         x: &ExecutionTensor,
@@ -562,9 +599,10 @@ impl Context {
             shape: &layout.shape,
             byte_len: layout.byte_len,
             dtype: Dtype::F32,
+            promotes: true,
         };
         expected.complete(&output, built)?;
-        Ok(elementwise_result(state, output, layout))
+        Ok(promoting_elementwise_result(state, output, layout))
     }
 
     pub(in crate::kernels::mlx) fn batched_mm(
@@ -582,7 +620,7 @@ impl Context {
         let _inputs = [a.share(), b.share()];
         clear_message();
         let stream = state.stream.0;
-        let output = dispatch_elementwise(label, &layout, stream, |output| unsafe {
+        let output = dispatch_promoting_elementwise(label, &layout, stream, |output| unsafe {
             ffi::mlx_matmul(
                 output,
                 a.storage.native_array(),
@@ -590,7 +628,7 @@ impl Context {
                 stream,
             )
         })?;
-        Ok(elementwise_result(state, output, layout))
+        Ok(promoting_elementwise_result(state, output, layout))
     }
 
     pub(in crate::kernels::mlx) fn gather_qmm(
@@ -645,9 +683,10 @@ impl Context {
             shape: &layout.shape,
             byte_len: layout.byte_len,
             dtype: Dtype::F32,
+            promotes: true,
         };
         expected.complete(&output, built)?;
-        Ok(elementwise_result(state, output, layout))
+        Ok(promoting_elementwise_result(state, output, layout))
     }
 
     pub(in crate::kernels::mlx) fn dequantize(
@@ -659,6 +698,10 @@ impl Context {
         self.check_ready()?;
         let state = self.state.as_mut().unwrap();
         check_packed(label, state, weight)?;
+        // F32 only (packet Q36-BF16-a fix): the call pins the output dtype to F32, and the strict
+        // result check below rejects anything else. The scales and biases may be stored BF16, as
+        // the embedding rows are: the shim casts them to the output dtype first, so the F32 result
+        // stays exact (kernels.md).
         let layout = shape::dequantize(label, weight.logical_shape())?;
         let quant = quant_args(weight.quantization())?;
         let biases = weight
@@ -702,7 +745,7 @@ impl Context {
         let _input = x.share();
         clear_message();
         let stream = state.stream.0;
-        let output = dispatch_elementwise(label, &layout, stream, |output| unsafe {
+        let output = dispatch_promoting_elementwise(label, &layout, stream, |output| unsafe {
             ffi::mlx_rms_norm(
                 output,
                 x.storage.native_array(),
@@ -711,7 +754,7 @@ impl Context {
                 stream,
             )
         })?;
-        Ok(elementwise_result(state, output, layout))
+        Ok(promoting_elementwise_result(state, output, layout))
     }
 
     pub(in crate::kernels::mlx) fn rope_scaled(
@@ -731,7 +774,7 @@ impl Context {
         let _input = x.share();
         clear_message();
         let stream = state.stream.0;
-        let output = dispatch_elementwise(label, &layout, stream, |output| unsafe {
+        let output = dispatch_promoting_elementwise(label, &layout, stream, |output| unsafe {
             ffi::mlx_rope_scaled(
                 output,
                 x.storage.native_array(),
@@ -742,7 +785,7 @@ impl Context {
                 stream,
             )
         })?;
-        Ok(elementwise_result(state, output, layout))
+        Ok(promoting_elementwise_result(state, output, layout))
     }
 
     pub(in crate::kernels::mlx) fn grouped_attention(
@@ -771,6 +814,7 @@ impl Context {
             shape: &layout.shape,
             byte_len: layout.byte_len,
             dtype: Dtype::F32,
+            promotes: true,
         };
         let output = dispatch_contiguous(&expected, |slot| unsafe {
             ffi::mlx_grouped_attention(
@@ -783,7 +827,7 @@ impl Context {
                 stream,
             )
         })?;
-        Ok(elementwise_result(state, output, layout))
+        Ok(promoting_elementwise_result(state, output, layout))
     }
 
     /// Runs the gated delta rule kernel of mlx-lm over `T` tokens and returns `y` and the new
@@ -802,8 +846,12 @@ impl Context {
         let _dispatch = DispatchGuard::enter();
         self.check_ready()?;
         let state = self.state.as_mut().unwrap();
+        // The Metal kernel reads every operand as plain F32 bytes (decision 0050: `InT` is float,
+        // both outputs F32), so a BF16 operand is silent garbage, not a promoted operand. The
+        // strict check keeps the old rejection text even with `allow_bf16` on (packet Q36-BF16-a
+        // fix).
         for operand in [q, k, v, g, beta, recurrent] {
-            check_operand(label, state, operand)?;
+            check_f32_operand(label, state, operand)?;
         }
         let [qs, ks, vs, gs, bs, ss] = [q, k, v, g, beta, recurrent].map(ExecutionTensor::shape);
         let layout = gated_delta::layout(qs, ks, vs, gs, bs, ss)?;
@@ -839,6 +887,7 @@ impl Context {
             shape: &layout.y_shape,
             byte_len: layout.y_byte_len,
             dtype: Dtype::F32,
+            promotes: false,
         };
         y_expected.complete(&y, built)?;
         let next_expected = ExpectedOutput {
@@ -935,6 +984,7 @@ impl Context {
             shape: &shape,
             byte_len,
             dtype: Dtype::F32,
+            promotes: false,
         };
         expected.complete(&output, built)?;
         Ok(state.resident(output, Dtype::F32, shape.to_vec(), byte_len))
@@ -1007,6 +1057,7 @@ impl Context {
             shape: &output_shape,
             byte_len,
             dtype: Dtype::F32,
+            promotes: false,
         };
         expected.complete(&output, built)?;
         Ok(state.resident(output, Dtype::F32, output_shape.to_vec(), byte_len))
@@ -1142,9 +1193,11 @@ impl Context {
             shape: &shape,
             byte_len,
             dtype: Dtype::F32,
+            promotes: true,
         };
         let contiguous = dispatch_qmm(&expected, activation, weight, &quant)?;
-        Ok(state.resident(contiguous, Dtype::F32, shape.to_vec(), byte_len))
+        let (dtype, byte_len) = float_result(&contiguous, byte_len);
+        Ok(state.resident(contiguous, dtype, shape.to_vec(), byte_len))
     }
 
     pub(in crate::kernels::mlx) fn mm(
@@ -1169,9 +1222,11 @@ impl Context {
             shape: &shape,
             byte_len,
             dtype: Dtype::F32,
+            promotes: true,
         };
         let contiguous = dispatch_mm(&expected, activation, weight)?;
-        Ok(state.resident(contiguous, Dtype::F32, shape.to_vec(), byte_len))
+        let (dtype, byte_len) = float_result(&contiguous, byte_len);
+        Ok(state.resident(contiguous, dtype, shape.to_vec(), byte_len))
     }
 }
 
@@ -1182,6 +1237,10 @@ struct ExpectedOutput<'a> {
     shape: &'a [u32],
     byte_len: u64,
     dtype: Dtype,
+    /// Whether a BF16 result with half the bytes may replace the F32 one. Only a wrapper that
+    /// `allow_bf16` opened for operands may set it (packet Q36-BF16-a fix): an F32-only wrapper
+    /// that sees a BF16 result has a dtype bug, and the check must reject it, not absorb it.
+    promotes: bool,
 }
 
 impl ExpectedOutput<'_> {
@@ -1200,7 +1259,14 @@ impl ExpectedOutput<'_> {
     }
 
     fn validate(&self, output: &Array) -> Result<(), EngError> {
-        if native_output_valid(output.0, self.shape, self.dtype, self.byte_len) {
+        // A wrapper that allows BF16 operands can get a BF16 result, whose byte length is half the
+        // F32 layout. Every other result keeps the expected dtype exactly, BF16 included.
+        let (dtype, byte_len) = if self.dtype == Dtype::F32 && self.promotes {
+            float_result(output, self.byte_len)
+        } else {
+            (self.dtype, self.byte_len)
+        };
+        if native_output_valid(output.0, self.shape, dtype, byte_len) {
             return Ok(());
         }
         Err(EngError::Backend {
@@ -1241,12 +1307,14 @@ fn dispatch_typed(
         shape: &layout.shape,
         byte_len: layout.byte_len,
         dtype,
+        promotes: false,
     };
     expected.complete(&output, built)?;
     Ok(output)
 }
 
-/// Builds one lazy F32 operation and validates its output metadata.
+/// Builds one lazy F32 operation whose result must be F32 exactly, and validates its metadata.
+/// The F32-only wrappers use this: a BF16 result on their path is a mismatch, not a promotion.
 fn dispatch_elementwise(
     operation: &'static str,
     layout: &ElementwiseLayout,
@@ -1254,6 +1322,28 @@ fn dispatch_elementwise(
     native_call: impl FnOnce(*mut ffi::mlx_array) -> i32,
 ) -> Result<Array, EngError> {
     dispatch_typed(operation, layout, Dtype::F32, stream, native_call)
+}
+
+/// Builds one lazy F32 operation of a wrapper that `allow_bf16` opened for BF16 operands: the
+/// result may be BF16 with half the F32 bytes, as MLX promotes the operands (packet Q36-BF16-a).
+fn dispatch_promoting_elementwise(
+    operation: &'static str,
+    layout: &ElementwiseLayout,
+    stream: ffi::mlx_stream,
+    native_call: impl FnOnce(*mut ffi::mlx_array) -> i32,
+) -> Result<Array, EngError> {
+    let mut output = Array::null();
+    let built = produce(&mut output, operation, native_call);
+    let expected = ExpectedOutput {
+        operation,
+        stream,
+        shape: &layout.shape,
+        byte_len: layout.byte_len,
+        dtype: Dtype::F32,
+        promotes: true,
+    };
+    expected.complete(&output, built)?;
+    Ok(output)
 }
 
 /// Rotates one tensor with the static-offset RoPE call.
@@ -1286,6 +1376,7 @@ fn dispatch_rope(
         shape: x.shape(),
         byte_len,
         dtype: Dtype::F32,
+        promotes: false,
     };
     expected.complete(&output, built)?;
     Ok(output)
@@ -1310,6 +1401,34 @@ fn dispatch_contiguous(
 
 fn elementwise_result(state: &State, output: Array, layout: ElementwiseLayout) -> ExecutionTensor {
     state.resident(output, Dtype::F32, layout.shape, layout.byte_len)
+}
+
+/// The result form of a wrapper that `allow_bf16` opened for BF16 operands: an all-BF16 operand
+/// set gives a BF16 result with half the F32 bytes (packet Q36-BF16-a). Every other wrapper uses
+/// `elementwise_result`, whose F32 result is exact.
+fn promoting_elementwise_result(
+    state: &State,
+    output: Array,
+    layout: ElementwiseLayout,
+) -> ExecutionTensor {
+    let (dtype, byte_len) = float_result(&output, layout.byte_len);
+    state.resident(output, dtype, layout.shape, byte_len)
+}
+
+/// The dtype and byte length of a float result whose layout counts F32 bytes.
+///
+/// Only a wrapper that `allow_bf16` opened for BF16 operands calls this (packet Q36-BF16-a fix):
+/// such a wrapper gets a BF16 result when every operand is BF16, because MLX promotes mixed F32
+/// and BF16 operands to F32. With the switch off, every float operand is F32, so the result is
+/// F32 and the byte length is the layout's own count.
+fn float_result(output: &Array, f32_byte_len: u64) -> (Dtype, u64) {
+    if !output.0.ctx.is_null()
+        && unsafe { ffi::mlx_array_dtype(output.0) } == native_dtype(Dtype::Bf16)
+    {
+        let bytes = f32_byte_len / Dtype::F32.byte_width() * Dtype::Bf16.byte_width();
+        return (Dtype::Bf16, bytes);
+    }
+    (Dtype::F32, f32_byte_len)
 }
 
 fn row_output_layout(rows: u32, width: u32) -> Result<([i32; 2], u64), EngError> {
@@ -1340,7 +1459,7 @@ fn validate_qmm(
             "execution tensor belongs to another native owner".into(),
         ));
     }
-    if activation.dtype() != Dtype::F32 {
+    if !state.accepts_float(activation.dtype()) {
         return Err(EngError::BadRequest("activation dtype must be F32".into()));
     }
     let &[rows, columns] = weight.logical_shape() else {
@@ -1397,7 +1516,7 @@ fn validate_mm(
             "execution tensor belongs to another native owner".into(),
         ));
     }
-    if activation.dtype() != Dtype::F32 || weight.dtype() != Dtype::F32 {
+    if !state.accepts_float(activation.dtype()) || !state.accepts_float(weight.dtype()) {
         return Err(EngError::BadRequest("mm operand dtype must be F32".into()));
     }
     let activation_shape = matrix_shape(activation.shape())?;
@@ -1513,8 +1632,28 @@ fn check_owner(
     Ok(())
 }
 
-/// Rejects an input of another owner or a dtype other than F32, before any native call.
+/// Rejects an input of another owner or a float dtype that the adapter does not take (F32, and
+/// BF16 after `Context::allow_bf16`), before any native call.
 fn check_operand(
+    operation: &'static str,
+    state: &State,
+    x: &ExecutionTensor,
+) -> Result<(), EngError> {
+    check_owner(operation, state, x)?;
+    if !state.accepts_float(x.dtype()) {
+        return Err(EngError::BadRequest(format!(
+            "{operation}: input dtype must be F32"
+        )));
+    }
+    Ok(())
+}
+
+/// Rejects an input of another owner or a dtype other than F32, before any native call. The
+/// wrappers whose native path is F32 by construction use this even with `allow_bf16` on (packet
+/// Q36-BF16-a fix): the gated delta Metal kernel reads plain F32 bytes (`InT` is float, decision
+/// 0050), and a BF16 operand there is silent garbage, not a promoted operand. The rejection text
+/// is the text of `check_operand` from before the switch existed.
+fn check_f32_operand(
     operation: &'static str,
     state: &State,
     x: &ExecutionTensor,
@@ -1801,5 +1940,347 @@ mod rebind_tests {
                 label: "evaluate",
             },
         );
+    }
+}
+
+#[cfg(test)]
+mod cast_tests {
+    //! The `cast` and `allow_bf16` surface of packet Q36-BF16-a. These tests need the GPU.
+
+    use crate::{
+        EngError,
+        kernels::MlxKernels,
+        tensor::{Dtype, ExecutionTensor, Tensor},
+    };
+
+    /// An F32 resident of `values` with shape `[1, n]`, imported with one synchronization.
+    fn f32_resident(kernels: &mut MlxKernels, values: &[f32]) -> ExecutionTensor {
+        let bytes: Vec<u8> = values
+            .iter()
+            .flat_map(|value| value.to_le_bytes())
+            .collect();
+        kernels
+            .import_tensor(
+                &Tensor::try_from_host(Dtype::F32, vec![1, values.len() as u32], bytes).unwrap(),
+            )
+            .unwrap()
+    }
+
+    /// Reads an F32 resident back as values.
+    fn read_f32(kernels: &mut MlxKernels, x: &ExecutionTensor) -> Vec<f32> {
+        kernels
+            .readback(x)
+            .unwrap()
+            .host_bytes()
+            .unwrap()
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .map(|pair| f32::from_le_bytes(*pair))
+            .collect()
+    }
+
+    /// `silu` in F32, the value that a BF16 operand rounds towards.
+    fn silu(x: f32) -> f32 {
+        x / (1.0 + (-x).exp())
+    }
+
+    /// Values that BF16 holds exactly, so a round trip through BF16 must return them unchanged.
+    const BF16_EXACT: [f32; 4] = [0.5, 2.0, -0.25, 8.0];
+
+    #[test]
+    fn cast_round_trips_f32_through_bf16_and_back() {
+        let _serial = crate::native_test_lock();
+        let mut kernels = MlxKernels::try_new().unwrap();
+        kernels.allow_bf16(true);
+        let x = f32_resident(&mut kernels, &BF16_EXACT);
+        let bf16 = kernels.cast(&x, Dtype::Bf16).unwrap();
+        assert_eq!(bf16.dtype(), Dtype::Bf16, "the cast target dtype");
+        assert_eq!(bf16.shape(), [1, 4], "the shape survives the cast");
+        assert_eq!(bf16.byte_len(), 8, "four BF16 elements are 8 bytes");
+        let back = kernels.cast(&bf16, Dtype::F32).unwrap();
+        assert_eq!(back.dtype(), Dtype::F32, "the cast back to F32");
+        assert_eq!(back.byte_len(), 16, "four F32 elements are 16 bytes");
+        assert_eq!(
+            read_f32(&mut kernels, &back),
+            BF16_EXACT.to_vec(),
+            "BF16-exact values survive the round trip"
+        );
+    }
+
+    #[test]
+    fn cast_rejects_a_bf16_target_while_the_switch_is_off() {
+        let _serial = crate::native_test_lock();
+        let mut kernels = MlxKernels::try_new().unwrap();
+        let x = f32_resident(&mut kernels, &BF16_EXACT);
+        let refused = kernels.cast(&x, Dtype::Bf16);
+        assert!(
+            matches!(&refused, Err(EngError::BadRequest(m)) if m == "convert: output dtype must be F32 or an allowed BF16"),
+            "{:?}",
+            refused.as_ref().err()
+        );
+    }
+
+    #[test]
+    fn the_off_switch_rejects_bf16_operands_with_the_old_text() {
+        let _serial = crate::native_test_lock();
+        let mut kernels = MlxKernels::try_new().unwrap();
+        // A BF16 resident exists only after the switch, so the test makes one and turns the
+        // switch off again. The owner stays the same, so the dtype check is what must fire.
+        kernels.allow_bf16(true);
+        let source = f32_resident(&mut kernels, &BF16_EXACT);
+        let bf16 = kernels.cast(&source, Dtype::Bf16).unwrap();
+        kernels.allow_bf16(false);
+        let refused = kernels.silu(&bf16);
+        assert!(
+            matches!(&refused, Err(EngError::BadRequest(m)) if m == "SiLU: input dtype must be F32"),
+            "{:?}",
+            refused.as_ref().err()
+        );
+        let refused = kernels.slice(&bf16, &[0, 0], &[1, 2]);
+        assert!(
+            matches!(&refused, Err(EngError::BadRequest(m)) if m == "slice: input dtype must be F32 or U32"),
+            "{:?}",
+            refused.as_ref().err()
+        );
+    }
+
+    #[test]
+    fn bf16_operands_flow_through_the_wrappers_when_allowed() {
+        let _serial = crate::native_test_lock();
+        let mut kernels = MlxKernels::try_new().unwrap();
+        kernels.allow_bf16(true);
+        let source = f32_resident(&mut kernels, &BF16_EXACT);
+        let bf16 = kernels.cast(&source, Dtype::Bf16).unwrap();
+        // A unary, a binary, and a slice of BF16 operands stay BF16 with half the F32 bytes.
+        let gated = kernels.silu(&bf16).unwrap();
+        assert_eq!(gated.dtype(), Dtype::Bf16, "silu keeps BF16");
+        let doubled = kernels
+            .binary(crate::kernels::BinaryOp::Mul, &gated, &bf16)
+            .unwrap();
+        assert_eq!(
+            doubled.dtype(),
+            Dtype::Bf16,
+            "an all-BF16 product stays BF16"
+        );
+        assert_eq!(doubled.byte_len(), 8, "the byte length follows the dtype");
+        let window = kernels.slice(&doubled, &[0, 1], &[1, 3]).unwrap();
+        assert_eq!(window.dtype(), Dtype::Bf16, "a slice keeps BF16");
+        assert_eq!(window.byte_len(), 4, "two BF16 elements are 4 bytes");
+        // The BF16 `silu` values are the F32 `silu` of the rounded inputs, within BF16 rounding.
+        let back = kernels.cast(&gated, Dtype::F32).unwrap();
+        let back = read_f32(&mut kernels, &back);
+        for (got, want) in back.iter().zip(BF16_EXACT.iter().map(|x| silu(*x))) {
+            assert!(
+                (got - want).abs() <= 1e-2,
+                "BF16 silu {got} against F32 {want}"
+            );
+        }
+        // A mixed F32 and BF16 product promotes to F32, as MLX does.
+        let f32 = f32_resident(&mut kernels, &BF16_EXACT);
+        let mixed = kernels
+            .binary(crate::kernels::BinaryOp::Mul, &gated, &f32)
+            .unwrap();
+        assert_eq!(mixed.dtype(), Dtype::F32, "a mixed product promotes to F32");
+    }
+}
+
+#[cfg(test)]
+mod f32_only_tests {
+    //! The wrappers that stay F32 only even with `allow_bf16` on (packet Q36-BF16-a fix; the rev
+    //! 55 text of `docs/design/kernels.md`): a BF16 operand of theirs is `BadRequest` with the
+    //! text that rejected it before the switch existed, because their native path is F32 by
+    //! construction. These tests need the GPU.
+
+    use crate::{
+        EngError,
+        kernels::{MlxKernels, PackedWeight, QuantizationMode, QuantizationSpec, RopeStep},
+        tensor::{Dtype, ExecutionTensor, Tensor},
+    };
+
+    /// An F32 resident of `values` with `shape`, imported with one synchronization.
+    fn f32_resident(kernels: &mut MlxKernels, shape: &[u32], values: &[f32]) -> ExecutionTensor {
+        let bytes: Vec<u8> = values
+            .iter()
+            .flat_map(|value| value.to_le_bytes())
+            .collect();
+        kernels
+            .import_tensor(&Tensor::try_from_host(Dtype::F32, shape.to_vec(), bytes).unwrap())
+            .unwrap()
+    }
+
+    /// A BF16 resident of BF16-exact `values` with `shape`. `cast` is the only way a BF16 resident
+    /// exists, so the switch is on for the whole test.
+    fn bf16_resident(kernels: &mut MlxKernels, shape: &[u32], values: &[f32]) -> ExecutionTensor {
+        let source = f32_resident(kernels, shape, values);
+        kernels.cast(&source, Dtype::Bf16).unwrap()
+    }
+
+    /// The minimal gated delta layout: one batch, one token, one key head of width 32 (the kernel
+    /// lane count), one value head of width 1.
+    #[test]
+    fn the_switch_on_keeps_the_gated_delta_kernel_f32_only() {
+        let _serial = crate::native_test_lock();
+        let mut kernels = MlxKernels::try_new().unwrap();
+        kernels.allow_bf16(true);
+        let q = f32_resident(&mut kernels, &[1, 1, 1, 32], &[1.0; 32]);
+        let k = f32_resident(&mut kernels, &[1, 1, 1, 32], &[1.0; 32]);
+        let v = f32_resident(&mut kernels, &[1, 1, 1, 1], &[1.0]);
+        let g = f32_resident(&mut kernels, &[1, 1, 1], &[0.5]);
+        // The Metal kernel reads every operand as plain F32 bytes (decision 0050), so a BF16 beta
+        // would be read as F32 garbage, not promoted.
+        let beta = bf16_resident(&mut kernels, &[1, 1, 1], &[0.5]);
+        let state = f32_resident(&mut kernels, &[1, 1, 1, 32], &[0.0; 32]);
+        let refused = kernels.gated_delta(&q, &k, &v, &g, &beta, &state);
+        assert!(
+            matches!(&refused, Err(EngError::BadRequest(m)) if m == "gated delta rule: input dtype must be F32"),
+            "gated delta with a BF16 beta must keep the old refusal, got {:?}",
+            refused.err()
+        );
+    }
+
+    /// The Flash-Next `add` keeps its own F32 rule under the switch.
+    #[test]
+    fn the_switch_on_keeps_add_f32_only() {
+        let _serial = crate::native_test_lock();
+        let mut kernels = MlxKernels::try_new().unwrap();
+        kernels.allow_bf16(true);
+        let (a, b) = (
+            bf16_resident(&mut kernels, &[1, 4], &[0.5, 2.0, -0.25, 8.0]),
+            f32_resident(&mut kernels, &[1, 4], &[0.5, 2.0, -0.25, 8.0]),
+        );
+        let refused = kernels.add(&a, &b);
+        assert!(
+            matches!(&refused, Err(EngError::BadRequest(m)) if m == "elementwise add: input dtype must be F32"),
+            "add with a BF16 operand must keep the old refusal, got {:?}",
+            refused.err()
+        );
+    }
+
+    /// The Flash-Next `mul` keeps its own F32 rule under the switch.
+    #[test]
+    fn the_switch_on_keeps_mul_f32_only() {
+        let _serial = crate::native_test_lock();
+        let mut kernels = MlxKernels::try_new().unwrap();
+        kernels.allow_bf16(true);
+        let (a, b) = (
+            bf16_resident(&mut kernels, &[1, 4], &[0.5, 2.0, -0.25, 8.0]),
+            f32_resident(&mut kernels, &[1, 4], &[0.5, 2.0, -0.25, 8.0]),
+        );
+        let refused = kernels.mul(&a, &b);
+        assert!(
+            matches!(&refused, Err(EngError::BadRequest(m)) if m == "elementwise multiply: input dtype must be F32"),
+            "mul with a BF16 operand must keep the old refusal, got {:?}",
+            refused.err()
+        );
+    }
+
+    /// The rebinding `rope` keeps its own F32 rule under the switch.
+    #[test]
+    fn the_switch_on_keeps_rope_f32_only() {
+        let _serial = crate::native_test_lock();
+        let mut kernels = MlxKernels::try_new().unwrap();
+        kernels.allow_bf16(true);
+        let (mut q, mut k) = (
+            bf16_resident(&mut kernels, &[1, 1, 4], &[0.5, 2.0, -0.25, 8.0]),
+            f32_resident(&mut kernels, &[1, 1, 4], &[0.5, 2.0, -0.25, 8.0]),
+        );
+        let step = RopeStep {
+            pos: 1,
+            theta: 1e7,
+            part: 4,
+        };
+        let refused = kernels.rope(&mut q, &mut k, &step);
+        assert!(
+            matches!(&refused, Err(EngError::BadRequest(m)) if m == "RoPE: q and k dtype must be F32"),
+            "rope with a BF16 operand must keep the old refusal, got {:?}",
+            refused.err()
+        );
+    }
+
+    /// `broadcast_rows` keeps its own F32 rule under the switch.
+    #[test]
+    fn the_switch_on_keeps_broadcast_rows_f32_only() {
+        let _serial = crate::native_test_lock();
+        let mut kernels = MlxKernels::try_new().unwrap();
+        kernels.allow_bf16(true);
+        let x = bf16_resident(&mut kernels, &[1, 4], &[0.5, 2.0, -0.25, 8.0]);
+        let refused = kernels.broadcast_rows(&x, 3);
+        assert!(
+            matches!(&refused, Err(EngError::BadRequest(m)) if m == "broadcast rows input must be F32"),
+            "broadcast_rows with a BF16 operand must keep the old refusal, got {:?}",
+            refused.err()
+        );
+    }
+
+    /// `weighted_row_sum` keeps its own F32 rule under the switch.
+    #[test]
+    fn the_switch_on_keeps_weighted_row_sum_f32_only() {
+        let _serial = crate::native_test_lock();
+        let mut kernels = MlxKernels::try_new().unwrap();
+        kernels.allow_bf16(true);
+        let rows = bf16_resident(
+            &mut kernels,
+            &[2, 4],
+            &[0.5, 2.0, -0.25, 8.0, 1.0, 1.0, 1.0, 1.0],
+        );
+        let weights = f32_resident(&mut kernels, &[2, 1, 1], &[0.25, 0.75]);
+        let refused = kernels.weighted_row_sum(&rows, &weights);
+        assert!(
+            matches!(&refused, Err(EngError::BadRequest(m)) if m == "weighted row sum inputs must be F32"),
+            "weighted_row_sum with a BF16 operand must keep the old refusal, got {:?}",
+            refused.err()
+        );
+    }
+
+    /// `dequantize` stays F32 on the result side under the switch: over stored BF16 scales, as the
+    /// embedding rows are, the shim casts the scales and the result keeps the F32 dtype and the
+    /// F32 byte count. A loosened result check that absorbed a BF16 result would fail here.
+    #[test]
+    fn the_switch_on_keeps_the_dequantize_result_f32_over_bf16_scales() {
+        let _serial = crate::native_test_lock();
+        let mut kernels = MlxKernels::try_new().unwrap();
+        kernels.allow_bf16(true);
+        // A `[1, 32]` affine int4 weight: four U32 words of payload, one BF16 scale and bias of
+        // group 32. BF16 holds 1.0 and 0.0 exactly.
+        let bf16_of = |value: f32| -> [u8; 2] {
+            let bits = value.to_bits();
+            assert_eq!(bits & 0xFFFF, 0, "{value} is not exact in BF16");
+            ((bits >> 16) as u16).to_le_bytes()
+        };
+        let payload = Tensor::try_from_host(
+            Dtype::U32,
+            vec![1, 4],
+            [0u32; 4].iter().flat_map(|w| w.to_le_bytes()).collect(),
+        )
+        .unwrap();
+        let scales = Tensor::try_from_host(Dtype::Bf16, vec![1, 1], bf16_of(1.0).to_vec()).unwrap();
+        let biases = Tensor::try_from_host(Dtype::Bf16, vec![1, 1], bf16_of(0.0).to_vec()).unwrap();
+        let weight = PackedWeight::try_new(
+            payload,
+            scales,
+            Some(biases),
+            vec![1, 32],
+            QuantizationSpec {
+                mode: QuantizationMode::Affine,
+                bits: 4,
+                group_size: 32,
+            },
+        )
+        .unwrap();
+        let resident = kernels
+            .import_packed_many(&[&weight])
+            .unwrap()
+            .pop()
+            .unwrap();
+        assert_eq!(
+            resident.scales().dtype(),
+            Dtype::Bf16,
+            "the setup imported the scales as stored BF16"
+        );
+        let row = kernels.dequantize(&resident).unwrap();
+        assert_eq!(row.dtype(), Dtype::F32, "the dequantized row stays F32");
+        assert_eq!(row.shape(), [1, 32], "the logical shape");
+        assert_eq!(row.byte_len(), 128, "32 F32 elements are 128 bytes");
     }
 }

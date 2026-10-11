@@ -6,7 +6,7 @@
 //! thread. Q36 results never satisfy Phase 0B or Phase 1B.
 
 use crate::family::spec::{AttentionKind, FamilySpec, QWEN3_6_35B_A3B};
-use crate::{EngError, tokenizer::TokenizerPin};
+use crate::{EngError, tensor::Dtype, tokenizer::TokenizerPin};
 use serde::Deserialize;
 use std::path::{Path, PathBuf};
 
@@ -64,6 +64,10 @@ pub(crate) struct Q36Options {
     /// pressure margin. It has no default: it is required with `prefill_budget_bytes` and refused
     /// without it. A value of 0 is allowed and admits a larger chunk than the memory plan allows.
     pub(crate) prefill_session_reserve_bytes: Option<u64>,
+    /// The dtype of the decode activations (packet Q36-BF16-a): `f32` or `bf16`. The default is
+    /// `bf16`. It also picks the scale storage: `bf16` keeps the stored BF16 scales and biases,
+    /// `f32` keeps the G0 widening, and the decoder constructor refuses any other pairing.
+    pub(crate) activation_dtype: Option<String>,
 }
 
 /// The environment fallbacks, read by the caller so that this file stays pure.
@@ -71,6 +75,89 @@ pub(crate) struct Q36Options {
 pub(crate) struct Q36Env {
     /// `Q36_CACHE_LIMIT`, a byte count.
     pub(crate) cache_limit: Option<String>,
+}
+
+/// The dtype of the Q36 decode activations (packet Q36-BF16-a): the hidden state between blocks,
+/// the inputs of the quantized matmuls, and the converted layer norms. `bf16` is the serving
+/// default (user decision of 2026-10-10; decision 0046 A6); `f32` is the qualification control.
+/// Scale storage follows the same setting, so the two are one lever.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Activation {
+    F32,
+    Bf16,
+}
+
+/// The config text of `activation`.
+pub(crate) fn activation_name(activation: Activation) -> &'static str {
+    match activation {
+        Activation::F32 => "f32",
+        Activation::Bf16 => "bf16",
+    }
+}
+
+impl Activation {
+    /// The resident dtype of this activation: the value that `Consts::act` holds and that the
+    /// kernels take as operands.
+    pub(crate) fn dtype(self) -> Dtype {
+        match self {
+            Activation::F32 => Dtype::F32,
+            Activation::Bf16 => Dtype::Bf16,
+        }
+    }
+}
+
+/// Parses the `activation_dtype` member (packet Q36-BF16-a): `f32` or `bf16`. Any other text is
+/// refused in the style of the numeric members.
+pub(crate) fn parse_activation(text: &str) -> Result<Activation, EngError> {
+    match text {
+        "f32" => Ok(Activation::F32),
+        "bf16" => Ok(Activation::Bf16),
+        other => Err(bad(format!(
+            "activation_dtype must be f32 or bf16, got {other:?}"
+        ))),
+    }
+}
+
+/// The activation dtype of `text`, the raw member value: `None` is the default `bf16`.
+pub(crate) fn activation_of(text: Option<&str>) -> Result<Activation, EngError> {
+    match text {
+        None => Ok(Activation::Bf16),
+        Some(text) => parse_activation(text),
+    }
+}
+
+/// The scale-pairing rule of packet Q36-BF16-a: the stored scales and biases (counted by
+/// `ResidentWeights::scale_census`) must all have the dtype that matches `activation`, because the
+/// setting is one lever. A `bf16` engine over F32 scales promotes every `qmm` back to F32, and an
+/// `f32` engine over BF16 scales makes MLX cast the scales on every call (about 31.6 tok/s, the
+/// trap that the G0 measurement closed). Returns the refusal text of a mismatched pair.
+pub(crate) fn scale_pairing_error(
+    weights: u64,
+    f32_parts: u64,
+    bf16_parts: u64,
+    other_parts: u64,
+    activation: Activation,
+) -> Option<String> {
+    let (name, scale_dtype, wrong) = match activation {
+        Activation::F32 => ("f32", "F32", bf16_parts + other_parts),
+        Activation::Bf16 => ("bf16", "BF16", f32_parts + other_parts),
+    };
+    (wrong > 0).then(|| {
+        format!(
+            "activation_dtype {name} needs {scale_dtype} scales and biases; the census holds \
+             {weights} packed weights with {f32_parts} F32, {bf16_parts} BF16, and {other_parts} other parts"
+        )
+    })
+}
+
+/// Whether the chunked prefill may run with the activation dtype `act` (packet Q36-BF16-a): the
+/// chunk path runs F32 activations only until slice Q36-BF16-b makes it dtype aware, so a BF16
+/// engine plans no chunk and every prompt token runs as one step with the `NO_BUDGET_PIECE` worker
+/// piece. This is the one authority for the rule: `start::plan_prefill` (the start-up line) and
+/// `Q36Executor::plan_prefill` (the plan itself) both ask this function, each with the dtype it
+/// holds (`Q36Settings::activation` and `Consts::act` respectively).
+pub(crate) fn chunked_prefill_allowed(act: Dtype) -> bool {
+    act == Dtype::F32
 }
 
 /// The checked settings of one Q36 engine.
@@ -93,6 +180,9 @@ pub(crate) struct Q36Settings {
     pub(crate) prefill_budget: Option<u64>,
     /// The bytes that the planner keeps free. It is used only when `prefill_budget` is set.
     pub(crate) prefill_reserve: u64,
+    /// The dtype of the decode activations (packet Q36-BF16-a), which also picks the scale storage.
+    /// The default is `bf16`.
+    pub(crate) activation: Activation,
 }
 
 fn bad(message: String) -> EngError {
@@ -226,6 +316,7 @@ impl Q36Settings {
         let options = options.unwrap_or(&default);
         let prefill_budget = at_least_one("prefill_budget_bytes", options.prefill_budget_bytes)?;
         let prefill_reserve = prefill_reserve(options, prefill_budget)?;
+        let activation = activation_of(options.activation_dtype.as_deref())?;
         Ok(Self {
             artifact: model_dir.to_path_buf(),
             tokenizer_dir: tokenizer_dir.to_path_buf(),
@@ -253,6 +344,7 @@ impl Q36Settings {
             )?,
             prefill_budget,
             prefill_reserve,
+            activation,
         })
     }
 
@@ -318,11 +410,12 @@ pub(crate) fn tokenizer_pin() -> Result<TokenizerPin, EngError> {
 mod tests {
     use super::{
         DEFAULT_CONTEXT_LIMIT, DEFAULT_PREFILL_CHUNK, DEFAULT_SESSION_CAP, NO_BUDGET_PIECE, Q36Env,
-        Q36Options, Q36Settings, cache_growth_per_position, delta_state_bytes, digest,
-        tokenizer_pin,
+        Q36Options, Q36Settings, activation_name, activation_of, cache_growth_per_position,
+        chunked_prefill_allowed, delta_state_bytes, digest, scale_pairing_error, tokenizer_pin,
     };
     use crate::EngError;
     use crate::family::spec::QWEN3_6_35B_A3B;
+    use crate::tensor::Dtype;
     use std::path::{Path, PathBuf};
 
     fn with_limit() -> Q36Options {
@@ -444,6 +537,7 @@ mod tests {
                 prefill_chunk: 256,
                 prefill_budget: None,
                 prefill_reserve: 0,
+                activation: super::Activation::Bf16,
             }
         );
         assert_eq!(DEFAULT_CONTEXT_LIMIT, 32_768);
@@ -467,6 +561,7 @@ mod tests {
             prefill_chunk: Some(64),
             prefill_budget_bytes: Some(30_000_000_000),
             prefill_session_reserve_bytes: Some(7),
+            activation_dtype: Some("f32".to_string()),
         };
         let got = settings(Some(&options), &Q36Env::default()).unwrap();
         assert_eq!(got.cache_limit, 5);
@@ -475,6 +570,7 @@ mod tests {
         assert_eq!(got.prefill_chunk, 64);
         assert_eq!(got.prefill_budget, Some(30_000_000_000));
         assert_eq!(got.prefill_reserve, 7);
+        assert_eq!(got.activation, super::Activation::F32);
         assert_eq!(got.artifact, PathBuf::from("/m"));
         assert_eq!(got.tokenizer_dir, PathBuf::from("/t"));
     }
@@ -653,6 +749,117 @@ mod tests {
                 prefill_session_reserve_bytes: Some(6_776_750_080),
                 ..Q36Options::default()
             }
+        );
+    }
+
+    #[test]
+    fn activation_dtype_parses_f32_and_bf16_and_the_default_is_bf16() {
+        let bf16 = Q36Options {
+            activation_dtype: Some("bf16".to_string()),
+            ..with_limit()
+        };
+        let f32 = Q36Options {
+            activation_dtype: Some("f32".to_string()),
+            ..with_limit()
+        };
+        assert_eq!(
+            settings(Some(&bf16), &Q36Env::default())
+                .unwrap()
+                .activation,
+            super::Activation::Bf16
+        );
+        assert_eq!(
+            settings(Some(&f32), &Q36Env::default()).unwrap().activation,
+            super::Activation::F32
+        );
+        assert_eq!(
+            settings(Some(&with_limit()), &Q36Env::default())
+                .unwrap()
+                .activation,
+            super::Activation::Bf16,
+            "the serving default of the user decision of 2026-10-10"
+        );
+        assert_eq!(activation_of(None).unwrap(), super::Activation::Bf16);
+        assert_eq!(activation_name(super::Activation::Bf16), "bf16");
+        assert_eq!(activation_name(super::Activation::F32), "f32");
+    }
+
+    #[test]
+    fn a_bad_activation_dtype_is_refused_with_the_member_style() {
+        for text in ["f16", "BF16", ""] {
+            let options = Q36Options {
+                activation_dtype: Some(text.to_string()),
+                ..with_limit()
+            };
+            assert_eq!(
+                message(settings(Some(&options), &Q36Env::default())),
+                format!("engine config: activation_dtype must be f32 or bf16, got {text:?}"),
+                "the text {text:?}"
+            );
+        }
+        let json = r#"{"activation_dtype": "bf16"}"#;
+        let options: Q36Options = serde_json::from_str(json).unwrap();
+        assert_eq!(options.activation_dtype.as_deref(), Some("bf16"));
+    }
+
+    #[test]
+    fn the_scale_pairing_rule_accepts_only_the_matching_pair() {
+        // The real model: 431 packed weights, each with a scale and a bias tensor, 862 parts.
+        assert_eq!(862, 2 * 431, "every packed weight holds two parts");
+        for (f32_parts, bf16_parts, activation) in [
+            (862u64, 0u64, super::Activation::F32),
+            (0, 862, super::Activation::Bf16),
+            (43, 0, super::Activation::F32),
+            (0, 43, super::Activation::Bf16),
+        ] {
+            assert_eq!(
+                scale_pairing_error(431, f32_parts, bf16_parts, 0, activation),
+                None,
+                "the matching pair passes"
+            );
+        }
+        let bf16_over_f32 = scale_pairing_error(431, 862, 0, 0, super::Activation::Bf16).unwrap();
+        assert!(
+            bf16_over_f32.contains("activation_dtype bf16 needs BF16 scales and biases"),
+            "{bf16_over_f32}"
+        );
+        let f32_over_bf16 = scale_pairing_error(431, 0, 862, 0, super::Activation::F32).unwrap();
+        assert!(
+            f32_over_bf16.contains("activation_dtype f32 needs F32 scales and biases"),
+            "{f32_over_bf16}"
+        );
+        for activation in [super::Activation::F32, super::Activation::Bf16] {
+            assert!(
+                scale_pairing_error(431, 861, 1, 0, activation).is_some(),
+                "one stray part refuses the pair"
+            );
+            assert!(
+                scale_pairing_error(431, 862, 0, 1, activation).is_some(),
+                "one other-dtype part refuses the pair"
+            );
+        }
+    }
+
+    #[test]
+    fn the_chunk_rule_plans_no_chunk_while_the_activations_are_bf16() {
+        assert!(
+            chunked_prefill_allowed(Dtype::F32),
+            "the F32 control keeps the chunked prefill"
+        );
+        assert!(
+            !chunked_prefill_allowed(Dtype::Bf16),
+            "the chunk path is F32 only until slice Q36-BF16-b"
+        );
+        // The two callers reach the rule through the setting and through `Consts::act`.
+        assert_eq!(
+            super::Activation::F32.dtype(),
+            Dtype::F32,
+            "the F32 control maps to the F32 the rule asks for"
+        );
+        assert_eq!(
+            super::Activation::Bf16.dtype(),
+            Dtype::Bf16,
+            "the BF16 setting maps to the BF16 the rule refuses"
         );
     }
 

@@ -12,13 +12,13 @@
 //! reading the prefix needs a `slice`, which copies again (it ends with `mlx_contiguous`). One
 //! `concatenate` copies `T` positions once. The step builds a lazy graph only.
 
-use super::ops::{Ctx, dim, linear};
+use super::ops::{Ctx, cast_to, dim, linear, to_act};
 use super::weights::RAttn;
 use crate::{
     EngError,
     family::qwen36::host::HostShape,
     kernels::{BinaryOp, RopeSpec, UnaryOp},
-    tensor::ExecutionTensor,
+    tensor::{Dtype, ExecutionTensor},
 };
 
 /// Bytes of one F32 element, the resident cache dtype. A BF16 cache is parked (it needs a cast
@@ -145,6 +145,10 @@ pub(super) fn step(
     // 4. New value.
     let v_new = linear(ctx, &w.v, x)?;
     let v_new = ctx.kernels.reshape(&v_new, &[1, kv_heads, 1, width])?;
+    // The cache stays F32 whatever the activation dtype (packet Q36-BF16-a; a BF16 cache is a
+    // parked lever of decision 0046 item 5).
+    let k_new = cast_to(ctx, &k_new, Dtype::F32)?;
+    let v_new = cast_to(ctx, &v_new, Dtype::F32)?;
     // 5. Append on the time axis, or start the cache.
     let (k_all, v_all) = match past {
         None => (k_new, v_new),
@@ -162,6 +166,8 @@ pub(super) fn step(
     let att = ctx.kernels.reshape(&att, &[heads, width])?;
     let gate = ctx.kernels.unary(UnaryOp::Sigmoid, &gate)?;
     let o = ctx.kernels.binary(BinaryOp::Mul, &att, &gate)?;
+    // The attention output is F32 over the F32 cache; the projection takes the activation dtype.
+    let o = to_act(ctx, &o)?;
     let out = linear(ctx, &w.o, &o)?;
     Ok(AttnStep {
         out,

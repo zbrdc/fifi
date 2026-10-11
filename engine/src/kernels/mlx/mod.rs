@@ -711,6 +711,23 @@ impl MlxKernels {
         self.context.u32_to_f32(x)
     }
 
+    /// Converts an F32 resident to `dtype`, or a BF16 resident to F32 or BF16, with the same shape
+    /// (packet Q36-BF16-a). `dtype` is F32, or BF16 after `allow_bf16`; a BF16 input also needs
+    /// that call. Another dtype is `BadRequest`. It returns an unevaluated resident. It uses the
+    /// shim of `u32_to_f32`.
+    pub fn cast(&mut self, x: &ExecutionTensor, dtype: Dtype) -> Result<ExecutionTensor, EngError> {
+        self.context.cast(x, dtype)
+    }
+
+    /// Lets the resident float operations take BF16 operands and return BF16 results (packet
+    /// Q36-BF16-a). The default is off: `qmm`, `gather_qmm`, `mm`, and the elementwise, shape,
+    /// norm, RoPE, and attention operations then reject BF16 as before, so Flash-Next and every
+    /// other caller that never calls this see no change. An operation promotes mixed F32 and BF16
+    /// operands to F32, as MLX does. Quantized weights keep their stored scale dtype.
+    pub fn allow_bf16(&mut self, allow: bool) {
+        self.context.allow_bf16(allow);
+    }
+
     /// Returns the indices of the maximum along `axis` as U32, with the lowest index on ties.
     pub fn argmax(
         &mut self,

@@ -35,7 +35,7 @@ use crate::{
     family::flash_next::stored::{self, SlicedWeight},
     kernels::{BinaryOp, PackedWeight},
     sched::GrowthPermit,
-    tensor::ExecutionTensor,
+    tensor::{Dtype, ExecutionTensor},
     weights::StreamedCheckpoint,
 };
 
@@ -55,16 +55,22 @@ fn row_count(tokens: &[u32]) -> Result<u32, EngError> {
 ///
 /// The host checks of the whole prompt come first: a poisoned state, an empty prompt, and a prompt
 /// that passes the context limit return an error and change nothing. Then the chunks run in order.
-/// A failed host check or a denied growth permit (`MemoryPlan`) in a later chunk comes before
-/// `begin`. It leaves the state clean, with the earlier chunks published and `state.pos()` after
-/// the last of them. An error after `begin` poisons the state until `reset`. A chunk routes on the
-/// host whatever `Routing` the decoder holds, and its result has `routes: None`.
+/// A decoder whose activation dtype is not F32 (packet Q36-BF16-a) returns `BadRequest` first,
+/// before every other check, permit, and native call, and changes nothing: the chunk path is not
+/// dtype aware until slice Q36-BF16-b. A failed host check or a denied growth permit
+/// (`MemoryPlan`) in a later chunk comes before `begin`. It leaves the state clean, with the
+/// earlier chunks published and `state.pos()` after the last of them. An error after `begin`
+/// poisons the state until `reset`. A chunk routes on the host whatever `Routing` the decoder
+/// holds, and its result has `routes: None`.
 pub(in super::super) fn prefill(
     decoder: &mut ResidentDecoder<'_>,
     state: &mut ResidentState,
     tokens: &[u32],
     mode: StepMode,
 ) -> Result<StepResult, EngError> {
+    if decoder.weights.consts.act != Dtype::F32 {
+        return Err(bad("the chunked prefill runs F32 activations only"));
+    }
     let rows = row_count(tokens)?;
     state.check_chunk(&decoder.weights, decoder.context_limit, rows)?; // the whole prompt
     let parts = ranges(rows, decoder.chunk_rows)?;
@@ -275,6 +281,7 @@ fn run(
         logits: logits_out,
         layer_out,
         routes: None,
+        probs: None,
     })
 }
 
@@ -289,6 +296,7 @@ mod tests {
     use crate::family::qwen36::host::{self, HostState, LayerState as HostLayer};
     use crate::family::qwen36::host_cpu::CpuProjector;
     use crate::family::qwen36::host_load::HostWeights;
+    use crate::family::qwen36::settings::Activation;
     use crate::family::qwen36::tiny::{self, TINY_GQA};
     use crate::kernels::MlxKernels;
     use crate::sched::SessionBudget;
@@ -401,7 +409,8 @@ mod tests {
                         token: None,
                         logits: None,
                         layer_out: None,
-                        routes: None
+                        routes: None,
+                        probs: None
                     },
                     "{what}"
                 ),
@@ -411,7 +420,8 @@ mod tests {
                         token: Some(host_argmax(&want.logits)),
                         logits: None,
                         layer_out: None,
-                        routes: None
+                        routes: None,
+                        probs: None
                     },
                     "{what}"
                 ),
@@ -709,5 +719,39 @@ mod tests {
         let three = decoder.prefill(&mut state, &tokens, StepMode::Record);
         ok(three, "three chunks");
         assert_eq!(syncs(&decoder) - before, 8 + 8 + 13, "three chunks");
+    }
+
+    /// The chunked prefill is not dtype aware (packet Q36-BF16-a): a decoder that holds BF16
+    /// activations is refused before any host check, any permit, or any native call, and the state
+    /// stays clean. Slice Q36-BF16-b lifts the refusal.
+    #[test]
+    fn a_decoder_with_bf16_activations_is_refused_by_the_prefill() {
+        let _serial = crate::native_test_lock();
+        let ckpt = setup();
+        let config = tiny::config(&TINY_GQA);
+        let host = HostWeights::load(&ckpt, &TINY_GQA, &config).unwrap();
+        let mut decoder = ResidentDecoder::new_with_activation(
+            MlxKernels::try_new().unwrap(),
+            &ckpt,
+            host,
+            1024,
+            Activation::Bf16,
+        )
+        .unwrap();
+        assert_eq!(
+            decoder.weights.consts.act,
+            Dtype::Bf16,
+            "the decoder holds BF16"
+        );
+        let mut state = decoder.zero_state().unwrap();
+        let refused = decoder.prefill(&mut state, &[1, 2, 3], StepMode::Generate);
+        assert!(
+            matches!(&refused, Err(EngError::BadRequest(m)) if m.contains("F32 activations only")),
+            "{:?}",
+            refused.as_ref().err()
+        );
+        assert_eq!(state.pos(), 0, "a refusal does not advance");
+        assert!(!state.is_poisoned(), "a refusal does not poison");
+        assert_eq!(decoder.session_used(), 0, "a refusal takes no permit");
     }
 }

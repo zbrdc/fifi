@@ -7,10 +7,32 @@
 //! 1. `device_routing_picks_the_host_experts_on_the_real_checkpoint` runs the 5-token prompt of the
 //!    frozen Q36-HR evidence and 31 greedy steps twice in `Record` mode: once with host routing and
 //!    once with device routing, on the same tokens. It requires equal expert ids (rank order) in
-//!    every layer of every step, equal tokens, and logits with cosine at least 0.99999. It also
-//!    measures the synchronizations of each mode, and the forced retire flushes of the device run.
+//!    every layer of every step, equal tokens, and logits with cosine at least 0.99999 in the
+//!    `f32` control. It also measures the synchronizations of each mode, and the forced retire
+//!    flushes of the device run.
 //!    The ids of an exact tie are equal too, because both rules take the lower index first. A
 //!    difference at an exact tie is a failure of the gate.
+//!
+//!    The id rule follows the activation dtype (fix3, fix4, and fix5 of packet Q36-BF16-a;
+//!    decision 0046 A6 item 8). In the `f32` control the rule above is exact and unchanged. In
+//!    BF16 the two routings rank the SAME probability node but renormalize the selected gates
+//!    with different F32 summation orders, so their residual streams diverge in the last BF16
+//!    bit after the first layer and near-tied experts can swap rank or exchange the last expert
+//!    of the top 8. The rule (`route::compare_top_k`): a set difference or a rank swap passes
+//!    only when the host-row probability gap to the nearest exchanged (or swapped) expert is
+//!    <= `BF16_TIE_EPSILON` (5e-3, an absolute probability gap); a missing exchange partner
+//!    is a fault; ties at exactly equal probability must agree with the lower index; any other
+//!    difference fails. The report prints the absolute and relative gap distributions of the
+//!    mismatching cells. The co-conditions of the BF16 run (fix5): no cell differs at layers
+//!    0 to 2 of step 0 (`route::origin_fault`, the summation-order origin), no differing
+//!    cell has a gap relative to max(p_a, p_b) above `BF16_RELATIVE_GAP_LIMIT`
+//!    (`route::route_cell_deltas`), the fraction of differing cells stays at or under
+//!    `BF16_DIFFERING_FRACTION_LIMIT`, and the absolute signed mean of the per-cell
+//!    host-minus-device probability sums stays at or under `BF16_SIGNED_MEAN_LIMIT`. Greedy
+//!    ids equal in all 36 steps is a gate of both dtypes, and the logits-cosine floor follows
+//!    the dtype too: `MIN_COSINE` (0.99999) for `f32` and `BF16_MIN_COSINE` (0.997) for BF16
+//!    (`route::cosine_passes`), so a cosine under the floor of the run still fails the gate.
+//!    Every failed check is collected into the report's `failures` list before the test fails.
 //! 2. `device_routing_speed_table` times greedy decoding after a 16-token prompt (and, on request,
 //!    after an 8,192-token prompt) with the prompt ids of the Q36-REF run.
 //!
@@ -36,6 +58,12 @@
 //! | `Q36_SPEED_ROUTING` | `device` runs the device routing block only | both blocks |
 //! | `Q36_SPEED_GAP_MS` | 1 to 10,000 ms of idle time | none |
 //!
+//! `Q36_ACTIVATION` (packet Q36-BF16-a) selects the decode activation dtype of the speed test
+//! through the product lever: unset or `f32` is the table above and is unchanged, `bf16` runs BF16
+//! activations with the stored BF16 scales and the converted norms. Every row and the report carry
+//! `activation_dtype`, and the decode rows carry the first 32 tokens. The routing test does not
+//! read it.
+//!
 //! `Q36_SPEED_GAP_MS` sleeps before the prompt phase and before the greedy phase of every timed
 //! trial (the warm-up trial has no sleep). The sleeps are outside the timed regions. The GPU is
 //! idle during them, so a trace shows each phase as its own cluster of GPU work. The idle GPU can
@@ -52,7 +80,15 @@ use super::moe::Routing;
 use super::real::{env_path, open, rss_kb};
 use super::scale_knob::{hash_f32s, new_decoder};
 use crate::{
-    family::{qwen36::host_load::HostWeights, spec::QWEN3_6_35B_A3B},
+    family::{
+        qwen36::host_load::HostWeights,
+        qwen36::settings::{Activation, activation_name},
+        route::{
+            compare_top_k, cosine_passes, differing_fraction_passes, origin_fault,
+            route_cell_deltas, signed_mean_passes,
+        },
+        spec::QWEN3_6_35B_A3B,
+    },
     kernels::{MlxKernels, QualificationTiming},
 };
 
@@ -64,8 +100,46 @@ const STEPS: usize = 36;
 const CONFIG_SHA256: &str = "a822a9e48b0aafbe3144ec37d4fb067e178ed96615ce6e4420b3149893cc5767";
 /// SHA-256 of the pinned `model.safetensors.index.json` (decision 0046 item 2).
 const INDEX_SHA256: &str = "e359cd95565275b923fed8df019dd8e869d9af5dc4a621b4114ab7a8e6c534d1";
-/// The gate of decision 0046 item 4.
+/// The logits-cosine floor of the `f32` control (decision 0046 item 4). The BF16 run of this
+/// gate uses `BF16_MIN_COSINE` instead (fix4 of packet Q36-BF16-a).
 const MIN_COSINE: f64 = 0.99999;
+/// The logits-cosine floor of the BF16 run of this gate (fix4 and fix5 of packet Q36-BF16-a;
+/// decision 0046 A6 item 8). The same summation-order noise that moves the router probabilities
+/// moves the logits: the d1 BF16 gate run saw a minimum cosine of 0.99864 over its 36 steps
+/// (evidence 907030d6) against the 0.99999 of the unchanged F32 control. 0.97 would sit on the
+/// observed minimum, so the floor is 0.997, with a 1.64e-3 margin under it (fix5 tightened the
+/// 0.995 of fix4), and a logits cosine under it still fails the gate (`route::cosine_passes`).
+const BF16_MIN_COSINE: f64 = 0.997;
+/// The near-tie epsilon of the BF16 routing rule (fix4 of packet Q36-BF16-a; decision 0046 A6
+/// item 8), an absolute probability gap. The two routings of one token renormalize their
+/// selected gates with different F32 summation orders (the host sums the top 8 sequentially in
+/// `route::weights_for`; the device reduces them as one graph node), so after the first layer
+/// their residual streams differ in the last BF16 bit and the router probabilities of near-tied
+/// experts move by up to the 2.55e-3 maximum of the 600 mismatching cells of 1,440 that the d1
+/// BF16 gate run saw (median 2.4e-4; greedy ids equal in all 36 steps, so the swaps are that ULP
+/// noise and not a bug). The number 5e-3 is chosen above the observed maximum 2.55e-3 of 600
+/// differing cells over 36 steps of a 5-token prompt, a thin sample; the epsilon is to be
+/// re-derived from the 922-token prompt run (slice d) and the longer-decode run. Every observed
+/// near-tie passes it, and any differing cell with a gap above it fails the gate. The report
+/// prints the gap distribution of every mismatching cell, so each Mac run re-checks the split.
+const BF16_TIE_EPSILON: f32 = 5e-3;
+/// The derivation of `BF16_TIE_EPSILON` for the report field (fix5 of packet Q36-BF16-a).
+const BF16_TIE_EPSILON_BASIS: &str = "chosen above the observed maximum 2.55e-3 of 600 differing cells over 36 steps of a 5-token \
+     prompt (d1 evidence 907030d6), a thin sample; the epsilon is to be re-derived from the \
+     922-token prompt run (slice d) and the longer-decode run";
+/// The relative-gap gate of one differing BF16 cell (fix5 of packet Q36-BF16-a; decision 0046
+/// A6 item 8): the cell's largest `gap / max(p_a, p_b)` (`route::route_cell_deltas`) may not
+/// exceed it. The d1 evidence records absolute gaps only, so 0.5 is the first gate: the report
+/// prints the observed maximum relative gap and decision 0046 A6 records it as to be tightened
+/// once a Mac run measures it.
+const BF16_RELATIVE_GAP_LIMIT: f32 = 0.5;
+/// The largest fraction of compared cells that may differ (fix5 of packet Q36-BF16-a; decision
+/// 0046 A6 item 8): 60% against the 42% (600 of 1,440) that the d1 BF16 gate run observed.
+const BF16_DIFFERING_FRACTION_LIMIT: f64 = 0.6;
+/// The largest absolute signed mean of the per-cell host-minus-device probability sums over the
+/// differing cells (fix5 of packet Q36-BF16-a; decision 0046 A6 item 8): `BF16_TIE_EPSILON` / 5,
+/// 1e-3, so a one-sided bias beyond the near-tie noise fails the gate.
+const BF16_SIGNED_MEAN_LIMIT: f64 = 1e-3;
 /// SHA-256 of the little-endian `u32` ids of the first 16 and the first 8,192 prompt tokens of the
 /// Q36-REF run (`ref-ops.json` and `ref-kernel.json`, `prompt_sha`).
 const REF_PROMPT_16_SHA256: &str =
@@ -242,7 +316,7 @@ fn device_routing_picks_the_host_experts_on_the_real_checkpoint() {
         "config.json differs from the pinned checkpoint"
     );
     let host = HostWeights::load(&real.ckpt, &QWEN3_6_35B_A3B, &real.config).unwrap();
-    let (mut decoder, scale_storage) =
+    let (mut decoder, activation) =
         new_decoder(MlxKernels::try_new().unwrap(), &real.ckpt, host, 256);
     let mut host_state = decoder.zero_state().unwrap();
     let mut device_state = decoder.zero_state().unwrap();
@@ -256,6 +330,24 @@ fn device_routing_picks_the_host_experts_on_the_real_checkpoint() {
     // logits of all 36 steps, per routing, and the equal greedy ids.
     let (mut host_hash, mut device_hash) = (Sha256::new(), Sha256::new());
     let mut fed = PROMPT[0];
+    // The BF16 near-tie bookkeeping (fix3): the gap that each mismatching cell bridged. The
+    // relative gaps and the signed host-minus-device sums of the same cells joined in fix5.
+    let mut cell_gaps: Vec<f64> = Vec::new();
+    let mut cell_relative_gaps: Vec<f64> = Vec::new();
+    let mut cell_signed_gaps: Vec<f64> = Vec::new();
+    // Greedy ids equal in all 36 steps is a gate of both dtypes (fix5 of packet Q36-BF16-a).
+    let mut greedy_ids_equal = true;
+    // The logits-cosine floor of this run (fix4, fix5): the exact floor for `f32`, 0.997 for
+    // BF16.
+    let (cosine_floor, floor_basis) = if activation == Activation::F32 {
+        (MIN_COSINE, "the exact gate of decision 0046 item 4")
+    } else {
+        (
+            BF16_MIN_COSINE,
+            "0.997, a 1.64e-3 margin under the observed BF16 minimum 0.99864 of the 36 steps \
+             (evidence 907030d6)",
+        )
+    };
     for step in 0..STEPS {
         if let Some(&prompt_token) = PROMPT.get(step) {
             fed = prompt_token;
@@ -275,15 +367,95 @@ fn device_routing_picks_the_host_experts_on_the_real_checkpoint() {
         hash_f32s(&mut host_hash, want.logits.as_ref().unwrap());
         hash_f32s(&mut device_hash, got.logits.as_ref().unwrap());
         let (want_routes, got_routes) = (want.routes.unwrap(), got.routes.unwrap());
-        assert_eq!(want_routes.len(), 40, "step {step}: host layers");
-        assert_eq!(got_routes.len(), 40, "step {step}: device layers");
-        for (layer, (a, b)) in want_routes.iter().zip(&got_routes).enumerate() {
-            assert_eq!(a.len(), 8, "step {step} layer {layer}: host top-k");
-            compared += 1;
-            if a != b {
+        // The shape checks are collected, not asserted, so every failed check of the run lands
+        // in the report's `failures` list before the test fails (fix4 of packet Q36-BF16-a).
+        if want_routes.len() != 40 {
+            failures.push(format!("step {step}: {} host layers", want_routes.len()));
+        }
+        if got_routes.len() != 40 {
+            failures.push(format!("step {step}: {} device layers", got_routes.len()));
+        }
+        // The host probability rows: the oracle the near-tie gaps are measured on. `Record` with
+        // host routing holds one row per layer (fix3 of packet Q36-BF16-a).
+        let want_probs = want.probs.unwrap();
+        if want_probs.len() != 40 {
+            failures.push(format!(
+                "step {step}: {} host router rows",
+                want_probs.len()
+            ));
+        }
+        for (layer, ((a, b), probs)) in want_routes
+            .iter()
+            .zip(&got_routes)
+            .zip(&want_probs)
+            .enumerate()
+        {
+            if a.len() != 8 {
+                failures.push(format!("step {step} layer {layer}: {} host top-k", a.len()));
+                continue;
+            }
+            if probs.len() != 256 {
                 failures.push(format!(
-                    "step {step} layer {layer}: host {a:?}, device {b:?}"
+                    "step {step} layer {layer}: {} router width",
+                    probs.len()
                 ));
+                continue;
+            }
+            compared += 1;
+            if activation == Activation::F32 {
+                // The F32 control keeps the exact rule (decision 0046 A6): the ids match in rank
+                // order, and an exact tie already agrees because both rules take the lower index.
+                if a != b {
+                    failures.push(format!(
+                        "step {step} layer {layer}: host {a:?}, device {b:?}"
+                    ));
+                }
+                continue;
+            }
+            // The BF16 rule (fix5; decision 0046 A6 item 8): a set difference or a rank swap
+            // passes only when the host-row probability gap to the nearest exchanged (or
+            // swapped) expert is <= BF16_TIE_EPSILON; a missing exchange partner is a fault;
+            // ties at exactly equal probability must agree with the lower index; any other
+            // difference fails.
+            let comparison = compare_top_k(a, b, probs, BF16_TIE_EPSILON);
+            if a != b {
+                cell_gaps.push(f64::from(comparison.max_gap));
+                let deltas = route_cell_deltas(a, b, probs);
+                cell_relative_gaps.push(f64::from(deltas.max_relative_gap));
+                cell_signed_gaps.push(f64::from(deltas.signed_gap));
+                if !(deltas.max_relative_gap.is_finite()
+                    && deltas.max_relative_gap <= BF16_RELATIVE_GAP_LIMIT)
+                {
+                    failures.push(format!(
+                        "step {step} layer {layer}: relative gap {}",
+                        deltas.max_relative_gap
+                    ));
+                }
+                if origin_fault(step, layer) {
+                    failures.push(format!(
+                        "step {step} layer {layer}: a cell differs within layers 0 to 2 of \
+                         step 0, before the summation-order origin"
+                    ));
+                }
+            }
+            for fault in &comparison.faults {
+                failures.push(match fault.rank {
+                    Some(rank) => format!(
+                        "step {step} layer {layer}: rank {rank} holds host {} and device {}, \
+                         probability gap {:?}",
+                        fault.oracle, fault.routed, fault.gap
+                    ),
+                    None if fault.oracle == fault.routed => format!(
+                        "step {step} layer {layer}: expert {} appears on one side with no \
+                         exchanged expert in the probability row",
+                        fault.oracle
+                    ),
+                    None => format!(
+                        "step {step} layer {layer}: host {} against device {}, set difference \
+                         with probability gap {:?}",
+                        fault.oracle, fault.routed, fault.gap
+                    ),
+                });
             }
         }
         if want.token != got.token {
@@ -291,10 +463,11 @@ fn device_routing_picks_the_host_experts_on_the_real_checkpoint() {
                 "step {step}: host token {:?}, device token {:?}",
                 want.token, got.token
             ));
+            greedy_ids_equal = false;
         }
         let cos = cosine(want.logits.as_ref().unwrap(), got.logits.as_ref().unwrap());
         min_logit_cosine = min_cosine(min_logit_cosine, cos);
-        if !(cos.is_finite() && cos >= MIN_COSINE) {
+        if !cosine_passes(cos, cosine_floor) {
             failures.push(format!("step {step}: logits cosine {cos}"));
         }
         fed = want.token.unwrap();
@@ -347,10 +520,84 @@ fn device_routing_picks_the_host_experts_on_the_real_checkpoint() {
         ));
     }
     let stats = decoder.kernels.memory_stats().unwrap();
+    // The gap distribution of the mismatching cells (fix3): the evidence behind the epsilon.
+    let (gap_max, gap_median) = if cell_gaps.is_empty() {
+        (0.0, 0.0)
+    } else {
+        (
+            cell_gaps.iter().copied().fold(0.0, f64::max),
+            median(cell_gaps.clone()),
+        )
+    };
+    let mut gap_buckets = std::collections::BTreeMap::new();
+    for gap in &cell_gaps {
+        *gap_buckets.entry(gap_bucket(*gap)).or_insert(0u64) += 1;
+    }
+    // The relative-gap distribution and the bias aggregates of the same cells (fix5): the
+    // evidence behind the relative gate, the differing-fraction gate, and the signed-mean gate.
+    let (relative_max, relative_median) = if cell_relative_gaps.is_empty() {
+        (0.0, 0.0)
+    } else {
+        (
+            cell_relative_gaps.iter().copied().fold(0.0, f64::max),
+            median(cell_relative_gaps.clone()),
+        )
+    };
+    let mut relative_buckets = std::collections::BTreeMap::new();
+    for relative in &cell_relative_gaps {
+        *relative_buckets
+            .entry(relative_bucket(*relative))
+            .or_insert(0u64) += 1;
+    }
+    let differing_fraction = if compared == 0 {
+        0.0
+    } else {
+        cell_gaps.len() as f64 / compared as f64
+    };
+    let signed_mean = if cell_signed_gaps.is_empty() {
+        0.0
+    } else {
+        cell_signed_gaps.iter().sum::<f64>() / cell_signed_gaps.len() as f64
+    };
+    if !differing_fraction_passes(compared, cell_gaps.len(), BF16_DIFFERING_FRACTION_LIMIT) {
+        failures.push(format!(
+            "{} of {compared} cells differ, above the fraction gate \
+             {BF16_DIFFERING_FRACTION_LIMIT}",
+            cell_gaps.len()
+        ));
+    }
+    if !signed_mean_passes(signed_mean, BF16_SIGNED_MEAN_LIMIT) {
+        failures.push(format!(
+            "signed mean {signed_mean} of the per-cell host-minus-device probability sums, \
+             above the gate {BF16_SIGNED_MEAN_LIMIT}"
+        ));
+    }
     let report = serde_json::json!({
         "steps": STEPS, "layers_compared": compared,
         "min_logits_cosine": number_or_nan(min_logit_cosine),
+        "min_logits_cosine_floor": cosine_floor,
+        "min_logits_cosine_floor_basis": floor_basis,
         "greedy_ids": tokens, "failures": failures, "budgets": budgets,
+        "route_rule": if activation == Activation::F32 {
+            "f32-exact"
+        } else {
+            "bf16-set-difference-or-rank-swap-within-tie-epsilon"
+        },
+        "bf16_tie_epsilon": BF16_TIE_EPSILON,
+        "bf16_tie_epsilon_basis": BF16_TIE_EPSILON_BASIS,
+        "cells_differing": cell_gaps.len(),
+        "cell_gap_max": number_or_nan(gap_max),
+        "cell_gap_median": number_or_nan(gap_median),
+        "cell_gap_buckets": gap_buckets,
+        "cell_relative_gap_max": number_or_nan(relative_max),
+        "cell_relative_gap_median": number_or_nan(relative_median),
+        "cell_relative_gap_buckets": relative_buckets,
+        "cell_relative_gap_gate": BF16_RELATIVE_GAP_LIMIT,
+        "cells_differing_fraction": differing_fraction,
+        "cells_differing_fraction_gate": BF16_DIFFERING_FRACTION_LIMIT,
+        "cell_signed_gap_mean": number_or_nan(signed_mean),
+        "cell_signed_gap_mean_gate": BF16_SIGNED_MEAN_LIMIT,
+        "greedy_ids_equal_in_all_steps": greedy_ids_equal,
         "forced_retire_flushes": flushes, "forced_retire_flushes_recorded_steps": record_flushes,
         "peak_retired_bytes": host_peaks.peak_retired_bytes.max(device_peaks.peak_retired_bytes),
         "mlx_active": stats.active, "mlx_peak": host_peaks.mlx_peak.max(device_peaks.mlx_peak),
@@ -362,7 +609,7 @@ fn device_routing_picks_the_host_experts_on_the_real_checkpoint() {
             "peak_retired_bytes": device_peaks.peak_retired_bytes,
         },
         "rss_kb": rss_kb(),
-        "scale_storage": scale_storage,
+        "activation_dtype": activation_name(activation),
         "host_logits_sha256": format!("{:x}", host_hash.finalize()),
         "device_logits_sha256": format!("{:x}", device_hash.finalize()),
     });
@@ -472,6 +719,38 @@ fn median(mut values: Vec<f64>) -> f64 {
     values[values.len() / 2]
 }
 
+/// The bucket of one mismatching cell's gap, for the report distribution (fix3 of packet
+/// Q36-BF16-a). The boundaries sit at 1e-4, 1e-3, and 1e-2 around `BF16_TIE_EPSILON` (5e-3,
+/// inside `le_1e-2`), so the report shows whether the tolerated gaps and the failing gaps
+/// separate cleanly.
+fn gap_bucket(gap: f64) -> &'static str {
+    if gap <= 1e-4 {
+        "le_1e-4"
+    } else if gap <= 1e-3 {
+        "le_1e-3"
+    } else if gap <= 1e-2 {
+        "le_1e-2"
+    } else {
+        "gt_1e-2"
+    }
+}
+
+/// The bucket of one differing cell's relative gap, for the report distribution (fix5 of packet
+/// Q36-BF16-a). The boundaries sit at 1e-2, 1e-1, and 5e-1 around `BF16_RELATIVE_GAP_LIMIT`
+/// (0.5, inside `le_5e-1`), so the report shows whether the tolerated relative gaps and the
+/// failing ones separate cleanly.
+fn relative_bucket(relative: f64) -> &'static str {
+    if relative <= 1e-2 {
+        "le_1e-2"
+    } else if relative <= 1e-1 {
+        "le_1e-1"
+    } else if relative <= 5e-1 {
+        "le_5e-1"
+    } else {
+        "gt_5e-1"
+    }
+}
+
 #[test]
 #[ignore = "needs the real checkpoint and the Q36-REF prompt ids on the Mac; run with --ignored"]
 fn device_routing_speed_table() {
@@ -503,7 +782,7 @@ fn device_routing_speed_table() {
     let real = open(&ckpt_dir);
     assert_eq!(sha256(&real.config), CONFIG_SHA256, "config.json differs");
     let host = HostWeights::load(&real.ckpt, &QWEN3_6_35B_A3B, &real.config).unwrap();
-    let (mut decoder, scale_storage) = new_decoder(
+    let (mut decoder, act) = new_decoder(
         MlxKernels::try_new().unwrap(),
         &real.ckpt,
         host,
@@ -527,6 +806,8 @@ fn device_routing_speed_table() {
         }
         let mut row = serde_json::json!({
             "case": "decode_16", "routing": format!("{routing:?}"),
+            "activation_dtype": activation_name(act),
+            "first_tokens": trials[0].tokens.iter().take(32).collect::<Vec<_>>(),
             "trials": trial_count, "new_tokens": new_tokens, "gap_ms": gap_ms,
             "generation_tps": trials.iter().map(|t| t.generation_tps).collect::<Vec<_>>(),
             "median_generation_tps": median(trials.iter().map(|t| t.generation_tps).collect()),
@@ -559,6 +840,8 @@ fn device_routing_speed_table() {
         let peaks = Peaks::read(&decoder.kernels);
         let mut row = serde_json::json!({
             "case": "decode_8192", "routing": "Device",
+            "activation_dtype": activation_name(act),
+            "first_tokens": one.tokens.iter().take(32).collect::<Vec<_>>(),
             "generation_tps": one.generation_tps, "prompt_tps": one.prompt_tps,
             "tokens_sha256": sha256(&id_bytes(&one.tokens)),
             "mlx_peak": peaks.mlx_peak, "peak_retired_bytes": peaks.peak_retired_bytes,
@@ -581,11 +864,8 @@ fn device_routing_speed_table() {
         .filter_map(|row| row["mlx_peak"].as_u64())
         .max()
         .unwrap_or(0);
-    for row in &mut rows {
-        row["scale_dtype"] = scale_storage["dtype"].clone();
-    }
     let report = serde_json::json!({
-        "scale_storage": scale_storage,
+        "activation_dtype": activation_name(act),
         "rows": rows, "forced_retire_flushes": flushes, "peak_retired_bytes": peak_retired,
         "mlx_active": stats.active, "mlx_peak": peak, "rss_kb": rss_kb(),
         "reference": {

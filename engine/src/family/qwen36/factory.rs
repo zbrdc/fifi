@@ -173,6 +173,19 @@ mod tests {
         );
     }
 
+    #[test]
+    fn a_bad_activation_dtype_is_refused_by_name_before_the_backend() {
+        let options = Q36Options {
+            cache_limit_bytes: Some(1024),
+            activation_dtype: Some("f16".to_string()),
+            ..Q36Options::default()
+        };
+        assert_eq!(
+            message(start(Some(&options), &Q36Env::default())),
+            "engine config: activation_dtype must be f32 or bf16, got \"f16\""
+        );
+    }
+
     #[cfg(not(all(feature = "native-mlx", target_os = "macos", target_arch = "aarch64")))]
     #[test]
     fn a_complete_entry_in_a_build_without_the_backend_names_the_feature() {

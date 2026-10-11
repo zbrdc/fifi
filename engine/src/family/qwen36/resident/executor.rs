@@ -72,6 +72,7 @@ use crate::{
         qwen36::{
             host::HostShape,
             host_load::{HostWeights, rotary_dim},
+            settings::{Activation, chunked_prefill_allowed},
         },
         session::{DecodeSession, Limits, PrefixSlot, TokenStepper},
         spec::{AttentionKind, QWEN3_6_35B_A3B},
@@ -100,6 +101,9 @@ pub(crate) struct Q36Rules {
     pub(crate) context_limit: u32,
     /// The bytes of cache growth that this engine admits: the cap of the decoder's `SessionBudget`.
     pub(crate) session_cap: u64,
+    /// The dtype of the decode activations (packet Q36-BF16-a), which also picks the scale storage
+    /// at construction. The config member defaults to `bf16`.
+    pub(crate) activation: Activation,
 }
 
 /// The numeric path of a prefill. A saved prefix restores only under the path that built it:
@@ -325,7 +329,13 @@ impl Q36Executor {
         admit(host.shape(), &rules)?;
         let context_limit = usize::try_from(rules.context_limit)
             .map_err(|_| EngError::BadRequest("context limit overflows".to_string()))?;
-        let mut decoder = ResidentDecoder::new(kernels, ckpt, host, rules.context_limit)?;
+        let mut decoder = ResidentDecoder::new_with_activation(
+            kernels,
+            ckpt,
+            host,
+            rules.context_limit,
+            rules.activation,
+        )?;
         // No state exists yet, so no permit charges the old budget.
         decoder.budget = SessionBudget::new(rules.session_cap);
         let state = decoder.zero_state()?;
@@ -402,7 +412,15 @@ impl Q36Executor {
             weights: self.decoder.weights.byte_len()?,
             session_reserve,
         };
-        let chunk = admitted_chunk(&self.prefill_cost()?, terms.remaining(), max_rows)?;
+        // TODO(slice Q36-BF16-b): the chunk path becomes dtype aware and this temporary rule of
+        // packet Q36-BF16-a drops. A BF16 decoder would fail the chunk on a silent F32 promotion,
+        // so the plan admits no chunk and the prefill runs one-token steps. `chunked_prefill_allowed`
+        // is the one authority: `start::plan_prefill` asks the same function for the start-up line.
+        let chunk = if chunked_prefill_allowed(self.decoder.weights.consts.act) {
+            admitted_chunk(&self.prefill_cost()?, terms.remaining(), max_rows)?
+        } else {
+            None
+        };
         self.apply_chunk(chunk)?;
         Ok(PrefillPlan { chunk, terms })
     }
@@ -524,6 +542,7 @@ mod tests {
             sampler_vocab,
             context_limit: LIMIT,
             session_cap: u64::from(LIMIT) * GROWTH,
+            activation: Activation::F32,
         }
     }
 
@@ -709,6 +728,7 @@ mod tests {
             sampler_vocab: 248_077,
             context_limit: 32_768,
             session_cap: 40_960 * 32_768,
+            activation: Activation::F32,
         }
     }
 
@@ -916,6 +936,7 @@ mod tests {
             sampler_vocab,
             context_limit,
             session_cap,
+            activation: Activation::F32,
         };
         // Every rule is broken: the vocabulary is named first, then the limit, then the cap.
         assert!(message(bad(0, 1, 0)).contains("sampler vocabulary"));
@@ -990,6 +1011,7 @@ mod tests {
             sampler_vocab: VOCAB,
             context_limit: CHUNK_LIMIT,
             session_cap: u64::from(CHUNK_LIMIT) * GROWTH,
+            activation: Activation::F32,
         }
     }
 
@@ -1263,6 +1285,39 @@ mod tests {
         );
     }
 
+    /// Packet Q36-BF16-a, the temporary chunk rule: a BF16 executor plans no chunk however large
+    /// the budget is, so prompts run one token at a time and the worker piece falls back to
+    /// `NO_BUDGET_PIECE`. The F32 control on the same budget still plans the largest chunk. Slice
+    /// Q36-BF16-b lifts the rule.
+    #[test]
+    fn plan_prefill_admits_no_chunk_while_the_activations_are_bf16() {
+        let _serial = crate::native_test_lock();
+        let (mut f32_executor, _session) = build(chunk_rules());
+        let huge = held(&f32_executor) + (1 << 40);
+        let plan = f32_executor.plan_prefill(huge, 0, 256).unwrap();
+        assert_eq!(
+            plan.chunk,
+            Some(256),
+            "the F32 control plans the largest chunk"
+        );
+        assert_eq!(
+            f32_executor.prefill_piece(),
+            Some(256),
+            "the F32 piece follows"
+        );
+        let mut rules = chunk_rules();
+        rules.activation = Activation::Bf16;
+        let (mut bf16_executor, _session) = build(rules);
+        let plan = bf16_executor.plan_prefill(huge, 0, 256).unwrap();
+        assert_eq!(plan.chunk, None, "a BF16 engine plans no chunk");
+        assert_eq!(bf16_executor.prefill_chunk(), None, "no chunk is stored");
+        assert_eq!(
+            bf16_executor.prefill_piece(),
+            None,
+            "the worker piece falls back to NO_BUDGET_PIECE"
+        );
+    }
+
     /// Without a plan, and with a plan that admits no chunk, every prompt row is a one-token
     /// step: the logits row is bit for bit that of the steps of a fresh decoder. A failure on the
     /// one-token path keeps its earlier behavior: the earlier rows stay fed and the executor does
@@ -1492,6 +1547,11 @@ mod tests {
     /// is `NO_BUDGET_PIECE`, which the planned chunk replaces. It runs one job of 10 prompt tokens
     /// and 4 generated tokens.
     fn serve(settings: Q36Settings) -> Served {
+        serve_with(settings, chunk_rules())
+    }
+
+    /// `serve` with the rules that the engine thread builds, so a test can serve another dtype.
+    fn serve_with(settings: Q36Settings, rules: Q36Rules) -> Served {
         use crate::sched::{
             job::{Job, JobEvent},
             worker::{EngineState, ShutdownReport, spawn_engine},
@@ -1503,7 +1563,7 @@ mod tests {
         let thread_seen = std::sync::Arc::clone(&seen);
         let fallback = usize::try_from(NO_BUDGET_PIECE).unwrap();
         let engine = spawn_engine(fallback, move || {
-            let (mut executor, session) = build(chunk_rules());
+            let (mut executor, session) = build(rules);
             let line = plan_prefill(&mut executor, &settings)?;
             *thread_seen.lock().unwrap() = (line, executor.prefill_chunk());
             executor.log = thread_log;
@@ -1538,9 +1598,11 @@ mod tests {
     }
 
     /// A serving entry with a budget plans a chunk from its settings, and the worker feeds the
-    /// prompt in chunks. The planned chunk sets the worker piece, whatever the largest chunk is:
-    /// row 1 plans 4 with a largest chunk of 8, and row 2 plans 4 with a largest chunk of 4, so
-    /// the pieces of 4 tokens give the chunks 3, 4, then 2 in both rows.
+    /// prompt in chunks. The settings carry the explicit F32 control (`activation_dtype`), because
+    /// the member's default is bf16 and a BF16 entry plans no chunk. The planned chunk sets the
+    /// worker piece, whatever the largest chunk is: row 1 plans 4 with a largest chunk of 8, and
+    /// row 2 plans 4 with a largest chunk of 4, so the pieces of 4 tokens give the chunks 3, 4,
+    /// then 2 in both rows.
     #[test]
     fn a_serving_entry_with_a_budget_plans_a_chunk_and_the_prompt_runs_in_chunks() {
         let _serial = crate::native_test_lock();
@@ -1555,6 +1617,7 @@ mod tests {
                 prefill_chunk: Some(largest),
                 prefill_budget_bytes: Some(budget),
                 prefill_session_reserve_bytes: Some(0),
+                activation_dtype: Some("f32".to_string()),
                 ..Q36Options::default()
             }));
             let what = format!("budget {budget}, largest {largest}");
@@ -1569,13 +1632,44 @@ mod tests {
         }
     }
 
+    /// A BF16 serving entry (the default of `activation_dtype`, packet Q36-BF16-a) plans no chunk
+    /// even with a budget that admits the largest one: the start-up line names the dtype and slice
+    /// Q36-BF16-b, and every prompt row is a one-token step.
+    #[test]
+    fn a_bf16_serving_entry_plans_no_chunk_and_names_the_rule_in_the_line() {
+        let _serial = crate::native_test_lock();
+        let (weights, _cost) = probe();
+        let mut rules = chunk_rules();
+        rules.activation = Activation::Bf16;
+        let served = serve_with(
+            serving(Q36Options {
+                prefill_budget_bytes: Some(weights + (1 << 40)),
+                prefill_session_reserve_bytes: Some(0),
+                ..Q36Options::default()
+            }),
+            rules,
+        );
+        assert_eq!(served.planned, None, "no chunk is planned");
+        assert!(served.log.is_empty(), "no chunk ran");
+        assert_eq!(served.tokens, 4, "the job still decodes");
+        let line = served.line.expect("a budget gives a start-up line");
+        assert!(
+            line.contains("no chunk planned while activation_dtype is bf16"),
+            "{line}"
+        );
+        assert!(line.contains("Q36-BF16-b"), "{line}");
+        assert!(line.contains("prompts run one token at a time"), "{line}");
+    }
+
     /// Without a budget the start-up code plans nothing: no line, no chunk size, and every prompt
-    /// row is a one-token step, whatever the worker piece is.
+    /// row is a one-token step, whatever the worker piece is. The settings carry the explicit F32
+    /// control so the entry matches the F32 rules of the engine thread.
     #[test]
     fn a_serving_entry_without_a_budget_keeps_the_one_token_path() {
         let _serial = crate::native_test_lock();
         let served = serve(serving(Q36Options {
             prefill_chunk: Some(4),
+            activation_dtype: Some("f32".to_string()),
             ..Q36Options::default()
         }));
         assert_eq!(served.line, None, "start-up line");
@@ -1585,8 +1679,10 @@ mod tests {
     }
 
     /// A plan that admits no chunk does not fail the engine. The path stays off, the job runs, and
-    /// the line names the terms that were charged. Row 1: the budget of 4 rows with a reserve of
-    /// 2 GiB plus 1024 bytes leaves nothing. Row 2: one byte below the
+    /// the line names the terms that were charged. The settings carry the explicit F32 control
+    /// (`activation_dtype`), because the member's default is bf16 and would give the BF16 refusal
+    /// line of packet Q36-BF16-a instead of the budget terms. Row 1: the budget of 4 rows with a
+    /// reserve of 2 GiB plus 1024 bytes leaves nothing. Row 2: one byte below the
     /// workspace of 4 rows. Row 3: a largest chunk of 3 is below the smallest candidate.
     #[test]
     fn a_budget_that_admits_no_chunk_keeps_the_one_token_path_and_says_why() {
@@ -1604,6 +1700,7 @@ mod tests {
                 prefill_chunk: Some(largest),
                 prefill_budget_bytes: Some(budget),
                 prefill_session_reserve_bytes: Some(charged),
+                activation_dtype: Some("f32".to_string()),
                 ..Q36Options::default()
             }));
             let what = format!("budget {budget}, largest {largest}");
@@ -1772,6 +1869,7 @@ mod tests {
             sampler_vocab: 248_320,
             context_limit: 256,
             session_cap: 1 << 30,
+            activation: Activation::F32,
         };
         let (mut executor, mut session) = Q36Executor::open(&ckpt_dir, cache_limit, rules).unwrap();
         let mut job = GenerationState::new(IncrementalDecoder::new(&tokenizer)).with_max_tokens(32);
@@ -1868,6 +1966,7 @@ mod tests {
             sampler_vocab: 248_320,
             context_limit: 256,
             session_cap: 1 << 30,
+            activation: Activation::F32,
         };
         let (mut executor, mut session) = Q36Executor::open(&ckpt_dir, cache_limit, rules).unwrap();
         let run = |executor: &mut Q36Executor, session: &mut Q36Session| {
@@ -1980,6 +2079,7 @@ mod tests {
             sampler_vocab: 248_320,
             context_limit: 4_096,
             session_cap: 4_096 * 40_960,
+            activation: Activation::F32,
         };
         let (mut executor, mut session) = Q36Executor::open(&ckpt_dir, cache_limit, rules).unwrap();
         let reserve = real_reserve(&executor, &session, 4_096, cache_limit);
@@ -2093,6 +2193,7 @@ mod tests {
             sampler_vocab: VOCAB,
             context_limit: PREFIX_LIMIT,
             session_cap: 100_000,
+            activation: Activation::F32,
         }
     }
 
@@ -2105,6 +2206,7 @@ mod tests {
             sampler_vocab: VOCAB,
             context_limit: PREFIX_LIMIT,
             session_cap: 28_000,
+            activation: Activation::F32,
         }
     }
 

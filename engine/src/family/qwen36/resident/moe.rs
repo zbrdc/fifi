@@ -17,7 +17,7 @@
 //! probability row (the health). A softmax row sums to 1, so a NaN or infinite entry makes the sum
 //! non-finite. The step adds the sums of all layers and checks the total at the token readback.
 
-use super::ops::{Ctx, dim, f32_tensor, linear, short_import, u32_tensor, values};
+use super::ops::{Ctx, dim, f32_tensor, linear, short_import, to_act, u32_tensor, values};
 use super::weights::RMoe;
 use crate::{
     EngError,
@@ -109,7 +109,10 @@ fn combine(
     let weighted = ctx.kernels.binary(BinaryOp::Mul, &eo, gates)?;
     let experts = ctx.kernels.reduce(ReduceOp::Sum, &weighted, 0, false)?;
     let shared_out = shared(ctx, w, x)?;
-    ctx.kernels.binary(BinaryOp::Add, &experts, &shared_out)
+    // Packet Q36-BF16-a: the gates are F32, so the weighted sum and the shared expert product are
+    // F32. The residual add takes the activation dtype.
+    let total = ctx.kernels.binary(BinaryOp::Add, &experts, &shared_out)?;
+    to_act(ctx, &total)
 }
 
 /// The lazy outcome of device routing for one probability row.

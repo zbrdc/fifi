@@ -25,7 +25,7 @@
 
 use super::decoder::{ResidentDecoder, StepMode, StepResult};
 use super::moe::{self, Routing};
-use super::ops::{Ctx, linear, short_import, values};
+use super::ops::{Ctx, cast_to, linear, short_import, to_act, values};
 use super::state::{LayerState, ResidentState, kv_growth_bytes};
 use super::weights::RMixer;
 use super::{attn, delta};
@@ -53,8 +53,10 @@ pub(super) fn step(
     run(decoder, state, old, permit, token, mode)
 }
 
-/// Reads the embedding row of `token`, imports it packed, and dequantizes it to `[1, hidden]`.
-/// One synchronization (one `import_packed_many` call). A token outside the table returns `BadRequest` from the read.
+/// Reads the embedding row of `token`, imports it packed, and dequantizes it to `[1, hidden]` in
+/// the activation dtype (packet Q36-BF16-a; the dequantized row is F32 and one cast moves it to
+/// BF16). One synchronization (one `import_packed_many` call). A token outside the table returns
+/// `BadRequest` from the read.
 fn embed_row(
     ctx: &mut Ctx<'_>,
     ckpt: &crate::weights::StreamedCheckpoint,
@@ -67,7 +69,8 @@ fn embed_row(
         .import_packed_many(&[&row])?
         .pop()
         .ok_or_else(short_import)?;
-    ctx.kernels.dequantize(&resident)
+    let row = ctx.kernels.dequantize(&resident)?;
+    to_act(ctx, &row)
 }
 
 /// Builds the token graph, evaluates it once, reads back, and commits. `permit` moves into the
@@ -98,8 +101,12 @@ fn run(
     let mut chosen: Vec<ExecutionTensor> = Vec::new();
     // Host routing in `Record`: the expert ids of each layer.
     let mut host_routes: Vec<Vec<u32>> = Vec::new();
+    // Host routing in `Record`: the router probability row that each selection read (fix3 of
+    // packet Q36-BF16-a). The readback already exists, so recording it adds no synchronization.
+    let mut host_probs: Vec<Vec<f32>> = Vec::new();
     for (index, (layer, old_layer)) in weights.layers.iter().zip(old).enumerate() {
         let normed = ctx.kernels.rms_norm(&h, &layer.input_norm, shape.eps)?;
+        check_dtype("input norm output", &normed, ctx.consts.act)?;
         // The old layer state moves into its arm and drops at the end of the arm, after the
         // replacement graph exists. The next synchronization frees it.
         let (mixed, next) = match (&layer.mixer, old_layer) {
@@ -131,11 +138,13 @@ fn run(
             break;
         }
         let normed = ctx.kernels.rms_norm(&mid, &layer.post_norm, shape.eps)?;
+        check_dtype("post norm output", &normed, ctx.consts.act)?;
         let routed = match routing {
             Routing::Host => {
-                let (out, (selection, _probs)) = moe::step(&mut ctx, shape, &layer.moe, &normed)?;
+                let (out, (selection, probs)) = moe::step(&mut ctx, shape, &layer.moe, &normed)?;
                 if mode == StepMode::Record {
                     host_routes.push(selection.iter().map(|pick| pick.0).collect());
+                    host_probs.push(probs);
                 }
                 out
             }
@@ -152,8 +161,12 @@ fn run(
             }
         };
         h = ctx.kernels.binary(BinaryOp::Add, &mid, &routed)?;
+        // MLX promotes mixed operands, so a stray F32 operand would turn BF16 activations back to
+        // F32 without an error. The check keeps a BF16 run honest (packet Q36-BF16-a).
+        check_dtype("layer output", &h, ctx.consts.act)?;
         if mode == StepMode::Record {
-            records.push(h.share());
+            // The recorded rows read back as F32.
+            records.push(cast_to(&mut ctx, &h, Dtype::F32)?);
         }
     }
     // The head. `Prompt` skips the norm, `lm_head`, and the argmax.
@@ -197,6 +210,21 @@ fn run(
     } else {
         None
     };
+    // Packet Q36-BF16-a: the recurrent state, the convolution ring, and the key-value cache stay
+    // F32 whatever the activation dtype, and the step refuses a graph that planned otherwise.
+    for layer in &layers {
+        match layer {
+            LayerState::Delta { rec, ring } => {
+                check_dtype("recurrent state", rec, Dtype::F32)?;
+                check_dtype("convolution ring", ring, Dtype::F32)?;
+            }
+            LayerState::Attn(cache) => {
+                for tensor in [&cache.k, &cache.v].into_iter().flatten() {
+                    check_dtype("key-value cache", tensor, Dtype::F32)?;
+                }
+            }
+        }
+    }
     // One evaluate of the new state and the head outputs.
     let mut outputs: Vec<&ExecutionTensor> = Vec::new();
     for layer in &layers {
@@ -241,12 +269,32 @@ fn run(
         None if mode == StepMode::Record => Some(host_routes),
         None => None,
     };
+    // `Record` with host routing keeps the probability row of every layer (fix3 of packet
+    // Q36-BF16-a): the near-tie rule of the route-parity gate reads its gaps from it.
+    let probs_out = match (mode, routing) {
+        (StepMode::Record, Routing::Host) => Some(host_probs),
+        _ => None,
+    };
     state.commit(layers, permit)?;
     Ok(StepResult {
         token: token_out,
         logits: logits_out,
         layer_out,
         routes: routes_out,
+        probs: probs_out,
+    })
+}
+
+/// Returns `Backend` when `tensor` does not have the dtype that the step plans for it (packet
+/// Q36-BF16-a). MLX promotes mixed operands silently, so the dtype is the only honest witness of
+/// a stray F32 operand in a BF16 run. The check never fires in an F32 run.
+fn check_dtype(what: &str, tensor: &ExecutionTensor, want: Dtype) -> Result<(), EngError> {
+    if tensor.dtype() == want {
+        return Ok(());
+    }
+    Err(EngError::Backend {
+        operation: "qwen36",
+        message: format!("{what} has dtype {:?}, expected {want:?}", tensor.dtype()),
     })
 }
 
@@ -353,6 +401,7 @@ mod tests {
     use crate::family::qwen36::host::{self, HostState, LayerState as HostLayer};
     use crate::family::qwen36::host_cpu::CpuProjector;
     use crate::family::qwen36::host_load::HostWeights;
+    use crate::family::qwen36::settings::Activation;
     use crate::family::qwen36::tiny::{self, TINY_GQA};
     use crate::kernels::MlxKernels;
     use crate::sched::SessionBudget;
@@ -365,6 +414,11 @@ mod tests {
         let ckpt = tiny::checkpoint(&TINY_GQA);
         let host = HostWeights::load(&ckpt, &TINY_GQA, &tiny::config(&TINY_GQA)).unwrap();
         (ckpt, host)
+    }
+
+    /// A second host load of the fixture, for a decoder built with another activation dtype.
+    fn host_load(ckpt: &StreamedCheckpoint) -> HostWeights {
+        HostWeights::load(ckpt, &TINY_GQA, &tiny::config(&TINY_GQA)).unwrap()
     }
 
     /// A decoder over the four-layer tiny model, and a second host load for the oracle.
@@ -534,7 +588,8 @@ mod tests {
                             token: None,
                             logits: None,
                             layer_out: None,
-                            routes: None
+                            routes: None,
+                            probs: None
                         },
                         "{what}"
                     ),
@@ -544,7 +599,8 @@ mod tests {
                             token: Some(want_token),
                             logits: None,
                             layer_out: None,
-                            routes: None
+                            routes: None,
+                            probs: None
                         },
                         "{what}"
                     ),
@@ -991,5 +1047,79 @@ mod tests {
         let previous = decoder.kernels.set_retire_cap(1 << 20).unwrap();
         assert_eq!(previous, DECODE_RETIRE_CAP);
         assert_eq!(DECODE_RETIRE_CAP, 4 << 30, "4 GiB");
+    }
+    /// A BF16 decoder (packet Q36-BF16-a) steps the tiny model finitely and keeps the F32 argmax on
+    /// every step whose F32 top-two logit gap exceeds 0.25, the BF16 rounding scale, so the two
+    /// decoders read the same tokens only where the fixture decides clearly. The test also holds
+    /// the dtype itself to account: `Consts::act` is `Bf16` and a converted layer norm reads BF16,
+    /// so a decoder that silently stayed F32 fails here and not only on the finite check. The
+    /// dtype guard inside `run` makes any stray F32 operand fail the step with `Backend`, so this
+    /// test also proves the whole BF16 graph: embedding cast, converted norms, quantized matmuls,
+    /// F32 cache and DeltaNet state.
+    #[test]
+    fn a_bf16_decoder_steps_finitely_and_keeps_the_f32_argmax_where_it_holds() {
+        let _serial = crate::native_test_lock();
+        let (ckpt, _) = setup();
+        let mut f32 = ResidentDecoder::new(
+            MlxKernels::try_new().unwrap(),
+            &ckpt,
+            host_load(&ckpt),
+            1024,
+        )
+        .unwrap();
+        let mut bf16 = ResidentDecoder::new_with_activation(
+            MlxKernels::try_new().unwrap(),
+            &ckpt,
+            host_load(&ckpt),
+            1024,
+            Activation::Bf16,
+        )
+        .unwrap();
+        // The hard dtype assertions: the decoder really runs BF16, not F32 with a finite readback.
+        assert_eq!(
+            bf16.weights.consts.act,
+            Dtype::Bf16,
+            "the decoder holds the BF16 activation dtype"
+        );
+        assert_eq!(
+            bf16.weights.layers[0].input_norm.dtype(),
+            Dtype::Bf16,
+            "a converted layer norm reads BF16"
+        );
+        let mut state_f32 = f32.zero_state().unwrap();
+        let mut state_bf16 = bf16.zero_state().unwrap();
+        let mut token = token(0);
+        let mut checked = 0u32;
+        for step in 0..8u32 {
+            let want = f32.step(&mut state_f32, token, StepMode::Logits).unwrap();
+            let got = bf16.step(&mut state_bf16, token, StepMode::Logits).unwrap();
+            let row = got.logits.as_ref().unwrap();
+            assert!(
+                row.iter().all(|value| value.is_finite()),
+                "step {step}: every BF16 logit is finite"
+            );
+            assert_eq!(row.len(), 8, "step {step}: the vocabulary width");
+            // The F32 top-two gap decides whether the argmax is a clear choice: only a gap above
+            // the BF16 rounding scale of 0.25 binds.
+            let mut ranked = want.logits.as_ref().unwrap().clone();
+            ranked.sort_by(|a, b| b.total_cmp(a));
+            let gap = ranked[0] - ranked[1];
+            if gap > 0.25 {
+                assert_eq!(
+                    got.token, want.token,
+                    "step {step}: BF16 keeps the F32 argmax (F32 gap {gap})"
+                );
+                checked += 1;
+            }
+            token = want.token.unwrap();
+        }
+        if checked == 0 {
+            // The fixture has no position whose F32 top-two gap exceeds the BF16 rounding scale,
+            // so only the finite-logit and dtype assertions bind on it (packet Q36-BF16-a fix).
+            eprintln!(
+                "no step of the tiny fixture has an F32 top-two gap above 0.25; \
+                 the BF16 argmax comparison did not run"
+            );
+        }
     }
 }

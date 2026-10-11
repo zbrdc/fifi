@@ -57,9 +57,18 @@ struct State {
     /// Held only for drop order: the adapter slot outlives the stream and the device (decision 0024).
     _lease: Rc<Lease>,
     owner: OwnerKey,
+    /// Whether the resident float operations take BF16 operands (packet Q36-BF16-a). `false` until
+    /// `Context::allow_bf16` sets it, so a caller that never calls it rejects BF16 exactly as before.
+    allow_bf16: bool,
 }
 
 impl State {
+    /// Whether `dtype` is a float operand of the resident operations: F32, and BF16 only after
+    /// `Context::allow_bf16` sets the switch.
+    fn accepts_float(&self, dtype: Dtype) -> bool {
+        dtype == Dtype::F32 || (dtype == Dtype::Bf16 && self.allow_bf16)
+    }
+
     /// Wraps an output as a resident tensor that holds this adapter's retire core, which holds the lease.
     ///
     /// The output can still be lazy. `readback` evaluates it (decision 0032).
@@ -114,6 +123,12 @@ impl Context {
     #[cfg(feature = "native-fault-qualification")]
     pub(super) fn qualification_reset_flush_stats(&mut self) {
         handles::qualification_reset_flush_stats();
+    }
+
+    /// Lets the resident float operations take BF16 operands and return BF16 results (packet
+    /// Q36-BF16-a). It makes no native call. Mixed F32 and BF16 operands promote to F32 in MLX.
+    pub(super) fn allow_bf16(&mut self, allow: bool) {
+        self.state.as_mut().unwrap().allow_bf16 = allow;
     }
 
     /// Reads the process-wide MLX allocator counters. A failure is reported and recoverable,
@@ -188,6 +203,7 @@ impl Context {
                 _device: device,
                 _lease: lease,
                 owner,
+                allow_bf16: false,
             }),
             _thread: PhantomData,
         })
