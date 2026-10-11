@@ -1,7 +1,7 @@
 //! Test helper: checks server JSON against `api/openapi.yaml`.
 //!
 //! The crate has no YAML parser, so the helper reads `testdata/openapi.json`.
-//! `scripts/openapi_to_json.py` writes that file from the contract and records the hash of the YAML bytes.
+//! The OpenAPI fixture script writes that file from the contract and records the hash of the YAML bytes.
 
 use jsonschema::Validator;
 use serde_json::{Value, json};
@@ -69,7 +69,7 @@ mod tests {
         let fixture: Value = serde_json::from_str(FIXTURE).expect("parse openapi.json");
         assert_eq!(
             fixture["x-source-sha256"], expected,
-            "stale fixture: run scripts/openapi_to_json.py"
+            "stale fixture: regenerate it from api/openapi.yaml with the OpenAPI fixture script"
         );
     }
 

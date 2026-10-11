@@ -2,7 +2,7 @@
 //! decision 0039 gates 3, 5, and 6; S1-C plan section 4).
 //!
 //! The three real-checkpoint tests are ignored. They need the Flash-Next artifact on the Mac, and
-//! the coordinator runs them through `qualification/resident-decode`. The teacher-forced and
+//! the coordinator runs them through the resident-decode qualification harness. The teacher-forced and
 //! end-to-end tests reuse the frozen tolerances and the `Gate` of `flash_next/mlx.rs`. The decode
 //! test measures and writes its report; the runner applies the gate 5 and gate 6 rules. The other
 //! tests check the helpers and run in the normal Mac suite.
@@ -42,7 +42,7 @@ const GENERATED: usize = 512;
 const MATCH: usize = 32;
 /// Generated-token counts after which the decode test records the process RSS.
 const RSS_AT: [usize; 5] = [16, 128, 256, 384, 512];
-/// Column order of each `stepNNNN` line. `qualification/resident-decode` parses the same order.
+/// Column order of each `stepNNNN` line. The resident-decode qualification harness parses the same order.
 const STEP_COLUMNS: &str =
     "mode,input,output,seconds,syncs,flushes,retired_peak,peak,active,cache,read_bytes,read_ns";
 

@@ -1,6 +1,6 @@
 //! Output assembly over incremental decode.
 //!
-//! Interface and flush rules: `docs/design/tokenizer.md`.
+//! Interface and flush rules: the tokenizer design.
 
 use super::stop::{StopHit, StopMatcher};
 use crate::EngError;

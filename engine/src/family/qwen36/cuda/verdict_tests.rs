@@ -2,7 +2,9 @@
 use super::{
     book::CommitRefusal,
     rules::sampler_width,
-    verdict::{Decision, FailureAction, action_for, bad_token_error, decide},
+    verdict::{
+        Decision, FailureAction, action_for, bad_token_error, decide, entered_after_failed_sync,
+    },
 };
 use crate::{EngError, kernels::cuda::resident::step_params::ResultPair};
 
@@ -18,10 +20,19 @@ fn pair(token: i32, status: i32) -> ResultPair {
 
 #[test]
 fn a_clean_pair_yields_a_token_inside_the_vocabulary() {
-    assert_eq!(decide(pair(0, 0), VOCAB), Decision::Commit { token: 0 });
+    assert_eq!(
+        decide(pair(0, 0), VOCAB),
+        Decision::Commit {
+            token: 0,
+            status: 0
+        }
+    );
     assert_eq!(
         decide(pair(248_319, 0), VOCAB),
-        Decision::Commit { token: 248_319 }
+        Decision::Commit {
+            token: 248_319,
+            status: 0
+        }
     );
     assert_eq!(decide(pair(248_320, 0), VOCAB), Decision::BadToken(248_320));
     assert_eq!(decide(pair(-1, 0), VOCAB), Decision::BadToken(-1));
@@ -64,7 +75,7 @@ fn the_status_is_judged_before_the_token() {
         for token in [-1, 7, 248_320] {
             assert_eq!(
                 decide(pair(token, status), VOCAB),
-                Decision::Commit { token: 0 },
+                Decision::Commit { token: 0, status },
                 "status {status:#x} token {token}"
             );
         }
@@ -111,4 +122,52 @@ fn only_a_failure_of_the_first_op_takes_the_step_back() {
     assert_eq!(action_for(1), FailureAction::Cancel);
     assert_eq!(action_for(2), FailureAction::Poison);
     assert_eq!(action_for(80), FailureAction::Poison);
+}
+
+#[test]
+fn a_failed_sync_after_the_first_op_poisons_the_step() {
+    // With INFERENCE_CUDA_SYNC_EACH on, a synchronize error after op 1 arrives with
+    // `entered == 1`, but op 1 WAS queued and the error is a device fault: the failed sync
+    // counts as having entered the next op, so the failure rule poisons, not cancels.
+    assert_eq!(entered_after_failed_sync(1), 2);
+    assert_eq!(
+        action_for(entered_after_failed_sync(1)),
+        FailureAction::Poison
+    );
+    assert_eq!(
+        action_for(entered_after_failed_sync(40)),
+        FailureAction::Poison
+    );
+}
+
+#[test]
+fn a_flagged_pair_carries_its_exact_status_and_never_a_token() {
+    // The read-back routes the pair: status 1, 2, 4 and 8 (and any mix) reaches
+    // `commit_step` with that exact status, whatever token the flagged row holds (the filler
+    // -1, a real id, a padding id or an id outside the head).
+    for status in [1, 2, 4, 8, 1 | 2, 4 | 8, 16] {
+        for token in [-1, 0, 7, 248_077, 248_100, 248_320] {
+            assert_eq!(
+                decide(pair(token, status), 248_077),
+                Decision::Commit { token: 0, status },
+                "status {status:#x} token {token}"
+            );
+        }
+    }
+}
+
+#[test]
+fn a_clean_row_at_the_sampler_bound_is_a_bad_token() {
+    // The sampler width is exclusive: 248_076 is the last id it holds, while 248_077 (the
+    // width itself, the first padding row of the head) and any negative token are bad.
+    let width = sampler_width(VOCAB, 248_077);
+    assert_eq!(
+        decide(pair(248_076, 0), width),
+        Decision::Commit {
+            token: 248_076,
+            status: 0
+        }
+    );
+    assert_eq!(decide(pair(248_077, 0), width), Decision::BadToken(248_077));
+    assert_eq!(decide(pair(-1, 0), width), Decision::BadToken(-1));
 }

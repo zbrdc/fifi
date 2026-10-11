@@ -2,7 +2,7 @@
  * RD-4c: embedding row gather of the resident Qwen3.6 decode step (decision 0047).
  *
  * Design guidance only, no code copied. Idea from MegaCapybara v1.35 static RE,
- * research/megacapybara-re-lessons.md section 6.1 C17 (the embedding table stays on the device and the
+ * the MegaCapybara static-RE lessons, C17 (the embedding table stays on the device and the
  * token id is read there, so a captured step needs no host-known token). The code is original CUDA C
  * for sm_86 (sm_72 compiles), written from the tile layout of this repository (vendor repack.cu and
  * mma884.cuh, the user's own xavier-qwen code).

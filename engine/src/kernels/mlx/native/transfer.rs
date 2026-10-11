@@ -2,7 +2,7 @@
 //!
 //! Both directions are resident paths. Any native failure is terminal: the copied array may still
 //! be in flight, so the adapter keeps it allocated (see "Native failure policy" in
-//! `docs/design/kernels.md`).
+//! the kernels design).
 
 use super::{
     Context, State, ffi,

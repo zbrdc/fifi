@@ -1,6 +1,6 @@
 //! One generation job: the prompt, the generation state, and the bounded output channel.
 //!
-//! Design: `docs/design/scheduler.md` ("Threads and channels"). A job carries portable data only.
+//! Design: the scheduler design ("Threads and channels"). A job carries portable data only.
 //!
 //! Terminal events: the output channel holds `EVENT_CAPACITY` events. The engine sends a data
 //! event (a batch) only while at least two slots are free, so the last slot always remains for

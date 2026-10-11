@@ -681,5 +681,5 @@
     "rustdocs": "Unavailable in the session; inspected official crate archives and pinned upstream source.",
     "metal_preprocess": "passed; __METAL_VERSION__ reports 400 for deployment target 26.5"
   },
-  "environment_update": "docs/environment/metal-toolchain.json"
+  "environment_update": "the Metal toolchain environment record"
 }

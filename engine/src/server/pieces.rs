@@ -1,6 +1,6 @@
 //! Maps the events of the tool-call and think-block parser to the parts of a reply.
 //!
-//! Contract: `docs/design/server.md` ("Streaming format"). The parser in `tokenizer::toolcall`
+//! Contract: the server design ("Streaming format"). The parser in `tokenizer::toolcall`
 //! (decision 0025) owns the grammar: the think and call markers, the trimming of sections, the
 //! types of the arguments, and the check of a call body. This module owns only what the reply
 //! does with each parser event:

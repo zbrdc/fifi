@@ -1,7 +1,7 @@
 //! Message and tool validation for chat requests.
 //!
 //! Contract: `ChatMessage`, `ToolCall`, `Tool`, and `ToolChoice` in `api/openapi.yaml`, and the
-//! section "Tool requests and message roles" of `docs/design/server.md`.
+//! section "Tool requests and message roles" of the server design.
 //! Every failure is a `BadRequest` that names the field.
 //!
 //! `name` is not a member of `ChatMessage`, and the contract permits extra members.

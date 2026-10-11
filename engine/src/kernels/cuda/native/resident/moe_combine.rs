@@ -3,7 +3,7 @@
 //! `allow(unsafe_code)` of `native.rs` (decision 0047, child modules of `native.rs`).
 //!
 //! Design guidance only, no code copied. Ideas from MegaCapybara v1.35 static RE,
-//! `research/megacapybara-re-lessons.md` section 6.1 C6 and C8.
+//! the MegaCapybara static-RE lessons, C6 and C8.
 //!
 //! Safety invariants this file relies on:
 //! - The launch entry is called only through `CudaContext::launch_on`, on the thread that owns the

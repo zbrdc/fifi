@@ -1738,7 +1738,7 @@ fn failed_embedding_rows_synchronization_retains_pending_arrays() {
 }
 
 // A completed-host call recovers when its synchronization succeeds. See "Native failure policy"
-// in `docs/design/kernels.md`. The injected failure takes the first matching call only.
+// in the kernels design. The injected failure takes the first matching call only.
 fn assert_host_failure_recovers(
     test: &str,
     fault: &str,

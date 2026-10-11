@@ -57,7 +57,7 @@
 //!
 //! Design guidance only, no code copied; the per-component sizing follows the idea of
 //! MegaCapybara C4, and the slot-indexed DeltaNet pool is the addressing hook of C12
-//! (research/megacapybara-re-lessons.md section 6.1).
+//! (the MegaCapybara static-RE lessons).
 
 use super::dims::{KvMode, StepDims, StepOptions};
 use crate::{

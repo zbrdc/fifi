@@ -1,6 +1,6 @@
 //! Process-wide serialization, ownership, and failure state of the native adapter.
 //!
-//! Failure policy. See "Native failure policy" in `docs/design/kernels.md`.
+//! Failure policy. See "Native failure policy" in the kernels design.
 //!
 //! - A failure with unknown completion is terminal. The adapter calls [`mark_failed`] before any
 //!   temporary array can drop, so `Array::drop` retains the array instead of freeing it

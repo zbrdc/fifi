@@ -309,7 +309,7 @@ impl Q36Executor {
         let config = std::fs::read(artifact.join("config.json"))
             .map_err(|error| io_error("config.json", &error))?;
         // The rules are checked against the shape from `config.json` before any shard opens, so a
-        // refused rule costs no load (CLAUDE.md: enforce the memory plan at engine load).
+        // refused rule costs no load (the project rules: enforce the memory plan at engine load).
         admit(&shape_of(&config)?, &rules)?;
         let ckpt: &'static StreamedCheckpoint = Box::leak(Box::new(open_checkpoint(artifact)?));
         let host = HostWeights::load(ckpt, &QWEN3_6_35B_A3B, &config)?;

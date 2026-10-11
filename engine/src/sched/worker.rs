@@ -1,7 +1,7 @@
 //! The engine worker: one OS thread per engine, one generation at a time.
 //!
-//! Design: `docs/design/scheduler.md` ("Threads and channels", "Engine lifecycle") and
-//! `docs/design/family-descriptor.md` ("Executor trait", the worker call order).
+//! Design: the scheduler design ("Threads and channels", "Engine lifecycle") and
+//! the family descriptor design ("Executor trait", the worker call order).
 //! The worker is generic over `ExecutorOps`, so Linux tests run it on the scripted fake.
 //!
 //! Panic safety: the whole thread body runs under one `catch_unwind`. The executor, its session,

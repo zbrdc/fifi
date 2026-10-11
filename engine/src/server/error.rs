@@ -1,6 +1,6 @@
 //! Request failures and their HTTP form.
 //!
-//! The table "Error codes" in `docs/design/server.md` is normative.
+//! The table "Error codes" in the server design is normative.
 //! `EngError` stays unchanged. This wrapper adds the three variants that only the server needs.
 
 use crate::EngError;

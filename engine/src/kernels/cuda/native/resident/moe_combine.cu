@@ -2,7 +2,7 @@
  * RD-4e: MoE combine of the resident Qwen3.6 decode step (decision 0047).
  *
  * Design guidance only, no code copied. Ideas from MegaCapybara v1.35 static RE,
- * research/megacapybara-re-lessons.md section 6.1 C6 (stop-fusing rule: keep the combine a small
+ * the MegaCapybara static-RE lessons, C6 (stop-fusing rule: keep the combine a small
  * separate kernel in stage 1) and C8 (sum the picks in a fixed order in registers so that the result
  * does not depend on scheduling). The code is original CUDA C for sm_86 (sm_72 compiles), written from
  * the shapes of this repository and the graph of the pinned llama.cpp (qwen35moe, build_moe_ffn).

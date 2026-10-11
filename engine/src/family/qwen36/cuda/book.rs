@@ -37,7 +37,7 @@
 //!    cross-stream path.
 //!
 //! Design guidance only, no code copied; the strict per-component accounting follows the idea of
-//! MegaCapybara C4 and the slot-indexed state is the C12 hook (research/megacapybara-re-lessons.md
+//! MegaCapybara C4 and the slot-indexed state is the C12 hook (the MegaCapybara static-RE lessons
 //! section 6.1).
 
 use std::fmt;

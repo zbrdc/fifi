@@ -6,7 +6,7 @@
 //! (file sha256 `0061131b615c5721fc88a78feeb22c1f8c450f1c2646a317d80796a653bf595c`).
 //! Each grid entry packs eight (or four) unsigned byte weights in little-endian order.
 //! The dequantization logic that uses them is original code in `gguf_dequant.rs`.
-//! The script `qualification/gguf-dequant/gen_tables.py` generated this file.
+//! The GGUF dequantization qualification harness (`gen_tables.py`) generated this file.
 //!
 //! llama.cpp and ggml are distributed under the MIT license:
 //!

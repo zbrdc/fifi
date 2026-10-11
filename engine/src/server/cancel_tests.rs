@@ -1,6 +1,6 @@
 //! Tests of cancellation through the whole stack: client, router, handler, pump, and engine thread.
 //!
-//! Rules: `docs/design/server.md` ("Streaming format"). A client disconnect cancels the job. A job
+//! Rules: the server design ("Streaming format"). A client disconnect cancels the job. A job
 //! whose bounded output channel is full with no reader is cancelled. Neither case sends `[DONE]`
 //! or an error event.
 

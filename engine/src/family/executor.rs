@@ -1,6 +1,6 @@
 //! Crate-internal executor seam: the `ExecutorOps` trait and the per-job `GenerationState`.
 //!
-//! Design: `docs/design/family-descriptor.md` ("Executor trait"), decision 0033.
+//! Design: the family descriptor design ("Executor trait"), decision 0033.
 //! The scripted test fake lives in `crate::exec_fake`.
 
 use crate::EngError;

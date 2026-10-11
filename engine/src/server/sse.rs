@@ -1,6 +1,6 @@
 //! Server-sent events for a streaming chat completion.
 //!
-//! Format: `docs/design/server.md` ("Streaming format"). The response headers and the role chunk
+//! Format: the server design ("Streaming format"). The response headers and the role chunk
 //! go out when the queue admits the job, before prefill starts. A keep-alive comment follows every
 //! quiet interval, so that a long prefill does not trip a client timeout. Think text goes to
 //! `reasoning_content`. A tool call goes out as two entries when it is complete. The last chunk

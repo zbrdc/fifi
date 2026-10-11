@@ -14,7 +14,7 @@
 //! | `attention.rs` | The resident dense-attention caller. |
 //! | `pages.rs` | Caller-owned host pages and their in-place import (decision 0041). |
 //!
-//! Failure policy. See "Native failure policy" in `docs/design/kernels.md` and `guard.rs`.
+//! Failure policy. See "Native failure policy" in the kernels design and `guard.rs`.
 
 #![allow(unsafe_code)]
 

@@ -60,7 +60,7 @@ async fn health() -> Json<serde_json::Value> {
     Json(json!({"status": "ok"}))
 }
 
-/// Only this handler builds the `not_ready` body (`docs/design/server.md`, "Error codes").
+/// Only this handler builds the `not_ready` body (the server design, "Error codes").
 /// It logs each new engine failure before the readiness check, so a failed engine is logged once
 /// even when another engine makes the answer 200.
 async fn ready(State(state): State<Arc<AppState>>) -> Response {

@@ -89,6 +89,21 @@ pub(super) struct StepWidths {
     pub(super) verdict: usize,
 }
 
+/// Refuses a token id outside the sampler vocabulary before any device write. The embedding
+/// table is padded to `head_rows` rows and its own guard refuses only ids at or above the table,
+/// so an id in `sampler_vocab..head_rows` (a padding row inside the table) would embed and run;
+/// the argmax can never choose such an id, so the host input is refused here instead (R-3
+/// report, section 5). `sampler_width` is the width the step wires in (`StepWidths`), never the
+/// padded head width.
+pub(super) fn check_token_id(token: u32, sampler_width: usize) -> Result<(), EngError> {
+    if usize::try_from(token).is_ok_and(|token| token >= sampler_width) {
+        return Err(EngError::BadRequest(format!(
+            "token id {token} is outside the sampler vocabulary 0..{sampler_width}"
+        )));
+    }
+    Ok(())
+}
+
 /// Every refusal `QwenResidentStep::new` makes before it touches the context, in one pure seam:
 /// the session options ([`check_stage1_options`]), then the head width ([`check_vocab`]), then
 /// the widths the step wires in. The step itself needs a `CudaContext` and cannot run on the

@@ -88,7 +88,7 @@ components:
               description: >-
                 Stable machine code for the failure class. The mapping from
                 EngError variant to code is normative and lives in
-                docs/design/server.md, section Error codes. Only the /ready
+                the server design, section Error codes. Only the /ready
                 handler produces not_ready. No chat route returns it.
               enum:
                 - bad_request
@@ -916,7 +916,7 @@ paths:
               $ref: "#/components/schemas/SessionSpec"
       responses:
         "201":
-          description: Session created. Phase 1 does not ship this route (docs/design/server.md, Phase 1 session scope).
+          description: Session created. Phase 1 does not ship this route (the server design, Phase 1 session scope).
           content:
             application/json:
               schema:
@@ -947,7 +947,7 @@ paths:
         "401":
           $ref: "#/components/responses/Unauthorized"
         "200":
-          description: The session. Phase 1 does not ship this route (docs/design/server.md, Phase 1 session scope).
+          description: The session. Phase 1 does not ship this route (the server design, Phase 1 session scope).
           content:
             application/json:
               schema:
@@ -958,7 +958,7 @@ paths:
       operationId: deleteSession
       summary: Delete one session
       description: Drops the held state and its memory reservation.
-        Phase 1 does not ship this route (docs/design/server.md, Phase 1 session scope).
+        Phase 1 does not ship this route (the server design, Phase 1 session scope).
         Deletes the disk snapshot when no other session references it.
       responses:
         "204":

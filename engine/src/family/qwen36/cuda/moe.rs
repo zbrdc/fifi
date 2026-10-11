@@ -671,7 +671,7 @@ impl MoeBuffers<'_> {
 }
 
 /// The context and the one owned stream the block queues on. Grouping them keeps every function
-/// of this file at four arguments or fewer (AGENTS.md).
+/// of this file at four arguments or fewer (the project rules).
 pub(super) struct Launch<'a> {
     /// The adapter that owns every buffer of the block.
     pub(super) ctx: &'a CudaContext,

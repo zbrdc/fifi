@@ -2,7 +2,7 @@
  * RD-4a: launch entry of the vendored add_rmsnorm_pack (RD-4V, with the norm_out patch).
  *
  * Design guidance only, no code copied. Idea from MegaCapybara v1.35 static RE,
- * research/megacapybara-re-lessons.md section 6.1 C6 (fuse the residual add, the RMSNorm and the
+ * the MegaCapybara static-RE lessons, C6 (fuse the residual add, the RMSNorm and the
  * fp16 pack so the activations make one trip through memory). The kernel is the user's own
  * xavier-qwen code (MIT); this file only validates, zeroes the fragment-order xf like
  * inference_cuda_pack_launch and makes one kern:: call on the given stream.

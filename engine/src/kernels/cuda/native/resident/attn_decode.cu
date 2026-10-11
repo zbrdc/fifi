@@ -2,7 +2,7 @@
  * RD-8b: decode attention of the resident Qwen3.6 decode step (decision 0047).
  *
  * Design guidance only, no code copied. Idea from MegaCapybara v1.35 static RE,
- * research/megacapybara-re-lessons.md section 6.1 C10 (split-KV decode attention with a
+ * the MegaCapybara static-RE lessons, C10 (split-KV decode attention with a
  * fixed-order combine and a tuned minimum number of keys per split); the technique is also public
  * (Flash-Decoding, Dao et al. 2023). The cache layout and the q/gate row layout are those of the
  * vendored attn_prep (the user's own xavier-qwen code, RD-4V). The code is original CUDA C for

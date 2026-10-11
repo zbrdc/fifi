@@ -55,7 +55,7 @@
 //! the two causes apart.
 //!
 //! Design guidance only, no code copied; the per-component accounting and the plan print follow
-//! the idea of MegaCapybara C4 (research/megacapybara-re-lessons.md section 6.1).
+//! the idea of MegaCapybara C4 (the MegaCapybara static-RE lessons).
 
 use std::fmt;
 

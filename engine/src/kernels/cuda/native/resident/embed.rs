@@ -4,7 +4,7 @@
 //! (decision 0047, child modules of `native.rs`).
 //!
 //! Design guidance only, no code copied. Idea from MegaCapybara v1.35 static RE,
-//! `research/megacapybara-re-lessons.md` section 6.1 C17.
+//! the MegaCapybara static-RE lessons, C17.
 //!
 //! Safety invariants this module relies on:
 //! - A device range is proved in bounds by `RawRange::new` before it gets here. This module

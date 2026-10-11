@@ -1,6 +1,6 @@
 //! Completed-host operations: stage private copies, run, synchronize once, and return host bytes.
 //!
-//! Failure policy. See "Native failure policy" in `docs/design/kernels.md`.
+//! Failure policy. See "Native failure policy" in the kernels design.
 //! A failed synchronization leaves completion unknown. That failure is terminal, and the state keeps
 //! the pending work with its staging, arrays, stream, device, and lease. After a successful
 //! synchronization no native work is in flight and no handle outlives the call. A dispatch or

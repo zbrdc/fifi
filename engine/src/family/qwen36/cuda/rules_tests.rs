@@ -1,7 +1,7 @@
 //! Unit tests of the executor rules (test seam U13). CPU only.
 use super::{
     dims::{KvMode, StepOptions},
-    rules::{QwenRules, check_vocab, validate_step_inputs},
+    rules::{QwenRules, check_token_id, check_vocab, validate_step_inputs},
 };
 use crate::EngError;
 
@@ -100,4 +100,34 @@ fn validate_step_inputs_names_the_sampler_vocabulary_at_both_sites() {
     let widths = validate_step_inputs(&options(false), SAMPLER_VOCAB, &square).expect("widths");
     assert_eq!(widths.argmax_n, SAMPLER_VOCAB);
     assert_eq!(widths.verdict, SAMPLER_VOCAB);
+}
+
+#[test]
+fn check_token_id_accepts_every_id_inside_the_sampler_vocabulary() {
+    assert!(check_token_id(0, SAMPLER_VOCAB).is_ok());
+    // 248_076: the last id the sampler can draw.
+    assert!(check_token_id(SAMPLER_VOCAB as u32 - 1, SAMPLER_VOCAB).is_ok());
+}
+
+#[test]
+fn check_token_id_refuses_the_padding_and_head_ids_naming_the_id() {
+    // 248_077 is the first padding row INSIDE the padded table (the R-3 poison path), 248_319
+    // the last padded row, 248_320 the first row above the table.
+    for id in [
+        SAMPLER_VOCAB as u32,
+        HEAD_ROWS as u32 - 1,
+        HEAD_ROWS as u32,
+        u32::MAX,
+    ] {
+        match check_token_id(id, SAMPLER_VOCAB) {
+            Err(EngError::BadRequest(message)) => {
+                assert!(
+                    message.contains(&format!("token id {id}")),
+                    "id {id}: {message}"
+                );
+                assert!(message.contains("sampler vocabulary"), "id {id}: {message}");
+            }
+            other => panic!("id {id} must be refused before any device write: {other:?}"),
+        }
+    }
 }

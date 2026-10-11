@@ -717,7 +717,7 @@ mod tests {
     use crate::family::qwen36::fixtures::val;
     use crate::family::spec::QWEN3_6_35B_A3B;
 
-    // The fixtures below follow `qualification/q36/oracle/q36_oracle.py`. Weights come from `val`, an
+    // The fixtures below follow the Q36 oracle script (`q36_oracle.py`). Weights come from `val`, an
     // integer hash with dyadic results, so the Rust tests and the f64 oracle hold identical values.
 
     fn vals(tag: u64, n: usize) -> Vec<f32> {

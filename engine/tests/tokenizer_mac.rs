@@ -17,7 +17,7 @@ const TOKENIZER_CONFIG_SHA256: &str =
     "e98f1901ac6f0adff67b1d540bfa0c36ac1a0cf59eb72ed78146ef89aafa1182";
 const CHAT_TEMPLATE_SHA256: &str =
     "e84f32a23fdda27689f868aa4a1a5621f41133e51a48d7f3efcbea2839574259";
-// Hash from docs/environment/mac-phase0a.json (generation_config.json, 202 bytes).
+// Hash from `engine/testdata/mac-phase0a.json` (generation_config.json, 202 bytes).
 const GENERATION_CONFIG_SHA256: &str =
     "e70c136c1b78ddc1fb0905bac8e733a4dc448d4f852a5dd75143fffc70be550e";
 

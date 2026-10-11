@@ -23,9 +23,9 @@ use crate::{EngError, kernels::cuda::resident::step_params::ResultPair};
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum Decision {
     /// Hand the pair's status to `commit_step`. A clean status commits and yields `token`; a
-    /// non-zero status is refused there (the state is poisoned). `token` is 0 and unused when the
-    /// status is not clean: the filler token of a flagged row never reaches the sampler.
-    Commit { token: u32 },
+    /// non-zero status is refused there (the state is poisoned). `token` is 0 and unused when
+    /// the status is not clean: the filler token of a flagged row never reaches the sampler.
+    Commit { token: u32, status: i32 },
     /// A clean status with a token outside `0..vocab`: poison, commit nothing.
     BadToken(i32),
 }
@@ -33,11 +33,14 @@ pub(super) enum Decision {
 /// Maps the status before the token: a flagged row is never judged by its token.
 pub(super) fn decide(pair: ResultPair, vocab: usize) -> Decision {
     if pair.status.0 != 0 {
-        return Decision::Commit { token: 0 };
+        return Decision::Commit {
+            token: 0,
+            status: pair.status.0,
+        };
     }
     match u32::try_from(pair.token) {
         Ok(token) if usize::try_from(token).is_ok_and(|id| id < vocab) => {
-            Decision::Commit { token }
+            Decision::Commit { token, status: 0 }
         }
         _ => Decision::BadToken(pair.token),
     }
@@ -69,4 +72,13 @@ pub(super) fn action_for(entered: usize) -> FailureAction {
     } else {
         FailureAction::Poison
     }
+}
+
+/// A synchronize error after op `entered` arrived means that op was QUEUED and the device
+/// faulted, but `entered` still counts only the ops that ran: with `entered == 1` the failure
+/// rule of [`action_for`] would read "the first op refused to launch, nothing ran" and take the
+/// step back. The failed sync counts as having entered the next op, so the rule poisons.
+#[must_use]
+pub(super) fn entered_after_failed_sync(entered: usize) -> usize {
+    entered + 1
 }

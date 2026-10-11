@@ -1,6 +1,6 @@
 //! The engines that the server routes to, and the shared state of the routes.
 //!
-//! Routing rules: `docs/design/scheduler.md` ("Request flow") and `docs/design/server.md`
+//! Routing rules: the scheduler design ("Request flow") and the server design
 //! ("Session handling"). Phase 1 has anonymous sessions only.
 
 use super::error::ServerError;
@@ -15,7 +15,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, PoisonError};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-/// The quiet time after which a stream sends a keep-alive comment (`docs/design/server.md`).
+/// The quiet time after which a stream sends a keep-alive comment (the server design).
 const KEEP_ALIVE: Duration = Duration::from_secs(15);
 
 /// One engine as the routes see it.

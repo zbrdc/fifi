@@ -266,7 +266,7 @@ const QWEN3_8_FLASH_NEXT_LAYERS: [AttentionKind; 48] = [
 /// The Flash-Next family: `Qwen/Qwen3.8-Flash-Next`, model type `qwen4_exp`.
 ///
 /// The values come from the pinned artifact `config.json` (see
-/// `docs/design/flash-next-executor.md` and `docs/environment/flashnext-pin.json`).
+/// the Flash-Next executor design and the environment record).
 /// The configuration names the root model type `qwen4_exp` and the `text_config`
 /// model type `qwen4_exp_text`, so both belong to the family.
 pub const QWEN3_8_FLASH_NEXT: FamilySpec = FamilySpec {

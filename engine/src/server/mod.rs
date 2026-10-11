@@ -1,6 +1,6 @@
 //! The HTTP server: authentication, validation, routing, and reply writers.
 //!
-//! Design: `docs/design/server.md`. Contract: `api/openapi.yaml`.
+//! Design: the server design. Contract: `api/openapi.yaml`.
 //! Decision 0043 fixes the dependency set, the hand-written wire types, and the error wrapper.
 
 mod auth;

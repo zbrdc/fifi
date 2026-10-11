@@ -1,5 +1,5 @@
 {
- "x-source-sha256": "f528d625a5fa0a824bdb0bc4626d240cde2bea84d79d9e1a9ae72cf34723255f",
+ "x-source-sha256": "d34a868945f5bde0293dd1f104a713eead5958b9e961a96544a39466961f4545",
  "components": {
   "securitySchemes": {
    "apiKey": {
@@ -99,7 +99,7 @@
        },
        "code": {
         "type": "string",
-        "description": "Stable machine code for the failure class. The mapping from EngError variant to code is normative and lives in docs/design/server.md, section Error codes. Only the /ready handler produces not_ready. No chat route returns it.",
+        "description": "Stable machine code for the failure class. The mapping from EngError variant to code is normative and lives in the server design, section Error codes. Only the /ready handler produces not_ready. No chat route returns it.",
         "enum": [
          "bad_request",
          "unauthorized",
@@ -1329,7 +1329,7 @@
     },
     "responses": {
      "201": {
-      "description": "Session created. Phase 1 does not ship this route (docs/design/server.md, Phase 1 session scope).",
+      "description": "Session created. Phase 1 does not ship this route (the server design, Phase 1 session scope).",
       "content": {
        "application/json": {
         "schema": {
@@ -1379,7 +1379,7 @@
       "$ref": "#/components/responses/Unauthorized"
      },
      "200": {
-      "description": "The session. Phase 1 does not ship this route (docs/design/server.md, Phase 1 session scope).",
+      "description": "The session. Phase 1 does not ship this route (the server design, Phase 1 session scope).",
       "content": {
        "application/json": {
         "schema": {
@@ -1396,7 +1396,7 @@
    "delete": {
     "operationId": "deleteSession",
     "summary": "Delete one session",
-    "description": "Drops the held state and its memory reservation. Phase 1 does not ship this route (docs/design/server.md, Phase 1 session scope). Deletes the disk snapshot when no other session references it.",
+    "description": "Drops the held state and its memory reservation. Phase 1 does not ship this route (the server design, Phase 1 session scope). Deletes the disk snapshot when no other session references it.",
     "responses": {
      "204": {
       "description": "Session deleted."

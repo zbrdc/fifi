@@ -299,6 +299,15 @@ fn prefill(step: &mut QwenResidentStep<'_>, x: &RunInputs<'_>) -> Result<u32, En
     Ok(last)
 }
 
+/// The row buffers and `fed`, allocated BEFORE `PhaseTimer::start` so no allocation sits
+/// inside a timed region (RD-10a-17b item 3): one zeroed logits row per timed step and the
+/// fed vector at its full capacity.
+fn alloc_rows(step: &QwenResidentStep<'_>) -> (Vec<Vec<u8>>, Vec<u32>) {
+    let row_len = step.row_bytes().len();
+    let rows: Vec<Vec<u8>> = (0..N_STEPS).map(|_| vec![0u8; row_len]).collect();
+    (rows, Vec::with_capacity(N_STEPS))
+}
+
 /// One run: the prefill, then the 128 timed steps; on deadline expiry the region reports how
 /// many steps completed and the caller writes the incomplete document.
 fn timed_region(
@@ -309,11 +318,7 @@ fn timed_region(
 ) -> Result<Region, EngError> {
     let last_prompt = prefill(step, x)?;
     let prompt_synced = unix_ns()?;
-    // The ~127 MB of row buffers and `fed` are allocated BEFORE the timer starts, so no
-    // allocation sits inside a timed region (RD-10a-17b item 3).
-    let row_len = step.row_bytes().len();
-    let mut rows: Vec<Vec<u8>> = (0..N_STEPS).map(|_| vec![0u8; row_len]).collect();
-    let mut fed: Vec<u32> = Vec::with_capacity(N_STEPS);
+    let (mut rows, mut fed) = alloc_rows(step);
     let mut timer = PhaseTimer::start(MonotonicClock::new());
     let timed_start = unix_ns()?;
     let (mut prev, mut syncs, mut host_writes) = (0u32, 0u64, 0u64);
@@ -734,21 +739,74 @@ mod tests {
 
     #[test]
     fn the_row_buffers_are_allocated_before_the_timer_starts() {
+        // The allocations live in the helper: one zeroed row per timed step and the fed
+        // vector, both produced before the timer starts and the timed_start stamp.
+        let helper = pinned_text(fn_section("fn alloc_rows("));
+        let helper_len = helper.len();
+        for allocation in ["vec![0u8; row_len]", "Vec::with_capacity(N_STEPS)"] {
+            assert!(
+                helper.contains(allocation),
+                "alloc_rows ({helper_len} bytes) does not allocate {allocation}"
+            );
+        }
         let body = pinned_text(fn_section("fn timed_region("));
         let length = body.len();
+        let helper_call = body.find("alloc_rows(step)").unwrap_or_else(|| {
+            panic!("timed_region ({length} bytes) never takes alloc_rows(step)")
+        });
         let timer = body
             .find("PhaseTimer::start")
             .unwrap_or_else(|| panic!("timed_region ({length} bytes) has no PhaseTimer::start"));
-        for allocation in ["vec![0u8; row_len]", "Vec::with_capacity(N_STEPS)"] {
-            let at = body.find(allocation).unwrap_or_else(|| {
-                panic!("timed_region ({length} bytes) does not allocate {allocation}")
-            });
+        let stamp = body
+            .find("timed_start = unix_ns")
+            .unwrap_or_else(|| panic!("timed_region ({length} bytes) never stamps timed_start"));
+        assert!(
+            helper_call < timer && helper_call < stamp,
+            "the alloc_rows call ({helper_call}) sits inside the timed region (the timer \
+             starts at {timer}, the timed_start stamp is at {stamp})"
+        );
+        // The loop must use the helper's own bindings, and nothing may rebuild them or
+        // allocate anywhere in the timed region: the raw forms live in alloc_rows only.
+        for used in ["rows.iter_mut()", "fed.push("] {
+            let at = body
+                .find(used)
+                .unwrap_or_else(|| panic!("the timed loop ({length} bytes) does not use {used}"));
             assert!(
-                at < timer,
-                "the allocation {allocation} ({at}) sits inside the timed region \
-                 (the timer starts at {timer})"
+                helper_call < at,
+                "the loop uses {used} ({at}) before alloc_rows produced it ({helper_call})"
             );
         }
+        for stray in ["vec![0u8", "Vec::with_capacity", "rows =", "fed ="] {
+            assert!(
+                !body.contains(stray),
+                "the timed region ({length} bytes) builds {stray} instead of taking alloc_rows"
+            );
+        }
+        assert!(
+            !body[timer..].contains("alloc_rows"),
+            "the timed region calls alloc_rows again after the timer starts"
+        );
+    }
+
+    #[test]
+    fn the_sync_each_refusal_is_propagated_before_any_device_call() {
+        let body = pinned_text(fn_section("fn device_gate("));
+        let length = body.len();
+        // The pin demands the propagated call itself: a commented-out call is stripped with
+        // its comment, and a dead `let _ = refuse_sync_each(sync_each);` binding carries no
+        // `?` behind the closing parenthesis, so neither of them satisfies the pin.
+        let refusal = body
+            .find("refuse_sync_each(sync_each)?")
+            .unwrap_or_else(|| {
+                panic!("device_gate ({length} bytes) never propagates the refuse_sync_each refusal")
+            });
+        let device = body
+            .find("CudaProjector::new")
+            .unwrap_or_else(|| panic!("device_gate ({length} bytes) never opens the device"));
+        assert!(
+            refusal < device,
+            "the sync-each refusal ({refusal}) runs after the device work ({device})"
+        );
     }
 
     #[test]

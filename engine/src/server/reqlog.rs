@@ -1,6 +1,6 @@
 //! The request log: one JSON line on standard error for each chat request that has a prompt.
 //!
-//! Rules: `docs/design/server.md` ("Request log"). The log shows counts, timings, and codes. It
+//! Rules: the server design ("Request log"). The log shows counts, timings, and codes. It
 //! never shows prompt text, reply text, a key, or a header value. `RequestLog` follows one request.
 //! The line goes out once, when the request ends. A request that the client abandons ends when its
 //! `RunningJob` drops, and its line says `cancelled`.

@@ -17,7 +17,7 @@
 //! exclude each other.
 //!
 //! Design guidance only, no code copied; the single host wait per token follows the idea of
-//! MegaCapybara C1 (research/megacapybara-re-lessons.md section 6.1), without its ring.
+//! MegaCapybara C1 (the MegaCapybara static-RE lessons), without its ring.
 
 use super::run_report::{CaptureOutcome, RunReport};
 use crate::EngError;

@@ -38,13 +38,15 @@ use super::{
         GlobalSpecs, GlobalWeights, MoeSpecs, STEP_ROWS, StepResources, f32_bytes, moe_dims,
         moe_layer_weights,
     },
-    rules::{QwenRules, StepWidths, validate_step_inputs},
+    rules::{QwenRules, StepWidths, check_token_id, validate_step_inputs},
     run_report::RunReport,
     state::{ResidentState, StepField, export::ExportedState},
     state_layout::Word,
     step_ops::{StepOp, final_resid, resid_in, resid_out, token_ops},
     step_plan::Slot,
-    verdict::{Decision, FailureAction, action_for, bad_token_error, decide},
+    verdict::{
+        Decision, FailureAction, action_for, bad_token_error, decide, entered_after_failed_sync,
+    },
 };
 use crate::{
     EngError,
@@ -220,8 +222,10 @@ impl<'a> QwenResidentStep<'a> {
 
     /// Runs one token: feeds `token` at the next position, optionally reads the logits row back,
     /// and returns the token the device argmax chose. The row is in [`Self::row_bytes`] afterwards
-    /// when `want_logits` was true.
+    /// when `want_logits` was true. A `token` outside the sampler vocabulary (a padding row of
+    /// the padded head) is refused before any device write, so the state stays idle.
     pub(crate) fn run_token(&mut self, token: u32, want_logits: bool) -> Result<u32, EngError> {
+        check_token_id(token, self.widths.verdict)?;
         let plan = self.readback_plan(want_logits)?;
         // The start block is written at a committed boundary (the state is idle), then the step
         // is admitted; a refused write queues nothing.
@@ -232,16 +236,21 @@ impl<'a> QwenResidentStep<'a> {
             return Err(self.fail(entered, error));
         }
         let pair = self.read_back(&plan).inspect_err(|_| self.state.poison())?;
+        // The post-read-back decision is `decide`'s: a flagged row keeps a filler token and
+        // hands its exact status to `commit_step`, a clean row commits and yields its token,
+        // and a clean row with a token outside the sampler vocabulary poisons.
         let token = match decide(pair, self.widths.verdict) {
             Decision::BadToken(token) => {
                 self.state.poison();
                 return Err(bad_token_error(token));
             }
-            Decision::Commit { token } => token,
+            Decision::Commit { token, status } => {
+                // A non-zero status is refused here and poisons the state; the error has the
+                // class of the wrapper (4, 8, 1, 2 in that order).
+                self.state.commit_step(STEP_ROWS, status)?;
+                token
+            }
         };
-        // A non-zero status is refused here and poisons the state; the error has the class of
-        // the wrapper (4, 8, 1, 2 in that order).
-        self.state.commit_step(STEP_ROWS, pair.status.0)?;
         self.report = eager_report(&plan);
         Ok(token)
     }
@@ -252,8 +261,11 @@ impl<'a> QwenResidentStep<'a> {
         ReadbackPlan::new(self.res.dims.shape.vocab, want_logits)
     }
 
-    /// The start block of the step: the token, at the position of the committed rows.
+    /// The start block of the step: the token, at the position of the committed rows. A token
+    /// outside the sampler vocabulary is refused before `write_step_params`, so nothing is
+    /// written and the state is not poisoned by the refusal.
     fn write_start(&mut self, token: u32) -> Result<(), EngError> {
+        check_token_id(token, self.widths.verdict)?;
         let too_big = |what| EngError::BadRequest(format!("step: the {what} does not fit an i32"));
         let token = i32::try_from(token).map_err(|_| too_big("token"))?;
         let pos = i32::try_from(self.state.tokens()).map_err(|_| too_big("position"))?;
@@ -289,8 +301,15 @@ impl<'a> QwenResidentStep<'a> {
         for op in token_ops(self.res.table.len()) {
             *entered += 1;
             self.run_op(op, admit_pos, &bufs, params)?;
-            if self.sync_each {
-                self.stream.synchronize()?;
+            if self.sync_each
+                && let Err(error) = self.stream.synchronize()
+            {
+                // The op was queued and the sync error is a device fault, not a refused
+                // launch: `entered == 1` here would make `fail` treat the step as "nothing
+                // ran" and take it back, so the failed sync counts as having entered the
+                // next op and the failure rule poisons instead.
+                *entered = entered_after_failed_sync(*entered);
+                return Err(error);
             }
         }
         Ok(())

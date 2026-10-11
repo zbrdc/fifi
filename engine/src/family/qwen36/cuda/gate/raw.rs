@@ -152,4 +152,45 @@ mod tests {
             (json!(1), json!(2), json!(3))
         );
     }
+
+    #[test]
+    fn a_run_has_exactly_the_fields_the_evaluator_reads() {
+        let t = Timing {
+            decode_ns: 0,
+            replay_ns: 0,
+            readback_ns: 0,
+            host_ns: 0,
+            step_ns: vec![],
+        };
+        let m = RunMeta {
+            captured: false,
+            graph_ready_before_timed: false,
+            analysis_ns: 0,
+            syncs: 0,
+            host_writes: 0,
+            prompt_synced_unix_ns: 0,
+            timed_start_unix_ns: 0,
+            timed_end_unix_ns: 0,
+        };
+        let v = run_json(&m, &t, vec![]);
+        let mut keys: Vec<_> = v.as_object().unwrap().keys().cloned().collect();
+        keys.sort();
+        assert_eq!(
+            keys,
+            [
+                "analysis_ns",
+                "captured",
+                "decode_ns",
+                "graph_ready_before_timed",
+                "host_writes",
+                "phase_ns",
+                "prompt_synced_unix_ns",
+                "step_ns",
+                "steps",
+                "syncs",
+                "timed_end_unix_ns",
+                "timed_start_unix_ns",
+            ]
+        );
+    }
 }

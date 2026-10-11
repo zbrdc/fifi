@@ -4,7 +4,7 @@
 //! stage 1, RD-5).
 //!
 //! Design guidance only, no code copied. Idea from MegaCapybara v1.35 static RE,
-//! `research/megacapybara-re-lessons.md` section 6.1 C9 (route on the device so that the expert
+//! the MegaCapybara static-RE lessons, C9 (route on the device so that the expert
 //! ids never reach the host; the expert kernel reads them from device memory).
 //!
 //! [`CudaContext::router`] queues two kernels on a [`DeviceStream`] and returns. It allocates

@@ -2,7 +2,7 @@
 //!
 //! The fixture holds the pinned artifact `config.json` values recorded by the
 //! P0B-R3 inspection of `Qwen/Qwen3.8-Flash-Next-oQ4e-mtp`
-//! (`docs/environment/flashnext-pin.json`, `docs/design/flash-next-executor.md`).
+//! (the environment record, the Flash-Next executor design).
 
 use inference_engine::{
     EngError,

@@ -1,6 +1,6 @@
 //! Resident operations: inputs and outputs stay on the device as `ExecutionTensor` values.
 //!
-//! Failure policy. See "Native failure policy" in `docs/design/kernels.md`.
+//! Failure policy. See "Native failure policy" in the kernels design.
 //! Every native failure on this path is terminal, including a failure before submission. An output
 //! stays on the device and its inputs are shared, so the adapter cannot show that a failed call left
 //! no work in flight. Each failure branch calls `mark_failed` before the function returns, so no
@@ -2088,7 +2088,7 @@ mod cast_tests {
 #[cfg(test)]
 mod f32_only_tests {
     //! The wrappers that stay F32 only even with `allow_bf16` on (packet Q36-BF16-a fix; the rev
-    //! 55 text of `docs/design/kernels.md`): a BF16 operand of theirs is `BadRequest` with the
+    //! 55 text of the kernels design): a BF16 operand of theirs is `BadRequest` with the
     //! text that rejected it before the switch existed, because their native path is F32 by
     //! construction. These tests need the GPU.
 

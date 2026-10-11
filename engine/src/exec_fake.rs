@@ -1,7 +1,7 @@
 //! The scripted test fake of the executor seam.
 //!
 //! The trait and `GenerationState` live in `crate::family::executor`.
-//! Design: `docs/design/family-descriptor.md` ("Executor trait"), decision 0033.
+//! Design: the family descriptor design ("Executor trait"), decision 0033.
 
 use crate::EngError;
 use crate::family::executor::{ExecutorOps, GenerationState};

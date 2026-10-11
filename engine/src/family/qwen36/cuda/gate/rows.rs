@@ -47,8 +47,12 @@ pub(super) fn log_sum_exp(row: &[f32]) -> f64 {
         .ln()
 }
 
-/// The `k` largest entries, descending by logit, ties to the lower id. A NaN never ranks.
+/// The `k` largest entries, descending by logit, ties to the lower id. A NaN never ranks. A `k` of zero
+/// returns no pairs: the scan below compares against `best[k - 1]`, which would index before the start.
 pub(super) fn top_k(row: &[f32], k: usize) -> Vec<(u32, f32)> {
+    if k == 0 {
+        return Vec::new();
+    }
     let mut best: Vec<(u32, f32)> = Vec::with_capacity(k + 1);
     for (id, &v) in row.iter().enumerate() {
         if v.is_nan() || (best.len() == k && v <= best[k - 1].1) {
@@ -136,6 +140,17 @@ mod tests {
     }
 
     #[test]
+    fn lse_subtracts_the_max_before_the_exponential() {
+        // ln(e^100 + e^100) = 100 + ln 2.
+        assert!((log_sum_exp(&[100.0, 100.0]) - (100.0 + std::f64::consts::LN_2)).abs() < 1e-9);
+        // Above 88.0, where a plain f32 exp overflows; 1000 is beyond f64's exp domain too, so the
+        // unstabilized form returns +inf while the max-subtracted form stays exact.
+        let got = log_sum_exp(&[1000.0, 999.0]);
+        let want = 1000.0 + (1.0 + std::f64::consts::E.recip()).ln();
+        assert!((got - want).abs() < 1e-9, "got {got}, want {want}");
+    }
+
+    #[test]
     fn lse_of_non_finite_rows_is_not_finite() {
         assert!(log_sum_exp(&[1.0, f32::NAN]).is_nan());
         assert_eq!(log_sum_exp(&[1.0, f32::INFINITY]), f64::INFINITY);
@@ -148,6 +163,12 @@ mod tests {
         assert_eq!(&ids[..8], &[10, 11, 23, 900, 840, 990, 6, 338]);
         assert_eq!(top.len(), 32);
         assert!(top.windows(2).all(|w| w[0].1 >= w[1].1));
+    }
+
+    #[test]
+    fn top_k_of_zero_is_empty_for_any_row() {
+        assert!(top_k(&[1.0, 2.0, 3.0], 0).is_empty());
+        assert!(top_k(&[], 0).is_empty());
     }
 
     #[test]

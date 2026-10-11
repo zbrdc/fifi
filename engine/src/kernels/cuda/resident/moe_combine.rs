@@ -2,7 +2,7 @@
 //! plus the optional gated shared term, in one launch (decision 0047, stage 1, RD-4e).
 //!
 //! Design guidance only, no code copied. Ideas from MegaCapybara v1.35 static RE,
-//! `research/megacapybara-re-lessons.md` section 6.1 C6 (a small separate combine kernel in
+//! the MegaCapybara static-RE lessons, C6 (a small separate combine kernel in
 //! stage 1; fusion into the expert kernel is RD-6b) and C8 (sum the picks in a fixed order in
 //! registers so that the result does not depend on scheduling).
 //!

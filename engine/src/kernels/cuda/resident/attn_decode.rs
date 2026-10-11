@@ -1,7 +1,7 @@
 //! Safe launch wrapper of the split-KV decode attention kernel (RD-8b, decision 0047, seam 1).
 //!
 //! Design guidance only, no code copied: the idea is split-KV decode attention with a fixed-order
-//! combine (MegaCapybara v1.35 static RE, `research/megacapybara-re-lessons.md` section 6.1 C10).
+//! combine (the MegaCapybara v1.35 static-RE lessons, C10).
 //!
 //! [`CudaContext::attn_decode`] queues two kernels on a [`DeviceStream`] and returns: the part
 //! kernel gives every (split, kv head, token) block one partial softmax of its key range, and the

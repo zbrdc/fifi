@@ -1,7 +1,7 @@
 //! The embedding row gather of the resident step (RD-4c, decision 0047, stage 1).
 //!
 //! Design guidance only, no code copied. Idea from MegaCapybara v1.35 static RE,
-//! `research/megacapybara-re-lessons.md` section 6.1 C17: the embedding table stays on the device
+//! the MegaCapybara static-RE lessons, C17: the embedding table stays on the device
 //! and the token id is read there, so a captured step needs no host-known token. The host-table
 //! variant of C17 stays deferred.
 //!

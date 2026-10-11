@@ -1,6 +1,6 @@
 //! The chat completion handler: `POST /v1/chat/completions`.
 //!
-//! Request flow: `docs/design/server.md` ("Request lifecycle"). The handler reads the body, validates
+//! Request flow: the server design ("Request lifecycle"). The handler reads the body, validates
 //! it, picks the engine, renders and tokenizes the prompt, submits the job, and writes the reply.
 //! The model runs on the engine thread. This module never touches model state.
 

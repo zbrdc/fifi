@@ -2,7 +2,7 @@
  * RD-5: the device router of the resident Qwen3.6 decode step (decision 0047).
  *
  * Design guidance only, no code copied. Idea from MegaCapybara v1.35 static RE,
- * research/megacapybara-re-lessons.md section 6.1 C9 (route on the device so that the expert ids
+ * the MegaCapybara static-RE lessons, C9 (route on the device so that the expert ids
  * never reach the host); design guidance only, no code copied. The code is original CUDA C for
  * sm_86 (sm_72 compiles), written from the shapes of this repository.
  *

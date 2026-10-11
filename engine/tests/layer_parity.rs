@@ -136,7 +136,7 @@ mod mac {
         let bytes = std::fs::read(path).unwrap_or_else(|error| {
             panic!(
                 "cannot read frozen layer parity fixture {} ({error}); \
-                 regenerate it with qualification/layer-parity/prepare.py",
+                 regenerate it with the layer-parity qualification harness",
                 path.display()
             )
         });

@@ -3,7 +3,7 @@
 //! `native::resident`, so it inherits the `allow(unsafe_code)` of `native.rs` (decision 0047).
 //!
 //! Design guidance only, no code copied. Idea from MegaCapybara v1.35 static RE,
-//! `research/megacapybara-re-lessons.md` section 6.1 C9.
+//! the MegaCapybara static-RE lessons, C9.
 //!
 //! Safety invariants this file relies on:
 //! - The launch entry is called only through `CudaContext::launch_on`, on the thread that owns the

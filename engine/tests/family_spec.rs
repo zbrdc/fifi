@@ -93,7 +93,7 @@ fn constants_match_checkpoint_config() {
 
 #[test]
 fn linear_widths_follow_the_pinned_inventory() {
-    // Widths from docs/design/stepping-stone-key-table.md: 16 x 128 keys, 32 x 128 values.
+    // Widths from the stepping-stone key table: 16 x 128 keys, 32 x 128 values.
     let linear = QWEN3_6_35B_A3B.linear.expect("linear dimensions");
     assert_eq!(linear.key_dim().expect("key width"), 2048);
     assert_eq!(linear.value_dim().expect("value width"), 4096);
