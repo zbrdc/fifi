@@ -13,7 +13,7 @@
 //! packet Q36-G may ask for after it measures the chunk.
 
 use super::super::chunk_plan::{PairPlan, pair_plan};
-use super::super::ops::{Ctx, dim, f32_tensor, short_import, u32_tensor, values};
+use super::super::ops::{Ctx, dim, f32_tensor, short_import, to_act, u32_tensor, values};
 use super::super::weights::RMoe;
 use crate::{
     EngError,
@@ -123,6 +123,10 @@ pub(super) fn chunk(
     let experts = ctx.kernels.reduce(ReduceOp::Sum, &ordered, 1, false)?;
     let shared_out = shared_rows(ctx, w, x)?;
     let out = ctx.kernels.binary(BinaryOp::Add, &experts, &shared_out)?;
+    // Packet Q36-BF16-b, as the decode combine of `moe.rs`: the gates are F32, so the weighted
+    // expert sum and the shared expert product are F32. The residual add takes the activation
+    // dtype.
+    let out = to_act(ctx, &out)?;
     Ok((out, routed))
 }
 

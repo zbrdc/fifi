@@ -10,15 +10,18 @@
 //! head output is multiplied by `sigmoid(gate)`. There is no indexer and no block selection.
 //!
 //! The cache keeps the decode layout `[1, KVH, len, D]`, so a chunk and a decode step share it.
+//! The cache is F32 in every activation dtype: the new keys and values convert to F32 before the
+//! append (packet Q36-BF16-b, as the decode step of `attn.rs`), and the block output converts to
+//! the activation dtype at the o-projection.
 
 use super::super::attn::{AttnStep, KvCache};
-use super::super::ops::{Ctx, dim};
+use super::super::ops::{Ctx, cast_to, dim, to_act};
 use super::super::weights::RAttn;
 use crate::{
     EngError,
     family::qwen36::host::HostShape,
     kernels::{BinaryOp, RopeSpec, UnaryOp},
-    tensor::ExecutionTensor,
+    tensor::{Dtype, ExecutionTensor},
 };
 
 fn overflow() -> EngError {
@@ -104,6 +107,15 @@ pub(super) fn chunk(
     let vp = m.reshape(&vp, &[rows, kv_heads, width])?;
     let v_new = m.transpose(&vp, &[1, 0, 2])?;
     let v_new = m.reshape(&v_new, &[1, kv_heads, rows, width])?;
+    // The cache stays F32 whatever the activation dtype (packet Q36-BF16-b, as the decode step of
+    // `attn.rs`; a BF16 cache is a parked lever of decision 0046 item 5). The cast runs before the
+    // append so that a cache which starts with this chunk is F32 too, not only one that appends
+    // to F32 keys and values.
+    let (k_new, v_new) = (
+        cast_to(ctx, &k_new, Dtype::F32)?,
+        cast_to(ctx, &v_new, Dtype::F32)?,
+    );
+    let m = &mut *ctx.kernels;
     // 5. Append on the time axis, or start the cache.
     let (k_all, v_all) = match past {
         None => (k_new, v_new),
@@ -115,13 +127,15 @@ pub(super) fn chunk(
     // 6. Causal attention over all positions; head h reads KV head h / (QH / KVH).
     let scale = 1.0 / (width as f32).sqrt();
     let att = m.grouped_attention(&q, &k_all, &v_all, scale, true)?;
-    // 7. Back to rows, sigmoid output gate, and output projection.
+    // 7. Back to rows, sigmoid output gate, and output projection. The attention output is F32
+    // over the F32 cache; the projection takes the activation dtype (packet Q36-BF16-b).
     let att = m.transpose(&att, &[0, 2, 1, 3])?;
     let att = m.reshape(&att, &[rows, heads, width])?;
     let gate = m.unary(UnaryOp::Sigmoid, &gate)?;
     let o = m.binary(BinaryOp::Mul, &att, &gate)?;
     let o = m.reshape(&o, &[rows, q_width])?;
-    let out = m.qmm(&o, &w.o)?;
+    let o = to_act(ctx, &o)?;
+    let out = ctx.kernels.qmm(&o, &w.o)?;
     Ok(AttnStep {
         out,
         cache: KvCache {

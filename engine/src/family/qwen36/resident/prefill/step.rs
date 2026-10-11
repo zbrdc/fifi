@@ -20,14 +20,23 @@
 //! A chunk marks the state poisoned before its first native call and
 //! publishes the new state only after the final `evaluate` and the readbacks succeed. A host check
 //! that fails first changes nothing.
+//!
+//! The activation dtype (packet Q36-BF16-b): a chunk runs the same boundary casts as the decode
+//! step of `step.rs` — the concatenated embedding rows, `bb`, the new keys and values, and the MoE
+//! combine convert at the block edges — and the same dtype guard runs after each norm, after each
+//! layer, and on every state tensor before the final `evaluate`; on the last layer of a `Prompt`
+//! chunk, where the head and the post norm are skipped, the guard runs on the layer's `mid` itself
+//! (fix1 of packet Q36-BF16-b). The key-value cache, the DeltaNet state, and the convolution ring
+//! stay F32 whatever the activation dtype, and the recorded rows read back as F32. An F32 decoder
+//! builds the same graph as before the packet: every cast shares the tensor it would have copied.
 
 use super::super::chunk_plan::{
     PREFILL_RETIRE_CAP, delta_retire_per_token, delta_subchunk, ranges,
 };
 use super::super::decoder::{ResidentDecoder, StepMode, StepResult};
-use super::super::ops::{Ctx, dim, linear, short_import, values};
+use super::super::ops::{Ctx, cast_to, dim, linear, short_import, to_act, values};
 use super::super::state::{LayerState, ResidentState, chunk_growth_bytes};
-use super::super::step::{read_token, split_rows};
+use super::super::step::{check_dtype, read_token, split_rows};
 use super::super::weights::RMixer;
 use super::{attn, delta, moe};
 use crate::{
@@ -55,22 +64,16 @@ fn row_count(tokens: &[u32]) -> Result<u32, EngError> {
 ///
 /// The host checks of the whole prompt come first: a poisoned state, an empty prompt, and a prompt
 /// that passes the context limit return an error and change nothing. Then the chunks run in order.
-/// A decoder whose activation dtype is not F32 (packet Q36-BF16-a) returns `BadRequest` first,
-/// before every other check, permit, and native call, and changes nothing: the chunk path is not
-/// dtype aware until slice Q36-BF16-b. A failed host check or a denied growth permit
-/// (`MemoryPlan`) in a later chunk comes before `begin`. It leaves the state clean, with the
-/// earlier chunks published and `state.pos()` after the last of them. An error after `begin`
-/// poisons the state until `reset`. A chunk routes on the host whatever `Routing` the decoder
-/// holds, and its result has `routes: None`.
+/// A failed host check or a denied growth permit (`MemoryPlan`) in a later chunk comes before
+/// `begin`. It leaves the state clean, with the earlier chunks published and `state.pos()` after
+/// the last of them. An error after `begin` poisons the state until `reset`. A chunk routes on the
+/// host whatever `Routing` the decoder holds, and its result has `routes: None`.
 pub(in super::super) fn prefill(
     decoder: &mut ResidentDecoder<'_>,
     state: &mut ResidentState,
     tokens: &[u32],
     mode: StepMode,
 ) -> Result<StepResult, EngError> {
-    if decoder.weights.consts.act != Dtype::F32 {
-        return Err(bad("the chunked prefill runs F32 activations only"));
-    }
     let rows = row_count(tokens)?;
     state.check_chunk(&decoder.weights, decoder.context_limit, rows)?; // the whole prompt
     let parts = ranges(rows, decoder.chunk_rows)?;
@@ -123,7 +126,9 @@ pub(in super::super) fn chunk_with_cap(
 }
 
 /// Reads the embedding row of every token, imports the rows packed with one synchronization, and
-/// dequantizes them to `[T, hidden]`. A token outside the table returns `BadRequest` from the read.
+/// dequantizes them to `[T, hidden]` in the activation dtype (packet Q36-BF16-b; the dequantized
+/// rows are F32 and one cast moves them to BF16). A token outside the table returns `BadRequest`
+/// from the read.
 fn embed_rows(
     ctx: &mut Ctx<'_>,
     ckpt: &StreamedCheckpoint,
@@ -144,7 +149,8 @@ fn embed_rows(
         .map(|row| ctx.kernels.dequantize(row))
         .collect::<Result<Vec<_>, _>>()?;
     let parts: Vec<&ExecutionTensor> = rows.iter().collect();
-    ctx.kernels.concatenate(&parts, 0)
+    let rows = ctx.kernels.concatenate(&parts, 0)?;
+    to_act(ctx, &rows)
 }
 
 /// The last row of `h` `[T, H]` as `[1, H]`.
@@ -193,6 +199,9 @@ fn run(
     let mut records = Vec::new();
     for (index, (layer, old_layer)) in weights.layers.iter().zip(old).enumerate() {
         let normed = ctx.kernels.rms_norm(&h, &layer.input_norm, shape.eps)?;
+        // Packet Q36-BF16-b: the same dtype guard as the decode step. MLX promotes mixed operands,
+        // so a stray F32 operand would turn BF16 activations back to F32 without an error.
+        check_dtype("input norm output", &normed, ctx.consts.act)?;
         // The old layer state moves into its arm and drops at the end of the arm, after the
         // replacement graph exists. The next synchronization frees it.
         let (mixed, next) = match (&layer.mixer, old_layer) {
@@ -215,15 +224,24 @@ fn run(
         layers.push(next);
         let mid = ctx.kernels.binary(BinaryOp::Add, &h, &mixed)?;
         if mode == StepMode::Prompt && index == last {
-            // The last layer's MoE output feeds only the head, which `Prompt` skips.
+            // The last layer's MoE output feeds only the head, which `Prompt` skips, so no post
+            // norm runs after this `mid` and the recorded rows are gone: without this guard a
+            // dropped `to_act` at a mixer out-projection would pass unnoticed on the last layer
+            // of a Prompt chunk (fix1 of packet Q36-BF16-b). Every other layer, and every other
+            // mode, is already covered: its `mid` meets the guarded post norm below.
+            check_dtype("last layer mid", &mid, ctx.consts.act)?;
             h = mid;
             break;
         }
         let normed = ctx.kernels.rms_norm(&mid, &layer.post_norm, shape.eps)?;
+        check_dtype("post norm output", &normed, ctx.consts.act)?;
         let (routed, _routes) = moe::chunk(&mut ctx, shape, &layer.moe, &normed)?;
         h = ctx.kernels.binary(BinaryOp::Add, &mid, &routed)?;
+        check_dtype("layer output", &h, ctx.consts.act)?;
         if mode == StepMode::Record {
-            records.push(last_row(&mut ctx, &h, rows, hidden)?);
+            // The recorded last row reads back as F32.
+            let row = last_row(&mut ctx, &h, rows, hidden)?;
+            records.push(cast_to(&mut ctx, &row, Dtype::F32)?);
         }
     }
     // The head runs on the last row only. `Prompt` skips it.
@@ -243,6 +261,21 @@ fn run(
     } else {
         None
     };
+    // Packet Q36-BF16-b: the recurrent state, the convolution ring, and the key-value cache stay
+    // F32 whatever the activation dtype, and the chunk refuses a graph that planned otherwise.
+    for layer in &layers {
+        match layer {
+            LayerState::Delta { rec, ring } => {
+                check_dtype("recurrent state", rec, Dtype::F32)?;
+                check_dtype("convolution ring", ring, Dtype::F32)?;
+            }
+            LayerState::Attn(cache) => {
+                for tensor in [&cache.k, &cache.v].into_iter().flatten() {
+                    check_dtype("key-value cache", tensor, Dtype::F32)?;
+                }
+            }
+        }
+    }
     // One evaluate of the new state and the head outputs.
     let mut outputs: Vec<&ExecutionTensor> = Vec::new();
     for layer in &layers {
@@ -291,11 +324,13 @@ mod tests {
         DECODE_RETIRE_CAP, MAX_CHUNK_ROWS, ResidentDecoder, StepMode, StepResult,
     };
     use super::super::super::ops::{assert_parity, values};
+    use super::super::super::parity::{cosine, top5};
     use super::super::super::state::LayerState;
     use super::*;
     use crate::family::qwen36::host::{self, HostState, LayerState as HostLayer};
     use crate::family::qwen36::host_cpu::CpuProjector;
     use crate::family::qwen36::host_load::HostWeights;
+    use crate::family::qwen36::resident::moe::Routing;
     use crate::family::qwen36::settings::Activation;
     use crate::family::qwen36::tiny::{self, TINY_GQA};
     use crate::kernels::MlxKernels;
@@ -721,11 +756,29 @@ mod tests {
         assert_eq!(syncs(&decoder) - before, 8 + 8 + 13, "three chunks");
     }
 
-    /// The chunked prefill is not dtype aware (packet Q36-BF16-a): a decoder that holds BF16
-    /// activations is refused before any host check, any permit, or any native call, and the state
-    /// stays clean. Slice Q36-BF16-b lifts the refusal.
+    /// `max|got - want| / max|want|`, the F32 gate metric, reported for the BF16 run.
+    fn relative_error(got: &[f32], want: &[f32]) -> f64 {
+        let (mut diff, mut top) = (0f64, 0f64);
+        for (&g, &w) in got.iter().zip(want) {
+            let (g, w) = (f64::from(g), f64::from(w));
+            diff = diff.max((g - w).abs());
+            top = top.max(w.abs());
+        }
+        if top > 0.0 { diff / top } else { f64::INFINITY }
+    }
+
+    /// Packet Q36-BF16-b: a BF16 decoder runs the chunk path, and the chunk equals the BF16
+    /// one-token steps within the mode: every recorded layer row and the logits keep a cosine of
+    /// at least 0.99999, the top 5 and the argmax are equal, and the next 8 greedy tokens are
+    /// equal. The max relative error is reported, not gated: BF16 rounding moves a row by more
+    /// than the 1e-4 of the F32 gates without changing the mode's decisions. The committed state
+    /// is F32 in every part with the position and charge of the chunk itself (fix1: asserted
+    /// right after the chunk, before the one-token steps and the greedy loop move them on), a
+    /// `Prompt` chunk commits the same F32 state through the last-layer mid guard, and the one-token
+    /// path routes on the host like the chunk (fix1), so no device-routing near tie can flake the
+    /// comparison.
     #[test]
-    fn a_decoder_with_bf16_activations_is_refused_by_the_prefill() {
+    fn a_bf16_chunk_matches_the_bf16_one_token_steps_within_the_mode() {
         let _serial = crate::native_test_lock();
         let ckpt = setup();
         let config = tiny::config(&TINY_GQA);
@@ -743,15 +796,180 @@ mod tests {
             Dtype::Bf16,
             "the decoder holds BF16"
         );
+        decoder.set_chunk_rows(8).unwrap();
+        let tokens: Vec<u32> = (0..16).map(token).collect();
+        let mut chunked = decoder.zero_state().unwrap();
+        let got = ok(
+            decoder.prefill(&mut chunked, &tokens, StepMode::Record),
+            "the BF16 chunk",
+        );
+        // The state of the chunk itself, before the one-token steps and the greedy loop below
+        // move the position and the charge on (fix1 of packet Q36-BF16-b).
+        assert_eq!(chunked.pos(), tokens.len() as u32, "position");
+        assert!(!chunked.is_poisoned(), "the chunk committed");
+        assert_eq!(
+            decoder.budget.used(),
+            u64::from(tokens.len() as u32) * GROWTH,
+            "the charge of the chunk"
+        );
+        for (l, layer) in chunked.layers().iter().enumerate() {
+            match layer {
+                LayerState::Delta { rec, ring } => {
+                    assert_eq!(rec.dtype(), Dtype::F32, "layer {l} rec dtype");
+                    assert_eq!(ring.dtype(), Dtype::F32, "layer {l} ring dtype");
+                }
+                LayerState::Attn(cache) => {
+                    for tensor in [&cache.k, &cache.v].into_iter().flatten() {
+                        assert_eq!(tensor.dtype(), Dtype::F32, "layer {l} cache dtype");
+                    }
+                }
+            }
+        }
+        let mut stepped = decoder.zero_state().unwrap();
+        let (last, before) = tokens.split_last().unwrap();
+        // Every chunk routes on the host, so the one-token path routes on the host too (fix1, as
+        // the real gate): only the accumulation of M > 1 against M = 1 differs, and no device
+        // near tie can flake the top-5 and greedy equality below.
+        decoder.set_routing(Routing::Host);
+        for &t in before {
+            ok(
+                decoder.step(&mut stepped, t, StepMode::Prompt),
+                "a BF16 one-token step",
+            );
+        }
+        let want = ok(
+            decoder.step(&mut stepped, *last, StepMode::Record),
+            "the last BF16 step",
+        );
+        let mut max_rel = 0f64;
+        for (l, (g, w)) in got
+            .layer_out
+            .as_ref()
+            .unwrap()
+            .iter()
+            .zip(want.layer_out.as_ref().unwrap())
+            .enumerate()
+        {
+            let cos = cosine(g, w);
+            assert!(cos >= 0.99999, "layer {l}: cosine {cos}");
+            max_rel = max_rel.max(relative_error(g, w));
+        }
+        let (g, w) = (got.logits.as_ref().unwrap(), want.logits.as_ref().unwrap());
+        let logits_cos = cosine(g, w);
+        assert!(logits_cos >= 0.99999, "logits cosine {logits_cos}");
+        assert_eq!(top5(g), top5(w), "the top 5 of the mode");
+        assert_eq!(got.token, want.token, "the argmax of the mode");
+        max_rel = max_rel.max(relative_error(g, w));
+        eprintln!(
+            "bf16 chunk against steps: max relative error {max_rel:.3e} (reported, not gated)"
+        );
+        let (mut a, mut b) = (vec![got.token.unwrap()], vec![want.token.unwrap()]);
+        for _ in 1..8 {
+            let next = ok(
+                decoder.step(&mut chunked, *a.last().unwrap(), StepMode::Generate),
+                "greedy after the chunk",
+            );
+            a.push(next.token.unwrap());
+            let next = ok(
+                decoder.step(&mut stepped, *b.last().unwrap(), StepMode::Generate),
+                "greedy after the steps",
+            );
+            b.push(next.token.unwrap());
+        }
+        assert_eq!(a, b, "the next 8 greedy tokens of the mode");
+        // A `Prompt` chunk runs the same guards without the head and without the last layer's
+        // MoE, so the last layer's `mid` carries the guard alone (fix1): it commits an F32 state
+        // at the same position and returns nothing.
+        let mut prompt = decoder.zero_state().unwrap();
+        let got = ok(
+            decoder.prefill(&mut prompt, &tokens, StepMode::Prompt),
+            "a BF16 chunk in Prompt mode",
+        );
+        assert_eq!(
+            got,
+            StepResult {
+                token: None,
+                logits: None,
+                layer_out: None,
+                routes: None,
+                probs: None
+            },
+            "a Prompt chunk returns nothing"
+        );
+        assert_eq!(prompt.pos(), tokens.len() as u32, "the Prompt position");
+        assert!(!prompt.is_poisoned(), "the Prompt chunk committed");
+        for (l, layer) in prompt.layers().iter().enumerate() {
+            match layer {
+                LayerState::Delta { rec, ring } => {
+                    assert_eq!(rec.dtype(), Dtype::F32, "layer {l} rec dtype");
+                    assert_eq!(ring.dtype(), Dtype::F32, "layer {l} ring dtype");
+                }
+                LayerState::Attn(cache) => {
+                    for tensor in [&cache.k, &cache.v].into_iter().flatten() {
+                        assert_eq!(tensor.dtype(), Dtype::F32, "layer {l} cache dtype");
+                    }
+                }
+            }
+        }
+    }
+
+    /// Fix1 of packet Q36-BF16-b: the state guards are pinned separately from the casts. A BF16
+    /// convolution ring handed to the chunk makes the mixed concatenate produce a BF16 new ring,
+    /// and the chunk refuses it before the `evaluate` with the dtype guard text; the error leaves
+    /// the state poisoned, because it happens after `begin`.
+    #[test]
+    fn a_chunk_refuses_a_bf16_ring_through_the_state_dtype_guard() {
+        let _serial = crate::native_test_lock();
+        let ckpt = setup();
+        let config = tiny::config(&TINY_GQA);
+        let host = HostWeights::load(&ckpt, &TINY_GQA, &config).unwrap();
+        let mut decoder = ResidentDecoder::new_with_activation(
+            MlxKernels::try_new().unwrap(),
+            &ckpt,
+            host,
+            1024,
+            Activation::Bf16,
+        )
+        .unwrap();
+        decoder.set_chunk_rows(8).unwrap();
         let mut state = decoder.zero_state().unwrap();
-        let refused = decoder.prefill(&mut state, &[1, 2, 3], StepMode::Generate);
+        // Take the committed layers out, as the chunk does, and cast one Delta ring to BF16: the
+        // graph builder then plans a BF16 new ring, which only the guard refuses.
+        let mut old = state.begin();
+        let at = old
+            .iter()
+            .position(|layer| matches!(layer, LayerState::Delta { .. }))
+            .unwrap();
+        if let LayerState::Delta { ring, .. } = &old[at] {
+            let bad = decoder.kernels.cast(ring, Dtype::Bf16).unwrap();
+            if let LayerState::Delta { ring, .. } = &mut old[at] {
+                *ring = bad;
+            }
+        }
+        assert_eq!(
+            old.iter()
+                .filter(|layer| matches!(layer, LayerState::Delta { ring, .. } if ring.dtype() == Dtype::Bf16))
+                .count(),
+            1,
+            "exactly one ring is BF16"
+        );
+        let tokens: Vec<u32> = (0..8).map(token).collect();
+        let rows = row_count(&tokens).unwrap();
+        let growth = chunk_growth_bytes(&decoder.weights, rows).unwrap();
+        let permit = decoder.budget.acquire_growth(growth).unwrap();
+        let refused = run(
+            &mut decoder,
+            &mut state,
+            old,
+            permit,
+            &tokens,
+            StepMode::Generate,
+            PREFILL_RETIRE_CAP,
+        );
         assert!(
-            matches!(&refused, Err(EngError::BadRequest(m)) if m.contains("F32 activations only")),
-            "{:?}",
+            matches!(&refused, Err(EngError::Backend { message, .. }) if message.contains("has dtype")),
+            "the dtype guard refuses the BF16 ring: {:?}",
             refused.as_ref().err()
         );
-        assert_eq!(state.pos(), 0, "a refusal does not advance");
-        assert!(!state.is_poisoned(), "a refusal does not poison");
-        assert_eq!(decoder.session_used(), 0, "a refusal takes no permit");
     }
 }

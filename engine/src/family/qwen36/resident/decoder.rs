@@ -99,14 +99,13 @@ impl<'c> ResidentDecoder<'c> {
     /// lets the adapter take BF16 operands, converts the 100 layer norms to BF16 with one
     /// synchronization, and sets `Consts::act`; the key-value cache, the DeltaNet state and ring,
     /// the router, the final norm, and the logits stay F32. `ensure_scale_pairing` refuses a
-    /// mismatched scale pair before any of that. `prefill` refuses a decoder that holds BF16
-    /// activations (the chunk path is F32 only until slice Q36-BF16-b).
+    /// mismatched scale pair before any of that. The chunked prefill runs the same activation
+    /// dtype (packet Q36-BF16-b: the chunk blocks cast at their boundaries and guard their dtypes).
     ///
     /// The head keeps an F32 activation over BF16 scales (packet Q36-BF16-a, documented, not
     /// changed): the final norm promotes the BF16 hidden state against the F32 final-norm weight,
     /// so the `lm_head` qmm runs F32 over the stored BF16 scales, and MLX casts the scales per
-    /// token (about 64 MB of temporaries). A speed-table row for the Mac run; slice Q36-BF16-b
-    /// revisits the head.
+    /// token (about 64 MB of temporaries). A speed-table row for the Mac run.
     pub(super) fn new_with_activation(
         kernels: MlxKernels,
         ckpt: &'c StreamedCheckpoint,

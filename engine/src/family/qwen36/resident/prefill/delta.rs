@@ -5,20 +5,27 @@
 //! steps of `delta::step`. The rules are those of `delta.rs`: the output gate is `silu(z)`, and the
 //! query and key norm adds `key_dim * 1e-6` to the sum of squares.
 //!
+//! The activation dtype (packet Q36-BF16-b): the projections over `x` run in the activation
+//! dtype, while the recurrence, its state, and the convolution ring stay F32, as the decode step
+//! of `delta.rs` keeps them. `bb` converts to F32 before its sigmoid because the gated delta
+//! kernel takes an F32 `beta`; the query, the key, the value, and the decay meet an F32 constant
+//! or the F32 state first and promote on their own. The block output converts back to the
+//! activation dtype at the out-projection.
+//!
 //! `gated_delta_recurrence` is the one seam of this file. The normalized query and key, the value,
 //! the write strength `beta`, the decay factor `g`, and the state go in; the readout of every token
 //! and the new state come out. It is one call of the gated delta kernel adapted from mlx-lm 0.31.0
 //! (decision 0050), which loops over the tokens inside the kernel. The recurrent state is
 //! `[VH, VD, KD]`, the layout of the kernel and of the host reference.
 
-use super::super::ops::{Ctx, dim};
+use super::super::ops::{Ctx, cast_to, dim, to_act};
 use super::super::weights::RDelta;
 use super::conv::causal_conv;
 use crate::{
     EngError,
     family::qwen36::host::HostShape,
     kernels::{BinaryOp, MlxKernels, ReduceOp, UnaryOp},
-    tensor::ExecutionTensor,
+    tensor::{Dtype, ExecutionTensor},
 };
 
 /// Output and replacement state of one DeltaNet chunk. Every tensor is lazy.
@@ -169,6 +176,11 @@ pub(super) fn chunk(
     let u = ctx.kernels.qmm(x, &w.qkv)?;
     let z = ctx.kernels.qmm(x, &w.z)?;
     let bb = ctx.kernels.qmm(x, &w.b)?;
+    // Packet Q36-BF16-b, as the decode step of `delta.rs`: the recurrence, its state, and the
+    // convolution ring stay F32. `u`, `z`, and `aa` meet an F32 weight or state first and promote
+    // on their own. `bb` feeds a sigmoid alone and the gated delta kernel takes F32 `beta`, so it
+    // converts here.
+    let bb = cast_to(ctx, &bb, Dtype::F32)?;
     let aa = ctx.kernels.qmm(x, &w.a)?;
     let consts = ctx.consts;
     let m = &mut *ctx.kernels;
@@ -209,6 +221,9 @@ pub(super) fn chunk(
     let gate = m.silu(&zr)?;
     let o = m.binary(BinaryOp::Mul, &normed, &gate)?;
     let o = m.reshape(&o, &[t, vw])?;
+    // The gated norm and the gate promote to F32; the out-projection takes the activation dtype
+    // (packet Q36-BF16-b, as the decode step).
+    let o = to_act(ctx, &o)?;
     let out = ctx.kernels.qmm(&o, &w.out)?;
     Ok(DeltaChunk {
         out,

@@ -2,6 +2,13 @@
 //!
 //! MLX has no `conv1d` entry point here, and a convolution with `K` taps is `K` shifted slices.
 //! DeltaNet uses `CK - 1 = 3` past taps one row apart and one tap for the current row.
+//!
+//! The dtypes (packet Q36-BF16-b): `ring`, `taps`, and `last` stay F32, and `x` carries the
+//! activation dtype, so a BF16 chunk meets the F32 ring inside `seq` and the F32 taps inside every
+//! product. MLX promotes a mixed F32 and BF16 operand set to F32, which is numerically identical
+//! to casting `x` to F32 first: the convolution runs in F32 whatever the activation dtype, and
+//! the pre-activation and the new ring come back F32. The test
+//! `a_bf16_chunk_convolves_against_the_f32_ring_in_f32` pins the promotion and the values.
 
 use crate::{
     EngError,
@@ -20,6 +27,10 @@ fn bad(message: &str) -> EngError {
 /// that `t` earlier tokens would have left. Its output for channel `c` is
 /// `last[c] * x[t][c] + sum over k of taps[c][k] * seq[c][t + k]`, where `seq` is the ring followed
 /// by `x` along time. `taps` is `[W, taps]` and `last` is `[W]`.
+///
+/// `x` may hold the activation dtype while `ring`, `taps`, and `last` stay F32: the mixed
+/// `concatenate` and the mixed products promote to F32, so the outputs are F32 (see the module
+/// doc; packet Q36-BF16-b).
 ///
 /// Returns the pre-activation `[T, W]` and the new ring `[W, taps]`, which is the last `taps`
 /// columns of `seq`. The function builds lazy graphs only. A shape error returns `BadRequest`
@@ -65,6 +76,7 @@ pub(super) fn causal_conv(
 mod tests {
     use super::super::super::ops::{assert_close, f32_tensor, values};
     use super::*;
+    use crate::tensor::Dtype;
 
     fn upload(kernels: &mut MlxKernels, shape: Vec<u32>, data: &[f32]) -> ExecutionTensor {
         kernels
@@ -144,6 +156,69 @@ mod tests {
         assert_close(&got, &[14.0, 70.0], 1e-4, "conv");
         let got_ring = values(&mut kernels, &next).unwrap();
         assert_close(&got_ring, &[3.0, 7.0, 20.0, 40.0], 1e-4, "ring");
+    }
+
+    /// Packet Q36-BF16-b: a BF16 chunk against an F32 ring, taps, and last tap. The chunk values
+    /// 4, 40, 5, and 50 are exact in BF16, and the ring's first value 1.0009765625 (1 + 2^-10)
+    /// needs the tenth mantissa bit that BF16 rounds away, so a mutation that rounds the ring to
+    /// BF16 changes the convolution by 0.5 x 2^-10 = 4.88e-4 and fails the value assert below,
+    /// not only the dtype assert (fix1 of packet Q36-BF16-b). With the ring left F32, the mixed
+    /// concatenate and the mixed products must give exactly the all-F32 values, and MLX must
+    /// promote the mixed operand set to F32: the pre-activation and the new ring are F32, not
+    /// BF16. A promotion that silently widened the ring instead, or a concatenate that dropped the
+    /// ring, changes the values or the dtypes and fails here.
+    #[test]
+    fn a_bf16_chunk_convolves_against_the_f32_ring_in_f32() {
+        let _serial = crate::native_test_lock();
+        let mut kernels = MlxKernels::try_new().unwrap();
+        kernels.allow_bf16(true);
+        let f32 = upload(&mut kernels, vec![2, 2], &[4.0, 40.0, 5.0, 50.0]);
+        let x = kernels.cast(&f32, Dtype::Bf16).unwrap();
+        assert_eq!(x.dtype(), Dtype::Bf16, "the chunk is BF16");
+        let ring = upload(
+            &mut kernels,
+            vec![2, 3],
+            &[1.000_976_6, 2.0, 3.0, 10.0, 20.0, 30.0],
+        );
+        let taps = upload(
+            &mut kernels,
+            vec![2, 3],
+            &[0.5, 0.25, 0.125, 1.0, -1.0, 2.0],
+        );
+        let last = upload(&mut kernels, vec![2], &[2.0, 3.0]);
+
+        let (conv, next) = causal_conv(&mut kernels, &x, &ring, &taps, &last).unwrap();
+
+        assert_eq!(
+            conv.dtype(),
+            Dtype::F32,
+            "the mixed convolution promotes to F32"
+        );
+        assert_eq!(next.dtype(), Dtype::F32, "the new ring is F32");
+        assert_close(
+            &values(&mut kernels, &conv).unwrap(),
+            &[9.375_488, 170.0, 12.25, 220.0],
+            1e-4,
+            "conv",
+        );
+        assert_close(
+            &values(&mut kernels, &next).unwrap(),
+            &[3.0, 4.0, 5.0, 30.0, 40.0, 50.0],
+            1e-4,
+            "ring",
+        );
+        // The all-F32 call on the same numbers gives the same bytes.
+        let (f32_conv, f32_next) = causal_conv(&mut kernels, &f32, &ring, &taps, &last).unwrap();
+        assert_eq!(
+            values(&mut kernels, &conv).unwrap(),
+            values(&mut kernels, &f32_conv).unwrap(),
+            "the BF16 chunk equals the F32 chunk"
+        );
+        assert_eq!(
+            values(&mut kernels, &next).unwrap(),
+            values(&mut kernels, &f32_next).unwrap(),
+            "the BF16 ring equals the F32 ring"
+        );
     }
 
     #[test]

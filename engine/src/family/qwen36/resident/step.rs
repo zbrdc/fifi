@@ -287,8 +287,13 @@ fn run(
 
 /// Returns `Backend` when `tensor` does not have the dtype that the step plans for it (packet
 /// Q36-BF16-a). MLX promotes mixed operands silently, so the dtype is the only honest witness of
-/// a stray F32 operand in a BF16 run. The check never fires in an F32 run.
-fn check_dtype(what: &str, tensor: &ExecutionTensor, want: Dtype) -> Result<(), EngError> {
+/// a stray F32 operand in a BF16 run. The check never fires in an F32 run. The prefill chunk loop
+/// runs the same guard (packet Q36-BF16-b).
+pub(super) fn check_dtype(
+    what: &str,
+    tensor: &ExecutionTensor,
+    want: Dtype,
+) -> Result<(), EngError> {
     if tensor.dtype() == want {
         return Ok(());
     }

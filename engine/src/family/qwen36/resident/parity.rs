@@ -26,6 +26,9 @@ use sha2::{Digest, Sha256};
 use super::decoder::StepMode;
 use super::real::{env_path, open, rss_kb};
 use super::scale_knob::{hash_f32s, new_decoder};
+use super::within_mode::{
+    BF16_LAYER_COSINE_FLOOR, BF16_LAYER_COSINE_REGRESSION, D1_BF16_MIN_LAYER_COSINE, passes,
+};
 use crate::{
     family::{
         qwen36::host_load::HostWeights,
@@ -46,22 +49,6 @@ pub(super) const LOGITS_SHA256: &str =
 /// SHA-256 of the pinned `config.json` (decision 0046 item 2).
 pub(super) const CONFIG_SHA256: &str =
     "a822a9e48b0aafbe3144ec37d4fb067e178ed96615ce6e4420b3149893cc5767";
-
-/// The gate of decision 0046 item 4.
-const MIN_COSINE: f64 = 0.99999;
-/// The floor of the BF16 run's minimum per-layer cosine (fix5 of packet Q36-BF16-a; decision
-/// 0046 A6): 0.95, below the 0.9799 that the d1 BF16 run observed (evidence 9dec1b7c).
-const BF16_LAYER_COSINE_FLOOR: f64 = 0.95;
-/// The d1 BF16 minimum layer cosine (evidence 9dec1b7c): the no-ratchet anchor of the floor.
-const D1_BF16_MIN_LAYER_COSINE: f64 = 0.9799;
-/// The largest regression below the d1 minimum that the floor allows without a recorded
-/// decision (fix5 of packet Q36-BF16-a).
-const BF16_LAYER_COSINE_REGRESSION: f64 = 0.01;
-
-/// True for a finite cosine at or above the gate. A NaN fails.
-pub(super) fn passes(cosine: f64) -> bool {
-    cosine.is_finite() && cosine >= MIN_COSINE
-}
 
 /// The smaller of two cosines. A NaN in either input gives NaN, so a NaN cosine cannot hide
 /// behind a larger value.

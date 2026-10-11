@@ -1,9 +1,13 @@
 # Engine configs
 
 `qwen36-mac-studio-36gb.json` is the `enginesrv` config for the Qwen3.6-35B-A3B stepping stone on the 36 GB Mac Studio.
-It states `activation_dtype: "bf16"` (the default), so until slice Q36-BF16-b makes the chunk path dtype aware it plans no chunk: the executor's prefill plan admits none, every prompt token runs as one step with the 16-token (`NO_BUDGET_PIECE`) worker piece, and the start-up line names the temporary rule (`no chunk planned while activation_dtype is bf16 ... until slice Q36-BF16-b`).
-The chunked prefill that decision 0046 A4 turned on returns for this file when slice Q36-BF16-b lands (or now, with `activation_dtype: "f32"`); the budget and reserve members below are what it needs, and they stay.
-The file leaves `prefill_chunk` absent, so the default of 256 applies.
+It states `activation_dtype: "bf16"` (the default).
+The chunk path of the prefill is dtype aware (slice Q36-BF16-b) and the budget and reserve members below are what its planner needs, and they stay.
+TEMPORARY BF16 POLICY: the file leaves `prefill_chunk` absent, and the engine default of `prefill_chunk` is 1 for a BF16 engine (256 for an `f32` engine; `BF16_DEFAULT_PREFILL_CHUNK` in `engine/src/family/qwen36/settings.rs`).
+A chunk of 1 plans no chunk: the prompt runs one token at a time, as before slice Q36-BF16-b, and the start-up line says so.
+The reason is an open finding (Q36-BF16-SENS): on the 922-token tool prompt the BF16 chunked prefill gives a format-token probability of 0.0426 at chunk 16 and 0.998 at chunk 256 (token by token: 0.9994), and the reference mlx-lm itself varies with the chunk size in BF16 (0.72 to 0.9999 over 13 sizes) but never loses the top token.
+To use the chunked prefill with BF16 before the finding is closed, set `prefill_chunk` explicitly (at your own risk for tool calls); the prefill is about 40% faster with the sorted expert products (Q36-PF-SORTED) than before.
+Lifting the policy is a one-line change of the constant.
 
 ## Activation dtype
 
@@ -12,8 +16,10 @@ activation dtype: `bf16` or `f32`. The default is `bf16`, and this file states i
 The member is one lever: `bf16` keeps the stored BF16 scales and biases and converts the layer
 norms, `f32` keeps the F32 widening of Q36-G0, and the engine refuses any other pairing at load.
 The key-value cache, the DeltaNet state, the router, and the logits stay F32 in both modes.
-While the chunked prefill runs F32 activations only (until slice Q36-BF16-b), a `bf16` engine
-plans no chunk and serves prompts one token at a time; the start-up line says so.
+The chunked prefill runs in either dtype (slice Q36-BF16-b): the chunk blocks cast at the same
+boundaries as the decode step, a dtype guard runs after each norm, after each layer, and on every
+state tensor, and a `bf16` engine plans its chunk exactly like an `f32` engine when the budget
+allows one.
 With `bf16` the resident weights are 19,286,549,004 bytes against 21,420,001,804 with `f32`.
 
 ## Numbers
@@ -39,7 +45,7 @@ The rule is `Q36Settings::check_prefix_reuse_cap` in `engine/src/family/qwen36/s
 ## Evidence
 
 The E10/E11 numbers are F32 measurements, taken before `activation_dtype` existed: one X32 smoke trial on the 36 GB Mac Studio admitted 32,010 tokens at chunk 256 (decision 0046 item 5c and A4), with swap flat against a baseline of about 1.0 GB already in use.
-It is one trial and not a bound, and it does not describe the shipped `bf16` entry, which plans no chunk until slice Q36-BF16-b.
+It is one trial and not a bound, and it predates `activation_dtype`; the chunk numbers of the shipped `bf16` entry are to be re-measured by the Mac gates of slice Q36-BF16-b (the E8 chunk gates and the prompt-speed test, both dtypes).
 
 ## Use
 

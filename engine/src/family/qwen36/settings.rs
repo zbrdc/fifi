@@ -21,6 +21,12 @@ pub(crate) const DEFAULT_SESSION_CAP: u64 = 2 << 30;
 /// the worker piece (`ExecutorOps::prefill_piece`). Without a plan, or when the plan admits no
 /// chunk, the piece is `NO_BUDGET_PIECE`.
 pub(crate) const DEFAULT_PREFILL_CHUNK: u32 = 256;
+/// Temporary BF16 serving policy (decision 0046 A6 item 11, fix 5 of packet Q36-BF16-b): the
+/// default chunk of a BF16 engine is 1, i.e. no chunked prefill, until Q36-BF16-SENS has a cause
+/// or a bound for the chunk-size dependence of the BF16 prefill (the format-token probability of
+/// the 922-token tool prompt is 0.0426 at chunk 16 and 0.998 at chunk 256). Lifting the policy
+/// is a one-line change of this constant. An explicit `prefill_chunk` in the config always wins.
+pub(crate) const BF16_DEFAULT_PREFILL_CHUNK: u32 = 1;
 /// The fallback worker piece for an executor that plans no chunk: no budget, or a plan that admits
 /// none. The executor then runs one token per step.
 /// The worker checks the cancel flag only between pieces. At about 62 tok/s, a piece of 16 waits
@@ -51,7 +57,9 @@ pub(crate) struct Q36Options {
     pub(crate) context_limit: Option<u32>,
     /// The bytes of cache growth that the engine admits. The default is 2 GiB.
     pub(crate) session_cap_bytes: Option<u64>,
-    /// The prompt tokens per `prefill` call, from 1 to 512. The default is 256. It is the largest
+    /// The prompt tokens per `prefill` call, from 1 to 512. The default is 256 for an F32 engine and
+    /// 1 (no chunked prefill) for a BF16 engine (`BF16_DEFAULT_PREFILL_CHUNK`, a temporary policy
+    /// until Q36-BF16-SENS has a cause or a bound). It is the largest
     /// chunk that the planner may choose; the worker piece is the planned chunk, or 16
     /// (`NO_BUDGET_PIECE`) when no chunk is planned: no budget, or a budget that admits none.
     pub(crate) prefill_chunk: Option<u32>,
@@ -150,14 +158,14 @@ pub(crate) fn scale_pairing_error(
     })
 }
 
-/// Whether the chunked prefill may run with the activation dtype `act` (packet Q36-BF16-a): the
-/// chunk path runs F32 activations only until slice Q36-BF16-b makes it dtype aware, so a BF16
-/// engine plans no chunk and every prompt token runs as one step with the `NO_BUDGET_PIECE` worker
-/// piece. This is the one authority for the rule: `start::plan_prefill` (the start-up line) and
-/// `Q36Executor::plan_prefill` (the plan itself) both ask this function, each with the dtype it
-/// holds (`Q36Settings::activation` and `Consts::act` respectively).
+/// Whether the chunked prefill may run with the activation dtype `act` (packet Q36-BF16-b): the
+/// chunk path is dtype aware — its blocks run the same boundary casts as the decode step and the
+/// chunk loop guards every dtype — so both activation dtypes plan a chunk and only the budget and
+/// the largest chunk can keep one out. This is the one authority for the rule:
+/// `Q36Executor::plan_prefill` asks it with `Consts::act`, and the start-up line of
+/// `start::plan_prefill` follows the plan and names no dtype rule.
 pub(crate) fn chunked_prefill_allowed(act: Dtype) -> bool {
-    act == Dtype::F32
+    matches!(act, Dtype::F32 | Dtype::Bf16)
 }
 
 /// The checked settings of one Q36 engine.
@@ -338,7 +346,11 @@ impl Q36Settings {
             prefill_chunk: ranged(
                 "prefill_chunk",
                 options.prefill_chunk,
-                DEFAULT_PREFILL_CHUNK,
+                if activation == Activation::Bf16 {
+                    BF16_DEFAULT_PREFILL_CHUNK
+                } else {
+                    DEFAULT_PREFILL_CHUNK
+                },
                 1,
                 MAX_PREFILL_CHUNK,
             )?,
@@ -409,9 +421,10 @@ pub(crate) fn tokenizer_pin() -> Result<TokenizerPin, EngError> {
 #[cfg(test)]
 mod tests {
     use super::{
-        DEFAULT_CONTEXT_LIMIT, DEFAULT_PREFILL_CHUNK, DEFAULT_SESSION_CAP, NO_BUDGET_PIECE, Q36Env,
-        Q36Options, Q36Settings, activation_name, activation_of, cache_growth_per_position,
-        chunked_prefill_allowed, delta_state_bytes, digest, scale_pairing_error, tokenizer_pin,
+        BF16_DEFAULT_PREFILL_CHUNK, DEFAULT_CONTEXT_LIMIT, DEFAULT_PREFILL_CHUNK,
+        DEFAULT_SESSION_CAP, NO_BUDGET_PIECE, Q36Env, Q36Options, Q36Settings, activation_name,
+        activation_of, cache_growth_per_position, chunked_prefill_allowed, delta_state_bytes,
+        digest, scale_pairing_error, tokenizer_pin,
     };
     use crate::EngError;
     use crate::family::spec::QWEN3_6_35B_A3B;
@@ -534,7 +547,7 @@ mod tests {
                 cache_limit: 1024,
                 context_limit: 32_768,
                 session_cap: 2 << 30,
-                prefill_chunk: 256,
+                prefill_chunk: 1,
                 prefill_budget: None,
                 prefill_reserve: 0,
                 activation: super::Activation::Bf16,
@@ -543,6 +556,7 @@ mod tests {
         assert_eq!(DEFAULT_CONTEXT_LIMIT, 32_768);
         assert_eq!(DEFAULT_SESSION_CAP, 2_147_483_648);
         assert_eq!(DEFAULT_PREFILL_CHUNK, 256);
+        assert_eq!(BF16_DEFAULT_PREFILL_CHUNK, 1);
         assert_eq!(NO_BUDGET_PIECE, 16);
         // The reserve of `config/qwen36-mac-studio-36gb.json` is a plan sum (see its README).
         assert_eq!(32_768u64 * 40_960, 1_342_177_280);
@@ -550,6 +564,41 @@ mod tests {
             1_342_177_280u64 + 65_863_680 + 4_294_967_296 + (1 << 30),
             6_776_750_080
         );
+    }
+
+    /// Temporary BF16 serving policy (fix 5 of packet Q36-BF16-b): without a `prefill_chunk` the
+    /// default chunk of a BF16 engine is 1 (no chunked prefill) and that of an F32 engine is 256;
+    /// an explicit `prefill_chunk` wins for both. The shipped config leaves the member absent.
+    #[test]
+    fn the_default_chunk_depends_on_the_activation_and_an_explicit_chunk_wins() {
+        let bf16 = settings(Some(&with_limit()), &Q36Env::default()).unwrap();
+        assert_eq!(
+            bf16.activation,
+            super::Activation::Bf16,
+            "the default activation"
+        );
+        assert_eq!(
+            bf16.prefill_chunk, 1,
+            "BF16 default: no chunked prefill (temporary policy)"
+        );
+        let f32 = Q36Options {
+            activation_dtype: Some("f32".to_string()),
+            ..with_limit()
+        };
+        let got = settings(Some(&f32), &Q36Env::default()).unwrap();
+        assert_eq!(got.prefill_chunk, 256, "F32 default");
+        for activation in ["bf16", "f32"] {
+            let options = Q36Options {
+                activation_dtype: Some(activation.to_string()),
+                prefill_chunk: Some(64),
+                ..with_limit()
+            };
+            let got = settings(Some(&options), &Q36Env::default()).unwrap();
+            assert_eq!(
+                got.prefill_chunk, 64,
+                "an explicit chunk wins for {activation}"
+            );
+        }
     }
 
     #[test]
@@ -840,17 +889,25 @@ mod tests {
         }
     }
 
+    /// The chunk rule of packet Q36-BF16-b: the chunk path is dtype aware, so both activation
+    /// dtypes plan a chunk. `Q36Executor::plan_prefill` asks the rule with `Consts::act`, which
+    /// the setting maps through `Activation::dtype`, and the start-up line of `start::plan_prefill`
+    /// follows the plan and names no dtype rule.
     #[test]
-    fn the_chunk_rule_plans_no_chunk_while_the_activations_are_bf16() {
+    fn the_chunk_rule_plans_a_chunk_for_both_activation_dtypes() {
         assert!(
             chunked_prefill_allowed(Dtype::F32),
             "the F32 control keeps the chunked prefill"
         );
         assert!(
-            !chunked_prefill_allowed(Dtype::Bf16),
-            "the chunk path is F32 only until slice Q36-BF16-b"
+            chunked_prefill_allowed(Dtype::Bf16),
+            "the chunk path is dtype aware (packet Q36-BF16-b)"
         );
-        // The two callers reach the rule through the setting and through `Consts::act`.
+        assert!(
+            !chunked_prefill_allowed(Dtype::F16),
+            "a dtype the decoder cannot hold plans no chunk (fix1 of packet Q36-BF16-b): the rule
+            stays a rule, not a constant true"
+        );
         assert_eq!(
             super::Activation::F32.dtype(),
             Dtype::F32,
@@ -859,7 +916,7 @@ mod tests {
         assert_eq!(
             super::Activation::Bf16.dtype(),
             Dtype::Bf16,
-            "the BF16 setting maps to the BF16 the rule refuses"
+            "the BF16 setting maps to the BF16 the rule accepts"
         );
     }
 

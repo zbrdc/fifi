@@ -11,8 +11,9 @@
 //! | --- | --- | --- |
 //! | `Q36_ACTIVATION` | `f32` is the qualification control, `bf16` builds the BF16 decoder | `f32` |
 //!
-//! Any other set value fails the test. The knob applies to the real-checkpoint tests of `parity`
-//! and `route_parity` (both tests). The weights load test keeps `Q36_SCALE_DTYPE`, the older knob
+//! Any other set value fails the test. The knob applies to the real-checkpoint tests of `parity`,
+//! `route_parity` (both tests), and `prefill/parity` (its two parity gates and the prompt-speed
+//! test; packet Q36-BF16-b). The weights load test keeps `Q36_SCALE_DTYPE`, the older knob
 //! that selects the scale import alone, because it measures both import forms at the weights level;
 //! as a decoder pairing that combination is refused.
 

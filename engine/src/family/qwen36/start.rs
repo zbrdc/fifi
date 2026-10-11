@@ -16,14 +16,11 @@
 //! one-token steps and the start-up line says why.
 //!
 //! The activation dtype (packet Q36-BF16-a) travels with the rules into
-//! `ResidentDecoder::new_with_activation`. A BF16 engine also plans no chunk, whatever the budget:
-//! the chunk path runs F32 activations only until slice Q36-BF16-b, so the start-up line says so
-//! and prompts run one token at a time with the `NO_BUDGET_PIECE` piece.
+//! `ResidentDecoder::new_with_activation`. The chunk path is dtype aware (packet Q36-BF16-b), so
+//! a BF16 engine plans its chunk exactly like an F32 engine when the budget allows one.
 
 use super::resident::executor::{Q36Executor, Q36Rules};
-use super::settings::{
-    NO_BUDGET_PIECE, Q36Settings, activation_name, chunked_prefill_allowed, tokenizer_pin,
-};
+use super::settings::{NO_BUDGET_PIECE, Q36Settings, tokenizer_pin};
 use crate::{
     EngError,
     sched::worker::{Engine, spawn_engine},
@@ -62,8 +59,9 @@ pub(crate) fn start(settings: &Q36Settings) -> Result<(Engine, TokenizerBundle),
 /// Plans the chunked prefill of `executor` from the settings and returns the line to log. Without
 /// `prefill_budget` it does nothing and returns `None`, and the executor stays on one-token steps.
 /// With a budget, a plan that admits no chunk also succeeds: the line names the terms, and the
-/// executor stays on one-token steps. Only a failed plan returns an error. A BF16 engine never
-/// plans a chunk before slice Q36-BF16-b (packet Q36-BF16-a), and its line says so.
+/// executor stays on one-token steps. Only a failed plan returns an error. Both activation dtypes
+/// plan a chunk (packet Q36-BF16-b): the chunk path is dtype aware, and only the budget or the
+/// largest chunk can keep a chunk out.
 pub(super) fn plan_prefill(
     executor: &mut Q36Executor,
     settings: &Q36Settings,
@@ -74,16 +72,12 @@ pub(super) fn plan_prefill(
     let max_rows = settings.prefill_chunk;
     let plan = executor.plan_prefill(budget, settings.prefill_reserve, max_rows)?;
     let terms = plan.terms.to_string().lines().collect::<Vec<_>>().join(" ");
-    // TODO(slice Q36-BF16-b): the chunk path becomes dtype aware and this rule drops with the
-    // refusal in `ResidentDecoder::prefill`.
     Ok(Some(match plan.chunk {
         Some(rows) => {
             format!("q36 prefill: chunk of {rows} rows planned (largest {max_rows}); {terms}")
         }
-        None if !chunked_prefill_allowed(settings.activation.dtype()) => format!(
-            "q36 prefill: no chunk planned while activation_dtype is {} (the chunk path runs F32 \
-             activations only until slice Q36-BF16-b); prompts run one token at a time; {terms}",
-            activation_name(settings.activation)
+        None if max_rows == 1 => format!(
+            "q36 prefill: the largest chunk is 1 (prefill_chunk; the BF16 default until Q36-BF16-SENS, set prefill_chunk to enable the chunked prefill); prompts run one token at a time; {terms}"
         ),
         None => format!(
             "q36 prefill: no chunk above one token fits (largest {max_rows}); prompts run one token at a time; {terms}"
