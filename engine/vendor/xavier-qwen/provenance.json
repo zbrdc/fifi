@@ -43,7 +43,7 @@
     "src/ops.cu": {
       "restored_from": "src/kernels.cu",
       "vendored_sha256": "e514e857b4d0472a79d373157e49bc4d0bc62a86a4363a596d1d56eb32b76b1b",
-      "patched_sha256": "a1fd04f814032e886b990a265c8e7f8982769e990957d0f111e376dea5de7a96"
+      "patched_sha256": "70ed3e91ee2f188afe6d812869cf935c79ae7cb8ae823176c8c315479fab8a3e"
     },
     "src/ops.h": {
       "restored_from": "src/kernels.h",
@@ -204,6 +204,17 @@
         "src/ops.h": {
           "before_sha256": "0b747b26e6fb976a31c98dcc9eaa4f3235af380947475f9869d245da9968a6fa",
           "after_sha256": "87dae60022e33d7e7dbd251d6fb1a084ebd9d9c045af6d185c26c1c95cc503ce"
+        }
+      }
+    },
+    {
+      "id": "MEMSET-TRIM-xf-zero-tail",
+      "description": "add_rmsnorm_pack_k and swiglu_pack_k write the shared zero tail entry xf[mma884::kXfEntries] themselves (block 0, thread 0, !rowmajor), so the engine wrappers drop the per-call whole-buffer memset of xf (MEMSET-TRIM)",
+      "diff": "patches/MEMSET-TRIM-xf-zero-tail.patch",
+      "files": {
+        "src/ops.cu": {
+          "before_sha256": "a1fd04f814032e886b990a265c8e7f8982769e990957d0f111e376dea5de7a96",
+          "after_sha256": "70ed3e91ee2f188afe6d812869cf935c79ae7cb8ae823176c8c315479fab8a3e"
         }
       }
     }

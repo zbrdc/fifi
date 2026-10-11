@@ -105,8 +105,9 @@ fn check_swiglu(call: &SwigluRaw<'_>) -> Result<(), DeviceFailure> {
     Ok(())
 }
 
-/// Queues the SwiGLU + pack on `stream`: the zero tails of `gu` when `n_ff < k_pad`, the zeroing
-/// of a fragment-order `xf`, and the kernel. Returns when it is queued.
+/// Queues the SwiGLU + pack on `stream`: the zero tails of `gu` when `n_ff < k_pad`, and the
+/// kernel (which writes the shared zero tail of a fragment-order `xf` itself). Returns when it
+/// is queued.
 pub(in crate::kernels::cuda) fn swiglu_pack_launch(
     stream: &RawStream,
     call: SwigluRaw<'_>,

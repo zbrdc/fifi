@@ -4,8 +4,9 @@
  * Design guidance only, no code copied. Idea from MegaCapybara v1.35 static RE,
  * the MegaCapybara static-RE lessons, C6 (fuse the residual add, the RMSNorm and the
  * fp16 pack so the activations make one trip through memory). The kernel is the user's own
- * xavier-qwen code (MIT); this file only validates, zeroes the fragment-order xf like
- * inference_cuda_pack_launch and makes one kern:: call on the given stream.
+ * xavier-qwen code (MIT); this file validates and makes one kern:: call on the given stream; the
+ * kernel itself writes the zero tail entry that the padding-token lanes read (MEMSET-TRIM), so no
+ * whole-buffer memset is queued here.
  */
 #include <cuda_runtime.h>
 #include <cmath>
@@ -84,17 +85,13 @@ extern "C" int inference_cuda_add_norm_pack_launch(const inference_cuda_add_norm
             return INFERENCE_CUDA_INVALID_ARGUMENT;
         }
         const cudaStream_t s = (cudaStream_t)stream;
+        // MEMSET-TRIM: the kernel writes the zero tail entry the padding lanes read; the rest of
+        // the padding bytes is never read by any consumer, so no whole-buffer memset runs here.
         Failure failure;
-        // Padding tokens of a fragment-order xf read its zeroed tail.
-        if (in->m <= kern::kMaxTokens) {
-            failure.record(cudaMemsetAsync(in->xf, 0, xf_bytes, s), INFERENCE_CUDA_STAGE_LAUNCH);
-        }
-        if (failure.ok()) {
-            failure.record(kern::add_rmsnorm_pack((float *)in->h, (const float *)in->delta,
-                                                  (const float *)in->w, in->m, in->n, in->eps,
-                                                  (uint4 *)in->xf, (float *)in->norm_out, s),
-                           INFERENCE_CUDA_STAGE_LAUNCH);
-        }
+        failure.record(kern::add_rmsnorm_pack((float *)in->h, (const float *)in->delta,
+                                              (const float *)in->w, in->m, in->n, in->eps,
+                                              (uint4 *)in->xf, (float *)in->norm_out, s),
+                       INFERENCE_CUDA_STAGE_LAUNCH);
         report_stage(out_stage, failure.stage);
         return (int)failure.err;
     } catch (...) {

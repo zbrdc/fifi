@@ -3,8 +3,10 @@
  *
  * Design guidance only, no code copied (no MegaCapybara-derived design; the fusion of the
  * activation into the pack follows the same stop-fusing rule C6 as RD-4a). The kernel is the
- * user's own xavier-qwen code (MIT); this file validates, zeroes the padded tails and the
- * fragment-order xf, and makes one kern:: call on the given stream.
+ * user's own xavier-qwen code (MIT); this file validates, zeroes the padded tails of gu and
+ * makes one kern:: call on the given stream; the kernel itself writes the zero tail entry of
+ * the fragment-order xf that the padding-token lanes read (MEMSET-TRIM), so no whole-buffer
+ * memset of xf is queued here.
  */
 #include <cuda_runtime.h>
 #include <stddef.h>
@@ -73,10 +75,8 @@ extern "C" int inference_cuda_swiglu_pack_launch(const inference_cuda_swiglu_pac
         const cudaStream_t s = (cudaStream_t)stream;
         Failure failure;
         zero_tails(in, s, failure);
-        // Padding tokens of a fragment-order xf read its zeroed tail.
-        if (failure.ok() && in->m <= kern::kMaxTokens) {
-            failure.record(cudaMemsetAsync(in->xf, 0, xf_bytes, s), INFERENCE_CUDA_STAGE_LAUNCH);
-        }
+        // MEMSET-TRIM: the kernel writes the zero tail entry the padding lanes read; the rest of
+        // the padding bytes is never read by any consumer, so no whole-buffer memset runs here.
         if (failure.ok()) {
             failure.record(
                 kern::swiglu_pack((const float *)in->gu, in->m, in->k_pad, (uint4 *)in->xf, s),

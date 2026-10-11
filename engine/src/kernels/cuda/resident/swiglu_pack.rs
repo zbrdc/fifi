@@ -12,9 +12,9 @@
 //! the matmul queued behind it.
 //!
 //! What a call queues, in order: for `n_ff < k_pad` two 2-D memsets that zero columns
-//! `n_ff..k_pad` of both halves of every row of `gu`; for `m <= 16` one memset of the whole
-//! fixed-size fragment-order `xf`; then the kernel (with `n_ff = k_pad`, so `silu(0) * 0 = +0`
-//! fills the tail of `xf`).
+//! `n_ff..k_pad` of both halves of every row of `gu`; then the kernel (with `n_ff = k_pad`, so
+//! `silu(0) * 0 = +0` fills the tail of `xf`, and with the zero tail entry of a fragment-order
+//! `xf` written by the kernel itself, MEMSET-TRIM).
 //!
 //! Layout of `gu`: f32 `[m][2 * k_pad]`, 4-byte aligned. Row `t` holds the gate in columns
 //! `0..k_pad` (live `0..n_ff`) and the up values in columns `k_pad..2 * k_pad` (live
@@ -23,8 +23,10 @@
 //! call (the matmul wrapper writes `ldy = rows`). **The call overwrites the tails of `gu` with
 //! zeros**; the live columns are only read.
 //!
-//! `xf` is `native::xf_bytes(m, k_pad)` bytes (1,048,592 for `m <= 16`), 16-byte aligned, fully
-//! written. `gu` and `xf` must not overlap.
+//! `xf` is `native::xf_bytes(m, k_pad)` bytes (1,048,592 for `m <= 16`), 16-byte aligned; for
+//! `m <= 16` the kernel writes the data lanes of the `m` rows and the zero tail entry the padding
+//! lanes read, and the bytes no consumer reads are left untouched (MEMSET-TRIM); above 16 rows it
+//! is written in full. `gu` and `xf` must not overlap.
 //!
 //! Numerics (lane M REPLY-44 class E2, REPLY-73): the fp16 result equals the round to nearest even
 //! of the float64 `silu(gate) * up`, or the adjacent value when the reference lies within 2^-20

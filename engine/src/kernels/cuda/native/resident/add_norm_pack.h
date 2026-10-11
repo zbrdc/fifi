@@ -14,8 +14,9 @@ extern "C" {
 
 /* For each of m rows of n values: h = h + delta (when delta is not NULL; h is updated in place),
  * then norm = h * rsqrt(mean(h^2) + eps) * w, rounded to nearest even into the fp16 matmul input
- * xf (the layout kern::pack_f32 writes: fragment order for m <= 16, with the whole fixed-size
- * buffer zeroed first; row-major fp16 [m][n] for m > 16). When norm_out is not NULL it also
+ * xf (the layout kern::pack_f32 writes: fragment order for m <= 16, with the data lanes and the
+ * zero tail entry the kernel itself writes and the bytes no consumer reads left untouched,
+ * MEMSET-TRIM; row-major fp16 [m][n] for m > 16). When norm_out is not NULL it also
  * receives the f32 value that xf rounds ([m][n], the router input). All pointers are device
  * pointers. h, delta, w: f32, 4-byte aligned; norm_out: f32, 16-byte aligned (RD-5 reads it as the router
  * input and needs 16); xf: 16-byte aligned, 65537 * 16 bytes for
@@ -23,7 +24,7 @@ extern "C" {
  * finite and > 0. h, xf and norm_out are written; no range may overlap another (w and delta
  * may). stream must not be NULL (no default-stream path). Returns
  * INFERENCE_CUDA_INVALID_ARGUMENT before any CUDA call for a bad argument; enqueues at most
- * one memset and one kernel; never synchronizes. */
+ * one kernel; never synchronizes. */
 typedef struct inference_cuda_add_norm_pack_args {
     void *h;
     const void *delta;

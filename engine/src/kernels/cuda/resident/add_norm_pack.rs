@@ -5,15 +5,17 @@
 //!
 //! Design guidance only, no code copied (idea from MegaCapybara v1.35 static RE, section 6.1 C6).
 //!
-//! [`CudaContext::add_norm_pack`] queues one memset (for `m <= 16`) and one kernel on a
-//! [`DeviceStream`] and returns. The call allocates nothing, copies nothing and never
+//! [`CudaContext::add_norm_pack`] queues one kernel on a [`DeviceStream`] and returns. The call
+//! allocates nothing, copies nothing and never
 //! synchronizes; a fault in the queued work surfaces at the next synchronize of the stream and
 //! latches the backend there. The caller owns the order: the writer of `delta` must be queued on
 //! the same stream before this call, and `delta` must not share bytes with `h`.
 //!
 //! Layouts: `h`, `delta`, `norm_out` are f32 `[m][n]`, token-major; `weight` is f32 `[n]`. `xf` is
-//! the layout `pack` writes: the fixed-size fragment-order buffer (1,048,592 bytes, zeroed in
-//! full first) for `m <= 16`, fp16 `[m][n]` row-major above. `norm_out` must be 16-byte aligned
+//! the layout `pack` writes: the fixed-size fragment-order buffer (1,048,592 bytes, of which the
+//! kernel writes the data lanes of the `m` rows and the zero tail entry the padding lanes read,
+//! MEMSET-TRIM; the bytes no consumer reads are left untouched) for `m <= 16`, fp16 `[m][n]`
+//! row-major above. `norm_out` must be 16-byte aligned
 //! because the router reads it as its input row.
 //!
 //! Numerics: the f32 sum of squares runs in a fixed order (no atomics), so a launch is
@@ -56,7 +58,8 @@ const UNIT_C: c_int = NORM_WIDTH_UNIT as c_int;
 ///   `weight` and with nothing else.
 /// - `weight`: f32 `[n]`, 4-byte aligned, read only.
 /// - `xf`: [`xf_bytes`]`(m, n)` bytes (1,048,592 for `m <= 16`, `m * n * 2` above), 16-byte
-///   aligned; written in full (zeroed first for `m <= 16`).
+///   aligned; the data lanes of the `m` rows and the zero tail entry are written (`m <= 16`), the
+///   whole buffer above.
 /// - `norm_out`: `None`, or f32 `[m][n]`, 16-byte aligned; the value that `xf` rounds.
 /// - `eps`: finite and above 0 (GGUF `layer_norm_rms_epsilon`).
 pub(crate) struct AddNormCall<'b> {
@@ -176,9 +179,10 @@ fn check_apart(call: &AddNormCall<'_>, need: &Sizes) -> Result<(), EngError> {
 impl CudaContext {
     /// Queues the fused residual add, RMSNorm and fp16 pack of `call` on `stream`: `h += delta`
     /// in place when `delta` is given, the f32 normalised row into `norm_out` when given, and the
-    /// fp16 matmul input into `xf` (fragment order for `m <= 16`, zeroed in full first;
-    /// row-major above). Returns when the work is queued; the outputs are valid after the stream
-    /// drained.
+    /// fp16 matmul input into `xf` (fragment order for `m <= 16`, where the kernel also writes
+    /// the zero tail entry the padding lanes read and leaves the unread bytes untouched,
+    /// MEMSET-TRIM; row-major and fully written above). Returns when the work is queued; the
+    /// outputs are valid after the stream drained.
     ///
     /// The caller owns the order: queue the writer of `delta` on `stream` before this call, and
     /// never pass the same bytes as `delta` and `h`. A finite row whose sum of squares overflows

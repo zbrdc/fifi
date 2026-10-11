@@ -95,6 +95,15 @@ fn range(buffer: &DeviceBuffer, bytes: usize) -> DeviceRange<'_> {
     buffer.range(0, bytes).expect("range")
 }
 
+/// The 16 bytes of the shared zero tail entry `xf[kXfEntries]` (65,536 data entries, then the
+/// tail): every padding lane of `mma884::load_x` reads it. MEMSET-TRIM: the pack kernels write
+/// it themselves, so no whole-buffer memset runs.
+fn tail(xf: &[u8]) -> [u8; 16] {
+    let mut out = [0u8; 16];
+    out.copy_from_slice(&xf[65_536 * 16..65_536 * 16 + 16]);
+    out
+}
+
 /// What a launch left in `h`, `xf` and `norm_out`, as bytes.
 struct Output {
     h: Vec<u8>,
@@ -338,9 +347,17 @@ fn pin_overflow(rig: &Rig) {
         got.out.iter().all(|&b| b == 0),
         "overflowing finite row: norm_out is not zero"
     );
+    // MEMSET-TRIM: only the data lanes and the tail entry are written; the unread bytes keep the
+    // fill, so the zeros are asserted on what a reader consumes.
+    let packed = unpack_xf(&got.xf, 1, 256);
     assert!(
-        got.xf.iter().all(|&b| b == 0),
-        "overflowing finite row: xf is not zero"
+        packed.iter().all(|&b| b & 0x7fff == 0),
+        "overflowing finite row: the xf data lanes are not zero"
+    );
+    assert_eq!(
+        tail(&got.xf),
+        [0u8; 16],
+        "overflowing finite row: the xf tail entry is not zero"
     );
     inp.h[5] = f32::INFINITY;
     let got = launch(rig, &inp, false, true);
@@ -442,11 +459,27 @@ fn pack_and_matmul(rig: &Rig, m: usize, n: usize) {
         read_bytes(ctx, &fused, xf_len),
         read_bytes(ctx, &packed, xf_len),
     );
-    assert_eq!(
-        (a.len(), fnv1a64(&a)),
-        (b.len(), fnv1a64(&b)),
-        "m={m} n={n}: the fused xf differs from pack"
-    );
+    // MEMSET-TRIM: below 17 rows only the data lanes and the tail are written, so the fused and
+    // the `pack` buffers are compared on what a reader consumes (the tables and the tail), not on
+    // the unread fill; above they are row-major and fully written.
+    if m <= 16 {
+        assert_eq!(
+            unpack_xf(&a, m, n),
+            unpack_xf(&b, m, n),
+            "m={m} n={n}: the fused xf data lanes differ from pack"
+        );
+        assert_eq!(
+            tail(&a),
+            tail(&b),
+            "m={m} n={n}: the fused xf tail differs from pack"
+        );
+    } else {
+        assert_eq!(
+            (a.len(), fnv1a64(&a)),
+            (b.len(), fnv1a64(&b)),
+            "m={m} n={n}: the fused xf differs from pack"
+        );
+    }
     let weights = upload_weight(ctx, GgufType::Q80, Y_ROWS, n);
     let ya = matmul_y(rig, &weights, (&fused, xf_len), m);
     let yb = matmul_y(rig, &weights, (&packed, xf_len), m);
@@ -467,6 +500,186 @@ fn add_norm_pack_xf_equals_the_pack_wrapper_and_feeds_the_matmul() {
         pack_and_matmul(&rig, m, 2048);
     }
     pack_and_matmul(&rig, 1, 4096);
+}
+
+/// One pack of `inp` into a fresh `xf` buffer preloaded with `fill` bytes, keeping the buffer on
+/// the device for a following matmul (MEMSET-TRIM: the fill stands in for the garbage an aliased
+/// arena slot can hold, `fill = 0` for the old way, a zeroed buffer).
+fn trim_pack(rig: &Rig, inp: &Inputs, fill: u8, run: (bool, bool)) -> (DeviceBuffer, Vec<u8>) {
+    let ctx = &rig.ctx;
+    let row = row_bytes(inp.m, inp.n).expect("row bytes");
+    let xf_len = xf_bytes(inp.m, inp.n).expect("xf bytes");
+    let h = upload_f32(ctx, &inp.h);
+    let delta = upload_f32(ctx, &inp.delta);
+    let weight = upload_f32(ctx, &inp.weight);
+    let xf = upload_filled(ctx, fill, xf_len);
+    let out = upload_filled(ctx, FILL, row);
+    let call = AddNormCall {
+        m: inp.m,
+        n: inp.n,
+        eps: inp.eps,
+        h: range(&h, row),
+        delta: run.0.then(|| range(&delta, row)),
+        weight: range(&weight, inp.n * 4),
+        xf: range(&xf, xf_len),
+        norm_out: run.1.then(|| range(&out, row)),
+    };
+    ctx.add_norm_pack(&rig.stream, call).expect("launch");
+    rig.stream.synchronize().expect("drain the stream");
+    let bytes = read_bytes(ctx, &xf, xf_len);
+    (xf, bytes)
+}
+
+/// MEMSET-TRIM test 1: with the whole `xf` buffer pre-filled with garbage (0xFF, the tail
+/// included) the pack itself must leave (a) the shared zero tail entry zero, (b) the data lanes
+/// of the tokens below `m` at the float64 reference, and (c) a following `matmul` bitwise equal
+/// to the same matmul over a buffer prepared the old way (zeroed, then packed). `m = 16` at
+/// `n = 32768` covers the top data entry `kXfEntries - 1` (token 15's last tile), which an
+/// off-by-one tail write would clobber.
+#[test]
+fn add_norm_pack_writes_the_zero_tail_over_garbage() {
+    if !testkit::device_present("add_norm_pack_writes_the_zero_tail_over_garbage") {
+        return;
+    }
+    let rig = Rig::new();
+    let mut one_step = 0usize;
+    let mut elements = 0usize;
+    for (m, n) in [
+        (1, 2048),
+        (3, 2048),
+        (8, 2048),
+        (9, 2048),
+        (16, 2048),
+        (16, 32_768),
+    ] {
+        let inp = inputs(MODEL, m, n, 0x4b10 + (m * 131 + n) as u64);
+        for run in [(true, true), (true, false), (false, true), (false, false)] {
+            let (garbage, bytes) = trim_pack(&rig, &inp, FILL, run);
+            assert_eq!(
+                tail(&bytes),
+                [0u8; 16],
+                "m={m} n={n} delta={} out={}: the tail entry kept garbage",
+                run.0,
+                run.1
+            );
+            let reference = ref_norm(&residual(&inp, run.0), &inp);
+            let packed = unpack_xf(&bytes, m, n);
+            for (i, (&bits, &want)) in packed.iter().zip(&reference).enumerate() {
+                assert!(
+                    e2_holds(bits, want),
+                    "m={m} n={n} delta={} out={}: xf[{i}] = {bits:#06x} misses the E2 rule for {want:e}",
+                    run.0,
+                    run.1
+                );
+                one_step += usize::from(bits != f64_to_f16_bits(want));
+            }
+            elements += packed.len();
+            let (zeroed, zeroed_bytes) = trim_pack(&rig, &inp, 0, run);
+            assert_eq!(
+                packed,
+                unpack_xf(&zeroed_bytes, m, n),
+                "m={m} n={n}: the data lanes depend on the fill"
+            );
+            let weight = upload_weight(&rig.ctx, GgufType::Q80, Y_ROWS, n);
+            let ya = matmul_y(&rig, &weight, (&garbage, xf_bytes(m, n).expect("xf")), m);
+            let yb = matmul_y(&rig, &weight, (&zeroed, xf_bytes(m, n).expect("xf")), m);
+            if n == 32_768 {
+                // At k = 32768 the matmul splits K 16 ways and accumulates with atomicAdd
+                // (mma884 store<SPLIT>), so even two runs over byte-identical buffers differ in
+                // the low bits by the summation order; with two addends (k <= 4096, split <= 2)
+                // float addition commutes and the result is exact. A wrong or garbage lane would
+                // move a partial sum wholesale, orders above this tolerance.
+                let (dev, ref_max) = (testkit::floats(&ya), testkit::floats(&yb));
+                let scale = ref_max.iter().fold(1.0f32, |top, v| top.max(v.abs()));
+                let worst = dev
+                    .iter()
+                    .zip(&ref_max)
+                    .map(|(&a, &b)| (a - b).abs())
+                    .fold(0.0f32, f32::max);
+                assert!(
+                    worst <= 1e-3 * scale,
+                    "m={m} n={n}: the matmul over garbage differs by {worst:e} (scale {scale:e})"
+                );
+                println!(
+                    "MEMSET-TRIM add_norm_pack m={m} n={n}: split-K matmul, max |d| {worst:e} of scale {scale:e}"
+                );
+            } else {
+                assert_eq!(
+                    ya, yb,
+                    "m={m} n={n}: the matmul over garbage differs from the old way"
+                );
+            }
+        }
+    }
+    println!(
+        "MEMSET-TRIM add_norm_pack: {elements} data lanes, {one_step} one-step fp16 roundings"
+    );
+}
+
+/// MEMSET-TRIM test 2: a pack of `m = 3` straight into a pack of `m = 1` on the same buffer, with
+/// no re-zeroing between the calls (an aliased arena slot reuses the bytes); the `m = 1` data
+/// lanes, the tail and the matmul must not depend on the stale lanes of tokens 1 and 2.
+#[test]
+fn add_norm_pack_ignores_stale_padding_between_launches() {
+    if !testkit::device_present("add_norm_pack_ignores_stale_padding_between_launches") {
+        return;
+    }
+    let rig = Rig::new();
+    let (ctx, stream) = (&rig.ctx, &rig.stream);
+    let n = 2048;
+    let xf_len = xf_bytes(1, n).expect("xf bytes");
+    let row3 = row_bytes(3, n).expect("row bytes");
+    let row1 = row_bytes(1, n).expect("row bytes");
+    let xf = upload_filled(ctx, FILL, xf_len);
+    let one = |m: usize, row: usize| {
+        let inp = inputs(MODEL, m, n, 0x4b20 + m as u64);
+        let h = upload_f32(ctx, &inp.h);
+        let delta = upload_f32(ctx, &inp.delta);
+        let weight = upload_f32(ctx, &inp.weight);
+        let out = upload_filled(ctx, FILL, row);
+        let call = AddNormCall {
+            m,
+            n,
+            eps: inp.eps,
+            h: range(&h, row),
+            delta: Some(range(&delta, row)),
+            weight: range(&weight, n * 4),
+            xf: range(&xf, xf_len),
+            norm_out: Some(range(&out, row)),
+        };
+        ctx.add_norm_pack(stream, call).expect("launch");
+        stream.synchronize().expect("drain the stream");
+        inp
+    };
+    let _stale = one(3, row3);
+    let inp = one(1, row1);
+    let bytes = read_bytes(ctx, &xf, xf_len);
+    assert_eq!(
+        tail(&bytes),
+        [0u8; 16],
+        "the tail entry is not zero after m=1"
+    );
+    let reference = ref_norm(&residual(&inp, true), &inp);
+    let packed = unpack_xf(&bytes, 1, n);
+    for (i, (&bits, &want)) in packed.iter().zip(&reference).enumerate() {
+        assert!(
+            e2_holds(bits, want),
+            "after m=3 then m=1: xf[{i}] = {bits:#06x} misses the E2 rule for {want:e}"
+        );
+    }
+    let weight = upload_weight(ctx, GgufType::Q80, Y_ROWS, n);
+    let ya = matmul_y(&rig, &weight, (&xf, xf_len), 1);
+    let (zeroed, zeroed_bytes) = trim_pack(&rig, &inp, 0, (true, true));
+    assert_eq!(
+        packed,
+        unpack_xf(&zeroed_bytes, 1, n),
+        "the m=1 data lanes depend on the stale bytes"
+    );
+    let yb = matmul_y(&rig, &weight, (&zeroed, xf_len), 1);
+    assert_eq!(
+        ya, yb,
+        "the matmul over the stale buffer differs from the old way"
+    );
 }
 
 /// The text of a `BadRequest`, or a failure naming the unexpected result.
@@ -1004,7 +1217,8 @@ fn add_norm_pack_reports_a_bad_range_before_a_latched_context() {
     println!("latch child: done");
 }
 
-/// One captured call replays to the bytes of the eager call, as two graph nodes (memset, kernel).
+/// One captured call replays to the bytes of the eager call, as one graph node (the kernel; the
+/// whole-buffer memset is gone, MEMSET-TRIM).
 #[test]
 fn add_norm_pack_inside_a_capture_equals_eager() {
     if !testkit::device_present("add_norm_pack_inside_a_capture_equals_eager") {
@@ -1043,7 +1257,7 @@ fn add_norm_pack_inside_a_capture_equals_eager() {
             rig.ctx.add_norm_pack(&rig.stream, call_on(&b, &inp, 1))
         })
         .expect("capture");
-    assert_eq!(graph.nodes(), 2, "a memset and a kernel");
+    assert_eq!(graph.nodes(), 1, "one kernel, no memset (MEMSET-TRIM)");
     assert_eq!(read()[1], vec![FILL; xf_len], "the capture ran nothing");
     graph.launch(&rig.stream).expect("replay");
     rig.stream.synchronize().expect("drain the replay");

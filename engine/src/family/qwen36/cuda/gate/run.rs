@@ -301,9 +301,9 @@ fn prefill(step: &mut QwenResidentStep<'_>, x: &RunInputs<'_>) -> Result<u32, En
 
 /// The row buffers and `fed`, allocated BEFORE `PhaseTimer::start` so no allocation sits
 /// inside a timed region (RD-10a-17b item 3): one zeroed logits row per timed step and the
-/// fed vector at its full capacity.
-fn alloc_rows(step: &QwenResidentStep<'_>) -> (Vec<Vec<u8>>, Vec<u32>) {
-    let row_len = step.row_bytes().len();
+/// fed vector at its full capacity. The caller passes the row length (`step.row_bytes()`),
+/// so the helper runs and is checked on the CPU, with no device.
+fn alloc_rows(row_len: usize) -> (Vec<Vec<u8>>, Vec<u32>) {
     let rows: Vec<Vec<u8>> = (0..N_STEPS).map(|_| vec![0u8; row_len]).collect();
     (rows, Vec::with_capacity(N_STEPS))
 }
@@ -318,7 +318,7 @@ fn timed_region(
 ) -> Result<Region, EngError> {
     let last_prompt = prefill(step, x)?;
     let prompt_synced = unix_ns()?;
-    let (mut rows, mut fed) = alloc_rows(step);
+    let (mut rows, mut fed) = alloc_rows(step.row_bytes().len());
     let mut timer = PhaseTimer::start(MonotonicClock::new());
     let timed_start = unix_ns()?;
     let (mut prev, mut syncs, mut host_writes) = (0u32, 0u64, 0u64);
@@ -688,44 +688,84 @@ mod tests {
         rest.starts_with("fn ")
     }
 
-    /// A copy of the section text without line comments and without string literals: every
-    /// `//` to the end of its line and every `"..."` (with `\` escapes) becomes one space, so
-    /// a comment cannot satisfy a pin.
+    /// A copy of the section text without comments and without string or char literals:
+    /// every `//` line comment, every nested `/* ... */` block comment and every `"..."` or
+    /// `'...'` literal (with `\` escapes) becomes one space, so a comment cannot satisfy a
+    /// pin and a `/*` inside a literal starts no comment (lifetimes like `'a` are kept).
     fn code_only(text: &str) -> String {
         let bytes = text.as_bytes();
         let mut out = String::with_capacity(text.len());
         let (mut plain, mut at) = (0, 0);
         while at < bytes.len() {
-            match bytes[at] {
-                b'/' if bytes.get(at + 1) == Some(&b'/') => {
-                    out.push_str(&text[plain..at]);
-                    out.push(' ');
-                    while at < bytes.len() && bytes[at] != b'\n' {
-                        at += 1;
-                    }
-                    plain = at;
+            let skipped = match bytes[at] {
+                b'/' if bytes.get(at + 1) == Some(&b'/') => Some(skip_line_comment(bytes, at)),
+                b'/' if bytes.get(at + 1) == Some(&b'*') => {
+                    Some(skip_block_comment(bytes, at + 2, 1))
                 }
-                b'"' => {
-                    out.push_str(&text[plain..at]);
-                    out.push(' ');
-                    at += 1;
-                    while at < bytes.len() {
-                        match bytes[at] {
-                            b'\\' => at = (at + 2).min(bytes.len()),
-                            b'"' => {
-                                at += 1;
-                                break;
-                            }
-                            _ => at += 1,
-                        }
-                    }
-                    plain = at;
-                }
-                _ => at += 1,
+                b'"' => Some(skip_quoted(bytes, at + 1, b'"')),
+                b'\'' if opens_char_literal(bytes, at) => Some(skip_quoted(bytes, at + 1, b'\'')),
+                _ => None,
+            };
+            if let Some(end) = skipped {
+                out.push_str(&text[plain..at]);
+                out.push(' ');
+                at = end;
+                plain = at;
+            } else {
+                at += 1;
             }
         }
         out.push_str(&text[plain..]);
         out
+    }
+
+    /// The index after the `//` line comment starting at `at` (the newline itself stays).
+    fn skip_line_comment(bytes: &[u8], mut at: usize) -> usize {
+        while at < bytes.len() && bytes[at] != b'\n' {
+            at += 1;
+        }
+        at
+    }
+
+    /// The index after the nested block comment whose body starts at `at` (depth 1 on
+    /// entry): `/*` nests, a `//` inside is plain text, and an unterminated comment ends at
+    /// the end of the text instead of a panic.
+    fn skip_block_comment(bytes: &[u8], mut at: usize, mut depth: usize) -> usize {
+        while depth > 0 && at < bytes.len() {
+            match (bytes.get(at), bytes.get(at + 1)) {
+                (Some(b'/'), Some(b'*')) => {
+                    depth += 1;
+                    at += 2;
+                }
+                (Some(b'*'), Some(b'/')) => {
+                    depth -= 1;
+                    at += 2;
+                }
+                _ => at += 1,
+            }
+        }
+        at
+    }
+
+    /// The index after the quoted literal (string or char) whose body starts at `at`.
+    fn skip_quoted(bytes: &[u8], mut at: usize, quote: u8) -> usize {
+        while at < bytes.len() {
+            match bytes[at] {
+                b'\\' => at = (at + 2).min(bytes.len()),
+                b if b == quote => return at + 1,
+                _ => at += 1,
+            }
+        }
+        at
+    }
+
+    /// True when the `'` at `at` opens a char literal rather than a lifetime: `'x'`, `'''`
+    /// never occurs, and an escape (`'\\..'`) always does.
+    fn opens_char_literal(bytes: &[u8], at: usize) -> bool {
+        matches!(
+            (bytes.get(at + 1), bytes.get(at + 2)),
+            (Some(b'\\'), _) | (Some(_), Some(b'\''))
+        )
     }
 
     /// The pinned form of a section: code only, whitespace collapsed to one space, so a
@@ -735,6 +775,70 @@ mod tests {
             .split_whitespace()
             .collect::<Vec<_>>()
             .join(" ")
+    }
+
+    #[test]
+    fn code_only_strips_block_comments_and_keeps_the_rest_alive() {
+        // Pinned text inside a block comment is not found: the comment becomes one space.
+        let stripped = code_only(r#"let a = 1; /* refuse_sync_each(sync_each)?; */ let b = 2;"#);
+        assert!(stripped.contains("let a = 1;"));
+        assert!(stripped.contains("let b = 2;"));
+        assert!(!stripped.contains("refuse_sync_each"));
+        // Block comments nest: everything up to the OUTER close goes.
+        let nested = code_only("/* outer /* inner */ still a comment */ let c = 3;");
+        assert!(nested.contains("let c = 3;"));
+        assert!(!nested.contains("still a comment"));
+        // A `/*` inside a string literal starts no comment: the code after it survives.
+        let quoted = code_only(r#"let s = "/*"; let d = 4;"#);
+        assert!(quoted.contains("let d = 4;"));
+        assert!(!quoted.contains("/*"));
+        // A `//` inside a block comment does not end it: the close still closes.
+        let mixed = code_only("/* // not a line end */ let e = 5;");
+        assert!(mixed.contains("let e = 5;"));
+        assert!(!mixed.contains("not a line end"));
+        // An unterminated block comment strips to the end of the text and does not panic.
+        let open = code_only("let f = 6; /* never closed");
+        assert!(open.contains("let f = 6;"));
+        assert!(!open.contains("never closed"));
+    }
+
+    #[test]
+    fn code_only_keeps_lifetimes_and_skips_char_literals() {
+        // The pinned sections carry lifetimes (`QwenResidentStep<'_>`): not literals.
+        let lifetime = code_only("fn f(step: &mut QwenResidentStep<'_>) {}");
+        assert!(lifetime.contains("QwenResidentStep<'_>"));
+        // A quote inside a char literal opens no string: the code after it survives.
+        let quoted = code_only("let q = '\"'; let g = 7;");
+        assert!(quoted.contains("let g = 7;"));
+        assert!(!quoted.contains("'\"'"));
+        // An escaped quote inside a string ends nothing early.
+        let escaped = code_only(r#"let h = "a\"b"; let i = 8;"#);
+        assert!(escaped.contains("let i = 8;"));
+        assert!(!escaped.contains(r#""a\"b""#));
+    }
+
+    #[test]
+    fn alloc_rows_builds_one_zeroed_row_per_step_and_an_empty_fed_at_capacity() {
+        let row_len = 12;
+        let (rows, fed) = alloc_rows(row_len);
+        assert_eq!(
+            rows.len(),
+            N_STEPS,
+            "the helper must build one row per timed step"
+        );
+        for (index, row) in rows.iter().enumerate() {
+            assert_eq!(
+                row.len(),
+                row_len,
+                "row {index} is not {row_len} bytes long"
+            );
+            assert!(
+                row.iter().all(|&byte| byte == 0),
+                "row {index} is not zeroed"
+            );
+        }
+        assert!(fed.is_empty(), "fed starts empty");
+        assert!(fed.capacity() >= N_STEPS, "fed is not at its full capacity");
     }
 
     #[test]
@@ -751,9 +855,13 @@ mod tests {
         }
         let body = pinned_text(fn_section("fn timed_region("));
         let length = body.len();
-        let helper_call = body.find("alloc_rows(step)").unwrap_or_else(|| {
-            panic!("timed_region ({length} bytes) never takes alloc_rows(step)")
-        });
+        let helper_call = body
+            .find("alloc_rows(step.row_bytes().len())")
+            .unwrap_or_else(|| {
+                panic!(
+                    "timed_region ({length} bytes) never takes alloc_rows(step.row_bytes().len())"
+                )
+            });
         let timer = body
             .find("PhaseTimer::start")
             .unwrap_or_else(|| panic!("timed_region ({length} bytes) has no PhaseTimer::start"));
@@ -765,8 +873,7 @@ mod tests {
             "the alloc_rows call ({helper_call}) sits inside the timed region (the timer \
              starts at {timer}, the timed_start stamp is at {stamp})"
         );
-        // The loop must use the helper's own bindings, and nothing may rebuild them or
-        // allocate anywhere in the timed region: the raw forms live in alloc_rows only.
+        // The loop must use the helper's own bindings: the raw forms live in alloc_rows only.
         for used in ["rows.iter_mut()", "fed.push("] {
             let at = body
                 .find(used)
@@ -776,12 +883,6 @@ mod tests {
                 "the loop uses {used} ({at}) before alloc_rows produced it ({helper_call})"
             );
         }
-        for stray in ["vec![0u8", "Vec::with_capacity", "rows =", "fed ="] {
-            assert!(
-                !body.contains(stray),
-                "the timed region ({length} bytes) builds {stray} instead of taking alloc_rows"
-            );
-        }
         assert!(
             !body[timer..].contains("alloc_rows"),
             "the timed region calls alloc_rows again after the timer starts"
@@ -789,12 +890,49 @@ mod tests {
     }
 
     #[test]
+    fn the_timed_region_text_spells_no_allocation() {
+        let body = pinned_text(fn_section("fn timed_region("));
+        let length = body.len();
+        // What is actually checked: a substring denylist over the STRIPPED timed_region
+        // text. It catches the known allocating spellings (a per-step to_vec copy, a
+        // rebound Vec::from(..).collect(), a fresh Vec::new); a genuinely new allocation
+        // whose spelling shares no substring with this list would still pass.
+        for stray in [
+            "to_vec",
+            "Vec::new",
+            "Vec::from",
+            ".collect",
+            ".clone()",
+            "vec!",
+            "Box::new",
+            "format!",
+            "String::from",
+            ".to_owned",
+            ".into_boxed",
+            "Vec::with_capacity",
+            "rows =",
+            "fed =",
+        ] {
+            assert!(
+                !body.contains(stray),
+                "the timed region ({length} bytes) contains the allocating form {stray}"
+            );
+        }
+        // The per-step copy is the pinned statement itself (quoted from run.rs).
+        assert!(
+            body.contains("row.copy_from_slice(step.row_bytes())"),
+            "the per-step copy of the {length}-byte body is not row.copy_from_slice(step.row_bytes())"
+        );
+    }
+
+    #[test]
     fn the_sync_each_refusal_is_propagated_before_any_device_call() {
         let body = pinned_text(fn_section("fn device_gate("));
         let length = body.len();
-        // The pin demands the propagated call itself: a commented-out call is stripped with
-        // its comment, and a dead `let _ = refuse_sync_each(sync_each);` binding carries no
-        // `?` behind the closing parenthesis, so neither of them satisfies the pin.
+        // The pin demands the propagated call itself: a commented-out call (a line or a
+        // block comment) is stripped with its comment, and a dead `let _ =
+        // refuse_sync_each(sync_each);` binding carries no `?` behind the closing
+        // parenthesis, so neither of them satisfies the pin.
         let refusal = body
             .find("refuse_sync_each(sync_each)?")
             .unwrap_or_else(|| {
@@ -806,6 +944,27 @@ mod tests {
         assert!(
             refusal < device,
             "the sync-each refusal ({refusal}) runs after the device work ({device})"
+        );
+        // The call must also sit at the TOP LEVEL of the function body: an `if false { .. }`
+        // wrapper, a `match` arm or a closure all move it off the unconditional path, and a
+        // rebind of `sync_each` between the env read and the call silences the refusal.
+        let before = &body[..refusal];
+        let depth = before.matches('{').count() as isize - before.matches('}').count() as isize;
+        assert_eq!(
+            depth, 1,
+            "the refusal ({refusal}) sits {depth} brace levels into device_gate, not at the top level"
+        );
+        let boundary = before.trim_end().chars().next_back();
+        assert!(
+            matches!(boundary, Some(';') | Some('{') | Some('}')),
+            "the refusal ({refusal}) does not start a standalone statement of device_gate"
+        );
+        let env_read = body
+            .find("std::env::var(SYNC_EACH_VAR)")
+            .unwrap_or_else(|| panic!("device_gate ({length} bytes) never reads {SYNC_EACH_VAR}"));
+        assert!(
+            !body[env_read..refusal].contains("let sync_each"),
+            "sync_each is rebound between the env read ({env_read}) and the refusal ({refusal})"
         );
     }
 

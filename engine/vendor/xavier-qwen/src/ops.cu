@@ -34,6 +34,12 @@ __device__ float softplus(float x) { return x > 20.f ? x : log1pf(__expf(x)); }
 
 __global__ void add_rmsnorm_pack_k(float* h, const float* delta, const float* w, int n,
                                    float eps, bool rowmajor, uint4* xf, float* norm_out) {
+  // MEMSET-TRIM: the padding-token lanes of mma884 load_x all read the one shared zero entry
+  // xf[kXfEntries], which write_xf never touches (its top index is kXfEntries - 1). One store
+  // here re-establishes that tail every call, so the wrapper needs no per-call memset of the
+  // whole 1 MiB buffer, and an arena slot whose bytes another tensor reused stays correct.
+  if (!rowmajor && blockIdx.x == 0 && threadIdx.x == 0)
+    xf[mma884::kXfEntries] = make_uint4(0, 0, 0, 0);
   int tok = blockIdx.x;
   float* row = h + (size_t)tok * n;
   float ss = 0.f;
@@ -55,6 +61,10 @@ __global__ void add_rmsnorm_pack_k(float* h, const float* delta, const float* w,
 }
 
 __global__ void swiglu_pack_k(const float* gu, int n_ff, bool rowmajor, uint4* xf) {
+  // MEMSET-TRIM: as in add_rmsnorm_pack_k, one store keeps the shared zero tail entry that the
+  // padding-token lanes of mma884 load_x read, so the wrapper drops the whole-buffer memset.
+  if (!rowmajor && blockIdx.x == 0 && threadIdx.x == 0)
+    xf[mma884::kXfEntries] = make_uint4(0, 0, 0, 0);
   const float* g = gu + (size_t)blockIdx.x * 2 * n_ff;
   write_xf(xf, n_ff, blockIdx.x, rowmajor, [&](int i) { return silu(g[i]) * g[n_ff + i]; });
 }

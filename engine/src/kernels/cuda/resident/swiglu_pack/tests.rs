@@ -116,6 +116,15 @@ fn to_bytes(values: &[f32]) -> Vec<u8> {
     values.iter().flat_map(|v| v.to_le_bytes()).collect()
 }
 
+/// The 16 bytes of the shared zero tail entry `xf[kXfEntries]` (65,536 data entries, then the
+/// tail): every padding lane of `mma884::load_x` reads it. MEMSET-TRIM: the pack kernel writes
+/// it itself, so no whole-buffer memset runs.
+fn tail(xf: &[u8]) -> [u8; 16] {
+    let mut out = [0u8; 16];
+    out.copy_from_slice(&xf[65_536 * 16..65_536 * 16 + 16]);
+    out
+}
+
 /// The float64 reference of one element.
 fn ref_swiglu(gate: f32, up: f32) -> f64 {
     silu_f64(f64::from(gate)) * f64::from(up)
@@ -395,11 +404,22 @@ fn check_padded(dev: &Dev, shape: Shape, stats: &mut Stats) {
     }
     let first = run_case(dev, shape, &gu, 0xFF);
     let second = run_case(dev, shape, &gu, 0x5A);
+    // MEMSET-TRIM: only the data lanes and the tail are written, so the two fills are compared on
+    // what a reader consumes (the unpacked rows and the tail), not on the unread fill bytes.
     assert_eq!(
-        fnv1a64(&first.xf),
-        fnv1a64(&second.xf),
-        "{shape:?}: the 0xFF and 0x5A results"
+        unpack_xf(&first.xf, shape.m, shape.k_pad),
+        unpack_xf(&second.xf, shape.m, shape.k_pad),
+        "{shape:?}: the 0xFF and 0x5A data lanes"
     );
+    // MEMSET-TRIM: the tail entry exists only in the fragment-order buffer (m <= 16); above that
+    // the buffer is row-major and fully written.
+    if shape.m <= 16 {
+        assert_eq!(
+            tail(&first.xf),
+            [0u8; 16],
+            "{shape:?}: the tail entry kept garbage"
+        );
+    }
     let after = floats(&first.gu);
     for (at, (&got, &sent)) in after.iter().zip(&gu).enumerate() {
         // Only a tail starts as NaN, and it must come back as +0.0; a live word is unchanged.
@@ -419,11 +439,21 @@ fn check_padded(dev: &Dev, shape: Shape, stats: &mut Stats) {
         }
     }
     check_live(shape, &gu, &first.xf, stats);
+    // MEMSET-TRIM: `pack` still zeroes its whole output buffer, so the comparison with the pack
+    // of `[h | 0]` covers the unpacked rows and the tail, the bytes a reader consumes.
+    let reference = pack_reference(dev, &x, shape);
     assert_eq!(
-        first.xf,
-        pack_reference(dev, &x, shape),
-        "{shape:?}: xf bytes against the pack of [h | 0]"
+        unpack_xf(&first.xf, shape.m, shape.k_pad),
+        unpack_xf(&reference, shape.m, shape.k_pad),
+        "{shape:?}: xf rows against the pack of [h | 0]"
     );
+    if shape.m <= 16 {
+        assert_eq!(
+            tail(&first.xf),
+            tail(&reference),
+            "{shape:?}: the tail against the pack of [h | 0]"
+        );
+    }
     let weight = upload_weight(&dev.ctx, GgufType::Q4K, WEIGHT_ROWS, shape.k_pad);
     assert_eq!(
         consumer_y(dev, &weight, &first.xf, shape.m),
@@ -459,6 +489,135 @@ fn swiglu_pack_pads_with_exact_zeros_for_mellum_shapes() {
         report("padded shapes", &stats),
         0,
         "E2 misses of the live columns"
+    );
+}
+
+/// Packs `gu` of `shape` into the given `xf` buffer and returns its bytes: the buffer keeps its
+/// old bytes wherever the kernel writes none (MEMSET-TRIM: the lanes of an earlier call stay
+/// stale, exactly as in an aliased arena slot).
+fn pack_into(dev: &Dev, shape: Shape, gu: &[f32], xf: &DeviceBuffer) -> Vec<u8> {
+    let gu_buffer = upload_f32(&dev.ctx, gu);
+    let xf_len = xf_bytes(shape.m, shape.k_pad).expect("xf size");
+    let call = SwigluPackCall {
+        gu: gu_buffer.range(0, gu.len() * 4).expect("gu range"),
+        xf: xf.range(0, xf_len).expect("xf range"),
+        m: shape.m,
+        n_ff: shape.n_ff,
+    };
+    if shape.n_ff == shape.k_pad {
+        dev.ctx.swiglu_pack(&dev.stream, call)
+    } else {
+        dev.ctx.swiglu_pack_padded(&dev.stream, call, shape.k_pad)
+    }
+    .expect("swiglu_pack");
+    dev.stream.synchronize().expect("drain the stream");
+    read_bytes(&dev.ctx, xf, xf_len)
+}
+
+/// MEMSET-TRIM test 1: with the whole `xf` buffer pre-filled with garbage (0xFF, the tail
+/// included) the pack itself must leave (a) the shared zero tail entry zero, (b) the live columns
+/// at the float64 reference, and (c) a following `matmul` bitwise equal to the same matmul over a
+/// buffer prepared the old way (zeroed, then packed). `m = 16` at `k_pad = 32768` covers the top
+/// data entry `kXfEntries - 1` (token 15's last tile), which an off-by-one tail write would
+/// clobber; the padded shape covers the 2-D tail memsets path.
+#[test]
+fn swiglu_pack_writes_the_zero_tail_over_garbage() {
+    if !testkit::device_present("swiglu_pack_writes_the_zero_tail_over_garbage") {
+        return;
+    }
+    let dev = Dev::new();
+    let mut stats = Stats::default();
+    let mut shapes: Vec<Shape> = [1, 3, 8, 9, 16].map(|m| unpadded(m, 512)).to_vec();
+    shapes.push(unpadded(16, 32_768));
+    shapes.push(Shape {
+        m: 3,
+        n_ff: 896,
+        k_pad: 1024,
+    });
+    for shape in shapes {
+        let mut rng = Rng::new(0x7bd0_0000 + (shape.m * 97 + shape.n_ff) as u64);
+        let gu = make_gu(&mut rng, shape, Scale { gate: 1.5, up: 1.0 });
+        let first = run_case(&dev, shape, &gu, 0xFF);
+        let second = run_case(&dev, shape, &gu, 0x00);
+        assert_eq!(
+            tail(&first.xf),
+            [0u8; 16],
+            "{shape:?}: the tail entry kept garbage"
+        );
+        check_live(shape, &gu, &first.xf, &mut stats);
+        assert_eq!(
+            unpack_xf(&first.xf, shape.m, shape.k_pad),
+            unpack_xf(&second.xf, shape.m, shape.k_pad),
+            "{shape:?}: the data lanes depend on the fill"
+        );
+        let weight = upload_weight(&dev.ctx, GgufType::Q4K, WEIGHT_ROWS, shape.k_pad);
+        let ya = consumer_y(&dev, &weight, &first.xf, shape.m);
+        let yb = consumer_y(&dev, &weight, &second.xf, shape.m);
+        if shape.k_pad == 32_768 {
+            // At k = 32768 the matmul splits K 16 ways with atomicAdd accumulation, so two runs
+            // over identical buffers differ in the low bits (see the add_norm_pack twin); a
+            // wrong lane moves a partial sum wholesale, orders above this tolerance.
+            let (dev, ref_max) = (floats(&ya), floats(&yb));
+            let scale = ref_max.iter().fold(1.0f32, |top, v| top.max(v.abs()));
+            let worst = dev
+                .iter()
+                .zip(&ref_max)
+                .map(|(&a, &b)| (a - b).abs())
+                .fold(0.0f32, f32::max);
+            assert!(
+                worst <= 1e-3 * scale,
+                "{shape:?}: the matmul over garbage differs by {worst:e} (scale {scale:e})"
+            );
+            println!(
+                "[{PROFILE}] MEMSET-TRIM swiglu_pack {shape:?}: split-K matmul, max |d| {worst:e} of scale {scale:e}"
+            );
+        } else {
+            assert_eq!(
+                ya, yb,
+                "{shape:?}: the matmul over garbage differs from the old way"
+            );
+        }
+    }
+    assert_eq!(report("memset-trim garbage", &stats), 0, "E2 misses");
+}
+
+/// MEMSET-TRIM test 2: a pack of `m = 3` straight into a pack of `m = 1` on the same buffer, with
+/// no re-zeroing between the calls; the `m = 1` live columns, the tail and the matmul must not
+/// depend on the stale lanes of tokens 1 and 2.
+#[test]
+fn swiglu_pack_ignores_stale_padding_between_launches() {
+    if !testkit::device_present("swiglu_pack_ignores_stale_padding_between_launches") {
+        return;
+    }
+    let dev = Dev::new();
+    let shape = unpadded(1, 512);
+    let xf_len = xf_bytes(shape.m, shape.k_pad).expect("xf size");
+    let xf = upload_filled(&dev.ctx, 0xFF, xf_len);
+    let mut rng = Rng::new(0x7bd0_1000);
+    let scale = Scale { gate: 1.5, up: 1.0 };
+    let stale = make_gu(&mut rng, unpadded(3, shape.n_ff), scale);
+    let _ = pack_into(&dev, unpadded(3, shape.n_ff), &stale, &xf);
+    let gu = make_gu(&mut rng, shape, scale);
+    let bytes = pack_into(&dev, shape, &gu, &xf);
+    assert_eq!(
+        tail(&bytes),
+        [0u8; 16],
+        "the tail entry is not zero after m=3 then m=1"
+    );
+    let mut stats = Stats::default();
+    check_live(shape, &gu, &bytes, &mut stats);
+    assert_eq!(stats.misses, 0, "E2 misses after m=3 then m=1");
+    let old = run_case(&dev, shape, &gu, 0x00);
+    assert_eq!(
+        unpack_xf(&bytes, shape.m, shape.k_pad),
+        unpack_xf(&old.xf, shape.m, shape.k_pad),
+        "the m=1 data lanes depend on the stale bytes"
+    );
+    let weight = upload_weight(&dev.ctx, GgufType::Q4K, WEIGHT_ROWS, shape.k_pad);
+    assert_eq!(
+        consumer_y(&dev, &weight, &bytes, shape.m),
+        consumer_y(&dev, &weight, &old.xf, shape.m),
+        "the matmul over the stale buffer differs from the old way"
     );
 }
 
@@ -899,13 +1058,14 @@ fn swiglu_pack_inside_a_capture_equals_eager() {
         return;
     }
     let dev = Dev::new();
-    // The nodes of a call: memset + kernel, and two more 2-D memsets for the padded width.
+    // The nodes of a call: the kernel (the whole-xf memset is gone, MEMSET-TRIM), plus two more
+    // 2-D memsets for the padded width.
     let padded = Shape {
         m: 1,
         n_ff: 896,
         k_pad: 1024,
     };
-    for (shape, nodes) in [(padded, 4), (unpadded(1, 512), 2)] {
+    for (shape, nodes) in [(padded, 3), (unpadded(1, 512), 1)] {
         let mut rng = Rng::new(0xca97_0000 + shape.n_ff as u64);
         let scale = Scale { gate: 1.5, up: 1.0 };
         let gu = to_bytes(&make_gu(&mut rng, shape, scale));
