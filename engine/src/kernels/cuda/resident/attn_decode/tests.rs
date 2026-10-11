@@ -17,7 +17,7 @@
 use super::{AttnDecodeCall, AttnShape, AttnSpan, AttnSplit, attn_part_bytes};
 use crate::EngError;
 use crate::kernels::cuda::testkit::{self, Rng, f16_bits, f16_to_f32};
-use crate::kernels::cuda::{CudaContext, DeviceBuffer, DeviceRange, DeviceStream};
+use crate::kernels::cuda::{CapturePlan, CudaContext, DeviceBuffer, DeviceRange, DeviceStream};
 
 /// Class E3 for RD-8b, final: `max|d| <= 2^-17 * max(max|ref|, 1)` per head vector (lane M
 /// REPLY-44, REPLY-48 and REPLY-50; decision 0047 on main `1a547172`, "finalize E3 and R1").
@@ -778,4 +778,138 @@ fn attn_decode_rejects_bad_calls_before_any_launch() {
     let (again, again_out) = attempt(&rig, &other, &Plan::base());
     again.expect("the backend is usable after the refusals");
     assert_eq!(first_out, again_out, "the base call after the refusals");
+}
+
+// ---------------------------------------------------------------- T7 (RD-11a)
+
+/// The capture plan of the owed test: the rig owns every buffer, so no pin and no hold.
+fn no_pins() -> CapturePlan<'static> {
+    CapturePlan {
+        pins: &[],
+        holds: Vec::new(),
+    }
+}
+
+/// The persistent buffers of the owed test: one `attn_decode` whose `kv_len` is a device word
+/// that the rig rewrites between replays.
+struct WordRig<'r> {
+    ctx: &'r CudaContext,
+    stream: &'r DeviceStream,
+    spec: Spec,
+    q: &'r DeviceBuffer,
+    proj: Option<&'r DeviceBuffer>,
+    k: &'r DeviceBuffer,
+    v: &'r DeviceBuffer,
+    word: &'r DeviceBuffer,
+    part: &'r DeviceBuffer,
+    out: &'r DeviceBuffer,
+    nan_part: Vec<u8>,
+    out_len: usize,
+}
+
+impl WordRig<'_> {
+    /// Sets the length word and restores the scratch and the output to their start image (host
+    /// writes, outside any window).
+    fn set(&self, len: i32) {
+        let stream = self.stream;
+        self.word
+            .write_at(stream, 0, &len.to_le_bytes())
+            .expect("set the length word");
+        self.part
+            .write_at(stream, 0, &self.nan_part)
+            .expect("reset the partials");
+        self.out
+            .write_at(stream, 0, &vec![0xFF; self.out_len])
+            .expect("poison the output");
+    }
+
+    fn queue(&self) -> Result<(), EngError> {
+        self.ctx.attn_decode(
+            self.stream,
+            AttnDecodeCall {
+                shape: self.spec.shape(),
+                span: self.spec.span(),
+                split: self.spec.split,
+                scale: self.spec.scale(),
+                q: whole(self.q),
+                proj: self.proj.map(whole),
+                k_cache: whole(self.k),
+                v_cache: whole(self.v),
+                kv_len: whole(self.word),
+                part: whole(self.part),
+                out: whole(self.out),
+            },
+        )
+    }
+
+    /// One eager launch at `len`; the caller drains the stream.
+    fn eager(&self, len: i32) -> Vec<u8> {
+        self.set(len);
+        self.queue().expect("queue the attention");
+        self.stream.synchronize().expect("drain");
+        testkit::read_bytes(self.ctx, self.out, self.out_len)
+    }
+}
+
+/// T7 (RD-8b, owed; the seven lengths of its graph row): one `attn_decode` captured and replayed
+/// at kv_len 10, 100, 33, 1024, 2048, 1 and 777, with the device word rewritten between replays,
+/// equals the eager launch at that length byte for byte, on a two-node graph (the split-KV pair).
+#[test]
+fn attn_decode_inside_a_capture_follows_the_word() {
+    if !testkit::device_present("attn_decode_inside_a_capture_follows_the_word") {
+        return;
+    }
+    let rig = Rig::new();
+    let pool = Pool::new();
+    let lengths = [10, 100, 33, 1024, 2048, 1, 777];
+    let spec = Spec::qwen(1, 2048);
+    let p = problem(&spec, &pool, true);
+    let (ctx, stream) = (&rig.ctx, &rig.stream);
+    let part_len = attn_part_bytes(spec.m, spec.n_kv_head, spec.head_dim, spec.split.max_splits)
+        .expect("part bytes");
+    let out_len = spec.m * spec.n_head * spec.head_dim * 4;
+    let (q, proj) = (
+        testkit::upload_f32(ctx, &p.q),
+        testkit::upload_f32(ctx, &p.proj),
+    );
+    let (k, v) = (
+        testkit::upload_bytes(ctx, &le_bytes(&p.k)),
+        testkit::upload_bytes(ctx, &le_bytes(&p.v)),
+    );
+    let word = testkit::upload_bytes(ctx, &spec.kv_len.to_le_bytes());
+    let nan_part = part_content(part_len, PartFill::Nan);
+    let (part, out) = (
+        testkit::upload_bytes(ctx, &nan_part),
+        testkit::upload_filled(ctx, 0xFF, out_len),
+    );
+    let words = WordRig {
+        ctx,
+        stream,
+        spec: spec.clone(),
+        q: &q,
+        proj: Some(&proj),
+        k: &k,
+        v: &v,
+        word: &word,
+        part: &part,
+        out: &out,
+        nan_part,
+        out_len,
+    };
+    let eager: Vec<Vec<u8>> = lengths.iter().map(|&len| words.eager(len)).collect();
+    words.set(lengths[0]);
+    let (graph, ()) = ctx
+        .capture(stream, no_pins(), || words.queue())
+        .expect("capture of the attention");
+    assert_eq!(graph.nodes(), 2, "the split-KV graph holds two kernels");
+    for (case, &len) in lengths.iter().enumerate() {
+        words.set(len);
+        graph.launch(stream).expect("replay");
+        stream.synchronize().expect("drain");
+        assert_eq!(
+            testkit::read_bytes(ctx, &out, out_len),
+            eager[case],
+            "kv_len {len}: the replay differs from the eager launch"
+        );
+    }
 }

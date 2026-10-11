@@ -168,10 +168,6 @@ impl Workspace {
     }
 
     /// Takes a hold on the current allocation.
-    #[cfg_attr(
-        not(test),
-        expect(dead_code, reason = "staged for RD-9a (decision 0047)")
-    )]
     pub(super) fn hold(&self) -> ArenaHold {
         self.holds.take()
     }
@@ -230,10 +226,6 @@ impl CudaContext {
     /// Takes a hold on the current workspace allocation, so a grow is refused
     /// until the hold is dropped. The capture of a graph (RD-2d) is the first
     /// caller.
-    #[cfg_attr(
-        not(test),
-        expect(dead_code, reason = "staged for RD-9a (decision 0047)")
-    )]
     pub(crate) fn workspace_hold(&self) -> Result<ArenaHold, EngError> {
         self.ensure_usable()?;
         let workspace = self

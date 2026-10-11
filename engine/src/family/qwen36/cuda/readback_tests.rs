@@ -1,6 +1,9 @@
 //! Unit tests of the read-back plan and the mode switches (test seam U13). CPU only.
 use super::{
-    readback::{ReadStep, ReadbackPlan, check_mode, eager_report, parse_sync_each},
+    readback::{
+        ReadStep, ReadbackPlan, captured_report, check_mode, eager_report, parse_sync_each,
+        refused_report,
+    },
     run_report::CaptureOutcome,
 };
 
@@ -70,4 +73,28 @@ fn an_eager_token_reports_one_wait_and_one_start_block_write() {
     let report = eager_report(&ReadbackPlan::new(VOCAB, true).expect("plan"));
     assert_eq!(report.capture, CaptureOutcome::Eager);
     assert_eq!((report.syncs, report.host_writes), (1, 1));
+}
+
+#[test]
+fn captured_report_sets_the_outcome_and_the_waits() {
+    for want_logits in [false, true] {
+        let plan = ReadbackPlan::new(VOCAB, want_logits).expect("plan");
+        let report = captured_report(&plan);
+        assert_eq!(report.capture, CaptureOutcome::Captured, "{want_logits}");
+        assert_eq!((report.syncs, report.host_writes), (1, 1), "{want_logits}");
+    }
+}
+
+#[test]
+fn refused_report_sets_the_fallback_outcome() {
+    for want_logits in [false, true] {
+        let plan = ReadbackPlan::new(VOCAB, want_logits).expect("plan");
+        let report = refused_report(&plan);
+        assert_eq!(
+            report.capture,
+            CaptureOutcome::RefusedFellBackToEager,
+            "{want_logits}"
+        );
+        assert_eq!((report.syncs, report.host_writes), (1, 1), "{want_logits}");
+    }
 }

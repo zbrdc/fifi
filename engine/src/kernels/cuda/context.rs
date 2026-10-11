@@ -78,10 +78,6 @@ static STREAM_IDS: AtomicU64 = AtomicU64::new(0);
 
 /// Live executable graphs of this process. An owner skipped after a terminal
 /// failure stays counted.
-#[cfg_attr(
-    not(test),
-    expect(dead_code, reason = "staged for RD-9a (decision 0047)")
-)]
 static LIVE_GRAPHS: AtomicUsize = AtomicUsize::new(0);
 
 /// Native destroy calls made by streams, events, pinned words and graphs. Incremented
@@ -843,7 +839,7 @@ mod tile_q5_0;
 mod workspace;
 
 pub(crate) use device_arena::{ArenaHold, DeviceArena};
-pub(crate) use graph::{CapturePlan, GraphExec};
+pub(crate) use graph::{CapturePlan, GraphExec, is_capture_refusal};
 pub(in crate::kernels::cuda) use launch::{Claim, require_apart, require_fit};
 pub(crate) use launch::{MatmulIo, PackCall, Projection};
 pub(crate) use pinned::{PinnedWord, WordValue};

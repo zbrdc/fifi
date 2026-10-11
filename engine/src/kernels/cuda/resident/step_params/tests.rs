@@ -23,8 +23,14 @@ use super::{
     StepParams, StepStatus, WORD_MAX, check_n, ensure_rows,
 };
 use crate::EngError;
+use crate::kernels::cuda::native::activation_bytes;
+use crate::kernels::cuda::resident::embed::EmbedCall;
 use crate::kernels::cuda::testkit::{self, Rng};
-use crate::kernels::cuda::{CudaContext, DeviceBuffer, DeviceStream};
+use crate::kernels::cuda::{
+    CapturePlan, CudaContext, DeviceBuffer, DeviceStream, MatmulIo, PackCall, Projection,
+    TiledWeight,
+};
+use crate::weights::GgufType;
 
 const SENTINEL: i32 = 0x1111_1111;
 const PAD_SENTINEL: [i32; 3] = [0x2222_2222, 0x3333_3333, 0x4444_4444];
@@ -1074,6 +1080,168 @@ fn step_status_maps_as_the_replies_say() {
             pair.into_token().is_err(),
             error.is_some(),
             "status {status}"
+        );
+    }
+}
+
+// ---------------------------------------------------------------- T10 (RD-11a)
+
+/// The capture plan of the owed test: the rig owns every buffer, so no pin and no hold.
+fn no_pins() -> CapturePlan<'static> {
+    CapturePlan {
+        pins: &[],
+        holds: Vec::new(),
+    }
+}
+
+/// The buffers of one chain session: the step block, the embedded row, the packed row, the
+/// logits row, the argmax scratch and the result pair.
+struct Chain {
+    params: DeviceBuffer,
+    x: DeviceBuffer,
+    xf: DeviceBuffer,
+    y: DeviceBuffer,
+    part: DeviceBuffer,
+    pair: DeviceBuffer,
+    k: usize,
+    xf_bytes: usize,
+    y_bytes: usize,
+    start: [u8; STEP_PARAMS_BYTES],
+}
+
+impl Chain {
+    fn new(ctx: &CudaContext, token: i32, pos: i32, k: usize) -> Self {
+        let start = StepParams::new(token, pos).expect("start block");
+        let need = activation_bytes(8, k, 1).expect("activations");
+        Self {
+            params: testkit::upload_bytes(ctx, start.to_bytes().as_slice()),
+            x: testkit::upload_filled(ctx, 0x55, k * 4),
+            xf: testkit::upload_filled(ctx, 0xAA, need.xf),
+            y: testkit::upload_filled(ctx, 0x55, need.y),
+            part: testkit::upload_filled(ctx, 0xFF, ARGMAX_PART_BYTES),
+            pair: testkit::upload_filled(ctx, 0xEE, RESULT_PAIR_BYTES),
+            k,
+            xf_bytes: need.xf,
+            y_bytes: need.y,
+            start: start.to_bytes(),
+        }
+    }
+
+    /// Resets the step block to its start (the one host write of a replay series).
+    fn reset(&self, stream: &DeviceStream) {
+        self.params
+            .write_at(stream, 0, &self.start)
+            .expect("reset the step block");
+    }
+
+    /// The whole chain: begin, embed (reading the token word), pack, matmul, argmax (writing the
+    /// token word), advance.
+    fn step(
+        &self,
+        ctx: &CudaContext,
+        stream: &DeviceStream,
+        table: &TiledWeight,
+        weight: &TiledWeight,
+    ) -> Result<(), EngError> {
+        let block = self.params.range(0, STEP_PARAMS_BYTES)?;
+        ctx.step_begin(stream, block)?;
+        ctx.embed(
+            stream,
+            EmbedCall {
+                weight: table,
+                ids: self.params.range(OFFSET_TOKEN_ID, 4)?,
+                x: self.x.range(0, self.k * 4)?,
+                status: self.params.range(OFFSET_STATUS, 4)?,
+                m: 1,
+            },
+        )?;
+        ctx.pack(
+            stream,
+            PackCall {
+                x: self.x.range(0, self.k * 4)?,
+                xf: self.xf.range(0, self.xf_bytes)?,
+                m: 1,
+                k: self.k,
+            },
+        )?;
+        ctx.matmul(
+            stream,
+            Projection {
+                weight,
+                first_row: 0,
+                rows: 8,
+            },
+            MatmulIo {
+                xf: self.xf.range(0, self.xf_bytes)?,
+                y: self.y.range(0, self.y_bytes)?,
+                m: 1,
+            },
+        )?;
+        ctx.argmax(
+            stream,
+            ArgmaxCall {
+                n: 8,
+                logits: self.y.range(0, self.y_bytes)?,
+                part: self.part.range(0, ARGMAX_PART_BYTES)?,
+                params: self.params.range(0, STEP_PARAMS_BYTES)?,
+                result: Some(self.pair.range(0, RESULT_PAIR_BYTES)?),
+            },
+        )?;
+        ctx.step_advance(stream, self.params.range(0, STEP_PARAMS_BYTES)?, 1)
+    }
+}
+
+/// T10 (RD-4d, owed): the step chain `step_begin`, embed, pack, matmul, argmax, `step_advance`
+/// captured once and replayed eight times with NO host write between replays (each replay's
+/// argmax token feeds the next replay's embed through the token word, the positions advance
+/// through `step_advance`) equals the eager chain byte for byte: the step block (32 bytes) and
+/// the result pair after every step.
+#[test]
+fn step_chain_inside_a_capture_equals_eager() {
+    if !testkit::device_present("step_chain_inside_a_capture_equals_eager") {
+        return;
+    }
+    let fx = Fx::new();
+    let (ctx, stream) = (&fx.ctx, &fx.stream);
+    let k = 256;
+    let table = testkit::upload_weight(ctx, GgufType::Q4K, 8, k);
+    let weight = testkit::upload_weight(ctx, GgufType::Q80, 8, k);
+    let steps = 8;
+
+    // The eager reference: one chain launch per step, reads between steps only.
+    let eager_chain = Chain::new(ctx, 3, 0, k);
+    let mut eager_blocks = Vec::with_capacity(steps);
+    let mut eager_pairs = Vec::with_capacity(steps);
+    for _ in 0..steps {
+        eager_chain
+            .step(ctx, stream, &table, &weight)
+            .expect("the eager chain step");
+        eager_blocks.push(fx.read_params(&eager_chain.params));
+        eager_pairs.push(fx.read_pair(&eager_chain.pair, 0));
+    }
+
+    // The captured session: one eager warm-up step (it loads every kernel module of the chain),
+    // the block back to its start, one capture, then eight replays with no host write between
+    // them.
+    let cap = Chain::new(ctx, 3, 0, k);
+    cap.step(ctx, stream, &table, &weight)
+        .expect("the warm-up chain step");
+    cap.reset(stream);
+    let (graph, ()) = ctx
+        .capture(stream, no_pins(), || cap.step(ctx, stream, &table, &weight))
+        .expect("capture of the step chain");
+    assert_eq!(graph.nodes(), 8, "the chain graph holds eight nodes");
+    for step in 0..steps {
+        graph.launch(stream).expect("replay");
+        assert_eq!(
+            fx.read_params(&cap.params),
+            eager_blocks[step],
+            "step {step}: the step block differs"
+        );
+        assert_eq!(
+            fx.read_pair(&cap.pair, 0),
+            eager_pairs[step],
+            "step {step}: the result pair differs"
         );
     }
 }

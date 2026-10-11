@@ -113,7 +113,7 @@ pub(super) fn operation_of(failure: &DeviceFailure) -> &'static str {
 /// capture`. A caller that falls back to the eager path after a refused capture records
 /// `captured = false` on this answer, without matching the operation string. A `cuda capture`
 /// error that latched the backend (an unlisted status at the end of the capture) is not a refusal.
-pub(in crate::kernels::cuda) fn is_capture_refusal(error: &EngError) -> bool {
+pub(crate) fn is_capture_refusal(error: &EngError) -> bool {
     matches!(
         error,
         EngError::Backend {

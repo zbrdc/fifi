@@ -818,6 +818,23 @@ mod tests {
     }
 
     #[test]
+    fn code_only_gives_exact_output_for_escapes_comments_and_a_trailing_backslash() {
+        // Exact outputs: each stripped piece becomes ONE space and nothing else changes.
+        let table: [(&str, &str); 7] = [
+            ("a/* x */b", "a b"),
+            ("a// c\nb", "a \nb"),
+            ("a\"s\"b", "a b"),
+            (r#"let n = '\"'; let o = 12;"#, "let n =  ; let o = 12;"),
+            (r#"let b = '\\'; let c = 13;"#, "let b =  ; let c = 13;"),
+            ("let p = \"abc\\", "let p =  "),
+            ("let q = 'x'; let r = 14;", "let q =  ; let r = 14;"),
+        ];
+        for (input, expected) in table {
+            assert_eq!(code_only(input), expected, "code_only({input:?})");
+        }
+    }
+
+    #[test]
     fn alloc_rows_builds_one_zeroed_row_per_step_and_an_empty_fed_at_capacity() {
         let row_len = 12;
         let (rows, fed) = alloc_rows(row_len);

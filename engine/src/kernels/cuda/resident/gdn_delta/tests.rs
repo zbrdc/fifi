@@ -17,7 +17,7 @@ use std::path::{Path, PathBuf};
 use super::{DeltaBytes, DeltaCall, DeltaShape, DeltaWeights, GDN_EPS, GDN_HEAD_DIM, delta_bytes};
 use crate::EngError;
 use crate::kernels::cuda::testkit::{self, Rng, fnv1a64, read_f32_file, silu_f64, softplus_f64};
-use crate::kernels::cuda::{CudaContext, DeviceBuffer, DeviceRange, DeviceStream};
+use crate::kernels::cuda::{CapturePlan, CudaContext, DeviceBuffer, DeviceRange, DeviceStream};
 
 /// E4, provisional (REPLY-55): `max |d| <= E4 * max(max |ref|, 1)` per step vector and for the end state; lane M
 /// tightens it after the first GPU step.
@@ -1549,4 +1549,58 @@ oracle_tests! {
     delta_oracle_L38_P4: 38, "P4";
     delta_oracle_L1_P2: 1, "P2";
     delta_oracle_L5_P1: 5, "P1";
+}
+
+// ---------------------------------------------------------------- T6 (RD-11a)
+
+/// The capture plan of the owed test: the rig owns every buffer, so no pin and no hold.
+fn no_pins() -> CapturePlan<'static> {
+    CapturePlan {
+        pins: &[],
+        holds: Vec::new(),
+    }
+}
+
+/// T6 (RD-7b, owed): one `gdn_delta` call captured and replayed twice equals the eager run bit
+/// for bit (out and end state), on a one-node graph. The warm-up launch and the eager reference
+/// run on scratch buffers, so the captured buffers still hold their start state.
+#[test]
+fn delta_inside_a_capture_equals_eager() {
+    if !testkit::device_present("delta_inside_a_capture_equals_eager") {
+        return;
+    }
+    let rig = Rig::new();
+    let (nk, nv, m) = (4, 8, 1);
+    let lay = Layout::odd(nk, nv);
+    let inp = generate(nk, nv, m, lay, 0xd17a_1105, false);
+    let shape = inp.shape(m);
+    let bits = |values: &[f32]| -> Vec<u32> { values.iter().map(|f| f.to_bits()).collect() };
+    let same = |got: &Run, want: &Run, case: &str| {
+        assert_eq!(bits(&got.out), bits(&want.out), "{case}: out differs");
+        assert_eq!(bits(&got.state), bits(&want.state), "{case}: state differs");
+    };
+    let eager = launch_all(&rig, &inp, &[m]);
+    let bufs = Bufs::separate(&rig.ctx, &inp, 0);
+    let (graph, ()) = rig
+        .ctx
+        .capture(&rig.stream, no_pins(), || {
+            rig.ctx.gdn_delta(&rig.stream, bufs.call(shape, 0))
+        })
+        .expect("capture of the delta step");
+    assert_eq!(graph.nodes(), 1, "the delta graph holds one kernel");
+    graph.launch(&rig.stream).expect("the first replay");
+    same(&bufs.finish(&rig), &eager, "replay 1");
+    // Replay 2 starts from the same start state: both restores are host writes, outside any
+    // window.
+    let state0 = le_bytes(&inp.state0);
+    bufs.pads[STATE]
+        .buf
+        .write_at(&rig.stream, PAD_BYTES, &state0)
+        .expect("reset the state");
+    bufs.pads[OUT]
+        .buf
+        .write_at(&rig.stream, PAD_BYTES, &vec![0xFF; m * nv * D * 4])
+        .expect("poison the output");
+    graph.launch(&rig.stream).expect("the second replay");
+    same(&bufs.finish(&rig), &eager, "replay 2");
 }

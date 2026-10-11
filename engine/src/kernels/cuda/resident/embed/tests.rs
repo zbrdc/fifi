@@ -14,7 +14,8 @@ use crate::kernels::cuda::resident::step_params::{
 };
 use crate::kernels::cuda::testkit::{self, Rng};
 use crate::kernels::cuda::{
-    CHUNK_LIMIT, CudaContext, DeviceBuffer, DeviceRange, DeviceStream, QuantTensor, TiledWeight,
+    CHUNK_LIMIT, CapturePlan, CudaContext, DeviceBuffer, DeviceRange, DeviceStream, QuantTensor,
+    TiledWeight,
 };
 use crate::weights::{GgufType, dequantize};
 
@@ -714,6 +715,101 @@ fn embed_is_deterministic() {
                 ));
             }
             assert_eq!(seen[0], seen[1], "{ty:?} {ids:?}: two launches differ");
+        }
+    }
+}
+
+// ---------------------------------------------------------------- T6 (RD-11a)
+
+/// The capture plan of the owed test: the rig owns every buffer, so no pin and no hold.
+fn no_pins() -> CapturePlan<'static> {
+    CapturePlan {
+        pins: &[],
+        holds: Vec::new(),
+    }
+}
+
+/// T6 (RD-4c, owed): one captured `embed` replayed with the id rewritten between replays (7,
+/// 511, -1, 300, 512 over a table of exactly 512 rows) reads the new id every time: each replay
+/// equals the eager launch at that id bit for bit, and the status word (which the rig CLEARS
+/// between replays, because `embed` ORs bit 4 and never clears it) holds bit 4 exactly for the
+/// two ids outside the table, -1 and 512.
+#[test]
+fn embed_inside_a_capture_reads_the_new_id_between_replays() {
+    if !testkit::device_present("embed_inside_a_capture_reads_the_new_id_between_replays") {
+        return;
+    }
+    let rig = Rig::new();
+    for ty in [GgufType::Q4K, GgufType::Q80] {
+        let table = Table::new(&rig.ctx, ty, (512, 256), Scales::Mixed, 0x4c11);
+        let ids = [7i32, 511, -1, 300, 512];
+        // The eager references (the first one also warms the kernel of this context).
+        let eager: Vec<(Vec<f32>, i32)> =
+            ids.iter().map(|&id| rig.gather(&table, &[id], 0)).collect();
+        // The captured buffers follow `gather`: the ids word, the guarded status word and the
+        // guarded rows of x.
+        let ids_buf = testkit::upload_bytes(&rig.ctx, &ids[0].to_le_bytes());
+        let status = testkit::upload_filled(&rig.ctx, 0x55, 12);
+        let x_buf = rig.x_buffer(1, table.k);
+        let bytes = embed_x_bytes(1, table.k).expect("size");
+        let call = || {
+            rig.ctx.embed(
+                &rig.stream,
+                EmbedCall {
+                    weight: &table.weight,
+                    ids: ids_buf.range(0, 4).expect("ids"),
+                    x: x_buf.range(GUARD_BYTES, bytes).expect("x"),
+                    status: status.range(4, 4).expect("status"),
+                    m: 1,
+                },
+            )
+        };
+        let (graph, ()) = rig
+            .ctx
+            .capture(&rig.stream, no_pins(), call)
+            .expect("capture of the gather");
+        assert_eq!(
+            graph.nodes(),
+            1,
+            "{ty:?}: the gather graph holds one kernel"
+        );
+        for (case, &id) in ids.iter().enumerate() {
+            ids_buf
+                .write_at(&rig.stream, 0, &id.to_le_bytes())
+                .expect("rewrite the id");
+            // The rig clears the status word between replays.
+            status
+                .write_at(&rig.stream, 4, &0i32.to_le_bytes())
+                .expect("clear the status");
+            x_buf
+                .write_at(&rig.stream, GUARD_BYTES, &vec![0x55; bytes])
+                .expect("poison the rows");
+            graph.launch(&rig.stream).expect("replay");
+            let (want_bits, want_status) = (&eager[case].0, eager[case].1);
+            rig.stream.synchronize().expect("drain the replay");
+            let all = testkit::read_bytes(&rig.ctx, &x_buf, bytes + 2 * GUARD_BYTES);
+            assert!(
+                all[..GUARD_BYTES]
+                    .iter()
+                    .chain(&all[GUARD_BYTES + bytes..])
+                    .all(|&b| b == 0x55),
+                "{ty:?} id {id}: a byte outside the rows of x changed"
+            );
+            let rows = testkit::floats(&all[GUARD_BYTES..GUARD_BYTES + bytes]);
+            assert_eq!(
+                rows.iter().map(|f| f.to_bits()).collect::<Vec<_>>(),
+                want_bits.iter().map(|f| f.to_bits()).collect::<Vec<_>>(),
+                "{ty:?} id {id}: the replay differs from the eager launch"
+            );
+            let word = testkit::read_bytes(&rig.ctx, &status, 12);
+            let got = i32::from_le_bytes(word[4..8].try_into().expect("word"));
+            assert_eq!(got, want_status, "{ty:?} id {id}: the status word differs");
+            let bit4 = got & 4 != 0;
+            assert_eq!(
+                bit4,
+                !(0..512).contains(&id),
+                "{ty:?} id {id}: bit 4 must hold exactly outside the table"
+            );
         }
     }
 }

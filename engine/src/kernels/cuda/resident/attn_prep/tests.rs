@@ -28,7 +28,7 @@ use crate::kernels::cuda::resident::step_params::{
     StepStatus,
 };
 use crate::kernels::cuda::testkit::{self, Rng, f16_bits, f16_to_f32};
-use crate::kernels::cuda::{CudaContext, DeviceBuffer, DeviceStream};
+use crate::kernels::cuda::{CapturePlan, CudaContext, DeviceBuffer, DeviceStream};
 
 /// RP1, lane M REPLY-53, provisional until the first GPU step; f32 RoPE angle; not checked against
 /// an f64 reference above position 1,150; A5 covers positions up to about 1,150 only.
@@ -912,4 +912,91 @@ fn pinned_rounding() {
         (0, 0x8000)
     );
     assert!(f16_value(f64_to_f16_bits(f64::NAN)).is_nan());
+}
+
+// ---------------------------------------------------------------- T10 (RD-11a)
+
+/// The capture plan of the owed test: the fixture owns every buffer, so no pin and no hold.
+fn no_pins() -> CapturePlan<'static> {
+    CapturePlan {
+        pins: &[],
+        holds: Vec::new(),
+    }
+}
+
+/// Restores every mutable buffer of the fixture to its pristine image with the position word
+/// set to `word` (the host writes are outside any capture window).
+fn reset_to(fx: &Fx, word: i32) {
+    let s = fx.shape;
+    let row = s.n_kv_head * D * 2;
+    let cache = vec![SENT; cache_bytes(s.rows, s.n_kv_head) + 2 * CANARY_ROWS * row];
+    let q = vec![Q_FILL; q_bytes(s.m, s.n_head)];
+    let block = params_block(word, 0).to_vec();
+    let stream = &fx.rig.stream;
+    fx.bufs[KC]
+        .write_at(stream, 0, &cache)
+        .expect("reset the k cache");
+    fx.bufs[VC]
+        .write_at(stream, 0, &cache)
+        .expect("reset the v cache");
+    fx.bufs[Q].write_at(stream, 0, &q).expect("reset q");
+    fx.bufs[PARAMS_BUF]
+        .write_at(stream, 0, &block)
+        .expect("reset the step block");
+}
+
+/// The full bytes of one eager launch at `word` (fresh fixture, same data: the seed stays the
+/// base configuration's).
+fn eager_prep_bytes(cfg: &Cfg, word: i32) -> [Vec<u8>; 4] {
+    let fx = Fx::new(&Cfg { word, ..*cfg });
+    fx.run().expect("the eager launch");
+    [
+        fx.bytes(Q),
+        fx.bytes(KC),
+        fx.bytes(VC),
+        fx.bytes(PARAMS_BUF),
+    ]
+}
+
+/// T10 (RD-8a, owed): one `attn_prep` captured and replayed with the position word rewritten
+/// between replays equals the eager launch at that position byte for byte (q, both caches, the
+/// step block).
+#[test]
+fn attn_prep_inside_a_capture_equals_eager() {
+    if !testkit::device_present("attn_prep_inside_a_capture_equals_eager") {
+        return;
+    }
+    let base = Cfg::new(qwen(1, 4200), 5);
+    let words = [5, 77, 4090];
+    let eager: Vec<[Vec<u8>; 4]> = words.iter().map(|&w| eager_prep_bytes(&base, w)).collect();
+    let fx = Fx::new(&Cfg {
+        word: words[0],
+        ..base
+    });
+    fx.run().expect("the warm launch");
+    reset_to(&fx, words[0]);
+    let (graph, ()) = fx
+        .rig
+        .ctx
+        .capture(&fx.rig.stream, no_pins(), || {
+            fx.attempt(&fx.rig.stream, None)
+        })
+        .expect("capture of attn_prep");
+    assert_eq!(graph.nodes(), 1, "the attn_prep graph holds one kernel");
+    for (case, &word) in words.iter().enumerate() {
+        reset_to(&fx, word);
+        graph.launch(&fx.rig.stream).expect("replay");
+        for (at, slot, name) in [(0, Q, "q"), (1, KC, "the k cache"), (2, VC, "the v cache")] {
+            assert_eq!(
+                fx.bytes(fx.slots[slot].0),
+                eager[case][at],
+                "word {word}: {name} differs from the eager launch"
+            );
+        }
+        assert_eq!(
+            fx.bytes(PARAMS_BUF),
+            eager[case][3],
+            "word {word}: the step block differs"
+        );
+    }
 }

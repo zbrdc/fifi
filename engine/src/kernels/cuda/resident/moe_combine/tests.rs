@@ -7,13 +7,13 @@
 //! `--test-threads=1`.
 
 use crate::EngError;
-use crate::kernels::cuda::DeviceBuffer;
 use crate::kernels::cuda::context::{CudaContext, DeviceRange, DeviceStream};
 use crate::kernels::cuda::resident::moe_combine::{
     CombineCall, CombineOut, CombineShape, SharedTerm, check_shape, combine_down_bytes,
     combine_row_bytes,
 };
 use crate::kernels::cuda::testkit::{self, Rng};
+use crate::kernels::cuda::{CapturePlan, DeviceBuffer};
 
 /// The E3 bound, `2^-17`.
 const E3: f64 = 1.0 / 131_072.0;
@@ -758,4 +758,118 @@ fn combine_rejects_bad_calls_before_any_launch() {
     stream
         .synchronize()
         .expect("the backend is usable after the refusals");
+}
+
+// ---------------------------------------------------------------- T6 (RD-11a)
+
+/// The capture plan of the owed test: the rig owns every buffer, so no pin and no hold.
+fn no_pins() -> CapturePlan<'static> {
+    CapturePlan {
+        pins: &[],
+        holds: Vec::new(),
+    }
+}
+
+/// T6 (RD-4e, owed): one captured `moe_combine` replayed three times with the weights and the
+/// shared gate rewritten between replays reads the new values every time: each replay equals
+/// the eager launch on those values byte for byte and the host sequence bit for bit, on a
+/// one-node graph.
+#[test]
+fn combine_inside_a_capture_reads_the_new_values_between_replays() {
+    let Some((ctx, stream)) = rig("combine_inside_a_capture_reads_the_new_values_between_replays")
+    else {
+        return;
+    };
+    let mut rng = Rng::new(0x4e11);
+    let s = shape(1, 512, 8, 512);
+    let rows = combine_row_bytes(&s).expect("row bytes");
+    let base = random_inputs(&mut rng, s, true, (0.3, 0.3), 0);
+    let (res, down, shared_row) = (
+        base.res.clone(),
+        base.down.clone(),
+        base.shared.clone().expect("gated").1,
+    );
+    // Three weight/gate variants over the one fixed problem.
+    let variants: Vec<(Vec<f32>, Vec<f32>)> = (0..3)
+        .map(|rep| {
+            let v = random_inputs(&mut rng, s, true, (0.3, 0.3), rep);
+            let (gate, _) = v.shared.expect("gated");
+            (v.weights, gate)
+        })
+        .collect();
+    let down_bytes = 4 * down.len();
+    let weights_bytes = 4 * s.m * s.top_k;
+    let gate_bytes = 4 * s.m;
+    let (res_b, down_b, row_b) = (
+        testkit::upload_f32(&ctx, &res),
+        testkit::upload_f32(&ctx, &down),
+        testkit::upload_f32(&ctx, &shared_row),
+    );
+    let (weights_b, gate_b) = (
+        testkit::upload_f32(&ctx, &variants[0].0),
+        testkit::upload_f32(&ctx, &variants[0].1),
+    );
+    let out_b = testkit::upload_filled(&ctx, POISON, rows);
+    let set_variant = |case: usize| {
+        weights_b
+            .write_at(&stream, 0, &bytes_of(&variants[case].0))
+            .expect("rewrite the weights");
+        gate_b
+            .write_at(&stream, 0, &bytes_of(&variants[case].1))
+            .expect("rewrite the gate");
+        out_b
+            .write_at(&stream, 0, &vec![POISON; rows])
+            .expect("poison the output");
+    };
+    let call = || {
+        ctx.moe_combine(
+            &stream,
+            CombineCall {
+                shape: s,
+                res: res_b.range(0, rows).expect("res"),
+                down: down_b.range(0, down_bytes).expect("down"),
+                weights: weights_b.range(0, weights_bytes).expect("weights"),
+                shared: Some(SharedTerm {
+                    gate: gate_b.range(0, gate_bytes).expect("gate"),
+                    row: row_b.range(0, rows).expect("row"),
+                }),
+                out: CombineOut::To(out_b.range(0, rows).expect("out")),
+            },
+        )
+    };
+    // The eager references on the same buffers (the first run also warms the kernel).
+    let eager: Vec<Vec<u8>> = variants
+        .iter()
+        .enumerate()
+        .map(|(case, _)| {
+            set_variant(case);
+            call().expect("the eager combine");
+            stream.synchronize().expect("drain");
+            testkit::read_bytes(&ctx, &out_b, rows)
+        })
+        .collect();
+    set_variant(0);
+    let (graph, ()) = ctx
+        .capture(&stream, no_pins(), call)
+        .expect("capture of the combine");
+    assert_eq!(graph.nodes(), 1, "the combine graph holds one kernel");
+    for (case, (weights, gate)) in variants.iter().enumerate() {
+        set_variant(case);
+        graph.launch(&stream).expect("replay");
+        stream.synchronize().expect("drain");
+        let got = testkit::read_bytes(&ctx, &out_b, rows);
+        assert_eq!(
+            got, eager[case],
+            "replay {case}: the replay differs from the eager launch"
+        );
+        let inp = Inputs {
+            shape: s,
+            res: res.clone(),
+            down: down.clone(),
+            weights: weights.clone(),
+            shared: Some((gate.clone(), shared_row.clone())),
+        };
+        let floats = testkit::floats(&got);
+        check(&format!("replay {case}"), &inp, &floats);
+    }
 }

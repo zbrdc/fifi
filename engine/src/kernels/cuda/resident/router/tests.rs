@@ -13,12 +13,12 @@
 //! T6 (a capture) is deferred to RD-11a: this base has no capture window (V9).
 
 use crate::EngError;
-use crate::kernels::cuda::DeviceBuffer;
 use crate::kernels::cuda::context::{CudaContext, DeviceRange, DeviceStream};
 use crate::kernels::cuda::resident::router::{
     ROUTER_STATUS_BIT, RouterCall, RouterOut, RouterShape, RouterWeights, router_logits_bytes,
 };
 use crate::kernels::cuda::testkit::{self, Rng};
+use crate::kernels::cuda::{CapturePlan, DeviceBuffer};
 
 /// The R1 margin, `2^-10` (lane M REPLY-44, final by REPLY-50, decision 0047).
 const R1_MARGIN: f64 = 1.0 / 1024.0;
@@ -1162,4 +1162,76 @@ fn router_logits_bytes_pins_the_scratch_rule() {
         16_448
     );
     assert!(router_logits_bytes(shape(2048, 256, 8, usize::MAX)).is_err());
+}
+
+// ---------------------------------------------------------------- T6 (RD-11a)
+
+/// The capture plan of the owed tests: the rig owns every buffer, so no pin and no hold.
+fn no_pins() -> CapturePlan<'static> {
+    CapturePlan {
+        pins: &[],
+        holds: Vec::new(),
+    }
+}
+
+/// Rewrites every byte the router call writes with the poison byte, so a replayed graph must
+/// write every byte again (the slack of each buffer keeps its poison).
+fn repoison(rig: &Rig<'_>) {
+    let s = rig.shape;
+    let picks = s.m * s.top_k * 4;
+    let logits = router_logits_bytes(s).expect("bytes");
+    let word = |bytes: usize| vec![POISON; bytes];
+    rig.logits
+        .write_at(rig.stream, 0, &word(logits))
+        .expect("poison the logits");
+    rig.ids
+        .write_at(rig.stream, 0, &word(picks))
+        .expect("poison the ids");
+    rig.weights
+        .write_at(rig.stream, 0, &word(picks))
+        .expect("poison the weights");
+    rig.status
+        .write_at(rig.stream, 0, &word(4))
+        .expect("poison the status");
+    if let Some(gate) = &rig.shared_gate {
+        gate.write_at(rig.stream, 0, &word(s.m * 4))
+            .expect("poison the gate");
+    }
+}
+
+/// T6 (RD-5, owed): one `router` call captured and replayed twice equals the eager run byte for
+/// byte, on a two-node graph (`router_logits_k` and `router_select_k`).
+#[test]
+fn router_inside_a_capture_equals_eager() {
+    if !testkit::device_present("router_inside_a_capture_equals_eager") {
+        return;
+    }
+    let ctx = CudaContext::new().expect("context");
+    let stream = ctx.stream().expect("stream");
+    let s = shape(2048, 256, 8, 1);
+    let mut rng = Rng::new(0x5eed_1102);
+    let x = gaussian(&mut rng, s.m * s.hidden, 1.0);
+    let w = gaussian(&mut rng, s.n_expert * s.hidden, 0.05);
+    let shared = gaussian(&mut rng, s.hidden, 0.05);
+    let rig = Rig::new(&ctx, &stream, s, (&x, &w, Some(shared.as_slice())));
+    // The eager reference also warms both kernels of this context. It runs under the same
+    // poisoned outputs as every replay: the status word is an OR-flag the kernel writes only
+    // on faulty rows (like `embed`'s bit 4), so a clean launch leaves it as it started and the
+    // comparison must start both runs from the same image.
+    repoison(&rig);
+    rig.call().expect("the eager router call");
+    let eager = rig.snapshot();
+    let (graph, ()) = ctx
+        .capture(&stream, no_pins(), || rig.call())
+        .expect("capture of the router call");
+    assert_eq!(graph.nodes(), 2, "the router graph holds two kernels");
+    for replay in 0..2 {
+        repoison(&rig);
+        graph.launch(&stream).expect("replay");
+        assert_eq!(
+            rig.snapshot(),
+            eager,
+            "replay {replay} differs from the eager run"
+        );
+    }
 }

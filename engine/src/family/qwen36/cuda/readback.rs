@@ -115,3 +115,24 @@ pub(super) fn eager_report(plan: &ReadbackPlan) -> RunReport {
         host_writes: HOST_WRITES_PER_TOKEN,
     }
 }
+
+/// The report of a token whose body was captured into a graph and replayed: the outcome is
+/// `Captured`, and the waits and the start-block write stay one each (the read-back and the
+/// start block of a token are outside the graph).
+pub(super) fn captured_report(plan: &ReadbackPlan) -> RunReport {
+    RunReport {
+        capture: CaptureOutcome::Captured,
+        syncs: plan.blocking_waits(),
+        host_writes: HOST_WRITES_PER_TOKEN,
+    }
+}
+
+/// The report of a token whose capture was refused and whose body then ran eagerly: the outcome
+/// is the sticky `RefusedFellBackToEager`.
+pub(super) fn refused_report(plan: &ReadbackPlan) -> RunReport {
+    RunReport {
+        capture: CaptureOutcome::RefusedFellBackToEager,
+        syncs: plan.blocking_waits(),
+        host_writes: HOST_WRITES_PER_TOKEN,
+    }
+}

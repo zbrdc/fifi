@@ -10,8 +10,12 @@
 //! 2. the private `run_body`, which ONLY enqueues launches (its doc states the contract);
 //! 3. the read-back, the event and ONE blocking wait (`read_back`).
 //!
-//! The pin accessors, the warm-up token and the setting of `CaptureOutcome` belong to the slim
-//! RD-11a (lane C); this packet always runs the body eagerly.
+//! Since RD-11a the body of a token runs in one of three modes (the pure `next_mode` rule
+//! below): eager (the warm-up token, every fallback and every plain session), captured (one
+//! capture, then replays), or eager-after-refusal. A refused capture is STICKY for the whole
+//! step construction: later tokens stay eager and keep reporting
+//! `RefusedFellBackToEager`, across `reset_state` and `import_state`, which are
+//! `ResidentState` methods and cannot touch the step's own flags.
 //!
 //! # Call order and errors (RD-9b, binding)
 //!
@@ -23,8 +27,9 @@
 //!
 //! One row only: `m = 1` everywhere (the MoE block takes one row).
 //!
-//! Drop order: the borrowed weights and views first, then the state, the pinned word, the event
-//! and the stream; `Drop` synchronizes the stream first.
+//! Drop order: the captured graph first (it keeps the holds of its capture and covers the state
+//! buffers by drop order), then the borrowed weights and views, the state, the pinned word, the
+//! event and the stream; `Drop` synchronizes the stream first.
 //!
 //! Design guidance only, no code copied.
 
@@ -33,13 +38,16 @@ use super::{
     mixer::{BlockIo, MixerParts, MixerViews, Mixers},
     mixer_weights::MixerWeights,
     moe::{ExpertBufs, Launch, MoeBuffers, MoeDims, MoeLayerWeights, RouteBufs, run_moe_block},
-    readback::{ReadbackPlan, SYNC_EACH_VAR, eager_report, parse_sync_each},
+    readback::{
+        ReadbackPlan, SYNC_EACH_VAR, captured_report, check_mode, eager_report, parse_sync_each,
+        refused_report,
+    },
     resources::{
         GlobalSpecs, GlobalWeights, MoeSpecs, STEP_ROWS, StepResources, f32_bytes, moe_dims,
         moe_layer_weights,
     },
     rules::{QwenRules, StepWidths, check_token_id, validate_step_inputs},
-    run_report::RunReport,
+    run_report::{CaptureOutcome, RunReport},
     state::{ResidentState, StepField, export::ExportedState},
     state_layout::Word,
     step_ops::{StepOp, final_resid, resid_in, resid_out, token_ops},
@@ -52,7 +60,8 @@ use crate::{
     EngError,
     family::project::cuda::CudaWeights,
     kernels::cuda::{
-        CudaContext, DeviceEvent, DeviceRange, DeviceStream, MatmulIo, PinnedWord, Projection,
+        CapturePlan, CudaContext, DeviceBuffer, DeviceEvent, DeviceRange, DeviceStream, GraphExec,
+        MatmulIo, PinnedWord, Projection,
         resident::{
             add_norm_pack::AddNormCall,
             embed::EmbedCall,
@@ -62,6 +71,80 @@ use crate::{
 };
 
 const F32: usize = size_of::<f32>();
+
+/// Capture settings of the step; distinct from `dims::StepOptions` (the dimensions options of
+/// `new`).
+pub(crate) struct CaptureConfig {
+    /// Whether the step should capture its body into a replayable graph.
+    pub(crate) capture: bool,
+}
+
+/// How the body of this token will run (the dispatch discriminator of `run_token`).
+pub(super) enum Mode {
+    /// The stored graph replays.
+    Replay,
+    /// The first capture is attempted (a warmed step that asked for it and never refused one).
+    Capture,
+    /// The launches run one by one.
+    Eager,
+}
+
+/// The dispatch rule: replay once a graph exists; attempt the capture only on a warmed step
+/// that asked for it and has not already refused one; otherwise run eagerly.
+pub(super) fn next_mode(graph_ready: bool, warmed: bool, capture_on: bool, refused: bool) -> Mode {
+    if graph_ready {
+        Mode::Replay
+    } else if warmed && capture_on && !refused {
+        Mode::Capture
+    } else {
+        Mode::Eager
+    }
+}
+
+/// The pure part of `capture_once`: what to do with the result of the capture attempt.
+/// `Ok(Some(graph))`: the capture succeeded, the caller stores and replays the graph. `Ok(None)`:
+/// the device refused the capture, so the attempt's op count is discarded (`entered` back to 0,
+/// the failure rule must judge the rerun alone), the sticky refusal is set (`refused`) and the
+/// caller reruns the body eagerly. `Err`: any other error comes back unchanged, with `entered`
+/// and `refused` untouched, for the caller to fail on.
+pub(super) fn fold_capture<G>(
+    attempt: Result<(G, ()), EngError>,
+    is_refusal: fn(&EngError) -> bool,
+    entered: &mut usize,
+    refused: &mut bool,
+) -> Result<Option<G>, EngError> {
+    match attempt {
+        Ok((graph, ())) => Ok(Some(graph)),
+        Err(error) if is_refusal(&error) => {
+            *entered = 0;
+            *refused = true;
+            Ok(None)
+        }
+        Err(error) => Err(error),
+    }
+}
+
+/// How the body of one token ran (the discriminator `reported_outcome` maps to the outcome).
+#[derive(Debug, Clone, Copy)]
+pub(super) enum HowRan {
+    /// The launches ran one by one (warm-up, fallback or plain session).
+    Eager,
+    /// A capture succeeded and the graph ran this token.
+    Captured,
+    /// A capture was refused and the body ran eagerly in the same token.
+    Refused,
+}
+
+/// The outcome one token reports: after a refusal every later token keeps reporting the
+/// fallback (sticky outcome), so the one-read gate FAILs the silent fallback with no new field.
+pub(super) fn reported_outcome(ran: HowRan, refused: bool) -> CaptureOutcome {
+    match ran {
+        HowRan::Eager if refused => CaptureOutcome::RefusedFellBackToEager,
+        HowRan::Eager => CaptureOutcome::Eager,
+        HowRan::Captured => CaptureOutcome::Captured,
+        HowRan::Refused => CaptureOutcome::RefusedFellBackToEager,
+    }
+}
 
 /// The environment value of `INFERENCE_CUDA_SYNC_EACH`, `None` when unset.
 fn sync_each_from_env() -> Result<bool, EngError> {
@@ -76,7 +159,16 @@ fn sync_each_from_env() -> Result<bool, EngError> {
 
 /// The resident decode step of one session. See the module doc.
 pub(crate) struct QwenResidentStep<'a> {
-    // Declaration order is drop order: borrows first, the stream last.
+    // Declaration order is drop order: the graph first, then the borrows, the stream last.
+    /// The leaked pin slice of the weights and the arena slot: one leaked slice per new step
+    /// (per session in stage 1); the graph bakes their addresses in.
+    pins: &'a [&'a DeviceBuffer],
+    /// The replayable body, once a capture has succeeded. Declared BEFORE the state field: the
+    /// graph (which keeps the arena holds and borrows the pin slice) drops first, and that
+    /// covers the state buffers by drop order -- they live inside the step and never move
+    /// after they are built, so the pin list need not name them (the one documented deviation
+    /// from the plan's pins doc, accepted for stage 1).
+    graph: Option<GraphExec<'a>>,
     context: &'a CudaContext,
     res: &'a StepResources,
     mixers: Mixers<'a>,
@@ -88,6 +180,18 @@ pub(crate) struct QwenResidentStep<'a> {
     event: DeviceEvent,
     stream: DeviceStream,
     sync_each: bool,
+    /// Set once a token has passed the host checks (token id, read-back plan) and is about to
+    /// write its start block, succeeded or not: the capture mode is fixed from then on. A token
+    /// the host refuses before that has no device effect and does not freeze the mode.
+    started: bool,
+    /// Set only at the end of a fully successful eager token (a failed first token does not
+    /// warm; the warm-up retries).
+    warmed: bool,
+    /// The capture setting of `set_capture_config` (default false).
+    capture_on: bool,
+    /// The sticky refusal flag: set only by a refused capture, never cleared -- `reset_state`
+    /// and `import_state` are `ResidentState` methods and cannot touch it.
+    refused: bool,
     pub(super) rules: QwenRules,
     /// The sampler widths the step wires in (see `rules::StepWidths`): the argmax `n` and the
     /// verdict width, both the sampler vocabulary, never the padded head width.
@@ -108,6 +212,10 @@ impl<'a> QwenResidentStep<'a> {
     /// `make` closure. Its documented limit applies unchanged: every engine open leaks one handle,
     /// so every reload leaks one more. An owning `Arc` of the three is the clean fix; the types
     /// allow it (nothing here needs a borrow longer than the step), and it is a later packet.
+    ///
+    /// The pin slice of the graph is built here too, beside that limit: one leaked slice of
+    /// the weight buffers and the arena slot per new step (per session in stage 1), stored for
+    /// the whole life of the step and of any graph it captures.
     pub(crate) fn new(
         context: &'a CudaContext,
         res: &'a StepResources,
@@ -133,7 +241,12 @@ impl<'a> QwenResidentStep<'a> {
             .map(|&layer| moe_layer_weights(&res.table, weights, &specs, layer))
             .collect::<Result<Vec<_>, _>>()?;
         let vocab = res.dims.shape.vocab;
+        let mut pinned: Vec<&'a DeviceBuffer> = weights.device_buffers().collect();
+        pinned.push(res.arena.buffer());
+        let pins: &'a [&'a DeviceBuffer] = Box::leak(pinned.into_boxed_slice());
         Ok(Self {
+            pins,
+            graph: None,
             context,
             res,
             mixers: Mixers::new(context, parts)?,
@@ -145,11 +258,28 @@ impl<'a> QwenResidentStep<'a> {
             event,
             stream,
             sync_each,
+            started: false,
+            warmed: false,
+            capture_on: false,
+            refused: false,
             rules,
             widths,
             logits_bytes: vec![0; f32_bytes(vocab)?],
             report: RunReport::default(),
         })
+    }
+
+    /// Sets the capture settings; refuses after the first token and refuses
+    /// `INFERENCE_CUDA_SYNC_EACH=1` together with a capture (`check_mode`'s first caller).
+    pub(crate) fn set_capture_config(&mut self, config: CaptureConfig) -> Result<(), EngError> {
+        check_mode(self.sync_each, config.capture)?;
+        if self.started {
+            return Err(EngError::BadRequest(
+                "step: the capture mode is fixed once the session runs".to_owned(),
+            ));
+        }
+        self.capture_on = config.capture;
+        Ok(())
     }
 
     /// The report of the last SUCCESSFUL token: after a failed token it still holds the previous
@@ -229,12 +359,27 @@ impl<'a> QwenResidentStep<'a> {
         let plan = self.readback_plan(want_logits)?;
         // The start block is written at a committed boundary (the state is idle), then the step
         // is admitted; a refused write queues nothing.
+        self.started = true;
         self.write_start(token)?;
         let admitted = self.state.enqueue_rows(STEP_ROWS)?;
         let mut entered = 0;
-        if let Err(error) = self.run_body(admitted.admit_pos, &mut entered) {
-            return Err(self.fail(entered, error));
-        }
+        let mode = next_mode(
+            self.graph.is_some(),
+            self.warmed,
+            self.capture_on,
+            self.refused,
+        );
+        let ran = match mode {
+            Mode::Replay => self.replay().map(|()| HowRan::Captured),
+            Mode::Capture => self.capture_once(admitted.admit_pos, &mut entered),
+            Mode::Eager => self
+                .run_body(admitted.admit_pos, &mut entered)
+                .map(|()| HowRan::Eager),
+        };
+        let how = match ran {
+            Ok(how) => how,
+            Err(error) => return Err(self.fail(entered, error)),
+        };
         let pair = self.read_back(&plan).inspect_err(|_| self.state.poison())?;
         // The post-read-back decision is `decide`'s: a flagged row keeps a filler token and
         // hands its exact status to `commit_step`, a clean row commits and yields its token,
@@ -251,7 +396,14 @@ impl<'a> QwenResidentStep<'a> {
                 token
             }
         };
-        self.report = eager_report(&plan);
+        if matches!(how, HowRan::Eager) {
+            self.warmed = true;
+        }
+        self.report = match reported_outcome(how, self.refused) {
+            CaptureOutcome::Eager => eager_report(&plan),
+            CaptureOutcome::Captured => captured_report(&plan),
+            CaptureOutcome::RefusedFellBackToEager => refused_report(&plan),
+        };
         Ok(token)
     }
 
@@ -313,6 +465,50 @@ impl<'a> QwenResidentStep<'a> {
             }
         }
         Ok(())
+    }
+
+    /// Attempts the one capture of the body: the holds are a local here (the returned graph
+    /// keeps them for its life; eager tokens hold nothing), the body runs inside the window
+    /// through the launch-only wrappers, and a succeeded capture stores the graph and replays
+    /// it in the same token (a capture records but does not run). A refused capture (the one
+    /// non-terminal refusal of the device capture) discards the attempt's op count, reruns the
+    /// body eagerly in the same token (which re-records any events) and sets the sticky
+    /// refusal; every other error is the caller's to fail on.
+    fn capture_once(&mut self, admit_pos: usize, entered: &mut usize) -> Result<HowRan, EngError> {
+        let holds = vec![self.res.arena.hold(), self.context.workspace_hold()?];
+        let attempt = self.context.capture(
+            &self.stream,
+            CapturePlan {
+                pins: self.pins,
+                holds,
+            },
+            || self.run_body(admit_pos, entered),
+        );
+        match fold_capture(
+            attempt,
+            crate::kernels::cuda::is_capture_refusal,
+            entered,
+            &mut self.refused,
+        )? {
+            Some(graph) => {
+                self.graph = Some(graph);
+                self.replay()?;
+                Ok(HowRan::Captured)
+            }
+            None => {
+                self.run_body(admit_pos, entered)?;
+                Ok(HowRan::Refused)
+            }
+        }
+    }
+
+    /// Replays the stored graph on the owned stream (the graph is borrowed in its own scope).
+    fn replay(&mut self) -> Result<(), EngError> {
+        let Self { graph, stream, .. } = self;
+        match graph {
+            Some(graph) => graph.launch(stream),
+            None => Err(EngError::BadRequest("step: no graph to replay".to_owned())),
+        }
     }
 
     fn run_op(

@@ -74,7 +74,7 @@ pub(crate) use context::{
 )]
 pub(crate) use context::{
     ArenaHold, CapturePlan, DeviceArena, DeviceEvent, DeviceRange, DeviceStream, GraphExec,
-    MatmulIo, PackCall, PinnedWord, Projection, WordValue,
+    MatmulIo, PackCall, PinnedWord, Projection, WordValue, is_capture_refusal,
 };
 pub(crate) use {
     arena::{ArenaPlan, ArenaTensor, plan_arena},

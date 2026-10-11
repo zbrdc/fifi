@@ -134,6 +134,15 @@ impl CudaWeights {
         self.weights.iter().map(CudaWeight::device_bytes).sum()
     }
 
+    /// The device buffer of every tensor of the load, in load order: the leaked pin slice of a
+    /// resident step reads them (RD-11a), beside the arena slot.
+    pub(crate) fn device_buffers(&self) -> impl Iterator<Item = &DeviceBuffer> {
+        self.weights.iter().map(|weight| match weight {
+            CudaWeight::Tiled { weight, .. } => weight.buffer(),
+            CudaWeight::Raw { buffer, .. } => buffer,
+        })
+    }
+
     pub(crate) fn times(&self) -> LoadTimes {
         self.times
     }

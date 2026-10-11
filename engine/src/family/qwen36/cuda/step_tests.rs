@@ -4,7 +4,10 @@
 //! step cannot run here, so a mutant of a wiring must still fail a named test. The pinned text
 //! is stripped of line comments and string literals and its whitespace is collapsed first, so a
 //! comment cannot satisfy a pin and a rustfmt re-wrap cannot break one.
-use super::{state::StepField, state_layout::Word};
+use super::run_report::CaptureOutcome;
+use super::state::StepField;
+use super::state_layout::Word;
+use super::step::{HowRan, Mode, fold_capture, next_mode, reported_outcome};
 use crate::kernels::cuda::resident::step_params::{
     OFFSET_KV_LEN, OFFSET_POS, OFFSET_STATUS, OFFSET_TOKEN_ID, STEP_PARAMS_BYTES,
 };
@@ -280,11 +283,11 @@ fn run_token_refuses_a_bad_id_without_poisoning_or_cancelling() {
     let body = pinned_text(fn_section("fn run_token"));
     let length = body.len();
     let check = body
-        .find("check_token_id(token, self.widths.verdict)")
+        .find("check_token_id(token, self.widths.verdict)?")
         .unwrap_or_else(|| {
             panic!(
                 "the run_token body ({length} bytes) does not call \
-                 check_token_id(token, self.widths.verdict)"
+                 check_token_id(token, self.widths.verdict)?"
             )
         });
     let write = body
@@ -313,11 +316,11 @@ fn run_token_checks_the_token_id_before_the_start_block() {
     let body = pinned_text(fn_section("fn run_token"));
     let length = body.len();
     let check = body
-        .find("check_token_id(token, self.widths.verdict)")
+        .find("check_token_id(token, self.widths.verdict)?")
         .unwrap_or_else(|| {
             panic!(
                 "the run_token body ({length} bytes) does not call \
-                 check_token_id(token, self.widths.verdict)"
+                 check_token_id(token, self.widths.verdict)?"
             )
         });
     let mut found = body.find("write_start(");
@@ -341,11 +344,11 @@ fn write_start_checks_the_token_id_before_the_device_write() {
     let body = pinned_text(fn_section("fn write_start"));
     let length = body.len();
     let check = body
-        .find("check_token_id(token, self.widths.verdict)")
+        .find("check_token_id(token, self.widths.verdict)?")
         .unwrap_or_else(|| {
             panic!(
                 "the write_start body ({length} bytes) does not call \
-                 check_token_id(token, self.widths.verdict)"
+                 check_token_id(token, self.widths.verdict)?"
             )
         });
     let mut found = body.find("write_step_params(");
@@ -358,5 +361,163 @@ fn write_start_checks_the_token_id_before_the_device_write() {
         found = body[at + 1..]
             .find("write_step_params(")
             .map(|more| at + 1 + more);
+    }
+}
+
+/// The text of the `QwenResidentStep` struct item of the merged `step.rs`.
+fn struct_section(name: &str) -> &'static str {
+    let source = include_str!("step.rs");
+    let at = source
+        .find(name)
+        .unwrap_or_else(|| panic!("step.rs has no {name:?}"));
+    let line_start = source[..at].rfind('\n').map_or(0, |nl| nl + 1);
+    let mut end = source.len();
+    let mut line = source[at..]
+        .find('\n')
+        .map_or(source.len(), |nl| at + nl + 1);
+    while line < source.len() {
+        let next = source[line..]
+            .find('\n')
+            .map_or(source.len(), |nl| line + nl + 1);
+        let text = source[line..next].trim();
+        if text == "}" {
+            end = line;
+            break;
+        }
+        line = next;
+    }
+    &source[line_start..end]
+}
+
+#[test]
+fn the_graph_field_is_declared_before_the_state() {
+    // D1: the drop-order coverage of the state buffers. The `graph` field (which keeps the
+    // arena holds and borrows the pin slice) must drop before the `state` field that owns the
+    // `kv`, `delta` and `words` buffers whose addresses the graph bakes in.
+    let body = pinned_text(struct_section("struct QwenResidentStep"));
+    let length = body.len();
+    let graph = body
+        .find("graph: Option<GraphExec")
+        .unwrap_or_else(|| panic!("the struct ({length} bytes) has no graph field"));
+    let state = body
+        .find("state: ResidentState")
+        .unwrap_or_else(|| panic!("the struct ({length} bytes) has no state field"));
+    assert!(
+        graph < state,
+        "the graph field must be declared before the state field (graph at {graph}, state at          {state}, {length} bytes)"
+    );
+}
+
+#[test]
+fn next_mode_decides_every_combination() {
+    // All sixteen combinations of the pure dispatch rule: Replay iff a graph exists; Capture
+    // iff none exists and the step is warmed, asked for the capture and has not already
+    // refused one (the sticky guard); Eager otherwise.
+    for graph_ready in [false, true] {
+        for warmed in [false, true] {
+            for capture_on in [false, true] {
+                for refused in [false, true] {
+                    let mode = next_mode(graph_ready, warmed, capture_on, refused);
+                    let want = if graph_ready {
+                        Mode::Replay
+                    } else if warmed && capture_on && !refused {
+                        Mode::Capture
+                    } else {
+                        Mode::Eager
+                    };
+                    assert_eq!(
+                        std::mem::discriminant(&mode),
+                        std::mem::discriminant(&want),
+                        "graph {graph_ready} warmed {warmed} on {capture_on} refused {refused}"
+                    );
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn a_sticky_refusal_keeps_reporting_the_fallback_outcome() {
+    // All SIX (outcome, refused) combinations: an eager token after a refusal keeps reporting
+    // the fallback, so the landed one-read gate FAILs the silent fallback with no new field;
+    // a captured token reports Captured whatever the flag holds (a refusal never follows a
+    // capture on the same step).
+    for (ran, refused, want) in [
+        (HowRan::Eager, false, CaptureOutcome::Eager),
+        (HowRan::Eager, true, CaptureOutcome::RefusedFellBackToEager),
+        (HowRan::Captured, false, CaptureOutcome::Captured),
+        (HowRan::Captured, true, CaptureOutcome::Captured),
+        (
+            HowRan::Refused,
+            false,
+            CaptureOutcome::RefusedFellBackToEager,
+        ),
+        (
+            HowRan::Refused,
+            true,
+            CaptureOutcome::RefusedFellBackToEager,
+        ),
+    ] {
+        assert_eq!(
+            reported_outcome(ran, refused),
+            want,
+            "{ran:?} with refused {refused}"
+        );
+    }
+}
+
+#[test]
+fn a_succeeded_capture_hands_the_graph_on_and_touches_nothing() {
+    let (mut entered, mut refused) = (7, false);
+    let folded = fold_capture(Ok((42_u32, ())), |_| true, &mut entered, &mut refused);
+    assert!(matches!(folded, Ok(Some(42))), "the graph must come back");
+    assert_eq!(entered, 7, "a succeeded capture keeps the op count");
+    assert!(!refused, "a succeeded capture is not a refusal");
+}
+
+#[test]
+fn a_refused_capture_resets_the_count_sets_the_sticky_flag_and_asks_for_the_rerun() {
+    let (mut entered, mut refused) = (5, false);
+    let error = crate::EngError::BadRequest("refused".to_owned());
+    let folded = fold_capture::<u32>(Err(error), |_| true, &mut entered, &mut refused);
+    assert!(
+        matches!(folded, Ok(None)),
+        "a refusal asks for the eager rerun"
+    );
+    assert_eq!(entered, 0, "the failure rule must judge the rerun alone");
+    assert!(refused, "the refusal is sticky");
+}
+
+#[test]
+fn any_other_capture_error_passes_through_unchanged_and_touches_nothing() {
+    let (mut entered, mut refused) = (5, false);
+    let error = crate::EngError::BadRequest("other".to_owned());
+    let folded = fold_capture::<u32>(Err(error), |_| false, &mut entered, &mut refused);
+    assert!(
+        matches!(&folded, Err(crate::EngError::BadRequest(text)) if text == "other"),
+        "the error must come back as it was"
+    );
+    assert_eq!(
+        entered, 5,
+        "a non-refusal keeps the op count for the failure rule"
+    );
+    assert!(!refused, "a non-refusal never sets the sticky flag");
+}
+
+#[test]
+fn capture_once_folds_the_attempt_through_the_seam_and_reruns_on_none() {
+    // The wiring: the real predicate and the step's own flag go into the seam, `?` hands any
+    // other error to the caller, and only the `None` arm reruns the body and reports Refused.
+    let body = pinned_text(fn_section("fn capture_once"));
+    let length = body.len();
+    for needle in [
+        "fold_capture( attempt, crate::kernels::cuda::is_capture_refusal, entered, &mut self.refused, )?",
+        "Some(graph) => { self.graph = Some(graph); self.replay()?; Ok(HowRan::Captured) }",
+        "None => { self.run_body(admit_pos, entered)?; Ok(HowRan::Refused) }",
+    ] {
+        assert!(
+            body.contains(needle),
+            "the capture_once body ({length} bytes) lacks {needle:?}"
+        );
     }
 }
