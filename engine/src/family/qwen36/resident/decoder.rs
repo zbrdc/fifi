@@ -260,9 +260,9 @@ impl<'c> ResidentDecoder<'c> {
     /// The chunks run in `Prompt` mode except the last, which runs in `mode`. The result is that of
     /// the last chunk: the head reads the last row of the prompt.
     ///
-    /// A prompt of one token runs as a chunk of one row, not as `step`. Every chunk routes on the
-    /// host whatever `Routing` the decoder holds, so the result has `routes: None` in every mode.
-    /// `step` returns `Some(routes)` in `Record` mode.
+    /// A prompt of one token runs as a chunk of one row, not as `step`. A chunk routes as this
+    /// decoder holds (`Routing::Host` or `Routing::Device`, packet Q36-PF-DEVROUTE), so the result
+    /// has `routes: None` in every mode. `step` returns `Some(routes)` in `Record` mode.
     ///
     /// The host checks of the whole prompt (a poisoned state, an empty prompt, and the context
     /// limit) run first and change nothing on error. Each chunk repeats the host checks and takes

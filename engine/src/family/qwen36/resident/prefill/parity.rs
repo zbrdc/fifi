@@ -10,9 +10,11 @@
 //!    bounds of decision 0044 G2, as in Flash-Next H8b, not proposals. Each of the 40 last-row
 //!    layer outputs and the logits need a cosine of at least 0.99999 and a relative error
 //!    `max|got - want| / max|want|` of at most 1e-4. The top 5 and the 8 greedy tokens must be equal.
-//!    The one-token path runs with `Routing::Host`, because every chunk routes on the host. Only the
-//!    accumulation of M > 1 against M = 1 differs between the two paths. Device against host routing
-//!    parity is gated by Q36-DR4, not here. The report records the experts of the stepped last token.
+//!    The one-token path still runs with `Routing::Host` as the parity reference (packet
+//!    Q36-PF-DEVROUTE: the chunk follows the decoder's routing, `Routing::Device` by default), so
+//!    the gate compares a device chunk with host steps. Both paths select experts from the same
+//!    F32 probability bits with the same tie rule, so only the accumulation of M > 1 against
+//!    M = 1 differs between the two paths. The report records the experts of the stepped last token.
 //! 3. `real_checkpoint_prompt_speed`: a 2,048-token prompt in chunks of each size in `Q36_CHUNKS`.
 //!    It reports seconds, tokens per second, memory, and the peak retired bytes of each run. With
 //!    the `native-fault-qualification` feature it also reports synchronizations and forced
@@ -440,8 +442,11 @@ fn real_checkpoint_chunks_match_the_one_token_path() {
     let chunk_seconds = started.elapsed().as_secs_f64();
     let started = std::time::Instant::now();
     let (last, before) = tokens.split_last().unwrap();
-    // Every chunk routes on the host, so the one-token path routes on the host too. Only the
-    // accumulation of M > 1 against M = 1 differs. Device routing parity is gated by Q36-DR4.
+    // The chunk follows the decoder's routing (`Routing::Device`, the default); the one-token
+    // path runs on the host as the parity reference, so the gate compares a device chunk with
+    // host steps. Both select experts from the same F32 probability bits with the same tie rule,
+    // so only the accumulation of M > 1 against M = 1 differs. Device routing parity of the
+    // decode path is gated by Q36-DR4.
     decoder.set_routing(Routing::Host);
     for &t in before {
         decoder.step(&mut stepped, t, StepMode::Prompt).unwrap();

@@ -6,20 +6,26 @@
 //! last chunk runs in the requested mode. The head reads the last row only.
 //!
 //! Synchronizations of one chunk with `L` layers, `D` DeltaNet layers, and `S = ceil(T / s)` parts
-//! of the recurrence (`delta::gated_delta_recurrence`): the token-start import 1, host routing 2
-//! per layer (the probability readback and the index import), `S` per DeltaNet layer when `S > 1`
-//! (one evaluation of the operands and `S - 1` part boundaries) and none when `S = 1`, one final
-//! `evaluate`, and the readbacks of the one-token step for the last row. `Prompt` skips the last
-//! layer's MoE, so it makes `2 L`, plus `D * S` when `S > 1`. `Generate`, `Logits`, and `Record`
-//! make 3, 4, and 5 more than the `2 L`, as in `step.rs`. The qualification build counts them
+//! of the recurrence (`delta::gated_delta_recurrence`): the token-start import 1, then the routing
+//! mode of the decoder. `Routing::Host` (the reference) reads the probabilities and imports the
+//! sorted pairs of every layer (2 per layer, none for the last layer of a `Prompt` chunk);
+//! `Routing::Device` (the default, packet Q36-PF-DEVROUTE) makes none in a layer and instead
+//! evaluates the layer output every `EVAL_CADENCE` layers (see below) plus the one health readback
+//! of the chunk (the stacked router sums). Then `S` per DeltaNet layer when `S > 1` (one evaluation
+//! of the operands and `S - 1` part boundaries) and none when `S = 1`, one final `evaluate`, and
+//! the readbacks of the one-token step for the last row. So `Routing::Host` makes `2 L` in
+//! `Prompt` and `2 L + 3`, `2 L + 4`, `2 L + 5` in `Generate`, `Logits`, and `Record` (8, 11, 12,
+//! and 13 on the four-layer test model). `Routing::Device` makes `1 + cadence + 1 + 1` in
+//! `Prompt` (6 on the test model with a cadence evaluate per layer) and one more per head readback
+//! (7, 8, and 9 in `Generate`, `Logits`, and `Record`). The qualification build counts them
 //! exactly.
 //!
 //! The retire cap of the adapter is a flat 512 MiB while a chunk runs and the previous cap (the
-//! decoder's `DECODE_RETIRE_CAP`) afterwards, on every path. A chunk routes on the host
-//! (`moe::chunk`) whatever `Routing` the decoder holds, and its result has `routes: None`.
-//! A chunk marks the state poisoned before its first native call and
-//! publishes the new state only after the final `evaluate` and the readbacks succeed. A host check
-//! that fails first changes nothing.
+//! decoder's `DECODE_RETIRE_CAP`) afterwards, on every path. A chunk routes as its decoder holds:
+//! `Routing::Host` calls the host-routed `moe::chunk` and `Routing::Device` the device-routed
+//! `moe::chunk_device`; either way the result has `routes: None`. A chunk marks the state
+//! poisoned before its first native call and publishes the new state only after the final
+//! `evaluate` and the readbacks succeed. A host check that fails first changes nothing.
 //!
 //! The activation dtype (packet Q36-BF16-b): a chunk runs the same boundary casts as the decode
 //! step of `step.rs` — the concatenated embedding rows, `bb`, the new keys and values, and the MoE
@@ -34,6 +40,7 @@ use super::super::chunk_plan::{
     PREFILL_RETIRE_CAP, delta_retire_per_token, delta_subchunk, ranges,
 };
 use super::super::decoder::{ResidentDecoder, StepMode, StepResult};
+use super::super::moe::Routing;
 use super::super::ops::{Ctx, cast_to, dim, linear, short_import, to_act, values};
 use super::super::state::{LayerState, ResidentState, chunk_growth_bytes};
 use super::super::step::{check_dtype, read_token, split_rows};
@@ -42,11 +49,25 @@ use super::{attn, delta, moe};
 use crate::{
     EngError,
     family::flash_next::stored::{self, SlicedWeight},
+    family::route::check_health,
     kernels::{BinaryOp, PackedWeight},
     sched::GrowthPermit,
     tensor::{Dtype, ExecutionTensor},
     weights::StreamedCheckpoint,
 };
+
+/// Layers of a device-routed chunk between two evaluations of the layer output (packet
+/// Q36-PF-DEVROUTE). The value is 1: without the host routing synchronizations the retired bytes
+/// of the chunk would grow by one layer of MoE temporaries per layer (the `repeat`, the gathered
+/// products, and the un-sorted rows are about 208 MB per 512-row layer, on top of the projections
+/// of the mixer), and a wider cadence would cross the flat 512 MiB `PREFILL_RETIRE_CAP` of the
+/// adapter at 512 rows and force retire flushes. One layer keeps the peak at about one layer of
+/// temporaries (about 1.04 GB planned workspace at 256 rows, `ChunkCost::workspace`); the cost is
+/// one `evaluate` per layer, which is a stream synchronization without a readback. The Mac gates
+/// measure the allocator peak (`mlx_peak_bytes` of the prompt-speed report) against the plan at
+/// 256 and 512 rows; a measured peak below the plan with a wider cadence would justify raising
+/// this constant.
+const EVAL_CADENCE: usize = 1;
 
 fn bad(message: &str) -> EngError {
     EngError::BadRequest(message.into())
@@ -66,8 +87,9 @@ fn row_count(tokens: &[u32]) -> Result<u32, EngError> {
 /// that passes the context limit return an error and change nothing. Then the chunks run in order.
 /// A failed host check or a denied growth permit (`MemoryPlan`) in a later chunk comes before
 /// `begin`. It leaves the state clean, with the earlier chunks published and `state.pos()` after
-/// the last of them. An error after `begin` poisons the state until `reset`. A chunk routes on the
-/// host whatever `Routing` the decoder holds, and its result has `routes: None`.
+/// the last of them. An error after `begin` poisons the state until `reset`. A chunk routes as its
+/// decoder holds (`Routing::Host` or `Routing::Device`, packet Q36-PF-DEVROUTE) and its result
+/// has `routes: None`.
 pub(in super::super) fn prefill(
     decoder: &mut ResidentDecoder<'_>,
     state: &mut ResidentState,
@@ -197,6 +219,10 @@ fn run(
     let mut h = embed_rows(&mut ctx, ckpt, &weights.embed, tokens)?;
     let mut layers = Vec::with_capacity(old.len());
     let mut records = Vec::new();
+    // The device routing of packet Q36-PF-DEVROUTE collects one health node per layer and checks
+    // the stacked vector once at the chunk end. The host path checks every row inside
+    // `route_experts` and holds no node.
+    let mut healths: Vec<ExecutionTensor> = Vec::new();
     for (index, (layer, old_layer)) in weights.layers.iter().zip(old).enumerate() {
         let normed = ctx.kernels.rms_norm(&h, &layer.input_norm, shape.eps)?;
         // Packet Q36-BF16-b: the same dtype guard as the decode step. MLX promotes mixed operands,
@@ -235,13 +261,30 @@ fn run(
         }
         let normed = ctx.kernels.rms_norm(&mid, &layer.post_norm, shape.eps)?;
         check_dtype("post norm output", &normed, ctx.consts.act)?;
-        let (routed, _routes) = moe::chunk(&mut ctx, shape, &layer.moe, &normed)?;
+        let routed = match decoder.routing {
+            Routing::Host => moe::chunk(&mut ctx, shape, &layer.moe, &normed)?.0,
+            Routing::Device => {
+                let device = moe::chunk_device(&mut ctx, shape, &layer.moe, &normed)?;
+                healths.push(device.health);
+                device.out
+            }
+        };
         h = ctx.kernels.binary(BinaryOp::Add, &mid, &routed)?;
         check_dtype("layer output", &h, ctx.consts.act)?;
         if mode == StepMode::Record {
             // The recorded last row reads back as F32.
             let row = last_row(&mut ctx, &h, rows, hidden)?;
             records.push(cast_to(&mut ctx, &row, Dtype::F32)?);
+        }
+        // The evaluation cadence of the device path (see `EVAL_CADENCE`): evaluating the layer
+        // output frees the layer's retired temporaries at the next flush without reading anything
+        // back, so the lazy graph of the chunk stays bounded without the host routing
+        // synchronizations. The last layer feeds the final evaluate, so it needs no own evaluate.
+        if decoder.routing == Routing::Device
+            && index != last
+            && (index + 1).is_multiple_of(EVAL_CADENCE)
+        {
+            ctx.kernels.evaluate(&[&h])?;
         }
     }
     // The head runs on the last row only. `Prompt` skips it.
@@ -276,7 +319,15 @@ fn run(
             }
         }
     }
-    // One evaluate of the new state and the head outputs.
+    // One evaluate of the new state and the head outputs. A device-routed chunk also evaluates
+    // the stacked health of its router blocks, so the readback of the stack that follows the
+    // evaluate is the one extra synchronization per chunk (packet Q36-PF-DEVROUTE).
+    let health_stack = if healths.is_empty() {
+        None
+    } else {
+        let parts: Vec<&ExecutionTensor> = healths.iter().collect();
+        Some(ctx.kernels.concatenate(&parts, 0)?)
+    };
     let mut outputs: Vec<&ExecutionTensor> = Vec::new();
     for layer in &layers {
         match layer {
@@ -293,7 +344,16 @@ fn run(
     if let Some(rows) = &record_rows {
         outputs.push(rows);
     }
+    if let Some(health) = &health_stack {
+        outputs.push(health);
+    }
     ctx.kernels.evaluate(&outputs)?;
+    // The health of every routed layer, read back once: a non-finite value is the same failure
+    // that `route_experts` reports per row under host routing, checked before any head output is
+    // used. This is after `begin`, so the failure poisons the state like a native failure.
+    if let Some(health) = &health_stack {
+        check_health(&values(ctx.kernels, health)?)?;
+    }
     let token_out = match &head {
         Some((_, next)) => Some(read_token(ctx.kernels, next, shape.vocab)?),
         None => None,
@@ -462,7 +522,7 @@ mod tests {
                 ),
                 StepMode::Logits | StepMode::Record => {
                     assert_eq!(got.token, Some(host_argmax(&want.logits)), "{what}: argmax");
-                    assert!(got.routes.is_none(), "{what}: a chunk routes on the host");
+                    assert!(got.routes.is_none(), "{what}: a chunk never reports routes");
                     assert_parity(
                         &some(got.logits, &format!("{what} logits")),
                         &want.logits,
@@ -543,6 +603,72 @@ mod tests {
         prefill_matches_the_host(40, 16, None, &[StepMode::Record, StepMode::Prompt]);
     }
 
+    /// The tiny GQA checkpoint with the embedding scales of row `token` set to NaN, so that the
+    /// row dequantizes to NaN and every router block of a chunk on that token is NaN (the fixture
+    /// of the decode tests, copied for the chunk tests).
+    fn nan_embedding_checkpoint(token: u32) -> StreamedCheckpoint {
+        let mut entries = tiny::entries(&TINY_GQA);
+        for (name, _, shape, bytes) in &mut entries {
+            if name == "language_model.model.embed_tokens.scales" {
+                let row_bytes = shape[1] as usize * 2;
+                let at = token as usize * row_bytes;
+                for pair in bytes[at..at + row_bytes].as_chunks_mut::<2>().0 {
+                    *pair = crate::family::qwen36::fixtures::bf16(f32::NAN);
+                }
+            }
+        }
+        crate::family::qwen36::fixtures::checkpoint(entries)
+    }
+
+    /// Packet Q36-PF-DEVROUTE: a chunk whose first row dequantizes to NaN has NaN router blocks.
+    /// The device path cannot check a row before it picks experts, so it fails at the chunk-end
+    /// health readback with the `Backend` error of `route_experts`, after `begin`, and the state
+    /// is poisoned until `reset`; the growth permit is released and the retire cap restored, as
+    /// for any failed chunk. The host path fails inside `route_experts` at the first layer with
+    /// the same error.
+    #[test]
+    fn a_nan_router_row_fails_the_chunk_at_the_health_readback() {
+        let _serial = crate::native_test_lock();
+        let ckpt = nan_embedding_checkpoint(7);
+        let (mut decoder, _) = decoder_and_oracle(&ckpt, 1024);
+        for routing in [Routing::Device, Routing::Host] {
+            decoder.set_routing(routing);
+            let mut state = decoder.zero_state().unwrap();
+            let failed = decoder.prefill(&mut state, &[7, 1, 2], StepMode::Generate);
+            assert!(
+                matches!(
+                    &failed,
+                    Err(EngError::Backend {
+                        operation: "route_experts",
+                        ..
+                    })
+                ),
+                "{routing:?}: {failed:?}"
+            );
+            assert!(state.is_poisoned(), "{routing:?}: a failed chunk poisons");
+            assert_eq!(state.pos(), 0, "{routing:?}: position");
+            assert_eq!(
+                decoder.session_used(),
+                0,
+                "{routing:?}: the failed chunk released its permit"
+            );
+            let cap = decoder.kernels.set_retire_cap(1 << 20).unwrap();
+            assert_eq!(
+                cap, DECODE_RETIRE_CAP,
+                "{routing:?}: the failed chunk restored the cap of the decoder"
+            );
+            decoder.kernels.set_retire_cap(DECODE_RETIRE_CAP).unwrap();
+            decoder.reset(&mut state).unwrap();
+            assert!(
+                !state.is_poisoned() && state.pos() == 0,
+                "{routing:?}: reset recovers"
+            );
+            let again = decoder.prefill(&mut state, &[1], StepMode::Generate);
+            assert!(again.is_ok(), "{routing:?}: after reset {again:?}");
+            assert_eq!(state.pos(), 1, "{routing:?}: position after reset");
+        }
+    }
+
     /// Eight tokens as one chunk under a small cap. The kernel ignores the sub-chunk size, so the
     /// result equals the whole chunk.
     #[test]
@@ -553,6 +679,60 @@ mod tests {
             512,
             Some(CAP_FOR_TWO),
             &[StepMode::Record, StepMode::Prompt],
+        );
+    }
+
+    /// Packet Q36-PF-DEVROUTE T6: the same 8-token chunk under both routings. Both select experts
+    /// from the same F32 probability bits with the same tie rule, so every recorded layer row and
+    /// the logits agree within 1e-6 relative (stated; the only differences are the F32 summation
+    /// order of the gate renormalization and the place of the gate product). The device run goes
+    /// through the whole chunk step - the device MoE, the cadence evaluates, the health stack and
+    /// its readback - and the host run keeps the reference path.
+    #[test]
+    fn the_same_chunk_under_host_and_device_routing_agrees() {
+        let _serial = crate::native_test_lock();
+        let ckpt = setup();
+        let (mut decoder, _) = decoder_and_oracle(&ckpt, 1024);
+        decoder.set_chunk_rows(8).unwrap();
+        let tokens: Vec<u32> = (0..8).map(token).collect();
+        let mut run = |routing: Routing, what: &str| -> StepResult {
+            decoder.set_routing(routing);
+            let mut state = decoder.zero_state().unwrap();
+            ok(decoder.prefill(&mut state, &tokens, StepMode::Record), what)
+        };
+        let host = run(Routing::Host, "the host-routed chunk");
+        let device = run(Routing::Device, "the device-routed chunk");
+        assert!(
+            host.routes.is_none() && device.routes.is_none(),
+            "a chunk never reports routes"
+        );
+        assert_eq!(host.token, device.token, "the argmax of both routings");
+        let relative = |got: &[f32], want: &[f32]| {
+            let (mut diff, mut top) = (0f64, 0f64);
+            for (&g, &w) in got.iter().zip(want) {
+                diff = diff.max((f64::from(g) - f64::from(w)).abs());
+                top = top.max(f64::from(w).abs());
+            }
+            diff / top
+        };
+        let host_rows = some(host.layer_out, "the host layer rows");
+        let device_rows = some(device.layer_out, "the device layer rows");
+        assert_eq!(device_rows.len(), host_rows.len(), "the layer count");
+        for (l, (d, h)) in device_rows.iter().zip(&host_rows).enumerate() {
+            assert_eq!(d.len(), h.len(), "layer {l} width");
+            let error = relative(d, h);
+            assert!(
+                error <= 1e-6,
+                "layer {l}: device against host relative error {error}"
+            );
+        }
+        let error = relative(
+            &some(device.logits, "the device logits"),
+            &some(host.logits, "the host logits"),
+        );
+        assert!(
+            error <= 1e-6,
+            "logits: device against host relative error {error}"
         );
     }
 
@@ -717,11 +897,15 @@ mod tests {
         );
     }
 
-    /// Synchronizations on the tiny model: 4 layers, 2 DeltaNet layers. One chunk of 8 rows makes
-    /// `Prompt` 8, `Generate` 11, `Logits` 12, `Record` 13, as `step.rs`. The gated delta kernel
-    /// makes no synchronization, so `CAP_FOR_TWO` adds none: the counts stay `Prompt` 8 and
-    /// `Record` 13. Eight rows in chunks of 3, 3, and 2 run `Prompt`, `Prompt`, and the requested
-    /// mode: `8 + 8 + 13`.
+    /// Synchronizations on the tiny model: 4 layers, 2 DeltaNet layers. Device routing (the
+    /// default, packet Q36-PF-DEVROUTE): one chunk of 8 rows makes the token-start import 1, one
+    /// cadence evaluate per layer except the last 3, the final evaluate 1, and the health readback
+    /// 1: `Prompt` 6, `Generate` 7 (plus the token), `Logits` 8 (plus the logits), `Record` 9
+    /// (plus the layer rows). The gated delta kernel makes no synchronization, so `CAP_FOR_TWO`
+    /// adds none: the counts stay `Prompt` 6 and `Record` 9. Eight rows in chunks of 3,
+    /// 3, and 2 run `Prompt`, `Prompt`, and the requested mode: `6 + 6 + 9`. Host routing (the
+    /// reference) keeps the counts before the packet: `Prompt` 8 and `Generate`/`Logits`/`Record`
+    /// 11/12/13.
     #[cfg(feature = "native-fault-qualification")]
     #[test]
     fn each_prefill_uses_its_planned_synchronizations() {
@@ -730,18 +914,31 @@ mod tests {
         let (mut decoder, _) = decoder_and_oracle(&ckpt, 1024);
         let tokens: Vec<u32> = (0..8).map(token).collect();
         let syncs = |decoder: &ResidentDecoder<'_>| decoder.kernels.qualification_sync_count();
-        for (mode, want) in [
-            (StepMode::Prompt, 8),
-            (StepMode::Generate, 11),
-            (StepMode::Logits, 12),
-            (StepMode::Record, 13),
+        for (routing, budget) in [
+            (Routing::Device, [6, 7, 8, 9]),
+            (Routing::Host, [8, 11, 12, 13]),
         ] {
-            let mut state = decoder.zero_state().unwrap();
-            let before = syncs(&decoder);
-            ok(decoder.prefill(&mut state, &tokens, mode), "one chunk");
-            assert_eq!(syncs(&decoder) - before, want, "one chunk {mode:?}");
+            decoder.set_routing(routing);
+            for (mode, want) in [
+                (StepMode::Prompt, budget[0]),
+                (StepMode::Generate, budget[1]),
+                (StepMode::Logits, budget[2]),
+                (StepMode::Record, budget[3]),
+            ] {
+                let mut state = decoder.zero_state().unwrap();
+                let before = syncs(&decoder);
+                ok(decoder.prefill(&mut state, &tokens, mode), "one chunk");
+                assert_eq!(
+                    syncs(&decoder) - before,
+                    want,
+                    "one chunk {routing:?} {mode:?}"
+                );
+            }
         }
-        for (mode, want) in [(StepMode::Prompt, 8), (StepMode::Record, 13)] {
+        // The loop above ends on `Routing::Host`: the sub-chunk and three-chunk cases below count
+        // the device-routed chunk, the production default, so they set it again.
+        decoder.set_routing(Routing::Device);
+        for (mode, want) in [(StepMode::Prompt, 6), (StepMode::Record, 9)] {
             let mut state = decoder.zero_state().unwrap();
             let before = syncs(&decoder);
             let split = chunk_with_cap(&mut decoder, &mut state, &tokens, mode, CAP_FOR_TWO);
@@ -753,7 +950,7 @@ mod tests {
         let before = syncs(&decoder);
         let three = decoder.prefill(&mut state, &tokens, StepMode::Record);
         ok(three, "three chunks");
-        assert_eq!(syncs(&decoder) - before, 8 + 8 + 13, "three chunks");
+        assert_eq!(syncs(&decoder) - before, 6 + 6 + 9, "three chunks");
     }
 
     /// `max|got - want| / max|want|`, the F32 gate metric, reported for the BF16 run.
@@ -774,9 +971,10 @@ mod tests {
     /// than the 1e-4 of the F32 gates without changing the mode's decisions. The committed state
     /// is F32 in every part with the position and charge of the chunk itself (fix1: asserted
     /// right after the chunk, before the one-token steps and the greedy loop move them on), a
-    /// `Prompt` chunk commits the same F32 state through the last-layer mid guard, and the one-token
-    /// path routes on the host like the chunk (fix1), so no device-routing near tie can flake the
-    /// comparison.
+    /// `Prompt` chunk commits the same F32 state through the last-layer mid guard, and the chunk
+    /// runs the default `Routing::Device` against `Host` one-token steps (the shape of the E8 g2
+    /// gate after packet Q36-PF-DEVROUTE): both paths select experts from the same F32 probability
+    /// bits with the same tie rule, so no device-routing near tie can flake the comparison.
     #[test]
     fn a_bf16_chunk_matches_the_bf16_one_token_steps_within_the_mode() {
         let _serial = crate::native_test_lock();
@@ -827,9 +1025,10 @@ mod tests {
         }
         let mut stepped = decoder.zero_state().unwrap();
         let (last, before) = tokens.split_last().unwrap();
-        // Every chunk routes on the host, so the one-token path routes on the host too (fix1, as
-        // the real gate): only the accumulation of M > 1 against M = 1 differs, and no device
-        // near tie can flake the top-5 and greedy equality below.
+        // The chunk above ran the default device routing; the one-token path routes on the host
+        // (fix1, as the real gate): both select from the same probability bits, so only the
+        // accumulation of M > 1 against M = 1 differs, and no device near tie can flake the
+        // top-5 and greedy equality below.
         decoder.set_routing(Routing::Host);
         for &t in before {
             ok(

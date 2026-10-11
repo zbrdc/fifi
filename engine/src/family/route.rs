@@ -88,6 +88,21 @@ fn backend_fault(message: &str) -> EngError {
     }
 }
 
+/// Checks the stacked router-health values of a device-routed chunk (packet Q36-PF-DEVROUTE).
+/// Each layer of the chunk sums its whole `[T, E]` probability block into one F32 value, the chunk
+/// stacks the values and reads them back once, and this check replaces the finite check that
+/// `route_experts` makes per row under host routing: any non-finite value returns the same
+/// `Backend` error with the same operation label, and a finite vector passes. A softmax row sums
+/// to 1, so a NaN or infinite entry makes its layer's sum non-finite, as in `route_device`.
+pub fn check_health(values: &[f32]) -> Result<(), EngError> {
+    if values.iter().all(|value| value.is_finite()) {
+        return Ok(());
+    }
+    Err(backend_fault(
+        "router probabilities must be finite and non-negative",
+    ))
+}
+
 /// One beyond-tie difference that [`compare_top_k`] found between two selections of the same
 /// probability row (packet Q36-BF16-a fix3; decision 0046 A6).
 #[derive(Debug, Clone, PartialEq)]
@@ -357,6 +372,38 @@ mod tests {
     /// The gap of the 3/11 near-tie, computed the way `compare_top_k` computes it.
     fn tie_gap(probs: &[f32]) -> f32 {
         (probs[3] - probs[11]).abs()
+    }
+
+    #[test]
+    fn the_health_check_rejects_a_non_finite_layer_and_passes_a_finite_stack() {
+        // A finite stack of layer sums, as a healthy chunk of four layers reads back: every value
+        // is 1 within rounding and the check passes.
+        let healthy = [1.0, 0.9999999, 1.0000001, 1.0];
+        assert_eq!(check_health(&healthy), Ok(()), "a finite stack passes");
+        assert_eq!(check_health(&[]), Ok(()), "an empty stack passes");
+        // A NaN, either infinity, and a NaN anywhere but the first layer all give the same
+        // `Backend` error that `route_experts` gives for a bad row. The middle and last cases
+        // keep the first layer finite, so a check that reads only the first value fails here.
+        for (what, bad) in [
+            ("a NaN first", [f32::NAN, 1.0, 1.0, 1.0]),
+            ("a positive infinity last", [1.0, 1.0, 1.0, f32::INFINITY]),
+            (
+                "a negative infinity middle",
+                [1.0, f32::NEG_INFINITY, 1.0, 1.0],
+            ),
+            ("a NaN middle", [1.0, 1.0, f32::NAN, 1.0]),
+            ("a NaN last", [1.0, 1.0, 1.0, f32::NAN]),
+        ] {
+            let failed = check_health(&bad);
+            assert_eq!(
+                failed,
+                Err(EngError::Backend {
+                    operation: "route_experts",
+                    message: "router probabilities must be finite and non-negative".into(),
+                }),
+                "{what}"
+            );
+        }
     }
 
     #[test]

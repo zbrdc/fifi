@@ -85,6 +85,19 @@ pub(super) fn pair_plan(
     Ok(plan)
 }
 
+/// Proves on the host the order that `gather_qmm_sorted` requires: `experts` must be
+/// non-decreasing. An inversion returns `BadRequest`; an empty slice passes. The caller is the
+/// chunk MoE, which checks its pair plan before the import (packet Q36-PF-SORTED, fix N1).
+pub(super) fn require_sorted_experts(experts: &[u32]) -> Result<(), EngError> {
+    if experts.is_sorted() {
+        Ok(())
+    } else {
+        Err(EngError::BadRequest(
+            "moe prefill: the expert pairs are not sorted".into(),
+        ))
+    }
+}
+
 /// Retired bytes of one chunk token in one DeltaNet layer: `3 * VH * KD * VD * 4` (F32 state).
 /// A zero dimension or an overflow returns `BadRequest`.
 pub(super) fn delta_retire_per_token(
@@ -314,6 +327,38 @@ mod tests {
                 assert_eq!(plan.gates[sorted], row.weights[j], "gate of ({t}, {j})");
             }
         }
+    }
+
+    /// The order check of the sorted prefill gather, next to the plan that must satisfy it: a
+    /// sorted slice passes, the empty slice passes, and one inversion is a bad request that
+    /// names the moe prefill (fix N1).
+    #[test]
+    fn the_order_check_passes_sorted_and_empty_and_fails_one_inversion() {
+        assert!(
+            require_sorted_experts(&[0, 1, 1, 3, 5]).is_ok(),
+            "a sorted slice passes"
+        );
+        assert!(
+            require_sorted_experts(&[]).is_ok(),
+            "the empty slice passes"
+        );
+        let failed = require_sorted_experts(&[0, 2, 1]);
+        assert!(
+            matches!(&failed, Err(EngError::BadRequest(m)) if m.starts_with("moe prefill:")),
+            "one inversion is a bad request that names the moe prefill, got {:?}",
+            failed
+        );
+    }
+
+    /// Two tokens of top-2 routes over four experts. In token-major order the pairs hold the
+    /// experts [2, 1, 0, 3]; the plan that `chunk` imports must present them as [0, 1, 2, 3],
+    /// the order that `gather_qmm_sorted` requires.
+    #[test]
+    fn the_imported_pair_plan_satisfies_the_order_check() {
+        let rows = [routed(&[(2, 0.6), (1, 0.4)]), routed(&[(0, 0.7), (3, 0.3)])];
+        let plan = pair_plan(&rows, 2, 4).unwrap();
+        assert_eq!(plan.experts, [0, 1, 2, 3]);
+        assert!(require_sorted_experts(&plan.experts).is_ok());
     }
 
     #[test]

@@ -230,12 +230,34 @@ impl Context {
         let _dispatch = DispatchGuard::enter();
         self.check_ready()?;
         let state = self.state.as_mut().unwrap();
-        check_operand(label, state, x)?;
+        // A U32 input keeps its dtype, as `slice` does, and the layout's 4-byte elements are
+        // exact for it: the device chunk MoE flattens its U32 expert ids (packet
+        // Q36-PF-DEVROUTE). Only U32 takes that branch; every other input keeps the rejection of
+        // `check_operand` from before the branch existed, so a BF16 input is rejected exactly as
+        // before (and F32, or BF16 after `allow_bf16`, keeps the promoting wrapper below).
+        let u32_input = x.dtype() == Dtype::U32;
+        if u32_input {
+            check_owner(label, state, x)?;
+        } else {
+            check_operand(label, state, x)?;
+        }
         let layout = shape::reshape(label, x.shape(), target)?;
         let native_shape = native_ints(label, target)?;
         let _input = x.share();
         clear_message();
         let stream = state.stream.0;
+        if u32_input {
+            let output = dispatch_typed(label, &layout, Dtype::U32, stream, |output| unsafe {
+                ffi::mlx_reshape(
+                    output,
+                    x.storage.native_array(),
+                    native_shape.as_ptr(),
+                    native_shape.len(),
+                    stream,
+                )
+            })?;
+            return Ok(state.resident(output, Dtype::U32, layout.shape, layout.byte_len));
+        }
         let output = dispatch_promoting_elementwise(label, &layout, stream, |output| unsafe {
             ffi::mlx_reshape(
                 output,
@@ -605,6 +627,69 @@ impl Context {
         Ok(promoting_elementwise_result(state, output, layout))
     }
 
+    /// `take_along_axis` (packet Q36-PF-DEVROUTE): gathers along `axis` with U32 indices of the
+    /// input rank, as `numpy.take_along_axis` does. The input is F32, BF16 after `allow_bf16`, or
+    /// U32 (the device chunk MoE gathers its sorted expert ids, and `take` rejects a U32 input);
+    /// the output keeps the input dtype and takes the indices shape. Indices above the axis
+    /// length are clamped to the last element of the axis on the device, as `take` does.
+    pub(in crate::kernels::mlx) fn take_along_axis(
+        &mut self,
+        x: &ExecutionTensor,
+        indices: &ExecutionTensor,
+        axis: u32,
+    ) -> Result<ExecutionTensor, EngError> {
+        let label = "take_along_axis";
+        let _dispatch = DispatchGuard::enter();
+        self.check_ready()?;
+        let state = self.state.as_mut().unwrap();
+        check_owner(label, state, x)?;
+        if !(state.accepts_float(x.dtype()) || x.dtype() == Dtype::U32) {
+            return Err(EngError::BadRequest(format!(
+                "{label}: input dtype must be F32 or U32"
+            )));
+        }
+        check_index(label, state, indices)?;
+        let dtype = x.dtype();
+        let layout = shape::take_along_axis(label, x.shape(), indices.shape(), axis)?;
+        let native_axis = native_ints(label, &[axis])?[0];
+        let _inputs = [x.share(), indices.share()];
+        clear_message();
+        let stream = state.stream.0;
+        let upper = x.shape()[axis as usize] - 1;
+        let (mut clamped, mut product, mut output) = (Array::null(), Array::null(), Array::null());
+        let built = produce(&mut clamped, label, |slot| unsafe {
+            ffi::mlx_clamp_indices(slot, indices.storage.native_array(), upper, stream)
+        })
+        .and_then(|()| {
+            produce(&mut product, label, |slot| unsafe {
+                ffi::mlx_resident_take_along_axis(
+                    slot,
+                    x.storage.native_array(),
+                    clamped.0,
+                    native_axis,
+                    stream,
+                )
+            })
+        })
+        .and_then(|()| {
+            produce(&mut output, label, |slot| unsafe {
+                ffi::mlx_contiguous(slot, product.0, false, stream)
+            })
+        });
+        // The layout counts 4-byte elements, which is exact for F32 and U32 and halves for BF16.
+        let byte_len = layout.byte_len / Dtype::F32.byte_width() * dtype.byte_width();
+        let expected = ExpectedOutput {
+            operation: label,
+            stream,
+            shape: &layout.shape,
+            byte_len,
+            dtype,
+            promotes: false,
+        };
+        expected.complete(&output, built)?;
+        Ok(state.resident(output, dtype, layout.shape, byte_len))
+    }
+
     pub(in crate::kernels::mlx) fn batched_mm(
         &mut self,
         a: &ExecutionTensor,
@@ -636,6 +721,30 @@ impl Context {
         x: &ExecutionTensor,
         stack: &ResidentPackedWeight,
         indices: &ExecutionTensor,
+    ) -> Result<ExecutionTensor, EngError> {
+        self.gather_qmm_with(x, stack, indices, false)
+    }
+
+    /// `gather_qmm` with MLX's `sorted_indices` flag set. The indices must be non-decreasing along
+    /// the flat axis: with unsorted indices MLX may return wrong values, and this method cannot
+    /// read the device indices, so the caller proves the order on the host.
+    pub(in crate::kernels::mlx) fn gather_qmm_sorted(
+        &mut self,
+        x: &ExecutionTensor,
+        stack: &ResidentPackedWeight,
+        indices: &ExecutionTensor,
+    ) -> Result<ExecutionTensor, EngError> {
+        self.gather_qmm_with(x, stack, indices, true)
+    }
+
+    /// The one body of `gather_qmm` and `gather_qmm_sorted`: `sorted` is the value passed to MLX's
+    /// `sorted_indices` flag, which changes the kernel choice only, not the checks or the layout.
+    fn gather_qmm_with(
+        &mut self,
+        x: &ExecutionTensor,
+        stack: &ResidentPackedWeight,
+        indices: &ExecutionTensor,
+        sorted: bool,
     ) -> Result<ExecutionTensor, EngError> {
         let label = "gather quantized matmul";
         let _dispatch = DispatchGuard::enter();
@@ -672,7 +781,7 @@ impl Context {
                     ffi::optional_int(quant.group_size),
                     ffi::optional_int(quant.bits),
                     quant.mode.as_ptr(),
-                    false,
+                    sorted,
                     stream,
                 )
             })
@@ -2282,5 +2391,325 @@ mod f32_only_tests {
         assert_eq!(row.dtype(), Dtype::F32, "the dequantized row stays F32");
         assert_eq!(row.shape(), [1, 32], "the logical shape");
         assert_eq!(row.byte_len(), 128, "32 F32 elements are 128 bytes");
+    }
+}
+
+#[cfg(test)]
+mod gather_sorted_tests {
+    //! `gather_qmm_sorted` against `gather_qmm` on identical inputs (packet Q36-PF-SORTED): the
+    //! `sorted_indices` flag must not change the values, and the device clamp must hold for it
+    //! too. These tests need the GPU. Every index list holds at least 16 pairs and at least 4
+    //! pairs per expert on average, the shape for which the pinned MLX picks its sorted kernel,
+    //! so the sorted call does not silently run the kernel of the unsorted call.
+
+    use crate::{
+        kernels::{
+            MlxKernels, PackedWeight, QuantizationMode, QuantizationSpec, ResidentPackedWeight,
+        },
+        tensor::{Dtype, ExecutionTensor, Tensor},
+    };
+
+    /// The stack of the tests: six experts of three rows and 64 columns, so the index lists can
+    /// give rows to several experts and leave one expert with no rows (packet Q36-PF-SORTED).
+    const EXPERTS: u32 = 6;
+    const ROWS: u32 = 3;
+    const COLUMNS: u32 = 64;
+
+    /// Builds the int4 affine stack `[6, 3, 64]` with the scales and the biases stored as
+    /// `scale_dtype`, F32 or BF16: every row repeats the word `0x7654_3210`, so column `c` holds
+    /// the code `c % 8`; expert `e` has scale `(4 + e) / 16` and row `r` has bias `r / 8`. MLX
+    /// promotes the activation dtype against the stored scale dtype, so a BF16 activation needs
+    /// a BF16 scale store to return BF16. Every scale and bias is a dyadic number of at most
+    /// seven significand bits, exact in F32 and in BF16, so the BF16 store below truncates the
+    /// F32 bits without rounding.
+    fn stack(kernels: &mut MlxKernels, scale_dtype: Dtype) -> ResidentPackedWeight {
+        let words = usize::try_from(EXPERTS * ROWS * (COLUMNS / 8)).unwrap();
+        let payload = Tensor::try_from_host(
+            Dtype::U32,
+            vec![EXPERTS, ROWS, COLUMNS / 8],
+            0x7654_3210u32.to_le_bytes().repeat(words),
+        )
+        .unwrap();
+        let scales: Vec<f32> = (0..EXPERTS * ROWS)
+            .map(|slot| (4 + slot / ROWS) as f32 / 16.0)
+            .collect();
+        let biases: Vec<f32> = (0..EXPERTS * ROWS)
+            .map(|slot| (slot % ROWS) as f32 / 8.0)
+            .collect();
+        let role = |values: &[f32]| {
+            let bytes: Vec<u8> = match scale_dtype {
+                Dtype::F32 => values
+                    .iter()
+                    .flat_map(|value| value.to_le_bytes())
+                    .collect(),
+                Dtype::Bf16 => values
+                    .iter()
+                    .map(|value| (value.to_bits() >> 16) as u16)
+                    .flat_map(|word| word.to_le_bytes())
+                    .collect(),
+                other => panic!("the stack stores no scales as {other:?}"),
+            };
+            Tensor::try_from_host(scale_dtype, vec![EXPERTS, ROWS, COLUMNS / 64], bytes).unwrap()
+        };
+        let weight = PackedWeight::try_new(
+            payload,
+            role(&scales),
+            Some(role(&biases)),
+            vec![EXPERTS, ROWS, COLUMNS],
+            QuantizationSpec {
+                mode: QuantizationMode::Affine,
+                bits: 4,
+                group_size: 64,
+            },
+        )
+        .unwrap();
+        kernels.import_packed(&weight).unwrap()
+    }
+
+    /// Activation rows `[pairs, 1, 64]`: row `p` holds `((p + c) % 2)` in F32.
+    fn f32_activations(kernels: &mut MlxKernels, pairs: u32) -> ExecutionTensor {
+        let values: Vec<f32> = (0..pairs)
+            .flat_map(|p| (0..COLUMNS).map(move |c| ((p + c) % 2) as f32))
+            .collect();
+        let bytes: Vec<u8> = values
+            .iter()
+            .flat_map(|value| value.to_le_bytes())
+            .collect();
+        kernels
+            .import_tensor(
+                &Tensor::try_from_host(Dtype::F32, vec![pairs, 1, COLUMNS], bytes).unwrap(),
+            )
+            .unwrap()
+    }
+
+    /// Imports `values` as the rank-one U32 index resident.
+    fn indices(kernels: &mut MlxKernels, values: &[u32]) -> ExecutionTensor {
+        let bytes: Vec<u8> = values
+            .iter()
+            .flat_map(|value| value.to_le_bytes())
+            .collect();
+        kernels
+            .import_tensor(
+                &Tensor::try_from_host(
+                    Dtype::U32,
+                    vec![u32::try_from(values.len()).unwrap()],
+                    bytes,
+                )
+                .unwrap(),
+            )
+            .unwrap()
+    }
+
+    /// Reads a float resident back as F32 values, widening BF16 without loss.
+    fn read_floats(kernels: &mut MlxKernels, x: &ExecutionTensor) -> Vec<f32> {
+        let tensor = kernels.readback(x).unwrap();
+        let bytes = tensor.host_bytes().unwrap();
+        match tensor.dtype() {
+            Dtype::F32 => bytes
+                .as_chunks::<4>()
+                .0
+                .iter()
+                .map(|word| f32::from_le_bytes(*word))
+                .collect(),
+            Dtype::Bf16 => bytes
+                .as_chunks::<2>()
+                .0
+                .iter()
+                .map(|word| f32::from_bits(u32::from(u16::from_le_bytes(*word)) << 16))
+                .collect(),
+            other => panic!("gather readback dtype {other:?}"),
+        }
+    }
+
+    /// Reads a BF16 resident back as its raw bit patterns.
+    fn read_bf16_bits(kernels: &mut MlxKernels, x: &ExecutionTensor) -> Vec<u16> {
+        let tensor = kernels.readback(x).unwrap();
+        assert_eq!(
+            tensor.dtype(),
+            Dtype::Bf16,
+            "the BF16 activations return BF16"
+        );
+        tensor
+            .host_bytes()
+            .unwrap()
+            .as_chunks::<2>()
+            .0
+            .iter()
+            .map(|word| u16::from_le_bytes(*word))
+            .collect()
+    }
+
+    /// The sorted index list of the agreement tests: 30 pairs with 6, 5, 6, 5, 0 and 8 rows for
+    /// the experts 0 to 5, so expert 4 stays empty. The count reaches the pinned MLX's sorted
+    /// kernel: 30 pairs are at least 16 and 30 / 6 = 5 pairs per expert on average.
+    const SORTED_IDS: [u32; 30] = [
+        0, 0, 0, 0, 0, 0, // expert 0
+        1, 1, 1, 1, 1, // expert 1
+        2, 2, 2, 2, 2, 2, // expert 2
+        3, 3, 3, 3, 3, // expert 3
+        // expert 4 holds no rows
+        5, 5, 5, 5, 5, 5, 5, 5, // expert 5
+    ];
+
+    /// The absolute oracle of the agreement tests (fix B2b). The pinned MLX dequantizes the int4
+    /// word affinely as `code * scale + bias`, so the output of pair `p` at column `r` is
+    /// `scale_e * sum_c x[c] code(c) + bias_r * sum_c x[c]`: with `x[c] = (p + c) % 2` over 64
+    /// columns the code sum is 128 for even `p` and 96 for odd `p`, and the activation sum is 32,
+    /// so the element is `(8 or 6) * (4 + e) + 4 r`, an integer from 24 to 80 that F32 and BF16
+    /// hold exactly, whatever order the kernel sums in.
+    fn oracle(ids: &[u32]) -> Vec<f32> {
+        ids.iter()
+            .enumerate()
+            .flat_map(|(p, &e)| {
+                let head = (if p % 2 == 0 { 8 } else { 6 }) * (4 + e);
+                (0..ROWS).map(move |r| (head + 4 * r) as f32)
+            })
+            .collect()
+    }
+
+    #[test]
+    fn sorted_and_unsorted_gather_qmm_agree_on_sorted_indices_in_f32() {
+        let _serial = crate::native_test_lock();
+        let mut kernels = MlxKernels::try_new().unwrap();
+        let stack = stack(&mut kernels, Dtype::F32);
+        let ids = indices(&mut kernels, &SORTED_IDS);
+        let x = f32_activations(&mut kernels, 30);
+        let sorted = kernels.gather_qmm_sorted(&x, &stack, &ids).unwrap();
+        let unsorted = kernels.gather_qmm(&x, &stack, &ids).unwrap();
+        assert_eq!(
+            sorted.shape(),
+            [30, 1, ROWS],
+            "the output layout does not change"
+        );
+        assert_eq!(sorted.dtype(), Dtype::F32, "the F32 activation returns F32");
+        let (a, b) = (
+            read_floats(&mut kernels, &sorted),
+            read_floats(&mut kernels, &unsorted),
+        );
+        assert_eq!(a.len(), b.len(), "both calls return every element");
+        for (i, (got, want)) in a.iter().zip(&b).enumerate() {
+            assert!(
+                (got - want).abs() <= 1e-5,
+                "element {i}: sorted {got} vs unsorted {want}"
+            );
+        }
+        // The absolute oracle: a defect shared by both calls cannot pass the agreement above.
+        let want = oracle(&SORTED_IDS);
+        assert_eq!(a.len(), want.len(), "the oracle covers every element");
+        for (i, (got, &want)) in a.iter().zip(&want).enumerate() {
+            assert!(
+                *got == want,
+                "element {i}: {got} against the dyadic oracle {want}"
+            );
+        }
+    }
+
+    #[test]
+    fn sorted_and_unsorted_gather_qmm_agree_on_sorted_indices_in_bf16() {
+        let _serial = crate::native_test_lock();
+        let mut kernels = MlxKernels::try_new().unwrap();
+        kernels.allow_bf16(true);
+        // MLX promotes the activation dtype against the stored scale dtype, so the scales and
+        // the biases of this case are BF16: an F32 scale store would promote the result to F32.
+        let stack = stack(&mut kernels, Dtype::Bf16);
+        let ids = indices(&mut kernels, &SORTED_IDS);
+        let source = f32_activations(&mut kernels, 30);
+        let x = kernels.cast(&source, Dtype::Bf16).unwrap();
+        let sorted = kernels.gather_qmm_sorted(&x, &stack, &ids).unwrap();
+        let unsorted = kernels.gather_qmm(&x, &stack, &ids).unwrap();
+        assert_eq!(
+            sorted.dtype(),
+            Dtype::Bf16,
+            "BF16 activations over a BF16 scale store return BF16"
+        );
+        // The setup's outputs are non-negative, so the BF16 bit patterns order like the values
+        // and neighboring bits are one output step apart: the final rounding of the same sum may
+        // differ by at most that step.
+        let (a, b) = (
+            read_bf16_bits(&mut kernels, &sorted),
+            read_bf16_bits(&mut kernels, &unsorted),
+        );
+        assert_eq!(
+            a.len(),
+            usize::try_from(30 * ROWS).unwrap(),
+            "the result holds 30 pairs x 3 outputs"
+        );
+        assert_eq!(a.len(), b.len(), "both calls return every element");
+        for (i, (got, want)) in a.iter().zip(&b).enumerate() {
+            assert!(
+                got.abs_diff(*want) <= 1,
+                "element {i}: sorted bits {got} vs unsorted bits {want}"
+            );
+        }
+        // The absolute oracle of the F32 case, exact in BF16: the outputs are integers 24 to 80.
+        let values = read_floats(&mut kernels, &sorted);
+        let want = oracle(&SORTED_IDS);
+        assert_eq!(values.len(), want.len(), "the oracle covers every element");
+        for (i, (got, &want)) in values.iter().zip(&want).enumerate() {
+            assert!(
+                *got == want,
+                "element {i}: {got} against the dyadic oracle {want}"
+            );
+        }
+    }
+
+    #[test]
+    fn gather_qmm_sorted_clamps_an_index_above_the_last_expert() {
+        let _serial = crate::native_test_lock();
+        let mut kernels = MlxKernels::try_new().unwrap();
+        let stack = stack(&mut kernels, Dtype::F32);
+        // The list stays non-decreasing for the sorted call; 9 clamps to the last expert 5. The
+        // 24 pairs (6 rows of each named id over six experts) reach the pinned MLX's sorted
+        // kernel: 24 pairs are at least 16 and 24 / 6 = 4 pairs per expert on average.
+        let overflow = indices(
+            &mut kernels,
+            &[
+                0, 0, 0, 0, 0, 0, 2, 2, 2, 2, 2, 2, 5, 5, 5, 5, 5, 5, 9, 9, 9, 9, 9, 9,
+            ],
+        );
+        let clamped = indices(
+            &mut kernels,
+            &[
+                0, 0, 0, 0, 0, 0, 2, 2, 2, 2, 2, 2, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5,
+            ],
+        );
+        let x = f32_activations(&mut kernels, 24);
+        let sorted = kernels.gather_qmm_sorted(&x, &stack, &overflow).unwrap();
+        assert_eq!(sorted.shape(), [24, 1, ROWS], "the gather layout");
+        let sorted_values = read_floats(&mut kernels, &sorted);
+        // The absolute oracle: the clamp bound is the same on every side of the comparisons below, so only an oracle can see a wrong bound.
+        let expected_ids = [
+            0, 0, 0, 0, 0, 0, 2, 2, 2, 2, 2, 2, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5,
+        ];
+        let want = oracle(&expected_ids);
+        assert_eq!(
+            sorted_values.len(),
+            want.len(),
+            "the oracle covers every element"
+        );
+        for (i, (got, &want)) in sorted_values.iter().zip(&want).enumerate() {
+            assert!(
+                *got == want,
+                "element {i}: {got} against the dyadic oracle {want} (the ids above the last expert must clamp to expert 5)"
+            );
+        }
+        for (name, other) in [
+            ("the unsorted run over the same ids", &overflow),
+            ("the run that names the last expert", &clamped),
+        ] {
+            let reference = kernels.gather_qmm(&x, &stack, other).unwrap();
+            let want = read_floats(&mut kernels, &reference);
+            assert_eq!(
+                sorted_values.len(),
+                want.len(),
+                "{name} returns every element"
+            );
+            for (i, (got, reference)) in sorted_values.iter().zip(&want).enumerate() {
+                assert!(
+                    (got - reference).abs() <= 1e-5,
+                    "{name} element {i}: {got} vs {reference}"
+                );
+            }
+        }
     }
 }

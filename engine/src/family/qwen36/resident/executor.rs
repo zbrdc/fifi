@@ -38,9 +38,11 @@
 //! (`ResidentDecoder::chunk_rows`) in one place, `apply_chunk`, so the decoder never splits a
 //! chunk again and no other code sets either value. The decoder default of 512 rows serves
 //! decoder tests only. A run of one row is a one-token step, as in the Flash-Next executor, and a
-//! chunk equals the steps within the tolerance of gate G2, not bit for bit. A chunk routes its
-//! experts on the host, and every decode step keeps device routing. A Q36 chunk has no page set,
-//! so the Flash-Next rule that opens page sets once has no counterpart here.
+//! chunk equals the steps within the tolerance of gate G2, not bit for bit. A chunk routes as
+//! its decoder holds (`Routing::Device`, the default, routes on the device;
+//! `Routing::Host` keeps the host-routed reference), and every decode step keeps device routing.
+//! A Q36 chunk has no page set, so the Flash-Next rule that opens page sets once has no
+//! counterpart here.
 //!
 //! A failed prefill: a denied growth permit or a bad token in chunk k leaves chunks 1 to k - 1
 //! published (the decoder rules), and the shared session has already taken its pending token. The
@@ -1760,10 +1762,12 @@ mod tests {
     }
 
     /// The synthetic model has 4 layers. A one-token `Prompt` step makes 2 synchronizations under
-    /// device routing, so 9 rows make 18. A chunk in `Prompt` mode makes `2 * layers` = 8
+    /// device routing (the executor's default), so 9 rows make 18. A chunk in `Prompt` mode makes
+    /// `1 + (layers - 1) + 1 + 1 = layers + 2` = 6: the token-start import 1, one cadence evaluate
+    /// per layer except the last 3, the final evaluate 1, and the health readback 1
     /// (`prefill/step.rs`; the retire cap leaves one DeltaNet part). A prompt of 10 tokens has 9
-    /// rows: one chunk of 8 and a step for the last row make 10. A chunk in `Generate` mode would
-    /// make 3 more, so the count also pins the mode.
+    /// rows: one chunk of 8 and a step for the last row make 8. A chunk in `Generate` mode would
+    /// make 1 more (the token readback), so the count also pins the mode.
     #[cfg(feature = "native-fault-qualification")]
     #[test]
     fn a_chunked_prefill_makes_the_synchronizations_of_one_chunk_per_run_of_rows() {
@@ -1778,7 +1782,7 @@ mod tests {
         let before = count(&executor);
         executor.prefill(&mut session, &cycle(10)).unwrap();
         assert_eq!(take_log(&executor), vec![8], "one chunk of 8 rows");
-        assert_eq!(count(&executor) - before, 8 + 2, "chunk, then step");
+        assert_eq!(count(&executor) - before, 6 + 2, "chunk, then step");
     }
 
     static_assertions::assert_not_impl_any!(Q36Executor: Send, Sync);

@@ -113,6 +113,66 @@ fn reshape_and_expand_dims_keep_element_order() {
 }
 
 #[test]
+fn reshape_keeps_u32_values_in_element_order() {
+    let _serial = GPU_TEST.lock().unwrap();
+    let mut kernels = MlxKernels::try_new().unwrap();
+    // A U32 resident keeps U32 through a reshape, as through a slice: the device chunk MoE
+    // flattens its U32 expert ids this way (packet Q36-PF-DEVROUTE). 16_777_217 (2^24 + 1) and
+    // 4_000_000_000 do not survive a trip through F32.
+    let ids = kernels
+        .import_tensor(&u32_input(
+            vec![2, 3],
+            &[3, 16_777_217, 1, 0, 3, 4_000_000_000],
+        ))
+        .unwrap();
+
+    let flat = kernels.reshape(&ids, &[6]).unwrap();
+    assert_eq!(flat.shape(), [6]);
+    assert_eq!(flat.dtype(), Dtype::U32, "the reshape keeps U32");
+    assert_eq!(
+        u32_values(&kernels.readback(&flat).unwrap()),
+        &[3, 16_777_217, 1, 0, 3, 4_000_000_000],
+        "the flat order is the row-major order"
+    );
+
+    let swapped = kernels.reshape(&ids, &[3, 2]).unwrap();
+    assert_eq!(swapped.shape(), [3, 2]);
+    assert_eq!(swapped.dtype(), Dtype::U32);
+    assert_eq!(
+        u32_values(&kernels.readback(&swapped).unwrap()),
+        &[3, 16_777_217, 1, 0, 3, 4_000_000_000],
+        "the element order does not move"
+    );
+
+    let refused = kernels.reshape(&ids, &[5]);
+    assert!(
+        matches!(&refused, Err(EngError::BadRequest(m)) if m.contains("element counts differ")),
+        "a wrong count stays a bad request"
+    );
+}
+
+#[test]
+fn reshape_rejects_a_dtype_other_than_f32_and_u32() {
+    let _serial = GPU_TEST.lock().unwrap();
+    let mut kernels = MlxKernels::try_new().unwrap();
+    let wide = kernels
+        .import_tensor(&Tensor::try_from_host(Dtype::Bf16, vec![2, 2], vec![0u8; 8]).unwrap())
+        .unwrap();
+
+    let rejected = kernels.reshape(&wide, &[4]);
+
+    match rejected {
+        // The rejection of `check_operand` from before the U32 branch existed (packet
+        // Q36-PF-DEVROUTE fix1 K4): only U32 takes the new branch, so BF16 is rejected exactly
+        // as before, with the same text.
+        Err(EngError::BadRequest(message)) => {
+            assert_eq!(message, "reshape: input dtype must be F32");
+        }
+        other => panic!("expected BadRequest, got {:?}", other.err()),
+    }
+}
+
+#[test]
 fn transpose_reads_back_in_row_major_order() {
     let _serial = GPU_TEST.lock().unwrap();
     let mut kernels = MlxKernels::try_new().unwrap();

@@ -375,6 +375,14 @@ unsafe extern "C" {
         axis: i32,
         stream: mlx_stream,
     ) -> i32;
+    #[link_name = "inference_mlx_resident_take_along_axis"]
+    pub(super) fn mlx_resident_take_along_axis(
+        result: *mut mlx_array,
+        input: mlx_array,
+        indices: mlx_array,
+        axis: i32,
+        stream: mlx_stream,
+    ) -> i32;
     #[link_name = "inference_mlx_clamp_indices"]
     pub(super) fn mlx_clamp_indices(
         result: *mut mlx_array,

@@ -1134,6 +1134,34 @@ const TAKE_CLAMP: Operation = Operation {
     ..TAKE
 };
 
+// `take_along_axis` of one row of [2, N] on axis 0 with [1, N] U32 indices returns [1, N]:
+// `RETAINED_ELEMENTS` values, as `prepare_take` builds for `take` (the indices carry the input
+// rank here). The clamp of the indices is native call 1 and the gather is call 2 (packet
+// Q36-PF-DEVROUTE fix1 K1).
+fn prepare_take_along_axis(kernels: &mut MlxKernels) -> Operands {
+    Operands {
+        tensors: vec![
+            import_f32(kernels, vec![2, RETAINED_ELEMENTS]),
+            import_u32(kernels, vec![1, RETAINED_ELEMENTS], 1),
+        ],
+        weight: None,
+        cache: None,
+    }
+}
+
+const TAKE_ALONG_AXIS: Operation = Operation {
+    label: "take_along_axis",
+    imports: 2,
+    outputs: 1,
+    fault_call: 2,
+    prepare: prepare_take_along_axis,
+    call: |kernels, operands| {
+        kernels
+            .take_along_axis(&operands.tensors[0], &operands.tensors[1], 0)
+            .and_then(|output| kernels.readback(&output).map(drop))
+    },
+};
+
 // gather_qmm of x [1, 64, 64] with 16 indices over a [2, 1024, 64] stack returns [16, 64, 1024],
 // which is `RETAINED_ELEMENTS` values.
 fn prepare_gather_qmm(kernels: &mut MlxKernels) -> Operands {
@@ -1615,6 +1643,7 @@ fault_suite!(argsort_axis, ARGSORT);
 fault_suite!(u32_to_f32_convert, U32_TO_F32);
 fault_suite!(take_gather, TAKE);
 fault_suite!(take_index_clamp, TAKE_CLAMP);
+fault_suite!(take_along_axis_gather, TAKE_ALONG_AXIS);
 fault_suite!(gather_qmm_experts, GATHER_QMM);
 fault_suite!(dequantize_weight, DEQUANTIZE);
 fault_suite!(rope_scaled_rotation, ROPE_SCALED);

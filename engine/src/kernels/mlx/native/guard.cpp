@@ -521,6 +521,14 @@ extern "C" int inference_mlx_resident_take_axis(
   });
 }
 
+extern "C" int inference_mlx_resident_take_along_axis(
+    mlx_array* result, mlx_array input, mlx_array indices, int axis,
+    mlx_stream stream) noexcept {
+  return run_selected_operation(result, stream, [&] {
+    return mlx_take_along_axis(result, input, indices, axis, stream);
+  });
+}
+
 // Clamps U32 indices to `upper` so that a gather never reads outside its operand.
 extern "C" int inference_mlx_clamp_indices(
     mlx_array* result, mlx_array indices, uint32_t upper, mlx_stream stream) noexcept {

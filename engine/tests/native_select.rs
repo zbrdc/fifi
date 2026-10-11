@@ -253,6 +253,193 @@ fn take_clamps_out_of_range_indices() {
 }
 
 #[test]
+fn take_along_axis_gathers_one_value_per_index_cell() {
+    let _serial = GPU_TEST.lock().unwrap();
+    let mut kernels = MlxKernels::try_new().unwrap();
+    // x [3, 5], one value per cell:
+    //    0   1   2   3   4
+    //   10  11  12  13  14
+    //   20  21  22  23  24
+    let x = kernels
+        .import_tensor(&f32_input(
+            vec![3, 5],
+            &[
+                0.0, 1.0, 2.0, 3.0, 4.0, 10.0, 11.0, 12.0, 13.0, 14.0, 20.0, 21.0, 22.0, 23.0, 24.0,
+            ],
+        ))
+        .unwrap();
+
+    // Axis 1 with indices [3, 2]: out[t, k] = x[t, idx[t, k]]. By hand, row 0 picks columns
+    // 1 and 3 (1, 3), row 1 picks columns 4 and 0 (14, 10), row 2 picks columns 2 and 4 (22, 24).
+    let idx = kernels
+        .import_tensor(&u32_input(vec![3, 2], &[1, 3, 4, 0, 2, 4]))
+        .unwrap();
+    let picked = kernels.take_along_axis(&x, &idx, 1).unwrap();
+    assert_eq!(picked.shape(), [3, 2], "axis 1 output shape");
+    assert_eq!(picked.dtype(), Dtype::F32, "axis 1 output dtype");
+    assert_close(
+        &values_of(&kernels.readback(&picked).unwrap()),
+        &[1.0, 3.0, 14.0, 10.0, 22.0, 24.0],
+    );
+
+    // Axis 0 with indices [2, 5]: out[a, j] = x[idx[a, j], j]. By hand, index row (2, 0, 2, 1, 1)
+    // gives 20, 1, 22, 13, 14 and index row (0, 2, 1, 2, 0) gives 0, 21, 12, 23, 4.
+    let rows = kernels
+        .import_tensor(&u32_input(vec![2, 5], &[2, 0, 2, 1, 1, 0, 2, 1, 2, 0]))
+        .unwrap();
+    let picked = kernels.take_along_axis(&x, &rows, 0).unwrap();
+    assert_eq!(picked.shape(), [2, 5], "axis 0 output shape");
+    assert_eq!(picked.dtype(), Dtype::F32, "axis 0 output dtype");
+    assert_close(
+        &values_of(&kernels.readback(&picked).unwrap()),
+        &[20.0, 1.0, 22.0, 13.0, 14.0, 0.0, 21.0, 12.0, 23.0, 4.0],
+    );
+}
+
+#[test]
+fn take_along_axis_clamps_out_of_range_indices() {
+    let _serial = GPU_TEST.lock().unwrap();
+    let mut kernels = MlxKernels::try_new().unwrap();
+    let x = kernels
+        .import_tensor(&f32_input(
+            vec![3, 5],
+            &[
+                0.0, 1.0, 2.0, 3.0, 4.0, 10.0, 11.0, 12.0, 13.0, 14.0, 20.0, 21.0, 22.0, 23.0, 24.0,
+            ],
+        ))
+        .unwrap();
+
+    // Axis 1 spans five columns, so the index 9 clamps to column 4: by hand the rows pick
+    // (0, 4), (14, 11), and (24, 24).
+    let idx = kernels
+        .import_tensor(&u32_input(vec![3, 2], &[0, 9, 9, 1, 4, 4]))
+        .unwrap();
+    let clamped = kernels.take_along_axis(&x, &idx, 1).unwrap();
+    assert_eq!(clamped.shape(), [3, 2]);
+    assert_close(
+        &values_of(&kernels.readback(&clamped).unwrap()),
+        &[0.0, 4.0, 14.0, 11.0, 24.0, 24.0],
+    );
+
+    // Axis 0 spans three rows, so the index 7 clamps to row 2: by hand the index rows
+    // (2, 7, 0, 7, 7) and (7, 2, 1, 7, 0) give 20, 21, 2, 23, 24 and 20, 21, 12, 23, 4.
+    let rows = kernels
+        .import_tensor(&u32_input(vec![2, 5], &[2, 7, 0, 7, 7, 7, 2, 1, 7, 0]))
+        .unwrap();
+    let clamped = kernels.take_along_axis(&x, &rows, 0).unwrap();
+    assert_eq!(clamped.shape(), [2, 5]);
+    assert_close(
+        &values_of(&kernels.readback(&clamped).unwrap()),
+        &[20.0, 21.0, 2.0, 23.0, 24.0, 20.0, 21.0, 12.0, 23.0, 4.0],
+    );
+}
+
+#[test]
+fn take_along_axis_keeps_u32_values_and_bf16_operands() {
+    let _serial = GPU_TEST.lock().unwrap();
+    let mut kernels = MlxKernels::try_new().unwrap();
+    // A U32 input keeps U32: the device chunk MoE gathers its sorted expert ids this way.
+    // 16_777_217 (2^24 + 1) and 4_000_000_000 do not survive a trip through F32.
+    let ids = kernels
+        .import_tensor(&u32_input(
+            vec![6],
+            &[3, 16_777_217, 1, 0, 3, 4_000_000_000],
+        ))
+        .unwrap();
+    let order = kernels
+        .import_tensor(&u32_input(vec![6], &[3, 0, 1, 2, 4, 5]))
+        .unwrap();
+    let sorted = kernels.take_along_axis(&ids, &order, 0).unwrap();
+    assert_eq!(sorted.shape(), [6]);
+    assert_eq!(sorted.dtype(), Dtype::U32, "a U32 input keeps U32");
+    assert_eq!(
+        u32_values(&kernels.readback(&sorted).unwrap()),
+        &[0, 3, 16_777_217, 1, 3, 4_000_000_000],
+    );
+
+    // A BF16 operand after `allow_bf16`: values that BF16 holds exactly survive the gather.
+    kernels.allow_bf16(true);
+    let source = kernels
+        .import_tensor(&f32_input(vec![4], &[1.0, 2.0, 4.0, 8.0]))
+        .unwrap();
+    let bf16 = kernels.cast(&source, Dtype::Bf16).unwrap();
+    let idx = kernels.import_tensor(&u32_input(vec![2], &[3, 0])).unwrap();
+    let picked = kernels.take_along_axis(&bf16, &idx, 0).unwrap();
+    assert_eq!(picked.shape(), [2]);
+    assert_eq!(picked.dtype(), Dtype::Bf16, "a BF16 operand keeps BF16");
+    assert_eq!(picked.byte_len(), 4, "two BF16 elements are 4 bytes");
+    let host = kernels.readback(&picked).unwrap();
+    let bytes = host.host_bytes().unwrap();
+    let decoded: Vec<f32> = bytes
+        .as_chunks::<2>()
+        .0
+        .iter()
+        .map(|pair| f32::from_bits(u32::from(u16::from_le_bytes(*pair)) << 16))
+        .collect();
+    assert_eq!(
+        decoded,
+        [8.0, 1.0],
+        "the BF16 gather reads the picked cells"
+    );
+
+    // With the switch off, a BF16 operand is a bad request with the text of `slice`.
+    kernels.allow_bf16(false);
+    let refused = kernels.take_along_axis(&bf16, &idx, 0);
+    assert_eq!(
+        message_of(refused),
+        "take_along_axis: input dtype must be F32 or U32"
+    );
+}
+
+#[test]
+fn take_along_axis_rejects_mismatched_layouts() {
+    let _serial = GPU_TEST.lock().unwrap();
+    let mut kernels = MlxKernels::try_new().unwrap();
+    let x = kernels
+        .import_tensor(&f32_input(vec![3, 5], &[0.5; 15]))
+        .unwrap();
+    let rank = kernels.import_tensor(&u32_input(vec![2], &[0, 1])).unwrap();
+    let width = kernels
+        .import_tensor(&u32_input(vec![4, 2], &[0, 1, 0, 1, 0, 1, 0, 1]))
+        .unwrap();
+    let float_idx = kernels
+        .import_tensor(&f32_input(vec![3, 2], &[0.0; 6]))
+        .unwrap();
+    assert_eq!(
+        message_of(kernels.take_along_axis(&x, &rank, 1)),
+        "take_along_axis: indices rank must match the input"
+    );
+    assert_eq!(
+        message_of(kernels.take_along_axis(&x, &width, 1)),
+        "take_along_axis: indices differ outside the axis"
+    );
+    assert_eq!(
+        message_of(kernels.take_along_axis(&x, &float_idx, 1)),
+        "take_along_axis: indices dtype must be U32"
+    );
+    assert_eq!(
+        message_of(kernels.take_along_axis(&x, &rank, 2)),
+        "take_along_axis: axis is out of range"
+    );
+    let good = kernels
+        .import_tensor(&u32_input(vec![3, 2], &[0, 1, 2, 3, 4, 0]))
+        .unwrap();
+    assert!(
+        kernels.take_along_axis(&x, &good, 1).is_ok(),
+        "the matching layout is accepted"
+    );
+}
+
+/// The message of a `BadRequest`, or a description of any other outcome.
+fn message_of<T>(result: Result<T, EngError>) -> String {
+    match result {
+        Err(EngError::BadRequest(message)) => message,
+        Err(other) => format!("{other:?}"),
+        Ok(_) => "accepted".to_string(),
+    }
+}
+
+#[test]
 fn argmax_of_a_vector_is_a_scalar() {
     let _serial = GPU_TEST.lock().unwrap();
     let mut kernels = MlxKernels::try_new().unwrap();

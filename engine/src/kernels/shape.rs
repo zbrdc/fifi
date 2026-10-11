@@ -210,6 +210,32 @@ pub(crate) fn take(
     layout(operation, output)
 }
 
+/// Gathers along `axis` with an index tensor of the input rank, as `numpy.take_along_axis` does:
+/// the indices shape equals the input shape except on `axis`, and the output takes the indices
+/// shape (packet Q36-PF-DEVROUTE; the device chunk MoE reads the top-k probability of each row).
+pub(crate) fn take_along_axis(
+    operation: &'static str,
+    shape: &[u32],
+    indices: &[u32],
+    axis: u32,
+) -> Result<ElementwiseLayout, EngError> {
+    check_shape(operation, shape, AxisRule::LastAxisRequired)?;
+    check_shape(operation, indices, AxisRule::Any)?;
+    let axis = axis_index(operation, axis, shape.len())?;
+    if indices.len() != shape.len() {
+        return Err(bad_request(operation, "indices rank must match the input"));
+    }
+    if indices
+        .iter()
+        .zip(shape)
+        .enumerate()
+        .any(|(index, (&index_dim, &dim))| index != axis && index_dim != dim)
+    {
+        return Err(bad_request(operation, "indices differ outside the axis"));
+    }
+    layout(operation, indices.to_vec())
+}
+
 /// Batched matrix product `a @ b`. Both operands have rank at least two. The batch axes
 /// (all axes except the last two) broadcast with the NumPy rule.
 pub(crate) fn matmul(
@@ -359,7 +385,7 @@ fn layout(operation: &'static str, shape: Vec<u32>) -> Result<ElementwiseLayout,
 mod tests {
     use super::{
         attention, concatenate, dequantize, expand_dims, gather_qmm, last_axis, matmul, reduce,
-        repeat, reshape, rope, slice, slice_update, sort, take, transpose,
+        repeat, reshape, rope, slice, slice_update, sort, take, take_along_axis, transpose,
     };
     use crate::EngError;
     fn rejects(result: Result<super::ElementwiseLayout, EngError>, text: &str) {
@@ -592,6 +618,58 @@ mod tests {
 
         rejects(take("take", &[2, 3], &[1], 2), "axis is out of range");
         rejects(take("take", &[2, 3], &[0], 0), "must not be empty");
+    }
+
+    #[test]
+    fn take_along_axis_layout_takes_the_indices_shape() {
+        // x [3, 5] with indices [3, 2] on axis 1: the output is the indices shape [3, 2],
+        // 6 elements of 4 bytes.
+        let columns = take_along_axis("take_along_axis", &[3, 5], &[3, 2], 1).unwrap();
+        assert_eq!(columns.shape, [3, 2]);
+        assert_eq!(columns.byte_len, 24);
+
+        // Axis 0: indices [2, 5] of x [3, 5] give the output [2, 5].
+        let rows = take_along_axis("take_along_axis", &[3, 5], &[2, 5], 0).unwrap();
+        assert_eq!(rows.shape, [2, 5]);
+        assert_eq!(rows.byte_len, 40);
+
+        // A rank-one input works with rank-one indices.
+        let flat = take_along_axis("take_along_axis", &[6], &[2], 0).unwrap();
+        assert_eq!(flat.shape, [2]);
+        assert_eq!(flat.byte_len, 8);
+
+        rejects(
+            take_along_axis("take_along_axis", &[3, 5], &[2], 1),
+            "indices rank must match the input",
+        );
+        // An indices rank above the input rank is a rank mismatch too: a weakened check that
+        // only rejects a smaller rank would let it through to the shape comparison, whose zip
+        // stops at the input rank.
+        rejects(
+            take_along_axis("take_along_axis", &[3, 5], &[3, 2, 7], 1),
+            "indices rank must match the input",
+        );
+        // Rank-0 indices of a rank-2 input: the other side of the same weakening.
+        rejects(
+            take_along_axis("take_along_axis", &[3, 5], &[], 1),
+            "indices rank must match the input",
+        );
+        rejects(
+            take_along_axis("take_along_axis", &[3, 5], &[4, 2], 1),
+            "indices differ outside the axis",
+        );
+        rejects(
+            take_along_axis("take_along_axis", &[3, 5], &[3, 2], 2),
+            "axis is out of range",
+        );
+        rejects(
+            take_along_axis("take_along_axis", &[3, 0], &[3, 2], 1),
+            "must not be empty",
+        );
+        rejects(
+            take_along_axis("take_along_axis", &[3, 5], &[0, 2], 1),
+            "must not be empty",
+        );
     }
 
     #[test]

@@ -555,6 +555,22 @@ impl MlxKernels {
         self.context.gather_qmm(x, stack, indices)
     }
 
+    /// Multiplies each activation row by the expert that its index names in one native call, with
+    /// MLX's `sorted_indices` flag set (packet Q36-PF-SORTED). The indices must be non-decreasing
+    /// along the flat axis: with unsorted indices MLX may return wrong values, and this method
+    /// cannot read the device indices, so the caller proves the order on the host. In the pinned
+    /// MLX the flag changes the kernel only for at least 16 pairs with at least 4 pairs per expert
+    /// on average. The checks and the output layout are those of `gather_qmm`, and indices at or
+    /// above the expert count are clamped to the last expert on the device.
+    pub fn gather_qmm_sorted(
+        &mut self,
+        x: &ExecutionTensor,
+        stack: &ResidentPackedWeight,
+        indices: &ExecutionTensor,
+    ) -> Result<ExecutionTensor, EngError> {
+        self.context.gather_qmm_sorted(x, stack, indices)
+    }
+
     /// Multiplies an `[m, k]` F32 activation by a `[k, n]` F32 weight and
     /// returns an owned `[m, n]` F32 resident tensor.
     pub fn mm(
@@ -752,6 +768,20 @@ impl MlxKernels {
         axis: u32,
     ) -> Result<ExecutionTensor, EngError> {
         self.context.take(x, indices, axis)
+    }
+
+    /// Gathers along `axis` with U32 indices of the input rank, as `numpy.take_along_axis` does:
+    /// the indices shape equals the input shape except on `axis`, and the output takes the indices
+    /// shape. The input is F32, BF16 after `allow_bf16`, or U32, and the output keeps the input
+    /// dtype. Indices above the axis length are clamped to the last element of the axis, as `take`
+    /// does. The method does not read the indices (packet Q36-PF-DEVROUTE).
+    pub fn take_along_axis(
+        &mut self,
+        x: &ExecutionTensor,
+        indices: &ExecutionTensor,
+        axis: u32,
+    ) -> Result<ExecutionTensor, EngError> {
+        self.context.take_along_axis(x, indices, axis)
     }
 
     pub fn rms_norm(
