@@ -1,0 +1,7 @@
+# The vendored Metal source keeps the bytes of mlx-lm, including its trailing spaces (decision 0050).
+engine/vendor/mlx-lm-gated-delta/gated_delta_step.metal -whitespace
+# Stored patch diffs replay byte for byte (check_patches.py), so a trailing blank context line must stay.
+engine/vendor/xavier-qwen/patches/*.patch whitespace=-blank-at-eof
+# An SSE stream ends with a blank line by format; these expected fixtures keep the exact bytes.
+qualification/server-fixtures/expected/chat_stream.txt whitespace=-blank-at-eof
+qualification/server-fixtures/expected/chat_toolbot_stream.txt whitespace=-blank-at-eof

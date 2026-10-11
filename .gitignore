@@ -1,0 +1,19 @@
+/target
+/engine/target
+/qualification/*/target/
+.env
+*.log
+.DS_Store
+*.swp
+*.swo
+__pycache__/
+*.py[cod]
+
+# The ledger and process documents live in /home/dan/fifi/ledger/.
+/WORK_LOG.md
+/docs/reviews/
+/docs/plans/
+/specs/execution-status.yaml
+/specs/planning-status.yaml
+/specs/state.yaml
+/scripts/size-report.md

@@ -1,0 +1,18 @@
+{
+  "listen": "127.0.0.1:18791",
+  "api_key_env": "ENGINESRV_API_KEY",
+  "engines": [
+    {
+      "id": "q36",
+      "family": "qwen3_6_35b_a3b",
+      "model": "fifi-q36",
+      "model_dir": "/Users/dan/edge0/models/edge0-35b",
+      "tokenizer_dir": "/Users/dan/edge0/models/edge0-35b",
+      "qwen36": {
+        "cache_limit_bytes": 4294967296,
+        "prefill_budget_bytes": 32212254720,
+        "prefill_session_reserve_bytes": 6776750080
+      }
+    }
+  ]
+}

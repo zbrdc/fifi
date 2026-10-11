@@ -1,0 +1,995 @@
+openapi: 3.1.0
+info:
+  title: Inference Engine API
+  version: 0.1.0
+  description: >-
+    Local inference engine for Apple Silicon. One server process holds a
+    fleet of engines. Agents and CLI tools call the OpenAI-compatible
+    chat paths. Fleet and session paths extend the core for multi-engine
+    use. Request extensions use "x-" fields. The top_k parameter and
+    response fields engine and session are not request extensions.
+servers:
+  - url: http://127.0.0.1:8100
+    description: Local server
+security:
+  - apiKey: []
+components:
+  securitySchemes:
+    apiKey:
+      type: http
+      scheme: bearer
+      description: >-
+        When the server configures an API key, every request must carry
+        that bearer token except routes whose security array is empty.
+  responses:
+    Unauthorized:
+      description: The configured bearer credential is missing or invalid.
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/Error"
+    BadRequest:
+      description: >-
+        The request fails schema or bounds checks.
+        A bounds failure names the field in error.message.
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/Error"
+    NotFound:
+      description: The requested model, engine, or session does not exist.
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/Error"
+    CapacityConflict:
+      description: >-
+        MemoryPlan or ContextLimit rejects the requested capacity.
+        MemoryPlan returns code memory_plan.
+        ContextLimit returns code context_limit when the prompt exceeds the
+        position limit of the engine. The resident Flash-Next path allows
+        2,051 positions today, so a prompt of 2,051 tokens or more returns 409.
+        The status is never 400. The server checks this limit before admission.
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/Error"
+    CheckpointFailure:
+      description: A checkpoint or snapshot failed identity or load.
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/Error"
+    Overloaded:
+      description: The bounded job queue cannot admit the request.
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/Error"
+    BackendFailure:
+      description: Native initialization or model execution failed before response headers.
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/BackendError"
+  schemas:
+    Error:
+      type: object
+      required: [error]
+      properties:
+        error:
+          type: object
+          required: [message, code]
+          properties:
+            message:
+              type: string
+            code:
+              type: string
+              description: >-
+                Stable machine code for the failure class. The mapping from
+                EngError variant to code is normative and lives in
+                docs/design/server.md, section Error codes. Only the /ready
+                handler produces not_ready. No chat route returns it.
+              enum:
+                - bad_request
+                - unauthorized
+                - not_found
+                - memory_plan
+                - context_limit
+                - checkpoint_failure
+                - overloaded
+                - not_ready
+                - backend_error
+    BackendError:
+      type: object
+      additionalProperties: false
+      required: [error]
+      properties:
+        error:
+          type: object
+          additionalProperties: false
+          required: [message, code]
+          properties:
+            message:
+              type: string
+              const: Model execution failed.
+            code:
+              type: string
+              const: backend_error
+    Model:
+      type: object
+      required: [id, object, created, owned_by]
+      properties:
+        id:
+          type: string
+          description: Model name. Use this value in the "model" field
+            of a chat request.
+        object:
+          type: string
+          const: model
+        created:
+          type: integer
+          description: Unix time in seconds when the server started.
+            OpenAI clients require this field.
+        owned_by:
+          type: string
+        engines:
+          type: array
+          items:
+            $ref: "#/components/schemas/Engine"
+          description: Engines that hold this model right now.
+    EngineOptions:
+      type: object
+      properties:
+        cache_budget_mb:
+          type: integer
+          minimum: 1
+          description: Aggregate session-state reservation in MiB for this
+            engine. All active and idle sessions share this cap, including
+            KV, indexer, recurrent, auxiliary, history, and logit storage.
+            Omission uses a cap derived from the engine memory plan.
+        quantize_kv:
+          type: boolean
+          default: false
+          description: Store the key-value cache at 8 bits. The rope
+            component of each key stays unquantized.
+        memory_budget_mb:
+          type: integer
+          minimum: 256
+          description: Upper bound on memory this engine may hold. The
+            server rejects the engine when the fleet plan cannot fit it.
+        expert_tier:
+          type: string
+          enum: [resident, ssd]
+          default: resident
+          description: '"ssd" streams mixture-of-experts weights from
+            disk. "resident" holds all weights in memory.'
+    Engine:
+      type: object
+      required: [id, model, state]
+      properties:
+        id:
+          type: string
+        model:
+          type: string
+        state:
+          type: string
+          enum: [loading, ready, busy, error, stopped, native-failed]
+          description: >-
+            A native failure is process-scoped (decision 0022). When it
+            occurs, every engine becomes native-failed, drains, and the
+            process exits. The engine_state gauge uses the integers
+            loading=0, ready=1, busy=2, error=3, stopped=4, native-failed=5.
+        options:
+          $ref: "#/components/schemas/EngineOptions"
+        cache:
+          $ref: "#/components/schemas/CacheStats"
+    EngineSpec:
+      type: object
+      required: [model]
+      properties:
+        model:
+          type: string
+        options:
+          $ref: "#/components/schemas/EngineOptions"
+    CacheStats:
+      type: object
+      required: [kv_bytes, prefix_hits, prefix_misses]
+      properties:
+        kv_bytes:
+          type: integer
+          description: Key-value cache bytes now held in memory.
+        prefix_hits:
+          type: integer
+          description: Turns that reused a cached prefix.
+        prefix_misses:
+          type: integer
+        snapshot_bytes:
+          type: integer
+          description: Snapshot bytes now held on disk for this engine.
+    Session:
+      type: object
+      required: [id, engine, created_at]
+      properties:
+        id:
+          type: string
+        engine:
+          type: string
+        created_at:
+          type: string
+          format: date-time
+        persist:
+          type: boolean
+          default: false
+          description: True writes a snapshot after each turn. The
+            session resumes after a server restart.
+        tokens_held:
+          type: integer
+          description: Tokens the engine holds for this session.
+    SessionSpec:
+      type: object
+      required: [engine]
+      properties:
+        engine:
+          type: string
+        persist:
+          type: boolean
+          default: false
+    ChatRequest:
+      type: object
+      required: [messages]
+      properties:
+        model:
+          type: string
+          description: >-
+            Without x-session, route to the first engine that holds this model unless x-engine selects an engine.
+            With x-session, a model that conflicts with the session binding returns BadRequest from Phase 2.
+            In Phase 1, a request with x-session that passes authentication, body size, and schema checks returns NotFound before the model is checked.
+            A request that sets none of model, x-engine, and x-session returns BadRequest.
+        messages:
+          type: array
+          items:
+            $ref: "#/components/schemas/ChatMessage"
+        tools:
+          type: array
+          items:
+            $ref: "#/components/schemas/Tool"
+        tool_choice:
+          $ref: "#/components/schemas/ToolChoice"
+        response_format:
+          $ref: "#/components/schemas/ResponseFormat"
+        temperature:
+          type: number
+          minimum: 0
+          maximum: 2
+          description: >-
+            The engine default from generation_config.json in the model directory of the engine
+            that serves the request, else 0.7. A request that sets the field keeps its value.
+        top_p:
+          type: number
+          minimum: 0
+          maximum: 1
+          description: >-
+            The engine default from generation_config.json in the model directory of the engine
+            that serves the request, else 1.0. A request that sets the field keeps its value.
+        top_k:
+          type: integer
+          minimum: 0
+          description: >-
+            The engine default from generation_config.json in the model directory of the engine
+            that serves the request, else 0 (off). A request that sets the field keeps its value.
+        max_tokens:
+          type: integer
+          default: 2048
+          minimum: 1
+        stream:
+          type: boolean
+          default: false
+        x-thinking:
+          type: string
+          enum: [default, "on", "off"]
+          default: default
+          description: Maps to the chat template enable_thinking
+            flag of the family.
+        stop:
+          description: Stop sequences match on decoded text.
+          type: array
+          items:
+            type: string
+        x-engine:
+          type: string
+          description: >-
+            Without x-session, this engine id takes precedence over model.
+            With x-session, an engine that conflicts with the session binding returns BadRequest from Phase 2.
+            In Phase 1, a request with x-session that passes authentication, body size, and schema checks returns NotFound.
+        x-session:
+          type: string
+          description: >-
+            In Phase 1, no session registry exists. A request with x-session that passes authentication, body size, and schema checks returns NotFound.
+            From Phase 2, resolve this session and its engine binding. A missing session returns NotFound.
+            From Phase 2, a conflicting model or x-engine returns BadRequest.
+            Prefix reuse follows the cache rules, not unconditional processing of unheld tokens.
+            Without x-session, create one anonymous session with empty private state.
+            Release it after completion and GPU teardown.
+    ToolFunction:
+      type: object
+      required: [name]
+      properties:
+        name:
+          type: string
+        description:
+          type: string
+        parameters:
+          type: object
+        strict:
+          type: boolean
+          default: false
+          description: >-
+            Requests typed argument values that follow parameters. Until the
+            grammar packets of decision 0045 land, the server accepts this
+            field and applies no constraint. The server parses tool calls
+            from the output in all cases.
+    ResponseFormat:
+      description: >-
+        Output format. The type text is the default and applies no constraint.
+        Until the grammar packets of decision 0045 land, the types json_object
+        and json_schema return 400 bad_request. The server never ignores them
+        silently.
+      oneOf:
+        - type: object
+          required: [type]
+          properties:
+            type:
+              type: string
+              const: text
+        - type: object
+          required: [type]
+          properties:
+            type:
+              type: string
+              const: json_object
+        - type: object
+          required: [type, json_schema]
+          properties:
+            type:
+              type: string
+              const: json_schema
+            json_schema:
+              type: object
+              required: [name]
+              properties:
+                name:
+                  type: string
+                description:
+                  type: string
+                schema:
+                  type: object
+                strict:
+                  type: boolean
+                  default: false
+    Tool:
+      type: object
+      required: [type, function]
+      properties:
+        type:
+          type: string
+          const: function
+        function:
+          $ref: "#/components/schemas/ToolFunction"
+    ToolChoice:
+      description: >-
+        none disables tool calls. auto permits tool calls. required requires a tool call.
+        The object selects one named function.
+        Until the grammar packets of decision 0045 land, the server cannot
+        enforce required or a named function. It returns 400 bad_request for
+        both and never treats them as a prompt hint.
+      oneOf:
+        - type: string
+          enum: [none, auto, required]
+        - type: object
+          required: [type, function]
+          properties:
+            type:
+              type: string
+              const: function
+            function:
+              type: object
+              required: [name]
+              properties:
+                name:
+                  type: string
+    ToolCall:
+      type: object
+      required: [id, type, function]
+      properties:
+        id:
+          type: string
+        type:
+          type: string
+          enum: [function]
+        function:
+          type: object
+          required: [name, arguments]
+          properties:
+            name:
+              type: string
+            arguments:
+              type: string
+              description: >-
+                JSON encoded arguments. A completed call carries a JSON object
+                as text.
+    ToolCallDelta:
+      type: object
+      required: [index]
+      description: >-
+        One tool call fragment in a stream. Clients group fragments by index.
+        The first fragment of a call carries id, type, and function.name.
+        Later fragments of the same call carry function.arguments only.
+        A client concatenates the arguments strings in stream order.
+      properties:
+        index:
+          type: integer
+          minimum: 0
+          description: Position of the call in the message. The first call has index 0.
+        id:
+          type: string
+        type:
+          type: string
+          const: function
+        function:
+          type: object
+          properties:
+            name:
+              type: string
+            arguments:
+              type: string
+              description: A fragment of the JSON encoded arguments.
+    ChatMessage:
+      type: object
+      required: [role]
+      allOf:
+        - if:
+            properties:
+              role:
+                const: tool
+          then:
+            required: [tool_call_id, content]
+            properties:
+              content:
+                type: [string, array]
+        - if:
+            properties:
+              role:
+                enum: [system, developer, user]
+          then:
+            required: [content]
+            properties:
+              content:
+                type: [string, array]
+        - if:
+            properties:
+              role:
+                const: assistant
+          then:
+            if:
+              not:
+                required: [tool_calls]
+            then:
+              required: [content]
+              properties:
+                content:
+                  type: [string, array]
+      properties:
+        role:
+          type: string
+          enum: [system, developer, user, assistant, tool]
+        content:
+          type: [string, array, "null"]
+          items:
+            type: object
+            required: [type, text]
+            properties:
+              type:
+                type: string
+                const: text
+              text:
+                type: string
+          description: >-
+            A string, or an array of text parts whose text the server
+            concatenates in order with no separator. Null is valid on an
+            assistant message that carries tool calls.
+        tool_call_id:
+          type: string
+          description: >-
+            Required when role is tool. The value is the id of the assistant
+            tool call that this message answers. The content of a tool message
+            is the result text.
+        tool_calls:
+          type: array
+          items:
+            $ref: "#/components/schemas/ToolCall"
+    Usage:
+      type: object
+      required: [prompt_tokens, completion_tokens, total_tokens]
+      properties:
+        prompt_tokens:
+          type: integer
+        completion_tokens:
+          type: integer
+        total_tokens:
+          type: integer
+          description: The sum of prompt_tokens and completion_tokens.
+        reused_tokens:
+          type: integer
+          description: >-
+            Prompt tokens served from the saved prefix state; 0 when a
+            stop string ended the reply.
+    ResponseMessage:
+      type: object
+      required: [role, content]
+      properties:
+        role:
+          type: string
+          const: assistant
+        content:
+          type: [string, "null"]
+          description: >-
+            Null is valid when the message carries tool calls.
+            This field never contains the text of a think block.
+        reasoning_content:
+          type: string
+          description: >-
+            Optional extension. The text of the think block, without the
+            think tags. The server omits the field when the reply has no
+            think block.
+        tool_calls:
+          type: array
+          description: >-
+            Present when the model completed at least one tool call.
+            Each call has a server generated id.
+          items:
+            $ref: "#/components/schemas/ToolCall"
+    Choice:
+      type: object
+      required: [index, message, finish_reason]
+      properties:
+        index:
+          type: integer
+        message:
+          $ref: "#/components/schemas/ResponseMessage"
+        finish_reason:
+          type: string
+          enum: [stop, length, tool_calls]
+    ChatCompletion:
+      type: object
+      required: [id, object, created, model, choices, usage]
+      properties:
+        id:
+          type: string
+        object:
+          type: string
+          const: chat.completion
+        created:
+          type: integer
+          description: Unix time in seconds when the completion started.
+        model:
+          type: string
+          description: Name of the model that served the request.
+        engine:
+          type: string
+        session:
+          type: string
+        choices:
+          type: array
+          items:
+            $ref: "#/components/schemas/Choice"
+        usage:
+          $ref: "#/components/schemas/Usage"
+    ChoiceDelta:
+      type: object
+      properties:
+        role:
+          type: string
+          const: assistant
+          description: The first chunk of a stream carries role assistant. Later chunks omit it.
+        content:
+          type: string
+          description: Never contains the text of a think block.
+        reasoning_content:
+          type: string
+          description: >-
+            Optional extension. A fragment of the think block text, without
+            the think tags. Fragments come before the first content fragment.
+        tool_calls:
+          type: array
+          description: >-
+            Tool call fragments. The server sends no part of the tool call
+            markup as content. A call appears here after the server has
+            parsed it, with its id, name, and arguments. The final chunk
+            carries finish_reason tool_calls when at least one call completed.
+          items:
+            $ref: "#/components/schemas/ToolCallDelta"
+    ChunkChoice:
+      type: object
+      required: [index, delta]
+      properties:
+        index:
+          type: integer
+        delta:
+          $ref: "#/components/schemas/ChoiceDelta"
+        finish_reason:
+          type: string
+          enum: [stop, length, tool_calls]
+          description: Present on the final chunk only.
+    ChatCompletionChunk:
+      type: object
+      required: [id, object, created, model, choices]
+      properties:
+        id:
+          type: string
+        object:
+          type: string
+          const: chat.completion.chunk
+        created:
+          type: integer
+          description: Unix time in seconds when the completion started.
+        model:
+          type: string
+          description: Name of the model that served the request.
+        engine:
+          type: string
+        session:
+          type: string
+        choices:
+          type: array
+          items:
+            $ref: "#/components/schemas/ChunkChoice"
+        usage:
+          $ref: "#/components/schemas/Usage"
+          description: Present on the final chunk only.
+paths:
+  /health:
+    get:
+      operationId: getHealth
+      summary: Liveness probe
+      security: []
+      responses:
+        "200":
+          description: The process runs.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [status]
+                properties:
+                  status:
+                    type: string
+                    enum: [ok]
+  /ready:
+    get:
+      operationId: getReady
+      summary: Readiness probe
+      security: []
+      responses:
+        "200":
+          description: At least one engine is ready.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [status]
+                properties:
+                  status:
+                    type: string
+                    const: ready
+        "503":
+          description: No engine is ready. Only this handler builds the body with code not_ready.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+  /v1/models:
+    get:
+      operationId: listModels
+      summary: List models
+      responses:
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "200":
+          description: Models with their engines.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [object, data]
+                properties:
+                  object:
+                    type: string
+                    const: list
+                  data:
+                    type: array
+                    items:
+                      $ref: "#/components/schemas/Model"
+  /v1/chat/completions:
+    post:
+      operationId: createChatCompletion
+      summary: Chat completion
+      description: >-
+        Set stream to true for server-sent events. From Phase 2, session routing preserves the session binding.
+        The stream field selects the response media type. The server ignores Accept.
+        Before response headers, all listed errors return JSON even when stream is true.
+        A streaming response sends its headers and the role chunk when the server admits the job, before prefill starts.
+        Until the first data event, the server sends the SSE comment line ": keep-alive" every 15 seconds.
+        After headers, any error sends exactly one event: error whose JSON data matches Error (BackendError for a backend failure), then closes the stream without a success finish event, usage event, or [DONE].
+        A prompt above the position limit of the engine returns 409 context_limit before admission.
+        The server returns 400 bad_request for response_format of type json_object or json_schema, and for tool_choice required or a named function, until the grammar packets of decision 0045 land.
+        Client disconnect cancels the job. The server closes that stream without [DONE] and without an error event.
+        A job whose bounded output channel is full with no reader is cancelled. The server closes that stream as on disconnect. No timeout applies.
+        Tokens do not cross jobs.
+        finish_reason is stop on end of sequence or a stop-sequence match,
+        length on the max_tokens limit, and tool_calls when an assembled tool call completes.
+      requestBody:
+        description: The chat body has a 16 MiB cap. Larger bodies return BadRequest.
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/ChatRequest"
+      responses:
+        "200":
+          description: One completion, or a stream of chunks.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ChatCompletion"
+            text/event-stream:
+              schema:
+                allOf:
+                  - $ref: "#/components/schemas/ChatCompletionChunk"
+                description: |-
+                  Each token event has this shape:
+                  data: {"id":"...","object":"chat.completion.chunk","created":1700000000,"model":"...","choices":[{"index":0,"delta":{"content":"..."}}]}
+                  The first event carries delta.role assistant. Later events omit it.
+                  The server sends the headers and this first event at admission.
+                  Until the first data event, the server sends the comment line
+                  ": keep-alive" followed by a blank line every 15 seconds.
+                  Clients ignore comment lines.
+                  Think block text arrives in delta.reasoning_content. It never
+                  arrives in delta.content.
+                  Tool calls arrive in delta.tool_calls. Each entry has an index.
+                  The first entry of a call has id, type, and function.name.
+                  Entries carry function.arguments fragments.
+                  A blank line ends each event.
+                  The final event carries usage. Its choice carries finish_reason.
+                  finish_reason is tool_calls when at least one call completed.
+                  A successful stream ends with data: [DONE].
+                  After response headers, any error sends exactly one
+                  event: error event whose JSON data matches Error
+                  (BackendError for a backend failure). Example:
+                  event: error
+                  data: {"error":{"message":"Model execution failed.","code":"backend_error"}}
+                  The server then closes the stream without a success
+                  finish event, usage event, or [DONE] marker.
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "409":
+          $ref: "#/components/responses/CapacityConflict"
+        "422":
+          $ref: "#/components/responses/CheckpointFailure"
+        "503":
+          $ref: "#/components/responses/Overloaded"
+        "500":
+          $ref: "#/components/responses/BackendFailure"
+  /v1/engines:
+    get:
+      operationId: listEngines
+      summary: List engines
+      responses:
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "200":
+          description: The fleet.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [data]
+                properties:
+                  data:
+                    type: array
+                    items:
+                      $ref: "#/components/schemas/Engine"
+    post:
+      operationId: createEngine
+      summary: Create an engine
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/EngineSpec"
+      responses:
+        "201":
+          description: Engine created and loading.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Engine"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "500":
+          $ref: "#/components/responses/BackendFailure"
+        "409":
+          description: The memory plan cannot fit this engine,
+            or the context limit rejects the request.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        "422":
+          description: The checkpoint failed identity or load.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+  /v1/engines/{engineId}:
+    parameters:
+      - name: engineId
+        in: path
+        required: true
+        schema:
+          type: string
+    get:
+      operationId: getEngine
+      summary: Read one engine
+      responses:
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "200":
+          description: The engine.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Engine"
+        "404":
+          $ref: "#/components/responses/NotFound"
+    delete:
+      operationId: deleteEngine
+      summary: Stop one engine
+      description: Stops the engine and frees its memory. Sessions that
+        point at this engine stop. Snapshots stay on disk.
+      responses:
+        "204":
+          description: Engine stopped.
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "404":
+          $ref: "#/components/responses/NotFound"
+  /v1/engines/{engineId}/cache:
+    parameters:
+      - name: engineId
+        in: path
+        required: true
+        schema:
+          type: string
+    get:
+      operationId: getEngineCache
+      summary: Cache statistics
+      responses:
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "200":
+          description: Current cache state.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/CacheStats"
+    delete:
+      operationId: deleteEngineCache
+      summary: Clear the in-memory cache
+      description: Drops all held prefixes and key-value state. Disk
+        snapshots stay.
+      responses:
+        "204":
+          description: Cache cleared.
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "404":
+          $ref: "#/components/responses/NotFound"
+  /v1/sessions:
+    post:
+      operationId: createSession
+      summary: Create a session
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/SessionSpec"
+      responses:
+        "201":
+          description: Session created. Phase 1 does not ship this route (docs/design/server.md, Phase 1 session scope).
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Session"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "409":
+          description: The engine lacks capacity for another session state.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+  /v1/sessions/{sessionId}:
+    parameters:
+      - name: sessionId
+        in: path
+        required: true
+        schema:
+          type: string
+    get:
+      operationId: getSession
+      summary: Read one session
+      responses:
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "200":
+          description: The session. Phase 1 does not ship this route (docs/design/server.md, Phase 1 session scope).
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Session"
+        "404":
+          $ref: "#/components/responses/NotFound"
+    delete:
+      operationId: deleteSession
+      summary: Delete one session
+      description: Drops the held state and its memory reservation.
+        Phase 1 does not ship this route (docs/design/server.md, Phase 1 session scope).
+        Deletes the disk snapshot when no other session references it.
+      responses:
+        "204":
+          description: Session deleted.
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "404":
+          $ref: "#/components/responses/NotFound"
+  /metrics:
+    get:
+      operationId: getMetrics
+      summary: Process metrics
+      security: []
+      responses:
+        "200":
+          description: |-
+            Prometheus text format. The metrics inventory is:
+
+            | Metric | Type | Labels |
+            |---|---|---|
+            | requests_total | counter | engine, code |
+            | generate_seconds_total | counter | engine |
+            | tokens_out_total | counter | engine |
+            | reused_tokens_total | counter | engine |
+            | draft_passes_total | counter | engine |
+            | draft_accepted_total | counter | engine |
+            | weights_faults_total | counter | engine |
+            | kv_bytes | gauge | engine |
+            | mlx_retained_bytes | gauge | none |
+            | engine_state | gauge, 0 to 5: loading=0, ready=1, busy=2, error=3, stopped=4, native-failed=5 | engine |
+          content:
+            text/plain:
+              schema:
+                type: string

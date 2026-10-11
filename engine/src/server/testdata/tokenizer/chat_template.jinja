@@ -1,0 +1,1 @@
+{% for m in messages %}<|im_start|>{{ m.role }}{{ '\n' }}{{ m.content }}<|im_end|>{{ '\n' }}{% endfor %}{% if add_generation_prompt %}<|im_start|>assistant{{ '\n' }}{% if enable_thinking is defined and enable_thinking is true %}<think>{{ '\n' }}{% endif %}{% endif %}

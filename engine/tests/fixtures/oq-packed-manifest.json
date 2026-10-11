@@ -1,0 +1,578 @@
+{
+  "producer": "mlx.core.quantize and mlx.core.save_safetensors",
+  "mlx_version": "0.30.6",
+  "python": "3.12.14",
+  "host": "macOS-26.5.2-arm64-arm-64bit",
+  "device": "Metal GPU",
+  "input_pattern": [
+    -6.0,
+    -5.0,
+    -4.0,
+    -3.0,
+    -2.0,
+    -1.0,
+    0.0,
+    1.0,
+    2.0,
+    3.0,
+    4.0,
+    5.0,
+    6.0,
+    7.0,
+    8.0,
+    9.0
+  ],
+  "input_rows": "Repeat pattern to the declared width. Reverse the second row.",
+  "cases": [
+    {
+      "name": "affine_2_g32",
+      "mode": "affine",
+      "bits": 2,
+      "group_size": 32,
+      "logical_shape": [
+        2,
+        64
+      ],
+      "input_dtype": "mlx.core.float32",
+      "tensors": {
+        "payload": {
+          "key": "affine_2_g32.payload",
+          "dtype": "mlx.core.uint32",
+          "shape": [
+            2,
+            4
+          ],
+          "first_row": [
+            22457087,
+            22457087,
+            22457087,
+            22457087
+          ]
+        },
+        "scales": {
+          "key": "affine_2_g32.scales",
+          "dtype": "mlx.core.float32",
+          "shape": [
+            2,
+            2
+          ],
+          "first_row": [
+            -4.5,
+            -4.5
+          ]
+        },
+        "biases": {
+          "key": "affine_2_g32.biases",
+          "dtype": "mlx.core.float32",
+          "shape": [
+            2,
+            2
+          ],
+          "first_row": [
+            9.0,
+            9.0
+          ]
+        }
+      }
+    },
+    {
+      "name": "affine_3_g32",
+      "mode": "affine",
+      "bits": 3,
+      "group_size": 32,
+      "logical_shape": [
+        2,
+        64
+      ],
+      "input_dtype": "mlx.core.float32",
+      "tensors": {
+        "payload": {
+          "key": "affine_3_g32.payload",
+          "dtype": "mlx.core.uint32",
+          "shape": [
+            2,
+            6
+          ],
+          "first_row": [
+            2610060215,
+            1538719892,
+            9739154,
+            2610060215,
+            1538719892,
+            9739154
+          ]
+        },
+        "scales": {
+          "key": "affine_3_g32.scales",
+          "dtype": "mlx.core.float32",
+          "shape": [
+            2,
+            2
+          ],
+          "first_row": [
+            -2.25,
+            -2.25
+          ]
+        },
+        "biases": {
+          "key": "affine_3_g32.biases",
+          "dtype": "mlx.core.float32",
+          "shape": [
+            2,
+            2
+          ],
+          "first_row": [
+            9.0,
+            9.0
+          ]
+        }
+      }
+    },
+    {
+      "name": "affine_4_g32",
+      "mode": "affine",
+      "bits": 4,
+      "group_size": 32,
+      "logical_shape": [
+        2,
+        64
+      ],
+      "input_dtype": "mlx.core.bfloat16",
+      "tensors": {
+        "payload": {
+          "key": "affine_4_g32.payload",
+          "dtype": "mlx.core.uint32",
+          "shape": [
+            2,
+            8
+          ],
+          "first_row": [
+            2309737967,
+            19088743,
+            2309737967,
+            19088743,
+            2309737967,
+            19088743,
+            2309737967,
+            19088743
+          ]
+        },
+        "scales": {
+          "key": "affine_4_g32.scales",
+          "dtype": "mlx.core.bfloat16",
+          "shape": [
+            2,
+            2
+          ],
+          "first_row": [
+            -1.0,
+            -1.0
+          ]
+        },
+        "biases": {
+          "key": "affine_4_g32.biases",
+          "dtype": "mlx.core.bfloat16",
+          "shape": [
+            2,
+            2
+          ],
+          "first_row": [
+            9.0,
+            9.0
+          ]
+        }
+      }
+    },
+    {
+      "name": "affine_5_g32",
+      "mode": "affine",
+      "bits": 5,
+      "group_size": 32,
+      "logical_shape": [
+        2,
+        64
+      ],
+      "input_dtype": "mlx.core.float16",
+      "tensors": {
+        "payload": {
+          "key": "affine_5_g32.payload",
+          "dtype": "mlx.core.uint32",
+          "shape": [
+            2,
+            10
+          ],
+          "first_row": [
+            3950833631,
+            1680715660,
+            4024369288,
+            2945248124,
+            8938541,
+            3950833631,
+            1680715660,
+            4024369288,
+            2945248124,
+            8938541
+          ]
+        },
+        "scales": {
+          "key": "affine_5_g32.scales",
+          "dtype": "mlx.core.float16",
+          "shape": [
+            2,
+            2
+          ],
+          "first_row": [
+            -0.4736328125,
+            -0.4736328125
+          ]
+        },
+        "biases": {
+          "key": "affine_5_g32.biases",
+          "dtype": "mlx.core.float16",
+          "shape": [
+            2,
+            2
+          ],
+          "first_row": [
+            9.0,
+            9.0
+          ]
+        }
+      }
+    },
+    {
+      "name": "affine_6_g32",
+      "mode": "affine",
+      "bits": 6,
+      "group_size": 32,
+      "logical_shape": [
+        2,
+        64
+      ],
+      "input_dtype": "mlx.core.bfloat16",
+      "tensors": {
+        "payload": {
+          "key": "affine_6_g32.payload",
+          "dtype": "mlx.core.uint32",
+          "shape": [
+            2,
+            12
+          ],
+          "first_row": [
+            2932834047,
+            1449036394,
+            4328773,
+            2932834047,
+            1449036394,
+            4328773,
+            2932834047,
+            1449036394,
+            4328773,
+            2932834047,
+            1449036394,
+            4328773
+          ]
+        },
+        "scales": {
+          "key": "affine_6_g32.scales",
+          "dtype": "mlx.core.bfloat16",
+          "shape": [
+            2,
+            2
+          ],
+          "first_row": [
+            -0.2373046875,
+            -0.2373046875
+          ]
+        },
+        "biases": {
+          "key": "affine_6_g32.biases",
+          "dtype": "mlx.core.bfloat16",
+          "shape": [
+            2,
+            2
+          ],
+          "first_row": [
+            9.0,
+            9.0
+          ]
+        }
+      }
+    },
+    {
+      "name": "affine_8_g32",
+      "mode": "affine",
+      "bits": 8,
+      "group_size": 32,
+      "logical_shape": [
+        2,
+        64
+      ],
+      "input_dtype": "mlx.core.float32",
+      "tensors": {
+        "payload": {
+          "key": "affine_8_g32.payload",
+          "dtype": "mlx.core.uint32",
+          "shape": [
+            2,
+            16
+          ],
+          "first_row": [
+            3437096703,
+            2291772091,
+            1146447479,
+            1122867,
+            3437096703,
+            2291772091,
+            1146447479,
+            1122867,
+            3437096703,
+            2291772091,
+            1146447479,
+            1122867,
+            3437096703,
+            2291772091,
+            1146447479,
+            1122867
+          ]
+        },
+        "scales": {
+          "key": "affine_8_g32.scales",
+          "dtype": "mlx.core.float32",
+          "shape": [
+            2,
+            2
+          ],
+          "first_row": [
+            -0.05882352963089943,
+            -0.05882352963089943
+          ]
+        },
+        "biases": {
+          "key": "affine_8_g32.biases",
+          "dtype": "mlx.core.float32",
+          "shape": [
+            2,
+            2
+          ],
+          "first_row": [
+            9.0,
+            9.0
+          ]
+        }
+      }
+    },
+    {
+      "name": "affine_4_g64",
+      "mode": "affine",
+      "bits": 4,
+      "group_size": 64,
+      "logical_shape": [
+        2,
+        64
+      ],
+      "input_dtype": "mlx.core.bfloat16",
+      "tensors": {
+        "payload": {
+          "key": "affine_4_g64.payload",
+          "dtype": "mlx.core.uint32",
+          "shape": [
+            2,
+            8
+          ],
+          "first_row": [
+            2309737967,
+            19088743,
+            2309737967,
+            19088743,
+            2309737967,
+            19088743,
+            2309737967,
+            19088743
+          ]
+        },
+        "scales": {
+          "key": "affine_4_g64.scales",
+          "dtype": "mlx.core.bfloat16",
+          "shape": [
+            2,
+            1
+          ],
+          "first_row": [
+            -1.0
+          ]
+        },
+        "biases": {
+          "key": "affine_4_g64.biases",
+          "dtype": "mlx.core.bfloat16",
+          "shape": [
+            2,
+            1
+          ],
+          "first_row": [
+            9.0
+          ]
+        }
+      }
+    },
+    {
+      "name": "affine_4_g128",
+      "mode": "affine",
+      "bits": 4,
+      "group_size": 128,
+      "logical_shape": [
+        2,
+        128
+      ],
+      "input_dtype": "mlx.core.float32",
+      "tensors": {
+        "payload": {
+          "key": "affine_4_g128.payload",
+          "dtype": "mlx.core.uint32",
+          "shape": [
+            2,
+            16
+          ],
+          "first_row": [
+            2309737967,
+            19088743,
+            2309737967,
+            19088743,
+            2309737967,
+            19088743,
+            2309737967,
+            19088743,
+            2309737967,
+            19088743,
+            2309737967,
+            19088743,
+            2309737967,
+            19088743,
+            2309737967,
+            19088743
+          ]
+        },
+        "scales": {
+          "key": "affine_4_g128.scales",
+          "dtype": "mlx.core.float32",
+          "shape": [
+            2,
+            1
+          ],
+          "first_row": [
+            -1.0
+          ]
+        },
+        "biases": {
+          "key": "affine_4_g128.biases",
+          "dtype": "mlx.core.float32",
+          "shape": [
+            2,
+            1
+          ],
+          "first_row": [
+            9.0
+          ]
+        }
+      }
+    },
+    {
+      "name": "mxfp4_4_g32",
+      "mode": "mxfp4",
+      "bits": 4,
+      "group_size": 32,
+      "logical_shape": [
+        2,
+        64
+      ],
+      "input_dtype": "mlx.core.float32",
+      "tensors": {
+        "payload": {
+          "key": "mxfp4_4_g32.payload",
+          "dtype": "mlx.core.uint32",
+          "shape": [
+            2,
+            8
+          ],
+          "first_row": [
+            278576333,
+            1717912626,
+            278576333,
+            1717912626,
+            278576333,
+            1717912626,
+            278576333,
+            1717912626
+          ]
+        },
+        "scales": {
+          "key": "mxfp4_4_g32.scales",
+          "dtype": "mlx.core.uint8",
+          "shape": [
+            2,
+            2
+          ],
+          "first_row": [
+            128,
+            128
+          ]
+        }
+      }
+    },
+    {
+      "name": "mxfp8_8_g32",
+      "mode": "mxfp8",
+      "bits": 8,
+      "group_size": 32,
+      "logical_shape": [
+        2,
+        64
+      ],
+      "input_dtype": "mlx.core.float32",
+      "tensors": {
+        "payload": {
+          "key": "mxfp8_8_g32.payload",
+          "dtype": "mlx.core.uint32",
+          "shape": [
+            2,
+            16
+          ],
+          "first_row": [
+            4109957884,
+            1744890096,
+            2054714480,
+            2122219132,
+            4109957884,
+            1744890096,
+            2054714480,
+            2122219132,
+            4109957884,
+            1744890096,
+            2054714480,
+            2122219132,
+            4109957884,
+            1744890096,
+            2054714480,
+            2122219132
+          ]
+        },
+        "scales": {
+          "key": "mxfp8_8_g32.scales",
+          "dtype": "mlx.core.uint8",
+          "shape": [
+            2,
+            2
+          ],
+          "first_row": [
+            121,
+            121
+          ]
+        }
+      }
+    }
+  ],
+  "file_sha256": "18d95aae3bb21b3b187f8710b86f1295c398e48b7a29e3ac3a2d77376a64d23d",
+  "bytes": 3206,
+  "scope": "Observed Python MLX storage fixtures. No Rust execution or numerical parity claim.",
+  "producer_script_sha256": "6a4b191073ae1882b01894aaddf102592165b4f44ef941ce89c2228cbad636d0"
+}

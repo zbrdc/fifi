@@ -1,0 +1,186 @@
+--- a/src/gemm.cuh
++++ b/src/gemm.cuh
+@@ -335,7 +335,7 @@
+ }
+
+ // y[t * ldy + r] for t < m, r < n_rows (n_rows % 8 == 0, k % 256 == 0,
+-// ldy >= n_rows); x is row-major fp16 [m][k]. Default stream. Returns
++// ldy >= n_rows); x is row-major fp16 [m][k]. Runs on `stream` (nullptr: default). Returns
+ // cudaErrorInvalidValue for a bad shape, else the attribute or launch status.
+ //
+ // Dispatch rule (measured on Xavier, see bench/gemm_bench.cu): use
+@@ -344,7 +344,7 @@
+ // 33..64 and Tile<128, 128, 2, 4, 1> above.
+ template <class D, class T>
+ cudaError_t launch(const uint4* w, const __half* x, float* y, int ldy, int n_rows, int k,
+-                   int m) {
++                   int m, cudaStream_t stream = nullptr) {
+   if (m <= 0 || n_rows % 8 != 0 || k % mma884::kTileK != 0 || ldy < n_rows)
+     return cudaErrorInvalidValue;
+   // Per template instance; not thread-safe and only valid for the current
+@@ -357,7 +357,7 @@
+     configured = true;
+   }
+   dim3 grid((n_rows + T::BM - 1) / T::BM, (m + T::BN - 1) / T::BN);
+-  gemm_kernel<D, T><<<grid, T::kThreads, T::kSmem>>>(w, x, y, ldy, n_rows, k, m);
++  gemm_kernel<D, T><<<grid, T::kThreads, T::kSmem, stream>>>(w, x, y, ldy, n_rows, k, m);
+   return cudaGetLastError();
+ }
+ }  // namespace gemm
+--- a/src/kernels.cu
++++ b/src/kernels.cu
+@@ -58,11 +58,13 @@
+ // prefill tails) over the 64-token one.
+ template <class D>
+ cudaError_t gemm_launch(int m, const uint4* w, const uint4* xf, float* y, int ldy, int n_rows,
+-                        int k) {
++                        int k, cudaStream_t stream) {
+   const __half* x = reinterpret_cast<const __half*>(xf);
+-  if (m <= 32) return gemm::launch<D, gemm::Tile<128, 32, 4, 2, 1>>(w, x, y, ldy, n_rows, k, m);
+-  if (m <= 64) return gemm::launch<D, gemm::Tile<128, 64, 4, 2, 1>>(w, x, y, ldy, n_rows, k, m);
+-  return gemm::launch<D, gemm::Tile<128, 128, 2, 4, 1>>(w, x, y, ldy, n_rows, k, m);
++  if (m <= 32)
++    return gemm::launch<D, gemm::Tile<128, 32, 4, 2, 1>>(w, x, y, ldy, n_rows, k, m, stream);
++  if (m <= 64)
++    return gemm::launch<D, gemm::Tile<128, 64, 4, 2, 1>>(w, x, y, ldy, n_rows, k, m, stream);
++  return gemm::launch<D, gemm::Tile<128, 128, 2, 4, 1>>(w, x, y, ldy, n_rows, k, m, stream);
+ }
+
+ }  // namespace
+@@ -73,25 +75,25 @@
+ size_t xf_vecs() { return mma884::kXfEntries + 1; }
+
+ cudaError_t matmul(GgmlType type, int m, const uint4* w, const uint4* xf, float* y, int ldy,
+-                   int n_rows, int k) {
++                   int n_rows, int k, cudaStream_t stream) {
+   bool wide = m > kMaxTokens;
+   switch (type) {
+     case GgmlType::Q8_0:
+-      if (wide) return gemm_launch<gemm::DQ8>(m, w, xf, y, ldy, n_rows, k);
+-      return mma884::launch_packed<mma884::Q8_0>(m, w, xf, y, ldy, n_rows, k);
++      if (wide) return gemm_launch<gemm::DQ8>(m, w, xf, y, ldy, n_rows, k, stream);
++      return mma884::launch_packed<mma884::Q8_0>(m, w, xf, y, ldy, n_rows, k, stream);
+     case GgmlType::Q4_K:
+-      if (wide) return gemm_launch<gemm::DQ4K>(m, w, xf, y, ldy, n_rows, k);
+-      return mma884::launch_packed<mma884::Q4_K>(m, w, xf, y, ldy, n_rows, k);
++      if (wide) return gemm_launch<gemm::DQ4K>(m, w, xf, y, ldy, n_rows, k, stream);
++      return mma884::launch_packed<mma884::Q4_K>(m, w, xf, y, ldy, n_rows, k, stream);
+     case GgmlType::Q6_K:
+-      if (wide) return gemm_launch<gemm::DQ6K>(m, w, xf, y, ldy, n_rows, k);
+-      return mma884::launch_packed<mma884::Q6_K>(m, w, xf, y, ldy, n_rows, k);
++      if (wide) return gemm_launch<gemm::DQ6K>(m, w, xf, y, ldy, n_rows, k, stream);
++      return mma884::launch_packed<mma884::Q6_K>(m, w, xf, y, ldy, n_rows, k, stream);
+     default:
+       return cudaErrorInvalidValue;
+   }
+ }
+
+-cudaError_t pack_f32(const float* x, int m, int k, uint4* xf) {
+-  pack_f32_k<<<m, 256>>>(x, k, m > kMaxTokens, xf);
++cudaError_t pack_f32(const float* x, int m, int k, uint4* xf, cudaStream_t stream) {
++  pack_f32_k<<<m, 256, 0, stream>>>(x, k, m > kMaxTokens, xf);
+   return cudaGetLastError();
+ }
+
+--- a/src/kernels.h
++++ b/src/kernels.h
+@@ -1,7 +1,7 @@
+ // Engine kernels for Qwen3.8 (qwen35 arch) on sm_72. Activations are f32 in
+ // [token][feature] rows; matmul inputs go through the fp16 buffer xf: fragment
+ // order (what mma884 reads) for m <= kMaxTokens, row-major [m][k] (what the
+-// gemm path reads) for larger m. All launches use the default stream.
++// gemm path reads) for larger m. Every entry takes a stream; nullptr is the default stream.
+ #pragma once
+
+ #include <cuda_fp16.h>
+@@ -26,9 +26,9 @@
+ // the decode kernels only by fp32 summation order. Returns cudaErrorInvalidValue
+ // for an untiled type or a bad shape, else the memset, attribute or launch status.
+ cudaError_t matmul(GgmlType type, int m, const uint4* w, const uint4* xf, float* y, int ldy,
+-                   int n_rows, int k);
++                   int n_rows, int k, cudaStream_t stream = nullptr);
+
+ // xf = x for x [m][k]; returns the launch status.
+-cudaError_t pack_f32(const float* x, int m, int k, uint4* xf);
++cudaError_t pack_f32(const float* x, int m, int k, uint4* xf, cudaStream_t stream = nullptr);
+
+ }  // namespace kern
+--- a/src/mma884.cuh
++++ b/src/mma884.cuh
+@@ -121,24 +121,23 @@
+   return split;
+ }
+
+-// Packs x (m tokens x k, row-major fp16) into a process-wide fragment-order
+-// buffer whose last entry stays zero, or returns nullptr when the buffer
+-// cannot be set up. Bench helper: the engine's rmsnorm writes this layout directly.
+-inline const uint4* prepare_x(const __half* x, int k, int m) {
++// Packs x (m tokens x k, row-major fp16) on `stream` into a process-wide fragment-order buffer
++// whose last entry stays zero, or returns nullptr when setup fails. Bench helper, not capture-safe.
++inline const uint4* prepare_x(const __half* x, int k, int m, cudaStream_t stream = nullptr) {
+   static uint4* xf = nullptr;
+   if (!xf) {
+     if (cudaMalloc(&xf, (kXfEntries + 1) * sizeof(uint4)) != cudaSuccess) {
+       xf = nullptr;
+       return nullptr;
+     }
+-    if (cudaMemset(xf + kXfEntries, 0, sizeof(uint4)) != cudaSuccess) {
++    if (cudaMemsetAsync(xf + kXfEntries, 0, sizeof(uint4), stream) != cudaSuccess) {
+       cudaFree(xf);
+       xf = nullptr;
+       return nullptr;
+     }
+   }
+   int entries = (m <= 8 ? 1 : 2) * (k / kTileK) * 8 * 32;
+-  pack_x<<<(entries + 255) / 256, 256>>>(x, xf, k, m, entries);
++  pack_x<<<(entries + 255) / 256, 256, 0, stream>>>(x, xf, k, m, entries);
+   return xf;
+ }
+
+@@ -197,35 +196,36 @@
+ }
+
+ // y[t * ldy + r] = (x W^T)[t][r] for packed tiles w and fragment-order xf of
+-// m <= 16 tokens; on the default stream. Returns the memset or launch status.
++// m <= 16 tokens; on `stream` (nullptr: default). Returns the memset or launch status.
+ template <class F>
+ cudaError_t launch_packed(int m, const uint4* w, const uint4* xf, float* y, int ldy,
+-                          int n_rows, int k) {
++                          int n_rows, int k, cudaStream_t stream = nullptr) {
+   int warps = n_rows / 8;
+   int split = split_k(warps, k / kTileK);
+   if (split > 1) {
+-    cudaError_t err = cudaMemset2DAsync(y, sizeof(float) * ldy, 0, sizeof(float) * n_rows, m);
++    cudaError_t err = cudaMemset2DAsync(y, sizeof(float) * ldy, 0, sizeof(float) * n_rows, m, stream);
+     if (err != cudaSuccess) return err;
+   }
+   dim3 grid((warps + kWarps - 1) / kWarps, split), block(kWarps * 32);
+   bool one = m <= 8;
+   if (one && split == 1)
+-    matmul<F, 1, false><<<grid, block>>>(w, xf, y, ldy, n_rows, k, m);
++    matmul<F, 1, false><<<grid, block, 0, stream>>>(w, xf, y, ldy, n_rows, k, m);
+   else if (one)
+-    matmul<F, 1, true><<<grid, block>>>(w, xf, y, ldy, n_rows, k, m);
++    matmul<F, 1, true><<<grid, block, 0, stream>>>(w, xf, y, ldy, n_rows, k, m);
+   else if (split == 1)
+-    matmul<F, 2, false><<<grid, block>>>(w, xf, y, ldy, n_rows, k, m);
++    matmul<F, 2, false><<<grid, block, 0, stream>>>(w, xf, y, ldy, n_rows, k, m);
+   else
+-    matmul<F, 2, true><<<grid, block>>>(w, xf, y, ldy, n_rows, k, m);
++    matmul<F, 2, true><<<grid, block, 0, stream>>>(w, xf, y, ldy, n_rows, k, m);
+   return cudaGetLastError();
+ }
+
+ // Bench entry: packs row-major x, then y is [m][n_rows].
+ template <class F>
+-cudaError_t launch(int m, const uint4* w, const __half* x, float* y, int n_rows, int k) {
+-  const uint4* xf = prepare_x(x, k, m);
++cudaError_t launch(int m, const uint4* w, const __half* x, float* y, int n_rows, int k,
++                   cudaStream_t stream = nullptr) {
++  const uint4* xf = prepare_x(x, k, m, stream);
+   if (!xf) return cudaErrorMemoryAllocation;
+-  return launch_packed<F>(m, w, xf, y, n_rows, n_rows, k);
++  return launch_packed<F>(m, w, xf, y, n_rows, n_rows, k, stream);
+ }
+
+ // Q4_K tile (1152 B, same as its 8 blocks): 8 row heads (fp16 d and dmin,

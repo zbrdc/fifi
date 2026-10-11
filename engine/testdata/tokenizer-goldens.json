@@ -1,0 +1,177 @@
+{
+  "schema": "p1-tokenizer-goldens-1",
+  "reference": {
+    "python": "3.12.14",
+    "transformers": "5.17.0",
+    "tokenizers": "0.23.2",
+    "jinja2": "3.1.6",
+    "model_dir": "/Users/dan/edge0/models/edge0-35b",
+    "files": {
+      "tokenizer.json": {
+        "bytes": 19989343,
+        "sha256": "87a7830d63fcf43bf241c3c5242e96e62dd3fdc29224ca26fed8ea333db72de4"
+      },
+      "tokenizer_config.json": {
+        "bytes": 1139,
+        "sha256": "e98f1901ac6f0adff67b1d540bfa0c36ac1a0cf59eb72ed78146ef89aafa1182"
+      },
+      "chat_template.jinja": {
+        "bytes": 7764,
+        "sha256": "e84f32a23fdda27689f868aa4a1a5621f41133e51a48d7f3efcbea2839574259"
+      }
+    },
+    "vocab_size": 248077,
+    "eos_token_id": 248046
+  },
+  "renders": [
+    {
+      "id": "system-user-default",
+      "thinking": "default",
+      "messages_json": "[{\"role\": \"system\", \"content\": \"You are terse.\"}, {\"role\": \"user\", \"content\": \"hi\"}]",
+      "tools_json": "[]",
+      "reference": "<|im_start|>system\nYou are terse.<|im_end|>\n<|im_start|>user\nhi<|im_end|>\n<|im_start|>assistant\n<think>\n",
+      "jinja": "<|im_start|>system\nYou are terse.<|im_end|>\n<|im_start|>user\nhi<|im_end|>\n<|im_start|>assistant\n<think>\n"
+    },
+    {
+      "id": "system-user-on",
+      "thinking": "on",
+      "messages_json": "[{\"role\": \"system\", \"content\": \"You are terse.\"}, {\"role\": \"user\", \"content\": \"hi\"}]",
+      "tools_json": "[]",
+      "reference": "<|im_start|>system\nYou are terse.<|im_end|>\n<|im_start|>user\nhi<|im_end|>\n<|im_start|>assistant\n<think>\n",
+      "jinja": "<|im_start|>system\nYou are terse.<|im_end|>\n<|im_start|>user\nhi<|im_end|>\n<|im_start|>assistant\n<think>\n"
+    },
+    {
+      "id": "system-user-off",
+      "thinking": "off",
+      "messages_json": "[{\"role\": \"system\", \"content\": \"You are terse.\"}, {\"role\": \"user\", \"content\": \"hi\"}]",
+      "tools_json": "[]",
+      "reference": "<|im_start|>system\nYou are terse.<|im_end|>\n<|im_start|>user\nhi<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n",
+      "jinja": "<|im_start|>system\nYou are terse.<|im_end|>\n<|im_start|>user\nhi<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n"
+    },
+    {
+      "id": "user-only-default",
+      "thinking": "default",
+      "messages_json": "[{\"role\": \"user\", \"content\": \"only this\"}]",
+      "tools_json": "[]",
+      "reference": "<|im_start|>user\nonly this<|im_end|>\n<|im_start|>assistant\n<think>\n",
+      "jinja": "<|im_start|>user\nonly this<|im_end|>\n<|im_start|>assistant\n<think>\n"
+    },
+    {
+      "id": "tool-conversation-default",
+      "thinking": "default",
+      "messages_json": "[{\"role\": \"user\", \"content\": \"Weather in Paris and the time there?\"}, {\"role\": \"assistant\", \"content\": null, \"tool_calls\": [{\"id\": \"call_1\", \"name\": \"get_weather\", \"arguments\": {\"city\": \"Paris\"}}, {\"id\": \"call_2\", \"name\": \"get_time\", \"arguments\": {\"zone\": \"Europe/Paris\"}}]}, {\"role\": \"tool\", \"content\": \"18 C\", \"tool_call_id\": \"call_1\"}, {\"role\": \"tool\", \"content\": \"14:30\", \"tool_call_id\": \"call_2\"}]",
+      "tools_json": "[{\"description\": \"Get the weather for a city.\", \"name\": \"get_weather\", \"parameters\": {\"properties\": {\"city\": {\"type\": \"string\"}}, \"required\": [\"city\"], \"type\": \"object\"}}, {\"description\": \"Get the local time for a zone.\", \"name\": \"get_time\", \"parameters\": {\"properties\": {\"zone\": {\"type\": \"string\"}}, \"required\": [\"zone\"], \"type\": \"object\"}}]",
+      "reference": "<|im_start|>system\n# Tools\n\nYou have access to the following functions:\n\n<tools>\n{\"description\": \"Get the weather for a city.\", \"name\": \"get_weather\", \"parameters\": {\"properties\": {\"city\": {\"type\": \"string\"}}, \"required\": [\"city\"], \"type\": \"object\"}}\n{\"description\": \"Get the local time for a zone.\", \"name\": \"get_time\", \"parameters\": {\"properties\": {\"zone\": {\"type\": \"string\"}}, \"required\": [\"zone\"], \"type\": \"object\"}}\n</tools>\n\nIf you choose to call a function ONLY reply in the following format with NO suffix:\n\n<tool_call>\n<function=example_function_name>\n<parameter=example_parameter_1>\nvalue_1\n</parameter>\n<parameter=example_parameter_2>\nThis is the value for the second parameter\nthat can span\nmultiple lines\n</parameter>\n</function>\n</tool_call>\n\n<IMPORTANT>\nReminder:\n- Function calls MUST follow the specified format: an inner <function=...></function> block must be nested within <tool_call></tool_call> XML tags\n- Required parameters MUST be specified\n- You may provide optional reasoning for your function call in natural language BEFORE the function call, but NOT after\n- If there is no function call available, answer the question like normal with your current knowledge and do not tell the user about function calls\n</IMPORTANT><|im_end|>\n<|im_start|>user\nWeather in Paris and the time there?<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n<tool_call>\n<function=get_weather>\n<parameter=city>\nParis\n</parameter>\n</function>\n</tool_call>\n<tool_call>\n<function=get_time>\n<parameter=zone>\nEurope/Paris\n</parameter>\n</function>\n</tool_call><|im_end|>\n<|im_start|>user\n<tool_response>\n18 C\n</tool_response>\n<tool_response>\n14:30\n</tool_response><|im_end|>\n<|im_start|>assistant\n<think>\n",
+      "jinja": "<|im_start|>system\n# Tools\n\nYou have access to the following functions:\n\n<tools>\n{\"description\": \"Get the weather for a city.\", \"name\": \"get_weather\", \"parameters\": {\"properties\": {\"city\": {\"type\": \"string\"}}, \"required\": [\"city\"], \"type\": \"object\"}}\n{\"description\": \"Get the local time for a zone.\", \"name\": \"get_time\", \"parameters\": {\"properties\": {\"zone\": {\"type\": \"string\"}}, \"required\": [\"zone\"], \"type\": \"object\"}}\n</tools>\n\nIf you choose to call a function ONLY reply in the following format with NO suffix:\n\n<tool_call>\n<function=example_function_name>\n<parameter=example_parameter_1>\nvalue_1\n</parameter>\n<parameter=example_parameter_2>\nThis is the value for the second parameter\nthat can span\nmultiple lines\n</parameter>\n</function>\n</tool_call>\n\n<IMPORTANT>\nReminder:\n- Function calls MUST follow the specified format: an inner <function=...></function> block must be nested within <tool_call></tool_call> XML tags\n- Required parameters MUST be specified\n- You may provide optional reasoning for your function call in natural language BEFORE the function call, but NOT after\n- If there is no function call available, answer the question like normal with your current knowledge and do not tell the user about function calls\n</IMPORTANT><|im_end|>\n<|im_start|>user\nWeather in Paris and the time there?<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n<tool_call>\n<function=get_weather>\n<parameter=city>\nParis\n</parameter>\n</function>\n</tool_call>\n<tool_call>\n<function=get_time>\n<parameter=zone>\nEurope/Paris\n</parameter>\n</function>\n</tool_call><|im_end|>\n<|im_start|>user\n<tool_response>\n18 C\n</tool_response>\n<tool_response>\n14:30\n</tool_response><|im_end|>\n<|im_start|>assistant\n<think>\n"
+    }
+  ],
+  "encodes": [
+    {
+      "id": "smoke",
+      "text": "Say hello in one short sentence.",
+      "ids": [
+        44240,
+        23066,
+        303,
+        799,
+        2716,
+        11316,
+        13
+      ]
+    },
+    {
+      "id": "ascii-code",
+      "text": "Write a Python function that adds two numbers.",
+      "ids": [
+        7734,
+        264,
+        12654,
+        709,
+        421,
+        11039,
+        1330,
+        4947,
+        13
+      ]
+    },
+    {
+      "id": "cjk-accented",
+      "text": "Translate to French: naïve café résumé 中文测试",
+      "ids": [
+        26583,
+        310,
+        8323,
+        25,
+        91603,
+        571,
+        50203,
+        238976,
+        220,
+        99986,
+        99449
+      ]
+    },
+    {
+      "id": "whitespace-runs",
+      "text": "line1\n\n  spaced \t tabbed\n",
+      "ids": [
+        1021,
+        16,
+        271,
+        220,
+        61674,
+        6800,
+        5474,
+        2634,
+        198
+      ]
+    },
+    {
+      "id": "special-token-literal",
+      "text": "The literal text <|im_start|> appears in data.",
+      "ids": [
+        760,
+        22419,
+        1414,
+        220,
+        248045,
+        7701,
+        303,
+        795,
+        13
+      ]
+    }
+  ],
+  "smoke": {
+    "text": "Say hello in one short sentence.",
+    "ids": [
+      44240,
+      23066,
+      303,
+      799,
+      2716,
+      11316,
+      13
+    ],
+    "prompt": "<|im_start|>user\nSay hello in one short sentence.<|im_end|>\n<|im_start|>assistant\n<think>\n",
+    "prompt_ids": [
+      248045,
+      846,
+      198,
+      44240,
+      23066,
+      303,
+      799,
+      2716,
+      11316,
+      13,
+      248046,
+      198,
+      248045,
+      74455,
+      198,
+      248068,
+      198
+    ]
+  }
+}

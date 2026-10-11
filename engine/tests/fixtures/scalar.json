@@ -1,0 +1,13 @@
+{
+  "producer": "safetensors.numpy.save",
+  "version": "0.8.0",
+  "numpy": "2.5.3",
+  "input": "answer = numpy.array(42, dtype=numpy.uint8)",
+  "sha256": "14de09435b7daf651b6bfbc7271ad443de5b4b4623f6e393e8fd476f7b34161b",
+  "file_bytes": 73,
+  "dtype": "U8",
+  "shape": [],
+  "payload": [
+    42
+  ]
+}
