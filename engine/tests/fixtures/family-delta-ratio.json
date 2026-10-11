@@ -386,7 +386,7 @@
   "moe_inter": 64,
   "shared_inter": 64
  },
- "producer": "/media/dan/nvme/fifi/scrch/3a141a6/p1-family-fixes/producer/make-family-delta-ratio-fixture.py",
+ "producer": "<scratch>/3a141a6/p1-family-fixes/producer/make-family-delta-ratio-fixture.py",
  "quantization": {
   "bits": 4,
   "group_size": 32,

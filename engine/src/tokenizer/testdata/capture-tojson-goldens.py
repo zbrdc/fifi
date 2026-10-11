@@ -188,7 +188,7 @@ def capture_filters(source_unused):
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--model-dir", default="/Users/dan/edge0/models/edge0-35b")
+    parser.add_argument("--model-dir", required=True)
     parser.add_argument("--output", required=True)
     args = parser.parse_args()
     model_dir = Path(args.model_dir)

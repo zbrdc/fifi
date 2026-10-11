@@ -97,7 +97,7 @@
    "output_sha256": "5b194816d0ee623985639620203d2d171c634791556454a15c6f0e3e11a67518",
    "fma_differing_elems": 0,
    "oracle_build": {
-    "host": "kubdan",
+    "host": "build-host",
     "os": "Ubuntu 25.10, Linux 6.17.0-41-generic x86_64",
     "compiler": "Ubuntu clang version 20.1.8 (0ubuntu4)",
     "info": [
@@ -634,7 +634,7 @@
    "byte_len": 1088,
    "data_start": 10989056,
    "oracle_build": {
-    "host": "kubdan",
+    "host": "build-host",
     "os": "Ubuntu 25.10, Linux 6.17.0-41-generic x86_64",
     "compiler": "Ubuntu clang version 20.1.8 (0ubuntu4)",
     "fixture_flags": "-O2 -ffp-contract=off"

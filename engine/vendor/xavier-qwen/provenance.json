@@ -1,6 +1,6 @@
 {
   "project": "xavier-qwen",
-  "source": "/home/dan/git/xavier-qwen (kubdan), exported with git archive",
+  "source": "the xavier-qwen repository on a build host, exported with git archive",
   "commit": "2f9183c1d99b7f459316f89b7dd9450ac7e8df66",
   "license": "MIT",
   "copyright": "Copyright (c) 2026 Dan Campos",

@@ -312,7 +312,7 @@ mod tests {
     fn a_listen_address_that_is_not_loopback_is_rejected() {
         for address in [
             "0.0.0.0:8100",
-            "192.168.1.5:8100",
+            "192.0.2.5:8100",
             "[::]:8100",
             "[2001:db8::1]:8100",
         ] {

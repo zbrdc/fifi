@@ -6,8 +6,8 @@
       "id": "q36",
       "family": "qwen3_6_35b_a3b",
       "model": "fifi-q36",
-      "model_dir": "/Users/dan/edge0/models/edge0-35b",
-      "tokenizer_dir": "/Users/dan/edge0/models/edge0-35b",
+      "model_dir": "/path/to/Qwen3.6-35B-A3B-mlx-int4",
+      "tokenizer_dir": "/path/to/Qwen3.6-35B-A3B-mlx-int4",
       "qwen36": {
         "cache_limit_bytes": 4294967296,
         "prefill_budget_bytes": 32212254720,

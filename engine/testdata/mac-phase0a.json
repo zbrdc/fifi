@@ -4,13 +4,13 @@
   "status": "done",
   "blocker": null,
   "base_commit": "751440c0192694830c449221b9ec2ff13a506828",
-  "ssh_target": "dan@192.168.0.16",
+  "ssh_target": "user@mac-host",
   "paths": {
-    "host_worktree": "/media/dan/nvme/fifi/wrktr/751440c/phase0a-environment",
-    "host_scratch": "/media/dan/nvme/fifi/scrch/751440c/phase0a-environment",
-    "mac_runner": "/Users/dan/fifi/wrktr/751440c/phase0a-environment",
-    "mac_scratch": "/Users/dan/fifi/scrch/751440c/phase0a-environment",
-    "mac_activation": "/Users/dan/fifi/scrch/751440c/phase0a-environment/activate.sh"
+    "host_worktree": "<host_worktree>",
+    "host_scratch": "<host_scratch>",
+    "mac_runner": "<mac_runner>",
+    "mac_scratch": "<mac_scratch>",
+    "mac_activation": "<mac_scratch>/activate.sh"
   },
   "hardware": {
     "model": "Mac16,9",
@@ -74,11 +74,11 @@
   },
   "installed_toolchain": {
     "paths": {
-      "TMPDIR": "/Users/dan/fifi/scrch/751440c/phase0a-environment/tmp",
-      "CARGO_HOME": "/Users/dan/fifi/scrch/751440c/phase0a-environment/cargo",
-      "RUSTUP_HOME": "/Users/dan/fifi/scrch/751440c/phase0a-environment/rustup",
-      "CARGO_TARGET_DIR": "/Users/dan/fifi/scrch/751440c/phase0a-environment/build",
-      "UV_CACHE_DIR": "/Users/dan/fifi/scrch/751440c/phase0a-environment/uv-cache"
+      "TMPDIR": "<mac_scratch>/tmp",
+      "CARGO_HOME": "<mac_scratch>/cargo",
+      "RUSTUP_HOME": "<mac_scratch>/rustup",
+      "CARGO_TARGET_DIR": "<mac_scratch>/build",
+      "UV_CACHE_DIR": "<mac_scratch>/uv-cache"
     },
     "versions": {
       "rustc": "rustc 1.98.1 (48a229cea 2026-09-01)\nbinary: rustc\ncommit-hash: 48a229ceaefd4985c50990b14116b6d856af0985\ncommit-date: 2026-09-01\nhost: aarch64-apple-darwin\nrelease: 1.98.1\nLLVM version: 22.1.8",
@@ -137,7 +137,7 @@
       "MLX_BUILD_ACCELERATE": "ON",
       "MLX_METAL_JIT": "OFF (upstream default)",
       "MACOSX_DEPLOYMENT_TARGET": "26.5",
-      "MLX_RS_METAL_PATH": "/Users/dan/fifi/scrch/751440c/phase0a-environment/metallib",
+      "MLX_RS_METAL_PATH": "<mac_scratch>/metallib",
       "enforcement": "Before the first native build, enforce the immutable native MLX commit rather than relying only on its mutable tag."
     }
   },
@@ -168,7 +168,7 @@
     }
   ],
   "checkpoint": {
-    "path": "/Users/dan/edge0/models/edge0-35b",
+    "path": "<model_dir>",
     "index_tensor_count": 1757,
     "base_weight_files": [
       "model-00001-of-00004.safetensors",
@@ -653,13 +653,13 @@
     }
   },
   "reference": {
-    "path": "/Users/dan/edge0",
+    "path": "<reference_checkout>",
     "revision": "cb50d47bfbe93246500279106074faa944cddd73",
     "branch": "kv-slices",
     "git_status": "?? models/",
     "packages": {
       "python": "3.12.14 (main, Sep  1 2026, 14:09:38) [Clang 22.1.3 ]",
-      "executable": "/Users/dan/edge0/.venv/bin/python",
+      "executable": "<reference_checkout>/.venv/bin/python",
       "packages": {
         "mlx": "0.30.6",
         "mlx-lm": "0.31.0",

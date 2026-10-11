@@ -832,7 +832,7 @@ mod tests {
     }
 
     // Reference values: the published SplitMix64 test vectors, and the same recurrence evaluated
-    // with 64-bit shell arithmetic (`/home/dan/fifi/scrch/ee264a3/server-packets/splitmix.sh`).
+    // with 64-bit shell arithmetic (`<scratch>/ee264a3/server-packets/splitmix.sh`).
     #[test]
     fn splitmix64_matches_the_reference_vectors_for_two_seeds() {
         let mut zero = SplitMix64::new(0);
@@ -909,8 +909,8 @@ mod tests {
         );
     }
 
-    /// The `generation_config.json` of the pinned edge0-35b checkpoint, quoted from the
-    /// coordinator's copy of `/Users/dan/edge0/models/edge0-35b/generation_config.json`.
+    /// The `generation_config.json` of the pinned checkpoint, quoted from the
+    /// coordinator's copy of `<model_dir>/generation_config.json`.
     const EDGE0_GENERATION_CONFIG: &str = r#"{
     "bos_token_id": 248044,
     "do_sample": true,

@@ -6,7 +6,7 @@
 //! which shares no kernel with MLX. mlx-lm is not involved. A Q36 result never satisfies Phase 0B or 1B.
 //!
 //! ```text
-//! Q36_CKPT_DIR=/Users/dan/edge0/models/edge0-35b Q36_REF_DIR=<copy of the evidence directory ref/> \
+//! Q36_CKPT_DIR=<model_dir> Q36_REF_DIR=<copy of the evidence directory ref/> \
 //!   Q36_OUT_DIR=<a path that does not exist yet> \
 //!   cargo test --release --features native-mlx,native-fault-qualification --lib \
 //!   family::qwen36::resident::parity -- --ignored --nocapture
@@ -36,7 +36,7 @@ use crate::{
     kernels::MlxKernels,
 };
 
-/// SHA-256 of the frozen evidence files (`/home/dan/fifi/scrch/4c35122c/q36-hr-mac/evidence/SHA256SUMS`).
+/// SHA-256 of the frozen evidence files (`<scratch>/4c35122c/q36-hr-mac/evidence/SHA256SUMS`).
 pub(super) const HOST_REF_JSON_SHA256: &str =
     "27acedbe149a50eab685299f3faa4202de0558689b681f383c19d2e16234a076";
 pub(super) const LAYERS_SHA256: &str =

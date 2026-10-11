@@ -5,7 +5,7 @@
     "version": "0.31.0",
     "home": "https://github.com/ml-explore/mlx-lm",
     "path_in_package": "mlx_lm/models/gated_delta.py",
-    "copied_from": "dan@192.168.0.16:/Users/dan/edge0/.venv/lib/python3.12/site-packages (installed wheel, read-only copy with scp)",
+    "copied_from": "the site-packages directory of an installed wheel on a Mac host (read-only copy with scp)",
     "wheel_record": "mlx_lm/models/gated_delta.py,sha256=PkRVKKzAH3vLDkSEfL27HO1pzoEhgID33XAXVOTe6FY,8044"
   },
   "license": "MIT",

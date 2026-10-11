@@ -37,7 +37,7 @@
 //!    after an 8,192-token prompt) with the prompt ids of the Q36-REF run.
 //!
 //! ```text
-//! Q36_CKPT_DIR=/Users/dan/edge0/models/edge0-35b Q36_OUT_DIR=<a path that does not exist yet> \
+//! Q36_CKPT_DIR=<model_dir> Q36_OUT_DIR=<a path that does not exist yet> \
 //!   cargo test --release --features native-mlx,native-fault-qualification --lib \
 //!   family::qwen36::resident::route_parity::device_routing_picks -- --ignored --nocapture
 //! Q36_CKPT_DIR=... Q36_PROMPT_IDS=<8,192 little-endian u32 ids> Q36_OUT_DIR=<new path> \

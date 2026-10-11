@@ -10,13 +10,13 @@ Ordinary tests read these local files and require no model download or Python in
 The malformed-file tests construct deliberately invalid headers directly.
 They do not call the loader to generate expected results.
 
-Producer and raw evidence: `/media/dan/nvme/fifi/scrch/751440c/phase0a-portable-loader/`.
+Producer and raw evidence: `<scratch>/751440c/phase0a-portable-loader/`.
 The arithmetic record (portable-loader-math.json, in the ledger) checks overflow and byte-count examples.
 
 `packed.safetensors` uses the same official `TensorSpec` serializer.
 It contains a `[2, 8]` U32 payload and `[2, 1]` BF16 scales and additive biases.
 Its manifest records affine int4, group size `64`, and logical shape `[2, 64]`.
-Producer: `/media/dan/nvme/fifi/scrch/751440c/phase0a-packed-weights/make-packed-fixture.py`.
+Producer: `<scratch>/751440c/phase0a-packed-weights/make-packed-fixture.py`.
 The packed constructor tests read this independent fixture without calling MLX.
 
 ## oQ metadata fixture
@@ -35,7 +35,7 @@ The producer uses `mlx.core.save_safetensors`. It does not call the Rust impleme
 The examples cover all six affine widths, all three group sizes, F16, BF16, F32, and both MXFP modes.
 MXFP scales retain their encoded U8 bytes. Affine examples include negative scales.
 The constructor checks storage and retains owners. These fixtures do not establish Rust unpacking or native numerical parity.
-Producer script: `/media/dan/nvme/fifi/scrch/567b92b/oq-weights/make-reference-fixtures.py`.
+Producer script: `<scratch>/567b92b/oq-weights/make-reference-fixtures.py`.
 Arithmetic evidence (oq-weights-math.json, in the ledger) records the additional size and overflow checks.
 
 ## Family layer-weight fixtures
@@ -53,7 +53,7 @@ so the producer writes the safetensors header and payload bytes manually from th
 per-tensor shapes and fill values, and artifact hashes.
 The tests derive expected shapes, widths, and metadata by hand from these manifest values, not from the Rust plan or resolver.
 The replaced fixture files are preserved with hashes under `evidence/original-fixtures/` in the task scratch.
-Producer script: `/media/dan/nvme/fifi/scrch/80b60ed/p1-weight-handoff/make-family-fixtures.py`.
+Producer script: `<scratch>/80b60ed/p1-weight-handoff/make-family-fixtures.py`.
 
 Four dtype-rejection fixtures keep the full geometry, names, shapes, and quantization
 of `family-full.safetensors` while changing exactly one declared storage dtype:
@@ -77,4 +77,4 @@ The default quantization is affine 4-bit, group size `32`, with no overrides.
 `family-delta-ratio.index.json` is the matching weight map.
 The local Python `safetensors` package, version `0.7.0`, deserializes the container and lists all 45 tensors.
 The manual writer follows the `family-fixtures` producer. No engine code generated these files.
-Producer script: `/media/dan/nvme/fifi/scrch/3a141a6/p1-family-fixes/producer/make-family-delta-ratio-fixture.py`.
+Producer script: `<scratch>/3a141a6/p1-family-fixes/producer/make-family-delta-ratio-fixture.py`.

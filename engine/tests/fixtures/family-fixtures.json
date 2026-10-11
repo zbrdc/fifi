@@ -4916,7 +4916,7 @@
     "moe_inter": 64,
     "shared_inter": 64
   },
-  "producer": "/media/dan/nvme/fifi/scrch/80b60ed/p1-weight-handoff/make-family-fixtures.py",
+  "producer": "<scratch>/80b60ed/p1-weight-handoff/make-family-fixtures.py",
   "quantization": {
     "bits": 4,
     "group_size": 32,

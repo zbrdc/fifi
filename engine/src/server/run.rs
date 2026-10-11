@@ -615,7 +615,7 @@ mod tests {
     fn the_start_line_quotes_the_file_and_the_effective_defaults() {
         let from_file = defaults_line(
             "q36",
-            std::path::Path::new("/m/edge0-35b/generation_config.json"),
+            std::path::Path::new("/m/model/generation_config.json"),
             &SamplingDefaults {
                 temperature: 1.0,
                 top_p: 0.95,
@@ -626,7 +626,7 @@ mod tests {
         assert_eq!(
             from_file,
             "engine q36: sampling defaults temperature 1, top_p 0.95, top_k 20 \
-             from /m/edge0-35b/generation_config.json"
+             from /m/model/generation_config.json"
         );
         let absent = defaults_line(
             "e1",

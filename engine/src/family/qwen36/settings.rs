@@ -29,7 +29,7 @@ pub(crate) const NO_BUDGET_PIECE: u32 = 16;
 /// The largest accepted prefill chunk.
 pub(crate) const MAX_PREFILL_CHUNK: u32 = 512;
 
-/// SHA-256 of the pinned files of `/Users/dan/edge0/models/edge0-35b`
+/// SHA-256 of the pinned files of `<model_dir>`
 /// (`engine/testdata/mac-phase0a.json`).
 const TOKENIZER_JSON_SHA256: &str =
     "87a7830d63fcf43bf241c3c5242e96e62dd3fdc29224ca26fed8ea333db72de4";

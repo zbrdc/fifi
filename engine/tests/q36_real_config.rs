@@ -1,6 +1,6 @@
 //! Checks the stepping-stone specification against the recorded real checkpoint.
 //!
-//! Source: `/Users/dan/edge0/models/edge0-35b` on the Mac (base shards only). The tests read the
+//! Source: `<model_dir>` on the Mac (base shards only). The tests read the
 //! committed `config.json` copy and the committed shard headers (the 8-byte prefix and the JSON
 //! header of each shard). They read no tensor data. Every expected number below comes from the
 //! shard headers, the index, and `config.json`, as recorded in the packet Q36-A. None comes from

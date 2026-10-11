@@ -9,7 +9,7 @@
 __pycache__/
 *.py[cod]
 
-# The ledger and process documents live in /home/dan/fifi/ledger/.
+# The ledger and process documents live in the internal ledger.
 /WORK_LOG.md
 /docs/
 /specs/

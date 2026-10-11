@@ -45,5 +45,5 @@ It is one trial and not a bound, and it does not describe the shipped `bf16` ent
 
 The API key comes from the variable `ENGINESRV_API_KEY`. The file holds no secret.
 The server listens on `127.0.0.1:18791`. The port must never be 8788.
-The model path is a Mac path. Change `model_dir` and `tokenizer_dir` together on another machine.
+The paths `model_dir` and `tokenizer_dir` in the file are placeholders. Set both to the directory of your Qwen3.6-35B-A3B checkpoint before you start the server.
 A Q36 result never satisfies Phase 0B or Phase 1B.

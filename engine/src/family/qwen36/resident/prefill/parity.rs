@@ -22,7 +22,7 @@
 //! Run each test alone with its own `Q36_OUT_DIR`, which is required and must not exist yet:
 //!
 //! ```text
-//! Q36_CKPT_DIR=/Users/dan/edge0/models/edge0-35b Q36_REF_DIR=<copy of the evidence directory ref/> \
+//! Q36_CKPT_DIR=<model_dir> Q36_REF_DIR=<copy of the evidence directory ref/> \
 //!   Q36_OUT_DIR=<a path that does not exist yet> \
 //!   cargo test --release --features native-mlx,native-fault-qualification --lib \
 //!   family::qwen36::resident::prefill::parity::<test name> -- --ignored --exact --nocapture

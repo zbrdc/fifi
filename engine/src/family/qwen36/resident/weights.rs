@@ -1079,7 +1079,7 @@ mod tests {
     }
 
     /// The pinned checkpoint, loaded the way the server loads it. Run on the Mac with
-    /// `Q36_CKPT_DIR=/Users/dan/edge0/models/edge0-35b` and `--ignored --nocapture`. Optional:
+    /// `Q36_CKPT_DIR=<model_dir>` and `--ignored --nocapture`. Optional:
     /// `Q36_OUT_DIR` (a path that does not exist yet) receives `load.json`.
     #[test]
     #[ignore = "needs the real checkpoint on the Mac; run with --ignored"]

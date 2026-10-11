@@ -43,13 +43,9 @@ fn file_digest(path: &PathBuf) -> [u8; 32] {
 }
 
 fn tokenizer_dir() -> Option<PathBuf> {
-    match std::env::var("INFERENCE_TOKENIZER_DIR") {
-        Ok(value) => Some(PathBuf::from(value)),
-        Err(_) => {
-            let default = PathBuf::from("/Users/dan/edge0/models/edge0-35b");
-            default.exists().then_some(default)
-        }
-    }
+    std::env::var("INFERENCE_TOKENIZER_DIR")
+        .ok()
+        .map(PathBuf::from)
 }
 
 fn pinned_bundle() -> Option<(PathBuf, TokenizerBundle)> {
@@ -70,7 +66,7 @@ fn pinned_bundle() -> Option<(PathBuf, TokenizerBundle)> {
 fn skip_without_pin() {
     if cfg!(all(target_os = "macos", target_arch = "aarch64")) {
         panic!(
-            "the Mac tokenizer qualification requires INFERENCE_TOKENIZER_DIR or the pinned model path"
+            "the Mac tokenizer qualification requires INFERENCE_TOKENIZER_DIR (the pinned model directory)"
         );
     }
     eprintln!("skip: INFERENCE_TOKENIZER_DIR is unavailable");

@@ -2,7 +2,7 @@
 //! needs the checkpoint on the Mac, uses the CPU only, and writes its evidence to `Q36_OUT_DIR`.
 //!
 //! ```text
-//! Q36_CKPT_DIR=/Users/dan/edge0/models/edge0-35b Q36_OUT_DIR=<a path that does not exist yet> \
+//! Q36_CKPT_DIR=<model_dir> Q36_OUT_DIR=<a path that does not exist yet> \
 //!   cargo test --release --lib family::qwen36::host_real -- --ignored --nocapture
 //! ```
 //! Optional: `Q36_PROMPT` (default `The capital of France is`), `Q36_GREEDY_TOKENS` (default 32),
