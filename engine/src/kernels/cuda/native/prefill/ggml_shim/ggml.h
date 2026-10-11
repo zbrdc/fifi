@@ -22,6 +22,21 @@ __host__ __device__ constexpr inline void ggml_unused_vars_impl(Args&&...) noexc
 
 #define GGML_PAD(x, n) (((x) + (n) - 1) & ~((n) - 1)) // derived; n must be a power of two
 
+// derived: copied verbatim from ggml/include/ggml.h at the pin (MATVEC-PAR S1 c1); the GLU switch
+// of the vendored mul_mat_vec_q kernels and the fusion struct name the op. Nothing else of the
+// upstream enum block is carried.
+enum ggml_glu_op {
+    GGML_GLU_OP_REGLU,
+    GGML_GLU_OP_GEGLU,
+    GGML_GLU_OP_SWIGLU,
+    GGML_GLU_OP_SWIGLU_OAI,
+    GGML_GLU_OP_GEGLU_ERF,
+    GGML_GLU_OP_GEGLU_QUICK,
+    GGML_GLU_OP_SWIGLU_CLAMP,
+
+    GGML_GLU_OP_COUNT,
+};
+
 // derived: copied verbatim modulo indentation (8 spaces became 4); the numbers are the GGUF tensor type ids
 enum ggml_type {
     GGML_TYPE_F32     = 0,

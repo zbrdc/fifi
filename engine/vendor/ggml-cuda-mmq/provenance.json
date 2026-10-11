@@ -4,7 +4,7 @@
   "commit": "acecd56032ddc34bada14a2d978f110d9c987095",
   "license": "MIT",
   "copyright": "Copyright (c) 2023-2026 The ggml authors",
-  "note": "CPF-V1 pure import: the include closure of the mmq instances q4_k, q5_0, q6_k, q8_0, quantize.cu and mmid.cu, byte identical to the pin; vendored_sha256 equals upstream_sha256 for every file and there is no patch. Shims are our glue (CPF-V2); sha256 null means not written yet. CPF-V2 patch V-2 (patches/V-2-errors.patch) follows the import, so the sentence above on the absence of a patch describes the CPF-V1 state; patched_sha256 is the file after the last patch of its chain. Patch V-3a (patches/V-3a-backend-machinery.patch) deletes the unused ggml backend machinery. Patch V-3b (patches/V-3b-stream-fixup-device-guard.patch) makes the fixup range and the device facts arguments and adds the typed host refusal fifi_check_device. Patch V-3c (patches/V-3c-pdl-off.patch) sets PDL off with one line. The three shims are written; their sha256 is recorded. Patch V-4 (patches/V-4-trim.patch) edits three files; ten whole files are removed and listed under trim with their upstream hashes (the pin holds their bytes).",
+  "note": "CPF-V1 pure import: the include closure of the mmq instances q4_k, q5_0, q6_k, q8_0, quantize.cu and mmid.cu, byte identical to the pin; vendored_sha256 equals upstream_sha256 for every file and there is no patch. Shims are our glue (CPF-V2); sha256 null means not written yet. CPF-V2 patch V-2 (patches/V-2-errors.patch) follows the import, so the sentence above on the absence of a patch describes the CPF-V1 state; patched_sha256 is the file after the last patch of its chain. Patch V-3a (patches/V-3a-backend-machinery.patch) deletes the unused ggml backend machinery. Patch V-3b (patches/V-3b-stream-fixup-device-guard.patch) makes the fixup range and the device facts arguments and adds the typed host refusal fifi_check_device. Patch V-3c (patches/V-3c-pdl-off.patch) sets PDL off with one line. The three shims are written; their sha256 is recorded. Patch V-4 (patches/V-4-trim.patch) edits three files; ten whole files are removed and listed under trim with their upstream hashes (the pin holds their bytes). MATVEC-PAR S1 c1: the MMVQ import (mmvq.cu, mmvq.cuh, byte identical to the pin) with a new unary.cuh shim (the four scalar GLU device helpers) and enum ggml_glu_op added to the ggml.h shim, so the untrimmed include of unary.cuh resolves. MATVEC-PAR S1 c2: patch V-MV1 (patches/V-MV1-mmvq.patch) trims the import to the device-only, error-returning form; final hashes in files.patched_sha256.",
   "include_roots": [
     "src/ggml-cuda",
     "src"
@@ -30,6 +30,18 @@
       "upstream_path": "ggml/src/ggml-cuda/mma.cuh",
       "upstream_sha256": "c7e0f3332da182e203b4b953f9fa8535ffca3767d2b7d4d7dbf7ce486262d1af",
       "vendored_sha256": "c7e0f3332da182e203b4b953f9fa8535ffca3767d2b7d4d7dbf7ce486262d1af"
+    },
+    "src/ggml-cuda/mmvq.cu": {
+      "upstream_path": "ggml/src/ggml-cuda/mmvq.cu",
+      "upstream_sha256": "d4c70f68ab79d463fd6fd52cac66a62e915858397ba4b2b7f658a7fbf13121f3",
+      "vendored_sha256": "d4c70f68ab79d463fd6fd52cac66a62e915858397ba4b2b7f658a7fbf13121f3",
+      "patched_sha256": "8ffa0a71dd8e9a0ca1931f455d007d1e0a0f9190d9ba6a9c649598e4d6a82d9d"
+    },
+    "src/ggml-cuda/mmvq.cuh": {
+      "upstream_path": "ggml/src/ggml-cuda/mmvq.cuh",
+      "upstream_sha256": "b37f8359f519ba90ddecd9cb3ca5f8c2ae05685bfae6813d435d75763c2bb006",
+      "vendored_sha256": "b37f8359f519ba90ddecd9cb3ca5f8c2ae05685bfae6813d435d75763c2bb006",
+      "patched_sha256": "d10e0201283eff3bbbe6e2d9f3cfc813a7af507547f55f79ad6359520e49d317"
     },
     "src/ggml-cuda/mmid.cu": {
       "upstream_path": "ggml/src/ggml-cuda/mmid.cu",
@@ -208,6 +220,21 @@
           "after_sha256": "fab32d8bac8cbcf0201511c1afdd6b75597715ff3adee59ae84fdf10a3a0e5c7"
         }
       }
+    },
+    {
+      "id": "V-MV1",
+      "description": "Trim mmvq to a device-only, error-returning MMVQ for Q4_K, Q5_0, Q6_K and Q8_0 (MATVEC-PAR S1): the ggml_tensor host entries are removed and replaced by fifi_mmvq_launch over fifi_mmvq_args (device facts from the caller, V-3b pattern); every assert and abort on the launch path returns cudaErrorInvalidValue or cudaErrorNotSupported and ggml_cuda_kernel_launch results are returned; the type switch keeps only the four formats; the ids path guards the per-slot expert id against the stack range and writes a quiet NaN for an out-of-range id, reading no weight (KUBDAN-MSG-62 A1); ggml_cuda_mm_fusion_args_device is restored into mmvq.cuh; no PDL; the dense-view fastdiv precondition is checked only when ids is null (the ids path passes zeros, and fastdiv_valid(0) is false); fifi_mmvq_launch also refuses ncols_x < 1 and an ids launch with more than one column (the multi-column ids kernel is not wrapped in S1)",
+      "diff": "patches/V-MV1-mmvq.patch",
+      "files": {
+        "src/ggml-cuda/mmvq.cu": {
+          "before_sha256": "d4c70f68ab79d463fd6fd52cac66a62e915858397ba4b2b7f658a7fbf13121f3",
+          "after_sha256": "8ffa0a71dd8e9a0ca1931f455d007d1e0a0f9190d9ba6a9c649598e4d6a82d9d"
+        },
+        "src/ggml-cuda/mmvq.cuh": {
+          "before_sha256": "b37f8359f519ba90ddecd9cb3ca5f8c2ae05685bfae6813d435d75763c2bb006",
+          "after_sha256": "d10e0201283eff3bbbe6e2d9f3cfc813a7af507547f55f79ad6359520e49d317"
+        }
+      }
     }
   ],
   "shims": [
@@ -216,7 +243,7 @@
       "stands_in_for": "ggml/include/ggml.h",
       "upstream_sha256": "9ac7ee3d3a957e5f7b21b104d3e3dc50b1b106f808f9d6735ead950450bfeec6",
       "path": "../../src/kernels/cuda/native/prefill/ggml_shim/ggml.h",
-      "sha256": "6992f82969fcc01127e3f100615558969532d650369dc08e10c0ed87407f214c",
+      "sha256": "1671ed3077506a2bf2c657f1d88a0d4127f8d7bedf00a623596612391fc25b1f",
       "included_by": [
         "src/ggml-cuda/common.cuh"
       ]
@@ -240,9 +267,19 @@
       "included_by": [
         "src/ggml-cuda/common.cuh"
       ]
+    },
+    {
+      "include": "unary.cuh",
+      "stands_in_for": "ggml/src/ggml-cuda/unary.cuh",
+      "upstream_sha256": "a6903bb02577a33b79c738e62e425867f9122d1b4981a3b228062b4f978b2858",
+      "path": "../../src/kernels/cuda/native/prefill/ggml_shim/unary.cuh",
+      "sha256": "7e092c635294ceabbedfbfa0c0eda03fdf4c362e4d2b4157668f292a8d6129d2",
+      "included_by": [
+        "src/ggml-cuda/mmvq.cu"
+      ]
     }
   ],
-  "import_file_count": 29,
+  "import_file_count": 31,
   "trim": {
     "removed_files": {
       "src/ggml-cuda/mmq-config-blackwell.cuh": {

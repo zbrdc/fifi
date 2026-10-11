@@ -74,6 +74,20 @@ const CUDA_SOURCES: &[&str] = &[
     "src/kernels/cuda/native/resident/moe_combine.cu",
     "src/kernels/cuda/native/resident/swiglu_pack.cu",
     "src/kernels/cuda/native/resident/add_norm_pack.cu",
+    "src/kernels/cuda/native/resident/quantize_q8_1.cu",
+    "src/kernels/cuda/native/resident/matvec_q.cu",
+    "src/kernels/cuda/native/resident/matvec_expert.cu",
+    "src/kernels/cuda/native/resident/mmvq_arch.cu",
+];
+
+/// The vendored llama.cpp MMQ sources that compile to objects (MATVEC-PAR S1 c2b). Decision 0049
+/// item 5 prescribes their build group: `-use_fast_math --extended-lambda` like the llama.cpp
+/// oracle, warnings tolerated (an accepted exception to E1, KUBDAN-MSG-27/28, extended to these
+/// two objects by KUBDAN-MSG-62 A4), no cuBLAS. A new vendored `.cu` goes here, not at the end of
+/// `CUDA_SOURCES`; the recorded exception is this list.
+const MMQ_VENDOR_SOURCES: &[&str] = &[
+    "vendor/ggml-cuda-mmq/src/ggml-cuda/mmvq.cu",
+    "vendor/ggml-cuda-mmq/src/ggml-cuda/quantize.cu",
 ];
 /// Headers whose change reruns the build, one path per line, alphabetical. A resident kernel
 /// adds its `native/resident/<n>.h` here.
@@ -82,6 +96,10 @@ const CUDA_HEADERS: &[&str] = &[
     "src/kernels/cuda/native/abi_device.h",
     "src/kernels/cuda/native/abi_resident.h",
     "src/kernels/cuda/native/device.h",
+    "src/kernels/cuda/native/prefill/ggml_shim/ggml-cuda.h",
+    "src/kernels/cuda/native/prefill/ggml_shim/ggml-impl.h",
+    "src/kernels/cuda/native/prefill/ggml_shim/ggml.h",
+    "src/kernels/cuda/native/prefill/ggml_shim/unary.cuh",
     "src/kernels/cuda/native/resident/add_norm_pack.h",
     "src/kernels/cuda/native/resident/attn_decode.h",
     "src/kernels/cuda/native/resident/attn_prep.h",
@@ -91,10 +109,26 @@ const CUDA_HEADERS: &[&str] = &[
     "src/kernels/cuda/native/resident/graph.h",
     "src/kernels/cuda/native/resident/matmul_expert.h",
     "src/kernels/cuda/native/resident/matmul_q5_0.h",
+    "src/kernels/cuda/native/resident/matvec_expert.h",
+    "src/kernels/cuda/native/resident/matvec_q.h",
+    "src/kernels/cuda/native/resident/mmvq_arch.h",
     "src/kernels/cuda/native/resident/moe_combine.h",
+    "src/kernels/cuda/native/resident/quantize_q8_1.h",
     "src/kernels/cuda/native/resident/router.h",
     "src/kernels/cuda/native/resident/step_params.h",
     "src/kernels/cuda/native/resident/swiglu_pack.h",
+    "vendor/ggml-cuda-mmq/src/ggml-common.h",
+    "vendor/ggml-cuda-mmq/src/ggml-cuda/common.cuh",
+    "vendor/ggml-cuda-mmq/src/ggml-cuda/mma.cuh",
+    "vendor/ggml-cuda-mmq/src/ggml-cuda/mmq-config-ampere.cuh",
+    "vendor/ggml-cuda-mmq/src/ggml-cuda/mmq-config-pascal-dp4a.cuh",
+    "vendor/ggml-cuda-mmq/src/ggml-cuda/mmq-load-tiles.cuh",
+    "vendor/ggml-cuda-mmq/src/ggml-cuda/mmq-vec-dot.cuh",
+    "vendor/ggml-cuda-mmq/src/ggml-cuda/mmq.cuh",
+    "vendor/ggml-cuda-mmq/src/ggml-cuda/mmvq.cuh",
+    "vendor/ggml-cuda-mmq/src/ggml-cuda/quantize.cuh",
+    "vendor/ggml-cuda-mmq/src/ggml-cuda/vecdotq.cuh",
+    "vendor/ggml-cuda-mmq/src/ggml-cuda/vendors/cuda.h",
     "vendor/xavier-qwen/src/frag_layout.cuh",
     "vendor/xavier-qwen/src/gemm.cuh",
     "vendor/xavier-qwen/src/kernels.h",
@@ -123,7 +157,11 @@ fn build_cuda() {
     for name in nvcc_env_names() {
         println!("cargo:rerun-if-env-changed={name}");
     }
-    for path in CUDA_SOURCES.iter().chain(CUDA_HEADERS.iter()) {
+    for path in CUDA_SOURCES
+        .iter()
+        .chain(MMQ_VENDOR_SOURCES.iter())
+        .chain(CUDA_HEADERS.iter())
+    {
         println!("cargo:rerun-if-changed={path}");
     }
     let toolkit = CudaToolkit::locate();
@@ -136,6 +174,12 @@ fn build_cuda() {
         .cudart("none")
         .include("src/kernels/cuda/native")
         .include("vendor/xavier-qwen/src")
+        // The vendored MMQ tree and the ggml shims its headers resolve through (MATVEC-PAR S1
+        // c2b). No file name of these roots shadows one of the two roots above, so the include
+        // order of the existing objects is unchanged.
+        .include("vendor/ggml-cuda-mmq/src")
+        .include("vendor/ggml-cuda-mmq/src/ggml-cuda")
+        .include("src/kernels/cuda/native/prefill/ggml_shim")
         .files(CUDA_SOURCES)
         .warnings_into_errors(true);
     // The fault entry points exist only in builds that qualify fault handling.
@@ -159,10 +203,65 @@ fn build_cuda() {
             .flag(format!("arch=compute_{newest},code=compute_{newest}"));
     }
     build.compile("inference_cuda_native");
+    build_mmq_vendor(&archs);
     // Static archives resolve left to right, so the runtime must follow the
     // adapter archive on the link line; the Xavier lib-test link failed with
     // undefined cudart symbols when it came first.
     toolkit.link_static_cudart();
+}
+
+/// Builds the vendored MMQ objects (decision 0049 item 5, MATVEC-PAR S1 c2b, KUBDAN-MSG-62 A4):
+/// `-use_fast_math --extended-lambda` like the llama.cpp oracle, warnings tolerated, no cuBLAS.
+/// The archive is compiled after `inference_cuda_native`, so glue that calls
+/// `fifi_mmvq_launch`/`quantize_row_q8_1_cuda` resolves against it (link order glue, then
+/// vendor). `__CUDA_ARCH_LIST__` rides in a generated header taken with `-include`: nvcc splits
+/// comma-valued `-D` when it forwards them to the host compiler, so the define cannot go on the
+/// command line (checked with nvcc 12.2).
+fn build_mmq_vendor(archs: &[String]) {
+    let out_dir = std::env::var("OUT_DIR").expect("cargo sets OUT_DIR");
+    let arch_list = archs
+        .iter()
+        .map(|arch| {
+            let sm: u32 = arch.parse().unwrap_or_else(|error| {
+                panic!("INFERENCE_CUDA_ARCHS entry {arch:?} is not a decimal SM number: {error}")
+            });
+            format!("{}", sm * 10)
+        })
+        .collect::<Vec<_>>()
+        .join(",");
+    let arch_header = std::path::Path::new(&out_dir).join("fifi_cuda_arch_list.h");
+    std::fs::write(
+        &arch_header,
+        format!("#define __CUDA_ARCH_LIST__ {arch_list}\n"),
+    )
+    .unwrap_or_else(|error| panic!("cannot write {}: {error}", arch_header.display()));
+    let mut vendor = cc::Build::new();
+    vendor
+        .cuda(true)
+        .cudart("none")
+        .include("vendor/ggml-cuda-mmq/src")
+        .include("vendor/ggml-cuda-mmq/src/ggml-cuda")
+        .include("src/kernels/cuda/native/prefill/ggml_shim")
+        .files(MMQ_VENDOR_SOURCES)
+        .flag("-use_fast_math")
+        .flag("--extended-lambda")
+        .flag("-include")
+        .flag(arch_header.to_str().expect("OUT_DIR is UTF-8"));
+    for arch in archs {
+        vendor
+            .flag("-gencode")
+            .flag(format!("arch=compute_{arch},code=sm_{arch}"));
+    }
+    // PTX for the newest listed arch lets a newer GPU (sm_89) JIT the vendored kernels.
+    if let Some(newest) = archs
+        .iter()
+        .max_by_key(|arch| arch.parse::<u32>().unwrap_or(0))
+    {
+        vendor
+            .flag("-gencode")
+            .flag(format!("arch=compute_{newest},code=compute_{newest}"));
+    }
+    vendor.compile("ggml_cuda_mmq_vendor");
 }
 
 /// One CUDA toolkit: the `nvcc` that compiles and the root whose runtime links.
