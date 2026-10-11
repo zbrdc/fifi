@@ -3,11 +3,12 @@
 `qwen36-mac-studio-36gb.json` is the `enginesrv` config for the Qwen3.6-35B-A3B stepping stone on the 36 GB Mac Studio.
 It states `activation_dtype: "bf16"` (the default).
 The chunk path of the prefill is dtype aware (slice Q36-BF16-b) and the budget and reserve members below are what its planner needs, and they stay.
-TEMPORARY BF16 POLICY: the file leaves `prefill_chunk` absent, and the engine default of `prefill_chunk` is 1 for a BF16 engine (256 for an `f32` engine; `BF16_DEFAULT_PREFILL_CHUNK` in `engine/src/family/qwen36/settings.rs`).
-A chunk of 1 plans no chunk: the prompt runs one token at a time, as before slice Q36-BF16-b, and the start-up line says so.
-The reason is an open finding (Q36-BF16-SENS): on the 922-token tool prompt the BF16 chunked prefill gives a format-token probability of 0.0426 at chunk 16 and 0.998 at chunk 256 (token by token: 0.9994), and the reference mlx-lm itself varies with the chunk size in BF16 (0.72 to 0.9999 over 13 sizes) but never loses the top token.
-To use the chunked prefill with BF16 before the finding is closed, set `prefill_chunk` explicitly (at your own risk for tool calls); the prefill is about 40% faster with the sorted expert products (Q36-PF-SORTED) than before.
-Lifting the policy is a one-line change of the constant.
+BF16 PREFILL POLICY: the file leaves `prefill_chunk` absent, and the engine default of `prefill_chunk` is 256 for a BF16 engine and for an `f32` engine (`BF16_DEFAULT_PREFILL_CHUNK` in `engine/src/family/qwen36/settings.rs`).
+Slice Q36-BF16-b had set the BF16 default to 1 (no chunked prefill) while the finding Q36-BF16-SENS was open. Decision 0046 A6 item 11 (amendment of 2026-10-11) lifted that policy.
+The finding: on the 922-token tool prompt the BF16 format-token probability depends on the chunk size, in fifi and in the reference mlx-lm (mlx-lm: 0.72 to 0.9999 over 13 chunk sizes, and the top token never changes).
+The serving shapes measure inside the mlx-lm range. Chunk 256 gives 0.9969 (token by token: 0.9994). The tails of 8, 20, 40, 60, 100, 150 and 300 tokens after a 256-token head give 0.9968, 0.9962, 0.9970, 0.9788, 0.9558, 0.9788 and 0.9986. The format token is the top token in each case.
+Smaller chunks of 4 to 100 rows give lower values on this prompt. The planner picks them only when the budget leaves no room for 256 rows. The broad tool-call eval (Q36-BF16-EVAL) confirms or reverses the default.
+To run BF16 prompts one token at a time, set `prefill_chunk` to 1. A chunk of 1 plans no chunk, and the start-up line says so.
 
 ## Activation dtype
 

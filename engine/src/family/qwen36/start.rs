@@ -77,7 +77,7 @@ pub(super) fn plan_prefill(
             format!("q36 prefill: chunk of {rows} rows planned (largest {max_rows}); {terms}")
         }
         None if max_rows == 1 => format!(
-            "q36 prefill: the largest chunk is 1 (prefill_chunk; the BF16 default until Q36-BF16-SENS, set prefill_chunk to enable the chunked prefill); prompts run one token at a time; {terms}"
+            "q36 prefill: the largest chunk is 1 (prefill_chunk); prompts run one token at a time; {terms}"
         ),
         None => format!(
             "q36 prefill: no chunk above one token fits (largest {max_rows}); prompts run one token at a time; {terms}"

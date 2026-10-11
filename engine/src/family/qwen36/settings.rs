@@ -21,12 +21,13 @@ pub(crate) const DEFAULT_SESSION_CAP: u64 = 2 << 30;
 /// the worker piece (`ExecutorOps::prefill_piece`). Without a plan, or when the plan admits no
 /// chunk, the piece is `NO_BUDGET_PIECE`.
 pub(crate) const DEFAULT_PREFILL_CHUNK: u32 = 256;
-/// Temporary BF16 serving policy (decision 0046 A6 item 11, fix 5 of packet Q36-BF16-b): the
-/// default chunk of a BF16 engine is 1, i.e. no chunked prefill, until Q36-BF16-SENS has a cause
-/// or a bound for the chunk-size dependence of the BF16 prefill (the format-token probability of
-/// the 922-token tool prompt is 0.0426 at chunk 16 and 0.998 at chunk 256). Lifting the policy
-/// is a one-line change of this constant. An explicit `prefill_chunk` in the config always wins.
-pub(crate) const BF16_DEFAULT_PREFILL_CHUNK: u32 = 1;
+/// The default chunk of a BF16 engine (decision 0046 A6 item 11, amendment of 2026-10-11): 256,
+/// the same as an F32 engine. Fix 5 of packet Q36-BF16-b had pinned it to 1 (no chunked prefill)
+/// while the chunk-size dependence of the BF16 prefill was open; the serving shapes (chunk 256 and
+/// the tails after a 256 head) measured inside the range of mlx-lm, and the pin cost about 14x on
+/// prompt speed. The constant stays separate so that a re-pin is a one-line change. An explicit
+/// `prefill_chunk` in the config always wins.
+pub(crate) const BF16_DEFAULT_PREFILL_CHUNK: u32 = 256;
 /// The fallback worker piece for an executor that plans no chunk: no budget, or a plan that admits
 /// none. The executor then runs one token per step.
 /// The worker checks the cancel flag only between pieces. At about 62 tok/s, a piece of 16 waits
@@ -58,8 +59,7 @@ pub(crate) struct Q36Options {
     /// The bytes of cache growth that the engine admits. The default is 2 GiB.
     pub(crate) session_cap_bytes: Option<u64>,
     /// The prompt tokens per `prefill` call, from 1 to 512. The default is 256 for an F32 engine and
-    /// 1 (no chunked prefill) for a BF16 engine (`BF16_DEFAULT_PREFILL_CHUNK`, a temporary policy
-    /// until Q36-BF16-SENS has a cause or a bound). It is the largest
+    /// for a BF16 engine (`BF16_DEFAULT_PREFILL_CHUNK`). It is the largest
     /// chunk that the planner may choose; the worker piece is the planned chunk, or 16
     /// (`NO_BUDGET_PIECE`) when no chunk is planned: no budget, or a budget that admits none.
     pub(crate) prefill_chunk: Option<u32>,
@@ -547,7 +547,7 @@ mod tests {
                 cache_limit: 1024,
                 context_limit: 32_768,
                 session_cap: 2 << 30,
-                prefill_chunk: 1,
+                prefill_chunk: 256,
                 prefill_budget: None,
                 prefill_reserve: 0,
                 activation: super::Activation::Bf16,
@@ -556,7 +556,7 @@ mod tests {
         assert_eq!(DEFAULT_CONTEXT_LIMIT, 32_768);
         assert_eq!(DEFAULT_SESSION_CAP, 2_147_483_648);
         assert_eq!(DEFAULT_PREFILL_CHUNK, 256);
-        assert_eq!(BF16_DEFAULT_PREFILL_CHUNK, 1);
+        assert_eq!(BF16_DEFAULT_PREFILL_CHUNK, 256);
         assert_eq!(NO_BUDGET_PIECE, 16);
         // The reserve of `config/qwen36-mac-studio-36gb.json` is a plan sum (see its README).
         assert_eq!(32_768u64 * 40_960, 1_342_177_280);
@@ -566,9 +566,9 @@ mod tests {
         );
     }
 
-    /// Temporary BF16 serving policy (fix 5 of packet Q36-BF16-b): without a `prefill_chunk` the
-    /// default chunk of a BF16 engine is 1 (no chunked prefill) and that of an F32 engine is 256;
-    /// an explicit `prefill_chunk` wins for both. The shipped config leaves the member absent.
+    /// BF16 serving policy (decision 0046 A6 item 11, amendment of 2026-10-11): without a
+    /// `prefill_chunk` the default chunk is 256 for a BF16 engine and for an F32 engine; an
+    /// explicit `prefill_chunk` wins for both. The shipped config leaves the member absent.
     #[test]
     fn the_default_chunk_depends_on_the_activation_and_an_explicit_chunk_wins() {
         let bf16 = settings(Some(&with_limit()), &Q36Env::default()).unwrap();
@@ -577,10 +577,7 @@ mod tests {
             super::Activation::Bf16,
             "the default activation"
         );
-        assert_eq!(
-            bf16.prefill_chunk, 1,
-            "BF16 default: no chunked prefill (temporary policy)"
-        );
+        assert_eq!(bf16.prefill_chunk, 256, "BF16 default: the chunk of F32");
         let f32 = Q36Options {
             activation_dtype: Some("f32".to_string()),
             ..with_limit()

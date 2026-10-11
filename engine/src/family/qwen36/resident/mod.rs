@@ -113,8 +113,7 @@ mod within_mode {
     /// The floor of the BF16 logits cosine of gate 2 (chunk against one-token steps): 0.98. The
     /// lowest value over seven BF16 samples of the slice b gate (64 to 1000 tokens, chunks 32 to
     /// 256) is 0.9901, so the margin is about 0.01. PROVISIONAL (git-db, 2026-10-11): the sample
-    /// is thin, BF16 serving stays pinned to no chunked prefill, and the floor is re-derived
-    /// after Q36-BF16-SENS.
+    /// is thin and the floor is re-derived after the broad format-token eval (Q36-BF16-EVAL).
     pub(super) const BF16_LOGITS_COSINE_FLOOR: f64 = 0.98;
 
     /// True for the LOGITS row of gate 2 under `activation`: as `within_mode_passes` for the F32
