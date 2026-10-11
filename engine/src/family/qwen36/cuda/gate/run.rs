@@ -34,7 +34,7 @@ use crate::{
                 resources::StepResources,
                 rules::QwenRules,
                 run_report::CaptureOutcome,
-                step::QwenResidentStep,
+                step::{CaptureConfig, QwenResidentStep},
             },
             host::HostShape,
             settings::tokenizer_pin,
@@ -141,13 +141,14 @@ fn row_values(bytes: &[u8]) -> Vec<f32> {
 
 /// The per-run capture flags from the step's own outcome, never the setting: only a captured
 /// run says `captured` and had a graph before the timed region; Eager with graph mode requested
-/// never ran the mode at all (RD-11a absent), which stops the call.
+/// never ran the mode at all (the capture setting did not reach the step), which stops the call.
 fn capture_flags(outcome: CaptureOutcome, requested: bool) -> Result<(bool, bool), EngError> {
     match outcome {
         CaptureOutcome::Captured => Ok((true, true)),
         CaptureOutcome::RefusedFellBackToEager => Ok((false, false)),
         CaptureOutcome::Eager if requested => Err(bad(
-            "graph mode never ran: the step reports an eager outcome (RD-11a absent)",
+            "graph mode never ran: the step reports an eager outcome although capture was \
+             requested (the capture setting did not reach the step)",
         )),
         CaptureOutcome::Eager => Ok((false, false)),
     }
@@ -241,7 +242,8 @@ fn rules_from_bundle(
 
 /// The resident step over the loaded weights and the rules built from the tokenizer bundle
 /// BEFORE any device work (KUBDAN-MSG-56; Q-M7: same bundle, no constants). `tokenizer_pin`
-/// checked the bundle's digests when it was loaded.
+/// checked the bundle's digests when it was loaded. The gate's capture setting is handed to
+/// the step here, before its first token, so a graph-mode call actually captures.
 fn build_step<'a>(
     projector: &'a CudaProjector,
     res: &'a StepResources,
@@ -249,13 +251,15 @@ fn build_step<'a>(
     rules: QwenRules,
     s: &GateSettings,
 ) -> Result<QwenResidentStep<'a>, EngError> {
-    QwenResidentStep::new(
+    let mut step = QwenResidentStep::new(
         projector.context(),
         res,
         weights,
         &session_options(s)?,
         rules,
-    )
+    )?;
+    step.set_capture_config(CaptureConfig { capture: s.capture })?;
+    Ok(step)
 }
 
 /// The per-prompt inputs of the timed runs (`check_settings` has agreed the lists).
@@ -641,7 +645,59 @@ mod tests {
             capture_flags(CaptureOutcome::Eager, false),
             Ok((false, false))
         );
-        assert!(capture_flags(CaptureOutcome::Eager, true).is_err());
+        // The STOP of a graph-mode run that stayed eager: the merged step exists, so the text
+        // must name the real failure (the setting never reached the step), not an absent
+        // packet.
+        match capture_flags(CaptureOutcome::Eager, true) {
+            Err(EngError::BadRequest(message)) => {
+                assert!(
+                    !message.contains("RD-11a"),
+                    "the STOP text still names RD-11a after the merge: {message}"
+                );
+                assert!(
+                    message.contains("capture was requested"),
+                    "the STOP text does not say capture was requested: {message}"
+                );
+            }
+            other => panic!("Eager with capture requested is a STOP, not {other:?}"),
+        }
+    }
+
+    #[test]
+    fn build_step_hands_the_capture_setting_to_the_step() {
+        // The step cannot run on the CPU, so the wiring is pinned on this file's own text
+        // (the c17 style): comments are stripped and whitespace is removed entirely, so only
+        // the real call with its `?` matches, and a comment or a dead spelling cannot.
+        let body = code_only(fn_section("fn build_step"))
+            .split_whitespace()
+            .collect::<String>();
+        let length = body.len();
+        let call = body
+            .find("set_capture_config(CaptureConfig{capture:s.capture})?")
+            .unwrap_or_else(|| {
+                panic!("build_step ({length} bytes) never hands the setting to the step")
+            });
+        let built = body
+            .find("QwenResidentStep::new(")
+            .unwrap_or_else(|| panic!("build_step ({length} bytes) never constructs the step"));
+        let returned = body
+            .rfind("Ok(")
+            .unwrap_or_else(|| panic!("build_step ({length} bytes) never returns the step"));
+        assert!(
+            built < call && call < returned,
+            "the capture setting ({call}) must travel after construction ({built}) and before \
+             the return ({returned})"
+        );
+        for wrong in [
+            "capture:false",
+            "CaptureConfig::default",
+            "capture:!s.capture",
+        ] {
+            assert!(
+                !body.contains(wrong),
+                "build_step ({length} bytes) carries the wrong capture spelling {wrong}"
+            );
+        }
     }
 
     #[test]
