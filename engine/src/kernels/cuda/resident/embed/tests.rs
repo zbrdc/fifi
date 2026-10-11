@@ -7,15 +7,18 @@
 //! test reads an oracle file or an environment variable. The device tests assume
 //! `--test-threads=1` (decision 0040).
 
-use super::{EMBED_MAX_TOKENS, EmbedCall, check_host_ids, check_shape, embed_x_bytes};
+use super::{
+    EMBED_MAX_TOKENS, EmbedCall, EmbedNativeCall, check_host_ids, check_native_shape, check_shape,
+    embed_x_bytes, native_blocks_bytes,
+};
 use crate::EngError;
 use crate::kernels::cuda::resident::step_params::{
     OFFSET_STATUS, OFFSET_TOKEN_ID, StepParams, StepStatus,
 };
 use crate::kernels::cuda::testkit::{self, Rng};
 use crate::kernels::cuda::{
-    CHUNK_LIMIT, CapturePlan, CudaContext, DeviceBuffer, DeviceRange, DeviceStream, QuantTensor,
-    TiledWeight,
+    CHUNK_LIMIT, CapturePlan, CudaContext, DeviceBuffer, DeviceRange, DeviceStream, NativeWeight,
+    QuantTensor, TiledWeight,
 };
 use crate::weights::{GgufType, dequantize};
 
@@ -717,6 +720,481 @@ fn embed_is_deterministic() {
             assert_eq!(seen[0], seen[1], "{ty:?} {ids:?}: two launches differ");
         }
     }
+}
+
+// --- MATVEC-PAR S2 c3: the native Q4_K gather -----------------------------------
+
+/// Uploads a Q4_K table's source blocks natively: the bytes land as the file holds them.
+fn native_table(ctx: &CudaContext, n_rows: usize, k: usize, source: &[u8]) -> NativeWeight {
+    let tensor = QuantTensor {
+        name: "embed table",
+        ty: GgufType::Q4K,
+        n_rows,
+        k,
+        source_len: source.len(),
+    };
+    ctx.upload_native(tensor, CHUNK_LIMIT, &mut |at, buf| {
+        buf.copy_from_slice(&source[at..at + buf.len()]);
+        Ok(())
+    })
+    .expect("upload the native table")
+}
+
+impl Rig {
+    /// The native twin of `gather`: queues one native gather and returns its rows and the
+    /// status word, guards included.
+    fn gather_native(
+        &self,
+        k: usize,
+        weight: &NativeWeight,
+        ids: &[i32],
+        init: i32,
+    ) -> (Vec<f32>, i32) {
+        let ids_bytes: Vec<u8> = ids.iter().flat_map(|id| id.to_le_bytes()).collect();
+        let ids_buf = testkit::upload_bytes(&self.ctx, &ids_bytes);
+        let status = testkit::upload_filled(&self.ctx, 0x55, 12);
+        status
+            .write_at(&self.stream, 4, &init.to_le_bytes())
+            .expect("preset");
+        let x_buf = self.x_buffer(ids.len(), k);
+        let bytes = embed_x_bytes(ids.len(), k).expect("size");
+        let call = EmbedNativeCall {
+            weight,
+            ids: ids_buf.range(0, ids_bytes.len()).expect("ids"),
+            x: x_buf.range(GUARD_BYTES, bytes).expect("x"),
+            status: status.range(4, 4).expect("status"),
+            m: ids.len(),
+        };
+        self.ctx
+            .embed_native(&self.stream, call)
+            .expect("queue the native gather");
+        self.stream.synchronize().expect("drain the native gather");
+        let all = testkit::read_bytes(&self.ctx, &x_buf, bytes + 2 * GUARD_BYTES);
+        assert!(
+            all[..GUARD_BYTES]
+                .iter()
+                .chain(&all[GUARD_BYTES + bytes..])
+                .all(|&b| b == 0x55),
+            "a byte outside the rows of x changed"
+        );
+        let word = testkit::read_bytes(&self.ctx, &status, 12);
+        assert!(
+            word[..4].iter().chain(&word[8..]).all(|&b| b == 0x55),
+            "a status guard changed"
+        );
+        (
+            testkit::floats(&all[GUARD_BYTES..GUARD_BYTES + bytes]),
+            i32::from_le_bytes([word[4], word[5], word[6], word[7]]),
+        )
+    }
+}
+
+#[test]
+fn embed_native_is_bit_equal_to_the_tiled_gather() {
+    const NAME: &str = "embed_native_is_bit_equal_to_the_tiled_gather";
+    if !testkit::device_present(NAME) {
+        return;
+    }
+    let rig = Rig::new();
+    let mut rng = Rng::new(0x524e_3233);
+    for shape in [(64, 256), (520, 768), (4096, 2048), (8, 32768)] {
+        let table = Table::new(
+            &rig.ctx,
+            GgufType::Q4K,
+            shape,
+            Scales::Mixed,
+            rng.next_u64(),
+        );
+        let native = native_table(&rig.ctx, table.n_rows, table.k, &table.source);
+        let last = table.n_rows as i32 - 1;
+        // ids 0, 7, 8, 9 and the last row cross every 8-row tile-group boundary the tiled
+        // kernel indexes; a middle id fills the gap.
+        let ids: Vec<i32> = [0, 7, 8, 9, table.n_rows as i32 / 2, last]
+            .into_iter()
+            .filter(|&id| id <= last)
+            .collect();
+        let (tiled_x, tiled_status) = rig.gather(&table, &ids, 0);
+        let (native_x, native_status) = rig.gather_native(table.k, &native, &ids, 0);
+        assert_eq!(native_status, tiled_status, "the status words differ");
+        for (t, (&a, &b)) in tiled_x.iter().zip(&native_x).enumerate() {
+            assert_eq!(a.to_bits(), b.to_bits(), "{NAME}: row {t} of {ids:?}");
+        }
+        let (count, ratio) = check_rows(&table, &ids, &native_x, "native");
+        assert_eq!(count, ids.len() * table.k);
+        assert!(ratio <= RATIO_BOUND, "{NAME}: ratio {ratio}");
+        // The bad-id probe of the tiled twin: negative, both bounds of the table, both i32
+        // extremes, at status init 0 and 1. The kernel guard `id >= 0 && id < n_rows`
+        // (embed.cu) is the only check these ids meet - the wrapper cannot see device ids -
+        // and a dropped or loosened `id < n_rows` would read up to 144 B per block PAST the
+        // table on n_rows / n_rows + 1 / i32::MAX, and a dropped `id >= 0` on i32::MIN:
+        // those rows must be NaN instead, and bit 4 must OR into both status inits.
+        let n = i32::try_from(table.n_rows).expect("small");
+        let probe = [0, -1, n, n + 1, i32::MAX, i32::MIN, last];
+        for init in [0, 1] {
+            let (bad_x, bad_status) = rig.gather_native(table.k, &native, &probe, init);
+            assert_eq!(bad_status, init | 4, "{NAME}: the bad ids must OR bit 4");
+            for (t, &id) in probe.iter().enumerate() {
+                let row = &bad_x[t * table.k..(t + 1) * table.k];
+                if (0..n).contains(&id) {
+                    let cpu = table.cpu_row(usize::try_from(id).expect("a valid id"));
+                    assert!(
+                        row.iter()
+                            .zip(&cpu)
+                            .all(|(&a, &b)| a.to_bits() == b.to_bits()),
+                        "{NAME}: valid id {id} of the probe"
+                    );
+                } else {
+                    assert!(
+                        row.iter().all(|&v| v.to_bits() == NAN_BITS),
+                        "{NAME}: the row of bad id {id} must be NaN"
+                    );
+                }
+            }
+        }
+    }
+    // A table of 13 rows, which no 8-row tile group holds, gathers natively against the CPU
+    // dequantizer (the tiled kernel cannot run it at all).
+    let (n_rows, k) = (13, 256);
+    let mut source: Vec<u8> = (0..n_rows * k / 256 * 144)
+        .map(|_| rng.next_u64().to_le_bytes()[4])
+        .collect();
+    for one in source.as_chunks_mut::<144>().0 {
+        one[0..2].copy_from_slice(&half_bits(&mut rng, Scales::Mixed).to_le_bytes());
+        one[2..4].copy_from_slice(&half_bits(&mut rng, Scales::Mixed).to_le_bytes());
+    }
+    let native = native_table(&rig.ctx, n_rows, k, &source);
+    let ids = [0, 6, 7, 8, 9, n_rows as i32 - 1];
+    let (x, status) = rig.gather_native(k, &native, &ids, 0);
+    assert_eq!(status, 0);
+    for (t, &id) in ids.iter().enumerate() {
+        let row = &x[t * k..(t + 1) * k];
+        let id = usize::try_from(id).expect("a valid id");
+        let cpu =
+            dequantize(GgufType::Q4K, &source[id * 144..(id + 1) * 144]).expect("dequantize a row");
+        assert!(
+            row.iter()
+                .zip(&cpu)
+                .all(|(&a, &b)| a.to_bits() == b.to_bits()),
+            "{NAME}: odd table row {id}"
+        );
+    }
+}
+
+#[test]
+fn the_native_gather_takes_only_q4_k_blocks() {
+    const NAME: &str = "the_native_gather_takes_only_q4_k_blocks";
+    if !testkit::device_present(NAME) {
+        return;
+    }
+    let rig = Rig::new();
+    // A Q8_0 native table is refused by the wrapper before any launch.
+    let weight = q8_0_native(&rig.ctx);
+    let k = weight.k();
+    let ids_buf = testkit::upload_bytes(&rig.ctx, &1i32.to_le_bytes());
+    let status = testkit::upload_filled(&rig.ctx, 0x55, 8);
+    let x = rig.x_buffer(1, k);
+    let call = EmbedNativeCall {
+        weight: &weight,
+        ids: ids_buf.range(0, 4).expect("ids"),
+        x: x.range(GUARD_BYTES, 4 * k).expect("x"),
+        status: status.range(4, 4).expect("status"),
+        m: 1,
+    };
+    let error = rig
+        .ctx
+        .embed_native(&rig.stream, call)
+        .expect_err("Q8_0 is refused");
+    let text = format!("{error:?}");
+    assert!(
+        text.contains("BadRequest") && text.contains("takes Q4_K blocks"),
+        "{NAME}: {text}"
+    );
+}
+
+/// A Q8_0 native weight of 8 rows: a type the native gather refuses before any launch
+/// (the twin of `q5_0_weight` above).
+fn q8_0_native(ctx: &CudaContext) -> NativeWeight {
+    let source = vec![0_u8; 8 * 16 * 34];
+    let tensor = QuantTensor {
+        name: "q8_0",
+        ty: GgufType::Q80,
+        n_rows: 8,
+        k: 512,
+        source_len: source.len(),
+    };
+    ctx.upload_native(tensor, CHUNK_LIMIT, &mut |at, buf| {
+        buf.copy_from_slice(&source[at..at + buf.len()]);
+        Ok(())
+    })
+    .expect("upload the Q8_0 native weight")
+}
+
+/// A Q4_K native weight of 8 rows marked as a 4-expert stack: the gather refuses it (an
+/// embedding table is a plain matrix; KUBDAN-MSG-68 item 7).
+fn native_stack(ctx: &CudaContext) -> NativeWeight {
+    let source = vec![0_u8; 8 * 2 * 144];
+    let tensor = QuantTensor {
+        name: "stack",
+        ty: GgufType::Q4K,
+        n_rows: 8,
+        k: 512,
+        source_len: source.len(),
+    };
+    ctx.upload_native(tensor, CHUNK_LIMIT, &mut |at, buf| {
+        buf.copy_from_slice(&source[at..at + buf.len()]);
+        Ok(())
+    })
+    .expect("upload the stack")
+    .with_experts(Some(4))
+}
+
+#[test]
+fn native_shape_and_blocks_bytes_rules_need_no_device() {
+    // `check_native_shape` has no 8-row rule: one row and 12 rows are gather shapes, and
+    // the bound is inclusive at 2^28 rows (KUBDAN-MSG-68 item 6; the tiled twin refuses
+    // 12 rows and stops at a multiple of 8).
+    check_native_shape(1, 256).expect("one row");
+    check_native_shape(12, 256).expect("12 rows: no 8-row rule");
+    check_native_shape(1 << 28, 256).expect("the largest table");
+    for (rows, k) in [
+        (0, 256),
+        ((1 << 28) + 1, 256),
+        (8, 0),
+        (8, 100),
+        (8, 300),
+        (8, 33_024),
+    ] {
+        assert_bad_request(
+            check_native_shape(rows, k),
+            &format!("{rows} x {k}"),
+            &[&rows.to_string(), &k.to_string()],
+        );
+    }
+    // `native_blocks_bytes`: 144 bytes per 256 values, and the size refuses to overflow.
+    assert_eq!(
+        native_blocks_bytes(8, 256).expect("one block per row"),
+        8 * 144
+    );
+    assert_eq!(
+        native_blocks_bytes(64, 512).expect("the fixture table"),
+        64 * 2 * 144
+    );
+    assert!(
+        matches!(
+            native_blocks_bytes(usize::MAX, 32_768),
+            Err(EngError::BadRequest(message)) if message.contains("table size overflows")
+        ),
+        "the largest row count must refuse to overflow"
+    );
+}
+
+#[test]
+fn embed_native_rejects_bad_calls_before_any_launch() {
+    const NAME: &str = "embed_native_rejects_bad_calls_before_any_launch";
+    if !testkit::device_present(NAME) {
+        return;
+    }
+    let rig = Rig::new();
+    let other_ctx = CudaContext::new().expect("second context");
+    let table = Table::new(&rig.ctx, GgufType::Q4K, (64, 512), Scales::Mixed, 0x4c0a);
+    let native = native_table(&rig.ctx, table.n_rows, table.k, &table.source);
+    let q8 = q8_0_native(&rig.ctx);
+    let stack = native_stack(&rig.ctx);
+    let ints: Vec<u8> = (1..=4100_i32).flat_map(i32::to_le_bytes).collect();
+    let big = 4 * 4097 * 512 + 64;
+    let buffers = [
+        testkit::upload_bytes(&rig.ctx, &ints),
+        testkit::upload_filled(&rig.ctx, 0x55, big),
+        testkit::upload_filled(&rig.ctx, 0x66, 16),
+        testkit::upload_filled(&rig.ctx, 0x77, 8192),
+    ];
+    let [ids, x, status, shared] = &buffers;
+    let (other_ids, other_stream) = (
+        testkit::upload_bytes(&other_ctx, &ints),
+        other_ctx.stream().expect("stream"),
+    );
+    let snapshot = || {
+        buffers
+            .each_ref()
+            .map(|b| testkit::fnv1a64(&testkit::read_bytes(&rig.ctx, b, b.bytes())))
+    };
+    let before = snapshot();
+    let w = &native;
+    // Every case reaches its OWN guard of `plan_embed_native` with every earlier check
+    // satisfied (the S2b lesson): the three ranges resolve first, the type second, then the
+    // m range, the ids/x/status fits and alignments in order, and the five overlap checks.
+    let try_call = |weight: &NativeWeight,
+                    m,
+                    ids: DeviceRange<'_>,
+                    x: DeviceRange<'_>,
+                    status: DeviceRange<'_>,
+                    stream: &DeviceStream| {
+        rig.ctx.embed_native(
+            stream,
+            EmbedNativeCall {
+                weight,
+                ids,
+                x,
+                status,
+                m,
+            },
+        )
+    };
+    let (ids_ok, x_ok, st_ok) = (at(ids, 0, 8), at(x, 0, 4096), at(status, 0, 4));
+    let s = &rig.stream;
+    type Case<'a> = (&'a str, &'a [&'a str], &'a dyn Fn() -> Result<(), EngError>);
+    let cases: [Case<'_>; 17] = [
+        ("m 0", &["1 to 4096 tokens", "got 0"], &|| {
+            try_call(w, 0, ids_ok, x_ok, st_ok, s)
+        }),
+        ("m 4097", &["got 4097"], &|| {
+            try_call(
+                w,
+                4097,
+                at(ids, 0, 16_388),
+                at(x, 0, 4 * 4097 * 512),
+                st_ok,
+                s,
+            )
+        }),
+        ("Q8_0 weight", &["takes Q4_K blocks", "Q80"], &|| {
+            try_call(&q8, 2, ids_ok, x_ok, st_ok, s)
+        }),
+        (
+            "expert stack weight",
+            &["takes a plain matrix", "stack of 4 experts"],
+            &|| try_call(&stack, 2, ids_ok, x_ok, st_ok, s),
+        ),
+        (
+            "ids one int short",
+            &["ids range holds 4 bytes", "needs 8"],
+            &|| try_call(w, 2, at(ids, 0, 4), x_ok, st_ok, s),
+        ),
+        (
+            "ids misaligned",
+            &["ids range starts at offset 2", "multiple of 4"],
+            &|| try_call(w, 2, at(ids, 2, 8), x_ok, st_ok, s),
+        ),
+        (
+            "x one float short",
+            &["x range holds 4092", "needs 4096"],
+            &|| try_call(w, 2, ids_ok, at(x, 0, 4092), st_ok, s),
+        ),
+        (
+            "x misaligned",
+            &["x range starts at offset 4", "multiple of 16"],
+            &|| try_call(w, 2, ids_ok, at(x, 4, 4096), st_ok, s),
+        ),
+        (
+            "status short",
+            &["status range holds 2", "needs 4"],
+            &|| try_call(w, 2, ids_ok, x_ok, at(status, 0, 2), s),
+        ),
+        (
+            "status misaligned",
+            &["status range starts at offset 2"],
+            &|| try_call(w, 2, ids_ok, x_ok, at(status, 2, 4), s),
+        ),
+        ("x over ids", &["x and ids ranges overlap"], &|| {
+            try_call(w, 2, at(shared, 256, 8), at(shared, 0, 4096), st_ok, s)
+        }),
+        (
+            "x over the blocks",
+            &["x and blocks ranges overlap"],
+            &|| try_call(w, 2, ids_ok, at(w.buffer(), 0, 4096), st_ok, s),
+        ),
+        ("status over x", &["x and status ranges overlap"], &|| {
+            try_call(w, 2, ids_ok, at(shared, 0, 4096), at(shared, 8, 4), s)
+        }),
+        (
+            "status over ids",
+            &["status and ids ranges overlap"],
+            &|| try_call(w, 2, at(shared, 0, 8), x_ok, at(shared, 4, 4), s),
+        ),
+        (
+            "status over the blocks",
+            &["status and blocks ranges overlap"],
+            &|| try_call(w, 2, ids_ok, x_ok, at(w.buffer(), 64, 4), s),
+        ),
+        (
+            "stream of another context",
+            &["stream belongs to another adapter"],
+            &|| try_call(w, 2, ids_ok, x_ok, st_ok, &other_stream),
+        ),
+        (
+            "ids of another context",
+            &["buffer belongs to another adapter"],
+            &|| try_call(w, 2, at(&other_ids, 0, 8), x_ok, st_ok, s),
+        ),
+    ];
+    for (case, needle, call) in cases {
+        assert_bad_request(call(), case, needle);
+        assert_eq!(
+            snapshot(),
+            before,
+            "{case}: a refused call changed a buffer"
+        );
+    }
+    // Accepted controls: an ids range longer than 4 m, a status range of 8 bytes, and a
+    // gather that still runs after the refusals.
+    try_call(w, 2, at(ids, 0, 16), x_ok, at(status, 0, 8), s)
+        .expect("longer ids and status ranges");
+    s.synchronize().expect("drain the controls");
+    let (rows, status_word) = rig.gather_native(table.k, &native, &[7, 8], 0);
+    let (count, _) = check_rows(&table, &[7, 8], &rows, "after the refusals");
+    assert_eq!(count, 2 * table.k);
+    assert_eq!(status_word, 0);
+}
+
+#[test]
+fn native_gather_is_deterministic_and_takes_one_token() {
+    const NAME: &str = "native_gather_is_deterministic_and_takes_one_token";
+    if !testkit::device_present(NAME) {
+        return;
+    }
+    let rig = Rig::new();
+    let table = Table::new(&rig.ctx, GgufType::Q4K, (64, 512), Scales::Mixed, 0x4c0b);
+    let native = native_table(&rig.ctx, table.n_rows, table.k, &table.source);
+    // The twin of `embed_is_deterministic`: two launches of the same ids, the second into an
+    // x refilled with 0xFF, agree on every byte of x (guards included) and the status word.
+    for ids in [vec![5, 63, 0, 17, 5, 5], vec![5, -1, 63, 64, 0, i32::MIN]] {
+        let ids_bytes: Vec<u8> = ids.iter().flat_map(|id| id.to_le_bytes()).collect();
+        let ids_buf = testkit::upload_bytes(&rig.ctx, &ids_bytes);
+        let x_buf = rig.x_buffer(ids.len(), table.k);
+        let bytes = embed_x_bytes(ids.len(), table.k).expect("size");
+        let mut seen = Vec::new();
+        for round in 0..2 {
+            if round == 1 {
+                x_buf
+                    .write_at(&rig.stream, GUARD_BYTES, &vec![0xFF; bytes])
+                    .expect("refill");
+            }
+            let status = testkit::upload_bytes(&rig.ctx, &0_i32.to_le_bytes());
+            let call = EmbedNativeCall {
+                weight: &native,
+                ids: ids_buf.range(0, ids_bytes.len()).expect("ids"),
+                x: x_buf.range(GUARD_BYTES, bytes).expect("x"),
+                status: status.range(0, 4).expect("status"),
+                m: ids.len(),
+            };
+            rig.ctx
+                .embed_native(&rig.stream, call)
+                .expect("queue the native gather");
+            rig.stream.synchronize().expect("drain the native gather");
+            let all = testkit::read_bytes(&rig.ctx, &x_buf, x_buf.bytes());
+            seen.push((
+                testkit::fnv1a64(&all),
+                testkit::read_bytes(&rig.ctx, &status, 4),
+            ));
+        }
+        assert_eq!(seen[0], seen[1], "{NAME} {ids:?}: two launches differ");
+    }
+    // m 1: the resident step's first token is one block of one thread group; the row
+    // matches the CPU dequantizer bit for bit.
+    let (rows, status) = rig.gather_native(table.k, &native, &[9], 0);
+    assert_eq!(status, 0, "{NAME}");
+    let (count, _) = check_rows(&table, &[9], &rows, "native m 1");
+    assert_eq!(count, table.k, "{NAME}");
 }
 
 // ---------------------------------------------------------------- T6 (RD-11a)

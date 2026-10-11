@@ -35,9 +35,12 @@ use std::ffi::c_int;
 
 use crate::EngError;
 use crate::kernels::cuda::context::{Claim, require_apart, require_fit};
-use crate::kernels::cuda::native::resident::embed::{EmbedRaw, embed_launch};
+use crate::kernels::cuda::native::resident::embed::{
+    EmbedNativeRaw, EmbedRaw, embed_launch, embed_native_launch,
+};
 use crate::kernels::cuda::native::{TileVec, Tiled, TiledType};
-use crate::kernels::cuda::{CudaContext, DeviceRange, DeviceStream, TiledWeight};
+use crate::kernels::cuda::resident::matvec_q::QuantType;
+use crate::kernels::cuda::{CudaContext, DeviceRange, DeviceStream, NativeWeight, TiledWeight};
 
 /// The most tokens one gather takes.
 pub(crate) const EMBED_MAX_TOKENS: usize = 4096;
@@ -93,8 +96,49 @@ pub(crate) fn check_host_ids(ids: &[i32], n_rows: usize) -> Result<(), EngError>
     }
 }
 
+/// The table, the token ids, the output rows and the step status word of one gather against
+/// the file's own Q4_K blocks (MATVEC-PAR S2 c3): bitwise equal to [`EmbedCall`] on the same
+/// weights, for readers that hold a [`NativeWeight`]. The table is a PLAIN matrix: a
+/// rank-3 stack (`experts() == Some(_)`) is refused. The ids are read when the kernel runs,
+/// as in [`EmbedCall`].
+pub(crate) struct EmbedNativeCall<'b> {
+    /// The native token embedding, Q4_K.
+    pub(crate) weight: &'b NativeWeight,
+    /// `m` device ints, read when the kernel runs (4-byte offset, at least `4 m` bytes).
+    pub(crate) ids: DeviceRange<'b>,
+    /// `m` rows of `k` floats, written in full (16-byte offset, at least `4 m k` bytes).
+    pub(crate) x: DeviceRange<'b>,
+    /// The step status word (4-byte offset, at least 4 bytes); a bad id ORs bit 4 into it.
+    pub(crate) status: DeviceRange<'b>,
+    /// Tokens: `1..=EMBED_MAX_TOKENS`.
+    pub(crate) m: usize,
+}
+
+/// `BadRequest` unless the native table is a gather shape: `n_rows` any count in
+/// `1..=2^28` (no 8-row rule: the file's rows are what they are) and `k` a multiple of 256
+/// in `256..=32768`.
+fn check_native_shape(n_rows: usize, k: usize) -> Result<(), EngError> {
+    let rows_ok = (1..=EMBED_MAX_ROWS).contains(&n_rows);
+    let k_ok = (256..=EMBED_MAX_K).contains(&k) && k.is_multiple_of(256);
+    if rows_ok && k_ok {
+        return Ok(());
+    }
+    Err(EngError::BadRequest(format!(
+        "the CUDA native embedding gather needs rows from 1 up to {EMBED_MAX_ROWS} and k as a \
+         multiple of 256 up to {EMBED_MAX_K}, got {n_rows} rows of {k}"
+    )))
+}
+
+/// Bytes of the native blocks of the table: `weight_bytes` of `QuantType::Q4K` (`n_rows`
+/// rows of `k / 256` blocks of 144 bytes).
+fn native_blocks_bytes(n_rows: usize, k: usize) -> Result<usize, EngError> {
+    QuantType::Q4K
+        .weight_bytes(n_rows, k)
+        .ok_or_else(|| EngError::BadRequest("the CUDA embedding table size overflows".to_owned()))
+}
+
 impl CudaContext {
-    /// Queues the gather of rows `ids[0..m]` of the table into `call.x` on `stream`.
+    /// Queues the gather of rows `ids[0..m]` of the tiled table into `call.x` on `stream`.
     ///
     /// Returns `BadRequest` for a stream or buffer of another adapter, for a table that is not
     /// Q4_K or Q8_0 or not a gather shape, for `m` outside `1..=4096`, for an `ids`, `x` or
@@ -105,6 +149,82 @@ impl CudaContext {
         self.ensure_usable()?;
         let raw = self.plan_embed(&call)?;
         self.launch_on(stream, |stream_raw| embed_launch(stream_raw, &raw))
+    }
+
+    /// Queues the native Q4_K gather of `call` on `stream`, bitwise equal to [`Self::embed`]
+    /// on the same weights.
+    ///
+    /// Returns `BadRequest` for a stream or buffer of another adapter, for a table that is not
+    /// Q4_K or not a native gather shape, for a stack rather than a plain matrix, for `m`
+    /// outside `1..=4096`, for an `ids`, `x` or `status` range that is short or misaligned,
+    /// and for an `x` or `status` that overlaps another range of the call. A bad id on the
+    /// device writes a NaN row and sets status bit 4, as in [`Self::embed`].
+    pub(crate) fn embed_native(
+        &self,
+        stream: &DeviceStream,
+        call: EmbedNativeCall<'_>,
+    ) -> Result<(), EngError> {
+        self.ensure_usable()?;
+        let raw = self.plan_embed_native(&call)?;
+        self.launch_on(stream, |stream_raw| embed_native_launch(stream_raw, &raw))
+    }
+
+    /// Every check of a native gather, then the native view of its ranges.
+    fn plan_embed_native<'b>(
+        &self,
+        call: &EmbedNativeCall<'b>,
+    ) -> Result<EmbedNativeRaw<'b>, EngError> {
+        let (ids_raw, x_raw, status_raw) = (
+            self.raw_range(&call.ids)?,
+            self.raw_range(&call.x)?,
+            self.raw_range(&call.status)?,
+        );
+        let (k, n_rows) = (call.weight.k(), call.weight.n_rows());
+        if call.weight.quant() != QuantType::Q4K {
+            return Err(EngError::BadRequest(format!(
+                "the CUDA native embedding gather takes Q4_K blocks, got {:?}",
+                call.weight.quant()
+            )));
+        }
+        if let Some(experts) = call.weight.experts() {
+            return Err(EngError::BadRequest(format!(
+                "the CUDA native embedding gather takes a plain matrix, got a stack of \
+                 {experts} experts"
+            )));
+        }
+        check_native_shape(n_rows, k)?;
+        if !(1..=EMBED_MAX_TOKENS).contains(&call.m) {
+            return Err(EngError::BadRequest(format!(
+                "the CUDA embedding gather takes 1 to {EMBED_MAX_TOKENS} tokens, got {}",
+                call.m
+            )));
+        }
+        let blocks_bytes = native_blocks_bytes(n_rows, k)?;
+        let blocks = call.weight.buffer().range(0, blocks_bytes)?;
+        let blocks_raw = self.raw_range(&blocks)?;
+        let x_need = embed_x_bytes(call.m, k)?;
+        let ids_need = call.m * size_of::<i32>();
+        require_fit("ids", &call.ids, ids_need, size_of::<i32>())?;
+        require_fit("x", &call.x, x_need, 16)?;
+        require_fit("status", &call.status, size_of::<i32>(), size_of::<i32>())?;
+        let x = Claim::of("x", &call.x, x_need);
+        let status = Claim::of("status", &call.status, size_of::<i32>());
+        let ids = Claim::of("ids", &call.ids, ids_need);
+        let blocks_claim = Claim::of("blocks", &blocks, blocks_bytes);
+        require_apart(&x, &ids)?;
+        require_apart(&x, &blocks_claim)?;
+        require_apart(&x, &status)?;
+        require_apart(&status, &ids)?;
+        require_apart(&status, &blocks_claim)?;
+        Ok(EmbedNativeRaw {
+            blocks: blocks_raw,
+            ids: ids_raw,
+            x: x_raw,
+            status: status_raw,
+            m: c_int_of("m", call.m)?,
+            n_rows: c_int_of("rows", n_rows)?,
+            k: c_int_of("k", k)?,
+        })
     }
 
     /// Every check of a gather, then the native view of its ranges.

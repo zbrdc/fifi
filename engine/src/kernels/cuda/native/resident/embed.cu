@@ -162,6 +162,56 @@ __global__ void __launch_bounds__(kQ8Threads)
     }
 }
 
+/* MATVEC-PAR S2: the same Q4_K gather against the file's own blocks (row-major, one block of
+ * 144 bytes per 256 values: d, dmin, 12 scale bytes, then 128 qs bytes). A row of k values is
+ * k / 256 consecutive blocks, so block ib of row id starts at uint4 index (id * nb + ib) * 9 and
+ * every uint4 load is aligned (144 is a multiple of 16 and the base is 16-byte aligned). One
+ * thread owns the same (block, quadpair qp, half h) unit as the tiled kernel: head = block[0]
+ * (d, dmin and the 12 scale bytes, byte for byte the tile head) and qs = block[1 + 2 * qp + h]
+ * (qs bytes 32 qp + 16 h .. +15 of the block; the low nibbles are columns 64 qp + 16 h + l, the
+ * high nibbles 64 qp + 32 + 16 h + l). The arithmetic is the tiled kernel's, operation for
+ * operation, so the two gathers are bit equal on the same weights. The row count needs no 8-row
+ * rule: any n_rows in [1, 2^28] inclusive. */
+__global__ void __launch_bounds__(kQ4Threads)
+    embed_q4k_native_k(const uint4 *blocks, const int *ids, float *x, int *status, int n_rows, int k) {
+    const int t = blockIdx.x;
+    const int id = ids[t];
+    const bool ok = id >= 0 && id < n_rows;
+    if (!ok && threadIdx.x == 0) {
+        atomicOr(status, kMaskInvalidState);  // one thread, one integer OR: idempotent, order independent
+    }
+    const int nb = k / kTileK;
+    float *row = x + (size_t)t * k;
+    for (int w = threadIdx.x; w < nb * 8; w += kQ4Threads) {
+        const int ib = w >> 3, qp = (w >> 1) & 3, h = w & 1;
+        float *dst = row + ib * kTileK + 64 * qp + 16 * h;  // low columns; the high ones are dst + 32
+        if (!ok) {
+            store_nan16(dst);
+            store_nan16(dst + 32);
+            continue;
+        }
+        const uint4 *block = blocks + ((size_t)id * nb + ib) * 9;
+        const uint4 head = block[0];
+        const uint4 qs = block[1 + 2 * qp + h];
+        const float d = half_to_f32(head.x & 0xffffu), dmin = half_to_f32(head.x >> 16);
+        int sc_lo, mn_lo, sc_hi, mn_hi;
+        scale_min(2 * qp, head, sc_lo, mn_lo);
+        scale_min(2 * qp + 1, head, sc_hi, mn_hi);
+        const float d_lo = __fmul_rn(d, (float)sc_lo), m_lo = __fmul_rn(dmin, (float)mn_lo);
+        const float d_hi = __fmul_rn(d, (float)sc_hi), m_hi = __fmul_rn(dmin, (float)mn_hi);
+        for (int l = 0; l < 16; l += 4) {
+            float lo[4], hi[4];
+            for (int c = 0; c < 4; ++c) {
+                const unsigned b = byte_of(qs, l + c);
+                lo[c] = __fsub_rn(__fmul_rn(d_lo, (float)(b & 0xFu)), m_lo);
+                hi[c] = __fsub_rn(__fmul_rn(d_hi, (float)(b >> 4)), m_hi);
+            }
+            store4(dst + l, lo[0], lo[1], lo[2], lo[3]);
+            store4(dst + 32 + l, hi[0], hi[1], hi[2], hi[3]);
+        }
+    }
+}
+
 bool aligned_to(const void *p, size_t n) { return ((uintptr_t)p % n) == 0; }
 
 /* Bytes of the tiles of n_rows x k for the type, 0 for a type that is not gathered. */
@@ -194,6 +244,27 @@ bool valid(const inference_cuda_embed_args *a, void *stream) {
            apart(a->status, 4, a->tiles, tiles_bytes);
 }
 
+/* Bytes of the native Q4_K blocks of n_rows x k. */
+size_t native_blocks_bytes(int n_rows, int k) {
+    return (size_t)n_rows * (size_t)(k / kTileK) * 144;
+}
+
+/* The native twin of valid(): Q4_K only, any row count from 1 up (no 8-row rule). */
+bool valid_native(const inference_cuda_embed_native_args *a, void *stream) {
+    if (a == NULL || stream == NULL || a->blocks == NULL || a->ids == NULL || a->x == NULL || a->status == NULL) return false;
+    const bool m_ok = a->m >= 1 && a->m <= kMaxTokens;
+    const bool rows_ok = a->n_rows >= 1 && a->n_rows <= kMaxRows;
+    const bool k_ok = a->k >= kTileK && a->k <= kMaxK && a->k % kTileK == 0;
+    if (!(m_ok && rows_ok && k_ok)) return false;
+    if (!(aligned_to(a->blocks, 16) && aligned_to(a->ids, 4) && aligned_to(a->x, 16) &&
+          aligned_to(a->status, 4))) return false;
+    const size_t x_bytes = (size_t)a->m * a->k * 4;
+    const size_t blocks_bytes = native_blocks_bytes(a->n_rows, a->k);
+    return apart(a->x, x_bytes, a->ids, (size_t)a->m * 4) && apart(a->x, x_bytes, a->blocks, blocks_bytes) &&
+           apart(a->status, 4, a->x, x_bytes) && apart(a->status, 4, a->ids, (size_t)a->m * 4) &&
+           apart(a->status, 4, a->blocks, blocks_bytes);
+}
+
 }  // namespace
 
 extern "C" int inference_cuda_embed_launch(const inference_cuda_embed_args *a, void *stream, int *out_stage) {
@@ -209,6 +280,25 @@ extern "C" int inference_cuda_embed_launch(const inference_cuda_embed_args *a, v
         } else {
             embed_q80_k<<<a->m, kQ8Threads, 0, s>>>(tiles, a->ids, a->x, a->status, a->n_rows, a->k);
         }
+        Failure failure;
+        failure.record(cudaGetLastError(), INFERENCE_CUDA_STAGE_LAUNCH);
+        report_stage(out_stage, failure.stage);
+        return (int)failure.err;
+    } catch (...) {
+        return INFERENCE_CUDA_NATIVE_EXCEPTION;
+    }
+}
+
+extern "C" int inference_cuda_embed_native_launch(const inference_cuda_embed_native_args *a, void *stream,
+                                                  int *out_stage) {
+    try {
+        report_stage(out_stage, INFERENCE_CUDA_STAGE_NONE);
+        if (!valid_native(a, stream)) {
+            return INFERENCE_CUDA_INVALID_ARGUMENT;
+        }
+        const cudaStream_t s = (cudaStream_t)stream;
+        embed_q4k_native_k<<<a->m, kQ4Threads, 0, s>>>((const uint4 *)a->blocks, a->ids, a->x, a->status,
+                                                        a->n_rows, a->k);
         Failure failure;
         failure.record(cudaGetLastError(), INFERENCE_CUDA_STAGE_LAUNCH);
         report_stage(out_stage, failure.stage);

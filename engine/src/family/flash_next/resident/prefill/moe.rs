@@ -4,8 +4,13 @@
 //! one readback of `[T, E]` probabilities is the only synchronization (decision 0041 item 3). The
 //! host selects the experts of each row with `moe::select`, merges the choices into the sorted
 //! union of the chunk (`prefill_plan::union_and_remap`), and reads the union once into a page set
-//! of the prefill pool. `gather_qmm` then runs over all `T * top_k` (token, choice) pairs, and the
-//! gate-weighted rows of a token are summed in choice order, as the decode step sums them.
+//! of the prefill pool. `gather_qmm_sorted` then runs over all `T * top_k` (token, choice) pairs:
+//! `split_waves` orders the pairs of each wave by local rank, the non-decreasing order that MLX's
+//! `sorted_indices` flag requires, and `pool.import_wave` proves that order on the host before
+//! the import, because the method cannot read the device indices (packet FN-PF-SORTED; on the Q36
+//! model the flag cut the expert products of a 512-row chunk from about 457 ms to 207 ms,
+//! Q36-GAP 3a; the decode path keeps `gather_qmm` with `false`). The gate-weighted rows of a
+//! token are summed in choice order, as the decode step sums them.
 
 use super::super::super::{
     moe::{MoeShape, select},
@@ -59,8 +64,11 @@ fn chunk_route(
 /// Returns the gate-weighted expert rows `[n, H]` of the `n` pairs of one wave.
 ///
 /// Row `i` is the token row `tokens[i]` of `x` through the expert `ranks[i]` of the wave, times
-/// `gates[i]`. `gather_qmm` clamps a rank above the wave's expert count on the device, so the
-/// ranks must come from `split_waves`.
+/// `gates[i]`. The three expert products run `gather_qmm_sorted` with `pages.ranks`: the wave
+/// pairs arrive from `split_waves` sorted by local rank, the non-decreasing order that MLX's
+/// `sorted_indices` flag requires, and `pool.import_wave` proved that order before the import
+/// (packet FN-PF-SORTED). A rank above the wave's expert count would clamp to the last expert on
+/// the device, so the ranks must come from `split_waves`.
 fn wave_rows(
     ctx: &mut Ctx<'_>,
     pages: &WavePages,
@@ -75,11 +83,11 @@ fn wave_rows(
     let [g, u, d] = &pages.stacks;
     let picked = ctx.kernels.take(x, &pages.tokens, 0)?;
     let x_pairs = ctx.kernels.reshape(&picked, &[pairs, 1, hidden])?;
-    let hg = ctx.kernels.gather_qmm(&x_pairs, g, &pages.ranks)?;
-    let hu = ctx.kernels.gather_qmm(&x_pairs, u, &pages.ranks)?;
+    let hg = ctx.kernels.gather_qmm_sorted(&x_pairs, g, &pages.ranks)?;
+    let hu = ctx.kernels.gather_qmm_sorted(&x_pairs, u, &pages.ranks)?;
     let act = ctx.kernels.silu(&hg)?;
     let h = ctx.kernels.binary(BinaryOp::Mul, &act, &hu)?;
-    let eo = ctx.kernels.gather_qmm(&h, d, &pages.ranks)?;
+    let eo = ctx.kernels.gather_qmm_sorted(&h, d, &pages.ranks)?;
     let g3 = ctx.kernels.reshape(&pages.gates, &[pairs, 1, 1])?;
     let weighted = ctx.kernels.binary(BinaryOp::Mul, &eo, &g3)?;
     ctx.kernels.reshape(&weighted, &[pairs, hidden])
@@ -91,8 +99,10 @@ fn wave_rows(
 /// Each wave reads its experts into a free set. A wave before the last is evaluated and its set
 /// released at once (one synchronization), so the next wave can reuse a set. The last wave stays
 /// lent until the router readback of the next layer, as the only wave of a small chunk does. The
-/// rows of all waves are joined in wave order, restored to pair order with the inverse
-/// permutation, and summed in choice order, as the decode step sums them.
+/// rows of all waves are joined in wave order and restored to pair order with the inverse
+/// permutation, whatever the wave count: `split_waves` lists the pairs of every wave, a single
+/// wave included, in (local rank, pair) order, so one wave needs the inverse as much as several.
+/// The restored rows are summed in choice order, as the decode step sums them.
 fn routed_rows(
     ctx: &mut Ctx<'_>,
     ckpt: &StreamedCheckpoint,
@@ -109,7 +119,7 @@ fn routed_rows(
     let mut inverse: Option<ExecutionTensor> = None;
     for (index, wave) in plan.waves.iter().enumerate() {
         let last = index + 1 == plan.waves.len();
-        let wanted = (last && plan.waves.len() > 1).then_some(plan.inverse.as_slice());
+        let wanted = last.then_some(plan.inverse.as_slice());
         let pages = pool.import_wave(ctx.kernels, ckpt, w, wave, wanted)?;
         let rows = wave_rows(ctx, &pages, x)?;
         if last {
@@ -120,15 +130,14 @@ fn routed_rows(
         }
         parts.push(rows);
     }
-    let ordered = match (parts.as_slice(), inverse) {
-        ([rows], None) => ctx.kernels.reshape(rows, &[tokens, top_k, hidden])?,
-        (_, Some(inverse)) => {
+    let ordered = match inverse {
+        Some(inverse) => {
             let refs: Vec<&ExecutionTensor> = parts.iter().collect();
             let joined = ctx.kernels.concatenate(&refs, 0)?;
             let ordered = ctx.kernels.take(&joined, &inverse, 0)?;
             ctx.kernels.reshape(&ordered, &[tokens, top_k, hidden])?
         }
-        _ => return Err(bad("chunk waves are inconsistent")),
+        None => return Err(bad("chunk waves are inconsistent")),
     };
     ctx.kernels.reduce(ReduceOp::Sum, &ordered, 1, false)
 }
@@ -412,6 +421,62 @@ mod tests {
         }
     }
 
+    /// Packet FN-PF-SORTED task 4b and the fix round: twelve token rows over the four test
+    /// tokens make 24 pairs (the union is the experts 0, 1, and 3). Hand-derived pair counts:
+    /// tokens 0, 2, and 3 take the experts 0 and 1 and token 1 takes 3 and 1, so over the twelve
+    /// rows (three copies of each token) rank 0 has 3 * 3 = 9 pairs, rank 1 has 12 * 1 = 12, and
+    /// rank 2 has 3 * 1 = 3, which the fixture route confirms (the `rank_idx` of
+    /// `chunk_route_breaks_ties...` repeated three times). Cap 4 holds the union in one wave of
+    /// those 24 pairs, which reaches the sorted kernel of the pinned MLX: 24 pairs are at least
+    /// 16 and 24 / 3 = 8 pairs per expert are at least 4. Cap 2 splits the same pairs into the
+    /// waves {0, 1} with 9 + 12 = 21 pairs over 2 experts (21 is at least 16 and 21 / 2 = 10 is
+    /// at least 4, so this wave runs the sorted kernel) and {3} with 3 pairs (below 16, the
+    /// unsorted kernel), so several waves, a sorted wave, and the inverse `take` run together.
+    /// Every wave lists non-decreasing local ranks, and every output row matches its one-token
+    /// decode block, which runs the unsorted `gather_qmm` of the decode path, within the parity
+    /// tolerance, and the float64 anchors of the fixture.
+    #[test]
+    fn a_chunk_of_twenty_four_pairs_reaches_the_sorted_kernel_and_matches_the_decode_block() {
+        let _serial = crate::native_test_lock();
+        let mut kernels = MlxKernels::try_new().unwrap();
+        let (ckpt, weights) = load(&mut kernels);
+        let indices = [0, 1, 2, 3, 0, 1, 2, 3, 0, 1, 2, 3];
+        for (cap, sizes) in [(4u32, &[24usize][..]), (2, &[21, 3])] {
+            let mut pool = pool_for(&ckpt, &weights, cap, 24);
+            let (rows, route) =
+                run_chunk(&mut kernels, &weights, &ckpt, &mut pool, &indices).unwrap();
+            assert_eq!(
+                route.rank_idx.len(),
+                24,
+                "cap {cap}: 24 pairs of 12 tokens of top-k 2"
+            );
+            assert_eq!(route.distinct, [0, 1, 3], "cap {cap}: distinct experts");
+            let plan = split_waves(&route, cap).unwrap();
+            let got: Vec<usize> = plan.waves.iter().map(|wave| wave.pairs.len()).collect();
+            assert_eq!(got, sizes, "cap {cap}: pairs per wave");
+            for (wave, list) in plan.waves.iter().enumerate() {
+                assert!(
+                    list.local_ranks.is_sorted(),
+                    "cap {cap}: wave {wave} lists non-decreasing local ranks"
+                );
+            }
+            let mut slots = decode_slots(&ckpt, &weights);
+            for (t, row) in rows.as_chunks::<HIDDEN>().0.iter().enumerate() {
+                let want = decode_row(&mut kernels, &weights, &ckpt, &mut slots, indices[t]);
+                assert_parity(
+                    row,
+                    &want,
+                    &format!("cap {cap} token {t} against its decode call"),
+                );
+                assert_anchor(
+                    row,
+                    indices[t],
+                    &format!("cap {cap} token {t} against the oracle"),
+                );
+            }
+        }
+    }
+
     /// Every byte of both sets starts as 0xFF (F32 NaN, U32 4,294,967,295). Call A uses set 0,
     /// call B uses set 1, and call C reuses set 0, which still holds the pages of call A with a
     /// different union, token count, and gates.
@@ -495,8 +560,12 @@ mod tests {
     /// The union of tokens 0 to 3 is the experts 0, 1, and 3. The cap `c` splits them into
     /// `ceil(3 / c)` waves: cap 4 and cap 3 one wave, cap 2 the waves {0, 1} and {3}, and cap 1
     /// the waves {0}, {1}, and {3}. The single wave matches the oracle. Every split gives the
-    /// same bits as the single wave: each pair row is one `take` row through `gather_qmm`, the
-    /// join and the inverse `take` only move rows, and the sum runs in choice order.
+    /// same bits as the single wave: each pair row is one `take` row through `gather_qmm_sorted`,
+    /// the join and the inverse `take` only move rows, and the sum runs in choice order. That
+    /// bitwise equality holds while every wave holds fewer than 16 pairs, as the 8-pair waves of
+    /// this route do, because the pinned MLX runs one kernel below that bound; a wave of 16 pairs
+    /// or more takes the sorted kernel and its different tiling, so do not enlarge this fixture
+    /// and read a bitwise failure as a defect.
     #[test]
     fn waves_of_every_size_equal_the_oracle_and_the_single_wave_result() {
         let _serial = crate::native_test_lock();

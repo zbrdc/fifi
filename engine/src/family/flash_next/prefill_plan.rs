@@ -465,7 +465,8 @@ pub(crate) fn admitted_chunk(cost: &ChunkCost, remaining: u64) -> Result<Option<
 pub(crate) struct Wave {
     /// The experts of the wave, ascending. `coalesce_runs` on this list gives wave-local ranks.
     pub(crate) experts: Vec<u32>,
-    /// The pairs `p = t * top_k + j` whose expert is in the wave, ascending.
+    /// The pairs `p = t * top_k + j` whose expert is in the wave, ordered by (local rank, pair
+    /// index): stable by local rank, so the pair index breaks ties.
     pub(crate) pairs: Vec<u32>,
     /// For each pair of `pairs`, the rank of its expert inside `experts`.
     pub(crate) local_ranks: Vec<u32>,
@@ -496,9 +497,13 @@ pub(crate) fn wave_count(union: u32, wave_cap: u32) -> Result<u32, EngError> {
 /// Splits the experts of a chunk route into waves of at most `wave_cap` experts.
 ///
 /// Wave `i` takes ranks `i * wave_cap` to `(i + 1) * wave_cap - 1` of `route.distinct`. Each pair
-/// joins the wave of its rank and keeps its token-major order inside the wave. The route must come
-/// from `union_and_remap`: ascending distinct experts, ranks below their count, one gate per pair,
-/// a whole number of tokens, and every expert used by at least one pair.
+/// joins the wave of its rank, and the pairs of a wave are ordered by (local rank, pair index):
+/// a stable sort by rank keeps the pair index ascending inside one rank, so every wave lists
+/// non-decreasing local ranks and the concatenation of the wave pair lists holds the pairs in
+/// (rank, pair) order, the non-decreasing index order that `gather_qmm_sorted` requires (packet
+/// FN-PF-SORTED). The route must come from `union_and_remap`: ascending distinct experts, ranks
+/// below their count, one gate per pair, a whole number of tokens, and every expert used by at
+/// least one pair.
 pub(crate) fn split_waves(route: &ChunkRoute, wave_cap: u32) -> Result<WavePlan, EngError> {
     let union =
         u32::try_from(route.distinct.len()).map_err(|_| bad("prefill union exceeds u32"))?;
@@ -527,7 +532,18 @@ pub(crate) fn split_waves(route: &ChunkRoute, wave_cap: u32) -> Result<WavePlan,
             gates: Vec::new(),
         });
     }
-    for (pair, (&rank, &gate)) in route.rank_idx.iter().zip(&route.gates).enumerate() {
+    // The pairs in (rank, pair) order: a stable sort by rank keeps the pair index ascending
+    // inside one rank, so each wave receives its pairs already ordered by (local rank, pair
+    // index) and the concatenation of the wave pair lists is the (rank, pair) order that the
+    // inverse permutation inverts (packet FN-PF-SORTED).
+    let mut order: Vec<(u32, usize)> = route
+        .rank_idx
+        .iter()
+        .enumerate()
+        .map(|(pair, &rank)| (rank, pair))
+        .collect();
+    order.sort_by_key(|&(rank, _)| rank);
+    for &(rank, pair) in &order {
         let rank = usize::try_from(rank).map_err(|_| bad("prefill rank exceeds usize"))?;
         if rank >= route.distinct.len() {
             return Err(bad("prefill route rank is out of range"));
@@ -535,6 +551,11 @@ pub(crate) fn split_waves(route: &ChunkRoute, wave_cap: u32) -> Result<WavePlan,
         let wave = waves
             .get_mut(rank / cap)
             .ok_or_else(|| bad("prefill route rank has no wave"))?;
+        let gate = route
+            .gates
+            .get(pair)
+            .copied()
+            .ok_or_else(|| bad("prefill route is inconsistent"))?;
         wave.pairs
             .push(u32::try_from(pair).map_err(|_| bad("prefill pair exceeds u32"))?);
         wave.local_ranks
@@ -560,6 +581,19 @@ pub(crate) fn split_waves(route: &ChunkRoute, wave_cap: u32) -> Result<WavePlan,
         }
     }
     Ok(WavePlan { waves, inverse })
+}
+
+/// Proves on the host the order that `gather_qmm_sorted` requires of one wave: the wave-local
+/// ranks of its pairs must be non-decreasing (packet FN-PF-SORTED). The wave import runs this
+/// check before it writes any page, because the method cannot read the device indices. An
+/// inversion returns a `BadRequest` whose text starts `flash-next prefill:`; an empty slice
+/// passes.
+pub(crate) fn require_sorted_ranks(ranks: &[u32]) -> Result<(), EngError> {
+    if ranks.is_sorted() {
+        Ok(())
+    } else {
+        Err(bad("flash-next prefill: the wave ranks are not sorted"))
+    }
 }
 
 /// Extra synchronizations that waves add to one chunk.
@@ -740,7 +774,9 @@ mod tests {
     }
 
     /// Cap 2 over the five experts 0, 2, 5, 7, 9 of `selections()` gives the waves {0, 2}, {5, 7},
-    /// and {9}. The pair ranks are 2, 1, 4, 1, 3, 2, 4, 0, 3 for p = 0 to 8, with 3 pairs per token.
+    /// and {9}. The pair ranks are 2, 1, 4, 1, 3, 2, 4, 0, 3 for p = 0 to 8, with 3 pairs per
+    /// token, so the pairs in (rank, pair) order are p7 (rank 0), p1 and p3 (rank 1), p0 and p5
+    /// (rank 2), p4 and p8 (rank 3), and p2 and p6 (rank 4).
     #[test]
     fn split_waves_assigns_pairs_local_ranks_and_the_inverse() {
         let route = union_and_remap(&selections(), 512).unwrap();
@@ -751,32 +787,40 @@ mod tests {
             [&[0, 2][..], &[5, 7][..], &[9][..]],
             "wave experts"
         );
-        // Ranks 0 and 1 are wave 0, ranks 2 and 3 are wave 1, and rank 4 is wave 2.
+        // Wave 0 (ranks 0 and 1, local rank = rank) takes p7, then p1 and p3: pairs 7, 1, 3 of
+        // tokens 2, 0, 1 with gates 0.35, 0.3, 0.6 and local ranks 0, 1, 1.
         let wave0 = &plan.waves[0];
-        assert_eq!(wave0.pairs, [1, 3, 7], "wave 0 pairs");
-        assert_eq!(wave0.local_ranks, [1, 1, 0], "wave 0 local ranks");
-        assert_eq!(wave0.tokens, [0, 1, 2], "wave 0 tokens");
-        assert_eq!(wave0.gates, [0.3, 0.6, 0.35], "wave 0 gates");
+        assert_eq!(wave0.pairs, [7, 1, 3], "wave 0 pairs");
+        assert_eq!(wave0.local_ranks, [0, 1, 1], "wave 0 local ranks");
+        assert_eq!(wave0.tokens, [2, 0, 1], "wave 0 tokens");
+        assert_eq!(wave0.gates, [0.35, 0.3, 0.6], "wave 0 gates");
+        // Wave 1 (ranks 2 and 3) takes p0 and p5 of rank 2, then p4 and p8 of rank 3: pairs
+        // 0, 5, 4, 8 of tokens 0, 1, 1, 2 with gates 0.5, 0.1, 0.3, 0.25 and local ranks 0, 0, 1, 1.
         let wave1 = &plan.waves[1];
-        assert_eq!(wave1.pairs, [0, 4, 5, 8], "wave 1 pairs");
-        assert_eq!(wave1.local_ranks, [0, 1, 0, 1], "wave 1 local ranks");
+        assert_eq!(wave1.pairs, [0, 5, 4, 8], "wave 1 pairs");
+        assert_eq!(wave1.local_ranks, [0, 0, 1, 1], "wave 1 local ranks");
         assert_eq!(wave1.tokens, [0, 1, 1, 2], "wave 1 tokens");
-        assert_eq!(wave1.gates, [0.5, 0.3, 0.1, 0.25], "wave 1 gates");
+        assert_eq!(wave1.gates, [0.5, 0.1, 0.3, 0.25], "wave 1 gates");
+        // Wave 2 (rank 4) takes p2 and p6 in pair order.
         let wave2 = &plan.waves[2];
         assert_eq!(wave2.pairs, [2, 6], "wave 2 pairs");
         assert_eq!(wave2.local_ranks, [0, 0], "wave 2 local ranks");
         assert_eq!(wave2.tokens, [0, 2], "wave 2 tokens");
         assert_eq!(wave2.gates, [0.2, 0.4], "wave 2 gates");
-        // The concatenation of the pair lists is 1, 3, 7, 0, 4, 5, 8, 2, 6.
+        // The concatenation of the pair lists is 7, 1, 3, 0, 5, 4, 8, 2, 6, so p0 sits at
+        // position 3, p1 at 1, p2 at 7, p3 at 2, p4 at 5, p5 at 4, p6 at 8, p7 at 0, and p8 at 6.
         assert_eq!(
             plan.inverse,
-            [3, 0, 7, 1, 4, 5, 8, 2, 6],
+            [3, 1, 7, 2, 5, 4, 8, 0, 6],
             "inverse permutation"
         );
     }
 
     /// Cap 4 over the union 3, 4, 5, 7, 8, 20 gives {3, 4, 5, 7} and {8, 20}. The pair ranks are
-    /// 0, 4, 1, 5, 2, 3. `coalesce_runs` on each wave gives wave-local ranks.
+    /// 0, 4, 1, 5, 2, 3 for p = 0 to 5, so the (rank, pair) order is p0, p2, p4, p5, p1, p3: the
+    /// rank order happens to coincide with the token-major order for this route, so the expected
+    /// lists are the same as before the rank sort. `coalesce_runs` on each wave gives wave-local
+    /// ranks.
     #[test]
     fn split_waves_keeps_runs_and_ranks_local_to_each_wave() {
         let route = run_route();
@@ -831,27 +875,251 @@ mod tests {
         );
     }
 
+    /// A cap at or above the union (five experts) leaves one wave that holds every pair in
+    /// (rank, pair) order: p7 (rank 0), p1 and p3 (rank 1), p0 and p5 (rank 2), p4 and p8
+    /// (rank 3), and p2 and p6 (rank 4). The local ranks of that wave are the chunk ranks in that
+    /// order, non-decreasing, and the inverse of the concatenation restores pair order.
     #[test]
-    fn split_waves_with_a_large_cap_is_one_identity_wave() {
+    fn split_waves_with_a_large_cap_is_one_rank_sorted_wave() {
         let route = union_and_remap(&selections(), 512).unwrap();
         for cap in [5, 6, u32::MAX] {
             let plan = split_waves(&route, cap).unwrap();
             assert_eq!(plan.waves.len(), 1, "cap {cap}");
             let wave = &plan.waves[0];
             assert_eq!(wave.experts, [0, 2, 5, 7, 9], "cap {cap}: experts");
-            assert_eq!(wave.pairs, [0, 1, 2, 3, 4, 5, 6, 7, 8], "cap {cap}: pairs");
-            assert_eq!(wave.local_ranks, route.rank_idx, "cap {cap}: local ranks");
+            assert_eq!(
+                wave.pairs,
+                [7, 1, 3, 0, 5, 4, 8, 2, 6],
+                "cap {cap}: pairs in (rank, pair) order"
+            );
+            assert_eq!(
+                wave.local_ranks,
+                [0, 1, 1, 2, 2, 3, 3, 4, 4],
+                "cap {cap}: local ranks are non-decreasing"
+            );
             assert_eq!(
                 wave.tokens,
-                [0, 0, 0, 1, 1, 1, 2, 2, 2],
+                [2, 0, 1, 0, 1, 1, 2, 0, 2],
                 "cap {cap}: tokens"
             );
-            assert_eq!(wave.gates, route.gates, "cap {cap}: gates");
+            assert_eq!(
+                wave.gates,
+                [0.35, 0.3, 0.6, 0.5, 0.1, 0.3, 0.25, 0.2, 0.4],
+                "cap {cap}: gates"
+            );
             assert_eq!(
                 plan.inverse,
-                [0, 1, 2, 3, 4, 5, 6, 7, 8],
+                [3, 1, 7, 2, 5, 4, 8, 0, 6],
                 "cap {cap}: inverse"
             );
+        }
+    }
+
+    /// Packet FN-PF-SORTED task 2 and the fix round: the order proof that the wave import runs
+    /// before any device work of the wave. Hand derivations: `[0, 1, 1, 3, 5]` never falls and
+    /// the empty list has no adjacent pair, so both pass; `[0, 2, 1]` falls at the last window
+    /// (2 > 1), `[2, 1, 3]` falls at the first window (2 > 1), and the strictly descending
+    /// `[5, 4, 3, 2, 1]` falls at every window, so all three fail.
+    #[test]
+    fn require_sorted_ranks_passes_sorted_and_empty_and_fails_one_inversion() {
+        assert!(
+            require_sorted_ranks(&[0, 1, 1, 3, 5]).is_ok(),
+            "a sorted list passes"
+        );
+        assert!(require_sorted_ranks(&[]).is_ok(), "the empty list passes");
+        for (list, why) in [
+            (&[0u32, 2, 1][..], "one inversion at the end"),
+            (&[2u32, 1, 3][..], "one inversion at the start"),
+            (&[5u32, 4, 3, 2, 1][..], "a strictly descending list"),
+        ] {
+            let failed = require_sorted_ranks(list);
+            assert!(
+                matches!(&failed, Err(EngError::BadRequest(m)) if m.starts_with("flash-next prefill:")),
+                "{why} ({list:?}) is a bad request that names the flash-next prefill, got {failed:?}"
+            );
+        }
+    }
+
+    /// A hand-written route of the property test: token-major rows of (expert, gate) pairs.
+    type Selections = Vec<Vec<(u32, f32)>>;
+
+    /// The hand-written route family of the property test (packet FN-PF-SORTED task 4a): seven
+    /// token-major routes over experts below 64, no RNG.
+    fn property_routes() -> Vec<(&'static str, Selections)> {
+        vec![
+            ("one token one expert", vec![vec![(5, 1.0)]]),
+            (
+                "one token three experts",
+                vec![vec![(9, 0.1), (3, 0.6), (6, 0.3)]],
+            ),
+            (
+                "every token the same two experts",
+                vec![
+                    vec![(2, 0.5), (4, 0.5)],
+                    vec![(4, 0.6), (2, 0.4)],
+                    vec![(2, 0.7), (4, 0.3)],
+                    vec![(4, 0.8), (2, 0.2)],
+                    vec![(2, 0.9), (4, 0.1)],
+                ],
+            ),
+            (
+                "the selections family",
+                vec![
+                    vec![(5, 0.5), (2, 0.3), (9, 0.2)],
+                    vec![(2, 0.6), (7, 0.3), (5, 0.1)],
+                    vec![(9, 0.4), (0, 0.35), (7, 0.25)],
+                ],
+            ),
+            (
+                "descending rows",
+                vec![
+                    vec![(7, 0.2), (5, 0.3), (3, 0.5)],
+                    vec![(6, 0.1), (4, 0.4), (2, 0.5)],
+                ],
+            ),
+            (
+                "two experts swapped between tokens",
+                vec![
+                    vec![(0, 0.6), (8, 0.4)],
+                    vec![(8, 0.7), (0, 0.3)],
+                    vec![(0, 0.1), (8, 0.9)],
+                ],
+            ),
+            (
+                "six tokens of four choices",
+                vec![
+                    vec![(1, 0.4), (15, 0.3), (2, 0.2), (9, 0.1)],
+                    vec![(9, 0.25), (2, 0.25), (1, 0.25), (15, 0.25)],
+                    vec![(15, 0.1), (9, 0.2), (2, 0.3), (1, 0.4)],
+                    vec![(2, 0.34), (1, 0.33), (9, 0.32), (15, 0.01)],
+                    vec![(0, 0.5), (3, 0.2), (6, 0.2), (9, 0.1)],
+                    vec![(10, 0.6), (11, 0.2), (12, 0.1), (13, 0.1)],
+                ],
+            ),
+        ]
+    }
+
+    /// Packet FN-PF-SORTED task 4a: for every route of the family and every wave cap, each wave
+    /// lists its pairs with non-decreasing local ranks that still name the pair's rank, token,
+    /// and gate in the route, the concatenated pair lists taken at `inverse` restore the
+    /// token-major pair order, and the multiset of (token, gate, rank) triples is unchanged.
+    #[test]
+    fn split_waves_sorts_ranks_and_keeps_the_inverse_and_the_multiset_over_a_family() {
+        for (name, selections) in property_routes() {
+            let route = union_and_remap(&selections, 64).unwrap();
+            let top_k = route.top_k as usize;
+            let pairs = route.rank_idx.len();
+            // The token-major multiset of (token, gate, rank).
+            let mut want: Vec<(u32, f32, u32)> = route
+                .rank_idx
+                .iter()
+                .zip(&route.gates)
+                .enumerate()
+                .map(|(pair, (&rank, &gate))| (u32::try_from(pair / top_k).unwrap(), gate, rank))
+                .collect();
+            want.sort_by(|a, b| a.0.cmp(&b.0).then(a.2.cmp(&b.2)).then(a.1.total_cmp(&b.1)));
+            for cap in [1u32, 2, 3, 5, 64] {
+                let plan = split_waves(&route, cap).unwrap();
+                let mut concatenated: Vec<u32> = Vec::with_capacity(pairs);
+                let mut got: Vec<(u32, f32, u32)> = Vec::with_capacity(pairs);
+                for (index, wave) in plan.waves.iter().enumerate() {
+                    let offset = u32::try_from(index).unwrap() * cap;
+                    assert!(
+                        wave.local_ranks.is_sorted(),
+                        "{name}, cap {cap}: wave {index} lists non-decreasing local ranks"
+                    );
+                    let rows = wave
+                        .pairs
+                        .iter()
+                        .zip(&wave.local_ranks)
+                        .zip(&wave.tokens)
+                        .zip(&wave.gates);
+                    for (((&pair, &local), &token), &gate) in rows {
+                        let pair = pair as usize;
+                        assert_eq!(
+                            route.rank_idx[pair],
+                            offset + local,
+                            "{name}, cap {cap}: pair {pair} keeps its rank"
+                        );
+                        assert_eq!(
+                            token,
+                            u32::try_from(pair / top_k).unwrap(),
+                            "{name}, cap {cap}: pair {pair} keeps its token"
+                        );
+                        assert_eq!(
+                            gate, route.gates[pair],
+                            "{name}, cap {cap}: pair {pair} keeps its gate"
+                        );
+                        concatenated.push(pair as u32);
+                        got.push((token, gate, offset + local));
+                    }
+                }
+                assert_eq!(
+                    concatenated.len(),
+                    pairs,
+                    "{name}, cap {cap}: every pair joins exactly one wave"
+                );
+                for (pair, &slot) in plan.inverse.iter().enumerate() {
+                    assert_eq!(
+                        concatenated[slot as usize], pair as u32,
+                        "{name}, cap {cap}: the inverse restores pair {pair}"
+                    );
+                }
+                got.sort_by(|a, b| a.0.cmp(&b.0).then(a.2.cmp(&b.2)).then(a.1.total_cmp(&b.1)));
+                assert_eq!(
+                    got, want,
+                    "{name}, cap {cap}: the (token, gate, rank) multiset"
+                );
+            }
+        }
+    }
+
+    /// A route of more than 20 pairs whose local ranks repeat many times, so the (rank, pair)
+    /// order of `split_waves` is pinned at a size that no small-slice luck can pass: two hundred
+    /// tokens of two choices over the two experts 0 and 1, where even tokens pick (0, 1) and odd
+    /// tokens pick (1, 0). Hand derivation: the distinct experts are 0 and 1, and the pair
+    /// `p = t * 2 + j` has rank 0 when `p` is 0 or 3 modulo 4 (the first choice of an even token
+    /// and the second of an odd one) and rank 1 when `p` is 1 or 2 modulo 4, so each rank is
+    /// shared by the 200 pairs of its two residues, interleaved in pair order. For every wave and
+    /// every cap, equal adjacent local ranks must imply an ascending pair index: the stable sort
+    /// of `split_waves` gives that order, and an unstable sort of these 400 pairs, above the
+    /// 20-element insertion-sort bound of `sort_unstable_by_key`, can swap pairs of one rank.
+    #[test]
+    fn split_waves_keeps_equal_local_ranks_in_pair_order_over_a_large_route() {
+        let selections: Vec<Vec<(u32, f32)>> = (0..200)
+            .map(|token| {
+                if token % 2 == 0 {
+                    vec![(0, 0.75), (1, 0.25)]
+                } else {
+                    vec![(1, 0.25), (0, 0.75)]
+                }
+            })
+            .collect();
+        let route = union_and_remap(&selections, 64).unwrap();
+        assert_eq!(route.distinct, [0, 1], "two experts");
+        assert_eq!(route.rank_idx.len(), 400, "200 tokens of two pairs");
+        for cap in [1u32, 2, 3, 5, 64] {
+            let plan = split_waves(&route, cap).unwrap();
+            for (index, wave) in plan.waves.iter().enumerate() {
+                assert!(
+                    wave.local_ranks.is_sorted(),
+                    "cap {cap}: wave {index} lists non-decreasing local ranks"
+                );
+                assert!(
+                    wave.local_ranks.windows(2).any(|two| two[0] == two[1]),
+                    "cap {cap}: wave {index} repeats a local rank, or the route tests no tie"
+                );
+                for (pairs, ranks) in wave.pairs.windows(2).zip(wave.local_ranks.windows(2)) {
+                    if ranks[0] == ranks[1] {
+                        assert!(
+                            pairs[0] < pairs[1],
+                            "cap {cap}: wave {index}: pair {} follows pair {} inside one rank",
+                            pairs[1],
+                            pairs[0]
+                        );
+                    }
+                }
+            }
         }
     }
 

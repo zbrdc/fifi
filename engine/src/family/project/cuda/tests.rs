@@ -626,6 +626,7 @@ pub(super) fn weight_of<'a>(loaded: &'a CudaWeights, name: &str) -> &'a CudaWeig
 pub(super) fn tiled_of<'a>(loaded: &'a CudaWeights, name: &str) -> &'a TiledWeight {
     match weight_of(loaded, name) {
         CudaWeight::Tiled { weight, .. } => weight,
+        CudaWeight::Native { .. } => panic!("{name} loaded native, not tiled"),
         CudaWeight::Raw { ty, .. } => panic!("{name} loaded raw as {ty:?}, not tiled"),
     }
 }
@@ -1455,10 +1456,21 @@ fn planned_rejects_a_tiled_stack_whose_experts_miss_the_tile_groups_on_every_hos
             make_blocks(&mut rng, 8 * 4 * BLOCKS_PER_ROW),
         )]);
         assert_error(
-            planned(&weights, "w"),
+            planned(&weights, "w", WeightLayout::Tiled),
             "Checkpoint",
             "tensor w stacks experts of 4 rows, which do not start on 8-row tile groups",
         );
+        // The same 4-row stack plans natively for every type: the tile-group rule is a
+        // Tiled-only guard in `planned` (a removed `layout == Tiled` condition would refuse
+        // these too), and the bytes are the file's own blocks, not the tiles.
+        let source = match ty {
+            GgufType::Q4K => 8 * 4 * (K / 256) * 144,
+            GgufType::Q6K => 8 * 4 * (K / 256) * 210,
+            _ => 8 * 4 * (K / 32) * 34,
+        };
+        let (_, native_bytes) =
+            planned(&weights, "w", WeightLayout::Native).expect("a 4-row native stack plans");
+        assert_eq!(native_bytes, source as u64, "{ty:?}");
     }
 }
 
@@ -1474,11 +1486,173 @@ fn planned_accepts_whole_group_stacks_and_raw_stacks_of_any_expert_height() {
         ),
         stack_entry("raw", GgufType::F32, (8, 4, K), vec![0; 8 * 4 * K * 4]),
     ]);
-    let (_, bytes) = planned(&weights, "tiled").expect("two whole groups");
+    let (_, bytes) = planned(&weights, "tiled", WeightLayout::Tiled).expect("two whole groups");
     // 2 groups of 2 tiles of 72 vectors of 16 bytes.
     assert_eq!(bytes, 2 * 2 * 72 * 16);
-    let (_, bytes) = planned(&weights, "raw").expect("a raw stack is copied as read");
+    let (_, bytes) =
+        planned(&weights, "raw", WeightLayout::Tiled).expect("a raw stack is copied as read");
     assert_eq!(bytes, 8 * 4 * K as u64 * 4);
+    // The same stack under Native counts its source bytes (Q4_K tiles add no padding here);
+    // the 4-row experts that `planned` refuses for Tiled plan and LOAD natively - the twin
+    // test above and `a_native_load_takes_stacks_whose_experts_miss_the_tile_groups`.
+    let (_, bytes) = planned(&weights, "tiled", WeightLayout::Native).expect("a native stack");
+    assert_eq!(bytes, 2 * 8 * (K / 256) as u64 * 144);
+}
+
+#[test]
+fn the_default_layout_is_tiled() {
+    assert_eq!(WeightLayout::default(), WeightLayout::Tiled);
+    assert_eq!(LoadOptions::default().layout, WeightLayout::Tiled);
+}
+
+#[test]
+fn a_native_load_refuses_an_unsupported_type_naming_the_tensor() {
+    // The GGUF reader accepts exactly F32, F16 and the four native types (`SUPPORTED_TYPES`), so a
+    // file cannot carry a type the native plan refuses: a Q5_K tensor fails the open (see
+    // `a_gguf_with_a_q5k_tensor_fails_the_open_before_any_device_call`). The plan function that
+    // `planned` calls is therefore checked directly for the refusal and its text.
+    let text = error_text(plan::native_device_bytes("odd", GgufType::Q5K, &[256, 8]));
+    assert!(
+        text.starts_with("Checkpoint")
+            && text.contains("tensor odd has type Q5K, which the CUDA native weights do not take"),
+        "{text}"
+    );
+    let mut rng = Rng(SEED);
+    let (_dir, weights) = open_fixture(&[weight_entry(
+        "w",
+        GgufType::Q4K,
+        (N_ROWS, K),
+        q4k_blocks(&mut rng, N_ROWS * BLOCKS_PER_ROW),
+    )]);
+    let (_, bytes) = planned(&weights, "w", WeightLayout::Native).expect("a native plan");
+    assert_eq!(bytes, (N_ROWS * (K / 256) * 144) as u64);
+    // Q6_K is the one type whose native bytes differ from the tiles (1680 vs 1792 per
+    // 8x256 rows): the dispatch in `planned` must reach `native_device_bytes` for it too,
+    // not only for Q4_K (KUBDAN-MSG-68 M-4).
+    let (_dir, weights) = open_fixture(&[weight_entry(
+        "q6",
+        GgufType::Q6K,
+        (N_ROWS, K),
+        q6k_blocks(&mut rng, N_ROWS * BLOCKS_PER_ROW),
+    )]);
+    let (_, native) = planned(&weights, "q6", WeightLayout::Native).expect("a native Q6_K plan");
+    assert_eq!(native, (N_ROWS * (K / 256) * 210) as u64);
+    let (_, tiled) = planned(&weights, "q6", WeightLayout::Tiled).expect("a tiled Q6_K plan");
+    assert_ne!(
+        native, tiled,
+        "the Q6_K layouts must differ: {native} vs {tiled}"
+    );
+}
+
+#[test]
+fn a_native_load_records_the_stack_depth() {
+    const NAME: &str = "a_native_load_records_the_stack_depth";
+    if !device_present(NAME) {
+        return;
+    }
+    let mut rng = Rng(SEED);
+    let (_dir, weights) = open_fixture(&[stack_entry(
+        "stack",
+        GgufType::Q4K,
+        (2, 8, K),
+        q4k_blocks(&mut rng, 2 * 8 * BLOCKS_PER_ROW),
+    )]);
+    let projector = CudaProjector::new().expect("create the CUDA projector");
+    let native = LoadOptions {
+        layout: WeightLayout::Native,
+        ..LoadOptions::default()
+    };
+    let loaded = projector
+        .load(&weights, &["stack"], native)
+        .expect("load the stack natively");
+    let CudaWeight::Native { weight, .. } = weight_of(&loaded, "stack") else {
+        panic!("{NAME}: the stack did not load native");
+    };
+    // The depth the S1 expert launch indexes (expert e at e * rows bytes) is recorded on the
+    // weight; the bytes are the file's own blocks: 2 experts of 8 rows of K / 256 blocks.
+    assert_eq!(weight.experts(), Some(2), "{NAME}");
+    assert_eq!(weight.n_rows(), 16, "{NAME}");
+    assert_eq!(weight.k(), K, "{NAME}");
+    assert_eq!(loaded.device_bytes(), 2 * 8 * (K / 256) * 144, "{NAME}");
+}
+
+#[test]
+fn a_native_load_takes_stacks_whose_experts_miss_the_tile_groups() {
+    const NAME: &str = "a_native_load_takes_stacks_whose_experts_miss_the_tile_groups";
+    if !device_present(NAME) {
+        return;
+    }
+    let mut rng = Rng(SEED);
+    // 8 experts of 4 rows: the tile-group guard of `planned` refuses this stack for Tiled
+    // (the twin test above); under Native there is no such rule, so it plans AND loads
+    // (KUBDAN-MSG-68 M-4: a removed `layout == Tiled` condition on the guard would refuse
+    // this load with "experts of 4 rows, which do not start on 8-row tile groups").
+    let (_dir, weights) = open_fixture(&[stack_entry(
+        "stack",
+        GgufType::Q4K,
+        (8, 4, K),
+        q4k_blocks(&mut rng, 8 * 4 * BLOCKS_PER_ROW),
+    )]);
+    let projector = CudaProjector::new().expect("create the CUDA projector");
+    let native = LoadOptions {
+        layout: WeightLayout::Native,
+        ..LoadOptions::default()
+    };
+    let loaded = projector
+        .load(&weights, &["stack"], native)
+        .expect("load the 4-row stack natively");
+    let CudaWeight::Native { weight, .. } = weight_of(&loaded, "stack") else {
+        panic!("{NAME}: the stack did not load native");
+    };
+    assert_eq!(weight.experts(), Some(8), "{NAME}");
+    assert_eq!(weight.n_rows(), 32, "{NAME}");
+    assert_eq!(loaded.device_bytes(), 8 * 4 * (K / 256) * 144, "{NAME}");
+    // The tiled load of the same stack still refuses: the guard runs for Tiled only.
+    assert_error(
+        projector.load(&weights, &["stack"], LoadOptions::default()),
+        "Checkpoint",
+        "tensor stack stacks experts of 4 rows",
+    );
+}
+
+#[test]
+fn a_native_load_puts_the_file_bytes_on_the_device_and_refuses_tile_readers() {
+    const NAME: &str = "a_native_load_puts_the_file_bytes_on_the_device_and_refuses_tile_readers";
+    if !device_present(NAME) {
+        return;
+    }
+    let mut rng = Rng(SEED);
+    let fixture = Fixture::new(GgufType::Q4K, q4k_blocks(&mut rng, N_ROWS * BLOCKS_PER_ROW));
+    let mut projector = CudaProjector::new().expect("create the CUDA projector");
+    let before = projector.live_bytes();
+    let native = LoadOptions {
+        layout: WeightLayout::Native,
+        ..LoadOptions::default()
+    };
+    let loaded = projector
+        .load(&fixture.weights, &["w"], native)
+        .expect("load natively");
+    // Q4_K: the native bytes are the file bytes, and for this type they equal the tile bytes
+    // of the same shape (the plan test pins the Q6_K difference).
+    assert_eq!(loaded.device_bytes(), N_ROWS * (K / 256) * 144);
+    assert_eq!(projector.live_bytes() - before, loaded.device_bytes());
+    // The host projection oracle reads tiles: a native weight is a typed error, never a
+    // reinterpretation (R-S2-2), and the backend stays usable for a tiled load afterwards.
+    assert_error(
+        projector.linear(weight_of(&loaded, "w"), &vec![0.0; K]),
+        "Checkpoint",
+        "tensor w is loaded in the native layout; cuda linear reads tiles",
+    );
+    let tiled = projector
+        .load(&fixture.weights, &["w"], LoadOptions::default())
+        .expect("a tiled load after the native one");
+    drop(tiled);
+    drop(loaded);
+    assert_eq!(
+        projector.live_bytes(),
+        before,
+        "both loads freed their bytes"
+    );
 }
 
 #[test]
@@ -1782,6 +1956,65 @@ fn a_q6k_scale_overflow_in_a_later_tensor_fails_before_any_upload() {
         before,
         "the rejected load allocated device memory"
     );
+}
+
+#[test]
+fn a_native_load_skips_the_scale_scans_that_stop_the_tiled_load() {
+    const NAME: &str = "a_native_load_skips_the_scale_scans_that_stop_the_tiled_load";
+    if !device_present(NAME) {
+        return;
+    }
+    let mut rng = Rng(SEED);
+    let big = q4k_blocks(&mut rng, UNWIND_ROWS * UNWIND_K / BLOCK_VALUES);
+    let mut bad = q6k_blocks(&mut rng, N_ROWS * BLOCKS_PER_ROW);
+    // The same poisoning as the twin test above: d = 65504 and a scale of 2 overflow fp16,
+    // which only the tile dequantisation cannot hold (R-S2-4).
+    for block in bad.as_chunks_mut::<Q6K_BLOCK_BYTES>().0 {
+        block[192] = 2;
+        block[208..].copy_from_slice(&0x7bffu16.to_le_bytes());
+    }
+    let (_dir, weights) = open_fixture(&[
+        weight_entry("big", GgufType::Q4K, (UNWIND_ROWS, UNWIND_K), big),
+        weight_entry("bad", GgufType::Q6K, (N_ROWS, K), bad),
+    ]);
+    let mut projector = CudaProjector::new().expect("create the CUDA projector");
+    let before = projector.live_bytes();
+    // The tiled control: the pre-upload scan refuses `bad` before any upload.
+    assert_error(
+        projector.load(&weights, &["big", "bad"], LoadOptions::default()),
+        "Checkpoint",
+        "tensor bad block 0: Q6_K scale product",
+    );
+    assert_eq!(
+        projector.live_bytes(),
+        before,
+        "{NAME}: the refused tiled load allocated device memory"
+    );
+    // The native load of the SAME tensors succeeds: a native block keeps its exact scales,
+    // so no scan runs (a mutant that scans for Native too fails here with the error above).
+    let native = LoadOptions {
+        layout: WeightLayout::Native,
+        ..LoadOptions::default()
+    };
+    let loaded = projector
+        .load(&weights, &["big", "bad"], native)
+        .expect("the same tensors load natively");
+    let big_bytes = UNWIND_ROWS * (UNWIND_K / 256) * 144;
+    let bad_bytes = N_ROWS * (K / 256) * 210;
+    assert_eq!(
+        loaded.device_bytes(),
+        big_bytes + bad_bytes,
+        "{NAME}: the file's own bytes, Q4_K and Q6_K alike"
+    );
+    drop(loaded);
+    assert_eq!(
+        projector.live_bytes(),
+        before,
+        "{NAME}: the drop freed the load"
+    );
+    // The backend still loads and runs after both loads.
+    let fixture = Fixture::new(GgufType::Q4K, q4k_blocks(&mut rng, N_ROWS * BLOCKS_PER_ROW));
+    assert_loads_and_runs_after(&mut projector, &fixture, "tiled after the native load");
 }
 
 #[test]
@@ -3067,7 +3300,7 @@ fn plan_of<'a>(
 ) -> LoadPlan<'a> {
     let tensors = names
         .iter()
-        .map(|name| planned(weights, name))
+        .map(|name| planned(weights, name, WeightLayout::Tiled))
         .collect::<Result<Vec<_>, _>>()
         .expect("plan the tensors");
     LoadPlan {
@@ -3075,6 +3308,7 @@ fn plan_of<'a>(
         index: load_index(names).expect("index the names"),
         policy,
         drop_file,
+        layout: WeightLayout::Tiled,
     }
 }
 
@@ -3230,6 +3464,7 @@ fn an_integrated_load_evicts_the_file_before_admission() {
                 ..Reserve::default()
             },
             drop_page_cache: None,
+            ..LoadOptions::default()
         };
         assert_error(
             projector.load(&fixture.weights, &["w"], options),

@@ -61,9 +61,9 @@ pub(crate) mod resident;
 mod testkit;
 
 pub(crate) use context::{
-    Admission, CHUNK_LIMIT, CudaContext, DeviceBuffer, Growth, MemoryInfo, QuantTensor,
-    TiledWeight, WorkspaceShape, check_q5_0_scales, check_q6k_scales, check_q8_0_scales,
-    drop_page_cache,
+    Admission, CHUNK_LIMIT, CudaContext, DeviceBuffer, Growth, MemoryInfo, NativeWeight,
+    QuantTensor, TiledWeight, WorkspaceShape, check_q5_0_scales, check_q6k_scales,
+    check_q8_0_scales, drop_page_cache,
 };
 #[cfg_attr(
     not(test),

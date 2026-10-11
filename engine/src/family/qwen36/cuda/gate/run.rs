@@ -459,6 +459,7 @@ pub(super) fn device_gate(s: &GateSettings) -> Result<GateReport, EngError> {
                 headroom: 0,
             },
             drop_page_cache: None,
+            ..Default::default()
         },
     )?;
     let after = projector.memory_info()?;

@@ -1,16 +1,20 @@
 //! CUDA adapter of the projection seam (decision 0040 packet 3).
 //!
 //! [`CudaProjector`] loads Q4_K, Q6_K and Q8_0 tensors of a GGUF file into the
-//! vendored tile layout and runs `linear` through the tiled matmul. F32 and
+//! vendored tile layout and runs `linear` through the tiled matmul — or, when
+//! `LoadOptions::layout` says `Native` (MATVEC-PAR S2), uploads the file's own
+//! blocks for the S1 MMVQ kernels: one layout per load, never both, and the
+//! default stays `Tiled`, so no existing caller changes behaviour. F32 and
 //! F16 tensors load as raw device copies for later norms and tables, and
 //! `linear` rejects them. A rank-3 tensor is a stack of experts: it loads as
 //! one tiled weight of `out * experts` rows, `expert_linear` runs the matmul
 //! on the tiles of one expert in place, and `linear` rejects the stack. Row gathers follow in a later
 //! packet, so `rows` returns `BadRequest`.
 //!
-//! A load checks every tensor, including the fp16 range of Q6_K and Q8_0
-//! scales, and admits the whole device demand before the first upload. A
-//! quantized tensor is read, repacked and uploaded in chunks of whole 8-row
+//! A load checks every tensor and admits the whole device demand before the first
+//! upload. A tiled load also scans the fp16 scale range of every Q6_K, Q8_0 and Q5_0
+//! tensor first; a native load scans nothing, because a native block keeps its exact
+//! scales (R-S2-4). A quantized tensor is read, repacked and uploaded in chunks of whole 8-row
 //! groups, and the scale scan reads in chunks of the same size, so host memory
 //! is one chunk of source blocks plus one chunk of repacked tiles (each at
 //! most [`CHUNK_LIMIT`], 64 MiB) however large the tensor is. The tensor size
@@ -46,8 +50,8 @@ use crate::{
     EngError,
     family::gguf_model::GgufModel,
     kernels::cuda::{
-        self, Admission, CHUNK_LIMIT, CudaContext, DeviceBuffer, Growth, MemoryInfo, QuantTensor,
-        TiledWeight, WorkspaceShape, plan,
+        self, Admission, CHUNK_LIMIT, CudaContext, DeviceBuffer, Growth, MemoryInfo, NativeWeight,
+        QuantTensor, TiledWeight, WorkspaceShape, plan,
     },
     weights::{GgufTensor, GgufType, GgufWeights},
 };
@@ -60,6 +64,27 @@ pub(crate) struct Reserve {
     pub(crate) headroom: u64,
 }
 
+/// The device layout of the quantized tensors of one load (MATVEC-PAR S2): the vendored tiles
+/// (the default; every merged reader) or the file's own native blocks, which the S1 MMVQ
+/// kernels and the native embedding gather read. One layout per load, never both; a load in
+/// one layout serves only readers of that layout (R-S2-2). The default keeps every existing
+/// caller and test on the tiled path.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) enum WeightLayout {
+    #[default]
+    Tiled,
+    /// Staged (KUBDAN-MSG-68 M-1): no production caller constructs a Native load yet; the
+    /// resident step and the gate of MATVEC-PAR S3 do. Tests construct it freely.
+    #[cfg_attr(
+        not(test),
+        expect(
+            dead_code,
+            reason = "the S3 resident step and gate construct Native loads"
+        )
+    )]
+    Native,
+}
+
 /// Options of one [`CudaProjector::load`].
 #[derive(Debug, Clone, Copy, Default)]
 pub(crate) struct LoadOptions<'a> {
@@ -68,6 +93,10 @@ pub(crate) struct LoadOptions<'a> {
     /// (`posix_fadvise(DONTNEED)`), or `None` to keep the page cache. Decision
     /// 0040 item 5 keeps the call only if the Xavier measurement shows a gain.
     pub(crate) drop_page_cache: Option<&'a File>,
+    /// The device layout of the quantized tensors of this load (MATVEC-PAR S2). `Tiled` by
+    /// default; `Native` applies to resident-step loads only — the host `Projector` oracle
+    /// reads tiles and refuses a native weight with a typed error (R-S2-2).
+    pub(crate) layout: WeightLayout,
 }
 
 /// One checkpoint tensor resident on the device.
@@ -80,6 +109,10 @@ pub(crate) enum CudaWeight {
         weight: TiledWeight,
         experts: Option<usize>,
     },
+    /// A quantized matrix in the file's native block layout (MATVEC-PAR S2): the S1 MMVQ
+    /// matvec kernels and the native embedding gather read it. The stack depth of a rank-3
+    /// tensor rides `weight.experts()`.
+    Native { name: String, weight: NativeWeight },
     /// An F32 or F16 tensor copied as read.
     Raw {
         name: String,
@@ -91,7 +124,7 @@ pub(crate) enum CudaWeight {
 impl CudaWeight {
     pub(crate) fn name(&self) -> &str {
         match self {
-            Self::Tiled { name, .. } | Self::Raw { name, .. } => name,
+            Self::Tiled { name, .. } | Self::Native { name, .. } | Self::Raw { name, .. } => name,
         }
     }
 
@@ -99,6 +132,7 @@ impl CudaWeight {
     pub(crate) fn device_bytes(&self) -> usize {
         match self {
             Self::Tiled { weight, .. } => weight.buffer().bytes(),
+            Self::Native { weight, .. } => weight.buffer().bytes(),
             Self::Raw { buffer, .. } => buffer.bytes(),
         }
     }
@@ -139,6 +173,7 @@ impl CudaWeights {
     pub(crate) fn device_buffers(&self) -> impl Iterator<Item = &DeviceBuffer> {
         self.weights.iter().map(|weight| match weight {
             CudaWeight::Tiled { weight, .. } => weight.buffer(),
+            CudaWeight::Native { weight, .. } => weight.buffer(),
             CudaWeight::Raw { buffer, .. } => buffer,
         })
     }
@@ -158,6 +193,17 @@ impl Drop for CudaWeights {
 pub(crate) struct LoadedModel {
     /// All tensors of the plan, on the device.
     pub(crate) device: CudaWeights,
+    /// The layout the quantized tensors were loaded in (MATVEC-PAR S2), so the resident step
+    /// can assert it: one layout per load, never both. Staged (KUBDAN-MSG-68 M-1): no
+    /// production reader yet; the S3 resident step asserts it.
+    #[cfg_attr(
+        not(test),
+        expect(
+            dead_code,
+            reason = "the S3 resident step asserts the layout of its weights"
+        )
+    )]
+    pub(crate) layout: WeightLayout,
 }
 
 /// What [`CudaProjector::transfer`] works from, after the checks and the
@@ -167,6 +213,8 @@ struct LoadPlan<'a> {
     index: HashMap<String, usize>,
     policy: LoadPolicy,
     drop_file: Option<&'a File>,
+    /// The device layout of the quantized tensors (MATVEC-PAR S2).
+    layout: WeightLayout,
 }
 
 /// Tokens of the largest call the default workspace holds without growing: the
@@ -264,10 +312,11 @@ impl CudaProjector {
     ///
     /// Every tensor is checked and the whole demand admitted against free
     /// device memory before the first upload. A missing tensor, a repeated
-    /// name, an unsupported type or shape, or a Q6_K or Q8_0 scale outside the fp16
-    /// range fails without any upload, as does a demand above free memory
-    /// (`MemoryPlan`). The scale error names the tensor and the block index
-    /// from the start of the tensor, wherever its chunk lies.
+    /// name, an unsupported type or shape, or - on the tiled layout only - a
+    /// Q6_K, Q8_0 or Q5_0 scale outside the fp16 range fails without any
+    /// upload, as does a demand above free memory (`MemoryPlan`). The scale
+    /// error names the tensor and the block index from the start of the
+    /// tensor, wherever its chunk lies.
     ///
     /// On an integrated GPU the load also evicts the model file before
     /// admission, forces the per-tensor page-cache drop and retries a tensor's
@@ -280,9 +329,10 @@ impl CudaProjector {
     ) -> Result<CudaWeights, EngError> {
         self.context.ensure_usable()?;
         let index = load_index(names)?;
+        let layout = options.layout;
         let tensors = names
             .iter()
-            .map(|name| planned(weights, name))
+            .map(|name| planned(weights, name, layout))
             .collect::<Result<Vec<_>, _>>()?;
         let total = tensors
             .iter()
@@ -303,6 +353,7 @@ impl CudaProjector {
                 index,
                 policy,
                 drop_file,
+                layout,
             },
         )
     }
@@ -322,11 +373,17 @@ impl CudaProjector {
             index,
             policy,
             drop_file,
+            layout,
         } = plan;
         let scan_began = Instant::now();
-        check_scale_ranges(weights, &tensors, self.chunk_limit)?;
+        // The fp16 scale scans guard the tile dequantisation (fp16(d * scale)); a native load
+        // keeps the file's exact scales and scans nothing (R-S2-4).
+        if layout == WeightLayout::Tiled {
+            check_scale_ranges(weights, &tensors, self.chunk_limit)?;
+        }
         let scan = scan_began.elapsed();
-        // The scan read every Q6_K and Q8_0 tensor once and refilled the cache.
+        // A tiled load's scan read every Q6_K, Q8_0 and Q5_0 tensor once and refilled the
+        // cache; a native load ran no scan (R-S2-4).
         if policy.evict_file {
             evict_model(weights.file())?;
         }
@@ -340,7 +397,7 @@ impl CudaProjector {
             let weight = retry_on_oom(
                 &policy,
                 &self.oom_retries,
-                || self.upload(weights, tensor),
+                || self.upload(weights, tensor, layout),
                 || recover(weights.file(), policy.retry_pause),
             )?;
             loaded.weights.push(weight);
@@ -368,8 +425,9 @@ impl CudaProjector {
         options: LoadOptions<'_>,
     ) -> Result<LoadedModel, EngError> {
         let names = model.plan().device_names();
+        let layout = options.layout;
         let device = self.load(&model.weights, &names, options)?;
-        Ok(LoadedModel { device })
+        Ok(LoadedModel { device, layout })
     }
 
     fn admit(&self, tensors: u64, reserve: Reserve) -> Result<(), EngError> {
@@ -383,22 +441,60 @@ impl CudaProjector {
         plan::admit(&demand, u64::try_from(free).unwrap_or(u64::MAX)).map(drop)
     }
 
-    fn upload(&self, weights: &GgufWeights, tensor: &GgufTensor) -> Result<CudaWeight, EngError> {
+    fn upload(
+        &self,
+        weights: &GgufWeights,
+        tensor: &GgufTensor,
+        layout: WeightLayout,
+    ) -> Result<CudaWeight, EngError> {
         let name = tensor.name();
-        match tensor.ggml_type() {
-            ty @ (GgufType::Q4K | GgufType::Q6K | GgufType::Q80 | GgufType::Q50) => {
-                let (n_rows, k) = matrix_shape(tensor)?;
-                let experts = stack_depth(tensor)?;
-                let source_len = usize::try_from(tensor.byte_len()).map_err(|_| {
-                    EngError::MemoryPlan(format!("cuda allocate: tensor {name} does not fit"))
-                })?;
-                let quant = QuantTensor {
-                    name,
+        match (tensor.ggml_type(), layout) {
+            (ty @ (GgufType::Q4K | GgufType::Q6K | GgufType::Q80 | GgufType::Q50), layout) => {
+                self.upload_quant(weights, tensor, name, ty, layout)
+            }
+            (ty @ (GgufType::F32 | GgufType::F16), _) => {
+                let (_, bytes) = weights.read_tensor(name)?;
+                Ok(CudaWeight::Raw {
+                    name: name.to_owned(),
                     ty,
-                    n_rows,
-                    k,
-                    source_len,
-                };
+                    buffer: self.context.upload(&bytes)?,
+                })
+            }
+            (other, WeightLayout::Native) => Err(EngError::Checkpoint(format!(
+                "tensor {name} has type {other:?}, which the CUDA native weights do not take"
+            ))),
+            (other, _) => Err(EngError::Checkpoint(format!(
+                "tensor {name} has type {other:?}, which the CUDA backend does not load"
+            ))),
+        }
+    }
+
+    /// Uploads one quantized tensor in `layout`: the repacked tiles through `upload_tiled`
+    /// (whose dequantisation the fp16 scale scans guard) or the file's own blocks through
+    /// `upload_native` (no repack, no scan, R-S2-4), with the stack depth of a rank-3
+    /// tensor riding the weight.
+    fn upload_quant(
+        &self,
+        weights: &GgufWeights,
+        tensor: &GgufTensor,
+        name: &str,
+        ty: GgufType,
+        layout: WeightLayout,
+    ) -> Result<CudaWeight, EngError> {
+        let (n_rows, k) = matrix_shape(tensor)?;
+        let experts = stack_depth(tensor)?;
+        let source_len = usize::try_from(tensor.byte_len()).map_err(|_| {
+            EngError::MemoryPlan(format!("cuda allocate: tensor {name} does not fit"))
+        })?;
+        let quant = QuantTensor {
+            name,
+            ty,
+            n_rows,
+            k,
+            source_len,
+        };
+        match layout {
+            WeightLayout::Tiled => {
                 let weight =
                     self.context
                         .upload_tiled(quant, self.chunk_limit, &mut |at, buf| {
@@ -410,17 +506,19 @@ impl CudaProjector {
                     experts,
                 })
             }
-            ty @ (GgufType::F32 | GgufType::F16) => {
-                let (_, bytes) = weights.read_tensor(name)?;
-                Ok(CudaWeight::Raw {
+            WeightLayout::Native => {
+                // The file's own blocks, no repack and no scale scan (R-S2-4).
+                let weight = self
+                    .context
+                    .upload_native(quant, self.chunk_limit, &mut |at, buf| {
+                        weights.read_range(name, at as u64, buf)
+                    })?
+                    .with_experts(experts);
+                Ok(CudaWeight::Native {
                     name: name.to_owned(),
-                    ty,
-                    buffer: self.context.upload(&bytes)?,
+                    weight,
                 })
             }
-            other => Err(EngError::Checkpoint(format!(
-                "tensor {name} has type {other:?}, which the CUDA backend does not load"
-            ))),
         }
     }
 }
@@ -488,12 +586,16 @@ impl Projector for CudaProjector {
     }
 }
 
-/// Returns the tiles of a weight that the projection `operation` executes. A
-/// raw tensor fails before any native call with a `Checkpoint` naming the
-/// operation, and the backend stays usable (REPLY-17 item 2).
+/// Returns the tiles of a weight that the projection `operation` executes. A raw tensor
+/// fails before any native call with a `Checkpoint` naming the operation, and the backend
+/// stays usable (REPLY-17 item 2). A native weight fails the same way: the host projection
+/// reads tiles and never reinterprets the other layout (R-S2-2).
 fn tiled<'w>(weight: &'w CudaWeight, operation: &str) -> Result<&'w TiledWeight, EngError> {
     match weight {
         CudaWeight::Tiled { weight, .. } => Ok(weight),
+        CudaWeight::Native { name, .. } => Err(EngError::Checkpoint(format!(
+            "tensor {name} is loaded in the native layout; cuda {operation} reads tiles"
+        ))),
         CudaWeight::Raw { name, ty, .. } => Err(EngError::Checkpoint(format!(
             "tensor {name} has type {ty:?}; cuda {operation} executes Q4_K, Q6_K and Q8_0 only"
         ))),
@@ -530,16 +632,25 @@ fn load_index(names: &[&str]) -> Result<HashMap<String, usize>, EngError> {
     Ok(index)
 }
 
-/// Looks up a tensor and returns its device bytes after upload. A tiled
-/// rank-3 stack whose experts do not start on 8-row tile groups fails here,
-/// before any upload.
-fn planned<'w>(weights: &'w GgufWeights, name: &str) -> Result<(&'w GgufTensor, u64), EngError> {
+/// Looks up a tensor and returns its device bytes after upload, counted for `layout`
+/// (MATVEC-PAR S2: the tiles and the native blocks differ only for Q6_K). A tiled rank-3
+/// stack whose experts do not start on 8-row tile groups fails here, before any upload; a
+/// native stack has no such rule (the S1 expert kernel reads the device-side id).
+fn planned<'w>(
+    weights: &'w GgufWeights,
+    name: &str,
+    layout: WeightLayout,
+) -> Result<(&'w GgufTensor, u64), EngError> {
     let tensor = weights
         .header()
         .tensor(name)
         .ok_or_else(|| EngError::Checkpoint(format!("tensor {name} is not in the file")))?;
-    let bytes = plan::device_bytes(name, tensor.ggml_type(), tensor.dims())?;
-    if let &[_, out, _] = tensor.dims()
+    let bytes = match layout {
+        WeightLayout::Tiled => plan::device_bytes(name, tensor.ggml_type(), tensor.dims())?,
+        WeightLayout::Native => plan::native_device_bytes(name, tensor.ggml_type(), tensor.dims())?,
+    };
+    if layout == WeightLayout::Tiled
+        && let &[_, out, _] = tensor.dims()
         && matches!(
             tensor.ggml_type(),
             GgufType::Q4K | GgufType::Q6K | GgufType::Q80 | GgufType::Q50
@@ -611,8 +722,9 @@ fn scan_blocks(
 
 /// Returns the stack depth of a rank-3 tensor `[k, out, experts]`, or `None`
 /// for any other rank. Expert `e` owns rows `e * out..(e + 1) * out`, which
-/// start on a tile group only when `out` is a multiple of 8, so `planned`
-/// rejects other stacks before any upload.
+/// start on a tile group only when `out` is a multiple of 8; `planned` rejects
+/// other stacks for a TILED load before any upload (a native stack has no tile
+/// groups and loads at any expert height).
 fn stack_depth(tensor: &GgufTensor) -> Result<Option<usize>, EngError> {
     let &[_, _, experts] = tensor.dims() else {
         return Ok(None);

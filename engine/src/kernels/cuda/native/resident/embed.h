@@ -65,6 +65,50 @@ _Static_assert(sizeof(inference_cuda_embed_args) == 48 && offsetof(inference_cud
 
 int inference_cuda_embed_launch(const inference_cuda_embed_args *args, void *stream, int *out_stage);
 
+/*
+ * MATVEC-PAR S2: the native twin of the entry above, against the file's own Q4_K blocks. Same
+ * ids/x/status contract (one id outside [0, n_rows) writes a NaN row, reads no weight and ORs
+ * status bit 4), same numerics bit for bit. blocks is the row-major native table: n_rows rows of
+ * k / 256 blocks of 144 bytes (d, dmin, 12 scale bytes, 128 qs bytes), 16-byte aligned. Q4_K only;
+ * n_rows any count in [1, 2^28] inclusive (no 8-row rule); k multiple of 256 in [256, 32768]; m in [1, 4096].
+ * x may not overlap ids, status or the blocks. Rejected arguments return INFERENCE_CUDA_INVALID_ARGUMENT
+ * before any CUDA call.
+ */
+typedef struct inference_cuda_embed_native_args {
+    const void *blocks;
+    const int *ids;
+    float *x;
+    int *status;
+    int m;
+    int n_rows;
+    int k;
+} inference_cuda_embed_native_args;
+
+int inference_cuda_embed_native_launch(const inference_cuda_embed_native_args *args, void *stream,
+                                        int *out_stage);
+
+#ifdef __cplusplus
+static_assert(sizeof(inference_cuda_embed_native_args) == 48 &&
+                  offsetof(inference_cuda_embed_native_args, blocks) == 0 &&
+                  offsetof(inference_cuda_embed_native_args, ids) == 8 &&
+                  offsetof(inference_cuda_embed_native_args, x) == 16 &&
+                  offsetof(inference_cuda_embed_native_args, status) == 24 &&
+                  offsetof(inference_cuda_embed_native_args, m) == 32 &&
+                  offsetof(inference_cuda_embed_native_args, n_rows) == 36 &&
+                  offsetof(inference_cuda_embed_native_args, k) == 40,
+              "inference_cuda_embed_native_args layout");
+#else
+_Static_assert(sizeof(inference_cuda_embed_native_args) == 48 &&
+                   offsetof(inference_cuda_embed_native_args, blocks) == 0 &&
+                   offsetof(inference_cuda_embed_native_args, ids) == 8 &&
+                   offsetof(inference_cuda_embed_native_args, x) == 16 &&
+                   offsetof(inference_cuda_embed_native_args, status) == 24 &&
+                   offsetof(inference_cuda_embed_native_args, m) == 32 &&
+                   offsetof(inference_cuda_embed_native_args, n_rows) == 36 &&
+                   offsetof(inference_cuda_embed_native_args, k) == 40,
+               "inference_cuda_embed_native_args layout");
+#endif
+
 #ifdef __cplusplus
 }
 #endif

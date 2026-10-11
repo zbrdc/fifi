@@ -5,6 +5,10 @@
 //! the wave's experts (`SetLayout`), then the route page. The route page holds the U32 wave-local
 //! rank, the U32 token row, and the F32 gate of each pair of the wave, and the U32 inverse
 //! permutation of the chunk (the last wave of a layer only).
+//! The pairs of a wave arrive sorted by local rank (`prefill_plan::split_waves`), and
+//! `import_wave` proves that order with `require_sorted_ranks` before any page write, because the
+//! expert products of the wave run `gather_qmm_sorted` with MLX's `sorted_indices` flag (packet
+//! FN-PF-SORTED).
 //! The release rule of decision 0041 is unchanged: the last set of a layer is released after the
 //! router readback of the next layer (`release_lent`), and `acquire` never waits. A wave before
 //! the last is released right after the `evaluate` that covers its graph (packet PF-7b).
@@ -14,7 +18,10 @@
 
 #[cfg(feature = "native-fault-qualification")]
 use super::super::super::stored::record_page_import;
-use super::super::super::{prefill_plan::Wave, stored::read_stack_into};
+use super::super::super::{
+    prefill_plan::{Wave, require_sorted_ranks},
+    stored::read_stack_into,
+};
 use super::super::{
     ops::short_import,
     slots::{ExpertSlots, SetLayout},
@@ -184,8 +191,15 @@ impl PrefillPool {
     /// route ranges move with it and stay inside the set.
     ///
     /// The checks run before any page changes and return `BadRequest`: more experts than
-    /// `set_experts`, more pairs than the pool was sized for, and lists of different lengths.
-    /// When no set is free it returns `Backend` (a release was missed).
+    /// `set_experts`, more pairs than the pool was sized for, lists of different lengths, and
+    /// local ranks that fall (`require_sorted_ranks`, the non-decreasing order that
+    /// `gather_qmm_sorted` requires; this is the gate that runs before any device work of the
+    /// wave, because this import is the single entry point that writes and imports the wave
+    /// buffers, whichever caller built the plan). The check runs once per wave at its own import,
+    /// so a multi-wave layer may already have imported and run its earlier waves when a later
+    /// wave is rejected; that cannot happen while `split_waves` is the only producer of waves,
+    /// because it only emits waves with sorted ranks. When no set is free it returns `Backend`
+    /// (a release was missed).
     pub(super) fn import_wave(
         &mut self,
         kernels: &mut MlxKernels,
@@ -212,6 +226,7 @@ impl PrefillPool {
         {
             return Err(bad("the wave pairs do not fit the pool"));
         }
+        require_sorted_ranks(&wave.local_ranks)?;
         let mut layout = PrefillLayout::new(ckpt, w, experts, self.pairs, HostPages::page_size())?;
         layout.ranks.shape = vec![pairs];
         layout.tokens.shape = vec![pairs];
@@ -364,7 +379,11 @@ mod tests {
 
     /// The U32 ranks, tokens, and inverse permutation and the F32 gates come back as written, and
     /// the stacks have the rank-order shape `[3, rows, columns]`. One wave holds the whole route,
-    /// so its local ranks are the chunk ranks, and pair `p` belongs to token `p / 2`.
+    /// so its local ranks are the chunk ranks, and pair `p` belongs to token `p / 2`. The wave
+    /// lists its pairs in (rank, pair) order (`split_waves`): p0, p4, and p6 of rank 0 (tokens
+    /// 0, 2, 3), p1, p3, p5, and p7 of rank 1 (tokens 0, 1, 2, 3), and p2 of rank 2 (token 1),
+    /// so the ranks read 0, 0, 0, 1, 1, 1, 1, 2, the tokens 0, 2, 3, 0, 1, 2, 3, 1, and the
+    /// gates follow the pairs in that order.
     #[test]
     fn the_route_page_imports_u32_ranks_tokens_inverse_and_f32_gates() {
         let _serial = crate::native_test_lock();
@@ -397,15 +416,19 @@ mod tests {
                 .collect::<Vec<u8>>()
         };
         for (name, tensor, want) in [
-            ("ranks", &pages.ranks, bytes(&[0, 1, 2, 1, 0, 1, 0, 1])),
-            ("tokens", &pages.tokens, bytes(&[0, 0, 1, 1, 2, 2, 3, 3])),
+            ("ranks", &pages.ranks, bytes(&[0, 0, 0, 1, 1, 1, 1, 2])),
+            ("tokens", &pages.tokens, bytes(&[0, 2, 3, 0, 1, 2, 3, 1])),
             ("inverse", inverse_tensor, bytes(&inverse)),
         ] {
             let host = kernels.readback(tensor).unwrap();
             assert_eq!(host.host_bytes(), Some(want.as_slice()), "{name} bytes");
         }
         let gates = values(&mut kernels, &pages.gates).unwrap();
-        assert_eq!(gates, route.gates, "gates");
+        assert_eq!(
+            gates,
+            [0.5, 1.0, 0.625, 0.25, 0.75, 0.0, 0.375, 0.125],
+            "gates in (rank, pair) order"
+        );
         let shapes: Vec<&[u32]> = pages.stacks.iter().map(|s| s.logical_shape()).collect();
         assert_eq!(
             shapes,
@@ -477,6 +500,41 @@ mod tests {
         assert!(
             bad_request(&small, Some(&[0u32; 9][..])),
             "inverse longer than the pool"
+        );
+    }
+
+    /// Packet FN-PF-SORTED task 2 and the fix round: the import proves the wave order before any
+    /// device work of the wave. A wave whose local ranks fall (one inversion suffices) is a
+    /// `BadRequest` of the same pre-write group, whatever built the wave, and a sorted wave
+    /// imports into the same pool right after the rejection, which shows that the rejected
+    /// import checked the ranks before it acquired a set or wrote a page and left the pool
+    /// usable. The checks assert rather than `panic!` on the wrong shape, per decision 0032 (a
+    /// panicking native test marks the shared native owner failed and cascades).
+    #[test]
+    fn an_unsorted_wave_is_rejected_before_any_page_write() {
+        let _serial = crate::native_test_lock();
+        let mut kernels = MlxKernels::try_new().unwrap();
+        let (ckpt, weights) = load(&mut kernels);
+        let layers = weights.layers.iter().map(|layer| &layer.moe);
+        let mut pool = PrefillPool::new(&ckpt, layers, 4, 8).unwrap();
+        let mut wave = split_waves(&route(), 4).unwrap().waves.remove(0);
+        assert!(
+            wave.local_ranks.is_sorted(),
+            "the plan hands over sorted ranks"
+        );
+        wave.local_ranks.reverse();
+        let rejected = pool.import_wave(&mut kernels, &ckpt, &weights.layers[0].moe, &wave, None);
+        let failure = rejected.err();
+        assert!(
+            matches!(&failure, Some(EngError::BadRequest(m)) if m.starts_with("flash-next prefill:")),
+            "one inversion is a bad request that names the flash-next prefill: {failure:?}"
+        );
+        let sorted = split_waves(&route(), 4).unwrap().waves.remove(0);
+        let imported = pool.import_wave(&mut kernels, &ckpt, &weights.layers[0].moe, &sorted, None);
+        let failure = imported.err();
+        assert!(
+            failure.is_none(),
+            "the pool imports a sorted wave after the rejection: {failure:?}"
         );
     }
 

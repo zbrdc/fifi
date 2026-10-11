@@ -89,6 +89,7 @@ fn options_without_headroom() -> LoadOptions<'static> {
             ..Reserve::default()
         },
         drop_page_cache: None,
+        ..Default::default()
     }
 }
 
@@ -252,6 +253,48 @@ fn the_whole_model_loads_and_the_counts_match_the_header() {
     live_after_drop(&projector, start, "the model load");
 }
 
+/// `load_model` records the layout of its options in `LoadedModel.layout` (MATVEC-PAR S2,
+/// KUBDAN-MSG-68 M-4): one native whole-model load - `load_model` was covered only by the
+/// scratch route before. The native device bytes are the tiled totals minus the 27,811,840
+/// Q6_K tile padding (the plan tests pin the difference), every quantized tensor arrives as
+/// a `CudaWeight::Native`, and the drop frees the load. The Tiled side of the assertion is
+/// `the_whole_model_loads_and_the_counts_match_the_header` (the default options).
+#[test]
+#[ignore = "real file: needs INFERENCE_CUDA_MODEL_GGUF and a device with 20 GiB free"]
+fn load_model_records_the_native_layout_of_its_options() {
+    const NAME: &str = "load_model_records_the_native_layout_of_its_options";
+    let Some(model) = open_model(NAME) else {
+        return;
+    };
+    assert_plan_totals(&model);
+    let projector = CudaProjector::new().expect("create the CUDA projector");
+    let start = projector.live_bytes();
+    let native = LoadOptions {
+        layout: WeightLayout::Native,
+        ..options_without_headroom()
+    };
+    let loaded = projector
+        .load_model(&model, native)
+        .expect("load the whole model natively");
+    assert_eq!(loaded.layout, WeightLayout::Native, "{NAME}");
+    // The tiles of this file hold 27,811,840 bytes of Q6_K padding over the source blocks.
+    const NATIVE_DEVICE_BYTES: usize = DEVICE_BYTES - 27_811_840;
+    const _: () = assert!(NATIVE_DEVICE_BYTES == 20_408_576_512);
+    assert_eq!(loaded.device.device_bytes(), NATIVE_DEVICE_BYTES, "{NAME}");
+    for (name, _) in model.plan().tensors() {
+        match loaded
+            .device
+            .get(name)
+            .unwrap_or_else(|| panic!("{NAME}: tensor {name} is missing"))
+        {
+            CudaWeight::Native { .. } | CudaWeight::Raw { .. } => {}
+            CudaWeight::Tiled { .. } => panic!("{NAME}: tensor {name} loaded tiled under Native"),
+        }
+    }
+    drop(loaded);
+    live_after_drop(&projector, start, "the native model load");
+}
+
 #[test]
 #[ignore = "real file: needs INFERENCE_CUDA_MODEL_GGUF and a device"]
 fn a_refused_whole_model_load_leaves_the_live_bytes_unchanged_and_the_next_load_succeeds() {
@@ -268,6 +311,7 @@ fn a_refused_whole_model_load_leaves_the_live_bytes_unchanged_and_the_next_load_
             ..Reserve::default()
         },
         drop_page_cache: None,
+        ..Default::default()
     };
     match projector.load_model(&model, refused) {
         Err(EngError::MemoryPlan(text)) => {
@@ -1187,6 +1231,7 @@ fn measure_model_load_headroom() {
             ..Reserve::default()
         },
         drop_page_cache: drops.then_some(&file),
+        ..Default::default()
     };
     let device = projector
         .load_model(&model, options)

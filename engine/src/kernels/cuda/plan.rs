@@ -80,6 +80,52 @@ pub(crate) fn device_bytes(name: &str, ty: GgufType, dims: &[u64]) -> Result<u64
         .ok_or_else(overflow)
 }
 
+/// Values per block and bytes per block of the four native-layout types.
+const fn native_block(ty: GgufType) -> Option<(u64, u64)> {
+    match ty {
+        GgufType::Q4K => Some((256, 144)),
+        GgufType::Q6K => Some((256, 210)),
+        GgufType::Q80 => Some((32, 34)),
+        GgufType::Q50 => Some((32, 22)),
+        _ => None,
+    }
+}
+
+/// Device bytes of the tensor `name` after a native upload (MATVEC-PAR S2): the file's own
+/// blocks, row-major, exactly the source bytes. Q4_K, Q5_0, Q6_K and Q8_0 only. There is no
+/// 8-row rule and no tile-column rule: any row count from one up loads, and `dims[0]` must be
+/// a positive multiple of the type's block size up to `MAX_COLS`. The count differs from the
+/// tiles only for Q6_K, which needs 1680 native against 1792 tile bytes per 8x256 rows.
+/// F32 and F16 count as in [`device_bytes`]: both layouts load them as raw copies. Any other
+/// type fails with `EngError::Checkpoint` naming the tensor.
+pub(crate) fn native_device_bytes(name: &str, ty: GgufType, dims: &[u64]) -> Result<u64, EngError> {
+    if matches!(ty, GgufType::F32 | GgufType::F16) {
+        return device_bytes(name, ty, dims);
+    }
+    let overflow = || EngError::MemoryPlan(format!("tensor {name}: device size overflows u64"));
+    let (&cols, rest) = dims
+        .split_first()
+        .ok_or_else(|| EngError::Checkpoint(format!("tensor {name} has no dimensions")))?;
+    let rows = rest
+        .iter()
+        .try_fold(1u64, |rows, &dim| rows.checked_mul(dim))
+        .ok_or_else(overflow)?;
+    let Some((block_size, block_bytes)) = native_block(ty) else {
+        return Err(EngError::Checkpoint(format!(
+            "tensor {name} has type {ty:?}, which the CUDA native weights do not take"
+        )));
+    };
+    if rows == 0 || cols == 0 || !cols.is_multiple_of(block_size) || cols > MAX_COLS {
+        return Err(EngError::Checkpoint(format!(
+            "tensor {name} ({ty:?}) has {rows} rows of {cols}; the native layout needs rows \
+             above zero and a row length that is a multiple of {block_size} up to {MAX_COLS}"
+        )));
+    }
+    rows.checked_mul(cols / block_size)
+        .and_then(|blocks| blocks.checked_mul(block_bytes))
+        .ok_or_else(overflow)
+}
+
 fn check_tile_shape(name: &str, ty: GgufType, rows: u64, cols: u64) -> Result<(), EngError> {
     let tile_cols = tile_cols(ty);
     if rows == 0
@@ -219,6 +265,74 @@ mod tests {
             device_bytes("w", GgufType::F32, &[]),
             Err(EngError::Checkpoint(_))
         ));
+    }
+
+    #[test]
+    fn native_bytes_equal_tile_bytes_except_q6_k_for_every_tensor_class() {
+        // The tensor classes of the pinned checkpoint (Annex A dims): the Q4_K expert stacks
+        // [2048, 512, 256], the Q8_0 dense shapes, the Q4_K token embedding [2048, 248320] and
+        // the Q6_K output head. Native equals the tiles everywhere but Q6_K.
+        for (ty, dims) in [
+            (GgufType::Q4K, &[2048, 512, 256][..]),
+            (GgufType::Q80, &[2048, 8192][..]),
+            (GgufType::Q80, &[512, 2048][..]),
+            (GgufType::Q4K, &[2048, 248_320][..]),
+        ] {
+            assert_eq!(
+                native_device_bytes("w", ty, dims),
+                device_bytes("w", ty, dims),
+                "{ty:?} {dims:?}"
+            );
+        }
+        // Q6_K: 1680 native against 1792 tile bytes per 8x256 rows; the lm_head of the pinned
+        // checkpoint is 27,811,840 bytes smaller natively.
+        assert_eq!(native_device_bytes("w", GgufType::Q6K, &[256, 8]), Ok(1680));
+        assert_eq!(device_bytes("w", GgufType::Q6K, &[256, 8]), Ok(1792));
+        assert_eq!(
+            native_device_bytes("out", GgufType::Q6K, &[2048, 248_320]),
+            Ok(417_177_600)
+        );
+        assert_eq!(
+            device_bytes("out", GgufType::Q6K, &[2048, 248_320]),
+            Ok(444_989_440)
+        );
+        assert_eq!(444_989_440 - 417_177_600, 27_811_840);
+    }
+
+    #[test]
+    fn native_bytes_drop_the_tile_shape_rules_and_refuse_other_types() {
+        // 12 rows and a 224-value row: off every tile rule, on the Q8_0 block grid.
+        assert_eq!(
+            native_device_bytes("w", GgufType::Q80, &[224, 12]),
+            Ok(12 * 7 * 34)
+        );
+        assert!(device_bytes("w", GgufType::Q80, &[224, 12]).is_err());
+        for dims in [[100, 8], [0, 8], [MAX_COLS + 256, 8], [256, 0]] {
+            let error =
+                native_device_bytes("embd", GgufType::Q4K, &dims).expect_err("off the native grid");
+            assert!(
+                matches!(&error, EngError::Checkpoint(message) if message.contains("embd")),
+                "{dims:?}: {error:?}"
+            );
+        }
+        assert!(matches!(
+            native_device_bytes("w", GgufType::Q5K, &[256, 8]),
+            Err(EngError::Checkpoint(message)) if message.contains("tensor w has type Q5K")
+        ));
+        // F32 and F16 count as in the tiled plan: raw copies in both layouts.
+        assert_eq!(native_device_bytes("norm", GgufType::F32, &[5]), Ok(20));
+        assert_eq!(native_device_bytes("t", GgufType::F16, &[3, 7]), Ok(42));
+        assert!(matches!(
+            native_device_bytes("w", GgufType::F32, &[]),
+            Err(EngError::Checkpoint(_))
+        ));
+        // Q5_0 pins its own block, 22 bytes per 32 values (not Q8_0's 34): one row of one
+        // block, and the Mellum ffn_down_exps stack. Rows below the tile rule load natively.
+        assert_eq!(native_device_bytes("q5", GgufType::Q50, &[32, 1]), Ok(22));
+        assert_eq!(
+            native_device_bytes("e", GgufType::Q50, &[896, 2304, 64]),
+            Ok(28 * 22 * 2304 * 64)
+        );
     }
 
     #[test]
