@@ -78,6 +78,8 @@ const CUDA_SOURCES: &[&str] = &[
     "src/kernels/cuda/native/resident/matvec_q.cu",
     "src/kernels/cuda/native/resident/matvec_expert.cu",
     "src/kernels/cuda/native/resident/mmvq_arch.cu",
+    "src/kernels/cuda/native/resident/add_rmsnorm_q8.cu",
+    "src/kernels/cuda/native/resident/swiglu_q8.cu",
 ];
 
 /// The vendored llama.cpp MMQ sources that compile to objects (MATVEC-PAR S1 c2b). Decision 0049
@@ -101,6 +103,7 @@ const CUDA_HEADERS: &[&str] = &[
     "src/kernels/cuda/native/prefill/ggml_shim/ggml.h",
     "src/kernels/cuda/native/prefill/ggml_shim/unary.cuh",
     "src/kernels/cuda/native/resident/add_norm_pack.h",
+    "src/kernels/cuda/native/resident/add_rmsnorm_q8.h",
     "src/kernels/cuda/native/resident/attn_decode.h",
     "src/kernels/cuda/native/resident/attn_prep.h",
     "src/kernels/cuda/native/resident/embed.h",
@@ -117,6 +120,7 @@ const CUDA_HEADERS: &[&str] = &[
     "src/kernels/cuda/native/resident/router.h",
     "src/kernels/cuda/native/resident/step_params.h",
     "src/kernels/cuda/native/resident/swiglu_pack.h",
+    "src/kernels/cuda/native/resident/swiglu_q8.h",
     "vendor/ggml-cuda-mmq/src/ggml-common.h",
     "vendor/ggml-cuda-mmq/src/ggml-cuda/common.cuh",
     "vendor/ggml-cuda-mmq/src/ggml-cuda/mma.cuh",

@@ -243,7 +243,7 @@ mod tests {
     fn check_expert_refuses_short_unpadded_misaligned_and_overlapping_ranges() {
         let device = RawDevice::unbacked(1 << 23);
         assert_eq!(verdict(&device, &VALID), Ok(()));
-        let cases: [LayoutCase; 29] = [
+        let cases: [LayoutCase; 30] = [
             ("stack one block short", |l| l.w_stack.1 = STACK_BYTES - 144),
             ("ids one int short", |l| l.ids.1 = IDS_BYTES - 4),
             ("x one byte short", |l| l.x_q8.1 = X_ROW_BYTES - 1),
@@ -285,6 +285,13 @@ mod tests {
             ("rows * n_expert overflows (F10)", |l| {
                 l.rows = (usize::MAX / 8) & !3;
                 l.y_slot_stride = l.rows;
+            }),
+            ("rows * n_expert wraps to zero (1<<61 x 8)", |l| {
+                l.rows = 1 << 61;
+                l.n_expert = 8;
+                l.n_used = 1;
+                l.ids.1 = 4;
+                l.y_slot_stride = 1 << 61;
             }),
             ("stack bytes overflow", |l| {
                 l.rows = (usize::MAX / 288) & !3;
@@ -379,7 +386,9 @@ mod tests {
     /// must answer `INVALID_ARGUMENT`; a case that is not refused reaches the CUDA runtime (status
     /// 35 on the CPU runner), so the failure message lists each such case with its status. The
     /// control mutants E1 (the four alignment checks), E2 (the y/x_q8 and y/w_stack overlap checks)
-    /// and E3 (the `y_slot_stride < rows` check) each flip named cases of this table.
+    /// and E3 (the `y_slot_stride < rows` check) each flip named cases of this table, and the
+    /// stack-guard mutants S2b (both int64 guards), S2b1 (guard 1 only) and S2b2 (guard 2 only)
+    /// each flip the two wrap-to-zero rows.
     #[test]
     fn matvec_expert_arguments_are_checked_before_any_launch() {
         let ranges = [
@@ -397,7 +406,7 @@ mod tests {
                 );
             }
         }
-        let cases: [Case; 31] = [
+        let cases: [Case; 33] = [
             ("NULL w_stack", |a| a.w_stack = 0),
             ("NULL ids", |a| a.ids = 0),
             ("NULL x_q8", |a| a.x_q8 = 0),
@@ -437,6 +446,28 @@ mod tests {
                 a.rows = 1 << 26;
                 a.y_slot_stride = c_int::MAX;
             }),
+            // S2b (lane C's S2 review): the two stack-byte overflow guards, reached with every
+            // EARLIER check satisfied — the "stack bytes overflow" case above is also caught by
+            // the apart guard once the guards are deleted (its n_expert x c_int::MAX stride y
+            // footprint ~60 GB and the wrapped stack bytes ~1.8e19 both overlap), so it kills
+            // nothing. Both cases below wrap the product to EXACTLY zero without the guards
+            // (2^30 x 2^30 x 144 = 9 x 2^64, and 2^52 x 2^20 = 2^72), keep y at 1 << 40 so its
+            // 2^35-byte footprint overlaps nothing, and pass rows % 4, k % 256, n_used <= 8,
+            // the alignments and the c_int ranges.
+            ("stack bytes wrap to zero (guard 2)", |a| {
+                a.k = 256;
+                a.rows = 1 << 30;
+                a.n_expert = 1 << 30;
+                a.y_slot_stride = 1 << 30;
+                a.y = 1 << 40;
+            }),
+            ("expert blocks over INT64_MAX/n_expert (guard 1)", |a| {
+                a.k = 1 << 30;
+                a.rows = 1 << 30;
+                a.n_expert = 1 << 20;
+                a.y_slot_stride = 1 << 30;
+                a.y = 1 << 40;
+            }),
             ("y over the last id word", |a| a.y = a.ids + 28),
             ("per-slot x, y over the seventh activation row", |a| {
                 a.x_per_slot = 1;
@@ -463,6 +494,34 @@ mod tests {
         assert!(
             not_refused.is_empty(),
             "expert: cases not refused with INVALID_ARGUMENT: {not_refused:?}"
+        );
+    }
+
+    /// S5c (lane C's K2 verdict): no `check_expert` row can tell a wrapping `call_sizes` from
+    /// the checked one — the c_int ranges refuse the huge rows before the sizes are computed —
+    /// so the wrap is pinned directly. rows 1<<61 x 8 experts wraps to 2^64 == 0 in the
+    /// stack-rows product while every other count of this call stays inside usize (y:
+    /// 0 * stride + 1<<61 floats, one shared activation row, 16 padded blocks), so a wrapping
+    /// form would answer `Some` and this assert fails.
+    #[test]
+    fn call_sizes_refuses_a_rows_n_expert_that_wraps_to_zero() {
+        let device = RawDevice::unbacked(64);
+        let range = || RawRange::new(&device, 0, 64).expect("a range inside the arena");
+        assert!(
+            call_sizes(&ExpertMatvecRaw {
+                ty: QuantType::Q4K,
+                w_stack: range(),
+                ids: range(),
+                x_q8: range(),
+                x_per_slot: false,
+                y: range(),
+                y_slot_stride: 1 << 61,
+                k: 256,
+                rows: 1 << 61,
+                n_expert: 8,
+                n_used: 1,
+            })
+            .is_none()
         );
     }
 }

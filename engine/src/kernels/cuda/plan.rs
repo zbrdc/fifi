@@ -315,6 +315,17 @@ mod tests {
                 "{dims:?}: {error:?}"
             );
         }
+        // The row length limit is inclusive: exactly MAX_COLS values load (the guard is
+        // `cols > MAX_COLS`, which reaches this row with every earlier check satisfied: rows 1,
+        // a multiple of 256), one block more does not (the [MAX_COLS + 256, 8] row above).
+        assert_eq!(
+            native_device_bytes("w", GgufType::Q4K, &[MAX_COLS, 1]),
+            Ok(MAX_COLS / 256 * 144)
+        );
+        assert_eq!(
+            native_device_bytes("w", GgufType::Q80, &[MAX_COLS, 3]),
+            Ok(3 * (MAX_COLS / 32) * 34)
+        );
         assert!(matches!(
             native_device_bytes("w", GgufType::Q5K, &[256, 8]),
             Err(EngError::Checkpoint(message)) if message.contains("tensor w has type Q5K")

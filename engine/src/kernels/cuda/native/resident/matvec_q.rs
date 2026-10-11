@@ -425,7 +425,5 @@ mod tests {
             edit(&mut args);
             assert_eq!(run(args), STATUS_INVALID_ARGUMENT, "matvec: {name}");
         }
-        // The dense view: an ids-less launch of ncols 1 is the shape the entry builds.
-        let _ = QuantType::Q4K.block_bytes();
     }
 }

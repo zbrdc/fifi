@@ -670,10 +670,10 @@ fn nan_filled(ctx: &CudaContext, bytes: usize) -> DeviceBuffer {
     testkit::upload_bytes(ctx, &fill)
 }
 
-/// Times `launch` 200 times with events and returns the microseconds per launch; with `flush`
-/// some, every launch is preceded by a big read that evicts L2 (the 3090 has 6 MB).
+/// Times `launch` `iters` times between two events and returns the microseconds per launch; the
+/// warmup before the window is `iters.min(10)` launches.
 fn bench(ctx: &CudaContext, stream: &DeviceStream, iters: usize, launch: &dyn Fn()) -> f32 {
-    for _ in 0..10 {
+    for _ in 0..iters.min(10) {
         launch();
     }
     stream.synchronize().expect("warmup drain");
@@ -696,6 +696,17 @@ fn matvec_report_gbps() {
     }
     let ctx = CudaContext::new().expect("context");
     let stream = ctx.stream().expect("stream");
+    // S1 follow-up 3 (KUBDAN-MSG-67 condition 2): the debug cargo profile runs unoptimised
+    // device code (lane L measured it about 100x slower: qkv 3350 us, lm_head 191 ms), so its
+    // timings are meaningless. The loops shrink to a smoke pass; every correctness check stays.
+    let (warm_iters, cold_iters) = if cfg!(debug_assertions) {
+        (5, 3)
+    } else {
+        (200, 20)
+    };
+    if cfg!(debug_assertions) {
+        println!("debug build: timing shrunk to {warm_iters} warm / {cold_iters} cold passes");
+    }
     // The six dense shapes of the design table (the three expert rows are measured in
     // matvec_expert's tests, which own the expert wrapper).
     let mut shapes: Vec<(&str, QuantType, usize, usize)> = vec![
@@ -744,8 +755,9 @@ fn matvec_report_gbps() {
         .expect("flush matvec");
     };
     println!(
-        "warm = 200 launches between two events; cold = one launch timed alone right after a read \
-         of the {} MB flush buffer (L2 evicted); a shape under 6 MB is resident in L2 when warm",
+        "warm = {warm_iters} launches between two events; cold = one launch timed alone right \
+         after a read of the {} MB flush buffer (L2 evicted); a shape under 6 MB is resident in \
+         L2 when warm",
         flush_w_bytes / 1_000_000
     );
     println!("shape                     warm_us  cold_us   GB/s_warm GB/s_cold  %936");
@@ -769,10 +781,10 @@ fn matvec_report_gbps() {
             )
             .expect("matvec");
         };
-        let warm_us = bench(&ctx, &stream, 200, &launch);
-        // Cold: one launch behind the L2 flush read, timed alone, median of 20.
+        let warm_us = bench(&ctx, &stream, warm_iters, &launch);
+        // Cold: one launch behind the L2 flush read, timed alone, median of the cold passes.
         let mut cold = Vec::new();
-        for _ in 0..20 {
+        for _ in 0..cold_iters {
             flush();
             let start = ctx.bench_mark(&stream).expect("start");
             launch();
@@ -857,9 +869,9 @@ fn matvec_report_gbps() {
             )
             .expect("expert matvec");
         };
-        let warm_us = bench(&ctx, &stream, 200, &|| launch(&fixed));
+        let warm_us = bench(&ctx, &stream, warm_iters, &|| launch(&fixed));
         let mut cold = Vec::new();
-        for set in 0..20 {
+        for set in 0..cold_iters {
             flush();
             let ids = id_sets[set % id_sets.len()].range(0, 32).expect("ids");
             let start = ctx.bench_mark(&stream).expect("start");

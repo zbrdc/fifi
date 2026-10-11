@@ -211,6 +211,28 @@ fn expert_needs_are_pure_and_exact() {
     assert!(expert_needs(&huge_stride).is_none());
     let no_slots = ExpertShape { n_used: 0, ..shape };
     assert!(expert_needs(&no_slots).is_none());
+    // S1 follow-up 1 (KUBDAN-MSG-67 condition 2): a `rows * n_expert` that WRAPS TO ZERO while
+    // every later product stays small, so only the checked multiply refuses it. rows 1<<61 x 8
+    // experts wraps to 0 (a wrapping form would answer weight_bytes(0, k) = 0 and pass), and
+    // the y footprint (0 * stride + 1<<61, times 4 = 1<<63) still fits usize. The packet's
+    // 1<<62 x 4 form wraps as well; BOTH forms are refused by the rows.checked_mul(n_expert)
+    // multiply itself (1<<62 * 4 = 2^64 overflows it too — the second form's y footprint would
+    // also overflow its own multiply, but the w_stack field is evaluated first); both are
+    // pinned.
+    let wrap_zero = ExpertShape {
+        rows: 1 << 61,
+        n_expert: 8,
+        n_used: 1,
+        y_slot_stride: 1 << 61,
+        ..shape
+    };
+    assert!(expert_needs(&wrap_zero).is_none());
+    let wrap_zero_y_too = ExpertShape {
+        rows: 1 << 62,
+        n_expert: 4,
+        ..shape
+    };
+    assert!(expert_needs(&wrap_zero_y_too).is_none());
 }
 
 #[test]

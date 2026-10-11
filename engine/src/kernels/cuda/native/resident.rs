@@ -40,6 +40,7 @@ use super::{
 
 // One `pub(in crate::kernels::cuda) mod <n>;` line per kernel child module, alphabetical.
 pub(in crate::kernels::cuda) mod add_norm_pack;
+pub(in crate::kernels::cuda) mod add_rmsnorm_q8;
 pub(in crate::kernels::cuda) mod attn_decode;
 pub(in crate::kernels::cuda) mod attn_prep;
 pub(in crate::kernels::cuda) mod embed;
@@ -55,6 +56,7 @@ pub(in crate::kernels::cuda) mod quantize_q8_1;
 pub(in crate::kernels::cuda) mod router;
 pub(in crate::kernels::cuda) mod step_params;
 pub(in crate::kernels::cuda) mod swiglu_pack;
+pub(in crate::kernels::cuda) mod swiglu_q8;
 
 /// A non-blocking CUDA stream. Consumed by [`stream_destroy`].
 #[derive(Debug)]

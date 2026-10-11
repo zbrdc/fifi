@@ -77,6 +77,7 @@
 
 // One `pub(crate) mod <n>;` line per kernel, alphabetical, below this line.
 pub(crate) mod add_norm_pack;
+pub(crate) mod add_rmsnorm_q8;
 pub(crate) mod attn_decode;
 pub(crate) mod attn_prep;
 pub(crate) mod embed;
@@ -90,3 +91,4 @@ pub(crate) mod quantize_q8_1;
 pub(crate) mod router;
 pub(crate) mod step_params;
 pub(crate) mod swiglu_pack;
+pub(crate) mod swiglu_q8;
