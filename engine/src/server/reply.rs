@@ -225,7 +225,7 @@ mod tests {
     use crate::sched::worker::Engine;
     use crate::server::error::ServerError;
     use crate::server::pieces::{Piece, ReplyParser};
-    use crate::server::reqlog::RequestLog;
+    use crate::server::reqlog::{RequestLog, default_clock};
     use crate::server::testkit;
     use crate::server::wire::{FinishReason, ReplyHead, Usage};
     use crate::tokenizer::toolcall::{Start, ToolCall as ParsedCall};
@@ -238,7 +238,13 @@ mod tests {
 
     /// A request log that writes nowhere. The tests of the pump do not read the log.
     fn silent() -> RequestLog {
-        RequestLog::new(Arc::new(Mutex::new(std::io::sink())), "m", false, 3)
+        RequestLog::new(
+            Arc::new(Mutex::new(std::io::sink())),
+            default_clock(),
+            "m",
+            false,
+            3,
+        )
     }
 
     fn head() -> ReplyHead {

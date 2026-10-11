@@ -13,10 +13,6 @@
 //! - The C argument structs are live locals that the entries read only during the call. Their
 //!   `repr(C)` mirrors are private here and pinned by `const` asserts to the `static_assert`s of
 //!   `step_params.h`. No raw pointer and no unsafe function leaves this module.
-#![cfg_attr(
-    not(test),
-    expect(dead_code, reason = "staged for RD-9a (decision 0047)")
-)]
 
 use std::ffi::{c_int, c_void};
 use std::mem::{offset_of, size_of};

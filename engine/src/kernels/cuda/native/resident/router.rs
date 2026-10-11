@@ -16,10 +16,6 @@
 //!   synchronizes the whole device before `cudaFree`; the launch is asynchronous.
 //! - The extern declaration, the `repr(C)` mirror and every raw pointer stay private to this file;
 //!   nothing is re-exported.
-#![cfg_attr(
-    not(test),
-    expect(dead_code, reason = "staged for RD-9a (decision 0047)")
-)]
 
 use std::ffi::{c_int, c_void};
 use std::ptr;

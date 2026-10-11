@@ -63,33 +63,17 @@ static LIVE_BYTES: AtomicUsize = AtomicUsize::new(0);
 
 /// Live streams of this process. Like [`LIVE_BYTES`], an owner skipped after a
 /// terminal failure stays counted.
-#[cfg_attr(
-    not(test),
-    expect(dead_code, reason = "staged for RD-9a (decision 0047)")
-)]
 static LIVE_STREAMS: AtomicUsize = AtomicUsize::new(0);
 
 /// Live events of this process. An owner skipped after a terminal failure stays
 /// counted.
-#[cfg_attr(
-    not(test),
-    expect(dead_code, reason = "staged for RD-9a (decision 0047)")
-)]
 static LIVE_EVENTS: AtomicUsize = AtomicUsize::new(0);
 
 /// Bytes of pinned host memory held by live owners of this process. An owner
 /// skipped after a terminal failure stays counted.
-#[cfg_attr(
-    not(test),
-    expect(dead_code, reason = "staged for RD-9a (decision 0047)")
-)]
 static LIVE_PINNED: AtomicUsize = AtomicUsize::new(0);
 
 /// The last stream id handed out. Ids start at 1, so 0 names no stream.
-#[cfg_attr(
-    not(test),
-    expect(dead_code, reason = "staged for RD-9a (decision 0047)")
-)]
 static STREAM_IDS: AtomicU64 = AtomicU64::new(0);
 
 /// Live executable graphs of this process. An owner skipped after a terminal

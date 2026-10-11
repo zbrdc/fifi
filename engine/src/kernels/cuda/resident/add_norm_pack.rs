@@ -26,10 +26,6 @@
 //! shape and `eps`, size and alignment (`require_fit`), disjointness (`require_apart`), then
 //! `raw_range` for each range, all before `launch_on`. So on a latched context every call answers
 //! the latch error and the native entry never sees a bad argument (it would latch the backend).
-#![cfg_attr(
-    not(test),
-    expect(dead_code, reason = "staged for RD-9a (decision 0047)")
-)]
 
 use std::ffi::c_int;
 

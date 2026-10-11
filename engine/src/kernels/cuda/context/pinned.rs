@@ -17,10 +17,6 @@
 //!
 //! The word is `!Send` and `!Sync`, shares the lease of its context, and follows
 //! the drop rule of decision 0022 through [`super::stream::release`].
-#![cfg_attr(
-    not(test),
-    expect(dead_code, reason = "staged for RD-9a (decision 0047)")
-)]
 
 use std::{cell::Cell, marker::PhantomData, rc::Rc, sync::atomic::Ordering};
 

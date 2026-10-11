@@ -26,6 +26,32 @@ pub(crate) fn default_sink() -> Sink {
     }
 }
 
+/// The clock that stamps the moments of a request: a function that reads the current moment. A
+/// server request holds the wall clock; a test request holds a clock with fixed steps.
+pub(crate) type Clock = Box<dyn FnMut() -> Instant + Send>;
+
+/// The clock of a new request: the wall clock in a server, and in a test build a clock with fixed
+/// 2 ms steps, so that every span a test reads is exact and no test waits on the wall clock.
+pub(crate) fn default_clock() -> Clock {
+    if cfg!(test) {
+        stepped_clock(Duration::from_millis(2))
+    } else {
+        Box::new(Instant::now)
+    }
+}
+
+/// A clock with fixed steps for a test: read `n` gives `start + n * step`, so the span between two
+/// reads is exact and no real time passes.
+fn stepped_clock(step: Duration) -> Clock {
+    let start = Instant::now();
+    let mut reads = 0_u32;
+    Box::new(move || {
+        let at = start + step.saturating_mul(reads);
+        reads = reads.saturating_add(1);
+        at
+    })
+}
+
 /// How a request ended.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Outcome {
@@ -103,6 +129,8 @@ fn render(entry: &Entry<'_>) -> String {
 /// Follows one request from its prompt to its end and writes its line once.
 pub(crate) struct RequestLog {
     sink: Sink,
+    /// Stamps the moments of the request.
+    clock: Clock,
     model: String,
     stream: bool,
     request_id: Option<String>,
@@ -117,10 +145,18 @@ pub(crate) struct RequestLog {
 }
 
 impl RequestLog {
-    /// Starts the log of a request whose prompt has `prompt_tokens` tokens.
-    pub(crate) fn new(sink: Sink, model: &str, stream: bool, prompt_tokens: u32) -> Self {
+    /// Starts the log of a request whose prompt has `prompt_tokens` tokens. `clock` stamps the
+    /// moments of the request: `default_clock` in a server, a fixed-step clock in a test.
+    pub(crate) fn new(
+        sink: Sink,
+        clock: Clock,
+        model: &str,
+        stream: bool,
+        prompt_tokens: u32,
+    ) -> Self {
         Self {
             sink,
+            clock,
             model: model.to_string(),
             stream,
             request_id: None,
@@ -140,7 +176,7 @@ impl RequestLog {
 
     /// Records that the queue admitted the job.
     pub(crate) fn admit(&mut self) {
-        self.admitted = Some(Instant::now());
+        self.admitted = Some((self.clock)());
     }
 
     /// Records the arrival of a batch. A batch without tokens counts for nothing.
@@ -148,7 +184,7 @@ impl RequestLog {
         if tokens == 0 {
             return;
         }
-        let now = Instant::now();
+        let now = (self.clock)();
         self.first_batch.get_or_insert((now, tokens));
         self.last_batch = Some(now);
         self.completion_tokens = self.completion_tokens.saturating_add(tokens);
@@ -235,7 +271,7 @@ impl Drop for RequestLog {
 
 #[cfg(test)]
 mod tests {
-    use super::{Entry, Outcome, RequestLog, millis, rate, render};
+    use super::{Entry, Outcome, RequestLog, default_clock, millis, rate, render, stepped_clock};
     use crate::EngError;
     use crate::sched::worker::{Engine, EngineState};
     use crate::server::router::router;
@@ -415,11 +451,53 @@ mod tests {
         assert_eq!(millis(Duration::from_micros(1999)), 2.0);
     }
 
+    /// The line of a request whose `batches` batches of one token arrive `step` apart on an
+    /// injected fixed-step clock: 21 prompt tokens, and a reply that ends with `Length`.
+    fn stamped_line(step: Duration, batches: u32) -> Value {
+        let capture = Capture::default();
+        let mut log = RequestLog::new(
+            Arc::new(Mutex::new(capture.clone())),
+            stepped_clock(step),
+            "model-a",
+            false,
+            21,
+        );
+        log.admit();
+        for _ in 0..batches {
+            log.batch(1);
+        }
+        log.done(FinishReason::Length, &Usage::new(21, batches, 0));
+        drop(log);
+        let mut lines = capture.lines();
+        assert_eq!(lines.len(), 1, "{lines:?}");
+        lines.remove(0)
+    }
+
+    /// The helper of the timing tests writes one line with the counts of its batches.
+    #[test]
+    fn a_stamped_line_holds_the_counts_of_its_batches() {
+        let line = stamped_line(Duration::from_millis(2), 3);
+        assert_eq!(line["prompt_tokens"], 21, "{line}");
+        assert_eq!(line["completion_tokens"], 3, "{line}");
+        assert_eq!(line["reused_tokens"], 0, "{line}");
+    }
+
+    /// The one bound check of the rate computation, on fixed synthetic timings: 10 decode tokens
+    /// over 20 ms give exactly the 500 tokens per second bound, and a zero duration gives the
+    /// documented fallback of no rate.
+    #[test]
+    fn the_rate_computation_holds_its_bound_on_fixed_timings_and_a_zero_duration_gives_no_rate() {
+        let fast = stamped_line(Duration::from_millis(2), 11);
+        assert_eq!(fast["decode_tokens_per_second"], 500.0, "{fast}");
+        let flat = stamped_line(Duration::ZERO, 11);
+        assert_eq!(flat["decode_tokens_per_second"], Value::Null, "{flat}");
+    }
+
     #[test]
     fn a_line_goes_out_in_one_write_and_the_drop_adds_none() {
         let capture = Capture::default();
         let sink = Arc::new(Mutex::new(capture.clone()));
-        let mut log = RequestLog::new(sink, "m", false, 4);
+        let mut log = RequestLog::new(sink, default_clock(), "m", false, 4);
         log.set_id("chatcmpl-9");
         log.admit();
         log.batch(0);
@@ -449,14 +527,14 @@ mod tests {
 
     #[test]
     fn a_sink_that_fails_loses_the_line_and_nothing_else() {
-        let mut log = RequestLog::new(Arc::new(Mutex::new(Broken)), "m", false, 4);
+        let mut log = RequestLog::new(Arc::new(Mutex::new(Broken)), default_clock(), "m", false, 4);
         log.done(FinishReason::Stop, &Usage::new(4, 0, 0));
         drop(log);
     }
 
     #[tokio::test]
     async fn a_non_streaming_reply_writes_one_line_with_its_counts_and_timings() {
-        let probes = testkit::probes(Duration::from_millis(2));
+        let probes = testkit::probes(Duration::ZERO);
         let (app, capture) = app(&probes.engine, 100_000);
         let body = request(json!({"temperature": 0, "max_tokens": 5}));
         let post = testkit::post_json("/v1/chat/completions", &body);
@@ -478,12 +556,11 @@ mod tests {
         assert_eq!(line["completion_tokens"], 5);
         assert_eq!(line["reused_tokens"], 0);
         assert_eq!(line["queue_wait_ms"], Value::Null);
-        // The probe sleeps 2 ms before each decode: the first token needs 2 ms, and the 4 later
-        // tokens need 8 ms, which caps the rate at 500 tokens per second.
-        let first = line["time_to_first_token_ms"].as_f64().expect("a time");
-        assert!(first >= 2.0, "{first}");
-        let rate = line["decode_tokens_per_second"].as_f64().expect("a rate");
-        assert!(rate > 0.0 && rate <= 500.0, "{rate}");
+        // The clock of a test request stamps every moment 2 ms after the last, so the timings are
+        // exact: the first token needs 2 ms, and the 4 later tokens need 8 ms, which gives exactly
+        // 500 tokens per second, the cap that the wall-clock test flaked on.
+        assert_eq!(line["time_to_first_token_ms"], 2.0, "{line}");
+        assert_eq!(line["decode_tokens_per_second"], 500.0, "{line}");
     }
 
     #[tokio::test]
@@ -557,7 +634,7 @@ mod tests {
 
     #[tokio::test]
     async fn a_stream_that_the_client_drops_writes_one_cancelled_line() {
-        let probes = testkit::probes(Duration::from_millis(2));
+        let probes = testkit::probes(Duration::ZERO);
         let (app, capture) = app(&probes.engine, 100_000);
         let body = request(json!({"stream": true, "max_tokens": 50_000}));
         let post = testkit::post_json("/v1/chat/completions", &body);
@@ -585,11 +662,14 @@ mod tests {
         assert_eq!(line["finish_reason"], Value::Null);
         let produced = line["completion_tokens"].as_u64().expect("count");
         assert!((1..50_000).contains(&produced), "{produced}");
-        assert!(line["time_to_first_token_ms"].is_f64(), "{line}");
+        assert_eq!(line["time_to_first_token_ms"], 2.0, "{line}");
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn a_dropped_non_streaming_request_writes_a_cancelled_line_without_a_status() {
+        // The probe delay keeps the job mid-generation until the abort: the non-streaming pump
+        // runs eagerly, and a fast probe could finish the 50_000 tokens first. It feeds no
+        // asserted duration.
         let probes = testkit::probes(Duration::from_millis(2));
         let (app, capture) = app(&probes.engine, 100_000);
         let body = request(json!({"max_tokens": 50_000}));
@@ -697,7 +777,7 @@ mod tests {
         assert_eq!(line["error_code"], "backend_error");
         assert_eq!(line["finish_reason"], Value::Null);
         assert_eq!(line["completion_tokens"], 2);
-        assert!(line["time_to_first_token_ms"].is_f64(), "{line}");
+        assert_eq!(line["time_to_first_token_ms"], 2.0, "{line}");
         let raw = &capture.writes()[0];
         assert!(
             !raw.contains("Metal"),

@@ -33,10 +33,6 @@
 //! `INVALID_ARGUMENT` (which would latch the backend). Local rules carry the tag
 //! `attn_decode: <rule>`; size, alignment and overlap are refused by `require_fit` and
 //! `require_apart` with their own texts.
-#![cfg_attr(
-    not(test),
-    expect(dead_code, reason = "staged for RD-9a (decision 0047)")
-)]
 
 use std::ffi::c_int;
 

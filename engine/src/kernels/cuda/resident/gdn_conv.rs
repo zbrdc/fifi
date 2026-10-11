@@ -35,10 +35,6 @@
 //! `out` 4, `weights` 16); `state`, which the kernel reads and writes, overlaps none of the other
 //! ranges, and `out` overlaps neither `proj` nor `weights` (`proj` and `weights` are read only
 //! and may share bytes); the four ranges belong to this context. A refused call changes nothing.
-#![cfg_attr(
-    not(test),
-    expect(dead_code, reason = "staged for RD-9a (decision 0047)")
-)]
 
 use crate::EngError;
 use crate::kernels::cuda::context::{Claim, require_apart, require_fit};

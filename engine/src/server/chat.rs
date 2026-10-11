@@ -8,7 +8,7 @@ use super::error::ServerError;
 use super::messages::bad;
 use super::pieces::ReplyParser;
 use super::reply::{RunningJob, collect};
-use super::reqlog::RequestLog;
+use super::reqlog::{RequestLog, default_clock};
 use super::sse;
 use super::state::{AppState, unix_seconds};
 use super::validate::{ChatInput, parse_chat};
@@ -106,7 +106,13 @@ async fn submit(state: &AppState, input: ChatInput) -> Result<Submitted, ServerE
     })??;
     let prompt_tokens = u32::try_from(prompt.len()).unwrap_or(u32::MAX);
     // From here on, every end of the request writes one line of the request log.
-    let mut log = RequestLog::new(state.request_log(), &entry.model, stream, prompt_tokens);
+    let mut log = RequestLog::new(
+        state.request_log(),
+        default_clock(),
+        &entry.model,
+        stream,
+        prompt_tokens,
+    );
     if prompt_tokens >= entry.context_limit {
         return Err(failed(
             &mut log,

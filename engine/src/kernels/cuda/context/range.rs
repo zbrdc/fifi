@@ -3,10 +3,6 @@
 //! The pinned-word copy takes a [`DeviceRange`] instead of a raw pointer, so
 //! the bounds are proved once, in safe code, when the range is made. The
 //! native layer checks them again (`native::resident::RawRange`).
-#![cfg_attr(
-    not(test),
-    expect(dead_code, reason = "staged for RD-9a (decision 0047)")
-)]
 
 use super::DeviceBuffer;
 use crate::EngError;

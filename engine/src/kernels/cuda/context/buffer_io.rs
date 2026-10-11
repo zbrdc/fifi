@@ -20,10 +20,6 @@
 //! - Every range is proved in bounds here, before any native call, so a caller
 //!   mistake is a `BadRequest` and never a terminal adapter failure;
 //!   `native::resident` checks it again.
-#![cfg_attr(
-    not(test),
-    expect(dead_code, reason = "staged for RD-9a (decision 0047)")
-)]
 
 use super::graph::ensure_closed;
 use super::stream::{DeviceStream, same_adapter};

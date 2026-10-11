@@ -23,10 +23,6 @@
 //! type. The checks above are shared; only the shape rule differs (`q5_0_shape_ok`: k a multiple
 //! of 128, no split along k) and `xf` holds a row of `native::activation_k` values (K = 896 gives
 //! a 1024-wide fragment-order buffer with a zero tail the kernel never reads).
-#![cfg_attr(
-    not(test),
-    expect(dead_code, reason = "staged for RD-9a (decision 0047)")
-)]
 
 use crate::EngError;
 use crate::kernels::cuda::context::{Claim, require_apart, require_fit};

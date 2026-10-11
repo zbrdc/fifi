@@ -9,7 +9,7 @@
 //! `Q36_THREADS` (default: all cores), `Q36_SOURCE_COMMIT` (default: `git rev-parse HEAD` of the checkout).
 //!
 //! Input identity: before any compute, the run hashes `config.json`, the index, `tokenizer.json`, and
-//! every shard, and compares size and SHA-256 with the pins of `docs/environment/mac-phase0a.json`
+//! every shard, and compares size and SHA-256 with the pins of `engine/testdata/mac-phase0a.json`
 //! (included at compile time). A mismatch fails the run. `host-ref.json` records every file name, size,
 //! and SHA-256 and the source commit.
 //!

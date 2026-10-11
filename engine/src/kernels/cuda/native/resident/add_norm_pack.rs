@@ -16,10 +16,6 @@
 //!   device before `cudaFree`.
 //! - The `extern` declaration, the `repr(C)` mirror and every raw pointer are private to this
 //!   file. Nothing is re-exported.
-#![cfg_attr(
-    not(test),
-    expect(dead_code, reason = "staged for RD-9a (decision 0047)")
-)]
 
 use std::ffi::{c_int, c_void};
 use std::mem::{offset_of, size_of};

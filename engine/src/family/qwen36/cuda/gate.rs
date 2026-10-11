@@ -1,7 +1,7 @@
 //! `family::qwen36::cuda::gate`: the ONE public item of the stage 1 gate (decision 0047 item 11). Design guidance only,
 //! no code copied (no MegaCapybara-derived design).
 //!
-//! RD-10a-1 lands this surface as a compiling stub; RD-10a-17 replaces the body of `run_step_gate` with the device loop.
+//! RD-10a-17 wires the device loop of `run.rs` into `run_step_gate`.
 //! The `pub` items of the whole `family::qwen36` tree are exactly `qwen36`, `cuda`, `gate`, `run_step_gate`,
 //! `GateSettings` and `GateReport` (a source check, `public_items.py`, asserts it). The two types keep PRIVATE fields: the
 //! binary builds a `GateSettings` from a JSON text (`str::parse`, the `FromStr` impl) and reads the report as text
@@ -13,8 +13,13 @@ use std::fmt;
 use std::path::PathBuf;
 use std::str::FromStr;
 
+mod phases;
+mod raw;
+mod rows;
+mod run;
+mod steps;
+
 /// What one GPU call is asked to do. Built only by parsing a JSON object with the keys named in `from_str`.
-#[expect(dead_code, reason = "read by the gate loop, RD-10a-17 (decision 0047)")]
 pub struct GateSettings {
     gguf: PathBuf,
     /// SHA-256 of the GGUF as checked by the run script (echoed into the raw file; the binary does not rehash 20 GB).
@@ -124,12 +129,10 @@ impl fmt::Display for GateReport {
     }
 }
 
-/// Runs the gate. RD-10a-1: not wired yet.
+/// Runs the gate: the settings checks, the load, the memory admission and the device loop of
+/// `run.rs` (RD-10a-17).
 pub fn run_step_gate(settings: &GateSettings) -> Result<GateReport, EngError> {
-    let _ = settings;
-    Err(EngError::BadRequest(
-        "the stage 1 gate loop is not wired yet (RD-10a-17)".to_owned(),
-    ))
+    run::device_gate(settings)
 }
 
 #[cfg(test)]
@@ -250,7 +253,7 @@ mod tests {
     }
 
     #[test]
-    fn the_report_displays_its_raw_text_and_the_stub_gate_refuses() {
+    fn the_report_displays_its_raw_text_and_refusals_precede_the_device() {
         assert_eq!(
             GateReport {
                 raw: "{\"a\":1}".to_owned()
@@ -258,6 +261,11 @@ mod tests {
             .to_string(),
             "{\"a\":1}"
         );
-        assert!(run_step_gate(&GOOD.parse().unwrap()).is_err());
+        // kv_fp16 is refused before a context exists, so this needs no device (U13).
+        let refused = GOOD.replace("\"kv_fp16\":true", "\"kv_fp16\":false");
+        assert!(matches!(
+            run_step_gate(&refused.parse().unwrap()),
+            Err(EngError::BadRequest(_))
+        ));
     }
 }

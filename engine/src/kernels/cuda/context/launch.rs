@@ -32,10 +32,6 @@
 //! overlaps none it reads. `native::resident` and the C entries repeat these
 //! checks, so a rejection is always a `BadRequest` here and never a terminal
 //! adapter failure. A refused call changes nothing.
-#![cfg_attr(
-    not(test),
-    expect(dead_code, reason = "staged for RD-9a (decision 0047)")
-)]
 
 use super::stream::{DeviceStream, same_adapter};
 use super::{

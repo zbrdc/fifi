@@ -20,10 +20,6 @@
 //!   unsafe function leaves this module.
 //! - The conv state is planar `[3][channels]` on the device; ggml keeps `[channel][tap]`. Import
 //!   and export of a state (owner RD-9a2) must transpose it.
-#![cfg_attr(
-    not(test),
-    expect(dead_code, reason = "staged for RD-9a (decision 0047)")
-)]
 
 use std::ffi::{c_int, c_void};
 use std::mem::{offset_of, size_of};
