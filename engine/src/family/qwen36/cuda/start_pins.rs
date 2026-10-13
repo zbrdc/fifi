@@ -64,6 +64,38 @@ fn the_guard_is_committed_between_the_leaks_and_the_step() {
 }
 
 #[test]
+fn make_takes_the_step_layout_from_the_loaded_weights() {
+    // KUBDAN-MSG-72 item 1 (the S3b merge): make builds the step options AFTER the load, from
+    // the loaded weights' own layout, and BEFORE the step resources; never from a layout
+    // constant or from the load options. Mutant m20 "layout read from the load options" breaks
+    // the call this pin finds.
+    let make = pinned(fn_section("fn make("));
+    let load = make.find("load_model(").expect("make loads the model");
+    let options = make
+        .find("step_options(settings.context_limit,loaded.device.layout()?)?")
+        .expect("make derives the step layout from the loaded weights");
+    let resources = make
+        .find("StepResources::new(")
+        .expect("make builds the step resources");
+    assert!(
+        load < options && options < resources,
+        "load {load}, options {options}, resources {resources}"
+    );
+    assert!(
+        !make.contains("WeightLayout::"),
+        "make names no layout constant"
+    );
+    assert!(
+        !make.contains(".layout,"),
+        "make reads no other layout field"
+    );
+    // start() validates the limit only: no step options and no layout before the device.
+    let start = pinned(fn_section("fn start("));
+    assert!(start.contains("context_tokens(settings.context_limit)?"));
+    assert!(!start.contains("step_options(") && !start.contains("WeightLayout::"));
+}
+
+#[test]
 fn the_rules_are_built_before_the_first_device_call() {
     // start(): the bundle and the rules precede the guard and the spawn, and the eos ids come
     // from the SAME loaded bundle — never hard-coded ids, never another file.

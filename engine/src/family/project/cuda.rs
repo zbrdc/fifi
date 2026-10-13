@@ -73,15 +73,7 @@ pub(crate) struct Reserve {
 pub(crate) enum WeightLayout {
     #[default]
     Tiled,
-    /// Staged (KUBDAN-MSG-68 M-1): no production caller constructs a Native load yet; the
-    /// resident step and the gate of MATVEC-PAR S3 do. Tests construct it freely.
-    #[cfg_attr(
-        not(test),
-        expect(
-            dead_code,
-            reason = "the S3 resident step and gate construct Native loads"
-        )
-    )]
+    /// Read by the resident step of MATVEC-PAR S3 through [`CudaWeights::layout`].
     Native,
 }
 
@@ -181,12 +173,67 @@ impl CudaWeights {
     pub(crate) fn times(&self) -> LoadTimes {
         self.times
     }
+
+    /// The one device layout of this load's quantized tensors (MATVEC-PAR S3b): the resident
+    /// step derives its mode from it, and a mixed load is a typed refusal naming the tensor.
+    pub(crate) fn layout(&self) -> Result<WeightLayout, EngError> {
+        load_layout(
+            self.weights
+                .iter()
+                .map(|weight| (weight.name(), weight.kind())),
+        )
+    }
 }
 
 impl Drop for CudaWeights {
     fn drop(&mut self) {
         while self.weights.pop().is_some() {}
     }
+}
+
+/// The layout kind of one checkpoint tensor as a layout input (MATVEC-PAR S3b): the vendored
+/// tiles, the file's own native blocks, or a raw F32/F16 copy, which no layout rule reads.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum TensorKind {
+    Tiled,
+    Native,
+    Raw,
+}
+
+impl CudaWeight {
+    /// The layout kind of the tensor for [`load_layout`].
+    pub(crate) fn kind(&self) -> TensorKind {
+        match self {
+            Self::Tiled { .. } => TensorKind::Tiled,
+            Self::Native { .. } => TensorKind::Native,
+            Self::Raw { .. } => TensorKind::Raw,
+        }
+    }
+}
+
+/// The one device layout of a load's quantized tensors (MATVEC-PAR S3b): every quantized tensor
+/// of a load is `Tiled` or every one is `Native` — one layout per load, never both (R-S2-2). A
+/// mix is a `Checkpoint` naming the tensor that broke it; a load of raw tensors only has no
+/// quantized reader and answers `Tiled`. Pure: no context, no device.
+pub(crate) fn load_layout<'a>(
+    tensors: impl Iterator<Item = (&'a str, TensorKind)>,
+) -> Result<WeightLayout, EngError> {
+    let mut layout: Option<WeightLayout> = None;
+    for (name, kind) in tensors {
+        let this = match kind {
+            TensorKind::Tiled => WeightLayout::Tiled,
+            TensorKind::Native => WeightLayout::Native,
+            TensorKind::Raw => continue,
+        };
+        let earlier = layout.replace(this);
+        if earlier.is_some_and(|earlier| earlier != this) {
+            return Err(EngError::Checkpoint(format!(
+                "tensor {name} is loaded in the {this:?} layout beside {earlier:?} tensors: \
+                 one load serves one layout"
+            )));
+        }
+    }
+    Ok(layout.unwrap_or(WeightLayout::Tiled))
 }
 
 /// A whole model after [`CudaProjector::load_model`].

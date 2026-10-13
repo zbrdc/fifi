@@ -12,6 +12,17 @@
 //! path see the same addresses. Prefill has its own plan and arena (decision 0049); nothing here
 //! is a prefill size.
 //!
+//! # The two layouts (MATVEC-PAR S3b)
+//!
+//! [`StepOptions::layout`] selects the pack slots: the `Tiled` plan of today (fp16 `Xf*` packs,
+//! byte-identical to the a4ca4075 lists, pinned by the existing tests) or the `Native` plan, whose
+//! `Q8*` slots are the padded `block_q8_1` rows of `q8_1_bytes` at the SAME lifetimes (`Q8Down`
+//! holds the `top_k` rows of the expert slots in ONE pack). Every non-pack slot is shared but
+//! `NormRow`, which the NATIVE plan holds live across the whole step because the fused
+//! `add_rmsnorm_q8` always writes the f32 normalized row (the MIXER PROLOGUE writes it as
+//! scratch beside Q8Mix; the final norm writes its own FinalNormRow instead). The Native plan
+//! exists at one row only (`check_layout_rows`).
+//!
 //! # Rows
 //!
 //! A plan is built for `rows` in `1..=MAX_STEP_ROWS` (8): plain decode is 1, a verify window
@@ -65,10 +76,12 @@ use super::{
 };
 use crate::{
     EngError,
+    family::project::cuda::WeightLayout,
     kernels::cuda::{
         ArenaPlan, ArenaTensor, plan_arena,
         resident::{
             attn_decode::{AttnSplit, attn_part_bytes},
+            quantize_q8_1::q8_1_bytes,
             router::{RouterShape, router_logits_bytes},
             step_params::ARGMAX_PART_BYTES,
         },
@@ -150,11 +163,15 @@ pub(crate) enum Slot {
     ResidB,
     /// fp16 pack feeding the mixer in-projections (`k` = hidden).
     XfMix,
+    /// The padded q8_1 row feeding the Native mixer in-projections (`k` = hidden; MATVEC-PAR S3b).
+    Q8Mix,
     /// f32 `[rows][delta_proj]`: qkv, z, beta, alpha side by side.
     DeltaProj,
     DeltaConv,
     DeltaCore,
     XfDeltaOut,
+    /// The padded q8_1 row of the delta-rule output (`k` = value width; MATVEC-PAR S3b).
+    Q8DeltaOut,
     /// f32 `[rows][attn_proj]`: per query head `[q | gate]`, then k, then v.
     AttnProj,
     AttnQ,
@@ -163,9 +180,13 @@ pub(crate) enum Slot {
     AttnPart,
     AttnCore,
     XfAttnOut,
+    /// The padded q8_1 row of the attention output (`k` = q width; MATVEC-PAR S3b).
+    Q8AttnOut,
     /// Mixer output `[rows][hidden]`, added into the residual by the next norm.
     MixOut,
     XfMoe,
+    /// The padded q8_1 row of the mixer epilogue norm (`k` = hidden; MATVEC-PAR S3b).
+    Q8Moe,
     /// f32 normalized row, the router input.
     NormRow,
     /// RD-5 logits `[rows][experts + 1]`; the last column is the shared-gate dot.
@@ -176,11 +197,24 @@ pub(crate) enum Slot {
     ExpertGu,
     /// Pack feeding the expert down projection; one per routed expert when forked.
     XfDown(usize),
+    /// The padded q8_1 rows of the eight expert slots (`k` = inter; MATVEC-PAR S3b).
+    Q8Down,
     ExpertDown,
     SharedGu,
     XfShared,
+    /// The padded q8_1 row of the shared expert (`k` = shared inter; MATVEC-PAR S3b).
+    Q8Shared,
     SharedOut,
     XfFinal,
+    /// The padded q8_1 row of the output norm (`k` = hidden; MATVEC-PAR S3b).
+    Q8Final,
+    /// The own f32 scratch row of the NATIVE final norm: the fused producer must write an f32
+    /// row beside the pack. `NormRow` alone would be SOUND here (its native lifetime
+    /// MIX_PACK..ARGMAX covers FINAL_NORM, and the planner keeps live slots byte-disjoint) -
+    /// the own slot is deliberate isolation instead: the final norm then depends on no other
+    /// op's slot, and the write cannot interfere with the mixer's NormRow bytes whatever a
+    /// later plan changes (MATVEC-PAR S3b; MSG-74 item 2).
+    FinalNormRow,
     Logits,
     /// RD-4d argmax partials, live only in `ARGMAX`.
     ArgmaxPart,
@@ -354,6 +388,7 @@ impl StepPlan {
                 "step plan: {rows} rows, a decode step takes 1 to {MAX_STEP_ROWS}"
             )));
         }
+        check_layout_rows(rows, options)?;
         scratch.check(dims, rows)?;
         let slots = list_slots(dims, rows, options, scratch)?;
         let arena = plan_arena(&arena_tensors(&slots))?;
@@ -463,6 +498,32 @@ impl SlotList {
         xf_bytes(self.rows, k)
             .ok_or_else(|| EngError::MemoryPlan("step plan: an xf size overflows".to_owned()))
     }
+
+    /// The padded `block_q8_1` bytes of `ncols` rows of `k` values: the Native step's input packs
+    /// (MATVEC-PAR S3b). `ncols` is 1 for every activation row and `top_k` for the expert slots.
+    fn q8(&self, k: usize, ncols: usize) -> Result<usize, EngError> {
+        q8_1_bytes(k, ncols)
+            .ok_or_else(|| EngError::MemoryPlan("step plan: a q8 pack size overflows".to_owned()))
+    }
+}
+
+/// The typed refusals of the NATIVE plan (MATVEC-PAR S3b), before any slot is sized: the q8_1
+/// producers take the step's single row, and the Native MoE runs ONE merged down launch, so the
+/// forked per-expert packs have no Native form. Stage-1 unreachable through `StepResources`
+/// (one row, `check_stage1_options`); the plan refuses them on its own so no caller can build a
+/// half-tiled plan.
+fn check_layout_rows(rows: usize, options: &StepOptions) -> Result<(), EngError> {
+    if options.layout == WeightLayout::Native && rows != 1 {
+        return Err(EngError::BadRequest(format!(
+            "step plan: the native layout takes one row, got {rows}"
+        )));
+    }
+    if options.layout == WeightLayout::Native && options.forked_experts {
+        return Err(EngError::BadRequest(
+            "step plan: the native layout takes the single merged expert down pack".to_owned(),
+        ));
+    }
+    Ok(())
 }
 
 fn list_slots(
@@ -475,10 +536,20 @@ fn list_slots(
         rows,
         slots: Vec::new(),
     };
-    list_mixers(&mut list, dims, scratch)?;
+    list_mixers(&mut list, dims, options, scratch)?;
     list_moe(&mut list, dims, options, scratch)?;
     let h = dims.shape.hidden;
-    list.add(Slot::XfFinal, list.xf(h), FINAL_NORM, LM_HEAD)?;
+    match options.layout {
+        WeightLayout::Tiled => list.add(Slot::XfFinal, list.xf(h), FINAL_NORM, LM_HEAD)?,
+        WeightLayout::Native => {
+            list.add(Slot::Q8Final, list.q8(h, 1), FINAL_NORM, LM_HEAD)?;
+            // The fused producer must also write an f32 row beside the pack; the native plan
+            // gives the final norm its OWN scratch row - sound in isolation (NormRow's native
+            // lifetime covers FINAL_NORM and live slots never share bytes), kept so the final
+            // norm depends on no other op's slot (MATVEC-PAR S3b; MSG-74 item 2).
+            list.add(Slot::FinalNormRow, list.row(h), FINAL_NORM, FINAL_NORM)?;
+        }
+    }
     list.add(Slot::Logits, list.row(dims.shape.vocab), LM_HEAD, ARGMAX)?;
     list.add(Slot::ArgmaxPart, Ok(scratch.argmax_part), ARGMAX, ARGMAX)?;
     Ok(list.slots)
@@ -488,13 +559,17 @@ fn list_slots(
 fn list_mixers(
     list: &mut SlotList,
     dims: &StepDims,
+    options: &StepOptions,
     scratch: &KernelScratch,
 ) -> Result<(), EngError> {
     let (h, d, a) = (dims.shape.hidden, &dims.shape.delta, &dims.shape.attn);
     let (value_width, q_width) = (d.value_heads * d.value_dim, a.heads_q * a.head_dim);
     list.add(Slot::ResidA, list.row(h), EMBED, ARGMAX)?;
     list.add(Slot::ResidB, list.row(h), EMBED, ARGMAX)?;
-    list.add(Slot::XfMix, list.xf(h), MIX_PACK, ATTN_IN)?;
+    match options.layout {
+        WeightLayout::Tiled => list.add(Slot::XfMix, list.xf(h), MIX_PACK, ATTN_IN)?,
+        WeightLayout::Native => list.add(Slot::Q8Mix, list.q8(h, 1), MIX_PACK, ATTN_IN)?,
+    }
     list.add(
         Slot::DeltaProj,
         list.row(dims.delta_proj),
@@ -513,17 +588,30 @@ fn list_mixers(
         DELTA_RULE,
         DELTA_PACK,
     )?;
-    list.add(
-        Slot::XfDeltaOut,
-        list.xf(value_width),
-        DELTA_PACK,
-        DELTA_OUT,
-    )?;
+    match options.layout {
+        WeightLayout::Tiled => list.add(
+            Slot::XfDeltaOut,
+            list.xf(value_width),
+            DELTA_PACK,
+            DELTA_OUT,
+        )?,
+        WeightLayout::Native => list.add(
+            Slot::Q8DeltaOut,
+            list.q8(value_width, 1),
+            DELTA_PACK,
+            DELTA_OUT,
+        )?,
+    }
     list.add(Slot::AttnProj, list.row(dims.attn_proj), ATTN_IN, ATTN_CORE)?;
     list.add(Slot::AttnQ, list.row(q_width), ATTN_PREP, ATTN_CORE)?;
     list.add(Slot::AttnPart, Ok(scratch.attn_part), ATTN_CORE, ATTN_CORE)?;
     list.add(Slot::AttnCore, list.row(q_width), ATTN_CORE, ATTN_PACK)?;
-    list.add(Slot::XfAttnOut, list.xf(q_width), ATTN_PACK, ATTN_OUT)?;
+    match options.layout {
+        WeightLayout::Tiled => list.add(Slot::XfAttnOut, list.xf(q_width), ATTN_PACK, ATTN_OUT)?,
+        WeightLayout::Native => {
+            list.add(Slot::Q8AttnOut, list.q8(q_width, 1), ATTN_PACK, ATTN_OUT)?
+        }
+    }
     list.add(Slot::MixOut, list.row(h), DELTA_OUT, ADD_NORM)
 }
 
@@ -543,21 +631,43 @@ fn list_moe(
 ) -> Result<(), EngError> {
     let (h, e) = (dims.shape.hidden, &dims.shape.moe);
     let m = list.rows;
-    list.add(Slot::XfMoe, list.xf(h), ADD_NORM, GATE_UP)?;
-    list.add(Slot::NormRow, list.row(h), ADD_NORM, ROUTE)?;
+    match options.layout {
+        WeightLayout::Tiled => list.add(Slot::XfMoe, list.xf(h), ADD_NORM, GATE_UP)?,
+        WeightLayout::Native => list.add(Slot::Q8Moe, list.q8(h, 1), ADD_NORM, GATE_UP)?,
+    }
+    match options.layout {
+        // The fused `add_rmsnorm_q8` always writes the f32 normalized row, so the NATIVE
+        // mixer prologue writes `NormRow` as scratch beside its `Q8Mix` pack: the slot is live
+        // from that first write to the end of the step (the router reads it at ROUTE). The
+        // final norm does NOT touch it - it writes the plan's own FinalNormRow.
+        WeightLayout::Tiled => list.add(Slot::NormRow, list.row(h), ADD_NORM, ROUTE)?,
+        WeightLayout::Native => list.add(Slot::NormRow, list.row(h), MIX_PACK, ARGMAX)?,
+    }
     list.add(Slot::RouterLogits, Ok(scratch.router_logits), ROUTE, ROUTE)?;
     list.add(Slot::TopkId, product(&[m, e.top_k, I32]), ROUTE, COMBINE)?;
     list.add(Slot::TopkWeight, list.row(e.top_k), ROUTE, COMBINE)?;
     list.add(Slot::SharedGate, list.row(1), ROUTE, COMBINE)?;
     let gate_up = product(&[m, e.top_k, 2 * e.inter, F32]);
     list.add(Slot::ExpertGu, gate_up, GATE_UP, DOWN)?;
-    let branches = if options.forked_experts { e.top_k } else { 1 };
-    for branch in 0..branches {
-        list.add(Slot::XfDown(branch), list.xf(e.inter), SWIGLU, DOWN)?;
+    match options.layout {
+        WeightLayout::Tiled => {
+            let branches = if options.forked_experts { e.top_k } else { 1 };
+            for branch in 0..branches {
+                list.add(Slot::XfDown(branch), list.xf(e.inter), SWIGLU, DOWN)?;
+            }
+        }
+        // One merged pack of `top_k` padded q8_1 rows feeds the ONE down launch of the slots
+        // (MATVEC-PAR S3b); the forked per-expert packs have no Native form (`check_layout_rows`).
+        WeightLayout::Native => list.add(Slot::Q8Down, list.q8(e.inter, e.top_k), SWIGLU, DOWN)?,
     }
     let down = product(&[m, e.top_k, h, F32]);
     list.add(Slot::ExpertDown, down, DOWN, COMBINE)?;
     list.add(Slot::SharedGu, list.row(2 * e.shared_inter), GATE_UP, DOWN)?;
-    list.add(Slot::XfShared, list.xf(e.shared_inter), SWIGLU, DOWN)?;
+    match options.layout {
+        WeightLayout::Tiled => list.add(Slot::XfShared, list.xf(e.shared_inter), SWIGLU, DOWN)?,
+        WeightLayout::Native => {
+            list.add(Slot::Q8Shared, list.q8(e.shared_inter, 1), SWIGLU, DOWN)?
+        }
+    }
     list.add(Slot::SharedOut, list.row(h), DOWN, COMBINE)
 }

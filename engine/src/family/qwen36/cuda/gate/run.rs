@@ -26,7 +26,7 @@ use crate::{
     family::{
         QWEN3_6_35B_A3B,
         gguf_model::{Inventory, open_qwen3_6_35b_a3b},
-        project::cuda::{CudaProjector, CudaWeights, LoadOptions, Reserve},
+        project::cuda::{CudaProjector, CudaWeights, LoadOptions, Reserve, WeightLayout},
         qwen36::{
             cuda::{
                 dims::{KvMode, StepDims, StepOptions},
@@ -169,6 +169,7 @@ fn identities_of(s: &GateSettings, total: usize, before: usize, after: usize) ->
         "capture_requested": if s.capture { "graph" } else { "eager" },
         "gguf_sha256": s.gguf_sha256,
         "kv_mode": "fp16",
+        "layout": if s.layout == WeightLayout::Native { "native" } else { "tiled" },
         "mem_total": total,
         "mem_free_before": before,
         "mem_free_after_load": after,
@@ -183,22 +184,29 @@ fn report(doc: Value) -> Result<GateReport, EngError> {
 }
 
 /// The session options of the call: fp16 KV, one committed DeltaNet slot, no forked experts, a
-/// cache that holds every prompt plus the decode rows.
-fn session_options(s: &GateSettings) -> Result<StepOptions, EngError> {
+/// cache that holds every prompt plus the decode rows, and the layout DERIVED from the loaded
+/// weights (`CudaWeights::layout()`), never configured twice: the settings' `layout` chose the
+/// load, the step follows what landed (MATVEC-PAR S3b, KUBDAN-MSG-70 condition 4).
+fn session_options(s: &GateSettings, layout: WeightLayout) -> Result<StepOptions, EngError> {
     Ok(StepOptions {
         kv_mode: KvMode::Fp16,
         context_tokens: context_tokens(s.prompts.iter().map(Vec::len).max().unwrap_or(0))?,
         delta_slots: 1,
         forked_experts: false,
+        layout,
     })
 }
 
 /// Everything a session builds once: the checked dimensions of the pinned model and the arena.
-fn build_resources(context: &CudaContext, s: &GateSettings) -> Result<StepResources, EngError> {
+fn build_resources(
+    context: &CudaContext,
+    s: &GateSettings,
+    layout: WeightLayout,
+) -> Result<StepResources, EngError> {
     let inventory = Inventory::for_spec(&QWEN3_6_35B_A3B)?;
     let shape = HostShape::from_spec(&QWEN3_6_35B_A3B, ROTARY_DIM)?;
     let dims = StepDims::new(&shape, &inventory)?;
-    StepResources::new(context, dims, &inventory, &session_options(s)?)
+    StepResources::new(context, dims, &inventory, &session_options(s, layout)?)
 }
 
 /// The directory the pinned tokenizer bundle sits in: the GGUF's parent directory, never the
@@ -237,12 +245,13 @@ fn build_step<'a>(
     weights: &'a CudaWeights,
     rules: QwenRules,
     s: &GateSettings,
+    layout: WeightLayout,
 ) -> Result<QwenResidentStep<'a>, EngError> {
     let mut step = QwenResidentStep::new(
         projector.context(),
         res,
         weights,
-        &session_options(s)?,
+        &session_options(s, layout)?,
         rules,
     )?;
     step.set_capture_config(CaptureConfig { capture: s.capture })?;
@@ -446,7 +455,7 @@ pub(super) fn device_gate(s: &GateSettings) -> Result<GateReport, EngError> {
                 headroom: 0,
             },
             drop_page_cache: None,
-            ..Default::default()
+            layout: s.layout,
         },
     )?;
     let after = projector.memory_info()?;
@@ -456,8 +465,10 @@ pub(super) fn device_gate(s: &GateSettings) -> Result<GateReport, EngError> {
         doc["refused"] = json!({ "kind": "memory", "free_after_load": after.free });
         return report(doc);
     }
-    let res = build_resources(projector.context(), s)?;
-    let mut step = build_step(&projector, &res, &loaded.device, rules, s)?;
+    // The step's layout comes from the loaded weights (the settings' member chose the LOAD).
+    let layout = loaded.device.layout()?;
+    let res = build_resources(projector.context(), s, layout)?;
+    let mut step = build_step(&projector, &res, &loaded.device, rules, s, layout)?;
     run_all(&mut step, s, mode, identities)
 }
 #[cfg(test)]
@@ -579,6 +590,7 @@ mod tests {
                 "capture_requested": "eager",
                 "gguf_sha256": "ab",
                 "kv_mode": "fp16",
+                "layout": "tiled",
                 "mem_total": 10,
                 "mem_free_before": 4,
                 "mem_free_after_load": 2,

@@ -18,10 +18,6 @@
 //! usable; `k` is a multiple of 32; `ncols` is in `1..=8`; `x` holds `ncols * k` floats and `y`
 //! holds [`q8_1_bytes`] bytes, both 4-byte aligned; `y` overlaps no byte of `x`. A refused call
 //! changes nothing.
-#![cfg_attr(
-    not(test),
-    expect(dead_code, reason = "staged for RD-9a (decision 0047)")
-)]
 
 use crate::EngError;
 use crate::kernels::cuda::context::{

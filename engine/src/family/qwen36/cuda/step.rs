@@ -37,14 +37,16 @@ use super::{
     dims::StepOptions,
     mixer::{BlockIo, MixerParts, MixerViews, Mixers},
     mixer_weights::MixerWeights,
-    moe::{ExpertBufs, Launch, MoeBuffers, MoeDims, MoeLayerWeights, RouteBufs, run_moe_block},
+    moe::{
+        ExpertBufs, Launch, MoeBuffers, MoeDims, MoeLayerWeights, Packs, RouteBufs, run_moe_block,
+    },
     readback::{
         ReadbackPlan, SYNC_EACH_VAR, captured_report, check_mode, eager_report, parse_sync_each,
         refused_report,
     },
     resources::{
-        GlobalSpecs, GlobalWeights, MoeSpecs, STEP_ROWS, StepResources, f32_bytes, moe_dims,
-        moe_layer_weights,
+        EmbedWeight, GlobalSpecs, GlobalWeights, HeadWeight, MoeSpecs, STEP_ROWS, StepResources,
+        f32_bytes, moe_dims, moe_layer_weights,
     },
     rules::{QwenRules, StepWidths, check_token_id, validate_step_inputs},
     run_report::{CaptureOutcome, RunReport},
@@ -58,13 +60,15 @@ use super::{
 };
 use crate::{
     EngError,
-    family::project::cuda::CudaWeights,
+    family::project::cuda::{CudaWeights, WeightLayout},
     kernels::cuda::{
         CapturePlan, CudaContext, DeviceBuffer, DeviceEvent, DeviceRange, DeviceStream, GraphExec,
         MatmulIo, PinnedWord, Projection,
         resident::{
             add_norm_pack::AddNormCall,
-            embed::EmbedCall,
+            add_rmsnorm_q8::AddNormQ8Call,
+            embed::{EmbedCall, EmbedNativeCall},
+            matvec_q::MatvecCall,
             step_params::{ArgmaxCall, ResultPair, StepParams, StepStatus},
         },
     },
@@ -146,6 +150,18 @@ pub(super) fn reported_outcome(ran: HowRan, refused: bool) -> CaptureOutcome {
     }
 }
 
+/// The one typed refusal of a layout mismatch (MATVEC-PAR S3b): the step runs the layout of the
+/// loaded weights and the options must agree with it. Pure, so the CPU tests pin it directly.
+pub(super) fn agree_layout(weights: WeightLayout, options: WeightLayout) -> Result<(), EngError> {
+    if weights != options {
+        return Err(EngError::Checkpoint(format!(
+            "the step options run {options:?} over {weights:?} weights: the layout follows the \
+             loaded model"
+        )));
+    }
+    Ok(())
+}
+
 /// The environment value of `INFERENCE_CUDA_SYNC_EACH`, `None` when unset.
 fn sync_each_from_env() -> Result<bool, EngError> {
     match std::env::var(SYNC_EACH_VAR) {
@@ -174,6 +190,9 @@ pub(crate) struct QwenResidentStep<'a> {
     mixers: Mixers<'a>,
     moe: Vec<MoeLayerWeights<'a>>,
     globals: GlobalWeights<'a>,
+    /// The layout the step runs (MATVEC-PAR S3b): the loaded weights' own layout, checked
+    /// against the options at construction.
+    layout: WeightLayout,
     moe_dims: MoeDims,
     state: ResidentState,
     word: PinnedWord,
@@ -224,6 +243,10 @@ impl<'a> QwenResidentStep<'a> {
         rules: QwenRules,
     ) -> Result<Self, EngError> {
         let widths = validate_step_inputs(options, res.dims.shape.vocab, &rules)?;
+        // The mode follows the loaded weights (MATVEC-PAR S3b): the options carry the same
+        // layout, derived from `CudaWeights::layout()` by every production caller, and a
+        // mismatch is a typed error before any context work.
+        agree_layout(weights.layout()?, options.layout)?;
         let sync_each = sync_each_from_env()?;
         let stream = context.stream()?;
         let state = ResidentState::allocate(context, &stream, &res.dims, options)?;
@@ -232,13 +255,20 @@ impl<'a> QwenResidentStep<'a> {
         let parts = MixerParts {
             geometry: res.geometry,
             table: &res.table,
-            weights: MixerWeights::new(&res.geometry, &res.table, weights, &layers)?,
-            views: MixerViews::new(&res.plan, &res.arena, &res.geometry)?,
+            weights: MixerWeights::new(
+                &res.geometry,
+                &res.table,
+                weights,
+                &layers,
+                options.layout,
+            )?,
+            views: MixerViews::new(&res.plan, &res.arena, &res.geometry, options.layout)?,
+            layout: options.layout,
         };
         let specs = MoeSpecs::new(&res.dims)?;
         let moe = layers
             .iter()
-            .map(|&layer| moe_layer_weights(&res.table, weights, &specs, layer))
+            .map(|&layer| moe_layer_weights(&res.table, weights, &specs, layer, options.layout))
             .collect::<Result<Vec<_>, _>>()?;
         let vocab = res.dims.shape.vocab;
         let mut pinned: Vec<&'a DeviceBuffer> = weights.device_buffers().collect();
@@ -251,7 +281,13 @@ impl<'a> QwenResidentStep<'a> {
             res,
             mixers: Mixers::new(context, parts)?,
             moe,
-            globals: GlobalWeights::new(&res.names, &GlobalSpecs::new(&res.dims), weights)?,
+            globals: GlobalWeights::new(
+                &res.names,
+                &GlobalSpecs::new(&res.dims),
+                weights,
+                options.layout,
+            )?,
+            layout: options.layout,
             moe_dims: moe_dims(&res.dims),
             state,
             word,
@@ -339,12 +375,24 @@ impl<'a> QwenResidentStep<'a> {
                 status: self.state.step_status()?,
             },
             expert: ExpertBufs {
-                xf_moe: view(Slot::XfMoe)?,
+                // The packs follow the plan: the fp16 packs of the Tiled plan or the padded
+                // q8_1 packs of the Native plan (MATVEC-PAR S3b).
+                packs: if self.res.plan.index(Slot::Q8Moe).is_some() {
+                    Packs::Q8 {
+                        moe: view(Slot::Q8Moe)?,
+                        down: view(Slot::Q8Down)?,
+                        shared: view(Slot::Q8Shared)?,
+                    }
+                } else {
+                    Packs::Xf {
+                        moe: view(Slot::XfMoe)?,
+                        down: view(Slot::XfDown(0))?,
+                        shared: view(Slot::XfShared)?,
+                    }
+                },
                 expert_gu: view(Slot::ExpertGu)?,
-                xf_down: view(Slot::XfDown(0))?,
                 expert_down: view(Slot::ExpertDown)?,
                 shared_gu: view(Slot::SharedGu)?,
-                xf_shared: view(Slot::XfShared)?,
                 shared_out: view(Slot::SharedOut)?,
             },
         })
@@ -521,16 +569,34 @@ impl<'a> QwenResidentStep<'a> {
         let (ctx, s) = (self.context, &self.stream);
         match op {
             StepOp::Begin => ctx.step_begin(s, params),
-            StepOp::Embed => ctx.embed(
-                s,
-                EmbedCall {
-                    weight: self.globals.embed,
-                    ids: self.state.step_field(StepField::TokenId)?,
-                    x: self.view(resid_in(0))?,
-                    status: self.state.step_status()?,
-                    m: STEP_ROWS,
-                },
-            ),
+            StepOp::Embed => {
+                let ids = self.state.step_field(StepField::TokenId)?;
+                let x = self.view(resid_in(0))?;
+                let status = self.state.step_status()?;
+                match self.globals.embed {
+                    EmbedWeight::Tiled(weight) => ctx.embed(
+                        s,
+                        EmbedCall {
+                            weight,
+                            ids,
+                            x,
+                            status,
+                            m: STEP_ROWS,
+                        },
+                    ),
+                    // The native gather reads the file's own Q4_K blocks (MATVEC-PAR S3b).
+                    EmbedWeight::Native(weight) => ctx.embed_native(
+                        s,
+                        EmbedNativeCall {
+                            weight,
+                            ids,
+                            x,
+                            status,
+                            m: STEP_ROWS,
+                        },
+                    ),
+                }
+            }
             StepOp::Mixer(layer) => {
                 let io = BlockIo {
                     resid: self.view(resid_in(layer))?,
@@ -564,36 +630,76 @@ impl<'a> QwenResidentStep<'a> {
     fn final_norm(&self) -> Result<(), EngError> {
         let layers = self.res.table.len();
         let norm = self.globals.output_norm;
-        self.context.add_norm_pack(
-            &self.stream,
-            AddNormCall {
-                m: STEP_ROWS,
-                n: self.res.geometry.hidden,
-                eps: self.res.geometry.eps,
-                h: self.view(final_resid(layers))?,
-                delta: None,
-                weight: norm.range(0, norm.bytes())?,
-                xf: self.view(Slot::XfFinal)?,
-                norm_out: None,
-            },
-        )
+        let h = self.view(final_resid(layers))?;
+        let weight = norm.range(0, norm.bytes())?;
+        match self.layout {
+            WeightLayout::Tiled => self.context.add_norm_pack(
+                &self.stream,
+                AddNormCall {
+                    m: STEP_ROWS,
+                    n: self.res.geometry.hidden,
+                    eps: self.res.geometry.eps,
+                    h,
+                    delta: None,
+                    weight,
+                    xf: self.view(Slot::XfFinal)?,
+                    norm_out: None,
+                },
+            ),
+            // The fused producer must write an f32 row beside the pack: the native plan's OWN
+            // FinalNormRow slot (MSG-74 item 2 / C4-F3's true reading): writing NormRow here
+            // would have broken no lifetime (its native lifetime covers FINAL_NORM and live
+            // slots never share bytes) - it silently repurposed the router-input value slot as
+            // scratch, a latent bug the moment NormRow's lifetime tightens to its true need.
+            WeightLayout::Native => self.context.add_rmsnorm_q8(
+                &self.stream,
+                AddNormQ8Call {
+                    n: self.res.geometry.hidden,
+                    eps: self.res.geometry.eps,
+                    h,
+                    delta: None,
+                    weight,
+                    norm_out: self.view(Slot::FinalNormRow)?,
+                    q8: self.view(Slot::Q8Final)?,
+                },
+            ),
+        }
     }
 
     fn lm_head(&self) -> Result<(), EngError> {
-        let head = self.globals.head;
-        self.context.matmul(
-            &self.stream,
-            Projection {
-                weight: head,
-                first_row: 0,
-                rows: head.n_rows(),
-            },
-            MatmulIo {
-                xf: self.view(Slot::XfFinal)?,
-                y: self.view(Slot::Logits)?,
-                m: STEP_ROWS,
-            },
-        )
+        // The pack slot is resolved INSIDE each arm (the S3c scratch defect): the Native plan
+        // holds no XfFinal slot, so a lookup before the match refused every native run.
+        let y = self.view(Slot::Logits)?;
+        match self.globals.head {
+            HeadWeight::Tiled(head) => self.context.matmul(
+                &self.stream,
+                Projection {
+                    weight: head,
+                    first_row: 0,
+                    rows: head.n_rows(),
+                },
+                MatmulIo {
+                    xf: self.view(Slot::XfFinal)?,
+                    y,
+                    m: STEP_ROWS,
+                },
+            ),
+            HeadWeight::Native(head) => {
+                let ty = head.quant();
+                self.context.matvec_q(
+                    &self.stream,
+                    MatvecCall {
+                        ty,
+                        w: head.buffer().range(0, head.buffer().bytes())?,
+                        x_q8: self.view(Slot::Q8Final)?,
+                        y,
+                        k: head.k(),
+                        rows: head.n_rows(),
+                        ncols: STEP_ROWS,
+                    },
+                )
+            }
+        }
     }
 
     /// The defined read-back point: queue the pair copy and its event, read the logits row when

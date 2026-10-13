@@ -20,10 +20,6 @@
 //! [`q8_1_bytes`]`(n, 1)` bytes, with `norm_out` 16-byte aligned and the rest 4; the written
 //! ranges (`h`, `norm_out`, `q8`) overlap no other range of the call (`delta` and `weight` may
 //! overlap each other). A refused call changes nothing.
-#![cfg_attr(
-    not(test),
-    expect(dead_code, reason = "staged for RD-9a (decision 0047)")
-)]
 
 use crate::EngError;
 use crate::kernels::cuda::context::{

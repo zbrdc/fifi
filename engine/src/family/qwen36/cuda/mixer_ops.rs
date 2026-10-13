@@ -18,11 +18,13 @@ use super::{
 };
 use crate::{
     EngError,
-    family::{AttentionKind, gguf_model::Role},
+    family::{AttentionKind, gguf_model::Role, project::cuda::WeightLayout},
 };
 
 /// Rows of every block: the shared projection row exists only at one row (see `mixer_geometry.rs`).
 pub(super) const BLOCK_ROWS: usize = 1;
+
+const F32: usize = size_of::<f32>();
 
 /// One launch of a block.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -36,6 +38,18 @@ pub(super) enum BlockOp {
         xf: Slot,
         norm_out: Option<Slot>,
     },
+    /// The NATIVE twin of [`BlockOp::NormPack`] (MATVEC-PAR S3b): the same fused add and norm
+    /// through `add_rmsnorm_q8`, writing the padded q8_1 row `q8` (the matvec input) beside the
+    /// f32 normalized row `norm_out` — the S3a producer always writes both, so every `NormQ8`
+    /// names `NormRow` (the router's input at the epilogue, dead scratch at the prologue and the
+    /// final norm, which is why the NATIVE plan holds `NormRow` live across the whole layer).
+    NormQ8 {
+        phase: Phase,
+        weight: Role,
+        delta: Option<Slot>,
+        q8: Slot,
+        norm_out: Slot,
+    },
     /// One dense projection of the row packed in `xf` into columns `col..` of `y`'s row.
     Project {
         phase: Phase,
@@ -44,11 +58,29 @@ pub(super) enum BlockOp {
         y: Slot,
         col: usize,
     },
+    /// The NATIVE twin of [`BlockOp::Project`] (MATVEC-PAR S3b): one `matvec_q` launch against
+    /// the native blocks of `role`, reading the padded q8_1 row `x_q8` and writing `rows` f32
+    /// values at column `col` of `y`'s row (one row only, the matvec's `y[j * rows + r]`).
+    ProjectQ {
+        phase: Phase,
+        role: Role,
+        x_q8: Slot,
+        y: Slot,
+        col: usize,
+    },
     /// `pack` of the f32 row `x` (`k` values) into `xf`.
     Pack {
         phase: Phase,
         x: Slot,
         xf: Slot,
+        k: usize,
+    },
+    /// The NATIVE twin of [`BlockOp::Pack`] (MATVEC-PAR S3b): the q8_1 quantize of the f32 row
+    /// `x` (`k` values) into the padded row `q8`.
+    QuantizeQ8 {
+        phase: Phase,
+        x: Slot,
+        q8: Slot,
         k: usize,
     },
     /// RD-7a causal conv: the qkv columns of `proj` -> `out`, with the conv weights `weights`.
@@ -91,8 +123,11 @@ impl BlockOp {
     pub(super) fn phase(&self) -> Phase {
         match *self {
             Self::NormPack { phase, .. }
+            | Self::NormQ8 { phase, .. }
             | Self::Project { phase, .. }
-            | Self::Pack { phase, .. } => phase,
+            | Self::ProjectQ { phase, .. }
+            | Self::Pack { phase, .. }
+            | Self::QuantizeQ8 { phase, .. } => phase,
             Self::Conv { .. } => Phase::DeltaConv,
             Self::Delta { .. } => Phase::DeltaRule,
             Self::AttnPrep { .. } => Phase::AttnPrep,
@@ -103,9 +138,12 @@ impl BlockOp {
     /// The plan slots the launch reads (the residual stream is not a slot).
     pub(super) fn reads(&self) -> Vec<Slot> {
         match *self {
-            Self::NormPack { delta, .. } => delta.into_iter().collect(),
+            Self::NormPack { delta, .. } | Self::NormQ8 { delta, .. } => {
+                delta.into_iter().collect()
+            }
             Self::Project { xf, .. } => vec![xf],
-            Self::Pack { x, .. } => vec![x],
+            Self::ProjectQ { x_q8, .. } => vec![x_q8],
+            Self::Pack { x, .. } | Self::QuantizeQ8 { x, .. } => vec![x],
             Self::Conv { proj, .. } => vec![proj],
             Self::Delta { conv, proj, .. } => vec![conv, proj],
             Self::AttnPrep { proj, .. } => vec![proj],
@@ -119,8 +157,10 @@ impl BlockOp {
             Self::NormPack { xf, norm_out, .. } => {
                 [Some(xf), norm_out].into_iter().flatten().collect()
             }
-            Self::Project { y, .. } => vec![y],
+            Self::NormQ8 { q8, norm_out, .. } => vec![q8, norm_out],
+            Self::Project { y, .. } | Self::ProjectQ { y, .. } => vec![y],
             Self::Pack { xf, .. } => vec![xf],
+            Self::QuantizeQ8 { q8, .. } => vec![q8],
             Self::Conv { out, .. } | Self::Delta { out, .. } => vec![out],
             Self::AttnPrep { q, .. } => vec![q],
             Self::AttnDecode { part, out, .. } => vec![part, out],
@@ -128,36 +168,121 @@ impl BlockOp {
     }
 }
 
+/// The byte offset of column `col` inside a fused f32 row, checked for every `ProjectQ` pair of
+/// the geometry at block construction (a typed refusal here, never a launch-time wrapper error
+/// inside a token): `col * 4` must not overflow and `rows` must fit the fused row's rest. The
+/// 4-byte alignment arm was DELETED (MSG-74 item 3): `col * 4` is a multiple of 4 for every
+/// integer `col`, the arm was unreachable and its test line a tautology; the wrapper's own
+/// alignment check on the (always 4-aligned, because 256-byte arena offsets) slot remains.
+pub(super) fn check_native_column(
+    role: Role,
+    col: usize,
+    rows: usize,
+    ld: usize,
+) -> Result<(), EngError> {
+    col.checked_mul(F32).ok_or_else(|| {
+        EngError::Checkpoint(format!(
+            "mixer ops: the column offset of {role:?} overflows a byte count"
+        ))
+    })?;
+    if col.checked_add(rows).is_none_or(|end| end > ld) {
+        return Err(EngError::Checkpoint(format!(
+            "mixer ops: {role:?} writes {rows} columns at {col}, past the fused row of {ld}"
+        )));
+    }
+    Ok(())
+}
+
+/// The projection twin of one fused-row launch (one role, one column): `Project` against the
+/// fp16 pack `xf` or `ProjectQ` against the padded q8_1 row `x_q8` (MATVEC-PAR S3b).
+fn project_op(
+    phase: Phase,
+    role: Role,
+    xf: Slot,
+    x_q8: Slot,
+    y: Slot,
+    col: usize,
+    layout: WeightLayout,
+) -> BlockOp {
+    match layout {
+        WeightLayout::Tiled => BlockOp::Project {
+            phase,
+            role,
+            xf,
+            y,
+            col,
+        },
+        WeightLayout::Native => BlockOp::ProjectQ {
+            phase,
+            role,
+            x_q8,
+            y,
+            col,
+        },
+    }
+}
+
+/// The pack twin of one core-output launch: `Pack` into the fp16 `xf` or `QuantizeQ8` into the
+/// padded q8_1 row `q8` (MATVEC-PAR S3b).
+fn pack_op(phase: Phase, x: Slot, xf: Slot, q8: Slot, k: usize, layout: WeightLayout) -> BlockOp {
+    match layout {
+        WeightLayout::Tiled => BlockOp::Pack { phase, x, xf, k },
+        WeightLayout::Native => BlockOp::QuantizeQ8 { phase, x, q8, k },
+    }
+}
+
 /// The input norm of the mixer: the residual is normalized with the layer's input norm.
-fn prologue() -> BlockOp {
-    BlockOp::NormPack {
-        phase: Phase::MixPack,
-        weight: Role::AttnNorm,
-        delta: None,
-        xf: Slot::XfMix,
-        norm_out: None,
+fn prologue(layout: WeightLayout) -> BlockOp {
+    match layout {
+        WeightLayout::Tiled => BlockOp::NormPack {
+            phase: Phase::MixPack,
+            weight: Role::AttnNorm,
+            delta: None,
+            xf: Slot::XfMix,
+            norm_out: None,
+        },
+        WeightLayout::Native => BlockOp::NormQ8 {
+            phase: Phase::MixPack,
+            weight: Role::AttnNorm,
+            delta: None,
+            q8: Slot::Q8Mix,
+            norm_out: Slot::NormRow,
+        },
     }
 }
 
 /// The residual add of the mixer output and the norm for the MoE block: ends the mixer block.
-fn epilogue() -> BlockOp {
-    BlockOp::NormPack {
-        phase: Phase::AddNorm,
-        weight: Role::PostAttentionNorm,
-        delta: Some(Slot::MixOut),
-        xf: Slot::XfMoe,
-        norm_out: Some(Slot::NormRow),
+fn epilogue(layout: WeightLayout) -> BlockOp {
+    match layout {
+        WeightLayout::Tiled => BlockOp::NormPack {
+            phase: Phase::AddNorm,
+            weight: Role::PostAttentionNorm,
+            delta: Some(Slot::MixOut),
+            xf: Slot::XfMoe,
+            norm_out: Some(Slot::NormRow),
+        },
+        WeightLayout::Native => BlockOp::NormQ8 {
+            phase: Phase::AddNorm,
+            weight: Role::PostAttentionNorm,
+            delta: Some(Slot::MixOut),
+            q8: Slot::Q8Moe,
+            norm_out: Slot::NormRow,
+        },
     }
 }
 
-fn delta_ops(g: &MixerGeometry) -> Vec<BlockOp> {
+fn delta_ops(g: &MixerGeometry, layout: WeightLayout) -> Vec<BlockOp> {
     let d = &g.delta;
-    let project = |role, col| BlockOp::Project {
-        phase: Phase::DeltaIn,
-        role,
-        xf: Slot::XfMix,
-        y: Slot::DeltaProj,
-        col,
+    let project = |role, col| {
+        project_op(
+            Phase::DeltaIn,
+            role,
+            Slot::XfMix,
+            Slot::Q8Mix,
+            Slot::DeltaProj,
+            col,
+            layout,
+        )
     };
     vec![
         project(Role::AttnQkv, 0),
@@ -177,30 +302,38 @@ fn delta_ops(g: &MixerGeometry) -> Vec<BlockOp> {
             dt_bias: Role::SsmDtBias,
             norm: Role::SsmNorm,
         },
-        BlockOp::Pack {
-            phase: Phase::DeltaPack,
-            x: Slot::DeltaCore,
-            xf: Slot::XfDeltaOut,
-            k: d.value_width,
-        },
-        BlockOp::Project {
-            phase: Phase::DeltaOut,
-            role: Role::SsmOut,
-            xf: Slot::XfDeltaOut,
-            y: Slot::MixOut,
-            col: 0,
-        },
+        pack_op(
+            Phase::DeltaPack,
+            Slot::DeltaCore,
+            Slot::XfDeltaOut,
+            Slot::Q8DeltaOut,
+            d.value_width,
+            layout,
+        ),
+        project_op(
+            Phase::DeltaOut,
+            Role::SsmOut,
+            Slot::XfDeltaOut,
+            Slot::Q8DeltaOut,
+            Slot::MixOut,
+            0,
+            layout,
+        ),
     ]
 }
 
-fn attn_ops(g: &MixerGeometry) -> Vec<BlockOp> {
+fn attn_ops(g: &MixerGeometry, layout: WeightLayout) -> Vec<BlockOp> {
     let a = &g.attn;
-    let project = |role, col| BlockOp::Project {
-        phase: Phase::AttnIn,
-        role,
-        xf: Slot::XfMix,
-        y: Slot::AttnProj,
-        col,
+    let project = |role, col| {
+        project_op(
+            Phase::AttnIn,
+            role,
+            Slot::XfMix,
+            Slot::Q8Mix,
+            Slot::AttnProj,
+            col,
+            layout,
+        )
     };
     vec![
         project(Role::AttnQ, 0),
@@ -221,34 +354,73 @@ fn attn_ops(g: &MixerGeometry) -> Vec<BlockOp> {
             out: Slot::AttnCore,
             kv_len: StepField::KvLen,
         },
-        BlockOp::Pack {
-            phase: Phase::AttnPack,
-            x: Slot::AttnCore,
-            xf: Slot::XfAttnOut,
-            k: a.q_width,
-        },
-        BlockOp::Project {
-            phase: Phase::AttnOut,
-            role: Role::AttnOutput,
-            xf: Slot::XfAttnOut,
-            y: Slot::MixOut,
-            col: 0,
-        },
+        pack_op(
+            Phase::AttnPack,
+            Slot::AttnCore,
+            Slot::XfAttnOut,
+            Slot::Q8AttnOut,
+            a.q_width,
+            layout,
+        ),
+        project_op(
+            Phase::AttnOut,
+            Role::AttnOutput,
+            Slot::XfAttnOut,
+            Slot::Q8AttnOut,
+            Slot::MixOut,
+            0,
+            layout,
+        ),
     ]
 }
 
-/// The launches of one block for a layer of `kind`, in queue order.
-pub(super) fn block_ops(kind: AttentionKind, g: &MixerGeometry) -> Result<Vec<BlockOp>, EngError> {
-    let mut ops = vec![prologue()];
+/// Every fused-row column the `ProjectQ` launches of `kind` write, as (role, col, rows, ld): the
+/// four (three) in-projections tile `DeltaProj`/`AttnProj` and the output projection writes
+/// `MixOut` from column 0.
+fn native_columns(g: &MixerGeometry, kind: AttentionKind) -> Vec<(Role, usize, usize, usize)> {
+    let (d, a, h) = (&g.delta, &g.attn, g.hidden);
     match kind {
-        AttentionKind::DeltaNet => ops.extend(delta_ops(g)),
-        AttentionKind::Full => ops.extend(attn_ops(g)),
+        AttentionKind::DeltaNet => vec![
+            (Role::AttnQkv, 0, d.channels, d.ld),
+            (Role::AttnGate, d.z_off, d.z_rows, d.ld),
+            (Role::SsmBeta, d.beta_off, d.beta_rows, d.ld),
+            (Role::SsmAlpha, d.alpha_off, d.alpha_rows, d.ld),
+            (Role::SsmOut, 0, h, h),
+        ],
+        _ => vec![
+            (Role::AttnQ, 0, a.q_rows, a.ld),
+            (Role::AttnK, a.k_off, a.kv_rows, a.ld),
+            (Role::AttnV, a.v_off, a.kv_rows, a.ld),
+            (Role::AttnOutput, 0, h, h),
+        ],
+    }
+}
+
+/// The launches of one block for a layer of `kind`, in queue order. With `Tiled` the list is
+/// byte-identical to the a4ca4075 lists (pinned by the literal fixture test); with `Native` the
+/// `NormPack`/`Project`/`Pack` triples become `NormQ8`/`ProjectQ`/`QuantizeQ8` and the fused-row
+/// column offsets are checked first (`check_native_column`), so a bad offset is a typed refusal
+/// here at construction, never a launch-time wrapper error inside a token.
+pub(super) fn block_ops(
+    kind: AttentionKind,
+    g: &MixerGeometry,
+    layout: WeightLayout,
+) -> Result<Vec<BlockOp>, EngError> {
+    if layout == WeightLayout::Native {
+        for (role, col, rows, ld) in native_columns(g, kind) {
+            check_native_column(role, col, rows, ld)?;
+        }
+    }
+    let mut ops = vec![prologue(layout)];
+    match kind {
+        AttentionKind::DeltaNet => ops.extend(delta_ops(g, layout)),
+        AttentionKind::Full => ops.extend(attn_ops(g, layout)),
         other => {
             return Err(EngError::Checkpoint(format!(
                 "block ops: attention kind {other:?} has no resident mixer"
             )));
         }
     }
-    ops.push(epilogue());
+    ops.push(epilogue(layout));
     Ok(ops)
 }

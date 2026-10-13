@@ -156,6 +156,77 @@ fn the_start_block_and_the_result_pair_have_their_own_words() {
 }
 
 #[test]
+fn a_layout_mismatch_is_refused_before_any_context_work() {
+    use crate::family::project::cuda::WeightLayout;
+    // The pure refusal: the options must agree with the loaded weights.
+    assert!(super::step::agree_layout(WeightLayout::Native, WeightLayout::Native).is_ok());
+    assert!(super::step::agree_layout(WeightLayout::Tiled, WeightLayout::Tiled).is_ok());
+    for (weights, options) in [
+        (WeightLayout::Tiled, WeightLayout::Native),
+        (WeightLayout::Native, WeightLayout::Tiled),
+    ] {
+        match super::step::agree_layout(weights, options) {
+            Err(crate::EngError::Checkpoint(message)) => {
+                assert!(message.contains("follows the loaded model"), "{message}")
+            }
+            other => panic!("a mismatched layout must be refused: {other:?}"),
+        }
+    }
+    // And `new` runs it before anything device-side: the wiring is pinned on the merged source
+    // (the c17 style), so a mutant that reads the layout from the options alone still fails.
+    let body = pinned_text(fn_section("fn new("));
+    let length = body.len();
+    let agree = body
+        .find("agree_layout(weights.layout()?, options.layout)?;")
+        .unwrap_or_else(|| panic!("new ({length} bytes) never agrees the layouts"));
+    let device = body
+        .find("context.stream()")
+        .unwrap_or_else(|| panic!("new ({length} bytes) never opens a stream"));
+    assert!(
+        agree < device,
+        "the layout agreement ({agree}) runs after the device work ({device})"
+    );
+}
+
+#[test]
+fn the_head_resolves_its_pack_slot_inside_each_arm() {
+    // The S3c scratch defect: lm_head resolved XfFinal BEFORE the layout match, so every Native
+    // run refused ("the plan has no slot XfFinal") although the Native arm never reads it. The
+    // pinned body must carry the Tiled pack lookup inside the tiled arm and no pre-match lookup.
+    let body = pinned_text(fn_section("fn lm_head"));
+    let length = body.len();
+    assert!(
+        !body.contains("let (xf, y) ="),
+        "lm_head ({length} bytes) resolves the pack before the layout match"
+    );
+    assert!(
+        body.contains("xf: self.view(Slot::XfFinal)?"),
+        "lm_head ({length} bytes) does not read the tiled pack inside the tiled arm"
+    );
+    assert!(
+        !body[..body.find("match self.globals.head").expect("the match")].contains("XfFinal"),
+        "lm_head ({length} bytes) names the tiled pack before the match"
+    );
+}
+
+/// The defect-2 WRITER pin (C4's F4): the plan-side killer catches a missing FinalNormRow
+/// slot; this pins the WRITER through the same seam, so a step.rs-only regression (the native
+/// final norm writing Slot::NormRow again) fails a committed CPU test too.
+#[test]
+fn the_native_final_norm_writes_its_own_scratch_row() {
+    let body = pinned_text(fn_section("fn final_norm"));
+    let length = body.len();
+    assert!(
+        body.contains("norm_out: self.view(Slot::FinalNormRow)?"),
+        "final_norm ({length} bytes) does not write the plan's own FinalNormRow slot"
+    );
+    assert!(
+        !body.contains("norm_out: self.view(Slot::NormRow)?"),
+        "final_norm ({length} bytes) writes NormRow (the scratch-defect-2 form)"
+    );
+}
+
+#[test]
 fn new_validates_the_step_inputs_before_it_touches_the_context() {
     let body = pinned_text(fn_section("fn new("));
     let length = body.len();

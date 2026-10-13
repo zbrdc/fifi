@@ -8,11 +8,12 @@ use super::{
     state::StepField,
     step_plan::{Phase, Slot},
 };
+use crate::family::project::cuda::WeightLayout;
 use crate::family::{AttentionKind, gguf_model::Role};
 
 fn ops_of(kind: AttentionKind) -> Vec<BlockOp> {
     let g = MixerGeometry::new(&dims()).expect("geometry");
-    block_ops(kind, &g).expect("ops")
+    block_ops(kind, &g, crate::family::project::cuda::WeightLayout::Tiled).expect("ops")
 }
 
 fn kinds() -> Vec<AttentionKind> {
@@ -132,9 +133,8 @@ fn launches_stay_inside_their_slot_lifetimes() {
 
 #[test]
 fn a_block_starts_with_the_input_norm_and_hands_the_moe_input_over() {
-    let g = MixerGeometry::new(&dims()).expect("geometry");
     for kind in kinds() {
-        let ops = block_ops(kind, &g).expect("ops");
+        let ops = ops_of(kind);
         assert_eq!(
             ops.first(),
             Some(&BlockOp::NormPack {
@@ -417,5 +417,7 @@ fn the_attention_pack_op_reads_the_query_width_of_the_packet() {
 #[test]
 fn a_kind_without_a_block_is_refused() {
     let g = MixerGeometry::new(&dims()).expect("geometry");
-    assert!(block_ops(AttentionKind::Qsa, &g).is_err());
+    assert!(block_ops(AttentionKind::Qsa, &g, WeightLayout::Tiled).is_err());
+    // The Native lists carry the same refusal: no kind without a resident mixer.
+    assert!(block_ops(AttentionKind::Qsa, &g, WeightLayout::Native).is_err());
 }

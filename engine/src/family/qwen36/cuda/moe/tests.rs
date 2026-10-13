@@ -6,10 +6,11 @@ use super::super::super::host::HostShape;
 use super::super::dims::{KvMode, StepDims, StepOptions};
 use super::super::step_plan::{KernelScratch, Slot, StepPlan};
 use super::{
-    BufferFacts, ExpertFacts, MoeDims, MoeOp, OpSlots, ProjFacts, RangeFacts, RouteFacts,
-    StackFacts, WeightFacts, check_block, moe_sequence, op_slots,
+    BufferFacts, ExpertFacts, MoeDims, MoeOp, OpSlots, PackFacts, PackKind, ProjFacts, RangeFacts,
+    RouteFacts, StackFacts, WeightFacts, check_block, moe_sequence, op_slots,
 };
 use crate::EngError;
+use crate::family::project::cuda::WeightLayout;
 use crate::family::{QWEN3_6_35B_A3B, gguf_model::Inventory};
 use crate::kernels::cuda::resident::router::{RouterShape, router_logits_bytes};
 use crate::kernels::cuda::xf_bytes;
@@ -46,8 +47,30 @@ fn plan(rows: usize) -> StepPlan {
         context_tokens: 8,
         delta_slots: 1,
         forked_experts: false,
+        layout: WeightLayout::Tiled,
     };
     StepPlan::new(&dims, rows, &options, &scratch).expect("plan")
+}
+
+/// The real step plan of the fixture at one row in the given layout.
+fn plan_of(layout: WeightLayout) -> StepPlan {
+    let dims = step_dims();
+    let router = RouterShape {
+        m: 1,
+        hidden: dims.shape.hidden,
+        n_expert: dims.shape.moe.experts,
+        top_k: dims.shape.moe.top_k,
+    };
+    let scratch = KernelScratch::new(&dims, 1, router_logits_bytes(router).expect("router bytes"))
+        .expect("scratch");
+    let options = StepOptions {
+        kv_mode: KvMode::Fp16,
+        context_tokens: 8,
+        delta_slots: 1,
+        forked_experts: false,
+        layout,
+    };
+    StepPlan::new(&dims, 1, &options, &scratch).expect("plan")
 }
 
 /// The first and last launch position at which the sequence touches `slot`.
@@ -131,10 +154,13 @@ fn buffer_facts(dims: &MoeDims) -> BufferFacts {
             status: at(4),
         },
         expert: ExpertFacts {
-            xf_moe: at(pack(dims.hidden)),
+            packs: PackFacts {
+                kind: PackKind::Xf,
+                moe: at(pack(dims.hidden)),
+                down: at(pack(dims.inter)),
+                shared: at(pack(dims.shared_inter)),
+            },
             expert_gu: at(dims.top_k * dims.inter * 2 * 4),
-            xf_down: at(pack(dims.inter)),
-            xf_shared: at(pack(dims.shared_inter)),
             expert_down: at(dims.top_k * dims.hidden * 4),
             shared_gu: at(dims.shared_inter * 2 * 4),
             shared_out: at(dims.hidden * 4),
@@ -205,7 +231,7 @@ fn sequence_has_the_documented_order() {
         MoeOp::SharedDown,
         MoeOp::Combine,
     ];
-    let got = moe_sequence(moe_dims(1).top_k);
+    let got = moe_sequence(moe_dims(1).top_k, WeightLayout::Tiled);
     assert_eq!(got, want);
     assert_eq!(
         got.len(),
@@ -218,7 +244,7 @@ fn sequence_has_the_documented_order() {
 #[test]
 fn ops_stay_inside_their_slot_lifetimes() {
     let plan = plan(1);
-    for op in moe_sequence(moe_dims(1).top_k) {
+    for op in moe_sequence(moe_dims(1).top_k, WeightLayout::Tiled) {
         let slots = op_slots(op);
         for slot in slots.reads.iter().chain(slots.writes.iter()) {
             let planned = plan.tensors()[plan.index(*slot).expect("a plan slot")];
@@ -244,7 +270,7 @@ fn ops_stay_inside_their_slot_lifetimes() {
 #[test]
 fn aliased_slots_are_never_live_together() {
     let plan = plan(1);
-    let seq = moe_sequence(moe_dims(1).top_k);
+    let seq = moe_sequence(moe_dims(1).top_k, WeightLayout::Tiled);
     let mut touched: Vec<Slot> = Vec::new();
     for op in &seq {
         let slots = op_slots(*op);
@@ -301,7 +327,7 @@ fn block_refuses_shape_mismatches_before_launch() {
     let mut short = weight_facts(&base);
     short.router.bytes -= 4;
     let mut packed = buffer_facts(&base);
-    packed.expert.xf_moe.bytes -= 256;
+    packed.expert.packs.moe.bytes -= 256;
     let mut shared = buffer_facts(&base);
     shared.route.ids.offset = shared.route.norm_row.offset;
     let cases = [
@@ -351,4 +377,104 @@ fn block_refuses_shape_mismatches_before_launch() {
     for (case, dims, weights, bufs, needle) in cases {
         assert_bad_request(check_block(&dims, &weights, &bufs), case, needle);
     }
+}
+
+/// The NATIVE sequence as a literal: the router first and the combine last (their places and
+/// bytes are the OFF-T hook's), the per-slot triples collapsed to one merged launch each.
+#[test]
+fn the_native_moe_sequence_is_the_ten_merged_ops() {
+    let want: Vec<MoeOp> = vec![
+        MoeOp::Router,
+        MoeOp::ExpertGateQ,
+        MoeOp::ExpertUpQ,
+        MoeOp::SharedGateQ,
+        MoeOp::SharedUpQ,
+        MoeOp::SwigluSharedQ,
+        MoeOp::SwigluExperts,
+        MoeOp::ExpertDownQ,
+        MoeOp::SharedDownQ,
+        MoeOp::Combine,
+    ];
+    assert_eq!(moe_sequence(8, WeightLayout::Native), want);
+    // Any top_k gives the same ten ops: the merged launches take the slots together.
+    assert_eq!(moe_sequence(4, WeightLayout::Native), want);
+}
+
+/// T2 of the packet, on the native list: every slot an op touches is live in its phase in the
+/// NATIVE plan, and two slots that share bytes are never live at the same launch position
+/// (T3's rule, spelled over the merged ops).
+#[test]
+fn native_moe_ops_stay_inside_their_slot_lifetimes() {
+    let plan = plan_of(WeightLayout::Native);
+    let seq = moe_sequence(8, WeightLayout::Native);
+    for op in &seq {
+        let slots = op_slots(*op);
+        for slot in slots.reads.iter().chain(slots.writes.iter()) {
+            let planned = plan.tensors()[plan.index(*slot).expect("a plan slot")];
+            assert!(
+                planned.first <= slots.phase && slots.phase <= planned.last,
+                "{op:?} touches {slot:?} at phase {} outside {}..={}",
+                slots.phase,
+                planned.first,
+                planned.last
+            );
+        }
+    }
+    let mut touched: Vec<Slot> = Vec::new();
+    for op in &seq {
+        let slots = op_slots(*op);
+        for slot in slots.reads.iter().chain(slots.writes.iter()) {
+            if !touched.contains(slot) {
+                touched.push(*slot);
+            }
+        }
+    }
+    for (index, &a) in touched.iter().enumerate() {
+        for &b in &touched[index + 1..] {
+            let (span_a, span_b) = (span_of(&seq, a), span_of(&seq, b));
+            if span_a.0 <= span_b.1 && span_b.0 <= span_a.1 {
+                let (bytes_a, bytes_b) = (bytes_of(&plan, a), bytes_of(&plan, b));
+                assert!(
+                    bytes_a.1 <= bytes_b.0 || bytes_b.1 <= bytes_a.0,
+                    "{a:?} and {b:?} share bytes and are live together at {span_a:?}/{span_b:?}"
+                );
+            }
+        }
+    }
+}
+
+/// The q8_1 pack sizes of the native block: a Q8 buffer_facts set passes check_block, a wrong
+/// moe pack size is refused, and the Tiled fact set (fp16 sizes) is refused against the Q8 kind.
+#[test]
+fn the_native_block_needs_the_q8_1_pack_sizes() {
+    let dims = moe_dims(1);
+    let mut facts = buffer_facts(&dims);
+    facts.expert.packs = PackFacts {
+        kind: PackKind::Q8,
+        moe: facts.expert.packs.moe,
+        down: facts.expert.packs.down,
+        shared: facts.expert.packs.shared,
+    };
+    // The Q8 kind over the Tiled fp16 sizes is refused before any launch.
+    assert_bad_request(
+        check_block(&dims, &weight_facts(&dims), &facts),
+        "fp16 sizes under the q8 kind",
+        "xf_moe",
+    );
+    let q8 = |k: usize, rows: usize| {
+        crate::kernels::cuda::resident::quantize_q8_1::q8_1_bytes(k, rows).expect("size")
+    };
+    facts.expert.packs.moe.bytes = q8(dims.hidden, 1);
+    facts.expert.packs.down.bytes = q8(dims.inter, dims.top_k);
+    facts.expert.packs.shared.bytes = q8(dims.shared_inter, 1);
+    assert!(
+        check_block(&dims, &weight_facts(&dims), &facts).is_ok(),
+        "the q8_1 pack sizes pass the pure checks"
+    );
+    facts.expert.packs.down.bytes -= 36;
+    assert_bad_request(
+        check_block(&dims, &weight_facts(&dims), &facts),
+        "one block short",
+        "xf_down",
+    );
 }

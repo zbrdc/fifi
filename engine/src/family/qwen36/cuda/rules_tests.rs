@@ -4,6 +4,7 @@ use super::{
     rules::{QwenRules, check_token_id, check_vocab, validate_step_inputs},
 };
 use crate::EngError;
+use crate::family::project::cuda::WeightLayout;
 
 /// The real token counts of Qwen3.6: the sampler draws from 248_077 ids, the head tensor is
 /// padded to 248_320 rows, and the tokenizer's end-of-sequence ids are 248_046 and 248_044.
@@ -16,6 +17,7 @@ fn options(forked_experts: bool) -> StepOptions {
         context_tokens: 1024,
         delta_slots: 1,
         forked_experts,
+        layout: WeightLayout::Tiled,
     }
 }
 

@@ -118,11 +118,8 @@ impl NativeWeight {
         self.k
     }
 
-    /// The stack depth of a rank-3 tensor, `None` for a plain matrix.
-    #[cfg_attr(
-        not(test),
-        expect(dead_code, reason = "the resident step reads it (decision 0047, S3)")
-    )]
+    /// The stack depth of a rank-3 tensor, `None` for a plain matrix. Read by the resident
+    /// step's native stack lookups (MATVEC-PAR S3b).
     pub(crate) fn experts(&self) -> Option<usize> {
         self.experts
     }

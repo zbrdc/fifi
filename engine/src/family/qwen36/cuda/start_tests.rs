@@ -7,8 +7,8 @@ use super::dims::{KvMode, StepDims};
 use super::pinned::ROTARY_DIM;
 use super::start::{
     BuildGuard, CUDA_ENGINE_BUILT, GGUF_BYTES, GGUF_NAME, KV_BYTES_PER_POSITION, already_built,
-    check_gguf_identity, check_sha256, file_sha256, ignored_mlx_line, kv_cache_bytes, load_options,
-    pinned_gguf, sha256_wanted, step_options,
+    check_gguf_identity, check_sha256, context_tokens, file_sha256, ignored_mlx_line,
+    kv_cache_bytes, load_options, pinned_gguf, sha256_wanted, step_options,
 };
 use super::state_layout::KvPool;
 use crate::EngError;
@@ -205,25 +205,36 @@ fn the_file_digest_and_the_mismatch_text_come_from_one_pass() {
 }
 
 #[test]
-fn the_step_options_follow_the_context_limit() {
-    let options = step_options(32_768).expect("the serve default");
-    assert_eq!(options.context_tokens, 32_768);
-    assert_eq!((options.delta_slots, options.forked_experts), (1, false));
-    assert!(matches!(options.kv_mode, KvMode::Fp16));
+fn the_step_options_follow_the_context_limit_and_the_given_layout() {
+    // KUBDAN-MSG-72 item 1: step_options is pure in (limit, layout); make passes the loaded
+    // weights' layout, so the options carry whichever layout they are given, unchanged.
+    for layout in [WeightLayout::Tiled, WeightLayout::Native] {
+        let options = step_options(32_768, layout).expect("the serve default");
+        assert_eq!(options.context_tokens, 32_768);
+        assert_eq!((options.delta_slots, options.forked_experts), (1, false));
+        assert!(matches!(options.kv_mode, KvMode::Fp16));
+        assert_eq!(options.layout, layout, "the layout passes through");
+    }
     assert!(
-        step_options(2).is_ok(),
+        step_options(2, WeightLayout::Tiled).is_ok(),
         "the smallest limit the Mac arm accepts"
     );
     for limit in [0, 1] {
-        let text = match step_options(limit) {
+        let text = match step_options(limit, WeightLayout::Native) {
             Err(EngError::BadRequest(text)) => text,
             other => panic!("limit {limit} was accepted: {other:?}"),
         };
         assert!(text.contains("context_limit must be at least 2"), "{text}");
+        // start() validates through the same function before any device work.
+        assert!(
+            context_tokens(limit).is_err(),
+            "start refuses limit {limit} too"
+        );
     }
     // u32::MAX overflows no pure term (20,480 * 4,294,967,295 < 2^64): the largest limits are
     // refused by the load admission, which names the demand and the free figure.
-    let huge = step_options(u32::MAX).expect("no pure term overflows");
+    let huge = step_options(u32::MAX, WeightLayout::Tiled).expect("no pure term overflows");
+    assert_eq!(context_tokens(u32::MAX), Ok(huge.context_tokens));
     assert_eq!(
         kv_cache_bytes(huge.context_tokens),
         Ok(20_480 * 4_294_967_295u64)

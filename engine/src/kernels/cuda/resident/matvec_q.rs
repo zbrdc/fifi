@@ -13,10 +13,6 @@
 //! usable; `k` is a multiple of the type's block size; `rows` is a positive multiple of 4
 //! ([`ROWS_MULTIPLE`]); `ncols` is in `1..=8`; `w`, `x_q8` and `y` hold the bytes the call uses and
 //! are 4-byte aligned; `y` overlaps neither `w` nor `x_q8`. A refused call changes nothing.
-#![cfg_attr(
-    not(test),
-    expect(dead_code, reason = "staged for RD-9a (decision 0047)")
-)]
 
 use crate::EngError;
 use crate::kernels::cuda::context::{

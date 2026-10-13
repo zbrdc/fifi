@@ -18,10 +18,6 @@
 //! usable; `n_ff` is a multiple of 32 in `32..=32768`; `slots` is in `1..=8`; `y_slot_stride` is
 //! at least `2 * n_ff`; `gu` holds the A2 footprint and `q8` the padded rows, both 4-byte
 //! aligned; `q8` overlaps no byte of `gu`. A refused call changes nothing.
-#![cfg_attr(
-    not(test),
-    expect(dead_code, reason = "staged for RD-9a (decision 0047)")
-)]
 
 use crate::EngError;
 use crate::kernels::cuda::context::{

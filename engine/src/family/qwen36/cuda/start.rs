@@ -186,10 +186,27 @@ pub(super) fn check_gguf_identity(path: &Path, verify: Option<&str>) -> Result<(
     Ok(())
 }
 
-/// The session options: fp16 KV, one committed DeltaNet slot, no forked experts, and the fixed
-/// KV capacity of `context_limit` positions (the step's context limit IS this number). Below 2
-/// is refused.
-pub(super) fn step_options(context_limit: u32) -> Result<StepOptions, EngError> {
+/// The session options: fp16 KV, one committed DeltaNet slot, no forked experts, the fixed KV
+/// capacity of `context_limit` positions (the step's context limit IS this number), and the
+/// step layout. `make` calls it AFTER the load with the loaded weights' own layout
+/// (`loaded.device.layout()?`, KUBDAN-MSG-72 item 1), so the step always runs the layout the
+/// device holds.
+pub(super) fn step_options(
+    context_limit: u32,
+    layout: WeightLayout,
+) -> Result<StepOptions, EngError> {
+    Ok(StepOptions {
+        kv_mode: KvMode::Fp16,
+        context_tokens: context_tokens(context_limit)?,
+        delta_slots: 1,
+        forked_experts: false,
+        layout,
+    })
+}
+
+/// The KV capacity in positions of `context_limit`, with its KV bytes checked: below 2 is
+/// refused. `start` validates the limit with this before any device work.
+pub(super) fn context_tokens(context_limit: u32) -> Result<usize, EngError> {
     if context_limit < 2 {
         return Err(EngError::BadRequest(format!(
             "engine config: context_limit must be at least 2, found {context_limit}"
@@ -198,12 +215,7 @@ pub(super) fn step_options(context_limit: u32) -> Result<StepOptions, EngError> 
     let context_tokens = usize::try_from(context_limit)
         .map_err(|_| EngError::BadRequest("engine config: context_limit exceeds usize".into()))?;
     kv_cache_bytes(context_tokens)?;
-    Ok(StepOptions {
-        kv_mode: KvMode::Fp16,
-        context_tokens,
-        delta_slots: 1,
-        forked_experts: false,
-    })
+    Ok(context_tokens)
 }
 
 /// The KV cache bytes of `context_tokens` fp16 positions, in checked arithmetic: the number is
@@ -248,25 +260,24 @@ pub(crate) fn start(settings: &Q36Settings) -> Result<(Engine, TokenizerBundle),
         .map_err(|_| EngError::Checkpoint("tokenizer vocabulary exceeds usize".into()))?;
     let head_rows = head_rows_of()?;
     let rules = QwenRules::new(eos, sampler_vocab, head_rows)?;
-    let options = step_options(settings.context_limit)?;
-    let kv_cache = kv_cache_bytes(options.context_tokens)?;
+    let kv_cache = kv_cache_bytes(context_tokens(settings.context_limit)?)?;
     // The CUDA arm refuses the prefill budget, so its worker piece is the no-budget piece.
     let piece = usize::try_from(NO_BUDGET_PIECE).map_err(|_| {
         EngError::BadRequest("engine config: the worker piece exceeds usize".into())
     })?;
     let guard = BuildGuard::acquire()?;
     let owned = settings.clone();
-    let engine = spawn_engine(piece, move || make(owned, rules, options, kv_cache, guard))?;
+    let engine = spawn_engine(piece, move || make(owned, rules, kv_cache, guard))?;
     Ok((engine, bundle))
 }
 
 /// The engine-thread half: everything CUDA is built here, in the gate's own order — projector,
-/// memory figure, GGUF identity, open, load with admission, free-after-load floor, step
-/// resources, then the leaks, the step and the capture setting.
+/// memory figure, GGUF identity, open, load with admission, free-after-load floor, the step
+/// options from the loaded layout, step resources, then the leaks, the step and the capture
+/// setting.
 fn make(
     settings: Q36Settings,
     rules: QwenRules,
-    options: StepOptions,
     kv_cache: u64,
     mut guard: BuildGuard,
 ) -> Result<(QwenResidentStep<'static>, DecodeSession), EngError> {
@@ -286,6 +297,9 @@ fn make(
     let inventory = Inventory::for_spec(&QWEN3_6_35B_A3B)?;
     let shape = HostShape::from_spec(&QWEN3_6_35B_A3B, ROTARY_DIM)?;
     let dims = StepDims::new(&shape, &inventory)?;
+    // The step layout is the loaded weights' own, never a constant or the load options: the
+    // step's matvecs read the blocks the device holds (a mixed load is refused by layout()).
+    let options = step_options(settings.context_limit, loaded.device.layout()?)?;
     let res = StepResources::new(projector.context(), dims, &inventory, &options)?;
     // LEAK (CUDA-SERVE-1 2.1, condition 2): the three owners are leaked for the process
     // lifetime, giving `QwenResidentStep<'static>`; an owning `Arc` variant would rewrite the

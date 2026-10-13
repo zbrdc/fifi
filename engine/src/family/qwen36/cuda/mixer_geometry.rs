@@ -196,6 +196,24 @@ fn no_mixer(kind: AttentionKind) -> EngError {
     ))
 }
 
+/// Refuses a NATIVE dense weight that is not the launch's shape (MATVEC-PAR S3b): the shape rule
+/// of [`check_dense`] plus the MMVQ row-group rule of `matvec_q` (`ROWS_MULTIPLE`), `rows % 4 == 0`
+/// — the native loader accepts any row count, so the refusal belongs to the step's construction.
+pub(super) fn check_native_dense(
+    name: &str,
+    have: (usize, usize),
+    want: &DenseSpec,
+) -> Result<(), EngError> {
+    let (rows, k) = have;
+    check_dense(name, (rows, k, None), want)?;
+    if !rows.is_multiple_of(4) {
+        return Err(EngError::Checkpoint(format!(
+            "mixer weights: {name} has {rows} rows, the native matvec needs a multiple of 4"
+        )));
+    }
+    Ok(())
+}
+
 /// Refuses a dense weight whose shape is not the one the launch needs. `experts` is the stack
 /// depth: a dense mixer weight has none.
 pub(super) fn check_dense(

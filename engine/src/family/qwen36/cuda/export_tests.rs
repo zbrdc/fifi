@@ -11,6 +11,7 @@ use super::{
     },
     state_layout::StateLayout,
 };
+use crate::family::project::cuda::WeightLayout;
 use crate::family::{QWEN3_6_35B_A3B, gguf_model::Inventory};
 
 fn dims() -> StepDims {
@@ -25,6 +26,7 @@ fn options(mode: KvMode, ctx: usize) -> StepOptions {
         context_tokens: ctx,
         delta_slots: 1,
         forked_experts: false,
+        layout: WeightLayout::Tiled,
     }
 }
 

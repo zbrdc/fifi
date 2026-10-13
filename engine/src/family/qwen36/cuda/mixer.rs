@@ -33,15 +33,18 @@ use super::{
 };
 use crate::{
     EngError,
-    family::AttentionKind,
+    family::{AttentionKind, project::cuda::WeightLayout},
     kernels::cuda::{
         CudaContext, DeviceArena, DeviceRange, DeviceStream, MatmulIo, PackCall, Projection,
         resident::{
             add_norm_pack::AddNormCall,
+            add_rmsnorm_q8::AddNormQ8Call,
             attn_decode::{AttnDecodeCall, AttnSpan, AttnSplit},
             attn_prep::{AttnPrepCall, RopeParams},
             gdn_conv::ConvCall,
             gdn_delta::{DeltaCall, DeltaWeights},
+            matvec_q::MatvecCall,
+            quantize_q8_1::QuantizeCall,
         },
     },
 };
@@ -55,10 +58,10 @@ struct KindOps {
 }
 
 impl KindOps {
-    fn new(g: &MixerGeometry) -> Result<Self, EngError> {
+    fn new(g: &MixerGeometry, layout: WeightLayout) -> Result<Self, EngError> {
         Ok(Self {
-            delta: block_ops(AttentionKind::DeltaNet, g)?,
-            attn: block_ops(AttentionKind::Full, g)?,
+            delta: block_ops(AttentionKind::DeltaNet, g, layout)?,
+            attn: block_ops(AttentionKind::Full, g, layout)?,
         })
     }
 
@@ -87,8 +90,9 @@ impl<'a> MixerViews<'a> {
         plan: &StepPlan,
         arena: &'a DeviceArena,
         g: &MixerGeometry,
+        layout: WeightLayout,
     ) -> Result<Self, EngError> {
-        let ops = KindOps::new(g)?;
+        let ops = KindOps::new(g, layout)?;
         let mut views: Vec<(Slot, DeviceRange<'a>)> = Vec::new();
         for op in ops.all() {
             for slot in op.reads().into_iter().chain(op.writes()) {
@@ -140,6 +144,9 @@ pub(super) struct MixerParts<'a> {
     pub(super) table: &'a LayerTable,
     pub(super) weights: MixerWeights<'a>,
     pub(super) views: MixerViews<'a>,
+    /// The layout the op lists and the weight lookups were built for (MATVEC-PAR S3b): taken
+    /// from the session options, which the step has checked against the loaded weights.
+    pub(super) layout: WeightLayout,
 }
 
 pub(super) struct Mixers<'a> {
@@ -172,7 +179,7 @@ fn tail<'b>(range: DeviceRange<'b>, col: usize) -> Result<DeviceRange<'b>, EngEr
 impl<'a> Mixers<'a> {
     pub(super) fn new(context: &'a CudaContext, parts: MixerParts<'a>) -> Result<Self, EngError> {
         check_delta_eps(parts.geometry.eps)?;
-        let ops = KindOps::new(&parts.geometry)?;
+        let ops = KindOps::new(&parts.geometry, parts.layout)?;
         Ok(Self {
             context,
             parts,
@@ -254,6 +261,51 @@ impl<'a> Mixers<'a> {
                     xf: self.view(xf)?,
                     m: BLOCK_ROWS,
                     k,
+                },
+            ),
+            BlockOp::NormQ8 {
+                weight,
+                delta,
+                q8,
+                norm_out,
+                ..
+            } => ctx.add_rmsnorm_q8(
+                stream,
+                AddNormQ8Call {
+                    n: g.hidden,
+                    eps: g.eps,
+                    h: run.io.resid,
+                    delta: delta.map(|slot| self.view(slot)).transpose()?,
+                    weight: run.weights.raw(weight)?,
+                    norm_out: self.view(norm_out)?,
+                    q8: self.view(q8)?,
+                },
+            ),
+            BlockOp::ProjectQ {
+                role, x_q8, y, col, ..
+            } => {
+                let weight = run.weights.native(role)?;
+                let ty = weight.quant();
+                ctx.matvec_q(
+                    stream,
+                    MatvecCall {
+                        ty,
+                        w: weight.buffer().range(0, weight.buffer().bytes())?,
+                        x_q8: self.view(x_q8)?,
+                        y: tail(self.view(y)?, col)?,
+                        k: weight.k(),
+                        rows: weight.n_rows(),
+                        ncols: BLOCK_ROWS,
+                    },
+                )
+            }
+            BlockOp::QuantizeQ8 { x, q8, k, .. } => ctx.quantize_q8_1(
+                stream,
+                QuantizeCall {
+                    x: self.view(x)?,
+                    y: self.view(q8)?,
+                    k,
+                    ncols: BLOCK_ROWS,
                 },
             ),
             BlockOp::Conv { proj, out, weights } => ctx.gdn_conv(

@@ -17,11 +17,6 @@
 //!   (decisions 0023 and 0024).
 //! - No raw pointer and no unsafe function leaves this module.
 
-#![cfg_attr(
-    not(test),
-    expect(dead_code, reason = "staged for RD-9a (decision 0047)")
-)]
-
 use std::ffi::{c_int, c_void};
 use std::mem::offset_of;
 

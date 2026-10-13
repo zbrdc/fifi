@@ -5,10 +5,11 @@ use super::{
     dims::{KvMode, StepOptions},
     mixer_geometry::DenseSpec,
     resources::{
-        GlobalNames, GlobalSpecs, MoeSpecs, STEP_ROWS, StackSpec, check_stack,
+        GlobalNames, GlobalSpecs, MoeSpecs, STEP_ROWS, StackSpec, check_native_stack, check_stack,
         check_stage1_options, f32_bytes, moe_dims,
     },
 };
+use crate::family::project::cuda::WeightLayout;
 use crate::{EngError, family::gguf_model::Role};
 
 #[test]
@@ -65,6 +66,43 @@ fn the_moe_block_gets_the_dimensions_of_the_layout_record() {
             m.shared_inter
         )
     );
+}
+
+/// The NATIVE stack guard (MATVEC-PAR S3b, MSG-70 condition 5): the shape rule passes first,
+/// then the per-expert `rows % 4` rule refuses a stack whose per-expert height is ragged (every
+/// earlier check satisfied), `experts: None` refuses as "not an expert stack", and the valid
+/// multiples-of-4 form passes.
+#[test]
+fn a_native_stack_with_ragged_per_expert_rows_is_refused() {
+    let want = StackSpec {
+        experts: 4,
+        rows: 8,
+        k: 256,
+    };
+    // The valid native form: 4 experts of 8 rows (8 % 4 == 0).
+    assert!(check_native_stack("w", (32, 256, Some(4)), &want).is_ok());
+    // Ragged per-expert rows: a shape check_stack ACCEPTS (4 experts of 8 rows... 34 rows over
+    // 4 experts would fail the shape rule first, so use a want of 4x9: 36 rows, 9 % 4 != 0).
+    let ragged = StackSpec {
+        experts: 4,
+        rows: 9,
+        k: 256,
+    };
+    match check_native_stack("w", (36, 256, Some(4)), &ragged) {
+        Err(EngError::Checkpoint(message)) => {
+            assert!(
+                message.contains("multiple of 4") && message.contains("9"),
+                "{message}"
+            );
+        }
+        other => panic!("a 9-row-per-expert native stack must be refused: {other:?}"),
+    }
+    // The guard's first conjunct (rows not a multiple of the depth) is UNREACHABLE by
+    // construction: check_stack's shape rule pins have.0 == experts * rows, which always
+    // divides - stated so nobody adds a dead case for it. `experts: None` is the same: the
+    // shape rule refuses it first (pinned), so the native rule's own None arm is
+    // defence-in-depth behind it.
+    assert!(check_native_stack("w", (32, 256, None), &want).is_err());
 }
 
 #[test]
@@ -137,6 +175,7 @@ fn forked_experts_are_refused_in_stage_one() {
         context_tokens: 1024,
         delta_slots: 1,
         forked_experts,
+        layout: WeightLayout::Tiled,
     };
     match check_stage1_options(&options(true)) {
         Err(EngError::BadRequest(message)) => {

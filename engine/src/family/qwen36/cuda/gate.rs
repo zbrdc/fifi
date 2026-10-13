@@ -8,6 +8,7 @@
 //! (`to_string`, the `Display` impl). Trait impls carry no `pub` keyword, and the same check lists them too.
 //! A `prefill` key is a later addition to the settings text, never a second function.
 use crate::EngError;
+use crate::family::project::cuda::WeightLayout;
 use serde_json::Value;
 use std::fmt;
 use std::path::PathBuf;
@@ -37,6 +38,10 @@ pub struct GateSettings {
     kv_fp16: bool,
     /// Wall-clock budget of the call in seconds (0 = none); on expiry the report is `incomplete`.
     deadline_secs: u32,
+    /// The LOAD layout of the call (MATVEC-PAR S3b): "tiled" (the default when the key is
+    /// absent) or "native". It chooses only how the tensors are uploaded; the step's layout
+    /// always follows the loaded weights.
+    layout: WeightLayout,
 }
 
 /// The raw JSON of schema `cuda-rd-raw/2` (see `a5_eval.py`), without the identities only the binary knows.
@@ -96,8 +101,10 @@ fn flag(v: &Value, key: &str) -> Result<bool, EngError> {
 impl FromStr for GateSettings {
     type Err = EngError;
 
-    /// Keys: gguf, gguf_sha256, names, prompts, forced, forced_stream_sha256, gen_tokens, runs, capture, kv_fp16,
-    /// deadline_secs. A missing or mistyped key is a typed `BadRequest`, never a default.
+    /// Keys: gguf, gguf_sha256, names, prompts, forced, forced_stream_sha256, gen_tokens, runs,
+    /// capture, kv_fp16, deadline_secs, and the ONE optional key `layout` ("tiled", the default,
+    /// or "native"; MATVEC-PAR S3b). A missing or mistyped key is a typed `BadRequest`, never a
+    /// default.
     fn from_str(text: &str) -> Result<Self, EngError> {
         let v: Value = serde_json::from_str(text)
             .map_err(|e| EngError::BadRequest(format!("gate settings: {e}")))?;
@@ -113,6 +120,20 @@ impl FromStr for GateSettings {
             capture: flag(&v, "capture")?,
             kv_fp16: flag(&v, "kv_fp16")?,
             deadline_secs: number(&v, "deadline_secs")?,
+            // The ONE optional key (MATVEC-PAR S3b): absent means tiled, anything but "tiled"
+            // and "native" is a typed error naming the key.
+            layout: match v.get("layout") {
+                None => WeightLayout::Tiled,
+                Some(value) => match value.as_str() {
+                    Some("tiled") => WeightLayout::Tiled,
+                    Some("native") => WeightLayout::Native,
+                    _ => {
+                        return Err(EngError::BadRequest(
+                            "gate settings: layout must be \"tiled\" or \"native\"".to_owned(),
+                        ));
+                    }
+                },
+            },
         };
         if s.names.len() != s.prompts.len() || s.gguf_sha256.is_empty() || s.runs == 0 {
             return Err(EngError::BadRequest(
@@ -250,6 +271,29 @@ mod tests {
         let s: GateSettings = GOOD.parse().unwrap();
         assert_eq!(s.gguf, PathBuf::from("/m.gguf"));
         assert_eq!(s.gguf_sha256, "ab");
+    }
+
+    #[test]
+    fn the_layout_member_defaults_to_tiled_and_refuses_other_values() {
+        let s: GateSettings = GOOD.parse().unwrap();
+        assert_eq!(s.layout, WeightLayout::Tiled);
+        let native = GOOD.replace("\"runs\":1", "\"runs\":1,\"layout\":\"native\"");
+        assert_eq!(
+            native.parse::<GateSettings>().unwrap().layout,
+            WeightLayout::Native
+        );
+        for bad in [
+            GOOD.replace("\"runs\":1", "\"runs\":1,\"layout\":\"bogus\""),
+            GOOD.replace("\"runs\":1", "\"runs\":1,\"layout\":5"),
+        ] {
+            match bad.parse::<GateSettings>() {
+                Ok(_) => panic!("a bad layout value must be refused: it parsed"),
+                Err(EngError::BadRequest(message)) => {
+                    assert!(message.contains("layout"), "{message}")
+                }
+                Err(other) => panic!("a bad layout value must be a BadRequest: {other:?}"),
+            }
+        }
     }
 
     #[test]

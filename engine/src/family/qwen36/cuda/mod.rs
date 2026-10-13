@@ -33,6 +33,18 @@ mod mixer_tests;
 mod mixer_weights;
 mod moe;
 #[cfg(test)]
+mod native_device_rig;
+#[cfg(test)]
+mod native_guard_tests;
+#[cfg(test)]
+mod native_mixer_device_tests;
+#[cfg(test)]
+mod native_moe_device_tests;
+#[cfg(test)]
+mod native_ops_tests;
+#[cfg(test)]
+mod native_plan_tests;
+#[cfg(test)]
 mod ops_tests;
 mod pinned;
 mod readback;

@@ -12,6 +12,7 @@ use crate::{
     family::{
         AttentionKind,
         gguf_model::{Inventory, Role},
+        project::cuda::WeightLayout,
     },
 };
 
@@ -65,6 +66,11 @@ pub(crate) struct StepOptions {
     pub(crate) delta_slots: usize,
     /// Stage 1b: one `xf` buffer per routed expert, so the experts can run on branch streams.
     pub(crate) forked_experts: bool,
+    /// The device layout the step runs (MATVEC-PAR S3b): the q8_1 producers and MMVQ matvecs of
+    /// `Native`, or today's fp16 packs and tiled matmuls of `Tiled`. DERIVED from
+    /// `CudaWeights::layout()` of the loaded model by every production caller (the gate); the
+    /// step refuses a mismatch of the two, and the default keeps every caller on the tiled path.
+    pub(crate) layout: WeightLayout,
 }
 
 /// The checked dimensions of the step: the layout record plus the widths of the fused

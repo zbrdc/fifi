@@ -6,6 +6,7 @@ use super::{
     state_layout::{KvPool, Plane, StateLayout, Word},
     step_plan::{KernelScratch, MAX_STEP_ROWS, PHASES, Phase, Slot, StepPlan, writes_status},
 };
+use crate::family::project::cuda::WeightLayout;
 use crate::family::{AttentionKind, QWEN3_6_35B_A3B, gguf_model::Inventory};
 use crate::kernels::cuda::{ArenaTensor, plan_arena};
 
@@ -30,6 +31,7 @@ fn options(mode: KvMode, ctx: usize) -> StepOptions {
         context_tokens: ctx,
         delta_slots: 1,
         forked_experts: false,
+        layout: WeightLayout::Tiled,
     }
 }
 

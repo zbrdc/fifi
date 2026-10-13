@@ -12,6 +12,7 @@ fn the_router_scratch_comes_from_the_router_wrapper() {
         context_tokens: 8,
         delta_slots: 1,
         forked_experts: false,
+        layout: crate::family::project::cuda::WeightLayout::Tiled,
     };
     for (rows, bytes) in [(1, 1_028), (8, 8_224)] {
         let scratch = KernelScratch::for_dims(&d, rows).expect("scratch");

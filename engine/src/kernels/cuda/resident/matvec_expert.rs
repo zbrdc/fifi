@@ -20,10 +20,6 @@
 //! ([`ROWS_MULTIPLE`]); `n_used` is in `1..=8` and at most `n_expert`; `y_slot_stride >= rows`;
 //! every range holds the bytes the call uses and is 4-byte aligned; `y` overlaps none of
 //! `w_stack`, `x_q8`, `ids`. A refused call changes nothing.
-#![cfg_attr(
-    not(test),
-    expect(dead_code, reason = "staged for RD-9a (decision 0047)")
-)]
 
 use crate::EngError;
 use crate::kernels::cuda::context::{
