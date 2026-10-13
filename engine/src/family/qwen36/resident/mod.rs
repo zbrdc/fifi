@@ -31,6 +31,11 @@ pub(super) mod executor;
 /// rewrite.
 #[cfg(test)]
 mod graph_count;
+/// The long-context gate of the 8-bit KV cache (decision 0046, addendum 7, rule 4). `cfg(test)`
+/// like `decode_timing`: the prompt builder, the log-softmax comparison, and the report helpers
+/// carry Linux unit tests, and the Mac harness inside carries the native cfg.
+#[cfg(test)]
+mod long_context;
 #[cfg(all(feature = "native-mlx", target_os = "macos", target_arch = "aarch64"))]
 mod moe;
 #[cfg(all(feature = "native-mlx", target_os = "macos", target_arch = "aarch64"))]

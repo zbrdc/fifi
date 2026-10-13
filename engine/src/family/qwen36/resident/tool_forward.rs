@@ -202,8 +202,9 @@ const TOP_K: usize = 20;
 pub(super) const TOTAL_IDS: usize = 922;
 /// The format token of the finding: the token id 198 after the 922-token
 /// tool prompt. The parameter of the `format_token` report rows and of the `Q36_FORMAT_GATE`
-/// assert; the default is the captured id and every gate asserts on it.
-const FORMAT_TOKEN_ID: u32 = 198;
+/// assert; the default is the captured id and every gate asserts on it. Shared with
+/// `long_context`.
+pub(super) const FORMAT_TOKEN_ID: u32 = 198;
 
 /// The required `Q36_OUT_DIR`. Panics when it is unset or when the path exists, before the long run.
 /// Shared with `decode_timing`.
