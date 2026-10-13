@@ -12,12 +12,19 @@ use std::path::{Path, PathBuf};
 
 /// Vocabulary size of the pinned `tokenizer.json` with its added tokens.
 const TOKENIZER_VOCAB_SIZE: u32 = 248_077;
-/// Positions of the default context limit (decision 0046 item 6).
+/// Positions of the default context limit of the CUDA arm (decision 0046 item 6). The CUDA arm
+/// sizes its F32 cache by the limit, so it keeps 32,768 until it builds the 8-bit cache.
 pub(crate) const DEFAULT_CONTEXT_LIMIT: u32 = 32_768;
-/// The default cache cap: 2 GiB admits 32,768 positions at the default form's 40,960 bytes each
-/// (1.25 GiB); a Q8 engine at BF16 scales charges 10,880 bytes per position and the same cap
-/// admits more (packet KV8-INTEGRATE).
-pub(crate) const DEFAULT_SESSION_CAP: u64 = 2 << 30;
+/// Positions of the default context limit of the MLX arm: 262,144, the headline of decision 0046
+/// A7. The 8-bit cache holds them in 2.85 GB (10,880 bytes per position with BF16 scales). The
+/// gate of record Q36-KV8-GATE measured the fit, the retrieval, and the tool-call format on the
+/// 36 GB Mac Studio. The default form is the 8-bit cache, so the limit belongs to that form: an
+/// explicit `kv_dtype` of `f32` needs an explicit `context_limit` and `session_cap_bytes` too.
+pub(crate) const MLX_DEFAULT_CONTEXT_LIMIT: u32 = 262_144;
+/// The default cache cap of the MLX arm: 4 GiB admits 262,144 positions of the 8-bit form
+/// (2,852,126,720 bytes with BF16 scales, 3,019,898,880 with F32 scales) plus the DeltaNet state
+/// (65,863,680 bytes). The F32 form at 32,768 positions (1,342,177,280 bytes) fits as well.
+pub(crate) const DEFAULT_SESSION_CAP: u64 = 4 << 30;
 /// The largest chunk that the prefill plan may pick when `prefill_budget_bytes` is set. One chunk
 /// takes about 0.9 s at 290 tok/s, so a cancellation waits that long at most. The plan result sets
 /// the worker piece (`ExecutorOps::prefill_piece`). Without a plan, or when the plan admits no
@@ -63,10 +70,11 @@ pub(crate) enum Backend {
 pub(crate) struct Q36Options {
     /// The MLX allocator cache limit in bytes. Fallback: `Q36_CACHE_LIMIT`. There is no default.
     pub(crate) cache_limit_bytes: Option<u64>,
-    /// The first position that the engine refuses, from 2. The default is 32,768. The executor
-    /// rejects a limit whose cache does not fit `session_cap_bytes`.
+    /// The first position that the engine refuses, from 2. The default is 262,144 on the MLX arm
+    /// (the 8-bit cache, decision 0046 A7) and 32,768 on the CUDA arm. The executor rejects a
+    /// limit whose cache does not fit `session_cap_bytes`.
     pub(crate) context_limit: Option<u32>,
-    /// The bytes of cache growth that the engine admits. The default is 2 GiB.
+    /// The bytes of cache growth that the engine admits. The default is 4 GiB.
     pub(crate) session_cap_bytes: Option<u64>,
     /// The prompt tokens per `prefill` call, from 1 to 512. The default is 256 for an F32 engine and
     /// for a BF16 engine (`BF16_DEFAULT_PREFILL_CHUNK`). It is the largest
@@ -88,8 +96,9 @@ pub(crate) struct Q36Options {
     pub(crate) activation_dtype: Option<String>,
     /// The form of the attention KV cache (packet KV8-INTEGRATE, decision 0046 A7): `f32`, the
     /// pair of F32 capacity buffers, or `q8`, the 8-bit affine codes with scales and biases of
-    /// the activation dtype. The default is `f32`, the control; the shipped default changes to
-    /// `q8` only after the A7 rule-4 Mac gate.
+    /// the activation dtype. The default is `q8` on the MLX arm (the user's decision of
+    /// 2026-10-13 after the A7 rule-4 Mac gate, record Q36-KV8-GATE) and `f32` on the CUDA arm,
+    /// which does not build the 8-bit cache yet. `f32` stays the control on the MLX arm.
     pub(crate) kv_dtype: Option<String>,
     /// Graph capture of the CUDA arm (default false, gate G1 eager); the MLX arm ignores it.
     pub(crate) capture: Option<bool>,
@@ -316,11 +325,14 @@ pub(crate) fn parse_kv_dtype(text: &str) -> Result<KvDtype, EngError> {
     }
 }
 
-/// The cache form of `text`, the raw member value: `None` is the default `f32`.
-pub(crate) fn kv_dtype_of(text: Option<&str>) -> Result<KvDtype, EngError> {
-    match text {
-        None => Ok(KvDtype::F32),
-        Some(text) => parse_kv_dtype(text),
+/// The cache form of `text`, the raw member value. `None` is the default of the arm: the 8-bit
+/// cache on the MLX arm (decision 0046 A7, gate of record Q36-KV8-GATE) and the F32 cache on the
+/// CUDA arm, which does not build the 8-bit form yet.
+pub(crate) fn kv_dtype_of(text: Option<&str>, backend: Backend) -> Result<KvDtype, EngError> {
+    match (text, backend) {
+        (Some(text), _) => parse_kv_dtype(text),
+        (None, Backend::Mlx) => Ok(KvDtype::Q8),
+        (None, Backend::Cuda) => Ok(KvDtype::F32),
     }
 }
 
@@ -567,7 +579,7 @@ impl Q36Settings {
                         at_least_one("prefill_budget_bytes", options.prefill_budget_bytes)?;
                     let reserve = prefill_reserve(options, budget)?;
                     let activation = activation_of(options.activation_dtype.as_deref())?;
-                    let kv = kv_dtype_of(options.kv_dtype.as_deref())?;
+                    let kv = kv_dtype_of(options.kv_dtype.as_deref(), Backend::Mlx)?;
                     (
                         budget,
                         reserve,
@@ -584,7 +596,7 @@ impl Q36Settings {
                         options.prefill_session_reserve_bytes,
                     )?;
                     let activation = activation_of(options.activation_dtype.as_deref())?;
-                    let kv = kv_dtype_of(options.kv_dtype.as_deref())?;
+                    let kv = kv_dtype_of(options.kv_dtype.as_deref(), Backend::Cuda)?;
                     if kv == KvDtype::Q8 {
                         // Decision 0046 A7 puts the 8-bit cache on every backend, but only the
                         // MLX decoder builds it so far: refuse instead of serving the F32 cache.
@@ -604,7 +616,10 @@ impl Q36Settings {
         let context_limit = ranged(
             "context_limit",
             options.context_limit,
-            DEFAULT_CONTEXT_LIMIT,
+            match backend {
+                Backend::Mlx => MLX_DEFAULT_CONTEXT_LIMIT,
+                Backend::Cuda => DEFAULT_CONTEXT_LIMIT,
+            },
             2,
             u32::MAX,
         )?;
@@ -714,10 +729,10 @@ pub(crate) fn tokenizer_pin() -> Result<TokenizerPin, EngError> {
 mod tests {
     use super::{
         BF16_DEFAULT_PREFILL_CHUNK, Backend, DEFAULT_CONTEXT_LIMIT, DEFAULT_PREFILL_CHUNK,
-        DEFAULT_SESSION_CAP, NO_BUDGET_PIECE, Q36Env, Q36Options, Q36Settings, TieredSettings,
-        activation_name, activation_of, cache_growth_per_position, chunked_prefill_allowed,
-        delta_state_bytes, digest, kv_dtype_name, kv_dtype_of, parse_kv_dtype, scale_pairing_error,
-        tokenizer_pin,
+        DEFAULT_SESSION_CAP, MLX_DEFAULT_CONTEXT_LIMIT, NO_BUDGET_PIECE, Q36Env, Q36Options,
+        Q36Settings, TieredSettings, activation_name, activation_of, cache_growth_per_position,
+        chunked_prefill_allowed, delta_state_bytes, digest, kv_dtype_name, kv_dtype_of,
+        parse_kv_dtype, scale_pairing_error, tokenizer_pin,
     };
     use crate::EngError;
     use crate::family::spec::QWEN3_6_35B_A3B;
@@ -807,7 +822,7 @@ mod tests {
         let enough = Q36Options {
             cache_limit_bytes: Some(1024),
             session_cap_bytes: Some(required),
-            ..Q36Options::default()
+            ..f32_form_at_the_cuda_limit()
         };
         let passed = settings(Some(&enough), &Q36Env::default())
             .unwrap()
@@ -816,7 +831,7 @@ mod tests {
         let one_less = Q36Options {
             cache_limit_bytes: Some(1024),
             session_cap_bytes: Some(required - 1),
-            ..Q36Options::default()
+            ..f32_form_at_the_cuda_limit()
         };
         let refused = settings(Some(&one_less), &Q36Env::default())
             .unwrap()
@@ -833,7 +848,7 @@ mod tests {
         let options = Q36Options {
             cache_limit_bytes: Some(1024),
             session_cap_bytes: Some(2_750_218_239),
-            ..Q36Options::default()
+            ..f32_form_at_the_cuda_limit()
         };
         let refused = settings(Some(&options), &Q36Env::default())
             .unwrap()
@@ -843,6 +858,67 @@ mod tests {
             "engine config: prefix_reuse needs session_cap_bytes of at least 2750218240 bytes for \
              context limit 32768: 2 * 40960 cache bytes per position plus 65863680 DeltaNet bytes; \
              the cap is 2750218239 bytes; raise session_cap_bytes"
+        );
+    }
+
+    /// The F32 control at 32,768 positions: the form and the limit that the first prefix-reuse
+    /// numbers (2,750,218,240 bytes) were derived for, stated because neither is the MLX default.
+    fn f32_form_at_the_cuda_limit() -> Q36Options {
+        Q36Options {
+            kv_dtype: Some("f32".to_string()),
+            context_limit: Some(DEFAULT_CONTEXT_LIMIT),
+            ..Q36Options::default()
+        }
+    }
+
+    /// The default MLX engine holds the 8-bit cache at 262,144 positions, so the prefix-reuse rule
+    /// asks for `2 * 10,880 * 262,144 + 65,863,680` = 5,770,117,120 bytes: more than the default
+    /// cap of 4 GiB, which covers one live session (2,917,990,400 bytes) but not the entry beside
+    /// it. The rule accepts the requirement and refuses one byte less, and the refusal names the
+    /// cap, the requirement, the limit, and the hint.
+    #[test]
+    fn the_default_engine_needs_a_larger_cap_for_prefix_reuse_and_the_error_says_so() {
+        let required = 2 * 10_880 * u64::from(MLX_DEFAULT_CONTEXT_LIMIT) + 65_863_680;
+        assert_eq!(
+            required, 5_770_117_120,
+            "the required cap of the default form"
+        );
+        assert!(
+            DEFAULT_SESSION_CAP < required,
+            "the default cap is below it"
+        );
+        assert!(
+            DEFAULT_SESSION_CAP >= 10_880 * u64::from(MLX_DEFAULT_CONTEXT_LIMIT) + 65_863_680,
+            "the default cap covers one live session of the default form"
+        );
+        let at_default_cap = settings(Some(&with_limit()), &Q36Env::default()).unwrap();
+        assert_eq!(
+            error_text(at_default_cap.check_prefix_reuse_cap(true)),
+            "engine config: prefix_reuse needs session_cap_bytes of at least 5770117120 bytes for \
+             context limit 262144: 2 * 10880 cache bytes per position plus 65863680 DeltaNet \
+             bytes; the cap is 4294967296 bytes; raise session_cap_bytes"
+        );
+        let enough = Q36Options {
+            session_cap_bytes: Some(required),
+            ..with_limit()
+        };
+        assert_eq!(
+            settings(Some(&enough), &Q36Env::default())
+                .unwrap()
+                .check_prefix_reuse_cap(true),
+            Ok(()),
+            "the requirement passes"
+        );
+        let one_less = Q36Options {
+            session_cap_bytes: Some(required - 1),
+            ..with_limit()
+        };
+        assert!(
+            settings(Some(&one_less), &Q36Env::default())
+                .unwrap()
+                .check_prefix_reuse_cap(true)
+                .is_err(),
+            "one byte below the requirement is refused"
         );
     }
 
@@ -869,28 +945,34 @@ mod tests {
                 artifact: PathBuf::from("/m"),
                 tokenizer_dir: PathBuf::from("/t"),
                 cache_limit: 1024,
-                context_limit: 32_768,
-                session_cap: 2 << 30,
+                context_limit: 262_144,
+                session_cap: 4 << 30,
                 prefill_chunk: 256,
                 prefill_budget: None,
                 prefill_reserve: 0,
                 activation: super::Activation::Bf16,
-                kv: super::KvDtype::F32,
+                kv: super::KvDtype::Q8,
                 capture: false,
                 tiered: None,
                 ignored_mlx_keys: Vec::new(),
             }
         );
-        assert_eq!(DEFAULT_CONTEXT_LIMIT, 32_768);
-        assert_eq!(DEFAULT_SESSION_CAP, 2_147_483_648);
+        assert_eq!(MLX_DEFAULT_CONTEXT_LIMIT, 262_144);
+        assert_eq!(
+            DEFAULT_CONTEXT_LIMIT, 32_768,
+            "the CUDA arm keeps its limit"
+        );
+        assert_eq!(DEFAULT_SESSION_CAP, 4_294_967_296);
         assert_eq!(DEFAULT_PREFILL_CHUNK, 256);
         assert_eq!(BF16_DEFAULT_PREFILL_CHUNK, 256);
         assert_eq!(NO_BUDGET_PIECE, 16);
-        // The reserve of `config/qwen36-mac-studio-36gb.json` is a plan sum (see its README).
-        assert_eq!(32_768u64 * 40_960, 1_342_177_280);
+        // The reserve of `config/qwen36-mac-studio-36gb.json` is a plan sum (see its README): the
+        // 8-bit cache at 262,144 positions, the DeltaNet state, the cache limit of the file, and
+        // the pressure margin.
+        assert_eq!(262_144u64 * 10_880, 2_852_126_720);
         assert_eq!(
-            1_342_177_280u64 + 65_863_680 + 4_294_967_296 + (1 << 30),
-            6_776_750_080
+            2_852_126_720u64 + 65_863_680 + 4_294_967_296 + (1 << 30),
+            8_286_699_520
         );
     }
 
@@ -1318,11 +1400,12 @@ mod tests {
         assert_eq!(options.activation_dtype.as_deref(), Some("bf16"));
     }
 
-    /// Packet KV8-INTEGRATE item 1: `kv_dtype` parses `f32` and `q8`, defaults to `f32` (the
-    /// control; the shipped default flips only after the A7 rule-4 gate), reads from JSON, and
-    /// refuses any other text in the style of its neighbors.
+    /// Packet KV8-INTEGRATE item 1: `kv_dtype` parses `f32` and `q8`, reads from JSON, and refuses
+    /// any other text in the style of its neighbors. The default is `q8` on the MLX arm (the
+    /// user's decision of 2026-10-13 after the gate of record Q36-KV8-GATE; the F32 control stays
+    /// one member away) and `f32` on the CUDA arm, which does not build the 8-bit cache yet.
     #[test]
-    fn kv_dtype_parses_f32_and_q8_and_the_default_is_f32() {
+    fn kv_dtype_parses_f32_and_q8_and_the_default_is_q8_on_mlx_and_f32_on_cuda() {
         for (text, want) in [("f32", super::KvDtype::F32), ("q8", super::KvDtype::Q8)] {
             let options = Q36Options {
                 kv_dtype: Some(text.to_string()),
@@ -1338,11 +1421,25 @@ mod tests {
             settings(Some(&with_limit()), &Q36Env::default())
                 .unwrap()
                 .kv,
-            super::KvDtype::F32,
-            "the default is the F32 control"
+            super::KvDtype::Q8,
+            "the MLX default is the 8-bit cache"
         );
-        assert_eq!(kv_dtype_of(None).unwrap(), super::KvDtype::F32);
-        assert_eq!(kv_dtype_of(Some("q8")).unwrap(), super::KvDtype::Q8);
+        assert_eq!(kv_dtype_of(None, Backend::Mlx).unwrap(), super::KvDtype::Q8);
+        assert_eq!(
+            kv_dtype_of(None, Backend::Cuda).unwrap(),
+            super::KvDtype::F32,
+            "the CUDA default is the F32 cache"
+        );
+        assert_eq!(
+            kv_dtype_of(Some("f32"), Backend::Mlx).unwrap(),
+            super::KvDtype::F32,
+            "an explicit f32 selects the control on the MLX arm"
+        );
+        assert_eq!(
+            kv_dtype_of(Some("q8"), Backend::Cuda).unwrap(),
+            super::KvDtype::Q8,
+            "parsing does not decide availability; the CUDA arm refuses q8 in its settings"
+        );
         assert_eq!(kv_dtype_name(super::KvDtype::F32), "f32");
         assert_eq!(kv_dtype_name(super::KvDtype::Q8), "q8");
         assert_eq!(parse_kv_dtype("f32").unwrap(), super::KvDtype::F32);
@@ -1478,6 +1575,15 @@ mod tests {
                 .kv,
             super::KvDtype::Q8
         );
+    }
+
+    /// The default flip of the MLX arm does not reach the CUDA arm: it keeps the F32 cache and
+    /// 32,768 positions, which its F32 cache is sized by.
+    #[test]
+    fn the_cuda_arm_keeps_the_f32_form_and_32768_positions_by_default() {
+        let got = settings_for(None, &Q36Env::default(), Backend::Cuda).unwrap();
+        assert_eq!(got.kv, super::KvDtype::F32);
+        assert_eq!(got.context_limit, 32_768);
     }
 
     #[cfg(all(feature = "native-cuda", target_os = "linux"))]

@@ -11,7 +11,7 @@
 //! - M1 `m1_serving_path`: the serving path as the executor plans it for the activation of the
 //!   run (`Q36Executor::plan_prefill` on the shipped config
 //!   `engine/config/qwen36-mac-studio-36gb.json`: `prefill_budget_bytes` 32,212,254,720,
-//!   `prefill_session_reserve_bytes` 6,776,750,080, `cache_limit_bytes` 4,294,967,296), then
+//!   `prefill_session_reserve_bytes` 8,286,699,520, `cache_limit_bytes` 4,294,967,296), then
 //!   the final decode step in `StepMode::Logits`. The largest chunk is NOT a copied constant:
 //!   `serve_chunk_setting` below reads it through the same `Q36Settings` path the server uses,
 //!   so it follows the `prefill_chunk` member of the config and otherwise
@@ -180,16 +180,16 @@ type Result<T> = std::result::Result<T, EngError>;
 /// Shared with `decode_timing`.
 pub(super) const PREFILL_BUDGET: u64 = 32_212_254_720;
 /// `prefill_session_reserve_bytes` of the shipped config. Shared with `decode_timing`.
-pub(super) const PREFILL_RESERVE: u64 = 6_776_750_080;
+pub(super) const PREFILL_RESERVE: u64 = 8_286_699_520;
 /// `cache_limit_bytes` of the shipped config: the MLX allocator cache limit. Shared with
 /// `decode_timing`.
 pub(super) const CACHE_LIMIT: u64 = 4_294_967_296;
-/// `session_cap_bytes` of the shipped config (absent, so the default of `settings.rs`). Shared
-/// with `decode_timing`.
-pub(super) const SESSION_CAP: u64 = 2 << 30;
-/// The context limit of the shipped config (absent, so the default of `settings.rs`). Shared
-/// with `decode_timing`.
-pub(super) const CONTEXT_LIMIT: u32 = 32_768;
+/// `session_cap_bytes` of the shipped config (4 GiB, the default of `settings.rs` on the MLX
+/// arm). Shared with `decode_timing`.
+pub(super) const SESSION_CAP: u64 = 4 << 30;
+/// The context limit of the shipped config (262,144, the default of `settings.rs` on the MLX
+/// arm). Shared with `decode_timing`.
+pub(super) const CONTEXT_LIMIT: u32 = 262_144;
 /// The largest chunk of M2.
 const SMALL_CHUNK: u32 = 16;
 /// The worker piece without a plan (16, the engine's `NO_BUDGET_PIECE`): M3's piece, and M1's

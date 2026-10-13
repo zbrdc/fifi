@@ -10,9 +10,12 @@
       "tokenizer_dir": "/path/to/Qwen3.6-35B-A3B-mlx-int4",
       "qwen36": {
         "cache_limit_bytes": 4294967296,
+        "context_limit": 262144,
+        "session_cap_bytes": 4294967296,
         "prefill_budget_bytes": 32212254720,
-        "prefill_session_reserve_bytes": 6776750080,
-        "activation_dtype": "bf16"
+        "prefill_session_reserve_bytes": 8286699520,
+        "activation_dtype": "bf16",
+        "kv_dtype": "q8"
       }
     }
   ]

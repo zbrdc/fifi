@@ -370,13 +370,18 @@ fn the_shipped_mac_studio_config_passes_every_check_before_the_backend() {
         .expect("api_key_env")
         .to_owned();
     assert_eq!(variable, "ENGINESRV_API_KEY");
-    // The numbers of the README: 30 GiB budget, and the reserve as the plan sum.
+    // The numbers of the README: 30 GiB budget, the 8-bit cache at 262,144 positions, and the
+    // reserve as the plan sum (the 8-bit cache at the limit, the DeltaNet state, the cache limit,
+    // and the pressure margin).
     let options = &value["engines"][0]["qwen36"];
     assert_eq!(options["prefill_budget_bytes"], 30u64 << 30);
     assert_eq!(options["cache_limit_bytes"], 4u64 << 30);
+    assert_eq!(options["kv_dtype"], "q8");
+    assert_eq!(options["context_limit"], 262_144u64);
+    assert_eq!(options["session_cap_bytes"], 4u64 << 30);
     assert_eq!(
         options["prefill_session_reserve_bytes"],
-        1_342_177_280u64 + 65_863_680 + (4u64 << 30) + (1 << 30)
+        10_880u64 * 262_144 + 65_863_680 + (4u64 << 30) + (1 << 30)
     );
     assert!(options.get("prefill_chunk").is_none());
     value["listen"] = serde_json::json!("127.0.0.1:0");

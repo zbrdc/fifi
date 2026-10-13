@@ -149,13 +149,14 @@ mod tests {
             cache_limit_bytes: Some(1024),
             ..Q36Options::default()
         };
-        // The default cap of 2 GiB covers one live session at the default limit (1,342,177,280
-        // bytes), but not the entry beside it (2,750,218,240 bytes together).
+        // The default cap of 4 GiB covers one live session of the default 8-bit cache at the
+        // default limit of 262,144 positions (2,917,990,400 bytes with the DeltaNet state), but
+        // not the entry beside it (5,770,117,120 bytes together).
         let text = error_text(start_with_reuse(Some(&options), &Q36Env::default(), true));
         assert!(
-            text.contains("at least 2750218240 bytes")
-                && text.contains("context limit 32768")
-                && text.contains("the cap is 2147483648 bytes")
+            text.contains("at least 5770117120 bytes")
+                && text.contains("context limit 262144")
+                && text.contains("the cap is 4294967296 bytes")
                 && text.contains("raise session_cap_bytes"),
             "{text}"
         );
@@ -168,7 +169,7 @@ mod tests {
     fn a_prefix_reuse_entry_at_the_required_session_cap_passes_the_rule() {
         let options = Q36Options {
             cache_limit_bytes: Some(1024),
-            session_cap_bytes: Some(2_750_218_240),
+            session_cap_bytes: Some(5_770_117_120),
             ..Q36Options::default()
         };
         let text = error_text(start_with_reuse(Some(&options), &Q36Env::default(), true));

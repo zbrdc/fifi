@@ -420,11 +420,12 @@ mod tests {
     fn a_q36_entry_with_prefix_reuse_keeps_the_no_backend_text() {
         // KUBDAN-MSG-71 item 3: without a Q36 backend the CUDA-specific prefix-reuse refusal
         // must not fire; the factory's own refusal names the missing backend. The session cap
-        // covers the prefix-reuse cap rule (2,750,218,240 bytes at the default context limit),
-        // which the factory checks before the backend.
+        // covers the prefix-reuse cap rule (5,770,117,120 bytes for the default 8-bit cache at
+        // the default context limit of 262,144 positions), which the factory checks before the
+        // backend.
         let options = Q36Options {
             cache_limit_bytes: Some(1024),
-            session_cap_bytes: Some(3_000_000_000),
+            session_cap_bytes: Some(6_000_000_000),
             ..Q36Options::default()
         };
         let error = start_engines(&file_with(vec![q36_config(Some(options))], true))
@@ -528,15 +529,15 @@ mod tests {
             ..Q36Options::default()
         };
         // With the flag on, the Q36 engine start applies the session-cap rule and refuses the
-        // default cap of 2 GiB before it reaches the backend.
+        // default cap of 4 GiB before it reaches the backend.
         let error = start_engines(&file_with(vec![q36_config(Some(options))], true))
             .err()
             .expect("error");
         let text = error.to_string();
         assert!(
             text.contains("engine e9 failed to start")
-                && text.contains("at least 2750218240 bytes")
-                && text.contains("the cap is 2147483648 bytes")
+                && text.contains("at least 5770117120 bytes")
+                && text.contains("the cap is 4294967296 bytes")
                 && text.contains("raise session_cap_bytes"),
             "{text}"
         );
