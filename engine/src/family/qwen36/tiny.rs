@@ -3,8 +3,12 @@
 //! `TINY` is the two-layer model of the host reference tests: layer 0 is DeltaNet and layer 1 is dense
 //! attention with 2 query heads and 1 key-value head. `TINY_GQA` has four layers (DeltaNet, attention,
 //! DeltaNet, attention) and 4 query heads over 2 key-value heads, so that the head grouping is visible.
-//! Both use hidden 64, quantization groups of 32, vocabulary 8, 4 experts with top 2, head dimension 32,
-//! and a rotary dimension of 16. Router and shared expert gate are 8-bit. Every other module is 4-bit.
+//! `TINY_WIDE` is `TINY` with a wider DeltaNet. `TINY_KV8` is `TINY_GQA` with a head dimension of 64,
+//! the multiple of the Q8 cache group (64) that the 8-bit cache form of packet KV8-INTEGRATE needs —
+//! a 32-lane head cannot quantize. `TINY`, `TINY_GQA`, and `TINY_WIDE` use hidden 64, quantization
+//! groups of 32, vocabulary 8, 4 experts with top 2, head dimension 32, and a rotary dimension of 16
+//! (the config's partial factor of 0.5); `TINY_KV8` keeps every other number, takes head dimension 64
+//! with a rotary dimension of 32. Router and shared expert gate are 8-bit. Every other module is 4-bit.
 
 use serde_json::Value;
 
@@ -17,6 +21,7 @@ const fn model(
     layers: u32,
     (heads_q, heads_kv): (u32, u32),
     (key_heads, value_heads): (u32, u32),
+    head_dim: u32,
     kinds: &'static [AttentionKind],
 ) -> FamilySpec {
     FamilySpec {
@@ -25,7 +30,7 @@ const fn model(
         hidden: 64,
         heads_q,
         heads_kv,
-        head_dim: 32,
+        head_dim,
         rope_theta: 10_000.0,
         rms_norm_eps: 1e-6,
         model_types: &["qwen3_5_moe", "qwen3_5_moe_text"],
@@ -57,6 +62,7 @@ pub(super) const TINY: FamilySpec = model(
     2,
     (2, 1),
     (1, 2),
+    32,
     &[AttentionKind::DeltaNet, AttentionKind::Full],
 );
 
@@ -67,6 +73,7 @@ pub(super) const TINY_WIDE: FamilySpec = model(
     2,
     (2, 1),
     (2, 4),
+    32,
     &[AttentionKind::DeltaNet, AttentionKind::Full],
 );
 
@@ -76,6 +83,24 @@ pub(super) const TINY_GQA: FamilySpec = model(
     4,
     (4, 2),
     (1, 2),
+    32,
+    &[
+        AttentionKind::DeltaNet,
+        AttentionKind::Full,
+        AttentionKind::DeltaNet,
+        AttentionKind::Full,
+    ],
+);
+
+/// Four layers like `TINY_GQA` with a head dimension of 64 (packet KV8-INTEGRATE): the multiple
+/// of the Q8 cache group (64) that lets the 8-bit cache quantize its keys and values. The
+/// rotary dimension follows the config's partial factor of 0.5, so it is 32.
+pub(super) const TINY_KV8: FamilySpec = model(
+    "q36_tiny_kv8",
+    4,
+    (4, 2),
+    (1, 2),
+    64,
     &[
         AttentionKind::DeltaNet,
         AttentionKind::Full,
@@ -95,6 +120,11 @@ pub(super) fn config(spec: &FamilySpec) -> Vec<u8> {
         }
     }
     let lin = spec.linear.unwrap();
+    // The mrope sections must sum to half the rotary dimension (`head_dim / 4` with the
+    // partial factor of 0.5): `[3, 3, 2]` at head dimension 32 (rotary 16, sum 8) and `[6, 6, 4]`
+    // at 64 (rotary 32, sum 16).
+    let section = i64::from(spec.head_dim / 32);
+    let mrope = serde_json::json!([3 * section, 3 * section, 2 * section]);
     let value: Value = serde_json::json!({
         "model_type": "qwen3_5_moe",
         "quantization": quantization,
@@ -103,7 +133,7 @@ pub(super) fn config(spec: &FamilySpec) -> Vec<u8> {
             "num_attention_heads": spec.heads_q, "num_hidden_layers": spec.layers,
             "num_key_value_heads": spec.heads_kv, "vocab_size": 8,
             "num_experts": 4, "num_experts_per_tok": 2, "moe_intermediate_size": 64,
-            "shared_expert_intermediate_size": 64, "head_dim": 32, "rms_norm_eps": 1e-6,
+            "shared_expert_intermediate_size": 64, "head_dim": spec.head_dim, "rms_norm_eps": 1e-6,
             "hidden_act": "silu", "full_attention_interval": 2,
             "linear_num_key_heads": lin.key_heads, "linear_key_head_dim": 32,
             "linear_num_value_heads": lin.value_heads,
@@ -111,7 +141,7 @@ pub(super) fn config(spec: &FamilySpec) -> Vec<u8> {
             "partial_rotary_factor": 0.5,
             "rope_parameters": {
                 "rope_theta": 10000.0, "partial_rotary_factor": 0.5,
-                "rope_type": "default", "mrope_section": [3, 3, 2]
+                "rope_type": "default", "mrope_section": mrope
             }
         }
     });
@@ -239,11 +269,12 @@ pub(super) fn entries(spec: &FamilySpec) -> Vec<Entry> {
                 one_plus_quarter,
             );
         } else {
+            let head = spec.head_dim;
             for (name, rows, cols) in [
-                ("q_proj", hq * 64, 64),
-                ("k_proj", hkv * 32, 64),
-                ("v_proj", hkv * 32, 64),
-                ("o_proj", 64, hq * 32),
+                ("q_proj", hq * 2 * head, 64),
+                ("k_proj", hkv * head, 64),
+                ("v_proj", hkv * head, 64),
+                ("o_proj", 64, hq * head),
             ] {
                 module(
                     &mut out,
@@ -258,14 +289,14 @@ pub(super) fn entries(spec: &FamilySpec) -> Vec<Entry> {
                 &mut out,
                 tag,
                 &format!("{p}self_attn.q_norm.weight"),
-                32,
+                head,
                 one_plus_quarter,
             );
             floats(
                 &mut out,
                 tag,
                 &format!("{p}self_attn.k_norm.weight"),
-                32,
+                head,
                 one_plus_quarter,
             );
         }
@@ -312,7 +343,7 @@ mod tests {
 
     #[test]
     fn both_models_pass_the_config_check_and_the_host_load_reads_every_tensor() {
-        for spec in [&TINY, &TINY_GQA, &TINY_WIDE] {
+        for spec in [&TINY, &TINY_GQA, &TINY_WIDE, &TINY_KV8] {
             let mut names: Vec<String> = entries(spec).iter().map(|e| e.0.clone()).collect();
             names.sort();
             let ckpt = checkpoint(spec);
@@ -328,5 +359,20 @@ mod tests {
             HostWeights::load(&checkpoint(&TINY_GQA), &TINY_GQA, &config(&TINY_GQA)).unwrap();
         let attn = weights.shape().attn;
         assert_eq!((attn.heads_q, attn.heads_kv, attn.rotary_dim), (4, 2, 16));
+    }
+
+    /// The KV8 fixture of packet KV8-INTEGRATE: a head dimension of 64, the multiple of the Q8
+    /// cache group, with the rotary dimension the config's partial factor gives (32).
+    #[test]
+    fn the_kv8_model_has_a_head_dimension_of_64() {
+        let weights =
+            HostWeights::load(&checkpoint(&TINY_KV8), &TINY_KV8, &config(&TINY_KV8)).unwrap();
+        let attn = weights.shape().attn;
+        assert_eq!((attn.heads_q, attn.heads_kv, attn.head_dim), (4, 2, 64));
+        assert_eq!(attn.rotary_dim, 32, "the partial factor of 0.5");
+        assert_eq!(
+            attn.head_dim % usize::try_from(crate::family::qwen36::settings::Q8_GROUP).unwrap(),
+            0
+        );
     }
 }

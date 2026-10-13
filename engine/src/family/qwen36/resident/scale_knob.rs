@@ -10,6 +10,7 @@
 //! | Variable | Values | Default |
 //! | --- | --- | --- |
 //! | `Q36_ACTIVATION` | `f32` is the qualification control, `bf16` builds the BF16 decoder | `f32` |
+//! | `Q36_KV_DTYPE` | `f32` is the control cache, `q8` keeps the attention cache as 8-bit codes | `f32` |
 //!
 //! Any other set value fails the test. The knob applies to the real-checkpoint tests of `parity`,
 //! `route_parity` (both tests), and `prefill/parity` (its two parity gates and the prompt-speed
@@ -20,10 +21,10 @@
 use sha2::{Digest, Sha256};
 
 use super::decoder::ResidentDecoder;
-use super::real::{activation_from_env, rss_kb};
+use super::real::{activation_from_env, kv_dtype_from_env, rss_kb};
 use crate::{
     family::qwen36::host_load::HostWeights,
-    family::qwen36::settings::{Activation, activation_name},
+    family::qwen36::settings::{Activation, activation_name, kv_dtype_name},
     kernels::MlxKernels,
     weights::StreamedCheckpoint,
 };
@@ -53,9 +54,14 @@ pub(super) fn new_decoder<'c>(
     context_limit: u32,
 ) -> (ResidentDecoder<'c>, Activation) {
     let activation = activation_from_env();
+    // The shared construction helper of the ignored runs (packet KV8-INTEGRATE): the cache form
+    // comes from `Q36_KV_DTYPE` through the same env-helper rule as `Q36_ACTIVATION`. The runs
+    // that build their decoder through this function (parity, route_parity, tool_forward) pick it
+    // up here; `decode_timing` and `graph_count` build their own decoder and read the same helper.
+    // Every report records the cache form, so a run states which cache it measured.
+    let kv = kv_dtype_from_env();
     let decoder =
-        ResidentDecoder::new_with_activation(kernels, ckpt, host, context_limit, activation)
-            .unwrap();
+        ResidentDecoder::new_with_kv(kernels, ckpt, host, context_limit, activation, kv).unwrap();
     let census = decoder.weights.scale_census();
     let (want_f32, want_bf16) = match activation {
         Activation::F32 => (862, 0),
@@ -81,6 +87,7 @@ pub(super) fn new_decoder<'c>(
     );
     let report = serde_json::json!({
         "activation_dtype": activation_name(activation),
+        "kv_dtype": kv_dtype_name(kv),
         "packed_weights": census.weights,
         "f32_parts": census.f32_parts, "bf16_parts": census.bf16_parts,
         "resident_bytes": decoder.weights.byte_len().unwrap(),

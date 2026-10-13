@@ -16,12 +16,24 @@ The `qwen36.activation_dtype` member (packet Q36-BF16-a, decision 0046 A6) selec
 activation dtype: `bf16` or `f32`. The default is `bf16`, and this file states it explicitly.
 The member is one lever: `bf16` keeps the stored BF16 scales and biases and converts the layer
 norms, `f32` keeps the F32 widening of Q36-G0, and the engine refuses any other pairing at load.
-The key-value cache, the DeltaNet state, the router, and the logits stay F32 in both modes.
+The DeltaNet state, the router, and the logits stay F32 in both modes. The key-value cache is F32 unless `kv_dtype` is `q8` (next section).
 The chunked prefill runs in either dtype (slice Q36-BF16-b): the chunk blocks cast at the same
 boundaries as the decode step, a dtype guard runs after each norm, after each layer, and on every
 state tensor, and a `bf16` engine plans its chunk exactly like an `f32` engine when the budget
 allows one.
 With `bf16` the resident weights are 19,286,549,004 bytes against 21,420,001,804 with `f32`.
+
+## KV cache dtype
+
+The `qwen36.kv_dtype` member (decision 0046 A7) selects the form of the attention cache: `f32` or `q8`.
+The default is `f32`, the control, and this file does not set it.
+The `q8` form keeps 8-bit affine codes with one scale and one bias per group of 64 lanes.
+The scales and biases have the activation dtype.
+On the real model (2 key-value heads of width 256, 10 attention layers), one position takes 40,960 bytes in the `f32` form.
+It takes 10,880 bytes in the `q8` form with `bf16` activations and 11,520 bytes with `f32` activations.
+The `q8` form needs a head dimension that is a multiple of 64.
+Only the MLX arm builds the `q8` form so far. The CUDA arm refuses it.
+The session admission and the prefix-reuse requirement use the bytes of the chosen form. The reserve below is a plan sum for the `f32` form: recompute it when `kv_dtype` is `q8`.
 
 ## Numbers
 

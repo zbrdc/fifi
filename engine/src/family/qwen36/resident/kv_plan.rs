@@ -1,25 +1,125 @@
-//! Portable planning of the attention capacity cache (packet Q36-KV-INTEGRATE).
+//! Portable planning of the attention capacity cache (packet Q36-KV-INTEGRATE) and the
+//! depth-dependent prefill chunk of packet KV8-INTEGRATE.
 //!
-//! The cache of one attention layer is a pair of preallocated F32 capacity buffers
-//! `[1, KVH, cap, D]` (keys and values) written in place by the consuming `kv_append`: the first
-//! `len` positions are valid and the rest is slack. The arithmetic here — the capacity rounding,
-//! the capacity after an append, and the logical byte count that the session budget charges —
-//! calls no native code, so the tests run on Linux.
+//! The cache of one attention layer is written in place by the consuming `kv_append`: the first
+//! `len` positions are valid and the rest is slack. In the F32 form (`KvDtype::F32`, the
+//! control) it is a pair of F32 buffers `[1, KVH, cap, D]`; in the Q8 form (`KvDtype::Q8`,
+//! decision 0046 A7) it is the 8-bit affine codes `[1, KVH, cap, D/4]` beside scales and biases
+//! `[1, KVH, cap, D/64]` of the ACTIVATION dtype (`settings::kv_growth_per_position`, the one
+//! byte authority). The arithmetic here — the capacity rounding, the capacity after an append,
+//! the logical byte count that the session budget charges, and the score-matrix bound that
+//! shrinks a prefill chunk at depth — calls no native code, so the tests run on Linux.
+//!
+//! The logical charge per layer and position is 4,096 bytes in the F32 form on the real model
+//! (KVH 2, D 256; 40,960 over its 10 attention layers), and in the Q8 form 1,088 bytes at BF16
+//! scales (10,880 over the 10 layers) or 1,152 at F32 scales (11,520). The session slack stays
+//! below one `KV_STEP` of the charge per attention layer: 10,485,760 bytes in the F32 form,
+//! 2,785,280 at Q8/BF16, 2,949,120 at Q8/F32 scales.
 //!
 //! The growth TRANSIENT at a capacity growth — the old buffer, its slice copy, and the new
-//! buffer alive together, about 100 MB per layer at depth 8,192 — is NOT part of the slack
-//! bound below: the session reserve margin and the retire cap cover it.
+//! buffer alive together, about 100 MB per layer at depth 8,192 in the F32 form — is NOT part
+//! of the slack bound below: the session reserve margin and the retire cap cover it.
 
 use crate::EngError;
 
 /// The growth quantum of the capacity buffers, in positions (packet Q36-KV-INTEGRATE): a buffer
 /// grows to a multiple of this many positions, so the slack of one layer stays below one quantum
 /// of its growth bytes and the slack of a whole session below one quantum per attention layer
-/// (256 * 4,096 * 10 = 10,485,760 bytes on the real model).
+/// (in the F32 form 256 * 4,096 * 10 = 10,485,760 bytes on the real model; at Q8 with BF16
+/// scales 256 * 1,088 * 10 = 2,785,280).
 pub(super) const KV_STEP: usize = 256;
+
+/// The score-matrix byte budget of one attention layer of one prefill chunk (packet
+/// KV8-INTEGRATE item 6): 512 MiB. The F32 score matrix of a chunk of `L` rows at `len`
+/// positions is `rep * L * len * 4` bytes (`rep = QH / KVH`, 8 on the real model: 2.1 GB at
+/// L = 256 and len = 262,144), and the softmax and the mask add copies on top, so the planner
+/// halves the chunk once the matrix alone would pass the budget.
+pub(super) const SCORE_BUDGET_BYTES: u64 = 512 << 20;
 
 fn bad(message: &str) -> EngError {
     EngError::BadRequest(format!("q36 kv plan: {message}"))
+}
+
+/// The largest power of two at most `requested` whose score matrix at a cache of `len`
+/// positions — `rep * rows * len * 4` bytes, the packet's formula — stays within
+/// `score_budget`, never below 16 rows and never above `requested` (packet KV8-INTEGRATE
+/// item 6). The chunk runs to `len + rows` positions and the next chunk plans from there, so
+/// the split of a prompt is a deterministic function of the prompt length, the start position,
+/// and the requested setting. With the real shape (`rep` 8) and `SCORE_BUDGET_BYTES` the answer
+/// is 256 up to len 65,536 (where `8 * 256 * 65,536 * 4` is exactly the budget) and halves
+/// beyond: 128 at 131,072 and 64 at 262,144. A `requested` below 16 is honored as is: the
+/// floor bounds the budget's squeeze, not the caller's own request. A smaller chunk changes
+/// the BF16 rounding of the prefill (finding Q36-BF16-SENS), so any gate that compares a
+/// chunked prefill must compare it at the same depth schedule.
+pub(super) fn chunk_rows_for_depth(
+    requested: usize,
+    len: usize,
+    rep: u64,
+    score_budget: u64,
+) -> usize {
+    let requested = requested.max(1);
+    let len = len as u64;
+    let fits = |rows: u64| {
+        rep.checked_mul(rows)
+            .and_then(|cells| cells.checked_mul(len))
+            .and_then(|cells| cells.checked_mul(4))
+            .is_some_and(|bytes| bytes <= score_budget)
+    };
+    // The largest power of two at most `requested`, halved until the matrix fits.
+    let mut rows: u64 = 1;
+    while rows
+        .checked_mul(2)
+        .is_some_and(|doubled| doubled <= requested as u64)
+    {
+        rows *= 2;
+    }
+    while rows > 1 && !fits(rows) {
+        rows /= 2;
+    }
+    let floored = rows.max(16);
+    usize::try_from(floored)
+        .unwrap_or(usize::MAX)
+        .min(requested)
+}
+
+/// The chunk ranges `(start, stop)` of `rows` prompt rows after a cache of `start_len` valid
+/// positions, each of at most the depth-aware chunk of `chunk_rows_for_depth` at its own
+/// position (packet KV8-INTEGRATE item 6): the prefill planner's one split, a deterministic
+/// function of the prompt length, the start position, and the setting. `rep` is the query
+/// repeats per key-value head (`QH / KVH`). Every range is non-empty and together they cover
+/// `0..rows` exactly, as the fixed-size split did before the depth rule.
+pub(super) fn depth_ranges(
+    start_len: u32,
+    rows: u32,
+    requested: u32,
+    rep: u64,
+    score_budget: u64,
+) -> Result<Vec<(u32, u32)>, EngError> {
+    if rows == 0 || requested == 0 {
+        return Err(bad("depth ranges need positive rows and a requested chunk"));
+    }
+    let (requested, mut begin, mut len) = (
+        usize::try_from(requested).map_err(|_| bad("the requested chunk exceeds the platform"))?,
+        0usize,
+        u64::from(start_len),
+    );
+    let total = usize::try_from(rows).map_err(|_| bad("the prompt rows exceed the platform"))?;
+    let mut out = Vec::new();
+    while begin < total {
+        let len_now = usize::try_from(len).map_err(|_| bad("the cache length exceeds usize"))?;
+        let take = chunk_rows_for_depth(requested, len_now, rep, score_budget).min(total - begin);
+        let stop = begin
+            .checked_add(take)
+            .ok_or_else(|| bad("the chunk range overflows"))?;
+        let (a, b) = (
+            u32::try_from(begin).map_err(|_| bad("the chunk range exceeds u32"))?,
+            u32::try_from(stop).map_err(|_| bad("the chunk range exceeds u32"))?,
+        );
+        out.push((a, b));
+        begin = stop;
+        len += u64::try_from(take).map_err(|_| bad("the chunk length exceeds u64"))?;
+    }
+    Ok(out)
 }
 
 /// Rounds `positions` up to a multiple of `step`. A zero step or an overflow is `BadRequest`.
@@ -191,12 +291,94 @@ mod tests {
 
     /// Review B finding 3: the constant itself is pinned, with the slack arithmetic of the four
     /// doc comments that state the session bound (256 * 4,096 * 10 = 10,485,760 on the real
-    /// model). The slack of one layer stays below one quantum — at most `KV_STEP - 1` positions
-    /// — so the session slack stays strictly below the bound.
+    /// model in the F32 form; 256 * 1,088 * 10 = 2,785,280 at Q8 with BF16 scales). The slack of
+    /// one layer stays below one quantum — at most `KV_STEP - 1` positions — so the session
+    /// slack stays strictly below each bound.
     #[test]
     fn the_growth_quantum_pins_the_slack_bound_of_the_docs() {
         assert_eq!(KV_STEP, 256, "the documented slack arithmetic assumes 256");
         assert!((KV_STEP - 1) as u64 * 4_096 * 10 < 10_485_760);
         assert_eq!(KV_STEP as u64 * 4_096 * 10, 10_485_760);
+        assert!((KV_STEP - 1) as u64 * 1_088 * 10 < 2_785_280);
+        assert_eq!(KV_STEP as u64 * 1_088 * 10, 2_785_280);
+    }
+
+    /// Packet KV8-INTEGRATE item 6, hand-derived at the real shape (`rep` 8) with
+    /// `SCORE_BUDGET_BYTES`: 256 up to len 65,536 — where `8 * 256 * 65,536 * 4` is exactly the
+    /// budget — and halving beyond. A `requested` below 16 is the caller's own request and is
+    /// honored; the floor of 16 bounds the budget's squeeze; a non-power-of-two `requested`
+    /// quantizes down to its power of two.
+    #[test]
+    fn chunk_rows_for_depth_returns_256_to_len_65k_and_halves_beyond() {
+        assert_eq!(SCORE_BUDGET_BYTES, 536_870_912, "512 MiB");
+        // The budget arithmetic the table rests on: 2.1 GB is the packet's example.
+        assert_eq!(8u64 * 256 * 65_536 * 4, 536_870_912);
+        assert_eq!(8u64 * 256 * 262_144 * 4, 2_147_483_648);
+        let table = [
+            (32_768usize, 256usize),
+            (65_536, 256),
+            (131_072, 128),
+            (262_144, 64),
+        ];
+        for (len, want) in table {
+            assert_eq!(
+                chunk_rows_for_depth(256, len, 8, SCORE_BUDGET_BYTES),
+                want,
+                "the chunk at len {len}"
+            );
+        }
+        // One past the exact fit halves.
+        assert_eq!(
+            chunk_rows_for_depth(256, 65_537, 8, SCORE_BUDGET_BYTES),
+            128
+        );
+        // The floor of 16: even a len whose matrix at 16 rows passes the budget keeps 16, and a
+        // requested below 16 is honored as the caller's request (the tiny-model test knobs).
+        assert_eq!(
+            chunk_rows_for_depth(256, 1 << 24, 8, SCORE_BUDGET_BYTES),
+            16
+        );
+        assert_eq!(chunk_rows_for_depth(3, 0, 8, SCORE_BUDGET_BYTES), 3);
+        assert_eq!(chunk_rows_for_depth(2, 1_000, 2, SCORE_BUDGET_BYTES), 2);
+        // A non-power-of-two requested value quantizes down to its power of two.
+        assert_eq!(chunk_rows_for_depth(100, 0, 8, SCORE_BUDGET_BYTES), 64);
+        // At len 0 every requested power of two fits.
+        assert_eq!(chunk_rows_for_depth(2_048, 0, 8, SCORE_BUDGET_BYTES), 2_048);
+    }
+
+    /// The prefill split of `depth_ranges`: the fixed-size cover of the old `ranges` at a depth
+    /// the budget admits everywhere, the depth-aware halving inside one piece at 65,536, and
+    /// the tiny-model knobs that keep their own size. Deterministic in the prompt length, the
+    /// start position, and the setting.
+    #[test]
+    fn depth_ranges_split_a_prompt_by_the_depth_schedule() {
+        // Shallow: the old fixed split.
+        assert_eq!(
+            depth_ranges(0, 600, 256, 8, SCORE_BUDGET_BYTES).unwrap(),
+            vec![(0, 256), (256, 512), (512, 600)]
+        );
+        // A prompt after 65,536 cached positions: the first chunk is 256 (the exact fit), the
+        // second plans at 65,792 where 256 no longer fits, so it halves to 128, and so does the
+        // third.
+        assert_eq!(
+            depth_ranges(65_536, 512, 256, 8, SCORE_BUDGET_BYTES).unwrap(),
+            vec![(0, 256), (256, 384), (384, 512)]
+        );
+        // The tiny-model knob of three rows keeps three rows at every depth of a test.
+        assert_eq!(
+            depth_ranges(0, 9, 3, 2, SCORE_BUDGET_BYTES).unwrap(),
+            vec![(0, 3), (3, 6), (6, 9)]
+        );
+        // One row is one range, and the same inputs give the same ranges.
+        let once = depth_ranges(5, 1, 256, 8, SCORE_BUDGET_BYTES).unwrap();
+        assert_eq!(once, vec![(0, 1)]);
+        assert_eq!(
+            depth_ranges(5, 1, 256, 8, SCORE_BUDGET_BYTES).unwrap(),
+            once,
+            "the split is deterministic"
+        );
+        // Zero rows or a zero requested chunk is refused.
+        assert!(depth_ranges(0, 0, 256, 8, SCORE_BUDGET_BYTES).is_err());
+        assert!(depth_ranges(0, 4, 0, 8, SCORE_BUDGET_BYTES).is_err());
     }
 }

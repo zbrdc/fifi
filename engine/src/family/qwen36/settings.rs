@@ -14,7 +14,9 @@ use std::path::{Path, PathBuf};
 const TOKENIZER_VOCAB_SIZE: u32 = 248_077;
 /// Positions of the default context limit (decision 0046 item 6).
 pub(crate) const DEFAULT_CONTEXT_LIMIT: u32 = 32_768;
-/// The default cache cap: 2 GiB admits 32,768 positions at 40,960 bytes each (1.25 GiB).
+/// The default cache cap: 2 GiB admits 32,768 positions at the default form's 40,960 bytes each
+/// (1.25 GiB); a Q8 engine at BF16 scales charges 10,880 bytes per position and the same cap
+/// admits more (packet KV8-INTEGRATE).
 pub(crate) const DEFAULT_SESSION_CAP: u64 = 2 << 30;
 /// The largest chunk that the prefill plan may pick when `prefill_budget_bytes` is set. One chunk
 /// takes about 0.9 s at 290 tok/s, so a cancellation waits that long at most. The plan result sets
@@ -84,6 +86,11 @@ pub(crate) struct Q36Options {
     /// `bf16`. It also picks the scale storage: `bf16` keeps the stored BF16 scales and biases,
     /// `f32` keeps the G0 widening, and the decoder constructor refuses any other pairing.
     pub(crate) activation_dtype: Option<String>,
+    /// The form of the attention KV cache (packet KV8-INTEGRATE, decision 0046 A7): `f32`, the
+    /// pair of F32 capacity buffers, or `q8`, the 8-bit affine codes with scales and biases of
+    /// the activation dtype. The default is `f32`, the control; the shipped default changes to
+    /// `q8` only after the A7 rule-4 Mac gate.
+    pub(crate) kv_dtype: Option<String>,
     /// Graph capture of the CUDA arm (default false, gate G1 eager); the MLX arm ignores it.
     pub(crate) capture: Option<bool>,
 }
@@ -122,6 +129,81 @@ impl Activation {
             Activation::Bf16 => Dtype::Bf16,
         }
     }
+
+    /// The activation whose resident dtype is `dtype`, the inverse of `dtype` (packet
+    /// KV8-INTEGRATE): the resident state reads the activation back from `Consts::act` when it
+    /// charges the cache. Any other dtype is `None`.
+    pub(crate) fn of_dtype(dtype: Dtype) -> Option<Self> {
+        match dtype {
+            Dtype::F32 => Some(Self::F32),
+            Dtype::Bf16 => Some(Self::Bf16),
+            _ => None,
+        }
+    }
+}
+
+/// The group size of the Q8 cache form, along the head dimension (decision 0046 A7): 64 lanes
+/// share one scale and one bias. `head_dim` must be a multiple of this; the decoder constructor
+/// refuses a Q8 engine whose head dimension is not (packet KV8-INTEGRATE item 2). The one
+/// definition: the byte charge below, and the quantize, the append, and the attention of the Q8
+/// form, all read it.
+pub(crate) const Q8_GROUP: u32 = 64;
+
+/// The bits of the Q8 cache form (decision 0046 A7): 8-bit affine codes, four per U32 word. The
+/// code width also sits in the shapes of the cache buffers (`attn.rs` divides the head dimension
+/// by 4) and in the byte charge of `kv_growth_per_position` (one byte per code), so a change of
+/// this constant needs those places and the portable check of `quantize_rows` (packet KV8-OPS).
+pub(crate) const Q8_BITS: u32 = 8;
+
+/// The LOGICAL bytes that one more position adds to the cache of ONE attention layer (packet
+/// KV8-INTEGRATE item 5), from the cache form and the activation dtype — the one byte authority:
+/// `attn::growth_bytes` (which `state::kv_growth_bytes` calls) and `cache_growth_per_position`
+/// reach it.
+///
+/// - `F32`: keys and values `[1, KVH, 1, D]` F32, `KVH * D * 2 * 4` bytes. The real model
+///   (KVH 2, D 256) adds 4,096 bytes per layer and position and 40,960 over its 10 attention
+///   layers.
+/// - `Q8`: per side (keys, values) codes `[1, KVH, 1, D/4]` U32 of `KVH * D` bytes, plus scales
+///   and biases `[1, KVH, 1, D/64]` of the ACTIVATION dtype, `2 * KVH * (D/64) * scale_bytes`
+///   bytes per side. The real model adds 1,088 bytes per layer and position at BF16 scales
+///   (10,880 over the 10 layers) and 1,152 at F32 scales (11,520).
+///
+/// A Q8 form whose `head_dim` is not a multiple of `Q8_GROUP` (64) is `BadRequest`. An overflow
+/// is `MemoryPlan`.
+pub(crate) fn kv_growth_per_position(
+    kv_heads: u32,
+    head_dim: u32,
+    kv: KvDtype,
+    act: Activation,
+) -> Result<u64, EngError> {
+    if kv == KvDtype::Q8 && !head_dim.is_multiple_of(Q8_GROUP) {
+        return Err(bad(format!(
+            "kv_dtype q8 needs a head_dim that is a multiple of {Q8_GROUP}, got {head_dim}"
+        )));
+    }
+    let scale_bytes = act.dtype().byte_width();
+    let heads = u64::from(kv_heads);
+    let width = u64::from(head_dim);
+    let bytes = match kv {
+        // Keys and values `[1, KVH, 1, D]` F32.
+        KvDtype::F32 => heads
+            .checked_mul(width)
+            .and_then(|row| row.checked_mul(2))
+            .and_then(|bytes| bytes.checked_mul(4)),
+        // Per side: codes `[1, KVH, 1, D/4]` U32 (`KVH * D` bytes), plus scales and biases
+        // `[1, KVH, 1, D/64]` (`2 sides * 2 arrays * KVH * groups * scale_bytes`).
+        KvDtype::Q8 => heads.checked_mul(width).and_then(|codes| {
+            let codes = codes.checked_mul(2)?;
+            let params = width
+                .checked_div(u64::from(Q8_GROUP))
+                .and_then(|groups| heads.checked_mul(groups))
+                .and_then(|n| n.checked_mul(2))
+                .and_then(|n| n.checked_mul(2))
+                .and_then(|n| n.checked_mul(scale_bytes))?;
+            codes.checked_add(params)
+        }),
+    };
+    bytes.ok_or_else(|| EngError::MemoryPlan("attention growth bytes overflow u64".into()))
 }
 
 /// Parses the `activation_dtype` member (packet Q36-BF16-a): `f32` or `bf16`. Any other text is
@@ -168,6 +250,48 @@ pub(crate) fn scale_pairing_error(
     })
 }
 
+/// The form of the attention KV cache of one engine (packet KV8-INTEGRATE; decision 0046 A7):
+/// `F32` keeps the pair of F32 capacity buffers `[1, KVH, cap, D]` (4,096 bytes per layer and
+/// position on the real model, 40,960 over its 10 attention layers); `Q8` keeps the 8-bit affine
+/// codes `[1, KVH, cap, D/4]` beside scales and biases `[1, KVH, cap, D/64]` of the ACTIVATION
+/// dtype (1,088 bytes per layer and position at BF16 scales, 1,152 at F32 scales; 10,880 and
+/// 11,520 over the 10 attention layers). `F32` is the default and the control that the A7
+/// quality gate compares against; the shipped default flips to `Q8` only after that gate
+/// passes (A7 rule 4).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum KvDtype {
+    /// The F32 capacity buffers, the control.
+    F32,
+    /// The 8-bit affine codes, scales, and biases (group 64, bits 8).
+    Q8,
+}
+
+/// The config text of `kv_dtype`.
+pub(crate) fn kv_dtype_name(kv: KvDtype) -> &'static str {
+    match kv {
+        KvDtype::F32 => "f32",
+        KvDtype::Q8 => "q8",
+    }
+}
+
+/// Parses the `kv_dtype` member (packet KV8-INTEGRATE): `f32` or `q8`. Any other text is refused
+/// in the style of the numeric members.
+pub(crate) fn parse_kv_dtype(text: &str) -> Result<KvDtype, EngError> {
+    match text {
+        "f32" => Ok(KvDtype::F32),
+        "q8" => Ok(KvDtype::Q8),
+        other => Err(bad(format!("kv_dtype must be f32 or q8, got {other:?}"))),
+    }
+}
+
+/// The cache form of `text`, the raw member value: `None` is the default `f32`.
+pub(crate) fn kv_dtype_of(text: Option<&str>) -> Result<KvDtype, EngError> {
+    match text {
+        None => Ok(KvDtype::F32),
+        Some(text) => parse_kv_dtype(text),
+    }
+}
+
 /// Whether the chunked prefill may run with the activation dtype `act` (packet Q36-BF16-b): the
 /// chunk path is dtype aware — its blocks run the same boundary casts as the decode step and the
 /// chunk loop guards every dtype — so both activation dtypes plan a chunk and only the budget and
@@ -201,6 +325,9 @@ pub(crate) struct Q36Settings {
     /// The dtype of the decode activations (packet Q36-BF16-a), which also picks the scale storage.
     /// The default is `bf16`.
     pub(crate) activation: Activation,
+    /// The form of the attention KV cache (packet KV8-INTEGRATE). The default is `f32`, the
+    /// control.
+    pub(crate) kv: KvDtype,
     /// Graph capture of the CUDA arm; the MLX arm ignores it with one start line.
     pub(crate) capture: bool,
     /// The MLX-only keys the CUDA arm ignores (in `Q36Options` order); the start logs one
@@ -306,15 +433,18 @@ fn delta_state_bytes(spec: &FamilySpec) -> Result<u64, EngError> {
         .ok_or_else(|| bad("the DeltaNet state bytes overflow u64".into()))
 }
 
-/// The cache bytes that one position adds over every full-attention layer: keys and values
-/// `[1, heads_kv, 1, head_dim]`, F32. It is derived from the family spec, never a literal:
-/// `QWEN3_6_35B_A3B` adds 40,960 bytes per position in its 10 attention layers.
-fn cache_growth_per_position(spec: &FamilySpec) -> Result<u64, EngError> {
-    let per_layer = u64::from(spec.heads_kv)
-        .checked_mul(u64::from(spec.head_dim))
-        .and_then(|row| row.checked_mul(2))
-        .and_then(|bytes| bytes.checked_mul(4))
-        .ok_or_else(|| bad("the cache growth per position overflows u64".into()))?;
+/// The cache bytes that one position adds over every full-attention layer, in the cache form
+/// `kv` (packet KV8-INTEGRATE): the F32 control is keys and values `[1, heads_kv, 1, head_dim]`
+/// F32, and the Q8 form is the 8-bit codes beside scales and biases of the activation dtype
+/// (`kv_growth_per_position`, the one authority). It is derived from the family spec, never a
+/// literal: `QWEN3_6_35B_A3B` adds 40,960 bytes per position in its 10 attention layers in the
+/// F32 form, 10,880 at Q8 with BF16 scales, and 11,520 at Q8 with F32 scales.
+fn cache_growth_per_position(
+    spec: &FamilySpec,
+    kv: KvDtype,
+    act: Activation,
+) -> Result<u64, EngError> {
+    let per_layer = kv_growth_per_position(spec.heads_kv, spec.head_dim, kv, act)?;
     let layers = spec
         .layers_attention
         .iter()
@@ -365,17 +495,19 @@ impl Q36Settings {
     ) -> Result<Self, EngError> {
         let default = Q36Options::default();
         let options = options.unwrap_or(&default);
-        let (prefill_budget, prefill_reserve, activation, cache_limit, ignored_mlx_keys) =
+        let (prefill_budget, prefill_reserve, activation, kv, cache_limit, ignored_mlx_keys) =
             match backend {
                 Backend::Mlx => {
                     let budget =
                         at_least_one("prefill_budget_bytes", options.prefill_budget_bytes)?;
                     let reserve = prefill_reserve(options, budget)?;
                     let activation = activation_of(options.activation_dtype.as_deref())?;
+                    let kv = kv_dtype_of(options.kv_dtype.as_deref())?;
                     (
                         budget,
                         reserve,
                         activation,
+                        kv,
                         cache_limit(options, env)?,
                         Vec::new(),
                     )
@@ -386,16 +518,20 @@ impl Q36Settings {
                         "prefill_session_reserve_bytes",
                         options.prefill_session_reserve_bytes,
                     )?;
-                    (
-                        None,
-                        0,
-                        activation_of(options.activation_dtype.as_deref())?,
-                        0,
-                        ignored_mlx_keys_of(options),
-                    )
+                    let activation = activation_of(options.activation_dtype.as_deref())?;
+                    let kv = kv_dtype_of(options.kv_dtype.as_deref())?;
+                    if kv == KvDtype::Q8 {
+                        // Decision 0046 A7 puts the 8-bit cache on every backend, but only the
+                        // MLX decoder builds it so far: refuse instead of serving the F32 cache.
+                        return Err(bad(
+                            "kv_dtype q8 is not available on the CUDA arm yet; its cache stays f32"
+                                .into(),
+                        ));
+                    }
+                    (None, 0, activation, kv, 0, ignored_mlx_keys_of(options))
                 }
             };
-        // The MLX error order of the base: budget, reserve, activation_dtype, cache_limit,
+        // The MLX error order of the base: budget, reserve, activation_dtype, kv_dtype, cache_limit,
         // context_limit, session_cap, prefill_chunk (KUBDAN-MSG-71 item 4). `cache_limit` is
         // computed in the match above, BEFORE `context_limit` and the second match, so a config
         // with both faults names the cache-limit fault first; the CUDA arm refuses its keys in
@@ -442,6 +578,7 @@ impl Q36Settings {
             prefill_budget,
             prefill_reserve,
             activation,
+            kv,
             capture: options.capture.unwrap_or(false),
             ignored_mlx_keys,
         })
@@ -452,15 +589,17 @@ impl Q36Settings {
     /// this engine's `SessionBudget`: the entry charges its attention caches plus the fixed
     /// DeltaNet state, and the live session can hold the same caches again up to the context
     /// limit. The cap must therefore cover `2 * growth_per_position * context_limit +
-    /// fixed_bytes` (2,750,218,240 bytes at the default context limit of 32,768), or a later job
-    /// fails with `MemoryPlan` although the same job succeeds with `prefix_reuse` off. Engine
-    /// start refuses a smaller cap and answers with the cap, the requirement, the context limit,
-    /// and the hint `raise session_cap_bytes`. With the flag off the rule does not apply.
+    /// fixed_bytes` (2,750,218,240 bytes at the default context limit of 32,768 in the default
+    /// F32 cache form; the growth follows `kv_dtype`, so a Q8 engine with BF16 scales needs
+    /// 2 * 10,880 * 32,768 + 65,863,680), or a later job fails with `MemoryPlan` although the
+    /// same job succeeds with `prefix_reuse` off. Engine start refuses a smaller cap and answers
+    /// with the cap, the requirement, the context limit, and the hint `raise session_cap_bytes`.
+    /// With the flag off the rule does not apply.
     pub(crate) fn check_prefix_reuse_cap(&self, prefix_reuse: bool) -> Result<(), EngError> {
         if !prefix_reuse {
             return Ok(());
         }
-        let growth = cache_growth_per_position(&QWEN3_6_35B_A3B)?;
+        let growth = cache_growth_per_position(&QWEN3_6_35B_A3B, self.kv, self.activation)?;
         let fixed = delta_state_bytes(&QWEN3_6_35B_A3B)?;
         let required = growth
             .checked_mul(2)
@@ -511,7 +650,7 @@ mod tests {
         BF16_DEFAULT_PREFILL_CHUNK, Backend, DEFAULT_CONTEXT_LIMIT, DEFAULT_PREFILL_CHUNK,
         DEFAULT_SESSION_CAP, NO_BUDGET_PIECE, Q36Env, Q36Options, Q36Settings, activation_name,
         activation_of, cache_growth_per_position, chunked_prefill_allowed, delta_state_bytes,
-        digest, scale_pairing_error, tokenizer_pin,
+        digest, kv_dtype_name, kv_dtype_of, parse_kv_dtype, scale_pairing_error, tokenizer_pin,
     };
     use crate::EngError;
     use crate::family::spec::QWEN3_6_35B_A3B;
@@ -552,7 +691,8 @@ mod tests {
         }
     }
 
-    /// The rule derives its byte counts from the family spec, never from a literal.
+    /// The rule derives its byte counts from the family spec and the cache form, never from a
+    /// literal (packet KV8-INTEGRATE item 5).
     #[test]
     fn the_prefix_reuse_bytes_are_derived_from_the_family_spec() {
         // 30 DeltaNet layers of a `[32, 128, 128]` state and an `[8192, 3]` ring, F32.
@@ -561,11 +701,33 @@ mod tests {
             65_863_680,
             "DeltaNet state bytes"
         );
-        // 10 attention layers of keys and values `[1, 2, 1, 256]`, F32.
+        // 10 attention layers: the F32 control keeps `[1, 2, 1, 256]` keys and values, and the
+        // Q8 form charges 1,088 per layer and position at BF16 scales, 1,152 at F32 scales.
         assert_eq!(
-            cache_growth_per_position(&QWEN3_6_35B_A3B).unwrap(),
+            cache_growth_per_position(
+                &QWEN3_6_35B_A3B,
+                super::KvDtype::F32,
+                super::Activation::F32
+            )
+            .unwrap(),
             40_960,
-            "cache bytes per position"
+            "cache bytes per position, F32 control"
+        );
+        assert_eq!(
+            cache_growth_per_position(
+                &QWEN3_6_35B_A3B,
+                super::KvDtype::Q8,
+                super::Activation::Bf16
+            )
+            .unwrap(),
+            10_880,
+            "cache bytes per position, Q8 with BF16 scales"
+        );
+        assert_eq!(
+            cache_growth_per_position(&QWEN3_6_35B_A3B, super::KvDtype::Q8, super::Activation::F32)
+                .unwrap(),
+            11_520,
+            "cache bytes per position, Q8 with F32 scales"
         );
     }
 
@@ -646,6 +808,7 @@ mod tests {
                 prefill_budget: None,
                 prefill_reserve: 0,
                 activation: super::Activation::Bf16,
+                kv: super::KvDtype::F32,
                 capture: false,
                 ignored_mlx_keys: Vec::new(),
             }
@@ -705,6 +868,7 @@ mod tests {
             prefill_budget_bytes: Some(30_000_000_000),
             prefill_session_reserve_bytes: Some(7),
             activation_dtype: Some("f32".to_string()),
+            kv_dtype: Some("q8".to_string()),
             capture: Some(true),
         };
         let got = settings(Some(&options), &Q36Env::default()).unwrap();
@@ -715,6 +879,7 @@ mod tests {
         assert_eq!(got.prefill_budget, Some(30_000_000_000));
         assert_eq!(got.prefill_reserve, 7);
         assert_eq!(got.activation, super::Activation::F32);
+        assert_eq!(got.kv, super::KvDtype::Q8, "the kv_dtype member overrides");
         assert!(got.capture, "every member of the object overrides");
         assert_eq!(got.artifact, PathBuf::from("/m"));
         assert_eq!(got.tokenizer_dir, PathBuf::from("/t"));
@@ -976,6 +1141,96 @@ mod tests {
         assert_eq!(activation_name(super::Activation::F32), "f32");
     }
 
+    /// Packet KV8-INTEGRATE item 5, hand-derived: the per-layer, per-position charge of both
+    /// cache forms. The real model is KVH 2, D 256 — codes `2 * 256 * 2 = 1,024` bytes, scales
+    /// and biases `2 sides * 2 arrays * 2 * 4 groups * scale_bytes`, so 64 bytes at BF16 scales
+    /// (2) and 128 at F32 scales (4): 1,088 and 1,152 per layer and position, 10,880 and 11,520
+    /// over the 10 attention layers. The F32 form stays the control at 4,096 and 40,960, and a
+    /// head dimension below the group (TINY_GQA's 32) refuses the Q8 form.
+    #[test]
+    fn the_growth_bytes_derive_both_cache_forms_by_hand() {
+        use super::{Activation, KvDtype, kv_growth_per_position};
+        // The F32 control: the tiny GQA layer (2 heads of 32) and the real layer (2 of 256).
+        assert_eq!(
+            kv_growth_per_position(2, 32, KvDtype::F32, Activation::F32).unwrap(),
+            512
+        );
+        assert_eq!(
+            kv_growth_per_position(2, 256, KvDtype::F32, Activation::F32).unwrap(),
+            4_096
+        );
+        // The Q8 form, both activation dtypes: the tiny KV8 fixture (2 heads of 64) and the
+        // real layer (2 of 256). The fixture: codes 2 * 64 * 2 = 256 bytes, plus scales and
+        // biases 2 sides * 2 arrays * 2 * 1 group * scale_bytes — 32 at F32, 16 at BF16.
+        assert_eq!(
+            kv_growth_per_position(2, 64, KvDtype::Q8, Activation::F32).unwrap(),
+            288
+        );
+        assert_eq!(
+            kv_growth_per_position(2, 64, KvDtype::Q8, Activation::Bf16).unwrap(),
+            272
+        );
+        assert_eq!(
+            kv_growth_per_position(2, 256, KvDtype::Q8, Activation::Bf16).unwrap(),
+            1_088
+        );
+        assert_eq!(
+            kv_growth_per_position(2, 256, KvDtype::Q8, Activation::F32).unwrap(),
+            1_152
+        );
+        // Over the 10 attention layers of the real model, both forms.
+        assert_eq!(
+            10 * kv_growth_per_position(2, 256, KvDtype::F32, Activation::F32).unwrap(),
+            40_960
+        );
+        assert_eq!(
+            10 * kv_growth_per_position(2, 256, KvDtype::Q8, Activation::Bf16).unwrap(),
+            10_880
+        );
+        assert_eq!(
+            10 * kv_growth_per_position(2, 256, KvDtype::Q8, Activation::F32).unwrap(),
+            11_520
+        );
+        // Decision 0046 A7 sizing: 2.85 GB at 262,144 positions instead of 10.7 GB.
+        assert_eq!(10_880u64 * 262_144, 2_852_126_720);
+        assert_eq!(40_960u64 * 262_144, 10_737_418_240);
+        // A head dimension below the group refuses the Q8 form (TINY_GQA's 32), naming the
+        // setting.
+        let refused = kv_growth_per_position(2, 32, KvDtype::Q8, Activation::F32);
+        assert!(
+            matches!(&refused, Err(EngError::BadRequest(m)) if m.contains("kv_dtype q8") && m.contains("multiple of 64")),
+            "the head-dimension rule: {refused:?}"
+        );
+        // An overflow of either form is MemoryPlan: the F32 form at the extremes, the Q8 form
+        // with a head dimension of 2^31 lanes (a multiple of 64 whose codes alone overflow).
+        assert!(kv_growth_per_position(u32::MAX, u32::MAX, KvDtype::F32, Activation::F32).is_err());
+        assert!(kv_growth_per_position(u32::MAX, 1 << 31, KvDtype::Q8, Activation::Bf16).is_err());
+    }
+
+    /// The `kv_dtype` pairs with `activation_dtype` freely: the Q8 scales follow the activation
+    /// dtype, so all four combinations are legal settings (packet KV8-INTEGRATE items 1 and 3).
+    #[test]
+    fn every_kv_dtype_pairs_with_every_activation_dtype() {
+        for kv in [super::KvDtype::F32, super::KvDtype::Q8] {
+            for (text, act) in [
+                ("f32", super::Activation::F32),
+                ("bf16", super::Activation::Bf16),
+            ] {
+                let options = Q36Options {
+                    activation_dtype: Some(text.to_string()),
+                    kv_dtype: Some(kv_dtype_name(kv).to_string()),
+                    ..with_limit()
+                };
+                let got = settings(Some(&options), &Q36Env::default()).unwrap();
+                assert_eq!(
+                    (got.activation, got.kv),
+                    (act, kv),
+                    "the pair {text}/{kv:?}"
+                );
+            }
+        }
+    }
+
     #[test]
     fn a_bad_activation_dtype_is_refused_with_the_member_style() {
         for text in ["f16", "BF16", ""] {
@@ -992,6 +1247,54 @@ mod tests {
         let json = r#"{"activation_dtype": "bf16"}"#;
         let options: Q36Options = serde_json::from_str(json).unwrap();
         assert_eq!(options.activation_dtype.as_deref(), Some("bf16"));
+    }
+
+    /// Packet KV8-INTEGRATE item 1: `kv_dtype` parses `f32` and `q8`, defaults to `f32` (the
+    /// control; the shipped default flips only after the A7 rule-4 gate), reads from JSON, and
+    /// refuses any other text in the style of its neighbors.
+    #[test]
+    fn kv_dtype_parses_f32_and_q8_and_the_default_is_f32() {
+        for (text, want) in [("f32", super::KvDtype::F32), ("q8", super::KvDtype::Q8)] {
+            let options = Q36Options {
+                kv_dtype: Some(text.to_string()),
+                ..with_limit()
+            };
+            assert_eq!(
+                settings(Some(&options), &Q36Env::default()).unwrap().kv,
+                want,
+                "the text {text}"
+            );
+        }
+        assert_eq!(
+            settings(Some(&with_limit()), &Q36Env::default())
+                .unwrap()
+                .kv,
+            super::KvDtype::F32,
+            "the default is the F32 control"
+        );
+        assert_eq!(kv_dtype_of(None).unwrap(), super::KvDtype::F32);
+        assert_eq!(kv_dtype_of(Some("q8")).unwrap(), super::KvDtype::Q8);
+        assert_eq!(kv_dtype_name(super::KvDtype::F32), "f32");
+        assert_eq!(kv_dtype_name(super::KvDtype::Q8), "q8");
+        assert_eq!(parse_kv_dtype("f32").unwrap(), super::KvDtype::F32);
+        let json = r#"{"kv_dtype": "q8"}"#;
+        let options: Q36Options = serde_json::from_str(json).unwrap();
+        assert_eq!(options.kv_dtype.as_deref(), Some("q8"));
+    }
+
+    #[test]
+    fn a_bad_kv_dtype_is_refused_with_the_member_style() {
+        for text in ["f16", "Q8", "int8", ""] {
+            let options = Q36Options {
+                kv_dtype: Some(text.to_string()),
+                ..with_limit()
+            };
+            assert_eq!(
+                message(settings(Some(&options), &Q36Env::default())),
+                format!("engine config: kv_dtype must be f32 or q8, got {text:?}"),
+                "the text {text:?}"
+            );
+        }
     }
 
     #[test]
@@ -1083,6 +1386,29 @@ mod tests {
                 "{text:?}"
             );
         }
+    }
+
+    #[test]
+    fn the_cuda_arm_refuses_the_8_bit_cache_it_cannot_build_and_takes_f32() {
+        let q8: Q36Options = serde_json::from_str("{\"kv_dtype\": \"q8\"}").unwrap();
+        assert_eq!(
+            message(settings_for(Some(&q8), &Q36Env::default(), Backend::Cuda)),
+            "engine config: kv_dtype q8 is not available on the CUDA arm yet; its cache stays f32"
+        );
+        let f32_form: Q36Options = serde_json::from_str("{\"kv_dtype\": \"f32\"}").unwrap();
+        let got = settings_for(Some(&f32_form), &Q36Env::default(), Backend::Cuda).unwrap();
+        assert_eq!(got.kv, super::KvDtype::F32);
+        // The MLX arm takes the same member.
+        let mlx = Q36Options {
+            kv_dtype: Some("q8".to_string()),
+            ..with_limit()
+        };
+        assert_eq!(
+            settings_for(Some(&mlx), &Q36Env::default(), Backend::Mlx)
+                .unwrap()
+                .kv,
+            super::KvDtype::Q8
+        );
     }
 
     #[cfg(all(feature = "native-cuda", target_os = "linux"))]

@@ -74,7 +74,7 @@ use crate::{
         qwen36::{
             host::HostShape,
             host_load::{HostWeights, rotary_dim},
-            settings::{Activation, chunked_prefill_allowed},
+            settings::{Activation, KvDtype, chunked_prefill_allowed},
         },
         session::{DecodeSession, Limits, PrefixSlot, TokenStepper, check_prompt},
         spec::{AttentionKind, QWEN3_6_35B_A3B},
@@ -106,6 +106,10 @@ pub(crate) struct Q36Rules {
     /// The dtype of the decode activations (packet Q36-BF16-a), which also picks the scale storage
     /// at construction. The config member defaults to `bf16`.
     pub(crate) activation: Activation,
+    /// The form of the attention KV cache (packet KV8-INTEGRATE; decision 0046 A7): `F32`, the
+    /// control, or `Q8`, the 8-bit codes with activation-dtype scales and biases. The config
+    /// member `kv_dtype` defaults to `f32`.
+    pub(crate) kv_dtype: KvDtype,
 }
 
 /// The numeric path of a prefill. A saved prefix restores only under the path that built it:
@@ -252,16 +256,20 @@ fn open_checkpoint(dir: &Path) -> Result<StreamedCheckpoint> {
     StreamedCheckpoint::open(&index, shards, 64 << 20)
 }
 
-/// The cache bytes that one position adds over all attention layers.
-fn growth_per_position(shape: &HostShape) -> Result<u64> {
+/// The cache bytes that one position adds over all attention layers, in the cache form `kv`
+/// with scales of the activation dtype `act` (packet KV8-INTEGRATE item 5). The admission rule
+/// calls it with the rules' own form and activation, so a Q8 engine admits its sessions by the
+/// 8-bit bytes (4,096 * layers F32, 1,088 * layers at Q8/BF16 on the real model).
+fn growth_per_position(shape: &HostShape, kv: KvDtype, act: Activation) -> Result<u64> {
     let layers = shape
         .kinds
         .iter()
         .filter(|kind| **kind == AttentionKind::Full)
         .count();
+    let per_layer = growth_bytes(shape, kv, act)?;
     u64::try_from(layers)
         .ok()
-        .and_then(|layers| growth_bytes(shape).ok()?.checked_mul(layers))
+        .and_then(|layers| per_layer.checked_mul(layers))
         .ok_or_else(|| EngError::MemoryPlan("cache growth bytes overflow u64".to_string()))
 }
 
@@ -288,7 +296,7 @@ fn admit(shape: &HostShape, rules: &Q36Rules) -> Result<()> {
             rules.context_limit
         )));
     }
-    let needed = growth_per_position(shape)?
+    let needed = growth_per_position(shape, rules.kv_dtype, rules.activation)?
         .checked_mul(u64::from(rules.context_limit))
         .ok_or_else(|| EngError::MemoryPlan("cache bytes at the limit overflow u64".to_string()))?;
     if needed > rules.session_cap {
@@ -331,12 +339,13 @@ impl Q36Executor {
         admit(host.shape(), &rules)?;
         let context_limit = usize::try_from(rules.context_limit)
             .map_err(|_| EngError::BadRequest("context limit overflows".to_string()))?;
-        let mut decoder = ResidentDecoder::new_with_activation(
+        let mut decoder = ResidentDecoder::new_with_kv(
             kernels,
             ckpt,
             host,
             rules.context_limit,
             rules.activation,
+            rules.kv_dtype,
         )?;
         // No state exists yet, so no permit charges the old budget.
         decoder.budget = SessionBudget::new(rules.session_cap);
@@ -527,10 +536,10 @@ impl ExecutorOps for Q36Executor {
 #[cfg(test)]
 mod tests {
     use super::super::ops::assert_parity;
-    use super::super::real::{activation_from_env, env_path};
+    use super::super::real::{activation_from_env, env_path, kv_dtype_from_env};
     use super::*;
     use crate::family::qwen36::settings::activation_name;
-    use crate::family::qwen36::tiny::{self, TINY_GQA};
+    use crate::family::qwen36::tiny::{self, TINY_GQA, TINY_KV8};
     use crate::{
         family::sampler::{Sampler, SamplingParams},
         tokenizer::{DecodeFinish, IncrementalDecoder, Tokenizer},
@@ -554,7 +563,64 @@ mod tests {
             context_limit: LIMIT,
             session_cap: u64::from(LIMIT) * GROWTH,
             activation: Activation::F32,
+            kv_dtype: KvDtype::F32,
         }
+    }
+
+    /// The cache form of the rules reaches the decoder (the hop `from_parts` to `new_with_kv`),
+    /// and the admission counts the bytes of that form. The tiny KV8 model has two attention
+    /// layers of 2 key-value heads of width 64. With F32 scales one layer and position takes, per
+    /// side, 2 * 64 code bytes plus 2 arrays * 2 heads * 1 group * 4 bytes = 144, so 288 for keys
+    /// and values and 576 over both layers. The F32 form takes 2 * 64 * 2 * 4 = 1,024 per layer
+    /// and 2,048 over both. A cap of exactly `LIMIT` positions of the Q8 bytes admits the Q8
+    /// engine and refuses the F32 engine; one byte less refuses the Q8 engine.
+    #[test]
+    fn the_cache_form_of_the_rules_reaches_the_decoder_and_the_admission() {
+        const Q8_GROWTH: u64 = 2 * 288;
+        let _serial = crate::native_test_lock();
+        let ckpt: &'static StreamedCheckpoint = Box::leak(Box::new(tiny::checkpoint(&TINY_KV8)));
+        let host = || HostWeights::load(ckpt, &TINY_KV8, &tiny::config(&TINY_KV8)).unwrap();
+        let with = |cap: u64, kv: KvDtype| Q36Rules {
+            session_cap: cap,
+            kv_dtype: kv,
+            ..rules(vec![], VOCAB)
+        };
+        let cap = u64::from(LIMIT) * Q8_GROWTH;
+        let build = |rules: Q36Rules| {
+            Q36Executor::from_parts(MlxKernels::try_new().unwrap(), ckpt, host(), rules)
+        };
+        let built = build(with(cap, KvDtype::Q8));
+        assert_eq!(
+            built
+                .as_ref()
+                .ok()
+                .map(|(executor, _)| executor.decoder.weights.kv),
+            Some(KvDtype::Q8),
+            "the Q8 rules build a Q8 decoder: {:?}",
+            built.as_ref().err()
+        );
+        drop(built);
+        for (kv, cap) in [(KvDtype::F32, cap), (KvDtype::Q8, cap - 1)] {
+            let refused = build(with(cap, kv)).err();
+            assert!(
+                matches!(&refused, Some(EngError::MemoryPlan(text)) if text.contains("needs")),
+                "{kv:?} at {cap} bytes: {refused:?}"
+            );
+        }
+        // A Q8 engine over a model whose head dimension is not a multiple of 64 is a BadRequest
+        // that names the setting, not a cache-byte overflow.
+        let gqa: &'static StreamedCheckpoint = Box::leak(Box::new(tiny::checkpoint(&TINY_GQA)));
+        let refused = Q36Executor::from_parts(
+            MlxKernels::try_new().unwrap(),
+            gqa,
+            HostWeights::load(gqa, &TINY_GQA, &tiny::config(&TINY_GQA)).unwrap(),
+            with(u64::MAX, KvDtype::Q8),
+        )
+        .err();
+        assert!(
+            matches!(&refused, Some(EngError::BadRequest(text)) if text.contains("kv_dtype q8")),
+            "{refused:?}"
+        );
     }
 
     fn tokenizer() -> Tokenizer {
@@ -740,6 +806,7 @@ mod tests {
             context_limit: 32_768,
             session_cap: 40_960 * 32_768,
             activation: Activation::F32,
+            kv_dtype: KvDtype::F32,
         }
     }
 
@@ -969,6 +1036,7 @@ mod tests {
             context_limit,
             session_cap,
             activation: Activation::F32,
+            kv_dtype: KvDtype::F32,
         };
         // Every rule is broken: the vocabulary is named first, then the limit, then the cap.
         assert!(message(bad(0, 1, 0)).contains("sampler vocabulary"));
@@ -990,7 +1058,7 @@ mod tests {
         assert_eq!(per_step, GROWTH, "bytes per step");
         let shape = executor.decoder.weights.shape.clone();
         assert_eq!(
-            growth_per_position(&shape).unwrap(),
+            growth_per_position(&shape, KvDtype::F32, Activation::F32).unwrap(),
             per_step,
             "admission rule"
         );
@@ -1044,6 +1112,7 @@ mod tests {
             context_limit: CHUNK_LIMIT,
             session_cap: u64::from(CHUNK_LIMIT) * GROWTH,
             activation: Activation::F32,
+            kv_dtype: KvDtype::F32,
         }
     }
 
@@ -1954,6 +2023,7 @@ mod tests {
             context_limit: 256,
             session_cap: 1 << 30,
             activation: Activation::F32,
+            kv_dtype: KvDtype::F32,
         };
         let (mut executor, mut session) = Q36Executor::open(&ckpt_dir, cache_limit, rules).unwrap();
         let mut job = GenerationState::new(IncrementalDecoder::new(&tokenizer)).with_max_tokens(32);
@@ -2015,7 +2085,15 @@ mod tests {
         positions: u64,
         cache_limit: u64,
     ) -> u64 {
-        let growth = growth_per_position(&executor.decoder.weights.shape).unwrap();
+        // The form and the activation of the run's own decoder (packet KV8-INTEGRATE): an F32
+        // control run and a Q8 run each reserve their own cache bytes.
+        let act = Activation::of_dtype(executor.decoder.weights.consts.act).unwrap();
+        let growth = growth_per_position(
+            &executor.decoder.weights.shape,
+            executor.decoder.weights.kv,
+            act,
+        )
+        .unwrap();
         session.state.byte_len().unwrap() + growth * positions + cache_limit + (1 << 30)
     }
 
@@ -2053,6 +2131,7 @@ mod tests {
             context_limit: 256,
             session_cap: 1 << 30,
             activation: activation_from_env(),
+            kv_dtype: kv_dtype_from_env(),
         };
         let dtype = activation_name(rules.activation);
         let (mut executor, mut session) = Q36Executor::open(&ckpt_dir, cache_limit, rules).unwrap();
@@ -2170,6 +2249,7 @@ mod tests {
             context_limit: 4_096,
             session_cap: 4_096 * 40_960,
             activation: activation_from_env(),
+            kv_dtype: kv_dtype_from_env(),
         };
         let dtype = activation_name(rules.activation);
         let (mut executor, mut session) = Q36Executor::open(&ckpt_dir, cache_limit, rules).unwrap();
@@ -2286,6 +2366,7 @@ mod tests {
             context_limit: PREFIX_LIMIT,
             session_cap: 100_000,
             activation: Activation::F32,
+            kv_dtype: KvDtype::F32,
         }
     }
 
@@ -2299,6 +2380,7 @@ mod tests {
             context_limit: PREFIX_LIMIT,
             session_cap: 28_000,
             activation: Activation::F32,
+            kv_dtype: KvDtype::F32,
         }
     }
 

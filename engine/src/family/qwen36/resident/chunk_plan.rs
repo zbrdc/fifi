@@ -125,20 +125,6 @@ pub(super) fn delta_subchunk(rows: u32, cap: u64, per_token: u64) -> Result<u32,
     Ok(u32::try_from(fit).unwrap_or(u32::MAX).clamp(1, rows))
 }
 
-/// The ranges `(start, stop)` of `rows` rows in parts of at most `size` rows, in order. Every range
-/// is non-empty and together they cover `0..rows` exactly. `rows` and `size` must be positive.
-pub(super) fn ranges(rows: u32, size: u32) -> Result<Vec<(u32, u32)>, EngError> {
-    if rows == 0 || size == 0 {
-        return Err(bad("ranges need positive rows and size"));
-    }
-    Ok((0..rows.div_ceil(size))
-        .map(|part| {
-            let start = part.saturating_mul(size);
-            (start, start.saturating_add(size).min(rows))
-        })
-        .collect())
-}
-
 /// The chunk sizes that the admission rule tries, largest first (the list of decision 0044 item 6;
 /// Q36 keeps its own copy, decision 0046). The largest is the most rows that
 /// `ResidentDecoder::set_chunk_rows` accepts (`decoder::MAX_CHUNK_ROWS`). A compile-time check in
@@ -419,19 +405,5 @@ mod tests {
         assert!(delta_subchunk(1, PREFILL_RETIRE_CAP, 0).is_err());
         assert!(delta_retire_per_token(0, 128, 128).is_err());
         assert!(delta_retire_per_token(u32::MAX, u32::MAX, u32::MAX).is_err());
-    }
-
-    #[test]
-    fn ranges_cover_the_rows_without_an_empty_part() {
-        assert_eq!(ranges(7, 3).unwrap(), [(0, 3), (3, 6), (6, 7)]);
-        assert_eq!(ranges(6, 3).unwrap(), [(0, 3), (3, 6)]);
-        assert_eq!(ranges(2, 5).unwrap(), [(0, 2)]);
-        assert_eq!(ranges(1, 1).unwrap(), [(0, 1)]);
-        // 2,048 rows in chunks of 512 and 74-row sub-chunks of one chunk.
-        assert_eq!(ranges(2_048, 512).unwrap().len(), 4);
-        assert_eq!(ranges(512, 74).unwrap().len(), 7);
-        assert_eq!(ranges(512, 74).unwrap().last(), Some(&(444, 512)));
-        assert!(ranges(0, 3).is_err());
-        assert!(ranges(3, 0).is_err());
     }
 }

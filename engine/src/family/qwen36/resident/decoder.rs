@@ -3,7 +3,7 @@
 //! `ResidentDecoder` runs one token per `step` in a `StepMode`. It owns the adapter and the weights.
 //! It holds no session: the caller owns each `ResidentState` and passes it to `step`.
 
-use super::super::settings::Activation;
+use super::super::settings::{Activation, KvDtype, Q8_GROUP};
 use super::moe::Routing;
 use super::prefill;
 use super::state::{ResidentSnapshot, ResidentState};
@@ -79,7 +79,8 @@ pub(super) struct ResidentDecoder<'c> {
     pub(super) budget: SessionBudget,
     /// The first position that a step refuses with `ContextLimit`.
     pub(super) context_limit: u32,
-    /// The most rows of one prefill chunk. `prefill` splits a longer prompt.
+    /// The most rows of one prefill chunk. `prefill` splits a longer prompt, and the attention
+    /// of a deep chunk runs in smaller parts (`kv_plan::depth_ranges`).
     pub(super) chunk_rows: u32,
     /// How the layers pick their experts. `Device` unless a parity run asks for `Host`.
     pub(super) routing: Routing,
@@ -128,6 +129,8 @@ impl<'c> ResidentDecoder<'c> {
         activation: Activation,
     ) -> Result<Self, EngError> {
         // The product path: the scale import follows the activation, so the census always matches.
+        // The cache form is the F32 control (packet KV8-INTEGRATE: the shipped default stays F32
+        // until the A7 rule-4 gate).
         Self::new_paired(
             kernels,
             ckpt,
@@ -135,6 +138,34 @@ impl<'c> ResidentDecoder<'c> {
             context_limit,
             activation,
             activation == Activation::F32,
+            KvDtype::F32,
+        )
+    }
+
+    /// Builds the decoder for the cache form `kv` (packet KV8-INTEGRATE; decision 0046 A7):
+    /// `KvDtype::F32` is the control and equals `new_with_activation`, and `KvDtype::Q8` keeps
+    /// the attention cache as 8-bit affine codes beside scales and biases of the activation
+    /// dtype - the new K and V rows stay in the activation dtype and `quantize_rows` packs them,
+    /// so BF16 activations give BF16 scales (1,088 bytes per layer and position on the real
+    /// model) and F32 activations give F32 scales (1,152). A Q8 engine whose `head_dim` is not a
+    /// multiple of the group (64) is refused at load with `BadRequest` naming the setting, before
+    /// any weight imports.
+    pub(super) fn new_with_kv(
+        kernels: MlxKernels,
+        ckpt: &'c StreamedCheckpoint,
+        host: HostWeights,
+        context_limit: u32,
+        activation: Activation,
+        kv: KvDtype,
+    ) -> Result<Self, EngError> {
+        Self::new_paired(
+            kernels,
+            ckpt,
+            host,
+            context_limit,
+            activation,
+            activation == Activation::F32,
+            kv,
         )
     }
 
@@ -157,11 +188,14 @@ impl<'c> ResidentDecoder<'c> {
             context_limit,
             activation,
             super::scale_knob::scales_f32_requested(),
+            KvDtype::F32,
         )
     }
 
     /// The one constructor body: it imports the scales in the `f32_scales` form, then refuses a
-    /// pair that does not match `activation` before anything else changes.
+    /// pair that does not match `activation` before anything else changes. The cache form `kv`
+    /// is checked against the head dimension BEFORE any import (a Q8 cache needs a multiple of
+    /// the group of 64) and lands on the weights, where `zero_with` reads it for every cache.
     fn new_paired(
         mut kernels: MlxKernels,
         ckpt: &'c StreamedCheckpoint,
@@ -169,8 +203,21 @@ impl<'c> ResidentDecoder<'c> {
         context_limit: u32,
         activation: Activation,
         f32_scales: bool,
+        kv: KvDtype,
     ) -> Result<Self, EngError> {
         let act = activation.dtype();
+        if kv == KvDtype::Q8
+            && !host
+                .shape()
+                .attn
+                .head_dim
+                .is_multiple_of(usize::try_from(Q8_GROUP).unwrap_or(0))
+        {
+            return Err(EngError::BadRequest(format!(
+                "kv_dtype q8 needs a head_dim that is a multiple of {Q8_GROUP}, got {}",
+                host.shape().attn.head_dim
+            )));
+        }
         kernels.set_retire_cap(DECODE_RETIRE_CAP)?;
         let mut weights = if f32_scales {
             ResidentWeights::import(&mut kernels, ckpt, host)?
@@ -183,6 +230,7 @@ impl<'c> ResidentDecoder<'c> {
             weights.convert_norms(&mut kernels, Dtype::Bf16)?;
             weights.consts.act = Dtype::Bf16;
         }
+        weights.kv = kv;
         Ok(Self::with_weights(kernels, ckpt, weights, context_limit))
     }
 

@@ -9,19 +9,22 @@
 //! as stored, RoPE rotates the first `rotary_dim` dimensions, and the head output is multiplied
 //! by `sigmoid(gate)`. There is no indexer and no block selection.
 //!
-//! The cache keeps the decode layout — capacity buffers `[1, KVH, cap, D]` written in place by
-//! `kv_append` (packet Q36-KV-INTEGRATE) — so a chunk and a decode step share it. The cache is
-//! F32 in every activation dtype: the new keys and values convert to F32 before the append
-//! (packet Q36-BF16-b, as the decode step of `attn.rs`), and the block output converts to the
-//! activation dtype at the o-projection.
+//! The cache keeps the decode layout — capacity buffers written in place by `kv_append`
+//! (packets Q36-KV-INTEGRATE and KV8-INTEGRATE) — so a chunk and a decode step share it. The
+//! F32 control converts its new keys and values to F32 before the append (packet Q36-BF16-b, as
+//! the decode step of `attn.rs`); the Q8 form keeps the activation dtype and `quantize_rows`
+//! packs the rows. The attention runs `quantized_attention_prefix` over the quantized buffers,
+//! causal for a chunk of more than one row (packet KV8-INTEGRATE item 4), and the block output
+//! converts to the activation dtype at the o-projection.
 
-use super::super::attn::{AttnStep, KvCache, append};
+use super::super::attn::{AttnStep, KvBuffers, KvCache, append};
 use super::super::ops::{Ctx, cast_to, dim, to_act};
 use super::super::weights::RAttn;
 use crate::{
     EngError,
     family::qwen36::host::HostShape,
-    kernels::{BinaryOp, RopeSpec, UnaryOp},
+    family::qwen36::settings::{KvDtype, Q8_BITS, Q8_GROUP},
+    kernels::{BinaryOp, QuantizedKv, RopeSpec, UnaryOp},
     tensor::{Dtype, ExecutionTensor},
 };
 
@@ -67,7 +70,7 @@ pub(super) fn chunk(
             cache.len
         )));
     }
-    cache.check_buffers(kv_heads, width)?;
+    cache.check_buffers(kv_heads, width, cache.kv)?;
     let pair = width.checked_mul(2).ok_or_else(overflow)?;
     let q_width = heads.checked_mul(width).ok_or_else(overflow)?;
     let next_len = usize::try_from(rows)
@@ -103,28 +106,56 @@ pub(super) fn chunk(
     let vp = m.reshape(&vp, &[rows, kv_heads, width])?;
     let v_new = m.transpose(&vp, &[1, 0, 2])?;
     let v_new = m.reshape(&v_new, &[1, kv_heads, rows, width])?;
-    // The cache stays F32 whatever the activation dtype (packet Q36-BF16-b, as the decode step
-    // of `attn.rs`; a BF16 cache is a parked lever of decision 0046 item 5). The cast runs before
-    // the append so that a cache which starts with this chunk is F32 too, not only one that
-    // appends to F32 keys and values.
-    let (k_new, v_new) = (
-        cast_to(ctx, &k_new, Dtype::F32)?,
-        cast_to(ctx, &v_new, Dtype::F32)?,
-    );
-    // 5. Append the rows into the capacity buffer (a growth builds the larger buffer first).
-    let cache = append(ctx, kv_heads, width, cache, rows, &k_new, &v_new)?;
-    let (k_buf, v_buf) = match (&cache.k, &cache.v) {
-        (Some(k), Some(v)) => (k, v),
-        _ => return Err(mismatch()),
+    // The cache form (packet KV8-INTEGRATE, as the decode step of `attn.rs`): the F32 control
+    // keeps its cast to F32 whatever the activation dtype (packet Q36-BF16-b; the cast runs
+    // before the append so that a cache which starts with this chunk is F32 too), and the Q8
+    // form keeps the activation dtype, so the quantized scales and biases hold it.
+    let (k_new, v_new) = match cache.kv {
+        KvDtype::F32 => (
+            cast_to(ctx, &k_new, Dtype::F32)?,
+            cast_to(ctx, &v_new, Dtype::F32)?,
+        ),
+        KvDtype::Q8 => (k_new, v_new),
     };
+    // 5. Append the rows into the capacity buffers (a growth builds the larger buffers first).
+    let cache = append(ctx, kv_heads, width, cache, rows, &k_new, &v_new)?;
     // 6. Causal attention over the valid prefix, as a copy-free view of the capacity buffers;
-    // head h reads KV head h / (QH / KVH).
+    // head h reads KV head h / (QH / KVH). The Q8 form runs the mlx-lm quantized attention over
+    // the codes, scales, and biases - causal for a chunk of more than one row, and a one-row
+    // chunk is the decode case (packet KV8-INTEGRATE item 4).
     let scale = 1.0 / (width as f32).sqrt();
-    let att =
-        ctx.kernels
-            .grouped_attention_prefix(&q, k_buf, v_buf, dim(next_len)?, scale, true)?;
+    let att = match cache.buffers.as_ref() {
+        Some(KvBuffers::F32 { k, v }) => {
+            ctx.kernels
+                .grouped_attention_prefix(&q, k, v, dim(next_len)?, scale, true)?
+        }
+        Some(KvBuffers::Q8 { k, v }) => {
+            let keys = QuantizedKv {
+                codes: &k.codes,
+                scales: &k.scales,
+                biases: &k.biases,
+            };
+            let values = QuantizedKv {
+                codes: &v.codes,
+                scales: &v.scales,
+                biases: &v.biases,
+            };
+            ctx.kernels.quantized_attention_prefix(
+                &q,
+                &keys,
+                &values,
+                dim(next_len)?,
+                scale,
+                rows > 1,
+                Q8_GROUP,
+                Q8_BITS,
+            )?
+        }
+        None => return Err(mismatch()),
+    };
     // 7. Back to rows, sigmoid output gate, and output projection. The attention output is F32
-    // over the F32 cache; the projection takes the activation dtype (packet Q36-BF16-b).
+    // over the F32 cache and follows the query dtype over the Q8 cache; the projection takes the
+    // activation dtype (packet Q36-BF16-b).
     let att = ctx.kernels.transpose(&att, &[0, 2, 1, 3])?;
     let att = ctx.kernels.reshape(&att, &[rows, heads, width])?;
     let gate = ctx.kernels.unary(UnaryOp::Sigmoid, &gate)?;
@@ -146,6 +177,7 @@ mod tests {
     use crate::family::qwen36::host::{self, KvCache as HostCache, MixerW, rms_plain};
     use crate::family::qwen36::host_cpu::CpuProjector;
     use crate::family::qwen36::host_load::HostWeights;
+    use crate::family::qwen36::settings::Activation;
     use crate::family::qwen36::tiny::{self, TINY_GQA};
     use crate::kernels::MlxKernels;
     use crate::weights::StreamedCheckpoint;
@@ -177,6 +209,14 @@ mod tests {
         kernels
             .import_tensor(&f32_tensor(shape, data).unwrap())
             .unwrap()
+    }
+
+    /// The F32 pair of a cache of the F32 form (test observer).
+    fn f32_pair(cache: &KvCache) -> (&ExecutionTensor, &ExecutionTensor) {
+        match &cache.buffers {
+            Some(KvBuffers::F32 { k, v }) => (k, v),
+            _ => panic!("the cache is not the F32 form"),
+        }
     }
 
     /// The input rows of positions `first..first + count` as `[count, 64]`.
@@ -383,13 +423,13 @@ mod tests {
             "the capacity {want_cap} must hold the valid rows {total}"
         );
         assert_eq!(
-            next.cache.k.as_ref().unwrap().shape(),
+            f32_pair(&next.cache).0.shape(),
             [1, hkv as u32, next.cache.cap as u32, hd as u32],
             "key shape"
         );
         assert_eq!(
             next.cache.byte_len(),
-            next.cache.cap as u64 * growth_bytes(&shape).unwrap(),
+            next.cache.cap as u64 * growth_bytes(&shape, KvDtype::F32, Activation::F32).unwrap(),
             "stored bytes follow the capacity"
         );
         let want_out: Vec<f32> = host.outputs[warm as usize..].concat();
@@ -398,9 +438,10 @@ mod tests {
             &want_out,
             "chunk output",
         );
+        let (k_buf, v_buf) = f32_pair(&next.cache);
         assert_parity(
             &prefix_rows(
-                &values(&mut kernels, next.cache.k.as_ref().unwrap()).unwrap(),
+                &values(&mut kernels, k_buf).unwrap(),
                 hkv,
                 next.cache.cap,
                 total,
@@ -411,7 +452,7 @@ mod tests {
         );
         assert_parity(
             &prefix_rows(
-                &values(&mut kernels, next.cache.v.as_ref().unwrap()).unwrap(),
+                &values(&mut kernels, v_buf).unwrap(),
                 hkv,
                 next.cache.cap,
                 total,
@@ -524,13 +565,13 @@ mod tests {
         assert_eq!(cache.cap, 12, "the decode steps crossed the second growth");
         // The caches agree bit for bit on the valid prefix.
         let (hkv, hd) = (shape.attn.heads_kv, shape.attn.head_dim);
+        let (k_buf, v_buf) = f32_pair(&cache);
         for (name, new_tensor, old_tensor) in [
-            ("keys", &cache.k, &concat.k),
-            ("values", &cache.v, &concat.v),
+            ("keys", k_buf, concat.k.as_ref().unwrap()),
+            ("values", v_buf, concat.v.as_ref().unwrap()),
         ] {
-            let (new_tensor, old_tensor) = (new_tensor.as_ref(), old_tensor.as_ref());
-            let got = values(&mut kernels, new_tensor.unwrap()).unwrap();
-            let want = values(&mut kernels, old_tensor.unwrap()).unwrap();
+            let got = values(&mut kernels, new_tensor).unwrap();
+            let want = values(&mut kernels, old_tensor).unwrap();
             assert_eq!(
                 prefix_rows(&got, hkv, cache.cap, 12, hd),
                 want,
@@ -665,8 +706,11 @@ mod tests {
         let flat = upload(&mut kernels, vec![128], &[0.0; 128]);
         let one_head = |kernels: &mut MlxKernels| upload(kernels, vec![1, 1, 1, 32], &[0.0; 32]);
         let bad = KvCache {
-            k: Some(one_head(&mut kernels)),
-            v: Some(one_head(&mut kernels)),
+            buffers: Some(KvBuffers::F32 {
+                k: one_head(&mut kernels),
+                v: one_head(&mut kernels),
+            }),
+            kv: KvDtype::F32,
             len: 1,
             cap: 1,
             step: 4,
@@ -698,6 +742,199 @@ mod tests {
         }
     }
 
+    /// Layer 1 of the four-layer tiny KV8 model (packet KV8-INTEGRATE): head dimension 64, the
+    /// multiple of the Q8 group, so the Q8 form is available.
+    fn setup_kv8() -> (StreamedCheckpoint, HostWeights, ResidentWeights, MlxKernels) {
+        let ckpt = tiny::checkpoint(&tiny::TINY_KV8);
+        let config = tiny::config(&tiny::TINY_KV8);
+        let oracle = HostWeights::load(&ckpt, &tiny::TINY_KV8, &config).unwrap();
+        let mut kernels = MlxKernels::try_new().unwrap();
+        let w = ResidentWeights::import(
+            &mut kernels,
+            &ckpt,
+            HostWeights::load(&ckpt, &tiny::TINY_KV8, &config).unwrap(),
+        )
+        .unwrap();
+        (ckpt, oracle, w, kernels)
+    }
+
+    /// A Q8 cache (growth quantum 4) that holds the decode-step positions `0..warm`, with
+    /// `perturbed` (if any) given a different input.
+    fn q8_warm_cache(
+        kernels: &mut MlxKernels,
+        w: &ResidentWeights,
+        shape: &HostShape,
+        rw: &RAttn,
+        warm: u32,
+        perturbed: Option<u32>,
+    ) -> KvCache {
+        let mut cache = KvCache::with_form(KvDtype::Q8, 4);
+        for n in 0..warm {
+            let mut data = input(n);
+            if perturbed == Some(n) {
+                data = data.iter().map(|v| 0.0625 - v).collect();
+            }
+            let xr = upload(kernels, vec![1, 64], &data);
+            let mut ctx = Ctx {
+                kernels: &mut *kernels,
+                consts: &w.consts,
+            };
+            cache = step(&mut ctx, shape, rw, cache, n, &xr).unwrap().cache;
+        }
+        cache
+    }
+
+    /// The `[count, 64]` output of a Q8 chunk of the rows `data` after `warm` Q8 decode steps.
+    fn q8_chunk_output(
+        kernels: &mut MlxKernels,
+        w: &ResidentWeights,
+        shape: &HostShape,
+        rw: &RAttn,
+        warm: u32,
+        perturbed: Option<u32>,
+        data: &[f32],
+    ) -> Vec<f32> {
+        let cache = q8_warm_cache(kernels, w, shape, rw, warm, perturbed);
+        let count = u32::try_from(data.len() / 64).unwrap();
+        let x = upload(kernels, vec![count, 64], data);
+        let mut ctx = Ctx {
+            kernels: &mut *kernels,
+            consts: &w.consts,
+        };
+        let next = chunk(&mut ctx, shape, rw, cache, warm, &x).unwrap();
+        assert_eq!(next.cache.len, warm as usize + count as usize);
+        values(kernels, &next.out).unwrap()
+    }
+
+    /// Packet KV8-INTEGRATE test (d), causality: in the Q8 chunk a row reads no later row. Two
+    /// chunks of five rows after three cached positions have the same rows 0 to 2 and different
+    /// rows 3 and 4. The masked keys get the probability 0 exactly and every other step of a
+    /// row (projection, norm, RoPE, quantization of its own K and V, softmax, output
+    /// projection) depends on that row alone, so the outputs of rows 0 to 2 are bit-identical.
+    /// A chunk that attends without the causal mask lets rows 0 to 2 read rows 3 and 4 and
+    /// differ. The perturbation reaches its own rows (rows 3 and 4 differ), so the equality is
+    /// not an artifact of equal outputs.
+    #[test]
+    fn a_q8_chunk_row_never_reads_a_later_row() {
+        let _serial = crate::native_test_lock();
+        let (_ckpt, oracle, w, mut kernels) = setup_kv8();
+        let shape = oracle.shape().clone();
+        let RMixer::Attn(rw) = &w.layers[1].mixer else {
+            panic!("resident layer 1 is attention");
+        };
+        let (warm, count) = (3u32, 5usize);
+        let base: Vec<f32> = (warm..warm + count as u32).flat_map(input).collect();
+        let mut changed = base.clone();
+        for value in &mut changed[3 * 64..] {
+            *value = 0.0625 - *value;
+        }
+        let a = q8_chunk_output(&mut kernels, &w, &shape, rw, warm, None, &base);
+        let b = q8_chunk_output(&mut kernels, &w, &shape, rw, warm, None, &changed);
+        assert_eq!(a.len(), count * 64);
+        assert!(a.iter().chain(&b).all(|value| value.is_finite()));
+        assert_eq!(
+            a[..3 * 64],
+            b[..3 * 64],
+            "rows 0 to 2 read nothing of rows 3 and 4"
+        );
+        assert_ne!(
+            a[3 * 64..],
+            b[3 * 64..],
+            "rows 3 and 4 read their own input"
+        );
+    }
+
+    /// Packet KV8-INTEGRATE test (d), alignment: a Q8 chunk row sees EVERY cached position and
+    /// the chunk rows up to itself (the mask is aligned to the last key). Changing the input of
+    /// cached position 1 changes the output of every chunk row, row 0 included: with a mask
+    /// aligned to the first key, row 0 would see position 0 alone and ignore position 1.
+    #[test]
+    fn a_q8_chunk_row_reads_every_cached_position() {
+        let _serial = crate::native_test_lock();
+        let (_ckpt, oracle, w, mut kernels) = setup_kv8();
+        let shape = oracle.shape().clone();
+        let RMixer::Attn(rw) = &w.layers[1].mixer else {
+            panic!("resident layer 1 is attention");
+        };
+        let (warm, count) = (3u32, 5u32);
+        let data: Vec<f32> = (warm..warm + count).flat_map(input).collect();
+        let a = q8_chunk_output(&mut kernels, &w, &shape, rw, warm, None, &data);
+        let b = q8_chunk_output(&mut kernels, &w, &shape, rw, warm, Some(1), &data);
+        for row in 0..count as usize {
+            assert_ne!(
+                a[row * 64..(row + 1) * 64],
+                b[row * 64..(row + 1) * 64],
+                "row {row} ignores cached position 1"
+            );
+        }
+    }
+
+    /// Packet KV8-INTEGRATE test (d), agreement: the Q8 chunk of five rows after three cached
+    /// positions and five Q8 decode steps from the same cache quantize the same rows, so they
+    /// differ only by float reduction order and, rarely, by one code that a one-ulp change moves
+    /// across a rounding boundary. Both paths must agree at least as well as the Q8 chunk agrees
+    /// with the F32 chunk, whose gap is the quantization error itself (a floor of 1e-5 covers a
+    /// run where the two forms happen to agree to that level). The causal-off and the
+    /// wrong-length mutants differ by far more than that gap.
+    #[test]
+    fn a_q8_chunk_agrees_with_five_q8_decode_steps_at_least_as_well_as_with_the_f32_chunk() {
+        let _serial = crate::native_test_lock();
+        let (_ckpt, oracle, w, mut kernels) = setup_kv8();
+        let shape = oracle.shape().clone();
+        let RMixer::Attn(rw) = &w.layers[1].mixer else {
+            panic!("resident layer 1 is attention");
+        };
+        let (warm, count) = (3u32, 5u32);
+        let data: Vec<f32> = (warm..warm + count).flat_map(input).collect();
+        let chunked = q8_chunk_output(&mut kernels, &w, &shape, rw, warm, None, &data);
+        // Five Q8 decode steps from the same warm-up.
+        let mut cache = q8_warm_cache(&mut kernels, &w, &shape, rw, warm, None);
+        let mut stepped = Vec::new();
+        for n in warm..warm + count {
+            let xr = upload(&mut kernels, vec![1, 64], &input(n));
+            let mut ctx = Ctx {
+                kernels: &mut kernels,
+                consts: &w.consts,
+            };
+            let next = step(&mut ctx, &shape, rw, cache, n, &xr).unwrap();
+            cache = next.cache;
+            stepped.extend(values(&mut kernels, &next.out).unwrap());
+        }
+        assert_eq!(cache.len, 8);
+        // The F32 chunk after three F32 decode steps.
+        let mut f32_cache = KvCache::with_step(4);
+        for n in 0..warm {
+            let xr = upload(&mut kernels, vec![1, 64], &input(n));
+            let mut ctx = Ctx {
+                kernels: &mut kernels,
+                consts: &w.consts,
+            };
+            f32_cache = step(&mut ctx, &shape, rw, f32_cache, n, &xr).unwrap().cache;
+        }
+        let x = upload(&mut kernels, vec![count, 64], &data);
+        let mut ctx = Ctx {
+            kernels: &mut kernels,
+            consts: &w.consts,
+        };
+        let control = chunk(&mut ctx, &shape, rw, f32_cache, warm, &x).unwrap();
+        let control = values(&mut kernels, &control.out).unwrap();
+        let gap = |a: &[f32], b: &[f32]| {
+            a.iter()
+                .zip(b)
+                .map(|(&x, &y)| (x - y).abs())
+                .fold(0f32, f32::max)
+        };
+        let quantization = gap(&chunked, &control);
+        let paths = gap(&chunked, &stepped);
+        println!("q8 chunk against f32 chunk {quantization}, against q8 steps {paths}");
+        assert!(stepped.iter().all(|value| value.is_finite()));
+        assert!(
+            paths <= quantization.max(1e-5),
+            "the Q8 chunk differs from five Q8 decode steps by {paths}, more than from the F32 \
+             chunk ({quantization})"
+        );
+    }
+
     #[cfg(feature = "native-fault-qualification")]
     #[test]
     fn a_chunk_builds_lazy_outputs_without_synchronizing() {
@@ -719,10 +956,7 @@ mod tests {
             before,
             "chunk synchronized"
         );
-        let (k, v) = (
-            next.cache.k.as_ref().unwrap(),
-            next.cache.v.as_ref().unwrap(),
-        );
+        let (k, v) = f32_pair(&next.cache);
         kernels.evaluate(&[&next.out, k, v]).unwrap();
         assert_eq!(
             kernels.qualification_sync_count(),

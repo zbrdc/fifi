@@ -23,12 +23,14 @@
 //! bytes that the step adds to the attention caches. A denial returns `MemoryPlan` and changes
 //! nothing. The permit moves into `run` and then into `commit`. Any earlier return drops it.
 
+use super::attn::KvBuffers;
 use super::decoder::{ResidentDecoder, StepMode, StepResult};
 use super::moe::{self, Routing};
 use super::ops::{Ctx, cast_to, linear, short_import, to_act, values};
 use super::state::{LayerState, ResidentState, kv_growth_bytes};
 use super::weights::RMixer;
 use super::{attn, delta};
+use crate::family::qwen36::settings::KvDtype;
 use crate::{
     EngError,
     family::flash_next::stored,
@@ -215,19 +217,34 @@ fn run(
     } else {
         None
     };
-    // Packet Q36-BF16-a: the recurrent state, the convolution ring, and the key-value cache stay
-    // F32 whatever the activation dtype, and the step refuses a graph that planned otherwise.
+    // Packet Q36-BF16-a: the recurrent state and the convolution ring stay F32 whatever the
+    // activation dtype. The key-value cache keeps its form's dtypes (packet KV8-INTEGRATE): the
+    // F32 control holds F32 keys and values, and the Q8 form holds U32 codes beside scales and
+    // biases of the activation dtype. The step refuses a graph that planned otherwise.
     for layer in &layers {
         match layer {
             LayerState::Delta { rec, ring } => {
                 check_dtype("recurrent state", rec, Dtype::F32)?;
                 check_dtype("convolution ring", ring, Dtype::F32)?;
             }
-            LayerState::Attn(cache) => {
-                for tensor in [&cache.k, &cache.v].into_iter().flatten() {
-                    check_dtype("key-value cache", tensor, Dtype::F32)?;
+            LayerState::Attn(cache) => match cache.kv {
+                KvDtype::F32 => {
+                    if let Some(KvBuffers::F32 { k, v }) = &cache.buffers {
+                        check_dtype("key-value cache", k, Dtype::F32)?;
+                        check_dtype("key-value cache", v, Dtype::F32)?;
+                    }
                 }
-            }
+                KvDtype::Q8 => {
+                    if let Some(KvBuffers::Q8 { k, v }) = &cache.buffers {
+                        for (side, tensor) in [("key codes", &k.codes), ("value codes", &v.codes)] {
+                            check_dtype(side, tensor, Dtype::U32)?;
+                        }
+                        for tensor in [&k.scales, &k.biases, &v.scales, &v.biases] {
+                            check_dtype("key-value scales", tensor, ctx.consts.act)?;
+                        }
+                    }
+                }
+            },
         }
     }
     // One evaluate of the new state and the head outputs.
@@ -235,7 +252,7 @@ fn run(
     for layer in &layers {
         match layer {
             LayerState::Delta { rec, ring } => outputs.extend([rec, ring]),
-            LayerState::Attn(cache) => outputs.extend([&cache.k, &cache.v].into_iter().flatten()),
+            LayerState::Attn(cache) => outputs.extend(cache.tensors()),
         }
     }
     if let Some((logits, out)) = &head {

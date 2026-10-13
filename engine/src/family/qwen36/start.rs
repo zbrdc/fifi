@@ -16,8 +16,10 @@
 //! one-token steps and the start-up line says why.
 //!
 //! The activation dtype (packet Q36-BF16-a) travels with the rules into
-//! `ResidentDecoder::new_with_activation`. The chunk path is dtype aware (packet Q36-BF16-b), so
-//! a BF16 engine plans its chunk exactly like an F32 engine when the budget allows one.
+//! `ResidentDecoder::new_with_kv`, and the cache form (packet KV8-INTEGRATE) with them:
+//! `kv_dtype` `f32` is the control and `q8` keeps the 8-bit codes. The chunk path is dtype aware
+//! (packet Q36-BF16-b), so a BF16 engine plans its chunk exactly like an F32 engine when the
+//! budget allows one.
 
 use super::resident::executor::{Q36Executor, Q36Rules};
 use super::settings::{NO_BUDGET_PIECE, Q36Settings, tokenizer_pin};
@@ -50,6 +52,7 @@ pub(crate) fn start(settings: &Q36Settings) -> Result<(Engine, TokenizerBundle),
         context_limit: settings.context_limit,
         session_cap: settings.session_cap,
         activation: settings.activation,
+        kv_dtype: settings.kv,
     };
     let engine = spawn_engine(fallback, move || {
         let (mut executor, session) = Q36Executor::open(&owned.artifact, owned.cache_limit, rules)?;

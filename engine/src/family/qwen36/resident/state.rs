@@ -1,17 +1,20 @@
 //! Resident Q36 session state (packet Q36-D), with the step's check, poison, and commit.
 //!
 //! DeltaNet layers keep a recurrent state `[VH, VD, KD]` and a convolution ring `[CD, CK - 1]`.
-//! Attention layers keep an F32 key-value cache in preallocated capacity buffers written in
-//! place (packet Q36-KV-INTEGRATE): `[1, KVH, cap, D]` per key and value tensor, `len` valid
-//! positions, growth in `KV_STEP` quanta. The growth charge covers the cache only, as in the
-//! Flash-Next decoder (decision 0039 amendment), and stays LOGICAL — `len` positions of growth
-//! bytes per layer — so the capacity slack, bounded by one `KV_STEP` of growth bytes per
-//! attention layer (256 * 4,096 * 10 = 10,485,760 bytes on the real model), never enters a
-//! permit; `kv_storage_bytes` reports the stored bytes. The slack bound excludes the growth
-//! TRANSIENT — the old buffer, its slice copy, and the new buffer alive together at a growth,
-//! about 100 MB per layer at depth 8,192 — which the session reserve margin and the retire cap
-//! cover. The fixed DeltaNet state of 65,863,680 bytes is not charged by the steps; a snapshot
-//! charges it once with its entry (decision 0036, addendum 1).
+//! Attention layers keep a key-value cache in preallocated capacity buffers written in place
+//! (packets Q36-KV-INTEGRATE and KV8-INTEGRATE): in the F32 control `[1, KVH, cap, D]` per key
+//! and value tensor, in the Q8 form the codes `[1, KVH, cap, D/4]` beside scales and biases
+//! `[1, KVH, cap, D/64]` of the activation dtype, `len` valid positions, growth in `KV_STEP`
+//! quanta. The growth charge covers the cache only, as in the Flash-Next decoder (decision
+//! 0039 amendment), and stays LOGICAL — `len` positions of growth bytes per layer, from the
+//! cache form and the activation dtype — so the capacity slack, bounded by one `KV_STEP` of
+//! growth bytes per attention layer (256 * 4,096 * 10 = 10,485,760 bytes on the real model in
+//! the F32 form; 256 * 1,088 * 10 = 2,785,280 at Q8 with BF16 scales), never enters a permit;
+//! `kv_storage_bytes` reports the stored bytes. The slack bound excludes the growth TRANSIENT —
+//! the old buffer, its slice copy, and the new buffer alive together at a growth, about 100 MB
+//! per layer at depth 8,192 in the F32 form — which the session reserve margin and the retire
+//! cap cover. The fixed DeltaNet state of 65,863,680 bytes is not charged by the steps; a
+//! snapshot charges it once with its entry (decision 0036, addendum 1).
 
 use super::attn::{KvCache, growth_bytes};
 use super::kv_plan::{KV_STEP, session_bytes};
@@ -43,28 +46,38 @@ impl LayerState {
                 rec: rec.share(),
                 ring: ring.share(),
             },
-            Self::Attn(cache) => Self::Attn(KvCache {
-                k: cache.k.as_ref().map(ExecutionTensor::share),
-                v: cache.v.as_ref().map(ExecutionTensor::share),
-                len: cache.len,
-                cap: cache.cap,
-                step: cache.step,
-            }),
+            Self::Attn(cache) => Self::Attn(cache.share()),
         }
     }
 }
 
-/// Bytes that one more token adds to the stored caches of all attention layers.
+/// Bytes that one more token adds to the stored caches of all attention layers, from the cache
+/// form and the activation dtype (packet KV8-INTEGRATE item 5): the F32 control charges
+/// `layers * KVH * D * 2 * 4` and the Q8 form the codes plus the activation-dtype scales and
+/// biases.
 pub(super) fn kv_growth_bytes(weights: &ResidentWeights) -> Result<u64, EngError> {
     let layers = weights
         .layers
         .iter()
         .filter(|layer| matches!(layer.mixer, RMixer::Attn(_)))
         .count();
+    let per_layer = kv_growth_per_layer_bytes(weights)?;
     u64::try_from(layers)
         .ok()
-        .and_then(|layers| growth_bytes(&weights.shape).ok()?.checked_mul(layers))
+        .and_then(|layers| per_layer.checked_mul(layers))
         .ok_or_else(|| EngError::MemoryPlan("kv growth bytes overflow u64".into()))
+}
+
+/// Bytes that one more token adds to the cache of ONE attention layer, from the cache form and
+/// the activation dtype: the logical charge multiplies it by the attention layer count
+/// (`kv_bytes`), so the state keeps this per-layer figure and never the all-layer sum.
+pub(super) fn kv_growth_per_layer_bytes(weights: &ResidentWeights) -> Result<u64, EngError> {
+    let activation = crate::family::qwen36::settings::Activation::of_dtype(weights.consts.act)
+        .ok_or_else(|| EngError::Backend {
+            operation: "qwen36",
+            message: "the decoder holds no known activation dtype".into(),
+        })?;
+    growth_bytes(&weights.shape, weights.kv, activation)
 }
 
 /// Bytes that a chunk of `rows` tokens adds to the stored caches: `rows` positions of
@@ -155,17 +168,12 @@ fn check_saved_layer(
             }
         }
         (RMixer::Attn(_), LayerState::Attn(cache)) => {
-            let kv_shape = [1, dim(a.heads_kv)?, dim(cache.cap)?, dim(a.head_dim)?];
-            let parts_ok = match (&cache.k, &cache.v) {
-                (None, None) => cache.len == 0 && cache.cap == 0,
-                (Some(k), Some(v)) => {
-                    cache.cap >= cache.len
-                        && k.shape() == kv_shape.as_slice()
-                        && v.shape() == kv_shape.as_slice()
-                }
-                _ => false,
-            };
-            if usize::try_from(pos).ok() == Some(cache.len) && parts_ok {
+            // The form and the shapes of every buffer, with no native call (packet
+            // KV8-INTEGRATE: a saved cache of another form or shape is refused).
+            let form_ok = cache
+                .check_buffers(dim(a.heads_kv)?, dim(a.head_dim)?, weights.kv)
+                .is_ok();
+            if usize::try_from(pos).ok() == Some(cache.len) && form_ok {
                 Ok(())
             } else {
                 Err(EngError::BadRequest(
@@ -212,7 +220,8 @@ pub(super) struct ResidentState {
     /// `reset` and drop release them. A failed step keeps the earlier permits until `reset`.
     permits: Vec<GrowthPermit>,
     /// The LOGICAL growth bytes of ONE position of ONE attention layer
-    /// (`attn::growth_bytes(&weights.shape)`), fixed at `zero`. `kv_bytes` multiplies it by the
+    /// (`attn::growth_bytes(&weights.shape, weights.kv, activation)`), fixed at `zero`. `kv_bytes`
+    /// multiplies it by the
     /// attention layer count and the valid length, so a state at `pos` charges exactly
     /// `pos * kv_growth_bytes(weights)` — the all-layer growth — which the permits hold (packet
     /// Q36-KV-INTEGRATE fix1 item 1).
@@ -273,7 +282,7 @@ impl ResidentState {
                     rec: next()?,
                     ring: next()?,
                 },
-                RMixer::Attn(_) => LayerState::Attn(KvCache::with_step(kv_step)),
+                RMixer::Attn(_) => LayerState::Attn(KvCache::with_form(weights.kv, kv_step)),
             });
         }
         Ok(Self {
@@ -281,7 +290,7 @@ impl ResidentState {
             pos: 0,
             poisoned: false,
             permits: Vec::new(),
-            kv_growth_per_layer: growth_bytes(&weights.shape)?,
+            kv_growth_per_layer: kv_growth_per_layer_bytes(weights)?,
             kv_step,
         })
     }
@@ -349,6 +358,7 @@ impl ResidentState {
                     cache.check_buffers(
                         dim(weights.shape.attn.heads_kv)?,
                         dim(weights.shape.attn.head_dim)?,
+                        weights.kv,
                     )?;
                 }
                 _ => {
@@ -556,6 +566,7 @@ mod snapshot_tests {
     use super::super::decoder::{ResidentDecoder, StepMode};
     use super::super::ops::values;
     use super::{KV_STEP, LayerState, ResidentState, kv_storage_bytes};
+    use crate::family::project::Projector;
     use crate::family::qwen36::host_load::HostWeights;
     use crate::family::qwen36::tiny::{self, TINY_GQA};
     use crate::{
@@ -577,6 +588,137 @@ mod snapshot_tests {
         (ckpt, host)
     }
 
+    /// The tiny KV8 checkpoint and its host weights (packet KV8-INTEGRATE): head dimension 64.
+    fn load_kv8() -> (StreamedCheckpoint, HostWeights) {
+        let ckpt = tiny::checkpoint(&tiny::TINY_KV8);
+        let host =
+            HostWeights::load(&ckpt, &tiny::TINY_KV8, &tiny::config(&tiny::TINY_KV8)).unwrap();
+        (ckpt, host)
+    }
+
+    /// A decoder over the KV8 fixture with an explicit cache form and activation, whose session
+    /// budget holds `cap` bytes.
+    fn decoder_kv8<'c>(
+        ckpt: &'c StreamedCheckpoint,
+        host: HostWeights,
+        cap: u64,
+        kv: crate::family::qwen36::settings::KvDtype,
+        activation: crate::family::qwen36::settings::Activation,
+    ) -> ResidentDecoder<'c> {
+        let mut decoder = ResidentDecoder::new_with_kv(
+            MlxKernels::try_new().unwrap(),
+            ckpt,
+            host,
+            32,
+            activation,
+            kv,
+        )
+        .unwrap();
+        decoder.set_session_budget(SessionBudget::new(cap));
+        decoder
+    }
+
+    /// The F32 control and Q8 decoders of the KV8 logits tests: two decoders over one host load
+    /// each, differing only by the cache form.
+    fn control_and_q8(
+        ckpt: &StreamedCheckpoint,
+        activation: crate::family::qwen36::settings::Activation,
+    ) -> (ResidentDecoder<'_>, ResidentDecoder<'_>) {
+        let (control, host) = (
+            HostWeights::load(ckpt, &tiny::TINY_KV8, &tiny::config(&tiny::TINY_KV8)).unwrap(),
+            HostWeights::load(ckpt, &tiny::TINY_KV8, &tiny::config(&tiny::TINY_KV8)).unwrap(),
+        );
+        (
+            decoder_kv8(
+                ckpt,
+                control,
+                1_000_000,
+                crate::family::qwen36::settings::KvDtype::F32,
+                activation,
+            ),
+            decoder_kv8(
+                ckpt,
+                host,
+                1_000_000,
+                crate::family::qwen36::settings::KvDtype::Q8,
+                activation,
+            ),
+        )
+    }
+
+    /// The largest row sum of |W| of a host projection, computed exactly from the basis rows
+    /// (the host linear of the unit vector e_i is column i of the weight): the elementwise
+    /// amplification of the projection.
+    fn row_amp(
+        cpu: &mut crate::family::qwen36::host_cpu::CpuProjector<'_>,
+        weight: &crate::family::flash_next::stored::StoredWeight,
+        cols: usize,
+    ) -> f32 {
+        let mut sums = vec![0f32; 1 << 6];
+        for i in 0..cols {
+            let basis = (0..cols)
+                .map(|j| if j == i { 1.0 } else { 0.0 })
+                .collect::<Vec<f32>>();
+            let column = cpu.linear(weight, &basis).unwrap();
+            for (j, &value) in column.iter().enumerate() {
+                sums[j] += value.abs();
+            }
+        }
+        sums.iter().copied().fold(0f32, f32::max)
+    }
+
+    /// The per-element 8-bit affine error bound and the largest magnitude of the valid F32 cache
+    /// rows of one state (packet KV8-INTEGRATE): per group of 64 lanes the error is at most
+    /// `(max - min) / 510`, measured over the valid positions of both key-value heads of both
+    /// attention caches. A buffer is `[1, KVH, cap, D]`, so element (g, t, d) sits at
+    /// `(g * cap + t) * D + d`, and the slack above `len` does not count.
+    fn q8_error_of(
+        state: &ResidentState,
+        decoder: &mut ResidentDecoder<'_>,
+        width: usize,
+    ) -> (f32, f32) {
+        let hkv = decoder.weights.shape.attn.heads_kv;
+        let groups = width / crate::family::qwen36::settings::Q8_GROUP as usize;
+        let mut range = 0f32;
+        let mut top = 0f32;
+        for layer in state.layers() {
+            let LayerState::Attn(cache) = layer else {
+                continue;
+            };
+            for tensor in cache.tensors() {
+                if tensor.dtype() != crate::tensor::Dtype::F32
+                    || tensor.shape()[3] as usize != width
+                {
+                    continue;
+                }
+                let cap = tensor.shape()[2] as usize;
+                let rows = values(&mut decoder.kernels, tensor).unwrap();
+                for head in 0..hkv {
+                    for position in 0..cache.len {
+                        let lanes = &rows[(head * cap + position) * width..][..width];
+                        for lane in lanes {
+                            top = top.max(lane.abs());
+                        }
+                        for group in 0..groups {
+                            let g = &lanes[group * 64..(group + 1) * 64];
+                            let (mut lo, mut hi) = (f32::INFINITY, f32::NEG_INFINITY);
+                            for &lane in g {
+                                lo = lo.min(lane);
+                                hi = hi.max(lane);
+                            }
+                            range = range.max(hi - lo);
+                        }
+                    }
+                }
+            }
+        }
+        assert!(
+            range > 0.0 && top > 0.0,
+            "the control's cache rows are all zero"
+        );
+        (range / 510.0, top)
+    }
+
     /// A decoder on `ckpt` whose session budget holds `cap` bytes.
     fn decoder_with_cap<'c>(
         ckpt: &'c StreamedCheckpoint,
@@ -596,15 +738,14 @@ mod snapshot_tests {
         }
     }
 
-    /// Every array of `layers` in model order: the DeltaNet state and ring, then keys and values.
+    /// Every array of `layers` in model order: the DeltaNet state and ring, then the cache
+    /// buffers in `KvCache::tensors` order.
     fn arrays(layers: &[LayerState]) -> Vec<&ExecutionTensor> {
         let mut out = Vec::new();
         for layer in layers {
             match layer {
                 LayerState::Delta { rec, ring } => out.extend([rec, ring]),
-                LayerState::Attn(cache) => {
-                    out.extend([cache.k.as_ref(), cache.v.as_ref()].into_iter().flatten())
-                }
+                LayerState::Attn(cache) => out.extend(cache.tensors()),
             }
         }
         out
@@ -637,7 +778,7 @@ mod snapshot_tests {
     /// value (packet Q36-KV-INTEGRATE).
     fn read_state(decoder: &mut ResidentDecoder<'_>, layers: &[LayerState]) -> Vec<Vec<f32>> {
         let shape = &decoder.weights.shape;
-        let (hkv, hd) = (shape.attn.heads_kv as u32, shape.attn.head_dim as u32);
+        let hkv = shape.attn.heads_kv as u32;
         let mut out = Vec::new();
         for layer in layers {
             match layer {
@@ -646,11 +787,25 @@ mod snapshot_tests {
                     out.push(values(&mut decoder.kernels, ring).unwrap());
                 }
                 LayerState::Attn(cache) => {
-                    for tensor in [&cache.k, &cache.v].into_iter().flatten() {
+                    // The F32 buffers read their prefix directly; the U32 codes of the Q8 form
+                    // convert first and BF16 scales cast to F32 (the values of a quantized cache
+                    // never come back by hand).
+                    for tensor in cache.tensors() {
+                        let last = tensor.shape()[3];
                         let prefix = decoder
                             .kernels
-                            .slice(tensor, &[0, 0, 0, 0], &[1, hkv, cache.len as u32, hd])
+                            .slice(tensor, &[0, 0, 0, 0], &[1, hkv, cache.len as u32, last])
                             .unwrap();
+                        let prefix = if tensor.dtype() == crate::tensor::Dtype::U32 {
+                            decoder.kernels.u32_to_f32(&prefix).unwrap()
+                        } else if tensor.dtype() != crate::tensor::Dtype::F32 {
+                            decoder
+                                .kernels
+                                .cast(&prefix, crate::tensor::Dtype::F32)
+                                .unwrap()
+                        } else {
+                            prefix
+                        };
                         out.push(values(&mut decoder.kernels, &prefix).unwrap());
                     }
                 }
@@ -1035,6 +1190,386 @@ mod snapshot_tests {
         );
     }
 
+    /// Packet KV8-INTEGRATE test (a) at the decoder level: eight decode steps of a Q8-cache
+    /// engine against the F32-cache control, both in F32 activation. The tolerance derivation
+    /// (stated): the 8-bit affine error of one cached element is `e = R / 510` (`R` the largest
+    /// group range over the valid rows of both heads of the control's caches, measured in the
+    /// test); one score moves by at most `sqrt(D) * Q_max * e` with the
+    /// RMS-normed query magnitude bounded by `Q_max` 16; the softmax moves total variation by at
+    /// most twice that; one attention output moves by at most `e + V_max * 2 * sqrt(D) * Q_max *
+    /// e`; the o-projection amplifies elementwise by `amp` (its exact largest row sum), and the
+    /// head by `head_amp` (the exact largest row sum of `lm_head`). The factor 16 stands for the
+    /// compounding through the 2 attention layers and the 8 steps; it is a safety factor, not a
+    /// derivation, because the RMS norms, the DeltaNet recurrence, and the discrete top-2 routing
+    /// are not bounded here. The bound is therefore a worst-case guard that catches only a gross
+    /// error; the corrupted-cache test of `attn.rs` supplies the sensitivity to a wrong scale or
+    /// bias. Every logit is finite, and every greedy token of the run is equal (a gate on top of
+    /// the bound: it assumes the tiny vocabulary keeps a top-two gap above the Q8 error, which
+    /// the passing Mac run confirms for this fixture only).
+    #[test]
+    fn eight_q8_decode_steps_match_the_f32_cache_logits_within_the_derived_tolerance() {
+        let _serial = crate::native_test_lock();
+        let (ckpt, host) = load_kv8();
+        let mut cpu = crate::family::qwen36::host_cpu::CpuProjector::new(&ckpt, 1);
+        let view = host.view();
+        let mut amp = 0f32;
+        for layer in &view.layers {
+            if let crate::family::qwen36::host::MixerW::Attn(w) = &layer.mixer {
+                amp = amp.max(row_amp(&mut cpu, w.o, 256));
+            }
+        }
+        let head_amp = row_amp(&mut cpu, view.lm_head, 64);
+        let (mut control, mut quantized) =
+            control_and_q8(&ckpt, crate::family::qwen36::settings::Activation::F32);
+        let mut control_state = control.zero_state().unwrap();
+        let mut q8_state = quantized.zero_state().unwrap();
+        let mut worst = 0f32;
+        for step in 0..8u32 {
+            let token = (step + 1) % 8;
+            let from_control = control
+                .step(&mut control_state, token, StepMode::Logits)
+                .unwrap();
+            let from_q8 = quantized
+                .step(&mut q8_state, token, StepMode::Logits)
+                .unwrap();
+            let (control_logits, q8_logits) = (
+                from_control.logits.as_ref().unwrap(),
+                from_q8.logits.as_ref().unwrap(),
+            );
+            for value in q8_logits {
+                assert!(value.is_finite(), "step {step}: a Q8 logit is not finite");
+            }
+            assert_eq!(
+                from_control.token, from_q8.token,
+                "step {step}: the greedy token differs"
+            );
+            let (e, v_max) = q8_error_of(&control_state, &mut control, 64);
+            let tol = 2.0 * 8.0 * amp * (e + v_max * 2.0 * 8.0 * 16.0 * e) * head_amp;
+            let step_worst = control_logits
+                .iter()
+                .zip(q8_logits)
+                .map(|(&a, &b)| (a - b).abs())
+                .fold(0f32, f32::max);
+            assert!(
+                step_worst <= tol,
+                "step {step}: the Q8 logits differ by {step_worst}, the derived tolerance is                  {tol} (e {e}, v_max {v_max}, amp {amp}, head_amp {head_amp})"
+            );
+            worst = worst.max(step_worst);
+        }
+        println!("q8 decoder logits: worst difference {worst}");
+        assert_eq!(q8_state.pos(), 8, "the Q8 run holds 8 positions");
+    }
+
+    /// Packet KV8-INTEGRATE test (b): the same comparison under BF16 activation, where the Q8
+    /// scales and biases are BF16. Rounding a scale `s` and a bias `b` to BF16 moves a
+    /// reconstructed element `q * s + b` by at most `(255 * |s| + |b|) / 256`, which is
+    /// `(R + |b|) / 256` for a group of range `R` (`255 * |s|` is about `R`) and at most
+    /// `(R + V_max) / 256` because a bias is no larger than the largest magnitude; this term is
+    /// added to `e`. Every other term of the derivation is the one of the F32-activation test.
+    #[test]
+    fn eight_q8_decode_steps_match_the_f32_cache_logits_within_the_derived_tolerance_in_bf16() {
+        let _serial = crate::native_test_lock();
+        let (ckpt, host) = load_kv8();
+        let mut cpu = crate::family::qwen36::host_cpu::CpuProjector::new(&ckpt, 1);
+        let view = host.view();
+        let mut amp = 0f32;
+        for layer in &view.layers {
+            if let crate::family::qwen36::host::MixerW::Attn(w) = &layer.mixer {
+                amp = amp.max(row_amp(&mut cpu, w.o, 256));
+            }
+        }
+        let head_amp = row_amp(&mut cpu, view.lm_head, 64);
+        let activation = crate::family::qwen36::settings::Activation::Bf16;
+        let (mut control, mut quantized) = control_and_q8(&ckpt, activation);
+        let mut control_state = control.zero_state().unwrap();
+        let mut q8_state = quantized.zero_state().unwrap();
+        for step in 0..8u32 {
+            let token = (step + 1) % 8;
+            let from_control = control
+                .step(&mut control_state, token, StepMode::Logits)
+                .unwrap();
+            let from_q8 = quantized
+                .step(&mut q8_state, token, StepMode::Logits)
+                .unwrap();
+            let (control_logits, q8_logits) = (
+                from_control.logits.as_ref().unwrap(),
+                from_q8.logits.as_ref().unwrap(),
+            );
+            for value in q8_logits {
+                assert!(
+                    value.is_finite(),
+                    "step {step}: a BF16 Q8 logit is not finite"
+                );
+            }
+            assert_eq!(
+                from_control.token, from_q8.token,
+                "step {step}: the greedy token differs under BF16"
+            );
+            let (e, v_max) = q8_error_of(&control_state, &mut control, 64);
+            let e = e + (e * 510.0 + v_max) / 256.0;
+            let tol = 2.0 * 8.0 * amp * (e + v_max * 2.0 * 8.0 * 16.0 * e) * head_amp;
+            let step_worst = control_logits
+                .iter()
+                .zip(q8_logits)
+                .map(|(&a, &b)| (a - b).abs())
+                .fold(0f32, f32::max);
+            assert!(
+                step_worst <= tol,
+                "step {step}: the BF16 Q8 logits differ by {step_worst}, the derived tolerance                  is {tol}"
+            );
+        }
+    }
+
+    /// Packet KV8-INTEGRATE test (c) at the decoder level: a Q8 run that crosses two capacity
+    /// growth boundaries (the step quantum 3 against the default 256) is BIT-IDENTICAL to the
+    /// same run that never grows: the quantization of a row and the prefix views never depend on
+    /// the capacity.
+    #[test]
+    fn a_q8_run_across_growth_boundaries_is_bit_identical_to_a_large_step_run() {
+        let _serial = crate::native_test_lock();
+        let (ckpt, host) = load_kv8();
+        let mut small = decoder_kv8(
+            &ckpt,
+            host,
+            1_000_000,
+            crate::family::qwen36::settings::KvDtype::Q8,
+            crate::family::qwen36::settings::Activation::F32,
+        );
+        let mut small_state =
+            ResidentState::zero_with_step(&mut small.kernels, &small.weights, 3).unwrap();
+        let mut large = decoder_kv8(
+            &ckpt,
+            HostWeights::load(&ckpt, &tiny::TINY_KV8, &tiny::config(&tiny::TINY_KV8)).unwrap(),
+            1_000_000,
+            crate::family::qwen36::settings::KvDtype::Q8,
+            crate::family::qwen36::settings::Activation::F32,
+        );
+        let mut large_state = large.zero_state().unwrap();
+        for step in 0..8u32 {
+            let token = (step + 1) % 8;
+            let from_small = small
+                .step(&mut small_state, token, StepMode::Logits)
+                .unwrap();
+            let from_large = large
+                .step(&mut large_state, token, StepMode::Logits)
+                .unwrap();
+            assert_eq!(
+                from_small.token, from_large.token,
+                "step {step}: the token differs across the growth"
+            );
+            assert_eq!(
+                from_small.logits, from_large.logits,
+                "step {step}: the logits differ across the growth"
+            );
+        }
+        assert_eq!(kv_caps(small_state.layers()), vec![9, 9], "two growths");
+        assert_eq!(
+            kv_caps(large_state.layers()),
+            vec![KV_STEP, KV_STEP],
+            "the default quantum never grows in 8 steps"
+        );
+    }
+
+    /// Packet KV8-INTEGRATE test (e), first half: a snapshot taken before further Q8 steps keeps
+    /// its own rows across an in-place append and two growths, and restoring it and running the
+    /// same suffix is bit-identical to the first continuation.
+    #[test]
+    fn a_q8_snapshot_keeps_its_rows_and_restores_to_the_same_tokens() {
+        let _serial = crate::native_test_lock();
+        let (ckpt, host) = load_kv8();
+        let mut decoder = decoder_kv8(
+            &ckpt,
+            host,
+            1_000_000,
+            crate::family::qwen36::settings::KvDtype::Q8,
+            crate::family::qwen36::settings::Activation::F32,
+        );
+        let mut live =
+            ResidentState::zero_with_step(&mut decoder.kernels, &decoder.weights, 3).unwrap();
+        prefill(&mut decoder, &mut live, &[1, 2]);
+        let snapshot = decoder.snapshot(&live).unwrap();
+        let saved = read_state(&mut decoder, &snapshot.layers);
+        // The snapshot holds the live arrays, part by part. A snapshot that swapped two parts
+        // (scales for biases) would still round-trip through a restore that swaps them back, so
+        // the round trip alone cannot see it.
+        assert_eq!(
+            read_state(&mut decoder, live.layers()),
+            saved,
+            "the Q8 snapshot differs from the live state it was taken from"
+        );
+        let suffix = [4u32, 5, 6, 7, 1, 2, 3];
+        let mut straight = Vec::new();
+        for &token in &suffix {
+            straight.push(decoder.step(&mut live, token, StepMode::Record).unwrap());
+        }
+        let after = read_state(&mut decoder, &snapshot.layers);
+        assert_eq!(
+            after, saved,
+            "live Q8 steps (an in-place append on the shared buffers and two growths) changed the snapshot"
+        );
+        assert_eq!(kv_caps(live.layers()), vec![9, 9], "the buffers grew twice");
+        let mut restored = decoder.zero_state().unwrap();
+        decoder.restore(&mut restored, &snapshot).unwrap();
+        for (index, &token) in suffix.iter().enumerate() {
+            let got = decoder
+                .step(&mut restored, token, StepMode::Record)
+                .unwrap();
+            assert_eq!(
+                got.token, straight[index].token,
+                "suffix token {index} differs after the Q8 restore"
+            );
+            assert_eq!(
+                got.logits, straight[index].logits,
+                "suffix token {index} logits differ after the Q8 restore"
+            );
+        }
+        assert_eq!(restored.pos(), 9, "position after the suffix");
+    }
+
+    /// Packet KV8-INTEGRATE test (e), second half: the session A, B, A isolation of the F32 path
+    /// repeated for Q8. Two states restored from ONE Q8 snapshot step DIFFERENT tokens at the
+    /// SAME position; every sharer's append writes the first slack row of the shared buffers, so
+    /// a missed copy makes B's token overwrite A's. Each state's logits are compared bit for bit
+    /// with an independent straight run.
+    #[test]
+    fn two_q8_restores_that_step_different_tokens_match_independent_straight_runs() {
+        let _serial = crate::native_test_lock();
+        let (ckpt, host) = load_kv8();
+        let mut decoder = decoder_kv8(
+            &ckpt,
+            host,
+            1_000_000,
+            crate::family::qwen36::settings::KvDtype::Q8,
+            crate::family::qwen36::settings::Activation::F32,
+        );
+        let mut live =
+            ResidentState::zero_with_step(&mut decoder.kernels, &decoder.weights, 3).unwrap();
+        prefill(&mut decoder, &mut live, &[1, 2]);
+        let snapshot = decoder.snapshot(&live).unwrap();
+        let mut a = decoder.zero_state().unwrap();
+        decoder.restore(&mut a, &snapshot).unwrap();
+        let mut b = decoder.zero_state().unwrap();
+        decoder.restore(&mut b, &snapshot).unwrap();
+        let a_four = decoder.step(&mut a, 4, StepMode::Record).unwrap();
+        let b_five = decoder.step(&mut b, 5, StepMode::Record).unwrap();
+        let a_six = decoder.step(&mut a, 6, StepMode::Record).unwrap();
+        let mut straight_a =
+            ResidentState::zero_with_step(&mut decoder.kernels, &decoder.weights, 3).unwrap();
+        prefill(&mut decoder, &mut straight_a, &[1, 2]);
+        let want_four = decoder.step(&mut straight_a, 4, StepMode::Record).unwrap();
+        let want_six = decoder.step(&mut straight_a, 6, StepMode::Record).unwrap();
+        let mut straight_b =
+            ResidentState::zero_with_step(&mut decoder.kernels, &decoder.weights, 3).unwrap();
+        prefill(&mut decoder, &mut straight_b, &[1, 2]);
+        let want_five = decoder.step(&mut straight_b, 5, StepMode::Record).unwrap();
+        assert_eq!(
+            a_four.token, want_four.token,
+            "A: the token of the first step"
+        );
+        assert_eq!(
+            a_four.logits, want_four.logits,
+            "A: the logits of the first step differ from the straight run"
+        );
+        assert_eq!(
+            a_six.token, want_six.token,
+            "A: the token after the aliased row"
+        );
+        assert_eq!(
+            a_six.logits, want_six.logits,
+            "A: the logits after stepping past the aliased row differ from the straight run"
+        );
+        assert_eq!(b_five.token, want_five.token, "B: the token");
+        assert_eq!(
+            b_five.logits, want_five.logits,
+            "B: the logits differ from the straight run"
+        );
+        assert_eq!((a.pos(), b.pos()), (4, 3), "A moved on and B stayed");
+    }
+
+    /// Packet KV8-INTEGRATE test (f): the stored bytes of a whole Q8 state equal the logical
+    /// charge of its positions plus at most one `KV_STEP` of slack per attention layer. `per_layer`
+    /// is the hand-derived charge of one layer and position on the fixture (two key-value heads of
+    /// width 64, one group per head): per side the codes take 2 * 64 bytes and the scales and
+    /// biases take 2 arrays * 2 heads * 1 group * the scale width, so F32 scales give
+    /// 2 * (128 + 16) = 288 and BF16 scales give 2 * (128 + 8) = 272. The fixture has two
+    /// attention layers.
+    fn q8_state_stores_the_logical_charge(
+        activation: crate::family::qwen36::settings::Activation,
+        per_layer: u64,
+    ) {
+        let _serial = crate::native_test_lock();
+        let (ckpt, host) = load_kv8();
+        let mut decoder = decoder_kv8(
+            &ckpt,
+            host,
+            1_000_000,
+            crate::family::qwen36::settings::KvDtype::Q8,
+            activation,
+        );
+        let mut state = decoder.zero_state().unwrap();
+        let tokens: Vec<u32> = (0..30).map(|t| (t % 7 + 1) as u32).collect();
+        prefill(&mut decoder, &mut state, &tokens);
+        let growth = 2 * per_layer;
+        let logical = u64::from(state.pos()) * growth;
+        let stored = kv_storage_bytes(state.layers());
+        assert_eq!(
+            kv_lens(state.layers()),
+            vec![30, 30],
+            "both Q8 caches hold the run"
+        );
+        assert_eq!(
+            kv_caps(state.layers()),
+            vec![KV_STEP, KV_STEP],
+            "thirty positions of the default quantum hold one step of capacity"
+        );
+        assert_eq!(stored, KV_STEP as u64 * growth, "the exact Q8 storage");
+        assert!(
+            stored <= logical + KV_STEP as u64 * growth,
+            "the storage {stored} exceeds the logical {logical} plus one step of slack per layer"
+        );
+        assert!(
+            stored >= logical,
+            "the buffers hold at least the valid rows: {stored} < {logical}"
+        );
+    }
+
+    #[test]
+    fn the_q8_state_stores_the_logical_charge_plus_the_slack_bound() {
+        q8_state_stores_the_logical_charge(crate::family::qwen36::settings::Activation::F32, 288);
+    }
+
+    #[test]
+    fn the_q8_state_with_bf16_scales_stores_the_logical_charge_plus_the_slack_bound() {
+        q8_state_stores_the_logical_charge(crate::family::qwen36::settings::Activation::Bf16, 272);
+    }
+
+    /// Packet KV8-INTEGRATE test (g): a Q8 decoder refuses a state whose attention cache holds
+    /// the F32 form at `check_step`, with no native call (the host validation of the step, which
+    /// runs before the first native call and before any buffer is consumed).
+    #[test]
+    fn a_q8_decoder_refuses_a_state_of_the_f32_form_before_any_native_call() {
+        let _serial = crate::native_test_lock();
+        let (ckpt, host) = load_kv8();
+        let mut decoder = decoder_kv8(
+            &ckpt,
+            host,
+            1_000_000,
+            crate::family::qwen36::settings::KvDtype::Q8,
+            crate::family::qwen36::settings::Activation::F32,
+        );
+        let mut state = decoder.zero_state().unwrap();
+        prefill(&mut decoder, &mut state, &[1]);
+        if let LayerState::Attn(cache) = &mut state.layers[1] {
+            cache.kv = crate::family::qwen36::settings::KvDtype::F32;
+        }
+        let refused = state.check_step(&decoder.weights, 32);
+        assert!(
+            matches!(&refused, Err(EngError::BadRequest(m)) if m.contains("form")),
+            "an F32-form cache under a Q8 engine: {:?}",
+            refused.err()
+        );
+    }
+
     /// A saved layer whose recurrent state shape differs from the model layout is refused with
     /// `BadRequest` before the restore shares anything.
     #[test]
@@ -1105,34 +1640,27 @@ mod snapshot_tests {
         assert_eq!(target.pos(), 0, "the target is unchanged");
     }
 
-    /// A saved attention cache that holds half a key-value pair is refused with `BadRequest`, in
-    /// both directions.
+    /// A saved attention cache whose declared form does not match its buffers is refused with
+    /// `BadRequest` (packet KV8-INTEGRATE item 7g). The half-filled pair of the old
+    /// `Option`-per-side layout is now a TYPE error - the `KvBuffers` enum cannot express it -
+    /// so the runtime refusal that stays is the form mismatch: a cache that claims the Q8 form
+    /// while holding the F32 buffers.
     #[test]
-    fn a_restore_rejects_a_saved_cache_that_holds_half_a_key_value_pair() {
+    fn a_restore_rejects_a_saved_cache_whose_form_does_not_match_its_buffers() {
         let _serial = crate::native_test_lock();
         let (ckpt, host) = load();
         let mut decoder = decoder_with_cap(&ckpt, host, 100_000);
         let mut live = decoder.zero_state().unwrap();
         prefill(&mut decoder, &mut live, &[1, 2, 3]);
         let mut target = decoder.zero_state().unwrap();
-        let mut missing_v = decoder.snapshot(&live).unwrap();
-        if let LayerState::Attn(cache) = &mut missing_v.layers[1] {
-            cache.v = None;
+        let mut wrong_form = decoder.snapshot(&live).unwrap();
+        if let LayerState::Attn(cache) = &mut wrong_form.layers[1] {
+            cache.kv = crate::family::qwen36::settings::KvDtype::Q8;
         }
-        let rejected = decoder.restore(&mut target, &missing_v);
+        let rejected = decoder.restore(&mut target, &wrong_form);
         assert!(
             matches!(&rejected, Err(EngError::BadRequest(_))),
-            "a cache without its values: {:?}",
-            rejected.err()
-        );
-        let mut missing_k = decoder.snapshot(&live).unwrap();
-        if let LayerState::Attn(cache) = &mut missing_k.layers[1] {
-            cache.k = None;
-        }
-        let rejected = decoder.restore(&mut target, &missing_k);
-        assert!(
-            matches!(&rejected, Err(EngError::BadRequest(_))),
-            "a cache without its keys: {:?}",
+            "a cache whose form does not match its buffers: {:?}",
             rejected.err()
         );
         assert_eq!(target.pos(), 0, "the target is unchanged");
@@ -1150,8 +1678,7 @@ mod snapshot_tests {
         let mut wrong = decoder.snapshot(&live).unwrap();
         // Layer 1 is attention: its cache claims three positions and holds no arrays.
         if let LayerState::Attn(cache) = &mut wrong.layers[1] {
-            cache.k = None;
-            cache.v = None;
+            cache.buffers = None;
         }
         let mut target = decoder.zero_state().unwrap();
         let rejected = decoder.restore(&mut target, &wrong);

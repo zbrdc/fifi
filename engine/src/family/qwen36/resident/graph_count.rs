@@ -250,12 +250,14 @@ fn decode_graph_primitives() {
         "config.json differs from the pinned checkpoint"
     );
     let host = HostWeights::load(&real.ckpt, &QWEN3_6_35B_A3B, &real.config).unwrap();
-    let mut decoder = ResidentDecoder::new_with_activation(
+    let kv = super::real::kv_dtype_from_env();
+    let mut decoder = ResidentDecoder::new_with_kv(
         MlxKernels::try_new().unwrap(),
         &real.ckpt,
         host,
         DEFAULT_CONTEXT_LIMIT,
         activation,
+        kv,
     )
     .unwrap();
     let mut state = decoder.zero_state().unwrap();
@@ -301,6 +303,7 @@ fn decode_graph_primitives() {
     let report = serde_json::json!({
         "tool": "fifi decode_graph_primitives (mlx_print_graph)",
         "activation_dtype": super::super::settings::activation_name(activation),
+        "kv_dtype": super::super::settings::kv_dtype_name(kv),
         "depth": DEPTH,
         "decode_token": ids[DEPTH],
         "outputs_dumped": outputs_dumped,

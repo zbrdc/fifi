@@ -309,11 +309,11 @@ use super::tool_forward::{
 
 #[cfg(all(feature = "native-mlx", target_os = "macos", target_arch = "aarch64"))]
 use {
-    super::super::settings::{activation_name, chunked_prefill_allowed},
+    super::super::settings::{activation_name, chunked_prefill_allowed, kv_dtype_name},
     super::chunk_plan::{ChunkCost, PrefillTerms, admitted_chunk},
     super::decoder::{ResidentDecoder, StepMode, StepResult},
     super::parity::{CONFIG_SHA256, sha256},
-    super::real::{env_path, open},
+    super::real::{env_path, kv_dtype_from_env, open},
     super::state::ResidentState,
     super::within_mode::{BankConfig, env_number, run_pieces},
     crate::family::{
@@ -719,8 +719,9 @@ fn decode_phase_timing_by_mode() {
     kernels.set_cache_limit(CACHE_LIMIT).unwrap();
     let host = HostWeights::load(&real.ckpt, &QWEN3_6_35B_A3B, &real.config).unwrap();
     let heads_q = u64::try_from(host.shape().attn.heads_q).unwrap();
+    let kv = kv_dtype_from_env();
     let mut decoder =
-        ResidentDecoder::new_with_activation(kernels, &real.ckpt, host, CONTEXT_LIMIT, activation)
+        ResidentDecoder::new_with_kv(kernels, &real.ckpt, host, CONTEXT_LIMIT, activation, kv)
             .unwrap();
     decoder.budget = SessionBudget::new(SESSION_CAP);
     let mut state = decoder.zero_state().unwrap();
@@ -856,6 +857,7 @@ fn decode_phase_timing_by_mode() {
         "config_sha256": sha256(&real.config),
         "ids": ids_report,
         "activation_dtype": activation_name(activation),
+        "kv_dtype": kv_dtype_name(kv),
         "timed_tokens_per_case": timed,
         "warmup_tokens": WARMUP_TOKENS,
         "depths": depths,
@@ -949,8 +951,9 @@ fn prefill_rate_by_depth_segment() {
     kernels.set_cache_limit(CACHE_LIMIT).unwrap();
     let host = HostWeights::load(&real.ckpt, &QWEN3_6_35B_A3B, &real.config).unwrap();
     let heads_q = u64::try_from(host.shape().attn.heads_q).unwrap();
+    let kv = kv_dtype_from_env();
     let mut decoder =
-        ResidentDecoder::new_with_activation(kernels, &real.ckpt, host, CONTEXT_LIMIT, activation)
+        ResidentDecoder::new_with_kv(kernels, &real.ckpt, host, CONTEXT_LIMIT, activation, kv)
             .unwrap();
     decoder.budget = SessionBudget::new(SESSION_CAP);
     let mut state = decoder.zero_state().unwrap();
@@ -1019,6 +1022,7 @@ fn prefill_rate_by_depth_segment() {
         "test": "prefill_rate_by_depth_segment",
         "checkpoint": ckpt_dir.display().to_string(),
         "activation_dtype": activation_name(activation),
+        "kv_dtype": kv_dtype_name(kv),
         "serving_chunk_requested": serve_setting,
         "serving_chunk": chunk,
         "chunk_piece": piece,

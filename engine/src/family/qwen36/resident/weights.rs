@@ -411,6 +411,11 @@ pub(super) struct ResidentWeights {
     pub(super) final_norm: ExecutionTensor,
     pub(super) layers: Vec<RLayer>,
     pub(super) consts: Consts,
+    /// The form of the attention KV cache (packet KV8-INTEGRATE): `F32` at import; the decoder
+    /// constructor sets `Q8` for a Q8 engine after the head-dimension check, and nothing mutates
+    /// it afterwards. `ResidentState::zero_with` reads it for every cache, and `check_step`
+    /// refuses a cache of another form.
+    pub(super) kv: crate::family::qwen36::settings::KvDtype,
 }
 
 impl ResidentWeights {
@@ -488,6 +493,7 @@ impl ResidentWeights {
             final_norm,
             layers,
             consts,
+            kv: crate::family::qwen36::settings::KvDtype::F32,
         })
     }
 

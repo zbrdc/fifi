@@ -1,7 +1,8 @@
 //! Chunk step assembly (packet Q36-E6; decision 0044 items 1, 4, 8, and 9 without the page pool).
 //!
-//! `prefill` runs `T` prompt tokens. It splits them into chunks of at most `chunk_rows` tokens and
-//! runs each chunk layer by layer: layer 1 over all rows, then layer 2, and so on. A chunk of one
+//! `prefill` runs `T` prompt tokens. It splits them into chunks of at most `chunk_rows` tokens
+//! (each part at most the depth-aware size of `kv_plan::depth_ranges`, so the score matrix of a deep
+//! chunk stays within its budget) and runs each chunk layer by layer: layer 1 over all rows, then layer 2, and so on. A chunk of one
 //! row runs the same blocks with `T = 1`. Every chunk but the last runs in `Prompt` mode, and the
 //! last chunk runs in the requested mode. The head reads the last row only.
 //!
@@ -32,20 +33,23 @@
 //! combine convert at the block edges — and the same dtype guard runs after each norm, after each
 //! layer, and on every state tensor before the final `evaluate`; on the last layer of a `Prompt`
 //! chunk, where the head and the post norm are skipped, the guard runs on the layer's `mid` itself
-//! (fix1 of packet Q36-BF16-b). The key-value cache, the DeltaNet state, and the convolution ring
-//! stay F32 whatever the activation dtype, and the recorded rows read back as F32. An F32 decoder
-//! builds the same graph as before the packet: every cast shares the tensor it would have copied.
+//! (fix1 of packet Q36-BF16-b). The DeltaNet state and the convolution ring stay F32 whatever
+//! the activation dtype, the key-value cache keeps its form's dtypes (packet KV8-INTEGRATE: F32
+//! keys and values, or U32 codes beside activation-dtype scales and biases), and the recorded
+//! rows read back as F32. An F32 decoder with the F32 cache form builds the same graph as before
+//! the packet: every cast shares the tensor it would have copied.
 
-use super::super::chunk_plan::{
-    PREFILL_RETIRE_CAP, delta_retire_per_token, delta_subchunk, ranges,
-};
+use super::super::attn::KvBuffers;
+use super::super::chunk_plan::{PREFILL_RETIRE_CAP, delta_retire_per_token, delta_subchunk};
 use super::super::decoder::{ResidentDecoder, StepMode, StepResult};
+use super::super::kv_plan::{SCORE_BUDGET_BYTES, depth_ranges};
 use super::super::moe::Routing;
 use super::super::ops::{Ctx, cast_to, dim, linear, short_import, to_act, values};
 use super::super::state::{LayerState, ResidentState, chunk_growth_bytes};
 use super::super::step::{check_dtype, read_token, split_rows};
 use super::super::weights::RMixer;
 use super::{attn, delta, moe};
+use crate::family::qwen36::settings::KvDtype;
 use crate::{
     EngError,
     family::flash_next::stored::{self, SlicedWeight},
@@ -81,6 +85,18 @@ fn row_count(tokens: &[u32]) -> Result<u32, EngError> {
         .ok_or_else(|| bad("a prefill needs between one and u32::MAX tokens"))
 }
 
+/// The query repeats per key-value head (`QH / KVH`, 8 on the real model): the width of the
+/// score matrix that the depth-aware chunk bound plans with (packet KV8-INTEGRATE item 6).
+fn repeat_count(shape: &crate::family::qwen36::host::HostShape) -> Result<u64, EngError> {
+    let (heads_q, heads_kv) = (shape.attn.heads_q, shape.attn.heads_kv);
+    if heads_kv == 0 || heads_q % heads_kv != 0 {
+        return Err(bad(
+            "the query heads are not a multiple of the key-value heads",
+        ));
+    }
+    u64::try_from(heads_q / heads_kv).map_err(|_| bad("the query repeat count exceeds u64"))
+}
+
 /// Runs `tokens` as a prefill and publishes the state after them. See `ResidentDecoder::prefill`.
 ///
 /// The host checks of the whole prompt come first: a poisoned state, an empty prompt, and a prompt
@@ -98,7 +114,16 @@ pub(in super::super) fn prefill(
 ) -> Result<StepResult, EngError> {
     let rows = row_count(tokens)?;
     state.check_chunk(&decoder.weights, decoder.context_limit, rows)?; // the whole prompt
-    let parts = ranges(rows, decoder.chunk_rows)?;
+    // The depth-aware split (packet KV8-INTEGRATE item 6): a deterministic function of the
+    // prompt length, the start position, and the chunk setting, so snapshots and prefix reuse
+    // see the same boundaries on a recompute. It applies to both KV forms.
+    let parts = depth_ranges(
+        state.pos(),
+        rows,
+        decoder.chunk_rows,
+        repeat_count(&decoder.weights.shape)?,
+        SCORE_BUDGET_BYTES,
+    )?;
     let mut result = None;
     for (index, &(start, stop)) in parts.iter().enumerate() {
         let part = usize::try_from(start)
@@ -305,19 +330,33 @@ fn run(
     } else {
         None
     };
-    // Packet Q36-BF16-b: the recurrent state, the convolution ring, and the key-value cache stay
-    // F32 whatever the activation dtype, and the chunk refuses a graph that planned otherwise.
+    // Packet Q36-BF16-b: the recurrent state and the convolution ring stay F32 whatever the
+    // activation dtype; the key-value cache keeps its form's dtypes (packet KV8-INTEGRATE), and
+    // the chunk refuses a graph that planned otherwise.
     for layer in &layers {
         match layer {
             LayerState::Delta { rec, ring } => {
                 check_dtype("recurrent state", rec, Dtype::F32)?;
                 check_dtype("convolution ring", ring, Dtype::F32)?;
             }
-            LayerState::Attn(cache) => {
-                for tensor in [&cache.k, &cache.v].into_iter().flatten() {
-                    check_dtype("key-value cache", tensor, Dtype::F32)?;
+            LayerState::Attn(cache) => match cache.kv {
+                KvDtype::F32 => {
+                    if let Some(KvBuffers::F32 { k, v }) = &cache.buffers {
+                        check_dtype("key-value cache", k, Dtype::F32)?;
+                        check_dtype("key-value cache", v, Dtype::F32)?;
+                    }
                 }
-            }
+                KvDtype::Q8 => {
+                    if let Some(KvBuffers::Q8 { k, v }) = &cache.buffers {
+                        for (side, tensor) in [("key codes", &k.codes), ("value codes", &v.codes)] {
+                            check_dtype(side, tensor, Dtype::U32)?;
+                        }
+                        for tensor in [&k.scales, &k.biases, &v.scales, &v.biases] {
+                            check_dtype("key-value scales", tensor, ctx.consts.act)?;
+                        }
+                    }
+                }
+            },
         }
     }
     // One evaluate of the new state and the head outputs. A device-routed chunk also evaluates
@@ -333,7 +372,7 @@ fn run(
     for layer in &layers {
         match layer {
             LayerState::Delta { rec, ring } => outputs.extend([rec, ring]),
-            LayerState::Attn(cache) => outputs.extend([&cache.k, &cache.v].into_iter().flatten()),
+            LayerState::Attn(cache) => outputs.extend(cache.tensors()),
         }
     }
     if let Some((logits, next)) = &head {
@@ -1021,7 +1060,7 @@ mod tests {
                     assert_eq!(ring.dtype(), Dtype::F32, "layer {l} ring dtype");
                 }
                 LayerState::Attn(cache) => {
-                    for tensor in [&cache.k, &cache.v].into_iter().flatten() {
+                    for tensor in cache.tensors() {
                         assert_eq!(tensor.dtype(), Dtype::F32, "layer {l} cache dtype");
                     }
                 }
@@ -1108,7 +1147,7 @@ mod tests {
                     assert_eq!(ring.dtype(), Dtype::F32, "layer {l} ring dtype");
                 }
                 LayerState::Attn(cache) => {
-                    for tensor in [&cache.k, &cache.v].into_iter().flatten() {
+                    for tensor in cache.tensors() {
                         assert_eq!(tensor.dtype(), Dtype::F32, "layer {l} cache dtype");
                     }
                 }
