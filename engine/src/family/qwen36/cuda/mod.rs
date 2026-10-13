@@ -34,6 +34,7 @@ mod mixer_weights;
 mod moe;
 #[cfg(test)]
 mod ops_tests;
+mod pinned;
 mod readback;
 #[cfg(test)]
 mod readback_tests;
@@ -50,6 +51,13 @@ mod run_report;
 mod run_report_tests;
 #[cfg(test)]
 mod shape_tests;
+pub(crate) mod start;
+#[cfg(test)]
+mod start_health_tests;
+#[cfg(test)]
+mod start_pins;
+#[cfg(test)]
+mod start_tests;
 mod state;
 mod state_layout;
 mod step;

@@ -31,6 +31,11 @@ use crate::{
 /// the engine state stays `Loading` until the weights are resident. Returns the engine and the
 /// pinned tokenizer bundle that renders and encodes its prompts.
 pub(crate) fn start(settings: &Q36Settings) -> Result<(Engine, TokenizerBundle), EngError> {
+    if settings.capture {
+        // `capture` is a CUDA key; one config schema serves both arms, so the MLX arm reads
+        // it, ignores it, and says so on start-up (CUDA-SERVE-1 2.3).
+        eprintln!("q36: capture is a CUDA key and is ignored on this arm");
+    }
     let bundle = TokenizerBundle::load(&settings.tokenizer_dir, &tokenizer_pin()?)?;
     let eos = bundle.eos_token_ids().to_vec();
     let sampler_vocab = usize::try_from(bundle.vocab_size())

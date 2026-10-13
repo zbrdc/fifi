@@ -1561,7 +1561,7 @@ mod tests {
     }
 
     use crate::family::qwen36::{
-        settings::{NO_BUDGET_PIECE, Q36Env, Q36Options, Q36Settings},
+        settings::{Backend, NO_BUDGET_PIECE, Q36Env, Q36Options, Q36Settings},
         start::plan_prefill,
     };
 
@@ -1579,7 +1579,14 @@ mod tests {
             ..options
         };
         let env = Q36Env::default();
-        Q36Settings::new(Path::new("/m"), Path::new("/t"), Some(&options), &env).unwrap()
+        let built = Q36Settings::new(
+            Path::new("/m"),
+            Path::new("/t"),
+            Some(&options),
+            &env,
+            Backend::Mlx,
+        );
+        built.unwrap()
     }
 
     /// What one served job shows: the start-up line, the planned chunk, the chunk log, and the

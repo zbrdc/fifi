@@ -47,6 +47,14 @@ const CHAT_TEMPLATE_SHA256: &str =
 const GENERATION_CONFIG_SHA256: &str =
     "e70c136c1b78ddc1fb0905bac8e733a4dc448d4f852a5dd75143fffc70be550e";
 
+/// The backend a build serves Q36 from (CUDA-SERVE-1 2.4): MLX on Apple Silicon, CUDA on
+/// Linux with `native-cuda`; a build with neither keeps the MLX reading, as before.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Backend {
+    Mlx,
+    Cuda,
+}
+
 /// The `qwen36` object of an engine entry. Every member is optional.
 #[derive(Clone, Debug, Default, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
@@ -76,6 +84,8 @@ pub(crate) struct Q36Options {
     /// `bf16`. It also picks the scale storage: `bf16` keeps the stored BF16 scales and biases,
     /// `f32` keeps the G0 widening, and the decoder constructor refuses any other pairing.
     pub(crate) activation_dtype: Option<String>,
+    /// Graph capture of the CUDA arm (default false, gate G1 eager); the MLX arm ignores it.
+    pub(crate) capture: Option<bool>,
 }
 
 /// The environment fallbacks, read by the caller so that this file stays pure.
@@ -191,6 +201,11 @@ pub(crate) struct Q36Settings {
     /// The dtype of the decode activations (packet Q36-BF16-a), which also picks the scale storage.
     /// The default is `bf16`.
     pub(crate) activation: Activation,
+    /// Graph capture of the CUDA arm; the MLX arm ignores it with one start line.
+    pub(crate) capture: bool,
+    /// The MLX-only keys the CUDA arm ignores (in `Q36Options` order); the start logs one
+    /// line per name. Empty on the MLX arm.
+    pub(crate) ignored_mlx_keys: Vec<&'static str>,
 }
 
 fn bad(message: String) -> EngError {
@@ -311,52 +326,110 @@ fn cache_growth_per_position(spec: &FamilySpec) -> Result<u64, EngError> {
         .ok_or_else(|| bad("the cache growth per position overflows u64".into()))
 }
 
+/// Refuses one MLX chunked-prefill key on the CUDA arm, naming it: the arm prefills one token
+/// per step until CPF lands, so accepting the key would promise a speed it does not have.
+fn refuse_cuda_key(key: &str, value: Option<u64>) -> Result<(), EngError> {
+    if value.is_some() {
+        return Err(bad(format!(
+            "{key} is an MLX chunked-prefill key; the CUDA arm prefills one token per step until CPF"
+        )));
+    }
+    Ok(())
+}
+
+/// The MLX allocator and session keys the CUDA arm ignores (the KV cache is sized by
+/// `context_limit` alone, the prefill runs one token per step): the start logs one line each.
+fn ignored_mlx_keys_of(options: &Q36Options) -> Vec<&'static str> {
+    [
+        (options.cache_limit_bytes.is_some(), "cache_limit_bytes"),
+        (options.session_cap_bytes.is_some(), "session_cap_bytes"),
+        (options.prefill_chunk.is_some(), "prefill_chunk"),
+    ]
+    .into_iter()
+    .filter(|&(set, _)| set)
+    .map(|(_, key)| key)
+    .collect()
+}
+
 impl Q36Settings {
-    /// Checks the directories of the entry and its `qwen36` object (absent means all members
-    /// absent). The config value wins over the environment.
+    /// Checks the entry and its `qwen36` object (absent means all members absent); the config
+    /// value wins over the environment. The backend fixes which keys are read: `Cuda` refuses
+    /// the chunked-prefill budget keys by name and makes the allocator and session keys
+    /// optional (ignored, recorded for the start lines); `Mlx` reads them all.
     pub(crate) fn new(
         model_dir: &Path,
         tokenizer_dir: &Path,
         options: Option<&Q36Options>,
         env: &Q36Env,
+        backend: Backend,
     ) -> Result<Self, EngError> {
         let default = Q36Options::default();
         let options = options.unwrap_or(&default);
-        let prefill_budget = at_least_one("prefill_budget_bytes", options.prefill_budget_bytes)?;
-        let prefill_reserve = prefill_reserve(options, prefill_budget)?;
         let activation = activation_of(options.activation_dtype.as_deref())?;
+        let (prefill_budget, prefill_reserve, ignored_mlx_keys) = match backend {
+            Backend::Mlx => {
+                let budget = at_least_one("prefill_budget_bytes", options.prefill_budget_bytes)?;
+                (budget, prefill_reserve(options, budget)?, Vec::new())
+            }
+            Backend::Cuda => {
+                refuse_cuda_key("prefill_budget_bytes", options.prefill_budget_bytes)?;
+                refuse_cuda_key(
+                    "prefill_session_reserve_bytes",
+                    options.prefill_session_reserve_bytes,
+                )?;
+                (None, 0, ignored_mlx_keys_of(options))
+            }
+        };
+        // The MLX error order of the base: budget, reserve, activation_dtype, cache_limit,
+        // context_limit, session_cap, prefill_chunk (KUBDAN-MSG-71 item 4). `context_limit` is
+        // evaluated BEFORE the second match so a `context_limit` fault reports before a
+        // `session_cap` or `prefill_chunk` fault, as before; the CUDA arm refuses its keys in
+        // the first match and reads none of the second.
+        let context_limit = ranged(
+            "context_limit",
+            options.context_limit,
+            DEFAULT_CONTEXT_LIMIT,
+            2,
+            u32::MAX,
+        )?;
+        let (cache_limit, session_cap, prefill_chunk) = match backend {
+            Backend::Mlx => (
+                cache_limit(options, env)?,
+                ranged(
+                    "session_cap_bytes",
+                    options.session_cap_bytes,
+                    DEFAULT_SESSION_CAP,
+                    1,
+                    u64::MAX,
+                )?,
+                ranged(
+                    "prefill_chunk",
+                    options.prefill_chunk,
+                    if activation == Activation::Bf16 {
+                        BF16_DEFAULT_PREFILL_CHUNK
+                    } else {
+                        DEFAULT_PREFILL_CHUNK
+                    },
+                    1,
+                    MAX_PREFILL_CHUNK,
+                )?,
+            ),
+            // Inert: the CUDA arm reads none of them (the KV is sized by `context_limit`,
+            // the worker piece is `NO_BUDGET_PIECE`).
+            Backend::Cuda => (0, 0, 0),
+        };
         Ok(Self {
             artifact: model_dir.to_path_buf(),
             tokenizer_dir: tokenizer_dir.to_path_buf(),
-            cache_limit: cache_limit(options, env)?,
-            context_limit: ranged(
-                "context_limit",
-                options.context_limit,
-                DEFAULT_CONTEXT_LIMIT,
-                2,
-                u32::MAX,
-            )?,
-            session_cap: ranged(
-                "session_cap_bytes",
-                options.session_cap_bytes,
-                DEFAULT_SESSION_CAP,
-                1,
-                u64::MAX,
-            )?,
-            prefill_chunk: ranged(
-                "prefill_chunk",
-                options.prefill_chunk,
-                if activation == Activation::Bf16 {
-                    BF16_DEFAULT_PREFILL_CHUNK
-                } else {
-                    DEFAULT_PREFILL_CHUNK
-                },
-                1,
-                MAX_PREFILL_CHUNK,
-            )?,
+            cache_limit,
+            context_limit,
+            session_cap,
+            prefill_chunk,
             prefill_budget,
             prefill_reserve,
             activation,
+            capture: options.capture.unwrap_or(false),
+            ignored_mlx_keys,
         })
     }
 
@@ -421,7 +494,7 @@ pub(crate) fn tokenizer_pin() -> Result<TokenizerPin, EngError> {
 #[cfg(test)]
 mod tests {
     use super::{
-        BF16_DEFAULT_PREFILL_CHUNK, DEFAULT_CONTEXT_LIMIT, DEFAULT_PREFILL_CHUNK,
+        BF16_DEFAULT_PREFILL_CHUNK, Backend, DEFAULT_CONTEXT_LIMIT, DEFAULT_PREFILL_CHUNK,
         DEFAULT_SESSION_CAP, NO_BUDGET_PIECE, Q36Env, Q36Options, Q36Settings, activation_name,
         activation_of, cache_growth_per_position, chunked_prefill_allowed, delta_state_bytes,
         digest, scale_pairing_error, tokenizer_pin,
@@ -438,8 +511,16 @@ mod tests {
         }
     }
 
+    fn settings_for(
+        options: Option<&Q36Options>,
+        env: &Q36Env,
+        backend: Backend,
+    ) -> Result<Q36Settings, EngError> {
+        Q36Settings::new(Path::new("/m"), Path::new("/t"), options, env, backend)
+    }
+
     fn settings(options: Option<&Q36Options>, env: &Q36Env) -> Result<Q36Settings, EngError> {
-        Q36Settings::new(Path::new("/m"), Path::new("/t"), options, env)
+        settings_for(options, env, Backend::Mlx)
     }
 
     fn message(result: Result<Q36Settings, EngError>) -> String {
@@ -551,6 +632,8 @@ mod tests {
                 prefill_budget: None,
                 prefill_reserve: 0,
                 activation: super::Activation::Bf16,
+                capture: false,
+                ignored_mlx_keys: Vec::new(),
             }
         );
         assert_eq!(DEFAULT_CONTEXT_LIMIT, 32_768);
@@ -608,6 +691,7 @@ mod tests {
             prefill_budget_bytes: Some(30_000_000_000),
             prefill_session_reserve_bytes: Some(7),
             activation_dtype: Some("f32".to_string()),
+            capture: Some(true),
         };
         let got = settings(Some(&options), &Q36Env::default()).unwrap();
         assert_eq!(got.cache_limit, 5);
@@ -617,6 +701,7 @@ mod tests {
         assert_eq!(got.prefill_budget, Some(30_000_000_000));
         assert_eq!(got.prefill_reserve, 7);
         assert_eq!(got.activation, super::Activation::F32);
+        assert!(got.capture, "every member of the object overrides");
         assert_eq!(got.artifact, PathBuf::from("/m"));
         assert_eq!(got.tokenizer_dir, PathBuf::from("/t"));
     }
@@ -704,6 +789,31 @@ mod tests {
             let got = message(settings(Some(&options), &Q36Env::default()));
             assert_eq!(got, format!("engine config: {want}"));
         }
+    }
+
+    #[test]
+    fn the_mlx_error_order_is_budget_reserve_cache_context_session_chunk() {
+        // The base order (KUBDAN-MSG-71 item 4): `context_limit` reports before the second
+        // match's keys, so `{context_limit: 1, prefill_chunk: 0}` names `context_limit` first.
+        let both = Q36Options {
+            context_limit: Some(1),
+            prefill_chunk: Some(0),
+            ..with_limit()
+        };
+        assert_eq!(
+            message(settings(Some(&both), &Q36Env::default())),
+            "engine config: context_limit must be between 2 and 4294967295, found 1"
+        );
+        let all = Q36Options {
+            context_limit: Some(1),
+            session_cap_bytes: Some(0),
+            prefill_chunk: Some(0),
+            ..with_limit()
+        };
+        assert_eq!(
+            message(settings(Some(&all), &Q36Env::default())),
+            "engine config: context_limit must be between 2 and 4294967295, found 1"
+        );
     }
 
     #[test]
@@ -935,6 +1045,43 @@ mod tests {
             assert!(
                 matches!(digest(text), Err(EngError::Checkpoint(_))),
                 "{text:?}"
+            );
+        }
+    }
+
+    #[cfg(all(feature = "native-cuda", target_os = "linux"))]
+    #[test]
+    fn a_cuda_entry_needs_no_cache_limit_and_refuses_the_prefill_budget_by_name() {
+        // A CUDA entry is configurable with an empty object: no cache limit, no environment.
+        let got = settings_for(None, &Q36Env::default(), Backend::Cuda).unwrap();
+        assert_eq!(
+            (got.context_limit, got.cache_limit, got.capture),
+            (DEFAULT_CONTEXT_LIMIT, 0, false)
+        );
+        // Default options set no MLX key, so NOTHING is recorded for the start lines
+        // (KUBDAN-MSG-71 item 5: the empty case pins the filter of `ignored_mlx_keys_of`).
+        assert!(
+            got.ignored_mlx_keys.is_empty(),
+            "default cuda options record no ignored key: {:?}",
+            got.ignored_mlx_keys
+        );
+        assert_eq!(
+            got.prefill_budget, None,
+            "the CUDA arm plans no budget: the worker piece is NO_BUDGET_PIECE"
+        );
+        for key in ["prefill_budget_bytes", "prefill_session_reserve_bytes"] {
+            let text: String = format!("{{\"{key}\": 5}}");
+            let options: Q36Options = serde_json::from_str(&text).unwrap();
+            assert_eq!(
+                message(settings_for(
+                    Some(&options),
+                    &Q36Env::default(),
+                    Backend::Cuda
+                )),
+                format!(
+                    "engine config: {key} is an MLX chunked-prefill key; the CUDA arm \
+                     prefills one token per step until CPF"
+                )
             );
         }
     }

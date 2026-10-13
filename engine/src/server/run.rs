@@ -80,6 +80,23 @@ fn shutdown_failure(id: &str, report: &ShutdownReport) -> Option<String> {
 /// and the sampling defaults that its `generation_config.json` sets together with the flag of
 /// whether that file supplied them (the start line quotes both).
 fn start_engines(file: &Config) -> Result<(Vec<Engine>, Vec<EngineEntry>), StartupError> {
+    // The CUDA Q36 arm has no prefix reuse until CUDA-SERVE-2, and its refusal is a PRE-PASS
+    // (KUBDAN-MSG-71 item 6): it fires before ANY engine of the file starts, so an entry
+    // listed before the Q36 entry is not built only to be torn down again. Builds whose Q36
+    // arm is the MLX arm — and builds with no Q36 backend, whose entries fail in the factory
+    // with the build's own text — are unaffected.
+    for config in &file.engines {
+        if file.prefix_reuse
+            && config.family == q36_factory::FAMILY
+            && !q36_factory::prefix_reuse_supported()
+        {
+            return Err(StartupError(format!(
+                "engine {} failed to start: prefix_reuse is not supported by the CUDA Q36 \
+                 backend yet (CUDA-SERVE-2); set prefix_reuse to false",
+                config.id
+            )));
+        }
+    }
     let mut engines = Vec::new();
     let mut entries = Vec::new();
     for config in &file.engines {
@@ -395,6 +412,80 @@ mod tests {
         }
     }
 
+    #[cfg(not(any(
+        all(feature = "native-mlx", target_os = "macos", target_arch = "aarch64"),
+        all(feature = "native-cuda", target_os = "linux")
+    )))]
+    #[test]
+    fn a_q36_entry_with_prefix_reuse_keeps_the_no_backend_text() {
+        // KUBDAN-MSG-71 item 3: without a Q36 backend the CUDA-specific prefix-reuse refusal
+        // must not fire; the factory's own refusal names the missing backend. The session cap
+        // covers the prefix-reuse cap rule (2,750,218,240 bytes at the default context limit),
+        // which the factory checks before the backend.
+        let options = Q36Options {
+            cache_limit_bytes: Some(1024),
+            session_cap_bytes: Some(3_000_000_000),
+            ..Q36Options::default()
+        };
+        let error = start_engines(&file_with(vec![q36_config(Some(options))], true))
+            .err()
+            .expect("refused");
+        let text = error.to_string();
+        assert!(
+            text.contains("engine e9 failed to start")
+                && text.contains("this build has no Q36 backend"),
+            "{text}"
+        );
+        assert!(!text.contains("CUDA-SERVE-2"), "{text}");
+    }
+
+    #[cfg(all(feature = "native-cuda", target_os = "linux"))]
+    #[test]
+    fn prefix_reuse_is_refused_for_the_cuda_arm() {
+        // The Q36 arm of this build is the CUDA arm, which has no prefix reuse yet.
+        let error = start_engines(&file_with(vec![q36_config(None)], true))
+            .err()
+            .expect("refused");
+        assert_eq!(
+            error.to_string(),
+            "engine e9 failed to start: prefix_reuse is not supported by the CUDA Q36 backend \
+             yet (CUDA-SERVE-2); set prefix_reuse to false"
+        );
+    }
+
+    #[cfg(all(feature = "native-cuda", target_os = "linux"))]
+    #[test]
+    fn prefix_reuse_is_refused_before_any_engine_starts() {
+        // KUBDAN-MSG-71 item 6: with entries [fake, q36] the refusal must fire BEFORE the fake
+        // engine starts. The fake entry's tokenizer directory is missing, so it would FAIL
+        // startup if it ran first: its error text is the mutant's tell — with the pre-pass the
+        // refusal names the q36 entry alone.
+        let mut broken = engine_config("e1", None);
+        broken.tokenizer_dir = PathBuf::from("/does/not/exist");
+        let error = start_engines(&file_with(vec![broken, q36_config(None)], true))
+            .err()
+            .expect("refused");
+        let text = error.to_string();
+        assert!(
+            text.contains("engine e9 failed to start")
+                && text.contains("prefix_reuse is not supported by the CUDA Q36 backend"),
+            "{text}"
+        );
+        assert!(!text.contains("tokenizer.json"), "{text}");
+    }
+
+    #[cfg(all(feature = "native-cuda", target_os = "linux"))]
+    #[test]
+    fn prefix_reuse_is_accepted_for_other_families() {
+        // The fake family never had the refusal: the flag still reaches every entry.
+        let file = file_with(vec![engine_config("e1", None)], true);
+        let (engines, entries) = start_engines(&file).expect("engines");
+        assert!(entries[0].prefix_reuse);
+        for engine in engines {
+            engine.shutdown();
+        }
+    }
+
     #[test]
     fn a_flash_next_entry_goes_to_the_flash_next_factory_and_its_failure_names_the_engine() {
         let mut flash = engine_config("e8", None);
@@ -427,6 +518,9 @@ mod tests {
         q36
     }
 
+    // The pinned dispatch of the builds whose Q36 settings read the MLX keys: the CUDA arm
+    // ignores `prefill_chunk` by design, so this error cannot occur on a native-cuda build.
+    #[cfg(not(all(feature = "native-cuda", target_os = "linux")))]
     #[test]
     fn the_prefix_reuse_flag_of_the_file_reaches_the_q36_session_cap_rule() {
         let options = Q36Options {
@@ -466,9 +560,11 @@ mod tests {
         // The entry sets its own cache limit, which wins over `Q36_CACHE_LIMIT`, so an inherited
         // value cannot change the error. The missing limit is tested with an injected environment
         // in `family::qwen36::factory` and with a clean process environment in `server_q36_cli`.
+        // `context_limit` is a member that both Q36 arms read and refuse below its minimum of 2,
+        // so one test serves every build.
         let options = Q36Options {
             cache_limit_bytes: Some(1024),
-            prefill_chunk: Some(0),
+            context_limit: Some(1),
             ..Q36Options::default()
         };
         let error = start_engines(&file_with(vec![q36_config(Some(options))], false))
@@ -477,7 +573,7 @@ mod tests {
         let text = error.to_string();
         assert!(
             text.contains("engine e9 failed to start")
-                && text.contains("prefill_chunk must be between 1 and 512, found 0"),
+                && text.contains("context_limit must be between 2 and 4294967295, found 1"),
             "{text}"
         );
     }
@@ -497,13 +593,19 @@ mod tests {
         // check names the cache-limit settings instead.
         assert!(!text.contains("cache_limit_bytes"), "{text}");
         assert!(!text.contains("Q36_CACHE_LIMIT"), "{text}");
-        // A build without the backend stops at the feature check. The Mac build stops at the
-        // pinned loader of the Q36 start path, which words a missing file "is missing from the
-        // checkpoint directory". The development engine, which an entry reaches when the Q36
-        // arm is skipped, also fails on the missing file but words it "could not be read".
-        #[cfg(not(all(feature = "native-mlx", target_os = "macos", target_arch = "aarch64")))]
+        // A build without the backend stops at the feature check. The Mac build and the CUDA
+        // build stop at the pinned loader of their Q36 start path, which words a missing file
+        // "is missing from the checkpoint directory". The development engine, which an entry
+        // reaches when the Q36 arm is skipped, words it "could not be read".
+        #[cfg(not(any(
+            all(feature = "native-mlx", target_os = "macos", target_arch = "aarch64"),
+            all(feature = "native-cuda", target_os = "linux")
+        )))]
         assert!(text.contains("native-mlx"), "{text}");
-        #[cfg(all(feature = "native-mlx", target_os = "macos", target_arch = "aarch64"))]
+        #[cfg(any(
+            all(feature = "native-mlx", target_os = "macos", target_arch = "aarch64"),
+            all(feature = "native-cuda", target_os = "linux")
+        ))]
         {
             assert!(
                 text.contains("tokenizer.json is missing from the checkpoint directory"),

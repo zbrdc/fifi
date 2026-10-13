@@ -162,7 +162,7 @@ use crate::{
             host_cpu::CpuProjector,
             host_load::HostWeights,
             settings::{
-                Activation, Q36Env, Q36Options, Q36Settings, activation_name,
+                Activation, Backend, Q36Env, Q36Options, Q36Settings, activation_name,
                 chunked_prefill_allowed,
             },
         },
@@ -254,6 +254,7 @@ pub(super) fn serve_chunk_setting(activation: Activation) -> u32 {
         Path::new("."),
         Some(&options),
         &Q36Env::default(),
+        Backend::Mlx,
     )
     .unwrap()
     .prefill_chunk

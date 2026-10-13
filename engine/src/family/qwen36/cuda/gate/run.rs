@@ -30,6 +30,7 @@ use crate::{
         qwen36::{
             cuda::{
                 dims::{KvMode, StepDims, StepOptions},
+                pinned::{MIN_FREE_AFTER_LOAD, ROTARY_DIM, head_rows_of},
                 readback::{SYNC_EACH_VAR, parse_sync_each},
                 resources::StepResources,
                 rules::QwenRules,
@@ -46,12 +47,6 @@ use crate::{
 use serde_json::{Value, json};
 use std::path::{Path, PathBuf};
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
-
-/// Rotary dimension of the pinned model (head_dim 256 times the partial-rotary factor 0.25);
-/// the GGUF carries no config.json, and the RD-9b fixtures name the same 64.
-const ROTARY_DIM: u32 = 64;
-/// Less than this many bytes free after the load is a typed refusal, not an error (0040 A2).
-const MIN_FREE_AFTER_LOAD: usize = 1 << 30;
 
 fn bad(text: &str) -> EngError {
     EngError::BadRequest(format!("gate: {text}"))
@@ -204,14 +199,6 @@ fn build_resources(context: &CudaContext, s: &GateSettings) -> Result<StepResour
     let shape = HostShape::from_spec(&QWEN3_6_35B_A3B, ROTARY_DIM)?;
     let dims = StepDims::new(&shape, &inventory)?;
     StepResources::new(context, dims, &inventory, &session_options(s)?)
-}
-
-/// The head width of the pinned model from the host-side dimensions: no context, no device, so
-/// the rules can be checked before any device work (RD-10a-17b item 4).
-fn head_rows_of() -> Result<usize, EngError> {
-    let inventory = Inventory::for_spec(&QWEN3_6_35B_A3B)?;
-    let shape = HostShape::from_spec(&QWEN3_6_35B_A3B, ROTARY_DIM)?;
-    Ok(StepDims::new(&shape, &inventory)?.shape.vocab)
 }
 
 /// The directory the pinned tokenizer bundle sits in: the GGUF's parent directory, never the
