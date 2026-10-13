@@ -79,10 +79,12 @@
 pub(crate) mod add_norm_pack;
 pub(crate) mod add_rmsnorm_q8;
 pub(crate) mod attn_decode;
+pub(crate) mod attn_decode_q8;
 pub(crate) mod attn_prep;
 pub(crate) mod embed;
 pub(crate) mod gdn_conv;
 pub(crate) mod gdn_delta;
+pub(crate) mod kv8_append;
 pub(crate) mod matmul_expert;
 pub(crate) mod matvec_expert;
 pub(crate) mod matvec_q;

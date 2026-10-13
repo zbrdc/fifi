@@ -42,11 +42,13 @@ use super::{
 pub(in crate::kernels::cuda) mod add_norm_pack;
 pub(in crate::kernels::cuda) mod add_rmsnorm_q8;
 pub(in crate::kernels::cuda) mod attn_decode;
+pub(in crate::kernels::cuda) mod attn_decode_q8;
 pub(in crate::kernels::cuda) mod attn_prep;
 pub(in crate::kernels::cuda) mod embed;
 pub(in crate::kernels::cuda) mod gdn_conv;
 pub(in crate::kernels::cuda) mod gdn_delta;
 pub(in crate::kernels::cuda) mod graph;
+pub(in crate::kernels::cuda) mod kv8_append;
 pub(in crate::kernels::cuda) mod matmul_expert;
 pub(in crate::kernels::cuda) mod matmul_q5_0;
 pub(in crate::kernels::cuda) mod matvec_expert;

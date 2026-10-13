@@ -37,6 +37,9 @@ use crate::{
 
 pub(super) mod export;
 
+#[cfg(test)]
+mod tests;
+
 /// Names the element orders of `state_layout.rs`. Change it whenever one of them changes.
 pub(crate) const LAYOUT_TAG: &str = "qwen36-gguf-xq-1";
 const F32: usize = size_of::<f32>();
@@ -116,18 +119,16 @@ pub(crate) struct ResidentState {
 
 impl ResidentState {
     /// Allocates the buffers and zeroes the DeltaNet state and the words, ordered on `stream`,
-    /// which becomes the owning stream. `Int8G32` allocates from RD-8k.
+    /// which becomes the owning stream. `Int8G32` allocates the four KV8 planes of
+    /// `state_layout.rs` and zeroes their codes and scales, so a cell that no step appended
+    /// holds scale 0 and code 0 (it dequantizes to 0, never NaN); the `Fp16` path is unchanged
+    /// (its KV plane holds no valid row until a step appends one, as before).
     pub(crate) fn allocate(
         context: &CudaContext,
         stream: &DeviceStream,
         dims: &StepDims,
         options: &StepOptions,
     ) -> Result<Self, EngError> {
-        if options.kv_mode != KvMode::Fp16 {
-            return Err(EngError::BadRequest(
-                "the Int8G32 KV pool is allocated from RD-8k".to_owned(),
-            ));
-        }
         let layout = StateLayout::new(dims, options)?;
         if layout.delta.total == 0 || layout.kv.total == 0 {
             return Err(EngError::Checkpoint(
@@ -146,12 +147,20 @@ impl ResidentState {
             identity: StateIdentity::new(dims, options.kv_mode),
             book,
         };
+        if matches!(options.kv_mode, KvMode::Int8G32) {
+            state.clear_kv(stream)?;
+        }
         state.reset(stream)?;
         Ok(state)
     }
 
     pub(crate) fn layout(&self) -> &StateLayout {
         &self.layout
+    }
+
+    /// Bytes of the KV pool allocation (the admission term of the layout, not rounded).
+    pub(crate) fn kv_bytes(&self) -> usize {
+        self.kv.bytes()
     }
 
     pub(crate) fn identity(&self) -> &StateIdentity {
@@ -339,6 +348,18 @@ impl ResidentState {
                 self.delta
                     .write_at(stream, conv, &zeros[..pool.conv_values * F32])?;
             }
+        }
+        Ok(())
+    }
+
+    /// Zeroes the whole KV pool in place, ordered on `stream` (the copies run behind all work
+    /// queued on the stream), in bounded host chunks: the Int8G32 codes and scales start at 0.
+    fn clear_kv(&self, stream: &DeviceStream) -> Result<(), EngError> {
+        const CHUNK: usize = 1 << 24; // 16 MiB of staging per copy
+        let zeros = vec![0u8; CHUNK.min(self.layout.kv.total)];
+        for at in (0..self.layout.kv.total).step_by(zeros.len()) {
+            let end = (at + zeros.len()).min(self.layout.kv.total);
+            self.kv.write_at(stream, at, &zeros[..end - at])?;
         }
         Ok(())
     }

@@ -80,6 +80,8 @@ const CUDA_SOURCES: &[&str] = &[
     "src/kernels/cuda/native/resident/mmvq_arch.cu",
     "src/kernels/cuda/native/resident/add_rmsnorm_q8.cu",
     "src/kernels/cuda/native/resident/swiglu_q8.cu",
+    "src/kernels/cuda/native/resident/kv8_append.cu",
+    "src/kernels/cuda/native/resident/attn_decode_q8.cu",
 ];
 
 /// The vendored llama.cpp MMQ sources that compile to objects (MATVEC-PAR S1 c2b). Decision 0049
@@ -105,11 +107,13 @@ const CUDA_HEADERS: &[&str] = &[
     "src/kernels/cuda/native/resident/add_norm_pack.h",
     "src/kernels/cuda/native/resident/add_rmsnorm_q8.h",
     "src/kernels/cuda/native/resident/attn_decode.h",
+    "src/kernels/cuda/native/resident/attn_decode_q8.h",
     "src/kernels/cuda/native/resident/attn_prep.h",
     "src/kernels/cuda/native/resident/embed.h",
     "src/kernels/cuda/native/resident/gdn_conv.h",
     "src/kernels/cuda/native/resident/gdn_delta.h",
     "src/kernels/cuda/native/resident/graph.h",
+    "src/kernels/cuda/native/resident/kv8_append.h",
     "src/kernels/cuda/native/resident/matmul_expert.h",
     "src/kernels/cuda/native/resident/matmul_q5_0.h",
     "src/kernels/cuda/native/resident/matvec_expert.h",
