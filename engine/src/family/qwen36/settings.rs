@@ -365,26 +365,41 @@ impl Q36Settings {
     ) -> Result<Self, EngError> {
         let default = Q36Options::default();
         let options = options.unwrap_or(&default);
-        let activation = activation_of(options.activation_dtype.as_deref())?;
-        let (prefill_budget, prefill_reserve, ignored_mlx_keys) = match backend {
-            Backend::Mlx => {
-                let budget = at_least_one("prefill_budget_bytes", options.prefill_budget_bytes)?;
-                (budget, prefill_reserve(options, budget)?, Vec::new())
-            }
-            Backend::Cuda => {
-                refuse_cuda_key("prefill_budget_bytes", options.prefill_budget_bytes)?;
-                refuse_cuda_key(
-                    "prefill_session_reserve_bytes",
-                    options.prefill_session_reserve_bytes,
-                )?;
-                (None, 0, ignored_mlx_keys_of(options))
-            }
-        };
+        let (prefill_budget, prefill_reserve, activation, cache_limit, ignored_mlx_keys) =
+            match backend {
+                Backend::Mlx => {
+                    let budget =
+                        at_least_one("prefill_budget_bytes", options.prefill_budget_bytes)?;
+                    let reserve = prefill_reserve(options, budget)?;
+                    let activation = activation_of(options.activation_dtype.as_deref())?;
+                    (
+                        budget,
+                        reserve,
+                        activation,
+                        cache_limit(options, env)?,
+                        Vec::new(),
+                    )
+                }
+                Backend::Cuda => {
+                    refuse_cuda_key("prefill_budget_bytes", options.prefill_budget_bytes)?;
+                    refuse_cuda_key(
+                        "prefill_session_reserve_bytes",
+                        options.prefill_session_reserve_bytes,
+                    )?;
+                    (
+                        None,
+                        0,
+                        activation_of(options.activation_dtype.as_deref())?,
+                        0,
+                        ignored_mlx_keys_of(options),
+                    )
+                }
+            };
         // The MLX error order of the base: budget, reserve, activation_dtype, cache_limit,
-        // context_limit, session_cap, prefill_chunk (KUBDAN-MSG-71 item 4). `context_limit` is
-        // evaluated BEFORE the second match so a `context_limit` fault reports before a
-        // `session_cap` or `prefill_chunk` fault, as before; the CUDA arm refuses its keys in
-        // the first match and reads none of the second.
+        // context_limit, session_cap, prefill_chunk (KUBDAN-MSG-71 item 4). `cache_limit` is
+        // computed in the match above, BEFORE `context_limit` and the second match, so a config
+        // with both faults names the cache-limit fault first; the CUDA arm refuses its keys in
+        // the first match, reads no cache limit, and takes only `context_limit` below.
         let context_limit = ranged(
             "context_limit",
             options.context_limit,
@@ -392,9 +407,8 @@ impl Q36Settings {
             2,
             u32::MAX,
         )?;
-        let (cache_limit, session_cap, prefill_chunk) = match backend {
+        let (session_cap, prefill_chunk) = match backend {
             Backend::Mlx => (
-                cache_limit(options, env)?,
                 ranged(
                     "session_cap_bytes",
                     options.session_cap_bytes,
@@ -416,7 +430,7 @@ impl Q36Settings {
             ),
             // Inert: the CUDA arm reads none of them (the KV is sized by `context_limit`,
             // the worker piece is `NO_BUDGET_PIECE`).
-            Backend::Cuda => (0, 0, 0),
+            Backend::Cuda => (0, 0),
         };
         Ok(Self {
             artifact: model_dir.to_path_buf(),
@@ -792,9 +806,12 @@ mod tests {
     }
 
     #[test]
-    fn the_mlx_error_order_is_budget_reserve_cache_context_session_chunk() {
-        // The base order (KUBDAN-MSG-71 item 4): `context_limit` reports before the second
-        // match's keys, so `{context_limit: 1, prefill_chunk: 0}` names `context_limit` first.
+    fn the_mlx_first_error_order_is_budget_reserve_cache_context_session_chunk() {
+        // The base order (KUBDAN-MSG-71 item 4): budget, reserve, cache_limit, context_limit,
+        // session_cap, prefill_chunk. `cache_limit` is computed before `context_limit`, so a
+        // config with BOTH faults names the cache-limit fault first — a missing limit (no
+        // key, no env) or a zero one against `context_limit: 1` — and
+        // `{context_limit: 1, prefill_chunk: 0}` names `context_limit` before the chunk.
         let both = Q36Options {
             context_limit: Some(1),
             prefill_chunk: Some(0),
@@ -813,6 +830,25 @@ mod tests {
         assert_eq!(
             message(settings(Some(&all), &Q36Env::default())),
             "engine config: context_limit must be between 2 and 4294967295, found 1"
+        );
+        // The two pairs with a FAULTING cache limit pin the flip the cases above cannot
+        // see (`with_limit()` never faults the cache limit): the cache-limit fault wins.
+        let no_limit = Q36Options {
+            context_limit: Some(1),
+            ..Q36Options::default()
+        };
+        assert_eq!(
+            message(settings(Some(&no_limit), &Q36Env::default())),
+            "engine config: cache_limit_bytes is missing and Q36_CACHE_LIMIT is not set"
+        );
+        let zero_limit = Q36Options {
+            cache_limit_bytes: Some(0),
+            context_limit: Some(1),
+            ..Q36Options::default()
+        };
+        assert_eq!(
+            message(settings(Some(&zero_limit), &Q36Env::default())),
+            "engine config: the cache limit must be above 0"
         );
     }
 

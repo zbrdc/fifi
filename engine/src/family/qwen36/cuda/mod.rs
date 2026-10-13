@@ -47,6 +47,8 @@ mod native_plan_tests;
 #[cfg(test)]
 mod ops_tests;
 mod pinned;
+#[cfg(test)]
+mod r5_fmt;
 mod readback;
 #[cfg(test)]
 mod readback_tests;

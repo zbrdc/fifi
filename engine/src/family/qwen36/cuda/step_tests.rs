@@ -227,6 +227,32 @@ fn the_native_final_norm_writes_its_own_scratch_row() {
 }
 
 #[test]
+fn the_head_launches_write_every_logits_row() {
+    // m19 (S3c): a head launch that skips its last rows leaves logits unwritten that the
+    // sampler can read (13 of the last 256 ids fall inside its 248,077-wide range), and on
+    // the qualification prompts no such id reaches the top-k, so neither the tokens nor rule C
+    // see it. Both head arms launch the head's full row count, and neither trims it.
+    let body = pinned_text(fn_section("fn lm_head("));
+    let length = body.len();
+    let native = body
+        .find("HeadWeight::Native(head)")
+        .expect("lm_head has a native arm");
+    assert_eq!(
+        body.matches("rows: head.n_rows(),").count(),
+        2,
+        "lm_head ({length} bytes): both head arms launch head.n_rows() rows"
+    );
+    assert!(
+        body[native..].contains("rows: head.n_rows(),"),
+        "lm_head ({length} bytes): the native head launch writes every row"
+    );
+    assert!(
+        !body.contains("head.n_rows() -") && !body.contains("head.n_rows()-"),
+        "lm_head ({length} bytes): a head arm trims its row count"
+    );
+}
+
+#[test]
 fn new_validates_the_step_inputs_before_it_touches_the_context() {
     let body = pinned_text(fn_section("fn new("));
     let length = body.len();

@@ -27,16 +27,17 @@ fn serve_hands_the_capture_setting_to_the_step() {
 }
 
 #[test]
-fn load_options_writes_the_tiled_layout_outright() {
-    // The S2 seam admits two layouts; the serve load carries the tiled one IN ITS OWN TEXT
-    // (MSG-70 condition 8), not through a derived default, so the later `Native` flip is
-    // this one field of `load_options` and nothing else moves.
+fn load_options_writes_the_native_layout_outright() {
+    // The S2 seam admits two layouts; the serve load carries the native one IN ITS OWN TEXT
+    // (MSG-70 condition 8), not through a derived default: the S3c-qualified flip is this one
+    // field of `load_options`, and a mutant back to Tiled (or to a default) fails here.
     let body = pinned(fn_section("fn load_options("));
     assert!(
         body.contains("LoadOptions{"),
         "load_options builds the options itself"
     );
-    assert!(body.contains("layout:WeightLayout::Tiled,"));
+    assert!(body.contains("layout:WeightLayout::Native,"));
+    assert!(!body.contains("WeightLayout::Tiled"));
     assert!(!body.contains("..Default::default()"));
 }
 
@@ -149,6 +150,38 @@ fn the_ignored_key_lines_print_through_the_helper_before_the_bundle() {
         start.contains("forkeyin&settings.ignored_mlx_keys{"),
         "the loop walks the settings' own list"
     );
+}
+
+#[test]
+fn the_sha256_toggle_is_resolved_in_start_not_in_make() {
+    // SERVE-1-F F4: a bad Q36_VERIFY_GGUF_SHA256 spelling must fail FAST, at startup —
+    // start() resolves the toggle before the bundle, the guard and the spawn — while make()
+    // receives only the resolved bool (a mutant that moves the read or the validation onto
+    // the engine thread, after the projector exists, breaks both halves of the pin).
+    let start = pinned(fn_section("fn start("));
+    let resolve = start
+        .find("sha256_wanted(std::env::var(VERIFY_SHA256_VAR).ok().as_deref())?")
+        .expect("start resolves the toggle");
+    let load = start
+        .find("TokenizerBundle::load")
+        .expect("start loads the bundle");
+    assert!(resolve < load, "resolve {resolve}, bundle {load}");
+    let spawn = start
+        .find("spawn_engine(")
+        .expect("start spawns the engine thread");
+    assert!(resolve < spawn, "resolve {resolve}, spawn {spawn}");
+    let make = pinned(fn_section("fn make("));
+    assert!(
+        !make.contains("sha256_wanted(") && !make.contains("std::env::var("),
+        "make must not read or validate the toggle on the engine thread"
+    );
+    // The identity check gates the 20 GB hash on the RESOLVED bool alone.
+    let identity = pinned(fn_section("fn check_gguf_identity("));
+    let gate = identity.find("ifverify{").expect("the verify gate");
+    let hash = identity
+        .find("check_sha256(path,GGUF_SHA256)?;")
+        .expect("the full-file hash");
+    assert!(gate < hash, "gate {gate}, hash {hash}");
 }
 
 #[test]

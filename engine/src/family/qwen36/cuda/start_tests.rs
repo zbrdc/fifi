@@ -148,7 +148,7 @@ fn the_gguf_identity_is_checked_by_name_and_size() {
         Err(EngError::Checkpoint(message)) => message,
         other => panic!("expected Checkpoint, got {other:?}"),
     };
-    let missing = text(check_gguf_identity(&gguf, None));
+    let missing = text(check_gguf_identity(&gguf, false));
     assert!(
         missing.contains("is missing") && missing.contains(GGUF_NAME),
         "{missing}"
@@ -157,12 +157,12 @@ fn the_gguf_identity_is_checked_by_name_and_size() {
     // 20 GB written).
     let file = std::fs::File::create(&gguf).expect("create");
     file.set_len(GGUF_BYTES - 1).expect("truncate");
-    let wrong = text(check_gguf_identity(&gguf, None));
+    let wrong = text(check_gguf_identity(&gguf, false));
     assert!(wrong.contains(&format!("{}", GGUF_BYTES - 1)), "{wrong}");
     assert!(wrong.contains(&GGUF_BYTES.to_string()), "{wrong}");
     file.set_len(GGUF_BYTES).expect("sparse to the pinned size");
     assert!(
-        check_gguf_identity(&gguf, None).is_ok(),
+        check_gguf_identity(&gguf, false).is_ok(),
         "metadata admits the size"
     );
     for (raw, want) in [(None, false), (Some("0"), false), (Some("1"), true)] {
@@ -282,7 +282,7 @@ fn the_load_reserve_covers_the_kv_cache() {
         (671_088_640, 1 << 30, 0)
     );
     assert!(options.drop_page_cache.is_none());
-    // MSG-70 condition 8: the load layout is `Tiled` (the default), written outright — the
-    // later `Native` flip after S3c is this one field of `load_options`.
-    assert_eq!(options.layout, WeightLayout::Tiled);
+    // MSG-70 condition 8: the load layout is written outright; since the S3c qualification
+    // (KUBDAN-MSG-77) it is `Native`, and this one field of `load_options` is the switch.
+    assert_eq!(options.layout, WeightLayout::Native);
 }

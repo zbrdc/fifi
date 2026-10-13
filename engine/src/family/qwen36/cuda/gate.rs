@@ -38,8 +38,8 @@ pub struct GateSettings {
     kv_fp16: bool,
     /// Wall-clock budget of the call in seconds (0 = none); on expiry the report is `incomplete`.
     deadline_secs: u32,
-    /// The LOAD layout of the call (MATVEC-PAR S3b): "tiled" (the default when the key is
-    /// absent) or "native". It chooses only how the tensors are uploaded; the step's layout
+    /// The LOAD layout of the call (MATVEC-PAR S3b): "native" (the default when the key is
+    /// absent, since the S3c qualification) or "tiled". It chooses only how the tensors are uploaded; the step's layout
     /// always follows the loaded weights.
     layout: WeightLayout,
 }
@@ -102,8 +102,8 @@ impl FromStr for GateSettings {
     type Err = EngError;
 
     /// Keys: gguf, gguf_sha256, names, prompts, forced, forced_stream_sha256, gen_tokens, runs,
-    /// capture, kv_fp16, deadline_secs, and the ONE optional key `layout` ("tiled", the default,
-    /// or "native"; MATVEC-PAR S3b). A missing or mistyped key is a typed `BadRequest`, never a
+    /// capture, kv_fp16, deadline_secs, and the ONE optional key `layout` ("native", the default
+    /// since the S3c qualification, or "tiled"; MATVEC-PAR S3b). A missing or mistyped key is a typed `BadRequest`, never a
     /// default.
     fn from_str(text: &str) -> Result<Self, EngError> {
         let v: Value = serde_json::from_str(text)
@@ -120,10 +120,10 @@ impl FromStr for GateSettings {
             capture: flag(&v, "capture")?,
             kv_fp16: flag(&v, "kv_fp16")?,
             deadline_secs: number(&v, "deadline_secs")?,
-            // The ONE optional key (MATVEC-PAR S3b): absent means tiled, anything but "tiled"
-            // and "native" is a typed error naming the key.
+            // The ONE optional key (MATVEC-PAR S3b): absent means native (the S3c-qualified
+            // default), anything but "tiled" and "native" is a typed error naming the key.
             layout: match v.get("layout") {
-                None => WeightLayout::Tiled,
+                None => WeightLayout::Native,
                 Some(value) => match value.as_str() {
                     Some("tiled") => WeightLayout::Tiled,
                     Some("native") => WeightLayout::Native,
@@ -274,13 +274,13 @@ mod tests {
     }
 
     #[test]
-    fn the_layout_member_defaults_to_tiled_and_refuses_other_values() {
+    fn the_layout_member_defaults_to_native_and_refuses_other_values() {
         let s: GateSettings = GOOD.parse().unwrap();
-        assert_eq!(s.layout, WeightLayout::Tiled);
-        let native = GOOD.replace("\"runs\":1", "\"runs\":1,\"layout\":\"native\"");
+        assert_eq!(s.layout, WeightLayout::Native);
+        let tiled = GOOD.replace("\"runs\":1", "\"runs\":1,\"layout\":\"tiled\"");
         assert_eq!(
-            native.parse::<GateSettings>().unwrap().layout,
-            WeightLayout::Native
+            tiled.parse::<GateSettings>().unwrap().layout,
+            WeightLayout::Tiled
         );
         for bad in [
             GOOD.replace("\"runs\":1", "\"runs\":1,\"layout\":\"bogus\""),

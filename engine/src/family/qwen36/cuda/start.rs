@@ -166,7 +166,9 @@ pub(super) fn check_sha256(path: &Path, expected: &str) -> Result<(), EngError> 
 
 /// Checks the pinned identity of the GGUF: the NAME by construction (`pinned_gguf`), the exact
 /// SIZE always (the metadata alone), the full-file SHA-256 only when `verify` asks for it.
-pub(super) fn check_gguf_identity(path: &Path, verify: Option<&str>) -> Result<(), EngError> {
+/// The toggle value itself is resolved by the caller (`start()`, SERVE-1-F F4), so a bad
+/// spelling is refused at startup, before any device work; unset stays OFF with no error.
+pub(super) fn check_gguf_identity(path: &Path, verify: bool) -> Result<(), EngError> {
     let metadata = std::fs::metadata(path).map_err(|_| {
         EngError::Checkpoint(format!(
             "cuda checkpoint: {} is missing (pinned: {GGUF_NAME}, {GGUF_BYTES} bytes)",
@@ -180,7 +182,7 @@ pub(super) fn check_gguf_identity(path: &Path, verify: Option<&str>) -> Result<(
             path.display()
         )));
     }
-    if sha256_wanted(verify)? {
+    if verify {
         check_sha256(path, GGUF_SHA256)?;
     }
     Ok(())
@@ -230,8 +232,9 @@ pub(super) fn kv_cache_bytes(context_tokens: usize) -> Result<u64, EngError> {
 }
 
 /// The load options of the engine: THE ONE PLACE the reserve terms and the load layout live
-/// (MSG-70 condition 8: the layout is written `Tiled` outright — the default — and the later
-/// `Native` flip after S3c is this one field). `work: 0` is right: `CudaProjector::new`
+/// (MSG-70 condition 8: the layout is written outright, never through a derived default). The
+/// layout is `Native` since the S3c qualification of MATVEC-PAR S3b on the 3090 (lane C's
+/// ruling); the step follows the loaded weights, so this one field is the whole switch. `work: 0` is right: `CudaProjector::new`
 /// allocates the matmul workspace BEFORE the admission reads the free figure, so counting it
 /// in `work` too would double-count it.
 pub(super) fn load_options(kv_cache: u64) -> LoadOptions<'static> {
@@ -242,7 +245,7 @@ pub(super) fn load_options(kv_cache: u64) -> LoadOptions<'static> {
             headroom: HEADROOM,
         },
         drop_page_cache: None,
-        layout: WeightLayout::Tiled,
+        layout: WeightLayout::Native,
     }
 }
 
@@ -251,6 +254,11 @@ pub(super) fn load_options(kv_cache: u64) -> LoadOptions<'static> {
 /// one-engine guard, and starts the engine thread. The state is `Loading` until `make` returns;
 /// a load failure leaves `Error` with the message and releases the guard.
 pub(crate) fn start(settings: &Q36Settings) -> Result<(Engine, TokenizerBundle), EngError> {
+    // The toggle is resolved HERE, before any work (SERVE-1-F F4): a bad
+    // `Q36_VERIFY_GGUF_SHA256` spelling is refused at startup, not on the engine thread after
+    // the projector exists; unset stays OFF with no error (`sha256_wanted(None)` is
+    // `Ok(false)`, pinned in start_tests).
+    let verify = sha256_wanted(std::env::var(VERIFY_SHA256_VAR).ok().as_deref())?;
     for key in &settings.ignored_mlx_keys {
         eprintln!("{}", ignored_mlx_line(key));
     }
@@ -267,24 +275,26 @@ pub(crate) fn start(settings: &Q36Settings) -> Result<(Engine, TokenizerBundle),
     })?;
     let guard = BuildGuard::acquire()?;
     let owned = settings.clone();
-    let engine = spawn_engine(piece, move || make(owned, rules, kv_cache, guard))?;
+    let engine = spawn_engine(piece, move || make(owned, rules, kv_cache, verify, guard))?;
     Ok((engine, bundle))
 }
 
 /// The engine-thread half: everything CUDA is built here, in the gate's own order — projector,
 /// memory figure, GGUF identity, open, load with admission, free-after-load floor, the step
 /// options from the loaded layout, step resources, then the leaks, the step and the capture
-/// setting.
+/// setting. The SHA-256 toggle arrives already resolved (`start()` validated it), so this
+/// thread never reads the environment.
 fn make(
     settings: Q36Settings,
     rules: QwenRules,
     kv_cache: u64,
+    verify: bool,
     mut guard: BuildGuard,
 ) -> Result<(QwenResidentStep<'static>, DecodeSession), EngError> {
     let projector = CudaProjector::new()?;
     let before = projector.memory_info()?;
     let gguf = pinned_gguf(&settings.artifact);
-    check_gguf_identity(&gguf, std::env::var(VERIFY_SHA256_VAR).ok().as_deref())?;
+    check_gguf_identity(&gguf, verify)?;
     let model = open_qwen3_6_35b_a3b(&gguf, None)?;
     let loaded = projector.load_model(&model, load_options(kv_cache))?;
     let after = projector.memory_info()?;

@@ -218,9 +218,12 @@ fn read_reference(path: &str) -> Reference {
     let mut top = Vec::new();
     for step in steps.as_array().expect("steps is a list") {
         ids.push(step["argmax"].as_u64().expect("argmax") as u32);
-        let pairs = step["top"]
-            .as_array()
-            .expect("top")
+        // The raw shape names the list `top32`, the oracle shape `top`.
+        let pairs = step
+            .get("top32")
+            .or_else(|| step.get("top"))
+            .and_then(serde_json::Value::as_array)
+            .expect("top32 (raw) or top (oracle)")
             .iter()
             .map(|pair| {
                 (

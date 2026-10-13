@@ -590,7 +590,7 @@ mod tests {
                 "capture_requested": "eager",
                 "gguf_sha256": "ab",
                 "kv_mode": "fp16",
-                "layout": "tiled",
+                "layout": "native",
                 "mem_total": 10,
                 "mem_free_before": 4,
                 "mem_free_after_load": 2,

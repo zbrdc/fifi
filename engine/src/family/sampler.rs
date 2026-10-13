@@ -362,6 +362,23 @@ impl Sampler {
         let temperature = self.params.temperature;
         let top = top_logit(logits);
         let top_k = usize::try_from(self.params.top_k).unwrap_or(usize::MAX);
+        // The open-vocabulary prefix path: with `top_k` off on a row longer than `PREFIX_ROWS`,
+        // rank only the prefix first; when its weights provably vanish inside it (`closed`), the
+        // full row's weight walk would stop at the same weight and total, so the prefix answers
+        // without the full-row sort. Otherwise the full path below runs exactly as before. The
+        // random draw is taken only inside `draw_kept`, after the path is decided, so a fallback
+        // never spends a second draw.
+        if top_k == 0 && logits.len() > PREFIX_ROWS {
+            let prefix = ranked_prefix(logits, PREFIX_ROWS);
+            let (weights, total, closed) = ranked_weights_prefix(&prefix, top, temperature);
+            if closed {
+                #[cfg(test)]
+                sample_path::note_prefix();
+                return self.draw_kept(&prefix, &weights, total);
+            }
+            #[cfg(test)]
+            sample_path::note_fallback();
+        }
         // The ranked candidates. With `top_k` only the best `limit` entries are needed and a
         // bounded heap pulls them in one pass over the row without the full candidate allocation;
         // the open vocabulary takes the whole ranked order so that the normaliser can add the
@@ -390,10 +407,22 @@ impl Sampler {
         temperature: f64,
     ) -> Result<(u32, usize), EngError> {
         let (weights, total) = ranked_weights(ranked, top, temperature);
+        self.draw_kept(ranked, &weights, total)
+    }
+
+    /// The one keep and cumulative walk every path draws through: `weights` are the weights of
+    /// `ranked` in ranked order and `total` their sum. The walk is the reference's, and it takes
+    /// the call's single random draw, so every path into it consumes exactly one draw.
+    fn draw_kept(
+        &mut self,
+        ranked: &[(u32, f32)],
+        weights: &[f64],
+        total: f64,
+    ) -> Result<(u32, usize), EngError> {
         let threshold = self.params.top_p * total;
         let mut keep = 0_usize;
         let mut mass = 0.0_f64;
-        for &w in &weights {
+        for &w in weights {
             mass += w;
             keep += 1;
             if mass >= threshold {
@@ -402,7 +431,7 @@ impl Sampler {
         }
         let target = self.rng.next_unit() * mass;
         let mut cumulative = 0.0_f64;
-        for (entry, &w) in ranked.iter().zip(&weights).take(keep) {
+        for (entry, &w) in ranked.iter().zip(weights).take(keep) {
             cumulative += w;
             if cumulative > target {
                 return Ok((entry.0, keep));
@@ -452,6 +481,12 @@ fn argmax(logits: &[f32]) -> u32 {
 /// The largest `top_k` the bounded heap takes. Above it the heap's `O(n log top_k)` churn costs
 /// more than building the whole ranked order once.
 const HEAP_TOP_K: usize = 4096;
+
+/// The number of ranked entries the prefix path ranks before it falls back to the full ranked
+/// row: with `top_k` off on a row longer than this, the prefix answers only when its weights
+/// provably vanish inside it, which the observed nuclei do by a wide margin at every sampling
+/// temperature in use.
+const PREFIX_ROWS: usize = 1_024;
 
 /// The largest logit as the f64 shift `top` that makes the largest weight exactly 1.
 fn top_logit(logits: &[f32]) -> f64 {
@@ -557,14 +592,47 @@ fn order_key(logit: f32) -> u32 {
     }
 }
 
+/// The present sort's composite rank key of an entry: `(order_key(logit) << 32) | !index`.
+/// Larger keys rank first and the reversed index breaks ties toward the lower index, exactly
+/// as `compare_ranked` orders them; distinct indices give distinct keys, so the key is a total
+/// order and a key sort reproduces the comparator sort.
+fn ranked_key(entry: &(u32, f32)) -> u64 {
+    (u64::from(order_key(entry.1)) << 32) | u64::from(!entry.0)
+}
+
 /// The whole row in ranked order: larger logit first, a tie to the lower index, exactly the
 /// reference sort's order. The composite key (logit key, reversed index) is a total order, so a
 /// key sort reproduces the reference's comparator sort at a fraction of its cost.
 fn ranked_row(logits: &[f32]) -> Vec<(u32, f32)> {
     let mut pairs = candidate_pairs(logits);
-    pairs.sort_unstable_by_key(|&(index, logit)| {
-        (u64::from(order_key(logit)) << 32) | u64::from(!index)
-    });
+    pairs.sort_unstable_by_key(ranked_key);
+    // Ascending keys give (logit up, index down); reversed they give the ranked order.
+    pairs.reverse();
+    pairs
+}
+
+/// The first `rows` entries of the ranked order, in ranked order, found in O(n): a partial
+/// selection moves the `rows` largest composite keys to the back of the row without the full
+/// sort, and the selected entries are sorted by the same key afterwards, because the order of
+/// the elements around the selection point is unspecified. The entries, keys, and tie-breaks
+/// are exactly `ranked_row`'s, so the result is the head of the full ranked row.
+/// `rows >= logits.len()` returns the whole ranked row.
+fn ranked_prefix(logits: &[f32], rows: usize) -> Vec<(u32, f32)> {
+    let rows = rows.min(logits.len());
+    let mut pairs = candidate_pairs(logits);
+    if rows < pairs.len() {
+        if rows == 0 {
+            pairs.clear();
+            return pairs;
+        }
+        // Ascending keys put the `rows` largest entries in the suffix past index `len - rows`;
+        // the selection leaves the order on both sides unspecified, so the suffix is sorted by
+        // the same key afterwards.
+        let at = pairs.len() - rows;
+        pairs.select_nth_unstable_by_key(at, ranked_key);
+        pairs.drain(..at);
+    }
+    pairs.sort_unstable_by_key(ranked_key);
     // Ascending keys give (logit up, index down); reversed they give the ranked order.
     pairs.reverse();
     pairs
@@ -587,12 +655,28 @@ fn ranked_row(logits: &[f32]) -> Vec<(u32, f32)> {
 /// reference's direction for exactly-representable cases (`mass >= threshold` to keep,
 /// `cumulative > target` to return), so no other observable sampling behaviour changes.
 fn ranked_weights(ranked: &[(u32, f32)], top: f64, temperature: f64) -> (Vec<f64>, f64) {
+    let (weights, total, _) = ranked_weights_prefix(ranked, top, temperature);
+    (weights, total)
+}
+
+/// The weights, the normaliser, and whether the tail provably vanished: `closed` is true when
+/// the loop stopped at a weight no larger than a stalled previous one — the same walk over a
+/// longer ranked row stops at the same weight with the same total — and false when every entry
+/// of `ranked` was consumed, so a longer row may still change the total and only the full row
+/// can answer. This is the one loop `ranked_weights` runs.
+fn ranked_weights_prefix(
+    ranked: &[(u32, f32)],
+    top: f64,
+    temperature: f64,
+) -> (Vec<f64>, f64, bool) {
     let mut weights = Vec::with_capacity(ranked.len());
     let mut total = 0.0_f64;
     let mut stalled: Option<f64> = None;
+    let mut closed = false;
     for &(_, logit) in ranked {
         let w = weight(logit, top, temperature);
         if stalled.is_some_and(|previous| w <= previous) {
+            closed = true;
             break;
         }
         let before = total;
@@ -600,14 +684,46 @@ fn ranked_weights(ranked: &[(u32, f32)], top: f64, temperature: f64) -> (Vec<f64
         weights.push(w);
         stalled = (total == before).then_some(w);
     }
-    (weights, total)
+    (weights, total, closed)
+}
+
+/// Test-only bookkeeping of which sampling path answered, so a test can assert that the ranked
+/// prefix answered a peaked row and that the full ranked row answered a flat one. The counters
+/// are per thread and the harness runs each test on its own thread, so parallel tests cannot
+/// pollute each other's counts.
+#[cfg(test)]
+mod sample_path {
+    use std::cell::Cell;
+
+    thread_local! {
+        static PREFIX: Cell<u64> = const { Cell::new(0) };
+        static FALLBACK: Cell<u64> = const { Cell::new(0) };
+    }
+
+    /// Records that the ranked prefix answered a draw.
+    pub(super) fn note_prefix() {
+        PREFIX.with(|count| count.set(count.get() + 1));
+    }
+
+    /// Records that the prefix did not close and the full ranked row answered.
+    pub(super) fn note_fallback() {
+        FALLBACK.with(|count| count.set(count.get() + 1));
+    }
+
+    /// Takes both counters and resets them: (prefix answers, fallback answers).
+    pub(super) fn take() -> (u64, u64) {
+        let prefix = PREFIX.with(|count| count.replace(0));
+        let fallback = FALLBACK.with(|count| count.replace(0));
+        (prefix, fallback)
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::{
-        DEFAULT_TEMPERATURE, LoadedDefaults, Sampler, SamplingDefaults, SamplingParams, SplitMix64,
-        argmax, check_logits, entropy_seed, invalid_logits, ranked_row, ranked_weights,
+        DEFAULT_TEMPERATURE, LoadedDefaults, PREFIX_ROWS, Sampler, SamplingDefaults,
+        SamplingParams, SplitMix64, argmax, check_logits, entropy_seed, invalid_logits,
+        ranked_prefix, ranked_row, ranked_weights, ranked_weights_prefix, sample_path, top_logit,
     };
     use crate::EngError;
     use std::cmp::Ordering;
@@ -1534,6 +1650,212 @@ mod tests {
         }
     }
 
+    // The prefix round against the reference: sizes below, just above, and far above
+    // PREFIX_ROWS (1,000 takes the full path only; 1,025 and up try the prefix first), every
+    // temperature around and beyond the default, all three top_p modes, several seeds, and
+    // consecutive draws from one sampler so the draw sequence stays in step. The kept count is
+    // compared too, so a prefix that answers with a different nucleus than the reference fails
+    // even when the token happens to match.
+    #[test]
+    fn the_prefix_path_matches_the_reference_over_sizes_parameters_and_seeds() {
+        let mut rng = SplitMix64::new(0x5EED_C0FF);
+        for &size in &[1_000_usize, 1_025, 4_096, 248_077] {
+            let logits = random_row(&mut rng, size);
+            // The 248,077-entry vocabulary costs the reference a full sort per draw, so it takes
+            // fewer seeds and draws than the small rows.
+            let (seeds, count) = if size > 100_000 {
+                (4_u64, 4_usize)
+            } else {
+                (8, 8)
+            };
+            for &temperature in &[0.2, 0.7, 1.0, 2.0] {
+                for &top_p in &[0.5, 0.95, 1.0] {
+                    for seed in 0..seeds {
+                        assert_same_draws(
+                            "prefix grid",
+                            &logits,
+                            temperature,
+                            top_p,
+                            0,
+                            seed,
+                            count,
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    // The named adversarial rows at the full vocabulary size through the prefix path: ties in
+    // pairs, one spike first and last, two equal spikes, the tiny-tail row, and the
+    // spread-magnitude row. Seed 0's first unit is 0.8833 (pinned above), so with the two equal
+    // spikes at a closing temperature the draw lands past the first spike's weight and a
+    // reversed tie-break in the prefix would return the other spike; seed 42 spreads the draws
+    // over the other rows.
+    #[test]
+    fn the_prefix_path_matches_the_reference_on_the_named_adversarial_rows() {
+        let rows: [(&str, Vec<f32>); 6] = [
+            ("tie pairs", tie_pairs(248_077)),
+            ("one spike first", one_spike_first(248_077)),
+            ("one spike last", one_spike_last(248_077)),
+            ("two equal spikes", two_equal_spikes(248_077)),
+            ("tiny tail", tiny_tail_row(248_077)),
+            ("spread magnitude", spread_magnitude_row(248_077)),
+        ];
+        for (name, logits) in &rows {
+            for &temperature in &[0.2, 0.7, 1.0, 2.0] {
+                for &top_p in &[0.5, 0.95, 1.0] {
+                    for seed in [0_u64, 42] {
+                        assert_same_draws(name, logits, temperature, top_p, 0, seed, 4);
+                    }
+                }
+            }
+        }
+    }
+
+    // A flat 248,077-entry row at temperature 1.0: every weight is exactly 1.0, so the running
+    // total grows by 1 on each of the 1,024 prefix entries and never stalls — `closed` stays
+    // false and the full ranked row must answer, because the mass keeps growing past the prefix.
+    // The path counter proves the fallback answered, and the draws still match the reference
+    // draw for draw.
+    #[test]
+    fn a_flat_row_at_the_vocabulary_size_takes_the_fallback_and_matches_the_reference() {
+        let logits = vec![0.0_f32; 248_077];
+        let settings = params(1.0, 1.0, 0);
+        let mut sampler = Sampler::new(settings, 0);
+        let got = draws_with_keep(&mut sampler, &logits, 3);
+        assert_eq!(
+            sample_path::take(),
+            (0, 3),
+            "a flat row must fall back to the full ranked row"
+        );
+        let mut reference = Sampler::new(settings, 0);
+        let want = reference_draws_with_keep(&mut reference, &logits, 3);
+        assert_eq!(got, want, "flat row diverged from the reference");
+    }
+
+    // A peaked row: logit 0.0 at index 0 and -40.0 everywhere else. At temperature 1.0 every
+    // tail weight is exp(-40) ≈ 4.2e-18, far below half an ulp of the running total 1.0, so the
+    // second weight stalls the total and the third breaks the loop inside the prefix: `closed`
+    // is true and the prefix must answer. The counter proves the prefix path ran (a fallback
+    // here would leave the fast path dead); the draws match the reference as everywhere else.
+    #[test]
+    fn a_peaked_row_at_the_vocabulary_size_takes_the_prefix_and_matches_the_reference() {
+        let mut logits = vec![-40.0_f32; 248_077];
+        logits[0] = 0.0;
+        let settings = params(1.0, 1.0, 0);
+        let mut sampler = Sampler::new(settings, 0);
+        let got = draws_with_keep(&mut sampler, &logits, 3);
+        assert_eq!(
+            sample_path::take(),
+            (3, 0),
+            "a peaked row must answer from the ranked prefix"
+        );
+        let mut reference = Sampler::new(settings, 0);
+        let want = reference_draws_with_keep(&mut reference, &logits, 3);
+        assert_eq!(got, want, "peaked row diverged from the reference");
+    }
+
+    // A row whose prefix weights stall exactly at a chosen entry of the ranked prefix, derived
+    // by hand. Index 0 holds the top logit 0.0, whose weight is exactly 1. `dense` entries hold
+    // ln(1e-10) ≈ -23.025851, whose weight is about 1e-10 — far above half an ulp (1.1e-16) of a
+    // running total near 1, so no addition among them can leave the total unchanged. `boundary`
+    // entries hold ln(1e-20) ≈ -46.051702, whose weight is about 1e-20 — far below that half
+    // ulp, so the first of them stalls the total and a second, no larger, breaks the loop. Every
+    // other entry holds ln(1e-30), which ranks below all of them. With PREFIX_ROWS 1,024 the
+    // ranked prefix is the top entry, then the `dense` entries, then the `boundary` entries:
+    // `dense` 1,021 with `boundary` 2 puts the stall at entry 1,023 and the break at entry 1,024
+    // (closed, 1,023 weights), and `dense` 1,022 with `boundary` 1 puts the only stall at entry
+    // 1,024, where the prefix runs out before any break (not closed, so the fallback answers).
+    fn boundary_stall_row(dense: usize, boundary: usize, size: usize) -> Vec<f32> {
+        let tail = (-30.0 * std::f64::consts::LN_10) as f32;
+        let dense_logit = (-10.0 * std::f64::consts::LN_10) as f32;
+        let boundary_logit = (-20.0 * std::f64::consts::LN_10) as f32;
+        let mut row = vec![tail; size];
+        for slot in &mut row[1..1 + dense] {
+            *slot = dense_logit;
+        }
+        for slot in &mut row[1 + dense..1 + dense + boundary] {
+            *slot = boundary_logit;
+        }
+        row[0] = 0.0;
+        row
+    }
+
+    // The stall at entry 1,023 with the break at entry 1,024: the prefix closes with exactly
+    // 1,023 weights, its total is bit-for-bit the total the full ranked row produces (the full
+    // row breaks at the same weight), and the prefix answers the draw. This is the last position
+    // at which the prefix can still prove that the tail vanished.
+    #[test]
+    fn a_stall_at_entry_1023_breaks_at_entry_1024_and_the_prefix_answers() {
+        let logits = boundary_stall_row(1_021, 2, 248_077);
+        let prefix = ranked_prefix(&logits, PREFIX_ROWS);
+        assert_eq!(prefix.len(), PREFIX_ROWS, "the prefix must be full size");
+        let top = top_logit(&logits);
+        let (prefix_weights, prefix_total, closed) = ranked_weights_prefix(&prefix, top, 1.0);
+        assert!(closed, "a stall at 1,023 plus a break at 1,024 must close");
+        assert_eq!(
+            prefix_weights.len(),
+            1_023,
+            "weights must stop at the stall"
+        );
+        let (full_weights, full_total) = ranked_weights(&ranked_row(&logits), top, 1.0);
+        assert_eq!(
+            full_weights.len(),
+            1_023,
+            "the full row must break at the same weight"
+        );
+        assert_eq!(
+            prefix_total.to_bits(),
+            full_total.to_bits(),
+            "prefix total {prefix_total} differs from full total {full_total}"
+        );
+        let settings = params(1.0, 1.0, 0);
+        let mut sampler = Sampler::new(settings, 0);
+        let got = draws_with_keep(&mut sampler, &logits, 3);
+        assert_eq!(sample_path::take(), (3, 0), "the prefix must answer");
+        let mut reference = Sampler::new(settings, 0);
+        let want = reference_draws_with_keep(&mut reference, &logits, 3);
+        assert_eq!(got, want, "boundary row diverged from the reference");
+    }
+
+    // The stall at entry 1,024 itself: the prefix runs out of entries before any weight can
+    // break the loop, so `closed` is false even though the very next entry of the full row would
+    // break it, and the fallback must answer. The prefix cannot know what the 1,025th weight is,
+    // so falling back here is the contract, not a missed optimisation; the totals still agree
+    // bit for bit, which documents that only the proof, not the arithmetic, was missing.
+    #[test]
+    fn a_stall_at_entry_1024_exhausts_the_prefix_and_the_fallback_answers() {
+        let logits = boundary_stall_row(1_022, 1, 248_077);
+        let prefix = ranked_prefix(&logits, PREFIX_ROWS);
+        let top = top_logit(&logits);
+        let (prefix_weights, prefix_total, closed) = ranked_weights_prefix(&prefix, top, 1.0);
+        assert!(!closed, "a stall at the last entry cannot break the loop");
+        assert_eq!(
+            prefix_weights.len(),
+            PREFIX_ROWS,
+            "every entry was consumed"
+        );
+        let (full_weights, full_total) = ranked_weights(&ranked_row(&logits), top, 1.0);
+        assert_eq!(
+            full_weights.len(),
+            PREFIX_ROWS,
+            "the full row breaks one later"
+        );
+        assert_eq!(
+            prefix_total.to_bits(),
+            full_total.to_bits(),
+            "prefix total {prefix_total} differs from full total {full_total}"
+        );
+        let settings = params(1.0, 1.0, 0);
+        let mut sampler = Sampler::new(settings, 0);
+        let got = draws_with_keep(&mut sampler, &logits, 3);
+        assert_eq!(sample_path::take(), (0, 3), "the fallback must answer");
+        let mut reference = Sampler::new(settings, 0);
+        let want = reference_draws_with_keep(&mut reference, &logits, 3);
+        assert_eq!(got, want, "boundary row diverged from the reference");
+    }
+
     // The server default (top_k 20, top_p 0.95, temperature 1.0 and 0.7) and its neighbours: the
     // bounded heap must return the same ranked top-k as the reference's sort, including the
     // tie-break that sends a tie to the lower index.
@@ -1604,6 +1926,44 @@ mod tests {
                     per_sample * 1e6
                 );
             }
+        }
+    }
+
+    // Timing harness for the ranked-prefix round. Run:
+    //   cargo test --release --offline --lib -- --ignored --nocapture sample_timing_at_the_vocabulary_size
+    // Three warm-up draws, then thirty timed draws, on a seeded row of 248,077 logits uniform in
+    // [-10, 10), at the five measured points: greedy, the top_k 20 nucleus, and the open-
+    // vocabulary top_k 0 points at temperature 0.2 (top_p 0.95 and 1.0) and 1.0. It prints the
+    // milliseconds per draw and asserts nothing: the numbers are read by a human, before and
+    // after the change under measurement.
+    #[test]
+    #[ignore = "timing harness; run with --ignored --nocapture"]
+    fn sample_timing_at_the_vocabulary_size() {
+        let mut rng = SplitMix64::new(0x0710_2026);
+        let logits: Vec<f32> = (0..248_077)
+            .map(|_| ((rng.next_unit() * 20.0) - 10.0) as f32)
+            .collect();
+        for &(temperature, top_p, top_k) in &[
+            (0.0, 1.0, 0_u32),
+            (0.2, 0.95, 20),
+            (0.2, 0.95, 0),
+            (0.2, 1.0, 0),
+            (1.0, 0.95, 0),
+        ] {
+            let settings = params(temperature, top_p, top_k);
+            let mut sampler = Sampler::new(settings, 1);
+            for _ in 0..3 {
+                sampler.sample(&logits).expect("warm-up sample");
+            }
+            let start = std::time::Instant::now();
+            for _ in 0..30 {
+                sampler.sample(&logits).expect("timed sample");
+            }
+            let per_draw_ms = start.elapsed().as_secs_f64() / 30.0 * 1e3;
+            println!(
+                "vocab 248077, temperature {temperature}, top_p {top_p}, top_k {top_k}: \
+                 {per_draw_ms:.2} ms per draw"
+            );
         }
     }
 }
