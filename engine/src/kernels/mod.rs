@@ -28,7 +28,7 @@ pub(crate) mod mlx;
 #[cfg(all(feature = "native-mlx", target_os = "macos", target_arch = "aarch64"))]
 pub use mlx::{
     BoundedIndices, GatedDeltaOutput, HostPages, MemoryStats, MlxKernels, PackedPages, PageRange,
-    ResidentPackedWeight,
+    QuantizedKv, ResidentPackedWeight,
 };
 
 #[cfg(all(

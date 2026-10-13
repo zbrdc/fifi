@@ -426,6 +426,227 @@ pub(crate) fn float_operands(
     Ok(())
 }
 
+/// The dtype rule of `kv_append` (packet KV8-OPS): F32, BF16 after `allow_bf16`, and now U32 —
+/// the quantized KV cache appends its U32 code rows beside the F32 and BF16 rows it already
+/// served. The caller still requires the two dtypes to be equal. `float_operands` keeps its old
+/// rule for the float-only operations.
+pub(crate) fn kv_append_operands(
+    operation: &'static str,
+    allow_bf16: bool,
+    dtypes: &[Dtype],
+) -> Result<(), EngError> {
+    for &dtype in dtypes {
+        let accepted =
+            dtype == Dtype::F32 || dtype == Dtype::U32 || (allow_bf16 && dtype == Dtype::Bf16);
+        if !accepted {
+            return Err(bad_request(operation, "input dtype must be F32"));
+        }
+    }
+    Ok(())
+}
+
+/// The dtype rule of `quantized_attention_prefix` (packet KV8-OPS): the queries and the four
+/// scale and bias residents are F32, or BF16 after `allow_bf16` (the stored scale dtype of the
+/// quantized cache, as `gather_qmm` takes it), and the two code residents are U32. The scales
+/// and biases of one side must share one dtype, and the two sides must agree.
+pub(crate) fn quantized_kv_operands(
+    operation: &'static str,
+    allow_bf16: bool,
+    queries: Dtype,
+    codes: [Dtype; 2],
+    sides: [[Dtype; 2]; 2],
+) -> Result<(), EngError> {
+    float_operands(
+        operation,
+        allow_bf16,
+        &[queries, sides[0][0], sides[0][1], sides[1][0], sides[1][1]],
+    )?;
+    for &code in &codes {
+        if code != Dtype::U32 {
+            return Err(bad_request(operation, "codes dtype must be U32"));
+        }
+    }
+    if sides[0] != sides[1] || sides[0][0] != sides[0][1] {
+        return Err(bad_request(
+            operation,
+            "scale and bias dtypes must agree across the keys and values",
+        ));
+    }
+    Ok(())
+}
+
+/// The output layouts of `quantize_rows` (packet KV8-OPS).
+pub(crate) struct QuantizeRowsLayout {
+    /// The packed codes, U32 `[.., D * bits / 32]`. The byte count of 4-byte elements is exact.
+    pub(crate) codes: ElementwiseLayout,
+    /// The scales and the biases, `[.., D / group]` of the input dtype. The byte count is the
+    /// F32 count; the caller halves it for a BF16 input.
+    pub(crate) groups: ElementwiseLayout,
+}
+
+/// The portable checks of `quantize_rows` (packet KV8-OPS): `x` has rank at least two, its last
+/// axis is a multiple of `group_size`, and the packed width `D * bits` fills whole U32 words.
+/// `bits` is 8 only for now; widening to 4 bits is the one-line change of this check. The
+/// outputs are codes U32 `[.., D * bits / 32]` and scales and biases `[.., D / group]`.
+pub(crate) fn quantize_rows(
+    operation: &'static str,
+    shape: &[u32],
+    group_size: u32,
+    bits: u32,
+) -> Result<QuantizeRowsLayout, EngError> {
+    check_shape(operation, shape, AxisRule::LastAxisRequired)?;
+    if shape.len() < 2 {
+        return Err(bad_request(operation, "input needs rank at least two"));
+    }
+    if bits != 8 {
+        return Err(bad_request(operation, "bits must be 8"));
+    }
+    if group_size == 0 {
+        return Err(bad_request(operation, "group size must be nonzero"));
+    }
+    let width = shape[shape.len() - 1];
+    if !width.is_multiple_of(group_size) {
+        return Err(bad_request(
+            operation,
+            "last axis must be a multiple of the group size",
+        ));
+    }
+    let packed_bits = u64::from(width)
+        .checked_mul(u64::from(bits))
+        .ok_or_else(|| bad_request(operation, "packed width overflows"))?;
+    if packed_bits % 32 != 0 {
+        return Err(bad_request(
+            operation,
+            "packed width requires complete U32 words",
+        ));
+    }
+    let words = u32::try_from(packed_bits / 32)
+        .map_err(|_| bad_request(operation, "packed width exceeds u32"))?;
+    let mut codes_shape = shape.to_vec();
+    let last = codes_shape.len() - 1;
+    codes_shape[last] = words;
+    let mut group_shape = shape.to_vec();
+    group_shape[last] = width / group_size;
+    Ok(QuantizeRowsLayout {
+        codes: layout(operation, codes_shape)?,
+        groups: layout(operation, group_shape)?,
+    })
+}
+
+/// The portable checks of `quantized_attention_prefix` (packet KV8-OPS): `queries` is
+/// `[B, QH, L, D]`, each quantized buffer is `[B, KVH, CAP, last]` with the codes packing
+/// `D * bits / 32` U32 words and the scales and biases holding `D / group` groups per row on
+/// both sides, the two sides agree, `QH` is a multiple of `KVH`, `len` is 1 to `CAP` and, for
+/// a causal chunk, at least `L` (the mask of query row t covers keys 0..=len - L + t, so a
+/// shorter prefix would leave the earliest rows with no visible key). The output is the
+/// query shape.
+#[allow(
+    clippy::too_many_arguments,
+    reason = "the packet fixes this signature: len and causal name the attention, group_size \
+             and bits name the quantization of the buffers"
+)]
+pub(crate) fn quantized_attention_prefix(
+    operation: &'static str,
+    queries: &[u32],
+    keys: [&[u32]; 3],
+    values: [&[u32]; 3],
+    len: u32,
+    causal: bool,
+    group_size: u32,
+    bits: u32,
+) -> Result<ElementwiseLayout, EngError> {
+    check_shape(operation, queries, AxisRule::Any)?;
+    let &[batch, heads, rows, width] = queries else {
+        return Err(bad_request(operation, "queries must have rank four"));
+    };
+    // One quantized side: rank-four buffers whose scales and biases share one shape and agree
+    // with the codes on batch, heads, and capacity. Their last axes differ by construction -
+    // codes pack D * bits / 32 words, scales and biases hold D / group values - so the last
+    // axis is checked against the group and bits rules below, not here.
+    let quantized = |buffer: &[&[u32]; 3]| -> Result<[u32; 4], EngError> {
+        let [codes, scales, biases] = buffer;
+        for shape in [codes, scales, biases] {
+            check_shape(operation, shape, AxisRule::Any)?;
+            if shape.len() != 4 {
+                return Err(bad_request(
+                    operation,
+                    "quantized buffers must have rank four",
+                ));
+            }
+        }
+        if scales != biases || codes[..3] != scales[..3] {
+            return Err(bad_request(
+                operation,
+                "scales and biases must match the codes shape",
+            ));
+        }
+        let Some(&shape) = codes.last_chunk::<4>() else {
+            return Err(bad_request(operation, "codes must have rank four"));
+        };
+        Ok(shape)
+    };
+    let key_shape = quantized(&keys)?;
+    let value_shape = quantized(&values)?;
+    if value_shape != key_shape {
+        return Err(bad_request(
+            operation,
+            "value codes shape must match the key codes shape",
+        ));
+    }
+    let [key_batch, key_heads, capacity, packed] = key_shape;
+    if key_batch != batch {
+        return Err(bad_request(operation, "codes must match the query batch"));
+    }
+    if !heads.is_multiple_of(key_heads) {
+        return Err(bad_request(
+            operation,
+            "query heads must be a multiple of key heads",
+        ));
+    }
+    if bits != 8 {
+        return Err(bad_request(operation, "bits must be 8"));
+    }
+    if group_size == 0 {
+        return Err(bad_request(operation, "group size must be nonzero"));
+    }
+    let packed_bits = u64::from(width)
+        .checked_mul(u64::from(bits))
+        .ok_or_else(|| bad_request(operation, "packed width overflows"))?;
+    if packed_bits % 32 != 0 || packed_bits / 32 != u64::from(packed) {
+        return Err(bad_request(
+            operation,
+            "codes width must be D * bits / 32 words",
+        ));
+    }
+    if width % group_size != 0 || width / group_size != keys[1][3] {
+        return Err(bad_request(
+            operation,
+            "scales width must be D / group values",
+        ));
+    }
+    // The value side carries its own scales and biases, so its last axis needs the same width
+    // rule: the shape equality of the two sides above covers only the codes.
+    if width / group_size != values[1][3] {
+        return Err(bad_request(
+            operation,
+            "value scales width must be D / group values",
+        ));
+    }
+    if len == 0 || len > capacity {
+        return Err(bad_request(
+            operation,
+            "len must be at least one and at most the capacity",
+        ));
+    }
+    if causal && len < rows {
+        return Err(bad_request(
+            operation,
+            "a causal chunk needs len at least the query rows",
+        ));
+    }
+    layout(operation, queries.to_vec())
+}
+
 fn axis_index(operation: &'static str, axis: u32, rank: usize) -> Result<usize, EngError> {
     usize::try_from(axis)
         .ok()
@@ -445,7 +666,8 @@ fn layout(operation: &'static str, shape: Vec<u32>) -> Result<ElementwiseLayout,
 mod tests {
     use super::{
         attention, attention_prefix, bound_covers, clamp_max, concatenate, dequantize, expand_dims,
-        float_operands, gather_qmm, last_axis, matmul, reduce, repeat, reshape, rope, slice,
+        float_operands, gather_qmm, kv_append_operands, last_axis, matmul, quantize_rows,
+        quantized_attention_prefix, quantized_kv_operands, reduce, repeat, reshape, rope, slice,
         slice_update, sort, take, take_along_axis, transpose,
     };
     use crate::{EngError, tensor::Dtype};
@@ -1044,6 +1266,451 @@ mod tests {
         );
         rejects_unit(
             float_operands("kv append", true, &[Dtype::F16, Dtype::F16]),
+            "input dtype must be F32",
+        );
+    }
+
+    #[test]
+    fn kv_append_operands_take_u32_rows_beside_the_floats() {
+        // The U32 codes of the quantized cache append beside F32, and BF16 still needs the
+        // switch (packet KV8-OPS).
+        assert!(kv_append_operands("kv append", false, &[Dtype::F32, Dtype::F32]).is_ok());
+        assert!(kv_append_operands("kv append", false, &[Dtype::U32, Dtype::U32]).is_ok());
+        assert!(kv_append_operands("kv append", true, &[Dtype::Bf16, Dtype::Bf16]).is_ok());
+
+        rejects_unit(
+            kv_append_operands("kv append", false, &[Dtype::Bf16, Dtype::Bf16]),
+            "input dtype must be F32",
+        );
+        rejects_unit(
+            kv_append_operands("kv append", true, &[Dtype::I64, Dtype::I64]),
+            "input dtype must be F32",
+        );
+        // A U32/BF16 pair passes the dtype rule with the switch on: the two dtypes must still
+        // be equal, and that equality check is `kv_append`'s own, not this rule's (the mixed
+        // rejection is a Mac test through the public call).
+        assert!(kv_append_operands("kv append", true, &[Dtype::U32, Dtype::Bf16]).is_ok());
+    }
+
+    #[test]
+    fn quantize_rows_layout_packs_codes_and_groups() {
+        // A [1, 2, 8, 256] F32 row block at 8 bits and group 64 packs to [1, 2, 8, 64] U32
+        // codes (64 words = 256 values of 8 bits) and [1, 2, 8, 4] scales and biases.
+        let layout = quantize_rows("quantize rows", &[1, 2, 8, 256], 64, 8).unwrap();
+        assert_eq!(layout.codes.shape, [1, 2, 8, 64]);
+        assert_eq!(layout.codes.byte_len, 4096);
+        assert_eq!(layout.groups.shape, [1, 2, 8, 4]);
+        assert_eq!(layout.groups.byte_len, 256);
+
+        // A rank-two input works: [8, 64] packs to [8, 16] codes and [8, 1] groups.
+        let flat = quantize_rows("quantize rows", &[8, 64], 64, 8).unwrap();
+        assert_eq!(flat.codes.shape, [8, 16]);
+        assert_eq!(flat.groups.shape, [8, 1]);
+    }
+
+    #[test]
+    fn quantize_rows_layout_rejects_the_wrong_bits_groups_and_ranks() {
+        // Only 8 bits for now; a later 4-bit widens this one check.
+        rejects(
+            quantize_rows("quantize rows", &[8, 64], 64, 4).map(|layout| layout.codes),
+            "bits must be 8",
+        );
+        rejects(
+            quantize_rows("quantize rows", &[8, 64], 0, 8).map(|layout| layout.codes),
+            "group size must be nonzero",
+        );
+        rejects(
+            quantize_rows("quantize rows", &[8, 65], 64, 8).map(|layout| layout.codes),
+            "last axis must be a multiple of the group size",
+        );
+        // 18 values of 8 bits fill four and a half words: the packed width must fill whole
+        // U32 words (24 values would fill six whole words and stay legal).
+        rejects(
+            quantize_rows("quantize rows", &[8, 18], 6, 8).map(|layout| layout.codes),
+            "packed width requires complete U32 words",
+        );
+        rejects(
+            quantize_rows("quantize rows", &[64], 64, 8).map(|layout| layout.codes),
+            "input needs rank at least two",
+        );
+    }
+
+    /// The six buffers of one side as `[codes, scales, biases]` shapes, at capacity 16.
+    fn kv8_buffers() -> [&'static [u32]; 3] {
+        [&[1, 2, 16, 64], &[1, 2, 16, 4], &[1, 2, 16, 4]]
+    }
+
+    #[test]
+    fn quantized_attention_prefix_layout_checks_the_buffers() {
+        // Queries [1, 16, 7, 256] over 8-bit buffers of group 64 at cap 16: the codes pack
+        // 64 words and the scales hold 4 groups per row; the output is the query shape.
+        let layout = quantized_attention_prefix(
+            "quantized attention prefix",
+            &[1, 16, 7, 256],
+            kv8_buffers(),
+            kv8_buffers(),
+            7,
+            false,
+            64,
+            8,
+        )
+        .unwrap();
+        assert_eq!(layout.shape, [1, 16, 7, 256]);
+        assert_eq!(layout.byte_len, 114688);
+
+        // The full capacity is allowed, and so is one position.
+        assert!(
+            quantized_attention_prefix(
+                "quantized attention prefix",
+                &[1, 16, 7, 256],
+                kv8_buffers(),
+                kv8_buffers(),
+                16,
+                false,
+                64,
+                8
+            )
+            .is_ok()
+        );
+        assert!(
+            quantized_attention_prefix(
+                "quantized attention prefix",
+                &[1, 4, 1, 64],
+                [&[1, 2, 16, 16], &[1, 2, 16, 1], &[1, 2, 16, 1]],
+                [&[1, 2, 16, 16], &[1, 2, 16, 1], &[1, 2, 16, 1]],
+                1,
+                false,
+                64,
+                8
+            )
+            .is_ok()
+        );
+    }
+
+    #[test]
+    fn quantized_attention_prefix_layout_rejects_bad_shapes() {
+        let rejects_layout = |keys, values, len, group, bits, text: &str| {
+            rejects(
+                quantized_attention_prefix(
+                    "quantized attention prefix",
+                    &[1, 16, 7, 256],
+                    keys,
+                    values,
+                    len,
+                    false,
+                    group,
+                    bits,
+                ),
+                text,
+            )
+        };
+        // len 0 and len above the capacity.
+        rejects_layout(
+            kv8_buffers(),
+            kv8_buffers(),
+            0,
+            64,
+            8,
+            "len must be at least one",
+        );
+        rejects_layout(
+            kv8_buffers(),
+            kv8_buffers(),
+            17,
+            64,
+            8,
+            "len must be at least one",
+        );
+        // A head count that 16 query heads cannot share.
+        let five_heads = [
+            &[1u32, 5, 16, 64][..],
+            &[1u32, 5, 16, 4][..],
+            &[1u32, 5, 16, 4][..],
+        ];
+        rejects_layout(
+            five_heads,
+            five_heads,
+            7,
+            64,
+            8,
+            "query heads must be a multiple of key heads",
+        );
+        // The codes width must be D * bits / 32 words.
+        let narrow_codes = [
+            &[1u32, 2, 16, 32][..],
+            &[1u32, 2, 16, 4][..],
+            &[1u32, 2, 16, 4][..],
+        ];
+        rejects_layout(
+            narrow_codes,
+            narrow_codes,
+            7,
+            64,
+            8,
+            "codes width must be D * bits / 32 words",
+        );
+        // The scales and the biases must share the codes shape.
+        let narrow_scales = [
+            &[1u32, 2, 16, 64][..],
+            &[1u32, 2, 16, 8][..],
+            &[1u32, 2, 16, 4][..],
+        ];
+        rejects_layout(
+            narrow_scales,
+            narrow_scales,
+            7,
+            64,
+            8,
+            "scales and biases must match the codes shape",
+        );
+        // The two sides must agree.
+        rejects_layout(
+            kv8_buffers(),
+            [
+                &[1u32, 2, 8, 64][..],
+                &[1u32, 2, 8, 4][..],
+                &[1u32, 2, 8, 4][..],
+            ],
+            7,
+            64,
+            8,
+            "value codes shape must match the key codes shape",
+        );
+        // A batch that differs from the queries.
+        let batch_two = [
+            &[2u32, 2, 16, 64][..],
+            &[2u32, 2, 16, 4][..],
+            &[2u32, 2, 16, 4][..],
+        ];
+        rejects_layout(
+            batch_two,
+            batch_two,
+            7,
+            64,
+            8,
+            "codes must match the query batch",
+        );
+        // The bits and the group checks of `quantize_rows` apply here too.
+        rejects_layout(kv8_buffers(), kv8_buffers(), 7, 64, 4, "bits must be 8");
+        rejects_layout(
+            kv8_buffers(),
+            kv8_buffers(),
+            7,
+            0,
+            8,
+            "group size must be nonzero",
+        );
+        // A rank-three buffer.
+        let rank_three = [
+            &[1u32, 2, 16][..],
+            &[1u32, 2, 16, 4][..],
+            &[1u32, 2, 16, 4][..],
+        ];
+        rejects_layout(
+            rank_three,
+            kv8_buffers(),
+            7,
+            64,
+            8,
+            "quantized buffers must have rank four",
+        );
+        // A wrong scales width against the group size.
+        rejects_layout(
+            kv8_buffers(),
+            kv8_buffers(),
+            7,
+            128,
+            8,
+            "scales width must be D / group values",
+        );
+    }
+
+    #[test]
+    fn quantized_attention_prefix_layout_checks_the_value_scales() {
+        // D 256 over group 64 gives 256 / 64 = 4 groups per row on BOTH sides. A value side of
+        // width 8 keeps its codes matching the key codes, so only the width rule of the value
+        // buffers themselves refuses it.
+        let wide = [
+            &[1u32, 2, 16, 64][..],
+            &[1u32, 2, 16, 8][..],
+            &[1u32, 2, 16, 8][..],
+        ];
+        rejects(
+            quantized_attention_prefix(
+                "quantized attention prefix",
+                &[1, 16, 7, 256],
+                kv8_buffers(),
+                wide,
+                7,
+                false,
+                64,
+                8,
+            ),
+            "value scales width must be D / group values",
+        );
+        // A key-only mismatch still fails on the key-side rule, with its own message.
+        rejects(
+            quantized_attention_prefix(
+                "quantized attention prefix",
+                &[1, 16, 7, 256],
+                wide,
+                kv8_buffers(),
+                7,
+                false,
+                64,
+                8,
+            ),
+            "scales width must be D / group values",
+        );
+        // The valid case of both sides at width 4 still passes.
+        assert!(
+            quantized_attention_prefix(
+                "quantized attention prefix",
+                &[1, 16, 7, 256],
+                kv8_buffers(),
+                kv8_buffers(),
+                7,
+                false,
+                64,
+                8,
+            )
+            .is_ok()
+        );
+    }
+
+    #[test]
+    fn quantized_attention_prefix_layout_bounds_the_causal_len() {
+        // The causal mask of query row t covers keys 0..=len - rows + t, so len < rows leaves
+        // the earliest rows with no visible key and an undefined softmax. Rows 4 against
+        // len 3 is refused; len 4 is the full triangle and passes; a non-causal call with
+        // len 3 applies no mask, keeps every key visible, and stays accepted.
+        rejects(
+            quantized_attention_prefix(
+                "quantized attention prefix",
+                &[1, 16, 4, 256],
+                kv8_buffers(),
+                kv8_buffers(),
+                3,
+                true,
+                64,
+                8,
+            ),
+            "causal chunk needs len at least the query rows",
+        );
+        assert!(
+            quantized_attention_prefix(
+                "quantized attention prefix",
+                &[1, 16, 4, 256],
+                kv8_buffers(),
+                kv8_buffers(),
+                4,
+                true,
+                64,
+                8,
+            )
+            .is_ok()
+        );
+        assert!(
+            quantized_attention_prefix(
+                "quantized attention prefix",
+                &[1, 16, 4, 256],
+                kv8_buffers(),
+                kv8_buffers(),
+                3,
+                false,
+                64,
+                8,
+            )
+            .is_ok()
+        );
+    }
+
+    #[test]
+    fn quantized_kv_operands_check_the_dtypes() {
+        assert!(
+            quantized_kv_operands(
+                "quantized attention prefix",
+                false,
+                Dtype::F32,
+                [Dtype::U32; 2],
+                [[Dtype::F32; 2]; 2]
+            )
+            .is_ok()
+        );
+        // A BF16 cache after the switch.
+        assert!(
+            quantized_kv_operands(
+                "quantized attention prefix",
+                true,
+                Dtype::Bf16,
+                [Dtype::U32; 2],
+                [[Dtype::Bf16; 2]; 2]
+            )
+            .is_ok()
+        );
+
+        rejects_unit(
+            quantized_kv_operands(
+                "quantized attention prefix",
+                false,
+                Dtype::F32,
+                [Dtype::U32; 2],
+                [[Dtype::Bf16; 2]; 2],
+            ),
+            "input dtype must be F32",
+        );
+        rejects_unit(
+            quantized_kv_operands(
+                "quantized attention prefix",
+                false,
+                Dtype::U32,
+                [Dtype::U32; 2],
+                [[Dtype::F32; 2]; 2],
+            ),
+            "input dtype must be F32",
+        );
+        rejects_unit(
+            quantized_kv_operands(
+                "quantized attention prefix",
+                false,
+                Dtype::F32,
+                [Dtype::F32, Dtype::U32],
+                [[Dtype::F32; 2]; 2],
+            ),
+            "codes dtype must be U32",
+        );
+        // The agree checks run after the float rule, so they need the switch: a BF16 scale of
+        // an F32 side, or BF16 values beside F32 keys, is legal to the float rule but not to
+        // the agreement of the four scale and bias dtypes.
+        rejects_unit(
+            quantized_kv_operands(
+                "quantized attention prefix",
+                true,
+                Dtype::F32,
+                [Dtype::U32; 2],
+                [[Dtype::F32, Dtype::Bf16], [Dtype::F32; 2]],
+            ),
+            "scale and bias dtypes must agree",
+        );
+        rejects_unit(
+            quantized_kv_operands(
+                "quantized attention prefix",
+                true,
+                Dtype::F32,
+                [Dtype::U32; 2],
+                [[Dtype::F32; 2], [Dtype::Bf16; 2]],
+            ),
+            "scale and bias dtypes must agree",
+        );
+        // With the switch off the float rule fires first, as it does for every operation.
+        rejects_unit(
+            quantized_kv_operands(
+                "quantized attention prefix",
+                false,
+                Dtype::F32,
+                [Dtype::U32; 2],
+                [[Dtype::F32, Dtype::Bf16], [Dtype::F32; 2]],
+            ),
             "input dtype must be F32",
         );
     }

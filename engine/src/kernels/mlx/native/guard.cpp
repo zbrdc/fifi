@@ -8,6 +8,7 @@
 #include "mlx/c/transforms.h"
 #include "mlx/c/vector.h"
 #include <cstring>
+#include <limits>
 #include <unistd.h>
 
 #ifdef INFERENCE_NATIVE_FAULT_QUALIFICATION
@@ -725,6 +726,185 @@ extern "C" int inference_mlx_grouped_attention_prefix(
     const int free_values = mlx_array_free(value_prefix);
     if (status != 0) return status;
     return free_keys != 0 ? free_keys : free_values;
+  });
+}
+
+// Affine row quantization (packet KV8-OPS): `mlx_quantize` of the last axis of `x` in groups of
+// `group_size` at `bits` bits, with mode "affine" and no global scale, so the scales and biases
+// carry the full range of each group. MLX fills one result VECTOR (codes, scales, biases); this
+// shim unpacks it into the caller's three handles and frees the vector on every path, as the
+// gated-delta shim unpacks its output vector. The codes are U32 with `bits`-wide fields packed
+// from the low end; the scales and biases take the dtype of `x`. The injected faults strike the
+// codes output.
+extern "C" int inference_mlx_quantize_rows(
+    mlx_array* codes, mlx_array* scales, mlx_array* biases, mlx_array x,
+    mlx_optional_int group_size, mlx_optional_int bits, const char* mode,
+    mlx_stream stream) noexcept {
+  return run_selected_operation(codes, stream, [&] {
+    mlx_vector_array results = mlx_vector_array_new();
+    if (results.ctx == nullptr) return 1;
+    int status =
+        mlx_quantize(&results, x, group_size, bits, mode, mlx_array{nullptr}, stream);
+    if (status == 0 && mlx_vector_array_size(results) != 3) status = 1;
+    if (status == 0) status = mlx_vector_array_get(codes, results, 0);
+    if (status == 0) status = mlx_vector_array_get(scales, results, 1);
+    if (status == 0) status = mlx_vector_array_get(biases, results, 2);
+    const int release = mlx_vector_array_free(results);
+    if (status != 0) return status;
+    return release;
+  });
+}
+
+// Quantized attention over the first `len` positions of quantized capacity buffers (packet
+// KV8-OPS), the form of mlx-lm's quantized KV cache. `queries` is [B, QH, L, D] and reshapes to
+// [B, KVH, rep * L, D] with `rep = QH / KVH` (the heads of one KV group are adjacent, so query
+// head h reads KV head h / rep). The scores are `mlx_quantized_matmul(q', K views, transpose =
+// true)` [B, KVH, rep * L, len] times `scale`; a causal chunk (L > 1) masks with `mlx_where`
+// over a device-built `keep` aligned to the LAST key - query row t sees keys 0..len - L + t -
+// broadcast over the repeats; the softmax runs over the last axis with the precise (F32) flag;
+// the output is `mlx_quantized_matmul(probs, V views, transpose = false)` [B, KVH, rep * L, D]
+// reshaped back to [B, QH, L, D]. All six prefix views are `mlx_slice` views with NO
+// `mlx_contiguous`, so the capacity buffers are read in place: MLX's quantized matmul reads a
+// strided prefix view without copying it (the Mac view-cost test and a probe in the MLX Python
+// package, both on 2026-10-13). Every temporary is freed on every path, as
+// `inference_mlx_grouped_attention_prefix` frees its views. The injected faults strike `result`.
+extern "C" int inference_mlx_quantized_attention_prefix(
+    mlx_array* result, mlx_array queries, mlx_array k_codes, mlx_array k_scales,
+    mlx_array k_biases, mlx_array v_codes, mlx_array v_scales, mlx_array v_biases, int len,
+    float scale, bool causal, mlx_optional_int group_size, mlx_optional_int bits,
+    const char* mode, mlx_stream stream) noexcept {
+  return run_selected_operation(result, stream, [&] {
+    const int* query_shape = mlx_array_shape(queries);
+    const int* code_shape = mlx_array_shape(k_codes);
+    if (query_shape == nullptr || code_shape == nullptr) return 1;
+    const int batch = query_shape[0], heads = query_shape[1], rows = query_shape[2];
+    const int kv_heads = code_shape[1];
+    if (kv_heads <= 0 || heads % kv_heads != 0) return 1;
+    const int repeats = heads / kv_heads;
+
+    // One prefix view of the first `len` rows of a capacity buffer: axis two is cut to `len`,
+    // every other axis keeps its full extent, and no `mlx_contiguous` runs.
+    const auto slice_prefix = [&](mlx_array* view, mlx_array buffer) {
+      const int* shape = mlx_array_shape(buffer);
+      if (shape == nullptr) return 1;
+      const int start[4] = {0, 0, 0, 0};
+      const int stop[4] = {shape[0], shape[1], len, shape[3]};
+      const int strides[4] = {1, 1, 1, 1};
+      return mlx_slice(view, buffer, start, 4, stop, 4, strides, 4, stream);
+    };
+
+    mlx_array reshaped{nullptr};
+    mlx_array k_code_view{nullptr}, k_scale_view{nullptr}, k_bias_view{nullptr};
+    mlx_array v_code_view{nullptr}, v_scale_view{nullptr}, v_bias_view{nullptr};
+    mlx_array scores{nullptr}, scaled{nullptr}, scores5{nullptr}, masked{nullptr};
+    mlx_array softmaxed{nullptr}, probs{nullptr}, values{nullptr};
+    mlx_array scalar{nullptr}, scalar_cast{nullptr};
+    mlx_array key_index{nullptr}, query_index{nullptr}, query_column{nullptr}, keep{nullptr};
+    mlx_array blocked{nullptr}, blocked_cast{nullptr};
+    const int grouped[4] = {batch, kv_heads, repeats * rows, query_shape[3]};
+    int status = mlx_reshape(&reshaped, queries, grouped, 4, stream);
+    if (status == 0) status = slice_prefix(&k_code_view, k_codes);
+    if (status == 0) status = slice_prefix(&k_scale_view, k_scales);
+    if (status == 0) status = slice_prefix(&k_bias_view, k_biases);
+    if (status == 0) status = slice_prefix(&v_code_view, v_codes);
+    if (status == 0) status = slice_prefix(&v_scale_view, v_scales);
+    if (status == 0) status = slice_prefix(&v_bias_view, v_biases);
+    if (status == 0) {
+      status = mlx_quantized_matmul(&scores, reshaped, k_code_view, k_scale_view, k_bias_view,
+                                    true, group_size, bits, mode, stream);
+    }
+    // `scores * scale` with the scalar in the dtype of the scores, so a BF16 prefix keeps its
+    // dtype instead of promoting the whole tail of the graph to F32.
+    const mlx_dtype score_dtype =
+        scores.ctx != nullptr ? mlx_array_dtype(scores) : MLX_FLOAT32;
+    if (status == 0) {
+      scalar = mlx_array_new_data(&scale, nullptr, 0, MLX_FLOAT32);
+      if (scalar.ctx == nullptr) status = 1;
+    }
+    if (status == 0 && score_dtype != MLX_FLOAT32) {
+      status = mlx_astype(&scalar_cast, scalar, score_dtype, stream);
+    }
+    if (status == 0) {
+      status = mlx_multiply(&scaled, scores, scalar_cast.ctx != nullptr ? scalar_cast : scalar,
+                            stream);
+    }
+    // The causal chunk mask [rows, len], built ON THE DEVICE from two `mlx_arange` index
+    // vectors: the key index [len] and the query index [rows] starting at `len - rows`,
+    // reshaped to [rows, 1]. `keep = key index <= query index` marks the keys query row t may
+    // see (0..=len - rows + t) and broadcasts against the five-dimensional scores over the
+    // batch, the KV heads, and the repeats, and `mlx_where` replaces the blocked scores with a
+    // -infinity scalar of the scores' dtype (a BF16 prefix keeps its dtype) - no host buffer
+    // is built or uploaded, at any chunk or prefix size. A decode row (L == 1) sees every
+    // key, so it needs no mask, and the portable check rejects `len < L` for a causal chunk,
+    // so no row is ever fully blocked here.
+    const bool chunked = causal && rows > 1;
+    if (status == 0 && chunked) {
+      status = mlx_arange(&key_index, 0.0, static_cast<double>(len), 1.0, MLX_INT32, stream);
+      if (status == 0) {
+        status = mlx_arange(&query_index, static_cast<double>(len - rows),
+                            static_cast<double>(len), 1.0, MLX_INT32, stream);
+      }
+      if (status == 0) {
+        const int column[2] = {rows, 1};
+        status = mlx_reshape(&query_column, query_index, column, 2, stream);
+      }
+      if (status == 0) status = mlx_less_equal(&keep, key_index, query_column, stream);
+      if (status == 0) {
+        const int strided[5] = {batch, kv_heads, repeats, rows, len};
+        status = mlx_reshape(&scores5, scaled, strided, 5, stream);
+      }
+      if (status == 0) {
+        blocked = mlx_array_new_float(-std::numeric_limits<float>::infinity());
+        if (blocked.ctx == nullptr) status = 1;
+      }
+      if (status == 0 && score_dtype != MLX_FLOAT32) {
+        status = mlx_astype(&blocked_cast, blocked, score_dtype, stream);
+      }
+      if (status == 0) {
+        status = mlx_where(&masked, keep, scores5,
+                           blocked_cast.ctx != nullptr ? blocked_cast : blocked, stream);
+      }
+    }
+    if (status == 0) {
+      status = mlx_softmax_axis(&softmaxed, chunked ? masked : scaled, -1, true, stream);
+    }
+    // The probabilities back in the flat [B, KVH, rep * L, len] form for the value matmul: the
+    // masked path leaves them five dimensional, the plain path four dimensional already.
+    if (status == 0) {
+      const int flat_probs[4] = {batch, kv_heads, repeats * rows, len};
+      status = mlx_reshape(&probs, softmaxed, flat_probs, 4, stream);
+    }
+    if (status == 0) {
+      status = mlx_quantized_matmul(&values, probs, v_code_view, v_scale_view, v_bias_view,
+                                    false, group_size, bits, mode, stream);
+    }
+    if (status == 0) {
+      const int output_shape[4] = {batch, heads, rows, query_shape[3]};
+      status = mlx_reshape(result, values, output_shape, 4, stream);
+    }
+    int released = mlx_array_free(reshaped);
+    released |= mlx_array_free(k_code_view);
+    released |= mlx_array_free(k_scale_view);
+    released |= mlx_array_free(k_bias_view);
+    released |= mlx_array_free(v_code_view);
+    released |= mlx_array_free(v_scale_view);
+    released |= mlx_array_free(v_bias_view);
+    released |= mlx_array_free(scores);
+    released |= mlx_array_free(scaled);
+    released |= mlx_array_free(scores5);
+    released |= mlx_array_free(masked);
+    released |= mlx_array_free(softmaxed);
+    released |= mlx_array_free(probs);
+    released |= mlx_array_free(values);
+    released |= mlx_array_free(scalar);
+    released |= mlx_array_free(scalar_cast);
+    released |= mlx_array_free(key_index);
+    released |= mlx_array_free(query_index);
+    released |= mlx_array_free(query_column);
+    released |= mlx_array_free(keep);
+    released |= mlx_array_free(blocked);
+    released |= mlx_array_free(blocked_cast);
+    return status != 0 ? status : released;
   });
 }
 

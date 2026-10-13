@@ -487,6 +487,41 @@ unsafe extern "C" {
         causal: bool,
         stream: mlx_stream,
     ) -> i32;
+    /// Affine row quantization (packet KV8-OPS): the shim unpacks the `mlx_quantize` result
+    /// vector into the three caller handles and frees the vector on every path. The injected
+    /// faults strike the codes output.
+    #[link_name = "inference_mlx_quantize_rows"]
+    pub(super) fn mlx_quantize_rows(
+        codes: *mut mlx_array,
+        scales: *mut mlx_array,
+        biases: *mut mlx_array,
+        x: mlx_array,
+        group_size: mlx_optional_int,
+        bits: mlx_optional_int,
+        mode: *const c_char,
+        stream: mlx_stream,
+    ) -> i32;
+    /// Quantized attention over the first `len` positions of quantized capacity buffers
+    /// (packet KV8-OPS): one composite shim covers the six prefix views, the reshapes, the two
+    /// `mlx_quantized_matmul` calls, the causal chunk mask, and the F32 softmax.
+    #[link_name = "inference_mlx_quantized_attention_prefix"]
+    pub(super) fn mlx_quantized_attention_prefix(
+        result: *mut mlx_array,
+        queries: mlx_array,
+        k_codes: mlx_array,
+        k_scales: mlx_array,
+        k_biases: mlx_array,
+        v_codes: mlx_array,
+        v_scales: mlx_array,
+        v_biases: mlx_array,
+        len: i32,
+        scale: f32,
+        causal: bool,
+        group_size: mlx_optional_int,
+        bits: mlx_optional_int,
+        mode: *const c_char,
+        stream: mlx_stream,
+    ) -> i32;
     /// The gated delta rule as one Metal kernel (decision 0050). `dims` holds B, T, Hk, Dk, Hv, Dv.
     /// `source` is NUL-terminated. Both outputs are lazy. Faults strike `y`.
     #[link_name = "inference_mlx_gated_delta"]

@@ -254,6 +254,25 @@ impl BoundedIndices {
     }
 }
 
+/// One side of the quantized KV cache of packet KV8-OPS: the three residents of one tensor
+/// (keys or values) as `quantize_rows` produces them and `kv_append` appends row by row into
+/// capacity buffers. The three buffers share one shape `[B, KVH, CAP, ·]` whose last axis is
+/// `D * bits / 32` U32 words for the codes and `D / group` values for the scales and the
+/// biases; the codes are U32 and the scales and biases share the dtype the cache was quantized
+/// in (F32, or BF16 after `allow_bf16`).
+#[derive(Clone, Copy)]
+pub struct QuantizedKv<'a> {
+    /// The packed codes, U32 `[B, KVH, CAP, D * bits / 32]`, `bits`-wide fields from the low
+    /// end of each word.
+    pub codes: &'a ExecutionTensor,
+    /// The affine scales, `[B, KVH, CAP, D / group]` of the cache dtype: one per group of
+    /// `group_size` lanes (MLX's affine definition, whose magnitude is close to
+    /// `(max - min) / (2^bits - 1)` and whose sign can be negative).
+    pub scales: &'a ExecutionTensor,
+    /// The affine biases, the shape of [`Self::scales`]: one per group.
+    pub biases: &'a ExecutionTensor,
+}
+
 pub struct MlxKernels {
     context: native::Context,
 }
@@ -849,8 +868,9 @@ impl MlxKernels {
     /// reference moves into the graph, and MLX frees the buffer only after the GPU is done with
     /// the graph. Every other drop keeps the retire list.
     ///
-    /// The target and the update are F32 residents of this adapter, or BF16 after `allow_bf16`,
-    /// and share one dtype. A validation failure returns `BadRequest` before the first native
+    /// The target and the update are F32 residents of this adapter, BF16 after `allow_bf16`, or
+    /// U32 - the packed codes of the quantized KV cache (packet KV8-OPS), whose byte width equals
+    /// F32 - and share one dtype. A validation failure returns `BadRequest` before the first native
     /// call and frees the consumed handle once through the retire list; the adapter stays usable.
     /// A native failure follows the resident rule and makes the adapter terminal; a failed
     /// release of the taken handle is terminal (decision 0022) and returns `Backend` with label
@@ -1016,6 +1036,60 @@ impl MlxKernels {
     ) -> Result<ExecutionTensor, EngError> {
         self.context
             .grouped_attention_prefix(queries, keys, values, len, scale, causal)
+    }
+
+    /// Quantizes the last axis of `x` row by row with MLX affine quantization (packet KV8-OPS):
+    /// per group of `group_size` lanes, `scale = (max - min) / (2^bits - 1)`, `bias = min`, and
+    /// the codes are `round((x - bias) / scale)` packed `32 / bits` per U32 word from the low
+    /// end. `bits` is 8 only for now (the one portable check rejects the rest, so a later 4-bit
+    /// is a one-line change). `x` is an F32 resident of this adapter, or BF16 after `allow_bf16`,
+    /// of rank at least two whose last axis is a multiple of `group_size`. Returns
+    /// `(codes, scales, biases)`, all lazy: codes U32 `[.., D * bits / 32]`, scales and biases
+    /// `[.., D / group]` of the dtype of `x`. A validation failure returns `BadRequest`; a native
+    /// failure follows the resident rule and makes the adapter terminal.
+    pub fn quantize_rows(
+        &mut self,
+        x: &ExecutionTensor,
+        group_size: u32,
+        bits: u32,
+    ) -> Result<(ExecutionTensor, ExecutionTensor, ExecutionTensor), EngError> {
+        self.context.quantize_rows(x, group_size, bits)
+    }
+
+    /// Runs scaled dot-product attention over the first `len` positions of QUANTIZED capacity
+    /// buffers (packet KV8-OPS), the form of mlx-lm's quantized KV cache: no F32 copy of the
+    /// prefix is built. `queries` is `[B, QH, L, D]`; `keys` and `values` are the three
+    /// quantized residents of each side, with `QH` a multiple of `KVH` and `1 <= len <= CAP`.
+    /// The heads of one KV group are adjacent, so query head `h` reads KV head `h / rep` with
+    /// `rep = QH / KVH`: the queries reshape to `[B, KVH, rep * L, D]`, the scores are
+    /// `quantized_matmul(q', K, transpose = true) * scale`, a causal chunk (`L > 1`) adds a mask
+    /// aligned to the LAST key - query row `t` sees keys `0..len - L + t`, broadcast over the
+    /// repeats - the softmax runs over the last axis in F32 (precise), and the output is
+    /// `quantized_matmul(probs, V, transpose = false)` reshaped back to `[B, QH, L, D]`. All six
+    /// prefix views are MLX slice views with no `mlx_contiguous`, so the capacity buffers are
+    /// read in place: MLX's quantized matmul reads a strided prefix view without copying it (the
+    /// Mac view-cost test measures the peak growth). `group_size` and `bits` must
+    /// match the quantization of the buffers (`bits` is 8 only). The result is F32 for F32
+    /// queries, or BF16 after `allow_bf16` as the operand promotion goes. A validation failure
+    /// returns `BadRequest`; a native failure follows the resident rule and is terminal.
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "the packet fixes this signature: len, scale, and causal name the attention, \
+                 group_size and bits name the quantization of the buffers"
+    )]
+    pub fn quantized_attention_prefix(
+        &mut self,
+        queries: &ExecutionTensor,
+        keys: &QuantizedKv<'_>,
+        values: &QuantizedKv<'_>,
+        len: u32,
+        scale: f32,
+        causal: bool,
+        group_size: u32,
+        bits: u32,
+    ) -> Result<ExecutionTensor, EngError> {
+        self.context
+            .quantized_attention_prefix(queries, keys, values, len, scale, causal, group_size, bits)
     }
 
     /// Runs the gated delta rule of mlx-lm 0.31.0 as one Metal kernel over `T` tokens

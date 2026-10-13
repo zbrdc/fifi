@@ -9,7 +9,9 @@
 
 use std::rc::Rc;
 
-use super::super::{QuantArgs, ResidentPackedWeight, bad_request, matrix_shape, quant_args};
+use super::super::{
+    QuantArgs, QuantizedKv, ResidentPackedWeight, bad_request, matrix_shape, quant_args,
+};
 use super::{
     Context, State, ffi,
     guard::{DispatchGuard, check, clear_message, failure, has_failed, mark_failed},
@@ -528,6 +530,171 @@ impl Context {
         Ok(promoting_elementwise_result(state, output, layout))
     }
 
+    /// `quantize_rows` (packet KV8-OPS): affine quantization of the last axis of `x` in groups of
+    /// `group_size`, at `bits` bits (8 only for now). Returns the codes U32 `[.., D * bits / 32]`
+    /// and the scales and biases `[.., D / group]` of the dtype of `x`. The shim unpacks the
+    /// `mlx_quantize` result vector into the three handles and frees the vector on every path;
+    /// the injected faults strike the codes output.
+    pub(in crate::kernels::mlx) fn quantize_rows(
+        &mut self,
+        x: &ExecutionTensor,
+        group_size: u32,
+        bits: u32,
+    ) -> Result<(ExecutionTensor, ExecutionTensor, ExecutionTensor), EngError> {
+        let label = "quantize rows";
+        let _dispatch = DispatchGuard::enter();
+        self.check_ready()?;
+        let state = self.state.as_mut().unwrap();
+        check_operand(label, state, x)?;
+        let dtype = x.dtype();
+        let layouts = shape::quantize_rows(label, x.shape(), group_size, bits)?;
+        let native = native_ints(label, &[group_size, bits])?;
+        // The layouts count 4-byte elements: exact for the U32 codes, halved for BF16 groups.
+        let group_bytes = layouts.groups.byte_len / Dtype::F32.byte_width() * dtype.byte_width();
+        let _input = x.share();
+        clear_message();
+        let stream = state.stream.0;
+        let (mut codes, mut scales, mut biases) = (Array::null(), Array::null(), Array::null());
+        let built = produce(&mut codes, label, |slot| unsafe {
+            ffi::mlx_quantize_rows(
+                slot,
+                &mut scales.0,
+                &mut biases.0,
+                x.storage.native_array(),
+                ffi::optional_int(Some(native[0])),
+                ffi::optional_int(Some(native[1])),
+                c"affine".as_ptr(),
+                stream,
+            )
+        });
+        let expected_codes = ExpectedOutput {
+            operation: label,
+            stream,
+            shape: &layouts.codes.shape,
+            byte_len: layouts.codes.byte_len,
+            dtype: Dtype::U32,
+            promotes: false,
+        };
+        expected_codes.complete(&codes, built)?;
+        let expected_groups = ExpectedOutput {
+            operation: label,
+            stream,
+            shape: &layouts.groups.shape,
+            byte_len: group_bytes,
+            dtype,
+            promotes: false,
+        };
+        expected_groups.complete(&scales, Ok(()))?;
+        expected_groups.complete(&biases, Ok(()))?;
+        Ok((
+            state.resident(
+                codes,
+                Dtype::U32,
+                layouts.codes.shape,
+                layouts.codes.byte_len,
+            ),
+            state.resident(scales, dtype, layouts.groups.shape.clone(), group_bytes),
+            state.resident(biases, dtype, layouts.groups.shape, group_bytes),
+        ))
+    }
+
+    /// `quantized_attention_prefix` (packet KV8-OPS): attention over the first `len` positions of
+    /// quantized capacity buffers, the form of mlx-lm's quantized KV cache. The one composite
+    /// shim builds the six prefix views (no `mlx_contiguous`), reshapes the queries to
+    /// `[B, KVH, rep * L, D]`, runs the two `mlx_quantized_matmul` calls, applies the causal chunk
+    /// mask, softmaxes over the last axis in F32, and reshapes back, so its temporaries free on
+    /// every path as `grouped_attention_prefix` does.
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "the packet fixes this signature: len, scale, and causal name the attention, \
+                 group_size and bits name the quantization of the buffers"
+    )]
+    pub(in crate::kernels::mlx) fn quantized_attention_prefix(
+        &mut self,
+        queries: &ExecutionTensor,
+        keys: &QuantizedKv<'_>,
+        values: &QuantizedKv<'_>,
+        len: u32,
+        scale: f32,
+        causal: bool,
+        group_size: u32,
+        bits: u32,
+    ) -> Result<ExecutionTensor, EngError> {
+        let label = "quantized attention prefix";
+        let _dispatch = DispatchGuard::enter();
+        self.check_ready()?;
+        let state = self.state.as_mut().unwrap();
+        let operands = [
+            queries,
+            keys.codes,
+            keys.scales,
+            keys.biases,
+            values.codes,
+            values.scales,
+            values.biases,
+        ];
+        for operand in operands {
+            check_owner(label, state, operand)?;
+        }
+        shape::quantized_kv_operands(
+            label,
+            state.allow_bf16,
+            queries.dtype(),
+            [keys.codes.dtype(), values.codes.dtype()],
+            [
+                [keys.scales.dtype(), keys.biases.dtype()],
+                [values.scales.dtype(), values.biases.dtype()],
+            ],
+        )?;
+        check_positive(label, "scale", scale)?;
+        let layout = shape::quantized_attention_prefix(
+            label,
+            queries.shape(),
+            [keys.codes.shape(), keys.scales.shape(), keys.biases.shape()],
+            [
+                values.codes.shape(),
+                values.scales.shape(),
+                values.biases.shape(),
+            ],
+            len,
+            causal,
+            group_size,
+            bits,
+        )?;
+        let native = native_ints(label, &[len, group_size, bits])?;
+        let _inputs: Vec<_> = operands.iter().map(|operand| operand.share()).collect();
+        clear_message();
+        let stream = state.stream.0;
+        let expected = ExpectedOutput {
+            operation: label,
+            stream,
+            shape: &layout.shape,
+            byte_len: layout.byte_len,
+            dtype: Dtype::F32,
+            promotes: true,
+        };
+        let output = dispatch_contiguous(&expected, |slot| unsafe {
+            ffi::mlx_quantized_attention_prefix(
+                slot,
+                queries.storage.native_array(),
+                keys.codes.storage.native_array(),
+                keys.scales.storage.native_array(),
+                keys.biases.storage.native_array(),
+                values.codes.storage.native_array(),
+                values.scales.storage.native_array(),
+                values.biases.storage.native_array(),
+                native[0],
+                scale,
+                causal,
+                ffi::optional_int(Some(native[1])),
+                ffi::optional_int(Some(native[2])),
+                c"affine".as_ptr(),
+                stream,
+            )
+        })?;
+        Ok(promoting_elementwise_result(state, output, layout))
+    }
+
     /// `kv_append` (packet NATIVE-OPS-1): `slice_update` that consumes `target`. The lazy node
     /// must hold the only owner of the target's buffer when the graph runs, so MLX donates the
     /// buffer and writes the rows in place. The adapter releases its own native handle of the
@@ -535,9 +702,11 @@ impl Context {
     /// a second owner of the buffer until the next synchronization, and MLX would copy the whole
     /// capacity instead. The node holds the array until the GPU completes, so the release is as
     /// safe as a retire-list entry. A caller that keeps a `share()` of `target` loses the donation
-    /// but stays correct. The result keeps the dtype and shape of `target`. A failed release of
-    /// the taken handle is terminal (decision 0022) and this call reports it as `Backend` with
-    /// label `kv append`, as `evaluate` reports a failed vector release.
+    /// but stays correct. The result keeps the dtype and shape of `target`. The target and the
+    /// update may also be U32 - the packed codes of the quantized KV cache (packet KV8-OPS) -
+    /// whose byte width equals F32, so the byte-length scaling below changes nothing for them. A
+    /// failed release of the taken handle is terminal (decision 0022) and this call reports it as
+    /// `Backend` with label `kv append`, as `evaluate` reports a failed vector release.
     pub(in crate::kernels::mlx) fn kv_append(
         &mut self,
         mut target: ExecutionTensor,
@@ -550,7 +719,10 @@ impl Context {
         let state = self.state.as_mut().unwrap();
         check_owner(label, state, &target)?;
         check_owner(label, state, update)?;
-        shape::float_operands(label, state.allow_bf16, &[target.dtype(), update.dtype()])?;
+        // The dtype rule of `kv_append` (packet KV8-OPS): F32, BF16 after `allow_bf16`, and U32
+        // for the codes of the quantized cache; `float_operands` keeps its old rule for the float
+        // operations.
+        shape::kv_append_operands(label, state.allow_bf16, &[target.dtype(), update.dtype()])?;
         if target.dtype() != update.dtype() {
             return Err(EngError::BadRequest(format!(
                 "{label}: target and update dtypes differ"
