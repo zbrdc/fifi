@@ -18,6 +18,7 @@
 //! | `REF_JSON` | the reference with the 3 `suffix_ids` and the token counts (`tool` only) | required with `tool` |
 //! | `Q36_OUT_DIR` | the output directory; created after every input is validated, right before the load | required |
 //! | `Q36_ACTIVATION` | the decode activation dtype | required: `bf16` or `f32`, no default |
+//! | `Q36_KV_DTYPE` | the attention cache form: `f32` or `q8` | `f32` |
 //! | `DT_IDS_SOURCE` | `tool` (the 922-id tool prompt) or `file` (the `Q36_PROMPT_IDS` ids) | `tool` |
 //! | `Q36_PROMPT_IDS` | a file of little-endian `u32` ids, the format `route_parity` reads (`file` only) | required with `file` |
 //! | `DT_TOKENS` | decode tokens per case | 64 |

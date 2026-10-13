@@ -346,7 +346,7 @@ mod tests {
         assert_eq!(chunk_rows_for_depth(2_048, 0, 8, SCORE_BUDGET_BYTES), 2_048);
     }
 
-    /// The prefill split of `depth_ranges`: the fixed-size cover of the old `ranges` at a depth
+    /// The prefill split of `depth_ranges`: the fixed-size cover of the old fixed split at a depth
     /// the budget admits everywhere, the depth-aware halving inside one piece at 65,536, and
     /// the tiny-model knobs that keep their own size. Deterministic in the prompt length, the
     /// start position, and the setting.

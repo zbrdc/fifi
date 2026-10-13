@@ -668,7 +668,7 @@ mod snapshot_tests {
     }
 
     /// The per-element 8-bit affine error bound and the largest magnitude of the valid F32 cache
-    /// rows of one state (packet KV8-INTEGRATE): per group of 64 lanes the error is at most
+    /// rows of one state (packet KV8-INTEGRATE): per group of 64 lanes the error is about
     /// `(max - min) / 510`, measured over the valid positions of both key-value heads of both
     /// attention caches. A buffer is `[1, KVH, cap, D]`, so element (g, t, d) sits at
     /// `(g * cap + t) * D + d`, and the slack above `len` does not count.
@@ -1265,7 +1265,9 @@ mod snapshot_tests {
     /// reconstructed element `q * s + b` by at most `(255 * |s| + |b|) / 256`, which is
     /// `(R + |b|) / 256` for a group of range `R` (`255 * |s|` is about `R`) and at most
     /// `(R + V_max) / 256` because a bias is no larger than the largest magnitude; this term is
-    /// added to `e`. Every other term of the derivation is the one of the F32-activation test.
+    /// added to `e`. The scores, the softmax, and the attention output of the Q8 path also run in
+    /// BF16 and add a relative 2^-8 to every score; the factor 16 and the `V_max` term of the
+    /// bound swallow it, so the bound stays a worst-case guard.
     #[test]
     fn eight_q8_decode_steps_match_the_f32_cache_logits_within_the_derived_tolerance_in_bf16() {
         let _serial = crate::native_test_lock();
@@ -1511,6 +1513,14 @@ mod snapshot_tests {
         prefill(&mut decoder, &mut state, &tokens);
         let growth = 2 * per_layer;
         let logical = u64::from(state.pos()) * growth;
+        // The charge the code holds against the session budget is the hand-derived figure, so a
+        // wrong scale width in the charge (F32 bytes for BF16 scales) cannot hide behind a
+        // charge and a permit that are both wrong the same way.
+        assert_eq!(
+            decoder.session_used(),
+            logical,
+            "the logical charge of the committed positions"
+        );
         let stored = kv_storage_bytes(state.layers());
         assert_eq!(
             kv_lens(state.layers()),

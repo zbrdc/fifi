@@ -51,7 +51,7 @@ The reserve has no derived default.
 ## Prefix reuse
 
 With `prefix_reuse` on in the configuration file, one saved prefix entry and the live session share the engine's `session_cap_bytes` budget: the entry charges its attention caches plus the DeltaNet state (65,863,680 bytes) and the live session can hold the same caches again up to `context_limit`.
-The engine start therefore refuses a run whose `session_cap_bytes` is below `2 * 40960 * context_limit + 65863680` (2,750,218,240 bytes at 32,768 positions) and answers with the cap, the requirement, and the hint `raise session_cap_bytes`.
+For the `f32` cache form, the engine start therefore refuses a run whose `session_cap_bytes` is below `2 * 40960 * context_limit + 65863680` (2,750,218,240 bytes at 32,768 positions) and answers with the cap, the requirement, and the hint `raise session_cap_bytes`.
 A smaller cap would let a later job fail with `MemoryPlan` although the same job succeeds with `prefix_reuse` off.
 The rule is `Q36Settings::check_prefix_reuse_cap` in `engine/src/family/qwen36/settings.rs`; the shipped JSON keeps its current numbers, and the coordinator sets `session_cap_bytes` later.
 

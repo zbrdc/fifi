@@ -589,17 +589,34 @@ mod tests {
         let build = |rules: Q36Rules| {
             Q36Executor::from_parts(MlxKernels::try_new().unwrap(), ckpt, host(), rules)
         };
-        let built = build(with(cap, KvDtype::Q8));
+        let (executor, session) = build(with(cap, KvDtype::Q8)).unwrap();
         assert_eq!(
-            built
-                .as_ref()
-                .ok()
-                .map(|(executor, _)| executor.decoder.weights.kv),
-            Some(KvDtype::Q8),
-            "the Q8 rules build a Q8 decoder: {:?}",
-            built.as_ref().err()
+            executor.decoder.weights.kv,
+            KvDtype::Q8,
+            "the Q8 rules build a Q8 decoder"
         );
-        drop(built);
+        drop(session);
+        drop(executor);
+        // BF16 scales take 2 * 272 bytes per position over both layers: the same rules in BF16
+        // activation admit exactly that cap and refuse one byte less.
+        let bf16 = |cap: u64| Q36Rules {
+            activation: Activation::Bf16,
+            ..with(cap, KvDtype::Q8)
+        };
+        let bf16_cap = u64::from(LIMIT) * 2 * 272;
+        let (executor, session) = build(bf16(bf16_cap)).unwrap();
+        assert_eq!(
+            executor.decoder.weights.consts.act,
+            crate::tensor::Dtype::Bf16,
+            "the BF16 rules build a BF16 decoder"
+        );
+        drop(session);
+        drop(executor);
+        let refused = build(bf16(bf16_cap - 1)).err();
+        assert!(
+            matches!(&refused, Some(EngError::MemoryPlan(text)) if text.contains("needs")),
+            "{refused:?}"
+        );
         for (kv, cap) in [(KvDtype::F32, cap), (KvDtype::Q8, cap - 1)] {
             let refused = build(with(cap, kv)).err();
             assert!(

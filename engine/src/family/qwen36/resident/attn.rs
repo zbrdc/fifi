@@ -747,7 +747,8 @@ mod tests {
 
     /// The per-element bound of the 8-bit affine quantization error of the F32 cache rows
     /// (packet KV8-INTEGRATE test a): per group of `Q8_GROUP` lanes the reconstruction error of
-    /// one element is at most `(max - min) / 255 / 2`, so `e = R / 510` with `R` the largest
+    /// one element is about `(max - min) / 255 / 2` (the MLX scale magnitude is within 0.4 percent
+    /// of `(max - min) / 255`), so `e = R / 510` with `R` the largest
     /// group range over the valid rows of keys and values. `k` and `v` are the readbacks of the
     /// `[1, KVH, cap, D]` buffers, where element (g, t, d) sits at `(g * cap + t) * D + d`; only
     /// the first `len` positions of each head count (the rest is capacity slack). The function
@@ -1181,10 +1182,81 @@ mod tests {
         kernels.set_retire_cap(previous_cap).unwrap();
     }
 
+    /// The Q8 analogue of `two_hundred_decode_steps_donate_the_capacity_buffer`: after warm-up,
+    /// appending to a unique Q8 cache does not grow the MLX peak by a buffer. If `kv_append`
+    /// could not write the codes, scales, or biases in place, every decode step would copy the
+    /// whole cache (about 1.4 GB per token at 131K positions on the real model, a cost that grows
+    /// with the depth). The step quantum 65,536 gives each codes buffer of the tiny layer (2
+    /// key-value heads of width 64) 8 MiB; a donating loop adds only the small temporaries of
+    /// the projections, so the bound is one quarter of one codes buffer. The scales and biases
+    /// are 16 times smaller and are covered by the same loop but not by the bound.
+    #[test]
+    fn two_hundred_q8_decode_steps_donate_the_capacity_buffers() {
+        let _serial = crate::native_test_lock();
+        let (_ckpt, oracle, w, mut kernels) = setup_kv8();
+        let shape = oracle.shape().clone();
+        let RMixer::Attn(rw) = &w.layers[1].mixer else {
+            panic!("resident layer 1 is attention");
+        };
+        let codes_bytes: u64 = 65_536 * 2 * (64 / 4) * 4;
+        assert_eq!(codes_bytes, 8 << 20);
+        // A cap that no forced flush of the loop below can reach.
+        let previous_cap = kernels.set_retire_cap(8 << 30).unwrap();
+        let warm = upload(&mut kernels, &input(0));
+        let mut ctx = Ctx {
+            kernels: &mut kernels,
+            consts: &w.consts,
+        };
+        let first = step(
+            &mut ctx,
+            &shape,
+            rw,
+            KvCache::with_form(KvDtype::Q8, 65_536),
+            0,
+            &warm,
+        )
+        .unwrap();
+        let mut parts = vec![&first.out];
+        parts.extend(first.cache.tensors());
+        kernels.evaluate(&parts).unwrap();
+        let mut cache = first.cache;
+        kernels.reset_peak_memory().unwrap();
+        let start = kernels.memory_stats().unwrap().active;
+        for n in 1..200u32 {
+            let xr = upload(&mut kernels, &input(n));
+            let mut ctx = Ctx {
+                kernels: &mut kernels,
+                consts: &w.consts,
+            };
+            let next = step(&mut ctx, &shape, rw, cache, n, &xr).unwrap();
+            if n % 8 == 7 {
+                let mut parts = vec![&next.out];
+                parts.extend(next.cache.tensors());
+                kernels.evaluate(&parts).unwrap();
+            }
+            cache = next.cache;
+        }
+        assert_eq!(cache.len, 200, "the loop appended 199 more rows");
+        assert_eq!(cache.cap, 65_536, "no step of the loop grew the buffers");
+        let growth = kernels.memory_stats().unwrap().peak.saturating_sub(start);
+        println!(
+            "q8 decode steps: peak growth {growth} bytes over an {codes_bytes}-byte codes buffer, \
+             bound {}",
+            codes_bytes / 4
+        );
+        assert!(
+            growth < codes_bytes / 4,
+            "the Q8 decode step peak grew by {growth} bytes; a donating loop stays below one \
+             quarter of one codes buffer ({})",
+            codes_bytes / 4
+        );
+        kernels.set_retire_cap(previous_cap).unwrap();
+    }
+
     /// Packet KV8-INTEGRATE test (a) at the layer level: eight decode steps of the Q8 form
     /// against the F32 control on the same weights, in F32 activation. Tolerance derivation
     /// (stated, every input measured or asserted in the test): the 8-bit affine error of one
-    /// cached element is at most `e = R / 510` (`quantization_error`, `R` the largest group
+    /// cached element is about `e = R / 510` (`quantization_error`, `R` the largest group
     /// range over the valid rows of both heads, measured in the test); one score moves by at most `|dq * dk| / sqrt(D)` summed over
     /// the head width, which Cauchy-Schwarz bounds by `sqrt(D) * Q_max * e` with the
     /// RMS-normed query magnitude `Q_max` at most 16 (the norm weights are 1 +/- 0.25, so
@@ -1314,8 +1386,9 @@ mod tests {
     /// three caches built from the same history - the correct Q8 cache, one whose key scales
     /// and key biases are swapped, and one whose value biases are replaced by the value scales -
     /// and requires the correct cache to sit at least four times closer to the F32 control than
-    /// either corrupted cache. A Q8 attention that read the wrong scale or bias buffer, or
-    /// dropped the bias term, fails it.
+    /// either corrupted cache. A Q8 attention that reads the scale buffer where the bias buffer
+    /// belongs, for keys or for values, fails it (the correct cache then sits far from the
+    /// control and a corrupted copy sits near it).
     #[test]
     fn the_q8_layer_output_is_far_closer_to_the_f32_control_than_a_corrupted_q8_cache() {
         let _serial = crate::native_test_lock();
@@ -1369,6 +1442,10 @@ mod tests {
              biases replaced by scales {scaled}"
         );
         assert!(outputs.iter().flatten().all(|value| value.is_finite()));
+        assert!(
+            swapped > 0.0 && scaled > 0.0,
+            "the corrupted caches changed nothing: the attention is insensitive on this fixture"
+        );
         assert!(
             swapped >= 4.0 * good && scaled >= 4.0 * good,
             "the correct Q8 cache is not far closer to the F32 control ({good}) than the \

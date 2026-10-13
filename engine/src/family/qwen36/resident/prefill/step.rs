@@ -1214,4 +1214,75 @@ mod tests {
             refused.as_ref().err()
         );
     }
+
+    /// The Q8 form through the decoder's chunked prefill (packet KV8-INTEGRATE), in both
+    /// activation dtypes: eight tokens in chunks of 3 rows (3, 3, 2) commit without a dtype-guard
+    /// refusal, leave every attention cache in the Q8 form with U32 codes and scales and biases of
+    /// the ACTIVATION dtype, hold all eight positions, charge the hand-derived Q8 bytes to the
+    /// session budget, and return finite logits. On the tiny KV8 model (2 key-value heads of
+    /// width 64, two attention layers) one layer and position takes 288 bytes with F32 scales and
+    /// 272 with BF16 scales (codes 2 * 2 * 64 = 256, plus 2 sides * 2 arrays * 2 heads * 1 group
+    /// * the scale width), so the charge is 2 * 8 * 288 = 4,608 or 2 * 8 * 272 = 4,352.
+    fn q8_prefill_keeps_the_form_and_the_charge(
+        activation: Activation,
+        scale_dtype: Dtype,
+        per_layer: u64,
+    ) {
+        use crate::family::qwen36::settings::KvDtype;
+        let _serial = crate::native_test_lock();
+        let ckpt = tiny::checkpoint(&tiny::TINY_KV8);
+        let host =
+            HostWeights::load(&ckpt, &tiny::TINY_KV8, &tiny::config(&tiny::TINY_KV8)).unwrap();
+        let mut decoder = ResidentDecoder::new_with_kv(
+            MlxKernels::try_new().unwrap(),
+            &ckpt,
+            host,
+            64,
+            activation,
+            KvDtype::Q8,
+        )
+        .unwrap();
+        decoder.set_chunk_rows(3).unwrap();
+        let tokens: Vec<u32> = (0..8u32).map(|t| t % 7 + 1).collect();
+        let mut state = decoder.zero_state().unwrap();
+        let got = ok(
+            decoder.prefill(&mut state, &tokens, StepMode::Logits),
+            "the Q8 chunked prefill",
+        );
+        assert_eq!(state.pos(), 8, "position");
+        assert!(!state.is_poisoned(), "the chunks committed");
+        assert_eq!(
+            decoder.budget.used(),
+            2 * 8 * per_layer,
+            "the Q8 charge of the eight positions"
+        );
+        let mut caches = 0;
+        for layer in state.layers() {
+            if let LayerState::Attn(cache) = layer {
+                caches += 1;
+                assert_eq!(cache.len, 8, "valid positions");
+                for (index, tensor) in cache.tensors().iter().enumerate() {
+                    let want = if index % 3 == 0 {
+                        Dtype::U32
+                    } else {
+                        scale_dtype
+                    };
+                    assert_eq!(tensor.dtype(), want, "part {index} of the Q8 cache");
+                }
+            }
+        }
+        assert_eq!(caches, 2, "two attention layers");
+        let logits = some(got.logits, "the logits of the last chunk");
+        assert!(logits.iter().all(|value| value.is_finite()));
+    }
+
+    #[test]
+    fn a_q8_chunked_prefill_keeps_the_q8_form_and_charge_with_f32_scales() {
+        q8_prefill_keeps_the_form_and_the_charge(Activation::F32, Dtype::F32, 288);
+    }
+
+    #[test]
+    fn a_q8_chunked_prefill_keeps_the_q8_form_and_charge_with_bf16_scales() {
+        q8_prefill_keeps_the_form_and_the_charge(Activation::Bf16, Dtype::Bf16, 272);
+    }
 }

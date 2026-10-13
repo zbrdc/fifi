@@ -79,8 +79,8 @@ pub(super) struct ResidentDecoder<'c> {
     pub(super) budget: SessionBudget,
     /// The first position that a step refuses with `ContextLimit`.
     pub(super) context_limit: u32,
-    /// The most rows of one prefill chunk. `prefill` splits a longer prompt, and the attention
-    /// of a deep chunk runs in smaller parts (`kv_plan::depth_ranges`).
+    /// The most rows of one prefill chunk. `prefill` splits a longer prompt, and a chunk at
+    /// a great depth is split again into smaller chunks (`kv_plan::depth_ranges`).
     pub(super) chunk_rows: u32,
     /// How the layers pick their experts. `Device` unless a parity run asks for `Host`.
     pub(super) routing: Routing,

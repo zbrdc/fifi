@@ -58,7 +58,8 @@ pub(super) fn new_decoder<'c>(
     // comes from `Q36_KV_DTYPE` through the same env-helper rule as `Q36_ACTIVATION`. The runs
     // that build their decoder through this function (parity, route_parity, tool_forward) pick it
     // up here; `decode_timing` and `graph_count` build their own decoder and read the same helper.
-    // Every report records the cache form, so a run states which cache it measured.
+    // The census printed here, the `decode_timing` reports, and the `graph_count` report record
+    // the cache form; the result files of the other runs record the activation dtype only.
     let kv = kv_dtype_from_env();
     let decoder =
         ResidentDecoder::new_with_kv(kernels, ckpt, host, context_limit, activation, kv).unwrap();

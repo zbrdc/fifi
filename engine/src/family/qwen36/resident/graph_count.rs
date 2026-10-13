@@ -17,6 +17,7 @@
 //! | `IDS_FILE` | the fifi render dump with the 919 prompt ids | required |
 //! | `REF_JSON` | the reference with the 3 `suffix_ids` and the token counts | required |
 //! | `Q36_ACTIVATION` | the decode activation dtype | required: `bf16` or `f32`, no default |
+//! | `Q36_KV_DTYPE` | the attention cache form: `f32` or `q8` | `f32` |
 //! | `Q36_OUT_DIR` | the output directory; must not exist, created at the start of the run | required |
 //!
 //! The run prefills the first 16 ids of the tool prompt (`IDS_FILE` plus the `suffix_ids` of
