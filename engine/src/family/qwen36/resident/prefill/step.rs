@@ -228,8 +228,9 @@ fn run(
         // Packet Q36-BF16-b: the same dtype guard as the decode step. MLX promotes mixed operands,
         // so a stray F32 operand would turn BF16 activations back to F32 without an error.
         check_dtype("input norm output", &normed, ctx.consts.act)?;
-        // The old layer state moves into its arm and drops at the end of the arm, after the
-        // replacement graph exists. The next synchronization frees it.
+        // The old layer state moves into its arm: an attention cache is consumed by `kv_append`
+        // (a growth replaces the buffer), and a DeltaNet state drops at the end of the arm, after
+        // the replacement graph exists. The next synchronization frees the dropped arrays.
         let (mixed, next) = match (&layer.mixer, old_layer) {
             (RMixer::Delta(w), LayerState::Delta { rec, ring }) => {
                 let s = delta::chunk(&mut ctx, shape, w, &rec, &ring, &normed, sub)?;
@@ -242,7 +243,7 @@ fn run(
                 )
             }
             (RMixer::Attn(w), LayerState::Attn(cache)) => {
-                let s = attn::chunk(&mut ctx, shape, w, &cache, pos, &normed)?;
+                let s = attn::chunk(&mut ctx, shape, w, cache, pos, &normed)?;
                 (s.out, LayerState::Attn(s.cache))
             }
             _ => return Err(bad("layer state kind does not match its weights")),
@@ -383,9 +384,10 @@ mod tests {
     use super::super::super::decoder::{
         DECODE_RETIRE_CAP, MAX_CHUNK_ROWS, ResidentDecoder, StepMode, StepResult,
     };
+    use super::super::super::kv_plan::KV_STEP;
     use super::super::super::ops::{assert_parity, values};
     use super::super::super::parity::{cosine, top5};
-    use super::super::super::state::LayerState;
+    use super::super::super::state::{LayerState, kv_storage_bytes};
     use super::*;
     use crate::family::qwen36::host::{self, HostState, LayerState as HostLayer};
     use crate::family::qwen36::host_cpu::CpuProjector;
@@ -553,17 +555,19 @@ mod tests {
                 }
             }
             assert_eq!(compared, 2, "{what}: both DeltaNet layers compared");
+            // The logical charge follows the position; the storage is the exact hand-derived
+            // capacity (review B finding 4): every count of this helper (1, 8, and 40 positions)
+            // fits one default quantum of 256, so each layer stores exactly `KV_STEP` positions.
+            let logical = u64::from(count) * GROWTH;
+            let stored = kv_storage_bytes(state.layers());
             assert_eq!(
-                state
-                    .layers()
-                    .iter()
-                    .map(|layer| match layer {
-                        LayerState::Attn(cache) => cache.byte_len(),
-                        LayerState::Delta { .. } => 0,
-                    })
-                    .sum::<u64>(),
-                u64::from(count) * GROWTH,
-                "{what}: cache bytes"
+                stored,
+                KV_STEP as u64 * GROWTH,
+                "{what}: the cache storage is exactly one quantum"
+            );
+            assert!(
+                stored >= logical,
+                "{what}: the buffers hold at least the valid rows"
             );
             assert_eq!(
                 decoder.budget.used(),

@@ -2,19 +2,20 @@
 //!
 //! `chunk` is the chunk form of `attn::step`. The `T` rows of a chunk attend to the `P` cached
 //! positions and to the chunk rows before them. The mask is causal and aligned to the last key, so
-//! row `i` sees the positions `0..P + i`. The pinned MLX aligns it that way when there are more keys
-//! than queries (the test `grouped_attention_aligns_the_causal_mask_to_the_last_key` in
-//! `tests/native_fast.rs`, and the test of this file with cached positions). The rules are those of
-//! `attn.rs`: the query projection holds the query rows and then the gate rows per head, the query
-//! and key norms use the weights as stored, RoPE rotates the first `rotary_dim` dimensions, and the
-//! head output is multiplied by `sigmoid(gate)`. There is no indexer and no block selection.
+//! row `i` sees the positions `0..P + i`: `grouped_attention_prefix` keeps the mask mode string of
+//! `grouped_attention`, and the new operation's test proved that the causal prefix view equals the
+//! contiguous formulation bit for bit. The rules are those of `attn.rs`: the query projection
+//! holds the query rows and then the gate rows per head, the query and key norms use the weights
+//! as stored, RoPE rotates the first `rotary_dim` dimensions, and the head output is multiplied
+//! by `sigmoid(gate)`. There is no indexer and no block selection.
 //!
-//! The cache keeps the decode layout `[1, KVH, len, D]`, so a chunk and a decode step share it.
-//! The cache is F32 in every activation dtype: the new keys and values convert to F32 before the
-//! append (packet Q36-BF16-b, as the decode step of `attn.rs`), and the block output converts to
-//! the activation dtype at the o-projection.
+//! The cache keeps the decode layout — capacity buffers `[1, KVH, cap, D]` written in place by
+//! `kv_append` (packet Q36-KV-INTEGRATE) — so a chunk and a decode step share it. The cache is
+//! F32 in every activation dtype: the new keys and values convert to F32 before the append
+//! (packet Q36-BF16-b, as the decode step of `attn.rs`), and the block output converts to the
+//! activation dtype at the o-projection.
 
-use super::super::attn::{AttnStep, KvCache};
+use super::super::attn::{AttnStep, KvCache, append};
 use super::super::ops::{Ctx, cast_to, dim, to_act};
 use super::super::weights::RAttn;
 use crate::{
@@ -33,14 +34,20 @@ fn mismatch() -> EngError {
 }
 
 /// Runs one dense attention chunk of `x` `[T, H]` at position `pos`. It builds a lazy graph only:
-/// no readback and no evaluate. `cache` is never changed. A cache that holds a number of positions
-/// other than `pos`, tensors of the wrong shape, or an input that is not `[T, H]` with `T > 0`
-/// returns `BadRequest` before the first native call.
+/// no readback and no evaluate. `cache` is CONSUMED: `kv_append` writes the chunk rows into its
+/// buffer in place at `[0, 0, len, 0]` (a growth replaces the buffer), so the caller hands the
+/// layer's cache over and keeps only the returned one. The host validation — the input rank, the
+/// position, the buffer shapes, and the capacity invariants — runs before the first native call
+/// and before any buffer is consumed; once a buffer is consumed, any error leaves the caller's
+/// state poisoned until `reset` (the rule of the chunk step, which takes the layer states before
+/// it runs). A cache that holds a number of positions other than `pos`, tensors of the wrong
+/// shape, or an input that is not `[T, H]` with `T > 0` returns `BadRequest` before the first
+/// native call.
 pub(super) fn chunk(
     ctx: &mut Ctx<'_>,
     shape: &HostShape,
     w: &RAttn,
-    cache: &KvCache,
+    cache: KvCache,
     pos: u32,
     x: &ExecutionTensor,
 ) -> Result<AttnStep, EngError> {
@@ -60,18 +67,7 @@ pub(super) fn chunk(
             cache.len
         )));
     }
-    let cached = dim(cache.len)?;
-    let past = match (&cache.k, &cache.v) {
-        (None, None) if cache.len == 0 => None,
-        (Some(k), Some(v)) if cache.len > 0 => {
-            let kv_shape = [1, kv_heads, cached, width];
-            if k.shape() != kv_shape.as_slice() || v.shape() != kv_shape.as_slice() {
-                return Err(mismatch());
-            }
-            Some((k, v))
-        }
-        _ => return Err(mismatch()),
-    };
+    cache.check_buffers(kv_heads, width)?;
     let pair = width.checked_mul(2).ok_or_else(overflow)?;
     let q_width = heads.checked_mul(width).ok_or_else(overflow)?;
     let next_len = usize::try_from(rows)
@@ -107,48 +103,41 @@ pub(super) fn chunk(
     let vp = m.reshape(&vp, &[rows, kv_heads, width])?;
     let v_new = m.transpose(&vp, &[1, 0, 2])?;
     let v_new = m.reshape(&v_new, &[1, kv_heads, rows, width])?;
-    // The cache stays F32 whatever the activation dtype (packet Q36-BF16-b, as the decode step of
-    // `attn.rs`; a BF16 cache is a parked lever of decision 0046 item 5). The cast runs before the
-    // append so that a cache which starts with this chunk is F32 too, not only one that appends
-    // to F32 keys and values.
+    // The cache stays F32 whatever the activation dtype (packet Q36-BF16-b, as the decode step
+    // of `attn.rs`; a BF16 cache is a parked lever of decision 0046 item 5). The cast runs before
+    // the append so that a cache which starts with this chunk is F32 too, not only one that
+    // appends to F32 keys and values.
     let (k_new, v_new) = (
         cast_to(ctx, &k_new, Dtype::F32)?,
         cast_to(ctx, &v_new, Dtype::F32)?,
     );
-    let m = &mut *ctx.kernels;
-    // 5. Append on the time axis, or start the cache.
-    let (k_all, v_all) = match past {
-        None => (k_new, v_new),
-        Some((k, v)) => (
-            m.concatenate(&[k, &k_new], 2)?,
-            m.concatenate(&[v, &v_new], 2)?,
-        ),
+    // 5. Append the rows into the capacity buffer (a growth builds the larger buffer first).
+    let cache = append(ctx, kv_heads, width, cache, rows, &k_new, &v_new)?;
+    let (k_buf, v_buf) = match (&cache.k, &cache.v) {
+        (Some(k), Some(v)) => (k, v),
+        _ => return Err(mismatch()),
     };
-    // 6. Causal attention over all positions; head h reads KV head h / (QH / KVH).
+    // 6. Causal attention over the valid prefix, as a copy-free view of the capacity buffers;
+    // head h reads KV head h / (QH / KVH).
     let scale = 1.0 / (width as f32).sqrt();
-    let att = m.grouped_attention(&q, &k_all, &v_all, scale, true)?;
+    let att =
+        ctx.kernels
+            .grouped_attention_prefix(&q, k_buf, v_buf, dim(next_len)?, scale, true)?;
     // 7. Back to rows, sigmoid output gate, and output projection. The attention output is F32
     // over the F32 cache; the projection takes the activation dtype (packet Q36-BF16-b).
-    let att = m.transpose(&att, &[0, 2, 1, 3])?;
-    let att = m.reshape(&att, &[rows, heads, width])?;
-    let gate = m.unary(UnaryOp::Sigmoid, &gate)?;
-    let o = m.binary(BinaryOp::Mul, &att, &gate)?;
-    let o = m.reshape(&o, &[rows, q_width])?;
+    let att = ctx.kernels.transpose(&att, &[0, 2, 1, 3])?;
+    let att = ctx.kernels.reshape(&att, &[rows, heads, width])?;
+    let gate = ctx.kernels.unary(UnaryOp::Sigmoid, &gate)?;
+    let o = ctx.kernels.binary(BinaryOp::Mul, &att, &gate)?;
+    let o = ctx.kernels.reshape(&o, &[rows, q_width])?;
     let o = to_act(ctx, &o)?;
     let out = ctx.kernels.qmm(&o, &w.o)?;
-    Ok(AttnStep {
-        out,
-        cache: KvCache {
-            k: Some(k_all),
-            v: Some(v_all),
-            len: next_len,
-        },
-    })
+    Ok(AttnStep { out, cache })
 }
 
 #[cfg(test)]
 mod tests {
-    use super::super::super::attn::{growth_bytes, step};
+    use super::super::super::attn::{ConcatCache, concat_step, growth_bytes, step};
     use super::super::super::ops::{assert_parity, f32_tensor, values};
     use super::super::super::weights::{RMixer, ResidentWeights};
     use super::*;
@@ -194,6 +183,17 @@ mod tests {
     fn rows(kernels: &mut MlxKernels, first: u32, count: u32) -> ExecutionTensor {
         let data: Vec<f32> = (first..first + count).flat_map(input).collect();
         upload(kernels, vec![count, 64], &data)
+    }
+
+    /// The first `len` positions of each key-value head of a `[1, KVH, cap, D]` buffer readback,
+    /// in the `[1, KVH, len, D]` layout.
+    fn prefix_rows(full: &[f32], heads: usize, cap: usize, len: usize, width: usize) -> Vec<f32> {
+        let mut out = Vec::new();
+        for g in 0..heads {
+            let head = &full[g * cap * width..(g + 1) * cap * width];
+            out.extend_from_slice(&head[..len * width]);
+        }
+        out
     }
 
     /// The host attention of layer 1 over some positions: the output of every position and, by
@@ -249,44 +249,148 @@ mod tests {
         out
     }
 
+    /// The chunk step exactly as it was before packet Q36-KV-INTEGRATE (test-only): the cache is
+    /// `[1, KVH, len, D]` (see `attn::ConcatCache`) and every chunk rebuilds it with
+    /// `concatenate`. The bit equality of this formulation and the capacity buffers proves that
+    /// the new cache changes no numerics.
+    fn concat_chunk(
+        ctx: &mut Ctx<'_>,
+        shape: &HostShape,
+        w: &RAttn,
+        cache: &ConcatCache,
+        pos: u32,
+        x: &ExecutionTensor,
+    ) -> Result<(ExecutionTensor, ConcatCache), EngError> {
+        let a = &shape.attn;
+        let (heads, kv_heads, width) = (dim(a.heads_q)?, dim(a.heads_kv)?, dim(a.head_dim)?);
+        let &[rows, _] = x.shape() else {
+            return Err(EngError::BadRequest(
+                "attention chunk input must be [T, H]".into(),
+            ));
+        };
+        let cached = dim(cache.len)?;
+        let past = match (&cache.k, &cache.v) {
+            (None, None) if cache.len == 0 => None,
+            (Some(k), Some(v)) if cache.len > 0 => {
+                let kv_shape = [1, kv_heads, cached, width];
+                if k.shape() != kv_shape.as_slice() || v.shape() != kv_shape.as_slice() {
+                    return Err(mismatch());
+                }
+                Some((k, v))
+            }
+            _ => return Err(mismatch()),
+        };
+        let pair = width.checked_mul(2).ok_or_else(overflow)?;
+        let q_width = heads.checked_mul(width).ok_or_else(overflow)?;
+        let next_len = usize::try_from(rows)
+            .ok()
+            .and_then(|rows| cache.len.checked_add(rows))
+            .ok_or_else(overflow)?;
+        let rope = RopeSpec {
+            dims: dim(a.rotary_dim)?,
+            base: a.theta,
+            scale: 1.0,
+            offset: pos,
+        };
+        let m = &mut *ctx.kernels;
+        let qp = m.qmm(x, &w.q)?;
+        let qp = m.reshape(&qp, &[rows, heads, pair])?;
+        let q_raw = m.slice(&qp, &[0, 0, 0], &[rows, heads, width])?;
+        let gate = m.slice(&qp, &[0, 0, width], &[rows, heads, pair])?;
+        let q = m.rms_norm(&q_raw, &w.q_norm, shape.eps)?;
+        let q = m.transpose(&q, &[1, 0, 2])?;
+        let q = m.reshape(&q, &[1, heads, rows, width])?;
+        let q = m.rope_scaled(&q, &rope)?;
+        let kp = m.qmm(x, &w.k)?;
+        let kp = m.reshape(&kp, &[rows, kv_heads, width])?;
+        let k_new = m.rms_norm(&kp, &w.k_norm, shape.eps)?;
+        let k_new = m.transpose(&k_new, &[1, 0, 2])?;
+        let k_new = m.reshape(&k_new, &[1, kv_heads, rows, width])?;
+        let k_new = m.rope_scaled(&k_new, &rope)?;
+        let vp = m.qmm(x, &w.v)?;
+        let vp = m.reshape(&vp, &[rows, kv_heads, width])?;
+        let v_new = m.transpose(&vp, &[1, 0, 2])?;
+        let v_new = m.reshape(&v_new, &[1, kv_heads, rows, width])?;
+        let (k_new, v_new) = (
+            cast_to(ctx, &k_new, Dtype::F32)?,
+            cast_to(ctx, &v_new, Dtype::F32)?,
+        );
+        let m = &mut *ctx.kernels;
+        let (k_all, v_all) = match past {
+            None => (k_new, v_new),
+            Some((k, v)) => (
+                m.concatenate(&[k, &k_new], 2)?,
+                m.concatenate(&[v, &v_new], 2)?,
+            ),
+        };
+        let scale = 1.0 / (width as f32).sqrt();
+        let att = m.grouped_attention(&q, &k_all, &v_all, scale, true)?;
+        let att = m.transpose(&att, &[0, 2, 1, 3])?;
+        let att = m.reshape(&att, &[rows, heads, width])?;
+        let gate = m.unary(UnaryOp::Sigmoid, &gate)?;
+        let o = m.binary(BinaryOp::Mul, &att, &gate)?;
+        let o = m.reshape(&o, &[rows, q_width])?;
+        let o = to_act(ctx, &o)?;
+        let out = ctx.kernels.qmm(&o, &w.o)?;
+        Ok((
+            out,
+            ConcatCache {
+                k: Some(k_all),
+                v: Some(v_all),
+                len: next_len,
+            },
+        ))
+    }
+
     /// Runs positions `warm..warm + count` as one chunk after `warm` decode steps and compares the
-    /// outputs and the whole cache with the host run over `warm + count` positions.
-    fn chunk_matches_the_host(warm: u32, count: u32) {
+    /// outputs and the whole valid prefix with the host run over `warm + count` positions. The
+    /// caches grow in quanta of 4, and `want_cap` is the exact hand-derived capacity after the
+    /// chunk (review B finding 4): round_up(warm + count, 4).
+    fn chunk_matches_the_host(warm: u32, count: u32, want_cap: usize) {
         let (ckpt, oracle, w, mut kernels) = setup();
         let shape = oracle.shape().clone();
         let RMixer::Attn(rw) = &w.layers[1].mixer else {
             panic!("resident layer 1 is attention");
         };
         let host = host_run(&ckpt, &oracle, warm + count);
-        // The cached positions come from the decode step, which Q36-C1 compared with the host.
-        let mut cache = KvCache::empty();
+        // The cached positions come from the decode step, which the tests of `attn.rs` compared
+        // with the host.
+        let mut cache = KvCache::with_step(4);
         for n in 0..warm {
             let xr = upload(&mut kernels, vec![1, 64], &input(n));
             let mut ctx = Ctx {
                 kernels: &mut kernels,
                 consts: &w.consts,
             };
-            cache = step(&mut ctx, &shape, rw, &cache, n, &xr).unwrap().cache;
+            cache = step(&mut ctx, &shape, rw, cache, n, &xr).unwrap().cache;
         }
         let x = rows(&mut kernels, warm, count);
         let mut ctx = Ctx {
             kernels: &mut kernels,
             consts: &w.consts,
         };
-        let next = chunk(&mut ctx, &shape, rw, &cache, warm, &x).unwrap();
-        let total = warm + count;
+        let next = chunk(&mut ctx, &shape, rw, cache, warm, &x).unwrap();
+        let total = warm as usize + count as usize;
         let (hkv, hd) = (shape.attn.heads_kv, shape.attn.head_dim);
         assert_eq!(next.out.shape(), [count, 64], "output shape");
-        assert_eq!(next.cache.len, total as usize, "cache length");
+        assert_eq!(next.cache.len, total, "cache length");
+        assert_eq!(
+            next.cache.cap, want_cap,
+            "the exact capacity after the chunk (review B finding 4)"
+        );
+        assert!(
+            want_cap >= total,
+            "the capacity {want_cap} must hold the valid rows {total}"
+        );
         assert_eq!(
             next.cache.k.as_ref().unwrap().shape(),
-            [1, hkv as u32, total, hd as u32],
+            [1, hkv as u32, next.cache.cap as u32, hd as u32],
             "key shape"
         );
         assert_eq!(
             next.cache.byte_len(),
-            u64::from(total) * growth_bytes(&shape).unwrap(),
-            "stored bytes follow the growth rule"
+            next.cache.cap as u64 * growth_bytes(&shape).unwrap(),
+            "stored bytes follow the capacity"
         );
         let want_out: Vec<f32> = host.outputs[warm as usize..].concat();
         assert_parity(
@@ -295,12 +399,24 @@ mod tests {
             "chunk output",
         );
         assert_parity(
-            &values(&mut kernels, next.cache.k.as_ref().unwrap()).unwrap(),
+            &prefix_rows(
+                &values(&mut kernels, next.cache.k.as_ref().unwrap()).unwrap(),
+                hkv,
+                next.cache.cap,
+                total,
+                hd,
+            ),
             &cache_layout(&host.keys, hkv, hd),
             "cached keys",
         );
         assert_parity(
-            &values(&mut kernels, next.cache.v.as_ref().unwrap()).unwrap(),
+            &prefix_rows(
+                &values(&mut kernels, next.cache.v.as_ref().unwrap()).unwrap(),
+                hkv,
+                next.cache.cap,
+                total,
+                hd,
+            ),
             &cache_layout(&host.vals, hkv, hd),
             "cached values",
         );
@@ -309,14 +425,232 @@ mod tests {
     #[test]
     fn a_chunk_from_an_empty_cache_matches_the_host_steps() {
         let _serial = crate::native_test_lock();
-        chunk_matches_the_host(0, 6);
+        // Six rows of an empty cache grow in quanta of 4: round_up(6, 4) = 8.
+        chunk_matches_the_host(0, 6, 8);
     }
 
     #[test]
     fn a_chunk_after_cached_positions_matches_the_host_steps() {
         // Five cached positions: RoPE starts at position 5 and row i sees 5 + i + 1 positions.
+        // Five decode steps fill 4 and grow to 8; the chunk of 4 needs 9, so round_up(9, 4) = 12.
         let _serial = crate::native_test_lock();
-        chunk_matches_the_host(5, 4);
+        chunk_matches_the_host(5, 4, 12);
+    }
+
+    /// Packet Q36-KV-INTEGRATE 6(b): a chunk of 5 rows that crosses a growth (the buffers hold 2
+    /// of 4 positions, the chunk needs 7, so they grow to 8), then decode steps that fill 8
+    /// exactly and grow to 12. Every output is bit-equal to the old concatenate formulation and
+    /// within the parity bounds of the host run.
+    #[test]
+    fn a_chunk_of_five_rows_crossing_a_growth_then_decode_steps_match_the_old_formulation() {
+        let _serial = crate::native_test_lock();
+        let (ckpt, oracle, w, mut kernels) = setup();
+        let shape = oracle.shape().clone();
+        let RMixer::Attn(rw) = &w.layers[1].mixer else {
+            panic!("resident layer 1 is attention");
+        };
+        let host = host_run(&ckpt, &oracle, 12);
+        let mut cache = KvCache::with_step(4);
+        let mut concat = ConcatCache {
+            k: None,
+            v: None,
+            len: 0,
+        };
+        // Two decode steps hold 2 of the 4 first positions.
+        for n in 0..2u32 {
+            let xr = upload(&mut kernels, vec![1, 64], &input(n));
+            let mut ctx = Ctx {
+                kernels: &mut kernels,
+                consts: &w.consts,
+            };
+            let next = step(&mut ctx, &shape, rw, cache, n, &xr).unwrap();
+            let old = concat_step(&mut ctx, &shape, rw, &concat, n, &xr).unwrap();
+            assert_eq!(
+                values(&mut kernels, &next.out).unwrap(),
+                values(&mut kernels, &old.0).unwrap(),
+                "warm step {n} differs from the concatenate formulation"
+            );
+            cache = next.cache;
+            concat = old.1;
+        }
+        assert_eq!(cache.cap, 4, "the warm steps hold capacity 4");
+        // The chunk of 5 rows: 2 + 5 = 7 passes 4, so the buffers grow to 8.
+        let x = rows(&mut kernels, 2, 5);
+        let mut ctx = Ctx {
+            kernels: &mut kernels,
+            consts: &w.consts,
+        };
+        let next = chunk(&mut ctx, &shape, rw, cache, 2, &x).unwrap();
+        let old = concat_chunk(&mut ctx, &shape, rw, &concat, 2, &x).unwrap();
+        let got = values(&mut kernels, &next.out).unwrap();
+        assert_eq!(
+            got,
+            values(&mut kernels, &old.0).unwrap(),
+            "the chunk output differs from the concatenate formulation"
+        );
+        assert_parity(
+            &got,
+            &host.outputs[2..7].concat(),
+            "chunk output against the host",
+        );
+        assert_eq!(next.cache.len, 7, "cache length after the chunk");
+        assert_eq!(next.cache.cap, 8, "the chunk crossed a growth");
+        cache = next.cache;
+        concat = old.1;
+        // Decode steps fill 8 exactly and then grow to 12.
+        for n in 7..12u32 {
+            let xr = upload(&mut kernels, vec![1, 64], &input(n));
+            let mut ctx = Ctx {
+                kernels: &mut kernels,
+                consts: &w.consts,
+            };
+            let next = step(&mut ctx, &shape, rw, cache, n, &xr).unwrap();
+            let old = concat_step(&mut ctx, &shape, rw, &concat, n, &xr).unwrap();
+            let got = values(&mut kernels, &next.out).unwrap();
+            assert_eq!(
+                got,
+                values(&mut kernels, &old.0).unwrap(),
+                "decode step {n} after the chunk differs from the concatenate formulation"
+            );
+            assert_parity(
+                &got,
+                &host.outputs[n as usize],
+                &format!("decode step {n} against the host"),
+            );
+            cache = next.cache;
+            concat = old.1;
+        }
+        assert_eq!(cache.len, 12, "final length");
+        assert_eq!(cache.cap, 12, "the decode steps crossed the second growth");
+        // The caches agree bit for bit on the valid prefix.
+        let (hkv, hd) = (shape.attn.heads_kv, shape.attn.head_dim);
+        for (name, new_tensor, old_tensor) in [
+            ("keys", &cache.k, &concat.k),
+            ("values", &cache.v, &concat.v),
+        ] {
+            let (new_tensor, old_tensor) = (new_tensor.as_ref(), old_tensor.as_ref());
+            let got = values(&mut kernels, new_tensor.unwrap()).unwrap();
+            let want = values(&mut kernels, old_tensor.unwrap()).unwrap();
+            assert_eq!(
+                prefix_rows(&got, hkv, cache.cap, 12, hd),
+                want,
+                "cached {name} differ from the concatenate formulation"
+            );
+        }
+    }
+
+    /// Review B finding 2 (the chunk half of it): a chunk of MORE than one row appended into
+    /// existing slack with NO growth — two decode steps hold 2 of 4 positions and a chunk of 2
+    /// fills the capacity exactly, in place — then a second chunk of 3 rows that grows the
+    /// buffers to 8, then decode steps that fill 8 exactly and grow to 12. Every output is
+    /// bit-equal to the old concatenate formulation, and the capacity assertions pin the growth
+    /// schedule (no growth inside the slack, growth at the boundary). Whether the append runs in
+    /// place is not visible here: a branch that always grows keeps every capacity and every
+    /// result; only the donation test of `attn.rs` on the Mac can see it.
+    #[test]
+    fn two_chunks_in_slack_then_a_growth_then_decode_match_the_old_formulation() {
+        let _serial = crate::native_test_lock();
+        let (ckpt, oracle, w, mut kernels) = setup();
+        let shape = oracle.shape().clone();
+        let RMixer::Attn(rw) = &w.layers[1].mixer else {
+            panic!("resident layer 1 is attention");
+        };
+        let host = host_run(&ckpt, &oracle, 9);
+        let mut cache = KvCache::with_step(4);
+        let mut concat = ConcatCache {
+            k: None,
+            v: None,
+            len: 0,
+        };
+        // Two decode steps hold 2 of the first 4 positions.
+        for n in 0..2u32 {
+            let xr = upload(&mut kernels, vec![1, 64], &input(n));
+            let mut ctx = Ctx {
+                kernels: &mut kernels,
+                consts: &w.consts,
+            };
+            let next = step(&mut ctx, &shape, rw, cache, n, &xr).unwrap();
+            let old = concat_step(&mut ctx, &shape, rw, &concat, n, &xr).unwrap();
+            assert_eq!(
+                values(&mut kernels, &next.out).unwrap(),
+                values(&mut kernels, &old.0).unwrap(),
+                "warm step {n} differs from the concatenate formulation"
+            );
+            cache = next.cache;
+            concat = old.1;
+        }
+        assert_eq!(cache.cap, 4, "the warm steps hold capacity 4");
+        // The first chunk of 2 rows: 2 + 2 = 4 fits, so the append runs in place with no growth.
+        let x = rows(&mut kernels, 2, 2);
+        let mut ctx = Ctx {
+            kernels: &mut kernels,
+            consts: &w.consts,
+        };
+        let next = chunk(&mut ctx, &shape, rw, cache, 2, &x).unwrap();
+        let old = concat_chunk(&mut ctx, &shape, rw, &concat, 2, &x).unwrap();
+        let got = values(&mut kernels, &next.out).unwrap();
+        assert_eq!(
+            got,
+            values(&mut kernels, &old.0).unwrap(),
+            "the in-place chunk output differs from the concatenate formulation"
+        );
+        assert_parity(
+            &got,
+            &host.outputs[2..4].concat(),
+            "the in-place chunk output against the host",
+        );
+        assert_eq!(next.cache.len, 4, "length after the in-place chunk");
+        assert_eq!(next.cache.cap, 4, "the in-place chunk grows nothing");
+        cache = next.cache;
+        concat = old.1;
+        // The second chunk of 3 rows: 4 + 3 = 7 passes 4, so the buffers grow to 8.
+        let x = rows(&mut kernels, 4, 3);
+        let mut ctx = Ctx {
+            kernels: &mut kernels,
+            consts: &w.consts,
+        };
+        let next = chunk(&mut ctx, &shape, rw, cache, 4, &x).unwrap();
+        let old = concat_chunk(&mut ctx, &shape, rw, &concat, 4, &x).unwrap();
+        let got = values(&mut kernels, &next.out).unwrap();
+        assert_eq!(
+            got,
+            values(&mut kernels, &old.0).unwrap(),
+            "the second chunk output differs from the concatenate formulation"
+        );
+        assert_parity(
+            &got,
+            &host.outputs[4..7].concat(),
+            "the second chunk output against the host",
+        );
+        assert_eq!(next.cache.len, 7, "length after the second chunk");
+        assert_eq!(next.cache.cap, 8, "the second chunk crossed a growth");
+        cache = next.cache;
+        concat = old.1;
+        // Decode steps fill 8 exactly and then grow to 12.
+        for n in 7..9u32 {
+            let xr = upload(&mut kernels, vec![1, 64], &input(n));
+            let mut ctx = Ctx {
+                kernels: &mut kernels,
+                consts: &w.consts,
+            };
+            let next = step(&mut ctx, &shape, rw, cache, n, &xr).unwrap();
+            let old = concat_step(&mut ctx, &shape, rw, &concat, n, &xr).unwrap();
+            let got = values(&mut kernels, &next.out).unwrap();
+            assert_eq!(
+                got,
+                values(&mut kernels, &old.0).unwrap(),
+                "decode step {n} after the chunks differs from the concatenate formulation"
+            );
+            assert_parity(
+                &got,
+                &host.outputs[n as usize],
+                &format!("decode step {n} against the host"),
+            );
+            cache = next.cache;
+            concat = old.1;
+        }
+        assert_eq!(cache.len, 9, "final length");
+        assert_eq!(cache.cap, 12, "the last decode step crossed the growth");
     }
 
     #[test]
@@ -334,6 +668,8 @@ mod tests {
             k: Some(one_head(&mut kernels)),
             v: Some(one_head(&mut kernels)),
             len: 1,
+            cap: 1,
+            step: 4,
         };
         let mut ctx = Ctx {
             kernels: &mut kernels,
@@ -342,15 +678,15 @@ mod tests {
         let cases = [
             (
                 "cache holds 0 positions",
-                chunk(&mut ctx, &shape, rw, &KvCache::empty(), 3, &x),
+                chunk(&mut ctx, &shape, rw, KvCache::empty(), 3, &x),
             ),
             (
                 "does not match its shape",
-                chunk(&mut ctx, &shape, rw, &bad, 1, &x),
+                chunk(&mut ctx, &shape, rw, bad, 1, &x),
             ),
             (
                 "chunk input must be [T, H]",
-                chunk(&mut ctx, &shape, rw, &KvCache::empty(), 0, &flat),
+                chunk(&mut ctx, &shape, rw, KvCache::empty(), 0, &flat),
             ),
         ];
         for (needle, result) in cases {
@@ -377,7 +713,7 @@ mod tests {
             kernels: &mut kernels,
             consts: &w.consts,
         };
-        let next = chunk(&mut ctx, &shape, rw, &KvCache::empty(), 0, &x).unwrap();
+        let next = chunk(&mut ctx, &shape, rw, KvCache::empty(), 0, &x).unwrap();
         assert_eq!(
             kernels.qualification_sync_count(),
             before,

@@ -1,12 +1,20 @@
 //! Resident Q36 session state (packet Q36-D), with the step's check, poison, and commit.
 //!
 //! DeltaNet layers keep a recurrent state `[VH, VD, KD]` and a convolution ring `[CD, CK - 1]`.
-//! Attention layers keep an F32 key-value cache that grows by one position per step. The growth
-//! charge covers the cache only, as in the Flash-Next decoder (decision 0039 amendment). The fixed
-//! DeltaNet state of 65,863,680 bytes is not charged by the steps; a snapshot charges it once with
-//! its entry (decision 0036, addendum 1).
+//! Attention layers keep an F32 key-value cache in preallocated capacity buffers written in
+//! place (packet Q36-KV-INTEGRATE): `[1, KVH, cap, D]` per key and value tensor, `len` valid
+//! positions, growth in `KV_STEP` quanta. The growth charge covers the cache only, as in the
+//! Flash-Next decoder (decision 0039 amendment), and stays LOGICAL — `len` positions of growth
+//! bytes per layer — so the capacity slack, bounded by one `KV_STEP` of growth bytes per
+//! attention layer (256 * 4,096 * 10 = 10,485,760 bytes on the real model), never enters a
+//! permit; `kv_storage_bytes` reports the stored bytes. The slack bound excludes the growth
+//! TRANSIENT — the old buffer, its slice copy, and the new buffer alive together at a growth,
+//! about 100 MB per layer at depth 8,192 — which the session reserve margin and the retire cap
+//! cover. The fixed DeltaNet state of 65,863,680 bytes is not charged by the steps; a snapshot
+//! charges it once with its entry (decision 0036, addendum 1).
 
 use super::attn::{KvCache, growth_bytes};
+use super::kv_plan::{KV_STEP, session_bytes};
 use super::ops::{Bytes, dim, short_import, zeros};
 use super::weights::{RMixer, ResidentWeights};
 use crate::{
@@ -39,6 +47,8 @@ impl LayerState {
                 k: cache.k.as_ref().map(ExecutionTensor::share),
                 v: cache.v.as_ref().map(ExecutionTensor::share),
                 len: cache.len,
+                cap: cache.cap,
+                step: cache.step,
             }),
         }
     }
@@ -65,8 +75,39 @@ pub(super) fn chunk_growth_bytes(weights: &ResidentWeights, rows: u32) -> Result
         .ok_or_else(|| EngError::MemoryPlan("kv chunk growth bytes overflow u64".into()))
 }
 
-/// Bytes of the attention caches in `layers`, summed from the tensors' own sizes.
-fn kv_bytes(layers: &[LayerState]) -> u64 {
+/// The LOGICAL bytes of the attention caches in `layers` (packet Q36-KV-INTEGRATE): one
+/// `kv_plan::session_bytes` charge — the attention layer count, the valid length they hold, and
+/// the PER-LAYER growth — because every attention layer of a committed, snapshotted, or restored
+/// state holds the same valid length, the position (`check_step` before a step,
+/// `check_saved_layer` before a restore). The charge of a state at `pos` is therefore exactly
+/// `pos * kv_growth_bytes(weights)`, the formula the step and chunk permits hold; the capacity
+/// slack of the buffers never enters it, and the slack of a whole session stays below one
+/// `KV_STEP` of growth bytes per attention layer (256 * 4,096 * 10 = 10,485,760 bytes on the
+/// real model). Attention layers of UNEQUAL valid length give `u64::MAX`, so a state whose layers
+/// disagree fails the permit equality check instead of passing on the last layer's length. Use
+/// `kv_storage_bytes` for the stored bytes.
+fn kv_bytes(layers: &[LayerState], per_layer: u64) -> u64 {
+    let mut attn_layers = 0;
+    let mut len: Option<usize> = None;
+    for layer in layers {
+        if let LayerState::Attn(cache) = layer {
+            attn_layers += 1;
+            match len {
+                None => len = Some(cache.len),
+                // Attention layers of unequal valid length cannot be a committed state: the
+                // charge saturates, so the permit equality check of `commit_rows` fails.
+                Some(first) if first != cache.len => return u64::MAX,
+                Some(_) => {}
+            }
+        }
+    }
+    session_bytes(attn_layers, len.unwrap_or(0), per_layer).unwrap_or(u64::MAX)
+}
+
+/// Bytes that the attention cache tensors of `layers` store: the capacity buffers summed from
+/// the tensors' own sizes, slack included (packet Q36-KV-INTEGRATE). Reports and tests read this;
+/// the admission charge is `kv_bytes`.
+pub(super) fn kv_storage_bytes(layers: &[LayerState]) -> u64 {
     layers
         .iter()
         .map(|layer| match layer {
@@ -114,11 +155,13 @@ fn check_saved_layer(
             }
         }
         (RMixer::Attn(_), LayerState::Attn(cache)) => {
-            let kv_shape = [1, dim(a.heads_kv)?, dim(cache.len)?, dim(a.head_dim)?];
+            let kv_shape = [1, dim(a.heads_kv)?, dim(cache.cap)?, dim(a.head_dim)?];
             let parts_ok = match (&cache.k, &cache.v) {
-                (None, None) => cache.len == 0,
+                (None, None) => cache.len == 0 && cache.cap == 0,
                 (Some(k), Some(v)) => {
-                    k.shape() == kv_shape.as_slice() && v.shape() == kv_shape.as_slice()
+                    cache.cap >= cache.len
+                        && k.shape() == kv_shape.as_slice()
+                        && v.shape() == kv_shape.as_slice()
                 }
                 _ => false,
             };
@@ -136,10 +179,12 @@ fn check_saved_layer(
     }
 }
 
-/// A committed `ResidentState` held by shared handles (decision 0036, addendum 1). Its arrays are
-/// immutable: a step builds new arrays and never writes into an existing one. One growth permit
-/// charges all its bytes to the session budget and releases them when the snapshot drops. It holds
-/// no logits (addendum 1 item 3).
+/// A committed `ResidentState` held by shared handles (decision 0036, addendum 1). Its arrays
+/// stay unchanged: a step on a cache buffer this snapshot shares keeps the handle count above
+/// one, so `kv_append` copies the buffer once instead of writing it in place, and a step on a
+/// buffer nothing else holds writes in place without touching this snapshot. One growth permit
+/// charges all its bytes to the session budget and releases them when the snapshot drops. It
+/// holds no logits (addendum 1 item 3).
 pub(super) struct ResidentSnapshot {
     layers: Vec<LayerState>,
     pos: u32,
@@ -163,16 +208,46 @@ pub(super) struct ResidentState {
     layers: Vec<LayerState>,
     pos: u32,
     poisoned: bool,
-    /// One growth permit per committed step. Together they hold the stored cache bytes.
+    /// One growth permit per committed step. Together they hold the logical cache bytes.
     /// `reset` and drop release them. A failed step keeps the earlier permits until `reset`.
     permits: Vec<GrowthPermit>,
+    /// The LOGICAL growth bytes of ONE position of ONE attention layer
+    /// (`attn::growth_bytes(&weights.shape)`), fixed at `zero`. `kv_bytes` multiplies it by the
+    /// attention layer count and the valid length, so a state at `pos` charges exactly
+    /// `pos * kv_growth_bytes(weights)` — the all-layer growth — which the permits hold (packet
+    /// Q36-KV-INTEGRATE fix1 item 1).
+    kv_growth_per_layer: u64,
+    /// The growth quantum of the attention caches, in positions: `KV_STEP` for `zero` and the
+    /// test step for `zero_with_step`. `reset` keeps it (fix1 item 3.5).
+    kv_step: usize,
 }
 
 impl ResidentState {
-    /// Imports a zero state with one `import_many` (one synchronization, outside the per-token budget).
+    /// Imports a zero state with one `import_many` (one synchronization, outside the per-token
+    /// budget). The attention caches grow in `KV_STEP` quanta.
     pub(super) fn zero(
         kernels: &mut MlxKernels,
         weights: &ResidentWeights,
+    ) -> Result<Self, EngError> {
+        Self::zero_with(kernels, weights, KV_STEP)
+    }
+
+    /// Imports a zero state whose attention caches grow in `kv_step`-position quanta. Tests use
+    /// a small step so a run crosses a growth boundary within a few tokens.
+    #[cfg(test)]
+    pub(super) fn zero_with_step(
+        kernels: &mut MlxKernels,
+        weights: &ResidentWeights,
+        kv_step: usize,
+    ) -> Result<Self, EngError> {
+        Self::zero_with(kernels, weights, kv_step)
+    }
+
+    /// The one constructor body of `zero` and `zero_with_step`.
+    fn zero_with(
+        kernels: &mut MlxKernels,
+        weights: &ResidentWeights,
+        kv_step: usize,
     ) -> Result<Self, EngError> {
         let d = &weights.shape.delta;
         let rec = vec![dim(d.value_heads)?, dim(d.value_dim)?, dim(d.key_dim)?];
@@ -198,7 +273,7 @@ impl ResidentState {
                     rec: next()?,
                     ring: next()?,
                 },
-                RMixer::Attn(_) => LayerState::Attn(KvCache::empty()),
+                RMixer::Attn(_) => LayerState::Attn(KvCache::with_step(kv_step)),
             });
         }
         Ok(Self {
@@ -206,6 +281,8 @@ impl ResidentState {
             pos: 0,
             poisoned: false,
             permits: Vec::new(),
+            kv_growth_per_layer: growth_bytes(&weights.shape)?,
+            kv_step,
         })
     }
 
@@ -236,8 +313,10 @@ impl ResidentState {
 
     /// Host checks before a step. They make no native call. On error the state is unchanged and not
     /// poisoned. A poisoned state returns `BadRequest`. A position at `context_limit` returns
-    /// `ContextLimit`. A layer kind or cache length that differs from the weights or the position
-    /// returns `BadRequest`.
+    /// `ContextLimit`. A layer kind, cache length, or attention buffer shape — the `[1, KVH, cap, D]`
+    /// pair with `cap >= len`, the same check as `KvCache::check_buffers` — that differs from the
+    /// weights or the position returns `BadRequest`, so every host validation of the step runs
+    /// before the first native call and before any buffer is consumed (fix1 item 3.3).
     pub(super) fn check_step(
         &self,
         weights: &ResidentWeights,
@@ -261,8 +340,17 @@ impl ResidentState {
         for (layer, state) in weights.layers.iter().zip(&self.layers) {
             match (&layer.mixer, state) {
                 (RMixer::Delta(_), LayerState::Delta { .. }) => {}
-                (RMixer::Attn(_), LayerState::Attn(cache))
-                    if usize::try_from(self.pos).ok() == Some(cache.len) => {}
+                (RMixer::Attn(_), LayerState::Attn(cache)) => {
+                    if usize::try_from(self.pos).ok() != Some(cache.len) {
+                        return Err(EngError::BadRequest(
+                            "layer state does not match its weights or the position".into(),
+                        ));
+                    }
+                    cache.check_buffers(
+                        dim(weights.shape.attn.heads_kv)?,
+                        dim(weights.shape.attn.head_dim)?,
+                    )?;
+                }
                 _ => {
                     return Err(EngError::BadRequest(
                         "layer state does not match its weights or the position".into(),
@@ -324,8 +412,9 @@ impl ResidentState {
     }
 
     /// Publishes a step of `rows` tokens after its `evaluate` and readbacks succeeded. It keeps
-    /// `permit` only if the total charge equals the stored cache bytes. Otherwise it returns
-    /// `MemoryPlan`, drops `permit`, and changes nothing.
+    /// `permit` only if the total charge equals the LOGICAL cache bytes (`len` positions of
+    /// growth per layer; packet Q36-KV-INTEGRATE). Otherwise it returns `MemoryPlan`, drops
+    /// `permit`, and changes nothing.
     pub(super) fn commit_rows(
         &mut self,
         rows: u32,
@@ -340,10 +429,10 @@ impl ResidentState {
             .charged_bytes()?
             .checked_add(permit.retained_bytes())
             .ok_or_else(|| EngError::MemoryPlan("session charge overflows u64".into()))?;
-        let stored = kv_bytes(&layers);
-        if stored != charged {
+        let logical = kv_bytes(&layers, self.kv_growth_per_layer);
+        if logical != charged {
             return Err(EngError::MemoryPlan(format!(
-                "session charge {charged} bytes differs from stored cache bytes {stored}"
+                "session charge {charged} bytes differs from the logical cache bytes {logical}"
             )));
         }
         self.permits.push(permit);
@@ -366,7 +455,7 @@ impl ResidentState {
                 "a poisoned resident state cannot be saved".into(),
             ));
         }
-        let bytes = kv_bytes(&self.layers)
+        let bytes = kv_bytes(&self.layers, self.kv_growth_per_layer)
             .checked_add(fixed_bytes(&self.layers)?)
             .ok_or_else(|| EngError::MemoryPlan("snapshot bytes overflow u64".into()))?;
         let charge = budget.acquire_growth(bytes)?;
@@ -415,16 +504,17 @@ impl ResidentState {
         // bytes first, so the state keeps its old charge and returns `MemoryPlan` unchanged.
         let held = self.charged_bytes()?;
         drop(std::mem::take(&mut self.permits));
-        let permit = match budget.acquire_growth(kv_bytes(&snapshot.layers)) {
-            Ok(permit) => permit,
-            Err(denied) => {
-                self.permits = budget
-                    .acquire_growth(held)
-                    .map(|permit| vec![permit])
-                    .unwrap_or_default();
-                return Err(denied);
-            }
-        };
+        let permit =
+            match budget.acquire_growth(kv_bytes(&snapshot.layers, self.kv_growth_per_layer)) {
+                Ok(permit) => permit,
+                Err(denied) => {
+                    self.permits = budget
+                        .acquire_growth(held)
+                        .map(|permit| vec![permit])
+                        .unwrap_or_default();
+                    return Err(denied);
+                }
+            };
         self.permits = vec![permit];
         self.layers = snapshot.layers.iter().map(LayerState::share).collect();
         self.pos = snapshot.pos;
@@ -432,13 +522,16 @@ impl ResidentState {
         Ok(())
     }
 
-    /// Replaces this state with a fresh zero state. On error the state is unchanged.
+    /// Replaces this state with a fresh zero state. On error the state is unchanged. The state
+    /// keeps its growth quantum: a state made with `zero_with_step` resets to the same step, not
+    /// to `KV_STEP` (fix1 item 3.5).
     pub(super) fn reset(
         &mut self,
         kernels: &mut MlxKernels,
         weights: &ResidentWeights,
     ) -> Result<(), EngError> {
-        *self = Self::zero(kernels, weights)?;
+        let kv_step = self.kv_step;
+        *self = Self::zero_with(kernels, weights, kv_step)?;
         Ok(())
     }
 
@@ -462,7 +555,7 @@ impl ResidentState {
 mod snapshot_tests {
     use super::super::decoder::{ResidentDecoder, StepMode};
     use super::super::ops::values;
-    use super::{LayerState, ResidentState};
+    use super::{KV_STEP, LayerState, ResidentState, kv_storage_bytes};
     use crate::family::qwen36::host_load::HostWeights;
     use crate::family::qwen36::tiny::{self, TINY_GQA};
     use crate::{
@@ -528,11 +621,42 @@ mod snapshot_tests {
             .collect()
     }
 
-    /// Reads back every array in `list`.
-    fn read(decoder: &mut ResidentDecoder<'_>, list: Vec<&ExecutionTensor>) -> Vec<Vec<f32>> {
-        list.into_iter()
-            .map(|tensor| values(&mut decoder.kernels, tensor).unwrap())
+    /// The capacity of every attention cache in `layers`, in model order.
+    fn kv_caps(layers: &[LayerState]) -> Vec<usize> {
+        layers
+            .iter()
+            .filter_map(|layer| match layer {
+                LayerState::Attn(cache) => Some(cache.cap),
+                LayerState::Delta { .. } => None,
+            })
             .collect()
+    }
+
+    /// Reads back the state that `layers` holds, in the order of `arrays`. An attention cache
+    /// reads only its first `len` positions: the rows beyond `len` are capacity slack with no
+    /// value (packet Q36-KV-INTEGRATE).
+    fn read_state(decoder: &mut ResidentDecoder<'_>, layers: &[LayerState]) -> Vec<Vec<f32>> {
+        let shape = &decoder.weights.shape;
+        let (hkv, hd) = (shape.attn.heads_kv as u32, shape.attn.head_dim as u32);
+        let mut out = Vec::new();
+        for layer in layers {
+            match layer {
+                LayerState::Delta { rec, ring } => {
+                    out.push(values(&mut decoder.kernels, rec).unwrap());
+                    out.push(values(&mut decoder.kernels, ring).unwrap());
+                }
+                LayerState::Attn(cache) => {
+                    for tensor in [&cache.k, &cache.v].into_iter().flatten() {
+                        let prefix = decoder
+                            .kernels
+                            .slice(tensor, &[0, 0, 0, 0], &[1, hkv, cache.len as u32, hd])
+                            .unwrap();
+                        out.push(values(&mut decoder.kernels, &prefix).unwrap());
+                    }
+                }
+            }
+        }
+        out
     }
 
     #[test]
@@ -704,8 +828,8 @@ mod snapshot_tests {
         let mut live = decoder.zero_state().unwrap();
         prefill(&mut decoder, &mut live, &[1, 2, 3]);
         let snapshot = decoder.snapshot(&live).unwrap();
-        let live_before = read(&mut decoder, arrays(live.layers()));
-        let saved_before = read(&mut decoder, arrays(&snapshot.layers));
+        let live_before = read_state(&mut decoder, live.layers());
+        let saved_before = read_state(&mut decoder, &snapshot.layers);
         assert_eq!(
             saved_before, live_before,
             "the snapshot holds the live values"
@@ -727,15 +851,100 @@ mod snapshot_tests {
             "the DeltaNet state is not all zero, so the test can see a change"
         );
         prefill(&mut decoder, &mut live, &[4, 5, 6, 7, 1]);
-        let saved_after = read(&mut decoder, arrays(&snapshot.layers));
+        let saved_after = read_state(&mut decoder, &snapshot.layers);
         assert_eq!(
             saved_after, saved_before,
             "live steps changed the snapshot arrays"
         );
-        let live_after = read(&mut decoder, arrays(live.layers()));
+        let live_after = read_state(&mut decoder, live.layers());
         assert_ne!(
             live_after[0], saved_before[0],
             "the live DeltaNet state moved on"
+        );
+    }
+
+    /// Packet Q36-KV-INTEGRATE item 4: a snapshot taken before further steps keeps its own
+    /// values. The caches grow in quanta of 3, so the snapshot at position 2 shares a buffer
+    /// whose next append on the live state would write in place (the operation copies a shared
+    /// buffer once), the fourth token grows the buffers to 6, and the seventh to 9. The rows
+    /// below the snapshot's `len` stay bitwise unchanged, and restoring the snapshot and running
+    /// the same suffix gives the same tokens and logits as the straight run.
+    #[test]
+    fn a_snapshot_keeps_its_rows_across_growth_and_restores_to_the_same_tokens() {
+        let _serial = crate::native_test_lock();
+        let (ckpt, host) = load();
+        let mut decoder = decoder_with_cap(&ckpt, host, 1_000_000);
+        let mut live =
+            ResidentState::zero_with_step(&mut decoder.kernels, &decoder.weights, 3).unwrap();
+        prefill(&mut decoder, &mut live, &[1, 2]);
+        let snapshot = decoder.snapshot(&live).unwrap();
+        let saved = read_state(&mut decoder, &snapshot.layers);
+        let suffix = [4u32, 5, 6, 7, 1, 2, 3];
+        let mut straight = Vec::new();
+        for &token in &suffix {
+            straight.push(decoder.step(&mut live, token, StepMode::Record).unwrap());
+        }
+        let after = read_state(&mut decoder, &snapshot.layers);
+        assert_eq!(
+            after, saved,
+            "live steps (an in-place append on the shared buffer and two growths) changed the snapshot"
+        );
+        // The live state really crossed the growth boundaries: caps 3 -> 6 -> 9.
+        assert_eq!(kv_caps(live.layers()), vec![9, 9], "both caches grew twice");
+        // Restoring the snapshot and running the same suffix gives the straight run.
+        let mut restored = decoder.zero_state().unwrap();
+        decoder.restore(&mut restored, &snapshot).unwrap();
+        for (index, &token) in suffix.iter().enumerate() {
+            let got = decoder
+                .step(&mut restored, token, StepMode::Record)
+                .unwrap();
+            assert_eq!(
+                got.token, straight[index].token,
+                "suffix token {index} differs after the restore"
+            );
+            assert_eq!(
+                got.logits, straight[index].logits,
+                "suffix token {index} logits differ after the restore"
+            );
+        }
+        assert_eq!(restored.pos(), 9, "position after the suffix");
+    }
+
+    /// Packet Q36-KV-INTEGRATE item 6(d): after 30 steps with the default quantum (the test decoder's context limit is 32 positions) the actual
+    /// storage (the sum of the tensors' `byte_len`) is exactly one quantum of capacity per
+    /// attention layer, that is the logical bytes plus the unused `KV_STEP - 30` positions.
+    #[test]
+    fn the_cache_storage_exceeds_the_logical_bytes_by_exactly_the_unused_quantum() {
+        let _serial = crate::native_test_lock();
+        let (ckpt, host) = load();
+        let mut decoder = decoder_with_cap(&ckpt, host, 1_000_000);
+        let mut state = decoder.zero_state().unwrap();
+        let tokens: Vec<u32> = (0..30).map(|t| (t % 7 + 1) as u32).collect();
+        prefill(&mut decoder, &mut state, &tokens);
+        let logical = u64::from(state.pos()) * KV_PER_TOKEN;
+        let stored = kv_storage_bytes(state.layers());
+        assert_eq!(
+            kv_lens(state.layers()),
+            vec![30, 30],
+            "both caches hold the run"
+        );
+        // The exact hand-derived storage (review B finding 4): 30 positions of the default
+        // quantum 256 round up to one step of capacity per layer, so the buffers hold exactly
+        // `KV_STEP * KV_PER_TOKEN` bytes, not any capacity in [30, 30 + 256].
+        assert_eq!(
+            kv_caps(state.layers()),
+            vec![KV_STEP, KV_STEP],
+            "thirty positions of the default quantum hold exactly one step of capacity"
+        );
+        assert_eq!(
+            state.byte_len().unwrap(),
+            FIXED_BYTES + stored,
+            "the state reports the stored bytes"
+        );
+        assert_eq!(stored, KV_STEP as u64 * KV_PER_TOKEN, "the exact storage");
+        assert!(
+            stored >= logical,
+            "the buffers hold at least the valid rows: {stored} < {logical}"
         );
     }
 
@@ -1090,9 +1299,9 @@ mod snapshot_tests {
         decoder.restore(&mut first, &snapshot).unwrap();
         let mut second = decoder.zero_state().unwrap();
         decoder.restore(&mut second, &snapshot).unwrap();
-        let saved = read(&mut decoder, arrays(&snapshot.layers));
-        let first_before = read(&mut decoder, arrays(first.layers()));
-        let second_before = read(&mut decoder, arrays(second.layers()));
+        let saved = read_state(&mut decoder, &snapshot.layers);
+        let first_before = read_state(&mut decoder, first.layers());
+        let second_before = read_state(&mut decoder, second.layers());
         assert_eq!(
             first_before, saved,
             "the first restore shares the saved arrays"
@@ -1102,8 +1311,8 @@ mod snapshot_tests {
             "the second restore shares the saved arrays"
         );
         decoder.step(&mut first, 4, StepMode::Prompt).unwrap();
-        let first_after = read(&mut decoder, arrays(first.layers()));
-        let second_after = read(&mut decoder, arrays(second.layers()));
+        let first_after = read_state(&mut decoder, first.layers());
+        let second_after = read_state(&mut decoder, second.layers());
         assert_eq!(
             second_after, second_before,
             "a step on one state changed the other bitwise"
@@ -1114,6 +1323,99 @@ mod snapshot_tests {
         );
         assert_eq!(first.pos(), 4, "the first state advanced");
         assert_eq!(second.pos(), 3, "the second state stayed");
+    }
+
+    /// Fix1 item 2 (review A finding 2, review B finding 1): two states restored from ONE
+    /// snapshot step DIFFERENT tokens at the SAME position. Every sharer's append writes
+    /// position 2, the first slack row of the shared buffer, so a missed copy — `kv_append`
+    /// writing in place through the snapshot's handle — makes B's token 5 overwrite A's token 4,
+    /// and A's next step, whose growth copies the valid prefix `[0, 3)`, reads B's row. Each
+    /// state's logits are compared bit for bit with an independent straight run of the same
+    /// token sequence on a fresh state.
+    #[test]
+    fn two_restores_that_step_different_tokens_match_independent_straight_runs() {
+        let _serial = crate::native_test_lock();
+        let (ckpt, host) = load();
+        let mut decoder = decoder_with_cap(&ckpt, host, 1_000_000);
+        let mut live =
+            ResidentState::zero_with_step(&mut decoder.kernels, &decoder.weights, 3).unwrap();
+        prefill(&mut decoder, &mut live, &[1, 2]);
+        // The snapshot at position 2 of capacity 3 shares its buffers with every restore.
+        let snapshot = decoder.snapshot(&live).unwrap();
+        let mut a = decoder.zero_state().unwrap();
+        decoder.restore(&mut a, &snapshot).unwrap();
+        let mut b = decoder.zero_state().unwrap();
+        decoder.restore(&mut b, &snapshot).unwrap();
+        // Both states write position 2, A with token 4 and B with token 5.
+        let a_four = decoder.step(&mut a, 4, StepMode::Record).unwrap();
+        let b_five = decoder.step(&mut b, 5, StepMode::Record).unwrap();
+        // A steps again: the growth to 6 copies the prefix `[0, 3)`, which under the missed-copy
+        // bug holds B's row 2 instead of A's.
+        let a_six = decoder.step(&mut a, 6, StepMode::Record).unwrap();
+        // The independent straight runs of the same token sequences, on fresh states.
+        let mut straight_a =
+            ResidentState::zero_with_step(&mut decoder.kernels, &decoder.weights, 3).unwrap();
+        prefill(&mut decoder, &mut straight_a, &[1, 2]);
+        let want_four = decoder.step(&mut straight_a, 4, StepMode::Record).unwrap();
+        let want_six = decoder.step(&mut straight_a, 6, StepMode::Record).unwrap();
+        let mut straight_b =
+            ResidentState::zero_with_step(&mut decoder.kernels, &decoder.weights, 3).unwrap();
+        prefill(&mut decoder, &mut straight_b, &[1, 2]);
+        let want_five = decoder.step(&mut straight_b, 5, StepMode::Record).unwrap();
+        assert_eq!(
+            a_four.token, want_four.token,
+            "A: the token of the first step"
+        );
+        assert_eq!(
+            a_four.logits, want_four.logits,
+            "A: the logits of the first step differ from the straight run [1, 2, 4]"
+        );
+        assert_eq!(
+            a_six.token, want_six.token,
+            "A: the token after the aliased row"
+        );
+        assert_eq!(
+            a_six.logits, want_six.logits,
+            "A: the logits after stepping past the aliased row differ from the straight run [1, 2, 4, 6]"
+        );
+        assert_eq!(b_five.token, want_five.token, "B: the token");
+        assert_eq!(
+            b_five.logits, want_five.logits,
+            "B: the logits differ from the straight run [1, 2, 5]"
+        );
+        assert_eq!(a.pos(), 4, "A holds four positions");
+        assert_eq!(b.pos(), 3, "B holds three positions");
+    }
+
+    /// Review B finding 5: the `cap >= len` clause of `check_saved_layer` is reached by a cache
+    /// whose buffer shapes MATCH the claimed capacity. The snapshot claims 300 positions while
+    /// its buffers hold the 256 of one default quantum, and the restore refuses it.
+    #[test]
+    fn a_restore_rejects_a_saved_cache_whose_capacity_is_below_its_length() {
+        let _serial = crate::native_test_lock();
+        let (ckpt, host) = load();
+        let mut decoder = decoder_with_cap(&ckpt, host, 100_000);
+        let mut live = decoder.zero_state().unwrap();
+        prefill(&mut decoder, &mut live, &[1, 2, 3]);
+        let mut wrong = decoder.snapshot(&live).unwrap();
+        // The attention layers (1 and 3 of TINY_GQA) have buffers `[1, 2, 256, 32]` (one
+        // quantum) and now ALL claim 300 valid positions at the same capacity, so the layer
+        // check reaches its `cap >= len` clause (one layer left at 3 positions would reject on
+        // the position before the capacity is looked at).
+        for layer in &mut wrong.layers {
+            if let LayerState::Attn(cache) = layer {
+                cache.len = 300;
+            }
+        }
+        wrong.pos = 300;
+        let mut target = decoder.zero_state().unwrap();
+        let rejected = decoder.restore(&mut target, &wrong);
+        assert!(
+            matches!(&rejected, Err(EngError::BadRequest(m)) if m.contains("snapshot position")),
+            "{:?}",
+            rejected.err()
+        );
+        assert_eq!(target.pos(), 0, "the target is unchanged");
     }
 
     #[test]
@@ -1144,8 +1446,8 @@ mod snapshot_tests {
             "the restored run differs from the full recompute"
         );
         assert_eq!(
-            read(&mut decoder, arrays(restored.layers())),
-            read(&mut decoder, arrays(recomputed.layers())),
+            read_state(&mut decoder, restored.layers()),
+            read_state(&mut decoder, recomputed.layers()),
             "the restored state differs from the recomputed state bitwise"
         );
         assert_eq!(restored.pos(), 8, "position after prefix and suffix");

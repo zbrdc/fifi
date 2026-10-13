@@ -107,8 +107,9 @@ fn run(
     for (index, (layer, old_layer)) in weights.layers.iter().zip(old).enumerate() {
         let normed = ctx.kernels.rms_norm(&h, &layer.input_norm, shape.eps)?;
         check_dtype("input norm output", &normed, ctx.consts.act)?;
-        // The old layer state moves into its arm and drops at the end of the arm, after the
-        // replacement graph exists. The next synchronization frees it.
+        // The old layer state moves into its arm: an attention cache is consumed by `kv_append`
+        // (a growth replaces the buffer), and a DeltaNet state drops at the end of the arm, after
+        // the replacement graph exists. The next synchronization frees the dropped arrays.
         let (mixed, next) = match (&layer.mixer, old_layer) {
             (RMixer::Delta(w), LayerState::Delta { rec, ring }) => {
                 let s = delta::step(&mut ctx, shape, w, &rec, &ring, &normed)?;
@@ -121,7 +122,7 @@ fn run(
                 )
             }
             (RMixer::Attn(w), LayerState::Attn(cache)) => {
-                let s = attn::step(&mut ctx, shape, w, &cache, pos, &normed)?;
+                let s = attn::step(&mut ctx, shape, w, cache, pos, &normed)?;
                 (s.out, LayerState::Attn(s.cache))
             }
             _ => {
@@ -399,8 +400,9 @@ pub(super) fn split_rows(flat: Vec<f32>, layers: usize) -> Result<Vec<Vec<f32>>,
 #[cfg(test)]
 mod tests {
     use super::super::decoder::{DECODE_RETIRE_CAP, ResidentDecoder, StepMode, StepResult};
+    use super::super::kv_plan::KV_STEP;
     use super::super::ops::{assert_parity, f32_tensor, values};
-    use super::super::state::{LayerState, ResidentState};
+    use super::super::state::{LayerState, ResidentState, kv_storage_bytes};
     use super::*;
     use crate::family::qwen36::fixtures;
     use crate::family::qwen36::host::{self, HostState, LayerState as HostLayer};
@@ -450,16 +452,10 @@ mod tests {
         best as u32
     }
 
-    /// Bytes of the stored caches, summed from the tensors themselves.
+    /// Bytes of the stored caches, summed from the tensors themselves: the capacity buffers,
+    /// slack included (packet Q36-KV-INTEGRATE).
     fn stored_kv_bytes(state: &ResidentState) -> u64 {
-        state
-            .layers()
-            .iter()
-            .map(|layer| match layer {
-                LayerState::Attn(cache) => cache.byte_len(),
-                LayerState::Delta { .. } => 0,
-            })
-            .sum()
+        kv_storage_bytes(state.layers())
     }
 
     /// The process-wide synchronization count in qualification builds.
@@ -660,10 +656,18 @@ mod tests {
                 }
             }
             assert_eq!(compared, 2, "{name}: both DeltaNet layers compared");
+            // The logical charge follows the position; the storage is the exact hand-derived
+            // capacity (review B finding 4): every count of this helper (8 and 40 positions) fits
+            // one default quantum of 256, so each layer stores exactly `KV_STEP` positions.
+            let logical = u64::from(count) * GROWTH;
             assert_eq!(
                 stored_kv_bytes(state),
-                u64::from(count) * GROWTH,
-                "{name}: cache bytes"
+                KV_STEP as u64 * GROWTH,
+                "{name}: the cache storage is exactly one quantum"
+            );
+            assert!(
+                stored_kv_bytes(state) >= logical,
+                "{name}: the buffers hold at least the valid rows"
             );
         }
     }
@@ -741,7 +745,7 @@ mod tests {
     }
 
     #[test]
-    fn each_committed_step_charges_the_stored_cache_growth() {
+    fn each_committed_step_charges_the_logical_cache_growth() {
         let _serial = crate::native_test_lock();
         let (ckpt, _) = setup();
         let (mut decoder, _) = decoder_and_oracle(&ckpt, 1024);
@@ -752,10 +756,18 @@ mod tests {
             let result = decoder.step(&mut state, token(t as u32), StepMode::Prompt);
             assert!(result.is_ok(), "step {t} must commit: {result:?}");
             assert_eq!(decoder.session_used(), t * GROWTH, "charge after step {t}");
+            // The charge is logical; the storage is the exact hand-derived capacity (review B
+            // finding 4): one to three positions fit the first default quantum of 256, so each
+            // layer stores exactly `KV_STEP` positions.
+            let stored = stored_kv_bytes(&state);
             assert_eq!(
-                stored_kv_bytes(&state),
-                t * GROWTH,
-                "stored bytes after step {t}"
+                stored,
+                KV_STEP as u64 * GROWTH,
+                "step {t}: the cache storage is exactly one quantum"
+            );
+            assert!(
+                stored >= t * GROWTH,
+                "step {t}: the buffers hold at least the valid rows"
             );
         }
     }
