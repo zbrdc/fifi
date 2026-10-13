@@ -76,7 +76,7 @@ use crate::{
             host_load::{HostWeights, rotary_dim},
             settings::{Activation, chunked_prefill_allowed},
         },
-        session::{DecodeSession, Limits, PrefixSlot, TokenStepper},
+        session::{DecodeSession, Limits, PrefixSlot, TokenStepper, check_prompt},
         spec::{AttentionKind, QWEN3_6_35B_A3B},
     },
     kernels::MlxKernels,
@@ -458,6 +458,13 @@ impl Q36Executor {
 impl ExecutorOps for Q36Executor {
     type Session = Q36Session;
 
+    /// Refuses a prompt that cannot fit before any state changes. The limit is the same number
+    /// that `prefill` enforces chunk by chunk (`Limits::context_limit`), so both checks refuse
+    /// the same prompts.
+    fn check_prompt(&self, prompt_tokens: usize) -> Result<()> {
+        check_prompt(prompt_tokens, self.context_limit())
+    }
+
     fn history<'s>(&self, st: &'s Q36Session) -> &'s [u32] {
         st.core.history()
     }
@@ -807,6 +814,27 @@ mod tests {
             "{second:?}"
         );
         assert_eq!(session.state.pos(), 8, "fed positions");
+    }
+
+    #[test]
+    fn a_prompt_that_cannot_fit_is_refused_before_any_decoder_step() {
+        let _serial = crate::native_test_lock();
+        let (executor, session) = build(rules(vec![], VOCAB));
+        // The message of `session::check_prompt`, written out by hand: a prompt of 8 tokens
+        // against the limit of 8 leaves no position for the first sampled token.
+        assert_eq!(
+            executor.check_prompt(LIMIT as usize),
+            Err(EngError::ContextLimit(
+                "prompt has 8 tokens; this engine allows 7 (context limit 8 positions)".to_string()
+            ))
+        );
+        assert!(
+            executor.check_prompt(LIMIT as usize - 1).is_ok(),
+            "a prompt of 7 tokens leaves room for one sampled token"
+        );
+        assert_eq!(session.state.pos(), 0, "no decoder step ran");
+        assert!(executor.history(&session).is_empty(), "history");
+        assert!(take_log(&executor).is_empty(), "no chunk ran");
     }
 
     #[test]

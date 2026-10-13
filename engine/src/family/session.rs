@@ -356,8 +356,10 @@ struct SavedPrefix<S, P> {
 
 /// Rejects a prompt that leaves no room to generate. A prompt of `total` tokens needs `total`
 /// fed positions, and the first sampled token needs one more, so `total` must stay below
-/// `context_limit`. For example, 32,768 positions allow 32,767 prompt tokens.
-fn check_prompt(total: usize, context_limit: usize) -> Result<()> {
+/// `context_limit`. For example, 32,768 positions allow 32,767 prompt tokens. This is the one
+/// authority for the rule and its message: the session applies it in `prefill`, and the
+/// executors apply it through `ExecutorOps::check_prompt` before a job starts.
+pub(crate) fn check_prompt(total: usize, context_limit: usize) -> Result<()> {
     if total < context_limit {
         return Ok(());
     }

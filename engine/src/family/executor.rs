@@ -58,9 +58,16 @@ impl GenerationState {
     }
 }
 
-/// The calls the engine worker makes on an executor, in the worker's call order.
+/// The calls the engine worker makes on an executor, in the worker's call order. `check_prompt`
+/// comes first: the worker asks it at the start of every job, before it resets a session or
+/// feeds a token, so a prompt that cannot fit is refused before any engine work.
 pub(crate) trait ExecutorOps {
     type Session;
+    /// An executor with a context limit returns `ContextLimit` for a prompt that cannot fit; it
+    /// changes no state. Executors without a limit accept every prompt.
+    fn check_prompt(&self, _prompt_tokens: usize) -> Result<()> {
+        Ok(())
+    }
     /// The committed tokens of the session.
     fn history<'s>(&self, st: &'s Self::Session) -> &'s [u32];
     /// Clears all mutable session state together.

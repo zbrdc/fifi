@@ -796,6 +796,44 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_prompt_over_the_limit_is_refused_with_no_prefill_on_the_engine() {
+        // The rendered prompt of "hi" is 21 tokens, so an entry limit of 21 refuses it at
+        // admission: the engine never sees the job.
+        let (engine, seen) = testkit::probe_engine();
+        let (status, body) = post(&app(&engine, 21), &request(json!({}))).await;
+        assert_eq!(status, StatusCode::CONFLICT);
+        assert_eq!(error_code(&body), "context_limit");
+        assert_schema("Error", &body);
+        assert!(
+            seen.lock().expect("prompt lock").is_empty(),
+            "the engine prefilled a refused prompt"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_streaming_prompt_over_the_limit_gets_the_error_response_not_a_stream() {
+        // The refusal happens before the stream is built, so the client gets the same JSON error
+        // as a non-streaming request, with no SSE byte and no role chunk.
+        let (engine, seen) = testkit::probe_engine();
+        let app = app(&engine, 21);
+        let (status, headers, bytes) = testkit::send(
+            &app,
+            testkit::post_json("/v1/chat/completions", &request(json!({"stream": true}))),
+        )
+        .await;
+        assert_eq!(status, StatusCode::CONFLICT);
+        let content_type = headers[axum::http::header::CONTENT_TYPE]
+            .to_str()
+            .expect("content type");
+        assert_eq!(content_type, "application/json", "not an SSE stream");
+        assert_eq!(error_code(&testkit::json_of(&bytes)), "context_limit");
+        assert!(
+            seen.lock().expect("prompt lock").is_empty(),
+            "the engine prefilled a refused prompt"
+        );
+    }
+
+    #[tokio::test]
     async fn a_backend_failure_returns_500_hides_the_diagnostic_and_stops_the_engine() {
         let failure = EngError::Backend {
             operation: "qmm",

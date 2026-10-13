@@ -27,7 +27,7 @@ use crate::{
     EngError,
     family::{
         executor::{ExecutorOps, GenerationState},
-        session::{DecodeSession, Limits, TokenStepper},
+        session::{DecodeSession, Limits, TokenStepper, check_prompt},
     },
     tokenizer::DecodeBatch,
 };
@@ -60,6 +60,12 @@ impl TokenStepper for QwenResidentStep<'_> {
 
 impl ExecutorOps for QwenResidentStep<'_> {
     type Session = DecodeSession;
+
+    /// Refuses a prompt that cannot fit before any state changes. The limit is the same KV
+    /// capacity that `prefill` enforces chunk by chunk (`self.context_limit()`).
+    fn check_prompt(&self, prompt_tokens: usize) -> Result<()> {
+        check_prompt(prompt_tokens, self.context_limit())
+    }
 
     fn history<'s>(&self, st: &'s DecodeSession) -> &'s [u32] {
         st.history()

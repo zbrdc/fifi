@@ -78,7 +78,7 @@ use crate::{
     EngError,
     family::{
         executor::{ExecutorOps, GenerationState},
-        session::{DecodeSession, Limits, PrefixSlot, TokenStepper},
+        session::{DecodeSession, Limits, PrefixSlot, TokenStepper, check_prompt},
     },
     kernels::{HostPages, MlxKernels},
     tokenizer::DecodeBatch,
@@ -443,6 +443,13 @@ impl FlashExecutor {
 
 impl ExecutorOps for FlashExecutor {
     type Session = FlashSession;
+
+    /// Refuses a prompt that cannot fit before any state changes: a prompt of `context_limit()`
+    /// tokens or more fails with `ContextLimit`, the Flash-Next rule that `prefill` enforces
+    /// chunk by chunk on the same number.
+    fn check_prompt(&self, prompt_tokens: usize) -> Result<()> {
+        check_prompt(prompt_tokens, self.context_limit())
+    }
 
     fn history<'s>(&self, st: &'s FlashSession) -> &'s [u32] {
         st.core.history()

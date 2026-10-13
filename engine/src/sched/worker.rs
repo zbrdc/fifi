@@ -407,7 +407,10 @@ struct PromptPlan<'a> {
     boundary: Option<usize>,
 }
 
-/// Runs one job and returns the state of the engine after it.
+/// Runs one job and returns the state of the engine after it. The first call is the prompt
+/// check: a prompt that the executor refuses ends the job with the executor's error before any
+/// state changes, so the session stays as the last job left it, a saved prefix survives for the
+/// next job, and the engine stays `Ready`.
 fn run_job<E: ExecutorOps>(
     executor: &mut E,
     session: &mut E::Session,
@@ -421,6 +424,13 @@ fn run_job<E: ExecutorOps>(
     if generation.cancel.load(Ordering::SeqCst) {
         // A queued cancellation: nothing ran, so the session is untouched.
         send_cancelled(events, prompt_tokens);
+        return EngineState::Ready;
+    }
+    // The whole job prompt, including any tokens that a restore would cover, before any state
+    // change: the executor refuses a prompt that cannot fit here, so the job costs the next job
+    // nothing (no reset, no restore, no prefill, and its saved prefix survives).
+    if let Err(error) = executor.check_prompt(plan.tokens.len()) {
+        send_terminal(events, JobEvent::Error(error));
         return EngineState::Ready;
     }
     let reused = match start(executor, session, plan, prefill_chunk, &generation.cancel) {
@@ -577,6 +587,7 @@ mod tests {
     use crate::EngError;
     use crate::exec_fake::FakeExecutor;
     use crate::family::executor::{ExecutorOps, GenerationState};
+    use crate::family::session::check_prompt;
     use crate::sched::job::{Job, JobEvent, JobHandle, JobUsage};
     use crate::tokenizer::{DecodeBatch, DecodeFinish, IncrementalDecoder, Tokenizer};
     use std::sync::atomic::{AtomicBool, Ordering};
@@ -612,6 +623,8 @@ mod tests {
         fail_restore: Option<EngError>,
         /// The piece that `prefill_piece` reports.
         piece: Option<usize>,
+        /// The context limit that `check_prompt` applies, or `None` to accept every prompt.
+        context_limit: Option<usize>,
     }
 
     impl Spy {
@@ -630,6 +643,7 @@ mod tests {
                 fail_save: None,
                 fail_restore: None,
                 piece: None,
+                context_limit: None,
             }
         }
 
@@ -640,6 +654,16 @@ mod tests {
 
     impl ExecutorOps for Spy {
         type Session = <FakeExecutor as ExecutorOps>::Session;
+
+        /// Applies the shared rule of `session::check_prompt` when the test sets a limit. The
+        /// call is not logged: the log asserts what a job ran, and every job starts with this
+        /// check.
+        fn check_prompt(&self, prompt_tokens: usize) -> Result<(), EngError> {
+            match self.context_limit {
+                Some(limit) => check_prompt(prompt_tokens, limit),
+                None => Ok(()),
+            }
+        }
 
         fn history<'s>(&self, st: &'s Self::Session) -> &'s [u32] {
             self.inner.history(st)
@@ -1598,6 +1622,58 @@ mod tests {
                 "decode",
             ])
         );
+        drop(handle);
+        engine.shutdown();
+    }
+
+    #[test]
+    fn a_prompt_that_cannot_fit_is_refused_before_any_executor_call() {
+        // The spy applies the shared rule of `session::check_prompt` with a limit of 8: a prompt
+        // of 8 tokens needs one position for its first sampled token, so only 7 fit.
+        const LIMIT: usize = 8;
+        let log = new_log();
+        let mut spy = Spy::new(vec![vec![EOS], vec![EOS]], &log);
+        spy.context_limit = Some(LIMIT);
+        let engine = start_spy(100, spy);
+        let handle = engine.handle();
+        // The accepted prompt of 7 tokens, one below the limit, saves the key of its first 4.
+        let (first, first_events) = job_with_boundary(&[2, 2, 2, 2, 7, 7, 7], 4);
+        assert_eq!(run_one(&handle, first, first_events), stop_events(7, 0));
+        let saved = calls(&log);
+        // Every refused prompt starts with the saved key and carries a boundary, so a check that
+        // ran only after the restore would have spent the entry before refusing the prompt.
+        for (name, len, message) in [
+            (
+                "the limit",
+                LIMIT,
+                "prompt has 8 tokens; this engine allows 7 (context limit 8 positions)",
+            ),
+            (
+                "one over the limit",
+                LIMIT + 1,
+                "prompt has 9 tokens; this engine allows 7 (context limit 8 positions)",
+            ),
+            (
+                "ten times the limit",
+                10 * LIMIT,
+                "prompt has 80 tokens; this engine allows 7 (context limit 8 positions)",
+            ),
+        ] {
+            let mut prompt = vec![2, 2, 2, 2];
+            prompt.resize(len, 7);
+            let (job, events) = job_with_boundary(&prompt, 4);
+            assert_eq!(
+                run_one(&handle, job, events),
+                vec![JobEvent::Error(EngError::ContextLimit(message.to_string()))],
+                "{name}"
+            );
+            assert_eq!(calls(&log), saved, "{name}: no executor call may run");
+            assert_eq!(handle.state(), EngineState::Ready, "{name}");
+        }
+        // The next job under the limit restores the entry that the first job saved, so the
+        // refused jobs cost it nothing.
+        let (next, next_events) = job_with_boundary(&[2, 2, 2, 2, 7, 7, 7], 4);
+        assert_eq!(run_one(&handle, next, next_events), stop_events(7, 4));
         drop(handle);
         engine.shutdown();
     }
