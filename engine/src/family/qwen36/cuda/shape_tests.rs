@@ -50,3 +50,19 @@ fn the_attention_shapes_pin_every_scalar_argument() {
     assert_eq!(g.attn.scale, 0.0625);
     assert_eq!(g.attn.rope_base, 1.0e7);
 }
+
+#[test]
+fn the_attention_shapes_forward_the_kv_capacity_they_are_given() {
+    // Packet RD-9b3b section 2 pins `rows == KV capacity` and `cache_rows == capacity`: the
+    // builders must forward the capacity the executor passes (`layout().kv.capacity`), not a
+    // constant. The pin uses a capacity unlike the plan fixture's 1024 (`context_tokens`), so a
+    // hard-coded 1024 cannot pass it.
+    let capacity = 1536;
+    let p = attn_prep_shape(&geometry(), capacity);
+    assert_eq!(p.rows, capacity, "prep must forward the KV capacity");
+    let a = attn_decode_shape(&geometry(), capacity);
+    assert_eq!(
+        a.cache_rows, capacity,
+        "decode must forward the KV capacity"
+    );
+}

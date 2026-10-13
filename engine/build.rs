@@ -176,6 +176,9 @@ fn build_cuda() {
         .cuda(true)
         // cc would otherwise emit its own cudart link line. link_static_cudart emits it instead.
         .cudart("none")
+        // The vendored MMQ/MMVQ headers need C++17; nvcc takes its default dialect from the host
+        // compiler, which is C++14 under the Xavier's g++ 9.
+        .flag("-std=c++17")
         .include("src/kernels/cuda/native")
         .include("vendor/xavier-qwen/src")
         // The vendored MMQ tree and the ggml shims its headers resolve through (MATVEC-PAR S1
@@ -243,6 +246,7 @@ fn build_mmq_vendor(archs: &[String]) {
     vendor
         .cuda(true)
         .cudart("none")
+        .flag("-std=c++17")
         .include("vendor/ggml-cuda-mmq/src")
         .include("vendor/ggml-cuda-mmq/src/ggml-cuda")
         .include("src/kernels/cuda/native/prefill/ggml_shim")
