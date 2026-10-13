@@ -5,6 +5,7 @@
 //! split a prompt into chunks and a DeltaNet layer into sub-chunks. Nothing here calls the native
 //! adapter, so the tests run on Linux.
 
+use super::kv_plan::SCORE_BUDGET_BYTES;
 use crate::{EngError, family::route::Routed};
 
 /// The reserve that `delta_subchunk` keeps below the retire cap, and the default cap of the adapter:
@@ -144,11 +145,23 @@ const SCORE_COPIES: u64 = 2;
 const PLAN_FIXED: u64 = 100_000_000;
 
 /// The admission cost of a prefill chunk (decision 0044 item 6 without the page sets: every Q36
-/// expert is resident). The workspace of `rows` rows is `rows * per_token + fixed`.
+/// expert is resident). The workspace of `rows` rows is
+/// `rows * activation_per_token + min(rows * score_per_token, score_cap) + fixed`.
+///
+/// The attention scores of a chunk grow with the chunk and with the context, but the prefill cuts
+/// a chunk at great depth into parts whose score matrix stays within `SCORE_BUDGET_BYTES`
+/// (`kv_plan::depth_ranges`), so the score term never passes `SCORE_COPIES` times that budget.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) struct ChunkCost {
-    /// Bytes for each chunk token: the planning activations and the score rows at the context limit.
+    /// Bytes for each chunk token if the score rows are not capped: the planning activations and
+    /// the score rows at the context limit. A report prints it.
     pub(super) per_token: u64,
+    /// Bytes for each chunk token outside the attention scores.
+    pub(super) activation_per_token: u64,
+    /// Bytes of the score rows for each chunk token at the context limit.
+    pub(super) score_per_token: u64,
+    /// The most bytes the score term takes, whatever the chunk size.
+    pub(super) score_cap: u64,
     /// Bytes that do not depend on the chunk size, including the retire cap of a chunk.
     pub(super) fixed: u64,
 }
@@ -165,6 +178,11 @@ impl ChunkCost {
             .ok_or_else(overflow)?;
         Ok(Self {
             per_token: PLAN_PER_TOKEN.checked_add(scores).ok_or_else(overflow)?,
+            activation_per_token: PLAN_PER_TOKEN,
+            score_per_token: scores,
+            score_cap: SCORE_COPIES
+                .checked_mul(SCORE_BUDGET_BYTES)
+                .ok_or_else(overflow)?,
             fixed: PLAN_FIXED
                 .checked_add(PREFILL_RETIRE_CAP)
                 .ok_or_else(overflow)?,
@@ -173,10 +191,19 @@ impl ChunkCost {
 
     /// Workspace bytes of a chunk of `rows` rows.
     pub(super) fn workspace(&self, rows: u32) -> Result<u64, EngError> {
-        u64::from(rows)
-            .checked_mul(self.per_token)
+        let overflow = || EngError::MemoryPlan("q36 prefill workspace overflows u64".into());
+        let rows = u64::from(rows);
+        let activations = rows
+            .checked_mul(self.activation_per_token)
+            .ok_or_else(overflow)?;
+        let scores = rows
+            .checked_mul(self.score_per_token)
+            .ok_or_else(overflow)?
+            .min(self.score_cap);
+        activations
+            .checked_add(scores)
             .and_then(|n| n.checked_add(self.fixed))
-            .ok_or_else(|| EngError::MemoryPlan("q36 prefill workspace overflows u64".into()))
+            .ok_or_else(overflow)
     }
 }
 
@@ -405,5 +432,50 @@ mod tests {
         assert!(delta_subchunk(1, PREFILL_RETIRE_CAP, 0).is_err());
         assert!(delta_retire_per_token(0, 128, 128).is_err());
         assert!(delta_retire_per_token(u32::MAX, u32::MAX, u32::MAX).is_err());
+    }
+
+    /// The real shape (16 query heads) at the shipped limit of 32,768 positions and at 262,144:
+    /// the score rows are 4,194,304 and 33,554,432 bytes per token. By hand, with 1 MiB of
+    /// activations per token and `fixed` = 100,000,000 + 536,870,912 = 636,870,912:
+    /// 256 rows at 32,768 take 268,435,456 + 1,073,741,824 + 636,870,912 = 1,979,048,192, and
+    /// the score term sits exactly at its cap of 2 * 512 MiB; at 262,144 the uncapped term
+    /// would be 8,589,934,592, and the cap holds the workspace at the same 1,979,048,192.
+    #[test]
+    fn the_score_term_of_a_chunk_is_capped_at_the_depth_budget() {
+        let shipped = ChunkCost::new(16, 32_768).unwrap();
+        let deep = ChunkCost::new(16, 262_144).unwrap();
+        assert_eq!(shipped.score_per_token, 4_194_304);
+        assert_eq!(deep.score_per_token, 33_554_432);
+        assert_eq!(deep.score_cap, 1_073_741_824);
+        assert_eq!(deep.fixed, 636_870_912);
+        assert_eq!(shipped.workspace(256).unwrap(), 1_979_048_192);
+        assert_eq!(deep.workspace(256).unwrap(), 1_979_048_192);
+        // 64 rows at 262,144 positions: the cap binds (2,147,483,648 uncapped).
+        assert_eq!(deep.workspace(64).unwrap(), 1_777_721_600);
+        // 16 rows: below the cap (536,870,912), so the term is linear.
+        assert_eq!(deep.workspace(16).unwrap(), 1_190_519_040);
+        // The shipped plan is unchanged: at 32,768 positions the cap is where 256 rows end.
+        assert_eq!(
+            shipped.workspace(256).unwrap(),
+            256 * shipped.per_token + shipped.fixed
+        );
+    }
+
+    /// With the cap, a 262,144-position limit admits 256 rows when 1,979,048,192 bytes remain,
+    /// and 128 rows (1,844,830,464 bytes) with one byte less. Before the cap the 256-row
+    /// workspace was 9.5 GB and the same remainder admitted 32 rows at best.
+    #[test]
+    fn a_deep_context_limit_still_admits_a_full_chunk() {
+        let deep = ChunkCost::new(16, 262_144).unwrap();
+        assert_eq!(
+            admitted_chunk(&deep, 1_979_048_192, 256).unwrap(),
+            Some(256)
+        );
+        assert_eq!(
+            admitted_chunk(&deep, 1_979_048_191, 256).unwrap(),
+            Some(128)
+        );
+        assert_eq!(deep.workspace(128).unwrap(), 1_844_830_464);
+        assert_eq!(admitted_chunk(&deep, 1_190_519_040, 256).unwrap(), Some(16));
     }
 }
