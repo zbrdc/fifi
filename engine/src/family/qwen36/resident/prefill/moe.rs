@@ -17,12 +17,13 @@
 //! `gather_qmm` reads the selected experts in place, so a chunk has no page pool and no expert
 //! waves. The weighted rows return to token-major order with the inverse permutation and sum in
 //! choice order, as the decode step sums them. Sorting keeps the rows of one expert next to each
-//! other, and the three expert products call `gather_qmm_sorted`, which passes MLX's
-//! `sorted_indices` flag (packet Q36-PF-SORTED; the flag cuts the expert product time of a 512-row
+//! other, and the three expert products call `gather_qmm_sorted_bounded`, which passes MLX's
+//! `sorted_indices` flag over ids that one `bound_indices` clamp covers for the whole chunk
+//! (packets Q36-PF-SORTED and GAP-TRIM-A; the flag cuts the expert product time of a 512-row
 //! chunk from about 457 ms to 207 ms, Q36-GAP 3a). The host path proves the non-decreasing order
 //! of `plan.experts` before the import, because the method cannot read the device indices; the
 //! device path needs no proof, because its order comes from `argsort` by definition. The decode
-//! path keeps `gather_qmm` with `false`.
+//! path keeps the unsorted flag (`gather_qmm_bounded` with `false`).
 
 use super::super::chunk_plan::{PairPlan, pair_plan, require_sorted_experts};
 use super::super::ops::{Ctx, dim, f32_tensor, short_import, to_act, u32_tensor, values};
@@ -122,14 +123,25 @@ pub(super) fn chunk(
     require_sorted_experts(&plan.experts)?;
     let pairs = dim(plan.experts.len())?;
     let [ids, tokens, inverse, gates] = import_plan(ctx, &plan)?;
+    // One clamp for the expert ids of the whole chunk (packet GAP-TRIM-A): the three sorted
+    // gathered products share it, and the clamp of the already in-range plan ids is the identity.
+    // The `tokens` and `inverse` takes keep their own clamps: each is consumed once, so a shared
+    // clamp would save no node.
+    let bounded = ctx.kernels.bound_indices(&ids, dim(m.experts)?)?;
     // Selected experts: gate and up on the input row of each pair, SwiGLU, then down per pair.
     let picked = ctx.kernels.take(x, &tokens, 0)?;
     let x_pairs = ctx.kernels.reshape(&picked, &[pairs, 1, hidden])?;
-    let hg = ctx.kernels.gather_qmm_sorted(&x_pairs, &w.gate, &ids)?;
-    let hu = ctx.kernels.gather_qmm_sorted(&x_pairs, &w.up, &ids)?;
+    let hg = ctx
+        .kernels
+        .gather_qmm_sorted_bounded(&x_pairs, &w.gate, &bounded)?;
+    let hu = ctx
+        .kernels
+        .gather_qmm_sorted_bounded(&x_pairs, &w.up, &bounded)?;
     let act = ctx.kernels.silu(&hg)?;
     let h = ctx.kernels.binary(BinaryOp::Mul, &act, &hu)?;
-    let eo = ctx.kernels.gather_qmm_sorted(&h, &w.down, &ids)?;
+    let eo = ctx
+        .kernels
+        .gather_qmm_sorted_bounded(&h, &w.down, &bounded)?;
     let weighted = ctx.kernels.binary(BinaryOp::Mul, &eo, &gates)?;
     // Back to token-major order, then the sum over the choices of each token.
     let flat = ctx.kernels.reshape(&weighted, &[pairs, hidden])?;
@@ -252,6 +264,10 @@ pub(super) fn chunk_device(
     let keys_f = ctx.kernels.u32_to_f32(&keys)?;
     let order_p = ctx.kernels.argsort(&keys_f, 0)?;
     let sorted_ids = ctx.kernels.take_along_axis(&keys, &order_p, 0)?;
+    // One clamp for the sorted expert ids of the whole chunk (packet GAP-TRIM-A): the three
+    // sorted gathered products share it. The clamp of the argsort output is the identity, so the
+    // chunk keeps its values bit for bit.
+    let sorted_bounded = ctx.kernels.bound_indices(&sorted_ids, dim(m.experts)?)?;
     let x_rep = ctx.kernels.repeat(x, top_k, 0)?;
     let x_sorted = ctx.kernels.take(&x_rep, &order_p, 0)?;
     let x_pairs = ctx.kernels.reshape(&x_sorted, &[pairs, 1, hidden])?;
@@ -260,13 +276,15 @@ pub(super) fn chunk_device(
     // elementwise product as in the host path; only its place moves (token-major, not sorted).
     let hg = ctx
         .kernels
-        .gather_qmm_sorted(&x_pairs, &w.gate, &sorted_ids)?;
+        .gather_qmm_sorted_bounded(&x_pairs, &w.gate, &sorted_bounded)?;
     let hu = ctx
         .kernels
-        .gather_qmm_sorted(&x_pairs, &w.up, &sorted_ids)?;
+        .gather_qmm_sorted_bounded(&x_pairs, &w.up, &sorted_bounded)?;
     let act = ctx.kernels.silu(&hg)?;
     let h = ctx.kernels.binary(BinaryOp::Mul, &act, &hu)?;
-    let eo = ctx.kernels.gather_qmm_sorted(&h, &w.down, &sorted_ids)?;
+    let eo = ctx
+        .kernels
+        .gather_qmm_sorted_bounded(&h, &w.down, &sorted_bounded)?;
     let order_p_f = ctx.kernels.u32_to_f32(&order_p)?;
     let inverse = ctx.kernels.argsort(&order_p_f, 0)?;
     let eo_flat = ctx.kernels.reshape(&eo, &[pairs, hidden])?;
@@ -556,7 +574,7 @@ mod tests {
         let (decode, route) = decode;
         assert_eq!(
             read_u32(&mut kernels, &device.trace.ids),
-            read_u32(&mut kernels, &route.ids),
+            read_u32(&mut kernels, route.ids.ids()),
             "the ids of the decode block"
         );
         let health = values(&mut kernels, &device.health).unwrap()[0];

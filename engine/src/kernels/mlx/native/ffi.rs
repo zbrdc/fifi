@@ -46,6 +46,22 @@ unsafe extern "C" {
     #[cfg(feature = "native-fault-qualification")]
     #[link_name = "inference_mlx_qualification_sync_count"]
     pub(super) fn mlx_qualification_sync_count() -> u64;
+    /// Prints the lazy graph of `outputs` into one malloced buffer (packet GPU-GAP-COUNT). The
+    /// buffer is NUL-terminated, `len` bytes long, and owned by the caller: free it with
+    /// `mlx_free_string`. The dump fills no output array, so — like `mlx_async_eval` — it takes
+    /// part in no selection of the qualification operation faults and no counted fault applies.
+    #[cfg(feature = "native-fault-qualification")]
+    #[link_name = "inference_mlx_graph_print"]
+    pub(super) fn mlx_graph_print(
+        out: *mut *mut c_char,
+        len: *mut usize,
+        outputs: *const mlx_array,
+        count: usize,
+    ) -> i32;
+    /// Frees a buffer that `mlx_graph_print` returned. A null pointer is nothing to free.
+    #[cfg(feature = "native-fault-qualification")]
+    #[link_name = "inference_mlx_free_string"]
+    pub(super) fn mlx_free_string(text: *mut c_char);
     #[link_name = "inference_mlx_array_set_data"]
     pub(super) fn mlx_array_set_data(
         array: *mut mlx_array,

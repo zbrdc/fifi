@@ -24,6 +24,13 @@ mod decoder;
 mod delta;
 #[cfg(all(feature = "native-mlx", target_os = "macos", target_arch = "aarch64"))]
 pub(super) mod executor;
+/// The primitive-histogram diagnostic of packet GPU-GAP-COUNT. `cfg(test)` like `route_parity`:
+/// the pure parts (the `mlx_print_graph` parser and the id and activation readers) carry Linux
+/// unit tests, and the one ignored Mac run (`decode_graph_primitives`) is additionally gated on
+/// the native feature pair, so pf-typecheck.sh compile-checks it on Linux through the cfg
+/// rewrite.
+#[cfg(test)]
+mod graph_count;
 #[cfg(all(feature = "native-mlx", target_os = "macos", target_arch = "aarch64"))]
 mod moe;
 #[cfg(all(feature = "native-mlx", target_os = "macos", target_arch = "aarch64"))]

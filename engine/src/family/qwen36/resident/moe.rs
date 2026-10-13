@@ -16,6 +16,9 @@
 //! host rule does, because `argsort` is stable. The call also returns the sum of the whole
 //! probability row (the health). A softmax row sums to 1, so a NaN or infinite entry makes the sum
 //! non-finite. The step adds the sums of all layers and checks the total at the token readback.
+//! The expert ids are clamped below the expert count ONCE per layer (`bound_indices`, packet
+//! GAP-TRIM-A): the top-probability take and the gate, up, and down products of the layer share
+//! the one clamp node, and the values stay bit for bit the values of the per-operation clamps.
 
 use super::ops::{Ctx, dim, f32_tensor, linear, short_import, to_act, u32_tensor, values};
 use super::weights::RMoe;
@@ -24,7 +27,7 @@ use crate::{
     family::{
         flash_next::math::expect_len, qwen36::host::HostShape, route::route_experts, spec::Router,
     },
-    kernels::{BinaryOp, ReduceOp, UnaryOp},
+    kernels::{BinaryOp, BoundedIndices, ReduceOp, UnaryOp},
     tensor::{ExecutionTensor, Tensor},
 };
 
@@ -83,29 +86,35 @@ pub(super) fn step(
     let mut imported = ctx.kernels.import_many(&[&ids, &gates])?.into_iter();
     let ids = imported.next().ok_or_else(short_import)?;
     let gates = imported.next().ok_or_else(short_import)?;
-    let out = combine(ctx, shape, w, x, &ids, &gates)?;
+    // One clamp for the whole layer (packet GAP-TRIM-A): the host selection is inside the expert
+    // count already, and the clamp of an already clamped tensor is the identity, so the three
+    // gathered products below keep their values bit for bit.
+    let bounded = ctx.kernels.bound_indices(&ids, dim(m.experts)?)?;
+    let out = combine(ctx, shape, w, x, &bounded, &gates)?;
     let selection = routed.indices.iter().copied().zip(routed.weights).collect();
     Ok((out, (selection, host)))
 }
 
 /// The selected experts and the shared expert on `x` `[1, H]`: gate and up on the shared input,
-/// SwiGLU, down per expert, the gate-weighted sum over `ids` `[k]` (U32) and `gates` `[k, 1, 1]`
-/// (F32), and the shared expert. Returns `[1, H]`. It makes no synchronization.
+/// SwiGLU, down per expert, the gate-weighted sum over the once-clamped `ids` `[k]` (U32,
+/// `BoundedIndices` of packet GAP-TRIM-A) and `gates` `[k, 1, 1]` (F32), and the shared expert.
+/// Returns `[1, H]`. It makes no synchronization and builds ONE clamp node for the expert ids,
+/// the clamp that every gathered product of the layer shares.
 fn combine(
     ctx: &mut Ctx<'_>,
     shape: &HostShape,
     w: &RMoe,
     x: &ExecutionTensor,
-    ids: &ExecutionTensor,
+    ids: &BoundedIndices,
     gates: &ExecutionTensor,
 ) -> Result<ExecutionTensor, EngError> {
     let hidden = dim(shape.hidden)?;
     let x3 = ctx.kernels.reshape(x, &[1, 1, hidden])?;
-    let hg = ctx.kernels.gather_qmm(&x3, &w.gate, ids)?;
-    let hu = ctx.kernels.gather_qmm(&x3, &w.up, ids)?;
+    let hg = ctx.kernels.gather_qmm_bounded(&x3, &w.gate, ids)?;
+    let hu = ctx.kernels.gather_qmm_bounded(&x3, &w.up, ids)?;
     let act = ctx.kernels.silu(&hg)?;
     let h = ctx.kernels.binary(BinaryOp::Mul, &act, &hu)?;
-    let eo = ctx.kernels.gather_qmm(&h, &w.down, ids)?;
+    let eo = ctx.kernels.gather_qmm_bounded(&h, &w.down, ids)?;
     let weighted = ctx.kernels.binary(BinaryOp::Mul, &eo, gates)?;
     let experts = ctx.kernels.reduce(ReduceOp::Sum, &weighted, 0, false)?;
     let shared_out = shared(ctx, w, x)?;
@@ -117,8 +126,10 @@ fn combine(
 
 /// The lazy outcome of device routing for one probability row.
 pub(super) struct DeviceRoute {
-    /// The chosen experts `[k]` (U32) in rank order.
-    pub(super) ids: ExecutionTensor,
+    /// The chosen experts `[k]` (U32) in rank order, clamped below the expert count ONCE
+    /// (packet GAP-TRIM-A): the top-probability take and every gathered product of the layer
+    /// read this same clamped resident, so the layer builds one `Minimum` node for its ids.
+    pub(super) ids: BoundedIndices,
     /// The gates `[k, 1, 1]` (F32): the chosen probabilities, renormalized over the selection when
     /// the family asks for it.
     pub(super) gates: ExecutionTensor,
@@ -156,7 +167,10 @@ pub(super) fn route_device(
     let negated = ctx.kernels.unary(UnaryOp::Neg, &flat)?;
     let order = ctx.kernels.argsort(&negated, 0)?;
     let ids = ctx.kernels.slice(&order, &[0], &[k])?;
-    let top = ctx.kernels.take(&flat, &ids, 0)?;
+    // One clamp below the expert count for the whole layer (packet GAP-TRIM-A): the take below
+    // and the three gathered products of `combine` share it.
+    let bounded = ctx.kernels.bound_indices(&ids, experts)?;
+    let top = ctx.kernels.take_bounded(&flat, &bounded, 0)?;
     let health = ctx.kernels.reduce(ReduceOp::Sum, &flat, 0, true)?;
     let gates = if renorm {
         let sum = ctx.kernels.reduce(ReduceOp::Sum, &top, 0, true)?;
@@ -165,7 +179,11 @@ pub(super) fn route_device(
         top
     };
     let gates = ctx.kernels.reshape(&gates, &[k, 1, 1])?;
-    Ok(DeviceRoute { ids, gates, health })
+    Ok(DeviceRoute {
+        ids: bounded,
+        gates,
+        health,
+    })
 }
 
 /// Runs one resident MoE step on `x` `[1, H]` with device routing and returns `[1, H]` with the
@@ -486,11 +504,11 @@ mod tests {
             };
             route_device(&mut ctx, &probs, 8, renorm).unwrap()
         };
-        assert_eq!(route.ids.shape(), [8], "ids shape");
-        assert_eq!(route.ids.dtype(), Dtype::U32, "ids dtype");
+        assert_eq!(route.ids.ids().shape(), [8], "ids shape");
+        assert_eq!(route.ids.ids().dtype(), Dtype::U32, "ids dtype");
         assert_eq!(route.gates.shape(), [8, 1, 1], "gates shape");
         assert_eq!(route.health.shape(), [1], "health shape");
-        let ids = read_u32(kernels, &route.ids);
+        let ids = read_u32(kernels, route.ids.ids());
         let gates = values(kernels, &route.gates).unwrap();
         let health = values(kernels, &route.health).unwrap()[0];
         (ids, gates, health)
@@ -631,7 +649,7 @@ mod tests {
             };
             assert_eq!(out.shape(), [1, 64], "input {n} output shape");
             assert_eq!(
-                read_u32(&mut kernels, &route.ids),
+                read_u32(&mut kernels, route.ids.ids()),
                 LAYER0_ROUTES[n as usize],
                 "input {n} experts"
             );
@@ -662,7 +680,7 @@ mod tests {
             };
             step_device(&mut ctx, &shape, &w.layers[0].moe, &xr).unwrap()
         };
-        assert_eq!(read_u32(&mut kernels, &route.ids), [0, 1]);
+        assert_eq!(read_u32(&mut kernels, route.ids.ids()), [0, 1]);
         assert_eq!(values(&mut kernels, &route.gates).unwrap(), [0.5, 0.5]);
     }
 

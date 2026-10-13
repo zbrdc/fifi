@@ -228,6 +228,32 @@ pub struct GatedDeltaOutput {
     pub state: ExecutionTensor,
 }
 
+/// A U32 id resident plus the exclusive bound it was clamped below (packet GAP-TRIM-A).
+///
+/// `MlxKernels::bound_indices` is the only constructor: it clamps the ids on the device with one
+/// `mlx_minimum` node, so one layer can pass the SAME clamped ids to every gather over the same
+/// axis instead of paying a clamp per operation. The bounded variants of the gather and take
+/// operations (`gather_qmm_bounded`, `gather_qmm_sorted_bounded`, `take_bounded`) skip their own
+/// clamp exactly while the recorded bound covers their operand axis (`shape::bound_covers`, a
+/// portable pure function); with a bound past the axis they clamp again on the device, so an
+/// out-of-range id never reads outside its operand, the safety rule of the plain operations.
+pub struct BoundedIndices {
+    ids: ExecutionTensor,
+    bound: u32,
+}
+
+impl BoundedIndices {
+    /// The clamped U32 resident. Every value is below `bound`.
+    pub fn ids(&self) -> &ExecutionTensor {
+        &self.ids
+    }
+
+    /// The exclusive bound the ids were clamped below.
+    pub fn bound(&self) -> u32 {
+        self.bound
+    }
+}
+
 pub struct MlxKernels {
     context: native::Context,
 }
@@ -294,6 +320,19 @@ impl MlxKernels {
     #[cfg(feature = "native-fault-qualification")]
     pub fn qualification_reset_timing(&mut self) {
         timing::reset();
+    }
+
+    /// Returns the lazy graph of `outputs` as the text of `mlx_print_graph` (packet
+    /// GPU-GAP-COUNT). Qualification builds ONLY: the product build must not contain the dump.
+    /// The call describes the pending graph — it evaluates, synchronizes, and releases nothing,
+    /// and it takes part in no selection of the qualification operation faults, like
+    /// `evaluate_async`. A native failure is terminal.
+    #[cfg(feature = "native-fault-qualification")]
+    pub fn qualification_graph_text(
+        &mut self,
+        outputs: &[&ExecutionTensor],
+    ) -> Result<String, EngError> {
+        self.context.qualification_graph_text(outputs)
     }
 
     /// Reads the process-wide allocator counters.
@@ -593,6 +632,69 @@ impl MlxKernels {
         self.context.gather_qmm_sorted(x, stack, indices)
     }
 
+    /// Multiplies each activation row by the expert that its index names in one native call, with
+    /// ids that `bound_indices` clamped once (packet GAP-TRIM-A). The checks and the output layout
+    /// are those of `gather_qmm`. While the recorded bound covers the expert count the method
+    /// builds no clamp node (the once-clamped ids are already inside the stack); with a bound past
+    /// the expert count it clamps on the device itself, so ids at or above the expert count clamp
+    /// to the last expert exactly as `gather_qmm` does.
+    pub fn gather_qmm_bounded(
+        &mut self,
+        x: &ExecutionTensor,
+        stack: &ResidentPackedWeight,
+        indices: &BoundedIndices,
+    ) -> Result<ExecutionTensor, EngError> {
+        self.context
+            .gather_qmm_bounded(x, stack, indices.ids(), indices.bound())
+    }
+
+    /// `gather_qmm_bounded` with MLX's `sorted_indices` flag set (packet GAP-TRIM-A): the checks,
+    /// the sortedness duty, and the clamp rule are those of `gather_qmm_bounded`, and the flag
+    /// semantics are those of `gather_qmm_sorted`.
+    pub fn gather_qmm_sorted_bounded(
+        &mut self,
+        x: &ExecutionTensor,
+        stack: &ResidentPackedWeight,
+        indices: &BoundedIndices,
+    ) -> Result<ExecutionTensor, EngError> {
+        self.context
+            .gather_qmm_sorted_bounded(x, stack, indices.ids(), indices.bound())
+    }
+
+    /// Gathers along `axis` with ids that `bound_indices` clamped once (packet GAP-TRIM-A). The
+    /// checks and the output layout are those of `take`. While the recorded bound covers the axis
+    /// length the method builds no clamp node; with a bound past the axis length it clamps on the
+    /// device itself, so an id at or above the axis length clamps to the last element exactly as
+    /// `take` does.
+    pub fn take_bounded(
+        &mut self,
+        x: &ExecutionTensor,
+        indices: &BoundedIndices,
+        axis: u32,
+    ) -> Result<ExecutionTensor, EngError> {
+        self.context
+            .take_bounded(x, indices.ids(), indices.bound(), axis)
+    }
+
+    /// Clamps a U32 id resident below the exclusive `upper` with ONE `mlx_minimum` node and
+    /// returns it with the bound it was clamped below (packet GAP-TRIM-A): the single clamp that
+    /// the bounded gather and take variants of one layer share. The output keeps the shape of
+    /// `ids`; the clamp of an already clamped tensor is the identity, so a graph that routes once
+    /// and gathers several times keeps its values bit for bit. `upper` of zero is a `BadRequest`
+    /// before the first native call; a native failure follows the resident rule and makes the
+    /// adapter terminal.
+    pub fn bound_indices(
+        &mut self,
+        ids: &ExecutionTensor,
+        upper: u32,
+    ) -> Result<BoundedIndices, EngError> {
+        let clamped = self.context.bound_indices(ids, upper)?;
+        Ok(BoundedIndices {
+            ids: clamped,
+            bound: upper,
+        })
+    }
+
     /// Multiplies an `[m, k]` F32 activation by a `[k, n]` F32 weight and
     /// returns an owned `[m, n]` F32 resident tensor.
     pub fn mm(
@@ -811,6 +913,9 @@ impl MlxKernels {
 
     /// Gathers along `axis` with U32 indices. Every index must stay inside axis `axis`; indices
     /// above the axis length are clamped to the last element. The method does not read the indices.
+    /// A take along axis 0 returns the fresh gather output of MLX `take` as is (row-contiguous by
+    /// construction); a take along another axis can end in the transpose view that MLX `take`
+    /// builds, so it still makes the result contiguous (packet GAP-TRIM-A).
     pub fn take(
         &mut self,
         x: &ExecutionTensor,

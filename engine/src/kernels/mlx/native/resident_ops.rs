@@ -19,7 +19,7 @@ use crate::{
     EngError,
     kernels::{
         BinaryOp, ReduceOp, RopeSpec, UnaryOp,
-        elementwise::{self, AxisRule, ElementwiseInputs, ElementwiseLayout},
+        elementwise::{self, AxisRule, ElementwiseInputs, ElementwiseLayout, output_bytes},
         gated_delta,
         rope::{self, RopeLayout, RopeOperands, RopeStep},
         shape,
@@ -46,6 +46,30 @@ type BinaryElementwise = unsafe extern "C" fn(
 
 type ReduceAxis =
     unsafe extern "C" fn(*mut ffi::mlx_array, ffi::mlx_array, i32, bool, ffi::mlx_stream) -> i32;
+
+/// The expert ids of one gathered product (packet GAP-TRIM-A).
+enum GatherIds<'a> {
+    /// Clamp the ids to the last expert on the device, the rule of the public operations.
+    Clamp(&'a ExecutionTensor),
+    /// Ids that `bound_indices` clamped below `bound` already: the clamp is skipped while the
+    /// bound covers the expert count and rebuilt when it does not.
+    Bounded {
+        ids: &'a ExecutionTensor,
+        bound: u32,
+    },
+}
+
+/// The ids of one `take` (packet GAP-TRIM-A).
+enum TakeIds<'a> {
+    /// Clamp the ids to the last element of the axis, the rule of `take`.
+    Clamp(&'a ExecutionTensor),
+    /// Ids that `bound_indices` clamped below `bound` already: the clamp is skipped while the
+    /// bound covers the axis length and rebuilt when it does not.
+    Bounded {
+        ids: &'a ExecutionTensor,
+        bound: u32,
+    },
+}
 
 impl Context {
     pub(in crate::kernels::mlx) fn silu(
@@ -473,6 +497,12 @@ impl Context {
         let _inputs = [queries.share(), keys.share(), values.share()];
         clear_message();
         let stream = state.stream.0;
+        // The two `mlx_slice` prefix views inside the shim stay views. The attention output is
+        // fresh, but MLX writes it row-contiguous only in the vector mode (a query length of
+        // at most 8, the decode step); the full mode of a chunk allocates it with the strides
+        // of the transposed layout. So the result is NOT guaranteed row-contiguous and carries
+        // no `Contiguous` node: a strided result is copied once at `readback`, and every
+        // consumer in this tree accepts a strided input (packet GAP-TRIM-A).
         let expected = ExpectedOutput {
             operation: label,
             stream,
@@ -481,7 +511,8 @@ impl Context {
             dtype: Dtype::F32,
             promotes: true,
         };
-        let output = dispatch_contiguous(&expected, |slot| unsafe {
+        let mut output = Array::null();
+        let built = produce(&mut output, label, |slot| unsafe {
             ffi::mlx_grouped_attention_prefix(
                 slot,
                 queries.storage.native_array(),
@@ -492,7 +523,8 @@ impl Context {
                 causal,
                 stream,
             )
-        })?;
+        });
+        expected.complete(&output, built)?;
         Ok(promoting_elementwise_result(state, output, layout))
     }
 
@@ -720,37 +752,92 @@ impl Context {
         indices: &ExecutionTensor,
         axis: u32,
     ) -> Result<ExecutionTensor, EngError> {
+        self.take_with(x, TakeIds::Clamp(indices), axis)
+    }
+
+    /// `take` over ids that `bound_indices` clamped once (packet GAP-TRIM-A): the clamp is
+    /// skipped while the recorded bound covers the axis length and rebuilt when it does not, so
+    /// an id at or above the axis length still clamps to the last element of the axis.
+    pub(in crate::kernels::mlx) fn take_bounded(
+        &mut self,
+        x: &ExecutionTensor,
+        ids: &ExecutionTensor,
+        bound: u32,
+        axis: u32,
+    ) -> Result<ExecutionTensor, EngError> {
+        self.take_with(x, TakeIds::Bounded { ids, bound }, axis)
+    }
+
+    /// The one body of `take` and `take_bounded`. MLX `take` composes a gather, a transpose of
+    /// the taken axis into place (only when `axis` is not 0), and a squeeze. The gather output is
+    /// a fresh row-contiguous array and the squeeze of it keeps that, so an axis-0 take returns
+    /// the gather output as is; a take along another axis can end in the strided transpose view,
+    /// so that case still makes the result contiguous (packet GAP-TRIM-A).
+    fn take_with(
+        &mut self,
+        x: &ExecutionTensor,
+        indices: TakeIds<'_>,
+        axis: u32,
+    ) -> Result<ExecutionTensor, EngError> {
         let label = "take";
         let _dispatch = DispatchGuard::enter();
         self.check_ready()?;
         let state = self.state.as_mut().unwrap();
+        let (ids, bound) = match &indices {
+            TakeIds::Clamp(ids) => (ids, None),
+            TakeIds::Bounded { ids, bound } => (ids, Some(*bound)),
+        };
         check_operand(label, state, x)?;
-        check_index(label, state, indices)?;
-        let layout = shape::take(label, x.shape(), indices.shape(), axis)?;
+        check_index(label, state, ids)?;
+        let layout = shape::take(label, x.shape(), ids.shape(), axis)?;
+        // After the layout check the axis exists. The skip is value-neutral: the clamp of an
+        // already clamped tensor is the identity (packet GAP-TRIM-A).
+        let skip_clamp =
+            bound.is_some_and(|bound| shape::bound_covers(bound, x.shape()[axis as usize]));
         let native_axis = native_ints(label, &[axis])?[0];
-        let _inputs = [x.share(), indices.share()];
+        let _inputs = [x.share(), ids.share()];
         clear_message();
         let stream = state.stream.0;
         let upper = x.shape()[axis as usize] - 1;
         let (mut clamped, mut product, mut output) = (Array::null(), Array::null(), Array::null());
-        let built = produce(&mut clamped, label, |slot| unsafe {
-            ffi::mlx_clamp_indices(slot, indices.storage.native_array(), upper, stream)
-        })
-        .and_then(|()| {
+        let built = if skip_clamp {
             produce(&mut product, label, |slot| unsafe {
                 ffi::mlx_resident_take_axis(
                     slot,
                     x.storage.native_array(),
-                    clamped.0,
+                    ids.storage.native_array(),
                     native_axis,
                     stream,
                 )
             })
-        })
-        .and_then(|()| {
-            produce(&mut output, label, |slot| unsafe {
-                ffi::mlx_contiguous(slot, product.0, false, stream)
+        } else {
+            produce(&mut clamped, label, |slot| unsafe {
+                ffi::mlx_clamp_indices(slot, ids.storage.native_array(), upper, stream)
             })
+            .and_then(|()| {
+                produce(&mut product, label, |slot| unsafe {
+                    ffi::mlx_resident_take_axis(
+                        slot,
+                        x.storage.native_array(),
+                        clamped.0,
+                        native_axis,
+                        stream,
+                    )
+                })
+            })
+        }
+        .and_then(|()| {
+            if axis == 0 {
+                // The gather output of an axis-0 take is row-contiguous by construction; hand it
+                // through without a `Contiguous` node (packet GAP-TRIM-A). The null that stays
+                // in `product` frees nothing.
+                output = std::mem::replace(&mut product, Array::null());
+                Ok(())
+            } else {
+                produce(&mut output, label, |slot| unsafe {
+                    ffi::mlx_contiguous(slot, product.0, false, stream)
+                })
+            }
         });
         let expected = ExpectedOutput {
             operation: label,
@@ -768,7 +855,9 @@ impl Context {
     /// input rank, as `numpy.take_along_axis` does. The input is F32, BF16 after `allow_bf16`, or
     /// U32 (the device chunk MoE gathers its sorted expert ids, and `take` rejects a U32 input);
     /// the output keeps the input dtype and takes the indices shape. Indices above the axis
-    /// length are clamped to the last element of the axis on the device, as `take` does.
+    /// length are clamped to the last element of the axis on the device, as `take` does. The
+    /// gather is one fresh MLX `GatherAxis` output with no trailing view, so it is row-contiguous
+    /// by construction and the method adds no `Contiguous` node (packet GAP-TRIM-A).
     pub(in crate::kernels::mlx) fn take_along_axis(
         &mut self,
         x: &ExecutionTensor,
@@ -793,12 +882,12 @@ impl Context {
         clear_message();
         let stream = state.stream.0;
         let upper = x.shape()[axis as usize] - 1;
-        let (mut clamped, mut product, mut output) = (Array::null(), Array::null(), Array::null());
+        let (mut clamped, mut output) = (Array::null(), Array::null());
         let built = produce(&mut clamped, label, |slot| unsafe {
             ffi::mlx_clamp_indices(slot, indices.storage.native_array(), upper, stream)
         })
         .and_then(|()| {
-            produce(&mut product, label, |slot| unsafe {
+            produce(&mut output, label, |slot| unsafe {
                 ffi::mlx_resident_take_along_axis(
                     slot,
                     x.storage.native_array(),
@@ -806,11 +895,6 @@ impl Context {
                     native_axis,
                     stream,
                 )
-            })
-        })
-        .and_then(|()| {
-            produce(&mut output, label, |slot| unsafe {
-                ffi::mlx_contiguous(slot, product.0, false, stream)
             })
         });
         // The layout counts 4-byte elements, which is exact for F32 and U32 and halves for BF16.
@@ -825,6 +909,35 @@ impl Context {
         };
         expected.complete(&output, built)?;
         Ok(state.resident(output, dtype, layout.shape, byte_len))
+    }
+
+    /// Clamps U32 `ids` below the exclusive `bound` with ONE `mlx_minimum` node (packet
+    /// GAP-TRIM-A): the single clamp that the bounded gather and take variants of one layer
+    /// share. The output keeps the shape of `ids` and the U32 dtype; `output_bytes` counts
+    /// 4-byte elements, exact for U32. A `bound` of zero is a `BadRequest` before the first
+    /// native call; a native failure follows the resident rule and makes the adapter terminal.
+    pub(in crate::kernels::mlx) fn bound_indices(
+        &mut self,
+        ids: &ExecutionTensor,
+        bound: u32,
+    ) -> Result<ExecutionTensor, EngError> {
+        let label = "bound indices";
+        let _dispatch = DispatchGuard::enter();
+        self.check_ready()?;
+        let state = self.state.as_mut().unwrap();
+        check_index(label, state, ids)?;
+        let upper = shape::clamp_max(label, bound)?;
+        let layout = ElementwiseLayout {
+            byte_len: output_bytes(label, ids.shape())?,
+            shape: ids.shape().to_vec(),
+        };
+        let _input = ids.share();
+        clear_message();
+        let stream = state.stream.0;
+        let output = dispatch_typed(label, &layout, Dtype::U32, stream, |output| unsafe {
+            ffi::mlx_clamp_indices(output, ids.storage.native_array(), upper, stream)
+        })?;
+        Ok(state.resident(output, Dtype::U32, layout.shape, layout.byte_len))
     }
 
     pub(in crate::kernels::mlx) fn batched_mm(
@@ -859,7 +972,7 @@ impl Context {
         stack: &ResidentPackedWeight,
         indices: &ExecutionTensor,
     ) -> Result<ExecutionTensor, EngError> {
-        self.gather_qmm_with(x, stack, indices, false)
+        self.gather_qmm_with(x, stack, GatherIds::Clamp(indices), false)
     }
 
     /// `gather_qmm` with MLX's `sorted_indices` flag set. The indices must be non-decreasing along
@@ -871,40 +984,73 @@ impl Context {
         stack: &ResidentPackedWeight,
         indices: &ExecutionTensor,
     ) -> Result<ExecutionTensor, EngError> {
-        self.gather_qmm_with(x, stack, indices, true)
+        self.gather_qmm_with(x, stack, GatherIds::Clamp(indices), true)
     }
 
-    /// The one body of `gather_qmm` and `gather_qmm_sorted`: `sorted` is the value passed to MLX's
-    /// `sorted_indices` flag, which changes the kernel choice only, not the checks or the layout.
+    /// `gather_qmm` over ids that `bound_indices` clamped once (packet GAP-TRIM-A): the clamp is
+    /// skipped while the recorded bound covers the expert count and rebuilt when it does not.
+    pub(in crate::kernels::mlx) fn gather_qmm_bounded(
+        &mut self,
+        x: &ExecutionTensor,
+        stack: &ResidentPackedWeight,
+        ids: &ExecutionTensor,
+        bound: u32,
+    ) -> Result<ExecutionTensor, EngError> {
+        self.gather_qmm_with(x, stack, GatherIds::Bounded { ids, bound }, false)
+    }
+
+    /// `gather_qmm_sorted` over ids that `bound_indices` clamped once (packet GAP-TRIM-A): the
+    /// clamp is skipped while the recorded bound covers the expert count and rebuilt when it does
+    /// not, and the sortedness duty is the one of `gather_qmm_sorted`.
+    pub(in crate::kernels::mlx) fn gather_qmm_sorted_bounded(
+        &mut self,
+        x: &ExecutionTensor,
+        stack: &ResidentPackedWeight,
+        ids: &ExecutionTensor,
+        bound: u32,
+    ) -> Result<ExecutionTensor, EngError> {
+        self.gather_qmm_with(x, stack, GatherIds::Bounded { ids, bound }, true)
+    }
+
+    /// The one body of the `gather_qmm` family: `sorted` is the value passed to MLX's
+    /// `sorted_indices` flag, which changes the kernel choice only, not the checks or the layout,
+    /// and `indices` names the ids and whether this call clamps them itself (packet GAP-TRIM-A:
+    /// `Bounded` ids skip the clamp exactly while their bound covers the expert count).
     fn gather_qmm_with(
         &mut self,
         x: &ExecutionTensor,
         stack: &ResidentPackedWeight,
-        indices: &ExecutionTensor,
+        indices: GatherIds<'_>,
         sorted: bool,
     ) -> Result<ExecutionTensor, EngError> {
         let label = "gather quantized matmul";
         let _dispatch = DispatchGuard::enter();
         self.check_ready()?;
         let state = self.state.as_mut().unwrap();
+        let (ids, bound) = match &indices {
+            GatherIds::Clamp(ids) => (*ids, None),
+            GatherIds::Bounded { ids, bound } => (*ids, Some(*bound)),
+        };
         check_operand(label, state, x)?;
-        check_index(label, state, indices)?;
+        check_index(label, state, ids)?;
         check_packed(label, state, stack)?;
-        let layout = shape::gather_qmm(label, x.shape(), stack.logical_shape(), indices.shape())?;
+        let layout = shape::gather_qmm(label, x.shape(), stack.logical_shape(), ids.shape())?;
+        // After the layout check the expert axis exists; the skip is value-neutral either way:
+        // the clamp of an already clamped tensor is the identity, so the gathered rows are bit for
+        // bit the rows the per-call clamp reads (packet GAP-TRIM-A).
+        let skip_clamp =
+            bound.is_some_and(|bound| shape::bound_covers(bound, stack.logical_shape()[0]));
         let quant = quant_args(stack.quantization())?;
         let biases = stack
             .biases()
             .map(|biases| biases.storage.native_array())
             .unwrap_or(ffi::NULL_ARRAY);
         let upper = stack.logical_shape()[0] - 1;
-        let _inputs = [x.share(), indices.share()];
+        let _inputs = [x.share(), ids.share()];
         clear_message();
         let stream = state.stream.0;
         let (mut clamped, mut output) = (Array::null(), Array::null());
-        let built = produce(&mut clamped, label, |slot| unsafe {
-            ffi::mlx_clamp_indices(slot, indices.storage.native_array(), upper, stream)
-        })
-        .and_then(|()| {
+        let built = if skip_clamp {
             produce(&mut output, label, |slot| unsafe {
                 ffi::mlx_resident_gather_qmm(
                     slot,
@@ -913,7 +1059,7 @@ impl Context {
                     stack.scales().storage.native_array(),
                     biases,
                     ffi::NULL_ARRAY,
-                    clamped.0,
+                    ids.storage.native_array(),
                     true,
                     ffi::optional_int(quant.group_size),
                     ffi::optional_int(quant.bits),
@@ -922,7 +1068,30 @@ impl Context {
                     stream,
                 )
             })
-        });
+        } else {
+            produce(&mut clamped, label, |slot| unsafe {
+                ffi::mlx_clamp_indices(slot, ids.storage.native_array(), upper, stream)
+            })
+            .and_then(|()| {
+                produce(&mut output, label, |slot| unsafe {
+                    ffi::mlx_resident_gather_qmm(
+                        slot,
+                        x.storage.native_array(),
+                        stack.payload().storage.native_array(),
+                        stack.scales().storage.native_array(),
+                        biases,
+                        ffi::NULL_ARRAY,
+                        clamped.0,
+                        true,
+                        ffi::optional_int(quant.group_size),
+                        ffi::optional_int(quant.bits),
+                        quant.mode.as_ptr(),
+                        sorted,
+                        stream,
+                    )
+                })
+            })
+        };
         let expected = ExpectedOutput {
             operation: label,
             stream,
@@ -1054,6 +1223,11 @@ impl Context {
         let _inputs = [queries.share(), keys.share(), values.share()];
         clear_message();
         let stream = state.stream.0;
+        // MLX scaled dot-product attention allocates one fresh output. It is row-contiguous in
+        // the vector mode (a query length of at most 8, the decode step) and has the strides of
+        // the transposed layout in the full mode of a chunk, so the result carries no
+        // `Contiguous` node and a strided result is copied once at `readback` (packet
+        // GAP-TRIM-A).
         let expected = ExpectedOutput {
             operation: label,
             stream,
@@ -1062,7 +1236,8 @@ impl Context {
             dtype: Dtype::F32,
             promotes: true,
         };
-        let output = dispatch_contiguous(&expected, |slot| unsafe {
+        let mut output = Array::null();
+        let built = produce(&mut output, label, |slot| unsafe {
             ffi::mlx_grouped_attention(
                 slot,
                 queries.storage.native_array(),
@@ -1072,7 +1247,8 @@ impl Context {
                 causal,
                 stream,
             )
-        })?;
+        });
+        expected.complete(&output, built)?;
         Ok(promoting_elementwise_result(state, output, layout))
     }
 
@@ -1630,6 +1806,11 @@ fn dispatch_rope(
 
 /// Builds a lazy product, makes it contiguous, and validates the output metadata.
 ///
+/// The callers are the operations whose MLX primitive can return a strided view — `transpose`,
+/// `slice`, and `repeat` (packet GAP-TRIM-A). Every operation with a fresh, row-contiguous output
+/// by construction validates its product directly instead, and `readback` itself copies a
+/// strided array at the read, so a missed case fails no read.
+///
 /// The call does not evaluate. Evaluation happens at `readback` (decision 0032).
 fn dispatch_contiguous(
     expected: &ExpectedOutput<'_>,
@@ -1736,7 +1917,10 @@ fn dispatch_qmm(
         .biases()
         .map(|biases| biases.storage.native_array())
         .unwrap_or(ffi::NULL_ARRAY);
-    dispatch_contiguous(expected, |slot| unsafe {
+    // MLX `quantized_matmul` allocates one fresh output array, row-contiguous by construction,
+    // so the product needs no `Contiguous` node after it (packet GAP-TRIM-A).
+    let mut output = Array::null();
+    let built = produce(&mut output, expected.operation, |slot| unsafe {
         ffi::mlx_quantized_matmul(
             slot,
             activation.storage.native_array(),
@@ -1749,7 +1933,9 @@ fn dispatch_qmm(
             quant.mode.as_ptr(),
             expected.stream,
         )
-    })
+    });
+    expected.complete(&output, built)?;
+    Ok(output)
 }
 
 fn validate_mm(
@@ -1780,14 +1966,20 @@ fn dispatch_mm(
     activation: &ExecutionTensor,
     weight: &ExecutionTensor,
 ) -> Result<Array, EngError> {
-    dispatch_contiguous(expected, |slot| unsafe {
+    // MLX `matmul` of rank-at-least-two operands allocates one fresh output (a squeeze or
+    // reshape view of it stays row-contiguous), so the product needs no `Contiguous` node after
+    // it (packet GAP-TRIM-A).
+    let mut output = Array::null();
+    let built = produce(&mut output, expected.operation, |slot| unsafe {
         ffi::mlx_matmul(
             slot,
             activation.storage.native_array(),
             weight.storage.native_array(),
             expected.stream,
         )
-    })
+    });
+    expected.complete(&output, built)?;
+    Ok(output)
 }
 
 fn validate_rms_norm(
@@ -2848,5 +3040,462 @@ mod gather_sorted_tests {
                 );
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod bounded_tests {
+    //! The `*_bounded` operations of packet GAP-TRIM-A against their clamping siblings: the same
+    //! values bit for bit while the recorded bound covers the operand axis, the operand's own
+    //! clamp rebuilt when it does not, and the once-clamped resident safe against out-of-range
+    //! ids. `take` along axis 1 also covers the transpose-view contiguity rule of `take_with`.
+    //! These tests need the GPU.
+
+    use crate::{
+        EngError,
+        kernels::{
+            MlxKernels, PackedWeight, QuantizationMode, QuantizationSpec, ResidentPackedWeight,
+        },
+        tensor::{Dtype, ExecutionTensor, Tensor},
+    };
+
+    /// The stack of the gather tests: `EXPERTS` experts of `ROWS` rows and 64 columns, affine
+    /// int4, group 64. Every payload word is `0x7654_3210`, so column `c` holds the code `c % 8`;
+    /// expert `e` has scale `(4 + e) / 16` and row `r` has bias `r / 8`, all dyadic and exact in
+    /// F32, so equal graphs return bit-equal rows and the equality checks below need no oracle.
+    fn stack(kernels: &mut MlxKernels, experts: u32, rows: u32) -> ResidentPackedWeight {
+        const COLUMNS: u32 = 64;
+        let words = usize::try_from(experts * rows * (COLUMNS / 8)).unwrap();
+        let payload = Tensor::try_from_host(
+            Dtype::U32,
+            vec![experts, rows, COLUMNS / 8],
+            0x7654_3210u32.to_le_bytes().repeat(words),
+        )
+        .unwrap();
+        let role = |values: &[f32]| {
+            let bytes: Vec<u8> = values.iter().flat_map(|v| v.to_le_bytes()).collect();
+            Tensor::try_from_host(Dtype::F32, vec![experts, rows, COLUMNS / 64], bytes).unwrap()
+        };
+        let scales: Vec<f32> = (0..experts * rows)
+            .map(|slot| (4 + slot / rows) as f32 / 16.0)
+            .collect();
+        let biases: Vec<f32> = (0..experts * rows)
+            .map(|slot| (slot % rows) as f32 / 8.0)
+            .collect();
+        let weight = PackedWeight::try_new(
+            payload,
+            role(&scales),
+            Some(role(&biases)),
+            vec![experts, rows, COLUMNS],
+            QuantizationSpec {
+                mode: QuantizationMode::Affine,
+                bits: 4,
+                group_size: 64,
+            },
+        )
+        .unwrap();
+        kernels.import_packed(&weight).unwrap()
+    }
+
+    /// Activation rows `[pairs, 1, 64]`: row `p` holds `((p + c) % 2)` in F32.
+    fn activations(kernels: &mut MlxKernels, pairs: u32) -> ExecutionTensor {
+        const COLUMNS: u32 = 64;
+        let values: Vec<f32> = (0..pairs)
+            .flat_map(|p| (0..COLUMNS).map(move |c| ((p + c) % 2) as f32))
+            .collect();
+        let bytes: Vec<u8> = values.iter().flat_map(|v| v.to_le_bytes()).collect();
+        kernels
+            .import_tensor(
+                &Tensor::try_from_host(Dtype::F32, vec![pairs, 1, COLUMNS], bytes).unwrap(),
+            )
+            .unwrap()
+    }
+
+    /// Imports `values` as the rank-one U32 index resident.
+    fn indices(kernels: &mut MlxKernels, values: &[u32]) -> ExecutionTensor {
+        let bytes: Vec<u8> = values.iter().flat_map(|v| v.to_le_bytes()).collect();
+        kernels
+            .import_tensor(
+                &Tensor::try_from_host(
+                    Dtype::U32,
+                    vec![u32::try_from(values.len()).unwrap()],
+                    bytes,
+                )
+                .unwrap(),
+            )
+            .unwrap()
+    }
+
+    /// Reads an F32 resident back as values.
+    fn read_f32(kernels: &mut MlxKernels, x: &ExecutionTensor) -> Vec<f32> {
+        kernels
+            .readback(x)
+            .unwrap()
+            .host_bytes()
+            .unwrap()
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .map(|word| f32::from_le_bytes(*word))
+            .collect()
+    }
+
+    /// The 24-pair index lists of the gather tests, non-decreasing for the sorted calls: `ALL`
+    /// names every expert of a six-expert stack four times (the last four name expert 5, the id
+    /// AT the exclusive bound 6), and `OVER` replaces the last four with 9, which clamps to 5.
+    const ALL: [u32; 24] = [
+        0, 0, 0, 0, 1, 1, 1, 1, 2, 2, 2, 2, 3, 3, 3, 3, 4, 4, 4, 4, 5, 5, 5, 5,
+    ];
+    const OVER: [u32; 24] = [
+        0, 0, 0, 0, 1, 1, 1, 1, 2, 2, 2, 2, 3, 3, 3, 3, 4, 4, 4, 4, 9, 9, 9, 9,
+    ];
+    /// Every id below the tight bound 2 of the third rule: two experts alternate, so the bounded
+    /// gather with bound 2 sees the same ids as its clamping sibling.
+    const LOW: [u32; 24] = [
+        0, 1, 0, 1, 0, 1, 0, 1, 0, 1, 0, 1, 0, 1, 0, 1, 0, 1, 0, 1, 0, 1, 0, 1,
+    ];
+
+    /// `gather_qmm_bounded` equals `gather_qmm` bit for bit on the same raw ids for every bound
+    /// rule (packet GAP-TRIM-A 4a): a bound at the expert count skips the clamp, a bound past the
+    /// count rebuilds the operand's own clamp, and a tighter bound that covers the count skips
+    /// too. Ids above the bound never read outside the stack: the `OVER` run of every rule equals
+    /// the `ALL` run, because 9 clamps to the last expert on both paths.
+    #[test]
+    fn gather_qmm_bounded_equals_gather_qmm_under_every_bound_rule() {
+        let _serial = crate::native_test_lock();
+        let mut kernels = MlxKernels::try_new().unwrap();
+        let stack = stack(&mut kernels, 6, 3);
+        let x = activations(&mut kernels, 24);
+        for (rule, bound, ids) in [
+            ("a bound at the expert count skips the clamp", 6, &ALL[..]),
+            ("a bound past the count rebuilds the clamp", 13, &OVER[..]),
+            ("a tighter bound that covers the count skips", 2, &LOW[..]),
+        ] {
+            let raw = indices(&mut kernels, ids);
+            let bounded = kernels.bound_indices(&raw, bound).unwrap();
+            let got = kernels.gather_qmm_bounded(&x, &stack, &bounded).unwrap();
+            let want = kernels.gather_qmm(&x, &stack, &raw).unwrap();
+            assert_eq!(
+                read_f32(&mut kernels, &got),
+                read_f32(&mut kernels, &want),
+                "{rule}: the bounded gather must equal the clamping sibling bit for bit"
+            );
+        }
+        // The out-of-range rule: the OVER ids and the ALL ids give the same rows, because 9
+        // clamps to the last expert 5 on both paths.
+        let over = indices(&mut kernels, &OVER);
+        let all = indices(&mut kernels, &ALL);
+        let bounded_over = kernels.bound_indices(&over, 6).unwrap();
+        let got = kernels
+            .gather_qmm_bounded(&x, &stack, &bounded_over)
+            .unwrap();
+        let bounded_all = kernels.bound_indices(&all, 6).unwrap();
+        let want = kernels
+            .gather_qmm_bounded(&x, &stack, &bounded_all)
+            .unwrap();
+        assert_eq!(
+            read_f32(&mut kernels, &got),
+            read_f32(&mut kernels, &want),
+            "ids above the bound must clamp to the last expert"
+        );
+    }
+
+    /// `gather_qmm_sorted_bounded` equals `gather_qmm_sorted` bit for bit on sorted ids under the
+    /// same bound rules (packet GAP-TRIM-A 4a). The 24 pairs over six experts reach the pinned
+    /// MLX's sorted kernel (24 pairs, four per expert on average).
+    #[test]
+    fn gather_qmm_sorted_bounded_equals_the_sorted_sibling() {
+        let _serial = crate::native_test_lock();
+        let mut kernels = MlxKernels::try_new().unwrap();
+        let stack = stack(&mut kernels, 6, 3);
+        let x = activations(&mut kernels, 24);
+        for (rule, bound, ids) in [
+            ("a bound at the expert count", 6, &ALL[..]),
+            ("a bound past the count", 13, &OVER[..]),
+        ] {
+            let raw = indices(&mut kernels, ids);
+            let bounded = kernels.bound_indices(&raw, bound).unwrap();
+            let got = kernels
+                .gather_qmm_sorted_bounded(&x, &stack, &bounded)
+                .unwrap();
+            let want = kernels.gather_qmm_sorted(&x, &stack, &raw).unwrap();
+            assert_eq!(
+                read_f32(&mut kernels, &got),
+                read_f32(&mut kernels, &want),
+                "{rule}: the sorted bounded gather must equal the sorted sibling bit for bit"
+            );
+        }
+    }
+
+    /// The bound is checked against the EXPERT axis, not any other axis of the stack (packet
+    /// GAP-TRIM-A mutation "apply the bound to the wrong axis"): this stack has three experts and
+    /// six rows, and the bound 4 covers the row count but not the expert count, so the gather
+    /// must rebuild its own clamp — id 9 reads expert 2, exactly as the sibling does. A check
+    /// against the row axis would skip the clamp and read the out-of-range expert 3.
+    #[test]
+    fn the_gather_bound_covers_the_expert_axis_not_the_row_axis() {
+        let _serial = crate::native_test_lock();
+        let mut kernels = MlxKernels::try_new().unwrap();
+        let stack = stack(&mut kernels, 3, 6);
+        let x = activations(&mut kernels, 24);
+        let raw = indices(
+            &mut kernels,
+            &[
+                0, 0, 0, 0, 0, 0, 0, 0, 1, 1, 1, 1, 1, 1, 1, 1, 2, 2, 2, 2, 9, 9, 9, 9,
+            ],
+        );
+        let bounded = kernels.bound_indices(&raw, 4).unwrap();
+        let got = kernels.gather_qmm_bounded(&x, &stack, &bounded).unwrap();
+        let want = kernels.gather_qmm(&x, &stack, &raw).unwrap();
+        assert_eq!(
+            read_f32(&mut kernels, &got),
+            read_f32(&mut kernels, &want),
+            "the bound 4 does not cover the three experts, so the gather must clamp to expert 2"
+        );
+    }
+
+    /// `take_bounded` equals `take` bit for bit under the same bound rules (packet GAP-TRIM-A 4a)
+    /// on a take along axis 1, whose output is the transpose view of the gather (the contiguity
+    /// rule of `take_with`), and on a take along axis 0, whose output is the raw gather. Ids
+    /// above the axis clamp to the last element.
+    #[test]
+    fn take_bounded_equals_take_under_every_bound_rule() {
+        let _serial = crate::native_test_lock();
+        let mut kernels = MlxKernels::try_new().unwrap();
+        let table = {
+            let bytes: Vec<u8> = [0.0f32, 1.0, 10.0, 11.0, 20.0, 21.0, 30.0, 31.0]
+                .iter()
+                .flat_map(|v| v.to_le_bytes())
+                .collect();
+            kernels
+                .import_tensor(&Tensor::try_from_host(Dtype::F32, vec![4, 2], bytes).unwrap())
+                .unwrap()
+        };
+        for (axis, rule, bound, ids) in [
+            (1u32, "a bound at the axis length", 2u32, &[1u32, 0][..]),
+            (1, "a bound past the axis length", 5, &[9, 0]),
+            (0, "a bound at the row count", 4, &[3, 0]),
+            (0, "a bound past the row count", 9, &[9, 0]),
+        ] {
+            let raw = indices(&mut kernels, ids);
+            let bounded = kernels.bound_indices(&raw, bound).unwrap();
+            let got = kernels.take_bounded(&table, &bounded, axis).unwrap();
+            let want = kernels.take(&table, &raw, axis).unwrap();
+            assert_eq!(
+                read_f32(&mut kernels, &got),
+                read_f32(&mut kernels, &want),
+                "axis {axis}, {rule}: the bounded take must equal the clamping take"
+            );
+        }
+        // The out-of-range rule on axis 1: 9 clamps to the last column on both paths.
+        let raw = indices(&mut kernels, &[9, 0]);
+        let bounded = kernels.bound_indices(&raw, 2).unwrap();
+        let taken = kernels.take_bounded(&table, &bounded, 1).unwrap();
+        assert_eq!(
+            read_f32(&mut kernels, &taken),
+            [1.0, 0.0, 11.0, 10.0, 21.0, 20.0, 31.0, 30.0],
+            "9 clamps to column 1 and 0 reads column 0, in every row of the [4, 2] table"
+        );
+    }
+
+    /// The take bound is checked against the TAKEN axis, not axis 0 (packet GAP-TRIM-A mutation
+    /// "apply the bound to the wrong axis"): a take along axis 1 of a `[4, 2]` table with the
+    /// bound 3 sits above the axis length 2 and below the row count 4, so the take must rebuild
+    /// its clamp and id 9 reads column 1. A check against axis 0 would skip the clamp and read
+    /// the out-of-range column 2.
+    #[test]
+    fn the_take_bound_covers_the_taken_axis_not_axis_zero() {
+        let _serial = crate::native_test_lock();
+        let mut kernels = MlxKernels::try_new().unwrap();
+        let table = {
+            let bytes: Vec<u8> = [0.0f32, 1.0, 10.0, 11.0, 20.0, 21.0, 30.0, 31.0]
+                .iter()
+                .flat_map(|v| v.to_le_bytes())
+                .collect();
+            kernels
+                .import_tensor(&Tensor::try_from_host(Dtype::F32, vec![4, 2], bytes).unwrap())
+                .unwrap()
+        };
+        let raw = indices(&mut kernels, &[9, 0]);
+        let bounded = kernels.bound_indices(&raw, 3).unwrap();
+        let got = kernels.take_bounded(&table, &bounded, 1).unwrap();
+        let want = kernels.take(&table, &raw, 1).unwrap();
+        assert_eq!(
+            read_f32(&mut kernels, &got),
+            read_f32(&mut kernels, &want),
+            "the bound 3 does not cover the two columns, so the take must clamp to column 1"
+        );
+    }
+
+    /// The constructor rules of `BoundedIndices` (packet GAP-TRIM-A 4): a bound of zero is a
+    /// `BadRequest` before the first native call, the ids keep their shape and dtype through the
+    /// clamp, and the recorded bound is the constructor's bound.
+    #[test]
+    fn bound_indices_rejects_zero_and_keeps_the_id_layout() {
+        let _serial = crate::native_test_lock();
+        let mut kernels = MlxKernels::try_new().unwrap();
+        let raw = indices(&mut kernels, &[2, 9]);
+        let refused = kernels.bound_indices(&raw, 0);
+        assert!(
+            matches!(
+                &refused,
+                Err(EngError::BadRequest(m)) if m == "bound indices: bound must exceed zero"
+            ),
+            "a zero bound must refuse before any native call, got {:?}",
+            refused.err()
+        );
+        let bounded = kernels.bound_indices(&raw, 4).unwrap();
+        assert_eq!(bounded.bound(), 4, "the recorded bound");
+        assert_eq!(bounded.ids().shape(), [2], "the clamp keeps the shape");
+        assert_eq!(bounded.ids().dtype(), Dtype::U32, "the clamp keeps U32");
+        let host = kernels.readback(bounded.ids()).unwrap();
+        assert_eq!(host.dtype(), Dtype::U32, "readback dtype");
+        let words: Vec<u32> = host
+            .host_bytes()
+            .unwrap()
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .map(|w| u32::from_le_bytes(*w))
+            .collect();
+        assert_eq!(words, [2, 3], "9 clamps below the bound 4 to 3");
+    }
+
+    /// The clamp runs once per layer (packet GAP-TRIM-A): three bounded gathers that share one
+    /// `BoundedIndices` (the gate, up and down products of one layer) hold exactly one `Minimum`
+    /// primitive, the one `bound_indices` built, while three clamping siblings on the same raw
+    /// ids hold three. The bounded gather itself adds none. Qualification builds only, like
+    /// `decode_graph_primitives` reads the graph.
+    #[cfg(feature = "native-fault-qualification")]
+    #[test]
+    fn three_bounded_gathers_share_one_clamp_node() {
+        let _serial = crate::native_test_lock();
+        let mut kernels = MlxKernels::try_new().unwrap();
+        let stack = stack(&mut kernels, 6, 3);
+        let x = activations(&mut kernels, 24);
+        let raw = indices(&mut kernels, &ALL);
+        let bounded = kernels.bound_indices(&raw, 6).unwrap();
+        let counts_minimum = |text: &str| {
+            text.lines()
+                .filter(|line| line.trim_start().starts_with("Minimum"))
+                .count()
+        };
+        let shared: Vec<ExecutionTensor> = (0..3)
+            .map(|_| kernels.gather_qmm_bounded(&x, &stack, &bounded).unwrap())
+            .collect();
+        let shared_refs: Vec<&ExecutionTensor> = shared.iter().collect();
+        let shared_text = kernels.qualification_graph_text(&shared_refs).unwrap();
+        assert_eq!(
+            counts_minimum(&shared_text),
+            1,
+            "three bounded gathers share the one clamp of bound_indices: {shared_text}"
+        );
+        let siblings: Vec<ExecutionTensor> = (0..3)
+            .map(|_| kernels.gather_qmm(&x, &stack, &raw).unwrap())
+            .collect();
+        let sibling_refs: Vec<&ExecutionTensor> = siblings.iter().collect();
+        let sibling_text = kernels.qualification_graph_text(&sibling_refs).unwrap();
+        assert_eq!(
+            counts_minimum(&sibling_text),
+            3,
+            "each clamping sibling builds its own clamp: {sibling_text}"
+        );
+    }
+}
+
+#[cfg(test)]
+mod view_readback_tests {
+    //! Readback of the view-producing operations after the contiguity guarantee moved to the
+    //! read (packet GAP-TRIM-A 4c): `slice`, `transpose`, `repeat`, `broadcast`, and a reshape
+    //! of a view all read back through `Resident::readback`, which copies a strided array at the
+    //! read when one reaches it. These tests need the GPU.
+
+    use crate::{
+        kernels::MlxKernels,
+        tensor::{Dtype, ExecutionTensor, Tensor},
+    };
+
+    /// An F32 resident of `values` with `shape`.
+    fn f32_resident(kernels: &mut MlxKernels, shape: &[u32], values: &[f32]) -> ExecutionTensor {
+        let bytes: Vec<u8> = values.iter().flat_map(|v| v.to_le_bytes()).collect();
+        kernels
+            .import_tensor(&Tensor::try_from_host(Dtype::F32, shape.to_vec(), bytes).unwrap())
+            .unwrap()
+    }
+
+    /// Reads an F32 resident back as values.
+    fn read_f32(kernels: &mut MlxKernels, x: &ExecutionTensor) -> Vec<f32> {
+        kernels
+            .readback(x)
+            .unwrap()
+            .host_bytes()
+            .unwrap()
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .map(|word| f32::from_le_bytes(*word))
+            .collect()
+    }
+
+    /// Every view-producing operation reads back in row-major order (packet GAP-TRIM-A 4c): a
+    /// slice of a wider table, the transpose of it, a repeat of both axes, a broadcast row, and
+    /// reshapes OF those views. Each expected vector follows from the operation's definition.
+    #[test]
+    fn view_operations_read_back_in_row_major_order() {
+        let _serial = crate::native_test_lock();
+        let mut kernels = MlxKernels::try_new().unwrap();
+        let x = f32_resident(&mut kernels, &[3, 2], &[0.0, 1.0, 2.0, 3.0, 4.0, 5.0]);
+        // slice: rows [1, 3) of the table.
+        let sliced = kernels.slice(&x, &[1, 0], &[3, 2]).unwrap();
+        assert_eq!(
+            read_f32(&mut kernels, &sliced),
+            [2.0, 3.0, 4.0, 5.0],
+            "the slice rows"
+        );
+        // transpose of the slice: the two columns become rows.
+        let transposed = kernels.transpose(&sliced, &[1, 0]).unwrap();
+        assert_eq!(
+            read_f32(&mut kernels, &transposed),
+            [2.0, 4.0, 3.0, 5.0],
+            "the transposed slice"
+        );
+        // reshape OF a view: the transposed slice as one row.
+        let reshaped = kernels.reshape(&transposed, &[4]).unwrap();
+        assert_eq!(
+            read_f32(&mut kernels, &reshaped),
+            [2.0, 4.0, 3.0, 5.0],
+            "the reshape of the view keeps the element order"
+        );
+        // repeat of the slice along both axes.
+        let repeated = kernels.repeat(&sliced, 2, 0).unwrap();
+        let repeated = kernels.repeat(&repeated, 2, 1).unwrap();
+        assert_eq!(
+            read_f32(&mut kernels, &repeated),
+            [
+                2.0, 2.0, 3.0, 3.0, 2.0, 2.0, 3.0, 3.0, 4.0, 4.0, 5.0, 5.0, 4.0, 4.0, 5.0, 5.0
+            ],
+            "the repeat follows numpy.repeat on both axes"
+        );
+        // broadcast of one row to three.
+        let row = f32_resident(&mut kernels, &[1, 3], &[7.0, 8.0, 9.0]);
+        let broadcast = kernels.broadcast_rows(&row, 3).unwrap();
+        assert_eq!(
+            read_f32(&mut kernels, &broadcast),
+            [7.0, 8.0, 9.0, 7.0, 8.0, 9.0, 7.0, 8.0, 9.0],
+            "the broadcast row"
+        );
+        // A COLUMN slice is strided (rows keep the stride of the wider table), so it is the
+        // case that needs the copy: the row slice above is only an offset into the buffer.
+        let wide = f32_resident(
+            &mut kernels,
+            &[3, 4],
+            &[0.0, 1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 9.0, 10.0, 11.0],
+        );
+        let columns = kernels.slice(&wide, &[0, 1], &[3, 3]).unwrap();
+        assert_eq!(
+            read_f32(&mut kernels, &columns),
+            [1.0, 2.0, 5.0, 6.0, 9.0, 10.0],
+            "columns 1 and 2 of every row of the [3, 4] table"
+        );
     }
 }

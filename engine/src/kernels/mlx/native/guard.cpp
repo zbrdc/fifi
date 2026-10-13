@@ -15,6 +15,9 @@
 #include <cstdlib>
 #include <cstring>
 #include <cstdint>
+#include <cstdio>
+
+#include "mlx/c/graph_utils.h"
 
 static std::atomic_ulong sync_calls{0};
 
@@ -192,6 +195,60 @@ extern "C" int inference_mlx_synchronize(mlx_stream stream) noexcept {
 #ifdef INFERENCE_NATIVE_FAULT_QUALIFICATION
 extern "C" std::uint64_t inference_mlx_qualification_sync_count() noexcept {
   return static_cast<std::uint64_t>(sync_calls.load(std::memory_order_relaxed));
+}
+
+// Prints the lazy graph of `outputs` into one malloced buffer (packet GPU-GAP-COUNT). The dump
+// takes part in NO selection of `run_selected_operation`, like `inference_mlx_async_eval`: it
+// fills no output array, so the null fault has no output to report and the mismatch fault has
+// no result to reshape, and the selection counts resident operation calls, which a description
+// of a pending graph is not (it neither runs work nor produces an array). `mlx_print_graph`
+// reads node names, shapes, and dtypes only: no evaluation, no synchronization, no release, so
+// the retire list of the adapter keeps its arrays. Every temporary frees on every path: the
+// output vector, the node namer, the memstream and its buffer. On success `*out` is a malloced
+// NUL-terminated buffer of `*len` bytes that the caller owns (free it with
+// `inference_mlx_free_string`); on failure `*out` stays null and no allocation leaks.
+extern "C" int inference_mlx_graph_print(
+    char** out, size_t* len, const mlx_array* outputs, size_t count) noexcept {
+  if (out == nullptr || len == nullptr || outputs == nullptr || count == 0) return 1;
+  *out = nullptr;
+  *len = 0;
+  mlx_vector_array vector = mlx_vector_array_new_data(outputs, count);
+  if (vector.ctx == nullptr) return 1;
+  char* buffer = nullptr;
+  size_t size = 0;
+  FILE* stream = open_memstream(&buffer, &size);
+  if (stream == nullptr) {
+    mlx_vector_array_free(vector);
+    return 1;
+  }
+  const mlx_node_namer namer = mlx_node_namer_new();
+  int status = namer.ctx == nullptr ? 1 : mlx_print_graph(stream, namer, vector);
+  const int namer_release = namer.ctx == nullptr ? 0 : mlx_node_namer_free(namer);
+  // The fclose flushes the text into `buffer` and closes the stream; the buffer stays owned by
+  // the caller, so the failure path frees it below.
+  const int stream_release = fclose(stream);
+  const int vector_release = mlx_vector_array_free(vector);
+  if (status != 0) {
+    free(buffer);
+    return status;
+  }
+  if (namer_release != 0 || stream_release != 0 || vector_release != 0) {
+    free(buffer);
+    return namer_release != 0 ? namer_release
+                              : (stream_release != 0 ? stream_release : vector_release);
+  }
+  if (buffer == nullptr || size == 0) {
+    free(buffer);
+    return 1;
+  }
+  *out = buffer;
+  *len = size;
+  return 0;
+}
+
+// Frees a buffer that `inference_mlx_graph_print` returned. A null pointer is nothing to free.
+extern "C" void inference_mlx_free_string(char* text) noexcept {
+  free(text);
 }
 #endif
 

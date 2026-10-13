@@ -89,6 +89,10 @@ fn run(
     let shape = &weights.shape;
     let pos = state.pos();
     let last = weights.layers.len().saturating_sub(1);
+    // Packet GPU-GAP-COUNT: the test-only graph probe leaves the decoder before `ctx` borrows its
+    // kernels. `None` in every run that sets no probe, so the step is what it was without this.
+    #[cfg(test)]
+    let mut graph_probe = decoder.graph_probe.take();
     let mut ctx = Ctx {
         kernels: &mut decoder.kernels,
         consts: &weights.consts,
@@ -156,7 +160,7 @@ fn run(
                     None => route.health,
                 });
                 if mode == StepMode::Record {
-                    chosen.push(route.ids);
+                    chosen.push(route.ids.ids().share());
                 }
                 out
             }
@@ -245,6 +249,14 @@ fn run(
     }
     if let Some(route_rows) = &route_rows {
         outputs.push(route_rows);
+    }
+    // Packet GPU-GAP-COUNT: the test-only probe runs with the lazy outputs before the one
+    // `evaluate` (it describes the graph, so it adds no synchronization and no counted fault).
+    // With no probe set — every build except `decode_graph_primitives` — the block is a no-op and
+    // the step is byte for byte what it is without it.
+    #[cfg(test)]
+    if let Some(probe) = graph_probe.as_mut() {
+        probe(ctx.kernels, &outputs)?;
     }
     ctx.kernels.evaluate(&outputs)?;
     let token_out = match &head {
@@ -1137,6 +1149,171 @@ mod tests {
                 "no step of the tiny fixture has an F32 top-two gap above 0.25; \
                  the BF16 argmax comparison did not run"
             );
+        }
+    }
+
+    /// The frozen expectation of one half of the bit-equality run (packet GAP-TRIM-A 4(b)): the
+    /// tokens and the logit bits of eight `Record` steps of the tiny GQA model in one activation
+    /// dtype. The literals come from a Mac run of the test below at the BASE commit of the trims
+    /// (2253cbcc: one clamp per gather, a contiguous node after every product), taken twice with
+    /// identical output. After an intended numeric change, run the test with `GAP_TRIM_FREEZE=1`
+    /// (`--ignored` is not needed) and paste the printed block over each constant. A `u32::MAX`
+    /// token marks an unfrozen half, and the test refuses it with these instructions.
+    struct Frozen {
+        tokens: [u32; 8],
+        logits: [[f32; 8]; 8],
+    }
+
+    /// F32 expectation, frozen from a run at the base commit 2253cbcc (Mac, `GAP_TRIM_FREEZE=1`).
+    const FROZEN_F32: Frozen = Frozen {
+        tokens: [5, 5, 5, 5, 5, 5, 5, 5],
+        logits: [
+            [
+                9.919306, 5.498854, 9.913164, 5.079399, 10.585416, 11.879209, 7.241288, 10.526949,
+            ],
+            [
+                9.920084, 5.498866, 9.913519, 5.0806437, 10.586811, 11.880026, 7.2418394, 10.527744,
+            ],
+            [
+                9.918437, 5.4970307, 9.916389, 5.0787616, 10.589268, 11.881268, 7.2431817,
+                10.527388,
+            ],
+            [
+                9.918474, 5.497011, 9.914625, 5.0805902, 10.588559, 11.878557, 7.2429037, 10.525873,
+            ],
+            [
+                9.920477, 5.4977455, 9.913423, 5.081953, 10.58787, 11.880568, 7.241171, 10.526303,
+            ],
+            [
+                9.920667, 5.4968534, 9.912812, 5.0828376, 10.586788, 11.879564, 7.2410135,
+                10.526457,
+            ],
+            [
+                9.920649, 5.4976397, 9.913076, 5.0823975, 10.588538, 11.880221, 7.2412996,
+                10.527037,
+            ],
+            [
+                9.92029, 5.4959135, 9.913987, 5.081272, 10.589256, 11.881017, 7.2413163, 10.525632,
+            ],
+        ],
+    };
+
+    /// BF16 expectation, frozen from a run at the base commit 2253cbcc (Mac, `GAP_TRIM_FREEZE=1`).
+    const FROZEN_BF16: Frozen = Frozen {
+        tokens: [5, 5, 5, 5, 5, 5, 5, 5],
+        logits: [
+            [
+                9.919812, 5.4982963, 9.912594, 5.0796347, 10.587905, 11.876688, 7.2452645,
+                10.524265,
+            ],
+            [
+                9.919178, 5.501468, 9.915744, 5.078258, 10.586157, 11.878135, 7.241685, 10.5295105,
+            ],
+            [
+                9.917215, 5.4937, 9.918845, 5.076762, 10.590743, 11.87645, 7.2530966, 10.5297575,
+            ],
+            [
+                9.920153, 5.497995, 9.9168625, 5.0813932, 10.590816, 11.875647, 7.24703, 10.526147,
+            ],
+            [
+                9.92337, 5.4974136, 9.913061, 5.0848355, 10.587328, 11.87897, 7.244747, 10.527159,
+            ],
+            [
+                9.92108, 5.497634, 9.917196, 5.081452, 10.585882, 11.877356, 7.2483125, 10.528478,
+            ],
+            [
+                9.921514, 5.5030937, 9.918383, 5.0804787, 10.58349, 11.877964, 7.248267, 10.531643,
+            ],
+            [
+                9.921381, 5.500646, 9.918471, 5.0784984, 10.588705, 11.87885, 7.248251, 10.527467,
+            ],
+        ],
+    };
+
+    /// Renders one measured half as a paste-ready block for `Frozen`.
+    fn frozen_block(name: &str, tokens: &[u32], logits: &[Vec<f32>]) -> String {
+        let mut text = format!("    const {name}: Frozen = Frozen {{\n        tokens: [");
+        for token in tokens {
+            text.push_str(&format!("{token}, "));
+        }
+        text.push_str("],\n        logits: [\n");
+        for row in logits {
+            text.push_str("            [");
+            for value in row {
+                text.push_str(&format!("{value:?}, "));
+            }
+            text.push_str("],\n");
+        }
+        text.push_str("        ],\n    };\n");
+        text
+    }
+
+    /// Runs eight `Record` steps of one activation dtype and returns the tokens and the logit
+    /// rows (packet GAP-TRIM-A 4(b)). The step input is the frozen `token` sequence, so the run
+    /// is deterministic in both dtypes.
+    fn eight_record_steps(activation: Activation) -> (Vec<u32>, Vec<Vec<f32>>) {
+        let (ckpt, _) = setup();
+        let mut decoder = ResidentDecoder::new_with_activation(
+            MlxKernels::try_new().unwrap(),
+            &ckpt,
+            host_load(&ckpt),
+            1024,
+            activation,
+        )
+        .unwrap();
+        let mut state = decoder.zero_state().unwrap();
+        let mut tokens = Vec::new();
+        let mut logits = Vec::new();
+        for step in 0..8u32 {
+            let got = decoder
+                .step(&mut state, token(step), StepMode::Record)
+                .unwrap();
+            tokens.push(got.token.unwrap());
+            logits.push(got.logits.unwrap());
+        }
+        (tokens, logits)
+    }
+
+    /// Packet GAP-TRIM-A 4(b): the end-to-end bit equality of a short decode. Eight `Record`
+    /// steps of the tiny GQA model must return the SAME tokens and the SAME logit bits on the
+    /// trimmed graph (one clamp per layer, no no-op contiguous nodes) as the frozen expectation
+    /// at the base commit, in F32 and in BF16. The comparison is on `f32::to_bits`.
+    #[test]
+    fn eight_decode_steps_match_the_frozen_expectation_in_f32_and_bf16() {
+        let freeze = std::env::var_os("GAP_TRIM_FREEZE").is_some();
+        for (name, activation, frozen) in [
+            ("FROZEN_F32", Activation::F32, &FROZEN_F32),
+            ("FROZEN_BF16", Activation::Bf16, &FROZEN_BF16),
+        ] {
+            let (tokens, logits) = eight_record_steps(activation);
+            if freeze {
+                eprintln!(
+                    "\npaste over the {name} constant:\n{}",
+                    frozen_block(name, &tokens, &logits)
+                );
+                continue;
+            }
+            assert_ne!(
+                frozen.tokens,
+                [u32::MAX; 8],
+                "{name} is unfrozen: run this test at the base commit with GAP_TRIM_FREEZE=1, \
+                 paste the printed block, and remove the ignore"
+            );
+            assert_eq!(tokens.as_slice(), frozen.tokens, "{name}: the eight tokens");
+            for (step, (got, want)) in logits.iter().zip(&frozen.logits).enumerate() {
+                assert_eq!(
+                    got.len(),
+                    want.len(),
+                    "{name} step {step}: the vocabulary width"
+                );
+                for (index, (got, want)) in got.iter().zip(want).enumerate() {
+                    assert_eq!(
+                        got.to_bits(),
+                        want.to_bits(),
+                        "{name} step {step} logit {index}: {got} against the frozen {want}"
+                    );
+                }
+            }
         }
     }
 }

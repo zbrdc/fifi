@@ -245,7 +245,9 @@ impl Context {
             return Err(error);
         }
         state.retire.flush_after_sync();
-        let result = source.storage.readback();
+        // The stream goes along for the strided case: a non-row-contiguous array is made
+        // contiguous inside the read and synchronized there (packet GAP-TRIM-A).
+        let result = source.storage.readback(state.stream.0);
         if result.is_err() {
             mark_failed();
         }
@@ -395,5 +397,65 @@ impl Context {
         let state = self.state.as_mut().unwrap();
         clear_message();
         state.import_batch(sources, data)
+    }
+
+    /// Returns the lazy graph of `outputs` as the text of `mlx_print_graph`, a
+    /// qualification-only graph dump (packet GPU-GAP-COUNT). The graph is DESCRIBED, never run:
+    /// the dump reads node names, shapes, and dtypes of the pending graph, so it evaluates,
+    /// synchronizes, and releases nothing, and the retire list keeps its arrays (a dump never
+    /// flushes). Like `evaluate_async` the shim fills no output array, so it takes part in no
+    /// selection of the qualification operation faults and consumes no operation-fault slot; no
+    /// counted fault applies to it. A native failure is terminal. The caller owns nothing: the
+    /// shim frees its buffer and the text lives in the returned `String`.
+    #[cfg(feature = "native-fault-qualification")]
+    pub(in crate::kernels::mlx) fn qualification_graph_text(
+        &mut self,
+        outputs: &[&ExecutionTensor],
+    ) -> Result<String, EngError> {
+        let _dispatch = DispatchGuard::enter();
+        self.check_ready()?;
+        let state = self.state.as_ref().unwrap();
+        if outputs.is_empty() {
+            return Err(EngError::BadRequest(
+                "the graph dump needs at least one output".into(),
+            ));
+        }
+        if outputs
+            .iter()
+            .any(|output| output.owner_key() != state.owner)
+        {
+            return Err(EngError::BadRequest(
+                "execution tensor belongs to another native owner".into(),
+            ));
+        }
+        clear_message();
+        let arrays: Vec<ffi::mlx_array> = outputs
+            .iter()
+            .map(|output| output.storage.native_array())
+            .collect();
+        let mut text: *mut std::ffi::c_char = std::ptr::null_mut();
+        let mut len = 0usize;
+        let status =
+            unsafe { ffi::mlx_graph_print(&mut text, &mut len, arrays.as_ptr(), arrays.len()) };
+        let result = check(status, "graph print").and_then(|_| {
+            if text.is_null() || len == 0 {
+                Err(failure("graph print"))
+            } else {
+                // Copy out before the free: the buffer is the shim's malloced memory.
+                let bytes = unsafe { std::slice::from_raw_parts(text.cast::<u8>(), len) };
+                match std::str::from_utf8(bytes) {
+                    Ok(printed) => Ok(printed.to_string()),
+                    Err(_) => Err(EngError::Backend {
+                        operation: "graph print",
+                        message: "the printed graph is not UTF-8 text".into(),
+                    }),
+                }
+            }
+        });
+        unsafe { ffi::mlx_free_string(text) };
+        if result.is_err() {
+            mark_failed();
+        }
+        result
     }
 }

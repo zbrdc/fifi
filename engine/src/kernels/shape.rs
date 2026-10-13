@@ -237,6 +237,24 @@ pub(crate) fn take_along_axis(
     layout(operation, indices.to_vec())
 }
 
+/// The inclusive maximum of the single `mlx_minimum` clamp that `bound_indices` builds for the
+/// exclusive `bound` (packet GAP-TRIM-A): every id of the clamped resident is `<= bound - 1`,
+/// that is `< bound`. A bound of zero clamps nothing (no id is below zero), so it is a
+/// `BadRequest` before any native call.
+pub(crate) fn clamp_max(operation: &'static str, bound: u32) -> Result<u32, EngError> {
+    bound
+        .checked_sub(1)
+        .ok_or_else(|| bad_request(operation, "bound must exceed zero"))
+}
+
+/// Whether ids that `bound_indices` clamped below the exclusive `bound` can never read outside
+/// an axis of `axis_len` entries, so a bounded gather or take along that axis can skip its own
+/// clamp (packet GAP-TRIM-A). A bound past the axis leaves the clamp in place, so the safety
+/// rule of the public operations holds for every `BoundedIndices`, whatever bound it records.
+pub(crate) fn bound_covers(bound: u32, axis_len: u32) -> bool {
+    bound <= axis_len
+}
+
 /// Batched matrix product `a @ b`. Both operands have rank at least two. The batch axes
 /// (all axes except the last two) broadcast with the NumPy rule.
 pub(crate) fn matmul(
@@ -426,9 +444,9 @@ fn layout(operation: &'static str, shape: Vec<u32>) -> Result<ElementwiseLayout,
 #[cfg(test)]
 mod tests {
     use super::{
-        attention, attention_prefix, concatenate, dequantize, expand_dims, float_operands,
-        gather_qmm, last_axis, matmul, reduce, repeat, reshape, rope, slice, slice_update, sort,
-        take, take_along_axis, transpose,
+        attention, attention_prefix, bound_covers, clamp_max, concatenate, dequantize, expand_dims,
+        float_operands, gather_qmm, last_axis, matmul, reduce, repeat, reshape, rope, slice,
+        slice_update, sort, take, take_along_axis, transpose,
     };
     use crate::{EngError, tensor::Dtype};
     fn rejects(result: Result<super::ElementwiseLayout, EngError>, text: &str) {
@@ -452,6 +470,57 @@ mod tests {
             Err(other) => panic!("expected BadRequest containing {text:?}, got {other:?}"),
             Ok(()) => panic!("expected BadRequest containing {text:?}, got Ok"),
         }
+    }
+
+    /// `clamp_max` is one below the exclusive bound and rejects zero: the clamp of the MoE names
+    /// the last expert `E - 1` for the expert count `E` (hand-derived, packet GAP-TRIM-A).
+    #[test]
+    fn clamp_max_is_one_below_the_exclusive_bound() {
+        assert_eq!(
+            clamp_max("bound indices", 1).unwrap(),
+            0,
+            "one id, expert 0"
+        );
+        assert_eq!(clamp_max("bound indices", 8).unwrap(), 7, "the tiny model");
+        assert_eq!(
+            clamp_max("bound indices", 256).unwrap(),
+            255,
+            "the real model"
+        );
+        assert_eq!(
+            clamp_max("bound indices", u32::MAX).unwrap(),
+            u32::MAX - 1,
+            "the largest bound clamps to the largest id"
+        );
+        match clamp_max("bound indices", 0) {
+            Err(EngError::BadRequest(message)) => assert!(
+                message.contains("bound must exceed zero"),
+                "message: {message}"
+            ),
+            other => panic!("expected a bound-of-zero rejection, got {other:?}"),
+        }
+    }
+
+    /// `bound_covers` holds exactly while the clamped ids stay inside the axis (hand-derived,
+    /// packet GAP-TRIM-A): a bound equal to the axis covers it (the last id is inside), a tighter
+    /// bound covers it too, and one past the axis does not.
+    #[test]
+    fn bound_covers_only_while_the_bound_fits_the_axis() {
+        assert!(
+            bound_covers(256, 256),
+            "a bound at the axis length covers it"
+        );
+        assert!(bound_covers(8, 256), "a tighter bound covers it too");
+        assert!(bound_covers(1, 1), "a one-entry axis");
+        assert!(!bound_covers(257, 256), "one past the axis re-clamps");
+        assert!(
+            !bound_covers(2, 1),
+            "a one-entry axis rejects the bound of two"
+        );
+        assert!(
+            !bound_covers(u32::MAX, 256),
+            "the largest bound never covers"
+        );
     }
 
     #[test]

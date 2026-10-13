@@ -9,10 +9,17 @@ use super::prefill;
 use super::state::{ResidentSnapshot, ResidentState};
 use super::step;
 use super::weights::ResidentWeights;
+#[cfg(test)]
+use crate::tensor::ExecutionTensor;
 use crate::{
     EngError, family::qwen36::host_load::HostWeights, kernels::MlxKernels, sched::SessionBudget,
     tensor::Dtype, weights::StreamedCheckpoint,
 };
+
+/// The test-only graph probe of packet GPU-GAP-COUNT: it runs after the token graph is built
+/// and before the step's single `evaluate`, with the kernels handle and the lazy outputs.
+#[cfg(test)]
+type GraphProbe = Box<dyn FnMut(&mut MlxKernels, &[&ExecutionTensor]) -> Result<(), EngError>>;
 
 /// What one step computes and reads back.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -76,6 +83,13 @@ pub(super) struct ResidentDecoder<'c> {
     pub(super) chunk_rows: u32,
     /// How the layers pick their experts. `Device` unless a parity run asks for `Host`.
     pub(super) routing: Routing,
+    /// A test-only probe that runs after the token graph is built and before the step's single
+    /// `evaluate` (packet GPU-GAP-COUNT): the graph dump of `decode_graph_primitives` reads the
+    /// lazy outputs there without evaluating them. `None` unless a test sets it, so every other
+    /// build and test runs the same step as before; the probe makes no native call of its own
+    /// except through the kernels handle it receives.
+    #[cfg(test)]
+    pub(super) graph_probe: Option<GraphProbe>,
 }
 
 impl<'c> ResidentDecoder<'c> {
@@ -186,7 +200,17 @@ impl<'c> ResidentDecoder<'c> {
             context_limit,
             chunk_rows: DEFAULT_CHUNK_ROWS,
             routing: Routing::default(),
+            #[cfg(test)]
+            graph_probe: None,
         }
+    }
+
+    /// Sets the test-only graph probe (packet GPU-GAP-COUNT), the hook that sees the lazy
+    /// outputs of one step before its `evaluate`. Test builds only; production code has no
+    /// setter, so no product path can install a probe.
+    #[cfg(test)]
+    pub(super) fn set_graph_probe(&mut self, probe: GraphProbe) {
+        self.graph_probe = Some(probe);
     }
 
     /// Selects how the next steps route. The parity gate runs `Host` as the reference. The choice

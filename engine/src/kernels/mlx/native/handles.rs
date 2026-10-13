@@ -392,14 +392,40 @@ impl Resident {
 
     /// Copies the array into portable host bytes. The caller has evaluated the array
     /// and synchronized the stream, so an array that an earlier lazy call built is complete here.
-    pub(super) fn readback(&self) -> Result<Tensor, EngError> {
+    ///
+    /// An array that is not row-contiguous — the strided view a `slice`, `transpose`, `repeat`,
+    /// or `broadcast` can return — is made contiguous HERE, at the read (packet GAP-TRIM-A): one
+    /// `mlx_contiguous` node, evaluated and synchronized on `stream`, and its bytes are what the
+    /// read returns. `readback` therefore no longer fails on a strided array; a failure of the
+    /// copy, its evaluation, or its synchronization follows the terminal readback rule.
+    pub(super) fn readback(&self, stream: ffi::mlx_stream) -> Result<Tensor, EngError> {
         let array = self.array.as_ref().unwrap().0;
-        let mut contiguous = false;
+        let mut row_contiguous = false;
         check(
-            unsafe { ffi::_mlx_array_is_row_contiguous(&mut contiguous, array) },
+            unsafe { ffi::_mlx_array_is_row_contiguous(&mut row_contiguous, array) },
             "readback layout",
         )?;
-        if !contiguous || unsafe { ffi::mlx_array_dtype(array) } != native_dtype(self.dtype) {
+        if row_contiguous {
+            return self.read_array(array);
+        }
+        let mut contiguous = Array::null();
+        check(
+            unsafe { ffi::mlx_contiguous(&mut contiguous.0, array, false, stream) },
+            "readback layout",
+        )?;
+        if contiguous.0.ctx.is_null() {
+            return Err(failure("readback layout"));
+        }
+        check(unsafe { ffi::mlx_array_eval(contiguous.0) }, "evaluate")?;
+        check(unsafe { ffi::mlx_synchronize(stream) }, "synchronize")?;
+        // The copy is evaluated and synchronized, so its drop below frees a completed buffer and
+        // never a lazy temporary that a failure would have to retain.
+        self.read_array(contiguous.0)
+    }
+
+    /// Reads the bytes of one evaluated, row-contiguous `array` after the metadata checks.
+    fn read_array(&self, array: ffi::mlx_array) -> Result<Tensor, EngError> {
+        if unsafe { ffi::mlx_array_dtype(array) } != native_dtype(self.dtype) {
             return Err(failure("readback layout"));
         }
         if unsafe { ffi::mlx_array_ndim(array) } != self.shape.len() {
