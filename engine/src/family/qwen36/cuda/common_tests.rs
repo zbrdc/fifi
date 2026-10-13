@@ -28,6 +28,7 @@ pub(super) fn plan_of(d: &StepDims, layout: WeightLayout) -> StepPlan {
         context_tokens: 1024,
         delta_slots: 1,
         forked_experts: false,
+        tiered: None,
         layout,
     };
     let scratch = KernelScratch::for_dims(d, 1).expect("scratch");

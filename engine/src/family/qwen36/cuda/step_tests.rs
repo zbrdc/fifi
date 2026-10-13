@@ -618,3 +618,23 @@ fn capture_once_folds_the_attempt_through_the_seam_and_reruns_on_none() {
         );
     }
 }
+
+#[test]
+fn tiered_step_refuses_capture_with_a_typed_error() {
+    use super::step::tiered_capture_refusal;
+    assert!(
+        tiered_capture_refusal(false, true).is_ok(),
+        "a plain step may capture"
+    );
+    assert!(
+        tiered_capture_refusal(true, false).is_ok(),
+        "a tiered step runs eager"
+    );
+    match tiered_capture_refusal(true, true) {
+        Err(crate::EngError::BadRequest(message)) => {
+            assert!(message.contains("eager only"), "{message}");
+            assert!(message.contains("amendment of 2026-10-13"), "{message}");
+        }
+        other => panic!("tiered with capture must be refused: {other:?}"),
+    }
+}

@@ -93,6 +93,35 @@ pub(crate) struct Q36Options {
     pub(crate) kv_dtype: Option<String>,
     /// Graph capture of the CUDA arm (default false, gate G1 eager); the MLX arm ignores it.
     pub(crate) capture: Option<bool>,
+    /// The tiered expert mode of the CUDA arm (OFF-2). Absent means off: the routed experts are
+    /// all resident on the device, as before. The MLX arm refuses the member.
+    pub(crate) tiered: Option<TieredOptions>,
+}
+
+/// The `tiered` member of the `qwen36` object.
+#[derive(Clone, Copy, Debug, Default, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct TieredOptions {
+    /// Expert bank slots per layer, from 8 (the picks per token) to 256. Required: the number
+    /// depends on the card, the context and the desktop, so no default covers it.
+    pub(crate) slots: Option<u32>,
+    /// CPU worker threads, from 1 to 8. The default is 6.
+    pub(crate) threads: Option<u32>,
+    /// The longest wait for one layer's CPU experts, in milliseconds, from 1 to 600,000. The
+    /// default is 10,000.
+    pub(crate) timeout_ms: Option<u32>,
+    /// Fill every layer's bank with its lowest-numbered experts before the first token. The
+    /// default is false: the banks start empty and policy P fills them.
+    pub(crate) preload: Option<bool>,
+}
+
+/// The checked tiered settings.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct TieredSettings {
+    pub(crate) slots: usize,
+    pub(crate) threads: usize,
+    pub(crate) timeout_ms: u32,
+    pub(crate) preload: bool,
 }
 
 /// The environment fallbacks, read by the caller so that this file stays pure.
@@ -330,6 +359,8 @@ pub(crate) struct Q36Settings {
     pub(crate) kv: KvDtype,
     /// Graph capture of the CUDA arm; the MLX arm ignores it with one start line.
     pub(crate) capture: bool,
+    /// The tiered expert mode, or `None` for the plain engine. Never on without the member.
+    pub(crate) tiered: Option<TieredSettings>,
     /// The MLX-only keys the CUDA arm ignores (in `Q36Options` order); the start logs one
     /// line per name. Empty on the MLX arm.
     pub(crate) ignored_mlx_keys: Vec<&'static str>,
@@ -456,6 +487,37 @@ fn cache_growth_per_position(
         .ok_or_else(|| bad("the cache growth per position overflows u64".into()))
 }
 
+/// The tiered member, checked: CUDA only, `slots` required, no capture (the tiered step waits for
+/// the host inside every layer, which a captured graph cannot do), no chunked prefill (the CUDA
+/// arm refuses its keys by name above, and the tiered prefill runs one token per step).
+fn tiered_settings(
+    options: &Q36Options,
+    backend: Backend,
+) -> Result<Option<TieredSettings>, EngError> {
+    let Some(tiered) = options.tiered else {
+        return Ok(None);
+    };
+    if backend == Backend::Mlx {
+        return Err(bad("tiered is a CUDA member; the MLX arm refuses it".into()));
+    }
+    if options.capture == Some(true) {
+        return Err(bad(
+            "tiered and capture exclude each other: the tiered step is eager only".into(),
+        ));
+    }
+    let slots = tiered
+        .slots
+        .ok_or_else(|| bad("tiered needs slots (bank slots per layer, 8 to 256)".into()))?;
+    Ok(Some(TieredSettings {
+        slots: usize::try_from(ranged("tiered.slots", Some(slots), 8, 8, 256)?)
+            .map_err(|_| bad("tiered.slots exceeds usize".into()))?,
+        threads: usize::try_from(ranged("tiered.threads", tiered.threads, 6, 1, 8)?)
+            .map_err(|_| bad("tiered.threads exceeds usize".into()))?,
+        timeout_ms: ranged("tiered.timeout_ms", tiered.timeout_ms, 10_000, 1, 600_000)?,
+        preload: tiered.preload.unwrap_or(false),
+    }))
+}
+
 /// Refuses one MLX chunked-prefill key on the CUDA arm, naming it: the arm prefills one token
 /// per step until CPF lands, so accepting the key would promise a speed it does not have.
 fn refuse_cuda_key(key: &str, value: Option<u64>) -> Result<(), EngError> {
@@ -580,6 +642,7 @@ impl Q36Settings {
             activation,
             kv,
             capture: options.capture.unwrap_or(false),
+            tiered: tiered_settings(options, backend)?,
             ignored_mlx_keys,
         })
     }
@@ -648,9 +711,10 @@ pub(crate) fn tokenizer_pin() -> Result<TokenizerPin, EngError> {
 mod tests {
     use super::{
         BF16_DEFAULT_PREFILL_CHUNK, Backend, DEFAULT_CONTEXT_LIMIT, DEFAULT_PREFILL_CHUNK,
-        DEFAULT_SESSION_CAP, NO_BUDGET_PIECE, Q36Env, Q36Options, Q36Settings, activation_name,
-        activation_of, cache_growth_per_position, chunked_prefill_allowed, delta_state_bytes,
-        digest, kv_dtype_name, kv_dtype_of, parse_kv_dtype, scale_pairing_error, tokenizer_pin,
+        DEFAULT_SESSION_CAP, NO_BUDGET_PIECE, Q36Env, Q36Options, Q36Settings, TieredSettings,
+        activation_name, activation_of, cache_growth_per_position, chunked_prefill_allowed,
+        delta_state_bytes, digest, kv_dtype_name, kv_dtype_of, parse_kv_dtype, scale_pairing_error,
+        tokenizer_pin,
     };
     use crate::EngError;
     use crate::family::spec::QWEN3_6_35B_A3B;
@@ -810,6 +874,7 @@ mod tests {
                 activation: super::Activation::Bf16,
                 kv: super::KvDtype::F32,
                 capture: false,
+                tiered: None,
                 ignored_mlx_keys: Vec::new(),
             }
         );
@@ -870,6 +935,7 @@ mod tests {
             activation_dtype: Some("f32".to_string()),
             kv_dtype: Some("q8".to_string()),
             capture: Some(true),
+            tiered: None,
         };
         let got = settings(Some(&options), &Q36Env::default()).unwrap();
         assert_eq!(got.cache_limit, 5);
@@ -1446,5 +1512,86 @@ mod tests {
                 )
             );
         }
+    }
+
+    fn tiered(body: &str) -> Q36Options {
+        serde_json::from_str(&format!("{{{body}}}")).expect("a valid qwen36 object")
+    }
+
+    #[test]
+    fn the_tiered_member_is_off_by_default_and_takes_its_defaults_when_given() {
+        let off = settings_for(None, &Q36Env::default(), Backend::Cuda).unwrap();
+        assert_eq!(off.tiered, None, "tiered is never on without the member");
+        let minimal = tiered(r#""tiered": {"slots": 40}"#);
+        let got = settings_for(Some(&minimal), &Q36Env::default(), Backend::Cuda).unwrap();
+        assert_eq!(
+            got.tiered,
+            Some(TieredSettings {
+                slots: 40,
+                threads: 6,
+                timeout_ms: 10_000,
+                preload: false
+            })
+        );
+        let full =
+            tiered(r#""tiered": {"slots": 61, "threads": 4, "timeout_ms": 5000, "preload": true}"#);
+        let got = settings_for(Some(&full), &Q36Env::default(), Backend::Cuda).unwrap();
+        assert_eq!(
+            got.tiered,
+            Some(TieredSettings {
+                slots: 61,
+                threads: 4,
+                timeout_ms: 5000,
+                preload: true
+            })
+        );
+    }
+
+    #[test]
+    fn the_tiered_member_is_checked_by_name() {
+        let refused = |body: &str, backend: Backend, needle: &str| {
+            let options = tiered(body);
+            let text = message(settings_for(Some(&options), &Q36Env::default(), backend));
+            assert!(text.contains(needle), "{body}: {text}");
+        };
+        let cuda = Backend::Cuda;
+        refused(r#""tiered": {}"#, cuda, "tiered needs slots");
+        refused(r#""tiered": {"slots": 7}"#, cuda, "tiered.slots");
+        refused(r#""tiered": {"slots": 257}"#, cuda, "tiered.slots");
+        refused(
+            r#""tiered": {"slots": 40, "threads": 0}"#,
+            cuda,
+            "tiered.threads",
+        );
+        refused(
+            r#""tiered": {"slots": 40, "threads": 9}"#,
+            cuda,
+            "tiered.threads",
+        );
+        refused(
+            r#""tiered": {"slots": 40, "timeout_ms": 0}"#,
+            cuda,
+            "tiered.timeout_ms",
+        );
+        refused(
+            r#""tiered": {"slots": 40, "timeout_ms": 600001}"#,
+            cuda,
+            "tiered.timeout_ms",
+        );
+        refused(
+            r#""cache_limit_bytes": 1024, "tiered": {"slots": 40}"#,
+            Backend::Mlx,
+            "tiered is a CUDA member",
+        );
+        refused(
+            r#""capture": true, "tiered": {"slots": 40}"#,
+            cuda,
+            "exclude each other",
+        );
+        let unknown = serde_json::from_str::<Q36Options>(r#"{"tiered": {"slots": 40, "bank": 1}}"#);
+        assert!(
+            unknown.is_err(),
+            "an unknown tiered member is refused by the parser"
+        );
     }
 }

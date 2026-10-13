@@ -7,8 +7,9 @@ use super::dims::{KvMode, StepDims};
 use super::pinned::ROTARY_DIM;
 use super::start::{
     BuildGuard, CUDA_ENGINE_BUILT, GGUF_BYTES, GGUF_NAME, KV_BYTES_PER_POSITION, already_built,
-    check_gguf_identity, check_sha256, context_tokens, file_sha256, ignored_mlx_line,
-    kv_cache_bytes, load_options, pinned_gguf, sha256_wanted, step_options,
+    check_gguf_identity, check_sha256, check_tiered_start, context_tokens, file_sha256,
+    ignored_mlx_line, kv_cache_bytes, load_options, pinned_gguf, sha256_wanted, step_options,
+    tiered_plan_of,
 };
 use super::state_layout::KvPool;
 use crate::EngError;
@@ -212,6 +213,10 @@ fn the_step_options_follow_the_context_limit_and_the_given_layout() {
         let options = step_options(32_768, layout).expect("the serve default");
         assert_eq!(options.context_tokens, 32_768);
         assert_eq!((options.delta_slots, options.forked_experts), (1, false));
+        assert_eq!(
+            options.tiered, None,
+            "tiered is off unless a config key turns it on"
+        );
         assert!(matches!(options.kv_mode, KvMode::Fp16));
         assert_eq!(options.layout, layout, "the layout passes through");
     }
@@ -285,4 +290,66 @@ fn the_load_reserve_covers_the_kv_cache() {
     // MSG-70 condition 8: the load layout is written outright; since the S3c qualification
     // (KUBDAN-MSG-77) it is `Native`, and this one field of `load_options` is the switch.
     assert_eq!(options.layout, WeightLayout::Native);
+}
+
+fn cuda_settings(object: &str) -> Q36Settings {
+    let options: Q36Options = serde_json::from_str(object).expect("a valid qwen36 object");
+    Q36Settings::new(
+        Path::new("/m"),
+        Path::new("/t"),
+        Some(&options),
+        &Q36Env::default(),
+        Backend::Cuda,
+    )
+    .expect("valid CUDA settings")
+}
+
+#[test]
+fn start_without_the_tiered_key_builds_no_bank() {
+    let plain = cuda_settings("{}");
+    assert_eq!(
+        tiered_plan_of(&plain),
+        None,
+        "tiered is off unless the member is set"
+    );
+    assert!(check_tiered_start(&plain).is_ok());
+    let tiered = cuda_settings(
+        r#"{"tiered": {"slots": 40, "threads": 4, "timeout_ms": 2500, "preload": true}}"#,
+    );
+    let plan = tiered_plan_of(&tiered).expect("the member asks for a plan");
+    assert_eq!(
+        (plan.slots_per_layer, plan.threads, plan.timeout_ms),
+        (40, 4, 2500)
+    );
+    assert_eq!(
+        (plan.swaps_milli, plan.decay_milli),
+        (250, 999),
+        "the measured defaults"
+    );
+    assert!(plan.preload, "the member asks for the preload");
+    assert!(
+        !tiered_plan_of(&cuda_settings(r#"{"tiered": {"slots": 40}}"#))
+            .unwrap()
+            .preload,
+        "the banks start empty unless asked"
+    );
+    assert!(plan.check().is_ok());
+    assert!(check_tiered_start(&tiered).is_ok());
+}
+
+#[test]
+fn start_refuses_capture_with_tiered() {
+    // The settings refuse the pair by name; the start checks it again on its own, so a settings
+    // value built by hand cannot start a captured tiered engine.
+    let mut tiered = cuda_settings(r#"{"tiered": {"slots": 40}}"#);
+    tiered.capture = true;
+    match check_tiered_start(&tiered) {
+        Err(EngError::BadRequest(message)) => {
+            assert!(
+                message.contains("tiered and capture exclude each other"),
+                "{message}"
+            );
+        }
+        other => panic!("tiered with capture must be refused at the start: {other:?}"),
+    }
 }

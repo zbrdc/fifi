@@ -17,6 +17,7 @@ fn options(forked_experts: bool) -> StepOptions {
         context_tokens: 1024,
         delta_slots: 1,
         forked_experts,
+        tiered: None,
         layout: WeightLayout::Tiled,
     }
 }

@@ -31,6 +31,7 @@ fn options(mode: KvMode, ctx: usize) -> StepOptions {
         context_tokens: ctx,
         delta_slots: 1,
         forked_experts: false,
+        tiered: None,
         layout: WeightLayout::Tiled,
     }
 }
@@ -83,6 +84,7 @@ fn forked_experts_add_one_pack_per_routed_expert() {
     let d = dims();
     let fork_opts = StepOptions {
         forked_experts: true,
+        tiered: None,
         ..options(KvMode::Fp16, 1024)
     };
     let fork = plan(&d, 1, &fork_opts);

@@ -4,6 +4,10 @@
     all(feature = "native-mlx", target_os = "macos", target_arch = "aarch64")
 ))]
 mod elementwise;
+pub mod expert_cpu;
+pub mod expert_cpu_avx2;
+pub mod expert_cpu_q8g;
+pub mod expert_cpu_q8k;
 #[cfg(any(
     test,
     all(feature = "native-mlx", target_os = "macos", target_arch = "aarch64")

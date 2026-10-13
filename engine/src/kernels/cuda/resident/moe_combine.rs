@@ -37,10 +37,6 @@
 //! range belong to this context; the shape (see [`check_shape`]); each range holds what the call
 //! uses and starts at its alignment; the range the call writes overlaps no input. The native entry
 //! and the C entry repeat these checks. A refused call changes nothing.
-#![cfg_attr(
-    not(test),
-    expect(dead_code, reason = "staged for RD-9a (decision 0047)")
-)]
 
 use std::ffi::c_int;
 

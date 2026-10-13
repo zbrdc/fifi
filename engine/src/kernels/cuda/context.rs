@@ -830,21 +830,25 @@ fn host_floats(len: usize) -> Result<Vec<f32>, EngError> {
 
 mod buffer_io;
 mod device_arena;
+mod expert_bank;
 mod graph;
 mod launch;
 mod native_weight;
 mod pinned;
+mod pinned_buf;
 mod range;
 mod stream;
 mod tile_q5_0;
 mod workspace;
 
 pub(crate) use device_arena::{ArenaHold, DeviceArena};
+pub(crate) use expert_bank::{ExpertBank, ExpertBankGeometry};
 pub(crate) use graph::{CapturePlan, GraphExec, is_capture_refusal};
 pub(in crate::kernels::cuda) use launch::{Claim, require_apart, require_fit};
 pub(crate) use launch::{MatmulIo, PackCall, Projection};
 pub(crate) use native_weight::NativeWeight;
 pub(crate) use pinned::{PinnedWord, WordValue};
+pub(crate) use pinned_buf::PinnedBuf;
 pub(crate) use range::DeviceRange;
 pub(crate) use stream::{DeviceEvent, DeviceStream};
 pub(crate) use workspace::{Admission, Growth, WorkspaceShape};

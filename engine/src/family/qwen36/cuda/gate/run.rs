@@ -36,9 +36,11 @@ use crate::{
                 rules::QwenRules,
                 run_report::CaptureOutcome,
                 step::{CaptureConfig, QwenResidentStep},
+                tiered_load::{attach_tiered_parts, names_without_experts},
             },
             host::HostShape,
             settings::tokenizer_pin,
+            tiered::report::TokenReport,
         },
     },
     kernels::cuda::CudaContext,
@@ -165,7 +167,7 @@ fn gate_doc(mode: Mode, identities: Value, prompts: Vec<Value>) -> Value {
 /// The identity fields of the memory admission plus the settings' full-file GGUF hash, echoed
 /// for the evaluator (0040 A2; `rawcheck.py` requires `identities.gguf_sha256`).
 fn identities_of(s: &GateSettings, total: usize, before: usize, after: usize) -> Value {
-    json!({
+    let mut identities = json!({
         "capture_requested": if s.capture { "graph" } else { "eager" },
         "gguf_sha256": s.gguf_sha256,
         "kv_mode": "fp16",
@@ -173,7 +175,17 @@ fn identities_of(s: &GateSettings, total: usize, before: usize, after: usize) ->
         "mem_total": total,
         "mem_free_before": before,
         "mem_free_after_load": after,
-    })
+    });
+    if let Some(plan) = s.tiered {
+        // Only a tiered call carries the member: a plain call's identities stay byte for byte.
+        identities["tiered"] = json!({
+            "slots": plan.slots_per_layer,
+            "threads": plan.threads,
+            "timeout_ms": plan.timeout_ms,
+            "preload": plan.preload,
+        });
+    }
+    identities
 }
 
 fn report(doc: Value) -> Result<GateReport, EngError> {
@@ -193,6 +205,7 @@ fn session_options(s: &GateSettings, layout: WeightLayout) -> Result<StepOptions
         context_tokens: context_tokens(s.prompts.iter().map(Vec::len).max().unwrap_or(0))?,
         delta_slots: 1,
         forked_experts: false,
+        tiered: s.tiered,
         layout,
     })
 }
@@ -262,6 +275,7 @@ fn build_step<'a>(
 struct RunInputs<'a> {
     mode: Mode,
     requested: bool,
+    tiered: bool,
     prompt: &'a [u32],
     forced: &'a [u32],
 }
@@ -278,6 +292,8 @@ struct Timed {
     prompt_synced: u64,
     timed_start: u64,
     timed_end: u64,
+    /// The summed counters of the tiered boundaries of this run, `None` on a plain call.
+    tiered: Option<TokenReport>,
 }
 
 enum Region {
@@ -322,6 +338,7 @@ fn timed_region(
     let mut timer = PhaseTimer::start(MonotonicClock::new());
     let timed_start = unix_ns()?;
     let (mut prev, mut syncs, mut host_writes) = (0u32, 0u64, 0u64);
+    let mut tiered = x.tiered.then(TokenReport::default);
     for (j, row) in rows.iter_mut().enumerate() {
         let token = input_for(x.mode, j, last_prompt, x.forced, prev).map_err(bad)?;
         check(timer.step_begin())?;
@@ -337,6 +354,9 @@ fn timed_region(
         let run = step.last_report();
         syncs += u64::from(run.syncs);
         host_writes += u64::from(run.host_writes);
+        if let Some(sum) = tiered.as_mut() {
+            sum.merge(&step.last_tiered_report());
+        }
         check(timer.end(Phase::Host))?;
         check(timer.step_end())?;
         if secs != 0 && started.elapsed().as_secs() >= u64::from(secs) {
@@ -357,6 +377,7 @@ fn timed_region(
         prompt_synced,
         timed_start,
         timed_end,
+        tiered,
     }))
 }
 
@@ -380,7 +401,25 @@ fn run_json_of(t: &Timed, x: &RunInputs<'_>) -> Result<Value, EngError> {
         timed_start_unix_ns: t.timed_start,
         timed_end_unix_ns: t.timed_end,
     };
-    Ok(run_json(&meta, &t.timing, steps))
+    let mut run = run_json(&meta, &t.timing, steps);
+    if let Some(extra) = tiered_json(t.tiered.as_ref()) {
+        run["tiered"] = extra;
+    }
+    Ok(run)
+}
+
+/// The tiered counters of one run for the raw document: present only on a tiered call, so the
+/// run object of a plain call keeps its keys byte for byte.
+fn tiered_json(sum: Option<&TokenReport>) -> Option<Value> {
+    sum.map(|sum| {
+        json!({
+            "bank_hits": sum.bank_hits,
+            "cpu_served": sum.cpu_served,
+            "swaps": sum.swaps,
+            "routed_weight_ppm": sum.routed_weight_ppm,
+            "cpu_weight_ppm": sum.cpu_weight_ppm,
+        })
+    })
 }
 
 /// Every prompt and every run, then the raw document; the deadline expiry ends the call with
@@ -397,6 +436,7 @@ fn run_all(
         let x = RunInputs {
             mode,
             requested: s.capture,
+            tiered: s.tiered.is_some(),
             prompt: &s.prompts[index],
             forced: if mode == Mode::Forced {
                 &s.forced[index]
@@ -446,18 +486,24 @@ pub(super) fn device_gate(s: &GateSettings) -> Result<GateReport, EngError> {
     let projector = CudaProjector::new()?;
     let before = projector.memory_info()?;
     let model = open_qwen3_6_35b_a3b(&s.gguf, None)?;
-    let loaded = projector.load_model(
-        &model,
-        LoadOptions {
-            reserve: Reserve {
-                kv_cache: 0,
-                work: 0,
-                headroom: 0,
-            },
-            drop_page_cache: None,
-            layout: s.layout,
+    let options = LoadOptions {
+        reserve: Reserve {
+            kv_cache: 0,
+            work: 0,
+            headroom: 0,
         },
-    )?;
+        drop_page_cache: None,
+        layout: s.layout,
+    };
+    // A tiered call leaves the routed expert stacks in the file: the banks hold the hot ones.
+    let device = match s.tiered {
+        None => projector.load_model(&model, options)?.device,
+        Some(_) => {
+            let names = model.plan().device_names();
+            let names = names_without_experts(&names);
+            projector.load(&model.weights, &names, options)?
+        }
+    };
     let after = projector.memory_info()?;
     let identities = identities_of(s, after.total, before.free, after.free);
     if after.free < MIN_FREE_AFTER_LOAD {
@@ -466,9 +512,13 @@ pub(super) fn device_gate(s: &GateSettings) -> Result<GateReport, EngError> {
         return report(doc);
     }
     // The step's layout comes from the loaded weights (the settings' member chose the LOAD).
-    let layout = loaded.device.layout()?;
+    let layout = device.layout()?;
     let res = build_resources(projector.context(), s, layout)?;
-    let mut step = build_step(&projector, &res, &loaded.device, rules, s, layout)?;
+    let mut step = build_step(&projector, &res, &device, rules, s, layout)?;
+    if let Some(plan) = s.tiered {
+        let source = (model.weights.header(), s.gguf.as_path());
+        attach_tiered_parts(&mut step, projector.context(), (source, &res.dims), &plan)?;
+    }
     run_all(&mut step, s, mode, identities)
 }
 #[cfg(test)]
@@ -1071,6 +1121,65 @@ mod tests {
         assert!(
             seam.contains("QwenRules::new("),
             "the rules seam ({seam_len} bytes) does not build QwenRules"
+        );
+    }
+
+    #[test]
+    fn the_gate_echoes_tiered_in_the_identities_only_when_set() {
+        let plain: GateSettings = FREE.parse().unwrap();
+        let off = identities_of(&plain, 100, 90, 40);
+        assert!(
+            off.get("tiered").is_none(),
+            "a plain call carries no tiered identity"
+        );
+        // Byte for byte as before the member existed.
+        assert_eq!(
+            off.to_string(),
+            r#"{"capture_requested":"eager","gguf_sha256":"ab","kv_mode":"fp16","layout":"native","mem_total":100,"mem_free_before":90,"mem_free_after_load":40}"#
+        );
+        let text = FREE.replace(
+            "\"deadline_secs\":270",
+            "\"deadline_secs\":270,\"tiered\":{\"slots\":40,\"threads\":4,\"preload\":true}",
+        );
+        let tiered: GateSettings = text.parse().unwrap();
+        let on = identities_of(&tiered, 100, 90, 40);
+        assert_eq!(on["tiered"]["slots"], 40);
+        assert_eq!(on["tiered"]["threads"], 4);
+        assert_eq!(on["tiered"]["timeout_ms"], 10_000);
+        assert_eq!(on["tiered"]["preload"], true);
+        assert_eq!(
+            session_options(&tiered, WeightLayout::Native)
+                .unwrap()
+                .tiered
+                .unwrap()
+                .slots_per_layer,
+            40
+        );
+        assert_eq!(
+            session_options(&plain, WeightLayout::Native)
+                .unwrap()
+                .tiered,
+            None
+        );
+    }
+
+    #[test]
+    fn the_run_report_carries_the_token_report_only_when_tiered() {
+        assert_eq!(tiered_json(None), None);
+        let sum = TokenReport {
+            bank_hits: 5,
+            cpu_served: 3,
+            swaps: 2,
+            routed_weight_ppm: 700_000,
+            cpu_weight_ppm: 250_000,
+            ..TokenReport::default()
+        };
+        assert_eq!(
+            tiered_json(Some(&sum)),
+            Some(json!({
+                "bank_hits": 5, "cpu_served": 3, "swaps": 2,
+                "routed_weight_ppm": 700_000, "cpu_weight_ppm": 250_000
+            }))
         );
     }
 }

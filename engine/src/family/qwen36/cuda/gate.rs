@@ -7,6 +7,7 @@
 //! binary builds a `GateSettings` from a JSON text (`str::parse`, the `FromStr` impl) and reads the report as text
 //! (`to_string`, the `Display` impl). Trait impls carry no `pub` keyword, and the same check lists them too.
 //! A `prefill` key is a later addition to the settings text, never a second function.
+use super::dims::TieredPlan;
 use crate::EngError;
 use crate::family::project::cuda::WeightLayout;
 use serde_json::Value;
@@ -42,6 +43,49 @@ pub struct GateSettings {
     /// absent, since the S3c qualification) or "tiled". It chooses only how the tensors are uploaded; the step's layout
     /// always follows the loaded weights.
     layout: WeightLayout,
+    /// The tiered expert mode (OFF-2), or `None` for the plain native step; never on without the
+    /// optional `tiered` member.
+    tiered: Option<TieredPlan>,
+}
+
+/// The optional `tiered` member: `{"slots": n, "threads": n, "timeout_ms": n, "preload": bool}`,
+/// `slots` required.
+pub(super) fn tiered_member(v: &Value) -> Result<Option<TieredPlan>, EngError> {
+    let bad = |what: &str| EngError::BadRequest(format!("gate settings: tiered {what}"));
+    let Some(member) = v.get("tiered") else {
+        return Ok(None);
+    };
+    let object = member.as_object().ok_or_else(|| bad("must be an object"))?;
+    if let Some(key) = object
+        .keys()
+        .find(|key| !["slots", "threads", "timeout_ms", "preload"].contains(&key.as_str()))
+    {
+        return Err(bad(&format!("has the unknown member {key}")));
+    }
+    let number = |key: &str| -> Result<Option<u32>, EngError> {
+        object
+            .get(key)
+            .map(|value| {
+                value
+                    .as_u64()
+                    .and_then(|n| u32::try_from(n).ok())
+                    .ok_or_else(|| bad(&format!("{key} is not a u32")))
+            })
+            .transpose()
+    };
+    let slots = number("slots")?.ok_or_else(|| bad("needs slots"))?;
+    let threads = number("threads")?.unwrap_or(6);
+    let mut plan = TieredPlan::new(slots as usize, threads as usize);
+    if let Some(timeout_ms) = number("timeout_ms")? {
+        plan.timeout_ms = timeout_ms;
+    }
+    if let Some(preload) = object.get("preload") {
+        plan.preload = preload
+            .as_bool()
+            .ok_or_else(|| bad("preload is not a bool"))?;
+    }
+    plan.check()?;
+    Ok(Some(plan))
 }
 
 /// The raw JSON of schema `cuda-rd-raw/2` (see `a5_eval.py`), without the identities only the binary knows.
@@ -102,8 +146,9 @@ impl FromStr for GateSettings {
     type Err = EngError;
 
     /// Keys: gguf, gguf_sha256, names, prompts, forced, forced_stream_sha256, gen_tokens, runs,
-    /// capture, kv_fp16, deadline_secs, and the ONE optional key `layout` ("native", the default
-    /// since the S3c qualification, or "tiled"; MATVEC-PAR S3b). A missing or mistyped key is a typed `BadRequest`, never a
+    /// capture, kv_fp16, deadline_secs, and the optional keys `layout` ("native", the default
+    /// since the S3c qualification, or "tiled"; MATVEC-PAR S3b) and `tiered` (OFF-2; absent means
+    /// off, refused with capture and with the tiled layout). A missing or mistyped key is a typed `BadRequest`, never a
     /// default.
     fn from_str(text: &str) -> Result<Self, EngError> {
         let v: Value = serde_json::from_str(text)
@@ -134,7 +179,20 @@ impl FromStr for GateSettings {
                     }
                 },
             },
+            tiered: tiered_member(&v)?,
         };
+        if s.tiered.is_some() && s.capture {
+            return Err(EngError::BadRequest(
+                "gate settings: tiered and capture exclude each other: the tiered step is eager only"
+                    .to_owned(),
+            ));
+        }
+        if s.tiered.is_some() && s.layout != WeightLayout::Native {
+            return Err(EngError::BadRequest(
+                "gate settings: tiered needs the native layout: the bank stacks are native blocks"
+                    .to_owned(),
+            ));
+        }
         if s.names.len() != s.prompts.len() || s.gguf_sha256.is_empty() || s.runs == 0 {
             return Err(EngError::BadRequest(
                 "gate settings: inconsistent lists or zero runs".to_owned(),
@@ -311,5 +369,57 @@ mod tests {
             run_step_gate(&refused.parse().unwrap()),
             Err(EngError::BadRequest(_))
         ));
+    }
+
+    fn with_member(member: &str) -> String {
+        let mut v: Value = serde_json::from_str(GOOD).unwrap();
+        v.as_object_mut()
+            .unwrap()
+            .insert("capture".into(), Value::Bool(false));
+        v.as_object_mut()
+            .unwrap()
+            .insert("tiered".into(), serde_json::from_str(member).unwrap());
+        v.to_string()
+    }
+
+    #[test]
+    fn the_gate_settings_parse_tiered_and_it_is_off_without_the_member() {
+        let plain: GateSettings = GOOD.parse().unwrap();
+        assert_eq!(plain.tiered, None, "tiered is never on without the member");
+        let tiered: GateSettings = with_member(r#"{"slots": 61, "timeout_ms": 5000}"#)
+            .parse()
+            .unwrap();
+        let plan = tiered.tiered.expect("the member sets the plan");
+        assert_eq!(
+            (plan.slots_per_layer, plan.threads, plan.timeout_ms),
+            (61, 6, 5000)
+        );
+        assert!(!plan.preload, "the banks start empty unless asked");
+        let preloaded: GateSettings = with_member(r#"{"slots": 256, "preload": true}"#)
+            .parse()
+            .unwrap();
+        assert!(preloaded.tiered.expect("the member sets the plan").preload);
+    }
+
+    #[test]
+    fn the_tiered_member_is_checked_and_refused_with_capture_and_the_tiled_layout() {
+        rejects_naming(&with_member(r#"{}"#), "needs slots");
+        rejects_naming(&with_member(r#"{"slots": 0}"#), "slots_per_layer");
+        rejects_naming(&with_member(r#"{"slots": 40, "threads": 99}"#), "threads");
+        rejects_naming(
+            &with_member(r#"{"slots": 40, "banks": 1}"#),
+            "unknown member banks",
+        );
+        rejects_naming(&with_member(r#"[1]"#), "must be an object");
+        rejects_naming(
+            &with_member(r#"{"slots": 40, "preload": 1}"#),
+            "preload is not a bool",
+        );
+        let mut capture: Value = serde_json::from_str(&with_member(r#"{"slots": 40}"#)).unwrap();
+        capture["capture"] = Value::Bool(true);
+        rejects_naming(&capture.to_string(), "exclude each other");
+        let mut tiled: Value = serde_json::from_str(&with_member(r#"{"slots": 40}"#)).unwrap();
+        tiled["layout"] = Value::String("tiled".into());
+        rejects_naming(&tiled.to_string(), "needs the native layout");
     }
 }

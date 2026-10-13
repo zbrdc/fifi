@@ -45,6 +45,7 @@ fn options(mode: KvMode, context_tokens: usize) -> StepOptions {
         context_tokens,
         delta_slots: 1,
         forked_experts: false,
+        tiered: None,
         // The pool tests exercise no weight path; Native is the layout of the resident step
         // whose Int8G32 pool these tests pin.
         layout: WeightLayout::Native,

@@ -17,5 +17,6 @@ mod resident;
 pub(crate) mod settings;
 #[cfg(all(feature = "native-mlx", target_os = "macos", target_arch = "aarch64"))]
 mod start;
+pub mod tiered;
 #[cfg(test)]
 mod tiny;

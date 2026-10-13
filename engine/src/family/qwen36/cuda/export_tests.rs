@@ -26,6 +26,7 @@ fn options(mode: KvMode, ctx: usize) -> StepOptions {
         context_tokens: ctx,
         delta_slots: 1,
         forked_experts: false,
+        tiered: None,
         layout: WeightLayout::Tiled,
     }
 }

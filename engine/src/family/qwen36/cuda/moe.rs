@@ -1364,5 +1364,7 @@ pub(super) fn run_moe_block(
     Ok(())
 }
 
+pub(super) mod tiered;
+
 #[cfg(test)]
 mod tests;

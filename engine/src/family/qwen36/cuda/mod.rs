@@ -45,6 +45,8 @@ mod native_ops_tests;
 #[cfg(test)]
 mod native_plan_tests;
 #[cfg(test)]
+mod native_tiered_device_tests;
+#[cfg(test)]
 mod ops_tests;
 mod pinned;
 #[cfg(test)]
@@ -83,6 +85,8 @@ mod step_plan;
 mod step_tests;
 #[cfg(test)]
 mod tests;
+mod tiered_load;
+mod tiered_step;
 mod verdict;
 #[cfg(test)]
 mod verdict_tests;

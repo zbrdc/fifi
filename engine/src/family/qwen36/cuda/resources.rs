@@ -17,6 +17,7 @@ use super::{
     mixer_weights::dense_weight,
     moe::{MoeDims, MoeLayerWeights, StackWeights},
     step_plan::{KernelScratch, StepPlan},
+    tiered_step::LayerParts,
 };
 use crate::{
     EngError,
@@ -200,6 +201,15 @@ pub(super) fn check_stage1_options(options: &StepOptions) -> Result<(), EngError
                 .to_owned(),
         ));
     }
+    if let Some(plan) = options.tiered {
+        plan.check()?;
+        if options.layout != WeightLayout::Native {
+            return Err(EngError::Checkpoint(String::from(
+                "tiered needs the native layout: the bank stacks are native blocks and the expert \
+                 launches read them",
+            )));
+        }
+    }
     Ok(())
 }
 
@@ -349,6 +359,35 @@ pub(super) fn moe_layer_weights<'w>(
         shared_down: dense_weight(
             weights,
             name(Role::FfnDownShexp)?,
+            &specs.shared_down,
+            layout,
+        )?,
+    })
+}
+
+/// The router and shared-expert weights of `layer`, shapes checked against `specs`: what the
+/// tiered mode takes from the loaded model (the routed expert stacks are not loaded then).
+pub(super) fn moe_layer_parts<'w>(
+    table: &LayerTable,
+    weights: &'w CudaWeights,
+    specs: &MoeSpecs,
+    layer: usize,
+    layout: WeightLayout,
+) -> Result<LayerParts<'w>, EngError> {
+    let tensor = |role| table.name(layer, role);
+    Ok(LayerParts {
+        router: raw_buffer(weights, tensor(Role::FfnGateInp)?, specs.router_values)?,
+        router_shared: raw_buffer(weights, tensor(Role::FfnGateInpShexp)?, specs.shexp_values)?,
+        shared_gate: dense_weight(
+            weights,
+            tensor(Role::FfnGateShexp)?,
+            &specs.shared_gate,
+            layout,
+        )?,
+        shared_up: dense_weight(weights, tensor(Role::FfnUpShexp)?, &specs.shared_up, layout)?,
+        shared_down: dense_weight(
+            weights,
+            tensor(Role::FfnDownShexp)?,
             &specs.shared_down,
             layout,
         )?,

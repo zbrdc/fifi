@@ -23,28 +23,28 @@ use crate::family::project::cuda::WeightLayout;
 use crate::kernels::cuda::{CudaContext, DeviceBuffer, DeviceStream, PackCall, xf_bytes};
 
 /// The host-side results of one block run, in the plain-data form the asserts consume.
-struct BlockRun {
-    resid_out: Vec<f32>,
-    expert_gu: Vec<f32>,
-    expert_down: Vec<f32>,
-    ids: Vec<i32>,
-    weights: Vec<f32>,
-    shared_out: Vec<f32>,
+pub(super) struct BlockRun {
+    pub(super) resid_out: Vec<f32>,
+    pub(super) expert_gu: Vec<f32>,
+    pub(super) expert_down: Vec<f32>,
+    pub(super) ids: Vec<i32>,
+    pub(super) weights: Vec<f32>,
+    pub(super) shared_out: Vec<f32>,
     /// The per-block q8_1 scales `d` of the produced down pack, decoded on the host: the down
     /// hop's own input amplitudes for its derived bound.
-    down_scales: Vec<f32>,
+    pub(super) down_scales: Vec<f32>,
     /// The per-block q8_1 scales of the produced SHARED pack (the shared swiglu row): the shared
     /// down hop's own input amplitude.
-    shared_scales: Vec<f32>,
+    pub(super) shared_scales: Vec<f32>,
 }
 
 /// The device buffers of one block run, OWNED by the caller's device phase (no leaks): the f32
 /// rows (norm, resid in, resid out), the router words, the outputs and the layout's packs.
-struct BlockBufs {
-    f32s: Vec<DeviceBuffer>,
-    smalls: Vec<DeviceBuffer>,
-    outs: Vec<DeviceBuffer>,
-    packs: Vec<DeviceBuffer>,
+pub(super) struct BlockBufs {
+    pub(super) f32s: Vec<DeviceBuffer>,
+    pub(super) smalls: Vec<DeviceBuffer>,
+    pub(super) outs: Vec<DeviceBuffer>,
+    pub(super) packs: Vec<DeviceBuffer>,
 }
 
 fn range(buf: &DeviceBuffer) -> Result<crate::kernels::cuda::DeviceRange<'_>, EngError> {
@@ -53,7 +53,11 @@ fn range(buf: &DeviceBuffer) -> Result<crate::kernels::cuda::DeviceRange<'_>, En
 
 /// Allocates one run's buffers: the inputs uploaded, everything else zeroed (no allocation may
 /// happen inside a capture window, so the capture test builds these before it opens one).
-fn block_bufs(ctx: &CudaContext, s: &Sources, layout: WeightLayout) -> Result<BlockBufs, EngError> {
+pub(super) fn block_bufs(
+    ctx: &CudaContext,
+    s: &Sources,
+    layout: WeightLayout,
+) -> Result<BlockBufs, EngError> {
     let f32s: Vec<DeviceBuffer> = vec![
         f32_buf(ctx, &s.norm)?,
         f32_buf(ctx, &s.resid)?,
@@ -113,7 +117,7 @@ fn block_bufs(ctx: &CudaContext, s: &Sources, layout: WeightLayout) -> Result<Bl
 }
 
 /// The block's buffer set over `b` in `layout`.
-fn moe_bufs(b: &BlockBufs, layout: WeightLayout) -> Result<MoeBuffers<'_>, EngError> {
+pub(super) fn moe_bufs(b: &BlockBufs, layout: WeightLayout) -> Result<MoeBuffers<'_>, EngError> {
     Ok(MoeBuffers {
         route: RouteBufs {
             resid_in: range(&b.f32s[1])?,
@@ -147,7 +151,7 @@ fn moe_bufs(b: &BlockBufs, layout: WeightLayout) -> Result<MoeBuffers<'_>, EngEr
 }
 
 /// The input pack from the norm row through the layout's own producer.
-fn produce(
+pub(super) fn produce(
     ctx: &CudaContext,
     stream: &DeviceStream,
     b: &BlockBufs,
@@ -177,7 +181,7 @@ fn produce(
 }
 
 /// Reads one run's outputs back; the caller has drained the stream.
-fn read_back(stream: &DeviceStream, b: &BlockBufs) -> Result<BlockRun, EngError> {
+pub(super) fn read_back(stream: &DeviceStream, b: &BlockBufs) -> Result<BlockRun, EngError> {
     let read_f32 = |buf: &DeviceBuffer| -> Result<Vec<f32>, EngError> {
         let mut bytes = vec![0u8; buf.bytes()];
         buf.read_at(stream, 0, &mut bytes)?;
@@ -239,7 +243,7 @@ fn read_back(stream: &DeviceStream, b: &BlockBufs) -> Result<BlockRun, EngError>
 
 /// One eager `run_moe_block` run in `layout`: buffers, producer, block, ONE trailing
 /// synchronize, read-backs - only `?` inside (the isolation rule).
-fn run_block(
+pub(super) fn run_block(
     ctx: &CudaContext,
     stream: &DeviceStream,
     s: &Sources,

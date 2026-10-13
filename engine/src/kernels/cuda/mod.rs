@@ -61,7 +61,7 @@ pub(crate) mod resident;
 mod testkit;
 
 pub(crate) use context::{
-    Admission, CHUNK_LIMIT, CudaContext, DeviceBuffer, Growth, MemoryInfo, NativeWeight,
+    Admission, CHUNK_LIMIT, CudaContext, DeviceBuffer, Growth, MemoryInfo, NativeWeight, PinnedBuf,
     QuantTensor, TiledWeight, WorkspaceShape, check_q5_0_scales, check_q6k_scales,
     check_q8_0_scales, drop_page_cache,
 };
@@ -73,8 +73,9 @@ pub(crate) use context::{
     )
 )]
 pub(crate) use context::{
-    ArenaHold, CapturePlan, DeviceArena, DeviceEvent, DeviceRange, DeviceStream, GraphExec,
-    MatmulIo, PackCall, PinnedWord, Projection, WordValue, is_capture_refusal,
+    ArenaHold, CapturePlan, DeviceArena, DeviceEvent, DeviceRange, DeviceStream, ExpertBank,
+    ExpertBankGeometry, GraphExec, MatmulIo, PackCall, PinnedWord, Projection, WordValue,
+    is_capture_refusal,
 };
 pub(crate) use {
     arena::{ArenaPlan, ArenaTensor, plan_arena},

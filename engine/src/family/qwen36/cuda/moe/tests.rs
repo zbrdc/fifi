@@ -23,7 +23,7 @@ fn step_dims() -> StepDims {
 }
 
 /// The MoE block dims of the fixture at `rows` rows.
-fn moe_dims(rows: usize) -> MoeDims {
+pub(super) fn moe_dims(rows: usize) -> MoeDims {
     MoeDims::new(&step_dims(), rows)
 }
 
@@ -47,6 +47,7 @@ fn plan(rows: usize) -> StepPlan {
         context_tokens: 8,
         delta_slots: 1,
         forked_experts: false,
+        tiered: None,
         layout: WeightLayout::Tiled,
     };
     StepPlan::new(&dims, rows, &options, &scratch).expect("plan")
@@ -68,6 +69,7 @@ fn plan_of(layout: WeightLayout) -> StepPlan {
         context_tokens: 8,
         delta_slots: 1,
         forked_experts: false,
+        tiered: None,
         layout,
     };
     StepPlan::new(&dims, 1, &options, &scratch).expect("plan")
@@ -86,7 +88,7 @@ fn span_of(seq: &[MoeOp], slot: Slot) -> (usize, usize) {
 }
 
 /// The valid weight facts of `dims`: raw router allocations and the tiled stack geometry.
-fn weight_facts(dims: &MoeDims) -> WeightFacts {
+pub(super) fn weight_facts(dims: &MoeDims) -> WeightFacts {
     WeightFacts {
         router: RangeFacts {
             offset: 0,
@@ -130,7 +132,7 @@ fn weight_facts(dims: &MoeDims) -> WeightFacts {
 
 /// The valid buffer facts of `dims`: the fifteen ranges placed one behind the other in one
 /// allocation, the way the arena places them apart.
-fn buffer_facts(dims: &MoeDims) -> BufferFacts {
+pub(super) fn buffer_facts(dims: &MoeDims) -> BufferFacts {
     let mut next = 0;
     let mut at = |bytes: usize| {
         let at = RangeFacts {
@@ -178,7 +180,7 @@ fn bytes_of(plan: &StepPlan, slot: Slot) -> (usize, usize) {
 }
 
 /// Asserts a `BadRequest` whose message contains `needle`.
-fn assert_bad_request(result: Result<(), EngError>, case: &str, needle: &str) {
+pub(super) fn assert_bad_request(result: Result<(), EngError>, case: &str, needle: &str) {
     let Err(error) = result else {
         panic!("{case}: expected a BadRequest, got Ok");
     };

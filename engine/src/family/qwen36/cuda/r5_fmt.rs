@@ -7,6 +7,11 @@
 //! 3090, `INFERENCE_CUDA_MODEL_GGUF` and the three `FMT_*` variables, so it is `#[ignore]`d and
 //! run by name in one baton hold:
 //! `<exe> --ignored --exact family::qwen36::cuda::r5_fmt::r5_format_token --test-threads=1`.
+//! The optional `FMT_TIERED` is a JSON object in the shape of the gate's `tiered` member
+//! (`{"slots": 40, "threads": 6, "preload": true}`) and runs the tiered expert mode: the layout
+//! must be `native`, the routed expert stacks stay in the file and the banks are attached after
+//! the step, as in the gate, and the output JSON carries the member as `tiered`. Unset, nothing
+//! changes: the plain probe and its output are byte for byte as before.
 //! It is a probe, run alone in its own process: its device phase uses `expect`, so a failure
 //! latches only that process.
 
@@ -14,10 +19,12 @@ use std::{path::PathBuf, time::Instant};
 
 use super::{
     super::host::HostShape,
-    dims::{KvMode, StepDims, StepOptions},
+    dims::{KvMode, StepDims, StepOptions, TieredPlan},
+    gate::tiered_member,
     resources::StepResources,
     rules::QwenRules,
     step::QwenResidentStep,
+    tiered_load::{attach_tiered_parts, names_without_experts},
 };
 use crate::{
     family::{
@@ -39,6 +46,17 @@ fn required(var: &str) -> String {
         .ok()
         .filter(|v| !v.is_empty())
         .unwrap_or_else(|| panic!("set {var}"))
+}
+
+/// The tiered plan of `FMT_TIERED` (the gate's member text, checked by the gate's own reader), or `None` when unset.
+fn tiered_from_env() -> Option<(TieredPlan, String)> {
+    let text = std::env::var("FMT_TIERED").ok().filter(|v| !v.is_empty())?;
+    let member: serde_json::Value = serde_json::from_str(&text).expect("FMT_TIERED is JSON");
+    let holder = serde_json::json!({ "tiered": member });
+    let plan = tiered_member(&holder)
+        .expect("FMT_TIERED is a valid tiered member")
+        .expect("FMT_TIERED names the member");
+    Some((plan, holder["tiered"].to_string()))
 }
 
 fn f32s(bytes: &[u8]) -> Vec<f32> {
@@ -81,6 +99,38 @@ fn row_stats(logits: &[f32], watch: usize) -> String {
     )
 }
 
+/// The `r5-fmt/1` output document. `member` is the tiered member text of a tiered run; a plain run passes `None` and the
+/// document is byte for byte what the probe wrote before the member existed.
+fn output_json(
+    n_ids: usize,
+    watch: usize,
+    secs: f64,
+    member: Option<&str>,
+    rows: &[String],
+) -> String {
+    let member = member.map_or_else(String::new, |text| format!(",\"tiered\":{text}"));
+    format!(
+        "{{\"schema\":\"r5-fmt/1\",\"n_ids\":{n_ids},\"watch\":{watch},\"secs\":{secs:.2}{member},\"tail_rows\":[{}]}}\n",
+        rows.join(",")
+    )
+}
+
+#[test]
+fn the_output_document_carries_the_tiered_member_only_when_given() {
+    let rows = [String::from("{\"row\":1}"), String::from("{\"row\":2}")];
+    assert_eq!(
+        output_json(922, 198, 12.345, None, &rows),
+        "{\"schema\":\"r5-fmt/1\",\"n_ids\":922,\"watch\":198,\"secs\":12.35,\"tail_rows\":[{\"row\":1},{\"row\":2}]}\n"
+    );
+    let tiered = output_json(922, 198, 12.345, Some("{\"slots\":40}"), &rows);
+    assert!(
+        tiered.contains("\"secs\":12.35,\"tiered\":{\"slots\":40},\"tail_rows\""),
+        "{tiered}"
+    );
+    let parsed: serde_json::Value = serde_json::from_str(&tiered).expect("valid JSON");
+    assert_eq!(parsed["tiered"]["slots"], 40);
+}
+
 #[test]
 #[ignore = "device probe: needs the 3090, the real GGUF and FMT_IDS, FMT_NL, FMT_OUT; run by name"]
 fn r5_format_token() {
@@ -119,9 +169,24 @@ fn r5_format_token() {
             WeightLayout::Tiled
         },
     };
-    let loaded = projector
-        .load_model(&gguf, load_options)
-        .expect("load the whole model");
+    let tiered = tiered_from_env();
+    assert!(
+        tiered.is_none() || native,
+        "FMT_TIERED needs FMT_LAYOUT=native (the tiered mode refuses the tiled layout)"
+    );
+    let device = if tiered.is_some() {
+        // The routed expert stacks stay in the file: the banks hold the hot ones.
+        let names = gguf.plan().device_names();
+        let names = names_without_experts(&names);
+        projector
+            .load(&gguf.weights, &names, load_options)
+            .expect("load the model without the expert stacks")
+    } else {
+        projector
+            .load_model(&gguf, load_options)
+            .expect("load the whole model")
+            .device
+    };
     let shape = HostShape::from_spec(&QWEN3_6_35B_A3B, 64).expect("shape");
     let inventory = Inventory::for_spec(&QWEN3_6_35B_A3B).expect("inventory");
     let dims = StepDims::new(&shape, &inventory).expect("dims");
@@ -131,13 +196,17 @@ fn r5_format_token() {
         context_tokens: CONTEXT_TOKENS,
         delta_slots: 1,
         forked_experts: false,
-        layout: loaded.device.layout().expect("the loaded layout"),
+        tiered: tiered.as_ref().map(|(plan, _)| *plan),
+        layout: device.layout().expect("the loaded layout"),
     };
     let context = projector.context();
     let res = StepResources::new(context, dims, &inventory, &options).expect("resources");
     let rules = QwenRules::new(EOS.to_vec(), SAMPLER_VOCAB, HEAD_ROWS).expect("rules");
-    let mut step =
-        QwenResidentStep::new(context, &res, &loaded.device, &options, rules).expect("step");
+    let mut step = QwenResidentStep::new(context, &res, &device, &options, rules).expect("step");
+    if let Some((plan, _)) = &tiered {
+        let source = (gguf.weights.header(), std::path::Path::new(&path));
+        attach_tiered_parts(&mut step, context, (source, &res.dims), plan).expect("attach tiered");
+    }
 
     let began = Instant::now();
     let mut rows = Vec::new();
@@ -158,11 +227,13 @@ fn r5_format_token() {
             );
         }
     }
-    let json = format!(
-        "{{\"schema\":\"r5-fmt/1\",\"n_ids\":{},\"watch\":{watch},\"secs\":{:.2},\"tail_rows\":[{}]}}\n",
+    let member = tiered.as_ref().map(|(_, text)| text.as_str());
+    let json = output_json(
         ids.len(),
+        watch,
         began.elapsed().as_secs_f64(),
-        rows.join(",")
+        member,
+        &rows,
     );
     std::fs::write(&out_path, json).expect("write FMT_OUT");
     println!("R5 fmt: PASS (probe; numbers reported, never gated), wrote {out_path}");

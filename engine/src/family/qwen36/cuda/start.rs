@@ -11,11 +11,12 @@
 
 use super::super::settings::{NO_BUDGET_PIECE, Q36Settings, tokenizer_pin};
 use super::{
-    dims::{KvMode, StepDims, StepOptions},
+    dims::{KvMode, StepDims, StepOptions, TieredPlan},
     pinned::{MIN_FREE_AFTER_LOAD, ROTARY_DIM, head_rows_of},
     resources::StepResources,
     rules::QwenRules,
     step::{CaptureConfig, QwenResidentStep},
+    tiered_load::{attach_tiered_parts, names_without_experts},
 };
 use crate::{
     EngError,
@@ -188,11 +189,33 @@ pub(super) fn check_gguf_identity(path: &Path, verify: bool) -> Result<(), EngEr
     Ok(())
 }
 
+/// The tiered plan the settings ask for, or `None` for the plain engine: tiered is never on without
+/// the member of the config.
+pub(super) fn tiered_plan_of(settings: &Q36Settings) -> Option<TieredPlan> {
+    settings.tiered.map(|tiered| TieredPlan {
+        timeout_ms: tiered.timeout_ms,
+        preload: tiered.preload,
+        ..TieredPlan::new(tiered.slots, tiered.threads)
+    })
+}
+
+/// The refusal of a tiered start with graph capture, before any work (the settings refuse it too;
+/// this is the start's own check): the tiered step waits for the host inside every layer.
+pub(super) fn check_tiered_start(settings: &Q36Settings) -> Result<(), EngError> {
+    if settings.tiered.is_some() && settings.capture {
+        return Err(EngError::BadRequest(
+            "engine config: tiered and capture exclude each other: the tiered step is eager only"
+                .to_owned(),
+        ));
+    }
+    Ok(())
+}
+
 /// The session options: fp16 KV, one committed DeltaNet slot, no forked experts, the fixed KV
 /// capacity of `context_limit` positions (the step's context limit IS this number), and the
 /// step layout. `make` calls it AFTER the load with the loaded weights' own layout
-/// (`loaded.device.layout()?`, KUBDAN-MSG-72 item 1), so the step always runs the layout the
-/// device holds.
+/// (`device.layout()?`, KUBDAN-MSG-72 item 1), so the step always runs the layout the device
+/// holds.
 pub(super) fn step_options(
     context_limit: u32,
     layout: WeightLayout,
@@ -202,6 +225,7 @@ pub(super) fn step_options(
         context_tokens: context_tokens(context_limit)?,
         delta_slots: 1,
         forked_experts: false,
+        tiered: None,
         layout,
     })
 }
@@ -259,6 +283,7 @@ pub(crate) fn start(settings: &Q36Settings) -> Result<(Engine, TokenizerBundle),
     // the projector exists; unset stays OFF with no error (`sha256_wanted(None)` is
     // `Ok(false)`, pinned in start_tests).
     let verify = sha256_wanted(std::env::var(VERIFY_SHA256_VAR).ok().as_deref())?;
+    check_tiered_start(settings)?;
     for key in &settings.ignored_mlx_keys {
         eprintln!("{}", ignored_mlx_line(key));
     }
@@ -296,7 +321,16 @@ fn make(
     let gguf = pinned_gguf(&settings.artifact);
     check_gguf_identity(&gguf, verify)?;
     let model = open_qwen3_6_35b_a3b(&gguf, None)?;
-    let loaded = projector.load_model(&model, load_options(kv_cache))?;
+    let tiered = tiered_plan_of(&settings);
+    // A tiered load leaves the routed expert stacks in the file: the banks hold the hot ones.
+    let device = match tiered {
+        None => projector.load_model(&model, load_options(kv_cache))?.device,
+        Some(_) => {
+            let names = model.plan().device_names();
+            let names = names_without_experts(&names);
+            projector.load(&model.weights, &names, load_options(kv_cache))?
+        }
+    };
     let after = projector.memory_info()?;
     if after.free < MIN_FREE_AFTER_LOAD {
         return Err(EngError::MemoryPlan(format!(
@@ -309,7 +343,8 @@ fn make(
     let dims = StepDims::new(&shape, &inventory)?;
     // The step layout is the loaded weights' own, never a constant or the load options: the
     // step's matvecs read the blocks the device holds (a mixed load is refused by layout()).
-    let options = step_options(settings.context_limit, loaded.device.layout()?)?;
+    let mut options = step_options(settings.context_limit, device.layout()?)?;
+    options.tiered = tiered;
     let res = StepResources::new(projector.context(), dims, &inventory, &options)?;
     // LEAK (CUDA-SERVE-1 2.1, condition 2): the three owners are leaked for the process
     // lifetime, giving `QwenResidentStep<'static>`; an owning `Arc` variant would rewrite the
@@ -319,13 +354,26 @@ fn make(
     // documented text. A process whose engine ended in Error or NativeFailed is restarted,
     // not rebuilt.
     let projector: &'static CudaProjector = Box::leak(Box::new(projector));
-    let weights: &'static CudaWeights = Box::leak(Box::new(loaded.device));
+    let weights: &'static CudaWeights = Box::leak(Box::new(device));
     let res: &'static StepResources = Box::leak(Box::new(res));
     guard.commit();
     let mut step = QwenResidentStep::new(projector.context(), res, weights, &options, rules)?;
     step.set_capture_config(CaptureConfig {
         capture: settings.capture,
     })?;
+    if let Some(plan) = tiered {
+        // The banks come last: they take what the weights, the KV cache and the step state left.
+        attach_tiered_parts(
+            &mut step,
+            projector.context(),
+            ((model.weights.header(), &gguf), &res.dims),
+            &plan,
+        )?;
+        eprintln!(
+            "q36 cuda: tiered, {} slots per layer, {} cpu threads, timeout {} ms",
+            plan.slots_per_layer, plan.threads, plan.timeout_ms
+        );
+    }
     eprintln!(
         "q36 cuda: weights resident ({} B), free after load {} B, context_limit {}, capture {}",
         before.free.saturating_sub(after.free),

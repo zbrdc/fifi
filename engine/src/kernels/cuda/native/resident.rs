@@ -409,6 +409,75 @@ pub(in crate::kernels::cuda) fn pinned_read(pinned: &RawPinned) -> [u8; 8] {
     out
 }
 
+/// Queues a copy of `src` into the pinned memory at byte `host_offset` on `stream`, behind the
+/// work queued earlier on it. The copy has not finished when the call returns; the safe owner
+/// (`PinnedBuf`) tracks it and refuses every read until an event recorded behind it completed.
+pub(in crate::kernels::cuda) fn copy_d2h_async_at(
+    host: &RawPinned,
+    host_offset: usize,
+    src: RawRange<'_>,
+    stream: &RawStream,
+) -> Result<(), DeviceFailure> {
+    let end = host_offset
+        .checked_add(src.bytes)
+        .ok_or_else(invalid_argument)?;
+    if end > host.bytes {
+        return Err(invalid_argument());
+    }
+    let mut stage = STAGE_NONE;
+    // SAFETY: `RawRange::new` proved `offset + bytes <= device.bytes` for the live device
+    // allocation; the check above proved `host_offset + src.bytes <= host.bytes`, so the offset
+    // pointer and the `src.bytes` bytes behind it lie inside the pinned allocation. Both stay
+    // valid until the copy finishes: `inference_cuda_free` and `pinned_free` synchronize the
+    // device first. `stream` is live for the call.
+    let status = unsafe {
+        let dst = host
+            .ptr
+            .as_ptr()
+            .cast::<u8>()
+            .add(host_offset)
+            .cast::<c_void>();
+        copy_d2h_async_raw(dst, src.address(), src.bytes, stream.0.as_ptr(), &mut stage)
+    };
+    checked(status, stage)
+}
+
+/// Zeroes the pinned memory. Only for freshly allocated memory that no copy has been queued
+/// into yet, so the host never reads indeterminate bytes.
+pub(in crate::kernels::cuda) fn pinned_zero(pinned: &RawPinned) {
+    // SAFETY: the allocation is `pinned.bytes` bytes long and live (borrowed); the safe owner calls
+    // this before it hands out the buffer, so no DMA is queued into it and nothing else reads
+    // or writes it concurrently.
+    unsafe { std::ptr::write_bytes(pinned.ptr.as_ptr().cast::<u8>(), 0, pinned.bytes) };
+}
+
+/// Copies `out.len()` bytes at `offset` of the pinned memory into `out`.
+///
+/// Precondition the caller must discharge (this function cannot check it): no device-to-host
+/// copy into `[offset, offset + out.len())` is in flight. The only caller, `PinnedBuf::read`,
+/// refuses to run while a copy is pending and clears the pending state only after it verified
+/// that an event recorded behind the last copy completed. Returns an error for a range outside
+/// the allocation.
+pub(in crate::kernels::cuda) fn pinned_read_into(
+    pinned: &RawPinned,
+    offset: usize,
+    out: &mut [u8],
+) -> Result<(), DeviceFailure> {
+    let end = offset.checked_add(out.len()).ok_or_else(invalid_argument)?;
+    if end > pinned.bytes {
+        return Err(invalid_argument());
+    }
+    let base = pinned.ptr.as_ptr().cast::<u8>().cast_const();
+    for (index, slot) in out.iter_mut().enumerate() {
+        // SAFETY: `offset + index < end <= pinned.bytes`, and the allocation stays live and
+        // unfreed while `pinned` is borrowed. The volatile read keeps the compiler from caching
+        // bytes a device copy wrote; that no copy is writing them right now is the caller's
+        // proven precondition above.
+        *slot = unsafe { base.add(offset + index).read_volatile() };
+    }
+    Ok(())
+}
+
 /// What one pack launch reads and writes: `x` is `m` rows of `k` f32 values, `xf`
 /// receives their fp16 form.
 pub(in crate::kernels::cuda) struct PackRaw<'a> {

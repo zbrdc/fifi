@@ -2,7 +2,7 @@
 //! lookups that read `CudaWeights` are covered by the scratch device run.
 use super::{
     common_tests::{dims, inventory},
-    dims::{KvMode, StepOptions},
+    dims::{KvMode, StepOptions, TieredPlan},
     mixer_geometry::DenseSpec,
     resources::{
         GlobalNames, GlobalSpecs, MoeSpecs, STEP_ROWS, StackSpec, check_native_stack, check_stack,
@@ -175,6 +175,7 @@ fn forked_experts_are_refused_in_stage_one() {
         context_tokens: 1024,
         delta_slots: 1,
         forked_experts,
+        tiered: None,
         layout: WeightLayout::Tiled,
     };
     match check_stage1_options(&options(true)) {
@@ -189,4 +190,96 @@ fn forked_experts_are_refused_in_stage_one() {
         other => panic!("forked experts must be refused in stage 1: {other:?}"),
     }
     assert!(check_stage1_options(&options(false)).is_ok());
+}
+
+#[test]
+fn tiered_plan_is_copy_eq_and_validates_its_numbers() {
+    let plan = TieredPlan::new(40, 6);
+    let copy = plan;
+    assert_eq!(plan, copy, "the plan is Copy and Eq");
+    assert!(plan.check().is_ok());
+    let refused = |bad: TieredPlan, needle: &str| match bad.check() {
+        Err(EngError::BadRequest(message)) => {
+            assert!(message.contains(needle), "{message}");
+        }
+        other => panic!("{bad:?} must be refused naming {needle}: {other:?}"),
+    };
+    refused(
+        TieredPlan {
+            slots_per_layer: 0,
+            ..plan
+        },
+        "slots_per_layer",
+    );
+    refused(TieredPlan { threads: 0, ..plan }, "threads 0");
+    refused(
+        TieredPlan {
+            threads: TieredPlan::MAX_THREADS + 1,
+            ..plan
+        },
+        "threads 9",
+    );
+    refused(
+        TieredPlan {
+            timeout_ms: 0,
+            ..plan
+        },
+        "timeout_ms",
+    );
+    refused(
+        TieredPlan {
+            swaps_milli: 8_001,
+            ..plan
+        },
+        "swaps_milli",
+    );
+    refused(
+        TieredPlan {
+            decay_milli: 0,
+            ..plan
+        },
+        "decay_milli",
+    );
+    refused(
+        TieredPlan {
+            decay_milli: 1_001,
+            ..plan
+        },
+        "decay_milli",
+    );
+    assert!(
+        TieredPlan {
+            threads: TieredPlan::MAX_THREADS,
+            decay_milli: 1_000,
+            ..plan
+        }
+        .check()
+        .is_ok()
+    );
+}
+
+#[test]
+fn tiered_requires_the_native_layout_and_a_valid_plan_at_the_option_check() {
+    let options = |layout, tiered| StepOptions {
+        kv_mode: KvMode::Fp16,
+        context_tokens: 1024,
+        delta_slots: 1,
+        forked_experts: false,
+        tiered,
+        layout,
+    };
+    let plan = Some(TieredPlan::new(40, 6));
+    assert!(check_stage1_options(&options(WeightLayout::Native, plan)).is_ok());
+    assert!(check_stage1_options(&options(WeightLayout::Native, None)).is_ok());
+    match check_stage1_options(&options(WeightLayout::Tiled, plan)) {
+        Err(EngError::Checkpoint(message)) => {
+            assert!(message.contains("native layout"), "{message}")
+        }
+        other => panic!("tiered on the tiled layout must be refused: {other:?}"),
+    }
+    let broken = Some(TieredPlan::new(40, 0));
+    assert!(matches!(
+        check_stage1_options(&options(WeightLayout::Native, broken)),
+        Err(EngError::BadRequest(_))
+    ));
 }

@@ -39,6 +39,7 @@ use super::{
     mixer_weights::MixerWeights,
     moe::{
         ExpertBufs, Launch, MoeBuffers, MoeDims, MoeLayerWeights, Packs, RouteBufs, run_moe_block,
+        tiered::TieredScratch,
     },
     readback::{
         ReadbackPlan, SYNC_EACH_VAR, captured_report, check_mode, eager_report, parse_sync_each,
@@ -46,7 +47,7 @@ use super::{
     },
     resources::{
         EmbedWeight, GlobalSpecs, GlobalWeights, HeadWeight, MoeSpecs, STEP_ROWS, StepResources,
-        f32_bytes, moe_dims, moe_layer_weights,
+        f32_bytes, moe_dims, moe_layer_parts, moe_layer_weights,
     },
     rules::{QwenRules, StepWidths, check_token_id, validate_step_inputs},
     run_report::{CaptureOutcome, RunReport},
@@ -54,6 +55,7 @@ use super::{
     state_layout::Word,
     step_ops::{StepOp, final_resid, resid_in, resid_out, token_ops},
     step_plan::Slot,
+    tiered_step::{LayerParts, TieredRuntime},
     verdict::{
         Decision, FailureAction, action_for, bad_token_error, decide, entered_after_failed_sync,
     },
@@ -61,9 +63,10 @@ use super::{
 use crate::{
     EngError,
     family::project::cuda::{CudaWeights, WeightLayout},
+    family::qwen36::tiered::{host::TieredHost, report::TokenReport},
     kernels::cuda::{
-        CapturePlan, CudaContext, DeviceBuffer, DeviceEvent, DeviceRange, DeviceStream, GraphExec,
-        MatmulIo, PinnedWord, Projection,
+        CapturePlan, CudaContext, DeviceBuffer, DeviceEvent, DeviceRange, DeviceStream, ExpertBank,
+        GraphExec, MatmulIo, PinnedWord, Projection,
         resident::{
             add_norm_pack::AddNormCall,
             add_rmsnorm_q8::AddNormQ8Call,
@@ -162,6 +165,19 @@ pub(super) fn agree_layout(weights: WeightLayout, options: WeightLayout) -> Resu
     Ok(())
 }
 
+/// The tiered mode is eager only: it waits for the host inside every layer, which a captured
+/// graph cannot do (decision 0047, amendment of 2026-10-13). Pure, so the CPU tests pin it.
+pub(super) fn tiered_capture_refusal(tiered_mode: bool, capture: bool) -> Result<(), EngError> {
+    if tiered_mode && capture {
+        return Err(EngError::BadRequest(
+            "step: the tiered mode is eager only: it waits for the host inside every layer, \
+             which a captured graph cannot do (decision 0047, amendment of 2026-10-13)"
+                .to_owned(),
+        ));
+    }
+    Ok(())
+}
+
 /// The environment value of `INFERENCE_CUDA_SYNC_EACH`, `None` when unset.
 fn sync_each_from_env() -> Result<bool, EngError> {
     match std::env::var(SYNC_EACH_VAR) {
@@ -189,6 +205,18 @@ pub(crate) struct QwenResidentStep<'a> {
     res: &'a StepResources,
     mixers: Mixers<'a>,
     moe: Vec<MoeLayerWeights<'a>>,
+    /// The tiered mode (OFF-2 D5): the options asked for it. The routed expert stacks are then not
+    /// loaded, `moe` is empty and every layer's MoE block runs through `tiered`. Cost: each layer of
+    /// each token syncs with the host (about 0.8 ms per token over the plain step, measured on the
+    /// 3090 at 256 slots), and a prompt is prefilled one token per step, so a prompt of n tokens costs
+    /// n of these steps until the batched tiered prefill (OFF-7) exists.
+    tiered_mode: bool,
+    /// The router and shared weights of each layer, held until `attach_tiered` builds the runtime.
+    tiered_parts: Option<Vec<LayerParts<'a>>>,
+    /// The tiered runtime; interior mutability because the token body takes `&self`.
+    tiered: Option<std::cell::RefCell<TieredRuntime<'a>>>,
+    /// The counters of the last token's boundary.
+    tiered_report: TokenReport,
     globals: GlobalWeights<'a>,
     /// The layout the step runs (MATVEC-PAR S3b): the loaded weights' own layout, checked
     /// against the options at construction.
@@ -266,10 +294,20 @@ impl<'a> QwenResidentStep<'a> {
             layout: options.layout,
         };
         let specs = MoeSpecs::new(&res.dims)?;
-        let moe = layers
-            .iter()
-            .map(|&layer| moe_layer_weights(&res.table, weights, &specs, layer, options.layout))
-            .collect::<Result<Vec<_>, _>>()?;
+        let tiered_mode = options.tiered.is_some();
+        let (moe, tiered_parts) = if tiered_mode {
+            let parts = layers
+                .iter()
+                .map(|&layer| moe_layer_parts(&res.table, weights, &specs, layer, options.layout))
+                .collect::<Result<Vec<_>, _>>()?;
+            (Vec::new(), Some(parts))
+        } else {
+            let moe = layers
+                .iter()
+                .map(|&layer| moe_layer_weights(&res.table, weights, &specs, layer, options.layout))
+                .collect::<Result<Vec<_>, _>>()?;
+            (moe, None)
+        };
         let vocab = res.dims.shape.vocab;
         let mut pinned: Vec<&'a DeviceBuffer> = weights.device_buffers().collect();
         pinned.push(res.arena.buffer());
@@ -281,6 +319,10 @@ impl<'a> QwenResidentStep<'a> {
             res,
             mixers: Mixers::new(context, parts)?,
             moe,
+            tiered_mode,
+            tiered_parts,
+            tiered: None,
+            tiered_report: TokenReport::default(),
             globals: GlobalWeights::new(
                 &res.names,
                 &GlobalSpecs::new(&res.dims),
@@ -309,6 +351,7 @@ impl<'a> QwenResidentStep<'a> {
     /// `INFERENCE_CUDA_SYNC_EACH=1` together with a capture (`check_mode`'s first caller).
     pub(crate) fn set_capture_config(&mut self, config: CaptureConfig) -> Result<(), EngError> {
         check_mode(self.sync_each, config.capture)?;
+        tiered_capture_refusal(self.tiered_mode, config.capture)?;
         if self.started {
             return Err(EngError::BadRequest(
                 "step: the capture mode is fixed once the session runs".to_owned(),
@@ -322,6 +365,42 @@ impl<'a> QwenResidentStep<'a> {
     /// token's numbers.
     pub(crate) fn last_report(&self) -> RunReport {
         self.report
+    }
+
+    /// Builds the tiered runtime of a step made with `StepOptions.tiered`: one bank per layer
+    /// and the host. Refuses a plain step, a second attach and a bank count other than the layer
+    /// count. The scratch buffers are allocated here.
+    pub(crate) fn attach_tiered(
+        &mut self,
+        banks: Vec<ExpertBank>,
+        host: TieredHost,
+    ) -> Result<(), EngError> {
+        let parts = self.tiered_parts.take().ok_or_else(|| {
+            EngError::BadRequest(
+                "step: no tiered weights to attach to (not a tiered step, or already attached)"
+                    .to_owned(),
+            )
+        })?;
+        let moe = &self.moe_dims;
+        let scratch = TieredScratch::new(self.context, moe.hidden, moe.top_k)?;
+        self.tiered = Some(std::cell::RefCell::new(TieredRuntime::new(
+            parts, banks, scratch, host,
+        )?));
+        Ok(())
+    }
+
+    /// Fills the tiered banks before the first token; returns the number of fills. Refuses a
+    /// step without an attached tiered runtime.
+    pub(crate) fn preload_tiered(&mut self) -> Result<usize, EngError> {
+        let runtime = self.tiered.as_ref().ok_or_else(|| {
+            EngError::BadRequest("step: the tiered runtime is not attached".to_owned())
+        })?;
+        runtime.borrow_mut().preload(&self.stream)
+    }
+
+    /// The counters of the last token's tiered boundary (all zero on a plain step).
+    pub(crate) fn last_tiered_report(&self) -> TokenReport {
+        self.tiered_report
     }
 
     /// KV positions the session holds.
@@ -404,6 +483,11 @@ impl<'a> QwenResidentStep<'a> {
     /// the padded head) is refused before any device write, so the state stays idle.
     pub(crate) fn run_token(&mut self, token: u32, want_logits: bool) -> Result<u32, EngError> {
         check_token_id(token, self.widths.verdict)?;
+        if self.tiered_mode && self.tiered.is_none() {
+            return Err(EngError::BadRequest(
+                "step: a tiered step needs attach_tiered before its first token".to_owned(),
+            ));
+        }
         let plan = self.readback_plan(want_logits)?;
         // The start block is written at a committed boundary (the state is idle), then the step
         // is admitted; a refused write queues nothing.
@@ -447,12 +531,36 @@ impl<'a> QwenResidentStep<'a> {
         if matches!(how, HowRan::Eager) {
             self.warmed = true;
         }
+        if self.tiered_mode {
+            self.end_tiered_token()?;
+        }
         self.report = match reported_outcome(how, self.refused) {
             CaptureOutcome::Eager => eager_report(&plan),
             CaptureOutcome::Captured => captured_report(&plan),
             CaptureOutcome::RefusedFellBackToEager => refused_report(&plan),
         };
         Ok(token)
+    }
+
+    /// The token boundary of the tiered mode, after the token committed: policy P, the bank
+    /// fills, the counters. A failure poisons the state: the bank and the policy may disagree.
+    fn end_tiered_token(&mut self) -> Result<(), EngError> {
+        let ended = match self.tiered.as_ref() {
+            Some(runtime) => runtime.borrow_mut().end_token(&self.stream),
+            None => Err(EngError::BadRequest(
+                "step: the tiered runtime is not attached".to_owned(),
+            )),
+        };
+        match ended {
+            Ok(report) => {
+                self.tiered_report = report;
+                Ok(())
+            }
+            Err(error) => {
+                self.state.poison();
+                Err(error)
+            }
+        }
     }
 
     /// The read-back plan of one token. The row buffer is head-wide (the `lm_head` writes the
@@ -603,6 +711,15 @@ impl<'a> QwenResidentStep<'a> {
                     admit_pos,
                 };
                 self.mixers.run_block(s, &self.state, layer, io)
+            }
+            StepOp::Moe(layer) if self.tiered_mode => {
+                let runtime = self.tiered.as_ref().ok_or_else(|| {
+                    EngError::BadRequest("step: the tiered runtime is not attached".to_owned())
+                })?;
+                let launch = Launch { ctx, stream: s };
+                runtime
+                    .borrow_mut()
+                    .run_layer(&launch, layer, &bufs[layer % 2], &self.moe_dims)
             }
             StepOp::Moe(layer) => {
                 let weights = self.moe.get(layer).ok_or_else(|| {

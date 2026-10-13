@@ -71,6 +71,79 @@ pub(crate) struct StepOptions {
     /// `CudaWeights::layout()` of the loaded model by every production caller (the gate); the
     /// step refuses a mismatch of the two, and the default keeps every caller on the tiled path.
     pub(crate) layout: WeightLayout,
+    /// The tiered expert mode (OFF-2): `None` is the plain native step. Set only by an explicit
+    /// config key; the step then runs eager with a host decision in every layer (decision 0047,
+    /// amendment of 2026-10-13).
+    pub(crate) tiered: Option<TieredPlan>,
+}
+
+/// The numbers of the tiered expert mode, plain so `StepOptions` stays `Copy` and `Eq`
+/// (fractions are milli-units).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct TieredPlan {
+    /// Bank slots per layer; at least the picks per token, at most the experts of a layer.
+    pub(crate) slots_per_layer: usize,
+    /// CPU worker threads, 1 to [`TieredPlan::MAX_THREADS`].
+    pub(crate) threads: usize,
+    /// The longest the host waits for one layer's CPU experts.
+    pub(crate) timeout_ms: u32,
+    /// Bank swaps per token in thousandths (250 is 0.25).
+    pub(crate) swaps_milli: u32,
+    /// Popularity decay per token in thousandths (999 is 0.999).
+    pub(crate) decay_milli: u32,
+    /// Fill the banks with the lowest-numbered experts of every layer before the first token. With
+    /// a bank as deep as the layer it makes every pick resident, which the bitwise gate against the
+    /// plain step needs.
+    pub(crate) preload: bool,
+}
+
+impl TieredPlan {
+    /// The thread cap (git-db, 2026-10-13: the machine is on its thermal limit).
+    pub(crate) const MAX_THREADS: usize = 8;
+
+    /// The defaults of the measurements: the caller chooses the slots and the thread count (6 in
+    /// the measurements); timeout 10 s, 0.25 swaps per token, decay 0.999, no preload.
+    pub(crate) fn new(slots_per_layer: usize, threads: usize) -> Self {
+        Self {
+            slots_per_layer,
+            threads,
+            timeout_ms: 10_000,
+            swaps_milli: 250,
+            decay_milli: 999,
+            preload: false,
+        }
+    }
+
+    /// Refuses a plan the host or the policy cannot run, naming the field.
+    pub(crate) fn check(&self) -> Result<(), EngError> {
+        let bad = |what: String| Err(EngError::BadRequest(format!("tiered plan: {what}")));
+        if self.slots_per_layer == 0 {
+            return bad(String::from("slots_per_layer must be above zero"));
+        }
+        if !(1..=Self::MAX_THREADS).contains(&self.threads) {
+            return bad(format!(
+                "threads {} is outside 1..={}",
+                self.threads,
+                Self::MAX_THREADS
+            ));
+        }
+        if !(1..=600_000).contains(&self.timeout_ms) {
+            return bad(format!(
+                "timeout_ms {} is outside 1..=600000",
+                self.timeout_ms
+            ));
+        }
+        if self.swaps_milli > 8_000 {
+            return bad(format!("swaps_milli {} is above 8000", self.swaps_milli));
+        }
+        if !(1..=1_000).contains(&self.decay_milli) {
+            return bad(format!(
+                "decay_milli {} is outside 1..=1000",
+                self.decay_milli
+            ));
+        }
+        Ok(())
+    }
 }
 
 /// The checked dimensions of the step: the layout record plus the widths of the fused

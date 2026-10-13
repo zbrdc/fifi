@@ -27,6 +27,7 @@ fn options(layout: WeightLayout) -> StepOptions {
         context_tokens: 8,
         delta_slots: 1,
         forked_experts: false,
+        tiered: None,
         layout,
     }
 }
@@ -186,6 +187,7 @@ fn the_native_plan_refuses_extra_rows_and_forked_packs() {
     }
     let forked = StepOptions {
         forked_experts: true,
+        tiered: None,
         ..options(WeightLayout::Native)
     };
     match StepPlan::new(

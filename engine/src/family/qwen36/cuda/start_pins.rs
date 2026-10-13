@@ -73,7 +73,7 @@ fn make_takes_the_step_layout_from_the_loaded_weights() {
     let make = pinned(fn_section("fn make("));
     let load = make.find("load_model(").expect("make loads the model");
     let options = make
-        .find("step_options(settings.context_limit,loaded.device.layout()?)?")
+        .find("step_options(settings.context_limit,device.layout()?)?")
         .expect("make derives the step layout from the loaded weights");
     let resources = make
         .find("StepResources::new(")

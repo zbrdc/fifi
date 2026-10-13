@@ -59,6 +59,7 @@ fn run_block(
         context_tokens: 8,
         delta_slots: 1,
         forked_experts: false,
+        tiered: None,
         layout,
     };
     let scratch = KernelScratch::for_dims(&dims, 1)?;
