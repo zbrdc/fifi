@@ -69,6 +69,8 @@ cudaError_t gated_delta(const DeltaArgs& a, cudaStream_t stream = nullptr);
 // Attention preparation for one layer (attn_prep): Q/K RMSNorm, NEOX rope on the first n_rot dims,
 // KV cache write. It reads proj, ld, n_head, n_kv_head, n_rot, q_norm, k_norm, eps, rope_base,
 // k_cache, v_cache, rows, status_dev, status_bits, q, pos_dev, pos0 and m; the other fields belong to the attention kernels.
+// A non-null k_rows (KV8-B B1) selects the f32 rows instance instead, which reads k_rows, v_rows
+// and rows (the plane cell count) in place of the caches and the cache rows.
 struct AttnArgs {
   const float* proj;  // [m][ld]: per q head [q 256 | gate 256], then k, then v
   int ld, n_head, n_kv_head, n_rot;
@@ -90,6 +92,12 @@ struct AttnArgs {
   // Null, or a device word that receives status_bits (integer OR, one thread) when a launch is refused.
   int* status_dev = nullptr;
   int status_bits = 0;
+  // KV8-B B1: f32 rows output. A non-null k_rows selects the kRows instance of attn_prep_k
+  // (v_rows must be non-null too): the same math stores k and v as f32 at [t][n_kv_head][256] of
+  // k_rows/v_rows, indexed by the token t instead of the position, and writes no cache byte; rows
+  // is then the plane cell count that bounds the pos word.
+  float* k_rows = nullptr;  // [m][n_kv_head][256] f32
+  float* v_rows = nullptr;
 };
 cudaError_t attn_prep(const AttnArgs& a, cudaStream_t stream = nullptr);
 

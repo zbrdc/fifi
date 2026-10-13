@@ -43,12 +43,12 @@
     "src/ops.cu": {
       "restored_from": "src/kernels.cu",
       "vendored_sha256": "e514e857b4d0472a79d373157e49bc4d0bc62a86a4363a596d1d56eb32b76b1b",
-      "patched_sha256": "70ed3e91ee2f188afe6d812869cf935c79ae7cb8ae823176c8c315479fab8a3e"
+      "patched_sha256": "12ed2ca756a03886f68769432a5d11085a4d11781ee9387561624eceb03a2c50"
     },
     "src/ops.h": {
       "restored_from": "src/kernels.h",
       "vendored_sha256": "fc9fae28d1156632ab102c4b4b6d679cbb0f55eadfc27311738355f6cecf5f44",
-      "patched_sha256": "87dae60022e33d7e7dbd251d6fb1a084ebd9d9c045af6d185c26c1c95cc503ce"
+      "patched_sha256": "d5205048817aed7312589dcb9e0d77bcbd47293bafb8354e42ebbd4f92d05033"
     },
     "src/frag_layout.cuh": {
       "patched_sha256": "b566a419e9896c30251116d6ff6613680f8cf9eff304cbddd81e9d14c86fd1bc"
@@ -215,6 +215,21 @@
         "src/ops.cu": {
           "before_sha256": "a1fd04f814032e886b990a265c8e7f8982769e990957d0f111e376dea5de7a96",
           "after_sha256": "70ed3e91ee2f188afe6d812869cf935c79ae7cb8ae823176c8c315479fab8a3e"
+        }
+      }
+    },
+    {
+      "id": "KV8-B-attn-prep-rows",
+      "description": "The kRows template instance of attn_prep_k stores post-rope K and raw V as f32 rows for the Int8G32 KV append; the kRows=false instance is unchanged (KV8-B, commit 24092a9a)",
+      "diff": "patches/KV8-B-attn-prep-rows.patch",
+      "files": {
+        "src/ops.cu": {
+          "before_sha256": "70ed3e91ee2f188afe6d812869cf935c79ae7cb8ae823176c8c315479fab8a3e",
+          "after_sha256": "12ed2ca756a03886f68769432a5d11085a4d11781ee9387561624eceb03a2c50"
+        },
+        "src/ops.h": {
+          "before_sha256": "87dae60022e33d7e7dbd251d6fb1a084ebd9d9c045af6d185c26c1c95cc503ce",
+          "after_sha256": "d5205048817aed7312589dcb9e0d77bcbd47293bafb8354e42ebbd4f92d05033"
         }
       }
     }

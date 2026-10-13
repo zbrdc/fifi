@@ -16,6 +16,7 @@ use super::moe::tiered::{
     LayerPlan, RouteRead, TieredBlock, TieredLayerHost, TieredScratch, run_moe_block_tiered,
 };
 use super::moe::{Launch, MoeBuffers, MoeDims, MoeLayerWeights, StackWeights};
+use super::run_report::HostSyncs;
 use crate::EngError;
 use crate::family::qwen36::tiered::cpu_pool::MappedRegion;
 use crate::family::qwen36::tiered::host::{BankDevice, HostError, TieredHost};
@@ -103,6 +104,8 @@ pub(super) struct TieredRuntime<'w> {
     banks: Vec<ExpertBank>,
     scratch: TieredScratch,
     host: TieredHost,
+    /// The host waits of the token so far: the layers' and, after `end_token`, the bank fills'.
+    syncs: HostSyncs,
 }
 
 impl<'w> TieredRuntime<'w> {
@@ -125,6 +128,7 @@ impl<'w> TieredRuntime<'w> {
             banks,
             scratch,
             host,
+            syncs: HostSyncs::default(),
         })
     }
 
@@ -157,7 +161,10 @@ impl<'w> TieredRuntime<'w> {
             scratch: &mut self.scratch,
             dims,
         };
-        run_moe_block_tiered(launch, &mut HostAdapter(&mut self.host), layer, &mut block)
+        let made =
+            run_moe_block_tiered(launch, &mut HostAdapter(&mut self.host), layer, &mut block)?;
+        self.syncs.add(made);
+        Ok(())
     }
 
     /// Fills the banks before the first token (see `TieredHost::preload_all`) with blocking
@@ -170,6 +177,18 @@ impl<'w> TieredRuntime<'w> {
         self.host.preload_all(&mut fills).map_err(host_error)
     }
 
+    /// Drops what a failed token left in the host: the layer in flight, the routes and the
+    /// counters of the layers that ran (see `TieredHost::abort_token`).
+    pub(super) fn abort_token(&mut self) {
+        self.host.abort_token();
+        self.syncs = HostSyncs::default();
+    }
+
+    /// The host waits of the token that just ended (layers and fills), and zero for the next one.
+    pub(super) fn take_syncs(&mut self) -> HostSyncs {
+        std::mem::take(&mut self.syncs)
+    }
+
     /// Ends the token: policy P decides the swaps, the bank slots are filled with blocking
     /// writes on `stream`, and the token's counters come back.
     pub(super) fn end_token(&mut self, stream: &DeviceStream) -> Result<TokenReport, EngError> {
@@ -177,6 +196,8 @@ impl<'w> TieredRuntime<'w> {
             banks: &self.banks,
             stream,
         };
-        self.host.end_token(&mut fills).map_err(host_error)
+        let report = self.host.end_token(&mut fills).map_err(host_error)?;
+        self.syncs.writes += report.swaps * ExpertBank::FILL_WRITES;
+        Ok(report)
     }
 }

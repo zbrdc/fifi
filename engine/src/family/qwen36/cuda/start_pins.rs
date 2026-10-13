@@ -137,6 +137,96 @@ fn the_tiered_load_builds_its_pool_through_tier_pool_and_names_no_kernel() {
 }
 
 #[test]
+fn a_failed_token_aborts_the_tiered_host_before_the_error_returns() {
+    // A failure between begin_layer and finish_layer leaves a layer in flight, and every later
+    // begin_layer would refuse until the engine was rebuilt. run_token hands the failure of its
+    // inner token to the abort and returns the same result; the abort reaches the host through the
+    // runtime. Deleting the call, or narrowing it to a branch of the error, fails here.
+    let token = pinned(section_of(
+        include_str!("step.rs"),
+        "step.rs",
+        "pub(crate) fn run_token(",
+    ));
+    assert!(
+        token.contains("letran=self.run_token_inner(token,want_logits);"),
+        "{token}"
+    );
+    assert!(
+        token.contains("ifran.is_err(){self.abort_tiered_token();}ran"),
+        "{token}"
+    );
+    let abort = pinned(section_of(
+        include_str!("step.rs"),
+        "step.rs",
+        "fn abort_tiered_token(",
+    ));
+    assert!(
+        abort.contains("runtime.borrow_mut().abort_token();"),
+        "{abort}"
+    );
+    let runtime = pinned(section_of(
+        include_str!("tiered_step.rs"),
+        "tiered_step.rs",
+        "pub(super) fn abort_token(",
+    ));
+    assert!(runtime.contains("self.host.abort_token();"), "{runtime}");
+}
+
+#[test]
+fn the_tiered_token_report_carries_the_layer_waits_and_the_bank_fills() {
+    // The plain report says one wait per token, which undercounts the tiered step by two orders of
+    // magnitude. The report of a token folds in what the runtime counted: every layer's block, the
+    // fills of the boundary, and nothing left over from a failed token.
+    let token = pinned(section_of(
+        include_str!("step.rs"),
+        "step.rs",
+        "fn run_token_inner(",
+    ));
+    assert!(
+        token.contains("self.report=with_host_syncs(report,self.take_tiered_syncs());"),
+        "{token}"
+    );
+    // The fills of the boundary belong to the token that made them: taking the count before
+    // `end_tiered_token` would carry them into the next token's report.
+    let ended = token.find("self.end_tiered_token()?;");
+    let taken = token.find("self.take_tiered_syncs()");
+    assert!(
+        ended.zip(taken).is_some_and(|(ended, taken)| ended < taken),
+        "end_tiered_token at {ended:?}, take_tiered_syncs at {taken:?}"
+    );
+    let take = pinned(section_of(
+        include_str!("step.rs"),
+        "step.rs",
+        "fn take_tiered_syncs(",
+    ));
+    assert!(take.contains("runtime.borrow_mut().take_syncs()"), "{take}");
+    let layer = pinned(section_of(
+        include_str!("tiered_step.rs"),
+        "tiered_step.rs",
+        "pub(super) fn run_layer(",
+    ));
+    assert!(layer.contains("self.syncs.add(made);"), "{layer}");
+    let boundary = pinned(section_of(
+        include_str!("tiered_step.rs"),
+        "tiered_step.rs",
+        "pub(super) fn end_token(",
+    ));
+    assert!(
+        boundary.contains("self.syncs.writes+=report.swaps*ExpertBank::FILL_WRITES;"),
+        "{boundary}"
+    );
+    let abort = pinned(section_of(
+        include_str!("tiered_step.rs"),
+        "tiered_step.rs",
+        "pub(super) fn abort_token(",
+    ));
+    assert!(
+        abort.contains("self.syncs=HostSyncs::default();"),
+        "{abort}"
+    );
+}
+
+#[test]
 fn the_rules_are_built_before_the_first_device_call() {
     // start(): the bundle and the rules precede the guard and the spawn, and the eos ids come
     // from the SAME loaded bundle — never hard-coded ids, never another file.

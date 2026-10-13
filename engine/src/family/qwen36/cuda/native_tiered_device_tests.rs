@@ -16,6 +16,7 @@ use super::native_device_rig::{f32_buf, zero_buf};
 use super::native_moe_device_tests::{
     BlockRun, block_bufs, moe_bufs, produce, read_back, run_block,
 };
+use super::run_report::HostSyncs;
 use super::tiered_load::tier_pool;
 use super::tiered_step::BankFill;
 use crate::EngError;
@@ -102,9 +103,19 @@ fn bank_weights<'w>(real: &MoeLayerWeights<'w>, bank: &'w ExpertBank) -> MoeLaye
 /// sources and `host`; both read back as host data after every owner dropped.
 fn native_and_tiered(
     s: &Sources,
-    (slot_of, slots): (&[i32], usize),
+    bank: (&[i32], usize),
     host: &mut dyn TieredLayerHost,
 ) -> Result<(BlockRun, BlockRun, u32), EngError> {
+    let (native, tiered, status, _) = native_and_tiered_counted(s, bank, host)?;
+    Ok((native, tiered, status))
+}
+
+/// [`native_and_tiered`] with the host waits the tiered block reported.
+fn native_and_tiered_counted(
+    s: &Sources,
+    (slot_of, slots): (&[i32], usize),
+    host: &mut dyn TieredLayerHost,
+) -> Result<(BlockRun, BlockRun, u32, HostSyncs), EngError> {
     let ctx = CudaContext::new()?;
     let stream = ctx.stream()?;
     let weights = rig_weights(&ctx, s)?;
@@ -123,7 +134,7 @@ fn native_and_tiered(
         scratch: &mut scratch,
         dims: &DIMS,
     };
-    run_moe_block_tiered(
+    let syncs = run_moe_block_tiered(
         &Launch {
             ctx: &ctx,
             stream: &stream,
@@ -136,7 +147,7 @@ fn native_and_tiered(
     let tiered = read_back(&stream, &b)?;
     let mut status = [0u8; 4];
     b.smalls[4].read_at(&stream, 0, &mut status)?;
-    Ok((native, tiered, u32::from_le_bytes(status)))
+    Ok((native, tiered, u32::from_le_bytes(status), syncs))
 }
 
 fn bits(values: &[f32]) -> Vec<u32> {
@@ -588,6 +599,45 @@ fn a_half_size_bank_with_a_real_expert_in_slot_zero_agrees_with_the_native_block
         bits(&tiered.resid_out),
         bits(&native.resid_out),
         "the CPU path really ran"
+    );
+    Ok(())
+}
+
+/// The host waits the block reports (they feed the run report): the route event wait and the two
+/// plan writes always, plus the write of the CPU partial exactly when a pick was served on the CPU.
+#[test]
+fn the_block_reports_its_host_waits_with_and_without_a_cpu_partial() -> Result<(), EngError> {
+    if !device_present("the_block_reports_its_host_waits_with_and_without_a_cpu_partial") {
+        return Ok(());
+    }
+    let s = sources(0x7125_0005);
+    let identity: Vec<i32> = (0..DIMS.n_expert as i32).collect();
+    let bank = (identity.as_slice(), DIMS.n_expert);
+    let mut resident = Mixed::new(&s, identity.clone(), Vec::new())?;
+    let (_, _, status, none) = native_and_tiered_counted(&s, bank, &mut resident)?;
+    let mut mixed = Mixed::new(&s, identity.clone(), vec![1, 4, 9, 12])?;
+    let (_, tiered, mixed_status, some) = native_and_tiered_counted(&s, bank, &mut mixed)?;
+    assert_eq!((status, mixed_status), (0, 0));
+    assert!(
+        tiered.ids.iter().any(|id| [1, 4, 9, 12].contains(id)),
+        "the route has a CPU pick: {:?}",
+        tiered.ids
+    );
+    assert_eq!(
+        none,
+        HostSyncs {
+            waits: 1,
+            writes: 2
+        },
+        "no CPU pick"
+    );
+    assert_eq!(
+        some,
+        HostSyncs {
+            waits: 1,
+            writes: 3
+        },
+        "with a CPU partial"
     );
     Ok(())
 }

@@ -40,6 +40,14 @@
 //! RoPE accuracy: the kernel computes the angle in f32. The tests hold it to the class RP1 (lane
 //! M REPLY-53): f32 RoPE angle; not checked against an f64 reference above position 1,150; A5
 //! covers positions up to about 1,150 only.
+//!
+//! [`CudaContext::attn_prep_rows`] (KV8-B B1) is the f32 rows entry of the same kernel, the
+//! Int8G32 KV handoff: the same math stores the post-rope k and the unchanged v as f32 at
+//! `[t][n_kv_head][256]` of `k_rows`/`v_rows`, indexed by the token `t` instead of the position,
+//! and no fp16 cache byte is written. The device `pos` word is bounded by the Int8G32 plane cell
+//! count (`shape.rows`), the poison rule is the same (no row, NaN `q`, mask 4), and `m` is at
+//! most the decode bound of `kv8_append` (16): chunk prefill under Int8G32 uses the CPF-ATTN-A
+//! chunk entry (CPF-7), not this one. The step op list wires it in KV8-B B3.
 #![cfg_attr(
     not(test),
     expect(dead_code, reason = "staged for RD-9a (decision 0047)")
@@ -50,6 +58,7 @@ use std::ffi::c_int;
 use crate::EngError;
 use crate::kernels::cuda::context::{Claim, require_apart, require_fit};
 use crate::kernels::cuda::native::resident::attn_prep::{AttnInts, AttnPrepRaw, attn_prep_launch};
+use crate::kernels::cuda::native::resident::{AttnPrepRowsRaw, attn_prep_rows_launch};
 use crate::kernels::cuda::resident::step_params::ensure_rows;
 use crate::kernels::cuda::{CudaContext, DeviceRange, DeviceStream};
 
@@ -182,6 +191,16 @@ pub(crate) fn q_bytes(m: usize, n_head: usize) -> usize {
         .saturating_mul(4)
 }
 
+/// The most tokens one rows call takes: the decode bound of `kv8_append` (KV8-B B1).
+pub(crate) const MAX_DECODE_ROWS: usize = 16;
+
+/// Bytes of each rows buffer: `m` rows of `n_kv_head` f32 heads of 256.
+pub(crate) fn rows_bytes(m: usize, n_kv_head: usize) -> usize {
+    m.saturating_mul(n_kv_head)
+        .saturating_mul(HEAD_DIM)
+        .saturating_mul(4)
+}
+
 /// Checks the configuration rules (head size, gate, slot mode).
 fn check_configuration(shape: &AttnPrepShape) -> Result<(), EngError> {
     if shape.head_dim != HEAD_DIM {
@@ -293,6 +312,133 @@ fn check_apart(call: &AttnPrepCall<'_>) -> Result<(), EngError> {
     Ok(())
 }
 
+// ---- KV8-B B1: the f32 rows entry (the Int8G32 KV handoff) -----------------------------------
+
+/// One rows attention preparation call: as [`AttnPrepCall`] with the f32 rows buffers in place of
+/// the fp16 caches. Token `t` goes to `[t]` of `k_rows`/`v_rows` (f32 `[m][n_kv_head][256]`,
+/// 16-byte aligned), indexed by the token; `shape.rows` is the Int8G32 plane cell count that
+/// bounds the pos word, and `shape.m` is at most [`MAX_DECODE_ROWS`].
+pub(crate) struct AttnPrepRowsCall<'b> {
+    pub(crate) shape: AttnPrepShape,
+    pub(crate) rope: RopeParams,
+    pub(crate) admit_pos: usize,
+    pub(crate) proj: DeviceRange<'b>,
+    pub(crate) q_norm: DeviceRange<'b>,
+    pub(crate) k_norm: DeviceRange<'b>,
+    pub(crate) k_rows: DeviceRange<'b>,
+    pub(crate) v_rows: DeviceRange<'b>,
+    pub(crate) q: DeviceRange<'b>,
+    pub(crate) pos: DeviceRange<'b>,
+    pub(crate) status: DeviceRange<'b>,
+}
+
+/// A `BadRequest` that names the rule of the rows entry that fired.
+fn rows_rule(tag: &str, detail: &str) -> EngError {
+    EngError::BadRequest(format!("attn_prep_rows: {tag}: {detail}"))
+}
+
+/// `value` as `c_int` for the rows rule `tag`, or the "exceeds i32" refusal.
+fn rows_to_int(tag: &str, value: usize) -> Result<c_int, EngError> {
+    c_int::try_from(value).map_err(|_| rows_rule(tag, &format!("{tag} is {value}, above i32::MAX")))
+}
+
+/// `value` as `c_int` when it lies in `low..=high`, else the rows refusal for `tag`.
+fn rows_ranged(tag: &str, value: usize, low: usize, high: usize) -> Result<c_int, EngError> {
+    if !(low..=high).contains(&value) {
+        return Err(rows_rule(
+            tag,
+            &format!("{tag} is {value}, not {low} to {high}"),
+        ));
+    }
+    rows_to_int(tag, value)
+}
+
+/// Checks every shape rule of the rows entry and converts the integers once: the configuration
+/// rules are [`check_shape`]'s, `m` is bounded by the decode bound [`MAX_DECODE_ROWS`] and `rows`
+/// is the plane cell count. Each refusal carries the tag `attn_prep_rows: <rule>`.
+fn check_rows_shape(shape: &AttnPrepShape) -> Result<AttnInts, EngError> {
+    check_configuration(shape)?;
+    let n_head = rows_ranged("n_head", shape.n_head, 1, MAX_N_HEAD)?;
+    let n_kv_head = rows_ranged("n_kv_head", shape.n_kv_head, 1, MAX_N_KV_HEAD)?;
+    let m = rows_ranged("m", shape.m, 1, MAX_DECODE_ROWS)?;
+    let n_rot = rows_ranged("n_rot", shape.n_rot, 2, HEAD_DIM)?;
+    if !shape.n_rot.is_power_of_two() {
+        return Err(rows_rule(
+            "n_rot",
+            &format!("n_rot is {}, not a power of two", shape.n_rot),
+        ));
+    }
+    let rows = rows_ranged("rows", shape.rows, shape.m, MAX_ROWS)?;
+    let row_w = row_width(shape.n_head, shape.n_kv_head);
+    if shape.ld < row_w {
+        return Err(rows_rule(
+            "ld",
+            &format!("ld is {}, below the row width {row_w}", shape.ld),
+        ));
+    }
+    let ld = rows_to_int("ld", shape.ld)?;
+    Ok(AttnInts {
+        m,
+        n_head,
+        n_kv_head,
+        n_rot,
+        rows,
+        ld,
+    })
+}
+
+/// Size and alignment of each range of a rows call: `proj`, the norms, `pos` and `status` as in
+/// [`check_fit`], `q` as in [`check_fit`], and `k_rows`/`v_rows` of [`rows_bytes`] each, 16-byte
+/// aligned.
+fn check_rows_fit(call: &AttnPrepRowsCall<'_>) -> Result<(), EngError> {
+    let shape = &call.shape;
+    let row_w = row_width(shape.n_head, shape.n_kv_head);
+    require_fit("proj", &call.proj, proj_bytes(shape.m, shape.ld, row_w), 4)?;
+    require_fit("q_norm", &call.q_norm, NORM_BYTES, 4)?;
+    require_fit("k_norm", &call.k_norm, NORM_BYTES, 4)?;
+    require_fit("q", &call.q, q_bytes(shape.m, shape.n_head), 16)?;
+    require_fit(
+        "k_rows",
+        &call.k_rows,
+        rows_bytes(shape.m, shape.n_kv_head),
+        16,
+    )?;
+    require_fit(
+        "v_rows",
+        &call.v_rows,
+        rows_bytes(shape.m, shape.n_kv_head),
+        16,
+    )?;
+    require_fit("pos", &call.pos, 4, 4)?;
+    require_fit("status", &call.status, 4, 4)
+}
+
+/// Disjointness of the touched extents of a rows call: as [`check_apart`], with the rows buffers
+/// in place of the caches.
+fn check_rows_apart(call: &AttnPrepRowsCall<'_>) -> Result<(), EngError> {
+    let shape = &call.shape;
+    let row_w = row_width(shape.n_head, shape.n_kv_head);
+    let rows = rows_bytes(shape.m, shape.n_kv_head);
+    let written = [
+        Claim::of("q", &call.q, q_bytes(shape.m, shape.n_head)),
+        Claim::of("k_rows", &call.k_rows, rows),
+        Claim::of("v_rows", &call.v_rows, rows),
+        Claim::of("status", &call.status, 4),
+    ];
+    let read = [
+        Claim::of("proj", &call.proj, proj_bytes(shape.m, shape.ld, row_w)),
+        Claim::of("q_norm", &call.q_norm, NORM_BYTES),
+        Claim::of("k_norm", &call.k_norm, NORM_BYTES),
+        Claim::of("pos", &call.pos, 4),
+    ];
+    for (i, claim) in written.iter().enumerate() {
+        for other in written[i + 1..].iter().chain(read.iter()) {
+            require_apart(claim, other)?;
+        }
+    }
+    Ok(())
+}
+
 impl CudaContext {
     /// Queues the attention preparation of `call` on `stream`: RMSNorm and rope of every q and k
     /// head at position `*pos + t`, the `q` output, and the append of the k and v rows to the
@@ -335,6 +481,63 @@ impl CudaContext {
                     k_norm,
                     k_cache,
                     v_cache,
+                    q,
+                    pos,
+                    status,
+                    ints,
+                    eps,
+                    rope_base,
+                },
+            )
+        })
+    }
+
+    /// Queues the f32 rows attention preparation of `call` on `stream` (KV8-B B1, the Int8G32 KV
+    /// handoff): the same RMSNorm and rope math as [`Self::attn_prep`], but the post-rope k and
+    /// the unchanged v go to f32 rows `[t]` of `k_rows`/`v_rows`, indexed by the token, and no
+    /// cache byte is written. Returns when the kernel is queued; the outputs are valid after the
+    /// stream drained.
+    ///
+    /// The device word `*pos` is authoritative; a word outside `0..=rows - m` (with `rows` the
+    /// plane cell count) writes no row, NaNs every `q` element and ORs mask 4 into the status
+    /// word. `m` is at most [`MAX_DECODE_ROWS`]; the B3 step op list is the first caller.
+    ///
+    /// Returns `BadRequest`, before any native call and with the backend unchanged, for a buffer
+    /// or stream of another context, a freed buffer, a shape, rope scalar or configuration the
+    /// kernel refuses, an `admit_pos` that does not leave `m` rows, a range that is too short or
+    /// misaligned, and a written range that overlaps another range of the call.
+    #[cfg_attr(
+        not(test),
+        expect(dead_code, reason = "staged for KV8-B B3: the Int8G32 step op list")
+    )]
+    pub(crate) fn attn_prep_rows(
+        &self,
+        stream: &DeviceStream,
+        call: AttnPrepRowsCall<'_>,
+    ) -> Result<(), EngError> {
+        let proj = self.raw_range(&call.proj)?;
+        let q_norm = self.raw_range(&call.q_norm)?;
+        let k_norm = self.raw_range(&call.k_norm)?;
+        let k_rows = self.raw_range(&call.k_rows)?;
+        let v_rows = self.raw_range(&call.v_rows)?;
+        let q = self.raw_range(&call.q)?;
+        let pos = self.raw_range(&call.pos)?;
+        let status = self.raw_range(&call.status)?;
+        let ints = check_rows_shape(&call.shape)?;
+        check_rope(&call.rope)?;
+        ensure_rows(call.admit_pos, call.shape.m, call.shape.rows)?;
+        check_rows_fit(&call)?;
+        check_rows_apart(&call)?;
+        let RopeParams { eps, rope_base } = call.rope;
+        self.launch_on(stream, move |raw| {
+            attn_prep_rows_launch(
+                raw,
+                AttnPrepRowsRaw {
+                    proj,
+                    q_norm,
+                    k_norm,
+                    k_rows,
+                    v_rows,
                     q,
                     pos,
                     status,

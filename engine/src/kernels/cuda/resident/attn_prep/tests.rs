@@ -19,8 +19,9 @@
 //! logits" is first tested at RD-9 integration.
 
 use super::{
-    AttnPrepCall, AttnPrepShape, HEAD_DIM, MAX_N_HEAD, MAX_N_KV_HEAD, MAX_ROWS, MAX_TOKENS,
-    RopeParams, SlotMode, cache_bytes, check_rope, check_shape, proj_bytes, q_bytes, row_width,
+    AttnPrepCall, AttnPrepRowsCall, AttnPrepShape, HEAD_DIM, MAX_DECODE_ROWS, MAX_N_HEAD,
+    MAX_N_KV_HEAD, MAX_ROWS, MAX_TOKENS, RopeParams, SlotMode, cache_bytes, check_rope,
+    check_shape, proj_bytes, q_bytes, row_width, rows_bytes,
 };
 use crate::EngError;
 use crate::kernels::cuda::resident::step_params::{
@@ -999,4 +1000,538 @@ fn attn_prep_inside_a_capture_equals_eager() {
             "word {word}: the step block differs"
         );
     }
+}
+
+// ---- KV8-B B1: the f32 rows entry (the Int8G32 KV handoff) -----------------------------------
+//
+// The rows entry runs the same kernel math as the fp16 path and must agree with it: test A runs
+// both entries on one fixture and checks that rounding the f32 rows to fp16 gives the fp16 path's
+// cache bytes bit for bit, that the rows carry the full f32 values (the f64 reference and the RP1
+// bound for k, a bit-exact pass-through for v), and that q is shared. Test B is the poison rule
+// with cells in place of rows; test C is the wrapper's refusals, each reaching its own guard with
+// every earlier check satisfied. The null and shape refusals of the C entry itself are the host
+// test `the_native_launch_entries_refuse_bad_arguments_before_any_device_call`.
+//
+// Every test below runs in the isolation split of MSG-73 (the pattern of
+// `family/qwen36/cuda/native_mixer_device_tests.rs`): a device phase consumes the fixture, works
+// only through `?` - no assert, expect or unwrap while a CUDA owner is alive - hands back plain
+// host bytes, and drops every owner at its return; only then do the assertions run.
+
+/// Buffer indexes of the rows fixture: 0 proj, 1 q_norm, 2 k_norm, 3 q, 4 k rows, 5 v rows,
+/// 6 the StepParams block, 7 and 8 spare word buffers, 9 and 10 the fp16 caches of test A.
+const KR: usize = 4;
+const VR: usize = 5;
+const KC_FP16: usize = 9;
+const VC_FP16: usize = 10;
+
+struct RowsFx {
+    rig: Rig,
+    bufs: Vec<DeviceBuffer>,
+    slots: [Slot; 8],
+    base: [Slot; 8],
+    shape: AttnPrepShape,
+    rope: RopeParams,
+    admit: usize,
+    data: Data,
+}
+
+/// A rows fixture of the Qwen shape: `m` tokens, `cells` plane cells (also the fp16 cache rows of
+/// test A), the position word `word`, real-scale data (the model group's 1.7) and a canary tail of
+/// 32 words after each rows buffer.
+impl RowsFx {
+    #[rustfmt::skip]
+    fn new(m: usize, cells: usize, word: i32, status: i32, slack: usize) -> Self {
+        let rig = Rig::new();
+        let shape = qwen(m, cells);
+        let data = data(&shape, 0xa77e_0000 ^ (word as u64) ^ ((m as u64) << 32), 1.7);
+        let ctx = &rig.ctx;
+        let rows_len = rows_bytes(m, shape.n_kv_head);
+        let rows_buf = vec![SENT; rows_len + 32 * 4 + slack];
+        let q_len = q_bytes(m, shape.n_head);
+        let row_bytes = shape.n_kv_head * D * 2;
+        let cache = cache_bytes(cells, shape.n_kv_head) + 2 * CANARY_ROWS * row_bytes;
+        let cache_buf = vec![SENT; cache + slack];
+        let words = vec![0u8; 64 + slack];
+        let params = padded(params_block(word, status).to_vec(), 32 + slack, 0);
+        let bufs = vec![
+            testkit::upload_bytes(ctx, &padded(le(&data.proj), slack, 0)),
+            testkit::upload_bytes(ctx, &padded(le(&data.q_norm), slack, 0)),
+            testkit::upload_bytes(ctx, &padded(le(&data.k_norm), slack, 0)),
+            testkit::upload_filled(ctx, Q_FILL, q_len + 1024 * 4 + slack),
+            testkit::upload_bytes(ctx, &rows_buf),
+            testkit::upload_bytes(ctx, &rows_buf),
+            testkit::upload_bytes(ctx, &params),
+            testkit::upload_bytes(ctx, &words),
+            testkit::upload_bytes(ctx, &words),
+            testkit::upload_bytes(ctx, &cache_buf),
+            testkit::upload_bytes(ctx, &cache_buf),
+        ];
+        let proj = proj_bytes(m, shape.ld, row_width(shape.n_head, shape.n_kv_head));
+        let slots = [(0, 0, proj), (1, 0, D * 4), (2, 0, D * 4), (3, 0, q_len), (4, 0, rows_len), (5, 0, rows_len), (PARAMS_BUF, OFFSET_POS, 4), (PARAMS_BUF, OFFSET_STATUS, 4)];
+        Self { rig, bufs, slots, base: slots, shape, rope: RopeParams { eps: EPS, rope_base: BASE }, admit: usize::try_from(word).unwrap_or(0), data }
+    }
+
+    fn range(&self, slot: usize) -> Result<crate::kernels::cuda::DeviceRange<'_>, EngError> {
+        let (index, offset, bytes) = self.slots[slot];
+        self.bufs[index].range(offset, bytes)
+    }
+
+    /// Queues the rows call; `foreign` replaces the range of one slot by a range of another context.
+    fn attempt(&self, foreign: Option<(usize, &DeviceBuffer)>) -> Result<(), EngError> {
+        let r = |i: usize| match foreign {
+            Some((slot, other)) if slot == i => other.range(self.slots[i].1, self.slots[i].2),
+            _ => self.range(i),
+        };
+        self.rig.ctx.attn_prep_rows(
+            &self.rig.stream,
+            AttnPrepRowsCall {
+                shape: self.shape,
+                rope: self.rope,
+                admit_pos: self.admit,
+                proj: r(PROJ)?,
+                q_norm: r(QN)?,
+                k_norm: r(KN)?,
+                k_rows: r(KR)?,
+                v_rows: r(VR)?,
+                q: r(Q)?,
+                pos: r(POS)?,
+                status: r(STATUS)?,
+            },
+        )
+    }
+
+    /// Queues the rows call and drains the stream when it was accepted.
+    fn run_rows(&self) -> Result<(), EngError> {
+        self.attempt(None)?;
+        self.rig.stream.synchronize()?;
+        Ok(())
+    }
+
+    /// Queues the fp16 call on the same fixture (the caches of buffers 9 and 10).
+    fn run_fp16(&self) -> Result<(), EngError> {
+        let cache = cache_bytes(self.shape.rows, self.shape.n_kv_head);
+        let off = CANARY_ROWS * self.shape.n_kv_head * D * 2;
+        self.rig.ctx.attn_prep(
+            &self.rig.stream,
+            AttnPrepCall {
+                shape: self.shape,
+                rope: self.rope,
+                admit_pos: self.admit,
+                proj: self.range(PROJ)?,
+                q_norm: self.range(QN)?,
+                k_norm: self.range(KN)?,
+                k_cache: self.bufs[KC_FP16].range(off, cache)?,
+                v_cache: self.bufs[VC_FP16].range(off, cache)?,
+                q: self.range(Q)?,
+                pos: self.range(POS)?,
+                status: self.range(STATUS)?,
+            },
+        )?;
+        self.rig.stream.synchronize()?;
+        Ok(())
+    }
+
+    /// The whole bytes of buffer `index`, read on the fixture's stream: the Result-only read of
+    /// the device phases below (no panic path while an owner is alive).
+    fn pull(&self, index: usize) -> Result<Vec<u8>, EngError> {
+        let buffer = &self.bufs[index];
+        let mut bytes = vec![0u8; buffer.bytes()];
+        buffer.read_at(&self.rig.stream, 0, &mut bytes)?;
+        Ok(bytes)
+    }
+}
+
+/// The status word of a pulled step block (host bytes only).
+fn rows_status_word(params: &[u8]) -> i32 {
+    i32::from_le_bytes(
+        params[OFFSET_STATUS..OFFSET_STATUS + 4]
+            .try_into()
+            .expect("word"),
+    )
+}
+
+/// Test A (KV8-B B1 a): for m in {1, 4, 16} and pos in {0, 1000, cells - m}, the f32 rows of the
+/// rows entry round to exactly the fp16 path's cache bytes, carry the full f32 values (the f64
+/// reference with the RP1 bound for k, a bit-exact pass-through for v) and share q with it.
+#[test]
+#[rustfmt::skip]
+fn attn_prep_rows_round_to_the_fp16_cache_bits_and_carry_the_f32_values() {
+    if !testkit::device_present("attn_prep_rows_round_to_the_fp16_cache_bits_and_carry_the_f32_values") { return; }
+    let mut rep = Report::default();
+    let cells = 1024usize;
+    let cases = [
+        (1usize, 0usize), (4, 0), (16, 0), (1, 1000), (4, 1000), (16, 1000),
+        (1, cells - 1), (4, cells - 4), (16, cells - 16),
+    ];
+    for (m, pos) in cases {
+        let fx = RowsFx::new(m, cells, pos as i32, 0, 0);
+        let out = rows_a_phase(fx).expect("test A: the device phase");
+        let rows_len = rows_bytes(m, out.shape.n_kv_head);
+        let (kr, vr) = (testkit::floats(&out.k_rows[..rows_len]), testkit::floats(&out.v_rows[..rows_len]));
+        let q_len = q_bytes(m, out.shape.n_head);
+        assert!(out.q[..q_len] == out.fp16_q[..q_len], "m {m} pos {pos}: q differs between the two entries");
+        assert!(out.q[q_len..].iter().all(|&b| b == Q_FILL), "m {m} pos {pos}: the q tail canary changed");
+        let half = |b: &[u8], at: usize| u16::from_le_bytes([b[at], b[at + 1]]);
+        let nkv = out.shape.n_kv_head;
+        let kv_base = out.shape.n_head * 2 * D;
+        for t in 0..m {
+            let p = pos + t;
+            let row = &out.data.proj[t * out.shape.ld..];
+            for j in 0..nkv {
+                let at = CANARY_ROWS * nkv * D * 2 + (p * nkv + j) * D * 2;
+                let reference = ref_head(&row[kv_base + j * D..][..D], &out.data.k_norm, p, out.shape.n_rot);
+                for d in 0..D {
+                    let (k, v) = (kr[(t * nkv + j) * D + d], vr[(t * nkv + j) * D + d]);
+                    assert_eq!(f16_bits(k), half(&out.kc, at + 2 * d), "K m {m} pos {pos} token {t} head {j} dim {d}");
+                    assert_eq!(f16_bits(v), half(&out.vc, at + 2 * d), "V m {m} pos {pos} token {t} head {j} dim {d}");
+                    assert_eq!(v.to_bits(), row[kv_base + (nkv + j) * D + d].to_bits(), "V f32 m {m} pos {pos} token {t} head {j} dim {d}");
+                    let b = rp1(&reference, d, p, out.shape.n_rot);
+                    let ratio = (f64::from(k) - reference[d]).abs() / b;
+                    assert!(ratio <= 1.0, "K row m {m} pos {pos} token {t} head {j} dim {d}: ratio {ratio}");
+                    rep.note(Group::Model, false, ratio, p, (t, j, d));
+                }
+            }
+        }
+        assert!(out.k_rows[rows_len..].iter().all(|&b| b == SENT) && out.v_rows[rows_len..].iter().all(|&b| b == SENT), "m {m} pos {pos}: the rows canary changed");
+        assert_eq!(rows_status_word(&out.params), 0, "m {m} pos {pos}: a valid launch leaves the status alone");
+    }
+    rep.print("ROWS-A");
+    assert!(rep.worst() <= 1.0);
+}
+
+/// The host data of test A's device phase: the fp16 launch's q and both caches, then the rows
+/// launch's q, both rows buffers and step block, and the fixture's shape and host data.
+struct RowsAOut {
+    fp16_q: Vec<u8>,
+    kc: Vec<u8>,
+    vc: Vec<u8>,
+    q: Vec<u8>,
+    k_rows: Vec<u8>,
+    v_rows: Vec<u8>,
+    params: Vec<u8>,
+    data: Data,
+    shape: AttnPrepShape,
+}
+
+/// Test A's device phase (the isolation split: only `?` inside, every owner drops at the
+/// return): the fp16 launch, then the q canary refill, then the rows launch, then every buffer
+/// the assertions read. The refill erases the fp16 output from q between the two launches, so
+/// the q equality above cannot pass vacuously, and leaves the q tail canary (the 1024 words the
+/// fixture allocates after q) at its fill byte, where the rows launch must not touch it.
+fn rows_a_phase(fx: RowsFx) -> Result<RowsAOut, EngError> {
+    fx.run_fp16()?;
+    let (fp16_q, kc, vc) = (fx.pull(Q)?, fx.pull(KC_FP16)?, fx.pull(VC_FP16)?);
+    let q_len = q_bytes(fx.shape.m, fx.shape.n_head);
+    fx.bufs[Q].write_at(&fx.rig.stream, 0, &vec![Q_FILL; q_len])?;
+    fx.run_rows()?;
+    Ok(RowsAOut {
+        fp16_q,
+        kc,
+        vc,
+        q: fx.pull(Q)?,
+        k_rows: fx.pull(KR)?,
+        v_rows: fx.pull(VR)?,
+        params: fx.pull(PARAMS_BUF)?,
+        data: fx.data,
+        shape: fx.shape,
+    })
+}
+
+/// Test B (KV8-B B1 b): a bad pos word (-1, and cells - m + 1) writes no row, sets q to NaN and
+/// ORs mask 4 into the status word, and the earlier status bits and the other words survive.
+#[test]
+#[rustfmt::skip]
+fn a_poisoned_word_writes_no_rows_and_reports_mask_4() {
+    if !testkit::device_present("a_poisoned_word_writes_no_rows_and_reports_mask_4") { return; }
+    let (m, cells) = (16usize, 256usize);
+    for word in [-1, (cells - m + 1) as i32] {
+        let mut fx = RowsFx::new(m, cells, word, STATUS_NON_FINITE_LOGITS, 0);
+        fx.admit = 5;
+        let out = rows_b_phase(fx).expect("test B: the device phase");
+        let q_len = q_bytes(m, out.shape.n_head);
+        assert!(testkit::floats(&out.q[..q_len]).iter().all(|v| v.is_nan()), "word {word}: q is NaN");
+        assert!(out.k_rows.iter().all(|&b| b == SENT) && out.v_rows.iter().all(|&b| b == SENT), "word {word}: no row is written");
+        let status = rows_status_word(&out.params);
+        assert!(StepStatus(status).invalid_step_state(), "word {word}: mask 4");
+        assert_eq!(status & !4, STATUS_NON_FINITE_LOGITS, "word {word}: earlier bits survive");
+        assert_eq!(out.before[..OFFSET_STATUS], out.params[..OFFSET_STATUS], "word {word}: other words");
+    }
+}
+
+/// The host data of test B's device phase: the step block before the poisoned launch, then q,
+/// both rows buffers and the step block after it.
+struct RowsBOut {
+    before: Vec<u8>,
+    q: Vec<u8>,
+    k_rows: Vec<u8>,
+    v_rows: Vec<u8>,
+    params: Vec<u8>,
+    shape: AttnPrepShape,
+}
+
+/// Test B's device phase (the isolation split): the step block as it was, the poisoned launch,
+/// then the buffers its assertions read.
+fn rows_b_phase(fx: RowsFx) -> Result<RowsBOut, EngError> {
+    let before = fx.pull(PARAMS_BUF)?;
+    fx.run_rows()?;
+    Ok(RowsBOut {
+        before,
+        q: fx.pull(Q)?,
+        k_rows: fx.pull(KR)?,
+        v_rows: fx.pull(VR)?,
+        params: fx.pull(PARAMS_BUF)?,
+        shape: fx.shape,
+    })
+}
+
+/// Test C (KV8-B B1 c): the wrapper's refusals. Each row edits one thing of a valid base call, so
+/// the refusal is the edited rule's own text and every earlier check was satisfied.
+#[test]
+fn attn_prep_rows_rejects_bad_arguments_before_any_launch() {
+    if !testkit::device_present("attn_prep_rows_rejects_bad_arguments_before_any_launch") {
+        return;
+    }
+    let fx = RowsFx::new(2, 16, 3, 0, 1 << 20);
+    let rows_len = rows_bytes(2, fx.shape.n_kv_head);
+    let out = rows_c_phase(fx).expect("test C: the device phase");
+    for (label, text, result) in &out.refused {
+        assert!(
+            matches!(result, Err(EngError::BadRequest(m)) if m.contains(*text)),
+            "{label}: {result:?}"
+        );
+    }
+    assert!(
+        out.before.0 == out.after.0 && out.before.1[..rows_len] == out.after.1[..rows_len],
+        "the refusals changed the words or a row"
+    );
+}
+
+/// One row of the refusal table: the label, the text its guard must name, and the edit.
+type RowsRow = (&'static str, &'static str, fn(&mut RowsFx));
+
+/// The host data of test C's device phase: the step block and a rows buffer before and after the
+/// refusal table, every refusal's own result, and the good call after them.
+struct RowsCOut {
+    before: (Vec<u8>, Vec<u8>),
+    after: (Vec<u8>, Vec<u8>),
+    refused: Vec<(&'static str, &'static str, Result<(), EngError>)>,
+}
+
+/// Test C's device phase (the isolation split): the base call, every refusal edit with the base
+/// restored after it, the good call after the refusals, and the words and a rows buffer before
+/// and after. The refusal results are data; the assertions run in the test.
+fn rows_c_phase(mut fx: RowsFx) -> Result<RowsCOut, EngError> {
+    fx.run_rows()?;
+    let before = (fx.pull(PARAMS_BUF)?, fx.pull(KR)?);
+    let mut rows: Vec<RowsRow> = Vec::new();
+    for (label, text, edit) in [
+        (
+            "m 0",
+            "attn_prep_rows: m:",
+            (|fx: &mut RowsFx| fx.shape.m = 0) as fn(&mut RowsFx),
+        ),
+        ("m 17", "attn_prep_rows: m:", |fx| {
+            fx.shape.m = MAX_DECODE_ROWS + 1
+        }),
+        ("m above the grid bound", "attn_prep_rows: m:", |fx| {
+            fx.shape.m = MAX_TOKENS
+        }),
+        ("cells below m", "attn_prep_rows: rows:", |fx| {
+            fx.shape.rows = 1
+        }),
+        ("n_rot not a power of two", "attn_prep_rows: n_rot:", |fx| {
+            fx.shape.n_rot = 96
+        }),
+        ("ld below the row width", "attn_prep_rows: ld:", |fx| {
+            fx.shape.ld -= 1
+        }),
+        ("admit_pos + m > cells", "the step needs positions", |fx| {
+            fx.admit = fx.shape.rows
+        }),
+        ("eps 0", "eps:", |fx| fx.rope.eps = 0.0),
+        ("k_rows short", "CUDA k_rows range holds", |fx| {
+            fx.slots[KR].2 -= 4
+        }),
+        ("v_rows short", "CUDA v_rows range holds", |fx| {
+            fx.slots[VR].2 -= 4
+        }),
+        ("k_rows at +4", "CUDA k_rows range starts at offset", |fx| {
+            fx.slots[KR].1 += 4
+        }),
+        ("v_rows at +4", "CUDA v_rows range starts at offset", |fx| {
+            fx.slots[VR].1 += 4
+        }),
+        ("q short", "CUDA q range holds", |fx| fx.slots[Q].2 -= 4),
+        ("pos short", "CUDA pos range holds", |fx| {
+            fx.slots[POS].2 -= 2
+        }),
+        ("k_rows inside q", "q and k_rows ranges overlap", |fx| {
+            fx.slots[POS] = (7, 0, 4);
+            fx.slots[STATUS] = (8, 0, 4);
+            fx.slots[KR] = (fx.base[Q].0, fx.base[Q].1, fx.base[KR].2);
+        }),
+        (
+            "k_rows inside proj",
+            "k_rows and proj ranges overlap",
+            |fx| {
+                fx.slots[POS] = (7, 0, 4);
+                fx.slots[STATUS] = (8, 0, 4);
+                fx.slots[KR] = (fx.base[PROJ].0, 0, fx.base[KR].2);
+            },
+        ),
+        (
+            "k_rows over status",
+            "k_rows and status ranges overlap",
+            |fx| {
+                fx.slots[POS] = (7, 0, 4);
+                fx.slots[STATUS] = (8, 0, 4);
+                fx.slots[KR] = (8, 0, fx.base[KR].2);
+            },
+        ),
+        ("v_rows inside q", "q and v_rows ranges overlap", |fx| {
+            fx.slots[POS] = (7, 0, 4);
+            fx.slots[STATUS] = (8, 0, 4);
+            fx.slots[VR] = (fx.base[Q].0, fx.base[Q].1, fx.base[VR].2);
+        }),
+        (
+            "k_rows on v_rows",
+            "k_rows and v_rows ranges overlap",
+            |fx| {
+                fx.slots[KR] = (fx.base[VR].0, fx.base[VR].1, fx.base[KR].2);
+            },
+        ),
+        (
+            "v_rows inside proj",
+            "v_rows and proj ranges overlap",
+            |fx| {
+                fx.slots[POS] = (7, 0, 4);
+                fx.slots[STATUS] = (8, 0, 4);
+                fx.slots[VR] = (fx.base[PROJ].0, 0, fx.base[VR].2);
+            },
+        ),
+        (
+            "v_rows over status",
+            "v_rows and status ranges overlap",
+            |fx| {
+                fx.slots[POS] = (7, 0, 4);
+                fx.slots[STATUS] = (8, 0, 4);
+                fx.slots[VR] = (8, 0, fx.base[VR].2);
+            },
+        ),
+    ] {
+        rows.push((label, text, edit));
+    }
+    let saved = (fx.base, fx.shape, fx.rope, fx.admit);
+    let mut refused = Vec::new();
+    for (label, text, edit) in rows {
+        edit(&mut fx);
+        refused.push((label, text, fx.run_rows()));
+        (fx.slots, fx.shape, fx.rope, fx.admit) = saved;
+    }
+    let after = (fx.pull(PARAMS_BUF)?, fx.pull(KR)?);
+    fx.run_rows()?;
+    Ok(RowsCOut {
+        before,
+        after,
+        refused,
+    })
+}
+
+// ------------------------------------------------------------- KV8-B B1F: T10 of the rows entry
+
+/// Restores every mutable buffer of the rows fixture to its pristine image with the position
+/// word set to `word` (the host writes are outside any capture window).
+fn reset_rows_to(fx: &RowsFx, word: i32) -> Result<(), EngError> {
+    let s = fx.shape;
+    let rows = vec![SENT; fx.bufs[KR].bytes()];
+    let q = vec![Q_FILL; q_bytes(s.m, s.n_head)];
+    let block = params_block(word, 0).to_vec();
+    let stream = &fx.rig.stream;
+    fx.bufs[KR].write_at(stream, 0, &rows)?;
+    fx.bufs[VR].write_at(stream, 0, &rows)?;
+    fx.bufs[Q].write_at(stream, 0, &q)?;
+    fx.bufs[PARAMS_BUF].write_at(stream, 0, &block)?;
+    Ok(())
+}
+
+/// The host data of the rows capture phase: the node count of the graph and the four buffers of
+/// each word, eager first, then replayed.
+struct RowsCaptureOut {
+    nodes: usize,
+    eager: Vec<[Vec<u8>; 4]>,
+    replayed: Vec<[Vec<u8>; 4]>,
+}
+
+/// T10 (KV8-B B1F): the rows entry captured in a graph and replayed with the position word
+/// rewritten between replays equals the eager rows launch at that position byte for byte (q,
+/// both rows buffers, the step block), for the decode shape m = 1.
+#[test]
+fn attn_prep_rows_inside_a_capture_equals_eager() {
+    if !testkit::device_present("attn_prep_rows_inside_a_capture_equals_eager") {
+        return;
+    }
+    let words = [5, 77, 4090];
+    let out = rows_capture_phase(&words).expect("the rows capture phase");
+    assert_eq!(out.nodes, 1, "the rows graph holds one kernel");
+    for (case, &word) in words.iter().enumerate() {
+        for (at, name) in [
+            (0, "q"),
+            (1, "the k rows"),
+            (2, "the v rows"),
+            (3, "the step block"),
+        ] {
+            assert_eq!(
+                out.replayed[case][at], out.eager[case][at],
+                "word {word}: {name} differs from the eager rows launch"
+            );
+        }
+    }
+}
+
+/// The capture phase of the rows T10 (the isolation split): the eager rows launches of every
+/// word on fresh fixtures, then one fixture whose captured graph is replayed at each word after
+/// a reset. The eager fixtures share the captured fixture's data (RowsFx seeds its data by the
+/// word, so they keep the base word's seed and only their position word is rewritten, as the
+/// fp16 T10's eager_prep_bytes does). The warm launch loads the rows instance's module, which a
+/// capture forbids.
+fn rows_capture_phase(words: &[i32; 3]) -> Result<RowsCaptureOut, EngError> {
+    let (m, cells) = (1usize, 4200usize);
+    let mut eager = Vec::new();
+    for &word in words {
+        let mut fx = RowsFx::new(m, cells, words[0], 0, 0);
+        fx.admit = usize::try_from(word).unwrap_or(0);
+        let block = params_block(word, 0).to_vec();
+        fx.bufs[PARAMS_BUF].write_at(&fx.rig.stream, 0, &block)?;
+        fx.run_rows()?;
+        eager.push([
+            fx.pull(Q)?,
+            fx.pull(KR)?,
+            fx.pull(VR)?,
+            fx.pull(PARAMS_BUF)?,
+        ]);
+    }
+    let fx = RowsFx::new(m, cells, words[0], 0, 0);
+    fx.run_rows()?;
+    reset_rows_to(&fx, words[0])?;
+    let (graph, ()) = fx
+        .rig
+        .ctx
+        .capture(&fx.rig.stream, no_pins(), || fx.attempt(None))?;
+    let nodes = graph.nodes();
+    let mut replayed = Vec::new();
+    for &word in words {
+        reset_rows_to(&fx, word)?;
+        graph.launch(&fx.rig.stream)?;
+        replayed.push([
+            fx.pull(Q)?,
+            fx.pull(KR)?,
+            fx.pull(VR)?,
+            fx.pull(PARAMS_BUF)?,
+        ]);
+    }
+    Ok(RowsCaptureOut {
+        nodes,
+        eager,
+        replayed,
+    })
 }

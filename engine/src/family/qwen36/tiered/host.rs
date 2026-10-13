@@ -108,6 +108,41 @@ fn weight_ppm(weight: f32) -> u64 {
     (f64::from(weight).max(0.0) * 1e6).round() as u64
 }
 
+/// The picks of every layer of one token as the device logged them: `(id, weight)` in rank order,
+/// exactly `top_k` per layer (`id < 0` is the router-fault value). WHY (TCAP): the classification
+/// moves onto the device, so the host learns a token's routes after it ran and accounts for them
+/// at the boundary with [`TieredHost::account_token`]. First caller: TCAP C6.
+#[derive(Clone, Debug, PartialEq)]
+pub struct RouteLog {
+    layers: usize,
+    top_k: usize,
+    picks: Vec<(i32, f32)>,
+}
+
+impl RouteLog {
+    /// A log of `layers` layers of `top_k` picks each; `Err(BadRoute)` when `picks` is not exactly
+    /// `layers * top_k` long.
+    pub fn new(layers: usize, top_k: usize, picks: Vec<(i32, f32)>) -> Result<Self, HostError> {
+        if layers.checked_mul(top_k) != Some(picks.len()) {
+            return Err(HostError::BadRoute(format!(
+                "a log of {layers} layers of {top_k} picks holds {} picks",
+                picks.len()
+            )));
+        }
+        Ok(Self {
+            layers,
+            top_k,
+            picks,
+        })
+    }
+
+    /// The picks of `layer`, empty for a layer outside the log.
+    fn layer(&self, layer: usize) -> &[(i32, f32)] {
+        let at = layer.saturating_mul(self.top_k);
+        self.picks.get(at..at + self.top_k).unwrap_or(&[])
+    }
+}
+
 /// The host side of the tiered step.
 pub struct TieredHost {
     cfg: TieredConfig,
@@ -250,6 +285,70 @@ impl TieredHost {
         Ok(plan)
     }
 
+    /// Accounts for a whole token from the device's route log: the same counters and the same
+    /// `routes` per layer as [`Self::begin_layer`] leaves, without starting any CPU job (the device
+    /// classified and a server ran the jobs). Every layer is validated first, so a refused log
+    /// changes nothing. Refuses while a v1 layer is in flight. A log must hold exactly the config's
+    /// `top_k` picks per layer. First caller: TCAP C6.
+    pub fn account_token(&mut self, log: &RouteLog) -> Result<(), HostError> {
+        if let Some(open) = &self.in_flight {
+            return Err(HostError::Order(format!(
+                "account_token while layer {} is in flight",
+                open.layer
+            )));
+        }
+        if log.layers != self.cfg.layers || log.top_k != self.cfg.top_k {
+            return Err(HostError::BadRoute(format!(
+                "a log of {} layers of {} picks for {} layers of top_k {}",
+                log.layers, log.top_k, self.cfg.layers, self.cfg.top_k
+            )));
+        }
+        for layer in 0..log.layers {
+            let (ids, weights): (Vec<i32>, Vec<f32>) = log.layer(layer).iter().copied().unzip();
+            self.check_route(layer, &ids, &weights)?;
+        }
+        for layer in 0..log.layers {
+            let picks = log.layer(layer);
+            self.routes[layer] = picks
+                .iter()
+                .filter(|&&(id, _)| id >= 0)
+                .map(|&(id, _)| id as u16)
+                .collect();
+            for &(id, weight) in picks.iter().filter(|&&(id, _)| id >= 0) {
+                let ppm = weight_ppm(weight);
+                self.report.routed_weight_ppm += ppm;
+                if self.table.lookup(layer, id as u16).is_some() {
+                    self.report.bank_hits += 1;
+                } else {
+                    self.report.cpu_served += 1;
+                    self.report.cpu_weight_ppm += ppm;
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// The device slot table row of `layer`: for every expert its bank slot while it is published,
+    /// else -1 (a miss; never 0, which is a real slot). `Err(BadRoute)` for a layer outside the
+    /// model. First caller: TCAP C6.
+    pub fn slot_row(&self, layer: usize) -> Result<Vec<i32>, HostError> {
+        if layer >= self.cfg.layers {
+            return Err(HostError::BadRoute(format!(
+                "layer {layer} is outside 0..{}",
+                self.cfg.layers
+            )));
+        }
+        (0..self.cfg.experts)
+            .map(|expert| {
+                let Some((slot, _)) = self.table.lookup(layer, expert as u16) else {
+                    return Ok(-1);
+                };
+                i32::try_from(slot)
+                    .map_err(|_| HostError::Config(format!("slot {slot} does not fit an i32")))
+            })
+            .collect()
+    }
+
     /// Validates a route: the layer, the list lengths, every non-negative expert id (in
     /// range, picked once) and its weight (finite).
     fn check_route(&self, layer: usize, ids: &[i32], weights: &[f32]) -> Result<(), HostError> {
@@ -304,6 +403,18 @@ impl TieredHost {
                 "finish_layer({layer}) with no layer begun"
             ))),
         }
+    }
+
+    /// Drops what a token that failed left behind: the layer in flight (nobody joins its CPU
+    /// jobs, the late results go with their channel), the routes and the counters of the layers
+    /// that ran. WHY: a failure between `begin_layer` and `finish_layer` would leave
+    /// `in_flight` set, and every later `begin_layer` would refuse with [`HostError::Order`]
+    /// until the engine was rebuilt. The ledger, the policy and the poison flag are untouched
+    /// (a failed fill stays poisoned: the policy and the ledger still disagree).
+    pub fn abort_token(&mut self) {
+        self.in_flight = None;
+        self.routes = vec![Vec::new(); self.cfg.layers];
+        self.report = TokenReport::default();
     }
 
     /// Ends the token: feeds this token's routes to policy P, runs the swaps it decides
@@ -445,6 +556,7 @@ impl TieredHost {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::family::qwen36::tiered::classify::classify_reference;
     use crate::family::qwen36::tiered::cpu_pool::ExpertKernel;
     use crate::family::qwen36::tiered::locator::ExpertTensorNames;
     use crate::family::qwen36::tiered::locator::tests::{Lcg, expert_file, parse};
@@ -887,6 +999,327 @@ mod tests {
         ));
         f.host.finish_layer(0).unwrap();
         assert!(f.host.end_token(&mut device).is_ok());
+    }
+
+    #[test]
+    fn an_aborted_token_frees_the_layer_in_flight_and_drops_its_counters() {
+        let mut f = fixture();
+        let mut device = MockDevice::default();
+        f.host.begin_layer(0, &[1], &[0.5], &f.hidden).unwrap();
+        // The failure between begin_layer and finish_layer: without the abort every later
+        // layer is refused for good.
+        assert!(matches!(
+            f.host.begin_layer(1, &[2], &[0.5], &f.hidden),
+            Err(HostError::Order(_))
+        ));
+        f.host.abort_token();
+        f.host.begin_layer(1, &[2], &[0.5], &f.hidden).unwrap();
+        f.host.finish_layer(1).unwrap();
+        let report = f.host.end_token(&mut device).unwrap();
+        assert_eq!(
+            (report.cpu_served, report.bank_hits),
+            (1, 0),
+            "only the layer after the abort is counted"
+        );
+    }
+
+    #[test]
+    fn an_aborted_token_drops_its_routes_before_the_policy_sees_them() {
+        let mut f = fixture();
+        let mut device = MockDevice::default();
+        // The failed token routed experts 1 and 2 in layer 0 and then failed.
+        f.host
+            .begin_layer(0, &[1, 2], &[0.5, 0.5], &f.hidden)
+            .unwrap();
+        f.host.abort_token();
+        // The next token reaches only layers 1 and 2: a stale route of layer 0 would reach the
+        // policy at the boundary, and the policy would fill layer 0 for it.
+        for layer in 1..LAYERS {
+            f.host.begin_layer(layer, &[3], &[1.0], &f.hidden).unwrap();
+            f.host.finish_layer(layer).unwrap();
+        }
+        f.host.end_token(&mut device).unwrap();
+        assert!(!device.fills.is_empty(), "the routed layers were filled");
+        assert!(
+            device.fills.iter().all(|(layer, _, _)| *layer != 0),
+            "layer 0 was never routed after the abort"
+        );
+    }
+
+    #[test]
+    fn an_abort_leaves_the_poison_of_a_failed_fill_in_place() {
+        let mut f = fixture();
+        let mut device = MockDevice {
+            fail_on: Some(0),
+            ..MockDevice::default()
+        };
+        run_token(&mut f, &[vec![0], vec![1]], &mut device).unwrap_err();
+        f.host.abort_token();
+        assert_eq!(f.host.end_token(&mut device), Err(HostError::Poisoned));
+    }
+
+    /// The seeded picks of one token, per layer: `TOP_K` distinct experts with fixed weights, a
+    /// router fault (every id -1, weight 0.0) in layer 1 of every seventh token, and a mixed list
+    /// (a fault id between valid picks) in layer 2 of every fifth token. The design's 2,000-token
+    /// replay of the OFFT trace is not in the repo: these are seeded stand-ins.
+    fn seeded_routes(rng: &mut Lcg, token: usize) -> Vec<Vec<(i32, f32)>> {
+        const WEIGHTS: [f32; TOP_K] = [0.4, 0.3, 0.2, 0.1];
+        (0..LAYERS)
+            .map(|layer| {
+                if layer == 1 && token % 7 == 6 {
+                    return vec![(-1, 0.0); TOP_K];
+                }
+                if layer == 2 && token % 5 == 3 {
+                    return vec![(2, 0.4), (-1, 0.0), (5, 0.2), (3, 0.1)];
+                }
+                let mut ids: Vec<i32> = Vec::new();
+                while ids.len() < TOP_K {
+                    let id = (rng.next() % EXPERTS as u64) as i32;
+                    if !ids.contains(&id) {
+                        ids.push(id);
+                    }
+                }
+                ids.into_iter().zip(WEIGHTS).collect()
+            })
+            .collect()
+    }
+
+    #[test]
+    fn account_token_equals_the_per_layer_counters() {
+        // The same routes through the v1 path (begin_layer and finish_layer per layer) and through
+        // the log of the device: equal reports, equal swaps, equal slot rows, token after token.
+        let (mut v1, mut logged) = (fixture(), fixture());
+        let (mut dev_v1, mut dev_logged) = (MockDevice::default(), MockDevice::default());
+        let mut rng = Lcg(0x7CA9_0004_0000_0001);
+        for token in 0..120 {
+            let routes = seeded_routes(&mut rng, token);
+            for (layer, picks) in routes.iter().enumerate() {
+                let (ids, weights): (Vec<i32>, Vec<f32>) = picks.iter().copied().unzip();
+                v1.host
+                    .begin_layer(layer, &ids, &weights, &v1.hidden)
+                    .unwrap();
+                v1.host.finish_layer(layer).unwrap();
+            }
+            let log = RouteLog::new(LAYERS, TOP_K, routes.concat()).unwrap();
+            logged.host.account_token(&log).unwrap();
+            let want = v1.host.end_token(&mut dev_v1).unwrap();
+            let got = logged.host.end_token(&mut dev_logged).unwrap();
+            assert_eq!(got, want, "token {token}");
+            for layer in 0..LAYERS {
+                assert_eq!(
+                    logged.host.slot_row(layer),
+                    v1.host.slot_row(layer),
+                    "token {token} layer {layer}"
+                );
+            }
+        }
+        assert_eq!(
+            dev_logged.fills, dev_v1.fills,
+            "the same swaps in the same order"
+        );
+        assert!(!dev_logged.fills.is_empty(), "the run really swapped");
+        logged.host.check_consistency().unwrap();
+    }
+
+    #[test]
+    fn a_refused_log_changes_nothing_and_a_good_one_counts_once() {
+        let mut f = fixture();
+        let mut device = MockDevice::default();
+        // A pick twice in layer 2 is refused as a whole: layers 0 and 1 are not counted either.
+        let mut picks: Vec<(i32, f32)> = vec![(1, 0.25), (2, 0.25), (3, 0.25), (4, 0.25)]
+            .into_iter()
+            .cycle()
+            .take(LAYERS * TOP_K)
+            .collect();
+        picks[2 * TOP_K + 1] = (1, 0.25);
+        let bad = RouteLog::new(LAYERS, TOP_K, picks.clone()).unwrap();
+        assert!(matches!(
+            f.host.account_token(&bad),
+            Err(HostError::BadRoute(_))
+        ));
+        picks[2 * TOP_K + 1] = (2, 0.25);
+        let good = RouteLog::new(LAYERS, TOP_K, picks).unwrap();
+        f.host.account_token(&good).unwrap();
+        let report = f.host.end_token(&mut device).unwrap();
+        assert_eq!(
+            report.cpu_served,
+            (LAYERS * TOP_K) as u32,
+            "nothing is resident yet"
+        );
+        assert_eq!(report.routed_weight_ppm, 250_000 * (LAYERS * TOP_K) as u64);
+        assert_eq!(
+            report.cpu_weight_ppm, report.routed_weight_ppm,
+            "all of it on the CPU"
+        );
+    }
+
+    #[test]
+    fn begin_layer_and_the_log_refuse_the_same_routes() {
+        let good = [(1, 0.25), (2, 0.25), (3, 0.25), (4, 0.25)];
+        let bad: [(&str, [(i32, f32); TOP_K]); 3] = [
+            ("pick twice", [(1, 0.25), (2, 0.25), (1, 0.25), (3, 0.25)]),
+            (
+                "expert past the layer",
+                [(1, 0.25), (2, 0.25), (EXPERTS as i32, 0.25), (3, 0.25)],
+            ),
+            (
+                "non-finite weight",
+                [(1, 0.25), (2, f32::NAN), (4, 0.25), (3, 0.25)],
+            ),
+        ];
+        for (what, picks) in bad {
+            let mut f = fixture();
+            let (ids, weights): (Vec<i32>, Vec<f32>) = picks.iter().copied().unzip();
+            assert!(
+                matches!(
+                    f.host.begin_layer(2, &ids, &weights, &f.hidden),
+                    Err(HostError::BadRoute(_))
+                ),
+                "begin_layer: {what}"
+            );
+            let all = [good.to_vec(), good.to_vec(), picks.to_vec()].concat();
+            let log = RouteLog::new(LAYERS, TOP_K, all).unwrap();
+            assert!(
+                matches!(f.host.account_token(&log), Err(HostError::BadRoute(_))),
+                "log: {what}"
+            );
+        }
+    }
+
+    #[test]
+    fn classify_reference_equals_begin_layer_plans() {
+        // The oracle of the device classification against the host classification it replaces:
+        // seeded single-layer routes over a ledger with a mix of resident and missing experts,
+        // faults included.
+        let mut f = fixture_with_slots(Duration::from_secs(60), EXPERTS);
+        let mut event = 1;
+        for layer in 0..LAYERS {
+            for expert in [0u16, 2, 3, 5, 7] {
+                install(&mut f.host, layer, expert, event);
+                event += 1;
+            }
+        }
+        let mut rng = Lcg(0x7CA9_0001);
+        for route in 0..2_000 {
+            let layer = route % LAYERS;
+            let fault = route % 13 == 12;
+            let mut ids: Vec<i32> = Vec::new();
+            while !fault && ids.len() < TOP_K {
+                let id = (rng.next() % EXPERTS as u64) as i32;
+                if !ids.contains(&id) {
+                    ids.push(id);
+                }
+            }
+            if fault {
+                ids = vec![-1; TOP_K];
+            }
+            let weights: Vec<f32> = ids
+                .iter()
+                .map(|&id| {
+                    if id < 0 {
+                        0.0
+                    } else {
+                        0.1 + (id as f32) * 0.05
+                    }
+                })
+                .collect();
+            let want = f
+                .host
+                .begin_layer(layer, &ids, &weights, &f.hidden)
+                .unwrap();
+            f.host.finish_layer(layer).unwrap();
+            let row = f.host.slot_row(layer).unwrap();
+            let got = classify_reference(&row, EXPERTS, &ids, &weights);
+            assert_eq!(got.slot_ids, want.slot_ids, "route {route}");
+            assert_eq!(
+                bits(&got.weights),
+                bits(&want.device_weights),
+                "route {route}"
+            );
+            assert_eq!(got.word, 0);
+            let missed = ids
+                .iter()
+                .filter(|&&id| id >= 0 && row[id as usize] < 0)
+                .count();
+            assert_eq!(got.misses.len(), missed, "route {route}");
+        }
+    }
+
+    #[test]
+    fn a_log_is_refused_while_a_v1_layer_is_in_flight() {
+        let mut f = fixture();
+        f.host.begin_layer(0, &[1], &[0.5], &f.hidden).unwrap();
+        let log = RouteLog::new(LAYERS, TOP_K, vec![(1, 0.5); LAYERS * TOP_K]).unwrap();
+        assert!(matches!(
+            f.host.account_token(&log),
+            Err(HostError::Order(_))
+        ));
+    }
+
+    #[test]
+    fn a_log_of_the_wrong_shape_is_refused() {
+        // Distinct ids in every layer: check_route would accept each layer, so only the shape
+        // guard of account_token can refuse these logs.
+        let distinct = |layers: usize, top_k: usize| {
+            let picks = (0..layers * top_k)
+                .map(|i| ((i % top_k) as i32, 0.25))
+                .collect();
+            RouteLog::new(layers, top_k, picks).unwrap()
+        };
+        assert!(RouteLog::new(LAYERS, TOP_K, vec![(0, 0.5); LAYERS * TOP_K - 1]).is_err());
+        let mut f = fixture();
+        for (what, log) in [
+            ("one layer short", distinct(LAYERS - 1, TOP_K)),
+            ("one layer too many", distinct(LAYERS + 1, TOP_K)),
+            ("one pick too wide", distinct(LAYERS, TOP_K + 1)),
+            ("one pick too narrow", distinct(LAYERS, TOP_K - 1)),
+        ] {
+            assert!(
+                matches!(f.host.account_token(&log), Err(HostError::BadRoute(_))),
+                "{what}"
+            );
+        }
+        f.host.account_token(&distinct(LAYERS, TOP_K)).unwrap();
+        assert!(f.host.slot_row(LAYERS).is_err());
+    }
+
+    #[test]
+    fn slot_rows_equal_the_ledger_after_every_boundary() {
+        let mut f = fixture();
+        let mut device = MockDevice::default();
+        let mut rng = Lcg(0x7CA9_0004_0000_0002);
+        for token in 0..60 {
+            let routes = seeded_routes(&mut rng, token);
+            let log = RouteLog::new(LAYERS, TOP_K, routes.concat()).unwrap();
+            f.host.account_token(&log).unwrap();
+            f.host.end_token(&mut device).unwrap();
+            for layer in 0..LAYERS {
+                let row = f.host.slot_row(layer).unwrap();
+                assert_eq!(row.len(), EXPERTS);
+                let mut slots = Vec::new();
+                for (expert, &slot) in row.iter().enumerate() {
+                    let ledger = f
+                        .host
+                        .table
+                        .lookup(layer, expert as u16)
+                        .map_or(-1, |(slot, _)| slot as i32);
+                    assert_eq!(slot, ledger, "token {token} layer {layer} expert {expert}");
+                    assert_eq!(slot >= 0, f.host.is_resident(layer, expert as u16));
+                    assert!((-1..SLOTS as i32).contains(&slot), "slot {slot}");
+                    if slot >= 0 {
+                        slots.push(slot);
+                    }
+                }
+                slots.sort_unstable();
+                slots.dedup();
+                let resident = row.iter().filter(|&&s| s >= 0).count();
+                assert_eq!(
+                    slots.len(),
+                    resident,
+                    "token {token} layer {layer}: slots are distinct"
+                );
+            }
+        }
     }
 
     #[test]

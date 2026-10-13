@@ -82,6 +82,8 @@ const CUDA_SOURCES: &[&str] = &[
     "src/kernels/cuda/native/resident/swiglu_q8.cu",
     "src/kernels/cuda/native/resident/kv8_append.cu",
     "src/kernels/cuda/native/resident/attn_decode_q8.cu",
+    "src/kernels/cuda/native/prefill/attn_prep_chunk.cu",
+    "src/kernels/cuda/native/prefill/attn_prefill.cu",
 ];
 
 /// The vendored llama.cpp MMQ sources that compile to objects (MATVEC-PAR S1 c2b). Decision 0049
@@ -100,6 +102,8 @@ const CUDA_HEADERS: &[&str] = &[
     "src/kernels/cuda/native/abi_device.h",
     "src/kernels/cuda/native/abi_resident.h",
     "src/kernels/cuda/native/device.h",
+    "src/kernels/cuda/native/prefill/attn_prep_chunk.h",
+    "src/kernels/cuda/native/prefill/attn_prefill.h",
     "src/kernels/cuda/native/prefill/ggml_shim/ggml-cuda.h",
     "src/kernels/cuda/native/prefill/ggml_shim/ggml-impl.h",
     "src/kernels/cuda/native/prefill/ggml_shim/ggml.h",

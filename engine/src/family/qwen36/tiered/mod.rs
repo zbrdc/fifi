@@ -9,6 +9,7 @@
 //! [`mapped_file`]. The tiered step (OFF-2 D5) uses it through `cuda/tiered_step.rs` and `cuda/tiered_load.rs`.
 
 pub mod budget;
+pub mod classify;
 pub mod cpu_pool;
 pub mod guess;
 pub mod host;

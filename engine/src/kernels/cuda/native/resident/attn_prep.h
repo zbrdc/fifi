@@ -71,6 +71,44 @@ _Static_assert(sizeof(inference_cuda_attn_prep_args) == 112 && offsetof(inferenc
 int inference_cuda_attn_prep_launch(const inference_cuda_attn_prep_args *args, void *stream,
                                     int *out_stage);
 
+/* KV8-B B1: the f32 rows entry of the same vendored kernel (the Int8G32 KV handoff). Every rule of
+ * inference_cuda_attn_prep_args holds, with k_rows/v_rows in place of the caches and cells (the
+ * Int8G32 plane cells per head) in place of rows: k_rows and v_rows are f32 [m][n_kv_head][256],
+ * 16-byte aligned, and token t goes to [t] of both, indexed by the token, not the position; the
+ * poison rule is the same with cells in place of rows; and m is 1..16, the decode bound of
+ * kv8_append (chunk prefill uses the CPF-ATTN-A chunk entry, CPF-7). */
+typedef struct inference_cuda_attn_prep_rows_args {
+    const void *proj;
+    const void *q_norm;
+    const void *k_norm;
+    void *k_rows;
+    void *v_rows;
+    void *q;
+    const void *pos;
+    void *status;
+    int ld;
+    int m;          /* tokens, 1..16 */
+    int n_head;     /* 1..256 */
+    int n_kv_head;  /* 1..64 */
+    int head_dim;   /* 256 */
+    int n_rot;      /* a power of two, 2..256 (RP1 domain, REPLY-53) */
+    int cells;      /* Int8G32 plane cells per head, m..2^30 - 1 */
+    int has_gate;   /* 1 */
+    int slot_mode;  /* INFERENCE_CUDA_SLOT_POSITION */
+    int slot_ring;  /* 0 */
+    float eps;      /* finite, > 0 */
+    float rope_base;/* finite, > 1 */
+} inference_cuda_attn_prep_rows_args;
+
+#ifdef __cplusplus
+static_assert(sizeof(inference_cuda_attn_prep_rows_args) == 112 && offsetof(inference_cuda_attn_prep_rows_args, k_rows) == 24 && offsetof(inference_cuda_attn_prep_rows_args, cells) == 88,
+              "inference_cuda_attn_prep_rows_args layout");
+#endif
+
+/* One launch of the f32 rows instance (grid n_head + 2 * n_kv_head by m, 256 threads). */
+int inference_cuda_attn_prep_rows_launch(const inference_cuda_attn_prep_rows_args *args,
+                                         void *stream, int *out_stage);
+
 #ifdef __cplusplus
 }
 #endif

@@ -20,6 +20,7 @@
 //! stack facts of the bank replaced by full-depth facts (the real stacks are not in VRAM); the
 //! bank stacks get their own checks in [`check_bank`].
 
+use super::super::run_report::HostSyncs;
 use super::{
     ExpertBufs, Launch, MoeBuffers, MoeDims, MoeLayerWeights, RouteBufs, StackFacts, WeightFacts,
     check_block, launch_op, moe_sequence, op_router, refuse,
@@ -299,13 +300,15 @@ fn add_cpu_partial(
 ///
 /// The caller keeps the block eager (it syncs with the host); a capture window refuses it. An
 /// error from the host or from a device call is returned as it is: the step then poisons the
-/// token, so nothing here undoes the launches already queued.
+/// token, so nothing here undoes the launches already queued. On success it returns the host
+/// waits it made: the route event wait, the two blocking plan writes, and the blocking write of
+/// the CPU partial when a pick was served on the CPU.
 pub(in crate::family::qwen36::cuda) fn run_moe_block_tiered(
     launch: &Launch<'_>,
     host: &mut dyn TieredLayerHost,
     layer: usize,
     block: &mut TieredBlock<'_, '_, '_>,
-) -> Result<(), EngError> {
+) -> Result<HostSyncs, EngError> {
     let (dims, weights) = (block.dims, block.weights);
     let slots = check_tiered(dims, weights, block.bufs)?;
     if block.scratch.hidden != dims.hidden || block.scratch.top_k != dims.top_k {
@@ -315,6 +318,10 @@ pub(in crate::family::qwen36::cuda) fn run_moe_block_tiered(
         )));
     }
     let route = route_to_host(launch, weights, block.bufs, block.scratch, dims)?;
+    let mut syncs = HostSyncs {
+        waits: 1,
+        writes: 0,
+    };
     let plan = host.begin_layer(layer, &route)?;
     check_plan(&plan, dims.top_k, slots)?;
     let scratch = &*block.scratch;
@@ -323,11 +330,13 @@ pub(in crate::family::qwen36::cuda) fn run_moe_block_tiered(
         0,
         &to_bytes(&plan.slot_ids, i32::to_le_bytes),
     )?;
+    syncs.writes += 1;
     scratch.slot_weights.write_at(
         launch.stream,
         0,
         &to_bytes(&plan.device_weights, f32::to_le_bytes),
     )?;
+    syncs.writes += 1;
     let tiered = tiered_bufs(block.bufs, scratch)?;
     for op in moe_sequence(dims.top_k, WeightLayout::Native)
         .into_iter()
@@ -337,8 +346,9 @@ pub(in crate::family::qwen36::cuda) fn run_moe_block_tiered(
     }
     if let Some(partial) = host.finish_layer(layer)? {
         add_cpu_partial(launch, block, &partial)?;
+        syncs.writes += 1;
     }
-    Ok(())
+    Ok(syncs)
 }
 
 #[cfg(test)]

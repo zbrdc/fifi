@@ -31,6 +31,7 @@
 )]
 
 use std::ffi::{c_int, c_void};
+use std::mem::{offset_of, size_of};
 use std::ptr::NonNull;
 
 use super::{
@@ -64,6 +65,13 @@ pub(in crate::kernels::cuda) mod swiglu_q8;
 #[derive(Debug)]
 #[must_use = "a stream must be passed to stream_destroy"]
 pub(in crate::kernels::cuda) struct RawStream(NonNull<c_void>);
+
+impl RawStream {
+    /// The raw handle, for the launch entries of the kernel child modules.
+    pub(in crate::kernels::cuda) fn as_ptr(&self) -> *mut c_void {
+        self.0.as_ptr()
+    }
+}
 
 /// A timing-free CUDA event. Consumed by [`event_destroy`].
 #[derive(Debug)]
@@ -103,8 +111,19 @@ impl<'a> RawRange<'a> {
 }
 
 impl RawRange<'_> {
+    /// The byte offset of the range inside its allocation. Read-only: `address` relies on
+    /// `RawRange::new`'s bound proof, so the fields stay private.
+    pub(in crate::kernels::cuda) fn offset(&self) -> usize {
+        self.offset
+    }
+
+    /// The length of the range in bytes.
+    pub(in crate::kernels::cuda) fn bytes(&self) -> usize {
+        self.bytes
+    }
+
     /// The device address of the first byte of the range.
-    fn address(&self) -> *mut c_void {
+    pub(in crate::kernels::cuda) fn address(&self) -> *mut c_void {
         // SAFETY: `RawRange::new` proved `offset + bytes <= device.bytes` with
         // `bytes > 0`, so the offset is inside the live allocation.
         unsafe {
@@ -500,14 +519,15 @@ pub(in crate::kernels::cuda) struct MatmulRaw<'a> {
 
 /// `len` bytes of one allocation from `start` on. The allocation is named by its
 /// handle: two live handles are two allocations, which never overlap.
-struct Span<'a> {
+pub(in crate::kernels::cuda) struct Span<'a> {
     device: &'a RawDevice,
     start: usize,
     len: usize,
 }
 
 impl<'a> Span<'a> {
-    fn of(range: &RawRange<'a>, len: usize) -> Self {
+    /// The span of the first `len` bytes of `range`.
+    pub(in crate::kernels::cuda) fn of(range: &RawRange<'a>, len: usize) -> Self {
         Self {
             device: range.device,
             start: range.offset,
@@ -517,7 +537,7 @@ impl<'a> Span<'a> {
 
     /// True when the two spans share no byte. Every span lies inside its
     /// allocation, so the sums cannot overflow; a saturated sum would only refuse.
-    fn apart(&self, other: &Self) -> bool {
+    pub(in crate::kernels::cuda) fn apart(&self, other: &Self) -> bool {
         !std::ptr::eq(self.device, other.device)
             || self.start.saturating_add(self.len) <= other.start
             || other.start.saturating_add(other.len) <= self.start
@@ -645,6 +665,163 @@ pub(in crate::kernels::cuda) fn matmul_launch(
             &mut stage,
         )
     };
+    checked(status, stage)
+}
+
+// ---- KV8-B B1: the f32 rows entry of attn_prep (the Int8G32 KV handoff) ----------------------
+//
+// Raw FFI to `inference_cuda_attn_prep_rows_launch` of `native/resident/attn_prep.cu` (declared in
+// `native/resident/attn_prep.h`): the same kernel's f32 rows instance, which indexes the k and v
+// rows by the token and bounds the pos word by the plane cell count. The safety invariants and the
+// proofs are the child `attn_prep`'s, mirrored here on the rows extents; the safe wrapper of
+// `kernels::cuda::resident::attn_prep` is its only caller.
+
+/// The head size of the rows entry (the vendored kernel's only one).
+const ROWS_HEAD_DIM: usize = 256;
+
+/// Mirror of `inference_cuda_attn_prep_rows_args` in `attn_prep.h`, field for field.
+#[repr(C)]
+struct AttnPrepRowsArgsRaw {
+    proj: *const c_void,
+    q_norm: *const c_void,
+    k_norm: *const c_void,
+    k_rows: *mut c_void,
+    v_rows: *mut c_void,
+    q: *mut c_void,
+    pos: *const c_void,
+    status: *mut c_void,
+    ld: c_int,
+    m: c_int,
+    n_head: c_int,
+    n_kv_head: c_int,
+    head_dim: c_int,
+    n_rot: c_int,
+    cells: c_int,
+    has_gate: c_int,
+    slot_mode: c_int,
+    slot_ring: c_int,
+    eps: f32,
+    rope_base: f32,
+}
+
+const _: () = assert!(
+    size_of::<AttnPrepRowsArgsRaw>() == 112
+        && offset_of!(AttnPrepRowsArgsRaw, k_rows) == 24
+        && offset_of!(AttnPrepRowsArgsRaw, cells) == 88
+);
+
+unsafe extern "C" {
+    #[link_name = "inference_cuda_attn_prep_rows_launch"]
+    fn attn_prep_rows_launch_raw(
+        args: *const AttnPrepRowsArgsRaw,
+        stream: *mut c_void,
+        out_stage: *mut c_int,
+    ) -> c_int;
+}
+
+/// What one rows attention preparation reads and writes; `ints.rows` is the plane cell count.
+pub(in crate::kernels::cuda) struct AttnPrepRowsRaw<'a> {
+    pub(in crate::kernels::cuda) proj: RawRange<'a>,
+    pub(in crate::kernels::cuda) q_norm: RawRange<'a>,
+    pub(in crate::kernels::cuda) k_norm: RawRange<'a>,
+    pub(in crate::kernels::cuda) k_rows: RawRange<'a>,
+    pub(in crate::kernels::cuda) v_rows: RawRange<'a>,
+    pub(in crate::kernels::cuda) q: RawRange<'a>,
+    pub(in crate::kernels::cuda) pos: RawRange<'a>,
+    pub(in crate::kernels::cuda) status: RawRange<'a>,
+    pub(in crate::kernels::cuda) ints: attn_prep::AttnInts,
+    pub(in crate::kernels::cuda) eps: f32,
+    pub(in crate::kernels::cuda) rope_base: f32,
+}
+
+/// Proves a rows launch before the native call: sizes and alignment of the eight ranges (`q` and
+/// both rows buffers 16, the rest 4) and that the written extents (`q`, both rows buffers,
+/// `status`) share no byte with each other or with the reads. `cells` sizes nothing: the rows
+/// buffers hold `m` rows, not `cells`.
+fn check_attn_prep_rows(io: &AttnPrepRowsRaw<'_>) -> Result<(), DeviceFailure> {
+    let cvt = |n: c_int| usize::try_from(n).map_err(|_| invalid_argument());
+    let (m, ld) = (cvt(io.ints.m)?, cvt(io.ints.ld)?);
+    let (heads, kv) = (cvt(io.ints.n_head)?, cvt(io.ints.n_kv_head)?);
+    let mul = |a: usize, b: usize| a.checked_mul(b).ok_or_else(invalid_argument);
+    let row_w = mul(heads * 2 + kv * 2, ROWS_HEAD_DIM)?;
+    let proj = mul(
+        m.saturating_sub(1).saturating_mul(ld).saturating_add(row_w),
+        4,
+    )?;
+    let norm = ROWS_HEAD_DIM * 4;
+    let q = mul(mul(mul(m, heads)?, ROWS_HEAD_DIM)?, 4)?;
+    let rows = mul(mul(mul(m, kv)?, ROWS_HEAD_DIM)?, 4)?;
+    let fits = |range: &RawRange<'_>, bytes: usize, align: usize| {
+        range.bytes >= bytes && range.offset.is_multiple_of(align)
+    };
+    if !(fits(&io.proj, proj, 4)
+        && fits(&io.q_norm, norm, 4)
+        && fits(&io.k_norm, norm, 4)
+        && fits(&io.q, q, 16)
+        && fits(&io.k_rows, rows, 16)
+        && fits(&io.v_rows, rows, 16)
+        && fits(&io.pos, 4, 4)
+        && fits(&io.status, 4, 4))
+    {
+        return Err(invalid_argument());
+    }
+    let written = [
+        Span::of(&io.q, q),
+        Span::of(&io.k_rows, rows),
+        Span::of(&io.v_rows, rows),
+        Span::of(&io.status, 4),
+    ];
+    let read = [
+        Span::of(&io.proj, proj),
+        Span::of(&io.q_norm, norm),
+        Span::of(&io.k_norm, norm),
+        Span::of(&io.pos, 4),
+    ];
+    for (i, a) in written.iter().enumerate() {
+        if !(written[i + 1..].iter().all(|b| a.apart(b)) && read.iter().all(|b| a.apart(b))) {
+            return Err(invalid_argument());
+        }
+    }
+    Ok(())
+}
+
+/// Queues the f32 rows attention preparation kernel on `stream`: per-head RMSNorm of q and k,
+/// rope at the device position, the `q` output and the k/v f32 rows at `[t]`. Returns when queued.
+pub(in crate::kernels::cuda) fn attn_prep_rows_launch(
+    stream: &RawStream,
+    call: AttnPrepRowsRaw<'_>,
+) -> Result<(), DeviceFailure> {
+    check_attn_prep_rows(&call)?;
+    let ints = call.ints;
+    let args = AttnPrepRowsArgsRaw {
+        proj: call.proj.address().cast_const(),
+        q_norm: call.q_norm.address().cast_const(),
+        k_norm: call.k_norm.address().cast_const(),
+        k_rows: call.k_rows.address(),
+        v_rows: call.v_rows.address(),
+        q: call.q.address(),
+        pos: call.pos.address().cast_const(),
+        status: call.status.address(),
+        ld: ints.ld,
+        m: ints.m,
+        n_head: ints.n_head,
+        n_kv_head: ints.n_kv_head,
+        head_dim: 256,
+        n_rot: ints.n_rot,
+        cells: ints.rows,
+        has_gate: 1,
+        slot_mode: 0, // INFERENCE_CUDA_SLOT_POSITION
+        slot_ring: 0,
+        eps: call.eps,
+        rope_base: call.rope_base,
+    };
+    let mut stage = STAGE_NONE;
+    // SAFETY: as the child `attn_prep`: `check_attn_prep_rows` proved every range inside its live
+    // allocation, large enough, aligned and disjoint on the touched extents, and the allocations
+    // outlive the queued work; `stream` is live for the call, `args` is a local the entry keeps no
+    // pointer to, and the dispatch guard is held by `launch_on`, the only caller.
+    let status =
+        unsafe { attn_prep_rows_launch_raw(&raw const args, stream.0.as_ptr(), &mut stage) };
     checked(status, stage)
 }
 
@@ -1044,7 +1221,7 @@ mod tests {
     /// A named edit of a valid argument set.
     type Case<T> = (&'static str, fn(&mut T));
 
-    fn pointer<T>(address: usize) -> *mut T {
+    const fn pointer<T>(address: usize) -> *mut T {
         std::ptr::without_provenance_mut(address)
     }
 
@@ -1163,5 +1340,71 @@ mod tests {
             edit(&mut args);
             assert_eq!(run_matmul(args), refused, "matmul: {name}");
         }
+        let rows: [Case<AttnPrepRowsArgsRaw>; 7] = [
+            ("NULL k_rows", |a| a.k_rows = pointer(0)),
+            ("NULL v_rows", |a| a.v_rows = pointer(0)),
+            ("k_rows not 16-byte aligned", |a| {
+                a.k_rows = pointer(0x2_0008)
+            }),
+            ("v_rows not 16-byte aligned", |a| {
+                a.v_rows = pointer(0x3_0008)
+            }),
+            ("no tokens", |a| a.m = 0),
+            ("m 17 (kv8_append's decode bound)", |a| a.m = 17),
+            ("cells below m", |a| a.cells = 0),
+        ];
+        for (name, edit) in rows {
+            assert_eq!(run_rows(edit), refused, "rows: {name}");
+        }
+        // The null argument itself: the entry tests its pointer before any field (the B1F fix),
+        // so a NULL args must be refused, not dereferenced.
+        let mut stage = STAGE_NONE;
+        // SAFETY: the entry refuses a NULL args pointer before it uses any pointer, as the
+        // cases above pin for every argument the entry accepts; `stage` is a live, writable
+        // c_int.
+        let status = unsafe {
+            attn_prep_rows_launch_raw(
+                pointer::<AttnPrepRowsArgsRaw>(0).cast_const(),
+                pointer(0x1),
+                &mut stage,
+            )
+        };
+        assert_eq!((status, stage), refused, "rows: NULL args");
+    }
+
+    /// A rows call that would launch (see `PACK_ARGS`): the addresses are made up, and every case
+    /// below changes one thing so the entry refuses before it uses any pointer.
+    const ROWS_BASE: AttnPrepRowsArgsRaw = AttnPrepRowsArgsRaw {
+        proj: pointer::<c_void>(0x1_0000).cast_const(),
+        q_norm: pointer::<c_void>(0x1_0010).cast_const(),
+        k_norm: pointer::<c_void>(0x1_0020).cast_const(),
+        k_rows: pointer(0x2_0000),
+        v_rows: pointer(0x3_0000),
+        q: pointer(0x4_0000),
+        pos: pointer::<c_void>(0x5_0000).cast_const(),
+        status: pointer(0x5_0010),
+        ld: 9216,
+        m: 1,
+        n_head: 16,
+        n_kv_head: 2,
+        head_dim: 256,
+        n_rot: 64,
+        cells: 4096,
+        has_gate: 1,
+        slot_mode: 0,
+        slot_ring: 0,
+        eps: 1e-6,
+        rope_base: 1e7,
+    };
+
+    /// `(status, stage)` of the rows entry after `edit` of the base arguments.
+    fn run_rows(edit: fn(&mut AttnPrepRowsArgsRaw)) -> (c_int, c_int) {
+        let mut a = ROWS_BASE;
+        edit(&mut a);
+        let mut stage = STAGE_NONE;
+        // SAFETY: only called with arguments the entry refuses before it uses any
+        // pointer (see `ROWS_BASE`); `stage` is a live, writable c_int.
+        let status = unsafe { attn_prep_rows_launch_raw(&a, pointer(0x1), &mut stage) };
+        (status, stage)
     }
 }

@@ -304,7 +304,7 @@ fn the_argmax_arm_passes_the_sampler_width_not_the_head_rows() {
 
 #[test]
 fn run_token_decides_against_the_sampler_width() {
-    let body = pinned_text(fn_section("fn run_token"));
+    let body = pinned_text(fn_section("fn run_token_inner"));
     let length = body.len();
     assert!(
         body.contains("decide(pair, self.widths.verdict)"),
@@ -340,7 +340,7 @@ fn run_token_hands_the_decision_status_to_commit_step() {
     // must take that SAME binding, not a literal clean status and not a fresh read of the
     // pair: with a literal 0 a flagged row would commit as clean and return its filler
     // token 0 (mutant m8).
-    let body = pinned_text(fn_section("fn run_token"));
+    let body = pinned_text(fn_section("fn run_token_inner"));
     let length = body.len();
     let arm = body
         .find("Decision::Commit { token, status }")
@@ -377,7 +377,7 @@ fn run_token_refuses_a_bad_id_without_poisoning_or_cancelling() {
     // The refusal of c18 leaves the state idle: between the id check and the start-block
     // write there must be no poison, cancel or failure handling, or a refused host id would
     // poison or take back a session whose device saw nothing (mutant m9).
-    let body = pinned_text(fn_section("fn run_token"));
+    let body = pinned_text(fn_section("fn run_token_inner"));
     let length = body.len();
     let check = body
         .find("check_token_id(token, self.widths.verdict)?")
@@ -410,7 +410,7 @@ fn run_token_checks_the_token_id_before_the_start_block() {
     // The wiring of c18: the host refuses a token outside the sampler vocabulary before the
     // start block, or a padding id would be written to the device before the refusal and the
     // state would be poisoned by its own write.
-    let body = pinned_text(fn_section("fn run_token"));
+    let body = pinned_text(fn_section("fn run_token_inner"));
     let length = body.len();
     let check = body
         .find("check_token_id(token, self.widths.verdict)?")

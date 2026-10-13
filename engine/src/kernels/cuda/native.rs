@@ -13,6 +13,7 @@ use std::ffi::{CStr, c_char, c_int, c_void};
 use std::ptr::NonNull;
 
 pub(super) mod device_info;
+pub(super) mod prefill;
 pub(super) mod resident;
 
 /// Matches `INFERENCE_CUDA_OK` in `native/abi.h`.

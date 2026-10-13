@@ -19,7 +19,7 @@
 //! Design guidance only, no code copied; the single host wait per token follows the idea of
 //! MegaCapybara C1 (the MegaCapybara static-RE lessons), without its ring.
 
-use super::run_report::{CaptureOutcome, RunReport};
+use super::run_report::{CaptureOutcome, HostSyncs, RunReport};
 use crate::EngError;
 
 /// The environment variable that makes the eager step synchronize after every launch.
@@ -105,6 +105,16 @@ impl ReadbackPlan {
             .position(|step| matches!(step, ReadStep::ReadLogits | ReadStep::ReadPair));
         u32::from(first_read.is_some())
     }
+}
+
+/// The report of a tiered token: `report` of the plain path, plus the host waits of the layers and
+/// of the bank fills. Every one of them blocks the host, so each counts as a sync, and each
+/// blocking write also counts as a host write. WHY: the plain report says one wait per token, and
+/// the tiered step makes about four per layer.
+pub(super) fn with_host_syncs(mut report: RunReport, extra: HostSyncs) -> RunReport {
+    report.syncs += extra.waits + extra.writes;
+    report.host_writes += extra.writes;
+    report
 }
 
 /// The report of a token that ran eagerly (RD-9d runs nothing else).

@@ -43,14 +43,14 @@ use super::{
     },
     readback::{
         ReadbackPlan, SYNC_EACH_VAR, captured_report, check_mode, eager_report, parse_sync_each,
-        refused_report,
+        refused_report, with_host_syncs,
     },
     resources::{
         EmbedWeight, GlobalSpecs, GlobalWeights, HeadWeight, MoeSpecs, STEP_ROWS, StepResources,
         f32_bytes, moe_dims, moe_layer_parts, moe_layer_weights,
     },
     rules::{QwenRules, StepWidths, check_token_id, validate_step_inputs},
-    run_report::{CaptureOutcome, RunReport},
+    run_report::{CaptureOutcome, HostSyncs, RunReport},
     state::{ResidentState, StepField, export::ExportedState},
     state_layout::Word,
     step_ops::{StepOp, final_resid, resid_in, resid_out, token_ops},
@@ -483,6 +483,32 @@ impl<'a> QwenResidentStep<'a> {
     /// when `want_logits` was true. A `token` outside the sampler vocabulary (a padding row of
     /// the padded head) is refused before any device write, so the state stays idle.
     pub(crate) fn run_token(&mut self, token: u32, want_logits: bool) -> Result<u32, EngError> {
+        let ran = self.run_token_inner(token, want_logits);
+        if ran.is_err() {
+            self.abort_tiered_token();
+        }
+        ran
+    }
+
+    /// Drops what a failed token left in the tiered host (a layer that never reached its
+    /// `finish_layer` would refuse every later token). A plain step has no runtime: nothing to do.
+    fn abort_tiered_token(&self) {
+        if let Some(runtime) = self.tiered.as_ref() {
+            runtime.borrow_mut().abort_token();
+        }
+    }
+
+    /// The host waits the tiered runtime made in the token that just ended (none on a plain step).
+    fn take_tiered_syncs(&self) -> HostSyncs {
+        self.tiered
+            .as_ref()
+            .map_or_else(HostSyncs::default, |runtime| {
+                runtime.borrow_mut().take_syncs()
+            })
+    }
+
+    /// The token of [`Self::run_token`], whose failure the caller cleans up after.
+    fn run_token_inner(&mut self, token: u32, want_logits: bool) -> Result<u32, EngError> {
         check_token_id(token, self.widths.verdict)?;
         if self.tiered_mode && self.tiered.is_none() {
             return Err(EngError::BadRequest(
@@ -535,11 +561,12 @@ impl<'a> QwenResidentStep<'a> {
         if self.tiered_mode {
             self.end_tiered_token()?;
         }
-        self.report = match reported_outcome(how, self.refused) {
+        let report = match reported_outcome(how, self.refused) {
             CaptureOutcome::Eager => eager_report(&plan),
             CaptureOutcome::Captured => captured_report(&plan),
             CaptureOutcome::RefusedFellBackToEager => refused_report(&plan),
         };
+        self.report = with_host_syncs(report, self.take_tiered_syncs());
         Ok(token)
     }
 

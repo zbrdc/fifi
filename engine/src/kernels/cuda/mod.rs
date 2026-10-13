@@ -56,6 +56,7 @@ mod fault;
 mod guard;
 mod native;
 pub(crate) mod plan;
+pub(crate) mod prefill;
 pub(crate) mod resident;
 #[cfg(test)]
 mod testkit;

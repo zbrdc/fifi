@@ -2,9 +2,9 @@
 use super::{
     readback::{
         ReadStep, ReadbackPlan, captured_report, check_mode, eager_report, parse_sync_each,
-        refused_report,
+        refused_report, with_host_syncs,
     },
-    run_report::CaptureOutcome,
+    run_report::{CaptureOutcome, HostSyncs},
 };
 
 /// The Qwen3.6 head width. The test pins the byte count; the code derives it from the shape.
@@ -97,4 +97,40 @@ fn refused_report_sets_the_fallback_outcome() {
         );
         assert_eq!((report.syncs, report.host_writes), (1, 1), "{want_logits}");
     }
+}
+
+#[test]
+fn a_tiered_report_counts_every_layer_wait_and_blocking_write_as_a_sync() {
+    // 40 layers, each with the route event wait, the two plan writes and the CPU partial write,
+    // and 2 bank fills of 3 writes at the token boundary, on top of the read-back wait and the
+    // start-block write of the plain report.
+    let plain = eager_report(&ReadbackPlan::new(VOCAB, false).expect("plan"));
+    assert_eq!((plain.syncs, plain.host_writes), (1, 1));
+    let mut extra = HostSyncs::default();
+    for _ in 0..40 {
+        extra.add(HostSyncs {
+            waits: 1,
+            writes: 3,
+        });
+    }
+    extra.add(HostSyncs {
+        waits: 0,
+        writes: 6,
+    });
+    assert_eq!(
+        extra,
+        HostSyncs {
+            waits: 40,
+            writes: 126
+        }
+    );
+    let tiered = with_host_syncs(plain, extra);
+    assert_eq!(tiered.syncs, 1 + 40 + 126);
+    assert_eq!(tiered.host_writes, 1 + 126);
+    assert_eq!(tiered.capture, plain.capture, "the outcome is not touched");
+    assert_eq!(
+        with_host_syncs(plain, HostSyncs::default()),
+        plain,
+        "a plain step adds nothing"
+    );
 }

@@ -94,6 +94,9 @@ impl ExpertBankGeometry {
 }
 
 impl ExpertBank {
+    /// The blocking writes of one [`Self::fill`] (gate, up, down): the run report counts them.
+    pub(crate) const FILL_WRITES: u32 = 3;
+
     /// Device bytes of a bank of `slots` slots: three stacks. A pure checked function, so
     /// admission can size a bank before allocating it.
     pub(crate) fn bytes_for(geometry: ExpertBankGeometry, slots: usize) -> Result<u64, EngError> {
@@ -173,8 +176,8 @@ impl ExpertBank {
         self.geometry.slice_bytes()
     }
 
-    /// Copies one expert into `slot` with three blocking writes behind the work queued on
-    /// `stream`. Refuses before any copy for a slot out of range or a slice of the wrong
+    /// Copies one expert into `slot` with [`Self::FILL_WRITES`] blocking writes behind the work
+    /// queued on `stream`. Refuses before any copy for a slot out of range or a slice of the wrong
     /// length. An error from a write itself can leave the slot half written: the caller treats
     /// it as a failed fill and never publishes the slot.
     pub(crate) fn fill(
@@ -225,6 +228,28 @@ mod tests {
         top_k: 8,
     };
     const SLICE: usize = 512 * 8 * 144; // 589,824 bytes: gate, up and down are all this size
+
+    /// The run report counts `FILL_WRITES` blocking writes per fill; the constant must be what
+    /// `fill` really makes, so a fourth copy (or a dropped one) fails here without a device. The
+    /// count is textual: it skips whole-line comments and does not see block comments, trailing
+    /// comments or the `DeviceBuffer::write_at(&buffer, ...)` call form.
+    #[test]
+    fn fill_writes_counts_the_write_at_calls_of_fill() {
+        let source = include_str!("expert_bank.rs");
+        let start = source
+            .find("pub(crate) fn fill(")
+            .expect("expert_bank.rs defines fill");
+        let body = &source[start..];
+        let end = body
+            .find("\n    }\n")
+            .expect("fill ends at its closing brace");
+        let code: String = body[..end]
+            .lines()
+            .filter(|line| !line.trim_start().starts_with("//"))
+            .collect();
+        let writes = code.matches(".write_at(").count();
+        assert_eq!(writes, ExpertBank::FILL_WRITES as usize, "{code}");
+    }
 
     #[test]
     fn bank_sizes_follow_the_geometry() {

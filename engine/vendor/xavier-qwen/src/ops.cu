@@ -153,6 +153,10 @@ __global__ void __launch_bounds__(kStateDim) gated_delta_k(DeltaArgs a) {
 
 // Block (head, token), thread per dim: RMSNorm, NEOX rope over the first n_rot
 // dims. Heads are the n_head queries, then n_kv_head keys, then values.
+// kRows (KV8-B B1) is the f32 rows instance: the same math stores k (after norm and rope) and v
+// at [t][n_kv_head][256] of k_rows/v_rows, indexed by the token t instead of the position, and
+// writes no cache byte. The kRows = false instance is the original kernel unchanged.
+template <bool kRows>
 __global__ void attn_prep_k(AttnArgs a) {
   constexpr int D = kHeadDim;
   __shared__ float x[D];
@@ -176,7 +180,10 @@ __global__ void attn_prep_k(AttnArgs a) {
   if (head >= a.n_head + a.n_kv_head) {
     int vh = head - a.n_head - a.n_kv_head;
     float v = p[kv_base + (a.n_kv_head + vh) * D + d];
-    a.v_cache[((size_t)pos * a.n_kv_head + vh) * D + d] = __float2half(v);
+    if (kRows)
+      a.v_rows[((size_t)t * a.n_kv_head + vh) * D + d] = v;
+    else
+      a.v_cache[((size_t)pos * a.n_kv_head + vh) * D + d] = __float2half(v);
     return;
   }
   bool is_q = head < a.n_head;
@@ -194,6 +201,8 @@ __global__ void attn_prep_k(AttnArgs a) {
   }
   if (is_q)
     a.q[((size_t)t * a.n_head + head) * D + d] = out;
+  else if (kRows)
+    a.k_rows[((size_t)t * a.n_kv_head + head - a.n_head) * D + d] = out;
   else
     a.k_cache[((size_t)pos * a.n_kv_head + head - a.n_head) * D + d] = __float2half(out);
 }
@@ -228,8 +237,14 @@ cudaError_t gated_delta(const DeltaArgs& a, cudaStream_t stream) {
 }
 
 // The attn_prep_k launch of upstream attention() (2f9183c kernels.cu:845) as an entry of its own.
+// A non-null k_rows (with v_rows, KV8-B B1) selects the f32 rows instance; the branch is on the
+// host, so each instance is compiled as the kernel it is.
 cudaError_t attn_prep(const AttnArgs& a, cudaStream_t stream) {
-  attn_prep_k<<<dim3(a.n_head + 2 * a.n_kv_head, a.m), kHeadDim, 0, stream>>>(a);
+  dim3 grid(a.n_head + 2 * a.n_kv_head, a.m);
+  if (a.k_rows)
+    attn_prep_k<true><<<grid, kHeadDim, 0, stream>>>(a);
+  else
+    attn_prep_k<false><<<grid, kHeadDim, 0, stream>>>(a);
   return cudaGetLastError();
 }
 

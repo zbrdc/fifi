@@ -40,12 +40,33 @@ impl CaptureOutcome {
     }
 }
 
+/// The host waits the tiered mode adds to a token: each one blocks the host until the stream has
+/// reached it (an event wait, or a blocking host-to-device write, which returns when the copy
+/// finished behind the queued work). A plain step adds none.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(super) struct HostSyncs {
+    /// Event waits.
+    pub(super) waits: u32,
+    /// Blocking host-to-device writes.
+    pub(super) writes: u32,
+}
+
+impl HostSyncs {
+    /// Adds the counts of `other` into `self`.
+    pub(super) fn add(&mut self, other: HostSyncs) {
+        self.waits += other.waits;
+        self.writes += other.writes;
+    }
+}
+
 /// The report of the last run of the step.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub(crate) struct RunReport {
     /// How the body ran.
     pub(crate) capture: CaptureOutcome,
-    /// Host waits for the run to finish, per token (the "syncs per token" of RD-10b).
+    /// Host waits for the run to finish, per token (the "syncs per token" of RD-10b). A plain step
+    /// makes one. A tiered token adds the waits of every layer's block and of its bank fills (see
+    /// [`HostSyncs`]), each blocking write counted as a sync too.
     pub(crate) syncs: u32,
     /// Blocking host-to-device copies before the launches (the start block of the step).
     pub(crate) host_writes: u32,
