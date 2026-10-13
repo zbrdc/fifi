@@ -175,6 +175,13 @@ pub struct DotBackend(Backend);
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Backend {
     Scalar,
+    #[cfg_attr(
+        not(target_arch = "x86_64"),
+        allow(
+            dead_code,
+            reason = "only `detect()` on x86_64 builds it; the other targets keep the match arms"
+        )
+    )]
     Avx2,
 }
 
