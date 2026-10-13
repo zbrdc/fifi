@@ -10,6 +10,14 @@ mod layout;
 
 #[cfg(all(feature = "native-mlx", target_os = "macos", target_arch = "aarch64"))]
 mod attn;
+/// The decode-phase timing diagnostic of the served Q36 decode path. The module is `cfg(test)`
+/// like the tests around it so its PURE parts (the `DT_DEPTHS` list parser with the default
+/// depth list, the nearest-rank percentile, the host argmax, the ids-source parse, the
+/// ids-file parse, and the required-activation parse) run their unit tests on Linux too; the
+/// ignored Mac-only real-checkpoint test inside carries `tool_forward`'s own native cfg, so
+/// it compiles exactly where the loader helpers it reuses do.
+#[cfg(test)]
+mod decode_timing;
 #[cfg(all(feature = "native-mlx", target_os = "macos", target_arch = "aarch64"))]
 mod decoder;
 #[cfg(all(feature = "native-mlx", target_os = "macos", target_arch = "aarch64"))]
@@ -54,6 +62,13 @@ mod scale_knob;
 mod state;
 #[cfg(all(feature = "native-mlx", target_os = "macos", target_arch = "aarch64"))]
 mod step;
+#[cfg(all(
+    test,
+    feature = "native-mlx",
+    target_os = "macos",
+    target_arch = "aarch64"
+))]
+mod tool_forward;
 #[cfg(all(feature = "native-mlx", target_os = "macos", target_arch = "aarch64"))]
 mod weights;
 
@@ -67,7 +82,7 @@ mod weights;
 /// unit test next to it.
 #[cfg(test)]
 mod within_mode {
-    use super::super::settings::Activation;
+    use super::super::settings::{Activation, NO_BUDGET_PIECE};
     use crate::family::route::keeps_floored_anchor;
 
     /// The cosine gate of every parity run (decision 0046 item 4): 0.99999.
@@ -167,6 +182,153 @@ mod within_mode {
             .unwrap_or(default)
     }
 
+    /// One configuration of the multi-prompt format-token eval (packet BF16-EVAL), the entry of
+    /// the `Q36_BANK_CONFIGS` comma list of the `bank_format_token_by_config` run: `steps` runs
+    /// the prompt token by token, `chunkN` runs the serving prefill with the chunk N that the
+    /// planner admits, and `tailT` runs the first N - T ids in the serving chunk plus the last
+    /// T ids as one piece (a tail at least as long as the prompt is skipped and recorded as
+    /// null). Portable so its parsing has a Linux unit test next to it.
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    pub(super) enum BankConfig {
+        /// Token by token: no chunked prefill.
+        Steps,
+        /// The serving prefill with the chunk size N.
+        Chunk(u32),
+        /// The serving chunk with the last T ids fed as one short piece.
+        Tail(u32),
+    }
+
+    /// Parses one `Q36_BANK_CONFIGS` entry: `steps`, `chunkN`, or `tailN` with N at least 1.
+    /// Any other word is an error that names the variable and the accepted forms.
+    pub(super) fn parse_bank_config(text: &str) -> Result<BankConfig, String> {
+        let unknown =
+            || format!("Q36_BANK_CONFIGS: unknown config {text:?} (steps, chunkN, or tailN)");
+        if text == "steps" {
+            return Ok(BankConfig::Steps);
+        }
+        let (prefix, digits) = text.split_at(
+            text.find(|c: char| c.is_ascii_digit())
+                .unwrap_or(text.len()),
+        );
+        let size = || -> Result<u32, String> {
+            if prefix == "chunk" || prefix == "tail" {
+                digits
+                    .parse::<u32>()
+                    .map_err(|_| unknown())
+                    .and_then(|n| if n >= 1 { Ok(n) } else { Err(unknown()) })
+            } else {
+                Err(unknown())
+            }
+        };
+        match prefix {
+            "chunk" => size().map(BankConfig::Chunk),
+            "tail" => size().map(BankConfig::Tail),
+            _ => Err(unknown()),
+        }
+    }
+
+    /// Parses the `Q36_BANK_CONFIGS` comma list. An empty list, an empty entry, or a duplicate
+    /// is an error (a duplicate would overwrite its own result row).
+    pub(super) fn parse_bank_configs(text: &str) -> Result<Vec<BankConfig>, String> {
+        if text.trim().is_empty() {
+            return Err("Q36_BANK_CONFIGS must name at least one config".to_string());
+        }
+        let mut configs = Vec::new();
+        for part in text.split(',') {
+            let config = parse_bank_config(part.trim())?;
+            if configs.contains(&config) {
+                return Err(format!(
+                    "Q36_BANK_CONFIGS: {} appears twice",
+                    bank_config_name(&config)
+                ));
+            }
+            configs.push(config);
+        }
+        Ok(configs)
+    }
+
+    /// The default config list of the eval run (packet BF16-EVAL).
+    pub(super) fn default_bank_configs() -> Vec<BankConfig> {
+        parse_bank_configs(
+            "steps,chunk256,chunk64,tail8,tail20,tail40,tail60,tail100,tail150,tail300",
+        )
+        .unwrap_or_else(|error| panic!("the default bank config list is broken: {error}"))
+    }
+
+    /// The name of a config as the report row key: `steps`, `chunkN`, `tailT`.
+    pub(super) fn bank_config_name(config: &BankConfig) -> String {
+        match config {
+            BankConfig::Steps => "steps".to_string(),
+            BankConfig::Chunk(n) => format!("chunk{n}"),
+            BankConfig::Tail(t) => format!("tail{t}"),
+        }
+    }
+
+    /// `n` in pieces of at most `width` rows (at least 1): the piece list a chunked run feeds.
+    fn chunk_lengths(n: usize, width: usize) -> Vec<usize> {
+        let width = width.max(1);
+        let mut pieces = vec![width; n / width];
+        if let Some(rest) = n.checked_rem(width).filter(|&rest| rest > 0) {
+            pieces.push(rest);
+        }
+        pieces
+    }
+
+    /// The row counts one run feeds to the decoder, in order, INCLUDING the final one-token
+    /// logits step of the pending token, so the counts always sum to `prompt_len`. This is the
+    /// one authority for what `chunkN` and `tailT` feed — every report row, every bank row, and
+    /// every fed-rows assert of the harnesses prints or checks its output, so the definition
+    /// and the runs cannot drift:
+    ///
+    /// - the pieces: `Steps` chunks the prompt at the fallback piece 16 (`NO_BUDGET_PIECE`),
+    ///   `Chunk` at the chunk the plan admitted for the request, and `Tail` chunks the first
+    ///   `prompt_len - t` ids the same way and appends the last `t` ids as ONE piece;
+    /// - the pending-token shift: `DecodeSession::prefill` holds the last id of every piece
+    ///   pending and feeds it with the next piece, so the first piece feeds `len - 1` rows,
+    ///   every later piece feeds `len` rows, and a one-id first piece feeds nothing (its id
+    ///   stays pending); the boundaries therefore sit one token earlier than a reference that
+    ///   chunks the first `prompt_len - 1` ids in N-sized pieces;
+    /// - the chunk split: `ServeStep::feed_rows` splits every fed run into runs of at most
+    ///   `chunk` rows (`None` or 1 is token by token), so a tail longer than the chunk is NOT
+    ///   one call — `tail300` at chunk 256 feeds 256 and then 44 rows;
+    /// - the final one-token logits step of the last pending id is the last entry.
+    ///
+    /// `chunk` is the chunk the run feeds with: `None` for `Steps` and for a `Chunk` request
+    /// the plan cannot admit (the token-by-token fallback), the admitted chunk for `Chunk`, and
+    /// the serving chunk for `Tail`. Portable so the piece construction has a Linux unit test
+    /// next to it.
+    pub(super) fn run_pieces(
+        prompt_len: usize,
+        config: BankConfig,
+        chunk: Option<usize>,
+    ) -> Vec<usize> {
+        let fallback = usize::try_from(NO_BUDGET_PIECE).unwrap_or(1);
+        let pieces = match config {
+            BankConfig::Steps => chunk_lengths(prompt_len, fallback),
+            BankConfig::Chunk(_) => chunk_lengths(prompt_len, chunk.unwrap_or(fallback)),
+            BankConfig::Tail(t) => {
+                let tail = t as usize;
+                assert!(tail < prompt_len, "run_pieces: a tail needs t < prompt_len");
+                let mut pieces = chunk_lengths(prompt_len - tail, chunk.unwrap_or(fallback));
+                pieces.push(tail);
+                pieces
+            }
+        };
+        let mut fed = Vec::new();
+        for (index, &len) in pieces.iter().enumerate() {
+            let run = if index == 0 { len - 1 } else { len };
+            if run == 0 {
+                continue; // a one-id first piece: its id stays pending
+            }
+            match chunk.filter(|&width| width > 1) {
+                None => fed.extend(vec![1; run]),
+                Some(width) => fed.extend(chunk_lengths(run, width)),
+            }
+        }
+        fed.push(1); // the final logits step feeds the last pending id
+        fed
+    }
+
     /// Writes `values` to `path` as little-endian f32 bytes, the dump format that the `f32s`
     /// reader of `parity` reads back. Gated like its only caller (`prefill/parity.rs`) and its
     /// reader, so a Linux test build sees no unused definition.
@@ -221,6 +383,65 @@ mod within_mode {
 
     mod tests {
         use super::*;
+
+        /// The comma list of `Q36_BANK_CONFIGS` parses every form (packet BF16-EVAL): `steps` is
+        /// token by token, `chunkN` names the serving chunk N, `tailT` the serving chunk with the
+        /// last T ids as one piece. The default list is the eval run's, its names round-trip, and
+        /// every malformed form is rejected with the variable named: an unknown word, a size of
+        /// zero, a bare prefix, a negative number, an empty token, an empty list, and a duplicate
+        /// (a duplicate would overwrite its own result row).
+        #[test]
+        fn bank_configs_parse_the_accepted_forms_and_reject_the_rest() {
+            assert_eq!(
+                default_bank_configs()
+                    .iter()
+                    .map(bank_config_name)
+                    .collect::<Vec<_>>(),
+                [
+                    "steps", "chunk256", "chunk64", "tail8", "tail20", "tail40", "tail60",
+                    "tail100", "tail150", "tail300",
+                ]
+            );
+            assert_eq!(parse_bank_config("steps"), Ok(BankConfig::Steps));
+            assert_eq!(parse_bank_config("chunk64"), Ok(BankConfig::Chunk(64)));
+            assert_eq!(parse_bank_config("tail300"), Ok(BankConfig::Tail(300)));
+            assert_eq!(
+                parse_bank_configs("steps,chunk256,chunk64,tail8"),
+                Ok(vec![
+                    BankConfig::Steps,
+                    BankConfig::Chunk(256),
+                    BankConfig::Chunk(64),
+                    BankConfig::Tail(8),
+                ])
+            );
+            assert_eq!(
+                parse_bank_configs(" steps , tail20 "),
+                Ok(vec![BankConfig::Steps, BankConfig::Tail(20)])
+            );
+            for bad in [
+                "",
+                "step",
+                "chunks",
+                "chunk0",
+                "tail0",
+                "chunk",
+                "tail",
+                "chunk-8",
+                "chunk1.5",
+                "steps,",
+                ",steps",
+                "steps,steps",
+            ] {
+                assert!(
+                    parse_bank_configs(bad).is_err(),
+                    "{bad:?} must not parse as a bank config list"
+                );
+            }
+            assert_eq!(
+                parse_bank_configs("step").unwrap_err(),
+                "Q36_BANK_CONFIGS: unknown config \"step\" (steps, chunkN, or tailN)"
+            );
+        }
 
         /// The F32 branch of the gate asserts both cosine and relative error; a BF16 LAYER row needs
         /// a finite cosine only (fix4 and fix5 of packet Q36-BF16-b): the slice b gate measured a
@@ -392,6 +613,92 @@ mod within_mode {
                 "the dump bytes read back as the same floats"
             );
             std::fs::remove_file(&path).unwrap();
+        }
+
+        /// `run_pieces` is the authority for the rows a config feeds: the first
+        /// piece feeds one row less (the pending-token shift of `DecodeSession::prefill`), a
+        /// fed run longer than the chunk splits at the chunk — a tail of 300 at chunk 256 is
+        /// 256 + 44 rows, not one call — and the final one-token logits step is the last entry.
+        #[test]
+        fn run_pieces_count_the_rows_each_call_feeds() {
+            // N = 922, T = 8, serve chunk 256: the head 914 is 256 + 256 + 256 + 146 as pieces,
+            // the first feeds 255 (the shift), and the 8-row tail is one call.
+            assert_eq!(
+                run_pieces(922, BankConfig::Tail(8), Some(256)),
+                vec![255, 256, 256, 146, 8, 1]
+            );
+            // T = 300: the tail piece feeds 300 rows, which the chunk splits into 256 + 44.
+            assert_eq!(
+                run_pieces(922, BankConfig::Tail(300), Some(256)),
+                vec![255, 256, 110, 256, 44, 1]
+            );
+            // T = 20 at N = 30: the 10-id head is one piece of 9 fed rows, the tail one call.
+            assert_eq!(
+                run_pieces(30, BankConfig::Tail(20), Some(256)),
+                vec![9, 20, 1]
+            );
+            // A chunk of 1 is the token-by-token path: one row per step.
+            assert_eq!(
+                run_pieces(5, BankConfig::Chunk(1), Some(1)),
+                vec![1, 1, 1, 1, 1]
+            );
+            // A chunk larger than the prompt is one piece of N - 1 rows plus the logits step.
+            assert_eq!(
+                run_pieces(20, BankConfig::Chunk(512), Some(512)),
+                vec![19, 1]
+            );
+            // A one-id first piece (tail 8 at N = 9: the 1-id head is one piece): its id stays
+            // pending, so the head feeds nothing and the 8-row tail piece feeds it plus its own
+            // first 7 ids as ONE 8-row run; the final logits step feeds the last pending id.
+            assert_eq!(run_pieces(9, BankConfig::Tail(8), Some(256)), vec![8, 1]);
+            // A tail with NO chunk (the token-by-token path): whatever the piece layout, every
+            // id is its own one-row step, so the list is one row per prompt token.
+            assert_eq!(run_pieces(40, BankConfig::Tail(20), None), vec![1; 40]);
+            // Steps feeds every prompt token as its own step (the piece 16 only groups them).
+            assert_eq!(run_pieces(20, BankConfig::Steps, None), vec![1; 20]);
+            // A chunk request the plan cannot admit falls back to the steps rows.
+            assert_eq!(run_pieces(20, BankConfig::Chunk(100), None), vec![1; 20]);
+        }
+
+        /// The row counts always sum to the prompt length: no id is fed twice and none is
+        /// dropped, whatever the config, the chunk, and the prompt length.
+        #[test]
+        fn run_pieces_sum_to_the_prompt_length() {
+            for len in [1usize, 2, 3, 15, 16, 17, 100, 922] {
+                for chunk in [
+                    None,
+                    Some(1),
+                    Some(4),
+                    Some(16),
+                    Some(64),
+                    Some(256),
+                    Some(1024),
+                ] {
+                    assert_eq!(
+                        run_pieces(len, BankConfig::Steps, None)
+                            .iter()
+                            .sum::<usize>(),
+                        len,
+                        "steps at len {len}"
+                    );
+                    assert_eq!(
+                        run_pieces(len, BankConfig::Chunk(64), chunk)
+                            .iter()
+                            .sum::<usize>(),
+                        len,
+                        "chunk at len {len}, chunk {chunk:?}"
+                    );
+                    for tail in 1..len {
+                        assert_eq!(
+                            run_pieces(len, BankConfig::Tail(tail as u32), chunk)
+                                .iter()
+                                .sum::<usize>(),
+                            len,
+                            "tail {tail} at len {len}, chunk {chunk:?}"
+                        );
+                    }
+                }
+            }
         }
 
         /// The F32 branch of the gate-1 verdict asserts every recorded failure and the BF16 branch

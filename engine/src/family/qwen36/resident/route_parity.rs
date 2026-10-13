@@ -199,19 +199,6 @@ fn id_bytes(ids: &[u32]) -> Vec<u8> {
     ids.iter().flat_map(|id| id.to_le_bytes()).collect()
 }
 
-/// Reads the ids of `Q36_PROMPT_IDS` (little-endian `u32`).
-fn read_ids() -> Vec<u32> {
-    let path = env_path("Q36_PROMPT_IDS");
-    let bytes = std::fs::read(&path).unwrap_or_else(|e| panic!("read {}: {e}", path.display()));
-    assert_eq!(bytes.len() % 4, 0, "Q36_PROMPT_IDS holds whole u32 words");
-    bytes
-        .as_chunks::<4>()
-        .0
-        .iter()
-        .map(|chunk| u32::from_le_bytes(*chunk))
-        .collect()
-}
-
 /// The required `Q36_OUT_DIR`. Panics when it is unset or when the path exists, before the long run.
 fn out_dir() -> String {
     let out = std::env::var("Q36_OUT_DIR").unwrap_or_else(|_| panic!("set Q36_OUT_DIR"));
@@ -757,7 +744,9 @@ fn device_routing_speed_table() {
     let _serial = crate::native_test_lock();
     let ckpt_dir = env_path("Q36_CKPT_DIR");
     let out = out_dir();
-    let ids = read_ids();
+    // The ids of `Q36_PROMPT_IDS`: the one shared reader of the little-endian `u32` dump
+    // format, `decode_timing::read_prompt_ids` (whose pure parse has its own unit test).
+    let ids = super::decode_timing::read_prompt_ids();
     assert!(ids.len() >= 16, "Q36_PROMPT_IDS holds at least 16 ids");
     assert_eq!(
         sha256(&id_bytes(&ids[..16])),
