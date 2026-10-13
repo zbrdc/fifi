@@ -1,8 +1,9 @@
 //! The text pins of the CUDA serve start (CUDA-SERVE-1 test 6): the capture setting must
 //! reach the step after its construction and before the return, and the rules must be built
 //! from the loaded bundle BEFORE every device call. The step cannot run on a CPU, so the
-//! wiring is pinned on `start.rs`'s own text in the gate's c17 style: comments stripped,
-//! whitespace collapsed, so only the real calls match.
+//! wiring is pinned on the source text of `start.rs`, and for the tiered mode (OFF-2-F) also
+//! of `tiered_load.rs` and of the capture backstop in `step.rs`, in the gate's c17 style:
+//! comments stripped, whitespace collapsed, so only the real calls match.
 
 #[test]
 fn serve_hands_the_capture_setting_to_the_step() {
@@ -94,6 +95,45 @@ fn make_takes_the_step_layout_from_the_loaded_weights() {
     let start = pinned(fn_section("fn start("));
     assert!(start.contains("context_tokens(settings.context_limit)?"));
     assert!(!start.contains("step_options(") && !start.contains("WeightLayout::"));
+}
+
+#[test]
+fn the_step_backstop_refuses_the_tiered_capture_pair_before_the_session_runs() {
+    // OFF-2-F4: the settings, the start, the gate and the block each refuse tiered together with a
+    // capture; this is the step's own backstop, the one a caller that builds the step by hand meets.
+    // It runs after the sync-each check and before the "capture mode is fixed" check, so deleting it or
+    // moving it behind the started test fails here.
+    let body = pinned(section_of(
+        include_str!("step.rs"),
+        "step.rs",
+        "pub(crate) fn set_capture_config(",
+    ));
+    let mode = body.find("check_mode(self.sync_each,config.capture)?;");
+    let tiered = body.find("tiered_capture_refusal(self.tiered_mode,config.capture)?;");
+    let started = body.find("ifself.started{");
+    let (mode, tiered, started) = (
+        mode.expect("the sync-each check"),
+        tiered.expect("the tiered capture refusal"),
+        started.expect("the started check"),
+    );
+    assert!(
+        mode < tiered && tiered < started,
+        "check_mode {mode}, tiered {tiered}, started {started}"
+    );
+}
+
+#[test]
+fn the_tiered_load_builds_its_pool_through_tier_pool_and_names_no_kernel() {
+    // OFF-2-F3: the kernel of the tier is chosen in ONE place (tier_kernel, behind tier_pool). A
+    // build_tiered that named a kernel or built the pool itself would bypass the choice the gate (b)
+    // runs and the device rule-C tests pin.
+    let body = pinned(section_of(
+        include_str!("tiered_load.rs"),
+        "tiered_load.rs",
+        "pub(super) fn build_tiered(",
+    ));
+    assert!(body.contains("tier_pool(plan.threads,shape)"), "{body}");
+    assert!(!body.contains("ExpertKernel") && !body.contains("CpuPool::"));
 }
 
 #[test]
@@ -208,10 +248,14 @@ fn code_only_strips_comments_and_literals_and_never_loops() {
 /// The text of one `fn` item of start.rs's production code, from the line that holds `start`
 /// to the next line that opens a `fn` item (the hardened c17 `gate/run.rs` style).
 fn fn_section(start: &str) -> &'static str {
-    let source = include_str!("start.rs");
+    section_of(include_str!("start.rs"), "start.rs", start)
+}
+
+/// The same for any source file: `file` names it in the panic message.
+fn section_of(source: &'static str, file: &str, start: &str) -> &'static str {
     let at = source
         .find(start)
-        .unwrap_or_else(|| panic!("start.rs has no {start:?}"));
+        .unwrap_or_else(|| panic!("{file} has no {start:?}"));
     let line_start = source[..at].rfind('\n').map_or(0, |nl| nl + 1);
     let mut end = source.len();
     let mut line = source[at..]

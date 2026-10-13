@@ -15,8 +15,10 @@
 //! the `Mmap` map call - whose only view out is `AsRef<[u8]>` (a safe
 //! [`MappedRegion`](super::cpu_pool::MappedRegion)), so no pointer leaves.
 //! Residual risk: truncation under a live mapping still faults (SIGBUS) when
-//! a page past the new end is touched; no Rust-level check closes that
-//! window, only narrows it, and model files are immutable by policy.
+//! a page past the new end is touched, and an in-place overwrite by another
+//! process changes the bytes behind the `&[u8]` without any fault; no
+//! Rust-level check closes that window, only narrows it, and model files are
+//! immutable by policy.
 //! Authority: decision 0017, Addendum 1 (2026-10-13, approved by git-db, not
 //! a user ruling). Opened by the tiered load (OFF-2 D5b).
 
@@ -105,8 +107,12 @@ impl MappedFile {
         // writable, no MAP_SHARED-writable mapping); the expected length was
         // just confirmed on this handle and the second stat below confirms
         // length and mtime did not move across the map. Residual risk: a
-        // truncation under the live map still SIGBUSes on touch; model files
-        // are immutable by policy and `check_unchanged` re-stats on demand.
+        // truncation under the live map still SIGBUSes on touch and nothing in
+        // production narrows that window (`check_unchanged` is a test-side
+        // check today); an in-place overwrite by another process raises no
+        // fault at all and changes the bytes the CPU tier reads. Model files
+        // are immutable by policy, the operator's contract (stated on
+        // `TieredOptions`), and that is the argument this block rests on.
         let map = unsafe { MmapOptions::new().map(&file) }.map_err(io_err)?;
         let (after_len, after_mtime) = stat(&file)?;
         if after_len != len {
@@ -137,7 +143,8 @@ impl MappedFile {
     /// Re-stats the OPEN handle (fstat; a rename-over of the path cannot
     /// matter because the mapping belongs to the inode): `Changed { what:
     /// "length" | "mtime" }` when the file differs from the recorded values,
-    /// else `Ok(())` - the narrowest cheap evidence the bytes did not move.
+    /// else `Ok(())` - the narrowest cheap evidence the bytes did not move. No production path calls
+    /// it yet (the tests do); it narrows a window, it does not close it.
     pub fn check_unchanged(&self) -> Result<(), MapError> {
         let (len, mtime) = stat(&self.file)?;
         if len != self.len {

@@ -13,8 +13,8 @@
 //! caller; no model constant lives here. All sizes are bytes (`u64`), every
 //! operation is checked (an absurd input is refused as [`BudgetError`] — never
 //! wrapped, never a panic), and the split is deterministic: no I/O, no clocks,
-//! no randomness, no threads. The module is staged for later integration
-//! (OFF-2 C7).
+//! no randomness, no threads. The tiered load uses its VRAM plan
+//! (OFF-2 D5b).
 
 use super::TieredConfig;
 

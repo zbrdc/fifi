@@ -207,9 +207,10 @@ pub(crate) struct QwenResidentStep<'a> {
     moe: Vec<MoeLayerWeights<'a>>,
     /// The tiered mode (OFF-2 D5): the options asked for it. The routed expert stacks are then not
     /// loaded, `moe` is empty and every layer's MoE block runs through `tiered`. Cost: each layer of
-    /// each token syncs with the host (about 0.8 ms per token over the plain step, measured on the
-    /// 3090 at 256 slots), and a prompt is prefilled one token per step, so a prompt of n tokens costs
-    /// n of these steps until the batched tiered prefill (OFF-7) exists.
+    /// each token syncs with the host: about 0.8 ms per token over the plain step when every expert is
+    /// resident (3090, 256 slots, measured), and about 18 ms per step with most picks on the CPU (slots 40
+    /// with preload, measured). A prompt is prefilled one token per step, so a prompt of n tokens costs n
+    /// of these steps until the batched tiered prefill (OFF-7) exists.
     tiered_mode: bool,
     /// The router and shared weights of each layer, held until `attach_tiered` builds the runtime.
     tiered_parts: Option<Vec<LayerParts<'a>>>,

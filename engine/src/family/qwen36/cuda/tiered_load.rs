@@ -16,7 +16,7 @@ use super::dims::{StepDims, TieredPlan};
 use super::step::QwenResidentStep;
 use crate::EngError;
 use crate::family::qwen36::tiered::budget::{ExpertSize, KvPlan, VramBudget, plan_vram};
-use crate::family::qwen36::tiered::cpu_pool::{CpuPool, ExpertKernel, MappedRegion};
+use crate::family::qwen36::tiered::cpu_pool::{CpuPool, ExpertKernel, MappedRegion, PoolError};
 use crate::family::qwen36::tiered::host::TieredHost;
 use crate::family::qwen36::tiered::locator::{ExpertLocator, ExpertTensorNames};
 use crate::family::qwen36::tiered::mapped_file::MappedFile;
@@ -28,10 +28,16 @@ use crate::weights::GgufHeader;
 
 /// The expert kernel of the tier's CPU pool: the per-32 group grid of the device path, not llama.cpp's
 /// Q8_K. Gate (b) failed with Q8_K at 80 percent CPU-served picks (p95 0.686 against the bound 0.651) and
-/// passed with this grid (0.478). One function so the device rule-C tests, which pin the choice by their
-/// bound, build the pool exactly like the load does.
-pub(super) fn tier_kernel() -> ExpertKernel {
+/// passed with this grid (0.478). The choice is pinned by the pure test below and, on the device, by the
+/// rule-C bounds; [`tier_pool`] is where the load and those tests share it.
+fn tier_kernel() -> ExpertKernel {
     ExpertKernel::Q8g(DotBackend::detect())
+}
+
+/// The CPU pool of the tier: `threads` workers running [`tier_kernel`] over experts of `shape`. The load and
+/// the device rule-C tests both build their pool here, and a source pin keeps `build_tiered` on this call.
+pub(super) fn tier_pool(threads: usize, shape: ExpertShape) -> Result<CpuPool, PoolError> {
+    CpuPool::with_kernel(threads, shape, tier_kernel())
 }
 
 /// The three routed expert stacks of a layer, by the suffix of their GGUF names.
@@ -120,7 +126,7 @@ pub(super) fn build_tiered(
     let mapped = MappedFile::open(gguf, header.file_len())
         .map_err(|error| checkpoint(format!("mapping {}: {error}", gguf.display())))?;
     let region: Arc<dyn MappedRegion> = Arc::new(mapped);
-    let pool = CpuPool::with_kernel(plan.threads, shape, tier_kernel())
+    let pool = tier_pool(plan.threads, shape)
         .map_err(|error| checkpoint(format!("cpu pool: {error:?}")))?;
     let config = TieredConfig {
         layers,
@@ -181,6 +187,17 @@ mod tests {
             "{:?}",
             tier_kernel()
         );
+        let shape = ExpertShape {
+            hidden: 256,
+            inter: 256,
+        };
+        let pool = tier_pool(2, shape).expect("a pool");
+        assert!(
+            matches!(pool.kernel(), ExpertKernel::Q8g(_)),
+            "{:?}",
+            pool.kernel()
+        );
+        assert_eq!(pool.threads(), 2);
     }
 
     #[test]

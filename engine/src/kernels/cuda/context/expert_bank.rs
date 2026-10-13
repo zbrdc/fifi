@@ -7,7 +7,7 @@
 //! hot experts of a layer in VRAM; the S1 launches stay untouched, so the bank has to look
 //! exactly like an expert stack, and it has to be finite everywhere (a missed pick reads slot 0
 //! with weight 0.0, and `0 * Inf` would be NaN). Design: `ledger/plans/OFF-2-DEVICE-WIRING.md`
-//! section 2. Staged for later integration (OFF-2 D5).
+//! section 2. Built by the tiered load (OFF-2 D5b).
 //!
 //! `slots` must be at least `top_k`: the launch needs `n_used <= n_expert`. Slot 0 doubles as
 //! the dummy target of a missed pick but may also hold a real expert: duplicate ids in one

@@ -9,6 +9,10 @@
 //! 32-value groups bound the noise of an outlier to its own group. A Q4_K sub-block is 32
 //! values wide, so each activation group lines up with exactly one weight sub-block.
 //!
+//! This mirrors the device's GRID (groups of 32, `d = amax / 127`, `q = round(x / d)`), not its bits: the
+//! CPU keeps `d` in f32 and the group sums as exact integers, where the device stores both as f16
+//! (`ds = half2(d, sum)`); the rule-C bound of the device tests carries that difference.
+//!
 //! Numerics (binding; the scalar path is the reference, [`DotBackend`] may dispatch to the
 //! scoped AVX2 module `expert_cpu_avx2`, which reproduces it bit for bit). An activation row is
 //! quantized per group of 32: `amax = max|x_i|`; if `amax == 0` then `d = 0`, every `q = 0`;

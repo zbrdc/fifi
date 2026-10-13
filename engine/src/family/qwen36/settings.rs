@@ -98,7 +98,10 @@ pub(crate) struct Q36Options {
     pub(crate) tiered: Option<TieredOptions>,
 }
 
-/// The `tiered` member of the `qwen36` object.
+/// The `tiered` member of the `qwen36` object. The CPU tier maps the model file read-only for the whole
+/// serve, so the operator's contract is that the model file must not change while it is served: no
+/// truncation (the next touch of a lost page faults with SIGBUS) and no in-place overwrite (the CPU tier
+/// would read the new bytes without any fault).
 #[derive(Clone, Copy, Debug, Default, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct TieredOptions {

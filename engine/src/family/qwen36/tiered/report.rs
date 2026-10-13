@@ -3,8 +3,8 @@
 //! One [`TokenReport`] aggregates what a decode token cost in the tier split: which
 //! routed experts their layer bank served, which the CPU served, how many serves fell
 //! through the page cache to the SSD, and the swaps the token boundary decided. The
-//! report is plain data for the caller's accounting; this module is staged for later
-//! integration (OFF-2 C6/C7).
+//! report is plain data for the caller's accounting; the tiered host fills it (OFF-2 D4) and the
+//! gate prints it (OFF-2 D5c).
 
 /// Counters of one decode token in the tier split.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]

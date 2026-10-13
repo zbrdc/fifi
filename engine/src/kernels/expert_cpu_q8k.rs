@@ -1,5 +1,5 @@
-//! Q8_K integer-dot expert kernels on the CPU, safe Rust (staged for later
-//! integration, OFF-2 C6/C7).
+//! Q8_K integer-dot expert kernels on the CPU, safe Rust (a reference kernel of OFF-2: the tier
+//! runs the per-32 kernel of `expert_cpu_q8g`, see there for why).
 //!
 //! The safe f32 kernel in [`super::expert_cpu`] is DRAM-bound at ~2.6 GB/s per thread
 //! (lane L, 2026-10-13) because it expands every Q4_K nibble to f32 before the dot.
@@ -908,6 +908,7 @@ mod tests {
         assert!(out.iter().all(|v| !v.is_nan()), "valid call must fill out");
     }
 
+    /// Skips (prints, passes) on a host without AVX2: the scalar path is then the only path.
     #[test]
     fn avx2_equals_scalar_bitwise() {
         let backend = DotBackend::detect();
@@ -973,6 +974,7 @@ mod tests {
         assert_eq!(bits(&a), bits(&b), "alternating signs diverged");
     }
 
+    /// Skips (prints, passes) on a host without AVX2: the scalar path is then the only path.
     #[test]
     fn scalar_and_avx2_expert_forward_are_bitwise_equal() {
         let backend = DotBackend::detect();

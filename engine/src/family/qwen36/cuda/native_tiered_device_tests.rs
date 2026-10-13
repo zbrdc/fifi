@@ -11,12 +11,12 @@ use super::moe::tiered::{
     LayerPlan, RouteRead, TieredBlock, TieredLayerHost, TieredScratch, run_moe_block_tiered,
 };
 use super::moe::{Launch, MoeLayerWeights, StackWeights};
-use super::native_device_rig::{DIMS, Sources, device_present, rig_weights, sources};
+use super::native_device_rig::{DIMS, Sources, device_present, host_router, rig_weights, sources};
 use super::native_device_rig::{f32_buf, zero_buf};
 use super::native_moe_device_tests::{
     BlockRun, block_bufs, moe_bufs, produce, read_back, run_block,
 };
-use super::tiered_load::tier_kernel;
+use super::tiered_load::tier_pool;
 use super::tiered_step::BankFill;
 use crate::EngError;
 use crate::family::project::cuda::WeightLayout;
@@ -54,27 +54,32 @@ impl TieredLayerHost for Resident {
     }
 }
 
-/// A bank of every expert of the sources, expert `e` in slot `slot_of[e]`.
+/// A bank of `slots` slots holding every expert of the sources with a slot (`slot_of[e] >= 0`), expert `e`
+/// in slot `slot_of[e]`; experts with -1 are not resident. The `(slot_of, slots)` pair is the one
+/// [`native_and_tiered`] takes.
 fn full_bank(
     ctx: &CudaContext,
     stream: &DeviceStream,
     s: &Sources,
-    slot_of: &[i32],
+    (slot_of, slots): (&[i32], usize),
 ) -> Result<ExpertBank, EngError> {
     let geometry = ExpertBankGeometry {
         hidden: DIMS.hidden,
         inter: DIMS.inter,
         top_k: DIMS.top_k,
     };
-    let bank = ExpertBank::new(ctx, geometry, DIMS.n_expert)?;
+    let bank = ExpertBank::new(ctx, geometry, slots)?;
     for (expert, &slot) in slot_of.iter().enumerate() {
+        let Ok(slot) = usize::try_from(slot) else {
+            continue; // not resident: served on the CPU
+        };
         let at = expert * SLICE;
         let (gate, up, down) = (
             &s.gate[at..at + SLICE],
             &s.up[at..at + SLICE],
             &s.down[at..at + SLICE],
         );
-        bank.fill(stream, usize::try_from(slot).unwrap_or(0), gate, up, down)?;
+        bank.fill(stream, slot, gate, up, down)?;
     }
     Ok(bank)
 }
@@ -97,7 +102,7 @@ fn bank_weights<'w>(real: &MoeLayerWeights<'w>, bank: &'w ExpertBank) -> MoeLaye
 /// sources and `host`; both read back as host data after every owner dropped.
 fn native_and_tiered(
     s: &Sources,
-    slot_of: &[i32],
+    (slot_of, slots): (&[i32], usize),
     host: &mut dyn TieredLayerHost,
 ) -> Result<(BlockRun, BlockRun, u32), EngError> {
     let ctx = CudaContext::new()?;
@@ -105,7 +110,7 @@ fn native_and_tiered(
     let weights = rig_weights(&ctx, s)?;
     let native = run_block(&ctx, &stream, s, WeightLayout::Native, &weights)?;
     let real = weights.moe(WeightLayout::Native)?;
-    let bank = full_bank(&ctx, &stream, s, slot_of)?;
+    let bank = full_bank(&ctx, &stream, s, (slot_of, slots))?;
     let tiered_weights = bank_weights(&real, &bank);
     let b = block_bufs(&ctx, s, WeightLayout::Native)?;
     let bufs = moe_bufs(&b, WeightLayout::Native)?;
@@ -152,7 +157,7 @@ fn tiered_block_with_everything_resident_equals_the_native_block() -> Result<(),
     let mut host = Resident {
         slot_of: identity.clone(),
     };
-    let (native, tiered, status) = native_and_tiered(&s, &identity, &mut host)?;
+    let (native, tiered, status) = native_and_tiered(&s, (&identity, DIMS.n_expert), &mut host)?;
     assert_eq!(status, 0, "a clean run sets no status bit");
     assert_ne!(
         bits(&native.resid_out),
@@ -182,7 +187,7 @@ fn a_permuted_bank_gives_the_native_bits_too() -> Result<(), EngError> {
     let mut host = Resident {
         slot_of: permuted.clone(),
     };
-    let (native, tiered, _) = native_and_tiered(&s, &permuted, &mut host)?;
+    let (native, tiered, _) = native_and_tiered(&s, (&permuted, DIMS.n_expert), &mut host)?;
     assert_eq!(bits(&tiered.expert_gu), bits(&native.expert_gu));
     assert_eq!(bits(&tiered.expert_down), bits(&native.expert_down));
     assert_eq!(bits(&tiered.resid_out), bits(&native.resid_out));
@@ -286,7 +291,7 @@ fn a_faulted_router_row_still_gives_nan_and_poisons() -> Result<(), EngError> {
     let mut host = Resident {
         slot_of: identity.clone(),
     };
-    let (_, tiered, status) = native_and_tiered(&s, &identity, &mut host)?;
+    let (_, tiered, status) = native_and_tiered(&s, (&identity, DIMS.n_expert), &mut host)?;
     assert_eq!(
         tiered.ids,
         vec![-1; DIMS.top_k],
@@ -301,7 +306,7 @@ fn a_faulted_router_row_still_gives_nan_and_poisons() -> Result<(), EngError> {
     Ok(())
 }
 
-/// Serves the chosen experts on the CPU (real `CpuPool`, the load's own `tier_kernel`) from the rig's own expert bytes,
+/// Serves the chosen experts on the CPU (real `CpuPool`, the load's own `tier_pool`) from the rig's own expert bytes,
 /// the rest from the bank; picks on the CPU read slot 0 with weight 0.0.
 struct Mixed {
     slot_of: Vec<i32>,
@@ -317,8 +322,7 @@ impl Mixed {
             hidden: DIMS.hidden,
             inter: DIMS.inter,
         };
-        let pool = CpuPool::with_kernel(2, shape, tier_kernel())
-            .map_err(|e| backend(&format!("{e:?}")))?;
+        let pool = tier_pool(2, shape).map_err(|e| backend(&format!("{e:?}")))?;
         let bytes: Vec<u8> = [&s.gate, &s.up, &s.down]
             .iter()
             .flat_map(|stack| stack.iter().copied())
@@ -405,29 +409,39 @@ fn delta_error(resid: &[f32], native: &[f32], tiered: &[f32]) -> f32 {
             .max(f32::MIN_POSITIVE)
 }
 
-/// The rule-C bound for `n_cpu` experts served on the CPU, derived from its terms. Both paths put the
-/// normed row and the SwiGLU row on groups of 32 with `d = amax / 127` and `q = round(x / d)` (the CPU
-/// in f32 with `x * (127 / amax)`, the device's vendored q8_1 by a division), so the grids agree except
-/// on exact ties. They differ in what the dot multiplies by: the device stores the scale `d` and the
-/// group sum as f16 (relative half-ulp `2^-11 = 4.9e-4` each), the CPU keeps f32. Per expert three
-/// roundings act on the output (the scale of the gate/up input, the scale of the SwiGLU row, the f16
-/// sum of the min terms) and add linearly at worst: `u = 3 * 2^-11 = 1.5e-3` of the expert's own scale,
-/// which bounds its share of the residual delta too (the shared expert and the other picks only dilute
-/// it; the device SwiGLU's fast `__expf` is at 1e-6). The errors of different experts are independent,
-/// so they add in quadrature: `u * sqrt(n_cpu)`. The f32 summation order of the partial against the
-/// device combine adds `n * 2^-23`, orders of magnitude below. Device numbers (3090, 07c73ff8): 6.67e-4
-/// at 4 experts (bound 2.9e-3) and 3.23e-4 at 16 (bound 5.9e-3). The Q8_K grid measured 5.34e-3 and
-/// 1.35e-2 (133d5519), above both bounds, which is what pins the kernel choice.
-fn rule_c_bound(n_cpu: usize) -> f32 {
-    3.0 * 2f32.powi(-11) * (n_cpu as f32).sqrt() + n_cpu as f32 * 2f32.powi(-23)
+/// The rule-C bound for a token whose picks include `n_cpu` experts served on the CPU, from a model of the
+/// two kernels' arithmetic, NOT a proof. Nothing in it is fitted: the constants come from the kernel
+/// structure (four scale-like values per expert) and the number formats (the f16 half-ulp `2^-11`, the f32
+/// `2^-23`); the device numbers below only check it from both sides. Both paths put the normed row and the SwiGLU row
+/// on groups of 32 with `d = amax / 127` and `q = round(x / d)` (the CPU in f32 with `x * (127 / amax)`,
+/// the device's vendored q8_1 by a division), so the grids agree except on exact ties. They differ in
+/// what the dot multiplies by: the device stores `ds = half2(d, sum)` for BOTH rows, i.e. FOUR f16
+/// roundings per expert (the scale and the group sum of the gate/up input row, the same two of the
+/// SwiGLU row), each with a relative half-ulp of `2^-11 = 4.9e-4`, the CPU keeps f32. They add linearly
+/// at worst: `u = 4 * 2^-11 = 2.0e-3` of the expert's own scale, which bounds its share of the residual
+/// delta too (the shared expert and the other picks only dilute it; the device SwiGLU's fast `__expf`
+/// is at 1e-6). A token has `top_k` picks, so no more than `min(n_cpu, top_k)` of them are on the CPU;
+/// the errors of different experts are independent and add in quadrature: `u * sqrt(min(n_cpu, top_k))`.
+/// The f32 summation order of the partial against the device combine adds `n * 2^-23`, orders of
+/// magnitude below. Device numbers (3090, 07c73ff8): 6.67e-4 at 4 experts (bound 3.9e-3), 3.23e-4 with
+/// every expert on the CPU (bound 5.5e-3 at the 8 picks); the Q8_K grid measured 5.34e-3 and 1.35e-2
+/// (133d5519), above both bounds, which is what pins the kernel choice. The half bank (bce0c0cb) measured
+/// 1.43e-4 at its 3 CPU picks (bound 3.4e-3), and the Q8_K kernel (m22) 5.11e-3 there.
+fn rule_c_bound(n_cpu: usize, top_k: usize) -> f32 {
+    let picks = n_cpu.min(top_k) as f32;
+    4.0 * 2f32.powi(-11) * picks.sqrt() + picks * 2f32.powi(-23)
 }
 
 /// The pure pin of the bound: above what the per-32 kernel measured, below what the Q8_K kernel did,
-/// at both expert counts of the tests. No device needed.
+/// at the expert counts of the tests (top_k 8). No device needed.
 #[test]
 fn the_rule_c_bound_sits_between_the_per_32_and_the_q8_k_measurements() {
-    for (n_cpu, per_32, q8_k) in [(4usize, 6.67e-4f32, 5.337e-3f32), (16, 3.23e-4, 1.349e-2)] {
-        let bound = rule_c_bound(n_cpu);
+    for (n_cpu, per_32, q8_k) in [
+        (4usize, 6.67e-4f32, 5.337e-3f32),
+        (16, 3.23e-4, 1.349e-2),
+        (HALF_BANK_CPU_PICKS, 1.43e-4, 5.11e-3),
+    ] {
+        let bound = rule_c_bound(n_cpu, DIMS.top_k);
         assert!(
             bound > 2.0 * per_32,
             "{n_cpu}: bound {bound} leaves no headroom over {per_32}"
@@ -437,6 +451,52 @@ fn the_rule_c_bound_sits_between_the_per_32_and_the_q8_k_measurements() {
             "{n_cpu}: bound {bound} would accept the Q8_K kernel ({q8_k})"
         );
     }
+    // The pick cap: more CPU experts than picks add nothing.
+    assert_eq!(rule_c_bound(16, 8), rule_c_bound(8, 8));
+    assert!(rule_c_bound(4, 8) < rule_c_bound(8, 8));
+}
+
+/// The half bank of F5: `HALF_SLOTS` slots for the 16 experts, the geometry the 4050 runs.
+const HALF_SLOTS: usize = 8;
+/// The seed of the half-bank test.
+const HALF_BANK_SEED: u64 = 0x7125_0008;
+/// The CPU picks (experts at or above `HALF_SLOTS`) of that seed's route; the pure test below pins the
+/// number on the host router, the device test checks it on the device route and bounds its error by it.
+const HALF_BANK_CPU_PICKS: usize = 3;
+
+/// The slot map of the half bank: the experts `0..HALF_SLOTS` rotated so that `first` sits in slot 0, the
+/// others not resident (-1). With the route picking `first`, slot id 0 appears twice in the pick list: once
+/// for its own pick and once for every dummy read of a CPU pick (the duplicate case of the dummy-slot rule).
+fn half_bank_slot_of(first: usize) -> Vec<i32> {
+    (0..DIMS.n_expert)
+        .map(|e| {
+            if e < HALF_SLOTS {
+                ((e + HALF_SLOTS - first) % HALF_SLOTS) as i32
+            } else {
+                -1
+            }
+        })
+        .collect()
+}
+
+/// The half-bank seed on the host: its route has resident picks (so a slot map can put one in slot 0), and
+/// exactly [`HALF_BANK_CPU_PICKS`] picks on the CPU; the slot map is a permutation of the 8 slots with the
+/// experts above them absent. No device needed.
+#[test]
+fn the_half_bank_seed_routes_resident_and_cpu_picks_and_the_slot_map_is_a_permutation() {
+    let (ids, _) = host_router(&sources(HALF_BANK_SEED));
+    let first = ids.iter().copied().find(|&id| id < HALF_SLOTS);
+    let Some(first) = first else {
+        panic!("no resident pick in {ids:?}");
+    };
+    let cpu = ids.iter().filter(|&&id| id >= HALF_SLOTS).count();
+    assert_eq!(cpu, HALF_BANK_CPU_PICKS, "route {ids:?}");
+    let slot_of = half_bank_slot_of(first);
+    assert_eq!(slot_of[first], 0, "the first resident pick sits in slot 0");
+    assert!(slot_of[HALF_SLOTS..].iter().all(|&slot| slot == -1));
+    let mut slots = slot_of[..HALF_SLOTS].to_vec();
+    slots.sort_unstable();
+    assert_eq!(slots, (0..HALF_SLOTS as i32).collect::<Vec<_>>());
 }
 
 /// Rule C for CPU-served experts: not bitwise (the CPU keeps the group scales in f32, the GPU's q8_1
@@ -452,14 +512,74 @@ fn tiered_block_with_cpu_served_experts_matches_the_native_block_within_rule_c()
     let s = sources(0x7125_0005);
     let identity: Vec<i32> = (0..DIMS.n_expert as i32).collect();
     let mut host = Mixed::new(&s, identity.clone(), vec![1, 4, 9, 12])?;
-    let (native, tiered, status) = native_and_tiered(&s, &identity, &mut host)?;
+    let (native, tiered, status) = native_and_tiered(&s, (&identity, DIMS.n_expert), &mut host)?;
     assert_eq!(status, 0);
     assert!(tiered.resid_out.iter().all(|v| v.is_finite()));
     let error = delta_error(&s.resid, &native.resid_out, &tiered.resid_out);
     println!(
         "RULE-C MEASURED mixed (4 of 16 experts on the CPU): max|tiered-native| / max|native delta| = {error:e}"
     );
-    let bound = rule_c_bound(4);
+    let bound = rule_c_bound(4, DIMS.top_k);
+    assert!(
+        error <= bound,
+        "relative delta error {error} above the bound {bound}"
+    );
+    assert_ne!(
+        bits(&tiered.resid_out),
+        bits(&native.resid_out),
+        "the CPU path really ran"
+    );
+    Ok(())
+}
+
+/// A bank of 8 slots for 16 experts (F5), the geometry the 4050 runs. The mixed and all-skipped banks above
+/// already have a real expert in slot 0 and send their CPU picks there; what this test adds is the 8-slot
+/// geometry: `check_plan` refuses slot ids of 8 and above, and experts 8..16 are absent from the bank. The
+/// resident experts are `half_bank_slot_of`'s rotation of 0..8, with the first resident pick of the route in
+/// slot 0, so slot id 0 appears twice in the pick list (the pick's own and the dummy reads of the CPU picks,
+/// weight 0.0). The CPU picks are bounded by their REALIZED count. This test pins the dummy-slot geometry,
+/// not the kernel choice: that is the pure pin of the bound above and the mixed test.
+#[test]
+fn a_half_size_bank_with_a_real_expert_in_slot_zero_agrees_with_the_native_block_by_rule_c()
+-> Result<(), EngError> {
+    if !device_present(
+        "a_half_size_bank_with_a_real_expert_in_slot_zero_agrees_with_the_native_block_by_rule_c",
+    ) {
+        return Ok(());
+    }
+    let s = sources(HALF_BANK_SEED);
+    let (route, _) = host_router(&s);
+    let first = route
+        .iter()
+        .copied()
+        .find(|&id| id < HALF_SLOTS)
+        .ok_or_else(|| backend("the half-bank route has no resident pick"))?;
+    let slot_of = half_bank_slot_of(first);
+    let on_cpu = (HALF_SLOTS..DIMS.n_expert).collect();
+    let mut host = Mixed::new(&s, slot_of.clone(), on_cpu)?;
+    let (native, tiered, status) = native_and_tiered(&s, (&slot_of, HALF_SLOTS), &mut host)?;
+    assert_eq!(status, 0);
+    assert!(tiered.resid_out.iter().all(|v| v.is_finite()));
+    let cpu_picks = tiered
+        .ids
+        .iter()
+        .filter(|&&id| id >= HALF_SLOTS as i32)
+        .count();
+    assert!(
+        tiered.ids.contains(&(first as i32)),
+        "the expert in slot 0 is picked, so slot id 0 appears twice: {:?}",
+        tiered.ids
+    );
+    assert_eq!(
+        cpu_picks, HALF_BANK_CPU_PICKS,
+        "the device route is the one the pure pin checks: {:?}",
+        tiered.ids
+    );
+    let error = delta_error(&s.resid, &native.resid_out, &tiered.resid_out);
+    println!(
+        "RULE-C MEASURED half bank (8 slots, expert {first} in slot 0, {cpu_picks} CPU picks): max|tiered-native| / max|native delta| = {error:e}"
+    );
+    let bound = rule_c_bound(cpu_picks, DIMS.top_k);
     assert!(
         error <= bound,
         "relative delta error {error} above the bound {bound}"
@@ -483,14 +603,14 @@ fn an_all_skipped_list_is_finite_and_agrees_with_the_native_block_by_rule_c() ->
     let s = sources(0x7125_0006);
     let identity: Vec<i32> = (0..DIMS.n_expert as i32).collect();
     let mut host = Mixed::new(&s, identity.clone(), (0..DIMS.n_expert).collect())?;
-    let (native, tiered, status) = native_and_tiered(&s, &identity, &mut host)?;
+    let (native, tiered, status) = native_and_tiered(&s, (&identity, DIMS.n_expert), &mut host)?;
     assert_eq!(status, 0);
     assert!(tiered.resid_out.iter().all(|v| v.is_finite()));
     let error = delta_error(&s.resid, &native.resid_out, &tiered.resid_out);
     println!(
         "RULE-C MEASURED all skipped (16 of 16 experts on the CPU): max|tiered-native| / max|native delta| = {error:e}"
     );
-    let bound = rule_c_bound(DIMS.n_expert);
+    let bound = rule_c_bound(DIMS.n_expert, DIMS.top_k);
     assert!(
         error <= bound,
         "relative delta error {error} above the bound {bound}"
@@ -506,7 +626,7 @@ fn captured_attempt(s: &Sources) -> Result<String, EngError> {
     let weights = rig_weights(&ctx, s)?;
     let real = weights.moe(WeightLayout::Native)?;
     let identity: Vec<i32> = (0..DIMS.n_expert as i32).collect();
-    let bank = full_bank(&ctx, &stream, s, &identity)?;
+    let bank = full_bank(&ctx, &stream, s, (&identity, DIMS.n_expert))?;
     let tiered_weights = bank_weights(&real, &bank);
     let b = block_bufs(&ctx, s, WeightLayout::Native)?;
     let bufs = moe_bufs(&b, WeightLayout::Native)?;
