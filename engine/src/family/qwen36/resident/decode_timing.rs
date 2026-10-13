@@ -904,6 +904,136 @@ fn decode_phase_timing_by_mode() {
     }
 }
 
+/// Prefill rate by depth segment (Mac, ignored, real checkpoint): the like-for-like counterpart of
+/// the segment rates that an mlx-lm baseline reports. One growing state is prefilled through
+/// the serving path (the same pieces, chunks and `DecodeSession` as `decode_phase_timing_by_mode`)
+/// up to each depth of `PT_DEPTHS` (a comma list, default `16,8192,30000`); the wall time of
+/// each segment (from the previous depth to this one) is measured around the whole segment, so a
+/// segment's rate includes the attention over the growing context, as a prompt of that length
+/// would pay it. Only the prefill runs: no token is decoded. The ids come from the same sources
+/// as the decode timing (`DT_IDS_SOURCE=file` with `Q36_PROMPT_IDS` for depths above the
+/// 922-id tool prompt). Run it like the decode timing with this test name.
+#[test]
+#[ignore = "needs the real checkpoint on the Mac; run with --ignored"]
+#[cfg(all(feature = "native-mlx", target_os = "macos", target_arch = "aarch64"))]
+fn prefill_rate_by_depth_segment() {
+    let _serial = crate::native_test_lock();
+    let ckpt_dir = env_path("Q36_CKPT_DIR");
+    let source = ids_source_from_env();
+    let ids = match source {
+        IdsSource::Tool => {
+            let (ids_path, ref_path) = (env_path("IDS_FILE"), env_path("REF_JSON"));
+            let ids_value: serde_json::Value =
+                serde_json::from_slice(&std::fs::read(&ids_path).unwrap()).unwrap();
+            let ref_value: serde_json::Value =
+                serde_json::from_slice(&std::fs::read(&ref_path).unwrap()).unwrap();
+            read_ids(&ids_value, &ref_value)
+        }
+        IdsSource::File => read_prompt_ids(),
+    };
+    let marks = match std::env::var("PT_DEPTHS") {
+        Ok(text) => parse_depths(&text, ids.len()).unwrap_or_else(|why| panic!("PT_DEPTHS: {why}")),
+        Err(_) => parse_depths("16,8192,30000", ids.len()).unwrap_or_else(|why| panic!("{why}")),
+    };
+    let activation = required_activation_from_env();
+    let out = out_dir_must_be_new();
+    let out_dir = create_out_dir(&out);
+
+    let real = open(&ckpt_dir);
+    assert_eq!(
+        sha256(&real.config),
+        CONFIG_SHA256,
+        "config.json differs from the pinned checkpoint"
+    );
+    let mut kernels = MlxKernels::try_new().unwrap();
+    kernels.set_cache_limit(CACHE_LIMIT).unwrap();
+    let host = HostWeights::load(&real.ckpt, &QWEN3_6_35B_A3B, &real.config).unwrap();
+    let heads_q = u64::try_from(host.shape().attn.heads_q).unwrap();
+    let mut decoder =
+        ResidentDecoder::new_with_activation(kernels, &real.ckpt, host, CONTEXT_LIMIT, activation)
+            .unwrap();
+    decoder.budget = SessionBudget::new(SESSION_CAP);
+    let mut state = decoder.zero_state().unwrap();
+    let terms = PrefillTerms {
+        budget: PREFILL_BUDGET,
+        weights: decoder.weights.byte_len().unwrap(),
+        session_reserve: PREFILL_RESERVE,
+    };
+    let cost = ChunkCost::new(heads_q, CONTEXT_LIMIT).unwrap();
+    let serve_setting = serve_chunk_setting(activation);
+    let chunked = chunked_prefill_allowed(decoder.weights.consts.act);
+    let chunk = if chunked {
+        admitted_chunk(&cost, terms.remaining(), serve_setting).unwrap()
+    } else {
+        None
+    };
+    let piece = chunk
+        .map(|rows| usize::try_from(rows).unwrap())
+        .unwrap_or(NO_BUDGET_PIECE);
+    if let Some(rows) = chunk {
+        decoder.set_chunk_rows(rows).unwrap();
+    }
+    let limit = usize::try_from(CONTEXT_LIMIT).unwrap();
+    let mut session = DecodeSession::default();
+    let mut fed = Vec::new();
+    let mut segments = Vec::new();
+    let mut done = 0usize;
+    decoder.kernels.reset_peak_memory().unwrap();
+    for &mark in &marks {
+        let mut step = ServeStep {
+            decoder: &mut decoder,
+            state: &mut state,
+            chunk,
+            fed: &mut fed,
+        };
+        let started = Instant::now();
+        for rows in ids[done..mark].chunks(piece) {
+            session.prefill(&mut step, rows, limit).unwrap();
+        }
+        // The last chunk's state is evaluated inside `prefill`; nothing is left pending, but
+        // a read of one pending value would add a synchronization to the timed region, so the
+        // wall of the loop above is the segment time.
+        let seconds = started.elapsed().as_secs_f64();
+        let tokens = mark - done;
+        let memory = decoder.kernels.memory_stats().unwrap();
+        println!(
+            "PREFILL segment {done} -> {mark}: {tokens} tokens in {seconds:.2} s = {:.0} tok/s, \
+             mlx active {:.2} GB peak {:.2} GB",
+            tokens as f64 / seconds,
+            memory.active as f64 / 1e9,
+            memory.peak as f64 / 1e9
+        );
+        segments.push(serde_json::json!({
+            "from": done,
+            "to": mark,
+            "tokens": tokens,
+            "seconds": seconds,
+            "tok_s": tokens as f64 / seconds,
+            "mlx_active_bytes": memory.active,
+            "mlx_peak_bytes_process": memory.peak,
+        }));
+        done = mark;
+    }
+    let report = serde_json::json!({
+        "engine": "fifi",
+        "test": "prefill_rate_by_depth_segment",
+        "checkpoint": ckpt_dir.display().to_string(),
+        "activation_dtype": activation_name(activation),
+        "serving_chunk_requested": serve_setting,
+        "serving_chunk": chunk,
+        "chunk_piece": piece,
+        "ids_in_source": ids.len(),
+        "segments": segments,
+        "fed_row_runs_total": fed.len(),
+    });
+    std::fs::write(
+        out_dir.join("prefill_timing.json"),
+        serde_json::to_vec_pretty(&report).unwrap(),
+    )
+    .unwrap();
+    println!("wrote {}", out_dir.join("prefill_timing.json").display());
+}
+
 #[cfg(test)]
 mod tests {
     use super::super::within_mode::{BankConfig, run_pieces};
