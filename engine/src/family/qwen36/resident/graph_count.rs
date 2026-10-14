@@ -46,7 +46,7 @@
 //! which the first-array cut handles.
 //!
 //! How MLX prints a compiled region (recorded from the MLX source at the
-//! pinned commit 1f8e74e3, `mlx/compile.cpp` `Compiled::name`): a compiled function is ONE
+//! pinned commit 64ea011c (v0.32.3; the rule is unchanged from 1f8e74e3), `mlx/compile.cpp` `Compiled::name`): a compiled function is ONE
 //! primitive node whose name is `"Compiled"` followed by the concatenated names of every
 //! primitive of its tape, for example
 //! `CompiledQuantizedMatmulMultiplySumAxisAddSigmoid A [[1, 32], float32] -> B [[1, 32], float32]`.
@@ -436,7 +436,7 @@ mod tests {
     }
 
     /// A compiled region prints as ONE node line whose name is "Compiled" plus the concatenated
-    /// names of its tape (recorded from the MLX source at the pinned commit 1f8e74e3,
+    /// names of its tape (recorded from the MLX source at the pinned commit 64ea011c (v0.32.3; the rule is unchanged from 1f8e74e3),
     /// `mlx/compile.cpp` `Compiled::name`). The parser must keep that whole
     /// name and count the node once, so the graph dump with `QWEN36_G2A_COMPILE=1` shows each
     /// compiled DeltaNet and MoE decode block as one `Compiled...` node and `total_nodes` drops by

@@ -1708,6 +1708,8 @@ extern "C" int mlx_gather_qmm(
             (bits.has_value ? std::make_optional<int>(bits.value)
                             : std::nullopt),
             std::string(mode),
+            /* global_scale (added by MLX v0.32.3): absent, as for the affine mode */
+            std::nullopt,
             sorted_indices,
             mlx_stream_get_(s)));
   } catch (std::exception& e) {

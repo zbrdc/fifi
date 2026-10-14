@@ -8,7 +8,7 @@ set(CMAKE_CXX_STANDARD 20)
 
 # ----------------------------- Configuration -----------------------------
 if(NOT MLX_C_VERSION)
-  set(MLX_C_VERSION 0.6.0)
+  set(MLX_C_VERSION 0.7.0)
 endif()
 
 option(BUILD_SHARED_LIBS "Build mlx C as a shared library" OFF)
@@ -49,7 +49,7 @@ else()
   FetchContent_Declare(
     mlx
     GIT_REPOSITORY "https://github.com/ml-explore/mlx.git"
-    GIT_TAG 1f8e74e3f12f31365464a6867c6579f0e9b29d85)
+    GIT_TAG 64ea011cb65f14d9ce2737e60db9a4ae91ed7441)
   FetchContent_MakeAvailable(mlx)
 endif()
 
