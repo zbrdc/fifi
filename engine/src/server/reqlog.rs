@@ -7,6 +7,7 @@
 
 use super::error::ServerError;
 use super::wire::{FinishReason, Usage};
+use crate::sched::job::PrefixReport;
 use serde_json::json;
 use std::io::Write;
 use std::sync::{Arc, Mutex, PoisonError};
@@ -90,6 +91,11 @@ struct Entry<'a> {
     first_token: Option<Duration>,
     /// The tokens after the first batch and the time from the first to the last batch.
     decode: Option<(u32, Duration)>,
+    /// The prefix report of the job (packet SERVE-2-c item 4, fix M3). It is `None` until the
+    /// pump reads the `Finished` event of the request's own job, and `None` keeps the four
+    /// `prefix_*` keys out of the line — a cancelled, failed, refused, or stop-string request
+    /// logs no prefix keys, and neither does an executor without a prefix report.
+    prefix: Option<PrefixReport>,
 }
 
 /// Milliseconds with one decimal.
@@ -106,9 +112,11 @@ fn rate(tokens: u32, span: Duration) -> Option<f64> {
 }
 
 /// The log line without the final newline. `queue_wait_ms` is always `null`: the engine thread
-/// reports no start event, so the server cannot split the queue wait from the prefill.
+/// reports no start event, so the server cannot split the queue wait from the prefill. The four
+/// `prefix_*` keys appear only on a line whose request carried a prefix boundary (decision 0036,
+/// addendum 2, item 7; packet SERVE-2-c item 4).
 fn render(entry: &Entry<'_>) -> String {
-    json!({
+    let mut line = json!({
         "request_id": entry.request_id,
         "model": entry.model,
         "stream": entry.stream,
@@ -122,8 +130,19 @@ fn render(entry: &Entry<'_>) -> String {
         "queue_wait_ms": null,
         "time_to_first_token_ms": entry.first_token.map(millis),
         "decode_tokens_per_second": entry.decode.and_then(|(tokens, span)| rate(tokens, span)),
-    })
-    .to_string()
+    });
+    if let Some(prefix) = entry.prefix
+        && let Some(object) = line.as_object_mut()
+    {
+        object.insert("prefix_hit".to_string(), json!(prefix.hit.as_str()));
+        object.insert("prefix_entries".to_string(), json!(prefix.entries));
+        object.insert("prefix_bytes".to_string(), json!(prefix.bytes));
+        object.insert(
+            "prefix_uncached_shared".to_string(),
+            json!(prefix.uncached_shared),
+        );
+    }
+    line.to_string()
 }
 
 /// Follows one request from its prompt to its end and writes its line once.
@@ -142,6 +161,12 @@ pub(crate) struct RequestLog {
     last_batch: Option<Instant>,
     completion_tokens: u32,
     written: bool,
+    /// True after the handler marked a prefix boundary on this request: the line then carries
+    /// the four `prefix_*` keys (packet SERVE-2-c item 4) when the job's report arrived.
+    prefix_boundary: bool,
+    /// The prefix report of the job, set only when the pump read the request's `Finished`
+    /// event (fix M3). It stays `None` on a cancelled, failed, refused, or stop-string request.
+    prefix: Option<PrefixReport>,
 }
 
 impl RequestLog {
@@ -166,6 +191,8 @@ impl RequestLog {
             last_batch: None,
             completion_tokens: 0,
             written: false,
+            prefix_boundary: false,
+            prefix: None,
         }
     }
 
@@ -190,8 +217,25 @@ impl RequestLog {
         self.completion_tokens = self.completion_tokens.saturating_add(tokens);
     }
 
-    /// Writes the line of a reply that ended with `finish`.
-    pub(crate) fn done(&mut self, finish: FinishReason, usage: &Usage) {
+    /// Marks the request as one with a prefix boundary: its line then carries the four
+    /// `prefix_*` keys with the prefix report of its job (packet SERVE-2-c item 4), when the
+    /// job's `Finished` event is read. A request without a boundary keeps the old line byte for
+    /// byte.
+    pub(crate) fn set_prefix_boundary(&mut self) {
+        self.prefix_boundary = true;
+    }
+
+    /// Writes the line of a reply that ended with `finish` and carried the prefix report
+    /// `prefix`, which the pump read from the job's `Finished` event. The report lands in the
+    /// line's `prefix_*` keys only when the request had a boundary and the report arrived
+    /// (fix M3); `None` omits the keys.
+    pub(crate) fn done(
+        &mut self,
+        finish: FinishReason,
+        usage: &Usage,
+        prefix: Option<&PrefixReport>,
+    ) {
+        self.prefix = prefix.copied();
         self.write(
             Some(200),
             Outcome::Ok,
@@ -252,6 +296,7 @@ impl RequestLog {
             reused_tokens,
             first_token,
             decode,
+            prefix: self.prefix.filter(|_| self.prefix_boundary),
         };
         let mut line = render(&entry);
         line.push('\n');
@@ -273,6 +318,7 @@ impl Drop for RequestLog {
 mod tests {
     use super::{Entry, Outcome, RequestLog, default_clock, millis, rate, render, stepped_clock};
     use crate::EngError;
+    use crate::sched::job::{PrefixHit, PrefixReport};
     use crate::sched::worker::{Engine, EngineState};
     use crate::server::router::router;
     use crate::server::state::AppState;
@@ -289,7 +335,7 @@ mod tests {
 
     const CALL: &str = "<tool_call>\n<function=add>\n<parameter=a>\n1\n</parameter>\n<parameter=b>\n2\n</parameter>\n</function>\n</tool_call>";
 
-    /// The keys of every line, sorted.
+    /// The keys of every line without a prefix boundary, sorted.
     const KEYS: [&str; 13] = [
         "completion_tokens",
         "decode_tokens_per_second",
@@ -297,6 +343,28 @@ mod tests {
         "finish_reason",
         "model",
         "outcome",
+        "prompt_tokens",
+        "queue_wait_ms",
+        "request_id",
+        "reused_tokens",
+        "status",
+        "stream",
+        "time_to_first_token_ms",
+    ];
+
+    /// The keys of a line whose request carried a prefix boundary (packet SERVE-2-c item 4):
+    /// the thirteen keys above plus the four prefix keys, sorted.
+    const PREFIX_KEYS: [&str; 17] = [
+        "completion_tokens",
+        "decode_tokens_per_second",
+        "error_code",
+        "finish_reason",
+        "model",
+        "outcome",
+        "prefix_bytes",
+        "prefix_entries",
+        "prefix_hit",
+        "prefix_uncached_shared",
         "prompt_tokens",
         "queue_wait_ms",
         "request_id",
@@ -331,8 +399,23 @@ mod tests {
                 .collect()
         }
 
-        /// The lines as JSON. Each write must be one complete line with the right keys.
+        /// The lines as JSON. Each write must be one complete line whose keys are exactly the
+        /// thirteen keys of a request without a prefix boundary, so a stray prefix key fails
+        /// here. A caller whose requests carried a boundary and finished calls
+        /// `lines_with_prefix` instead.
         fn lines(&self) -> Vec<Value> {
+            self.lines_with_keys(&KEYS)
+        }
+
+        /// The lines as JSON of requests that carried a prefix boundary and finished: each
+        /// write must be one complete line whose keys are exactly the seventeen keys of a
+        /// boundary request.
+        fn lines_with_prefix(&self) -> Vec<Value> {
+            self.lines_with_keys(&PREFIX_KEYS)
+        }
+
+        /// The lines as JSON, each with exactly the `expected` key set, sorted.
+        fn lines_with_keys(&self, expected: &[&str]) -> Vec<Value> {
             self.writes()
                 .iter()
                 .map(|write| {
@@ -346,7 +429,7 @@ mod tests {
                         .map(String::as_str)
                         .collect();
                     keys.sort_unstable();
-                    assert_eq!(keys, KEYS, "{write}");
+                    assert_eq!(keys, expected, "the keys are not the expected set");
                     line
                 })
                 .collect()
@@ -384,6 +467,7 @@ mod tests {
             reused_tokens: 0,
             first_token: None,
             decode: None,
+            prefix: None,
         }
     }
 
@@ -466,7 +550,7 @@ mod tests {
         for _ in 0..batches {
             log.batch(1);
         }
-        log.done(FinishReason::Length, &Usage::new(21, batches, 0));
+        log.done(FinishReason::Length, &Usage::new(21, batches, 0), None);
         drop(log);
         let mut lines = capture.lines();
         assert_eq!(lines.len(), 1, "{lines:?}");
@@ -493,6 +577,47 @@ mod tests {
         assert_eq!(flat["decode_tokens_per_second"], Value::Null, "{flat}");
     }
 
+    /// A line whose request carried a prefix boundary carries the four prefix keys with the
+    /// report of its job (packet SERVE-2-c item 4). The keys land after the thirteen old keys.
+    ///
+    /// Mutation check (the keys-without-a-boundary patch): rendering the prefix keys
+    /// unconditionally makes the byte-for-byte test of a boundary-free request fail.
+    #[test]
+    fn a_line_of_a_request_with_a_boundary_carries_the_four_prefix_keys() {
+        let entry = Entry {
+            prefix: Some(PrefixReport {
+                entries: 3,
+                bytes: 422_379_520,
+                hit: PrefixHit::Root,
+                uncached_shared: 6,
+            }),
+            ..empty_entry()
+        };
+        let line: Value = serde_json::from_str(&render(&entry)).expect("json");
+        assert_eq!(
+            line,
+            json!({
+                "request_id": null,
+                "model": "m",
+                "stream": false,
+                "status": null,
+                "outcome": "cancelled",
+                "error_code": null,
+                "finish_reason": null,
+                "prompt_tokens": 0,
+                "completion_tokens": 0,
+                "reused_tokens": 0,
+                "queue_wait_ms": null,
+                "time_to_first_token_ms": null,
+                "decode_tokens_per_second": null,
+                "prefix_hit": "root",
+                "prefix_entries": 3,
+                "prefix_bytes": 422379520,
+                "prefix_uncached_shared": 6,
+            })
+        );
+    }
+
     #[test]
     fn a_line_goes_out_in_one_write_and_the_drop_adds_none() {
         let capture = Capture::default();
@@ -503,7 +628,7 @@ mod tests {
         log.batch(0);
         log.batch(1);
         log.batch(2);
-        log.done(FinishReason::Stop, &Usage::new(4, 3, 1));
+        log.done(FinishReason::Stop, &Usage::new(4, 3, 1), None);
         drop(log);
         let lines = capture.lines();
         assert_eq!(lines.len(), 1, "{:?}", capture.writes());
@@ -528,7 +653,7 @@ mod tests {
     #[test]
     fn a_sink_that_fails_loses_the_line_and_nothing_else() {
         let mut log = RequestLog::new(Arc::new(Mutex::new(Broken)), default_clock(), "m", false, 4);
-        log.done(FinishReason::Stop, &Usage::new(4, 0, 0));
+        log.done(FinishReason::Stop, &Usage::new(4, 0, 0), None);
         drop(log);
     }
 
@@ -586,7 +711,7 @@ mod tests {
             assert_eq!(status, StatusCode::OK);
             replies.push(testkit::json_of(&bytes));
         }
-        let lines = capture.lines();
+        let lines = capture.lines_with_prefix();
         assert_eq!(lines.len(), 2, "{lines:?}");
         assert_eq!(lines[0]["reused_tokens"], 0, "first line");
         assert_eq!(lines[1]["reused_tokens"], 10, "second line");
@@ -594,6 +719,236 @@ mod tests {
             lines[1]["reused_tokens"],
             replies[1]["usage"]["reused_tokens"]
         );
+    }
+
+    /// A router over one engine at the addendum 2 prefix limits (two roots, six entries) whose
+    /// entry has `prefix_reuse` on, and the capture of its request log.
+    fn prefix_app(engine: &Engine) -> (Router, Capture) {
+        testkit::wait_for_state(&engine.handle(), EngineState::Ready);
+        let capture = Capture::default();
+        let mut entry = testkit::entry("e1", "model-a", engine, 4_096);
+        entry.prefix_reuse = true;
+        let state = AppState::new(testkit::API_KEY, vec![entry]).with_request_log(capture.clone());
+        (router(Arc::new(state)), capture)
+    }
+
+    /// Two conversations that share a system prompt of 2,100 "a" bytes; the first user turn is
+    /// "hi", the second "yo". Under the fixture tokenizer every ASCII byte is one id and every
+    /// special marker is one id, so the system message renders as `<|im_start|>` (1) +
+    /// "system\n" (7) + 2,100 + `<|im_end|>` (1) + "\n" (1) = 2,110 ids (the root), each user
+    /// turn as `<|im_start|>` (1) + "user\n" + content + `<|im_end|>` (1) + "\n" (1) = 10 ids,
+    /// and the generation tail `<|im_start|>assistant\n` as 11 ids: every prompt holds 2,131
+    /// ids with its boundary (the tip) at 2,120. The two user turns share the six header ids
+    /// 2,110..2,115 (`<|im_start|>` + "user\n") and diverge at the seventh ("y" against
+    /// "h"), so the second conversation restores the root, shares 6 ids with the stored tip
+    /// beyond it, and restores no tip.
+    fn same_system_conversations() -> [Value; 2] {
+        let system = "a".repeat(2_100);
+        let turn = |content: &str| {
+            request(json!({"messages": [
+                {"role": "system", "content": system},
+                {"role": "user", "content": content},
+            ]}))
+        };
+        [turn("hi"), turn("yo")]
+    }
+
+    #[tokio::test]
+    async fn the_first_request_with_a_boundary_logs_a_miss_and_the_two_entries() {
+        let engine = testkit::engine_with_prefix_limits(
+            [testkit::script("a"), testkit::script("b")].concat(),
+            2,
+            6,
+        );
+        let (app, capture) = prefix_app(&engine);
+        let first = same_system_conversations();
+        let post = testkit::post_json("/v1/chat/completions", &first[0]);
+        let (status, _headers, bytes) = testkit::send(&app, post).await;
+        assert_eq!(status, StatusCode::OK);
+        let reply = testkit::json_of(&bytes);
+        let lines = capture.lines_with_prefix();
+        assert_eq!(lines.len(), 1, "{lines:?}");
+        let line = &lines[0];
+        assert_eq!(line["prompt_tokens"], 2_131, "{line}");
+        // The store was empty at the restore and holds the root and the tip after the prefill:
+        // the worker takes the report after the job's save points.
+        assert_eq!(line["prefix_hit"], "miss", "{line}");
+        assert_eq!(line["prefix_entries"], 2, "the root and the tip, {line}");
+        // The fake charges a flat 1,000 bytes per stored entry (fix L3), and the value flows
+        // worker → `JobUsage` → the reply pump → this line.
+        assert_eq!(
+            line["prefix_bytes"], 2_000,
+            "two entries at 1,000 charged bytes each, {line}"
+        );
+        assert_eq!(line["prefix_uncached_shared"], 0, "{line}");
+        // The rendered line itself, not only its parsed keys (fix L4): the thirteen old keys in
+        // their render order, then the four prefix keys in theirs, in one write.
+        let want = json!({
+            "request_id": reply["id"],
+            "model": "model-a",
+            "stream": false,
+            "status": 200,
+            "outcome": "ok",
+            "error_code": null,
+            "finish_reason": "stop",
+            "prompt_tokens": 2_131,
+            "completion_tokens": 2,
+            "reused_tokens": 0,
+            "queue_wait_ms": null,
+            "time_to_first_token_ms": 2.0,
+            "decode_tokens_per_second": 500.0,
+            "prefix_hit": "miss",
+            "prefix_entries": 2,
+            "prefix_bytes": 2_000,
+            "prefix_uncached_shared": 0,
+        });
+        assert_eq!(capture.writes(), vec![format!("{want}\n")]);
+    }
+
+    #[tokio::test]
+    async fn the_second_conversation_with_the_same_system_prompt_logs_the_root_hit() {
+        let engine = testkit::engine_with_prefix_limits(
+            [testkit::script("a"), testkit::script("b")].concat(),
+            2,
+            6,
+        );
+        let (app, capture) = prefix_app(&engine);
+        for body in same_system_conversations() {
+            let post = testkit::post_json("/v1/chat/completions", &body);
+            let (status, _headers, _bytes) = testkit::send(&app, post).await;
+            assert_eq!(status, StatusCode::OK);
+        }
+        let lines = capture.lines_with_prefix();
+        assert_eq!(lines.len(), 2, "{lines:?}");
+        let line = &lines[1];
+        assert_eq!(
+            line["reused_tokens"], 2_110,
+            "the root covers the system prompt"
+        );
+        assert_eq!(line["prefix_hit"], "root", "the root restored, not a tip");
+        // The tip of the first conversation shares the template header
+        // `<|im_start|>user\n` — the ids 2,110..2,115 — with the second conversation's user
+        // turn "yo" before the two diverge ("y" against "h"), so the longest common prefix
+        // with the stored tip is 2,116 tokens: 6 beyond the restored root are shared with a
+        // stored key that no checkpoint covered (fix M2).
+        assert_eq!(
+            line["prefix_uncached_shared"], 6,
+            "the header of the user turn is shared but uncached, {line}"
+        );
+        assert_eq!(
+            line["prefix_entries"], 3,
+            "the root and the two tips, {line}"
+        );
+        assert_eq!(
+            line["prefix_bytes"], 3_000,
+            "three entries at 1,000 charged bytes each (fix L3), {line}"
+        );
+    }
+
+    /// A line of a request that never read its job's `Finished` event carries no prefix keys
+    /// (fix M3): a stream that the client drops is cancelled, so the pump reads no report even
+    /// though the request had a boundary and the engine had a store.
+    ///
+    /// Mutation check: emitting the four keys whenever the boundary flag is set (with a
+    /// zeroed report) fails the keys row.
+    #[tokio::test]
+    async fn a_cancelled_request_with_a_boundary_logs_no_prefix_keys() {
+        let engine = testkit::engine_with_prefix_limits(testkit::script(&"a".repeat(2_100)), 2, 6);
+        let (app, capture) = prefix_app(&engine);
+        let first = same_system_conversations();
+        let mut body = request(json!({"stream": true}));
+        body["messages"] = first[0]["messages"].clone();
+        let post = testkit::post_json("/v1/chat/completions", &body);
+        let response = tower::ServiceExt::oneshot(app.clone(), post)
+            .await
+            .expect("response");
+        let mut frames = response.into_body().into_data_stream();
+        // The role chunk and the first content chunk show that the pump read a batch.
+        for _ in 0..2 {
+            frames.next().await.expect("a frame").expect("frame bytes");
+        }
+        drop(frames);
+        testkit::wait_until("the cancelled line", || !capture.writes().is_empty());
+        let lines = capture.lines();
+        assert_eq!(lines.len(), 1, "{lines:?}");
+        let line = &lines[0];
+        assert_eq!(line["outcome"], "cancelled", "{line}");
+        let mut keys: Vec<&str> = line
+            .as_object()
+            .expect("object")
+            .keys()
+            .map(String::as_str)
+            .collect();
+        keys.sort_unstable();
+        assert_eq!(
+            keys, KEYS,
+            "a cancelled request logs the thirteen old keys and no prefix key"
+        );
+    }
+
+    /// A request that the server refused before admission never ran a job, so it carries no
+    /// prefix keys either (fix M3), although its engine entry turns `prefix_reuse` on.
+    ///
+    /// Mutation check: emitting the four keys whenever the boundary flag is set (with a
+    /// zeroed report) fails the keys row.
+    #[tokio::test]
+    async fn a_refused_request_with_a_boundary_engine_logs_no_prefix_keys() {
+        let engine = testkit::engine_with_prefix_limits(Vec::new(), 2, 6);
+        testkit::wait_for_state(&engine.handle(), EngineState::Ready);
+        let capture = Capture::default();
+        let mut entry = testkit::entry("e1", "model-a", &engine, 21);
+        entry.prefix_reuse = true;
+        let state = AppState::new(testkit::API_KEY, vec![entry]).with_request_log(capture.clone());
+        let app = router(Arc::new(state));
+        let post = testkit::post_json("/v1/chat/completions", &request(json!({})));
+        let (status, _headers, _bytes) = testkit::send(&app, post).await;
+        assert_eq!(status, StatusCode::CONFLICT);
+        let lines = capture.lines();
+        assert_eq!(lines.len(), 1, "{lines:?}");
+        let line = &lines[0];
+        assert_eq!(line["outcome"], "error", "{line}");
+        assert_eq!(line["error_code"], "context_limit", "{line}");
+        let mut keys: Vec<&str> = line
+            .as_object()
+            .expect("object")
+            .keys()
+            .map(String::as_str)
+            .collect();
+        keys.sort_unstable();
+        assert_eq!(
+            keys, KEYS,
+            "a refused request logs the thirteen old keys and no prefix key"
+        );
+    }
+
+    #[tokio::test]
+    async fn the_line_of_a_request_without_a_boundary_stays_byte_for_byte() {
+        let probes = testkit::probes(Duration::ZERO);
+        let (app, capture) = app(&probes.engine, 100_000);
+        let body = request(json!({"temperature": 0, "max_tokens": 5}));
+        let post = testkit::post_json("/v1/chat/completions", &body);
+        let (status, _headers, bytes) = testkit::send(&app, post).await;
+        assert_eq!(status, StatusCode::OK);
+        let reply = testkit::json_of(&bytes);
+        // The exact bytes of the old line: the same thirteen keys, in the render order, with
+        // the values of this request; the stepped test clock makes the timings exact. A line
+        // that gained the prefix keys of a request without a boundary fails here.
+        let want = json!({
+            "request_id": reply["id"],
+            "model": "model-a",
+            "stream": false,
+            "status": 200,
+            "outcome": "ok",
+            "error_code": null,
+            "finish_reason": "length",
+            "prompt_tokens": 21,
+            "completion_tokens": 5,
+            "reused_tokens": 0,
+            "queue_wait_ms": null,
+            "time_to_first_token_ms": 2.0,
+            "decode_tokens_per_second": 500.0,
+        });
+        assert_eq!(capture.writes(), vec![format!("{}\n", want)]);
     }
 
     #[tokio::test]

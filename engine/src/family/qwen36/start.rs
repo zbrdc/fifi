@@ -25,13 +25,23 @@ use super::resident::executor::{Q36Executor, Q36Rules};
 use super::settings::{NO_BUDGET_PIECE, Q36Settings, tokenizer_pin};
 use crate::{
     EngError,
+    family::session::StoreLimits,
     sched::worker::{Engine, spawn_engine},
     tokenizer::TokenizerBundle,
 };
 
+/// The prefix-store limits of a `prefix_reuse` engine (decision 0036, addendum 2): two pinned
+/// roots and six LRU entries. An engine without the flag keeps the addendum 1 store.
+const PREFIX_STORE_LIMITS: StoreLimits = StoreLimits {
+    roots: 2,
+    entries: 6,
+};
+
 /// The rules of one engine, built from the settings and the pinned tokenizer facts. Every
 /// setting that the decoder reads travels here in one place: `compile` is the `qwen36.compile`
-/// member, so a settings change reaches the decoder exactly through this function.
+/// member, so a settings change reaches the decoder exactly through this function, and
+/// `prefix_reuse` (set by the factory after `Q36Settings::new`) picks the prefix-store limits:
+/// the addendum 2 set with the flag on, the addendum 1 store without it.
 fn rules_of(settings: &Q36Settings, eos: Vec<u32>, sampler_vocab: usize) -> Q36Rules {
     Q36Rules {
         eos,
@@ -41,6 +51,11 @@ fn rules_of(settings: &Q36Settings, eos: Vec<u32>, sampler_vocab: usize) -> Q36R
         activation: settings.activation,
         kv_dtype: settings.kv,
         compile: settings.compile,
+        prefix_store: if settings.prefix_reuse {
+            PREFIX_STORE_LIMITS
+        } else {
+            StoreLimits::default()
+        },
     }
 }
 
@@ -117,6 +132,7 @@ pub(super) fn plan_prefill(
 mod tests {
     use super::rules_of;
     use crate::family::qwen36::settings::{Backend, Q36Env, Q36Options, Q36Settings};
+    use crate::family::session::StoreLimits;
     use std::path::Path;
 
     /// The rules of the engine thread carry the `qwen36.compile` member of the settings: `start`
@@ -155,6 +171,50 @@ mod tests {
         assert!(
             !rules_of(&without, vec![248_046], 8).compile,
             "off stays off through the whole start path"
+        );
+    }
+
+    /// The rules carry the prefix-store limits of the `prefix_reuse` flag (packet SERVE-2-c
+    /// item 1; decision 0036, addendum 2): the factory sets the flag on the settings after
+    /// `new`, and `rules_of` maps it to the addendum 2 limits (two pinned roots, six LRU
+    /// entries); with the flag off the rules keep the addendum 1 store (zero roots, one
+    /// entry), so every engine started without the flag behaves exactly as before.
+    ///
+    /// Mutation check (the limits-ignored patch): with `StoreLimits::default()` in both arms,
+    /// the (2, 6) row fails.
+    #[test]
+    fn the_rules_carry_the_prefix_store_limits_of_the_prefix_reuse_flag() {
+        let settings = |flag: bool| {
+            let mut settings = Q36Settings::new(
+                Path::new("/m"),
+                Path::new("/t"),
+                Some(&Q36Options {
+                    cache_limit_bytes: Some(1024),
+                    ..Q36Options::default()
+                }),
+                &Q36Env::default(),
+                Backend::Mlx,
+            )
+            .unwrap();
+            // The factory sets the flag after `new`; the test does the same.
+            settings.prefix_reuse = flag;
+            settings
+        };
+        assert_eq!(
+            rules_of(&settings(true), vec![248_046], 8).prefix_store,
+            StoreLimits {
+                roots: 2,
+                entries: 6
+            },
+            "a prefix_reuse engine keeps the addendum 2 set (a literal, not the constant)"
+        );
+        assert_eq!(
+            rules_of(&settings(false), vec![248_046], 8).prefix_store,
+            StoreLimits {
+                roots: 0,
+                entries: 1
+            },
+            "a literal, not the default under test: off keeps the addendum 1 store"
         );
     }
 }

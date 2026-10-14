@@ -13,6 +13,7 @@
 
 use crate::EngError;
 use crate::family::executor::GenerationState;
+use crate::family::session::SaveKind;
 use crate::tokenizer::{DecodeBatch, DecodeFinish};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -34,6 +35,82 @@ pub(crate) struct JobUsage {
     /// Prompt tokens served from the saved prefix state (decision 0036, addendum 1). It is 0
     /// unless the job carries a prefix boundary and the executor restored a saved prefix.
     pub(crate) reused_tokens: u32,
+    /// The prefix-store report of the job (decision 0036, addendum 2; packet SERVE-2-c item
+    /// 3), taken after the prefill: the store of a job with a prefix boundary, or `None`
+    /// when the executor keeps no prefix report (the default of `ExecutorOps::prefix_report`).
+    pub(crate) prefix: Option<PrefixReport>,
+}
+
+/// The kind of the stored prefix entry that a job restored (decision 0036, addendum 2; packet
+/// SERVE-2-c item 3), for the request-log field `prefix_hit`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum PrefixHit {
+    /// No stored entry matched the prompt.
+    Miss,
+    /// The job restored a pinned root.
+    Root,
+    /// The job restored a periodic checkpoint.
+    Periodic,
+    /// The job restored a tip entry.
+    Tip,
+}
+
+impl PrefixHit {
+    /// The name of the request-log field `prefix_hit`.
+    pub(crate) fn as_str(self) -> &'static str {
+        match self {
+            PrefixHit::Miss => "miss",
+            PrefixHit::Root => "root",
+            PrefixHit::Periodic => "periodic",
+            PrefixHit::Tip => "tip",
+        }
+    }
+}
+
+/// The prefix-hit class of the entry a restore took (fix L5): `Some(kind)` maps to its own
+/// class and `None` (nothing restored) to `Miss`. The one mapping that the executors share.
+impl From<Option<SaveKind>> for PrefixHit {
+    fn from(kind: Option<SaveKind>) -> Self {
+        match kind {
+            Some(SaveKind::Root) => PrefixHit::Root,
+            Some(SaveKind::Periodic) => PrefixHit::Periodic,
+            Some(SaveKind::Tip) => PrefixHit::Tip,
+            None => PrefixHit::Miss,
+        }
+    }
+}
+
+/// The prefix-store facts of one job (decision 0036, addendum 2; packet SERVE-2-c item 3):
+/// what the engine's store holds after the job's save points and what the job restored. The
+/// worker takes it after the prefill, before the first decode, and carries it in `JobUsage`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct PrefixReport {
+    /// The entries the store holds after the job's save points, pinned roots and LRU entries
+    /// together.
+    pub(crate) entries: u32,
+    /// The charged bytes of the stored snapshots (the measured cost, report M0): each entry
+    /// charges the KV bytes of its positions plus its fixed state bytes, and the executor sums
+    /// the charge of its own entries. The store never sizes a snapshot, and an executor
+    /// without a charge reports 0.
+    pub(crate) bytes: u64,
+    /// The kind of the entry the job restored, or `Miss` when nothing restored.
+    pub(crate) hit: PrefixHit,
+    /// Prompt tokens shared with the longest stored key beyond the restored prefix: tokens
+    /// that were shared with a stored key but not covered by a checkpoint. It is 0 when the
+    /// longest stored key equals the restored prefix.
+    pub(crate) uncached_shared: u32,
+}
+
+impl Default for PrefixReport {
+    /// The report of an executor that keeps no prefix state: all zero with a `Miss`.
+    fn default() -> Self {
+        Self {
+            entries: 0,
+            bytes: 0,
+            hit: PrefixHit::Miss,
+            uncached_shared: 0,
+        }
+    }
 }
 
 /// One message from the engine thread to the owner of a job.
@@ -180,13 +257,14 @@ pub(super) fn send_cancelled(events: &mpsc::Sender<JobEvent>, prompt_tokens: u32
             prompt_tokens,
             completion_tokens: 0,
             reused_tokens: 0,
+            prefix: None,
         }),
     );
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{EVENT_CAPACITY, Job, JobEvent, JobUsage};
+    use super::{EVENT_CAPACITY, Job, JobEvent, JobUsage, PrefixHit, PrefixReport};
     use crate::EngError;
     use crate::family::executor::GenerationState;
     use crate::tokenizer::{IncrementalDecoder, Tokenizer};
@@ -204,7 +282,57 @@ mod tests {
             prompt_tokens: 1,
             completion_tokens: 0,
             reused_tokens: 0,
+            prefix: None,
         })
+    }
+
+    /// The default report of an executor that keeps no prefix state is all zero with a `Miss`,
+    /// and each hit kind carries its request-log name (packet SERVE-2-c item 3).
+    #[test]
+    fn a_default_prefix_report_is_all_zero_with_a_miss_and_the_hits_have_names() {
+        assert_eq!(
+            PrefixReport::default(),
+            PrefixReport {
+                entries: 0,
+                bytes: 0,
+                hit: PrefixHit::Miss,
+                uncached_shared: 0
+            },
+            "a literal, not the default under test"
+        );
+        let names = [
+            (PrefixHit::Miss, "miss"),
+            (PrefixHit::Root, "root"),
+            (PrefixHit::Periodic, "periodic"),
+            (PrefixHit::Tip, "tip"),
+        ];
+        for (hit, name) in names {
+            assert_eq!(hit.as_str(), name, "{hit:?}");
+        }
+    }
+
+    /// The `From` mapping of the restored kind (fix L5): every `SaveKind` names its own class
+    /// and `None` names a `Miss`. The `Periodic` row is the one no other test reaches, because
+    /// the store-level tests restore roots and tips only.
+    ///
+    /// Mutation check: mapping `Some(SaveKind::Periodic)` to `PrefixHit::Tip` fails the
+    /// periodic row.
+    #[test]
+    fn the_restored_kind_maps_to_its_prefix_hit_class() {
+        use crate::family::session::SaveKind;
+        let hits = [
+            (None, PrefixHit::Miss),
+            (Some(SaveKind::Root), PrefixHit::Root),
+            (Some(SaveKind::Periodic), PrefixHit::Periodic),
+            (Some(SaveKind::Tip), PrefixHit::Tip),
+        ];
+        for (kind, want) in hits {
+            assert_eq!(
+                PrefixHit::from(kind),
+                want,
+                "kind {kind:?} must name its own class"
+            );
+        }
     }
 
     #[test]

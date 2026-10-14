@@ -80,6 +80,8 @@ For the `f32` cache form the growth is 40,960 bytes per position (2,750,218,240 
 A run with `prefix_reuse` on and the default limit must therefore set `session_cap_bytes` of at least 5,770,117,120.
 A smaller cap would let a later job fail with `MemoryPlan` although the same job succeeds with `prefix_reuse` off.
 The rule is `Q36Settings::check_prefix_reuse_cap` in `engine/src/family/qwen36/settings.rs`; the shipped JSON does not turn `prefix_reuse` on.
+With the flag on, the Q36 engine keeps up to 2 pinned roots and 6 LRU entries of decision 0036, addendum 2.
+Each entry's charged bytes are the KV bytes of its positions plus 65,863,680 bytes of DeltaNet state, as measured; the cap rule above is unchanged, because roots and periodic entries are best effort inside the cap and never fail an engine start.
 
 ## Evidence
 

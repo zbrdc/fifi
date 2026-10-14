@@ -10,7 +10,7 @@ use super::pieces::{Piece, ReplyParser};
 use super::reqlog::RequestLog;
 use super::wire::{FinishReason, ReplyParts, ToolCall, Usage};
 use crate::EngError;
-use crate::sched::job::{JobEvent, JobHandle};
+use crate::sched::job::{JobEvent, JobHandle, JobUsage, PrefixReport};
 use crate::tokenizer::{DecodeBatch, DecodeFinish, OutputAssembler};
 
 /// What the pump learned from one event.
@@ -42,6 +42,10 @@ pub(crate) struct RunningJob {
     /// the `Finished` event, which the pump reads after a job that ended by itself. A reply that a
     /// stop string ended reports 0, because the pump does not wait for the cancelled job.
     reused: u32,
+    /// The prefix-store report of the job (packet SERVE-2-c item 3, fix M3), read from the same
+    /// `Finished` event as `reused`, with the same fallback: it stays `None` unless the pump read
+    /// the event, so a cancelled, failed, refused, or stop-string reply logs no prefix keys.
+    prefix: Option<PrefixReport>,
     calls: u32,
     /// The log of the request. A writer that ends the request without a step writes through it.
     pub(crate) log: RequestLog,
@@ -71,6 +75,7 @@ impl RunningJob {
             prompt_tokens,
             produced: 0,
             reused: 0,
+            prefix: None,
             calls: 0,
             log,
         }
@@ -105,7 +110,9 @@ impl RunningJob {
                         batch.finish,
                         Some(DecodeFinish::Stop | DecodeFinish::Length)
                     ) {
-                        self.reused = self.read_reused().await;
+                        let usage = self.read_finished().await;
+                        self.reused = usage.reused_tokens;
+                        self.prefix = usage.prefix;
                     }
                     if let Some(step) = self.on_batch(&batch)? {
                         return Ok(step);
@@ -119,11 +126,16 @@ impl RunningJob {
 
     /// Reads the event that follows the last batch of a job that ended by itself. The engine sends
     /// the `Finished` event right after that batch, and the channel always has room for it. Any
-    /// other event, or a closed channel, gives 0.
-    async fn read_reused(&mut self) -> u32 {
+    /// other event, or a closed channel, gives the zero usage with no prefix report.
+    async fn read_finished(&mut self) -> JobUsage {
         match self.handle.events.recv().await {
-            Some(JobEvent::Finished(usage)) => usage.reused_tokens,
-            _ => 0,
+            Some(JobEvent::Finished(usage)) => usage,
+            _ => JobUsage {
+                prompt_tokens: 0,
+                completion_tokens: 0,
+                reused_tokens: 0,
+                prefix: None,
+            },
         }
     }
 
@@ -156,7 +168,7 @@ impl RunningJob {
             finish
         };
         let usage = Usage::new(self.prompt_tokens, self.produced, self.reused);
-        self.log.done(finish, &usage);
+        self.log.done(finish, &usage, self.prefix.as_ref());
         Step::Done {
             pieces,
             finish,
@@ -247,6 +259,32 @@ mod tests {
         )
     }
 
+    /// A log sink that keeps every write, for the tests that read the request-log line.
+    #[derive(Clone, Default)]
+    struct Capture(Arc<Mutex<Vec<u8>>>);
+
+    impl std::io::Write for Capture {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            self.0
+                .lock()
+                .expect("capture lock")
+                .extend_from_slice(bytes);
+            Ok(bytes.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl Capture {
+        /// Everything written so far, as one line of text.
+        fn text(&self) -> String {
+            let bytes = self.0.lock().expect("capture lock");
+            String::from_utf8(bytes.clone()).expect("utf-8 write")
+        }
+    }
+
     fn head() -> ReplyHead {
         ReplyHead {
             id: "chatcmpl-0000000000000001".to_string(),
@@ -268,6 +306,17 @@ mod tests {
         budget: u32,
         boundary: Option<usize>,
     ) -> (RunningJob, Arc<AtomicBool>) {
+        submit_logged(engine, stops, budget, boundary, silent())
+    }
+
+    /// `submit` with the pump's request log given by the caller.
+    fn submit_logged(
+        engine: &Engine,
+        stops: &[&str],
+        budget: u32,
+        boundary: Option<usize>,
+        log: RequestLog,
+    ) -> (RunningJob, Arc<AtomicBool>) {
         let bundle = testkit::bundle();
         let generation = GenerationState::new(IncrementalDecoder::new(bundle.tokenizer()))
             .with_max_tokens(budget);
@@ -285,10 +334,7 @@ mod tests {
             &[testkit::add_tool()],
             &head().call_prefix(),
         );
-        (
-            RunningJob::new(handle, assembler, parser, 3, silent()),
-            cancel,
-        )
+        (RunningJob::new(handle, assembler, parser, 3, log), cancel)
     }
 
     async fn steps(job: &mut RunningJob) -> Vec<Step> {
@@ -340,6 +386,41 @@ mod tests {
                 },
             ]
         );
+    }
+
+    /// The pump hands the prefix report of the `Finished` event to the request log (fix L3):
+    /// the value flows worker → `JobUsage` → this pump → the log line. The fake charges a flat
+    /// 1,000 bytes per stored entry, and this boundary job stores one tip of two tokens, so
+    /// the line of the finished request carries the four prefix keys with `prefix_bytes` 1000.
+    ///
+    /// Mutation check: zeroing `bytes` in the fake's report makes the `prefix_bytes` row fail.
+    #[tokio::test]
+    async fn a_finished_job_hands_its_prefix_report_to_the_request_log() {
+        let engine = testkit::engine(testkit::script("a"));
+        let capture = Capture::default();
+        let mut log = RequestLog::new(
+            Arc::new(Mutex::new(capture.clone())),
+            default_clock(),
+            "m",
+            false,
+            3,
+        );
+        log.set_prefix_boundary();
+        let (mut job, _cancel) = submit_logged(&engine, &[], 100, Some(2), log);
+        let found = steps(&mut job).await;
+        assert!(
+            matches!(found.last(), Some(Step::Done { .. })),
+            "the reply finished"
+        );
+        let line: serde_json::Value =
+            serde_json::from_str(capture.text().trim_end()).expect("the log line");
+        assert_eq!(line["prefix_hit"], "miss", "{line}");
+        assert_eq!(line["prefix_entries"], 1, "one stored tip, {line}");
+        assert_eq!(
+            line["prefix_bytes"], 1_000,
+            "one entry at 1,000 bytes, {line}"
+        );
+        assert_eq!(line["prefix_uncached_shared"], 0, "{line}");
     }
 
     #[tokio::test]

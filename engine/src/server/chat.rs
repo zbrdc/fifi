@@ -160,6 +160,9 @@ async fn submit(state: &AppState, input: ChatInput) -> Result<Submitted, ServerE
                 )
             })?;
         }
+        // The line of this request carries the prefix fields (packet SERVE-2-c item 4); a
+        // request without a boundary keeps the old line byte for byte.
+        log.set_prefix_boundary();
     }
     entry
         .handle

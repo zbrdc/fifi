@@ -1909,7 +1909,11 @@ mod tests {
                 Some(JobUsage {
                     prompt_tokens: u32::try_from(prompt.len()).unwrap(),
                     completion_tokens: 4,
-                    reused_tokens: reused
+                    reused_tokens: reused,
+                    // The Flash-Next executor keeps the default `prefix_report` (`None`, fix
+                    // M3): although it saves and restores tips, it reports no store facts, so
+                    // its request lines omit the four `prefix_*` keys.
+                    prefix: None
                 }),
                 "round {round}: usage"
             );
@@ -2171,7 +2175,8 @@ mod tests {
                 Some(JobUsage {
                     prompt_tokens,
                     completion_tokens: 8,
-                    reused_tokens: 0
+                    reused_tokens: 0,
+                    prefix: None
                 }),
                 "round {round}: usage"
             );

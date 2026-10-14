@@ -57,6 +57,7 @@ use crate::family::qwen36::host::HostShape;
 use crate::family::qwen36::host_load::HostWeights;
 use crate::family::qwen36::settings::Activation;
 use crate::family::qwen36::tiny::{self, TINY_GQA};
+use crate::family::session::StoreLimits;
 use crate::family::spec::QWEN3_6_35B_A3B;
 use crate::kernels::MlxKernels;
 use crate::kernels::mlx::compile_stats;
@@ -590,6 +591,7 @@ fn rules_with_compile_true_warm_the_decoder_at_open() {
     // The cache growth of the tiny model per position: 2 attention layers of 2 key-value heads
     // of width 32, keys and values, F32 — 2 * 2 * 32 * 2 * 4 bytes.
     let rules = |compile| Q36Rules {
+        prefix_store: StoreLimits::default(),
         eos: vec![],
         sampler_vocab: 8,
         context_limit: 8,

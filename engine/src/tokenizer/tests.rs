@@ -2216,6 +2216,85 @@ fn the_pinned_template_gives_a_root_that_covers_the_tools_block() {
     assert_eq!(ids[..system_ids.len()], system_ids[..], "root ids lead");
 }
 
+/// A system message with empty or whitespace-only content still gives a root (packet
+/// SERVE-2-c item 5, left open by the SERVE-2-b review): the pinned template trims the
+/// content of a system message (`render_content(...)|trim`), so every whitespace-only
+/// content renders as the empty system block `<|im_start|>system\n<|im_end|>\n`, and the
+/// root equals that text's encoded length. Hand-derived from the template text: the marker
+/// (1 id), "system\n" (7 bytes), the end marker (1 id), and the newline (1 byte).
+#[test]
+fn the_pinned_template_gives_a_root_for_an_empty_system_message() {
+    let bundle = pinned_bundle();
+    let empty = fixture_tokenizer()
+        .encode(&format!("{SYSTEM_MARKER}{IM_END}"))
+        .expect("encode the empty system block");
+    assert!(!empty.is_empty(), "a vacuous root of zero tokens");
+    for content in ["", " ", " \n\t "] {
+        let messages = [system_message(content), user_message("hi")];
+        let (ids, boundaries) = bundle
+            .encode_prompt_with_boundary(&messages, &[], Thinking::Default)
+            .expect("encode");
+        assert_eq!(
+            boundaries.root,
+            Some(empty.len()),
+            "content {content:?}: the trimmed system block is the root"
+        );
+        assert_eq!(
+            &ids[..empty.len()],
+            &empty[..],
+            "content {content:?}: root ids lead"
+        );
+    }
+}
+
+/// The root is identical for the three `Thinking` settings (packet SERVE-2-c item 5): the
+/// settings change only the generation prompt that the template appends (`<think>\n` with
+/// thinking on or default, `<think>\n\n</think>\n\n` with it off), never the head or the
+/// system block inside it, so the root cannot depend on them.
+#[test]
+fn the_root_is_identical_for_the_three_thinking_settings() {
+    let bundle = pinned_bundle();
+    let messages = [system_message("You are terse."), user_message("hi")];
+    let want = fixture_tokenizer()
+        .encode(&format!("{SYSTEM_MARKER}You are terse.{IM_END}"))
+        .expect("encode the system block")
+        .len();
+    for thinking in [Thinking::Default, Thinking::On, Thinking::Off] {
+        let (_ids, boundaries) = bundle
+            .encode_prompt_with_boundary(&messages, &[], thinking)
+            .expect("encode");
+        assert_eq!(
+            boundaries.root,
+            Some(want),
+            "{thinking:?}: the head does not depend on the thinking setting"
+        );
+    }
+}
+
+/// Tools with a non-system first message give no root (packet SERVE-2-c item 5): the template
+/// writes its tools block inside a system block even when the first message is a user
+/// message, but the root is the end of the first MESSAGE, and only a system message opens
+/// one, so the root stays `None` while the tip is set.
+#[test]
+fn tools_with_a_non_system_first_message_give_no_root() {
+    let bundle = pinned_bundle();
+    let tool = ToolSpec(serde_json::json!({"name": "f"}));
+    let messages = [user_message("hi")];
+    let (ids, boundaries) = bundle
+        .encode_prompt_with_boundary(&messages, std::slice::from_ref(&tool), Thinking::Off)
+        .expect("encode");
+    assert_eq!(
+        boundaries.root, None,
+        "the first message is not a system message"
+    );
+    assert!(
+        boundaries.tip.is_some_and(|tip| tip > 0 && tip < ids.len()),
+        "the head still has a boundary inside the prompt: {:?} of {} ids",
+        boundaries,
+        ids.len()
+    );
+}
+
 #[test]
 fn the_pinned_template_renders_the_tools_block_inside_the_head() {
     let template = pinned_template();

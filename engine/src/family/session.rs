@@ -342,6 +342,7 @@ impl DecodeSession {
         mut restore: impl FnMut(&S) -> Result<()>,
     ) -> Result<usize> {
         store.restored = None;
+        store.restored_kind = None;
         for (id, is_root, _len) in store.candidates(prompt, &path) {
             if let Some((key, pending)) = store.restore_entry(id, is_root, &mut restore)? {
                 self.history.clone_from(&key);
@@ -405,6 +406,10 @@ pub(crate) struct PrefixStore<S, P> {
     next_id: u64,
     /// The id of the entry that the last `restore_prefix` call restored, root or LRU entry.
     restored: Option<u64>,
+    /// The kind of the entry that the last `restore_prefix` call restored. It is kept beside
+    /// `restored`, because the lineage rule may drop the restored entry before a report reads
+    /// the id back (packet SERVE-2-c item 3).
+    restored_kind: Option<SaveKind>,
 }
 
 /// The old name of `PrefixStore` (decision 0036, addendum 1), kept for the executors' field
@@ -426,6 +431,7 @@ impl<S, P> PrefixStore<S, P> {
             limits,
             next_id: 0,
             restored: None,
+            restored_kind: None,
         }
     }
 
@@ -446,6 +452,51 @@ impl<S, P> PrefixStore<S, P> {
     /// The number of LRU entries.
     pub(crate) fn entries_len(&self) -> usize {
         self.lru.len()
+    }
+
+    /// The limits this store was built with.
+    pub(crate) fn limits(&self) -> StoreLimits {
+        self.limits
+    }
+
+    /// The kind of the entry that the last `restore_prefix` call restored, or `None` when it
+    /// restored nothing. The kind survives the lineage drop of the restored entry, so a report
+    /// taken after the job's saves still names the entry the job restored.
+    pub(crate) fn restored_kind(&self) -> Option<SaveKind> {
+        self.restored_kind
+    }
+
+    /// Every stored state, roots first, each list from the least to the most recently used.
+    /// The store never sizes a state: the executor sums the charge of its own snapshots
+    /// (packet SERVE-2-c item 3).
+    pub(crate) fn snapshots(&self) -> impl Iterator<Item = &S> {
+        self.roots
+            .iter()
+            .chain(&self.lru)
+            .map(|stored| &stored.saved.state)
+    }
+
+    /// The prompt tokens shared with a stored key beyond the `restored` tokens (packet
+    /// SERVE-2-c item 3): the longest common prefix length between `prompt` and ANY stored
+    /// key, of any numeric path, minus `restored`, saturating at 0. The literal common
+    /// prefix counts, not a full stored key: a conversation that diverges from a stored tip
+    /// at token 30,000 still shares 30,000 tokens with it, and the tokens between the restore
+    /// and the divergence are exactly the ones no checkpoint covers (lesson L2 of the
+    /// vllm-kvcache study). A restore that took the longest common prefix reports 0.
+    pub(crate) fn uncached_shared(&self, prompt: &[u32], restored: usize) -> u32 {
+        // `restored` is the floor: the count saturates at 0 when every key shares less.
+        let mut longest = restored;
+        for stored in self.roots.iter().chain(&self.lru) {
+            let shared = stored
+                .saved
+                .key
+                .iter()
+                .zip(prompt)
+                .take_while(|(key, token)| key == token)
+                .count();
+            longest = longest.max(shared);
+        }
+        u32::try_from(longest - restored).unwrap_or(u32::MAX)
     }
 
     /// The key length and `is_root` of every stored entry, roots first, each list from the least
@@ -687,8 +738,10 @@ impl<S, P: PartialEq> PrefixStore<S, P> {
                 let stored = list.remove(pos);
                 let given = (stored.saved.key.clone(), stored.saved.pending);
                 let id = stored.id;
+                let kind = stored.kind;
                 list.push(stored);
                 self.restored = Some(id);
+                self.restored_kind = Some(kind);
                 Ok(Some(given))
             }
             Err(EngError::MemoryPlan(_)) => {
@@ -3095,6 +3148,205 @@ mod tests {
         );
         assert!(slot.keys().is_empty(), "nothing is stored");
         assert_eq!(slot.entries_len(), 0, "no LRU entry either");
+    }
+
+    /// The report accessors of the store (packet SERVE-2-c item 3): `restored_kind` names the
+    /// entry the last restore took, of either list, and `None` after a restore that took
+    /// nothing. The kind survives the lineage drop of the restored entry: the tip that replaces
+    /// the restored entry erases the id but not the kind.
+    ///
+    /// Mutation check: clearing `restored_kind` in the lineage drop makes the kind row fail.
+    #[test]
+    fn the_store_names_the_kind_of_the_entry_the_last_restore_took() {
+        let (mut step, mut session) = held(&[1, 2, 3, 4]);
+        let mut slot = store(1, 6);
+        assert_eq!(slot.restored_kind(), None, "a fresh store restored nothing");
+        assert_eq!(
+            save_as(&session, &mut slot, &step, &[1, 2, 3, 4], 1, SaveKind::Root),
+            Ok(true),
+            "the root"
+        );
+        session.prefill(&mut step, &[5, 6, 7, 8], LIMIT).unwrap();
+        assert_eq!(
+            save_as(
+                &session,
+                &mut slot,
+                &step,
+                &[1, 2, 3, 4, 5, 6, 7, 8],
+                1,
+                SaveKind::Tip
+            ),
+            Ok(true),
+            "the tip"
+        );
+        session.reset(&mut step).unwrap();
+        assert_eq!(
+            restore(&mut session, &mut slot, &mut step, &[1, 2, 3, 4, 9], 1).unwrap(),
+            4,
+            "the root restores for a divergent continuation"
+        );
+        assert_eq!(slot.restored_kind(), Some(SaveKind::Root), "the root kind");
+        // A restore that matches nothing clears the kind.
+        session.reset(&mut step).unwrap();
+        assert_eq!(
+            restore(&mut session, &mut slot, &mut step, &[9, 9, 9], 1).unwrap(),
+            0,
+            "nothing matches"
+        );
+        assert_eq!(slot.restored_kind(), None, "the kind is cleared");
+        // A tip restore names the tip, and the kind survives the lineage drop of that entry.
+        session.reset(&mut step).unwrap();
+        assert_eq!(
+            restore(
+                &mut session,
+                &mut slot,
+                &mut step,
+                &[1, 2, 3, 4, 5, 6, 7, 8, 9],
+                1
+            )
+            .unwrap(),
+            8,
+            "the tip restores"
+        );
+        assert_eq!(slot.restored_kind(), Some(SaveKind::Tip), "the tip kind");
+        session.prefill(&mut step, &[9], LIMIT).unwrap();
+        assert_eq!(
+            save_as(
+                &session,
+                &mut slot,
+                &step,
+                &[1, 2, 3, 4, 5, 6, 7, 8, 9],
+                1,
+                SaveKind::Tip
+            ),
+            Ok(true),
+            "the extending tip replaces the restored entry"
+        );
+        assert_eq!(
+            slot.restored_kind(),
+            Some(SaveKind::Tip),
+            "the kind survives the lineage drop"
+        );
+    }
+
+    /// `uncached_shared` takes the literal longest common prefix with any stored key (packet
+    /// SERVE-2-c item 3, fix M2): a prompt that diverges from the stored tip after the first
+    /// token still shares that token with it, a prompt that diverges after three tokens shares
+    /// three, and a restore that took the longest common prefix reports 0. A key of another
+    /// numeric path counts too: its tokens are shared but no checkpoint could serve them.
+    ///
+    /// Mutation check: restoring the old `prompt.starts_with(key)` filter makes the divergent
+    /// rows report 0.
+    #[test]
+    fn uncached_shared_takes_the_longest_common_prefix_with_any_stored_key() {
+        let (step, session) = held(&[1, 2, 3, 4]);
+        let (step_root, root_session) = held(&[1, 2]);
+        let mut slot = store(1, 6);
+        assert_eq!(
+            save_as(&session, &mut slot, &step, &[1, 2, 3, 4], 1, SaveKind::Tip),
+            Ok(true),
+            "the tip"
+        );
+        assert_eq!(
+            save_as(
+                &root_session,
+                &mut slot,
+                &step_root,
+                &[1, 2],
+                2,
+                SaveKind::Root
+            ),
+            Ok(true),
+            "a root of another path"
+        );
+        // A prompt that diverges from both keys after the first token still shares it: the tip
+        // [1, 2, 3, 4] and the root [1, 2] each hold a first token of 1.
+        assert_eq!(
+            slot.uncached_shared(&[1, 9, 3, 4, 5], 0),
+            1,
+            "the longest common prefix with the tip is the single token 1"
+        );
+        // The prompt diverges from the tip after three tokens, so three tokens are shared with
+        // the stored tip that no checkpoint of this restore covered (the root of the other path
+        // shares only two).
+        assert_eq!(
+            slot.uncached_shared(&[1, 2, 3, 9, 9], 0),
+            3,
+            "the tip shares its first three tokens"
+        );
+        // The tip key covers the first four tokens of the prompt; a restore under another path
+        // took none of them, so all four are shared but uncached.
+        assert_eq!(
+            slot.uncached_shared(&[1, 2, 3, 4, 5], 0),
+            4,
+            "the full tip key counts beyond a zero restore"
+        );
+        // A restore that took the longest common prefix reports 0.
+        assert_eq!(
+            slot.uncached_shared(&[1, 2, 3, 4, 5], 4),
+            0,
+            "the restored key"
+        );
+        // A shorter restore leaves the tip tokens uncached.
+        assert_eq!(
+            slot.uncached_shared(&[1, 2, 3, 4, 5], 2),
+            2,
+            "the tip covers two tokens beyond the shorter restore"
+        );
+        // A key of equal length covers the whole prompt.
+        assert_eq!(
+            slot.uncached_shared(&[1, 2, 3, 4], 0),
+            4,
+            "a key equal to the prompt covers it"
+        );
+        // A store whose every key shares less than the restore saturates at 0.
+        let empty = store(0, 1);
+        assert_eq!(
+            empty.uncached_shared(&[7, 7], 2),
+            0,
+            "no stored key, a restore of two: nothing beyond it"
+        );
+    }
+
+    /// `uncached_shared` counts a pinned root, too: a store whose only long shared key is a
+    /// `SaveKind::Root` entry, beside an LRU tip that shares nothing with the prompt, reports
+    /// the root's shared tokens against a zero restore, and 0 for a prompt that shares
+    /// nothing.
+    ///
+    /// Mutation check: skipping `self.roots` in the scan (the LRU list only) makes the root
+    /// row report 0.
+    #[test]
+    fn uncached_shared_counts_a_root_when_no_lru_entry_shares_more() {
+        let (step, session) = held(&[5, 6, 7, 8]);
+        let (tip_step, tip_session) = held(&[9]);
+        let mut slot = store(1, 6);
+        assert_eq!(
+            save_as(&session, &mut slot, &step, &[5, 6, 7, 8], 1, SaveKind::Root),
+            Ok(true),
+            "the root"
+        );
+        assert_eq!(
+            save_as(&tip_session, &mut slot, &tip_step, &[9], 2, SaveKind::Tip),
+            Ok(true),
+            "an LRU tip that shares nothing with the prompt"
+        );
+        assert_eq!(
+            slot.keys(),
+            vec![(4, true), (1, false)],
+            "the root, then the tip"
+        );
+        // The prompt [5, 6, 7, 9] shares its first three tokens with the root [5, 6, 7, 8]
+        // and nothing with the tip, so a zero restore leaves three shared tokens uncached.
+        assert_eq!(
+            slot.uncached_shared(&[5, 6, 7, 9], 0),
+            3,
+            "the root shares its first three tokens beyond the zero restore"
+        );
+        assert_eq!(
+            slot.uncached_shared(&[1, 2], 0),
+            0,
+            "a prompt that shares nothing with either key reports 0"
+        );
     }
 
     #[test]

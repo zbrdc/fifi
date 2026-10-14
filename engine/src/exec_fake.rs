@@ -12,6 +12,7 @@
 use crate::EngError;
 use crate::family::executor::{ExecutorOps, GenerationState};
 use crate::family::session::{DecodeSession, PrefixStore, SaveKind, StoreLimits, TokenStepper};
+use crate::sched::job::{PrefixHit, PrefixReport};
 use crate::tokenizer::{DecodeBatch, DecodeFinish};
 use std::collections::VecDeque;
 use std::sync::atomic::Ordering;
@@ -85,8 +86,24 @@ pub(crate) struct FakeExecutor {
     prefix: Arc<Mutex<PrefixStore<(), u32>>>,
     revision: u32,
     deny_saves: bool,
+    /// Denies the charge of the first `n` save calls only (fix L6), so a test can deny one
+    /// save point of a job (a root) and let the later ones (the tip) run. A save call that the
+    /// store serves as a use of a duplicate key never reaches the snapshot closure but still
+    /// counts.
+    deny_first_saves: usize,
+    /// The number of save calls so far: one per `save_prefix` call, counted before the store
+    /// decides whether a snapshot is needed. A save call that the store serves as a use of a
+    /// duplicate key never reaches the snapshot closure but still counts.
+    save_calls: usize,
     /// Fails the next snapshot with this error, before the store sees its result.
     fail_snapshot: Option<EngError>,
+    /// The kind of the entry that the last `restore_prefix` call restored, for
+    /// `prefix_report` (packet SERVE-2-c item 3). A reset clears it (fix M4), so the report
+    /// of a job without a boundary is a miss.
+    prefix_hit: PrefixHit,
+    /// The `uncached_shared` count of the last `restore_prefix` call, for `prefix_report`;
+    /// a reset clears it too.
+    prefix_uncached: u32,
 }
 
 impl FakeExecutor {
@@ -99,7 +116,11 @@ impl FakeExecutor {
             prefix: Arc::new(Mutex::new(PrefixStore::default())),
             revision: 1,
             deny_saves: false,
+            deny_first_saves: 0,
+            save_calls: 0,
             fail_snapshot: None,
+            prefix_hit: PrefixHit::Miss,
+            prefix_uncached: 0,
         }
     }
 
@@ -133,6 +154,14 @@ impl FakeExecutor {
         self.deny_saves = true;
     }
 
+    /// Denies the charge of the first `n` save calls only (fix L6), so a test can deny one
+    /// save point of a job (a root) while the later ones (the tip) still run. A save call that
+    /// the store serves as a use of a duplicate key never reaches the snapshot closure but
+    /// still counts.
+    pub(crate) fn deny_first_saves(&mut self, n: usize) {
+        self.deny_first_saves = n;
+    }
+
     /// Fails the next snapshot with `error`, so the save fails like a real snapshot failure.
     /// The failure waits for a snapshot call: a save that the store refuses or serves as a use
     /// without a snapshot leaves it armed.
@@ -152,6 +181,11 @@ impl ExecutorOps for FakeExecutor {
         st.core.reset(&mut st.step)?;
         st.history.clear();
         st.finished = false;
+        // The restore facts of the report do not survive a job (fix M4): the worker resets every
+        // job and skips the restore when the job has no boundary, so the report of such a job
+        // must not carry the hit of the job before it.
+        self.prefix_hit = PrefixHit::Miss;
+        self.prefix_uncached = 0;
         Ok(())
     }
 
@@ -237,6 +271,21 @@ impl ExecutorOps for FakeExecutor {
         self.limits
     }
 
+    /// The report of the fake's real store (packet SERVE-2-c item 3): the entries it holds,
+    /// charged at a flat 1,000 bytes per entry (fix L3 — the fake's saved state is `()`, so the
+    /// charge is synthetic, but the plumbing that sums and logs it is real), beside the kind of
+    /// the entry the last restore took and the shared tokens of that restore.
+    fn prefix_report(&self) -> Option<PrefixReport> {
+        let store = lock_store(&self.prefix);
+        let entries = u32::try_from(store.roots_len() + store.entries_len()).unwrap_or(u32::MAX);
+        Some(PrefixReport {
+            entries,
+            bytes: u64::from(entries) * 1_000,
+            hit: self.prefix_hit,
+            uncached_shared: self.prefix_uncached,
+        })
+    }
+
     fn save_prefix(&mut self, st: &FakeSession, key: &[u32], kind: SaveKind) -> Result<bool> {
         // The committed tokens include every scripted token, so a save after a decode is
         // refused before the session rules run.
@@ -248,13 +297,16 @@ impl ExecutorOps for FakeExecutor {
         let fed = st.step.fed();
         let path = self.revision;
         let deny = self.deny_saves;
+        let first_denied = self.deny_first_saves;
+        let call = self.save_calls;
+        self.save_calls += 1;
         let failing = &mut self.fail_snapshot;
         let mut store = lock_store(&self.prefix);
         st.core.save_prefix(&mut *store, key, path, fed, kind, || {
             if let Some(error) = failing.take() {
                 return Err(error);
             }
-            if deny {
+            if deny || call < first_denied {
                 return Err(EngError::MemoryPlan(
                     "the fake denies the prefix charge".to_string(),
                 ));
@@ -269,6 +321,10 @@ impl ExecutorOps for FakeExecutor {
         let covered = st
             .core
             .restore_prefix(&mut *store, prompt, path, |_| Ok(()))?;
+        // The restore facts of the report, read while the store is locked.
+        self.prefix_hit = store.restored_kind().into();
+        self.prefix_uncached = store.uncached_shared(prompt, covered);
+        drop(store);
         if covered > 0 {
             // The restored state fed every key token but the pending one, and the scripted
             // tokens of an earlier decode never survive a restore.
@@ -376,6 +432,7 @@ mod prefix_tests {
     use crate::EngError;
     use crate::family::executor::ExecutorOps;
     use crate::family::session::SaveKind;
+    use crate::sched::job::{PrefixHit, PrefixReport};
 
     /// A fake with an empty script, and a session that holds `tokens` as its prefilled prompt.
     fn fake_with_prefilled(tokens: &[u32]) -> (FakeExecutor, FakeSession) {
@@ -556,6 +613,82 @@ mod prefix_tests {
         assert!(
             matches!(&rejected, Err(EngError::BadRequest(_))),
             "got {rejected:?}"
+        );
+    }
+
+    /// The report of the fake (packet SERVE-2-c item 3): the entries of its real store, each
+    /// charged a flat 1,000 bytes (fix L3), and the kind of the entry the last restore took.
+    /// A prompt that diverges from the stored tip restores the root; the tip still shares its
+    /// first four tokens with the prompt, which equals the restored root, so nothing is
+    /// uncached.
+    ///
+    /// Mutation check (the hit-always-Miss patch): the hit rows fail; zeroing the bytes fails
+    /// the bytes rows.
+    #[test]
+    fn the_fake_reports_the_store_entries_and_the_restored_kind() {
+        let (mut executor, mut session) = fake_with_prefilled(&[1, 2, 3, 4]);
+        executor.with_prefix_limits(2, 6);
+        assert_eq!(
+            executor.prefix_report(),
+            Some(PrefixReport {
+                entries: 0,
+                bytes: 0,
+                hit: PrefixHit::Miss,
+                uncached_shared: 0
+            }),
+            "a fresh store reports all zero"
+        );
+        assert!(
+            executor
+                .save_prefix(&session, &[1, 2, 3, 4], SaveKind::Root)
+                .expect("save the root")
+        );
+        executor.prefill(&mut session, &[5, 6]).expect("prefill");
+        assert!(
+            executor
+                .save_prefix(&session, &[1, 2, 3, 4, 5, 6], SaveKind::Tip)
+                .expect("save the tip")
+        );
+        assert_eq!(
+            executor.prefix_report(),
+            Some(PrefixReport {
+                entries: 2,
+                bytes: 2_000,
+                hit: PrefixHit::Miss,
+                uncached_shared: 0
+            }),
+            "the root and the tip, 1,000 charged bytes each, no restore yet"
+        );
+        let mut second = FakeSession::default();
+        assert_eq!(
+            executor
+                .restore_prefix(&mut second, &[1, 2, 3, 4, 9, 9])
+                .expect("restore"),
+            4,
+            "the root covers the divergent conversation"
+        );
+        assert_eq!(
+            executor.prefix_report(),
+            Some(PrefixReport {
+                entries: 2,
+                bytes: 2_000,
+                hit: PrefixHit::Root,
+                uncached_shared: 0
+            }),
+            "the root hit; the tip shares exactly the restored four tokens"
+        );
+        // A reset clears the restore facts (fix M4): the report of the next job starts from a
+        // miss even though the job before it restored a root.
+        executor.reset(&mut second).expect("reset");
+        assert_eq!(
+            executor.prefix_report(),
+            Some(PrefixReport {
+                entries: 2,
+                bytes: 2_000,
+                hit: PrefixHit::Miss,
+                uncached_shared: 0
+            }),
+            "the reset cleared the hit of the restore"
         );
     }
 

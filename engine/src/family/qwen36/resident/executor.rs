@@ -54,9 +54,11 @@
 //!
 //! Prefix reuse (decision 0036, addendum 2; packet Q36-PR-b): `save_prefix` snapshots the state
 //! after the held prompt, and `restore_prefix` gives it back after a reset. The executor keeps
-//! its entries in a `PrefixStore`, declared first so its arrays drop before the decoder does. For
-//! now the store keeps the addendum 1 limits (one tip entry) and the worker saves the tip only;
-//! the roots and the periodic points of addendum 2 come with the SERVE-2 packets. Each entry
+//! its entries in a `PrefixStore`, declared first so its arrays drop before the decoder does. The
+//! store takes its limits from `Q36Rules::prefix_store` (packet SERVE-2-c): an engine started
+//! with `prefix_reuse` keeps the addendum 2 set (two pinned roots, six LRU entries), and every
+//! other engine keeps the addendum 1 store (zero roots, one entry), so the worker saves the tip
+//! only there. Each entry
 //! carries the `PrefillPath` that built it, so an entry restores only under its own path: a restore
 //! under `Chunked(n)` matches a full recompute only within the decision 0044 G2 tolerance, and
 //! only the `Steps` path is bitwise (addendum 1 item 8).
@@ -78,11 +80,14 @@ use crate::{
             host_load::{HostWeights, rotary_dim},
             settings::{Activation, KvDtype, chunked_prefill_allowed},
         },
-        session::{DecodeSession, Limits, PrefixSlot, SaveKind, TokenStepper, check_prompt},
+        session::{
+            DecodeSession, Limits, PrefixSlot, SaveKind, StoreLimits, TokenStepper, check_prompt,
+        },
         spec::{AttentionKind, QWEN3_6_35B_A3B},
     },
     kernels::MlxKernels,
     sched::SessionBudget,
+    sched::job::{PrefixHit, PrefixReport},
     tokenizer::DecodeBatch,
     weights::{ShardIo, StreamedCheckpoint},
 };
@@ -116,6 +121,12 @@ pub(crate) struct Q36Rules {
     /// the `qwen36.compile` member, default false. When true, the decoder warms both blocks once
     /// at load, so a trace failure fails the load instead of a request.
     pub(crate) compile: bool,
+    /// The limits of this executor's prefix store (decision 0036, addendum 2; packet
+    /// SERVE-2-c item 1): the start maps the `prefix_reuse` flag to two pinned roots and six
+    /// LRU entries; every other caller keeps the addendum 1 store (zero roots, one entry), so
+    /// the existing tests keep their meaning. `from_parts` builds the store with these limits
+    /// and `prefix_limits` reports them.
+    pub(crate) prefix_store: StoreLimits,
 }
 
 /// The numeric path of a prefill. A saved prefix restores only under the path that built it:
@@ -151,6 +162,13 @@ pub(crate) struct Q36Executor {
     context_limit: usize,
     /// The chunk size of the batched prefill, set only by `apply_chunk`. `None` means one-token steps.
     chunk: Option<u32>,
+    /// The kind of the entry that the last `restore_prefix` call restored, for
+    /// `prefix_report` (packet SERVE-2-c item 3). `Miss` until a restore takes an entry, and
+    /// a reset clears it again (fix M4), so the report of a job without a boundary is a miss.
+    prefix_hit: PrefixHit,
+    /// The `uncached_shared` count of the last `restore_prefix` call, for `prefix_report`;
+    /// a reset clears it too.
+    prefix_uncached: u32,
     /// Tests only: the row count of each chunk that ran through `ResidentDecoder::prefill`, in
     /// order. It is shared so that an engine thread test can read it.
     #[cfg(test)]
@@ -368,12 +386,14 @@ impl Q36Executor {
             core: DecodeSession::default(),
         };
         let executor = Self {
-            prefix: PrefixSlot::default(),
+            prefix: PrefixSlot::with_limits(rules.prefix_store),
             decoder,
             eos: rules.eos,
             sampler_vocab: rules.sampler_vocab,
             context_limit,
             chunk: None,
+            prefix_hit: PrefixHit::Miss,
+            prefix_uncached: 0,
             #[cfg(test)]
             log: std::sync::Arc::default(),
         };
@@ -515,10 +535,44 @@ impl ExecutorOps for Q36Executor {
         self.chunk.and_then(|rows| usize::try_from(rows).ok())
     }
 
+    /// The limits of this executor's prefix store: the store this executor was built with
+    /// (`Q36Rules::prefix_store` through `from_parts`), so a `prefix_reuse` engine reports
+    /// two pinned roots and six LRU entries (decision 0036, addendum 2).
+    fn prefix_limits(&self) -> StoreLimits {
+        self.prefix.limits()
+    }
+
+    /// The prefix-store report of this executor (decision 0036, addendum 2; packet SERVE-2-c
+    /// item 3): the entries the store holds after the job's save points and their charged
+    /// bytes — each `ResidentSnapshot` holds its own growth permit, so the executor sums
+    /// `charged_bytes` over the stored states; the store never sizes a snapshot — beside the
+    /// kind of the entry the job restored and the prompt tokens shared with a stored key
+    /// beyond the restored prefix, both taken at the restore.
+    fn prefix_report(&self) -> Option<PrefixReport> {
+        let stored = self.prefix.roots_len() + self.prefix.entries_len();
+        let entries = u32::try_from(stored).unwrap_or(u32::MAX);
+        Some(PrefixReport {
+            entries,
+            bytes: self
+                .prefix
+                .snapshots()
+                .map(|snapshot| snapshot.charged_bytes())
+                .sum(),
+            hit: self.prefix_hit,
+            uncached_shared: self.prefix_uncached,
+        })
+    }
+
     fn reset(&mut self, st: &mut Q36Session) -> Result<()> {
         let Q36Session { state, core } = st;
         let (mut step, _) = self.split(state);
-        core.reset(&mut step)
+        core.reset(&mut step)?;
+        // The restore facts of the report do not survive a job (fix M4): the worker resets every
+        // job and skips the restore when the job has no boundary, so the report of such a job
+        // must not carry the hit of the job before it.
+        self.prefix_hit = PrefixHit::Miss;
+        self.prefix_uncached = 0;
+        Ok(())
     }
 
     /// Feeds the prompt rows of one piece. After any error the caller must reset the session
@@ -563,9 +617,14 @@ impl ExecutorOps for Q36Executor {
         let path = self.prefill_path();
         let decoder = &mut self.decoder;
         let Q36Session { state, core } = st;
-        core.restore_prefix(&mut self.prefix, prompt, path, |snapshot| {
+        let covered = core.restore_prefix(&mut self.prefix, prompt, path, |snapshot| {
             decoder.restore(state, snapshot)
-        })
+        })?;
+        // The restore facts of the report, read now: the store moves on with the job's saves,
+        // and the report is taken only after the prefill.
+        self.prefix_hit = self.prefix.restored_kind().into();
+        self.prefix_uncached = self.prefix.uncached_shared(prompt, covered);
+        Ok(covered)
     }
 }
 
@@ -594,6 +653,7 @@ mod tests {
     /// The rules of the synthetic executor: the cap admits exactly `LIMIT` positions.
     fn rules(eos: Vec<u32>, sampler_vocab: usize) -> Q36Rules {
         Q36Rules {
+            prefix_store: StoreLimits::default(),
             eos,
             sampler_vocab,
             context_limit: LIMIT,
@@ -618,6 +678,7 @@ mod tests {
         let ckpt: &'static StreamedCheckpoint = Box::leak(Box::new(tiny::checkpoint(&TINY_KV8)));
         let host = || HostWeights::load(ckpt, &TINY_KV8, &tiny::config(&TINY_KV8)).unwrap();
         let with = |cap: u64, kv: KvDtype| Q36Rules {
+            prefix_store: StoreLimits::default(),
             session_cap: cap,
             kv_dtype: kv,
             compile: false,
@@ -638,6 +699,7 @@ mod tests {
         // BF16 scales take 2 * 272 bytes per position over both layers: the same rules in BF16
         // activation admit exactly that cap and refuse one byte less.
         let bf16 = |cap: u64| Q36Rules {
+            prefix_store: StoreLimits::default(),
             activation: Activation::Bf16,
             ..with(cap, KvDtype::Q8)
         };
@@ -856,6 +918,7 @@ mod tests {
 
     fn real_rules() -> Q36Rules {
         Q36Rules {
+            prefix_store: StoreLimits::default(),
             eos: vec![248_046, 248_044],
             sampler_vocab: 248_077,
             context_limit: 32_768,
@@ -870,6 +933,7 @@ mod tests {
     fn open_refuses_a_cap_that_the_model_cannot_meet_before_it_opens_any_shard() {
         let dir = config_only_dir();
         let rules = Q36Rules {
+            prefix_store: StoreLimits::default(),
             session_cap: 40_960 * 32_768 - 1,
             ..real_rules()
         };
@@ -887,6 +951,7 @@ mod tests {
     fn open_refuses_a_vocabulary_wider_than_the_head_before_it_opens_any_shard() {
         let dir = config_only_dir();
         let rules = Q36Rules {
+            prefix_store: StoreLimits::default(),
             sampler_vocab: 248_321,
             ..real_rules()
         };
@@ -975,6 +1040,7 @@ mod tests {
         // fed. The limit of 16 positions and its cap leave room for them; the limit of `LIMIT`
         // would end the job with `Length` after 6 tokens.
         let rules = Q36Rules {
+            prefix_store: StoreLimits::default(),
             context_limit: 2 * LIMIT,
             session_cap: u64::from(2 * LIMIT) * GROWTH,
             ..rules(vec![], LIMIT_VOCAB)
@@ -1051,6 +1117,7 @@ mod tests {
             (
                 "context limit 1",
                 Q36Rules {
+                    prefix_store: StoreLimits::default(),
                     context_limit: 1,
                     ..rules(vec![], VOCAB)
                 },
@@ -1059,6 +1126,7 @@ mod tests {
             (
                 "cap one byte short",
                 Q36Rules {
+                    prefix_store: StoreLimits::default(),
                     session_cap: u64::from(LIMIT) * GROWTH - 1,
                     ..rules(vec![], VOCAB)
                 },
@@ -1087,6 +1155,7 @@ mod tests {
             other => panic!("expected a rule error, got {other:?}"),
         };
         let bad = |sampler_vocab, context_limit, session_cap| Q36Rules {
+            prefix_store: StoreLimits::default(),
             eos: vec![],
             sampler_vocab,
             context_limit,
@@ -1164,6 +1233,7 @@ mod tests {
     /// The rules of the chunk tests: the cap admits exactly `CHUNK_LIMIT` positions.
     fn chunk_rules() -> Q36Rules {
         Q36Rules {
+            prefix_store: StoreLimits::default(),
             eos: vec![],
             sampler_vocab: VOCAB,
             context_limit: CHUNK_LIMIT,
@@ -1643,7 +1713,7 @@ mod tests {
     #[test]
     fn an_engine_thread_feeds_each_worker_piece_as_one_chunk() {
         use crate::sched::{
-            job::{Job, JobEvent, JobUsage},
+            job::{Job, JobEvent, JobUsage, PrefixReport},
             worker::{EngineState, ShutdownReport, spawn_engine},
         };
         let _serial = crate::native_test_lock();
@@ -1674,7 +1744,8 @@ mod tests {
             Some(JobUsage {
                 prompt_tokens: 10,
                 completion_tokens: 4,
-                reused_tokens: 0
+                reused_tokens: 0,
+                prefix: Some(PrefixReport::default())
             }),
             "usage"
         );
@@ -2002,7 +2073,7 @@ mod tests {
     #[test]
     fn an_engine_thread_builds_the_executor_runs_two_jobs_and_shuts_down() {
         use crate::sched::{
-            job::{Job, JobEvent, JobUsage},
+            job::{Job, JobEvent, JobUsage, PrefixReport},
             worker::{EngineState, ShutdownReport, spawn_engine},
         };
         let _serial = crate::native_test_lock();
@@ -2037,7 +2108,8 @@ mod tests {
                 Some(JobUsage {
                     prompt_tokens,
                     completion_tokens: 4,
-                    reused_tokens: 0
+                    reused_tokens: 0,
+                    prefix: Some(PrefixReport::default())
                 }),
                 "round {round}: usage"
             );
@@ -2076,6 +2148,7 @@ mod tests {
                 .unwrap();
         // No EOS ids: the frozen chain is compared id for id.
         let rules = Q36Rules {
+            prefix_store: StoreLimits::default(),
             eos: vec![],
             sampler_vocab: 248_320,
             context_limit: 256,
@@ -2185,6 +2258,7 @@ mod tests {
                 .unwrap();
         // No EOS ids: the frozen chain is compared id for id.
         let rules = Q36Rules {
+            prefix_store: StoreLimits::default(),
             eos: vec![],
             sampler_vocab: 248_320,
             context_limit: 256,
@@ -2304,6 +2378,7 @@ mod tests {
             Tokenizer::from_bytes(&std::fs::read(ckpt_dir.join("tokenizer.json")).unwrap())
                 .unwrap();
         let rules = Q36Rules {
+            prefix_store: StoreLimits::default(),
             eos: vec![],
             sampler_vocab: 248_320,
             context_limit: 4_096,
@@ -2422,6 +2497,7 @@ mod tests {
     /// saved entry (an entry charges `FIXED_BYTES` plus one `GROWTH` per key position).
     fn prefix_rules() -> Q36Rules {
         Q36Rules {
+            prefix_store: StoreLimits::default(),
             eos: vec![],
             sampler_vocab: VOCAB,
             context_limit: PREFIX_LIMIT,
@@ -2437,6 +2513,7 @@ mod tests {
     /// tests add around it, but not the denied call that each test names.
     fn denial_rules() -> Q36Rules {
         Q36Rules {
+            prefix_store: StoreLimits::default(),
             eos: vec![],
             sampler_vocab: VOCAB,
             context_limit: PREFIX_LIMIT,
@@ -2848,10 +2925,264 @@ mod tests {
         );
     }
 
+    /// The default rules keep the addendum 1 store (decision 0036, addendum 1): every executor
+    /// built without the `prefix_reuse` flag reports zero roots and one entry, so the worker
+    /// saves only the tip, exactly as before the addendum 2 set existed. The literals pin the
+    /// value, not the `Default` under test.
+    #[test]
+    fn the_default_rules_keep_the_addendum_one_store_limits() {
+        let _serial = crate::native_test_lock();
+        let (executor, _session) = build(rules(vec![], VOCAB));
+        assert_eq!(
+            executor.prefix_limits(),
+            StoreLimits {
+                roots: 0,
+                entries: 1
+            },
+            "zero roots and one entry"
+        );
+    }
+
+    /// A `prefix_reuse` engine holds the addendum 2 set (packet SERVE-2-c item 1): the rules
+    /// carry the limits and the executor reports them, so the worker emits the root save point
+    /// and the store keeps two pinned roots beside six LRU entries.
+    ///
+    /// Mutation check (the limits-ignored patch): building the store with
+    /// `PrefixSlot::default()` in `from_parts` makes the report read `(0, 1)` and fails.
+    #[test]
+    fn a_prefix_reuse_engine_reports_two_roots_and_six_entries() {
+        let _serial = crate::native_test_lock();
+        let (executor, _session) = build(Q36Rules {
+            prefix_store: StoreLimits {
+                roots: 2,
+                entries: 6,
+            },
+            ..prefix_rules()
+        });
+        assert_eq!(
+            executor.prefix_limits(),
+            StoreLimits {
+                roots: 2,
+                entries: 6
+            },
+            "the executor holds the addendum 2 set"
+        );
+    }
+
+    /// Decision 0036, addendum 2, item 6 (packet SERVE-2-c item 2): a root is best effort
+    /// inside the session cap. A denied root save skips only that save: the store stays empty,
+    /// the denial charges nothing, and the job runs on to its tip save and its decode like a
+    /// job without a root point. The charge grows with the position — the tip snapshot of a
+    /// longer key needs strictly more bytes than the root snapshot beside the same live
+    /// session — so no single cap can deny the earlier root and admit the later tip; the test
+    /// raises the cap between the two saves, after the reset that the `set_session_budget`
+    /// seam requires, at a point where no entry is stored (the root was skipped).
+    #[test]
+    fn a_denied_root_save_skips_only_that_save_and_the_job_still_succeeds() {
+        let _serial = crate::native_test_lock();
+        let want = oracle(&PREFIX_PROMPT, 4, &mut seeded_sampler(), VOCAB);
+        let (mut executor, mut session) = build(Q36Rules {
+            prefix_store: StoreLimits {
+                roots: 2,
+                entries: 6,
+            },
+            ..prefix_rules()
+        });
+        // The tight cap: the 4-token root key holds 3 fed positions (3 * GROWTH = 3,072) and
+        // its snapshot needs 3 * GROWTH + FIXED_BYTES = 22,528, together 25,600; the cap of
+        // 25,500 denies the root save.
+        executor
+            .decoder
+            .set_session_budget(SessionBudget::new(25_500));
+        executor.reset(&mut session).unwrap();
+        executor
+            .prefill(&mut session, &PREFIX_PROMPT[..KEY])
+            .unwrap();
+        assert!(
+            !executor
+                .save_prefix(&session, &PREFIX_PROMPT[..KEY], SaveKind::Root)
+                .unwrap(),
+            "the denied root save reports false"
+        );
+        assert!(executor.prefix.key_len().is_none(), "the store stays empty");
+        assert_eq!(
+            executor.decoder.session_used(),
+            3 * GROWTH,
+            "the denial charged nothing"
+        );
+        // The job still succeeds: the rest of the prompt and the whole decode are untouched.
+        executor
+            .prefill(&mut session, &PREFIX_PROMPT[KEY..])
+            .unwrap();
+        let mut job = seeded_generation(4);
+        assert_eq!(
+            tokens_of(&decode_all(&mut executor, &mut session, &mut job)),
+            want,
+            "the tokens after a denied root save equal those of a full run"
+        );
+        // The tip is still saved when it fits: the raised cap (after the reset, with no stored
+        // entry) admits both points of the same prompt, and the tip lands beside the root.
+        executor.reset(&mut session).unwrap();
+        executor
+            .decoder
+            .set_session_budget(SessionBudget::new(100_000));
+        executor
+            .prefill(&mut session, &PREFIX_PROMPT[..KEY])
+            .unwrap();
+        assert!(
+            executor
+                .save_prefix(&session, &PREFIX_PROMPT[..KEY], SaveKind::Root)
+                .unwrap(),
+            "the root fits under the raised cap"
+        );
+        executor
+            .prefill(&mut session, &PREFIX_PROMPT[KEY..])
+            .unwrap();
+        assert!(
+            executor
+                .save_prefix(&session, &PREFIX_PROMPT, SaveKind::Tip)
+                .unwrap(),
+            "the tip is saved when it fits"
+        );
+        assert_eq!(
+            executor.prefix.keys(),
+            vec![(KEY, true), (PREFIX_PROMPT.len(), false)],
+            "the pinned root and the tip are stored"
+        );
+    }
+
+    /// The report of the executor (packet SERVE-2-c item 3): the entries and the charged bytes
+    /// of the store after the job's save points, and the kind of the entry a later job
+    /// restored. Every number is hand-derived from the fixture: an entry of `n` key tokens
+    /// holds `n - 1` fed positions, so it charges `(n - 1) * GROWTH + FIXED_BYTES` bytes.
+    ///
+    /// Mutation checks: the hit-always-Miss patch fails the restored rows; the byte-sum-dropped
+    /// patch (bytes 0) fails the bytes rows.
+    #[test]
+    fn the_prefix_report_counts_entries_bytes_and_the_restored_kind() {
+        let _serial = crate::native_test_lock();
+        let (mut executor, mut session) = build(Q36Rules {
+            prefix_store: StoreLimits {
+                roots: 2,
+                entries: 6,
+            },
+            ..prefix_rules()
+        });
+        assert_eq!(
+            executor.prefix_report(),
+            Some(PrefixReport {
+                entries: 0,
+                bytes: 0,
+                hit: PrefixHit::Miss,
+                uncached_shared: 0
+            }),
+            "a fresh store reports all zero"
+        );
+        // The worker's flow of a first job: prefill to the root point, save the root, prefill
+        // to the tip, save the tip. No restore ran, so the hit stays a miss.
+        executor.reset(&mut session).unwrap();
+        executor
+            .prefill(&mut session, &PREFIX_PROMPT[..KEY])
+            .unwrap();
+        assert!(
+            executor
+                .save_prefix(&session, &PREFIX_PROMPT[..KEY], SaveKind::Root)
+                .unwrap(),
+            "the root is saved"
+        );
+        executor
+            .prefill(&mut session, &PREFIX_PROMPT[KEY..])
+            .unwrap();
+        assert!(
+            executor
+                .save_prefix(&session, &PREFIX_PROMPT, SaveKind::Tip)
+                .unwrap(),
+            "the tip is saved"
+        );
+        assert_eq!(
+            executor.prefix_report(),
+            Some(PrefixReport {
+                entries: 2,
+                bytes: 2 * FIXED_BYTES + 8 * GROWTH,
+                hit: PrefixHit::Miss,
+                uncached_shared: 0
+            }),
+            "the root of 4 and the tip of 6 key tokens"
+        );
+        // A second conversation diverges after the root: it restores the root. The stored tip
+        // shares its first four tokens with the divergent prompt — the longest common prefix —
+        // which equals the restored root, so no token is shared beyond the restore.
+        executor.reset(&mut session).unwrap();
+        let divergent = [1, 2, 3, 4, 9, 9];
+        assert_eq!(
+            executor.restore_prefix(&mut session, &divergent).unwrap(),
+            KEY,
+            "the root covers the shared system prompt"
+        );
+        assert_eq!(
+            executor.prefix_report(),
+            Some(PrefixReport {
+                entries: 2,
+                bytes: 2 * FIXED_BYTES + 8 * GROWTH,
+                hit: PrefixHit::Root,
+                uncached_shared: 0
+            }),
+            "the root hit, and the tip's common prefix equals the restored root"
+        );
+        // A prompt that extends the tip restores the tip.
+        executor.reset(&mut session).unwrap();
+        let extends = [1, 2, 3, 4, 5, 6, 7];
+        assert_eq!(
+            executor.restore_prefix(&mut session, &extends).unwrap(),
+            PREFIX_PROMPT.len(),
+            "the tip covers six tokens"
+        );
+        assert_eq!(
+            executor.prefix_report().unwrap().hit,
+            PrefixHit::Tip,
+            "the tip hit"
+        );
+    }
+
+    /// The `uncached_shared` count of the report (packet SERVE-2-c item 3): a stored key that
+    /// the prompt covers but cannot restore — here one of another numeric path — leaves its
+    /// tokens shared but uncached. The chunk path refuses the steps entry, nothing restores,
+    /// and the whole stored key counts.
+    ///
+    /// Mutation check: returning 0 from `uncached_shared` fails the count row.
+    #[test]
+    fn the_prefix_report_counts_tokens_shared_with_a_key_that_cannot_restore() {
+        let _serial = crate::native_test_lock();
+        let (mut executor, mut session) = build(prefix_rules());
+        assert!(
+            save_key(&mut executor, &mut session),
+            "the steps path saves the key"
+        );
+        assert_eq!(plan_chunk(&mut executor, 4), Some(4), "plan the chunk path");
+        executor.reset(&mut session).unwrap();
+        assert_eq!(
+            executor
+                .restore_prefix(&mut session, &PREFIX_PROMPT)
+                .unwrap(),
+            0,
+            "the chunk path refuses the steps entry"
+        );
+        assert_eq!(
+            executor.prefix_report(),
+            Some(PrefixReport {
+                entries: 1,
+                bytes: (KEY as u64 - 1) * GROWTH + FIXED_BYTES,
+                hit: PrefixHit::Miss,
+                uncached_shared: KEY as u32
+            }),
+            "the stored key covers four prompt tokens that no checkpoint served"
+        );
+    }
+
     #[test]
     fn an_engine_reuses_a_saved_prefix_between_two_jobs_and_never_across_other_prompts() {
         use crate::sched::{
-            job::{Job, JobEvent, JobUsage},
+            job::{Job, JobEvent, JobUsage, PrefixReport},
             worker::{EngineState, ShutdownReport, spawn_engine},
         };
         let _serial = crate::native_test_lock();
@@ -2869,27 +3200,51 @@ mod tests {
         let (want_a, want_b, want_e) = (chain(&prompt_a), chain(&prompt_b), chain(&prompt_e));
         // The worker piece of 3 splits the 4 key tokens into two pieces.
         let engine = spawn_engine(3, move || Ok(build(prefix_rules()))).unwrap();
-        // Each round: the prompt, the boundary of the job, the expected tokens, and the expected
-        // reused count.
+        // The report of a store with the one tip entry of `n` key tokens, which holds
+        // `n - 1` fed positions and charges `(n - 1) * GROWTH + FIXED_BYTES` bytes.
+        let tip_of = |key: usize, hit: PrefixHit, uncached: u32| {
+            Some(PrefixReport {
+                entries: 1,
+                bytes: (key as u64 - 1) * GROWTH + FIXED_BYTES,
+                hit,
+                uncached_shared: uncached,
+            })
+        };
+        // Each round: the prompt, the boundary of the job, the expected tokens, the expected
+        // reused count, and the expected prefix report.
         let rounds = [
             // The first A saves the key of 4 tokens.
-            (&prompt_a, KEY, &want_a, 0u32),
+            (
+                &prompt_a,
+                KEY,
+                &want_a,
+                0u32,
+                tip_of(KEY, PrefixHit::Miss, 0),
+            ),
             // The next two A restore it, so the entry survives a restore.
-            (&prompt_a, KEY, &want_a, 4),
-            (&prompt_a, KEY, &want_a, 4),
-            // A prompt that equals the key restores nothing. It saves a key of 3 tokens.
-            (&prompt_e, KEY - 1, &want_e, 0),
+            (&prompt_a, KEY, &want_a, 4, tip_of(KEY, PrefixHit::Tip, 0)),
+            (&prompt_a, KEY, &want_a, 4, tip_of(KEY, PrefixHit::Tip, 0)),
+            // A prompt that equals the key restores nothing — the restore needs a strictly
+            // shorter key — but the stored key covers all four of its tokens, so the report
+            // counts them as shared and uncached. The job saves a key of 3 tokens.
+            (
+                &prompt_e,
+                KEY - 1,
+                &want_e,
+                0,
+                tip_of(KEY - 1, PrefixHit::Miss, KEY as u32),
+            ),
             // The key of 3 tokens is a prefix of A: 3 tokens are covered. The tip of 4 tokens
             // extends the restored entry, so it replaces it although the store holds one entry.
-            (&prompt_a, KEY, &want_a, 3),
+            (&prompt_a, KEY, &want_a, 3, tip_of(KEY, PrefixHit::Tip, 0)),
             // The tip of 4 tokens was stored after that restore, so this A covers all 4 key
             // tokens. Had the tip not been stored, the entry of 3 tokens would restore: 3.
-            (&prompt_a, KEY, &want_a, 4),
+            (&prompt_a, KEY, &want_a, 4, tip_of(KEY, PrefixHit::Tip, 0)),
             // B replaces the entry, so the last A restores nothing.
-            (&prompt_b, KEY, &want_b, 0),
-            (&prompt_a, KEY, &want_a, 0),
+            (&prompt_b, KEY, &want_b, 0, tip_of(KEY, PrefixHit::Miss, 0)),
+            (&prompt_a, KEY, &want_a, 0, tip_of(KEY, PrefixHit::Miss, 0)),
         ];
-        for (round, (prompt, boundary, want, reused)) in rounds.into_iter().enumerate() {
+        for (round, (prompt, boundary, want, reused, report)) in rounds.into_iter().enumerate() {
             let (job, mut handle) = Job::new(prompt.clone(), seeded_generation(4)).unwrap();
             let job = job.with_prefix_boundary(boundary).unwrap();
             engine.handle().try_submit(job).unwrap();
@@ -2910,7 +3265,8 @@ mod tests {
                 Some(JobUsage {
                     prompt_tokens: u32::try_from(prompt.len()).unwrap(),
                     completion_tokens: 4,
-                    reused_tokens: reused
+                    reused_tokens: reused,
+                    prefix: report,
                 }),
                 "round {round}: usage"
             );

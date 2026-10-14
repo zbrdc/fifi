@@ -392,6 +392,12 @@ pub(crate) struct Q36Settings {
     /// The backend these settings were read for. The `prefix_reuse` cap rule applies to the MLX
     /// arm only.
     pub(crate) backend: Backend,
+    /// The process-wide `prefix_reuse` flag (decision 0036), set by the factory after `new`:
+    /// with the flag on, this engine's prefix store keeps the addendum 2 limits (two pinned
+    /// roots, six LRU entries); with it off, the addendum 1 store (zero roots, one entry). No
+    /// config member reads it: the flag belongs to the server configuration file, and `new`
+    /// leaves it false.
+    pub(crate) prefix_reuse: bool,
     /// The tiered expert mode, or `None` for the plain engine. Never on without the member.
     pub(crate) tiered: Option<TieredSettings>,
     /// The MLX-only keys the CUDA arm ignores (in `Q36Options` order); the start logs one
@@ -682,6 +688,7 @@ impl Q36Settings {
                 Backend::Cuda => false,
             },
             backend,
+            prefix_reuse: false,
             tiered: tiered_settings(options, backend)?,
             ignored_mlx_keys,
         })
@@ -699,7 +706,10 @@ impl Q36Settings {
     /// with the cap, the requirement, the context limit, and the hint `raise session_cap_bytes`.
     /// With the flag off the rule does not apply. It does not apply to the CUDA arm either: that
     /// arm ignores `session_cap_bytes` (the value is 0), and its entry lives in host RAM bounded
-    /// by `context_limit` (decision 0036, addendum 2, CUDA arm).
+    /// by `context_limit` (decision 0036, addendum 2, CUDA arm). Roots and periodic entries
+    /// (decision 0036, addendum 2, item 6) do not raise this requirement: they are best effort
+    /// inside the cap, a denied save skips only that save, and the requirement keeps covering
+    /// exactly the live session plus the one tip entry at the context limit.
     pub(crate) fn check_prefix_reuse_cap(&self, prefix_reuse: bool) -> Result<(), EngError> {
         if !prefix_reuse || self.backend == Backend::Cuda {
             return Ok(());
@@ -1010,6 +1020,7 @@ mod tests {
                 capture: false,
                 compile: false,
                 backend: Backend::Mlx,
+                prefix_reuse: false,
                 tiered: None,
                 ignored_mlx_keys: Vec::new(),
             }
@@ -1031,6 +1042,23 @@ mod tests {
             2_852_126_720u64 + 65_863_680 + 4_294_967_296 + (1 << 30),
             8_286_699_520
         );
+    }
+
+    /// The `prefix_reuse` member of the settings (packet SERVE-2-c item 1): `new` leaves it
+    /// false on both backends, because no config member or environment key carries the flag;
+    /// the factory sets it after `new` from the process-wide flag of the configuration file.
+    #[test]
+    fn the_settings_default_prefix_reuse_to_false() {
+        for backend in [Backend::Mlx, Backend::Cuda] {
+            let options = match backend {
+                Backend::Mlx => with_limit(),
+                Backend::Cuda => Q36Options::default(),
+            };
+            let got = settings_for(Some(&options), &Q36Env::default(), backend)
+                .map(|got| got.prefix_reuse)
+                .unwrap_or_else(|_| panic!("{backend:?} settings must build"));
+            assert!(!got, "{backend:?}: the factory sets the flag after `new`");
+        }
     }
 
     /// BF16 serving policy (decision 0046 A6 item 11, amendment of 2026-10-11): without a

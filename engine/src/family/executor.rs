@@ -6,6 +6,7 @@
 use crate::EngError;
 use crate::family::sampler::Sampler;
 use crate::family::session::{SaveKind, StoreLimits};
+use crate::sched::job::PrefixReport;
 use crate::tokenizer::{DecodeBatch, IncrementalDecoder};
 use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
@@ -117,6 +118,17 @@ pub(crate) trait ExecutorOps {
     fn restore_prefix(&mut self, _st: &mut Self::Session, _prompt: &[u32]) -> Result<usize> {
         Ok(0)
     }
+    /// The prefix-store report of this executor (decision 0036, addendum 2; packet SERVE-2-c
+    /// item 3), which the worker takes once per job after the prefill and carries in
+    /// `JobUsage`: the entries the store holds, the charged bytes of their snapshots, the kind
+    /// of the entry the job restored, and the prompt tokens shared with a stored key beyond
+    /// the restored prefix. Executors that keep no prefix report use this default: `None`,
+    /// and the request log then omits its four `prefix_*` keys even for a request with a
+    /// boundary (fix M3 — no false zeros). The Flash-Next executor keeps this default: it
+    /// reports nothing in this packet.
+    fn prefix_report(&self) -> Option<PrefixReport> {
+        None
+    }
 }
 
 #[cfg(test)]
@@ -222,6 +234,17 @@ mod tests {
                 entries: 1
             },
             "zero roots and one entry (a literal, not the default under test)"
+        );
+    }
+
+    /// The default `prefix_report` of an executor without a prefix report is `None` (fix M3):
+    /// its request lines omit the four `prefix_*` keys instead of carrying false zeros.
+    #[test]
+    fn an_executor_without_prefix_support_reports_no_prefix_report() {
+        assert_eq!(
+            Bare.prefix_report(),
+            None,
+            "no report, taken with `&self`, after any call sequence"
         );
     }
 

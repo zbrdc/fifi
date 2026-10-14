@@ -54,6 +54,26 @@ fn backend_of_build() -> Backend {
     }
 }
 
+/// The settings of an entry with the process-wide `prefix_reuse` flag applied (packet
+/// SERVE-2-c item 1, fix M1): `Q36Settings::new` builds the checked settings and leaves the
+/// flag false, because no config member or environment key carries the process-wide flag, so
+/// the flag travels in the settings from here — the MLX `start` reads it into the
+/// `prefix_store` limits of the rules. The builder is pure: the factory and its test share it.
+fn settings_with_prefix_reuse(
+    model_dir: &Path,
+    tokenizer_dir: &Path,
+    options: Option<&Q36Options>,
+    env: &Q36Env,
+    backend: Backend,
+    prefix_reuse: bool,
+) -> Result<Q36Settings, EngError> {
+    let mut settings = Q36Settings::new(model_dir, tokenizer_dir, options, env, backend)?;
+    settings.prefix_reuse = prefix_reuse;
+    Ok(settings)
+}
+
+/// The Linux tests reach `settings_with_prefix_reuse` and the rules; the call from this
+/// function is covered by the Mac served smoke (prefix-reuse row).
 fn start_engine_with(
     model_dir: &Path,
     tokenizer_dir: &Path,
@@ -61,7 +81,14 @@ fn start_engine_with(
     env: &Q36Env,
     prefix_reuse: bool,
 ) -> Result<StartedEngine, EngError> {
-    let settings = Q36Settings::new(model_dir, tokenizer_dir, options, env, backend_of_build())?;
+    let settings = settings_with_prefix_reuse(
+        model_dir,
+        tokenizer_dir,
+        options,
+        env,
+        backend_of_build(),
+        prefix_reuse,
+    )?;
     settings.check_prefix_reuse_cap(prefix_reuse)?;
     let (engine, bundle) = launch(&settings)?;
     Ok(StartedEngine {
@@ -177,6 +204,31 @@ mod tests {
         };
         let text = error_text(start_with_reuse(Some(&options), &Q36Env::default(), false));
         assert!(!text.contains("raise session_cap_bytes"), "{text}");
+    }
+
+    /// The pure settings builder carries the flag for both values (fix M1): deleting the line
+    /// that sets `settings.prefix_reuse` kept every other test green, so the flag is asserted
+    /// here, on the builder the factory itself uses.
+    ///
+    /// Mutation check: removing `settings.prefix_reuse = prefix_reuse;` fails the `true` row.
+    #[test]
+    fn the_settings_builder_carries_the_prefix_reuse_flag_for_both_values() {
+        let options = Q36Options {
+            cache_limit_bytes: Some(1024),
+            ..Q36Options::default()
+        };
+        for flag in [false, true] {
+            let settings = super::settings_with_prefix_reuse(
+                Path::new("/a"),
+                Path::new("/a"),
+                Some(&options),
+                &Q36Env::default(),
+                super::backend_of_build(),
+                flag,
+            )
+            .unwrap_or_else(|_| panic!("flag {flag}: the settings must build"));
+            assert_eq!(settings.prefix_reuse, flag, "flag {flag}");
+        }
     }
 
     #[test]
