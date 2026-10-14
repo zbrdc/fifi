@@ -14,7 +14,7 @@ mod stop;
 mod template;
 pub mod toolcall;
 
-pub use bundle::{TokenizerBundle, TokenizerIdentity, TokenizerPin};
+pub use bundle::{PromptBoundaries, TokenizerBundle, TokenizerIdentity, TokenizerPin};
 pub use decode::IncrementalDecoder;
 pub use encode::Tokenizer;
 pub use output::{DecodeBatch, DecodeFinish, OutputAssembler, OutputDelta};

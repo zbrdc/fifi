@@ -28,6 +28,7 @@ use super::job::{
 };
 use crate::EngError;
 use crate::family::executor::{ExecutorOps, GenerationState};
+use crate::family::session::{SaveKind, StoreLimits};
 use std::any::Any;
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
@@ -368,6 +369,7 @@ fn work<E, F>(
             generation,
             events,
             prefix_boundary,
+            root_boundary,
         } = job;
         // Register the cancel flag first and read `stop` second. `shutdown` sets `stop` first
         // and reads the flag second, so one of the two sees the other.
@@ -380,6 +382,7 @@ fn work<E, F>(
         let plan = PromptPlan {
             tokens: &prompt,
             boundary: prefix_boundary,
+            root: root_boundary,
         };
         let next = run_job(
             &mut executor,
@@ -400,11 +403,44 @@ fn work<E, F>(
     drain(jobs, cancel_unstarted);
 }
 
-/// The prompt of one job and the length of its reusable prefix.
+/// The prompt of one job, the length of its reusable prefix, and the root inside it.
 struct PromptPlan<'a> {
     tokens: &'a [u32],
     /// The number of leading tokens that end at the last message boundary, or `None`.
     boundary: Option<usize>,
+    /// The number of leading tokens that end at the first system message, or `None`. It is
+    /// set only beside a boundary, and it lies inside it.
+    root: Option<usize>,
+}
+
+/// The shortest root that a save point accepts (decision 0036, addendum 2, item 2a).
+const MIN_ROOT_TOKENS: usize = 2_048;
+
+/// The ordered save points of a job (decision 0036, addendum 2, item 2): the root at the end
+/// of the first system message, then the tip at the last message boundary. The root runs only
+/// when the store keeps roots (`limits.roots > 0`), it reaches `MIN_ROOT_TOKENS`, lies strictly
+/// inside the tip, and the restore covered none of it. Without roots a root point would only
+/// split the prefill and change its chunk grouping for a save the store refuses, so a job with
+/// a root boundary then runs exactly like a job without one. The tip runs only when the
+/// restore covered none of it, today's rule.
+fn save_points(
+    plan: &PromptPlan<'_>,
+    restored: usize,
+    limits: StoreLimits,
+) -> Vec<(usize, SaveKind)> {
+    let mut points = Vec::new();
+    if let Some(root) = plan
+        .root
+        .filter(|_| limits.roots > 0)
+        .filter(|&root| root >= MIN_ROOT_TOKENS && root > restored)
+        .filter(|&root| plan.boundary.is_some_and(|tip| root < tip))
+    {
+        points.push((root, SaveKind::Root));
+    }
+    if let Some(tip) = plan.boundary.filter(|&tip| tip > restored) {
+        points.push((tip, SaveKind::Tip));
+    }
+    points
 }
 
 /// Runs one job and returns the state of the engine after it. The first call is the prompt
@@ -466,9 +502,10 @@ fn run_job<E: ExecutorOps>(
     }
 }
 
-/// Resets the session, restores a saved prefix when the job has a boundary, runs `boundary`, and
-/// prefills the rest of the prompt in chunks. When the prefill reaches the job's boundary, it
-/// saves the prefix state. Returns the number of prompt tokens that the restore covered.
+/// Resets the session, restores a saved prefix when the job has a boundary, runs `boundary`,
+/// and prefills the rest of the prompt in chunks. It prefills up to every save point of the
+/// job in turn (decision 0036, addendum 2: the root, then the tip) and saves the prefix state
+/// at each point. Returns the number of prompt tokens that the restore covered.
 fn start<E: ExecutorOps>(
     executor: &mut E,
     session: &mut E::Session,
@@ -489,8 +526,8 @@ fn start<E: ExecutorOps>(
     executor.boundary(session);
     let mut chunks_run = 0;
     let mut next = restored;
-    if let Some(boundary) = plan.boundary.filter(|&boundary| boundary > restored) {
-        let head = span(plan.tokens, restored, boundary)?;
+    for (point, kind) in save_points(plan, restored, executor.prefix_limits()) {
+        let head = span(plan.tokens, next, point)?;
         if !prefill_chunks(
             executor,
             session,
@@ -504,8 +541,8 @@ fn start<E: ExecutorOps>(
         if cancel.load(Ordering::SeqCst) {
             return Ok(restored);
         }
-        executor.save_prefix(session, span(plan.tokens, 0, boundary)?)?;
-        next = boundary;
+        executor.save_prefix(session, span(plan.tokens, 0, point)?, kind)?;
+        next = point;
     }
     let tail = span(plan.tokens, next, plan.tokens.len())?;
     prefill_chunks(
@@ -587,7 +624,7 @@ mod tests {
     use crate::EngError;
     use crate::exec_fake::FakeExecutor;
     use crate::family::executor::{ExecutorOps, GenerationState};
-    use crate::family::session::check_prompt;
+    use crate::family::session::{PrefixStore, SaveKind, StoreLimits, check_prompt};
     use crate::sched::job::{Job, JobEvent, JobHandle, JobUsage};
     use crate::tokenizer::{DecodeBatch, DecodeFinish, IncrementalDecoder, Tokenizer};
     use std::sync::atomic::{AtomicBool, Ordering};
@@ -610,6 +647,10 @@ mod tests {
         hold: Option<(mpsc::Sender<()>, mpsc::Receiver<()>)>,
         fail_first_decode: Option<EngError>,
         cancel_after_prefill: Option<Arc<AtomicBool>>,
+        /// Sets the cancel flag after the `at`-th `prefill` call (0 is the first).
+        cancel_after_prefill_call: Option<(usize, Arc<AtomicBool>)>,
+        /// The number of `prefill` calls so far.
+        prefill_calls: usize,
         /// Fails the n-th `reset` call (0 is the first) with the error.
         fail_reset_call: Option<(usize, EngError)>,
         reset_calls: usize,
@@ -619,6 +660,13 @@ mod tests {
         restore_override: Option<usize>,
         /// Fails the next `save_prefix` call with the error, before the fake sees it.
         fail_save: Option<EngError>,
+        /// Fails the n-th `save_prefix` call (0 is the first) with the error, before the fake
+        /// sees it.
+        fail_save_call: Option<(usize, EngError)>,
+        /// The number of `save_prefix` calls so far.
+        save_calls: usize,
+        /// Sets the cancel flag after the first `save_prefix` call that the fake accepts.
+        cancel_after_save: Option<Arc<AtomicBool>>,
         /// Fails the next `restore_prefix` call with the error, before the fake sees it.
         fail_restore: Option<EngError>,
         /// The piece that `prefill_piece` reports.
@@ -635,12 +683,17 @@ mod tests {
                 hold: None,
                 fail_first_decode: None,
                 cancel_after_prefill: None,
+                cancel_after_prefill_call: None,
+                prefill_calls: 0,
                 fail_reset_call: None,
                 reset_calls: 0,
                 fail_prefill: None,
                 panic_in_decode: None,
                 restore_override: None,
                 fail_save: None,
+                fail_save_call: None,
+                save_calls: 0,
+                cancel_after_save: None,
                 fail_restore: None,
                 piece: None,
                 context_limit: None,
@@ -673,6 +726,10 @@ mod tests {
             self.piece
         }
 
+        fn prefix_limits(&self) -> StoreLimits {
+            self.inner.prefix_limits()
+        }
+
         fn reset(&mut self, st: &mut Self::Session) -> Result<(), EngError> {
             self.note("reset".to_string());
             let call = self.reset_calls;
@@ -691,7 +748,14 @@ mod tests {
                 return Err(error);
             }
             self.inner.prefill(st, toks)?;
+            let call = self.prefill_calls;
+            self.prefill_calls += 1;
             if let Some(flag) = &self.cancel_after_prefill {
+                flag.store(true, Ordering::SeqCst);
+            }
+            if let Some((at, flag)) = &self.cancel_after_prefill_call
+                && *at == call
+            {
                 flag.store(true, Ordering::SeqCst);
             }
             Ok(())
@@ -721,12 +785,28 @@ mod tests {
             self.inner.boundary(st);
         }
 
-        fn save_prefix(&mut self, st: &Self::Session, key: &[u32]) -> Result<bool, EngError> {
+        fn save_prefix(
+            &mut self,
+            st: &Self::Session,
+            key: &[u32],
+            kind: SaveKind,
+        ) -> Result<bool, EngError> {
             self.note(format!("save_prefix:{}", key.len()));
+            let call = self.save_calls;
+            self.save_calls += 1;
             if let Some(error) = self.fail_save.take() {
                 return Err(error);
             }
-            self.inner.save_prefix(st, key)
+            if matches!(&self.fail_save_call, Some((index, _)) if *index == call)
+                && let Some((_, error)) = self.fail_save_call.take()
+            {
+                return Err(error);
+            }
+            let saved = self.inner.save_prefix(st, key, kind)?;
+            if let Some(flag) = self.cancel_after_save.take() {
+                flag.store(true, Ordering::SeqCst);
+            }
+            Ok(saved)
         }
 
         fn restore_prefix(
@@ -825,6 +905,47 @@ mod tests {
             job.with_prefix_boundary(boundary).expect("boundary"),
             handle,
         )
+    }
+
+    /// A job whose first `tip` prompt tokens form the reusable prefix with a root at `root`.
+    fn job_with_points(prompt: &[u32], tip: usize, root: usize) -> (Job, JobHandle) {
+        let (job, handle) = job(prompt);
+        let job = job.with_prefix_boundary(tip).expect("tip boundary");
+        (job.with_root_boundary(root).expect("root boundary"), handle)
+    }
+
+    /// The view of a fake's prefix store that a test reads while the fake runs on its engine
+    /// thread.
+    type StoreView = Arc<Mutex<PrefixStore<(), u32>>>;
+
+    /// The stored prefix keys as `(length, is_root)` of a fake's store.
+    fn stored(store: &StoreView) -> Vec<(usize, bool)> {
+        store.lock().expect("store lock").keys()
+    }
+
+    /// Starts an engine on a spy whose fake holds the addendum 2 limits (two roots, six
+    /// entries), and returns the store view for assertions.
+    fn start_limited_spy(
+        chunk: usize,
+        script: Vec<Vec<u32>>,
+        log: &Log,
+    ) -> (super::Engine, StoreView) {
+        let mut spy = Spy::new(script, log);
+        spy.inner.with_prefix_limits(2, 6);
+        let store = spy.inner.prefix_store();
+        (start_spy(chunk, spy), store)
+    }
+
+    /// The save points of the worker-level root tests: a system prefix of 2,048 tokens of id
+    /// 2, a first turn that ends at 2,148, and a tail of 50 tokens of id 5.
+    const ROOT: usize = 2_048;
+    const TIP: usize = 2_148;
+
+    /// A prompt of 2,198 tokens whose first 2,148 tokens are id 2 and whose last 50 are id 5.
+    fn root_tip_prompt() -> Vec<u32> {
+        let mut prompt = vec![2; TIP];
+        prompt.extend(std::iter::repeat_n(5, 50));
+        prompt
     }
 
     /// Submits the job, waits for its end, and returns its events.
@@ -1811,6 +1932,7 @@ mod tests {
         let log = new_log();
         let mut spy = Spy::new(vec![vec![EOS]; 2], &log);
         spy.inner.deny_saves();
+        let store = spy.inner.prefix_store();
         let engine = start_spy(100, spy);
         let handle = engine.handle();
         let (first, first_events) = job_with_boundary(&[2, 2, 2, 2, 2], 3);
@@ -1831,6 +1953,10 @@ mod tests {
         let mut want = want_job("prefill:2");
         want.extend(want_job("prefill:3"));
         assert_eq!(calls(&log), want);
+        assert!(
+            stored(&store).is_empty(),
+            "the denied snapshots left no entry in the store"
+        );
         drop(handle);
         engine.shutdown();
     }
@@ -2042,6 +2168,449 @@ mod tests {
         .err()
         .expect("a zero chunk must fail");
         assert!(matches!(error, EngError::BadRequest(_)), "got {error:?}");
+    }
+
+    /// The save points of a plan over eight tokens with the given tip and root, for a store
+    /// with the addendum 2 limits (two roots, six entries).
+    fn points(
+        boundary: Option<usize>,
+        root: Option<usize>,
+        restored: usize,
+    ) -> Vec<(usize, SaveKind)> {
+        points_with(
+            boundary,
+            root,
+            restored,
+            StoreLimits {
+                roots: 2,
+                entries: 6,
+            },
+        )
+    }
+
+    /// The save points of a plan over eight tokens for a store with the given limits.
+    fn points_with(
+        boundary: Option<usize>,
+        root: Option<usize>,
+        restored: usize,
+        limits: StoreLimits,
+    ) -> Vec<(usize, SaveKind)> {
+        let tokens = vec![0; 8];
+        let plan = super::PromptPlan {
+            tokens: &tokens,
+            boundary,
+            root,
+        };
+        super::save_points(&plan, restored, limits)
+    }
+
+    #[test]
+    fn a_store_without_roots_drops_the_root_point() {
+        // The default limits hold zero roots: a root point would only split the prefill.
+        for entries in [1, 6] {
+            assert_eq!(
+                points_with(
+                    Some(3_000),
+                    Some(2_048),
+                    0,
+                    StoreLimits { roots: 0, entries }
+                ),
+                vec![(3_000, SaveKind::Tip)],
+                "entries {entries}: no root point without a root place"
+            );
+        }
+        assert_eq!(
+            points_with(
+                Some(3_000),
+                Some(2_048),
+                0,
+                StoreLimits {
+                    roots: 1,
+                    entries: 1
+                }
+            ),
+            vec![(2_048, SaveKind::Root), (3_000, SaveKind::Tip)],
+            "one root place is enough"
+        );
+    }
+
+    #[test]
+    fn a_root_below_the_minimum_token_count_is_dropped() {
+        assert_eq!(
+            points(Some(3_000), Some(2_047), 0),
+            vec![(3_000, SaveKind::Tip)],
+            "a root of 2,047 tokens stays under the 2,048 minimum"
+        );
+    }
+
+    #[test]
+    fn a_root_of_exactly_the_minimum_is_kept_before_the_tip() {
+        assert_eq!(
+            points(Some(3_000), Some(2_048), 0),
+            vec![(2_048, SaveKind::Root), (3_000, SaveKind::Tip)],
+            "the root of exactly 2,048 tokens runs first, then the tip"
+        );
+    }
+
+    #[test]
+    fn a_root_at_or_below_the_restored_tokens_is_dropped() {
+        for restored in [2_048, 2_100] {
+            assert_eq!(
+                points(Some(3_000), Some(2_048), restored),
+                vec![(3_000, SaveKind::Tip)],
+                "restored {restored}: the restore already covered the root"
+            );
+        }
+    }
+
+    #[test]
+    fn a_root_at_or_above_the_tip_is_dropped() {
+        for root in [3_000, 3_100] {
+            assert_eq!(
+                points(Some(3_000), Some(root), 0),
+                vec![(3_000, SaveKind::Tip)],
+                "root {root}: only the tip lies inside the boundary"
+            );
+        }
+    }
+
+    #[test]
+    fn a_job_without_a_boundary_has_no_save_points() {
+        assert_eq!(points(None, None, 0), Vec::new(), "no boundary");
+        assert_eq!(
+            points(None, Some(2_048), 0),
+            Vec::new(),
+            "a root without a tip is impossible and yields nothing"
+        );
+    }
+
+    #[test]
+    fn a_first_job_saves_a_root_and_a_tip_in_the_store() {
+        let log = new_log();
+        let (engine, store) = start_limited_spy(4_096, vec![vec![EOS]], &log);
+        let prompt = root_tip_prompt();
+        let (job, events) = job_with_points(&prompt, TIP, ROOT);
+        assert_eq!(
+            run_one(&engine.handle(), job, events),
+            stop_events(2_198, 0)
+        );
+        assert_eq!(
+            stored(&store),
+            vec![(ROOT, true), (TIP, false)],
+            "the store holds the pinned root and the tip"
+        );
+        engine.shutdown();
+    }
+
+    #[test]
+    fn a_second_conversation_restores_the_root_and_saves_its_own_tip() {
+        let log = new_log();
+        let (engine, store) = start_limited_spy(4_096, vec![vec![EOS], vec![EOS]], &log);
+        let handle = engine.handle();
+        let first_prompt = root_tip_prompt();
+        let (first, first_events) = job_with_points(&first_prompt, TIP, ROOT);
+        assert_eq!(run_one(&handle, first, first_events), stop_events(2_198, 0));
+        // The same 2,048-token system prefix, a different first turn, and a different tail: the
+        // stored tip key does not match, the root key does.
+        let mut second_prompt = vec![2; ROOT];
+        second_prompt.extend(std::iter::repeat_n(7, 102));
+        let (second, second_events) = job_with_points(&second_prompt, 2_100, ROOT);
+        assert_eq!(
+            run_one(&handle, second, second_events),
+            stop_events(2_150, ROOT as u32),
+            "the second conversation reuses the root tokens"
+        );
+        assert_eq!(
+            stored(&store),
+            vec![(ROOT, true), (TIP, false), (2_100, false)],
+            "the root and the first tip stay; the second tip joins them"
+        );
+        drop(handle);
+        engine.shutdown();
+    }
+
+    #[test]
+    fn a_prompt_that_extends_the_tip_restores_the_tip_not_the_root() {
+        let log = new_log();
+        let (engine, store) = start_limited_spy(4_096, vec![vec![EOS], vec![EOS]], &log);
+        let handle = engine.handle();
+        let first_prompt = root_tip_prompt();
+        let (first, first_events) = job_with_points(&first_prompt, TIP, ROOT);
+        assert_eq!(run_one(&handle, first, first_events), stop_events(2_198, 0));
+        // A strict extension of the first prompt: the longest stored key, the tip, wins, and
+        // the tip that this job saves drops the restored entry (the lineage rule).
+        let mut prompt = first_prompt;
+        prompt.extend(std::iter::repeat_n(9, 100));
+        let (job, events) = job_with_points(&prompt, 2_248, ROOT);
+        assert_eq!(
+            run_one(&handle, job, events),
+            stop_events(2_298, TIP as u32),
+            "the longest stored key, the tip, covers the restore"
+        );
+        assert_eq!(
+            stored(&store),
+            vec![(ROOT, true), (2_248, false)],
+            "the new tip replaced the restored one; the root stays pinned"
+        );
+        drop(handle);
+        engine.shutdown();
+    }
+
+    #[test]
+    fn a_cancel_after_the_root_prefill_and_before_the_root_save_leaves_the_store_as_it_was() {
+        let log = new_log();
+        let state = generation();
+        let flag = Arc::clone(&state.cancel);
+        let mut spy = Spy::new(vec![vec![0]], &log);
+        spy.inner.with_prefix_limits(2, 6);
+        let store = spy.inner.prefix_store();
+        spy.cancel_after_prefill_call = Some((0, flag));
+        let engine = start_spy(4_096, spy);
+        let prompt = root_tip_prompt();
+        let (job, handle) = Job::new(prompt, state).expect("job");
+        let job = job.with_prefix_boundary(TIP).expect("tip boundary");
+        let job = job.with_root_boundary(ROOT).expect("root boundary");
+        assert_eq!(
+            run_one(&engine.handle(), job, handle),
+            vec![
+                batch(&[], "", Some(DecodeFinish::Cancelled)),
+                finished(2_198, 0)
+            ]
+        );
+        assert!(stored(&store).is_empty(), "the store changed on a cancel");
+        engine.shutdown();
+    }
+
+    #[test]
+    fn a_cancel_between_the_root_save_and_the_tip_save_keeps_the_root() {
+        let log = new_log();
+        let state = generation();
+        let flag = Arc::clone(&state.cancel);
+        let mut spy = Spy::new(vec![vec![0]], &log);
+        spy.inner.with_prefix_limits(2, 6);
+        let store = spy.inner.prefix_store();
+        // The chunk size 2,048 ends the first chunk at the root point, so prefill call 1 is the
+        // chunk between the root save and the tip save.
+        spy.cancel_after_prefill_call = Some((1, flag));
+        let engine = start_spy(2_048, spy);
+        let prompt = root_tip_prompt();
+        let (job, handle) = Job::new(prompt, state).expect("job");
+        let job = job.with_prefix_boundary(TIP).expect("tip boundary");
+        let job = job.with_root_boundary(ROOT).expect("root boundary");
+        assert_eq!(
+            run_one(&engine.handle(), job, handle),
+            vec![
+                batch(&[], "", Some(DecodeFinish::Cancelled)),
+                finished(2_198, 0)
+            ]
+        );
+        assert_eq!(
+            stored(&store),
+            vec![(ROOT, true)],
+            "the root stays and no tip was saved"
+        );
+        engine.shutdown();
+    }
+
+    #[test]
+    fn a_failing_root_snapshot_fails_the_job_and_leaves_the_store_unchanged() {
+        let log = new_log();
+        let mut spy = Spy::new(vec![vec![EOS], vec![EOS]], &log);
+        spy.inner.with_prefix_limits(2, 6);
+        let store = spy.inner.prefix_store();
+        spy.inner
+            .fail_snapshots(EngError::Checkpoint("snapshot boom".to_string()));
+        let engine = start_spy(4_096, spy);
+        let handle = engine.handle();
+        let prompt = root_tip_prompt();
+        let (first, first_events) = job_with_points(&prompt, TIP, ROOT);
+        assert_eq!(
+            run_one(&handle, first, first_events),
+            vec![JobEvent::Error(EngError::Checkpoint(
+                "snapshot boom".to_string()
+            ))]
+        );
+        assert_eq!(handle.state(), EngineState::Ready);
+        assert!(
+            stored(&store).is_empty(),
+            "the store changed on a failed save"
+        );
+        // The next job runs clean, exactly like a job after a failing tip save.
+        let (second, second_events) = job_with_points(&prompt, TIP, ROOT);
+        assert_eq!(
+            run_one(&handle, second, second_events),
+            stop_events(2_198, 0)
+        );
+        drop(handle);
+        engine.shutdown();
+    }
+
+    /// The executor calls of one job on a fake with the given limits (`None` keeps the default
+    /// limits), with a chunk of 1,024 tokens, and the store it left. The prompt is
+    /// `root_tip_prompt()` with its tip at `TIP`; the job carries a root at `ROOT` only when
+    /// `with_root` is set.
+    fn calls_of_a_root_job(
+        limits: Option<(usize, usize)>,
+        with_root: bool,
+    ) -> (Vec<String>, Vec<(usize, bool)>) {
+        let log = new_log();
+        let mut spy = Spy::new(vec![vec![EOS]], &log);
+        if let Some((roots, entries)) = limits {
+            spy.inner.with_prefix_limits(roots, entries);
+        }
+        let store = spy.inner.prefix_store();
+        let engine = start_spy(1_024, spy);
+        let prompt = root_tip_prompt();
+        let (job, events) = if with_root {
+            job_with_points(&prompt, TIP, ROOT)
+        } else {
+            job_with_boundary(&prompt, TIP)
+        };
+        assert_eq!(
+            run_one(&engine.handle(), job, events),
+            stop_events(2_198, 0)
+        );
+        engine.shutdown();
+        (calls(&log), stored(&store))
+    }
+
+    #[test]
+    fn with_the_default_limits_a_root_boundary_changes_nothing() {
+        // Restored 0, root 2,048, tip 2,148, chunk 1,024. A root point would split the head
+        // into 1,024 + 1,024 | 100; without it the head is 1,024 + 1,024 + 100. The default
+        // store keeps no roots, so both jobs must run the same pieces, with one save at the tip.
+        let without_root = calls_of_a_root_job(None, false);
+        assert_eq!(
+            without_root.0,
+            strings(&[
+                "reset",
+                "restore_prefix",
+                "boundary",
+                "prefill:1024",
+                "prefill:1024",
+                "prefill:100",
+                "save_prefix:2148",
+                "prefill:50",
+                "decode",
+            ]),
+            "the job without a root"
+        );
+        assert_eq!(without_root.1, vec![(TIP, false)], "its store");
+        let with_root = calls_of_a_root_job(None, true);
+        assert_eq!(
+            with_root, without_root,
+            "a root boundary changed the calls or the store under the default limits"
+        );
+        assert!(
+            !with_root.0.contains(&"save_prefix:2048".to_string()),
+            "a root save was attempted"
+        );
+    }
+
+    #[test]
+    fn with_roots_enabled_the_root_point_splits_the_prefill_at_the_root() {
+        let (log, store) = calls_of_a_root_job(Some((2, 6)), true);
+        assert_eq!(
+            log,
+            strings(&[
+                "reset",
+                "restore_prefix",
+                "boundary",
+                "prefill:1024",
+                "prefill:1024",
+                "save_prefix:2048",
+                "prefill:100",
+                "save_prefix:2148",
+                "prefill:50",
+                "decode",
+            ]),
+            "the root point ends the second piece and saves"
+        );
+        assert_eq!(store, vec![(ROOT, true), (TIP, false)], "root and tip");
+    }
+
+    #[test]
+    fn a_failing_tip_save_after_a_root_save_fails_the_job_and_keeps_the_root() {
+        let log = new_log();
+        let mut spy = Spy::new(vec![vec![EOS]], &log);
+        spy.inner.with_prefix_limits(2, 6);
+        let store = spy.inner.prefix_store();
+        // Save call 0 is the root, save call 1 is the tip.
+        spy.fail_save_call = Some((1, EngError::MemoryPlan("save boom".to_string())));
+        let engine = start_spy(4_096, spy);
+        let handle = engine.handle();
+        let prompt = root_tip_prompt();
+        let (first, first_events) = job_with_points(&prompt, TIP, ROOT);
+        assert_eq!(
+            run_one(&handle, first, first_events),
+            vec![JobEvent::Error(EngError::MemoryPlan(
+                "save boom".to_string()
+            ))],
+            "the job fails like a job with a failing tip save"
+        );
+        assert_eq!(handle.state(), EngineState::Ready);
+        assert_eq!(
+            calls(&log),
+            strings(&[
+                "reset",
+                "restore_prefix",
+                "boundary",
+                "prefill:2048",
+                "save_prefix:2048",
+                "prefill:100",
+                "save_prefix:2148",
+                "reset",
+            ])
+        );
+        assert_eq!(
+            stored(&store),
+            vec![(ROOT, true)],
+            "the root saved before the failure stays; the tip is missing"
+        );
+        // The next job restores the root and runs to its end.
+        let (second, second_events) = job_with_points(&prompt, TIP, ROOT);
+        assert_eq!(
+            run_one(&handle, second, second_events),
+            stop_events(2_198, ROOT as u32)
+        );
+        drop(handle);
+        engine.shutdown();
+    }
+
+    #[test]
+    fn a_cancel_right_after_the_root_save_runs_no_more_prefill_and_saves_no_tip() {
+        let log = new_log();
+        let state = generation();
+        let mut spy = Spy::new(vec![vec![0]], &log);
+        spy.inner.with_prefix_limits(2, 6);
+        let store = spy.inner.prefix_store();
+        spy.cancel_after_save = Some(Arc::clone(&state.cancel));
+        let engine = start_spy(4_096, spy);
+        let prompt = root_tip_prompt();
+        let (job, handle) = Job::new(prompt, state).expect("job");
+        let job = job.with_prefix_boundary(TIP).expect("tip boundary");
+        let job = job.with_root_boundary(ROOT).expect("root boundary");
+        assert_eq!(
+            run_one(&engine.handle(), job, handle),
+            vec![
+                batch(&[], "", Some(DecodeFinish::Cancelled)),
+                finished(2_198, 0)
+            ]
+        );
+        assert_eq!(
+            calls(&log),
+            strings(&[
+                "reset",
+                "restore_prefix",
+                "boundary",
+                "prefill:2048",
+                "save_prefix:2048",
+                "decode",
+            ]),
+            "no piece of the tip head ran after the root save"
+        );
+        assert_eq!(stored(&store), vec![(ROOT, true)], "the root stays alone");
+        engine.shutdown();
     }
 
     #[test]

@@ -55,6 +55,9 @@ pub(crate) struct Job {
     /// The number of leading prompt tokens that end at the last message boundary. `None` turns
     /// prefix reuse off for this job.
     pub(super) prefix_boundary: Option<usize>,
+    /// The number of leading prompt tokens that end at the first system message, when the job
+    /// carries one. It is set only beside a prefix boundary, and it lies inside it.
+    pub(super) root_boundary: Option<usize>,
 }
 
 /// The owner side of a job: its event receiver and its cancellation handle.
@@ -82,6 +85,7 @@ impl Job {
                 generation,
                 events,
                 prefix_boundary: None,
+                root_boundary: None,
             },
             JobHandle {
                 events: receiver,
@@ -92,14 +96,40 @@ impl Job {
 
     /// Marks the first `boundary` prompt tokens as the reusable prefix. The engine restores a
     /// saved prefix that matches them and saves the state after them. The boundary must leave at
-    /// least one token after it.
+    /// least one token after it. A job that already carries a root keeps the rule `root <
+    /// boundary`: a new boundary at or before that root is refused.
     pub(crate) fn with_prefix_boundary(mut self, boundary: usize) -> Result<Job, EngError> {
         if boundary == 0 || boundary >= self.prompt.len() {
             return Err(EngError::BadRequest(
                 "prefix boundary must lie inside the prompt".to_string(),
             ));
         }
+        if self.root_boundary.is_some_and(|root| root >= boundary) {
+            return Err(EngError::BadRequest(
+                "the prefix boundary must lie after the root boundary".to_string(),
+            ));
+        }
         self.prefix_boundary = Some(boundary);
+        Ok(self)
+    }
+
+    /// Marks the first `root` prompt tokens as the root save point of decision 0036, addendum
+    /// 2: the engine saves them as a pinned root after prefilling them. A root needs a prefix
+    /// boundary first (`with_prefix_boundary`) and must lie inside it: `0 < root <
+    /// prefix_boundary`. The 2,048-token minimum of the decision is the worker's rule, not the
+    /// job's.
+    pub(crate) fn with_root_boundary(mut self, root: usize) -> Result<Job, EngError> {
+        let Some(boundary) = self.prefix_boundary else {
+            return Err(EngError::BadRequest(
+                "a root boundary needs a prefix boundary first".to_string(),
+            ));
+        };
+        if root == 0 || root >= boundary {
+            return Err(EngError::BadRequest(
+                "the root boundary must lie inside the reusable prefix".to_string(),
+            ));
+        }
+        self.root_boundary = Some(root);
         Ok(self)
     }
 }
@@ -202,6 +232,50 @@ mod tests {
     fn a_new_job_carries_no_prefix_boundary() {
         let (job, _handle) = Job::new(vec![5, 6, 7], generation()).expect("job");
         assert_eq!(job.prefix_boundary, None);
+        assert_eq!(job.root_boundary, None, "a fresh job carries no root");
+    }
+
+    #[test]
+    fn a_root_boundary_needs_a_prefix_boundary_first() {
+        let (job, _handle) = Job::new(vec![5, 6, 7], generation()).expect("job");
+        let error = job
+            .with_root_boundary(1)
+            .err()
+            .expect("a root without a tip must fail");
+        assert!(matches!(error, EngError::BadRequest(_)), "got {error:?}");
+    }
+
+    #[test]
+    fn a_new_prefix_boundary_must_stay_after_the_root_boundary() {
+        // The tip 4 and the root 3 are valid. A new boundary of 3 or 2 would leave the root at
+        // or after the tip, so the job refuses it. A boundary of 5 keeps the rule.
+        let cases: [(usize, bool); 3] = [(2, false), (3, false), (5, true)];
+        for (boundary, accepted) in cases {
+            let (job, _handle) = Job::new(vec![5, 6, 7, 8, 9, 10], generation()).expect("job");
+            let job = job.with_prefix_boundary(4).expect("tip");
+            let job = job.with_root_boundary(3).expect("root");
+            let result = job.with_prefix_boundary(boundary);
+            assert_eq!(result.is_ok(), accepted, "boundary {boundary}");
+            if let Ok(job) = result {
+                assert_eq!(job.prefix_boundary, Some(boundary), "stored tip");
+                assert_eq!(job.root_boundary, Some(3), "the root stays");
+            }
+        }
+    }
+
+    #[test]
+    fn a_root_boundary_must_lie_inside_the_reusable_prefix() {
+        // The tip boundary is 3, so a root of 1 or 2 lies inside it.
+        let cases: [(usize, bool); 5] = [(0, false), (1, true), (2, true), (3, false), (4, false)];
+        for (root, accepted) in cases {
+            let (job, _handle) = Job::new(vec![5, 6, 7, 8], generation()).expect("job");
+            let job = job.with_prefix_boundary(3).expect("boundary");
+            let result = job.with_root_boundary(root);
+            assert_eq!(result.is_ok(), accepted, "root {root}");
+            if let Ok(job) = result {
+                assert_eq!(job.root_boundary, Some(root), "stored root");
+            }
+        }
     }
 
     #[test]

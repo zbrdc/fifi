@@ -483,14 +483,16 @@ impl ExecutorOps for FlashExecutor {
     /// No transient routing or draft state exists: the page sets return at the end of each step.
     fn boundary(&mut self, _st: &mut FlashSession) {}
 
-    /// Shares the resident state as a tip entry of this executor's prefix store. The session
-    /// rules decide whether the call is valid. The snapshot charges the session budget.
-    fn save_prefix(&mut self, st: &FlashSession, key: &[u32]) -> Result<bool> {
+    /// Shares the resident state as an entry of this executor's prefix store, saved as `kind`
+    /// (a pinned root at the first system message or a tip at the last boundary; the worker
+    /// passes the kind). The session rules decide whether the call is valid. The snapshot
+    /// charges the session budget.
+    fn save_prefix(&mut self, st: &FlashSession, key: &[u32], kind: SaveKind) -> Result<bool> {
         let path = self.prefill_path();
         let decoder = &mut self.decoder;
         let fed = fed_positions(&st.state);
         st.core
-            .save_prefix(&mut self.prefix, key, path, fed, SaveKind::Tip, || {
+            .save_prefix(&mut self.prefix, key, path, fed, kind, || {
                 decoder.snapshot(&st.state)
             })
     }
@@ -1586,7 +1588,7 @@ mod tests {
         executor.reset(session).unwrap();
         executor.prefill(session, &PREFIX_PROMPT[..KEY]).unwrap();
         executor
-            .save_prefix(session, &PREFIX_PROMPT[..KEY])
+            .save_prefix(session, &PREFIX_PROMPT[..KEY], SaveKind::Tip)
             .unwrap()
     }
 
@@ -1719,7 +1721,9 @@ mod tests {
             "before the second save"
         );
         assert!(
-            executor.save_prefix(&session, &PREFIX_PROMPT).unwrap(),
+            executor
+                .save_prefix(&session, &PREFIX_PROMPT, SaveKind::Tip)
+                .unwrap(),
             "second save"
         );
         assert_eq!(
@@ -1808,7 +1812,7 @@ mod tests {
             .unwrap();
         assert!(
             executor
-                .save_prefix(&session, &PREFIX_PROMPT[..KEY])
+                .save_prefix(&session, &PREFIX_PROMPT[..KEY], SaveKind::Tip)
                 .unwrap(),
             "the save was refused"
         );
@@ -1992,7 +1996,7 @@ mod tests {
             .decoder
             .step(&mut session.state, 5, StepMode::Prompt)
             .unwrap();
-        let refused = executor.save_prefix(&session, &PREFIX_PROMPT[..KEY]);
+        let refused = executor.save_prefix(&session, &PREFIX_PROMPT[..KEY], SaveKind::Tip);
         assert!(
             matches!(refused, Err(EngError::BadRequest(_))),
             "{refused:?}"
@@ -2070,7 +2074,7 @@ mod tests {
         executor.reset(&mut session).unwrap();
         executor.prefill(&mut session, key).unwrap();
         assert!(
-            executor.save_prefix(&session, key).unwrap(),
+            executor.save_prefix(&session, key, SaveKind::Tip).unwrap(),
             "the save was denied"
         );
         executor.reset(&mut session).unwrap();

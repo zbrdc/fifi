@@ -376,6 +376,16 @@ pub(crate) struct StoreLimits {
     pub(crate) entries: usize,
 }
 
+impl Default for StoreLimits {
+    /// The addendum 1 limits: zero roots and one entry.
+    fn default() -> Self {
+        Self {
+            roots: 0,
+            entries: 1,
+        }
+    }
+}
+
 /// The prefix store of an engine (decision 0036, addendum 2): up to `limits.roots` pinned roots
 /// and up to `limits.entries` entries in an LRU list. `S` is the model state that the executor
 /// saves, and `P` names the numeric path that built it. A state restores only under the path that
@@ -403,10 +413,7 @@ pub(crate) type PrefixSlot<S, P> = PrefixStore<S, P>;
 
 impl<S, P> Default for PrefixStore<S, P> {
     fn default() -> Self {
-        Self::with_limits(StoreLimits {
-            roots: 0,
-            entries: 1,
-        })
+        Self::with_limits(StoreLimits::default())
     }
 }
 

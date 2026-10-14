@@ -1,4 +1,4 @@
-use super::{ChatTemplate, PromptMessage, Thinking, Tokenizer, ToolSpec};
+use super::{ChatTemplate, PromptMessage, Role, Thinking, Tokenizer, ToolSpec};
 use crate::{EngError, checkpoint_json::UniqueValue};
 use sha2::{Digest, Sha256};
 use std::fs;
@@ -20,6 +20,19 @@ pub struct TokenizerPin {
     pub chat_template_jinja: [u8; 32],
     pub generation_config_json: [u8; 32],
     pub vocab_size: u32,
+}
+
+/// The message-boundary token counts of one encoded prompt (decision 0036, addenda 1 and 2).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct PromptBoundaries {
+    /// The number of prompt tokens that end at the last message boundary, when the prompt ids
+    /// extend them: the prompt without its generation tail. `None` turns prefix reuse off.
+    pub tip: Option<usize>,
+    /// The number of prompt tokens that end at the first system message, when the prompt ids
+    /// extend them and a tip follows them. `None` when the first message is not a system
+    /// message, the render of the system block fails or does not end in the text of an empty
+    /// user turn, there is no tip, or the two boundaries meet.
+    pub root: Option<usize>,
 }
 
 pub struct TokenizerBundle {
@@ -95,24 +108,68 @@ impl TokenizerBundle {
         self.tokenizer.encode(&rendered)
     }
 
-    /// Encodes the prompt like `encode_prompt` and also returns the prompt length at the last
-    /// message boundary: the prompt without its generation tail (decision 0036, addendum 1).
-    /// The boundary is `None` unless the ids of the text without the tail are the first ids of the
-    /// prompt. A boundary of `Some(n)` always has `0 < n < ids.len()`.
+    /// Encodes the prompt like `encode_prompt` and also returns its message boundaries
+    /// (decision 0036, addenda 1 and 2): the `tip` is the prompt length at the last message
+    /// boundary, the prompt without its generation tail, and the `root` is the prompt length
+    /// at the end of the first system message. A boundary is `None` unless the ids of its
+    /// render are the first ids of the prompt. A set boundary always has `0 < n < ids.len()`,
+    /// and the root is always shorter than the tip.
     pub fn encode_prompt_with_boundary(
         &self,
         msgs: &[PromptMessage],
         tools: &[ToolSpec],
         thinking: Thinking,
-    ) -> Result<(Vec<u32>, Option<usize>), EngError> {
+    ) -> Result<(Vec<u32>, PromptBoundaries), EngError> {
         let ids = self.encode_prompt(msgs, tools, thinking)?;
         let head = self
             .template
             .render_without_generation_prompt(msgs, tools, thinking)?;
         let head_ids = self.tokenizer.encode(&head)?;
-        let boundary = Some(head_ids.len())
+        let tip = Some(head_ids.len())
             .filter(|&len| len > 0 && len < ids.len() && ids.starts_with(&head_ids));
-        Ok((ids, boundary))
+        let root = self.root_boundary(msgs, tools, thinking, &ids, tip);
+        Ok((ids, PromptBoundaries { tip, root }))
+    }
+
+    /// The token count at the end of the first system message. The pinned Qwen template raises
+    /// `No user query found in messages.` for every render without a user turn, so the first
+    /// message cannot be rendered alone. This renders the first message plus an empty user turn
+    /// (same tools and thinking setting, no generation prompt) and cuts the text of an empty user
+    /// turn, which the template writes last, from the end. The system block (the tools block
+    /// included) comes first in the pinned template and does not depend on later messages, so
+    /// the rest is the text of the first system message. The ids of that text must be the first
+    /// ids of the prompt, shorter than the tip. When the tip is `None`, the root is dropped too.
+    /// Every error of the root render gives `None`: the root only helps reuse, and the full
+    /// prompt rendered already.
+    fn root_boundary(
+        &self,
+        msgs: &[PromptMessage],
+        tools: &[ToolSpec],
+        thinking: Thinking,
+        ids: &[u32],
+        tip: Option<usize>,
+    ) -> Option<usize> {
+        let tip = tip?;
+        let first = msgs.first().filter(|m| matches!(m.role, Role::System))?;
+        let empty_user = PromptMessage {
+            role: Role::User,
+            content: Some(String::new()),
+            name: None,
+            tool_call_id: None,
+            tool_calls: Vec::new(),
+        };
+        let stub = self
+            .template
+            .render_without_generation_prompt(std::slice::from_ref(&empty_user), &[], thinking)
+            .ok()?;
+        let render = self
+            .template
+            .render_without_generation_prompt(&[first.clone(), empty_user], tools, thinking)
+            .ok()?;
+        let root_text = render.strip_suffix(stub.as_str())?;
+        let root_ids = self.tokenizer.encode(root_text).ok()?;
+        Some(root_ids.len())
+            .filter(|&len| len > 0 && len < ids.len() && len < tip && ids.starts_with(&root_ids))
     }
 }
 

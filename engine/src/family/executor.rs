@@ -5,6 +5,7 @@
 
 use crate::EngError;
 use crate::family::sampler::Sampler;
+use crate::family::session::{SaveKind, StoreLimits};
 use crate::tokenizer::{DecodeBatch, IncrementalDecoder};
 use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
@@ -88,11 +89,25 @@ pub(crate) trait ExecutorOps {
     fn prefill_piece(&self) -> Option<usize> {
         None
     }
-    /// Saves the session as a tip in the engine's prefix store (decision 0036, addenda 1 and 2).
-    /// `key` holds the committed prompt tokens of the session. Returns `Ok(false)` when this
-    /// executor cannot save or when the memory plan denies the charge. It never changes the
-    /// session. Executors that keep no prefix state use this default.
-    fn save_prefix(&mut self, _st: &Self::Session, _key: &[u32]) -> Result<bool> {
+    /// The limits of this executor's prefix store (decision 0036, addenda 1 and 2): how many
+    /// pinned roots and how many LRU entries it holds. The worker asks once per job and plans
+    /// its save points with the answer: it emits a root point only when `roots > 0`, so a job
+    /// with a root boundary behaves like a job without one on an engine that keeps no roots.
+    /// The default is the addendum 1 store: zero roots and one entry. An executor that enables
+    /// the set overrides this method and must answer with the limits of its own store (the
+    /// Qwen3.6 engine will answer two roots and six entries). The periodic points of a later
+    /// packet need `entries >= 2`.
+    fn prefix_limits(&self) -> StoreLimits {
+        StoreLimits::default()
+    }
+    /// Saves the session as an entry of the engine's prefix store (decision 0036, addenda 1 and
+    /// 2). `kind` names the save point: `SaveKind::Root` a pinned root at the end of the first
+    /// system message, `SaveKind::Periodic` a periodic checkpoint of a long prompt, and
+    /// `SaveKind::Tip` the last message boundary. `key` holds the committed prompt tokens of
+    /// the session. Returns `Ok(false)` when this executor cannot save or when the memory plan
+    /// denies the charge. It never changes the session. Executors that keep no prefix state use
+    /// this default.
+    fn save_prefix(&mut self, _st: &Self::Session, _key: &[u32], _kind: SaveKind) -> Result<bool> {
         Ok(false)
     }
     /// Replaces the reset session with the saved prefix state. It does so only when the saved key is
@@ -108,6 +123,7 @@ mod tests {
     use super::{ExecutorOps, GenerationState};
     use crate::EngError;
     use crate::family::sampler::{Sampler, SamplingParams};
+    use crate::family::session::{SaveKind, StoreLimits};
     use crate::tokenizer::{DecodeBatch, IncrementalDecoder, Tokenizer};
     use std::sync::atomic::Ordering;
 
@@ -182,7 +198,11 @@ mod tests {
     fn an_executor_without_prefix_support_saves_nothing_and_restores_nothing() {
         let mut executor = Bare;
         let mut session = vec![1, 2, 3];
-        assert!(!executor.save_prefix(&session, &[1, 2, 3]).expect("save"));
+        assert!(
+            !executor
+                .save_prefix(&session, &[1, 2, 3], SaveKind::Tip)
+                .expect("save")
+        );
         assert_eq!(
             executor
                 .restore_prefix(&mut session, &[1, 2, 3, 4])
@@ -190,6 +210,18 @@ mod tests {
             0
         );
         assert_eq!(session, vec![1, 2, 3], "the session is unchanged");
+    }
+
+    #[test]
+    fn an_executor_without_prefix_support_reports_the_addendum_one_limits() {
+        assert_eq!(
+            Bare.prefix_limits(),
+            StoreLimits {
+                roots: 0,
+                entries: 1
+            },
+            "zero roots and one entry (a literal, not the default under test)"
+        );
     }
 
     #[test]

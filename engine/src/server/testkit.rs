@@ -32,6 +32,27 @@ pub(super) fn bundle() -> Arc<TokenizerBundle> {
     Arc::new(load_bundle(&dir).expect("load fixture tokenizer"))
 }
 
+/// Loads the fixture tokenizer with the pinned Qwen chat template (`testdata/chat_template.jinja`)
+/// in place of the toy template. The special ids stay as above: the pinned template writes
+/// `<|im_start|>` and `<|im_end|>` as one id each and every other character as its byte value.
+pub(super) fn bundle_with_pinned_template() -> Arc<TokenizerBundle> {
+    let source = Path::new(env!("CARGO_MANIFEST_DIR")).join("src/server/testdata/tokenizer");
+    let dir = tempfile::tempdir().expect("tempdir");
+    for name in [
+        "tokenizer.json",
+        "tokenizer_config.json",
+        "generation_config.json",
+    ] {
+        std::fs::copy(source.join(name), dir.path().join(name)).expect("copy fixture file");
+    }
+    std::fs::write(
+        dir.path().join("chat_template.jinja"),
+        include_str!("../../testdata/chat_template.jinja"),
+    )
+    .expect("write the pinned template");
+    Arc::new(load_bundle(dir.path()).expect("load the fixture with the pinned template"))
+}
+
 /// The token ids of ASCII text under the fixture tokenizer.
 pub(super) fn ids(text: &str) -> Vec<u32> {
     text.bytes().map(u32::from).collect()
@@ -51,6 +72,21 @@ pub(super) fn engine(script: Vec<Vec<u32>>) -> Engine {
             FakeExecutor::new(script, &[EOS], 100_000),
             Default::default(),
         ))
+    })
+    .expect("spawn engine")
+}
+
+/// Starts an engine thread on the scripted fake executor with the prefix store limits of
+/// decision 0036, addendum 2 (the default limits are zero roots and one entry).
+pub(super) fn engine_with_prefix_limits(
+    script: Vec<Vec<u32>>,
+    roots: usize,
+    entries: usize,
+) -> Engine {
+    spawn_engine(512, move || {
+        let mut executor = FakeExecutor::new(script, &[EOS], 100_000);
+        executor.with_prefix_limits(roots, entries);
+        Ok((executor, Default::default()))
     })
     .expect("spawn engine")
 }

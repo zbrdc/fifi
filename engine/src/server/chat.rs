@@ -19,7 +19,7 @@ use crate::family::sampler::{Sampler, SamplingParams};
 use crate::sched::job::Job;
 use crate::sched::worker::SubmitError;
 use crate::tokenizer::toolcall::Start;
-use crate::tokenizer::{IncrementalDecoder, OutputAssembler, TokenizerBundle};
+use crate::tokenizer::{IncrementalDecoder, OutputAssembler, PromptBoundaries, TokenizerBundle};
 use axum::Json;
 use axum::body::Body;
 use axum::extract::State;
@@ -84,18 +84,18 @@ async fn submit(state: &AppState, input: ChatInput) -> Result<Submitted, ServerE
     let (messages, thinking) = (input.messages, input.thinking);
     let template_tools = input.tools.clone();
     let prefix_reuse = entry.prefix_reuse;
-    let (prompt, boundary, start) = tokio::task::spawn_blocking(move || {
+    let (prompt, boundaries, start) = tokio::task::spawn_blocking(move || {
         // Without the flag the handler marks no boundary, so the engine neither saves nor restores.
-        let (prompt, boundary) = if prefix_reuse {
+        let (prompt, boundaries) = if prefix_reuse {
             bundle.encode_prompt_with_boundary(&messages, &template_tools, thinking)?
         } else {
             (
                 bundle.encode_prompt(&messages, &template_tools, thinking)?,
-                None,
+                PromptBoundaries::default(),
             )
         };
         let start = reply_start(&bundle, &prompt);
-        Ok::<_, EngError>((prompt, boundary, start))
+        Ok::<_, EngError>((prompt, boundaries, start))
     })
     .await
     .map_err(|error| {
@@ -137,7 +137,7 @@ async fn submit(state: &AppState, input: ChatInput) -> Result<Submitted, ServerE
     let generation = GenerationState::with_sampler(decoder, sampler).with_max_tokens(max_tokens);
     let (mut job, handle) =
         Job::new(prompt, generation).map_err(|error| failed(&mut log, error))?;
-    if let Some(boundary) = boundary {
+    if let Some(boundary) = boundaries.tip {
         // The tokenizer returns a boundary inside the prompt, so a refusal here is a defect.
         job = job.with_prefix_boundary(boundary).map_err(|error| {
             failed(
@@ -148,6 +148,18 @@ async fn submit(state: &AppState, input: ChatInput) -> Result<Submitted, ServerE
                 },
             )
         })?;
+        // The tokenizer puts the root inside the tip, so a refusal here is a defect, too.
+        if let Some(root) = boundaries.root {
+            job = job.with_root_boundary(root).map_err(|error| {
+                failed(
+                    &mut log,
+                    EngError::Backend {
+                        operation: "root_boundary",
+                        message: format!("{error:?}"),
+                    },
+                )
+            })?;
+        }
     }
     entry
         .handle
@@ -210,6 +222,7 @@ mod tests {
     use crate::server::router::router;
     use crate::server::state::AppState;
     use crate::server::testkit;
+    use crate::tokenizer::TokenizerBundle;
     use axum::Router;
     use axum::http::StatusCode;
     use serde_json::{Value, json};
@@ -564,6 +577,15 @@ mod tests {
         router(Arc::new(AppState::new(testkit::API_KEY, vec![entry])))
     }
 
+    /// A router over one engine whose entry reuses prefixes and renders prompts with `bundle`.
+    fn reuse_app_with_bundle(engine: &Engine, bundle: Arc<TokenizerBundle>) -> Router {
+        testkit::wait_for_state(&engine.handle(), EngineState::Ready);
+        let mut entry = testkit::entry("e1", "model-a", engine, 4_096);
+        entry.prefix_reuse = true;
+        entry.bundle = bundle;
+        router(Arc::new(AppState::new(testkit::API_KEY, vec![entry])))
+    }
+
     /// A request with the given messages as (role, content) pairs.
     fn conversation(messages: &[(&str, &str)]) -> Value {
         let messages: Vec<Value> = messages
@@ -637,6 +659,50 @@ mod tests {
         // B replaces the saved key of A, so the second A finds nothing to restore.
         let usage = usage_of(&reuse_app(&engine, true), &[a.clone(), b, a]).await;
         assert_eq!(usage, [(21, 0), (21, 0), (21, 0)]);
+    }
+
+    #[tokio::test]
+    async fn with_the_flag_on_a_second_conversation_restores_the_shared_root() {
+        // Two conversations share a system prompt of 2,100 "a" bytes. Under the fixture
+        // tokenizer every ASCII byte is one id, so the first system message renders as
+        // `<|im_start|>` (1 id) + "system\n" (7 ids) + 2,100 ids + `<|im_end|>` (1 id) + "\n"
+        // (1 id) = 2,110 ids: the root. Every prompt adds `<|im_start|>user\nhi<|im_end|>\n`
+        // (10 ids) and the generation tail `<|im_start|>assistant\n` (11 ids), so both prompts
+        // hold 2,131 ids. The second conversation's user turn differs from the first, so its
+        // tip key matches nothing and only the root key matches.
+        let engine = testkit::engine_with_prefix_limits(
+            [testkit::script("a"), testkit::script("b")].concat(),
+            2,
+            6,
+        );
+        let system = "a".repeat(2_100);
+        let first = conversation(&[("system", system.as_str()), ("user", "hi")]);
+        let second = conversation(&[("system", system.as_str()), ("user", "yo")]);
+        let usage = usage_of(&reuse_app(&engine, true), &[first, second]).await;
+        assert_eq!(usage, [(2_131, 0), (2_131, 2_110)]);
+    }
+
+    #[tokio::test]
+    async fn with_the_pinned_template_a_second_conversation_restores_the_shared_root() {
+        // The pinned Qwen template raises `No user query found in messages.` for every render
+        // without a user turn, so a root render of the system message alone would always fail
+        // and no second conversation would restore anything. The fixture tokenizer gives one id
+        // per byte and one id per special marker. The first system message renders as
+        // `<|im_start|>` (1) + "system\n" (7) + 2,100 "a" + `<|im_end|>` (1) + "\n" (1) = 2,110
+        // ids: the root. The user turn `<|im_start|>user\nhi<|im_end|>\n` adds 10 ids. The
+        // generation tail `<|im_start|>assistant\n<think>\n` adds 1 + 10 + 8 = 19 ids, so
+        // both prompts hold 2,139 ids. The second user turn differs, so only the root matches.
+        let engine = testkit::engine_with_prefix_limits(
+            [testkit::script("a"), testkit::script("b")].concat(),
+            2,
+            6,
+        );
+        let app = reuse_app_with_bundle(&engine, testkit::bundle_with_pinned_template());
+        let system = "a".repeat(2_100);
+        let first = conversation(&[("system", system.as_str()), ("user", "hi")]);
+        let second = conversation(&[("system", system.as_str()), ("user", "yo")]);
+        let usage = usage_of(&app, &[first, second]).await;
+        assert_eq!(usage, [(2_139, 0), (2_139, 2_110)]);
     }
 
     #[tokio::test]

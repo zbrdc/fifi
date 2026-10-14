@@ -2,38 +2,91 @@
 //!
 //! The trait and `GenerationState` live in `crate::family::executor`.
 //! Design: the family descriptor design ("Executor trait"), decision 0033.
+//!
+//! The fake keeps the real prefix rules (decision 0036, addendum 2): its session holds a real
+//! `DecodeSession` for the token side, and `save_prefix` / `restore_prefix` run through
+//! `DecodeSession::save_prefix` / `restore_prefix` and a real `PrefixStore`, the same code path
+//! the resident executors use. The saved state is `()`: the fake has no model, and the store
+//! never inspects a state.
 
 use crate::EngError;
 use crate::family::executor::{ExecutorOps, GenerationState};
+use crate::family::session::{DecodeSession, PrefixStore, SaveKind, StoreLimits, TokenStepper};
 use crate::tokenizer::{DecodeBatch, DecodeFinish};
 use std::collections::VecDeque;
 use std::sync::atomic::Ordering;
+use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 
 type Result<T> = std::result::Result<T, EngError>;
 
-#[derive(Default)]
-pub(crate) struct FakeSession {
-    history: Vec<u32>,
-    finished: bool,
+/// Locks the shared store. A poisoned lock means a test thread panicked while saving; the
+/// store is still readable, so the poison is cleared like every other lock in this crate.
+fn lock_store(store: &Mutex<PrefixStore<(), u32>>) -> MutexGuard<'_, PrefixStore<(), u32>> {
+    store.lock().unwrap_or_else(PoisonError::into_inner)
 }
 
-/// The one saved prefix of a fake: its key and the numeric path revision that built it.
-struct SavedPrefix {
-    key: Vec<u32>,
-    revision: u32,
+/// The fake's model side: it counts the fed positions and has no logits. It lives in the
+/// session, like the model state of the resident executors, so its positions reset with the
+/// session instead of surviving it.
+#[derive(Default)]
+struct CountingStepper {
+    fed: usize,
+}
+
+impl TokenStepper for CountingStepper {
+    const OPERATION: &'static str = "fake";
+
+    fn feed(&mut self, _token: u32) -> Result<()> {
+        self.fed += 1;
+        Ok(())
+    }
+
+    fn logits(&mut self, _token: u32) -> Result<Vec<f32>> {
+        Err(EngError::BadRequest("the fake has no logits".to_string()))
+    }
+
+    fn fed(&self) -> usize {
+        self.fed
+    }
+
+    fn reset(&mut self) -> Result<()> {
+        self.fed = 0;
+        Ok(())
+    }
+}
+
+#[derive(Default)]
+pub(crate) struct FakeSession {
+    /// Every committed token: the prompt and the scripted tokens, like the history of a real
+    /// session after decode.
+    history: Vec<u32>,
+    /// The token side of the prompt, driven through the real `DecodeSession` prefill and
+    /// prefix rules. The fake's scripted `decode` cannot enter it, because the real `decode`
+    /// samples one token per call from logits, so the prompt tokens stay here and in `history`.
+    core: DecodeSession,
+    /// The model side of the session: the count of fed positions.
+    step: CountingStepper,
+    finished: bool,
 }
 
 /// Returns scripted token batches and applies the `decode` finish rules:
 /// EOS, output limit, and cancellation. It never matches stop strings.
 /// The output limit is the lower of the constructor cap and the job limit in `GenerationState`.
-/// It also keeps one saved prefix with the rules of decision 0036, addendum 1.
+/// Its prefix store is a real `PrefixStore` with the addendum 1 limits by default (zero roots,
+/// one entry) and the limits that `with_prefix_limits` sets.
 pub(crate) struct FakeExecutor {
     script: VecDeque<Vec<u32>>,
     eos: Vec<u32>,
     remaining: u32,
-    saved: Option<SavedPrefix>,
+    /// The limits of the store, reported by `prefix_limits`.
+    limits: StoreLimits,
+    /// The real prefix store behind a lock, so a test can read it while the fake runs on the
+    /// engine thread.
+    prefix: Arc<Mutex<PrefixStore<(), u32>>>,
     revision: u32,
     deny_saves: bool,
+    /// Fails the next snapshot with this error, before the store sees its result.
+    fail_snapshot: Option<EngError>,
 }
 
 impl FakeExecutor {
@@ -42,10 +95,30 @@ impl FakeExecutor {
             script: script.into(),
             eos: eos.to_vec(),
             remaining: max_tokens,
-            saved: None,
+            limits: StoreLimits::default(),
+            prefix: Arc::new(Mutex::new(PrefixStore::default())),
             revision: 1,
             deny_saves: false,
+            fail_snapshot: None,
         }
+    }
+
+    /// Sets the limits of the prefix store (decision 0036, addendum 2). The default limits are
+    /// the addendum 1 limits: zero roots, one entry.
+    pub(crate) fn with_prefix_limits(&mut self, roots: usize, entries: usize) {
+        self.limits = StoreLimits { roots, entries };
+        *lock_store(&self.prefix) = PrefixStore::with_limits(self.limits);
+    }
+
+    /// The handle through which a test reads the store while the fake runs on its engine
+    /// thread.
+    pub(crate) fn prefix_store(&self) -> Arc<Mutex<PrefixStore<(), u32>>> {
+        Arc::clone(&self.prefix)
+    }
+
+    /// The stored prefix keys as `(length, is_root)`, roots first, for test assertions.
+    pub(crate) fn stored_prefixes(&self) -> Vec<(usize, bool)> {
+        lock_store(&self.prefix).keys()
     }
 
     /// Sets the numeric path revision. A saved prefix restores only under the revision that built it.
@@ -53,9 +126,18 @@ impl FakeExecutor {
         self.revision = revision;
     }
 
-    /// Makes every later `save_prefix` report a denied memory charge.
+    /// Makes every later snapshot report a denied memory charge (`MemoryPlan`). The real store
+    /// applies its own rules to the denial: it drops victims before each retry and skips the
+    /// save when none is left, as it does for the resident executors.
     pub(crate) fn deny_saves(&mut self) {
         self.deny_saves = true;
+    }
+
+    /// Fails the next snapshot with `error`, so the save fails like a real snapshot failure.
+    /// The failure waits for a snapshot call: a save that the store refuses or serves as a use
+    /// without a snapshot leaves it armed.
+    pub(crate) fn fail_snapshots(&mut self, error: EngError) {
+        self.fail_snapshot = Some(error);
     }
 }
 
@@ -67,14 +149,15 @@ impl ExecutorOps for FakeExecutor {
     }
 
     fn reset(&mut self, st: &mut FakeSession) -> Result<()> {
-        *st = FakeSession::default();
+        st.core.reset(&mut st.step)?;
+        st.history.clear();
+        st.finished = false;
         Ok(())
     }
 
     fn prefill(&mut self, st: &mut FakeSession, toks: &[u32]) -> Result<()> {
-        if toks.is_empty() {
-            return Err(EngError::BadRequest("empty prefill chunk".to_string()));
-        }
+        // The fake models no context limit, so every prompt fits.
+        st.core.prefill(&mut st.step, toks, usize::MAX)?;
         st.history.extend_from_slice(toks);
         Ok(())
     }
@@ -114,7 +197,7 @@ impl ExecutorOps for FakeExecutor {
                     Ok(piece) => text.push_str(&piece),
                     Err(error) => {
                         // Decision D8: an error resets the session.
-                        *st = FakeSession::default();
+                        let _ = self.reset(st);
                         return Err(error);
                     }
                 }
@@ -130,13 +213,13 @@ impl ExecutorOps for FakeExecutor {
             match generation.decoder.finish() {
                 Ok(tail) => text.push_str(&tail),
                 Err(error) => {
-                    *st = FakeSession::default();
+                    let _ = self.reset(st);
                     return Err(error);
                 }
             }
             if finish == Some(DecodeFinish::Cancelled) {
                 // Decision D8: a cancelled job resets the session.
-                *st = FakeSession::default();
+                let _ = self.reset(st);
             } else {
                 st.finished = true;
             }
@@ -150,38 +233,50 @@ impl ExecutorOps for FakeExecutor {
 
     fn boundary(&mut self, _st: &mut FakeSession) {}
 
-    fn save_prefix(&mut self, st: &FakeSession, key: &[u32]) -> Result<bool> {
-        if st.history.as_slice() != key {
+    fn prefix_limits(&self) -> StoreLimits {
+        self.limits
+    }
+
+    fn save_prefix(&mut self, st: &FakeSession, key: &[u32], kind: SaveKind) -> Result<bool> {
+        // The committed tokens include every scripted token, so a save after a decode is
+        // refused before the session rules run.
+        if st.history != key {
             return Err(EngError::BadRequest(
                 "prefix key differs from the committed tokens".to_string(),
             ));
         }
-        self.saved = None;
-        if self.deny_saves {
-            return Ok(false);
-        }
-        self.saved = Some(SavedPrefix {
-            key: key.to_vec(),
-            revision: self.revision,
-        });
-        Ok(true)
+        let fed = st.step.fed();
+        let path = self.revision;
+        let deny = self.deny_saves;
+        let failing = &mut self.fail_snapshot;
+        let mut store = lock_store(&self.prefix);
+        st.core.save_prefix(&mut *store, key, path, fed, kind, || {
+            if let Some(error) = failing.take() {
+                return Err(error);
+            }
+            if deny {
+                return Err(EngError::MemoryPlan(
+                    "the fake denies the prefix charge".to_string(),
+                ));
+            }
+            Ok(())
+        })
     }
 
     fn restore_prefix(&mut self, st: &mut FakeSession, prompt: &[u32]) -> Result<usize> {
-        let Some(saved) = &self.saved else {
-            return Ok(0);
-        };
-        if saved.revision != self.revision
-            || saved.key.len() >= prompt.len()
-            || !prompt.starts_with(&saved.key)
-        {
-            return Ok(0);
+        let path = self.revision;
+        let mut store = lock_store(&self.prefix);
+        let covered = st
+            .core
+            .restore_prefix(&mut *store, prompt, path, |_| Ok(()))?;
+        if covered > 0 {
+            // The restored state fed every key token but the pending one, and the scripted
+            // tokens of an earlier decode never survive a restore.
+            st.step.fed = covered - 1;
+            st.history = st.core.history().to_vec();
+            st.finished = false;
         }
-        *st = FakeSession {
-            history: saved.key.clone(),
-            finished: false,
-        };
-        Ok(saved.key.len())
+        Ok(covered)
     }
 }
 
@@ -280,6 +375,7 @@ mod prefix_tests {
     use super::{FakeExecutor, FakeSession};
     use crate::EngError;
     use crate::family::executor::ExecutorOps;
+    use crate::family::session::SaveKind;
 
     /// A fake with an empty script, and a session that holds `tokens` as its prefilled prompt.
     fn fake_with_prefilled(tokens: &[u32]) -> (FakeExecutor, FakeSession) {
@@ -292,7 +388,11 @@ mod prefix_tests {
     #[test]
     fn a_saved_prefix_restores_into_a_reset_session_and_reports_its_length() {
         let (mut executor, session) = fake_with_prefilled(&[1, 2, 3, 4]);
-        assert!(executor.save_prefix(&session, &[1, 2, 3, 4]).expect("save"));
+        assert!(
+            executor
+                .save_prefix(&session, &[1, 2, 3, 4], SaveKind::Tip)
+                .expect("save")
+        );
         let mut fresh = FakeSession::default();
         let covered = executor
             .restore_prefix(&mut fresh, &[1, 2, 3, 4, 5, 6])
@@ -304,7 +404,9 @@ mod prefix_tests {
     #[test]
     fn a_saved_prefix_restores_only_for_a_longer_prompt_that_starts_with_the_key() {
         let (mut executor, session) = fake_with_prefilled(&[1, 2, 3, 4]);
-        executor.save_prefix(&session, &[1, 2, 3, 4]).expect("save");
+        executor
+            .save_prefix(&session, &[1, 2, 3, 4], SaveKind::Tip)
+            .expect("save");
         let cases: [(&str, &[u32]); 3] = [
             ("equal prompt", &[1, 2, 3, 4]),
             ("shorter prompt", &[1, 2, 3]),
@@ -324,7 +426,9 @@ mod prefix_tests {
     #[test]
     fn a_changed_numeric_revision_hides_the_saved_prefix() {
         let (mut executor, session) = fake_with_prefilled(&[1, 2]);
-        executor.save_prefix(&session, &[1, 2]).expect("save");
+        executor
+            .save_prefix(&session, &[1, 2], SaveKind::Tip)
+            .expect("save");
         executor.set_numeric_revision(2);
         let mut fresh = FakeSession::default();
         let covered = executor
@@ -336,10 +440,14 @@ mod prefix_tests {
     #[test]
     fn a_new_save_replaces_the_old_one_and_a_denied_save_leaves_none() {
         let (mut executor, first) = fake_with_prefilled(&[1, 2]);
-        executor.save_prefix(&first, &[1, 2]).expect("save first");
+        executor
+            .save_prefix(&first, &[1, 2], SaveKind::Tip)
+            .expect("save first");
         let mut second = FakeSession::default();
         executor.prefill(&mut second, &[3, 4]).expect("prefill");
-        executor.save_prefix(&second, &[3, 4]).expect("save second");
+        executor
+            .save_prefix(&second, &[3, 4], SaveKind::Tip)
+            .expect("save second");
         let mut fresh = FakeSession::default();
         assert_eq!(
             executor
@@ -355,9 +463,28 @@ mod prefix_tests {
             2,
             "the second key is missing"
         );
+        // A job start restores before it saves. This restore matches nothing, so the entry
+        // [3, 4] that the last restore protected is a plain entry again.
+        let mut third = FakeSession::default();
+        assert_eq!(
+            executor
+                .restore_prefix(&mut third, &[5, 6, 7])
+                .expect("restore"),
+            0,
+            "nothing stored matches the third prompt"
+        );
+        executor.prefill(&mut third, &[5, 6]).expect("prefill");
         executor.deny_saves();
-        let saved = executor.save_prefix(&second, &[3, 4]).expect("denied save");
+        // The default store holds one entry, so the save drops [3, 4] to make room. The
+        // snapshot is then denied and no victim is left: the save is skipped.
+        let saved = executor
+            .save_prefix(&third, &[5, 6], SaveKind::Tip)
+            .expect("denied save");
         assert!(!saved, "a denied save reports false");
+        assert!(
+            executor.stored_prefixes().is_empty(),
+            "the store rules dropped the old entry and the denied save added none"
+        );
         let mut other = FakeSession::default();
         assert_eq!(
             executor
@@ -369,12 +496,105 @@ mod prefix_tests {
     }
 
     #[test]
+    fn a_denied_save_keeps_the_entry_that_the_last_restore_protected() {
+        // The rule the old wipe hid: the restored entry is never a victim, so a denied save of
+        // an unrelated key keeps it and the store still restores it.
+        let (mut executor, first) = fake_with_prefilled(&[1, 2]);
+        executor
+            .save_prefix(&first, &[1, 2], SaveKind::Tip)
+            .expect("save first");
+        let mut restored = FakeSession::default();
+        assert_eq!(
+            executor
+                .restore_prefix(&mut restored, &[1, 2, 5])
+                .expect("restore"),
+            2,
+            "the first key restores"
+        );
+        let mut unrelated = FakeSession::default();
+        executor.prefill(&mut unrelated, &[7, 8]).expect("prefill");
+        executor.deny_saves();
+        let saved = executor
+            .save_prefix(&unrelated, &[7, 8], SaveKind::Tip)
+            .expect("denied save");
+        assert!(!saved, "a denied save reports false");
+        assert_eq!(
+            executor.stored_prefixes(),
+            vec![(2, false)],
+            "the protected entry stays"
+        );
+    }
+
+    #[test]
+    fn an_armed_snapshot_failure_waits_for_a_snapshot_call() {
+        // The second save repeats a stored key, so the store serves it as a use and never calls
+        // the snapshot. The armed failure must survive it and fail the next real snapshot.
+        let (mut executor, first) = fake_with_prefilled(&[1, 2]);
+        executor
+            .save_prefix(&first, &[1, 2], SaveKind::Tip)
+            .expect("save first");
+        executor.fail_snapshots(EngError::Checkpoint("snapshot boom".to_string()));
+        assert!(
+            executor
+                .save_prefix(&first, &[1, 2], SaveKind::Tip)
+                .expect("a repeated key is a use"),
+            "the repeat counts as done"
+        );
+        let mut second = FakeSession::default();
+        executor.prefill(&mut second, &[3, 4]).expect("prefill");
+        let failed = executor.save_prefix(&second, &[3, 4], SaveKind::Tip);
+        assert!(
+            matches!(&failed, Err(EngError::Checkpoint(_))),
+            "got {failed:?}"
+        );
+    }
+
+    #[test]
     fn a_save_rejects_a_key_that_differs_from_the_committed_tokens() {
         let (mut executor, session) = fake_with_prefilled(&[1, 2, 3]);
-        let rejected = executor.save_prefix(&session, &[1, 2]);
+        let rejected = executor.save_prefix(&session, &[1, 2], SaveKind::Tip);
         assert!(
             matches!(&rejected, Err(EngError::BadRequest(_))),
             "got {rejected:?}"
         );
+    }
+
+    #[test]
+    fn the_fake_saves_a_root_and_a_tip_through_the_real_store() {
+        // The addendum 2 limits hold two roots and six entries. A Root save of the key of a
+        // stored tip promotes that entry to a pinned root (clarification 1, item 3), so the
+        // store ends with one pinned root and no entry.
+        let (mut executor, session) = fake_with_prefilled(&[1, 2, 3, 4]);
+        executor.with_prefix_limits(2, 6);
+        executor
+            .save_prefix(&session, &[1, 2, 3, 4], SaveKind::Tip)
+            .expect("save tip");
+        assert_eq!(
+            executor.stored_prefixes(),
+            vec![(4, false)],
+            "the tip alone"
+        );
+        assert!(
+            executor
+                .save_prefix(&session, &[1, 2, 3, 4], SaveKind::Root)
+                .expect("save root")
+        );
+        assert_eq!(
+            executor.stored_prefixes(),
+            vec![(4, true)],
+            "the root replaced the tip of the same key"
+        );
+    }
+
+    #[test]
+    fn a_failing_snapshot_fails_the_save_and_leaves_the_store_unchanged() {
+        let (mut executor, session) = fake_with_prefilled(&[1, 2, 3]);
+        executor.fail_snapshots(EngError::Checkpoint("snapshot boom".to_string()));
+        let failed = executor.save_prefix(&session, &[1, 2, 3], SaveKind::Tip);
+        assert!(
+            matches!(&failed, Err(EngError::Checkpoint(_))),
+            "got {failed:?}"
+        );
+        assert!(executor.stored_prefixes().is_empty(), "the store changed");
     }
 }

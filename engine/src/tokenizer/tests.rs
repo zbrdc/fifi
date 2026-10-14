@@ -1858,11 +1858,11 @@ fn the_boundary_is_the_id_count_of_the_text_before_the_generation_tail() {
         "{{ messages[0].content }}{% if add_generation_prompt %} world{% endif %}",
     );
     let messages = [user_message("hello")];
-    let (ids, boundary) = bundle
+    let (ids, boundaries) = bundle
         .encode_prompt_with_boundary(&messages, &[], Thinking::Default)
         .expect("encode");
     assert_eq!(ids, vec![8, 14], "ids of hello and the tail");
-    assert_eq!(boundary, Some(1), "the head holds the id of hello");
+    assert_eq!(boundaries.tip, Some(1), "the head holds the id of hello");
     let plain = bundle
         .encode_prompt(&messages, &[], Thinking::Default)
         .expect("encode");
@@ -1876,43 +1876,43 @@ fn the_boundary_is_none_when_the_tail_merges_into_the_text_before_it() {
     let bundle = bundle_with_template(
         "{{ messages[0].content }}{% if add_generation_prompt %}llo world{% endif %}",
     );
-    let (ids, boundary) = bundle
+    let (ids, boundaries) = bundle
         .encode_prompt_with_boundary(&[user_message("he")], &[], Thinking::Default)
         .expect("encode");
     assert_eq!(ids, vec![8, 14], "ids of hello world");
-    assert_eq!(boundary, None);
+    assert_eq!(boundaries.tip, None);
 }
 
 #[test]
 fn the_boundary_is_none_when_the_generation_prompt_comes_first() {
     let bundle =
         bundle_with_template("{% if add_generation_prompt %}a{% endif %}{{ messages[0].content }}");
-    let (ids, boundary) = bundle
+    let (ids, boundaries) = bundle
         .encode_prompt_with_boundary(&[user_message("hello")], &[], Thinking::Default)
         .expect("encode");
     assert_eq!(ids, vec![9, 8], "ids of a and hello");
-    assert_eq!(boundary, None);
+    assert_eq!(boundaries.tip, None);
 }
 
 #[test]
 fn the_boundary_is_none_when_nothing_precedes_the_tail() {
     let bundle = bundle_with_template("{% if add_generation_prompt %}hello{% endif %}");
-    let (ids, boundary) = bundle
+    let (ids, boundaries) = bundle
         .encode_prompt_with_boundary(&[user_message("x")], &[], Thinking::Default)
         .expect("encode");
     assert_eq!(ids, vec![8], "ids of the tail");
-    assert_eq!(boundary, None);
+    assert_eq!(boundaries.tip, None);
 }
 
 #[test]
 fn the_boundary_is_none_when_the_tail_adds_no_token() {
     let bundle =
         bundle_with_template("{{ messages[0].content }}{% if add_generation_prompt %}{% endif %}");
-    let (ids, boundary) = bundle
+    let (ids, boundaries) = bundle
         .encode_prompt_with_boundary(&[user_message("hello")], &[], Thinking::Default)
         .expect("encode");
     assert_eq!(ids, vec![8], "ids of hello");
-    assert_eq!(boundary, None);
+    assert_eq!(boundaries.tip, None);
 }
 
 #[test]
@@ -1924,20 +1924,20 @@ fn the_boundary_follows_the_tools_that_the_head_renders() {
         "{% if add_generation_prompt %} world{% endif %}",
     ));
     let messages = [user_message("hello")];
-    let (ids, boundary) = bundle
+    let (ids, boundaries) = bundle
         .encode_prompt_with_boundary(&messages, &[example_tool()], Thinking::Default)
         .expect("encode with a tool");
     assert_eq!(ids, vec![9, 8, 14], "ids of a, hello, and the tail");
     assert_eq!(
-        boundary,
+        boundaries.tip,
         Some(2),
         "the head holds the tool marker and hello"
     );
-    let (ids, boundary) = bundle
+    let (ids, boundaries) = bundle
         .encode_prompt_with_boundary(&messages, &[], Thinking::Default)
         .expect("encode without a tool");
     assert_eq!(ids, vec![8, 14], "ids of hello and the tail");
-    assert_eq!(boundary, Some(1), "the head holds hello alone");
+    assert_eq!(boundaries.tip, Some(1), "the head holds hello alone");
 }
 
 #[test]
@@ -1954,12 +1954,266 @@ fn the_boundary_follows_the_thinking_mode_that_the_head_renders() {
         (Thinking::Off, vec![10, 8, 14], Some(2)),
     ];
     for (thinking, want_ids, want_boundary) in cases {
-        let (ids, boundary) = bundle
+        let (ids, boundaries) = bundle
             .encode_prompt_with_boundary(&messages, &[], thinking)
             .expect("encode");
         assert_eq!(ids, want_ids, "ids for {thinking:?}");
-        assert_eq!(boundary, want_boundary, "boundary for {thinking:?}");
+        assert_eq!(boundaries.tip, want_boundary, "boundary for {thinking:?}");
     }
+}
+
+/// A system message with the given content.
+fn system_message(content: &str) -> PromptMessage {
+    PromptMessage {
+        role: Role::System,
+        content: Some(content.to_string()),
+        name: None,
+        tool_call_id: None,
+        tool_calls: vec![],
+    }
+}
+
+/// The template of the root tests: one space after every message and "a" as the tail, so the
+/// message renders stay byte-comparable.
+const ROOT_TEMPLATE: &str =
+    "{% for m in messages %}{{ m.content }} {% endfor %}{% if add_generation_prompt %}a{% endif %}";
+
+#[test]
+fn the_root_is_the_id_count_of_the_first_system_message() {
+    // Hand-derived ids of the toy vocabulary: "hello" is [8] (h+e+l+l+o merged), " held" is
+    // [4, 12, 7] (space, "hel", "d"), and " a" is [4, 9]. The full render of
+    // [system "hello", user "held"] is "hello held a" = [8, 4, 12, 7, 4, 9]; its head without
+    // the tail is "hello held " = [8, 4, 12, 7, 4], and the first message alone is
+    // "hello " = [8, 4].
+    let bundle = bundle_with_template(ROOT_TEMPLATE);
+    let messages = [system_message("hello"), user_message("held")];
+    let (ids, boundaries) = bundle
+        .encode_prompt_with_boundary(&messages, &[], Thinking::Default)
+        .expect("encode");
+    assert_eq!(ids, vec![8, 4, 12, 7, 4, 9], "ids of the prompt");
+    assert_eq!(
+        boundaries.tip,
+        Some(5),
+        "the tip ends after the trailing space"
+    );
+    assert_eq!(
+        boundaries.root,
+        Some(2),
+        "the root is the id count of the system message"
+    );
+}
+
+#[test]
+fn a_prompt_without_a_system_message_reports_no_root() {
+    let bundle = bundle_with_template(ROOT_TEMPLATE);
+    let messages = [user_message("hello")];
+    let (ids, boundaries) = bundle
+        .encode_prompt_with_boundary(&messages, &[], Thinking::Default)
+        .expect("encode");
+    assert_eq!(ids, vec![8, 4, 9], "ids of hello, its space, and the tail");
+    assert_eq!(
+        boundaries.tip,
+        Some(2),
+        "the tip covers hello and its space"
+    );
+    assert_eq!(
+        boundaries.root, None,
+        "the first message is not a system message"
+    );
+}
+
+#[test]
+fn the_root_covers_the_tools_block_that_the_first_system_message_renders() {
+    // The template writes every tool name and a space before the messages, like the pinned
+    // Qwen template writes the tools block inside the first system message. Hand-derived ids:
+    // "b" is [10] ("a" is 9), " hello" is [4, 8], so the render of the first message alone
+    // with the tool "b" is "b hello " = [10, 4, 8, 4].
+    let bundle = bundle_with_template(concat!(
+        "{% for t in tools %}{{ t.name }} {% endfor %}",
+        "{% for m in messages %}{{ m.content }} {% endfor %}",
+        "{% if add_generation_prompt %}a{% endif %}",
+    ));
+    let tool = ToolSpec(serde_json::json!({"name": "b"}));
+    let messages = [system_message("hello"), user_message("held")];
+    let (ids, boundaries) = bundle
+        .encode_prompt_with_boundary(&messages, std::slice::from_ref(&tool), Thinking::Default)
+        .expect("encode");
+    assert_eq!(ids, vec![10, 4, 8, 4, 12, 7, 4, 9], "ids with the tool");
+    assert_eq!(
+        boundaries.tip,
+        Some(7),
+        "the tip covers the tool and both messages"
+    );
+    assert_eq!(
+        boundaries.root,
+        Some(4),
+        "the root covers the tools block and the system message"
+    );
+}
+
+#[test]
+fn a_system_only_prompt_reports_no_root() {
+    // The first message is also the last, so its render equals the tip head and the two
+    // boundaries meet: the root is None.
+    let bundle = bundle_with_template(ROOT_TEMPLATE);
+    let messages = [system_message("hello")];
+    let (ids, boundaries) = bundle
+        .encode_prompt_with_boundary(&messages, &[], Thinking::Default)
+        .expect("encode");
+    assert_eq!(ids, vec![8, 4, 9], "ids of hello, its space, and the tail");
+    assert_eq!(boundaries.tip, Some(2), "the tip covers the one message");
+    assert_eq!(boundaries.root, None, "the root equals the tip");
+}
+
+#[test]
+fn a_root_render_that_the_template_rejects_reports_no_root() {
+    // The template refuses an empty user turn, which the root render appends to the system
+    // message. A rejection (`raise_exception`) and a template defect (an unknown method) both
+    // give no root, while the full prompt, which has no empty turn, still encodes and keeps its
+    // tip.
+    let rejections = [
+        "{{ raise_exception('empty content') }}",
+        "{{ 'a'.upper('x') }}",
+    ];
+    for rejection in rejections {
+        let template = concat!(
+            "{% for m in messages %}",
+            "{% if m.content == '' %}REJECT{% endif %}",
+            "{{ m.content }} ",
+            "{% endfor %}",
+            "{% if add_generation_prompt %}a{% endif %}"
+        )
+        .replace("REJECT", rejection);
+        let bundle = bundle_with_template(&template);
+        let messages = [system_message("hello"), user_message("held")];
+        let (ids, boundaries) = bundle
+            .encode_prompt_with_boundary(&messages, &[], Thinking::Default)
+            .expect("the full prompt has no empty turn");
+        assert_eq!(ids, vec![8, 4, 12, 7, 4, 9], "ids with {rejection}");
+        assert_eq!(boundaries.tip, Some(5), "tip with {rejection}");
+        assert_eq!(boundaries.root, None, "root with {rejection}");
+    }
+}
+
+#[test]
+fn a_user_turn_first_prompt_reports_no_root_although_its_first_render_is_a_prefix() {
+    // The first message is a user message, so the Role::System gate must refuse the root. The
+    // stub rules alone would accept it: "hello " = [8, 4] is a prefix of the prompt
+    // "hello held a" = [8, 4, 12, 7, 4, 9] and ends before its tip 5.
+    let bundle = bundle_with_template(ROOT_TEMPLATE);
+    let messages = [user_message("hello"), user_message("held")];
+    let (ids, boundaries) = bundle
+        .encode_prompt_with_boundary(&messages, &[], Thinking::Default)
+        .expect("encode");
+    assert_eq!(ids, vec![8, 4, 12, 7, 4, 9], "ids of the prompt");
+    assert_eq!(boundaries.tip, Some(5), "the tip ends after the last space");
+    assert_eq!(boundaries.root, None, "the first message is a user message");
+}
+
+#[test]
+fn a_root_that_tokenizes_differently_inside_the_prompt_reports_no_root() {
+    // "hel" alone encodes to [12], but inside "hello held a" the first message merges into the
+    // token "hello" = [8], so the ids of the root render are not the first ids of the prompt.
+    // The prompt ids are [8, 4, 12, 7, 4, 9] and its tip (the text "hello held") is 4.
+    let bundle = bundle_with_template(concat!(
+        "{% for m in messages %}{{ m.content }}{% endfor %}",
+        "{% if add_generation_prompt %} a{% endif %}"
+    ));
+    let messages = [system_message("hel"), user_message("lo held")];
+    let (ids, boundaries) = bundle
+        .encode_prompt_with_boundary(&messages, &[], Thinking::Default)
+        .expect("encode");
+    assert_eq!(ids, vec![8, 4, 12, 7, 4, 9], "ids of the prompt");
+    assert_eq!(boundaries.tip, Some(4), "the tip holds hello and held");
+    assert_eq!(boundaries.root, None, "the root ids are not a prefix");
+}
+
+/// The pinned Qwen chat template on the toy tokenizer.
+fn pinned_bundle() -> TokenizerBundle {
+    bundle_with_template(std::str::from_utf8(CHAT_TEMPLATE_JINJA).expect("template is UTF-8"))
+}
+
+/// The end of every message in the pinned template.
+const IM_END: &str = "\u{3c}|im_end|\u{3e}\n";
+
+/// The user turn of `hi` under the pinned template.
+const USER_HI: &str = "\u{3c}|im_start|\u{3e}user\nhi\u{3c}|im_end|\u{3e}\n";
+
+#[test]
+fn the_pinned_template_gives_a_root_that_is_the_first_system_block() {
+    // The pinned template raises `No user query` for a render without a user turn, so the root
+    // render needs the stub of an empty user turn. The expected root is the token count of the
+    // text the template writes for the system message: marker, content, end marker.
+    let bundle = pinned_bundle();
+    let messages = [system_message("You are terse."), user_message("hi")];
+    let (ids, boundaries) = bundle
+        .encode_prompt_with_boundary(&messages, &[], Thinking::Default)
+        .expect("encode");
+    let system_text = format!("{SYSTEM_MARKER}You are terse.{IM_END}");
+    let system_ids = fixture_tokenizer().encode(&system_text).expect("encode");
+    let head_ids = fixture_tokenizer()
+        .encode(&format!("{system_text}{USER_HI}"))
+        .expect("encode");
+    assert!(!system_ids.is_empty(), "a vacuous root of zero tokens");
+    assert!(system_ids.len() < head_ids.len(), "the user turn adds ids");
+    assert_eq!(boundaries.root, Some(system_ids.len()), "root");
+    assert_eq!(boundaries.tip, Some(head_ids.len()), "tip");
+    assert_eq!(ids[..system_ids.len()], system_ids[..], "root ids lead");
+}
+
+#[test]
+fn the_pinned_template_gives_a_root_that_covers_the_tools_block() {
+    // With one tool the template writes the tools block first and puts the content of the
+    // first system message after it (separated by a blank line) in the same system block.
+    let bundle = pinned_bundle();
+    let tool = ToolSpec(serde_json::json!({"name": "f"}));
+    let messages = [system_message("You are terse."), user_message("hi")];
+    let (ids, boundaries) = bundle
+        .encode_prompt_with_boundary(&messages, std::slice::from_ref(&tool), Thinking::Default)
+        .expect("encode");
+    let tools_block = concat!(
+        "\u{3c}|im_start|\u{3e}system\n# Tools\n\nYou have access to the following functions:\n\n",
+        "\u{3c}tools\u{3e}\n{\"name\": \"f\"}\n\u{3c}/tools\u{3e}",
+        "\n",
+        "\n",
+        "If you choose to call a function ONLY reply in the following format with NO suffix:\n",
+        "\n",
+        "\u{3c}tool_call\u{3e}\n",
+        "\u{3c}function=example_function_name\u{3e}\n",
+        "\u{3c}parameter=example_parameter_1\u{3e}\n",
+        "value_1\n",
+        "\u{3c}/parameter\u{3e}\n",
+        "\u{3c}parameter=example_parameter_2\u{3e}\n",
+        "This is the value for the second parameter\n",
+        "that can span\n",
+        "multiple lines\n",
+        "\u{3c}/parameter\u{3e}\n",
+        "\u{3c}/function\u{3e}\n",
+        "\u{3c}/tool_call\u{3e}\n",
+        "\n",
+        "\u{3c}IMPORTANT\u{3e}\n",
+        "Reminder:\n",
+        "- Function calls MUST follow the specified format: an inner \u{3c}function=...\u{3e}\u{3c}/function\u{3e} block must be nested within \u{3c}tool_call\u{3e}\u{3c}/tool_call\u{3e} XML tags\n",
+        "- Required parameters MUST be specified\n",
+        "- You may provide optional reasoning for your function call in natural language BEFORE the function call, but NOT after\n",
+        "- If there is no function call available, answer the question like normal with your current knowledge and do not tell the user about function calls\n",
+        "\u{3c}/IMPORTANT\u{3e}",
+    );
+    let system_text = format!("{tools_block}\n\nYou are terse.{IM_END}");
+    let system_ids = fixture_tokenizer().encode(&system_text).expect("encode");
+    let without_tools = fixture_tokenizer()
+        .encode(&format!("{SYSTEM_MARKER}You are terse.{IM_END}"))
+        .expect("encode");
+    let head_ids = fixture_tokenizer()
+        .encode(&format!("{system_text}{USER_HI}"))
+        .expect("encode");
+    assert!(
+        system_ids.len() > without_tools.len(),
+        "the tools block adds ids to the root"
+    );
+    assert_eq!(boundaries.root, Some(system_ids.len()), "root");
+    assert_eq!(boundaries.tip, Some(head_ids.len()), "tip");
+    assert_eq!(ids[..system_ids.len()], system_ids[..], "root ids lead");
 }
 
 #[test]

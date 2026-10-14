@@ -544,14 +544,16 @@ impl ExecutorOps for Q36Executor {
     /// No transient routing or draft state exists: expert routing is computed inside each step.
     fn boundary(&mut self, _st: &mut Q36Session) {}
 
-    /// Shares the resident state as a tip entry of this executor's prefix store. The session
-    /// rules decide whether the call is valid. The snapshot charges the session budget.
-    fn save_prefix(&mut self, st: &Q36Session, key: &[u32]) -> Result<bool> {
+    /// Shares the resident state as an entry of this executor's prefix store, saved as `kind`
+    /// (a pinned root at the first system message or a tip at the last boundary; the worker
+    /// passes the kind). The session rules decide whether the call is valid. The snapshot
+    /// charges the session budget.
+    fn save_prefix(&mut self, st: &Q36Session, key: &[u32], kind: SaveKind) -> Result<bool> {
         let path = self.prefill_path();
         let decoder = &mut self.decoder;
         let fed = fed_positions(&st.state);
         st.core
-            .save_prefix(&mut self.prefix, key, path, fed, SaveKind::Tip, || {
+            .save_prefix(&mut self.prefix, key, path, fed, kind, || {
                 decoder.snapshot(&st.state)
             })
     }
@@ -2450,7 +2452,7 @@ mod tests {
         executor.reset(session).unwrap();
         executor.prefill(session, &PREFIX_PROMPT[..KEY]).unwrap();
         executor
-            .save_prefix(session, &PREFIX_PROMPT[..KEY])
+            .save_prefix(session, &PREFIX_PROMPT[..KEY], SaveKind::Tip)
             .unwrap()
     }
 
@@ -2597,7 +2599,9 @@ mod tests {
             "before the second save"
         );
         assert!(
-            executor.save_prefix(&session, &PREFIX_PROMPT).unwrap(),
+            executor
+                .save_prefix(&session, &PREFIX_PROMPT, SaveKind::Tip)
+                .unwrap(),
             "second save"
         );
         assert_eq!(
@@ -2711,7 +2715,9 @@ mod tests {
         // 5 * GROWTH + FIXED_BYTES = 24,576: 29,696 together, over the cap of 28,000. The earlier
         // entry has dropped before the snapshot runs, so its 22,528 bytes are gone at the denial.
         assert!(
-            !executor.save_prefix(&session, &PREFIX_PROMPT).unwrap(),
+            !executor
+                .save_prefix(&session, &PREFIX_PROMPT, SaveKind::Tip)
+                .unwrap(),
             "the second save is denied"
         );
         assert_eq!(
@@ -2826,7 +2832,7 @@ mod tests {
             .decoder
             .step(&mut session.state, 5, StepMode::Prompt)
             .unwrap();
-        let refused = executor.save_prefix(&session, &PREFIX_PROMPT[..KEY]);
+        let refused = executor.save_prefix(&session, &PREFIX_PROMPT[..KEY], SaveKind::Tip);
         assert!(
             matches!(refused, Err(EngError::BadRequest(_))),
             "{refused:?}"
