@@ -274,6 +274,33 @@ impl SamplingParams {
         )
     }
 
+    /// The softmax temperature; 0 selects greedy decoding.
+    #[cfg_attr(
+        not(test),
+        expect(dead_code, reason = "staged for the CUDA device sampler (DEVSAMPLE-1)")
+    )]
+    pub(crate) fn temperature(&self) -> f64 {
+        self.temperature
+    }
+
+    /// The cumulative mass kept by nucleus sampling.
+    #[cfg_attr(
+        not(test),
+        expect(dead_code, reason = "staged for the CUDA device sampler (DEVSAMPLE-1)")
+    )]
+    pub(crate) fn top_p(&self) -> f64 {
+        self.top_p
+    }
+
+    /// The number of best candidates kept; 0 keeps every token.
+    #[cfg_attr(
+        not(test),
+        expect(dead_code, reason = "staged for the CUDA device sampler (DEVSAMPLE-1)")
+    )]
+    pub(crate) fn top_k(&self) -> u32 {
+        self.top_k
+    }
+
     /// True when the settings select the largest logit without a random draw.
     pub(crate) fn is_greedy(&self) -> bool {
         self.temperature == 0.0
@@ -317,6 +344,11 @@ impl SplitMix64 {
 /// Draws token ids from logits under checked settings and a seeded generator.
 pub(crate) struct Sampler {
     params: SamplingParams,
+    #[cfg_attr(
+        not(test),
+        expect(dead_code, reason = "staged for the CUDA device sampler (DEVSAMPLE-1)")
+    )]
+    seed: u64,
     rng: SplitMix64,
 }
 
@@ -325,6 +357,7 @@ impl Sampler {
     pub(crate) fn new(params: SamplingParams, seed: u64) -> Self {
         Self {
             params,
+            seed,
             rng: SplitMix64::new(seed),
         }
     }
@@ -344,6 +377,15 @@ impl Sampler {
         self.params
     }
 
+    /// The seed that the generator started from. The generator state is not exposed.
+    #[cfg_attr(
+        not(test),
+        expect(dead_code, reason = "staged for the CUDA device sampler (DEVSAMPLE-1)")
+    )]
+    pub(crate) fn seed(&self) -> u64 {
+        self.seed
+    }
+
     /// Returns the next token id. `logits` holds one finite value per vocabulary entry.
     /// Empty, oversized, or non-finite logits fail with `Backend`, because they mean that the
     /// forward pass produced invalid numbers.
@@ -355,94 +397,119 @@ impl Sampler {
     /// equivalence tests compare both against the reference implementation, because a wrong kept
     /// count can hide behind the same token for a whole row.
     fn sample_with_keep(&mut self, logits: &[f32]) -> Result<(u32, usize), EngError> {
-        check_logits(logits)?;
-        if self.params.is_greedy() {
-            return Ok((argmax(logits), 1));
+        let rng = &mut self.rng;
+        pick_row(self.params, logits, || rng.next_unit())
+    }
+
+    /// The token and the number of kept candidates that `sample_with_keep` returns when the
+    /// generator's next draw is `unit`. The generator does not move, so the call is repeatable.
+    /// `unit` must lie in [0, 1); any other value, NaN included, fails with `BadRequest` before
+    /// the row is read. A greedy row ignores a valid `unit`, and invalid logits fail as in
+    /// `sample_with_keep`.
+    #[cfg_attr(
+        not(test),
+        expect(dead_code, reason = "staged for the CUDA device sampler (DEVSAMPLE-1)")
+    )]
+    pub(crate) fn pick_with_unit(
+        &self,
+        logits: &[f32],
+        unit: f64,
+    ) -> Result<(u32, usize), EngError> {
+        if !(0.0..1.0).contains(&unit) {
+            return Err(EngError::BadRequest(format!(
+                "the sampling unit must be in [0, 1), got {unit}"
+            )));
         }
-        let temperature = self.params.temperature;
-        let top = top_logit(logits);
-        let top_k = usize::try_from(self.params.top_k).unwrap_or(usize::MAX);
-        // The open-vocabulary prefix path: with `top_k` off on a row longer than `PREFIX_ROWS`,
-        // rank only the prefix first; when its weights provably vanish inside it (`closed`), the
-        // full row's weight walk would stop at the same weight and total, so the prefix answers
-        // without the full-row sort. Otherwise the full path below runs exactly as before. The
-        // random draw is taken only inside `draw_kept`, after the path is decided, so a fallback
-        // never spends a second draw.
-        if top_k == 0 && logits.len() > PREFIX_ROWS {
-            let prefix = ranked_prefix(logits, PREFIX_ROWS);
-            let (weights, total, closed) = ranked_weights_prefix(&prefix, top, temperature);
-            if closed {
-                #[cfg(test)]
-                sample_path::note_prefix();
-                return self.draw_kept(&prefix, &weights, total);
-            }
+        pick_row(self.params, logits, || unit)
+    }
+}
+
+/// The token and kept count of one row under `params`. The path is the sampler's whole decision:
+/// `check_logits`, the greedy argmax, the prefix path, and the ranked paths. `draw` supplies the
+/// call's one random unit and runs exactly once, inside `draw_kept` after the path is decided;
+/// a greedy row and an error path never call it.
+fn pick_row(
+    params: SamplingParams,
+    logits: &[f32],
+    draw: impl FnOnce() -> f64,
+) -> Result<(u32, usize), EngError> {
+    check_logits(logits)?;
+    if params.is_greedy() {
+        return Ok((argmax(logits), 1));
+    }
+    let temperature = params.temperature;
+    let top = top_logit(logits);
+    let top_k = usize::try_from(params.top_k).unwrap_or(usize::MAX);
+    // The open-vocabulary prefix path: with `top_k` off on a row longer than `PREFIX_ROWS`,
+    // rank only the prefix first; when its weights provably vanish inside it (`closed`), the
+    // full row's weight walk would stop at the same weight and total, so the prefix answers
+    // without the full-row sort. Otherwise the full path below runs exactly as before. The
+    // random draw is taken only inside `draw_kept`, after the path is decided, so a fallback
+    // never spends a second draw.
+    if top_k == 0 && logits.len() > PREFIX_ROWS {
+        let prefix = ranked_prefix(logits, PREFIX_ROWS);
+        let (weights, total, closed) = ranked_weights_prefix(&prefix, top, temperature);
+        if closed {
             #[cfg(test)]
-            sample_path::note_fallback();
+            sample_path::note_prefix();
+            return draw_kept(params, &prefix, &weights, total, draw);
         }
-        // The ranked candidates. With `top_k` only the best `limit` entries are needed and a
-        // bounded heap pulls them in one pass over the row without the full candidate allocation;
-        // the open vocabulary takes the whole ranked order so that the normaliser can add the
-        // weights exactly like the reference's `weights.iter().sum()`.
-        let ranked = if top_k == 0 {
-            ranked_row(logits)
-        } else if top_k <= HEAP_TOP_K {
-            top_ranked(logits, top_k.min(logits.len()))
-        } else {
-            let mut ranked = ranked_row(logits);
-            ranked.truncate(top_k);
-            ranked
-        };
-        self.pick(&ranked, top, temperature)
+        #[cfg(test)]
+        sample_path::note_fallback();
     }
-
-    /// Draws from the ranked candidates exactly like the reference kept in the tests: the keep
-    /// loop walks the ranked weights left to right and keeps the smallest prefix whose mass
-    /// reaches `top_p` times the total, one random draw scales the kept mass, and the cumulative
-    /// walk returns the first kept token whose cumulative weight is above the target. Returns the
-    /// token and the number of kept candidates.
-    fn pick(
-        &mut self,
-        ranked: &[(u32, f32)],
-        top: f64,
-        temperature: f64,
-    ) -> Result<(u32, usize), EngError> {
-        let (weights, total) = ranked_weights(ranked, top, temperature);
-        self.draw_kept(ranked, &weights, total)
-    }
-
-    /// The one keep and cumulative walk every path draws through: `weights` are the weights of
-    /// `ranked` in ranked order and `total` their sum. The walk is the reference's, and it takes
-    /// the call's single random draw, so every path into it consumes exactly one draw.
-    fn draw_kept(
-        &mut self,
-        ranked: &[(u32, f32)],
-        weights: &[f64],
-        total: f64,
-    ) -> Result<(u32, usize), EngError> {
-        let threshold = self.params.top_p * total;
-        let mut keep = 0_usize;
-        let mut mass = 0.0_f64;
-        for &w in weights {
-            mass += w;
-            keep += 1;
-            if mass >= threshold {
-                break;
-            }
-        }
-        let target = self.rng.next_unit() * mass;
-        let mut cumulative = 0.0_f64;
-        for (entry, &w) in ranked.iter().zip(weights).take(keep) {
-            cumulative += w;
-            if cumulative > target {
-                return Ok((entry.0, keep));
-            }
-        }
-        // Rounding can leave `target` at the total. The last kept token is the answer then.
+    // The ranked candidates. With `top_k` only the best `limit` entries are needed and a
+    // bounded heap pulls them in one pass over the row without the full candidate allocation;
+    // the open vocabulary takes the whole ranked order so that the normaliser can add the
+    // weights exactly like the reference's `weights.iter().sum()`.
+    let ranked = if top_k == 0 {
+        ranked_row(logits)
+    } else if top_k <= HEAP_TOP_K {
+        top_ranked(logits, top_k.min(logits.len()))
+    } else {
+        let mut ranked = ranked_row(logits);
+        ranked.truncate(top_k);
         ranked
-            .get(keep.saturating_sub(1))
-            .map(|entry| (entry.0, keep))
-            .ok_or_else(|| invalid_logits("no candidate token"))
+    };
+    let (weights, total) = ranked_weights(&ranked, top, temperature);
+    draw_kept(params, &ranked, &weights, total, draw)
+}
+
+/// The one keep and cumulative walk every path draws through: `weights` are the weights of
+/// `ranked` in ranked order and `total` their sum. The walk is the reference's: the keep loop
+/// walks the ranked weights left to right and keeps the smallest prefix whose mass reaches
+/// `top_p` times the total, the call's single `draw()` scales the kept mass, and the cumulative
+/// walk returns the first kept token whose cumulative weight is above the target. Every path
+/// consumes exactly one draw. Returns the token and the number of kept candidates.
+fn draw_kept(
+    params: SamplingParams,
+    ranked: &[(u32, f32)],
+    weights: &[f64],
+    total: f64,
+    draw: impl FnOnce() -> f64,
+) -> Result<(u32, usize), EngError> {
+    let threshold = params.top_p * total;
+    let mut keep = 0_usize;
+    let mut mass = 0.0_f64;
+    for &w in weights {
+        mass += w;
+        keep += 1;
+        if mass >= threshold {
+            break;
+        }
     }
+    let target = draw() * mass;
+    let mut cumulative = 0.0_f64;
+    for (entry, &w) in ranked.iter().zip(weights).take(keep) {
+        cumulative += w;
+        if cumulative > target {
+            return Ok((entry.0, keep));
+        }
+    }
+    // Rounding can leave `target` at the total. The last kept token is the answer then.
+    ranked
+        .get(keep.saturating_sub(1))
+        .map(|entry| (entry.0, keep))
+        .ok_or_else(|| invalid_logits("no candidate token"))
 }
 
 fn invalid_logits(message: &str) -> EngError {
@@ -1404,6 +1471,185 @@ mod tests {
     fn a_top_p_of_zero_keeps_only_the_largest_token() {
         let mut sampler = Sampler::new(params(1.0, 0.0, 0), 0);
         assert_eq!(draws(&mut sampler, &[0.1, 0.5, 0.2], 20), [1; 20]);
+    }
+
+    // The grid over rows on both ranked paths (a one-entry row, small rows, a flat 1,025-entry row
+    // that falls back, a peaked 2,000-entry row that the prefix answers, and tie pairs): a second
+    // sampler of the same seed draws with `sample_with_keep`, `reference_sample` draws the same
+    // unit from a third sampler, and a separate `SplitMix64` hands the unit to `pick_with_unit`.
+    // All three give the same (token, keep) for four consecutive draws.
+    //
+    // Mutation check: in `pick_with_unit`, replace `|| unit` by `|| 0.5`. The unit then differs
+    // from the generator's draws, so the rows of 64 and more entries give other tokens and the
+    // test fails.
+    #[test]
+    fn pick_with_unit_equals_sample_with_keep_and_the_reference_over_the_grid() {
+        let mut row_rng = SplitMix64::new(0xD5_0001);
+        let rows = [
+            random_row(&mut row_rng, 1),
+            random_row(&mut row_rng, 5),
+            random_row(&mut row_rng, 64),
+            random_row(&mut row_rng, 1_025),
+            one_spike_first(2_000),
+            tie_pairs(64),
+        ];
+        for (row_index, logits) in rows.iter().enumerate() {
+            for (step, &(temperature, top_p, top_k)) in grid().iter().enumerate() {
+                let settings = params(temperature, top_p, top_k);
+                let seed = ((row_index as u64) << 8) | step as u64;
+                let mut sampled = Sampler::new(settings, seed);
+                let mut reference = Sampler::new(settings, seed);
+                let picker = Sampler::new(settings, seed);
+                let mut units = SplitMix64::new(seed);
+                for draw in 0..4 {
+                    let want = sampled.sample_with_keep(logits).expect("sample_with_keep");
+                    let reference_want =
+                        reference_sample(&mut reference, logits).expect("reference");
+                    let got = picker
+                        .pick_with_unit(logits, units.next_unit())
+                        .expect("pick_with_unit");
+                    let label = format!(
+                        "row {row_index} ({}), temperature {temperature}, top_p {top_p}, \
+                         top_k {top_k}, seed {seed}, draw {draw}",
+                        logits.len()
+                    );
+                    assert_eq!(got, want, "against sample_with_keep: {label}");
+                    assert_eq!(got, reference_want, "against the reference: {label}");
+                }
+            }
+        }
+        // The grid must keep covering both ranked paths, or the equality above proves less.
+        let (prefix_answers, fallback_answers) = sample_path::take();
+        assert!(
+            prefix_answers > 0,
+            "no draw of the grid took the prefix path"
+        );
+        assert!(
+            fallback_answers > 0,
+            "no draw of the grid took the fallback path"
+        );
+    }
+
+    // Four equal logits at temperature 1 weigh 1, 1, 1, 1 in the ranked order 0, 1, 2, 3 (a tie
+    // goes to the lower index). With top_p 1 all four stay (mass 4) and the unit u picks the token
+    // whose cumulative weight first exceeds 4u: 0.1, 0.3, 0.6, and 0.9 give 0.4, 1.2, 2.4, and
+    // 3.6, so the tokens 0, 1, 2, and 3 with keep 4. With top_p 0.5 the threshold is 2, so two
+    // tokens stay (mass 2) and the units 0.4 and 0.9 give 0.8 and 1.8: tokens 0 and 1, keep 2.
+    //
+    // Mutation check: in `draw_kept`, replace `draw() * mass` by `draw() * total`. At top_p 0.5
+    // the unit 0.4 then gives 1.6 instead of 0.8 and returns token 1 instead of 0, so the test
+    // fails.
+    #[test]
+    fn a_given_unit_picks_the_token_whose_cumulative_weight_passes_its_target() {
+        let sampler = Sampler::new(params(1.0, 1.0, 0), 0);
+        for (unit, token) in [(0.1, 0), (0.3, 1), (0.6, 2), (0.9, 3)] {
+            assert_eq!(
+                sampler.pick_with_unit(&[0.0; 4], unit),
+                Ok((token, 4)),
+                "unit {unit}"
+            );
+        }
+        let half = Sampler::new(params(1.0, 0.5, 0), 0);
+        assert_eq!(half.pick_with_unit(&[0.0; 4], 0.4), Ok((0, 2)));
+        assert_eq!(half.pick_with_unit(&[0.0; 4], 0.9), Ok((1, 2)));
+    }
+
+    // The constructor values come back through the accessors. The three settings differ from
+    // each other, so a swapped accessor shows. A greedy sampler has seed 0.
+    //
+    // Mutation check: in `SamplingParams::top_p`, return `f64::from(self.top_k)`. The test then
+    // reads 20.0 where it expects 0.95 and fails.
+    #[test]
+    fn the_seed_and_the_settings_come_back_through_their_accessors() {
+        let settings = params(0.7, 0.95, 20);
+        assert_eq!(settings.temperature(), 0.7);
+        assert_eq!(settings.top_p(), 0.95);
+        assert_eq!(settings.top_k(), 20);
+        let sampler = Sampler::new(settings, 1_234_567);
+        assert_eq!(sampler.seed(), 1_234_567);
+        assert_eq!(sampler.params(), settings);
+        assert_eq!(Sampler::greedy().seed(), 0);
+    }
+
+    // Four equal logits and top_p 1: the unit 0.0 gives target 0 and the unit -0.0 gives target
+    // -0.0; both are below the first cumulative weight 1, so token 0. The unit 0.999999 gives
+    // 3.999996, below the last cumulative weight 4: token 3. The units 1.0, 1.5, -0.5, and NaN
+    // fail with `BadRequest` that prints the value. A valid call gives the unit 0.6 the target 2.4:
+    // token 2.
+    //
+    // Mutation check: in `pick_with_unit`, replace the range `0.0..1.0` by `0.0..=1.0`. The
+    // unit 1.0 is then accepted and the test fails on it.
+    #[test]
+    fn pick_with_unit_accepts_units_below_one_and_refuses_the_others() {
+        let sampler = Sampler::new(params(1.0, 1.0, 0), 0);
+        let row = [0.0_f32; 4];
+        for (unit, token) in [(0.0, 0), (-0.0, 0), (0.999_999, 3)] {
+            assert_eq!(
+                sampler.pick_with_unit(&row, unit),
+                Ok((token, 4)),
+                "unit {unit}"
+            );
+        }
+        assert_eq!(sampler.pick_with_unit(&row, 0.6), Ok((2, 4)));
+        for bad in [1.0, 1.5, -0.5, f64::NAN] {
+            match sampler.pick_with_unit(&row, bad) {
+                Err(EngError::BadRequest(text)) => {
+                    assert!(text.contains(&format!("{bad}")), "message was {text}");
+                }
+                other => panic!("expected BadRequest for {bad}, got {other:?}"),
+            }
+        }
+    }
+
+    // A greedy sampler picks the largest logit, the lowest index on a tie, and keeps one entry,
+    // whatever valid unit it receives. Here the logits 1, 3, 3, 2 give token 1.
+    //
+    // Mutation check: in `pick_row`, replace `argmax(logits)` by `0`. The token is then 0 and the
+    // test fails.
+    #[test]
+    fn a_greedy_sampler_ignores_the_unit() {
+        let sampler = Sampler::greedy();
+        for unit in [0.0, 0.25, 0.5, 0.999_999] {
+            assert_eq!(
+                sampler.pick_with_unit(&[1.0, 3.0, 3.0, 2.0], unit),
+                Ok((1, 1)),
+                "unit {unit}"
+            );
+        }
+    }
+
+    // `pick_with_unit` reads no draw from the generator. Two samplers start from seed 5. One
+    // takes five calls of `pick_with_unit` (the same unit twice, then four others): the repeated
+    // call returns the same answer, its generator equals the untouched one, and its next
+    // `sample_with_keep` equals the untouched one's.
+    //
+    // Mutation check: give `pick_with_unit` a `&mut self` receiver and add
+    // `let _ = self.rng.next_unit();` before its `pick_row` call (the bindings of the tests then
+    // need `mut`). The generator then moves five draws and the test fails on the generator
+    // equality.
+    #[test]
+    fn pick_with_unit_does_not_consume_a_generator_draw() {
+        let settings = params(1.0, 1.0, 0);
+        let row = [0.0_f32; 16];
+        let mut touched = Sampler::new(settings, 5);
+        let mut untouched = Sampler::new(settings, 5);
+        let first = touched.pick_with_unit(&row, 0.3);
+        assert_eq!(
+            touched.pick_with_unit(&row, 0.3),
+            first,
+            "same unit, same answer"
+        );
+        for unit in [0.0, 0.1, 0.5, 0.9] {
+            touched.pick_with_unit(&row, unit).expect("pick_with_unit");
+        }
+        assert_eq!(
+            touched.rng, untouched.rng,
+            "pick_with_unit moved the generator"
+        );
+        assert_eq!(
+            touched.sample_with_keep(&row),
+            untouched.sample_with_keep(&row)
+        );
     }
 
     #[test]

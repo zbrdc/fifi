@@ -6,8 +6,9 @@
 //!
 //! Call order: `reset`, `prefill` for each chunk, then `decode` until a finish. A prompt feeds
 //! every token except the last one through `TokenStepper::feed`. The last token stays pending.
-//! Each `decode` feeds the pending token through `TokenStepper::logits`, draws the next token from
-//! the job's sampler, and keeps that token pending. One token leaves per call.
+//! Each `decode` feeds the pending token through `TokenStepper::next_token`, which by default reads
+//! `TokenStepper::logits` and draws the next token from the job's sampler, and keeps that token
+//! pending. One token leaves per call.
 //!
 //! The finish rules are pure functions in this file. The session owns EOS, the output limit, the
 //! context limit, and cancellation (decision 0030, D7).
@@ -23,7 +24,7 @@
 
 use crate::{
     EngError,
-    family::executor::GenerationState,
+    family::{executor::GenerationState, sampler::Sampler},
     tokenizer::{DecodeBatch, DecodeFinish},
 };
 use std::{cmp::Reverse, sync::atomic::Ordering};
@@ -44,6 +45,37 @@ pub(crate) trait TokenStepper {
     }
     /// Feeds `token`, runs the head, and returns the full logits row of the next token.
     fn logits(&mut self, token: u32) -> Result<Vec<f32>>;
+    /// Feeds `token` and returns the next token. The default reads the full logits row through
+    /// `logits`, hands the first `sampler_vocab` values to `sampler`, and returns its draw. A
+    /// model that draws on its own device overrides it. A row narrower than `sampler_vocab` is a
+    /// `Backend` error of `OPERATION`.
+    ///
+    /// The fed rule: `DecodeSession::decode` clears the pending token after an `Err` exactly when
+    /// `fed` changed during this call. So `fed` must advance when, and only when, the model state
+    /// consumed the token. An override owns the same contract. Two paths differ from the code
+    /// before this hook existed:
+    /// - A CUDA tiered-mode failure in `end_tiered_token` after the step committed
+    ///   (`qwen36/cuda/step.rs`, `run_token_inner`). `fed` advanced, so the pending token is now
+    ///   cleared where it stayed before. The state is poisoned. The worker resets the session on
+    ///   any non-`Backend` error and fails the engine on a `Backend` error, so the difference
+    ///   is harmless.
+    /// - The unreachable error "the logits step returned no logits" after a commit. It follows the
+    ///   same rule.
+    fn next_token(
+        &mut self,
+        token: u32,
+        sampler: &mut Sampler,
+        sampler_vocab: usize,
+    ) -> Result<u32> {
+        let logits = self.logits(token)?;
+        let visible = logits
+            .get(..sampler_vocab)
+            .ok_or_else(|| EngError::Backend {
+                operation: Self::OPERATION,
+                message: "the logits are narrower than the sampler vocabulary".to_string(),
+            })?;
+        sampler.sample(visible)
+    }
     /// The number of positions fed so far.
     fn fed(&self) -> usize;
     /// Clears the model state of the session.
@@ -139,9 +171,10 @@ impl DecodeSession {
         Ok(())
     }
 
-    /// Commits one batch of tokens: feeds the pending token through a logits step, draws the next
-    /// token from the job's sampler, and keeps it pending. One token leaves per call. A job that
-    /// was cancelled, has no tokens left, or hits a limit ends with a finish reason.
+    /// Commits one batch of tokens: feeds the pending token through `TokenStepper::next_token`,
+    /// which draws the next token from the job's sampler, and keeps it pending. One token leaves
+    /// per call. A job that was cancelled, has no tokens left, or hits a limit ends with a finish
+    /// reason. If `next_token` fails, the pending token stays only when the model did not feed it.
     pub(crate) fn decode<S: TokenStepper>(
         &mut self,
         step: &mut S,
@@ -166,15 +199,20 @@ impl DecodeSession {
         if let Some(reason) = before_step(generation.remaining_tokens()) {
             return self.end(step, generation, Vec::new(), String::new(), reason);
         }
-        let logits = step.logits(pending)?;
+        // The token is consumed exactly when the model fed it. A failure before the feed (a failing
+        // `logits`) keeps the token pending; a failure after it (a narrow row, an invalid row)
+        // leaves no pending token, because a retry would feed the token twice.
+        let fed_before = step.fed();
+        let token = match step.next_token(pending, &mut generation.sampler, limits.sampler_vocab) {
+            Ok(token) => token,
+            Err(error) => {
+                if step.fed() != fed_before {
+                    self.pending = None;
+                }
+                return Err(error);
+            }
+        };
         self.pending = None;
-        let visible = logits
-            .get(..limits.sampler_vocab)
-            .ok_or_else(|| EngError::Backend {
-                operation: S::OPERATION,
-                message: "the logits are narrower than the sampler vocabulary".to_string(),
-            })?;
-        let token = generation.sampler.sample(visible)?;
         self.history.push(token);
         let mut text = String::new();
         if !limits.eos.contains(&token) {
@@ -714,7 +752,10 @@ mod tests {
     };
     use crate::{
         EngError,
-        family::executor::GenerationState,
+        family::{
+            executor::GenerationState,
+            sampler::{Sampler, SamplingParams},
+        },
         tokenizer::{DecodeBatch, DecodeFinish, IncrementalDecoder, Tokenizer},
     };
     use std::sync::atomic::Ordering;
@@ -990,7 +1031,9 @@ mod tests {
             Ok(())
         }
 
-        fn logits(&mut self, _token: u32) -> Result<Vec<f32>> {
+        // Like the real steppers, `logits` advances the position that `fed` reads.
+        fn logits(&mut self, token: u32) -> Result<Vec<f32>> {
+            self.0.push(token);
             Ok(Vec::new())
         }
 
@@ -1402,6 +1445,235 @@ mod tests {
         assert_eq!(session.history(), [1, 2, 3], "history");
         assert_eq!(session.pending(), Some(3), "pending token");
         assert!(!session.is_finished(), "finished");
+    }
+
+    /// When an `Override` fails.
+    #[derive(Clone, Copy)]
+    enum Failure {
+        /// Never: `next_token` returns the scripted token.
+        Never,
+        /// `next_token` fails before it feeds the token.
+        BeforeFeed,
+        /// `next_token` feeds the token and then fails.
+        AfterFeed,
+    }
+
+    /// A stepper that overrides `next_token`. Its `logits` counts the call and fails, so a decode
+    /// that reaches `logits` is visible in `logits_calls` and in the error.
+    struct Override {
+        /// The token that `next_token` returns.
+        token: u32,
+        failure: Failure,
+        /// The positions fed so far.
+        fed: usize,
+        /// The `logits` calls.
+        logits_calls: usize,
+        /// The arguments of every `next_token` call: the token and the sampler vocabulary.
+        calls: Vec<(u32, usize)>,
+    }
+
+    impl TokenStepper for Override {
+        const OPERATION: &'static str = "override";
+
+        fn feed(&mut self, _token: u32) -> Result<()> {
+            self.fed += 1;
+            Ok(())
+        }
+
+        fn logits(&mut self, _token: u32) -> Result<Vec<f32>> {
+            self.logits_calls += 1;
+            Err(EngError::Backend {
+                operation: "override",
+                message: "logits must not run".to_string(),
+            })
+        }
+
+        fn next_token(
+            &mut self,
+            token: u32,
+            _sampler: &mut Sampler,
+            sampler_vocab: usize,
+        ) -> Result<u32> {
+            self.calls.push((token, sampler_vocab));
+            if matches!(self.failure, Failure::BeforeFeed) {
+                return Err(EngError::Backend {
+                    operation: "override",
+                    message: "failed before the feed".to_string(),
+                });
+            }
+            self.fed += 1;
+            if matches!(self.failure, Failure::AfterFeed) {
+                return Err(EngError::Backend {
+                    operation: "override",
+                    message: "failed after the feed".to_string(),
+                });
+            }
+            Ok(self.token)
+        }
+
+        fn fed(&self) -> usize {
+            self.fed
+        }
+
+        fn reset(&mut self) -> Result<()> {
+            self.fed = 0;
+            Ok(())
+        }
+    }
+
+    /// An `Override` that returns `token` or fails as `failure` says, and a session that holds the
+    /// prompt `[1, 2, 3]`: two positions are fed and the token 3 is pending.
+    fn prefilled_override(token: u32, failure: Failure) -> (Override, DecodeSession) {
+        let mut step = Override {
+            token,
+            failure,
+            fed: 0,
+            logits_calls: 0,
+            calls: Vec::new(),
+        };
+        let mut session = DecodeSession::default();
+        session.prefill(&mut step, &[1, 2, 3], LIMIT).unwrap();
+        (step, session)
+    }
+
+    // The override returns the token 6, where the counting `Fake` would give 4. The session records
+    // 6 and keeps it pending; the hook gets the pending token 3 and the sampler vocabulary; the
+    // default `logits` is not called; and the job's sampler is not touched (its next 16 draws
+    // equal those of a fresh sampler with the same seed).
+    //
+    // Mutation check: in `decode`, replace the `step.next_token(...)` call by `step.logits(pending)`
+    // followed by `generation.sampler.sample(..)`. The override is then bypassed, `logits` runs
+    // and fails, and the test fails.
+    #[test]
+    fn an_overridden_next_token_supplies_the_token_without_logits_or_the_sampler() {
+        let (mut step, mut session) = prefilled_override(6, Failure::Never);
+        let settings = SamplingParams::new(1.0, 1.0, 0).unwrap();
+        let tokenizer = Tokenizer::from_bytes(TOKENIZER_JSON.as_bytes()).unwrap();
+        let mut job = GenerationState::with_sampler(
+            IncrementalDecoder::new(&tokenizer),
+            Sampler::new(settings, 9),
+        );
+        let batch = session
+            .decode(&mut step, &mut job, &limits(&EOS_NONE))
+            .unwrap();
+        assert_eq!(batch.tokens, vec![6], "batch tokens");
+        assert_eq!(session.history(), [1, 2, 3, 6], "history");
+        assert_eq!(session.pending(), Some(6), "pending token");
+        assert_eq!(step.calls, vec![(3, VOCAB)], "next_token calls");
+        assert_eq!(step.logits_calls, 0, "logits calls");
+        let row = [0.0_f32; 8];
+        let mut fresh = Sampler::new(settings, 9);
+        for draw in 0..16 {
+            assert_eq!(
+                job.sampler.sample(&row),
+                fresh.sample(&row),
+                "draw {draw}: the sampler was used"
+            );
+        }
+    }
+
+    // The default hook with a stepper whose `OPERATION` is "plain": its `logits` returns an empty
+    // row, which is narrower than the sampler vocabulary 8, so the error carries the label of the
+    // stepper, not a fixed text of the session. The `Fake` tests above pin the same error for the
+    // label "fake".
+    //
+    // Mutation check: in the default body of `next_token`, replace `Self::OPERATION` by "fake".
+    // The label is then "fake" instead of "plain" and the test fails.
+    #[test]
+    fn the_default_next_token_labels_a_narrow_row_with_the_operation_of_the_stepper() {
+        let mut step = Plain(Vec::new());
+        let mut session = DecodeSession::default();
+        session.prefill(&mut step, &[1, 2, 3], LIMIT).unwrap();
+        let result = session.decode(&mut step, &mut generation(), &limits(&EOS_NONE));
+        assert_eq!(
+            result,
+            Err(EngError::Backend {
+                operation: "plain",
+                message: "the logits are narrower than the sampler vocabulary".to_string(),
+            })
+        );
+        assert_eq!(session.pending(), None, "pending token");
+    }
+
+    // After the model fed the token and the row was narrower than the sampler vocabulary, the
+    // token is gone: today's code clears `pending` after `logits` and before the narrowing. The
+    // history keeps the prompt, and the model fed the token (three positions).
+    //
+    // Mutation check: in `decode`, delete the `self.pending = None;` inside the `Err` arm. The
+    // pending token 3 then survives the error and the test fails.
+    #[test]
+    fn a_narrow_row_consumes_the_pending_token() {
+        let mut step = Fake {
+            width: VOCAB - 1,
+            ..Fake::default()
+        };
+        let mut session = DecodeSession::default();
+        session.prefill(&mut step, &[1, 2, 3], LIMIT).unwrap();
+        let result = session.decode(&mut step, &mut generation(), &limits(&EOS_NONE));
+        assert_eq!(result, Err(narrow_logits_error()));
+        assert_eq!(step.fed, vec![1, 2, 3], "the model fed the token");
+        assert_eq!(session.history(), [1, 2, 3], "history");
+        assert_eq!(session.pending(), None, "pending token");
+        assert!(!session.is_finished(), "finished");
+    }
+
+    // A sampler vocabulary of 0 hands the sampler an empty row, which the sampler refuses with a
+    // `Backend` error of the operation "sample". The model fed the token before, so the token is
+    // gone, exactly as after a narrow row.
+    //
+    // Mutation check: in `decode`, delete the `self.pending = None;` inside the `Err` arm. The
+    // pending token 3 then survives the error and the test fails.
+    #[test]
+    fn a_sampler_failure_consumes_the_pending_token() {
+        let mut step = Fake::new();
+        let mut session = DecodeSession::default();
+        session.prefill(&mut step, &[1, 2, 3], LIMIT).unwrap();
+        let empty = Limits {
+            eos: &EOS_NONE,
+            sampler_vocab: 0,
+            context_limit: LIMIT,
+        };
+        let result = session.decode(&mut step, &mut generation(), &empty);
+        assert!(
+            matches!(
+                &result,
+                Err(EngError::Backend {
+                    operation: "sample",
+                    ..
+                })
+            ),
+            "{result:?}"
+        );
+        assert_eq!(step.fed, vec![1, 2, 3], "the model fed the token");
+        assert_eq!(session.history(), [1, 2, 3], "history");
+        assert_eq!(session.pending(), None, "pending token");
+    }
+
+    // An override that fails before it feeds the token leaves the token pending, as a failing
+    // `logits` does (`a_failed_step_leaves_the_tokens_and_the_pending_token_unchanged`). One that
+    // fails after the feed consumes it. Both leave the history at the prompt.
+    //
+    // Mutation check: in `decode`, replace the `if step.fed() != fed_before` condition of the `Err`
+    // arm by `true`. The before-feed case then loses its pending token and the test fails.
+    #[test]
+    fn an_override_that_fails_keeps_the_token_pending_only_when_it_did_not_feed_it() {
+        let (mut step, mut session) = prefilled_override(6, Failure::BeforeFeed);
+        let result = session.decode(&mut step, &mut generation(), &limits(&EOS_NONE));
+        assert!(
+            matches!(result, Err(EngError::Backend { .. })),
+            "{result:?}"
+        );
+        assert_eq!(session.pending(), Some(3), "pending token before the feed");
+        assert_eq!(session.history(), [1, 2, 3], "history before the feed");
+        let (mut step, mut session) = prefilled_override(6, Failure::AfterFeed);
+        let result = session.decode(&mut step, &mut generation(), &limits(&EOS_NONE));
+        assert!(
+            matches!(result, Err(EngError::Backend { .. })),
+            "{result:?}"
+        );
+        assert_eq!(session.pending(), None, "pending token after the feed");
+        assert_eq!(session.history(), [1, 2, 3], "history after the feed");
+        assert_eq!(step.logits_calls, 0, "logits calls");
     }
 
     #[test]
