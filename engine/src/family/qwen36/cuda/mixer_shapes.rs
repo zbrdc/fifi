@@ -10,9 +10,11 @@ use crate::{
     EngError,
     kernels::cuda::resident::{
         attn_decode::AttnShape,
+        attn_decode_q8::AttnQ8Shape,
         attn_prep::{AttnPrepShape, SlotMode},
         gdn_conv::ConvShape,
         gdn_delta::{DeltaShape, GDN_EPS},
+        kv8_append::Kv8Shape,
     },
 };
 
@@ -73,6 +75,30 @@ pub(super) fn attn_decode_shape(g: &MixerGeometry, rows: usize) -> AttnShape {
         n_kv_head: a.heads_kv,
         head_dim: a.head_dim,
         cache_rows: rows,
+        ld: a.ld,
+    }
+}
+
+/// The KV8 append of the Int8G32 step (KV8-B B3): `cells` is the plane cell count (the KV
+/// capacity of the state), which bounds the device pos word.
+pub(super) fn kv8_shape(g: &MixerGeometry, cells: usize) -> Kv8Shape {
+    Kv8Shape {
+        rows: BLOCK_ROWS,
+        n_kv_head: g.attn.heads_kv,
+        head_dim: g.attn.head_dim,
+        cells,
+    }
+}
+
+/// The KV8 decode attention of the Int8G32 step (KV8-B B3): `cells` is the plane cell count.
+pub(super) fn attn_q8_shape(g: &MixerGeometry, cells: usize) -> AttnQ8Shape {
+    let a = &g.attn;
+    AttnQ8Shape {
+        m: BLOCK_ROWS,
+        n_head: a.heads_q,
+        n_kv_head: a.heads_kv,
+        head_dim: a.head_dim,
+        cells,
         ld: a.ld,
     }
 }

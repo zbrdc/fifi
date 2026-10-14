@@ -26,11 +26,6 @@
 //! `attn_decode_q8: <rule>`; size, alignment and overlap are refused by `require_fit` and
 //! `require_apart` with their own texts.
 
-#![cfg_attr(
-    not(test),
-    expect(dead_code, reason = "staged for phase B (decision 0047 item 6)")
-)]
-
 use std::ffi::c_int;
 
 use crate::EngError;

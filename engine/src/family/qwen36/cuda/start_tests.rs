@@ -6,10 +6,10 @@
 use super::dims::{KvMode, StepDims};
 use super::pinned::ROTARY_DIM;
 use super::start::{
-    BuildGuard, CUDA_ENGINE_BUILT, GGUF_BYTES, GGUF_NAME, KV_BYTES_PER_POSITION, already_built,
-    check_gguf_identity, check_sha256, check_tiered_start, context_tokens, file_sha256,
-    ignored_mlx_line, kv_cache_bytes, load_options, pinned_gguf, sha256_wanted, step_options,
-    tiered_plan_of,
+    BuildGuard, CUDA_ENGINE_BUILT, GGUF_BYTES, GGUF_NAME, already_built, check_gguf_identity,
+    check_sha256, check_tiered_start, context_tokens, file_sha256, ignored_mlx_line,
+    kv_bytes_per_position, kv_cache_bytes, kv_mode_of, load_options, pinned_gguf, serve_kv_mode,
+    sha256_wanted, step_options, tiered_plan_of,
 };
 use super::state_layout::KvPool;
 use crate::EngError;
@@ -17,7 +17,9 @@ use crate::family::QWEN3_6_35B_A3B;
 use crate::family::gguf_model::Inventory;
 use crate::family::project::cuda::WeightLayout;
 use crate::family::qwen36::host::HostShape;
-use crate::family::qwen36::settings::{Backend, Q36Env, Q36Options, Q36Settings};
+use crate::family::qwen36::settings::{
+    Backend, KvDtype, Q36Env, Q36Options, Q36Settings, kv_dtype_name,
+};
 use std::path::Path;
 use std::sync::{Mutex, atomic::Ordering};
 
@@ -206,11 +208,12 @@ fn the_file_digest_and_the_mismatch_text_come_from_one_pass() {
 }
 
 #[test]
-fn the_step_options_follow_the_context_limit_and_the_given_layout() {
-    // KUBDAN-MSG-72 item 1: step_options is pure in (limit, layout); make passes the loaded
-    // weights' layout, so the options carry whichever layout they are given, unchanged.
+fn the_step_options_follow_the_context_limit_and_the_given_layout_and_mode() {
+    // KUBDAN-MSG-72 item 1: step_options is pure in (limit, layout, kv_mode); make passes the
+    // loaded weights' layout and the resolved mode, so the options carry whichever pair they
+    // are given, unchanged.
     for layout in [WeightLayout::Tiled, WeightLayout::Native] {
-        let options = step_options(32_768, layout).expect("the serve default");
+        let options = step_options(32_768, layout, KvMode::Fp16).expect("the serve default");
         assert_eq!(options.context_tokens, 32_768);
         assert_eq!((options.delta_slots, options.forked_experts), (1, false));
         assert_eq!(
@@ -221,60 +224,130 @@ fn the_step_options_follow_the_context_limit_and_the_given_layout() {
         assert_eq!(options.layout, layout, "the layout passes through");
     }
     assert!(
-        step_options(2, WeightLayout::Tiled).is_ok(),
+        step_options(2, WeightLayout::Tiled, KvMode::Fp16).is_ok(),
         "the smallest limit the Mac arm accepts"
     );
     for limit in [0, 1] {
-        let text = match step_options(limit, WeightLayout::Native) {
+        let text = match step_options(limit, WeightLayout::Native, KvMode::Fp16) {
             Err(EngError::BadRequest(text)) => text,
             other => panic!("limit {limit} was accepted: {other:?}"),
         };
         assert!(text.contains("context_limit must be at least 2"), "{text}");
         // start() validates through the same function before any device work.
         assert!(
-            context_tokens(limit).is_err(),
+            context_tokens(limit, KvMode::Fp16).is_err(),
             "start refuses limit {limit} too"
         );
     }
     // u32::MAX overflows no pure term (20,480 * 4,294,967,295 < 2^64): the largest limits are
     // refused by the load admission, which names the demand and the free figure.
-    let huge = step_options(u32::MAX, WeightLayout::Tiled).expect("no pure term overflows");
-    assert_eq!(context_tokens(u32::MAX), Ok(huge.context_tokens));
+    let huge =
+        step_options(u32::MAX, WeightLayout::Tiled, KvMode::Fp16).expect("no pure term overflows");
     assert_eq!(
-        kv_cache_bytes(huge.context_tokens),
+        context_tokens(u32::MAX, KvMode::Fp16),
+        Ok(huge.context_tokens)
+    );
+    assert_eq!(
+        kv_cache_bytes(huge.context_tokens, KvMode::Fp16),
         Ok(20_480 * 4_294_967_295u64)
     );
     assert!(
-        kv_cache_bytes(usize::MAX).is_err(),
+        kv_cache_bytes(usize::MAX, KvMode::Fp16).is_err(),
         "an overflowing product is refused"
     );
 }
 
 #[test]
-fn the_kv_bytes_per_position_is_the_pool_figure_of_the_pinned_shape() {
-    // KUBDAN-MSG-72 item 6: the admission's per-position term is the SAME figure the state
-    // layout computes for the pinned shape at fp16, not an independent constant — the layout
-    // is the source, the constant is the pin.
+fn the_kv_bytes_per_position_is_the_pool_figure_of_the_pinned_shape_in_both_modes() {
+    // KUBDAN-MSG-72 item 6, carried to both modes (KV8-B B4): the admission's per-position
+    // term is the SAME figure the state layout computes for the pinned shape — 20,480 B under
+    // Fp16 and 10,880 B under Int8G32 — never an independent constant: the layout is the
+    // source, the two literals are the pin.
     let dims = StepDims::new(
         &HostShape::from_spec(&QWEN3_6_35B_A3B, ROTARY_DIM).expect("shape"),
         &Inventory::for_spec(&QWEN3_6_35B_A3B).expect("inventory"),
     )
     .expect("dims");
-    let per_token = KvPool::bytes_per_token(&dims, KvMode::Fp16).expect("bytes per token");
+    for (mode, want) in [(KvMode::Fp16, 20_480u64), (KvMode::Int8G32, 10_880u64)] {
+        let per_token = KvPool::bytes_per_token(&dims, mode).expect("bytes per token");
+        assert_eq!(u64::try_from(per_token).expect("u64"), want, "{mode:?}");
+        assert_eq!(
+            kv_bytes_per_position(mode).expect("per position"),
+            want,
+            "{mode:?}"
+        );
+        // And the admission term is that figure per position.
+        assert_eq!(
+            kv_cache_bytes(1, mode).expect("one position"),
+            want,
+            "{mode:?}"
+        );
+    }
+}
+
+#[test]
+fn the_kv_mode_of_the_config_maps_f32_to_fp16_and_q8_to_int8g32() {
+    // Main's "f32" names the CONTROL cache, and on the CUDA arm the control cache is fp16.
+    for layout in [WeightLayout::Tiled, WeightLayout::Native] {
+        assert_eq!(
+            kv_mode_of(settings(&KvDtype::F32).kv, layout).expect("f32"),
+            KvMode::Fp16
+        );
+    }
     assert_eq!(
-        u64::try_from(per_token).expect("u64"),
-        KV_BYTES_PER_POSITION
+        kv_mode_of(settings(&KvDtype::Q8).kv, WeightLayout::Native).expect("q8 native"),
+        KvMode::Int8G32
     );
-    // And the admission term is that figure per position.
+    // The serve admission resolves the mode against the layout the load pins (Native), so a
+    // q8 config serves Int8G32 and an absent or f32 config serves Fp16.
     assert_eq!(
-        kv_cache_bytes(1).expect("one position"),
-        KV_BYTES_PER_POSITION
+        serve_kv_mode(&settings(&KvDtype::F32)).expect("absent or f32"),
+        KvMode::Fp16
+    );
+    assert_eq!(
+        serve_kv_mode(&settings(&KvDtype::Q8)).expect("q8"),
+        KvMode::Int8G32
     );
 }
 
 #[test]
+fn q8_with_the_tiled_layout_is_refused_by_the_mode_of_the_start() {
+    // The typed refusal of the control path (the plan refuses it again, `check_layout_rows`):
+    // the guard is the (Q8, Tiled) pair alone — both layouts pass with F32 and Native passes
+    // with Q8 (the test above), so this run reaches its OWN guard.
+    match kv_mode_of(settings(&KvDtype::Q8).kv, WeightLayout::Tiled) {
+        Err(EngError::BadRequest(text)) => {
+            assert!(text.contains("Int8G32") && text.contains("Tiled"), "{text}");
+        }
+        other => panic!("a Tiled q8 start must be refused: {other:?}"),
+    }
+    let kv = kv_cache_bytes(32_768, KvMode::Int8G32).expect("bytes");
+    assert_eq!(
+        kv,
+        10_880 * 32_768,
+        "the q8 admission term follows its mode"
+    );
+}
+
+fn settings(kv: &KvDtype) -> Q36Settings {
+    let entry = serde_json::from_str::<Q36Options>(&format!(
+        "{{\"kv_dtype\": \"{}\"}}",
+        kv_dtype_name(*kv)
+    ))
+    .expect("a valid qwen36 object");
+    Q36Settings::new(
+        std::path::Path::new("/m"),
+        std::path::Path::new("/t"),
+        Some(&entry),
+        &Q36Env::default(),
+        Backend::Cuda,
+    )
+    .expect("the CUDA settings")
+}
+
+#[test]
 fn the_load_reserve_covers_the_kv_cache() {
-    let kv = kv_cache_bytes(32_768).expect("bytes");
+    let kv = kv_cache_bytes(32_768, KvMode::Fp16).expect("bytes");
     assert_eq!(kv, 20_480 * 32_768);
     let options = load_options(kv);
     // work is 0: the workspace is spent before the admission reads free.

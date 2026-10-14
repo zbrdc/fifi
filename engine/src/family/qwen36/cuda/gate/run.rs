@@ -75,12 +75,11 @@ fn mode_of(forced: &[Vec<u32>]) -> Mode {
     }
 }
 
-/// The consistency `FromStr` cannot see: stage-1 terms (fp16 KV, 128 rows), agreeing lists, a
-/// forced stream long enough for every row, non-empty prompts.
+/// The consistency `FromStr` cannot see: stage-1 terms (128 rows), agreeing lists, a forced
+/// stream long enough for every row, non-empty prompts. The KV mode itself needs no check
+/// beyond the parse: both modes are served, and the Tiled Int8G32 pair was refused by
+/// `FromStr`.
 fn check_settings(s: &GateSettings) -> Result<Mode, EngError> {
-    if !s.kv_fp16 {
-        return Err(bad("stage 1 runs an fp16 KV cache: kv_fp16 must be true"));
-    }
     if s.gen_tokens as usize != N_STEPS {
         return Err(bad("the gate times exactly 128 decode steps"));
     }
@@ -165,12 +164,16 @@ fn gate_doc(mode: Mode, identities: Value, prompts: Vec<Value>) -> Value {
 }
 
 /// The identity fields of the memory admission plus the settings' full-file GGUF hash, echoed
-/// for the evaluator (0040 A2; `rawcheck.py` requires `identities.gguf_sha256`).
+/// for the evaluator (0040 A2; `rawcheck.py` requires `identities.gguf_sha256`). The KV mode is
+/// the REAL mode of the session (KV8-B B4), never a constant.
 fn identities_of(s: &GateSettings, total: usize, before: usize, after: usize) -> Value {
     let mut identities = json!({
         "capture_requested": if s.capture { "graph" } else { "eager" },
         "gguf_sha256": s.gguf_sha256,
-        "kv_mode": "fp16",
+        "kv_mode": match s.kv_mode {
+            KvMode::Fp16 => "fp16",
+            KvMode::Int8G32 => "int8g32",
+        },
         "layout": if s.layout == WeightLayout::Native { "native" } else { "tiled" },
         "mem_total": total,
         "mem_free_before": before,
@@ -195,13 +198,14 @@ fn report(doc: Value) -> Result<GateReport, EngError> {
     })
 }
 
-/// The session options of the call: fp16 KV, one committed DeltaNet slot, no forked experts, a
-/// cache that holds every prompt plus the decode rows, and the layout DERIVED from the loaded
-/// weights (`CudaWeights::layout()`), never configured twice: the settings' `layout` chose the
-/// load, the step follows what landed (MATVEC-PAR S3b, KUBDAN-MSG-70 condition 4).
+/// The session options of the call: the settings' KV mode, one committed DeltaNet slot, no
+/// forked experts, a cache that holds every prompt plus the decode rows, and the layout
+/// DERIVED from the loaded weights (`CudaWeights::layout()`), never configured twice: the
+/// settings' `layout` chose the load, the step follows what landed (MATVEC-PAR S3b,
+/// KUBDAN-MSG-70 condition 4).
 fn session_options(s: &GateSettings, layout: WeightLayout) -> Result<StepOptions, EngError> {
     Ok(StepOptions {
-        kv_mode: KvMode::Fp16,
+        kv_mode: s.kv_mode,
         context_tokens: context_tokens(s.prompts.iter().map(Vec::len).max().unwrap_or(0))?,
         delta_slots: 1,
         forked_experts: false,
@@ -527,7 +531,7 @@ mod tests {
 
     const FREE: &str = r#"{"gguf":"/m/q.gguf","gguf_sha256":"ab","names":["P1"],"prompts":[[7,8,9]],
         "forced":[],"forced_stream_sha256":[],"gen_tokens":128,"runs":1,
-        "capture":false,"kv_fp16":true,"deadline_secs":270}"#;
+        "capture":false,"kv_mode":"fp16","deadline_secs":270}"#;
 
     /// The settings text of a call whose reference stream has `len` tokens (0 = the free shape).
     fn call_text(len: usize) -> String {
@@ -538,7 +542,7 @@ mod tests {
             (format!("[[{}]]", stream.join(",")), r#"["cd"]"#.to_owned())
         };
         format!(
-            r#"{{"gguf":"/m/q.gguf","gguf_sha256":"ab","names":["P1"],"prompts":[[7,8,9]],"forced":{forced},"forced_stream_sha256":{sha},"gen_tokens":128,"runs":1,"capture":false,"kv_fp16":true,"deadline_secs":270}}"#
+            r#"{{"gguf":"/m/q.gguf","gguf_sha256":"ab","names":["P1"],"prompts":[[7,8,9]],"forced":{forced},"forced_stream_sha256":{sha},"gen_tokens":128,"runs":1,"capture":false,"kv_mode":"fp16","deadline_secs":270}}"#
         )
     }
 
@@ -558,22 +562,27 @@ mod tests {
 
     #[test]
     fn the_stage_one_terms_are_refused_before_anything_runs() {
+        let wrong_steps = FREE.replace("\"gen_tokens\":128", "\"gen_tokens\":64");
+        assert!(as_call(&wrong_steps).is_err(), "{wrong_steps}");
+        // The KV-mode refusals are the parse's own (gate.rs), so no device is touched: the
+        // legacy boolean kv_fp16 and an unknown kv_mode value fail before a context exists.
         for bad_text in [
-            FREE.replace("\"kv_fp16\":true", "\"kv_fp16\":false"),
-            FREE.replace("\"gen_tokens\":128", "\"gen_tokens\":64"),
+            FREE.replace("\"kv_mode\":\"fp16\"", "\"kv_fp16\":true"),
+            FREE.replace("\"kv_mode\":\"fp16\"", "\"kv_mode\":\"int8\""),
         ] {
-            assert!(as_call(&bad_text).is_err(), "{bad_text}");
+            assert!(bad_text.parse::<GateSettings>().is_err(), "{bad_text}");
+            assert!(matches!(
+                run_step_gate_of(&bad_text),
+                Err(EngError::BadRequest(_))
+            ));
         }
-        // No device is touched: the refusal comes before the context.
-        let refused = FREE.replace("\"kv_fp16\":true", "\"kv_fp16\":false");
-        assert!(matches!(
-            run_step_gate_of(&refused),
-            Err(EngError::BadRequest(_))
-        ));
     }
 
     fn run_step_gate_of(text: &str) -> Result<GateReport, EngError> {
-        crate::family::qwen36::cuda::gate::run_step_gate(&text.parse().unwrap())
+        // The parse is part of the refusal: a settings text the parse rejects never reaches the
+        // device, so the error is returned, not unwrapped.
+        let settings = text.parse::<GateSettings>()?;
+        crate::family::qwen36::cuda::gate::run_step_gate(&settings)
     }
 
     #[test]
@@ -1161,6 +1170,22 @@ mod tests {
                 .tiered,
             None
         );
+    }
+
+    #[test]
+    fn the_identities_and_the_session_echo_the_real_kv_mode() {
+        // KV8-B B4: the raw document echoes the mode the call runs, never a constant, and the
+        // session options carry the same mode (the fp16 control keeps its byte-for-byte text,
+        // pinned by the tests above).
+        let q8: GateSettings = FREE
+            .replace("\"kv_mode\":\"fp16\"", "\"kv_mode\":\"int8g32\"")
+            .parse()
+            .unwrap();
+        assert_eq!(identities_of(&q8, 100, 90, 40)["kv_mode"], json!("int8g32"));
+        assert!(matches!(
+            session_options(&q8, WeightLayout::Native).unwrap().kv_mode,
+            KvMode::Int8G32
+        ));
     }
 
     #[test]

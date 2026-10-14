@@ -109,9 +109,10 @@ fn weight_ppm(weight: f32) -> u64 {
 }
 
 /// The picks of every layer of one token as the device logged them: `(id, weight)` in rank order,
-/// exactly `top_k` per layer (`id < 0` is the router-fault value). WHY (TCAP): the classification
-/// moves onto the device, so the host learns a token's routes after it ran and accounts for them
-/// at the boundary with [`TieredHost::account_token`]. First caller: TCAP C6.
+/// exactly `top_k` per layer (`id == -1` is the router-fault value, any other negative id is
+/// refused). WHY (TCAP): the classification moves onto the device, so the host learns a token's
+/// routes after it ran and accounts for them at the boundary with [`TieredHost::account_token`].
+/// First caller: TCAP C6.
 #[derive(Clone, Debug, PartialEq)]
 pub struct RouteLog {
     layers: usize,
@@ -214,11 +215,11 @@ impl TieredHost {
 
     /// Classifies the picks of `layer` and starts the CPU jobs of the missed ones.
     ///
-    /// `ids` and `weights` are the router's picks in rank order (`ids[i] < 0` is the
-    /// router-fault value); `hidden` is the normed row the CPU experts read. A resident
-    /// pick maps to its bank slot with its weight; a missed pick maps to slot 0 with
-    /// weight 0.0 and one CPU job; a negative id passes through. Nothing is started when
-    /// the route is refused.
+    /// `ids` and `weights` are the router's picks in rank order (`ids[i] == -1` is the
+    /// router-fault value; any other negative id is refused); `hidden` is the normed row the
+    /// CPU experts read. A resident pick maps to its bank slot with its weight; a missed pick
+    /// maps to slot 0 with weight 0.0 and one CPU job; the fault id -1 passes through. Nothing
+    /// is started when the route is refused.
     pub fn begin_layer(
         &mut self,
         layer: usize,
@@ -349,8 +350,9 @@ impl TieredHost {
             .collect()
     }
 
-    /// Validates a route: the layer, the list lengths, every non-negative expert id (in
-    /// range, picked once) and its weight (finite).
+    /// Validates a route: the layer, the list lengths, every expert id (in range, picked once) and
+    /// its weight (finite). The router-fault id -1 passes through unchecked; any other negative
+    /// id is outside the layer, as in the device classification (`classify_reference`).
     fn check_route(&self, layer: usize, ids: &[i32], weights: &[f32]) -> Result<(), HostError> {
         let bad = |what: String| Err(HostError::BadRoute(what));
         if layer >= self.cfg.layers {
@@ -366,7 +368,7 @@ impl TieredHost {
         }
         let mut picks: Vec<i32> = Vec::with_capacity(ids.len());
         for (&id, &weight) in ids.iter().zip(weights) {
-            if id < 0 {
+            if id == -1 {
                 continue;
             }
             if usize::try_from(id).map_or(true, |e| e >= self.cfg.experts) {
@@ -556,7 +558,7 @@ impl TieredHost {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::family::qwen36::tiered::classify::classify_reference;
+    use crate::family::qwen36::tiered::classify::{ROUTE_INVALID, classify_reference};
     use crate::family::qwen36::tiered::cpu_pool::ExpertKernel;
     use crate::family::qwen36::tiered::locator::ExpertTensorNames;
     use crate::family::qwen36::tiered::locator::tests::{Lcg, expert_file, parse};
@@ -1156,8 +1158,12 @@ mod tests {
     #[test]
     fn begin_layer_and_the_log_refuse_the_same_routes() {
         let good = [(1, 0.25), (2, 0.25), (3, 0.25), (4, 0.25)];
-        let bad: [(&str, [(i32, f32); TOP_K]); 3] = [
+        let bad: [(&str, [(i32, f32); TOP_K]); 4] = [
             ("pick twice", [(1, 0.25), (2, 0.25), (1, 0.25), (3, 0.25)]),
+            (
+                "id below the fault id",
+                [(1, 0.25), (2, 0.25), (-2, 0.25), (3, 0.25)],
+            ),
             (
                 "expert past the layer",
                 [(1, 0.25), (2, 0.25), (EXPERTS as i32, 0.25), (3, 0.25)],
@@ -1177,6 +1183,9 @@ mod tests {
                 ),
                 "begin_layer: {what}"
             );
+            let row = f.host.slot_row(2).unwrap();
+            let classified = classify_reference(&row, EXPERTS, &ids, &weights).unwrap();
+            assert_eq!(classified.word, ROUTE_INVALID, "classify_reference: {what}");
             let all = [good.to_vec(), good.to_vec(), picks.to_vec()].concat();
             let log = RouteLog::new(LAYERS, TOP_K, all).unwrap();
             assert!(
@@ -1189,29 +1198,44 @@ mod tests {
     #[test]
     fn classify_reference_equals_begin_layer_plans() {
         // The oracle of the device classification against the host classification it replaces:
-        // seeded single-layer routes over a ledger with a mix of resident and missing experts,
-        // faults included.
+        // seeded single-layer routes over a ledger with 4 residents and 4 missing experts of 8
+        // (so a route can be all hits, all misses or mixed), with whole-layer router faults and
+        // mixed lists (a fault id among valid picks). The slot ids, the weights (by bits) and the
+        // miss list (ids in pick order with their weights) must equal what begin_layer returns.
+        // 3,000 routes, not the design's 10,000: every begin_layer miss starts a real CPU expert
+        // job, and the counted categories below each occur dozens of times. The design's replay
+        // of the OFFT trace is not in the repo.
+        const RESIDENT: [u16; 4] = [0, 2, 3, 5];
         let mut f = fixture_with_slots(Duration::from_secs(60), EXPERTS);
         let mut event = 1;
         for layer in 0..LAYERS {
-            for expert in [0u16, 2, 3, 5, 7] {
+            for expert in RESIDENT {
                 install(&mut f.host, layer, expert, event);
                 event += 1;
             }
         }
         let mut rng = Lcg(0x7CA9_0001);
-        for route in 0..2_000 {
+        let (mut all_hit, mut all_miss, mut mixed, mut whole_fault, mut mixed_fault) =
+            (0, 0, 0, 0, 0);
+        let mut total_missed = 0u32;
+        for route in 0..3_000 {
             let layer = route % LAYERS;
-            let fault = route % 13 == 12;
             let mut ids: Vec<i32> = Vec::new();
-            while !fault && ids.len() < TOP_K {
+            let valid = if route % 13 == 12 {
+                0
+            } else if route % 11 == 10 {
+                TOP_K - 1
+            } else {
+                TOP_K
+            };
+            while ids.len() < valid {
                 let id = (rng.next() % EXPERTS as u64) as i32;
                 if !ids.contains(&id) {
                     ids.push(id);
                 }
             }
-            if fault {
-                ids = vec![-1; TOP_K];
+            while ids.len() < TOP_K {
+                ids.insert((rng.next() % (ids.len() as u64 + 1)) as usize, -1);
             }
             let weights: Vec<f32> = ids
                 .iter()
@@ -1229,20 +1253,75 @@ mod tests {
                 .unwrap();
             f.host.finish_layer(layer).unwrap();
             let row = f.host.slot_row(layer).unwrap();
-            let got = classify_reference(&row, EXPERTS, &ids, &weights);
+            let got = classify_reference(&row, EXPERTS, &ids, &weights).unwrap();
             assert_eq!(got.slot_ids, want.slot_ids, "route {route}");
             assert_eq!(
                 bits(&got.weights),
                 bits(&want.device_weights),
                 "route {route}"
             );
-            assert_eq!(got.word, 0);
-            let missed = ids
+            assert_eq!(got.word, 0, "route {route}");
+            // begin_layer sends a miss to slot 0 with weight 0.0, and every real weight here is positive.
+            let want_misses: Vec<(i32, u32)> = (0..ids.len())
+                .filter(|&i| ids[i] >= 0 && want.device_weights[i] == 0.0)
+                .map(|i| (ids[i], weights[i].to_bits()))
+                .collect();
+            let got_misses: Vec<(i32, u32)> = got
+                .misses
                 .iter()
-                .filter(|&&id| id >= 0 && row[id as usize] < 0)
-                .count();
-            assert_eq!(got.misses.len(), missed, "route {route}");
+                .map(|&(id, w)| (id, w.to_bits()))
+                .collect();
+            assert_eq!(
+                got_misses, want_misses,
+                "route {route}: the miss list, in pick order"
+            );
+            let valid_picks = ids.iter().filter(|&&id| id >= 0).count();
+            let missed = want_misses.len();
+            total_missed += missed as u32;
+            match (valid_picks, ids.contains(&-1)) {
+                (0, _) => whole_fault += 1,
+                (_, true) => mixed_fault += 1,
+                _ if missed == 0 => all_hit += 1,
+                _ if missed == TOP_K => all_miss += 1,
+                _ => mixed += 1,
+            }
         }
+        assert_eq!(
+            total_missed, f.host.report.cpu_served,
+            "the misses of the run are what the host counted as served on the CPU"
+        );
+        for (what, seen) in [
+            ("all hits", all_hit),
+            ("all misses", all_miss),
+            ("mixed hits and misses", mixed),
+            ("whole-layer faults", whole_fault),
+            ("fault ids among valid picks", mixed_fault),
+        ] {
+            assert!(seen >= 10, "the run covers {what} only {seen} times");
+        }
+    }
+
+    #[test]
+    fn an_id_below_the_fault_id_is_refused_by_the_route_check_and_the_log() {
+        // The router writes -1 and nothing else below zero. The device classification refuses
+        // any other negative id (ROUTE_INVALID), so the v1 check and the log path refuse it too.
+        let mut f = fixture();
+        let (ids, weights) = ([2, -2, 5, 3], [0.4, 0.0, 0.2, 0.1]);
+        assert!(matches!(
+            f.host.begin_layer(0, &ids, &weights, &f.hidden),
+            Err(HostError::BadRoute(_))
+        ));
+        let picks: Vec<(i32, f32)> = [(2, 0.4), (-1, 0.0), (5, 0.2), (3, 0.1)].repeat(LAYERS);
+        f.host
+            .account_token(&RouteLog::new(LAYERS, TOP_K, picks.clone()).unwrap())
+            .unwrap();
+        let mut bad = picks;
+        bad[TOP_K + 1].0 = -2;
+        assert!(matches!(
+            f.host
+                .account_token(&RouteLog::new(LAYERS, TOP_K, bad).unwrap()),
+            Err(HostError::BadRoute(_))
+        ));
     }
 
     #[test]

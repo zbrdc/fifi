@@ -7,7 +7,7 @@
 //! binary builds a `GateSettings` from a JSON text (`str::parse`, the `FromStr` impl) and reads the report as text
 //! (`to_string`, the `Display` impl). Trait impls carry no `pub` keyword, and the same check lists them too.
 //! A `prefill` key is a later addition to the settings text, never a second function.
-use super::dims::TieredPlan;
+use super::dims::{KvMode, TieredPlan};
 use crate::EngError;
 use crate::family::project::cuda::WeightLayout;
 use serde_json::Value;
@@ -35,8 +35,9 @@ pub struct GateSettings {
     runs: u32,
     /// true = the captured graph path (RD-11a), false = the uncaptured launches of the same code.
     capture: bool,
-    /// Stage gates: true. Anything else is refused.
-    kv_fp16: bool,
+    /// The KV mode of the call (KV8-B B4): "fp16" (the control) or "int8g32". The legacy
+    /// boolean `kv_fp16` is refused with a pointer to this key.
+    kv_mode: KvMode,
     /// Wall-clock budget of the call in seconds (0 = none); on expiry the report is `incomplete`.
     deadline_secs: u32,
     /// The LOAD layout of the call (MATVEC-PAR S3b): "native" (the default when the key is
@@ -142,11 +143,29 @@ fn flag(v: &Value, key: &str) -> Result<bool, EngError> {
         .ok_or_else(|| EngError::BadRequest(format!("gate settings: {key} is not a boolean")))
 }
 
+/// The `kv_mode` member (KV8-B B4): "fp16" or "int8g32", anything else is a typed error naming
+/// the key; the legacy boolean `kv_fp16` of the stage-1 schema is refused pointing at `kv_mode`.
+fn kv_mode_member(v: &Value) -> Result<KvMode, EngError> {
+    if v.get("kv_fp16").is_some() {
+        return Err(EngError::BadRequest(
+            "gate settings: kv_fp16 was replaced by kv_mode, \"fp16\" or \"int8g32\"".to_owned(),
+        ));
+    }
+    match string(v, "kv_mode")? {
+        "fp16" => Ok(KvMode::Fp16),
+        "int8g32" => Ok(KvMode::Int8G32),
+        other => Err(EngError::BadRequest(format!(
+            "gate settings: kv_mode must be \"fp16\" or \"int8g32\", got {other:?}"
+        ))),
+    }
+}
+
 impl FromStr for GateSettings {
     type Err = EngError;
 
     /// Keys: gguf, gguf_sha256, names, prompts, forced, forced_stream_sha256, gen_tokens, runs,
-    /// capture, kv_fp16, deadline_secs, and the optional keys `layout` ("native", the default
+    /// capture, kv_mode ("fp16", the control, or "int8g32"; KV8-B B4), deadline_secs, and the
+    /// optional keys `layout` ("native", the default
     /// since the S3c qualification, or "tiled"; MATVEC-PAR S3b) and `tiered` (OFF-2; absent means
     /// off, refused with capture and with the tiled layout). A missing or mistyped key is a typed `BadRequest`, never a
     /// default.
@@ -163,7 +182,7 @@ impl FromStr for GateSettings {
             gen_tokens: number(&v, "gen_tokens")?,
             runs: number(&v, "runs")?,
             capture: flag(&v, "capture")?,
-            kv_fp16: flag(&v, "kv_fp16")?,
+            kv_mode: kv_mode_member(&v)?,
             deadline_secs: number(&v, "deadline_secs")?,
             // The ONE optional key (MATVEC-PAR S3b): absent means native (the S3c-qualified
             // default), anything but "tiled" and "native" is a typed error naming the key.
@@ -193,6 +212,15 @@ impl FromStr for GateSettings {
                     .to_owned(),
             ));
         }
+        // KV8-B B4: the Int8G32 KV mode takes the native layout (the step plan refuses the
+        // Tiled Int8G32 plan too, `check_layout_rows`); the control keeps both layouts.
+        if s.kv_mode == KvMode::Int8G32 && s.layout != WeightLayout::Native {
+            return Err(EngError::BadRequest(
+                "gate settings: the Int8G32 KV mode takes the native layout; Tiled is the fp16 \
+                 control path"
+                    .to_owned(),
+            ));
+        }
         if s.names.len() != s.prompts.len() || s.gguf_sha256.is_empty() || s.runs == 0 {
             return Err(EngError::BadRequest(
                 "gate settings: inconsistent lists or zero runs".to_owned(),
@@ -219,7 +247,7 @@ mod tests {
     use super::*;
 
     const GOOD: &str = r#"{"gguf":"/m.gguf","gguf_sha256":"ab","names":["P1"],"prompts":[[1,2,3]],"forced":[],
-        "forced_stream_sha256":[],"gen_tokens":128,"runs":1,"capture":true,"kv_fp16":true,"deadline_secs":270}"#;
+        "forced_stream_sha256":[],"gen_tokens":128,"runs":1,"capture":true,"kv_mode":"fp16","deadline_secs":270}"#;
 
     fn without(key: &str) -> String {
         let mut v: Value = serde_json::from_str(GOOD).unwrap();
@@ -242,7 +270,13 @@ mod tests {
             (s.names.len(), s.prompts[0].clone(), s.runs, s.gen_tokens),
             (1, vec![1, 2, 3], 1, 128)
         );
-        assert!(s.capture && s.kv_fp16 && s.deadline_secs == 270);
+        assert!(s.capture && s.deadline_secs == 270);
+        assert_eq!(s.kv_mode, KvMode::Fp16);
+        let q8: GateSettings = GOOD
+            .replace("\"kv_mode\":\"fp16\"", "\"kv_mode\":\"int8g32\"")
+            .parse()
+            .unwrap();
+        assert_eq!(q8.kv_mode, KvMode::Int8G32);
     }
 
     #[test]
@@ -257,7 +291,7 @@ mod tests {
             "gen_tokens",
             "runs",
             "capture",
-            "kv_fp16",
+            "kv_mode",
             "deadline_secs",
         ] {
             assert!(
@@ -363,12 +397,36 @@ mod tests {
             .to_string(),
             "{\"a\":1}"
         );
-        // kv_fp16 is refused before a context exists, so this needs no device (U13).
-        let refused = GOOD.replace("\"kv_fp16\":true", "\"kv_fp16\":false");
-        assert!(matches!(
-            run_step_gate(&refused.parse().unwrap()),
-            Err(EngError::BadRequest(_))
-        ));
+        // The refusals below come before a context exists, so none needs a device (U13).
+        // The legacy boolean kv_fp16 points at its replacement, and an unknown kv_mode value
+        // is a typed error naming the key and both accepted values.
+        let legacy = GOOD.replace("\"kv_mode\":\"fp16\"", "\"kv_fp16\":true");
+        match legacy.parse::<GateSettings>() {
+            Err(EngError::BadRequest(m)) => {
+                assert!(m.contains("kv_fp16") && m.contains("kv_mode"), "{m}");
+            }
+            Err(other) => panic!("the legacy kv_fp16 must be a BadRequest: {other:?}"),
+            Ok(_) => panic!("the legacy kv_fp16 must be refused, parsed Ok"),
+        }
+        for bad in [
+            "\"kv_mode\":\"int8\"",
+            "\"kv_mode\":\"f16\"",
+            "\"kv_mode\":\"fp32\"",
+        ] {
+            rejects_naming(&GOOD.replace("\"kv_mode\":\"fp16\"", bad), "kv_mode");
+        }
+        // The Int8G32 KV mode takes the native layout only: the Tiled pair is refused naming
+        // the mode and the layout, with the default (native) layout accepted above.
+        let tiled_q8 = GOOD
+            .replace("\"kv_mode\":\"fp16\"", "\"kv_mode\":\"int8g32\"")
+            .replace("\"capture\":true", "\"capture\":true,\"layout\":\"tiled\"");
+        match tiled_q8.parse::<GateSettings>() {
+            Err(EngError::BadRequest(m)) => {
+                assert!(m.contains("Int8G32") && m.contains("Tiled"), "{m}");
+            }
+            Err(other) => panic!("a Tiled Int8G32 gate call must be a BadRequest: {other:?}"),
+            Ok(_) => panic!("a Tiled Int8G32 gate call must be refused, parsed Ok"),
+        }
     }
 
     fn with_member(member: &str) -> String {

@@ -62,7 +62,7 @@ fn run_block(
         tiered: None,
         layout,
     };
-    let scratch = KernelScratch::for_dims(&dims, 1)?;
+    let scratch = KernelScratch::for_dims(&dims, 1, super::dims::KvMode::Fp16)?;
     let plan = StepPlan::new(&dims, 1, &options, &scratch)?;
     // The rig reads the projection row AFTER the whole block, so no slot may share bytes: the
     // plan hands DeltaProj's bytes to DeltaCore, the out pack and MixOut once DELTA_RULE ends,
@@ -171,8 +171,9 @@ fn run_block(
         geometry,
         table: &table,
         weights,
-        views: MixerViews::new(&plan, &arena, &geometry, layout)?,
+        views: MixerViews::new(&plan, &arena, &geometry, layout, super::dims::KvMode::Fp16)?,
         layout,
+        kv_mode: super::dims::KvMode::Fp16,
     };
     let mixers = Mixers::new(ctx, parts)?;
     mixers.run_block(

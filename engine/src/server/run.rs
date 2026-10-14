@@ -80,23 +80,6 @@ fn shutdown_failure(id: &str, report: &ShutdownReport) -> Option<String> {
 /// and the sampling defaults that its `generation_config.json` sets together with the flag of
 /// whether that file supplied them (the start line quotes both).
 fn start_engines(file: &Config) -> Result<(Vec<Engine>, Vec<EngineEntry>), StartupError> {
-    // The CUDA Q36 arm has no prefix reuse until CUDA-SERVE-2, and its refusal is a PRE-PASS
-    // (KUBDAN-MSG-71 item 6): it fires before ANY engine of the file starts, so an entry
-    // listed before the Q36 entry is not built only to be torn down again. Builds whose Q36
-    // arm is the MLX arm — and builds with no Q36 backend, whose entries fail in the factory
-    // with the build's own text — are unaffected.
-    for config in &file.engines {
-        if file.prefix_reuse
-            && config.family == q36_factory::FAMILY
-            && !q36_factory::prefix_reuse_supported()
-        {
-            return Err(StartupError(format!(
-                "engine {} failed to start: prefix_reuse is not supported by the CUDA Q36 \
-                 backend yet (CUDA-SERVE-2); set prefix_reuse to false",
-                config.id
-            )));
-        }
-    }
     let mut engines = Vec::new();
     let mut entries = Vec::new();
     for config in &file.engines {
@@ -418,9 +401,8 @@ mod tests {
     )))]
     #[test]
     fn a_q36_entry_with_prefix_reuse_keeps_the_no_backend_text() {
-        // KUBDAN-MSG-71 item 3: without a Q36 backend the CUDA-specific prefix-reuse refusal
-        // must not fire; the factory's own refusal names the missing backend. The session cap
-        // covers the prefix-reuse cap rule (5,770,117,120 bytes for the default 8-bit cache at
+        // Without a Q36 backend the factory's own refusal names the missing backend. The session
+        // cap covers the prefix-reuse cap rule (5,770,117,120 bytes for the default 8-bit cache at
         // the default context limit of 262,144 positions), which the factory checks before the
         // backend.
         let options = Q36Options {
@@ -437,48 +419,11 @@ mod tests {
                 && text.contains("this build has no Q36 backend"),
             "{text}"
         );
-        assert!(!text.contains("CUDA-SERVE-2"), "{text}");
     }
 
-    #[cfg(all(feature = "native-cuda", target_os = "linux"))]
-    #[test]
-    fn prefix_reuse_is_refused_for_the_cuda_arm() {
-        // The Q36 arm of this build is the CUDA arm, which has no prefix reuse yet.
-        let error = start_engines(&file_with(vec![q36_config(None)], true))
-            .err()
-            .expect("refused");
-        assert_eq!(
-            error.to_string(),
-            "engine e9 failed to start: prefix_reuse is not supported by the CUDA Q36 backend \
-             yet (CUDA-SERVE-2); set prefix_reuse to false"
-        );
-    }
-
-    #[cfg(all(feature = "native-cuda", target_os = "linux"))]
-    #[test]
-    fn prefix_reuse_is_refused_before_any_engine_starts() {
-        // KUBDAN-MSG-71 item 6: with entries [fake, q36] the refusal must fire BEFORE the fake
-        // engine starts. The fake entry's tokenizer directory is missing, so it would FAIL
-        // startup if it ran first: its error text is the mutant's tell — with the pre-pass the
-        // refusal names the q36 entry alone.
-        let mut broken = engine_config("e1", None);
-        broken.tokenizer_dir = PathBuf::from("/does/not/exist");
-        let error = start_engines(&file_with(vec![broken, q36_config(None)], true))
-            .err()
-            .expect("refused");
-        let text = error.to_string();
-        assert!(
-            text.contains("engine e9 failed to start")
-                && text.contains("prefix_reuse is not supported by the CUDA Q36 backend"),
-            "{text}"
-        );
-        assert!(!text.contains("tokenizer.json"), "{text}");
-    }
-
-    #[cfg(all(feature = "native-cuda", target_os = "linux"))]
     #[test]
     fn prefix_reuse_is_accepted_for_other_families() {
-        // The fake family never had the refusal: the flag still reaches every entry.
+        // The flag reaches every entry of the fake family.
         let file = file_with(vec![engine_config("e1", None)], true);
         let (engines, entries) = start_engines(&file).expect("engines");
         assert!(entries[0].prefix_reuse);

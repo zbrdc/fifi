@@ -31,6 +31,6 @@ pub(super) fn plan_of(d: &StepDims, layout: WeightLayout) -> StepPlan {
         tiered: None,
         layout,
     };
-    let scratch = KernelScratch::for_dims(d, 1).expect("scratch");
+    let scratch = KernelScratch::for_dims(d, 1, KvMode::Fp16).expect("scratch");
     StepPlan::new(d, 1, &options, &scratch).expect("plan")
 }

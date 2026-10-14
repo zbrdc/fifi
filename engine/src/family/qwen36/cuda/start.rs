@@ -9,12 +9,13 @@
 //! is built per process: `BuildGuard` pins the flag before `spawn_engine`, commits it right
 //! after the leaks, and every retry in the same process is refused. No code copied.
 
-use super::super::settings::{NO_BUDGET_PIECE, Q36Settings, tokenizer_pin};
+use super::super::settings::{KvDtype, NO_BUDGET_PIECE, Q36Settings, tokenizer_pin};
 use super::{
     dims::{KvMode, StepDims, StepOptions, TieredPlan},
     pinned::{MIN_FREE_AFTER_LOAD, ROTARY_DIM, head_rows_of},
     resources::StepResources,
     rules::QwenRules,
+    state_layout::KvPool,
     step::{CaptureConfig, QwenResidentStep},
     tiered_load::{attach_tiered_parts, names_without_experts},
 };
@@ -37,9 +38,10 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Instant;
 
 /// The pinned checkpoint of the CUDA arm: the file NAME inside `model_dir` and its exact SIZE,
-/// both matching `qualification/cuda-rd/a5-gated-steps.json`. The full-file SHA-256 beside them
-/// is checked only when `Q36_VERIFY_GGUF_SHA256` is `1` (KUBDAN-MSG-69 condition 3): hashing
-/// 20 GB costs about 15-40 s per start (ESTIMATE) and the qualification script checks it.
+/// both matching the pinned identity the qualification tool checks before every gated run. The
+/// full-file SHA-256 beside them is checked only when `Q36_VERIFY_GGUF_SHA256` is `1`
+/// (KUBDAN-MSG-69 condition 3): hashing 20 GB costs about 15-40 s per start (ESTIMATE) and the
+/// qualification script checks it.
 pub(super) const GGUF_NAME: &str = "Qwen3.6-35B-A3B-Q4_K_M.gguf";
 pub(super) const GGUF_BYTES: u64 = 20_419_565_568;
 const GGUF_SHA256: &str = "671e47e0ec53c665d048b98c3ecbfd5236b5ca9c3e02ed19fc8f81f7b85140c7";
@@ -49,9 +51,6 @@ const GGUF_SHA256: &str = "671e47e0ec53c665d048b98c3ecbfd5236b5ca9c3e02ed19fc8f8
 /// cannot silently skip the check. A value Rust cannot read as UTF-8 reads as unset (std's
 /// `env::var`), so it leaves the check off (KUBDAN-MSG-72 NIT).
 const VERIFY_SHA256_VAR: &str = "Q36_VERIFY_GGUF_SHA256";
-/// KV bytes per position of the pinned fp16 cache (`cuda/tests.rs` pins 20,480 B/position;
-/// `start_tests` ties the figure to `KvPool::bytes_per_token`, KUBDAN-MSG-72 item 6).
-pub(super) const KV_BYTES_PER_POSITION: u64 = 20_480;
 /// The loader's admission headroom beside weights and KV (0040 A2 keeps the 1 GiB floor for
 /// the free-after-load check; `work: 0` is right — see `load_options`).
 const HEADROOM: u64 = 1 << 30;
@@ -211,18 +210,44 @@ pub(super) fn check_tiered_start(settings: &Q36Settings) -> Result<(), EngError>
     Ok(())
 }
 
-/// The session options: fp16 KV, one committed DeltaNet slot, no forked experts, the fixed KV
-/// capacity of `context_limit` positions (the step's context limit IS this number), and the
-/// step layout. `make` calls it AFTER the load with the loaded weights' own layout
-/// (`device.layout()?`, KUBDAN-MSG-72 item 1), so the step always runs the layout the device
-/// holds.
+/// The checked KV mode of the parsed `kv_dtype` member and the layout the step runs (KV8-B
+/// B4): absent or `f32` is `Fp16` — main's "f32" names the CONTROL cache, and on the CUDA arm
+/// the control cache is the fp16 cache — and `q8` is `Int8G32`, which exists as Native op lists
+/// only, so the Tiled layout is a typed refusal here (the plan refuses it again,
+/// `check_layout_rows`).
+pub(super) fn kv_mode_of(kv: KvDtype, layout: WeightLayout) -> Result<KvMode, EngError> {
+    match (kv, layout) {
+        (KvDtype::F32, _) => Ok(KvMode::Fp16),
+        (KvDtype::Q8, WeightLayout::Native) => Ok(KvMode::Int8G32),
+        (KvDtype::Q8, WeightLayout::Tiled) => Err(EngError::BadRequest(
+            "engine config: kv_dtype q8 builds the Int8G32 KV mode, which takes the native \
+             layout; Tiled is the fp16 control path"
+                .to_owned(),
+        )),
+    }
+}
+
+/// The KV mode of the config for the serve admission: resolved against the layout the load
+/// PINS (`load_options` writes `WeightLayout::Native` outright), so the admission needs no
+/// device work. `make` derives the mode again from the loaded weights' OWN layout, so the
+/// step's mode always agrees with the admission's.
+pub(super) fn serve_kv_mode(settings: &Q36Settings) -> Result<KvMode, EngError> {
+    kv_mode_of(settings.kv, WeightLayout::Native)
+}
+
+/// The session options: one committed DeltaNet slot, no forked experts, the fixed KV
+/// capacity of `context_limit` positions (the step's context limit IS this number), the KV
+/// mode of the config, and the step layout. `make` calls it AFTER the load with the loaded
+/// weights' own layout (`device.layout()?`, KUBDAN-MSG-72 item 1), so the step always runs the
+/// layout the device holds.
 pub(super) fn step_options(
     context_limit: u32,
     layout: WeightLayout,
+    kv_mode: KvMode,
 ) -> Result<StepOptions, EngError> {
     Ok(StepOptions {
-        kv_mode: KvMode::Fp16,
-        context_tokens: context_tokens(context_limit)?,
+        kv_mode,
+        context_tokens: context_tokens(context_limit, kv_mode)?,
         delta_slots: 1,
         forked_experts: false,
         tiered: None,
@@ -232,7 +257,7 @@ pub(super) fn step_options(
 
 /// The KV capacity in positions of `context_limit`, with its KV bytes checked: below 2 is
 /// refused. `start` validates the limit with this before any device work.
-pub(super) fn context_tokens(context_limit: u32) -> Result<usize, EngError> {
+pub(super) fn context_tokens(context_limit: u32, kv_mode: KvMode) -> Result<usize, EngError> {
     if context_limit < 2 {
         return Err(EngError::BadRequest(format!(
             "engine config: context_limit must be at least 2, found {context_limit}"
@@ -240,17 +265,31 @@ pub(super) fn context_tokens(context_limit: u32) -> Result<usize, EngError> {
     }
     let context_tokens = usize::try_from(context_limit)
         .map_err(|_| EngError::BadRequest("engine config: context_limit exceeds usize".into()))?;
-    kv_cache_bytes(context_tokens)?;
+    kv_cache_bytes(context_tokens, kv_mode)?;
     Ok(context_tokens)
 }
 
-/// The KV cache bytes of `context_tokens` fp16 positions, in checked arithmetic: the number is
-/// the loader's admission term, so an impossible product is refused at planning time. A u32
-/// limit cannot overflow u64; the largest limits are refused by the admission itself.
-pub(super) fn kv_cache_bytes(context_tokens: usize) -> Result<u64, EngError> {
+/// The KV bytes of ONE position under `kv_mode`, straight from the pool's own layout
+/// arithmetic (`KvPool::bytes_per_token`, 20,480 under Fp16 and 10,880 under Int8G32, pinned
+/// by the start tests), never a constant: the admission must follow the KV mode the config
+/// picked (KV8-B B4).
+pub(super) fn kv_bytes_per_position(kv_mode: KvMode) -> Result<u64, EngError> {
+    let inventory = Inventory::for_spec(&QWEN3_6_35B_A3B)?;
+    let shape = HostShape::from_spec(&QWEN3_6_35B_A3B, ROTARY_DIM)?;
+    let dims = StepDims::new(&shape, &inventory)?;
+    u64::try_from(KvPool::bytes_per_token(&dims, kv_mode)?).map_err(|_| {
+        EngError::MemoryPlan("cuda admission: the KV bytes per position exceed u64".into())
+    })
+}
+
+/// The KV cache bytes of `context_tokens` positions of `kv_mode`, in checked arithmetic: the
+/// number is the loader's admission term, so an impossible product is refused at planning
+/// time. A u32 limit cannot overflow u64; the largest limits are refused by the admission
+/// itself.
+pub(super) fn kv_cache_bytes(context_tokens: usize, kv_mode: KvMode) -> Result<u64, EngError> {
     let positions = u64::try_from(context_tokens)
         .map_err(|_| EngError::MemoryPlan("cuda admission: KV positions exceed u64".into()))?;
-    KV_BYTES_PER_POSITION
+    kv_bytes_per_position(kv_mode)?
         .checked_mul(positions)
         .ok_or_else(|| EngError::MemoryPlan("cuda admission: the KV bytes overflow u64".into()))
 }
@@ -293,7 +332,8 @@ pub(crate) fn start(settings: &Q36Settings) -> Result<(Engine, TokenizerBundle),
         .map_err(|_| EngError::Checkpoint("tokenizer vocabulary exceeds usize".into()))?;
     let head_rows = head_rows_of()?;
     let rules = QwenRules::new(eos, sampler_vocab, head_rows)?;
-    let kv_cache = kv_cache_bytes(context_tokens(settings.context_limit)?)?;
+    let kv_mode = serve_kv_mode(settings)?;
+    let kv_cache = kv_cache_bytes(context_tokens(settings.context_limit, kv_mode)?, kv_mode)?;
     // The CUDA arm refuses the prefill budget, so its worker piece is the no-budget piece.
     let piece = usize::try_from(NO_BUDGET_PIECE).map_err(|_| {
         EngError::BadRequest("engine config: the worker piece exceeds usize".into())
@@ -343,7 +383,11 @@ fn make(
     let dims = StepDims::new(&shape, &inventory)?;
     // The step layout is the loaded weights' own, never a constant or the load options: the
     // step's matvecs read the blocks the device holds (a mixed load is refused by layout()).
-    let mut options = step_options(settings.context_limit, device.layout()?)?;
+    // The KV mode is derived from the SAME parsed form against that layout (`kv_mode_of`),
+    // so the step's mode always agrees with the admission's.
+    let layout = device.layout()?;
+    let kv_mode = kv_mode_of(settings.kv, layout)?;
+    let mut options = step_options(settings.context_limit, layout, kv_mode)?;
     options.tiered = tiered;
     let res = StepResources::new(projector.context(), dims, &inventory, &options)?;
     // LEAK (CUDA-SERVE-1 2.1, condition 2): the three owners are leaked for the process
@@ -375,10 +419,15 @@ fn make(
         );
     }
     eprintln!(
-        "q36 cuda: weights resident ({} B), free after load {} B, context_limit {}, capture {}",
+        "q36 cuda: weights resident ({} B), free after load {} B, context_limit {}, kv {}, \
+         capture {}",
         before.free.saturating_sub(after.free),
         after.free,
         options.context_tokens,
+        match options.kv_mode {
+            KvMode::Fp16 => "fp16",
+            KvMode::Int8G32 => "int8g32",
+        },
         if settings.capture { "on" } else { "off" }
     );
     Ok((step, DecodeSession::default()))

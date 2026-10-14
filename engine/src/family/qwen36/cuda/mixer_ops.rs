@@ -12,13 +12,16 @@
 //! Design guidance only, no code copied.
 
 use super::{
+    dims::KvMode,
     mixer_geometry::MixerGeometry,
     state::StepField,
+    state_layout::Plane,
     step_plan::{Phase, Slot},
 };
 use crate::{
     EngError,
     family::{AttentionKind, gguf_model::Role, project::cuda::WeightLayout},
+    kernels::cuda::resident::attn_decode::AttnSplit,
 };
 
 /// Rows of every block: the shared projection row exists only at one row (see `mixer_geometry.rs`).
@@ -117,6 +120,48 @@ pub(super) enum BlockOp {
         out: Slot,
         kv_len: StepField,
     },
+    /// The Int8G32 twin of [`BlockOp::AttnPrep`] (KV8-B B3): the same per-head RMSNorm and
+    /// rope through the rows entry of `attn_prep`, but the post-rope k and the unchanged v go
+    /// to the f32 rows slots `k_rows`/`v_rows` (indexed by the token) and no fp16 cache byte is
+    /// written; a refused position ORs mask 4 into the `status` word.
+    AttnPrepRows {
+        proj: Slot,
+        q: Slot,
+        q_norm: Role,
+        k_norm: Role,
+        k_rows: Slot,
+        v_rows: Slot,
+        pos: StepField,
+        status: StepField,
+    },
+    /// RD-8k: the KV8 append of the Int8G32 step (KV8-B B3): the f32 `k`/`v` rows of the prep
+    /// op, quantized into the four code and scale `planes` of this layer's KV pool at cells
+    /// `*pos ..`; a refused position ORs mask 4 into the `status` word.
+    Kv8Append {
+        k: Slot,
+        v: Slot,
+        k_codes: Plane,
+        k_scales: Plane,
+        v_codes: Plane,
+        v_scales: Plane,
+        pos: StepField,
+        status: StepField,
+    },
+    /// RD-8l: the KV8 split-KV decode attention (KV8-B B3): `q`, the gate columns of `proj` and
+    /// the code and scale `planes` (up to the `kv_len` word) -> `part` partials -> `out`, at the
+    /// `split` the plan sized the partials with (Q8).
+    AttnDecodeQ8 {
+        q: Slot,
+        proj: Slot,
+        k_codes: Plane,
+        k_scales: Plane,
+        v_codes: Plane,
+        v_scales: Plane,
+        kv_len: StepField,
+        part: Slot,
+        out: Slot,
+        split: AttnSplit,
+    },
 }
 
 impl BlockOp {
@@ -130,8 +175,9 @@ impl BlockOp {
             | Self::QuantizeQ8 { phase, .. } => phase,
             Self::Conv { .. } => Phase::DeltaConv,
             Self::Delta { .. } => Phase::DeltaRule,
-            Self::AttnPrep { .. } => Phase::AttnPrep,
-            Self::AttnDecode { .. } => Phase::AttnCore,
+            Self::AttnPrep { .. } | Self::AttnPrepRows { .. } => Phase::AttnPrep,
+            Self::Kv8Append { .. } => Phase::Kv8Append,
+            Self::AttnDecode { .. } | Self::AttnDecodeQ8 { .. } => Phase::AttnCore,
         }
     }
 
@@ -146,8 +192,11 @@ impl BlockOp {
             Self::Pack { x, .. } | Self::QuantizeQ8 { x, .. } => vec![x],
             Self::Conv { proj, .. } => vec![proj],
             Self::Delta { conv, proj, .. } => vec![conv, proj],
-            Self::AttnPrep { proj, .. } => vec![proj],
-            Self::AttnDecode { q, proj, .. } => vec![q, proj],
+            Self::AttnPrep { proj, .. } | Self::AttnPrepRows { proj, .. } => vec![proj],
+            Self::Kv8Append { k, v, .. } => vec![k, v],
+            Self::AttnDecode { q, proj, .. } | Self::AttnDecodeQ8 { q, proj, .. } => {
+                vec![q, proj]
+            }
         }
     }
 
@@ -163,7 +212,14 @@ impl BlockOp {
             Self::QuantizeQ8 { q8, .. } => vec![q8],
             Self::Conv { out, .. } | Self::Delta { out, .. } => vec![out],
             Self::AttnPrep { q, .. } => vec![q],
-            Self::AttnDecode { part, out, .. } => vec![part, out],
+            Self::AttnPrepRows {
+                q, k_rows, v_rows, ..
+            } => vec![q, k_rows, v_rows],
+            // The quantized cells go to the state's KV planes, which are not plan slots.
+            Self::Kv8Append { .. } => Vec::new(),
+            Self::AttnDecode { part, out, .. } | Self::AttnDecodeQ8 { part, out, .. } => {
+                vec![part, out]
+            }
         }
     }
 }
@@ -322,7 +378,7 @@ fn delta_ops(g: &MixerGeometry, layout: WeightLayout) -> Vec<BlockOp> {
     ]
 }
 
-fn attn_ops(g: &MixerGeometry, layout: WeightLayout) -> Vec<BlockOp> {
+fn attn_ops(g: &MixerGeometry, layout: WeightLayout, kv_mode: KvMode) -> Vec<BlockOp> {
     let a = &g.attn;
     let project = |role, col| {
         project_op(
@@ -335,43 +391,87 @@ fn attn_ops(g: &MixerGeometry, layout: WeightLayout) -> Vec<BlockOp> {
             layout,
         )
     };
-    vec![
+    // The KV core of the mode (KV8-B B3): the fp16 pair writes the cache rows inside prep and
+    // decodes over the fp16 planes; the Int8G32 list hands f32 rows from the rows entry of
+    // `attn_prep` to `kv8_append`, which quantizes them into the code and scale planes the q8
+    // decode then reads (at the Q8 split, whose min_keys is a multiple of the 64-cell tile).
+    let core = match kv_mode {
+        KvMode::Fp16 => vec![
+            BlockOp::AttnPrep {
+                proj: Slot::AttnProj,
+                q: Slot::AttnQ,
+                q_norm: Role::AttnQNorm,
+                k_norm: Role::AttnKNorm,
+                pos: StepField::Pos,
+                status: StepField::Status,
+            },
+            BlockOp::AttnDecode {
+                q: Slot::AttnQ,
+                proj: Slot::AttnProj,
+                part: Slot::AttnPart,
+                out: Slot::AttnCore,
+                kv_len: StepField::KvLen,
+            },
+        ],
+        KvMode::Int8G32 => vec![
+            BlockOp::AttnPrepRows {
+                proj: Slot::AttnProj,
+                q: Slot::AttnQ,
+                q_norm: Role::AttnQNorm,
+                k_norm: Role::AttnKNorm,
+                k_rows: Slot::KRows,
+                v_rows: Slot::VRows,
+                pos: StepField::Pos,
+                status: StepField::Status,
+            },
+            BlockOp::Kv8Append {
+                k: Slot::KRows,
+                v: Slot::VRows,
+                k_codes: Plane::K,
+                k_scales: Plane::KScales,
+                v_codes: Plane::V,
+                v_scales: Plane::VScales,
+                pos: StepField::Pos,
+                status: StepField::Status,
+            },
+            BlockOp::AttnDecodeQ8 {
+                q: Slot::AttnQ,
+                proj: Slot::AttnProj,
+                k_codes: Plane::K,
+                k_scales: Plane::KScales,
+                v_codes: Plane::V,
+                v_scales: Plane::VScales,
+                kv_len: StepField::KvLen,
+                part: Slot::AttnPart,
+                out: Slot::AttnCore,
+                split: AttnSplit::Q8,
+            },
+        ],
+    };
+    let mut ops = vec![
         project(Role::AttnQ, 0),
         project(Role::AttnK, a.k_off),
         project(Role::AttnV, a.v_off),
-        BlockOp::AttnPrep {
-            proj: Slot::AttnProj,
-            q: Slot::AttnQ,
-            q_norm: Role::AttnQNorm,
-            k_norm: Role::AttnKNorm,
-            pos: StepField::Pos,
-            status: StepField::Status,
-        },
-        BlockOp::AttnDecode {
-            q: Slot::AttnQ,
-            proj: Slot::AttnProj,
-            part: Slot::AttnPart,
-            out: Slot::AttnCore,
-            kv_len: StepField::KvLen,
-        },
-        pack_op(
-            Phase::AttnPack,
-            Slot::AttnCore,
-            Slot::XfAttnOut,
-            Slot::Q8AttnOut,
-            a.q_width,
-            layout,
-        ),
-        project_op(
-            Phase::AttnOut,
-            Role::AttnOutput,
-            Slot::XfAttnOut,
-            Slot::Q8AttnOut,
-            Slot::MixOut,
-            0,
-            layout,
-        ),
-    ]
+    ];
+    ops.extend(core);
+    ops.push(pack_op(
+        Phase::AttnPack,
+        Slot::AttnCore,
+        Slot::XfAttnOut,
+        Slot::Q8AttnOut,
+        a.q_width,
+        layout,
+    ));
+    ops.push(project_op(
+        Phase::AttnOut,
+        Role::AttnOutput,
+        Slot::XfAttnOut,
+        Slot::Q8AttnOut,
+        Slot::MixOut,
+        0,
+        layout,
+    ));
+    ops
 }
 
 /// Every fused-row column the `ProjectQ` launches of `kind` write, as (role, col, rows, ld): the
@@ -400,11 +500,14 @@ fn native_columns(g: &MixerGeometry, kind: AttentionKind) -> Vec<(Role, usize, u
 /// byte-identical to the a4ca4075 lists (pinned by the literal fixture test); with `Native` the
 /// `NormPack`/`Project`/`Pack` triples become `NormQ8`/`ProjectQ`/`QuantizeQ8` and the fused-row
 /// column offsets are checked first (`check_native_column`), so a bad offset is a typed refusal
-/// here at construction, never a launch-time wrapper error inside a token.
+/// here at construction, never a launch-time wrapper error inside a token. Under `Int8G32`
+/// (Native only, `check_layout_rows`) the attention core becomes the KV8 pair of B3 (the rows
+/// entry, the append, the q8 decode).
 pub(super) fn block_ops(
     kind: AttentionKind,
     g: &MixerGeometry,
     layout: WeightLayout,
+    kv_mode: KvMode,
 ) -> Result<Vec<BlockOp>, EngError> {
     if layout == WeightLayout::Native {
         for (role, col, rows, ld) in native_columns(g, kind) {
@@ -414,7 +517,19 @@ pub(super) fn block_ops(
     let mut ops = vec![prologue(layout)];
     match kind {
         AttentionKind::DeltaNet => ops.extend(delta_ops(g, layout)),
-        AttentionKind::Full => ops.extend(attn_ops(g, layout)),
+        AttentionKind::Full => {
+            // The plan owns the refusal (`check_layout_rows`); the builder states it too
+            // (B2/B3 review item 4): the Int8G32 core's `KRows`/`VRows` slots exist in Native
+            // plans only, so a Tiled Int8G32 list could never be planned.
+            if kv_mode == KvMode::Int8G32 && layout == WeightLayout::Tiled {
+                return Err(EngError::BadRequest(
+                    "step ops: the Int8G32 KV mode takes the native layout; Tiled is the fp16 \
+                     control path"
+                        .to_owned(),
+                ));
+            }
+            ops.extend(attn_ops(g, layout, kv_mode));
+        }
         other => {
             return Err(EngError::Checkpoint(format!(
                 "block ops: attention kind {other:?} has no resident mixer"

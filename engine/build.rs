@@ -84,16 +84,33 @@ const CUDA_SOURCES: &[&str] = &[
     "src/kernels/cuda/native/resident/attn_decode_q8.cu",
     "src/kernels/cuda/native/prefill/attn_prep_chunk.cu",
     "src/kernels/cuda/native/prefill/attn_prefill.cu",
+    "src/kernels/cuda/native/prefill/gdn_scan_seq.cu",
+    "src/kernels/cuda/native/resident/tiered_classify.cu",
 ];
 
-/// The vendored llama.cpp MMQ sources that compile to objects (MATVEC-PAR S1 c2b). Decision 0049
-/// item 5 prescribes their build group: `-use_fast_math --extended-lambda` like the llama.cpp
-/// oracle, warnings tolerated (an accepted exception to E1, KUBDAN-MSG-27/28, extended to these
-/// two objects by KUBDAN-MSG-62 A4), no cuBLAS. A new vendored `.cu` goes here, not at the end of
-/// `CUDA_SOURCES`; the recorded exception is this list.
+/// The vendored llama.cpp MMQ sources that compile to objects (MATVEC-PAR S1 c2b, CPF-V4 V4-0).
+/// Decision 0049 item 5 prescribes their build group: `-use_fast_math --extended-lambda` like the
+/// llama.cpp oracle, warnings tolerated (an accepted exception to E1, KUBDAN-MSG-27/28, extended
+/// to these objects by KUBDAN-MSG-62 A4), no cuBLAS. A new vendored `.cu` goes here, not at the
+/// end of `CUDA_SOURCES`; the recorded exception is this list. CPF-V4 adds the mmid sort and the
+/// four `mul_mat_q` instances of decision 0049 item 3.
 const MMQ_VENDOR_SOURCES: &[&str] = &[
     "vendor/ggml-cuda-mmq/src/ggml-cuda/mmvq.cu",
     "vendor/ggml-cuda-mmq/src/ggml-cuda/quantize.cu",
+    "vendor/ggml-cuda-mmq/src/ggml-cuda/mmid.cu",
+    "vendor/ggml-cuda-mmq/src/ggml-cuda/template-instances/mmq-instance-q4_k.cu",
+    "vendor/ggml-cuda-mmq/src/ggml-cuda/template-instances/mmq-instance-q5_0.cu",
+    "vendor/ggml-cuda-mmq/src/ggml-cuda/template-instances/mmq-instance-q6_k.cu",
+    "vendor/ggml-cuda-mmq/src/ggml-cuda/template-instances/mmq-instance-q8_0.cu",
+];
+/// Our glue of the vendored MMQ (decision 0049 item 5, `mmq-glue`): the vendor group's flags
+/// (`-use_fast_math --extended-lambda`, the same generated `__CUDA_ARCH_LIST__`), with warnings
+/// as errors. Only the MMQ glue and `swiglu_quant`-class kernels go here (`swiglu_rows`, the silu
+/// half of PG3's composed reference: KUBDAN-MSG-85 ruling (b)); `router_tiled` and
+/// `moe_combine_rows` stay in `CUDA_SOURCES` without fast math (KUBDAN-MSG-32 Q1).
+const MMQ_GLUE_SOURCES: &[&str] = &[
+    "src/kernels/cuda/native/prefill/mmq_facts.cu",
+    "src/kernels/cuda/native/prefill/swiglu_rows.cu",
 ];
 /// Headers whose change reruns the build, one path per line, alphabetical. A resident kernel
 /// adds its `native/resident/<n>.h` here.
@@ -104,10 +121,14 @@ const CUDA_HEADERS: &[&str] = &[
     "src/kernels/cuda/native/device.h",
     "src/kernels/cuda/native/prefill/attn_prep_chunk.h",
     "src/kernels/cuda/native/prefill/attn_prefill.h",
+    "src/kernels/cuda/native/prefill/gdn_scan_seq.h",
     "src/kernels/cuda/native/prefill/ggml_shim/ggml-cuda.h",
     "src/kernels/cuda/native/prefill/ggml_shim/ggml-impl.h",
     "src/kernels/cuda/native/prefill/ggml_shim/ggml.h",
     "src/kernels/cuda/native/prefill/ggml_shim/unary.cuh",
+    "src/kernels/cuda/native/prefill/mmq_facts.h",
+    "src/kernels/cuda/native/prefill/status.h",
+    "src/kernels/cuda/native/prefill/swiglu_rows.h",
     "src/kernels/cuda/native/resident/add_norm_pack.h",
     "src/kernels/cuda/native/resident/add_rmsnorm_q8.h",
     "src/kernels/cuda/native/resident/attn_decode.h",
@@ -129,9 +150,11 @@ const CUDA_HEADERS: &[&str] = &[
     "src/kernels/cuda/native/resident/step_params.h",
     "src/kernels/cuda/native/resident/swiglu_pack.h",
     "src/kernels/cuda/native/resident/swiglu_q8.h",
+    "src/kernels/cuda/native/resident/tiered_classify.h",
     "vendor/ggml-cuda-mmq/src/ggml-common.h",
     "vendor/ggml-cuda-mmq/src/ggml-cuda/common.cuh",
     "vendor/ggml-cuda-mmq/src/ggml-cuda/mma.cuh",
+    "vendor/ggml-cuda-mmq/src/ggml-cuda/mmid.cuh",
     "vendor/ggml-cuda-mmq/src/ggml-cuda/mmq-config-ampere.cuh",
     "vendor/ggml-cuda-mmq/src/ggml-cuda/mmq-config-pascal-dp4a.cuh",
     "vendor/ggml-cuda-mmq/src/ggml-cuda/mmq-load-tiles.cuh",
@@ -172,6 +195,7 @@ fn build_cuda() {
     for path in CUDA_SOURCES
         .iter()
         .chain(MMQ_VENDOR_SOURCES.iter())
+        .chain(MMQ_GLUE_SOURCES.iter())
         .chain(CUDA_HEADERS.iter())
     {
         println!("cargo:rerun-if-changed={path}");
@@ -202,13 +226,29 @@ fn build_cuda() {
         build.define("INFERENCE_CUDA_FAULT_QUALIFICATION", None);
     }
     let archs = cuda_archs();
-    for arch in &archs {
+    gencode(&mut build, &archs);
+    let arch_header = arch_list_header(&archs);
+    // Static archives resolve left to right, and each compile() emits its archive's link line,
+    // so the call order is the link order: the MMQ glue (it calls the main archive's arch clamp
+    // and the vendored entries), the main archive (its MMVQ glue calls the vendored objects),
+    // the vendored objects, then the runtime; the Xavier lib-test link failed with undefined
+    // cudart symbols when the runtime came first. Decision 0049 item 5 writes "mmq-glue, then
+    // mmq-vendor, then the existing groups"; the main archive moves before the vendored one
+    // because the MMVQ glue of MATVEC-PAR S1 already lives in it (recorded deviation, CPF-V4).
+    build_mmq_glue(&archs, &arch_header);
+    build.compile("inference_cuda_native");
+    build_mmq_vendor(&archs, &arch_header);
+    toolkit.link_static_cudart();
+}
+
+/// One `-gencode` per listed arch, plus PTX for the newest one, which lets a newer GPU JIT the
+/// kernels instead of failing with cudaErrorNoKernelImageForDevice.
+fn gencode(build: &mut cc::Build, archs: &[String]) {
+    for arch in archs {
         build
             .flag("-gencode")
             .flag(format!("arch=compute_{arch},code=sm_{arch}"));
     }
-    // PTX for the newest listed arch lets a newer GPU JIT the kernels instead
-    // of failing with cudaErrorNoKernelImageForDevice.
     if let Some(newest) = archs
         .iter()
         .max_by_key(|arch| arch.parse::<u32>().unwrap_or(0))
@@ -217,22 +257,12 @@ fn build_cuda() {
             .flag("-gencode")
             .flag(format!("arch=compute_{newest},code=compute_{newest}"));
     }
-    build.compile("inference_cuda_native");
-    build_mmq_vendor(&archs);
-    // Static archives resolve left to right, so the runtime must follow the
-    // adapter archive on the link line; the Xavier lib-test link failed with
-    // undefined cudart symbols when it came first.
-    toolkit.link_static_cudart();
 }
 
-/// Builds the vendored MMQ objects (decision 0049 item 5, MATVEC-PAR S1 c2b, KUBDAN-MSG-62 A4):
-/// `-use_fast_math --extended-lambda` like the llama.cpp oracle, warnings tolerated, no cuBLAS.
-/// The archive is compiled after `inference_cuda_native`, so glue that calls
-/// `fifi_mmvq_launch`/`quantize_row_q8_1_cuda` resolves against it (link order glue, then
-/// vendor). `__CUDA_ARCH_LIST__` rides in a generated header taken with `-include`: nvcc splits
-/// comma-valued `-D` when it forwards them to the host compiler, so the define cannot go on the
-/// command line (checked with nvcc 12.2).
-fn build_mmq_vendor(archs: &[String]) {
+/// Writes `__CUDA_ARCH_LIST__` into a generated header the MMQ groups take with `-include`: nvcc
+/// splits comma-valued `-D` when it forwards them to the host compiler, so the define cannot go
+/// on the command line (checked with nvcc 12.2).
+fn arch_list_header(archs: &[String]) -> std::path::PathBuf {
     let out_dir = std::env::var("OUT_DIR").expect("cargo sets OUT_DIR");
     let arch_list = archs
         .iter()
@@ -250,6 +280,36 @@ fn build_mmq_vendor(archs: &[String]) {
         format!("#define __CUDA_ARCH_LIST__ {arch_list}\n"),
     )
     .unwrap_or_else(|error| panic!("cannot write {}: {error}", arch_header.display()));
+    arch_header
+}
+
+/// Builds our MMQ glue (decision 0049 item 5, `mmq-glue`; CPF-V4): the vendored group's flags and
+/// generated arch list, warnings as errors.
+fn build_mmq_glue(archs: &[String], arch_header: &std::path::Path) {
+    let mut glue = cc::Build::new();
+    glue.cuda(true)
+        .cudart("none")
+        .flag("-std=c++17")
+        .include("src/kernels/cuda/native")
+        .include("vendor/ggml-cuda-mmq/src")
+        .include("vendor/ggml-cuda-mmq/src/ggml-cuda")
+        .include("src/kernels/cuda/native/prefill/ggml_shim")
+        .files(MMQ_GLUE_SOURCES)
+        .flag("-use_fast_math")
+        .flag("--extended-lambda")
+        .flag("-include")
+        .flag(arch_header.to_str().expect("OUT_DIR is UTF-8"))
+        .warnings_into_errors(true);
+    gencode(&mut glue, archs);
+    glue.compile("inference_cuda_mmq_glue");
+}
+
+/// Builds the vendored MMQ objects (decision 0049 item 5, MATVEC-PAR S1 c2b, KUBDAN-MSG-62 A4):
+/// `-use_fast_math --extended-lambda` like the llama.cpp oracle, warnings tolerated, no cuBLAS.
+/// The archive is compiled after `inference_cuda_native` and the MMQ glue, so the glue that
+/// calls `fifi_mmvq_launch`/`quantize_row_q8_1_cuda`/`mul_mat_q_case` resolves against it.
+/// `__CUDA_ARCH_LIST__` rides in the generated header of [`arch_list_header`].
+fn build_mmq_vendor(archs: &[String], arch_header: &std::path::Path) {
     let mut vendor = cc::Build::new();
     vendor
         .cuda(true)
@@ -263,20 +323,7 @@ fn build_mmq_vendor(archs: &[String]) {
         .flag("--extended-lambda")
         .flag("-include")
         .flag(arch_header.to_str().expect("OUT_DIR is UTF-8"));
-    for arch in archs {
-        vendor
-            .flag("-gencode")
-            .flag(format!("arch=compute_{arch},code=sm_{arch}"));
-    }
-    // PTX for the newest listed arch lets a newer GPU (sm_89) JIT the vendored kernels.
-    if let Some(newest) = archs
-        .iter()
-        .max_by_key(|arch| arch.parse::<u32>().unwrap_or(0))
-    {
-        vendor
-            .flag("-gencode")
-            .flag(format!("arch=compute_{newest},code=compute_{newest}"));
-    }
+    gencode(&mut vendor, archs);
     vendor.compile("ggml_cuda_mmq_vendor");
 }
 

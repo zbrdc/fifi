@@ -18,9 +18,11 @@
 //!
 //! The words `pos`, `kv_len` and `kv_slot` are read by a fixed set of kernels
 //! ([`POS_WORD_READERS`]). Each range-checks the word before it touches memory and has a merged
-//! test that runs the poisoned word (the poison-consumer rule of the stage 1 plan). This packet
-//! adds no reader: the embedding reads `token_id` only, and its own bad-id path (NaN row and
-//! status mask 4) belongs to RD-4c.
+//! test that runs the poisoned word (the poison-consumer rule of the stage 1 plan). The Fp16
+//! step reads the words through `attn_prep` and `attn_decode` alone; the Int8G32 mode of KV8-B
+//! adds three readers (B5 owns this table and its pin): the rows entry `attn_prep_rows` and
+//! `kv8_append` read `pos`, and `attn_decode_q8` reads `kv_len`. The embedding reads
+//! `token_id` only, and its own bad-id path (NaN row and status mask 4) belongs to RD-4c.
 //!
 //! Design guidance only, no code copied.
 
@@ -84,6 +86,9 @@ impl StepOp {
                 Phase::MixPack,
                 Phase::AttnIn,
                 Phase::AttnPrep,
+                // The KV8 append of the Int8G32 mode (KV8-B B2): no kernel of the Fp16 path
+                // enters this phase, and the Int8G32 op list runs `kv8_append` in it.
+                Phase::Kv8Append,
                 Phase::AttnCore,
                 Phase::AttnPack,
                 Phase::AttnOut,
@@ -150,8 +155,11 @@ pub(super) struct PosReader {
     pub(super) test: &'static str,
 }
 
-/// Every kernel of the step that touches `pos`, `kv_len` or `kv_slot`.
-pub(super) const POS_WORD_READERS: [PosReader; 4] = [
+/// Every kernel of the step that touches `pos`, `kv_len` or `kv_slot`, in launch order. The
+/// Int8G32 kernels sit beside the Fp16 pair they replace (KV8-B B5): `attn_prep_rows` and
+/// `kv8_append` read `pos` (the append is never the first or only mask-4 writer: its guard
+/// equals the rows entry's, one launch earlier), and `attn_decode_q8` reads `kv_len`.
+pub(super) const POS_WORD_READERS: [PosReader; 7] = [
     PosReader {
         kernel: "step_begin",
         words: "pos kv_len kv_slot",
@@ -165,10 +173,28 @@ pub(super) const POS_WORD_READERS: [PosReader; 4] = [
         test: "a_poisoned_position_word_writes_nothing_and_reports_mask_4",
     },
     PosReader {
+        kernel: "attn_prep_rows",
+        words: "pos",
+        test_file: "attn_prep/tests.rs",
+        test: "a_poisoned_word_writes_no_rows_and_reports_mask_4",
+    },
+    PosReader {
+        kernel: "kv8_append",
+        words: "pos",
+        test_file: "kv8_append/tests.rs",
+        test: "kv8_append_refuses_a_bad_position_word_without_writing",
+    },
+    PosReader {
         kernel: "attn_decode",
         words: "kv_len",
         test_file: "attn_decode/tests.rs",
         test: "attn_decode_marks_an_invalid_kv_len_with_nan",
+    },
+    PosReader {
+        kernel: "attn_decode_q8",
+        words: "kv_len",
+        test_file: "attn_decode_q8/tests.rs",
+        test: "attn_decode_q8_marks_an_invalid_kv_len_with_nan",
     },
     PosReader {
         kernel: "step_advance",

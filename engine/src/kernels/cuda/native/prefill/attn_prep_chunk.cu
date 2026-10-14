@@ -9,7 +9,7 @@
  * vendored kernel stays decode-only (it reads the device pos word, ops.cu:166, and ORs mask
  * 4 of StepParams.status, attn_prep.cu:23); this chunk form takes p0 as a launch argument
  * (0049 item 1), writes post-rope f32 rows for the KV8 writer in the RowsOut mode, and ORs
- * bit 8 of the prefill status word (0049 item 10). Test 4 of the wrapper pins the bit
+ * mask 8 of the prefill status word (0049 item 10). Test 4 of the wrapper pins the bit
  * equality against the vendored entry. Contract: prefill/attn_prep_chunk.h. */
 #include "prefill/attn_prep_chunk.h"
 
@@ -125,7 +125,7 @@ __global__ void attn_prep_chunk_k(ChunkArgs a) {
     // (ops.cu:166-172): the answer is the same for every block, so the early return is block
     // uniform and happens before the first barrier. A refused launch writes no cache row and
     // no k/v row, sets q to NaN so the attention that reads it cannot yield a plausible
-    // value, and ORs bit 8 into the optional prefill status word (item 10).
+    // value, and ORs mask 8 into the optional prefill status word (item 10).
     if ((long long)a.p0 < 0 || (long long)a.p0 + a.m > a.rows) {
         if (a.status && blockIdx.x == 0 && blockIdx.y == 0 && threadIdx.x == 0)
             atomicOr(a.status, INFERENCE_CUDA_PREFILL_STATUS_BOUND_VIOLATION);

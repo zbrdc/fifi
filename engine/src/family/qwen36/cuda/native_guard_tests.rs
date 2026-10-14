@@ -2,6 +2,7 @@
 //! fused-row column offsets, the layout accessor's mixed refusal and the rows % 4 / column
 //! refusals. CPU only.
 use super::common_tests::dims;
+use super::dims::KvMode;
 use super::mixer_geometry::{DenseSpec, MixerGeometry, check_dense, check_native_dense};
 use super::mixer_ops::{block_ops, check_native_column};
 use crate::EngError;
@@ -48,7 +49,7 @@ fn the_native_projection_columns_are_aligned() {
     assert_eq!((a.k_off, a.v_off, a.ld), (8192, 8704, 9216));
     for kind in [AttentionKind::DeltaNet, AttentionKind::Full] {
         assert!(
-            block_ops(kind, &g, WeightLayout::Native).is_ok(),
+            block_ops(kind, &g, WeightLayout::Native, KvMode::Fp16).is_ok(),
             "{kind:?}"
         );
     }

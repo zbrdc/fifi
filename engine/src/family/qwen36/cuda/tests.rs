@@ -22,7 +22,7 @@ fn dims() -> StepDims {
 }
 
 fn scratch(d: &StepDims, rows: usize) -> KernelScratch {
-    KernelScratch::new(d, rows, router_bytes(d, rows)).expect("scratch")
+    KernelScratch::new(d, rows, router_bytes(d, rows), KvMode::Fp16).expect("scratch")
 }
 
 fn options(mode: KvMode, ctx: usize) -> StepOptions {
@@ -255,21 +255,22 @@ fn plan_refuses_bad_rows_and_scratch() {
     let opts = options(KvMode::Fp16, 8);
     for rows in [0, MAX_STEP_ROWS + 1, 16, 4096] {
         // The scratch matches the row count, so only the row bound can refuse the plan.
-        let own = KernelScratch::new(&d, rows, router_bytes(&d, rows)).expect("scratch");
+        let own =
+            KernelScratch::new(&d, rows, router_bytes(&d, rows), KvMode::Fp16).expect("scratch");
         assert!(StepPlan::new(&d, rows, &opts, &own).is_err(), "{rows}");
     }
     // A scratch made for one row cannot size a plan of eight rows, even when its router bytes
     // are big enough: the row counts must agree.
     assert!(StepPlan::new(&d, 8, &opts, &scratch(&d, 1)).is_err());
-    let wrong_rows = KernelScratch::new(&d, 2, router_bytes(&d, 8)).expect("scratch");
+    let wrong_rows = KernelScratch::new(&d, 2, router_bytes(&d, 8), KvMode::Fp16).expect("scratch");
     assert!(StepPlan::new(&d, 8, &opts, &wrong_rows).is_err());
     // A router scratch below 4 * rows * (experts + 1) is refused, one byte short included.
     let need = router_bytes(&d, 2);
     for short in [0, need - 1] {
-        let low = KernelScratch::new(&d, 2, short).expect("scratch");
+        let low = KernelScratch::new(&d, 2, short, KvMode::Fp16).expect("scratch");
         assert!(StepPlan::new(&d, 2, &opts, &low).is_err(), "{short}");
     }
-    let exact = KernelScratch::new(&d, 2, need).expect("scratch");
+    let exact = KernelScratch::new(&d, 2, need, KvMode::Fp16).expect("scratch");
     assert!(StepPlan::new(&d, 2, &opts, &exact).is_ok());
 }
 
@@ -296,6 +297,7 @@ fn only_the_documented_phases_write_status_and_argmax_is_last() {
         .filter(|&phase| writes_status(phase))
         .collect();
     // step_begin first, the embedding (RD-4c ORs mask 4 for a bad id), attn_prep (RD-8a ORs mask 4),
+    // kv8_append (KV8-B ORs mask 4 on a bad pos word; redundant, see `writes_status`),
     // the router (mask 1), argmax (mask 2).
     assert_eq!(
         writers,
@@ -303,6 +305,7 @@ fn only_the_documented_phases_write_status_and_argmax_is_last() {
             Phase::StepBegin,
             Phase::Embed,
             Phase::AttnPrep,
+            Phase::Kv8Append,
             Phase::Route,
             Phase::Argmax
         ]

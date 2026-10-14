@@ -31,7 +31,7 @@
 //! Three small regions live in their own block, not in a step arena, because their address must be
 //! the same for every captured graph of every row count and for the prefill path: `StepParams`
 //! (RD-4d, 32 bytes), the result pair `{token, status}` (RD-4d, 8 bytes, 8-byte aligned; room
-//! for 32 pairs) and the prefill status word (decision 0049, 4 bytes, bit 8). Each region is
+//! for 32 pairs) and the prefill status word (decision 0049, 4 bytes, mask 8). Each region is
 //! `STATE_ALIGN` bytes apart, so a later word is appended at the end and never moves another.
 //! `reset` zeroes the block, which is an invalid `StepParams` (`kv_len != pos + 1`): the host
 //! writes a valid block before the first step.
@@ -324,7 +324,8 @@ pub(crate) enum Word {
     StepParams,
     /// RD-4d result pair `{token, status}`; the host copies these 8 bytes after a step.
     ResultPair,
-    /// Decision 0049 prefill status word; the first prefill kernel of a chunk zeroes it.
+    /// Decision 0049 prefill status word; the host zeroes it at chunk open
+    /// (`ResidentState::clear_prefill_status`), replacing 0049 item 10's first-kernel rule.
     PrefillStatus,
 }
 

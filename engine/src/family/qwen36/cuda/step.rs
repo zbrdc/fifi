@@ -41,6 +41,7 @@ use super::{
         ExpertBufs, Launch, MoeBuffers, MoeDims, MoeLayerWeights, Packs, RouteBufs, run_moe_block,
         tiered::TieredScratch,
     },
+    prefix::CudaPrefillPath,
     readback::{
         ReadbackPlan, SYNC_EACH_VAR, captured_report, check_mode, eager_report, parse_sync_each,
         refused_report, with_host_syncs,
@@ -52,7 +53,7 @@ use super::{
     rules::{QwenRules, StepWidths, check_token_id, validate_step_inputs},
     run_report::{CaptureOutcome, HostSyncs, RunReport},
     state::{ResidentState, StepField, export::ExportedState},
-    state_layout::Word,
+    state_layout::{StateLayout, Word},
     step_ops::{StepOp, final_resid, resid_in, resid_out, token_ops},
     step_plan::Slot,
     tiered_step::{LayerParts, TieredRuntime},
@@ -64,6 +65,7 @@ use crate::{
     EngError,
     family::project::cuda::{CudaWeights, WeightLayout},
     family::qwen36::tiered::{host::TieredHost, report::TokenReport},
+    family::session::PrefixSlot,
     kernels::cuda::{
         CapturePlan, CudaContext, DeviceBuffer, DeviceEvent, DeviceRange, DeviceStream, ExpertBank,
         GraphExec, MatmulIo, PinnedWord, Projection,
@@ -247,6 +249,9 @@ pub(crate) struct QwenResidentStep<'a> {
     /// The bytes of the last logits row read back (little-endian f32).
     logits_bytes: Vec<u8>,
     report: RunReport,
+    /// The engine's one saved prefix entry (decision 0036, addendum 1): host memory only
+    /// (`ExportedState`), so its place in the drop order is free.
+    pub(super) prefix: PrefixSlot<ExportedState, CudaPrefillPath>,
 }
 
 impl<'a> QwenResidentStep<'a> {
@@ -291,8 +296,15 @@ impl<'a> QwenResidentStep<'a> {
                 &layers,
                 options.layout,
             )?,
-            views: MixerViews::new(&res.plan, &res.arena, &res.geometry, options.layout)?,
+            views: MixerViews::new(
+                &res.plan,
+                &res.arena,
+                &res.geometry,
+                options.layout,
+                options.kv_mode,
+            )?,
             layout: options.layout,
+            kv_mode: options.kv_mode,
         };
         let specs = MoeSpecs::new(&res.dims)?;
         let tiered_mode = options.tiered.is_some();
@@ -345,6 +357,7 @@ impl<'a> QwenResidentStep<'a> {
             widths,
             logits_bytes: vec![0; f32_bytes(vocab)?],
             report: RunReport::default(),
+            prefix: PrefixSlot::default(),
         })
     }
 
@@ -412,6 +425,16 @@ impl<'a> QwenResidentStep<'a> {
     /// Committed rows.
     pub(crate) fn tokens(&self) -> usize {
         self.state.tokens()
+    }
+
+    /// Whether the step runs the tiered MoE path: a tiered step never saves a prefix.
+    pub(super) fn is_tiered(&self) -> bool {
+        self.tiered_mode
+    }
+
+    /// The state layout, for the entry-byte charge of a prefix save.
+    pub(super) fn state_layout(&self) -> &StateLayout {
+        self.state.layout()
     }
 
     /// Zeroes the session state (see `ResidentState::reset`) and leaves it `Valid`; only a device

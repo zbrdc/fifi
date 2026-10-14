@@ -83,6 +83,18 @@ pub(crate) use {
     native::xf_bytes,
 };
 
+/// The kernels' prefill status mask (decision 0049 item 10), re-exported for the family book:
+/// `status_error` maps it to `prefill_chunk`, and its tests pin that mapping against this one
+/// const. The native tree stays private; the mask is its public contract.
+#[cfg_attr(
+    not(test),
+    expect(
+        unused_imports,
+        reason = "the book's tests read it today; the prefill driver will too (decision 0049)"
+    )
+)]
+pub(crate) use native::prefill::PREFILL_STATUS_BOUND_VIOLATION;
+
 use std::ffi::c_int;
 use std::sync::atomic::{AtomicBool, Ordering};
 

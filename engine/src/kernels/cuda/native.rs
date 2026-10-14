@@ -362,6 +362,15 @@ fn workspace_raw(work: &Work<'_>, need: Activations) -> Option<WorkspaceRaw> {
 unsafe extern "C" {
     #[link_name = "inference_cuda_device_count"]
     fn device_count_raw(out_count: *mut c_int) -> c_int;
+    #[cfg_attr(
+        not(test),
+        expect(
+            dead_code,
+            reason = "the query entry of the KV8-B B4' pins, called by their tests only"
+        )
+    )]
+    #[link_name = "inference_cuda_module_loading_mode"]
+    fn module_loading_mode_raw(out_mode: *mut c_int) -> c_int;
     #[link_name = "inference_cuda_vector_add_f32"]
     fn vector_add_f32_raw(
         lhs: *const f32,
@@ -478,6 +487,28 @@ pub(super) fn device_count() -> Result<c_int, c_int> {
     let status = unsafe { device_count_raw(&mut count) };
     if status == STATUS_OK {
         Ok(count)
+    } else {
+        Err(status)
+    }
+}
+
+/// The module loading mode of the driver (KV8-B B4'): `1` is `CU_MODULE_EAGER_LOADING` and
+/// `2` is `CU_MODULE_LAZY_LOADING` (cuda.h of the build image), read through the adapter's
+/// own query entry. The observation point of the eager-loading pins.
+#[cfg_attr(
+    not(test),
+    expect(
+        dead_code,
+        reason = "the query entry of the KV8-B B4' pins, called by their tests only"
+    )
+)]
+pub(super) fn module_loading_mode() -> Result<c_int, c_int> {
+    let mut mode: c_int = 0;
+    // SAFETY: `mode` is a live, writable c_int for the whole call. The adapter
+    // writes it only on success and keeps no pointer after it returns.
+    let status = unsafe { module_loading_mode_raw(&mut mode) };
+    if status == STATUS_OK {
+        Ok(mode)
     } else {
         Err(status)
     }
@@ -1478,5 +1509,35 @@ mod tests {
         let message = status_message(2);
         assert!(!message.is_empty());
         assert_ne!(message, "unknown status");
+    }
+
+    /// KV8-B B4' (lane C amendment 2): the adapter's constructor asks for EAGER module
+    /// loading before CUDA initializes. The constructor runs before main, before this test
+    /// harness and before any thread of the process, so the variable is set while the
+    /// process is provably single-threaded. This test must NOT set the variable itself -
+    /// the constructor keeps an operator's explicit value, so a run that set the variable
+    /// could not tell the constructor's work from its own - and a test-harness environment
+    /// that carries a different value (an operator's LAZY) fails here honestly.
+    #[test]
+    fn the_adapter_constructor_sets_eager_module_loading() {
+        assert_eq!(std::env::var("CUDA_MODULE_LOADING"), Ok("EAGER".to_owned()));
+    }
+
+    /// KV8-B B4': ONE device test, its own process, Result-only device phase. The driver
+    /// itself must report eager loading (CU_MODULE_EAGER_LOADING 1 of cuda.h): the default
+    /// of CUDA 12.2+ is lazy (2), so this pin dies if the constructor's setenv is removed.
+    #[test]
+    fn the_driver_reports_eager_module_loading() {
+        use crate::kernels::cuda::testkit::device_present;
+        if !device_present("the_driver_reports_eager_module_loading") {
+            return;
+        }
+        let outcome = (|| -> Result<i32, crate::EngError> {
+            let context = crate::kernels::cuda::context::CudaContext::new()?;
+            let mode = context.module_loading_mode()?;
+            Ok(mode)
+        })();
+        // The device phase is over (the context is dropped inside): plain asserts follow.
+        assert_eq!(outcome.expect("the loading-mode device phase"), 1);
     }
 }

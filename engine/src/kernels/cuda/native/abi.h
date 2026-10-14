@@ -38,6 +38,11 @@ extern "C" {
  * run kernels when the count is 0. */
 int inference_cuda_device_count(int *out_count);
 
+/* Writes the driver's module loading mode to *out_mode (the CUmoduleLoadingMode of cuda.h:
+ * CU_MODULE_EAGER_LOADING 1, CU_MODULE_LAZY_LOADING 2). The observation point of the
+ * eager-loading pin of KV8-B B4'. */
+int inference_cuda_module_loading_mode(int *out_mode);
+
 /* Stage of the first failure in a device call. The Rust caller turns the
  * stage into the operation name of its error. Freeing device memory counts
  * as the allocate stage. */

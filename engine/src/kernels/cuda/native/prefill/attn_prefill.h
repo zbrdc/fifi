@@ -9,17 +9,20 @@
  * rounded to fp16 for the P*V product and everything else accumulated in f32 (PA1's reference
  * form: "on fp16 Q, K and V"). Two launches on the caller's stream, the attn_decode structure
  * scaled by a query-tile dimension:
- *   attn_prefill_part_k    grid (max_splits, n_kv_head, q_tiles), 128 threads, q_tile = 8:
+ *   attn_prefill_part_dsplit_k  grid (q_tiles, n_kv_head, max_splits), 512 threads, q_tile 8:
  *                          a block owns one query tile (8 tokens x 8 heads = 64 rows) of one
- *                          kv head and one key range; online softmax over key tiles of 32;
- *                          one partial per row goes to part.
+ *                          kv head and one key range, the heaviest causal tiles first; its 16
+ *                          warps hold 4 row groups x 4 head_dim quarters, and the quarter
+ *                          scores are summed in one fixed order; online softmax over key tiles
+ *                          of 32; one partial per row goes to part.
  *   attn_prefill_combine_k grid (n_head, m), 256 threads: merges the partials of the active
  *                          splits in split-index order (exact block max, fixed-order sums),
  *                          divides and applies the sigmoid output gate when proj is given.
- * The device split rule is attn_decode's split_plan verbatim, evaluated per q_tile from its
- * own key count p0 + tile_end; every block and the combine recompute the same deterministic
- * plan from the launch arguments. kv_len is a HOST value in prefill (no device word, 0049
- * item 1), so capture is trivial and eager is the mode.
+ * The device split rule is attn_decode's split_plan verbatim, evaluated per q_tile over its
+ * key range: the union of its rows' windows (all p0 + tile_end keys with no window); every
+ * block and the combine recompute the same deterministic plan from the launch arguments.
+ * kv_len is a HOST value in prefill (no device word, 0049 item 1), so capture is trivial
+ * and eager is the mode.
  *
  * Layout (device pointers):
  *   q        f32 [m][n_head][head_dim] (attn_prep_chunk's q), 16-byte aligned.
@@ -37,19 +40,28 @@
  * Window and ring (the attn_decode rules, included for MEL-P1): window = 0 attends to all
  * keys; window = W > 0 attends to the last min(P + 1, W) positions. ring = 0 is a linear
  * cache (row = position); ring = R > 0 (needs window > 0 and window + m - 1 <= R <=
- * cache_rows) puts position p in row p % R.
+ * cache_rows) puts position p in row p % R. A ring cache still spans cache_rows >= p0 + m
+ * rows: the bound check below is linear, so the first windowed caller sizes it that way.
  *
- * Poison rule (decision 0049 item 2: the device checks p0/m again; item 10: bit 8): if
+ * Poison rule (decision 0049 item 2: the device checks p0/m again; item 10: mask 8): if
  * p0 < 0 or (long long)p0 + m > cache_rows, the part kernel writes no partial, the combine
- * kernel writes NaN to out, and each ORs bit 8
+ * kernel writes NaN to out, and each ORs mask 8
  * (INFERENCE_CUDA_PREFILL_STATUS_BOUND_VIOLATION) into *status when status != NULL. A valid
  * launch touches neither.
  *
- * The part kernel uses 96 KB of dynamic shared memory (the Q tile 32 KB, double-buffered K
- * and V tiles 2 x 16 KB each), above the 48 KB default: the entry opts in with
- * cudaFuncSetAttribute once per process (the vendored gemm.cuh pattern). sm_72
- * (__CUDA_ARCH__ < 800) compiles an fp32 SIMT arm with the same semantics; it is
- * compile-only in this packet (decision 0049 item 14; no board run).
+ * The part kernel uses 96 KB of dynamic shared memory (two cp.async stages of K and V, 2 x 32
+ * KB, and a 32 KB score exchange), above the 48 KB default: the entry opts in with
+ * cudaFuncSetAttribute once per process (the vendored gemm.cuh pattern), one block per SM.
+ * Code compiled for sm_72 (__CUDA_ARCH__ < 800; the entry selects by the loaded code's PTX
+ * arch) runs an fp32 SIMT part kernel instead, attn_prefill_part_simt_k (grid (max_splits,
+ * n_kv_head, q_tiles), 128 threads), with the same request and part layout; it computes the
+ * same result within the PA1 bound, not bit for bit. It is compile-only in this packet
+ * (decision 0049 item 14; no board run).
+ *
+ * NaN isolation is per 64-row query tile, not per row: a NaN V cell inside a tile's key range
+ * reaches every row of that tile (a row that does not see the key still multiplies p = 0 by
+ * it), and a NaN q row reaches only its own row. A cell outside every tile's key range is
+ * never read (the loader zero-fills past the range).
  *
  * Configurations: head_dim 256 and exactly 8 query heads per kv head are the compiled cases;
  * every geometry value stays a run-time argument (lane C condition 8) and a value the entry
@@ -62,6 +74,8 @@
 
 #include <stddef.h>
 
+#include "prefill/status.h"
+
 #ifdef __cplusplus
 extern "C" {
 #endif
@@ -70,9 +84,6 @@ extern "C" {
  * IMPL-KV8-A and is refused while the four kv8 pointers must be NULL. */
 #define INFERENCE_CUDA_PREFILL_KV_FP16 0
 #define INFERENCE_CUDA_PREFILL_KV_KV8 1
-/* Bit 8 of the prefill status word (decision 0049 item 10): a prefill chunk fault, a bound
- * violation here (the same bit attn_prep_chunk.h defines). */
-#define INFERENCE_CUDA_PREFILL_STATUS_BOUND_VIOLATION 0x100
 
 typedef struct inference_cuda_attn_prefill_args {
     const void *q;
@@ -85,7 +96,7 @@ typedef struct inference_cuda_attn_prefill_args {
     const void *kv8_v_scales;
     void *part;
     void *out;
-    int *status; /* optional; bit 8 on a refused launch */
+    int *status; /* optional; mask 8 on a refused launch */
     int ld;
     int p0;      /* the position of token 0, a launch argument */
     int m;       /* tokens, 1..65535 */
@@ -111,7 +122,7 @@ int inference_cuda_attn_prefill_launch(const inference_cuda_attn_prefill_args *a
 #ifdef INFERENCE_CUDA_FAULT_QUALIFICATION
 /* Qualified fault path (decision 0049 item 2's device re-check): validates every rule of the
  * entry EXCEPT the p0/m bound, then overrides p0 so the bound is violated, so the KERNELS'
- * own device guards (no partial, NaN out, bit 8) are the code under test. The validating
+ * own device guards (no partial, NaN out, mask 8) are the code under test. The validating
  * entry above can never reach them with bad bounds. */
 int inference_cuda_attn_prefill_fault_bad_bounds_launch(
     const inference_cuda_attn_prefill_args *args, void *stream, int *out_stage);

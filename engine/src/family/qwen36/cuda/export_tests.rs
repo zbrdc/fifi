@@ -6,7 +6,8 @@ use super::{
     state::{
         StateIdentity,
         export::{
-            DeltaExport, ExportedState, KvExport, check_import, f32_from_le, f32_to_le, plane_sizes,
+            DeltaExport, ExportedState, KvExport, check_import, f32_from_le, f32_to_le,
+            host_zeroed, plane_sizes,
         },
     },
     state_layout::StateLayout,
@@ -221,6 +222,31 @@ fn an_export_with_too_many_layers_is_refused_by_name() {
             "the attention layer count differs",
         );
     }
+}
+
+#[test]
+fn host_zeroed_refuses_a_huge_len_instead_of_aborting() {
+    match host_zeroed(usize::MAX) {
+        Err(crate::EngError::MemoryPlan(text)) => {
+            assert!(
+                text.contains("host bytes"),
+                "the refusal names the charge: {text}"
+            );
+        }
+        other => panic!("expected a MemoryPlan refusal, got {other:?}"),
+    }
+}
+
+#[test]
+fn host_zeroed_of_zero_and_a_thousand_bytes() {
+    let empty = host_zeroed(0).unwrap();
+    assert!(empty.is_empty(), "len 0 holds no byte");
+    let bytes = host_zeroed(1000).unwrap();
+    assert_eq!(bytes.len(), 1000);
+    assert!(
+        bytes.iter().all(|&byte| byte == 0),
+        "every byte starts zero"
+    );
 }
 
 /// The refusal is a `Checkpoint` error that names the rule.

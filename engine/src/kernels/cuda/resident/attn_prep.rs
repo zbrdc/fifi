@@ -48,10 +48,6 @@
 //! count (`shape.rows`), the poison rule is the same (no row, NaN `q`, mask 4), and `m` is at
 //! most the decode bound of `kv8_append` (16): chunk prefill under Int8G32 uses the CPF-ATTN-A
 //! chunk entry (CPF-7), not this one. The step op list wires it in KV8-B B3.
-#![cfg_attr(
-    not(test),
-    expect(dead_code, reason = "staged for RD-9a (decision 0047)")
-)]
 
 use std::ffi::c_int;
 
@@ -80,7 +76,12 @@ const NORM_BYTES: usize = HEAD_DIM * 4;
 pub(crate) enum SlotMode {
     /// The row is the position (Qwen3.6, a linear cache).
     Position,
-    /// The row is the position modulo the ring length (Mellum, MEL-K1). Refused today.
+    /// The row is the position modulo the ring length (Mellum, MEL-K1). Refused today; built by
+    /// the refusal tests only until that kernel exists.
+    #[cfg_attr(
+        not(test),
+        expect(dead_code, reason = "built by the refusal tests only until MEL-K1")
+    )]
     Ring(u32),
 }
 
@@ -506,10 +507,6 @@ impl CudaContext {
     /// or stream of another context, a freed buffer, a shape, rope scalar or configuration the
     /// kernel refuses, an `admit_pos` that does not leave `m` rows, a range that is too short or
     /// misaligned, and a written range that overlaps another range of the call.
-    #[cfg_attr(
-        not(test),
-        expect(dead_code, reason = "staged for KV8-B B3: the Int8G32 step op list")
-    )]
     pub(crate) fn attn_prep_rows(
         &self,
         stream: &DeviceStream,

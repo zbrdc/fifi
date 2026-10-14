@@ -21,6 +21,8 @@ mod export_tests;
 pub mod gate;
 #[cfg(test)]
 mod geometry_tests;
+#[cfg(test)]
+mod kv8_step_device_tests;
 mod layer_table;
 #[cfg(test)]
 mod layer_tests;
@@ -49,6 +51,14 @@ mod native_tiered_device_tests;
 #[cfg(test)]
 mod ops_tests;
 mod pinned;
+mod prefill_plan;
+#[cfg(test)]
+mod prefill_plan_tests;
+mod prefix;
+#[cfg(test)]
+mod prefix_device_tests;
+#[cfg(test)]
+mod prefix_tests;
 #[cfg(test)]
 mod r5_fmt;
 mod readback;

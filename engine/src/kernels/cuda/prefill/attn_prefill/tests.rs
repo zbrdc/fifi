@@ -1,9 +1,9 @@
-//! Tests of the prefill attention wrapper: the host-only plan and sizing tests (1 to 3b and
-//! the head-count row of test 20), the refusal tables of section 4, and the device tests 6
-//! to 10, 13 to 15, 18 and 19. The f64 reference reads the same fp16 K/V bits, rounds q to
-//! fp16 and computes the softmax in f64 (PA1's seam form); every bound below is derived in
-//! the test that uses it, never tuned. Sizing at the 262,144-position extent stays on the
-//! host (decision 0049 item 9).
+//! Tests of the prefill attention wrapper: the host-only plan and sizing tests (1 to 3b, the
+//! head-count row of test 20, the launch plan's 21 and 22), the refusal tables of section 4,
+//! and the device tests 6 to 10, 13 to 15, 18, 19, 23 and 24. The f64 reference reads the same
+//! fp16 K/V bits, rounds q to fp16 and computes the softmax in f64 (PA1's seam form); every
+//! bound below is derived in the test that uses it, never tuned. Sizing at the
+//! 262,144-position extent stays on the host (decision 0049 item 9).
 //!
 //! Device-test structure (the S3b lesson): every device test runs its device phase as
 //! `Result`-only, drops every owner, then asserts on host `Vec`s. The tests run with
@@ -12,9 +12,9 @@
 
 use super::{
     AttnPrefillCall, AttnPrefillShape, CPF_ATTN_MIN_KEYS, CPF_ATTN_PART_CAP, CPF_ATTN_Q_TILE,
-    CPF_ATTN_SM_COUNT, CPF_ATTN_TILE_ROWS, CpfAttnGeometry, CpfAttnPlan, CpfAttnSpan, CpfAttnSplit,
-    check_shape, cpf_attn_part_bytes, cpf_attn_split_plan, cpf_attn_workspace_bytes,
-    cpf_attn_workspace_bytes_for_sm,
+    CPF_ATTN_SM_COUNT, CPF_ATTN_TILE_KEYS, CPF_ATTN_TILE_ROWS, CpfAttnGeometry, CpfAttnPlan,
+    CpfAttnSpan, CpfAttnSplit, check_shape, cpf_attn_launch_plan, cpf_attn_part_bytes,
+    cpf_attn_split_plan, cpf_attn_workspace_bytes, cpf_attn_workspace_bytes_for_sm,
 };
 use crate::EngError;
 use crate::kernels::cuda::testkit::{self, Rng, f16_bits, f16_to_f32};
@@ -223,6 +223,150 @@ fn cpf_attn_split_plan_takes_the_head_counts_as_arguments() {
     let whole = cpf_attn_workspace_bytes(1_024, (32, 4), 256, 262_144, CPF_ATTN_TILE_ROWS)
         .expect("the sizing answer");
     assert_eq!(whole, 1_024 * 4 * 8 * (2 + 256) * 4);
+}
+
+/// Splits that hold keys for a tile of `count` keys: the test's own mirror of the device split
+/// rule (attn_prefill.cu `split_plan`, the form test 15 restates).
+fn active_splits(count: usize, max_splits: usize, min_keys: usize) -> usize {
+    let want = count.div_ceil(min_keys);
+    let n_split = want.max(1).min(max_splits);
+    let chunk = count.div_ceil(n_split).div_ceil(32) * 32;
+    count.div_ceil(chunk)
+}
+
+/// The launch plan on the 3090 (82 SMs) with no window.
+fn launch_plan(m: usize, kv_len: usize) -> CpfAttnPlan {
+    cpf_attn_launch_plan(q36(m), kv_len, 0, CPF_ATTN_SM_COUNT).expect("the launch plan")
+}
+
+/// Test 21: at depth the launch plan raises the split count to fill whole waves of the 82
+/// SMs (one block each), never past the part cap or the keys of the shortest tile.
+#[test]
+fn cpf_attn_launch_plan_fills_whole_waves_at_depth() {
+    // M 512 at 128K: base 64 q-tiles x 2 kv heads = 128 blocks per split. 2 splits = 3.12
+    // waves at 78.0 %; 7 splits = 896 blocks = 10.93 waves at 99.3 %, the best up to the cap
+    // (8 splits would need 67,633,152 B).
+    let deep = launch_plan(512, 131_584);
+    assert_eq!(deep.max_splits, 7);
+    assert_eq!(deep.min_keys, CPF_ATTN_MIN_KEYS);
+    assert_eq!(deep.q_tile, CPF_ATTN_Q_TILE);
+    assert_eq!(
+        cpf_attn_part_bytes(q36(512), deep).expect("bytes"),
+        59_179_008
+    );
+    assert_eq!(59_179_008, 7 * 8_454_144);
+    // The deliberate split between the two functions: the split plan's workspace stays at
+    // s_A = 2 splits at the same depth, while the launch plan launches 7; the driver
+    // allocates the flat cap, which bounds both.
+    let workspace = cpf_attn_workspace_bytes(512, (16, 2), 256, 131_584, CPF_ATTN_TILE_ROWS)
+        .expect("the sizing answer");
+    assert_eq!(workspace, 16_908_288);
+    assert_eq!(16_908_288, 2 * 8_454_144);
+    // M 256 at the same depth: 64 blocks per split; 14 splits = 896 blocks at 99.3 %, below
+    // the cap of 15 (15 splits: 12 waves at 97.6 %).
+    let narrow = launch_plan(256, 131_072 + 256);
+    assert_eq!(narrow.max_splits, 14);
+    assert_eq!(
+        cpf_attn_part_bytes(q36(256), narrow).expect("bytes"),
+        59_179_008
+    );
+
+    // The kv_len sweep (review MAJOR-1): every kv_len from m to m + 2,048, then every 97th
+    // up to 262,144. s_cap is the most splits whose partials fit the cap.
+    for (m, s_cap) in [(512_usize, 7_usize), (1_024, 3), (4_064, 1)] {
+        let least = cpf_attn_split_plan(q36(m), m, CPF_ATTN_TILE_ROWS, CPF_ATTN_SM_COUNT)
+            .expect("s_A")
+            .max_splits;
+        let shallow = m..=m + 2_048;
+        for kv_len in shallow.chain((m + 2_048 + 97..=262_144).step_by(97)) {
+            let plan = launch_plan(m, kv_len);
+            let s = plan.max_splits;
+            assert!(
+                s >= least,
+                "m {m} kv_len {kv_len}: {s} splits below s_A {least}"
+            );
+            assert!(
+                s <= s_cap,
+                "m {m} kv_len {kv_len}: {s} splits above s_cap {s_cap}"
+            );
+            let bytes = cpf_attn_part_bytes(q36(m), plan).expect("bytes");
+            assert!(
+                bytes <= CPF_ATTN_PART_CAP,
+                "m {m} kv_len {kv_len}: {bytes} B"
+            );
+            // Only above s_A: at m 512 and kv_len 512 the plan keeps s_A = 2 although tile 0
+            // (8 keys) activates one split; those blocks exit.
+            if s > least {
+                let p0 = kv_len - m;
+                for tile in 0..m.div_ceil(8) {
+                    let count = p0 + m.min(8 * tile + 8);
+                    assert_eq!(
+                        active_splits(count, s, CPF_ATTN_MIN_KEYS),
+                        s,
+                        "m {m} kv_len {kv_len}: tile {tile} ({count} keys) leaves a split idle"
+                    );
+                }
+            }
+        }
+    }
+}
+
+/// The launch plan keeps a split count only when every query tile activates all of them; with
+/// min_keys fixed at CPF_ATTN_MIN_KEYS, full activation implies s <= ceil(count / min_keys)
+/// for every tile, so the plan needs no separate bound on s (lane C's ruling on mutant MB20).
+/// Pinned over the plan's whole domain: every split count up to CPF_ATTN_MAX_SPLITS and every
+/// tile key count up to 262,144 positions.
+#[test]
+fn cpf_attn_full_activation_implies_the_min_keys_bound() {
+    for s in 1..=super::CPF_ATTN_MAX_SPLITS {
+        for count in 1..=262_144_usize {
+            if super::active_splits(count, s, CPF_ATTN_MIN_KEYS) == s {
+                assert!(
+                    s <= count.div_ceil(CPF_ATTN_MIN_KEYS),
+                    "{count} keys activate all {s} splits, above ceil(count / min_keys)"
+                );
+            }
+        }
+    }
+}
+
+/// Test 22: while some query tile has no keys for more splits, the launch plan is the split
+/// plan; and its refusals.
+#[test]
+fn cpf_attn_launch_plan_keeps_the_split_plan_while_a_tile_cannot_use_more_splits() {
+    // T18 (M 1,024 at p0 0): tile 0 holds 8 keys, so the plan is s_A = 1 split.
+    let t18 = launch_plan(1_024, 1_024);
+    assert_eq!(
+        t18,
+        cpf_attn_split_plan(q36(1_024), 1_024, CPF_ATTN_TILE_ROWS, CPF_ATTN_SM_COUNT).expect("s_A")
+    );
+    assert_eq!(t18.max_splits, 1);
+    // p0 600, M 512: c_min 608 allows 3 splits, and 3 (93.7 %) beats s_A = 2 (78.0 %).
+    assert_eq!(launch_plan(512, 600 + 512).max_splits, 3);
+    // A window of 300 at p0 100,000 leaves every tile at most 307 keys: s_A = 2 stays, where
+    // the same depth without a window launches 7.
+    let windowed =
+        cpf_attn_launch_plan(q36(512), 100_512, 300, CPF_ATTN_SM_COUNT).expect("the launch plan");
+    assert_eq!(windowed.max_splits, 2);
+    assert_eq!(launch_plan(512, 100_512).max_splits, 7);
+    // Refusals, each past every earlier rule: kv_len below m, an SM count of 0, and m 4,072
+    // (the split plan's part cap refusal).
+    match cpf_attn_launch_plan(q36(512), 511, 0, CPF_ATTN_SM_COUNT) {
+        Err(EngError::BadRequest(text)) => assert!(text.contains("attn_prefill: kv_len"), "{text}"),
+        other => panic!("expected the kv_len refusal, got {other:?}"),
+    }
+    match cpf_attn_launch_plan(q36(512), 131_584, 0, 0) {
+        Err(EngError::BadRequest(text)) => {
+            assert!(text.contains("attn_prefill: sm_count"), "{text}");
+        }
+        other => panic!("expected the sm_count refusal, got {other:?}"),
+    }
+    match cpf_attn_launch_plan(q36(4_072), 8_144, 0, CPF_ATTN_SM_COUNT) {
+        Err(EngError::MemoryPlan(text)) => {
+            assert!(text.contains("attn_prefill: part cap"), "{text}")
+        }
+        other => panic!("expected the part cap refusal, got {other:?}"),
+    }
 }
 
 // ---- the device fixture -------------------------------------------------------------------
@@ -743,6 +887,17 @@ fn attn_prefill_refuses_bad_span_rules() {
             }
         },
     ));
+    // window + m - 1 overflows i64: the checked_add branch of the same rule.
+    rows.push(row(
+        "window + m - 1 overflows",
+        "attn_prefill: ring: ring is below",
+        |fx| {
+            fx.span = CpfAttnSpan {
+                window: i64::MAX,
+                ring: 16,
+            }
+        },
+    ));
     refusal_phase(qwen(2, 64, 0), rows).expect("the device phase");
 }
 
@@ -1087,8 +1242,12 @@ fn attn_prefill_matches_one_row_attn_decode_on_the_same_cache() {
         let d_part = testkit::upload_filled(
             &fx.ctx,
             0,
-            crate::kernels::cuda::resident::attn_decode::attn_part_bytes(1, 2, D, split.max_splits)
-                .expect("the decode part bytes"),
+            crate::kernels::cuda::resident::attn_decode::attn_part_bytes(
+                1,
+                2,
+                D,
+                split.max_splits,
+            )?,
         );
         let d_out = testkit::upload_filled(&fx.ctx, OUT_FILL, D * 16 * 4);
         let (index, offset, bytes) = fx.base[Q];
@@ -1189,6 +1348,9 @@ fn attn_prefill_matches_one_row_attn_decode_on_the_same_cache() {
 /// query tile (rows at 60..67): split 2's only key tile holds no key of rows 60..63, which
 /// must leave their partials at zero, not NaN (review BLOCKER-1); p0 = 100, m = 40 meets the
 /// same hole at position 128 in tile 3.
+///
+/// A debug build checks the 3,968-key case on every 8th row plus the last (the f64
+/// reference is too slow unoptimized for every row in one hold); release checks every row.
 #[test]
 fn attn_prefill_matches_the_f64_host_reference() {
     if !testkit::device_present("attn_prefill_matches_the_f64_host_reference") {
@@ -1233,7 +1395,15 @@ fn attn_prefill_matches_the_f64_host_reference() {
         let bound = 2f64.powi(-9) * max_v;
         let mut worst = 0.0f64;
         let mut worst_at = (0_usize, 0_usize, 0_usize);
-        for t in 0..m {
+        // A debug build runs the f64 reference far slower (118 s of the 150 s hold with every
+        // row): there the 3,968-key case checks every 8th token and the last, whose late-score
+        // row is the one a dropped correction shows in. Release checks every row.
+        let stride = if cfg!(debug_assertions) && p0 > 1_024 {
+            8
+        } else {
+            1
+        };
+        for t in (0..m).filter(|&t| t % stride == 0 || t == m - 1) {
             for h in 0..16 {
                 let reference = ref_row(
                     &data.q[(t * 16 + h) * D..][..D],
@@ -1447,6 +1617,255 @@ fn attn_prefill_window_cuts_each_row_to_its_own_window() {
         );
         println!("{line}");
         if non_finite > 0 || worst > bound {
+            failures.push(line);
+        }
+    }
+    assert!(failures.is_empty(), "{}", failures.join("\n"));
+}
+
+/// Test 23: the window at depth, which tests 7 and 10 do not reach. A chunk of 64 tokens at
+/// p0 8,192 with a window of 1,000 over a ring of 1,200 rows (window + m - 1 = 1,063 fits):
+/// position p lives in row p % 1,200, so the ring holds positions 7,056..8,255 and wraps.
+/// Each query tile loads the union of its rows' windows, from 7,193 + 8 * tile on; the middle
+/// key tiles of each union are fully visible to every row of the tile (a kernel may take a
+/// mask-free path there), and the first and last are cut per row. The ring rows of positions
+/// 7,056..7,192, inside the ring but outside every tile's union, hold fp16 NaN: a key range
+/// or a mask that reaches below a union leaks NaN.
+///
+/// Every output must be finite; then each row is checked against the f64 reference over its
+/// own window of the linear cache, at test 7's derived bound 2^-9 * max(max|V|, 1) with
+/// max|V| over the positions the chunk may read (its f32 tile-depth term covers 128 tiles;
+/// a split here holds at most 8 and a row at most 33).
+#[test]
+fn attn_prefill_window_at_depth_reads_only_each_rows_window() {
+    if !testkit::device_present("attn_prefill_window_at_depth_reads_only_each_rows_window") {
+        return;
+    }
+    let (p0, m, window, ring) = (8_192_usize, 64_usize, 1_000_usize, 1_200_usize);
+    let positions = p0 + m;
+    let logical = data(m, positions, 0x23_0001, 0.2, 0.4);
+    let mut cache = ring_cache(&logical, positions, ring);
+    for pos in 7_056..=7_192 {
+        let row = pos % ring;
+        for kvh in 0..2 {
+            let at = (row * 2 + kvh) * D;
+            cache.k[at..at + D].fill(F16_NAN);
+            cache.v[at..at + D].fill(F16_NAN);
+        }
+    }
+    let phase = || -> Result<Vec<f32>, EngError> {
+        let shape = qwen(m, positions, p0 as i64);
+        let split = CpfAttnSplit {
+            max_splits: 4,
+            min_keys: 32,
+        };
+        let mut fx = Fx::with_data(shape, split, false, false, &cache)?;
+        fx.span = CpfAttnSpan {
+            window: window as i64,
+            ring: ring as i64,
+        };
+        fx.run()?;
+        let out = fx.out_values();
+        drop(fx);
+        Ok(out)
+    };
+    let out = phase().expect("the device phase");
+    let non_finite = out.iter().filter(|v| !v.is_finite()).count();
+    assert_eq!(
+        non_finite, 0,
+        "{non_finite} outputs are not finite: a poisoned key leaked"
+    );
+    let bound = 2f64.powi(-9) * v_scale(&logical.v[(p0 + 1 - window) * 2 * D..]);
+    let (mut worst, mut worst_at) = (0.0f64, (0, 0, 0));
+    for t in 0..m {
+        let own = p0 + t;
+        for h in 0..16 {
+            let reference = ref_row_in(
+                &logical.q[(t * 16 + h) * D..][..D],
+                &logical.k,
+                &logical.v,
+                h / GROUP,
+                own + 1 - window..own + 1,
+                f64::from(SCALE),
+            );
+            let got = &out[(t * 16 + h) * D..][..D];
+            for (d, (&value, want)) in got.iter().zip(&reference).enumerate() {
+                let delta = (f64::from(value) - want).abs();
+                if delta > worst {
+                    (worst, worst_at) = (delta, (t, h, d));
+                }
+            }
+        }
+    }
+    println!(
+        "T23 p0 {p0} m {m} window {window} ring {ring}: worst |Δout| {worst:.3e} at \
+         {worst_at:?} of the derived bound {bound:.3e}"
+    );
+    assert!(
+        worst <= bound,
+        "worst |Δout| {worst:.3e} at {worst_at:?} above the derived {bound:.3e}"
+    );
+}
+
+/// Test 25: the fast path's two tile-boundary comparisons (`full` in the dsplit kernel, the
+/// "fully visible tile skips the mask" branch), which no earlier geometry pins (review
+/// MINOR-1). Both clauses are exact at one key tile of the geometries below; an off-by-one
+/// survives every earlier device geometry, because either error moves one key across one
+/// row's softmax weight, within ~1/(keys + 2) of the right answer:
+///
+/// - Geometry A, the causal boundary: window 0, p0 = 94, m = 8, one split over all keys.
+///   p0 = 94 = 2 * 32 + 30, so the tile's first row P_first = 94 ≡ 30 (mod 32) and the key
+///   tile at base 64 ends at key 95 = P_first + 1: the `kTile - 1` term is exact there. A
+///   `kTile - 2` mutant would call that tile fully visible and let row 94 read key 95. (No
+///   earlier window-0 geometry has p0 + t0 ≡ 30 mod 32.)
+/// - Geometry B, the window boundary: window 40, p0 = 33, m = 8. The tile's `first` clamps
+///   to 0 and its last row's own position is max_p = 40 = W, so the window clause
+///   `first + base > max_p - W` is exact at base 0 (0 > 0). A `>=` mutant would call the
+///   tile fully visible and let row 40 read key 0.
+///
+/// The host computes and prints the key-tile / row-group pair where each boundary is exact
+/// (the query tile is tile 0; a kernel row group rg holds tokens 2 rg and 2 rg + 1 of its
+/// tile). Then test 23's shape: the hard gate first — every output finite, the fixture
+/// having prefilled `out` with 0x55 so an unwritten value reads ~1.1e13 and fails the bound
+/// below — then each row against the f64 reference over its own window, at test 7's derived
+/// 2^-9 * max(max|V|, 1) with max|V| over the positions the chunk may read (the whole cache:
+/// a window-0 row reads from position 0, and B's rows read back to row 0 or 1 of 41). The
+/// depth here is at most 3 key tiles per row, against test 7's 124, whose bound form this
+/// is; like every bound here it is derived, never tuned. The reference is gated like the
+/// output: every reference value must be finite before it enters a delta, and the loop keeps
+/// a NaN delta as the worst (`!(delta <= worst)`), so a hole in the reference's own key
+/// range (the window-0 lesson of the first cut) cannot pass silently.
+#[test]
+fn attn_prefill_fast_path_tile_boundaries_are_exact() {
+    if !testkit::device_present("attn_prefill_fast_path_tile_boundaries_are_exact") {
+        return;
+    }
+    let phase = |span: CpfAttnSpan, p0: usize, m: usize| -> Result<(Vec<f32>, Data), EngError> {
+        let positions = p0 + m;
+        let seed = 0x25_0000 ^ (span.window as u64) << 8 ^ span.ring as u64;
+        let logical = data(m, positions, seed, 0.2, 0.4);
+        let shape = qwen(m, positions, p0 as i64);
+        // One split over all keys: the boundary tile is reached by the only block.
+        let split = CpfAttnSplit {
+            max_splits: 1,
+            min_keys: 32,
+        };
+        let cache = ring_cache(&logical, positions, span.ring as usize);
+        let mut fx = Fx::with_data(shape, split, false, false, &cache)?;
+        fx.span = span;
+        fx.run()?;
+        let out = fx.out_values();
+        drop(fx);
+        Ok((out, logical))
+    };
+    let mut failures = Vec::new();
+    let rows: [(&str, usize, usize, usize); 2] = [("A causal", 0, 94, 8), ("B window", 40, 33, 8)];
+    for (label, window, p0, m) in rows {
+        // The boundary pair of this geometry, computed on the host from the same rules the
+        // kernel applies (query tile 0: t0 = 0, tile_end = min(m, 8) tokens, key tiles of 32).
+        if window == 0 {
+            // Causal clause: full needs first + base + 31 <= P_first, exact where a tile's
+            // last key is P_first + 1, i.e. base = P_first - 30.
+            let base = p0 + 1 - (CPF_ATTN_TILE_KEYS - 1);
+            assert_eq!(p0 % CPF_ATTN_TILE_KEYS, 30, "geometry A's boundary residue");
+            assert_eq!(
+                base % CPF_ATTN_TILE_KEYS,
+                0,
+                "geometry A's boundary tile base"
+            );
+            println!(
+                "{label}: window 0 p0 {p0} m {m} — key tile {} (base {base}, keys {base}..{}) \
+                 x row group 0 (tokens 0..1, positions {p0}..{}): last key {} = P_first + 1, \
+                 the kTile - 1 clause exact",
+                base / CPF_ATTN_TILE_KEYS,
+                base + CPF_ATTN_TILE_KEYS - 1,
+                p0 + 1,
+                p0 + 1,
+            );
+        } else {
+            // Window clause: full needs first + base > max_p - W, exact where a tile's first
+            // key equals max_p - W, i.e. base = max_p - W - first.
+            let tile_end = m.min(CPF_ATTN_Q_TILE);
+            let first = (p0 + 1).saturating_sub(window);
+            let max_p = p0 + tile_end - 1;
+            let base = max_p - window - first;
+            let rg = (tile_end - 1) / 2;
+            assert_eq!(first, 0, "geometry B's first clamps to 0");
+            assert_eq!(max_p, window, "geometry B's max_p equals the window");
+            assert_eq!(
+                base % CPF_ATTN_TILE_KEYS,
+                0,
+                "geometry B's boundary tile base"
+            );
+            println!(
+                "{label}: window {window} p0 {p0} m {m} — key tile {} (base {base}, first key \
+                 {first}) x row group {rg} (tokens {}..{tile_end}, max_p {max_p}): first + base \
+                 = max_p - window = {}, the `>` clause exact",
+                base / CPF_ATTN_TILE_KEYS,
+                2 * rg,
+                max_p - window,
+            );
+        }
+        let (out, logical) = phase(
+            CpfAttnSpan {
+                window: window as i64,
+                ring: 0,
+            },
+            p0,
+            m,
+        )
+        .expect("the device phase");
+        // The hard gate first: every output finite, before any comparison.
+        let non_finite = out.iter().filter(|v| !v.is_finite()).count();
+        assert_eq!(
+            non_finite, 0,
+            "{non_finite} outputs are not finite ({label})"
+        );
+        let bound = 2f64.powi(-9) * v_scale(&logical.v);
+        let (mut worst, mut worst_at) = (0.0f64, (0, 0, 0));
+        for t in 0..m {
+            let own = p0 + t;
+            // Window 0 is all keys: the row reads from position 0 (a saturating
+            // `(own + 1) - window` would be an empty range there).
+            let start = if window == 0 {
+                0
+            } else {
+                (own + 1).saturating_sub(window)
+            };
+            let keys = start..own + 1;
+            for h in 0..16 {
+                let reference = ref_row_in(
+                    &logical.q[(t * 16 + h) * D..][..D],
+                    &logical.k,
+                    &logical.v,
+                    h / GROUP,
+                    keys.clone(),
+                    f64::from(SCALE),
+                );
+                // The reference is gated like the output: a non-finite reference value
+                // cannot enter a delta, where `>` would silently skip it (Fix 2).
+                for (d, &want) in reference.iter().enumerate() {
+                    assert!(
+                        want.is_finite(),
+                        "{label}: the reference value at t {t} h {h} d {d} is {want}, not finite"
+                    );
+                }
+                let got = &out[(t * 16 + h) * D..][..D];
+                for (d, (&value, want)) in got.iter().zip(&reference).enumerate() {
+                    let delta = (f64::from(value) - want).abs();
+                    // NaN-propagating: a NaN delta becomes the worst and fails the bound.
+                    if delta > worst || delta.is_nan() {
+                        (worst, worst_at) = (delta, (t, h, d));
+                    }
+                }
+            }
+        }
+        let line = format!(
+            "{label} window {window} p0 {p0} m {m}: worst |Δout| {worst:.3e} at {worst_at:?} \
+             of the derived bound {bound:.3e}"
+        );
+        println!("{line}");
+        if worst > bound {
             failures.push(line);
         }
     }
@@ -1669,8 +2088,9 @@ fn attn_prefill_fault_bad_bounds_reports_bit_8() {
     }
     // The kernels' own device re-check of p0/m, reached through the qualified fault entry:
     // every other rule of the call holds, only the bound is violated (the entry forces p0 =
-    // cache_rows). The part kernel must write no partial, the combine NaN to out, and bit 8
+    // cache_rows). The part kernel must write no partial, the combine NaN to out, and mask 8
     // of the prefill status word must be OR-ed in.
+    use crate::kernels::cuda::PREFILL_STATUS_BOUND_VIOLATION;
     let phase = || -> Result<(Vec<f32>, Vec<u8>, i32), EngError> {
         use crate::kernels::cuda::native::prefill::attn_prefill::attn_prefill_fault_bad_bounds;
         let fx = Fx::new(
@@ -1701,7 +2121,10 @@ fn attn_prefill_fault_bad_bounds_reports_bit_8() {
         part.iter().all(|&b| b == PART_FILL),
         "a refused launch writes no partial byte"
     );
-    assert_eq!(status, 0x100, "bit 8 of the prefill status word");
+    assert_eq!(
+        status, PREFILL_STATUS_BOUND_VIOLATION,
+        "mask 8 of the prefill status word"
+    );
 }
 
 // ---- test 18 and the fp16 half of test 19: the timing reports -----------------------------
@@ -1785,19 +2208,63 @@ fn attn_prefill_report_ms() {
 /// warm-ups. The per-chunk (x10) number is REPORTED next to llama.cpp's 349 ms per 512-chunk
 /// at 128K depth and the 250 ms target, not asserted. A correctness spot check on 4 rows (2
 /// heads) runs in the same process so the timed kernel is the correct one. Ignored by
-/// default: run by name in one 3090 hold.
-///
-/// A debug build runs one launch on a tiled fill (a random block of a prime number of rows,
-/// repeated) and checks two rows: the release rig's host work (a fully random 2 x 128.5 MiB
-/// fill and eight f64 reference rows over 131K keys) does not fit one 150 s hold
-/// unoptimized, and the debug run is there for the overflow checks of the 128K arithmetic,
-/// not for the timing.
+/// default: run by name in one 3090 hold. The split is the split plan's (s_A = 2); test 24
+/// runs the same rig with the launch plan's.
 #[test]
 #[ignore = "the 128K north-star rig: run by name in one GPU hold"]
 fn attn_prefill_report_ms_at_128k() {
     if !testkit::device_present("attn_prefill_report_ms_at_128k") {
         return;
     }
+    // The plan is pure; taking it before the rig keeps its `expect` away from live owners.
+    north_star_rig(plan_for(512, 2, 131_584));
+}
+
+/// Test 24: the T19 acceptance row (section 1: <= 250 ms per 512-chunk over 10 layers) by the
+/// launch plan the driver calls, `cpf_attn_launch_plan(.., 131,584, 0, 82)`: test 19's rig
+/// and row (with its 4-row f64 spot check) at the launch plan's split count, after one line
+/// with the split count, the T19 line and the per-layer floors (compute at 71 TFLOP/s, and
+/// the K/V bytes the query tiles read from L2). Reported, not asserted; release-gated like
+/// test 19 (a debug build runs the spot check only). Ignored by default: one 3090 hold.
+#[test]
+#[ignore = "the 128K acceptance row by the launch plan: run by name in one GPU hold"]
+fn attn_prefill_report_ms_at_128k_by_the_launch_plan() {
+    if !testkit::device_present("attn_prefill_report_ms_at_128k_by_the_launch_plan") {
+        return;
+    }
+    let (m, p0, rows) = (512_usize, 131_072_usize, 131_584_usize);
+    let plan = cpf_attn_launch_plan(q36(m), rows, 0, CPF_ATTN_SM_COUNT).expect("the launch plan");
+    let flops = 4.0 * D as f64 * 16.0 * (p0 as f64 + m as f64 / 2.0) * m as f64;
+    // Every query tile of each kv head reads K and V (2 x 512 B per key) up to its last row.
+    let l2_bytes: f64 = (0..m.div_ceil(8))
+        .map(|tile| (p0 + m.min(8 * tile + 8)) as f64 * 2.0 * 2.0 * D as f64 * 2.0)
+        .sum();
+    println!(
+        "T24 launch plan at p0 {p0} M {m}: {} splits, min_keys {}; T19 line 250 ms per 512-chunk \
+         over 10 layers (25 ms/layer); floors per layer: compute {:.1} ms ({:.3} TFLOP at 71 \
+         TFLOP/s), L2 K/V traffic {:.2} GB",
+        plan.max_splits,
+        plan.min_keys,
+        flops / 71e12 * 1e3,
+        flops / 1e12,
+        l2_bytes / 1e9,
+    );
+    north_star_rig(CpfAttnSplit {
+        max_splits: plan.max_splits,
+        min_keys: plan.min_keys,
+    });
+}
+
+/// The north-star rig of tests 19 and 24 at the given split: p0 = 131,072, M = 512 over a
+/// single-layer fp16 cache of 131,584 rows, timed by [`report_north_star`] in release, then
+/// the f64 spot check.
+///
+/// A debug build runs one launch on a tiled fill (a random block of a prime number of rows,
+/// repeated) and checks two rows: the release rig's host work (a fully random 2 x 128.5 MiB
+/// fill and eight f64 reference rows over 131K keys) does not fit one 150 s hold
+/// unoptimized, and the debug run is there for the overflow checks of the 128K arithmetic,
+/// not for the timing.
+fn north_star_rig(split: CpfAttnSplit) {
     /// Rows of the random block a debug fill repeats: prime, so a wrong key row is almost
     /// never a copy of the right one.
     const DEBUG_PERIOD: usize = 4_099;
@@ -1850,7 +2317,6 @@ fn attn_prefill_report_ms_at_128k() {
         let q_buf = testkit::upload_bytes(&ctx, &le(&q));
         let kc = testkit::upload_bytes(&ctx, &le16(&k_bits));
         let vc = testkit::upload_bytes(&ctx, &le16(&v_bits));
-        let split = plan_for(m, 2, rows);
         let part_bytes = cpf_attn_part_bytes(
             CpfAttnGeometry {
                 m,

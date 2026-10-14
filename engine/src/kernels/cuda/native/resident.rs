@@ -60,6 +60,7 @@ pub(in crate::kernels::cuda) mod router;
 pub(in crate::kernels::cuda) mod step_params;
 pub(in crate::kernels::cuda) mod swiglu_pack;
 pub(in crate::kernels::cuda) mod swiglu_q8;
+pub(in crate::kernels::cuda) mod tiered_classify;
 
 /// A non-blocking CUDA stream. Consumed by [`stream_destroy`].
 #[derive(Debug)]

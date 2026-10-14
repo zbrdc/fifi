@@ -124,6 +124,21 @@ pub(crate) fn plane_sizes(
         .collect())
 }
 
+/// A zeroed host buffer of `len` bytes. `try_reserve_exact` returns an error (a capacity
+/// overflow or an allocation failure) where `vec![0u8; len]` and `Vec::resize` abort the
+/// process, so a huge or denied export becomes a `MemoryPlan` refusal -- which a prefix save
+/// turns into `Ok(false)` (decision 0036 addendum 1 item 7) instead of killing the engine.
+/// `f32_from_le` and `f32_to_le` stay as they are: they allocate at most one layer's vectors
+/// (about 2 MB per layer) from bytes the caller already holds.
+pub(crate) fn host_zeroed(len: usize) -> Result<Vec<u8>, EngError> {
+    let mut bytes = Vec::new();
+    bytes.try_reserve_exact(len).map_err(|error| {
+        EngError::MemoryPlan(format!("export_state: {len} host bytes: {error}"))
+    })?;
+    bytes.resize(len, 0);
+    Ok(bytes)
+}
+
 pub(crate) fn f32_from_le(bytes: &[u8]) -> Vec<f32> {
     bytes
         .as_chunks::<F32>()
@@ -203,14 +218,23 @@ impl ResidentState {
         let ranges = self.layout.kv.prefix_ranges(ordinal, self.book.tokens())?;
         let mut planes = Vec::new();
         for &plane in self.layout.kv.planes() {
-            let mut bytes = Vec::new();
+            // One fallible allocation per plane: the runs fill it at their offsets.
+            let total: usize = ranges
+                .iter()
+                .filter(|range| range.plane == plane)
+                .map(|range| range.bytes)
+                .sum();
+            let mut bytes = host_zeroed(total)?;
+            let mut at = 0;
             for range in ranges.iter().filter(|range| range.plane == plane) {
-                let start = bytes.len();
-                bytes.resize(start + range.bytes, 0);
                 if range.bytes > 0 {
-                    self.kv
-                        .read_at(stream, range.device_offset, &mut bytes[start..])?;
+                    self.kv.read_at(
+                        stream,
+                        range.device_offset,
+                        &mut bytes[at..at + range.bytes],
+                    )?;
                 }
+                at += range.bytes;
             }
             planes.push(bytes);
         }
@@ -242,7 +266,10 @@ impl ResidentState {
         offset: usize,
         values: usize,
     ) -> Result<Vec<f32>, EngError> {
-        let mut bytes = vec![0u8; values * F32];
+        let byte_len = values.checked_mul(F32).ok_or_else(|| {
+            EngError::MemoryPlan(format!("export_state: {values} f32 values overflow usize"))
+        })?;
+        let mut bytes = host_zeroed(byte_len)?;
         self.delta.read_at(stream, offset, &mut bytes)?;
         Ok(f32_from_le(&bytes))
     }

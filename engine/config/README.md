@@ -53,7 +53,7 @@ The scales and biases have the activation dtype.
 On the real model (2 key-value heads of width 256, 10 attention layers), one position takes 40,960 bytes in the `f32` form.
 It takes 10,880 bytes in the `q8` form with `bf16` activations and 11,520 bytes with `f32` activations.
 The `q8` form needs a head dimension that is a multiple of 64.
-Only the MLX arm builds the `q8` form so far. The CUDA arm refuses it and keeps `f32` and 32,768 positions by default.
+The CUDA arm builds the `q8` form too (KV8-B): `"kv_dtype": "q8"` there builds the Int8G32 cache, which takes the native weight layout, and the arm refuses `q8` with the Tiled layout. The CUDA default stays `f32` and 32,768 positions until the G-KV8 flip.
 The MLX arm defaults to `context_limit` 262,144 and `session_cap_bytes` 4,294,967,296 (4 GiB). In the `q8` form with `bf16` activations, 262,144 positions take 2,852,126,720 bytes, and with the DeltaNet state 2,917,990,400 bytes, which the cap admits.
 The session admission and the prefix-reuse requirement use the bytes of the chosen form. The reserve below is a plan sum for the `q8` form with `bf16` activations at 262,144 positions: recompute it when one of these changes.
 The gate of record Q36-KV8-GATE (in the project ledger) shows the fit on the 36 GB Mac Studio, the retrieval of a needle at 2,048 to 262,000 tokens, the tool-call format, and the window divergence against the `f32` cache, which stays within the schedule noise of the `bf16` prefill. The decode speed at depth is the known price of the composite attention until the fused kernel lands: 42.8 tok/s against 55.0 tok/s of the `f32` cache at 30,000 positions, and about 10 tok/s at 262,000 positions.
@@ -73,7 +73,8 @@ The reserve has no derived default.
 
 ## Prefix reuse
 
-With `prefix_reuse` on in the configuration file, one saved prefix entry and the live session share the engine's `session_cap_bytes` budget: the entry charges its attention caches plus the DeltaNet state (65,863,680 bytes) and the live session can hold the same caches again up to `context_limit`.
+With `prefix_reuse` on in the configuration file, the CUDA arm keeps one saved prefix entry in host RAM (decision 0036, addendum 1, with a copy restore); the tiered mode of the 4050 never saves one. The entry costs the DeltaNet state (65,863,680 bytes) plus the KV bytes of its positions. The arm has no `session_cap_bytes` rule: the entry is bounded by `context_limit`.
+On the MLX arm, one saved prefix entry and the live session share the engine's `session_cap_bytes` budget: the entry charges its attention caches plus the DeltaNet state (65,863,680 bytes) and the live session can hold the same caches again up to `context_limit`.
 The engine start therefore refuses a run whose `session_cap_bytes` is below `2 * growth_per_position * context_limit + 65863680` and answers with the cap, the requirement, and the hint `raise session_cap_bytes`.
 For the `f32` cache form the growth is 40,960 bytes per position (2,750,218,240 bytes at 32,768 positions). For the default `q8` form with `bf16` activations it is 10,880 bytes per position: 5,770,117,120 bytes at 262,144 positions, more than the default cap of 4 GiB.
 A run with `prefix_reuse` on and the default limit must therefore set `session_cap_bytes` of at least 5,770,117,120.

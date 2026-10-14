@@ -89,7 +89,7 @@ impl AttnSpan {
 /// The split plan: a grid of `max_splits` blocks per kv head and token, and the fewest keys
 /// (a multiple of 32) worth one split. They are constants of a step: the same input gives the
 /// same bytes only for one plan.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct AttnSplit {
     pub(crate) max_splits: usize,
     pub(crate) min_keys: usize,
@@ -100,6 +100,15 @@ impl AttnSplit {
     pub(crate) const STAGE1: Self = Self {
         max_splits: 64,
         min_keys: 32,
+    };
+
+    /// The KV8 plan of the Int8G32 step (KV8-B B2): `attn_decode_q8` reads contiguous 64-cell
+    /// tiles, so its `min_keys` is a multiple of 64 and the fp16 `STAGE1` (32) is refused. The
+    /// `max_splits` is STAGE1's own 64, so the part scratch byte count is the same number; the
+    /// CONSTANT is what differs and what the plan must size with.
+    pub(crate) const Q8: Self = Self {
+        max_splits: 64,
+        min_keys: 64,
     };
 }
 

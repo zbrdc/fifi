@@ -47,7 +47,12 @@
 //! by the embedding (RD-4c: ORs 4 for a token id outside the vocabulary), by `attn_prep` (RD-8a:
 //! ORs 4 on a refused launch), by the router (ORs 1) and by `argmax` (ORs
 //! 2; its `atomicOr` return value is the status half of the result pair). `argmax` MUST be the
-//! last kernel that writes status in the step; any later writer breaks the pair.
+//! last kernel that writes status in the step; any later writer breaks the pair. Under Int8G32
+//! (KV8-B) the rows entry of `attn_prep` holds the `ATTN_PREP` phase for the same mask-4 rule,
+//! and `kv8_append` (phase `KV8_APPEND`) also ORs 4 on a bad pos word — but the rows entry has
+//! already refused that same word against the same cell bound one launch earlier, so the append
+//! can never be the first to set a bit; the writer list of the composed step now names
+//! `KV8Append` itself (`writes_status` is true for it), still before `argmax`.
 //!
 //! What the compiler checks, and what it does not: [`writes_status`] is an exhaustive `match` over
 //! [`Phase`], so adding a phase forces a decision about status; `status_order_ok` (a `const fn`
@@ -71,7 +76,7 @@
 use std::fmt;
 
 use super::{
-    dims::{StepDims, StepOptions},
+    dims::{KvMode, StepDims, StepOptions},
     state_layout::align_up,
 };
 use crate::{
@@ -81,6 +86,7 @@ use crate::{
         ArenaPlan, ArenaTensor, plan_arena,
         resident::{
             attn_decode::{AttnSplit, attn_part_bytes},
+            attn_decode_q8::attn_q8_part_bytes,
             quantize_q8_1::q8_1_bytes,
             router::{RouterShape, router_logits_bytes},
             step_params::ARGMAX_PART_BYTES,
@@ -99,20 +105,30 @@ pub(crate) const MAX_STEP_ROWS: usize = 8;
 
 /// Scratch bytes of the stage 1 kernels for one row count. `attn_part` and `argmax_part` come
 /// from the merged wrappers (RD-8b `attn_part_bytes` with `AttnSplit::STAGE1`, RD-4d
-/// `ARGMAX_PART_BYTES`, RD-5 `router_logits_bytes`), so each size has one owner. [`Self::for_dims`]
-/// takes every size from its wrapper; [`Self::new`] takes a router size from the caller and the
-/// plan refuses anything below `4 * rows * (experts + 1)` (1,028 at one row).
+/// `ARGMAX_PART_BYTES`, RD-5 `router_logits_bytes`), so each size has one owner; under
+/// `Int8G32` the part scratch is the KV8 kernel's own `attn_q8_part_bytes` with
+/// `AttnSplit::Q8` (KV8-B B2). [`Self::for_dims`] takes every size from its wrapper;
+/// [`Self::new`] takes a router size from the caller and the plan refuses anything below
+/// `4 * rows * (experts + 1)` (1,028 at one row).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct KernelScratch {
     rows: usize,
     router_logits: usize,
     attn_part: usize,
+    /// The split `attn_part` was sized with: STAGE1 under `Fp16`, `Q8` under `Int8G32`. The two
+    /// constants share `max_splits` 64, so the byte count alone cannot tell them apart; this
+    /// field is what the plan checks against the KV mode.
+    attn_split: AttnSplit,
     argmax_part: usize,
 }
 
 impl KernelScratch {
     /// The scratch of `rows` rows with the router size of RD-5's `router_logits_bytes`.
-    pub(crate) fn for_dims(dims: &StepDims, rows: usize) -> Result<Self, EngError> {
+    pub(crate) fn for_dims(
+        dims: &StepDims,
+        rows: usize,
+        kv_mode: KvMode,
+    ) -> Result<Self, EngError> {
         let moe = &dims.shape.moe;
         let router = router_logits_bytes(RouterShape {
             m: rows,
@@ -120,36 +136,66 @@ impl KernelScratch {
             n_expert: moe.experts,
             top_k: moe.top_k,
         })?;
-        Self::new(dims, rows, router)
+        Self::new(dims, rows, router, kv_mode)
     }
 
     pub(crate) fn new(
         dims: &StepDims,
         rows: usize,
         router_logits: usize,
+        kv_mode: KvMode,
     ) -> Result<Self, EngError> {
         let attn = &dims.shape.attn;
-        let attn_part = attn_part_bytes(
-            rows,
-            attn.heads_kv,
-            attn.head_dim,
-            AttnSplit::STAGE1.max_splits,
-        )?;
+        // One arm per mode: the split constant and its own sizing wrapper stay inseparable, so
+        // a scratch cannot carry a split its bytes were not sized with.
+        let (attn_split, attn_part) = match kv_mode {
+            KvMode::Fp16 => (
+                AttnSplit::STAGE1,
+                attn_part_bytes(
+                    rows,
+                    attn.heads_kv,
+                    attn.head_dim,
+                    AttnSplit::STAGE1.max_splits,
+                )?,
+            ),
+            KvMode::Int8G32 => (
+                AttnSplit::Q8,
+                attn_q8_part_bytes(rows, attn.heads_kv, attn.head_dim, AttnSplit::Q8.max_splits)?,
+            ),
+        };
         Ok(Self {
             rows,
             router_logits,
             attn_part,
+            attn_split,
             argmax_part: ARGMAX_PART_BYTES,
         })
     }
 
-    /// Refuses a scratch made for another row count or too small for the shape.
-    fn check(&self, dims: &StepDims, rows: usize) -> Result<(), EngError> {
+    /// The split `AttnPart` was sized with (the observation point of the KV8-B sizing rule:
+    /// the byte counts of STAGE1 and Q8 coincide).
+    pub(crate) fn attn_split(&self) -> AttnSplit {
+        self.attn_split
+    }
+
+    /// Refuses a scratch made for another row count, a router size below the shape's need, or a
+    /// split that does not belong to the KV mode.
+    fn check(&self, dims: &StepDims, rows: usize, kv_mode: KvMode) -> Result<(), EngError> {
         let router_min = product(&[rows, dims.shape.moe.experts + 1, F32])?;
+        let want = match kv_mode {
+            KvMode::Fp16 => AttnSplit::STAGE1,
+            KvMode::Int8G32 => AttnSplit::Q8,
+        };
         if self.rows != rows || self.router_logits < router_min {
             return Err(EngError::BadRequest(format!(
                 "step plan: the kernel scratch was made for {} rows with {} router bytes, the plan needs {rows} rows and at least {router_min}",
                 self.rows, self.router_logits
+            )));
+        }
+        if self.attn_split != want {
+            return Err(EngError::BadRequest(format!(
+                "step plan: the kernel scratch sized AttnPart with the {:?} split, the {kv_mode:?} KV mode needs the {want:?} split",
+                self.attn_split
             )));
         }
         Ok(())
@@ -175,8 +221,14 @@ pub(crate) enum Slot {
     /// f32 `[rows][attn_proj]`: per query head `[q | gate]`, then k, then v.
     AttnProj,
     AttnQ,
+    /// f32 `[rows][n_kv_head][head_dim]` k rows of the Int8G32 KV handoff (KV8-B B2): written
+    /// by the rows entry of `attn_prep` at `ATTN_PREP`, quantized into the code and scale
+    /// planes by `kv8_append` at `KV8_APPEND`. Present only under `KvMode::Int8G32`.
+    KRows,
+    /// The v twin of [`Slot::KRows`]: the unchanged, un-roped v rows of the same handoff.
+    VRows,
     /// RD-8b split-KV partials; written by the part kernel and read by the combine kernel, both
-    /// in `ATTN_CORE`.
+    /// in `ATTN_CORE` (under `Int8G32` the KV8 kernel's own partials, same phase).
     AttnPart,
     AttnCore,
     XfAttnOut,
@@ -235,25 +287,29 @@ pub(super) enum Phase {
     DeltaOut = 7,
     AttnIn = 8,
     AttnPrep = 9,
-    AttnCore = 10,
-    AttnPack = 11,
-    AttnOut = 12,
-    AddNorm = 13,
-    Route = 14,
-    GateUp = 15,
-    Swiglu = 16,
-    Down = 17,
+    /// The KV8 append of the Int8G32 step (KV8-B B2): `kv8_append` quantizes the f32 k and v
+    /// rows of `ATTN_PREP` into the code and scale planes, before the decode attention reads
+    /// them. Fp16 plans never enter this phase.
+    Kv8Append = 10,
+    AttnCore = 11,
+    AttnPack = 12,
+    AttnOut = 13,
+    AddNorm = 14,
+    Route = 15,
+    GateUp = 16,
+    Swiglu = 17,
+    Down = 18,
     Combine = 19,
-    FinalNorm = 21,
-    LmHead = 22,
-    Argmax = 23,
+    FinalNorm = 22,
+    LmHead = 23,
+    Argmax = 24,
     /// `step_advance`: the last kernel of the step. It writes `pos`, `kv_len` and `kv_slot`,
     /// never `status`.
-    Advance = 24,
+    Advance = 25,
 }
 
 /// The phase table the plan's lifetimes are written in, in launch order.
-pub(super) const PHASES: [Phase; 23] = [
+pub(super) const PHASES: [Phase; 24] = [
     Phase::StepBegin,
     Phase::Embed,
     Phase::MixPack,
@@ -264,6 +320,7 @@ pub(super) const PHASES: [Phase; 23] = [
     Phase::DeltaOut,
     Phase::AttnIn,
     Phase::AttnPrep,
+    Phase::Kv8Append,
     Phase::AttnCore,
     Phase::AttnPack,
     Phase::AttnOut,
@@ -282,7 +339,16 @@ pub(super) const PHASES: [Phase; 23] = [
 /// Whether the kernel of `phase` writes the status word. Exhaustive: a new phase needs an answer.
 pub(super) const fn writes_status(phase: Phase) -> bool {
     match phase {
-        Phase::StepBegin | Phase::Embed | Phase::AttnPrep | Phase::Route | Phase::Argmax => true,
+        Phase::StepBegin
+        | Phase::Embed
+        | Phase::AttnPrep
+        | Phase::Kv8Append
+        | Phase::Route
+        | Phase::Argmax => true,
+        // The table states what the kernel does: `kv8_append` ORs mask 4 into the status word
+        // on a bad pos word (KV8-B). The OR is still redundant — the rows entry of `attn_prep`
+        // refused the SAME word against the SAME cell bound one launch earlier, so the append
+        // is never the first or only writer of the composed step.
         Phase::MixPack
         | Phase::DeltaIn
         | Phase::DeltaConv
@@ -335,6 +401,7 @@ const DELTA_PACK: usize = Phase::DeltaPack as usize;
 const DELTA_OUT: usize = Phase::DeltaOut as usize;
 const ATTN_IN: usize = Phase::AttnIn as usize;
 const ATTN_PREP: usize = Phase::AttnPrep as usize;
+const KV8_APPEND: usize = Phase::Kv8Append as usize;
 const ATTN_CORE: usize = Phase::AttnCore as usize;
 const ATTN_PACK: usize = Phase::AttnPack as usize;
 const ATTN_OUT: usize = Phase::AttnOut as usize;
@@ -389,7 +456,7 @@ impl StepPlan {
             )));
         }
         check_layout_rows(rows, options)?;
-        scratch.check(dims, rows)?;
+        scratch.check(dims, rows, options.kv_mode)?;
         let slots = list_slots(dims, rows, options, scratch)?;
         let arena = plan_arena(&arena_tensors(&slots))?;
         let unaliased = slots
@@ -507,11 +574,12 @@ impl SlotList {
     }
 }
 
-/// The typed refusals of the NATIVE plan (MATVEC-PAR S3b), before any slot is sized: the q8_1
-/// producers take the step's single row, and the Native MoE runs ONE merged down launch, so the
-/// forked per-expert packs have no Native form. Stage-1 unreachable through `StepResources`
-/// (one row, `check_stage1_options`); the plan refuses them on its own so no caller can build a
-/// half-tiled plan.
+/// The typed refusals of the NATIVE plan (MATVEC-PAR S3b) and of the Int8G32 KV mode (KV8-B
+/// B2), before any slot is sized: the q8_1 producers take the step's single row, the Native MoE
+/// runs ONE merged down launch, so the forked per-expert packs have no Native form, and the
+/// Int8G32 attention ops exist as Native op lists only (Tiled stays the fp16 control path).
+/// Stage-1 unreachable through `StepResources` (one row, `check_stage1_options`); the plan
+/// refuses them on its own so no caller can build a half-tiled plan.
 fn check_layout_rows(rows: usize, options: &StepOptions) -> Result<(), EngError> {
     if options.layout == WeightLayout::Native && rows != 1 {
         return Err(EngError::BadRequest(format!(
@@ -521,6 +589,13 @@ fn check_layout_rows(rows: usize, options: &StepOptions) -> Result<(), EngError>
     if options.layout == WeightLayout::Native && options.forked_experts {
         return Err(EngError::BadRequest(
             "step plan: the native layout takes the single merged expert down pack".to_owned(),
+        ));
+    }
+    if options.kv_mode == KvMode::Int8G32 && options.layout == WeightLayout::Tiled {
+        return Err(EngError::BadRequest(
+            "step plan: the Int8G32 KV mode takes the native layout; Tiled is the fp16 control \
+             path"
+                .to_owned(),
         ));
     }
     Ok(())
@@ -604,6 +679,13 @@ fn list_mixers(
     }
     list.add(Slot::AttnProj, list.row(dims.attn_proj), ATTN_IN, ATTN_CORE)?;
     list.add(Slot::AttnQ, list.row(q_width), ATTN_PREP, ATTN_CORE)?;
+    // The f32 rows handoff of the Int8G32 KV mode (KV8-B B2): written by the rows entry of
+    // `attn_prep` at ATTN_PREP, consumed by `kv8_append` at KV8_APPEND, dead after it.
+    if options.kv_mode == KvMode::Int8G32 {
+        let kv_width = a.heads_kv * a.head_dim;
+        list.add(Slot::KRows, list.row(kv_width), ATTN_PREP, KV8_APPEND)?;
+        list.add(Slot::VRows, list.row(kv_width), ATTN_PREP, KV8_APPEND)?;
+    }
     list.add(Slot::AttnPart, Ok(scratch.attn_part), ATTN_CORE, ATTN_CORE)?;
     list.add(Slot::AttnCore, list.row(q_width), ATTN_CORE, ATTN_PACK)?;
     match options.layout {

@@ -145,8 +145,14 @@ fn test_source(file: &str) -> &'static str {
             include_str!("../../../kernels/cuda/resident/step_params/tests.rs")
         }
         "attn_prep/tests.rs" => include_str!("../../../kernels/cuda/resident/attn_prep/tests.rs"),
+        "kv8_append/tests.rs" => {
+            include_str!("../../../kernels/cuda/resident/kv8_append/tests.rs")
+        }
         "attn_decode/tests.rs" => {
             include_str!("../../../kernels/cuda/resident/attn_decode/tests.rs")
+        }
+        "attn_decode_q8/tests.rs" => {
+            include_str!("../../../kernels/cuda/resident/attn_decode_q8/tests.rs")
         }
         other => panic!("no test source is wired for {other}"),
     }
@@ -157,7 +163,15 @@ fn every_reader_of_a_position_word_cites_a_merged_poisoned_word_test() {
     let kernels: Vec<&str> = POS_WORD_READERS.iter().map(|r| r.kernel).collect();
     assert_eq!(
         kernels,
-        ["step_begin", "attn_prep", "attn_decode", "step_advance"],
+        [
+            "step_begin",
+            "attn_prep",
+            "attn_prep_rows",
+            "kv8_append",
+            "attn_decode",
+            "attn_decode_q8",
+            "step_advance"
+        ],
         "a new reader of pos, kv_len or kv_slot needs a poisoned-word test first"
     );
     for reader in POS_WORD_READERS {

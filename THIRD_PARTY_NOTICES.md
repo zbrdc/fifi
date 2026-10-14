@@ -50,6 +50,9 @@ SOFTWARE.
   - `pack_q8_0` in `engine/vendor/xavier-qwen/src/repack.cu:32`, from ggml `block_q8_0`. It moves `d` and `qs` bytes and computes no values.
   - `Q8_0::dq` in `engine/vendor/xavier-qwen/src/mma884.cuh:312`, from ggml `dequantize_row_q8_0`.
   - `DQ8::dq` in `engine/vendor/xavier-qwen/src/gemm.cuh:102`, from ggml `dequantize_row_q8_0`. The gemm path runs it for more than 16 tokens.
+  - The J/config tables in `engine/src/kernels/cuda/prefill/mmq_size.rs`, from ggml
+    `ggml-cuda/mmq-config-ampere.cuh` and `ggml-cuda/mmq-config-pascal-dp4a.cuh` at the same
+    pin (MIT-derived constants, data only; a test re-parses both vendored headers).
 - Not derived: `dequant_256` in `engine/vendor/xavier-qwen/src/repack.cu:140` repeats no ggml Q4_K or Q6_K value logic. Its Q5_K branch calls `dequant_q5k`, listed above, and its other branches widen F32 and F16 values directly.
 
 ## ggml-cuda-mmq (llama.cpp CUDA MMQ and MMVQ kernels)

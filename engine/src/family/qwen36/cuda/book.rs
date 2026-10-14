@@ -411,18 +411,26 @@ impl StateBook {
     /// synchronizes the stream, so a refused call neither waits nor poisons.
     pub(super) fn begin_revalidate(&self, stream_id: u64) -> Result<(), EngError> {
         self.check_owner(stream_id, "revalidate")?;
-        self.require_prefill_open()
+        self.require_prefill_open("revalidate")
     }
 
-    /// `BadRequest` unless a prefill is in progress.
-    fn require_prefill_open(&self) -> Result<(), EngError> {
+    /// Guards of the prefill status word copies of decision 0049 item 10 (`what` names the
+    /// caller): the owning stream and an open prefill chunk, so the word is zeroed at chunk
+    /// open and read at chunk close, inside the chunk only.
+    pub(super) fn begin_prefill_word(&self, stream_id: u64, what: &str) -> Result<(), EngError> {
+        self.check_owner(stream_id, what)?;
+        self.require_prefill_open(what)
+    }
+
+    /// `BadRequest` unless a prefill is in progress (`what` names the caller).
+    fn require_prefill_open(&self, what: &str) -> Result<(), EngError> {
         if self.health == Health::PrefillOpen {
             return Ok(());
         }
         Err(refuse(
-            "revalidate",
+            what,
             &format!(
-                "only a prefill in progress can be revalidated, the state is {:?}",
+                "an open prefill chunk is required, the state is {:?}",
                 self.health
             ),
         ))
@@ -436,7 +444,7 @@ impl StateBook {
         tokens: usize,
         prefill_status: i32,
     ) -> Result<(), EngError> {
-        self.require_prefill_open()?;
+        self.require_prefill_open("revalidate")?;
         if prefill_status != 0 {
             self.health = Health::Poisoned;
             return Err(status_error(prefill_status));

@@ -73,27 +73,36 @@ fn make_takes_the_step_layout_from_the_loaded_weights() {
     // the call this pin finds.
     let make = pinned(fn_section("fn make("));
     let load = make.find("load_model(").expect("make loads the model");
+    let layout = make
+        .find("device.layout()?")
+        .expect("make reads the loaded weights' own layout");
+    let kv = make.find("kv_mode_of(settings.kv,layout)?").expect(
+        "make derives the KV mode from the parsed form and that layout (B4-F: not a constant)",
+    );
     let options = make
-        .find("step_options(settings.context_limit,device.layout()?)?")
-        .expect("make derives the step layout from the loaded weights");
+        .find("step_options(settings.context_limit,layout,kv_mode)?")
+        .expect("make builds the options from that layout and the resolved KV mode");
     let resources = make
         .find("StepResources::new(")
         .expect("make builds the step resources");
     assert!(
-        load < options && options < resources,
-        "load {load}, options {options}, resources {resources}"
+        load < layout && layout < kv && kv < options && options < resources,
+        "load {load}, layout {layout}, kv {kv}, options {options}, resources {resources}"
     );
     assert!(
         !make.contains("WeightLayout::"),
         "make names no layout constant"
     );
-    assert!(
-        !make.contains(".layout,"),
-        "make reads no other layout field"
-    );
-    // start() validates the limit only: no step options and no layout before the device.
+    // start() resolves the KV mode through serve_kv_mode and validates the limit only: no step
+    // options and no layout before the device. The admission charges the SAME resolved mode to
+    // the KV bytes (B4-F): a mode constant there over-charges a q8 user 1.88x and refuses
+    // spuriously.
     let start = pinned(fn_section("fn start("));
-    assert!(start.contains("context_tokens(settings.context_limit)?"));
+    assert!(start.contains("serve_kv_mode(settings)?"));
+    assert!(start.contains("context_tokens(settings.context_limit,kv_mode)?"));
+    assert!(
+        start.contains("kv_cache_bytes(context_tokens(settings.context_limit,kv_mode)?,kv_mode)?")
+    );
     assert!(!start.contains("step_options(") && !start.contains("WeightLayout::"));
 }
 

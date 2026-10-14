@@ -21,6 +21,8 @@ use super::{
     MAX_TOKENS, PrepChunkMode, check_rope, check_shape,
 };
 use crate::EngError;
+#[cfg(feature = "cuda-fault-qualification")]
+use crate::kernels::cuda::PREFILL_STATUS_BOUND_VIOLATION;
 use crate::kernels::cuda::native::prefill::attn_prep_chunk::{MODE_APPEND_FP16, MODE_ROWS_OUT};
 use crate::kernels::cuda::prefill::attn_prefill::{
     CPF_ATTN_MIN_KEYS, CPF_ATTN_SM_COUNT, CPF_ATTN_SM_TARGET, CPF_ATTN_TILE_KEYS,
@@ -44,10 +46,6 @@ const Q_FILL: u8 = 0x55;
 /// range inside its buffer and the case reaches its own guard, not the range boundary
 /// (`DeviceBuffer::range` refuses empty and past-the-end ranges).
 const SLACK: usize = 1 << 20;
-/// Bit 8 of the prefill status word: a bound violation (decision 0049 item 10). Used by the
-/// fault-qualification guard test only.
-#[cfg(feature = "cuda-fault-qualification")]
-const PREFILL_BOUND_VIOLATION: i32 = 0x100;
 
 /// The Qwen3.6 chunk shape at `m` tokens and `rows` cache rows, `p0` positions in.
 #[rustfmt::skip]
@@ -1018,7 +1016,7 @@ fn attn_prep_chunk_fault_bad_bounds_reports_bit_8() {
     }
     // The kernel's own device re-check of p0/m, reached through the qualified fault entry:
     // every other rule of the call holds, only the bound is violated (the entry forces p0 =
-    // rows). The guard must write no KV row, make every q element NaN, and OR bit 8 of the
+    // rows). The guard must write no KV row, make every q element NaN, and OR mask 8 of the
     // prefill status word — with no illegal access (the q range is valid).
     let phase = || -> Result<(Vec<f32>, Vec<u8>, i32), EngError> {
         let fx = Fx::new(qwen(4, 64, 0), Out::Fp16, true)?;
@@ -1044,8 +1042,8 @@ fn attn_prep_chunk_fault_bad_bounds_reports_bit_8() {
         "a refused launch writes no cache byte"
     );
     assert_eq!(
-        status, PREFILL_BOUND_VIOLATION,
-        "bit 8 of the prefill status word"
+        status, PREFILL_STATUS_BOUND_VIOLATION,
+        "mask 8 of the prefill status word"
     );
 }
 // ---- pure checks --------------------------------------------------------------------------

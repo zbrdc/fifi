@@ -18,7 +18,7 @@
 //!
 //! The device re-check (decision 0049 item 2, the vendored form): a `p0` outside
 //! `0..=rows - m` makes the launch write no cache row and no k/v row, sets every `q` element
-//! to NaN and ORs bit 8 of the optional prefill status word (item 10; the word is NOT
+//! to NaN and ORs mask 8 of the optional prefill status word (item 10; the word is NOT
 //! `StepParams.status`). The host cannot reach that path with bad bounds — this wrapper and
 //! the C entry each refuse them first — so the fault-qualification child of the native module
 //! exercises it in the tests.
@@ -32,7 +32,10 @@
 
 #![cfg_attr(
     not(test),
-    expect(dead_code, reason = "staged for the prefill driver (decision 0049)")
+    expect(
+        dead_code,
+        reason = "staged for CPF-7, the prefill driver (decision 0049)"
+    )
 )]
 
 use std::ffi::c_int;
@@ -105,7 +108,7 @@ pub(crate) enum PrepChunkMode<'b> {
 /// - `q_norm`, `k_norm`: f32 256 each, 4-byte aligned; they may alias each other.
 /// - `q`: f32 `[m][n_head][256]`, 16-byte aligned; NaN on a refused launch.
 /// - `status`: `None`, or one device `i32` — the prefill status word of decision 0049 item
-///   10 — that receives bit 8 on a refused launch and is untouched by a valid one.
+///   10 — that receives mask 8 on a refused launch and is untouched by a valid one.
 pub(crate) struct AttnPrepChunkCall<'b> {
     pub(crate) shape: AttnPrepChunkShape,
     pub(crate) rope: RopeParams,
@@ -271,7 +274,7 @@ impl CudaContext {
     /// kernel is queued; the outputs are valid after the stream drained.
     ///
     /// A `p0` outside `0..=rows - m` is refused here (and by the C entry, and re-checked on
-    /// the device, where it writes no KV row, NaN `q` and bit 8 of the optional status word).
+    /// the device, where it writes no KV row, NaN `q` and mask 8 of the optional status word).
     ///
     /// Returns `BadRequest`, before any native call and with the backend unchanged, for a
     /// buffer or stream of another context, a shape, rope scalar or mode the kernel refuses,

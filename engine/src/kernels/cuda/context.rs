@@ -203,6 +203,23 @@ impl CudaContext {
         Ok(MemoryInfo { free, total })
     }
 
+    /// The driver's module loading mode (KV8-B B4'): 1 is `CU_MODULE_EAGER_LOADING` and 2 is
+    /// `CU_MODULE_LAZY_LOADING` (cuda.h of the build image), through the adapter's own query
+    /// entry. The device-side observation point of the adapter's eager-loading constructor.
+    #[cfg_attr(
+        not(test),
+        expect(
+            dead_code,
+            reason = "the query entry of the KV8-B B4' pins, called by their tests only"
+        )
+    )]
+    pub(crate) fn module_loading_mode(&self) -> Result<i32, EngError> {
+        self.ensure_usable()?;
+        let _dispatch = self.enter()?;
+        native::module_loading_mode()
+            .map_err(|status| native_error(&TERMINAL, "inference_cuda_module_loading_mode", status))
+    }
+
     /// Device bytes held by the live buffers of every context in the process.
     /// The count is process-global, so tests compare it before and after.
     #[cfg(test)]

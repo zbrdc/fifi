@@ -9,8 +9,30 @@
 //! Staged for the tiered step of the TCAP design (commits C2 and C6).
 
 /// Bit of the tiered word the classification sets for a route the host would refuse: an id
-/// outside the layer, a pick twice, a slot outside the bank, or a non-finite weight.
+/// outside the layer (an id below -1 included, as in `TieredHost`'s route check), a pick twice,
+/// a table slot outside the bank, or a non-finite weight.
 pub const ROUTE_INVALID: i32 = 4;
+
+/// The ids and the weights of a layer differ in length: the reference refuses the call instead of
+/// classifying the shorter list, as `TieredHost::begin_layer` refuses it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct LengthMismatch {
+    /// Picks in the id list.
+    pub ids: usize,
+    /// Picks in the weight list.
+    pub weights: usize,
+}
+
+/// The tiered word after layer `layer` ran: layer 0 starts the token (it clears the word first),
+/// later layers OR their bits in. `layer_word` is the [`Classified::word`] of that layer. The
+/// device test composes the per-layer words with this function.
+pub fn word_after(layer: usize, previous: i32, layer_word: i32) -> i32 {
+    if layer == 0 {
+        layer_word
+    } else {
+        previous | layer_word
+    }
+}
 
 /// What the classification of one layer produces.
 #[derive(Clone, Debug, PartialEq)]
@@ -24,21 +46,54 @@ pub struct Classified {
     pub log: Vec<(i32, f32)>,
     /// The misses `(expert id, router weight)` in pick order: the request of the CPU server.
     pub misses: Vec<(i32, f32)>,
-    /// [`ROUTE_INVALID`] when a pick was refused, else 0.
+    /// [`ROUTE_INVALID`] when a pick was refused, else 0. It is the word of THIS layer; see
+    /// [`word_after`] for the token's word.
     pub word: i32,
+}
+
+impl Classified {
+    /// True when every field is equal bit for bit: the weights and the log weights by `to_bits`
+    /// (so a +0.0 rule violated as -0.0 differs and a NaN equals the same NaN). The derived
+    /// `PartialEq` is not enough for a device comparison.
+    pub fn same_bits(&self, other: &Self) -> bool {
+        let pairs = |a: &[(i32, f32)], b: &[(i32, f32)]| {
+            a.len() == b.len()
+                && a.iter()
+                    .zip(b)
+                    .all(|(x, y)| x.0 == y.0 && x.1.to_bits() == y.1.to_bits())
+        };
+        let bits = |v: &[f32]| v.iter().map(|w| w.to_bits()).collect::<Vec<u32>>();
+        self.slot_ids == other.slot_ids
+            && bits(&self.weights) == bits(&other.weights)
+            && pairs(&self.log, &other.log)
+            && pairs(&self.misses, &other.misses)
+            && self.word == other.word
+    }
 }
 
 /// Classifies one layer. `slot_row[e]` is the bank slot of expert `e` or -1 (see
 /// `TieredHost::slot_row`); `slots` is the bank size. A pick with `id == -1` (the router fault)
 /// passes through as `(-1, w)`; an id below -1 or at or above `slot_row.len()`, an expert picked
 /// twice, a table slot outside `0..slots` and a non-finite weight give `(-1, w)` and set
-/// [`ROUTE_INVALID`]. The caller never gives more than the picks of one layer.
+/// [`ROUTE_INVALID`]. A table slot below -1 is refused beyond what the design text lists: the
+/// kernel of TCAP C2b must implement every refusal above identically (an id below -1 is in the
+/// design text, only the table-slot refusal goes beyond it). A miss next to a refused pick is still
+/// listed and still published: `[1, 1]` with expert 1 missing lists `(1, w0)` AND sets
+/// [`ROUTE_INVALID`] for the repeat, because the token fails on the word later and the kernel does
+/// not look ahead. `Err` when the lists differ in length. The function does not bound the number of
+/// picks: the kernel takes `top_k <= 8` as a launch argument, so the device test passes at most 8.
 pub fn classify_reference(
     slot_row: &[i32],
     slots: usize,
     ids: &[i32],
     weights: &[f32],
-) -> Classified {
+) -> Result<Classified, LengthMismatch> {
+    if ids.len() != weights.len() {
+        return Err(LengthMismatch {
+            ids: ids.len(),
+            weights: weights.len(),
+        });
+    }
     let mut out = Classified {
         slot_ids: Vec::with_capacity(ids.len()),
         weights: Vec::with_capacity(ids.len()),
@@ -73,7 +128,7 @@ pub fn classify_reference(
             out.weights.push(weight);
         }
     }
-    out
+    Ok(out)
 }
 
 #[cfg(test)]
@@ -82,8 +137,17 @@ mod tests {
 
     const ROW: [i32; 6] = [2, -1, 0, -1, 1, -1];
 
+    /// One refused route: the slot row it runs against, its picks, and which pick is refused.
+    struct Refusal {
+        what: &'static str,
+        row: [i32; 6],
+        ids: [i32; 3],
+        weights: [f32; 3],
+        refused: usize,
+    }
+
     fn run(ids: &[i32], weights: &[f32]) -> Classified {
-        classify_reference(&ROW, 3, ids, weights)
+        classify_reference(&ROW, 3, ids, weights).unwrap()
     }
 
     #[test]
@@ -95,6 +159,13 @@ mod tests {
         assert_eq!(got.log, vec![(4, 0.4), (1, 0.3), (0, 0.2), (5, 0.1)]);
         assert_eq!(got.word, 0);
         assert_eq!(got.weights[1].to_bits(), 0.0f32.to_bits(), "+0.0, not -0.0");
+    }
+
+    #[test]
+    fn misses_keep_pick_order_not_id_order() {
+        // Ids descend: a miss list sorted by expert id would reverse it.
+        let got = run(&[5, 3, 1], &[0.5, 0.3, 0.2]);
+        assert_eq!(got.misses, vec![(5, 0.5), (3, 0.3), (1, 0.2)]);
     }
 
     #[test]
@@ -111,41 +182,157 @@ mod tests {
     }
 
     #[test]
-    fn every_refused_route_sets_the_invalid_bit_and_leaves_the_other_picks_alone() {
+    fn every_refused_route_sets_the_invalid_bit_keeps_the_refused_weight_and_leaves_the_other_picks_alone()
+     {
         let nan = f32::NAN;
-        let cases: [(&str, [i32; 3], [f32; 3]); 6] = [
-            ("id below -1", [4, -2, 0], [0.5, 0.25, 0.25]),
-            ("id past the layer", [4, 6, 0], [0.5, 0.25, 0.25]),
-            ("pick twice", [4, 0, 4], [0.5, 0.25, 0.25]),
-            ("non-finite weight", [4, 0, 2], [0.5, nan, 0.25]),
-            ("infinite weight", [4, 0, 2], [0.5, f32::INFINITY, 0.25]),
-            ("slot outside the bank", [4, 0, 2], [0.5, 0.25, 0.25]),
+        let case = |what, row, ids, weights, refused| Refusal {
+            what,
+            row,
+            ids,
+            weights,
+            refused,
+        };
+        let cases = [
+            case("id below -1", ROW, [4, -2, 0], [0.5, 0.25, 0.25], 1),
+            case("id past the layer", ROW, [4, 6, 0], [0.5, 0.25, 0.25], 1),
+            case("pick twice", ROW, [4, 0, 4], [0.5, 0.25, 0.25], 2),
+            case("non-finite weight", ROW, [4, 0, 2], [0.5, nan, 0.25], 1),
+            case(
+                "infinite weight",
+                ROW,
+                [4, 0, 2],
+                [0.5, f32::INFINITY, 0.25],
+                1,
+            ),
+            case(
+                "slot outside the bank",
+                [3, -1, 0, -1, 1, -1],
+                [4, 0, 2],
+                [0.5, 0.25, 0.25],
+                1,
+            ),
         ];
-        for (what, ids, weights) in cases {
-            let mut row = ROW;
-            if what == "slot outside the bank" {
-                row[0] = 3; // the bank has 3 slots: 0..3
-            }
-            let got = classify_reference(&row, 3, &ids, &weights);
+        for Refusal {
+            what,
+            row,
+            ids,
+            weights,
+            refused,
+        } in cases
+        {
+            let got = classify_reference(&row, 3, &ids, &weights).unwrap();
             assert_eq!(got.word, ROUTE_INVALID, "{what}");
-            let bad = got.slot_ids.iter().filter(|&&s| s == -1).count();
-            assert_eq!(
-                bad, 1,
-                "{what}: exactly the refused pick is -1: {:?}",
-                got.slot_ids
-            );
+            assert!(got.misses.is_empty(), "{what}: a refused pick is no miss");
             let logged: Vec<i32> = got.log.iter().map(|&(id, _)| id).collect();
             assert_eq!(logged, ids, "{what}: the log keeps every pick as it came");
+            for i in 0..ids.len() {
+                let (slot, weight) = if i == refused {
+                    (-1, weights[i]) // the refused pick keeps its router weight, not 0.0
+                } else {
+                    (row[ids[i] as usize], weights[i])
+                };
+                assert_eq!(got.slot_ids[i], slot, "{what}: slot of pick {i}");
+                assert_eq!(
+                    got.weights[i].to_bits(),
+                    weight.to_bits(),
+                    "{what}: weight of pick {i}"
+                );
+            }
         }
-        let neg = classify_reference(&ROW, 3, &[4, 0], &[0.5, 0.5]);
-        assert_eq!(neg.word, 0, "the control route is valid");
+        let control = run(&[4, 0], &[0.5, 0.5]);
+        assert_eq!(control.word, 0, "the control route is valid");
+    }
+
+    #[test]
+    fn a_miss_beside_a_refused_pick_is_still_listed_and_published() {
+        // ROW: expert 1 is missing. The repeat of expert 1 is refused, the first pick is a miss.
+        let got = run(&[1, 1], &[0.6, 0.4]);
+        assert_eq!(got.word, ROUTE_INVALID);
+        assert_eq!(got.slot_ids, vec![0, -1]);
+        assert_eq!(
+            got.misses,
+            vec![(1, 0.6)],
+            "the first pick is a miss, the repeat is not"
+        );
+        let weights: Vec<u32> = got.weights.iter().map(|w| w.to_bits()).collect();
+        assert_eq!(weights, vec![0.0f32.to_bits(), 0.4f32.to_bits()]);
     }
 
     #[test]
     fn a_slot_in_the_table_below_minus_one_is_refused() {
         let mut row = ROW;
         row[4] = -2;
-        let got = classify_reference(&row, 3, &[4], &[1.0]);
+        let got = classify_reference(&row, 3, &[4], &[1.0]).unwrap();
         assert_eq!((got.slot_ids, got.word), (vec![-1], ROUTE_INVALID));
+    }
+
+    #[test]
+    fn lists_of_different_lengths_are_refused() {
+        assert_eq!(
+            classify_reference(&ROW, 3, &[4, 0], &[1.0]),
+            Err(LengthMismatch { ids: 2, weights: 1 })
+        );
+        assert_eq!(
+            classify_reference(&ROW, 3, &[4], &[0.5, 0.5]),
+            Err(LengthMismatch { ids: 1, weights: 2 })
+        );
+    }
+
+    #[test]
+    fn the_word_of_a_token_clears_at_layer_zero_and_ors_after() {
+        assert_eq!(
+            word_after(0, 0xff, 0),
+            0,
+            "layer 0 starts the token: the old word is gone"
+        );
+        assert_eq!(word_after(0, 0xff, ROUTE_INVALID), ROUTE_INVALID);
+        assert_eq!(
+            word_after(1, ROUTE_INVALID, 0),
+            ROUTE_INVALID,
+            "a clean layer keeps the bit"
+        );
+        assert_eq!(word_after(7, 1, ROUTE_INVALID), 1 | ROUTE_INVALID);
+    }
+
+    #[test]
+    fn same_bits_tells_the_zero_signs_apart_and_equates_a_nan_with_itself() {
+        let a = run(&[1, 4], &[0.5, 0.5]);
+        assert!(a.same_bits(&a.clone()));
+        let mut negative_zero = a.clone();
+        negative_zero.weights[0] = -0.0;
+        assert_eq!(
+            a, negative_zero,
+            "the derived PartialEq cannot see the sign of zero"
+        );
+        assert!(!a.same_bits(&negative_zero));
+        let faulted = run(&[-1], &[f32::NAN]);
+        assert_ne!(faulted, faulted.clone(), "NaN != NaN under PartialEq");
+        assert!(faulted.same_bits(&faulted.clone()));
+        let mut other_word = a.clone();
+        other_word.word = ROUTE_INVALID;
+        assert!(!a.same_bits(&other_word));
+        // One case per clause: each field differing alone must tell the two apart.
+        let with_miss = run(&[1, 4], &[0.5, 0.5]);
+        let mut slot = with_miss.clone();
+        slot.slot_ids[1] += 1;
+        assert!(!with_miss.same_bits(&slot), "slot_ids");
+        let mut logged_id = with_miss.clone();
+        logged_id.log[0].0 += 1;
+        assert!(!with_miss.same_bits(&logged_id), "log id");
+        let mut logged_weight = with_miss.clone();
+        logged_weight.log[0].1 = f32::from_bits(logged_weight.log[0].1.to_bits() + 1);
+        assert!(!with_miss.same_bits(&logged_weight), "log weight");
+        let mut miss_id = with_miss.clone();
+        miss_id.misses[0].0 += 1;
+        assert!(!with_miss.same_bits(&miss_id), "miss id");
+        let mut miss_weight = with_miss.clone();
+        miss_weight.misses[0].1 = f32::from_bits(miss_weight.misses[0].1.to_bits() + 1);
+        assert!(!with_miss.same_bits(&miss_weight), "miss weight");
+        let mut shorter = with_miss.clone();
+        shorter.misses.clear();
+        assert!(!with_miss.same_bits(&shorter), "miss count");
+        let mut short_log = with_miss.clone();
+        short_log.log.pop();
+        assert!(!with_miss.same_bits(&short_log), "log length");
     }
 }

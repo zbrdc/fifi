@@ -29,9 +29,9 @@
  *   status   NULL, or one device i32: the prefill status word of decision 0049 item 10 (NOT
  *            StepParams.status). It is untouched by a valid launch.
  *
- * Poison rule (decision 0049 item 2: the device checks p0/m again; item 10: bit 8): if
+ * Poison rule (decision 0049 item 2: the device checks p0/m again; item 10: mask 8): if
  * p0 < 0 or (long long)p0 + m > rows, no cache row and no k/v row is written, every q
- * element is NaN, and bit 8 (INFERENCE_CUDA_PREFILL_STATUS_BOUND_VIOLATION, 0x100) is OR-ed
+ * element is NaN, and mask 8 (INFERENCE_CUDA_PREFILL_STATUS_BOUND_VIOLATION) is OR-ed
  * into *status by one thread (integer atomic) when status != NULL. The answer is
  * block-uniform, so the early return happens before the first barrier. A valid launch
  * writes neither NaN nor status.
@@ -47,15 +47,14 @@
 
 #include <stddef.h>
 
+#include "prefill/status.h"
+
 #ifdef __cplusplus
 extern "C" {
 #endif
 
 #define INFERENCE_CUDA_PREP_APPEND_FP16 0
 #define INFERENCE_CUDA_PREP_ROWS_OUT 1
-/* Bit 8 of the prefill status word (decision 0049 item 10): a prefill chunk fault, a bound
- * violation here. It maps to Backend with operation "prefill_chunk". */
-#define INFERENCE_CUDA_PREFILL_STATUS_BOUND_VIOLATION 0x100
 
 typedef struct inference_cuda_attn_prep_chunk_args {
     const void *proj;
@@ -66,7 +65,7 @@ typedef struct inference_cuda_attn_prep_chunk_args {
     float *q;        /* [m][n_head][head_dim] out */
     float *k_rows;   /* ROWS_OUT mode */
     float *v_rows;
-    int *status;     /* optional; bit 8 on a refused launch */
+    int *status;     /* optional; mask 8 on a refused launch */
     int ld;
     int p0;          /* the position of token 0, a launch argument */
     int m;           /* tokens, 1..65535 (grid y) */
@@ -86,7 +85,7 @@ int inference_cuda_attn_prep_chunk_launch(const inference_cuda_attn_prep_chunk_a
 #ifdef INFERENCE_CUDA_FAULT_QUALIFICATION
 /* Qualified fault path (decision 0049 item 2's device re-check): validates every rule of the
  * entry EXCEPT the p0/m bound, then overrides p0 so the bound is violated, so the KERNEL's
- * own device guard (no KV row, NaN q, bit 8) is the code under test. The validating entry
+ * own device guard (no KV row, NaN q, mask 8) is the code under test. The validating entry
  * above can never reach it with bad bounds; this entry changes no rule of that entry. */
 int inference_cuda_attn_prep_chunk_fault_bad_bounds_launch(
     const inference_cuda_attn_prep_chunk_args *args, void *stream, int *out_stage);

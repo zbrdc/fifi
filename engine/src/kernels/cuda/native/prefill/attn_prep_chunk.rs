@@ -21,7 +21,10 @@
 
 #![cfg_attr(
     not(test),
-    expect(dead_code, reason = "staged for the prefill driver (decision 0049)")
+    expect(
+        dead_code,
+        reason = "staged for CPF-7, the prefill driver (decision 0049)"
+    )
 )]
 
 use std::ffi::{c_int, c_void};

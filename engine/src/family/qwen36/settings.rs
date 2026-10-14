@@ -13,7 +13,8 @@ use std::path::{Path, PathBuf};
 /// Vocabulary size of the pinned `tokenizer.json` with its added tokens.
 const TOKENIZER_VOCAB_SIZE: u32 = 248_077;
 /// Positions of the default context limit of the CUDA arm (decision 0046 item 6). The CUDA arm
-/// sizes its F32 cache by the limit, so it keeps 32,768 until it builds the 8-bit cache.
+/// sizes its default F32 cache by the limit, so it keeps 32,768 until the G-KV8 default flip (it
+/// builds the 8-bit cache when `kv_dtype` is `q8`).
 pub(crate) const DEFAULT_CONTEXT_LIMIT: u32 = 32_768;
 /// Positions of the default context limit of the MLX arm: 262,144, the headline of decision 0046
 /// A7. The 8-bit cache holds them in 2.85 GB (10,880 bytes per position with BF16 scales). The
@@ -97,8 +98,9 @@ pub(crate) struct Q36Options {
     /// The form of the attention KV cache (packet KV8-INTEGRATE, decision 0046 A7): `f32`, the
     /// pair of F32 capacity buffers, or `q8`, the 8-bit affine codes with scales and biases of
     /// the activation dtype. The default is `q8` on the MLX arm (the user's decision of
-    /// 2026-10-13 after the A7 rule-4 Mac gate, record Q36-KV8-GATE) and `f32` on the CUDA arm,
-    /// which does not build the 8-bit cache yet. `f32` stays the control on the MLX arm.
+    /// 2026-10-13 after the A7 rule-4 Mac gate, record Q36-KV8-GATE) and `f32` on the CUDA arm
+    /// until the G-KV8 default flip; the CUDA arm builds the 8-bit cache (Int8G32) when the value is
+    /// `q8` (KV8-B). `f32` stays the control on the MLX arm.
     pub(crate) kv_dtype: Option<String>,
     /// Graph capture of the CUDA arm (default false, gate G1 eager); the MLX arm ignores it.
     pub(crate) capture: Option<bool>,
@@ -336,7 +338,7 @@ pub(crate) fn parse_kv_dtype(text: &str) -> Result<KvDtype, EngError> {
 
 /// The cache form of `text`, the raw member value. `None` is the default of the arm: the 8-bit
 /// cache on the MLX arm (decision 0046 A7, gate of record Q36-KV8-GATE) and the F32 cache on the
-/// CUDA arm, which does not build the 8-bit form yet.
+/// CUDA arm until the G-KV8 default flip. An explicit `q8` is valid on both arms.
 pub(crate) fn kv_dtype_of(text: Option<&str>, backend: Backend) -> Result<KvDtype, EngError> {
     match (text, backend) {
         (Some(text), _) => parse_kv_dtype(text),
@@ -387,6 +389,9 @@ pub(crate) struct Q36Settings {
     /// The default is `false`; the MLX arm reads it, admits the model at load, and warms one
     /// program per distinct compiled block, and the CUDA arm records the key as ignored.
     pub(crate) compile: bool,
+    /// The backend these settings were read for. The `prefix_reuse` cap rule applies to the MLX
+    /// arm only.
+    pub(crate) backend: Backend,
     /// The tiered expert mode, or `None` for the plain engine. Never on without the member.
     pub(crate) tiered: Option<TieredSettings>,
     /// The MLX-only keys the CUDA arm ignores (in `Q36Options` order); the start logs one
@@ -611,15 +616,10 @@ impl Q36Settings {
                         options.prefill_session_reserve_bytes,
                     )?;
                     let activation = activation_of(options.activation_dtype.as_deref())?;
+                    // KV8-B B4: unlike main, the arm does NOT refuse `q8` here — the CUDA
+                    // start maps the parsed form onto the step's `KvMode` (F32 to the fp16
+                    // control cache, Q8 to Int8G32) and refuses the Tiled layout there.
                     let kv = kv_dtype_of(options.kv_dtype.as_deref(), Backend::Cuda)?;
-                    if kv == KvDtype::Q8 {
-                        // Decision 0046 A7 puts the 8-bit cache on every backend, but only the
-                        // MLX decoder builds it so far: refuse instead of serving the F32 cache.
-                        return Err(bad(
-                            "kv_dtype q8 is not available on the CUDA arm yet; its cache stays f32"
-                                .into(),
-                        ));
-                    }
                     (None, 0, activation, kv, 0, ignored_mlx_keys_of(options))
                 }
             };
@@ -681,6 +681,7 @@ impl Q36Settings {
                 Backend::Mlx => options.compile.unwrap_or(false),
                 Backend::Cuda => false,
             },
+            backend,
             tiered: tiered_settings(options, backend)?,
             ignored_mlx_keys,
         })
@@ -696,9 +697,11 @@ impl Q36Settings {
     /// 2 * 10,880 * 32,768 + 65,863,680), or a later job fails with `MemoryPlan` although the
     /// same job succeeds with `prefix_reuse` off. Engine start refuses a smaller cap and answers
     /// with the cap, the requirement, the context limit, and the hint `raise session_cap_bytes`.
-    /// With the flag off the rule does not apply.
+    /// With the flag off the rule does not apply. It does not apply to the CUDA arm either: that
+    /// arm ignores `session_cap_bytes` (the value is 0), and its entry lives in host RAM bounded
+    /// by `context_limit` (decision 0036, addendum 2, CUDA arm).
     pub(crate) fn check_prefix_reuse_cap(&self, prefix_reuse: bool) -> Result<(), EngError> {
-        if !prefix_reuse {
+        if !prefix_reuse || self.backend == Backend::Cuda {
             return Ok(());
         }
         let growth = cache_growth_per_position(&QWEN3_6_35B_A3B, self.kv, self.activation)?;
@@ -943,6 +946,37 @@ mod tests {
         );
     }
 
+    /// The CUDA arm has no session cap (it is 0 and ignored), so the rule must not refuse it: a
+    /// CUDA start with the flag on passes at the default limit of 32,768 and at 40,960, the limit
+    /// that the 33,650-token pi transcript of the 3090 gate needs. A cap of 1 byte on the MLX arm
+    /// is refused, which shows that the backend alone decides.
+    #[test]
+    fn the_prefix_reuse_cap_rule_does_not_apply_to_the_cuda_arm() {
+        for limit in [DEFAULT_CONTEXT_LIMIT, 40_960] {
+            let options = Q36Options {
+                context_limit: Some(limit),
+                ..Q36Options::default()
+            };
+            let cuda = settings_for(Some(&options), &Q36Env::default(), Backend::Cuda).unwrap();
+            assert_eq!(cuda.session_cap, 0, "the CUDA arm has no session cap");
+            assert_eq!(
+                cuda.check_prefix_reuse_cap(true),
+                Ok(()),
+                "CUDA, context limit {limit}"
+            );
+        }
+        let mlx_options = Q36Options {
+            cache_limit_bytes: Some(1024),
+            session_cap_bytes: Some(1),
+            ..Q36Options::default()
+        };
+        let mlx = settings(Some(&mlx_options), &Q36Env::default()).unwrap();
+        assert!(
+            mlx.check_prefix_reuse_cap(true).is_err(),
+            "the MLX arm still refuses a cap of 1 byte"
+        );
+    }
+
     /// Without the flag the rule does not apply, whatever the cap is.
     #[test]
     fn the_prefix_reuse_cap_rule_is_off_when_the_flag_is_off() {
@@ -975,6 +1009,7 @@ mod tests {
                 kv: super::KvDtype::Q8,
                 capture: false,
                 compile: false,
+                backend: Backend::Mlx,
                 tiered: None,
                 ignored_mlx_keys: Vec::new(),
             }
@@ -1459,7 +1494,7 @@ mod tests {
     /// Packet KV8-INTEGRATE item 1: `kv_dtype` parses `f32` and `q8`, reads from JSON, and refuses
     /// any other text in the style of its neighbors. The default is `q8` on the MLX arm (the
     /// user's decision of 2026-10-13 after the gate of record Q36-KV8-GATE; the F32 control stays
-    /// one member away) and `f32` on the CUDA arm, which does not build the 8-bit cache yet.
+    /// one member away) and `f32` on the CUDA arm (the default flips to q8 only after G-KV8).
     #[test]
     fn kv_dtype_parses_f32_and_q8_and_the_default_is_q8_on_mlx_and_f32_on_cuda() {
         for (text, want) in [("f32", super::KvDtype::F32), ("q8", super::KvDtype::Q8)] {
@@ -1494,7 +1529,7 @@ mod tests {
         assert_eq!(
             kv_dtype_of(Some("q8"), Backend::Cuda).unwrap(),
             super::KvDtype::Q8,
-            "parsing does not decide availability; the CUDA arm refuses q8 in its settings"
+            "parsing does not decide availability; the CUDA start maps q8 onto Int8G32 (KV8-B B4)"
         );
         assert_eq!(kv_dtype_name(super::KvDtype::F32), "f32");
         assert_eq!(kv_dtype_name(super::KvDtype::Q8), "q8");
@@ -1517,6 +1552,23 @@ mod tests {
                 "the text {text:?}"
             );
         }
+    }
+
+    /// KV8-B B4-F: the CUDA arm refuses an unknown `kv_dtype` text at its own arm too.
+    #[test]
+    fn the_cuda_arm_refuses_an_unknown_kv_dtype_text_at_its_own_member() {
+        let options = Q36Options {
+            kv_dtype: Some("int8".to_string()),
+            ..with_limit()
+        };
+        assert_eq!(
+            message(settings_for(
+                Some(&options),
+                &Q36Env::default(),
+                Backend::Cuda
+            )),
+            "engine config: kv_dtype must be f32 or q8, got \"int8\"",
+        );
     }
 
     #[test]
@@ -1611,11 +1663,16 @@ mod tests {
     }
 
     #[test]
-    fn the_cuda_arm_refuses_the_8_bit_cache_it_cannot_build_and_takes_f32() {
+    fn the_cuda_arm_parses_the_8_bit_form_and_the_start_maps_it() {
+        // KV8-B B4 (merged with main): the CUDA arm no longer refuses `q8` at the settings —
+        // the start maps the parsed form onto the step's `KvMode` (F32 to the fp16 control
+        // cache, Q8 to Int8G32) and refuses the Tiled layout there.
         let q8: Q36Options = serde_json::from_str("{\"kv_dtype\": \"q8\"}").unwrap();
         assert_eq!(
-            message(settings_for(Some(&q8), &Q36Env::default(), Backend::Cuda)),
-            "engine config: kv_dtype q8 is not available on the CUDA arm yet; its cache stays f32"
+            settings_for(Some(&q8), &Q36Env::default(), Backend::Cuda)
+                .expect("the CUDA arm parses the 8-bit form")
+                .kv,
+            super::KvDtype::Q8
         );
         let f32_form: Q36Options = serde_json::from_str("{\"kv_dtype\": \"f32\"}").unwrap();
         let got = settings_for(Some(&f32_form), &Q36Env::default(), Backend::Cuda).unwrap();

@@ -289,7 +289,7 @@ impl ResidentState {
     /// `prefill_status` is the prefill status word the caller read after joining every other
     /// stream into `stream`; non-zero poisons. This call waits for `stream` itself, so the
     /// chunk's writes have finished; a failed wait poisons. A start block is owed afterwards.
-    #[expect(dead_code, reason = "first caller: prefill (0049)")]
+    #[cfg_attr(not(test), expect(dead_code, reason = "first caller: prefill (0049)"))]
     pub(crate) fn revalidate(
         &mut self,
         stream: &DeviceStream,
@@ -299,6 +299,51 @@ impl ResidentState {
         self.book.begin_revalidate(stream.id())?;
         stream.synchronize().inspect_err(|_| self.book.poison())?;
         self.book.revalidate(tokens, prefill_status)
+    }
+
+    /// Zeroes the prefill status word (decision 0049 item 10): a 4-byte `write_at` of
+    /// `Word::PrefillStatus`, ordered on `stream` behind the work already queued there. Called
+    /// at chunk open, right after `begin_prefill`: the stream is drained at a chunk boundary
+    /// (the previous chunk ended with its status read), so the write queues behind nothing, and
+    /// a bit left by an earlier chunk cannot fail this one. Blocking like every `write_at` of
+    /// this type. A failed write leaves the state `PrefillOpen`, not poisoned: an open chunk
+    /// already refuses decode, commit, export and a new `begin_prefill`, `reset` accepts any
+    /// health, and the driver poisons on any error of the chunk body (§C.4 step 2).
+    #[cfg_attr(
+        not(test),
+        expect(
+            dead_code,
+            reason = "first caller: the CPF-7 prefill driver (decision 0049)"
+        )
+    )]
+    pub(crate) fn clear_prefill_status(&self, stream: &DeviceStream) -> Result<(), EngError> {
+        self.book
+            .begin_prefill_word(stream.id(), "clear_prefill_status")?;
+        self.words
+            .write_at(stream, Word::PrefillStatus.offset(), &[0u8; 4])
+    }
+
+    /// Reads the prefill status word after the chunk's work, once per chunk, at chunk close:
+    /// one ordered 4-byte D2H on `stream` (`read_at` queues the copy behind the chunk's
+    /// launches and waits for the stream, the sync pattern of every host copy of this type),
+    /// after joining every other stream into `stream`, as `revalidate` requires of its caller.
+    /// The value goes to `revalidate` as `prefill_status`, which maps it (`status_error`,
+    /// precedence 4 > 8 > 1 > 2). A failed read leaves the state `PrefillOpen`, not poisoned,
+    /// for the same reasons as a failed clear.
+    #[cfg_attr(
+        not(test),
+        expect(
+            dead_code,
+            reason = "first caller: the CPF-7 prefill driver (decision 0049)"
+        )
+    )]
+    pub(crate) fn read_prefill_status(&self, stream: &DeviceStream) -> Result<i32, EngError> {
+        self.book
+            .begin_prefill_word(stream.id(), "read_prefill_status")?;
+        let mut word = [0u8; 4];
+        self.words
+            .read_at(stream, Word::PrefillStatus.offset(), &mut word)?;
+        Ok(i32::from_le_bytes(word))
     }
 
     /// Writes the start block of a step chain (`StepParams::new(token, pos)`), ordered on
@@ -327,6 +372,14 @@ impl ResidentState {
 
     /// Zeroes every DeltaNet slot and the words in place, ordered on `stream`, and forgets the KV
     /// positions and the pending steps (the copies run behind all work queued on the stream).
+    ///
+    /// Reset invariant under Int8G32 (KV8-B, design item 5): a reset leaves the STALE codes and
+    /// scales in every cell >= the new kv_len — nothing rewrites or clears them. That is
+    /// correct only because `attn_decode_q8` reads cells `[0, kv_len)` and every cell it does
+    /// read was appended in the CURRENT session before it is read: `pos` restarts at 0 after
+    /// the reset, so the decode at position p (kv_len = p + 1) reads exactly the cells the
+    /// tokens 0..=p of this session appended. The step device test of B5 pins it: 64 tokens of
+    /// a foreign prompt, a reset, then P5 is bitwise a fresh session's P5.
     pub(crate) fn reset(&mut self, stream: &DeviceStream) -> Result<(), EngError> {
         self.book.begin_reset(stream.id())?;
         self.clear_delta(stream, 0)?;

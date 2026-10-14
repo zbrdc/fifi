@@ -18,7 +18,10 @@
 
 #![cfg_attr(
     not(test),
-    expect(dead_code, reason = "staged for the prefill driver (decision 0049)")
+    expect(
+        dead_code,
+        reason = "staged for CPF-7, the prefill driver (decision 0049)"
+    )
 )]
 
 use std::ffi::{c_int, c_void};
@@ -183,8 +186,8 @@ fn needs(io: &AttnPrefillRaw<'_>) -> Result<Needs, DeviceFailure> {
     })
 }
 
-/// Proves a launch before the native call: sizes and alignment of every range (q, the caches
-/// and part 16-byte; proj, out and the status word 4-byte) and that `out` and `part`, which
+/// Proves a launch before the native call: sizes and alignment of every range (q, the caches,
+/// part and out 16-byte; proj and the status word 4-byte) and that `out` and `part`, which
 /// the kernels write, share no byte with any other range of the call.
 fn check_attn(io: &AttnPrefillRaw<'_>) -> Result<(), DeviceFailure> {
     let need = needs(io)?;
@@ -286,7 +289,7 @@ pub(in crate::kernels::cuda) fn attn_prefill_launch(
 }
 
 /// Queues the same two kernels with a deliberately violated p0 bound, so the kernels' own
-/// device re-checks (decision 0049 item 2: no partial, NaN out, bit 8) are the code under
+/// device re-checks (decision 0049 item 2: no partial, NaN out, mask 8) are the code under
 /// test; every other rule of the call holds. Qualified fault path only.
 #[cfg(all(test, feature = "cuda-fault-qualification"))]
 pub(in crate::kernels::cuda) fn attn_prefill_fault_bad_bounds(

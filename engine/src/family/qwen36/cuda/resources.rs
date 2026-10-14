@@ -233,7 +233,7 @@ impl StepResources {
         options: &StepOptions,
     ) -> Result<Self, EngError> {
         check_stage1_options(options)?;
-        let scratch = KernelScratch::for_dims(&dims, STEP_ROWS)?;
+        let scratch = KernelScratch::for_dims(&dims, STEP_ROWS, options.kv_mode)?;
         let plan = StepPlan::new(&dims, STEP_ROWS, options, &scratch)?;
         let arena = context.arena(&plan.arena_tensors())?;
         let table = LayerTable::new(&dims, inventory)?;

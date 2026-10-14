@@ -10,10 +10,15 @@
 //! `ceil(m/q_tile) * q_tile * n_kv_head * max_splits * G * (2 + head_dim) * 4` with the rows
 //! rounded up to the tile.
 //!
-//! The plan is independent of `kv_len`: the buffer serves the whole launch grid, and the
-//! kernels write only the splits the key count activates (the device split rule reduces
-//! `max_splits`, it never raises it). That is the no-N-squared property of decision 0049 —
-//! a deeper context never grows this workspace — and the sizing tests pin it.
+//! Two plans. [`cpf_attn_split_plan`] sizes `s_A`, the minimum split count, and is
+//! independent of `kv_len` (the kernels write only the splits the key count activates; the
+//! device split rule reduces `max_splits`, it never raises it). [`cpf_attn_launch_plan`] is
+//! the only plan the driver calls, for the grid and the launched bytes: it starts from `s_A`
+//! and, at depth, raises the split count to fill whole waves of the SMs, never past the part
+//! cap. So the launched bytes grow with `kv_len`, up to [`CPF_ATTN_PART_CAP`], while the
+//! allocation does not: the driver allocates `part` at the flat cap, which admission already
+//! charges in every row (decision 0049 item 9). That keeps the no-N-squared property of
+//! decision 0049 — a deeper context never grows the workspace — and the sizing tests pin it.
 //!
 //! Arithmetic is checked throughout: an overflowing product is a `BadRequest` (the pattern of
 //! `resident::attn_decode::attn_part_bytes`), and a plan whose partials do not fit
@@ -21,7 +26,10 @@
 //! the budget and must shrink (decision 0049 item 9; the driver owns admission).
 #![cfg_attr(
     not(test),
-    expect(dead_code, reason = "staged for the prefill driver (decision 0049)")
+    expect(
+        dead_code,
+        reason = "staged for CPF-7, the prefill driver (decision 0049)"
+    )
 )]
 
 use std::ffi::c_int;
@@ -54,9 +62,14 @@ pub(crate) const CPF_ATTN_MIN_KEYS: usize = 256;
 pub(crate) const CPF_ATTN_MAX_SPLITS: usize = 128;
 /// The SM count the five-argument sizing form binds: the 3090's 82 SMs.
 pub(crate) const CPF_ATTN_SM_COUNT: usize = 82;
-/// The block target of the plan: two blocks per SM (`2 x 82` on the 3090, the "below 2 x 82"
-/// rule of design section 3.7).
+/// The block target of the split plan: a 164-block target of design section 3.7 (`2 x 82` on
+/// the 3090). It is a block count, not an occupancy: the part kernel runs one block per SM
+/// ([`CPF_ATTN_BLOCKS_PER_SM`]).
 pub(crate) const CPF_ATTN_SM_TARGET: usize = 2 * CPF_ATTN_SM_COUNT;
+/// Blocks of the part kernel resident on one SM at once: its 96 KB of shared memory and its
+/// 512 threads at 128 registers (the whole register file) each allow one. The launch plan
+/// counts waves in these slots.
+pub(crate) const CPF_ATTN_BLOCKS_PER_SM: usize = 1;
 /// The KV-split partial budget of decision 0049 item 9: 64 MiB, charged flat in every
 /// admission row. The plan-sized bytes never exceed it (the plan reduces its splits to fit).
 pub(crate) const CPF_ATTN_PART_CAP: usize = 64 * 1024 * 1024;
@@ -112,17 +125,17 @@ fn tiles(m: usize, q_tile: usize) -> Result<usize, EngError> {
     Ok(m.div_ceil(q_tile))
 }
 
-/// The split plan of one call. `max_splits` fills the block target ([`CPF_ATTN_SM_TARGET`]
-/// from `sm_count`) after the `q_tiles * n_kv_head` base grid, then shrinks until the
-/// partial bytes fit [`CPF_ATTN_PART_CAP`]; the floor is one split, and a chunk whose
-/// partials do not fit at one split is a `MemoryPlan` refusal.
+/// The split plan of one call: it sizes `s_A`, the minimum split count, not the launch
+/// ([`cpf_attn_launch_plan`] starts from it). `max_splits` fills the block target
+/// ([`CPF_ATTN_SM_TARGET`] from `sm_count`) after the `q_tiles * n_kv_head` base grid, then
+/// shrinks until the partial bytes fit [`CPF_ATTN_PART_CAP`]; the floor is one split, and a
+/// chunk whose partials do not fit at one split is a `MemoryPlan` refusal.
 ///
-/// `kv_len` (the keys visible to the chunk's last row, `p0 + m`) fixes no part of the plan:
-/// the buffer serves every split of the grid and the kernels keep only the splits the key
-/// count activates, so the plan — and the workspace it sizes — is independent of `kv_len`.
-/// That is the no-N-squared rule the tests pin; the argument stays (named `_kv_len`, since
-/// no line of this function reads it) so the signature names the launch geometry the plan
-/// belongs to.
+/// `kv_len` (the keys visible to the chunk's last row, `p0 + m`) fixes no part of this plan,
+/// so `s_A` — and the workspace [`cpf_attn_workspace_bytes`] sizes from it — is independent
+/// of `kv_len`. That is the no-N-squared rule the tests pin; the argument stays (named
+/// `_kv_len`, since no line of this function reads it) so the signature names the launch
+/// geometry the plan belongs to.
 pub(crate) fn cpf_attn_split_plan(
     geometry: CpfAttnGeometry,
     _kv_len: usize,
@@ -184,11 +197,13 @@ pub(crate) fn cpf_attn_part_bytes(
         .ok_or_else(|| rule("size overflow", "the part scratch size overflows"))
 }
 
-/// Bytes of the whole attention workspace of one chunk on the default device (the 3090's
+/// Bytes of the split plan's workspace of one chunk on the default device (the 3090's
 /// [`CPF_ATTN_SM_COUNT`] SMs): the composition of [`cpf_attn_split_plan`] and
-/// [`cpf_attn_part_bytes`]. `heads` is the geometry pair `(n_head, n_kv_head)` — the partial
-/// cell is `G` heads wide, so both head counts enter — and `kv_len` is the keys the chunk
-/// attends; the bytes do not depend on it.
+/// [`cpf_attn_part_bytes`], so the bytes of `s_A` splits. `heads` is the geometry pair
+/// `(n_head, n_kv_head)` — the partial cell is `G` heads wide, so both head counts enter —
+/// and `kv_len` is the keys the chunk attends; the bytes do not depend on it. The launch
+/// plan may launch more splits at depth; the driver allocates `part` at the flat
+/// [`CPF_ATTN_PART_CAP`], which bounds both.
 pub(crate) fn cpf_attn_workspace_bytes(
     chunk: usize,
     heads: (usize, usize),
@@ -219,10 +234,109 @@ pub(crate) fn cpf_attn_workspace_bytes_for_sm(
     cpf_attn_part_bytes(geometry, plan)
 }
 
+/// The launch plan of one call: the only plan function the driver calls, for the grid and
+/// the launched bytes (`cpf_attn_part_bytes` of this plan, at most [`CPF_ATTN_PART_CAP`];
+/// the driver allocates `part` at the cap). `kv_len` is `p0 + m`; `window` is the span's
+/// window (0: all keys).
+///
+/// It starts from `s_A` ([`cpf_attn_split_plan`]). At depth, where every query tile has keys
+/// for more splits, it takes the split count in `s_A + 1 ..= s_cap` whose `q_tiles * n_kv_head
+/// * s` blocks fill whole waves of `sm_count * CPF_ATTN_BLOCKS_PER_SM` slots best (ties go to
+/// the smaller count). `s_cap` is 128 walked down to the most splits whose partials fit the
+/// cap; the `ceil(c_min / 256)` bound — `c_min` the fewest keys of any tile, from the
+/// device's union-of-windows rule — is implied by full activation and debug-asserted, not
+/// enforced. A count above `s_A` is taken only when every tile activates
+/// all its splits under the device split rule, so the blocks carry equal work. Equality of
+/// this plan and the launch's `max_splits` is the caller's contract.
+///
+/// Refusals: those of the split plan; `kv_len < m` (`attn_prefill: kv_len`); an `sm_count`
+/// of 0 (`attn_prefill: sm_count`).
+pub(crate) fn cpf_attn_launch_plan(
+    geometry: CpfAttnGeometry,
+    kv_len: usize,
+    window: usize,
+    sm_count: usize,
+) -> Result<CpfAttnPlan, EngError> {
+    let least = cpf_attn_split_plan(geometry, kv_len, CPF_ATTN_Q_TILE, sm_count)?;
+    let p0 = kv_len.checked_sub(geometry.m).ok_or_else(|| {
+        rule(
+            "kv_len",
+            &format!("kv_len {kv_len} is below the chunk's {} rows", geometry.m),
+        )
+    })?;
+    if sm_count == 0 {
+        return Err(rule("sm_count", "sm_count is 0"));
+    }
+    let c_min = tile_key_counts(geometry.m, p0, window).min().unwrap_or(0);
+    let mut s_cap = CPF_ATTN_MAX_SPLITS;
+    while s_cap > least.max_splits
+        && cpf_attn_part_bytes(
+            geometry,
+            CpfAttnPlan {
+                max_splits: s_cap,
+                ..least
+            },
+        )? > CPF_ATTN_PART_CAP
+    {
+        s_cap -= 1;
+    }
+    let base = geometry
+        .m
+        .div_ceil(CPF_ATTN_Q_TILE)
+        .saturating_mul(geometry.n_kv_head);
+    let slots = sm_count.saturating_mul(CPF_ATTN_BLOCKS_PER_SM);
+    let waves = |s: usize| base.saturating_mul(s).div_ceil(slots);
+    let mut best = least.max_splits;
+    for s in least.max_splits + 1..=s_cap {
+        let all_active = tile_key_counts(geometry.m, p0, window)
+            .all(|count| active_splits(count, s, CPF_ATTN_MIN_KEYS) == s);
+        // Efficiency is s / waves(s) up to the common factor base / slots: compare the
+        // fractions exactly, and keep the smaller count on a tie.
+        if all_active && s.saturating_mul(waves(best)) > best.saturating_mul(waves(s)) {
+            best = s;
+        }
+    }
+    // Full activation of every tile at min_keys CPF_ATTN_MIN_KEYS implies s <= ceil(c_min /
+    // min_keys), so no explicit bound on s is needed (pinned over the whole domain by a test).
+    debug_assert!(best == least.max_splits || best <= c_min.div_ceil(CPF_ATTN_MIN_KEYS));
+    Ok(CpfAttnPlan {
+        max_splits: best,
+        ..least
+    })
+}
+
+/// Keys of each query tile of a chunk of `m` rows at `p0`: the union of its rows' windows,
+/// the device's `visible` rule (from the first row's oldest visible position to the last
+/// row's own).
+fn tile_key_counts(m: usize, p0: usize, window: usize) -> impl Iterator<Item = usize> {
+    (0..m.div_ceil(CPF_ATTN_Q_TILE)).map(move |tile| {
+        let t0 = tile * CPF_ATTN_Q_TILE;
+        let n_keys = p0 + m.min(t0 + CPF_ATTN_Q_TILE);
+        let first = if window > 0 {
+            (p0 + t0 + 1).saturating_sub(window)
+        } else {
+            0
+        };
+        n_keys - first
+    })
+}
+
+/// Splits that hold keys for a tile of `count` keys under the device split rule
+/// (`split_plan` of attn_prefill.cu, attn_decode's verbatim).
+fn active_splits(count: usize, max_splits: usize, min_keys: usize) -> usize {
+    let n_split = count.div_ceil(min_keys).clamp(1, max_splits);
+    let chunk = count
+        .div_ceil(n_split)
+        .div_ceil(CPF_ATTN_TILE_KEYS)
+        .saturating_mul(CPF_ATTN_TILE_KEYS);
+    count.div_ceil(chunk)
+}
+
 // ---- the safe wrapper (CPF-ATTN-A C7) -----------------------------------------------------
 
 /// The span rules of a call, `attn_decode`'s [`AttnSpan`] (window 0 is all positions, else the
-/// last `window`; ring 0 is a linear cache, else position p lives in row `p % ring`).
+/// last `window`; ring 0 is a linear cache, else position p lives in row `p % ring`). A ring
+/// cache still spans `cache_rows >= p0 + m` rows: the bound rule is linear.
 pub(crate) type CpfAttnSpan = crate::kernels::cuda::resident::attn_decode::AttnSpan;
 
 /// The split plan of a call, `attn_decode`'s [`AttnSplit`] type with the prefill plan's
@@ -253,11 +367,12 @@ pub(crate) struct AttnPrefillShape {
 /// - `proj`: none (no output gate) or f32 `[m][ld]` with `ld >= n_head * 2 * head_dim`; head
 ///   `h`'s gate is at column `h * 2 * head_dim + head_dim + d`.
 /// - `k_cache`, `v_cache`: fp16 `[cache_rows][n_kv_head][head_dim]`, 16-byte aligned.
-/// - `part`: f32 scratch of [`cpf_attn_part_bytes`] bytes (the plan's), 16-byte aligned, no
-///   initialization needed; only the active splits are written.
+/// - `part`: f32 scratch of [`cpf_attn_part_bytes`] bytes of the call's split (the launch
+///   plan's, [`cpf_attn_launch_plan`]; the driver allocates the flat [`CPF_ATTN_PART_CAP`]),
+///   16-byte aligned, no initialization needed; only the active splits are written.
 /// - `out`: f32 `[m][n_head * head_dim]`, 16-byte aligned; NaN on a refused launch.
 /// - `status`: `None`, or one device `i32` — the prefill status word of decision 0049 item 10
-///   — that receives bit 8 on a refused launch and is untouched by a valid one.
+///   — that receives mask 8 on a refused launch and is untouched by a valid one.
 /// - `q_tile`: the compiled tile; only 8 runs (lane C ruling 5).
 /// - `scale`: multiplies the scores, finite and in `(0, 1e30)`; `1/sqrt(256) = 0.0625`.
 pub(crate) struct AttnPrefillCall<'b> {
@@ -389,7 +504,11 @@ fn check_span_split(call: &AttnPrefillCall<'_>) -> Result<(), EngError> {
         if span.ring > rows {
             return Err(rule("ring", "ring is above cache_rows"));
         }
-        if span.ring < span.window + tokens_after {
+        if span
+            .window
+            .checked_add(tokens_after)
+            .is_none_or(|need| span.ring < need)
+        {
             return Err(rule("ring", "ring is below window + m - 1"));
         }
     }
@@ -489,12 +608,14 @@ fn check_apart(call: &AttnPrefillCall<'_>, need: &Needs) -> Result<(), EngError>
 
 impl CudaContext {
     /// Queues the chunked-prefill attention of `call` on `stream`: the part kernel (one
-    /// partial per query row per active split), then the combine (fixed order, the sigmoid
+    /// partial per query row per active split; on sm_80 and later the head_dim-quarter
+    /// kernel, 512 threads, one block per SM), then the combine (fixed order, the sigmoid
     /// output gate when `proj` is given). Returns when both are queued; the output is valid
-    /// after the stream drained.
+    /// after the stream drained. The split is the caller's: the driver passes the launch
+    /// plan's ([`cpf_attn_launch_plan`]).
     ///
     /// A `p0` outside `0..=cache_rows - m` is refused here (and by the C entry, and
-    /// re-checked on the device, where it writes no partial, NaN `out` and bit 8 of the
+    /// re-checked on the device, where it writes no partial, NaN `out` and mask 8 of the
     /// optional status word). A chunk whose partials exceed the 64 MiB budget at the call's
     /// own split count is a `MemoryPlan` refusal: shrink the chunk.
     ///

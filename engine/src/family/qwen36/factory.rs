@@ -5,7 +5,7 @@
 //! same `StartedEngine`. The server start-up code (`server/run.rs`) calls it for the entries of
 //! this family with the process-wide `prefix_reuse` flag of the configuration file. Order of
 //! checks: the settings (`settings.rs`), the `prefix_reuse` session-cap rule when the flag is on
-//! (`Q36Settings::check_prefix_reuse_cap`), then the backend. A build with neither `native-mlx`
+//! and the arm is MLX (`Q36Settings::check_prefix_reuse_cap`), then the backend. A build with neither `native-mlx`
 //! on Apple Silicon nor `native-cuda` on Linux stops at the backend check with a clear error
 //! naming both features and never touches a file. Q36 results never satisfy Phase 0B or Phase
 //! 1B.
@@ -24,8 +24,9 @@ pub(crate) const FAMILY: &str = QWEN3_6_35B_A3B.name;
 
 /// Starts the engine of one config entry. Reads `Q36_CACHE_LIMIT` as a fallback. The engine state
 /// is `Loading` until the weights are resident. `prefix_reuse` is the process-wide flag of the
-/// configuration file: when it is on, the session cap must cover the entry and the live session
-/// together (`Q36Settings::check_prefix_reuse_cap`).
+/// configuration file: when it is on, the MLX arm needs a session cap that covers the entry and
+/// the live session together (`Q36Settings::check_prefix_reuse_cap`). The CUDA arm keeps its
+/// entry in host RAM and has no such rule.
 pub(crate) fn start_engine(
     model_dir: &Path,
     tokenizer_dir: &Path,
@@ -36,15 +37,6 @@ pub(crate) fn start_engine(
         cache_limit: std::env::var("Q36_CACHE_LIMIT").ok(),
     };
     start_engine_with(model_dir, tokenizer_dir, options, &env, prefix_reuse)
-}
-
-/// Whether this build's Q36 arm supports `prefix_reuse`: the MLX arm does; the CUDA arm gets
-/// it in CUDA-SERVE-2, so the server refuses a Q36 entry with the flag on there. A build with
-/// NO Q36 backend answers `true` on purpose (KUBDAN-MSG-71 item 3): its entries cannot start
-/// at all, and the factory's own refusal ("this build has no Q36 backend") names the real
-/// fault, so the server's CUDA-specific text must not shadow it.
-pub(crate) fn prefix_reuse_supported() -> bool {
-    !cfg!(all(feature = "native-cuda", target_os = "linux"))
 }
 
 /// The backend the settings read; a build with neither backend keeps the MLX reading.
@@ -139,8 +131,8 @@ mod tests {
         }
     }
 
-    // The CUDA arm ignores `session_cap_bytes` (an MLX-only key) and refuses `prefix_reuse` in the
-    // server pre-pass, so the cap rule has no CUDA premise.
+    // The CUDA arm ignores `session_cap_bytes` (an MLX-only key), so the cap rule has no CUDA
+    // premise (decision 0036, addendum 2, CUDA arm).
     #[cfg(not(all(feature = "native-cuda", target_os = "linux")))]
     #[test]
     fn a_prefix_reuse_entry_below_the_required_session_cap_is_refused_with_the_numbers_and_the_hint()
@@ -162,8 +154,8 @@ mod tests {
         );
     }
 
-    // The CUDA arm ignores `session_cap_bytes` (an MLX-only key) and refuses `prefix_reuse` in the
-    // server pre-pass, so the cap rule has no CUDA premise.
+    // The CUDA arm ignores `session_cap_bytes` (an MLX-only key), so the cap rule has no CUDA
+    // premise (decision 0036, addendum 2, CUDA arm).
     #[cfg(not(all(feature = "native-cuda", target_os = "linux")))]
     #[test]
     fn a_prefix_reuse_entry_at_the_required_session_cap_passes_the_rule() {

@@ -16,7 +16,8 @@ fn the_router_scratch_comes_from_the_router_wrapper() {
         layout: crate::family::project::cuda::WeightLayout::Tiled,
     };
     for (rows, bytes) in [(1, 1_028), (8, 8_224)] {
-        let scratch = KernelScratch::for_dims(&d, rows).expect("scratch");
+        let scratch =
+            KernelScratch::for_dims(&d, rows, super::dims::KvMode::Fp16).expect("scratch");
         let plan = StepPlan::new(&d, rows, &options, &scratch).expect("plan");
         let at = plan.index(Slot::RouterLogits).expect("router logits");
         assert_eq!(plan.tensors()[at].bytes, bytes, "{rows} rows");

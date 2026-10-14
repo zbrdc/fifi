@@ -40,6 +40,7 @@ fn plan(rows: usize) -> StepPlan {
         &dims,
         rows,
         router_logits_bytes(router).expect("router bytes"),
+        KvMode::Fp16,
     )
     .expect("scratch");
     let options = StepOptions {
@@ -62,8 +63,13 @@ fn plan_of(layout: WeightLayout) -> StepPlan {
         n_expert: dims.shape.moe.experts,
         top_k: dims.shape.moe.top_k,
     };
-    let scratch = KernelScratch::new(&dims, 1, router_logits_bytes(router).expect("router bytes"))
-        .expect("scratch");
+    let scratch = KernelScratch::new(
+        &dims,
+        1,
+        router_logits_bytes(router).expect("router bytes"),
+        KvMode::Fp16,
+    )
+    .expect("scratch");
     let options = StepOptions {
         kv_mode: KvMode::Fp16,
         context_tokens: 8,

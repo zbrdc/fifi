@@ -3,6 +3,7 @@
 //! CPU only.
 use super::{
     common_tests::{dims, plan},
+    dims::KvMode,
     mixer_geometry::MixerGeometry,
     mixer_ops::{BlockOp, block_ops},
     state::StepField,
@@ -13,7 +14,7 @@ use crate::family::{AttentionKind, gguf_model::Role};
 
 fn ops_of(kind: AttentionKind) -> Vec<BlockOp> {
     let g = MixerGeometry::new(&dims()).expect("geometry");
-    block_ops(kind, &g, crate::family::project::cuda::WeightLayout::Tiled).expect("ops")
+    block_ops(kind, &g, WeightLayout::Tiled, KvMode::Fp16).expect("ops")
 }
 
 fn kinds() -> Vec<AttentionKind> {
@@ -417,7 +418,7 @@ fn the_attention_pack_op_reads_the_query_width_of_the_packet() {
 #[test]
 fn a_kind_without_a_block_is_refused() {
     let g = MixerGeometry::new(&dims()).expect("geometry");
-    assert!(block_ops(AttentionKind::Qsa, &g, WeightLayout::Tiled).is_err());
+    assert!(block_ops(AttentionKind::Qsa, &g, WeightLayout::Tiled, KvMode::Fp16).is_err());
     // The Native lists carry the same refusal: no kind without a resident mixer.
-    assert!(block_ops(AttentionKind::Qsa, &g, WeightLayout::Native).is_err());
+    assert!(block_ops(AttentionKind::Qsa, &g, WeightLayout::Native, KvMode::Fp16).is_err());
 }

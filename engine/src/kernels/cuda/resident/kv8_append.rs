@@ -23,10 +23,6 @@
 //! would latch the backend). Local rules carry the tag `kv8_append: <rule>` or
 //! `kv8_chunk: <rule>`; size, alignment and overlap are refused by `require_fit` and
 //! `require_apart` with their own texts.
-#![cfg_attr(
-    not(test),
-    expect(dead_code, reason = "staged for phase B (decision 0047 item 6)")
-)]
 
 use std::ffi::c_int;
 
@@ -266,6 +262,13 @@ impl CudaContext {
     /// Returns `BadRequest`, before any native call and with the backend unchanged, for a
     /// `pos0` that does not leave `rows` cells, and every refusal of [`Self::kv8_append`] that
     /// does not concern the device words.
+    #[cfg_attr(
+        not(test),
+        expect(
+            dead_code,
+            reason = "staged for CPF-7: the Int8G32 chunk prefill of the rows handoff of CPF-ATTN-A"
+        )
+    )]
     pub(crate) fn kv8_chunk(
         &self,
         stream: &DeviceStream,

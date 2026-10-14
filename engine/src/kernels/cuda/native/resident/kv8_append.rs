@@ -19,7 +19,10 @@
 
 #![cfg_attr(
     not(test),
-    expect(dead_code, reason = "staged for phase B (decision 0047 item 6)")
+    expect(
+        dead_code,
+        reason = "the chunk entry is staged for CPF-7, the Int8G32 chunk prefill (decision 0047 item 6)"
+    )
 )]
 
 use std::ffi::{c_int, c_void};

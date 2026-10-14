@@ -1,5 +1,6 @@
 //! Unit tests of `StateBook` (test seam U13, approved by the user 2026-10-10). CPU only.
 use super::book::{Admitted, CommitRefusal, Health, StartRefusal, StateBook, status_error};
+use crate::kernels::cuda::PREFILL_STATUS_BOUND_VIOLATION;
 use crate::kernels::cuda::resident::step_params::MAX_ADVANCE;
 use crate::kernels::cuda::resident::step_params::StepParams;
 
@@ -136,6 +137,34 @@ fn a_status_refusal_keeps_the_class_and_the_precedence_of_the_wrapper() {
     ));
 }
 
+/// The kernels' prefill mask — [`PREFILL_STATUS_BOUND_VIOLATION`], the one Rust mirror of
+/// `prefill/status.h` — maps through `status_error` the way mask 8 must: alone it is a
+/// `prefill_chunk` fault, it beats mask 1, and mask 4 beats it (decision 0049 item 10, lane
+/// C ruling 2026-10-14: "bit 8" in the plan and decision text means mask 8). Without this
+/// pin a kernel writing 0x100 would read back as `step_status`, and 0x101 as `route_experts`.
+#[test]
+fn the_kernels_prefill_mask_maps_to_prefill_chunk() {
+    let class = |status: i32| match status_error(status) {
+        crate::EngError::Backend { operation, .. } => operation,
+        other => panic!("not a Backend error: {other:?}"),
+    };
+    assert_eq!(
+        class(PREFILL_STATUS_BOUND_VIOLATION),
+        "prefill_chunk",
+        "mask 8 (0x8) of the prefill status word is a prefill chunk fault"
+    );
+    assert_eq!(
+        class(PREFILL_STATUS_BOUND_VIOLATION | 0x1),
+        "prefill_chunk",
+        "8 beats 1"
+    );
+    assert_eq!(
+        class(PREFILL_STATUS_BOUND_VIOLATION | 0x4),
+        "step_params",
+        "4 beats 8"
+    );
+}
+
 #[test]
 fn commit_and_enqueue_refuse_a_poisoned_state_without_retiring() {
     let mut book = valid_book(64);
@@ -268,6 +297,37 @@ fn a_prefill_status_word_poisons() {
     assert!(
         book.begin_revalidate(OWNER).is_err(),
         "and a poisoned state is not revalidated, whoever owns it"
+    );
+}
+
+#[test]
+fn the_prefill_word_copies_need_an_open_chunk_on_the_owning_stream() {
+    let mut book = valid_book(64);
+    assert!(
+        book.begin_prefill_word(OWNER, "read_prefill_status")
+            .is_err(),
+        "a valid state has no open chunk, so the word is not read"
+    );
+    book.begin_prefill().expect("open");
+    // With the chunk open, the owner check is the only guard this call can fail, so the row
+    // reaches it (cuda-guard-tests-must-reach-their-guard).
+    assert!(
+        text(
+            book.begin_prefill_word(OWNER + 1, "clear_prefill_status")
+                .expect_err("another stream")
+        )
+        .contains("owned by stream 7, not stream 8"),
+        "the wrong-stream refusal names the owner, not just the caller"
+    );
+    book.begin_prefill_word(OWNER, "clear_prefill_status")
+        .expect("the word is zeroed at chunk open");
+    book.begin_prefill_word(OWNER, "read_prefill_status")
+        .expect("and read at chunk close, still inside the chunk");
+    book.poison();
+    assert!(
+        book.begin_prefill_word(OWNER, "read_prefill_status")
+            .is_err(),
+        "a poisoned state does not touch the word"
     );
 }
 

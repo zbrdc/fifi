@@ -20,18 +20,29 @@
 //! `Projector` stays the parity oracle for `linear` and `expert_linear`, and `rows` keeps
 //! returning `BadRequest`: nothing here touches either.
 //!
+//! Prefix reuse (decision 0036, addendum 1) adds no rule of its own: the two methods below are
+//! the same glue as the Mac arm, and the shared session rules decide everything. What differs is
+//! the state value. The CUDA export COPIES slot 0 and the first `tokens` KV rows to host bytes
+//! and the restore copies them back into the same buffers (the base decision's item 5), so a
+//! restored turn is bitwise against a cold one. A tiered step never saves: its numbers follow
+//! the bank state, which follows the history. A capture needs no invalidation: the graph bakes
+//! addresses, not positions, and the next token rewrites the `pos`/`kv_len` words from the
+//! imported `tokens` count.
+//!
 //! Design guidance only, no code copied.
 
+use super::prefix::{CudaPrefillPath, entry_bytes};
 use super::step::QwenResidentStep;
 use crate::{
     EngError,
     family::{
         executor::{ExecutorOps, GenerationState},
-        session::{DecodeSession, Limits, TokenStepper, check_prompt},
+        session::{DecodeSession, Limits, SaveKind, TokenStepper, check_prompt},
     },
     tokenizer::DecodeBatch,
 };
 use std::sync::Arc;
+use std::time::Instant;
 
 type Result<T> = std::result::Result<T, EngError>;
 
@@ -97,4 +108,65 @@ impl ExecutorOps for QwenResidentStep<'_> {
 
     /// No transient routing or draft state exists: the step keeps nothing between turns.
     fn boundary(&mut self, _st: &mut DecodeSession) {}
+
+    /// Exports the committed state as the one prefix entry (decision 0036, addendum 1), saved
+    /// as `kind` (the caller names the save point). The session rules decide whether the call
+    /// is valid. A tiered step cannot save: its numbers follow the bank state, so a restored
+    /// turn would not match a cold one bitwise.
+    fn save_prefix(&mut self, st: &DecodeSession, key: &[u32], kind: SaveKind) -> Result<bool> {
+        if self.is_tiered() {
+            return Ok(false);
+        }
+        let fed = self.tokens();
+        let began = Instant::now();
+        // The slot leaves the step for the call, so the snapshot closure can borrow the step.
+        let mut slot = std::mem::take(&mut self.prefix);
+        let saved = st.save_prefix(&mut slot, key, self.prefill_path(), fed, kind, || {
+            self.export_state()
+        });
+        self.prefix = slot;
+        if matches!(saved, Ok(true)) {
+            self.log_prefix("saved", began);
+        }
+        saved
+    }
+
+    /// Copies the saved entry into the reset state when the session rules accept the prompt.
+    fn restore_prefix(&mut self, st: &mut DecodeSession, prompt: &[u32]) -> Result<usize> {
+        let began = Instant::now();
+        let mut slot = std::mem::take(&mut self.prefix);
+        let covered = st.restore_prefix(&mut slot, prompt, self.prefill_path(), |saved| {
+            self.import_state(saved)
+        });
+        self.prefix = slot;
+        if matches!(covered, Ok(n) if n > 0) {
+            self.log_prefix("restored", began);
+        }
+        covered
+    }
+}
+
+impl QwenResidentStep<'_> {
+    /// The prefill path every entry of this step is saved and restored under: the one value a
+    /// `CudaPrefillPath` holds today, from one place, so a second variant (chunked prefill,
+    /// decision 0049) changes only this body — exactly like the Mac glue.
+    fn prefill_path(&self) -> CudaPrefillPath {
+        CudaPrefillPath::Steps
+    }
+
+    /// One stderr line per saved or restored entry; the G3 turn gate parses the copy times. The
+    /// save or restore it reports has already completed, so the line cannot fail the call: a
+    /// charge that cannot be computed is named in the line instead. The line's `positions` is
+    /// the entry's COMMITTED row count, `key.len() - 1` (the pending token is not a row), while
+    /// the request log's `reused_tokens` is `key.len()`: G3's parser adds one to this line's
+    /// `positions` to get the reused count.
+    fn log_prefix(&self, what: &str, began: Instant) {
+        let positions = self.tokens();
+        let charge = entry_bytes(self.state_layout(), positions)
+            .map_or_else(|error| format!("{error:?}"), |bytes| format!("{bytes} B"));
+        eprintln!(
+            "q36 cuda: prefix {what} {positions} positions, {charge}, {:.1} ms",
+            began.elapsed().as_secs_f64() * 1000.0
+        );
+    }
 }

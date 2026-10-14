@@ -1,11 +1,13 @@
-/* CPF-ATTN-A K2: the two kernels and the launch entry of attn_prefill, the flash-style
- * chunked-prefill attention (decision 0049 items 1, 2 and 10; the CPF-5a/5b kernel of design
- * section 3.7). Design guidance only, no code copied: the split rule, the visible/cache_row
- * span rules and the combine pattern restate the resident attn_decode (RD-8b, this tree);
- * the online-softmax recurrence, the query-tile geometry (8 tokens x 8 GQA heads = 64 rows,
- * key tiles of 32, K/V double-buffered in 96 KB of shared memory, the O accumulator in 128
- * registers per thread over 128 threads) follow design section 3.7. The device checks p0/m
- * again (item 2) and ORs bit 8 of the prefill status word (item 10).
+/* CPF-ATTN-A K2 and CPF-ATTN-B: the kernels and the launch entry of attn_prefill, the
+ * flash-style chunked-prefill attention (decision 0049 items 1, 2 and 10; the CPF-5a/5b kernel
+ * of design section 3.7). Design guidance only, no code copied: the split rule, the
+ * visible/cache_row span rules and the combine pattern restate the resident attn_decode
+ * (RD-8b, this tree); the online-softmax recurrence and the query-tile geometry (8 tokens x 8
+ * GQA heads = 64 rows, key tiles of 32) follow design section 3.7; the sm_80+ part kernel's
+ * head_dim split with a fixed-order exchange, cp.async with an XOR swizzle, Q in registers and
+ * ldmatrix follow the CPF-ATTN-B packet (Strata's micro-architecture and llama.cpp's MMA
+ * kernel as described there, nothing read or copied). The device checks p0/m again (item 2)
+ * and ORs mask 8 of the prefill status word (item 10).
  * Contract: prefill/attn_prefill.h. */
 #include "prefill/attn_prefill.h"
 
@@ -28,11 +30,18 @@ constexpr int kMaxGridY = 65535;
 constexpr int kMaxRows = (1 << 30) - 1;
 constexpr int kMaxSplits = 128;
 constexpr int kMaxMinKeys = 1 << 20;
-/* Dynamic shared memory of the part kernel: the Q tile (64 x 256 fp16 = 32 KB) plus two
- * double-buffered K and V tiles (2 x 16 KB each) = 96 KB, above the 48 KB default (the entry
- * opts in once per process, the vendored gemm.cuh pattern). The sm_72 SIMT arm uses the Q
- * tile and one K/V stage (64 KB) of the same allocation. */
+/* Dynamic shared memory of both part kernels: 96 KB = 98,304 B, above the 48 KB default (the
+ * entry opts in once per process, the vendored gemm.cuh pattern). The sm_72 SIMT kernel lays
+ * out a Q tile (64 x 256 fp16 = 32 KB) and two K and V stages of 16 KB each, and uses the Q
+ * tile and stage 0 of K (32-48 KB) and of V (64-80 KB), an 80 KB extent inside the request,
+ * which sm_72's 96 KB per-block opt-in admits. */
 constexpr int kSmemBytes = kRows * kHeadDim * 2 + 2 * (2 * kTile * kHeadDim * 2);
+/* The head_dim-quarter kernel: 16 warps, two cp.async stages of K and V (16 KB planes of 32
+ * keys x 512 B) and a 2 KB exchange slot per warp, the same 98,304 B request. */
+constexpr int kThreadsD = 512;
+constexpr int kPlaneBytes = kTile * kHeadDim * 2;
+constexpr int kStageBytes = 2 * kPlaneBytes;
+static_assert(2 * kStageBytes + (kThreadsD / 32) * 2048 == kSmemBytes, "dsplit shared memory");
 
 struct Args {
     const float *q;
@@ -79,7 +88,7 @@ __device__ inline int cache_row(const Args &a, int first, int i) {
 }
 
 /* The device re-check of the launch arguments (decision 0049 item 2): block-uniform, before
- * the first barrier. ORs bit 8 once; the caller's writes (or their absence) are the callers'. */
+ * the first barrier. ORs mask 8 once; the caller's writes (or their absence) are the callers'. */
 __device__ inline bool bounds_ok(const Args &a) {
     return (long long)a.p0 >= 0 && (long long)a.p0 + a.m <= a.cache_rows;
 }
@@ -89,13 +98,38 @@ __device__ inline void report_bound_violation(const Args &a) {
         atomicOr(a.status, INFERENCE_CUDA_PREFILL_STATUS_BOUND_VIOLATION);
 }
 
-/* Two adjacent fp16 values as one 32-bit register (little-endian: the first in the low half),
- * the operand form of mma.sync. */
-__device__ inline unsigned pack_hh(__half lo, __half hi) {
-    __half2 pair = __halves2half2(lo, hi);
-    return *reinterpret_cast<unsigned *>(&pair);
+/* One block's share of the work: query tile `tile` (rows t0 .. tile_end - 1 of the chunk) of one
+ * kv head, the keys k_begin .. k_end - 1 of the tile's visible span (visible key i at position
+ * first + i), and its partial cell. */
+struct Block {
+    int t0, tile_end, n_keys, first, k_begin, k_end, max_p;
+    float *stats, *accs;
+};
+
+/* The block of split s, kv head kvh and query tile `tile`; false when the split holds no key
+ * of the tile (the block then exits before any barrier). */
+__device__ inline bool block_of(const Args &a, int s, int kvh, int tile, Block &b) {
+    b.t0 = tile * kQTile;
+    b.tile_end = min(a.m, b.t0 + kQTile);
+    b.n_keys = a.p0 + b.tile_end;  // keys 0..p0 + tile_end - 1 exist for this tile
+    int count;
+    visible(a, a.p0 + b.t0, b.n_keys, b.first, count);
+    int chunk, n_active;
+    split_plan(count, a.max_splits, a.min_keys, chunk, n_active);
+    if (s >= n_active) return false;
+    b.k_begin = s * chunk;
+    b.k_end = min(count, b.k_begin + chunk);
+    b.max_p = b.n_keys - 1;  // the tile's last row's own position: the deepest key read
+    /* The partial cell: 64 stat pairs then, after every cell's stats, this cell's 64 x 256
+     * accumulators (the decode partial layout with the rows rounded to the tile). */
+    const size_t n_cells = (size_t)((a.m + kQTile - 1) / kQTile) * a.n_kv_head * a.max_splits;
+    const size_t cell = ((size_t)tile * a.n_kv_head + kvh) * a.max_splits + s;
+    b.stats = a.part + cell * (kRows * 2);
+    b.accs = a.part + n_cells * (kRows * 2) + cell * ((size_t)kRows * kHeadDim);
+    return true;
 }
 
+#if __CUDA_ARCH__ >= 800
 /* D (16x8 f32) += A (16x16 f16, row) * B (16x8 f16, col), the sm_80 tensor-core path. */
 __device__ inline void mma_16816(float *d, const unsigned *a, unsigned b0, unsigned b1) {
     asm volatile(
@@ -104,219 +138,72 @@ __device__ inline void mma_16816(float *d, const unsigned *a, unsigned b0, unsig
         : "+f"(d[0]), "+f"(d[1]), "+f"(d[2]), "+f"(d[3])
         : "r"(a[0]), "r"(a[1]), "r"(a[2]), "r"(a[3]), "r"(b0), "r"(b1));
 }
+#else
+/* The Q tile in shared memory, rounded to fp16 once (128 threads): rows past the chunk's end
+ * (m not a multiple of 8) hold zeros; their partials are written but never read. */
+__device__ inline void load_q_tile(const Args &a, const Block &b, int kvh, __half *sq) {
+    for (int i = threadIdx.x; i < kRows * kHeadDim; i += 128) {
+        const int r = i / kHeadDim, d = i % kHeadDim;
+        const int t = b.t0 + (r >> 3);
+        sq[i] = t < b.tile_end
+                    ? __float2half(a.q[((size_t)t * a.n_head + kvh * kGroup + (r & 7)) * kHeadDim + d])
+                    : __half(0);
+    }
+}
 
-/* One block: one query tile (kRows rows, row = token-of-tile * 8 + head-of-group) of one kv
- * head and one key range of the tile's visible span. Writes one partial cell. */
-__global__ void __launch_bounds__(128) attn_prefill_part_k(Args a) {
+/* Loads the key tile at visible index base into sk/sv (128 threads). Keys beyond the range
+ * hold zeros, so a masked or out-of-range key contributes exactly nothing (0 * V = 0) and a
+ * NaN cell no row may read never enters the tile. */
+__device__ inline void load_kv_tile(const Args &a, const Block &b, int kvh, int base, __half *sk,
+                                    __half *sv) {
+    const int nvalid = min(kTile, b.k_end - base);
+    for (int i = threadIdx.x; i < kTile * kHeadDim; i += 128) {
+        const int j = i / kHeadDim, d = i % kHeadDim;
+        __half k = __half(0), v = __half(0);
+        if (j < nvalid) {
+            const size_t at = ((size_t)cache_row(a, b.first, base + j) * a.n_kv_head + kvh) * kHeadDim + d;
+            k = a.k_cache[at];
+            v = a.v_cache[at];
+        }
+        sk[i] = k;
+        sv[i] = v;
+    }
+}
+#endif
+
+/* The fp32 SIMT kernel of sm_72 (compile-only in this packet, decision 0049 item 14), the
+ * same block and partial cell as attn_prefill_part_dsplit_k: 128 threads, two per row (each owning
+ * one half of the row's 256 dims), the same loaders, masking and part layout; the score halves
+ * join with one shuffle, so both halves of a row see the same statistics in the same order.
+ * An sm_80+ build traps here (the entry launches the tensor-core kernel there). */
+__global__ void __launch_bounds__(128) attn_prefill_part_simt_k(Args a) {
+#if __CUDA_ARCH__ >= 800
+    __trap();
+#else
     if (!bounds_ok(a)) {
         report_bound_violation(a);
         return;  // no partial
     }
     extern __shared__ __half smem[];
-    __half *sq = smem;                                        // [64][256]
-    __half *sk[2] = {smem + kRows * kHeadDim,
-                     smem + kRows * kHeadDim + kTile * kHeadDim};
-    __half *sv[2] = {smem + kRows * kHeadDim + 2 * kTile * kHeadDim,
-                     smem + kRows * kHeadDim + 3 * kTile * kHeadDim};
+    __half *sq = smem;  // [64][256], then stage 0 of K at 32 KB and of V at 64 KB
+    __half *sk = smem + kRows * kHeadDim, *sv = smem + kRows * kHeadDim + 2 * kTile * kHeadDim;
     const int s = blockIdx.x, kvh = blockIdx.y, tile = blockIdx.z;
-    const int t0 = tile * kQTile;
-    const int tile_end = min(a.m, t0 + kQTile);
-    const int n_keys = a.p0 + tile_end;  // keys 0..p0 + tile_end - 1 exist for this tile
-    int first, count;
-    visible(a, a.p0 + t0, n_keys, first, count);
-    int chunk, n_active;
-    split_plan(count, a.max_splits, a.min_keys, chunk, n_active);
-    if (s >= n_active) return;
-    const int k_begin = s * chunk, k_end = min(count, k_begin + chunk);
-    const int max_p = n_keys - 1;  // the tile's last row's own position: the deepest key read
-
-    /* The Q tile, rounded to fp16 once: rows past the chunk's end (m not a multiple of 8)
-     * hold zeros; their partials are written but never read. */
-    for (int i = threadIdx.x; i < kRows * kHeadDim; i += 128) {
-        const int r = i / kHeadDim, d = i % kHeadDim;
-        const int t = t0 + (r >> 3);
-        sq[i] = t < tile_end
-                    ? __float2half(a.q[((size_t)t * a.n_head + kvh * kGroup + (r & 7)) * kHeadDim + d])
-                    : __half(0);
-    }
-
-    /* Loads the key tile at visible index base into buffer idx. Keys beyond the range hold
-     * zeros, so a masked or out-of-range key contributes exactly nothing (0 * V = 0) and a
-     * NaN cell no row may read never enters the tile. */
-    const auto load_tile = [&](int base, int idx) {
-        const int nvalid = min(kTile, k_end - base);
-        for (int i = threadIdx.x; i < kTile * kHeadDim; i += 128) {
-            const int j = i / kHeadDim, d = i % kHeadDim;
-            __half k = __half(0), v = __half(0);
-            if (j < nvalid) {
-                const size_t at = ((size_t)cache_row(a, first, base + j) * a.n_kv_head + kvh) * kHeadDim + d;
-                k = a.k_cache[at];
-                v = a.v_cache[at];
-            }
-            sk[idx][i] = k;
-            sv[idx][i] = v;
-        }
-    };
-
-    /* The partial cell of this block: 64 stat pairs then, after every cell's stats, this
-     * cell's 64 x 256 accumulators (the decode partial layout with the rows rounded to the
-     * tile). */
-    const size_t n_cells = (size_t)((a.m + kQTile - 1) / kQTile) * a.n_kv_head * a.max_splits;
-    const size_t cell = ((size_t)tile * a.n_kv_head + kvh) * a.max_splits + s;
-    float *const stats = a.part + cell * (kRows * 2);
-    float *const accs = a.part + n_cells * (kRows * 2) + cell * ((size_t)kRows * kHeadDim);
-
-#if __CUDA_ARCH__ >= 800
-    /* Tensor-core arm (sm_80+): four warps, warp w owning rows w*16 + 0..15; per lane g =
-     * lane >> 2, c = (lane & 3) * 2. S = scale * Q̂·K^T lives in four 16x8 fragments (the
-     * tile's 32 keys), O in 32 fragments of 16x8 (the 256 dims); the row statistics are
-     * combined over each row's four lanes with two shuffles. */
-    const int lane = threadIdx.x & 31, warp = threadIdx.x >> 5;
-    const int g = lane >> 2, c = (lane & 3) * 2;
-    const int r0 = warp * 16 + g, r1 = r0 + 8;              // the lane's two rows
-    const int p0_row0 = a.p0 + t0 + (r0 >> 3);              // their absolute positions
-    const int p0_row1 = a.p0 + t0 + (r1 >> 3);
-    float s_f[4][4], o_f[kHeadDim / 8][4];
-#pragma unroll
-    for (int nb = 0; nb < kHeadDim / 8; ++nb)
-#pragma unroll
-        for (int e = 0; e < 4; ++e) o_f[nb][e] = 0.f;
-    float m_run[2] = {-INFINITY, -INFINITY}, l_run[2] = {0.f, 0.f};
-
-    load_tile(k_begin, 0);
-    int loaded = 1;
-    for (int base = k_begin; base < k_end && first + base <= max_p; base += kTile) {
-        const int next = base + kTile;
-        if (next < k_end && first + next <= max_p) load_tile(next, loaded & 1);
-        __syncthreads();  // this tile visible; the previous compute done
-        const __half *K = sk[(loaded - 1) & 1], *V = sv[(loaded - 1) & 1];
-        /* Scores: 16 k-steps of 16 dims; the A fragments read the Q tile, the B fragments
-         * read the K tile at (key = nb*8 + g, dims k0 + c .. +1 / +8 .. +9). */
-#pragma unroll
-        for (int nb = 0; nb < 4; ++nb)
-#pragma unroll
-            for (int e = 0; e < 4; ++e) s_f[nb][e] = 0.f;
-        for (int k0 = 0; k0 < kHeadDim; k0 += 16) {
-            const unsigned a_f[4] = {
-                pack_hh(sq[r0 * kHeadDim + k0 + c], sq[r0 * kHeadDim + k0 + c + 1]),
-                pack_hh(sq[r1 * kHeadDim + k0 + c], sq[r1 * kHeadDim + k0 + c + 1]),
-                pack_hh(sq[r0 * kHeadDim + k0 + c + 8], sq[r0 * kHeadDim + k0 + c + 9]),
-                pack_hh(sq[r1 * kHeadDim + k0 + c + 8], sq[r1 * kHeadDim + k0 + c + 9])};
-#pragma unroll
-            for (int nb = 0; nb < 4; ++nb) {
-                const int key = nb * kGroup + g;
-                const unsigned b0 = pack_hh(K[key * kHeadDim + k0 + c], K[key * kHeadDim + k0 + c + 1]);
-                const unsigned b1 = pack_hh(K[key * kHeadDim + k0 + c + 8], K[key * kHeadDim + k0 + c + 9]);
-                mma_16816(s_f[nb], a_f, b0, b1);
-            }
-        }
-        /* Scale, the row's mask (keys after its own position or before its window contribute
-         * nothing) and the row max over the lane's eight keys, then over the row's four lanes. */
-        float mx[2] = {-INFINITY, -INFINITY};
-#pragma unroll
-        for (int nb = 0; nb < 4; ++nb) {
-            const int pos = first + base + nb * kGroup + c;
-            s_f[nb][0] = sees(a, pos, p0_row0) ? s_f[nb][0] * a.scale : -INFINITY;
-            s_f[nb][1] = sees(a, pos + 1, p0_row0) ? s_f[nb][1] * a.scale : -INFINITY;
-            s_f[nb][2] = sees(a, pos, p0_row1) ? s_f[nb][2] * a.scale : -INFINITY;
-            s_f[nb][3] = sees(a, pos + 1, p0_row1) ? s_f[nb][3] * a.scale : -INFINITY;
-            mx[0] = fmaxf(mx[0], fmaxf(s_f[nb][0], s_f[nb][1]));
-            mx[1] = fmaxf(mx[1], fmaxf(s_f[nb][2], s_f[nb][3]));
-        }
-#pragma unroll
-        for (int o = 1; o <= 2; o <<= 1) {
-            mx[0] = fmaxf(mx[0], __shfl_xor_sync(0xffffffffu, mx[0], o));
-            mx[1] = fmaxf(mx[1], __shfl_xor_sync(0xffffffffu, mx[1], o));
-        }
-        const float m_new[2] = {fmaxf(m_run[0], mx[0]), fmaxf(m_run[1], mx[1])};
-        /* A row that has seen no key yet (every key so far masked: the split starts after the
-         * row's own position, review BLOCKER-1) keeps m_new = -inf; it exponentiates against 0
-         * instead, so p = 0, corr = 0 and l, O stay 0 rather than exp(-inf - -inf) = NaN. */
-        const float m_ref[2] = {m_new[0] == -INFINITY ? 0.f : m_new[0],
-                                m_new[1] == -INFINITY ? 0.f : m_new[1]};
-        float sum[2] = {0.f, 0.f};
-#pragma unroll
-        for (int nb = 0; nb < 4; ++nb) {
-            s_f[nb][0] = expf(s_f[nb][0] - m_ref[0]);
-            s_f[nb][1] = expf(s_f[nb][1] - m_ref[0]);
-            s_f[nb][2] = expf(s_f[nb][2] - m_ref[1]);
-            s_f[nb][3] = expf(s_f[nb][3] - m_ref[1]);
-            sum[0] += s_f[nb][0] + s_f[nb][1];
-            sum[1] += s_f[nb][2] + s_f[nb][3];
-        }
-#pragma unroll
-        for (int o = 1; o <= 2; o <<= 1) {
-            sum[0] += __shfl_xor_sync(0xffffffffu, sum[0], o);
-            sum[1] += __shfl_xor_sync(0xffffffffu, sum[1], o);
-        }
-        const float corr[2] = {expf(m_run[0] - m_ref[0]), expf(m_run[1] - m_ref[1])};
-        l_run[0] = l_run[0] * corr[0] + sum[0];
-        l_run[1] = l_run[1] * corr[1] + sum[1];
-        m_run[0] = m_new[0];
-        m_run[1] = m_new[1];
-        /* O = O * corr + P̂·V̂: the A fragments are the probabilities (rounded to fp16) of
-         * this tile's 32 keys, register-direct from the S fragments; the B fragments read
-         * the V tile at (key = 16*ks + c + {0,1}, dims nb*8 + g). */
-#pragma unroll
-        for (int nb = 0; nb < kHeadDim / 8; ++nb) {
-            o_f[nb][0] *= corr[0];
-            o_f[nb][1] *= corr[0];
-            o_f[nb][2] *= corr[1];
-            o_f[nb][3] *= corr[1];
-        }
-#pragma unroll
-        for (int ks = 0; ks < 2; ++ks) {
-            /* The A register order of m16n8k16 is (row, k-block): a0 row g keys c..c+1,
-             * a1 row g+8 keys c..c+1, a2 row g keys 8+c..8+c+1, a3 row g+8 keys 8+c..8+c+1. */
-            const unsigned pa[4] = {
-                pack_hh(__float2half(s_f[2 * ks][0]), __float2half(s_f[2 * ks][1])),
-                pack_hh(__float2half(s_f[2 * ks][2]), __float2half(s_f[2 * ks][3])),
-                pack_hh(__float2half(s_f[2 * ks + 1][0]), __float2half(s_f[2 * ks + 1][1])),
-                pack_hh(__float2half(s_f[2 * ks + 1][2]), __float2half(s_f[2 * ks + 1][3]))};
-#pragma unroll
-            for (int nb = 0; nb < kHeadDim / 8; ++nb) {
-                const int key = 16 * ks + c, dim = nb * kGroup + g;
-                const unsigned b0 = pack_hh(V[key * kHeadDim + dim], V[(key + 1) * kHeadDim + dim]);
-                const unsigned b1 =
-                    pack_hh(V[(key + 8) * kHeadDim + dim], V[(key + 9) * kHeadDim + dim]);
-                mma_16816(o_f[nb], pa, b0, b1);
-            }
-        }
-        __syncthreads();  // compute done before the next load overwrites this buffer
-        ++loaded;
-    }
-    if ((lane & 3) == 0) {
-        stats[r0 * 2] = m_run[0];
-        stats[r0 * 2 + 1] = l_run[0];
-        stats[r1 * 2] = m_run[1];
-        stats[r1 * 2 + 1] = l_run[1];
-    }
-#pragma unroll
-    for (int nb = 0; nb < kHeadDim / 8; ++nb) {
-        const int dim = nb * kGroup + c;
-        accs[(size_t)r0 * kHeadDim + dim] = o_f[nb][0];
-        accs[(size_t)r0 * kHeadDim + dim + 1] = o_f[nb][1];
-        accs[(size_t)r1 * kHeadDim + dim] = o_f[nb][2];
-        accs[(size_t)r1 * kHeadDim + dim + 1] = o_f[nb][3];
-    }
-#else
-    /* fp32 SIMT arm (sm_72, compile-only in this packet, decision 0049 item 14): 128 threads,
-     * two per row (each owning one half of the row's 256 dims), the same loaders, masking and
-     * part layout; the score halves join with one shuffle, so both halves of a row see the
-     * same statistics in the same order. */
+    Block b;
+    if (!block_of(a, s, kvh, tile, b)) return;
+    load_q_tile(a, b, kvh, sq);
     const int row = threadIdx.x >> 1, half = threadIdx.x & 1;
-    const int p_row = a.p0 + t0 + (row >> 3);
+    const int p_row = a.p0 + b.t0 + (row >> 3);
     float o_acc[kHeadDim / 2];
 #pragma unroll
     for (int e = 0; e < kHeadDim / 2; ++e) o_acc[e] = 0.f;
     float m_run = -INFINITY, l_run = 0.f;
-    for (int base = k_begin; base < k_end && first + base <= max_p; base += kTile) {
-        load_tile(base, 0);
+    for (int base = b.k_begin; base < b.k_end && b.first + base <= b.max_p; base += kTile) {
+        load_kv_tile(a, b, kvh, base, sk, sv);
         __syncthreads();
-        const __half *K = sk[0], *V = sv[0];
-        const int nvalid = min(kTile, k_end - base);
+        const __half *K = sk, *V = sv;
+        const int nvalid = min(kTile, b.k_end - base);
         for (int j = 0; j < nvalid; ++j) {
-            const bool vis = sees(a, first + base + j, p_row);
+            const bool vis = sees(a, b.first + base + j, p_row);
             float dot = 0.f;
 #pragma unroll 8
             for (int e = 0; e < kHeadDim / 2; ++e)
@@ -339,12 +226,310 @@ __global__ void __launch_bounds__(128) attn_prefill_part_k(Args a) {
         __syncthreads();
     }
     if (half == 0) {
-        stats[row * 2] = m_run;
-        stats[row * 2 + 1] = l_run;
+        b.stats[row * 2] = m_run;
+        b.stats[row * 2 + 1] = l_run;
     }
 #pragma unroll 8
     for (int e = 0; e < kHeadDim / 2; ++e)
-        accs[(size_t)row * kHeadDim + half * (kHeadDim / 2) + e] = o_acc[e];
+        b.accs[(size_t)row * kHeadDim + half * (kHeadDim / 2) + e] = o_acc[e];
+#endif
+}
+
+#if __CUDA_ARCH__ >= 800
+constexpr float kLog2e = 1.4426950408889634f;  // scores in log2 units: exp2(s * c2) = exp(s * scale)
+constexpr float kLn2 = 0.6931471805599453f;    // the stored max back in natural units
+
+/* The primitives of the head_dim-quarter kernel (sm_80+ only, so no device pass sees one
+ * unreferenced). Stage planes are [32 keys][512 B]; the 16-byte chunk j of key k sits at
+ * byte k * 512 + ((j ^ (k & 7)) << 4): the XOR stays inside a warp's 8-chunk quarter, and
+ * the 8 row addresses of every 8x8 ldmatrix hit 8 distinct chunks of one 128-byte span. */
+__device__ inline unsigned swz(int key, int chunk) {
+    return key * 512 + ((chunk ^ (key & 7)) << 4);
+}
+
+__device__ inline unsigned smem_addr(const void *p) {
+    return (unsigned)__cvta_generic_to_shared(p);
+}
+
+/* 16 bytes global -> shared, bypassing L1; src_bytes 0 reads nothing and writes zeros. */
+__device__ inline void cp_async16(unsigned dst, const void *src, int src_bytes) {
+    asm volatile("cp.async.cg.shared.global [%0], [%1], 16, %2;\n" ::"r"(dst), "l"(src),
+                 "r"(src_bytes));
+}
+
+__device__ inline void cp_async_commit() { asm volatile("cp.async.commit_group;\n" ::); }
+
+__device__ inline void cp_async_wait_all() {
+    asm volatile("cp.async.wait_group 0;\n" ::: "memory");
+}
+
+/* Four 8x8 b16 matrices; lanes 8i..8i+7 give the row addresses of matrix i. */
+__device__ inline void ldsm_x4(unsigned addr, unsigned (&r)[4]) {
+    asm volatile("ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%0,%1,%2,%3}, [%4];\n"
+                 : "=r"(r[0]), "=r"(r[1]), "=r"(r[2]), "=r"(r[3])
+                 : "r"(addr));
+}
+
+/* The same, transposed: lane T gets rows 2(T%4), 2(T%4)+1 of column T/4. */
+__device__ inline void ldsm_x4_trans(unsigned addr, unsigned (&r)[4]) {
+    asm volatile("ldmatrix.sync.aligned.m8n8.x4.trans.shared.b16 {%0,%1,%2,%3}, [%4];\n"
+                 : "=r"(r[0]), "=r"(r[1]), "=r"(r[2]), "=r"(r[3])
+                 : "r"(addr));
+}
+
+/* The named barrier of one row group's four warps (ids 1..4; 0 is __syncthreads). */
+__device__ inline void bar_row_group(int rg) {
+    asm volatile("bar.sync %0, 128;\n" ::"r"(1 + rg) : "memory");
+}
+
+/* Issues the K and V of the key tile at visible index base into the stage at byte `stage`
+ * (512 threads; thread i copies keys (i >> 5) + {0, 16}, chunk i & 31). A key at or past
+ * k_end copies src-size 0 (zeros, no global read) from the tile's first key row, a valid
+ * row, so a cell no row may read never enters the tile. */
+__device__ inline void issue_kv_tile(const Args &a, const Block &b, int kvh, int base,
+                                     unsigned stage) {
+    const int chunk = threadIdx.x & 31;
+#pragma unroll
+    for (int half = 0; half < 2; ++half) {
+        const int key = (threadIdx.x >> 5) + 16 * half;
+        const bool valid = base + key < b.k_end;
+        const size_t row = (size_t)cache_row(a, b.first, base + (valid ? key : 0));
+        const size_t at = (row * a.n_kv_head + kvh) * kHeadDim + chunk * 8;
+        const unsigned dst = stage + swz(key, chunk);
+        cp_async16(dst, a.k_cache + at, valid ? 16 : 0);
+        cp_async16(dst + kPlaneBytes, a.v_cache + at, valid ? 16 : 0);
+    }
+    cp_async_commit();
+}
+
+/* The lane's Q̂ A-fragments for rows r0 = 16 rg + g (token t0 + 2 rg) and r1 = r0 + 8 (the
+ * next token), head 8 kvh + g, dims 64 dq + 16 ks + {c, c+1, c+8, c+9}: rounded to fp16
+ * once, as CPF-ATTN-A's q̂; a token at or past tile_end loads zeros and reads no q. */
+__device__ inline void load_q_frags(const Args &a, const Block &b, int kvh, int rg, int dq,
+                                    unsigned (&qf)[4][4]) {
+    const int lane = threadIdx.x & 31, g = lane >> 2, c = (lane & 3) * 2;
+#pragma unroll
+    for (int i = 0; i < 2; ++i) {
+        const int t = b.t0 + 2 * rg + i;
+        const float *q = a.q + ((size_t)t * a.n_head + kvh * kGroup + g) * kHeadDim + 64 * dq + c;
+#pragma unroll
+        for (int ks = 0; ks < 4; ++ks)
+#pragma unroll
+            for (int hi = 0; hi < 2; ++hi) {
+                float2 v = make_float2(0.f, 0.f);
+                if (t < b.tile_end) v = *reinterpret_cast<const float2 *>(q + 16 * ks + 8 * hi);
+                const __half2 h = __floats2half2_rn(v.x, v.y);
+                qf[ks][i + 2 * hi] = *reinterpret_cast<const unsigned *>(&h);
+            }
+    }
+}
+#endif
+
+/* One block of the head_dim-quarter kernel (sm_80+): the block unit of CPF-ATTN-A's part kernel
+ * (one query tile of 64 rows, one kv head, one split's keys; the same partial cell) over 16
+ * warps. Warp w holds row group rg = w >> 2 (rows 16 rg .. +15) and head_dim quarter
+ * dq = w & 3 (dims 64 dq .. +63): Q̂ in registers, its quarter of S = Q̂·K^T, and O for its
+ * rows and dims. The four quarter partials of S are summed through shared memory in one
+ * fixed order, so the four warps of a row group hold identical statistics and P̂.
+ * K and V arrive by cp.async into two swizzled stages (one block barrier per tile) and
+ * reach the MMAs by ldmatrix. Grid (q_tiles, n_kv_head, max_splits), the heaviest causal
+ * tiles first; an sm_72 build traps here. */
+__global__ void __launch_bounds__(kThreadsD, 1) attn_prefill_part_dsplit_k(Args a) {
+#if __CUDA_ARCH__ >= 800
+    if (!bounds_ok(a)) {
+        report_bound_violation(a);
+        return;  // no partial
+    }
+    extern __shared__ __align__(16) unsigned char dsmem[];
+    const int q_tiles = (a.m + kQTile - 1) / kQTile;
+    const int tile = q_tiles - 1 - (int)blockIdx.x, kvh = blockIdx.y, s = blockIdx.z;
+    Block b;
+    if (!block_of(a, s, kvh, tile, b)) return;
+    const unsigned stages = smem_addr(dsmem);
+    float4 *const xch = reinterpret_cast<float4 *>(dsmem + 2 * kStageBytes);
+    issue_kv_tile(a, b, kvh, b.k_begin, stages);
+
+    const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
+    const int rg = warp >> 2, dq = warp & 3;
+    const int g = lane >> 2, c = (lane & 3) * 2;
+    unsigned qf[4][4];
+    load_q_frags(a, b, kvh, rg, dq, qf);
+    const int p_row0 = a.p0 + b.t0 + 2 * rg, p_row1 = p_row0 + 1;  // rows r0, r1
+    /* scale * log2(e), once per block. Every score product is __fmul_rn, in the masked and the
+     * fast path alike: under -fmad=true a plain product could contract into the FFMA of
+     * s2 - m_ref in one path only (lane C MINOR-1). */
+    const float c2 = __fmul_rn(a.scale, kLog2e);
+    /* ldmatrix lane roles: matrix mi = lane >> 3, row rr = lane & 7. K: key 16 np + 8 (mi >> 1)
+     * + rr, chunk 8 dq + 2 ks + (mi & 1). V: key 16 ks + 8 (mi & 1) + rr, chunk 8 dq + 2 jp +
+     * (mi >> 1). */
+    const int mi = lane >> 3, rr = lane & 7;
+    const int k_key = 8 * (mi >> 1) + rr, k_chunk = 8 * dq + (mi & 1);
+    const int v_key = 8 * (mi & 1) + rr, v_chunk = 8 * dq + (mi >> 1);
+
+    float o[8][4];
+#pragma unroll
+    for (int j = 0; j < 8; ++j)
+#pragma unroll
+        for (int e = 0; e < 4; ++e) o[j][e] = 0.f;
+    float m_run[2] = {-INFINITY, -INFINITY}, l_run[2] = {0.f, 0.f};
+
+    int n = 0;
+    for (int base = b.k_begin; base < b.k_end && b.first + base <= b.max_p; base += kTile, ++n) {
+        cp_async_wait_all();
+        __syncthreads();  // tile n visible; stage (n + 1) & 1 and the exchange free
+        const int next = base + kTile;
+        if (next < b.k_end && b.first + next <= b.max_p)
+            issue_kv_tile(a, b, kvh, next, stages + ((n + 1) & 1) * kStageBytes);
+        const unsigned kst = stages + (n & 1) * kStageBytes, vst = kst + kPlaneBytes;
+
+        /* This quarter's S: 4 k16 steps x 4 n8 key blocks. */
+        float sq[4][4];
+#pragma unroll
+        for (int nb = 0; nb < 4; ++nb)
+#pragma unroll
+            for (int e = 0; e < 4; ++e) sq[nb][e] = 0.f;
+#pragma unroll
+        for (int ks = 0; ks < 4; ++ks)
+#pragma unroll
+            for (int np = 0; np < 2; ++np) {
+                unsigned kb[4];
+                ldsm_x4(kst + swz(16 * np + k_key, k_chunk + 2 * ks), kb);
+                mma_16816(sq[2 * np], qf[ks], kb[0], kb[1]);
+                mma_16816(sq[2 * np + 1], qf[ks], kb[2], kb[3]);
+            }
+
+        /* The exchange, one softmax per row group (design 3.10). Warp dq owns key block dq
+         * (keys 8 dq .. +7) of its row group: it stores only the three blocks its siblings own
+         * (X[w][nb != dq]) and keeps its own in registers. The row group's other regions sit
+         * in own-block slots, which hold no S: the row maxima in X[4 rg][0], the row-sum
+         * partials in X[4 rg + 1][1], and P̂ in X[4 rg + 2] bytes 0..1,279 (16 rows of 80 B).
+         * P̂ covers X[4 rg + 2][0..1] and the first 256 B of X[4 rg + 2][2], the dq = 2 warp's
+         * own-block slot: safe, because that slot holds no S and every S read is over before
+         * X2, so after X2 only xmax and xsum must stay clear of P̂. */
+        float4 own = make_float4(0.f, 0.f, 0.f, 0.f);
+#pragma unroll
+        for (int nb = 0; nb < 4; ++nb) {
+            const float4 v = make_float4(sq[nb][0], sq[nb][1], sq[nb][2], sq[nb][3]);
+            if (nb == dq)
+                own = v;
+            else
+                xch[(warp * 4 + nb) * 32 + lane] = v;
+        }
+        float *const xmax = reinterpret_cast<float *>(xch + (16 * rg) * 32);          // X[4rg][0]
+        float *const xsum = reinterpret_cast<float *>(xch + (16 * rg + 5) * 32);      // X[4rg+1][1]
+        unsigned char *const xp = reinterpret_cast<unsigned char *>(xch + (16 * rg + 8) * 32);
+        bar_row_group(rg);  // X1: the S partials are in place
+        /* The own block summed over the four quarters in quarter order ((S0 + S1) + S2) + S3:
+         * the same values and order as the per-warp sum, so p and P̂ are bit-identical to it. */
+        float4 sum4 = dq == 0 ? own : xch[((4 * rg) * 4 + dq) * 32 + lane];
+#pragma unroll
+        for (int q = 1; q < 4; ++q) {
+            const float4 v = q == dq ? own : xch[((4 * rg + q) * 4 + dq) * 32 + lane];
+            sum4.x += v.x;
+            sum4.y += v.y;
+            sum4.z += v.z;
+            sum4.w += v.w;
+        }
+        /* Scale and mask the block (log2 units; the fully visible tile skips the mask). */
+        const bool full = b.first + base + kTile - 1 <= a.p0 + b.t0 &&
+                          (a.window == 0 || b.first + base > b.max_p - a.window);
+        float s2[4];
+        if (full) {
+            s2[0] = __fmul_rn(sum4.x, c2);
+            s2[1] = __fmul_rn(sum4.y, c2);
+            s2[2] = __fmul_rn(sum4.z, c2);
+            s2[3] = __fmul_rn(sum4.w, c2);
+        } else {
+            const int pos = b.first + base + dq * 8 + c;
+            s2[0] = sees(a, pos, p_row0) ? __fmul_rn(sum4.x, c2) : -INFINITY;
+            s2[1] = sees(a, pos + 1, p_row0) ? __fmul_rn(sum4.y, c2) : -INFINITY;
+            s2[2] = sees(a, pos, p_row1) ? __fmul_rn(sum4.z, c2) : -INFINITY;
+            s2[3] = sees(a, pos + 1, p_row1) ? __fmul_rn(sum4.w, c2) : -INFINITY;
+        }
+        float bm[2] = {fmaxf(s2[0], s2[1]), fmaxf(s2[2], s2[3])};
+#pragma unroll
+        for (int o2 = 1; o2 <= 2; o2 <<= 1) {
+            bm[0] = fmaxf(bm[0], __shfl_xor_sync(0xffffffffu, bm[0], o2));
+            bm[1] = fmaxf(bm[1], __shfl_xor_sync(0xffffffffu, bm[1], o2));
+        }
+        if (c == 0) {
+            xmax[g * 4 + dq] = bm[0];
+            xmax[(g + 8) * 4 + dq] = bm[1];
+        }
+        bar_row_group(rg);  // X2: the block maxima are in place
+        const float4 mq0 = *reinterpret_cast<const float4 *>(xmax + g * 4);
+        const float4 mq1 = *reinterpret_cast<const float4 *>(xmax + (g + 8) * 4);
+        const float mx[2] = {fmaxf(fmaxf(mq0.x, mq0.y), fmaxf(mq0.z, mq0.w)),
+                             fmaxf(fmaxf(mq1.x, mq1.y), fmaxf(mq1.z, mq1.w))};
+        const float m_new[2] = {fmaxf(m_run[0], mx[0]), fmaxf(m_run[1], mx[1])};
+        /* The no-key-yet rule (review BLOCKER-1, the B1 guard): exponentiate against 0 while
+         * the max is still -inf, so p = 0 and corr = 0 instead of NaN (exp2f(-inf) = 0). */
+        const float m_ref[2] = {m_new[0] == -INFINITY ? 0.f : m_new[0],
+                                m_new[1] == -INFINITY ? 0.f : m_new[1]};
+        const float p[4] = {exp2f(s2[0] - m_ref[0]), exp2f(s2[1] - m_ref[0]),
+                            exp2f(s2[2] - m_ref[1]), exp2f(s2[3] - m_ref[1])};
+        float ps[2] = {p[0] + p[1], p[2] + p[3]};
+#pragma unroll
+        for (int o2 = 1; o2 <= 2; o2 <<= 1) {
+            ps[0] += __shfl_xor_sync(0xffffffffu, ps[0], o2);
+            ps[1] += __shfl_xor_sync(0xffffffffu, ps[1], o2);
+        }
+        if (c == 0) {
+            xsum[g * 4 + dq] = ps[0];
+            xsum[(g + 8) * 4 + dq] = ps[1];
+        }
+        *reinterpret_cast<__half2 *>(xp + g * 80 + 16 * dq + 2 * c) = __floats2half2_rn(p[0], p[1]);
+        *reinterpret_cast<__half2 *>(xp + (g + 8) * 80 + 16 * dq + 2 * c) =
+            __floats2half2_rn(p[2], p[3]);
+        const float corr[2] = {exp2f(m_run[0] - m_ref[0]), exp2f(m_run[1] - m_ref[1])};
+        bar_row_group(rg);  // X3: the sum partials and P̂ are in place
+        const float4 sq0 = *reinterpret_cast<const float4 *>(xsum + g * 4);
+        const float4 sq1 = *reinterpret_cast<const float4 *>(xsum + (g + 8) * 4);
+        l_run[0] = l_run[0] * corr[0] + (((sq0.x + sq0.y) + sq0.z) + sq0.w);
+        l_run[1] = l_run[1] * corr[1] + (((sq1.x + sq1.y) + sq1.z) + sq1.w);
+        m_run[0] = m_new[0];
+        m_run[1] = m_new[1];
+
+        /* O = O * corr + P̂·V̂ over this quarter's 64 dims: P̂ (16 rows x 32 keys) by ldmatrix
+         * as A-fragments (matrix mi: rows 8 (mi & 1) .., keys 16 ks + 8 (mi >> 1) ..), V by
+         * ldmatrix.trans, two n8 blocks per load. */
+#pragma unroll
+        for (int j = 0; j < 8; ++j) {
+            o[j][0] *= corr[0];
+            o[j][1] *= corr[0];
+            o[j][2] *= corr[1];
+            o[j][3] *= corr[1];
+        }
+        const unsigned p_lane = smem_addr(xp) + (rr + 8 * (mi & 1)) * 80 + 16 * (mi >> 1);
+#pragma unroll
+        for (int ks = 0; ks < 2; ++ks) {
+            unsigned pa[4];
+            ldsm_x4(p_lane + 32 * ks, pa);
+#pragma unroll
+            for (int jp = 0; jp < 4; ++jp) {
+                unsigned vb[4];
+                ldsm_x4_trans(vst + swz(16 * ks + v_key, v_chunk + 2 * jp), vb);
+                mma_16816(o[2 * jp], pa, vb[0], vb[1]);
+                mma_16816(o[2 * jp + 1], pa, vb[2], vb[3]);
+            }
+        }
+    }
+    const int r0 = 16 * rg + g, r1 = r0 + 8;
+    /* The max goes out in natural units (m2 * ln2), so the combine's expf(ms - M) stays. */
+    if (dq == 0 && (lane & 3) == 0) {
+        b.stats[r0 * 2] = __fmul_rn(m_run[0], kLn2);
+        b.stats[r0 * 2 + 1] = l_run[0];
+        b.stats[r1 * 2] = __fmul_rn(m_run[1], kLn2);
+        b.stats[r1 * 2 + 1] = l_run[1];
+    }
+#pragma unroll
+    for (int j = 0; j < 8; ++j) {
+        const int dim = 64 * dq + 8 * j + c;
+        *reinterpret_cast<float2 *>(b.accs + (size_t)r0 * kHeadDim + dim) = make_float2(o[j][0], o[j][1]);
+        *reinterpret_cast<float2 *>(b.accs + (size_t)r1 * kHeadDim + dim) = make_float2(o[j][2], o[j][3]);
+    }
+#else
+    __trap();
 #endif
 }
 
@@ -477,22 +662,49 @@ Args to_args(const inference_cuda_attn_prefill_args *a) {
     return k;
 }
 
-/* Enqueues both kernels. The part kernel's 96 KB of dynamic shared memory need the opt-in
- * above the 48 KB default, set once per process (the vendored gemm.cuh pattern); every call
- * runs under the caller's dispatch guard, so the flag needs no lock of its own. */
-Failure enqueue(const Args &k, void *stream) {
-    static bool smem_armed = false;
-    Failure failure;
-    if (!smem_armed) {
-        failure.record(cudaFuncSetAttribute(attn_prefill_part_k,
-                                            cudaFuncAttributeMaxDynamicSharedMemorySize,
-                                            kSmemBytes),
-                       INFERENCE_CUDA_STAGE_LAUNCH);
-        if (failure.ok()) smem_armed = true;
+/* The part kernel this process launches, and how. */
+struct PartArm {
+    int ptx;               // cudaFuncAttributes::ptxVersion of the loaded code
+    void (*kernel)(Args);  // attn_prefill_part_dsplit_k (ptx >= 80) or attn_prefill_part_simt_k
+    bool dsplit;           // the head_dim-quarter kernel: grid (q_tiles, n_kv_head, max_splits)
+    int threads;
+    int bytes;             // dynamic shared memory, opted in above the 48 KB default
+    cudaError_t err;       // the first failure of the query or the opt-in
+};
+
+/* Selects by ptxVersion, the virtual arch the loaded code was compiled for (the __CUDA_ARCH__
+ * its #if saw), not by the device's compute capability: a compute_72-only build JIT-compiled
+ * on sm_86 still runs the SIMT kernel. Then opts the chosen kernel in to its dynamic shared
+ * memory (the vendored gemm.cuh pattern). Both kernels request the same 98,304 B. */
+PartArm arm_part() {
+    PartArm arm = {0, attn_prefill_part_simt_k, false, 128, kSmemBytes, cudaSuccess};
+    cudaFuncAttributes attr = {};
+    arm.err = cudaFuncGetAttributes(&attr, attn_prefill_part_dsplit_k);
+    if (arm.err != cudaSuccess) return arm;
+    arm.ptx = attr.ptxVersion;
+    if (arm.ptx >= 80) {
+        arm.kernel = attn_prefill_part_dsplit_k;
+        arm.dsplit = true;
+        arm.threads = kThreadsD;
     }
+    arm.err = cudaFuncSetAttribute(arm.kernel, cudaFuncAttributeMaxDynamicSharedMemorySize,
+                                   arm.bytes);
+    return arm;
+}
+
+/* Enqueues both kernels. The part kernel is chosen and armed once per process, by a
+ * function-local static with C++11 thread-safe initialisation (muse m3). A failed arm is
+ * cached too, so a transient failure stays permanent for the process; that assumes one
+ * device per process, the engine's model. */
+Failure enqueue(const Args &k, void *stream) {
+    static const PartArm arm = arm_part();
+    Failure failure;
+    failure.record(arm.err, INFERENCE_CUDA_STAGE_LAUNCH);
     if (failure.ok()) {
-        attn_prefill_part_k<<<dim3(k.max_splits, k.n_kv_head, (k.m + kQTile - 1) / kQTile),
-                              128, kSmemBytes, (cudaStream_t)stream>>>(k);
+        const int q_tiles = (k.m + kQTile - 1) / kQTile;
+        const dim3 grid = arm.dsplit ? dim3(q_tiles, k.n_kv_head, k.max_splits)
+                                     : dim3(k.max_splits, k.n_kv_head, q_tiles);
+        arm.kernel<<<grid, arm.threads, arm.bytes, (cudaStream_t)stream>>>(k);
         failure.record(cudaGetLastError(), INFERENCE_CUDA_STAGE_LAUNCH);
     }
     if (failure.ok()) {
@@ -535,7 +747,7 @@ extern "C" int inference_cuda_attn_prefill_fault_bad_bounds_launch(
         report_stage(out_stage, INFERENCE_CUDA_STAGE_NONE);
         /* Every rule except the p0 bound holds (m clamped to 1 so the shape rules stay
          * satisfiable); only the bound is violated, by force. The kernels' device re-checks
-         * (no partial, NaN out, bit 8) are the code under test. */
+         * (no partial, NaN out, mask 8) are the code under test. */
         if (!valid_sans_bounds(a)) {
             return INFERENCE_CUDA_INVALID_ARGUMENT;
         }

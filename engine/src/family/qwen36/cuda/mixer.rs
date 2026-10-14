@@ -14,18 +14,21 @@
 //! step are already queued. `cancel_enqueue` is only for a failure before `run_block` was called.
 //!
 //! Status writers in a block, in queue order: `attn_prep` ORs mask 4 into `StepParams.status` on
-//! a refused position (RD-8a). It runs after `step_begin` and before the router and `argmax`, as
-//! `step_plan.rs` requires. A block takes the `Pos`, `KvLen` and `Status` words as 4-byte ranges
-//! (`ResidentState::step_field`), never the 32-byte block.
+//! a refused position (RD-8a), and under Int8G32 the rows entry holds the same rule while
+//! `kv8_append` ORs 4 only on a word that entry already refused (KV8-B). They run after
+//! `step_begin` and before the router and `argmax`, as `step_plan.rs` requires. A block takes the
+//! `Pos`, `KvLen` and `Status` words as 4-byte ranges (`ResidentState::step_field`), never the
+//! 32-byte block.
 //!
 //! Design guidance only, no code copied.
 
 use super::{
+    dims::KvMode,
     layer_table::LayerTable,
     mixer_geometry::MixerGeometry,
     mixer_ops::{BLOCK_ROWS, BlockOp, block_ops},
     mixer_shapes::{attn_decode_shape, attn_prep_shape},
-    mixer_shapes::{check_delta_eps, conv_shape, delta_shape},
+    mixer_shapes::{attn_q8_shape, check_delta_eps, conv_shape, delta_shape, kv8_shape},
     mixer_weights::{LayerWeights, MixerWeights},
     state::ResidentState,
     state_layout::Plane,
@@ -40,9 +43,11 @@ use crate::{
             add_norm_pack::AddNormCall,
             add_rmsnorm_q8::AddNormQ8Call,
             attn_decode::{AttnDecodeCall, AttnSpan, AttnSplit},
-            attn_prep::{AttnPrepCall, RopeParams},
+            attn_decode_q8::AttnDecodeQ8Call,
+            attn_prep::{AttnPrepCall, AttnPrepRowsCall, RopeParams},
             gdn_conv::ConvCall,
             gdn_delta::{DeltaCall, DeltaWeights},
+            kv8_append::Kv8Data,
             matvec_q::MatvecCall,
             quantize_q8_1::QuantizeCall,
         },
@@ -58,10 +63,10 @@ struct KindOps {
 }
 
 impl KindOps {
-    fn new(g: &MixerGeometry, layout: WeightLayout) -> Result<Self, EngError> {
+    fn new(g: &MixerGeometry, layout: WeightLayout, kv_mode: KvMode) -> Result<Self, EngError> {
         Ok(Self {
-            delta: block_ops(AttentionKind::DeltaNet, g, layout)?,
-            attn: block_ops(AttentionKind::Full, g, layout)?,
+            delta: block_ops(AttentionKind::DeltaNet, g, layout, kv_mode)?,
+            attn: block_ops(AttentionKind::Full, g, layout, kv_mode)?,
         })
     }
 
@@ -91,8 +96,9 @@ impl<'a> MixerViews<'a> {
         arena: &'a DeviceArena,
         g: &MixerGeometry,
         layout: WeightLayout,
+        kv_mode: KvMode,
     ) -> Result<Self, EngError> {
-        let ops = KindOps::new(g, layout)?;
+        let ops = KindOps::new(g, layout, kv_mode)?;
         let mut views: Vec<(Slot, DeviceRange<'a>)> = Vec::new();
         for op in ops.all() {
             for slot in op.reads().into_iter().chain(op.writes()) {
@@ -147,6 +153,9 @@ pub(super) struct MixerParts<'a> {
     /// The layout the op lists and the weight lookups were built for (MATVEC-PAR S3b): taken
     /// from the session options, which the step has checked against the loaded weights.
     pub(super) layout: WeightLayout,
+    /// The KV mode the op lists were built for (KV8-B B3): the attention core is the fp16 pair
+    /// under `Fp16` and the KV8 rows/append/q8-decode triple under `Int8G32`.
+    pub(super) kv_mode: KvMode,
 }
 
 pub(super) struct Mixers<'a> {
@@ -179,7 +188,7 @@ fn tail<'b>(range: DeviceRange<'b>, col: usize) -> Result<DeviceRange<'b>, EngEr
 impl<'a> Mixers<'a> {
     pub(super) fn new(context: &'a CudaContext, parts: MixerParts<'a>) -> Result<Self, EngError> {
         check_delta_eps(parts.geometry.eps)?;
-        let ops = KindOps::new(&parts.geometry, parts.layout)?;
+        let ops = KindOps::new(&parts.geometry, parts.layout, parts.kv_mode)?;
         Ok(Self {
             context,
             parts,
@@ -384,6 +393,89 @@ impl<'a> Mixers<'a> {
                     proj: Some(self.view(proj)?),
                     k_cache: run.state.kv_plane(run.ordinal, Plane::K)?,
                     v_cache: run.state.kv_plane(run.ordinal, Plane::V)?,
+                    kv_len: run.state.step_field(kv_len)?,
+                    part: self.view(part)?,
+                    out: self.view(out)?,
+                },
+            ),
+            // The KV8 core of the Int8G32 mode (KV8-B B3): the rows entry writes the f32 k and v
+            // rows, `kv8_append` quantizes them into the layer's code and scale planes, and the
+            // q8 decode reads the planes back at the split the plan sized its partials with.
+            BlockOp::AttnPrepRows {
+                proj,
+                q,
+                q_norm,
+                k_norm,
+                k_rows,
+                v_rows,
+                pos,
+                status,
+            } => ctx.attn_prep_rows(
+                stream,
+                AttnPrepRowsCall {
+                    shape: attn_prep_shape(g, run.state.layout().kv.capacity),
+                    rope: RopeParams {
+                        eps: g.eps,
+                        rope_base: g.attn.rope_base,
+                    },
+                    admit_pos: run.io.admit_pos,
+                    proj: self.view(proj)?,
+                    q_norm: run.weights.raw(q_norm)?,
+                    k_norm: run.weights.raw(k_norm)?,
+                    k_rows: self.view(k_rows)?,
+                    v_rows: self.view(v_rows)?,
+                    q: self.view(q)?,
+                    pos: run.state.step_field(pos)?,
+                    status: run.state.step_field(status)?,
+                },
+            ),
+            BlockOp::Kv8Append {
+                k,
+                v,
+                k_codes,
+                k_scales,
+                v_codes,
+                v_scales,
+                pos,
+                status,
+            } => ctx.kv8_append(
+                stream,
+                kv8_shape(g, run.state.layout().kv.capacity),
+                Kv8Data {
+                    k: self.view(k)?,
+                    v: self.view(v)?,
+                    k_codes: run.state.kv_plane(run.ordinal, k_codes)?,
+                    k_scales: run.state.kv_plane(run.ordinal, k_scales)?,
+                    v_codes: run.state.kv_plane(run.ordinal, v_codes)?,
+                    v_scales: run.state.kv_plane(run.ordinal, v_scales)?,
+                },
+                run.state.step_field(pos)?,
+                run.state.step_field(status)?,
+            ),
+            BlockOp::AttnDecodeQ8 {
+                q,
+                proj,
+                k_codes,
+                k_scales,
+                v_codes,
+                v_scales,
+                kv_len,
+                part,
+                out,
+                split,
+            } => ctx.attn_decode_q8(
+                stream,
+                AttnDecodeQ8Call {
+                    shape: attn_q8_shape(g, run.state.layout().kv.capacity),
+                    span: AttnSpan::FULL,
+                    split,
+                    scale: g.attn.scale,
+                    q: self.view(q)?,
+                    proj: Some(self.view(proj)?),
+                    k_codes: run.state.kv_plane(run.ordinal, k_codes)?,
+                    k_scales: run.state.kv_plane(run.ordinal, k_scales)?,
+                    v_codes: run.state.kv_plane(run.ordinal, v_codes)?,
+                    v_scales: run.state.kv_plane(run.ordinal, v_scales)?,
                     kv_len: run.state.step_field(kv_len)?,
                     part: self.view(part)?,
                     out: self.view(out)?,
