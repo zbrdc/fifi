@@ -1092,6 +1092,79 @@ impl MlxKernels {
             .quantized_attention_prefix(queries, keys, values, len, scale, causal, group_size, bits)
     }
 
+    /// Runs the FUSED 8-bit KV decode attention over the first `len` positions of QUANTIZED
+    /// capacity buffers (packet FUSED-KV8-a): exactly the semantics of
+    /// [`Self::quantized_attention_prefix`] for one query row (`L = 1`, non-causal), computed
+    /// by one pair of custom Metal kernels instead of two `quantized_matmul` calls and a
+    /// softmax. `queries` is `[1, QH, 1, D]` in F32, or BF16 after `allow_bf16`; `keys` and
+    /// `values` are the three quantized residents of each side over buffers of shape
+    /// `[1, KVH, CAP, ..]`, read through the first `len` positions with the head stride CAP (no
+    /// prefix copy, and no read at or beyond `len`). The output is `[1, QH, 1, D]` in the dtype
+    /// of the queries.
+    ///
+    /// Limits of the fused kernel, on top of the composite checks: batch one, exactly one
+    /// query row, `bits == 8`, `group_size == 64`, `D` one of 64, 128, or 256 (each of the 32
+    /// lanes owns `D / 32` dims, a slice that must divide the group size 64 so it never
+    /// straddles a quantization group; D 512 fits that lane rule but its register budget is
+    /// unvalidated), and `QH / KVH` from 1 to 8 (REP 16 is unvalidated). The scratch of one
+    /// call is the F32 block partials `nb · QH · (D + 2)` values, with `nb` the block count of
+    /// `shape::decode_blocks` - empty tail blocks included - freed with the call.
+    ///
+    /// No fallback: a failure is a native failure. There is no silent return to the composite
+    /// `quantized_attention_prefix`; a validation failure returns `BadRequest` before the first
+    /// native call and leaves the adapter usable, and a native failure returns `Backend` with
+    /// label `quantized attention decode` and makes the adapter terminal (decision 0023/0032
+    /// rules).
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "the packet fixes this signature: len and scale name the attention, \
+                 group_size and bits name the quantization of the buffers"
+    )]
+    pub fn quantized_attention_decode(
+        &mut self,
+        queries: &ExecutionTensor,
+        keys: &QuantizedKv<'_>,
+        values: &QuantizedKv<'_>,
+        len: u32,
+        scale: f32,
+        group_size: u32,
+        bits: u32,
+    ) -> Result<ExecutionTensor, EngError> {
+        self.context
+            .quantized_attention_decode(queries, keys, values, len, scale, group_size, bits)
+    }
+
+    /// Whether [`Self::quantized_attention_decode`] accepts these operands: the portable shape
+    /// and quantization checks of the fused kernel (batch one, one query row, 8 bits, group 64,
+    /// `D` in 64, 128, 256, one to eight query heads per KV head, `1 <= len <= CAP`). It makes
+    /// no native call and changes no state, so a caller can choose between the fused kernel and
+    /// the composite [`Self::quantized_attention_prefix`] by shape without a failed call. It
+    /// does not check owners or dtypes; those checks stay in the operation itself.
+    pub fn supports_quantized_attention_decode(
+        &self,
+        queries: &ExecutionTensor,
+        keys: &QuantizedKv<'_>,
+        values: &QuantizedKv<'_>,
+        len: u32,
+        group_size: u32,
+        bits: u32,
+    ) -> bool {
+        crate::kernels::shape::quantized_attention_decode(
+            "quantized attention decode",
+            queries.shape(),
+            [keys.codes.shape(), keys.scales.shape(), keys.biases.shape()],
+            [
+                values.codes.shape(),
+                values.scales.shape(),
+                values.biases.shape(),
+            ],
+            len,
+            group_size,
+            bits,
+        )
+        .is_ok()
+    }
+
     /// Runs the gated delta rule of mlx-lm 0.31.0 as one Metal kernel over `T` tokens
     /// (decision 0050). Every operand is an F32 resident of this adapter.
     ///

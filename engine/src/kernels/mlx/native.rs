@@ -10,7 +10,8 @@
 //! | `handles.rs` | Owning wrappers for devices, streams, and arrays, and the resident storage. |
 //! | `transfer.rs` | Import of host tensors, readback of resident tensors, and the blocking and asynchronous evaluation of resident graphs. |
 //! | `host.rs` | Completed-host operations that return host bytes. |
-//! | `resident_ops.rs` | Resident `qmm`, `mm`, the elementwise methods, `rms_norm`, `rope`, the gated delta kernel (decision 0050), the consuming `kv_append`, and the prefix attention (packet NATIVE-OPS-1). |
+//! | `resident_ops.rs` | Resident `qmm`, `mm`, the elementwise methods, `rms_norm`, `rope`, the gated delta kernel (decision 0050), the consuming `kv_append`, the prefix attention (packet NATIVE-OPS-1), and the fused 8-bit KV decode attention (packet FUSED-KV8-a). |
+//! | `q8_decode_attention.metal` | The two kernel bodies of the fused 8-bit KV decode attention (packet FUSED-KV8-a), split at the pass marker and compiled per call by the shim. |
 //! | `attention.rs` | The resident dense-attention caller. |
 //! | `pages.rs` | Caller-owned host pages and their in-place import (decision 0041). |
 //!

@@ -647,6 +647,85 @@ pub(crate) fn quantized_attention_prefix(
     layout(operation, queries.to_vec())
 }
 
+/// The line that separates the two kernel bodies of the fused decode Metal source (packet
+/// FUSED-KV8-a). `native/q8_decode_attention.metal` holds pass 1 and pass 2 as plain Metal
+/// text with exactly one marker line between them; `resident_ops.rs` includes that file with
+/// `include_str!` and splits it here.
+pub(crate) const Q8_DECODE_PASS_MARKER: &str = "// ---- PASS 2 ----";
+
+/// The block-count rule NB of the fused decode attention (packet FUSED-KV8-a): at most
+/// 8,192 keys 128 blocks; at most 32,768 blocks of 512 (256 when the query heads per KV
+/// head stay below 6); above that 1,024 (512 below 6); always `min(NB, len)`, and at least
+/// one block. The rule can leave EMPTY tail blocks (len 130 gives NB 128 and a block size
+/// of 2, so blocks 65 to 127 hold no key): pass 1 writes them a partial of max -FLT_MAX,
+/// sum 0, and zeros, and pass 2 weights them by `exp(-FLT_MAX - m*) = 0` under MLX's
+/// default safe math. Pure: the shim receives the result as a scalar.
+pub(crate) fn decode_blocks(len: u32, rep: u32) -> u32 {
+    let nb = if len <= 8192 {
+        128
+    } else if len <= 32768 {
+        if rep >= 6 { 512 } else { 256 }
+    } else if rep >= 6 {
+        1024
+    } else {
+        512
+    };
+    nb.min(len).max(1)
+}
+
+/// The portable checks of `quantized_attention_decode` (packet FUSED-KV8-a): the checks of
+/// `quantized_attention_prefix` with `causal = false`, plus the limits of the fused kernel -
+/// batch one and exactly one query row (the shim builds a `[1, QH, 1, D]` output and the
+/// kernels carry no batch stride), 8-bit codes, group 64, a head dim of 64, 128, or 256
+/// (each of the 32 lanes owns `D / 32` consecutive dims, a slice that must divide the group
+/// size 64 so it never straddles a quantization group; D 512 fits that lane rule but its
+/// register budget is unvalidated), and 1 to 8 query heads per KV head (REP 16 is
+/// unvalidated). The output is the query shape.
+pub(crate) fn quantized_attention_decode(
+    operation: &'static str,
+    queries: &[u32],
+    keys: [&[u32]; 3],
+    values: [&[u32]; 3],
+    len: u32,
+    group_size: u32,
+    bits: u32,
+) -> Result<ElementwiseLayout, EngError> {
+    check_shape(operation, queries, AxisRule::Any)?;
+    let &[batch, heads, rows, width] = queries else {
+        return Err(bad_request(operation, "queries must have rank four"));
+    };
+    if batch != 1 {
+        return Err(bad_request(operation, "decode needs batch one"));
+    }
+    if rows != 1 {
+        return Err(bad_request(operation, "decode needs exactly one query row"));
+    }
+    if bits != 8 {
+        return Err(bad_request(operation, "decode bits must be 8"));
+    }
+    if group_size != 64 {
+        return Err(bad_request(operation, "decode group size must be 64"));
+    }
+    if !matches!(width, 64 | 128 | 256) {
+        return Err(bad_request(
+            operation,
+            "decode head dim must be 64, 128, or 256",
+        ));
+    }
+    let layout = quantized_attention_prefix(
+        operation, queries, keys, values, len, false, group_size, bits,
+    )?;
+    // After the shared checks the key head count exists and divides the query heads.
+    let key_heads = keys[0].get(1).copied().unwrap_or(0);
+    if key_heads == 0 || heads / key_heads > 8 {
+        return Err(bad_request(
+            operation,
+            "decode query heads per key head must be 1 to 8",
+        ));
+    }
+    Ok(layout)
+}
+
 fn axis_index(operation: &'static str, axis: u32, rank: usize) -> Result<usize, EngError> {
     usize::try_from(axis)
         .ok()
@@ -665,10 +744,11 @@ fn layout(operation: &'static str, shape: Vec<u32>) -> Result<ElementwiseLayout,
 #[cfg(test)]
 mod tests {
     use super::{
-        attention, attention_prefix, bound_covers, clamp_max, concatenate, dequantize, expand_dims,
-        float_operands, gather_qmm, kv_append_operands, last_axis, matmul, quantize_rows,
-        quantized_attention_prefix, quantized_kv_operands, reduce, repeat, reshape, rope, slice,
-        slice_update, sort, take, take_along_axis, transpose,
+        Q8_DECODE_PASS_MARKER, attention, attention_prefix, bound_covers, clamp_max, concatenate,
+        decode_blocks, dequantize, expand_dims, float_operands, gather_qmm, kv_append_operands,
+        last_axis, matmul, quantize_rows, quantized_attention_decode, quantized_attention_prefix,
+        quantized_kv_operands, reduce, repeat, reshape, rope, slice, slice_update, sort, take,
+        take_along_axis, transpose,
     };
     use crate::{EngError, tensor::Dtype};
     fn rejects(result: Result<super::ElementwiseLayout, EngError>, text: &str) {
@@ -1712,6 +1792,344 @@ mod tests {
                 [[Dtype::F32, Dtype::Bf16], [Dtype::F32; 2]],
             ),
             "input dtype must be F32",
+        );
+    }
+
+    /// The buffers of one quantized side for the decode checks: capacity 1024, two KV heads,
+    /// 8-bit codes of `width / 4` U32 words per row, and scales and biases of `groups` values
+    /// per row. A macro, because the shapes must live inside the call expression as
+    /// temporaries, as the prefix tests write them.
+    macro_rules! decode_side {
+        ($width:expr, $groups:expr) => {
+            [
+                &[1u32, 2, 1024, $width / 4][..],
+                &[1u32, 2, 1024, $groups][..],
+                &[1u32, 2, 1024, $groups][..],
+            ]
+        };
+    }
+
+    /// The valid shapes of the decode check (packet FUSED-KV8-a): the real model (QH 16 over
+    /// KVH 2, D 256, REP 8, capacity 1024, len 1000), the test shape (QH 4 over KVH 2, D 64,
+    /// REP 2), D 128 (QH 8 over KVH 2, REP 4), and the smallest repeat REP 1 (QH 2 over
+    /// KVH 2, D 64) give the query shape back, with the F32 byte count of the layout.
+    #[test]
+    fn quantized_attention_decode_layout_accepts_the_real_and_test_shapes() {
+        let real = quantized_attention_decode(
+            "quantized attention decode",
+            &[1, 16, 1, 256],
+            decode_side!(256, 4),
+            decode_side!(256, 4),
+            1000,
+            64,
+            8,
+        )
+        .unwrap();
+        assert_eq!(real.shape, [1, 16, 1, 256]);
+        assert_eq!(real.byte_len, 16384, "16 heads of 256 F32 values");
+
+        let test = quantized_attention_decode(
+            "quantized attention decode",
+            &[1, 4, 1, 64],
+            decode_side!(64, 1),
+            decode_side!(64, 1),
+            1000,
+            64,
+            8,
+        )
+        .unwrap();
+        assert_eq!(test.shape, [1, 4, 1, 64]);
+        assert_eq!(test.byte_len, 1024, "4 heads of 64 F32 values");
+
+        // D 128: four query heads per KV head, the middle validated head dim.
+        let mid = quantized_attention_decode(
+            "quantized attention decode",
+            &[1, 8, 1, 128],
+            decode_side!(128, 2),
+            decode_side!(128, 2),
+            1000,
+            64,
+            8,
+        )
+        .unwrap();
+        assert_eq!(mid.shape, [1, 8, 1, 128]);
+        assert_eq!(mid.byte_len, 4096, "8 heads of 128 F32 values");
+
+        // REP 1: one query head per KV head, the smallest validated repeat.
+        let single = quantized_attention_decode(
+            "quantized attention decode",
+            &[1, 2, 1, 64],
+            decode_side!(64, 1),
+            decode_side!(64, 1),
+            1000,
+            64,
+            8,
+        )
+        .unwrap();
+        assert_eq!(single.shape, [1, 2, 1, 64]);
+        assert_eq!(single.byte_len, 512, "2 heads of 64 F32 values");
+
+        // The capacity bounds of the shared rule: one position and the full capacity pass.
+        assert!(
+            quantized_attention_decode(
+                "quantized attention decode",
+                &[1, 16, 1, 256],
+                decode_side!(256, 4),
+                decode_side!(256, 4),
+                1,
+                64,
+                8
+            )
+            .is_ok()
+        );
+        assert!(
+            quantized_attention_decode(
+                "quantized attention decode",
+                &[1, 16, 1, 256],
+                decode_side!(256, 4),
+                decode_side!(256, 4),
+                1024,
+                64,
+                8
+            )
+            .is_ok()
+        );
+    }
+
+    /// Every added limit of the decode check refuses its shape (packet FUSED-KV8-a): a batch
+    /// above one (the shim builds a `[1, QH, 1, D]` output and the kernels carry no batch
+    /// stride), two query rows, bits 4, group 32 (with buffers that WOULD match a group-32
+    /// layout, so only the group rule refuses), a head dim outside the validated set - 96,
+    /// 192, 320, 384, and 448, whose lane slice `D / 32` straddles a 64-wide quantization
+    /// group, and 512, whose register budget is unvalidated - lengths 0 and capacity + 1,
+    /// query heads that no KV head count divides, and 9 and 16 query heads per KV head.
+    #[test]
+    fn quantized_attention_decode_layout_refuses_the_kernel_limits() {
+        fn refuses(
+            queries: &[u32],
+            keys: [&[u32]; 3],
+            values: [&[u32]; 3],
+            len: u32,
+            group: u32,
+            bits: u32,
+            text: &str,
+        ) {
+            rejects(
+                quantized_attention_decode(
+                    "quantized attention decode",
+                    queries,
+                    keys,
+                    values,
+                    len,
+                    group,
+                    bits,
+                ),
+                text,
+            )
+        }
+        // Batch two with batch-two buffers: only the decode batch rule refuses it.
+        refuses(
+            &[2, 16, 1, 256],
+            [
+                &[2u32, 2, 1024, 64][..],
+                &[2u32, 2, 1024, 4][..],
+                &[2u32, 2, 1024, 4][..],
+            ],
+            [
+                &[2u32, 2, 1024, 64][..],
+                &[2u32, 2, 1024, 4][..],
+                &[2u32, 2, 1024, 4][..],
+            ],
+            1000,
+            64,
+            8,
+            "decode needs batch one",
+        );
+        // Two query rows: the fused kernel serves exactly one decode row.
+        refuses(
+            &[1, 16, 2, 256],
+            decode_side!(256, 4),
+            decode_side!(256, 4),
+            1000,
+            64,
+            8,
+            "decode needs exactly one query row",
+        );
+        // Bits 4.
+        refuses(
+            &[1, 16, 1, 256],
+            decode_side!(256, 4),
+            decode_side!(256, 4),
+            1000,
+            64,
+            4,
+            "decode bits must be 8",
+        );
+        // Group 32 with scales and biases of 64 / 32 = 2 values per row: a layout the shared
+        // width rule accepts, so only the decode group rule refuses it.
+        refuses(
+            &[1, 16, 1, 64],
+            decode_side!(64, 2),
+            decode_side!(64, 2),
+            1000,
+            32,
+            8,
+            "decode group size must be 64",
+        );
+        // Head dims outside the validated set: 96 (not a multiple of 64), 192, 320, 384, and
+        // 448 (a lane slice of D / 32 dims that straddles a 64-wide quantization group), and
+        // 512 (a valid lane slice whose register budget is unvalidated). All of them pass the
+        // shared width rule, so only the decode head-dim rule refuses them.
+        for &bad_width in &[96u32, 192, 320, 384, 448, 512] {
+            let queries = [1u32, 16, 1, bad_width];
+            let codes = [1u32, 2, 1024, bad_width / 4];
+            let stats = [1u32, 2, 1024, bad_width / 64];
+            let keys = [&codes[..], &stats[..], &stats[..]];
+            let values = [&codes[..], &stats[..], &stats[..]];
+            refuses(
+                &queries[..],
+                keys,
+                values,
+                1000,
+                64,
+                8,
+                "decode head dim must be 64, 128, or 256",
+            );
+        }
+        // Lengths 0 and capacity + 1.
+        refuses(
+            &[1, 16, 1, 256],
+            decode_side!(256, 4),
+            decode_side!(256, 4),
+            0,
+            64,
+            8,
+            "len must be at least one and at most the capacity",
+        );
+        refuses(
+            &[1, 16, 1, 256],
+            decode_side!(256, 4),
+            decode_side!(256, 4),
+            1025,
+            64,
+            8,
+            "len must be at least one and at most the capacity",
+        );
+        // Fifteen query heads over two KV heads: no multiple.
+        refuses(
+            &[1, 15, 1, 256],
+            decode_side!(256, 4),
+            decode_side!(256, 4),
+            1000,
+            64,
+            8,
+            "query heads must be a multiple of key heads",
+        );
+        // Eighteen and thirty-two query heads over two KV heads: nine and sixteen per KV
+        // head, past the validated repeat range; thirty-four (seventeen per KV head) too.
+        for &bad_heads in &[18u32, 32, 34] {
+            let queries = [1u32, bad_heads, 1, 64];
+            refuses(
+                &queries[..],
+                decode_side!(64, 1),
+                decode_side!(64, 1),
+                1000,
+                64,
+                8,
+                "decode query heads per key head must be 1 to 8",
+            );
+        }
+    }
+
+    /// The NB table of the block-count rule (packet FUSED-KV8-a): at len 8192 the small tier
+    /// ends (128 blocks), 8193 and 32768 take the middle tier (512 for REP 8, 256 for REP 2),
+    /// 32769 and 262144 the large tier (1024 for REP 8, 512 for REP 2), and the small lengths
+    /// clamp NB to len (len 1 gives one block, len 100 one hundred). The REP 1, 5, 6, and 7
+    /// rows pin the `rep >= 6` split of the two upper tiers, derived by hand: len 100 is
+    /// below the 128-block floor for every REP, so `min(128, 100)` = 100; len 8192 ends the
+    /// small tier at exactly 128; len 40000 > 32768, so REP 1 and REP 5 (below 6) take 512
+    /// and REP 6 and REP 7 take 1,024.
+    #[test]
+    fn decode_blocks_follows_the_block_count_rule() {
+        for &(len, rep, nb) in &[
+            (1u32, 8u32, 1u32),
+            (100, 8, 100),
+            (8192, 8, 128),
+            (8193, 8, 512),
+            (32768, 8, 512),
+            (32769, 8, 1024),
+            (262144, 8, 1024),
+            (1, 2, 1),
+            (100, 2, 100),
+            (8192, 2, 128),
+            (8193, 2, 256),
+            (32768, 2, 256),
+            (32769, 2, 512),
+            (262144, 2, 512),
+            (100, 1, 100),
+            (8192, 1, 128),
+            (40000, 1, 512),
+            (100, 5, 100),
+            (8192, 5, 128),
+            (40000, 5, 512),
+            (100, 6, 100),
+            (8192, 6, 128),
+            (40000, 6, 1024),
+            (100, 7, 100),
+            (8192, 7, 128),
+            (40000, 7, 1024),
+        ] {
+            assert_eq!(
+                decode_blocks(len, rep),
+                nb,
+                "len {len} at REP {rep}: the block-count rule"
+            );
+        }
+    }
+
+    /// The fused decode Metal source splits at its marker (packet FUSED-KV8-a):
+    /// `native/q8_decode_attention.metal` holds exactly one marker line, both parts hold a
+    /// real kernel body - each part carries its kernel's anchor lines, the partial writes of
+    /// pass 1 and the output write and the global-max reduction of pass 2, not only
+    /// non-empty text - and neither part contains the marker. `resident_ops.rs` includes the
+    /// same file and splits it at `Q8_DECODE_PASS_MARKER`, so this pins the file the adapter
+    /// compiles on every platform, not only where the native module builds.
+    #[test]
+    fn q8_decode_attention_metal_splits_into_two_passes() {
+        let source = include_str!("mlx/native/q8_decode_attention.metal");
+        let count = source.matches(Q8_DECODE_PASS_MARKER).count();
+        assert_eq!(
+            count, 1,
+            "the Metal source must hold exactly one marker line"
+        );
+        let Some((pass1, pass2)) = source.split_once(Q8_DECODE_PASS_MARKER) else {
+            panic!("the marker count above makes this unreachable");
+        };
+        assert!(!pass1.trim().is_empty(), "pass 1 must hold a kernel body");
+        assert!(!pass2.trim().is_empty(), "pass 2 must hold a kernel body");
+        assert!(
+            pass1.contains("psum[h * nb + blk]"),
+            "pass 1 must carry its block-partial writes"
+        );
+        assert!(
+            pass1.contains("pmax[h * nb + blk]"),
+            "pass 1 must carry its block-max writes"
+        );
+        assert!(
+            pass2.contains("mstar = simd_max(mstar)"),
+            "pass 2 must reduce the block maxima to a global max"
+        );
+        assert!(
+            pass2.contains("out[(size_t)h * D + off + i]"),
+            "pass 2 must carry its output write"
+        );
+        assert!(
+            !pass1.contains(Q8_DECODE_PASS_MARKER),
+            "the marker must not repeat inside pass 1"
+        );
+        assert!(
+            !pass2.contains(Q8_DECODE_PASS_MARKER),
+            "the marker must not repeat inside pass 2"
         );
     }
 }

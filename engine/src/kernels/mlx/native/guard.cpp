@@ -966,6 +966,178 @@ extern "C" int inference_mlx_gated_delta(
   });
 }
 
+// The header of the two fused decode kernels: the metal_stdlib and simdgroup includes the
+// kernel bodies are written against. MLX compiles `metal::utils() + header + <generated
+// signature> + body`, so the explicit includes only repeat what the preamble already
+// carries; they keep the kernel bodies self-contained plain Metal text.
+static const char kQ8DecodeKernelHeader[] =
+    "\n#include <metal_stdlib>\n#include <metal_simdgroup>\nusing namespace metal;\n";
+
+// The fused 8-bit KV decode attention as two Metal kernels (packet FUSED-KV8-a), modeled on
+// `inference_mlx_gated_delta`. `dims` holds QH, KVH, D, REP (= QH / KVH), CAP, and GSZ;
+// `len`, `nb` (the block count of `shape::decode_blocks`), and `scale` arrive as scalars, and
+// `pass1_source` / `pass2_source` are the two NUL-terminated kernel bodies of
+// `native/q8_decode_attention.metal`. The kernel and input names, the template arguments
+// (T = the query dtype, D, REP, GSZ), the grids, and the threadgroups match the launcher of
+// the two kernels: pass 1 runs `grid (ceil(nb / rep) * 32, KVH * rep, 1)` with the threadgroup
+// `(32, rep, 1)` and returns the F32 partials po [QH, nb, D], psum [QH, nb], and pmax [QH,
+// nb]; pass 2 runs `grid (QH * 32, 1, 1)` with the threadgroup `(32, 1, 1)`, merges them by
+// log-sum-exp, and writes out [1, QH, 1, D] in the query dtype. `length`, `cap`, `nb`, and
+// `scale` are kernel INPUTS (scalar arrays), not template arguments, so one compiled program
+// serves every length. The two kernel handles, both configs, every vector, and every temporary
+// array are freed on every path in one release block, as the gated delta shim does. The lazy
+// graph holds the pass-1 partials through the pass-2 node. The injected faults strike `result`.
+extern "C" int inference_mlx_quantized_attention_decode(
+    mlx_array* result, mlx_array queries, mlx_array k_codes, mlx_array k_scales,
+    mlx_array k_biases, mlx_array v_codes, mlx_array v_scales, mlx_array v_biases,
+    const int* dims, int len, int nb, float scale, const char* pass1_source,
+    const char* pass2_source, mlx_stream stream) noexcept {
+  return run_selected_operation(result, stream, [&] {
+    const int qh = dims[0], kvh = dims[1], d = dims[2], rep = dims[3], cap = dims[4],
+              gsz = dims[5];
+    const char* pass1_input_names[] = {
+        "q_in", "kc", "ks_row", "kb_row", "vc", "vs_row", "vb_row",
+        "length", "cap", "nb", "scale"};
+    const char* pass1_output_names[] = {"po", "psum", "pmax"};
+    const char* pass2_input_names[] = {"po", "psum", "pmax", "nb"};
+    const char* pass2_output_names[] = {"out"};
+    mlx_vector_string pass1_in_names =
+        mlx_vector_string_new_data(pass1_input_names, 11);
+    mlx_vector_string pass1_out_names = mlx_vector_string_new_data(pass1_output_names, 3);
+    mlx_vector_string pass2_in_names = mlx_vector_string_new_data(pass2_input_names, 4);
+    mlx_vector_string pass2_out_names = mlx_vector_string_new_data(pass2_output_names, 1);
+    mlx_fast_metal_kernel pass1 = mlx_fast_metal_kernel_new(
+        "q8_decode_pass1", pass1_in_names, pass1_out_names, pass1_source,
+        kQ8DecodeKernelHeader, true, false);
+    mlx_fast_metal_kernel pass2 = mlx_fast_metal_kernel_new(
+        "q8_decode_pass2", pass2_in_names, pass2_out_names, pass2_source,
+        kQ8DecodeKernelHeader, true, false);
+    mlx_fast_metal_kernel_config pass1_config = mlx_fast_metal_kernel_config_new();
+    mlx_fast_metal_kernel_config pass2_config = mlx_fast_metal_kernel_config_new();
+    mlx_array length = mlx_array_new_int(len);
+    mlx_array capacity = mlx_array_new_int(cap);
+    mlx_array blocks = mlx_array_new_int(nb);
+    mlx_array scale_arg = mlx_array_new_data(&scale, nullptr, 0, MLX_FLOAT32);
+    const mlx_array pass1_operands[11] = {queries,  k_codes,   k_scales, k_biases,
+                                          v_codes,  v_scales,  v_biases, length,
+                                          capacity, blocks,    scale_arg};
+    mlx_vector_array pass1_inputs = mlx_vector_array_new_data(pass1_operands, 11);
+    mlx_vector_array pass1_outputs = mlx_vector_array_new();
+    const int po_shape[3] = {qh, nb, d};
+    const int partial_shape[2] = {qh, nb};
+    const int out_shape[4] = {1, qh, 1, d};
+    const mlx_dtype query_dtype = mlx_array_dtype(queries);
+    int status = (pass1_in_names.ctx && pass1_out_names.ctx && pass2_in_names.ctx &&
+                  pass2_out_names.ctx && pass1.ctx && pass2.ctx && pass1_config.ctx &&
+                  pass2_config.ctx && length.ctx && capacity.ctx && blocks.ctx &&
+                  scale_arg.ctx && pass1_inputs.ctx && pass1_outputs.ctx)
+                     ? 0
+                     : 1;
+    if (status == 0) {
+      status = mlx_fast_metal_kernel_config_add_output_arg(
+          pass1_config, po_shape, 3, MLX_FLOAT32);
+    }
+    if (status == 0) {
+      status = mlx_fast_metal_kernel_config_add_output_arg(
+          pass1_config, partial_shape, 2, MLX_FLOAT32);
+    }
+    if (status == 0) {
+      status = mlx_fast_metal_kernel_config_add_output_arg(
+          pass1_config, partial_shape, 2, MLX_FLOAT32);
+    }
+    if (status == 0) {
+      status = mlx_fast_metal_kernel_config_set_grid(
+          pass1_config, (nb + rep - 1) / rep * 32, kvh * rep, 1);
+    }
+    if (status == 0) {
+      status = mlx_fast_metal_kernel_config_set_thread_group(pass1_config, 32, rep, 1);
+    }
+    if (status == 0) {
+      status =
+          mlx_fast_metal_kernel_config_add_template_arg_dtype(pass1_config, "T", query_dtype);
+    }
+    if (status == 0) {
+      status = mlx_fast_metal_kernel_config_add_template_arg_int(pass1_config, "D", d);
+    }
+    if (status == 0) {
+      status = mlx_fast_metal_kernel_config_add_template_arg_int(pass1_config, "REP", rep);
+    }
+    if (status == 0) {
+      status = mlx_fast_metal_kernel_config_add_template_arg_int(pass1_config, "GSZ", gsz);
+    }
+    if (status == 0) {
+      status = mlx_fast_metal_kernel_apply(
+          &pass1_outputs, pass1, pass1_inputs, pass1_config, stream);
+    }
+    if (status == 0 && mlx_vector_array_size(pass1_outputs) != 3) status = 1;
+    mlx_array po{nullptr};
+    mlx_array psum{nullptr};
+    mlx_array pmax{nullptr};
+    if (status == 0) status = mlx_vector_array_get(&po, pass1_outputs, 0);
+    if (status == 0) status = mlx_vector_array_get(&psum, pass1_outputs, 1);
+    if (status == 0) status = mlx_vector_array_get(&pmax, pass1_outputs, 2);
+    // Built only after the pass-1 partials exist: `mlx_vector_array_new_data` rejects a null
+    // element, and on a failed path the partials stay null.
+    mlx_vector_array pass2_inputs{nullptr};
+    mlx_vector_array pass2_outputs{nullptr};
+    if (status == 0) {
+      const mlx_array pass2_operands[4] = {po, psum, pmax, blocks};
+      pass2_inputs = mlx_vector_array_new_data(pass2_operands, 4);
+      pass2_outputs = mlx_vector_array_new();
+      if (pass2_inputs.ctx == nullptr || pass2_outputs.ctx == nullptr) status = 1;
+    }
+    if (status == 0) {
+      status = mlx_fast_metal_kernel_config_add_output_arg(
+          pass2_config, out_shape, 4, query_dtype);
+    }
+    if (status == 0) {
+      status = mlx_fast_metal_kernel_config_set_grid(pass2_config, qh * 32, 1, 1);
+    }
+    if (status == 0) {
+      status = mlx_fast_metal_kernel_config_set_thread_group(pass2_config, 32, 1, 1);
+    }
+    if (status == 0) {
+      status =
+          mlx_fast_metal_kernel_config_add_template_arg_dtype(pass2_config, "T", query_dtype);
+    }
+    if (status == 0) {
+      status = mlx_fast_metal_kernel_config_add_template_arg_int(pass2_config, "D", d);
+    }
+    if (status == 0) {
+      status = mlx_fast_metal_kernel_config_add_template_arg_int(pass2_config, "REP", rep);
+    }
+    if (status == 0) {
+      status = mlx_fast_metal_kernel_config_add_template_arg_int(pass2_config, "GSZ", gsz);
+    }
+    if (status == 0) {
+      status = mlx_fast_metal_kernel_apply(
+          &pass2_outputs, pass2, pass2_inputs, pass2_config, stream);
+    }
+    if (status == 0 && mlx_vector_array_size(pass2_outputs) != 1) status = 1;
+    if (status == 0) status = mlx_vector_array_get(result, pass2_outputs, 0);
+    int released = mlx_vector_array_free(pass2_outputs);
+    released |= mlx_vector_array_free(pass2_inputs);
+    released |= mlx_array_free(po);
+    released |= mlx_array_free(psum);
+    released |= mlx_array_free(pmax);
+    released |= mlx_vector_array_free(pass1_outputs);
+    released |= mlx_vector_array_free(pass1_inputs);
+    released |= mlx_array_free(scale_arg);
+    released |= mlx_array_free(blocks);
+    released |= mlx_array_free(capacity);
+    released |= mlx_array_free(length);
+    mlx_fast_metal_kernel_config_free(pass2_config);
+    mlx_fast_metal_kernel_config_free(pass1_config);
+    mlx_fast_metal_kernel_free(pass2);
+    mlx_fast_metal_kernel_free(pass1);
+    released |= mlx_vector_string_free(pass2_out_names);
+    released |= mlx_vector_string_free(pass2_in_names);
+    released |= mlx_vector_string_free(pass1_out_names);
+    released |= mlx_vector_string_free(pass1_in_names);
+    return status != 0 ? status : released;
+  });
+}
+
 extern "C" int inference_mlx_slice(
     mlx_array* result, mlx_array input, const int* start, const int* stop,
     const int* strides, size_t rank, mlx_stream stream) noexcept {

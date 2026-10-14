@@ -538,6 +538,28 @@ unsafe extern "C" {
         source: *const c_char,
         stream: mlx_stream,
     ) -> i32;
+    /// The fused 8-bit KV decode attention as two Metal kernels (packet FUSED-KV8-a). `dims`
+    /// holds QH, KVH, D, REP, CAP, GSZ; `len` and `nb` are the prefix length and the block
+    /// count; `pass1_source` and `pass2_source` are NUL-terminated. The output is lazy.
+    /// Faults strike `result`.
+    #[link_name = "inference_mlx_quantized_attention_decode"]
+    pub(super) fn mlx_quantized_attention_decode(
+        result: *mut mlx_array,
+        queries: mlx_array,
+        k_codes: mlx_array,
+        k_scales: mlx_array,
+        k_biases: mlx_array,
+        v_codes: mlx_array,
+        v_scales: mlx_array,
+        v_biases: mlx_array,
+        dims: *const i32,
+        len: i32,
+        nb: i32,
+        scale: f32,
+        pass1_source: *const c_char,
+        pass2_source: *const c_char,
+        stream: mlx_stream,
+    ) -> i32;
     #[link_name = "inference_mlx_rms_norm"]
     pub(super) fn mlx_rms_norm(
         result: *mut mlx_array,

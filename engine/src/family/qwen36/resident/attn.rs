@@ -43,6 +43,37 @@ use crate::{
     tensor::{Dtype, ExecutionTensor},
 };
 
+/// The prefix length from which the Q8 decode step runs the fused one-row attention kernel. On
+/// the 36 GB Mac Studio (BF16 activation, 8-bit cache, run l9 of the KV8 gate record) the fused
+/// kernel costs about 0.7 ms more per token than the composite at 16 and 8,192 positions (two
+/// kernel launches per layer), saves 4.6 ms at 30,000 positions and 37 ms at 131,072 positions.
+/// The two costs cross near 11,000 positions; 16,384 stays on the safe side of that crossing.
+pub(super) const FUSED_DECODE_MIN_LEN: usize = 16_384;
+
+/// The threshold in force. Test builds read the environment variable `Q36_KV8_FUSED_MIN_LEN`
+/// (a position count; 1 forces the fused kernel at every length the shapes allow, and a value
+/// above the context limit forces the composite) so that the Mac gates can compare the two
+/// paths on the same binary and exercise the fused kernel on short prompts. Production builds
+/// always use [`FUSED_DECODE_MIN_LEN`].
+#[cfg(test)]
+fn fused_min_len() -> usize {
+    use std::sync::OnceLock;
+    static VALUE: OnceLock<usize> = OnceLock::new();
+    *VALUE.get_or_init(|| match std::env::var("Q36_KV8_FUSED_MIN_LEN") {
+        Err(std::env::VarError::NotPresent) => FUSED_DECODE_MIN_LEN,
+        Ok(text) => text.parse::<usize>().unwrap_or_else(|_| {
+            panic!("Q36_KV8_FUSED_MIN_LEN must be a position count, got {text:?}")
+        }),
+        Err(error) => panic!("Q36_KV8_FUSED_MIN_LEN is not valid text: {error}"),
+    })
+}
+
+/// The threshold in force (production builds): [`FUSED_DECODE_MIN_LEN`].
+#[cfg(not(test))]
+fn fused_min_len() -> usize {
+    FUSED_DECODE_MIN_LEN
+}
+
 /// The quantized buffers of one side (keys or values) of the Q8 cache (packet KV8-INTEGRATE;
 /// decision 0046 A7): the packed codes beside the affine scales and biases. All three are
 /// capacity buffers `[1, KVH, cap, last]` written in place by `kv_append` and read through
@@ -558,16 +589,24 @@ pub(super) fn step(
                 scales: &v.scales,
                 biases: &v.biases,
             };
-            ctx.kernels.quantized_attention_prefix(
-                &q,
-                &keys,
-                &values,
-                dim(next_len)?,
-                scale,
-                false,
-                Q8_GROUP,
-                Q8_BITS,
-            )?
+            let len = dim(next_len)?;
+            // From `fused_min_len()` positions on, the fused one-row kernel replaces the two
+            // quantized matmuls and the softmax whenever the shapes allow it. Below it, or for
+            // a shape the kernel does not support (the small test models), the composite runs.
+            // The choice is a function of the shape and the length only: a failure of the
+            // fused kernel is a native failure and never falls back to the composite.
+            if next_len >= fused_min_len()
+                && ctx
+                    .kernels
+                    .supports_quantized_attention_decode(&q, &keys, &values, len, Q8_GROUP, Q8_BITS)
+            {
+                ctx.kernels
+                    .quantized_attention_decode(&q, &keys, &values, len, scale, Q8_GROUP, Q8_BITS)?
+            } else {
+                ctx.kernels.quantized_attention_prefix(
+                    &q, &keys, &values, len, scale, false, Q8_GROUP, Q8_BITS,
+                )?
+            }
         }
         None => return Err(mismatch()),
     };

@@ -7,6 +7,7 @@
 //! temporary array drops while the owner is still healthy, and `Array::drop` retains it instead.
 //! Validation failures return `BadRequest` before the first native call and change nothing.
 
+use std::ffi::CString;
 use std::rc::Rc;
 
 use super::super::{
@@ -35,6 +36,40 @@ const GATED_DELTA_SOURCE: &str = concat!(
     include_str!("../../../../vendor/mlx-lm-gated-delta/gated_delta_step.metal"),
     "\0"
 );
+
+/// The Metal source of the fused 8-bit KV decode attention (packet FUSED-KV8-a): the two
+/// kernel bodies, separated by the marker line that `shape::Q8_DECODE_PASS_MARKER` names.
+/// `q8_decode_sources` splits it; the properties of the split are pinned by the portable
+/// unit test `kernels::shape::tests::q8_decode_attention_metal_splits_into_two_passes`.
+const Q8_DECODE_SOURCE: &str = include_str!("q8_decode_attention.metal");
+
+/// Splits the fused decode Metal source into its two kernel bodies: (pass 1, pass 2). A
+/// malformed file (no marker, a repeated marker, or an empty part) is a NON-terminal
+/// `Backend` error - the split runs before the first native call, so the adapter stays
+/// usable - and never a panic; the unit test of `kernels::shape` proves the shipped file
+/// splits cleanly, so a failure here means the file and this adapter no longer match.
+fn q8_decode_sources() -> Result<(CString, CString), EngError> {
+    let malformed = |message: &str| EngError::Backend {
+        operation: "quantized attention decode",
+        message: format!("the fused decode Metal source is malformed: {message}"),
+    };
+    if Q8_DECODE_SOURCE
+        .matches(shape::Q8_DECODE_PASS_MARKER)
+        .count()
+        != 1
+    {
+        return Err(malformed("it must hold exactly one pass marker"));
+    }
+    let Some((pass1, pass2)) = Q8_DECODE_SOURCE.split_once(shape::Q8_DECODE_PASS_MARKER) else {
+        return Err(malformed("the pass marker does not split it"));
+    };
+    if pass1.trim().is_empty() || pass2.trim().is_empty() {
+        return Err(malformed("both passes must hold a kernel body"));
+    }
+    let nul_free =
+        |pass: &str| CString::new(pass).map_err(|_| malformed("a kernel body holds a NUL byte"));
+    Ok((nul_free(pass1)?, nul_free(pass2)?))
+}
 
 type UnaryElementwise =
     unsafe extern "C" fn(*mut ffi::mlx_array, ffi::mlx_array, ffi::mlx_stream) -> i32;
@@ -693,6 +728,128 @@ impl Context {
             )
         })?;
         Ok(promoting_elementwise_result(state, output, layout))
+    }
+
+    /// `quantized_attention_decode` (packet FUSED-KV8-a): the fused 8-bit KV decode attention,
+    /// `quantized_attention_prefix` for one query row (`L = 1`, non-causal) as ONE pair of Metal
+    /// kernels instead of two `quantized_matmul` calls and a softmax. The shim builds the two
+    /// kernels of `native/q8_decode_attention.metal` per call and frees every handle on every
+    /// path, as the gated delta shim does; `len`, `scale`, the capacity, and the block count of
+    /// `shape::decode_blocks` travel as shim scalars, and `scale` and `len` are kernel inputs,
+    /// so one compiled program serves every length. The output takes the query dtype exactly
+    /// (the kernel casts it), so the expected-output record is strict, not promoting.
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "the packet fixes this signature: len and scale name the attention, \
+                 group_size and bits name the quantization of the buffers"
+    )]
+    pub(in crate::kernels::mlx) fn quantized_attention_decode(
+        &mut self,
+        queries: &ExecutionTensor,
+        keys: &QuantizedKv<'_>,
+        values: &QuantizedKv<'_>,
+        len: u32,
+        scale: f32,
+        group_size: u32,
+        bits: u32,
+    ) -> Result<ExecutionTensor, EngError> {
+        let label = "quantized attention decode";
+        let _dispatch = DispatchGuard::enter();
+        self.check_ready()?;
+        let state = self.state.as_mut().unwrap();
+        let operands = [
+            queries,
+            keys.codes,
+            keys.scales,
+            keys.biases,
+            values.codes,
+            values.scales,
+            values.biases,
+        ];
+        for operand in operands {
+            check_owner(label, state, operand)?;
+        }
+        shape::quantized_kv_operands(
+            label,
+            state.allow_bf16,
+            queries.dtype(),
+            [keys.codes.dtype(), values.codes.dtype()],
+            [
+                [keys.scales.dtype(), keys.biases.dtype()],
+                [values.scales.dtype(), values.biases.dtype()],
+            ],
+        )?;
+        check_positive(label, "scale", scale)?;
+        let layout = shape::quantized_attention_decode(
+            label,
+            queries.shape(),
+            [keys.codes.shape(), keys.scales.shape(), keys.biases.shape()],
+            [
+                values.codes.shape(),
+                values.scales.shape(),
+                values.biases.shape(),
+            ],
+            len,
+            group_size,
+            bits,
+        )?;
+        // After the layout check QH is a multiple of KVH, both are nonzero, and the codes
+        // carry the capacity on axis two.
+        let (heads, key_heads, capacity) = (
+            queries.shape()[1],
+            keys.codes.shape()[1],
+            keys.codes.shape()[2],
+        );
+        let rep = heads / key_heads;
+        let blocks = shape::decode_blocks(len, rep);
+        let dtype = queries.dtype();
+        // The layout counts F32 bytes; the kernel casts its output to the query dtype, whose
+        // byte width is half of F32 for BF16.
+        let byte_len = layout.byte_len / Dtype::F32.byte_width() * dtype.byte_width();
+        let dims = native_ints(
+            label,
+            &[
+                heads,
+                key_heads,
+                queries.shape()[3],
+                rep,
+                capacity,
+                group_size,
+            ],
+        )?;
+        let scalars = native_ints(label, &[len, blocks])?;
+        let (pass1, pass2) = q8_decode_sources()?;
+        let _inputs: Vec<_> = operands.iter().map(|operand| operand.share()).collect();
+        clear_message();
+        let stream = state.stream.0;
+        let expected = ExpectedOutput {
+            operation: label,
+            stream,
+            shape: &layout.shape,
+            byte_len,
+            dtype,
+            promotes: false,
+        };
+        let output = dispatch_contiguous(&expected, |slot| unsafe {
+            ffi::mlx_quantized_attention_decode(
+                slot,
+                queries.storage.native_array(),
+                keys.codes.storage.native_array(),
+                keys.scales.storage.native_array(),
+                keys.biases.storage.native_array(),
+                values.codes.storage.native_array(),
+                values.scales.storage.native_array(),
+                values.biases.storage.native_array(),
+                dims.as_ptr(),
+                scalars[0],
+                scalars[1],
+                scale,
+                pass1.as_ptr(),
+                pass2.as_ptr(),
+                stream,
+            )
+        })?;
+        Ok(state.resident(output, dtype, layout.shape, byte_len))
     }
 
     /// `kv_append` (packet NATIVE-OPS-1): `slice_update` that consumes `target`. The lazy node
