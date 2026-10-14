@@ -22,6 +22,11 @@
 use std::{marker::PhantomData, rc::Rc};
 
 mod attention;
+/// The `mlx_compile` seam (packet MX-COMPILE-1a): the compiled DeltaNet and device-routed MoE
+/// decode steps behind `qwen36.compile`, the test-only gated-delta probe, and the teardown clear
+/// of the calling thread's MLX compile cache (the cache is thread-local; the per-adapter program
+/// registry lives in `State`).
+pub(crate) mod compile;
 mod ffi;
 mod guard;
 mod handles;
@@ -61,6 +66,11 @@ struct State {
     /// Whether the resident float operations take BF16 operands (packet Q36-BF16-a). `false` until
     /// `Context::allow_bf16` sets it, so a caller that never calls it rejects BF16 exactly as before.
     allow_bf16: bool,
+    /// The compiled-program registry of THIS adapter context (packet MX-COMPILE-1a, fix round 1):
+    /// the MLX compile cache is thread-local and dies with its thread, so the registry lives and
+    /// dies with the adapter. The compile seam admits every cache key here before any native
+    /// call; a fifth distinct key of one adapter is a non-terminal `BadRequest`.
+    programs: crate::kernels::compile_key::ProgramRegistry,
 }
 
 impl State {
@@ -104,6 +114,11 @@ impl Context {
     #[cfg(feature = "native-fault-qualification")]
     pub(super) fn qualification_sync_count(&self) -> u64 {
         guard::qualification_sync_count()
+    }
+
+    #[cfg(feature = "native-fault-qualification")]
+    pub(super) fn selected_operation_count(&self) -> u64 {
+        guard::selected_operation_count()
     }
 
     #[cfg(feature = "native-fault-qualification")]
@@ -205,6 +220,7 @@ impl Context {
                 _lease: lease,
                 owner,
                 allow_bf16: false,
+                programs: crate::kernels::compile_key::ProgramRegistry::default(),
             }),
             _thread: PhantomData,
         })
@@ -243,6 +259,14 @@ impl Drop for Context {
                 return;
             }
             state.retire.flush_after_sync();
+            // The thread-local MLX compile cache outlives this adapter's compiled programs, so
+            // the teardown clears it HERE (packet MX-COMPILE-1a item 4): after the synchronize
+            // above completed every pending evaluation and drained the retire list, and BEFORE
+            // `state` below releases the stream and the device (field order is drop order). The
+            // clear empties the calling thread's cache — MLX keeps one cache per thread — and is
+            // idempotent (emptying an already empty cache changes nothing); a failure of it
+            // changes no completion state, so it only drops the count.
+            compile::teardown_clear();
         }
     }
 }

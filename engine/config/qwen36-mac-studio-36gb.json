@@ -15,7 +15,8 @@
         "prefill_budget_bytes": 32212254720,
         "prefill_session_reserve_bytes": 8286699520,
         "activation_dtype": "bf16",
-        "kv_dtype": "q8"
+        "kv_dtype": "q8",
+        "compile": true
       }
     }
   ]

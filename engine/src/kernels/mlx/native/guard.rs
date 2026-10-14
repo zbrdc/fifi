@@ -145,6 +145,11 @@ pub(super) fn qualification_sync_count() -> u64 {
     unsafe { ffi::mlx_qualification_sync_count() }
 }
 
+#[cfg(feature = "native-fault-qualification")]
+pub(super) fn selected_operation_count() -> u64 {
+    unsafe { ffi::mlx_selected_operation_count() }
+}
+
 /// One admitted adapter slot. Residents share it with their adapter, so it outlives the adapter.
 pub(super) struct Lease;
 

@@ -45,6 +45,19 @@
 //! primitive class names (`Matmul`, `RMSNorm`, `GatherQMM`); a few carry spaces (`Scatter Sum`),
 //! which the first-array cut handles.
 //!
+//! How MLX prints a compiled region (recorded from the MLX source at the
+//! pinned commit 1f8e74e3, `mlx/compile.cpp` `Compiled::name`): a compiled function is ONE
+//! primitive node whose name is `"Compiled"` followed by the concatenated names of every
+//! primitive of its tape, for example
+//! `CompiledQuantizedMatmulMultiplySumAxisAddSigmoid A [[1, 32], float32] -> B [[1, 32], float32]`.
+//! The name carries no space unless an embedded tape primitive carries one, and the inner tape is
+//! not printed, so ONE compiled block call (a whole DeltaNet or MoE decode step) appears as ONE
+//! node line. The parser below needs no change for it — the grammar cut at the first array
+//! reference keeps the whole concatenated name — and the unit test
+//! `a_compiled_region_prints_as_one_node_line` locks that in with a hand-written sample. With
+//! `QWEN36_G2A_COMPILE=1` the dump therefore shows each compiled DeltaNet and MoE block as a
+//! `Compiled...` node; `total_nodes` drops by the fused ops of the block.
+//!
 //! The exact Mac command (placeholders only; no personal path lives in this repository):
 //!
 //! ```text
@@ -57,7 +70,22 @@
 //!   family::qwen36::resident::graph_count::decode_graph_primitives -- --ignored --exact --nocapture
 //! ```
 //!
-//! The f32 control is the same command with `Q36_ACTIVATION=f32` and a fresh `Q36_OUT_DIR`.
+//! The f32 control is the same command with `Q36_ACTIVATION=f32` and a fresh `Q36_OUT_DIR`. The
+//! compiled run adds `QWEN36_G2A_COMPILE=1` and a fresh `Q36_OUT_DIR`:
+//!
+//! ```text
+//! Q36_CKPT_DIR=<CKPT_DIR> \
+//! IDS_FILE=<IDS_FILE> \
+//! REF_JSON=<REF_JSON> \
+//! Q36_OUT_DIR=<OUT_DIR> \
+//! Q36_ACTIVATION=bf16 \
+//! QWEN36_G2A_COMPILE=1 \
+//! cargo test --release --features native-mlx,native-fault-qualification --lib \
+//!   family::qwen36::resident::graph_count::decode_graph_primitives -- --ignored --exact --nocapture
+//! ```
+//!
+//! The report then carries `compile: true` and the `compile_counters` rows, and `graph_fifi.txt`
+//! shows the compiled blocks as `Compiled...` nodes.
 
 use super::super::settings::{Activation, parse_activation};
 
@@ -261,6 +289,10 @@ fn decode_graph_primitives() {
         kv,
     )
     .unwrap();
+    // The compile counters of the run start clean: with the switch on,
+    // the one decode step below traces each block kind once and hits the cache for the rest.
+    decoder.kernels.reset_compile_counters();
+    decoder.kernels.clear_compile_cache().unwrap();
     let mut state = decoder.zero_state().unwrap();
     // Prefill depth 16 through the chunked prefill, as the decode rows of Q36-GAP ran it.
     decoder
@@ -297,6 +329,9 @@ fn decode_graph_primitives() {
         .unwrap_or_else(|| panic!("the graph probe dumped nothing; the step ran without it"));
     let histogram = primitive_histogram(&text);
     let total: usize = histogram.iter().map(|&(_, count)| count).sum();
+    // The compile fields, beside the existing ones: the value of the
+    // `QWEN36_G2A_COMPILE` switch and the compile counters of the one decode step.
+    let (compile_switch, compile_counters) = super::compiled::switch_and_counters(&decoder.kernels);
     let rows: Vec<serde_json::Value> = histogram
         .iter()
         .map(|(name, count)| serde_json::json!({ "name": name, "count": count }))
@@ -309,6 +344,8 @@ fn decode_graph_primitives() {
         "decode_token": ids[DEPTH],
         "outputs_dumped": outputs_dumped,
         "total_nodes": total,
+        "compile": compile_switch,
+        "compile_counters": compile_counters,
         "histogram": rows,
         "calls_per_token": {
             "import": timing.import_calls.saturating_sub(timing_before.import_calls),
@@ -395,6 +432,34 @@ mod tests {
             primitive_histogram(text),
             vec![("CustomKernel".to_string(), 1)],
             "the parser is tolerant to names it has never seen"
+        );
+    }
+
+    /// A compiled region prints as ONE node line whose name is "Compiled" plus the concatenated
+    /// names of its tape (recorded from the MLX source at the pinned commit 1f8e74e3,
+    /// `mlx/compile.cpp` `Compiled::name`). The parser must keep that whole
+    /// name and count the node once, so the graph dump with `QWEN36_G2A_COMPILE=1` shows each
+    /// compiled DeltaNet and MoE decode block as one `Compiled...` node and `total_nodes` drops by
+    /// the fused ops of the block. Mutation check: make the parser skip lines whose name starts
+    /// with `Compiled` — this test must fail.
+    #[test]
+    fn a_compiled_region_prints_as_one_node_line() {
+        let text = "Inputs: A [[1, 2048], float32], B [[1, 2048], float32]\n\
+                    Outputs: C [[1, 2048], float32]\n\
+                    Matmul A [[1, 2048], float32], B [[2048, 2048], float32] -> D [[1, 2048], float32]\n\
+                    CompiledQuantizedMatmulMultiplySumAxisAddSigmoid D [[1, 2048], float32], B [[2048], float32] -> C [[1, 2048], float32]\n\
+                    Scatter Sum A [[4], uint32] -> F [[4], float32]\n";
+        assert_eq!(
+            primitive_histogram(text),
+            vec![
+                (
+                    "CompiledQuantizedMatmulMultiplySumAxisAddSigmoid".to_string(),
+                    1
+                ),
+                ("Matmul".to_string(), 1),
+                ("Scatter Sum".to_string(), 1),
+            ],
+            "the concatenated compiled name stays whole, counts once, and sorts by count then name"
         );
     }
 

@@ -46,6 +46,9 @@ unsafe extern "C" {
     #[cfg(feature = "native-fault-qualification")]
     #[link_name = "inference_mlx_qualification_sync_count"]
     pub(super) fn mlx_qualification_sync_count() -> u64;
+    #[cfg(feature = "native-fault-qualification")]
+    #[link_name = "inference_mlx_selected_operation_count"]
+    pub(super) fn mlx_selected_operation_count() -> u64;
     /// Prints the lazy graph of `outputs` into one malloced buffer (packet GPU-GAP-COUNT). The
     /// buffer is NUL-terminated, `len` bytes long, and owned by the caller: free it with
     /// `mlx_free_string`. The dump fills no output array, so — like `mlx_async_eval` — it takes
@@ -560,6 +563,84 @@ unsafe extern "C" {
         pass2_source: *const c_char,
         stream: mlx_stream,
     ) -> i32;
+    /// Stage 1 of the compile seam: compiles one closure that replays the gated delta kernel
+    /// with the fixed cache key `fun_id` (shapeless false) and applies it once to the six
+    /// operands. Both outputs are lazy. A non-zero status means MLX refused to trace or evaluate
+    /// the custom Metal kernel under compile. Test builds only, like its only caller.
+    #[cfg(test)]
+    #[link_name = "inference_mlx_compile_probe"]
+    pub(super) fn mlx_compile_probe(
+        y: *mut mlx_array,
+        state_out: *mut mlx_array,
+        q: mlx_array,
+        k: mlx_array,
+        v: mlx_array,
+        g: mlx_array,
+        beta: mlx_array,
+        state: mlx_array,
+        dims: *const i32,
+        source: *const c_char,
+        fun_id: usize,
+        stream: mlx_stream,
+    ) -> i32;
+    /// The DeltaNet decode block as one compiled closure (packet MX-COMPILE-1a behind
+    /// `qwen36.compile`). `dims` holds hidden, kh, kd,
+    /// vh, vd, cd, taps, kw, kw2; `quant` holds mode, group, bits per weight for qkv, z, b, a,
+    /// out; `inputs` holds the 26 closure inputs of the block input order; `activation` is the
+    /// activation dtype the block casts its output to (`to_act`). The three outputs (out, rec,
+    /// ring) are lazy. A non-zero status is a native failure of the adapter.
+    #[link_name = "inference_mlx_compile_delta_block"]
+    pub(super) fn mlx_compile_delta_block(
+        out: *mut mlx_array,
+        rec: *mut mlx_array,
+        ring: *mut mlx_array,
+        inputs: *const mlx_array,
+        inputs_num: usize,
+        dims: *const i32,
+        quant: *const i32,
+        eps: f32,
+        activation: mlx_dtype,
+        source: *const c_char,
+        fun_id: usize,
+        stream: mlx_stream,
+    ) -> i32;
+    /// The device-routed MoE decode block as one compiled closure (packet MX-COMPILE-1a behind
+    /// `qwen36.compile`). `dims` holds
+    /// hidden, experts, top_k, renorm (0 or 1); `quant` holds mode, group, bits per weight for
+    /// the shared gate, up, down and the gate, up, down stacks; `inputs` holds the 21 closure
+    /// inputs of the block input order; `activation` is the activation dtype the block casts its
+    /// output to. The four outputs (out, ids, gates, health) are lazy. A non-zero status is a
+    /// native failure of the adapter.
+    #[link_name = "inference_mlx_compile_moe_block"]
+    pub(super) fn mlx_compile_moe_block(
+        out: *mut mlx_array,
+        ids: *mut mlx_array,
+        gates: *mut mlx_array,
+        health: *mut mlx_array,
+        inputs: *const mlx_array,
+        inputs_num: usize,
+        dims: *const i32,
+        quant: *const i32,
+        activation: mlx_dtype,
+        fun_id: usize,
+        stream: mlx_stream,
+    ) -> i32;
+    /// Clears the calling thread's MLX compile cache (packet MX-COMPILE-1a): the measurement
+    /// harness between runs and the adapter teardown, after its pending work completed and
+    /// before its stream and device are released. The cache is thread-local.
+    #[link_name = "inference_mlx_compile_clear_cache"]
+    pub(super) fn mlx_compile_clear_cache() -> i32;
+    /// Reads the process-wide counts of compiled closure-body entries of the two block kinds
+    /// (packet MX-COMPILE-1a, fix round 1): the authoritative trace counts of the seam. A body
+    /// entry means MLX traced the closure (or returned the uncompiled function, which runs the
+    /// body on every call); a cache hit replays the compiled tape without entering the body.
+    #[link_name = "inference_mlx_compile_trace_counts"]
+    pub(super) fn mlx_compile_trace_counts(delta: *mut u64, moe: *mut u64);
+    /// Zeroes the counts of [`mlx_compile_trace_counts`]. Test builds only, from the test-only
+    /// counter reset of `compile_stats`.
+    #[cfg(test)]
+    #[link_name = "inference_mlx_compile_reset_trace_counts"]
+    pub(super) fn mlx_compile_reset_trace_counts();
     #[link_name = "inference_mlx_rms_norm"]
     pub(super) fn mlx_rms_norm(
         result: *mut mlx_array,

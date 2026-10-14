@@ -1,4 +1,6 @@
 #include "mlx/c/array.h"
+#include "mlx/c/closure.h"
+#include "mlx/c/compile.h"
 #include "mlx/c/device.h"
 #include "mlx/c/error.h"
 #include "mlx/c/fast.h"
@@ -7,7 +9,11 @@
 #include "mlx/c/stream.h"
 #include "mlx/c/transforms.h"
 #include "mlx/c/vector.h"
+#include <cstdint>
+#include <cstdio>
 #include <cstring>
+#include <atomic>
+#include <cstdlib>
 #include <limits>
 #include <unistd.h>
 
@@ -49,10 +55,16 @@ enum class OperationFault { None, Call, Null, Evaluate, Mismatch };
 
 static std::atomic_bool evaluate_fault_armed{false};
 
+// Every selected operation of the process, counted whether or not a fault is armed. A qualification
+// test reads it just before the call under test, so that a second run can arm the fault for the
+// operation that follows (the setup of a decoder takes a few hundred selected page imports).
+static std::atomic_ulong selected_operation_total{0};
+
 // One shot. The variable value is a failure name with an optional `:N` suffix. The Nth selected
 // operation of the process takes the failure. Without a suffix N is 1. Unset values, unknown names,
 // and malformed counts select no failure and leave the shot unused.
 static OperationFault take_operation_fault() noexcept {
+  selected_operation_total.fetch_add(1, std::memory_order_relaxed);
   static std::atomic_ulong seen{0};
   static std::atomic_bool taken{false};
   const char* value = std::getenv("INFERENCE_MLX_FAULT_NEXT_OPERATION");
@@ -134,9 +146,66 @@ static int run_selected_operation(mlx_array*, mlx_stream, Run run) noexcept {
 }
 #endif
 
+// First-error capture for the mlx_compile seam (fix round 2 of the seam). mlx-c reports a
+// failing closure body as the generic "mlx_closure returned a non-zero value", and that text is
+// the LAST message the error handler sees, so the real MLX exception of the failing traced call
+// is overwritten before the Rust adapter reads it. While the capture is armed, the handler below
+// stores the first message and forwards every message to the pair that
+// `inference_mlx_set_error_handler` installed; when a compile-seam call then fails, the seam
+// re-emits the stored first message, so the Backend error names the real cause. Every native call
+// runs under the dispatch guard and the handler runs on the calling thread, so like the handler
+// state of mlx-c's error.cpp these statics need no lock.
+static char compile_first_error_[1024];
+static size_t compile_first_error_len_ = 0;
+static bool compile_first_error_set_ = false;
+static mlx_error_handler_func compile_previous_handler_ = nullptr;
+static void* compile_previous_data_ = nullptr;
+// The seam vector that the code below is touching right now. mlx-c reports a null-handle misuse
+// ("expected a non-empty mlx_vector_array", mlx_array, ...) with only its own file and line and
+// names no handle, so the seam labels every vector it touches and the capture appends the label
+// of the call site that was running when the misuse struck.
+static const char* compile_seam_vector_ = "";
+
+// Names the vector that the next seam call touches, for the null-handle report above.
+static void compile_touching(const char* vector) noexcept {
+  compile_seam_vector_ = vector;
+}
+
+// True for the mlx-c null-handle misuse messages, which name no handle of their own.
+static bool compile_is_null_handle_misuse(const char* message) noexcept {
+  return std::strncmp(message, "expected a non-empty mlx_", 25) == 0;
+}
+
+static void compile_seam_capture_error(const char* message, void* data) noexcept {
+  if (message != nullptr && !compile_first_error_set_) {
+    size_t length = 0;
+    for (; length < sizeof(compile_first_error_) - 1 && message[length] != '\0'; ++length) {
+    }
+    std::memcpy(compile_first_error_, message, length);
+    if (compile_is_null_handle_misuse(message) && compile_seam_vector_[0] != '\0') {
+      const int added = std::snprintf(
+          compile_first_error_ + length, sizeof(compile_first_error_) - length,
+          " (seam vector: %s)", compile_seam_vector_);
+      if (added > 0) {
+        const size_t room = sizeof(compile_first_error_) - 1 - length;
+        length += static_cast<size_t>(added) <= room ? static_cast<size_t>(added) : room;
+      }
+    }
+    compile_first_error_[length] = '\0';
+    compile_first_error_len_ = length;
+    compile_first_error_set_ = true;
+  }
+  if (compile_previous_handler_ != nullptr) {
+    compile_previous_handler_(message, compile_previous_data_);
+  }
+  (void)data;
+}
+
 // Error formatting can throw after the C binding catches an exception. Keep that exception outside Rust.
 extern "C" void inference_mlx_set_error_handler(
     mlx_error_handler_func handler, void* data, void (*destructor)(void*)) noexcept {
+  compile_previous_handler_ = handler;
+  compile_previous_data_ = data;
   mlx_set_error_handler(handler, data, destructor);
 }
 
@@ -196,6 +265,12 @@ extern "C" int inference_mlx_synchronize(mlx_stream stream) noexcept {
 #ifdef INFERENCE_NATIVE_FAULT_QUALIFICATION
 extern "C" std::uint64_t inference_mlx_qualification_sync_count() noexcept {
   return static_cast<std::uint64_t>(sync_calls.load(std::memory_order_relaxed));
+}
+
+// The selected operations of the process so far (qualification builds). It resets nothing and
+// changes no fault selection.
+extern "C" std::uint64_t inference_mlx_selected_operation_count() noexcept {
+  return static_cast<std::uint64_t>(selected_operation_total.load(std::memory_order_relaxed));
 }
 
 // Prints the lazy graph of `outputs` into one malloced buffer (packet GPU-GAP-COUNT). The dump
@@ -914,13 +989,12 @@ extern "C" int inference_mlx_quantized_attention_prefix(
 // and `gated_delta_kernel` of mlx-lm 0.31.0 (`gated_delta.py` lines 100 to 115 and 196 to 209).
 // `dims` holds B, T, Hk, Dk, Hv, and Dv. Every operand and both outputs are F32, so `InT` is float.
 // The kernel handle, its configuration, and the temporary arrays are freed before the call
-// returns. The lazy graph keeps what it needs. The injected faults of `run_selected_operation`
-// strike `y`.
-extern "C" int inference_mlx_gated_delta(
+// returns. The lazy graph keeps what it needs. Shared with the compile closure bodies of packet
+// the compiled closures, which replay this call on tracer arrays.
+static int gated_delta_kernel_call(
     mlx_array* y, mlx_array* state_out, mlx_array q, mlx_array k, mlx_array v, mlx_array g,
     mlx_array beta, mlx_array state, const int* dims, const char* source,
     mlx_stream stream) noexcept {
-  return run_selected_operation(y, stream, [&] {
     const int b = dims[0], t = dims[1], hk = dims[2], dk = dims[3], hv = dims[4], dv = dims[5];
     const char* input_names[] = {"q", "k", "v", "g", "beta", "state_in", "T"};
     const char* output_names[] = {"y", "state_out"};
@@ -931,7 +1005,9 @@ extern "C" int inference_mlx_gated_delta(
     mlx_fast_metal_kernel_config config = mlx_fast_metal_kernel_config_new();
     mlx_array time = mlx_array_new_int(t);
     const mlx_array operands[7] = {q, k, v, g, beta, state, time};
+    compile_touching("gated delta kernel inputs vector");
     mlx_vector_array inputs = mlx_vector_array_new_data(operands, 7);
+    compile_touching("gated delta kernel outputs vector");
     mlx_vector_array outputs = mlx_vector_array_new();
     const int y_shape[4] = {b, t, hv, dv};
     const int state_shape[4] = {b, hv, dv, dk};
@@ -952,6 +1028,7 @@ extern "C" int inference_mlx_gated_delta(
     if (status == 0) status = mlx_fast_metal_kernel_config_add_template_arg_int(config, "Hk", hk);
     if (status == 0) status = mlx_fast_metal_kernel_config_add_template_arg_int(config, "Hv", hv);
     if (status == 0) status = mlx_fast_metal_kernel_apply(&outputs, kernel, inputs, config, stream);
+    compile_touching("gated delta kernel outputs element");
     if (status == 0 && mlx_vector_array_size(outputs) != 2) status = 1;
     if (status == 0) status = mlx_vector_array_get(y, outputs, 0);
     if (status == 0) status = mlx_vector_array_get(state_out, outputs, 1);
@@ -963,6 +1040,16 @@ extern "C" int inference_mlx_gated_delta(
     released |= mlx_vector_string_free(out_names);
     released |= mlx_vector_string_free(in_names);
     return status != 0 ? status : released;
+}
+
+// The gated delta rule as one resident operation. The injected faults of
+// `run_selected_operation` strike `y`.
+extern "C" int inference_mlx_gated_delta(
+    mlx_array* y, mlx_array* state_out, mlx_array q, mlx_array k, mlx_array v, mlx_array g,
+    mlx_array beta, mlx_array state, const int* dims, const char* source,
+    mlx_stream stream) noexcept {
+  return run_selected_operation(y, stream, [&] {
+    return gated_delta_kernel_call(y, state_out, q, k, v, g, beta, state, dims, source, stream);
   });
 }
 
@@ -1293,4 +1380,796 @@ extern "C" const uint32_t* inference_mlx_array_data_uint32(mlx_array array) noex
 
 extern "C" const int64_t* inference_mlx_array_data_int64(mlx_array array) noexcept {
   return mlx_array_data_int64(array);
+}
+
+// ---------------------------------------------------------------------------
+// mlx_compile seam (packet MX-COMPILE-1a: the compiled DeltaNet and MoE decode blocks run
+// behind the engine setting `qwen36.compile`, default false). The compile probe of stage 1
+// stays test-only. A non-zero status makes the Rust adapter mark itself failed, as every resident operation does:
+// there is no fallback to the uncompiled path after the setting turned the seam on. The two
+// block wrappers run under `run_selected_operation`, so the qualification fault hooks select
+// them for call failure, null output, and output mismatch like every resident operation. The
+// closures replay the exact op sequences of the Rust blocks by calling the inference_mlx_*
+// shims above, so an uncompiled run and a compiled run issue the same MLX calls.
+//
+// The MLX compile cache is THREAD-LOCAL (mlx/compile.cpp keeps one cache per thread), so the
+// Rust adapter keeps its program registry per adapter context and clears only the dropping
+// thread's cache at teardown.
+// ---------------------------------------------------------------------------
+
+// Process-wide counts of compiled closure-body entries per block kind (packet MX-COMPILE-1a,
+// fix round 1): the authoritative trace counts of the seam. A body entry means MLX traced the
+// closure — or returned the uncompiled function, which runs the body on every call — while a
+// cache hit replays the compiled tape without entering the body. The counts cover every thread;
+// relaxed loads and stores are enough because they only observe the counts, never order other
+// memory.
+static std::atomic<uint64_t> compile_delta_body_entries_{0};
+static std::atomic<uint64_t> compile_moe_body_entries_{0};
+
+// Arms the first-error capture of the compile seam: it installs the capturing handler and forgets
+// any earlier capture. The disarm below reinstalls the handler pair that
+// `inference_mlx_set_error_handler` last installed (or the mlx-c default when none was), so the
+// per-thread message capture of the Rust adapter keeps working between seam calls.
+static void compile_capture_arm() noexcept {
+  compile_first_error_set_ = false;
+  compile_first_error_len_ = 0;
+  compile_first_error_[0] = '\0';
+  compile_seam_vector_ = "";
+  mlx_set_error_handler(&compile_seam_capture_error, nullptr, nullptr);
+}
+
+// Reinstalls the handler pair that was active before `compile_capture_arm`.
+static void compile_capture_disarm() noexcept {
+  mlx_set_error_handler(compile_previous_handler_, compile_previous_data_, nullptr);
+}
+
+// Re-sends the first MLX error seen while the capture was armed through the active handler, so
+// the last message the Rust adapter reads is the real MLX exception of the failing traced call
+// (with its own origin line) instead of the generic closure status of mlx-c.
+static void compile_emit_first_error() noexcept {
+  if (compile_first_error_len_ == 0) {
+    return;
+  }
+  _mlx_error(__FILE__, __LINE__, "first MLX error under mlx_compile: %s",
+             compile_first_error_);
+}
+
+// Owns one temporary mlx_array and frees it when the scope ends. A null handle releases nothing.
+// A temporary of a failed call is a graph node, not pending work, so the release status is
+// dropped here; the wrapper reports the failure status itself.
+struct CompileScopeArray {
+  mlx_array value{nullptr};
+  ~CompileScopeArray() {
+    if (value.ctx != nullptr) {
+      mlx_array_free(value);
+    }
+  }
+};
+
+// Owns the borrowed input copies that mlx_vector_array_get returned.
+struct CompileScopeInputs {
+  static constexpr size_t kMax = 26;
+  mlx_array values[kMax] = {};
+  size_t count{0};
+  ~CompileScopeInputs() {
+    for (size_t i = 0; i < count; ++i) {
+      mlx_array_free(values[i]);
+    }
+  }
+};
+
+// The baked constants of the stage 1 probe closure. The six operands are closure inputs, so the
+// payload carries only the kernel dimensions, the Metal source, and the stream of the build call.
+struct CompileProbePayload {
+  int dims[6];
+  const char* source;
+  mlx_stream stream;
+};
+
+// Frees the stream copy that the payload holds, then the payload itself.
+static void compile_probe_payload_free(void* raw) noexcept {
+  CompileProbePayload* payload = static_cast<CompileProbePayload*>(raw);
+  if (payload != nullptr) {
+    mlx_stream_free(payload->stream);
+    std::free(payload);
+  }
+}
+
+// Copies `source` into a freshly owned stream handle, so a closure payload can hold it past the
+// call. A plain struct assignment would alias the caller's handle and free it twice.
+static int compile_copy_stream(mlx_stream* destination, mlx_stream source) noexcept {
+  *destination = mlx_stream{nullptr};
+  return mlx_stream_set(destination, source);
+}
+
+// The stage 1 probe body. mlx_compile traces this function: it replays the
+// gated delta kernel call on the tracer arrays of the closure input, in the q, k, v, g, beta,
+// state order of `inference_mlx_gated_delta`, and returns y and state_out through `res`. A
+// non-zero status means MLX refused to trace or evaluate the custom kernel.
+static int compile_probe_delta_body(
+    mlx_vector_array* res, const mlx_vector_array input, void* raw) noexcept {
+  const CompileProbePayload* payload = static_cast<const CompileProbePayload*>(raw);
+  compile_touching("probe closure input vector");
+  if (payload == nullptr || res == nullptr || mlx_vector_array_size(input) != 6) {
+    return 1;
+  }
+  compile_touching("probe closure input element");
+  CompileScopeInputs in;
+  for (; in.count < 6; ++in.count) {
+    if (mlx_vector_array_get(&in.values[in.count], input, in.count) != 0) {
+      return 1;
+    }
+  }
+  // mlx-c hands the body a default-constructed (null) result vector: the closure wrapper of
+  // `mlx_closure_new_func_payload` builds the slot with the no-argument `mlx_vector_array_new_()`,
+  // whose handle has a null ctx, and `mlx_vector_array_append_value` refuses such a vector with
+  // "expected a non-empty mlx_vector_array". So the body collects its outputs in a vector it
+  // created with `mlx_vector_array_new()` and moves them into the slot at the end:
+  // `mlx_vector_array_set` allocates the caller's slot when it is null, and the caller frees the
+  // slot exactly once on either return path of the body (the body frees its own vector once).
+  mlx_vector_array results = mlx_vector_array_new();
+  if (results.ctx == nullptr) {
+    return 1;
+  }
+  mlx_array y{nullptr};
+  mlx_array state_out{nullptr};
+  int status = gated_delta_kernel_call(&y, &state_out, in.values[0], in.values[1], in.values[2],
+                                       in.values[3], in.values[4], in.values[5], payload->dims,
+                                       payload->source, payload->stream);
+  compile_touching("probe body output vector");
+  if (status == 0) status = mlx_vector_array_append_value(results, y);
+  if (status == 0) status = mlx_vector_array_append_value(results, state_out);
+  if (y.ctx != nullptr) {
+    const int release = mlx_array_free(y);
+    if (status == 0) status = release;
+  }
+  if (state_out.ctx != nullptr) {
+    const int release = mlx_array_free(state_out);
+    if (status == 0) status = release;
+  }
+  compile_touching("probe closure result vector");
+  if (status == 0) status = mlx_vector_array_set(res, results);
+  const int release = mlx_vector_array_free(results);
+  return status != 0 ? status : release;
+}
+
+// Stage 1 of the compile seam: builds the probe closure, compiles it with the fixed cache key
+// `fun_id` (shapeless false), applies it once to the six operands, and returns y and state_out as
+// lazy arrays. A non-zero status means MLX refused to trace or evaluate the gated delta custom
+// kernel under compile.
+extern "C" int inference_mlx_compile_probe(
+    mlx_array* y, mlx_array* state_out, mlx_array q, mlx_array k, mlx_array v, mlx_array g,
+    mlx_array beta, mlx_array state, const int* dims, const char* source, uintptr_t fun_id,
+    mlx_stream stream) noexcept {
+  CompileProbePayload* payload =
+      static_cast<CompileProbePayload*>(std::malloc(sizeof(CompileProbePayload)));
+  if (payload == nullptr) {
+    return 1;
+  }
+  for (int i = 0; i < 6; ++i) {
+    payload->dims[i] = dims[i];
+  }
+  payload->source = source;
+  const int stream_status = compile_copy_stream(&payload->stream, stream);
+  if (stream_status != 0) {
+    std::free(payload);
+    return stream_status;
+  }
+  mlx_closure fun = mlx_closure_new_func_payload(
+      compile_probe_delta_body, payload, compile_probe_payload_free);
+  const mlx_array operands[6] = {q, k, v, g, beta, state};
+  compile_touching("probe closure input vector");
+  mlx_vector_array inputs = mlx_vector_array_new_data(operands, 6);
+  compile_touching("probe closure output vector");
+  mlx_vector_array outputs = mlx_vector_array_new();
+  mlx_closure compiled{nullptr};
+  int status = (fun.ctx != nullptr && inputs.ctx != nullptr && outputs.ctx != nullptr) ? 0 : 1;
+  compile_capture_arm();
+  compile_touching("probe compiled closure");
+  if (status == 0) status = mlx_detail_compile(&compiled, fun, fun_id, false, nullptr, 0);
+  compile_touching("probe closure output vector");
+  if (status == 0) status = mlx_closure_apply(&outputs, compiled, inputs);
+  compile_capture_disarm();
+  if (status == 0 && mlx_vector_array_size(outputs) != 2) status = 1;
+  if (status == 0) status = mlx_vector_array_get(y, outputs, 0);
+  if (status == 0) status = mlx_vector_array_get(state_out, outputs, 1);
+  if (compiled.ctx != nullptr) {
+    const int release = mlx_closure_free(compiled);
+    if (status == 0) status = release;
+  }
+  int release = mlx_vector_array_free(outputs);
+  if (status == 0) status = release;
+  release = mlx_vector_array_free(inputs);
+  if (status == 0) status = release;
+  release = mlx_closure_free(fun);
+  if (status == 0) status = release;
+  if (status != 0) compile_emit_first_error();
+  return status;
+}
+
+// The block payloads and bodies of the seam. The weights, the token input, and the
+// state tensors are closure inputs, not payload fields, so one compiled program serves every layer
+// with the same shapes and the trace never bakes a weight array. The payloads hold only host
+// constants: dimensions, the epsilon, the quantization triple per packed weight, the Metal source
+// of the gated delta kernel, and the adapter stream of the build call.
+
+// An optional int argument for the quantized matmul shims: -1 means "leave it to MLX".
+static mlx_optional_int compile_quant_optional(int value) noexcept {
+  return mlx_optional_int{value, value >= 0};
+}
+
+// The quantization mode name of `mode`: 0 affine, 1 mxfp4, 2 mxfp8.
+static const char* compile_quant_mode(int mode) noexcept {
+  return mode == 1 ? "mxfp4" : mode == 2 ? "mxfp8" : "affine";
+}
+
+// Converts `x` to `dtype` into `slot` only when its dtype differs, mirroring `ops::cast_to` of the
+// Rust step (a tensor that has the dtype already is shared and builds no node). The caller reads
+// the converted handle through a borrowed local when `slot` stays null.
+static int compile_cast_to(
+    mlx_array* slot, mlx_array x, mlx_dtype dtype, mlx_stream s) noexcept {
+  if (mlx_array_dtype(x) == dtype) {
+    return 0;
+  }
+  return inference_mlx_resident_astype(slot, x, dtype, s);
+}
+
+// The baked constants of the compiled DeltaNet decode closure. `act` is the activation dtype of
+// the step (the target of the block's final `to_act` cast and a distinct trace per dtype).
+struct CompileDeltaPayload {
+  int hidden;  // H
+  int kh, kd, vh, vd, cd, taps, kw, kw2;
+  float eps;
+  mlx_dtype act;
+  const char* source;
+  mlx_stream stream;
+  int mode[5];   // qkv, z, b, a, out
+  int group[5];
+  int bits[5];
+};
+
+// Frees the stream copy that the payload holds, then the payload itself.
+static void compile_block_payload_free(void* raw) noexcept {
+  CompileDeltaPayload* payload = static_cast<CompileDeltaPayload*>(raw);
+  if (payload != nullptr) {
+    mlx_stream_free(payload->stream);
+    std::free(payload);
+  }
+}
+
+// The compiled DeltaNet decode block body. It replays the op sequence of
+// `engine/src/family/qwen36/resident/delta.rs` `step`, calling the same inference_mlx_* shims
+// that the uncompiled
+// Rust path calls, in the same order, so a compiled run and an uncompiled run issue the same MLX
+// calls and build the same computation in both activation dtypes. The BF16 casts of packet
+// Q36-BF16-a are mirrored exactly: `bb` converts to F32 before its sigmoid (the conditional
+// `b_cast` below), the recurrence state and the convolution ring stay F32 (the one-tap column
+// converts, the many-tap concatenation promotes), and `o` converts to the activation dtype
+// before the out projection (the conditional `o_act`). A quantized matmul or matmul allocates a
+// fresh row-contiguous output, so GAP-TRIM-A dropped the no-op `Contiguous` calls of the original
+// closure; nothing here rebuilds them.
+//
+// Input order (26): x [1,H]; rec [VH,VD,KD]; ring [CD,CK-1]; payload, scales, biases of qkv, z,
+// b, a, and out (a null biases slot when the weight has none); conv_taps [CD,CK-1]; conv_last
+// [CD]; neg_exp_a_log [VH]; dt_bias [VH]; norm [VD]; zero; qk_eps; sqrt_kd.
+// Output order (3): out [1,H] in the activation dtype; rec [VH,VD,KD] F32; ring [CD,CK-1] F32.
+static int compile_delta_body(
+    mlx_vector_array* res, const mlx_vector_array input, void* raw) noexcept {
+  compile_delta_body_entries_.fetch_add(1, std::memory_order_relaxed);
+  const CompileDeltaPayload* p = static_cast<const CompileDeltaPayload*>(raw);
+  compile_touching("delta closure input vector");
+  if (p == nullptr || res == nullptr || mlx_vector_array_size(input) != 26) {
+    return 1;
+  }
+  compile_touching("delta closure input element");
+  CompileScopeInputs in;
+  for (; in.count < 26; ++in.count) {
+    if (mlx_vector_array_get(&in.values[in.count], input, in.count) != 0) {
+      return 1;
+    }
+  }
+  // Collected in a body-owned vector and moved into the caller's null slot at the end; the probe
+  // body above explains why appending to `*res` directly is wrong.
+  mlx_vector_array results = mlx_vector_array_new();
+  if (results.ctx == nullptr) {
+    return 1;
+  }
+  const mlx_stream s = p->stream;
+  const int one_hidden[2] = {1, p->hidden};
+  const int cd_shape[1] = {p->cd};
+  const int column_shape[2] = {p->cd, 1};
+  const int head_shape[2] = {p->kh, p->kd};
+  const int v_shape[4] = {1, 1, p->vh, p->vd};
+  const int qk_shape[4] = {1, 1, p->kh, p->kd};
+  const int gate_scalar_shape[3] = {1, 1, p->vh};
+  const int state_shape[4] = {1, p->vh, p->vd, p->kd};
+  const int core_shape[2] = {p->vh, p->vd};
+  const int rec_shape[3] = {p->vh, p->vd, p->kd};
+  const int flat_shape[2] = {1, p->vh * p->vd};
+  const int start_q[1] = {0};
+  const int start_k[1] = {p->kw};
+  const int start_v[1] = {p->kw2};
+  const int stop_q[1] = {p->kw};
+  const int stop_k[1] = {p->kw2};
+  const int stop_v[1] = {p->cd};
+  const int strides1[1] = {1};
+  const int strides2[2] = {1, 1};
+  const int kept_start[2] = {0, 1};
+  const int kept_stop[2] = {p->cd, p->taps};
+  const int kernel_dims[6] = {1, 1, p->kh, p->kd, p->vh, p->vd};
+  CompileScopeArray x_flat, u, u_flat;
+  CompileScopeArray z, b_product, b, b_cast, a;
+  CompileScopeArray now, past_wide, past, val, y;
+  CompileScopeArray column, column_cast, kept, ring_next;
+  CompileScopeArray q_sliced, q2d, k_sliced, k2d, v_sliced, v4d;
+  CompileScopeArray q_sq, q_sum, q_eps, q_den0, q_den, q_div;
+  CompileScopeArray k_sq, k_sum, k_eps, k_den, k_div;
+  CompileScopeArray q4d, k4d;
+  CompileScopeArray pre, soft, decay, alpha_exp, alpha, beta_sig, beta;
+  CompileScopeArray state4, y2, state_out;
+  CompileScopeArray core, rec_next, normed, z2d, gate, o, o_act, o_flat, out;
+  int status = 0;
+  // The four projections, each as `linear` on this stack: reshape to [1, width], then the
+  // quantized matmul, whose output is a fresh row-contiguous array (no `Contiguous` call).
+  // `u`, `z`, and `a` keep the activation dtype (BF16 activations meet the stored BF16 scales);
+  // `bb` converts to F32 right here, exactly as `delta.rs` does before its sigmoid.
+  if (status == 0) status = inference_mlx_reshape(&x_flat.value, in.values[0], one_hidden, 2, s);
+  if (status == 0)
+    status = inference_mlx_quantized_matmul(
+        &u.value, x_flat.value, in.values[3], in.values[4], in.values[5], true,
+        compile_quant_optional(p->group[0]), compile_quant_optional(p->bits[0]),
+        compile_quant_mode(p->mode[0]), s);
+  if (status == 0)
+    status = inference_mlx_quantized_matmul(
+        &z.value, x_flat.value, in.values[6], in.values[7], in.values[8], true,
+        compile_quant_optional(p->group[1]), compile_quant_optional(p->bits[1]),
+        compile_quant_mode(p->mode[1]), s);
+  if (status == 0)
+    status = inference_mlx_quantized_matmul(
+        &b_product.value, x_flat.value, in.values[9], in.values[10], in.values[11], true,
+        compile_quant_optional(p->group[2]), compile_quant_optional(p->bits[2]),
+        compile_quant_mode(p->mode[2]), s);
+  if (status == 0)
+    status = compile_cast_to(&b_cast.value, b_product.value, MLX_FLOAT32, s);
+  const mlx_array b_used = b_cast.value.ctx != nullptr ? b_cast.value : b_product.value;
+  if (status == 0)
+    status = inference_mlx_quantized_matmul(
+        &a.value, x_flat.value, in.values[12], in.values[13], in.values[14], true,
+        compile_quant_optional(p->group[3]), compile_quant_optional(p->bits[3]),
+        compile_quant_mode(p->mode[3]), s);
+  // Causal depthwise convolution over the ring and the new row, then SiLU. The F32 `conv_last`
+  // and `conv_taps` meet the activation-dtype `u` and promote, so the convolution runs in F32
+  // exactly as the uncompiled step does.
+  if (status == 0) status = inference_mlx_reshape(&u_flat.value, u.value, cd_shape, 1, s);
+  if (status == 0) status = inference_mlx_multiply(&now.value, in.values[19], u_flat.value, s);
+  if (status == 0) status = inference_mlx_multiply(&past_wide.value, in.values[18], in.values[2], s);
+  if (status == 0) status = inference_mlx_sum_axis(&past.value, past_wide.value, 1, false, s);
+  if (status == 0) status = inference_mlx_add(&val.value, now.value, past.value, s);
+  if (status == 0) status = inference_mlx_silu(&y.value, val.value, s);
+  // New ring: drop the oldest tap and append the new row. The ring stays F32: with more than one
+  // tap the F32 `kept` slice promotes the concatenated column; with one tap the column itself
+  // converts to F32 (`delta.rs` casts it when the projection did not already run in F32).
+  if (status == 0) status = inference_mlx_reshape(&column.value, u_flat.value, column_shape, 2, s);
+  if (status == 0 && p->taps > 1) {
+    status = inference_mlx_slice(
+        &kept.value, in.values[2], kept_start, kept_stop, strides2, 2, s);
+    if (status == 0) {
+      const mlx_array parts[2] = {kept.value, column.value};
+      status = inference_mlx_concatenate_axis(&ring_next.value, parts, 2, 1, s);
+    }
+  }
+  if (status == 0 && p->taps <= 1)
+    status = compile_cast_to(&column_cast.value, column.value, MLX_FLOAT32, s);
+  // Split y into q, k, v.
+  if (status == 0) status = inference_mlx_slice(&q_sliced.value, y.value, start_q, stop_q, strides1, 1, s);
+  if (status == 0) status = inference_mlx_reshape(&q2d.value, q_sliced.value, head_shape, 2, s);
+  if (status == 0) status = inference_mlx_slice(&k_sliced.value, y.value, start_k, stop_k, strides1, 1, s);
+  if (status == 0) status = inference_mlx_reshape(&k2d.value, k_sliced.value, head_shape, 2, s);
+  if (status == 0) status = inference_mlx_slice(&v_sliced.value, y.value, start_v, stop_v, strides1, 1, s);
+  if (status == 0) status = inference_mlx_reshape(&v4d.value, v_sliced.value, v_shape, 4, s);
+  // Query and key norm: x / sqrt(sum(x * x) + qk_eps), with sqrt(kd) extra on the query.
+  if (status == 0) status = inference_mlx_multiply(&q_sq.value, q2d.value, q2d.value, s);
+  if (status == 0) status = inference_mlx_sum_axis(&q_sum.value, q_sq.value, 1, true, s);
+  if (status == 0) status = inference_mlx_add(&q_eps.value, q_sum.value, in.values[24], s);
+  if (status == 0) status = inference_mlx_sqrt(&q_den0.value, q_eps.value, s);
+  if (status == 0) status = inference_mlx_multiply(&q_den.value, q_den0.value, in.values[25], s);
+  if (status == 0) status = inference_mlx_divide(&q_div.value, q2d.value, q_den.value, s);
+  if (status == 0) status = inference_mlx_multiply(&k_sq.value, k2d.value, k2d.value, s);
+  if (status == 0) status = inference_mlx_sum_axis(&k_sum.value, k_sq.value, 1, true, s);
+  if (status == 0) status = inference_mlx_add(&k_eps.value, k_sum.value, in.values[24], s);
+  if (status == 0) status = inference_mlx_sqrt(&k_den.value, k_eps.value, s);
+  if (status == 0) status = inference_mlx_divide(&k_div.value, k2d.value, k_den.value, s);
+  if (status == 0) status = inference_mlx_reshape(&q4d.value, q_div.value, qk_shape, 4, s);
+  if (status == 0) status = inference_mlx_reshape(&k4d.value, k_div.value, qk_shape, 4, s);
+  // alpha = exp(-exp(A_log) * softplus(a + dt_bias)), beta = sigmoid(b). The F32 `dt_bias`
+  // promotes the activation-dtype `a`; `b_used` is the F32 `bb`.
+  if (status == 0) status = inference_mlx_add(&pre.value, a.value, in.values[21], s);
+  if (status == 0) status = inference_mlx_logaddexp(&soft.value, pre.value, in.values[23], s);
+  if (status == 0) status = inference_mlx_multiply(&decay.value, in.values[20], soft.value, s);
+  if (status == 0) status = inference_mlx_exp(&alpha_exp.value, decay.value, s);
+  if (status == 0) status = inference_mlx_reshape(&alpha.value, alpha_exp.value, gate_scalar_shape, 3, s);
+  if (status == 0) status = inference_mlx_sigmoid(&beta_sig.value, b_used, s);
+  if (status == 0) status = inference_mlx_reshape(&beta.value, beta_sig.value, gate_scalar_shape, 3, s);
+  // The gated delta rule for one token (decision 0050).
+  if (status == 0) status = inference_mlx_reshape(&state4.value, in.values[1], state_shape, 4, s);
+  if (status == 0)
+    status = inference_mlx_gated_delta(
+        &y2.value, &state_out.value, q4d.value, k4d.value, v4d.value, alpha.value, beta.value,
+        state4.value, kernel_dims, p->source, s);
+  if (status == 0) status = inference_mlx_reshape(&core.value, y2.value, core_shape, 2, s);
+  if (status == 0) status = inference_mlx_reshape(&rec_next.value, state_out.value, rec_shape, 3, s);
+  // Output: silu(z) * rms_norm(core, norm), then the out projection. `normed` is F32 and the
+  // activation-dtype gate promotes the product to F32; `o` then converts to the activation
+  // dtype (`to_act` before the out projection, conditional like `ops::to_act`).
+  if (status == 0)
+    status = inference_mlx_rms_norm(&normed.value, core.value, in.values[22], p->eps, s);
+  if (status == 0) status = inference_mlx_reshape(&z2d.value, z.value, core_shape, 2, s);
+  if (status == 0) status = inference_mlx_silu(&gate.value, z2d.value, s);
+  if (status == 0) status = inference_mlx_multiply(&o.value, normed.value, gate.value, s);
+  if (status == 0) status = compile_cast_to(&o_act.value, o.value, p->act, s);
+  const mlx_array o_used = o_act.value.ctx != nullptr ? o_act.value : o.value;
+  if (status == 0) status = inference_mlx_reshape(&o_flat.value, o_used, flat_shape, 2, s);
+  if (status == 0)
+    status = inference_mlx_quantized_matmul(
+        &out.value, o_flat.value, in.values[15], in.values[16], in.values[17], true,
+        compile_quant_optional(p->group[4]), compile_quant_optional(p->bits[4]),
+        compile_quant_mode(p->mode[4]), s);
+  compile_touching("delta body output vector");
+  if (status == 0) status = mlx_vector_array_append_value(results, out.value);
+  if (status == 0) status = mlx_vector_array_append_value(results, rec_next.value);
+  // With one tap the new ring is the appended column itself, converted to F32 when the
+  // projection did not already run in F32 (`delta.rs` keeps a F32 column as is).
+  if (status == 0) {
+    status = p->taps > 1
+                 ? mlx_vector_array_append_value(results, ring_next.value)
+                 : mlx_vector_array_append_value(
+                       results,
+                       column_cast.value.ctx != nullptr ? column_cast.value : column.value);
+  }
+  compile_touching("delta closure result vector");
+  if (status == 0) status = mlx_vector_array_set(res, results);
+  const int release = mlx_vector_array_free(results);
+  return status != 0 ? status : release;
+}
+
+// The baked constants of the compiled device-routed MoE decode closure. `act` is the activation
+// dtype of the step (the target of the block's final `to_act` cast and a distinct trace per
+// dtype).
+struct CompileMoePayload {
+  int hidden;  // H
+  int experts, top_k, renorm;
+  mlx_dtype act;
+  mlx_stream stream;
+  int mode[6];   // shared gate, up, down, then the gate, up, down stacks
+  int group[6];
+  int bits[6];
+};
+
+// Frees the stream copy that the payload holds, then the payload itself.
+static void compile_moe_payload_free(void* raw) noexcept {
+  CompileMoePayload* payload = static_cast<CompileMoePayload*>(raw);
+  if (payload != nullptr) {
+    mlx_stream_free(payload->stream);
+    std::free(payload);
+  }
+}
+
+// The compiled device-routed MoE decode block body. It replays the op sequence of
+// `engine/src/family/qwen36/resident/moe.rs` `step_device`, `route_device`, and `combine`,
+// calling the same inference_mlx_* shims that the uncompiled Rust path calls, in the same
+// order. A stable
+// ascending argsort of the negated probabilities keeps the lowest index first on ties, like the
+// host rule. The expert ids are clamped below the expert count ONCE per layer (packet
+// GAP-TRIM-A): the top-probability take and the three gathered products share the one
+// `mlx_minimum` node. The BF16 casts of packet Q36-BF16-a are mirrored exactly: the F32
+// `router_t` and `shared_scalar_t` promote the activation-dtype products on their own, the F32
+// gates promote the weighted expert sum, and the block total converts to the activation dtype
+// at the very end (`to_act`, conditional like `ops::to_act`). A matmul allocates a fresh
+// row-contiguous output and an axis-0 take returns the gather output as is, so GAP-TRIM-A
+// dropped the no-op `Contiguous` calls of the original closure; nothing here rebuilds them.
+//
+// Input order (21): x [1,H]; router_t [H,E]; payload, scales, biases of the shared gate, up, and
+// down weights; shared_scalar_t [H,1]; payload, scales, biases of the gate, up, and down expert
+// stacks (a null biases slot when the weight has none).
+// Output order (4): out [1,H] in the activation dtype; ids [k] (U32, the once-clamped ids);
+// gates [k,1,1] (F32); health [1] (F32).
+static int compile_moe_body(
+    mlx_vector_array* res, const mlx_vector_array input, void* raw) noexcept {
+  compile_moe_body_entries_.fetch_add(1, std::memory_order_relaxed);
+  const CompileMoePayload* p = static_cast<const CompileMoePayload*>(raw);
+  compile_touching("moe closure input vector");
+  if (p == nullptr || res == nullptr || mlx_vector_array_size(input) != 21) {
+    return 1;
+  }
+  compile_touching("moe closure input element");
+  CompileScopeInputs in;
+  for (; in.count < 21; ++in.count) {
+    if (mlx_vector_array_get(&in.values[in.count], input, in.count) != 0) {
+      return 1;
+    }
+  }
+  // Collected in a body-owned vector and moved into the caller's null slot at the end; the probe
+  // body above explains why appending to `*res` directly is wrong.
+  mlx_vector_array results = mlx_vector_array_new();
+  if (results.ctx == nullptr) {
+    return 1;
+  }
+  const mlx_stream s = p->stream;
+  const int one_hidden[2] = {1, p->hidden};
+  const int flat_shape[1] = {p->experts};
+  const int gates_shape[3] = {p->top_k, 1, 1};
+  const int x3_shape[3] = {1, 1, p->hidden};
+  const int start[1] = {0};
+  const int stop[1] = {p->top_k};
+  const int strides1[1] = {1};
+  const uint32_t expert_upper = static_cast<uint32_t>(p->experts - 1);
+  CompileScopeArray logits, probs, flat, negated, order, ids;
+  CompileScopeArray clamped, top, health, renorm_sum, gates0, gates;
+  CompileScopeArray x3, hg, hu, act, h, eo, weighted, experts;
+  CompileScopeArray sg_flat, sg, su, act2, sh, so_flat, so;
+  CompileScopeArray scalar_logit, factor, shared_out, total, total_act;
+  int status = 0;
+  // Router probabilities softmax(x . router_t) [1, E]: the F32 router promotes the
+  // activation-dtype logits, so the routing arithmetic runs in F32 exactly as uncompiled.
+  if (status == 0) status = inference_mlx_matmul(&logits.value, in.values[0], in.values[1], s);
+  if (status == 0) status = inference_mlx_softmax(&probs.value, logits.value, true, s);
+  if (status == 0) status = inference_mlx_reshape(&flat.value, probs.value, flat_shape, 1, s);
+  // Device routing: stable argsort of the negated row, slice, ONE clamp below the expert count
+  // for the whole layer (packet GAP-TRIM-A), take, renormalize, health.
+  if (status == 0) status = inference_mlx_negative(&negated.value, flat.value, s);
+  if (status == 0) status = inference_mlx_argsort_axis(&order.value, negated.value, 0, s);
+  if (status == 0) status = inference_mlx_slice(&ids.value, order.value, start, stop, strides1, 1, s);
+  if (status == 0)
+    status = inference_mlx_clamp_indices(&clamped.value, ids.value, expert_upper, s);
+  if (status == 0)
+    status = inference_mlx_resident_take_axis(&top.value, flat.value, clamped.value, 0, s);
+  if (status == 0) status = inference_mlx_sum_axis(&health.value, flat.value, 0, true, s);
+  if (status == 0 && p->renorm != 0) {
+    status = inference_mlx_sum_axis(&renorm_sum.value, top.value, 0, true, s);
+    if (status == 0) status = inference_mlx_divide(&gates0.value, top.value, renorm_sum.value, s);
+  }
+  // Without renormalization the gates are the chosen probabilities themselves.
+  if (status == 0)
+    status = inference_mlx_reshape(
+        &gates.value, p->renorm != 0 ? gates0.value : top.value, gates_shape, 3, s);
+  // The selected experts on x: gate and up, SwiGLU, down, the gate-weighted sum. Every gather
+  // reads the SAME once-clamped ids, so the layer builds one clamp node, like `combine`.
+  if (status == 0) status = inference_mlx_reshape(&x3.value, in.values[0], x3_shape, 3, s);
+  if (status == 0)
+    status = inference_mlx_resident_gather_qmm(
+        &hg.value, x3.value, in.values[12], in.values[13], in.values[14], mlx_array{nullptr},
+        clamped.value, true, compile_quant_optional(p->group[3]),
+        compile_quant_optional(p->bits[3]), compile_quant_mode(p->mode[3]), false, s);
+  if (status == 0)
+    status = inference_mlx_resident_gather_qmm(
+        &hu.value, x3.value, in.values[15], in.values[16], in.values[17], mlx_array{nullptr},
+        clamped.value, true, compile_quant_optional(p->group[4]),
+        compile_quant_optional(p->bits[4]), compile_quant_mode(p->mode[4]), false, s);
+  if (status == 0) status = inference_mlx_silu(&act.value, hg.value, s);
+  if (status == 0) status = inference_mlx_multiply(&h.value, act.value, hu.value, s);
+  if (status == 0)
+    status = inference_mlx_resident_gather_qmm(
+        &eo.value, h.value, in.values[18], in.values[19], in.values[20], mlx_array{nullptr},
+        clamped.value, true, compile_quant_optional(p->group[5]),
+        compile_quant_optional(p->bits[5]), compile_quant_mode(p->mode[5]), false, s);
+  // The F32 gates promote the weighted products, so the expert sum is F32.
+  if (status == 0) status = inference_mlx_multiply(&weighted.value, eo.value, gates.value, s);
+  if (status == 0) status = inference_mlx_sum_axis(&experts.value, weighted.value, 0, false, s);
+  // The shared expert: sigmoid(x . s) * down(silu(gate(x)) * up(x)).
+  if (status == 0) status = inference_mlx_reshape(&sg_flat.value, in.values[0], one_hidden, 2, s);
+  if (status == 0)
+    status = inference_mlx_quantized_matmul(
+        &sg.value, sg_flat.value, in.values[2], in.values[3], in.values[4], true,
+        compile_quant_optional(p->group[0]), compile_quant_optional(p->bits[0]),
+        compile_quant_mode(p->mode[0]), s);
+  if (status == 0)
+    status = inference_mlx_quantized_matmul(
+        &su.value, sg_flat.value, in.values[5], in.values[6], in.values[7], true,
+        compile_quant_optional(p->group[1]), compile_quant_optional(p->bits[1]),
+        compile_quant_mode(p->mode[1]), s);
+  if (status == 0) status = inference_mlx_silu(&act2.value, sg.value, s);
+  if (status == 0) status = inference_mlx_multiply(&sh.value, act2.value, su.value, s);
+  if (status == 0 && sh.value.ctx != nullptr) {
+    const int* sh_shape = mlx_array_shape(sh.value);
+    if (sh_shape == nullptr || sh_shape[1] < 1) {
+      status = 1;
+    } else {
+      const int so_shape[2] = {1, sh_shape[1]};
+      status = inference_mlx_reshape(&so_flat.value, sh.value, so_shape, 2, s);
+    }
+  }
+  if (status == 0)
+    status = inference_mlx_quantized_matmul(
+        &so.value, so_flat.value, in.values[8], in.values[9], in.values[10], true,
+        compile_quant_optional(p->group[2]), compile_quant_optional(p->bits[2]),
+        compile_quant_mode(p->mode[2]), s);
+  // The F32 shared scalar promotes the sigmoid factor, so the shared product is F32 and so is
+  // the block total; the total then converts to the activation dtype (the block's `to_act`).
+  if (status == 0) status = inference_mlx_matmul(&scalar_logit.value, in.values[0], in.values[11], s);
+  if (status == 0) status = inference_mlx_sigmoid(&factor.value, scalar_logit.value, s);
+  if (status == 0) status = inference_mlx_multiply(&shared_out.value, factor.value, so.value, s);
+  if (status == 0) status = inference_mlx_add(&total.value, experts.value, shared_out.value, s);
+  if (status == 0) status = compile_cast_to(&total_act.value, total.value, p->act, s);
+  const mlx_array out = total_act.value.ctx != nullptr ? total_act.value : total.value;
+  compile_touching("moe body output vector");
+  if (status == 0) status = mlx_vector_array_append_value(results, out);
+  // The route is the once-clamped ids, exactly the `BoundedIndices::ids` the uncompiled route
+  // exposes; the clamp of an in-range id is the identity, so the values are bit for bit equal.
+  if (status == 0) status = mlx_vector_array_append_value(results, clamped.value);
+  if (status == 0) status = mlx_vector_array_append_value(results, gates.value);
+  if (status == 0) status = mlx_vector_array_append_value(results, health.value);
+  compile_touching("moe closure result vector");
+  if (status == 0) status = mlx_vector_array_set(res, results);
+  const int release = mlx_vector_array_free(results);
+  return status != 0 ? status : release;
+}
+
+// Builds a payload closure, compiles it under the fixed cache key `fun_id` (shapeless false),
+// applies it to `inputs`, checks the output count, extracts the outputs, and frees every handle
+// on every path. `outputs` holds the extracted arrays when the status is zero.
+static int compile_apply_block(
+    mlx_array* outputs, size_t outputs_num,
+    int (*body)(mlx_vector_array*, const mlx_vector_array, void*), void* payload,
+    void (*payload_free)(void*), const mlx_array* inputs, size_t inputs_num,
+    uintptr_t fun_id) noexcept {
+  mlx_closure fun = mlx_closure_new_func_payload(body, payload, payload_free);
+  compile_touching("block closure input vector");
+  mlx_vector_array input_vec = mlx_vector_array_new_data(inputs, inputs_num);
+  compile_touching("block closure output vector");
+  mlx_vector_array produced = mlx_vector_array_new();
+  mlx_closure compiled{nullptr};
+  int status = (fun.ctx != nullptr && input_vec.ctx != nullptr && produced.ctx != nullptr) ? 0 : 1;
+  compile_capture_arm();
+  compile_touching("block compiled closure");
+  if (status == 0) status = mlx_detail_compile(&compiled, fun, fun_id, false, nullptr, 0);
+  compile_touching("block closure output vector");
+  if (status == 0) status = mlx_closure_apply(&produced, compiled, input_vec);
+  compile_capture_disarm();
+  if (status == 0 && mlx_vector_array_size(produced) != outputs_num) status = 1;
+  for (size_t i = 0; status == 0 && i < outputs_num; ++i) {
+    status = mlx_vector_array_get(&outputs[i], produced, i);
+  }
+  if (compiled.ctx != nullptr) {
+    const int release = mlx_closure_free(compiled);
+    if (status == 0) status = release;
+  }
+  int release = mlx_vector_array_free(produced);
+  if (status == 0) status = release;
+  release = mlx_vector_array_free(input_vec);
+  if (status == 0) status = release;
+  release = mlx_closure_free(fun);
+  if (status == 0) status = release;
+  if (status != 0) compile_emit_first_error();
+  return status;
+}
+
+// The DeltaNet decode block as one compiled closure (packet MX-COMPILE-1a). `dims` holds
+// hidden, kh, kd, vh, vd, cd, taps, kw, kw2.
+// `quant` holds mode, group, bits per weight for qkv, z, b, a, out (15 values; group and bits -1
+// when the mode has none). `inputs` holds the 26 arrays of the input order of
+// `compile_delta_body`. `activation` is the activation dtype of the step. The outputs are lazy.
+// The wrapper runs under `run_selected_operation`, so the injected faults of the qualification
+// build strike `out` (the first output), like the `y` of `inference_mlx_gated_delta`.
+extern "C" int inference_mlx_compile_delta_block(
+    mlx_array* out, mlx_array* rec, mlx_array* ring, const mlx_array* inputs, size_t inputs_num,
+    const int* dims, const int* quant, float eps, mlx_dtype activation, const char* source,
+    uintptr_t fun_id, mlx_stream stream) noexcept {
+  return run_selected_operation(out, stream, [&]() noexcept {
+    if (inputs_num != 26) {
+      return 1;
+    }
+    CompileDeltaPayload* payload =
+        static_cast<CompileDeltaPayload*>(std::malloc(sizeof(CompileDeltaPayload)));
+    if (payload == nullptr) {
+      return 1;
+    }
+    payload->hidden = dims[0];
+    payload->kh = dims[1];
+    payload->kd = dims[2];
+    payload->vh = dims[3];
+    payload->vd = dims[4];
+    payload->cd = dims[5];
+    payload->taps = dims[6];
+    payload->kw = dims[7];
+    payload->kw2 = dims[8];
+    payload->eps = eps;
+    payload->act = activation;
+    payload->source = source;
+    int stream_status = compile_copy_stream(&payload->stream, stream);
+    if (stream_status != 0) {
+      std::free(payload);
+      return stream_status;
+    }
+    for (int i = 0; i < 5; ++i) {
+      payload->mode[i] = quant[3 * i];
+      payload->group[i] = quant[3 * i + 1];
+      payload->bits[i] = quant[3 * i + 2];
+    }
+    mlx_array outputs[3] = {{nullptr}, {nullptr}, {nullptr}};
+    int status = compile_apply_block(
+        outputs, 3, compile_delta_body, payload, compile_block_payload_free, inputs, inputs_num,
+        fun_id);
+    *out = outputs[0];
+    *rec = outputs[1];
+    *ring = outputs[2];
+    return status;
+  });
+}
+
+// The device-routed MoE decode block as one compiled closure (packet MX-COMPILE-1a). `dims`
+// holds hidden, experts, top_k, and renorm (0 or 1). `quant` holds mode, group, bits per weight for the shared gate, up, down
+// and the gate, up, down stacks (18 values). `inputs` holds the 21 arrays of the input order of
+// `compile_moe_body`. `activation` is the activation dtype of the step. The outputs are lazy.
+// The wrapper runs under `run_selected_operation`, so the injected faults of the qualification
+// build strike `out` (the first output), like the `y` of `inference_mlx_gated_delta`.
+extern "C" int inference_mlx_compile_moe_block(
+    mlx_array* out, mlx_array* ids, mlx_array* gates, mlx_array* health, const mlx_array* inputs,
+    size_t inputs_num, const int* dims, const int* quant, mlx_dtype activation, uintptr_t fun_id,
+    mlx_stream stream) noexcept {
+  return run_selected_operation(out, stream, [&]() noexcept {
+    if (inputs_num != 21) {
+      return 1;
+    }
+    CompileMoePayload* payload =
+        static_cast<CompileMoePayload*>(std::malloc(sizeof(CompileMoePayload)));
+    if (payload == nullptr) {
+      return 1;
+    }
+    payload->hidden = dims[0];
+    payload->experts = dims[1];
+    payload->top_k = dims[2];
+    payload->renorm = dims[3];
+    payload->act = activation;
+    int stream_status = compile_copy_stream(&payload->stream, stream);
+    if (stream_status != 0) {
+      std::free(payload);
+      return stream_status;
+    }
+    for (int i = 0; i < 6; ++i) {
+      payload->mode[i] = quant[3 * i];
+      payload->group[i] = quant[3 * i + 1];
+      payload->bits[i] = quant[3 * i + 2];
+    }
+    mlx_array outputs[4] = {{nullptr}, {nullptr}, {nullptr}, {nullptr}};
+    int status = compile_apply_block(
+        outputs, 4, compile_moe_body, payload, compile_moe_payload_free, inputs, inputs_num,
+        fun_id);
+    *out = outputs[0];
+    *ids = outputs[1];
+    *gates = outputs[2];
+    *health = outputs[3];
+    return status;
+  });
+}
+
+// Clears the calling thread's MLX compile cache (the cache is thread-local), so a following
+// block call compiles again and a measurement run can time a clean first call.
+extern "C" int inference_mlx_compile_clear_cache() noexcept {
+  mlx_compile_cache cache{nullptr};
+  int status = mlx_detail_compile_cache(&cache);
+  if (status == 0 && cache.ctx != nullptr) {
+    status = mlx_detail_compile_clear_cache(cache);
+    const int release = mlx_compile_cache_free(cache);
+    if (status == 0) status = release;
+  }
+  return status;
+}
+
+// Reads the process-wide counts of compiled closure-body entries of the two block kinds: the
+// authoritative trace counts of the seam (see the statics above). Null pointers read nothing.
+extern "C" void inference_mlx_compile_trace_counts(
+    uint64_t* delta, uint64_t* moe) noexcept {
+  if (delta != nullptr) {
+    *delta = compile_delta_body_entries_.load(std::memory_order_relaxed);
+  }
+  if (moe != nullptr) {
+    *moe = compile_moe_body_entries_.load(std::memory_order_relaxed);
+  }
+}
+
+// Zeroes the body-entry counts, so a test that resets the Rust counters reads its own traces
+// and not the body entries of the tests before it.
+extern "C" void inference_mlx_compile_reset_trace_counts() noexcept {
+  compile_delta_body_entries_.store(0, std::memory_order_relaxed);
+  compile_moe_body_entries_.store(0, std::memory_order_relaxed);
 }

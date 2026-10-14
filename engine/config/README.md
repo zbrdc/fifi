@@ -24,6 +24,25 @@ state tensor, and a `bf16` engine plans its chunk exactly like an `f32` engine w
 allows one.
 With `bf16` the resident weights are 19,286,549,004 bytes against 21,420,001,804 with `f32`.
 
+## Compile
+
+The `qwen36.compile` member (packet MX-COMPILE-1a) turns `mlx_compile` on for the decode blocks:
+boolean, default `false` in the code. The shipped Mac file sets `true` (the user decided this on
+2026-10-14 after the Mac gates of MX-COMPILE-1a). The MLX arm reads it; the CUDA arm records the
+key as ignored (it has no MLX compile seam) and logs one start line for it.
+With `compile: true` the DeltaNet and the device-routed MoE one-token decode blocks run as
+compiled closures: results are deterministic run to run but not bit-identical to the uncompiled
+path (F32 logits move by at most 5e-5). The Mac gate measured the greedy decode speed with the
+8-bit cache: 76.4 to 86.3 tokens per second at depth 16 (+13.0 percent), 62.7 to 70.5 at 8,192
+(+12.4 percent), and 53.1 to 58.2 at 30,000 (+9.6 percent), and the decode graph shrinks from
+4,542 to 3,042 nodes. In the 24-prompt tool-call bank the format token stays top-1 on 24 of 24
+prompts; the lowest P(format) is 0.9898 in the `chunk256` configuration (0.9954 without
+compile). The host routing mode and the chunked prefill never compile their blocks.
+The engine admits the model at load: it traces one program per distinct set of baked constants
+before the first token and refuses the load with a typed error when it cannot — a model with a
+packed weight that carries no biases, or one that needs more than 4 compiled programs. The
+adapter keeps at most 4 programs, and the start line prints the warm-up seconds per block kind.
+
 ## KV cache dtype
 
 The `qwen36.kv_dtype` member (decision 0046 A7) selects the form of the attention cache: `f32` or `q8`.

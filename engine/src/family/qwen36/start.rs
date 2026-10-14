@@ -29,6 +29,21 @@ use crate::{
     tokenizer::TokenizerBundle,
 };
 
+/// The rules of one engine, built from the settings and the pinned tokenizer facts. Every
+/// setting that the decoder reads travels here in one place: `compile` is the `qwen36.compile`
+/// member, so a settings change reaches the decoder exactly through this function.
+fn rules_of(settings: &Q36Settings, eos: Vec<u32>, sampler_vocab: usize) -> Q36Rules {
+    Q36Rules {
+        eos,
+        sampler_vocab,
+        context_limit: settings.context_limit,
+        session_cap: settings.session_cap,
+        activation: settings.activation,
+        kv_dtype: settings.kv,
+        compile: settings.compile,
+    }
+}
+
 /// Loads and pins the tokenizer, then starts the engine thread. The thread loads the weights, so
 /// the engine state stays `Loading` until the weights are resident. Returns the engine and the
 /// pinned tokenizer bundle that renders and encodes its prompts.
@@ -46,16 +61,21 @@ pub(crate) fn start(settings: &Q36Settings) -> Result<(Engine, TokenizerBundle),
         EngError::BadRequest("engine config: the worker piece exceeds usize".into())
     })?;
     let owned = settings.clone();
-    let rules = Q36Rules {
-        eos,
-        sampler_vocab,
-        context_limit: settings.context_limit,
-        session_cap: settings.session_cap,
-        activation: settings.activation,
-        kv_dtype: settings.kv,
-    };
+    let rules = rules_of(settings, eos, sampler_vocab);
     let engine = spawn_engine(fallback, move || {
         let (mut executor, session) = Q36Executor::open(&owned.artifact, owned.cache_limit, rules)?;
+        let (delta_warmup, moe_warmup) = executor.compile_warmup_seconds();
+        if !delta_warmup.is_empty() || !moe_warmup.is_empty() {
+            let total = |seconds: &[f64]| seconds.iter().sum::<f64>();
+            eprintln!(
+                "q36 compile: warm-up traced {} delta program(s) in {:.3} s and {} moe program(s) \
+                 in {:.3} s",
+                delta_warmup.len(),
+                total(delta_warmup),
+                moe_warmup.len(),
+                total(moe_warmup)
+            );
+        }
         if let Some(line) = plan_prefill(&mut executor, &owned)? {
             eprintln!("{line}");
         }
@@ -91,4 +111,50 @@ pub(super) fn plan_prefill(
             "q36 prefill: no chunk above one token fits (largest {max_rows}); prompts run one token at a time; {terms}"
         ),
     }))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::rules_of;
+    use crate::family::qwen36::settings::{Backend, Q36Env, Q36Options, Q36Settings};
+    use std::path::Path;
+
+    /// The rules of the engine thread carry the `qwen36.compile` member of the settings: `start`
+    /// builds its rules through `rules_of`, so a config entry with `compile: true` reaches the
+    /// decoder and an entry without it does not. Mutation check (the start-passes-false patch):
+    /// with the member dropped here, the `rules.compile` row reads false and the test fails.
+    #[test]
+    fn the_rules_carry_the_compile_setting_of_the_config() {
+        let settings = |options: Option<&Q36Options>| {
+            Q36Settings::new(
+                Path::new("/m"),
+                Path::new("/t"),
+                options,
+                &Q36Env::default(),
+                Backend::Mlx,
+            )
+        };
+        // The MLX arm requires a cache limit: the member stands in for `Q36_CACHE_LIMIT`.
+        let with = settings(Some(&Q36Options {
+            cache_limit_bytes: Some(1024),
+            compile: Some(true),
+            ..Q36Options::default()
+        }))
+        .unwrap();
+        assert!(with.compile, "the MLX arm reads the compile member");
+        assert!(
+            rules_of(&with, vec![248_046], 8).compile,
+            "the rules carry the compile setting into the executor"
+        );
+        let without = settings(Some(&Q36Options {
+            cache_limit_bytes: Some(1024),
+            ..Q36Options::default()
+        }))
+        .unwrap();
+        assert!(!without.compile, "the default is off");
+        assert!(
+            !rules_of(&without, vec![248_046], 8).compile,
+            "off stays off through the whole start path"
+        );
+    }
 }

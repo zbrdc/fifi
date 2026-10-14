@@ -240,6 +240,7 @@ fn run(
     let mut ctx = Ctx {
         kernels: &mut decoder.kernels,
         consts: &weights.consts,
+        compile: false,
     };
     let mut h = embed_rows(&mut ctx, ckpt, &weights.embed, tokens)?;
     let mut layers = Vec::with_capacity(old.len());

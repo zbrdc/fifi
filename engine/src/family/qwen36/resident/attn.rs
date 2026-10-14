@@ -898,6 +898,7 @@ mod tests {
             let mut ctx = Ctx {
                 kernels: &mut kernels,
                 consts: &w.consts,
+                compile: false,
             };
             let next = step(&mut ctx, &shape, rw, cache, n, &xr).unwrap();
             let old = concat_step(&mut ctx, &shape, rw, &concat, n, &xr).unwrap();
@@ -1042,6 +1043,7 @@ mod tests {
         let mut ctx = Ctx {
             kernels: &mut kernels,
             consts: &w.consts,
+            compile: false,
         };
         // An empty cache at position 3.
         let wrong_len = step(&mut ctx, &shape, rw, KvCache::empty(), 3, &xr);
@@ -1163,6 +1165,7 @@ mod tests {
         let mut ctx = Ctx {
             kernels: &mut kernels,
             consts: &w.consts,
+            compile: false,
         };
         let first = step(&mut ctx, &shape, rw, KvCache::with_step(65_536), 0, &warm).unwrap();
         let (first_k, first_v) = f32_pair(&first.cache);
@@ -1175,6 +1178,7 @@ mod tests {
             let mut ctx = Ctx {
                 kernels: &mut kernels,
                 consts: &w.consts,
+                compile: false,
             };
             let next = step(&mut ctx, &shape, rw, cache, n, &xr).unwrap();
             if n % 8 == 7 {
@@ -1245,6 +1249,7 @@ mod tests {
         let mut ctx = Ctx {
             kernels: &mut kernels,
             consts: &w.consts,
+            compile: false,
         };
         let first = step(
             &mut ctx,
@@ -1266,6 +1271,7 @@ mod tests {
             let mut ctx = Ctx {
                 kernels: &mut kernels,
                 consts: &w.consts,
+                compile: false,
             };
             let next = step(&mut ctx, &shape, rw, cache, n, &xr).unwrap();
             if n % 8 == 7 {
@@ -1344,6 +1350,7 @@ mod tests {
             let mut ctx = Ctx {
                 kernels: &mut kernels,
                 consts: &w.consts,
+                compile: false,
             };
             let control = step(
                 &mut ctx,
@@ -1443,6 +1450,7 @@ mod tests {
             let mut ctx = Ctx {
                 kernels: &mut kernels,
                 consts: &w.consts,
+                compile: false,
             };
             f32_cache = step(&mut ctx, &shape, rw, f32_cache, n, &xr).unwrap().cache;
             q8_cache = step(&mut ctx, &shape, rw, q8_cache, n, &xr).unwrap().cache;
@@ -1463,6 +1471,7 @@ mod tests {
             let mut ctx = Ctx {
                 kernels: &mut kernels,
                 consts: &w.consts,
+                compile: false,
             };
             let out = step(&mut ctx, &shape, rw, cache, 7, &last).unwrap().out;
             outputs.push(values(&mut kernels, &out).unwrap());
@@ -1511,6 +1520,7 @@ mod tests {
             let mut ctx = Ctx {
                 kernels: &mut kernels,
                 consts: &w.consts,
+                compile: false,
             };
             let from_small = step(
                 &mut ctx,
@@ -1525,6 +1535,7 @@ mod tests {
             let mut ctx = Ctx {
                 kernels: &mut kernels,
                 consts: &w.consts,
+                compile: false,
             };
             let from_large = step(
                 &mut ctx,
@@ -1577,6 +1588,7 @@ mod tests {
             let mut ctx = Ctx {
                 kernels: &mut kernels,
                 consts: &w.consts,
+                compile: false,
             };
             cache = step(&mut ctx, &shape, rw, cache, n, &xr).unwrap().cache;
             let logical = kv_plan::logical_bytes(cache.len, growth).unwrap();
@@ -1610,6 +1622,7 @@ mod tests {
         let mut ctx = Ctx {
             kernels: &mut kernels,
             consts: &w.consts,
+            compile: false,
         };
         // Run one step in each form, then cross the forms over.
         let control = step(
@@ -1672,6 +1685,7 @@ mod tests {
             let mut ctx = Ctx {
                 kernels: &mut kernels,
                 consts: &w.consts,
+                compile: false,
             };
             let next = step(&mut ctx, &shape, rw, cache, n as u32, xr).unwrap();
             assert_eq!(
@@ -1705,6 +1719,7 @@ mod tests {
         let mut ctx = Ctx {
             kernels: &mut kernels,
             consts: &w.consts,
+            compile: false,
         };
         let next = step(&mut ctx, &shape, rw, KvCache::empty(), 0, &xr).unwrap();
         assert_eq!(

@@ -98,6 +98,9 @@ fn run(
     let mut ctx = Ctx {
         kernels: &mut decoder.kernels,
         consts: &weights.consts,
+        // The `qwen36.compile` setting of the decoder (packet MX-COMPILE-1a): the one-token
+        // decode step is the only step that compiles its DeltaNet and MoE blocks.
+        compile: decoder.compile,
     };
     let mut h = embed_row(&mut ctx, ckpt, &weights.embed, token)?;
     let mut layers = Vec::with_capacity(old.len());

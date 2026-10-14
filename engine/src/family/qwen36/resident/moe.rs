@@ -61,6 +61,10 @@ fn shared(ctx: &mut Ctx<'_>, w: &RMoe, x: &ExecutionTensor) -> Result<ExecutionT
 /// chose the experts. It synchronizes twice: the probability readback (which also evaluates `x`)
 /// and the import of the selected indices and gates.
 ///
+/// This host-routed MoE step NEVER compiles (packet MX-COMPILE-1a): it is the parity reference
+/// of decision 0046 A2, and only the device-routed `step_device` has a compiled form. The
+/// DeltaNet block of a host-routed decoder still compiles — its step ignores the routing.
+///
 /// A router output with a count other than the expert count returns `BadRequest` before routing.
 /// A router row that holds a NaN, an infinite value, or a negative value returns `Backend` from
 /// `route_experts`. That error ends one job and does not make the adapter terminal.
@@ -198,6 +202,15 @@ pub(super) fn step_device(
     x: &ExecutionTensor,
 ) -> Result<(ExecutionTensor, DeviceRoute), EngError> {
     let m = &shape.moe;
+    // The compiled decode closure (packet MX-COMPILE-1a): the `qwen36.compile` setting (or the
+    // test override of
+    // `QWEN36_G2A_COMPILE`) runs the DEVICE-routed step through ONE compiled closure instead of
+    // the op sequence below, in the activation dtype of the step. The host-routed `step` below
+    // never compiles: it is the parity reference of decision 0046 A2. No fallback: a failure of
+    // the compiled path is a native failure of the adapter.
+    if super::compiled::step_requested(ctx.compile) {
+        return super::compiled::moe_step_device(ctx, shape, w, x);
+    }
     let logits = ctx.kernels.mm(x, &w.router_t)?;
     let probs = ctx.kernels.softmax(&logits)?;
     if probs.shape() != [1, dim(m.experts)?] {
@@ -304,6 +317,7 @@ mod tests {
             let mut ctx = Ctx {
                 kernels: &mut kernels,
                 consts: &w.consts,
+                compile: false,
             };
             let (out, (routes, probs)) = step(&mut ctx, &shape, &w.layers[0].moe, &xr).unwrap();
             assert_eq!(out.shape(), [1, 64], "input {n} output shape");
@@ -338,6 +352,7 @@ mod tests {
         let mut ctx = Ctx {
             kernels: &mut kernels,
             consts: &w.consts,
+            compile: false,
         };
         let (_, (_, probs)) = step(&mut ctx, &shape, &w.layers[0].moe, &xr).unwrap();
         assert_parity(&probs, &want, "router probabilities of input 2");
@@ -354,6 +369,7 @@ mod tests {
         let mut ctx = Ctx {
             kernels: &mut kernels,
             consts: &w.consts,
+            compile: false,
         };
         let (_, (routes, probs)) = step(&mut ctx, &shape, &w.layers[0].moe, &xr).unwrap();
         assert_eq!(routes, [(0, 0.5), (1, 0.5)]);
@@ -371,6 +387,7 @@ mod tests {
         let mut ctx = Ctx {
             kernels: &mut kernels,
             consts: &w.consts,
+            compile: false,
         };
         let failed = step(&mut ctx, &shape, &w.layers[0].moe, &xr);
         assert!(
@@ -389,6 +406,7 @@ mod tests {
         let mut ctx = Ctx {
             kernels: &mut kernels,
             consts: &w.consts,
+            compile: false,
         };
         assert!(step(&mut ctx, &shape, &w.layers[0].moe, &good).is_ok());
     }
@@ -403,6 +421,7 @@ mod tests {
         let mut ctx = Ctx {
             kernels: &mut kernels,
             consts: &w.consts,
+            compile: false,
         };
         let failed = step(&mut ctx, &shape, &w.layers[0].moe, &xr);
         assert!(
@@ -416,6 +435,7 @@ mod tests {
         let mut ctx = Ctx {
             kernels: &mut kernels,
             consts: &w.consts,
+            compile: false,
         };
         let failed = step(&mut ctx, &shape, &w.layers[0].moe, &xr);
         match failed {
@@ -438,6 +458,7 @@ mod tests {
         let mut ctx = Ctx {
             kernels: &mut kernels,
             consts: &w.consts,
+            compile: false,
         };
         let (out, _) = step(&mut ctx, &shape, &w.layers[0].moe, &xr).unwrap();
         assert_eq!(kernels.qualification_sync_count(), before + 2);
@@ -501,6 +522,7 @@ mod tests {
             let mut ctx = Ctx {
                 kernels: &mut *kernels,
                 consts: &consts,
+                compile: false,
             };
             route_device(&mut ctx, &probs, 8, renorm).unwrap()
         };
@@ -616,6 +638,7 @@ mod tests {
         let mut ctx = Ctx {
             kernels: &mut kernels,
             consts: &consts,
+            compile: false,
         };
         let top_k = "moe top-k must be between 1 and the expert count";
         assert_eq!(bad_request(route_device(&mut ctx, &row, 0, true)), top_k);
@@ -644,6 +667,7 @@ mod tests {
                 let mut ctx = Ctx {
                     kernels: &mut kernels,
                     consts: &w.consts,
+                    compile: false,
                 };
                 step_device(&mut ctx, &shape, &w.layers[0].moe, &xr).unwrap()
             };
@@ -677,6 +701,7 @@ mod tests {
             let mut ctx = Ctx {
                 kernels: &mut kernels,
                 consts: &w.consts,
+                compile: false,
             };
             step_device(&mut ctx, &shape, &w.layers[0].moe, &xr).unwrap()
         };
@@ -696,6 +721,7 @@ mod tests {
             let mut ctx = Ctx {
                 kernels: &mut kernels,
                 consts: &w.consts,
+                compile: false,
             };
             step_device(&mut ctx, &shape, &w.layers[0].moe, &xr).unwrap()
         };
@@ -707,6 +733,7 @@ mod tests {
             let mut ctx = Ctx {
                 kernels: &mut kernels,
                 consts: &w.consts,
+                compile: false,
             };
             step_device(&mut ctx, &shape, &w.layers[0].moe, &good).unwrap()
         };
@@ -725,6 +752,7 @@ mod tests {
         let mut ctx = Ctx {
             kernels: &mut kernels,
             consts: &w.consts,
+            compile: false,
         };
         assert_eq!(
             bad_request(step_device(&mut ctx, &shape, &w.layers[0].moe, &xr)),
@@ -743,6 +771,7 @@ mod tests {
         let mut ctx = Ctx {
             kernels: &mut kernels,
             consts: &w.consts,
+            compile: false,
         };
         let (out, route) = step_device(&mut ctx, &shape, &w.layers[0].moe, &xr).unwrap();
         assert_eq!(kernels.qualification_sync_count(), before);

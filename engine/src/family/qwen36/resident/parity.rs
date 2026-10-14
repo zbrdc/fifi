@@ -5,6 +5,15 @@
 //! last-row logits and their top 5, and 32 greedy tokens. The reference is the host forward of Q36-HR,
 //! which shares no kernel with MLX. mlx-lm is not involved. A Q36 result never satisfies Phase 0B or 1B.
 //!
+//! `QWEN36_G2A_COMPILE=1` runs the DeltaNet and device-routed MoE decode steps through `mlx_compile`d
+//! closures in the activation dtype of `Q36_ACTIVATION` (unset or `f32` is the F32 control,
+//! `bf16` runs the BF16 decoder — the dtype is part of the compile cache key) and adds the
+//! `compile` row to the report: the switch value and the `compile_counters` (traces, cache hits,
+//! calls, per block the cache key and the seconds of the first calls). Run the gate twice, once
+//! without the variable (the control) and once with it, in each activation dtype: bit identity of
+//! the two `layers_sha256` values is the first expectation, and the cosine gates below are the
+//! stated fallback tolerance when fusion changes the numerics.
+//!
 //! ```text
 //! Q36_CKPT_DIR=<model_dir> Q36_REF_DIR=<copy of the evidence directory ref/> \
 //!   Q36_OUT_DIR=<a path that does not exist yet> \
@@ -158,6 +167,8 @@ fn real_checkpoint_matches_the_host_reference() {
     );
     let mut kernels = MlxKernels::try_new().unwrap();
     kernels.reset_peak_memory().unwrap();
+    kernels.reset_compile_counters();
+    kernels.clear_compile_cache().unwrap();
     let started = std::time::Instant::now();
     let host = HostWeights::load(&real.ckpt, &QWEN3_6_35B_A3B, &real.config).unwrap();
     let (mut decoder, act) = new_decoder(kernels, &real.ckpt, host, 256);
@@ -238,7 +249,7 @@ fn real_checkpoint_matches_the_host_reference() {
         "min_layer_cosine": min_cos, "nan_layer_cosines": nan_cosines, "logits_cosine": logits_cos, "top5": got_top5,
         "greedy_ids": tokens, "failures": failures, "layer_cosines": table,
         "load_seconds": load_seconds, "step_seconds": seconds,
-        "mlx_active": stats.active, "mlx_peak": stats.peak, "rss_kb": rss_kb(),
+        "mlx_active": stats.active, "mlx_cache": stats.cache, "mlx_peak": stats.peak, "rss_kb": rss_kb(),
         "kv_charge_bytes": decoder.budget.used(), "state_bytes": state.byte_len().unwrap(),
         "activation_dtype": activation_name(act),
         "layers_sha256": format!("{:x}", layers_hash.finalize()),
@@ -247,7 +258,16 @@ fn real_checkpoint_matches_the_host_reference() {
         "top5_overlap": top5_overlap, "reference_greedy_ids": greedy,
         "greedy_equal_prefix": greedy_equal_prefix,
         "greedy_equal_positions": greedy_equal_positions,
+        "compile": super::compiled::report(&decoder.kernels),
     });
+    // The retired-byte peak exists only in qualification builds, like its counter.
+    #[cfg(feature = "native-fault-qualification")]
+    let report = {
+        let mut extended = report;
+        extended["peak_retired_bytes"] =
+            serde_json::json!(decoder.kernels.qualification_retire_stats().1);
+        extended
+    };
     println!("{}", serde_json::to_string_pretty(&report).unwrap());
     if let Some(out) = &out_dir {
         std::fs::create_dir(out).expect("Q36_OUT_DIR must not exist yet");

@@ -30,7 +30,8 @@
 //!    `BF16_DIFFERING_FRACTION_LIMIT`, and the absolute signed mean of the per-cell
 //!    host-minus-device probability sums stays at or under `BF16_SIGNED_MEAN_LIMIT`. Greedy
 //!    ids equal in all 36 steps is a gate of both dtypes, and the logits-cosine floor follows
-//!    the dtype too: `MIN_COSINE` (0.99999) for `f32` and `BF16_MIN_COSINE` (0.997) for BF16
+//!    the dtype too: `MIN_COSINE` (0.99999) for `f32` and `BF16_MIN_COSINE` (0.997) for BF16,
+//!    or `BF16_COMPILED_MIN_COSINE` (0.995) for BF16 with the compiled decode steps
 //!    (`route::cosine_passes`), so a cosine under the floor of the run still fails the gate.
 //!    Every failed check is collected into the report's `failures` list before the test fails.
 //! 2. `device_routing_speed_table` times greedy decoding after a 16-token prompt (and, on request,
@@ -47,6 +48,14 @@
 //!
 //! `Q36_OUT_DIR` is required in both tests. `Q36_SPEED_8K=1` adds the 8,192-token row, which runs on
 //! device routing only. Any other set value of `Q36_SPEED_8K` fails the test.
+//!
+//! `QWEN36_G2A_COMPILE=1` runs the DeltaNet and device-routed MoE decode steps of the device routing
+//! block through `mlx_compile`d closures in the activation dtype of `Q36_ACTIVATION` (the dtype is
+//! part of the compile cache key); host routing, the parity reference of decision 0046 A2, never
+//! compiles. Both reports then carry the `compile` row (the switch value and the
+//! `compile_counters`: traces, cache hits, calls, per block the cache key and the seconds of the
+//! first calls) beside `mlx_peak`, the active and cache bytes, and the retired-byte peak. Run each
+//! test with and without the variable, in each activation dtype, and compare the rows.
 //!
 //! The speed test has four more knobs for the profile run of packet Q36-PROF. The defaults give the
 //! table of the packet Q36-DR4. A set value outside the range fails the test.
@@ -110,6 +119,12 @@ const MIN_COSINE: f64 = 0.99999;
 /// observed minimum, so the floor is 0.997, with a 1.64e-3 margin under it (fix5 tightened the
 /// 0.995 of fix4), and a logits cosine under it still fails the gate (`route::cosine_passes`).
 const BF16_MIN_COSINE: f64 = 0.997;
+/// The logits-cosine floor of the BF16 run with the compiled decode steps (MX-COMPILE-1a gate G3).
+/// Compile fuses the elementwise chains of the DeltaNet and MoE blocks, which is another valid BF16
+/// rounding. The compiled run saw a minimum cosine of 0.99697 over its 36 steps (Mac gate l15 at
+/// d3263f43, step 1) against the 0.99864 of the uncompiled run. The floor is 0.995, the floor of
+/// fix4, with a 1.97e-3 margin under the compiled minimum. A cosine under it still fails the gate.
+const BF16_COMPILED_MIN_COSINE: f64 = 0.995;
 /// The near-tie epsilon of the BF16 routing rule (fix4 of packet Q36-BF16-a; decision 0046 A6
 /// item 8), an absolute probability gap. The two routings of one token renormalize their
 /// selected gates with different F32 summation orders (the host sums the top 8 sequentially in
@@ -305,6 +320,8 @@ fn device_routing_picks_the_host_experts_on_the_real_checkpoint() {
     let host = HostWeights::load(&real.ckpt, &QWEN3_6_35B_A3B, &real.config).unwrap();
     let (mut decoder, activation) =
         new_decoder(MlxKernels::try_new().unwrap(), &real.ckpt, host, 256);
+    decoder.kernels.reset_compile_counters();
+    decoder.kernels.clear_compile_cache().unwrap();
     let mut host_state = decoder.zero_state().unwrap();
     let mut device_state = decoder.zero_state().unwrap();
     let mut failures = Vec::new();
@@ -325,9 +342,15 @@ fn device_routing_picks_the_host_experts_on_the_real_checkpoint() {
     // Greedy ids equal in all 36 steps is a gate of both dtypes (fix5 of packet Q36-BF16-a).
     let mut greedy_ids_equal = true;
     // The logits-cosine floor of this run (fix4, fix5): the exact floor for `f32`, 0.997 for
-    // BF16.
+    // BF16, and 0.995 for BF16 with the compiled decode steps.
     let (cosine_floor, floor_basis) = if activation == Activation::F32 {
         (MIN_COSINE, "the exact gate of decision 0046 item 4")
+    } else if super::compiled::requested() {
+        (
+            BF16_COMPILED_MIN_COSINE,
+            "0.995, a 1.97e-3 margin under the observed BF16 minimum 0.99697 of the 36 steps \
+             with the compiled decode steps (Mac gate l15, head d3263f43)",
+        )
     } else {
         (
             BF16_MIN_COSINE,
@@ -587,7 +610,8 @@ fn device_routing_picks_the_host_experts_on_the_real_checkpoint() {
         "greedy_ids_equal_in_all_steps": greedy_ids_equal,
         "forced_retire_flushes": flushes, "forced_retire_flushes_recorded_steps": record_flushes,
         "peak_retired_bytes": host_peaks.peak_retired_bytes.max(device_peaks.peak_retired_bytes),
-        "mlx_active": stats.active, "mlx_peak": host_peaks.mlx_peak.max(device_peaks.mlx_peak),
+        "mlx_active": stats.active, "mlx_cache": stats.cache,
+        "mlx_peak": host_peaks.mlx_peak.max(device_peaks.mlx_peak),
         "host_peaks": {
             "mlx_peak": host_peaks.mlx_peak, "peak_retired_bytes": host_peaks.peak_retired_bytes,
         },
@@ -599,6 +623,7 @@ fn device_routing_picks_the_host_experts_on_the_real_checkpoint() {
         "activation_dtype": activation_name(activation),
         "host_logits_sha256": format!("{:x}", host_hash.finalize()),
         "device_logits_sha256": format!("{:x}", device_hash.finalize()),
+        "compile": super::compiled::report(&decoder.kernels),
     });
     write_report(&out, "route-parity.json", &report);
     assert_eq!(
@@ -777,6 +802,8 @@ fn device_routing_speed_table() {
         host,
         DEFAULT_CONTEXT_LIMIT,
     );
+    decoder.kernels.reset_compile_counters();
+    decoder.kernels.clear_compile_cache().unwrap();
     // The flush count never resets, so each block reports a delta from this baseline.
     let flushes_before = decoder.kernels.qualification_retire_stats().0;
     let mut rows = Vec::new();
@@ -856,7 +883,8 @@ fn device_routing_speed_table() {
     let report = serde_json::json!({
         "activation_dtype": activation_name(act),
         "rows": rows, "forced_retire_flushes": flushes, "peak_retired_bytes": peak_retired,
-        "mlx_active": stats.active, "mlx_peak": peak, "rss_kb": rss_kb(),
+        "mlx_active": stats.active, "mlx_cache": stats.cache, "mlx_peak": peak, "rss_kb": rss_kb(),
+        "compile": super::compiled::report(&decoder.kernels),
         "reference": {
             "decode_16": {"ops": 101.7, "kernel": 117.5},
             "decode_8192": {"ops": 92.3, "kernel": 106.2},

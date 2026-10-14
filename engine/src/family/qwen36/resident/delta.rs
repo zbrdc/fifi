@@ -76,6 +76,14 @@ pub(super) fn step(
             "resident delta ring shape differs from [CD, CK - 1]".into(),
         ));
     }
+    // The compiled decode closure (packet MX-COMPILE-1a): the `qwen36.compile` setting (or the
+    // test override of
+    // `QWEN36_G2A_COMPILE`) runs this step through ONE compiled closure instead of the op
+    // sequence below, in the activation dtype of the step. There is no fallback: a failure of
+    // the compiled path is a native failure of the adapter.
+    if super::compiled::step_requested(ctx.compile) {
+        return super::compiled::delta_step(ctx, shape, w, rec, ring, x);
+    }
     // Projections.
     let u = linear(ctx, &w.qkv, x)?;
     let z = linear(ctx, &w.z, x)?;
@@ -228,6 +236,7 @@ mod tests {
             let mut ctx = Ctx {
                 kernels: &mut kernels,
                 consts: &w.consts,
+                compile: false,
             };
             let next = step(&mut ctx, &shape, rw, &rec, &ring, &xr).unwrap();
             assert_eq!(next.out.shape(), [1, 64], "step {n} output shape");
@@ -282,6 +291,7 @@ mod tests {
         let mut ctx = Ctx {
             kernels: &mut kernels,
             consts: &w.consts,
+            compile: false,
         };
         let bad_rec = step(&mut ctx, &shape, rw, &flat_rec, &ring, &x);
         assert!(
@@ -314,6 +324,7 @@ mod tests {
         let mut ctx = Ctx {
             kernels: &mut kernels,
             consts: &w.consts,
+            compile: false,
         };
         let next = step(&mut ctx, &shape, rw, &rec, &ring, &x).unwrap();
         assert_eq!(

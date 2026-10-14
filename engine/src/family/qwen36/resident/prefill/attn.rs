@@ -401,6 +401,7 @@ mod tests {
             let mut ctx = Ctx {
                 kernels: &mut kernels,
                 consts: &w.consts,
+                compile: false,
             };
             cache = step(&mut ctx, &shape, rw, cache, n, &xr).unwrap().cache;
         }
@@ -408,6 +409,7 @@ mod tests {
         let mut ctx = Ctx {
             kernels: &mut kernels,
             consts: &w.consts,
+            compile: false,
         };
         let next = chunk(&mut ctx, &shape, rw, cache, warm, &x).unwrap();
         let total = warm as usize + count as usize;
@@ -503,6 +505,7 @@ mod tests {
             let mut ctx = Ctx {
                 kernels: &mut kernels,
                 consts: &w.consts,
+                compile: false,
             };
             let next = step(&mut ctx, &shape, rw, cache, n, &xr).unwrap();
             let old = concat_step(&mut ctx, &shape, rw, &concat, n, &xr).unwrap();
@@ -520,6 +523,7 @@ mod tests {
         let mut ctx = Ctx {
             kernels: &mut kernels,
             consts: &w.consts,
+            compile: false,
         };
         let next = chunk(&mut ctx, &shape, rw, cache, 2, &x).unwrap();
         let old = concat_chunk(&mut ctx, &shape, rw, &concat, 2, &x).unwrap();
@@ -544,6 +548,7 @@ mod tests {
             let mut ctx = Ctx {
                 kernels: &mut kernels,
                 consts: &w.consts,
+                compile: false,
             };
             let next = step(&mut ctx, &shape, rw, cache, n, &xr).unwrap();
             let old = concat_step(&mut ctx, &shape, rw, &concat, n, &xr).unwrap();
@@ -609,6 +614,7 @@ mod tests {
             let mut ctx = Ctx {
                 kernels: &mut kernels,
                 consts: &w.consts,
+                compile: false,
             };
             let next = step(&mut ctx, &shape, rw, cache, n, &xr).unwrap();
             let old = concat_step(&mut ctx, &shape, rw, &concat, n, &xr).unwrap();
@@ -626,6 +632,7 @@ mod tests {
         let mut ctx = Ctx {
             kernels: &mut kernels,
             consts: &w.consts,
+            compile: false,
         };
         let next = chunk(&mut ctx, &shape, rw, cache, 2, &x).unwrap();
         let old = concat_chunk(&mut ctx, &shape, rw, &concat, 2, &x).unwrap();
@@ -649,6 +656,7 @@ mod tests {
         let mut ctx = Ctx {
             kernels: &mut kernels,
             consts: &w.consts,
+            compile: false,
         };
         let next = chunk(&mut ctx, &shape, rw, cache, 4, &x).unwrap();
         let old = concat_chunk(&mut ctx, &shape, rw, &concat, 4, &x).unwrap();
@@ -673,6 +681,7 @@ mod tests {
             let mut ctx = Ctx {
                 kernels: &mut kernels,
                 consts: &w.consts,
+                compile: false,
             };
             let next = step(&mut ctx, &shape, rw, cache, n, &xr).unwrap();
             let old = concat_step(&mut ctx, &shape, rw, &concat, n, &xr).unwrap();
@@ -718,6 +727,7 @@ mod tests {
         let mut ctx = Ctx {
             kernels: &mut kernels,
             consts: &w.consts,
+            compile: false,
         };
         let cases = [
             (
@@ -778,6 +788,7 @@ mod tests {
             let mut ctx = Ctx {
                 kernels: &mut *kernels,
                 consts: &w.consts,
+                compile: false,
             };
             cache = step(&mut ctx, shape, rw, cache, n, &xr).unwrap().cache;
         }
@@ -800,6 +811,7 @@ mod tests {
         let mut ctx = Ctx {
             kernels: &mut *kernels,
             consts: &w.consts,
+            compile: false,
         };
         let next = chunk(&mut ctx, shape, rw, cache, warm, &x).unwrap();
         assert_eq!(next.cache.len, warm as usize + count as usize);
@@ -895,6 +907,7 @@ mod tests {
             let mut ctx = Ctx {
                 kernels: &mut kernels,
                 consts: &w.consts,
+                compile: false,
             };
             let next = step(&mut ctx, &shape, rw, cache, n, &xr).unwrap();
             cache = next.cache;
@@ -908,6 +921,7 @@ mod tests {
             let mut ctx = Ctx {
                 kernels: &mut kernels,
                 consts: &w.consts,
+                compile: false,
             };
             f32_cache = step(&mut ctx, &shape, rw, f32_cache, n, &xr).unwrap().cache;
         }
@@ -915,6 +929,7 @@ mod tests {
         let mut ctx = Ctx {
             kernels: &mut kernels,
             consts: &w.consts,
+            compile: false,
         };
         let control = chunk(&mut ctx, &shape, rw, f32_cache, warm, &x).unwrap();
         let control = values(&mut kernels, &control.out).unwrap();
@@ -949,6 +964,7 @@ mod tests {
         let mut ctx = Ctx {
             kernels: &mut kernels,
             consts: &w.consts,
+            compile: false,
         };
         let next = chunk(&mut ctx, &shape, rw, KvCache::empty(), 0, &x).unwrap();
         assert_eq!(

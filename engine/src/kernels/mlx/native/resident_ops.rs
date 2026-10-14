@@ -32,7 +32,7 @@ use crate::{
 
 /// The NUL-terminated Metal source of the gated delta kernel (decision 0050). The file is the text
 /// that `engine/vendor/mlx-lm-gated-delta/extract_kernel.py` derives from mlx-lm 0.31.0.
-const GATED_DELTA_SOURCE: &str = concat!(
+pub(super) const GATED_DELTA_SOURCE: &str = concat!(
     include_str!("../../../../vendor/mlx-lm-gated-delta/gated_delta_step.metal"),
     "\0"
 );
@@ -2028,7 +2028,7 @@ impl ExpectedOutput<'_> {
 }
 
 /// Runs one native call that fills `slot` and rejects a null result.
-fn produce(
+pub(super) fn produce(
     slot: &mut Array,
     operation: &'static str,
     native_call: impl FnOnce(*mut ffi::mlx_array) -> i32,
@@ -2363,7 +2363,12 @@ fn dtype_from_native(dtype: ffi::mlx_dtype) -> Option<Dtype> {
 }
 
 /// Whether an array has the dtype, rank, byte length, and shape that the caller expects.
-fn native_output_valid(output: ffi::mlx_array, shape: &[u32], dtype: Dtype, byte_len: u64) -> bool {
+pub(super) fn native_output_valid(
+    output: ffi::mlx_array,
+    shape: &[u32],
+    dtype: Dtype,
+    byte_len: u64,
+) -> bool {
     if output.ctx.is_null()
         || unsafe { ffi::mlx_array_dtype(output) } != native_dtype(dtype)
         || unsafe { ffi::mlx_array_ndim(output) } != shape.len()
@@ -2401,7 +2406,7 @@ fn check_owner(
 
 /// Rejects an input of another owner or a float dtype that the adapter does not take (F32, and
 /// BF16 after `Context::allow_bf16`), before any native call.
-fn check_operand(
+pub(super) fn check_operand(
     operation: &'static str,
     state: &State,
     x: &ExecutionTensor,
@@ -2420,7 +2425,7 @@ fn check_operand(
 /// Q36-BF16-a fix): the gated delta Metal kernel reads plain F32 bytes (`InT` is float, decision
 /// 0050), and a BF16 operand there is silent garbage, not a promoted operand. The rejection text
 /// is the text of `check_operand` from before the switch existed.
-fn check_f32_operand(
+pub(super) fn check_f32_operand(
     operation: &'static str,
     state: &State,
     x: &ExecutionTensor,

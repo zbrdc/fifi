@@ -107,6 +107,27 @@
 //! deep-depth run reads the prompt ids from a file instead — the little-endian `u32` format of
 //! `Q36_PROMPT_IDS` — by adding `DT_IDS_SOURCE=file Q36_PROMPT_IDS=<PROMPT_IDS>
 //! DT_DEPTHS=16,8192`; the file must hold at least as many ids as the largest depth.
+//!
+//! `QWEN36_G2A_COMPILE` turns the compiled DeltaNet and MoE decode
+//! blocks on in this test build; unset is off and the run is the control. Both runs add the
+//! `compile` field (the value of the switch) and the `compile_counters` field (traces, cache
+//! hits, calls) to `decode_timing.json`. The off/on measurement pair at the three depths, with
+//! the ids file source (placeholders only):
+//!
+//! ```text
+//! Q36_CKPT_DIR=<CKPT_DIR> IDS_FILE=<IDS_FILE> REF_JSON=<REF_JSON> Q36_OUT_DIR=<OUT_DIR_OFF> \
+//! Q36_ACTIVATION=bf16 DT_IDS_SOURCE=file Q36_PROMPT_IDS=<PROMPT_IDS> DT_DEPTHS=16,8192,30000 \
+//! cargo test --release --features native-mlx,native-fault-qualification --lib \
+//!   family::qwen36::resident::decode_timing::decode_phase_timing_by_mode -- --ignored --exact --nocapture
+//! Q36_CKPT_DIR=<CKPT_DIR> IDS_FILE=<IDS_FILE> REF_JSON=<REF_JSON> Q36_OUT_DIR=<OUT_DIR_ON> \
+//! Q36_ACTIVATION=bf16 QWEN36_G2A_COMPILE=1 DT_IDS_SOURCE=file Q36_PROMPT_IDS=<PROMPT_IDS> \
+//! DT_DEPTHS=16,8192,30000 \
+//! cargo test --release --features native-mlx,native-fault-qualification --lib \
+//!   family::qwen36::resident::decode_timing::decode_phase_timing_by_mode -- --ignored --exact --nocapture
+//! ```
+//!
+//! The f32 pair is the same two commands with `Q36_ACTIVATION=f32` and two more fresh output
+//! directories.
 
 use super::super::settings::{Activation, parse_activation};
 
@@ -725,6 +746,12 @@ fn decode_phase_timing_by_mode() {
         ResidentDecoder::new_with_kv(kernels, &real.ckpt, host, CONTEXT_LIMIT, activation, kv)
             .unwrap();
     decoder.budget = SessionBudget::new(SESSION_CAP);
+    // The compile counters of the run start clean: with the switch on,
+    // the warm-up tokens trace each block kind once per dtype and every later call hits the
+    // MLX cache, so the `compile_counters` row of the report separates the one-time compile
+    // from the timed decode calls.
+    decoder.kernels.reset_compile_counters();
+    decoder.kernels.clear_compile_cache().unwrap();
     let mut state = decoder.zero_state().unwrap();
     // The routing of the report is read from the decoder, never asserted as a literal string:
     // one setting serves the decode steps and the chunk prefill alike.
@@ -851,6 +878,9 @@ fn decode_phase_timing_by_mode() {
         }
     }
 
+    // The compile fields, read once for the whole run: the value of the
+    // `QWEN36_G2A_COMPILE` switch and the compile counters after every case and depth.
+    let (compile_switch, compile_counters) = super::compiled::switch_and_counters(&decoder.kernels);
     let report = serde_json::json!({
         "engine": "fifi",
         "packet": "decode_phase_timing_by_mode",
@@ -885,6 +915,8 @@ fn decode_phase_timing_by_mode() {
                         of the step wall minus the counter-timed evaluate and readback walls; \
                         evaluate is the wait for the GPU as the qualification timer counts it \
                         around the synchronizing evaluate call, not a GPU-side kernel time",
+        "compile": compile_switch,
+        "compile_counters": compile_counters,
         "rows": rows,
     });
     std::fs::write(

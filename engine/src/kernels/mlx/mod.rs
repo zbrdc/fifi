@@ -1,6 +1,114 @@
 pub(crate) mod native;
 mod staging;
 
+/// Process-wide production counters of the compiled block calls of the `mlx_compile` seam
+/// (packet MX-COMPILE-1a). The trace counts come from the NATIVE seam: the body of a compiled
+/// closure runs once per trace — and on every call when MLX returns the uncompiled function —
+/// while a cache hit replays the compiled tape without entering the body, so `traces` is the
+/// count of closure-body entries that the native side keeps and `cache_hits` is `calls -
+/// traces`. A retrace that a Rust-side key comparison cannot see — a shape or dtype drift under
+/// one key, `MLX_DISABLE_COMPILE`, a second engine thread with its own thread-local cache (MLX
+/// keeps one compile cache per thread) — still shows in `traces`. `call_seconds` times the
+/// first calls, so the first entry after a clear is the compile itself, and the load-time
+/// warm-up's seconds land here too.
+pub(crate) mod compile_stats {
+    use std::sync::{Mutex, OnceLock};
+
+    /// The counters of one block kind.
+    #[derive(Clone, Default)]
+    pub struct Block {
+        /// The cache key of the first call, `None` before any call.
+        pub(crate) fun_id: Option<u64>,
+        /// Every distinct cache key this block kind has run, in first-seen order.
+        pub(crate) seen: Vec<u64>,
+        /// Compiled calls so far.
+        pub(crate) calls: u64,
+        /// Calls that entered the closure body (traced) instead of hitting the MLX cache: the
+        /// native body-entry count, filled at every `read` (the stored value is stale between
+        /// reads).
+        pub(crate) traces: u64,
+        /// The seconds of the first calls, at most 8 entries.
+        pub(crate) call_seconds: Vec<f64>,
+    }
+
+    /// The counters of both block kinds and the cache control calls.
+    #[derive(Clone, Default)]
+    pub struct Stats {
+        /// The DeltaNet decode block.
+        pub(crate) delta: Block,
+        /// The device-routed MoE decode block.
+        pub(crate) moe: Block,
+        /// Cache clears through the seam.
+        pub(crate) cache_clears: u64,
+    }
+
+    impl Stats {
+        /// The summed counters of both blocks: `calls`, `traces`, and `cache_hits = calls -
+        /// traces`. The reports of the test harness read it.
+        #[cfg(test)]
+        pub(crate) fn totals(&self) -> (u64, u64, u64) {
+            let calls = self.delta.calls + self.moe.calls;
+            let traces = self.delta.traces + self.moe.traces;
+            (calls, traces, calls - traces)
+        }
+    }
+
+    fn slot() -> &'static Mutex<Stats> {
+        static SLOT: OnceLock<Mutex<Stats>> = OnceLock::new();
+        SLOT.get_or_init(|| Mutex::new(Stats::default()))
+    }
+
+    fn locked() -> std::sync::MutexGuard<'static, Stats> {
+        slot()
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    /// Reads a copy of the counters with the native body-entry counts as `traces`.
+    pub(crate) fn read() -> Stats {
+        let mut stats = locked().clone();
+        let (delta, moe) = super::native::compile::native_trace_counts();
+        stats.delta.traces = delta;
+        stats.moe.traces = moe;
+        stats
+    }
+
+    /// Zeroes every counter, the stored ones and the native body-entry counts. Test builds
+    /// only: production code never resets a counter it read, and a test that reads `traces`
+    /// must see its own traces, not the body entries of the tests before it.
+    #[cfg(test)]
+    pub(crate) fn reset() {
+        *locked() = Stats::default();
+        super::native::compile::native_trace_reset();
+    }
+
+    /// Records one compiled block call: the call count, the key (the first and the set of
+    /// distinct keys seen), and the seconds of the first calls. Whether the call TRACED is not
+    /// decided here — the native body-entry count is the authority, read at every `read`.
+    pub(crate) fn record(delta: bool, fun_id: u64, seconds: f64) {
+        let mut stats = locked();
+        let block = if delta {
+            &mut stats.delta
+        } else {
+            &mut stats.moe
+        };
+        block.fun_id.get_or_insert(fun_id);
+        if !block.seen.contains(&fun_id) {
+            block.seen.push(fun_id);
+        }
+        block.calls += 1;
+        if block.call_seconds.len() < 8 {
+            block.call_seconds.push(seconds);
+        }
+    }
+
+    /// Counts one cache clear. The next calls retrace on their own, which the native body-entry
+    /// counts observe without a flag here.
+    pub(crate) fn counted_clear() {
+        locked().cache_clears += 1;
+    }
+}
+
 /// Wall time of the synchronizing calls. Qualification builds record it; other builds only run the call.
 mod timing {
     /// The kind of synchronizing call.
@@ -230,13 +338,17 @@ pub struct GatedDeltaOutput {
 
 /// A U32 id resident plus the exclusive bound it was clamped below (packet GAP-TRIM-A).
 ///
-/// `MlxKernels::bound_indices` is the only constructor: it clamps the ids on the device with one
-/// `mlx_minimum` node, so one layer can pass the SAME clamped ids to every gather over the same
-/// axis instead of paying a clamp per operation. The bounded variants of the gather and take
-/// operations (`gather_qmm_bounded`, `gather_qmm_sorted_bounded`, `take_bounded`) skip their own
-/// clamp exactly while the recorded bound covers their operand axis (`shape::bound_covers`, a
-/// portable pure function); with a bound past the axis they clamp again on the device, so an
-/// out-of-range id never reads outside its operand, the safety rule of the plain operations.
+/// `MlxKernels::bound_indices` clamps the ids on the device with one `mlx_minimum` node, so
+/// one layer can pass the SAME clamped ids to every gather over the same axis instead of paying
+/// a clamp per operation. `from_clamped` is the second constructor: it wraps ids that the
+/// CALLER already clamped below `bound` with its own single clamp (the compiled decode blocks
+/// clamp inside their traced closure body), and the truth of that clamp is the caller's
+/// invariant — this type records the bound but proves nothing. The bounded variants of the
+/// gather and take operations (`gather_qmm_bounded`, `gather_qmm_sorted_bounded`,
+/// `take_bounded`) skip their own clamp exactly while the recorded bound covers their operand
+/// axis (`shape::bound_covers`, a portable pure function); with a bound past the axis they clamp
+/// again on the device, so an out-of-range id never reads outside its operand, the safety rule
+/// of the plain operations.
 pub struct BoundedIndices {
     ids: ExecutionTensor,
     bound: u32,
@@ -251,6 +363,15 @@ impl BoundedIndices {
     /// The exclusive bound the ids were clamped below.
     pub fn bound(&self) -> u32 {
         self.bound
+    }
+
+    /// Wraps ids that the caller already clamped below `bound` with its own ONE `mlx_minimum`
+    /// node (packet MX-COMPILE-1a): the compiled decode blocks clamp their expert ids inside
+    /// the traced closure body — exactly the clamp `bound_indices` builds — so the seam hands
+    /// the ids straight to the layer instead of clamping a second time. The caller owns the
+    /// truth of the clamp.
+    pub(crate) fn from_clamped(ids: ExecutionTensor, bound: u32) -> Self {
+        Self { ids, bound }
     }
 }
 
@@ -289,6 +410,16 @@ impl MlxKernels {
     #[cfg(feature = "native-fault-qualification")]
     pub fn qualification_sync_count(&self) -> u64 {
         self.context.qualification_sync_count()
+    }
+
+    /// Returns the number of selected native operations of this process so far in qualification
+    /// builds: every resident operation shim counts, whether or not a fault is armed. A test that
+    /// must arm `INFERENCE_MLX_FAULT_NEXT_OPERATION` for the operation after a long setup reads
+    /// it once in a counting run and arms `call:N` with `N` one above it in the fault run. It
+    /// resets nothing and alters no fault selection.
+    #[cfg(feature = "native-fault-qualification")]
+    pub fn selected_operation_count(&self) -> u64 {
+        self.context.selected_operation_count()
     }
 
     /// Returns the forced retire-cap flush attempts in this process, which never reset, and the
@@ -1189,6 +1320,76 @@ impl MlxKernels {
     ) -> Result<GatedDeltaOutput, EngError> {
         let (y, state) = self.context.gated_delta(q, k, v, g, beta, state)?;
         Ok(GatedDeltaOutput { y, state })
+    }
+
+    /// Stage 1 of the compile seam, kept as the measurement probe it was: the gated delta kernel of
+    /// decision 0050 through one `mlx_compile`d closure, so a Mac run can answer whether MLX
+    /// traces the custom kernel and compare the result bit for bit with
+    /// [`MlxKernels::gated_delta`]. Test builds only: no production path calls the probe.
+    /// no production path calls it.
+    #[cfg(test)]
+    pub(crate) fn compile_probe_gated_delta(
+        &mut self,
+        q: &ExecutionTensor,
+        k: &ExecutionTensor,
+        v: &ExecutionTensor,
+        g: &ExecutionTensor,
+        beta: &ExecutionTensor,
+        state: &ExecutionTensor,
+    ) -> Result<GatedDeltaOutput, EngError> {
+        let (y, state) = self
+            .context
+            .compile_probe_gated_delta(q, k, v, g, beta, state)?;
+        Ok(GatedDeltaOutput { y, state })
+    }
+
+    /// One DeltaNet decode step through one `mlx_compile`d closure (packet MX-COMPILE-1a): the
+    /// `qwen36.compile` product seam behind the resident decoder. The closure, its cache key,
+    /// its inputs, its baked constants, its dtype rules, and its no-fallback failure discipline
+    /// are documented on the `Context` method of the same name in
+    /// `kernels/mlx/native/compile.rs`.
+    pub(crate) fn compiled_delta_step(
+        &mut self,
+        args: &native::compile::CompileDeltaArgs<'_>,
+    ) -> Result<native::compile::CompiledDelta, EngError> {
+        self.context.compiled_delta_step(args)
+    }
+
+    /// One device-routed MoE decode step through one `mlx_compile`d closure (packet
+    /// MX-COMPILE-1a): the `qwen36.compile` product seam behind the resident decoder. The
+    /// closure, its cache key, its inputs, its baked constants, its dtype rules, and its
+    /// no-fallback failure discipline are documented on the `Context` method of the same name
+    /// in `kernels/mlx/native/compile.rs`.
+    pub(crate) fn compiled_moe_step(
+        &mut self,
+        args: &native::compile::CompileMoeArgs<'_>,
+    ) -> Result<native::compile::CompiledMoe, EngError> {
+        self.context.compiled_moe_step(args)
+    }
+
+    /// Reads the process-wide production counters of the compiled block calls (packet
+    /// MX-COMPILE-1a): calls, traces (the native closure-body counts), cache hits, and the
+    /// seconds of the first calls per block kind, plus the seam cache clears. The load-time
+    /// warm-up and the teardown clear land here too, so a report separates the one-time compile
+    /// from the steady decode.
+    pub fn compile_counters(&self) -> compile_stats::Stats {
+        compile_stats::read()
+    }
+
+    /// Zeroes the process-wide compiled block counters, the stored ones and the native body-entry
+    /// counts. Test builds only: production code never resets a counter it read.
+    #[cfg(test)]
+    pub(crate) fn reset_compile_counters(&mut self) {
+        compile_stats::reset()
+    }
+
+    /// Clears the calling thread's MLX compile cache and counts it, so the next block call
+    /// compiles again (packet MX-COMPILE-1a). The measurement harness of the test builds runs it
+    /// between runs; production clears the cache at adapter teardown, on its own path after the
+    /// pending work completed and before the stream and device are released.
+    #[cfg(test)]
+    pub(crate) fn clear_compile_cache(&mut self) -> Result<(), EngError> {
+        self.context.compile_clear_cache()
     }
 
     pub(crate) fn attend_dense(

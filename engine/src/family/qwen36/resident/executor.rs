@@ -110,6 +110,10 @@ pub(crate) struct Q36Rules {
     /// control, or `Q8`, the 8-bit codes with activation-dtype scales and biases. The config
     /// member `kv_dtype` defaults to `f32`.
     pub(crate) kv_dtype: KvDtype,
+    /// `mlx_compile` on the DeltaNet and device-routed MoE decode blocks (packet MX-COMPILE-1a):
+    /// the `qwen36.compile` member, default false. When true, the decoder warms both blocks once
+    /// at load, so a trace failure fails the load instead of a request.
+    pub(crate) compile: bool,
 }
 
 /// The numeric path of a prefill. A saved prefix restores only under the path that built it:
@@ -347,6 +351,13 @@ impl Q36Executor {
             rules.activation,
             rules.kv_dtype,
         )?;
+        // The compile seam admits the whole model and warms one layer per distinct program
+        // HERE, before the first state exists: a plan refusal or a trace failure is a typed
+        // load error (packet MX-COMPILE-1a item 6), never a failure in the middle of a request.
+        // The warm-up seconds of THIS engine land in the decoder.
+        if rules.compile {
+            decoder.set_compile(true)?;
+        }
         // No state exists yet, so no permit charges the old budget.
         decoder.budget = SessionBudget::new(rules.session_cap);
         let state = decoder.zero_state()?;
@@ -372,6 +383,26 @@ impl Q36Executor {
     /// position. The server uses it to check a prompt before admission.
     pub(crate) fn context_limit(&self) -> usize {
         self.context_limit
+    }
+
+    /// Reads the production counters of the compiled block calls of this executor's adapter
+    /// (packet MX-COMPILE-1a): calls, the native trace counts, the cache hits, and the seconds
+    /// of the first calls per block kind. The tests of the resident gate read them through the
+    /// executor, which owns the adapter.
+    pub(crate) fn compile_counters(&self) -> crate::kernels::mlx::compile_stats::Stats {
+        self.decoder.kernels.compile_counters()
+    }
+
+    /// The seconds of THIS engine's load-time compile warm-up (packet MX-COMPILE-1a item 6),
+    /// delta first and moe second: the seconds per traced program of each block kind, empty
+    /// vectors when `qwen36.compile` is off. They are measured inside this decoder's warm-up —
+    /// not read from the process-wide counters — so the start line reports this engine alone
+    /// and labels each block kind correctly.
+    pub(crate) fn compile_warmup_seconds(&self) -> (&[f64], &[f64]) {
+        (
+            &self.decoder.compile_warmup.delta,
+            &self.decoder.compile_warmup.moe,
+        )
     }
 
     /// Splits the executor into the model side of one call and the limits of the engine. The two
@@ -564,6 +595,7 @@ mod tests {
             session_cap: u64::from(LIMIT) * GROWTH,
             activation: Activation::F32,
             kv_dtype: KvDtype::F32,
+            compile: false,
         }
     }
 
@@ -583,6 +615,7 @@ mod tests {
         let with = |cap: u64, kv: KvDtype| Q36Rules {
             session_cap: cap,
             kv_dtype: kv,
+            compile: false,
             ..rules(vec![], VOCAB)
         };
         let cap = u64::from(LIMIT) * Q8_GROWTH;
@@ -824,6 +857,7 @@ mod tests {
             session_cap: 40_960 * 32_768,
             activation: Activation::F32,
             kv_dtype: KvDtype::F32,
+            compile: false,
         }
     }
 
@@ -1054,6 +1088,7 @@ mod tests {
             session_cap,
             activation: Activation::F32,
             kv_dtype: KvDtype::F32,
+            compile: false,
         };
         // Every rule is broken: the vocabulary is named first, then the limit, then the cap.
         assert!(message(bad(0, 1, 0)).contains("sampler vocabulary"));
@@ -1130,6 +1165,7 @@ mod tests {
             session_cap: u64::from(CHUNK_LIMIT) * GROWTH,
             activation: Activation::F32,
             kv_dtype: KvDtype::F32,
+            compile: false,
         }
     }
 
@@ -2041,6 +2077,7 @@ mod tests {
             session_cap: 1 << 30,
             activation: Activation::F32,
             kv_dtype: KvDtype::F32,
+            compile: false,
         };
         let (mut executor, mut session) = Q36Executor::open(&ckpt_dir, cache_limit, rules).unwrap();
         let mut job = GenerationState::new(IncrementalDecoder::new(&tokenizer)).with_max_tokens(32);
@@ -2149,6 +2186,7 @@ mod tests {
             session_cap: 1 << 30,
             activation: activation_from_env(),
             kv_dtype: kv_dtype_from_env(),
+            compile: false,
         };
         let dtype = activation_name(rules.activation);
         let (mut executor, mut session) = Q36Executor::open(&ckpt_dir, cache_limit, rules).unwrap();
@@ -2267,6 +2305,7 @@ mod tests {
             session_cap: 4_096 * 40_960,
             activation: activation_from_env(),
             kv_dtype: kv_dtype_from_env(),
+            compile: false,
         };
         let dtype = activation_name(rules.activation);
         let (mut executor, mut session) = Q36Executor::open(&ckpt_dir, cache_limit, rules).unwrap();
@@ -2384,6 +2423,7 @@ mod tests {
             session_cap: 100_000,
             activation: Activation::F32,
             kv_dtype: KvDtype::F32,
+            compile: false,
         }
     }
 
@@ -2398,6 +2438,7 @@ mod tests {
             session_cap: 28_000,
             activation: Activation::F32,
             kv_dtype: KvDtype::F32,
+            compile: false,
         }
     }
 

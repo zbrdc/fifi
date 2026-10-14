@@ -364,6 +364,7 @@ mod tests {
         let mut ctx = Ctx {
             kernels: &mut kernels,
             consts: &w.consts,
+            compile: false,
         };
         let next = chunk(&mut ctx, &shape, rw, &rec, &ring, &x, SUB).unwrap();
         assert_eq!(next.out.shape(), [count, 64], "output shape");
@@ -434,6 +435,7 @@ mod tests {
         let mut ctx = Ctx {
             kernels: &mut kernels,
             consts: &w.consts,
+            compile: false,
         };
         let cases = [
             (
@@ -474,6 +476,7 @@ mod tests {
         let mut ctx = Ctx {
             kernels: &mut kernels,
             consts: &w.consts,
+            compile: false,
         };
         let next = chunk(&mut ctx, &shape, rw, &rec, &ring, &x, SUB).unwrap();
         assert_eq!(

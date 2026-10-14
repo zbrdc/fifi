@@ -377,6 +377,7 @@ fn the_shipped_mac_studio_config_passes_every_check_before_the_backend() {
     assert_eq!(options["prefill_budget_bytes"], 30u64 << 30);
     assert_eq!(options["cache_limit_bytes"], 4u64 << 30);
     assert_eq!(options["kv_dtype"], "q8");
+    assert_eq!(options["compile"], true);
     assert_eq!(options["context_limit"], 262_144u64);
     assert_eq!(options["session_cap_bytes"], 4u64 << 30);
     assert_eq!(

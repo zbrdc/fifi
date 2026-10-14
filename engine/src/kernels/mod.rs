@@ -3,6 +3,11 @@
     test,
     all(feature = "native-mlx", target_os = "macos", target_arch = "aarch64")
 ))]
+pub(crate) mod compile_key;
+#[cfg(any(
+    test,
+    all(feature = "native-mlx", target_os = "macos", target_arch = "aarch64")
+))]
 mod elementwise;
 pub mod expert_cpu;
 pub mod expert_cpu_avx2;

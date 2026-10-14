@@ -149,6 +149,12 @@ impl Consts {
 pub(super) struct Ctx<'k> {
     pub(super) kernels: &'k mut MlxKernels,
     pub(super) consts: &'k Consts,
+    /// `mlx_compile` on the DeltaNet and device-routed MoE decode steps (packet MX-COMPILE-1a):
+    /// the decoder's `qwen36.compile` setting, copied by `step::run`. `delta::step` and
+    /// `moe::step_device` run their compiled closure when it is true; every other block — the
+    /// attention layers, the head, the embedding, and every chunk of the chunked prefill, whose
+    /// shapes vary — ignores it and never compiles.
+    pub(super) compile: bool,
 }
 
 /// Converts `x` to `dtype`. A tensor that has `dtype` already is shared and makes no native call, so
@@ -299,6 +305,7 @@ mod tests {
         let mut ctx = Ctx {
             kernels: &mut kernels,
             consts: &consts,
+            compile: false,
         };
         assert!(matches!(
             linear(&mut ctx, &resident, &wide),

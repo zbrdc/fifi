@@ -102,6 +102,15 @@ pub(crate) struct Q36Options {
     pub(crate) kv_dtype: Option<String>,
     /// Graph capture of the CUDA arm (default false, gate G1 eager); the MLX arm ignores it.
     pub(crate) capture: Option<bool>,
+    /// `mlx_compile` on the Q36 DeltaNet and device-routed MoE decode blocks (packet
+    /// MX-COMPILE-1; the amendment of decision 0039 item 8 that decision 0046 A5 reopened): the
+    /// engine traces both blocks once after the weights load and runs every one-token decode
+    /// step through the compiled closures, which gains 9.6 to 13.0 percent of decode speed
+    /// (measured at depths 30,000 to 16) and moves F32 logits by at most 5e-5 (compile is
+    /// deterministic run to run but not bit-identical to the uncompiled path). The default is
+    /// `false`; the shipped Mac config sets `true` (user decision 2026-10-14 after the Mac gates
+    /// of MX-COMPILE-1a). The MLX arm reads it; the CUDA arm records it as ignored.
+    pub(crate) compile: Option<bool>,
     /// The tiered expert mode of the CUDA arm (OFF-2). Absent means off: the routed experts are
     /// all resident on the device, as before. The MLX arm refuses the member.
     pub(crate) tiered: Option<TieredOptions>,
@@ -374,6 +383,10 @@ pub(crate) struct Q36Settings {
     pub(crate) kv: KvDtype,
     /// Graph capture of the CUDA arm; the MLX arm ignores it with one start line.
     pub(crate) capture: bool,
+    /// `mlx_compile` on the DeltaNet and device-routed MoE decode blocks (packet MX-COMPILE-1).
+    /// The default is `false`; the MLX arm reads it, admits the model at load, and warms one
+    /// program per distinct compiled block, and the CUDA arm records the key as ignored.
+    pub(crate) compile: bool,
     /// The tiered expert mode, or `None` for the plain engine. Never on without the member.
     pub(crate) tiered: Option<TieredSettings>,
     /// The MLX-only keys the CUDA arm ignores (in `Q36Options` order); the start logs one
@@ -544,13 +557,15 @@ fn refuse_cuda_key(key: &str, value: Option<u64>) -> Result<(), EngError> {
     Ok(())
 }
 
-/// The MLX allocator and session keys the CUDA arm ignores (the KV cache is sized by
-/// `context_limit` alone, the prefill runs one token per step): the start logs one line each.
+/// The MLX allocator, compile, and session keys the CUDA arm ignores (the KV cache is sized by
+/// `context_limit` alone, the prefill runs one token per step, and the CUDA arm does not build
+/// the MLX compile seam): the start logs one line each.
 fn ignored_mlx_keys_of(options: &Q36Options) -> Vec<&'static str> {
     [
         (options.cache_limit_bytes.is_some(), "cache_limit_bytes"),
         (options.session_cap_bytes.is_some(), "session_cap_bytes"),
         (options.prefill_chunk.is_some(), "prefill_chunk"),
+        (options.compile.is_some(), "compile"),
     ]
     .into_iter()
     .filter(|&(set, _)| set)
@@ -660,6 +675,12 @@ impl Q36Settings {
             activation,
             kv,
             capture: options.capture.unwrap_or(false),
+            // The CUDA arm has no MLX compile seam: the key stays false there and
+            // `ignored_mlx_keys_of` records it for the start line instead.
+            compile: match backend {
+                Backend::Mlx => options.compile.unwrap_or(false),
+                Backend::Cuda => false,
+            },
             tiered: tiered_settings(options, backend)?,
             ignored_mlx_keys,
         })
@@ -953,6 +974,7 @@ mod tests {
                 activation: super::Activation::Bf16,
                 kv: super::KvDtype::Q8,
                 capture: false,
+                compile: false,
                 tiered: None,
                 ignored_mlx_keys: Vec::new(),
             }
@@ -1020,6 +1042,7 @@ mod tests {
             activation_dtype: Some("f32".to_string()),
             kv_dtype: Some("q8".to_string()),
             capture: Some(true),
+            compile: Some(true),
             tiered: None,
         };
         let got = settings(Some(&options), &Q36Env::default()).unwrap();
@@ -1032,8 +1055,41 @@ mod tests {
         assert_eq!(got.activation, super::Activation::F32);
         assert_eq!(got.kv, super::KvDtype::Q8, "the kv_dtype member overrides");
         assert!(got.capture, "every member of the object overrides");
+        assert!(got.compile, "compile: every member of the object overrides");
         assert_eq!(got.artifact, PathBuf::from("/m"));
         assert_eq!(got.tokenizer_dir, PathBuf::from("/t"));
+    }
+
+    /// The compile key of packet MX-COMPILE-1a: the default is false (the shipped Mac file sets
+    /// true, pinned by `the_shipped_mac_studio_config_passes_every_check_before_the_backend`),
+    /// the MLX arm reads the member, and the CUDA arm
+    /// keeps false and records the key for its start line.
+    #[test]
+    fn the_compile_key_defaults_to_false_the_mlx_arm_reads_it_and_the_cuda_arm_ignores_it() {
+        let off = settings_for(Some(&with_limit()), &Q36Env::default(), Backend::Mlx).unwrap();
+        assert!(!off.compile, "compile is off without the member");
+        let on = Q36Options {
+            compile: Some(true),
+            ..with_limit()
+        };
+        assert!(
+            settings_for(Some(&on), &Q36Env::default(), Backend::Mlx)
+                .unwrap()
+                .compile,
+            "the MLX arm reads the member"
+        );
+        // A CUDA entry with only the compile key: no other MLX key is set, so the ignored list
+        // names the compile key alone.
+        let cuda_only: Q36Options = serde_json::from_str("{\"compile\": true}").unwrap();
+        let got = settings_for(Some(&cuda_only), &Q36Env::default(), Backend::Cuda).unwrap();
+        assert!(!got.compile, "the CUDA arm keeps the compile seam off");
+        assert_eq!(
+            got.ignored_mlx_keys,
+            vec!["compile"],
+            "the CUDA arm records the key for its start line"
+        );
+        let unknown = serde_json::from_str::<Q36Options>("{\"compile\": 1}");
+        assert!(unknown.is_err(), "the member is a boolean, not a count");
     }
 
     #[test]

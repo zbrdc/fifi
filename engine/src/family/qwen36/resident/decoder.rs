@@ -5,15 +5,20 @@
 
 use super::super::settings::{Activation, KvDtype, Q8_GROUP};
 use super::moe::Routing;
+use super::ops::{Ctx, cast_to, f32_tensor, short_import};
 use super::prefill;
 use super::state::{ResidentSnapshot, ResidentState};
 use super::step;
-use super::weights::ResidentWeights;
+use super::weights::{RMixer, ResidentWeights};
 #[cfg(test)]
 use crate::tensor::ExecutionTensor;
 use crate::{
-    EngError, family::qwen36::host_load::HostWeights, kernels::MlxKernels, sched::SessionBudget,
-    tensor::Dtype, weights::StreamedCheckpoint,
+    EngError,
+    family::qwen36::host_load::HostWeights,
+    kernels::MlxKernels,
+    sched::SessionBudget,
+    tensor::{Dtype, Tensor},
+    weights::StreamedCheckpoint,
 };
 
 /// The test-only graph probe of packet GPU-GAP-COUNT: it runs after the token graph is built
@@ -84,6 +89,13 @@ pub(super) struct ResidentDecoder<'c> {
     pub(super) chunk_rows: u32,
     /// How the layers pick their experts. `Device` unless a parity run asks for `Host`.
     pub(super) routing: Routing,
+    /// `mlx_compile` on the DeltaNet and device-routed MoE decode blocks (packet MX-COMPILE-1a):
+    /// the `qwen36.compile` setting, false until `set_compile` turns it on. `step` copies it
+    /// into its `Ctx`, `delta::step` and `moe::step_device` read it, and no other path compiles.
+    pub(super) compile: bool,
+    /// The seconds of this decoder's load-time compile warm-up, per block kind: empty until
+    /// `set_compile(true)` traces the programs. `WarmupSeconds` documents the shape.
+    pub(super) compile_warmup: WarmupSeconds,
     /// A test-only probe that runs after the token graph is built and before the step's single
     /// `evaluate` (packet GPU-GAP-COUNT): the graph dump of `decode_graph_primitives` reads the
     /// lazy outputs there without evaluating them. `None` unless a test sets it, so every other
@@ -91,6 +103,19 @@ pub(super) struct ResidentDecoder<'c> {
     /// except through the kernels handle it receives.
     #[cfg(test)]
     pub(super) graph_probe: Option<GraphProbe>,
+}
+
+/// The seconds of the load-time compile warm-up, per block kind (packet MX-COMPILE-1a, fix
+/// round 1): `delta` holds one entry per traced DeltaNet program and `moe` one entry per traced
+/// device-routed MoE program, each covering the whole warm step (the trace call and its
+/// evaluation). They are measured inside THIS decoder, so the start line never reports another
+/// engine's seconds, and the two lists are labeled separately.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub(super) struct WarmupSeconds {
+    /// One entry per traced DeltaNet program, in plan order.
+    pub(super) delta: Vec<f64>,
+    /// One entry per traced device-routed MoE program, in plan order.
+    pub(super) moe: Vec<f64>,
 }
 
 impl<'c> ResidentDecoder<'c> {
@@ -248,6 +273,8 @@ impl<'c> ResidentDecoder<'c> {
             context_limit,
             chunk_rows: DEFAULT_CHUNK_ROWS,
             routing: Routing::default(),
+            compile: false,
+            compile_warmup: WarmupSeconds::default(),
             #[cfg(test)]
             graph_probe: None,
         }
@@ -265,6 +292,163 @@ impl<'c> ResidentDecoder<'c> {
     /// applies to every state of this decoder.
     pub(super) fn set_routing(&mut self, routing: Routing) {
         self.routing = routing;
+    }
+
+    /// Turns the compiled decode blocks on or off (packet MX-COMPILE-1a item 6, fix round 1).
+    /// Turning them on admits the WHOLE model first — every DeltaNet layer and every
+    /// device-routed MoE layer's weight facts over the warm-up plan — and refuses the load with
+    /// `EngError::Backend { operation: "compile_warm_up", .. }` when the plan refuses (a packed
+    /// weight without biases, more than four distinct programs), so no compiled call can fail in
+    /// the middle of a request. The warm-up then traces ONE layer per distinct cache key on zero
+    /// tensors, evaluates the traced results, and records the per-block seconds in
+    /// `compile_warmup`, so the first token of the first request replays a compiled program
+    /// instead of tracing one. A trace failure is a native `Backend` HERE, at load, and the
+    /// adapter is terminal afterwards. Turning the setting off runs the warm-up never and
+    /// changes nothing else; the executor calls this once, right after construction, before the
+    /// first state exists. A Host-routed decoder warms its DeltaNet blocks and not its MoE
+    /// blocks (the host-routed MoE never compiles).
+    pub(super) fn set_compile(&mut self, on: bool) -> Result<(), EngError> {
+        self.compile = on;
+        if on {
+            self.warm_compile()?;
+        }
+        Ok(())
+    }
+
+    /// The load-time compile warm-up: the plan over ALL layers decides which programs the model
+    /// needs (nothing when the setting is off), and each needed program is traced once on zero
+    /// tensors — the layer input, the recurrent state, and the convolution ring of the first
+    /// DeltaNet layer of that program — through the compiled seam, then evaluated so the trace
+    /// and its first evaluation happen at load. The outputs are dropped; no state of any request
+    /// sees them.
+    fn warm_compile(&mut self) -> Result<(), EngError> {
+        // The facts of every layer, then the admission: a model the seam cannot compile refuses
+        // the load HERE, before any trace.
+        let act = self.weights.consts.act;
+        let shape = self.weights.shape.clone();
+        let eps = shape.eps;
+        let delta_facts: Vec<super::compile_plan::DeltaLayerFacts> = self
+            .weights
+            .layers
+            .iter()
+            .enumerate()
+            .filter_map(|(layer, current)| match &current.mixer {
+                RMixer::Delta(w) => Some(super::compiled::delta_facts(layer, &shape, w, act, eps)),
+                RMixer::Attn(_) => None,
+            })
+            .collect::<Result<Vec<_>, EngError>>()?;
+        let moe_facts: Vec<super::compile_plan::MoeLayerFacts> = self
+            .weights
+            .layers
+            .iter()
+            .enumerate()
+            .map(|(layer, current)| super::compiled::moe_facts(layer, &shape, &current.moe, act))
+            .collect::<Result<Vec<_>, EngError>>()?;
+        let plan = super::compile_plan::model_warmup(
+            self.compile,
+            self.routing == Routing::Device,
+            &delta_facts,
+            &moe_facts,
+        )
+        .map_err(|error| match error {
+            EngError::BadRequest(message) => EngError::Backend {
+                operation: "compile_warm_up",
+                message,
+            },
+            other => other,
+        })?;
+        if plan.delta.is_empty() && plan.moe.is_empty() {
+            return Ok(());
+        }
+        let mut ctx = Ctx {
+            kernels: &mut self.kernels,
+            consts: &self.weights.consts,
+            compile: true,
+        };
+        // The zero input of the layer, imported with one synchronization; it converts to the
+        // activation dtype of the decoder. The zero DeltaNet state and ring follow the checked
+        // dimensions of the plan (LOW-2: no unchecked subtraction or product).
+        let u32_of = |n: usize| {
+            u32::try_from(n).map_err(|_| {
+                EngError::BadRequest("the compile warm-up dimension exceeds u32".into())
+            })
+        };
+        let count_of = |name: &'static str, dims: &[u32]| {
+            let product = dims
+                .iter()
+                .try_fold(1u64, |n, &d| n.checked_mul(u64::from(d)));
+            let product = product.ok_or_else(|| {
+                EngError::BadRequest(format!("the compile warm-up {name} exceeds u64"))
+            })?;
+            usize::try_from(product).map_err(|_| {
+                EngError::BadRequest(format!("the compile warm-up {name} exceeds usize"))
+            })
+        };
+        let hosts_x = f32_tensor(vec![1, u32_of(shape.hidden)?], &vec![0.0; shape.hidden])?;
+        let mut hosts = vec![hosts_x];
+        if !plan.delta.is_empty() {
+            let dims = delta_facts
+                .first()
+                .map(|facts| facts.dims)
+                .ok_or_else(|| EngError::BadRequest("no DeltaNet layer".into()))?;
+            let [_, kd, vh, vd, cd, taps, _, _] = dims;
+            hosts.push(f32_tensor(
+                vec![vh, vd, kd],
+                &vec![0.0; count_of("state", &[vh, vd, kd])?],
+            )?);
+            hosts.push(f32_tensor(
+                vec![cd, taps],
+                &vec![0.0; count_of("ring", &[cd, taps])?],
+            )?);
+        }
+        let refs: Vec<&Tensor> = hosts.iter().collect();
+        let mut imported = ctx.kernels.import_many(&refs)?.into_iter();
+        let mut next = || imported.next().ok_or_else(short_import);
+        let x_zero = next()?;
+        let act = ctx.consts.act;
+        let x = cast_to(&mut ctx, &x_zero, act)?;
+        let (mut delta_seconds, mut moe_seconds) = (Vec::new(), Vec::new());
+        if !plan.delta.is_empty() {
+            let rec = next()?;
+            let ring = next()?;
+            for (layer, _id) in &plan.delta {
+                let RMixer::Delta(w) = &self
+                    .weights
+                    .layers
+                    .get(*layer)
+                    .ok_or_else(|| {
+                        EngError::BadRequest("the compile warm-up layer is missing".into())
+                    })?
+                    .mixer
+                else {
+                    return Err(EngError::BadRequest(
+                        "the compile warm-up found no DeltaNet layer".into(),
+                    ));
+                };
+                let started = std::time::Instant::now();
+                let got = super::compiled::delta_step(&mut ctx, &shape, w, &rec, &ring, &x)?;
+                ctx.kernels.evaluate(&[&got.out, &got.rec, &got.ring])?;
+                delta_seconds.push(started.elapsed().as_secs_f64());
+            }
+        }
+        for (layer, _id) in &plan.moe {
+            let moe = &self
+                .weights
+                .layers
+                .get(*layer)
+                .ok_or_else(|| EngError::BadRequest("the compile warm-up layer is missing".into()))?
+                .moe;
+            let started = std::time::Instant::now();
+            let got = super::compiled::moe_step_device(&mut ctx, &shape, moe, &x)?;
+            ctx.kernels
+                .evaluate(&[&got.0, got.1.ids.ids(), &got.1.gates, &got.1.health])?;
+            moe_seconds.push(started.elapsed().as_secs_f64());
+        }
+        self.compile_warmup = WarmupSeconds {
+            delta: delta_seconds,
+            moe: moe_seconds,
+        };
+        Ok(())
     }
 
     /// Replaces the session budget. Tests use small caps so that a step can be denied. Call it before

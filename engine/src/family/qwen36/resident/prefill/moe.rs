@@ -403,6 +403,7 @@ mod tests {
         let mut ctx = Ctx {
             kernels: &mut kernels,
             consts: &w.consts,
+            compile: false,
         };
         let (out, routes) = chunk(&mut ctx, &shape, &w.layers[0].moe, &xr).unwrap();
         assert_eq!(out.shape(), [8, 64], "output shape");
@@ -431,6 +432,7 @@ mod tests {
         let mut ctx = Ctx {
             kernels: &mut kernels,
             consts: &w.consts,
+            compile: false,
         };
         let (got, routes) = chunk(&mut ctx, &shape, &w.layers[0].moe, &one).unwrap();
         let (want, (selection, _)) = decode_step(&mut ctx, &shape, &w.layers[0].moe, &one).unwrap();
@@ -497,6 +499,7 @@ mod tests {
             let mut ctx = Ctx {
                 kernels: &mut kernels,
                 consts: &w.consts,
+                compile: false,
             };
             chunk_device(&mut ctx, &shape, &w.layers[0].moe, &xr).unwrap()
         };
@@ -530,6 +533,7 @@ mod tests {
             let mut ctx = Ctx {
                 kernels: &mut kernels,
                 consts: &w.consts,
+                compile: false,
             };
             chunk(&mut ctx, &shape, &w.layers[0].moe, &xr).unwrap()
         };
@@ -566,6 +570,7 @@ mod tests {
             let mut ctx = Ctx {
                 kernels: &mut kernels,
                 consts: &w.consts,
+                compile: false,
             };
             let device = chunk_device(&mut ctx, &shape, &w.layers[0].moe, &one).unwrap();
             let decode = decode_step_device(&mut ctx, &shape, &w.layers[0].moe, &one).unwrap();
@@ -600,6 +605,7 @@ mod tests {
             let mut ctx = Ctx {
                 kernels: &mut kernels,
                 consts: &w.consts,
+                compile: false,
             };
             let device = chunk_device(&mut ctx, &shape, &w.layers[0].moe, &xr).unwrap();
             let host = chunk(&mut ctx, &shape, &w.layers[0].moe, &xr).unwrap();
@@ -645,6 +651,7 @@ mod tests {
             let mut ctx = Ctx {
                 kernels: &mut kernels,
                 consts: &w.consts,
+                compile: false,
             };
             let device = chunk_device(&mut ctx, &shape, &w.layers[0].moe, &xr).unwrap();
             let host = chunk(&mut ctx, &shape, &w.layers[0].moe, &xr).unwrap();
@@ -694,6 +701,7 @@ mod tests {
             let mut ctx = Ctx {
                 kernels: &mut kernels,
                 consts: &w.consts,
+                compile: false,
             };
             let device = chunk_device(&mut ctx, &shape, &w.layers[0].moe, &xr).unwrap();
             let host = chunk(&mut ctx, &shape, &w.layers[0].moe, &xr).unwrap();
@@ -730,6 +738,7 @@ mod tests {
             let mut ctx = Ctx {
                 kernels: &mut kernels,
                 consts: &w.consts,
+                compile: false,
             };
             chunk_device(&mut ctx, &shape, &w.layers[0].moe, &xr).unwrap()
         };
@@ -780,6 +789,7 @@ mod tests {
             let mut ctx = Ctx {
                 kernels: &mut kernels,
                 consts: &w.consts,
+                compile: false,
             };
             chunk_device(&mut ctx, &shape, &w.layers[0].moe, &xr).unwrap()
         };
@@ -805,6 +815,7 @@ mod tests {
             let mut ctx = Ctx {
                 kernels: &mut kernels,
                 consts: &w.consts,
+                compile: false,
             };
             chunk_device(&mut ctx, &shape, &w.layers[0].moe, &xr).unwrap()
         };
@@ -829,6 +840,7 @@ mod tests {
         let mut ctx = Ctx {
             kernels: &mut kernels,
             consts: &w.consts,
+            compile: false,
         };
         let (_, routes) = chunk(&mut ctx, &shape, &w.layers[0].moe, &xr).unwrap();
         assert_eq!(routes[0].indices, [2, 1]);
@@ -846,6 +858,7 @@ mod tests {
         let mut ctx = Ctx {
             kernels: &mut kernels,
             consts: &w.consts,
+            compile: false,
         };
         for (what, x) in [("rank one", &flat), ("width 32", &narrow)] {
             let failed = chunk(&mut ctx, &shape, &w.layers[0].moe, x);
@@ -869,6 +882,7 @@ mod tests {
         let mut ctx = Ctx {
             kernels: &mut kernels,
             consts: &w.consts,
+            compile: false,
         };
         let (out, _) = chunk(&mut ctx, &shape, &w.layers[0].moe, &xr).unwrap();
         assert_eq!(kernels.qualification_sync_count(), before + 2);

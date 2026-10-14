@@ -10,6 +10,44 @@ mod layout;
 
 #[cfg(all(feature = "native-mlx", target_os = "macos", target_arch = "aarch64"))]
 mod attn;
+/// The Mac gate tests of the compiled decode blocks (packet MX-COMPILE-1a items 5 to 7): the
+/// tiny-model tests run with the plain test suite, the real-checkpoint tests are `#[ignore]`d
+/// like their siblings.
+#[cfg(all(
+    test,
+    feature = "native-mlx",
+    target_os = "macos",
+    target_arch = "aarch64"
+))]
+mod compile_gate;
+/// The `compile_changes_nothing_in_the_logits` test and the pure
+/// `compare_logit_files` with its Linux unit tests. `cfg(test)` like `decode_timing` and
+/// `graph_count`: the pure parts carry Linux unit tests, and the ignored Mac-only
+/// real-checkpoint test inside carries `tool_forward`'s own native cfg, so pf-typecheck.sh
+/// compile-checks it on Linux through the cfg rewrite.
+#[cfg(test)]
+mod compile_logits;
+/// The load-time compile warm-up decision (packet MX-COMPILE-1a item 6): pure, with the same cfg
+/// as this module, so its unit tests run on Linux.
+#[cfg(any(
+    test,
+    all(feature = "native-mlx", target_os = "macos", target_arch = "aarch64")
+))]
+mod compile_plan;
+/// The `mlx_compile` probe: `cfg(test)` and Mac-only, like the modules its
+/// tests live in (packet MX-COMPILE-1a keeps the probe test-only).
+#[cfg(all(
+    test,
+    feature = "native-mlx",
+    target_os = "macos",
+    target_arch = "aarch64",
+))]
+mod compile_probe;
+/// The compiled decode blocks behind `qwen36.compile` (packet MX-COMPILE-1a): Mac-only like
+/// the blocks it wraps, and production code —
+/// `delta::step` and `moe::step_device` call it when the setting is on.
+#[cfg(all(feature = "native-mlx", target_os = "macos", target_arch = "aarch64"))]
+mod compiled;
 /// The decode-phase timing diagnostic of the served Q36 decode path. The module is `cfg(test)`
 /// like the tests around it so its PURE parts (the `DT_DEPTHS` list parser with the default
 /// depth list, the nearest-rank percentile, the host argmax, the ids-source parse, the
