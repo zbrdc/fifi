@@ -52,6 +52,13 @@ SOFTWARE.
   - `DQ8::dq` in `engine/vendor/xavier-qwen/src/gemm.cuh:102`, from ggml `dequantize_row_q8_0`. The gemm path runs it for more than 16 tokens.
 - Not derived: `dequant_256` in `engine/vendor/xavier-qwen/src/repack.cu:140` repeats no ggml Q4_K or Q6_K value logic. Its Q5_K branch calls `dequant_q5k`, listed above, and its other branches widen F32 and F16 values directly.
 
+## ggml-cuda-mmq (llama.cpp CUDA MMQ and MMVQ kernels)
+
+- Source: https://github.com/ggml-org/llama.cpp, commit `acecd56032ddc34bada14a2d978f110d9c987095`.
+- Location: `engine/vendor/ggml-cuda-mmq/`. It holds the include closure of the MMQ instances `q4_k`, `q5_0`, `q6_k`, and `q8_0`, of `quantize.cu`, `mmid.cu`, and the MMVQ files. The files were imported byte for byte from the commit above.
+- Changes: the patches in `engine/vendor/ggml-cuda-mmq/patches/` (V-2 errors, V-3a backend machinery removed, V-3b stream fixup and device guard, V-3c PDL off, V-4 trim, V-MV1 MMVQ trim) change the imported files. The shims in the tree are original glue code. `engine/vendor/ggml-cuda-mmq/provenance.json` records the upstream and the patched sha256 of every file.
+- License: MIT, Copyright (c) 2023-2026 The ggml authors. The license text is the one quoted in the section "llama.cpp / ggml" above. The file `engine/vendor/ggml-cuda-mmq/LICENSE` carries it (sha256 `94f29bbed6a22c35b992c5c6ebf0e7c92f13b836b90f36f461c9cf2f0f1d010d`).
+
 ## xavier-qwen
 
 - Source: local repository `xavier-qwen`, exported with `git archive`. No upstream URL is recorded in `engine/vendor/xavier-qwen/provenance.json`.
