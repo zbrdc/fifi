@@ -88,10 +88,10 @@ pub(crate) trait ExecutorOps {
     fn prefill_piece(&self) -> Option<usize> {
         None
     }
-    /// Saves the session as the engine's one prefix state and drops any earlier one (decision 0036,
-    /// addendum 1). `key` holds the committed prompt tokens of the session. Returns `Ok(false)`
-    /// when this executor cannot save or when the memory plan denies the charge. It never changes
-    /// the session. Executors that keep no prefix state use this default.
+    /// Saves the session as a tip in the engine's prefix store (decision 0036, addenda 1 and 2).
+    /// `key` holds the committed prompt tokens of the session. Returns `Ok(false)` when this
+    /// executor cannot save or when the memory plan denies the charge. It never changes the
+    /// session. Executors that keep no prefix state use this default.
     fn save_prefix(&mut self, _st: &Self::Session, _key: &[u32]) -> Result<bool> {
         Ok(false)
     }

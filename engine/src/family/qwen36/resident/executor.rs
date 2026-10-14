@@ -52,16 +52,18 @@
 //! that is not `Backend`. A `Backend` error ends the engine (the worker makes no further call), so
 //! no native call follows it.
 //!
-//! Prefix reuse (decision 0036, addendum 1; packet Q36-PR-b): `save_prefix` snapshots the state
-//! after the held prompt, and `restore_prefix` gives it back after a reset. The executor keeps one
-//! entry in a `PrefixSlot`, declared first so its arrays drop before the decoder does. The entry
+//! Prefix reuse (decision 0036, addendum 2; packet Q36-PR-b): `save_prefix` snapshots the state
+//! after the held prompt, and `restore_prefix` gives it back after a reset. The executor keeps
+//! its entries in a `PrefixStore`, declared first so its arrays drop before the decoder does. For
+//! now the store keeps the addendum 1 limits (one tip entry) and the worker saves the tip only;
+//! the roots and the periodic points of addendum 2 come with the SERVE-2 packets. Each entry
 //! carries the `PrefillPath` that built it, so an entry restores only under its own path: a restore
 //! under `Chunked(n)` matches a full recompute only within the decision 0044 G2 tolerance, and
 //! only the `Steps` path is bitwise (addendum 1 item 8).
 //! `DecodeSession::save_prefix` and `DecodeSession::restore_prefix` own the rules, and the executor
-//! passes the two decoder calls `snapshot` and `restore`. A `MemoryPlan` from the save reports
-//! `false` and leaves the slot empty; a `MemoryPlan` from the restore drops the entry and restores
-//! nothing (addendum item 7).
+//! passes the two decoder calls `snapshot` and `restore`. A `MemoryPlan` from the save evicts
+//! entries, retries, and reports `false` when no victim is left; a `MemoryPlan` from the restore
+//! drops that entry and tries the next candidate (addendum item 7).
 
 use super::attn::growth_bytes;
 use super::chunk_plan::{ChunkCost, PREFILL_CANDIDATES, PrefillPlan, PrefillTerms, admitted_chunk};
@@ -76,7 +78,7 @@ use crate::{
             host_load::{HostWeights, rotary_dim},
             settings::{Activation, KvDtype, chunked_prefill_allowed},
         },
-        session::{DecodeSession, Limits, PrefixSlot, TokenStepper, check_prompt},
+        session::{DecodeSession, Limits, PrefixSlot, SaveKind, TokenStepper, check_prompt},
         spec::{AttentionKind, QWEN3_6_35B_A3B},
     },
     kernels::MlxKernels,
@@ -542,15 +544,16 @@ impl ExecutorOps for Q36Executor {
     /// No transient routing or draft state exists: expert routing is computed inside each step.
     fn boundary(&mut self, _st: &mut Q36Session) {}
 
-    /// Shares the resident state as the one prefix of this executor. The session rules decide
-    /// whether the call is valid. The snapshot charges the session budget.
+    /// Shares the resident state as a tip entry of this executor's prefix store. The session
+    /// rules decide whether the call is valid. The snapshot charges the session budget.
     fn save_prefix(&mut self, st: &Q36Session, key: &[u32]) -> Result<bool> {
         let path = self.prefill_path();
         let decoder = &mut self.decoder;
         let fed = fed_positions(&st.state);
-        st.core.save_prefix(&mut self.prefix, key, path, fed, || {
-            decoder.snapshot(&st.state)
-        })
+        st.core
+            .save_prefix(&mut self.prefix, key, path, fed, SaveKind::Tip, || {
+                decoder.snapshot(&st.state)
+            })
     }
 
     /// Restores the saved prefix into the reset session when the session rules accept the prompt.
@@ -2686,9 +2689,10 @@ mod tests {
         assert_eq!(target.state.pos(), 2, "the decode step committed");
     }
 
-    /// A denied save drops the earlier entry first (the documented rule of
-    /// `DecodeSession::save_prefix`: the new key replaces the entry), so the slot is empty
-    /// afterwards and the next job recomputes its whole prompt instead of restoring anything.
+    /// A save of a new key makes room first (the documented rule of `DecodeSession::save_prefix`:
+    /// with one entry place the earlier entry drops before the snapshot), and a denial then
+    /// evicts the remaining victims, so the store is empty afterwards and the next job recomputes
+    /// its whole prompt instead of restoring anything.
     #[test]
     fn a_denied_save_while_an_older_entry_exists_leaves_the_slot_empty_and_the_next_job_recomputes()
     {
@@ -2698,7 +2702,7 @@ mod tests {
         assert_eq!(
             executor.prefix.key_len(),
             Some(KEY),
-            "the first entry is in the slot"
+            "the first entry is stored"
         );
         executor
             .prefill(&mut session, &PREFIX_PROMPT[KEY..])
@@ -2713,7 +2717,7 @@ mod tests {
         assert_eq!(
             executor.prefix.key_len(),
             None,
-            "the slot is empty: the older entry dropped first"
+            "the store is empty: the older entry dropped first"
         );
         assert_eq!(
             executor.decoder.session_used(),
@@ -2869,8 +2873,12 @@ mod tests {
             (&prompt_a, KEY, &want_a, 4),
             // A prompt that equals the key restores nothing. It saves a key of 3 tokens.
             (&prompt_e, KEY - 1, &want_e, 0),
-            // The key of 3 tokens is a prefix of A: 3 tokens are covered, and the key of 4 follows.
+            // The key of 3 tokens is a prefix of A: 3 tokens are covered. The tip of 4 tokens
+            // extends the restored entry, so it replaces it although the store holds one entry.
             (&prompt_a, KEY, &want_a, 3),
+            // The tip of 4 tokens was stored after that restore, so this A covers all 4 key
+            // tokens. Had the tip not been stored, the entry of 3 tokens would restore: 3.
+            (&prompt_a, KEY, &want_a, 4),
             // B replaces the entry, so the last A restores nothing.
             (&prompt_b, KEY, &want_b, 0),
             (&prompt_a, KEY, &want_a, 0),

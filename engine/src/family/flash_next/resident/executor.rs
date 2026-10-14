@@ -57,12 +57,14 @@
 //! the chunk path of the batched prefill, and closes the prefill page sets at a reset.
 //!
 //! Prefix reuse (decision 0036, addendum 1; packet PR1c): `save_prefix` snapshots the state after
-//! the held prompt, and `restore_prefix` gives it back after a reset. The executor keeps one entry
-//! in a `PrefixSlot`. `DecodeSession::save_prefix` and `DecodeSession::restore_prefix` own the
-//! rules (the held prompt, the strict extension, the denied restore), and the executor passes the
-//! two calls that share the resident state. The entry carries the `PrefillPath` that built it.
-//! The one-token steps and each chunk size are separate paths, because a chunk matches the steps
-//! only within the tolerance of gate G2, so an entry restores only under its own path.
+//! the held prompt, and `restore_prefix` gives it back after a reset. The executor keeps its
+//! entries in a `PrefixStore` with the addendum 1 limits (one tip entry, saved by the worker); the
+//! roots and the periodic points of addendum 2 come with the SERVE-2 packets.
+//! `DecodeSession::save_prefix` and `DecodeSession::restore_prefix` own the rules (the held
+//! prompt, the strict extension, the denied restore), and the executor passes the two calls that
+//! share the resident state. The entry carries the `PrefillPath` that built it. The one-token
+//! steps and each chunk size are separate paths, because a chunk matches the steps only within
+//! the tolerance of gate G2, so an entry restores only under its own path.
 
 use super::super::{
     load::FlashWeights,
@@ -78,7 +80,7 @@ use crate::{
     EngError,
     family::{
         executor::{ExecutorOps, GenerationState},
-        session::{DecodeSession, Limits, PrefixSlot, TokenStepper, check_prompt},
+        session::{DecodeSession, Limits, PrefixSlot, SaveKind, TokenStepper, check_prompt},
     },
     kernels::{HostPages, MlxKernels},
     tokenizer::DecodeBatch,
@@ -481,15 +483,16 @@ impl ExecutorOps for FlashExecutor {
     /// No transient routing or draft state exists: the page sets return at the end of each step.
     fn boundary(&mut self, _st: &mut FlashSession) {}
 
-    /// Shares the resident state as the one prefix of this executor. The session rules decide
-    /// whether the call is valid. The snapshot charges the session budget.
+    /// Shares the resident state as a tip entry of this executor's prefix store. The session
+    /// rules decide whether the call is valid. The snapshot charges the session budget.
     fn save_prefix(&mut self, st: &FlashSession, key: &[u32]) -> Result<bool> {
         let path = self.prefill_path();
         let decoder = &mut self.decoder;
         let fed = fed_positions(&st.state);
-        st.core.save_prefix(&mut self.prefix, key, path, fed, || {
-            decoder.snapshot(&st.state)
-        })
+        st.core
+            .save_prefix(&mut self.prefix, key, path, fed, SaveKind::Tip, || {
+                decoder.snapshot(&st.state)
+            })
     }
 
     /// Restores the saved prefix into the reset session when the session rules accept the prompt.
