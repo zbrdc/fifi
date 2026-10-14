@@ -614,8 +614,18 @@ impl<S, P: PartialEq> PrefixStore<S, P> {
             .position(|stored| self.restored != Some(stored.id))
     }
 
-    /// Step (f): when the last restore restored an LRU entry that is still stored and the new tip
-    /// extends its key, that entry is dropped and the call reports `true`.
+    /// Step (f) and the last-resort drop of clarification 1: when the last restore restored an
+    /// LRU entry of kind `Tip` that is still stored and the new tip extends its key, that entry
+    /// is dropped and the call reports `true`.
+    ///
+    /// Rule 4 of addendum 2 says that periodic entries and roots are never dropped this way, so a
+    /// restored `Periodic` entry stays, and a restored root is not in the LRU list at all. The
+    /// last resort of clarification 1 uses the same filter. It matters only for a store with one
+    /// LRU entry, whose default limits (0 roots, 1 entry) never hold a periodic entry because the
+    /// worker emits no periodic point below two entries. With limits (2, 1) the worker emits no
+    /// periodic point either, so no periodic entry can share the list with the tip. A direct
+    /// `save_prefix` call that stores a periodic entry in a one-entry list is outside the rules:
+    /// the restored periodic entry then stays and the tip save is skipped.
     fn drop_restored_ancestor(&mut self, key: &[u32]) -> bool {
         let Some(id) = self.restored else {
             return false;
@@ -623,7 +633,11 @@ impl<S, P: PartialEq> PrefixStore<S, P> {
         let Some(pos) = self.lru.iter().position(|stored| stored.id == id) else {
             return false;
         };
-        if key.len() > self.lru[pos].saved.key.len() && key.starts_with(&self.lru[pos].saved.key) {
+        let stored = &self.lru[pos];
+        if stored.kind == SaveKind::Tip
+            && key.len() > stored.saved.key.len()
+            && key.starts_with(&stored.saved.key)
+        {
             self.lru.remove(pos);
             return true;
         }
@@ -2429,6 +2443,151 @@ mod tests {
             slot.keys().is_empty(),
             "the store is empty: {:?}",
             slot.keys()
+        );
+    }
+
+    /// A store with `(roots, entries)` limits after a restore of an entry of `kind`: a job saved
+    /// the key `[1, 2, 3, 4]` as `kind`, a second job restored it for the prompt `[1, 2, 3, 4, 5]`
+    /// and prefilled the fifth token, and the job then saves the tip `[1, 2, 3, 4, 5]`. Returns
+    /// the result of the tip save, the number of snapshots that the tip save took, and the store.
+    fn tip_after_a_restore_of(
+        roots: usize,
+        entries: usize,
+        kind: SaveKind,
+    ) -> (Result<bool>, usize, Slot) {
+        let (mut step, mut session) = held(&[1, 2, 3, 4]);
+        let mut slot = store(roots, entries);
+        assert_eq!(
+            save_as(&session, &mut slot, &step, &[1, 2, 3, 4], 1, kind),
+            Ok(true),
+            "the entry of 4 tokens is stored"
+        );
+        session.reset(&mut step).unwrap();
+        assert_eq!(
+            restore(&mut session, &mut slot, &mut step, &[1, 2, 3, 4, 5], 1).unwrap(),
+            4,
+            "the entry restores"
+        );
+        session.prefill(&mut step, &[5], LIMIT).unwrap();
+        let calls = std::cell::Cell::new(0usize);
+        let saved = session.save_prefix(
+            &mut slot,
+            &[1, 2, 3, 4, 5],
+            1,
+            step.fed(),
+            SaveKind::Tip,
+            || {
+                calls.set(calls.get() + 1);
+                Ok(step.fed.clone())
+            },
+        );
+        (saved, calls.get(), slot)
+    }
+
+    /// Rule 4 of addendum 2: a periodic entry is never dropped by the lineage rule. The tip of 5
+    /// tokens extends the restored periodic entry of 4 tokens, and the list has room for both.
+    ///
+    /// Mutation check: removing the `Tip` kind test from `drop_restored_ancestor` drops the
+    /// periodic entry, so the key list is `[(5, false)]`.
+    #[test]
+    fn a_restored_periodic_entry_survives_a_tip_that_extends_it() {
+        let (saved, calls, slot) = tip_after_a_restore_of(0, 2, SaveKind::Periodic);
+        assert_eq!(saved, Ok(true), "the tip is saved");
+        assert_eq!(calls, 1, "one snapshot");
+        // The restore made the periodic entry the most recently used one; the tip is newer.
+        assert_eq!(
+            slot.keys(),
+            vec![(4, false), (5, false)],
+            "the periodic entry of 4 tokens and the tip of 5 tokens"
+        );
+    }
+
+    /// A full list drops the other entry for the room, the restored periodic entry stays, and the
+    /// lineage rule does not take it afterwards.
+    ///
+    /// Mutation check: removing the `Tip` kind test from `drop_restored_ancestor` drops the
+    /// periodic entry after the save, so the key list is `[(4, false)]` without the periodic
+    /// entry of 3 tokens.
+    #[test]
+    fn a_full_list_keeps_a_restored_periodic_entry_and_drops_the_other_entry() {
+        let (mut step_a, mut a) = held(&[1, 2, 3]);
+        let (step_b, b) = held(&[5, 6, 7, 8, 9]);
+        let mut slot = store(0, 2);
+        assert_eq!(
+            save_as(&a, &mut slot, &step_a, &[1, 2, 3], 1, SaveKind::Periodic),
+            Ok(true),
+            "the periodic entry A"
+        );
+        assert_eq!(save(&b, &mut slot, &step_b, &[5, 6, 7, 8, 9], 1), Ok(true));
+        a.reset(&mut step_a).unwrap();
+        assert_eq!(
+            restore(&mut a, &mut slot, &mut step_a, &[1, 2, 3, 4], 1).unwrap(),
+            3,
+            "A restores"
+        );
+        a.prefill(&mut step_a, &[4], LIMIT).unwrap();
+        assert_eq!(
+            save(&a, &mut slot, &step_a, &[1, 2, 3, 4], 1),
+            Ok(true),
+            "the tip is saved"
+        );
+        assert_eq!(
+            slot.keys(),
+            vec![(3, false), (4, false)],
+            "B went in the room step; A (3 tokens) stays beside the tip (4 tokens)"
+        );
+    }
+
+    /// The last resort of clarification 1 drops a restored entry of kind `Tip` only. A restored
+    /// periodic entry in a one-entry list is outside the rules of the worker (it emits no
+    /// periodic point below two entries); the store keeps the entry and skips the tip save.
+    ///
+    /// Mutation check: removing the `Tip` kind test from `drop_restored_ancestor` replaces the
+    /// periodic entry, so the call count is 1 and the key list is `[(5, false)]`.
+    #[test]
+    fn the_last_resort_does_not_drop_a_restored_periodic_entry() {
+        let (saved, calls, slot) = tip_after_a_restore_of(0, 1, SaveKind::Periodic);
+        assert_eq!(saved, Ok(false), "the tip save is skipped");
+        assert_eq!(calls, 0, "no snapshot");
+        assert_eq!(slot.keys(), vec![(4, false)], "the periodic entry stays");
+    }
+
+    /// A restored root survives a tip that extends it: roots are not in the LRU list, so the
+    /// lineage rule cannot reach them. The tip takes the one LRU place.
+    #[test]
+    fn a_restored_root_survives_a_tip_that_extends_it() {
+        let (saved, calls, slot) = tip_after_a_restore_of(1, 1, SaveKind::Root);
+        assert_eq!(saved, Ok(true), "the tip is saved");
+        assert_eq!(calls, 1, "one snapshot");
+        assert_eq!(
+            slot.keys(),
+            vec![(4, true), (5, false)],
+            "the root of 4 tokens (roots first) and the tip of 5 tokens"
+        );
+    }
+
+    /// A restored entry of kind `Tip` is still replaced by a tip that extends it (rule 4), both
+    /// with room in the list and as the last resort in a one-entry list.
+    ///
+    /// Mutation check: making `drop_restored_ancestor` always return `false` leaves the entry of
+    /// 4 tokens beside the tip in the first case and skips the save in the second.
+    #[test]
+    fn a_restored_tip_entry_is_still_replaced_by_a_tip_that_extends_it() {
+        let (saved, calls, slot) = tip_after_a_restore_of(0, 2, SaveKind::Tip);
+        assert_eq!(saved, Ok(true), "with room: the tip is saved");
+        assert_eq!(calls, 1, "with room: one snapshot");
+        assert_eq!(
+            slot.keys(),
+            vec![(5, false)],
+            "with room: the old tip is gone"
+        );
+        let (saved, calls, slot) = tip_after_a_restore_of(0, 1, SaveKind::Tip);
+        assert_eq!(saved, Ok(true), "one entry: the tip is saved");
+        assert_eq!(calls, 1, "one entry: one snapshot");
+        assert_eq!(
+            slot.keys(),
+            vec![(5, false)],
+            "one entry: the old tip is gone"
         );
     }
 

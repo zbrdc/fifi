@@ -416,19 +416,40 @@ struct PromptPlan<'a> {
 /// The shortest root that a save point accepts (decision 0036, addendum 2, item 2a).
 const MIN_ROOT_TOKENS: usize = 2_048;
 
+/// The stride of the periodic save points (decision 0036, addendum 2, item 2b): one entry at
+/// every multiple of this many positions counted from the start of the prompt.
+const PERIODIC_TOKENS: usize = 16_384;
+
 /// The ordered save points of a job (decision 0036, addendum 2, item 2): the root at the end
-/// of the first system message, then the tip at the last message boundary. The root runs only
-/// when the store keeps roots (`limits.roots > 0`), it reaches `MIN_ROOT_TOKENS`, lies strictly
-/// inside the tip, and the restore covered none of it. Without roots a root point would only
-/// split the prefill and change its chunk grouping for a save the store refuses, so a job with
-/// a root boundary then runs exactly like a job without one. The tip runs only when the
-/// restore covered none of it, today's rule.
+/// of the first system message, one periodic entry at every multiple of `PERIODIC_TOKENS`
+/// positions counted from the start of the prompt, and the tip at the last message boundary.
+/// The root runs only when the store keeps roots (`limits.roots > 0`), it reaches
+/// `MIN_ROOT_TOKENS`, lies strictly inside the tip, and the restore covered none of it. Without
+/// roots a root point would only split the prefill and change its chunk grouping for a save
+/// the store refuses, so a job with a root boundary then runs exactly like a job without one.
+/// The periodic points run only when the store keeps at least two LRU entries
+/// (`limits.entries >= 2`): with one entry a periodic save would be replaced by the tip at
+/// once and spend a snapshot for nothing. Of the periodic points only the deepest
+/// `limits.entries - 1` are emitted, because the tip takes the last LRU place. The tip runs only
+/// when the restore covered none of it, today's rule.
+///
+/// The prefill runs in chunks of `piece` tokens that start at the current cursor: the cursor
+/// starts at `restored` and moves to every point that this function emits, so a root at an
+/// arbitrary position moves it. A periodic target P counts only when it lies above the cursor.
+/// It moves to the end of the chunk that contains it, `cursor + ceil((P - cursor) / piece) *
+/// piece` (a P that is already a chunk end stays P), and the moved position must stay strictly
+/// below the tip, otherwise the target is dropped. The moved position is always above the
+/// cursor, so no position is emitted twice. The points stay on chunk ends, so the periodic
+/// saves never split a chunk and the numeric path of an entry equals the path of a cold run,
+/// except after a root, which splits the sequence by design.
 fn save_points(
     plan: &PromptPlan<'_>,
     restored: usize,
     limits: StoreLimits,
+    piece: usize,
 ) -> Vec<(usize, SaveKind)> {
     let mut points = Vec::new();
+    let mut cursor = restored;
     if let Some(root) = plan
         .root
         .filter(|_| limits.roots > 0)
@@ -436,6 +457,35 @@ fn save_points(
         .filter(|&root| plan.boundary.is_some_and(|tip| root < tip))
     {
         points.push((root, SaveKind::Root));
+        cursor = root;
+    }
+    if let Some(tip) = plan.boundary.filter(|_| limits.entries >= 2) {
+        debug_assert!(piece > 0, "the prefill piece is positive");
+        let mut periodic = Vec::new();
+        for target in (PERIODIC_TOKENS..tip).step_by(PERIODIC_TOKENS) {
+            if target <= cursor {
+                continue;
+            }
+            let moved = cursor + (target - cursor).div_ceil(piece) * piece;
+            if moved >= tip {
+                continue;
+            }
+            periodic.push(moved);
+            cursor = moved;
+        }
+        // Only the deepest `entries - 1` periodic points survive in the store: the tip takes the
+        // last LRU place, and each save beyond that evicts the oldest entry, first the periodic
+        // entries of this same job and then the entries of other conversations. The final store
+        // is the same without the shallow points, which only spend snapshots. A moved position
+        // lies on the chunk lattice of the cursor, so skipping a shallow point does not change
+        // the position of a deeper one.
+        let skip = periodic.len().saturating_sub(limits.entries - 1);
+        points.extend(
+            periodic
+                .into_iter()
+                .skip(skip)
+                .map(|moved| (moved, SaveKind::Periodic)),
+        );
     }
     if let Some(tip) = plan.boundary.filter(|&tip| tip > restored) {
         points.push((tip, SaveKind::Tip));
@@ -504,8 +554,11 @@ fn run_job<E: ExecutorOps>(
 
 /// Resets the session, restores a saved prefix when the job has a boundary, runs `boundary`,
 /// and prefills the rest of the prompt in chunks. It prefills up to every save point of the
-/// job in turn (decision 0036, addendum 2: the root, then the tip) and saves the prefix state
-/// at each point. Returns the number of prompt tokens that the restore covered.
+/// job in turn (decision 0036, addendum 2: the root, the periodic entries, then the tip) and
+/// saves the prefix state at each point. Each segment is chunked from its own start, which is
+/// the cursor that `save_points` moved to the previous point, so the chunk sequence of the
+/// prefill is the one that `save_points` assumed. Returns the number of prompt tokens that the
+/// restore covered.
 fn start<E: ExecutorOps>(
     executor: &mut E,
     session: &mut E::Session,
@@ -526,7 +579,7 @@ fn start<E: ExecutorOps>(
     executor.boundary(session);
     let mut chunks_run = 0;
     let mut next = restored;
-    for (point, kind) in save_points(plan, restored, executor.prefix_limits()) {
+    for (point, kind) in save_points(plan, restored, executor.prefix_limits(), prefill_chunk) {
         let head = span(plan.tokens, next, point)?;
         if !prefill_chunks(
             executor,
@@ -2195,13 +2248,230 @@ mod tests {
         restored: usize,
         limits: StoreLimits,
     ) -> Vec<(usize, SaveKind)> {
+        points_full(boundary, root, restored, 256, limits)
+    }
+
+    /// The save points of a plan over eight tokens for a store with the given limits and a
+    /// prefill piece of `piece` tokens.
+    fn points_full(
+        boundary: Option<usize>,
+        root: Option<usize>,
+        restored: usize,
+        piece: usize,
+        limits: StoreLimits,
+    ) -> Vec<(usize, SaveKind)> {
         let tokens = vec![0; 8];
         let plan = super::PromptPlan {
             tokens: &tokens,
             boundary,
             root,
         };
-        super::save_points(&plan, restored, limits)
+        super::save_points(&plan, restored, limits, piece)
+    }
+
+    /// The limits of the addendum 2 store: two roots, six entries.
+    const WIDE: StoreLimits = StoreLimits {
+        roots: 2,
+        entries: 6,
+    };
+
+    #[test]
+    fn periodic_points_land_on_the_chunk_ends_below_the_tip() {
+        // No root, restored 0, piece 256: 16,384 = 64 * 256 and 32,768 = 128 * 256 are chunk
+        // ends, so both stay where they are; 49,152 lies past the tip 40,000; the tip follows.
+        assert_eq!(
+            points_full(Some(40_000), None, 0, 256, WIDE),
+            vec![
+                (16_384, SaveKind::Periodic),
+                (32_768, SaveKind::Periodic),
+                (40_000, SaveKind::Tip),
+            ],
+            "the multiples of 16,384, each on its chunk end, then the tip"
+        );
+    }
+
+    #[test]
+    fn a_root_moves_the_cursor_and_the_periodic_points_follow_the_chunks() {
+        // Root 3,000, so the cursor starts the chunks at 3,000: 16,384 moves to
+        // 3,000 + ceil(13,384 / 256) * 256 = 3,000 + 53 * 256 = 16,568; 32,768 then moves to
+        // 16,568 + ceil(16,200 / 256) * 256 = 16,568 + 64 * 256 = 32,952; the tip 39,990 follows.
+        assert_eq!(
+            points_full(Some(39_990), Some(3_000), 0, 256, WIDE),
+            vec![
+                (3_000, SaveKind::Root),
+                (16_568, SaveKind::Periodic),
+                (32_952, SaveKind::Periodic),
+                (39_990, SaveKind::Tip),
+            ],
+            "the root splits the chunk sequence by design and the periodic points follow"
+        );
+    }
+
+    #[test]
+    fn a_restore_hides_the_periodic_points_it_covers() {
+        // Restored 20,000: 16,384 lies below the cursor, so it is no candidate; 32,768 moves to
+        // 20,000 + ceil(12,768 / 256) * 256 = 20,000 + 50 * 256 = 32,800; then the tip.
+        assert_eq!(
+            points_full(Some(40_000), None, 20_000, 256, WIDE),
+            vec![(32_800, SaveKind::Periodic), (40_000, SaveKind::Tip)],
+            "only the multiples above the restore are candidates"
+        );
+    }
+
+    #[test]
+    fn a_periodic_point_that_reaches_the_tip_is_dropped() {
+        // Restored 100: 16,384 moves to 100 + ceil(16,284 / 256) * 256 = 100 + 64 * 256
+        // = 16,484, which equals the tip, and the moved position must stay strictly below it.
+        assert_eq!(
+            points_full(Some(16_484), None, 100, 256, WIDE),
+            vec![(16_484, SaveKind::Tip)],
+            "a target that snaps onto the tip is dropped; the tip itself runs"
+        );
+    }
+
+    #[test]
+    fn a_restore_that_ends_on_a_multiple_emits_no_empty_segment() {
+        // Restored 16,384, no root: the target 16,384 equals the cursor, so it is no candidate
+        // (a point there would be an empty segment and a second save of the restored key);
+        // 32,768 is a chunk end and stays; the tip follows.
+        assert_eq!(
+            points_full(Some(40_000), None, 16_384, 256, WIDE),
+            vec![(32_768, SaveKind::Periodic), (40_000, SaveKind::Tip)],
+            "no point at the restored position"
+        );
+    }
+
+    #[test]
+    fn a_root_on_a_multiple_is_not_saved_twice() {
+        // Root 16,384 moves the cursor to 16,384, so the target 16,384 equals the cursor and
+        // is no candidate; 32,768 = 16,384 + 64 * 256 is a chunk end of the root lattice.
+        assert_eq!(
+            points_full(Some(40_000), Some(16_384), 0, 256, WIDE),
+            vec![
+                (16_384, SaveKind::Root),
+                (32_768, SaveKind::Periodic),
+                (40_000, SaveKind::Tip),
+            ],
+            "the root stands alone at 16,384"
+        );
+    }
+
+    #[test]
+    fn only_the_deepest_periodic_points_that_fit_beside_the_tip_are_emitted() {
+        // Tip 262,143 in a prompt of 262,144 tokens: the multiples 16,384 * k for k = 1..15 lie
+        // below the tip (16 * 16,384 = 262,144 does not). Limits (2, 6) keep 5 LRU places beside
+        // the tip, so the points are the deepest five: k = 11..15.
+        // Without a root every multiple is a chunk end of the 256 piece:
+        // 11 * 16,384 = 180,224; 196,608; 212,992; 229,376; 245,760.
+        assert_eq!(
+            points_full(Some(262_143), None, 0, 256, WIDE),
+            vec![
+                (180_224, SaveKind::Periodic),
+                (196_608, SaveKind::Periodic),
+                (212_992, SaveKind::Periodic),
+                (229_376, SaveKind::Periodic),
+                (245_760, SaveKind::Periodic),
+                (262_143, SaveKind::Tip),
+            ],
+            "five periodic points, the deepest ones, then the tip"
+        );
+        // With a root at 3,000 the chunks start at 3,000, and every step moves by 16,384:
+        // the first target 16,384 moves to 3,000 + ceil(13,384 / 256) * 256 = 3,000 + 53 * 256
+        // = 16,568, and each next target adds ceil(16,200 / 256) * 256 = 64 * 256 = 16,384
+        // to the cursor. The deepest five are 16,568 + 16,384 * j for j = 10..14:
+        // 180,408; 196,792; 213,176; 229,560; 245,944.
+        assert_eq!(
+            points_full(Some(262_143), Some(3_000), 0, 256, WIDE),
+            vec![
+                (3_000, SaveKind::Root),
+                (180_408, SaveKind::Periodic),
+                (196_792, SaveKind::Periodic),
+                (213_176, SaveKind::Periodic),
+                (229_560, SaveKind::Periodic),
+                (245_944, SaveKind::Periodic),
+                (262_143, SaveKind::Tip),
+            ],
+            "the root, the deepest five periodic points on the root lattice, then the tip"
+        );
+    }
+
+    #[test]
+    fn two_lru_entries_keep_one_periodic_point_beside_the_tip() {
+        // Limits (2, 2): one place for the tip, one for the deepest periodic point, which is
+        // 15 * 16,384 = 245,760 below the tip 262,143.
+        assert_eq!(
+            points_full(
+                Some(262_143),
+                None,
+                0,
+                256,
+                StoreLimits {
+                    roots: 2,
+                    entries: 2
+                }
+            ),
+            vec![(245_760, SaveKind::Periodic), (262_143, SaveKind::Tip)],
+            "one periodic point"
+        );
+    }
+
+    #[test]
+    fn a_default_store_gets_the_tip_only() {
+        // The default limits (0 roots, 1 entry): no root point, no periodic point.
+        assert_eq!(
+            points_full(Some(39_990), Some(3_000), 0, 256, StoreLimits::default()),
+            vec![(39_990, SaveKind::Tip)],
+            "a store with one entry and no roots gets the tip only"
+        );
+    }
+
+    #[test]
+    fn a_store_with_one_lru_entry_gets_no_periodic_point() {
+        // Limits (2, 1): the root has a place, but a periodic entry would be replaced by the
+        // tip at once. With two entries the same prompt gets one periodic point: the points
+        // are 16,568 and 32,952 (see the root test), and only the deepest one fits beside the
+        // tip.
+        assert_eq!(
+            points_full(
+                Some(39_990),
+                Some(3_000),
+                0,
+                256,
+                StoreLimits {
+                    roots: 2,
+                    entries: 1
+                }
+            ),
+            vec![(3_000, SaveKind::Root), (39_990, SaveKind::Tip)],
+            "one LRU entry keeps the tip, so no periodic point is worth a snapshot"
+        );
+        assert_eq!(
+            points_full(
+                Some(39_990),
+                Some(3_000),
+                0,
+                256,
+                StoreLimits {
+                    roots: 2,
+                    entries: 2
+                }
+            ),
+            vec![
+                (3_000, SaveKind::Root),
+                (32_952, SaveKind::Periodic),
+                (39_990, SaveKind::Tip),
+            ],
+            "two LRU entries hold the tip and the deepest periodic point"
+        );
+    }
+
+    #[test]
+    fn a_prompt_shorter_than_the_periodic_stride_has_no_periodic_point() {
+        assert_eq!(
+            points_full(Some(16_000), None, 0, 256, WIDE),
+            vec![(16_000, SaveKind::Tip)],
+            "no multiple of 16,384 lies below the tip 16,000"
+        );
     }
 
     #[test]
@@ -2610,6 +2880,269 @@ mod tests {
             "no piece of the tip head ran after the root save"
         );
         assert_eq!(stored(&store), vec![(ROOT, true)], "the root stays alone");
+        engine.shutdown();
+    }
+
+    /// The periodic-point fixtures: a 40,000-token prompt of id 2 whose tip boundary lies one
+    /// token inside the prompt, and the prompts that share parts of it.
+    const LONG_TIP: usize = 39_999;
+
+    fn long_prompt() -> Vec<u32> {
+        vec![2; 40_000]
+    }
+
+    /// The `save_prefix` entries of a call log.
+    fn saves_in(entries: &[String]) -> Vec<String> {
+        entries
+            .iter()
+            .filter(|entry| entry.starts_with("save_prefix:"))
+            .cloned()
+            .collect()
+    }
+
+    #[test]
+    fn periodic_entries_restore_by_longest_prefix_across_jobs() {
+        let log = new_log();
+        let (engine, store) = start_limited_spy(256, vec![vec![EOS]; 3], &log);
+        let handle = engine.handle();
+        // The first job holds no root, so its save points are 16,384 and 32,768 (multiples of
+        // the 16,384 stride, each a multiple of the 256 piece) and the tip at 39,999.
+        let first_prompt = long_prompt();
+        let (first, first_events) = job_with_boundary(&first_prompt, LONG_TIP);
+        assert_eq!(
+            run_one(&handle, first, first_events),
+            stop_events(40_000, 0)
+        );
+        assert_eq!(
+            saves_in(&calls(&log)),
+            strings(&[
+                "save_prefix:16384",
+                "save_prefix:32768",
+                "save_prefix:39999"
+            ]),
+            "the periodic points run in position order before the tip"
+        );
+        assert_eq!(
+            stored(&store),
+            vec![(16_384, false), (32_768, false), (LONG_TIP, false)],
+            "the store holds both periodic entries beside the tip"
+        );
+        // The second job shares the first 33,000 tokens: the longest stored key below its
+        // prompt is the 32,768 periodic entry (the 39,999 tip is too long, 16,384 is shorter).
+        // The restore covers 32,768, so the target 32,768 equals the cursor and no periodic
+        // point remains: the job saves exactly its tip 33,999. The tip extends the restored
+        // entry, but periodic entries are never dropped by the lineage rule (rule 4), so the
+        // 32,768 entry stays.
+        let mut second_prompt = first_prompt[..33_000].to_vec();
+        second_prompt.extend(std::iter::repeat_n(7, 1_000));
+        let before_second = calls(&log).len();
+        let (second, second_events) = job_with_boundary(&second_prompt, 33_999);
+        assert_eq!(
+            run_one(&handle, second, second_events),
+            stop_events(34_000, 32_768),
+            "the second job reuses the 32,768 periodic entry"
+        );
+        assert_eq!(
+            saves_in(&calls(&log)[before_second..]),
+            strings(&["save_prefix:33999"]),
+            "no save at the restored position 32,768: that would be an empty segment"
+        );
+        // The restore made the 32,768 entry the most recently used one; the new tip follows it.
+        assert_eq!(
+            stored(&store),
+            vec![
+                (16_384, false),
+                (LONG_TIP, false),
+                (32_768, false),
+                (33_999, false)
+            ],
+            "the periodic entry stays beside the tip of the second job"
+        );
+        // The third job diverges at 20,000 tokens: only the 16,384 entry still matches (the
+        // 32,768 and 33,999 keys are longer than the 25,000-token prompt). The target 16,384
+        // equals the cursor, so the job saves its tip 24,999 only, and the periodic entry stays.
+        let mut third_prompt = first_prompt[..20_000].to_vec();
+        third_prompt.extend(std::iter::repeat_n(9, 5_000));
+        let before_third = calls(&log).len();
+        let (third, third_events) = job_with_boundary(&third_prompt, 24_999);
+        assert_eq!(
+            run_one(&handle, third, third_events),
+            stop_events(25_000, 16_384),
+            "the diverging job reuses the 16,384 periodic entry"
+        );
+        assert_eq!(
+            saves_in(&calls(&log)[before_third..]),
+            strings(&["save_prefix:24999"]),
+            "only the tip"
+        );
+        assert_eq!(
+            stored(&store),
+            vec![
+                (LONG_TIP, false),
+                (32_768, false),
+                (33_999, false),
+                (16_384, false),
+                (24_999, false)
+            ],
+            "the restore moved the 16,384 entry behind the others; the tip follows; nothing is dropped"
+        );
+        drop(handle);
+        engine.shutdown();
+    }
+
+    #[test]
+    fn a_cancel_between_two_periodic_saves_keeps_the_earlier_save() {
+        let log = new_log();
+        let state = generation();
+        let flag = Arc::clone(&state.cancel);
+        let mut spy = Spy::new(vec![vec![0]], &log);
+        spy.inner.with_prefix_limits(2, 6);
+        let store = spy.inner.prefix_store();
+        // Prefill calls 0 to 63 cover [0, 16,384). Call 64 is the first chunk after the 16,384
+        // save, so the cancel lands between the two periodic saves.
+        spy.cancel_after_prefill_call = Some((64, flag));
+        let engine = start_spy(256, spy);
+        let (job, handle) = Job::new(long_prompt(), state).expect("job");
+        let job = job.with_prefix_boundary(LONG_TIP).expect("tip boundary");
+        assert_eq!(
+            run_one(&engine.handle(), job, handle),
+            vec![
+                batch(&[], "", Some(DecodeFinish::Cancelled)),
+                finished(40_000, 0),
+            ]
+        );
+        assert_eq!(
+            stored(&store),
+            vec![(16_384, false)],
+            "the first periodic entry stays and the second was never saved"
+        );
+        assert_eq!(
+            saves_in(&calls(&log)),
+            strings(&["save_prefix:16384"]),
+            "no later save ran"
+        );
+        engine.shutdown();
+    }
+
+    #[test]
+    fn an_engine_with_one_lru_entry_saves_only_the_tip() {
+        // Limits (2, 1) hold one LRU entry: a periodic save would be replaced by the tip at
+        // once, so the worker emits no periodic point at all.
+        let log = new_log();
+        let mut spy = Spy::new(vec![vec![EOS]], &log);
+        spy.inner.with_prefix_limits(2, 1);
+        let store = spy.inner.prefix_store();
+        let engine = start_spy(256, spy);
+        let prompt = long_prompt();
+        let (job, events) = job_with_boundary(&prompt, LONG_TIP);
+        assert_eq!(
+            run_one(&engine.handle(), job, events),
+            stop_events(40_000, 0)
+        );
+        assert_eq!(
+            saves_in(&calls(&log)),
+            strings(&["save_prefix:39999"]),
+            "no periodic snapshot was spent"
+        );
+        assert_eq!(
+            stored(&store),
+            vec![(LONG_TIP, false)],
+            "the store holds the tip only"
+        );
+        engine.shutdown();
+    }
+
+    #[test]
+    fn the_cold_chunk_sequence_equals_the_sequence_with_periodic_points_and_no_root() {
+        // The periodic points sit on chunk ends, so they split no chunk. The tip 40,192 is a
+        // multiple of the 256 piece and the prompt ends 100 tokens later, so the tail chunk of
+        // the run with points has the size of the tail chunk of the cold run too.
+        let log = new_log();
+        let (engine, _store) = start_limited_spy(256, vec![vec![EOS], vec![EOS]], &log);
+        let handle = engine.handle();
+        let prompt = vec![2; 40_292];
+        let (cold, cold_events) = job(&prompt);
+        assert_eq!(run_one(&handle, cold, cold_events), stop_events(40_292, 0));
+        let after_cold = calls(&log).len();
+        let (periodic, periodic_events) = job_with_boundary(&prompt, 40_192);
+        assert_eq!(
+            run_one(&handle, periodic, periodic_events),
+            stop_events(40_292, 0)
+        );
+        let all = calls(&log);
+        let pieces = |entries: &[String]| -> Vec<String> {
+            entries
+                .iter()
+                .filter(|entry| entry.starts_with("prefill:"))
+                .cloned()
+                .collect()
+        };
+        let cold_pieces = pieces(&all[..after_cold]);
+        assert_eq!(cold_pieces.len(), 158, "157 chunks of 256 and one of 100");
+        assert_eq!(
+            cold_pieces,
+            pieces(&all[after_cold..]),
+            "the periodic saves left the chunk sequence of the prefill unchanged"
+        );
+        assert_eq!(
+            saves_in(&all[after_cold..]),
+            strings(&[
+                "save_prefix:16384",
+                "save_prefix:32768",
+                "save_prefix:40192"
+            ]),
+            "the periodic points and the tip ran between the same chunks"
+        );
+        drop(handle);
+        engine.shutdown();
+    }
+
+    #[test]
+    fn the_executor_piece_decides_where_a_periodic_point_lands() {
+        // The executor reports a piece of 100, which replaces the fallback 256 and does not
+        // divide 16,384. The target 16,384 moves to ceil(16,384 / 100) * 100 = 164 * 100
+        // = 16,400. The tip 19,900 is a multiple of 100, so the prefill runs 164 + 35 chunks of
+        // 100 up to the tip and one chunk of 100 after it: 200 chunks, as in the cold run.
+        let log = new_log();
+        let mut spy = Spy::new(vec![vec![EOS], vec![EOS]], &log);
+        spy.inner.with_prefix_limits(2, 6);
+        spy.piece = Some(100);
+        let engine = start_spy(256, spy);
+        let handle = engine.handle();
+        let prompt = vec![2; 20_000];
+        let (cold, cold_events) = job(&prompt);
+        assert_eq!(run_one(&handle, cold, cold_events), stop_events(20_000, 0));
+        let after_cold = calls(&log).len();
+        let (periodic, periodic_events) = job_with_boundary(&prompt, 19_900);
+        assert_eq!(
+            run_one(&handle, periodic, periodic_events),
+            stop_events(20_000, 0)
+        );
+        let all = calls(&log);
+        let pieces = |entries: &[String]| -> Vec<String> {
+            entries
+                .iter()
+                .filter(|entry| entry.starts_with("prefill:"))
+                .cloned()
+                .collect()
+        };
+        let cold_pieces = pieces(&all[..after_cold]);
+        assert_eq!(
+            cold_pieces,
+            vec!["prefill:100".to_string(); 200],
+            "the cold run uses the executor piece"
+        );
+        assert_eq!(
+            pieces(&all[after_cold..]),
+            cold_pieces,
+            "the periodic saves left the chunk sequence unchanged"
+        );
+        assert_eq!(
+            saves_in(&all[after_cold..]),
+            strings(&["save_prefix:16400", "save_prefix:19900"]),
+            "the periodic point is the end of the 164th chunk of 100"
+        );
+        drop(handle);
         engine.shutdown();
     }
 

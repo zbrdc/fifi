@@ -92,11 +92,12 @@ pub(crate) trait ExecutorOps {
     /// The limits of this executor's prefix store (decision 0036, addenda 1 and 2): how many
     /// pinned roots and how many LRU entries it holds. The worker asks once per job and plans
     /// its save points with the answer: it emits a root point only when `roots > 0`, so a job
-    /// with a root boundary behaves like a job without one on an engine that keeps no roots.
+    /// with a root boundary behaves like a job without one on an engine that keeps no roots. It
+    /// emits periodic points only when `entries >= 2`, because with one entry the tip would
+    /// replace a periodic entry at once.
     /// The default is the addendum 1 store: zero roots and one entry. An executor that enables
     /// the set overrides this method and must answer with the limits of its own store (the
-    /// Qwen3.6 engine will answer two roots and six entries). The periodic points of a later
-    /// packet need `entries >= 2`.
+    /// Qwen3.6 engine will answer two roots and six entries).
     fn prefix_limits(&self) -> StoreLimits {
         StoreLimits::default()
     }
