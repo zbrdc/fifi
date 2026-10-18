@@ -1,0 +1,38 @@
+[
+  {
+    "id": "chatcmpl-1",
+    "choices": [
+      {
+        "index": 0,
+        "delta": {
+          "content": "Hel"
+        }
+      }
+    ]
+  },
+  {
+    "id": "chatcmpl-1",
+    "choices": [
+      {
+        "index": 0,
+        "delta": {
+          "content": "lo."
+        }
+      }
+    ]
+  },
+  {
+    "id": "chatcmpl-1",
+    "choices": [
+      {
+        "index": 0,
+        "delta": {},
+        "finish_reason": "stop"
+      }
+    ],
+    "usage": {
+      "prompt_tokens": 12,
+      "completion_tokens": 5
+    }
+  }
+]

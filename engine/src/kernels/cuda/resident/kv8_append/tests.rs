@@ -17,6 +17,45 @@ use crate::EngError;
 use crate::kernels::cuda::testkit::{self, Rng, f16_bits, f16_to_f32};
 use crate::kernels::cuda::{CudaContext, DeviceBuffer, DeviceRange, DeviceStream};
 
+/// The fallible upload of `bytes` for the Result-only device phases of this file: the shared
+/// `testkit` uploads panic, which must not happen while a device owner is alive.
+fn upload_bytes(ctx: &CudaContext, bytes: &[u8]) -> Result<DeviceBuffer, EngError> {
+    ctx.upload(bytes)
+}
+
+/// The fallible upload of `values` for the Result-only device phases.
+fn upload_f32(ctx: &CudaContext, values: &[f32]) -> Result<DeviceBuffer, EngError> {
+    let bytes: Vec<u8> = values
+        .iter()
+        .flat_map(|value| value.to_le_bytes())
+        .collect();
+    upload_bytes(ctx, &bytes)
+}
+
+/// The fallible upload of `len` bytes that all equal `byte`.
+fn upload_filled(ctx: &CudaContext, byte: u8, len: usize) -> Result<DeviceBuffer, EngError> {
+    upload_bytes(ctx, &vec![byte; len])
+}
+
+/// The fallible download of the first `len` bytes of `buffer`.
+fn read_bytes(ctx: &CudaContext, buffer: &DeviceBuffer, len: usize) -> Result<Vec<u8>, EngError> {
+    let mut bytes = vec![0u8; len];
+    ctx.download(buffer, &mut bytes)?;
+    Ok(bytes)
+}
+
+/// Adds the phase's row label to a device error, so a drain or upload failure names the row
+/// whose call hit it again.
+fn labelled(label: &str, error: EngError) -> EngError {
+    match error {
+        EngError::Backend { operation, message } => EngError::Backend {
+            operation,
+            message: format!("{label}: {message}"),
+        },
+        other => other,
+    }
+}
+
 /// Sentinel byte of every unwritten code cell.
 const CODE_SENTINEL: u8 = 0x5a;
 /// Sentinel bits of every unwritten scale slot.
@@ -24,17 +63,17 @@ const SCALE_SENTINEL: u16 = 0xabcd;
 /// Bytes of slack past each plane's extent (see the module doc).
 const SLACK: usize = 32;
 
-/// A device context and its stream.
+/// A device context and its stream, owned by one device phase.
 struct Rig {
     ctx: CudaContext,
     stream: DeviceStream,
 }
 
 impl Rig {
-    fn new() -> Self {
-        let ctx = CudaContext::new().expect("context");
-        let stream = ctx.stream().expect("stream");
-        Self { ctx, stream }
+    fn new() -> Result<Self, EngError> {
+        let ctx = CudaContext::new()?;
+        let stream = ctx.stream()?;
+        Ok(Self { ctx, stream })
     }
 }
 
@@ -220,46 +259,52 @@ fn case(rows: usize, head_dim: usize, pos: usize, seed: u64) -> Case {
     }
 }
 
-/// The whole buffer as a range.
-fn whole(b: &DeviceBuffer) -> DeviceRange<'_> {
-    b.range(0, b.bytes()).expect("range")
+/// The whole buffer as a range, or its range error (the Result-only phases use it through
+/// `?`; every owner drops before they return, so a failure must not panic).
+fn whole(b: &DeviceBuffer) -> Result<DeviceRange<'_>, EngError> {
+    b.range(0, b.bytes())
 }
 
-/// The buffer minus its sentinel slack, as the range of the call.
-fn plane_range(b: &DeviceBuffer) -> DeviceRange<'_> {
-    b.range(0, b.bytes() - SLACK).expect("plane range")
+/// The buffer minus its sentinel slack, as the range of the call, or its range error.
+fn plane_range(b: &DeviceBuffer) -> Result<DeviceRange<'_>, EngError> {
+    b.range(0, b.bytes() - SLACK)
 }
 
 /// The four planes of a case on the device, holding the reference images.
 struct Planes([DeviceBuffer; 4]);
 
 impl Planes {
-    fn upload(ctx: &CudaContext, images: &[Vec<u8>; 4]) -> Self {
-        Self([
-            testkit::upload_bytes(ctx, &images[0]),
-            testkit::upload_bytes(ctx, &images[1]),
-            testkit::upload_bytes(ctx, &images[2]),
-            testkit::upload_bytes(ctx, &images[3]),
+    fn upload(ctx: &CudaContext, images: &[Vec<u8>; 4]) -> Result<Self, EngError> {
+        Ok(Self([
+            upload_bytes(ctx, &images[0])?,
+            upload_bytes(ctx, &images[1])?,
+            upload_bytes(ctx, &images[2])?,
+            upload_bytes(ctx, &images[3])?,
+        ]))
+    }
+
+    fn data<'b>(
+        &'b self,
+        k: &'b DeviceBuffer,
+        v: &'b DeviceBuffer,
+    ) -> Result<Kv8Data<'b>, EngError> {
+        Ok(Kv8Data {
+            k: whole(k)?,
+            v: whole(v)?,
+            k_codes: plane_range(&self.0[0])?,
+            k_scales: plane_range(&self.0[1])?,
+            v_codes: plane_range(&self.0[2])?,
+            v_scales: plane_range(&self.0[3])?,
+        })
+    }
+
+    fn read(&self, ctx: &CudaContext) -> Result<[Vec<u8>; 4], EngError> {
+        Ok([
+            read_bytes(ctx, &self.0[0], self.0[0].bytes())?,
+            read_bytes(ctx, &self.0[1], self.0[1].bytes())?,
+            read_bytes(ctx, &self.0[2], self.0[2].bytes())?,
+            read_bytes(ctx, &self.0[3], self.0[3].bytes())?,
         ])
-    }
-
-    fn data<'b>(&'b self, k: &'b DeviceBuffer, v: &'b DeviceBuffer) -> Kv8Data<'b> {
-        Kv8Data {
-            k: whole(k),
-            v: whole(v),
-            k_codes: plane_range(&self.0[0]),
-            k_scales: plane_range(&self.0[1]),
-            v_codes: plane_range(&self.0[2]),
-            v_scales: plane_range(&self.0[3]),
-        }
-    }
-
-    fn read(&self, ctx: &CudaContext) -> [Vec<u8>; 4] {
-        let mut out = Vec::new();
-        for buffer in &self.0 {
-            out.push(testkit::read_bytes(ctx, buffer, buffer.bytes()));
-        }
-        out.try_into().expect("four planes")
     }
 }
 
@@ -277,24 +322,49 @@ fn assert_planes(label: &str, got: &[Vec<u8>; 4], want: &[Vec<u8>; 4]) {
 }
 
 /// Uploads the case, queues the decode append at the device word `word`, drains and reads the
-/// planes back.
-fn run_append(rig: &Rig, c: &Case, word: i32) -> [Vec<u8>; 4] {
-    let planes = Planes::upload(&rig.ctx, &c.expected());
-    let k = testkit::upload_f32(&rig.ctx, &c.k);
-    let v = testkit::upload_f32(&rig.ctx, &c.v);
-    let pos = testkit::upload_bytes(&rig.ctx, &word.to_le_bytes());
-    let status = testkit::upload_bytes(&rig.ctx, &0u32.to_le_bytes());
-    rig.ctx
-        .kv8_append(
-            &rig.stream,
-            c.shape(),
-            planes.data(&k, &v),
-            whole(&pos),
-            whole(&status),
-        )
-        .expect("queue the append");
-    rig.stream.synchronize().expect("drain");
+/// planes back through `?`. Called only inside a Result-only device phase.
+fn run_append(rig: &Rig, c: &Case, word: i32) -> Result<[Vec<u8>; 4], EngError> {
+    let planes = Planes::upload(&rig.ctx, &c.expected())?;
+    let k = upload_f32(&rig.ctx, &c.k)?;
+    let v = upload_f32(&rig.ctx, &c.v)?;
+    let pos = upload_bytes(&rig.ctx, &word.to_le_bytes())?;
+    let status = upload_bytes(&rig.ctx, &0u32.to_le_bytes())?;
+    rig.ctx.kv8_append(
+        &rig.stream,
+        c.shape(),
+        planes.data(&k, &v)?,
+        whole(&pos)?,
+        whole(&status)?,
+    )?;
+    rig.stream.synchronize()?;
     planes.read(&rig.ctx)
+}
+
+/// One append outcome: the case label with the reference images and the plane bytes the device
+/// wrote, as plain vectors.
+struct PlanesOutcome {
+    label: String,
+    got: [Vec<u8>; 4],
+    want: [Vec<u8>; 4],
+}
+
+/// The device phase of the append cases: every case through the decode entry at its own
+/// position word, the Rig dropped with its buffers before the plain vectors return, so the
+/// asserts never run inside a live backend (the S3b lesson: a drop while panicking latches
+/// it).
+fn append_phase(cases: &[Case]) -> Result<Vec<PlanesOutcome>, EngError> {
+    let rig = Rig::new()?;
+    let mut outcomes = Vec::new();
+    for c in cases {
+        let want = c.expected();
+        let got = run_append(&rig, c, c.pos as i32)?;
+        outcomes.push(PlanesOutcome {
+            label: c.label(),
+            got,
+            want,
+        });
+    }
+    Ok(outcomes)
 }
 
 #[test]
@@ -302,7 +372,6 @@ fn kv8_append_writes_bit_equal_codes_and_scales() {
     if !testkit::device_present("kv8_append_writes_bit_equal_codes_and_scales") {
         return;
     }
-    let rig = Rig::new();
     let cases = [
         case(1, 256, 0, 0x8ad1_0001),
         case(1, 128, 0, 0x8ad1_0002),
@@ -310,11 +379,50 @@ fn kv8_append_writes_bit_equal_codes_and_scales() {
         case(16, 256, 3, 0x8ad1_0004),
         case(16, 128, 0, 0x8ad1_0005),
     ];
-    for c in &cases {
-        let want = c.expected();
-        let got = run_append(&rig, c, c.pos as i32);
-        assert_planes(&c.label(), &got, &want);
+    let outcomes = append_phase(&cases).expect("the device phase of the append cases");
+    for outcome in &outcomes {
+        assert_planes(&outcome.label, &outcome.got, &outcome.want);
     }
+}
+
+/// One chunk outcome: the case label, the plane bytes the valid chunk wrote against the
+/// reference, and the result of the pos0 refusal the test asserts afterwards.
+struct ChunkOutcome {
+    label: String,
+    got: [Vec<u8>; 4],
+    want: [Vec<u8>; 4],
+    refused: Result<(), EngError>,
+}
+
+/// The device phase of the chunk cases: one valid chunk launch and, on the same buffers, the
+/// pos0 refusal, the Rig dropped with its buffers before the plain vectors return.
+fn chunk_phase(cases: &[Case]) -> Result<Vec<ChunkOutcome>, EngError> {
+    let rig = Rig::new()?;
+    let mut outcomes = Vec::new();
+    for c in cases {
+        let want = c.expected();
+        let planes = Planes::upload(&rig.ctx, &want)?;
+        let k = upload_f32(&rig.ctx, &c.k)?;
+        let v = upload_f32(&rig.ctx, &c.v)?;
+        rig.ctx
+            .kv8_chunk(&rig.stream, c.shape(), planes.data(&k, &v)?, c.pos)?;
+        rig.stream.synchronize()?;
+        let got = planes.read(&rig.ctx)?;
+        // A chunk whose window does not fit is refused before any launch.
+        let refused = rig.ctx.kv8_chunk(
+            &rig.stream,
+            c.shape(),
+            planes.data(&k, &v)?,
+            c.cells - c.rows + 1,
+        );
+        outcomes.push(ChunkOutcome {
+            label: c.label(),
+            got,
+            want,
+            refused,
+        });
+    }
+    Ok(outcomes)
 }
 
 #[test]
@@ -322,35 +430,66 @@ fn kv8_chunk_writes_bit_equal_codes_and_scales() {
     if !testkit::device_present("kv8_chunk_writes_bit_equal_codes_and_scales") {
         return;
     }
-    let rig = Rig::new();
-    for c in [
+    let cases = [
         case(1, 256, 0, 0x8ad2_0001),
         case(3, 256, 11, 0x8ad2_0002),
         case(64, 128, 2, 0x8ad2_0003),
-    ] {
-        let want = c.expected();
-        let planes = Planes::upload(&rig.ctx, &want);
-        let k = testkit::upload_f32(&rig.ctx, &c.k);
-        let v = testkit::upload_f32(&rig.ctx, &c.v);
-        rig.ctx
-            .kv8_chunk(&rig.stream, c.shape(), planes.data(&k, &v), c.pos)
-            .expect("queue the chunk");
-        rig.stream.synchronize().expect("drain");
-        let got = planes.read(&rig.ctx);
-        assert_planes(&c.label(), &got, &want);
-        // A chunk whose window does not fit is refused before any launch.
-        let result = rig.ctx.kv8_chunk(
-            &rig.stream,
-            c.shape(),
-            planes.data(&k, &v),
-            c.cells - c.rows + 1,
-        );
-        let message = match result {
+    ];
+    let outcomes = chunk_phase(&cases).expect("the device phase of the chunk cases");
+    for outcome in &outcomes {
+        assert_planes(&outcome.label, &outcome.got, &outcome.want);
+        let message = match &outcome.refused {
             Err(EngError::BadRequest(message)) if message.contains("kv8_chunk: pos0") => message,
-            other => panic!("{}: expected the pos0 refusal, got {other:?}", c.label()),
+            other => panic!(
+                "{}: expected the pos0 refusal, got {other:?}",
+                outcome.label
+            ),
         };
         assert!(message.contains("cells"), "{message}");
     }
+}
+
+/// One invalid-word outcome: its label, the plane bytes after the append (which must stay
+/// pristine) and the status word the device OR-ed its mask 4 into.
+struct WordOutcome {
+    label: String,
+    got: [Vec<u8>; 4],
+    pristine: [Vec<u8>; 4],
+    status: i32,
+}
+
+/// The device phase of the invalid position words: the decode entry at every word, the Rig
+/// dropped with its buffers before the plain vectors return.
+fn bad_word_phase(c: &Case, words: &[(&'static str, i32)]) -> Result<Vec<WordOutcome>, EngError> {
+    let rig = Rig::new()?;
+    let mut outcomes = Vec::new();
+    for (label, word) in words {
+        let pristine = c.expected();
+        let planes = Planes::upload(&rig.ctx, &pristine)?;
+        let k = upload_f32(&rig.ctx, &c.k)?;
+        let v = upload_f32(&rig.ctx, &c.v)?;
+        let pos = upload_bytes(&rig.ctx, &word.to_le_bytes())?;
+        let status = upload_bytes(&rig.ctx, &1u32.to_le_bytes())?;
+        rig.ctx.kv8_append(
+            &rig.stream,
+            c.shape(),
+            planes.data(&k, &v)?,
+            whole(&pos)?,
+            whole(&status)?,
+        )?;
+        rig.stream.synchronize()?;
+        let got = planes.read(&rig.ctx)?;
+        let word_bytes = read_bytes(&rig.ctx, &status, 4)?;
+        let status =
+            i32::from_le_bytes([word_bytes[0], word_bytes[1], word_bytes[2], word_bytes[3]]);
+        outcomes.push(WordOutcome {
+            label: format!("poison {label}"),
+            got,
+            pristine,
+            status,
+        });
+    }
+    Ok(outcomes)
 }
 
 #[test]
@@ -358,45 +497,33 @@ fn kv8_append_refuses_a_bad_position_word_without_writing() {
     if !testkit::device_present("kv8_append_refuses_a_bad_position_word_without_writing") {
         return;
     }
-    let rig = Rig::new();
     let c = case(2, 256, 1, 0x8ad3_0001);
-    for (label, word) in [
+    let words = [
         ("negative", -1),
         ("past the cells", c.cells as i32),
         ("one row short", (c.cells - c.rows + 1) as i32),
-    ] {
-        let pristine = c.expected();
-        let planes = Planes::upload(&rig.ctx, &pristine);
-        let k = testkit::upload_f32(&rig.ctx, &c.k);
-        let v = testkit::upload_f32(&rig.ctx, &c.v);
-        let pos = testkit::upload_bytes(&rig.ctx, &word.to_le_bytes());
-        let status = testkit::upload_bytes(&rig.ctx, &1u32.to_le_bytes());
-        rig.ctx
-            .kv8_append(
-                &rig.stream,
-                c.shape(),
-                planes.data(&k, &v),
-                whole(&pos),
-                whole(&status),
-            )
-            .expect("queue the append");
-        rig.stream.synchronize().expect("drain");
-        let got = planes.read(&rig.ctx);
-        assert_planes(&format!("poison {label}"), &got, &pristine);
-        let word_bytes = testkit::read_bytes(&rig.ctx, &status, 4);
-        let value = i32::from_le_bytes(word_bytes[..4].try_into().expect("the status word"));
+    ];
+    let outcomes = bad_word_phase(&c, &words).expect("the device phase of the invalid words");
+    for outcome in &outcomes {
+        assert_planes(&outcome.label, &outcome.got, &outcome.pristine);
         assert_eq!(
-            value,
+            outcome.status,
             1 | 4,
-            "{label}: mask 4 must be OR-ed into the status word"
+            "{}: mask 4 must be OR-ed into the status word",
+            outcome.label
         );
     }
     // The boundary word (pos + rows == cells) is valid and writes.
     let mut edge = case(2, 256, 4, 0x8ad3_0002);
     edge.cells = edge.pos + edge.rows;
-    let want = edge.expected();
-    let got = run_append(&rig, &edge, edge.pos as i32);
-    assert_planes(&edge.label(), &got, &want);
+    let edge_outcomes =
+        append_phase(std::slice::from_ref(&edge)).expect("the device phase of the boundary word");
+    assert_eq!(edge_outcomes.len(), 1, "the boundary case ran once");
+    assert_planes(
+        &edge_outcomes[0].label,
+        &edge_outcomes[0].got,
+        &edge_outcomes[0].want,
+    );
 }
 
 // ---- refusals before any launch ----
@@ -481,8 +608,14 @@ impl Plan {
 }
 
 /// Runs the plan's call (the decode entry by default, the chunk entry for `chunk`) and returns
-/// the result and the `k_codes` bytes afterwards.
-fn attempt(rig: &Rig, other: &Rig, plan: &Plan, chunk: bool) -> (Result<(), EngError>, Vec<u8>) {
+/// the result of the call and the `k_codes` bytes afterwards through `?`. Called only inside a
+/// Result-only device phase.
+fn attempt(
+    rig: &Rig,
+    other: &Rig,
+    plan: &Plan,
+    chunk: bool,
+) -> Result<(Result<(), EngError>, Vec<u8>), EngError> {
     let (ctx, shape) = (&rig.ctx, plan.shape);
     let content = |i: usize, slot: &Slot| -> Vec<u8> {
         let fill: u8 = match i {
@@ -502,30 +635,31 @@ fn attempt(rig: &Rig, other: &Rig, plan: &Plan, chunk: bool) -> (Result<(), EngE
         .slots
         .iter()
         .enumerate()
-        .map(|(i, slot)| testkit::upload_bytes(ctx, &content(i, slot)))
-        .collect();
-    let shared = plan.alias.map(|(a, b)| {
-        let bytes = plan.slots[a].bytes.max(plan.slots[b].bytes);
-        (a, b, testkit::upload_bytes(ctx, &vec![0xff; bytes]))
-    });
-    let foreign = testkit::upload_filled(&other.ctx, 0, plan.slots[K].bytes);
-    let range = |i: usize| -> DeviceRange<'_> {
+        .map(|(i, slot)| upload_bytes(ctx, &content(i, slot)))
+        .collect::<Result<_, _>>()?;
+    let shared = plan
+        .alias
+        .map(|(a, b)| -> Result<_, EngError> {
+            let bytes = plan.slots[a].bytes.max(plan.slots[b].bytes);
+            Ok((a, b, upload_bytes(ctx, &vec![0xff; bytes])?))
+        })
+        .transpose()?;
+    let foreign = upload_filled(&other.ctx, 0, plan.slots[K].bytes)?;
+    let range = |i: usize| -> Result<DeviceRange<'_>, EngError> {
         let buffer = match &shared {
             Some((a, b, buf)) if i == *a || i == *b => buf,
             _ if i == K && plan.foreign_k => &foreign,
             _ => &bufs[i],
         };
-        buffer
-            .range(plan.slots[i].offset, plan.slots[i].bytes)
-            .expect("range")
+        buffer.range(plan.slots[i].offset, plan.slots[i].bytes)
     };
     let data = Kv8Data {
-        k: range(K),
-        v: range(V),
-        k_codes: range(KC),
-        k_scales: range(KS),
-        v_codes: range(VC),
-        v_scales: range(VS),
+        k: range(K)?,
+        v: range(V)?,
+        k_codes: range(KC)?,
+        k_scales: range(KS)?,
+        v_codes: range(VC)?,
+        v_scales: range(VS)?,
     };
     let stream = if plan.foreign_stream {
         &other.stream
@@ -535,13 +669,13 @@ fn attempt(rig: &Rig, other: &Rig, plan: &Plan, chunk: bool) -> (Result<(), EngE
     let result = if chunk {
         ctx.kv8_chunk(stream, shape, data, plan.pos0)
     } else {
-        ctx.kv8_append(stream, shape, data, range(POS), range(STATUS))
+        ctx.kv8_append(stream, shape, data, range(POS)?, range(STATUS)?)
     };
     stream
         .synchronize()
-        .unwrap_or_else(|e| panic!("{}: drain: {e:?}", plan.label));
-    let out = testkit::read_bytes(ctx, &bufs[KC], plan.slots[KC].bytes);
-    (result, out)
+        .map_err(|error| labelled(plan.label, error))?;
+    let out = read_bytes(ctx, &bufs[KC], plan.slots[KC].bytes)?;
+    Ok((result, out))
 }
 
 type Edit = fn(&mut Plan);
@@ -708,24 +842,76 @@ fn accepted() -> Vec<(&'static str, Edit)> {
     ]
 }
 
+/// One attempted call: the result of the call, the `k_codes` bytes after it, and whether the
+/// plan aliased two ranges (whose launch may legally write the codes).
+struct Attempt {
+    result: Result<(), EngError>,
+    codes: Vec<u8>,
+    aliased: bool,
+}
+
+/// The whole device phase of the refusal test: the base call, every refusal row (the decode or
+/// chunk entry as its row says) and every accepted row, then the base call again. Both rigs
+/// drop with every buffer before the plain attempts return, so the asserts below never run
+/// inside a live backend (S3b).
+struct RefusalPhase {
+    first: Attempt,
+    rows: Vec<Attempt>,
+    accepted: Vec<Attempt>,
+    again: Attempt,
+}
+
+fn refusal_phase(
+    rows: &[Row],
+    accepted_rows: &[(&'static str, Edit)],
+) -> Result<RefusalPhase, EngError> {
+    let (rig, other) = (Rig::new()?, Rig::new()?);
+    let run = |plan: &Plan, chunk: bool| -> Result<Attempt, EngError> {
+        let (result, codes) = attempt(&rig, &other, plan, chunk)?;
+        Ok(Attempt {
+            result,
+            codes,
+            aliased: plan.alias.is_some(),
+        })
+    };
+    let first = run(&Plan::base(256), false)?;
+    let mut attempts = Vec::new();
+    for (label, _needle, chunk, edit) in rows {
+        let mut plan = Plan::base(256);
+        plan.label = label;
+        edit(&mut plan);
+        attempts.push(run(&plan, *chunk)?);
+    }
+    let mut accepted_attempts = Vec::new();
+    for (label, edit) in accepted_rows {
+        let mut plan = Plan::base(128);
+        plan.label = label;
+        edit(&mut plan);
+        accepted_attempts.push(run(&plan, false)?);
+    }
+    let again = run(&Plan::base(256), false)?;
+    Ok(RefusalPhase {
+        first,
+        rows: attempts,
+        accepted: accepted_attempts,
+        again,
+    })
+}
+
 #[test]
 fn kv8_append_rejects_bad_calls_before_any_launch() {
     if !testkit::device_present("kv8_append_rejects_bad_calls_before_any_launch") {
         return;
     }
-    let (rig, other) = (Rig::new(), Rig::new());
-    let (first, first_out) = attempt(&rig, &other, &Plan::base(256), false);
-    first.expect("the base call is valid");
+    let (rows, accepted_rows) = (refusals(), accepted());
+    let phase = refusal_phase(&rows, &accepted_rows).expect("the device phase of the refusal test");
+    phase.first.result.expect("the base call is valid");
     assert!(
-        first_out.iter().any(|&b| b != CODE_SENTINEL),
+        phase.first.codes.iter().any(|&b| b != CODE_SENTINEL),
         "the base call wrote no code"
     );
-    for (label, needle, chunk, edit) in refusals() {
-        let mut plan = Plan::base(256);
-        plan.label = label;
-        edit(&mut plan);
-        let (result, out) = attempt(&rig, &other, &plan, chunk);
-        let message = match result {
+    for ((label, needle, _chunk, _edit), attempt) in rows.iter().zip(&phase.rows) {
+        let message = match &attempt.result {
             Err(EngError::BadRequest(message)) => message,
             other => panic!("{label}: expected a BadRequest, got {other:?}"),
         };
@@ -734,23 +920,23 @@ fn kv8_append_rejects_bad_calls_before_any_launch() {
             "{label}: expected {needle:?}, got {message:?}"
         );
         assert!(
-            plan.alias.is_some() || out.iter().all(|&b| b == CODE_SENTINEL),
+            attempt.aliased || attempt.codes.iter().all(|&b| b == CODE_SENTINEL),
             "{label}: k_codes changed"
         );
     }
-    for (label, edit) in accepted() {
-        let mut plan = Plan::base(128);
-        plan.label = label;
-        edit(&mut plan);
-        let (result, out) = attempt(&rig, &other, &plan, false);
-        result.unwrap_or_else(|error| panic!("{label}: {error:?}"));
+    for ((label, _edit), attempt) in accepted_rows.iter().zip(&phase.accepted) {
+        if let Err(error) = &attempt.result {
+            panic!("{label}: {error:?}");
+        }
         assert!(
-            out.iter().any(|&b| b != CODE_SENTINEL),
+            attempt.codes.iter().any(|&b| b != CODE_SENTINEL),
             "{label}: no code written"
         );
     }
-    let (again, _) = attempt(&rig, &other, &Plan::base(256), false);
-    again.expect("the backend is usable after the refusals");
+    phase
+        .again
+        .result
+        .expect("the backend is usable after the refusals");
 }
 
 // ---- the zero-scale groups of the format (the MINOR finding of the KV8-A review) ----
@@ -811,30 +997,30 @@ fn zero_scale_run(
     images: &[Vec<u8>; 4],
     chunk: bool,
 ) -> Result<[Vec<u8>; 4], EngError> {
-    let planes = Planes::upload(ctx, images);
-    let k = testkit::upload_f32(ctx, &c.k);
-    let v = testkit::upload_f32(ctx, &c.v);
+    let planes = Planes::upload(ctx, images)?;
+    let k = upload_f32(ctx, &c.k)?;
+    let v = upload_f32(ctx, &c.v)?;
     let data = Kv8Data {
-        k: whole(&k),
-        v: whole(&v),
-        k_codes: plane_range(&planes.0[0]),
-        k_scales: plane_range(&planes.0[1]),
-        v_codes: plane_range(&planes.0[2]),
-        v_scales: plane_range(&planes.0[3]),
+        k: whole(&k)?,
+        v: whole(&v)?,
+        k_codes: plane_range(&planes.0[0])?,
+        k_scales: plane_range(&planes.0[1])?,
+        v_codes: plane_range(&planes.0[2])?,
+        v_scales: plane_range(&planes.0[3])?,
     };
     if chunk {
         ctx.kv8_chunk(stream, c.shape(), data, c.pos)?;
     } else {
-        let word = testkit::upload_bytes(ctx, &(c.pos as i32).to_le_bytes());
-        let status = testkit::upload_bytes(ctx, &0u32.to_le_bytes());
-        ctx.kv8_append(stream, c.shape(), data, whole(&word), whole(&status))?;
+        let word = upload_bytes(ctx, &(c.pos as i32).to_le_bytes())?;
+        let status = upload_bytes(ctx, &0u32.to_le_bytes())?;
+        ctx.kv8_append(stream, c.shape(), data, whole(&word)?, whole(&status)?)?;
     }
     stream.synchronize()?;
     Ok([
-        testkit::read_bytes(ctx, &planes.0[0], planes.0[0].bytes()),
-        testkit::read_bytes(ctx, &planes.0[1], planes.0[1].bytes()),
-        testkit::read_bytes(ctx, &planes.0[2], planes.0[2].bytes()),
-        testkit::read_bytes(ctx, &planes.0[3], planes.0[3].bytes()),
+        read_bytes(ctx, &planes.0[0], planes.0[0].bytes())?,
+        read_bytes(ctx, &planes.0[1], planes.0[1].bytes())?,
+        read_bytes(ctx, &planes.0[2], planes.0[2].bytes())?,
+        read_bytes(ctx, &planes.0[3], planes.0[3].bytes())?,
     ])
 }
 
@@ -943,5 +1129,300 @@ fn kv8_append_writes_zero_codes_when_the_stored_scale_is_zero() {
     for outcome in &outcomes {
         assert_zero_scale(&outcome.label, &outcome.case, &outcome.got);
         assert_planes(&outcome.label, &outcome.got, &outcome.want);
+    }
+}
+
+// ---- the NaN poison of a stored group scale (G-KV8 item R-A; lane C ruling: propagate) ----
+
+/// One poisoned group of a scenario: `plane` 0 is K, 1 is V; `row` is the row block whose cell
+/// is `pos + row`. `stamp` is written into the group-local `lanes`, and `scale_nan` says what
+/// the STORED scale must be (an fp16 NaN, or +Inf for the inf case).
+#[derive(Clone)]
+struct PoisonMark {
+    plane: usize,
+    kvh: usize,
+    row: usize,
+    group: usize,
+    lanes: Vec<usize>,
+    stamp: f32,
+    scale_nan: bool,
+}
+
+/// The case with `value` (or every mark's own stamp when `value` is none) written into the
+/// marked lanes; the generated rows stay untouched.
+fn stamped_case(c: &Case, marks: &[PoisonMark], value: Option<f32>) -> Case {
+    let mut out = c.clone();
+    for mark in marks {
+        for &lane in &mark.lanes {
+            let at = (mark.row * c.n_kv_head + mark.kvh) * c.head_dim + mark.group * GROUP + lane;
+            let stamp = value.unwrap_or(mark.stamp);
+            if mark.plane == 0 {
+                out.k[at] = stamp;
+            } else {
+                out.v[at] = stamp;
+            }
+        }
+    }
+    out
+}
+
+/// One poison scenario: the clean case, the poisoned case (the same rows with the marked lanes
+/// stamped), the marks and the entry (`chunk`).
+struct PoisonScenario {
+    clean: Case,
+    poisoned: Case,
+    marks: Vec<PoisonMark>,
+    chunk: bool,
+    label: &'static str,
+}
+
+/// The clean twin of `c` under `marks` holds a finite 0.75 in the marked lanes, so every byte
+/// outside the marked groups must be bit-equal between the two runs.
+fn poison_scenario(
+    c: &Case,
+    marks: Vec<PoisonMark>,
+    chunk: bool,
+    label: &'static str,
+) -> PoisonScenario {
+    PoisonScenario {
+        clean: stamped_case(c, &marks, Some(0.75)),
+        poisoned: stamped_case(c, &marks, None),
+        marks,
+        chunk,
+        label,
+    }
+}
+
+/// One scenario's device outcome: the entry's four plane images for the clean and the poisoned
+/// run, plus the clean case and the marks. Plain data: every owner drops inside `poison_phase`.
+struct PoisonOutcome {
+    label: &'static str,
+    case: Case,
+    marks: Vec<PoisonMark>,
+    clean: [Vec<u8>; 4],
+    poisoned: [Vec<u8>; 4],
+}
+
+/// The device phase of the poison scenarios: both runs through the scenario's entry, and every
+/// owner (context, stream, buffers) dropped before the plain outcomes return (the S3b lesson:
+/// a drop while panicking latches the backend). No assertion runs here.
+fn poison_phase(scenarios: &[PoisonScenario]) -> Result<Vec<PoisonOutcome>, EngError> {
+    let ctx = CudaContext::new()?;
+    let stream = ctx.stream()?;
+    let mut outcomes = Vec::new();
+    for scenario in scenarios {
+        let clean = zero_scale_run(
+            &ctx,
+            &stream,
+            &scenario.clean,
+            &scenario.clean.expected(),
+            scenario.chunk,
+        )?;
+        let poisoned = zero_scale_run(
+            &ctx,
+            &stream,
+            &scenario.poisoned,
+            &scenario.poisoned.expected(),
+            scenario.chunk,
+        )?;
+        outcomes.push(PoisonOutcome {
+            label: scenario.label,
+            case: scenario.clean.clone(),
+            marks: scenario.marks.clone(),
+            clean,
+            poisoned,
+        });
+    }
+    Ok(outcomes)
+}
+
+/// Asserts one outcome: the clean run is the host reference; every marked group's STORED scale
+/// is an fp16 NaN (or +Inf for an inf mark) and every dequantized value of the group is
+/// non-finite; every byte outside the marked groups is bit-equal to the clean run.
+fn assert_poison_outcome(o: &PoisonOutcome) {
+    let c = &o.case;
+    let groups = c.head_dim / GROUP;
+    assert_planes(&format!("{} clean", o.label), &o.clean, &c.expected());
+    let mut skip: [Vec<(usize, usize)>; 4] = [Vec::new(), Vec::new(), Vec::new(), Vec::new()];
+    for mark in &o.marks {
+        let cell = c.pos + mark.row;
+        let (code_plane, scale_plane) = if mark.plane == 0 { (0, 1) } else { (2, 3) };
+        let code_at = (mark.kvh * c.cells + cell) * c.head_dim + mark.group * GROUP;
+        skip[code_plane].push((code_at, code_at + GROUP));
+        let scale_at = (mark.kvh * c.cells + cell) * groups + mark.group;
+        skip[scale_plane].push((2 * scale_at, 2 * scale_at + 2));
+        let bytes = &o.poisoned[scale_plane][2 * scale_at..2 * scale_at + 2];
+        let bits = u16::from_le_bytes([bytes[0], bytes[1]]);
+        let scale = f16_to_f32(bits);
+        if mark.scale_nan {
+            assert!(
+                scale.is_nan(),
+                "{}: the stored scale of kvh {} cell {cell} group {} must be an fp16 NaN, \
+                 got {bits:#06x}",
+                o.label,
+                mark.kvh,
+                mark.group
+            );
+        } else {
+            assert_eq!(
+                bits, 0x7c00,
+                "{}: the stored scale of kvh {} cell {cell} group {} must be +Inf",
+                o.label, mark.kvh, mark.group
+            );
+        }
+        for i in 0..GROUP {
+            let code = o.poisoned[code_plane][code_at + i] as i8 as f32;
+            assert!(
+                !(code * scale).is_finite(),
+                "{}: dequantized lane {i} of kvh {} cell {cell} group {} must be non-finite",
+                o.label,
+                mark.kvh,
+                mark.group
+            );
+        }
+    }
+    for (plane, clean) in o.clean.iter().enumerate() {
+        let poisoned = &o.poisoned[plane];
+        assert_eq!(
+            clean.len(),
+            poisoned.len(),
+            "{}: plane {plane} length",
+            o.label
+        );
+        for at in 0..clean.len() {
+            if skip[plane]
+                .iter()
+                .any(|&(start, end)| at >= start && at < end)
+            {
+                continue;
+            }
+            assert_eq!(
+                poisoned[at], clean[at],
+                "{}: plane {plane} byte {at} must be bit-equal to the clean run",
+                o.label
+            );
+        }
+    }
+}
+
+/// A NaN at dim 0, 17 or 31 of one K group and, separately, of one V group makes that group's
+/// STORED fp16 scale NaN, so every dequantized value of the group is NaN; every other group of
+/// the row, and every other row, is bit-equal to a clean run of the same rows. An all-NaN group
+/// is a NaN scale too. The decode entry (G-KV8 item R-A; lane C ruling: propagate).
+#[test]
+fn kv8_append_poisons_a_group_holding_nan() {
+    if !testkit::device_present("kv8_append_poisons_a_group_holding_nan") {
+        return;
+    }
+    let lanes = vec![0usize, 17, 31];
+    let nan_mark =
+        |plane: usize, kvh: usize, row: usize, group: usize, lanes: Vec<usize>| PoisonMark {
+            plane,
+            kvh,
+            row,
+            group,
+            lanes,
+            stamp: f32::NAN,
+            scale_nan: true,
+        };
+    let scenarios = [
+        poison_scenario(
+            &case(3, 128, 5, 0x8ad4_0001),
+            vec![nan_mark(0, 1, 1, 1, lanes.clone())],
+            false,
+            "decode K NaN at dims 0/17/31",
+        ),
+        poison_scenario(
+            &case(2, 256, 9, 0x8ad4_0002),
+            vec![nan_mark(1, 0, 1, 3, lanes.clone())],
+            false,
+            "decode V NaN at dims 0/17/31",
+        ),
+        poison_scenario(
+            &case(2, 128, 7, 0x8ad4_0003),
+            vec![nan_mark(0, 1, 0, 2, (0..GROUP).collect())],
+            false,
+            "decode K all-NaN group",
+        ),
+        poison_scenario(
+            &case(2, 128, 7, 0x8ad4_0004),
+            vec![nan_mark(1, 1, 0, 2, (0..GROUP).collect())],
+            false,
+            "decode V all-NaN group",
+        ),
+    ];
+    let outcomes = poison_phase(&scenarios).expect("the device phase of the NaN poison cases");
+    for outcome in &outcomes {
+        assert_poison_outcome(outcome);
+    }
+}
+
+/// ±Inf in a group keeps today's behavior: the amax is +Inf, the STORED scale is +Inf and every
+/// dequantized value of the group is non-finite (a finite code times Inf is ±Inf, and the code
+/// of the Inf lane itself is 0, whose 0 * Inf is NaN). Every other byte is bit-equal to the
+/// clean run. The decode entry.
+#[test]
+fn kv8_append_keeps_infinity_in_a_group_non_finite() {
+    if !testkit::device_present("kv8_append_keeps_infinity_in_a_group_non_finite") {
+        return;
+    }
+    let inf_mark =
+        |plane: usize, kvh: usize, row: usize, group: usize, lane: usize, stamp: f32| PoisonMark {
+            plane,
+            kvh,
+            row,
+            group,
+            lanes: vec![lane],
+            stamp,
+            scale_nan: false,
+        };
+    let scenarios = [
+        poison_scenario(
+            &case(2, 256, 3, 0x8ad6_0001),
+            vec![
+                inf_mark(0, 1, 1, 4, 0, f32::INFINITY),
+                inf_mark(0, 1, 1, 4, 31, f32::NEG_INFINITY),
+            ],
+            false,
+            "decode K +Inf and -Inf in one group",
+        ),
+        poison_scenario(
+            &case(2, 256, 3, 0x8ad6_0002),
+            vec![inf_mark(1, 0, 1, 2, 0, f32::NEG_INFINITY)],
+            false,
+            "decode V -Inf",
+        ),
+    ];
+    let outcomes = poison_phase(&scenarios).expect("the device phase of the infinity cases");
+    for outcome in &outcomes {
+        assert_poison_outcome(outcome);
+    }
+}
+
+/// The same NaN poison through the chunk entry: both entries enqueue the one `kv8_append_k`
+/// kernel, so a NaN at dim 0, 17 or 31 of one K group makes the group's stored scale NaN and
+/// every dequantized value of it non-finite, with every other byte bit-equal to the clean run.
+#[test]
+fn kv8_chunk_poisons_a_group_holding_nan() {
+    if !testkit::device_present("kv8_chunk_poisons_a_group_holding_nan") {
+        return;
+    }
+    let scenarios = [poison_scenario(
+        &case(2, 256, 11, 0x8ad7_0001),
+        vec![PoisonMark {
+            plane: 0,
+            kvh: 1,
+            row: 1,
+            group: 5,
+            lanes: vec![0, 17, 31],
+            stamp: f32::NAN,
+            scale_nan: true,
+        }],
+        true,
+        "chunk K NaN at dims 0/17/31",
+    )];
+    let outcomes = poison_phase(&scenarios).expect("the device phase of the chunk NaN case");
+    for outcome in &outcomes {
+        assert_poison_outcome(outcome);
     }
 }

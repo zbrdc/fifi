@@ -99,6 +99,8 @@ pub(crate) struct FlashRules {
     /// model head can be wider than the tokenizer, and the extra ids have no text.
     /// `FlashExecutor::from_parts` rejects 0 and any value above the width of the model head.
     pub(crate) sampler_vocab: usize,
+    /// Record-only next-layer expert hints in one-token steps, default false.
+    pub(crate) expert_prefetch: bool,
 }
 
 /// The numeric path of a prefill. A saved prefix restores only under the path that built it.
@@ -314,6 +316,7 @@ impl FlashExecutor {
         let context_limit = usize::try_from(MAX_POSITIONS)
             .map_err(|_| EngError::BadRequest("context limit overflows".to_string()))?;
         let mut decoder = ResidentDecoder::new(kernels, ckpt, flash)?;
+        decoder.set_expert_prefetch(rules.expert_prefetch);
         let state = decoder.zero_state()?;
         let session = FlashSession {
             state,
@@ -528,7 +531,11 @@ mod tests {
     const PROMPT: [u32; 3] = [1, 2, 3];
 
     fn rules(eos: Vec<u32>, sampler_vocab: usize) -> FlashRules {
-        FlashRules { eos, sampler_vocab }
+        FlashRules {
+            eos,
+            sampler_vocab,
+            expert_prefetch: false,
+        }
     }
 
     fn tokenizer() -> Tokenizer {
@@ -2048,6 +2055,7 @@ mod tests {
         let rules = FlashRules {
             eos: Vec::new(),
             sampler_vocab: usize::try_from(bundle.vocab_size()).unwrap(),
+            expert_prefetch: false,
         };
         let (mut executor, mut session) =
             FlashExecutor::open(&artifact, cache_limit, rules).unwrap();
@@ -2250,6 +2258,7 @@ mod tests {
         let rules = FlashRules {
             eos: bundle.eos_token_ids().to_vec(),
             sampler_vocab: usize::try_from(bundle.vocab_size()).unwrap(),
+            expert_prefetch: false,
         };
         let (mut executor, mut session) =
             FlashExecutor::open(&artifact, cache_limit, rules).unwrap();
@@ -2440,6 +2449,7 @@ mod tests {
         let rules = FlashRules {
             eos: vec![],
             sampler_vocab: 248_077,
+            expert_prefetch: false,
         };
         let (mut executor, mut session) =
             FlashExecutor::open(&artifact, env("FLASH_NEXT_CACHE_LIMIT", None), rules).unwrap();

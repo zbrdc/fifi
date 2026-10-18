@@ -15,28 +15,10 @@ use super::mixer_weights::DenseWeight;
 use super::moe::{MoeDims, MoeLayerWeights, StackWeights};
 use crate::EngError;
 use crate::family::project::cuda::WeightLayout;
-use crate::kernels::cuda::device_count;
+pub(super) use crate::kernels::cuda::device_present;
 pub(super) use crate::kernels::cuda::resident::quantize_q8_1::q8_1_bytes;
 use crate::kernels::cuda::{CudaContext, DeviceBuffer, QuantTensor};
 use crate::weights::GgufType;
-
-/// Mirrors `fault.rs` (the resident tests' rule): a host with no device skips the test, unless
-/// `INFERENCE_CUDA_REQUIRE_DEVICE` turns the missing device into a failure.
-pub(super) fn device_present(test: &str) -> bool {
-    let count = device_count().expect("CUDA device count query");
-    println!("CUDA devices visible: {count}");
-    if count > 0 {
-        return true;
-    }
-    let required = std::env::var("INFERENCE_CUDA_REQUIRE_DEVICE")
-        .is_ok_and(|value| !value.is_empty() && value != "0");
-    assert!(
-        !required,
-        "INFERENCE_CUDA_REQUIRE_DEVICE is set but no CUDA device is visible"
-    );
-    println!("SKIPPED {test}: no CUDA device");
-    false
-}
 
 /// Deterministic xorshift64* generator (the resident testkit's rule, local copy: the testkit
 /// module is private to `kernels::cuda`).

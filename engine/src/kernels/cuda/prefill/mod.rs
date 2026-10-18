@@ -28,5 +28,9 @@
 pub(crate) mod attn_prefill;
 pub(crate) mod attn_prep_chunk;
 pub(crate) mod gdn_scan_seq;
+pub(crate) mod mmq_dense;
+pub(crate) mod mmq_facts;
+pub(crate) mod mmq_mmid;
+pub(crate) mod mmq_quant;
 pub(crate) mod mmq_size;
 pub(crate) mod swiglu_rows;

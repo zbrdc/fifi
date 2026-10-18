@@ -18,7 +18,9 @@
 #include "prefill/mmq_facts.h"
 #include "resident/mmvq_arch.h"
 
-cudaError_t inference_cuda_mmq_query_facts(fifi_device_facts *out) {
+// The live query. Called once per process by the cached wrapper below, and on demand by the
+// introspection entry. The four attributes cannot change while the process holds one device.
+static cudaError_t mmq_facts_live(fifi_device_facts *out) {
     int device = 0, major = 0, minor = 0, nsm = 0, smpbo = 0;
     cudaError_t err = cudaGetDevice(&device);
     if (err == cudaSuccess) {
@@ -44,6 +46,23 @@ cudaError_t inference_cuda_mmq_query_facts(fifi_device_facts *out) {
     return cudaSuccess;
 }
 
+// Cached: every MMQ entry used to run this query, which is cudaGetDevice plus four
+// cudaDeviceGetAttribute calls. A 128-row chunk makes about 470 MMQ entries, so the cache
+// removes roughly 2,350 driver calls per chunk from the enqueue path.
+cudaError_t inference_cuda_mmq_query_facts(fifi_device_facts *out) {
+    static const fifi_device_facts cached = [] {
+        fifi_device_facts facts{};
+        const cudaError_t err = mmq_facts_live(&facts);
+        return err == cudaSuccess ? facts : fifi_device_facts{};
+    }();
+    if (cached.cc == 0) {
+        // The first query failed. Repeat it so the caller sees the device error, not a zero fact.
+        return mmq_facts_live(out);
+    }
+    *out = cached;
+    return cudaSuccess;
+}
+
 extern "C" int inference_cuda_mmq_device_facts(inference_cuda_mmq_facts *out) {
     try {
         if (out == NULL) {
@@ -52,7 +71,7 @@ extern "C" int inference_cuda_mmq_device_facts(inference_cuda_mmq_facts *out) {
         *out = inference_cuda_mmq_facts{};
         (void)cudaGetLastError();
         fifi_device_facts facts{};
-        const cudaError_t err = inference_cuda_mmq_query_facts(&facts);
+        const cudaError_t err = mmq_facts_live(&facts);
         (void)cudaGetLastError();
         if (err != cudaSuccess) {
             return (int)err;

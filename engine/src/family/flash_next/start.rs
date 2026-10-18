@@ -31,9 +31,13 @@ pub(crate) fn start(settings: &FlashSettings) -> Result<(Engine, TokenizerBundle
         .map_err(|_| EngError::BadRequest("engine config: prefill_chunk exceeds usize".into()))?;
     let artifact = settings.artifact.clone();
     let cache_limit = settings.cache_limit;
+    let rules = FlashRules {
+        eos,
+        sampler_vocab,
+        expert_prefetch: settings.expert_prefetch,
+    };
     let engine = spawn_engine(prefill_chunk, move || {
-        let (executor, session) =
-            FlashExecutor::open(&artifact, cache_limit, FlashRules { eos, sampler_vocab })?;
+        let (executor, session) = FlashExecutor::open(&artifact, cache_limit, rules)?;
         if usize::try_from(CONTEXT_LIMIT).ok() != Some(executor.context_limit()) {
             return Err(EngError::Checkpoint(format!(
                 "the executor accepts {} positions, but the server reports {CONTEXT_LIMIT}",

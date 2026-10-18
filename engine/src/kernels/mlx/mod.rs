@@ -1,3 +1,6 @@
+#[cfg(test)]
+mod attention_ab;
+
 pub(crate) mod native;
 mod staging;
 
@@ -741,6 +744,21 @@ impl MlxKernels {
         weight: &ResidentPackedWeight,
     ) -> Result<ExecutionTensor, EngError> {
         self.context.dequantize(weight)
+    }
+
+    /// Dequantizes one quantized KV side directly from its three residents, with no host round
+    /// trip (test builds only). The attention A/B uses it so its dequantized path no longer
+    /// builds a packed weight per side; production callers keep `dequantize`.
+    #[cfg(test)]
+    pub(in crate::kernels::mlx) fn dequantize_kv_for_test(
+        &mut self,
+        side: &QuantizedKv<'_>,
+        logical_shape: &[u32],
+        group_size: u32,
+        bits: u32,
+    ) -> Result<ExecutionTensor, EngError> {
+        self.context
+            .dequantize_kv_for_test(side, logical_shape, group_size, bits)
     }
 
     pub fn readback(&mut self, source: &ExecutionTensor) -> Result<Tensor, EngError> {

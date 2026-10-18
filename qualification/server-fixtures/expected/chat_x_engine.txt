@@ -1,0 +1,2 @@
+200 application/json
+{"id":"ID","object":"chat.completion","created":0,"model":"demo","engine":"e1","choices":[{"index":0,"message":{"role":"assistant","content":"Hello from the fake engine."},"finish_reason":"stop"}],"usage":{"prompt_tokens":21,"completion_tokens":28,"total_tokens":49,"reused_tokens":0}}

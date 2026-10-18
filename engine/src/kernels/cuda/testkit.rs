@@ -3,26 +3,242 @@
 //! read-back helpers that its launch tests and the later RD-2 tests share. Helpers
 //! that only one test file uses stay in that file.
 
+use std::sync::OnceLock;
+
 use super::{
     CHUNK_LIMIT, CudaContext, DeviceBuffer, DeviceRange, DeviceStream, QuantTensor, TiledWeight,
 };
+use crate::EngError;
 use crate::weights::GgufType;
 
-/// Mirrors `fault.rs`: a host with no device skips the test, unless
-/// `INFERENCE_CUDA_REQUIRE_DEVICE` turns the missing device into a failure.
-pub(super) fn device_present(test: &str) -> bool {
-    let count = super::device_count().expect("CUDA device count query");
-    println!("CUDA devices visible: {count}");
-    if count > 0 {
+/// `cudaErrorInsufficientDriver` of `cuda_runtime_api.h` (the build image's CUDA 12.2): the
+/// runtime cannot use the host's driver library, the status a host with no CUDA driver at
+/// all reports from `cudaDeviceCount` (observed on pinu, IMPL-DEVICE-PRESENT-NO-DRIVER).
+const CUDA_ERROR_INSUFFICIENT_DRIVER: i32 = 35;
+
+/// `cudaErrorNoDevice` of `cuda_runtime_api.h`: a usable driver but no device. The adapter
+/// already maps this status to a count of zero (`native/abi.h`), so reading it here is
+/// defensive; like 35 it means "no usable CUDA driver or device".
+const CUDA_ERROR_NO_DEVICE: i32 = 100;
+
+/// The panic text of a run that demands a device on a host without one: the message the
+/// `assert!` of the old per-file copies printed, kept so logs read the same.
+const REQUIRE_DEVICE_MESSAGE: &str =
+    "INFERENCE_CUDA_REQUIRE_DEVICE is set but no CUDA device is visible";
+
+/// What a device test does with the result of [`super::device_count`].
+#[derive(Debug, Clone, PartialEq)]
+enum Presence {
+    /// A device is visible; the test runs.
+    Present,
+    /// No driver or device, and none is required; the test prints SKIPPED.
+    Skip,
+    /// The probe failed a way that is not a missing driver or device, or a device is
+    /// required and missing; the test panics with the message.
+    Fail(String),
+}
+
+/// The decision of [`device_present`], pure so each of its branches is testable on a host
+/// without a driver (IMPL-DEVICE-PRESENT-NO-DRIVER): a visible device is
+/// [`Presence::Present`] whatever `required` says; a count of zero, or an error whose
+/// status means "no usable CUDA driver or device" (35 and 100), skips unless a device is
+/// required; every other error fails, required or not, keeping its text.
+fn presence(count: Result<i32, EngError>, required: bool) -> Presence {
+    let missing = match &count {
+        Ok(visible) => *visible == 0,
+        Err(error) => matches!(
+            status_of(error),
+            Some(CUDA_ERROR_INSUFFICIENT_DRIVER | CUDA_ERROR_NO_DEVICE)
+        ),
+    };
+    if missing {
+        return if required {
+            Presence::Fail(REQUIRE_DEVICE_MESSAGE.to_owned())
+        } else {
+            Presence::Skip
+        };
+    }
+    match count {
+        Ok(_) => Presence::Present,
+        Err(error) => Presence::Fail(format!("CUDA device count query: {error:?}")),
+    }
+}
+
+/// The runtime status of a failed count query. `EngError` has no structured status field,
+/// so the "(status N)" suffix that `native_error` writes into every `Backend` message is
+/// the only place it survives; other variants, and a message without the suffix, give
+/// `None`.
+fn status_of(error: &EngError) -> Option<i32> {
+    let EngError::Backend { message, .. } = error else {
+        return None;
+    };
+    let (_, digits) = message.rsplit_once("(status ")?;
+    digits
+        .strip_suffix(')')
+        .and_then(|digits| digits.parse().ok())
+}
+
+/// The count of [`super::device_count`], widened back: it returned a `usize` converted
+/// from a non-negative `c_int`, so the value always fits an `i32`.
+fn probe_count() -> Result<i32, EngError> {
+    super::device_count().map(|visible| visible as i32)
+}
+
+/// What the process's one device probe saw: the count, and the decision [`presence`]
+/// made of it with `required` false (`Present` and `Skip` do not depend on `required`).
+#[derive(Debug)]
+struct Probed {
+    /// The visible count, `None` when the probe failed.
+    visible: Option<i32>,
+    /// The decision for `required` false; a cached `Skip` still fails every test of a
+    /// run that sets `INFERENCE_CUDA_REQUIRE_DEVICE`.
+    decision: Presence,
+}
+
+impl Probed {
+    /// The probe outcome of `count`.
+    fn of(count: Result<i32, EngError>) -> Self {
+        let visible = count.as_ref().copied().ok();
+        Self {
+            visible,
+            decision: presence(count, false),
+        }
+    }
+}
+
+/// Caches one probe decision for a whole process (ruling of 2026-10-14): the no-driver
+/// count error latches the backend TERMINAL inside `native_error`, so only the FIRST
+/// probe sees status 35; every later `device_count()` of the same process would return
+/// the terminal refusal instead. The gate therefore probes once and every test shares
+/// the outcome, because device presence cannot change inside a process. The production
+/// `device_count()` and its latch stay unchanged.
+struct ProbeCache {
+    probed: OnceLock<Probed>,
+}
+
+impl ProbeCache {
+    /// An empty cache.
+    const fn new() -> Self {
+        Self {
+            probed: OnceLock::new(),
+        }
+    }
+
+    /// The cached decision, running `probe` only the first time.
+    fn decision(&self, probe: impl FnOnce() -> Result<i32, EngError>) -> &Probed {
+        self.probed.get_or_init(|| Probed::of(probe()))
+    }
+}
+
+/// The process's one device probe.
+static DEVICE_PROBE: ProbeCache = ProbeCache::new();
+
+/// A host with no driver or device skips the test, unless `INFERENCE_CUDA_REQUIRE_DEVICE`
+/// (non-empty and not "0") turns the missing device into a failure; a count-query error
+/// that is not a missing driver still panics, with its text. Every CUDA device test of the
+/// crate shares this gate: the kernels tests and `fault.rs` through `super::testkit`, the
+/// family rigs through the `device_present` re-export of [`super`]. The count comes from
+/// the one cached probe ([`DEVICE_PROBE`]): a second probe would see the TERMINAL latch
+/// the first no-driver error set, not status 35.
+pub(crate) fn device_present(test: &str) -> bool {
+    let probed = DEVICE_PROBE.decision(probe_count);
+    // The count line prints for every `Ok` on record, as before the cache: a runtime
+    // that reports zero devices still prints "CUDA devices visible: 0".
+    if let Some(visible) = probed.visible {
+        println!("CUDA devices visible: {visible}");
+    }
+    match &probed.decision {
+        Presence::Present => true,
+        Presence::Skip => {
+            let required = std::env::var("INFERENCE_CUDA_REQUIRE_DEVICE")
+                .is_ok_and(|value| !value.is_empty() && value != "0");
+            assert!(!required, "{REQUIRE_DEVICE_MESSAGE}");
+            println!("SKIPPED {test}: no CUDA device");
+            false
+        }
+        Presence::Fail(message) => panic!("{message}"),
+    }
+}
+
+/// The environment marker of a latching test's child run (see `latching_test_in_child`).
+const LATCHING_CHILD: &str = "INFERENCE_CUDA_LATCHING_CHILD";
+
+/// A latching test's child must finish within this long; on expiry the helper kills the child
+/// and fails the test. It is the same bound the other child helpers use (`resident_ops.rs:1612`,
+/// `step.rs:769`).
+const LATCHING_DEADLINE: std::time::Duration = std::time::Duration::from_secs(180);
+
+/// Drains a child's pipe on its own thread, so a full pipe buffer cannot deadlock the parent
+/// (the pattern of `resident_ops.rs:1614`).
+fn drain<R: std::io::Read + Send + 'static>(mut pipe: R) -> std::thread::JoinHandle<String> {
+    std::thread::spawn(move || {
+        let mut bytes = Vec::new();
+        let _ = pipe.read_to_end(&mut bytes);
+        String::from_utf8_lossy(&bytes).into_owned()
+    })
+}
+
+/// Runs a test whose body deliberately triggers a native refusal in a child process of the test
+/// executable. A native refusal latches the CUDA backend terminal for the whole process
+/// (`native.rs`), so in a one-process suite run, as the one-process gate run (2026-10-14) does,
+/// every later device test would fail on the latch. The pattern is `fault.rs:105`'s `run_child`
+/// (CUDA) and `resident_ops.rs:1624`'s `delegated_to_child` (MLX): re-run the test executable on
+/// this one test.
+///
+/// `path` is the test's full path below the crate. Returns `true` in the child, where the caller
+/// runs its body. In the parent it runs the child with `--exact path` under a deadline, checks
+/// that the child passed and printed every string of `expect` (the refusal text), prints the
+/// child's output so the text reaches the suite log, and returns `false`.
+pub(super) fn latching_test_in_child(path: &str, expect: &[&str]) -> bool {
+    if std::env::var(LATCHING_CHILD).is_ok_and(|name| name == path) {
         return true;
     }
-    let required = std::env::var("INFERENCE_CUDA_REQUIRE_DEVICE")
-        .is_ok_and(|value| !value.is_empty() && value != "0");
-    assert!(
-        !required,
-        "INFERENCE_CUDA_REQUIRE_DEVICE is set but no CUDA device is visible"
+    let exe = std::env::current_exe().expect("the test executable");
+    let mut child = std::process::Command::new(exe)
+        .args(["--exact", path, "--test-threads=1", "--nocapture"])
+        .env(LATCHING_CHILD, path)
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .expect("the latching test's child process");
+    let stdout = drain(child.stdout.take().expect("the child's stdout pipe"));
+    let stderr = drain(child.stderr.take().expect("the child's stderr pipe"));
+    let started = std::time::Instant::now();
+    let status = loop {
+        if let Some(status) = child.try_wait().expect("the child's status") {
+            break Some(status);
+        }
+        if started.elapsed() >= LATCHING_DEADLINE {
+            child.kill().expect("kill the latching test's child");
+            child.wait().expect("reap the latching test's child");
+            break None;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    };
+    let captured = format!(
+        "{} {}",
+        stdout.join().expect("the child's stdout reader"),
+        stderr.join().expect("the child's stderr reader")
     );
-    println!("SKIPPED {test}: no CUDA device");
+    let Some(status) = status else {
+        panic!(
+            "the latching test's child did not finish within {LATCHING_DEADLINE:?} and was \
+             killed:\n{captured}"
+        );
+    };
+    // A renamed test makes the child run nothing and exit 0, so require libtest's summary of
+    // exactly one passed test (the MLX helpers' "1 passed" check, narrowed).
+    assert!(
+        status.success() && captured.contains("test result: ok. 1 passed"),
+        "the latching test must pass in its child: {captured}"
+    );
+    for text in expect {
+        assert!(
+            captured.contains(text),
+            "the child must print {text:?}: {captured}"
+        );
+    }
+    println!("latching test child {path}:\n{captured}");
     false
 }
 
@@ -529,4 +745,210 @@ fn compare_chunk(
         }
     }
     Ok(())
+}
+
+/// `source` without its `//` and `/* */` comments: commenting a statement out must not satisfy a source pin. (Limits: a
+/// backslash-continued `//` comment and `#if 0` blocks are not recognised; the compiled pins see both.)
+pub(super) fn without_comments(source: &str) -> String {
+    let mut out = String::with_capacity(source.len());
+    let mut chars = source.chars().peekable();
+    while let Some(c) = chars.next() {
+        match (c, chars.peek()) {
+            ('/', Some('/')) => {
+                for d in chars.by_ref() {
+                    if d == '\n' {
+                        out.push('\n');
+                        break;
+                    }
+                }
+            }
+            ('/', Some('*')) => {
+                chars.next();
+                let mut previous = ' ';
+                for d in chars.by_ref() {
+                    if previous == '*' && d == '/' {
+                        break;
+                    }
+                    previous = d;
+                }
+                out.push(' ');
+            }
+            _ => out.push(c),
+        }
+    }
+    out
+}
+
+/// The code of `source` with every run of whitespace collapsed to one space and no comments.
+pub(super) fn squeezed(source: &str) -> String {
+    without_comments(source)
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+/// Walks `steps` through `text` in order, each one after the end of the previous.
+pub(super) fn assert_in_order(text: &str, steps: &[&str], what: &str) {
+    let mut at = 0;
+    for step in steps {
+        match text[at..].find(step) {
+            Some(found) => at += found + step.len(),
+            None => panic!("{what}: `{step}` is missing or out of order"),
+        }
+    }
+}
+
+/// The trimmed PTX lines of the kernel whose entry name contains `kernel`, compiled by nvcc (`-arch=sm_80 -O2`) from the
+/// embedded `files` (path under a scratch directory, text; `main` is the one to compile). `None`, with a note on stderr,
+/// when nvcc is not found, unless `INFERENCE_CUDA_REQUIRE_DEVICE` is set (then it fails). `NVCC` names the compiler like
+/// build.rs does. The scratch directory is always removed.
+pub(super) fn kernel_ptx(kernel: &str, main: &str, files: &[(&str, &str)]) -> Option<Vec<String>> {
+    let dir = std::env::temp_dir().join(format!("tcap-ptx-{kernel}-{}", std::process::id()));
+    for (name, text) in files {
+        let path = dir.join(name);
+        std::fs::create_dir_all(path.parent().expect("a file has a directory"))
+            .expect("the scratch directory");
+        std::fs::write(path, text).expect("a source file of the pin");
+    }
+    let ptx_path = dir.join("kernel.ptx");
+    let nvcc = std::env::var("NVCC").unwrap_or_else(|_| "nvcc".to_owned());
+    let compiled = std::process::Command::new(&nvcc)
+        .args(["-ptx", "-arch=sm_80", "-O2", "-I"])
+        .arg(&dir)
+        .arg(dir.join(main))
+        .arg("-o")
+        .arg(&ptx_path)
+        .output();
+    let ptx = match compiled {
+        Ok(output) if output.status.success() => std::fs::read_to_string(&ptx_path),
+        Ok(output) => Err(std::io::Error::other(format!(
+            "nvcc failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        ))),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            let _ = std::fs::remove_dir_all(&dir);
+            let required = std::env::var("INFERENCE_CUDA_REQUIRE_DEVICE")
+                .is_ok_and(|v| !v.is_empty() && v != "0");
+            assert!(!required, "nvcc is required here but not found: {error}");
+            eprintln!("SKIPPED the compiled pin of {kernel}: `{nvcc}` not found ({error})");
+            return None;
+        }
+        Err(error) => Err(error),
+    };
+    let _ = std::fs::remove_dir_all(&dir);
+    let ptx = ptx.expect("the PTX of the kernel");
+    let entry = ptx
+        .match_indices(".entry")
+        .map(|(at, _)| at)
+        .find(|&at| ptx[at..].lines().next().is_some_and(|l| l.contains(kernel)))
+        .expect("the kernel entry");
+    let body = &ptx[entry..entry + ptx[entry..].find("\n}\n").expect("the end of the kernel")];
+    Some(body.lines().map(|l| l.trim().to_owned()).collect())
+}
+
+/// The pure cases of IMPL-DEVICE-PRESENT-NO-DRIVER; they run on any host, driver or not.
+mod presence_tests {
+    use super::*;
+
+    /// A `Backend` error exactly as `native_error` writes it for a failed count query.
+    fn backend_error(status: i32) -> EngError {
+        EngError::Backend {
+            operation: "cuda initialize",
+            message: format!("the runtime refused the count (status {status})"),
+        }
+    }
+
+    /// The failure of any error that is not a missing driver or device.
+    fn query_failure(error: &EngError) -> Presence {
+        Presence::Fail(format!("CUDA device count query: {error:?}"))
+    }
+
+    #[test]
+    fn a_visible_device_is_present_required_or_not() {
+        assert_eq!(presence(Ok(1), false), Presence::Present);
+        assert_eq!(presence(Ok(1), true), Presence::Present);
+    }
+
+    #[test]
+    fn zero_devices_skip_unless_a_device_is_required() {
+        assert_eq!(presence(Ok(0), false), Presence::Skip);
+        assert_eq!(
+            presence(Ok(0), true),
+            Presence::Fail(REQUIRE_DEVICE_MESSAGE.to_owned())
+        );
+    }
+
+    #[test]
+    fn an_insufficient_driver_skips_unless_a_device_is_required() {
+        assert_eq!(presence(Err(backend_error(35)), false), Presence::Skip);
+        assert_eq!(
+            presence(Err(backend_error(35)), true),
+            Presence::Fail(REQUIRE_DEVICE_MESSAGE.to_owned())
+        );
+    }
+
+    #[test]
+    fn the_no_device_status_behaves_like_an_insufficient_driver() {
+        assert_eq!(presence(Err(backend_error(100)), false), Presence::Skip);
+        assert_eq!(
+            presence(Err(backend_error(100)), true),
+            Presence::Fail(REQUIRE_DEVICE_MESSAGE.to_owned())
+        );
+    }
+
+    /// An unknown runtime status, a negative adapter status and a `Backend` message with
+    /// no "(status N)" suffix are all failures, with the error's text, `required` or not.
+    #[test]
+    fn any_other_error_fails_required_or_not() {
+        let other_error = |case: i32| match case {
+            0 => backend_error(999),
+            1 => EngError::Backend {
+                operation: "cuda adapter",
+                message: "the adapter entry is missing (status -3)".to_owned(),
+            },
+            _ => EngError::Backend {
+                operation: "cuda initialize",
+                message: "the adapter could not be loaded".to_owned(),
+            },
+        };
+        for case in 0..3 {
+            let want = query_failure(&other_error(case));
+            assert_eq!(presence(Err(other_error(case)), false), want.clone());
+            assert_eq!(presence(Err(other_error(case)), true), want);
+        }
+    }
+
+    /// The probe runs once and every call shares its decision (ruling of 2026-10-14):
+    /// the later probes would answer differently, but the cache never runs them, and a
+    /// fresh cache probes again on its own.
+    #[test]
+    fn the_probe_runs_once_and_every_call_shares_its_decision() {
+        use std::cell::Cell;
+        let cache = ProbeCache::new();
+        let calls = Cell::new(0);
+        let run = |calls: &Cell<i32>| {
+            calls.set(calls.get() + 1);
+        };
+        let first = cache.decision(|| {
+            run(&calls);
+            Err(backend_error(35))
+        });
+        assert_eq!(first.visible, None);
+        assert_eq!(first.decision, Presence::Skip);
+        for _ in 0..3 {
+            let again = cache.decision(|| {
+                run(&calls);
+                Ok(1)
+            });
+            assert_eq!(again.visible, None, "the cached outcome of the first probe");
+            assert_eq!(again.decision, Presence::Skip);
+        }
+        assert_eq!(calls.get(), 1, "the probe ran once across several calls");
+        let second = ProbeCache::new();
+        assert_eq!(second.decision(|| Ok(1)).visible, Some(1));
+        assert_eq!(
+            second.decision(|| Err(backend_error(35))).decision,
+            Presence::Present
+        );
+    }
 }

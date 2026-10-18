@@ -258,7 +258,7 @@ mod tests {
         };
         assert_eq!(
             message(start(Some(&options), &Q36Env::default())),
-            "engine config: prefill_chunk must be between 1 and 512, found 0"
+            "engine config: prefill_chunk must be between 1 and 1024, found 0"
         );
     }
 

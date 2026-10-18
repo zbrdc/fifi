@@ -95,6 +95,12 @@ pub(crate) use {
 )]
 pub(crate) use native::prefill::PREFILL_STATUS_BOUND_VIOLATION;
 
+/// The device gate every CUDA device test shares (IMPL-DEVICE-PRESENT-NO-DRIVER): the
+/// family test rigs reach `testkit::device_present` through this path, the `testkit`
+/// module being private to `kernels::cuda`.
+#[cfg(test)]
+pub(crate) use testkit::device_present;
+
 use std::ffi::c_int;
 use std::sync::atomic::{AtomicBool, Ordering};
 

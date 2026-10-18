@@ -1,0 +1,10 @@
+#!/bin/sh
+set -eu
+
+if ! command -v python3 >/dev/null 2>&1; then
+    printf '%s\n' 'pre-commit: required tool python3 was not found on PATH' >&2
+    exit 127
+fi
+
+python3 scripts/check_staged.py pre-commit
+exec python3 scripts/check_doc_links.py

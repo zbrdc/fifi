@@ -1,0 +1,14 @@
+#!/bin/sh
+set -eu
+
+if ! command -v python3 >/dev/null 2>&1; then
+    printf '%s\n' 'commit-msg: required tool python3 was not found on PATH' >&2
+    exit 127
+fi
+
+if [ "$#" -ne 1 ]; then
+    printf '%s\n' 'commit-msg: expected one commit-message file argument' >&2
+    exit 2
+fi
+
+exec python3 scripts/check_staged.py commit-msg "$1"

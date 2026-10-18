@@ -28,16 +28,18 @@
 
 use crate::EngError;
 
-/// Values per `block_q8_1_mmq` (`QK8_1_MMQ`, mmq.cuh:24) and its bytes (:28-47, :57-58).
+/// Values per `block_q8_1_mmq` (`QK8_1_MMQ`, mmq.cuh:25) and its bytes (:28-47, :57-58).
 const QK8_1_MMQ: usize = 128;
 pub(crate) const Q8_1_BLOCK_BYTES: usize = 144;
-/// The y-tile copies' load granularity, `nthreads * sizeof(int)`: 256 threads on every kept
-/// row of both tables for our four types (mmq.cuh:859-865).
+/// The PAD's rounding granularity, a deliberate over-bound (KUBDAN-MSG-85 B1, rev 3): the
+/// y-tile copies' own loop steps by `nwarps * warp_size = 256` ints, so a copy spans
+/// `round_up(144 * J, 1024)` bytes (mmq.cuh:859-865) — the pad rounds `128 * 144` up to
+/// multiples of 2048 instead, the plan's one-line safety margin over the exact need.
 pub(crate) const SRC1_LOAD_CHUNK: usize = 2048;
 /// Rule M1 (rev 3, MSG-85 B1): the one constant pad on every q8_1 buffer, dense and
 /// grouped, `round_up(128 * 144, 2048)`. The two unconditional y-tile copies read
-/// `round_up(144 * J, SRC1_LOAD_CHUNK)` bytes from the first column of a J-column tile with
-/// no column bound (mmq.cuh:859-865, :875-881), so the worst need over every reachable J is
+/// `round_up(144 * J, 1024)` bytes from the first column of a J-column tile with no column
+/// bound (mmq.cuh:859-865, :875-881), so the worst need over every reachable J is
 /// `S(128) - 144 = 18,288 B`; a grouped top expert with one column reaches it whatever J
 /// the launch picked, so no `ncols_opt` function is safe (worst-row margin 144 B).
 pub(crate) const Q8_1_PAD: usize = 128 * Q8_1_BLOCK_BYTES;
@@ -64,12 +66,35 @@ fn pad_up(n: usize, m: usize) -> usize {
 }
 
 /// The MMQ weight types with a compiled instance (§A.4): per-tensor dispatch, never role.
+/// The widest Q4_K tile the vendored table implements as a tiling config (patch V-5). Above
+/// this width the Q4_K rows are stream-k configs.
+pub(crate) const Q4K_TILING_MAX_J: usize = 64;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum MmqType {
     Q80,
     Q50,
     Q4K,
     Q6K,
+}
+
+/// The q8_1 scale layout a weight of an [`MmqType`] reads (mmq.cuh:61-101): the D4 scale
+/// form for Q8_0, Q5_0 and Q6_K, the DS4 form for Q4_K. One q8_1 buffer is quantized once
+/// and read by every GEMM of its group, so the layout is a property of the weight type.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Q8_1Layout {
+    D4,
+    Ds4,
+}
+
+impl MmqType {
+    /// The scale layout of the q8_1 activations this weight type reads.
+    pub(crate) fn q8_1_layout(self) -> Q8_1Layout {
+        match self {
+            Self::Q80 | Self::Q50 | Self::Q6K => Q8_1Layout::D4,
+            Self::Q4K => Q8_1Layout::Ds4,
+        }
+    }
 }
 
 /// The two vendored config tables; `cc` selects one the way `ggml_cuda_mmq_get_config`
@@ -107,7 +132,7 @@ impl MmqConfig {
             .unwrap_or(-1)
     }
 
-    fn select(cc: i32) -> Self {
+    pub(crate) fn select(cc: i32) -> Self {
         match Self::highest_compiled_arch(cc) >= CC_VOLTA {
             true => Self::Ampere,
             false => Self::PascalDp4a,
@@ -142,6 +167,13 @@ impl MmqConfig {
     /// Table membership, the CASE chain's fall-through (`config.type == GGML_TYPE_COUNT`).
     fn contains(self, fallback: bool, j: usize) -> bool {
         self.config().j_sets[usize::from(fallback)].contains(&j)
+    }
+
+    /// Whether the table's row for this (type, J) runs stream-k. Patch V-5 turns the Q4_K rows for
+    /// J at or below [`Q4K_TILING_MAX_J`] into tiling configs, which need no fixup; every other
+    /// Ampere row is stream-k, and the pascal table has no stream-k rows.
+    pub(crate) fn stream_k(self, mmq_type: MmqType, j: usize) -> bool {
+        self == Self::Ampere && !(mmq_type == MmqType::Q4K && j <= Q4K_TILING_MAX_J)
     }
 
     /// The x-tile term of `mmq_get_nbytes_shared` (mmq.cuh:1342-1346 via :375-381): the MMA
@@ -279,9 +311,15 @@ pub(crate) fn ids_dst_ints(ne_get_rows: usize, ncols_max: usize) -> Result<usize
 /// :1060), while the fixup gather reaches `ne_get_rows + ncols_max + J - 2` (mmq.cuh:1295-
 /// 1302, no exit). Exported for the arena's byte accounting and the refusal tests.
 pub(crate) fn ids_gather_ints(base: usize, j: usize) -> Result<usize, EngError> {
-    base.checked_add(j)
-        .and_then(|ints| ints.checked_sub(1))
-        .ok_or_else(|| rule("size overflow", "the ids gather bound overflows"))
+    let sum = base
+        .checked_add(j)
+        .ok_or_else(|| rule("size overflow", "the ids gather bound overflows"))?;
+    sum.checked_sub(1).ok_or_else(|| {
+        rule(
+            "zero extent",
+            "ids_gather_ints(0, 0) underflows: the gather base and J are both 0",
+        )
+    })
 }
 
 /// `ids_src1` is written only at valid compact/token indices (mmid.cu:106-117).

@@ -4,7 +4,8 @@
 //! small per-layer VRAM bank of the hot experts; the rest is served on the CPU. This
 //! module is the pure-host brain of that split: the config and per-token report, the
 //! tier policy of the bank ([`policy`]) and the residency ledger of its slots
-//! ([`residency`]). There is no CUDA and no clock read here; time arrives as a
+//! ([`residency`]). There is no CUDA here and no clock read outside [`server`]'s
+//! thread and the pool's bounded `finish` (whose waits time themselves); time otherwise arrives as a
 //! parameter, and the only file access is the read-only mapping of
 //! [`mapped_file`]. The tiered step (OFF-2 D5) uses it through `cuda/tiered_step.rs` and `cuda/tiered_load.rs`.
 
@@ -18,6 +19,8 @@ pub mod mapped_file;
 pub mod policy;
 pub mod report;
 pub mod residency;
+pub mod server;
+pub mod watchdog;
 
 /// How the expert bank chooses its residents.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

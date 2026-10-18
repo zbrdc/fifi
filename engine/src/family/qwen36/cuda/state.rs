@@ -370,6 +370,12 @@ impl ResidentState {
         self.book.begin_block(stream.id())
     }
 
+    /// The book guard of the chunk body (CPF-7a part 2, B.3): the owning stream and an open
+    /// prefill chunk; `check_block` requires `Valid` and refuses every chunk.
+    pub(super) fn check_chunk(&self, stream: &DeviceStream) -> Result<(), EngError> {
+        self.book.begin_prefill_word(stream.id(), "run_chunk")
+    }
+
     /// Zeroes every DeltaNet slot and the words in place, ordered on `stream`, and forgets the KV
     /// positions and the pending steps (the copies run behind all work queued on the stream).
     ///

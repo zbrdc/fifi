@@ -13,13 +13,6 @@
 //! are inputs of the reproduction tests only). The attention `part` buffer is its own
 //! allocation outside the arena; its real size is reported in [`ChunkCost`] beside the flat
 //! 64 MiB charge, which CPF-1 keeps: lane M decides on the difference (0049 A6 item 8).
-#![cfg_attr(
-    not(test),
-    expect(
-        dead_code,
-        reason = "staged for CPF-7a/7b, the prefill driver (decision 0049)"
-    )
-)]
 
 use super::{
     dims::{KvMode, StepDims, StepOptions},

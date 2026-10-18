@@ -44,7 +44,10 @@ pub(crate) const BF16_DEFAULT_PREFILL_CHUNK: u32 = 256;
 /// about 0.26 s, and a piece of 256 would wait about 4.1 s.
 pub(crate) const NO_BUDGET_PIECE: u32 = 16;
 /// The largest accepted prefill chunk.
-pub(crate) const MAX_PREFILL_CHUNK: u32 = 512;
+pub(crate) const MAX_PREFILL_CHUNK: u32 = 1024;
+/// The CUDA arm cap of M_sess (lane C, decision 0049 A6 item 2): the largest chunk the
+/// prefill ladder admits, independent of the MLX prefill_chunk ceiling above.
+pub(crate) const DEFAULT_CUDA_PREFILL_CHUNK: u32 = 2048;
 
 /// SHA-256 of the pinned files of `<model_dir>`
 /// (`engine/testdata/mac-phase0a.json`).
@@ -77,10 +80,12 @@ pub(crate) struct Q36Options {
     pub(crate) context_limit: Option<u32>,
     /// The bytes of cache growth that the engine admits. The default is 4 GiB.
     pub(crate) session_cap_bytes: Option<u64>,
-    /// The prompt tokens per `prefill` call, from 1 to 512. The default is 256 for an F32 engine and
+    /// The prompt tokens per `prefill` call, from 1 to 1024. The default is 256 for an F32 engine and
     /// for a BF16 engine (`BF16_DEFAULT_PREFILL_CHUNK`). It is the largest
     /// chunk that the planner may choose; the worker piece is the planned chunk, or 16
     /// (`NO_BUDGET_PIECE`) when no chunk is planned: no budget, or a budget that admits none.
+    /// CUDA: ignored with one start line until lane M's CPF-7a integration commit wires it
+    /// as the cap of `M_sess` (decision 0049, A6 item 2; lane C's ruling of 2026-10-14).
     pub(crate) prefill_chunk: Option<u32>,
     /// The engine memory budget in bytes for the admission of the chunked prefill (decision 0044
     /// item 6), from 1. Absent means off: every prompt token is one step. The executor picks the
@@ -371,7 +376,10 @@ pub(crate) struct Q36Settings {
     pub(crate) context_limit: u32,
     /// The bytes of cache growth that the engine admits.
     pub(crate) session_cap: u64,
-    /// The prompt tokens per `prefill` call. With a budget it is also the largest planned chunk.
+    /// The prompt tokens per `prefill` call. MLX: with a budget it is also the largest planned
+    /// chunk. CUDA: always 0 (the key is ignored with one start line until CPF-7a's
+    /// integration commit, decision 0049 A6 item 2); the chunk cap the step holds is
+    /// `DEFAULT_CUDA_PREFILL_CHUNK`, set through `QwenResidentStep::set_m_sess_cap`.
     pub(crate) prefill_chunk: u32,
     /// The budget of the chunked prefill, or `None` when the chunked prefill is off.
     pub(crate) prefill_budget: Option<u64>,
@@ -400,8 +408,10 @@ pub(crate) struct Q36Settings {
     pub(crate) prefix_reuse: bool,
     /// The tiered expert mode, or `None` for the plain engine. Never on without the member.
     pub(crate) tiered: Option<TieredSettings>,
-    /// The MLX-only keys the CUDA arm ignores (in `Q36Options` order); the start logs one
-    /// line per name. Empty on the MLX arm.
+    /// The MLX allocator and session keys the CUDA arm ignores (the KV cache is sized by
+    /// `context_limit` alone, the prefill runs one token per step): the start logs one line
+    /// each. Empty on the MLX arm. `prefill_chunk` is among them until lane M's CPF-7a
+    /// integration commit accepts it as the cap of `M_sess` (decision 0049, A6 item 2).
     pub(crate) ignored_mlx_keys: Vec<&'static str>,
 }
 
@@ -528,7 +538,8 @@ fn cache_growth_per_position(
 
 /// The tiered member, checked: CUDA only, `slots` required, no capture (the tiered step waits for
 /// the host inside every layer, which a captured graph cannot do), no chunked prefill (the CUDA
-/// arm refuses its keys by name above, and the tiered prefill runs one token per step).
+/// arm refuses the budget keys by name above, and the tiered prefill runs one token per step;
+/// `chunk_ready` keeps a tiered session off the chunk path, plan rev 3 §C.4).
 fn tiered_settings(
     options: &Q36Options,
     backend: Backend,
@@ -570,7 +581,9 @@ fn refuse_cuda_key(key: &str, value: Option<u64>) -> Result<(), EngError> {
 
 /// The MLX allocator, compile, and session keys the CUDA arm ignores (the KV cache is sized by
 /// `context_limit` alone, the prefill runs one token per step, and the CUDA arm does not build
-/// the MLX compile seam): the start logs one line each.
+/// the MLX compile seam): the start logs one line each. `prefill_chunk` stays ignored until
+/// lane M's CPF-7a integration commit accepts it as the cap of `M_sess` (decision 0049, A6
+/// item 2; lane C's ruling of 2026-10-14: the key promises no speed the arm does not have).
 fn ignored_mlx_keys_of(options: &Q36Options) -> Vec<&'static str> {
     [
         (options.cache_limit_bytes.is_some(), "cache_limit_bytes"),
@@ -666,7 +679,8 @@ impl Q36Settings {
                 )?,
             ),
             // Inert: the CUDA arm reads none of them (the KV is sized by `context_limit`,
-            // the worker piece is `NO_BUDGET_PIECE`).
+            // the worker piece is `NO_BUDGET_PIECE`, `prefill_chunk` is ignored with its
+            // start line until CPF-7a's integration commit, decision 0049 A6 item 2).
             Backend::Cuda => (0, 0),
         };
         Ok(Self {
@@ -1091,6 +1105,17 @@ mod tests {
                 "an explicit chunk wins for {activation}"
             );
         }
+        let maximum = Q36Options {
+            prefill_chunk: Some(1024),
+            ..with_limit()
+        };
+        assert_eq!(
+            settings(Some(&maximum), &Q36Env::default())
+                .unwrap()
+                .prefill_chunk,
+            1024,
+            "the maximum accepted chunk"
+        );
     }
 
     #[test]
@@ -1217,14 +1242,14 @@ mod tests {
                     prefill_chunk: Some(0),
                     ..with_limit()
                 },
-                "prefill_chunk must be between 1 and 512, found 0",
+                "prefill_chunk must be between 1 and 1024, found 0",
             ),
             (
                 Q36Options {
-                    prefill_chunk: Some(513),
+                    prefill_chunk: Some(1025),
                     ..with_limit()
                 },
-                "prefill_chunk must be between 1 and 512, found 513",
+                "prefill_chunk must be between 1 and 1024, found 1025",
             ),
             (
                 Q36Options {
@@ -1762,6 +1787,36 @@ mod tests {
                 )
             );
         }
+    }
+
+    #[cfg(all(feature = "native-cuda", target_os = "linux"))]
+    #[test]
+    fn the_cuda_arm_ignores_prefill_chunk_until_cpf_7a_wires_it() {
+        use super::DEFAULT_CUDA_PREFILL_CHUNK;
+        // Lane C's ruling of 2026-10-14 (option (a) on the review's B-2/B-1): the CUDA arm
+        // keeps ignoring the key, with its start line, until lane M's CPF-7a integration
+        // commit accepts it as the cap of `M_sess` (decision 0049, A6 item 2). Any value is
+        // taken — 0 included, the CLI twin's case — and the field stays the inert 0; the
+        // step's cap is `DEFAULT_CUDA_PREFILL_CHUNK` until the config is wired.
+        let value = Q36Options {
+            prefill_chunk: Some(0),
+            ..Q36Options::default()
+        };
+        let got = settings_for(Some(&value), &Q36Env::default(), Backend::Cuda).unwrap();
+        assert_eq!(
+            got.ignored_mlx_keys,
+            ["prefill_chunk"],
+            "the chunk key is ignored with its start line"
+        );
+        assert_eq!(got.prefill_chunk, 0, "the CUDA field stays inert");
+        assert_eq!(
+            got.prefill_budget, None,
+            "the CUDA arm plans no budget: the worker piece is NO_BUDGET_PIECE"
+        );
+        assert_eq!(
+            DEFAULT_CUDA_PREFILL_CHUNK, 2048,
+            "the step's cap stays the no-cap default"
+        );
     }
 
     fn tiered(body: &str) -> Q36Options {

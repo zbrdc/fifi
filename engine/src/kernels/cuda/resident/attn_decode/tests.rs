@@ -19,6 +19,33 @@ use crate::EngError;
 use crate::kernels::cuda::testkit::{self, Rng, f16_bits, f16_to_f32};
 use crate::kernels::cuda::{CapturePlan, CudaContext, DeviceBuffer, DeviceRange, DeviceStream};
 
+/// The fallible upload of `bytes` for the Result-only device phases of this file: the shared
+/// `testkit` uploads panic, which must not happen while a device owner is alive.
+fn upload_bytes(ctx: &CudaContext, bytes: &[u8]) -> Result<DeviceBuffer, EngError> {
+    ctx.upload(bytes)
+}
+
+/// The fallible upload of `values` for the Result-only device phases.
+fn upload_f32(ctx: &CudaContext, values: &[f32]) -> Result<DeviceBuffer, EngError> {
+    let bytes: Vec<u8> = values
+        .iter()
+        .flat_map(|value| value.to_le_bytes())
+        .collect();
+    upload_bytes(ctx, &bytes)
+}
+
+/// The fallible upload of `len` bytes that all equal `byte`.
+fn upload_filled(ctx: &CudaContext, byte: u8, len: usize) -> Result<DeviceBuffer, EngError> {
+    upload_bytes(ctx, &vec![byte; len])
+}
+
+/// The fallible download of the first `len` bytes of `buffer`.
+fn read_bytes(ctx: &CudaContext, buffer: &DeviceBuffer, len: usize) -> Result<Vec<u8>, EngError> {
+    let mut bytes = vec![0u8; len];
+    ctx.download(buffer, &mut bytes)?;
+    Ok(bytes)
+}
+
 /// Class E3 for RD-8b, final: `max|d| <= 2^-17 * max(max|ref|, 1)` per head vector (lane M
 /// REPLY-44, REPLY-48 and REPLY-50; decision 0047 on main `1a547172`, "finalize E3 and R1").
 const E3: f64 = 1.0 / 131_072.0;
@@ -197,6 +224,12 @@ fn whole(b: &DeviceBuffer) -> DeviceRange<'_> {
     b.range(0, b.bytes()).expect("range")
 }
 
+/// The whole buffer as a range through `?`, for the Result-only device phases (every owner
+/// drops before they return, so a range failure must not panic).
+fn try_whole(b: &DeviceBuffer) -> Result<DeviceRange<'_>, EngError> {
+    b.range(0, b.bytes())
+}
+
 /// Uploads the problem, queues one call, waits and returns `out`. `out` starts as 0xFF bytes.
 fn launch(rig: &Rig, p: &Problem, fill: PartFill) -> Vec<f32> {
     let (ctx, s) = (&rig.ctx, &p.spec);
@@ -295,9 +328,15 @@ struct Rig {
 
 impl Rig {
     fn new() -> Self {
-        let ctx = CudaContext::new().expect("context");
-        let stream = ctx.stream().expect("stream");
-        Self { ctx, stream }
+        Self::try_new().expect("the device rig")
+    }
+
+    /// The fallible construction of the rig, for the Result-only device phases: a failure
+    /// returns after the context has dropped, so no owner is alive when the phase propagates.
+    fn try_new() -> Result<Self, EngError> {
+        let ctx = CudaContext::new()?;
+        let stream = ctx.stream()?;
+        Ok(Self { ctx, stream })
     }
 }
 
@@ -916,14 +955,15 @@ fn attn_decode_inside_a_capture_follows_the_word() {
 
 // ------------------------------------------- T8 (IMPL-ATTN-COMBINE-PIN)
 
-/// How the K rows of a T8 case are built: one key vector in every readable row, or the rows of
-/// the first active split scaled up by a factor. See [`combine_case`].
+/// How the K rows of a T8 case are built: one key vector in every readable row, the rows of
+/// the first active split scaled up by a factor, or one tied-hot row and one near-hot row per
+/// split at a shared hot factor. See [`combine_case`].
 #[derive(Clone, Copy)]
 enum Skew {
     Uniform,
     FirstSplit(f32),
+    NearHot(f32),
 }
-
 /// Host data of one T8 case: `q`, the projection (empty without the gate), the K and V bits and
 /// the f64 score gap a skew opens between the first split's max and the others' (0.0 without).
 struct CombineCase {
@@ -954,36 +994,75 @@ fn host_split_plan(n_keys: usize, split: &AttnSplit) -> (usize, usize) {
 /// `skew_gap` carries the score gap the caller asserts. V stays random per row, so the
 /// accumulators `a_{s,d}` are comparable, unordered sums and the sum order decides the bits.
 /// The gate half of the projection is 0 (`sigmoid(0) = 1/2` exactly); the q half stays NaN.
+///
+/// With `Skew::NearHot(f)` the FIRST row of every split holds `f` times the vector, the next
+/// `28 >> split` rows `f * 1023/1024` times it (one f16 step of 2^-10 below the hot bits, so
+/// their scores sit a small `delta` under the tied split maximum), and every other row the
+/// plain vector: the split maxima stay tied at the hot bits (every combine weight exactly
+/// `expf(0) = 1`) while the near-hot probabilities make `l_s = 1 + (28 >> split) * expf(-delta)`
+/// distinct f32 values a factor of two apart - 1.3 to 10 - so partial sums of the L chain round
+/// on different ulp grids in different orders and the L sum alone re-rounds under a reversed
+/// order (the uniform cases' `l_s` are the integer key counts of the chunks, order-blind, and
+/// near-equal `l_s` can round the same in both orders). The plain rows sit `skew_gap` below the
+/// hot rows, far past the `expf` underflow line, so only the hot and near-hot keys shape the
+/// partials. Every near-hot case draws `q` positive per query head and its keys positive, so
+/// `dot(q, k) > 0` for every head: the hot row leads every head's split at once while each
+/// head's own score sets its near-hot delta. The `l_s` set therefore differs per head (the
+/// `uniform_q` case below would put every head on one `l_s` set).
 fn combine_case(spec: &Spec, pool: &Pool, uniform_q: bool, skew: Skew) -> CombineCase {
     let mut rng =
         Rng::new(0xb1a5 ^ u64::from(spec.kv_len.unsigned_abs()) ^ ((spec.m as u64) << 32));
     let d = spec.head_dim;
     let mut draw = || (rng.normal() * spec.qsd) as f32;
+    // The near-hot cases vary the l set per query head: q is drawn positive per head and the
+    // keys below are positive too, so `f * dot(q, k)` leads `dot(q, k) > 0` for every head.
+    let per_head = !uniform_q && matches!(skew, Skew::NearHot(_));
     let q0: Vec<f32> = (0..d).map(|_| draw()).collect();
     let q = if uniform_q {
         q0.repeat(spec.m * spec.n_head)
+    } else if per_head {
+        (0..spec.m * spec.n_head * d)
+            .map(|_| draw().abs())
+            .collect()
     } else {
         (0..spec.m * spec.n_head * d).map(|_| draw()).collect()
     };
     let key: Vec<u16> = if uniform_q {
         q0.iter().map(|&x| f16_bits(x)).collect()
+    } else if per_head {
+        (0..d).map(|_| f16_bits(0.25 + rng.unit() as f32)).collect()
     } else {
         (0..d)
             .map(|_| pool.bits[usize::from(rng.next_u64() as u16)])
             .collect()
     };
-    let factor = match skew {
-        Skew::FirstSplit(f) => f,
-        Skew::Uniform => 1.0,
-    };
     let positions = spec.visible(0);
     let n_keys =
         usize::try_from(positions.end - positions.start).expect("the visible count fits usize");
     let (chunk, _) = host_split_plan(n_keys, &spec.split);
-    let mut scaled = vec![false; spec.cache_rows];
-    if factor != 1.0 {
-        for position in positions.take(chunk) {
-            scaled[spec.row_of(position)] = true;
+    // The key factor of every visible row of token 0 (the linear qwen cases give every token
+    // the same split layout): 1 everywhere, the first split scaled up, or - for NearHot - the
+    // first row of every split at the hot factor and its second row a shade below it.
+    let mut row_factor = vec![1.0f32; spec.cache_rows];
+    match skew {
+        Skew::Uniform => {}
+        Skew::FirstSplit(f) => {
+            for position in positions.take(chunk) {
+                row_factor[spec.row_of(position)] = f;
+            }
+        }
+        Skew::NearHot(f) => {
+            for (at, position) in positions.enumerate() {
+                let (split, key_at) = (at / chunk, at % chunk);
+                let near = 28usize >> split;
+                row_factor[spec.row_of(position)] = if key_at == 0 {
+                    f
+                } else if key_at <= near {
+                    f * (1023.0 / 1024.0)
+                } else {
+                    1.0
+                };
+            }
         }
     }
     let readable = spec.readable();
@@ -995,25 +1074,37 @@ fn combine_case(spec: &Spec, pool: &Pool, uniform_q: bool, skew: Skew) -> Combin
         }
         for (i, cell) in cells.iter_mut().enumerate() {
             let bits = key[i % d];
-            *cell = if scaled[row] {
-                f16_bits(factor * f16_to_f32(bits))
-            } else {
+            let factor = row_factor[row];
+            *cell = if factor == 1.0 {
                 bits
+            } else {
+                f16_bits(factor * f16_to_f32(bits))
             };
         }
     }
-    let skew_gap = if factor != 1.0 {
+    let hot_factor = match skew {
+        Skew::Uniform => 1.0,
+        Skew::FirstSplit(f) | Skew::NearHot(f) => f,
+    };
+    let skew_gap = if hot_factor != 1.0 {
         let value = |bits: u16| f64::from(f16_to_f32(bits));
-        let top: Vec<u16> = (0..d)
-            .map(|i| f16_bits(factor * f16_to_f32(key[i])))
+        // The score gap the hot row opens over the plain rows, per K element: the scaled key
+        // bits against the row bits. The minimum over every (token, head) q vector is the one
+        // the caller holds above the expf underflow line; the near-hot cases' per-head l sets
+        // are why the minimum cannot use the first head's q alone.
+        let deltas: Vec<f64> = key
+            .iter()
+            .map(|&bits| value(f16_bits(hot_factor * f16_to_f32(bits))) - value(bits))
             .collect();
-        f64::from(spec.scale())
-            * top
-                .iter()
-                .zip(&key)
-                .zip(&q0)
-                .map(|((&hi, &lo), &q)| f64::from(q) * (value(hi) - value(lo)))
-                .sum::<f64>()
+        q.chunks_exact(d)
+            .map(|q| {
+                f64::from(spec.scale())
+                    * q.iter()
+                        .zip(&deltas)
+                        .map(|(&q, &delta)| f64::from(q) * delta)
+                        .sum::<f64>()
+            })
+            .fold(f64::INFINITY, f64::min)
     } else {
         0.0
     };
@@ -1041,16 +1132,15 @@ fn combine_case(spec: &Spec, pool: &Pool, uniform_q: bool, skew: Skew) -> Combin
 /// (the S3b lesson: a drop while panicking latches the backend).
 fn launch_combine(rig: &Rig, case: &CombineCase) -> Result<(Vec<f32>, Vec<f32>), EngError> {
     let (ctx, spec) = (&rig.ctx, &case.spec);
-    let part_bytes = attn_part_bytes(spec.m, spec.n_kv_head, spec.head_dim, spec.split.max_splits)
-        .expect("the part bytes of a T8 case");
+    let part_bytes = attn_part_bytes(spec.m, spec.n_kv_head, spec.head_dim, spec.split.max_splits)?;
     let out_bytes = spec.m * spec.n_head * spec.head_dim * 4;
-    let q = testkit::upload_f32(ctx, &case.q);
-    let proj = spec.gate.then(|| testkit::upload_f32(ctx, &case.proj));
-    let k = testkit::upload_bytes(ctx, &le_bytes(&case.k));
-    let v = testkit::upload_bytes(ctx, &le_bytes(&case.v));
-    let word = testkit::upload_bytes(ctx, &spec.kv_len.to_le_bytes());
-    let part = testkit::upload_bytes(ctx, &part_content(part_bytes, PartFill::Nan));
-    let out = testkit::upload_filled(ctx, 0xFF, out_bytes);
+    let q = upload_f32(ctx, &case.q)?;
+    let proj = spec.gate.then(|| upload_f32(ctx, &case.proj)).transpose()?;
+    let k = upload_bytes(ctx, &le_bytes(&case.k))?;
+    let v = upload_bytes(ctx, &le_bytes(&case.v))?;
+    let word = upload_bytes(ctx, &spec.kv_len.to_le_bytes())?;
+    let part = upload_bytes(ctx, &part_content(part_bytes, PartFill::Nan))?;
+    let out = upload_filled(ctx, 0xFF, out_bytes)?;
     ctx.attn_decode(
         &rig.stream,
         AttnDecodeCall {
@@ -1058,18 +1148,18 @@ fn launch_combine(rig: &Rig, case: &CombineCase) -> Result<(Vec<f32>, Vec<f32>),
             span: spec.span(),
             split: spec.split,
             scale: spec.scale(),
-            q: whole(&q),
-            proj: proj.as_ref().map(whole),
-            k_cache: whole(&k),
-            v_cache: whole(&v),
-            kv_len: whole(&word),
-            part: whole(&part),
-            out: whole(&out),
+            q: try_whole(&q)?,
+            proj: proj.as_ref().map(try_whole).transpose()?,
+            k_cache: try_whole(&k)?,
+            v_cache: try_whole(&v)?,
+            kv_len: try_whole(&word)?,
+            part: try_whole(&part)?,
+            out: try_whole(&out)?,
         },
     )?;
     rig.stream.synchronize()?;
-    let out = testkit::floats(&testkit::read_bytes(ctx, &out, out_bytes));
-    let part = testkit::floats(&testkit::read_bytes(ctx, &part, part_bytes));
+    let out = testkit::floats(&read_bytes(ctx, &out, out_bytes)?);
+    let part = testkit::floats(&read_bytes(ctx, &part, part_bytes)?);
     Ok((out, part))
 }
 
@@ -1118,6 +1208,69 @@ fn host_combine(spec: &Spec, proj: Option<&[f32]>, part: &[f32]) -> Vec<f32> {
     out
 }
 
+/// One T8 case with its label and whether it is a near-hot L-order case.
+struct T8Case {
+    name: &'static str,
+    case: CombineCase,
+    near_hot: bool,
+}
+
+/// One T8 device result: the case reference and the device `out` and `part` as plain vectors.
+struct CombineOutcome<'a> {
+    case: &'a T8Case,
+    out: Vec<f32>,
+    part: Vec<f32>,
+}
+
+/// The T8 device phase: one launch per case, every owner dropped with the `Rig` before the
+/// plain outcomes return, so the assertions below never run inside a live backend.
+fn combine_device_phase<'a>(
+    cases: impl IntoIterator<Item = &'a T8Case>,
+) -> Result<Vec<CombineOutcome<'a>>, EngError> {
+    let rig = Rig::try_new()?;
+    let mut outcomes = Vec::new();
+    for case in cases {
+        let (out, part) = launch_combine(&rig, &case.case)?;
+        outcomes.push(CombineOutcome { case, out, part });
+    }
+    Ok(outcomes)
+}
+
+/// The combine's L sums of one case, in f32, from the device partials of `part`: the exact
+/// block max over the active splits, the weights `expf(m_s - M)` and the `fmaf` chain exactly
+/// as `attn_combine_k` sums them (`L = fmaf(l_s, w_s, L)`). One `(index, reversed)` pair per
+/// (token, query head); the case is blind to the L order when every pair is bit-equal.
+fn combine_l_orders(spec: &Spec, part: &[f32]) -> Vec<(f32, f32)> {
+    let (m, heads, kv_heads) = (spec.m, spec.n_head, spec.n_kv_head);
+    let splits = spec.split.max_splits;
+    let mut orders = Vec::new();
+    for t in 0..m {
+        let (_, n_active) = host_split_plan(spec.visible(t).count(), &spec.split);
+        for h in 0..heads {
+            let (kv_head, g) = (h / GROUP, h % GROUP);
+            let cell0 = (t * kv_heads + kv_head) * splits;
+            let maxes: Vec<f32> = (0..n_active)
+                .map(|s| part[(cell0 + s) * GROUP * 2 + g * 2])
+                .collect();
+            let sums: Vec<f32> = (0..n_active)
+                .map(|s| part[(cell0 + s) * GROUP * 2 + g * 2 + 1])
+                .collect();
+            let top = maxes.iter().fold(f32::NEG_INFINITY, |m, &x| m.max(x));
+            let weights: Vec<f32> = maxes.iter().map(|&mx| (mx - top).exp()).collect();
+            let mut index = 0.0f32;
+            for (&sum, &weight) in sums.iter().zip(&weights) {
+                index = sum.mul_add(weight, index);
+            }
+            let mut reversed = 0.0f32;
+            for (&sum, &weight) in sums.iter().zip(&weights).rev() {
+                reversed = sum.mul_add(weight, reversed);
+            }
+            orders.push((index, reversed));
+        }
+    }
+    orders
+}
+
 /// T8: the split-combine ORDER of `attn_decode`, pinned bit-exactly against the case's own
 /// partials (git-db made this pin required for the fp16 KV path).
 ///
@@ -1135,10 +1288,14 @@ fn host_combine(spec: &Spec, proj: Option<&[f32]>, part: &[f32]) -> Vec<f32> {
 /// bit-equality: the uniform cases give every active split the same max-score bits, so every
 /// weight is `expf(0) = 1` on both sides, and the skewed case scales one split's keys up so far
 /// (`skew_gap >= 120`, far past the `x <= -104` where `expf` underflows to `+0`) that every
-/// other weight is exactly `+0` on both sides. `fmaf` mirrors `mul_add`, the division is IEEE
+/// other weight is exactly `+0` on both sides; the near-hot cases' plain rows sit the same gap
+/// below their tied hot rows. `fmaf` mirrors `mul_add`, the division is IEEE
 /// on both, and the gate is 0, so `sigmoid(0) = 1/2` exactly; nothing else in the combine has a
 /// device intrinsic. Reversing the two index-order sums (mutant m7-fp16) re-rounds the A sums
-/// of the uniform cases and fails the bit assert.
+/// of the uniform cases and the L sum of the near-hot cases, and fails the bit assert. Each
+/// near-hot case is probed first: the reversed L of its own device partials must differ in at
+/// least one bit, so a case that cannot see the L order fails the probe instead of passing the
+/// bit comparison vacuously.
 #[test]
 fn attn_decode_combine_is_bit_equal_to_an_index_order_host_combine_of_its_partials() {
     if !testkit::device_present(
@@ -1146,24 +1303,30 @@ fn attn_decode_combine_is_bit_equal_to_an_index_order_host_combine_of_its_partia
     ) {
         return;
     }
-    let (rig, pool) = (Rig::new(), Pool::new());
+    let pool = Pool::new();
     let qwen_split = AttnSplit {
         max_splits: 8,
         min_keys: 256,
     };
     #[rustfmt::skip]
-    let cases = [
+    let raw = [
         (Spec { split: qwen_split, ..Spec::qwen(1, 1025) }, false, Skew::Uniform, "qwen m=1 kv 1025"),
         (Spec { split: qwen_split, ..Spec::qwen(4, 1025) }, false, Skew::Uniform, "qwen m=4 kv 1025"),
         (Spec { split: AttnSplit { max_splits: 8, min_keys: 32 }, kv_len: 200, ..Spec::other(128, 128, 143, 143, false) }, false, Skew::Uniform, "head 128 window 128 ring 143"),
         (Spec { split: qwen_split, ..Spec::qwen(1, 1025) }, true, Skew::FirstSplit(40.0), "qwen skewed first split x40"),
+        (Spec { split: qwen_split, ..Spec::qwen(1, 1025) }, false, Skew::NearHot(50.0), "qwen near-hot tied maxima x50, per-head l sets"),
+        (Spec { split: qwen_split, ..Spec::qwen(1, 1025) }, false, Skew::NearHot(45.0), "qwen near-hot tied maxima x45, per-head l sets"),
+        (Spec { split: qwen_split, ..Spec::qwen(1, 1025) }, false, Skew::NearHot(37.0), "qwen near-hot tied maxima x37, per-head l sets"),
+        (Spec { split: qwen_split, ..Spec::qwen(1, 1025) }, false, Skew::NearHot(21.0), "qwen near-hot tied maxima x21, per-head l sets"),
     ];
-    for (spec, uniform_q, skew, name) in cases {
+    // Build and precheck every case on the host first: no device owner exists at this point.
+    let mut cases = Vec::new();
+    for (spec, uniform_q, skew, name) in raw {
         let case = combine_case(&spec, &pool, uniform_q, skew);
-        if let Skew::FirstSplit(_) = skew {
+        if matches!(skew, Skew::FirstSplit(_) | Skew::NearHot(_)) {
             assert!(
                 case.skew_gap >= 120.0,
-                "{name}: the skew gap {} is below the expf underflow line",
+                "{name}: the score gap {} is below the expf underflow line",
                 case.skew_gap
             );
         }
@@ -1174,15 +1337,62 @@ fn attn_decode_combine_is_bit_equal_to_an_index_order_host_combine_of_its_partia
                 "{name}: token {t} has {n_active} active splits"
             );
         }
-        let (out, part) = launch_combine(&rig, &case)
-            .unwrap_or_else(|error| panic!("{name}: queue or drain: {error:?}"));
+        cases.push(T8Case {
+            name,
+            near_hot: matches!(skew, Skew::NearHot(_)),
+            case,
+        });
+    }
+    // MAJOR F1: every near-hot case must see the reversed L sum in its own device partials BY
+    // CONSTRUCTION, not by the luck of the rounding. This probe runs before the pin's device
+    // phase; a blind case fails loudly here with its label instead of passing the bit
+    // comparison. The probe makes the same launch as the pin (deterministic kernel, same
+    // inputs), so the checked l set is the pinned one.
+    let probed = combine_device_phase(cases.iter().filter(|c| c.near_hot))
+        .expect("the probe phase of the near-hot L preconditions");
+    for outcome in &probed {
+        let orders = combine_l_orders(&outcome.case.case.spec, &outcome.part);
+        let differing: Vec<&(f32, f32)> = orders
+            .iter()
+            .filter(|(index, reversed)| index.to_bits() != reversed.to_bits())
+            .collect();
+        println!(
+            "precondition {}: {} of {} L sets differ in index and reversed order",
+            outcome.case.name,
+            differing.len(),
+            orders.len()
+        );
+        for (index, reversed) in differing.iter().take(1) {
+            println!(
+                "  first: index {:#010x} ({index:e}), reversed {:#010x} ({reversed:e})",
+                index.to_bits(),
+                reversed.to_bits()
+            );
+        }
+        assert!(
+            !differing.is_empty(),
+            "{}: the near-hot case cannot see the L order: all {} of its (token, head) L sets \
+             sum bit-identically in index and reversed order; reseed or reshape the case",
+            outcome.case.name,
+            orders.len()
+        );
+    }
+    // The pin's own device phase, result-only like the probe: every owner drops at the return.
+    let outcomes = combine_device_phase(cases.iter()).expect("the device phase of the combine pin");
+    for outcome in &outcomes {
+        let name = outcome.case.name;
+        let case = &outcome.case.case;
+        assert!(
+            outcome.out.iter().all(|x| x.is_finite()),
+            "{name}: a non-finite device output element before the bit comparison"
+        );
         let gate = (!case.proj.is_empty()).then_some(case.proj.as_slice());
-        let want = host_combine(&spec, gate, &part);
-        for t in 0..spec.m {
-            for h in 0..spec.n_head {
-                for dim in 0..spec.head_dim {
-                    let at = (t * spec.n_head + h) * spec.head_dim + dim;
-                    let (got, expected) = (out[at], want[at]);
+        let want = host_combine(&case.spec, gate, &outcome.part);
+        for t in 0..case.spec.m {
+            for h in 0..case.spec.n_head {
+                for dim in 0..case.spec.head_dim {
+                    let at = (t * case.spec.n_head + h) * case.spec.head_dim + dim;
+                    let (got, expected) = (outcome.out[at], want[at]);
                     assert_eq!(
                         got.to_bits(),
                         expected.to_bits(),

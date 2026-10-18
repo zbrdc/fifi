@@ -23,6 +23,45 @@ use crate::EngError;
 use crate::kernels::cuda::testkit::{self, Rng, f16_bits, f16_to_f32};
 use crate::kernels::cuda::{CudaContext, DeviceBuffer, DeviceRange, DeviceStream};
 
+/// The fallible upload of `bytes` for the Result-only device phases of this file: the shared
+/// `testkit` uploads panic, which must not happen while a device owner is alive.
+fn upload_bytes(ctx: &CudaContext, bytes: &[u8]) -> Result<DeviceBuffer, EngError> {
+    ctx.upload(bytes)
+}
+
+/// The fallible upload of `values` for the Result-only device phases.
+fn upload_f32(ctx: &CudaContext, values: &[f32]) -> Result<DeviceBuffer, EngError> {
+    let bytes: Vec<u8> = values
+        .iter()
+        .flat_map(|value| value.to_le_bytes())
+        .collect();
+    upload_bytes(ctx, &bytes)
+}
+
+/// The fallible upload of `len` bytes that all equal `byte`.
+fn upload_filled(ctx: &CudaContext, byte: u8, len: usize) -> Result<DeviceBuffer, EngError> {
+    upload_bytes(ctx, &vec![byte; len])
+}
+
+/// The fallible download of the first `len` bytes of `buffer`.
+fn read_bytes(ctx: &CudaContext, buffer: &DeviceBuffer, len: usize) -> Result<Vec<u8>, EngError> {
+    let mut bytes = vec![0u8; len];
+    ctx.download(buffer, &mut bytes)?;
+    Ok(bytes)
+}
+
+/// Adds the phase's row label to a device error, so a drain or upload failure names the row
+/// whose call hit it again.
+fn labelled(label: &str, error: EngError) -> EngError {
+    match error {
+        EngError::Backend { operation, message } => EngError::Backend {
+            operation,
+            message: format!("{label}: {message}"),
+        },
+        other => other,
+    }
+}
+
 /// Class E3 (frozen, lane M REPLY-44): `max|d| <= 2^-17 * max(max|ref|, 1)` per head vector.
 const E3: f64 = 1.0 / 131_072.0;
 /// Two times the largest per-head query spread of the RD-M6 oracle (1.691144648391655): a case
@@ -259,46 +298,45 @@ fn le16(values: &[u16]) -> Vec<u8> {
     values.iter().flat_map(|c| c.to_le_bytes()).collect()
 }
 
-/// The whole buffer as a range.
-fn whole(b: &DeviceBuffer) -> DeviceRange<'_> {
-    b.range(0, b.bytes()).expect("range")
+/// The whole buffer as a range, or its range error (the Result-only phases use it through
+/// `?`; every owner drops before they return, so a failure must not panic).
+fn whole(b: &DeviceBuffer) -> Result<DeviceRange<'_>, EngError> {
+    b.range(0, b.bytes())
 }
 
-/// Uploads the problem, queues one call, waits and returns `out`. `out` starts as 0xFF bytes.
-fn launch(rig: &Rig, p: &Problem, fill: PartFill) -> Vec<f32> {
+/// Uploads the problem, queues one call, waits and returns `out` through `?`. `out` starts as
+/// 0xFF bytes. Called only inside a Result-only device phase.
+fn launch(rig: &Rig, p: &Problem, fill: PartFill) -> Result<Vec<f32>, EngError> {
     let (ctx, s) = (&rig.ctx, &p.spec);
-    let part_len =
-        attn_q8_part_bytes(s.m, s.n_kv_head, s.head_dim, s.split.max_splits).expect("part");
+    let part_len = attn_q8_part_bytes(s.m, s.n_kv_head, s.head_dim, s.split.max_splits)?;
     let out_len = s.m * s.n_head * s.head_dim * 4;
-    let q = testkit::upload_f32(ctx, &p.q);
-    let proj = s.gate.then(|| testkit::upload_f32(ctx, &p.proj));
-    let k_codes = testkit::upload_bytes(ctx, &le_i8(&p.k_codes));
-    let k_scales = testkit::upload_bytes(ctx, &le16(&p.k_scales));
-    let v_codes = testkit::upload_bytes(ctx, &le_i8(&p.v_codes));
-    let v_scales = testkit::upload_bytes(ctx, &le16(&p.v_scales));
-    let word = testkit::upload_bytes(ctx, &s.kv_len.to_le_bytes());
-    let part = testkit::upload_bytes(ctx, &part_content(part_len, fill));
-    let out = testkit::upload_filled(ctx, 0xFF, out_len);
+    let q = upload_f32(ctx, &p.q)?;
+    let proj = s.gate.then(|| upload_f32(ctx, &p.proj)).transpose()?;
+    let k_codes = upload_bytes(ctx, &le_i8(&p.k_codes))?;
+    let k_scales = upload_bytes(ctx, &le16(&p.k_scales))?;
+    let v_codes = upload_bytes(ctx, &le_i8(&p.v_codes))?;
+    let v_scales = upload_bytes(ctx, &le16(&p.v_scales))?;
+    let word = upload_bytes(ctx, &s.kv_len.to_le_bytes())?;
+    let part = upload_bytes(ctx, &part_content(part_len, fill))?;
+    let out = upload_filled(ctx, 0xFF, out_len)?;
     let call = AttnDecodeQ8Call {
         shape: s.shape(),
         span: s.span(),
         split: s.split,
         scale: s.scale(),
-        q: whole(&q),
-        proj: proj.as_ref().map(whole),
-        k_codes: whole(&k_codes),
-        k_scales: whole(&k_scales),
-        v_codes: whole(&v_codes),
-        v_scales: whole(&v_scales),
-        kv_len: whole(&word),
-        part: whole(&part),
-        out: whole(&out),
+        q: whole(&q)?,
+        proj: proj.as_ref().map(whole).transpose()?,
+        k_codes: whole(&k_codes)?,
+        k_scales: whole(&k_scales)?,
+        v_codes: whole(&v_codes)?,
+        v_scales: whole(&v_scales)?,
+        kv_len: whole(&word)?,
+        part: whole(&part)?,
+        out: whole(&out)?,
     };
-    rig.ctx
-        .attn_decode_q8(&rig.stream, call)
-        .expect("queue the attention");
-    rig.stream.synchronize().expect("drain");
-    testkit::floats(&testkit::read_bytes(ctx, &out, out_len))
+    rig.ctx.attn_decode_q8(&rig.stream, call)?;
+    rig.stream.synchronize()?;
+    Ok(testkit::floats(&read_bytes(ctx, &out, out_len)?))
 }
 
 /// The dequantized value of `codes[cell * d + dim]` against `scales[cell * groups + dim / 32]`.
@@ -345,18 +383,19 @@ fn reference(p: &Problem, t: usize, h: usize) -> Vec<f64> {
     out
 }
 
-/// Worst `max|dev - ref| / max(max|ref|, 1)` over the head vectors of `heads` for every token.
-fn worst_error(p: &Problem, out: &[f32], heads: &[usize]) -> f64 {
+/// Worst `max|dev - ref| / max(max|ref|, 1)` over the head vectors of `heads` for every token,
+/// with the first non-finite head vector (none expected). The computation asserts nothing: the
+/// caller asserts after the device phase has dropped every owner.
+fn worst_error(p: &Problem, out: &[f32], heads: &[usize]) -> (f64, Option<(usize, usize)>) {
     let s = &p.spec;
     let mut worst = 0.0f64;
+    let mut non_finite = None;
     for (t, &h) in (0..s.m).flat_map(|t| heads.iter().map(move |h| (t, h))) {
         let want = reference(p, t, h);
         let got = &out[(t * s.n_head + h) * s.head_dim..][..s.head_dim];
-        assert!(
-            got.iter().all(|x| x.is_finite()),
-            "non-finite output at token {t} head {h}: {}",
-            s.label()
-        );
+        if non_finite.is_none() && got.iter().any(|x| !x.is_finite()) {
+            non_finite = Some((t, h));
+        }
         let top = want.iter().fold(1.0f64, |m, x| m.max(x.abs()));
         let diff = got
             .iter()
@@ -364,42 +403,83 @@ fn worst_error(p: &Problem, out: &[f32], heads: &[usize]) -> f64 {
             .fold(0.0f64, |m, (&g, &w)| m.max((f64::from(g) - w).abs()));
         worst = worst.max(diff / top);
     }
-    worst
+    (worst, non_finite)
 }
 
-/// A device context and its stream.
+/// A device context and its stream, owned by one device phase.
 struct Rig {
     ctx: CudaContext,
     stream: DeviceStream,
 }
 
 impl Rig {
-    fn new() -> Self {
-        let ctx = CudaContext::new().expect("context");
-        let stream = ctx.stream().expect("stream");
-        Self { ctx, stream }
+    fn new() -> Result<Self, EngError> {
+        let ctx = CudaContext::new()?;
+        let stream = ctx.stream()?;
+        Ok(Self { ctx, stream })
     }
 }
 
-/// Runs `spec` and asserts E3 per head vector (in range) or the sanity bound (stress). Returns
-/// the error and whether the case is a stress case.
-fn check(rig: &Rig, spec: &Spec, heads: &[usize]) -> (f64, bool) {
-    let p = problem(spec, false);
-    let error = worst_error(&p, &launch(rig, &p, PartFill::Nan), heads);
-    let stress = spec.qsd > IN_RANGE_QSD;
-    println!("max error {error:e} stress={stress} {}", spec.label());
-    let bound = if stress { STRESS_SANITY } else { E3 };
-    assert!(
-        error <= bound,
-        "{}: {error:e} is above {bound:e}",
-        spec.label()
-    );
-    (error, stress)
+/// One measured device run: the spec label, the worst error, whether the case is a stress
+/// case, and the first non-finite head vector (none expected).
+struct RunOutcome {
+    label: String,
+    error: f64,
+    stress: bool,
+    non_finite: Option<(usize, usize)>,
 }
 
-fn check_all(rig: &Rig, spec: &Spec) -> (f64, bool) {
+/// Runs `spec` on the device and measures it against the host reference. Asserts nothing: the
+/// caller asserts after the device phase drops every owner.
+fn run_case(rig: &Rig, spec: &Spec, heads: &[usize]) -> Result<RunOutcome, EngError> {
+    let p = problem(spec, false);
+    let (error, non_finite) = worst_error(&p, &launch(rig, &p, PartFill::Nan)?, heads);
+    let stress = spec.qsd > IN_RANGE_QSD;
+    println!("max error {error:e} stress={stress} {}", spec.label());
+    Ok(RunOutcome {
+        label: spec.label(),
+        error,
+        stress,
+        non_finite,
+    })
+}
+
+fn run_all(rig: &Rig, spec: &Spec) -> Result<RunOutcome, EngError> {
     let heads = (0..spec.n_head).collect::<Vec<_>>();
-    check(rig, spec, &heads)
+    run_case(rig, spec, &heads)
+}
+
+/// Asserts one measured run: every output element finite, and the error inside the E3 bound
+/// (in range) or the stress sanity bound.
+fn assert_case(outcome: &RunOutcome) {
+    if let Some((t, h)) = outcome.non_finite {
+        panic!("non-finite output at token {t} head {h}: {}", outcome.label);
+    }
+    let bound = if outcome.stress { STRESS_SANITY } else { E3 };
+    assert!(
+        outcome.error <= bound,
+        "{}: {:e} is above {:e}",
+        outcome.label,
+        outcome.error,
+        bound
+    );
+}
+
+/// The device phase of the reference runs: one Rig for every spec, dropped with its buffers
+/// before the plain outcomes return, so the asserts never run inside a live backend (the S3b
+/// lesson: a drop while panicking latches it).
+fn reference_phase(specs: &[(Spec, Vec<usize>)]) -> Result<Vec<RunOutcome>, EngError> {
+    let rig = Rig::new()?;
+    specs
+        .iter()
+        .map(|(spec, heads)| run_case(&rig, spec, heads))
+        .collect()
+}
+
+/// The device phase of the all-heads reference runs, for the geometry sweeps.
+fn reference_phase_all(specs: &[Spec]) -> Result<Vec<RunOutcome>, EngError> {
+    let rig = Rig::new()?;
+    specs.iter().map(|spec| run_all(&rig, spec)).collect()
 }
 
 /// Prints the in-range and the stress maxima, with the lane M warnings.
@@ -425,33 +505,39 @@ fn attn_decode_q8_matches_the_host_reference() {
     if !testkit::device_present("attn_decode_q8_matches_the_host_reference") {
         return;
     }
-    let rig = Rig::new();
-    let mut specs: Vec<Spec> = [1, 2, 31, 32, 33, 64, 65, 100, 129, 1000, 1025, 4097]
-        .map(|kv| Spec::qwen(1, kv))
+    let mut specs: Vec<(Spec, Vec<usize>)> = [1, 2, 31, 32, 33, 64, 65, 100, 129, 1000, 1025, 4097]
+        .map(|kv| (Spec::qwen(1, kv), (0..16).collect()))
         .to_vec();
     for kv in [33, 100, 1025] {
         for (max_splits, min_keys) in [(1, 64), (4, 64), (64, 128)] {
-            specs.push(Spec {
-                split: AttnSplit {
-                    max_splits,
-                    min_keys,
+            specs.push((
+                Spec {
+                    split: AttnSplit {
+                        max_splits,
+                        min_keys,
+                    },
+                    ..Spec::qwen(1, kv)
                 },
-                ..Spec::qwen(1, kv)
-            });
+                (0..16).collect(),
+            ));
         }
     }
     for (m, kv) in [2, 3, 5, 16]
         .into_iter()
         .flat_map(|m| [1, 33, 100].map(|kv| (m, kv)))
     {
-        specs.push(Spec::qwen(m, kv));
+        specs.push((Spec::qwen(m, kv), (0..16).collect()));
     }
-    specs.extend([1, 16].map(|m| Spec::qwen(m, (4200 - (m - 1)) as i32)));
-    specs.extend([6.0, 20.0, 0.0].map(|qsd| Spec {
-        qsd,
-        ..Spec::qwen(1, 1025)
+    specs.extend([1, 16].map(|m| (Spec::qwen(m, (4200 - (m - 1)) as i32), (0..16).collect())));
+    specs.extend([6.0, 20.0, 0.0].map(|qsd| {
+        (
+            Spec {
+                qsd,
+                ..Spec::qwen(1, 1025)
+            },
+            (0..16).collect(),
+        )
     }));
-    let mut outcomes: Vec<_> = specs.iter().map(|spec| check_all(&rig, spec)).collect();
     // The long-context rows, one head per kv head: 32,768 and 131,072 keys (both inside one
     // hold of the gate run).
     for kv_len in [32_768_u32, 131_072] {
@@ -459,9 +545,19 @@ fn attn_decode_q8_matches_the_host_reference() {
             cells: kv_len as usize + 64,
             ..Spec::qwen(1, kv_len as i32)
         };
-        outcomes.push(check(&rig, &spec, &[0, 8]));
+        specs.push((spec, vec![0, 8]));
     }
-    report("T1", &outcomes);
+    let outcomes = reference_phase(&specs).expect("the device phase of the reference runs");
+    for outcome in &outcomes {
+        assert_case(outcome);
+    }
+    report(
+        "T1",
+        &outcomes
+            .iter()
+            .map(|o| (o.error, o.stress))
+            .collect::<Vec<_>>(),
+    );
 }
 
 #[test]
@@ -471,7 +567,6 @@ fn attn_decode_q8_matches_the_reference_for_head_128_window_ring_and_no_gate() {
     ) {
         return;
     }
-    let rig = Rig::new();
     // (`Spec::other(head_dim, window, ring, cells, gate)`, tokens per call, kv_len values)
     #[rustfmt::skip]
     let groups: [(Spec, &[usize], &[i32]); 5] = [
@@ -481,23 +576,55 @@ fn attn_decode_q8_matches_the_reference_for_head_128_window_ring_and_no_gate() {
         (Spec::other(256, 64, 79, 79, true), &[1, 16], &[10, 64, 65, 300]),
         (Spec::other(128, 1024, 1039, 2200, false), &[1, 5], &[1100, 1500, 3000]),
     ];
-    let mut outcomes = Vec::new();
+    let mut specs = Vec::new();
     for (geometry, tokens, lengths) in groups {
         for (&m, &kv_len) in tokens
             .iter()
             .flat_map(|m| lengths.iter().map(move |kv| (m, kv)))
         {
-            outcomes.push(check_all(
-                &rig,
-                &Spec {
-                    m,
-                    kv_len,
-                    ..geometry.clone()
-                },
-            ));
+            specs.push(Spec {
+                m,
+                kv_len,
+                ..geometry.clone()
+            });
         }
     }
-    report("T1b", &outcomes);
+    let outcomes = reference_phase_all(&specs).expect("the device phase of the reference runs");
+    for outcome in &outcomes {
+        assert_case(outcome);
+    }
+    report(
+        "T1b",
+        &outcomes
+            .iter()
+            .map(|o| (o.error, o.stress))
+            .collect::<Vec<_>>(),
+    );
+}
+
+/// One determinism outcome: the spec label and the `out` vectors of its two launches.
+struct PairOutcome {
+    label: String,
+    first: Vec<f32>,
+    second: Vec<f32>,
+}
+
+/// The device phase of the determinism cases: two launches per spec (the `part` scratch drawn
+/// from two different seeds), every owner dropped before the plain vectors return.
+fn determinism_phase(specs: &[Spec]) -> Result<Vec<PairOutcome>, EngError> {
+    let rig = Rig::new()?;
+    let mut outcomes = Vec::new();
+    for spec in specs {
+        let p = problem(spec, false);
+        let first = launch(&rig, &p, PartFill::Finite(11))?;
+        let second = launch(&rig, &p, PartFill::Finite(12))?;
+        outcomes.push(PairOutcome {
+            label: spec.label(),
+            first,
+            second,
+        });
+    }
+    Ok(outcomes)
 }
 
 #[test]
@@ -505,25 +632,93 @@ fn attn_decode_q8_is_deterministic() {
     if !testkit::device_present("attn_decode_q8_is_deterministic") {
         return;
     }
-    let rig = Rig::new();
     let ring = Spec {
         m: 2,
         kv_len: 300,
         ..Spec::other(128, 64, 79, 79, false)
     };
-    for spec in [Spec::qwen(1, 1025), Spec::qwen(3, 700), ring] {
-        let p = problem(&spec, false);
-        let first = launch(&rig, &p, PartFill::Finite(11));
-        let second = launch(&rig, &p, PartFill::Finite(12));
+    let specs = [Spec::qwen(1, 1025), Spec::qwen(3, 700), ring];
+    let outcomes = determinism_phase(&specs).expect("the device phase of the determinism cases");
+    for outcome in &outcomes {
+        assert!(
+            outcome.first.iter().all(|x| x.is_finite()),
+            "{}: a non-finite first output element",
+            outcome.label
+        );
+        assert!(
+            outcome.second.iter().all(|x| x.is_finite()),
+            "{}: a non-finite second output element",
+            outcome.label
+        );
         let bits = |v: &[f32]| v.iter().map(|x| x.to_bits()).collect::<Vec<_>>();
-        assert_eq!(bits(&first), bits(&second), "{}", spec.label());
-        assert!(first.iter().all(|x| x.is_finite()), "{}", spec.label());
+        assert_eq!(
+            bits(&outcome.first),
+            bits(&outcome.second),
+            "{}",
+            outcome.label
+        );
     }
 }
 
-/// Launches `spec` with finite planes (the length word may be invalid) and returns `out`.
-fn launch_finite(rig: &Rig, spec: &Spec) -> Vec<f32> {
+/// Launches `spec` with finite planes (the length word may be invalid) and returns `out`
+/// through `?`; called only inside a Result-only device phase.
+fn launch_finite(rig: &Rig, spec: &Spec) -> Result<Vec<f32>, EngError> {
     launch(rig, &problem(spec, true), PartFill::Nan)
+}
+
+/// One invalid-length outcome: its label and the device `out` of the launch.
+struct InvalidOutcome {
+    label: String,
+    out: Vec<f32>,
+}
+
+/// The device phase of the invalid-length cases: the linear and ring words that must mark the
+/// whole `out` NaN, then the two valid boundary runs, every owner dropped before the plain
+/// vectors return.
+fn invalid_length_phase(
+    linear: &Spec,
+    ring: &Spec,
+    edge: i32,
+    words: &[i32],
+    ring_words: &[i32],
+) -> Result<(Vec<InvalidOutcome>, RunOutcome, RunOutcome), EngError> {
+    let rig = Rig::new()?;
+    let mut invalid = Vec::new();
+    for &kv_len in words {
+        let out = launch_finite(
+            &rig,
+            &Spec {
+                kv_len,
+                ..linear.clone()
+            },
+        )?;
+        invalid.push(InvalidOutcome {
+            label: format!("linear kv_len {kv_len}"),
+            out,
+        });
+    }
+    let edge_run = run_all(
+        &rig,
+        &Spec {
+            kv_len: edge,
+            ..linear.clone()
+        },
+    )?;
+    for &kv_len in ring_words {
+        let out = launch_finite(
+            &rig,
+            &Spec {
+                kv_len,
+                ..ring.clone()
+            },
+        )?;
+        invalid.push(InvalidOutcome {
+            label: format!("ring kv_len {kv_len}"),
+            out,
+        });
+    }
+    let ring_run = run_all(&rig, ring)?;
+    Ok((invalid, edge_run, ring_run))
 }
 
 #[test]
@@ -531,42 +726,103 @@ fn attn_decode_q8_marks_an_invalid_kv_len_with_nan() {
     if !testkit::device_present("attn_decode_q8_marks_an_invalid_kv_len_with_nan") {
         return;
     }
-    let rig = Rig::new();
     let (cells, m) = (600usize, 2usize);
     let linear = Spec {
         cells,
         ..Spec::qwen(m, 1)
     };
     let edge = (cells - (m - 1)) as i32;
-    for kv_len in [0, -3, cells as i32 + 1, edge + 1] {
-        let out = launch_finite(
-            &rig,
-            &Spec {
-                kv_len,
-                ..linear.clone()
-            },
-        );
-        assert!(out.iter().all(|x| x.is_nan()), "linear kv_len {kv_len}");
-    }
-    check_all(
-        &rig,
-        &Spec {
-            kv_len: edge,
-            ..linear
-        },
-    );
     let ring = Spec::other(256, 64, 79, 79, true);
-    for kv_len in [0, 1 << 30] {
-        let out = launch_finite(
-            &rig,
-            &Spec {
-                kv_len,
-                ..ring.clone()
-            },
-        );
-        assert!(out.iter().all(|x| x.is_nan()), "ring kv_len {kv_len}");
+    let (invalid, edge_run, ring_run) = invalid_length_phase(
+        &linear,
+        &ring,
+        edge,
+        &[0, -3, cells as i32 + 1, edge + 1],
+        &[0, 1 << 30],
+    )
+    .expect("the device phase of the invalid-length cases");
+    for outcome in &invalid {
+        assert!(outcome.out.iter().all(|x| x.is_nan()), "{}", outcome.label);
     }
-    check_all(&rig, &ring);
+    assert_case(&edge_run);
+    assert_case(&ring_run);
+}
+
+/// The Result-only device phase of the poison row: queues one call through `?`, drains, reads
+/// `out`, and drops the context, the stream and every buffer as it returns, so no assert,
+/// expect or unwrap runs while a CUDA owner is alive (the S3b lesson). `out` starts as 0xFF
+/// bytes and the `part` scratch as NaN, exactly as `launch` prepares a case.
+fn poison_device_phase(p: &Problem) -> Result<Vec<f32>, EngError> {
+    let ctx = CudaContext::new()?;
+    let stream = ctx.stream()?;
+    let s = &p.spec;
+    let part_len = attn_q8_part_bytes(s.m, s.n_kv_head, s.head_dim, s.split.max_splits)?;
+    let out_len = s.m * s.n_head * s.head_dim * 4;
+    let q = testkit::upload_f32(&ctx, &p.q);
+    let proj = s.gate.then(|| testkit::upload_f32(&ctx, &p.proj));
+    let k_codes = testkit::upload_bytes(&ctx, &le_i8(&p.k_codes));
+    let k_scales = testkit::upload_bytes(&ctx, &le16(&p.k_scales));
+    let v_codes = testkit::upload_bytes(&ctx, &le_i8(&p.v_codes));
+    let v_scales = testkit::upload_bytes(&ctx, &le16(&p.v_scales));
+    let word = testkit::upload_bytes(&ctx, &s.kv_len.to_le_bytes());
+    let part = testkit::upload_bytes(&ctx, &part_content(part_len, PartFill::Nan));
+    let out = testkit::upload_filled(&ctx, 0xFF, out_len);
+    let call = AttnDecodeQ8Call {
+        shape: s.shape(),
+        span: s.span(),
+        split: s.split,
+        scale: s.scale(),
+        q: q.range(0, q.bytes())?,
+        proj: proj.as_ref().map(|b| b.range(0, b.bytes())).transpose()?,
+        k_codes: k_codes.range(0, k_codes.bytes())?,
+        k_scales: k_scales.range(0, k_scales.bytes())?,
+        v_codes: v_codes.range(0, v_codes.bytes())?,
+        v_scales: v_scales.range(0, v_scales.bytes())?,
+        kv_len: word.range(0, word.bytes())?,
+        part: part.range(0, part.bytes())?,
+        out: out.range(0, out.bytes())?,
+    };
+    ctx.attn_decode_q8(&stream, call)?;
+    stream.synchronize()?;
+    Ok(testkit::floats(&testkit::read_bytes(&ctx, &out, out_len)))
+}
+
+/// (e) The stored NaN group reaches attention (G-KV8 item R-A): a visible cache cell whose K
+/// and V group 0 hold the fp16 NaN scale the NaN-propagating `kv8_append` kernel stores (the
+/// output pin of `kv8_append/tests.rs`) makes every dimension of the 8 query heads of that kv
+/// head non-finite; the other kv head's heads stay finite. The reference is not used: this is a
+/// pure finiteness pin of the poison rule.
+#[test]
+fn attn_decode_q8_poison_reaches_the_heads_of_a_nan_stored_group() {
+    if !testkit::device_present("attn_decode_q8_poison_reaches_the_heads_of_a_nan_stored_group") {
+        return;
+    }
+    let spec = Spec::qwen(1, 33);
+    let kvh = 1usize;
+    let mut p = problem(&spec, false);
+    let groups = spec.head_dim / 32;
+    let cell = spec.cell_of(i64::from(spec.kv_len) - 1);
+    let at = kvh * spec.cells * groups + cell * groups;
+    p.k_scales[at] = F16_NAN;
+    p.v_scales[at] = F16_NAN;
+    let out = poison_device_phase(&p).expect("the device phase of the poison row");
+    // Host data only from here (the phase dropped every owner before it returned).
+    for h in 0..spec.n_head {
+        let row = &out[h * spec.head_dim..][..spec.head_dim];
+        if h / GROUP == kvh {
+            assert!(
+                row.iter().all(|x| x.is_nan()),
+                "head {h}: a NaN stored group must poison every dimension: {}",
+                spec.label()
+            );
+        } else {
+            assert!(
+                row.iter().all(|x| x.is_finite()),
+                "head {h}: the other kv head must stay finite: {}",
+                spec.label()
+            );
+        }
+    }
 }
 
 #[test]
@@ -677,8 +933,13 @@ impl Plan {
 }
 
 /// Runs the call of `plan` (buffers sized by the slots; the length word is 1) and returns the
-/// result and the `out` bytes afterwards. `other` supplies the foreign stream and buffer.
-fn attempt(rig: &Rig, other: &Rig, plan: &Plan) -> (Result<(), EngError>, Vec<u8>) {
+/// result of the call and the `out` bytes afterwards through `?`. `other` supplies the foreign
+/// stream and buffer. Called only inside a Result-only device phase.
+fn attempt(
+    rig: &Rig,
+    other: &Rig,
+    plan: &Plan,
+) -> Result<(Result<(), EngError>, Vec<u8>), EngError> {
     let (ctx, s) = (&rig.ctx, &plan.spec);
     let content = |i: usize, slot: &Slot| -> Vec<u8> {
         let mut bytes = vec![if i == OUT { 0xFF } else { 0 }; slot.offset + slot.bytes];
@@ -691,22 +952,23 @@ fn attempt(rig: &Rig, other: &Rig, plan: &Plan) -> (Result<(), EngError>, Vec<u8
         .slots
         .iter()
         .enumerate()
-        .map(|(i, slot)| testkit::upload_bytes(ctx, &content(i, slot)))
-        .collect();
-    let shared = plan.alias.map(|(a, b)| {
-        let bytes = plan.slots[a].bytes.max(plan.slots[b].bytes);
-        (a, b, testkit::upload_filled(ctx, 0xFF, bytes))
-    });
-    let foreign = testkit::upload_filled(&other.ctx, 0, plan.slots[Q].bytes);
-    let range = |i: usize| -> DeviceRange<'_> {
+        .map(|(i, slot)| upload_bytes(ctx, &content(i, slot)))
+        .collect::<Result<_, _>>()?;
+    let shared = plan
+        .alias
+        .map(|(a, b)| -> Result<_, EngError> {
+            let bytes = plan.slots[a].bytes.max(plan.slots[b].bytes);
+            Ok((a, b, upload_filled(ctx, 0xFF, bytes)?))
+        })
+        .transpose()?;
+    let foreign = upload_filled(&other.ctx, 0, plan.slots[Q].bytes)?;
+    let range = |i: usize| -> Result<DeviceRange<'_>, EngError> {
         let buffer = match &shared {
             Some((a, b, buf)) if i == *a || i == *b => buf,
             _ if i == Q && plan.foreign_q => &foreign,
             _ => &bufs[i],
         };
-        buffer
-            .range(plan.slots[i].offset, plan.slots[i].bytes)
-            .expect("range")
+        buffer.range(plan.slots[i].offset, plan.slots[i].bytes)
     };
     let call = AttnDecodeQ8Call {
         shape: AttnQ8Shape {
@@ -716,15 +978,15 @@ fn attempt(rig: &Rig, other: &Rig, plan: &Plan) -> (Result<(), EngError>, Vec<u8
         span: s.span(),
         split: s.split,
         scale: plan.scale,
-        q: range(Q),
-        proj: s.gate.then(|| range(PROJ)),
-        k_codes: range(KC),
-        k_scales: range(KS),
-        v_codes: range(VC),
-        v_scales: range(VS),
-        kv_len: range(KV),
-        part: range(PART),
-        out: range(OUT),
+        q: range(Q)?,
+        proj: if s.gate { Some(range(PROJ)?) } else { None },
+        k_codes: range(KC)?,
+        k_scales: range(KS)?,
+        v_codes: range(VC)?,
+        v_scales: range(VS)?,
+        kv_len: range(KV)?,
+        part: range(PART)?,
+        out: range(OUT)?,
     };
     let stream = if plan.foreign_stream {
         &other.stream
@@ -734,11 +996,9 @@ fn attempt(rig: &Rig, other: &Rig, plan: &Plan) -> (Result<(), EngError>, Vec<u8
     let result = ctx.attn_decode_q8(stream, call);
     stream
         .synchronize()
-        .unwrap_or_else(|e| panic!("{}: drain: {e:?}", plan.label));
-    (
-        result,
-        testkit::read_bytes(ctx, &bufs[OUT], plan.slots[OUT].bytes),
-    )
+        .map_err(|error| labelled(plan.label, error))?;
+    let out = read_bytes(ctx, &bufs[OUT], plan.slots[OUT].bytes)?;
+    Ok((result, out))
 }
 
 type Edit = fn(&mut Plan);
@@ -931,20 +1191,71 @@ fn accepted() -> Vec<(&'static str, Edit)> {
     ]
 }
 
+/// One attempted call: the result of the call, the `out` bytes afterwards, and whether the
+/// plan aliased two ranges (whose launch may legally write `out`).
+struct Attempt {
+    result: Result<(), EngError>,
+    out: Vec<u8>,
+    aliased: bool,
+}
+
+/// The whole device phase of the refusal test: the base call, every refusal row and every
+/// accepted row, then the base call again. Both rigs drop with every buffer before the plain
+/// attempts return, so the asserts below never run inside a live backend (S3b).
+struct RefusalPhase {
+    first: Attempt,
+    rows: Vec<Attempt>,
+    accepted: Vec<Attempt>,
+    again: Attempt,
+}
+
+fn refusal_phase(
+    rows: &[Row],
+    accepted_rows: &[(&'static str, Edit)],
+) -> Result<RefusalPhase, EngError> {
+    let (rig, other) = (Rig::new()?, Rig::new()?);
+    let run = |plan: &Plan| -> Result<Attempt, EngError> {
+        let (result, out) = attempt(&rig, &other, plan)?;
+        Ok(Attempt {
+            result,
+            out,
+            aliased: plan.alias.is_some(),
+        })
+    };
+    let first = run(&Plan::base())?;
+    let mut attempts = Vec::new();
+    for (label, _needle, edit) in rows {
+        let mut plan = Plan::base();
+        plan.label = label;
+        edit(&mut plan);
+        attempts.push(run(&plan)?);
+    }
+    let mut accepted_attempts = Vec::new();
+    for (label, edit) in accepted_rows {
+        let mut plan = Plan::base();
+        plan.label = label;
+        edit(&mut plan);
+        accepted_attempts.push(run(&plan)?);
+    }
+    let again = run(&Plan::base())?;
+    Ok(RefusalPhase {
+        first,
+        rows: attempts,
+        accepted: accepted_attempts,
+        again,
+    })
+}
+
 #[test]
 fn attn_decode_q8_rejects_bad_calls_before_any_launch() {
     if !testkit::device_present("attn_decode_q8_rejects_bad_calls_before_any_launch") {
         return;
     }
-    let (rig, other) = (Rig::new(), Rig::new());
-    let (first, first_out) = attempt(&rig, &other, &Plan::base());
-    first.expect("the base call is valid");
-    for (label, needle, edit) in refusals() {
-        let mut plan = Plan::base();
-        plan.label = label;
-        edit(&mut plan);
-        let (result, out) = attempt(&rig, &other, &plan);
-        let message = match result {
+    let (rows, accepted_rows) = (refusals(), accepted());
+    let phase = refusal_phase(&rows, &accepted_rows).expect("the device phase of the refusal test");
+    phase.first.result.expect("the base call is valid");
+    for ((label, needle, _edit), attempt) in rows.iter().zip(&phase.rows) {
+        let message = match &attempt.result {
             Err(EngError::BadRequest(message)) => message,
             other => panic!("{label}: expected a BadRequest, got {other:?}"),
         };
@@ -953,30 +1264,41 @@ fn attn_decode_q8_rejects_bad_calls_before_any_launch() {
             "{label}: expected {needle:?}, got {message:?}"
         );
         assert!(
-            plan.alias.is_some() || out.iter().all(|&b| b == 0xFF),
+            attempt.aliased || attempt.out.iter().all(|&b| b == 0xFF),
             "{label}: out changed"
         );
     }
-    for (label, edit) in accepted() {
-        let mut plan = Plan::base();
-        edit(&mut plan);
-        let (result, out) = attempt(&rig, &other, &plan);
-        result.unwrap_or_else(|error| panic!("{label}: {error:?}"));
+    for ((label, _edit), attempt) in accepted_rows.iter().zip(&phase.accepted) {
+        if let Err(error) = &attempt.result {
+            panic!("{label}: {error:?}");
+        }
         assert!(
-            testkit::floats(&out).iter().all(|x| x.is_finite()),
+            testkit::floats(&attempt.out).iter().all(|x| x.is_finite()),
             "{label}"
         );
     }
-    let (again, again_out) = attempt(&rig, &other, &Plan::base());
-    again.expect("the backend is usable after the refusals");
-    assert_eq!(first_out, again_out, "the base call after the refusals");
+    phase
+        .again
+        .result
+        .expect("the backend is usable after the refusals");
+    assert_eq!(
+        phase.first.out, phase.again.out,
+        "the base call after the refusals"
+    );
 }
 
 // ---- the split-combine order, pinned bit-exactly against the kernel's own partials ----
 
-/// The gate value of every gate row of the pin: `expf(-30)` is about 9.4e-14, far below half
-/// an ulp of 1, so `1 + expf(-30)` and the sigmoid are exactly 1 on the host and the device.
-const PIN_GATE: f32 = 30.0;
+/// The gate value of every gate row of the pin: 0, so the sigmoid `1 / (1 + expf(-0))` is
+/// exactly 0.5 on the host and the device (the former value 30 made it exactly 1, which left
+/// the combine's `* sig` stage unpinned: a kernel that drops it changed no bit).
+const PIN_GATE: f32 = 0.0;
+
+/// The K scale of a skewed split's hot key, the plain hot key scale, and the filler scale of
+/// the pin. The skew and the near-hot filler gaps are both expressed through this pair.
+const HOT_SCALE: f32 = 512.0;
+const PLAIN_SCALE: f32 = 1.0;
+const FILLER_SCALE: f32 = 1.0 / 64.0;
 
 /// `split_plan` of `attn_decode_q8.cu` on the host (all integers, so exact): `n_active` splits
 /// of `chunk` keys, a multiple of the 64-key tile, cover `count` keys.
@@ -1008,7 +1330,22 @@ fn pin_visible(spec: &Spec, t: usize) -> (i64, usize) {
 /// splits fresh patterns at 2^-16: the index-order A sum cancels split 0 against split 1 and
 /// keeps an odd multiple of 127 * 2^-16 of the rest, while any other order must round at the
 /// ulp of the ±508 terms and lands a 2^-16 off every element.
-fn pin_problem(spec: &Spec, skew: Option<usize>, seed: u64) -> Problem {
+///
+/// With `near_hot` every split also holds one NEAR-HOT key at its second position: the hot
+/// codes at the f16 scale `1 - (s + 1) * 2^-10` (every step an exact f16), so its score sits
+/// `delta_s = (1 - scale_s) * hot` strictly below the shared split maximum while every filler
+/// still underflows to +0. Its probability `expf(-delta_s)` makes the partials
+/// `l_s = 1 + expf(-delta_s)` distinct, non-dyadic f32 values, which the device computes and
+/// the pin reads back: the L fmaf sum of the combine then rounds differently in split-index
+/// order than in any other order. Without it every `l_s` is exactly 1 (the weight of the one
+/// hot key) and L is 8 in every order, so the A-tuned patterns cannot see the L loop at all.
+/// The near-hot V is filler V; its contribution to `a[dim]` is whatever the device computed,
+/// because the pin compares against the device's own partials: the partials need not be exact,
+/// only the shared split maxima do. Returns the problem and the f64 score gap the case opens:
+/// between the skewed split's hot key and the others' with a skew, between the hot key and the
+/// fillers of every split with `near_hot` (the filler gap the test holds above the expf
+/// underflow line), and 0.0 otherwise.
+fn pin_problem(spec: &Spec, skew: Option<usize>, near_hot: bool, seed: u64) -> (Problem, f64) {
     use std::collections::HashMap;
     let mut rng = Rng::new(seed);
     let (d, groups) = (spec.head_dim, spec.head_dim / 32);
@@ -1032,6 +1369,22 @@ fn pin_problem(spec: &Spec, skew: Option<usize>, seed: u64) -> Problem {
             hot.insert(spec.cell_of(first + s as i64 * chunk as i64), s);
         }
     }
+    // The near-hot cells (the second visible key of every split, when the case asks for them;
+    // every split of the plan holds at least two keys), mapped to their split index the same
+    // way. A cell that is both hot (for one token) and near (for another) stays hot: the hot
+    // map wins the classification below.
+    let mut near = HashMap::new();
+    if near_hot {
+        for t in 0..spec.m {
+            let (first, count) = pin_visible(spec, t);
+            let (chunk, n_active) = pin_split_plan(count, spec.split);
+            for s in 0..n_active {
+                if s * chunk + 1 < count {
+                    near.insert(spec.cell_of(first + (s * chunk + 1) as i64), s);
+                }
+            }
+        }
+    }
     let readable = spec.readable();
     let mut q = Vec::with_capacity(spec.m * spec.n_head * d);
     let (mut k_codes, mut k_scales) = (Vec::new(), Vec::new());
@@ -1039,7 +1392,11 @@ fn pin_problem(spec: &Spec, skew: Option<usize>, seed: u64) -> Problem {
     for k in 0..spec.n_kv_head {
         for (cell, &read) in readable.iter().enumerate() {
             let (kc, ks, vc, vs): (Vec<i8>, f32, Vec<i8>, f32) = if let Some(&s) = hot.get(&cell) {
-                let hot_k = if Some(s) == skew { 512.0 } else { 1.0 };
+                let hot_k = if Some(s) == skew {
+                    HOT_SCALE
+                } else {
+                    PLAIN_SCALE
+                };
                 let hot_codes: Vec<i8> = q0[k]
                     .iter()
                     .map(|&x| if x >= 0.0 { 127 } else { -127 })
@@ -1051,9 +1408,24 @@ fn pin_problem(spec: &Spec, skew: Option<usize>, seed: u64) -> Problem {
                     _ => (pattern(&mut rng), 1.0 / 65536.0),
                 };
                 (hot_codes, hot_k, vc, vs)
+            } else if let Some(&s) = near.get(&cell) {
+                // The near-hot key of split `s`: the hot codes at the f16 scale
+                // `1 - (s + 1) / 1024`, one step of 2^-10 further from 1 per split, so its
+                // score sits `delta_s` below the split maximum and `l_s` differs per split.
+                let near_codes: Vec<i8> = q0[k]
+                    .iter()
+                    .map(|&x| if x >= 0.0 { 127 } else { -127 })
+                    .collect();
+                let fill = |rng: &mut Rng| (0..d).map(|_| filler(rng)).collect::<Vec<i8>>();
+                (
+                    near_codes,
+                    PLAIN_SCALE - ((s + 1) as f32) / 1024.0,
+                    fill(&mut rng),
+                    FILLER_SCALE,
+                )
             } else if read {
                 let fill = |rng: &mut Rng| (0..d).map(|_| filler(rng)).collect::<Vec<i8>>();
-                (fill(&mut rng), 1.0 / 64.0, fill(&mut rng), 1.0 / 64.0)
+                (fill(&mut rng), FILLER_SCALE, fill(&mut rng), FILLER_SCALE)
             } else {
                 // A cell no token may read: poison, as `codes` above.
                 (vec![-128; d], f32::NAN, vec![-128; d], f32::NAN)
@@ -1074,15 +1446,41 @@ fn pin_problem(spec: &Spec, skew: Option<usize>, seed: u64) -> Problem {
     } else {
         Vec::new()
     };
-    Problem {
-        spec: spec.clone(),
-        q: q.repeat(spec.m),
-        proj,
-        k_codes,
-        k_scales,
-        v_codes,
-        v_scales,
-    }
+    // The f64 gap the case opens for one kv head, from the scale difference between its hot
+    // key (`127 * sign(q)` codes) and the keys below it: with a skew the hot key of the skewed
+    // split is at HOT_SCALE against the others' PLAIN_SCALE; with `near_hot` the plain hot key
+    // is at PLAIN_SCALE against fillers whose score is at most `127 * sum |q| / 64`, so the
+    // gap is `scale * 127 * (PLAIN_SCALE - FILLER_SCALE) * sum |q|`. The minimum over the kv
+    // heads is what the test holds above the expf underflow line.
+    let gap = |factor: f32| {
+        q0.iter()
+            .map(|q| {
+                f64::from(spec.scale())
+                    * 127.0
+                    * f64::from(factor)
+                    * q.iter().fold(0.0, |sum, &x| sum + f64::from(x.abs()))
+            })
+            .fold(f64::INFINITY, f64::min)
+    };
+    let gap = if skew.is_some() {
+        gap(HOT_SCALE - PLAIN_SCALE)
+    } else if near_hot {
+        gap(PLAIN_SCALE - FILLER_SCALE)
+    } else {
+        0.0
+    };
+    (
+        Problem {
+            spec: spec.clone(),
+            q: q.repeat(spec.m),
+            proj,
+            k_codes,
+            k_scales,
+            v_codes,
+            v_scales,
+        },
+        gap,
+    )
 }
 
 /// The combine of `attn_q8_combine_k` in f32, from the device partials of `part`: the exact
@@ -1091,7 +1489,7 @@ fn pin_problem(spec: &Spec, skew: Option<usize>, seed: u64) -> Problem {
 /// order read from the kernel. The data of the pin admits only two `expf` inputs: `m_s - M` is
 /// 0 (the split maxima have the same bits, and `expf(0)` is exactly 1 in every implementation)
 /// or, for the skewed split, deeply negative (`e^x` underflows to +0 on the host and the device
-/// alike); the gate value 30 makes `1 + expf(-30)` exactly 1 on both. So `f32::exp` matches the
+/// alike); the gate value 0 makes the sigmoid exactly 0.5 on both. So `f32::exp` matches the
 /// device `expf` bit for bit, `mul_add` is fmaf and `+`, `*`, `/` are IEEE on both: the replica
 /// shares every bit with the kernel and needs no ulp tolerance. Reversing the sums (m7) changes
 /// the A sum of every element by a 2^-16 step, far beyond any tolerance.
@@ -1134,20 +1532,24 @@ fn pin_host_combine(p: &Problem, t: usize, h: usize, part: &[f32]) -> Vec<f32> {
         .collect()
 }
 
-/// One case of the pin on the device: geometry, the skewed split (none or 1) and the seed.
+/// One case of the pin on the device: geometry, the skewed split (none or 1), whether every
+/// split also holds a near-hot key, and the seed.
 struct PinCase {
     label: &'static str,
     spec: Spec,
     skew: Option<usize>,
+    near_hot: bool,
     seed: u64,
 }
 
-/// One device result: the case label, its problem, the device `out` and the device `part`.
+/// One device result: the case label, its problem, the device `out`, the device `part`, and
+/// the f64 score gap the case opened (0.0 without a skew or near-hot fillers).
 struct PinOutcome {
     label: &'static str,
     problem: Problem,
     out: Vec<f32>,
     part: Vec<f32>,
+    gap: f64,
 }
 
 /// Uploads the problem (`part` starts as NaN, so a read the kernel must not make is visible),
@@ -1160,15 +1562,15 @@ fn pin_launch(
     let s = &p.spec;
     let part_bytes = attn_q8_part_bytes(s.m, s.n_kv_head, s.head_dim, s.split.max_splits)?;
     let out_bytes = s.m * s.n_head * s.head_dim * 4;
-    let q = testkit::upload_f32(ctx, &p.q);
-    let proj = s.gate.then(|| testkit::upload_f32(ctx, &p.proj));
-    let k_codes = testkit::upload_bytes(ctx, &le_i8(&p.k_codes));
-    let k_scales = testkit::upload_bytes(ctx, &le16(&p.k_scales));
-    let v_codes = testkit::upload_bytes(ctx, &le_i8(&p.v_codes));
-    let v_scales = testkit::upload_bytes(ctx, &le16(&p.v_scales));
-    let word = testkit::upload_bytes(ctx, &s.kv_len.to_le_bytes());
-    let part = testkit::upload_bytes(ctx, &part_content(part_bytes, PartFill::Nan));
-    let out = testkit::upload_filled(ctx, 0xFF, out_bytes);
+    let q = upload_f32(ctx, &p.q)?;
+    let proj = s.gate.then(|| upload_f32(ctx, &p.proj)).transpose()?;
+    let k_codes = upload_bytes(ctx, &le_i8(&p.k_codes))?;
+    let k_scales = upload_bytes(ctx, &le16(&p.k_scales))?;
+    let v_codes = upload_bytes(ctx, &le_i8(&p.v_codes))?;
+    let v_scales = upload_bytes(ctx, &le16(&p.v_scales))?;
+    let word = upload_bytes(ctx, &s.kv_len.to_le_bytes())?;
+    let part = upload_bytes(ctx, &part_content(part_bytes, PartFill::Nan))?;
+    let out = upload_filled(ctx, 0xFF, out_bytes)?;
     ctx.attn_decode_q8(
         stream,
         AttnDecodeQ8Call {
@@ -1176,45 +1578,88 @@ fn pin_launch(
             span: s.span(),
             split: s.split,
             scale: s.scale(),
-            q: whole(&q),
-            proj: proj.as_ref().map(whole),
-            k_codes: whole(&k_codes),
-            k_scales: whole(&k_scales),
-            v_codes: whole(&v_codes),
-            v_scales: whole(&v_scales),
-            kv_len: whole(&word),
-            part: whole(&part),
-            out: whole(&out),
+            q: whole(&q)?,
+            proj: proj.as_ref().map(whole).transpose()?,
+            k_codes: whole(&k_codes)?,
+            k_scales: whole(&k_scales)?,
+            v_codes: whole(&v_codes)?,
+            v_scales: whole(&v_scales)?,
+            kv_len: whole(&word)?,
+            part: whole(&part)?,
+            out: whole(&out)?,
         },
     )?;
     stream.synchronize()?;
     Ok((
-        testkit::floats(&testkit::read_bytes(ctx, &out, out_bytes)),
-        testkit::floats(&testkit::read_bytes(ctx, &part, part_bytes)),
+        testkit::floats(&read_bytes(ctx, &out, out_bytes)?),
+        testkit::floats(&read_bytes(ctx, &part, part_bytes)?),
     ))
 }
 
 /// The device phase: one launch per case, every device owner (buffers, stream, context) dropped
 /// before the plain vectors return, so the assertions below cannot unwind through a drop (S3b).
-fn pin_device_phase(cases: &[PinCase]) -> Result<Vec<PinOutcome>, EngError> {
+fn pin_device_phase<'a>(
+    cases: impl IntoIterator<Item = &'a PinCase>,
+) -> Result<Vec<PinOutcome>, EngError> {
     let ctx = CudaContext::new()?;
     let stream = ctx.stream()?;
     let mut outcomes = Vec::new();
     for case in cases {
-        let problem = pin_problem(&case.spec, case.skew, case.seed);
+        let (problem, gap) = pin_problem(&case.spec, case.skew, case.near_hot, case.seed);
         let (out, part) = pin_launch(&ctx, &stream, &problem)?;
         outcomes.push(PinOutcome {
             label: case.label,
             problem,
             out,
             part,
+            gap,
         });
     }
     Ok(outcomes)
 }
 
+/// The combine's L sums of one case, in f32, from the device partials of `part`: the exact
+/// block max, the weights `expf(m_s - M)` and the `fmaf` chain exactly as the kernel sums them
+/// (`L = fmaf(s_l[s], s_w[s], L)`). One `(index, reversed)` pair per (token, kv head,
+/// query-head group); the case is blind to the L order when every pair is bit-equal.
+fn pin_l_orders(p: &Problem, part: &[f32]) -> Vec<(f32, f32)> {
+    let s = &p.spec;
+    let max_splits = s.split.max_splits;
+    let mut orders = Vec::new();
+    for t in 0..s.m {
+        let (_, count) = pin_visible(s, t);
+        let (_, n_active) = pin_split_plan(count, s.split);
+        for kvh in 0..s.n_kv_head {
+            let cell0 = (t * s.n_kv_head + kvh) * max_splits;
+            for g in 0..GROUP {
+                let at = |split: usize| (cell0 + split) * GROUP * 2 + g * 2;
+                let top = (0..n_active).fold(f32::NEG_INFINITY, |m, split| m.max(part[at(split)]));
+                let weights: Vec<f32> = (0..n_active)
+                    .map(|split| (part[at(split)] - top).exp())
+                    .collect();
+                let mut index = 0.0f32;
+                let mut reversed = 0.0f32;
+                for split in 0..n_active {
+                    index = part[at(split) + 1].mul_add(weights[split], index);
+                }
+                for split in (0..n_active).rev() {
+                    reversed = part[at(split) + 1].mul_add(weights[split], reversed);
+                }
+                orders.push((index, reversed));
+            }
+        }
+    }
+    orders
+}
+
 /// The combine order of `attn_decode_q8` (KV8), pinned bit-exactly: the device `out` must equal
 /// an index-order host combine of the partials the kernel itself left in `part` (IMPL-KV8-M7).
+/// The A-tuned cases pin the A sum, the near-hot cases pin the L sum (their `l_s` are distinct
+/// non-dyadic values, and a precondition on the device's own partials fails the test before the
+/// pin if a case cannot see the reversed order), the skewed case pins the max and underflow
+/// paths of the weights, and the gate value 0 pins the final `* sigmoid` factor. Every output
+/// element is asserted finite before the bit comparison, so no NaN payload can pass it
+/// vacuously.
 #[test]
 fn attn_decode_q8_combine_is_bit_equal_to_an_index_order_host_combine_of_its_partials() {
     if !testkit::device_present(
@@ -1234,18 +1679,24 @@ fn attn_decode_q8_combine_is_bit_equal_to_an_index_order_host_combine_of_its_par
     // 1017..1020: chunk 128, 8 active splits (8 for every token of m = 4). The ring case gives
     // count 512: chunk 64, 8 splits. The skewed case is the Qwen shape with the hot K of split
     // 1 at scale 512, so its partial maximum sits ~5e5 above the others: every other weight
-    // underflows to +0 and the split maxima differ by orders of magnitude.
+    // underflows to +0 and the split maxima differ by orders of magnitude. The near-hot cases
+    // (three extra seeds, so one blind draw cannot hide the L order) keep every split maximum
+    // tied (every weight exactly `expf(0) = 1`) and give every split a distinct non-dyadic
+    // `l_s`, so the L sum alone re-rounds under a reversed order. The four near-hot cases are
+    // probed first and each must show a reversed L that differs in at least one bit.
     let cases = vec![
         PinCase {
             label: "qwen m=1 d=256 gate, 8 splits",
             spec: qwen(1, 1024, 1200),
             skew: None,
+            near_hot: false,
             seed: 0x51,
         },
         PinCase {
             label: "qwen m=4 d=256 gate, 8 splits",
             spec: qwen(4, 1017, 1024),
             skew: None,
+            near_hot: false,
             seed: 0x52,
         },
         PinCase {
@@ -1260,17 +1711,95 @@ fn attn_decode_q8_combine_is_bit_equal_to_an_index_order_host_combine_of_its_par
                 ..Spec::other(128, 512, 520, 520, false)
             },
             skew: None,
+            near_hot: false,
             seed: 0x53,
         },
         PinCase {
             label: "qwen m=1, split 1 K scale 512, 8 splits",
             spec: qwen(1, 1024, 1200),
             skew: Some(1),
+            near_hot: false,
             seed: 0x54,
         },
+        PinCase {
+            label: "qwen m=1 d=256 gate, 8 near-hot splits, tied maxima",
+            spec: qwen(1, 1024, 1200),
+            skew: None,
+            near_hot: true,
+            seed: 0x55,
+        },
+        PinCase {
+            label: "qwen m=1 d=256 gate, 8 near-hot splits, seed 0x56",
+            spec: qwen(1, 1024, 1200),
+            skew: None,
+            near_hot: true,
+            seed: 0x56,
+        },
+        PinCase {
+            label: "qwen m=1 d=256 gate, 8 near-hot splits, seed 0x57",
+            spec: qwen(1, 1024, 1200),
+            skew: None,
+            near_hot: true,
+            seed: 0x57,
+        },
+        PinCase {
+            label: "qwen m=1 d=256 gate, 8 near-hot splits, seed 0x58",
+            spec: qwen(1, 1024, 1200),
+            skew: None,
+            near_hot: true,
+            seed: 0x58,
+        },
     ];
+    // MAJOR F1: each near-hot case must see a reversed L sum in the device's own partials BY
+    // CONSTRUCTION, not by the luck of the rounding. This probe runs before the pin's device
+    // phase; a blind case fails loudly here with its label instead of passing the bit
+    // comparison. The probe is one extra launch per near-hot case, the same launch the pin
+    // makes (deterministic kernel, same inputs), so the checked l set is the pinned one.
+    let probed = pin_device_phase(cases.iter().filter(|case| case.near_hot))
+        .expect("the probe phase of the near-hot L preconditions");
+    for outcome in &probed {
+        let orders = pin_l_orders(&outcome.problem, &outcome.part);
+        let differing: Vec<&(f32, f32)> = orders
+            .iter()
+            .filter(|(index, reversed)| index.to_bits() != reversed.to_bits())
+            .collect();
+        println!(
+            "precondition {}: {} of {} L sets differ in index and reversed order",
+            outcome.label,
+            differing.len(),
+            orders.len()
+        );
+        for (index, reversed) in differing.iter().take(1) {
+            println!(
+                "  first: index {:#010x} ({index:e}), reversed {:#010x} ({reversed:e})",
+                index.to_bits(),
+                reversed.to_bits()
+            );
+        }
+        assert!(
+            !differing.is_empty(),
+            "{}: the near-hot case cannot see the L order: all {} of its (token, kv head, \
+             group) L sets sum bit-identically in index and reversed order; reseed or reshape \
+             the case",
+            outcome.label,
+            orders.len()
+        );
+    }
     let outcomes = pin_device_phase(&cases).expect("the device phase of the combine pin");
-    for outcome in &outcomes {
+    for (case, outcome) in cases.iter().zip(&outcomes) {
+        if case.skew.is_some() || case.near_hot {
+            assert!(
+                outcome.gap >= 120.0,
+                "{}: the score gap {} is below the expf underflow line",
+                outcome.label,
+                outcome.gap
+            );
+        }
+        assert!(
+            outcome.out.iter().all(|x| x.is_finite()),
+            "{}: a non-finite device output element before the bit comparison",
+            outcome.label
+        );
         let spec = &outcome.problem.spec;
         for t in 0..spec.m {
             let (_, count) = pin_visible(spec, t);

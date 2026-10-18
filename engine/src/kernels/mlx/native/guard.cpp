@@ -16,6 +16,7 @@
 #include <cstdlib>
 #include <limits>
 #include <unistd.h>
+#include <mach/mach.h>
 
 #ifdef INFERENCE_NATIVE_FAULT_QUALIFICATION
 #include <atomic>
@@ -352,6 +353,17 @@ extern "C" int inference_mlx_array_new_data_managed_payload(
 extern "C" size_t inference_page_size() noexcept {
   const long size = sysconf(_SC_PAGESIZE);
   return size > 0 ? static_cast<size_t>(size) : 0;
+}
+
+extern "C" int inference_mlx_process_rss_bytes(std::uint64_t* bytes) noexcept {
+  mach_task_basic_info_data_t info{};
+  mach_msg_type_number_t count = MACH_TASK_BASIC_INFO_COUNT;
+  const kern_return_t status = task_info(
+      mach_task_self(), MACH_TASK_BASIC_INFO, reinterpret_cast<task_info_t>(&info), &count);
+  if (status != KERN_SUCCESS) return status;
+  if (count != MACH_TASK_BASIC_INFO_COUNT) return KERN_FAILURE;
+  *bytes = static_cast<std::uint64_t>(info.resident_size);
+  return KERN_SUCCESS;
 }
 
 extern "C" int inference_mlx_array_free(mlx_array array) noexcept {

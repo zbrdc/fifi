@@ -43,4 +43,8 @@ pub(crate) const PREFILL_STATUS_BOUND_VIOLATION: c_int = 0x8;
 pub(in crate::kernels::cuda) mod attn_prefill;
 pub(in crate::kernels::cuda) mod attn_prep_chunk;
 pub(in crate::kernels::cuda) mod gdn_scan_seq;
+pub(in crate::kernels::cuda) mod mmq_dense;
+pub(in crate::kernels::cuda) mod mmq_facts;
+pub(in crate::kernels::cuda) mod mmq_mmid;
+pub(in crate::kernels::cuda) mod mmq_quant;
 pub(in crate::kernels::cuda) mod swiglu_rows;

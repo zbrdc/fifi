@@ -98,17 +98,10 @@ pub(super) fn open(dir: &Path) -> RealCheckpoint {
     RealCheckpoint { ckpt, config }
 }
 
-/// The resident set size of this process in kilobytes, from `ps` (Mac and Linux).
+/// The current resident set size of this process in KiB.
 pub(super) fn rss_kb() -> u64 {
-    let out = std::process::Command::new("ps")
-        .args(["-o", "rss=", "-p", &std::process::id().to_string()])
-        .output()
-        .unwrap();
-    String::from_utf8(out.stdout)
-        .unwrap()
-        .trim()
-        .parse()
-        .unwrap()
+    crate::kernels::mlx::native::process_rss_bytes().expect("native process RSS query must succeed")
+        / 1024
 }
 
 #[cfg(test)]
@@ -140,6 +133,39 @@ mod tests {
             parse_activation(Some("f64")),
             Err("Q36_ACTIVATION must be unset, f32, or bf16, got \"f64\"".to_string()),
             "a bad word names the knob"
+        );
+    }
+
+    #[test]
+    #[ignore = "needs the Mac; run alone with --ignored"]
+    fn rss_tracks_current_mapped_pages_in_kib() {
+        let _serial = crate::native_test_lock();
+        let before = rss_kb();
+        assert!(before > 0, "initial RSS must be positive: {before} KiB");
+
+        let mut mapping = memmap2::MmapMut::map_anon(67_108_864).unwrap();
+        mapping.fill(0xa5);
+        std::hint::black_box(&mapping[..]);
+        let mapped = rss_kb();
+        drop(mapping);
+        let after_drop = rss_kb();
+
+        let growth = mapped
+            .checked_sub(before)
+            .expect("RSS must not decrease while the mapping is resident");
+        let release = mapped
+            .checked_sub(after_drop)
+            .expect("RSS must not increase after dropping the mapping");
+        let diagnostic = format!(
+            "rss_before_kb={before}, rss_mapped_kb={mapped}, rss_after_drop_kb={after_drop}"
+        );
+        assert!(
+            (64_512..=66_560).contains(&growth),
+            "mapped RSS growth was {growth} KiB; {diagnostic}"
+        );
+        assert!(
+            (64_512..=66_560).contains(&release),
+            "RSS release was {release} KiB; {diagnostic}"
         );
     }
 }

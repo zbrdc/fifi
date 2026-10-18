@@ -9,7 +9,6 @@
 use super::load_policy::{OOM_RETRIES, is_device_out_of_memory, tests::resident_bytes};
 use super::*;
 use crate::family::project::{DenseProjector, DenseWeight};
-use crate::kernels::cuda::device_count;
 use crate::weights::{GgufHeader, GgufLimits, dequantize};
 use std::{
     io::{self, BufReader, BufWriter, Read, Seek, SeekFrom, Write},
@@ -253,21 +252,7 @@ fn assert_error<T>(result: Result<T, EngError>, kind: &str, needle: &str) {
 
 /// Runs a device gate only where a device is visible. INFERENCE_CUDA_REQUIRE_DEVICE
 /// turns a missing device into a failure, so a GPU job cannot pass by skipping.
-pub(super) fn device_present(test: &str) -> bool {
-    let count = device_count().expect("CUDA device count query");
-    println!("CUDA devices visible: {count}");
-    if count > 0 {
-        return true;
-    }
-    let required = std::env::var("INFERENCE_CUDA_REQUIRE_DEVICE")
-        .is_ok_and(|value| !value.is_empty() && value != "0");
-    assert!(
-        !required,
-        "INFERENCE_CUDA_REQUIRE_DEVICE is set but no CUDA device is visible"
-    );
-    println!("SKIPPED {test}: no CUDA device");
-    false
-}
+pub(super) use crate::kernels::cuda::device_present;
 
 /// fp16 bits -> f32 from the fields, so the scale checks do not rely on the
 /// production decoder they are meant to check. Every fp16 value is exact in f32.

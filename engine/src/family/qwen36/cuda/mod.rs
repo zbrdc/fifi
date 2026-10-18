@@ -17,6 +17,8 @@ mod common_tests;
 mod dims;
 mod executor;
 #[cfg(test)]
+mod executor_tests;
+#[cfg(test)]
 mod export_tests;
 pub mod gate;
 #[cfg(test)]
@@ -51,9 +53,19 @@ mod native_tiered_device_tests;
 #[cfg(test)]
 mod ops_tests;
 mod pinned;
+mod prefill;
+#[cfg(test)]
+mod prefill_device_tests;
+mod prefill_driver;
+#[cfg(test)]
+mod prefill_driver_tests;
 mod prefill_plan;
 #[cfg(test)]
 mod prefill_plan_tests;
+#[cfg(test)]
+mod prefill_step_device_tests;
+#[cfg(test)]
+mod prefill_tests;
 mod prefix;
 #[cfg(test)]
 mod prefix_device_tests;

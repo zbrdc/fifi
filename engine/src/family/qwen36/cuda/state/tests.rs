@@ -8,7 +8,9 @@
 //!
 //! The suite is a seam-1 device suite in the style of `kernels::cuda::resident::<n>::tests`: a
 //! host with no device skips, `INFERENCE_CUDA_REQUIRE_DEVICE=1` turns the skip into a failure,
-//! and it runs with `--test-threads=1` on the device.
+//! and it runs with `--test-threads=1` on the device. Every test runs its device phase through
+//! `?` and reads plain host data back; the context, its stream and the pool drop with that
+//! phase, so the asserts below never unwind through a live backend (the S3b lesson).
 
 use super::super::super::host::HostShape;
 use super::super::book::Health;
@@ -18,31 +20,14 @@ use super::ResidentState;
 use crate::EngError;
 use crate::family::project::cuda::WeightLayout;
 use crate::family::{QWEN3_6_35B_A3B, gguf_model::Inventory};
+use crate::kernels::cuda::device_present;
 use crate::kernels::cuda::{CudaContext, DeviceStream};
 
-/// Mirrors `testkit::device_present` (private to `kernels::cuda`): a host with no device skips
-/// the test, unless `INFERENCE_CUDA_REQUIRE_DEVICE` turns the missing device into a failure.
-fn device_present(test: &str) -> bool {
-    let count = crate::kernels::cuda::device_count().expect("CUDA device count query");
-    println!("CUDA devices visible: {count}");
-    if count > 0 {
-        return true;
-    }
-    let required = std::env::var("INFERENCE_CUDA_REQUIRE_DEVICE")
-        .is_ok_and(|value| !value.is_empty() && value != "0");
-    assert!(
-        !required,
-        "INFERENCE_CUDA_REQUIRE_DEVICE is set but no CUDA device is visible"
-    );
-    println!("SKIPPED {test}: no CUDA device");
-    false
-}
-
 /// The checked dims of the Qwen3.6-35B-A3B step (CPU arithmetic only).
-fn dims() -> StepDims {
-    let shape = HostShape::from_spec(&QWEN3_6_35B_A3B, 64).expect("shape");
-    let inventory = Inventory::for_spec(&QWEN3_6_35B_A3B).expect("inventory");
-    StepDims::new(&shape, &inventory).expect("dims")
+fn dims() -> Result<StepDims, EngError> {
+    let shape = HostShape::from_spec(&QWEN3_6_35B_A3B, 64)?;
+    let inventory = Inventory::for_spec(&QWEN3_6_35B_A3B)?;
+    StepDims::new(&shape, &inventory)
 }
 
 fn options(mode: KvMode, context_tokens: usize) -> StepOptions {
@@ -65,11 +50,87 @@ struct Rig {
 }
 
 impl Rig {
-    fn new() -> Self {
-        let ctx = CudaContext::new().expect("context");
-        let stream = ctx.stream().expect("stream");
-        Self { ctx, stream }
+    fn new() -> Result<Self, EngError> {
+        let ctx = CudaContext::new()?;
+        let stream = ctx.stream()?;
+        Ok(Self { ctx, stream })
     }
+}
+
+/// One plane read back from the zeroed pool: its ordinal, plane, the layout extent, the range's
+/// own extent on the device, and whether every byte read back was zero.
+struct PlaneProbe {
+    ordinal: usize,
+    plane: Plane,
+    extent: (usize, usize),
+    range: (usize, usize),
+    zeroed: bool,
+}
+
+/// The host data of the zeroed Int8G32 pool after the phase returns (no device owner alive):
+/// the pinned per-token bytes, the pool sizes and modes, and every plane read back.
+struct ZeroedProbe {
+    per_token: (usize, usize),
+    layout_total: usize,
+    state_bytes: usize,
+    state_total: usize,
+    layout_mode: KvMode,
+    identity_mode: KvMode,
+    planes: Vec<PlaneProbe>,
+}
+
+/// The Result-only device phase of the zeroed-allocation test: prime the allocator with a dirty
+/// block of the pool's size, allocate the state over it, read every plane back, and return
+/// plain host data through `?`. The context, its stream and the state drop before the asserts.
+fn zeroed_phase() -> Result<ZeroedProbe, EngError> {
+    let rig = Rig::new()?;
+    let d = dims()?;
+    // The pinned per-position bytes of both modes (the existing CPU test pins the same pair).
+    let per_token = (
+        KvPool::bytes_per_token(&d, KvMode::Fp16)?,
+        KvPool::bytes_per_token(&d, KvMode::Int8G32)?,
+    );
+    let capacity = 8;
+    let layout = StateLayout::new(&d, &options(KvMode::Int8G32, capacity))?;
+    // Prime the allocator with a dirty block of the pool's size, so a missing zeroing leaves
+    // 0xFF bytes in the planes the state allocates next (fresh cudaMalloc pages are often zero).
+    let dirty = rig.ctx.allocate(layout.kv.total)?;
+    dirty.write_at(&rig.stream, 0, &vec![0xFF; layout.kv.total])?;
+    drop(dirty);
+    let state = ResidentState::allocate(
+        &rig.ctx,
+        &rig.stream,
+        &d,
+        &options(KvMode::Int8G32, capacity),
+    )?;
+    // Every plane of every attention layer reads back zero: scale 0 and code 0 everywhere.
+    let mut planes = Vec::new();
+    for ordinal in 0..layout.kv.layers {
+        for &plane in state.layout().kv.planes() {
+            let extent = state.layout().kv.plane_extent(ordinal, plane)?;
+            let range = state.kv_plane(ordinal, plane)?;
+            let mut out = vec![0u8; extent.1];
+            range
+                .buffer()
+                .read_at(&rig.stream, range.offset(), &mut out)?;
+            planes.push(PlaneProbe {
+                ordinal,
+                plane,
+                extent,
+                range: (range.offset(), range.bytes()),
+                zeroed: out.iter().all(|&byte| byte == 0),
+            });
+        }
+    }
+    Ok(ZeroedProbe {
+        per_token,
+        layout_total: layout.kv.total,
+        state_bytes: state.kv_bytes(),
+        state_total: state.layout().kv.total,
+        layout_mode: state.layout().kv.mode,
+        identity_mode: state.identity().kv_mode,
+        planes,
+    })
 }
 
 #[test]
@@ -77,55 +138,65 @@ fn int8g32_allocates_the_four_planes_zeroed_and_sized_by_the_layout() {
     if !device_present("int8g32_allocates_the_four_planes_zeroed_and_sized_by_the_layout") {
         return;
     }
-    let rig = Rig::new();
-    let d = dims();
-    // The pinned per-position bytes of both modes (the existing CPU test pins the same pair).
-    let per_token = (
-        KvPool::bytes_per_token(&d, KvMode::Fp16).expect("fp16 bytes"),
-        KvPool::bytes_per_token(&d, KvMode::Int8G32).expect("int8 bytes"),
-    );
-    assert_eq!(per_token, (20_480, 10_880));
-    let capacity = 8;
-    let layout = StateLayout::new(&d, &options(KvMode::Int8G32, capacity)).expect("layout");
-    // Prime the allocator with a dirty block of the pool's size, so a missing zeroing leaves
-    // 0xFF bytes in the planes the state allocates next (fresh cudaMalloc pages are often zero).
-    let dirty = rig.ctx.allocate(layout.kv.total).expect("dirty block");
-    dirty
-        .write_at(&rig.stream, 0, &vec![0xFF; layout.kv.total])
-        .expect("dirty write");
-    drop(dirty);
-    let state = ResidentState::allocate(
-        &rig.ctx,
-        &rig.stream,
-        &d,
-        &options(KvMode::Int8G32, capacity),
-    )
-    .expect("the Int8G32 allocation");
-    assert_eq!(state.kv_bytes(), layout.kv.total);
-    assert_eq!(state.layout().kv.total, layout.kv.total);
-    assert_eq!(state.layout().kv.mode, KvMode::Int8G32);
-    assert_eq!(state.identity().kv_mode, KvMode::Int8G32);
-    // Every plane of every attention layer reads back zero: scale 0 and code 0 everywhere.
-    for ordinal in 0..layout.kv.layers {
-        for &plane in state.layout().kv.planes() {
-            let (offset, bytes) = state
-                .layout()
-                .kv
-                .plane_extent(ordinal, plane)
-                .expect("extent");
-            let range = state.kv_plane(ordinal, plane).expect("plane");
-            assert_eq!((range.offset(), range.bytes()), (offset, bytes));
-            let mut out = vec![0u8; bytes];
-            range
-                .buffer()
-                .read_at(&rig.stream, range.offset(), &mut out)
-                .expect("read the plane");
-            assert!(
-                out.iter().all(|&byte| byte == 0),
-                "layer {ordinal} plane {plane:?} holds a non-zero byte"
-            );
-        }
+    let probe = zeroed_phase().expect("the device phase of the zeroed Int8G32 pool");
+    assert_eq!(probe.per_token, (20_480, 10_880));
+    assert_eq!(probe.state_bytes, probe.layout_total);
+    assert_eq!(probe.state_total, probe.layout_total);
+    assert_eq!(probe.layout_mode, KvMode::Int8G32);
+    assert_eq!(probe.identity_mode, KvMode::Int8G32);
+    for plane in &probe.planes {
+        assert_eq!(
+            plane.range, plane.extent,
+            "layer {} plane {:?}",
+            plane.ordinal, plane.plane
+        );
+        assert!(
+            plane.zeroed,
+            "layer {} plane {:?} holds a non-zero byte",
+            plane.ordinal, plane.plane
+        );
     }
+}
+
+/// The host data of the Fp16 allocation after the phase returns: the pool sizes and modes, the
+/// plane list and the zeroed status word.
+struct Fp16Probe {
+    layout_total: usize,
+    state_bytes: usize,
+    planes: Vec<Plane>,
+    kscales_extent: usize,
+    identity_mode: KvMode,
+    k_ok: bool,
+    v_ok: bool,
+    status: i32,
+}
+
+/// The Result-only device phase of the Fp16 test: allocate the Fp16 pool, read its layout and
+/// status word back, and return plain host data through `?`. The context, its stream and the
+/// state drop before the asserts.
+fn fp16_phase() -> Result<Fp16Probe, EngError> {
+    let rig = Rig::new()?;
+    let d = dims()?;
+    let capacity = 8;
+    let layout = StateLayout::new(&d, &options(KvMode::Fp16, capacity))?;
+    let state =
+        ResidentState::allocate(&rig.ctx, &rig.stream, &d, &options(KvMode::Fp16, capacity))?;
+    let kscales_extent = state.layout().kv.plane_extent(0, Plane::KScales)?.1;
+    let words = state.step_field(super::StepField::Status)?;
+    let mut out = [0u8; 4];
+    words
+        .buffer()
+        .read_at(&rig.stream, words.offset(), &mut out)?;
+    Ok(Fp16Probe {
+        layout_total: layout.kv.total,
+        state_bytes: state.kv_bytes(),
+        planes: state.layout().kv.planes().to_vec(),
+        kscales_extent,
+        identity_mode: state.identity().kv_mode,
+        k_ok: state.kv_plane(0, Plane::K).is_ok(),
+        v_ok: state.kv_plane(0, Plane::V).is_ok(),
+        status: i32::from_le_bytes(out),
+    })
 }
 
 #[test]
@@ -133,36 +204,38 @@ fn an_fp16_allocation_is_unchanged() {
     if !device_present("an_fp16_allocation_is_unchanged") {
         return;
     }
-    let rig = Rig::new();
-    let d = dims();
-    let capacity = 8;
-    let layout = StateLayout::new(&d, &options(KvMode::Fp16, capacity)).expect("layout");
-    let state =
-        ResidentState::allocate(&rig.ctx, &rig.stream, &d, &options(KvMode::Fp16, capacity))
-            .expect("the Fp16 allocation");
+    let probe = fp16_phase().expect("the device phase of the Fp16 allocation");
     // The Fp16 pool of the layout: two whole planes per layer, no scale planes, one allocation.
-    assert_eq!(state.layout().kv.planes(), &[Plane::K, Plane::V]);
-    assert_eq!(
-        state
-            .layout()
-            .kv
-            .plane_extent(0, Plane::KScales)
-            .expect("extent")
-            .1,
-        0
-    );
-    assert_eq!(state.kv_bytes(), layout.kv.total);
-    assert_eq!(state.identity().kv_mode, KvMode::Fp16);
-    assert!(state.kv_plane(0, Plane::K).is_ok());
-    assert!(state.kv_plane(0, Plane::V).is_ok());
+    assert_eq!(probe.planes, [Plane::K, Plane::V]);
+    assert_eq!(probe.kscales_extent, 0);
+    assert_eq!(probe.state_bytes, probe.layout_total);
+    assert_eq!(probe.identity_mode, KvMode::Fp16);
+    assert!(probe.k_ok);
+    assert!(probe.v_ok);
     // The words are zeroed (an invalid `StepParams`, `status` 0), as before.
-    let words = state.step_field(super::StepField::Status).expect("status");
-    let mut out = [0u8; 4];
-    words
-        .buffer()
-        .read_at(&rig.stream, words.offset(), &mut out)
-        .expect("read the status word");
-    assert_eq!(i32::from_le_bytes(out), 0);
+    assert_eq!(probe.status, 0);
+}
+
+/// The host data of the Int8G32 allocation after the phase returns: the plane count and the two
+/// scale-plane lookups.
+struct Int8Probe {
+    plane_count: usize,
+    k_scales_ok: bool,
+    v_scales_ok: bool,
+}
+
+/// The Result-only device phase of the refusal test. Before RD-8k this call answered
+/// BadRequest("the Int8G32 KV pool is allocated from RD-8k"); it must allocate now. The
+/// context, its stream and the state drop before the asserts.
+fn int8g32_phase() -> Result<Int8Probe, EngError> {
+    let rig = Rig::new()?;
+    let d = dims()?;
+    let state = ResidentState::allocate(&rig.ctx, &rig.stream, &d, &options(KvMode::Int8G32, 4))?;
+    Ok(Int8Probe {
+        plane_count: state.layout().kv.planes().len(),
+        k_scales_ok: state.kv_plane(0, Plane::KScales).is_ok(),
+        v_scales_ok: state.kv_plane(0, Plane::VScales).is_ok(),
+    })
 }
 
 /// One chunk of the recorded protocol: the word `read_prefill_status` returned, the
@@ -190,7 +263,7 @@ fn backend_operation(verdict: &Result<(), EngError>) -> Option<&str> {
 fn word_protocol() -> Result<Vec<Phase>, EngError> {
     let ctx = CudaContext::new()?;
     let stream = ctx.stream()?;
-    let mut state = ResidentState::allocate(&ctx, &stream, &dims(), &options(KvMode::Fp16, 8))?;
+    let mut state = ResidentState::allocate(&ctx, &stream, &dims()?, &options(KvMode::Fp16, 8))?;
     // The layer below this one: a prefill kernel ORs its bits into the word range.
     let or_bits = |st: &ResidentState, value: i32| -> Result<(), EngError> {
         let word = st.word(Word::PrefillStatus)?;
@@ -318,13 +391,9 @@ fn the_int8g32_refusal_is_gone() {
     if !device_present("the_int8g32_refusal_is_gone") {
         return;
     }
-    let rig = Rig::new();
-    let d = dims();
-    // Before RD-8k this call answered
-    // BadRequest("the Int8G32 KV pool is allocated from RD-8k"); it must allocate now.
-    let state = ResidentState::allocate(&rig.ctx, &rig.stream, &d, &options(KvMode::Int8G32, 4))
-        .unwrap_or_else(|error| panic!("the Int8G32 refusal is gone: {error:?}"));
-    assert_eq!(state.layout().kv.planes().len(), 4);
-    assert!(state.kv_plane(0, Plane::KScales).is_ok());
-    assert!(state.kv_plane(0, Plane::VScales).is_ok());
+    let probe =
+        int8g32_phase().unwrap_or_else(|error| panic!("the Int8G32 refusal is gone: {error:?}"));
+    assert_eq!(probe.plane_count, 4);
+    assert!(probe.k_scales_ok);
+    assert!(probe.v_scales_ok);
 }

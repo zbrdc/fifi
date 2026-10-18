@@ -1,0 +1,16 @@
+[package]
+name = "q36-check-real"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.98.1"
+publish = false
+
+[dependencies]
+inference-engine = { path = "../../../engine" }
+sha2 = "=0.10.9"
+
+[patch.crates-io]
+mlx-sys = { path = "../../../engine/vendor/mlx-sys" }
+
+[lints.rust]
+unsafe_code = "deny"

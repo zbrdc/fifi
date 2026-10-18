@@ -1,0 +1,5 @@
+--- /dev/null
++++ b/src/fake/made.cuh
+@@ -0,0 +1,2 @@
++// made by patch FX-2
++#define MADE 1

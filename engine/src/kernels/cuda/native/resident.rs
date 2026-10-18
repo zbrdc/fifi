@@ -50,6 +50,7 @@ pub(in crate::kernels::cuda) mod gdn_conv;
 pub(in crate::kernels::cuda) mod gdn_delta;
 pub(in crate::kernels::cuda) mod graph;
 pub(in crate::kernels::cuda) mod kv8_append;
+pub(in crate::kernels::cuda) mod mailbox;
 pub(in crate::kernels::cuda) mod matmul_expert;
 pub(in crate::kernels::cuda) mod matmul_q5_0;
 pub(in crate::kernels::cuda) mod matvec_expert;
@@ -61,6 +62,7 @@ pub(in crate::kernels::cuda) mod step_params;
 pub(in crate::kernels::cuda) mod swiglu_pack;
 pub(in crate::kernels::cuda) mod swiglu_q8;
 pub(in crate::kernels::cuda) mod tiered_classify;
+pub(in crate::kernels::cuda) mod tiered_wait_add;
 
 /// A non-blocking CUDA stream. Consumed by [`stream_destroy`].
 #[derive(Debug)]

@@ -49,15 +49,33 @@ struct Args {
     int m, n_kv_head, head_dim, cells;
 };
 
+// NaN-propagating max: `fmaxf` returns the other operand when one is NaN, so a group holding a
+// NaN would lose its poison at the first reduction round. A NaN operand `!=` itself and is
+// returned as that NaN; otherwise the pair is `fmaxf`. The two selects carry no branch, so the
+// reduction stays straight-line between the shuffles. Precondition: every caller passes `fabsf`
+// results (never a signed zero); the `fmaxf` fallback is bit-identical to `fmaxf` for every
+// non-NaN pair anyway. No extra shuffle round.
+__device__ inline float fmax_nan(float a, float b) {
+    const float m = fmaxf(a, b);
+    const float n = (b != b) ? b : m;
+    return (a != a) ? a : n;
+}
+
 __device__ inline float warp_max_a(float v) {
 #pragma unroll
-    for (int o = 16; o > 0; o >>= 1) v = fmaxf(v, __shfl_xor_sync(0xffffffffu, v, o));
+    for (int o = 16; o > 0; o >>= 1) v = fmax_nan(v, __shfl_xor_sync(0xffffffffu, v, o));
     return v;
 }
 
 __device__ inline float h2f(unsigned short bits) { return __half2float(__ushort_as_half(bits)); }
 
 // scale = amax / 127 rounded to fp16 (half even). An all-zero group stores 0.
+// Poison rule (G-KV8 item R-A, lane C ruling): a NaN anywhere among the group's 32 values
+// reaches `warp_max_a` and makes amax NaN, so the stored scale is an fp16 NaN. The codes may be
+// anything `quant_code` gives, but every dequantized value `code * f32(scale)` of that group is
+// then NaN, so the poison cannot vanish from the int8 KV (the fp16 KV path keeps the NaN, and
+// the argmax status mask 2 catches it downstream). A group whose values are all ±Inf keeps the
+// old behavior: scale +Inf, and every dequantized value is non-finite (0 * Inf = NaN).
 __device__ inline unsigned short quant_scale(float amax) {
     return __half_as_ushort(__float2half(amax / 127.f));
 }

@@ -122,6 +122,9 @@ trait HeadBackend {
 #[cfg(all(feature = "native-ane", target_os = "macos", target_arch = "aarch64"))]
 mod ane;
 
+#[cfg(test)]
+mod trained;
+
 struct CpuBackend;
 
 impl HeadBackend for CpuBackend {

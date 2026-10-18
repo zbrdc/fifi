@@ -50,9 +50,18 @@ SOFTWARE.
   - `pack_q8_0` in `engine/vendor/xavier-qwen/src/repack.cu:32`, from ggml `block_q8_0`. It moves `d` and `qs` bytes and computes no values.
   - `Q8_0::dq` in `engine/vendor/xavier-qwen/src/mma884.cuh:312`, from ggml `dequantize_row_q8_0`.
   - `DQ8::dq` in `engine/vendor/xavier-qwen/src/gemm.cuh:102`, from ggml `dequantize_row_q8_0`. The gemm path runs it for more than 16 tokens.
-  - The J/config tables in `engine/src/kernels/cuda/prefill/mmq_size.rs`, from ggml
-    `ggml-cuda/mmq-config-ampere.cuh` and `ggml-cuda/mmq-config-pascal-dp4a.cuh` at the same
-    pin (MIT-derived constants, data only; a test re-parses both vendored headers).
+- Derived, data only, outside the xavier-qwen tree: the J/config tables in
+  `engine/src/kernels/cuda/prefill/mmq_size.rs`, from ggml
+  `ggml-cuda/mmq-config-ampere.cuh` and `ggml-cuda/mmq-config-pascal-dp4a.cuh` at the same
+  pin (MIT-derived constants, data only; a test re-parses both vendored headers and
+  hash-pins the vendored J-selection loop).
+- Derived, logic only, outside the xavier-qwen tree: `fixup_need` in
+  `engine/src/kernels/cuda/native/prefill/mmq_dense.cu`, which re-expresses the tile-width
+  selection loop of ggml `ggml-cuda/mmq.cuh` (`mul_mat_q_switch_J`, vendored mmq.cuh:1444-1461)
+  and the stream-k block and fixup-size rule of `launch_mul_mat_q` (vendored
+  mmq.cuh:1395-1412) at the same pin, on top of the vendored config helpers (no code copied;
+  a test hash-pins both passages and a sweep cross-checks the function against the Rust
+  sizing).
 - Not derived: `dequant_256` in `engine/vendor/xavier-qwen/src/repack.cu:140` repeats no ggml Q4_K or Q6_K value logic. Its Q5_K branch calls `dequant_q5k`, listed above, and its other branches widen F32 and F16 values directly.
 
 ## ggml-cuda-mmq (llama.cpp CUDA MMQ and MMVQ kernels)
@@ -114,6 +123,16 @@ SOFTWARE.
 | `src/ops.h` | `0b747b26e6fb976a31c98dcc9eaa4f3235af380947475f9869d245da9968a6fa` |
 | `src/repack.cu` | `c80b8ff352664bbc12f8f3d8f08490949974cd523fea6ea399578f25522f20c5` |
 | `src/repack.h` | `4cda8ee5aa5ae1a4ce0c99d8a2f46b8806b6184d12146fa8f3b0890959fa922a` |
+
+## mlx-sys
+
+- Source: `mlx-sys` 0.6.0, https://github.com/oxiglade/mlx-rs.
+- File: `build.rs`, `src/lib.rs`, and `src/mlx-c/` in the vendored crate.
+- Taken: the compiled C library and the C type definitions. Every operation call goes through the engine's own `inference_mlx_*` shims in `engine/src/kernels/mlx/native/guard.cpp`.
+- Location: `engine/vendor/mlx-sys/`, pinned by `engine/Cargo.toml`.
+- Build: `build.rs` compiles the vendored mlx-c sources. Their `CMakeLists.txt` sets `MLX_C_VERSION` to 0.7.0 and fetches MLX at git tag `64ea011cb65f14d9ce2737e60db9a4ae91ed7441`.
+- Note: `engine/vendor/mlx-sys/README.md:5-6` records a different tuple (mlx-c `c74db5307cc8ce122f48d97ef951b30578674e7f`, MLX `v0.32.2`); the CMake pin is what this repository builds.
+- License: `Cargo.toml` declares `MIT OR Apache-2.0`. The crate ships both license files: `engine/vendor/mlx-sys/LICENSE-MIT` and `engine/vendor/mlx-sys/LICENSE-APACHE`.
 
 ## mlx-lm (gated delta kernel)
 

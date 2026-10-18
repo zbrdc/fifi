@@ -25,6 +25,7 @@ mod ops;
 mod parity;
 #[cfg(all(feature = "native-mlx", target_os = "macos", target_arch = "aarch64"))]
 mod ple;
+mod prefetch;
 #[cfg(all(feature = "native-mlx", target_os = "macos", target_arch = "aarch64"))]
 mod prefill;
 #[cfg(all(feature = "native-mlx", target_os = "macos", target_arch = "aarch64"))]
@@ -93,6 +94,8 @@ struct ResidentDecoder<'c> {
     weights: ResidentWeights,
     /// The fixed expert page pool: `POOL_SETS` sets sized for the largest layer (decision 0041).
     slots: ExpertSlots,
+    /// Default-off, record-only expert hints. Never changes the demand path.
+    expert_prefetch: prefetch::Prefetch,
     /// The prefill page sets (decision 0044 item 5), open from `open_prefill` to `close_prefill`.
     /// They drop after the adapter like the decode pool.
     prefill_pages: Option<prefill::step::Open>,
@@ -147,11 +150,17 @@ impl<'c> ResidentDecoder<'c> {
             ckpt,
             weights,
             slots,
+            expert_prefetch: prefetch::Prefetch::default(),
             prefill_pages: None,
             budget: SessionBudget::new(u64::MAX),
             #[cfg(test)]
             route_trace: None,
         })
+    }
+
+    /// Enables record-only hints. The executor sets this from `flash_next.expert_prefetch`.
+    fn set_expert_prefetch(&mut self, on: bool) {
+        self.expert_prefetch.enabled = on;
     }
 
     /// Mapped bytes of the expert page pool, fixed at `new` (decision 0041 Memory). MLX active

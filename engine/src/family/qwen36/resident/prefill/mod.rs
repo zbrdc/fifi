@@ -14,3 +14,5 @@ mod moe;
 #[cfg(test)]
 mod parity;
 pub(super) mod step;
+#[cfg(test)]
+mod timing;

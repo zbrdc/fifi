@@ -1,0 +1,191 @@
+{
+  "client_path": {
+    "contract": {
+      "chat_nonstream": {
+        "content": "Hello.",
+        "created": null,
+        "finish": "stop",
+        "model": null,
+        "object": null,
+        "usage.total_tokens": null
+      },
+      "chat_stream": {
+        "events": 3,
+        "finish": "stop",
+        "text": "Hello.",
+        "usage": 5
+      },
+      "models_list": [
+        "qwen3.6-35b-a3b"
+      ]
+    },
+    "proposed": {
+      "chat_nonstream": {
+        "content": "Hello.",
+        "created": 1790000000,
+        "finish": "stop",
+        "model": "qwen3.6-35b-a3b",
+        "object": "chat.completion",
+        "usage.total_tokens": 17
+      },
+      "chat_stream": {
+        "events": 4,
+        "finish": "stop",
+        "text": "Hello.",
+        "usage": 5
+      },
+      "models_list": [
+        "qwen3.6-35b-a3b"
+      ]
+    }
+  },
+  "contract_schema_errors": {
+    "contract_chat_completion": [],
+    "contract_chunks": [
+      [],
+      [],
+      []
+    ],
+    "contract_models": []
+  },
+  "declared_required": {
+    "ChatCompletion": [
+      "choices",
+      "created",
+      "id",
+      "model",
+      "object"
+    ],
+    "ChatCompletion.Choice": [
+      "finish_reason",
+      "index",
+      "message"
+    ],
+    "ChatCompletionChunk": [
+      "choices",
+      "created",
+      "id",
+      "model",
+      "object"
+    ],
+    "ChatCompletionMessage": [
+      "role"
+    ],
+    "ChoiceDeltaToolCall": [
+      "index"
+    ],
+    "Chunk.Choice": [
+      "delta",
+      "index"
+    ],
+    "Chunk.ChoiceDelta": [],
+    "CompletionUsage": [
+      "completion_tokens",
+      "prompt_tokens",
+      "total_tokens"
+    ],
+    "Model": [
+      "created",
+      "id",
+      "object",
+      "owned_by"
+    ]
+  },
+  "openai_version": "2.6.1",
+  "required_by_ablation": {
+    "ChatCompletion": [
+      "choices",
+      "choices.0.finish_reason",
+      "choices.0.index",
+      "choices.0.message",
+      "choices.0.message.role",
+      "created",
+      "id",
+      "model",
+      "object",
+      "usage.completion_tokens",
+      "usage.prompt_tokens",
+      "usage.total_tokens"
+    ],
+    "ChatCompletionChunk(delta)": [
+      "choices",
+      "choices.0.delta",
+      "choices.0.index",
+      "created",
+      "id",
+      "model",
+      "object"
+    ],
+    "ChatCompletionChunk(final)": [
+      "choices",
+      "choices.0.delta",
+      "choices.0.index",
+      "created",
+      "id",
+      "model",
+      "object",
+      "usage.completion_tokens",
+      "usage.prompt_tokens",
+      "usage.total_tokens"
+    ],
+    "ChatCompletionChunk(tool_calls)": [
+      "choices",
+      "choices.0.delta",
+      "choices.0.delta.tool_calls.0.index",
+      "choices.0.index",
+      "created",
+      "id",
+      "model",
+      "object",
+      "usage.completion_tokens",
+      "usage.prompt_tokens",
+      "usage.total_tokens"
+    ],
+    "Model": [
+      "created",
+      "id",
+      "object",
+      "owned_by"
+    ]
+  },
+  "strict_validation_errors": {
+    "contract_chat_completion": [
+      "created:missing",
+      "model:missing",
+      "object:missing",
+      "usage.total_tokens:missing"
+    ],
+    "contract_chunks": [
+      [
+        "created:missing",
+        "model:missing",
+        "object:missing"
+      ],
+      [
+        "created:missing",
+        "model:missing",
+        "object:missing"
+      ],
+      [
+        "created:missing",
+        "model:missing",
+        "object:missing",
+        "usage.total_tokens:missing"
+      ]
+    ],
+    "contract_models.data[0]": null,
+    "proposed_chat_completion": null,
+    "proposed_chat_completion_tool_calls": null,
+    "proposed_chunks": [
+      null,
+      null,
+      null,
+      null
+    ],
+    "proposed_chunks_tool_calls": [
+      null,
+      null
+    ],
+    "proposed_models.data[0]": null
+  }
+}

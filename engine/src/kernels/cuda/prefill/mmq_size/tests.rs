@@ -76,6 +76,12 @@ fn parse_cases(text: &str) -> Vec<CaseRow> {
     rows
 }
 
+/// The opt-in shared-memory budget of `cc` in the tests: 96 KiB on sm_72, 99 KiB on the
+/// 3090 (the values of §B.0 (a); the skip never fires on either).
+fn smpbo_of(cc: i32) -> usize {
+    if cc >= 800 { 101_376 } else { 98_304 }
+}
+
 /// The layout string the vendored CASE rows name per type (both headers agree).
 fn layout_of(mmq_type: MmqType) -> &'static str {
     match mmq_type {
@@ -132,7 +138,7 @@ fn config_tables_match_vendored_headers() {
                         );
                         assert_eq!(row.3, cfg.i_tile, "I of {mmq_type:?} {table:?}");
                         assert_eq!(row.5, layout_of(mmq_type), "sram layout");
-                        assert!(row.7 == (table == MmqConfig::Ampere), "stream_k");
+                        assert_eq!(row.7, table.stream_k(mmq_type, row.4), "stream_k");
                         row.4
                     })
                     .collect();
@@ -175,17 +181,17 @@ fn shared_bytes_fit_both_build_architectures() {
 #[test]
 fn j_best_pins_the_launch_selection() {
     for cc in [720, 860] {
-        assert_eq!(j_best(MmqType::Q4K, false, cc, 101_376, 130), Some(80));
+        assert_eq!(j_best(MmqType::Q4K, false, cc, smpbo_of(cc), 130), Some(80));
         for (n, want) in [(56, 64), (72, 80), (88, 96), (104, 112), (120, 128)] {
             assert_eq!(
-                j_best(MmqType::Q80, false, cc, 101_376, n),
+                j_best(MmqType::Q80, false, cc, smpbo_of(cc), n),
                 Some(want),
                 "n={n}"
             );
         }
         for (n, want) in [(24, 32), (40, 64), (120, 128)] {
             assert_eq!(
-                j_best(MmqType::Q6K, true, cc, 101_376, n),
+                j_best(MmqType::Q6K, true, cc, smpbo_of(cc), n),
                 Some(want),
                 "n={n}"
             );
@@ -193,7 +199,7 @@ fn j_best_pins_the_launch_selection() {
         // Membership: every answer is a table J, for the whole chunk domain.
         for fallback in [false, true] {
             for n in 1..=NCOLS_LIMIT {
-                let j = j_best(MmqType::Q50, fallback, cc, 101_376, n).unwrap();
+                let j = j_best(MmqType::Q50, fallback, cc, smpbo_of(cc), n).unwrap();
                 assert!(MmqConfig::select(cc).contains(fallback, j), "n={n} j={j}");
             }
         }
@@ -214,7 +220,8 @@ fn j_best_models_the_shared_memory_skip() {
 
 /// The exact-equality pad contract (rev 3, finding 19): `Q8_1_PAD == 18,432` and
 /// `q8_1_bytes == (Kpad/128)*ncols*144 + 18,432`, at dense, grouped and non-multiple K
-/// shapes. V18 (floored Kpad) dies at K = 600; V2/V3 die at the grouped rows.
+/// shapes. V18 (floored Kpad) dies at K = 600; V2/V3 die at the dense (2048, 1) row, where
+/// their `ncols_opt`-sized pad is 2,048 B against the contract's 18,432 B.
 #[test]
 fn q8_1_pad_contract_is_exact() {
     assert_eq!(Q8_1_PAD, 18_432);
@@ -269,7 +276,7 @@ fn exhaustive_dense_pad_rule() {
         for fallback in [false, true] {
             let mut worst = 0;
             for n in 1..=NCOLS_LIMIT {
-                let j = j_best(MmqType::Q4K, fallback, cc, 101_376, n).unwrap();
+                let j = j_best(MmqType::Q4K, fallback, cc, smpbo_of(cc), n).unwrap();
                 let need = y_tile_span_bytes(nthreads, j) - tail_r(n, j) * 144;
                 assert!(need <= Q8_1_PAD, "n={n} fb={fallback} j={j} need={need}");
                 if j == 128 {
@@ -292,13 +299,13 @@ fn exhaustive_grouped_pad_rule() {
         let nthreads = MmqConfig::select(cc).config().nthreads;
         for fallback in [false, true] {
             for m in 1..=NCOLS_LIMIT {
-                let j = j_best(MmqType::Q4K, fallback, cc, 101_376, m).unwrap();
+                let j = j_best(MmqType::Q4K, fallback, cc, smpbo_of(cc), m).unwrap();
                 let need = y_tile_span_bytes(nthreads, j) - 144;
                 assert!(need <= Q8_1_PAD, "M={m} fb={fallback} j={j} need={need}");
             }
         }
         for m in 49..=56 {
-            let j = j_best(MmqType::Q4K, false, cc, 101_376, m).unwrap();
+            let j = j_best(MmqType::Q4K, false, cc, smpbo_of(cc), m).unwrap();
             assert_eq!(j, 64, "M={m}");
             assert_eq!(y_tile_span_bytes(256, 64) - 144, 9_072);
             let rev2 = pad_up(j_ub(m) * 144, SRC1_LOAD_CHUNK);
@@ -306,6 +313,22 @@ fn exhaustive_grouped_pad_rule() {
             assert_eq!(9_072 - rev2, 880, "the B1 shortfall at M={m}");
         }
     }
+}
+
+/// The typed underflow text of `ids_gather_ints(0, 0)` (review NIT-5): its own rule, not the
+/// overflow text.
+#[test]
+fn ids_gather_zero_extents_have_their_own_text() {
+    let err = ids_gather_ints(0, 0).unwrap_err();
+    assert!(
+        matches!(err, EngError::BadRequest(ref m) if m.contains("mmq_size: zero extent")
+            && m.contains("ids_gather_ints(0, 0) underflows")),
+        "{err:?}"
+    );
+    assert!(
+        matches!(ids_gather_ints(usize::MAX, 1).unwrap_err(), EngError::BadRequest(ref m)
+            if m.contains("mmq_size: size overflow"))
+    );
 }
 
 /// The exhaustive ids and fixup forms over the reachable domain (M up to 2,048,
@@ -319,7 +342,7 @@ fn exhaustive_ids_and_fixup_forms() {
         for fallback in [false, true] {
             for m in 1..=NCOLS_LIMIT {
                 let ne_get_rows = 8 * m;
-                let j = j_best(MmqType::Q4K, fallback, cc, 101_376, m).unwrap();
+                let j = j_best(MmqType::Q4K, fallback, cc, smpbo_of(cc), m).unwrap();
                 let closed = ids_dst_ints(ne_get_rows, m).unwrap();
                 assert_eq!(closed, 9 * m + 127);
                 assert!(
@@ -357,12 +380,12 @@ fn overread_windows_recomputed() {
     for cc in [720, 860] {
         for mmq_type in [MmqType::Q80, MmqType::Q50, MmqType::Q4K, MmqType::Q6K] {
             assert_eq!(
-                overread_window(mmq_type, false, cc, 101_376),
+                overread_window(mmq_type, false, cc, smpbo_of(cc)),
                 plain,
                 "fb=false cc={cc}"
             );
             assert_eq!(
-                overread_window(mmq_type, true, cc, 101_376),
+                overread_window(mmq_type, true, cc, smpbo_of(cc)),
                 with_gaps,
                 "fb=true cc={cc}"
             );
@@ -402,6 +425,213 @@ fn overflow_refusals_are_typed() {
         assert!(
             matches!(result, Err(EngError::BadRequest(ref m)) if m.contains("mmq_size: size overflow")),
             "{result:?}"
+        );
+    }
+}
+
+/// The table function of a config header must be EXACTLY the known shape (lane C's
+/// completeness rule): no preprocessor line and no block comment may appear, and every
+/// non-blank line is the one signature line, a CASE row, the known separator comment, or
+/// the two-line footer. A vendor edit that hides a row behind `#ifdef` or a comment fails
+/// here even when every CASE line still parses.
+#[test]
+fn config_headers_have_no_hidden_lines() {
+    let headers = [
+        (
+            "ampere",
+            include_str!(concat!(
+                env!("CARGO_MANIFEST_DIR"),
+                "/vendor/ggml-cuda-mmq/src/ggml-cuda/mmq-config-ampere.cuh"
+            )),
+        ),
+        (
+            "pascal-dp4a",
+            include_str!(concat!(
+                env!("CARGO_MANIFEST_DIR"),
+                "/vendor/ggml-cuda-mmq/src/ggml-cuda/mmq-config-pascal-dp4a.cuh"
+            )),
+        ),
+    ];
+    const SEPARATOR: &str = "// ---------------------------------------------------------------------------------------------";
+    let signature = |name: &str| {
+        let suffix = if name == "ampere" {
+            "ampere"
+        } else {
+            "pascal_dp4a"
+        };
+        format!(
+            "static constexpr __host__ __device__ ggml_cuda_mmq_config \
+ggml_cuda_mmq_get_config_{suffix}(ggml_type type, int J, bool fallback) {{"
+        )
+    };
+    for (name, text) in headers {
+        let mut saw_signature = false;
+        let mut saw_footer = false;
+        for line in text.lines() {
+            let trimmed = line.trim();
+            assert!(!line.contains('#'), "{name}: a preprocessor line: {line}");
+            assert!(
+                !trimmed.starts_with("/*") && !trimmed.starts_with("*"),
+                "{name}: a block comment: {line}"
+            );
+            if trimmed.is_empty() {
+                continue;
+            }
+            if trimmed.starts_with("CASE(") {
+                assert!(!saw_footer, "{name}: a CASE row after the footer: {line}");
+                continue; // parse_cases covers the fields
+            }
+            if !saw_signature {
+                assert_eq!(
+                    trimmed,
+                    signature(name),
+                    "{name}: the header's first line changed"
+                );
+                saw_signature = true;
+                continue;
+            }
+            if trimmed == SEPARATOR {
+                continue;
+            }
+            if trimmed.starts_with("return ggml_cuda_mmq_config(GGML_TYPE_COUNT,") {
+                assert!(saw_signature, "{name}: footer before the signature");
+                saw_footer = true;
+                continue;
+            }
+            assert_eq!(trimmed, "}", "{name}: an unexpected line: {line}");
+            assert!(saw_footer, "{name}: a stray close brace");
+        }
+        assert!(
+            saw_signature && saw_footer,
+            "{name}: missing head or footer"
+        );
+    }
+}
+
+/// The vendored J-selection loop (mmq.cuh:1444-1461) hash-pinned: the replica `j_best`
+/// models this exact loop, so a vendor change to it must fail CI. The first line is
+/// asserted first, so a line-number drift fails by text before the hash can mismatch.
+#[test]
+fn vendored_j_selection_loop_is_pinned() {
+    let mmq = include_str!(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/vendor/ggml-cuda-mmq/src/ggml-cuda/mmq.cuh"
+    ));
+    let lines: Vec<&str> = mmq.lines().collect();
+    let first = lines[1443];
+    assert!(
+        first.trim_start().starts_with("for (int J = 8; J <= 128"),
+        "mmq.cuh:1444 is no longer the J loop: {first}"
+    );
+    let text: String = lines[1443..=1460]
+        .iter()
+        .fold(String::new(), |acc, line| acc + line + "\n");
+    use sha2::Digest;
+    let hash = sha2::Sha256::digest(text.as_bytes());
+    assert_eq!(
+        format!("{hash:x}"),
+        "2eb7e09b7446e16f9d210888d2407d16d075817bcd73148fb1d4b73f7c8fc202",
+        "the vendored J-selection loop changed; re-derive j_best against it"
+    );
+}
+
+/// The sha-256 of vendored mmq.cuh lines `first..=last` (1-based), each with its newline,
+/// after asserting that line `first` still starts with `head`: a line-number drift fails by
+/// text before the hash can mismatch.
+fn vendored_mmq_range_hash(first: usize, last: usize, head: &str) -> String {
+    let mmq = include_str!(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/vendor/ggml-cuda-mmq/src/ggml-cuda/mmq.cuh"
+    ));
+    let lines: Vec<&str> = mmq.lines().collect();
+    assert!(
+        lines[first - 1].trim_start().starts_with(head),
+        "mmq.cuh:{first} no longer starts with {head:?}: {}",
+        lines[first - 1]
+    );
+    let text: String = lines[first - 1..last]
+        .iter()
+        .fold(String::new(), |acc, line| acc + line + "\n");
+    use sha2::Digest;
+    format!("{:x}", sha2::Sha256::digest(text.as_bytes()))
+}
+
+/// The vendored stream-k launch rule (mmq.cuh:1395-1412): the 90 % tiling test, the `2^30`
+/// limit, the fixup test and the fixup byte need. G2's `fixup_need` (C) and the Rust
+/// mirrors of the 2^30 limit re-express exactly this passage, so a vendor change to it
+/// must fail CI (lane C's ruling on the G2 verdict, m-1).
+#[test]
+fn vendored_stream_k_launch_rule_is_pinned() {
+    assert_eq!(
+        vendored_mmq_range_hash(1395, 1412, "// For the stream-k kernel it is possible"),
+        "38ebc22e187c1deecd6a4afb30c0171e8dfecf988cadbf9da22ee59f07477db8",
+        "the vendored stream-k rule changed; re-derive fixup_need and the grid-limit mirror"
+    );
+}
+
+/// The vendored launch's grid setup and stream-k branch test (mmq.cuh:1365-1367 and :1385):
+/// the row and column tile counts and the channel-sample count, and the test that picks the
+/// stream-k kernel. `fixup_need` re-expresses both (tiles = ntx * nty with ntzw = 1; the
+/// replica returns 0 for a type or J without a stream-k row), so a vendor change must fail CI.
+#[test]
+fn vendored_launch_grid_and_stream_k_branch_are_pinned() {
+    assert_eq!(
+        vendored_mmq_range_hash(1365, 1367, "const int nty"),
+        "92188104c7dbffb6eb6d136a8367c88af3a1901f2e4849412f61a87324cc1a60",
+        "the vendored tile-count setup changed; re-derive fixup_need"
+    );
+    assert_eq!(
+        vendored_mmq_range_hash(
+            1385,
+            1385,
+            "if (!ggml_cuda_mmq_get_stream_k(type, J, fallback, cc))"
+        ),
+        "880850ab75e67f60c46b55e0b0ef3374612189071d731723f9b24a00dea9ed0d",
+        "the vendored stream-k branch test changed; re-derive fixup_need"
+    );
+}
+
+/// The vendored case function (mmq.cuh:1500-1510): the device check and the fallback rule,
+/// `nrows_x % 128 != 0`, that picks the J set. Every sizing row names the fallback axis from
+/// it (plan section B.3), so a vendor change to it must fail CI.
+#[test]
+fn vendored_mmq_case_fallback_rule_is_pinned() {
+    assert_eq!(
+        vendored_mmq_range_hash(1500, 1510, "template <ggml_type type>"),
+        "3160816f078b9a79c9ff6a131ac94bbb0b407e1acdd3f12c734bd10272481b79",
+        "the vendored mul_mat_q_case changed; re-derive the fallback axis of the sizing"
+    );
+}
+
+/// `COMPILED_ARCHS` is pinned to the build (lane C's item 4): every architecture THIS build
+/// compiled — the list build.rs wrote into its generated `__CUDA_ARCH_LIST__` header — must
+/// appear in the constant, so a build whose arch set grows past it fails here instead of
+/// silently taking the wrong config table. (Deriving the constant from
+/// `INFERENCE_CUDA_ARCHS` at run time is not possible: the test exes run outside the build
+/// environment, where the variable is absent.)
+#[test]
+fn compiled_archs_cover_the_build() {
+    // Embedded at build time, not read at run time: a test exe copied away from its target
+    // directory (a mutant's, a sanitizer's) still has the list.
+    let generated = include_str!(concat!(env!("OUT_DIR"), "/fifi_cuda_arch_list.h"));
+    let list = generated
+        .lines()
+        .find_map(|line| line.strip_prefix("#define __CUDA_ARCH_LIST__ "))
+        .expect("the __CUDA_ARCH_LIST__ define");
+    let built: Vec<i32> = list
+        .split(',')
+        .map(|arch| {
+            arch.trim()
+                .parse::<i32>()
+                .unwrap_or_else(|error| panic!("arch {arch:?}: {error}"))
+        })
+        .collect();
+    assert!(!built.is_empty(), "no compiled architecture");
+    for cc in built {
+        assert!(
+            COMPILED_ARCHS.contains(&cc),
+            "the build compiled cc {cc}, outside COMPILED_ARCHS {:?}",
+            COMPILED_ARCHS
         );
     }
 }

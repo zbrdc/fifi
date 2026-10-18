@@ -16,6 +16,7 @@
 //! always free at layer `L`, so two sets suffice and the third is slack.
 
 use super::super::stored::{RoleRange, StackLayout};
+use super::prefetch::{Admission, ExpertHint};
 use super::weights::RMoe;
 use crate::{
     EngError,
@@ -94,6 +95,7 @@ fn page_range(range: &RoleRange) -> PageRange {
 pub(super) struct ExpertSlots {
     sets: Vec<HostPages>,
     lent: Vec<usize>,
+    hints: Admission,
 }
 
 impl ExpertSlots {
@@ -110,7 +112,19 @@ impl ExpertSlots {
         Ok(Self {
             sets,
             lent: Vec::new(),
+            hints: Admission::default(),
         })
+    }
+
+    /// Records a hint only. Staging is a later slice; demand never reads this record.
+    /// This does not read storage, wait, reserve pages, reorder demand, or influence routing.
+    pub(super) fn admit_hint(&mut self, hint: ExpertHint) {
+        self.hints.admit(hint);
+    }
+
+    #[cfg(test)]
+    pub(super) fn hint_admissions(&self) -> (usize, Option<ExpertHint>) {
+        self.hints.recorded()
     }
 
     /// Mapped bytes of the whole pool. They do not change after `new`.

@@ -32,7 +32,7 @@
 //! Design guidance only, no code copied.
 
 use super::prefix::{CudaPrefillPath, entry_bytes};
-use super::step::QwenResidentStep;
+use super::step::{ChunkVerdict, QwenResidentStep};
 use crate::{
     EngError,
     family::{
@@ -46,12 +46,75 @@ use std::time::Instant;
 
 type Result<T> = std::result::Result<T, EngError>;
 
+/// The prefill arm `feed_rows` takes for one chunk-gate verdict. THE ONE SWITCH of the chunk
+/// path (plan §C.4): until the chunk driver lands with CPF-7a, every verdict — each refusal
+/// and the accept — maps to the per-token arm, so no session's behaviour changes. CPF-7a's
+/// integration commit adds the `Chunked` arm (the `m_sess` cap of the accept verdict) and the
+/// driver call in `feed_rows`; the exhaustive match there is what makes the switch one call.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum ChunkPath {
+    /// One token per step: the default `TokenStepper::feed_rows` loop's own arm.
+    PerToken,
+    /// The chunk driver, at the admitted M_sess of the arena.
+    Chunked { m_sess: usize },
+}
+
+/// The prefill path of one chunk-gate verdict: every verdict keeps the per-token loop until
+/// the chunk driver lands with CPF-7a (decision 0049; see `ChunkPath`).
+pub(super) fn chunk_path_of(verdict: &ChunkVerdict) -> ChunkPath {
+    match verdict {
+        ChunkVerdict::Ready { m_sess } => ChunkPath::Chunked { m_sess: *m_sess },
+        _ => ChunkPath::PerToken,
+    }
+}
+
+/// The worker piece of the chunk path (plan CPF-7b-C B.9): the ADMITTED M_sess when the
+/// verdict is Ready, else None, so the caller own fallback stands on every refusal.
+pub(super) fn piece_of(verdict: &ChunkVerdict) -> Option<usize> {
+    match verdict {
+        ChunkVerdict::Ready { m_sess } => Some(*m_sess),
+        _ => None,
+    }
+}
+
+/// Feeds `tokens` one by one, stopping at the first failure: the default
+/// `TokenStepper::feed_rows` loop's own body, shared by the CUDA override so the two cannot
+/// drift while the chunk path is staged.
+pub(super) fn feed_per_token(step: &mut impl TokenStepper, tokens: &[u32]) -> Result<()> {
+    tokens.iter().try_for_each(|&token| step.feed(token))
+}
+
 impl TokenStepper for QwenResidentStep<'_> {
     const OPERATION: &'static str = "qwen36_cuda";
 
     /// Feeds one prompt token: the whole step runs, nothing is read back.
     fn feed(&mut self, token: u32) -> Result<()> {
         self.run_token(token, false).map(|_| ())
+    }
+
+    /// Feeds `tokens` in order as prompt rows, routed through the chunk gate (plan §C.4; the
+    /// Flash-Next precedent). Until the chunk driver lands with CPF-7a every verdict takes the
+    /// per-token arm — the default loop's own body — so every session behaves exactly as the
+    /// default `TokenStepper::feed_rows`; when it lands, `chunk_path_of` is the one call that
+    /// flips the accept verdict to the chunk arm.
+    fn feed_rows(&mut self, tokens: &[u32]) -> Result<()> {
+        let verdict = self.chunk_ready();
+        self.note_feed_rows(&verdict, tokens.len());
+        match chunk_path_of(&verdict) {
+            ChunkPath::PerToken => {
+                // The per-token arm records its rows too, so the report rows sum to the
+                // prompt on every path and the job line can carry them.
+                for &token in tokens {
+                    let p0 = self.tokens();
+                    let opened = Instant::now();
+                    TokenStepper::feed(self, token)?;
+                    let ns = u64::try_from(opened.elapsed().as_nanos()).unwrap_or(u64::MAX);
+                    self.record_feed(p0, ns);
+                }
+                Ok(())
+            }
+            ChunkPath::Chunked { m_sess } => self.feed_rows_chunked(tokens, m_sess),
+        }
     }
 
     /// Feeds `token` and returns the full logits row of the next token.
@@ -83,12 +146,34 @@ impl ExecutorOps for QwenResidentStep<'_> {
     }
 
     fn reset(&mut self, st: &mut DecodeSession) -> Result<()> {
+        // A job whose line was never taken must not cross into the next job.
+        self.log_prefill_job();
         st.reset(self)
     }
 
     fn prefill(&mut self, st: &mut DecodeSession, toks: &[u32]) -> Result<()> {
         let context_limit = self.context_limit();
-        st.prefill(self, toks, context_limit)
+        let began = Instant::now();
+        let out = st.prefill(self, toks, context_limit);
+        self.record_prefill_piece(toks.len(), began);
+        out
+    }
+
+    /// The worker piece of the chunk path (plan CPF-7b-C B.9, R1): the ADMITTED M_sess when
+    /// the verdict is Ready, else None, so the caller own fallback stands on every refusal.
+    ///
+    /// Cancel-latency trade: the worker checks cancellation only between pieces, so a cancel
+    /// waits up to one piece of M_sess rows. MEASURED on the 3090 at cap 2,048: the P1 release
+    /// chunk of 1,023 rows took 262.3 ms, status word 0 (
+    /// qrig/qb-run-01/result.json, sha256 656a4fe47864f5ad8a73adb9d54a5ebc8edbb7efdde276d03ddd22d172786af2, field steps[0].ns).
+    /// A 2,048-row piece is about 525 ms at 1K depth. Up to about 2.9 s at 32K depth
+    /// (CPF-8A section B.10 model); the worst case is the deepest admitted fp16 context, near
+    /// 100K, where a 2,048-token piece is 4 chunks of 512 at about 8 s (4 x (about 1.81 s
+    /// attention + about 0.19 s other); ESTIMATE from the PLAN C.6 FLOP model at 4.56 TFLOP/s,
+    /// not measured. The CPF-8a follow-up replaces the 2,048-row figure with
+    /// CPF8A.piece_ms_p50 (owner lane S; trigger: the CPF-8a report lands).
+    fn prefill_piece(&self) -> Option<usize> {
+        piece_of(&self.chunk_ready())
     }
 
     fn decode(
@@ -103,6 +188,7 @@ impl ExecutorOps for QwenResidentStep<'_> {
             sampler_vocab: self.rules.sampler_vocab,
             context_limit: self.context_limit(),
         };
+        self.log_prefill_job();
         st.decode(self, generation, &limits)
     }
 
@@ -150,6 +236,19 @@ impl QwenResidentStep<'_> {
     /// The prefill path every entry of this step is saved and restored under: the one value a
     /// `CudaPrefillPath` holds today, from one place, so a second variant (chunked prefill,
     /// decision 0049) changes only this body — exactly like the Mac glue.
+    /// Writes the one prefill line of a job, once: the first decode after the prefill, or
+    /// the next reset when no decode ran (plan CPF-7b-C B.8, OQ-13).
+    fn log_prefill_job(&mut self) {
+        // A session that has not fed a row yet has nothing to report: an empty line at the
+        // first reset would name no path and no pieces.
+        if self.last_prefill_report().feed_rows_calls().is_empty() {
+            return;
+        }
+        if let Some(line) = self.take_job_line() {
+            eprintln!("{line}");
+        }
+    }
+
     fn prefill_path(&self) -> CudaPrefillPath {
         CudaPrefillPath::Steps
     }

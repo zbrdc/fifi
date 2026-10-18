@@ -49,6 +49,7 @@ use super::{
 };
 use crate::EngError;
 use crate::kernels::cuda::native::resident::matmul_q5_0::MAX_DENSE_TOKENS;
+use crate::kernels::cuda::prefill::mmq_facts::MmqFactsCache;
 use crate::weights::GgufType;
 use workspace::Workspace;
 
@@ -134,6 +135,8 @@ pub(crate) struct CudaContext {
     workspace: RefCell<Workspace>,
     /// Whether a call larger than the workspace may grow it.
     growth: Growth,
+    /// The MMQ device facts of this context's device, read at most once.
+    pub(in crate::kernels::cuda) mmq_facts: MmqFactsCache,
     /// Workspace allocations made, the first one included; tests compare it.
     #[cfg(test)]
     workspace_allocations: std::cell::Cell<usize>,
@@ -183,6 +186,7 @@ impl CudaContext {
             lease,
             workspace: RefCell::new(workspace),
             growth,
+            mmq_facts: MmqFactsCache::default(),
             #[cfg(test)]
             workspace_allocations: std::cell::Cell::new(1),
             _thread_confined: PhantomData,
@@ -850,6 +854,7 @@ mod device_arena;
 mod expert_bank;
 mod graph;
 mod launch;
+mod mailbox;
 mod native_weight;
 mod pinned;
 mod pinned_buf;
@@ -863,6 +868,7 @@ pub(crate) use expert_bank::{ExpertBank, ExpertBankGeometry};
 pub(crate) use graph::{CapturePlan, GraphExec, is_capture_refusal};
 pub(in crate::kernels::cuda) use launch::{Claim, require_apart, require_fit};
 pub(crate) use launch::{MatmulIo, PackCall, Projection};
+pub(crate) use mailbox::Mailbox;
 pub(crate) use native_weight::NativeWeight;
 pub(crate) use pinned::{PinnedWord, WordValue};
 pub(crate) use pinned_buf::PinnedBuf;

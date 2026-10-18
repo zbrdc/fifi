@@ -2490,3 +2490,234 @@ fn gdn_scan_seq_inside_a_capture_equals_eager() -> Result<(), EngError> {
     assert_eq!(nodes, 2, "the graph holds the two kernels");
     Ok(())
 }
+
+// ---- test 17 and test 18 (CPF-DN-B: the token-tile edges and the speed row) ----------------
+
+/// Test 17: rows across the token-tile edges of the CPF-DN-B K1. The rewritten kernel stages
+/// the tokens of one chunk in tiles of `kTile = 16` (the `.cu` constant of `gdn_scan_seq.cu`,
+/// CPF-DN-B section 2.2); the arithmetic of a token must not depend on its tile slot, its tile
+/// index, `m` or `p0`, and a partial last tile must neither overread its inputs nor leave an
+/// output row unwritten. Landed at C1 on the CPF-DN-A kernel (which has no tiles), where it
+/// must already be green: it pins the rewrite, it does not only follow it.
+/// (a) The f64 reference with E3 (the `judge_scan` path) at `(nk, nv, m)` = (16,32,15),
+/// (16,32,16), (16,32,17), (16,32,31), (16,32,32), (16,32,33), (4,8,48), (1,1,17): one below,
+/// at and above every multiple of `kTile` inside the tested range, plus two non-Qwen
+/// geometries (a finer head tiling and the single-head scan).
+/// (b) Bit-exact self-split across tile boundaries: (16,32,40) as one call against three calls
+/// m = 16, 7, 17 at `row0` = 0, 16, 23 with p0 = `row0` and the state carried in its buffer
+/// (the test 4b pattern, which m = 9 never crosses a tile): the gated rows and the state must
+/// be bit-equal. Prints its measured maxima for lane M.
+#[test]
+fn gdn_scan_seq_tile_edges() -> Result<(), EngError> {
+    if !testkit::device_present("gdn_scan_seq_tile_edges") {
+        return Ok(());
+    }
+    let cases = [
+        (16_usize, 32_usize, 15_usize),
+        (16, 32, 16),
+        (16, 32, 17),
+        (16, 32, 31),
+        (16, 32, 32),
+        (16, 32, 33),
+        (4, 8, 48),
+        (1, 1, 17),
+    ];
+    let mut measured = Vec::new();
+    for &(nk, nv, m) in &cases {
+        let inp = generate_scan(nk, nv, m, ScanLayout::of(nk, nv), seed_of(nk, nv, m, 0x17));
+        assert_constraints(&inp, &[]);
+        let got = {
+            let rig = Rig::new()?;
+            let scan = ScanRig::new(rig, &inp)?;
+            scan.run(&inp, m, 0, 1024, 0)?;
+            let got = scan.finish()?;
+            (got.out, got.state)
+        };
+        let (rows, state) = judge_scan(&inp, &got.0, &got.1, &format!("test 17 ({nk},{nv},{m})"));
+        measured.push(format!(
+            "test 17 ({nk},{nv},{m}): rows {rows:.3e}, state {state:.3e}"
+        ));
+        assert!(
+            rows <= E3,
+            "test 17 ({nk},{nv},{m}): rows {rows:.3e} above E3 {E3:.3e}"
+        );
+        assert!(
+            state <= E3,
+            "test 17 ({nk},{nv},{m}): state {state:.3e} above E3 {E3:.3e}"
+        );
+    }
+    println!("REPORTED to lane M: {}", measured.join("; "));
+    // (b) The self-split: 16 + 7 + 17 = 40, the seams at 16 (a tile boundary) and 23 (mid-tile).
+    let (nk, nv, m) = (16_usize, 32, 40);
+    let inp = generate_scan(nk, nv, m, ScanLayout::qwen36(), seed_of(nk, nv, m, 0x17));
+    assert_constraints(&inp, &[]);
+    let (whole, split) = {
+        let rig = Rig::new()?;
+        let scan = ScanRig::new(rig, &inp)?;
+        scan.run(&inp, m, 0, 1024, 0)?;
+        let whole = scan.finish()?;
+        scan.reset_state(&inp)?;
+        scan.poison_out()?;
+        for &(cm, row0) in &[(16_usize, 0_usize), (7, 16), (17, 23)] {
+            scan.run(&inp, cm, row0 as i64, 1024, row0)?;
+        }
+        let split = scan.finish()?;
+        (whole, split)
+    };
+    assert_scan_finite("test 17 one chunk", &inp, &whole.out, &whole.state);
+    assert_scan_finite("test 17 split", &inp, &split.out, &split.state);
+    let bits = |v: &[f32]| -> Vec<u32> { v.iter().map(|f| f.to_bits()).collect() };
+    assert_eq!(
+        bits(&whole.out),
+        bits(&split.out),
+        "the gated rows differ across the split"
+    );
+    assert_eq!(
+        bits(&whole.state),
+        bits(&split.state),
+        "the state differs across the split"
+    );
+    Ok(())
+}
+
+/// Test 18 (CPF-DN-B): the speed qualification row. A PRINTED REPORT ONLY — never a wall-clock
+/// assert (Amendment 1 MAJOR 1: the tree has no SM-count or device-name query, `kernels/cuda/
+/// mod.rs:111-125`, so an assert cannot be limited to the 3090; a 1,104-us line from one hold
+/// would fail correct code on the Xavier (8 waves) or the 4050 (~3.2 waves)). Release-only and
+/// `#[ignore]`d: run by name inside the baton hold next to the C1 (kernel A) executable. The
+/// speed judgement itself — B >= 1.67x A in the same hold, the packet's STOP 6 — is made in the
+/// REPORT from the paired A/B medians, not in this test; what the test prints is B's rows next
+/// to A's round-1 MEASURED rows (ROUND-1-REPORT.md:126; single-run timings of this entry moved
+/// 1,256-1,578 us under contention, so the printed A/B ratio is indicative, the hold's is the
+/// judgement). Rows: the entry (one `gdn_scan_seq` call, K1+K2) at M = 512/1,024/2,048 next to
+/// the x30 path figures; the tail-chunk rows M = 1, 16, 17 (the tile overhead); the entry at
+/// nv = 1, M = 512 (the latency floor; A 442.4 us). The correctness spot check of test 15 runs
+/// in the same process in BOTH profiles, so the timed kernel is the correct one.
+#[test]
+#[ignore = "timing rows; run by name in a baton hold"]
+fn gdn_scan_seq_speed_rows() -> Result<(), EngError> {
+    if !testkit::device_present("gdn_scan_seq_speed_rows") {
+        return Ok(());
+    }
+    // CPF-DN-A's round-1 rows (3090 release, median of 11 after 2 warm-ups; MEASURED,
+    // CPF-DN-A ROUND-1-REPORT.md:122-131): the comparison constants of the printed rows.
+    const A_ENTRY_M512: f64 = 1380.2;
+    const A_ENTRY_M1024: f64 = 3078.7;
+    const A_ENTRY_M2048: f64 = 5779.2;
+    const A_PATH_M512_MS: f64 = 49.43;
+    const A_PATH_M1024_MS: f64 = 108.21;
+    const A_PATH_M2048_MS: f64 = 204.93;
+    const A_ENTRY_NV1_M512: f64 = 442.4;
+    if !cfg!(debug_assertions) {
+        let mut entries = Vec::new();
+        for &m in &[512_usize, 1024, 2048] {
+            let (nk, nv) = (16, 32);
+            let inp = generate_scan(nk, nv, m, ScanLayout::qwen36(), seed_of(nk, nv, m, 0x18));
+            assert_constraints(&inp, &[]);
+            let (conv_us, entry_us) = {
+                let t = TimingRig::new(&inp)?;
+                let conv = median_us(11, 2, || {
+                    t.queue_conv(&inp)?;
+                    t.scan.rig.stream.synchronize()
+                })?;
+                let entry = median_us(11, 2, || {
+                    t.queue_scan(&inp)?;
+                    t.scan.rig.stream.synchronize()
+                })?;
+                (conv, entry)
+            };
+            entries.push((m, conv_us, entry_us));
+        }
+        for &(m, conv_us, entry_us) in &entries {
+            println!(
+                "SPEED B M {m}: conv {conv_us:.1} us, entry {entry_us:.1} us per layer; \
+                 x30 path {:.2} ms (conv {:.2} + entry {:.2})",
+                30.0 * (conv_us + entry_us) / 1e3,
+                30.0 * conv_us / 1e3,
+                30.0 * entry_us / 1e3,
+            );
+        }
+        println!(
+            "SPEED B/A at M 512: A round-1 {A_ENTRY_M512} us, B {:.1} us, ratio {:.2}x \
+             (indicative; the paired in-hold medians are the judgement, STOP 6: B >= 1.67x A)",
+            entries[0].2,
+            A_ENTRY_M512 / entries[0].2,
+        );
+        println!(
+            "SPEED path x30 vs A and the lines: M 512 {:.2} ms (A {A_PATH_M512_MS}, line <= 35); \
+             M 1024 {:.2} ms (A {A_PATH_M1024_MS}, llama.cpp 58.5); M 2048 {:.2} ms \
+             (A {A_PATH_M2048_MS}, llama.cpp 130.8)",
+            30.0 * (entries[0].1 + entries[0].2) / 1e3,
+            30.0 * (entries[1].1 + entries[1].2) / 1e3,
+            30.0 * (entries[2].1 + entries[2].2) / 1e3,
+        );
+        // The tail-chunk rows (the tile overhead at and around one tile) and the latency floor.
+        for &m in &[1_usize, 16, 17] {
+            let (nk, nv) = (16, 32);
+            let inp = generate_scan(nk, nv, m, ScanLayout::qwen36(), seed_of(nk, nv, m, 0x18));
+            assert_constraints(&inp, &[]);
+            let entry_us = {
+                let t = TimingRig::new(&inp)?;
+                median_us(11, 2, || {
+                    t.queue_scan(&inp)?;
+                    t.scan.rig.stream.synchronize()
+                })?
+            };
+            println!("SPEED B tail M {m}: entry {entry_us:.1} us per layer");
+        }
+        let (nk, nv, m) = (1_usize, 1, 512);
+        let inp = generate_scan(nk, nv, m, ScanLayout::of(nk, nv), seed_of(nk, nv, m, 0x18));
+        assert_constraints(&inp, &[]);
+        let nv1_us = {
+            let t = TimingRig::new(&inp)?;
+            median_us(11, 2, || {
+                t.queue_scan(&inp)?;
+                t.scan.rig.stream.synchronize()
+            })?
+        };
+        println!(
+            "SPEED B nv = 1, M 512: entry {nv1_us:.1} us per layer (A {A_ENTRY_NV1_M512}; \
+             the latency floor row)"
+        );
+        println!(
+            "SPEED A rows for reference: entry {A_ENTRY_M512} / {A_ENTRY_M1024} / \
+             {A_ENTRY_M2048} us at M 512/1,024/2,048"
+        );
+    } else {
+        println!("timing skipped (debug build, the S3a lesson)");
+    }
+    // The correctness spot check, in the same process and against the same entry that was
+    // timed (test 15's pattern): 4 rows x 3 heads against E3, in BOTH profiles.
+    let (inp, got) = {
+        let (nk, nv, m) = (16, 32, 512);
+        let inp = generate_scan(nk, nv, m, ScanLayout::qwen36(), seed_of(nk, nv, m, 0x18));
+        assert_constraints(&inp, &[]);
+        let got = {
+            let rig = Rig::new()?;
+            let scan = ScanRig::new(rig, &inp)?;
+            scan.run(&inp, m, 0, 1024, 0)?;
+            scan.finish()?
+        };
+        (inp, got)
+    };
+    assert_scan_finite("test 18 spot check", &inp, &got.out, &got.state);
+    let want = scan_reference(&inp, RefOpts::default());
+    for t in [0_usize, inp.m / 3, inp.m / 2, inp.m - 1] {
+        for h in [0_usize, inp.nv / 2, inp.nv - 1] {
+            let g = &got.out[(t * inp.nv + h) * D..][..D];
+            let w = &want.out[(t * inp.nv + h) * D..][..D];
+            let scale = w.iter().fold(1.0_f64, |m, x| m.max(x.abs()));
+            let err = g
+                .iter()
+                .zip(w)
+                .fold(0.0_f64, |m, (a, b)| m.max((f64::from(*a) - b).abs()))
+                / scale;
+            assert!(
+                err <= E3,
+                "spot check t {t} head {h}: {err:.3e} above E3 {E3:.3e}"
+            );
+        }
+    }
+    println!("SPEED spot check: 12 sampled values of the timed run inside E3");
+    Ok(())
+}

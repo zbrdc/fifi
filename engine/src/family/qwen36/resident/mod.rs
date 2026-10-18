@@ -8,6 +8,13 @@ mod chunk_plan;
 mod kv_plan;
 mod layout;
 
+/// The ANE sidecar latency probe (packet ane-sidecar-1): the idle and between-steps cost of
+/// one `DecisionHead::ane` call, and the plain statement that the head is neither `Send` nor
+/// `Sync`, so the sidecar the packet asks about is serial. `cfg(test)` like `decode_timing`;
+/// the ignored Mac-only test inside carries the native feature pair, so it compiles exactly
+/// where the loader helpers it reuses do.
+#[cfg(test)]
+mod ane_latency;
 #[cfg(all(feature = "native-mlx", target_os = "macos", target_arch = "aarch64"))]
 mod attn;
 /// The Mac gate tests of the compiled decode blocks (packet MX-COMPILE-1a items 5 to 7): the
@@ -101,6 +108,18 @@ mod real;
     target_arch = "aarch64"
 ))]
 mod route_parity;
+/// The router-trace capture of the ANE plan's slice M3: one ignored Mac-only run over the real
+/// checkpoint that records the expert ids and gates of every layer and token through the
+/// production Record step. Gated like `real` and `tool_forward`, because the whole module is
+/// the one run and every helper it reuses sits behind this gate (`prefill/timing.rs` gets the
+/// same gate transitively from its parent).
+#[cfg(all(
+    test,
+    feature = "native-mlx",
+    target_os = "macos",
+    target_arch = "aarch64"
+))]
+mod route_trace;
 #[cfg(all(
     test,
     feature = "native-mlx",

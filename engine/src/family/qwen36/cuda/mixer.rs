@@ -186,6 +186,11 @@ fn tail<'b>(range: DeviceRange<'b>, col: usize) -> Result<DeviceRange<'b>, EngEr
 }
 
 impl<'a> Mixers<'a> {
+    /// The layer weights the chunk model borrows (CPF-7b-C B.4).
+    pub(super) fn weights(&self) -> &MixerWeights<'a> {
+        &self.parts.weights
+    }
+
     pub(super) fn new(context: &'a CudaContext, parts: MixerParts<'a>) -> Result<Self, EngError> {
         check_delta_eps(parts.geometry.eps)?;
         let ops = KindOps::new(&parts.geometry, parts.layout, parts.kv_mode)?;

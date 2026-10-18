@@ -9,14 +9,17 @@
 //! is built per process: `BuildGuard` pins the flag before `spawn_engine`, commits it right
 //! after the leaks, and every retry in the same process is refused. No code copied.
 
-use super::super::settings::{KvDtype, NO_BUDGET_PIECE, Q36Settings, tokenizer_pin};
+use super::super::settings::{
+    DEFAULT_CUDA_PREFILL_CHUNK, KvDtype, NO_BUDGET_PIECE, Q36Settings, tokenizer_pin,
+};
 use super::{
     dims::{KvMode, StepDims, StepOptions, TieredPlan},
     pinned::{MIN_FREE_AFTER_LOAD, ROTARY_DIM, head_rows_of},
+    prefill_driver::PrefillBudget,
     resources::StepResources,
     rules::QwenRules,
     state_layout::KvPool,
-    step::{CaptureConfig, QwenResidentStep},
+    step::{CaptureConfig, ChunkVerdict, QwenResidentStep},
     tiered_load::{attach_tiered_parts, names_without_experts},
 };
 use crate::{
@@ -95,13 +98,33 @@ impl Drop for BuildGuard {
 }
 
 /// The start line of one MLX-only key the CUDA arm ignores (the settings record the names in
-/// the order of `Q36Options`).
+/// the order of `Q36Options`). `prefill_chunk` keeps its line until lane M's CPF-7a
+/// integration commit accepts the key as the cap of `M_sess` (decision 0049, A6 item 2).
 pub(crate) fn ignored_mlx_line(key: &str) -> &'static str {
     match key {
         "cache_limit_bytes" => "q36 cuda: cache_limit_bytes is an MLX allocator key and is ignored",
         "session_cap_bytes" => "q36 cuda: session_cap_bytes is an MLX session key and is ignored",
         "prefill_chunk" => "q36 cuda: prefill_chunk is an MLX chunked-prefill key and is ignored",
         _ => "q36 cuda: an unknown key of the object is ignored",
+    }
+}
+
+/// The start line of the session's prefill path (lane C R3, CPF-7b-C B.11): one line per
+/// session build, printed after the arena admission — the accept names the ADMITTED
+/// `M_sess`, every refusal names its reason, and the match is exhaustive (no `_` arm), so a
+/// new verdict cannot go unlabelled. `make` prints it once `admit_prefill` returns
+/// (CPF-7b-C C5); the text is pinned by the host rows of `prefill_driver_tests`.
+/// `pub(super)` like the enum it takes: a `pub(crate)` fn cannot expose the `pub(super)`
+/// verdict type (B.8), and every caller — `make`, the host row, the device row — is in
+/// `cuda`.
+pub(super) fn prefill_start_line(verdict: &ChunkVerdict) -> String {
+    match verdict {
+        ChunkVerdict::Ready { m_sess } => format!("q36 cuda: prefill chunk M_sess {m_sess}"),
+        ChunkVerdict::TiledLayout => "q36 cuda: prefill per token: tiled layout".to_owned(),
+        ChunkVerdict::Kv8 => "q36 cuda: prefill per token: 8-bit cache".to_owned(),
+        ChunkVerdict::Tiered => "q36 cuda: prefill per token: tiered mode".to_owned(),
+        ChunkVerdict::Q6KWeight => "q36 cuda: prefill per token: Q6_K weight".to_owned(),
+        ChunkVerdict::NoArena => "q36 cuda: prefill per token: no arena".to_owned(),
     }
 }
 
@@ -405,6 +428,20 @@ fn make(
     step.set_capture_config(CaptureConfig {
         capture: settings.capture,
     })?;
+    // The chunk cap of the step (decision 0049, A6 item 2): the config is not wired yet
+    // (lane C, 2026-10-14 — the CUDA arm ignores `prefill_chunk` until CPF-7a's integration
+    // commit), so the step holds the no-cap default `DEFAULT_CUDA_PREFILL_CHUNK`.
+    step.set_m_sess_cap(DEFAULT_CUDA_PREFILL_CHUNK);
+
+    // The prefill arena (CPF-7b-C B.1): ONE admission after the load and the step build,
+    // from the free VRAM measured after the load less the 1 GiB headroom. A refusal leaves
+    // the session on the per-token arm, and the start line below names the arm it took.
+    let device_free = after.free.saturating_sub(1usize << 30);
+    let verdict = step.admit_prefill(PrefillBudget {
+        device_free,
+        extras: Vec::new(),
+    })?;
+    eprintln!("{}", prefill_start_line(&verdict));
     if let Some(plan) = tiered {
         // The banks come last: they take what the weights, the KV cache and the step state left.
         attach_tiered_parts(

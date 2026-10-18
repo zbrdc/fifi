@@ -31,6 +31,9 @@ pub(crate) struct FlashOptions {
     pub(crate) tokenizer_vocab_size: Option<u32>,
     /// The prompt tokens per `prefill` call, from 1 to 512. The default is 16.
     pub(crate) prefill_chunk: Option<u32>,
+    /// Records speculative next-layer expert hints in one-token steps. The default is false.
+    /// Hints do not stage storage or change routing.
+    pub(crate) expert_prefetch: Option<bool>,
 }
 
 /// The environment fallbacks, read by the caller so that this file stays pure.
@@ -58,6 +61,8 @@ pub(crate) struct FlashSettings {
     pub(crate) tokenizer_vocab_size: u32,
     /// The prompt tokens per `prefill` call.
     pub(crate) prefill_chunk: u32,
+    /// The default-off expert hint seam. It performs no prefetch I/O in this slice.
+    pub(crate) expert_prefetch: bool,
 }
 
 fn bad(message: String) -> EngError {
@@ -146,6 +151,7 @@ impl FlashSettings {
                 1,
                 MAX_PREFILL_CHUNK,
             )?,
+            expert_prefetch: options.expert_prefetch.unwrap_or(false),
         })
     }
 }
@@ -162,6 +168,7 @@ mod tests {
             cache_limit_bytes: Some(1_073_741_824),
             tokenizer_vocab_size: Some(1000),
             prefill_chunk: Some(8),
+            expert_prefetch: Some(true),
         }
     }
 
@@ -188,6 +195,7 @@ mod tests {
                 cache_limit: 1_073_741_824,
                 tokenizer_vocab_size: 1000,
                 prefill_chunk: 8,
+                expert_prefetch: true,
             }
         );
     }
@@ -208,6 +216,7 @@ mod tests {
                 cache_limit: 2048,
                 tokenizer_vocab_size: 248_077,
                 prefill_chunk: 16,
+                expert_prefetch: false,
             }
         );
     }
@@ -340,6 +349,28 @@ mod tests {
     }
 
     #[test]
+    fn expert_prefetch_defaults_off_and_parses_both_booleans() {
+        let env = FlashEnv {
+            manifest: Some("/manifest.json".into()),
+            cache_limit: Some("1024".into()),
+        };
+        assert!(!settings(None, &env).unwrap().expert_prefetch);
+        for (json, expected) in [
+            ("{}", false),
+            (r#"{"expert_prefetch": false}"#, false),
+            (r#"{"expert_prefetch": true}"#, true),
+        ] {
+            let options: FlashOptions = serde_json::from_str(json).unwrap();
+            assert_eq!(
+                settings(Some(&options), &env).unwrap().expert_prefetch,
+                expected,
+                "{json}"
+            );
+        }
+        assert!(serde_json::from_str::<FlashOptions>(r#"{"expert_prefetch": 1}"#).is_err());
+    }
+
+    #[test]
     fn the_object_reads_from_json_and_rejects_an_unknown_member() {
         let text = r#"{"manifest": "/m.json", "cache_limit_bytes": 7, "prefill_chunk": 4}"#;
         let got: FlashOptions = serde_json::from_str(text).unwrap();
@@ -350,6 +381,7 @@ mod tests {
                 cache_limit_bytes: Some(7),
                 tokenizer_vocab_size: None,
                 prefill_chunk: Some(4),
+                expert_prefetch: None,
             }
         );
         let error = serde_json::from_str::<FlashOptions>(r#"{"context_limit": 9}"#).unwrap_err();

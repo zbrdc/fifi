@@ -21,7 +21,7 @@ use super::{
 use crate::{
     EngError,
     kernels::{
-        BinaryOp, ReduceOp, RopeSpec, UnaryOp,
+        BinaryOp, QuantizationMode, QuantizationSpec, ReduceOp, RopeSpec, UnaryOp,
         elementwise::{self, AxisRule, ElementwiseInputs, ElementwiseLayout, output_bytes},
         gated_delta,
         rope::{self, RopeLayout, RopeOperands, RopeStep},
@@ -1460,6 +1460,64 @@ impl Context {
                 weight.payload().storage.native_array(),
                 weight.scales().storage.native_array(),
                 biases,
+                ffi::optional_int(quant.group_size),
+                ffi::optional_int(quant.bits),
+                quant.mode.as_ptr(),
+                ffi::NULL_ARRAY,
+                ffi::mlx_optional_dtype {
+                    value: ffi::mlx_dtype__MLX_FLOAT32,
+                    has_value: true,
+                },
+                stream,
+            )
+        })?;
+        Ok(elementwise_result(state, output, layout))
+    }
+
+    /// Dequantizes one quantized KV side directly from its three residents (test builds only).
+    ///
+    /// The measurement twin of [`Self::dequantize`]: the packed entry reads the same three
+    /// arrays through a `ResidentPackedWeight`, whose only constructor `import_packed` needs a
+    /// host `PackedWeight`, so a caller that already holds a `QuantizedKv` side would have to
+    /// read its residents back and import them again. This entry hands the residents to the
+    /// same native call with no host round trip. A `QuantizedKv` side is affine by definition,
+    /// so `group_size` and `bits` carry its whole quantization. `logical_shape` declares the
+    /// F32 output shape (`[B, KVH, cap, D]` for a cache side); the native output shape comes
+    /// from the codes and the bits, so a declaration that disagrees with the residents fails
+    /// the strict result check and makes the adapter terminal, as a packed weight whose
+    /// imported parts disagree with its logical shape would. Every check, the F32 pin, and the
+    /// terminal failure rule are those of `dequantize`. No production caller can reach this
+    /// entry: it exists only in test builds and only inside the kernels mlx module.
+    #[cfg(test)]
+    pub(in crate::kernels::mlx) fn dequantize_kv_for_test(
+        &mut self,
+        side: &QuantizedKv<'_>,
+        logical_shape: &[u32],
+        group_size: u32,
+        bits: u32,
+    ) -> Result<ExecutionTensor, EngError> {
+        let label = "dequantize";
+        let _dispatch = DispatchGuard::enter();
+        self.check_ready()?;
+        let state = self.state.as_mut().unwrap();
+        check_owner(label, state, side.codes)?;
+        check_owner(label, state, side.scales)?;
+        check_owner(label, state, side.biases)?;
+        let spec = QuantizationSpec {
+            mode: QuantizationMode::Affine,
+            bits,
+            group_size,
+        };
+        let layout = shape::dequantize(label, logical_shape)?;
+        let quant = quant_args(spec)?;
+        clear_message();
+        let stream = state.stream.0;
+        let output = dispatch_elementwise(label, &layout, stream, |output| unsafe {
+            ffi::mlx_resident_dequantize(
+                output,
+                side.codes.storage.native_array(),
+                side.scales.storage.native_array(),
+                side.biases.storage.native_array(),
                 ffi::optional_int(quant.group_size),
                 ffi::optional_int(quant.bits),
                 quant.mode.as_ptr(),

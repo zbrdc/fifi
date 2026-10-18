@@ -693,7 +693,7 @@ PartArm arm_part() {
 }
 
 /* Enqueues both kernels. The part kernel is chosen and armed once per process, by a
- * function-local static with C++11 thread-safe initialisation (muse m3). A failed arm is
+ * function-local static with C++11 thread-safe initialisation (review m3). A failed arm is
  * cached too, so a transient failure stays permanent for the process; that assumes one
  * device per process, the engine's model. */
 Failure enqueue(const Args &k, void *stream) {

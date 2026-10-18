@@ -1,0 +1,45 @@
+{
+  "purpose": "Restored HumanEval baseline harness for the inference-engine repository. Protocol and the grading functions are byte-identical to the recovered originals; he_run_mlx.py requires the problems path and checks that it is readable, and he_grade.py adds input checks.",
+  "originals": {
+    "recovery_copy": "/media/dan/nvme/fifi/scrch/4ee8756/recovered-20260920/legacy-reference-implementer",
+    "migration_manifest": "migration-manifest.json (in the ledger)",
+    "files": {
+      "he_run_mlx.py": {
+        "manifest_sha256": "6f7ee0ce1f79643aaaed1e3295a971adfeae414a1c0c65195f55ba5e5ce4bd32",
+        "recovered_sha256": "6f7ee0ce1f79643aaaed1e3295a971adfeae414a1c0c65195f55ba5e5ce4bd32",
+        "match": true
+      },
+      "he_grade.py": {
+        "manifest_sha256": "a3564cca9d51cb3546a0083021c0e8972b4a36fccd367d0eb0131c776481689e",
+        "recovered_sha256": "a3564cca9d51cb3546a0083021c0e8972b4a36fccd367d0eb0131c776481689e",
+        "match": true
+      }
+    },
+    "mismatch": false
+  },
+  "modified": {
+    "he_run_mlx.py": {
+      "sha256": "6b37082a20690ec657492c1d5494d80c44016452622f93975c91ab983828ea85",
+      "diff": "main(model_path, out_path) gains a required problems_path parameter with no default; open(\"/tmp/he.jsonl\") becomes open(problems_path). A new function check_problems_path(path) opens the problems file, reads one byte, and exits with a message on OSError. __main__ requires exactly three command-line arguments, calls check_problems_path, and exits with a message and status 1 otherwise. INSTR template, MAXTOK, prompt construction, generation loop, and all other original lines unchanged."
+    },
+    "he_grade.py": {
+      "sha256": "eaf9344664bd8c3bc22315d4b10267c165f3c138ebdb871fafe60197b7508bd6",
+      "diff": "Problems path is a required third argv with no default. Adds input checks with physical line numbers: exactly 164 unique problems with required string fields; rejects unreadable files, invalid JSON, non-object lines, an empty response file, duplicate or unknown task IDs, and non-string task_id or response values. pass@1 is reported over 164 with the missing-response count. extract_block, final_text, and passes are unchanged from the original (verified by source comparison). The regrade of the recorded responses is still 73/164."
+    }
+  },
+  "protocol": {
+    "problems": 164,
+    "decoding": "greedy (make_sampler(temp=0.0))",
+    "max_tokens": 2000,
+    "subprocess_timeout_seconds": 10,
+    "metric": "pass@1",
+    "tests": "official HumanEval tests, check(entry_point) per problem",
+    "isolation": "isolated subprocess per problem (python -I)",
+    "instruction_template": "INSTR constant in he_run_mlx.py, byte-identical to original"
+  },
+  "historical_cross_reference": {
+    "source": "/media/dan/nvme/fifi/scrch/4ee8756/recovered-20260920/legacy-reference-implementer/he_edge0_result.txt",
+    "claim": "edge0-35b pass@1 140/164 = 85.4%",
+    "note": "Measured under the Edge0 stack with adapters. Not the plain-base mlx-lm baseline. Must not be copied as one."
+  }
+}

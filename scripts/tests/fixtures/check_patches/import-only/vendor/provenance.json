@@ -1,0 +1,44 @@
+{
+  "project": "fixture",
+  "files": {
+    "LICENSE": {
+      "upstream_path": "fake/LICENSE",
+      "upstream_sha256": "102787665349ee2923e1794219666613e7ea87f59f09602aacfbb857c205fe5b",
+      "vendored_sha256": "102787665349ee2923e1794219666613e7ea87f59f09602aacfbb857c205fe5b"
+    },
+    "src/common.h": {
+      "upstream_path": "fake/src/common.h",
+      "upstream_sha256": "06d500b8b62bdb7a0f1fa8172fa3ab1de98d224458bf5898c384ddcaf47fc610",
+      "vendored_sha256": "06d500b8b62bdb7a0f1fa8172fa3ab1de98d224458bf5898c384ddcaf47fc610"
+    },
+    "src/fake/core.cuh": {
+      "upstream_path": "fake/src/fake/core.cuh",
+      "upstream_sha256": "cc97b38b313d09eaac0105b8809da15fd67b801befc9f4549b287c1b3e0b46d8",
+      "vendored_sha256": "cc97b38b313d09eaac0105b8809da15fd67b801befc9f4549b287c1b3e0b46d8"
+    },
+    "src/fake/util.cuh": {
+      "upstream_path": "fake/src/fake/util.cuh",
+      "upstream_sha256": "126f86302e26c08f668d45a0a390fd41b454b050d6edec8466f6c3a0d4eb0012",
+      "vendored_sha256": "126f86302e26c08f668d45a0a390fd41b454b050d6edec8466f6c3a0d4eb0012"
+    },
+    "src/fake/pre.cuh": {
+      "upstream_path": "fake/src/fake/pre.cuh",
+      "upstream_sha256": "1901c47d8fc6bac7f8f9bfde15697159d4e49ef10911a20e866450a9bec0dc5f",
+      "vendored_sha256": "1901c47d8fc6bac7f8f9bfde15697159d4e49ef10911a20e866450a9bec0dc5f"
+    },
+    "src/main.cu": {
+      "upstream_path": "fake/src/main.cu",
+      "upstream_sha256": "395f3b589223178f750f8d66bdabcc2fe078af3ea43176f69064a15ddea7f2a4",
+      "vendored_sha256": "395f3b589223178f750f8d66bdabcc2fe078af3ea43176f69064a15ddea7f2a4"
+    }
+  },
+  "patches": [],
+  "shims": [
+    {
+      "include": "fake_ggml.h",
+      "stands_in_for": "fake/include/fake_ggml.h",
+      "path": "../shim/fake_ggml.h",
+      "sha256": null
+    }
+  ]
+}

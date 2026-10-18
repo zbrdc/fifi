@@ -1,0 +1,55 @@
+200 text/event-stream
+data: {"id":"ID","object":"chat.completion.chunk","created":0,"model":"toolbot","engine":"e2","choices":[{"index":0,"delta":{"role":"assistant","content":""}}]}
+
+data: {"id":"ID","object":"chat.completion.chunk","created":0,"model":"toolbot","engine":"e2","choices":[{"index":0,"delta":{"reasoning_content":"I"}}]}
+
+data: {"id":"ID","object":"chat.completion.chunk","created":0,"model":"toolbot","engine":"e2","choices":[{"index":0,"delta":{"reasoning_content":" n"}}]}
+
+data: {"id":"ID","object":"chat.completion.chunk","created":0,"model":"toolbot","engine":"e2","choices":[{"index":0,"delta":{"reasoning_content":"e"}}]}
+
+data: {"id":"ID","object":"chat.completion.chunk","created":0,"model":"toolbot","engine":"e2","choices":[{"index":0,"delta":{"reasoning_content":"e"}}]}
+
+data: {"id":"ID","object":"chat.completion.chunk","created":0,"model":"toolbot","engine":"e2","choices":[{"index":0,"delta":{"reasoning_content":"d"}}]}
+
+data: {"id":"ID","object":"chat.completion.chunk","created":0,"model":"toolbot","engine":"e2","choices":[{"index":0,"delta":{"reasoning_content":" t"}}]}
+
+data: {"id":"ID","object":"chat.completion.chunk","created":0,"model":"toolbot","engine":"e2","choices":[{"index":0,"delta":{"reasoning_content":"h"}}]}
+
+data: {"id":"ID","object":"chat.completion.chunk","created":0,"model":"toolbot","engine":"e2","choices":[{"index":0,"delta":{"reasoning_content":"e"}}]}
+
+data: {"id":"ID","object":"chat.completion.chunk","created":0,"model":"toolbot","engine":"e2","choices":[{"index":0,"delta":{"reasoning_content":" s"}}]}
+
+data: {"id":"ID","object":"chat.completion.chunk","created":0,"model":"toolbot","engine":"e2","choices":[{"index":0,"delta":{"reasoning_content":"u"}}]}
+
+data: {"id":"ID","object":"chat.completion.chunk","created":0,"model":"toolbot","engine":"e2","choices":[{"index":0,"delta":{"reasoning_content":"m"}}]}
+
+data: {"id":"ID","object":"chat.completion.chunk","created":0,"model":"toolbot","engine":"e2","choices":[{"index":0,"delta":{"reasoning_content":"."}}]}
+
+data: {"id":"ID","object":"chat.completion.chunk","created":0,"model":"toolbot","engine":"e2","choices":[{"index":0,"delta":{"content":"A"}}]}
+
+data: {"id":"ID","object":"chat.completion.chunk","created":0,"model":"toolbot","engine":"e2","choices":[{"index":0,"delta":{"content":"d"}}]}
+
+data: {"id":"ID","object":"chat.completion.chunk","created":0,"model":"toolbot","engine":"e2","choices":[{"index":0,"delta":{"content":"d"}}]}
+
+data: {"id":"ID","object":"chat.completion.chunk","created":0,"model":"toolbot","engine":"e2","choices":[{"index":0,"delta":{"content":"i"}}]}
+
+data: {"id":"ID","object":"chat.completion.chunk","created":0,"model":"toolbot","engine":"e2","choices":[{"index":0,"delta":{"content":"n"}}]}
+
+data: {"id":"ID","object":"chat.completion.chunk","created":0,"model":"toolbot","engine":"e2","choices":[{"index":0,"delta":{"content":"g"}}]}
+
+data: {"id":"ID","object":"chat.completion.chunk","created":0,"model":"toolbot","engine":"e2","choices":[{"index":0,"delta":{"content":" n"}}]}
+
+data: {"id":"ID","object":"chat.completion.chunk","created":0,"model":"toolbot","engine":"e2","choices":[{"index":0,"delta":{"content":"o"}}]}
+
+data: {"id":"ID","object":"chat.completion.chunk","created":0,"model":"toolbot","engine":"e2","choices":[{"index":0,"delta":{"content":"w"}}]}
+
+data: {"id":"ID","object":"chat.completion.chunk","created":0,"model":"toolbot","engine":"e2","choices":[{"index":0,"delta":{"content":"."}}]}
+
+data: {"id":"ID","object":"chat.completion.chunk","created":0,"model":"toolbot","engine":"e2","choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"id":"call_ID_0","type":"function","function":{"name":"add","arguments":""}}]}}]}
+
+data: {"id":"ID","object":"chat.completion.chunk","created":0,"model":"toolbot","engine":"e2","choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"function":{"arguments":"{\"a\":1,\"b\":2}"}}]}}]}
+
+data: {"id":"ID","object":"chat.completion.chunk","created":0,"model":"toolbot","engine":"e2","choices":[{"index":0,"delta":{},"finish_reason":"tool_calls"}],"usage":{"prompt_tokens":21,"completion_tokens":151,"total_tokens":172,"reused_tokens":0}}
+
+data: [DONE]
+

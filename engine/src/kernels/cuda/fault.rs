@@ -27,7 +27,8 @@ use super::native::resident::graph::{fault_null_write_launch, fault_null_write_w
 use super::native::{self, DeviceFailure};
 use super::{
     CHUNK_LIMIT, CapturePlan, CudaContext, DeviceBuffer, DeviceEvent, DeviceStream, MatmulIo,
-    PackCall, PinnedWord, Projection, QuantTensor, TERMINAL, native_error, stage_operation,
+    PackCall, PinnedWord, Projection, QuantTensor, TERMINAL, device_present, native_error,
+    stage_operation,
 };
 use crate::EngError;
 use crate::family::project::Projector;
@@ -42,24 +43,6 @@ const TERMINAL_MESSAGE: &str = "CUDA backend is terminal after an earlier native
 /// `cudaErrorIllegalAddress`, the status a null-pointer write reports at synchronize.
 const CUDA_ERROR_ILLEGAL_ADDRESS: c_int = 700;
 const ILLEGAL_ADDRESS_MESSAGE: &str = "an illegal memory access was encountered (status 700)";
-
-/// Mirrors `tests/cuda_smoke.rs`: a host with no device skips the test, unless
-/// `INFERENCE_CUDA_REQUIRE_DEVICE` turns the missing device into a failure.
-fn device_present(test: &str) -> bool {
-    let count = super::device_count().expect("CUDA device count query");
-    println!("CUDA devices visible: {count}");
-    if count > 0 {
-        return true;
-    }
-    let required = std::env::var("INFERENCE_CUDA_REQUIRE_DEVICE")
-        .is_ok_and(|value| !value.is_empty() && value != "0");
-    assert!(
-        !required,
-        "INFERENCE_CUDA_REQUIRE_DEVICE is set but no CUDA device is visible"
-    );
-    println!("SKIPPED {test}: no CUDA device");
-    false
-}
 
 /// The resident owners made while the device is healthy: later calls on them must
 /// be refused, and their drops must make no native call.

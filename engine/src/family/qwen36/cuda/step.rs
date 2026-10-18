@@ -34,13 +34,19 @@
 //! Design guidance only, no code copied.
 
 use super::{
-    dims::StepOptions,
+    dims::{KvMode, StepOptions},
+    layer_table::LayerTable,
     mixer::{BlockIo, MixerParts, MixerViews, Mixers},
+    mixer_geometry::MixerGeometry,
     mixer_weights::MixerWeights,
     moe::{
         ExpertBufs, Launch, MoeBuffers, MoeDims, MoeLayerWeights, Packs, RouteBufs, run_moe_block,
         tiered::TieredScratch,
     },
+    prefill_driver::{
+        AdmitFacts, PrefillArena, PrefillBudget, admit_guard, admit_m_sess, needs_arena,
+    },
+    prefill_plan::{chunk_costs, state_bytes},
     prefix::CudaPrefillPath,
     readback::{
         ReadbackPlan, SYNC_EACH_VAR, captured_report, check_mode, eager_report, parse_sync_each,
@@ -51,7 +57,7 @@ use super::{
         f32_bytes, moe_dims, moe_layer_parts, moe_layer_weights,
     },
     rules::{QwenRules, StepWidths, check_token_id, validate_step_inputs},
-    run_report::{CaptureOutcome, HostSyncs, RunReport},
+    run_report::{CaptureOutcome, HostSyncs, PrefillReport, RunReport, StepKind, StepRecord},
     state::{ResidentState, StepField, export::ExportedState},
     state_layout::{StateLayout, Word},
     step_ops::{StepOp, final_resid, resid_in, resid_out, token_ops},
@@ -63,7 +69,9 @@ use super::{
 };
 use crate::{
     EngError,
-    family::project::cuda::{CudaWeights, WeightLayout},
+    family::gguf_model::Role,
+    family::project::cuda::{CudaWeight, CudaWeights, WeightLayout},
+    family::qwen36::settings::DEFAULT_CUDA_PREFILL_CHUNK,
     family::qwen36::tiered::{host::TieredHost, report::TokenReport},
     family::session::PrefixSlot,
     kernels::cuda::{
@@ -73,7 +81,7 @@ use crate::{
             add_norm_pack::AddNormCall,
             add_rmsnorm_q8::AddNormQ8Call,
             embed::{EmbedCall, EmbedNativeCall},
-            matvec_q::MatvecCall,
+            matvec_q::{MatvecCall, QuantType},
             step_params::{ArgmaxCall, ResultPair, StepParams, StepStatus},
         },
     },
@@ -225,6 +233,11 @@ pub(crate) struct QwenResidentStep<'a> {
     /// against the options at construction.
     layout: WeightLayout,
     moe_dims: MoeDims,
+    /// The prefill arena of the session (CPF-7b-C B.1/B.3): admitted ONCE by
+    /// `admit_prefill` after the step is built and the cap is set, and only for a session
+    /// whose pre-arena verdict passes (`needs_arena`). Declared BEFORE the state: the
+    /// arena drops before the state's buffers by drop order.
+    prefill: Option<PrefillArena>,
     state: ResidentState,
     word: PinnedWord,
     event: DeviceEvent,
@@ -246,12 +259,143 @@ pub(crate) struct QwenResidentStep<'a> {
     /// The sampler widths the step wires in (see `rules::StepWidths`): the argmax `n` and the
     /// verdict width, both the sampler vocabulary, never the padded head width.
     widths: StepWidths,
+    /// True when any MMQ weight of the chunk is Q6_K (`any_chunk_weight_q6k` at build), the
+    /// refusal of decision 0049 amendment A6 item 4.
+    chunk_q6k: bool,
+    /// The cap of `M_sess` (decision 0049, A6 item 2), set by `set_m_sess_cap`; the value is
+    /// the no-cap default until lane M's CPF-7a integration commit wires the config member
+    /// `qwen36.prefill_chunk` into it (lane C, 2026-10-14).
+    m_sess_cap: u32,
     /// The bytes of the last logits row read back (little-endian f32).
     logits_bytes: Vec<u8>,
     report: RunReport,
+    /// The prefill report of this session (CPF-7b-C B.8): the chunk and feed steps and the
+    /// counts the serve surface prints. Host values only.
+    prefill_report: PrefillReport,
     /// The engine's one saved prefix entry (decision 0036, addendum 1): host memory only
     /// (`ExportedState`), so its place in the drop order is free.
     pub(super) prefix: PrefixSlot<ExportedState, CudaPrefillPath>,
+}
+
+/// The typed verdict of the chunk gate (plan CPF-V4 rev 3 §C.4): whether `feed_rows` may run
+/// the chunk path for this session. Every refusal keeps the per-token prompt path; the run
+/// report records the reason when its fields land (CPF-7b).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum ChunkVerdict {
+    /// The session may use the chunk path. `m_sess` is the ADMITTED `M_sess`, one of
+    /// `M_LADDER` (`PrefillArena::m_sess`), never the raw cap: the arena admission of
+    /// CPF-7b-C narrows the cap of `set_m_sess_cap` to the largest ladder size whose
+    /// device sum fits the budget (CPF-7b-C B.2).
+    Ready {
+        /// The first reader is the chunk list of the prefill driver (CPF-1, decision 0049).
+        m_sess: usize,
+    },
+    /// The session runs the Tiled layout: the chunk path is defined for Native sessions only
+    /// (decision 0049, amendment A4 item 2).
+    TiledLayout,
+    /// The KV cache is Int8G32: v1 has no KV8 prefill (only the default serve path selects
+    /// Fp16; `kv_dtype` q8 selects Int8G32 on the Native layout).
+    Kv8,
+    /// The session is tiered: `chunk_ready` sends tiered sessions to the per-token loop
+    /// (plan §C.4); the tiered prefill stage is OFF-7's seam I5.
+    Tiered,
+    /// An MMQ weight of the chunk is Q6_K: no Q6_K chunk row exists, so the session keeps the
+    /// per-token path (decision 0049, A6 item 4).
+    Q6KWeight,
+    /// The session admitted no prefill arena (no `M` of the ladder fits the budget, or
+    /// `admit_prefill` was not called); the session keeps the per-token path (CPF-7b-C
+    /// B.2, carry item 4 of the merge note).
+    NoArena,
+}
+
+/// The chunk gate's inputs, fixed at step build (plan §C.4): the session's layout, KV mode
+/// and tier flag, the Q6_K scan of the chunk's MMQ weights, the cap of `M_sess`, and the
+/// admitted arena (CPF-7b-C B.2).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) struct ChunkFacts {
+    pub(super) layout: WeightLayout,
+    pub(super) kv_mode: KvMode,
+    pub(super) tiered: bool,
+    /// True when any MMQ weight of the chunk is Q6_K (`any_chunk_weight_q6k`).
+    pub(super) mmq_q6k: bool,
+    /// The cap of `M_sess` (`qwen36.prefill_chunk` on the CUDA arm). It stays beside the
+    /// admitted size: the run report needs both (CPF-8a §E.2).
+    pub(super) m_sess_cap: u32,
+    /// The admitted `M_sess` of the prefill arena (`PrefillArena::m_sess`); `None` until
+    /// `admit_prefill` admits one, so the gate answers `NoArena` (CPF-7b-C B.2).
+    pub(super) arena: Option<usize>,
+}
+
+/// The chunk gate itself, in the order of plan §C.4: Native first, then Fp16 KV, then the
+/// tier flag, then the Q6_K scan, then the admitted arena. The first refusal wins, so a
+/// session that fails more than one condition reports the earliest one; `NoArena` is
+/// checked after the Q6_K scan, and the accept verdict carries the ADMITTED size.
+pub(super) fn chunk_verdict(facts: &ChunkFacts) -> ChunkVerdict {
+    if facts.layout != WeightLayout::Native {
+        return ChunkVerdict::TiledLayout;
+    }
+    if facts.kv_mode != KvMode::Fp16 {
+        return ChunkVerdict::Kv8;
+    }
+    if facts.tiered {
+        return ChunkVerdict::Tiered;
+    }
+    if facts.mmq_q6k {
+        return ChunkVerdict::Q6KWeight;
+    }
+    let Some(m_sess) = facts.arena else {
+        return ChunkVerdict::NoArena;
+    };
+    ChunkVerdict::Ready { m_sess }
+}
+
+/// The MoE roles whose weights the chunk's MMQ launches read beside every dense projection of
+/// `MixerGeometry`: the routed expert stacks and the shared expert. The router matrices are
+/// raw f32 (not an MMQ input), the embedding is a Q4_K gather and the head runs in the decode
+/// step only (plan §A.4, §C.1), so none of the three is scanned.
+pub(super) const CHUNK_MOE_ROLES: [Role; 6] = [
+    Role::FfnGateExps,
+    Role::FfnUpExps,
+    Role::FfnDownExps,
+    Role::FfnGateShexp,
+    Role::FfnUpShexp,
+    Role::FfnDownShexp,
+];
+
+/// True when any MMQ weight of the chunk is Q6_K (decision 0049, A6 item 4): every dense
+/// projection of every layer plus the roles of `CHUNK_MOE_ROLES`. `quant_of` answers the
+/// quant type of the loaded Native tensor that the layer table names; `None` means the
+/// tensor was not loaded — legitimate only for the six MoE roles under a tiered load (the
+/// stacks stay in the file, and the `Tiered` verdict refuses such a session anyway), so an
+/// absent dense projection is a `Checkpoint` refusal naming the tensor: dense projections
+/// load in every mode (review B-3, review MINOR-2). Tiled loads carry no quant type and the
+/// layout refusal covers them.
+pub(super) fn any_chunk_weight_q6k(
+    table: &LayerTable,
+    geometry: &MixerGeometry,
+    quant_of: impl Fn(&str) -> Option<QuantType>,
+) -> Result<bool, EngError> {
+    for layer in 0..table.len() {
+        let kind = table.slot(layer)?.kind;
+        for spec in geometry.dense_specs(kind)? {
+            let name = table.name(layer, spec.role)?;
+            match quant_of(name) {
+                Some(QuantType::Q6K) => return Ok(true),
+                Some(_) => {}
+                None => {
+                    return Err(EngError::Checkpoint(format!(
+                        "chunk gate: {name} is not loaded; dense projections load in every mode"
+                    )));
+                }
+            }
+        }
+        for role in CHUNK_MOE_ROLES {
+            if quant_of(table.name(layer, role)?) == Some(QuantType::Q6K) {
+                return Ok(true);
+            }
+        }
+    }
+    Ok(false)
 }
 
 impl<'a> QwenResidentStep<'a> {
@@ -325,7 +469,16 @@ impl<'a> QwenResidentStep<'a> {
         let mut pinned: Vec<&'a DeviceBuffer> = weights.device_buffers().collect();
         pinned.push(res.arena.buffer());
         let pins: &'a [&'a DeviceBuffer] = Box::leak(pinned.into_boxed_slice());
-        Ok(Self {
+        // The chunk gate's Q6_K scan (decision 0049, A6 item 4), beside the other build-time
+        // facts: only Native weights carry a quant type; a Tiled session is refused by its
+        // layout before the scan matters. The lookup answers `None` for a tensor the load
+        // left in the file (the tiered stacks), which the scan takes as not Q6_K.
+        let chunk_q6k = options.layout == WeightLayout::Native
+            && any_chunk_weight_q6k(&res.table, &res.geometry, |name| match weights.get(name) {
+                Some(CudaWeight::Native { weight, .. }) => Some(weight.quant()),
+                _ => None,
+            })?;
+        let step = Self {
             pins,
             graph: None,
             context,
@@ -344,6 +497,7 @@ impl<'a> QwenResidentStep<'a> {
             )?,
             layout: options.layout,
             moe_dims: moe_dims(&res.dims),
+            prefill: None,
             state,
             word,
             event,
@@ -355,10 +509,16 @@ impl<'a> QwenResidentStep<'a> {
             refused: false,
             rules,
             widths,
+            chunk_q6k,
+            m_sess_cap: DEFAULT_CUDA_PREFILL_CHUNK,
             logits_bytes: vec![0; f32_bytes(vocab)?],
             report: RunReport::default(),
+            prefill_report: PrefillReport::default(),
             prefix: PrefixSlot::default(),
-        })
+        };
+        let mut step = step;
+        step.refill_prefill_report();
+        Ok(step)
     }
 
     /// Sets the capture settings; refuses after the first token and refuses
@@ -375,10 +535,116 @@ impl<'a> QwenResidentStep<'a> {
         Ok(())
     }
 
+    /// Sets the cap of `M_sess` (decision 0049, A6 item 2: one of 128, 256, 512, 1,024 and
+    /// 2,048 once the config is wired). The serve start calls this once at session build,
+    /// beside `set_capture_config`; until lane M's CPF-7a integration commit accepts
+    /// `qwen36.prefill_chunk` (lane C, 2026-10-14: the CUDA arm ignores the key), the call
+    /// passes the no-cap default, and `chunk_ready` carries the cap only in its accept
+    /// verdict.
+    pub(crate) fn set_m_sess_cap(&mut self, m_sess_cap: u32) {
+        self.m_sess_cap = m_sess_cap;
+    }
+
+    /// Admits the session's prefill arena (CPF-7b-C B.1): the two guards first (before the
+    /// first token, at most once — `admit_guard`), then the pre-arena verdict — a session
+    /// whose layout, KV mode, tier flag or Q6_K scan refuses the chunk path gets its
+    /// refusal verdict back with NOTHING allocated and no device fact even queried — then
+    /// the MMQ device facts, the ladder costs and [`admit_m_sess`] with the REAL state
+    /// term. An admitted `M` allocates the [`PrefillArena`] (the whole-arena zero fill of
+    /// B.3 runs here, ONCE per session); `None` allocates nothing. Both outcomes return
+    /// `chunk_ready()`: `Ready` with the admitted `M_sess`, or `NoArena`.
+    ///
+    /// A `MemoryPlan` from `PrefillArena::allocate` after a passing admission fails the
+    /// start: the budget snapshot is stale (another process took VRAM between the load and
+    /// here), and failing loud matches the free-after-load floor of `make`. The partly
+    /// built arena is dropped before the error returns — `allocate` fills the arena before
+    /// it takes `part`, and nothing of it survives a refusal.
+    ///
+    /// The tiered attach of `make` never meets an arena: `needs_arena` is false for a
+    /// tiered session, so the refusal returns before any allocation.
+    pub(crate) fn admit_prefill(
+        &mut self,
+        budget: PrefillBudget,
+    ) -> Result<ChunkVerdict, EngError> {
+        admit_guard(self.started, self.prefill.is_some())?;
+        let layout = self.state.layout();
+        if !needs_arena(
+            self.layout,
+            layout.kv.mode,
+            self.tiered_mode,
+            self.chunk_q6k,
+        ) {
+            return Ok(self.chunk_ready());
+        }
+        let admit = AdmitFacts {
+            budget: budget.device_free,
+            decode_arena: self.res.arena.bytes(),
+            state_planned: state_bytes(
+                &self.res.dims,
+                layout.kv.mode,
+                layout.kv.capacity,
+                layout.delta.slots,
+            )?,
+            state_allocated: layout.bytes()?,
+            cap: self.m_sess_cap as usize,
+        };
+        let facts = self.context.mmq_device_facts()?;
+        let costs = chunk_costs(&self.res.dims, facts.nsm)?;
+        let Some(m) = admit_m_sess(&admit, &budget.extras, &costs)? else {
+            return Ok(self.chunk_ready());
+        };
+        self.prefill = Some(PrefillArena::allocate(
+            self.context,
+            &self.stream,
+            &self.res.dims,
+            m,
+            facts,
+            budget.device_free,
+        )?);
+        // The report static fields come from the arena (CPF-7b-C B.8): refill them now,
+        // because the arena did not exist when the step was built. The session has no
+        // steps yet, so the refill cannot drop a record.
+        self.refill_prefill_report();
+        Ok(self.chunk_ready())
+    }
+
+    /// The chunk-gate verdict of this session (plan §C.4): whether `feed_rows` may run the
+    /// chunk path. The conditions, in order: the Native layout (A4 item 2), `Fp16` KV, a
+    /// non-tiered session, no Q6_K MMQ weight of the chunk (A6 item 4), and an ADMITTED
+    /// prefill arena (CPF-7b-C B.2) — until `admit_prefill` admits one, an otherwise-ready
+    /// session answers `NoArena` and keeps the per-token path. The accept verdict carries
+    /// the admitted `M_sess` of the arena, never the raw cap.
+    pub(super) fn chunk_ready(&self) -> ChunkVerdict {
+        chunk_verdict(&ChunkFacts {
+            layout: self.layout,
+            kv_mode: self.state.layout().kv.mode,
+            tiered: self.tiered_mode,
+            mmq_q6k: self.chunk_q6k,
+            m_sess_cap: self.m_sess_cap,
+            arena: self.prefill.as_ref().map(PrefillArena::m_sess),
+        })
+    }
+
     /// The report of the last SUCCESSFUL token: after a failed token it still holds the previous
     /// token's numbers.
     pub(crate) fn last_report(&self) -> RunReport {
         self.report
+    }
+
+    /// The resident state of the step, for the device tests' direct writes and reads (the
+    /// poison NaN of DV-B3 through `delta_rec`, the stale word of DV-B4 through `word`):
+    /// the production surface keeps the state private, so the rows reach it through this
+    /// test-only borrow. Test builds only.
+    #[cfg(test)]
+    pub(super) fn state_for_tests(&self) -> &ResidentState {
+        &self.state
+    }
+
+    /// The step own stream, for the device tests direct writes (DV-B4 stale word). Test
+    /// builds only.
+    #[cfg(test)]
+    pub(super) fn stream_for_tests(&self) -> &DeviceStream {
+        &self.stream
     }
 
     /// Builds the tiered runtime of a step made with `StepOptions.tiered`: one bank per layer
@@ -427,9 +693,187 @@ impl<'a> QwenResidentStep<'a> {
         self.state.tokens()
     }
 
+    /// Feeds prompt rows through the chunk plan (CPF-7b-C C4a): a multi-row step runs as one
+    /// chunk, a one-row step through the per-token feed. The chunk protocol records its own
+    /// step; this closure records only the feed steps. start_rows is taken at the first
+    /// chunked call of a reset or import epoch.
+    pub(super) fn feed_rows_chunked(
+        &mut self,
+        tokens: &[u32],
+        m_sess: usize,
+    ) -> Result<(), EngError> {
+        use super::prefill_driver::drive_chunks;
+        use super::prefill_plan::PrefillStep;
+        use crate::family::session::TokenStepper;
+
+        let start = self.tokens();
+        self.prefill_report.note_chunked_epoch_start(start);
+        drive_chunks(start, tokens, m_sess, |step, rows| match step {
+            PrefillStep::Chunk { p0, .. } => self.run_chunk(p0, rows),
+            PrefillStep::Feed { p0 } => {
+                let [token] = rows else {
+                    return Err(EngError::BadRequest(
+                        "prefill chunk: a feed step needs exactly one row".to_owned(),
+                    ));
+                };
+                let opened = std::time::Instant::now();
+                TokenStepper::feed(self, *token)?;
+                let ns = u64::try_from(opened.elapsed().as_nanos()).unwrap_or(u64::MAX);
+                self.record_feed(p0, ns);
+                Ok(())
+            }
+        })
+        .map(|_| ())
+    }
+
+    /// Records one one-row feed step of the prefill report.
+    pub(super) fn record_feed(&mut self, p0: usize, ns: u64) {
+        self.prefill_report.push_step(StepRecord {
+            p0,
+            rows: 1,
+            kind: StepKind::Feed,
+            ns,
+            status: 0,
+        });
+    }
+
+    /// Runs ONE prefill chunk of rows at p0 (CPF-7b-C B.4, decision 0049): the open, clear,
+    /// body, status-read, record and publish protocol. The one host wait of a chunk is the status
+    /// read (protection 2). Every error after the chunk opens poisons the state.
+    pub(super) fn run_chunk(&mut self, p0: usize, rows: &[u32]) -> Result<(), EngError> {
+        use super::moe::Launch;
+        use super::prefill::{
+            ChunkBufs, ChunkModel, ChunkRows, ChunkRun, ChunkViews, ChunkWeights, run_chunk_body,
+        };
+        use super::prefill_driver::{check_chunk_start, chunk_ids};
+        use super::prefill_plan::ChunkSlot;
+
+        let Self {
+            state,
+            prefill,
+            mixers,
+            moe,
+            globals,
+            context,
+            stream,
+            res,
+            widths,
+            prefill_report,
+            started,
+            ..
+        } = self;
+        // 1. Host checks. Nothing touches the device before all of them pass.
+        check_chunk_start(p0, state.tokens())?;
+        let arena = prefill
+            .as_ref()
+            .ok_or_else(|| EngError::BadRequest("prefill chunk: no prefill arena".to_owned()))?;
+        let m = rows.len();
+        let chunk_rows = ChunkRows::new(p0, m, state.layout().kv.capacity, arena.m_sess())?;
+        let ids = chunk_ids(rows, widths.verdict)?;
+        let embed = match globals.embed {
+            super::resources::GlobalWeight::Native(weight) => weight,
+            super::resources::GlobalWeight::Tiled(_) => {
+                return Err(EngError::BadRequest(
+                    "prefill chunk: the embedding is not native".to_owned(),
+                ));
+            }
+        };
+        // 2. The chunk parts, still before any device state change: a refusal leaves the state
+        //    untouched.
+        let views = ChunkViews::new(arena.list(), arena.arena())?;
+        let ids_range = views.get(ChunkSlot::IdsTok)?;
+        let bufs = ChunkBufs::new(
+            views,
+            arena.part().range(0, arena.part_bytes())?,
+            arena.facts(),
+            arena.m_sess(),
+        )?;
+        let model = ChunkModel::new(
+            &res.table,
+            &res.geometry,
+            &res.dims,
+            ChunkWeights::new(mixers.weights(), moe, embed),
+        )?;
+        // 3. From here every error poisons.
+        *started = true;
+        let opened = std::time::Instant::now();
+        let body = || -> Result<(), EngError> {
+            state.begin_prefill()?;
+            state.clear_prefill_status(stream)?;
+            let bytes: Vec<u8> = ids.iter().flat_map(|id| id.to_le_bytes()).collect();
+            ids_range
+                .buffer()
+                .write_at(stream, ids_range.offset(), &bytes)?;
+            let run = ChunkRun::new(&*state, &model, &bufs, chunk_rows)?;
+            run_chunk_body(
+                &Launch {
+                    ctx: context,
+                    stream,
+                },
+                &run,
+            )
+        };
+        body().inspect_err(|_| state.poison())?;
+        let status = state
+            .read_prefill_status(stream)
+            .inspect_err(|_| state.poison())?;
+        let ns = u64::try_from(opened.elapsed().as_nanos()).unwrap_or(u64::MAX);
+        prefill_report.push_step(StepRecord {
+            p0,
+            rows: m,
+            kind: StepKind::Chunk,
+            ns,
+            status,
+        });
+        state
+            .revalidate(stream, p0 + m, status)
+            .inspect_err(|_| state.poison())?;
+        Ok(())
+    }
+
     /// Whether the step runs the tiered MoE path: a tiered step never saves a prefix.
     pub(super) fn is_tiered(&self) -> bool {
         self.tiered_mode
+    }
+
+    /// The prefill report of this session (CPF-7b-C B.8).
+    pub(crate) fn last_prefill_report(&self) -> &PrefillReport {
+        &self.prefill_report
+    }
+
+    /// Records one feed_rows call and the verdict it routed on.
+    pub(super) fn note_feed_rows(&mut self, verdict: &ChunkVerdict, rows: usize) {
+        self.prefill_report.note_feed_rows(verdict, rows);
+    }
+
+    /// Takes the once-per-job prefill line.
+    pub(super) fn take_job_line(&mut self) -> Option<String> {
+        self.prefill_report.take_job_line()
+    }
+
+    /// Records one ExecutorOps::prefill call with its host wall time.
+    pub(super) fn record_prefill_piece(&mut self, tokens: usize, began: std::time::Instant) {
+        let ns = u64::try_from(began.elapsed().as_nanos()).unwrap_or(u64::MAX);
+        self.prefill_report.record_piece(tokens, ns);
+    }
+
+    /// The static fields of the prefill report from the session as it stands: the cap, the
+    /// arena and its part buffer (absent before the admission), the budget, the cache mode, the
+    /// layout and the capture setting.
+    fn refill_prefill_report(&mut self) {
+        let (arena_bytes, part_bytes, budget_bytes) = match self.prefill.as_ref() {
+            Some(arena) => (arena.bytes(), arena.part_bytes(), arena.budget()),
+            None => (0, 0, 0),
+        };
+        self.prefill_report.refill(
+            usize::try_from(self.m_sess_cap).unwrap_or(usize::MAX),
+            arena_bytes,
+            part_bytes,
+            budget_bytes,
+            self.state.layout().kv.mode,
+            self.layout,
+            self.capture_on,
+        );
     }
 
     /// The state layout, for the entry-byte charge of a prefix save.
@@ -440,7 +884,9 @@ impl<'a> QwenResidentStep<'a> {
     /// Zeroes the session state (see `ResidentState::reset`) and leaves it `Valid`; only a device
     /// write that failed in the middle of the reset leaves it `Poisoned`.
     pub(crate) fn reset_state(&mut self) -> Result<(), EngError> {
-        self.state.reset(&self.stream)
+        self.state.reset(&self.stream)?;
+        self.refill_prefill_report();
+        Ok(())
     }
 
     /// The committed state as a host value (checkpoint store, decision 0036).
@@ -450,7 +896,9 @@ impl<'a> QwenResidentStep<'a> {
 
     /// Replaces the committed state.
     pub(crate) fn import_state(&mut self, exported: &ExportedState) -> Result<(), EngError> {
-        self.state.import_state(&self.stream, exported)
+        self.state.import_state(&self.stream, exported)?;
+        self.refill_prefill_report();
+        Ok(())
     }
 
     fn view(&self, slot: Slot) -> Result<DeviceRange<'a>, EngError> {

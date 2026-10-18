@@ -1,0 +1,98 @@
+{
+  "project": "fixture",
+  "files": {
+    "LICENSE": {
+      "upstream_path": "fake/LICENSE",
+      "upstream_sha256": "102787665349ee2923e1794219666613e7ea87f59f09602aacfbb857c205fe5b",
+      "vendored_sha256": "102787665349ee2923e1794219666613e7ea87f59f09602aacfbb857c205fe5b"
+    },
+    "src/inc/common.h": {
+      "upstream_path": "fake/src/inc/common.h",
+      "upstream_sha256": "06d500b8b62bdb7a0f1fa8172fa3ab1de98d224458bf5898c384ddcaf47fc610",
+      "vendored_sha256": "06d500b8b62bdb7a0f1fa8172fa3ab1de98d224458bf5898c384ddcaf47fc610"
+    },
+    "src/fake/core.cuh": {
+      "upstream_path": "fake/src/fake/core.cuh",
+      "upstream_sha256": "cc97b38b313d09eaac0105b8809da15fd67b801befc9f4549b287c1b3e0b46d8",
+      "vendored_sha256": "cc97b38b313d09eaac0105b8809da15fd67b801befc9f4549b287c1b3e0b46d8"
+    },
+    "src/fake/util.cuh": {
+      "upstream_path": "fake/src/fake/util.cuh",
+      "upstream_sha256": "126f86302e26c08f668d45a0a390fd41b454b050d6edec8466f6c3a0d4eb0012",
+      "vendored_sha256": "126f86302e26c08f668d45a0a390fd41b454b050d6edec8466f6c3a0d4eb0012",
+      "patched_sha256": "a9496603245d1e6c55eeca1f12e6e3120fd9a2d79b2887484c1e5d4cf4240b43"
+    },
+    "src/fake/pre.cuh": {
+      "upstream_path": "fake/src/fake/pre.cuh",
+      "upstream_sha256": "1901c47d8fc6bac7f8f9bfde15697159d4e49ef10911a20e866450a9bec0dc5f",
+      "vendored_sha256": "1901c47d8fc6bac7f8f9bfde15697159d4e49ef10911a20e866450a9bec0dc5f",
+      "patched_sha256": "423860600620f95c05e7ad98c6195301fb22a4e225b551e369e6a8b717c4f7c1"
+    },
+    "src/main.cu": {
+      "upstream_path": "fake/src/main.cu",
+      "upstream_sha256": "395f3b589223178f750f8d66bdabcc2fe078af3ea43176f69064a15ddea7f2a4",
+      "vendored_sha256": "395f3b589223178f750f8d66bdabcc2fe078af3ea43176f69064a15ddea7f2a4"
+    },
+    "src/fake/made.cuh": {
+      "patched_sha256": "d0421b141780d2168ab62b747cf3e0677269968c66d75e8b0cf7d803f9130156"
+    }
+  },
+  "patches": [
+    {
+      "id": "FX-0",
+      "description": "fixture",
+      "diff": null,
+      "files": {
+        "src/fake/pre.cuh": {
+          "before_sha256": "1901c47d8fc6bac7f8f9bfde15697159d4e49ef10911a20e866450a9bec0dc5f",
+          "after_sha256": "423860600620f95c05e7ad98c6195301fb22a4e225b551e369e6a8b717c4f7c1"
+        }
+      }
+    },
+    {
+      "id": "FX-1",
+      "description": "fixture",
+      "diff": "patches/FX-1.patch",
+      "files": {
+        "src/fake/util.cuh": {
+          "before_sha256": "126f86302e26c08f668d45a0a390fd41b454b050d6edec8466f6c3a0d4eb0012",
+          "after_sha256": "24bfcc25b0a9f245b69c12cf3ae132f1aee3f630413256913a3f62fbbbc622c8"
+        }
+      }
+    },
+    {
+      "id": "FX-2",
+      "description": "fixture",
+      "diff": "patches/FX-2.patch",
+      "files": {
+        "src/fake/made.cuh": {
+          "before_sha256": null,
+          "after_sha256": "d0421b141780d2168ab62b747cf3e0677269968c66d75e8b0cf7d803f9130156"
+        }
+      }
+    },
+    {
+      "id": "FX-3",
+      "description": "fixture",
+      "diff": "patches/FX-3.patch",
+      "files": {
+        "src/fake/util.cuh": {
+          "before_sha256": "24bfcc25b0a9f245b69c12cf3ae132f1aee3f630413256913a3f62fbbbc622c8",
+          "after_sha256": "a9496603245d1e6c55eeca1f12e6e3120fd9a2d79b2887484c1e5d4cf4240b43"
+        }
+      }
+    }
+  ],
+  "shims": [
+    {
+      "include": "fake_ggml.h",
+      "stands_in_for": "fake/include/fake_ggml.h",
+      "path": "../shim/fake_ggml.h",
+      "sha256": "9e4c2931dc45395443c746f5618a26d9d9f3f1b684ebe014bddf9991f7384519"
+    }
+  ],
+  "include_roots": [
+    "src",
+    "src/inc"
+  ]
+}

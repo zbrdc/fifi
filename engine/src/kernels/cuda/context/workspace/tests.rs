@@ -4,29 +4,13 @@ use std::process::Command;
 
 use super::*;
 use crate::kernels::cuda::arena::ARENA_ALIGN;
+use crate::kernels::cuda::device_present;
 use crate::kernels::cuda::{CHUNK_LIMIT, EXECUTE_OPERATION, QuantTensor, TiledWeight};
 use crate::weights::GgufType;
 
 const K: usize = 256;
 /// The longest row the matmul takes.
 const WIDE_K: usize = 32_768;
-
-/// Mirrors `fault.rs`: a host without a device skips the test, unless
-/// `INFERENCE_CUDA_REQUIRE_DEVICE` turns the missing device into a failure.
-fn device_present(test: &str) -> bool {
-    let count = crate::kernels::cuda::device_count().expect("CUDA device count query");
-    if count > 0 {
-        return true;
-    }
-    let required = std::env::var("INFERENCE_CUDA_REQUIRE_DEVICE")
-        .is_ok_and(|value| !value.is_empty() && value != "0");
-    assert!(
-        !required,
-        "INFERENCE_CUDA_REQUIRE_DEVICE is set but no CUDA device is visible"
-    );
-    println!("SKIPPED {test}: no CUDA device");
-    false
-}
 
 /// Row `row`, column `col` of the test weight: small integers, scale 1.0.
 fn quant(row: usize, col: usize) -> i8 {
@@ -429,6 +413,11 @@ fn assert_bad_shape(shapes: Vec<WorkspaceShape>, case: &str) {
 
 #[test]
 fn admission_caps_are_the_union_of_the_shapes_and_bad_shapes_are_refused() {
+    // The latch this test asserts clear is set by the very first device probe on a host
+    // with no driver, so the test shares the device gate like every device test.
+    if !device_present("admission_caps_are_the_union_of_the_shapes_and_bad_shapes_are_refused") {
+        return;
+    }
     // One shape is wide with one token (large y), the other narrow with many tokens
     // (large x): the union takes the larger of each region.
     let wide = native::activation_bytes(1024, K, 1).expect("wide sizes");

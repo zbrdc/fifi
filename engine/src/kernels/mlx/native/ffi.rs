@@ -89,6 +89,9 @@ unsafe extern "C" {
     /// The OS page size in bytes, or 0 when the query fails.
     #[link_name = "inference_page_size"]
     pub(super) fn inference_page_size() -> usize;
+    #[cfg(test)]
+    #[link_name = "inference_mlx_process_rss_bytes"]
+    pub(super) fn mlx_process_rss_bytes(bytes: *mut u64) -> i32;
     #[link_name = "inference_mlx_array_free"]
     pub(super) fn mlx_array_free(array: mlx_array) -> i32;
     #[link_name = "inference_mlx_vector_array_new"]

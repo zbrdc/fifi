@@ -1,0 +1,47 @@
+[
+  {
+    "id": "chatcmpl-1",
+    "object": "chat.completion.chunk",
+    "created": 1790000000,
+    "model": "qwen3.6-35b-a3b",
+    "choices": [
+      {
+        "index": 0,
+        "delta": {
+          "role": "assistant",
+          "content": ""
+        }
+      }
+    ]
+  },
+  {
+    "id": "chatcmpl-1",
+    "object": "chat.completion.chunk",
+    "created": 1790000000,
+    "model": "qwen3.6-35b-a3b",
+    "choices": [
+      {
+        "index": 0,
+        "delta": {
+          "tool_calls": [
+            {
+              "index": 0,
+              "id": "call_1",
+              "type": "function",
+              "function": {
+                "name": "get_weather",
+                "arguments": "{\"city\":\"Oslo\"}"
+              }
+            }
+          ]
+        },
+        "finish_reason": "tool_calls"
+      }
+    ],
+    "usage": {
+      "prompt_tokens": 12,
+      "completion_tokens": 5,
+      "total_tokens": 17
+    }
+  }
+]

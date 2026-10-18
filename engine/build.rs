@@ -86,6 +86,8 @@ const CUDA_SOURCES: &[&str] = &[
     "src/kernels/cuda/native/prefill/attn_prefill.cu",
     "src/kernels/cuda/native/prefill/gdn_scan_seq.cu",
     "src/kernels/cuda/native/resident/tiered_classify.cu",
+    "src/kernels/cuda/native/resident/mailbox.cu",
+    "src/kernels/cuda/native/resident/tiered_wait_add.cu",
 ];
 
 /// The vendored llama.cpp MMQ sources that compile to objects (MATVEC-PAR S1 c2b, CPF-V4 V4-0).
@@ -109,7 +111,10 @@ const MMQ_VENDOR_SOURCES: &[&str] = &[
 /// half of PG3's composed reference: KUBDAN-MSG-85 ruling (b)); `router_tiled` and
 /// `moe_combine_rows` stay in `CUDA_SOURCES` without fast math (KUBDAN-MSG-32 Q1).
 const MMQ_GLUE_SOURCES: &[&str] = &[
+    "src/kernels/cuda/native/prefill/mmq_dense.cu",
     "src/kernels/cuda/native/prefill/mmq_facts.cu",
+    "src/kernels/cuda/native/prefill/mmq_mmid.cu",
+    "src/kernels/cuda/native/prefill/mmq_quant.cu",
     "src/kernels/cuda/native/prefill/swiglu_rows.cu",
 ];
 /// Headers whose change reruns the build, one path per line, alphabetical. A resident kernel
@@ -126,7 +131,10 @@ const CUDA_HEADERS: &[&str] = &[
     "src/kernels/cuda/native/prefill/ggml_shim/ggml-impl.h",
     "src/kernels/cuda/native/prefill/ggml_shim/ggml.h",
     "src/kernels/cuda/native/prefill/ggml_shim/unary.cuh",
+    "src/kernels/cuda/native/prefill/mmq_dense.h",
     "src/kernels/cuda/native/prefill/mmq_facts.h",
+    "src/kernels/cuda/native/prefill/mmq_mmid.h",
+    "src/kernels/cuda/native/prefill/mmq_quant.h",
     "src/kernels/cuda/native/prefill/status.h",
     "src/kernels/cuda/native/prefill/swiglu_rows.h",
     "src/kernels/cuda/native/resident/add_norm_pack.h",
@@ -139,6 +147,7 @@ const CUDA_HEADERS: &[&str] = &[
     "src/kernels/cuda/native/resident/gdn_delta.h",
     "src/kernels/cuda/native/resident/graph.h",
     "src/kernels/cuda/native/resident/kv8_append.h",
+    "src/kernels/cuda/native/resident/mailbox.h",
     "src/kernels/cuda/native/resident/matmul_expert.h",
     "src/kernels/cuda/native/resident/matmul_q5_0.h",
     "src/kernels/cuda/native/resident/matvec_expert.h",
@@ -151,6 +160,7 @@ const CUDA_HEADERS: &[&str] = &[
     "src/kernels/cuda/native/resident/swiglu_pack.h",
     "src/kernels/cuda/native/resident/swiglu_q8.h",
     "src/kernels/cuda/native/resident/tiered_classify.h",
+    "src/kernels/cuda/native/resident/tiered_wait_add.h",
     "vendor/ggml-cuda-mmq/src/ggml-common.h",
     "vendor/ggml-cuda-mmq/src/ggml-cuda/common.cuh",
     "vendor/ggml-cuda-mmq/src/ggml-cuda/mma.cuh",

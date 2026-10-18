@@ -350,8 +350,9 @@ fn fn_section(start: &str) -> &'static str {
     section_of(include_str!("start.rs"), "start.rs", start)
 }
 
-/// The same for any source file: `file` names it in the panic message.
-fn section_of(source: &'static str, file: &str, start: &str) -> &'static str {
+/// The same for any source file: `file` names it in the panic message. Shared with the
+/// other test modules of the family (the chunk-gate pins of `executor_tests`, review B-4).
+pub(super) fn section_of(source: &'static str, file: &str, start: &str) -> &'static str {
     let at = source
         .find(start)
         .unwrap_or_else(|| panic!("{file} has no {start:?}"));
@@ -461,6 +462,8 @@ fn opens_char_literal(bytes: &[u8], at: usize) -> bool {
 }
 
 /// Code only, whitespace REMOVED (the gate's own form): a rustfmt re-wrap cannot break a pin.
-fn pinned(section: &str) -> String {
+/// Shared with the other test modules of the family (the chunk-gate pins of
+/// `executor_tests`, review B-4).
+pub(super) fn pinned(section: &str) -> String {
     code_only(section).split_whitespace().collect::<String>()
 }

@@ -270,3 +270,16 @@ impl Drop for Context {
         }
     }
 }
+
+#[cfg(test)]
+pub(crate) fn process_rss_bytes() -> Result<u64, EngError> {
+    let mut bytes = 0;
+    let status = unsafe { ffi::mlx_process_rss_bytes(&mut bytes) };
+    if status != 0 {
+        return Err(EngError::Backend {
+            operation: "process_rss",
+            message: format!("native process RSS query failed with status {status}"),
+        });
+    }
+    Ok(bytes)
+}

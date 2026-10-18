@@ -99,7 +99,7 @@ fn a_bad_prefill_chunk_stops_startup_and_names_the_key() {
     let output = run(&config("127.0.0.1:0", Some(options)), &[]);
     assert_eq!(output.status.code(), Some(1), "{}", stderr(&output));
     assert!(
-        stderr(&output).contains("prefill_chunk must be between 1 and 512, found 0"),
+        stderr(&output).contains("prefill_chunk must be between 1 and 1024, found 0"),
         "{}",
         stderr(&output)
     );

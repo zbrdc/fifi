@@ -1,0 +1,14 @@
+{
+  "mlx_commit": "1f8e74e3f12f31365464a6867c6579f0e9b29d85",
+  "mlx_version": "0.32.2.dev20260927+1f8e74e3",
+  "mlx_c_commit": "c74db5307cc8ce122f48d97ef951b30578674e7f",
+  "build_flags": [
+    "-DMLX_BUILD_METAL=ON",
+    "-DMLX_BUILD_ACCELERATE=ON",
+    "-DMLX_METAL_JIT=OFF"
+  ],
+  "asserted_files": {
+    "core.cpython-312-darwin.so": "935cc4e023f4a3b548981bac866e7edb708256c42b04508f5f633f1c2f7839b3"
+  },
+  "recorded_files": ["lib/libmlx.dylib", "lib/libjaccl.dylib"]
+}

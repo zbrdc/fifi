@@ -465,7 +465,8 @@ mod tests {
     }
 
     // The pinned dispatch of the builds whose Q36 settings read the MLX keys: the CUDA arm
-    // ignores `prefill_chunk` by design, so this error cannot occur on a native-cuda build.
+    // ignores `prefill_chunk` (until CPF-7a's integration commit wires it as the chunk cap,
+    // decision 0049 A6 item 2), so this error cannot occur on a native-cuda build.
     #[cfg(not(all(feature = "native-cuda", target_os = "linux")))]
     #[test]
     fn the_prefix_reuse_flag_of_the_file_reaches_the_q36_session_cap_rule() {

@@ -20,6 +20,7 @@
 //! no evaluation can read or write those pages any more.
 
 use super::ops::{Ctx, linear, values};
+use super::prefetch::TokenIdentity;
 use super::state::{LayerState, ResidentState, qsa_growth_bytes};
 use super::weights::RAttn;
 use super::{ResidentDecoder, StepMode, StepResult, deltanet, hyper, moe, ple, qsa};
@@ -136,6 +137,15 @@ fn run(
         #[cfg(not(test))]
         drop(selection);
         h = hyper::apply(&mut ctx, &shape.hyper, &h, &gate, &out)?;
+        decoder.expert_prefetch.after_layer(
+            index,
+            weights.layers.len(),
+            TokenIdentity {
+                position: pos,
+                id: token,
+            },
+            |hint| decoder.slots.admit_hint(hint),
+        );
         if mode == StepMode::Record {
             records.push(h.share());
         }
@@ -300,6 +310,65 @@ mod tests {
             }
         }
         best as u32
+    }
+
+    #[test]
+    fn expert_hints_are_gated_without_changing_routes_logits_or_tokens() {
+        use super::super::trace::{RouteTrace, TraceMode, TraceStep};
+
+        let _serial = crate::native_test_lock();
+        let (ckpt, flash) = load();
+        let mut decoder =
+            ResidentDecoder::new(MlxKernels::try_new().unwrap(), &ckpt, &flash).unwrap();
+        let layers = decoder.weights.layers.len();
+        assert!(layers > 1);
+        let mut off = decoder.zero_state().unwrap();
+        let mut on = decoder.zero_state().unwrap();
+        decoder.route_trace = Some(RouteTrace::default());
+        for (position, token) in [1, 2, 1].into_iter().enumerate() {
+            let trace_step = TraceStep {
+                prompt: 0,
+                pos: u32::try_from(position).unwrap(),
+                mode: TraceMode::Generate,
+            };
+            decoder.set_expert_prefetch(false);
+            decoder.route_trace.as_mut().unwrap().begin(trace_step);
+            let before = decoder.slots.hint_admissions();
+            let expected = decoder.step(&mut off, token, StepMode::Record).unwrap();
+            assert_eq!(
+                decoder.slots.hint_admissions(),
+                before,
+                "disabled admission"
+            );
+            let routes = decoder.route_trace.as_mut().unwrap().take();
+
+            decoder.set_expert_prefetch(true);
+            decoder.route_trace.as_mut().unwrap().begin(trace_step);
+            let actual = decoder.step(&mut on, token, StepMode::Record).unwrap();
+            assert_eq!(
+                actual, expected,
+                "exact logits, layer rows, and emitted token"
+            );
+            assert_eq!(decoder.route_trace.as_mut().unwrap().take(), routes);
+            let (calls, pending) = decoder.slots.hint_admissions();
+            assert_eq!(
+                calls - before.0,
+                layers - 1,
+                "no target after the last layer"
+            );
+            let hint = pending.unwrap();
+            assert_eq!(hint.layer, layers - 1);
+            assert_eq!(hint.token.position, trace_step.pos);
+            assert_eq!(hint.token.id, token);
+            assert_eq!(
+                hint.expert_ids
+                    .iter()
+                    .flatten()
+                    .copied()
+                    .collect::<Vec<_>>(),
+                [0, 1, 2]
+            );
+        }
     }
 
     #[test]

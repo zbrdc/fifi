@@ -1,0 +1,2 @@
+200 application/json
+{"id":"ID","object":"chat.completion","created":0,"model":"toolbot","engine":"e2","choices":[{"index":0,"message":{"role":"assistant","content":"Adding now.","reasoning_content":"I need the sum.","tool_calls":[{"id":"call_ID_0","type":"function","function":{"name":"add","arguments":"{\"a\":1,\"b\":2}"}}]},"finish_reason":"tool_calls"}],"usage":{"prompt_tokens":21,"completion_tokens":151,"total_tokens":172,"reused_tokens":0}}
