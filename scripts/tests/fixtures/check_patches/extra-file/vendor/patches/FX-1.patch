@@ -1,6 +1,0 @@
---- a/src/fake/util.cuh
-+++ b/src/fake/util.cuh
-@@ -1,2 +1,2 @@
- // util: unpatched upstream text
--int util(int x) { return x; }
-+int util(int x) { return x + 1; }

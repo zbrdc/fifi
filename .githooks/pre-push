@@ -6,4 +6,6 @@ if ! command -v python3 >/dev/null 2>&1; then
     exit 127
 fi
 
+# scripts/ is untracked on fresh clones; the checks live in existing checkouts.
+[ -f scripts/check_staged.py ] || exit 0
 exec python3 scripts/check_staged.py pre-push

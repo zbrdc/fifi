@@ -1,2 +1,0 @@
-404 application/json
-{"error":{"message":"route not found","code":"not_found"}}

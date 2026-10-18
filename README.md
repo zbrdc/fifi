@@ -20,9 +20,9 @@ This is not a finished product. The model list below states where each family st
 
 - `Qwen/Qwen3.8-Flash-Next`, experts streamed from SSD, Apple Silicon: in progress.
 - `Qwen3.6-35B-A3B`, resident on Apple Silicon: in progress.
-- `Qwen3.6-35B-A3B`, CUDA: in progress. Only the model load works so far.
-- `Mellum2.1-12B-A2.5B`, CUDA: in progress.
-- `Qwen3.8-27B`: planned.
+- `Qwen3.6-35B-A3B`, CUDA: in progress. The Q4_K_M model load and the batched prefill path through real serving are in `main`; end-to-end decode is not measured yet.
+- `Mellum2.1-12B-A2.5B`, CUDA: in progress. The decode chain is qualified on stand-in weights; the family has no model code in `main` yet.
+- `Qwen3.8-27B`: planned. One real oQ6 dense-projection load proof is in `main`.
 
 Weight formats:
 
@@ -58,7 +58,7 @@ Third-party notices are in [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md).
 
 ## Source code
 
-The repository is private.
+The repository is public.
 
 ```sh
 git clone git@github.com:zbrdc/fifi.git

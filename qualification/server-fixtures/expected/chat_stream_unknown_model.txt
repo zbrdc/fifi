@@ -1,2 +1,0 @@
-404 application/json
-{"error":{"message":"model other does not exist","code":"not_found"}}

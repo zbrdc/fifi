@@ -1,2 +1,0 @@
-400 application/json
-{"error":{"message":"max_tokens must be an integer of at least 1","code":"bad_request"}}

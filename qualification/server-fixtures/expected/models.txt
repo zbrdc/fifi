@@ -1,2 +1,0 @@
-200 application/json
-{"object":"list","data":[{"id":"demo","object":"model","created":0,"owned_by":"local","engines":[{"id":"e1","model":"demo","state":"ready"}]},{"id":"toolbot","object":"model","created":0,"owned_by":"local","engines":[{"id":"e2","model":"toolbot","state":"ready"}]}]}

@@ -1,2 +1,0 @@
-404 application/json
-{"error":{"message":"session s1 does not exist","code":"not_found"}}

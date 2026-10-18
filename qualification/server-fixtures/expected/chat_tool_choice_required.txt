@@ -1,2 +1,0 @@
-400 application/json
-{"error":{"message":"tool_choice required needs grammar-constrained decoding, which is not available yet","code":"bad_request"}}

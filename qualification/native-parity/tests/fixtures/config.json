@@ -1,1 +1,0 @@
-{"quantization": {"mode": "affine", "bits": 4, "group_size": 64, "gate": {"mode": "affine", "bits": 8, "group_size": 64}}}
