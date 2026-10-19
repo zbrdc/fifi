@@ -78,10 +78,6 @@ The repository is public.
 git clone git@github.com:zbrdc/fifi.git
 ```
 
-## Security problems
-
-Report security problems privately to the maintainer, Dan Campos. Do not open a public issue.
-
 ## Credits
 
 [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md) lists the copied and derived third-party code that it covers.
