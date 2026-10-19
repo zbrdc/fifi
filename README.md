@@ -12,22 +12,36 @@ It runs on Apple Silicon (MLX and Metal) and NVIDIA CUDA.
 The `enginesrv` binary serves an OpenAI-compatible `/v1/chat/completions` route with streaming and tool calls.
 One process can hold several engines. The shared memory plan and prefix reuse are in progress.
 
-This is not a finished product. The model list below states where each family stands.
+## Current status
 
-## Models
+The primary target remains `Qwen/Qwen3.8-Flash-Next` on a 36 GB Mac Studio, with a planned, bounded SSD tier.
+Task-branch work below is separate from `main`.
 
-"Supported" means that the model passes its gates through `enginesrv`. No model is in that state yet.
+| Model and backend | Implementation status | Remaining work |
+| --- | --- | --- |
+| `Qwen/Qwen3.8-Flash-Next`, Apple Silicon | Work is paused. SSD expert streaming remains planned. | Feasibility and end-to-end validation remain incomplete. |
+| `Qwen3.6-35B-A3B`, Apple Silicon | `main` contains resident MLX execution and HTTP serving. | Full-context and end-to-end validation remain incomplete. |
+| `Qwen3.6-35B-A3B`, CUDA | `main` contains Q4_K_M loading and batched prefill through serving. | Correctness, native execution, and full-context validation continue. |
+| `Mellum2.1-12B-A2.5B`, CUDA | Decode-chain checks use stand-in weights. Real-checkpoint family execution is not integrated into `main`. | Real-checkpoint execution and end-to-end validation remain open. |
+| `Qwen3.8-27B` | `main` contains an oQ6 dense-projection loading proof. Dense loading and decode work continue on `task/qwen38-dense-compile`. | Native compilation, resource admission, and source checks remain open. Full-model validation remains incomplete. |
+| Gemma4 12B Humanizer, CUDA | Narrow generation checks and numerical checks at the first position passed on a task branch. | Integration remains on hold for a shared 8-bit quantization policy regression. |
+| Gemma4 26B-A4B, CUDA | A task branch is adding text-only execution, configuration, loading, and mixture-of-experts routing using the selected official Google Q4_0 artifact. | Configuration checks do not qualify model execution or the Q4_0 runtime. |
+| Nemotron3.5, CUDA | A task branch repairs staged weight projection and resource cleanup. | Memory-limit enforcement, native execution, staged transfers, and real-model checks remain open. |
 
-- `Qwen/Qwen3.8-Flash-Next`, experts streamed from SSD, Apple Silicon: in progress.
-- `Qwen3.6-35B-A3B`, resident on Apple Silicon: in progress.
-- `Qwen3.6-35B-A3B`, CUDA: in progress. The Q4_K_M model load and the batched prefill path through real serving are in `main`; end-to-end decode is not measured yet.
-- `Mellum2.1-12B-A2.5B`, CUDA: in progress. The decode chain is qualified on stand-in weights; the family has no model code in `main` yet.
-- `Qwen3.8-27B`: planned. One real oQ6 dense-projection load proof is in `main`.
+### Weight formats
 
-Weight formats:
+These formats are separate from model-level validation.
 
 - MLX affine and oQ safetensors, with the quantization read from the checkpoint metadata.
 - GGUF F16, Q4_K, Q6_K, and Q8_0. Q5_0 is in progress and is not in `main`.
+
+### Cache work
+
+The supplied Qwen3.6 Mac Studio configuration retains an 8-bit key-value (KV) cache.
+
+A separate CPU-only prototype routes Q8 cache bytes. It passed behavior and fault-detection checks and independent review, with notes. It is not integrated into the engine or HTTP serving.
+
+Native operation ordering, physical memory peaks, attention math, and useful performance remain unvalidated.
 
 ## Build
 
