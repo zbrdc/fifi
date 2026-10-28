@@ -1,0 +1,103 @@
+/* fifi design tokens. Component styles read tokens only. */
+:root {
+  color-scheme: light;
+
+  /* Type */
+  --fifi-font: -apple-system, BlinkMacSystemFont, "SF Pro Text", "Segoe UI", Roboto, sans-serif;
+  --fifi-mono: ui-monospace, "SF Mono", Menlo, Consolas, monospace;
+  --fifi-size-1: 12px;
+  --fifi-size-2: 13px;
+  --fifi-size-3: 15px;
+  --fifi-size-chat: 16px;
+  --fifi-size-4: 17px;
+  --fifi-size-5: 22px;
+  --fifi-size-6: 28px;
+
+  /* Color */
+  --fifi-accent: #0066cc;
+  --fifi-accent-pressed: #004c99;
+  --fifi-on-accent: #ffffff;
+  --fifi-text: #1d1d1f;
+  --fifi-text-secondary: #5f6368;
+  --fifi-text-tertiary: #6e6e73;
+  --fifi-content-bg: #ffffff;
+  --fifi-page-bg: #f5f5f7;
+  --fifi-sidebar-bg: rgba(242, 242, 247, 0.82);
+  --fifi-fill: rgba(120, 120, 128, 0.14);
+  --fifi-fill-strong: rgba(120, 120, 128, 0.24);
+  --fifi-hairline: rgba(0, 0, 0, 0.09);
+  --fifi-separator: rgba(0, 0, 0, 0.14);
+  --fifi-code-bg: rgba(120, 120, 128, 0.13);
+  --fifi-dim: rgba(0, 0, 0, 0.28);
+  --fifi-ready: #2e9e52;
+  --fifi-busy: #c77c00;
+  --fifi-error: #d32127;
+  --fifi-offline: #98989d;
+
+  /* Spacing */
+  --fifi-space-1: 4px;
+  --fifi-space-2: 8px;
+  --fifi-space-3: 12px;
+  --fifi-space-4: 16px;
+  --fifi-space-5: 24px;
+  --fifi-space-6: 32px;
+
+  /* Radius */
+  --fifi-radius-s: 8px;
+  --fifi-radius-m: 12px;
+  --fifi-radius-l: 18px;
+
+  /* Motion */
+  --fifi-motion: 200ms;
+  --fifi-motion-curve: cubic-bezier(0.2, 0.6, 0.3, 1);
+}
+
+[data-theme="dark"] {
+  color-scheme: dark;
+
+  --fifi-accent: #2997ff;
+  --fifi-accent-pressed: #5cb0ff;
+  --fifi-on-accent: #0c0c0e;
+  --fifi-text: #f2f2f5;
+  --fifi-text-secondary: #a8abb0;
+  --fifi-text-tertiary: #828489;
+  --fifi-content-bg: #1c1c1e;
+  --fifi-page-bg: #0a0a0b;
+  --fifi-sidebar-bg: rgba(24, 24, 26, 0.84);
+  --fifi-fill: rgba(120, 120, 128, 0.22);
+  --fifi-fill-strong: rgba(120, 120, 128, 0.34);
+  --fifi-hairline: rgba(255, 255, 255, 0.1);
+  --fifi-separator: rgba(255, 255, 255, 0.16);
+  --fifi-code-bg: rgba(120, 120, 128, 0.2);
+  --fifi-dim: rgba(0, 0, 0, 0.5);
+  --fifi-ready: #32d074;
+  --fifi-busy: #ffb02e;
+  --fifi-error: #ff6961;
+  --fifi-offline: #8e8e93;
+}
+
+@media (prefers-color-scheme: dark) {
+  :root:not([data-theme="light"]):not([data-theme="dark"]) {
+    color-scheme: dark;
+
+    --fifi-accent: #2997ff;
+    --fifi-accent-pressed: #5cb0ff;
+    --fifi-on-accent: #0c0c0e;
+    --fifi-text: #f2f2f5;
+    --fifi-text-secondary: #a8abb0;
+    --fifi-text-tertiary: #828489;
+    --fifi-content-bg: #1c1c1e;
+    --fifi-page-bg: #0a0a0b;
+    --fifi-sidebar-bg: rgba(24, 24, 26, 0.84);
+    --fifi-fill: rgba(120, 120, 128, 0.22);
+    --fifi-fill-strong: rgba(120, 120, 128, 0.34);
+    --fifi-hairline: rgba(255, 255, 255, 0.1);
+    --fifi-separator: rgba(255, 255, 255, 0.16);
+    --fifi-code-bg: rgba(120, 120, 128, 0.2);
+    --fifi-dim: rgba(0, 0, 0, 0.5);
+    --fifi-ready: #32d074;
+    --fifi-busy: #ffb02e;
+    --fifi-error: #ff6961;
+    --fifi-offline: #8e8e93;
+  }
+}

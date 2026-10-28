@@ -1,0 +1,2 @@
+ggml-cuda-mmq/** whitespace=-blank-at-eof
+*/patches/*.patch whitespace=-blank-at-eol,-blank-at-eof

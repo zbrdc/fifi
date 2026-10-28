@@ -1,0 +1,10 @@
+{
+  "status": 200,
+  "mode": "stream",
+  "query": "",
+  "asserts": [
+    "event-sequence",
+    "usage-in-message-start"
+  ],
+  "deviations": []
+}

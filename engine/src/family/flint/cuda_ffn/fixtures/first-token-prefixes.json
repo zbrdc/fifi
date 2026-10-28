@@ -1,0 +1,97 @@
+[
+  {
+    "case": "p01",
+    "prompt": "The capital of France is",
+    "utf8_hex": "546865206361706974616c206f66204672616e6365206973",
+    "utf8_sha256": "bbaff4d2ecd5892d4a442b0f53131641bf6e6f284761dd20fc0664bc97145762",
+    "input_ids": [
+      630,
+      6963,
+      297,
+      9865,
+      332
+    ]
+  },
+  {
+    "case": "p02",
+    "prompt": "2 + 2 =",
+    "utf8_hex": "32202b2032203d",
+    "utf8_sha256": "154e0c9c6176389176dd7a541d8f5a34cdeffc97ddf6360af63543ac155888cf",
+    "input_ids": [
+      17,
+      541,
+      220,
+      17,
+      311
+    ]
+  },
+  {
+    "case": "p03",
+    "prompt": "The opposite of hot is",
+    "utf8_hex": "546865206f70706f73697465206f6620686f74206973",
+    "utf8_sha256": "499d3b29e245003b63f6e79d2fa436b28583acfd82237825c9b856d21ff85143",
+    "input_ids": [
+      630,
+      10463,
+      297,
+      4797,
+      332
+    ]
+  },
+  {
+    "case": "p04",
+    "prompt": "A triangle has",
+    "utf8_hex": "4120747269616e676c6520686173",
+    "utf8_sha256": "e383966739675e1b45cd4de210056ca2f202360599030a5823105de72f987d61",
+    "input_ids": [
+      32,
+      10728,
+      648
+    ]
+  },
+  {
+    "case": "p05",
+    "prompt": "Once upon a time",
+    "utf8_hex": "4f6e63652075706f6e20612074696d65",
+    "utf8_sha256": "e286222c229ec73b1bc520d88583191572ae0cbbaa66ea68053994a5e50ac87a",
+    "input_ids": [
+      10052,
+      4237,
+      260,
+      739
+    ]
+  },
+  {
+    "case": "p06",
+    "prompt": "The sky is",
+    "utf8_hex": "54686520736b79206973",
+    "utf8_sha256": "63460e4223f8a4b261087a8d8133f25ac5fe640d21f9ffbe2fcef4c3f8719c19",
+    "input_ids": [
+      630,
+      10601,
+      332
+    ]
+  },
+  {
+    "case": "p07",
+    "prompt": "Rust is a",
+    "utf8_hex": "527573742069732061",
+    "utf8_sha256": "21e2d2ff148d78b4c2c9476639af044fb96ae14d52d30a818eaa68484e779ad9",
+    "input_ids": [
+      86386,
+      332,
+      260
+    ]
+  },
+  {
+    "case": "p08",
+    "prompt": "Water freezes at",
+    "utf8_hex": "576174657220667265657a6573206174",
+    "utf8_sha256": "aea444d1ed126622b0f679b4ee65af4c812dd2eec0a416458ebe6aec02c3b936",
+    "input_ids": [
+      21004,
+      72811,
+      471
+    ]
+  }
+]

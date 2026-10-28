@@ -1,0 +1,58 @@
+[
+  {
+    "name": "cc-plain",
+    "client": "claude-code",
+    "captured": "2026-10-24",
+    "purpose": "base field set, system array, beta query/header",
+    "sanitized": true
+  },
+  {
+    "name": "cc-tools",
+    "client": "claude-code",
+    "captured": "2026-10-24",
+    "purpose": "tool defs, tool_result roundtrip after a tool_use",
+    "sanitized": true
+  },
+  {
+    "name": "cc-history",
+    "client": "claude-code",
+    "captured": "2026-10-24",
+    "purpose": "continuation turn: history resent, thinking stripped by the client",
+    "sanitized": true
+  },
+  {
+    "name": "cc-thinktools",
+    "client": "claude-code",
+    "captured": "2026-10-24",
+    "purpose": "thinking resent with tool_use and tool_result (the thinking-carried evidence case)",
+    "sanitized": true
+  },
+  {
+    "name": "cc-midconv",
+    "client": "claude-code",
+    "captured": "2026-10-24",
+    "purpose": "mid-conversation system role in a plain text conversation",
+    "sanitized": true
+  },
+  {
+    "name": "sdk-plain",
+    "client": "python-sdk",
+    "captured": "2026-10-24",
+    "purpose": "SDK field set incl. metadata; system array of plain string items, the off-type input accepted as an extension",
+    "sanitized": false
+  },
+  {
+    "name": "sdk-stream",
+    "client": "python-sdk",
+    "captured": "2026-10-24",
+    "purpose": "stream:true request shape",
+    "sanitized": false
+  },
+  {
+    "name": "sdk-error",
+    "client": "python-sdk",
+    "captured": "2026-10-24",
+    "purpose": "first attempt of a 5xx retry storm (the capture observed 2 SDK retries; the replay expects our server to accept the request)",
+    "sanitized": false
+  }
+]

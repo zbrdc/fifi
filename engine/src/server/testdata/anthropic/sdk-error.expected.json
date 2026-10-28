@@ -1,0 +1,9 @@
+{
+  "status": 200,
+  "mode": "message",
+  "query": "",
+  "asserts": [
+    "message-shape"
+  ],
+  "deviations": []
+}

@@ -1,0 +1,4943 @@
+{
+  "files": {
+    "family-bad-dense-dtype.safetensors": {
+      "dtype_variant": {
+        "dtype": "uint32",
+        "key": "language_model.model.layers.0.input_layernorm.weight"
+      },
+      "index": "family-bad-dense-dtype.index.json",
+      "index_sha256": "78e0257ae000aa9f1644cc869d93e4796f0edf5f92ade44de1d995309dd73612",
+      "sha256": "757da7ab4eaf1778e9a60fe5d9092f0e739b81060977bbb5eebe28f67ce3d3a3",
+      "tensors": {
+        "language_model.model.layers.0.input_layernorm.weight": {
+          "dtype": "uint32",
+          "fill": 1,
+          "shape": [
+            128
+          ]
+        },
+        "language_model.model.layers.0.mlp.gate.biases": {
+          "dtype": "bfloat16",
+          "fill": 5,
+          "shape": [
+            4,
+            2
+          ]
+        },
+        "language_model.model.layers.0.mlp.gate.scales": {
+          "dtype": "bfloat16",
+          "fill": 4,
+          "shape": [
+            4,
+            2
+          ]
+        },
+        "language_model.model.layers.0.mlp.gate.weight": {
+          "dtype": "uint32",
+          "fill": 3,
+          "shape": [
+            4,
+            32
+          ]
+        },
+        "language_model.model.layers.0.mlp.shared_expert.down_proj.biases": {
+          "dtype": "bfloat16",
+          "fill": 17,
+          "shape": [
+            128,
+            2
+          ]
+        },
+        "language_model.model.layers.0.mlp.shared_expert.down_proj.scales": {
+          "dtype": "bfloat16",
+          "fill": 16,
+          "shape": [
+            128,
+            2
+          ]
+        },
+        "language_model.model.layers.0.mlp.shared_expert.down_proj.weight": {
+          "dtype": "uint32",
+          "fill": 15,
+          "shape": [
+            128,
+            8
+          ]
+        },
+        "language_model.model.layers.0.mlp.shared_expert.gate_proj.biases": {
+          "dtype": "bfloat16",
+          "fill": 11,
+          "shape": [
+            64,
+            4
+          ]
+        },
+        "language_model.model.layers.0.mlp.shared_expert.gate_proj.scales": {
+          "dtype": "bfloat16",
+          "fill": 10,
+          "shape": [
+            64,
+            4
+          ]
+        },
+        "language_model.model.layers.0.mlp.shared_expert.gate_proj.weight": {
+          "dtype": "uint32",
+          "fill": 9,
+          "shape": [
+            64,
+            16
+          ]
+        },
+        "language_model.model.layers.0.mlp.shared_expert.up_proj.biases": {
+          "dtype": "bfloat16",
+          "fill": 14,
+          "shape": [
+            64,
+            4
+          ]
+        },
+        "language_model.model.layers.0.mlp.shared_expert.up_proj.scales": {
+          "dtype": "bfloat16",
+          "fill": 13,
+          "shape": [
+            64,
+            4
+          ]
+        },
+        "language_model.model.layers.0.mlp.shared_expert.up_proj.weight": {
+          "dtype": "uint32",
+          "fill": 12,
+          "shape": [
+            64,
+            16
+          ]
+        },
+        "language_model.model.layers.0.mlp.shared_expert_gate.biases": {
+          "dtype": "bfloat16",
+          "fill": 8,
+          "shape": [
+            1,
+            2
+          ]
+        },
+        "language_model.model.layers.0.mlp.shared_expert_gate.scales": {
+          "dtype": "bfloat16",
+          "fill": 7,
+          "shape": [
+            1,
+            2
+          ]
+        },
+        "language_model.model.layers.0.mlp.shared_expert_gate.weight": {
+          "dtype": "uint32",
+          "fill": 6,
+          "shape": [
+            1,
+            32
+          ]
+        },
+        "language_model.model.layers.0.mlp.switch_mlp.down_proj.biases": {
+          "dtype": "bfloat16",
+          "fill": 26,
+          "shape": [
+            4,
+            128,
+            2
+          ]
+        },
+        "language_model.model.layers.0.mlp.switch_mlp.down_proj.scales": {
+          "dtype": "bfloat16",
+          "fill": 25,
+          "shape": [
+            4,
+            128,
+            2
+          ]
+        },
+        "language_model.model.layers.0.mlp.switch_mlp.down_proj.weight": {
+          "dtype": "uint32",
+          "fill": 24,
+          "shape": [
+            4,
+            128,
+            8
+          ]
+        },
+        "language_model.model.layers.0.mlp.switch_mlp.gate_proj.biases": {
+          "dtype": "bfloat16",
+          "fill": 20,
+          "shape": [
+            4,
+            64,
+            1
+          ]
+        },
+        "language_model.model.layers.0.mlp.switch_mlp.gate_proj.scales": {
+          "dtype": "bfloat16",
+          "fill": 19,
+          "shape": [
+            4,
+            64,
+            1
+          ]
+        },
+        "language_model.model.layers.0.mlp.switch_mlp.gate_proj.weight": {
+          "dtype": "uint32",
+          "fill": 18,
+          "shape": [
+            4,
+            64,
+            16
+          ]
+        },
+        "language_model.model.layers.0.mlp.switch_mlp.up_proj.biases": {
+          "dtype": "bfloat16",
+          "fill": 23,
+          "shape": [
+            4,
+            64,
+            4
+          ]
+        },
+        "language_model.model.layers.0.mlp.switch_mlp.up_proj.scales": {
+          "dtype": "bfloat16",
+          "fill": 22,
+          "shape": [
+            4,
+            64,
+            4
+          ]
+        },
+        "language_model.model.layers.0.mlp.switch_mlp.up_proj.weight": {
+          "dtype": "uint32",
+          "fill": 21,
+          "shape": [
+            4,
+            64,
+            16
+          ]
+        },
+        "language_model.model.layers.0.post_attention_layernorm.weight": {
+          "dtype": "bfloat16",
+          "fill": 2,
+          "shape": [
+            128
+          ]
+        },
+        "language_model.model.layers.0.self_attn.k_norm.weight": {
+          "dtype": "bfloat16",
+          "fill": 66,
+          "shape": [
+            16
+          ]
+        },
+        "language_model.model.layers.0.self_attn.k_proj.biases": {
+          "dtype": "bfloat16",
+          "fill": 58,
+          "shape": [
+            32,
+            4
+          ]
+        },
+        "language_model.model.layers.0.self_attn.k_proj.scales": {
+          "dtype": "bfloat16",
+          "fill": 57,
+          "shape": [
+            32,
+            4
+          ]
+        },
+        "language_model.model.layers.0.self_attn.k_proj.weight": {
+          "dtype": "uint32",
+          "fill": 56,
+          "shape": [
+            32,
+            16
+          ]
+        },
+        "language_model.model.layers.0.self_attn.o_proj.biases": {
+          "dtype": "bfloat16",
+          "fill": 64,
+          "shape": [
+            128,
+            2
+          ]
+        },
+        "language_model.model.layers.0.self_attn.o_proj.scales": {
+          "dtype": "bfloat16",
+          "fill": 63,
+          "shape": [
+            128,
+            2
+          ]
+        },
+        "language_model.model.layers.0.self_attn.o_proj.weight": {
+          "dtype": "uint32",
+          "fill": 62,
+          "shape": [
+            128,
+            8
+          ]
+        },
+        "language_model.model.layers.0.self_attn.q_norm.weight": {
+          "dtype": "bfloat16",
+          "fill": 65,
+          "shape": [
+            16
+          ]
+        },
+        "language_model.model.layers.0.self_attn.q_proj.biases": {
+          "dtype": "bfloat16",
+          "fill": 55,
+          "shape": [
+            128,
+            4
+          ]
+        },
+        "language_model.model.layers.0.self_attn.q_proj.scales": {
+          "dtype": "bfloat16",
+          "fill": 54,
+          "shape": [
+            128,
+            4
+          ]
+        },
+        "language_model.model.layers.0.self_attn.q_proj.weight": {
+          "dtype": "uint32",
+          "fill": 53,
+          "shape": [
+            128,
+            32
+          ]
+        },
+        "language_model.model.layers.0.self_attn.v_proj.biases": {
+          "dtype": "bfloat16",
+          "fill": 61,
+          "shape": [
+            32,
+            4
+          ]
+        },
+        "language_model.model.layers.0.self_attn.v_proj.scales": {
+          "dtype": "bfloat16",
+          "fill": 60,
+          "shape": [
+            32,
+            4
+          ]
+        },
+        "language_model.model.layers.0.self_attn.v_proj.weight": {
+          "dtype": "uint32",
+          "fill": 59,
+          "shape": [
+            32,
+            16
+          ]
+        },
+        "language_model.model.layers.1.input_layernorm.weight": {
+          "dtype": "bfloat16",
+          "fill": 27,
+          "shape": [
+            128
+          ]
+        },
+        "language_model.model.layers.1.linear_attn.A_log": {
+          "dtype": "bfloat16",
+          "fill": 68,
+          "shape": [
+            64
+          ]
+        },
+        "language_model.model.layers.1.linear_attn.conv1d.weight": {
+          "dtype": "bfloat16",
+          "fill": 67,
+          "shape": [
+            512,
+            4,
+            1
+          ]
+        },
+        "language_model.model.layers.1.linear_attn.dt_bias": {
+          "dtype": "bfloat16",
+          "fill": 69,
+          "shape": [
+            64
+          ]
+        },
+        "language_model.model.layers.1.linear_attn.in_proj_a.biases": {
+          "dtype": "bfloat16",
+          "fill": 73,
+          "shape": [
+            64,
+            4
+          ]
+        },
+        "language_model.model.layers.1.linear_attn.in_proj_a.scales": {
+          "dtype": "bfloat16",
+          "fill": 72,
+          "shape": [
+            64,
+            4
+          ]
+        },
+        "language_model.model.layers.1.linear_attn.in_proj_a.weight": {
+          "dtype": "uint32",
+          "fill": 71,
+          "shape": [
+            64,
+            16
+          ]
+        },
+        "language_model.model.layers.1.linear_attn.in_proj_b.biases": {
+          "dtype": "bfloat16",
+          "fill": 76,
+          "shape": [
+            64,
+            4
+          ]
+        },
+        "language_model.model.layers.1.linear_attn.in_proj_b.scales": {
+          "dtype": "bfloat16",
+          "fill": 75,
+          "shape": [
+            64,
+            4
+          ]
+        },
+        "language_model.model.layers.1.linear_attn.in_proj_b.weight": {
+          "dtype": "uint32",
+          "fill": 74,
+          "shape": [
+            64,
+            16
+          ]
+        },
+        "language_model.model.layers.1.linear_attn.in_proj_qkv.biases": {
+          "dtype": "bfloat16",
+          "fill": 79,
+          "shape": [
+            512,
+            4
+          ]
+        },
+        "language_model.model.layers.1.linear_attn.in_proj_qkv.scales": {
+          "dtype": "bfloat16",
+          "fill": 78,
+          "shape": [
+            512,
+            4
+          ]
+        },
+        "language_model.model.layers.1.linear_attn.in_proj_qkv.weight": {
+          "dtype": "uint32",
+          "fill": 77,
+          "shape": [
+            512,
+            16
+          ]
+        },
+        "language_model.model.layers.1.linear_attn.in_proj_z.biases": {
+          "dtype": "bfloat16",
+          "fill": 82,
+          "shape": [
+            256,
+            4
+          ]
+        },
+        "language_model.model.layers.1.linear_attn.in_proj_z.scales": {
+          "dtype": "bfloat16",
+          "fill": 81,
+          "shape": [
+            256,
+            4
+          ]
+        },
+        "language_model.model.layers.1.linear_attn.in_proj_z.weight": {
+          "dtype": "uint32",
+          "fill": 80,
+          "shape": [
+            256,
+            16
+          ]
+        },
+        "language_model.model.layers.1.linear_attn.norm.weight": {
+          "dtype": "bfloat16",
+          "fill": 70,
+          "shape": [
+            4
+          ]
+        },
+        "language_model.model.layers.1.linear_attn.out_proj.biases": {
+          "dtype": "bfloat16",
+          "fill": 85,
+          "shape": [
+            128,
+            8
+          ]
+        },
+        "language_model.model.layers.1.linear_attn.out_proj.scales": {
+          "dtype": "bfloat16",
+          "fill": 84,
+          "shape": [
+            128,
+            8
+          ]
+        },
+        "language_model.model.layers.1.linear_attn.out_proj.weight": {
+          "dtype": "uint32",
+          "fill": 83,
+          "shape": [
+            128,
+            32
+          ]
+        },
+        "language_model.model.layers.1.mlp.gate.biases": {
+          "dtype": "bfloat16",
+          "fill": 31,
+          "shape": [
+            4,
+            4
+          ]
+        },
+        "language_model.model.layers.1.mlp.gate.scales": {
+          "dtype": "bfloat16",
+          "fill": 30,
+          "shape": [
+            4,
+            4
+          ]
+        },
+        "language_model.model.layers.1.mlp.gate.weight": {
+          "dtype": "uint32",
+          "fill": 29,
+          "shape": [
+            4,
+            16
+          ]
+        },
+        "language_model.model.layers.1.mlp.shared_expert.down_proj.biases": {
+          "dtype": "bfloat16",
+          "fill": 43,
+          "shape": [
+            128,
+            2
+          ]
+        },
+        "language_model.model.layers.1.mlp.shared_expert.down_proj.scales": {
+          "dtype": "bfloat16",
+          "fill": 42,
+          "shape": [
+            128,
+            2
+          ]
+        },
+        "language_model.model.layers.1.mlp.shared_expert.down_proj.weight": {
+          "dtype": "uint32",
+          "fill": 41,
+          "shape": [
+            128,
+            8
+          ]
+        },
+        "language_model.model.layers.1.mlp.shared_expert.gate_proj.biases": {
+          "dtype": "bfloat16",
+          "fill": 37,
+          "shape": [
+            64,
+            4
+          ]
+        },
+        "language_model.model.layers.1.mlp.shared_expert.gate_proj.scales": {
+          "dtype": "bfloat16",
+          "fill": 36,
+          "shape": [
+            64,
+            4
+          ]
+        },
+        "language_model.model.layers.1.mlp.shared_expert.gate_proj.weight": {
+          "dtype": "uint32",
+          "fill": 35,
+          "shape": [
+            64,
+            16
+          ]
+        },
+        "language_model.model.layers.1.mlp.shared_expert.up_proj.biases": {
+          "dtype": "bfloat16",
+          "fill": 40,
+          "shape": [
+            64,
+            4
+          ]
+        },
+        "language_model.model.layers.1.mlp.shared_expert.up_proj.scales": {
+          "dtype": "bfloat16",
+          "fill": 39,
+          "shape": [
+            64,
+            4
+          ]
+        },
+        "language_model.model.layers.1.mlp.shared_expert.up_proj.weight": {
+          "dtype": "uint32",
+          "fill": 38,
+          "shape": [
+            64,
+            16
+          ]
+        },
+        "language_model.model.layers.1.mlp.shared_expert_gate.biases": {
+          "dtype": "bfloat16",
+          "fill": 34,
+          "shape": [
+            1,
+            4
+          ]
+        },
+        "language_model.model.layers.1.mlp.shared_expert_gate.scales": {
+          "dtype": "bfloat16",
+          "fill": 33,
+          "shape": [
+            1,
+            4
+          ]
+        },
+        "language_model.model.layers.1.mlp.shared_expert_gate.weight": {
+          "dtype": "uint32",
+          "fill": 32,
+          "shape": [
+            1,
+            16
+          ]
+        },
+        "language_model.model.layers.1.mlp.switch_mlp.down_proj.biases": {
+          "dtype": "bfloat16",
+          "fill": 52,
+          "shape": [
+            4,
+            128,
+            2
+          ]
+        },
+        "language_model.model.layers.1.mlp.switch_mlp.down_proj.scales": {
+          "dtype": "bfloat16",
+          "fill": 51,
+          "shape": [
+            4,
+            128,
+            2
+          ]
+        },
+        "language_model.model.layers.1.mlp.switch_mlp.down_proj.weight": {
+          "dtype": "uint32",
+          "fill": 50,
+          "shape": [
+            4,
+            128,
+            8
+          ]
+        },
+        "language_model.model.layers.1.mlp.switch_mlp.gate_proj.biases": {
+          "dtype": "bfloat16",
+          "fill": 46,
+          "shape": [
+            4,
+            64,
+            4
+          ]
+        },
+        "language_model.model.layers.1.mlp.switch_mlp.gate_proj.scales": {
+          "dtype": "bfloat16",
+          "fill": 45,
+          "shape": [
+            4,
+            64,
+            4
+          ]
+        },
+        "language_model.model.layers.1.mlp.switch_mlp.gate_proj.weight": {
+          "dtype": "uint32",
+          "fill": 44,
+          "shape": [
+            4,
+            64,
+            16
+          ]
+        },
+        "language_model.model.layers.1.mlp.switch_mlp.up_proj.biases": {
+          "dtype": "bfloat16",
+          "fill": 49,
+          "shape": [
+            4,
+            64,
+            4
+          ]
+        },
+        "language_model.model.layers.1.mlp.switch_mlp.up_proj.scales": {
+          "dtype": "bfloat16",
+          "fill": 48,
+          "shape": [
+            4,
+            64,
+            4
+          ]
+        },
+        "language_model.model.layers.1.mlp.switch_mlp.up_proj.weight": {
+          "dtype": "uint32",
+          "fill": 47,
+          "shape": [
+            4,
+            64,
+            16
+          ]
+        },
+        "language_model.model.layers.1.post_attention_layernorm.weight": {
+          "dtype": "bfloat16",
+          "fill": 28,
+          "shape": [
+            128
+          ]
+        }
+      }
+    },
+    "family-bad-expert-dtype.safetensors": {
+      "dtype_variant": {
+        "dtype": "float32",
+        "key": "language_model.model.layers.0.mlp.switch_mlp.gate_proj.weight"
+      },
+      "index": "family-bad-expert-dtype.index.json",
+      "index_sha256": "557eaeaf28d993c41e589e79edeee819b7e58b12dc941289c63868c0df44b501",
+      "sha256": "fbb425e7ccd852e031093cbc158c3391fd59725839a89530cf791fa2d06e810d",
+      "tensors": {
+        "language_model.model.layers.0.input_layernorm.weight": {
+          "dtype": "bfloat16",
+          "fill": 1,
+          "shape": [
+            128
+          ]
+        },
+        "language_model.model.layers.0.mlp.gate.biases": {
+          "dtype": "bfloat16",
+          "fill": 5,
+          "shape": [
+            4,
+            2
+          ]
+        },
+        "language_model.model.layers.0.mlp.gate.scales": {
+          "dtype": "bfloat16",
+          "fill": 4,
+          "shape": [
+            4,
+            2
+          ]
+        },
+        "language_model.model.layers.0.mlp.gate.weight": {
+          "dtype": "uint32",
+          "fill": 3,
+          "shape": [
+            4,
+            32
+          ]
+        },
+        "language_model.model.layers.0.mlp.shared_expert.down_proj.biases": {
+          "dtype": "bfloat16",
+          "fill": 17,
+          "shape": [
+            128,
+            2
+          ]
+        },
+        "language_model.model.layers.0.mlp.shared_expert.down_proj.scales": {
+          "dtype": "bfloat16",
+          "fill": 16,
+          "shape": [
+            128,
+            2
+          ]
+        },
+        "language_model.model.layers.0.mlp.shared_expert.down_proj.weight": {
+          "dtype": "uint32",
+          "fill": 15,
+          "shape": [
+            128,
+            8
+          ]
+        },
+        "language_model.model.layers.0.mlp.shared_expert.gate_proj.biases": {
+          "dtype": "bfloat16",
+          "fill": 11,
+          "shape": [
+            64,
+            4
+          ]
+        },
+        "language_model.model.layers.0.mlp.shared_expert.gate_proj.scales": {
+          "dtype": "bfloat16",
+          "fill": 10,
+          "shape": [
+            64,
+            4
+          ]
+        },
+        "language_model.model.layers.0.mlp.shared_expert.gate_proj.weight": {
+          "dtype": "uint32",
+          "fill": 9,
+          "shape": [
+            64,
+            16
+          ]
+        },
+        "language_model.model.layers.0.mlp.shared_expert.up_proj.biases": {
+          "dtype": "bfloat16",
+          "fill": 14,
+          "shape": [
+            64,
+            4
+          ]
+        },
+        "language_model.model.layers.0.mlp.shared_expert.up_proj.scales": {
+          "dtype": "bfloat16",
+          "fill": 13,
+          "shape": [
+            64,
+            4
+          ]
+        },
+        "language_model.model.layers.0.mlp.shared_expert.up_proj.weight": {
+          "dtype": "uint32",
+          "fill": 12,
+          "shape": [
+            64,
+            16
+          ]
+        },
+        "language_model.model.layers.0.mlp.shared_expert_gate.biases": {
+          "dtype": "bfloat16",
+          "fill": 8,
+          "shape": [
+            1,
+            2
+          ]
+        },
+        "language_model.model.layers.0.mlp.shared_expert_gate.scales": {
+          "dtype": "bfloat16",
+          "fill": 7,
+          "shape": [
+            1,
+            2
+          ]
+        },
+        "language_model.model.layers.0.mlp.shared_expert_gate.weight": {
+          "dtype": "uint32",
+          "fill": 6,
+          "shape": [
+            1,
+            32
+          ]
+        },
+        "language_model.model.layers.0.mlp.switch_mlp.down_proj.biases": {
+          "dtype": "bfloat16",
+          "fill": 26,
+          "shape": [
+            4,
+            128,
+            2
+          ]
+        },
+        "language_model.model.layers.0.mlp.switch_mlp.down_proj.scales": {
+          "dtype": "bfloat16",
+          "fill": 25,
+          "shape": [
+            4,
+            128,
+            2
+          ]
+        },
+        "language_model.model.layers.0.mlp.switch_mlp.down_proj.weight": {
+          "dtype": "uint32",
+          "fill": 24,
+          "shape": [
+            4,
+            128,
+            8
+          ]
+        },
+        "language_model.model.layers.0.mlp.switch_mlp.gate_proj.biases": {
+          "dtype": "bfloat16",
+          "fill": 20,
+          "shape": [
+            4,
+            64,
+            1
+          ]
+        },
+        "language_model.model.layers.0.mlp.switch_mlp.gate_proj.scales": {
+          "dtype": "bfloat16",
+          "fill": 19,
+          "shape": [
+            4,
+            64,
+            1
+          ]
+        },
+        "language_model.model.layers.0.mlp.switch_mlp.gate_proj.weight": {
+          "dtype": "float32",
+          "fill": 18,
+          "shape": [
+            4,
+            64,
+            16
+          ]
+        },
+        "language_model.model.layers.0.mlp.switch_mlp.up_proj.biases": {
+          "dtype": "bfloat16",
+          "fill": 23,
+          "shape": [
+            4,
+            64,
+            4
+          ]
+        },
+        "language_model.model.layers.0.mlp.switch_mlp.up_proj.scales": {
+          "dtype": "bfloat16",
+          "fill": 22,
+          "shape": [
+            4,
+            64,
+            4
+          ]
+        },
+        "language_model.model.layers.0.mlp.switch_mlp.up_proj.weight": {
+          "dtype": "uint32",
+          "fill": 21,
+          "shape": [
+            4,
+            64,
+            16
+          ]
+        },
+        "language_model.model.layers.0.post_attention_layernorm.weight": {
+          "dtype": "bfloat16",
+          "fill": 2,
+          "shape": [
+            128
+          ]
+        },
+        "language_model.model.layers.0.self_attn.k_norm.weight": {
+          "dtype": "bfloat16",
+          "fill": 66,
+          "shape": [
+            16
+          ]
+        },
+        "language_model.model.layers.0.self_attn.k_proj.biases": {
+          "dtype": "bfloat16",
+          "fill": 58,
+          "shape": [
+            32,
+            4
+          ]
+        },
+        "language_model.model.layers.0.self_attn.k_proj.scales": {
+          "dtype": "bfloat16",
+          "fill": 57,
+          "shape": [
+            32,
+            4
+          ]
+        },
+        "language_model.model.layers.0.self_attn.k_proj.weight": {
+          "dtype": "uint32",
+          "fill": 56,
+          "shape": [
+            32,
+            16
+          ]
+        },
+        "language_model.model.layers.0.self_attn.o_proj.biases": {
+          "dtype": "bfloat16",
+          "fill": 64,
+          "shape": [
+            128,
+            2
+          ]
+        },
+        "language_model.model.layers.0.self_attn.o_proj.scales": {
+          "dtype": "bfloat16",
+          "fill": 63,
+          "shape": [
+            128,
+            2
+          ]
+        },
+        "language_model.model.layers.0.self_attn.o_proj.weight": {
+          "dtype": "uint32",
+          "fill": 62,
+          "shape": [
+            128,
+            8
+          ]
+        },
+        "language_model.model.layers.0.self_attn.q_norm.weight": {
+          "dtype": "bfloat16",
+          "fill": 65,
+          "shape": [
+            16
+          ]
+        },
+        "language_model.model.layers.0.self_attn.q_proj.biases": {
+          "dtype": "bfloat16",
+          "fill": 55,
+          "shape": [
+            128,
+            4
+          ]
+        },
+        "language_model.model.layers.0.self_attn.q_proj.scales": {
+          "dtype": "bfloat16",
+          "fill": 54,
+          "shape": [
+            128,
+            4
+          ]
+        },
+        "language_model.model.layers.0.self_attn.q_proj.weight": {
+          "dtype": "uint32",
+          "fill": 53,
+          "shape": [
+            128,
+            32
+          ]
+        },
+        "language_model.model.layers.0.self_attn.v_proj.biases": {
+          "dtype": "bfloat16",
+          "fill": 61,
+          "shape": [
+            32,
+            4
+          ]
+        },
+        "language_model.model.layers.0.self_attn.v_proj.scales": {
+          "dtype": "bfloat16",
+          "fill": 60,
+          "shape": [
+            32,
+            4
+          ]
+        },
+        "language_model.model.layers.0.self_attn.v_proj.weight": {
+          "dtype": "uint32",
+          "fill": 59,
+          "shape": [
+            32,
+            16
+          ]
+        },
+        "language_model.model.layers.1.input_layernorm.weight": {
+          "dtype": "bfloat16",
+          "fill": 27,
+          "shape": [
+            128
+          ]
+        },
+        "language_model.model.layers.1.linear_attn.A_log": {
+          "dtype": "bfloat16",
+          "fill": 68,
+          "shape": [
+            64
+          ]
+        },
+        "language_model.model.layers.1.linear_attn.conv1d.weight": {
+          "dtype": "bfloat16",
+          "fill": 67,
+          "shape": [
+            512,
+            4,
+            1
+          ]
+        },
+        "language_model.model.layers.1.linear_attn.dt_bias": {
+          "dtype": "bfloat16",
+          "fill": 69,
+          "shape": [
+            64
+          ]
+        },
+        "language_model.model.layers.1.linear_attn.in_proj_a.biases": {
+          "dtype": "bfloat16",
+          "fill": 73,
+          "shape": [
+            64,
+            4
+          ]
+        },
+        "language_model.model.layers.1.linear_attn.in_proj_a.scales": {
+          "dtype": "bfloat16",
+          "fill": 72,
+          "shape": [
+            64,
+            4
+          ]
+        },
+        "language_model.model.layers.1.linear_attn.in_proj_a.weight": {
+          "dtype": "uint32",
+          "fill": 71,
+          "shape": [
+            64,
+            16
+          ]
+        },
+        "language_model.model.layers.1.linear_attn.in_proj_b.biases": {
+          "dtype": "bfloat16",
+          "fill": 76,
+          "shape": [
+            64,
+            4
+          ]
+        },
+        "language_model.model.layers.1.linear_attn.in_proj_b.scales": {
+          "dtype": "bfloat16",
+          "fill": 75,
+          "shape": [
+            64,
+            4
+          ]
+        },
+        "language_model.model.layers.1.linear_attn.in_proj_b.weight": {
+          "dtype": "uint32",
+          "fill": 74,
+          "shape": [
+            64,
+            16
+          ]
+        },
+        "language_model.model.layers.1.linear_attn.in_proj_qkv.biases": {
+          "dtype": "bfloat16",
+          "fill": 79,
+          "shape": [
+            512,
+            4
+          ]
+        },
+        "language_model.model.layers.1.linear_attn.in_proj_qkv.scales": {
+          "dtype": "bfloat16",
+          "fill": 78,
+          "shape": [
+            512,
+            4
+          ]
+        },
+        "language_model.model.layers.1.linear_attn.in_proj_qkv.weight": {
+          "dtype": "uint32",
+          "fill": 77,
+          "shape": [
+            512,
+            16
+          ]
+        },
+        "language_model.model.layers.1.linear_attn.in_proj_z.biases": {
+          "dtype": "bfloat16",
+          "fill": 82,
+          "shape": [
+            256,
+            4
+          ]
+        },
+        "language_model.model.layers.1.linear_attn.in_proj_z.scales": {
+          "dtype": "bfloat16",
+          "fill": 81,
+          "shape": [
+            256,
+            4
+          ]
+        },
+        "language_model.model.layers.1.linear_attn.in_proj_z.weight": {
+          "dtype": "uint32",
+          "fill": 80,
+          "shape": [
+            256,
+            16
+          ]
+        },
+        "language_model.model.layers.1.linear_attn.norm.weight": {
+          "dtype": "bfloat16",
+          "fill": 70,
+          "shape": [
+            4
+          ]
+        },
+        "language_model.model.layers.1.linear_attn.out_proj.biases": {
+          "dtype": "bfloat16",
+          "fill": 85,
+          "shape": [
+            128,
+            8
+          ]
+        },
+        "language_model.model.layers.1.linear_attn.out_proj.scales": {
+          "dtype": "bfloat16",
+          "fill": 84,
+          "shape": [
+            128,
+            8
+          ]
+        },
+        "language_model.model.layers.1.linear_attn.out_proj.weight": {
+          "dtype": "uint32",
+          "fill": 83,
+          "shape": [
+            128,
+            32
+          ]
+        },
+        "language_model.model.layers.1.mlp.gate.biases": {
+          "dtype": "bfloat16",
+          "fill": 31,
+          "shape": [
+            4,
+            4
+          ]
+        },
+        "language_model.model.layers.1.mlp.gate.scales": {
+          "dtype": "bfloat16",
+          "fill": 30,
+          "shape": [
+            4,
+            4
+          ]
+        },
+        "language_model.model.layers.1.mlp.gate.weight": {
+          "dtype": "uint32",
+          "fill": 29,
+          "shape": [
+            4,
+            16
+          ]
+        },
+        "language_model.model.layers.1.mlp.shared_expert.down_proj.biases": {
+          "dtype": "bfloat16",
+          "fill": 43,
+          "shape": [
+            128,
+            2
+          ]
+        },
+        "language_model.model.layers.1.mlp.shared_expert.down_proj.scales": {
+          "dtype": "bfloat16",
+          "fill": 42,
+          "shape": [
+            128,
+            2
+          ]
+        },
+        "language_model.model.layers.1.mlp.shared_expert.down_proj.weight": {
+          "dtype": "uint32",
+          "fill": 41,
+          "shape": [
+            128,
+            8
+          ]
+        },
+        "language_model.model.layers.1.mlp.shared_expert.gate_proj.biases": {
+          "dtype": "bfloat16",
+          "fill": 37,
+          "shape": [
+            64,
+            4
+          ]
+        },
+        "language_model.model.layers.1.mlp.shared_expert.gate_proj.scales": {
+          "dtype": "bfloat16",
+          "fill": 36,
+          "shape": [
+            64,
+            4
+          ]
+        },
+        "language_model.model.layers.1.mlp.shared_expert.gate_proj.weight": {
+          "dtype": "uint32",
+          "fill": 35,
+          "shape": [
+            64,
+            16
+          ]
+        },
+        "language_model.model.layers.1.mlp.shared_expert.up_proj.biases": {
+          "dtype": "bfloat16",
+          "fill": 40,
+          "shape": [
+            64,
+            4
+          ]
+        },
+        "language_model.model.layers.1.mlp.shared_expert.up_proj.scales": {
+          "dtype": "bfloat16",
+          "fill": 39,
+          "shape": [
+            64,
+            4
+          ]
+        },
+        "language_model.model.layers.1.mlp.shared_expert.up_proj.weight": {
+          "dtype": "uint32",
+          "fill": 38,
+          "shape": [
+            64,
+            16
+          ]
+        },
+        "language_model.model.layers.1.mlp.shared_expert_gate.biases": {
+          "dtype": "bfloat16",
+          "fill": 34,
+          "shape": [
+            1,
+            4
+          ]
+        },
+        "language_model.model.layers.1.mlp.shared_expert_gate.scales": {
+          "dtype": "bfloat16",
+          "fill": 33,
+          "shape": [
+            1,
+            4
+          ]
+        },
+        "language_model.model.layers.1.mlp.shared_expert_gate.weight": {
+          "dtype": "uint32",
+          "fill": 32,
+          "shape": [
+            1,
+            16
+          ]
+        },
+        "language_model.model.layers.1.mlp.switch_mlp.down_proj.biases": {
+          "dtype": "bfloat16",
+          "fill": 52,
+          "shape": [
+            4,
+            128,
+            2
+          ]
+        },
+        "language_model.model.layers.1.mlp.switch_mlp.down_proj.scales": {
+          "dtype": "bfloat16",
+          "fill": 51,
+          "shape": [
+            4,
+            128,
+            2
+          ]
+        },
+        "language_model.model.layers.1.mlp.switch_mlp.down_proj.weight": {
+          "dtype": "uint32",
+          "fill": 50,
+          "shape": [
+            4,
+            128,
+            8
+          ]
+        },
+        "language_model.model.layers.1.mlp.switch_mlp.gate_proj.biases": {
+          "dtype": "bfloat16",
+          "fill": 46,
+          "shape": [
+            4,
+            64,
+            4
+          ]
+        },
+        "language_model.model.layers.1.mlp.switch_mlp.gate_proj.scales": {
+          "dtype": "bfloat16",
+          "fill": 45,
+          "shape": [
+            4,
+            64,
+            4
+          ]
+        },
+        "language_model.model.layers.1.mlp.switch_mlp.gate_proj.weight": {
+          "dtype": "uint32",
+          "fill": 44,
+          "shape": [
+            4,
+            64,
+            16
+          ]
+        },
+        "language_model.model.layers.1.mlp.switch_mlp.up_proj.biases": {
+          "dtype": "bfloat16",
+          "fill": 49,
+          "shape": [
+            4,
+            64,
+            4
+          ]
+        },
+        "language_model.model.layers.1.mlp.switch_mlp.up_proj.scales": {
+          "dtype": "bfloat16",
+          "fill": 48,
+          "shape": [
+            4,
+            64,
+            4
+          ]
+        },
+        "language_model.model.layers.1.mlp.switch_mlp.up_proj.weight": {
+          "dtype": "uint32",
+          "fill": 47,
+          "shape": [
+            4,
+            64,
+            16
+          ]
+        },
+        "language_model.model.layers.1.post_attention_layernorm.weight": {
+          "dtype": "bfloat16",
+          "fill": 28,
+          "shape": [
+            128
+          ]
+        }
+      }
+    },
+    "family-bad-payload-dtype.safetensors": {
+      "dtype_variant": {
+        "dtype": "float32",
+        "key": "language_model.model.layers.0.mlp.gate.weight"
+      },
+      "index": "family-bad-payload-dtype.index.json",
+      "index_sha256": "5d2f009883858429e636485137b61c74fb2c2db4117ec161b7230ddd76d2eb1c",
+      "sha256": "f20cc23f6673970304c3da56390405e6ed0a4a53b89ccc9c1e566d5a2cd7271d",
+      "tensors": {
+        "language_model.model.layers.0.input_layernorm.weight": {
+          "dtype": "bfloat16",
+          "fill": 1,
+          "shape": [
+            128
+          ]
+        },
+        "language_model.model.layers.0.mlp.gate.biases": {
+          "dtype": "bfloat16",
+          "fill": 5,
+          "shape": [
+            4,
+            2
+          ]
+        },
+        "language_model.model.layers.0.mlp.gate.scales": {
+          "dtype": "bfloat16",
+          "fill": 4,
+          "shape": [
+            4,
+            2
+          ]
+        },
+        "language_model.model.layers.0.mlp.gate.weight": {
+          "dtype": "float32",
+          "fill": 3,
+          "shape": [
+            4,
+            32
+          ]
+        },
+        "language_model.model.layers.0.mlp.shared_expert.down_proj.biases": {
+          "dtype": "bfloat16",
+          "fill": 17,
+          "shape": [
+            128,
+            2
+          ]
+        },
+        "language_model.model.layers.0.mlp.shared_expert.down_proj.scales": {
+          "dtype": "bfloat16",
+          "fill": 16,
+          "shape": [
+            128,
+            2
+          ]
+        },
+        "language_model.model.layers.0.mlp.shared_expert.down_proj.weight": {
+          "dtype": "uint32",
+          "fill": 15,
+          "shape": [
+            128,
+            8
+          ]
+        },
+        "language_model.model.layers.0.mlp.shared_expert.gate_proj.biases": {
+          "dtype": "bfloat16",
+          "fill": 11,
+          "shape": [
+            64,
+            4
+          ]
+        },
+        "language_model.model.layers.0.mlp.shared_expert.gate_proj.scales": {
+          "dtype": "bfloat16",
+          "fill": 10,
+          "shape": [
+            64,
+            4
+          ]
+        },
+        "language_model.model.layers.0.mlp.shared_expert.gate_proj.weight": {
+          "dtype": "uint32",
+          "fill": 9,
+          "shape": [
+            64,
+            16
+          ]
+        },
+        "language_model.model.layers.0.mlp.shared_expert.up_proj.biases": {
+          "dtype": "bfloat16",
+          "fill": 14,
+          "shape": [
+            64,
+            4
+          ]
+        },
+        "language_model.model.layers.0.mlp.shared_expert.up_proj.scales": {
+          "dtype": "bfloat16",
+          "fill": 13,
+          "shape": [
+            64,
+            4
+          ]
+        },
+        "language_model.model.layers.0.mlp.shared_expert.up_proj.weight": {
+          "dtype": "uint32",
+          "fill": 12,
+          "shape": [
+            64,
+            16
+          ]
+        },
+        "language_model.model.layers.0.mlp.shared_expert_gate.biases": {
+          "dtype": "bfloat16",
+          "fill": 8,
+          "shape": [
+            1,
+            2
+          ]
+        },
+        "language_model.model.layers.0.mlp.shared_expert_gate.scales": {
+          "dtype": "bfloat16",
+          "fill": 7,
+          "shape": [
+            1,
+            2
+          ]
+        },
+        "language_model.model.layers.0.mlp.shared_expert_gate.weight": {
+          "dtype": "uint32",
+          "fill": 6,
+          "shape": [
+            1,
+            32
+          ]
+        },
+        "language_model.model.layers.0.mlp.switch_mlp.down_proj.biases": {
+          "dtype": "bfloat16",
+          "fill": 26,
+          "shape": [
+            4,
+            128,
+            2
+          ]
+        },
+        "language_model.model.layers.0.mlp.switch_mlp.down_proj.scales": {
+          "dtype": "bfloat16",
+          "fill": 25,
+          "shape": [
+            4,
+            128,
+            2
+          ]
+        },
+        "language_model.model.layers.0.mlp.switch_mlp.down_proj.weight": {
+          "dtype": "uint32",
+          "fill": 24,
+          "shape": [
+            4,
+            128,
+            8
+          ]
+        },
+        "language_model.model.layers.0.mlp.switch_mlp.gate_proj.biases": {
+          "dtype": "bfloat16",
+          "fill": 20,
+          "shape": [
+            4,
+            64,
+            1
+          ]
+        },
+        "language_model.model.layers.0.mlp.switch_mlp.gate_proj.scales": {
+          "dtype": "bfloat16",
+          "fill": 19,
+          "shape": [
+            4,
+            64,
+            1
+          ]
+        },
+        "language_model.model.layers.0.mlp.switch_mlp.gate_proj.weight": {
+          "dtype": "uint32",
+          "fill": 18,
+          "shape": [
+            4,
+            64,
+            16
+          ]
+        },
+        "language_model.model.layers.0.mlp.switch_mlp.up_proj.biases": {
+          "dtype": "bfloat16",
+          "fill": 23,
+          "shape": [
+            4,
+            64,
+            4
+          ]
+        },
+        "language_model.model.layers.0.mlp.switch_mlp.up_proj.scales": {
+          "dtype": "bfloat16",
+          "fill": 22,
+          "shape": [
+            4,
+            64,
+            4
+          ]
+        },
+        "language_model.model.layers.0.mlp.switch_mlp.up_proj.weight": {
+          "dtype": "uint32",
+          "fill": 21,
+          "shape": [
+            4,
+            64,
+            16
+          ]
+        },
+        "language_model.model.layers.0.post_attention_layernorm.weight": {
+          "dtype": "bfloat16",
+          "fill": 2,
+          "shape": [
+            128
+          ]
+        },
+        "language_model.model.layers.0.self_attn.k_norm.weight": {
+          "dtype": "bfloat16",
+          "fill": 66,
+          "shape": [
+            16
+          ]
+        },
+        "language_model.model.layers.0.self_attn.k_proj.biases": {
+          "dtype": "bfloat16",
+          "fill": 58,
+          "shape": [
+            32,
+            4
+          ]
+        },
+        "language_model.model.layers.0.self_attn.k_proj.scales": {
+          "dtype": "bfloat16",
+          "fill": 57,
+          "shape": [
+            32,
+            4
+          ]
+        },
+        "language_model.model.layers.0.self_attn.k_proj.weight": {
+          "dtype": "uint32",
+          "fill": 56,
+          "shape": [
+            32,
+            16
+          ]
+        },
+        "language_model.model.layers.0.self_attn.o_proj.biases": {
+          "dtype": "bfloat16",
+          "fill": 64,
+          "shape": [
+            128,
+            2
+          ]
+        },
+        "language_model.model.layers.0.self_attn.o_proj.scales": {
+          "dtype": "bfloat16",
+          "fill": 63,
+          "shape": [
+            128,
+            2
+          ]
+        },
+        "language_model.model.layers.0.self_attn.o_proj.weight": {
+          "dtype": "uint32",
+          "fill": 62,
+          "shape": [
+            128,
+            8
+          ]
+        },
+        "language_model.model.layers.0.self_attn.q_norm.weight": {
+          "dtype": "bfloat16",
+          "fill": 65,
+          "shape": [
+            16
+          ]
+        },
+        "language_model.model.layers.0.self_attn.q_proj.biases": {
+          "dtype": "bfloat16",
+          "fill": 55,
+          "shape": [
+            128,
+            4
+          ]
+        },
+        "language_model.model.layers.0.self_attn.q_proj.scales": {
+          "dtype": "bfloat16",
+          "fill": 54,
+          "shape": [
+            128,
+            4
+          ]
+        },
+        "language_model.model.layers.0.self_attn.q_proj.weight": {
+          "dtype": "uint32",
+          "fill": 53,
+          "shape": [
+            128,
+            32
+          ]
+        },
+        "language_model.model.layers.0.self_attn.v_proj.biases": {
+          "dtype": "bfloat16",
+          "fill": 61,
+          "shape": [
+            32,
+            4
+          ]
+        },
+        "language_model.model.layers.0.self_attn.v_proj.scales": {
+          "dtype": "bfloat16",
+          "fill": 60,
+          "shape": [
+            32,
+            4
+          ]
+        },
+        "language_model.model.layers.0.self_attn.v_proj.weight": {
+          "dtype": "uint32",
+          "fill": 59,
+          "shape": [
+            32,
+            16
+          ]
+        },
+        "language_model.model.layers.1.input_layernorm.weight": {
+          "dtype": "bfloat16",
+          "fill": 27,
+          "shape": [
+            128
+          ]
+        },
+        "language_model.model.layers.1.linear_attn.A_log": {
+          "dtype": "bfloat16",
+          "fill": 68,
+          "shape": [
+            64
+          ]
+        },
+        "language_model.model.layers.1.linear_attn.conv1d.weight": {
+          "dtype": "bfloat16",
+          "fill": 67,
+          "shape": [
+            512,
+            4,
+            1
+          ]
+        },
+        "language_model.model.layers.1.linear_attn.dt_bias": {
+          "dtype": "bfloat16",
+          "fill": 69,
+          "shape": [
+            64
+          ]
+        },
+        "language_model.model.layers.1.linear_attn.in_proj_a.biases": {
+          "dtype": "bfloat16",
+          "fill": 73,
+          "shape": [
+            64,
+            4
+          ]
+        },
+        "language_model.model.layers.1.linear_attn.in_proj_a.scales": {
+          "dtype": "bfloat16",
+          "fill": 72,
+          "shape": [
+            64,
+            4
+          ]
+        },
+        "language_model.model.layers.1.linear_attn.in_proj_a.weight": {
+          "dtype": "uint32",
+          "fill": 71,
+          "shape": [
+            64,
+            16
+          ]
+        },
+        "language_model.model.layers.1.linear_attn.in_proj_b.biases": {
+          "dtype": "bfloat16",
+          "fill": 76,
+          "shape": [
+            64,
+            4
+          ]
+        },
+        "language_model.model.layers.1.linear_attn.in_proj_b.scales": {
+          "dtype": "bfloat16",
+          "fill": 75,
+          "shape": [
+            64,
+            4
+          ]
+        },
+        "language_model.model.layers.1.linear_attn.in_proj_b.weight": {
+          "dtype": "uint32",
+          "fill": 74,
+          "shape": [
+            64,
+            16
+          ]
+        },
+        "language_model.model.layers.1.linear_attn.in_proj_qkv.biases": {
+          "dtype": "bfloat16",
+          "fill": 79,
+          "shape": [
+            512,
+            4
+          ]
+        },
+        "language_model.model.layers.1.linear_attn.in_proj_qkv.scales": {
+          "dtype": "bfloat16",
+          "fill": 78,
+          "shape": [
+            512,
+            4
+          ]
+        },
+        "language_model.model.layers.1.linear_attn.in_proj_qkv.weight": {
+          "dtype": "uint32",
+          "fill": 77,
+          "shape": [
+            512,
+            16
+          ]
+        },
+        "language_model.model.layers.1.linear_attn.in_proj_z.biases": {
+          "dtype": "bfloat16",
+          "fill": 82,
+          "shape": [
+            256,
+            4
+          ]
+        },
+        "language_model.model.layers.1.linear_attn.in_proj_z.scales": {
+          "dtype": "bfloat16",
+          "fill": 81,
+          "shape": [
+            256,
+            4
+          ]
+        },
+        "language_model.model.layers.1.linear_attn.in_proj_z.weight": {
+          "dtype": "uint32",
+          "fill": 80,
+          "shape": [
+            256,
+            16
+          ]
+        },
+        "language_model.model.layers.1.linear_attn.norm.weight": {
+          "dtype": "bfloat16",
+          "fill": 70,
+          "shape": [
+            4
+          ]
+        },
+        "language_model.model.layers.1.linear_attn.out_proj.biases": {
+          "dtype": "bfloat16",
+          "fill": 85,
+          "shape": [
+            128,
+            8
+          ]
+        },
+        "language_model.model.layers.1.linear_attn.out_proj.scales": {
+          "dtype": "bfloat16",
+          "fill": 84,
+          "shape": [
+            128,
+            8
+          ]
+        },
+        "language_model.model.layers.1.linear_attn.out_proj.weight": {
+          "dtype": "uint32",
+          "fill": 83,
+          "shape": [
+            128,
+            32
+          ]
+        },
+        "language_model.model.layers.1.mlp.gate.biases": {
+          "dtype": "bfloat16",
+          "fill": 31,
+          "shape": [
+            4,
+            4
+          ]
+        },
+        "language_model.model.layers.1.mlp.gate.scales": {
+          "dtype": "bfloat16",
+          "fill": 30,
+          "shape": [
+            4,
+            4
+          ]
+        },
+        "language_model.model.layers.1.mlp.gate.weight": {
+          "dtype": "uint32",
+          "fill": 29,
+          "shape": [
+            4,
+            16
+          ]
+        },
+        "language_model.model.layers.1.mlp.shared_expert.down_proj.biases": {
+          "dtype": "bfloat16",
+          "fill": 43,
+          "shape": [
+            128,
+            2
+          ]
+        },
+        "language_model.model.layers.1.mlp.shared_expert.down_proj.scales": {
+          "dtype": "bfloat16",
+          "fill": 42,
+          "shape": [
+            128,
+            2
+          ]
+        },
+        "language_model.model.layers.1.mlp.shared_expert.down_proj.weight": {
+          "dtype": "uint32",
+          "fill": 41,
+          "shape": [
+            128,
+            8
+          ]
+        },
+        "language_model.model.layers.1.mlp.shared_expert.gate_proj.biases": {
+          "dtype": "bfloat16",
+          "fill": 37,
+          "shape": [
+            64,
+            4
+          ]
+        },
+        "language_model.model.layers.1.mlp.shared_expert.gate_proj.scales": {
+          "dtype": "bfloat16",
+          "fill": 36,
+          "shape": [
+            64,
+            4
+          ]
+        },
+        "language_model.model.layers.1.mlp.shared_expert.gate_proj.weight": {
+          "dtype": "uint32",
+          "fill": 35,
+          "shape": [
+            64,
+            16
+          ]
+        },
+        "language_model.model.layers.1.mlp.shared_expert.up_proj.biases": {
+          "dtype": "bfloat16",
+          "fill": 40,
+          "shape": [
+            64,
+            4
+          ]
+        },
+        "language_model.model.layers.1.mlp.shared_expert.up_proj.scales": {
+          "dtype": "bfloat16",
+          "fill": 39,
+          "shape": [
+            64,
+            4
+          ]
+        },
+        "language_model.model.layers.1.mlp.shared_expert.up_proj.weight": {
+          "dtype": "uint32",
+          "fill": 38,
+          "shape": [
+            64,
+            16
+          ]
+        },
+        "language_model.model.layers.1.mlp.shared_expert_gate.biases": {
+          "dtype": "bfloat16",
+          "fill": 34,
+          "shape": [
+            1,
+            4
+          ]
+        },
+        "language_model.model.layers.1.mlp.shared_expert_gate.scales": {
+          "dtype": "bfloat16",
+          "fill": 33,
+          "shape": [
+            1,
+            4
+          ]
+        },
+        "language_model.model.layers.1.mlp.shared_expert_gate.weight": {
+          "dtype": "uint32",
+          "fill": 32,
+          "shape": [
+            1,
+            16
+          ]
+        },
+        "language_model.model.layers.1.mlp.switch_mlp.down_proj.biases": {
+          "dtype": "bfloat16",
+          "fill": 52,
+          "shape": [
+            4,
+            128,
+            2
+          ]
+        },
+        "language_model.model.layers.1.mlp.switch_mlp.down_proj.scales": {
+          "dtype": "bfloat16",
+          "fill": 51,
+          "shape": [
+            4,
+            128,
+            2
+          ]
+        },
+        "language_model.model.layers.1.mlp.switch_mlp.down_proj.weight": {
+          "dtype": "uint32",
+          "fill": 50,
+          "shape": [
+            4,
+            128,
+            8
+          ]
+        },
+        "language_model.model.layers.1.mlp.switch_mlp.gate_proj.biases": {
+          "dtype": "bfloat16",
+          "fill": 46,
+          "shape": [
+            4,
+            64,
+            4
+          ]
+        },
+        "language_model.model.layers.1.mlp.switch_mlp.gate_proj.scales": {
+          "dtype": "bfloat16",
+          "fill": 45,
+          "shape": [
+            4,
+            64,
+            4
+          ]
+        },
+        "language_model.model.layers.1.mlp.switch_mlp.gate_proj.weight": {
+          "dtype": "uint32",
+          "fill": 44,
+          "shape": [
+            4,
+            64,
+            16
+          ]
+        },
+        "language_model.model.layers.1.mlp.switch_mlp.up_proj.biases": {
+          "dtype": "bfloat16",
+          "fill": 49,
+          "shape": [
+            4,
+            64,
+            4
+          ]
+        },
+        "language_model.model.layers.1.mlp.switch_mlp.up_proj.scales": {
+          "dtype": "bfloat16",
+          "fill": 48,
+          "shape": [
+            4,
+            64,
+            4
+          ]
+        },
+        "language_model.model.layers.1.mlp.switch_mlp.up_proj.weight": {
+          "dtype": "uint32",
+          "fill": 47,
+          "shape": [
+            4,
+            64,
+            16
+          ]
+        },
+        "language_model.model.layers.1.post_attention_layernorm.weight": {
+          "dtype": "bfloat16",
+          "fill": 28,
+          "shape": [
+            128
+          ]
+        }
+      }
+    },
+    "family-bad-sidecar-dtype.safetensors": {
+      "dtype_variant": {
+        "dtype": "float16",
+        "key": "language_model.model.layers.0.mlp.gate.scales"
+      },
+      "index": "family-bad-sidecar-dtype.index.json",
+      "index_sha256": "b6a45bfe5c29b5d46ae94984f864e912da038fece01dd09ab57fc5be2892059d",
+      "sha256": "5ea22abe3b5829e0415b8c54671ec7786bc3578b1b47ed9b52a35b6ce4e23c77",
+      "tensors": {
+        "language_model.model.layers.0.input_layernorm.weight": {
+          "dtype": "bfloat16",
+          "fill": 1,
+          "shape": [
+            128
+          ]
+        },
+        "language_model.model.layers.0.mlp.gate.biases": {
+          "dtype": "bfloat16",
+          "fill": 5,
+          "shape": [
+            4,
+            2
+          ]
+        },
+        "language_model.model.layers.0.mlp.gate.scales": {
+          "dtype": "float16",
+          "fill": 4,
+          "shape": [
+            4,
+            2
+          ]
+        },
+        "language_model.model.layers.0.mlp.gate.weight": {
+          "dtype": "uint32",
+          "fill": 3,
+          "shape": [
+            4,
+            32
+          ]
+        },
+        "language_model.model.layers.0.mlp.shared_expert.down_proj.biases": {
+          "dtype": "bfloat16",
+          "fill": 17,
+          "shape": [
+            128,
+            2
+          ]
+        },
+        "language_model.model.layers.0.mlp.shared_expert.down_proj.scales": {
+          "dtype": "bfloat16",
+          "fill": 16,
+          "shape": [
+            128,
+            2
+          ]
+        },
+        "language_model.model.layers.0.mlp.shared_expert.down_proj.weight": {
+          "dtype": "uint32",
+          "fill": 15,
+          "shape": [
+            128,
+            8
+          ]
+        },
+        "language_model.model.layers.0.mlp.shared_expert.gate_proj.biases": {
+          "dtype": "bfloat16",
+          "fill": 11,
+          "shape": [
+            64,
+            4
+          ]
+        },
+        "language_model.model.layers.0.mlp.shared_expert.gate_proj.scales": {
+          "dtype": "bfloat16",
+          "fill": 10,
+          "shape": [
+            64,
+            4
+          ]
+        },
+        "language_model.model.layers.0.mlp.shared_expert.gate_proj.weight": {
+          "dtype": "uint32",
+          "fill": 9,
+          "shape": [
+            64,
+            16
+          ]
+        },
+        "language_model.model.layers.0.mlp.shared_expert.up_proj.biases": {
+          "dtype": "bfloat16",
+          "fill": 14,
+          "shape": [
+            64,
+            4
+          ]
+        },
+        "language_model.model.layers.0.mlp.shared_expert.up_proj.scales": {
+          "dtype": "bfloat16",
+          "fill": 13,
+          "shape": [
+            64,
+            4
+          ]
+        },
+        "language_model.model.layers.0.mlp.shared_expert.up_proj.weight": {
+          "dtype": "uint32",
+          "fill": 12,
+          "shape": [
+            64,
+            16
+          ]
+        },
+        "language_model.model.layers.0.mlp.shared_expert_gate.biases": {
+          "dtype": "bfloat16",
+          "fill": 8,
+          "shape": [
+            1,
+            2
+          ]
+        },
+        "language_model.model.layers.0.mlp.shared_expert_gate.scales": {
+          "dtype": "bfloat16",
+          "fill": 7,
+          "shape": [
+            1,
+            2
+          ]
+        },
+        "language_model.model.layers.0.mlp.shared_expert_gate.weight": {
+          "dtype": "uint32",
+          "fill": 6,
+          "shape": [
+            1,
+            32
+          ]
+        },
+        "language_model.model.layers.0.mlp.switch_mlp.down_proj.biases": {
+          "dtype": "bfloat16",
+          "fill": 26,
+          "shape": [
+            4,
+            128,
+            2
+          ]
+        },
+        "language_model.model.layers.0.mlp.switch_mlp.down_proj.scales": {
+          "dtype": "bfloat16",
+          "fill": 25,
+          "shape": [
+            4,
+            128,
+            2
+          ]
+        },
+        "language_model.model.layers.0.mlp.switch_mlp.down_proj.weight": {
+          "dtype": "uint32",
+          "fill": 24,
+          "shape": [
+            4,
+            128,
+            8
+          ]
+        },
+        "language_model.model.layers.0.mlp.switch_mlp.gate_proj.biases": {
+          "dtype": "bfloat16",
+          "fill": 20,
+          "shape": [
+            4,
+            64,
+            1
+          ]
+        },
+        "language_model.model.layers.0.mlp.switch_mlp.gate_proj.scales": {
+          "dtype": "bfloat16",
+          "fill": 19,
+          "shape": [
+            4,
+            64,
+            1
+          ]
+        },
+        "language_model.model.layers.0.mlp.switch_mlp.gate_proj.weight": {
+          "dtype": "uint32",
+          "fill": 18,
+          "shape": [
+            4,
+            64,
+            16
+          ]
+        },
+        "language_model.model.layers.0.mlp.switch_mlp.up_proj.biases": {
+          "dtype": "bfloat16",
+          "fill": 23,
+          "shape": [
+            4,
+            64,
+            4
+          ]
+        },
+        "language_model.model.layers.0.mlp.switch_mlp.up_proj.scales": {
+          "dtype": "bfloat16",
+          "fill": 22,
+          "shape": [
+            4,
+            64,
+            4
+          ]
+        },
+        "language_model.model.layers.0.mlp.switch_mlp.up_proj.weight": {
+          "dtype": "uint32",
+          "fill": 21,
+          "shape": [
+            4,
+            64,
+            16
+          ]
+        },
+        "language_model.model.layers.0.post_attention_layernorm.weight": {
+          "dtype": "bfloat16",
+          "fill": 2,
+          "shape": [
+            128
+          ]
+        },
+        "language_model.model.layers.0.self_attn.k_norm.weight": {
+          "dtype": "bfloat16",
+          "fill": 66,
+          "shape": [
+            16
+          ]
+        },
+        "language_model.model.layers.0.self_attn.k_proj.biases": {
+          "dtype": "bfloat16",
+          "fill": 58,
+          "shape": [
+            32,
+            4
+          ]
+        },
+        "language_model.model.layers.0.self_attn.k_proj.scales": {
+          "dtype": "bfloat16",
+          "fill": 57,
+          "shape": [
+            32,
+            4
+          ]
+        },
+        "language_model.model.layers.0.self_attn.k_proj.weight": {
+          "dtype": "uint32",
+          "fill": 56,
+          "shape": [
+            32,
+            16
+          ]
+        },
+        "language_model.model.layers.0.self_attn.o_proj.biases": {
+          "dtype": "bfloat16",
+          "fill": 64,
+          "shape": [
+            128,
+            2
+          ]
+        },
+        "language_model.model.layers.0.self_attn.o_proj.scales": {
+          "dtype": "bfloat16",
+          "fill": 63,
+          "shape": [
+            128,
+            2
+          ]
+        },
+        "language_model.model.layers.0.self_attn.o_proj.weight": {
+          "dtype": "uint32",
+          "fill": 62,
+          "shape": [
+            128,
+            8
+          ]
+        },
+        "language_model.model.layers.0.self_attn.q_norm.weight": {
+          "dtype": "bfloat16",
+          "fill": 65,
+          "shape": [
+            16
+          ]
+        },
+        "language_model.model.layers.0.self_attn.q_proj.biases": {
+          "dtype": "bfloat16",
+          "fill": 55,
+          "shape": [
+            128,
+            4
+          ]
+        },
+        "language_model.model.layers.0.self_attn.q_proj.scales": {
+          "dtype": "bfloat16",
+          "fill": 54,
+          "shape": [
+            128,
+            4
+          ]
+        },
+        "language_model.model.layers.0.self_attn.q_proj.weight": {
+          "dtype": "uint32",
+          "fill": 53,
+          "shape": [
+            128,
+            32
+          ]
+        },
+        "language_model.model.layers.0.self_attn.v_proj.biases": {
+          "dtype": "bfloat16",
+          "fill": 61,
+          "shape": [
+            32,
+            4
+          ]
+        },
+        "language_model.model.layers.0.self_attn.v_proj.scales": {
+          "dtype": "bfloat16",
+          "fill": 60,
+          "shape": [
+            32,
+            4
+          ]
+        },
+        "language_model.model.layers.0.self_attn.v_proj.weight": {
+          "dtype": "uint32",
+          "fill": 59,
+          "shape": [
+            32,
+            16
+          ]
+        },
+        "language_model.model.layers.1.input_layernorm.weight": {
+          "dtype": "bfloat16",
+          "fill": 27,
+          "shape": [
+            128
+          ]
+        },
+        "language_model.model.layers.1.linear_attn.A_log": {
+          "dtype": "bfloat16",
+          "fill": 68,
+          "shape": [
+            64
+          ]
+        },
+        "language_model.model.layers.1.linear_attn.conv1d.weight": {
+          "dtype": "bfloat16",
+          "fill": 67,
+          "shape": [
+            512,
+            4,
+            1
+          ]
+        },
+        "language_model.model.layers.1.linear_attn.dt_bias": {
+          "dtype": "bfloat16",
+          "fill": 69,
+          "shape": [
+            64
+          ]
+        },
+        "language_model.model.layers.1.linear_attn.in_proj_a.biases": {
+          "dtype": "bfloat16",
+          "fill": 73,
+          "shape": [
+            64,
+            4
+          ]
+        },
+        "language_model.model.layers.1.linear_attn.in_proj_a.scales": {
+          "dtype": "bfloat16",
+          "fill": 72,
+          "shape": [
+            64,
+            4
+          ]
+        },
+        "language_model.model.layers.1.linear_attn.in_proj_a.weight": {
+          "dtype": "uint32",
+          "fill": 71,
+          "shape": [
+            64,
+            16
+          ]
+        },
+        "language_model.model.layers.1.linear_attn.in_proj_b.biases": {
+          "dtype": "bfloat16",
+          "fill": 76,
+          "shape": [
+            64,
+            4
+          ]
+        },
+        "language_model.model.layers.1.linear_attn.in_proj_b.scales": {
+          "dtype": "bfloat16",
+          "fill": 75,
+          "shape": [
+            64,
+            4
+          ]
+        },
+        "language_model.model.layers.1.linear_attn.in_proj_b.weight": {
+          "dtype": "uint32",
+          "fill": 74,
+          "shape": [
+            64,
+            16
+          ]
+        },
+        "language_model.model.layers.1.linear_attn.in_proj_qkv.biases": {
+          "dtype": "bfloat16",
+          "fill": 79,
+          "shape": [
+            512,
+            4
+          ]
+        },
+        "language_model.model.layers.1.linear_attn.in_proj_qkv.scales": {
+          "dtype": "bfloat16",
+          "fill": 78,
+          "shape": [
+            512,
+            4
+          ]
+        },
+        "language_model.model.layers.1.linear_attn.in_proj_qkv.weight": {
+          "dtype": "uint32",
+          "fill": 77,
+          "shape": [
+            512,
+            16
+          ]
+        },
+        "language_model.model.layers.1.linear_attn.in_proj_z.biases": {
+          "dtype": "bfloat16",
+          "fill": 82,
+          "shape": [
+            256,
+            4
+          ]
+        },
+        "language_model.model.layers.1.linear_attn.in_proj_z.scales": {
+          "dtype": "bfloat16",
+          "fill": 81,
+          "shape": [
+            256,
+            4
+          ]
+        },
+        "language_model.model.layers.1.linear_attn.in_proj_z.weight": {
+          "dtype": "uint32",
+          "fill": 80,
+          "shape": [
+            256,
+            16
+          ]
+        },
+        "language_model.model.layers.1.linear_attn.norm.weight": {
+          "dtype": "bfloat16",
+          "fill": 70,
+          "shape": [
+            4
+          ]
+        },
+        "language_model.model.layers.1.linear_attn.out_proj.biases": {
+          "dtype": "bfloat16",
+          "fill": 85,
+          "shape": [
+            128,
+            8
+          ]
+        },
+        "language_model.model.layers.1.linear_attn.out_proj.scales": {
+          "dtype": "bfloat16",
+          "fill": 84,
+          "shape": [
+            128,
+            8
+          ]
+        },
+        "language_model.model.layers.1.linear_attn.out_proj.weight": {
+          "dtype": "uint32",
+          "fill": 83,
+          "shape": [
+            128,
+            32
+          ]
+        },
+        "language_model.model.layers.1.mlp.gate.biases": {
+          "dtype": "bfloat16",
+          "fill": 31,
+          "shape": [
+            4,
+            4
+          ]
+        },
+        "language_model.model.layers.1.mlp.gate.scales": {
+          "dtype": "bfloat16",
+          "fill": 30,
+          "shape": [
+            4,
+            4
+          ]
+        },
+        "language_model.model.layers.1.mlp.gate.weight": {
+          "dtype": "uint32",
+          "fill": 29,
+          "shape": [
+            4,
+            16
+          ]
+        },
+        "language_model.model.layers.1.mlp.shared_expert.down_proj.biases": {
+          "dtype": "bfloat16",
+          "fill": 43,
+          "shape": [
+            128,
+            2
+          ]
+        },
+        "language_model.model.layers.1.mlp.shared_expert.down_proj.scales": {
+          "dtype": "bfloat16",
+          "fill": 42,
+          "shape": [
+            128,
+            2
+          ]
+        },
+        "language_model.model.layers.1.mlp.shared_expert.down_proj.weight": {
+          "dtype": "uint32",
+          "fill": 41,
+          "shape": [
+            128,
+            8
+          ]
+        },
+        "language_model.model.layers.1.mlp.shared_expert.gate_proj.biases": {
+          "dtype": "bfloat16",
+          "fill": 37,
+          "shape": [
+            64,
+            4
+          ]
+        },
+        "language_model.model.layers.1.mlp.shared_expert.gate_proj.scales": {
+          "dtype": "bfloat16",
+          "fill": 36,
+          "shape": [
+            64,
+            4
+          ]
+        },
+        "language_model.model.layers.1.mlp.shared_expert.gate_proj.weight": {
+          "dtype": "uint32",
+          "fill": 35,
+          "shape": [
+            64,
+            16
+          ]
+        },
+        "language_model.model.layers.1.mlp.shared_expert.up_proj.biases": {
+          "dtype": "bfloat16",
+          "fill": 40,
+          "shape": [
+            64,
+            4
+          ]
+        },
+        "language_model.model.layers.1.mlp.shared_expert.up_proj.scales": {
+          "dtype": "bfloat16",
+          "fill": 39,
+          "shape": [
+            64,
+            4
+          ]
+        },
+        "language_model.model.layers.1.mlp.shared_expert.up_proj.weight": {
+          "dtype": "uint32",
+          "fill": 38,
+          "shape": [
+            64,
+            16
+          ]
+        },
+        "language_model.model.layers.1.mlp.shared_expert_gate.biases": {
+          "dtype": "bfloat16",
+          "fill": 34,
+          "shape": [
+            1,
+            4
+          ]
+        },
+        "language_model.model.layers.1.mlp.shared_expert_gate.scales": {
+          "dtype": "bfloat16",
+          "fill": 33,
+          "shape": [
+            1,
+            4
+          ]
+        },
+        "language_model.model.layers.1.mlp.shared_expert_gate.weight": {
+          "dtype": "uint32",
+          "fill": 32,
+          "shape": [
+            1,
+            16
+          ]
+        },
+        "language_model.model.layers.1.mlp.switch_mlp.down_proj.biases": {
+          "dtype": "bfloat16",
+          "fill": 52,
+          "shape": [
+            4,
+            128,
+            2
+          ]
+        },
+        "language_model.model.layers.1.mlp.switch_mlp.down_proj.scales": {
+          "dtype": "bfloat16",
+          "fill": 51,
+          "shape": [
+            4,
+            128,
+            2
+          ]
+        },
+        "language_model.model.layers.1.mlp.switch_mlp.down_proj.weight": {
+          "dtype": "uint32",
+          "fill": 50,
+          "shape": [
+            4,
+            128,
+            8
+          ]
+        },
+        "language_model.model.layers.1.mlp.switch_mlp.gate_proj.biases": {
+          "dtype": "bfloat16",
+          "fill": 46,
+          "shape": [
+            4,
+            64,
+            4
+          ]
+        },
+        "language_model.model.layers.1.mlp.switch_mlp.gate_proj.scales": {
+          "dtype": "bfloat16",
+          "fill": 45,
+          "shape": [
+            4,
+            64,
+            4
+          ]
+        },
+        "language_model.model.layers.1.mlp.switch_mlp.gate_proj.weight": {
+          "dtype": "uint32",
+          "fill": 44,
+          "shape": [
+            4,
+            64,
+            16
+          ]
+        },
+        "language_model.model.layers.1.mlp.switch_mlp.up_proj.biases": {
+          "dtype": "bfloat16",
+          "fill": 49,
+          "shape": [
+            4,
+            64,
+            4
+          ]
+        },
+        "language_model.model.layers.1.mlp.switch_mlp.up_proj.scales": {
+          "dtype": "bfloat16",
+          "fill": 48,
+          "shape": [
+            4,
+            64,
+            4
+          ]
+        },
+        "language_model.model.layers.1.mlp.switch_mlp.up_proj.weight": {
+          "dtype": "uint32",
+          "fill": 47,
+          "shape": [
+            4,
+            64,
+            16
+          ]
+        },
+        "language_model.model.layers.1.post_attention_layernorm.weight": {
+          "dtype": "bfloat16",
+          "fill": 28,
+          "shape": [
+            128
+          ]
+        }
+      }
+    },
+    "family-full.safetensors": {
+      "index": "family-full.index.json",
+      "index_sha256": "0be5c61abbe815b221011a14545ed9c9220d412c7171fdc2c556b4b18264bf53",
+      "sha256": "3d7c98b6d232bf26b38efe315cca73bfe15e66a6819e591699309c9823368adb",
+      "tensors": {
+        "language_model.model.layers.0.input_layernorm.weight": {
+          "dtype": "bfloat16",
+          "fill": 1,
+          "shape": [
+            128
+          ]
+        },
+        "language_model.model.layers.0.mlp.gate.biases": {
+          "dtype": "bfloat16",
+          "fill": 5,
+          "shape": [
+            4,
+            2
+          ]
+        },
+        "language_model.model.layers.0.mlp.gate.scales": {
+          "dtype": "bfloat16",
+          "fill": 4,
+          "shape": [
+            4,
+            2
+          ]
+        },
+        "language_model.model.layers.0.mlp.gate.weight": {
+          "dtype": "uint32",
+          "fill": 3,
+          "shape": [
+            4,
+            32
+          ]
+        },
+        "language_model.model.layers.0.mlp.shared_expert.down_proj.biases": {
+          "dtype": "bfloat16",
+          "fill": 17,
+          "shape": [
+            128,
+            2
+          ]
+        },
+        "language_model.model.layers.0.mlp.shared_expert.down_proj.scales": {
+          "dtype": "bfloat16",
+          "fill": 16,
+          "shape": [
+            128,
+            2
+          ]
+        },
+        "language_model.model.layers.0.mlp.shared_expert.down_proj.weight": {
+          "dtype": "uint32",
+          "fill": 15,
+          "shape": [
+            128,
+            8
+          ]
+        },
+        "language_model.model.layers.0.mlp.shared_expert.gate_proj.biases": {
+          "dtype": "bfloat16",
+          "fill": 11,
+          "shape": [
+            64,
+            4
+          ]
+        },
+        "language_model.model.layers.0.mlp.shared_expert.gate_proj.scales": {
+          "dtype": "bfloat16",
+          "fill": 10,
+          "shape": [
+            64,
+            4
+          ]
+        },
+        "language_model.model.layers.0.mlp.shared_expert.gate_proj.weight": {
+          "dtype": "uint32",
+          "fill": 9,
+          "shape": [
+            64,
+            16
+          ]
+        },
+        "language_model.model.layers.0.mlp.shared_expert.up_proj.biases": {
+          "dtype": "bfloat16",
+          "fill": 14,
+          "shape": [
+            64,
+            4
+          ]
+        },
+        "language_model.model.layers.0.mlp.shared_expert.up_proj.scales": {
+          "dtype": "bfloat16",
+          "fill": 13,
+          "shape": [
+            64,
+            4
+          ]
+        },
+        "language_model.model.layers.0.mlp.shared_expert.up_proj.weight": {
+          "dtype": "uint32",
+          "fill": 12,
+          "shape": [
+            64,
+            16
+          ]
+        },
+        "language_model.model.layers.0.mlp.shared_expert_gate.biases": {
+          "dtype": "bfloat16",
+          "fill": 8,
+          "shape": [
+            1,
+            2
+          ]
+        },
+        "language_model.model.layers.0.mlp.shared_expert_gate.scales": {
+          "dtype": "bfloat16",
+          "fill": 7,
+          "shape": [
+            1,
+            2
+          ]
+        },
+        "language_model.model.layers.0.mlp.shared_expert_gate.weight": {
+          "dtype": "uint32",
+          "fill": 6,
+          "shape": [
+            1,
+            32
+          ]
+        },
+        "language_model.model.layers.0.mlp.switch_mlp.down_proj.biases": {
+          "dtype": "bfloat16",
+          "fill": 26,
+          "shape": [
+            4,
+            128,
+            2
+          ]
+        },
+        "language_model.model.layers.0.mlp.switch_mlp.down_proj.scales": {
+          "dtype": "bfloat16",
+          "fill": 25,
+          "shape": [
+            4,
+            128,
+            2
+          ]
+        },
+        "language_model.model.layers.0.mlp.switch_mlp.down_proj.weight": {
+          "dtype": "uint32",
+          "fill": 24,
+          "shape": [
+            4,
+            128,
+            8
+          ]
+        },
+        "language_model.model.layers.0.mlp.switch_mlp.gate_proj.biases": {
+          "dtype": "bfloat16",
+          "fill": 20,
+          "shape": [
+            4,
+            64,
+            1
+          ]
+        },
+        "language_model.model.layers.0.mlp.switch_mlp.gate_proj.scales": {
+          "dtype": "bfloat16",
+          "fill": 19,
+          "shape": [
+            4,
+            64,
+            1
+          ]
+        },
+        "language_model.model.layers.0.mlp.switch_mlp.gate_proj.weight": {
+          "dtype": "uint32",
+          "fill": 18,
+          "shape": [
+            4,
+            64,
+            16
+          ]
+        },
+        "language_model.model.layers.0.mlp.switch_mlp.up_proj.biases": {
+          "dtype": "bfloat16",
+          "fill": 23,
+          "shape": [
+            4,
+            64,
+            4
+          ]
+        },
+        "language_model.model.layers.0.mlp.switch_mlp.up_proj.scales": {
+          "dtype": "bfloat16",
+          "fill": 22,
+          "shape": [
+            4,
+            64,
+            4
+          ]
+        },
+        "language_model.model.layers.0.mlp.switch_mlp.up_proj.weight": {
+          "dtype": "uint32",
+          "fill": 21,
+          "shape": [
+            4,
+            64,
+            16
+          ]
+        },
+        "language_model.model.layers.0.post_attention_layernorm.weight": {
+          "dtype": "bfloat16",
+          "fill": 2,
+          "shape": [
+            128
+          ]
+        },
+        "language_model.model.layers.0.self_attn.k_norm.weight": {
+          "dtype": "bfloat16",
+          "fill": 66,
+          "shape": [
+            16
+          ]
+        },
+        "language_model.model.layers.0.self_attn.k_proj.biases": {
+          "dtype": "bfloat16",
+          "fill": 58,
+          "shape": [
+            32,
+            4
+          ]
+        },
+        "language_model.model.layers.0.self_attn.k_proj.scales": {
+          "dtype": "bfloat16",
+          "fill": 57,
+          "shape": [
+            32,
+            4
+          ]
+        },
+        "language_model.model.layers.0.self_attn.k_proj.weight": {
+          "dtype": "uint32",
+          "fill": 56,
+          "shape": [
+            32,
+            16
+          ]
+        },
+        "language_model.model.layers.0.self_attn.o_proj.biases": {
+          "dtype": "bfloat16",
+          "fill": 64,
+          "shape": [
+            128,
+            2
+          ]
+        },
+        "language_model.model.layers.0.self_attn.o_proj.scales": {
+          "dtype": "bfloat16",
+          "fill": 63,
+          "shape": [
+            128,
+            2
+          ]
+        },
+        "language_model.model.layers.0.self_attn.o_proj.weight": {
+          "dtype": "uint32",
+          "fill": 62,
+          "shape": [
+            128,
+            8
+          ]
+        },
+        "language_model.model.layers.0.self_attn.q_norm.weight": {
+          "dtype": "bfloat16",
+          "fill": 65,
+          "shape": [
+            16
+          ]
+        },
+        "language_model.model.layers.0.self_attn.q_proj.biases": {
+          "dtype": "bfloat16",
+          "fill": 55,
+          "shape": [
+            128,
+            4
+          ]
+        },
+        "language_model.model.layers.0.self_attn.q_proj.scales": {
+          "dtype": "bfloat16",
+          "fill": 54,
+          "shape": [
+            128,
+            4
+          ]
+        },
+        "language_model.model.layers.0.self_attn.q_proj.weight": {
+          "dtype": "uint32",
+          "fill": 53,
+          "shape": [
+            128,
+            32
+          ]
+        },
+        "language_model.model.layers.0.self_attn.v_proj.biases": {
+          "dtype": "bfloat16",
+          "fill": 61,
+          "shape": [
+            32,
+            4
+          ]
+        },
+        "language_model.model.layers.0.self_attn.v_proj.scales": {
+          "dtype": "bfloat16",
+          "fill": 60,
+          "shape": [
+            32,
+            4
+          ]
+        },
+        "language_model.model.layers.0.self_attn.v_proj.weight": {
+          "dtype": "uint32",
+          "fill": 59,
+          "shape": [
+            32,
+            16
+          ]
+        },
+        "language_model.model.layers.1.input_layernorm.weight": {
+          "dtype": "bfloat16",
+          "fill": 27,
+          "shape": [
+            128
+          ]
+        },
+        "language_model.model.layers.1.linear_attn.A_log": {
+          "dtype": "bfloat16",
+          "fill": 68,
+          "shape": [
+            64
+          ]
+        },
+        "language_model.model.layers.1.linear_attn.conv1d.weight": {
+          "dtype": "bfloat16",
+          "fill": 67,
+          "shape": [
+            512,
+            4,
+            1
+          ]
+        },
+        "language_model.model.layers.1.linear_attn.dt_bias": {
+          "dtype": "bfloat16",
+          "fill": 69,
+          "shape": [
+            64
+          ]
+        },
+        "language_model.model.layers.1.linear_attn.in_proj_a.biases": {
+          "dtype": "bfloat16",
+          "fill": 73,
+          "shape": [
+            64,
+            4
+          ]
+        },
+        "language_model.model.layers.1.linear_attn.in_proj_a.scales": {
+          "dtype": "bfloat16",
+          "fill": 72,
+          "shape": [
+            64,
+            4
+          ]
+        },
+        "language_model.model.layers.1.linear_attn.in_proj_a.weight": {
+          "dtype": "uint32",
+          "fill": 71,
+          "shape": [
+            64,
+            16
+          ]
+        },
+        "language_model.model.layers.1.linear_attn.in_proj_b.biases": {
+          "dtype": "bfloat16",
+          "fill": 76,
+          "shape": [
+            64,
+            4
+          ]
+        },
+        "language_model.model.layers.1.linear_attn.in_proj_b.scales": {
+          "dtype": "bfloat16",
+          "fill": 75,
+          "shape": [
+            64,
+            4
+          ]
+        },
+        "language_model.model.layers.1.linear_attn.in_proj_b.weight": {
+          "dtype": "uint32",
+          "fill": 74,
+          "shape": [
+            64,
+            16
+          ]
+        },
+        "language_model.model.layers.1.linear_attn.in_proj_qkv.biases": {
+          "dtype": "bfloat16",
+          "fill": 79,
+          "shape": [
+            512,
+            4
+          ]
+        },
+        "language_model.model.layers.1.linear_attn.in_proj_qkv.scales": {
+          "dtype": "bfloat16",
+          "fill": 78,
+          "shape": [
+            512,
+            4
+          ]
+        },
+        "language_model.model.layers.1.linear_attn.in_proj_qkv.weight": {
+          "dtype": "uint32",
+          "fill": 77,
+          "shape": [
+            512,
+            16
+          ]
+        },
+        "language_model.model.layers.1.linear_attn.in_proj_z.biases": {
+          "dtype": "bfloat16",
+          "fill": 82,
+          "shape": [
+            256,
+            4
+          ]
+        },
+        "language_model.model.layers.1.linear_attn.in_proj_z.scales": {
+          "dtype": "bfloat16",
+          "fill": 81,
+          "shape": [
+            256,
+            4
+          ]
+        },
+        "language_model.model.layers.1.linear_attn.in_proj_z.weight": {
+          "dtype": "uint32",
+          "fill": 80,
+          "shape": [
+            256,
+            16
+          ]
+        },
+        "language_model.model.layers.1.linear_attn.norm.weight": {
+          "dtype": "bfloat16",
+          "fill": 70,
+          "shape": [
+            4
+          ]
+        },
+        "language_model.model.layers.1.linear_attn.out_proj.biases": {
+          "dtype": "bfloat16",
+          "fill": 85,
+          "shape": [
+            128,
+            8
+          ]
+        },
+        "language_model.model.layers.1.linear_attn.out_proj.scales": {
+          "dtype": "bfloat16",
+          "fill": 84,
+          "shape": [
+            128,
+            8
+          ]
+        },
+        "language_model.model.layers.1.linear_attn.out_proj.weight": {
+          "dtype": "uint32",
+          "fill": 83,
+          "shape": [
+            128,
+            32
+          ]
+        },
+        "language_model.model.layers.1.mlp.gate.biases": {
+          "dtype": "bfloat16",
+          "fill": 31,
+          "shape": [
+            4,
+            4
+          ]
+        },
+        "language_model.model.layers.1.mlp.gate.scales": {
+          "dtype": "bfloat16",
+          "fill": 30,
+          "shape": [
+            4,
+            4
+          ]
+        },
+        "language_model.model.layers.1.mlp.gate.weight": {
+          "dtype": "uint32",
+          "fill": 29,
+          "shape": [
+            4,
+            16
+          ]
+        },
+        "language_model.model.layers.1.mlp.shared_expert.down_proj.biases": {
+          "dtype": "bfloat16",
+          "fill": 43,
+          "shape": [
+            128,
+            2
+          ]
+        },
+        "language_model.model.layers.1.mlp.shared_expert.down_proj.scales": {
+          "dtype": "bfloat16",
+          "fill": 42,
+          "shape": [
+            128,
+            2
+          ]
+        },
+        "language_model.model.layers.1.mlp.shared_expert.down_proj.weight": {
+          "dtype": "uint32",
+          "fill": 41,
+          "shape": [
+            128,
+            8
+          ]
+        },
+        "language_model.model.layers.1.mlp.shared_expert.gate_proj.biases": {
+          "dtype": "bfloat16",
+          "fill": 37,
+          "shape": [
+            64,
+            4
+          ]
+        },
+        "language_model.model.layers.1.mlp.shared_expert.gate_proj.scales": {
+          "dtype": "bfloat16",
+          "fill": 36,
+          "shape": [
+            64,
+            4
+          ]
+        },
+        "language_model.model.layers.1.mlp.shared_expert.gate_proj.weight": {
+          "dtype": "uint32",
+          "fill": 35,
+          "shape": [
+            64,
+            16
+          ]
+        },
+        "language_model.model.layers.1.mlp.shared_expert.up_proj.biases": {
+          "dtype": "bfloat16",
+          "fill": 40,
+          "shape": [
+            64,
+            4
+          ]
+        },
+        "language_model.model.layers.1.mlp.shared_expert.up_proj.scales": {
+          "dtype": "bfloat16",
+          "fill": 39,
+          "shape": [
+            64,
+            4
+          ]
+        },
+        "language_model.model.layers.1.mlp.shared_expert.up_proj.weight": {
+          "dtype": "uint32",
+          "fill": 38,
+          "shape": [
+            64,
+            16
+          ]
+        },
+        "language_model.model.layers.1.mlp.shared_expert_gate.biases": {
+          "dtype": "bfloat16",
+          "fill": 34,
+          "shape": [
+            1,
+            4
+          ]
+        },
+        "language_model.model.layers.1.mlp.shared_expert_gate.scales": {
+          "dtype": "bfloat16",
+          "fill": 33,
+          "shape": [
+            1,
+            4
+          ]
+        },
+        "language_model.model.layers.1.mlp.shared_expert_gate.weight": {
+          "dtype": "uint32",
+          "fill": 32,
+          "shape": [
+            1,
+            16
+          ]
+        },
+        "language_model.model.layers.1.mlp.switch_mlp.down_proj.biases": {
+          "dtype": "bfloat16",
+          "fill": 52,
+          "shape": [
+            4,
+            128,
+            2
+          ]
+        },
+        "language_model.model.layers.1.mlp.switch_mlp.down_proj.scales": {
+          "dtype": "bfloat16",
+          "fill": 51,
+          "shape": [
+            4,
+            128,
+            2
+          ]
+        },
+        "language_model.model.layers.1.mlp.switch_mlp.down_proj.weight": {
+          "dtype": "uint32",
+          "fill": 50,
+          "shape": [
+            4,
+            128,
+            8
+          ]
+        },
+        "language_model.model.layers.1.mlp.switch_mlp.gate_proj.biases": {
+          "dtype": "bfloat16",
+          "fill": 46,
+          "shape": [
+            4,
+            64,
+            4
+          ]
+        },
+        "language_model.model.layers.1.mlp.switch_mlp.gate_proj.scales": {
+          "dtype": "bfloat16",
+          "fill": 45,
+          "shape": [
+            4,
+            64,
+            4
+          ]
+        },
+        "language_model.model.layers.1.mlp.switch_mlp.gate_proj.weight": {
+          "dtype": "uint32",
+          "fill": 44,
+          "shape": [
+            4,
+            64,
+            16
+          ]
+        },
+        "language_model.model.layers.1.mlp.switch_mlp.up_proj.biases": {
+          "dtype": "bfloat16",
+          "fill": 49,
+          "shape": [
+            4,
+            64,
+            4
+          ]
+        },
+        "language_model.model.layers.1.mlp.switch_mlp.up_proj.scales": {
+          "dtype": "bfloat16",
+          "fill": 48,
+          "shape": [
+            4,
+            64,
+            4
+          ]
+        },
+        "language_model.model.layers.1.mlp.switch_mlp.up_proj.weight": {
+          "dtype": "uint32",
+          "fill": 47,
+          "shape": [
+            4,
+            64,
+            16
+          ]
+        },
+        "language_model.model.layers.1.post_attention_layernorm.weight": {
+          "dtype": "bfloat16",
+          "fill": 28,
+          "shape": [
+            128
+          ]
+        }
+      }
+    },
+    "family-missing-router.safetensors": {
+      "index": "family-missing-router.index.json",
+      "index_sha256": "4e1c48a0469fd2d3f3279552a946394124739f04c4b6b743396fdd58f5a5c9f3",
+      "missing": "language_model.model.layers.0.mlp.gate.weight",
+      "sha256": "ceba823bf0d098419432fc4bd31fb9bbc9044e9f035338d3a0ec8cf67d4432e1",
+      "tensors": {
+        "language_model.model.layers.0.input_layernorm.weight": {
+          "dtype": "bfloat16",
+          "fill": 1,
+          "shape": [
+            128
+          ]
+        },
+        "language_model.model.layers.0.mlp.gate.biases": {
+          "dtype": "bfloat16",
+          "fill": 5,
+          "shape": [
+            4,
+            2
+          ]
+        },
+        "language_model.model.layers.0.mlp.gate.scales": {
+          "dtype": "bfloat16",
+          "fill": 4,
+          "shape": [
+            4,
+            2
+          ]
+        },
+        "language_model.model.layers.0.mlp.shared_expert.down_proj.biases": {
+          "dtype": "bfloat16",
+          "fill": 17,
+          "shape": [
+            128,
+            2
+          ]
+        },
+        "language_model.model.layers.0.mlp.shared_expert.down_proj.scales": {
+          "dtype": "bfloat16",
+          "fill": 16,
+          "shape": [
+            128,
+            2
+          ]
+        },
+        "language_model.model.layers.0.mlp.shared_expert.down_proj.weight": {
+          "dtype": "uint32",
+          "fill": 15,
+          "shape": [
+            128,
+            8
+          ]
+        },
+        "language_model.model.layers.0.mlp.shared_expert.gate_proj.biases": {
+          "dtype": "bfloat16",
+          "fill": 11,
+          "shape": [
+            64,
+            4
+          ]
+        },
+        "language_model.model.layers.0.mlp.shared_expert.gate_proj.scales": {
+          "dtype": "bfloat16",
+          "fill": 10,
+          "shape": [
+            64,
+            4
+          ]
+        },
+        "language_model.model.layers.0.mlp.shared_expert.gate_proj.weight": {
+          "dtype": "uint32",
+          "fill": 9,
+          "shape": [
+            64,
+            16
+          ]
+        },
+        "language_model.model.layers.0.mlp.shared_expert.up_proj.biases": {
+          "dtype": "bfloat16",
+          "fill": 14,
+          "shape": [
+            64,
+            4
+          ]
+        },
+        "language_model.model.layers.0.mlp.shared_expert.up_proj.scales": {
+          "dtype": "bfloat16",
+          "fill": 13,
+          "shape": [
+            64,
+            4
+          ]
+        },
+        "language_model.model.layers.0.mlp.shared_expert.up_proj.weight": {
+          "dtype": "uint32",
+          "fill": 12,
+          "shape": [
+            64,
+            16
+          ]
+        },
+        "language_model.model.layers.0.mlp.shared_expert_gate.biases": {
+          "dtype": "bfloat16",
+          "fill": 8,
+          "shape": [
+            1,
+            2
+          ]
+        },
+        "language_model.model.layers.0.mlp.shared_expert_gate.scales": {
+          "dtype": "bfloat16",
+          "fill": 7,
+          "shape": [
+            1,
+            2
+          ]
+        },
+        "language_model.model.layers.0.mlp.shared_expert_gate.weight": {
+          "dtype": "uint32",
+          "fill": 6,
+          "shape": [
+            1,
+            32
+          ]
+        },
+        "language_model.model.layers.0.mlp.switch_mlp.down_proj.biases": {
+          "dtype": "bfloat16",
+          "fill": 26,
+          "shape": [
+            4,
+            128,
+            2
+          ]
+        },
+        "language_model.model.layers.0.mlp.switch_mlp.down_proj.scales": {
+          "dtype": "bfloat16",
+          "fill": 25,
+          "shape": [
+            4,
+            128,
+            2
+          ]
+        },
+        "language_model.model.layers.0.mlp.switch_mlp.down_proj.weight": {
+          "dtype": "uint32",
+          "fill": 24,
+          "shape": [
+            4,
+            128,
+            8
+          ]
+        },
+        "language_model.model.layers.0.mlp.switch_mlp.gate_proj.biases": {
+          "dtype": "bfloat16",
+          "fill": 20,
+          "shape": [
+            4,
+            64,
+            1
+          ]
+        },
+        "language_model.model.layers.0.mlp.switch_mlp.gate_proj.scales": {
+          "dtype": "bfloat16",
+          "fill": 19,
+          "shape": [
+            4,
+            64,
+            1
+          ]
+        },
+        "language_model.model.layers.0.mlp.switch_mlp.gate_proj.weight": {
+          "dtype": "uint32",
+          "fill": 18,
+          "shape": [
+            4,
+            64,
+            16
+          ]
+        },
+        "language_model.model.layers.0.mlp.switch_mlp.up_proj.biases": {
+          "dtype": "bfloat16",
+          "fill": 23,
+          "shape": [
+            4,
+            64,
+            4
+          ]
+        },
+        "language_model.model.layers.0.mlp.switch_mlp.up_proj.scales": {
+          "dtype": "bfloat16",
+          "fill": 22,
+          "shape": [
+            4,
+            64,
+            4
+          ]
+        },
+        "language_model.model.layers.0.mlp.switch_mlp.up_proj.weight": {
+          "dtype": "uint32",
+          "fill": 21,
+          "shape": [
+            4,
+            64,
+            16
+          ]
+        },
+        "language_model.model.layers.0.post_attention_layernorm.weight": {
+          "dtype": "bfloat16",
+          "fill": 2,
+          "shape": [
+            128
+          ]
+        },
+        "language_model.model.layers.0.self_attn.k_norm.weight": {
+          "dtype": "bfloat16",
+          "fill": 66,
+          "shape": [
+            16
+          ]
+        },
+        "language_model.model.layers.0.self_attn.k_proj.biases": {
+          "dtype": "bfloat16",
+          "fill": 58,
+          "shape": [
+            32,
+            4
+          ]
+        },
+        "language_model.model.layers.0.self_attn.k_proj.scales": {
+          "dtype": "bfloat16",
+          "fill": 57,
+          "shape": [
+            32,
+            4
+          ]
+        },
+        "language_model.model.layers.0.self_attn.k_proj.weight": {
+          "dtype": "uint32",
+          "fill": 56,
+          "shape": [
+            32,
+            16
+          ]
+        },
+        "language_model.model.layers.0.self_attn.o_proj.biases": {
+          "dtype": "bfloat16",
+          "fill": 64,
+          "shape": [
+            128,
+            2
+          ]
+        },
+        "language_model.model.layers.0.self_attn.o_proj.scales": {
+          "dtype": "bfloat16",
+          "fill": 63,
+          "shape": [
+            128,
+            2
+          ]
+        },
+        "language_model.model.layers.0.self_attn.o_proj.weight": {
+          "dtype": "uint32",
+          "fill": 62,
+          "shape": [
+            128,
+            8
+          ]
+        },
+        "language_model.model.layers.0.self_attn.q_norm.weight": {
+          "dtype": "bfloat16",
+          "fill": 65,
+          "shape": [
+            16
+          ]
+        },
+        "language_model.model.layers.0.self_attn.q_proj.biases": {
+          "dtype": "bfloat16",
+          "fill": 55,
+          "shape": [
+            128,
+            4
+          ]
+        },
+        "language_model.model.layers.0.self_attn.q_proj.scales": {
+          "dtype": "bfloat16",
+          "fill": 54,
+          "shape": [
+            128,
+            4
+          ]
+        },
+        "language_model.model.layers.0.self_attn.q_proj.weight": {
+          "dtype": "uint32",
+          "fill": 53,
+          "shape": [
+            128,
+            32
+          ]
+        },
+        "language_model.model.layers.0.self_attn.v_proj.biases": {
+          "dtype": "bfloat16",
+          "fill": 61,
+          "shape": [
+            32,
+            4
+          ]
+        },
+        "language_model.model.layers.0.self_attn.v_proj.scales": {
+          "dtype": "bfloat16",
+          "fill": 60,
+          "shape": [
+            32,
+            4
+          ]
+        },
+        "language_model.model.layers.0.self_attn.v_proj.weight": {
+          "dtype": "uint32",
+          "fill": 59,
+          "shape": [
+            32,
+            16
+          ]
+        },
+        "language_model.model.layers.1.input_layernorm.weight": {
+          "dtype": "bfloat16",
+          "fill": 27,
+          "shape": [
+            128
+          ]
+        },
+        "language_model.model.layers.1.linear_attn.A_log": {
+          "dtype": "bfloat16",
+          "fill": 68,
+          "shape": [
+            64
+          ]
+        },
+        "language_model.model.layers.1.linear_attn.conv1d.weight": {
+          "dtype": "bfloat16",
+          "fill": 67,
+          "shape": [
+            512,
+            4,
+            1
+          ]
+        },
+        "language_model.model.layers.1.linear_attn.dt_bias": {
+          "dtype": "bfloat16",
+          "fill": 69,
+          "shape": [
+            64
+          ]
+        },
+        "language_model.model.layers.1.linear_attn.in_proj_a.biases": {
+          "dtype": "bfloat16",
+          "fill": 73,
+          "shape": [
+            64,
+            4
+          ]
+        },
+        "language_model.model.layers.1.linear_attn.in_proj_a.scales": {
+          "dtype": "bfloat16",
+          "fill": 72,
+          "shape": [
+            64,
+            4
+          ]
+        },
+        "language_model.model.layers.1.linear_attn.in_proj_a.weight": {
+          "dtype": "uint32",
+          "fill": 71,
+          "shape": [
+            64,
+            16
+          ]
+        },
+        "language_model.model.layers.1.linear_attn.in_proj_b.biases": {
+          "dtype": "bfloat16",
+          "fill": 76,
+          "shape": [
+            64,
+            4
+          ]
+        },
+        "language_model.model.layers.1.linear_attn.in_proj_b.scales": {
+          "dtype": "bfloat16",
+          "fill": 75,
+          "shape": [
+            64,
+            4
+          ]
+        },
+        "language_model.model.layers.1.linear_attn.in_proj_b.weight": {
+          "dtype": "uint32",
+          "fill": 74,
+          "shape": [
+            64,
+            16
+          ]
+        },
+        "language_model.model.layers.1.linear_attn.in_proj_qkv.biases": {
+          "dtype": "bfloat16",
+          "fill": 79,
+          "shape": [
+            512,
+            4
+          ]
+        },
+        "language_model.model.layers.1.linear_attn.in_proj_qkv.scales": {
+          "dtype": "bfloat16",
+          "fill": 78,
+          "shape": [
+            512,
+            4
+          ]
+        },
+        "language_model.model.layers.1.linear_attn.in_proj_qkv.weight": {
+          "dtype": "uint32",
+          "fill": 77,
+          "shape": [
+            512,
+            16
+          ]
+        },
+        "language_model.model.layers.1.linear_attn.in_proj_z.biases": {
+          "dtype": "bfloat16",
+          "fill": 82,
+          "shape": [
+            256,
+            4
+          ]
+        },
+        "language_model.model.layers.1.linear_attn.in_proj_z.scales": {
+          "dtype": "bfloat16",
+          "fill": 81,
+          "shape": [
+            256,
+            4
+          ]
+        },
+        "language_model.model.layers.1.linear_attn.in_proj_z.weight": {
+          "dtype": "uint32",
+          "fill": 80,
+          "shape": [
+            256,
+            16
+          ]
+        },
+        "language_model.model.layers.1.linear_attn.norm.weight": {
+          "dtype": "bfloat16",
+          "fill": 70,
+          "shape": [
+            4
+          ]
+        },
+        "language_model.model.layers.1.linear_attn.out_proj.biases": {
+          "dtype": "bfloat16",
+          "fill": 85,
+          "shape": [
+            128,
+            8
+          ]
+        },
+        "language_model.model.layers.1.linear_attn.out_proj.scales": {
+          "dtype": "bfloat16",
+          "fill": 84,
+          "shape": [
+            128,
+            8
+          ]
+        },
+        "language_model.model.layers.1.linear_attn.out_proj.weight": {
+          "dtype": "uint32",
+          "fill": 83,
+          "shape": [
+            128,
+            32
+          ]
+        },
+        "language_model.model.layers.1.mlp.gate.biases": {
+          "dtype": "bfloat16",
+          "fill": 31,
+          "shape": [
+            4,
+            4
+          ]
+        },
+        "language_model.model.layers.1.mlp.gate.scales": {
+          "dtype": "bfloat16",
+          "fill": 30,
+          "shape": [
+            4,
+            4
+          ]
+        },
+        "language_model.model.layers.1.mlp.gate.weight": {
+          "dtype": "uint32",
+          "fill": 29,
+          "shape": [
+            4,
+            16
+          ]
+        },
+        "language_model.model.layers.1.mlp.shared_expert.down_proj.biases": {
+          "dtype": "bfloat16",
+          "fill": 43,
+          "shape": [
+            128,
+            2
+          ]
+        },
+        "language_model.model.layers.1.mlp.shared_expert.down_proj.scales": {
+          "dtype": "bfloat16",
+          "fill": 42,
+          "shape": [
+            128,
+            2
+          ]
+        },
+        "language_model.model.layers.1.mlp.shared_expert.down_proj.weight": {
+          "dtype": "uint32",
+          "fill": 41,
+          "shape": [
+            128,
+            8
+          ]
+        },
+        "language_model.model.layers.1.mlp.shared_expert.gate_proj.biases": {
+          "dtype": "bfloat16",
+          "fill": 37,
+          "shape": [
+            64,
+            4
+          ]
+        },
+        "language_model.model.layers.1.mlp.shared_expert.gate_proj.scales": {
+          "dtype": "bfloat16",
+          "fill": 36,
+          "shape": [
+            64,
+            4
+          ]
+        },
+        "language_model.model.layers.1.mlp.shared_expert.gate_proj.weight": {
+          "dtype": "uint32",
+          "fill": 35,
+          "shape": [
+            64,
+            16
+          ]
+        },
+        "language_model.model.layers.1.mlp.shared_expert.up_proj.biases": {
+          "dtype": "bfloat16",
+          "fill": 40,
+          "shape": [
+            64,
+            4
+          ]
+        },
+        "language_model.model.layers.1.mlp.shared_expert.up_proj.scales": {
+          "dtype": "bfloat16",
+          "fill": 39,
+          "shape": [
+            64,
+            4
+          ]
+        },
+        "language_model.model.layers.1.mlp.shared_expert.up_proj.weight": {
+          "dtype": "uint32",
+          "fill": 38,
+          "shape": [
+            64,
+            16
+          ]
+        },
+        "language_model.model.layers.1.mlp.shared_expert_gate.biases": {
+          "dtype": "bfloat16",
+          "fill": 34,
+          "shape": [
+            1,
+            4
+          ]
+        },
+        "language_model.model.layers.1.mlp.shared_expert_gate.scales": {
+          "dtype": "bfloat16",
+          "fill": 33,
+          "shape": [
+            1,
+            4
+          ]
+        },
+        "language_model.model.layers.1.mlp.shared_expert_gate.weight": {
+          "dtype": "uint32",
+          "fill": 32,
+          "shape": [
+            1,
+            16
+          ]
+        },
+        "language_model.model.layers.1.mlp.switch_mlp.down_proj.biases": {
+          "dtype": "bfloat16",
+          "fill": 52,
+          "shape": [
+            4,
+            128,
+            2
+          ]
+        },
+        "language_model.model.layers.1.mlp.switch_mlp.down_proj.scales": {
+          "dtype": "bfloat16",
+          "fill": 51,
+          "shape": [
+            4,
+            128,
+            2
+          ]
+        },
+        "language_model.model.layers.1.mlp.switch_mlp.down_proj.weight": {
+          "dtype": "uint32",
+          "fill": 50,
+          "shape": [
+            4,
+            128,
+            8
+          ]
+        },
+        "language_model.model.layers.1.mlp.switch_mlp.gate_proj.biases": {
+          "dtype": "bfloat16",
+          "fill": 46,
+          "shape": [
+            4,
+            64,
+            4
+          ]
+        },
+        "language_model.model.layers.1.mlp.switch_mlp.gate_proj.scales": {
+          "dtype": "bfloat16",
+          "fill": 45,
+          "shape": [
+            4,
+            64,
+            4
+          ]
+        },
+        "language_model.model.layers.1.mlp.switch_mlp.gate_proj.weight": {
+          "dtype": "uint32",
+          "fill": 44,
+          "shape": [
+            4,
+            64,
+            16
+          ]
+        },
+        "language_model.model.layers.1.mlp.switch_mlp.up_proj.biases": {
+          "dtype": "bfloat16",
+          "fill": 49,
+          "shape": [
+            4,
+            64,
+            4
+          ]
+        },
+        "language_model.model.layers.1.mlp.switch_mlp.up_proj.scales": {
+          "dtype": "bfloat16",
+          "fill": 48,
+          "shape": [
+            4,
+            64,
+            4
+          ]
+        },
+        "language_model.model.layers.1.mlp.switch_mlp.up_proj.weight": {
+          "dtype": "uint32",
+          "fill": 47,
+          "shape": [
+            4,
+            64,
+            16
+          ]
+        },
+        "language_model.model.layers.1.post_attention_layernorm.weight": {
+          "dtype": "bfloat16",
+          "fill": 28,
+          "shape": [
+            128
+          ]
+        }
+      }
+    },
+    "family-partial.safetensors": {
+      "sha256": "2b90b835cf05fd9a6b559933b2d509859ddcdec13fd7ca0511204329bf89197c",
+      "tensors": {
+        "language_model.model.norm.weight": {
+          "dtype": "bfloat16",
+          "fill": 1,
+          "shape": [
+            128
+          ]
+        }
+      }
+    },
+    "family-wrong-rank.safetensors": {
+      "index": "family-wrong-rank.index.json",
+      "index_sha256": "528eb2813665ba467b6c10eb7eef35b8979c1a13fae7a6d30f0cd38c5a5a31d8",
+      "sha256": "465377af25676f973ff984930c9c4820de260902962763b13afdbca6e05e0c8c",
+      "tensors": {
+        "language_model.model.layers.0.input_layernorm.weight": {
+          "dtype": "bfloat16",
+          "fill": 1,
+          "shape": [
+            128
+          ]
+        },
+        "language_model.model.layers.0.mlp.gate.biases": {
+          "dtype": "bfloat16",
+          "fill": 5,
+          "shape": [
+            4,
+            2
+          ]
+        },
+        "language_model.model.layers.0.mlp.gate.scales": {
+          "dtype": "bfloat16",
+          "fill": 4,
+          "shape": [
+            4,
+            2
+          ]
+        },
+        "language_model.model.layers.0.mlp.gate.weight": {
+          "dtype": "uint32",
+          "fill": 3,
+          "shape": [
+            4,
+            1,
+            32
+          ]
+        },
+        "language_model.model.layers.0.mlp.shared_expert.down_proj.biases": {
+          "dtype": "bfloat16",
+          "fill": 17,
+          "shape": [
+            128,
+            2
+          ]
+        },
+        "language_model.model.layers.0.mlp.shared_expert.down_proj.scales": {
+          "dtype": "bfloat16",
+          "fill": 16,
+          "shape": [
+            128,
+            2
+          ]
+        },
+        "language_model.model.layers.0.mlp.shared_expert.down_proj.weight": {
+          "dtype": "uint32",
+          "fill": 15,
+          "shape": [
+            128,
+            8
+          ]
+        },
+        "language_model.model.layers.0.mlp.shared_expert.gate_proj.biases": {
+          "dtype": "bfloat16",
+          "fill": 11,
+          "shape": [
+            64,
+            4
+          ]
+        },
+        "language_model.model.layers.0.mlp.shared_expert.gate_proj.scales": {
+          "dtype": "bfloat16",
+          "fill": 10,
+          "shape": [
+            64,
+            4
+          ]
+        },
+        "language_model.model.layers.0.mlp.shared_expert.gate_proj.weight": {
+          "dtype": "uint32",
+          "fill": 9,
+          "shape": [
+            64,
+            16
+          ]
+        },
+        "language_model.model.layers.0.mlp.shared_expert.up_proj.biases": {
+          "dtype": "bfloat16",
+          "fill": 14,
+          "shape": [
+            64,
+            4
+          ]
+        },
+        "language_model.model.layers.0.mlp.shared_expert.up_proj.scales": {
+          "dtype": "bfloat16",
+          "fill": 13,
+          "shape": [
+            64,
+            4
+          ]
+        },
+        "language_model.model.layers.0.mlp.shared_expert.up_proj.weight": {
+          "dtype": "uint32",
+          "fill": 12,
+          "shape": [
+            64,
+            16
+          ]
+        },
+        "language_model.model.layers.0.mlp.shared_expert_gate.biases": {
+          "dtype": "bfloat16",
+          "fill": 8,
+          "shape": [
+            1,
+            2
+          ]
+        },
+        "language_model.model.layers.0.mlp.shared_expert_gate.scales": {
+          "dtype": "bfloat16",
+          "fill": 7,
+          "shape": [
+            1,
+            2
+          ]
+        },
+        "language_model.model.layers.0.mlp.shared_expert_gate.weight": {
+          "dtype": "uint32",
+          "fill": 6,
+          "shape": [
+            1,
+            32
+          ]
+        },
+        "language_model.model.layers.0.mlp.switch_mlp.down_proj.biases": {
+          "dtype": "bfloat16",
+          "fill": 26,
+          "shape": [
+            4,
+            128,
+            2
+          ]
+        },
+        "language_model.model.layers.0.mlp.switch_mlp.down_proj.scales": {
+          "dtype": "bfloat16",
+          "fill": 25,
+          "shape": [
+            4,
+            128,
+            2
+          ]
+        },
+        "language_model.model.layers.0.mlp.switch_mlp.down_proj.weight": {
+          "dtype": "uint32",
+          "fill": 24,
+          "shape": [
+            4,
+            128,
+            8
+          ]
+        },
+        "language_model.model.layers.0.mlp.switch_mlp.gate_proj.biases": {
+          "dtype": "bfloat16",
+          "fill": 20,
+          "shape": [
+            4,
+            64,
+            1
+          ]
+        },
+        "language_model.model.layers.0.mlp.switch_mlp.gate_proj.scales": {
+          "dtype": "bfloat16",
+          "fill": 19,
+          "shape": [
+            4,
+            64,
+            1
+          ]
+        },
+        "language_model.model.layers.0.mlp.switch_mlp.gate_proj.weight": {
+          "dtype": "uint32",
+          "fill": 18,
+          "shape": [
+            4,
+            64,
+            16
+          ]
+        },
+        "language_model.model.layers.0.mlp.switch_mlp.up_proj.biases": {
+          "dtype": "bfloat16",
+          "fill": 23,
+          "shape": [
+            4,
+            64,
+            4
+          ]
+        },
+        "language_model.model.layers.0.mlp.switch_mlp.up_proj.scales": {
+          "dtype": "bfloat16",
+          "fill": 22,
+          "shape": [
+            4,
+            64,
+            4
+          ]
+        },
+        "language_model.model.layers.0.mlp.switch_mlp.up_proj.weight": {
+          "dtype": "uint32",
+          "fill": 21,
+          "shape": [
+            4,
+            64,
+            16
+          ]
+        },
+        "language_model.model.layers.0.post_attention_layernorm.weight": {
+          "dtype": "bfloat16",
+          "fill": 2,
+          "shape": [
+            128
+          ]
+        },
+        "language_model.model.layers.0.self_attn.k_norm.weight": {
+          "dtype": "bfloat16",
+          "fill": 66,
+          "shape": [
+            16
+          ]
+        },
+        "language_model.model.layers.0.self_attn.k_proj.biases": {
+          "dtype": "bfloat16",
+          "fill": 58,
+          "shape": [
+            32,
+            4
+          ]
+        },
+        "language_model.model.layers.0.self_attn.k_proj.scales": {
+          "dtype": "bfloat16",
+          "fill": 57,
+          "shape": [
+            32,
+            4
+          ]
+        },
+        "language_model.model.layers.0.self_attn.k_proj.weight": {
+          "dtype": "uint32",
+          "fill": 56,
+          "shape": [
+            32,
+            16
+          ]
+        },
+        "language_model.model.layers.0.self_attn.o_proj.biases": {
+          "dtype": "bfloat16",
+          "fill": 64,
+          "shape": [
+            128,
+            2
+          ]
+        },
+        "language_model.model.layers.0.self_attn.o_proj.scales": {
+          "dtype": "bfloat16",
+          "fill": 63,
+          "shape": [
+            128,
+            2
+          ]
+        },
+        "language_model.model.layers.0.self_attn.o_proj.weight": {
+          "dtype": "uint32",
+          "fill": 62,
+          "shape": [
+            128,
+            8
+          ]
+        },
+        "language_model.model.layers.0.self_attn.q_norm.weight": {
+          "dtype": "bfloat16",
+          "fill": 65,
+          "shape": [
+            16
+          ]
+        },
+        "language_model.model.layers.0.self_attn.q_proj.biases": {
+          "dtype": "bfloat16",
+          "fill": 55,
+          "shape": [
+            128,
+            4
+          ]
+        },
+        "language_model.model.layers.0.self_attn.q_proj.scales": {
+          "dtype": "bfloat16",
+          "fill": 54,
+          "shape": [
+            128,
+            4
+          ]
+        },
+        "language_model.model.layers.0.self_attn.q_proj.weight": {
+          "dtype": "uint32",
+          "fill": 53,
+          "shape": [
+            128,
+            32
+          ]
+        },
+        "language_model.model.layers.0.self_attn.v_proj.biases": {
+          "dtype": "bfloat16",
+          "fill": 61,
+          "shape": [
+            32,
+            4
+          ]
+        },
+        "language_model.model.layers.0.self_attn.v_proj.scales": {
+          "dtype": "bfloat16",
+          "fill": 60,
+          "shape": [
+            32,
+            4
+          ]
+        },
+        "language_model.model.layers.0.self_attn.v_proj.weight": {
+          "dtype": "uint32",
+          "fill": 59,
+          "shape": [
+            32,
+            16
+          ]
+        },
+        "language_model.model.layers.1.input_layernorm.weight": {
+          "dtype": "bfloat16",
+          "fill": 27,
+          "shape": [
+            128
+          ]
+        },
+        "language_model.model.layers.1.linear_attn.A_log": {
+          "dtype": "bfloat16",
+          "fill": 68,
+          "shape": [
+            64
+          ]
+        },
+        "language_model.model.layers.1.linear_attn.conv1d.weight": {
+          "dtype": "bfloat16",
+          "fill": 67,
+          "shape": [
+            512,
+            4,
+            1
+          ]
+        },
+        "language_model.model.layers.1.linear_attn.dt_bias": {
+          "dtype": "bfloat16",
+          "fill": 69,
+          "shape": [
+            64
+          ]
+        },
+        "language_model.model.layers.1.linear_attn.in_proj_a.biases": {
+          "dtype": "bfloat16",
+          "fill": 73,
+          "shape": [
+            64,
+            4
+          ]
+        },
+        "language_model.model.layers.1.linear_attn.in_proj_a.scales": {
+          "dtype": "bfloat16",
+          "fill": 72,
+          "shape": [
+            64,
+            4
+          ]
+        },
+        "language_model.model.layers.1.linear_attn.in_proj_a.weight": {
+          "dtype": "uint32",
+          "fill": 71,
+          "shape": [
+            64,
+            16
+          ]
+        },
+        "language_model.model.layers.1.linear_attn.in_proj_b.biases": {
+          "dtype": "bfloat16",
+          "fill": 76,
+          "shape": [
+            64,
+            4
+          ]
+        },
+        "language_model.model.layers.1.linear_attn.in_proj_b.scales": {
+          "dtype": "bfloat16",
+          "fill": 75,
+          "shape": [
+            64,
+            4
+          ]
+        },
+        "language_model.model.layers.1.linear_attn.in_proj_b.weight": {
+          "dtype": "uint32",
+          "fill": 74,
+          "shape": [
+            64,
+            16
+          ]
+        },
+        "language_model.model.layers.1.linear_attn.in_proj_qkv.biases": {
+          "dtype": "bfloat16",
+          "fill": 79,
+          "shape": [
+            512,
+            4
+          ]
+        },
+        "language_model.model.layers.1.linear_attn.in_proj_qkv.scales": {
+          "dtype": "bfloat16",
+          "fill": 78,
+          "shape": [
+            512,
+            4
+          ]
+        },
+        "language_model.model.layers.1.linear_attn.in_proj_qkv.weight": {
+          "dtype": "uint32",
+          "fill": 77,
+          "shape": [
+            512,
+            16
+          ]
+        },
+        "language_model.model.layers.1.linear_attn.in_proj_z.biases": {
+          "dtype": "bfloat16",
+          "fill": 82,
+          "shape": [
+            256,
+            4
+          ]
+        },
+        "language_model.model.layers.1.linear_attn.in_proj_z.scales": {
+          "dtype": "bfloat16",
+          "fill": 81,
+          "shape": [
+            256,
+            4
+          ]
+        },
+        "language_model.model.layers.1.linear_attn.in_proj_z.weight": {
+          "dtype": "uint32",
+          "fill": 80,
+          "shape": [
+            256,
+            16
+          ]
+        },
+        "language_model.model.layers.1.linear_attn.norm.weight": {
+          "dtype": "bfloat16",
+          "fill": 70,
+          "shape": [
+            4
+          ]
+        },
+        "language_model.model.layers.1.linear_attn.out_proj.biases": {
+          "dtype": "bfloat16",
+          "fill": 85,
+          "shape": [
+            128,
+            8
+          ]
+        },
+        "language_model.model.layers.1.linear_attn.out_proj.scales": {
+          "dtype": "bfloat16",
+          "fill": 84,
+          "shape": [
+            128,
+            8
+          ]
+        },
+        "language_model.model.layers.1.linear_attn.out_proj.weight": {
+          "dtype": "uint32",
+          "fill": 83,
+          "shape": [
+            128,
+            32
+          ]
+        },
+        "language_model.model.layers.1.mlp.gate.biases": {
+          "dtype": "bfloat16",
+          "fill": 31,
+          "shape": [
+            4,
+            4
+          ]
+        },
+        "language_model.model.layers.1.mlp.gate.scales": {
+          "dtype": "bfloat16",
+          "fill": 30,
+          "shape": [
+            4,
+            4
+          ]
+        },
+        "language_model.model.layers.1.mlp.gate.weight": {
+          "dtype": "uint32",
+          "fill": 29,
+          "shape": [
+            4,
+            16
+          ]
+        },
+        "language_model.model.layers.1.mlp.shared_expert.down_proj.biases": {
+          "dtype": "bfloat16",
+          "fill": 43,
+          "shape": [
+            128,
+            2
+          ]
+        },
+        "language_model.model.layers.1.mlp.shared_expert.down_proj.scales": {
+          "dtype": "bfloat16",
+          "fill": 42,
+          "shape": [
+            128,
+            2
+          ]
+        },
+        "language_model.model.layers.1.mlp.shared_expert.down_proj.weight": {
+          "dtype": "uint32",
+          "fill": 41,
+          "shape": [
+            128,
+            8
+          ]
+        },
+        "language_model.model.layers.1.mlp.shared_expert.gate_proj.biases": {
+          "dtype": "bfloat16",
+          "fill": 37,
+          "shape": [
+            64,
+            4
+          ]
+        },
+        "language_model.model.layers.1.mlp.shared_expert.gate_proj.scales": {
+          "dtype": "bfloat16",
+          "fill": 36,
+          "shape": [
+            64,
+            4
+          ]
+        },
+        "language_model.model.layers.1.mlp.shared_expert.gate_proj.weight": {
+          "dtype": "uint32",
+          "fill": 35,
+          "shape": [
+            64,
+            16
+          ]
+        },
+        "language_model.model.layers.1.mlp.shared_expert.up_proj.biases": {
+          "dtype": "bfloat16",
+          "fill": 40,
+          "shape": [
+            64,
+            4
+          ]
+        },
+        "language_model.model.layers.1.mlp.shared_expert.up_proj.scales": {
+          "dtype": "bfloat16",
+          "fill": 39,
+          "shape": [
+            64,
+            4
+          ]
+        },
+        "language_model.model.layers.1.mlp.shared_expert.up_proj.weight": {
+          "dtype": "uint32",
+          "fill": 38,
+          "shape": [
+            64,
+            16
+          ]
+        },
+        "language_model.model.layers.1.mlp.shared_expert_gate.biases": {
+          "dtype": "bfloat16",
+          "fill": 34,
+          "shape": [
+            1,
+            4
+          ]
+        },
+        "language_model.model.layers.1.mlp.shared_expert_gate.scales": {
+          "dtype": "bfloat16",
+          "fill": 33,
+          "shape": [
+            1,
+            4
+          ]
+        },
+        "language_model.model.layers.1.mlp.shared_expert_gate.weight": {
+          "dtype": "uint32",
+          "fill": 32,
+          "shape": [
+            1,
+            16
+          ]
+        },
+        "language_model.model.layers.1.mlp.switch_mlp.down_proj.biases": {
+          "dtype": "bfloat16",
+          "fill": 52,
+          "shape": [
+            4,
+            128,
+            2
+          ]
+        },
+        "language_model.model.layers.1.mlp.switch_mlp.down_proj.scales": {
+          "dtype": "bfloat16",
+          "fill": 51,
+          "shape": [
+            4,
+            128,
+            2
+          ]
+        },
+        "language_model.model.layers.1.mlp.switch_mlp.down_proj.weight": {
+          "dtype": "uint32",
+          "fill": 50,
+          "shape": [
+            4,
+            128,
+            8
+          ]
+        },
+        "language_model.model.layers.1.mlp.switch_mlp.gate_proj.biases": {
+          "dtype": "bfloat16",
+          "fill": 46,
+          "shape": [
+            4,
+            64,
+            4
+          ]
+        },
+        "language_model.model.layers.1.mlp.switch_mlp.gate_proj.scales": {
+          "dtype": "bfloat16",
+          "fill": 45,
+          "shape": [
+            4,
+            64,
+            4
+          ]
+        },
+        "language_model.model.layers.1.mlp.switch_mlp.gate_proj.weight": {
+          "dtype": "uint32",
+          "fill": 44,
+          "shape": [
+            4,
+            64,
+            16
+          ]
+        },
+        "language_model.model.layers.1.mlp.switch_mlp.up_proj.biases": {
+          "dtype": "bfloat16",
+          "fill": 49,
+          "shape": [
+            4,
+            64,
+            4
+          ]
+        },
+        "language_model.model.layers.1.mlp.switch_mlp.up_proj.scales": {
+          "dtype": "bfloat16",
+          "fill": 48,
+          "shape": [
+            4,
+            64,
+            4
+          ]
+        },
+        "language_model.model.layers.1.mlp.switch_mlp.up_proj.weight": {
+          "dtype": "uint32",
+          "fill": 47,
+          "shape": [
+            4,
+            64,
+            16
+          ]
+        },
+        "language_model.model.layers.1.post_attention_layernorm.weight": {
+          "dtype": "bfloat16",
+          "fill": 28,
+          "shape": [
+            128
+          ]
+        }
+      }
+    }
+  },
+  "geometry": {
+    "aux": 64,
+    "experts": 4,
+    "head_dim": 16,
+    "heads_kv": 2,
+    "heads_q": 4,
+    "hidden": 128,
+    "layer_kinds": [
+      "full",
+      "delta_net"
+    ],
+    "moe_inter": 64,
+    "shared_inter": 64
+  },
+  "producer": "<scratch>/80b60ed/p1-weight-handoff/make-family-fixtures.py",
+  "quantization": {
+    "bits": 4,
+    "group_size": 32,
+    "language_model.model.layers.0.mlp.gate": {
+      "bits": 8,
+      "group_size": 64
+    },
+    "language_model.model.layers.0.mlp.shared_expert_gate": {
+      "bits": 8,
+      "group_size": 64
+    },
+    "language_model.model.layers.0.mlp.switch_mlp.gate_proj": {
+      "bits": 4,
+      "group_size": 128
+    },
+    "language_model.model.layers.0.self_attn.q_proj": {
+      "bits": 8,
+      "group_size": 32
+    },
+    "mode": "affine"
+  },
+  "schema": "family-fixtures/2",
+  "writer": "manual struct/json safetensors writer, python 3"
+}

@@ -1,0 +1,14 @@
+{
+  "metadata": {
+    "total_size": 32
+  },
+  "weight_map": {
+    "language_model.backbone.layers.0.mixer.in_proj.weight": "model-00001-of-00088.safetensors",
+    "language_model.backbone.layers.0.mixer.in_proj.input_scale": "model-00001-of-00088.safetensors",
+    "language_model.backbone.layers.0.mixer.in_proj.weight_scale": "model-00001-of-00088.safetensors",
+    "language_model.backbone.layers.1.mixer.experts.0.down_proj.weight": "model-00002-of-00088.safetensors",
+    "language_model.backbone.layers.1.mixer.experts.0.down_proj.input_scale": "model-00002-of-00088.safetensors",
+    "language_model.backbone.layers.1.mixer.experts.0.down_proj.weight_scale": "model-00002-of-00088.safetensors",
+    "language_model.backbone.layers.1.mixer.experts.0.down_proj.weight_scale_2": "model-00002-of-00088.safetensors"
+  }
+}

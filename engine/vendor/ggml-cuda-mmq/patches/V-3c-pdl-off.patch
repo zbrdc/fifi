@@ -1,0 +1,10 @@
+--- a/src/ggml-cuda/common.cuh
++++ b/src/ggml-cuda/common.cuh
+@@ -123,6 +123,7 @@
+     (CUDART_VERSION >= 12030 || (!(defined(_MSC_VER) && !defined(__clang__)) && CUDART_VERSION >= 11080))
+ #    define GGML_CUDA_USE_PDL
+ #endif  // !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA) && (CUDART_VERSION >= 12030 || (!(defined(_MSC_VER) && !defined(__clang__)) && CUDART_VERSION >= 11080))
++#undef GGML_CUDA_USE_PDL // V-3c: PDL off: plain launches on the caller's stream (no environment lookup, no static mutex, no aborting check)
+ 
+ static __device__ __forceinline__ void ggml_cuda_syncwarp() {
+ #ifndef GGML_USE_HIP

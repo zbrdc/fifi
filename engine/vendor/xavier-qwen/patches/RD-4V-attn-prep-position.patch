@@ -1,0 +1,33 @@
+--- a/src/ops.cu
++++ b/src/ops.cu
+@@ -141,7 +141,8 @@ __global__ void __launch_bounds__(kStateDim) gated_delta_k(DeltaArgs a) {
+ __global__ void attn_prep_k(AttnArgs a) {
+   constexpr int D = kHeadDim;
+   __shared__ float x[D];
+-  int head = blockIdx.x, t = blockIdx.y, d = threadIdx.x, pos = a.pos0 + t;
++  int head = blockIdx.x, t = blockIdx.y, d = threadIdx.x;
++  int pos = (a.pos_dev ? *a.pos_dev : a.pos0) + t;
+   const float* p = a.proj + (size_t)t * a.ld;
+   int kv_base = a.n_head * 2 * D;
+   if (head >= a.n_head + a.n_kv_head) {
+--- a/src/ops.h
++++ b/src/ops.h
+@@ -65,7 +65,7 @@ cudaError_t gated_delta(const DeltaArgs& a, cudaStream_t stream = nullptr);
+
+ // Attention preparation for one layer (attn_prep): Q/K RMSNorm, NEOX rope on the first n_rot dims,
+ // KV cache write. It reads proj, ld, n_head, n_kv_head, n_rot, q_norm, k_norm, eps, rope_base,
+-// k_cache, v_cache, q, pos0 and m; the other fields belong to the attention kernels.
++// k_cache, v_cache, q, pos_dev, pos0 and m; the other fields belong to the attention kernels.
+ struct AttnArgs {
+   const float* proj;  // [m][ld]: per q head [q 256 | gate 256], then k, then v
+   int ld, n_head, n_kv_head, n_rot;
+@@ -78,6 +78,9 @@ struct AttnArgs {
+   float* out;   // [m][n_head * 256]
+   float* part;  // scratch [m <= kMaxTokens][n_head][kAttnSplits][kAttnPartLd]
+   int pos0, m;
++  // Null, or a device word holding the position of token 0 (replaces pos0). The kernel reads it
++  // when it runs, so one captured graph serves every position.
++  const int* pos_dev = nullptr;
+ };
+ cudaError_t attn_prep(const AttnArgs& a, cudaStream_t stream = nullptr);
+

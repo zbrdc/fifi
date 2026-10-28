@@ -1,0 +1,15 @@
+{
+  "text": "The capital of France is",
+  "add_special_tokens": false,
+  "ids": [
+    2,
+    818,
+    5279,
+    529,
+    7001,
+    563
+  ],
+  "bos": 2,
+  "eos": 1,
+  "tokenizer_sha256": "12bac982b793c44b03d52a250a9f0d0b666813da566b910c24a6da0695fd11e6"
+}

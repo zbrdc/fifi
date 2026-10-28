@@ -1,0 +1,149 @@
+{
+  "model_repository": "RecursiveSI/flint-nvfp4-gguf",
+  "model_revision": "6ec43e19b565fc8d560e2d04985d7724f20673bf",
+  "model_sha256": "97cc8009ff9b132d5cf3c488e6767962bb5a5dc158a90ed661bbbddf876b8bde",
+  "model_license": "Apache-2.0",
+  "oracle": {
+    "target_commit": "a37cc46104eb50900d5ab4a9ba02a0abdac039db",
+    "executed_package_commit": "acecd56032ddc34bada14a2d978f110d9c987095",
+    "decoder_methods_exactly_equal": true,
+    "kvalues_equal": true,
+    "method_sha256": {
+      "ue4m3_to_fp32": "058e0895bc1f6f9133f3dc5e317ef12279c0b7d6476654c37e9ff772add07ae9",
+      "dequantize_blocks": "f8aea0d625ae70aa4f81fad34d32c53ebe5626894f29e22166a84f8c373e172d"
+    },
+    "source_bytes": 66774
+  },
+  "reference_source_url": "https://github.com/ggml-org/llama.cpp/blob/a37cc46104eb50900d5ab4a9ba02a0abdac039db/gguf-py/gguf/quants.py",
+  "entries": [
+    {
+      "name": "synthetic-all-scales",
+      "experts": 256,
+      "blocks": {
+        "file": "synthetic-all-scales.blocks",
+        "bytes": 9216,
+        "sha256": "cd64ce7386289a13bbfc16b05355fec97fbcb11225f54d47ba9036ff88c1cf57"
+      },
+      "scales": {
+        "file": "synthetic-all-scales.scales",
+        "bytes": 1024,
+        "sha256": "893a106828fbdb9521e1d868c985aab7ad2ae2f606edc55329265a5e7676006c"
+      },
+      "raw_f32": {
+        "file": "synthetic-all-scales.raw.f32",
+        "bytes": 65536,
+        "sha256": "7a220cb36cad3745f7b46f75f6f8824b43d3b8e26d52672a7e82bae1556b0a06"
+      },
+      "scaled_f32": {
+        "file": "synthetic-all-scales.scaled.f32",
+        "bytes": 65536,
+        "sha256": "7a220cb36cad3745f7b46f75f6f8824b43d3b8e26d52672a7e82bae1556b0a06"
+      },
+      "kind": "synthetic",
+      "description": "Every unsigned scale byte with every E2M1 code in each subgroup"
+    },
+    {
+      "name": "real-output",
+      "experts": 1,
+      "blocks": {
+        "file": "real-output.blocks",
+        "bytes": 36,
+        "sha256": "9a9f26e967e0175cea88cc945b0f269b71f96d4a5baa045dfc127d2e3c67989c"
+      },
+      "scales": {
+        "file": "real-output.scales",
+        "bytes": 4,
+        "sha256": "d6d5aed2c7d3802a00ad5b1da3a3558bb584bd1df5e43cbfdc8b5183f2e0054f"
+      },
+      "raw_f32": {
+        "file": "real-output.raw.f32",
+        "bytes": 256,
+        "sha256": "e01518047d7920212605235f8c8bfb1b850a6c9695a2c9f59bc17f2a63da1529"
+      },
+      "scaled_f32": {
+        "file": "real-output.scaled.f32",
+        "bytes": 256,
+        "sha256": "1e4934092c43fd02715f5774845055524dc325063694d11b36250fbd451017ec"
+      },
+      "kind": "real",
+      "tensor": "output.weight",
+      "scale_tensor": "output.scale",
+      "original_shape": [
+        2048,
+        150144
+      ],
+      "file_offset": 5512960,
+      "source_expert_stride": 172965888,
+      "sampling": "First64 values(row0/block0)per expert; original quant bytes and all expert scale entries unchanged"
+    },
+    {
+      "name": "real-attn-q",
+      "experts": 1,
+      "blocks": {
+        "file": "real-attn-q.blocks",
+        "bytes": 36,
+        "sha256": "0fd4d688ac8aeaf82294935526c40395407b0e839f334a07efc78b4d877276a3"
+      },
+      "scales": {
+        "file": "real-attn-q.scales",
+        "bytes": 4,
+        "sha256": "38e0ce30ed65f8ae43da8eea24a78ebd6a0688f55dbc64dcb050a8d0fd00ad31"
+      },
+      "raw_f32": {
+        "file": "real-attn-q.raw.f32",
+        "bytes": 256,
+        "sha256": "704188bbc43811e0d31317e54da8dfff1b010a0ffaf962e4ccb019e224f3337a"
+      },
+      "scaled_f32": {
+        "file": "real-attn-q.scaled.f32",
+        "bytes": 256,
+        "sha256": "a224f4c34345f26cf7ec2b8dbe7b37a01f774e19398c45062c24a7d57648567a"
+      },
+      "kind": "real",
+      "tensor": "blk.0.attn_q.weight",
+      "scale_tensor": "blk.0.attn_q.scale",
+      "original_shape": [
+        2048,
+        4096
+      ],
+      "file_offset": 205021120,
+      "source_expert_stride": 4718592,
+      "sampling": "First64 values(row0/block0)per expert; original quant bytes and all expert scale entries unchanged"
+    },
+    {
+      "name": "real-routed-gate",
+      "experts": 256,
+      "blocks": {
+        "file": "real-routed-gate.blocks",
+        "bytes": 9216,
+        "sha256": "aade46f04a01f41d89ce2232379e7594fe4d8deed497c683559e4a7809b170b9"
+      },
+      "scales": {
+        "file": "real-routed-gate.scales",
+        "bytes": 1024,
+        "sha256": "d725e4ac52faad6bac129356a037f6bfdf6bab07147e9750ce81d933e556908a"
+      },
+      "raw_f32": {
+        "file": "real-routed-gate.raw.f32",
+        "bytes": 65536,
+        "sha256": "46c1a4ae25596eb6d85a10de2fc9f1bacee2c5edf8f786a27435bc442d28dffc"
+      },
+      "scaled_f32": {
+        "file": "real-routed-gate.scaled.f32",
+        "bytes": 65536,
+        "sha256": "b4275874ac89e8781b231a90c72f72077b1f9903b5dff0da058255069cae8a6e"
+      },
+      "kind": "real",
+      "tensor": "blk.2.ffn_gate_exps.weight",
+      "scale_tensor": "blk.2.ffn_gate_exps.scale",
+      "original_shape": [
+        2048,
+        512,
+        256
+      ],
+      "file_offset": 407332288,
+      "source_expert_stride": 589824,
+      "sampling": "First64 values(row0/block0)per expert; original quant bytes and all expert scale entries unchanged"
+    }
+  ]
+}

@@ -1,0 +1,33 @@
+{
+  "compilerOptions": {
+    "target": "ES2022",
+    "module": "NodeNext",
+    "moduleResolution": "NodeNext",
+    "lib": ["ES2022", "DOM"],
+    "strict": true,
+    "noUncheckedIndexedAccess": true,
+    "isolatedModules": true,
+    "skipLibCheck": true,
+    "types": [],
+    "outDir": ".test-dist",
+    "rootDir": "src",
+    "noEmit": false
+  },
+  "include": [
+    "src/deadchats.ts",
+    "src/deadchats.test.ts",
+    "src/history.ts",
+    "src/history.test.ts",
+    "src/notices.ts",
+    "src/notices.test.ts",
+    "src/panel.ts",
+    "src/panel.test.ts",
+    "src/sendgate.ts",
+    "src/sendgate.test.ts",
+    "src/speed.ts",
+    "src/speed.test.ts",
+    "src/store.ts",
+    "src/store.test.ts",
+    "src/test-globals.d.ts"
+  ]
+}

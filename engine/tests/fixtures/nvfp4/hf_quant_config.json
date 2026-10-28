@@ -1,0 +1,20 @@
+{
+  "producer": {
+    "name": "modelopt",
+    "version": "0.37.0"
+  },
+  "quantization": {
+    "quant_algo": "MIXED_PRECISION",
+    "kv_cache_quant_algo": "FP8",
+    "quantized_layers": {
+      "language_model.backbone.layers.0.mixer.in_proj": {
+        "quant_algo": "FP8"
+      },
+      "language_model.backbone.layers.1.mixer.experts.0.down_proj": {
+        "quant_algo": "NVFP4",
+        "group_size": 16
+      }
+    },
+    "exclude_modules": []
+  }
+}

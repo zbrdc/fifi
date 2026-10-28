@@ -1,0 +1,5 @@
+{
+  "__metadata__": {"format": "pt"},
+  "sample.weight": {"dtype": "BF16", "shape": [2, 2], "data_offsets": [0, 8]},
+  "sample.input_scale": {"dtype": "F32", "shape": [1], "data_offsets": [8, 12]}
+}

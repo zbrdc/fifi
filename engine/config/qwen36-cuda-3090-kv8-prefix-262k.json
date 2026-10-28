@@ -1,0 +1,20 @@
+{
+  "listen": "127.0.0.1:18791",
+  "api_key_env": "ENGINESRV_API_KEY",
+  "prefix_reuse": true,
+  "engines": [
+    {
+      "id": "q36",
+      "family": "qwen3_6_35b_a3b",
+      "model": "fifi-q36",
+      "model_dir": "/path/to/Qwen3.6-35B-A3B-GGUF",
+      "tokenizer_dir": "/path/to/Qwen3.6-35B-A3B-GGUF",
+      "qwen36": {
+        "context_limit": 262144,
+        "kv_dtype": "q8",
+        "capture": true,
+        "activation_dtype": "f32"
+      }
+    }
+  ]
+}

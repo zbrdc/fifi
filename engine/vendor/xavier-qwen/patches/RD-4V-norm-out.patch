@@ -1,0 +1,53 @@
+--- a/src/ops.cu
++++ b/src/ops.cu
+@@ -33,7 +33,7 @@ __device__ float sigmoid(float x) { return 1.f / (1.f + __expf(-x)); }
+ __device__ float softplus(float x) { return x > 20.f ? x : log1pf(__expf(x)); }
+
+ __global__ void add_rmsnorm_pack_k(float* h, const float* delta, const float* w, int n,
+-                                   float eps, bool rowmajor, uint4* xf) {
++                                   float eps, bool rowmajor, uint4* xf, float* norm_out) {
+   int tok = blockIdx.x;
+   float* row = h + (size_t)tok * n;
+   float ss = 0.f;
+@@ -46,7 +46,12 @@ __global__ void add_rmsnorm_pack_k(float* h, const float* delta, const float* w,
+     ss += v * v;
+   }
+   float rstd = rsqrtf(block_sum(ss) / n + eps);
+-  write_xf(xf, n, tok, rowmajor, [&](int i) { return row[i] * rstd * w[i]; });
++  // write_xf calls f once per element, so norm_out holds the f32 value that xf rounds to fp16.
++  write_xf(xf, n, tok, rowmajor, [&](int i) {
++    float v = row[i] * rstd * w[i];
++    if (norm_out) norm_out[(size_t)tok * n + i] = v;
++    return v;
++  });
+ }
+
+ __global__ void swiglu_pack_k(const float* gu, int n_ff, bool rowmajor, uint4* xf) {
+@@ -173,8 +178,8 @@ __global__ void attn_prep_k(AttnArgs a) {
+ }  // namespace
+
+ cudaError_t add_rmsnorm_pack(float* h, const float* delta, const float* w, int m, int n,
+-                             float eps, uint4* xf, cudaStream_t stream) {
+-  add_rmsnorm_pack_k<<<m, 256, 0, stream>>>(h, delta, w, n, eps, m > kMaxTokens, xf);
++                             float eps, uint4* xf, float* norm_out, cudaStream_t stream) {
++  add_rmsnorm_pack_k<<<m, 256, 0, stream>>>(h, delta, w, n, eps, m > kMaxTokens, xf, norm_out);
+   return cudaGetLastError();
+ }
+
+--- a/src/ops.h
++++ b/src/ops.h
+@@ -18,9 +18,12 @@ constexpr int kStateDim = 128;  // DeltaNet head size (keys and values)
+ // Every entry runs on `stream` (nullptr: the default stream) and returns the launch status; none
+ // allocates, synchronizes or ends the process. Shapes are not checked: the caller owns them.
+
+-// h += delta (when delta is non-null), then xf = RMSNorm(h) * w. Needs n % 256 == 0.
++// h += delta (when delta is non-null), then xf = RMSNorm(h) * w. Needs n % 256 == 0. When norm_out
++// is non-null it also receives the f32 row RMSNorm(h) * w [m][n] (the router input), equal to the
++// output of rmsnorm() on the updated h.
+ cudaError_t add_rmsnorm_pack(float* h, const float* delta, const float* w, int m, int n,
+-                             float eps, uint4* xf, cudaStream_t stream = nullptr);
++                             float eps, uint4* xf, float* norm_out = nullptr,
++                             cudaStream_t stream = nullptr);
+
+ // out = RMSNorm(x) * w for x [m][n].
+ cudaError_t rmsnorm(const float* x, const float* w, int m, int n, float eps, float* out,

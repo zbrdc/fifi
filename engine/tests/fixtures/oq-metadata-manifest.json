@@ -1,0 +1,16 @@
+{
+  "source": "Jundot/Qwen3.8-Flash-Next-oQ4e-mtp",
+  "revision": "2615fc0e976e65c2f3b55daca3a948f1cdc5b9f8",
+  "source_sha256": "319b334a1abb705acf06035aa0331bcb7c25976ff93a5035b543548738a10824",
+  "fixture_sha256": "97978d6cbde3fa40deb8686aaaf3b5625167b5e3dbeb2851dbaecaccb9c03f41",
+  "selection": [
+    "mode",
+    "bits",
+    "group_size",
+    "language_model.model.layers.1.ple.ple_embedding.ngram_embedding.shards.0",
+    "language_model.model.layers.0.attn_hyper_connection.block_inject_weight",
+    "language_model.model.layers.0.linear_attn.in_proj_a",
+    "language_model.model.layers.0.mlp.shared_expert.down_proj"
+  ],
+  "transformation": "Retain selected settings under both original quantization keys. Serialize with indentation. Values are unchanged."
+}

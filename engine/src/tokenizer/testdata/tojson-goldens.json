@@ -1,0 +1,289 @@
+{
+ "schema": "p1-tokenizer-tojson-goldens-1",
+ "reference": {
+  "python": "3.12.14",
+  "transformers": "5.17.0",
+  "tokenizers": "0.23.2",
+  "jinja2": "3.1.6",
+  "model_dir": "<model_dir>",
+  "chat_template.jinja": {
+   "bytes": 7764,
+   "sha256": "e84f32a23fdda27689f868aa4a1a5621f41133e51a48d7f3efcbea2839574259"
+  }
+ },
+ "renders": [
+  {
+   "id": "openai-tools-default",
+   "thinking": "default",
+   "messages_json": "[{\"role\": \"system\", \"content\": \"You are terse.\"}, {\"role\": \"user\", \"content\": \"Weather in Z\u00fcrich?\"}]",
+   "tools_json": "[{\"type\": \"function\", \"function\": {\"name\": \"get_weather\", \"description\": \"Weather for <city> & \\\"region\\\"; it's caf\u00e9 \u2615 \u2014 \u65e5\u672c\ud83d\ude00 \u007f tab\\there\", \"parameters\": {\"type\": \"object\", \"required\": [\"city\"], \"properties\": {\"unit\": {\"type\": \"string\", \"default\": \"celsius\", \"enum\": [\"celsius\", \"fahrenheit\"]}, \"city\": {\"type\": \"string\", \"description\": \"City, e.g. Z\u00fcrich or S\u00e3o Paulo\"}}}}}, {\"type\": \"function\", \"function\": {\"parameters\": {\"type\": \"object\", \"properties\": {}}, \"name\": \"noop\", \"description\": \"\"}}]",
+   "reference": "<|im_start|>system\n# Tools\n\nYou have access to the following functions:\n\n<tools>\n{\"type\": \"function\", \"function\": {\"name\": \"get_weather\", \"description\": \"Weather for <city> & \\\"region\\\"; it's caf\u00e9 \u2615 \u2014 \u65e5\u672c\ud83d\ude00 \u007f tab\\there\", \"parameters\": {\"type\": \"object\", \"required\": [\"city\"], \"properties\": {\"unit\": {\"type\": \"string\", \"default\": \"celsius\", \"enum\": [\"celsius\", \"fahrenheit\"]}, \"city\": {\"type\": \"string\", \"description\": \"City, e.g. Z\u00fcrich or S\u00e3o Paulo\"}}}}}\n{\"type\": \"function\", \"function\": {\"parameters\": {\"type\": \"object\", \"properties\": {}}, \"name\": \"noop\", \"description\": \"\"}}\n</tools>\n\nIf you choose to call a function ONLY reply in the following format with NO suffix:\n\n<tool_call>\n<function=example_function_name>\n<parameter=example_parameter_1>\nvalue_1\n</parameter>\n<parameter=example_parameter_2>\nThis is the value for the second parameter\nthat can span\nmultiple lines\n</parameter>\n</function>\n</tool_call>\n\n<IMPORTANT>\nReminder:\n- Function calls MUST follow the specified format: an inner <function=...></function> block must be nested within <tool_call></tool_call> XML tags\n- Required parameters MUST be specified\n- You may provide optional reasoning for your function call in natural language BEFORE the function call, but NOT after\n- If there is no function call available, answer the question like normal with your current knowledge and do not tell the user about function calls\n</IMPORTANT>\n\nYou are terse.<|im_end|>\n<|im_start|>user\nWeather in Z\u00fcrich?<|im_end|>\n<|im_start|>assistant\n<think>\n"
+  },
+  {
+   "id": "openai-tools-history-default",
+   "thinking": "default",
+   "messages_json": "[{\"role\": \"system\", \"content\": \"You are terse.\"}, {\"role\": \"user\", \"content\": \"Weather in Z\u00fcrich?\"}, {\"role\": \"assistant\", \"content\": \"Checking.\", \"tool_calls\": [{\"id\": \"call_1\", \"name\": \"get_weather\", \"arguments\": {\"city\": \"Z\u00fcrich\", \"opts\": {\"zeta\": 1, \"alpha\": [1, 2, {\"b\": true, \"a\": null}]}, \"note\": \"it's <b>&</b> \u007f \u65e5\u672c\", \"count\": 3, \"ratio\": 0.5, \"flag\": false}}, {\"id\": \"call_2\", \"name\": \"noop\", \"arguments\": {\"z\": 1, \"a\": 2}}]}, {\"role\": \"tool\", \"content\": \"18 C\", \"tool_call_id\": \"call_1\"}, {\"role\": \"tool\", \"content\": \"ok\", \"tool_call_id\": \"call_2\"}]",
+   "tools_json": "[{\"type\": \"function\", \"function\": {\"name\": \"get_weather\", \"description\": \"Weather for <city> & \\\"region\\\"; it's caf\u00e9 \u2615 \u2014 \u65e5\u672c\ud83d\ude00 \u007f tab\\there\", \"parameters\": {\"type\": \"object\", \"required\": [\"city\"], \"properties\": {\"unit\": {\"type\": \"string\", \"default\": \"celsius\", \"enum\": [\"celsius\", \"fahrenheit\"]}, \"city\": {\"type\": \"string\", \"description\": \"City, e.g. Z\u00fcrich or S\u00e3o Paulo\"}}}}}, {\"type\": \"function\", \"function\": {\"parameters\": {\"type\": \"object\", \"properties\": {}}, \"name\": \"noop\", \"description\": \"\"}}]",
+   "reference": "<|im_start|>system\n# Tools\n\nYou have access to the following functions:\n\n<tools>\n{\"type\": \"function\", \"function\": {\"name\": \"get_weather\", \"description\": \"Weather for <city> & \\\"region\\\"; it's caf\u00e9 \u2615 \u2014 \u65e5\u672c\ud83d\ude00 \u007f tab\\there\", \"parameters\": {\"type\": \"object\", \"required\": [\"city\"], \"properties\": {\"unit\": {\"type\": \"string\", \"default\": \"celsius\", \"enum\": [\"celsius\", \"fahrenheit\"]}, \"city\": {\"type\": \"string\", \"description\": \"City, e.g. Z\u00fcrich or S\u00e3o Paulo\"}}}}}\n{\"type\": \"function\", \"function\": {\"parameters\": {\"type\": \"object\", \"properties\": {}}, \"name\": \"noop\", \"description\": \"\"}}\n</tools>\n\nIf you choose to call a function ONLY reply in the following format with NO suffix:\n\n<tool_call>\n<function=example_function_name>\n<parameter=example_parameter_1>\nvalue_1\n</parameter>\n<parameter=example_parameter_2>\nThis is the value for the second parameter\nthat can span\nmultiple lines\n</parameter>\n</function>\n</tool_call>\n\n<IMPORTANT>\nReminder:\n- Function calls MUST follow the specified format: an inner <function=...></function> block must be nested within <tool_call></tool_call> XML tags\n- Required parameters MUST be specified\n- You may provide optional reasoning for your function call in natural language BEFORE the function call, but NOT after\n- If there is no function call available, answer the question like normal with your current knowledge and do not tell the user about function calls\n</IMPORTANT>\n\nYou are terse.<|im_end|>\n<|im_start|>user\nWeather in Z\u00fcrich?<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\nChecking.\n\n<tool_call>\n<function=get_weather>\n<parameter=city>\nZ\u00fcrich\n</parameter>\n<parameter=opts>\n{\"zeta\": 1, \"alpha\": [1, 2, {\"b\": true, \"a\": null}]}\n</parameter>\n<parameter=note>\nit's <b>&</b> \u007f \u65e5\u672c\n</parameter>\n<parameter=count>\n3\n</parameter>\n<parameter=ratio>\n0.5\n</parameter>\n<parameter=flag>\nfalse\n</parameter>\n</function>\n</tool_call>\n<tool_call>\n<function=noop>\n<parameter=z>\n1\n</parameter>\n<parameter=a>\n2\n</parameter>\n</function>\n</tool_call><|im_end|>\n<|im_start|>user\n<tool_response>\n18 C\n</tool_response>\n<tool_response>\nok\n</tool_response><|im_end|>\n<|im_start|>assistant\n<think>\n"
+  },
+  {
+   "id": "openai-tools-history-off",
+   "thinking": "off",
+   "messages_json": "[{\"role\": \"system\", \"content\": \"You are terse.\"}, {\"role\": \"user\", \"content\": \"Weather in Z\u00fcrich?\"}, {\"role\": \"assistant\", \"content\": \"Checking.\", \"tool_calls\": [{\"id\": \"call_1\", \"name\": \"get_weather\", \"arguments\": {\"city\": \"Z\u00fcrich\", \"opts\": {\"zeta\": 1, \"alpha\": [1, 2, {\"b\": true, \"a\": null}]}, \"note\": \"it's <b>&</b> \u007f \u65e5\u672c\", \"count\": 3, \"ratio\": 0.5, \"flag\": false}}, {\"id\": \"call_2\", \"name\": \"noop\", \"arguments\": {\"z\": 1, \"a\": 2}}]}, {\"role\": \"tool\", \"content\": \"18 C\", \"tool_call_id\": \"call_1\"}, {\"role\": \"tool\", \"content\": \"ok\", \"tool_call_id\": \"call_2\"}]",
+   "tools_json": "[{\"type\": \"function\", \"function\": {\"name\": \"get_weather\", \"description\": \"Weather for <city> & \\\"region\\\"; it's caf\u00e9 \u2615 \u2014 \u65e5\u672c\ud83d\ude00 \u007f tab\\there\", \"parameters\": {\"type\": \"object\", \"required\": [\"city\"], \"properties\": {\"unit\": {\"type\": \"string\", \"default\": \"celsius\", \"enum\": [\"celsius\", \"fahrenheit\"]}, \"city\": {\"type\": \"string\", \"description\": \"City, e.g. Z\u00fcrich or S\u00e3o Paulo\"}}}}}, {\"type\": \"function\", \"function\": {\"parameters\": {\"type\": \"object\", \"properties\": {}}, \"name\": \"noop\", \"description\": \"\"}}]",
+   "reference": "<|im_start|>system\n# Tools\n\nYou have access to the following functions:\n\n<tools>\n{\"type\": \"function\", \"function\": {\"name\": \"get_weather\", \"description\": \"Weather for <city> & \\\"region\\\"; it's caf\u00e9 \u2615 \u2014 \u65e5\u672c\ud83d\ude00 \u007f tab\\there\", \"parameters\": {\"type\": \"object\", \"required\": [\"city\"], \"properties\": {\"unit\": {\"type\": \"string\", \"default\": \"celsius\", \"enum\": [\"celsius\", \"fahrenheit\"]}, \"city\": {\"type\": \"string\", \"description\": \"City, e.g. Z\u00fcrich or S\u00e3o Paulo\"}}}}}\n{\"type\": \"function\", \"function\": {\"parameters\": {\"type\": \"object\", \"properties\": {}}, \"name\": \"noop\", \"description\": \"\"}}\n</tools>\n\nIf you choose to call a function ONLY reply in the following format with NO suffix:\n\n<tool_call>\n<function=example_function_name>\n<parameter=example_parameter_1>\nvalue_1\n</parameter>\n<parameter=example_parameter_2>\nThis is the value for the second parameter\nthat can span\nmultiple lines\n</parameter>\n</function>\n</tool_call>\n\n<IMPORTANT>\nReminder:\n- Function calls MUST follow the specified format: an inner <function=...></function> block must be nested within <tool_call></tool_call> XML tags\n- Required parameters MUST be specified\n- You may provide optional reasoning for your function call in natural language BEFORE the function call, but NOT after\n- If there is no function call available, answer the question like normal with your current knowledge and do not tell the user about function calls\n</IMPORTANT>\n\nYou are terse.<|im_end|>\n<|im_start|>user\nWeather in Z\u00fcrich?<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\nChecking.\n\n<tool_call>\n<function=get_weather>\n<parameter=city>\nZ\u00fcrich\n</parameter>\n<parameter=opts>\n{\"zeta\": 1, \"alpha\": [1, 2, {\"b\": true, \"a\": null}]}\n</parameter>\n<parameter=note>\nit's <b>&</b> \u007f \u65e5\u672c\n</parameter>\n<parameter=count>\n3\n</parameter>\n<parameter=ratio>\n0.5\n</parameter>\n<parameter=flag>\nfalse\n</parameter>\n</function>\n</tool_call>\n<tool_call>\n<function=noop>\n<parameter=z>\n1\n</parameter>\n<parameter=a>\n2\n</parameter>\n</function>\n</tool_call><|im_end|>\n<|im_start|>user\n<tool_response>\n18 C\n</tool_response>\n<tool_response>\nok\n</tool_response><|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n"
+  },
+  {
+   "id": "history-without-tools",
+   "thinking": "default",
+   "messages_json": "[{\"role\": \"system\", \"content\": \"You are terse.\"}, {\"role\": \"user\", \"content\": \"Weather in Z\u00fcrich?\"}, {\"role\": \"assistant\", \"content\": \"Checking.\", \"tool_calls\": [{\"id\": \"call_1\", \"name\": \"get_weather\", \"arguments\": {\"city\": \"Z\u00fcrich\", \"opts\": {\"zeta\": 1, \"alpha\": [1, 2, {\"b\": true, \"a\": null}]}, \"note\": \"it's <b>&</b> \u007f \u65e5\u672c\", \"count\": 3, \"ratio\": 0.5, \"flag\": false}}, {\"id\": \"call_2\", \"name\": \"noop\", \"arguments\": {\"z\": 1, \"a\": 2}}]}, {\"role\": \"tool\", \"content\": \"18 C\", \"tool_call_id\": \"call_1\"}, {\"role\": \"tool\", \"content\": \"ok\", \"tool_call_id\": \"call_2\"}]",
+   "tools_json": "[]",
+   "reference": "<|im_start|>system\nYou are terse.<|im_end|>\n<|im_start|>user\nWeather in Z\u00fcrich?<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\nChecking.\n\n<tool_call>\n<function=get_weather>\n<parameter=city>\nZ\u00fcrich\n</parameter>\n<parameter=opts>\n{\"zeta\": 1, \"alpha\": [1, 2, {\"b\": true, \"a\": null}]}\n</parameter>\n<parameter=note>\nit's <b>&</b> \u007f \u65e5\u672c\n</parameter>\n<parameter=count>\n3\n</parameter>\n<parameter=ratio>\n0.5\n</parameter>\n<parameter=flag>\nfalse\n</parameter>\n</function>\n</tool_call>\n<tool_call>\n<function=noop>\n<parameter=z>\n1\n</parameter>\n<parameter=a>\n2\n</parameter>\n</function>\n</tool_call><|im_end|>\n<|im_start|>user\n<tool_response>\n18 C\n</tool_response>\n<tool_response>\nok\n</tool_response><|im_end|>\n<|im_start|>assistant\n<think>\n"
+  }
+ ],
+ "filters": [
+  {
+   "id": "default",
+   "template": "{{ tools[0] | tojson }}",
+   "x_json": "{\"zeta\": 1, \"alpha\": {\"y\": [1, 2.5, null, true, false], \"x\": \"caf\u00e9 \u65e5\u672c \ud83d\ude00\"}, \"text\": \"<&>' \\\"q\\\" \\\\ / \u007f \u2028 \u0085\", \"empty_list\": [], \"empty_map\": {}, \"big\": 12345678901234567890, \"neg\": -7}",
+   "reference": "{\"zeta\": 1, \"alpha\": {\"y\": [1, 2.5, null, true, false], \"x\": \"caf\u00e9 \u65e5\u672c \ud83d\ude00\"}, \"text\": \"<&>' \\\"q\\\" \\\\ / \u007f \u2028 \u0085\", \"empty_list\": [], \"empty_map\": {}, \"big\": 12345678901234567890, \"neg\": -7}"
+  },
+  {
+   "id": "controls",
+   "template": "{{ tools[0] | tojson }}",
+   "x_json": "{\"c\": \"\\u0000\\u0001\\u0002\\u0003\\u0004\\u0005\\u0006\\u0007\\b\\t\\n\\u000b\\f\\r\\u000e\\u000f\\u0010\\u0011\\u0012\\u0013\\u0014\\u0015\\u0016\\u0017\\u0018\\u0019\\u001a\\u001b\\u001c\\u001d\\u001e\\u001fend\"}",
+   "reference": "{\"c\": \"\\u0000\\u0001\\u0002\\u0003\\u0004\\u0005\\u0006\\u0007\\b\\t\\n\\u000b\\f\\r\\u000e\\u000f\\u0010\\u0011\\u0012\\u0013\\u0014\\u0015\\u0016\\u0017\\u0018\\u0019\\u001a\\u001b\\u001c\\u001d\\u001e\\u001fend\"}"
+  },
+  {
+   "id": "controls-ensure-ascii",
+   "template": "{{ tools[0] | tojson(ensure_ascii=True) }}",
+   "x_json": "{\"c\": \"\\u0000\\u0001\\u0002\\u0003\\u0004\\u0005\\u0006\\u0007\\b\\t\\n\\u000b\\f\\r\\u000e\\u000f\\u0010\\u0011\\u0012\\u0013\\u0014\\u0015\\u0016\\u0017\\u0018\\u0019\\u001a\\u001b\\u001c\\u001d\\u001e\\u001fend\"}",
+   "reference": "{\"c\": \"\\u0000\\u0001\\u0002\\u0003\\u0004\\u0005\\u0006\\u0007\\b\\t\\n\\u000b\\f\\r\\u000e\\u000f\\u0010\\u0011\\u0012\\u0013\\u0014\\u0015\\u0016\\u0017\\u0018\\u0019\\u001a\\u001b\\u001c\\u001d\\u001e\\u001fend\"}"
+  },
+  {
+   "id": "ensure-ascii-kw",
+   "template": "{{ tools[0] | tojson(ensure_ascii=True) }}",
+   "x_json": "{\"zeta\": 1, \"alpha\": {\"y\": [1, 2.5, null, true, false], \"x\": \"caf\u00e9 \u65e5\u672c \ud83d\ude00\"}, \"text\": \"<&>' \\\"q\\\" \\\\ / \u007f \u2028 \u0085\", \"empty_list\": [], \"empty_map\": {}, \"big\": 12345678901234567890, \"neg\": -7}",
+   "reference": "{\"zeta\": 1, \"alpha\": {\"y\": [1, 2.5, null, true, false], \"x\": \"caf\\u00e9 \\u65e5\\u672c \\ud83d\\ude00\"}, \"text\": \"<&>' \\\"q\\\" \\\\ / \\u007f \\u2028 \\u0085\", \"empty_list\": [], \"empty_map\": {}, \"big\": 12345678901234567890, \"neg\": -7}"
+  },
+  {
+   "id": "ensure-ascii-positional",
+   "template": "{{ tools[0] | tojson(true) }}",
+   "x_json": "{\"zeta\": 1, \"alpha\": {\"y\": [1, 2.5, null, true, false], \"x\": \"caf\u00e9 \u65e5\u672c \ud83d\ude00\"}, \"text\": \"<&>' \\\"q\\\" \\\\ / \u007f \u2028 \u0085\", \"empty_list\": [], \"empty_map\": {}, \"big\": 12345678901234567890, \"neg\": -7}",
+   "reference": "{\"zeta\": 1, \"alpha\": {\"y\": [1, 2.5, null, true, false], \"x\": \"caf\\u00e9 \\u65e5\\u672c \\ud83d\\ude00\"}, \"text\": \"<&>' \\\"q\\\" \\\\ / \\u007f \\u2028 \\u0085\", \"empty_list\": [], \"empty_map\": {}, \"big\": 12345678901234567890, \"neg\": -7}"
+  },
+  {
+   "id": "ensure-ascii-false-kw",
+   "template": "{{ tools[0] | tojson(ensure_ascii=False) }}",
+   "x_json": "{\"zeta\": 1, \"alpha\": {\"y\": [1, 2.5, null, true, false], \"x\": \"caf\u00e9 \u65e5\u672c \ud83d\ude00\"}, \"text\": \"<&>' \\\"q\\\" \\\\ / \u007f \u2028 \u0085\", \"empty_list\": [], \"empty_map\": {}, \"big\": 12345678901234567890, \"neg\": -7}",
+   "reference": "{\"zeta\": 1, \"alpha\": {\"y\": [1, 2.5, null, true, false], \"x\": \"caf\u00e9 \u65e5\u672c \ud83d\ude00\"}, \"text\": \"<&>' \\\"q\\\" \\\\ / \u007f \u2028 \u0085\", \"empty_list\": [], \"empty_map\": {}, \"big\": 12345678901234567890, \"neg\": -7}"
+  },
+  {
+   "id": "sort-keys",
+   "template": "{{ tools[0] | tojson(sort_keys=True) }}",
+   "x_json": "{\"zeta\": 1, \"alpha\": {\"y\": [1, 2.5, null, true, false], \"x\": \"caf\u00e9 \u65e5\u672c \ud83d\ude00\"}, \"text\": \"<&>' \\\"q\\\" \\\\ / \u007f \u2028 \u0085\", \"empty_list\": [], \"empty_map\": {}, \"big\": 12345678901234567890, \"neg\": -7}",
+   "reference": "{\"alpha\": {\"x\": \"caf\u00e9 \u65e5\u672c \ud83d\ude00\", \"y\": [1, 2.5, null, true, false]}, \"big\": 12345678901234567890, \"empty_list\": [], \"empty_map\": {}, \"neg\": -7, \"text\": \"<&>' \\\"q\\\" \\\\ / \u007f \u2028 \u0085\", \"zeta\": 1}"
+  },
+  {
+   "id": "sort-keys-unicode",
+   "template": "{{ tools[0] | tojson(sort_keys=True) }}",
+   "x_json": "{\"\u00e9t\u00e9\": 1, \"Z\": 2, \"a\": 3, \"\u65e5\": 4}",
+   "reference": "{\"Z\": 2, \"a\": 3, \"\u00e9t\u00e9\": 1, \"\u65e5\": 4}"
+  },
+  {
+   "id": "unsorted-unicode-keys",
+   "template": "{{ tools[0] | tojson }}",
+   "x_json": "{\"\u00e9t\u00e9\": 1, \"Z\": 2, \"a\": 3, \"\u65e5\": 4}",
+   "reference": "{\"\u00e9t\u00e9\": 1, \"Z\": 2, \"a\": 3, \"\u65e5\": 4}"
+  },
+  {
+   "id": "indent-2",
+   "template": "{{ tools[0] | tojson(indent=2) }}",
+   "x_json": "{\"zeta\": 1, \"alpha\": {\"y\": [1, 2.5, null, true, false], \"x\": \"caf\u00e9 \u65e5\u672c \ud83d\ude00\"}, \"text\": \"<&>' \\\"q\\\" \\\\ / \u007f \u2028 \u0085\", \"empty_list\": [], \"empty_map\": {}, \"big\": 12345678901234567890, \"neg\": -7}",
+   "reference": "{\n  \"zeta\": 1,\n  \"alpha\": {\n    \"y\": [\n      1,\n      2.5,\n      null,\n      true,\n      false\n    ],\n    \"x\": \"caf\u00e9 \u65e5\u672c \ud83d\ude00\"\n  },\n  \"text\": \"<&>' \\\"q\\\" \\\\ / \u007f \u2028 \u0085\",\n  \"empty_list\": [],\n  \"empty_map\": {},\n  \"big\": 12345678901234567890,\n  \"neg\": -7\n}"
+  },
+  {
+   "id": "indent-0",
+   "template": "{{ tools[0] | tojson(indent=0) }}",
+   "x_json": "{\"zeta\": 1, \"alpha\": {\"y\": [1, 2.5, null, true, false], \"x\": \"caf\u00e9 \u65e5\u672c \ud83d\ude00\"}, \"text\": \"<&>' \\\"q\\\" \\\\ / \u007f \u2028 \u0085\", \"empty_list\": [], \"empty_map\": {}, \"big\": 12345678901234567890, \"neg\": -7}",
+   "reference": "{\n\"zeta\": 1,\n\"alpha\": {\n\"y\": [\n1,\n2.5,\nnull,\ntrue,\nfalse\n],\n\"x\": \"caf\u00e9 \u65e5\u672c \ud83d\ude00\"\n},\n\"text\": \"<&>' \\\"q\\\" \\\\ / \u007f \u2028 \u0085\",\n\"empty_list\": [],\n\"empty_map\": {},\n\"big\": 12345678901234567890,\n\"neg\": -7\n}"
+  },
+  {
+   "id": "indent-tab",
+   "template": "{{ tools[0] | tojson(indent='\\t') }}",
+   "x_json": "{\"zeta\": 1, \"alpha\": {\"y\": [1, 2.5, null, true, false], \"x\": \"caf\u00e9 \u65e5\u672c \ud83d\ude00\"}, \"text\": \"<&>' \\\"q\\\" \\\\ / \u007f \u2028 \u0085\", \"empty_list\": [], \"empty_map\": {}, \"big\": 12345678901234567890, \"neg\": -7}",
+   "reference": "{\n\t\"zeta\": 1,\n\t\"alpha\": {\n\t\t\"y\": [\n\t\t\t1,\n\t\t\t2.5,\n\t\t\tnull,\n\t\t\ttrue,\n\t\t\tfalse\n\t\t],\n\t\t\"x\": \"caf\u00e9 \u65e5\u672c \ud83d\ude00\"\n\t},\n\t\"text\": \"<&>' \\\"q\\\" \\\\ / \u007f \u2028 \u0085\",\n\t\"empty_list\": [],\n\t\"empty_map\": {},\n\t\"big\": 12345678901234567890,\n\t\"neg\": -7\n}"
+  },
+  {
+   "id": "indent-string",
+   "template": "{{ tools[0] | tojson(indent='--') }}",
+   "x_json": "{\"zeta\": 1, \"alpha\": {\"y\": [1, 2.5, null, true, false], \"x\": \"caf\u00e9 \u65e5\u672c \ud83d\ude00\"}, \"text\": \"<&>' \\\"q\\\" \\\\ / \u007f \u2028 \u0085\", \"empty_list\": [], \"empty_map\": {}, \"big\": 12345678901234567890, \"neg\": -7}",
+   "reference": "{\n--\"zeta\": 1,\n--\"alpha\": {\n----\"y\": [\n------1,\n------2.5,\n------null,\n------true,\n------false\n----],\n----\"x\": \"caf\u00e9 \u65e5\u672c \ud83d\ude00\"\n--},\n--\"text\": \"<&>' \\\"q\\\" \\\\ / \u007f \u2028 \u0085\",\n--\"empty_list\": [],\n--\"empty_map\": {},\n--\"big\": 12345678901234567890,\n--\"neg\": -7\n}"
+  },
+  {
+   "id": "indent-negative",
+   "template": "{{ tools[0] | tojson(indent=-2) }}",
+   "x_json": "{\"zeta\": 1, \"alpha\": {\"y\": [1, 2.5, null, true, false], \"x\": \"caf\u00e9 \u65e5\u672c \ud83d\ude00\"}, \"text\": \"<&>' \\\"q\\\" \\\\ / \u007f \u2028 \u0085\", \"empty_list\": [], \"empty_map\": {}, \"big\": 12345678901234567890, \"neg\": -7}",
+   "reference": "{\n\"zeta\": 1,\n\"alpha\": {\n\"y\": [\n1,\n2.5,\nnull,\ntrue,\nfalse\n],\n\"x\": \"caf\u00e9 \u65e5\u672c \ud83d\ude00\"\n},\n\"text\": \"<&>' \\\"q\\\" \\\\ / \u007f \u2028 \u0085\",\n\"empty_list\": [],\n\"empty_map\": {},\n\"big\": 12345678901234567890,\n\"neg\": -7\n}"
+  },
+  {
+   "id": "indent-positional",
+   "template": "{{ tools[0] | tojson(false, 1) }}",
+   "x_json": "{\"zeta\": 1, \"alpha\": {\"y\": [1, 2.5, null, true, false], \"x\": \"caf\u00e9 \u65e5\u672c \ud83d\ude00\"}, \"text\": \"<&>' \\\"q\\\" \\\\ / \u007f \u2028 \u0085\", \"empty_list\": [], \"empty_map\": {}, \"big\": 12345678901234567890, \"neg\": -7}",
+   "reference": "{\n \"zeta\": 1,\n \"alpha\": {\n  \"y\": [\n   1,\n   2.5,\n   null,\n   true,\n   false\n  ],\n  \"x\": \"caf\u00e9 \u65e5\u672c \ud83d\ude00\"\n },\n \"text\": \"<&>' \\\"q\\\" \\\\ / \u007f \u2028 \u0085\",\n \"empty_list\": [],\n \"empty_map\": {},\n \"big\": 12345678901234567890,\n \"neg\": -7\n}"
+  },
+  {
+   "id": "indent-none",
+   "template": "{{ tools[0] | tojson(indent=None) }}",
+   "x_json": "{\"zeta\": 1, \"alpha\": {\"y\": [1, 2.5, null, true, false], \"x\": \"caf\u00e9 \u65e5\u672c \ud83d\ude00\"}, \"text\": \"<&>' \\\"q\\\" \\\\ / \u007f \u2028 \u0085\", \"empty_list\": [], \"empty_map\": {}, \"big\": 12345678901234567890, \"neg\": -7}",
+   "reference": "{\"zeta\": 1, \"alpha\": {\"y\": [1, 2.5, null, true, false], \"x\": \"caf\u00e9 \u65e5\u672c \ud83d\ude00\"}, \"text\": \"<&>' \\\"q\\\" \\\\ / \u007f \u2028 \u0085\", \"empty_list\": [], \"empty_map\": {}, \"big\": 12345678901234567890, \"neg\": -7}"
+  },
+  {
+   "id": "separators-compact",
+   "template": "{{ tools[0] | tojson(separators=(',', ':')) }}",
+   "x_json": "{\"zeta\": 1, \"alpha\": {\"y\": [1, 2.5, null, true, false], \"x\": \"caf\u00e9 \u65e5\u672c \ud83d\ude00\"}, \"text\": \"<&>' \\\"q\\\" \\\\ / \u007f \u2028 \u0085\", \"empty_list\": [], \"empty_map\": {}, \"big\": 12345678901234567890, \"neg\": -7}",
+   "reference": "{\"zeta\":1,\"alpha\":{\"y\":[1,2.5,null,true,false],\"x\":\"caf\u00e9 \u65e5\u672c \ud83d\ude00\"},\"text\":\"<&>' \\\"q\\\" \\\\ / \u007f \u2028 \u0085\",\"empty_list\":[],\"empty_map\":{},\"big\":12345678901234567890,\"neg\":-7}"
+  },
+  {
+   "id": "separators-custom",
+   "template": "{{ tools[0] | tojson(separators=(' ;', ' = ')) }}",
+   "x_json": "{\"zeta\": 1, \"alpha\": {\"y\": [1, 2.5, null, true, false], \"x\": \"caf\u00e9 \u65e5\u672c \ud83d\ude00\"}, \"text\": \"<&>' \\\"q\\\" \\\\ / \u007f \u2028 \u0085\", \"empty_list\": [], \"empty_map\": {}, \"big\": 12345678901234567890, \"neg\": -7}",
+   "reference": "{\"zeta\" = 1 ;\"alpha\" = {\"y\" = [1 ;2.5 ;null ;true ;false] ;\"x\" = \"caf\u00e9 \u65e5\u672c \ud83d\ude00\"} ;\"text\" = \"<&>' \\\"q\\\" \\\\ / \u007f \u2028 \u0085\" ;\"empty_list\" = [] ;\"empty_map\" = {} ;\"big\" = 12345678901234567890 ;\"neg\" = -7}"
+  },
+  {
+   "id": "separators-with-indent",
+   "template": "{{ tools[0] | tojson(indent=2, separators=(',', ':')) }}",
+   "x_json": "{\"zeta\": 1, \"alpha\": {\"y\": [1, 2.5, null, true, false], \"x\": \"caf\u00e9 \u65e5\u672c \ud83d\ude00\"}, \"text\": \"<&>' \\\"q\\\" \\\\ / \u007f \u2028 \u0085\", \"empty_list\": [], \"empty_map\": {}, \"big\": 12345678901234567890, \"neg\": -7}",
+   "reference": "{\n  \"zeta\":1,\n  \"alpha\":{\n    \"y\":[\n      1,\n      2.5,\n      null,\n      true,\n      false\n    ],\n    \"x\":\"caf\u00e9 \u65e5\u672c \ud83d\ude00\"\n  },\n  \"text\":\"<&>' \\\"q\\\" \\\\ / \u007f \u2028 \u0085\",\n  \"empty_list\":[],\n  \"empty_map\":{},\n  \"big\":12345678901234567890,\n  \"neg\":-7\n}"
+  },
+  {
+   "id": "separators-none",
+   "template": "{{ tools[0] | tojson(separators=None) }}",
+   "x_json": "{\"zeta\": 1, \"alpha\": {\"y\": [1, 2.5, null, true, false], \"x\": \"caf\u00e9 \u65e5\u672c \ud83d\ude00\"}, \"text\": \"<&>' \\\"q\\\" \\\\ / \u007f \u2028 \u0085\", \"empty_list\": [], \"empty_map\": {}, \"big\": 12345678901234567890, \"neg\": -7}",
+   "reference": "{\"zeta\": 1, \"alpha\": {\"y\": [1, 2.5, null, true, false], \"x\": \"caf\u00e9 \u65e5\u672c \ud83d\ude00\"}, \"text\": \"<&>' \\\"q\\\" \\\\ / \u007f \u2028 \u0085\", \"empty_list\": [], \"empty_map\": {}, \"big\": 12345678901234567890, \"neg\": -7}"
+  },
+  {
+   "id": "combo",
+   "template": "{{ tools[0] | tojson(ensure_ascii=True, indent=1, sort_keys=True) }}",
+   "x_json": "{\"zeta\": 1, \"alpha\": {\"y\": [1, 2.5, null, true, false], \"x\": \"caf\u00e9 \u65e5\u672c \ud83d\ude00\"}, \"text\": \"<&>' \\\"q\\\" \\\\ / \u007f \u2028 \u0085\", \"empty_list\": [], \"empty_map\": {}, \"big\": 12345678901234567890, \"neg\": -7}",
+   "reference": "{\n \"alpha\": {\n  \"x\": \"caf\\u00e9 \\u65e5\\u672c \\ud83d\\ude00\",\n  \"y\": [\n   1,\n   2.5,\n   null,\n   true,\n   false\n  ]\n },\n \"big\": 12345678901234567890,\n \"empty_list\": [],\n \"empty_map\": {},\n \"neg\": -7,\n \"text\": \"<&>' \\\"q\\\" \\\\ / \\u007f \\u2028 \\u0085\",\n \"zeta\": 1\n}"
+  },
+  {
+   "id": "all-positional",
+   "template": "{{ tools[0] | tojson(true, 2, (',', ': '), true) }}",
+   "x_json": "{\"zeta\": 1, \"alpha\": {\"y\": [1, 2.5, null, true, false], \"x\": \"caf\u00e9 \u65e5\u672c \ud83d\ude00\"}, \"text\": \"<&>' \\\"q\\\" \\\\ / \u007f \u2028 \u0085\", \"empty_list\": [], \"empty_map\": {}, \"big\": 12345678901234567890, \"neg\": -7}",
+   "reference": "{\n  \"alpha\": {\n    \"x\": \"caf\\u00e9 \\u65e5\\u672c \\ud83d\\ude00\",\n    \"y\": [\n      1,\n      2.5,\n      null,\n      true,\n      false\n    ]\n  },\n  \"big\": 12345678901234567890,\n  \"empty_list\": [],\n  \"empty_map\": {},\n  \"neg\": -7,\n  \"text\": \"<&>' \\\"q\\\" \\\\ / \\u007f \\u2028 \\u0085\",\n  \"zeta\": 1\n}"
+  },
+  {
+   "id": "nested-empty-indent",
+   "template": "{{ tools[0] | tojson(indent=2) }}",
+   "x_json": "{\"a\": [], \"b\": {}, \"c\": [[], {}]}",
+   "reference": "{\n  \"a\": [],\n  \"b\": {},\n  \"c\": [\n    [],\n    {}\n  ]\n}"
+  },
+  {
+   "id": "in-filter-chain",
+   "template": "{{ tools[0].alpha | tojson | length }}",
+   "x_json": "{\"zeta\": 1, \"alpha\": {\"y\": [1, 2.5, null, true, false], \"x\": \"caf\u00e9 \u65e5\u672c \ud83d\ude00\"}, \"text\": \"<&>' \\\"q\\\" \\\\ / \u007f \u2028 \u0085\", \"empty_list\": [], \"empty_map\": {}, \"big\": 12345678901234567890, \"neg\": -7}",
+   "reference": "52"
+  },
+  {
+   "id": "error-bad-separators",
+   "template": "{{ tools[0] | tojson(separators=1) }}",
+   "x_json": "{\"zeta\": 1, \"alpha\": {\"y\": [1, 2.5, null, true, false], \"x\": \"caf\u00e9 \u65e5\u672c \ud83d\ude00\"}, \"text\": \"<&>' \\\"q\\\" \\\\ / \u007f \u2028 \u0085\", \"empty_list\": [], \"empty_map\": {}, \"big\": 12345678901234567890, \"neg\": -7}",
+   "error": "TypeError"
+  },
+  {
+   "id": "error-bad-separators-length",
+   "template": "{{ tools[0] | tojson(separators=(',',)) }}",
+   "x_json": "{\"zeta\": 1, \"alpha\": {\"y\": [1, 2.5, null, true, false], \"x\": \"caf\u00e9 \u65e5\u672c \ud83d\ude00\"}, \"text\": \"<&>' \\\"q\\\" \\\\ / \u007f \u2028 \u0085\", \"empty_list\": [], \"empty_map\": {}, \"big\": 12345678901234567890, \"neg\": -7}",
+   "error": "ValueError"
+  },
+  {
+   "id": "error-bad-indent",
+   "template": "{{ tools[0] | tojson(indent=1.5) }}",
+   "x_json": "{\"zeta\": 1, \"alpha\": {\"y\": [1, 2.5, null, true, false], \"x\": \"caf\u00e9 \u65e5\u672c \ud83d\ude00\"}, \"text\": \"<&>' \\\"q\\\" \\\\ / \u007f \u2028 \u0085\", \"empty_list\": [], \"empty_map\": {}, \"big\": 12345678901234567890, \"neg\": -7}",
+   "error": "TypeError"
+  },
+  {
+   "id": "error-unknown-kwarg",
+   "template": "{{ tools[0] | tojson(pretty=True) }}",
+   "x_json": "{\"zeta\": 1, \"alpha\": {\"y\": [1, 2.5, null, true, false], \"x\": \"caf\u00e9 \u65e5\u672c \ud83d\ude00\"}, \"text\": \"<&>' \\\"q\\\" \\\\ / \u007f \u2028 \u0085\", \"empty_list\": [], \"empty_map\": {}, \"big\": 12345678901234567890, \"neg\": -7}",
+   "error": "TypeError"
+  },
+  {
+   "id": "error-too-many-args",
+   "template": "{{ tools[0] | tojson(false, None, None, false, 5) }}",
+   "x_json": "{\"zeta\": 1, \"alpha\": {\"y\": [1, 2.5, null, true, false], \"x\": \"caf\u00e9 \u65e5\u672c \ud83d\ude00\"}, \"text\": \"<&>' \\\"q\\\" \\\\ / \u007f \u2028 \u0085\", \"empty_list\": [], \"empty_map\": {}, \"big\": 12345678901234567890, \"neg\": -7}",
+   "error": "TypeError"
+  },
+  {
+   "id": "floats",
+   "template": "{{ tools[0] | tojson }}",
+   "x_json": "{\"a\": [0.1, 1.0, 1000000000000000.0, 1e+16, 0.0001, 1e-05, 1e-07, 5e-324, 1.5e+300, 1e+30, -0.0, 2.5e-05, 1.7976931348623157e+308, 0.30000000000000004, 100.0, 1e+22, 1.2345678901234568e+17, 1e+21, 0.0001234, 123456789.123, 0.0]}",
+   "reference": "{\"a\": [0.1, 1.0, 1000000000000000.0, 1e+16, 0.0001, 1e-05, 1e-07, 5e-324, 1.5e+300, 1e+30, -0.0, 2.5e-05, 1.7976931348623157e+308, 0.30000000000000004, 100.0, 1e+22, 1.2345678901234568e+17, 1e+21, 0.0001234, 123456789.123, 0.0]}"
+  },
+  {
+   "id": "long-floats",
+   "template": "{{ tools[0] | tojson }}",
+   "x_json": "{\"a\": [22707.319846318922, -95693268348.29051, -7442.733041219079, 26107.355549524742, -55534.990616406096, -38475.04162811635, 390.5098331794725, 88123.31515433741, 287746003547.011, 643774435254.5903, -900311238071.5613, 414689105006.1384, 9.998037984729436e-06, 9.202560400067246e-07, 2.6808819269098948e-14]}",
+   "reference": "{\"a\": [22707.319846318922, -95693268348.29051, -7442.733041219079, 26107.355549524742, -55534.990616406096, -38475.04162811635, 390.5098331794725, 88123.31515433741, 287746003547.011, 643774435254.5903, -900311238071.5613, 414689105006.1384, 9.998037984729436e-06, 9.202560400067246e-07, 2.6808819269098948e-14]}"
+  },
+  {
+   "id": "indent-float-integral",
+   "template": "{{ tools[0] | tojson(indent=2.0) }}",
+   "x_json": "{\"zeta\": 1, \"alpha\": {\"y\": [1, 2.5, null, true, false], \"x\": \"caf\u00e9 \u65e5\u672c \ud83d\ude00\"}, \"text\": \"<&>' \\\"q\\\" \\\\ / \u007f \u2028 \u0085\", \"empty_list\": [], \"empty_map\": {}, \"big\": 12345678901234567890, \"neg\": -7}",
+   "error": "TypeError"
+  },
+  {
+   "id": "indent-true",
+   "template": "{{ tools[0] | tojson(indent=True) }}",
+   "x_json": "{\"a\": [1]}",
+   "reference": "{\n \"a\": [\n  1\n ]\n}"
+  },
+  {
+   "id": "trim-chars-kw",
+   "template": "{{ 'xxhixx' | trim(chars='x') }}",
+   "x_json": "{\"zeta\": 1, \"alpha\": {\"y\": [1, 2.5, null, true, false], \"x\": \"caf\u00e9 \u65e5\u672c \ud83d\ude00\"}, \"text\": \"<&>' \\\"q\\\" \\\\ / \u007f \u2028 \u0085\", \"empty_list\": [], \"empty_map\": {}, \"big\": 12345678901234567890, \"neg\": -7}",
+   "reference": "hi"
+  },
+  {
+   "id": "trim-unknown-kw",
+   "template": "{{ 'x' | trim(bogus='x') }}",
+   "x_json": "{\"zeta\": 1, \"alpha\": {\"y\": [1, 2.5, null, true, false], \"x\": \"caf\u00e9 \u65e5\u672c \ud83d\ude00\"}, \"text\": \"<&>' \\\"q\\\" \\\\ / \u007f \u2028 \u0085\", \"empty_list\": [], \"empty_map\": {}, \"big\": 12345678901234567890, \"neg\": -7}",
+   "error": "TypeError"
+  },
+  {
+   "id": "trim-duplicate",
+   "template": "{{ 'x' | trim('x', chars='x') }}",
+   "x_json": "{\"zeta\": 1, \"alpha\": {\"y\": [1, 2.5, null, true, false], \"x\": \"caf\u00e9 \u65e5\u672c \ud83d\ude00\"}, \"text\": \"<&>' \\\"q\\\" \\\\ / \u007f \u2028 \u0085\", \"empty_list\": [], \"empty_map\": {}, \"big\": 12345678901234567890, \"neg\": -7}",
+   "error": "TypeError"
+  },
+  {
+   "id": "big-integer",
+   "template": "{{ tools[0] | tojson }}",
+   "x_json": "{\"n\": 12345678901234567890123}",
+   "known_divergence": "integers above u64::MAX print as floats",
+   "reference": "{\"n\": 12345678901234567890123}"
+  },
+  {
+   "id": "string-bad-indent",
+   "template": "{{ 'x' | tojson(indent=1.5) }}",
+   "x_json": "{\"zeta\": 1, \"alpha\": {\"y\": [1, 2.5, null, true, false], \"x\": \"caf\u00e9 \u65e5\u672c \ud83d\ude00\"}, \"text\": \"<&>' \\\"q\\\" \\\\ / \u007f \u2028 \u0085\", \"empty_list\": [], \"empty_map\": {}, \"big\": 12345678901234567890, \"neg\": -7}",
+   "known_divergence": "Python does not check indent for a top-level string",
+   "reference": "\"x\""
+  },
+  {
+   "id": "string-bad-separators",
+   "template": "{{ 'x' | tojson(separators=1) }}",
+   "x_json": "{\"zeta\": 1, \"alpha\": {\"y\": [1, 2.5, null, true, false], \"x\": \"caf\u00e9 \u65e5\u672c \ud83d\ude00\"}, \"text\": \"<&>' \\\"q\\\" \\\\ / \u007f \u2028 \u0085\", \"empty_list\": [], \"empty_map\": {}, \"big\": 12345678901234567890, \"neg\": -7}",
+   "error": "TypeError"
+  },
+  {
+   "id": "list-display",
+   "template": "{{ [1, 'a', none, true] }}",
+   "x_json": "{\"zeta\": 1, \"alpha\": {\"y\": [1, 2.5, null, true, false], \"x\": \"caf\u00e9 \u65e5\u672c \ud83d\ude00\"}, \"text\": \"<&>' \\\"q\\\" \\\\ / \u007f \u2028 \u0085\", \"empty_list\": [], \"empty_map\": {}, \"big\": 12345678901234567890, \"neg\": -7}",
+   "known_divergence": "a list prints with double quotes, Python prints single quotes",
+   "reference": "[1, 'a', None, True]"
+  }
+ ]
+}

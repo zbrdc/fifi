@@ -1,0 +1,59 @@
+{
+  "quantization_config": {
+    "config_groups": {
+      "group_0": {
+        "input_activations": {
+          "dynamic": false,
+          "num_bits": 8,
+          "type": "float"
+        },
+        "weights": {
+          "dynamic": false,
+          "num_bits": 8,
+          "type": "float"
+        },
+        "targets": [
+          "language_model.backbone.layers.0.mixer.in_proj"
+        ]
+      },
+      "group_1": {
+        "input_activations": {
+          "dynamic": false,
+          "num_bits": 4,
+          "type": "float",
+          "group_size": 16
+        },
+        "weights": {
+          "dynamic": false,
+          "num_bits": 4,
+          "type": "float",
+          "group_size": 16
+        },
+        "targets": [
+          "language_model.backbone.layers.1.mixer.experts.0.down_proj"
+        ]
+      }
+    },
+    "quantized_layers": {
+      "language_model.backbone.layers.0.mixer.in_proj": {
+        "quant_algo": "FP8"
+      },
+      "language_model.backbone.layers.1.mixer.experts.0.down_proj": {
+        "quant_algo": "NVFP4",
+        "group_size": 16
+      }
+    },
+    "ignore": [],
+    "quant_algo": "MIXED_PRECISION",
+    "kv_cache_scheme": {
+      "dynamic": false,
+      "num_bits": 8,
+      "type": "float"
+    },
+    "producer": {
+      "name": "modelopt",
+      "version": "0.37.0"
+    },
+    "quant_method": "modelopt_mixed"
+  }
+}

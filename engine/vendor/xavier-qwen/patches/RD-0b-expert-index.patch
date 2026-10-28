@@ -1,0 +1,122 @@
+--- a/src/kernels.cu
++++ b/src/kernels.cu
+@@ -97,4 +97,26 @@
+   return cudaGetLastError();
+ }
+
++cudaError_t matmul_expert(GgmlType type, int m, const uint4* stack, ExpertSelect sel,
++                          const uint4* xf, float* y, int ldy, int n_rows, int k,
++                          cudaStream_t stream) {
++  if (!sel.ids || sel.count <= 0 || sel.slot < 0 || m < 1 || m > 8 || n_rows <= 0 ||
++      n_rows % 8 != 0 || k <= 0 || k % mma884::kTileK != 0 || k > kMaxK ||
++      mma884::split_k(n_rows / 8, k / mma884::kTileK) != 1)
++    return cudaErrorInvalidValue;
++  switch (type) {
++    case GgmlType::Q8_0:
++      return mma884::launch_expert<mma884::Q8_0>(m, stack, sel.ids, sel.slot, sel.count, xf, y,
++                                                 ldy, n_rows, k, stream);
++    case GgmlType::Q4_K:
++      return mma884::launch_expert<mma884::Q4_K>(m, stack, sel.ids, sel.slot, sel.count, xf, y,
++                                                 ldy, n_rows, k, stream);
++    case GgmlType::Q6_K:
++      return mma884::launch_expert<mma884::Q6_K>(m, stack, sel.ids, sel.slot, sel.count, xf, y,
++                                                 ldy, n_rows, k, stream);
++    default:
++      return cudaErrorInvalidValue;
++  }
++}
++
+ }  // namespace kern
+--- a/src/kernels.h
++++ b/src/kernels.h
+@@ -31,4 +31,21 @@
+ // xf = x for x [m][k]; returns the launch status.
+ cudaError_t pack_f32(const float* x, int m, int k, uint4* xf, cudaStream_t stream = nullptr);
+
++// Picks one expert of a stack on the device: the expert is ids[slot], valid in [0, count).
++struct ExpertSelect {
++  const int* ids;
++  int slot;
++  int count;
++};
++
++// y[t * ldy + r] is the product with expert ids[slot] of `stack`, the tiled weight of `count`
++// experts of n_rows x k each, back to back. Same layout and results as matmul on that expert's
++// tiles, but the id is read by the kernel, so a captured graph needs no host-known id. m <= 8
++// and split_k == 1 only (decode shapes); an id outside [0, count) writes NaN to y and reads no
++// weight. Returns cudaErrorInvalidValue without a launch for a bad shape, a null ids, an
++// untiled type, or a shape that matmul would split along k.
++cudaError_t matmul_expert(GgmlType type, int m, const uint4* stack, ExpertSelect sel,
++                          const uint4* xf, float* y, int ldy, int n_rows, int k,
++                          cudaStream_t stream = nullptr);
++
+ }  // namespace kern
+--- a/src/mma884.cuh
++++ b/src/mma884.cuh
+@@ -362,3 +362,66 @@
+   }
+ };
+ }  // namespace mma884
++
++// Device-indexed expert matmul. A resident decode step routes on the device, so
++// the expert id is not known to the host when a graph is captured; this kernel
++// reads it from ids[slot] and offsets the weight base itself. `stack` holds the
++// tiles of `count` experts back to back, each n_rows / 8 * k / kTileK tiles.
++namespace mma884 {
++// The main loop below repeats the one in matmul (TG = 1, no split) on purpose, with
++// one change: the base of the weight tiles. Sharing a __device__ body would edit
++// matmul, whose SASS and cited source lines must stay as they are.
++// m <= 8 and one K range per warp only (split_k == 1; the caller checks).
++// An id outside [0, count) reads no weight: the accumulators are NaN, so the
++// store writes NaN into y and the failure reaches the logits. That case leaves
++// by an early return, ahead of the loop. Written as the else branch of the loop
++// instead, the kernel ran 6 percent slower than matmul on the same tiles (3090,
++// Q4_K 512x2048); with the early return it is not slower.
++template <class F>
++__global__ void __launch_bounds__(kWarps * 32)
++    matmul_expert_k(const uint4* __restrict__ stack, const int* __restrict__ ids, int slot,
++                    int count, const uint4* __restrict__ xf, float* __restrict__ y, int ldy,
++                    int n_rows, int k, int m) {
++  int lane = threadIdx.x & 31;
++  int g = blockIdx.x * kWarps + threadIdx.x / 32;
++  if (g >= n_rows / 8) return;
++  int nb = k / kTileK;
++  int id = __ldg(ids + slot);
++  if ((unsigned)id >= (unsigned)count) {
++    float bad_acc[1][8];
++#pragma unroll
++    for (int i = 0; i < 8; ++i) bad_acc[0][i] = __int_as_float(0x7fc00000);
++    store<1, false>(bad_acc, y, g, ldy, m, lane);
++    return;
++  }
++  float acc[1][8] = {};
++  size_t expert_vecs = (size_t)(n_rows / 8) * nb * F::kTileVecs;
++  const uint4* tiles = stack + (size_t)id * expert_vecs + (size_t)g * nb * F::kTileVecs;
++  typename F::Raw next = F::load(tiles, lane);
++  for (int ib = 0; ib < nb; ++ib) {
++    typename F::Raw cur = next;
++    if (ib + 1 < nb) next = F::load(tiles + (size_t)(ib + 1) * F::kTileVecs, lane);
++    typename F::Scales sc = F::scales(cur, lane);
++#pragma unroll
++    for (int wi = 0; wi < 8; ++wi) {
++      uint2 lo, hi;
++      F::dq(cur, sc, wi, lo, hi);
++      uint4 xv = load_x(xf, 0, nb, ib, wi, lane, m);
++      mma(acc[0], lo, make_uint2(xv.x, xv.y));
++      mma(acc[0], hi, make_uint2(xv.z, xv.w));
++    }
++  }
++  store<1, false>(acc, y, g, ldy, m, lane);
++}
++
++// y[t * ldy + r] for m <= 8 tokens against expert ids[slot] of `stack`; on `stream`.
++// Returns the launch status. The caller has validated the shape.
++template <class F>
++cudaError_t launch_expert(int m, const uint4* stack, const int* ids, int slot, int count,
++                          const uint4* xf, float* y, int ldy, int n_rows, int k,
++                          cudaStream_t stream) {
++  dim3 grid((n_rows / 8 + kWarps - 1) / kWarps), block(kWarps * 32);
++  matmul_expert_k<F><<<grid, block, 0, stream>>>(stack, ids, slot, count, xf, y, ldy, n_rows, k, m);
++  return cudaGetLastError();
++}
++}  // namespace mma884

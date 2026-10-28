@@ -1,0 +1,15 @@
+{
+  "metadata": {
+    "total_size": 75010189968
+  },
+  "weight_map": {
+    "language_model.backbone.embeddings.weight": "model-00001-of-00088.safetensors",
+    "language_model.backbone.layers.0.mixer.A_log": "model-00001-of-00088.safetensors",
+    "language_model.mtp.layers.0.eh_proj.weight": "model-00088-of-00088.safetensors",
+    "vision_model.radio_model.input_conditioner.norm_mean": "model-00001-of-00088.safetensors",
+    "vision_projector.vision_final_layernorm.bias": "model-00001-of-00088.safetensors",
+    "language_model.lm_head.weight": "model-00088-of-00088.safetensors",
+    "mlp1.0.weight": "model-00001-of-00088.safetensors",
+    "mlp1.1.weight": "model-00001-of-00088.safetensors"
+  }
+}

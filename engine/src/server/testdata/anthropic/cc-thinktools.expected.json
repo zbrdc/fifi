@@ -1,0 +1,13 @@
+{
+  "status": 200,
+  "mode": "stream",
+  "query": "beta=true",
+  "asserts": [
+    "event-sequence",
+    "usage-in-message-start"
+  ],
+  "deviations": [
+    "thinking-carried",
+    "system-kept-in-place"
+  ]
+}

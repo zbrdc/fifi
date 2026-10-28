@@ -1,0 +1,17 @@
+{
+  "max_tokens": 64,
+  "messages": [
+    {
+      "role": "user",
+      "content": "Say hi"
+    }
+  ],
+  "model": "capture-model",
+  "metadata": {
+    "user_id": "capture-user"
+  },
+  "system": [
+    "Be brief."
+  ],
+  "stream": true
+}

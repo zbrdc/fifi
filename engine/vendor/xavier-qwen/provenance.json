@@ -1,0 +1,476 @@
+{
+  "project": "xavier-qwen",
+  "source": "the xavier-qwen repository on a build host, exported with git archive",
+  "commit": "2f9183c1d99b7f459316f89b7dd9450ac7e8df66",
+  "license": "MIT",
+  "copyright": "Copyright (c) 2026 Dan Campos",
+  "origin_audit": "KUBDAN-ORIGIN-AUDIT-2f9183c.md, reviewed in coordinator REPLY-13 against llama.cpp acecd56032ddc34bada14a2d978f110d9c987095",
+  "files": {
+    "LICENSE": {
+      "upstream_sha256": "56dc032b18ae6211f3a3589f625e362118f81b90e79c038af865829b9def1e74",
+      "vendored_sha256": "56dc032b18ae6211f3a3589f625e362118f81b90e79c038af865829b9def1e74"
+    },
+    "src/gemm.cuh": {
+      "upstream_sha256": "968e90f2df23b14bdf6c1fc95e61e5fff1e83fc43bdd98998f80845c79e57f20",
+      "vendored_sha256": "968e90f2df23b14bdf6c1fc95e61e5fff1e83fc43bdd98998f80845c79e57f20",
+      "patched_sha256": "0ef3adf1a5a6be9893f900be1f0d54daa5b351a1e7c86f7e93537ca17dd58f6c"
+    },
+    "src/kernels.cu": {
+      "upstream_sha256": "64a82f0ac85d0d7e5047473bf953592e718f866e3e4616bc385dfe7abd4868a8",
+      "vendored_sha256": "890750f2a2a0b0a4054e354546758fcd83194ed920dfdd1d08e9f3a7f4feb9cd",
+      "patched_sha256": "b86627a78f879ae19de7020b9b4813ba33f570ea12d67c2d34c15d794b6083ee"
+    },
+    "src/kernels.h": {
+      "upstream_sha256": "669c7bac2fb06fafb5ea70e143ecd62386475bb0a9fab579fcf18de7c8f01033",
+      "vendored_sha256": "79051803fad9331b349135a0976c94e61847a62a742d91af6b4d2a459d74015d",
+      "patched_sha256": "6ca18bbc586cd02adf9c4103e87bade584159bb20be6300f657debed0b71f643"
+    },
+    "src/mma884.cuh": {
+      "upstream_sha256": "c6adc2113f4ac3348cf27f0ef6bbd9f4aad445f0764d56e897809341e8ba4ca1",
+      "vendored_sha256": "c6adc2113f4ac3348cf27f0ef6bbd9f4aad445f0764d56e897809341e8ba4ca1",
+      "patched_sha256": "506043e1c8a2a32b1feea806107acf5c1b0545bea342f27ec02a037e53d8bfae"
+    },
+    "src/repack.cu": {
+      "upstream_sha256": "e90dd73f8f32005359f293b146a04ef2de59b18d21022edd5e6d95a6cf6d548c",
+      "vendored_sha256": "e90dd73f8f32005359f293b146a04ef2de59b18d21022edd5e6d95a6cf6d548c",
+      "patched_sha256": "c80b8ff352664bbc12f8f3d8f08490949974cd523fea6ea399578f25522f20c5"
+    },
+    "src/repack.h": {
+      "upstream_sha256": "da47ff731136fec0faf5e3f3969d2d6bdd26e4d49dbe6995cc96b0752f769194",
+      "vendored_sha256": "da47ff731136fec0faf5e3f3969d2d6bdd26e4d49dbe6995cc96b0752f769194",
+      "patched_sha256": "4cda8ee5aa5ae1a4ce0c99d8a2f46b8806b6184d12146fa8f3b0890959fa922a"
+    },
+    "src/ops.cu": {
+      "restored_from": "src/kernels.cu",
+      "vendored_sha256": "e514e857b4d0472a79d373157e49bc4d0bc62a86a4363a596d1d56eb32b76b1b",
+      "patched_sha256": "12ed2ca756a03886f68769432a5d11085a4d11781ee9387561624eceb03a2c50"
+    },
+    "src/ops.h": {
+      "restored_from": "src/kernels.h",
+      "vendored_sha256": "fc9fae28d1156632ab102c4b4b6d679cbb0f55eadfc27311738355f6cecf5f44",
+      "patched_sha256": "d5205048817aed7312589dcb9e0d77bcbd47293bafb8354e42ebbd4f92d05033"
+    },
+    "src/frag_layout.cuh": {
+      "patched_sha256": "b566a419e9896c30251116d6ff6613680f8cf9eff304cbddd81e9d14c86fd1bc"
+    }
+  },
+  "patches": [
+    {
+      "id": "exit-paths-and-alignment",
+      "description": "Return errors instead of ending the process (REPLY-16 option A, commit 52ae269) and the write_xf alignment fix (commit 884020c). No diff file is stored; the end points are the trimmed files and the files before RD-0.",
+      "diff": null,
+      "files": {
+        "src/gemm.cuh": {
+          "before_sha256": "968e90f2df23b14bdf6c1fc95e61e5fff1e83fc43bdd98998f80845c79e57f20",
+          "after_sha256": "b916e46709ef709667b00824d41349cb0bdbe933b9c02a83a55eb74f3d747188"
+        },
+        "src/kernels.cu": {
+          "before_sha256": "890750f2a2a0b0a4054e354546758fcd83194ed920dfdd1d08e9f3a7f4feb9cd",
+          "after_sha256": "fc4c16574bcbf455f96e67e0779285a7d2931b7db37e55470b84ec84bff5df74"
+        },
+        "src/kernels.h": {
+          "before_sha256": "79051803fad9331b349135a0976c94e61847a62a742d91af6b4d2a459d74015d",
+          "after_sha256": "2ee6064c3c8fb3a50b1bf245869deed9f1fe80ee376c58afab4ee21d27ec0eb1"
+        },
+        "src/mma884.cuh": {
+          "before_sha256": "c6adc2113f4ac3348cf27f0ef6bbd9f4aad445f0764d56e897809341e8ba4ca1",
+          "after_sha256": "256aa343a32ea954aab927e9230e88eee8c2abbce08a9c993e3468f712e128d1"
+        },
+        "src/repack.cu": {
+          "before_sha256": "e90dd73f8f32005359f293b146a04ef2de59b18d21022edd5e6d95a6cf6d548c",
+          "after_sha256": "c80b8ff352664bbc12f8f3d8f08490949974cd523fea6ea399578f25522f20c5"
+        },
+        "src/repack.h": {
+          "before_sha256": "da47ff731136fec0faf5e3f3969d2d6bdd26e4d49dbe6995cc96b0752f769194",
+          "after_sha256": "4cda8ee5aa5ae1a4ce0c99d8a2f46b8806b6184d12146fa8f3b0890959fa922a"
+        }
+      }
+    },
+    {
+      "id": "RD-0-explicit-stream",
+      "description": "Trailing cudaStream_t stream = nullptr on every launching entry; every kernel, memset and memset2D of the entry goes to it. The default keeps all existing callers unchanged.",
+      "diff": "patches/RD-0-explicit-stream.patch",
+      "files": {
+        "src/gemm.cuh": {
+          "before_sha256": "b916e46709ef709667b00824d41349cb0bdbe933b9c02a83a55eb74f3d747188",
+          "after_sha256": "0ef3adf1a5a6be9893f900be1f0d54daa5b351a1e7c86f7e93537ca17dd58f6c"
+        },
+        "src/kernels.cu": {
+          "before_sha256": "fc4c16574bcbf455f96e67e0779285a7d2931b7db37e55470b84ec84bff5df74",
+          "after_sha256": "8b59e2b9032943db5872753961c9eeab711fed6b2c3d97f9cff5cfcba9b07feb"
+        },
+        "src/kernels.h": {
+          "before_sha256": "2ee6064c3c8fb3a50b1bf245869deed9f1fe80ee376c58afab4ee21d27ec0eb1",
+          "after_sha256": "9fd2706fd6be122f6e72fff83e9dd111d166f5ebe5c625fbc17933c45720586c"
+        },
+        "src/mma884.cuh": {
+          "before_sha256": "256aa343a32ea954aab927e9230e88eee8c2abbce08a9c993e3468f712e128d1",
+          "after_sha256": "6a1e9a1d8a3ed25bbccd9668c74d9371e37322b6881aa0d41305d82fee014fe2"
+        }
+      }
+    },
+    {
+      "id": "RD-0b-expert-index",
+      "description": "New kernel matmul_expert_k<F> in mma884.cuh and entry kern::matmul_expert with struct ExpertSelect: the weight base of one expert is read from ids[slot] on the device (m <= 8, no split-K); a bad id writes NaN. Insertions only; no existing function changes.",
+      "diff": "patches/RD-0b-expert-index.patch",
+      "files": {
+        "src/kernels.cu": {
+          "before_sha256": "8b59e2b9032943db5872753961c9eeab711fed6b2c3d97f9cff5cfcba9b07feb",
+          "after_sha256": "c9f737bb38623972ea23a7d26549593bb066e533b06989621bad818e6ba563f7"
+        },
+        "src/kernels.h": {
+          "before_sha256": "9fd2706fd6be122f6e72fff83e9dd111d166f5ebe5c625fbc17933c45720586c",
+          "after_sha256": "6ca18bbc586cd02adf9c4103e87bade584159bb20be6300f657debed0b71f643"
+        },
+        "src/mma884.cuh": {
+          "before_sha256": "6a1e9a1d8a3ed25bbccd9668c74d9371e37322b6881aa0d41305d82fee014fe2",
+          "after_sha256": "506043e1c8a2a32b1feea806107acf5c1b0545bea342f27ec02a037e53d8bfae"
+        }
+      }
+    },
+    {
+      "id": "RD-4V-stream-and-errors",
+      "description": "Entries of src/ops.cu take a trailing cudaStream_t stream = nullptr and return the launch status; the 10 glue lines are added (MIT notice in each file, the include of ops.h, separating blank lines); the process-ending check_launch is removed together with the includes it needed; attn_prep is the attn_prep_k launch of upstream attention() as an entry of its own. Host code only.",
+      "diff": "patches/RD-4V-stream-and-errors.patch",
+      "files": {
+        "src/ops.cu": {
+          "before_sha256": "e514e857b4d0472a79d373157e49bc4d0bc62a86a4363a596d1d56eb32b76b1b",
+          "after_sha256": "9ef08a20c8ad5f61efcb132a25b8c43e4697f32593421e39dd3523c555774ffd"
+        },
+        "src/ops.h": {
+          "before_sha256": "fc9fae28d1156632ab102c4b4b6d679cbb0f55eadfc27311738355f6cecf5f44",
+          "after_sha256": "2e08db2321d5d1fbaa90939553c9a04e2431c01509e4836adf95822b4b6e791b"
+        }
+      }
+    },
+    {
+      "id": "RD-4V-frag-layout",
+      "description": "write_xf and pack_half2x4 move unchanged from src/kernels.cu to the new src/frag_layout.cuh, which kernels.cu and ops.cu include, so that there is one copy of the fragment-order write. The device code of kernels.cu is unchanged (SASS identical by function).",
+      "diff": "patches/RD-4V-frag-layout.patch",
+      "files": {
+        "src/frag_layout.cuh": {
+          "before_sha256": null,
+          "after_sha256": "b566a419e9896c30251116d6ff6613680f8cf9eff304cbddd81e9d14c86fd1bc"
+        },
+        "src/kernels.cu": {
+          "before_sha256": "c9f737bb38623972ea23a7d26549593bb066e533b06989621bad818e6ba563f7",
+          "after_sha256": "b86627a78f879ae19de7020b9b4813ba33f570ea12d67c2d34c15d794b6083ee"
+        },
+        "src/ops.cu": {
+          "before_sha256": "9ef08a20c8ad5f61efcb132a25b8c43e4697f32593421e39dd3523c555774ffd",
+          "after_sha256": "b02d4a3cc6728d08248f60111efbdef89696480ab91a3b70efcaf02991225015"
+        }
+      }
+    },
+    {
+      "id": "RD-4V-attn-prep-position",
+      "description": "AttnArgs gets pos_dev (null by default); attn_prep_k reads the position of token 0 from device memory when it is set, so one captured graph serves every position.",
+      "diff": "patches/RD-4V-attn-prep-position.patch",
+      "files": {
+        "src/ops.cu": {
+          "before_sha256": "b02d4a3cc6728d08248f60111efbdef89696480ab91a3b70efcaf02991225015",
+          "after_sha256": "3584bce869fe94246c837444d6c8a3e9e16061225ed0cd4763f464b6d9b0857c"
+        },
+        "src/ops.h": {
+          "before_sha256": "2e08db2321d5d1fbaa90939553c9a04e2431c01509e4836adf95822b4b6e791b",
+          "after_sha256": "56d1d65c014a1dd7f6ca4d1ec8ed707bd7bfcc035be61a49eae4d3eff31cd747"
+        }
+      }
+    },
+    {
+      "id": "RD-4V-norm-out",
+      "description": "add_rmsnorm_pack takes an optional norm_out; add_rmsnorm_pack_k stores the f32 normalized row there (the router input) when it is non-null. The pack is unchanged.",
+      "diff": "patches/RD-4V-norm-out.patch",
+      "files": {
+        "src/ops.cu": {
+          "before_sha256": "3584bce869fe94246c837444d6c8a3e9e16061225ed0cd4763f464b6d9b0857c",
+          "after_sha256": "51789fccf9352147f7211b1cff8a491c2f5c365b90c8ea36a7b741cbce0d1c11"
+        },
+        "src/ops.h": {
+          "before_sha256": "56d1d65c014a1dd7f6ca4d1ec8ed707bd7bfcc035be61a49eae4d3eff31cd747",
+          "after_sha256": "0b747b26e6fb976a31c98dcc9eaa4f3235af380947475f9869d245da9968a6fa"
+        }
+      }
+    },
+    {
+      "id": "RD-8a",
+      "description": "attn_prep_k tests the device position word against the cache rows before any access and reports a refusal in a status word; AttnArgs gains rows, status_dev, status_bits (RD-8a)",
+      "diff": "patches/RD-8a-attn-prep-poison.patch",
+      "files": {
+        "src/ops.cu": {
+          "before_sha256": "51789fccf9352147f7211b1cff8a491c2f5c365b90c8ea36a7b741cbce0d1c11",
+          "after_sha256": "a1fd04f814032e886b990a265c8e7f8982769e990957d0f111e376dea5de7a96"
+        },
+        "src/ops.h": {
+          "before_sha256": "0b747b26e6fb976a31c98dcc9eaa4f3235af380947475f9869d245da9968a6fa",
+          "after_sha256": "87dae60022e33d7e7dbd251d6fb1a084ebd9d9c045af6d185c26c1c95cc503ce"
+        }
+      }
+    },
+    {
+      "id": "MEMSET-TRIM-xf-zero-tail",
+      "description": "add_rmsnorm_pack_k and swiglu_pack_k write the shared zero tail entry xf[mma884::kXfEntries] themselves (block 0, thread 0, !rowmajor), so the engine wrappers drop the per-call whole-buffer memset of xf (MEMSET-TRIM)",
+      "diff": "patches/MEMSET-TRIM-xf-zero-tail.patch",
+      "files": {
+        "src/ops.cu": {
+          "before_sha256": "a1fd04f814032e886b990a265c8e7f8982769e990957d0f111e376dea5de7a96",
+          "after_sha256": "70ed3e91ee2f188afe6d812869cf935c79ae7cb8ae823176c8c315479fab8a3e"
+        }
+      }
+    },
+    {
+      "id": "KV8-B-attn-prep-rows",
+      "description": "The kRows template instance of attn_prep_k stores post-rope K and raw V as f32 rows for the Int8G32 KV append; the kRows=false instance is unchanged (KV8-B, commit 24092a9a)",
+      "diff": "patches/KV8-B-attn-prep-rows.patch",
+      "files": {
+        "src/ops.cu": {
+          "before_sha256": "70ed3e91ee2f188afe6d812869cf935c79ae7cb8ae823176c8c315479fab8a3e",
+          "after_sha256": "12ed2ca756a03886f68769432a5d11085a4d11781ee9387561624eceb03a2c50"
+        },
+        "src/ops.h": {
+          "before_sha256": "87dae60022e33d7e7dbd251d6fb1a084ebd9d9c045af6d185c26c1c95cc503ce",
+          "after_sha256": "d5205048817aed7312589dcb9e0d77bcbd47293bafb8354e42ebbd4f92d05033"
+        }
+      }
+    }
+  ],
+  "note": "Import commit 80fdb5b is byte-identical to upstream; trim commit cea80ef is whole-function only; the exit-path patch (52ae269) and the alignment fix (884020c) are their own commits. vendored_sha256 is the trimmed file. patched_sha256 is the file after the last entry of patches, in order: exit-paths-and-alignment, then RD-0-explicit-stream, then RD-0b-expert-index (their diffs are stored in patches/). RD-0b-expert-index is the third entry: it appends the device-indexed expert entry (patched_sha256 of kernels.cu, kernels.h and mma884.cuh is the file after it; gemm.cuh, repack.cu and repack.h are not in that entry). RD-4V (2026-10-10) restores the functions listed under \"restored\" into src/ops.cu and src/ops.h; the line ranges taken unchanged from 2f9183c are listed there, and the RD-4V patches follow in \"patches\".",
+  "trim": {
+    "approval": "coordinator REPLY-13 item 2 and REPLY-16 item 2",
+    "scope": "whole functions and declarations only; kept code is byte-identical to upstream",
+    "kept": {
+      "src/kernels.cu": [
+        "write_xf",
+        "pack_f32_k",
+        "check_launch",
+        "gemm_launch",
+        "xf_vecs",
+        "matmul",
+        "pack_f32"
+      ],
+      "src/kernels.h": [
+        "kMaxTokens",
+        "kMaxK",
+        "xf_vecs",
+        "matmul",
+        "pack_f32"
+      ]
+    },
+    "removed": {
+      "src/kernels.cu": [
+        "warp_sum",
+        "block_sum",
+        "silu",
+        "sigmoid",
+        "softplus",
+        "add_rmsnorm_pack_k",
+        "rmsnorm_k",
+        "concat_rmsnorm_pack_k",
+        "swiglu_pack_k",
+        "conv_silu_k",
+        "gated_delta_k",
+        "attn_prep_k",
+        "attention kernels and launch_fa",
+        "row_argmax",
+        "argmax_k",
+        "argmax_prob_k",
+        "add_rmsnorm_pack",
+        "rmsnorm",
+        "concat_rmsnorm_pack",
+        "swiglu_pack",
+        "conv_silu",
+        "gated_delta",
+        "launch_attention_tile",
+        "attention",
+        "argmax",
+        "argmax_prob"
+      ],
+      "src/kernels.h": [
+        "kHeadDim",
+        "kStateDim",
+        "kGqa",
+        "kAttnSplits",
+        "kAttnPartLd",
+        "add_rmsnorm_pack",
+        "rmsnorm",
+        "concat_rmsnorm_pack",
+        "swiglu_pack",
+        "ConvArgs",
+        "conv_silu",
+        "DeltaArgs",
+        "gated_delta",
+        "AttnArgs",
+        "launch_attention_tile",
+        "attention",
+        "argmax",
+        "Top1",
+        "argmax_prob"
+      ]
+    }
+  },
+  "patch": {
+    "approval": "coordinator REPLY-16 item 1 (option A)",
+    "purpose": "A library must not end the process. Every path that ended the process with exit status 1 returns an error to the caller, and the diagnostics that were written to stderr are removed; the engine adapter maps each return to the decision 0040 status and stage.",
+    "files": [
+      "src/gemm.cuh",
+      "src/kernels.cu",
+      "src/kernels.h",
+      "src/mma884.cuh",
+      "src/repack.cu",
+      "src/repack.h"
+    ],
+    "changes": [
+      "gemm.cuh gemm::launch returns cudaError_t: cudaErrorInvalidValue for a bad shape, the cudaFuncSetAttribute error for the shared-memory opt-in, else cudaGetLastError() after the launch.",
+      "mma884.cuh prepare_x returns nullptr when its allocation or memset fails (freeing a partial allocation); launch_packed and launch return cudaError_t (memset error, cudaErrorMemoryAllocation, or cudaGetLastError()).",
+      "repack.cu: the [[noreturn]] unsupported() helper is removed; ggml_row_bytes and tiled_vecs return 0 for an unknown type, to_q8_0 returns no converter, and repack returns bool (false for an untiled type or bad shape).",
+      "kernels.cu: check_launch is removed; gemm_launch, matmul and pack_f32 return cudaError_t, and matmul returns cudaErrorInvalidValue for an unsupported type.",
+      "Includes made unused by the removals (<cstdio>, <cstdlib>, <cfloat>) are dropped."
+    ],
+    "gate": "No call of the process-ending functions exit or abort, and no fprintf to stderr, in engine/vendor/xavier-qwen/ or engine/src/kernels/cuda/.",
+    "alignment_fix": {
+      "purpose": "write_xf read a 4-byte aligned __half2[4] local array as a uint4, a misaligned 16-byte local read (undefined behaviour). compute-sanitizer on sm_86 reported 'Invalid __local__ read of size 16 bytes ... misaligned' and the launch failed with 'misaligned address (status 716)'.",
+      "files": [
+        "src/kernels.cu"
+      ],
+      "change": "kernels.cu adds pack_half2x4, which copies the four __half2 values into 32-bit words and builds the uint4 with make_uint4 (the pattern mma884.cuh pack_x uses); both write_xf branches (rowmajor and fragment order) call it. The stored values and the xf layout are unchanged.",
+      "found_by": "compute-sanitizer --tool memcheck, sm_86 (RTX 3090)"
+    }
+  },
+  "restored": {
+    "packet": "RD-4V",
+    "date": "2026-10-10",
+    "commit": "2f9183c1d99b7f459316f89b7dd9450ac7e8df66",
+    "grant": "lane M REPLY-35 and lane C RD-4V conditions (2026-10-09)",
+    "functions": [
+      "warp_sum",
+      "block_sum",
+      "silu",
+      "sigmoid",
+      "softplus",
+      "add_rmsnorm_pack_k",
+      "swiglu_pack_k",
+      "rmsnorm_k",
+      "conv_silu_k",
+      "gated_delta_k",
+      "attn_prep_k",
+      "check_launch (removed again by RD-4V-stream-and-errors)",
+      "wrappers add_rmsnorm_pack, rmsnorm, swiglu_pack, conv_silu, gated_delta"
+    ],
+    "not_restored": [
+      "write_xf is not restored: kernels.cu keeps it (alignment-fixed) and RD-4V moves it to src/frag_layout.cuh",
+      "pack_f32_k stays in kernels.cu",
+      "concat_rmsnorm_pack_k",
+      "decode attention kernels, attention_tile_k, attention_fa_k, launch_fa",
+      "row_argmax, argmax_k, argmax_prob_k"
+    ],
+    "files": {
+      "src/ops.cu": {
+        "ranges": [
+          {
+            "from": "src/kernels.cu",
+            "first": 1,
+            "last": 34,
+            "sha256": "34e46f6a7ecb2aaa18b0b21cb001418c9589bd52375ea0581dbc136a6a6aeaea"
+          },
+          {
+            "from": "src/kernels.cu",
+            "first": 60,
+            "last": 76,
+            "sha256": "10d203c5dc8bc651c7735a199b80a5eb48c8df098e93f05e51fd0f8783187b51"
+          },
+          {
+            "from": "src/kernels.cu",
+            "first": 82,
+            "last": 95,
+            "sha256": "941d9740f30c5692df26bad78e7f3fd0303d525f73a4c6185393a29067b96143"
+          },
+          {
+            "from": "src/kernels.cu",
+            "first": 113,
+            "last": 218,
+            "sha256": "cec75b75641f7bbc0509352d3d65bb4c96d76a84fbd448030ee8b734bd6b545e"
+          },
+          {
+            "from": "src/kernels.cu",
+            "first": 735,
+            "last": 741,
+            "sha256": "00d1ff6f2623d700db9463b2a2ae37599d9d4f7d2d32e89105bc3cab935f26c2"
+          },
+          {
+            "from": "src/kernels.cu",
+            "first": 757,
+            "last": 758,
+            "sha256": "c2bd7638f09d52cb034ed574f539304035fc6fab162bf8d5fa20a35d8c7288a1"
+          },
+          {
+            "from": "src/kernels.cu",
+            "first": 787,
+            "last": 797,
+            "sha256": "5eb954f02d2bda1f6524074c785ffb3a656b349e05009b0b3d41d6917f98b9fd"
+          },
+          {
+            "from": "src/kernels.cu",
+            "first": 809,
+            "last": 823,
+            "sha256": "5021833d3aec756aca6c700af99bd88c161310d52c0b61ef4f38d516fdcc5945"
+          },
+          {
+            "from": "src/kernels.cu",
+            "first": 869,
+            "last": 870,
+            "sha256": "a2f89fb4545f12efaffc38e2d77a376e5e11b1ca073204edf133b3202be7b880"
+          }
+        ]
+      },
+      "src/ops.h": {
+        "ranges": [
+          {
+            "from": "src/kernels.h",
+            "first": 5,
+            "last": 12,
+            "sha256": "9a9859a89fb90047d49f4276b139792e3bbacbf4bb8c8ad3c3bbe192674442e7"
+          },
+          {
+            "from": "src/kernels.h",
+            "first": 15,
+            "last": 16,
+            "sha256": "ebd477a528ce6afda484fc3ec31cbb98113e440abfbe0cbf583b2e17d83610c4"
+          },
+          {
+            "from": "src/kernels.h",
+            "first": 19,
+            "last": 20,
+            "sha256": "5979782e686adc0a733d6e8a8acdcd0ff296cd9a35b4f575672ff782e8102568"
+          },
+          {
+            "from": "src/kernels.h",
+            "first": 35,
+            "last": 41,
+            "sha256": "6c53ba8c3515ee0d3923bc9f79c6a1afd8a07bba69b93aeed96d5df2e8d4a422"
+          },
+          {
+            "from": "src/kernels.h",
+            "first": 49,
+            "last": 96,
+            "sha256": "2f59e8319341f0ad92a01e16ed8a8be3e7f8458214154ff25330d1225dbf7ad8"
+          },
+          {
+            "from": "src/kernels.h",
+            "first": 109,
+            "last": 110,
+            "sha256": "a2f89fb4545f12efaffc38e2d77a376e5e11b1ca073204edf133b3202be7b880"
+          }
+        ]
+      }
+    },
+    "ggml_comparison": {
+      "reference": "llama.cpp acecd56032ddc34bada14a2d978f110d9c987095",
+      "files": [
+        "ggml/src/ggml-cuda/gated_delta_net.cu",
+        "ggml/src/ggml-cuda/ssm-conv.cu"
+      ],
+      "verdict": "no match",
+      "evidence_sha256": "4484b45fcc761969aa342f927ed797e6032a83a43cc7ced179837f700dd3102a"
+    }
+  }
+}

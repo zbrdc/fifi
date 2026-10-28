@@ -1,0 +1,10 @@
+# clangd has no nvcc compile database; point it at the host CUDA toolkit
+# so the vendored CUDA headers and .cu sources resolve for diagnostics.
+# Path matches this lane's CUDA 12.6 build container; adjust locally if
+# your toolkit lives elsewhere (diagnostics only — the build is unaffected).
+CompileFlags:
+  Add: [-I/usr/local/cuda-12.6/include, --cuda-path=/usr/local/cuda-12.6]
+# projector.cu's #include "kernels.h" resolves via build.rs's
+# vendor/xavier-qwen/src include in the real nvcc build; clangd (no .cu
+# compile database) reports it unresolved — cosmetic, verified by the
+# container build compiling every .cu.

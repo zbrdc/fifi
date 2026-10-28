@@ -1,0 +1,34 @@
+{
+  "project": "mlx-lm-gated-delta",
+  "upstream": {
+    "package": "mlx-lm",
+    "version": "0.31.0",
+    "home": "https://github.com/ml-explore/mlx-lm",
+    "path_in_package": "mlx_lm/models/gated_delta.py",
+    "copied_from": "the site-packages directory of an installed wheel on a Mac host (read-only copy with scp)",
+    "wheel_record": "mlx_lm/models/gated_delta.py,sha256=PkRVKKzAH3vLDkSEfL27HO1pzoEhgID33XAXVOTe6FY,8044"
+  },
+  "license": "MIT",
+  "copyright": "Copyright © 2023 Apple Inc.",
+  "license_source": "mlx_lm-0.31.0.dist-info/licenses/LICENSE",
+  "files": {
+    "LICENSE": {
+      "upstream_sha256": "ccfab7ccb2ea306f71531c8ca77bb55507606cd90768b1e32b8b52ab5b48cf01",
+      "vendored_sha256": "ccfab7ccb2ea306f71531c8ca77bb55507606cd90768b1e32b8b52ab5b48cf01"
+    },
+    "src/gated_delta.py": {
+      "upstream_sha256": "3e445528acc01f7bcb0e44847cbdbb1ced69ce81218080f7dd701754e4dee856",
+      "vendored_sha256": "3e445528acc01f7bcb0e44847cbdbb1ced69ce81218080f7dd701754e4dee856"
+    }
+  },
+  "derived": {
+    "gated_delta_step.metal": {
+      "from": "src/gated_delta.py",
+      "method": "extract_kernel.py with has_mask=False and vectorized=False: the `source` argument that _make_gated_delta_kernel passes to mx.fast.metal_kernel, evaluated by Python from the vendored f-string",
+      "kernel_name": "gated_delta_step",
+      "sha256": "b4ea3ae7ff2ca0ecb1d203109e8b333d310a0f18a5cf6f882f0e11332d6131fe"
+    }
+  },
+  "patches": [],
+  "note": "The import commit holds src/gated_delta.py and LICENSE byte-identical to the installed mlx-lm 0.31.0 wheel (the wheel RECORD hash above equals upstream_sha256 of the Python file). gated_delta_step.metal is derived, not patched: it is the Metal source text of the scalar-gate, unmasked variant, byte for byte. The masked and vectorized variants are not used. A change to the Metal source is a patch: its own commit, a diff under patches/, before and after hashes, and an extension of check_provenance.py."
+}

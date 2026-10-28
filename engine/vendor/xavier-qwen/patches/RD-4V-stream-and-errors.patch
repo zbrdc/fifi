@@ -1,0 +1,153 @@
+--- a/src/ops.cu
++++ b/src/ops.cu
+@@ -1,10 +1,10 @@
+-#include "kernels.h"
++// MIT License, Copyright (c) 2026 Dan Campos (see ../LICENSE).
++// Restored from xavier-qwen 2f9183c src/kernels.cu (RD-4V); provenance.json lists the line
++// ranges taken unchanged and the patches applied since.
+
+-#include <cfloat>
+-#include <cstdio>
+-#include <cstdlib>
++#include "kernels.h"
++#include "ops.h"
+
+-#include "gemm.cuh"
+ #include "mma884.cuh"
+
+ namespace kern {
+@@ -169,39 +169,39 @@ __global__ void attn_prep_k(AttnArgs a) {
+     a.k_cache[((size_t)pos * a.n_kv_head + head - a.n_head) * D + d] = __float2half(out);
+ }
+
+-void check_launch(const char* what) {
+-  cudaError_t err = cudaGetLastError();
+-  if (err == cudaSuccess) return;
+-  fprintf(stderr, "%s: %s\n", what, cudaGetErrorString(err));
+-  exit(1);
+-}
+-
+ }  // namespace
+
+-void add_rmsnorm_pack(float* h, const float* delta, const float* w, int m, int n, float eps,
+-                      uint4* xf) {
+-  add_rmsnorm_pack_k<<<m, 256>>>(h, delta, w, n, eps, m > kMaxTokens, xf);
+-  check_launch("add_rmsnorm_pack");
++cudaError_t add_rmsnorm_pack(float* h, const float* delta, const float* w, int m, int n,
++                             float eps, uint4* xf, cudaStream_t stream) {
++  add_rmsnorm_pack_k<<<m, 256, 0, stream>>>(h, delta, w, n, eps, m > kMaxTokens, xf);
++  return cudaGetLastError();
++}
++
++cudaError_t rmsnorm(const float* x, const float* w, int m, int n, float eps, float* out,
++                    cudaStream_t stream) {
++  rmsnorm_k<<<m, 256, 0, stream>>>(x, w, n, eps, out);
++  return cudaGetLastError();
+ }
+
+-void rmsnorm(const float* x, const float* w, int m, int n, float eps, float* out) {
+-  rmsnorm_k<<<m, 256>>>(x, w, n, eps, out);
+-  check_launch("rmsnorm");
++cudaError_t swiglu_pack(const float* gu, int m, int n_ff, uint4* xf, cudaStream_t stream) {
++  swiglu_pack_k<<<m, 256, 0, stream>>>(gu, n_ff, m > kMaxTokens, xf);
++  return cudaGetLastError();
+ }
+
+-void swiglu_pack(const float* gu, int m, int n_ff, uint4* xf) {
+-  swiglu_pack_k<<<m, 256>>>(gu, n_ff, m > kMaxTokens, xf);
+-  check_launch("swiglu_pack");
++cudaError_t conv_silu(const ConvArgs& a, cudaStream_t stream) {
++  conv_silu_k<<<(a.channels + 255) / 256, 256, 0, stream>>>(a);
++  return cudaGetLastError();
+ }
+
+-void conv_silu(const ConvArgs& a) {
+-  conv_silu_k<<<(a.channels + 255) / 256, 256>>>(a);
+-  check_launch("conv_silu");
++cudaError_t gated_delta(const DeltaArgs& a, cudaStream_t stream) {
++  gated_delta_k<<<a.n_v_heads, kStateDim, 0, stream>>>(a);
++  return cudaGetLastError();
+ }
+
+-void gated_delta(const DeltaArgs& a) {
+-  gated_delta_k<<<a.n_v_heads, kStateDim>>>(a);
+-  check_launch("gated_delta");
++// The attn_prep_k launch of upstream attention() (2f9183c kernels.cu:845) as an entry of its own.
++cudaError_t attn_prep(const AttnArgs& a, cudaStream_t stream) {
++  attn_prep_k<<<dim3(a.n_head + 2 * a.n_kv_head, a.m), kHeadDim, 0, stream>>>(a);
++  return cudaGetLastError();
+ }
+
+
+--- a/src/ops.h
++++ b/src/ops.h
+@@ -1,3 +1,7 @@
++// MIT License, Copyright (c) 2026 Dan Campos (see ../LICENSE).
++// Restored from xavier-qwen 2f9183c src/kernels.h (RD-4V); provenance.json lists the line
++// ranges taken unchanged and the patches applied since.
++
+ #pragma once
+
+ #include <cuda_fp16.h>
+@@ -10,15 +14,21 @@ namespace kern {
+
+ constexpr int kHeadDim = 256;   // full-attention head size
+ constexpr int kStateDim = 128;  // DeltaNet head size (keys and values)
+-// h += delta (when delta is non-null), then xf = RMSNorm(h) * w.
+-void add_rmsnorm_pack(float* h, const float* delta, const float* w, int m, int n, float eps,
+-                      uint4* xf);
++
++// Every entry runs on `stream` (nullptr: the default stream) and returns the launch status; none
++// allocates, synchronizes or ends the process. Shapes are not checked: the caller owns them.
++
++// h += delta (when delta is non-null), then xf = RMSNorm(h) * w. Needs n % 256 == 0.
++cudaError_t add_rmsnorm_pack(float* h, const float* delta, const float* w, int m, int n,
++                             float eps, uint4* xf, cudaStream_t stream = nullptr);
+
+ // out = RMSNorm(x) * w for x [m][n].
+-void rmsnorm(const float* x, const float* w, int m, int n, float eps, float* out);
++cudaError_t rmsnorm(const float* x, const float* w, int m, int n, float eps, float* out,
++                    cudaStream_t stream = nullptr);
+
+-// xf = silu(gate) * up for gu [m][2 * n_ff] holding gate then up.
+-void swiglu_pack(const float* gu, int m, int n_ff, uint4* xf);
++// xf = silu(gate) * up for gu [m][2 * n_ff] holding gate then up. Needs n_ff % 256 == 0.
++cudaError_t swiglu_pack(const float* gu, int m, int n_ff, uint4* xf,
++                        cudaStream_t stream = nullptr);
+
+ // Causal depthwise conv (kernel 4) + silu over the first `channels` columns of
+ // proj [m][ld]; state [3][channels] holds the previous inputs, oldest first.
+@@ -31,7 +41,8 @@ struct ConvArgs {
+   float* snap;  // [m - 1][3][channels] or null
+   float* out;   // [m][channels]
+ };
+-void conv_silu(const ConvArgs& a);
++// w is [channels][4] f32, 16-byte aligned (one float4 per channel).
++cudaError_t conv_silu(const ConvArgs& a, cudaStream_t stream = nullptr);
+
+ // Gated DeltaNet recurrence for one layer (autoregressive over the m tokens).
+ struct DeltaArgs {
+@@ -48,10 +59,13 @@ struct DeltaArgs {
+   int m, n_k_heads, n_v_heads;
+   float eps;
+ };
+-void gated_delta(const DeltaArgs& a);
++// Value head h reads key head h % n_k_heads (the GGUF layout, tiled), so n_v_heads % n_k_heads
++// must be 0; the gate is silu(z).
++cudaError_t gated_delta(const DeltaArgs& a, cudaStream_t stream = nullptr);
+
+-// Full attention for one layer: Q/K RMSNorm, NEOX rope on the first n_rot
+-// dims, KV cache write, causal softmax attention, sigmoid output gate.
++// Attention preparation for one layer (attn_prep): Q/K RMSNorm, NEOX rope on the first n_rot dims,
++// KV cache write. It reads proj, ld, n_head, n_kv_head, n_rot, q_norm, k_norm, eps, rope_base,
++// k_cache, v_cache, q, pos0 and m; the other fields belong to the attention kernels.
+ struct AttnArgs {
+   const float* proj;  // [m][ld]: per q head [q 256 | gate 256], then k, then v
+   int ld, n_head, n_kv_head, n_rot;
+@@ -65,5 +79,6 @@ struct AttnArgs {
+   float* part;  // scratch [m <= kMaxTokens][n_head][kAttnSplits][kAttnPartLd]
+   int pos0, m;
+ };
++cudaError_t attn_prep(const AttnArgs& a, cudaStream_t stream = nullptr);
+
+ }  // namespace kern

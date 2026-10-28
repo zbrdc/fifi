@@ -1,0 +1,685 @@
+{
+  "recorded_at": "2026-09-20",
+  "task": "P0A-01",
+  "status": "done",
+  "blocker": null,
+  "base_commit": "751440c0192694830c449221b9ec2ff13a506828",
+  "ssh_target": "user@mac-host",
+  "paths": {
+    "host_worktree": "<host_worktree>",
+    "host_scratch": "<host_scratch>",
+    "mac_runner": "<mac_runner>",
+    "mac_scratch": "<mac_scratch>",
+    "mac_activation": "<mac_scratch>/activate.sh"
+  },
+  "hardware": {
+    "model": "Mac16,9",
+    "chip": "Apple M4 Max",
+    "architecture": "arm64",
+    "physical_bytes": 38654705664,
+    "logical_cpu_count": 14,
+    "os_version": "26.5.2",
+    "os_build": "25F84",
+    "metal_device": {
+      "resource_limit": 499000,
+      "max_buffer_length": 22613000192,
+      "architecture": "applegpu_g16s",
+      "memory_size": 38654705664,
+      "max_recommended_working_set_size": 33285996544,
+      "device_name": "Apple M4 Max"
+    }
+  },
+  "developer_tools": {
+    "selected_directory": "/Applications/Xcode-26.6.0.app/Contents/Developer",
+    "xcode_version": "Xcode 26.6\nBuild version 17F113",
+    "sdk": "26.5",
+    "clang": "Apple clang version 21.0.0 (clang-2100.1.1.101)\nTarget: arm64-apple-darwin25.5.0\nThread model: posix\nInstalledDir: /Applications/Xcode-26.6.0.app/Contents/Developer/Toolchains/XcodeDefault.xctoolchain/usr/bin",
+    "metal_component": {
+      "assetPath": "/System/Library/AssetsV2/com_apple_MobileAsset_MetalToolchain/5f4a441a6d0a11f2e9b28c67384263afe92320f7.asset/AssetData",
+      "buildVersion": "17F109",
+      "status": "installed",
+      "toolchainIdentifier": "com.apple.dt.toolchain.Metal.32023.883",
+      "toolchainSearchPath": "/private/var/run/com.apple.security.cryptexd/mnt/com.apple.MobileAsset.MetalToolchain-v17.6.109.0.eWPxD9"
+    },
+    "metal_version": {
+      "argv": [
+        "/usr/bin/xcrun",
+        "metal",
+        "--version"
+      ],
+      "exit": 0,
+      "stdout": "Apple metal version 32023.883 (metalfe-32023.883)\nTarget: air64-apple-darwin25.5.0\nThread model: posix\nInstalledDir: /private/var/run/com.apple.security.cryptexd/mnt/com.apple.MobileAsset.MetalToolchain-v17.6.109.0.eWPxD9/Metal.xctoolchain/usr/metal/current/bin\n",
+      "stderr": ""
+    },
+    "metallib_probe": {
+      "argv": [
+        "/usr/bin/xcrun",
+        "--find",
+        "metallib"
+      ],
+      "exit": 0,
+      "stdout": "/var/run/com.apple.security.cryptexd/mnt/com.apple.MobileAsset.MetalToolchain-v17.6.109.0.eWPxD9/Metal.xctoolchain/usr/bin/metallib\n",
+      "stderr": ""
+    },
+    "metallib_version": {
+      "argv": [
+        "/usr/bin/xcrun",
+        "metallib",
+        "--version"
+      ],
+      "exit": 0,
+      "stdout": "AIR-LLD 32023.883 (metalfe-32023.883) (compatible with legacy metallib linker)\n",
+      "stderr": ""
+    }
+  },
+  "installed_toolchain": {
+    "paths": {
+      "TMPDIR": "<mac_scratch>/tmp",
+      "CARGO_HOME": "<mac_scratch>/cargo",
+      "RUSTUP_HOME": "<mac_scratch>/rustup",
+      "CARGO_TARGET_DIR": "<mac_scratch>/build",
+      "UV_CACHE_DIR": "<mac_scratch>/uv-cache"
+    },
+    "versions": {
+      "rustc": "rustc 1.98.1 (48a229cea 2026-09-01)\nbinary: rustc\ncommit-hash: 48a229ceaefd4985c50990b14116b6d856af0985\ncommit-date: 2026-09-01\nhost: aarch64-apple-darwin\nrelease: 1.98.1\nLLVM version: 22.1.8",
+      "cargo": "cargo 1.98.1 (797e8a9bc 2026-08-05)",
+      "rustup": "rustup 1.29.1 (d95a37b6a 2026-08-13)",
+      "rustfmt": "rustfmt 1.9.0-stable (48a229ceae 2026-09-01)",
+      "clippy": "clippy 0.1.98 (48a229ceae 2026-09-01)",
+      "cmake": "cmake version 4.4.3\n\nCMake suite maintained and supported by Kitware (kitware.com/cmake).",
+      "ninja": "1.13.2.git.kitware.jobserver-pipe-1"
+    }
+  },
+  "selected_dependencies": {
+    "status": "Source selection and checksums recorded; Cargo lockfile and native build enforcement remain pending.",
+    "crates": [
+      {
+        "crate": "mlx-rs",
+        "version": "0.32.0",
+        "sha256": "44774de28d595d6bc0f9ae359e5365321b96eab252698ec0773406c0cf77762b",
+        "archive_url": "https://crates.io/api/v1/crates/mlx-rs/0.32.0/download",
+        "metadata_url": "https://crates.io/api/v1/crates/mlx-rs/0.32.0"
+      },
+      {
+        "crate": "mlx-sys",
+        "version": "0.6.0",
+        "sha256": "1848b6f1686114039e6e0adcf1578911e2e4d7707b9768ad61da074132319e1c",
+        "archive_url": "https://crates.io/api/v1/crates/mlx-sys/0.6.0/download",
+        "metadata_url": "https://crates.io/api/v1/crates/mlx-sys/0.6.0"
+      },
+      {
+        "crate": "safetensors",
+        "version": "0.8.0",
+        "sha256": "79b079b829cb27a1c3c374341345ed2e8b2c0c839034522cee576c140bd7f846",
+        "archive_url": "https://crates.io/api/v1/crates/safetensors/0.8.0/download",
+        "metadata_url": "https://crates.io/api/v1/crates/safetensors"
+      }
+    ],
+    "mlx_rs_features": {
+      "default_features": false,
+      "enabled": [
+        "accelerate",
+        "metal"
+      ],
+      "safetensors_conversion": "disabled; validate storage and shape at the engine boundary"
+    },
+    "native": {
+      "binding_vcs": "9c2fd72e172babb1e3719327a723717d98ccbe97",
+      "mlx_c_submodule": "a341b4925024b88b2c593468f16e12f5e17315da",
+      "mlx_c_source": "https://github.com/ml-explore/mlx-c/tree/a341b4925024b88b2c593468f16e12f5e17315da",
+      "native_mlx_version": "0.32.3",
+      "native_mlx_commit": "64ea011cb65f14d9ce2737e60db9a4ae91ed7441",
+      "rustup_init_url": "https://static.rust-lang.org/rustup/dist/aarch64-apple-darwin/rustup-init",
+      "rustup_init_sha256": "ec1b9233e7f72990ecd8e62063fa7f6c3dfc2bec8e97f88bff165f9100ac696a"
+    },
+    "native_build": {
+      "MLX_BUILD_METAL": "ON",
+      "MLX_BUILD_ACCELERATE": "ON",
+      "MLX_METAL_JIT": "OFF (upstream default)",
+      "MACOSX_DEPLOYMENT_TARGET": "26.5",
+      "MLX_RS_METAL_PATH": "<mac_scratch>/metallib",
+      "enforcement": "Before the first native build, enforce the immutable native MLX commit rather than relying only on its mutable tag."
+    }
+  },
+  "build_tool_downloads": [
+    {
+      "tool": "cmake",
+      "version": "4.4.3",
+      "metadata_url": "https://pypi.org/pypi/cmake/json",
+      "mac_wheels": [
+        {
+          "filename": "cmake-4.4.3-py3-none-macosx_10_10_universal2.whl",
+          "url": "https://files.pythonhosted.org/packages/da/2e/78cc0dab93ad407e4b126ab6a3c8a6fc3df89011b49e910c5a5e9bda78a6/cmake-4.4.3-py3-none-macosx_10_10_universal2.whl",
+          "sha256": "6c95b37116bb5c714656e4f76931ebdcb739209a1aee91cf51408ccfe137694e"
+        }
+      ]
+    },
+    {
+      "tool": "ninja",
+      "version": "1.13.2",
+      "metadata_url": "https://pypi.org/pypi/ninja/json",
+      "mac_wheels": [
+        {
+          "filename": "ninja-1.13.2-py3-none-macosx_10_9_universal2.whl",
+          "url": "https://files.pythonhosted.org/packages/b5/b8/90a9518f2264637084d6199bc20c2f3fb97fefc4c474d277720150c3bd6d/ninja-1.13.2-py3-none-macosx_10_9_universal2.whl",
+          "sha256": "fd82e26c0706ad4ab88e5fdd26f3fab0a987a90f810160f6c322e752c6af298b"
+        }
+      ]
+    }
+  ],
+  "checkpoint": {
+    "path": "<model_dir>",
+    "index_tensor_count": 1757,
+    "base_weight_files": [
+      "model-00001-of-00004.safetensors",
+      "model-00002-of-00004.safetensors",
+      "model-00003-of-00004.safetensors",
+      "model-00004-of-00004.safetensors"
+    ],
+    "files": [
+      {
+        "path": "README.md",
+        "bytes": 7012,
+        "sha256": "bba904365a53ec7b6981eb72adc42b17492a45fd304ab070869f38d171578833",
+        "role": "metadata"
+      },
+      {
+        "path": "chat_template.jinja",
+        "bytes": 7764,
+        "sha256": "e84f32a23fdda27689f868aa4a1a5621f41133e51a48d7f3efcbea2839574259",
+        "role": "metadata"
+      },
+      {
+        "path": "config.json",
+        "bytes": 23591,
+        "sha256": "a822a9e48b0aafbe3144ec37d4fb067e178ed96615ce6e4420b3149893cc5767",
+        "role": "metadata"
+      },
+      {
+        "path": "configuration.json",
+        "bytes": 58,
+        "sha256": "c1b09db419119513247e9b8b912c4b9897106c9b20c6cada7e107d993c5435eb",
+        "role": "metadata"
+      },
+      {
+        "path": "generation_config.json",
+        "bytes": 202,
+        "sha256": "e70c136c1b78ddc1fb0905bac8e733a4dc448d4f852a5dd75143fffc70be550e",
+        "role": "metadata"
+      },
+      {
+        "path": "lora_edge0_35b.safetensors",
+        "bytes": 42413928,
+        "sha256": "a407f6d27bb55e39e6461bd4bce1fd90489e70c7582b68a796fb764bdb441ec1",
+        "role": "reference_adapter",
+        "tensor_count": 620,
+        "dtypes": [
+          "F16"
+        ]
+      },
+      {
+        "path": "model-00001-of-00004.safetensors",
+        "bytes": 4395019264,
+        "sha256": "f7fff28fecb8221e53787c6339c938b113bcb94c7bbc60d09a8826eba08ef1ab",
+        "role": "base_weight",
+        "tensor_count": 383,
+        "dtypes": [
+          "BF16",
+          "U32"
+        ]
+      },
+      {
+        "path": "model-00002-of-00004.safetensors",
+        "bytes": 5368472749,
+        "sha256": "31dcdb1c49eebdb1505bd14e3cb33f9cf900bd2546b638f2464694ae763a033f",
+        "role": "base_weight",
+        "tensor_count": 498,
+        "dtypes": [
+          "BF16",
+          "U32"
+        ]
+      },
+      {
+        "path": "model-00003-of-00004.safetensors",
+        "bytes": 5368324139,
+        "sha256": "3e66de06a1f03dade16a612a368cfce4a4c9caa4efd7d28185454384082cec03",
+        "role": "base_weight",
+        "tensor_count": 504,
+        "dtypes": [
+          "BF16",
+          "U32"
+        ]
+      },
+      {
+        "path": "model-00004-of-00004.safetensors",
+        "bytes": 4377211365,
+        "sha256": "a5d0cf03519c26f8b506df6b0ba60526e5c08c8cea22d0c21ce92950e58a5422",
+        "role": "base_weight",
+        "tensor_count": 372,
+        "dtypes": [
+          "BF16",
+          "U32"
+        ]
+      },
+      {
+        "path": "model.safetensors.index.json",
+        "bytes": 180182,
+        "sha256": "e359cd95565275b923fed8df019dd8e869d9af5dc4a621b4114ab7a8e6c534d1",
+        "role": "metadata"
+      },
+      {
+        "path": "preprocessor_config.json",
+        "bytes": 390,
+        "sha256": "27225450ac9c6529872ee1924fcb0962ff5634834f817040f444118116f4e516",
+        "role": "metadata"
+      },
+      {
+        "path": "prerouter_edge0_35b.safetensors",
+        "bytes": 138422000,
+        "sha256": "93d07af08e1f5c8d174e941016740cb4d2c143c6b90f33581237679eca9b006f",
+        "role": "reference_adapter",
+        "tensor_count": 99,
+        "dtypes": [
+          "F16"
+        ]
+      },
+      {
+        "path": "processor_config.json",
+        "bytes": 1312,
+        "sha256": "51c5f33646392e0bf1ed3e96be02504da47406c21c6cb86925d8908d1a6c4da7",
+        "role": "metadata"
+      },
+      {
+        "path": "tokenizer.json",
+        "bytes": 19989343,
+        "sha256": "87a7830d63fcf43bf241c3c5242e96e62dd3fdc29224ca26fed8ea333db72de4",
+        "role": "metadata"
+      },
+      {
+        "path": "tokenizer_config.json",
+        "bytes": 1139,
+        "sha256": "e98f1901ac6f0adff67b1d540bfa0c36ac1a0cf59eb72ed78146ef89aafa1182",
+        "role": "metadata"
+      },
+      {
+        "path": "vocab.json",
+        "bytes": 6722759,
+        "sha256": "ce99b4cb2983d118806ce0a8b777a35b093e2000a503ebde25853284c9dfa003",
+        "role": "metadata"
+      }
+    ],
+    "hf_config_metadata": [
+      "e21098e7faa916a00f5493795f12f20497d032bb",
+      "e3a2334ebf2df216742ef3ed4b784417bfffe6fc"
+    ],
+    "identity": {
+      "readme_base_model": "- Qwen/Qwen3.6-35B-A3B",
+      "source_repository": "Edge0/Edge0-35b-a3b-preview",
+      "provenance_limit": "Repository identity comes from the local README. File hashes identify the inspected local bytes."
+    },
+    "config_summary": {
+      "architectures": [
+        "Qwen3_5MoeForConditionalGeneration"
+      ],
+      "model_type": "qwen3_5_moe",
+      "text_model_type": "qwen3_5_moe_text",
+      "quantization_defaults": {
+        "bits": 4,
+        "group_size": 64,
+        "mode": "affine"
+      },
+      "quantization_overrides": {
+        "language_model.model.layers.0.mlp.gate": {
+          "group_size": 64,
+          "bits": 8
+        },
+        "language_model.model.layers.0.mlp.shared_expert_gate": {
+          "group_size": 64,
+          "bits": 8
+        },
+        "language_model.model.layers.1.mlp.gate": {
+          "group_size": 64,
+          "bits": 8
+        },
+        "language_model.model.layers.1.mlp.shared_expert_gate": {
+          "group_size": 64,
+          "bits": 8
+        },
+        "language_model.model.layers.2.mlp.gate": {
+          "group_size": 64,
+          "bits": 8
+        },
+        "language_model.model.layers.2.mlp.shared_expert_gate": {
+          "group_size": 64,
+          "bits": 8
+        },
+        "language_model.model.layers.3.mlp.gate": {
+          "group_size": 64,
+          "bits": 8
+        },
+        "language_model.model.layers.3.mlp.shared_expert_gate": {
+          "group_size": 64,
+          "bits": 8
+        },
+        "language_model.model.layers.4.mlp.gate": {
+          "group_size": 64,
+          "bits": 8
+        },
+        "language_model.model.layers.4.mlp.shared_expert_gate": {
+          "group_size": 64,
+          "bits": 8
+        },
+        "language_model.model.layers.5.mlp.gate": {
+          "group_size": 64,
+          "bits": 8
+        },
+        "language_model.model.layers.5.mlp.shared_expert_gate": {
+          "group_size": 64,
+          "bits": 8
+        },
+        "language_model.model.layers.6.mlp.gate": {
+          "group_size": 64,
+          "bits": 8
+        },
+        "language_model.model.layers.6.mlp.shared_expert_gate": {
+          "group_size": 64,
+          "bits": 8
+        },
+        "language_model.model.layers.7.mlp.gate": {
+          "group_size": 64,
+          "bits": 8
+        },
+        "language_model.model.layers.7.mlp.shared_expert_gate": {
+          "group_size": 64,
+          "bits": 8
+        },
+        "language_model.model.layers.8.mlp.gate": {
+          "group_size": 64,
+          "bits": 8
+        },
+        "language_model.model.layers.8.mlp.shared_expert_gate": {
+          "group_size": 64,
+          "bits": 8
+        },
+        "language_model.model.layers.9.mlp.gate": {
+          "group_size": 64,
+          "bits": 8
+        },
+        "language_model.model.layers.9.mlp.shared_expert_gate": {
+          "group_size": 64,
+          "bits": 8
+        },
+        "language_model.model.layers.10.mlp.gate": {
+          "group_size": 64,
+          "bits": 8
+        },
+        "language_model.model.layers.10.mlp.shared_expert_gate": {
+          "group_size": 64,
+          "bits": 8
+        },
+        "language_model.model.layers.11.mlp.gate": {
+          "group_size": 64,
+          "bits": 8
+        },
+        "language_model.model.layers.11.mlp.shared_expert_gate": {
+          "group_size": 64,
+          "bits": 8
+        },
+        "language_model.model.layers.12.mlp.gate": {
+          "group_size": 64,
+          "bits": 8
+        },
+        "language_model.model.layers.12.mlp.shared_expert_gate": {
+          "group_size": 64,
+          "bits": 8
+        },
+        "language_model.model.layers.13.mlp.gate": {
+          "group_size": 64,
+          "bits": 8
+        },
+        "language_model.model.layers.13.mlp.shared_expert_gate": {
+          "group_size": 64,
+          "bits": 8
+        },
+        "language_model.model.layers.14.mlp.gate": {
+          "group_size": 64,
+          "bits": 8
+        },
+        "language_model.model.layers.14.mlp.shared_expert_gate": {
+          "group_size": 64,
+          "bits": 8
+        },
+        "language_model.model.layers.15.mlp.gate": {
+          "group_size": 64,
+          "bits": 8
+        },
+        "language_model.model.layers.15.mlp.shared_expert_gate": {
+          "group_size": 64,
+          "bits": 8
+        },
+        "language_model.model.layers.16.mlp.gate": {
+          "group_size": 64,
+          "bits": 8
+        },
+        "language_model.model.layers.16.mlp.shared_expert_gate": {
+          "group_size": 64,
+          "bits": 8
+        },
+        "language_model.model.layers.17.mlp.gate": {
+          "group_size": 64,
+          "bits": 8
+        },
+        "language_model.model.layers.17.mlp.shared_expert_gate": {
+          "group_size": 64,
+          "bits": 8
+        },
+        "language_model.model.layers.18.mlp.gate": {
+          "group_size": 64,
+          "bits": 8
+        },
+        "language_model.model.layers.18.mlp.shared_expert_gate": {
+          "group_size": 64,
+          "bits": 8
+        },
+        "language_model.model.layers.19.mlp.gate": {
+          "group_size": 64,
+          "bits": 8
+        },
+        "language_model.model.layers.19.mlp.shared_expert_gate": {
+          "group_size": 64,
+          "bits": 8
+        },
+        "language_model.model.layers.20.mlp.gate": {
+          "group_size": 64,
+          "bits": 8
+        },
+        "language_model.model.layers.20.mlp.shared_expert_gate": {
+          "group_size": 64,
+          "bits": 8
+        },
+        "language_model.model.layers.21.mlp.gate": {
+          "group_size": 64,
+          "bits": 8
+        },
+        "language_model.model.layers.21.mlp.shared_expert_gate": {
+          "group_size": 64,
+          "bits": 8
+        },
+        "language_model.model.layers.22.mlp.gate": {
+          "group_size": 64,
+          "bits": 8
+        },
+        "language_model.model.layers.22.mlp.shared_expert_gate": {
+          "group_size": 64,
+          "bits": 8
+        },
+        "language_model.model.layers.23.mlp.gate": {
+          "group_size": 64,
+          "bits": 8
+        },
+        "language_model.model.layers.23.mlp.shared_expert_gate": {
+          "group_size": 64,
+          "bits": 8
+        },
+        "language_model.model.layers.24.mlp.gate": {
+          "group_size": 64,
+          "bits": 8
+        },
+        "language_model.model.layers.24.mlp.shared_expert_gate": {
+          "group_size": 64,
+          "bits": 8
+        },
+        "language_model.model.layers.25.mlp.gate": {
+          "group_size": 64,
+          "bits": 8
+        },
+        "language_model.model.layers.25.mlp.shared_expert_gate": {
+          "group_size": 64,
+          "bits": 8
+        },
+        "language_model.model.layers.26.mlp.gate": {
+          "group_size": 64,
+          "bits": 8
+        },
+        "language_model.model.layers.26.mlp.shared_expert_gate": {
+          "group_size": 64,
+          "bits": 8
+        },
+        "language_model.model.layers.27.mlp.gate": {
+          "group_size": 64,
+          "bits": 8
+        },
+        "language_model.model.layers.27.mlp.shared_expert_gate": {
+          "group_size": 64,
+          "bits": 8
+        },
+        "language_model.model.layers.28.mlp.gate": {
+          "group_size": 64,
+          "bits": 8
+        },
+        "language_model.model.layers.28.mlp.shared_expert_gate": {
+          "group_size": 64,
+          "bits": 8
+        },
+        "language_model.model.layers.29.mlp.gate": {
+          "group_size": 64,
+          "bits": 8
+        },
+        "language_model.model.layers.29.mlp.shared_expert_gate": {
+          "group_size": 64,
+          "bits": 8
+        },
+        "language_model.model.layers.30.mlp.gate": {
+          "group_size": 64,
+          "bits": 8
+        },
+        "language_model.model.layers.30.mlp.shared_expert_gate": {
+          "group_size": 64,
+          "bits": 8
+        },
+        "language_model.model.layers.31.mlp.gate": {
+          "group_size": 64,
+          "bits": 8
+        },
+        "language_model.model.layers.31.mlp.shared_expert_gate": {
+          "group_size": 64,
+          "bits": 8
+        },
+        "language_model.model.layers.32.mlp.gate": {
+          "group_size": 64,
+          "bits": 8
+        },
+        "language_model.model.layers.32.mlp.shared_expert_gate": {
+          "group_size": 64,
+          "bits": 8
+        },
+        "language_model.model.layers.33.mlp.gate": {
+          "group_size": 64,
+          "bits": 8
+        },
+        "language_model.model.layers.33.mlp.shared_expert_gate": {
+          "group_size": 64,
+          "bits": 8
+        },
+        "language_model.model.layers.34.mlp.gate": {
+          "group_size": 64,
+          "bits": 8
+        },
+        "language_model.model.layers.34.mlp.shared_expert_gate": {
+          "group_size": 64,
+          "bits": 8
+        },
+        "language_model.model.layers.35.mlp.gate": {
+          "group_size": 64,
+          "bits": 8
+        },
+        "language_model.model.layers.35.mlp.shared_expert_gate": {
+          "group_size": 64,
+          "bits": 8
+        },
+        "language_model.model.layers.36.mlp.gate": {
+          "group_size": 64,
+          "bits": 8
+        },
+        "language_model.model.layers.36.mlp.shared_expert_gate": {
+          "group_size": 64,
+          "bits": 8
+        },
+        "language_model.model.layers.37.mlp.gate": {
+          "group_size": 64,
+          "bits": 8
+        },
+        "language_model.model.layers.37.mlp.shared_expert_gate": {
+          "group_size": 64,
+          "bits": 8
+        },
+        "language_model.model.layers.38.mlp.gate": {
+          "group_size": 64,
+          "bits": 8
+        },
+        "language_model.model.layers.38.mlp.shared_expert_gate": {
+          "group_size": 64,
+          "bits": 8
+        },
+        "language_model.model.layers.39.mlp.gate": {
+          "group_size": 64,
+          "bits": 8
+        },
+        "language_model.model.layers.39.mlp.shared_expert_gate": {
+          "group_size": 64,
+          "bits": 8
+        }
+      }
+    }
+  },
+  "reference": {
+    "path": "<reference_checkout>",
+    "revision": "cb50d47bfbe93246500279106074faa944cddd73",
+    "branch": "kv-slices",
+    "git_status": "?? models/",
+    "packages": {
+      "python": "3.12.14 (main, Sep  1 2026, 14:09:38) [Clang 22.1.3 ]",
+      "executable": "<reference_checkout>/.venv/bin/python",
+      "packages": {
+        "mlx": "0.30.6",
+        "mlx-lm": "0.31.0",
+        "safetensors": "0.8.0",
+        "numpy": "2.5.3",
+        "transformers": "5.17.0"
+      }
+    },
+    "qualification": "Existing reference inspected only. Version alignment and benchmark protocol remain pending."
+  },
+  "checks": {
+    "checkpoint_sha256": "All listed files hashed on the Mac; size and mtime unchanged during each hash.",
+    "safetensors": "Headers inventoried only. No Rust parser, tensor byte validation, or numerical gate ran.",
+    "tool_versions": "Installed binaries returned their recorded versions.",
+    "activation": "sh -n passed.",
+    "native_build": "not run; compiler and linker prerequisites now verified",
+    "inference": "not run",
+    "mathematical_verification": "No derived capacity or throughput results. Hardware byte values are direct observations.",
+    "rustdocs": "Unavailable in the session; inspected official crate archives and pinned upstream source.",
+    "metal_preprocess": "passed; __METAL_VERSION__ reports 400 for deployment target 26.5"
+  },
+  "environment_update": "the Metal toolchain environment record"
+}

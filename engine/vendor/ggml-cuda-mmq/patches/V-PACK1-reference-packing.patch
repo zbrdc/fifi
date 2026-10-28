@@ -1,0 +1,151 @@
+diff --git a/src/ggml-cuda/quantize.cu b/src/ggml-cuda/quantize.cu
+index 7bbac908..3f220696 100644
+--- a/src/ggml-cuda/quantize.cu
++++ b/src/ggml-cuda/quantize.cu
+@@ -454,7 +454,7 @@ static __global__ void quantize_mmq_mxfp4(const float * __restrict__ x,
+ }
+ 
+ // scatter: grid over tokens, quantize once, write to all the token's compact rows
+-template <mmq_q8_1_ds_layout ds_layout, bool scatter>
++template <mmq_q8_1_ds_layout ds_layout, bool scatter, bool q8_cpu_rounding = false>
+ static __global__ void quantize_mmq_q8_1(
+         const float * __restrict__ x, const int32_t * __restrict__ ids, void * __restrict__ vy,
+         const int64_t ne00, const int64_t s01, const int64_t s02, const int64_t s03,
+@@ -514,10 +514,17 @@ static __global__ void quantize_mmq_q8_1(
+ 
+     const float d_inv = 127.0f / amax;
+     char4 q;
+-    q.x = roundf(xi.x*d_inv);
+-    q.y = roundf(xi.y*d_inv);
+-    q.z = roundf(xi.z*d_inv);
+-    q.w = roundf(xi.w*d_inv);
++    if constexpr (q8_cpu_rounding) {
++        q.x = __float2int_rn(xi.x*d_inv);
++        q.y = __float2int_rn(xi.y*d_inv);
++        q.z = __float2int_rn(xi.z*d_inv);
++        q.w = __float2int_rn(xi.w*d_inv);
++    } else {
++        q.x = roundf(xi.x*d_inv);
++        q.y = roundf(xi.y*d_inv);
++        q.z = roundf(xi.z*d_inv);
++        q.w = roundf(xi.w*d_inv);
++    }
+     const float d = 1.0f / d_inv;
+ 
+     // write the block once (normal) or to each of the token's compact rows (scatter)
+@@ -548,7 +555,7 @@ static __global__ void quantize_mmq_q8_1(
+             if (ds_layout == MMQ_Q8_1_DS_LAYOUT_DS4) {
+                 y[ib].ds4[iqs/32] = make_half2(d, sum);
+             } else {
+-                y[ib].d4[iqs/32]  = d;
++                y[ib].d4[iqs/32]  = q8_cpu_rounding ? __half2float(__float2half_rn(d)) : d;
+             }
+         }
+     }
+@@ -573,10 +580,10 @@ cudaError_t quantize_row_q8_1_cuda(
+     return ggml_cuda_kernel_launch(quantize_q8_1, launch_params, x, vy, ne00, s01, s02, s03, ne0, ne1, ne2_fastdiv);
+ }
+ 
+-cudaError_t quantize_mmq_q8_1_cuda(
++cudaError_t quantize_mmq_q8_1_cuda_policy(
+         const float * x, const int32_t * ids, void * vy, const ggml_type type_src0,
+         const int64_t ne00, const int64_t s01, const int64_t s02, const int64_t s03,
+-        const int64_t ne0, const int64_t ne1, const int64_t ne2, const int64_t ne3, cudaStream_t stream) {
++        const int64_t ne0, const int64_t ne1, const int64_t ne2, const int64_t ne3, cudaStream_t stream, bool cpu_reference) {
+     FIFI_REQUIRE(ne00 % 4 == 0);
+     FIFI_REQUIRE(ne0 % QK8_1_MMQ == 0);
+ 
+@@ -586,8 +593,14 @@ cudaError_t quantize_mmq_q8_1_cuda(
+     const dim3 block_size(CUDA_QUANTIZE_BLOCK_SIZE_MMQ, 1, 1);
+     switch (mmq_get_q8_1_ds_layout(type_src0)) {
+         case MMQ_Q8_1_DS_LAYOUT_D4:
+-            quantize_mmq_q8_1<MMQ_Q8_1_DS_LAYOUT_D4, false>
+-                <<<num_blocks, block_size, 0, stream>>>(x, ids, vy, ne00, s01, s02, s03, ne0, ne1, ne2, /*n_expert_used=*/0);
++            // Reference packing is opt-in; generic MMQ keeps the original rounding.
++            if (cpu_reference && type_src0 == GGML_TYPE_Q8_0) {
++                quantize_mmq_q8_1<MMQ_Q8_1_DS_LAYOUT_D4, false, true>
++                    <<<num_blocks, block_size, 0, stream>>>(x, ids, vy, ne00, s01, s02, s03, ne0, ne1, ne2, /*n_expert_used=*/0);
++            } else {
++                quantize_mmq_q8_1<MMQ_Q8_1_DS_LAYOUT_D4, false>
++                    <<<num_blocks, block_size, 0, stream>>>(x, ids, vy, ne00, s01, s02, s03, ne0, ne1, ne2, /*n_expert_used=*/0);
++            }
+             break;
+         case MMQ_Q8_1_DS_LAYOUT_DS4:
+             quantize_mmq_q8_1<MMQ_Q8_1_DS_LAYOUT_DS4, false>
+@@ -604,10 +617,10 @@ cudaError_t quantize_mmq_q8_1_cuda(
+ }
+ 
+ // scatter=true reuses the quant kernel: grid over tokens, ids = inverse map (token slot -> compact row)
+-cudaError_t quantize_scatter_mmq_q8_1_cuda(
++cudaError_t quantize_scatter_mmq_q8_1_cuda_policy(
+         const float * x, const int32_t * ids_src1_inv, void * vy, const ggml_type type_src0,
+         const int64_t ne00, const int64_t stride_token, const int64_t ne0,
+-        const int64_t n_tokens, const int64_t nrows_dst, const int n_expert_used, cudaStream_t stream) {
++        const int64_t n_tokens, const int64_t nrows_dst, const int n_expert_used, cudaStream_t stream, bool cpu_reference) {
+     FIFI_REQUIRE(ne00 % 4 == 0);
+     FIFI_REQUIRE(ne0 % QK8_1_MMQ == 0);
+ 
+@@ -616,8 +629,14 @@ cudaError_t quantize_scatter_mmq_q8_1_cuda(
+     const dim3 block_size(CUDA_QUANTIZE_BLOCK_SIZE_MMQ, 1, 1);
+     switch (mmq_get_q8_1_ds_layout(type_src0)) {
+         case MMQ_Q8_1_DS_LAYOUT_D4:
+-            quantize_mmq_q8_1<MMQ_Q8_1_DS_LAYOUT_D4, true><<<num_blocks, block_size, 0, stream>>>(
+-                x, ids_src1_inv, vy, ne00, /*s01=*/0, /*s02=*/stride_token, /*s03=*/0, ne0, /*ne1=*/(int) nrows_dst, /*ne2=*/1, n_expert_used);
++            // Reference packing is opt-in; generic MMQ keeps the original rounding.
++            if (cpu_reference && type_src0 == GGML_TYPE_Q8_0) {
++                quantize_mmq_q8_1<MMQ_Q8_1_DS_LAYOUT_D4, true, true><<<num_blocks, block_size, 0, stream>>>(
++                    x, ids_src1_inv, vy, ne00, /*s01=*/0, /*s02=*/stride_token, /*s03=*/0, ne0, /*ne1=*/(int) nrows_dst, /*ne2=*/1, n_expert_used);
++            } else {
++                quantize_mmq_q8_1<MMQ_Q8_1_DS_LAYOUT_D4, true><<<num_blocks, block_size, 0, stream>>>(
++                    x, ids_src1_inv, vy, ne00, /*s01=*/0, /*s02=*/stride_token, /*s03=*/0, ne0, /*ne1=*/(int) nrows_dst, /*ne2=*/1, n_expert_used);
++            }
+             break;
+         case MMQ_Q8_1_DS_LAYOUT_DS4:
+             quantize_mmq_q8_1<MMQ_Q8_1_DS_LAYOUT_DS4, true><<<num_blocks, block_size, 0, stream>>>(
+@@ -704,3 +723,20 @@ cudaError_t quantize_mmq_fp4_cuda(
+     }
+     return cudaGetLastError();
+ }
++
++// Preserve the original signatures, including callers that use quantize_cuda_t.
++cudaError_t quantize_mmq_q8_1_cuda(
++        const float *x, const int32_t *ids, void *vy, ggml_type type_src0,
++        int64_t ne00, int64_t s01, int64_t s02, int64_t s03,
++        int64_t ne0, int64_t ne1, int64_t ne2, int64_t ne3, cudaStream_t stream) {
++    return quantize_mmq_q8_1_cuda_policy(x, ids, vy, type_src0, ne00, s01, s02, s03,
++                                        ne0, ne1, ne2, ne3, stream, false);
++}
++
++cudaError_t quantize_scatter_mmq_q8_1_cuda(
++        const float *x, const int32_t *ids, void *vy, ggml_type type_src0,
++        int64_t ne00, int64_t stride_token, int64_t ne0, int64_t n_tokens,
++        int64_t nrows_dst, int n_expert_used, cudaStream_t stream) {
++    return quantize_scatter_mmq_q8_1_cuda_policy(x, ids, vy, type_src0, ne00,
++        stride_token, ne0, n_tokens, nrows_dst, n_expert_used, stream, false);
++}
+diff --git a/src/ggml-cuda/quantize.cuh b/src/ggml-cuda/quantize.cuh
+index 82f9d365..d67a244e 100644
+--- a/src/ggml-cuda/quantize.cuh
++++ b/src/ggml-cuda/quantize.cuh
+@@ -68,3 +68,21 @@ cudaError_t quantize_scatter_mmq_q8_1_cuda(const float *   x,
+                                     int64_t         nrows_dst,
+                                     int             n_expert_used,
+                                     cudaStream_t    stream);
++
++// Internal policy entries; the original entry points retain vendor behavior.
++cudaError_t quantize_mmq_q8_1_cuda_policy(
++        const float * x, const int32_t * ids, void * vy,
++        ggml_type type_src0, int64_t ne00, int64_t s01, int64_t s02, int64_t s03,
++        int64_t ne0, int64_t ne1, int64_t ne2, int64_t ne3, cudaStream_t stream, bool cpu_reference);
++
++cudaError_t quantize_scatter_mmq_q8_1_cuda_policy(const float *   x,
++                                    const int32_t * ids_src1_inv,
++                                    void *          vy,
++                                    ggml_type       type_src0,
++                                    int64_t         ne00,
++                                    int64_t         stride_token,
++                                    int64_t         ne0,
++                                    int64_t         n_tokens,
++                                    int64_t         nrows_dst,
++                                    int             n_expert_used,
++                                    cudaStream_t    stream, bool cpu_reference);

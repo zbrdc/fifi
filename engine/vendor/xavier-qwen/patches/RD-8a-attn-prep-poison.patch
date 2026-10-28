@@ -1,0 +1,48 @@
+--- a/src/ops.cu
++++ b/src/ops.cu
+@@ -147,7 +147,20 @@
+   constexpr int D = kHeadDim;
+   __shared__ float x[D];
+   int head = blockIdx.x, t = blockIdx.y, d = threadIdx.x;
+-  int pos = (a.pos_dev ? *a.pos_dev : a.pos0) + t;
++  // Poison guard (RD-8a): the position word is read from the device and may hold the -1 of a
++  // saturated step. Test it, in 64 bits, against the cache rows before any memory access. The
++  // answer is the same for every block of the launch (while no other stream writes the word), so
++  // the early return below is block uniform and happens before the first barrier. A refused launch
++  // writes no KV row, ORs status_bits into status_dev (one thread, integer atomic) and sets q to
++  // NaN so that the attention that reads it cannot yield a plausible value.
++  long long first = a.pos_dev ? *a.pos_dev : a.pos0;
++  if (first < 0 || first + a.m > a.rows) {
++    if (a.status_dev && blockIdx.x == 0 && blockIdx.y == 0 && threadIdx.x == 0)
++      atomicOr(a.status_dev, a.status_bits);
++    if (head < a.n_head) a.q[((size_t)t * a.n_head + head) * D + d] = __int_as_float(0x7fc00000);
++    return;
++  }
++  int pos = (int)first + t;
+   const float* p = a.proj + (size_t)t * a.ld;
+   int kv_base = a.n_head * 2 * D;
+   if (head >= a.n_head + a.n_kv_head) {
+--- a/src/ops.h
++++ b/src/ops.h
+@@ -68,7 +68,7 @@
+ 
+ // Attention preparation for one layer (attn_prep): Q/K RMSNorm, NEOX rope on the first n_rot dims,
+ // KV cache write. It reads proj, ld, n_head, n_kv_head, n_rot, q_norm, k_norm, eps, rope_base,
+-// k_cache, v_cache, q, pos_dev, pos0 and m; the other fields belong to the attention kernels.
++// k_cache, v_cache, rows, status_dev, status_bits, q, pos_dev, pos0 and m; the other fields belong to the attention kernels.
+ struct AttnArgs {
+   const float* proj;  // [m][ld]: per q head [q 256 | gate 256], then k, then v
+   int ld, n_head, n_kv_head, n_rot;
+@@ -84,6 +84,12 @@
+   // Null, or a device word holding the position of token 0 (replaces pos0). The kernel reads it
+   // when it runs, so one captured graph serves every position.
+   const int* pos_dev = nullptr;
++  // Rows of k_cache and v_cache. The kernel writes KV rows only when 0 <= position and
++  // position + m <= rows; otherwise it writes no KV row and sets q to NaN. Zero refuses every launch.
++  int rows = 0;
++  // Null, or a device word that receives status_bits (integer OR, one thread) when a launch is refused.
++  int* status_dev = nullptr;
++  int status_bits = 0;
+ };
+ cudaError_t attn_prep(const AttnArgs& a, cudaStream_t stream = nullptr);
+ 

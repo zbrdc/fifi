@@ -1,0 +1,372 @@
+{
+  "project": "ggml-cuda-mmq",
+  "source": "https://github.com/ggml-org/llama.cpp",
+  "commit": "acecd56032ddc34bada14a2d978f110d9c987095",
+  "license": "MIT",
+  "copyright": "Copyright (c) 2023-2026 The ggml authors",
+  "note": "CPF-V1 pure import: the include closure of the mmq instances q4_k, q5_0, q6_k, q8_0, quantize.cu and mmid.cu, byte identical to the pin; vendored_sha256 equals upstream_sha256 for every file and there is no patch. Shims are our glue (CPF-V2); sha256 null means not written yet. CPF-V2 patch V-2 (patches/V-2-errors.patch) follows the import, so the sentence above on the absence of a patch describes the CPF-V1 state; patched_sha256 is the file after the last patch of its chain. Patch V-3a (patches/V-3a-backend-machinery.patch) deletes the unused ggml backend machinery. Patch V-3b (patches/V-3b-stream-fixup-device-guard.patch) makes the fixup range and the device facts arguments and adds the typed host refusal fifi_check_device. Patch V-3c (patches/V-3c-pdl-off.patch) sets PDL off with one line. The three shims are written; their sha256 is recorded. Patch V-4 (patches/V-4-trim.patch) edits three files; ten whole files are removed and listed under trim with their upstream hashes (the pin holds their bytes). MATVEC-PAR S1 c1: the MMVQ import (mmvq.cu, mmvq.cuh, byte identical to the pin) with a new unary.cuh shim (the four scalar GLU device helpers) and enum ggml_glu_op added to the ggml.h shim, so the untrimmed include of unary.cuh resolves. MATVEC-PAR S1 c2: patch V-MV1 (patches/V-MV1-mmvq.patch) trims the import to the device-only, error-returning form; final hashes in files.patched_sha256. V-PACK1 adds an opt-in Q8_0 reference policy. The original vendor entries retain their signatures and behavior. Q4_K reference packing remains in our native glue. Patch V-5 (patches/V-5-q4k-tiling-configs.patch) makes the Q4_K rows for J 8..64 tiling configs, so a narrow grouped tile does not switch the kernel to stream-k.",
+  "include_roots": [
+    "src/ggml-cuda",
+    "src"
+  ],
+  "files": {
+    "LICENSE": {
+      "upstream_path": "LICENSE",
+      "upstream_sha256": "94f29bbed6a22c35b992c5c6ebf0e7c92f13b836b90f36f461c9cf2f0f1d010d",
+      "vendored_sha256": "94f29bbed6a22c35b992c5c6ebf0e7c92f13b836b90f36f461c9cf2f0f1d010d"
+    },
+    "src/ggml-common.h": {
+      "upstream_path": "ggml/src/ggml-common.h",
+      "upstream_sha256": "0061131b615c5721fc88a78feeb22c1f8c450f1c2646a317d80796a653bf595c",
+      "vendored_sha256": "0061131b615c5721fc88a78feeb22c1f8c450f1c2646a317d80796a653bf595c"
+    },
+    "src/ggml-cuda/common.cuh": {
+      "upstream_path": "ggml/src/ggml-cuda/common.cuh",
+      "upstream_sha256": "de910de24b186d60216791828a52ec56dd0126fdf29eed6a4e0536104fd65520",
+      "vendored_sha256": "de910de24b186d60216791828a52ec56dd0126fdf29eed6a4e0536104fd65520",
+      "patched_sha256": "1d1d35cd0a829d5889c1cdcfa775595327033679d82bb9a49b9639a06b2bad20"
+    },
+    "src/ggml-cuda/mma.cuh": {
+      "upstream_path": "ggml/src/ggml-cuda/mma.cuh",
+      "upstream_sha256": "c7e0f3332da182e203b4b953f9fa8535ffca3767d2b7d4d7dbf7ce486262d1af",
+      "vendored_sha256": "c7e0f3332da182e203b4b953f9fa8535ffca3767d2b7d4d7dbf7ce486262d1af"
+    },
+    "src/ggml-cuda/mmvq.cu": {
+      "upstream_path": "ggml/src/ggml-cuda/mmvq.cu",
+      "upstream_sha256": "d4c70f68ab79d463fd6fd52cac66a62e915858397ba4b2b7f658a7fbf13121f3",
+      "vendored_sha256": "d4c70f68ab79d463fd6fd52cac66a62e915858397ba4b2b7f658a7fbf13121f3",
+      "patched_sha256": "8ffa0a71dd8e9a0ca1931f455d007d1e0a0f9190d9ba6a9c649598e4d6a82d9d"
+    },
+    "src/ggml-cuda/mmvq.cuh": {
+      "upstream_path": "ggml/src/ggml-cuda/mmvq.cuh",
+      "upstream_sha256": "b37f8359f519ba90ddecd9cb3ca5f8c2ae05685bfae6813d435d75763c2bb006",
+      "vendored_sha256": "b37f8359f519ba90ddecd9cb3ca5f8c2ae05685bfae6813d435d75763c2bb006",
+      "patched_sha256": "d10e0201283eff3bbbe6e2d9f3cfc813a7af507547f55f79ad6359520e49d317"
+    },
+    "src/ggml-cuda/mmid.cu": {
+      "upstream_path": "ggml/src/ggml-cuda/mmid.cu",
+      "upstream_sha256": "cd5a6895c52a413f7c8f7273d02ed5a1253d3b6833701fa40b68e3716bbc3c87",
+      "vendored_sha256": "cd5a6895c52a413f7c8f7273d02ed5a1253d3b6833701fa40b68e3716bbc3c87",
+      "patched_sha256": "ca0a5f1f499555daa73ff4dc0d40a00fecc0b123e0c5578783b0eba2eccb0f8e"
+    },
+    "src/ggml-cuda/mmid.cuh": {
+      "upstream_path": "ggml/src/ggml-cuda/mmid.cuh",
+      "upstream_sha256": "236962648e49c0faa2d76f505c781e36a99c833b27ff3a871111d9de135803ed",
+      "vendored_sha256": "236962648e49c0faa2d76f505c781e36a99c833b27ff3a871111d9de135803ed",
+      "patched_sha256": "0cf96dca5bfcbf42a460c40aa1b11f0a20e21ef0b29394a3932506f2cf3cf5f7"
+    },
+    "src/ggml-cuda/mmq-config-ampere.cuh": {
+      "upstream_path": "ggml/src/ggml-cuda/mmq-config-ampere.cuh",
+      "upstream_sha256": "6de9336a6c2f65c0ad83cbe9303dcd03e8cbb6185d15346133a31421000f6408",
+      "vendored_sha256": "6de9336a6c2f65c0ad83cbe9303dcd03e8cbb6185d15346133a31421000f6408",
+      "patched_sha256": "fcbf07e96134045950a3108a04179de385104f2f5065a1cc00a0feb857eac08d"
+    },
+    "src/ggml-cuda/mmq-config-pascal-dp4a.cuh": {
+      "upstream_path": "ggml/src/ggml-cuda/mmq-config-pascal-dp4a.cuh",
+      "upstream_sha256": "67a93b6d26d3e16e77fd285dd77e7cca7848fb0b0d68897c2ff1e8cc47102263",
+      "vendored_sha256": "67a93b6d26d3e16e77fd285dd77e7cca7848fb0b0d68897c2ff1e8cc47102263"
+    },
+    "src/ggml-cuda/mmq-load-tiles.cuh": {
+      "upstream_path": "ggml/src/ggml-cuda/mmq-load-tiles.cuh",
+      "upstream_sha256": "f1adb201fa40087e294c40887e62f583f6a7adf40ddca542a735774742e0ae2c",
+      "vendored_sha256": "f1adb201fa40087e294c40887e62f583f6a7adf40ddca542a735774742e0ae2c"
+    },
+    "src/ggml-cuda/mmq-vec-dot.cuh": {
+      "upstream_path": "ggml/src/ggml-cuda/mmq-vec-dot.cuh",
+      "upstream_sha256": "58e87f162ec6e4bd5d23e99aeac76f3dd0e13a6cdfe01165cae806b51fe9ae65",
+      "vendored_sha256": "58e87f162ec6e4bd5d23e99aeac76f3dd0e13a6cdfe01165cae806b51fe9ae65"
+    },
+    "src/ggml-cuda/mmq.cuh": {
+      "upstream_path": "ggml/src/ggml-cuda/mmq.cuh",
+      "upstream_sha256": "50db23f5055af6e28c142fcb4c7fb16c51f7137184ebf8c0ca113ed88906851b",
+      "vendored_sha256": "50db23f5055af6e28c142fcb4c7fb16c51f7137184ebf8c0ca113ed88906851b",
+      "patched_sha256": "b66116c5ac0ef41e316f399731d44e3381a8c14971525caf64548652ae9e9d9e"
+    },
+    "src/ggml-cuda/quantize.cu": {
+      "upstream_path": "ggml/src/ggml-cuda/quantize.cu",
+      "upstream_sha256": "71cd7baab62ee1f457d23ae648c381d18b9b1327ec34832f31463b14b81895b3",
+      "vendored_sha256": "71cd7baab62ee1f457d23ae648c381d18b9b1327ec34832f31463b14b81895b3",
+      "patched_sha256": "1045cfce82615ec67d08d40f6edb733e8279f62887819c91ff97440bfd56c6ef"
+    },
+    "src/ggml-cuda/quantize.cuh": {
+      "upstream_path": "ggml/src/ggml-cuda/quantize.cuh",
+      "upstream_sha256": "112e190a096e1fa68d4c72ca2a450cb202586e3f2919c884f3e3316a8d5c57cd",
+      "vendored_sha256": "112e190a096e1fa68d4c72ca2a450cb202586e3f2919c884f3e3316a8d5c57cd",
+      "patched_sha256": "3cad550cb483a4142651b5fe0c4ea3c4cd24abf3ef17f1f8c915ed94fbccff04"
+    },
+    "src/ggml-cuda/template-instances/mmq-instance-q4_k.cu": {
+      "upstream_path": "ggml/src/ggml-cuda/template-instances/mmq-instance-q4_k.cu",
+      "upstream_sha256": "2ab47361d40a9ece25406c20693424a466c93bcb5cdb5c06cee8f9d03a806beb",
+      "vendored_sha256": "2ab47361d40a9ece25406c20693424a466c93bcb5cdb5c06cee8f9d03a806beb"
+    },
+    "src/ggml-cuda/template-instances/mmq-instance-q5_0.cu": {
+      "upstream_path": "ggml/src/ggml-cuda/template-instances/mmq-instance-q5_0.cu",
+      "upstream_sha256": "34a443ed0e68b1ad614eb251758d0f43f003ce8d10e7833f9f58a46677d336db",
+      "vendored_sha256": "34a443ed0e68b1ad614eb251758d0f43f003ce8d10e7833f9f58a46677d336db"
+    },
+    "src/ggml-cuda/template-instances/mmq-instance-q6_k.cu": {
+      "upstream_path": "ggml/src/ggml-cuda/template-instances/mmq-instance-q6_k.cu",
+      "upstream_sha256": "989943d6501a74927d079eacca793e94a1233863196c94dd20e459017ed76fc2",
+      "vendored_sha256": "989943d6501a74927d079eacca793e94a1233863196c94dd20e459017ed76fc2"
+    },
+    "src/ggml-cuda/template-instances/mmq-instance-q8_0.cu": {
+      "upstream_path": "ggml/src/ggml-cuda/template-instances/mmq-instance-q8_0.cu",
+      "upstream_sha256": "b38f4de9a3563debaf4796d6772e1ed72ce6944c2b8b03f9c26bf19191addee7",
+      "vendored_sha256": "b38f4de9a3563debaf4796d6772e1ed72ce6944c2b8b03f9c26bf19191addee7"
+    },
+    "src/ggml-cuda/vecdotq.cuh": {
+      "upstream_path": "ggml/src/ggml-cuda/vecdotq.cuh",
+      "upstream_sha256": "a7fd4281ad9f0a6d9373c776325411d2522e0b62ffae2c16e91e667a1af251fe",
+      "vendored_sha256": "a7fd4281ad9f0a6d9373c776325411d2522e0b62ffae2c16e91e667a1af251fe"
+    },
+    "src/ggml-cuda/vendors/cuda.h": {
+      "upstream_path": "ggml/src/ggml-cuda/vendors/cuda.h",
+      "upstream_sha256": "e7847065d5d741f892d2f1f7aaaa8f418a41e3b983d1e6f09010055d4d1c38d1",
+      "vendored_sha256": "e7847065d5d741f892d2f1f7aaaa8f418a41e3b983d1e6f09010055d4d1c38d1",
+      "patched_sha256": "fab32d8bac8cbcf0201511c1afdd6b75597715ff3adee59ae84fdf10a3a0e5c7"
+    }
+  },
+  "patches": [
+    {
+      "id": "V-2",
+      "description": "Return errors instead of ending the process: the checked-call, abort and assert macro sites, the diagnostic print and the device trap on the way from the MMQ, quantize and mm_ids entry points become returned cudaError_t (V-2)",
+      "diff": "patches/V-2-errors.patch",
+      "files": {
+        "src/ggml-cuda/common.cuh": {
+          "before_sha256": "de910de24b186d60216791828a52ec56dd0126fdf29eed6a4e0536104fd65520",
+          "after_sha256": "aa8e3b2d8a8c9a3906c8ecec5684cef9dede0e18de5f4bb8ac55527e8daedf67"
+        },
+        "src/ggml-cuda/mmid.cu": {
+          "before_sha256": "cd5a6895c52a413f7c8f7273d02ed5a1253d3b6833701fa40b68e3716bbc3c87",
+          "after_sha256": "ef0062aca4f89eba965bc8b189084266f8c4522e0e3bdcc76fee655d6ead0587"
+        },
+        "src/ggml-cuda/mmid.cuh": {
+          "before_sha256": "236962648e49c0faa2d76f505c781e36a99c833b27ff3a871111d9de135803ed",
+          "after_sha256": "9d630a9e7a1e6abcfab503bee95790cec259005050986ed75a0489f0cbd0ac9f"
+        },
+        "src/ggml-cuda/mmq.cuh": {
+          "before_sha256": "50db23f5055af6e28c142fcb4c7fb16c51f7137184ebf8c0ca113ed88906851b",
+          "after_sha256": "6726d94b394d869145d5cc0c056cd9596fc5e4e11c5f51c5cf8a6d20d26beeb7"
+        },
+        "src/ggml-cuda/quantize.cu": {
+          "before_sha256": "71cd7baab62ee1f457d23ae648c381d18b9b1327ec34832f31463b14b81895b3",
+          "after_sha256": "34f8ddce3754382cd2030637a35af07b70a703bc56430905ec886102c9c2a8ef"
+        },
+        "src/ggml-cuda/quantize.cuh": {
+          "before_sha256": "112e190a096e1fa68d4c72ca2a450cb202586e3f2919c884f3e3316a8d5c57cd",
+          "after_sha256": "bf27ed80424b70dc6bf4dcc6138b03cdeb912a6bd7abc31a2ffdc957a26e0fd6"
+        }
+      }
+    },
+    {
+      "id": "V-3a",
+      "description": "Delete the ggml backend machinery no kept source uses: tensor extra, CUDA graph and event classes, fusion structs, and from the context its streams, cuBLAS handles, graphs, name, constructor and destructor (V-3a)",
+      "diff": "patches/V-3a-backend-machinery.patch",
+      "files": {
+        "src/ggml-cuda/common.cuh": {
+          "before_sha256": "aa8e3b2d8a8c9a3906c8ecec5684cef9dede0e18de5f4bb8ac55527e8daedf67",
+          "after_sha256": "9d1929bae33f88364fe1c3807a35dfe8606ae7b8c2e1b07a0d02baba8865c460"
+        }
+      }
+    },
+    {
+      "id": "V-3b",
+      "description": "Stream, fixup range and device facts become arguments: no context, pool or device table; typed host refusal fifi_check_device before every launch (V-3b)",
+      "diff": "patches/V-3b-stream-fixup-device-guard.patch",
+      "files": {
+        "src/ggml-cuda/common.cuh": {
+          "before_sha256": "9d1929bae33f88364fe1c3807a35dfe8606ae7b8c2e1b07a0d02baba8865c460",
+          "after_sha256": "3bc48bbb3466f839c78eedb55078c74e32c772279866968305f4638b24963eb2"
+        },
+        "src/ggml-cuda/mmid.cu": {
+          "before_sha256": "ef0062aca4f89eba965bc8b189084266f8c4522e0e3bdcc76fee655d6ead0587",
+          "after_sha256": "ca0a5f1f499555daa73ff4dc0d40a00fecc0b123e0c5578783b0eba2eccb0f8e"
+        },
+        "src/ggml-cuda/mmid.cuh": {
+          "before_sha256": "9d630a9e7a1e6abcfab503bee95790cec259005050986ed75a0489f0cbd0ac9f",
+          "after_sha256": "0cf96dca5bfcbf42a460c40aa1b11f0a20e21ef0b29394a3932506f2cf3cf5f7"
+        },
+        "src/ggml-cuda/mmq.cuh": {
+          "before_sha256": "6726d94b394d869145d5cc0c056cd9596fc5e4e11c5f51c5cf8a6d20d26beeb7",
+          "after_sha256": "adf34fd09d5a764c0070ce6a67afb98b6cbdf98371e5915ca58c97d89e715896"
+        }
+      }
+    },
+    {
+      "id": "V-3c",
+      "description": "PDL off by one line (V-3c)",
+      "diff": "patches/V-3c-pdl-off.patch",
+      "files": {
+        "src/ggml-cuda/common.cuh": {
+          "before_sha256": "3bc48bbb3466f839c78eedb55078c74e32c772279866968305f4638b24963eb2",
+          "after_sha256": "f0b45f14a405b0044b96c56bcbcfa649cec6f33b87348a0ee914f7862f876a08"
+        }
+      }
+    },
+    {
+      "id": "V-4",
+      "description": "Trim to what sm_72 and sm_86 use: two tile configs and their dispatch, the host-side check macros, the PDL probe, every cuBLAS reference (V-4)",
+      "diff": "patches/V-4-trim.patch",
+      "files": {
+        "src/ggml-cuda/common.cuh": {
+          "before_sha256": "f0b45f14a405b0044b96c56bcbcfa649cec6f33b87348a0ee914f7862f876a08",
+          "after_sha256": "1d1d35cd0a829d5889c1cdcfa775595327033679d82bb9a49b9639a06b2bad20"
+        },
+        "src/ggml-cuda/mmq.cuh": {
+          "before_sha256": "adf34fd09d5a764c0070ce6a67afb98b6cbdf98371e5915ca58c97d89e715896",
+          "after_sha256": "b66116c5ac0ef41e316f399731d44e3381a8c14971525caf64548652ae9e9d9e"
+        },
+        "src/ggml-cuda/vendors/cuda.h": {
+          "before_sha256": "e7847065d5d741f892d2f1f7aaaa8f418a41e3b983d1e6f09010055d4d1c38d1",
+          "after_sha256": "fab32d8bac8cbcf0201511c1afdd6b75597715ff3adee59ae84fdf10a3a0e5c7"
+        }
+      }
+    },
+    {
+      "id": "V-MV1",
+      "description": "Trim mmvq to a device-only, error-returning MMVQ for Q4_K, Q5_0, Q6_K and Q8_0 (MATVEC-PAR S1): the ggml_tensor host entries are removed and replaced by fifi_mmvq_launch over fifi_mmvq_args (device facts from the caller, V-3b pattern); every assert and abort on the launch path returns cudaErrorInvalidValue or cudaErrorNotSupported and ggml_cuda_kernel_launch results are returned; the type switch keeps only the four formats; the ids path guards the per-slot expert id against the stack range and writes a quiet NaN for an out-of-range id, reading no weight (KUBDAN-MSG-62 A1); ggml_cuda_mm_fusion_args_device is restored into mmvq.cuh; no PDL; the dense-view fastdiv precondition is checked only when ids is null (the ids path passes zeros, and fastdiv_valid(0) is false); fifi_mmvq_launch also refuses ncols_x < 1 and an ids launch with more than one column (the multi-column ids kernel is not wrapped in S1)",
+      "diff": "patches/V-MV1-mmvq.patch",
+      "files": {
+        "src/ggml-cuda/mmvq.cu": {
+          "before_sha256": "d4c70f68ab79d463fd6fd52cac66a62e915858397ba4b2b7f658a7fbf13121f3",
+          "after_sha256": "8ffa0a71dd8e9a0ca1931f455d007d1e0a0f9190d9ba6a9c649598e4d6a82d9d"
+        },
+        "src/ggml-cuda/mmvq.cuh": {
+          "before_sha256": "b37f8359f519ba90ddecd9cb3ca5f8c2ae05685bfae6813d435d75763c2bb006",
+          "after_sha256": "d10e0201283eff3bbbe6e2d9f3cfc813a7af507547f55f79ad6359520e49d317"
+        }
+      }
+    },
+    {
+      "id": "V-PACK1",
+      "description": "Add an explicit CPU-reference Q8_0 packing policy with half-rounded scales and nearest-even codes. Preserve vendor entry signatures and their original default behavior.",
+      "diff": "patches/V-PACK1-reference-packing.patch",
+      "files": {
+        "src/ggml-cuda/quantize.cu": {
+          "before_sha256": "34f8ddce3754382cd2030637a35af07b70a703bc56430905ec886102c9c2a8ef",
+          "after_sha256": "1045cfce82615ec67d08d40f6edb733e8279f62887819c91ff97440bfd56c6ef"
+        },
+        "src/ggml-cuda/quantize.cuh": {
+          "before_sha256": "bf27ed80424b70dc6bf4dcc6138b03cdeb912a6bd7abc31a2ffdc957a26e0fd6",
+          "after_sha256": "3cad550cb483a4142651b5fe0c4ea3c4cd24abf3ef17f1f8c915ed94fbccff04"
+        }
+      }
+    },
+    {
+      "id": "V-5",
+      "description": "Turn the Q4_K config rows for J 8, 16, 24, 32, 40, 48 and 64 into tiling configs (stream_k false), so a grouped launch that aims its tile at the average expert column count keeps every column reduction inside one block instead of switching to stream-k.",
+      "diff": "patches/V-5-q4k-tiling-configs.patch",
+      "files": {
+        "src/ggml-cuda/mmq-config-ampere.cuh": {
+          "before_sha256": "6de9336a6c2f65c0ad83cbe9303dcd03e8cbb6185d15346133a31421000f6408",
+          "after_sha256": "fcbf07e96134045950a3108a04179de385104f2f5065a1cc00a0feb857eac08d"
+        }
+      }
+    }
+  ],
+  "shims": [
+    {
+      "include": "ggml.h",
+      "stands_in_for": "ggml/include/ggml.h",
+      "upstream_sha256": "9ac7ee3d3a957e5f7b21b104d3e3dc50b1b106f808f9d6735ead950450bfeec6",
+      "path": "../../src/kernels/cuda/native/prefill/ggml_shim/ggml.h",
+      "sha256": "1671ed3077506a2bf2c657f1d88a0d4127f8d7bedf00a623596612391fc25b1f",
+      "included_by": [
+        "src/ggml-cuda/common.cuh"
+      ]
+    },
+    {
+      "include": "ggml-impl.h",
+      "stands_in_for": "ggml/src/ggml-impl.h",
+      "upstream_sha256": "43564db0238aebb7ed68501e346c194866b5dac218d1d37b26baff9f458c00d3",
+      "path": "../../src/kernels/cuda/native/prefill/ggml_shim/ggml-impl.h",
+      "sha256": "e7ea3de73d0a87efa60f9d0a655840e8c32abd201f793758ba5041e117400d84",
+      "included_by": [
+        "src/ggml-cuda/common.cuh"
+      ]
+    },
+    {
+      "include": "ggml-cuda.h",
+      "stands_in_for": "ggml/include/ggml-cuda.h",
+      "upstream_sha256": "9cbfcea49f6da4d07f41dc22fa8dbf870825faaa2a68e34e65fe30ea6c41e042",
+      "path": "../../src/kernels/cuda/native/prefill/ggml_shim/ggml-cuda.h",
+      "sha256": "17f85d8251510f76e8d4e7e2adff044f180fb57707cc761432dce9f071e2b45a",
+      "included_by": [
+        "src/ggml-cuda/common.cuh"
+      ]
+    },
+    {
+      "include": "unary.cuh",
+      "stands_in_for": "ggml/src/ggml-cuda/unary.cuh",
+      "upstream_sha256": "a6903bb02577a33b79c738e62e425867f9122d1b4981a3b228062b4f978b2858",
+      "path": "../../src/kernels/cuda/native/prefill/ggml_shim/unary.cuh",
+      "sha256": "7e092c635294ceabbedfbfa0c0eda03fdf4c362e4d2b4157668f292a8d6129d2",
+      "included_by": [
+        "src/ggml-cuda/mmvq.cu"
+      ]
+    }
+  ],
+  "import_file_count": 31,
+  "trim": {
+    "removed_files": {
+      "src/ggml-cuda/mmq-config-blackwell.cuh": {
+        "upstream_path": "ggml/src/ggml-cuda/mmq-config-blackwell.cuh",
+        "upstream_sha256": "8bec1e65a3a2a58fab1f406225f6ba2f1a4c38a19793dfa255baff69bc044d70"
+      },
+      "src/ggml-cuda/mmq-config-cdna.cuh": {
+        "upstream_path": "ggml/src/ggml-cuda/mmq-config-cdna.cuh",
+        "upstream_sha256": "314eeb8453834723d5224012f692f70673f86ecc42d2b6d6f2005a0fad124dbc"
+      },
+      "src/ggml-cuda/mmq-config-gcn.cuh": {
+        "upstream_path": "ggml/src/ggml-cuda/mmq-config-gcn.cuh",
+        "upstream_sha256": "f669a723fc19d1e650de33a2852a10472a5773b0c8a3cd5b96662bc4fe6ebfe3"
+      },
+      "src/ggml-cuda/mmq-config-pascal-older.cuh": {
+        "upstream_path": "ggml/src/ggml-cuda/mmq-config-pascal-older.cuh",
+        "upstream_sha256": "48bae44f1f0e667fa02fb898859eb18c03961bdbadf53c1e22d98801ed70affe"
+      },
+      "src/ggml-cuda/mmq-config-rdna2.cuh": {
+        "upstream_path": "ggml/src/ggml-cuda/mmq-config-rdna2.cuh",
+        "upstream_sha256": "758be2a33b89018841f432c15cd63009ad212d71eae888a04b4535cb64941aa7"
+      },
+      "src/ggml-cuda/mmq-config-rdna3-5.cuh": {
+        "upstream_path": "ggml/src/ggml-cuda/mmq-config-rdna3-5.cuh",
+        "upstream_sha256": "5243cb07aded29b0bd3254cf9f9856989f53b133a73874388282a35c3990f0cd"
+      },
+      "src/ggml-cuda/mmq-config-rdna3.cuh": {
+        "upstream_path": "ggml/src/ggml-cuda/mmq-config-rdna3.cuh",
+        "upstream_sha256": "a1ac4f4fa799f2fb200ead23f3403bb0f729d41109b8967c6d76216768aae0cf"
+      },
+      "src/ggml-cuda/mmq-config-rdna4.cuh": {
+        "upstream_path": "ggml/src/ggml-cuda/mmq-config-rdna4.cuh",
+        "upstream_sha256": "e40c9c5fe85607db07ae351dd6ca13c92caaa238e2a62d5134877d9fbcb5c645"
+      },
+      "src/ggml-cuda/vendors/hip.h": {
+        "upstream_path": "ggml/src/ggml-cuda/vendors/hip.h",
+        "upstream_sha256": "c22d5824001743b371f6f158179b123aaa3df6ed8b572af6df711b3861a49e05"
+      },
+      "src/ggml-cuda/vendors/musa.h": {
+        "upstream_path": "ggml/src/ggml-cuda/vendors/musa.h",
+        "upstream_sha256": "4874631c16eebbfc6d0f3081779dbe00890b7f94561db7224e4a517f33eb5a3e"
+      }
+    },
+    "entries": [
+      {
+        "id": "V-4",
+        "description": "Whole files that sm_72 and sm_86 never select (eight tile configs, the HIP and MUSA vendor headers)",
+        "files": [
+          "src/ggml-cuda/mmq-config-blackwell.cuh",
+          "src/ggml-cuda/mmq-config-cdna.cuh",
+          "src/ggml-cuda/mmq-config-gcn.cuh",
+          "src/ggml-cuda/mmq-config-pascal-older.cuh",
+          "src/ggml-cuda/mmq-config-rdna2.cuh",
+          "src/ggml-cuda/mmq-config-rdna3-5.cuh",
+          "src/ggml-cuda/mmq-config-rdna3.cuh",
+          "src/ggml-cuda/mmq-config-rdna4.cuh",
+          "src/ggml-cuda/vendors/hip.h",
+          "src/ggml-cuda/vendors/musa.h"
+        ]
+      }
+    ]
+  }
+}

@@ -1,0 +1,114 @@
+{
+  "source_attn_sha256": "60ed5c0fd5faa97ea68040a7299599c8a8e5c15ec19e68e9d028ecf93e9efdd9",
+  "source_pointwise_sha256": "ecbaf56ad001d8cd8cc46d4a2ec41ab96a81672d8ee04590f15b4b9b7404f5c4",
+  "cases": [
+    {
+      "file": "local-gqa2.bin",
+      "bytes": 223232,
+      "sha256": "bad05d3fe7f26ba65cdee3d442eca8c457881b8edbf98a8a0ee92045f61f7524",
+      "geometry": {
+        "q_heads": 16,
+        "kv_heads": 8,
+        "head_dim": 256,
+        "keys": 40,
+        "window": 16
+      },
+      "offsets": {
+        "q": {
+          "offset": 0,
+          "bytes": 16384
+        },
+        "k_codes": {
+          "offset": 16384,
+          "bytes": 81920
+        },
+        "k_scales": {
+          "offset": 98304,
+          "bytes": 5120
+        },
+        "v_codes": {
+          "offset": 103424,
+          "bytes": 81920
+        },
+        "v_scales": {
+          "offset": 185344,
+          "bytes": 5120
+        },
+        "expected": {
+          "offset": 190464,
+          "bytes": 32768
+        }
+      },
+      "expected_type": "little-endian f64",
+      "layout": "head-major KV planes",
+      "scale": 1.0
+    },
+    {
+      "file": "global-gqa16.bin",
+      "bytes": 141824,
+      "sha256": "1dd7565c8b2a62fbdae0b38632a3d9c402a9badf25b6902b1b93430c09e57ad1",
+      "geometry": {
+        "q_heads": 16,
+        "kv_heads": 1,
+        "head_dim": 512,
+        "keys": 40,
+        "window": null
+      },
+      "offsets": {
+        "q": {
+          "offset": 0,
+          "bytes": 32768
+        },
+        "k_codes": {
+          "offset": 32768,
+          "bytes": 20480
+        },
+        "k_scales": {
+          "offset": 53248,
+          "bytes": 1280
+        },
+        "v_codes": {
+          "offset": 54528,
+          "bytes": 20480
+        },
+        "v_scales": {
+          "offset": 75008,
+          "bytes": 1280
+        },
+        "expected": {
+          "offset": 76288,
+          "bytes": 65536
+        }
+      },
+      "expected_type": "little-endian f64",
+      "layout": "head-major KV planes",
+      "scale": 1.0
+    },
+    {
+      "file": "rope-local-8191.bin",
+      "bytes": 3072,
+      "sha256": "9226236d7565e5772d392929768bd4512756f6ddcad7bc25e7fdc3e07c03c55a",
+      "input_values": 256,
+      "expected_values": 256,
+      "position": 8191,
+      "format": "f32 inputs followed by f64 expected"
+    },
+    {
+      "file": "rope-global-zero-8191.bin",
+      "bytes": 6144,
+      "sha256": "0063e3c9170ad3b27fb2cdc87fedbafc1a2d50cda94b5f424652a3a2f339174e",
+      "input_values": 512,
+      "expected_values": 512,
+      "position": 8191,
+      "format": "f32 inputs followed by f64 expected"
+    },
+    {
+      "file": "gelu-tanh-gate-up.bin",
+      "bytes": 176,
+      "sha256": "f2fc3ea9524d159aa5dba0d9f77a61129f0087e09a790200339e99bce431f0ce",
+      "values": 11,
+      "format": "f32 gate, f32 up, f64 expected"
+    }
+  ],
+  "device_executed": false
+}

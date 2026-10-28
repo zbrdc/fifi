@@ -1,0 +1,61 @@
+{
+  "crate": "safetensors",
+  "version": "0.8.0",
+  "source": "https://static.crates.io/crates/safetensors/safetensors-0.8.0.crate",
+  "archive_sha256": "79b079b829cb27a1c3c374341345ed2e8b2c0c839034522cee576c140bd7f846",
+  "original_vcs": {
+    "git": {
+      "sha1": "a406ca3e7a90598be0cd05a50069cb9bf5ef6ba6"
+    },
+    "path_in_vcs": "safetensors"
+  },
+  "patch": {
+    "file": "src/tensor.rs",
+    "before": "if buffer_end + N_LEN + n != buffer_len {",
+    "after": "if buffer_end.checked_add(stop) != Some(buffer_len) {"
+  },
+  "files": {
+    "Cargo.toml": {
+      "upstream_sha256": "1f4db0ee1c944b02490780cfb10f97a1b62a40f5e851133d6245753897cbc712",
+      "vendored_sha256": "1f4db0ee1c944b02490780cfb10f97a1b62a40f5e851133d6245753897cbc712"
+    },
+    "Cargo.toml.orig": {
+      "upstream_sha256": "74801485bedd7b7a167d951a2a8eccabd9cab6c04da5f38a6b05f06bc5efe04c",
+      "vendored_sha256": "74801485bedd7b7a167d951a2a8eccabd9cab6c04da5f38a6b05f06bc5efe04c"
+    },
+    "LICENSE": {
+      "upstream_sha256": "c71d239df91726fc519c6eb72d318ec65820627232b2f796219e87dcf35d0ab4",
+      "vendored_sha256": "c71d239df91726fc519c6eb72d318ec65820627232b2f796219e87dcf35d0ab4"
+    },
+    "README.md": {
+      "upstream_sha256": "0a932f120de5c2477b286cae5517b6fec5e1d3ed64a19b99ccfc0a8504db7b13",
+      "vendored_sha256": "d61829ae1e19b7e19e51d224db1357f54712c92144e2eab240b63952ec02d71f"
+    },
+    "benches/benchmark.rs": {
+      "upstream_sha256": "70c750637d36c815ca9a01357a493200ab789de6a76154d7c5ee2178fee6c714",
+      "vendored_sha256": "70c750637d36c815ca9a01357a493200ab789de6a76154d7c5ee2178fee6c714"
+    },
+    "src/lib.rs": {
+      "upstream_sha256": "a342d167e4e18fae491ba6e4f0f501450879213f909766b746227c7c895d6869",
+      "vendored_sha256": "a342d167e4e18fae491ba6e4f0f501450879213f909766b746227c7c895d6869"
+    },
+    "src/slice.rs": {
+      "upstream_sha256": "7d1bfbe33fb6ad374d58a9db3167078a27cffbd1dca1f611df0b43ad516591a8",
+      "vendored_sha256": "bf0b6b78b5e09ab743d5a81edd326a0e9617349feaee2d25115d13d52da39c64"
+    },
+    "src/tensor.rs": {
+      "upstream_sha256": "d7033872125a58f2fca600a30646f69f585e6699991556186eb144e8ff17ffc6",
+      "vendored_sha256": "e7ac15e308f29e14b14f75426676ccede23e15b97ad23831c55e03e58bf9b28a"
+    }
+  },
+  "excluded_archive_files": [
+    "Cargo.lock",
+    ".cargo_vcs_info.json"
+  ],
+  "note": "The generated dependency lockfile is omitted. This manifest preserves the package VCS metadata.",
+  "formatting_only": {
+    "file": "src/slice.rs",
+    "scope": "Six pre-existing upstream test expressions formatted by cargo fmt 1.98.1."
+  },
+  "documentation_only": "Removed one upstream trailing space in README.md."
+}

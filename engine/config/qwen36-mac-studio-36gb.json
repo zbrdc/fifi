@@ -1,0 +1,23 @@
+{
+  "listen": "127.0.0.1:18791",
+  "api_key_env": "ENGINESRV_API_KEY",
+  "engines": [
+    {
+      "id": "q36",
+      "family": "qwen3_6_35b_a3b",
+      "model": "fifi-q36",
+      "model_dir": "/path/to/Qwen3.6-35B-A3B-mlx-int4",
+      "tokenizer_dir": "/path/to/Qwen3.6-35B-A3B-mlx-int4",
+      "qwen36": {
+        "cache_limit_bytes": 4294967296,
+        "context_limit": 262144,
+        "session_cap_bytes": 4294967296,
+        "prefill_budget_bytes": 32212254720,
+        "prefill_session_reserve_bytes": 8286699520,
+        "activation_dtype": "bf16",
+        "kv_dtype": "q8",
+        "compile": true
+      }
+    }
+  ]
+}

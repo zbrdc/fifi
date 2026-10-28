@@ -1,0 +1,12 @@
+{
+  "membership": "0::/system.slice/docker-de7f97a95faf4a16655dbc391425152a866754cb77fd49cbd3677016b54a5548.scope\n",
+  "mountinfo": "7710 7709 0:31 / /sys/fs/cgroup ro,nosuid,nodev,noexec,relatime - cgroup2 cgroup rw\n",
+  "controllers": "cpuset cpu io memory hugetlb pids rdma misc dmem\n",
+  "cgroup_type": null,
+  "memory_max": null,
+  "memory_current": null,
+  "captured_at": "2026-10-28T01:13:18.429897997Z",
+  "cat_stdout_sha256": "0b8a9c122c9f14d3a1bf81e11448a9191573303974d8fcc76f93e740bd1d32ea",
+  "cat_stderr_sha256": "220665d00fcf26761ea795d330da1e62f3b9afe476135147b9cac9844ec9b4a2",
+  "scope": "ACTUAL Docker host cgroup namespace; all three global-root interfaces captured; no GPU/native ELF execution"
+}

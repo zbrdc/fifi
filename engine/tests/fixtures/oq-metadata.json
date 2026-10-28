@@ -1,0 +1,52 @@
+{
+  "quantization": {
+    "mode": "affine",
+    "bits": 4,
+    "group_size": 64,
+    "language_model.model.layers.1.ple.ple_embedding.ngram_embedding.shards.0": {
+      "bits": 4,
+      "group_size": 32,
+      "mode": "affine"
+    },
+    "language_model.model.layers.0.attn_hyper_connection.block_inject_weight": {
+      "bits": 5,
+      "group_size": 64,
+      "mode": "affine"
+    },
+    "language_model.model.layers.0.linear_attn.in_proj_a": {
+      "bits": 6,
+      "group_size": 64,
+      "mode": "affine"
+    },
+    "language_model.model.layers.0.mlp.shared_expert.down_proj": {
+      "bits": 8,
+      "group_size": 128,
+      "mode": "affine"
+    }
+  },
+  "quantization_config": {
+    "mode": "affine",
+    "bits": 4,
+    "group_size": 64,
+    "language_model.model.layers.1.ple.ple_embedding.ngram_embedding.shards.0": {
+      "bits": 4,
+      "group_size": 32,
+      "mode": "affine"
+    },
+    "language_model.model.layers.0.attn_hyper_connection.block_inject_weight": {
+      "bits": 5,
+      "group_size": 64,
+      "mode": "affine"
+    },
+    "language_model.model.layers.0.linear_attn.in_proj_a": {
+      "bits": 6,
+      "group_size": 64,
+      "mode": "affine"
+    },
+    "language_model.model.layers.0.mlp.shared_expert.down_proj": {
+      "bits": 8,
+      "group_size": 128,
+      "mode": "affine"
+    }
+  }
+}
