@@ -544,6 +544,7 @@ fn original_routed(
     frame.gather(down, inverse, pairs, block.pairs)
 }
 
+#[allow(clippy::too_many_arguments)]
 fn device_run(
     ctx: &CudaContext,
     stream: &DeviceStream,
@@ -552,6 +553,7 @@ fn device_run(
     ids: &[i32],
     input: &[u8],
     grouped: Option<&GroupedScratch>,
+    gather: bool,
 ) -> (Vec<u8>, u64) {
     let FlintFfnView::Moe { experts, .. } = weights else {
         panic!("real layer must be routed")
@@ -579,7 +581,7 @@ fn device_run(
             grouped,
             experts,
             packed_pointwise: mode == Mode::Packed,
-            grouped_gather: false,
+            grouped_gather: gather,
         };
         if mode != Mode::Legacy {
             let input = RoutedTensor::owned(effects.frame, x)?;
@@ -589,6 +591,14 @@ fn device_run(
             original_routed(&mut effects, block(rows), ids, &grouping, x)
         }
     });
+    if mode != Mode::Legacy {
+        let expected = if gather { "gather" } else { "shuffle" };
+        assert_eq!(
+            CudaContext::test_routed_grouped_variant(),
+            Some(expected),
+            "leg claiming gather={gather} must actually run that variant"
+        );
+    }
     let output = frame.finish(down.unwrap()).unwrap();
     let mut bytes = vec![0; ids.len() * H * 4];
     output.read_at(stream, 0, &mut bytes).unwrap();
@@ -624,37 +634,142 @@ fn grouped_routed_actual_core_budget_on_real_bank() {
         .into_iter()
         .flat_map(f32::to_ne_bytes)
         .collect();
-    let (legacy_bits, legacy_launches) =
-        device_run(&ctx, &stream, &layer.ffn, Mode::Legacy, &ids, &input, None);
+    let (legacy_bits, legacy_launches) = device_run(
+        &ctx,
+        &stream,
+        &layer.ffn,
+        Mode::Legacy,
+        &ids,
+        &input,
+        None,
+        false,
+    );
     assert_eq!(
         legacy_launches, 432,
         "counter must observe actual legacy native enqueues"
     );
-    let (candidate_bits, actual) =
-        device_run(&ctx, &stream, &layer.ffn, Mode::Grouped, &ids, &input, None);
+    let (candidate_bits, actual) = device_run(
+        &ctx,
+        &stream,
+        &layer.ffn,
+        Mode::Grouped,
+        &ids,
+        &input,
+        None,
+        true,
+    );
     assert_eq!(
         candidate_bits, legacy_bits,
         "same bank/input, BF16-in-F32 output bits"
+    );
+    let (rollback_bits, _) = device_run(
+        &ctx,
+        &stream,
+        &layer.ffn,
+        Mode::Grouped,
+        &ids,
+        &input,
+        None,
+        false,
+    );
+    assert_eq!(
+        rollback_bits, legacy_bits,
+        "rollback path must stay bit-identical too"
     );
     println!(
         "real admitted layer2 forced G48: legacy_actual={legacy_launches}, candidate_actual={actual}, target=9; no performance claim"
     );
     assert_eq!(actual, 9, "actual successful routed-core native launches");
+    for rows in 1..=8u32 {
+        let ids: Vec<i32> = [255, 0, 73, 4, 111, 2]
+            .iter()
+            .cycle()
+            .take(rows as usize * 6)
+            .copied()
+            .collect();
+        let input: Vec<u8> = (0..rows as usize * H)
+            .map(|i| (((i * 17 + i / H * 31) % 257) as f32 - 128.0) / 1024.0)
+            .flat_map(f32::to_ne_bytes)
+            .collect();
+        let (legacy_bits, _) = device_run(
+            &ctx,
+            &stream,
+            &layer.ffn,
+            Mode::Legacy,
+            &ids,
+            &input,
+            None,
+            false,
+        );
+        let (before, old_core) = device_run(
+            &ctx,
+            &stream,
+            &layer.ffn,
+            Mode::Grouped,
+            &ids,
+            &input,
+            None,
+            true,
+        );
+        let (after, packed_core) = device_run(
+            &ctx,
+            &stream,
+            &layer.ffn,
+            Mode::Packed,
+            &ids,
+            &input,
+            None,
+            true,
+        );
+        assert_eq!(
+            before, legacy_bits,
+            "gather-on grouped bits for rows {rows}"
+        );
+        assert_eq!((old_core, packed_core), (9, 9));
+        assert!(
+            after == before,
+            "packed output bytes differ for rows {rows}"
+        );
+    }
     for ids in [
-        vec![255, 0, 73, 4, 111, 2],
-        [255, 0, 73, 4, 111, 2].repeat(7),
-        [255, 0, 73, 4, 111, 2].repeat(8),
         (0..48).rev().collect::<Vec<i32>>(),
-        (0..48).map(|i| (i * 5 + i / 6) % 11).collect(),
+        (0..48).map(|i| (i * 5 + i / 6) % 11).collect::<Vec<i32>>(),
     ] {
         let input: Vec<u8> = (0..ids.len() / 6 * H)
             .map(|i| (((i * 17 + i / H * 31) % 257) as f32 - 128.0) / 1024.0)
             .flat_map(f32::to_ne_bytes)
             .collect();
-        let (before, old_core) =
-            device_run(&ctx, &stream, &layer.ffn, Mode::Grouped, &ids, &input, None);
-        let (after, packed_core) =
-            device_run(&ctx, &stream, &layer.ffn, Mode::Packed, &ids, &input, None);
+        let (legacy_bits, _) = device_run(
+            &ctx,
+            &stream,
+            &layer.ffn,
+            Mode::Legacy,
+            &ids,
+            &input,
+            None,
+            false,
+        );
+        let (before, old_core) = device_run(
+            &ctx,
+            &stream,
+            &layer.ffn,
+            Mode::Grouped,
+            &ids,
+            &input,
+            None,
+            true,
+        );
+        let (after, packed_core) = device_run(
+            &ctx,
+            &stream,
+            &layer.ffn,
+            Mode::Packed,
+            &ids,
+            &input,
+            None,
+            true,
+        );
+        assert_eq!(before, legacy_bits, "gather-on grouped bits for {ids:?}");
         assert_eq!((old_core, packed_core), (9, 9));
         assert!(after == before, "packed output bytes differ for {ids:?}");
     }
@@ -680,8 +795,16 @@ fn grouped_routed_actual_core_budget_on_real_bank() {
                 })
                 .flat_map(f32::to_ne_bytes)
                 .collect();
-            let (before, old_core) =
-                device_run(&ctx, &stream, &layer.ffn, Mode::Grouped, &ids, &input, None);
+            let (before, old_core) = device_run(
+                &ctx,
+                &stream,
+                &layer.ffn,
+                Mode::Grouped,
+                &ids,
+                &input,
+                None,
+                true,
+            );
             for (index, spec) in retained.layout.tensors.iter().enumerate() {
                 let start = spec.bytes * rows / 8;
                 let bytes = spec.bytes - start;
@@ -701,6 +824,7 @@ fn grouped_routed_actual_core_budget_on_real_bank() {
                 &ids,
                 &input,
                 Some(&retained),
+                true,
             );
             assert_eq!((old_core, packed_core), (9, 9));
             assert!(

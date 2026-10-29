@@ -1,14 +1,14 @@
-//! The chunk layer loop of decision 0049 (CPF-7a part 2): plan §C.1 stages P1 and 1-17 of one
-//! prefill chunk on the state's owning stream. FP16 and staged KV8 attention are enqueue-only.
-//! Unstaged KV8 uses blocking causal-length writes before each native attention tile.
+//! The chunk layer loop of chunked prefill: stages P1 and 1-17 of one prefill chunk on the state's
+//! owning stream. FP16 and staged KV8 attention are enqueue-only. Unstaged KV8 uses blocking
+//! causal-length writes before each native attention tile.
 //!
-//! CPF-7b's driver admits the chunk, allocates the arena from
-//! [`super::prefill_plan::chunk_tensors`], fills the attention `part` buffer, uploads the ids
-//! and owns the §C.4 protocol around [`run_chunk_body`]. This module holds the slot views, the
-//! checked chunk rows, the pure call-shape builders, the stage lists, the constructor checks
-//! and the stage functions themselves. No function here allocates device memory, reads a device
-//! word or records an event. KV8 attention tiles update one device word with `write_at`, which
-//! waits for the owning stream. The body also calls [`super::state::ResidentState::check_chunk`].
+//! The chunked-prefill driver admits the chunk, allocates the arena from
+//! [`super::prefill_plan::chunk_tensors`], fills the attention `part` buffer, uploads the ids and
+//! owns the protocol around [`run_chunk_body`]. This module holds the slot views, the checked chunk
+//! rows, the pure call-shape builders, the stage lists, the constructor checks and the stage
+//! functions themselves. No function here allocates device memory, reads a device word or records
+//! an event. KV8 attention tiles update one device word with `write_at`, which waits for the owning
+//! stream. The body also calls [`super::state::ResidentState::check_chunk`].
 
 use super::{
     dims::{KvMode, StepDims},
@@ -69,9 +69,9 @@ use kernel_diagnostics::{
     diagnostic_dense, diagnostic_dense_input, diagnostic_routed, diagnostic_shared,
 };
 
-/// Every slot of the chunk arena exactly once, in `chunk_tensors` order (B.2): the view checks
-/// take the arena as the plan of exactly this set, so a slot added to the plan without this
-/// module fails [`super::prefill_tests`].
+/// Every slot of the chunk arena exactly once, in `chunk_tensors` order: the view checks take the
+/// arena as the plan of exactly this set, so a slot added to the plan without this module fails
+/// [`super::prefill_tests`].
 pub(super) const ALL_SLOTS: [ChunkSlot; 35] = [
     ChunkSlot::Hidden,
     ChunkSlot::IdsTok,
@@ -111,8 +111,8 @@ pub(super) const ALL_SLOTS: [ChunkSlot; 35] = [
 ];
 
 /// The rows of one chunk: `m` rows at the positions `p0..p0 + m` of a session whose arena was
-/// planned for `m_sess` rows (B.3). Constructed against the caller's `cap` and `m_sess`; the
-/// body re-checks the state's own cap (a chunk built against a larger cap than the state's).
+/// planned for `m_sess` rows. Constructed against the caller's `cap` and `m_sess`; the body
+/// re-checks the state's own cap (a chunk built against a larger cap than the state's).
 #[derive(Debug)]
 pub(super) struct ChunkRows {
     p0: usize,
@@ -155,7 +155,7 @@ impl ChunkRows {
     }
 }
 
-/// The index of `slot` in `slots`, or the `is not a view` refusal (B.2).
+/// The index of `slot` in `slots`, or the `is not a view` refusal.
 pub(super) fn slot_position(slots: &[ChunkSlot], slot: ChunkSlot) -> Result<usize, EngError> {
     slots
         .iter()
@@ -194,9 +194,10 @@ pub(super) fn check_view_list(arena_len: usize, slots: &[ChunkSlot]) -> Result<(
     Ok(())
 }
 
-/// (V4) after V1-V3: each view sits exactly where `plan_arena` puts the list's tensors, so the
-/// arena IS the plan of this list and the lifetimes the plan honoured are the list's. A bytes
-/// check alone cannot see two same-size slots in swapped order; the offset half can.
+/// (V4) after [`check_view_list`]: each view sits exactly where `plan_arena` puts the list's
+/// tensors, so the arena IS the plan of this list and the lifetimes the plan honoured are the
+/// list's. A bytes check alone cannot see two same-size slots in swapped order; the offset half
+/// can.
 pub(super) fn check_view_layout(
     list: &[(ChunkSlot, ArenaTensor)],
     actual: &[(usize, usize)],
@@ -216,8 +217,8 @@ pub(super) fn check_view_layout(
     Ok(())
 }
 
-/// The arena views of one chunk's slots (B.2): built from the same `chunk_tensors` list the
-/// arena was planned from, slots and tensors together.
+/// The arena views of one chunk's slots: built from the same `chunk_tensors` list the arena was
+/// planned from, slots and tensors together.
 pub(super) struct ChunkViews<'a> {
     views: Vec<(ChunkSlot, DeviceRange<'a>)>,
 }
@@ -260,8 +261,8 @@ impl<'a> ChunkViews<'a> {
     }
 }
 
-/// The stages of one mixer layer of a chunk (plan §C.1), in launch order; `NormA`, `QuantA`,
-/// `NormF`, `Route` and `Moe` are shared between the two kinds.
+/// The stages of one mixer layer of a chunk, in launch order; `NormA`, `QuantA`, `NormF`, `Route`
+/// and `Moe` are shared between the two kinds.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum Stage {
     NormA,
@@ -355,11 +356,11 @@ pub(super) fn resident_moe_stages() -> [MoeStage; 14] {
 
 /// The phase and slot columns of stage P1 (the embedding, before layer 0).
 pub(super) const EMBED_PHASE: Phase = Phase::Embed;
-/// Reads `IdsTok`, writes `Hidden` (B.11).
+/// Reads `IdsTok`, writes `Hidden`.
 pub(super) const EMBED_SLOTS: (&[ChunkSlot], &[ChunkSlot]) =
     (&[ChunkSlot::IdsTok], &[ChunkSlot::Hidden]);
 
-/// The phase a stage runs at (B.11). `Moe` runs at the block's first phase, `Shared`.
+/// The phase a stage runs at. `Moe` runs at the block's first phase, `Shared`.
 pub(super) fn stage_phase(stage: Stage) -> Phase {
     match stage {
         Stage::NormA => Phase::NormA,
@@ -380,7 +381,7 @@ pub(super) fn stage_phase(stage: Stage) -> Phase {
     }
 }
 
-/// The phase a MoE stage runs at (B.11).
+/// The phase a MoE stage runs at.
 pub(super) fn moe_stage_phase(stage: MoeStage) -> Phase {
     match stage {
         MoeStage::SharedQuant
@@ -399,8 +400,8 @@ pub(super) fn moe_stage_phase(stage: MoeStage) -> Phase {
     }
 }
 
-/// The arena slots a stage reads and writes (B.11); the persistent state, the weights and
-/// `part` are not arena slots.
+/// The arena slots a stage reads and writes; the persistent state, the weights and `part` are not
+/// arena slots.
 pub(super) fn stage_slots(stage: Stage) -> (&'static [ChunkSlot], &'static [ChunkSlot]) {
     match stage {
         Stage::NormA => (
@@ -444,7 +445,7 @@ pub(super) fn stage_slots(stage: Stage) -> (&'static [ChunkSlot], &'static [Chun
     }
 }
 
-/// The arena slots a MoE stage reads and writes (B.11).
+/// The arena slots a MoE stage reads and writes.
 pub(super) fn moe_stage_slots(stage: MoeStage) -> (&'static [ChunkSlot], &'static [ChunkSlot]) {
     match stage {
         MoeStage::SharedQuant => (&[ChunkSlot::X2], &[ChunkSlot::Q8X2]),
@@ -487,10 +488,10 @@ pub(super) fn moe_stage_slots(stage: MoeStage) -> (&'static [ChunkSlot], &'stati
     }
 }
 
-/// The q8 layout rule (lane C APPROVED): one q8 buffer is read by several GEMMs, and a GEMM
-/// of the other scale layout reads wrong values, not a fault. Refuses `prefill chunk: q8
-/// layout` for a group whose members differ in [`Q8_1Layout`]; the group's first member is
-/// the `mmq_dense_input` representative of the buffer.
+/// The q8 layout rule: one q8 buffer is read by several GEMMs, and a GEMM of the other scale layout
+/// reads wrong values, not a fault. Refuses `prefill chunk: q8 layout` for a group whose members
+/// differ in [`Q8_1Layout`]; the group's first member is the `mmq_dense_input` representative of
+/// the buffer.
 pub(super) fn check_q8_layouts(groups: &[(ChunkSlot, &[QuantType])]) -> Result<(), EngError> {
     for (slot, group) in groups {
         let mut layouts = group.iter().map(|quant| mmq_type_of(*quant).q8_1_layout());
@@ -528,10 +529,10 @@ pub(super) fn routed_up_view(gu_bytes: usize, dims: &MoeDims) -> Result<(usize, 
     tail_extent(gu_bytes, dims.inter)
 }
 
-// ---- the pure call-shape builders (B.10; the `mixer_shapes` pattern) -------------------------
+// ---- the pure call-shape builders (the `mixer_shapes` pattern) -------------------------------
 
-/// The four DeltaNet in-projections over one `Q8X` buffer: role, columns `n`, and the column
-/// offset in the `ProjD` row (B.5 stage 3d).
+/// The four DeltaNet in-projections over one `Q8X` buffer: role, columns `n`, and the column offset
+/// in the `ProjD` row (stage 3d).
 pub(super) fn delta_proj_cols(g: &MixerGeometry) -> [(Role, usize, usize); 4] {
     let d = &g.delta;
     [
@@ -542,7 +543,7 @@ pub(super) fn delta_proj_cols(g: &MixerGeometry) -> [(Role, usize, usize); 4] {
     ]
 }
 
-/// The three attention projections over one `Q8X` buffer (B.6 stage 3a).
+/// The three attention projections over one `Q8X` buffer (stage 3a).
 pub(super) fn attn_proj_cols(g: &MixerGeometry) -> [(Role, usize, usize); 3] {
     let a = &g.attn;
     [
@@ -552,7 +553,7 @@ pub(super) fn attn_proj_cols(g: &MixerGeometry) -> [(Role, usize, usize); 3] {
     ]
 }
 
-/// The conv shape of a chunk (B.5 stage 4d).
+/// The conv shape of a chunk (stage 4d).
 pub(super) fn chunk_conv_shape(g: &MixerGeometry, m: usize) -> ConvShape {
     ConvShape {
         m,
@@ -561,7 +562,7 @@ pub(super) fn chunk_conv_shape(g: &MixerGeometry, m: usize) -> ConvShape {
     }
 }
 
-/// The scan shape of a chunk of `rows` in a `cap`-row context (B.5 stage 5d).
+/// The scan shape of a chunk of `rows` in a `cap`-row context (stage 5d).
 pub(super) fn chunk_scan_shape(g: &MixerGeometry, rows: &ChunkRows, cap: usize) -> ScanShape {
     let d = &g.delta;
     ScanShape {
@@ -579,7 +580,7 @@ pub(super) fn chunk_scan_shape(g: &MixerGeometry, rows: &ChunkRows, cap: usize) 
     }
 }
 
-/// The chunk preparation shape (B.6 stage 4a).
+/// The chunk preparation shape (stage 4a).
 pub(super) fn chunk_prep_shape(
     g: &MixerGeometry,
     rows: &ChunkRows,
@@ -598,7 +599,7 @@ pub(super) fn chunk_prep_shape(
     }
 }
 
-/// The prefill attention shape (B.6 stage 5a).
+/// The prefill attention shape (stage 5a).
 pub(super) fn chunk_attn_shape(
     g: &MixerGeometry,
     rows: &ChunkRows,
@@ -698,14 +699,14 @@ pub(super) fn routed_weight<'a>(
     })
 }
 
-/// The whole allocation behind a weight buffer, as its weight range (B.7).
+/// The whole allocation behind a weight buffer, as its weight range.
 fn whole(buffer: &DeviceBuffer) -> Result<DeviceRange<'_>, EngError> {
     buffer.range(0, buffer.bytes())
 }
 
-// ---- ChunkBufs and its check (B.2, B.10) -----------------------------------------------------
+// ---- ChunkBufs and its check -----------------------------------------------------------------
 
-/// The plain facts `check_bufs` guards (B.10).
+/// The plain facts `check_bufs` guards.
 pub(super) struct BufFacts {
     pub(super) m_sess: usize,
     pub(super) part_bytes: usize,
@@ -751,9 +752,9 @@ pub(super) fn check_bufs(f: &BufFacts) -> Result<(), EngError> {
     Ok(())
 }
 
-/// The buffers the body runs on: the slot views, the attention `part` range, and the two
-/// facts the stages take from the device (B.2). The `part` range is CPF-7b's allocation,
-/// never sized from `ChunkCost.part`.
+/// The buffers the body runs on: the slot views, the attention `part` range, and the two facts the
+/// stages take from the device. The `part` range is the driver's allocation, never sized from
+/// `ChunkCost.part`.
 pub(super) struct ChunkBufs<'a> {
     views: ChunkViews<'a>,
     part: DeviceRange<'a>,
@@ -794,9 +795,9 @@ impl<'a> ChunkBufs<'a> {
     }
 }
 
-// ---- the model, its facts and its check (B.10; A1) --------------------------------------------
+// ---- the model, its facts and its check -------------------------------------------------------
 
-/// The plain facts of one routed expert stack (B.10): `None` is "not loaded Native".
+/// The plain facts of one routed expert stack: `None` is "not loaded Native".
 #[derive(Clone)]
 pub(super) struct StackFacts {
     pub(super) role: Role,
@@ -926,8 +927,8 @@ pub(super) fn check_model(f: &ModelFacts, expected_layers: usize) -> Result<(), 
     Ok(())
 }
 
-/// Extracts the facts of the first `layers` layers of `weights` (B.10): a Tiled or absent
-/// weight is `None`, and `check_model` is what refuses it.
+/// Extracts the facts of the first `layers` layers of `weights`: a Tiled or absent weight is
+/// `None`, and `check_model` is what refuses it.
 fn model_facts(
     table: &LayerTable,
     geometry: &MixerGeometry,
@@ -998,15 +999,15 @@ fn model_facts(
     })
 }
 
-/// The weights of the chunk body (B.1): the mixer weights, the MoE weights per layer and the
-/// native token embedding.
+/// The weights of the chunk body: the mixer weights, the MoE weights per layer and the native token
+/// embedding.
 pub(super) struct ChunkWeights<'a, 'w> {
     mixer: &'a MixerWeights<'w>,
     moe: &'a [MoeLayerWeights<'w>],
     embed: &'w NativeWeight,
 }
 
-/// The checked model of the chunk body (B.1).
+/// The checked model of the chunk body.
 pub(super) struct ChunkModel<'a, 'w> {
     table: &'a LayerTable,
     geometry: &'a MixerGeometry,
@@ -1063,8 +1064,7 @@ impl<'a, 'w> ChunkModel<'a, 'w> {
     }
 }
 impl<'a, 'w> ChunkWeights<'a, 'w> {
-    /// The production constructor (A1): the driver and the rigs build the weights only
-    /// through this.
+    /// The production constructor: the driver and the rigs build the weights only through this.
     pub(super) fn new(
         mixer: &'a MixerWeights<'w>,
         moe: &'a [MoeLayerWeights<'w>],
@@ -1074,7 +1074,7 @@ impl<'a, 'w> ChunkWeights<'a, 'w> {
     }
 }
 
-/// The plain facts `check_run` guards (A1).
+/// The plain facts `check_run` guards.
 pub(super) struct RunFacts {
     pub(super) m: usize,
     pub(super) m_sess: usize,
@@ -1082,9 +1082,9 @@ pub(super) struct RunFacts {
     pub(super) state_layers: usize,
 }
 
-/// The guards of [`ChunkRun::new`] (A1): the chunk fits the buffers, and the model holds no
-/// more layers than the state (a `leading(n)` rig model is a valid prefix; A1's exact-count
-/// reading would refuse the rigs the packet itself builds).
+/// The guards of [`ChunkRun::new`]: the chunk fits the buffers, and the model holds no more layers
+/// than the state (a `leading(n)` rig model is a valid prefix; an exact layer count would refuse
+/// the test rigs).
 pub(super) fn check_run(f: &RunFacts) -> Result<(), EngError> {
     if f.m == 0 || f.m > f.m_sess {
         return Err(EngError::BadRequest(format!(
@@ -1112,7 +1112,7 @@ pub(super) enum ChunkKernelClass {
     AllMmvq,
 }
 
-/// One run of the body: the state, the checked model, the buffers and the rows (B.1).
+/// One run of the body: the state, the checked model, the buffers and the rows.
 pub(super) struct ChunkRun<'r, 'w> {
     state: &'r ResidentState,
     model: &'r ChunkModel<'r, 'w>,
@@ -1124,8 +1124,8 @@ pub(super) struct ChunkRun<'r, 'w> {
 }
 
 impl<'r, 'w> ChunkRun<'r, 'w> {
-    /// The production constructor (A1): checks the rows against the buffers and the model
-    /// against the state.
+    /// The production constructor: checks the rows against the buffers and the model against the
+    /// state.
     pub(super) fn new(
         state: &'r ResidentState,
         model: &'r ChunkModel<'r, 'w>,
@@ -1162,7 +1162,7 @@ impl<'r, 'w> ChunkRun<'r, 'w> {
     }
 }
 
-// ---- the stage functions (B.4-B.6): P1 and the two mixer blocks ------------------------------
+// ---- the stage functions: P1 and the two mixer blocks ----------------------------------------
 
 /// What every stage of one layer needs: the launch, the weights, the ordinal, the index,
 /// the kind and the prefill word.
@@ -1202,7 +1202,7 @@ impl ChunkRun<'_, '_> {
     }
 }
 
-/// P1, the embedding (B.4).
+/// P1, the embedding.
 fn chunk_embed(
     launch: &Launch<'_>,
     run: &ChunkRun<'_, '_>,
@@ -1260,12 +1260,12 @@ fn quant_a(run: &ChunkRun<'_, '_>, ctx: &LayerCtx<'_, '_>) -> Result<(), EngErro
     )
 }
 
-/// Stage 3d, the four DeltaNet in-projections (B.5). With the fusion flag on (the same
-/// `INFERENCE_CUDA_GDN_FUSE_INPROJ` the native loader fuses under) the four weights are ONE
-/// wide qkv matrix, so every launch reads its SEGMENT of that one upload: the vendored MMQ
-/// schedules its stream-k blocks from (n, m, k), and one wide launch is NOT bitwise the
-/// four narrow ones (the GDN fusion divergence, 2026-10-27). Same-shape launches over the
-/// same bytes are, so the prefill keeps four launches and the fusion keeps its one upload.
+/// Stage 3d, the four DeltaNet in-projections. With the fusion flag on (the same
+/// `INFERENCE_CUDA_GDN_FUSE_INPROJ` the native loader fuses under) the four weights are ONE wide
+/// qkv matrix, so every launch reads its SEGMENT of that one upload: the vendored MMQ schedules its
+/// stream-k blocks from (n, m, k), and one wide launch is NOT bitwise the four narrow ones.
+/// Same-shape launches over the same bytes are, so the prefill keeps four launches and the fusion
+/// keeps its one upload.
 fn call_weight_k(weight: &crate::kernels::cuda::NativeWeight) -> usize {
     weight.k()
 }
@@ -1925,7 +1925,7 @@ fn attn_out(run: &ChunkRun<'_, '_>, ctx: &LayerCtx<'_, '_>) -> Result<(), EngErr
         },
     )
 }
-/// Stage 8, `NormF` (B.7).
+/// Stage 8, `NormF`.
 fn norm_f(run: &ChunkRun<'_, '_>, ctx: &LayerCtx<'_, '_>) -> Result<(), EngError> {
     let launch = ctx.launch;
     let g = run.model.geometry;
@@ -1944,7 +1944,7 @@ fn norm_f(run: &ChunkRun<'_, '_>, ctx: &LayerCtx<'_, '_>) -> Result<(), EngError
     )
 }
 
-// ---- the MoE block and the router (B.7, B.8) --------------------------------------------------
+// ---- the MoE block and the router -------------------------------------------------------------
 
 /// The native blocks of a MoE projection or stack; `check_model` refused every other load
 /// (D5, D6), so this only fails on a model that skipped its check.
@@ -1960,7 +1960,7 @@ fn native_dense<'b>(weight: &'b DenseWeight<'_>) -> Result<&'b NativeWeight, Eng
     }
 }
 
-/// The native blocks of an expert stack (B.8).
+/// The native blocks of an expert stack.
 fn native_stack<'b>(stack: &'b StackWeights<'_>) -> Result<&'b NativeWeight, EngError> {
     match stack {
         StackWeights::Native(weight) => Ok(weight),
@@ -1970,10 +1970,10 @@ fn native_stack<'b>(stack: &'b StackWeights<'_>) -> Result<&'b NativeWeight, Eng
     }
 }
 
-/// The one in/out contract of the MoE block (B.8): in, `x2` f32 `[m][hidden]` read only, the
-/// router's `ids` i32 `[m][top_k]` read only (seam I1), `weights` f32 `[m][top_k]`,
-/// `shared_gate` f32 `[m]` and `h` f32 `[m][hidden]`; out, `h = h + Σ_r weights[t][r]·down_r
-/// + shared_gate[t]·shared_t` in place, plus status bits into `status`.
+/// The one in/out contract of the MoE block: in, `x2` f32 `[m][hidden]` read only, the router's
+/// `ids` i32 `[m][top_k]` read only, `weights` f32 `[m][top_k]`, `shared_gate` f32 `[m]` and `h`
+/// f32 `[m][hidden]`; out, `h = h + Σ_r weights[t][r]·down_r + shared_gate[t]·shared_t` in place,
+/// plus status bits into `status`.
 pub(super) struct MoeChunkIo<'b> {
     pub(super) m: usize,
     pub(super) dims: MoeDims,
@@ -1986,14 +1986,14 @@ pub(super) struct MoeChunkIo<'b> {
     pub(super) scratch: &'b ChunkViews<'b>,
 }
 
-/// The MoE dispatch (B.8): the Resident arm; the Tiered arm is OFF-7's seam I5.
+/// The MoE dispatch: the Resident arm, and the Tiered arm that chunked prefill refuses.
 pub(super) enum ChunkMoe<'a, 'w> {
     Resident(&'a MoeLayerWeights<'w>),
     #[cfg_attr(
         test,
         expect(
             dead_code,
-            reason = "v1's refusal reads neither field; OFF-7 reads them (seam I5)"
+            reason = "v1's refusal reads neither field; tiered chunk prefill will read them"
         )
     )]
     Tiered {
@@ -2002,7 +2002,7 @@ pub(super) enum ChunkMoe<'a, 'w> {
     },
 }
 
-/// Stages 10-17 (B.8), ENQUEUE ONLY.
+/// Stages 10-17, ENQUEUE ONLY.
 pub(super) fn run_chunk_moe(
     launch: &Launch<'_>,
     moe: ChunkMoe<'_, '_>,
@@ -2012,7 +2012,7 @@ pub(super) fn run_chunk_moe(
         ChunkMoe::Resident(mw) => mw,
         ChunkMoe::Tiered { .. } => {
             return Err(EngError::BadRequest(
-                "tiered chunk prefill: OFF-7".to_owned(),
+                "tiered chunk prefill: not supported".to_owned(),
             ));
         }
     };
@@ -2202,8 +2202,8 @@ fn combine_chunk_moe(launch: &Launch<'_>, io: &MoeChunkIo<'_>) -> Result<(), Eng
         },
     )
 }
-/// The router call's buffers (B.7): stage 9 binds the two raw router buffers itself, never
-/// `&MoeLayerWeights`, so OFF-7's `ChunkModel::router(layer)` changes one line.
+/// The router call's buffers: stage 9 binds the two raw router buffers itself, never
+/// `&MoeLayerWeights`, so a tiered `ChunkModel::router(layer)` changes one line.
 pub(super) struct RouteIo<'b> {
     pub(super) m: usize,
     pub(super) dims: MoeDims,
@@ -2217,7 +2217,7 @@ pub(super) struct RouteIo<'b> {
     pub(super) router_shared: &'b DeviceBuffer,
 }
 
-/// Stage 9, the router (B.7).
+/// Stage 9, the router.
 pub(super) fn run_chunk_route(launch: &Launch<'_>, io: &RouteIo<'_>) -> Result<(), EngError> {
     launch.ctx.router(
         launch.stream,
@@ -2239,7 +2239,7 @@ pub(super) fn run_chunk_route(launch: &Launch<'_>, io: &RouteIo<'_>) -> Result<(
     )
 }
 
-// ---- the layer walk and the body (B.1) --------------------------------------------------------
+// ---- the layer walk and the body --------------------------------------------------------------
 
 /// Stage 9 inside the layer walk.
 fn chunk_route(run: &ChunkRun<'_, '_>, ctx: &LayerCtx<'_, '_>) -> Result<(), EngError> {
@@ -2290,8 +2290,8 @@ fn chunk_moe(run: &ChunkRun<'_, '_>, ctx: &LayerCtx<'_, '_>) -> Result<(), EngEr
     run_chunk_moe(launch, ChunkMoe::Resident(ctx.moe), &io)
 }
 
-/// One layer of the chunk (B.1): the state ranges by the layer's `ordinal`, the weights by
-/// `layer` itself, every stage in `layer_stages` order.
+/// One layer of the chunk: the state ranges by the layer's `ordinal`, the weights by `layer`
+/// itself, every stage in `layer_stages` order.
 pub(super) fn run_chunk_layer(
     launch: &Launch<'_>,
     run: &ChunkRun<'_, '_>,
@@ -2347,11 +2347,11 @@ pub(super) fn run_chunk_layer(
     Ok(())
 }
 
-/// The chunk layer loop (B.1 order): every host guard before the first launch, then the
-/// embedding and every layer on the state's owning stream. Resolves the prefill word ONCE;
-/// every stage takes it as a range. KV8 accepts bulk M up to 1024. Unstaged attention uses tiles
-/// up to 16; each tile initializes its independent part-tail carrier with a blocking write.
-/// FP16 and staged KV8 attention are enqueue-only. Normal chunk publication is unchanged.
+/// The chunk layer loop: every host guard before the first launch, then the embedding and every
+/// layer on the state's owning stream. Resolves the prefill word ONCE; every stage takes it as a
+/// range. KV8 accepts bulk M up to 1024. Unstaged attention uses tiles up to 16; each tile
+/// initializes its independent part-tail carrier with a blocking write. FP16 and staged KV8
+/// attention are enqueue-only. Normal chunk publication is unchanged.
 pub(super) fn run_chunk_body(launch: &Launch<'_>, run: &ChunkRun<'_, '_>) -> Result<(), EngError> {
     run.state.check_chunk(launch.stream)?;
     if run.rows.end() > run.state.layout().kv.capacity {
@@ -2480,7 +2480,7 @@ mod kernel_diagnostics {
             return Err(refusal());
         }
         // A segmented call reads only its rows of the weight, mirroring the production
-        // w_seg slice of mmq_dense (the GDN fusion, 2026-10-27).
+        // w_seg slice of mmq_dense (the GDN fusion).
         let (w_off, n) = call.w_seg.unwrap_or((0, call.weight.n_rows()));
         let k = call.weight.k();
         let q_stride = q8_1_bytes(k, 1).ok_or_else(refusal)?;

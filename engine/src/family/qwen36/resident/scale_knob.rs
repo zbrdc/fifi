@@ -1,11 +1,10 @@
-//! Test support for the activation dtype of the Q36 resident decoder (packet Q36-BF16-a).
+//! Test support for the activation dtype of the Q36 resident decoder.
 //!
 //! The product lever is the `activation_dtype` setting of the engine entry (`settings.rs`): `bf16`
 //! keeps the stored BF16 scales and biases and runs BF16 activations with converted norms, `f32`
-//! keeps the G0 widening, and the decoder constructor refuses any other pairing. The ignored
-//! real-checkpoint runs have no engine entry, so this file reads the same lever from one knob and
-//! builds the decoder through the product constructor. A Q36 result never satisfies Phase 0B or
-//! Phase 1B.
+//! keeps the scales and biases widened to F32, and the decoder constructor refuses any other
+//! pairing. The ignored real-checkpoint runs have no engine entry, so this file reads the same
+//! lever from one knob and builds the decoder through the product constructor.
 //!
 //! | Variable | Values | Default |
 //! | --- | --- | --- |
@@ -14,9 +13,9 @@
 //!
 //! Any other set value fails the test. The knob applies to the real-checkpoint tests of `parity`,
 //! `route_parity` (both tests), and `prefill/parity` (its two parity gates and the prompt-speed
-//! test; packet Q36-BF16-b). The weights load test keeps `Q36_SCALE_DTYPE`, the older knob
-//! that selects the scale import alone, because it measures both import forms at the weights level;
-//! as a decoder pairing that combination is refused.
+//! test). The weights load test keeps `Q36_SCALE_DTYPE`, the older knob that selects the scale
+//! import alone, because it measures both import forms at the weights level; as a decoder pairing
+//! that combination is refused.
 
 use sha2::{Digest, Sha256};
 
@@ -54,7 +53,7 @@ pub(super) fn new_decoder<'c>(
     context_limit: u32,
 ) -> (ResidentDecoder<'c>, Activation) {
     let activation = activation_from_env();
-    // The shared construction helper of the ignored runs (packet KV8-INTEGRATE): the cache form
+    // The shared construction helper of the ignored runs: the cache form
     // comes from `Q36_KV_DTYPE` through the same env-helper rule as `Q36_ACTIVATION`. The runs
     // that build their decoder through this function (parity, route_parity, tool_forward) pick it
     // up here; `decode_timing` and `graph_count` build their own decoder and read the same helper.

@@ -14,9 +14,9 @@ pub mod tensor;
 pub mod tokenizer;
 pub mod weights;
 
-/// Serializes the in-crate tests that hold MLX adapters. The process admits two adapter leases
-/// (decision 0024), so every library test module shares this one lock. A panicked test does not
-/// poison it for the others.
+/// Serializes the in-crate tests that hold MLX adapters. The process admits two adapter leases, so
+/// every library test module shares this one lock. A panicked test does not poison it for the
+/// others.
 #[cfg(all(
     test,
     feature = "native-mlx",

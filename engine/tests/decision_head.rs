@@ -1,5 +1,5 @@
-// ANE-DECISION-01a: portable CPU adapter for the decision head.
-// Tests cross DecisionHead::predict only (agreed seam 1).
+// Portable CPU adapter for the decision head.
+// Tests cross DecisionHead::predict only.
 use inference_engine::{
     EngError,
     kernels::decision::{DecisionHead, HeadConfig, HeadWeights},

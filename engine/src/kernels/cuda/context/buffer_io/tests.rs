@@ -1,8 +1,8 @@
-//! Device tests (3090) of `allocate`, `read_at` and `write_at` (seam 1: the Rust
-//! wrapper against the C entries against the driver).
+//! Device tests (3090) of `allocate`, `read_at` and `write_at`: the Rust wrapper
+//! against the C entries against the driver.
 //!
 //! The byte counts and the queued work are process-wide, so these tests assume
-//! `--test-threads=1`, as the device suite is always run (decision 0040).
+//! `--test-threads=1`, as the device suite is always run.
 
 use crate::EngError;
 use crate::kernels::cuda::native;

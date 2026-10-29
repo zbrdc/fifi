@@ -1597,11 +1597,12 @@ mod tests {
             );
         }
     }
-    /// The cohort gate capture (reusable, R4-6): the per-position logits for the default-flip gate. Env: Q36_CKPT_DIR,
-    /// Q36_GATE_IDS (the cohort tokens.json), Q36_GATE_OUT, Q36_ACTIVATION=bf16, Q36_FLASH_DELTA (selects the kernel),
-    /// Q36_KV_DTYPE=q8. Two chunks of 2048; per chunk: prefill the first 1024 rows in Prompt
-    /// mode, then EVERY scored position 1024..2046 runs as a ONE-ROW prefill chunk in Logits
-    /// mode. The [vocab] f32 logits of the 1023 scored positions append to chunk{c}.f32.
+    /// The cohort gate capture (reusable): the per-position logits for the default-flip gate. Env:
+    /// Q36_CKPT_DIR, Q36_GATE_IDS (the cohort tokens.json), Q36_GATE_OUT, Q36_ACTIVATION=bf16,
+    /// Q36_FLASH_DELTA (selects the kernel), Q36_KV_DTYPE=q8. Two chunks of 2048; per chunk:
+    /// prefill the first 1024 rows in Prompt mode, then EVERY scored position 1024..2046 runs as a
+    /// ONE-ROW prefill chunk in Logits mode. The [vocab] f32 logits of the 1023 scored positions
+    /// append to chunk{c}.f32.
     #[cfg(all(feature = "native-mlx", target_os = "macos", target_arch = "aarch64"))]
     #[ignore = "run with --ignored and Q36_CKPT_DIR/Q36_GATE_IDS/Q36_GATE_OUT set"]
     #[test]
@@ -1662,8 +1663,8 @@ mod tests {
         }
     }
 
-    /// The robust-depth gate capture (reusable, R4-6): the decode logits at the robust depths. Same env plus
-    /// DT_DEPTHS semantics: per depth in 16384/33600/40960, prefill to the depth then eight
+    /// The robust-depth gate capture (reusable): the decode logits at the robust depths. Same env
+    /// plus DT_DEPTHS semantics: per depth in 16384/33600/40960, prefill to the depth then eight
     /// Logits steps; the [8 x vocab] pairs land in depth{d}.f32.
     #[cfg(all(feature = "native-mlx", target_os = "macos", target_arch = "aarch64"))]
     #[ignore = "run with --ignored and Q36_CKPT_DIR/Q36_GATE_IDS/Q36_GATE_OUT set"]

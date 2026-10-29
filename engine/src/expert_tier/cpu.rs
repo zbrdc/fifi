@@ -135,8 +135,8 @@ impl<K: CpuExpertKernel> CpuTier<K> {
 ///
 /// The mapping is leaked on purpose: expert views borrow it for as long as the model lives, and a
 /// model lives as long as the process (the checkpoint is immutable by policy). The scoped
-/// `MappedFile` (decision 0017, Addendum 1) does the mapping: no mlock, no madvise, and a refusal
-/// when the length is not the one the caller expects.
+/// `MappedFile` does the mapping: no mlock, no madvise, and a refusal when the length is not the
+/// one the caller expects.
 pub fn map_read_only(path: &Path, expected_len: u64) -> Result<&'static [u8], EngError> {
     let file = MappedFile::open(path, expected_len)
         .map_err(|error| EngError::Checkpoint(format!("map {}: {error}", path.display())))?;

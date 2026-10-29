@@ -1,16 +1,15 @@
-//! Device tests of the resident state pool (RD-8k phase A, commit 3): `KvMode::Int8G32`
-//! allocates the four KV8 planes of `state_layout.rs` with codes and scales zeroed, the `Fp16`
-//! path is unchanged, and the old `Int8G32` refusal of `allocate` is gone.
+//! Device tests of the resident state pool: `KvMode::Int8G32` allocates the four KV8 planes of
+//! `state_layout.rs` with codes and scales zeroed, the `Fp16` path is unchanged, and the old
+//! `Int8G32` refusal of `allocate` is gone.
 //!
-//! The prefill status word (decision 0049 item 10, CPF-7b part A) shares the rig:
-//! `clear_prefill_status` zeroes the word at chunk open and `read_prefill_status` reads it at
-//! chunk close, and `revalidate` maps what it read.
+//! The prefill status word shares the rig: `clear_prefill_status` zeroes the word at chunk open and
+//! `read_prefill_status` reads it at chunk close, and `revalidate` maps what it read.
 //!
-//! The suite is a seam-1 device suite in the style of `kernels::cuda::resident::<n>::tests`: a
-//! host with no device skips, `INFERENCE_CUDA_REQUIRE_DEVICE=1` turns the skip into a failure,
-//! and it runs with `--test-threads=1` on the device. Every test runs its device phase through
-//! `?` and reads plain host data back; the context, its stream and the pool drop with that
-//! phase, so the asserts below never unwind through a live backend (the S3b lesson).
+//! The suite is a device suite in the style of `kernels::cuda::resident::<n>::tests`: a host with
+//! no device skips, `INFERENCE_CUDA_REQUIRE_DEVICE=1` turns the skip into a failure, and it runs
+//! with `--test-threads=1` on the device. Every test runs its device phase through `?` and reads
+//! plain host data back; the context, its stream and the pool drop with that phase, so the asserts
+//! below never unwind through a live backend.
 
 use super::super::super::host::HostShape;
 use super::super::book::Health;
@@ -224,9 +223,8 @@ struct Int8Probe {
     v_scales_ok: bool,
 }
 
-/// The Result-only device phase of the refusal test. Before RD-8k this call answered
-/// BadRequest("the Int8G32 KV pool is allocated from RD-8k"); it must allocate now. The
-/// context, its stream and the state drop before the asserts.
+/// The Result-only device phase of the refusal test: an `Int8G32` pool must allocate, not answer
+/// `BadRequest`. The context, its stream and the state drop before the asserts.
 fn int8g32_phase() -> Result<Int8Probe, EngError> {
     let rig = Rig::new()?;
     let d = dims()?;
@@ -272,9 +270,8 @@ fn word_protocol() -> Result<Vec<Phase>, EngError> {
     };
     let mut phases = Vec::new();
 
-    // Chunk 1, the stale-bit row (0049 item 10): the word still holds bits of an earlier chunk
-    // (9 = 1 | 8); the clear at chunk open must zero them, so the stale bit cannot fail this
-    // chunk.
+    // Chunk 1, the stale-bit row: the word still holds bits of an earlier chunk (9 = 1 | 8); the
+    // clear at chunk open must zero them, so the stale bit cannot fail this chunk.
     or_bits(&state, 9)?;
     state.begin_prefill()?;
     state.clear_prefill_status(&stream)?;
@@ -303,7 +300,7 @@ fn word_protocol() -> Result<Vec<Phase>, EngError> {
         reread_refused,
     });
 
-    // Chunk 3, the router-fault form alone: bit 1 keeps `route_experts` (0049 item 10).
+    // Chunk 3, the router-fault form alone: bit 1 keeps `route_experts`.
     state.reset(&stream)?;
     state.begin_prefill()?;
     or_bits(&state, 1)?;
@@ -368,7 +365,7 @@ fn the_prefill_status_word_is_cleared_at_open_and_read_back_at_close() {
     assert_eq!(
         backend_operation(&router.verdict),
         Some("route_experts"),
-        "word 1 alone maps to route_experts (0049 item 10)"
+        "word 1 alone maps to route_experts"
     );
     assert!(clean.verdict.is_ok(), "{:?}", clean.verdict);
     // The publish and poison rules the reader feeds.

@@ -1,7 +1,7 @@
-//! Seam-1 device tests (3090) of the KV8 split-KV decode attention wrapper (RD-8l, class Q8b):
-//! the Rust wrapper against the C entry against the two kernels, compared with a plain f64 host
-//! reference that reads the SAME dequantized values (`code * f32(stored fp16 scale)`), inside
-//! the frozen reduction class E3 (lane M REPLY-44; the class of attn_decode, tests.rs).
+//! Seam-1 device tests (3090) of the KV8 split-KV decode attention wrapper: the Rust wrapper
+//! against the C entry against the two kernels, compared with a plain f64 host reference that
+//! reads the SAME dequantized values (`code * f32(stored fp16 scale)`), inside the frozen
+//! reduction class E3 (the class of attn_decode, tests.rs).
 //!
 //! The reference is written from the window and ring convention of the fp16 contract (token `t`
 //! is at position `P = kv_len - 1 + t` and sees `p <= P` with `P - p < window`; position `p`
@@ -10,10 +10,10 @@
 //! Cells that no token of a call may read are int8 -128 with a NaN scale (0x7e00), and `part`
 //! starts as NaN, so an out-of-range read poisons the result.
 //!
-//! The device suite runs with `--test-threads=1` (decision 0040). The fixed combine order is a
-//! property the E3 comparisons above cannot see (they never read `part`), but it IS pinned: the
-//! last test of this file owns the `part` scratch, reads the partials back and requires the
-//! device `out` to be bit-equal to an index-order host combine of exactly those partials.
+//! The device suite runs with `--test-threads=1`. The fixed combine order is a property the E3
+//! comparisons above cannot see (they never read `part`), but it IS pinned: the last test of
+//! this file owns the `part` scratch, reads the partials back and requires the device `out` to
+//! be bit-equal to an index-order host combine of exactly those partials.
 //!
 //! Each refusal is checked by the text of its error, so a test fails when another check refuses
 //! the call instead of the one under test.
@@ -64,13 +64,13 @@ fn labelled(label: &str, error: EngError) -> EngError {
 
 mod sinks;
 
-/// Class E3 (frozen, lane M REPLY-44): `max|d| <= 2^-17 * max(max|ref|, 1)` per head vector.
+/// Class E3 (frozen): `max|d| <= 2^-17 * max(max|ref|, 1)` per head vector.
 const E3: f64 = 1.0 / 131_072.0;
-/// Two times the largest per-head query spread of the RD-M6 oracle (1.691144648391655): a case
-/// with a larger `q` standard deviation is a stress case, held to a sanity bound only.
+/// Two times the largest per-head query spread of the llama.cpp oracle dumps (1.691144648391655):
+/// a case with a larger `q` standard deviation is a stress case, held to a sanity bound only.
 const IN_RANGE_QSD: f64 = 3.382;
 const STRESS_SANITY: f64 = 1e-2;
-/// An in-range maximum above 2^-19 is reported to lane M as a headroom warning.
+/// An in-range maximum above 2^-19 is printed as a headroom warning.
 const HEADROOM: f64 = 1.0 / 524_288.0;
 /// fp16 quiet NaN: the scale of every cell no token may read (its codes are -128).
 const F16_NAN: u16 = 0x7e00;
@@ -468,8 +468,8 @@ fn assert_case(outcome: &RunOutcome) {
 }
 
 /// The device phase of the reference runs: one Rig for every spec, dropped with its buffers
-/// before the plain outcomes return, so the asserts never run inside a live backend (the S3b
-/// lesson: a drop while panicking latches it).
+/// before the plain outcomes return, so the asserts never run inside a live backend (a drop
+/// while panicking latches it).
 fn reference_phase(specs: &[(Spec, Vec<usize>)]) -> Result<Vec<RunOutcome>, EngError> {
     let rig = Rig::new()?;
     specs
@@ -484,7 +484,7 @@ fn reference_phase_all(specs: &[Spec]) -> Result<Vec<RunOutcome>, EngError> {
     specs.iter().map(|spec| run_all(&rig, spec)).collect()
 }
 
-/// Prints the in-range and the stress maxima, with the lane M warnings.
+/// Prints the in-range and the stress maxima, with the headroom and stress warnings.
 fn report(test: &str, outcomes: &[(f64, bool)]) {
     let top = |stress: bool| {
         outcomes
@@ -495,10 +495,10 @@ fn report(test: &str, outcomes: &[(f64, bool)]) {
     let (in_range, stress) = (top(false), top(true));
     println!("{test}: in-range maximum {in_range:e}, stress maximum {stress:e}");
     if in_range > HEADROOM {
-        println!("{test}: HEADROOM WARNING: in-range maximum above 2^-19, report to lane M");
+        println!("{test}: HEADROOM WARNING: in-range maximum above 2^-19");
     }
     if stress > 2.0 * E3 {
-        println!("{test}: FINDING: a stress maximum is above 2^-16, report to lane M");
+        println!("{test}: FINDING: a stress maximum is above 2^-16");
     }
 }
 
@@ -752,7 +752,7 @@ fn attn_decode_q8_marks_an_invalid_kv_len_with_nan() {
 
 /// The Result-only device phase of the poison row: queues one call through `?`, drains, reads
 /// `out`, and drops the context, the stream and every buffer as it returns, so no assert,
-/// expect or unwrap runs while a CUDA owner is alive (the S3b lesson). `out` starts as 0xFF
+/// expect or unwrap runs while a CUDA owner is alive. `out` starts as 0xFF
 /// bytes and the `part` scratch as NaN, exactly as `launch` prepares a case.
 fn poison_device_phase(p: &Problem) -> Result<Vec<f32>, EngError> {
     let ctx = CudaContext::new()?;
@@ -789,11 +789,11 @@ fn poison_device_phase(p: &Problem) -> Result<Vec<f32>, EngError> {
     Ok(testkit::floats(&testkit::read_bytes(&ctx, &out, out_len)))
 }
 
-/// (e) The stored NaN group reaches attention (G-KV8 item R-A): a visible cache cell whose K
-/// and V group 0 hold the fp16 NaN scale the NaN-propagating `kv8_append` kernel stores (the
-/// output pin of `kv8_append/tests.rs`) makes every dimension of the 8 query heads of that kv
-/// head non-finite; the other kv head's heads stay finite. The reference is not used: this is a
-/// pure finiteness pin of the poison rule.
+/// (e) The stored NaN group reaches attention: a visible cache cell whose K and V group 0 hold
+/// the fp16 NaN scale the NaN-propagating `kv8_append` kernel stores (the output pin of
+/// `kv8_append/tests.rs`) makes every dimension of the 8 query heads of that kv head non-finite;
+/// the other kv head's heads stay finite. The reference is not used: this is a pure finiteness
+/// pin of the poison rule.
 #[test]
 fn attn_decode_q8_poison_reaches_the_heads_of_a_nan_stored_group() {
     if !testkit::device_present("attn_decode_q8_poison_reaches_the_heads_of_a_nan_stored_group") {
@@ -1203,7 +1203,7 @@ struct Attempt {
 
 /// The whole device phase of the refusal test: the base call, every refusal row and every
 /// accepted row, then the base call again. Both rigs drop with every buffer before the plain
-/// attempts return, so the asserts below never run inside a live backend (S3b).
+/// attempts return, so the asserts below never run inside a live backend.
 struct RefusalPhase {
     first: Attempt,
     rows: Vec<Attempt>,
@@ -1305,8 +1305,14 @@ const FILLER_SCALE: f32 = 1.0 / 64.0;
 /// `split_plan` of `attn_decode_q8.cu` on the host (all integers, so exact): `n_active` splits
 /// of `chunk` keys, a multiple of the 64-key tile, cover `count` keys.
 fn pin_split_plan(count: usize, split: AttnSplit) -> (usize, usize) {
-    let n_split = count.div_ceil(split.min_keys).max(1).min(split.max_splits);
-    let chunk = count.div_ceil(n_split).div_ceil(64) * 64;
+    // Degenerate inputs (count 0, cap 0, min_keys 0) must produce a plan, not a division
+    // by zero: every divisor is clamped to at least 1 so a zero-count plan is
+    // (chunk 64, 0 active).
+    let n_split = count
+        .div_ceil(split.min_keys.max(1))
+        .max(1)
+        .min(split.max_splits.max(1));
+    let chunk = count.div_ceil(n_split).div_ceil(64).max(1) * 64;
     (chunk, count.div_ceil(chunk))
 }
 
@@ -1599,7 +1605,7 @@ fn pin_launch(
 }
 
 /// The device phase: one launch per case, every device owner (buffers, stream, context) dropped
-/// before the plain vectors return, so the assertions below cannot unwind through a drop (S3b).
+/// before the plain vectors return, so the assertions below cannot unwind through a drop.
 fn pin_device_phase<'a>(
     cases: impl IntoIterator<Item = &'a PinCase>,
 ) -> Result<Vec<PinOutcome>, EngError> {
@@ -1655,7 +1661,7 @@ fn pin_l_orders(p: &Problem, part: &[f32]) -> Vec<(f32, f32)> {
 }
 
 /// The combine order of `attn_decode_q8` (KV8), pinned bit-exactly: the device `out` must equal
-/// an index-order host combine of the partials the kernel itself left in `part` (IMPL-KV8-M7).
+/// an index-order host combine of the partials the kernel itself left in `part`.
 /// The A-tuned cases pin the A sum, the near-hot cases pin the L sum (their `l_s` are distinct
 /// non-dyadic values, and a precondition on the device's own partials fails the test before the
 /// pin if a case cannot see the reversed order), the skewed case pins the max and underflow
@@ -1828,5 +1834,540 @@ fn attn_decode_q8_combine_is_bit_equal_to_an_index_order_host_combine_of_its_par
             }
         }
         println!("{}: the combine order is pinned bit-exactly", outcome.label);
+    }
+}
+
+/// Prefetch-arm fixture: the prefetch arm must be bitwise-equal to the legacy arm
+/// (the multiply-then-fmaf order per head is shared, so any difference is a defect), over
+/// several depths, a batch, a ring, and distinct seeds. `part` and `out` are over-allocated
+/// with poisoned guard tails past the bytes the call needs, so a read or write the kernel
+/// must not make is visible; the per-row maximum of the legacy-vs-prefetch difference is
+/// asserted zero exactly, with the row reported on failure. The distinct-query case first
+/// proves on the f64 reference that its rows separate the heads, then asserts the DEVICE
+/// outputs differ pairwise over every head pair. The whole device leg runs in a child
+/// process: forced arms can never leak into another device test of this binary in this binary.
+#[cfg(feature = "cuda-arms-qualification")]
+#[test]
+fn attn_decode_q8_prefetch_arm_is_bit_equal() {
+    const NAME: &str = "attn_decode_q8_prefetch_arm_is_bit_equal";
+    if !testkit::device_present(NAME) {
+        return;
+    }
+    const CHILD_PATH: &str =
+        "kernels::cuda::resident::attn_decode_q8::tests::attn_decode_q8_prefetch_arm_is_bit_equal";
+    if !testkit::latching_test_in_child(CHILD_PATH, &["FIXTURE-LEGS-OK", "ARM-RECEIPTS-OK"]) {
+        return;
+    }
+    // The arms and the attrs below target the register-V kernels: production enables the
+    // arm only for R1 unset or exactly "1" and otherwise silently runs the original
+    // kernel, so a leg that resolved to the original kernel would fail the dispatch-tag
+    // assert below. Refuse here unless the arm is actually enabled.
+    match std::env::var("INFERENCE_CUDA_KV8_ATTN_R1") {
+        Err(std::env::VarError::NotPresent) => {}
+        Ok(ref v) if v == "1" => {}
+        other => panic!(
+            "{NAME}: the fixture needs the register-V arm enabled; R1 must be unset or exactly '1', got {other:?}"
+        ),
+    }
+    use crate::kernels::cuda::native::resident::attn_decode_q8::{
+        attn_decode_q8_arm_attrs, attn_decode_q8_dispatched, attn_decode_q8_kernel_identity,
+        attn_decode_q8_kernel_identity_reset, attn_decode_q8_set_arms,
+    };
+
+    // The two instantiations must be DIFFERENT kernels an arm toggle that
+    // silently compares a kernel with itself fails here instead of passing vacuously.
+    let (legacy_regs, legacy_smem) =
+        attn_decode_q8_arm_attrs(0).unwrap_or_else(|e| panic!("{NAME}: legacy attrs: {e:?}"));
+    let (prefetch_regs, prefetch_smem) =
+        attn_decode_q8_arm_attrs(1).unwrap_or_else(|e| panic!("{NAME}: prefetch attrs: {e:?}"));
+    assert_ne!(
+        (legacy_regs, legacy_smem),
+        (prefetch_regs, prefetch_smem),
+        "{NAME}: the forced arms resolved to the same kernel image",
+    );
+    println!(
+        "{NAME}: arm attrs legacy=({legacy_regs}r {legacy_smem}B) prefetch=({prefetch_regs}r {prefetch_smem}B)"
+    );
+
+    struct Case {
+        label: &'static str,
+        spec: Spec,
+        seed: u64,
+        distinct_queries: bool,
+    }
+    let mut ring = Spec::qwen(1, 4100);
+    ring.cells = 4096;
+    ring.window = 2048;
+    ring.ring = 4096;
+    let mut deep = Spec::qwen(1, 4224);
+    deep.cells = 4232;
+    let mut full = Spec::qwen(1, 4224);
+    full.cells = 4224; // full linear cache: the visible count equals the cell count
+    let mut partial = Spec::qwen(1, 4225); // 66 whole tiles + a one-key partial last tile
+    partial.cells = 4232;
+    let mut batch = Spec::qwen(2, 4160);
+    batch.cells = 4168;
+    let mut m16 = Spec::qwen(16, 4160); // the m cap: every warp row a distinct token
+    m16.cells = 4175;
+    let cases = [
+        Case {
+            label: "depth-96",
+            spec: Spec::qwen(1, 96),
+            seed: 0xC3C3,
+            distinct_queries: false,
+        },
+        Case {
+            label: "depth-1088-distinct-q",
+            // No gate: its random per-head sigmoid would let heads differ even with
+            // wrong q-head indexing; gate coverage lives in the pinned cases.
+            spec: {
+                let mut s = Spec::qwen(1, 1088);
+                s.gate = false;
+                s
+            },
+            seed: 0xC4C4,
+            distinct_queries: true,
+        },
+        Case {
+            label: "batch-4-distinct-q",
+            // m=4: distinct queries must separate heads for every token, not just m=1;
+            // no gate (its random per-head sigmoid would mask wrong q-head indexing).
+            spec: {
+                let mut s = Spec::qwen(4, 1088);
+                s.gate = false;
+                s
+            },
+            seed: 0xC6C6,
+            distinct_queries: true,
+        },
+        Case {
+            label: "depth-4224",
+            spec: deep,
+            seed: 0xC5C5,
+            distinct_queries: false,
+        },
+        Case {
+            label: "full-linear-4224",
+            spec: full,
+            seed: 0xCAC5,
+            distinct_queries: false,
+        },
+        Case {
+            label: "partial-tile-4225",
+            spec: partial,
+            seed: 0xCBC5,
+            distinct_queries: false,
+        },
+        Case {
+            label: "batch-m2-4160",
+            spec: batch,
+            seed: 0xC6C6,
+            distinct_queries: false,
+        },
+        Case {
+            label: "batch-m16-4160",
+            spec: m16,
+            seed: 0xC9C6,
+            distinct_queries: false,
+        },
+        Case {
+            label: "ring-2048",
+            spec: ring,
+            seed: 0xC7C7,
+            distinct_queries: false,
+        },
+    ];
+
+    /// One launch with poisoned guard tails: 0xA5 after `part`, 0x5A after `out`. Returns the
+    /// raw bytes of both buffers including the guards. The guards prove out-of-range
+    /// WRITES; a read past the end is caught only through the byte-exact output compare
+    /// (poison read into an output changes those bytes), not by the guards alone.
+    fn guarded_launch(
+        ctx: &CudaContext,
+        stream: &DeviceStream,
+        p: &Problem,
+        guard: usize,
+    ) -> Result<(Vec<u8>, Vec<u8>), EngError> {
+        let s = &p.spec;
+        let part_bytes = attn_q8_part_bytes(s.m, s.n_kv_head, s.head_dim, s.split.max_splits)?;
+        let out_bytes = s.m * s.n_head * s.head_dim * 4;
+        let q = upload_f32(ctx, &p.q)?;
+        let proj = s.gate.then(|| upload_f32(ctx, &p.proj)).transpose()?;
+        let k_codes = upload_bytes(ctx, &le_i8(&p.k_codes))?;
+        let k_scales = upload_bytes(ctx, &le16(&p.k_scales))?;
+        let v_codes = upload_bytes(ctx, &le_i8(&p.v_codes))?;
+        let v_scales = upload_bytes(ctx, &le16(&p.v_scales))?;
+        let word = upload_bytes(ctx, &s.kv_len.to_le_bytes())?;
+        let mut part = part_content(part_bytes, PartFill::Nan);
+        part.extend(std::iter::repeat_n(0xA5, guard));
+        let mut out = vec![0xFF; out_bytes];
+        out.extend(std::iter::repeat_n(0x5A, guard));
+        let part = upload_bytes(ctx, &part)?;
+        let out = upload_bytes(ctx, &out)?;
+        ctx.attn_decode_q8(
+            stream,
+            AttnDecodeQ8Call {
+                shape: s.shape(),
+                span: s.span(),
+                split: s.split,
+                scale: s.scale(),
+                q: whole(&q)?,
+                proj: proj.as_ref().map(whole).transpose()?,
+                k_codes: whole(&k_codes)?,
+                k_scales: whole(&k_scales)?,
+                v_codes: whole(&v_codes)?,
+                v_scales: whole(&v_scales)?,
+                kv_len: whole(&word)?,
+                part: whole(&part)?,
+                out: whole(&out)?,
+            },
+        )?;
+        stream.synchronize()?;
+        Ok((
+            read_bytes(ctx, &part, part_bytes + guard)?,
+            read_bytes(ctx, &out, out_bytes + guard)?,
+        ))
+    }
+
+    const GUARD: usize = 64;
+    struct ArmOutcome {
+        out: Vec<f32>,
+        part_raw: Vec<u8>,
+        part_guard: Vec<u8>,
+        out_guard: Vec<u8>,
+    }
+    let arm = |ctx: &CudaContext,
+               stream: &DeviceStream,
+               p: &Problem,
+               prefetch: i32|
+     -> Result<ArmOutcome, EngError> {
+        attn_decode_q8_set_arms(prefetch)
+            .unwrap_or_else(|code| panic!("arm force {prefetch} rejected: {code}"));
+        let (mut part_raw, out_raw) = guarded_launch(ctx, stream, p, GUARD)?;
+        let out_len = out_raw.len() - GUARD;
+        let part_guard = part_raw.split_off(part_raw.len() - GUARD);
+        Ok(ArmOutcome {
+            out: testkit::floats(&out_raw[..out_len]),
+            part_raw,
+            part_guard,
+            out_guard: out_raw[out_len..].to_vec(),
+        })
+    };
+
+    let ctx = match CudaContext::new() {
+        Ok(ctx) => ctx,
+        Err(error) => panic!("{NAME}: no CUDA context: {error:?}"),
+    };
+    let stream = ctx.stream().expect("a stream");
+    // A panic on any leg must still restore the arms (forced arms left behind by an
+    // early `.expect` poison every later launch in this process).
+    struct ArmRestore;
+    impl Drop for ArmRestore {
+        fn drop(&mut self) {
+            let _ = attn_decode_q8_set_arms(-1);
+        }
+    }
+    let _arm_restore = ArmRestore;
+    for case in &cases {
+        // The distinct case uses problem(): its q rows are drawn independently per
+        // (token, head), and its keys carry no planted hot key (pin_problem's first-key
+        // sign pattern at +-127 saturates the softmax - one weight of exactly 1.0 in fp32
+        // for every head once a split holds enough keys - which made distinct queries
+        // return bit-identical outputs; confirmed fixture-side).
+        // Every other case keeps pin_problem and its hot-key structure on purpose.
+        let problem = if case.distinct_queries {
+            problem(&case.spec, true)
+        } else {
+            pin_problem(&case.spec, None, false, case.seed).0
+        };
+        if case.distinct_queries {
+            // Data precondition on the f64 reference (before any device launch): the distinct
+            // rows must actually separate the heads, else the head-distinctness assert below
+            // is vacuous and the DATA is at fault (saturation), not the kernel.
+            let s = &problem.spec;
+            let mut worst_rel = 0.0f64;
+            for t in 0..s.m {
+                let a = reference(&problem, t, 0);
+                let b = reference(&problem, t, 1);
+                let denom = a.iter().fold(0.0f64, |x, &v| x.max(v.abs())).max(1.0);
+                worst_rel = worst_rel
+                    .max(a.iter().zip(&b).map(|(&x, &y)| (x - y).abs()).sum::<f64>() / denom);
+            }
+            assert!(
+                worst_rel > 1e-3,
+                "{}: reference heads 0/1 differ only {worst_rel:.2e} - the case data saturates (one hot key takes all the mass); fix the generator, not the kernel",
+                case.label
+            );
+        }
+        // Explicit 0 and 1: never env-follow, so the two legs cannot silently be the same
+        // kernel or bypass register-V entirely (the two arms exist).
+        // Device-written kernel identity: the kernel itself stamps its id into a device
+        // word (thread (0,0,0) of the launch), read back after the leg. A launch
+        // statement that resolves to the WRONG kernel leaves the other leg's stamp (or
+        // zero) here even though the host dispatch tag above still names the intent,
+        // so this is the proof that the executed kernel, not the enqueue path, is the
+        // one under test.
+        attn_decode_q8_kernel_identity_reset()
+            .unwrap_or_else(|code| panic!("{}: identity reset failed: {code}", case.label));
+        let legacy = arm(&ctx, &stream, &problem, 0).expect("the legacy arm");
+        // Host dispatch tag (1 legacy, 2 prefetch), read right after each leg: proves
+        // which enqueue path ran. A leg resolved to the original kernel gives 0.
+        let legacy_tag = attn_decode_q8_dispatched();
+        let legacy_ran = attn_decode_q8_kernel_identity()
+            .unwrap_or_else(|code| panic!("{}: identity read failed: {code}", case.label));
+        attn_decode_q8_kernel_identity_reset()
+            .unwrap_or_else(|code| panic!("{}: identity reset failed: {code}", case.label));
+        let prefetch = arm(&ctx, &stream, &problem, 1).expect("the prefetch arm");
+        let prefetch_tag = attn_decode_q8_dispatched();
+        let prefetch_ran = attn_decode_q8_kernel_identity()
+            .unwrap_or_else(|code| panic!("{}: identity read failed: {code}", case.label));
+        assert_eq!(
+            legacy_tag, 1,
+            "{}: the legacy leg did not dispatch the legacy kernel",
+            case.label
+        );
+        assert_eq!(
+            prefetch_tag, 2,
+            "{}: the prefetch leg did not dispatch the prefetch kernel",
+            case.label
+        );
+        assert_eq!(
+            legacy_ran, 1,
+            "{}: the DEVICE identity after the legacy leg is not the legacy kernel's",
+            case.label
+        );
+        assert_eq!(
+            prefetch_ran, 2,
+            "{}: the DEVICE identity after the prefetch leg is not the prefetch kernel's",
+            case.label
+        );
+
+        // Every asserted element is finite first, so no NaN can pass a comparison vacuously.
+        for (label, values) in [("legacy", &legacy.out), ("prefetch", &prefetch.out)] {
+            for (index, value) in values.iter().enumerate() {
+                assert!(
+                    value.is_finite(),
+                    "{}: {label} out[{index}] is {value}",
+                    case.label
+                );
+            }
+        }
+        // Guards: a kernel that read or wrote past its buffers cannot pass this.
+        assert_eq!(
+            legacy.part_guard,
+            vec![0xA5; GUARD],
+            "{}: part guard",
+            case.label
+        );
+        assert_eq!(
+            legacy.out_guard,
+            vec![0x5A; GUARD],
+            "{}: out guard",
+            case.label
+        );
+        assert_eq!(
+            prefetch.part_guard,
+            vec![0xA5; GUARD],
+            "{}: part guard",
+            case.label
+        );
+        assert_eq!(
+            prefetch.out_guard,
+            vec![0x5A; GUARD],
+            "{}: out guard",
+            case.label
+        );
+        // Bitwise identity of out and part (raw bytes: the untouched poison cells hold NaN
+        // bits that byte comparison keeps exact) and the per-row maximum on failure.
+        assert_eq!(
+            legacy.part_raw, prefetch.part_raw,
+            "{}: part bytes differ between the legacy and prefetch arms",
+            case.label
+        );
+        let spec = &case.spec;
+        for t in 0..spec.m {
+            for h in 0..spec.n_head {
+                let row = &legacy.out[(t * spec.n_head + h) * spec.head_dim..][..spec.head_dim];
+                let other = &prefetch.out[(t * spec.n_head + h) * spec.head_dim..][..spec.head_dim];
+                let max = row
+                    .iter()
+                    .zip(other)
+                    .map(|(&a, &b)| (a - b).abs())
+                    .fold(0.0f32, f32::max);
+                assert_eq!(
+                    max, 0.0,
+                    "{}: token {t} head {h} differs between the arms (max {max:e})",
+                    case.label
+                );
+                let row_bits: Vec<u32> = row.iter().map(|x| x.to_bits()).collect();
+                let other_bits: Vec<u32> = other.iter().map(|x| x.to_bits()).collect();
+                assert_eq!(
+                    row_bits, other_bits,
+                    "{}: token {t} head {h} bits",
+                    case.label
+                );
+            }
+        }
+        // Per-head f64 reference check: every head's device row must match the f64
+        // reference within fp32 softmax tolerance. Wrong q-head indexing (the failure
+        // mode pairwise head-distinctness can miss under gating) produces O(1)
+        // differences here.
+        {
+            let mut worst = 0.0f64;
+            for t in 0..spec.m {
+                for h in 0..spec.n_head {
+                    let r = reference(&problem, t, h);
+                    // A NaN reference element would make f64::max skip the diff and the
+                    // bound pass vacuously, so finiteness is asserted up front.
+                    assert!(
+                        r.iter().all(|v| v.is_finite()),
+                        "{}: f64 reference not finite at token {t} head {h}",
+                        case.label
+                    );
+                    let row = &legacy.out[(t * spec.n_head + h) * spec.head_dim..][..spec.head_dim];
+                    let denom = r.iter().fold(0.0f64, |x, &v| x.max(v.abs())).max(1.0);
+                    let diff = row
+                        .iter()
+                        .zip(&r)
+                        .map(|(&a, &b)| (a as f64 - b).abs())
+                        .fold(0.0f64, f64::max);
+                    worst = worst.max(diff / denom);
+                }
+            }
+            assert!(
+                worst <= 1e-3,
+                "{}: device vs f64 reference, worst relative head error {worst:e}",
+                case.label
+            );
+        }
+        if case.distinct_queries {
+            // The perturbed queries must actually reach the outputs: EVERY pair of heads of
+            // one token must differ, so the case is not vacuously identical across heads
+            // (pairs inside a KV group share V rows, the strongest form of the check).
+            let d = spec.head_dim;
+            for t in 0..spec.m {
+                for h0 in 0..spec.n_head {
+                    for h1 in (h0 + 1)..spec.n_head {
+                        let a = &legacy.out[(t * spec.n_head + h0) * d..][..d];
+                        let b = &legacy.out[(t * spec.n_head + h1) * d..][..d];
+                        assert_ne!(
+                            a, b,
+                            "{}: token {t} heads {h0}/{h1} identical under distinct queries",
+                            case.label
+                        );
+                    }
+                }
+            }
+        }
+        println!(
+            "{}: the prefetch arm is bitwise-equal to the legacy arm",
+            case.label
+        );
+    }
+    println!("ARM-RECEIPTS-OK");
+    println!("FIXTURE-LEGS-OK");
+}
+
+/// Host-only split-plan pin (moved out of the device test): the
+/// production cap 64 at 65,536 keys gives an even 1024-key chunk over 64 active splits.
+#[cfg(feature = "cuda-arms-qualification")]
+#[test]
+fn attn_decode_q8_split_plan_pin_64_cap_at_64k_keys() {
+    use crate::kernels::cuda::native::resident::attn_decode_q8::attn_decode_q8_split_plan;
+    let (chunk, n_active) = attn_decode_q8_split_plan(65_536, 64, 64)
+        .unwrap_or_else(|e| panic!("split plan pin: {e:?}"));
+    assert_eq!(
+        (chunk, n_active),
+        (1024, 64),
+        "the 64-cap plan at 65,536 keys"
+    );
+    let (chunk, n_active) = attn_decode_q8_split_plan(65_536, 61, 64)
+        .unwrap_or_else(|e| panic!("split plan pin (61 cap): {e:?}"));
+    assert_eq!(
+        (chunk, n_active),
+        (1088, 61),
+        "the 61-cap plan at 65,536 keys"
+    );
+    let (chunk, n_active) = attn_decode_q8_split_plan(65_536, 41, 64)
+        .unwrap_or_else(|e| panic!("split plan pin (41 cap): {e:?}"));
+    assert_eq!(
+        (chunk, n_active),
+        (1600, 41),
+        "the 41-cap plan at 65,536 keys"
+    );
+    assert!(
+        attn_decode_q8_split_plan(0, 64, 64).is_err(),
+        "degenerate n_keys must be rejected, not divide by zero"
+    );
+    assert!(
+        attn_decode_q8_split_plan(i32::MAX, 64, 64).is_err(),
+        "i32::MAX keys overflow want's sum and must be rejected"
+    );
+    assert!(
+        attn_decode_q8_split_plan(2_147_483_600, 1, 1).is_err(),
+        "only the tile round-up overflows here: c0+63 crosses INT_MAX"
+    );
+    // The exact accepted edge at cap 64 under addition bounds: n_keys + chunk is
+    // INT_MAX here; one key more and that ADDITION itself overflows on device
+    // before the -1 (C evaluates (a + b) - 1).
+    let (chunk, n_active) = attn_decode_q8_split_plan(2_114_445_375, 64, 64)
+        .unwrap_or_else(|e| panic!("split plan pin (edge): {e:?}"));
+    assert_eq!(
+        (chunk, n_active),
+        (33_038_272, 64),
+        "the 64-cap plan at the exact int overflow edge"
+    );
+    assert!(
+        attn_decode_q8_split_plan(2_114_445_376, 64, 64).is_err(),
+        "one key past the edge, n_keys + chunk = INT_MAX + 1 overflows the addition"
+    );
+
+    // Sweep: the host mirror must equal the pure-Rust model of the device arithmetic
+    // for every plausible key count and the four qualification caps.
+    for cap in [1, 41, 61, 64, 128] {
+        for keys in 1..=70_000 {
+            let host = attn_decode_q8_split_plan(keys, cap, 64).expect("sweep host");
+            let model = pin_split_plan(
+                keys as usize,
+                AttnSplit {
+                    max_splits: cap as usize,
+                    min_keys: 64,
+                },
+            );
+            assert_eq!(
+                (host.0 as usize, host.1 as usize),
+                model,
+                "mirror vs model drift at keys {keys} cap {cap}"
+            );
+        }
+    }
+}
+#[cfg(feature = "cuda-arms-qualification")]
+#[test]
+fn attn_decode_q8_split_plan_device_probe_pins_the_host_mirror() {
+    use crate::kernels::cuda::native::resident::attn_decode_q8::{
+        attn_decode_q8_split_plan, attn_decode_q8_split_plan_device,
+    };
+    if !testkit::device_present("attn_decode_q8_split_plan_device_probe_pins_the_host_mirror") {
+        return;
+    }
+    // The DEVICE helper must agree with the host mirror on the same tuples: this pins
+    // both copies, not only the host mirror. GPU-guarded: the probe allocates and
+    // launches, so a GPU-less feature run skips it instead of panicking.
+    for &(keys, cap, expect) in &[
+        (65_536, 64, (1024, 64)),
+        (65_536, 61, (1088, 61)),
+        (65_536, 41, (1600, 41)),
+        (2_114_445_375, 64, (33_038_272, 64)),
+    ] {
+        let host = attn_decode_q8_split_plan(keys, cap, 64)
+            .unwrap_or_else(|e| panic!("host mirror at cap {cap}: {e:?}"));
+        let device = attn_decode_q8_split_plan_device(keys, cap, 64)
+            .unwrap_or_else(|e| panic!("device probe at cap {cap}: {e:?}"));
+        assert_eq!(host, expect, "host mirror at cap {cap}, keys {keys}");
+        assert_eq!(
+            device, expect,
+            "device split_plan at cap {cap}, keys {keys}"
+        );
     }
 }

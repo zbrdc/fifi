@@ -94,9 +94,9 @@ impl CacheStep {
     }
 
     /// The context-limit seam: the same step at a raised full-layer capacity. The
-    /// limit is a SESSION parameter (the coordinator's 131,072 default), set only
-    /// after the factory/budget gates; `new` keeps the 8,192 default unchanged.
-    /// The hard ceiling is the model's 262,144.
+    /// limit is a SESSION parameter (131,072 by default), set only after the
+    /// factory/budget gates; `new` keeps the 8,192 default unchanged. The hard
+    /// ceiling is the model's 262,144.
     pub(super) fn with_limit(layer: usize, pos: u32, limit: u32) -> Result<Self, EngError> {
         if limit < WINDOW {
             return Err(EngError::BadRequest(format!(
@@ -200,9 +200,9 @@ mod native {
         pub(in crate::family::flint) planes: Vec<Option<Plane>>,
         pub(in crate::family::flint) pos: u32,
         pub(in crate::family::flint) valid: bool,
-        /// Grown full-attention capacity (CTX32K-GROW): full planes start at
-        /// the rounded-up prompt need, not the context limit, and double as
-        /// chunks cross it. Ring planes stay at WINDOW and never grow.
+        /// Grown full-attention capacity: full planes start at the rounded-up
+        /// prompt need, not the context limit, and double as chunks cross it.
+        /// Ring planes stay at WINDOW and never grow.
         pub(in crate::family::flint) full_capacity: u32,
     }
 
@@ -217,10 +217,10 @@ mod native {
         }
 
         /// Grows the full-attention planes so `need_end` rows fit, keeping
-        /// short prompts at a short-prompt allocation (CTX32K-GROW). The
-        /// capacity rounds up to 4096 rows, doubles on later crossings, and
-        /// never passes the context limit; a need beyond the limit is the
-        /// usual context error and grows nothing.
+        /// short prompts at a short-prompt allocation. The capacity rounds up
+        /// to 4096 rows, doubles on later crossings, and never passes the
+        /// context limit; a need beyond the limit is the usual context error
+        /// and grows nothing.
         pub(in crate::family::flint) fn ensure_full_capacity(
             &mut self,
             k: &mut MlxKernels,
@@ -269,8 +269,8 @@ mod native {
         /// Installs a snapshot as the live state, sharing again so the store's
         /// entry stays valid after this session continues. The WORKER hands
         /// over an already-reset session (it resets before invoking the
-        /// executor restore; Sol wave-2 N-5); `valid` is true because the
-        /// snapshot rows are exactly the rows the saved prefill produced.
+        /// executor restore); `valid` is true because the snapshot rows are
+        /// exactly the rows the saved prefill produced.
         pub(in crate::family::flint) fn restore_prefix(&mut self, snapshot: &PrefixSnapshot) {
             self.planes = share_planes(&snapshot.planes);
             self.pos = snapshot.pos;
@@ -333,8 +333,8 @@ mod native {
         }
 
         fn new(k: &mut MlxKernels, capacity: u32) -> Result<Self, EngError> {
-            // CTX32K-GROW: device zeros - no host staging vector, no import
-            // copy, so a full-capacity plane costs no host bandwidth.
+            // Device zeros - no host staging vector, no import copy, so a
+            // full-capacity plane costs no host bandwidth.
             let key = k.kv_zeros(capacity)?;
             let value = k.kv_zeros(capacity)?;
             Ok(Self { key, value })
@@ -422,30 +422,28 @@ mod native {
                 Some(plane) => plane,
                 None => Self::new(k, plan.step.capacity)?,
             };
-            // Ring-view route (the Qwen Q36-KV-INTEGRATE shape): a
-            // full-attention plane whose chunk does not wrap the ring appends
-            // its rows in place FIRST and hands attention the plane;
-            // shared_attention passes len = p0+1 separately from the plane's
-            // row count, and rows at or beyond len are masked or skipped, so
-            // retired ring rows are never read. Safety is MLX functional
-            // semantics, not geometry alone: kv_append donates in place only
-            // when the handle is unique (a copy otherwise), rows at or beyond
-            // len are never read, and the D2 group-boundary roots still
-            // evaluate the plane each four layers, so the next step's append
-            // finds the handle unique.
+            // Ring-view route (the shape of the Qwen3.6 KV path): a full-attention
+            // plane whose chunk does not wrap the ring appends its rows in place
+            // FIRST and hands attention the plane; shared_attention passes
+            // len = p0+1 separately from the plane's row count, and rows at or
+            // beyond len are masked or skipped, so retired ring rows are never
+            // read. Safety is MLX functional semantics, not geometry alone:
+            // kv_append donates in place only when the handle is unique (a copy
+            // otherwise), rows at or beyond len are never read, and the async
+            // chain's group-boundary roots still evaluate the plane each four
+            // layers, so the next step's append finds the handle unique.
             //
-            // F3: when FIFI_FLINT_MLX_DECODE_ATTN arms for this process,
-            // attention instead gets the PREFIX SLICE [0, len); flag off
-            // keeps the whole-plane share bit for bit. The slice is a
-            // zero-copy view for the vendor kernel (MLX vector-mode SDPA
-            // accepts batch-1, D-stride-1 planes without copying, and the
-            // never-wrap invariant makes rows [0, len) the valid
-            // chronological history), it turns len into the handed plane's
-            // own row count so the existing s <= kv_len guard admits the
-            // vendor route, and its bytes match the ring-OFF union arm
-            // exactly. The flash kernel WOULD copy that same slice (its
-            // metal_kernel API pins ensure_row_contiguous), so the slice
-            // arms only with the vendor predicate.
+            // When FIFI_FLINT_MLX_DECODE_ATTN arms for this process, attention
+            // instead gets the PREFIX SLICE [0, len); flag off keeps the
+            // whole-plane share bit for bit. The slice is a zero-copy view for
+            // the vendor kernel (MLX vector-mode SDPA accepts batch-1,
+            // D-stride-1 planes without copying, and the never-wrap invariant
+            // makes rows [0, len) the valid chronological history), it turns
+            // len into the handed plane's own row count so the existing
+            // s <= kv_len guard admits the vendor route, and its bytes match
+            // the ring-OFF union arm exactly. The flash kernel WOULD copy that
+            // same slice (its metal_kernel API pins ensure_row_contiguous), so
+            // the slice arms only with the vendor predicate.
             let capacity = plane.key.shape()[1];
             let routes = crate::family::flint::mlx_forward::ring_view_routes(
                 crate::family::flint::mlx_forward::RingViewGeometry {
@@ -495,7 +493,7 @@ mod native {
         }
 
         /// The tensors a group-boundary evaluate must root: the appended key
-        /// and value planes (D2 async chain).
+        /// and value planes (async chain).
         pub(in crate::family::flint) fn append_roots(&self) -> [&ExecutionTensor; 2] {
             [&self.key, &self.value]
         }
@@ -525,13 +523,12 @@ mod native {
             Ok(())
         }
 
-        /// D2 async chain (design scrch/7c82644c/flint-async-chain/DESIGN.md):
-        /// the one-row commit with no host-ordered fences. Instead of the
-        /// two evaluates above, each append carries a graph edge on this
-        /// layer's union views (`depended_update`), so MLX orders the in-place
-        /// plane write after every pending reader inside the graph; the
-        /// forward loop roots the accumulated graph at each group boundary.
-        /// The donate semantics of `kv_append` are unchanged.
+        /// Async chain: the one-row commit with no host-ordered fences. Instead of the
+        /// two evaluates above, each append carries a graph edge on this layer's union
+        /// views (`depended_update`), so MLX orders the in-place plane write after
+        /// every pending reader inside the graph; the forward loop roots the
+        /// accumulated graph at each group boundary. The donate semantics of
+        /// `kv_append` are unchanged.
         pub(in crate::family::flint) fn commit_chunk_chained(
             k: &mut MlxKernels,
             held: &mut Option<Self>,
@@ -711,13 +708,13 @@ pub(in crate::family::flint) fn capacity_target(need_end: u32, current: u32, lim
     rounded.max(current.max(1) * 2).min(limit)
 }
 
-/// F3: the prefix-slice row count vendor decode reads instead of the whole
+/// The prefix-slice row count vendor decode reads instead of the whole
 /// ring-view plane - the visible length INCLUDING the row just appended
-/// (p0 + rows) - or `None` to keep the whole-plane share. `None` also when
-/// the plane is exactly full (the slice would be the plane itself) and when
-/// the vendor flag does not arm for this process (flash must never meet the
-/// strided slice: it copies what the vendor kernel takes as a view). Pure
-/// so tests can pin the bounds without MLX arrays.
+/// (p0 + rows) - or `None` to keep the whole-plane share. `None` also when the
+/// plane is exactly full (the slice would be the plane itself) and when the
+/// vendor flag does not arm for this process (flash must never meet the strided
+/// slice: it copies what the vendor kernel takes as a view). Pure so tests can
+/// pin the bounds without MLX arrays.
 pub(in crate::family::flint) fn vendor_decode_slice_len(
     p0: u32,
     rows: u32,

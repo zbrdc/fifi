@@ -1,8 +1,8 @@
 /*
- * The Q5_0 decode matmul (MEL-C1b). One warp per 8-row group; the arithmetic is the vendored one
- * (mma884.cuh, unmodified): exact integer dequantization through the 0x6400 exponent trick with one
- * fp16 multiply by d, and fp32 accumulation in m8n8k4. Only the loop is new, because the tile is
- * 8 x 128 (MEL-C1a) and the vendored loop reads one 8 x 256 tile per step.
+ * The Q5_0 decode matmul. One warp per 8-row group; the arithmetic is the vendored one (mma884.cuh,
+ * unmodified): exact integer dequantization through the 0x6400 exponent trick with one fp16
+ * multiply by d, and fp32 accumulation in m8n8k4. Only the loop is new, because the tile is 8 x 128
+ * (tile_q5_0.rs) and the vendored loop reads one 8 x 256 tile per step.
  *
  * A logical tile is 256 k = two weight tiles A = 2L and B = 2L + 1 of the group. Quadpair q takes x
  * chunk 64q..64q+63 of the logical tile: the two consecutive blocks 2 (q & 1) and 2 (q & 1) + 1 of
@@ -38,8 +38,8 @@ struct Raw {
   uint4 qs[2];  // the 16 qs bytes of block jb and of block jb + 1
 };
 
-// b0 is the tile block index 4 * row + jb (MEL-C1a: b = 4 * row + j); jb is even, so every load
-// below is aligned to its width: d at tile byte 2 b0, qh at 64 + 4 b0, qs at 192 + 16 b0.
+// b0 is the tile block index 4 * row + jb (tile_q5_0.rs: b = 4 * row + j); jb is even, so every
+// load below is aligned to its width: d at tile byte 2 b0, qh at 64 + 4 b0, qs at 192 + 16 b0.
 __device__ inline Raw load_raw(const uint4* tile, int b0) {
   const unsigned char* bytes = reinterpret_cast<const unsigned char*>(tile);
   Raw r;

@@ -1,16 +1,16 @@
-//! The device tests of the chunk layer loop (CPF-7a part 2, D.2): DV1 (the Resident MoE arm
-//! against host references on the small rig), the five-layer rig (DV3, DV4a, DV4b, DV5, DV6)
-//! and DV7 (the Tiered arm's typed refusal).
+//! The device tests of the chunk layer loop: DV1 (the Resident MoE arm against host references on
+//! the small rig), the five-layer rig (DV3, DV4a, DV4b, DV5, DV6) and DV7 (the Tiered arm's typed
+//! refusal).
 //!
-//! Rig rules (lane rules): synthetic weights only; every device phase returns `Result` with
-//! only `?` inside and every owner dropped before the host asserts; the HARD GATE comes first
-//! (every device output finite or in its valid domain, output buffers prefilled with a 0xFF
-//! NaN sentinel so an unwritten value fails); tolerances are derived or frozen, never set or
-//! widened; each refusal row reaches its own guard with every other guard satisfied.
+//! Rig rules: synthetic weights only; every device phase returns `Result` with only `?` inside and
+//! every owner dropped before the host asserts; the HARD GATE comes first (every device output
+//! finite or in its valid domain, output buffers prefilled with a 0xFF NaN sentinel so an unwritten
+//! value fails); tolerances are derived or frozen, never set or widened; each refusal row reaches
+//! its own guard with every other guard satisfied.
 //!
-//! None of these tests deliberately triggers a native refusal: every refusal below is a
-//! host-side `BadRequest` before any native call (no latch), and C6's raw-FFI row reads the C
-//! status directly without the `native_error` mapping.
+//! None of these tests deliberately triggers a native refusal: every refusal below is a host-side
+//! `BadRequest` before any native call (no latch), and the raw-FFI row reads the C status directly
+//! without the `native_error` mapping.
 
 use super::moe::{Launch, MoeDims, MoeLayerWeights, StackWeights};
 use super::native_device_rig::{
@@ -177,10 +177,10 @@ fn q4k_stack(
         .with_experts(Some(experts)))
 }
 
-/// The router weights of the small rig: 16 rows of `hidden` and the shared row, values in
-/// [-1, 1] from the rig's generator. The first column carries a +-16 bonus (experts 0..8
-/// positive, 8..16 negative), so with an input whose first column is bounded away from 0 the
-/// 8th/9th logit gap holds for every row by construction (D.2's data precondition).
+/// The router weights of the small rig: 16 rows of `hidden` and the shared row, values in [-1, 1]
+/// from the rig's generator. The first column carries a +-16 bonus (experts 0..8 positive, 8..16
+/// negative), so with an input whose first column is bounded away from 0 the 8th/9th logit gap
+/// holds for every row by construction.
 fn small_router(rng: &mut Rng, hidden: usize) -> (Vec<f32>, Vec<f32>) {
     let mut w: Vec<f32> = (0..DIMS.n_expert * hidden)
         .map(|_| (unit01(rng) * 2.0 - 1.0) as f32)
@@ -213,9 +213,9 @@ fn small_row(rng: &mut Rng, t: usize, hidden: usize) -> Vec<f32> {
         .collect()
 }
 
-/// The host f64 router rule (RD-5's, as the kernel doc states it): softmax over all experts,
-/// the top-8 by probability descending and the lower index first on a tie, weights
-/// renormalized over the selected set in rank order, and the sigmoid of the shared dot.
+/// The host f64 router rule (the router kernel's, as its doc states it): softmax over all experts,
+/// the top-8 by probability descending and the lower index first on a tie, weights renormalized
+/// over the selected set in rank order, and the sigmoid of the shared dot.
 fn ref_route(
     x: &[f32],
     w: &[f32],
@@ -320,8 +320,8 @@ fn hop_stats(got: &[f32], want: &[f64], row_len: usize) -> HopStats {
     }
 }
 
-/// DV1: stages 9-17 on the small rig against host references (D.2). M in {49, 130} in one
-/// process; buffers unaliased, passed through `ChunkViews::from_ranges`.
+/// DV1: stages 9-17 on the small rig against host references. M in {49, 130} in one process;
+/// buffers unaliased, passed through `ChunkViews::from_ranges`.
 #[test]
 fn chunk_moe_resident_matches_the_host_reference() {
     if !device_present("chunk_moe_resident_matches_the_host_reference") {
@@ -684,7 +684,7 @@ fn chunk_moe_resident_matches_the_host_reference() {
                 sorted[7] - sorted[8]
             );
         }
-        // 3. The Q8X hops (0049 A2, FROZEN): routed gate/up from x2 <= 1e-3, routed down from
+        // 3. The Q8X hops (FROZEN): routed gate/up from x2 <= 1e-3, routed down from
         //    the device act rows <= 2e-3, shared gate/up from x2 <= 5e-4, shared down from the
         //    device act_sh rows <= 5e-4, all against f64 on the dequantized weights with the
         //    device's own f32 hop input.
@@ -902,7 +902,7 @@ fn chunk_moe_resident_matches_the_host_reference() {
     }
 }
 
-// ---- the five-layer rig (real dims; D.2) ------------------------------------------------------
+// ---- the five-layer rig (real dims) -----------------------------------------------------------
 
 use super::dims::{KvMode, StepDims, StepOptions};
 use super::layer_table::LayerTable;
@@ -1295,8 +1295,8 @@ fn widened_tensors(
         .collect())
 }
 
-/// Zero-fills `buffer` on `stream` in 4 MiB ordered writes (the C3 rule; production's driver
-/// owns it, the rig does it itself).
+/// Zero-fills `buffer` on `stream` in 4 MiB ordered writes (the driver's zero-fill rule;
+/// production's driver owns it, the rig does it itself).
 fn zero_fill(
     ctx: &CudaContext,
     stream: &DeviceStream,
@@ -1358,7 +1358,7 @@ type RigSession = (
 );
 
 /// The tensors, arena and part of one rig session: the widened tensors, the arena planned
-/// from them (zero-filled, C3's rule) and one part allocation of `part_bytes`.
+/// from them (zero-filled, as the driver does) and one part allocation of `part_bytes`.
 fn rig_session(
     rig: &Rig,
     m_sess: usize,
@@ -1395,7 +1395,7 @@ fn clean_ids(m: usize, rng: &mut Rng) -> Vec<i32> {
     (0..m).map(|_| rng.below(1_024) as i32).collect()
 }
 
-/// Opens a chunk the way the driver does (§C.4): `begin_prefill`, then the word clear.
+/// Opens a chunk the way the driver does: `begin_prefill`, then the word clear.
 fn open_chunk(state: &mut ResidentState, stream: &DeviceStream) -> Result<(), EngError> {
     state.begin_prefill()?;
     state.clear_prefill_status(stream)
@@ -1450,7 +1450,7 @@ fn rig_body(
 }
 
 /// DV3: a bad token id maps into the prefill word as 5 (embed mask 4 + router/guard mask 1),
-/// no mask 8, and the step status word is untouched. Kills 7a-M3.
+/// no mask 8, and the step status word is untouched.
 #[test]
 fn chunk_body_maps_faults_into_the_prefill_word() {
     if !device_present("chunk_body_maps_faults_into_the_prefill_word") {
@@ -1551,7 +1551,7 @@ fn chunk_body_maps_faults_into_the_prefill_word() {
     assert_eq!(before, after, "the step status word changed");
 }
 
-/// DV4a: prefix views repeat and continue (M1). Kills 7a-M6.
+/// DV4a: prefix views repeat and continue.
 #[test]
 fn chunk_body_prefix_views_repeat_and_continue() {
     if !device_present("chunk_body_prefix_views_repeat_and_continue") {
@@ -1715,7 +1715,7 @@ fn chunk_body_prefix_views_repeat_and_continue() {
     assert_eq!(word, 0, "the word of run (c)");
 }
 
-/// DV4b (i): the state is indexed by the layer's ordinal. Kills 7a-L1.
+/// DV4b (i): the state is indexed by the layer's ordinal.
 #[test]
 fn chunk_body_indexes_state_by_layer_ordinal() {
     if !device_present("chunk_body_indexes_state_by_layer_ordinal") {
@@ -1845,7 +1845,7 @@ fn chunk_body_indexes_state_by_layer_ordinal() {
     }
 }
 
-/// DV4b (ii): the weights are indexed by `layer`. Kills 7a-L2 and 7a-L3.
+/// DV4b (ii): the weights are indexed by `layer`.
 #[test]
 fn chunk_body_indexes_weights_by_layer() {
     if !device_present("chunk_body_indexes_weights_by_layer") {
@@ -1922,7 +1922,7 @@ fn chunk_body_indexes_weights_by_layer() {
 }
 
 /// DV5: every body guard refuses before any launch (the word and a canary on `Hidden` are
-/// unchanged after a synchronize). Kills 7a-M10, 7a-R1, 7a-K1.
+/// unchanged after a synchronize).
 #[test]
 fn chunk_body_refuses_before_any_launch() {
     if !device_present("chunk_body_refuses_before_any_launch") {
@@ -2024,8 +2024,7 @@ fn chunk_body_refuses_before_any_launch() {
     // fcd9c3e5 admits Int8G32, so this mode is no longer a refusal case.
 }
 
-/// DV6: the constructors refuse through their own checks (revision 2, MAJOR-2). Kills 7a-V4,
-/// 7a-V8, 7a-B6, 7a-D10.
+/// DV6: the constructors refuse through their own checks.
 #[test]
 fn chunk_constructors_refuse_through_their_checks() {
     if !device_present("chunk_constructors_refuse_through_their_checks") {
@@ -2167,8 +2166,7 @@ fn chunk_constructors_refuse_through_their_checks() {
     );
 }
 
-/// DV7: the Tiered arm refuses, before any launch, with exactly OFF-7's text (revision 2,
-/// MAJOR-2 and NIT-4). Kills 7a-T1.
+/// DV7: the Tiered arm refuses, before any launch, with exactly its typed refusal text.
 #[test]
 fn chunk_moe_tiered_arm_refuses_before_any_launch() {
     if !device_present("chunk_moe_tiered_arm_refuses_before_any_launch") {
@@ -2346,7 +2344,7 @@ fn chunk_moe_tiered_arm_refuses_before_any_launch() {
     let (text, h, word) = phase().expect("the device phase");
     assert_eq!(
         text.as_str(),
-        "tiered chunk prefill: OFF-7",
+        "tiered chunk prefill: not supported",
         "the Tiered refusal text"
     );
     assert!(h.iter().all(|byte| *byte == 0xFF), "the h canary changed");
@@ -2452,11 +2450,10 @@ fn fused_ab_digest() -> Result<Vec<(String, u64)>, EngError> {
     Ok(planes)
 }
 
-/// The GDN fusion's prefill identity (the 2026-10-27 divergence RED): with
-/// `INFERENCE_CUDA_GDN_FUSE_INPROJ=1` the delta layers' input projections run over the ONE
-/// fused upload, and the chunk's every output byte - arena, KV, conv and recurrent state -
-/// must equal the unfused launches'. The parent drives two children (env is process-global)
-/// and compares the digests.
+/// The GDN fusion's prefill identity: with `INFERENCE_CUDA_GDN_FUSE_INPROJ=1` the delta layers'
+/// input projections run over the ONE fused upload, and the chunk's every output byte - arena, KV,
+/// conv and recurrent state - must equal the unfused launches'. The parent drives two children (env
+/// is process-global) and compares the digests.
 #[test]
 fn fused_gdn_prefill_chunk_is_bitwise_the_unfused_launches() {
     const NAME: &str = "fused_gdn_prefill_chunk_is_bitwise_the_unfused_launches";

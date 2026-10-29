@@ -1,6 +1,5 @@
 //! Crate-internal executor seam: the `ExecutorOps` trait and the per-job `GenerationState`.
 //!
-//! Design: the family descriptor design ("Executor trait"), decision 0033.
 //! The scripted test fake lives in `crate::exec_fake`.
 
 use crate::EngError;
@@ -116,37 +115,34 @@ pub(crate) trait ExecutorOps {
     fn prefill_piece(&self) -> Option<usize> {
         None
     }
-    /// The limits of this executor's prefix store (decision 0036, addenda 1 and 2): how many
-    /// pinned roots and how many LRU entries it holds. The worker asks once per job and plans
-    /// its save points with the answer: it emits a root point only when `roots > 0`, so a job
-    /// with a root boundary behaves like a job without one on an engine that keeps no roots. It
-    /// emits periodic points only when `entries >= 2`, because with one entry the tip would
-    /// replace a periodic entry at once.
-    /// The default is the addendum 1 store: zero roots and one entry. An executor that enables
-    /// the set overrides this method and must answer with the limits of its own store (the
-    /// Qwen3.6 engine will answer two roots and six entries).
+    /// The limits of this executor's prefix store: how many pinned roots and how many LRU entries
+    /// it holds. The worker asks once per job and plans its save points with the answer: it emits a
+    /// root point only when `roots > 0`, so a job with a root boundary behaves like a job without
+    /// one on an engine that keeps no roots. It emits periodic points only when `entries >= 2`,
+    /// because with one entry the tip would replace a periodic entry at once. The default is a
+    /// store of zero roots and one entry. An executor that enables the set overrides this method
+    /// and must answer with the limits of its own store (the Qwen3.6 engine will answer two roots
+    /// and six entries).
     fn prefix_limits(&self) -> StoreLimits {
         StoreLimits::default()
     }
-    /// The block prefix-match spacing (KV-v1 slice 2; default ON since slice 3):
-    /// `None` only on the fail-safe rollback (a set value keeps the feature on
-    /// solely for `1`/`true`/`on`, trimmed and case-folded; everything else,
-    /// including non-UTF-8, disables); `Some(tokens)` cuts one rolling
-    /// intermediate entry per stored path at the last block boundary below the
-    /// tip. Each stored path holds at most one rolling Block. A protected store
-    /// may retain a recent longer Block instead of a shorter replacement. The default reads
-    /// `ENGINESRV_PREFIX_BLOCK_MATCH` and `ENGINESRV_PREFIX_BLOCK_TOKENS` once; a
-    /// test fake overrides this to control the spacing without the environment.
+    /// The block prefix-match spacing (default ON): `None` only on the fail-safe rollback (a
+    /// set value keeps the feature on solely for `1`/`true`/`on`, trimmed and case-folded;
+    /// everything else, including non-UTF-8, disables); `Some(tokens)` cuts one rolling
+    /// intermediate entry per stored path at the last block boundary below the tip. Each stored
+    /// path holds at most one rolling Block. A protected store may retain a recent longer Block
+    /// instead of a shorter replacement. The default reads `ENGINESRV_PREFIX_BLOCK_MATCH` and
+    /// `ENGINESRV_PREFIX_BLOCK_TOKENS` once; a test fake overrides this to control the spacing
+    /// without the environment.
     fn prefix_block_spacing(&self) -> Option<usize> {
         crate::family::session::prefix_block_spacing()
     }
-    /// Saves the session as an entry of the engine's prefix store (decision 0036, addenda 1 and
-    /// 2). `kind` names the save point: `SaveKind::Root` a pinned root at the end of the first
-    /// system message, `SaveKind::Periodic` a periodic checkpoint of a long prompt, and
-    /// `SaveKind::Tip` the last message boundary. `key` holds the committed prompt tokens of
-    /// the session. Returns `Ok(false)` when this executor cannot save or when the memory plan
-    /// denies the charge. It never changes the session. Executors that keep no prefix state use
-    /// this default.
+    /// Saves the session as an entry of the engine's prefix store. `kind` names the save point:
+    /// `SaveKind::Root` a pinned root at the end of the first system message, `SaveKind::Periodic`
+    /// a periodic checkpoint of a long prompt, and `SaveKind::Tip` the last message boundary. `key`
+    /// holds the committed prompt tokens of the session. Returns `Ok(false)` when this executor
+    /// cannot save or when the memory plan denies the charge. It never changes the session.
+    /// Executors that keep no prefix state use this default.
     fn save_prefix(&mut self, _st: &Self::Session, _key: &[u32], _kind: SaveKind) -> Result<bool> {
         Ok(false)
     }
@@ -156,28 +152,25 @@ pub(crate) trait ExecutorOps {
     fn restore_prefix(&mut self, _st: &mut Self::Session, _prompt: &[u32]) -> Result<usize> {
         Ok(0)
     }
-    /// The prefix-store report of this executor (decision 0036, addendum 2; packet SERVE-2-c
-    /// item 3), which the worker takes once per job after the prefill and carries in
-    /// `JobUsage`: the entries the store holds, the charged bytes of their snapshots, the kind
-    /// of the entry the job restored, and the prompt tokens shared with a stored key beyond
-    /// the restored prefix. Executors that keep no prefix report use this default: `None`,
-    /// and the request log then omits its four `prefix_*` keys even for a request with a
-    /// boundary (fix M3 — no false zeros). The Flash-Next executor keeps this default: it
-    /// reports nothing in this packet.
+    /// The prefix-store report of this executor, which the worker takes once per job after the
+    /// prefill and carries in `JobUsage`: the entries the store holds, the charged bytes of their
+    /// snapshots, the kind of the entry the job restored, and the prompt tokens shared with a
+    /// stored key beyond the restored prefix. Executors that keep no prefix report use this
+    /// default: `None`, and the request log then omits its four `prefix_*` keys even for a request
+    /// with a boundary (no false zeros). The Flash-Next executor keeps this default: it reports
+    /// nothing.
     fn prefix_report(&self) -> Option<PrefixReport> {
         None
     }
-    /// Evicts ONE of the engine's evictable prefix entries per the incremental denial order
-    /// (fix EV-1's blast radius, radix-compression, round 4d SF-1): dead tips first,
-    /// then redundant single-chain interior anchors, then anchor leaves, then branch
-    /// points (a shared header), oldest first within each tier; `protect` (the
-    /// denied job's restored anchor, review round 4 MF2) goes last; roots stay pinned.
-    /// Returns the number of bytes the eviction released from the session budget, or
-    /// `None` when no evictable entry remains -
-    /// the caller's eviction loop ends there and the denial stands for classification.
-    /// Executors that keep no prefix state use this default: nothing to free.
+    /// Evicts ONE of the engine's evictable prefix entries per the incremental denial order: dead
+    /// tips first, then redundant single-chain interior anchors, then anchor leaves, then branch
+    /// points (a shared header), oldest first within each tier; `protect` (the denied job's
+    /// restored anchor) goes last; roots stay pinned. Returns the number of bytes the eviction
+    /// released from the session budget, or `None` when no evictable entry remains - the caller's
+    /// eviction loop ends there and the denial stands for classification. Executors that keep no
+    /// prefix state use this default: nothing to free.
     // shortcut: the freed-byte count is not logged anywhere - the sched worker has no log
-    // channel; log it where the server's request log lives when the next RED needs it.
+    // channel; log it where the server's request log lives when a failing test needs it.
     fn evict_one_prefix_entry(&mut self, _protect: Option<u64>) -> Option<u64> {
         None
     }
@@ -188,20 +181,20 @@ pub(crate) trait ExecutorOps {
     fn restored_anchor_of(&self, _st: &Self::Session) -> Option<u64> {
         None
     }
-    /// The entry a restart of `prompt` would restore first: an admission-rebuild eviction
-    /// protects it (review round 4, MF2), because no session exists there to carry the
-    /// lineage and the rebuild must not free the very anchor its next attempt restores.
-    /// Executors that keep no prefix state use this default: no candidate.
+    /// The entry a restart of `prompt` would restore first: an admission-rebuild eviction protects
+    /// it, because no session exists there to carry the lineage and the rebuild must not free the
+    /// very anchor its next attempt restores. Executors that keep no prefix state use this default:
+    /// no candidate.
     fn restore_candidate(&self, _prompt: &[u32]) -> Option<u64> {
         None
     }
-    /// The largest prompt, in tokens, that the session budget could still admit for a fresh
-    /// attempt of `st` (fix EV-2): the pool-derived effective ceiling, not the configured
-    /// context limit. The worker reports it as `PromptTooLong::limit_tokens` when an admission
-    /// cannot be served even after the eviction, so a client can compact to a size that fits.
-    /// The ceiling counts the pool's free bytes plus the bytes `st` itself would release on
-    /// its next reset, because every attempt begins from a reset session. `None` means the
-    /// executor budgets nothing and reports no ceiling.
+    /// The largest prompt, in tokens, that the session budget could still admit for a fresh attempt
+    /// of `st`: the pool-derived effective ceiling, not the configured context limit. The worker
+    /// reports it as `PromptTooLong::limit_tokens` when an admission cannot be served even after
+    /// the eviction, so a client can compact to a size that fits. The ceiling counts the pool's
+    /// free bytes plus the bytes `st` itself would release on its next reset, because every attempt
+    /// begins from a reset session. `None` means the executor budgets nothing and reports no
+    /// ceiling.
     fn pool_prompt_ceiling(&self, _st: &Self::Session) -> Option<u64> {
         None
     }
@@ -330,8 +323,8 @@ mod tests {
         );
     }
 
-    /// The default `prefix_report` of an executor without a prefix report is `None` (fix M3):
-    /// its request lines omit the four `prefix_*` keys instead of carrying false zeros.
+    /// The default `prefix_report` of an executor without a prefix report is `None`: its request
+    /// lines omit the four `prefix_*` keys instead of carrying false zeros.
     #[test]
     fn an_executor_without_prefix_support_reports_no_prefix_report() {
         assert_eq!(

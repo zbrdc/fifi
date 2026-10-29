@@ -1,4 +1,4 @@
-//! Unit tests of the mixer geometry and the weight shapes (test seam U13). CPU only.
+//! Unit tests of the mixer geometry and the weight shapes. CPU only.
 use super::{
     common_tests::{dims, plan},
     mixer_geometry::{DenseSpec, MixerGeometry, check_dense},
@@ -53,8 +53,11 @@ fn geometry_refuses_projection_widths_that_differ_from_the_plan() {
 fn a_conv_kernel_other_than_four_is_refused() {
     let mut d = dims();
     d.shape.delta.conv_kernel = 5;
-    let error = MixerGeometry::new(&d).expect_err("RD-7a takes four taps");
-    assert!(format!("{error:?}").contains("RD-7a"), "{error:?}");
+    let error = MixerGeometry::new(&d).expect_err("the causal conv kernel takes four taps");
+    assert!(
+        format!("{error:?}").contains("the causal conv kernel takes"),
+        "{error:?}"
+    );
 }
 
 #[test]

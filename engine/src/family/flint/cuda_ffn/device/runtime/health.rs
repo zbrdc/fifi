@@ -136,8 +136,30 @@ impl Health {
         }
     }
 
+    pub(super) fn bytes_len(&self) -> usize {
+        self.0.bytes()
+    }
+
     pub(super) fn clear(&self, stream: &DeviceStream) -> Result<()> {
         self.0.write_at(stream, 0, &[0; RING_BYTES])
+    }
+
+    /// Whole-buffer host copy for the prefix snapshot (slice P1); reads only.
+    pub(super) fn snapshot_bytes(&self, stream: &DeviceStream) -> Result<Vec<u8>> {
+        let mut out = vec![0u8; self.0.bytes()];
+        self.0.read_at(stream, 0, &mut out)?;
+        Ok(out)
+    }
+
+    /// Refills the whole buffer from a snapshot (prefix restore); a length
+    /// mismatch refuses before any device write.
+    pub(super) fn restore_bytes(&self, stream: &DeviceStream, bytes: &[u8]) -> Result<()> {
+        if bytes.len() != self.0.bytes() {
+            return Err(EngError::BadRequest(
+                "flint cuda prefix restore refused: health buffer mismatch".into(),
+            ));
+        }
+        self.0.write_at(stream, 0, bytes)
     }
 
     pub(super) fn pending_error(&self, stream: &DeviceStream) -> Result<Option<EngError>> {

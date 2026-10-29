@@ -1,5 +1,5 @@
 /*
- * RD-4c: embedding row gather of the resident Qwen3.6 decode step (decision 0047).
+ * Embedding row gather of the resident Qwen3.6 decode step.
  *
  * The embedding table stays on the device and the token id is read there, so a captured step
  * needs no host-known token. The code is original CUDA C for sm_86 (sm_72 compiles), written from
@@ -27,10 +27,10 @@
  *
  * A token id outside [0, n_rows) (a poisoned step word is -1, an all-NaN argmax row gives -1) makes
  * every thread of the row store NaN and read no weight and no head, and thread 0 of that block ORs
- * status bit 4 (invalid step state, the existing bit; the host message names both causes, REPLY-47 and
- * lane M's confirmation) into the step status word with one integer atomicOr, the pattern of the RD-8a0
- * patch of attn_prep. The kernel writes no other bit, clears none and leaves the word alone for valid
- * ids. The ids are read once per thread.
+ * status bit 4 (invalid step state, the existing bit; the host message names both causes) into the
+ * step status word with one integer atomicOr, the pattern of the poison-guard patch of attn_prep.
+ * The kernel writes no other bit, clears none and leaves the word alone for valid ids. The ids are
+ * read once per thread.
  * No float atomic, no shared memory, no barrier; the same input twice gives equal bytes.
  */
 #include <cuda_fp16.h>
@@ -160,7 +160,7 @@ __global__ void __launch_bounds__(kQ8Threads)
     }
 }
 
-/* MATVEC-PAR S2: the same Q4_K gather against the file's own blocks (row-major, one block of
+/* The same Q4_K gather against the file's own blocks (row-major, one block of
  * 144 bytes per 256 values: d, dmin, 12 scale bytes, then 128 qs bytes). A row of k values is
  * k / 256 consecutive blocks, so block ib of row id starts at uint4 index (id * nb + ib) * 9 and
  * every uint4 load is aligned (144 is a multiple of 16 and the base is 16-byte aligned). One
@@ -225,7 +225,7 @@ bool apart(const void *a, size_t abytes, const void *b, size_t bbytes) {
     return pa + abytes <= pb || pb + bbytes <= pa;
 }
 
-/* Every term of this test has a twin in the Rust wrapper (the table "C and Rust refusals" of RD-4c.md). */
+/* Every term of this test has a twin in the Rust wrapper. */
 bool valid(const inference_cuda_embed_args *a, void *stream) {
     if (a == NULL || stream == NULL || a->tiles == NULL || a->ids == NULL || a->x == NULL || a->status == NULL) return false;
     const bool type_ok = a->ggml_type == INFERENCE_CUDA_TYPE_Q4_K || a->ggml_type == INFERENCE_CUDA_TYPE_Q8_0;

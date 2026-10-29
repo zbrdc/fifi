@@ -1,11 +1,11 @@
-// ANE-DECISION-01b: native ANE adapter parity with the CPU adapter.
-// Tests cross DecisionHead::predict only (agreed seam 2).
+// Native ANE adapter parity with the CPU adapter.
+// Tests cross DecisionHead::predict only.
 // Uses decision-head dims (4096/512/256/4). The CPU adapter is the oracle; the
 // hand-computed literals in tests/decision_head.rs validate that adapter
-// independently. The bridge applies the measured ANE layout rules
-// (ANE-RE-01): one const file per tensor; matmul channel storage shifted +64
-// mod width (W2c rows and the final readout compensate); second-layer width
-// padded to 512 to avoid a low-channel reshape artifact.
+// independently. The bridge applies the measured ANE layout rules: one const
+// file per tensor; matmul channel storage shifted +64 mod width (W2c rows and
+// the final readout compensate); second-layer width padded to 512 to avoid a
+// low-channel reshape artifact.
 #![cfg(all(feature = "native-ane", target_os = "macos", target_arch = "aarch64"))]
 
 use std::sync::Mutex;

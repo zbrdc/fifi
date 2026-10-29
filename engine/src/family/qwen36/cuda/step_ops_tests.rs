@@ -1,4 +1,4 @@
-//! Unit tests of the launch order of one token (test seam U13). CPU only.
+//! Unit tests of the launch order of one token. CPU only.
 use super::{
     common_tests::dims,
     step_ops::{POS_WORD_READERS, StepOp, final_resid, resid_in, resid_out, token_ops},
@@ -70,7 +70,7 @@ fn begin_embed_attention_mixers_moe_blocks_and_argmax_write_status() {
             "router of layer {layer}"
         );
     }
-    // RD-4c ORs mask 4 into status for a token id outside the vocabulary.
+    // The embedding ORs mask 4 into status for a token id outside the vocabulary.
     for op in [StepOp::Begin, StepOp::Embed, StepOp::Argmax] {
         assert!(op.writes_status(AttentionKind::Full), "{op:?}");
     }

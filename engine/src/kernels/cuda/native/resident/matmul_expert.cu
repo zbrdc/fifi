@@ -1,5 +1,5 @@
 /*
- * Entries of kern::matmul_expert (RD-0b) on an explicit stream. Glue only: no kernel and no device logic.
+ * Entries of kern::matmul_expert on an explicit stream. Glue only: no kernel and no device logic.
  * Wraps the vendored kern::matmul_expert (kernels.h) and asks mma884::split_k (mma884.cuh) whether a
  * shape splits along k, so the split rule has one owner. Every exported function has C linkage, takes
  * and returns C types only, and wraps its body in try/catch, like the projector adapter.

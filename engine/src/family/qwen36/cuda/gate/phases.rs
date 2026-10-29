@@ -1,17 +1,11 @@
 //! Bookkeeping of the timed region: the 128 decode steps and the three measured phases inside them.
 //!
-//! The clock is injected so the tests need no device and no wall time. Each phase is timed by its own begin/end pair,
-//! so time spent outside every phase stays unaccounted and the evaluator's 3 percent check against `decode_ns` means
-//! something (review A, finding 13). Each step is also timed on its own, so the first step can be reported beside the
-//! median and never dropped (REPLY-72 Q8). The host analysis (top-32, hash, lse) is NOT part of the timed region: it
-//! runs after `finish` and is reported as `analysis_ns`.
-#![cfg_attr(
-    not(test),
-    expect(
-        dead_code,
-        reason = "staged for the gate loop, RD-10a-17 (decision 0047)"
-    )
-)]
+//! The clock is injected so the tests need no device and no wall time. Each phase is timed by its
+//! own begin/end pair, so time spent outside every phase stays unaccounted and the evaluator's 3
+//! percent check against `decode_ns` means something. Each step is also timed on its own, so the
+//! first step can be reported beside the median and never dropped. The host analysis (top-32, hash,
+//! lse) is NOT part of the timed region: it runs after `finish` and is reported as `analysis_ns`.
+#![cfg_attr(not(test), expect(dead_code, reason = "staged for the gate loop"))]
 
 use std::time::Instant;
 

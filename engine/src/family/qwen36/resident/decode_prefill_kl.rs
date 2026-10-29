@@ -1,12 +1,10 @@
-//! The decode-vs-prefill KL gate: the standard check every KV8/quant/fusion change runs before
-//! it merges. Method per DeepInfer `tests/models/test_kl.py` (fifi reviews
-//! `ledger/research/deepinfer-774ce24/B-kernels-moe-attention-quant.md:76` and
-//! `.../C-kv-memory-longctx-serving.md:68`): the last `window` prompt positions run
-//! teacher-forced through the decode path, then the same tokens re-run through the prefill
-//! path, and the per-position KL divergence of the two rows stays under a bound. DeepInfer
-//! asserts exact equality behind `BATCH_INVARIANT=1`, an NVIDIA-only mode documented as
-//! slower; fifi has no batch-invariant kernels, so this is the truth-tolerance form the
-//! implementation map records: control = the prefill row, candidate = the decode row.
+//! The decode-vs-prefill KL gate: the standard check every KV8/quant/fusion change runs before it
+//! merges. Method per DeepInfer `tests/models/test_kl.py`: the last `window` prompt positions run
+//! teacher-forced through the decode path, then the same tokens re-run through the prefill path,
+//! and the per-position KL divergence of the two rows stays under a bound. DeepInfer asserts exact
+//! equality behind `BATCH_INVARIANT=1`, an NVIDIA-only mode documented as slower; fifi has no
+//! batch-invariant kernels, so this is the truth-tolerance form: control = the prefill row,
+//! candidate = the decode row.
 //!
 //! What the two arms share and what they differ in: both prefill the head of the prompt as
 //! chunks (three times, into three states, with a bitwise-equal output control), then the
@@ -30,7 +28,7 @@
 //! `long_context`; the model-touching arms and gates live in the `mac` module behind the
 //! native cfg, like that module's `mac` harness.
 //!
-//! The standard commands (the "script" a change lane runs):
+//! The standard commands (the "script" a change runs):
 //!
 //! ```text
 //! # the pure comparison core, part of the plain portable suite
@@ -478,12 +476,12 @@ mod mac {
         (pooled, passed)
     }
 
-    /// The gate on the tiny KV8 model (the Q8 cache), the portable-form member of the Mac
-    /// plain suite. The pinned bound holds the first Mac run's measured tiny numerics with
-    /// headroom (2026-10-23, pooled over 8 prompts / 72 rows: mean 5.5e-8, worst row
-    /// 1.0e-6, top-1 rate 1.0): about an order above the measurement and over three orders
-    /// below the real-weights bound family (Q36_KL_MEAN 0.004). A path split — a
-    /// decode-side quantize change that misses the prefill side — lands orders past it.
+    /// The gate on the tiny KV8 model (the Q8 cache), the portable-form member of the Mac plain
+    /// suite. The pinned bound holds the first Mac run's measured tiny numerics with headroom
+    /// (pooled over 8 prompts / 72 rows: mean 5.5e-8, worst row 1.0e-6, top-1 rate 1.0): about an
+    /// order above the measurement and over three orders below the real-weights bound family
+    /// (Q36_KL_MEAN 0.004). A path split — a decode-side quantize change that misses the prefill
+    /// side — lands orders past it.
     #[test]
     fn decode_vs_prefill_kl_passes_on_the_tiny_kv8_model() {
         let _serial = crate::native_test_lock();
@@ -515,10 +513,9 @@ mod mac {
         assert!(passed, "{pooled:?}");
     }
 
-    /// The real-weights gate: the standard command of the module doc. A fresh model load, so
-    /// it needs its own Mac window per the lane rules.
+    /// The real-weights gate: the standard command of the module doc. It loads the model fresh.
     #[test]
-    #[ignore = "real weights: fresh MAC-GO and Q36_CKPT_DIR required; correctness only"]
+    #[ignore = "real weights: Q36_CKPT_DIR required; correctness only"]
     fn real_weights_decode_vs_prefill_kl() {
         let _serial = crate::native_test_lock();
         let dir = super::super::real::env_path("Q36_CKPT_DIR");

@@ -1,4 +1,4 @@
-//! Device tests of the CUDA projector (decision 0040 packet 3 gates).
+//! Device tests of the CUDA projector.
 //!
 //! The gates decode the device tiles back to the GGUF block layout and compare
 //! them with the source bytes, so the repack is checked against the file rather
@@ -52,8 +52,8 @@ const LIMITS: GgufLimits = GgufLimits {
     max_header_bytes: 1 << 20,
     max_tensor_bytes: 1 << 24,
 };
-/// The open cap of decision 0040 item 4: a tensor up to 1 GiB opens, and `load`
-/// streams it in chunks whatever its size.
+/// The open cap of the GGUF opener: a tensor up to 1 GiB opens, and `load` streams it in
+/// chunks whatever its size.
 const LARGE_LIMITS: GgufLimits = GgufLimits {
     max_header_bytes: 1 << 20,
     max_tensor_bytes: 1 << 30,
@@ -888,9 +888,9 @@ fn q8_0_linear_matches_the_dense_projector_for_one_and_seventeen_tokens() {
     );
 }
 
-/// Q8_0 linear at `(n_rows, k)` shapes of the surveyed Q8_0 tensors, for one
-/// token (mma884) and seventeen (gemm DQ8), against the dense projector. The
-/// argmax gate applies from 64 outputs (REPLY-20 item 1).
+/// Q8_0 linear at `(n_rows, k)` shapes of the surveyed Q8_0 tensors, for one token
+/// (mma884) and seventeen (gemm DQ8), against the dense projector. The argmax gate
+/// applies from 64 outputs.
 fn q8_0_shape_case(test: &str, shapes: &[(usize, usize)], limits: GgufLimits) {
     if !device_present(test) {
         return;
@@ -961,11 +961,11 @@ fn q8_0_linear_matches_the_dense_projector_at_reduced_surveyed_shapes() {
     );
 }
 
-/// Full-size surveyed shapes (50 to 60 MB of Q8_0 each). Ignored by default;
-/// the packet 4 gates run it on the 3090 and the Xavier with
+/// Full-size surveyed shapes (50 to 60 MB of Q8_0 each). Ignored by default; the device gates run
+/// it on the 3090 and the Xavier with
 /// `cargo test --features native-cuda -- --ignored q8_0_linear_matches_the_dense_projector_at_full_surveyed_shapes`.
 #[test]
-#[ignore = "large Q8_0 shapes, run by the packet 4 device gates"]
+#[ignore = "large Q8_0 shapes, run by the device gates"]
 fn q8_0_linear_matches_the_dense_projector_at_full_surveyed_shapes() {
     q8_0_shape_case(
         "q8_0_linear_matches_the_dense_projector_at_full_surveyed_shapes",
@@ -1514,7 +1514,7 @@ fn a_native_load_refuses_an_unsupported_type_naming_the_tensor() {
     assert_eq!(bytes, (N_ROWS * (K / 256) * 144) as u64);
     // Q6_K is the one type whose native bytes differ from the tiles (1680 vs 1792 per
     // 8x256 rows): the dispatch in `planned` must reach `native_device_bytes` for it too,
-    // not only for Q4_K (KUBDAN-MSG-68 M-4).
+    // not only for Q4_K.
     let (_dir, weights) = open_fixture(&[weight_entry(
         "q6",
         GgufType::Q6K,
@@ -1554,7 +1554,7 @@ fn a_native_load_records_the_stack_depth() {
     let CudaWeight::Native { weight, .. } = weight_of(&loaded, "stack") else {
         panic!("{NAME}: the stack did not load native");
     };
-    // The depth the S1 expert launch indexes (expert e at e * rows bytes) is recorded on the
+    // The depth the MMVQ expert launch indexes (expert e at e * rows bytes) is recorded on the
     // weight; the bytes are the file's own blocks: 2 experts of 8 rows of K / 256 blocks.
     assert_eq!(weight.experts(), Some(2), "{NAME}");
     assert_eq!(weight.n_rows(), 16, "{NAME}");
@@ -1570,9 +1570,9 @@ fn a_native_load_takes_stacks_whose_experts_miss_the_tile_groups() {
     }
     let mut rng = Rng(SEED);
     // 8 experts of 4 rows: the tile-group guard of `planned` refuses this stack for Tiled
-    // (the twin test above); under Native there is no such rule, so it plans AND loads
-    // (KUBDAN-MSG-68 M-4: a removed `layout == Tiled` condition on the guard would refuse
-    // this load with "experts of 4 rows, which do not start on 8-row tile groups").
+    // (the twin test above); under Native there is no such rule, so it plans AND loads (a
+    // removed `layout == Tiled` condition on the guard would refuse this load with
+    // "experts of 4 rows, which do not start on 8-row tile groups").
     let (_dir, weights) = open_fixture(&[stack_entry(
         "stack",
         GgufType::Q4K,
@@ -1623,7 +1623,7 @@ fn a_native_load_puts_the_file_bytes_on_the_device_and_refuses_tile_readers() {
     assert_eq!(loaded.device_bytes(), N_ROWS * (K / 256) * 144);
     assert_eq!(projector.live_bytes() - before, loaded.device_bytes());
     // The host projection oracle reads tiles: a native weight is a typed error, never a
-    // reinterpretation (R-S2-2), and the backend stays usable for a tiled load afterwards.
+    // reinterpretation, and the backend stays usable for a tiled load afterwards.
     assert_error(
         projector.linear(weight_of(&loaded, "w"), &vec![0.0; K]),
         "Checkpoint",
@@ -1954,7 +1954,7 @@ fn a_native_load_skips_the_scale_scans_that_stop_the_tiled_load() {
     let big = q4k_blocks(&mut rng, UNWIND_ROWS * UNWIND_K / BLOCK_VALUES);
     let mut bad = q6k_blocks(&mut rng, N_ROWS * BLOCKS_PER_ROW);
     // The same poisoning as the twin test above: d = 65504 and a scale of 2 overflow fp16,
-    // which only the tile dequantisation cannot hold (R-S2-4).
+    // which only the tile dequantisation cannot hold.
     for block in bad.as_chunks_mut::<Q6K_BLOCK_BYTES>().0 {
         block[192] = 2;
         block[208..].copy_from_slice(&0x7bffu16.to_le_bytes());
@@ -3024,11 +3024,10 @@ fn measure_load_memory_for_one_page_cache_mode() {
     report_memory(mode, "after_release", &projector);
 }
 
-/// REPLY-20 item 4: the time the pre-upload Q8_0 scale scan adds to a load. It
-/// reads every Q8_0 tensor of INFERENCE_CUDA_MEASURE_SCAN_GGUF the way
-/// `check_scale_ranges` does, once after dropping the file from the page cache
-/// (cold) and once more (warm), and prints read and check time apart. Nothing
-/// is uploaded.
+/// The time the pre-upload Q8_0 scale scan adds to a load. It reads every Q8_0 tensor of
+/// INFERENCE_CUDA_MEASURE_SCAN_GGUF the way `check_scale_ranges` does, once after
+/// dropping the file from the page cache (cold) and once more (warm), and prints read
+/// and check time apart. Nothing is uploaded.
 #[test]
 fn measure_q8_0_scale_scan_time() {
     const NAME: &str = "measure_q8_0_scale_scan_time";
@@ -3168,7 +3167,7 @@ fn meminfo_kb_reads_only_the_named_line() {
     assert_eq!(meminfo_kb(text, "Cached"), 300);
 }
 
-// LD-1: the load policy of an integrated GPU.
+// The load policy of an integrated GPU.
 
 /// Residency at or below which a file counts as evicted. `posix_fadvise(DONTNEED)`
 /// drops whole pages inside the range only, so a page shared by two tensors, or

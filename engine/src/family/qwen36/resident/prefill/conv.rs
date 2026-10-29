@@ -1,9 +1,9 @@
-//! Short causal convolution over the time axis of a chunk (packet Q36-E2).
+//! Short causal convolution over the time axis of a chunk.
 //!
 //! MLX has no `conv1d` entry point here, and a convolution with `K` taps is `K` shifted slices.
 //! DeltaNet uses `CK - 1 = 3` past taps one row apart and one tap for the current row.
 //!
-//! The dtypes (packet Q36-BF16-b): `ring`, `taps`, and `last` stay F32, and `x` carries the
+//! The dtypes: `ring`, `taps`, and `last` stay F32, and `x` carries the
 //! activation dtype, so a BF16 chunk meets the F32 ring inside `seq` and the F32 taps inside every
 //! product. MLX promotes a mixed F32 and BF16 operand set to F32, which is numerically identical
 //! to casting `x` to F32 first: the convolution runs in F32 whatever the activation dtype, and
@@ -30,7 +30,7 @@ fn bad(message: &str) -> EngError {
 ///
 /// `x` may hold the activation dtype while `ring`, `taps`, and `last` stay F32: the mixed
 /// `concatenate` and the mixed products promote to F32, so the outputs are F32 (see the module
-/// doc; packet Q36-BF16-b).
+/// doc).
 ///
 /// Returns the pre-activation `[T, W]` and the new ring `[W, taps]`, which is the last `taps`
 /// columns of `seq`. The function builds lazy graphs only. A shape error returns `BadRequest`
@@ -158,11 +158,11 @@ mod tests {
         assert_close(&got_ring, &[3.0, 7.0, 20.0, 40.0], 1e-4, "ring");
     }
 
-    /// Packet Q36-BF16-b: a BF16 chunk against an F32 ring, taps, and last tap. The chunk values
+    /// A BF16 chunk against an F32 ring, taps, and last tap. The chunk values
     /// 4, 40, 5, and 50 are exact in BF16, and the ring's first value 1.0009765625 (1 + 2^-10)
     /// needs the tenth mantissa bit that BF16 rounds away, so a mutation that rounds the ring to
     /// BF16 changes the convolution by 0.5 x 2^-10 = 4.88e-4 and fails the value assert below,
-    /// not only the dtype assert (fix1 of packet Q36-BF16-b). With the ring left F32, the mixed
+    /// not only the dtype assert. With the ring left F32, the mixed
     /// concatenate and the mixed products must give exactly the all-F32 values, and MLX must
     /// promote the mixed operand set to F32: the pre-activation and the new ring are F32, not
     /// BF16. A promotion that silently widened the ring instead, or a concatenate that dropped the

@@ -1,6 +1,5 @@
-//! CPU tests of the NATIVE construction guards of MATVEC-PAR S3b (test seam U13): the pinned
-//! fused-row column offsets, the layout accessor's mixed refusal and the rows % 4 / column
-//! refusals. CPU only.
+//! CPU tests of the NATIVE construction guards: the pinned fused-row column offsets, the layout
+//! accessor's mixed refusal and the rows % 4 / column refusals. CPU only.
 use super::common_tests::dims;
 use super::dims::KvMode;
 use super::mixer_geometry::{DenseSpec, MixerGeometry, check_dense, check_native_dense};
@@ -14,12 +13,11 @@ fn geometry() -> MixerGeometry {
     MixerGeometry::new(&dims()).expect("geometry")
 }
 
-/// The Qwen3.6 fused-row column offsets pinned as the matvec needs them (open point 2): the
-/// geometry's offsets, and the construction of the Native lists (which runs `check_native_column`
-/// over exactly these pairs) passing both kinds. The alignment line is gone with the arm
-/// (MSG-74 item 3): `col * 4 % 4 == 0` held for every input by construction - a tautology.
-/// The native embed guard (MSG-70 condition 5; C4's F2): only Q4_K passes, every other type
-/// the loader can produce for the embedding table is refused naming the tensor and Q4_K.
+/// The Qwen3.6 fused-row column offsets pinned as the matvec needs them: the geometry's offsets,
+/// and the construction of the Native lists (which runs `check_native_column` over exactly these
+/// pairs) passing both kinds. There is no alignment line: `col * 4 % 4 == 0` holds for every input
+/// by construction. The native embed guard: only Q4_K passes, every other type the loader can
+/// produce for the embedding table is refused naming the tensor and Q4_K.
 #[test]
 fn the_native_embed_takes_q4_k_blocks_only() {
     use super::resources::check_native_embed;
@@ -166,10 +164,10 @@ fn assert_exl3_live_slots(plan: &super::step_plan::StepPlan, ops: &[super::mixer
     }
 }
 
-/// The typed refusals of the NATIVE construction (the packet's "unsupported type or row count",
-/// of which the type half is the embed's Q4_K rule in C4 and the mixed-layout rule above): a
-/// native dense weight of rows % 4 != 0, a wrong shape, and the two reachable column guards, each
-/// case reaching its own guard with every earlier check satisfied.
+/// The typed refusals of the NATIVE construction (an unsupported type or row count; the type half
+/// is the embed's Q4_K rule and the mixed-layout rule above): a native dense weight of
+/// rows % 4 != 0, a wrong shape, and the two reachable column guards, each case reaching its own
+/// guard with every earlier check satisfied.
 #[test]
 fn an_unsupported_type_or_row_count_is_refused_at_construction() {
     let spec = super::mixer_geometry::DenseSpec {
@@ -210,9 +208,9 @@ fn an_unsupported_type_or_row_count_is_refused_at_construction() {
 }
 
 /// The head and the final norm name only slots their layout's plan holds, and the native final
-/// norm's f32 scratch row is its own slot live exactly at FINAL_NORM (the S3c scratch defect 2:
-/// NormRow's bytes may belong to a slot live at FINAL_NORM, so the fused producer's mandatory
-/// row needed a home that cannot alias anything live).
+/// norm's f32 scratch row is its own slot live exactly at FINAL_NORM (NormRow's bytes may belong to
+/// a slot live at FINAL_NORM, so the fused producer's mandatory row needs a home that cannot alias
+/// anything live).
 #[test]
 fn the_head_and_final_norm_name_only_live_slots_of_their_layout() {
     use super::common_tests::plan_of;

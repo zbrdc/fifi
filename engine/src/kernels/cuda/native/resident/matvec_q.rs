@@ -1,6 +1,6 @@
 //! Raw FFI to `inference_cuda_matvec_q_launch` of `native/resident/matvec_q.cu` (declared in
 //! `native/resident/matvec_q.h`). Child of `native::resident`, so it inherits the
-//! `allow(unsafe_code)` of `native.rs` (decision 0047, child modules of `native.rs`).
+//! `allow(unsafe_code)` of `native.rs`.
 //!
 //! Safety invariants this module relies on:
 //! - A device range is proved in bounds by `RawRange::new` before it gets here. This module
@@ -13,8 +13,7 @@
 //!   a fault in the kernel surfaces at the next synchronize.
 //! - The allocations stay valid until the queued launch finishes because `inference_cuda_free`
 //!   synchronizes the whole device before `cudaFree`.
-//! - Every call runs under the process dispatch guard and on the thread that owns the context
-//!   (decisions 0023 and 0024).
+//! - Every call runs under the process dispatch guard and on the thread that owns the context.
 //! - No raw pointer and no unsafe function leaves this module.
 
 use std::ffi::{c_int, c_void};
@@ -140,7 +139,7 @@ pub(in crate::kernels::cuda) fn matvec_q_launch(
     checked(status, stage)
 }
 
-/// Test support of the seam-1 microbench: a raw timing event recorded on a stream. The handle
+/// Test support of the matvec microbench: a raw timing event recorded on a stream. The handle
 /// is opaque to Rust and consumed by [`event_elapsed_ms_raw`] and [`event_destroy_raw`].
 #[cfg(test)]
 pub(in crate::kernels::cuda) fn event_record_raw(
@@ -277,10 +276,9 @@ mod tests {
         unsafe { mmvq_runnable_arch_raw(cc, built.as_ptr(), n_built) }
     }
 
-    /// Host only (KUBDAN-MSG-64 item 1): the wrappers hand the vendored objects the built
-    /// architecture the device runs on, not the device's own cc. An sm_89 GPU with a 72,86 build
-    /// runs the sm_86 cubin; a Turing GPU does not run the sm_72 one; a device below every built
-    /// architecture runs nothing.
+    /// Host only: the wrappers hand the vendored objects the built architecture the device runs on,
+    /// not the device's own cc. An sm_89 GPU with a 72,86 build runs the sm_86 cubin; a Turing GPU
+    /// does not run the sm_72 one; a device below every built architecture runs nothing.
     #[test]
     fn mmvq_arch_clamps_to_the_cubin_the_device_runs() {
         // (built list, device cc, architecture to use; 0 refuses)
@@ -355,8 +353,8 @@ mod tests {
         })
     }
 
-    /// Host only (KUBDAN-MSG-64 items 6 and 10): the native check against the ranges of an unbacked
-    /// allocation. The valid layout passes; each case changes one thing and is refused.
+    /// Host only: the native check against the ranges of an unbacked allocation. The valid
+    /// layout passes; each case changes one thing and is refused.
     #[test]
     fn check_matvec_refuses_short_unpadded_misaligned_and_overlapping_ranges() {
         let device = RawDevice::unbacked(1 << 20);
@@ -397,8 +395,8 @@ mod tests {
     }
 
     /// Host only: every case is refused by the entry's own checks before any CUDA call. The
-    /// table covers the packet's rows: unknown type, k off the block grid, rows 0, ncols 0 and
-    /// 9, misaligned pointers, overlaps, short stream.
+    /// table covers unknown type, k off the block grid, rows 0, ncols 0 and 9, misaligned
+    /// pointers, overlaps, short stream.
     #[test]
     fn matvec_arguments_are_checked_before_any_launch() {
         let cases: [Case; 17] = [

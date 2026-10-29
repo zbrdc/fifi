@@ -1,5 +1,6 @@
 //! The raw file of one GPU call (schema `cuda-rd-raw/2`, see `a5_eval.py`): JSON assembly from already computed values.
-//! Pure host code (U13). Crates: serde_json 1.0.151 (`json!`, `to_string`), sha2 0.10.9 (`Sha256`, `Digest`).
+//! Pure host code. Crates: serde_json 1.0.151 (`json!`, `to_string`), sha2 0.10.9 (`Sha256`,
+//! `Digest`).
 
 use super::phases::Timing;
 use super::rows::RowSummary;
@@ -28,7 +29,7 @@ pub(super) fn step_json(in_token: u32, s: &RowSummary, forced_logit: Option<f32>
     })
 }
 
-/// What the loop knows about one run besides the timing: the flags and clocks that REPLY-72 (Q8, Q9) makes checkable.
+/// What the loop knows about one run besides the timing: the flags and clocks the evaluator checks.
 pub(super) struct RunMeta {
     /// True only if the graph was captured and replayed in this run.
     pub captured: bool,
@@ -36,7 +37,8 @@ pub(super) struct RunMeta {
     pub graph_ready_before_timed: bool,
     pub analysis_ns: u64,
     pub syncs: u64,
-    /// Host writes to the device per token: the single start-block write (lane C Q-C6). The gate checks 1 per token, 128 per run.
+    /// Host writes to the device per token: the single start-block write. The gate checks 1 per
+    /// token, 128 per run.
     pub host_writes: u64,
     /// CLOCK_REALTIME instants: the prompt pass synchronized, the timed region started and ended. They let the
     /// evaluator pick the card samples that belong to the timed region.

@@ -1,7 +1,7 @@
-//! CPU tests of the NATIVE step plan of MATVEC-PAR S3b (test seam U13): the q8_1 slot sizes, the
-//! pinned arena figures, the lifetimes of the swapped packs, the aliasing freedom of the plan and
-//! the pure refusals of the one-row rule. CPU only, no device call. The TILED plan stays pinned
-//! by `tests.rs`'s own figures; the Int8G32 rows slots of KV8-B B2 are pinned here beside them.
+//! CPU tests of the NATIVE step plan: the q8_1 slot sizes, the pinned arena figures, the lifetimes
+//! of the swapped packs, the aliasing freedom of the plan and the pure refusals of the one-row
+//! rule. CPU only, no device call. The TILED plan stays pinned by `tests.rs`'s own figures; the
+//! Int8G32 rows slots are pinned here beside them.
 use super::super::host::HostShape;
 use super::{
     dims::{KvMode, StepDims, StepOptions},
@@ -180,7 +180,7 @@ fn native_slot_sizes_are_the_q8_1_sizes() {
     let (h, m) = (d.shape.hidden, &d.shape.moe);
     let q_width = d.shape.attn.heads_q * d.shape.attn.head_dim;
     let value_width = d.shape.delta.value_heads * d.shape.delta.value_dim;
-    // The packet's literals: 2,304 B for k 2048, 4,608 B for k 4096, 576 B for k 512.
+    // The expected literals: 2,304 B for k 2048, 4,608 B for k 4096, 576 B for k 512.
     let want = [
         (Slot::Q8Mix, 2304, h, 1),
         (Slot::Q8DeltaOut, 4608, value_width, 1),
@@ -239,10 +239,9 @@ fn the_native_plan_figures_are_pinned_and_do_not_overlap() {
 
 /// Every Native slot takes the lifetime and size of its Tiled twin, with TWO spelled-out
 /// exceptions: the packs swap names, and `NormRow` — dead scratch that the fused `add_rmsnorm_q8`
-/// writes at the NATIVE mixer prologue beside its pack (the S3a producer always writes the f32
-/// row) — spans `MIX_PACK..ARGMAX` instead of `ADD_NORM..ROUTE`; the final norm writes its OWN
-/// FinalNormRow (`tests.rs` pins the Tiled table literally; the mapping here is the only new
-/// fact).
+/// writes at the NATIVE mixer prologue beside its pack (the producer always writes the f32 row) —
+/// spans `MIX_PACK..ARGMAX` instead of `ADD_NORM..ROUTE`; the final norm writes its OWN
+/// FinalNormRow (`tests.rs` pins the Tiled table literally; the mapping here is the only new fact).
 #[test]
 fn native_pack_slots_take_the_tiled_lifetimes_and_sizes() {
     let swap = |slot: Slot| match slot {
@@ -331,7 +330,7 @@ fn the_native_plan_refuses_extra_rows_and_forked_packs() {
     }
 }
 
-// ---- KV8-B B2: the Int8G32 rows slots of the NATIVE plan -------------------------------------
+// ---- the Int8G32 rows slots of the NATIVE plan -----------------------------------------------
 
 fn int8_options(layout: WeightLayout) -> StepOptions {
     StepOptions {
@@ -420,7 +419,7 @@ fn the_int8_native_plan_figures_are_pinned_and_do_not_overlap() {
     assert_eq!(&plan_arena(&p.arena_tensors()).expect("arena"), p.plan());
 }
 
-/// The KV8-B sizing rule: under Int8G32 the scratch sizes `AttnPart` with the KV8 kernel's own
+/// The KV8 sizing rule: under Int8G32 the scratch sizes `AttnPart` with the KV8 kernel's own
 /// `attn_q8_part_bytes` at `AttnSplit::Q8`, and the plan refuses a scratch of the other mode.
 /// STAGE1 and Q8 share `max_splits` 64, so the byte counts COINCIDE: the split is the observable,
 /// and a scratch sized with STAGE1 under Int8G32 is refused by the plan, not by a size.
@@ -435,9 +434,9 @@ fn int8_attn_part_is_sized_with_the_q8_split() {
         p.tensors()[p.index(Slot::AttnPart).expect("attn part")].bytes,
         attn_q8_part_bytes(1, a.heads_kv, a.head_dim, AttnSplit::Q8.max_splits).unwrap()
     );
-    // The Fp16 scratch stays on STAGE1 and its plan refuses the Q8 scratch, and the Int8G32
-    // plan refuses the STAGE1 scratch: each mode takes its own split, and the refusal names
-    // the split it found and the one it needs (B2/B3 review item 4).
+    // The Fp16 scratch stays on STAGE1 and its plan refuses the Q8 scratch, and the Int8G32 plan
+    // refuses the STAGE1 scratch: each mode takes its own split, and the refusal names the split it
+    // found and the one it needs.
     let fp16 = KernelScratch::for_dims(&d, 1, KvMode::Fp16).expect("scratch");
     assert_eq!(fp16.attn_split(), AttnSplit::STAGE1);
     match StepPlan::new(&d, 1, &int8_options(WeightLayout::Native), &fp16) {
@@ -465,8 +464,8 @@ fn int8_attn_part_is_sized_with_the_q8_split() {
     }
 }
 
-/// The typed refusal of the control path (KV8-B B2): Int8G32 has Native op lists only, so a
-/// Tiled Int8G32 plan is refused before any slot is sized.
+/// The typed refusal of the control path: Int8G32 has Native op lists only, so a Tiled Int8G32 plan
+/// is refused before any slot is sized.
 #[test]
 fn the_int8_plan_refuses_the_tiled_layout() {
     let d = dims();

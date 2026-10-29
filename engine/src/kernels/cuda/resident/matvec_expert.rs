@@ -1,19 +1,18 @@
-//! The MMVQ expert matvec against a native-layout expert stack (MATVEC-PAR S1 c3c, decision
-//! 0047, stage 1): [`CudaContext::matvec_expert`] queues ONE launch for the used slots, with the
-//! per-slot expert ids read on the DEVICE when the kernel runs (the router's `ids` buffer), and
-//! returns when it is queued. It allocates nothing, copies nothing and never synchronizes.
+//! The MMVQ expert matvec against a native-layout expert stack: [`CudaContext::matvec_expert`]
+//! queues ONE launch for the used slots, with the per-slot expert ids read on the DEVICE when
+//! the kernel runs (the router's `ids` buffer), and returns when it is queued. It allocates
+//! nothing, copies nothing and never synchronizes.
 //!
-//! `w_stack` holds `n_expert` experts of `rows` x `k` native blocks back to back; `x_q8` holds
-//! one shared padded activation row (`x_per_slot` false, the gate/up view: every slot reads row
-//! 0) or one row per used slot (`x_per_slot` true, the down view); `y` is f32
-//! `[n_used][y_slot_stride]` with `y_slot_stride >= rows` (KUBDAN-MSG-62 A2: the step's ExpertGu
-//! is `[top_k][gate|up]`, so gate and up are two launches into one `[slot][2*rows]` buffer at
-//! offsets 0 and `rows`).
+//! `w_stack` holds `n_expert` experts of `rows` x `k` native blocks back to back; `x_q8` holds one
+//! shared padded activation row (`x_per_slot` false, the gate/up view: every slot reads row 0) or
+//! one row per used slot (`x_per_slot` true, the down view); `y` is f32 `[n_used][y_slot_stride]`
+//! with `y_slot_stride >= rows` (the step's ExpertGu is `[top_k][gate|up]`, so gate and up are two
+//! launches into one `[slot][2*rows]` buffer at offsets 0 and `rows`).
 //!
 //! Ids contract: the kernel reads `ids[s]` when it runs, so a captured graph replay follows a
-//! rewritten ids word. An id outside `[0, n_expert)` — the router writes -1 only on a faulted
-//! row — makes the kernel write the quiet NaN `0x7fc00000` to that slot's rows and read no
-//! weight (the V-MV1 A1 guard); the S3 step keeps the router status-word check.
+//! rewritten ids word. An id outside `[0, n_expert)` — the router writes -1 only on a faulted row —
+//! makes the kernel write the quiet NaN `0x7fc00000` to that slot's rows and read no weight (the id
+//! range guard); the resident step keeps the router status-word check.
 //!
 //! Every refusal is a `BadRequest` and happens before any native call. In order: the backend is
 //! usable; `k` is a multiple of the type's block size; `rows` is a positive multiple of 4
@@ -67,7 +66,7 @@ struct ExpertNeeds {
 }
 
 /// What an expert matvec reads and writes: the native blocks of `n_expert` experts of `rows` rows,
-/// `n_used` ids, one padded q8_1 row (or one per used slot) and, for `y`, the A2 footprint
+/// `n_used` ids, one padded q8_1 row (or one per used slot) and, for `y`, the strided footprint
 /// `(n_used - 1) * y_slot_stride + rows` floats. `None` on overflow, for `n_used` 0 or when `k` is
 /// off the type's block grid.
 fn expert_needs(shape: &ExpertShape) -> Option<ExpertNeeds> {

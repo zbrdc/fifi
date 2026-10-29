@@ -1,10 +1,10 @@
-//! Safe launch wrapper of `swiglu_rows` (CPF-7a part 1, CPF-V4-CPF7-PLAN section C.2, N2;
-//! decision 0049, seam 1 of item 15): the M-row SwiGLU with f32 output of the chunked-prefill
-//! MoE path, `act[r][c] = silu(gu[r][c]) * gu[r][up_off + c]`. The routed experts run it on
-//! the 8M token-slot rows of the grouped gate/up GEMM and the shared expert on M rows; `act`
-//! then feeds the MMQ q8_1 quantizer. The silu is the upstream helper compiled under the MMQ
-//! glue group's fast math (`__expf`, approximate division, subnormals flushed to zero), so
-//! the tolerance is the row SW0, not bit equality with an IEEE silu.
+//! Safe launch wrapper of `swiglu_rows`: the M-row SwiGLU with f32 output of the
+//! chunked-prefill MoE path, `act[r][c] = silu(gu[r][c]) * gu[r][up_off + c]`. The routed
+//! experts run it on the 8M token-slot rows of the grouped gate/up GEMM and the shared expert
+//! on M rows; `act` then feeds the MMQ q8_1 quantizer. The silu is the upstream helper
+//! compiled under the MMQ glue group's fast math (`__expf`, approximate division, subnormals
+//! flushed to zero), so the tolerance is the tests' `SW0` bound (2^-18 relative), not bit
+//! equality with an IEEE silu.
 //!
 //! [`CudaContext::swiglu_rows`] queues one kernel on a [`DeviceStream`] and returns. The call
 //! allocates nothing, copies nothing and never synchronizes; a fault in the queued work

@@ -1,5 +1,5 @@
-//! The q8_1 quantize of activation rows for the MMVQ matvec kernels (MATVEC-PAR S1 c3a,
-//! decision 0047, stage 1): one launch of the vendored `quantize_q8_1` kernel per call.
+//! The q8_1 quantize of activation rows for the MMVQ matvec kernels: one launch of the vendored
+//! `quantize_q8_1` kernel per call.
 //!
 //! [`CudaContext::quantize_q8_1`] queues the kernel on a [`DeviceStream`] and returns when it is
 //! queued. It allocates nothing, copies nothing and never synchronizes. The output holds one
@@ -7,12 +7,11 @@
 //! writes the zero tail of the padding itself, so a later matvec over the padded width is
 //! unaffected by stale bytes beyond the live part (test 9 pins this).
 //!
-//! The block rule is the vendored kernel's: per 32 values `d = amax/127` and `q =
-//! roundf(x/d)` (0 when `amax` is 0), stored as halves, and `s` is the raw f32 SUM OF THE INPUTS
-//! reduced by the kernel's fixed warp order. The vendored objects are built with
-//! `-use_fast_math` (decision 0049 item 5), so the f32 `d` can be up to 3 ulp from the IEEE
-//! value and codes can differ at rounding boundaries; the seam-1 test asserts invariants, not
-//! bytes, and reports the bit-equal share.
+//! The block rule is the vendored kernel's: per 32 values `d = amax/127` and `q = roundf(x/d)` (0
+//! when `amax` is 0), stored as halves, and `s` is the raw f32 SUM OF THE INPUTS reduced by the
+//! kernel's fixed warp order. The vendored objects are built with `-use_fast_math`, so the f32 `d`
+//! can be up to 3 ulp from the IEEE value and codes can differ at rounding boundaries; the device
+//! test asserts invariants, not bytes, and reports the bit-equal share.
 //!
 //! Every refusal is a `BadRequest` and happens before any native call. In order: the backend is
 //! usable; `k` is a multiple of 32; `ncols` is in `1..=8`; `x` holds `ncols * k` floats and `y`

@@ -1,4 +1,4 @@
-//! Mac MLX adapter for the Flash-Next projection seam, and oracle parity tests (decision 0035).
+//! Mac MLX adapter for the Flash-Next projection seam, and oracle parity tests.
 
 use super::stored::{self, StoredWeight};
 use crate::family::project::Projector;

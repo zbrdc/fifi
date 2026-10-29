@@ -1,14 +1,14 @@
 //! Raw FFI to the chunk attention preparation entry of `native/prefill/attn_prep_chunk.cu`
-//! (declared in `native/prefill/attn_prep_chunk.h`), CPF-ATTN-A K1. Child module of
-//! `native/prefill.rs`, so it inherits the `allow(unsafe_code)` of `native.rs`.
+//! (declared in `native/prefill/attn_prep_chunk.h`). Child module of `native/prefill.rs`, so it
+//! inherits the `allow(unsafe_code)` of `native.rs`.
 //!
 //! The math is a byte-for-byte re-expression of the vendored `attn_prep` with `p0` a launch
-//! argument (decision 0049 items 1 and 2); the wrapper's tests pin the bit equality.
+//! argument that the device checks again; the wrapper's tests pin the bit equality.
 //!
 //! Safety invariants this file relies on:
 //! - The launch entry is called only through `CudaContext::launch_on`, on the thread that
-//!   owns the context and under the dispatch guard (decisions 0023 and 0024). It only
-//!   enqueues and returns; the stream is live for the call.
+//!   owns the context and under the dispatch guard. It only enqueues and returns; the
+//!   stream is live for the call.
 //! - Every range is a `RawRange`, proved inside a live allocation by `raw_range`. Sizes,
 //!   alignment and disjointness (`super::Span`) are proved again here, on the extents the
 //!   kernel touches, before the call; the C entry repeats the pointer, alignment and shape
@@ -21,10 +21,7 @@
 
 #![cfg_attr(
     not(test),
-    expect(
-        dead_code,
-        reason = "staged for CPF-7, the prefill driver (decision 0049)"
-    )
+    expect(dead_code, reason = "staged for the chunked-prefill driver")
 )]
 
 use std::ffi::{c_int, c_void};
@@ -35,7 +32,7 @@ use super::{DeviceFailure, RawRange, RawStream, STAGE_NONE, Span, checked, inval
 /// Mode of the KV outputs: append the normed and rotated rows to the fp16 cache planes.
 pub(in crate::kernels::cuda) const MODE_APPEND_FP16: c_int = 0;
 /// Mode of the KV outputs: write the post-rope k rows and the unchanged v rows as f32, the
-/// input contract of `kv8_append`'s chunk entry (IMPL-KV8-A).
+/// input contract of `kv8_append`'s chunk entry.
 pub(in crate::kernels::cuda) const MODE_ROWS_OUT: c_int = 1;
 
 /// Mirror of `inference_cuda_attn_prep_chunk_args` in `attn_prep_chunk.h`, field for field.
@@ -304,8 +301,8 @@ pub(in crate::kernels::cuda) fn attn_prep_chunk_launch(
 }
 
 /// Queues the same kernel with a deliberately violated p0 bound, so the kernel's own device
-/// re-check (decision 0049 item 2) is the code under test; every other rule of the call
-/// holds, so the guard's NaN-q write touches valid memory. Qualified fault path only.
+/// re-check is the code under test; every other rule of the call holds, so the guard's NaN-q write
+/// touches valid memory. Qualified fault path only.
 #[cfg(all(test, feature = "cuda-fault-qualification"))]
 pub(in crate::kernels::cuda) fn attn_prep_chunk_fault_bad_bounds(
     stream: &RawStream,

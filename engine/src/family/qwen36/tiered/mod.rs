@@ -1,13 +1,14 @@
-//! Host-only tier policy and residency tables of the Q36 expert banks (OFF-2 C1).
+//! Host-only tier policy and residency tables of the Q36 expert banks.
 //!
 //! Qwen3.6-35B-A3B decode keeps the expert weights in the OS page cache and holds a
 //! small per-layer VRAM bank of the hot experts; the rest is served on the CPU. This
 //! module is the pure-host brain of that split: the config and per-token report, the
 //! tier policy of the bank ([`policy`]) and the residency ledger of its slots
 //! ([`residency`]). There is no CUDA here and no clock read outside [`server`]'s
-//! thread and the pool's bounded `finish` (whose waits time themselves); time otherwise arrives as a
-//! parameter, and the only file access is the read-only mapping of
-//! [`mapped_file`]. The tiered step (OFF-2 D5) uses it through `cuda/tiered_step.rs` and `cuda/tiered_load.rs`.
+//! thread and the pool's bounded `finish` (whose waits time themselves); time
+//! otherwise arrives as a parameter, and the only file access is the read-only
+//! mapping of [`mapped_file`]. The tiered step uses it through `cuda/tiered_step.rs`
+//! and `cuda/tiered_load.rs`.
 
 pub mod budget;
 pub mod classify;

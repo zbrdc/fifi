@@ -1,4 +1,4 @@
-//! Unit tests of the result-pair decision and the failure action (test seam U13). CPU only.
+//! Unit tests of the result-pair decision and the failure action. CPU only.
 use super::{
     book::CommitRefusal,
     rules::sampler_width,
@@ -95,7 +95,7 @@ fn a_bad_token_is_a_sample_error() {
 
 #[test]
 fn commit_step_maps_the_status_with_precedence_4_8_1_2() {
-    // The rule this packet relies on (REPLY-76): the class of a refused status, 4 first.
+    // The rule the step relies on: the class of a refused status, 4 first.
     let order = [
         (4, "step_params"),
         (8, "prefill_chunk"),

@@ -7,9 +7,9 @@
 //! Cells that no token of a call may read are fp16 NaN, and `part` starts as NaN, so an
 //! out-of-range read poisons the result.
 //!
-//! The device suite runs with `--test-threads=1` (decision 0040). The fixed combine order IS
-//! pinned bit-exactly by the T8 test at the end of this file: it owns its `part` scratch, reads
-//! it back after the launch and recomputes `attn_combine_k` on the host in split-index order.
+//! The device suite runs with `--test-threads=1`. The fixed combine order IS pinned bit-exactly
+//! by the T8 test at the end of this file: it owns its `part` scratch, reads it back after the
+//! launch and recomputes `attn_combine_k` on the host in split-index order.
 //!
 //! Each refusal is checked by the text of its error, so a test fails when another check refuses
 //! the call instead of the one under test.
@@ -46,14 +46,13 @@ fn read_bytes(ctx: &CudaContext, buffer: &DeviceBuffer, len: usize) -> Result<Ve
     Ok(bytes)
 }
 
-/// Class E3 for RD-8b, final: `max|d| <= 2^-17 * max(max|ref|, 1)` per head vector (lane M
-/// REPLY-44, REPLY-48 and REPLY-50; decision 0047 on main `1a547172`, "finalize E3 and R1").
+/// Class E3: `max|d| <= 2^-17 * max(max|ref|, 1)` per head vector.
 const E3: f64 = 1.0 / 131_072.0;
-/// Two times the largest per-head query spread of the RD-M6 oracle (1.691144648391655): a case
-/// with a larger `q` standard deviation is a stress case, held to a sanity bound only.
+/// Two times the largest per-head query spread of the llama.cpp oracle dumps (1.691144648391655):
+/// a case with a larger `q` standard deviation is a stress case, held to a sanity bound only.
 const IN_RANGE_QSD: f64 = 3.382;
 const STRESS_SANITY: f64 = 1e-2;
-/// An in-range maximum above 2^-19 is reported to lane M as a headroom warning.
+/// An in-range maximum above 2^-19 is printed as a headroom warning.
 const HEADROOM: f64 = 1.0 / 524_288.0;
 /// fp16 quiet NaN: the content of every cell no token may read.
 const F16_NAN: u16 = 0x7e00;
@@ -360,7 +359,7 @@ fn check_all(rig: &Rig, pool: &Pool, spec: &Spec) -> (f64, bool) {
     check(rig, pool, spec, &(0..spec.n_head).collect::<Vec<_>>())
 }
 
-/// Prints the in-range and the stress maxima, with the lane M warnings.
+/// Prints the in-range and the stress maxima, with the headroom and stress warnings.
 fn report(test: &str, outcomes: &[(f64, bool)]) {
     let top = |stress: bool| {
         outcomes
@@ -371,10 +370,10 @@ fn report(test: &str, outcomes: &[(f64, bool)]) {
     let (in_range, stress) = (top(false), top(true));
     println!("{test}: in-range maximum {in_range:e}, stress maximum {stress:e}");
     if in_range > HEADROOM {
-        println!("{test}: HEADROOM WARNING: in-range maximum above 2^-19, report to lane M");
+        println!("{test}: HEADROOM WARNING: in-range maximum above 2^-19");
     }
     if stress > 2.0 * E3 {
-        println!("{test}: FINDING: a stress maximum is above 2^-16, report to lane M");
+        println!("{test}: FINDING: a stress maximum is above 2^-16");
     }
 }
 
@@ -544,7 +543,7 @@ fn attn_part_bytes_pins_the_scratch_rule() {
     assert!(matches!(overflow, Err(EngError::BadRequest(m)) if m.contains("size overflow")));
 }
 
-/// A fresh 4-byte word per length (the in-place `write_at` form waits for RD-2c).
+/// A fresh 4-byte word per length (the test does not use the in-place `write_at` form).
 #[test]
 fn attn_decode_reads_the_length_from_each_word() {
     if !testkit::device_present("attn_decode_reads_the_length_from_each_word") {
@@ -819,9 +818,9 @@ fn attn_decode_rejects_bad_calls_before_any_launch() {
     assert_eq!(first_out, again_out, "the base call after the refusals");
 }
 
-// ---------------------------------------------------------------- T7 (RD-11a)
+// ---------------------------------------------------------------- T7: graph capture
 
-/// The capture plan of the owed test: the rig owns every buffer, so no pin and no hold.
+/// The capture plan of the capture test: the rig owns every buffer, so no pin and no hold.
 fn no_pins() -> CapturePlan<'static> {
     CapturePlan {
         pins: &[],
@@ -829,7 +828,7 @@ fn no_pins() -> CapturePlan<'static> {
     }
 }
 
-/// The persistent buffers of the owed test: one `attn_decode` whose `kv_len` is a device word
+/// The persistent buffers of the capture test: one `attn_decode` whose `kv_len` is a device word
 /// that the rig rewrites between replays.
 struct WordRig<'r> {
     ctx: &'r CudaContext,
@@ -890,9 +889,9 @@ impl WordRig<'_> {
     }
 }
 
-/// T7 (RD-8b, owed; the seven lengths of its graph row): one `attn_decode` captured and replayed
-/// at kv_len 10, 100, 33, 1024, 2048, 1 and 777, with the device word rewritten between replays,
-/// equals the eager launch at that length byte for byte, on a two-node graph (the split-KV pair).
+/// T7: one `attn_decode` captured and replayed at kv_len 10, 100, 33, 1024, 2048, 1 and 777, with
+/// the device word rewritten between replays, equals the eager launch at that length byte for
+/// byte, on a two-node graph (the split-KV pair).
 #[test]
 fn attn_decode_inside_a_capture_follows_the_word() {
     if !testkit::device_present("attn_decode_inside_a_capture_follows_the_word") {
@@ -953,7 +952,7 @@ fn attn_decode_inside_a_capture_follows_the_word() {
     }
 }
 
-// ------------------------------------------- T8 (IMPL-ATTN-COMBINE-PIN)
+// ------------------------------------------- T8: the pinned combine order
 
 /// How the K rows of a T8 case are built: one key vector in every readable row, the rows of
 /// the first active split scaled up by a factor, or one tied-hot row and one near-hot row per
@@ -1128,8 +1127,8 @@ fn combine_case(spec: &Spec, pool: &Pool, uniform_q: bool, skew: Skew) -> Combin
 
 /// Uploads one case, queues one `attn_decode` through the wrapper, drains the stream and reads
 /// `out` and the owned `part` scratch back. Returns plain host vectors; every device owner is
-/// dropped before the return, so the caller's assertions never panic inside a live backend
-/// (the S3b lesson: a drop while panicking latches the backend).
+/// dropped before the return, so the caller's assertions never panic inside a live backend (a
+/// drop while panicking latches the backend).
 fn launch_combine(rig: &Rig, case: &CombineCase) -> Result<(Vec<f32>, Vec<f32>), EngError> {
     let (ctx, spec) = (&rig.ctx, &case.spec);
     let part_bytes = attn_part_bytes(spec.m, spec.n_kv_head, spec.head_dim, spec.split.max_splits)?;
@@ -1291,11 +1290,10 @@ fn combine_l_orders(spec: &Spec, part: &[f32]) -> Vec<(f32, f32)> {
 /// other weight is exactly `+0` on both sides; the near-hot cases' plain rows sit the same gap
 /// below their tied hot rows. `fmaf` mirrors `mul_add`, the division is IEEE
 /// on both, and the gate is 0, so `sigmoid(0) = 1/2` exactly; nothing else in the combine has a
-/// device intrinsic. Reversing the two index-order sums (mutant m7-fp16) re-rounds the A sums
-/// of the uniform cases and the L sum of the near-hot cases, and fails the bit assert. Each
-/// near-hot case is probed first: the reversed L of its own device partials must differ in at
-/// least one bit, so a case that cannot see the L order fails the probe instead of passing the
-/// bit comparison vacuously.
+/// device intrinsic. Reversing the two index-order sums re-rounds the A sums of the uniform cases
+/// and the L sum of the near-hot cases, and fails the bit assert. Each near-hot case is probed
+/// first: the reversed L of its own device partials must differ in at least one bit, so a case
+/// that cannot see the L order fails the probe instead of passing the bit comparison vacuously.
 #[test]
 fn attn_decode_combine_is_bit_equal_to_an_index_order_host_combine_of_its_partials() {
     if !testkit::device_present(

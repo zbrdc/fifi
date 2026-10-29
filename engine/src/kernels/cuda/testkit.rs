@@ -1,7 +1,6 @@
-//! Helpers shared by the tests of the resident-decode owners (RD-2). RD-2a-1 wrote
-//! the device check and the upload helper; RD-2a-2 added the weight, input and
-//! read-back helpers that its launch tests and the later RD-2 tests share. Helpers
-//! that only one test file uses stay in that file.
+//! Helpers shared by the tests of the resident-decode owners: the device check, the
+//! upload helper, and the weight, input and read-back helpers that the launch tests and
+//! the other owner tests share. Helpers that only one test file uses stay in that file.
 
 use std::sync::OnceLock;
 
@@ -13,7 +12,7 @@ use crate::weights::GgufType;
 
 /// `cudaErrorInsufficientDriver` of `cuda_runtime_api.h` (the build image's CUDA 12.2): the
 /// runtime cannot use the host's driver library, the status a host with no CUDA driver at
-/// all reports from `cudaDeviceCount` (observed on pinu, IMPL-DEVICE-PRESENT-NO-DRIVER).
+/// all reports from `cudaDeviceCount`.
 const CUDA_ERROR_INSUFFICIENT_DRIVER: i32 = 35;
 
 /// `cudaErrorNoDevice` of `cuda_runtime_api.h`: a usable driver but no device. The adapter
@@ -39,7 +38,7 @@ enum Presence {
 }
 
 /// The decision of [`device_present`], pure so each of its branches is testable on a host
-/// without a driver (IMPL-DEVICE-PRESENT-NO-DRIVER): a visible device is
+/// without a driver: a visible device is
 /// [`Presence::Present`] whatever `required` says; a count of zero, or an error whose
 /// status means "no usable CUDA driver or device" (35 and 100), skips unless a device is
 /// required; every other error fails, required or not, keeping its text.
@@ -106,7 +105,7 @@ impl Probed {
     }
 }
 
-/// Caches one probe decision for a whole process (ruling of 2026-10-14): the no-driver
+/// Caches one probe decision for a whole process: the no-driver
 /// count error latches the backend TERMINAL inside `native_error`, so only the FIRST
 /// probe sees status 35; every later `device_count()` of the same process would return
 /// the terminal refusal instead. The gate therefore probes once and every test shares
@@ -180,8 +179,8 @@ fn drain<R: std::io::Read + Send + 'static>(mut pipe: R) -> std::thread::JoinHan
 
 /// Runs a test whose body deliberately triggers a native refusal in a child process of the test
 /// executable. A native refusal latches the CUDA backend terminal for the whole process
-/// (`native.rs`), so in a one-process suite run, as the one-process gate run (2026-10-14) does,
-/// every later device test would fail on the latch. The pattern is `fault.rs:105`'s `run_child`
+/// (`native.rs`), so in a one-process suite run every later device test would fail on the
+/// latch. The pattern is `fault.rs:105`'s `run_child`
 /// (CUDA) and `resident_ops.rs:1624`'s `delegated_to_child` (MLX): re-run the test executable on
 /// this one test.
 ///
@@ -242,7 +241,7 @@ pub(super) fn latching_test_in_child(path: &str, expect: &[&str]) -> bool {
     false
 }
 
-/// Deterministic xorshift64* generator for the test data of the resident kernels (RD-2p). The
+/// Deterministic xorshift64* generator for the test data of the resident kernels. The
 /// kernel test modules draw from it instead of keeping local copies; one seed always gives one
 /// sequence, so a failing case replays.
 pub(crate) struct Rng(u64);
@@ -273,12 +272,12 @@ impl Rng {
     }
 }
 
-/// Draws of the `Rng` that the kernel tests share (stage 1 wave 1). They sit in a second `impl`
+/// Draws of the `Rng` that the kernel tests share. They sit in a second `impl`
 /// block, after the one that holds `new`, `next_u64` and `below`, so the staged `expect` of that
 /// block stays independent of them. Each test file uses a subset, hence the `allow`.
 #[allow(
     dead_code,
-    reason = "shared by the stage 1 kernel tests; each test file draws with a subset"
+    reason = "shared by the resident kernel tests; each test file draws with a subset"
 )]
 impl Rng {
     /// A uniform value in [0, 1): the top 53 bits of `next_u64` over 2^53. Every result is an
@@ -302,7 +301,7 @@ impl Rng {
 /// subnormal give a signed zero.
 #[allow(
     dead_code,
-    reason = "shared by the stage 1 kernel tests; each test file draws with a subset"
+    reason = "shared by the resident kernel tests; each test file draws with a subset"
 )]
 pub(super) fn f16_bits(value: f32) -> u16 {
     let bits = value.to_bits();
@@ -367,16 +366,16 @@ fn f16_subnormal(sign: u16, e: i32, full: u32) -> u16 {
 /// production scale checks use, so the tests and those checks read fp16 the same way.
 #[allow(
     dead_code,
-    reason = "shared by the stage 1 kernel tests; each test file draws with a subset"
+    reason = "shared by the resident kernel tests; each test file draws with a subset"
 )]
 pub(super) fn f16_to_f32(bits: u16) -> f32 {
     super::context::f16_to_f32(bits)
 }
 
-/// `x / (1 + exp(-x))` in f64: the SiLU reference of the DeltaNet kernels (RD-7a, RD-7b).
+/// `x / (1 + exp(-x))` in f64: the SiLU reference of the DeltaNet conv and gated-delta kernels.
 #[allow(
     dead_code,
-    reason = "shared by the stage 1 kernel tests; each test file draws with a subset"
+    reason = "shared by the resident kernel tests; each test file draws with a subset"
 )]
 pub(super) fn silu_f64(x: f64) -> f64 {
     x / (1.0 + (-x).exp())
@@ -385,7 +384,7 @@ pub(super) fn silu_f64(x: f64) -> f64 {
 /// `ln(1 + exp(x))` in f64 with the vendored kernel's cut: above 20 the value is `x`.
 #[allow(
     dead_code,
-    reason = "shared by the stage 1 kernel tests; each test file draws with a subset"
+    reason = "shared by the resident kernel tests; each test file draws with a subset"
 )]
 pub(super) fn softplus_f64(x: f64) -> f64 {
     if x > 20.0 { x } else { x.exp().ln_1p() }
@@ -395,7 +394,7 @@ pub(super) fn softplus_f64(x: f64) -> f64 {
 /// names the path; a length that is not a multiple of 4 is an error.
 #[allow(
     dead_code,
-    reason = "shared by the stage 1 kernel tests; each test file draws with a subset"
+    reason = "shared by the resident kernel tests; each test file draws with a subset"
 )]
 pub(super) fn read_f32_file(path: &std::path::Path) -> Result<Vec<f32>, String> {
     let bytes = std::fs::read(path).map_err(|e| format!("{}: {e}", path.display()))?;
@@ -413,7 +412,7 @@ pub(super) fn read_f32_file(path: &std::path::Path) -> Result<Vec<f32>, String> 
 /// refused call.
 #[allow(
     dead_code,
-    reason = "shared by the stage 1 kernel tests; each test file draws with a subset"
+    reason = "shared by the resident kernel tests; each test file draws with a subset"
 )]
 pub(super) fn fnv1a64(bytes: &[u8]) -> u64 {
     let mut hash = 0xcbf2_9ce4_8422_2325_u64;
@@ -429,7 +428,7 @@ pub(super) fn fnv1a64(bytes: &[u8]) -> u64 {
 /// infinity, subnormals are kept, NaN gives 0x7e00 and the sign of zero is kept.
 #[allow(
     dead_code,
-    reason = "shared by the stage 1 kernel tests; each test file draws with a subset"
+    reason = "shared by the resident kernel tests; each test file draws with a subset"
 )]
 pub(super) fn f64_to_f16_bits(value: f64) -> u16 {
     if value.is_nan() {
@@ -474,13 +473,13 @@ fn f16_ordered(bits: u16) -> f64 {
     f64::from(f16_to_f32(bits))
 }
 
-/// The E2 test of lane M (REPLY-44): `bits` equals `f64_to_f16_bits(reference)`, or it is the
+/// The binary16 rounding test: `bits` equals `f64_to_f16_bits(reference)`, or it is the
 /// neighbouring binary16 value and `reference` lies within 2^-20 (relative) of the rounding
 /// midpoint between the two. A reference out of range needs the same signed infinity (the
 /// neighbour rule gives 65504 against infinity a window of 2^-20 around 65520, nothing more).
 #[allow(
     dead_code,
-    reason = "shared by the stage 1 kernel tests; each test file draws with a subset"
+    reason = "shared by the resident kernel tests; each test file draws with a subset"
 )]
 pub(super) fn e2_holds(bits: u16, reference: f64) -> bool {
     let want = f64_to_f16_bits(reference);
@@ -507,7 +506,7 @@ pub(super) fn e2_holds(bits: u16, reference: f64) -> bool {
 /// `frag_layout.cuh` writes them. `k` is a multiple of 256.
 #[allow(
     dead_code,
-    reason = "shared by the stage 1 kernel tests; each test file draws with a subset"
+    reason = "shared by the resident kernel tests; each test file draws with a subset"
 )]
 pub(super) fn unpack_xf(xf: &[u8], m: usize, k: usize) -> Vec<u16> {
     let half = |vec: usize, j: usize| {
@@ -661,7 +660,7 @@ pub(super) fn blocking(
         .expect("blocking linear")
 }
 
-/// Repeats of one projection in the seam-1 determinism tests (decision 0047 item 7).
+/// Repeats of one projection in the determinism tests.
 pub(super) const REPEATS: usize = 1_000;
 /// Repeats queued, synchronized and compared together; bounds the host and device memory of a run.
 const REPEAT_CHUNK: usize = 100;
@@ -846,7 +845,7 @@ pub(super) fn kernel_ptx(kernel: &str, main: &str, files: &[(&str, &str)]) -> Op
     Some(body.lines().map(|l| l.trim().to_owned()).collect())
 }
 
-/// The pure cases of IMPL-DEVICE-PRESENT-NO-DRIVER; they run on any host, driver or not.
+/// The pure cases of the device-presence decision; they run on any host, driver or not.
 mod presence_tests {
     use super::*;
 
@@ -918,7 +917,7 @@ mod presence_tests {
         }
     }
 
-    /// The probe runs once and every call shares its decision (ruling of 2026-10-14):
+    /// The probe runs once and every call shares its decision:
     /// the later probes would answer differently, but the cache never runs them, and a
     /// fresh cache probes again on its own.
     #[test]

@@ -1,5 +1,5 @@
 /*
- * Architecture clamp of the vendored MMVQ wrappers (MATVEC-PAR S1 fix round): see mmvq_arch.h.
+ * Architecture clamp of the vendored MMVQ wrappers: see mmvq_arch.h.
  * Pure arithmetic over the architecture list, kept out of the wrappers so one definition serves
  * both and the CPU tests can drive it with any list.
  */

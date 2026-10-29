@@ -1,10 +1,10 @@
 //! The MoE block of ONE layer of the resident Qwen3.6 decode step at ONE token (`m = 1`): a fixed
-//! launch order on the one owned stream (decision 0047 item 3, packet RD-9c). The router (RD-5)
-//! writes the expert ids, the pick weights and the shared gate on the device; every expert op
-//! reads its id from device memory through `matmul_expert` (RD-0b), so the host never reads an id
-//! and no host value depends on device data. [`MoeOp`] is the sequence as data, [`moe_sequence`]
-//! the order, [`op_slots`] the slots each op touches and the phase it runs in (RD-9a's plan), and
-//! [`check_block`] every pure refusal, before the first launch.
+//! launch order on the one owned stream. The router writes the expert ids, the pick weights and the
+//! shared gate on the device; every expert op reads its id from device memory through
+//! `matmul_expert`, so the host never reads an id and no host value depends on device data.
+//! [`MoeOp`] is the sequence as data, [`moe_sequence`] the order, [`op_slots`] the slots each op
+//! touches and the phase it runs in (the step plan), and [`check_block`] every pure refusal, before
+//! the first launch.
 //!
 //! The order (one stream, phase numbers of `step_plan`): ROUTE the router; GATE_UP the gate and
 //! up matmul of every pick slot, then the shared gate and up; SWIGLU the shared pack first (the
@@ -13,17 +13,17 @@
 //! one pack buffer is enough); DOWN the shared down; COMBINE the residual plus the picks plus the
 //! gated shared row into the other residual buffer. [`run_moe_block`] queues exactly this.
 //!
-//! The block makes no allocation, copies nothing, never syncs and never maps the status
-//! word: the router ORs its fault bit on the device, and mapping is the step loop's job (RD-9d).
-//! Eager and captured steps call the same function; there is no capture branch.
+//! The block makes no allocation, copies nothing, never syncs and never maps the status word: the
+//! router ORs its fault bit on the device, and mapping is the step loop's job. Eager and captured
+//! steps call the same function; there is no capture branch.
 //!
-//! MATVEC-PAR S3b: the Native layout replaces the sixteen per-slot gate/up matmuls and the
-//! sixteen per-slot packs and down matmuls with ONE merged launch each (`matvec_expert` over the
-//! device ids, `swiglu_q8` over the eight slots), reading the padded q8_1 packs of the NATIVE
-//! plan; the router keeps its place and its bytes (the OFF-T hook reads them right after it).
-//! [`Packs`] carries the two views of the input packs and [`check_block`] sizes them per kind.
+//! The Native layout replaces the sixteen per-slot gate/up matmuls and the sixteen per-slot packs
+//! and down matmuls with ONE merged launch each (`matvec_expert` over the device ids, `swiglu_q8`
+//! over the eight slots), reading the padded q8_1 packs of the NATIVE plan; the router keeps its
+//! place and its bytes (the tiered expert hook reads them right after it). [`Packs`] carries the
+//! two views of the input packs and [`check_block`] sizes them per kind.
 //!
-//! The device-side expert routing this block relies on is RD-5's.
+//! The device-side expert routing this block relies on is the router's.
 
 use super::dims::StepDims;
 use super::mixer_weights::DenseWeight;
@@ -48,14 +48,14 @@ use crate::kernels::cuda::{
 
 const F32: usize = size_of::<f32>();
 const I32: usize = size_of::<i32>();
-/// The width quantum of `swiglu_pack` (`k_pad`, RD-4b's `WIDTH_QUANTUM`).
+/// The width quantum of `swiglu_pack` (`k_pad`, the pack kernel's `WIDTH_QUANTUM`).
 const PACK_WIDTH: usize = 256;
 
 /// The dims of one MoE block: the row count of the step and the MoE geometry. No model number
 /// lives here; [`Self::new`] reads the checked step dims.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) struct MoeDims {
-    /// Token rows; stage 1 runs this block at one row (verify windows get their own packet).
+    /// Token rows; stage 1 runs this block at one row (verify windows need their own sizing).
     pub(super) rows: usize,
     /// Hidden size: the router and shared-projection width, the residual width.
     pub(super) hidden: usize,
@@ -108,7 +108,7 @@ pub(super) enum MoeOp {
     /// The combine into the other residual buffer.
     Combine,
     /// The ONE merged gate matvec of every pick slot against `Q8Moe` (`matvec_expert`,
-    /// `x_per_slot` false, the ids on the device; MATVEC-PAR S3b).
+    /// `x_per_slot` false, the ids on the device).
     ExpertGateQ,
     /// The ONE merged up matmul of every pick slot (the twin of [`MoeOp::ExpertGateQ`]).
     ExpertUpQ,
@@ -132,8 +132,8 @@ pub(super) enum MoeOp {
 /// combine. `top_k` slots make `3 * top_k + 14` ops.
 pub(super) fn moe_sequence(top_k: usize, layout: WeightLayout) -> Vec<MoeOp> {
     if layout == WeightLayout::Native {
-        // The router keeps the first place and its bytes (the OFF-T hook reads them there); the
-        // per-slot triples collapse to one merged launch each, so a Native block is 10 ops.
+        // The router keeps the first place and its bytes (the tiered expert hook reads them there);
+        // the per-slot triples collapse to one merged launch each, so a Native block is 10 ops.
         return vec![
             MoeOp::Router,
             MoeOp::ExpertGateQ,
@@ -350,9 +350,9 @@ pub(super) struct ExpertFacts {
     pub(super) shared_out: RangeFacts,
 }
 
-/// The three input-pack views of one layout (MATVEC-PAR S3b): the fp16 packs of the Tiled
-/// block or the padded q8_1 packs of the Native block. The wrong-kind accessor is a typed
-/// refusal, so a Native list cannot launch against Tiled packs or the other way round.
+/// The three input-pack views of one layout: the fp16 packs of the Tiled block or the padded q8_1
+/// packs of the Native block. The wrong-kind accessor is a typed refusal, so a Native list cannot
+/// launch against Tiled packs or the other way round.
 #[derive(Clone, Copy)]
 pub(super) enum Packs<'b> {
     Xf {
@@ -455,7 +455,7 @@ impl NeedBytes {
     fn of(dims: &MoeDims, packs: PackKind) -> Result<Self, EngError> {
         let row = |width: usize| product(&[width, F32]);
         // The fp16 packs of the Tiled block (one per row) or the padded q8_1 packs of the Native
-        // block (one row for moe/shared, `top_k` rows for the expert slots; MATVEC-PAR S3b).
+        // block (one row for moe/shared, `top_k` rows for the expert slots).
         let pack = |k: usize, rows: usize| {
             match packs {
                 PackKind::Xf => xf_bytes(dims.rows, k),
@@ -681,17 +681,17 @@ fn check_apart(bufs: &BufferFacts) -> Result<(), EngError> {
     Ok(())
 }
 
-/// One expert stack of the block (MATVEC-PAR S3b): the tiles of the Tiled load (the per-slot
-/// `matmul_expert` launches) or the file's own blocks of the Native load (the ONE merged
-/// `matvec_expert` launch; the depth rides `NativeWeight::experts`).
+/// One expert stack of the block: the tiles of the Tiled load (the per-slot `matmul_expert`
+/// launches) or the file's own blocks of the Native load (the ONE merged `matvec_expert` launch;
+/// the depth rides `NativeWeight::experts`).
 pub(super) enum StackWeights<'w> {
     Tiled(ExpertStack<'w>),
     Native(&'w NativeWeight),
 }
 
-/// The weights of the MoE block of one layer, resolved by the layer driver (RD-9b's
-/// `(layer, role)` lookup): the raw F32 router matrices and the expert stacks and
-/// shared-expert projections of the session's layout (tiles or native blocks).
+/// The weights of the MoE block of one layer, resolved by the layer driver (the `(layer, role)`
+/// lookup of `LayerTable`): the raw F32 router matrices and the expert stacks and shared-expert
+/// projections of the session's layout (tiles or native blocks).
 pub(super) struct MoeLayerWeights<'w> {
     /// The raw F32 `[n_expert][hidden]` router matrix (`ffn_gate_inp`).
     pub(super) router: &'w DeviceBuffer,
@@ -711,7 +711,7 @@ pub(super) struct MoeLayerWeights<'w> {
     pub(super) shared_down: DenseWeight<'w>,
 }
 
-/// The routing and residual ranges of the block: views of the RD-9a arena and the status word.
+/// The routing and residual ranges of the block: views of the step arena and the status word.
 pub(super) struct RouteBufs<'b> {
     /// f32 `[hidden]`: the residual after the mixer add, the block input.
     pub(super) resid_in: DeviceRange<'b>,
@@ -732,7 +732,7 @@ pub(super) struct RouteBufs<'b> {
 }
 
 /// The expert and shared-expert ranges of the block: views of the step arena, the input packs
-/// grouped in [`Packs`] (MATVEC-PAR S3b).
+/// grouped in [`Packs`].
 pub(super) struct ExpertBufs<'b> {
     pub(super) packs: Packs<'b>,
     /// f32 `[top_k][gate | up]`, slot `s`'s halves contiguous for its pack.
@@ -806,7 +806,7 @@ impl StackWeights<'_> {
 
 impl MoeLayerWeights<'_> {
     /// The pure facts of the weight set, for [`check_block`] without a device: the layout of a
-    /// stack or projection does not change its shape facts (MATVEC-PAR S3b).
+    /// stack or projection does not change its shape facts.
     pub(super) fn facts(&self) -> WeightFacts {
         let stack = |s: &StackWeights<'_>| StackFacts {
             rows: match s {
@@ -947,9 +947,9 @@ fn whole_of<'b>(range: &DeviceRange<'b>) -> Result<DeviceRange<'b>, EngError> {
     range.buffer().range(range.offset(), range.bytes())
 }
 
-/// The tail of `range` from f32 column `col` (the A2 halves of `ExpertGu`/`SharedGu`): the tail
-/// ends at the end of the view, so the merged launch's `(n_used - 1) * stride + rows` footprint
-/// fits it exactly.
+/// The tail of `range` from f32 column `col` (the gate and up halves of `ExpertGu`/`SharedGu`): the
+/// tail ends at the end of the view, so the merged launch's `(n_used - 1) * stride + rows`
+/// footprint fits it exactly.
 fn tail<'b>(range: &DeviceRange<'b>, col: usize) -> Result<DeviceRange<'b>, EngError> {
     let offset = col
         .checked_mul(F32)
@@ -1150,7 +1150,7 @@ fn op_pack(
 /// The ONE merged gate/up matvec of the native block ([`MoeOp::ExpertGateQ`],
 /// [`MoeOp::ExpertUpQ`]): a single `matvec_expert` launch over the device ids, every slot reading
 /// the same `Q8Moe` row (`x_per_slot` false), writing slot `s`'s `rows` floats at column offset
-/// 0 (gate) or `inter` (up) of `ExpertGu` with the A2 stride `2 * inter`.
+/// 0 (gate) or `inter` (up) of `ExpertGu` with the stride `2 * inter`.
 fn op_expert_gu(
     launch: &Launch<'_>,
     weights: &MoeLayerWeights<'_>,
@@ -1300,7 +1300,7 @@ fn op_swiglu_q(
 }
 
 /// The combine: `resid_out = resid_in + (picks in pick order + gate * shared)` out of place
-/// (RD-4e, `CombineOut::To`), the weights and the gate exactly as the router wrote them.
+/// (`CombineOut::To`), the weights and the gate exactly as the router wrote them.
 fn op_combine(launch: &Launch<'_>, bufs: &MoeBuffers<'_>, dims: MoeDims) -> Result<(), EngError> {
     launch.ctx.moe_combine(
         launch.stream,
@@ -1355,9 +1355,9 @@ fn launch_op(
 
 /// The MoE block of one layer at one token on the one stream: every pure refusal first
 /// ([`check_block`], so a captured block cannot be half queued), then the fixed list of
-/// [`moe_sequence`], one wrapper call per op. The function makes no allocation, copies nothing
-/// and never syncs; eager and captured steps call the same one, and no host value depends on
-/// device data (RD-0b).
+/// [`moe_sequence`], one wrapper call per op. The function makes no allocation, copies nothing and
+/// never syncs; eager and captured steps call the same one, and no host value depends on device
+/// data.
 pub(super) fn run_moe_block(
     launch: &Launch<'_>,
     weights: &MoeLayerWeights<'_>,

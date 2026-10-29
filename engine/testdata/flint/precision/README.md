@@ -1,12 +1,21 @@
-# Pinned publisher embedding rounding fixture
+# Flint embedding rounding fixtures
 
-Model: RecursiveSI/flint-int4, revision `3b93f9053b530488405ae9fca51d4900d6ce21f0`.
-Publisher: Rec `e53663b262af4cb1ca498e596ca8b1a2d79e0800`, MLX 0.32.0, mlx-lm 0.31.3.
-These are only embedding rows 0 and 150000, in that order.
-The fixture retains INT8 codes, BF16 group64 scales/additive biases, and the captured publisher CPU dequantization output.
-The golden output is a lossless F32 container for the publisher BF16 result.
-The CPU dequantizer rounds the product to BF16, then rounds the sum to BF16.
-The CPU fixture is a negative witness for the GPU policy. Its bytes remain unchanged.
+Model: `RecursiveSI/flint-int4`, revision `3b93f9053b530488405ae9fca51d4900d6ce21f0`.
+Reference outputs: the model publisher's own source code at commit `e53663b262af4cb1ca498e596ca8b1a2d79e0800`, run with MLX 0.32.0 and mlx-lm 0.31.3.
+
+The embedding is stored as INT8 codes with BF16 scales and additive biases, one pair per group of 64 values.
+The two fixtures below hold the stored bytes of two embedding rows each, and the publisher's dequantized output for those rows.
+The BF16 outputs are stored losslessly as F32.
+
+The publisher's GPU path computes each value with an F32 multiply-add and rounds once to BF16.
+Its CPU dequantizer instead rounds the product to BF16 and then rounds the sum to BF16.
+The engine follows the GPU path.
+
+## CPU fixture
+
+Embedding rows 0 and 150000, in that order, dequantized by the publisher code on the CPU.
+All 4096 elements match the two-rounding CPU rule.
+The test `publisher_cpu_fixture_is_not_the_gpu_rounding_policy` (`engine/src/family/flint/precision.rs`) checks that the engine output differs from this fixture, which shows that the engine does not use the CPU rule.
 It does not qualify GPU attention, routed activation fusion, or full-model parity.
 
 SHA256:
@@ -17,15 +26,11 @@ SHA256:
 
 ## GPU fixture
 
-The GPU fixture contains rows 198 and 2, in that order.
-The publisher ran these two frozen token IDs on its GPU on 2026-10-22.
-An observation wrapper saved the actual input to layer 0. The wrapper delegated every original operation.
-The saved BF16 values use a lossless F32 container.
-All 4096 elements match F32 multiply-add with one final BF16 rounding.
-Only 1411 elements match the CPU policy with two BF16 rounds.
-The production test requires exact equality with the GPU values. No tolerance applies.
-
-The model revision, publisher commit, and package versions are the same as the CPU fixture.
+Embedding rows 198 and 2, in that order, from the publisher code running on the GPU.
+A wrapper recorded the actual input to layer 0 and passed every original operation through unchanged.
+All 4096 elements match an F32 multiply-add with one final BF16 rounding.
+Only 1411 elements match the two-rounding CPU rule.
+The test `embedding_matches_publisher_gpu_values_exactly` requires exact equality with these values. No tolerance applies.
 This fixture does not qualify attention, routed activation fusion, or full-model parity.
 
 SHA256:

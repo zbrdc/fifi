@@ -3,20 +3,17 @@
 //!
 //! The reference is written from the contract (RMSNorm times weight, then NEOX rope over the first
 //! `n_rot` dimensions at position `*pos + t`, computed in f64 from the exact f32 inputs), not from
-//! the kernel. The tolerance is the class RP1 (lane M REPLY-53, REPLY-56, REPLY-58). Every RP1
-//! statement carries its limit label: f32 RoPE angle; not checked against an f64 reference above
-//! position 1,150; A5 covers positions up to about 1,150 only.
+//! the kernel. The tolerance is the class RP1. Every RP1 statement carries its limit label: f32
+//! RoPE angle; checked against an f64 reference only up to about position 1,150.
 //!
-//! The device suite runs with `--test-threads=1` (decision 0040). Each refusal is checked by the
-//! text of its error, so a test fails when another check refuses the call instead of the one
-//! under test.
+//! The device suite runs with `--test-threads=1`. Each refusal is checked by the text of its
+//! error, so a test fails when another check refuses the call instead of the one under test.
 //!
 //! Argued, not tested: (1) a freed buffer: a `DeviceRange` borrows its buffer, so the compiler
-//! forbids freeing it early. (2) T10 (graph capture) is deferred to RD-11a: the capture window
-//! (RD-2d) is absent. (3) T11 (a latched context): the fault child of `fault.rs` is lane C's.
-//! (4) The size and offsets of the raw argument struct are pinned by a `const` assert in the
-//! native child (the struct is private there). (5) The chain "q NaN -> decode -> non-finite
-//! logits" is first tested at RD-9 integration.
+//! forbids freeing it early. (2) T11 (a latched context) belongs to the fault child of
+//! `fault.rs`. (3) The size and offsets of the raw argument struct are pinned by a `const` assert
+//! in the native child (the struct is private there). (4) The chain "q NaN -> decode ->
+//! non-finite logits" is first tested by the decode step.
 
 use super::{
     AttnPrepCall, AttnPrepRowsCall, AttnPrepShape, HEAD_DIM, MAX_DECODE_ROWS, MAX_N_HEAD,
@@ -31,8 +28,8 @@ use crate::kernels::cuda::resident::step_params::{
 use crate::kernels::cuda::testkit::{self, Rng, f16_bits, f16_to_f32};
 use crate::kernels::cuda::{CapturePlan, CudaContext, DeviceBuffer, DeviceStream};
 
-/// RP1, lane M REPLY-53, provisional until the first GPU step; f32 RoPE angle; not checked against
-/// an f64 reference above position 1,150; A5 covers positions up to about 1,150 only.
+/// RP1, provisional until the first GPU step; f32 RoPE angle; checked against an f64 reference
+/// only up to about position 1,150.
 const RP1_ANGLE: f64 = 1.0 / 4_194_304.0;
 /// Rows of canary on each side of the cache range inside its buffer.
 const CANARY_ROWS: usize = 64;
@@ -153,8 +150,8 @@ fn band_of(p: usize) -> usize {
     }
 }
 
-/// The REPLY-53 report: the worst ratio per position band and group, the q-only ratios of
-/// REPLY-58 and the K-tail numbers of REPLY-56.
+/// The RP1 report: the worst ratio per position band and group, the q-only ratios and the K-tail
+/// numbers.
 #[derive(Default)]
 struct Report {
     all: [[Worst; 5]; 2],
@@ -820,7 +817,7 @@ fn attn_prep_refuses_the_configurations_it_cannot_run() {
         let fx = fx_for(edit);
         let result = fx.run();
         assert!(
-            matches!(&result, Err(EngError::BadRequest(m)) if m.contains(tag) && m.contains("MEL-K1")),
+            matches!(&result, Err(EngError::BadRequest(m)) if m.contains(tag) && m.contains("Mellum")),
             "{tag}: {result:?}"
         );
         assert!(fx.caches_untouched(None));
@@ -915,9 +912,9 @@ fn pinned_rounding() {
     assert!(f16_value(f64_to_f16_bits(f64::NAN)).is_nan());
 }
 
-// ---------------------------------------------------------------- T10 (RD-11a)
+// ---------------------------------------------------------------- T10: graph capture
 
-/// The capture plan of the owed test: the fixture owns every buffer, so no pin and no hold.
+/// The capture plan of the capture test: the fixture owns every buffer, so no pin and no hold.
 fn no_pins() -> CapturePlan<'static> {
     CapturePlan {
         pins: &[],
@@ -959,9 +956,8 @@ fn eager_prep_bytes(cfg: &Cfg, word: i32) -> [Vec<u8>; 4] {
     ]
 }
 
-/// T10 (RD-8a, owed): one `attn_prep` captured and replayed with the position word rewritten
-/// between replays equals the eager launch at that position byte for byte (q, both caches, the
-/// step block).
+/// T10: one `attn_prep` captured and replayed with the position word rewritten between replays
+/// equals the eager launch at that position byte for byte (q, both caches, the step block).
 #[test]
 fn attn_prep_inside_a_capture_equals_eager() {
     if !testkit::device_present("attn_prep_inside_a_capture_equals_eager") {
@@ -1002,7 +998,7 @@ fn attn_prep_inside_a_capture_equals_eager() {
     }
 }
 
-// ---- KV8-B B1: the f32 rows entry (the Int8G32 KV handoff) -----------------------------------
+// ---- The f32 rows entry (the Int8G32 KV handoff) -----------------------------------
 //
 // The rows entry runs the same kernel math as the fp16 path and must agree with it: test A runs
 // both entries on one fixture and checks that rounding the f32 rows to fp16 gives the fp16 path's
@@ -1012,7 +1008,7 @@ fn attn_prep_inside_a_capture_equals_eager() {
 // every earlier check satisfied. The null and shape refusals of the C entry itself are the host
 // test `the_native_launch_entries_refuse_bad_arguments_before_any_device_call`.
 //
-// Every test below runs in the isolation split of MSG-73 (the pattern of
+// Every test below runs in an isolation split (the pattern of
 // `family/qwen36/cuda/native_mixer_device_tests.rs`): a device phase consumes the fixture, works
 // only through `?` - no assert, expect or unwrap while a CUDA owner is alive - hands back plain
 // host bytes, and drops every owner at its return; only then do the assertions run.
@@ -1150,7 +1146,7 @@ fn rows_status_word(params: &[u8]) -> i32 {
     )
 }
 
-/// Test A (KV8-B B1 a): for m in {1, 4, 16} and pos in {0, 1000, cells - m}, the f32 rows of the
+/// Test A: for m in {1, 4, 16} and pos in {0, 1000, cells - m}, the f32 rows of the
 /// rows entry round to exactly the fp16 path's cache bytes, carry the full f32 values (the f64
 /// reference with the RP1 bound for k, a bit-exact pass-through for v) and share q with it.
 #[test]
@@ -1195,7 +1191,7 @@ fn attn_prep_rows_round_to_the_fp16_cache_bits_and_carry_the_f32_values() {
         assert!(out.k_rows[rows_len..].iter().all(|&b| b == SENT) && out.v_rows[rows_len..].iter().all(|&b| b == SENT), "m {m} pos {pos}: the rows canary changed");
         assert_eq!(rows_status_word(&out.params), 0, "m {m} pos {pos}: a valid launch leaves the status alone");
     }
-    rep.print("ROWS-A");
+    rep.print("rows test A");
     assert!(rep.worst() <= 1.0);
 }
 
@@ -1237,7 +1233,7 @@ fn rows_a_phase(fx: RowsFx) -> Result<RowsAOut, EngError> {
     })
 }
 
-/// Test B (KV8-B B1 b): a bad pos word (-1, and cells - m + 1) writes no row, sets q to NaN and
+/// Test B: a bad pos word (-1, and cells - m + 1) writes no row, sets q to NaN and
 /// ORs mask 4 into the status word, and the earlier status bits and the other words survive.
 #[test]
 #[rustfmt::skip]
@@ -1284,7 +1280,7 @@ fn rows_b_phase(fx: RowsFx) -> Result<RowsBOut, EngError> {
     })
 }
 
-/// Test C (KV8-B B1 c): the wrapper's refusals. Each row edits one thing of a valid base call, so
+/// Test C: the wrapper's refusals. Each row edits one thing of a valid base call, so
 /// the refusal is the edited rule's own text and every earlier check was satisfied.
 #[test]
 fn attn_prep_rows_rejects_bad_arguments_before_any_launch() {
@@ -1437,7 +1433,7 @@ fn rows_c_phase(mut fx: RowsFx) -> Result<RowsCOut, EngError> {
     })
 }
 
-// ------------------------------------------------------------- KV8-B B1F: T10 of the rows entry
+// ------------------------------------------------------------- T10 of the rows entry
 
 /// Restores every mutable buffer of the rows fixture to its pristine image with the position
 /// word set to `word` (the host writes are outside any capture window).
@@ -1462,7 +1458,7 @@ struct RowsCaptureOut {
     replayed: Vec<[Vec<u8>; 4]>,
 }
 
-/// T10 (KV8-B B1F): the rows entry captured in a graph and replayed with the position word
+/// T10: the rows entry captured in a graph and replayed with the position word
 /// rewritten between replays equals the eager rows launch at that position byte for byte (q,
 /// both rows buffers, the step block), for the decode shape m = 1.
 #[test]

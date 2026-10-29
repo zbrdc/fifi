@@ -2,10 +2,9 @@
 //!
 //! The parent module declares this module under
 //! `#[cfg(all(feature = "native-cuda", target_os = "linux"))]`, the same gate
-//! that `build.rs` and `tests/cuda_smoke.rs` use. Packet 1 covers smoke
-//! operations only: device count and f32 vector add. Raw native calls live in
-//! `native` and its child modules, the only Rust files here that contain `unsafe`
-//! or `extern "C"` (decision 0047).
+//! that `build.rs` and `tests/cuda_smoke.rs` use. The smoke operations are the
+//! device count and an f32 vector add. Raw native calls live in `native` and its
+//! child modules, the only Rust files here that contain `unsafe` or `extern "C"`.
 //!
 //! Failure rule: `cudaErrorMemoryAllocation` at the allocate stage is a
 //! `MemoryPlan` error when cleanup succeeds. A failed smoke free is terminal,
@@ -21,34 +20,34 @@
 //! stage of a device call that failed first, and `cuda adapter` for a failure
 //! inside the adapter itself (rejected argument, caught C++ exception).
 //!
-//! Packet 3 adds resident device memory and the tiled matmul in `context`.
+//! `context` holds resident device memory and the tiled matmul.
 //! Each `CudaContext` holds one of two process leases and stays on its
 //! creating thread; every native call runs inside the process dispatch guard
-//! of `guard` (decisions 0023, 0024 and 0040 item 4).
+//! of `guard`.
 //!
-//! P6-workbuf: each `CudaContext` owns one activation workspace planned by
+//! Each `CudaContext` owns one activation workspace planned by
 //! `arena::plan_arena`, so a linear call allocates no device memory.
 //!
-//! RD-2a (decision 0047): `context` adds non-blocking streams, timing-free events
-//! and a pinned result word, and the launch-only `pack` and `matmul` entries on a
-//! stream; `native/resident.rs` holds their raw calls. Nothing outside the tests
-//! calls them until the resident step (RD-9a), which also takes the arena planner
+//! `context` also has non-blocking streams, timing-free events and a pinned
+//! result word, and the launch-only `pack` and `matmul` entries on a stream;
+//! `native/resident.rs` holds their raw calls. Nothing outside the tests calls
+//! them until the resident decode step, which also takes the arena planner
 //! (`plan_arena`) and the `xf` size rule (`xf_bytes`) re-exported here.
 //!
-//! RD-2c (decision 0047): `context` adds `allocate` and the stream-ordered ranged
-//! reads and writes of a buffer, a generic `DeviceArena` with checked views and the
-//! `ArenaHold` that keeps the workspace from being replaced under a graph. The
-//! caller sizes the workspace with an `Admission`; the model's numbers are not here.
+//! `context` also has `allocate` and the stream-ordered ranged reads and writes of
+//! a buffer, a generic `DeviceArena` with checked views and the `ArenaHold` that
+//! keeps the workspace from being replaced under a graph. The caller sizes the
+//! workspace with an `Admission`; the model's numbers are not here.
 //!
-//! RD-2d (decision 0047): `context` adds the capture window, executable graphs (`GraphExec`), the
-//! refusal of every non-capturable call inside a window and deferred drops; `native/resident/graph.rs`
-//! holds the raw calls. The operation name `cuda capture` names a capture refusal on the closed list
-//! (the seven `cudaErrorStreamCapture*` statuses 900 to 906, and an allocation failure when the
-//! capture is instantiated); such a refusal leaves the stream clean and the backend usable. Every
-//! other status stays terminal.
+//! `context` also has the capture window, executable graphs (`GraphExec`), the refusal of every
+//! non-capturable call inside a window and deferred drops; `native/resident/graph.rs` holds the
+//! raw calls. The operation name `cuda capture` names a capture refusal on the closed list (the
+//! seven `cudaErrorStreamCapture*` statuses 900 to 906, and an allocation failure when the
+//! capture is instantiated); such a refusal leaves the stream clean and the backend usable.
+//! Every other status stays terminal.
 //!
-//! `resident` holds the safe wrappers of the stage 1 kernels, one file per kernel (RD-2p). Its doc
-//! says how to add one.
+//! `resident` holds the safe wrappers of the resident-decode kernels, one file per kernel. Its
+//! doc says how to add one.
 
 mod arena;
 mod context;
@@ -76,7 +75,7 @@ pub(crate) use context::{
     not(test),
     expect(
         unused_imports,
-        reason = "staged for RD-9a (decision 0047): the resident step is the first user"
+        reason = "staged for the resident decode step, its first user"
     )
 )]
 pub(crate) use context::{
@@ -91,14 +90,14 @@ pub(crate) use {
     native::xf_bytes,
 };
 
-/// The kernels' prefill status mask (decision 0049 item 10), re-exported for the family book:
+/// The kernels' prefill status mask, re-exported for the family book:
 /// `status_error` maps it to `prefill_chunk`, and its tests pin that mapping against this one
 /// const. The native tree stays private; the mask is its public contract.
 #[cfg_attr(
     not(test),
     expect(
         unused_imports,
-        reason = "the book's tests read it today; the prefill driver will too (decision 0049)"
+        reason = "the book's tests read it today; the prefill driver will too"
     )
 )]
 pub(crate) use native::prefill::PREFILL_STATUS_BOUND_VIOLATION;
@@ -107,9 +106,9 @@ pub(crate) use native::prefill::PREFILL_STATUS_BOUND_VIOLATION;
 // the decommissioned device-chain driver; the CUDA kernels themselves
 // remain in native/mamba_step.cu.
 
-/// The device gate every CUDA device test shares (IMPL-DEVICE-PRESENT-NO-DRIVER): the
-/// family test rigs reach `testkit::device_present` through this path, the `testkit`
-/// module being private to `kernels::cuda`.
+/// The device gate every CUDA device test shares, which also skips on a host without a
+/// driver: the family test rigs reach `testkit::device_present` through this path, the
+/// `testkit` module being private to `kernels::cuda`.
 #[cfg(test)]
 pub(crate) use testkit::device_present;
 
@@ -194,7 +193,7 @@ pub fn vector_add_f32(lhs: &[f32], rhs: &[f32]) -> Result<Vec<f32>, EngError> {
             lhs.len()
         ))
     })?;
-    // The zero fill is host work a later packet can avoid with an
+    // The zero fill is host work a later change can avoid with an
     // uninitialized buffer. It keeps this smoke path free of extra unsafe.
     out.resize(lhs.len(), 0.0);
     let _dispatch = guard::DispatchGuard::enter(&TERMINAL);
@@ -302,7 +301,7 @@ fn native_error(terminal: &AtomicBool, operation: &'static str, status: c_int) -
     EngError::Backend { operation, message }
 }
 
-/// The seven `cudaErrorStreamCapture*` statuses (REPLY-30 item 1, decision 0047). The one definition
+/// The seven `cudaErrorStreamCapture*` statuses. The one definition
 /// of the closed list: [`is_capture_status`] and the capture window both use it.
 const CAPTURE_STATUSES: std::ops::RangeInclusive<c_int> = 900..=906;
 

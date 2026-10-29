@@ -1,13 +1,12 @@
-/* CPF-7a part 1: launch entry of swiglu_rows, the M-row SwiGLU with f32 output of the
- * chunked-prefill MoE path (decision 0049; CPF-V4-CPF7-PLAN C.2, N2), one header per kernel
- * file; abi_resident.h stays closed.
+/* Launch entry of swiglu_rows, the M-row SwiGLU with f32 output of the chunked-prefill MoE
+ * path, one header per kernel file; abi_resident.h stays closed.
  *
  * act[r][c] = ggml_cuda_op_silu_single(gu[r][c]) * gu[r][up_off + c] for r < rows, c < n_ff:
  * the upstream silu of the in-tree shim (ggml_shim/unary.cuh, MIT-derived) under the MMQ glue
  * group's -use_fast_math, as the llama.cpp oracle builds it (__expf, approximate division,
- * subnormals flushed to zero; tolerance row SW0). The routed experts run it on 8M token-slot
- * rows, the shared expert on M rows; act feeds the MMQ q8_1 quantizer. No device index, no
- * status word, deterministic.
+ * subnormals flushed to zero; the tests' tolerance `SW0`). The routed experts run it on 8M
+ * token-slot rows, the shared expert on M rows; act feeds the MMQ q8_1 quantizer. No device
+ * index, no status word, deterministic.
  *
  * gu  f32 [rows][ld_in], read only: gate at columns 0..n_ff, up at up_off..up_off + n_ff.
  * act f32 [rows][ld_out]: columns 0..n_ff written, no other byte.

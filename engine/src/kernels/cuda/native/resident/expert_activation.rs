@@ -1,6 +1,6 @@
 //! Raw FFI to the expert-activation entry of native/resident/expert_activation.cu
 //! (declared in native/resident/expert_activation.h). Child of native::resident, so it
-//! inherits the allow(unsafe_code) of native.rs (decision 0047).
+//! inherits the allow(unsafe_code) of native.rs.
 //!
 //! Safety invariants this module relies on (as row_scale.rs):
 //! - Ranges are proved in bounds by RawRange::new before they get here; this module
@@ -9,8 +9,7 @@
 //! - Launch-only: work queues on the given stream; a fault surfaces at the next
 //!   synchronize. Allocations stay valid because inference_cuda_free synchronizes
 //!   the whole device before cudaFree.
-//! - Every call runs under the process dispatch guard and on the context-owning
-//!   thread (decisions 0023 and 0024).
+//! - Every call runs under the process dispatch guard and on the context-owning thread.
 //! - No raw pointer and no unsafe function leaves this module.
 
 use std::ffi::{c_int, c_longlong, c_void};

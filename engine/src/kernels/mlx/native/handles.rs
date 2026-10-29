@@ -1,7 +1,7 @@
 //! Owning wrappers for native handles, and the resident tensor storage built from them.
 //!
 //! Every wrapper releases its handle under the dispatch guard. After the owner fails, a wrapper
-//! drops without releasing, so the native object stays allocated until process exit (decision 0022).
+//! drops without releasing, so the native object stays allocated until process exit.
 
 use std::cell::{Cell, RefCell};
 #[cfg(feature = "native-fault-qualification")]
@@ -136,8 +136,8 @@ impl Drop for Array {
     }
 }
 
-/// Default for the largest retired byte total before a retire forces a flush synchronization
-/// (decision 0039). `RetireCore::set_cap` changes it for one adapter.
+/// Default for the largest retired byte total before a retire forces a flush
+/// synchronization. `RetireCore::set_cap` changes it for one adapter.
 pub(super) const RETIRE_CAP_BYTES: u64 = 64 << 20;
 
 /// Forced retire-cap flush attempts in this process, counted before the synchronization
@@ -242,7 +242,7 @@ fn record_flush_free(elapsed: std::time::Duration) {
     );
 }
 
-/// Arrays that residents released, waiting for a completed synchronization (decision 0039).
+/// Arrays that residents released, waiting for a completed synchronization.
 ///
 /// One core exists per adapter generation. `State` and every `Resident` hold a share. The core
 /// holds the lease, so the adapter slot stays held while any retired array exists.
@@ -325,7 +325,7 @@ impl Drop for RetireCore {
     }
 }
 
-/// Native storage behind one `ExecutionTensor`. On drop it moves its array to the retire list (decision 0039).
+/// Native storage behind one `ExecutionTensor`. On drop it moves its array to the retire list.
 pub(crate) struct Resident {
     array: Option<Array>,
     dtype: Dtype,
@@ -359,11 +359,10 @@ impl Resident {
         self.array.as_ref().unwrap().0
     }
 
-    /// Takes the native handle out of this resident without freeing or retiring it (packet
-    /// NATIVE-OPS-1, `kv_append`). The caller owns the taken handle and releases it once, right
-    /// after the consuming graph node is built: the node holds the array alive until the GPU
-    /// completes, so the retire list never needs it. A later drop of this resident retires
-    /// nothing.
+    /// Takes the native handle out of this resident without freeing or retiring it (for
+    /// `kv_append`). The caller owns the taken handle and releases it once, right after the
+    /// consuming graph node is built: the node holds the array alive until the GPU completes,
+    /// so the retire list never needs it. A later drop of this resident retires nothing.
     pub(super) fn take_array(&mut self) -> Option<Array> {
         self.array.take()
     }
@@ -394,10 +393,10 @@ impl Resident {
     /// and synchronized the stream, so an array that an earlier lazy call built is complete here.
     ///
     /// An array that is not row-contiguous — the strided view a `slice`, `transpose`, `repeat`,
-    /// or `broadcast` can return — is made contiguous HERE, at the read (packet GAP-TRIM-A): one
-    /// `mlx_contiguous` node, evaluated and synchronized on `stream`, and its bytes are what the
-    /// read returns. `readback` therefore no longer fails on a strided array; a failure of the
-    /// copy, its evaluation, or its synchronization follows the terminal readback rule.
+    /// or `broadcast` can return — is made contiguous HERE, at the read: one `mlx_contiguous`
+    /// node, evaluated and synchronized on `stream`, and its bytes are what the read returns.
+    /// `readback` therefore no longer fails on a strided array; a failure of the copy, its
+    /// evaluation, or its synchronization follows the terminal readback rule.
     pub(super) fn readback(&self, stream: ffi::mlx_stream) -> Result<Tensor, EngError> {
         let array = self.array.as_ref().unwrap().0;
         let mut row_contiguous = false;

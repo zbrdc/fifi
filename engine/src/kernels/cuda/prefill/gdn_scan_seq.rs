@@ -1,15 +1,13 @@
-//! The chunked-prefill DeltaNet scan (CPF-DN-A, decision 0049 design row 9, P-a): the pure
-//! workspace sizing of this file now, and (with the later commits of the packet) the safe
-//! launch wrapper of `gdn_scan_seq`, the value-sliced sequential gated-delta scan over one
-//! chunk of `m` tokens.
+//! The chunked-prefill DeltaNet scan: the pure workspace sizing and the safe launch wrapper
+//! of `gdn_scan_seq`, the value-sliced sequential gated-delta scan over one chunk of `m`
+//! tokens.
 //!
-//! What the seam is. Per DeltaNet layer, the driver runs the reused decode conv (RD-7a's
-//! [`CudaContext::gdn_conv`], unedited, with `m = M`: its ring handoff across a chunk
-//! boundary is bit-identical to `M` decode steps, because the ring update is pure data
-//! movement — pinned bit-exactly by the tests), then this packet's scan: the
-//! value-sliced sequential kernel over the conv rows, and the gated output RMSNorm in place
-//! on the scan output. The chunkwise P-b kernels (CPF-4b..d) replace this packet's entry
-//! wholesale later; the conv reuse, the state buffer and layout, the in-place `o_out`
+//! Per DeltaNet layer, the driver runs the reused decode conv ([`CudaContext::gdn_conv`],
+//! unedited, with `m = M`: its ring handoff across a chunk boundary is bit-identical to `M`
+//! decode steps, because the ring update is pure data movement — pinned bit-exactly by the
+//! tests), then this scan: the value-sliced sequential kernel over the conv rows, and the
+//! gated output RMSNorm in place on the scan output. A chunkwise scan kernel may replace this
+//! entry wholesale; the conv reuse, the state buffer and layout, the in-place `o_out`
 //! contract, the `p0`/`ctx_tokens`/status-word guard rules and these sizing functions carry
 //! over unchanged.
 //!
@@ -21,9 +19,9 @@
 //! the kernel-side scratch of one chunk ONLY — the `conv_out` rows the conv writes and the
 //! scan reads, and the `o_out` rows the scan writes pre-norm and the out-gate rewrites in
 //! place (ONE buffer, not two). They deliberately do NOT count the projection rows (`qkv`,
-//! `z`, `alpha`/`beta`) — those are the DeltaProj GEMM output, CPF-V4's buffers — nor the
-//! driver's `q8_1`/`ssm_out` rows, nor the persistent `DeltaPool` state slab, so that no
-//! caller can double-count them against the admission budget.
+//! `z`, `alpha`/`beta`) — those are the DeltaProj GEMM output — nor the driver's
+//! `q8_1`/`ssm_out` rows, nor the persistent `DeltaPool` state slab, so that no caller can
+//! double-count them against the admission budget.
 
 #![cfg_attr(
     not(test),
@@ -73,7 +71,7 @@ fn refuse(detail: &str) -> EngError {
 }
 
 /// Bytes of the conv output rows of one chunk: `m` rows of `channels` f32 values. This is
-/// the exact read reach of the scan over `conv` (the K0 output is `[m][channels]` with no
+/// the exact read reach of the scan over `conv` (the conv output is `[m][channels]` with no
 /// row padding), so a shorter `conv` range can never reach the kernel. Pure; `BadRequest`
 /// when the byte count overflows `usize`.
 pub(crate) fn cpf_dn_conv_out_bytes(m: usize, channels: usize) -> Result<usize, EngError> {
@@ -151,7 +149,7 @@ pub(crate) struct ScanWeights<'b> {
     pub(crate) norm_w: DeviceRange<'b>,
 }
 
-/// One scan call: the K0 output rows `conv`, the projection rows `proj`, the weights, the
+/// One scan call: the conv output rows `conv`, the projection rows `proj`, the weights, the
 /// in-place `state`, the `o_out` rows (pre-norm, then gated in place), the optional prefill
 /// status word, `shape` and `eps` (exactly [`GDN_SCAN_EPS`]).
 pub(crate) struct GdnScanSeqCall<'b> {

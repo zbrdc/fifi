@@ -96,10 +96,10 @@ struct Entry<'a> {
     first_token: Option<Duration>,
     /// The tokens after the first batch and the time from the first to the last batch.
     decode: Option<(u32, Duration)>,
-    /// The prefix report of the job (packet SERVE-2-c item 4, fix M3). It is `None` until the
-    /// pump reads the `Finished` event of the request's own job, and `None` keeps the six
-    /// `prefix_*` keys out of the line — a cancelled, failed, refused, or stop-string request
-    /// logs no prefix keys, and neither does an executor without a prefix report.
+    /// The prefix report of the job. It is `None` until the pump reads the `Finished` event of the
+    /// request's own job, and `None` keeps the six `prefix_*` keys out of the line — a cancelled,
+    /// failed, refused, or stop-string request logs no prefix keys, and neither does an executor
+    /// without a prefix report.
     prefix: Option<PrefixReport>,
 }
 
@@ -118,8 +118,7 @@ fn rate(tokens: u32, span: Duration) -> Option<f64> {
 
 /// The log line without the final newline. `queue_wait_ms` is always `null`: the engine thread
 /// reports no start event, so the server cannot split the queue wait from the prefill. The four
-/// `prefix_*` keys appear only on a line whose request carried a prefix boundary (decision 0036,
-/// addendum 2, item 7; packet SERVE-2-c item 4).
+/// `prefix_*` keys appear only on a line whose request carried a prefix boundary.
 fn render(entry: &Entry<'_>) -> String {
     let mut line = json!({
         "request_id": entry.request_id,
@@ -156,7 +155,7 @@ fn render(entry: &Entry<'_>) -> String {
         object.insert("prefix_hit".to_string(), json!(prefix.hit.as_str()));
         object.insert("prefix_entries".to_string(), json!(prefix.entries));
         object.insert("prefix_bytes".to_string(), json!(prefix.bytes));
-        // SF1 attribution: LIFETIME totals; ONE sample per request line (taken after
+        // Restore attribution: LIFETIME totals; ONE sample per request line (taken after
         // the request's own restore/prefill; lines land in completion order). Attribute
         // a request's drops against the sample of the restore that ran just before it -
         // ordering samples by value recovers restore order - never against the previous
@@ -171,15 +170,15 @@ fn render(entry: &Entry<'_>) -> String {
             "prefix_uncached_shared".to_string(),
             json!(prefix.uncached_shared),
         );
-        // B2 attribution: the SAVE side of the store - LIFETIME totals with the same
-        // one-sample-per-request-line rule as the SF1 pair above. `prefix_save_room_removals`
-        // is the churn `prefix_evictions` cannot see: entries silently removed to admit
-        // OTHER saves (the room loop and the denial retry inside save). A lineage whose
-        // marks vanish between turns shows a rising room_removals, not evictions; a save
-        // that stored nothing shows in `prefix_save_refusals`; a save that was only a use
-        // shows in `prefix_save_duplicate_uses`; a Block cut that rolled the lineage's
-        // previous cut away shows in `prefix_save_block_rolls`; a tip that replaced the
-        // restored entry in place shows in `prefix_save_restored_replaces`. Saves rise at
+        // Save attribution: the SAVE side of the store - LIFETIME totals with the same
+        // one-sample-per-request-line rule as the restore pair above.
+        // `prefix_save_room_removals` is the churn `prefix_evictions` cannot see: entries
+        // silently removed to admit OTHER saves (the room loop and the denial retry inside
+        // save). A lineage whose marks vanish between turns shows a rising room_removals, not
+        // evictions; a save that stored nothing shows in `prefix_save_refusals`; a save that
+        // was only a use shows in `prefix_save_duplicate_uses`; a Block cut that rolled the
+        // lineage's previous cut away shows in `prefix_save_block_rolls`; a tip that replaced
+        // the restored entry in place shows in `prefix_save_restored_replaces`. Saves rise at
         // saves, so ordering samples by value recovers save order.
         object.insert(
             "prefix_save_room_removals".to_string(),
@@ -201,9 +200,9 @@ fn render(entry: &Entry<'_>) -> String {
             "prefix_save_restored_replaces".to_string(),
             json!(prefix.save_side.restored_replaces),
         );
-        // The shadow block-LCP observation (KV-v1 slice 1), only on a report whose lookup
-        // ran with the shadow on: what a block-granular restore could have used, beside the
-        // exact-key facts above and `reused_tokens`.
+        // The shadow block-LCP observation, only on a report whose lookup ran with the shadow
+        // on: what a block-granular restore could have used, beside the exact-key facts above
+        // and `reused_tokens`.
         if let Some(shadow) = prefix.shadow
             && let Some(object) = line.as_object_mut()
         {
@@ -242,11 +241,11 @@ const DIGEST_KEY: u64 = 0x5f1f_3a7c_d2e1_9b04;
 
 /// The keys a ring row exposes: an ALLOWLIST, so the digest keys,
 /// `prefix_*`, and `shadow_*` (prefix-overlap detail) never reach the
-/// panel, and a key a future `render` adds cannot leak automatically
-/// (Opus SF2). `queue_wait_ms` stays out — the line writes it as a
-/// permanent null (the engine thread reports no start event), and a
-/// forever-null column is noise. `reused_tokens` stays in: Dan wants
-/// reuse visible on the panel.
+/// panel, and a key a future `render` adds cannot leak automatically.
+/// `queue_wait_ms` stays out — the line writes it as a permanent null
+/// (the engine thread reports no start event), and a forever-null
+/// column is noise. `reused_tokens` stays in, so reuse is visible on
+/// the panel.
 const RING_KEYS: [&str; 14] = [
     "request_id",
     "method",
@@ -268,8 +267,8 @@ const RING_KEYS: [&str; 14] = [
 pub(crate) const RING_CAP: usize = 64;
 
 /// The monitor's recent-request ring, owned by `AppState` like the log
-/// sink (Opus SF1): every server — and every test server — gets its own,
-/// so the parallel suite never shares rows. It holds the last `RING_CAP`
+/// sink: every server — and every test server — gets its own, so the
+/// parallel suite never shares rows. It holds the last `RING_CAP`
 /// written lines that passed the endpoint filter, newest last.
 #[derive(Clone, Default)]
 pub(crate) struct RecentRing(Arc<Mutex<VecDeque<Value>>>);
@@ -280,9 +279,9 @@ impl RecentRing {
     }
 
     /// Pushes one written line's row: only the allowlisted keys. A
-    /// count_tokens line never lands (Claude Code floods it, and it would
-    /// inflate the panel's finished-ok count — Opus SF4); a line that
-    /// fails to parse as a JSON object is skipped, never fatal.
+    /// count_tokens line never lands (Claude Code floods it, and it
+    /// would inflate the panel's finished-ok count); a line that fails
+    /// to parse as a JSON object is skipped, never fatal.
     fn push(&self, line: &str) {
         let Ok(value) = serde_json::from_str::<Value>(line) else {
             return;
@@ -399,10 +398,10 @@ pub(crate) struct RequestLog {
     completion_tokens: u32,
     written: bool,
     /// True after the handler marked a prefix boundary on this request: the line then carries
-    /// the four `prefix_*` keys (packet SERVE-2-c item 4) when the job's report arrived.
+    /// the four `prefix_*` keys when the job's report arrived.
     prefix_boundary: bool,
     /// The prefix report of the job, set only when the pump read the request's `Finished`
-    /// event (fix M3). It stays `None` on a cancelled, failed, refused, or stop-string request.
+    /// event. It stays `None` on a cancelled, failed, refused, or stop-string request.
     prefix: Option<PrefixReport>,
     /// The HTTP method and path that produced this request, and the prompt
     /// digests of the rendered prompt. Set by the handlers before any line
@@ -482,17 +481,16 @@ impl RequestLog {
     }
 
     /// Marks the request as one with a prefix boundary: its line then carries the four
-    /// `prefix_*` keys with the prefix report of its job (packet SERVE-2-c item 4), when the
-    /// job's `Finished` event is read. A request without a boundary keeps the old line byte for
-    /// byte.
+    /// `prefix_*` keys with the prefix report of its job, when the job's `Finished` event is
+    /// read. A request without a boundary keeps the old line byte for byte.
     pub(crate) fn set_prefix_boundary(&mut self) {
         self.prefix_boundary = true;
     }
 
     /// Writes the line of a reply that ended with `finish` and carried the prefix report
     /// `prefix`, which the pump read from the job's `Finished` event. The report lands in the
-    /// line's `prefix_*` keys only when the request had a boundary and the report arrived
-    /// (fix M3); `None` omits the keys.
+    /// line's `prefix_*` keys only when the request had a boundary and the report arrived;
+    /// `None` omits the keys.
     pub(crate) fn done(
         &mut self,
         finish: FinishReason,
@@ -723,8 +721,8 @@ mod tests {
         "time_to_first_token_ms",
     ];
 
-    /// The keys of a line whose request carried a prefix boundary (packet SERVE-2-c item 4):
-    /// the thirteen keys above plus the four prefix keys, sorted.
+    /// The keys of a line whose request carried a prefix boundary: the thirteen keys above plus
+    /// the four prefix keys, sorted.
     const PREFIX_KEYS: [&str; 31] = [
         "completion_tokens",
         "decode_tokens_per_second",
@@ -853,7 +851,7 @@ mod tests {
 
     /// A server over one engine with a UNIQUE model name plus its own ring
     /// and request-log capture, so ring tests read exactly their own rows
-    /// (the ring is per-`AppState`, Opus SF1 — no process-global state).
+    /// (the ring is per-`AppState` — no process-global state).
     fn ring_app(engine: &Engine, model: &'static str) -> (Router, RecentRing, Capture) {
         testkit::wait_for_state(&engine.handle(), EngineState::Ready);
         let capture = Capture::default();
@@ -887,7 +885,7 @@ mod tests {
         let rows = reply["requests"].as_array().expect("requests array");
         assert_eq!(rows.len(), 1, "this server's ring holds exactly its row");
         let row = &rows[0];
-        // Opus SF2: the exact allowlist is the contract — the digest,
+        // The exact allowlist is the contract — the digest,
         // prefix_*, and shadow_* keys never reach the panel, and a key a
         // future render() adds cannot leak automatically.
         let mut keys: Vec<&str> = row
@@ -927,7 +925,7 @@ mod tests {
         assert_eq!(ring.rows_newest_first().len(), 1, "a served line lands");
     }
 
-    /// Opus SF5: a ring row is EXACTLY the written log line reduced to the
+    /// A ring row is EXACTLY the written log line reduced to the
     /// allowlist — the capture sink holds the line, the state holds the row.
     #[tokio::test]
     async fn a_ring_row_equals_the_log_line_reduced_to_the_allowlist() {
@@ -1233,7 +1231,7 @@ mod tests {
     }
 
     /// A line whose request carried a prefix boundary carries the four prefix keys with the
-    /// report of its job (packet SERVE-2-c item 4). The keys land after the thirteen old keys.
+    /// report of its job. The keys land after the thirteen old keys.
     ///
     /// Mutation check (the keys-without-a-boundary patch): rendering the prefix keys
     /// unconditionally makes the byte-for-byte test of a boundary-free request fail.
@@ -1286,9 +1284,9 @@ mod tests {
         );
     }
 
-    /// A report with a shadow section renders the six shadow keys after the prefix keys
-    /// (KV-v1 slice 1): what a block-granular restore could have used beside what the
-    /// exact-key restore took. A report without one renders none of them.
+    /// A report with a shadow section renders the six shadow keys after the prefix keys: what a
+    /// block-granular restore could have used beside what the exact-key restore took. A report
+    /// without one renders none of them.
     #[test]
     fn a_line_of_a_shadowed_report_carries_the_shadow_keys() {
         let entry = Entry {
@@ -1444,8 +1442,8 @@ mod tests {
         );
     }
 
-    /// A router over one engine at the addendum 2 prefix limits (two roots, six entries) whose
-    /// entry has `prefix_reuse` on, and the capture of its request log.
+    /// A router over one engine at the prefix limits of two roots and six entries whose entry
+    /// has `prefix_reuse` on, and the capture of its request log.
     fn prefix_app(engine: &Engine) -> (Router, Capture) {
         testkit::wait_for_state(&engine.handle(), EngineState::Ready);
         let capture = Capture::default();
@@ -1497,14 +1495,14 @@ mod tests {
         // the worker takes the report after the job's save points.
         assert_eq!(line["prefix_hit"], "miss", "{line}");
         assert_eq!(line["prefix_entries"], 2, "the root and the tip, {line}");
-        // The fake charges a flat 1,000 bytes per stored entry (fix L3), and the value flows
+        // The fake charges a flat 1,000 bytes per stored entry, and the value flows
         // worker → `JobUsage` → the reply pump → this line.
         assert_eq!(
             line["prefix_bytes"], 2_000,
             "two entries at 1,000 charged bytes each, {line}"
         );
         assert_eq!(line["prefix_uncached_shared"], 0, "{line}");
-        // The rendered line itself, not only its parsed keys (fix L4): the thirteen old keys in
+        // The rendered line itself, not only its parsed keys: the thirteen old keys in
         // their render order, then the four prefix keys in theirs, in one write.
         let want = json!({
             "request_id": reply["id"],
@@ -1560,7 +1558,7 @@ mod tests {
         // `<|im_start|>user\n` — the ids 2,110..2,115 — with the second conversation's user
         // turn "yo" before the two diverge ("y" against "h"), so the longest common prefix
         // with the stored tip is 2,116 tokens: 6 beyond the restored root are shared with a
-        // stored key that no checkpoint covered (fix M2).
+        // stored key that no checkpoint covered.
         assert_eq!(
             line["prefix_uncached_shared"], 6,
             "the header of the user turn is shared but uncached, {line}"
@@ -1571,13 +1569,13 @@ mod tests {
         );
         assert_eq!(
             line["prefix_bytes"], 3_000,
-            "three entries at 1,000 charged bytes each (fix L3), {line}"
+            "three entries at 1,000 charged bytes each, {line}"
         );
     }
 
-    /// A line of a request that never read its job's `Finished` event carries no prefix keys
-    /// (fix M3): a stream that the client drops is cancelled, so the pump reads no report even
-    /// though the request had a boundary and the engine had a store.
+    /// A line of a request that never read its job's `Finished` event carries no prefix keys: a
+    /// stream that the client drops is cancelled, so the pump reads no report even though the
+    /// request had a boundary and the engine had a store.
     ///
     /// Mutation check: emitting the four keys whenever the boundary flag is set (with a
     /// zeroed report) fails the keys row.
@@ -1617,7 +1615,7 @@ mod tests {
     }
 
     /// A request that the server refused before admission never ran a job, so it carries no
-    /// prefix keys either (fix M3), although its engine entry turns `prefix_reuse` on.
+    /// prefix keys either, although its engine entry turns `prefix_reuse` on.
     ///
     /// Mutation check: emitting the four keys whenever the boundary flag is set (with a
     /// zeroed report) fails the keys row.

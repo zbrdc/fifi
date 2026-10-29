@@ -1,6 +1,6 @@
-// RD-7a: launch shim for the vendored conv_silu_k (kern::conv_silu in ops.cu). No kernel is added;
+// Launch shim for the vendored conv_silu_k (kern::conv_silu in ops.cu). No kernel is added;
 // this file only proves the arguments the kernel does not check and makes one extern "C" call.
-// The kernel is vendored xavier-qwen code, restored in RD-4V.
+// The kernel is vendored xavier-qwen code.
 #include <cuda_runtime.h>
 #include <stddef.h>
 #include <stdint.h>
@@ -24,8 +24,8 @@ bool apart(const void *a, size_t a_bytes, const void *b, size_t b_bytes) {
     return pa + a_bytes <= pb || pb + b_bytes <= pa;
 }
 
-// Mirrors the Rust wrapper term by term (RD-7a.md "C and Rust refusals"); a term added here needs a
-// row there. The Rust side refuses everything this refuses, so a C refusal means a wrapper defect.
+// Mirrors the Rust wrapper term by term; a term added here needs its twin there. The Rust side
+// refuses everything this refuses, so a C refusal means a wrapper defect.
 bool valid(const inference_cuda_gdn_conv_args &a, void *stream) {
     if (a.proj == NULL || a.w == NULL || a.state == NULL || a.out == NULL || stream == NULL) {
         return false;
@@ -58,7 +58,7 @@ extern "C" int inference_cuda_gdn_conv_launch(const inference_cuda_gdn_conv_args
         if (args == NULL || !valid(*args, stream)) {
             return INFERENCE_CUDA_INVALID_ARGUMENT;
         }
-        // snap stays null: the speculative-rollback snapshots are not used at stage 1.
+        // snap stays null: this entry does not use the speculative-rollback snapshots.
         kern::ConvArgs call = {(const float *)args->proj, args->ld,   args->m,
                                args->channels,            (const float *)args->w,
                                (float *)args->state,      NULL,       (float *)args->out};

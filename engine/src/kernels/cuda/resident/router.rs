@@ -1,7 +1,6 @@
 //! The device router of the resident decode step: logits against the F32 router matrix, softmax,
 //! the top `k` probabilities, weights renormalized over the selected set, the sigmoid of the
-//! shared-expert gate (when the model has one) and a status bit for a faulty row (decision 0047,
-//! stage 1, RD-5).
+//! shared-expert gate (when the model has one) and a status bit for a faulty row.
 //!
 //! Routing runs on the device so that the expert ids never reach the host; the expert kernel
 //! reads them from device memory.
@@ -37,7 +36,7 @@
 //! changes nothing.
 #![cfg_attr(
     not(test),
-    expect(dead_code, reason = "staged for RD-9a (decision 0047)")
+    expect(dead_code, reason = "staged for the resident decode step")
 )]
 
 use crate::EngError;

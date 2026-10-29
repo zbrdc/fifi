@@ -1,7 +1,7 @@
-//! Tests of the chunked-prefill plan (CPF-1 v1, decision 0049): the chunk policy and list, the
-//! admission rule against 0049's table, and the arena list of one chunk. CPU only. Every
-//! number quoted from decision 0049 or from the CPF-7 plan (rev 3, section C.3) is named where
-//! it is used. Setup is inline; the shared helpers are small and pinned by the tests below.
+//! Tests of the chunked-prefill plan: the chunk policy and list, the admission rule against the
+//! design table, and the arena list of one chunk. CPU only. Every number quoted from the
+//! chunked-prefill design is named where it is used. Setup is inline; the shared helpers are small
+//! and pinned by the tests below.
 use super::{
     common_tests::{dims, plan_of},
     dims::KvMode,
@@ -256,11 +256,11 @@ fn a_chunk_size_off_the_ladder_or_an_overflowing_run_is_refused() {
     assert!(matches!(error, EngError::MemoryPlan(_)), "{error:?}");
 }
 
-// ---- admission against 0049's table --------------------------------------------------------
+// ---- admission against the design table ----------------------------------------------------
 
-/// 0049 item 9: the basis for KV and the prefill arena on the 3090 (Tiled era).
+/// The design basis for KV and the prefill arena on the 3090 (Tiled era).
 const BASIS: usize = 2490 * MIB;
-/// 0049 item 9: the P-b arena in tenths of a MiB for M = 128 ... 2,048 (EST).
+/// The design's arena in tenths of a MiB for M = 128 ... 2,048 (EST).
 const PB_TENTHS: [(usize, usize); 5] = [
     (128, 260),
     (256, 469),
@@ -308,8 +308,8 @@ fn last_window_with(
     low
 }
 
-/// The largest window `cost.m` passes at `per_position` bytes of KV a position: the state
-/// term is the KV alone, 0049's rows (the explicit zero-pool input; production charges
+/// The largest window `cost.m` passes at `per_position` bytes of KV a position: the state term is
+/// the KV alone, as in the design rows (the explicit zero-pool input; production charges
 /// [`state_bytes`], the whole resident state).
 fn last_window(admission: &Admission, cost: &ChunkCost, per_position: usize) -> usize {
     last_window_with(admission, cost, |window| window * per_position)
@@ -333,15 +333,14 @@ fn the_constants_are_0049s_and_the_kv_bytes_are_the_pools() {
 
 #[test]
 fn the_state_term_is_the_whole_resident_state_not_kv_alone() {
-    // Lane C ruling (2026-10-14 00:18, option (b)): ResidentState::allocate allocates the
-    // DeltaNet pool, the KV pool and the words together after the budget snapshot, so the
-    // state term is StateLayout::bytes(), never the KV alone. Derived from the layout's
-    // inputs at Qwen3.6: a DeltaNet layer holds align256(32 * 128 * 128 * 4 B) of recurrent
-    // state (2,097,152) and align256(3 * 8,192 * 4 B) of convolution taps (98,304), over 30
-    // layers: 65,863,680 B a slot (62.8125 MiB); the words block is 3 * 256 = 768 B; Fp16 KV
-    // planes (1,024 B a position a plane) are whole multiples of the 256 B alignment, so the
-    // pool and the words are the whole difference there. Int8G32 rounds its 20 scale planes
-    // (32 B a position each) up to the alignment: 20 * 160 B more at a window of 100,003.
+    // ResidentState::allocate allocates the DeltaNet pool, the KV pool and the words together after
+    // the budget snapshot, so the state term is StateLayout::bytes(), never the KV alone. Derived
+    // from the layout's inputs at Qwen3.6: a DeltaNet layer holds align256(32 * 128 * 128 * 4 B) of
+    // recurrent state (2,097,152) and align256(3 * 8,192 * 4 B) of convolution taps (98,304), over
+    // 30 layers: 65,863,680 B a slot (62.8125 MiB); the words block is 3 * 256 = 768 B; Fp16 KV
+    // planes (1,024 B a position a plane) are whole multiples of the 256 B alignment, so the pool
+    // and the words are the whole difference there. Int8G32 rounds its 20 scale planes (32 B a
+    // position each) up to the alignment: 20 * 160 B more at a window of 100,003.
     let d = dims();
     assert_eq!(
         state_bytes(&d, KvMode::Fp16, 120_000, 1).unwrap(),
@@ -371,13 +370,13 @@ fn the_state_term_is_the_whole_resident_state_not_kv_alone() {
 
 #[test]
 fn the_rule_reproduces_0049s_window_ends_from_its_pb_rows() {
-    // 0049's rows are KV-only arithmetic: this reproduction passes the KV bytes alone as the
-    // state term (an explicit zero DeltaNet pool and words), so 0049's figures reproduce
-    // exactly; production charges state_bytes (pool + KV + words, lane C ruling
-    // 2026-10-14 00:18, option (b)), which moves the real window ends down.
+    // The design rows are KV-only arithmetic: this reproduction passes the KV bytes alone as the
+    // state term (an explicit zero DeltaNet pool and words), so the design figures reproduce
+    // exactly; production charges state_bytes (pool + KV + words), which moves the real window ends
+    // down.
     let (costs, admission) = (pb_costs(), Admission::new(BASIS));
     let (fp16, kv8) = (per_position(KvMode::Fp16), per_position(KvMode::Int8G32));
-    // 0049: "FP16 prefill ends at 119.6K tokens (103.5K at M = 2,048)", to 0.1K.
+    // The design: "FP16 prefill ends at 119.6K tokens (103.5K at M = 2,048)", to 0.1K.
     assert_eq!(
         last_window(&admission, &cost_of(&costs, 128), fp16) / 100,
         1196
@@ -386,7 +385,7 @@ fn the_rule_reproduces_0049s_window_ends_from_its_pb_rows() {
         last_window(&admission, &cost_of(&costs, 2048), fp16) / 100,
         1035
     );
-    // 0049: "With 8-bit KV, M = 2,048 holds to about 195K tokens (about 153K with the Q4_K
+    // The design: "With 8-bit KV, M = 2,048 holds to about 195K tokens (about 153K with the Q4_K
     // fallback active)": the fallback is the 432 MiB untile scratch.
     let at_2048 = cost_of(&costs, 2048);
     assert!((194_500..=195_500).contains(&last_window(&admission, &at_2048, kv8)));
@@ -434,10 +433,10 @@ fn finding_13_dropping_the_part_row_flips_exactly_256_at_120k_fp16() {
             .iter()
             .all(|cost| !admission.passes(kv, cost).unwrap())
     );
-    // Without the 64 MiB part row: 256 leaves 146.25 - 46.9 = 99.35 MiB spare and is admitted,
-    // 512 leaves 57.65 MiB and stays refused. 128 passes too, so the largest size flips to 256.
-    // The part term is max(flat, real) (n3), so dropping the row zeroes both: the P-b rows
-    // carry the flat charge as their part figure.
+    // Without the 64 MiB part row: 256 leaves 146.25 - 46.9 = 99.35 MiB spare and is admitted, 512
+    // leaves 57.65 MiB and stays refused. 128 passes too, so the largest size flips to 256. The
+    // part term is max(flat, real), so dropping the row zeroes both: the design rows carry the flat
+    // charge as their part figure.
     let dropped_costs: Vec<ChunkCost> = costs
         .iter()
         .map(|cost| ChunkCost { part: 0, ..*cost })
@@ -584,9 +583,9 @@ fn a_per_token_extra_scales_with_the_chunk_size() {
 
 #[test]
 fn a_lowered_flat_part_charge_still_pays_the_real_part_when_it_is_larger() {
-    // n3: the part term of the sum is max(part_charge, cost.part). A later lowering of the
-    // flat charge (lane M, A6 item 8) below a chunk's real part still pays the real part,
-    // so the lowering cannot undercharge the chunk.
+    // The part term of the sum is max(part_charge, cost.part). A later lowering of the flat charge
+    // below a chunk's real part still pays the real part, so the lowering cannot undercharge the
+    // chunk.
     let cost = ChunkCost {
         m: 1024,
         arena: 300 * MIB,
@@ -727,10 +726,9 @@ fn sums_are_checked_not_wrapped_or_saturated() {
 
 // ---- the arena list of one chunk -----------------------------------------------------------
 
-/// The plan's table (C.3): per-token bytes at Qwen3.6, the fixed bytes (the constant q8_1 pad
-/// of rule M1, the ids and expert-bound capacities, the fixup range at 82 SMs) and the phases.
-/// The two `xf` sinks sit outside it: their bytes are not `per-token * m + fixed` (see
-/// [`XF_SINKS`]).
+/// The plan's table: per-token bytes at Qwen3.6, the fixed bytes (the constant q8_1 pad, the ids
+/// and expert-bound capacities, the fixup range at 82 SMs) and the phases. The two `xf` sinks sit
+/// outside it: their bytes are not `per-token * m + fixed` (see [`XF_SINKS`]).
 #[rustfmt::skip]
 const TABLE: [(S, usize, usize, Phase, Phase); 33] = [
     (S::Hidden, 8192, 0, Embed, Combine),
@@ -768,15 +766,14 @@ const TABLE: [(S, usize, usize, Phase, Phase); 33] = [
     (S::Fixup, 0, 4 * NSM * 128 * 128, Embed, Combine),
 ];
 
-/// The plan's two `xf` sinks, the one slots whose bytes are not `per-token * m + fixed`:
-/// `xf_bytes` returns the fixed fragment `65,537 * 16` B (the vendored fragment-order pack,
-/// `native.rs`) for any chunk of at most 16 rows, then `m * k * 2` halves. The sink planned
-/// at `M_sess` is the max of the two (verdict M1), or a 2-to-16-row chunk of the session
-/// would not fit its prefix: at Qwen3.6 4,096 B a row with the 1,048,592 B floor, so the
-/// sinks of M = 128 and 256 hold the whole fragment.
+/// The plan's two `xf` sinks, the one slots whose bytes are not `per-token * m + fixed`: `xf_bytes`
+/// returns the fixed fragment `65,537 * 16` B (the vendored fragment-order pack, `native.rs`) for
+/// any chunk of at most 16 rows, then `m * k * 2` halves. The sink planned at `M_sess` is the max
+/// of the two, or a 2-to-16-row chunk of the session would not fit its prefix: at Qwen3.6 4,096 B a
+/// row with the 1,048,592 B floor, so the sinks of M = 128 and 256 hold the whole fragment.
 const XF_SINKS: [(S, Phase, Phase); 2] = [(S::XfA, NormA, NormA), (S::XfF, NormF, NormF)];
 
-/// Bytes of one `xf` sink planned at `m` rows (the M1 max, pinned above the code).
+/// Bytes of one `xf` sink planned at `m` rows (the max of the two, pinned above the code).
 fn xf_sink_bytes(m: usize) -> usize {
     (4096 * m).max(65_537 * 16)
 }
@@ -827,10 +824,10 @@ fn the_tensor_list_is_the_plans_table_at_every_ladder_size() {
 
 #[test]
 fn every_smaller_chunk_fits_the_slots_planned_at_m_sess() {
-    // M1: the prefix promise of `chunk_tensors`. `xf_bytes` is not monotone in m (the fixed
-    // 1,048,592 B fragment of any chunk of at most 16 rows), so the sinks planned at M_sess
-    // carry the fragment floor; every other slot grows with m. Each slot of every smaller
-    // chunk must then fit its session's slot, at both SM counts.
+    // The prefix promise of `chunk_tensors`. `xf_bytes` is not monotone in m (the fixed 1,048,592 B
+    // fragment of any chunk of at most 16 rows), so the sinks planned at M_sess carry the fragment
+    // floor; every other slot grows with m. Each slot of every smaller chunk must then fit its
+    // session's slot, at both SM counts.
     let d = dims();
     for &nsm in &[NSM, 20] {
         for &m_sess in M_LADDER.iter().rev() {
@@ -955,7 +952,7 @@ fn the_fixup_range_and_the_part_buffer_follow_the_device_sm_count() {
 
 #[test]
 fn the_part_buffer_is_the_sister_plan_and_the_flat_charge_covers_it() {
-    // CPF-7 plan C.5 note 5: 16.1 / 16.1 / 32.3 MiB at M = 512 / 1,024 / 2,048 (82 SMs).
+    // The plan's figures: 16.1 / 16.1 / 32.3 MiB at M = 512 / 1,024 / 2,048 (82 SMs).
     let d = dims();
     let part = |m: usize| chunk_cost(&d, m, NSM).expect("cost").part;
     assert_eq!(
@@ -1049,11 +1046,10 @@ fn fp16_kv_is_capped_near_80k_positions_at_the_2048_row_arena_ceiling() {
     // state — the pool 65,863,680 B and the words 768 B on top of 20,480 B a position (Fp16
     // KV planes are whole multiples of the alignment, so the state adds the fixed
     // 65,864,448 B to the per-position figure).
-    // The bases are decision 0049's basis, not a measurement: 2,490 MiB (2,610,954,240 B)
-    // with the Native restatement at +42 MiB = 2,532 MiB (2,654,994,432 B). The measured
-    // Tiled free-after-load is 3,618,963,456 B (knowledge entry cuda-3090-context-budget,
-    // /home/dan/fifi/knowledge/), which leaves 2,427 MiB after the 1 GiB headroom — a 63 MiB
-    // gap below 0049's basis; no numeric change follows from it here (Q1).
+    // The bases are the design basis, not a measurement: 2,490 MiB (2,610,954,240 B) with the
+    // Native restatement at +42 MiB = 2,532 MiB (2,654,994,432 B). The measured Tiled
+    // free-after-load is 3,618,963,456 B, which leaves 2,427 MiB after the 1 GiB headroom — a 63
+    // MiB gap below the design basis; no numeric change follows from it here.
     //   2,490 MiB: (2,610,954,240 - 777,223,680 - 2 * 67,108,864 - 65,864,448) / 20,480
     //             = 1,633,648,384 / 20,480 = 79,767 (79,768 * 20,480 is 256 B past it).
     //   2,532 MiB: (2,654,994,432 - 777,223,680 - 2 * 67,108,864 - 65,864,448) / 20,480
@@ -1075,14 +1071,14 @@ fn fp16_kv_is_capped_near_80k_positions_at_the_2048_row_arena_ceiling() {
     assert_eq!(end(2532), 81_918);
 }
 
-/// The one report the packet prints (run with `--nocapture`): v1's `plan_arena` totals beside
-/// 0049's P-b rows, and the admission tables of both. Only the invariants are gated.
+/// The one report this module prints (run with `--nocapture`): v1's `plan_arena` totals beside the
+/// design's rows, and the admission tables of both. Only the invariants are gated.
 #[test]
 fn v1_totals_and_admission_tables_are_reported_beside_0049s_rows() {
     let d = dims();
     let v1 = chunk_costs(&d, NSM).expect("costs");
     let mib = |bytes: usize| bytes as f64 / MIB as f64;
-    println!("M      v1 arena  peak live  unaliased  P-b row   v1 part   flat part  (MiB)");
+    println!("M      v1 arena  peak live  unaliased  design    v1 part   flat part  (MiB)");
     for (&(m, tenths), cost) in PB_TENTHS.iter().zip(v1.iter().rev()) {
         let tensors = only(&tensors_of(m));
         let (peak, raw) = (
@@ -1103,7 +1099,7 @@ fn v1_totals_and_admission_tables_are_reported_beside_0049s_rows() {
     let pb = pb_costs();
     let admission = Admission::new(BASIS);
     let modes = [("FP16", KvMode::Fp16), ("KV8", KvMode::Int8G32)];
-    println!("last window each M passes (positions), P-b rows | v1 plan (whole state)");
+    println!("last window each M passes (positions), design rows | v1 plan (whole state)");
     for m in M_LADDER.iter().rev() {
         let ends = modes.map(|(_, mode)| {
             let per = per_position(mode);
@@ -1132,7 +1128,7 @@ fn v1_totals_and_admission_tables_are_reported_beside_0049s_rows() {
         262_144,
     ];
     for (label, mode) in modes {
-        println!("{label}: M x window, P-b/v1 (Y passes, - refused)");
+        println!("{label}: M x window, design/v1 (Y passes, - refused)");
         println!("  M    {}", windows.map(|w| format!("{w:>8}")).join(""));
         for &m in M_LADDER.iter().rev() {
             let cells = windows.map(|window| {
@@ -1146,7 +1142,7 @@ fn v1_totals_and_admission_tables_are_reported_beside_0049s_rows() {
             println!("  {m:<5}{}", cells.join(""));
         }
         println!(
-            "  admit P-b {:?}",
+            "  admit design {:?}",
             windows.map(|w| {
                 admission
                     .admit(kv_bytes(&d, mode, w).unwrap(), &pb, None)

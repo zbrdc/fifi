@@ -1,8 +1,7 @@
 /*
- * TCAP C3: the tiered wait-add of one layer, the device half of the CPU-expert answer (decision 0047,
- * amendment of the TCAP design). Semantics: see tiered_wait_add.h; the host half of the protocol is
- * context/mailbox.rs and its port. Original CUDA C; design from ledger/plans/TCAP-DESIGN.md
- * section 3.2.
+ * The tiered wait-add of one layer, the device half of the CPU-expert answer. Semantics: see
+ * tiered_wait_add.h; the host half of the protocol is context/mailbox.rs and its port. Original
+ * CUDA C.
  *
  * One block, 256 threads. Thread 0 alone waits on the mapped answer line with a bounded poll, so the
  * block occupies its SM but never the host: the decode stream keeps its enqueue-only contract. The

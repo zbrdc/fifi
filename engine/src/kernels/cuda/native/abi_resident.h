@@ -1,5 +1,5 @@
 /*
- * Resident-decode entries (CUDA-RD). Launch-only: none of these allocates,
+ * Resident-decode entries. Launch-only: none of these allocates,
  * copies synchronously, or synchronizes unless its name or comment says so. A
  * fault in queued work surfaces at the next synchronize. Handles (stream,
  * event, pinned memory) are opaque and owned by Rust; each is destroyed once
@@ -21,7 +21,7 @@ extern "C" {
 /* Creates a non-blocking stream. */
 int inference_cuda_stream_create(void **out_stream, int *out_stage);
 /* Synchronizes, then destroys the stream. If the synchronize fails nothing is
- * destroyed (decision 0022) and the status is returned. */
+ * destroyed and the status is returned. */
 int inference_cuda_stream_destroy(void *stream, int *out_stage);
 int inference_cuda_stream_synchronize(void *stream, int *out_stage);
 
@@ -29,7 +29,7 @@ int inference_cuda_stream_synchronize(void *stream, int *out_stage);
 int inference_cuda_event_create(void **out_event, int *out_stage);
 int inference_cuda_event_destroy(void *event, int *out_stage);
 int inference_cuda_event_record(void *event, void *stream, int *out_stage);
-/* The graph-timer trio (packet B1): timing-enabled event, external record (a capture turns it
+/* The graph-timer trio: timing-enabled event, external record (a capture turns it
  * into an event-record graph node), and the elapsed query between two completed events. */
 int inference_cuda_timing_event_create(void **out_event, int *out_stage);
 int inference_cuda_timing_event_record_external(void *event, void *stream, int *out_stage);

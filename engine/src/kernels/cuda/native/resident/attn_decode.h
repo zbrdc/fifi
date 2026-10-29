@@ -1,5 +1,5 @@
 /*
- * RD-8b: split-KV decode attention entry (native/resident/attn_decode.h, per-kernel header).
+ * Split-KV decode attention entry (native/resident/attn_decode.h, per-kernel header).
  * Launch-only, like the entries of abi_resident.h. Include after abi.h in C++; Rust mirrors the
  * struct in native/resident/attn_decode.rs (child module of native/resident.rs).
  */

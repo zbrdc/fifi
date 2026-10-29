@@ -1,4 +1,4 @@
-//! Resident dense attention of the Q36 family (packet Q36-C1; decision 0046).
+//! Resident dense attention of the Q36 family.
 //!
 //! The graph follows the dense branch of `flash_next/resident/qsa.rs` and the rules of
 //! `qwen36/host.rs::attn_step`: the query projection holds, per head, the query rows and then the
@@ -6,31 +6,30 @@
 //! 1); RoPE rotates the first `rotary_dim` dimensions; the head output is multiplied by
 //! `sigmoid(gate)` before the output projection. There is no indexer and no block selection.
 //!
-//! The cache (packet Q36-KV-INTEGRATE) is preallocated capacity buffers written in place by the
-//! consuming `kv_append`: the first `len` positions are valid, the rest is slack with no value.
-//! In the F32 form (`kv_dtype: f32`, the control) it is a pair of F32 buffers `[1, KVH, cap, D]`
-//! for keys and for values, preallocated in `KV_STEP` quanta. In the Q8 form (`kv_dtype: q8`,
-//! packet KV8-INTEGRATE; decision 0046 A7) it is three buffers per side: codes U32
-//! `[1, KVH, cap, D/4]`, scales and biases `[1, KVH, cap, D/64]` in the ACTIVATION dtype (BF16
-//! in the serving default, so the per-position cost is the 1,088 B of A7; F32 activation mode
-//! widens the scales and costs 1,152 B). A decode step appends one position at `[0, 0, len, 0]`;
-//! a chunk appends its rows the same way. When `len + rows` passes `cap`, the layer builds a
-//! larger buffer of `round_up(len + rows, KV_STEP)` positions - the valid prefix `[0, len)` of
-//! ALL the buffers copied once (a copy is acceptable once per growth), zero slack - and appends
-//! into that. Attention runs over the copy-free prefix view of the buffers
+//! The cache is preallocated capacity buffers written in place by the consuming `kv_append`: the
+//! first `len` positions are valid, the rest is slack with no value. In the F32 form
+//! (`kv_dtype: f32`, the control) it is a pair of F32 buffers `[1, KVH, cap, D]` for keys and for
+//! values, preallocated in `KV_STEP` quanta. In the Q8 form (`kv_dtype: q8`) it is three buffers
+//! per side: codes U32 `[1, KVH, cap, D/4]`, scales and biases `[1, KVH, cap, D/64]` in the
+//! ACTIVATION dtype (BF16 in the serving default, so the per-position cost is 1,088 B; F32
+//! activation mode widens the scales and costs 1,152 B). A decode step appends one position at
+//! `[0, 0, len, 0]`; a chunk appends its rows the same way. When `len + rows` passes `cap`, the
+//! layer builds a larger buffer of `round_up(len + rows, KV_STEP)` positions - the valid prefix
+//! `[0, len)` of ALL the buffers copied once (a copy is acceptable once per growth), zero slack -
+//! and appends into that. Attention runs over the copy-free prefix view of the buffers
 //! (`grouped_attention_prefix` in the F32 form, `quantized_attention_prefix` in the Q8 form, the
 //! mlx-lm form of the quantized cache: no F32 copy of the prefix is built), so a step no longer
-//! copies the whole cache per token as the `concatenate` formulation did (about 671 MB per token
-//! at depth 8,192 on the real model in the F32 form). A snapshot shares the buffers; the next
-//! in-place append on a shared buffer copies it once (the operation falls back when the handle
-//! is not unique), so the snapshot keeps its own rows. The admission charge of the session budget
-//! stays LOGICAL, `len` positions of growth bytes per layer (`settings::kv_growth_per_position`,
-//! the one byte authority); the capacity slack of a whole session stays below one `KV_STEP` of
-//! growth bytes per attention layer (256 * 4,096 * 10 = 10,485,760 bytes on the real model in
-//! the F32 form; 256 * 1,088 * 10 = 2,785,280 at Q8 with BF16 scales). That slack bound EXCLUDES
-//! the growth transient - the old buffer, its slice copy, and the new buffer alive together at a
-//! growth, about 100 MB per layer at depth 8,192 in the F32 form - which the session reserve
-//! margin and the retire cap cover. The step builds a lazy graph only.
+//! copies the whole cache per token as the `concatenate` formulation did (about 671 MB per token at
+//! depth 8,192 on the real model in the F32 form). A snapshot shares the buffers; the next in-place
+//! append on a shared buffer copies it once (the operation falls back when the handle is not
+//! unique), so the snapshot keeps its own rows. The admission charge of the session budget stays
+//! LOGICAL, `len` positions of growth bytes per layer (`settings::kv_growth_per_position`, the one
+//! byte authority); the capacity slack of a whole session stays below one `KV_STEP` of growth bytes
+//! per attention layer (256 * 4,096 * 10 = 10,485,760 bytes on the real model in the F32 form;
+//! 256 * 1,088 * 10 = 2,785,280 at Q8 with BF16 scales). That slack bound EXCLUDES the growth
+//! transient - the old buffer, its slice copy, and the new buffer alive together at a growth, about
+//! 100 MB per layer at depth 8,192 in the F32 form - which the session reserve margin and the
+//! retire cap cover. The step builds a lazy graph only.
 
 use super::kv_plan;
 use super::ops::{Ctx, cast_to, dim, linear, to_act};
@@ -74,12 +73,11 @@ fn fused_min_len() -> usize {
     FUSED_DECODE_MIN_LEN
 }
 
-/// The quantized buffers of one side (keys or values) of the Q8 cache (packet KV8-INTEGRATE;
-/// decision 0046 A7): the packed codes beside the affine scales and biases. All three are
-/// capacity buffers `[1, KVH, cap, last]` written in place by `kv_append` and read through
-/// prefix views by `quantized_attention_prefix`. Never reconstruct the values by hand (the Mac
-/// finding: MLX's affine scale is not the plain min/max form): the codes, scales and biases go
-/// only through MLX operations.
+/// The quantized buffers of one side (keys or values) of the Q8 cache: the packed codes beside the
+/// affine scales and biases. All three are capacity buffers `[1, KVH, cap, last]` written in place
+/// by `kv_append` and read through prefix views by `quantized_attention_prefix`. Never reconstruct
+/// the values by hand (MLX's affine scale is not the plain min/max form): the codes, scales and
+/// biases go only through MLX operations.
 pub(super) struct Q8Tensor {
     /// The packed 8-bit codes, U32 `[1, KVH, cap, D / 4]`; the first `len` positions are valid.
     pub(super) codes: ExecutionTensor,
@@ -90,7 +88,7 @@ pub(super) struct Q8Tensor {
 }
 
 /// The capacity buffers of one dense attention layer, one enum so that an impossible half-filled
-/// cache does not type-check (packet KV8-INTEGRATE item 2).
+/// cache does not type-check.
 pub(super) enum KvBuffers {
     /// The F32 control: keys and values `[1, KVH, cap, D]`.
     F32 {
@@ -121,15 +119,15 @@ pub(super) enum KvBuffers {
 pub(super) struct KvCache {
     /// The buffers of both sides; `None` while the cache holds no position.
     pub(super) buffers: Option<KvBuffers>,
-    /// The cache form (packet KV8-INTEGRATE): fixes how the buffers are shaped, appended, and
-    /// read. The decoder's `kv_dtype` sets it at `zero`; `check_buffers` refuses a mismatch.
+    /// The cache form: fixes how the buffers are shaped, appended, and read. The decoder's
+    /// `kv_dtype` sets it at `zero`; `check_buffers` refuses a mismatch.
     pub(super) kv: KvDtype,
     /// Valid positions.
     pub(super) len: usize,
     /// Allocated positions of each buffer. Zero while the cache holds no buffers.
     pub(super) cap: usize,
-    /// The growth quantum in positions (packet Q36-KV-INTEGRATE). The default is `KV_STEP`;
-    /// tests use a small step so a run crosses a growth boundary within a few tokens.
+    /// The growth quantum in positions. The default is `KV_STEP`; tests use a small step so a run
+    /// crosses a growth boundary within a few tokens.
     pub(super) step: usize,
 }
 
@@ -145,8 +143,8 @@ impl KvCache {
         Self::with_form(KvDtype::F32, step)
     }
 
-    /// A cache of form `kv` with no position that grows in `step`-position quanta (packet
-    /// KV8-INTEGRATE): `ResidentState::zero_with` builds it from the weights' `kv_dtype`.
+    /// A cache of form `kv` with no position that grows in `step`-position quanta:
+    /// `ResidentState::zero_with` builds it from the weights' `kv_dtype`.
     pub(super) fn with_form(kv: KvDtype, step: usize) -> Self {
         Self {
             buffers: None,
@@ -211,9 +209,8 @@ impl KvCache {
     /// call: in the F32 form a pair of `[1, KVH, cap, D]` tensors; in the Q8 form six tensors -
     /// codes `[1, KVH, cap, D/4]`, scales and biases `[1, KVH, cap, D/64]` - all with
     /// `cap >= len`, or no buffers at a zero `len` and `cap`. A cache of another form, or of the
-    /// wrong shapes, is the `BadRequest` of a cache that does not match its shape (packet
-    /// KV8-INTEGRATE item 7g: a cache that is not the form the decoder plans is refused before
-    /// any native call).
+    /// wrong shapes, is the `BadRequest` of a cache that does not match its shape (a cache that
+    /// is not the form the decoder plans is refused before any native call).
     pub(super) fn check_buffers(
         &self,
         kv_heads: u32,
@@ -277,17 +274,15 @@ fn share_q8(side: &Q8Tensor) -> Q8Tensor {
 }
 
 /// Bytes that one more position adds to the cache of one layer, from the cache form and the
-/// activation dtype (packet KV8-INTEGRATE item 5): the one authority is
-/// `settings::kv_growth_per_position`. The real model (KVH 2, D 256) adds 4,096 bytes per layer
-/// and position in the F32 form (40,960 over its 10 attention layers), and 1,088 at Q8 with
-/// BF16 scales (10,880) or 1,152 at F32 scales (11,520). This is the LOGICAL admission charge of
-/// one position (packet Q36-KV-INTEGRATE): the capacity buffers hold up to one `KV_STEP` of
-/// slack per layer on top of it, so the slack of a whole session stays below `KV_STEP *
-/// growth_bytes` summed over the attention layers - 10,485,760 bytes on the real model in the
-/// F32 form, 2,785,280 at Q8 with BF16 scales - and `state::kv_bytes` charges only this formula,
-/// never the stored bytes. The bound excludes the growth transient (the old buffer, its slice
-/// copy, and the new buffer alive at a growth), which the session reserve margin and the retire
-/// cap cover.
+/// activation dtype: the one authority is `settings::kv_growth_per_position`. The real model (KVH
+/// 2, D 256) adds 4,096 bytes per layer and position in the F32 form (40,960 over its 10 attention
+/// layers), and 1,088 at Q8 with BF16 scales (10,880) or 1,152 at F32 scales (11,520). This is the
+/// LOGICAL admission charge of one position: the capacity buffers hold up to one `KV_STEP` of slack
+/// per layer on top of it, so the slack of a whole session stays below `KV_STEP * growth_bytes`
+/// summed over the attention layers - 10,485,760 bytes on the real model in the F32 form, 2,785,280
+/// at Q8 with BF16 scales - and `state::kv_bytes` charges only this formula, never the stored
+/// bytes. The bound excludes the growth transient (the old buffer, its slice copy, and the new
+/// buffer alive at a growth), which the session reserve margin and the retire cap cover.
 pub(super) fn growth_bytes(
     shape: &HostShape,
     kv: KvDtype,
@@ -350,11 +345,11 @@ fn grown(
 }
 
 /// The zero capacity buffers of one Q8 side: `quantize_rows` of a zero `[1, KVH, positions, D]`
-/// tensor in the ACTIVATION dtype (packet KV8-INTEGRATE item 2). The quantization of a constant
-/// row is well defined - every group holds one value, the scale is 0, and every code reconstructs
-/// to the bias, which is the zero (the oracle test of packet KV8-OPS pins the constant group) -
-/// so the slack holds zero codes, zero scales, and zero biases. Like `zero_rows`, this builds a
-/// lazy graph only: no host import, no synchronization.
+/// tensor in the ACTIVATION dtype. The quantization of a constant row is well defined - every group
+/// holds one value, the scale is 0, and every code reconstructs to the bias, which is the zero (an
+/// oracle test of the quantization pins the constant group) - so the slack holds zero codes, zero
+/// scales, and zero biases. Like `zero_rows`, this builds a lazy graph only: no host import, no
+/// synchronization.
 fn zero_q8_side(
     ctx: &mut Ctx<'_>,
     kv_heads: u32,
@@ -371,11 +366,10 @@ fn zero_q8_side(
     })
 }
 
-/// Writes the three prefix views of `old` into the zero capacity buffers of `len` valid
-/// positions at `[0, 0, 0, 0]` (packet KV8-INTEGRATE item 2): the growth of one Q8 side. The
-/// valid prefix of ALL three buffers is copied once - the `kv_append` writes the rows of the
-/// unique zero buffer in place - and the slack above `len` stays zero, exactly as the F32
-/// `grown` copies its prefix once and zeroes its slack.
+/// Writes the three prefix views of `old` into the zero capacity buffers of `len` valid positions
+/// at `[0, 0, 0, 0]`: the growth of one Q8 side. The valid prefix of ALL three buffers is copied
+/// once - the `kv_append` writes the rows of the unique zero buffer in place - and the slack above
+/// `len` stays zero, exactly as the F32 `grown` copies its prefix once and zeroes its slack.
 fn grown_q8_side(
     ctx: &mut Ctx<'_>,
     old: &Q8Tensor,
@@ -403,7 +397,7 @@ fn grown_q8_side(
 }
 
 /// Appends the three parts of one quantized side `side` into the capacity buffers `target` at
-/// `[0, 0, at, 0]`: three `kv_append` calls per tensor side (packet KV8-INTEGRATE item 3).
+/// `[0, 0, at, 0]`: three `kv_append` calls per tensor side.
 fn append_q8_side(
     ctx: &mut Ctx<'_>,
     target: Q8Tensor,
@@ -417,18 +411,18 @@ fn append_q8_side(
     })
 }
 
-/// Appends `rows` new positions - `k_new` and `v_new`, each `[1, KVH, rows, D]` F32 in the F32
-/// form or of the ACTIVATION dtype in the Q8 form - to the validated `cache` and returns the
-/// next cache (packets Q36-KV-INTEGRATE and KV8-INTEGRATE). When `len + rows` passes `cap`, the
-/// buffers grow to `kv_plan::next_capacity(len, rows, cap, step)` positions: the valid prefix
-/// of ALL the buffers copied once and zero slack, for keys and for values. The append itself is
-/// the consuming `kv_append` at `[0, 0, len, 0]`: a unique buffer is written in place (MLX
-/// donates it), a buffer shared with a snapshot is copied once. In the Q8 form the new rows
-/// arrive as the activation dtype and `quantize_rows` packs them - three buffers per side - so
-/// the scales and biases hold the ACTIVATION dtype (BF16 in the serving default; the per-position
-/// cost is the 1,088 B of A7, or 1,152 B in F32 activation mode). Every call here builds a lazy
-/// graph only; the caller validated the cache before its first native call, and after this
-/// consumed a buffer any error leaves the caller's state poisoned until `reset`.
+/// Appends `rows` new positions - `k_new` and `v_new`, each `[1, KVH, rows, D]` F32 in the F32 form
+/// or of the ACTIVATION dtype in the Q8 form - to the validated `cache` and returns the next cache.
+/// When `len + rows` passes `cap`, the buffers grow to
+/// `kv_plan::next_capacity(len, rows, cap, step)` positions: the valid prefix of ALL the buffers
+/// copied once and zero slack, for keys and for values. The append itself is the consuming
+/// `kv_append` at `[0, 0, len, 0]`: a unique buffer is written in place (MLX donates it), a buffer
+/// shared with a snapshot is copied once. In the Q8 form the new rows arrive as the activation
+/// dtype and `quantize_rows` packs them - three buffers per side - so the scales and biases hold
+/// the ACTIVATION dtype (BF16 in the serving default; the per-position cost is 1,088 B, or 1,152 B
+/// in F32 activation mode). Every call here builds a lazy graph only; the caller validated the
+/// cache before its first native call, and after this consumed a buffer any error leaves the
+/// caller's state poisoned until `reset`.
 pub(super) fn append(
     ctx: &mut Ctx<'_>,
     kv_heads: u32,
@@ -443,8 +437,8 @@ pub(super) fn append(
     let cap = kv_plan::next_capacity(cache.len, rows, cache.cap, cache.step)?;
     let len = dim(cache.len)?;
     let buffers = match (cache.kv, cache.buffers) {
-        // The F32 form, byte for byte as before packet KV8-INTEGRATE's quantized form: the new
-        // rows are F32 (the caller cast them) and the append is two `kv_append` calls.
+        // The F32 form, byte for byte the same as without the Q8 form: the new rows are F32 (the
+        // caller cast them) and the append is two `kv_append` calls.
         (KvDtype::F32, Some(KvBuffers::F32 { k, v })) => {
             let (k, v) = if cap == cache.cap {
                 (
@@ -510,8 +504,8 @@ pub(super) fn append(
                 v: ctx.kernels.kv_append(v_buf, v_new, &[0, 0, 0, 0])?,
             }
         }
-        // The Q8 form (packet KV8-INTEGRATE item 3): quantize the activation-dtype rows once,
-        // then three `kv_append` calls per side.
+        // The Q8 form: quantize the activation-dtype rows once, then three `kv_append` calls per
+        // side.
         (KvDtype::Q8, buffers) => {
             let mut quantize = |x: &ExecutionTensor| -> Result<Q8Tensor, EngError> {
                 let (codes, scales, biases) = ctx.kernels.quantize_rows(x, Q8_GROUP, Q8_BITS)?;
@@ -646,9 +640,9 @@ pub(super) fn step_projected(
     let k_new = ctx.kernels.rope_scaled(&k_new, &rope)?;
     // 4. New value.
     let v_new = ctx.kernels.reshape(vp, &[1, kv_heads, 1, width])?;
-    // The cache form (packet KV8-INTEGRATE): the F32 control keeps its cast to F32 whatever the
-    // activation dtype (packet Q36-BF16-a), and the Q8 form keeps the activation dtype, so the
-    // scales and biases of the quantization hold it (BF16 in the serving default).
+    // The cache form: the F32 control keeps its cast to F32 whatever the activation dtype, and
+    // the Q8 form keeps the activation dtype, so the scales and biases of the quantization hold
+    // it (BF16 in the serving default).
     let (k_new, v_new) = match cache.kv {
         KvDtype::F32 => (
             cast_to(ctx, &k_new, Dtype::F32)?,
@@ -665,7 +659,7 @@ pub(super) fn step_projected(
     // 6. Attention over every valid position, as a copy-free prefix view of the capacity
     // buffers. Head h reads key-value head h / (QH / KVH). The Q8 form runs the mlx-lm
     // quantized attention over the codes, scales, and biases (no F32 copy of the prefix); the
-    // one-row decode is not causal (packet KV8-INTEGRATE item 4).
+    // one-row decode is not causal.
     let scale = 1.0 / (width as f32).sqrt();
     let att = match cache.buffers.as_ref() {
         Some(KvBuffers::F32 { k, v }) => {
@@ -734,7 +728,7 @@ pub(super) struct ConcatCache {
     pub(super) len: usize,
 }
 
-/// The decode step exactly as it was before packet Q36-KV-INTEGRATE (test-only): the cache is
+/// The decode step exactly as it was before the capacity-buffer cache (test-only): the cache is
 /// `[1, KVH, len, D]` and every step rebuilds it with `concatenate`. The bit equality of this
 /// formulation and the capacity buffers — asserted on every step by the tests of this file and
 /// of `prefill/attn.rs` — proves that the new cache changes no numerics.
@@ -862,8 +856,8 @@ mod tests {
             .unwrap()
     }
 
-    /// Layer 1 of the four-layer tiny KV8 model (packet KV8-INTEGRATE): 4 query heads over 2
-    /// key-value heads of width 64 - the multiple of the Q8 group - rotary dimension 32.
+    /// Layer 1 of the four-layer tiny KV8 model: 4 query heads over 2 key-value heads of width 64 -
+    /// the multiple of the Q8 group - rotary dimension 32.
     fn setup_kv8() -> (StreamedCheckpoint, HostWeights, ResidentWeights, MlxKernels) {
         let ckpt = tiny::checkpoint(&tiny::TINY_KV8);
         let config = tiny::config(&tiny::TINY_KV8);
@@ -886,15 +880,15 @@ mod tests {
         }
     }
 
-    /// The per-element bound of the 8-bit affine quantization error of the F32 cache rows
-    /// (packet KV8-INTEGRATE test a): per group of `Q8_GROUP` lanes the reconstruction error of
-    /// one element is about `(max - min) / 255 / 2` (the MLX scale magnitude is within 0.4 percent
-    /// of `(max - min) / 255`), so `e = R / 510` with `R` the largest
-    /// group range over the valid rows of keys and values. `k` and `v` are the readbacks of the
-    /// `[1, KVH, cap, D]` buffers, where element (g, t, d) sits at `(g * cap + t) * D + d`; only
-    /// the first `len` positions of each head count (the rest is capacity slack). The function
-    /// also returns `V_max`, the largest magnitude of the valid rows. Both feed the derived
-    /// tolerance, which is a worst-case guard; the corrupted-cache test supplies the sensitivity.
+    /// The per-element bound of the 8-bit affine quantization error of the F32 cache rows: per
+    /// group of `Q8_GROUP` lanes the reconstruction error of one element is about
+    /// `(max - min) / 255 / 2` (the MLX scale magnitude is within 0.4 percent of
+    /// `(max - min) / 255`), so `e = R / 510` with `R` the largest group range over the valid rows
+    /// of keys and values. `k` and `v` are the readbacks of the `[1, KVH, cap, D]` buffers, where
+    /// element (g, t, d) sits at `(g * cap + t) * D + d`; only the first `len` positions of each
+    /// head count (the rest is capacity slack). The function also returns `V_max`, the largest
+    /// magnitude of the valid rows. Both feed the derived tolerance, which is a worst-case guard;
+    /// the corrupted-cache test supplies the sensitivity.
     fn quantization_error(
         k: &[f32],
         v: &[f32],
@@ -954,9 +948,9 @@ mod tests {
     }
 
     /// Nine decode steps over a growth quantum of 3 (the buffers grow three times: caps 3, 6, 9)
-    /// match the host oracle within the parity bounds, are bit-equal to the old
-    /// concatenate-based step on every step, and keep the rotated keys and values in the valid
-    /// prefix of the capacity buffers (packet Q36-KV-INTEGRATE 6(b)).
+    /// match the host oracle within the parity bounds, are bit-equal to the old concatenate-based
+    /// step on every step, and keep the rotated keys and values in the valid prefix of the capacity
+    /// buffers.
     #[test]
     fn nine_steps_over_three_growths_match_the_host_and_the_old_formulation_bitwise() {
         let _serial = crate::native_test_lock();
@@ -1177,9 +1171,9 @@ mod tests {
             "{:?}",
             wrong_shape.as_ref().err()
         );
-        // A capacity below the valid length, with MATCHING buffer shapes (review B finding 5):
-        // `[1, 2, 1, 32]` buffers of one position that claim two valid positions pass the shape
-        // comparison and reach the `cap < len` clause of `check_buffers`.
+        // A capacity below the valid length, with MATCHING buffer shapes: `[1, 2, 1, 32]`
+        // buffers of one position that claim two valid positions pass the shape comparison and
+        // reach the `cap < len` clause of `check_buffers`.
         let two_heads = |ctx: &mut Ctx<'_>| {
             ctx.kernels
                 .import_tensor(&f32_tensor(vec![1, 2, 1, 32], &[0.0; 64]).unwrap())
@@ -1224,15 +1218,14 @@ mod tests {
         (key, cpu.linear(host_w.v, &x).unwrap())
     }
 
-    /// Packet Q36-KV-INTEGRATE 6(e), review B finding 2: after warm-up, appending to a unique
-    /// cache does not grow the MLX peak by a buffer — the method of
-    /// `kv_append_donates_the_buffer_over_200_appends` (engine/tests/native_kv_ops.rs) driven
-    /// through the real attention step. The step quantum 65,536 gives each capacity buffer of
-    /// the tiny layer (2 key-value heads of width 32) 16 MiB, the order of the real layer's
+    /// After warm-up, appending to a unique cache does not grow the MLX peak by a buffer — the
+    /// method of `kv_append_donates_the_buffer_over_200_appends` (engine/tests/native_kv_ops.rs)
+    /// driven through the real attention step. The step quantum 65,536 gives each capacity buffer
+    /// of the tiny layer (2 key-value heads of width 32) 16 MiB, the order of the real layer's
     /// `[1, 2, 16384, 256]` buffer of 32 MiB. A donating loop adds only the small temporaries of
-    /// the projections, so the bound is one quarter of one buffer (a copy of one buffer per
-    /// append already moves the peak past it); the measured growth is printed for the record,
-    /// and the cached rows are read back at the end and checked against the host derivation.
+    /// the projections, so the bound is one quarter of one buffer (a copy of one buffer per append
+    /// already moves the peak past it); the measured growth is printed for the record, and the
+    /// cached rows are read back at the end and checked against the host derivation.
     #[test]
     fn two_hundred_decode_steps_donate_the_capacity_buffer() {
         let _serial = crate::native_test_lock();
@@ -1401,19 +1394,19 @@ mod tests {
         kernels.set_retire_cap(previous_cap).unwrap();
     }
 
-    /// Packet KV8-INTEGRATE test (a) at the layer level: eight decode steps of the Q8 form
-    /// against the F32 control on the same weights, in F32 activation. Tolerance derivation
-    /// (stated, every input measured or asserted in the test): the 8-bit affine error of one
-    /// cached element is about `e = R / 510` (`quantization_error`, `R` the largest group
-    /// range over the valid rows of both heads, measured in the test); one score moves by at most `|dq * dk| / sqrt(D)` summed over
-    /// the head width, which Cauchy-Schwarz bounds by `sqrt(D) * Q_max * e` with the
-    /// RMS-normed query magnitude `Q_max` at most 16 (the norm weights are 1 +/- 0.25, so
-    /// `||q||_2` is about 10 at width 64); the softmax moves total variation by at most twice
-    /// the largest score shift; the attention output moves by at most `e + V_max * 2 *
-    /// sqrt(D) * Q_max * e` (`V_max` from the valid rows of the F32 cache, measured in the test); and the
-    /// o-projection amplifies elementwise by at most `amp`, the largest row sum of its host
-    /// weight (computed here exactly from the basis vectors). The bound is deliberately
-    /// worst-case-loose; the finiteness of every output is gated beside it.
+    /// The quantization-error test at the layer level: eight decode steps of the Q8 form against
+    /// the F32 control on the same weights, in F32 activation. Tolerance derivation (stated, every
+    /// input measured or asserted in the test): the 8-bit affine error of one cached element is
+    /// about `e = R / 510` (`quantization_error`, `R` the largest group range over the valid rows
+    /// of both heads, measured in the test); one score moves by at most `|dq * dk| / sqrt(D)`
+    /// summed over the head width, which Cauchy-Schwarz bounds by `sqrt(D) * Q_max * e` with the
+    /// RMS-normed query magnitude `Q_max` at most 16 (the norm weights are 1 +/- 0.25, so `||q||_2`
+    /// is about 10 at width 64); the softmax moves total variation by at most twice the largest
+    /// score shift; the attention output moves by at most `e + V_max * 2 * sqrt(D) * Q_max * e`
+    /// (`V_max` from the valid rows of the F32 cache, measured in the test); and the o-projection
+    /// amplifies elementwise by at most `amp`, the largest row sum of its host weight (computed
+    /// here exactly from the basis vectors). The bound is deliberately worst-case-loose; the
+    /// finiteness of every output is gated beside it.
     #[test]
     fn eight_q8_steps_match_the_f32_cache_within_the_derived_quantization_tolerance() {
         let _serial = crate::native_test_lock();
@@ -1604,10 +1597,10 @@ mod tests {
         );
     }
 
-    /// Packet KV8-INTEGRATE test (c): a run across capacity growth boundaries (the step quantum
-    /// 3 grows the buffers at positions 3 and 6) is BIT-IDENTICAL to the same run over one
-    /// large step, because the quantization of a row and the attention views never depend on the
-    /// capacity. The capacities differ exactly as planned (9 against 65,536).
+    /// A Q8 run across capacity growth boundaries (the step quantum 3 grows the buffers at
+    /// positions 3 and 6) is BIT-IDENTICAL to the same run over one large step, because the
+    /// quantization of a row and the attention views never depend on the capacity. The capacities
+    /// differ exactly as planned (9 against 65,536).
     #[test]
     fn a_q8_growth_boundary_changes_no_numerics_bit_for_bit() {
         let _serial = crate::native_test_lock();
@@ -1672,9 +1665,9 @@ mod tests {
         assert_eq!(large.byte_len(), 65_536 * growth, "the one-step storage");
     }
 
-    /// Packet KV8-INTEGRATE test (f) at the layer level: the stored bytes equal the logical
-    /// charge of the valid positions plus at most one step of slack, and exactly the capacity
-    /// times the per-position bytes of the form.
+    /// The Q8 storage at the layer level: the stored bytes equal the logical charge of the valid
+    /// positions plus at most one step of slack, and exactly the capacity times the per-position
+    /// bytes of the form.
     #[test]
     fn the_q8_cache_stores_the_charge_plus_one_step_of_slack() {
         let _serial = crate::native_test_lock();
@@ -1709,10 +1702,10 @@ mod tests {
         assert_eq!((cache.len, cache.cap), (7, 8), "one growth at position 4");
     }
 
-    /// Packet KV8-INTEGRATE test (g): a cache whose declared form does not match its buffers,
-    /// or whose Q8 buffers hold the wrong widths, is refused with `BadRequest` by the host
-    /// check before any native call. (The half-filled pair of the old layout is a TYPE error
-    /// now: the `KvBuffers` enum cannot express it.)
+    /// A cache whose declared form does not match its buffers, or whose Q8 buffers hold the wrong
+    /// widths, is refused with `BadRequest` by the host check before any native call. (The
+    /// half-filled pair of the old layout is a TYPE error now: the `KvBuffers` enum cannot express
+    /// it.)
     #[test]
     fn a_q8_cache_of_the_wrong_form_or_width_is_refused_before_any_native_call() {
         let _serial = crate::native_test_lock();

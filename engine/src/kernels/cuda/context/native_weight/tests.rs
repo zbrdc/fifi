@@ -1,11 +1,11 @@
-//! Host and device tests of the native-layout upload (MATVEC-PAR S2 c1).
+//! Host and device tests of the native-layout upload.
 //!
 //! Host: the shape gates of `checked_native` and the whole-row chunk arithmetic of
 //! `RowChunkPlan` (no chunk splits a row, the last chunk may be short, a row wider than the
 //! limit is its own chunk). Device (3090): the upload round trip of every type and a
 //! 16-expert stack through a small chunk limit, the free of a failed read (the live-byte
-//! count returns), and a Native weight through the S1 `matvec_q` against the integer
-//! reference. Device tests assume `--test-threads=1` (decision 0040).
+//! count returns), and a Native weight through `matvec_q` against the integer reference.
+//! Device tests assume `--test-threads=1`.
 
 use super::*;
 use crate::kernels::cuda::resident::matvec_q::{MatvecCall, tests::reference};
@@ -143,8 +143,8 @@ fn upload_native_round_trips_the_file_bytes_of_every_type_and_a_stack() {
         (GgufType::Q50, QuantType::Q50, 512),
     ] {
         // 10 rows: not a whole 8-row group, legal natively; a small limit forces chunks of
-        // 3, 3, 3 rows and a SHORT LAST CHUNK of 1 (KUBDAN-MSG-68 M-5: the device round trip
-        // must exercise a non-dividing row count too, like the 70-rows-in-16s plan case).
+        // 3, 3, 3 rows and a SHORT LAST CHUNK of 1 (the device round trip must exercise a
+        // non-dividing row count too, like the 70-rows-in-16s plan case).
         let n_rows = 10;
         let row_bytes = (k / quant.block_size()) * quant.block_bytes();
         let source: Vec<u8> = (0..n_rows * row_bytes)

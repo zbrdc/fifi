@@ -1,29 +1,28 @@
-//! Batched MoE over a chunk with every expert resident (packet Q36-E5; decision 0046 items 1 and 9).
+//! Batched MoE over a chunk with every expert resident.
 //!
 //! The chunk form of `moe::step` for `T` token rows. Both routing modes of the decoder select the
 //! experts of every row. `Routing::Host` (the reference) reads the `[T, 256]` probabilities once
 //! and routes every row with `route_experts`, the function that the decode block and the host
 //! reference use (the lowest index wins a tie; the gates renormalize over the selection). The
-//! `T * top_k` (token, choice) pairs then go to the device sorted by expert (`chunk_plan::pair_plan`)
-//! with one `import_many`. `Routing::Device` (the decoder default, packet Q36-PF-DEVROUTE) builds
+//! `T * top_k` (token, choice) pairs then go to the device sorted by expert
+//! (`chunk_plan::pair_plan`) with one `import_many`. `Routing::Device` (the decoder default) builds
 //! the whole route on the device as lazy graph nodes: the top-k by a stable `argsort` of the
-//! negated probabilities, the gates by `take_along_axis` and the renormalization, the pair sort
-//! by an `argsort` of the exact small integer keys, and the un-sort by its inverse permutation.
-//! It reads nothing back and imports nothing (packet Q36-GAP 3b: the host side of the routing
-//! measured 140 ms of the 855 ms 512-row chunk). Its health check replaces the per-row finite
-//! check of `route_experts`: each layer returns the sum of its whole probability block, and the
-//! chunk step reads the stacked sums back once and checks them with `route::check_health`.
+//! negated probabilities, the gates by `take_along_axis` and the renormalization, the pair sort by
+//! an `argsort` of the exact small integer keys, and the un-sort by its inverse permutation. It
+//! reads nothing back and imports nothing (the host side of the routing measured 140 ms of
+//! the 855 ms 512-row chunk). Its health check replaces the per-row finite check of
+//! `route_experts`: each layer returns the sum of its whole probability block, and the chunk step
+//! reads the stacked sums back once and checks them with `route::check_health`.
 //!
 //! `gather_qmm` reads the selected experts in place, so a chunk has no page pool and no expert
 //! waves. The weighted rows return to token-major order with the inverse permutation and sum in
 //! choice order, as the decode step sums them. Sorting keeps the rows of one expert next to each
 //! other, and the three expert products call `gather_qmm_sorted_bounded`, which passes MLX's
-//! `sorted_indices` flag over ids that one `bound_indices` clamp covers for the whole chunk
-//! (packets Q36-PF-SORTED and GAP-TRIM-A; the flag cuts the expert product time of a 512-row
-//! chunk from about 457 ms to 207 ms, Q36-GAP 3a). The host path proves the non-decreasing order
-//! of `plan.experts` before the import, because the method cannot read the device indices; the
-//! device path needs no proof, because its order comes from `argsort` by definition. The decode
-//! path keeps the unsorted flag (`gather_qmm_bounded` with `false`).
+//! `sorted_indices` flag over ids that one `bound_indices` clamp covers for the whole chunk (the
+//! flag cuts the expert product time of a 512-row chunk from about 457 ms to 207 ms). The host path
+//! proves the non-decreasing order of `plan.experts` before the import, because the method cannot
+//! read the device indices; the device path needs no proof, because its order comes from `argsort`
+//! by definition. The decode path keeps the unsorted flag (`gather_qmm_bounded` with `false`).
 
 use super::super::chunk_plan::{PairPlan, pair_plan, require_sorted_experts};
 use super::super::ops::{Ctx, dim, f32_tensor, short_import, to_act, u32_tensor, values};
@@ -42,7 +41,7 @@ use crate::{
 
 /// Shared expert `sigmoid(x · s) * down(silu(gate(x)) * up(x))` for `x` `[T, H]`, as `[T, H]`.
 /// The shared expert in kernel-ready parts: the down projection `so` `[T, H]` and the scalar
-/// logit `raw` `[T, 1]` (R4-7: the fused MoE combine folds `sigmoid(raw) * so` itself).
+/// logit `raw` `[T, 1]` (the fused MoE combine folds `sigmoid(raw) * so` itself).
 fn shared_parts(
     ctx: &mut Ctx<'_>,
     w: &RMoe,
@@ -134,7 +133,7 @@ pub(super) fn chunk(
     require_sorted_experts(&plan.experts)?;
     let pairs = dim(plan.experts.len())?;
     let [ids, tokens, inverse, gates] = import_plan(ctx, &plan)?;
-    // One clamp for the expert ids of the whole chunk (packet GAP-TRIM-A): the three sorted
+    // One clamp for the expert ids of the whole chunk: the three sorted
     // gathered products share it, and the clamp of the already in-range plan ids is the identity.
     // The `tokens` and `inverse` takes keep their own clamps: each is consumed once, so a shared
     // clamp would save no node.
@@ -161,9 +160,8 @@ pub(super) fn chunk(
     let experts = ctx.kernels.reduce(ReduceOp::Sum, &ordered, 1, false)?;
     let shared_out = shared_rows(ctx, w, x)?;
     let out = ctx.kernels.binary(BinaryOp::Add, &experts, &shared_out)?;
-    // Packet Q36-BF16-b, as the decode combine of `moe.rs`: the gates are F32, so the weighted
-    // expert sum and the shared expert product are F32. The residual add takes the activation
-    // dtype.
+    // As in the decode combine of `moe.rs`, the gates are F32, so the weighted expert sum and the
+    // shared expert product are F32. The residual add takes the activation dtype.
     let out = to_act(ctx, &out)?;
     Ok((out, routed))
 }
@@ -201,7 +199,7 @@ pub(super) struct DeviceChunk {
 }
 
 /// Runs the MoE of one layer for the `T` rows of `x` `[T, H]` entirely on the device and returns
-/// `[T, H]` with the health of the router block (packet Q36-PF-DEVROUTE). It reads nothing back
+/// `[T, H]` with the health of the router block. It reads nothing back
 /// and imports nothing, so it makes no synchronization; the caller bounds the lazy graph with its
 /// evaluation cadence and checks the stacked health at the chunk end.
 ///
@@ -275,7 +273,7 @@ pub(super) fn chunk_device(
     let keys_f = ctx.kernels.u32_to_f32(&keys)?;
     let order_p = ctx.kernels.argsort(&keys_f, 0)?;
     let sorted_ids = ctx.kernels.take_along_axis(&keys, &order_p, 0)?;
-    // One clamp for the sorted expert ids of the whole chunk (packet GAP-TRIM-A): the three
+    // One clamp for the sorted expert ids of the whole chunk: the three
     // sorted gathered products share it. The clamp of the argsort output is the identity, so the
     // chunk keeps its values bit for bit.
     let sorted_bounded = ctx.kernels.bound_indices(&sorted_ids, dim(m.experts)?)?;
@@ -302,7 +300,7 @@ pub(super) fn chunk_device(
     let order_p_f = ctx.kernels.u32_to_f32(&order_p)?;
     let inverse = ctx.kernels.argsort(&order_p_f, 0)?;
     let eo_flat = ctx.kernels.reshape(&eo, &[pairs, hidden])?;
-    // The fused MoE combine (R4-7, Q36_FUSED_PREFILL=1): the spike-validated kernel takes the
+    // The fused MoE combine (Q36_FUSED_PREFILL=1): the spike-validated kernel takes the
     // un-sort, the F32 gate product, the choice sum, the shared fold, and the activation cast
     // in one pass (no [T, K, H] F32 intermediate). The spike body hardcodes K 8 and HID 2048,
     // so only the production shape engages; anything else keeps the composite tail.
@@ -321,9 +319,8 @@ pub(super) fn chunk_device(
         let weighted = ctx.kernels.binary(BinaryOp::Mul, &ordered, &gates3)?;
         let experts = ctx.kernels.reduce(ReduceOp::Sum, &weighted, 1, false)?;
         let shared_out = shared_rows(ctx, w, x)?;
-        // Packet Q36-BF16-b, as the host chunk and the decode combine: the gates are F32, so
-        // the weighted expert sum and the shared expert product are F32. The residual add
-        // takes the activation dtype.
+        // As in the host chunk and the decode combine, the gates are F32, so the weighted expert
+        // sum and the shared expert product are F32. The residual add takes the activation dtype.
         ctx.kernels.binary(BinaryOp::Add, &experts, &shared_out)?
     };
     let out = to_act(ctx, &out)?;
@@ -637,9 +634,9 @@ mod tests {
             .collect()
     }
 
-    /// Asserts `max |a - b| / max |b| <= tol`, the device-against-host gate of packet
-    /// Q36-PF-DEVROUTE (1e-6 relative in F32: the two paths differ only in the F32 summation
-    /// order of the gate renormalization and the place of the gate product).
+    /// Asserts `max |a - b| / max |b| <= tol`, the device-against-host gate (1e-6 relative in F32:
+    /// the two paths differ only in the F32 summation order of the gate renormalization and the
+    /// place of the gate product).
     fn assert_close_relative(actual: &[f32], expected: &[f32], tol: f64, what: &str) {
         assert_eq!(actual.len(), expected.len(), "{what}: length");
         let (mut diff, mut top) = (0f64, 0f64);
@@ -651,7 +648,7 @@ mod tests {
         assert!(diff / top <= tol, "{what}: relative error {}", diff / top);
     }
 
-    /// Packet Q36-PF-DEVROUTE T3: the device-routed chunk of 8 rows selects the LAYER0_ROUTES
+    /// The device-routed chunk of 8 rows selects the LAYER0_ROUTES
     /// experts (the set per row, and with the gates the rank order), gates them like the host
     /// path, and matches the host-routed chunk of the same rows within 1e-6 relative and the CPU
     /// oracle at the standard parity gate.
@@ -764,8 +761,7 @@ mod tests {
         );
     }
 
-    /// Packet Q36-PF-DEVROUTE T3: a one-row device chunk equals the device decode block on the
-    /// same row.
+    /// A one-row device chunk equals the device decode block on the same row.
     #[test]
     fn a_device_chunk_of_one_row_equals_the_decode_block() {
         let _serial = crate::native_test_lock();
@@ -801,7 +797,7 @@ mod tests {
         );
     }
 
-    /// Packet Q36-PF-DEVROUTE T3: 16 rows, past the 8-row table. The expected routes come from the
+    /// Sixteen rows, past the 8-row table. The expected routes come from the
     /// host path inside the test, not from hard-coded numbers.
     #[test]
     fn a_device_chunk_of_sixteen_rows_matches_the_host_derived_routes() {
@@ -840,7 +836,7 @@ mod tests {
         );
     }
 
-    /// Packet Q36-PF-DEVROUTE fix1 N3a: 1100 rows run the multi-block merge sort of the pair
+    /// A chunk of 1100 rows runs the multi-block merge sort of the pair
     /// keys. The top-k is 2, so the pair axis holds 2200 > 2048 keys and the MLX sort runs its
     /// multi-block merge, as a real 512-row chunk (4096 pairs) does; the rows come from the
     /// `input` pattern (period 13), so the keys hold many duplicate expert ids. The direct
@@ -894,7 +890,7 @@ mod tests {
         );
     }
 
-    /// Packet Q36-PF-DEVROUTE fix1 N3c: a shape whose router does not renormalize the top-k
+    /// A shape whose router does not renormalize the top-k
     /// gates. `HostShape` is plain data, so a copy with `renorm` set to false builds the case
     /// with no production change; the weights are the same and only the gate rule differs. With
     /// no renormalization the gates are the raw top probabilities, the same F32 bits on both
@@ -936,7 +932,7 @@ mod tests {
         );
     }
 
-    /// Packet Q36-PF-DEVROUTE T4: the sorted ids are non-decreasing (the order that
+    /// The sorted ids are non-decreasing (the order that
     /// `gather_qmm_sorted` requires, from `argsort` by definition) and the inverse permutation
     /// restores the token-major order.
     #[test]

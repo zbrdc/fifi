@@ -1,4 +1,4 @@
-//! Unit tests of `StateBook` (test seam U13, approved by the user 2026-10-10). CPU only.
+//! Unit tests of `StateBook`. CPU only.
 use super::book::{Admitted, CommitRefusal, Health, StartRefusal, StateBook, status_error};
 use crate::kernels::cuda::PREFILL_STATUS_BOUND_VIOLATION;
 use crate::kernels::cuda::resident::step_params::MAX_ADVANCE;
@@ -62,7 +62,7 @@ fn a_partial_accept_poisons_because_the_step_already_ran() {
             accepted: 1
         }
     );
-    assert!(text(refusal.into()).contains("RD-7c"));
+    assert!(text(refusal.into()).contains("per-row DeltaNet snapshots"));
     assert_eq!(book.health(), Health::Poisoned, "the step cannot be undone");
     assert_eq!(
         (book.pending_rows(), book.tokens()),
@@ -93,7 +93,7 @@ fn a_partial_accept_poisons_because_the_step_already_ran() {
 
 #[test]
 fn a_status_report_poisons_and_retires_nothing() {
-    // Any non-zero bit poisons in stage 1 (REPLY-76 Q2): the masks alone, combined, and unknown bits.
+    // Any non-zero bit poisons in stage 1: the masks alone, combined, and unknown bits.
     for status in [1, 2, 4, 8, 5, 12, 16, 3, 0x7fff_ffff, -1] {
         let mut book = valid_book(64);
         book.enqueue(1).expect("step");
@@ -139,9 +139,9 @@ fn a_status_refusal_keeps_the_class_and_the_precedence_of_the_wrapper() {
 
 /// The kernels' prefill mask — [`PREFILL_STATUS_BOUND_VIOLATION`], the one Rust mirror of
 /// `prefill/status.h` — maps through `status_error` the way mask 8 must: alone it is a
-/// `prefill_chunk` fault, it beats mask 1, and mask 4 beats it (decision 0049 item 10, lane
-/// C ruling 2026-10-14: "bit 8" in the plan and decision text means mask 8). Without this
-/// pin a kernel writing 0x100 would read back as `step_status`, and 0x101 as `route_experts`.
+/// `prefill_chunk` fault, it beats mask 1, and mask 4 beats it. The fault is mask 8 (the value 8),
+/// not bit 8 (0x100): without this pin a kernel writing 0x100 would read back as `step_status`, and
+/// 0x101 as `route_experts`.
 #[test]
 fn the_kernels_prefill_mask_maps_to_prefill_chunk() {
     let class = |status: i32| match status_error(status) {
@@ -270,10 +270,7 @@ fn a_defect_poison_survives_revalidate_until_reset() {
     let mut book = valid_book(64);
     book.begin_prefill().expect("begin");
     book.poison();
-    assert!(
-        book.revalidate(3, 0).is_err(),
-        "REPLY-47: poisoned until reset"
-    );
+    assert!(book.revalidate(3, 0).is_err(), "poisoned until reset");
     assert_eq!(book.health(), Health::Poisoned);
     assert!(book.begin_prefill().is_err());
     book.begin_reset(OWNER).expect("reset");

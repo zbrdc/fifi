@@ -1,6 +1,5 @@
-//! The resident Qwen3.6 CUDA decode step (decision 0047), packet RD-9a: the pure host planning.
-//! The state owner (RD-9a2), the mixers, the MoE block and the token loop (RD-9b to RD-9d) are
-//! later packets, and chunked prefill (decision 0049) has its own plan beside this one.
+//! The resident Qwen3.6 CUDA decode step: the pure host planning, the state owner, the mixers, the
+//! MoE block and the token loop. Chunked prefill has its own plan beside the decode plan.
 //!
 //! `dims` holds the checked dimensions and the session options; `step_plan` derives the
 //! activation tensors of a decode step and their lifetimes; `state_layout` fixes the byte offsets

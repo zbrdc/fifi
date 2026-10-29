@@ -1,7 +1,7 @@
 //! The `enginesrv` configuration file and command line.
 //!
-//! Decision 0026 fixes the file: one JSON object with the listen address, the name of the
-//! environment variable that holds the API key, and an `engines` array. The file carries no key.
+//! The file is one JSON object with the listen address, the name of the environment variable
+//! that holds the API key, and an `engines` array. The file carries no key.
 
 use crate::family::flash_next::{factory::FAMILY as FLASH_FAMILY, settings::FlashOptions};
 use crate::family::flint::{FAMILY as FLINT_FAMILY, settings::FlintOptions};
@@ -53,9 +53,9 @@ pub(crate) struct Config {
     /// The name of the environment variable that holds the bearer key.
     pub(crate) api_key_env: String,
     /// True when the chat handler marks the last message boundary of each prompt, so that an
-    /// engine can save and restore a prefix state (decision 0036, addendum 1). The default is
-    /// false: the handler then sends no boundary, and no engine saves or restores. One value
-    /// serves every engine of the process. An engine without prefix support ignores it.
+    /// engine can save and restore a prefix state. The default is false: the handler then sends
+    /// no boundary, and no engine saves or restores. One value serves every engine of the
+    /// process. An engine without prefix support ignores it.
     #[serde(default)]
     pub(crate) prefix_reuse: bool,
     pub(crate) engines: Vec<EngineConfig>,
@@ -77,13 +77,13 @@ pub(crate) struct EngineConfig {
     /// Options of the `fake` family only.
     pub(crate) fake: Option<FakeOptions>,
     /// Options of the `qwen3_8_flash_next` family only. The family reads the manifest, the cache
-    /// limit, the vocabulary size, and the prefill chunk from here (packet H8c).
+    /// limit, the vocabulary size, and the prefill chunk from here.
     pub(crate) flash_next: Option<FlashOptions>,
     /// Options shared by `qwen3_6_35b_a3b` and `qwen3_8_27b_dense`.
     /// They read the cache limit, context limit, session cap, and prefill chunk here.
     pub(crate) qwen36: Option<Q36Options>,
     /// Options of the nemotron35 family only. The family reads the backend, the context
-    /// limit, the cache entries, and the prefill chunk from here (packet NEM35-F2).
+    /// limit, the cache entries, and the prefill chunk from here.
     pub(crate) nemotron: Option<NemotronOptions>,
     /// Explicit CUDA pilot context and KV profile; absent on legacy MLX entries.
     pub(crate) flint: Option<FlintOptions>,

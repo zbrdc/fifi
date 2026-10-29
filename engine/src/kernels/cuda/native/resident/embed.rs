@@ -1,7 +1,6 @@
 //! Raw FFI to `inference_cuda_embed_launch` of `native/resident/embed.cu` (declared in
-//! `native/resident/embed.h`): the embedding row gather of the resident step (RD-4c, decision
-//! 0047). Child of `native::resident`, so it inherits the `allow(unsafe_code)` of `native.rs`
-//! (decision 0047, child modules of `native.rs`).
+//! `native/resident/embed.h`): the embedding row gather of the resident step. Child of
+//! `native::resident`, so it inherits the `allow(unsafe_code)` of `native.rs`.
 //!
 //! Safety invariants this module relies on:
 //! - A device range is proved in bounds by `RawRange::new` before it gets here. This module
@@ -16,8 +15,7 @@
 //!   synchronizes the whole device before `cudaFree`.
 //! - The launch entry only queues work on the stream it is given and returns the launch status;
 //!   a fault in the kernel surfaces at the next synchronize.
-//! - Every call runs under the process dispatch guard and on the thread that owns the context
-//!   (decisions 0023 and 0024).
+//! - Every call runs under the process dispatch guard and on the thread that owns the context.
 //! - No raw pointer and no unsafe function leaves this module.
 
 use std::ffi::{c_int, c_void};
@@ -173,8 +171,8 @@ pub(in crate::kernels::cuda) fn embed_launch(
     checked(status, stage)
 }
 
-/// Mirror of `inference_cuda_embed_native_args` in `embed.h` (MATVEC-PAR S2: the native Q4_K
-/// gather of the same contract, against the file's own blocks).
+/// Mirror of `inference_cuda_embed_native_args` in `embed.h` (the native Q4_K gather of the same
+/// contract, against the file's own blocks).
 #[repr(C)]
 struct EmbedNativeArgsRaw {
     blocks: *const c_void,
@@ -547,7 +545,7 @@ mod tests {
         }
     }
 
-    // --- MATVEC-PAR S2: the native twin (KUBDAN-MSG-68 item 6a) -------------------------
+    // --- The native twin ----------------------------------------------------------------
 
     const BLOCKS: usize = 0x50_0000;
 
@@ -578,8 +576,8 @@ mod tests {
     /// call, so the test needs no device. The rows are the terms of `valid_native` in
     /// embed.cu: no type term (the entry is Q4_K by construction), no 8-row rule, and the
     /// row bound is inclusive at 2^28. Each case flips exactly one later term while every
-    /// earlier term of `valid_native` still holds (the S2b lesson: a case refused by an
-    /// earlier guard proves nothing).
+    /// earlier term of `valid_native` still holds (a case refused by an earlier guard proves
+    /// nothing).
     #[test]
     fn the_embed_native_entry_refuses_bad_arguments_before_any_device_call() {
         let refused = (STATUS_INVALID_ARGUMENT, STAGE_NONE);

@@ -1,4 +1,4 @@
-//! The embedding row gather of the resident step (RD-4c, decision 0047, stage 1).
+//! The embedding row gather of the resident step.
 //!
 //! The embedding table stays on the device and the token id is read there, so a captured step
 //! needs no host-known token. A host-table variant is deferred.
@@ -26,7 +26,7 @@
 //! rules mirror `valid()` in `embed.cu`: Rust rejects everything C rejects.
 #![cfg_attr(
     not(test),
-    expect(dead_code, reason = "staged for RD-9a (decision 0047)")
+    expect(dead_code, reason = "staged for the resident decode step")
 )]
 
 use std::ffi::c_int;
@@ -94,11 +94,10 @@ pub(crate) fn check_host_ids(ids: &[i32], n_rows: usize) -> Result<(), EngError>
     }
 }
 
-/// The table, the token ids, the output rows and the step status word of one gather against
-/// the file's own Q4_K blocks (MATVEC-PAR S2 c3): bitwise equal to [`EmbedCall`] on the same
-/// weights, for readers that hold a [`NativeWeight`]. The table is a PLAIN matrix: a
-/// rank-3 stack (`experts() == Some(_)`) is refused. The ids are read when the kernel runs,
-/// as in [`EmbedCall`].
+/// The table, the token ids, the output rows and the step status word of one gather against the
+/// file's own Q4_K blocks: bitwise equal to [`EmbedCall`] on the same weights, for readers that
+/// hold a [`NativeWeight`]. The table is a PLAIN matrix: a rank-3 stack (`experts() == Some(_)`) is
+/// refused. The ids are read when the kernel runs, as in [`EmbedCall`].
 pub(crate) struct EmbedNativeCall<'b> {
     /// The native token embedding, Q4_K.
     pub(crate) weight: &'b NativeWeight,

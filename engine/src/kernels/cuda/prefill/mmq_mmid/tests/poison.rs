@@ -1,12 +1,12 @@
-//! Poisoned router ids through the whole MoE chain (plan rev 3 section B.5 item 5). Rows of
-//! `-1` (RD-5's fault form), `n_experts`, 300, `i32::MIN`, `i32::MAX`, one `-1` among valid ids,
-//! one repeated id and a fully repeated row are written into a chunk of clean rows; the chunk goes
-//! through the builder (guard, then `mm_ids_helper`), the scatter quantize, the gate launch, and
-//! the gather quantize and down launch on the gate's output, and both launches must complete with
-//! in-domain outputs that match the f64 reference computed from the GUARDED rows (every flagged
-//! row reads experts `0..top_k`). The prefill status word reads the literal masks of
-//! `book.rs:91-101`: 1 (`route_experts`) for the fault form alone, 8 (`prefill_chunk`) for any
-//! other flagged row alone, 9 when both are present (8 outranks 1, so it maps to `prefill_chunk`).
+//! Poisoned router ids through the whole MoE chain. Rows of `-1` (the router's fault form),
+//! `n_experts`, 300, `i32::MIN`, `i32::MAX`, one `-1` among valid ids, one repeated id and a fully
+//! repeated row are written into a chunk of clean rows; the chunk goes through the builder (guard,
+//! then `mm_ids_helper`), the scatter quantize, the gate launch, and the gather quantize and down
+//! launch on the gate's output, and both launches must complete with in-domain outputs that match
+//! the f64 reference computed from the GUARDED rows (every flagged row reads experts `0..top_k`).
+//! The prefill status word reads the literal masks of `book.rs:91-101`: 1 (`route_experts`) for the
+//! fault form alone, 8 (`prefill_chunk`) for any other flagged row alone, 9 when both are present
+//! (8 outranks 1, so it maps to `prefill_chunk`).
 //!
 //! The same rows run under compute-sanitizer memcheck in the sanitizer table: the guard's rewrite
 //! to distinct in-range ids is what keeps the store indices of the scatter quantize and the GEMM
@@ -23,15 +23,15 @@ use crate::kernels::cuda::prefill::mmq_mmid::MmidShape;
 use crate::kernels::cuda::resident::matvec_q::QuantType;
 use crate::kernels::cuda::testkit;
 
-/// The frozen NMSE bounds of the gate/up and down classes (0049 A2), as in `launch.rs`.
+/// The frozen NMSE bounds of the gate/up and down classes, as in `launch.rs`.
 const GATE_UP_NMSE: f64 = 1e-3;
 const DOWN_NMSE: f64 = 2e-3;
 
-/// The poisoned rows of a 16-expert bank, by name: whether the row is RD-5's fault form, and its
-/// ids.
+/// The poisoned rows of a 16-expert bank, by name: whether the row is the router's fault form, and
+/// its ids.
 fn poisoned() -> Vec<(&'static str, bool, [i32; 8])> {
     vec![
-        ("all -1 (RD-5's fault form)", true, [-1; 8]),
+        ("all -1 (the router's fault form)", true, [-1; 8]),
         ("id == n_experts", false, [1, 2, 3, 4, 16, 6, 7, 8]),
         ("id 300", false, [300, 2, 3, 4, 5, 6, 7, 8]),
         ("i32::MIN", false, [1, 2, 3, i32::MIN, 5, 6, 7, 8]),

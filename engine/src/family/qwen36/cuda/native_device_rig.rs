@@ -1,9 +1,9 @@
-//! The shared rig of the NATIVE device tests of MATVEC-PAR S3b: the device gate, the
-//! deterministic generator, the Q4_K source builder and host reference, the correct IEEE-half
-//! decoder, and the derived activation-quantization bound (its statement lives with it). Pure
-//! host code beside `device_present`; CPU-tested here, device-used by the block tests.
+//! The shared rig of the NATIVE device tests: the device gate, the deterministic generator, the
+//! Q4_K source builder and host reference, the correct IEEE-half decoder, and the derived
+//! activation-quantization bound (its statement lives with it). Pure host code beside
+//! `device_present`; CPU-tested here, device-used by the block tests.
 //!
-//! # Isolation (git-db's rule, the MSG-73 latch)
+//! # Isolation
 //!
 //! `kernels/cuda/guard.rs` sets the backend TERMINAL when a device owner drops while
 //! `thread::panicking()`. Every assert or expect that unwinds with a live owner therefore
@@ -55,7 +55,7 @@ const D_SCALES: [u16; 2] = [0x0400, 0x0600];
 const DMIN_SCALES: [u16; 2] = [0x0200, 0x0300];
 
 /// The correct IEEE-754 binary16 decoder: sign, 5 exponent bits, 10 fraction bits, subnormals
-/// (exp 0: frac * 2^-24), infinities and NaNs preserved as f32 counterparts (MSG-73 F2).
+/// (exp 0: frac * 2^-24), infinities and NaNs preserved as f32 counterparts.
 pub(super) fn f16(bits: u16) -> f32 {
     let (sign, exp, frac) = (bits >> 15, (bits >> 10) & 0x1F, bits & 0x3FF);
     let value = match (exp, frac) {
@@ -101,7 +101,7 @@ pub(super) fn q4k_rows(rows: usize, k: usize, rng: &mut Rng) -> Vec<u8> {
     bytes
 }
 
-/// The dequantized weight `i` of one Q4_K block (ggml's Q4_K layout, S1's reference).
+/// The dequantized weight `i` of one Q4_K block (ggml's Q4_K layout).
 pub(super) fn q4k_value(block: &[u8], i: usize) -> f64 {
     fn scale_min(scales: &[u8], j: usize) -> (i32, i32) {
         if j < 4 {
@@ -140,15 +140,14 @@ pub(super) fn row_l1(source: &[u8], row: usize, k: usize) -> f64 {
 /// half-stored-scale term), so
 /// `|native_i - tiled_i| <= A * L1_i * ((1/2 + 127*2^-11)/127 + 2^-10 + 2^-18)` (the q8_1
 /// term, the Tiled fp16 pack/dequant terms 2^-11 each, the two matvecs' f32 accumulation
-/// slack 64*2^-24 each, S1's bound). No tuned constant; the caller passes each hop's own A
-/// (MSG-74 item 1).
+/// slack 64*2^-24 each). No tuned constant; the caller passes each hop's own A.
 pub(super) fn hop_bound(l1: f64, a: f64) -> f64 {
     a * l1 * ((0.5 + 127.0 / 2048.0) / 127.0 + 1.0 / 1024.0 + 1.0 / 262_144.0)
 }
 
 /// The synthetic layer: 16 experts over hidden 256, inter 256, top_k 8 - MORE experts than
 /// picks, so the router's choice is a real subset and its order/weights are checkable against
-/// a host reference (MSG-73 F5); shared inter 256.
+/// a host reference; shared inter 256.
 pub(super) const DIMS: MoeDims = MoeDims {
     rows: 1,
     hidden: 256,
@@ -245,7 +244,7 @@ pub(super) fn tiled(
 /// One Q4_K upload as the file's own blocks, with the stack depth recorded EXACTLY as
 /// production records it (`CudaProjector::upload_quant`: `.with_experts(stack_depth(..))`,
 /// family/project/cuda.rs ~523-566) - a NativeWeight carries no depth of its own and the
-/// block's facts read depth 0 without it (MSG-73 F1).
+/// block's facts read depth 0 without it.
 pub(super) fn native_stack(
     ctx: &CudaContext,
     source: &[u8],
@@ -262,9 +261,9 @@ pub(super) fn native_stack(
     .map(|w| w.with_experts(Some(experts)))
 }
 
-/// The whole weight set of one layout, OWNED (no leaks - MSG-73 F4: leaked buffers hold the
-/// adapter leases, and MAX_LEASES is 2). The stack/projection borrows live inside this struct,
-/// so the device phase can build it, run, and drop everything by value.
+/// The whole weight set of one layout, OWNED (no leaks: leaked buffers hold the adapter leases, and
+/// MAX_LEASES is 2). The stack/projection borrows live inside this struct, so the device phase can
+/// build it, run, and drop everything by value.
 pub(super) struct RigWeights {
     stacks: Vec<crate::kernels::cuda::NativeWeight>,
     denses: Vec<crate::kernels::cuda::NativeWeight>,
@@ -378,7 +377,7 @@ pub(super) fn rig_weights_agree(
     Ok(())
 }
 
-/// The pure pieces: the f16 decoder pinned against IEEE literals (MSG-73 F2), the Q4_K
+/// The pure pieces: the f16 decoder pinned against IEEE literals, the Q4_K
 /// reference decoding its own builder's blocks, the bound finite and positive, the router
 /// reference well-formed.
 #[test]

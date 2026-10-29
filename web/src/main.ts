@@ -227,14 +227,14 @@ function main(): void {
     if (pollOutstanding) return; // Skip a tick while a poll is in flight.
     pollOutstanding = true;
     try {
-      // The live speed panel (SF-A): whenever the Monitor view is on
+      // The live speed panel: whenever the Monitor view is on
       // screen — server up, starting, or down — the poll calls the full
       // guarded refresh, so health, readiness, models, and the ring move
       // under one truth and one timestamp; a dead engine can never keep
-      // last-good "runs"/"ready" next to a current time (Opus MF1). The
-      // decision lives in the DOM-free panel module (pollPlan, Sol MF2)
-      // and is table-tested there, offline row included. The extra
-      // fetches per tick are cheap; correctness beats the saving.
+      // last-good "runs"/"ready" next to a current time. The decision
+      // lives in the DOM-free panel module (pollPlan) and is table-tested
+      // there, offline row included. The extra fetches per tick are cheap;
+      // correctness beats the saving.
       if (
         pollPlan({
           monitorVisible: currentView === "monitor",

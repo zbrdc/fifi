@@ -1,4 +1,4 @@
-//! The Rust reference of the canonical device sampler (IMPL-DEVSAMPLE-1, Design 2). Test-only.
+//! The Rust reference of the canonical device sampler. Test-only.
 //!
 //! The CUDA kernels must reproduce `reference_sample` bit for bit (parity level P1). It is
 //! deliberately naive: a full sort, then sequential sums over exact integers. The device
@@ -190,7 +190,7 @@ fn select(weights: &[u64], theta: u64) -> Option<(usize, u64)> {
     None
 }
 
-/// The canonical draw of one row by full sort and sequential exact sums (Design 2).
+/// The canonical draw of one row by full sort and sequential exact sums.
 ///
 /// `unit` is the 53-bit unit; `unit(seed, p)` makes it, and the device tests inject it.
 pub(crate) fn reference_sample(

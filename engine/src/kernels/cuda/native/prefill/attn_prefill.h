@@ -1,14 +1,13 @@
-/* CPF-ATTN-A K2: launch entry of attn_prefill, the flash-style chunked-prefill attention
- * (decision 0049 items 1, 2 and 10; the CPF-5a/5b kernel of design section 3.7), one header
- * per kernel file (the lane C ruling the resident tree records); abi_resident.h stays closed.
+/* Launch entry of attn_prefill, the flash-style chunked-prefill attention, one header per
+ * kernel file; abi_resident.h stays closed.
  *
  * What it computes, per token t of m and query head h (kv head kh = h / G, G selected
  * by n_head / n_kv_head) over the keys j <= P with P = p0 + t (causal by ABSOLUTE position):
  *   out[t][h][:] = sigmoid(gate[t][h][:]) * sum_j softmax_j(scale * qhat . K[j][kh]) * V[j][kh]
  * with qhat = q rounded to fp16 (q is f32), K and V read from the KV cache, the probabilities
- * rounded to fp16 for the P*V product and everything else accumulated in f32 (PA1's reference
- * form: "on fp16 Q, K and V"). Two launches on the caller's stream, the attn_decode structure
- * scaled by a query-tile dimension:
+ * rounded to fp16 for the P*V product and everything else accumulated in f32 (the reference form of
+ * the prefill-attention tolerance: "on fp16 Q, K and V"). Two launches on the caller's stream, the
+ * attn_decode structure scaled by a query-tile dimension:
  *   attn_prefill_part_dsplit_k  grid (q_tiles, n_kv_head, max_splits), 512 threads, q_tile 8:
  *                          a block owns one query tile (8 tokens x 8 heads = 64 rows) of one
  *                          kv head and one key range, the heaviest causal tiles first; its 16
@@ -18,11 +17,10 @@
  *   attn_prefill_combine_k grid (n_head, m), 256 threads: merges the partials of the active
  *                          splits in split-index order (exact block max, fixed-order sums),
  *                          divides and applies the sigmoid output gate when proj is given.
- * The device split rule is attn_decode's split_plan verbatim, evaluated per q_tile over its
- * key range: the union of its rows' windows (all p0 + tile_end keys with no window); every
- * block and the combine recompute the same deterministic plan from the launch arguments.
- * kv_len is a HOST value in prefill (no device word, 0049 item 1), so capture is trivial
- * and eager is the mode.
+ * The device split rule is attn_decode's split_plan verbatim, evaluated per q_tile over its key
+ * range: the union of its rows' windows (all p0 + tile_end keys with no window); every block and
+ * the combine recompute the same deterministic plan from the launch arguments. kv_len is a HOST
+ * value in prefill (no device word), so capture is trivial and eager is the mode.
  *
  * Layout (device pointers):
  *   q        f32 [m][n_head][head_dim] (attn_prep_chunk's q), 16-byte aligned.
@@ -32,51 +30,46 @@
  *            denominator mass once after merging all parts, with no value vector.
  *   k_cache, v_cache  fp16 [cache_rows][n_kv_head][head_dim], 16-byte aligned (kv_mode 0).
  *   The four kv8_* pointers and kv8_capacity are the Int8G32 planes of state_layout.rs; they
- *            are NULL and 0 while kv_mode is 0 (the KV8 loader lands with IMPL-KV8-A).
+ *            are NULL and 0 while kv_mode is 0 (a later change adds the KV8 loader).
  *   part     f32 scratch of inference_cuda_attn_prefill_part_floats(m, n_kv_head, head_dim,
  *            max_splits, G) floats, 16-byte aligned, no initialization needed; only the active
  *            splits of each cell are written.
  *   out      f32 [m][n_head * head_dim], 16-byte aligned; NaN on a refused launch.
- *   status   NULL, or one device i32: the prefill status word of decision 0049 item 10.
+ *   status   NULL, or one device i32: the prefill status word of prefill/status.h.
  *
- * Window and ring (the attn_decode rules, included for MEL-P1): window = 0 attends to all
- * keys; window = W > 0 attends to the last min(P + 1, W) positions. ring = 0 is a linear
- * cache (row = position); ring = R > 0 (needs window > 0 and window + m - 1 <= R <=
- * cache_rows) puts position p in row p % R. Ring positions are absolute: p0 + m <= 2^30 - 1,
- * independent of physical cache_rows. The immutable union of all m query windows must be
- * staged before the call; do not overwrite it with the final W-row tail until consumption.
+ * Window and ring (the attn_decode rules, included for the Mellum chunk path): window = 0 attends
+ * to all keys; window = W > 0 attends to the last min(P + 1, W) positions. ring = 0 is a linear
+ * cache (row = position); ring = R > 0 (needs window > 0 and window + m - 1 <= R <= cache_rows)
+ * puts position p in row p % R. Ring positions are absolute: p0 + m <= 2^30 - 1, independent of
+ * physical cache_rows. The immutable union of all m query windows must be staged before the call;
+ * do not overwrite it with the final W-row tail until consumption.
  *
- * Poison rule (decision 0049 item 2: the device checks p0/m again; item 10: mask 8): if
- * p0 < 0 or (long long)p0 + m exceeds cache_rows (linear) or 2^30 - 1 (ring/segmented),
- * the part kernel writes no partial, the combine
- * kernel writes NaN to out, and each ORs mask 8
- * (INFERENCE_CUDA_PREFILL_STATUS_BOUND_VIOLATION) into *status when status != NULL. A valid
- * launch touches neither.
+ * Poison rule (the device checks p0/m again): if p0 < 0 or (long long)p0 + m exceeds cache_rows
+ * (linear) or 2^30 - 1 (ring/segmented), the part kernel writes no partial, the combine kernel
+ * writes NaN to out, and each ORs mask 8 (INFERENCE_CUDA_PREFILL_STATUS_BOUND_VIOLATION) into
+ * *status when status != NULL. A valid launch touches neither.
  *
- * The D256 MMA part uses 96 KB of dynamic shared memory; D128 uses 64 KB (two cp.async
- * K/V stages and a 32 KB score exchange). The entry opts in above the 48 KB default with
- * cudaFuncSetAttribute once per variant (the vendored gemm.cuh pattern), one block per SM.
- * Code compiled for sm_72 (__CUDA_ARCH__ < 800; the entry selects by the loaded code's PTX
- * arch) runs an fp32 SIMT part kernel instead, attn_prefill_part_simt_k (grid (max_splits,
- * n_kv_head, q_tiles), 128 threads), requesting 96/48 KB for D256/D128; it computes the
- * same result within the PA1 bound, not bit for bit. It is compile-only in this packet
- * (decision 0049 item 14; no board run).
+ * The D256 MMA part uses 96 KB of dynamic shared memory; D128 uses 64 KB (two cp.async K/V stages
+ * and a 32 KB score exchange). The entry opts in above the 48 KB default with cudaFuncSetAttribute
+ * once per variant (the vendored gemm.cuh pattern), one block per SM. Code compiled for sm_72
+ * (__CUDA_ARCH__ < 800; the entry selects by the loaded code's PTX arch) runs an fp32 SIMT part
+ * kernel instead, attn_prefill_part_simt_k (grid (max_splits, n_kv_head, q_tiles), 128 threads),
+ * requesting 96/48 KB for D256/D128; it computes the same result within the prefill-attention
+ * tolerance, not bit for bit. It is compile-only (no board run).
  *
  * Legacy F16 NaN isolation is per 64-row query tile, not per row: a NaN V cell inside a tile's key range
  * reaches every row of that tile (a row that does not see the key still multiplies p = 0 by
  * it), and a NaN q row reaches only its own row. A cell outside every tile's key range is
  * never read (the loader zero-fills past the range).
  *
- * Legacy F16: head_dim 128/256 and GQA 1/8. Tagged Q8 affine: D64/128/256 and
- * any positive integral GQA within the 64MiB partial budget; F32 Q and accumulators,
- * independent F16/BF16/F32 scalar planes, optional bias, no temporary F16 cache.
- * Q8 reads only keys visible to each row; signed/G32/F16-scale/no-bias is
- * Q8_0-equivalent separated planes, not the raw interleaved GGUF block layout.
- * In both paths,
- * every geometry value stays a run-time argument (lane C condition 8) and a value the entry
- * refuses returns INFERENCE_CUDA_INVALID_ARGUMENT before any launch, never an assertion
- * inside a kernel. The launch is asynchronous on stream (NULL: the default stream; the Rust
- * wrapper always passes one) and never synchronizes.
+ * Legacy F16: head_dim 128/256 and GQA 1/8. Tagged Q8 affine: D64/128/256 and any positive integral
+ * GQA within the 64MiB partial budget; F32 Q and accumulators, independent F16/BF16/F32 scalar
+ * planes, optional bias, no temporary F16 cache. Q8 reads only keys visible to each row;
+ * signed/G32/F16-scale/no-bias is Q8_0-equivalent separated planes, not the raw interleaved GGUF
+ * block layout. In both paths, every geometry value stays a run-time argument and a value the entry
+ * refuses returns INFERENCE_CUDA_INVALID_ARGUMENT before any launch, never an assertion inside a
+ * kernel. The launch is asynchronous on stream (NULL: the default stream; the Rust wrapper always
+ * passes one) and never synchronizes.
  */
 #ifndef INFERENCE_CUDA_PREFILL_ATTN_PREFILL_H
 #define INFERENCE_CUDA_PREFILL_ATTN_PREFILL_H
@@ -90,7 +83,7 @@ extern "C" {
 #endif
 
 /* kv_mode 0: the fp16 planes k_cache/v_cache. kv_mode 1 (the Int8G32 loader) arrives with
- * IMPL-KV8-A and is refused while the four kv8 pointers must be NULL. */
+ * the KV8 cache path and is refused while the four kv8 pointers must be NULL. */
 #define INFERENCE_CUDA_PREFILL_KV_FP16 0
 #define INFERENCE_CUDA_PREFILL_KV_KV8 1
 
@@ -182,17 +175,17 @@ int inference_cuda_attn_prefill_combine_launch(const inference_cuda_attn_prefill
                                                void *stream, int *out_stage);
 
 #ifdef INFERENCE_CUDA_FAULT_QUALIFICATION
-/* Qualified fault path (decision 0049 item 2's device re-check): validates every rule of the
- * entry EXCEPT the p0/m bound, then forces p0 = -1 for both linear and ring calls. The KERNELS'
- * own device guards (no partial, NaN out, mask 8) are the code under test. The validating
- * entry above can never reach them with bad bounds. */
+/* Qualified fault path (the device re-check of the launch arguments): validates every rule of the
+ * entry EXCEPT the p0/m bound, then forces p0 = -1 for both linear and ring calls. The KERNELS' own
+ * device guards (no partial, NaN out, mask 8) are the code under test. The validating entry above
+ * can never reach them with bad bounds. */
 int inference_cuda_attn_prefill_fault_bad_bounds_launch(
     const inference_cuda_attn_prefill_args *args, void *stream, int *out_stage);
 #endif
 
 #ifdef INFERENCE_CUDA_Q8_REFERENCE
-/* Fixture builds only (A ruling 01a18101): the q8 part kernel with the pre-hoist per-element
- * math, so one ELF can compare old vs new byte for byte. Requires q8 views like the Q8 path. */
+/* Fixture builds only: the q8 part kernel with the pre-hoist per-element math, so one ELF can
+ * compare old vs new byte for byte. Requires q8 views like the Q8 path. */
 int inference_cuda_attn_prefill_q8_reference_launch(
     const inference_cuda_attn_prefill_args *args, void *stream, int *out_stage);
 #endif

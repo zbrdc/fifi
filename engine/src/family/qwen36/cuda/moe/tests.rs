@@ -1,6 +1,6 @@
-//! CPU-only unit tests of the pure MoE planning (decision 0047 item 9, seam U13): the documented
-//! op order, the slot lifetimes of the real RD-9a plan, aliasing over the launch positions, and
-//! the pure refusals of `check_block`. No device, no kernel.
+//! CPU-only unit tests of the pure MoE planning: the documented op order, the slot lifetimes of
+//! the real step plan, aliasing over the launch positions, and the pure refusals of
+//! `check_block`. No device, no kernel.
 
 use super::super::super::host::HostShape;
 use super::super::dims::{KvMode, StepDims, StepOptions};
@@ -248,7 +248,7 @@ fn sequence_has_the_documented_order() {
     );
 }
 
-/// T2 (H1): every slot an op touches is live in its phase, in the real plan at one row.
+/// Every slot an op touches is live in its phase, in the real plan at one row.
 #[test]
 fn ops_stay_inside_their_slot_lifetimes() {
     let plan = plan(1);
@@ -272,9 +272,9 @@ fn ops_stay_inside_their_slot_lifetimes() {
     }
 }
 
-/// T3 (H2, H3): slots whose planned byte ranges share bytes are never live at the same launch
-/// position. The span of a slot runs from its first touch to its last; two spans that intersect
-/// while the byte ranges overlap is the write-then-still-needed hazard.
+/// Slots whose planned byte ranges share bytes are never live at the same launch position. The
+/// span of a slot runs from its first touch to its last; two spans that intersect while the
+/// byte ranges overlap is the write-then-still-needed hazard.
 #[test]
 fn aliased_slots_are_never_live_together() {
     let plan = plan(1);
@@ -388,7 +388,7 @@ fn block_refuses_shape_mismatches_before_launch() {
 }
 
 /// The NATIVE sequence as a literal: the router first and the combine last (their places and
-/// bytes are the OFF-T hook's), the per-slot triples collapsed to one merged launch each.
+/// bytes are the tiered hook's), the per-slot triples collapsed to one merged launch each.
 #[test]
 fn the_native_moe_sequence_is_the_ten_merged_ops() {
     let want: Vec<MoeOp> = vec![
@@ -408,9 +408,9 @@ fn the_native_moe_sequence_is_the_ten_merged_ops() {
     assert_eq!(moe_sequence(4, WeightLayout::Native), want);
 }
 
-/// T2 of the packet, on the native list: every slot an op touches is live in its phase in the
-/// NATIVE plan, and two slots that share bytes are never live at the same launch position
-/// (T3's rule, spelled over the merged ops).
+/// On the native list: every slot an op touches is live in its phase in the NATIVE plan, and
+/// two slots that share bytes are never live at the same launch position (the aliasing rule,
+/// spelled over the merged ops).
 #[test]
 fn native_moe_ops_stay_inside_their_slot_lifetimes() {
     let plan = plan_of(WeightLayout::Native);

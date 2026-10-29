@@ -1,6 +1,6 @@
-//! `family::qwen36::cuda::gate`: the ONE public item of the stage 1 gate (decision 0047 item 11).
+//! `family::qwen36::cuda::gate`: the ONE public item of the stage 1 gate.
 //!
-//! RD-10a-17 wires the device loop of `run.rs` into `run_step_gate`.
+//! `run_step_gate` runs the device loop of `run.rs`.
 //! The `pub` items of the whole `family::qwen36` tree are exactly `qwen36`, `cuda`, `gate`, `run_step_gate`,
 //! `GateSettings` and `GateReport` (a source check, `public_items.py`, asserts it). The two types keep PRIVATE fields: the
 //! binary builds a `GateSettings` from a JSON text (`str::parse`, the `FromStr` impl) and reads the report as text
@@ -32,19 +32,19 @@ pub struct GateSettings {
     forced_stream_sha256: Vec<String>,
     gen_tokens: u32,
     runs: u32,
-    /// true = the captured graph path (RD-11a), false = the uncaptured launches of the same code.
+    /// true = the captured graph path, false = the uncaptured launches of the same code.
     capture: bool,
-    /// The KV mode of the call (KV8-B B4): "fp16" (the control) or "int8g32". The legacy
-    /// boolean `kv_fp16` is refused with a pointer to this key.
+    /// The KV mode of the call: "fp16" (the control) or "int8g32". The legacy boolean `kv_fp16` is
+    /// refused with a pointer to this key.
     kv_mode: KvMode,
     /// Wall-clock budget of the call in seconds (0 = none); on expiry the report is `incomplete`.
     deadline_secs: u32,
-    /// The LOAD layout of the call (MATVEC-PAR S3b): "native" (the default when the key is
-    /// absent, since the S3c qualification) or "tiled". It chooses only how the tensors are uploaded; the step's layout
-    /// always follows the loaded weights.
+    /// The LOAD layout of the call: "native" (the default when the key is absent) or "tiled". It
+    /// chooses only how the tensors are uploaded; the step's layout always follows the loaded
+    /// weights.
     layout: WeightLayout,
-    /// The tiered expert mode (OFF-2), or `None` for the plain native step; never on without the
-    /// optional `tiered` member.
+    /// The tiered expert mode, or `None` for the plain native step; never on without the optional
+    /// `tiered` member.
     tiered: Option<TieredPlan>,
 }
 
@@ -142,8 +142,8 @@ fn flag(v: &Value, key: &str) -> Result<bool, EngError> {
         .ok_or_else(|| EngError::BadRequest(format!("gate settings: {key} is not a boolean")))
 }
 
-/// The `kv_mode` member (KV8-B B4): "fp16" or "int8g32", anything else is a typed error naming
-/// the key; the legacy boolean `kv_fp16` of the stage-1 schema is refused pointing at `kv_mode`.
+/// The `kv_mode` member: "fp16" or "int8g32", anything else is a typed error naming the key; the
+/// legacy boolean `kv_fp16` of the stage-1 schema is refused pointing at `kv_mode`.
 fn kv_mode_member(v: &Value) -> Result<KvMode, EngError> {
     if v.get("kv_fp16").is_some() {
         return Err(EngError::BadRequest(
@@ -163,11 +163,10 @@ impl FromStr for GateSettings {
     type Err = EngError;
 
     /// Keys: gguf, gguf_sha256, names, prompts, forced, forced_stream_sha256, gen_tokens, runs,
-    /// capture, kv_mode ("fp16", the control, or "int8g32"; KV8-B B4), deadline_secs, and the
-    /// optional keys `layout` ("native", the default
-    /// since the S3c qualification, or "tiled"; MATVEC-PAR S3b) and `tiered` (OFF-2; absent means
-    /// off, refused with capture and with the tiled layout). A missing or mistyped key is a typed `BadRequest`, never a
-    /// default.
+    /// capture, kv_mode ("fp16", the control, or "int8g32"), deadline_secs, and the optional keys
+    /// `layout` ("native", the default, or "tiled") and `tiered` (absent means off, refused with
+    /// capture and with the tiled layout). A missing or mistyped key is a typed `BadRequest`, never
+    /// a default.
     fn from_str(text: &str) -> Result<Self, EngError> {
         let v: Value = serde_json::from_str(text)
             .map_err(|e| EngError::BadRequest(format!("gate settings: {e}")))?;
@@ -183,8 +182,8 @@ impl FromStr for GateSettings {
             capture: flag(&v, "capture")?,
             kv_mode: kv_mode_member(&v)?,
             deadline_secs: number(&v, "deadline_secs")?,
-            // The ONE optional key (MATVEC-PAR S3b): absent means native (the S3c-qualified
-            // default), anything but "tiled" and "native" is a typed error naming the key.
+            // The ONE optional key: absent means native (the qualified default), anything but
+            // "tiled" and "native" is a typed error naming the key.
             layout: match v.get("layout") {
                 None => WeightLayout::Native,
                 Some(value) => match value.as_str() {
@@ -211,8 +210,8 @@ impl FromStr for GateSettings {
                     .to_owned(),
             ));
         }
-        // KV8-B B4: the Int8G32 KV mode takes the native layout (the step plan refuses the
-        // Tiled Int8G32 plan too, `check_layout_rows`); the control keeps both layouts.
+        // The Int8G32 KV mode takes the native layout (the step plan refuses the Tiled Int8G32 plan
+        // too, `check_layout_rows`); the control keeps both layouts.
         if s.kv_mode == KvMode::Int8G32 && s.layout != WeightLayout::Native {
             return Err(EngError::BadRequest(
                 "gate settings: the Int8G32 KV mode takes the native layout; Tiled is the fp16 \
@@ -236,7 +235,7 @@ impl fmt::Display for GateReport {
 }
 
 /// Runs the gate: the settings checks, the load, the memory admission and the device loop of
-/// `run.rs` (RD-10a-17).
+/// `run.rs`.
 pub fn run_step_gate(settings: &GateSettings) -> Result<GateReport, EngError> {
     run::device_gate(settings)
 }
@@ -396,7 +395,7 @@ mod tests {
             .to_string(),
             "{\"a\":1}"
         );
-        // The refusals below come before a context exists, so none needs a device (U13).
+        // The refusals below come before a context exists, so none needs a device.
         // The legacy boolean kv_fp16 points at its replacement, and an unknown kv_mode value
         // is a typed error naming the key and both accepted values.
         let legacy = GOOD.replace("\"kv_mode\":\"fp16\"", "\"kv_fp16\":true");

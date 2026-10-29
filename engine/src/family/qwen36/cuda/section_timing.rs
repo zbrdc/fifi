@@ -1,15 +1,14 @@
-//! The section-timing marks of one captured decode token (packet B1, in-graph section timer).
-//! Pure host code: which token sections carry in-graph timing events, and how the marked
-//! sections extrapolate to a whole token.
+//! The section-timing marks of one captured decode token (the in-graph section timer). Pure host
+//! code: which token sections carry in-graph timing events, and how the marked sections extrapolate
+//! to a whole token.
 //!
-//! The idea is DeepInfer's graph timer (ledger `deepinfer-774ce24/B-kernels-moe-attention-quant.md`
-//! lines 40 and 71): events recorded with the external-record flag inside a stream capture
-//! become event-record nodes of the captured graph, so a replay re-records them and the host
-//! reads the sections after the replay's read-back, with no re-capture. Only one layer of each
-//! run of identical layers is timed and scaled by the run size, which keeps the node count low
-//! (every extra event node costs replay time on a ~6.6 ms step). DeepInfer marks the second
-//! layer of each group; a run of one layer marks its only layer, since a singleton has no
-//! second and is its own representative.
+//! The idea is DeepInfer's graph timer: events recorded with the external-record flag inside a
+//! stream capture become event-record nodes of the captured graph, so a replay re-records them
+//! and the host reads the sections after the replay's read-back, with no re-capture. Only one
+//! layer of each run of identical layers is timed and scaled by the run size, which keeps the
+//! node count low (every extra event node costs replay time on a ~6.6 ms step). DeepInfer
+//! marks the second layer of each group; a run of one layer marks its only layer, since a
+//! singleton has no second and is its own representative.
 //!
 //! The sections follow `step_ops::token_ops`: the embedding, one mixer+MoE pair per marked
 //! layer, the tail (`FinalNorm`..`Advance`), and one whole-token pair around everything.
@@ -154,9 +153,8 @@ impl SectionTimes {
                 .sum::<f32>()
     }
 
-    /// The summed section time over the measured whole-token time. The qualification
-    /// target of the packet reads this within 3% of 1 (`B-kernels-moe-attention-quant.md:71`);
-    /// it leans below 1 by the gaps named on `extrapolated_ms`.
+    /// The summed section time over the measured whole-token time. The qualification target reads
+    /// this within 3% of 1; it leans below 1 by the gaps named on `extrapolated_ms`.
     pub(super) fn whole_ratio(&self) -> f32 {
         self.extrapolated_ms() / self.whole_ms
     }

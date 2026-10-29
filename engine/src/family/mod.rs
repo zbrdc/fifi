@@ -1,12 +1,12 @@
 mod config;
 #[allow(
     dead_code,
-    reason = "H4 and the executors of H8 use the history call, the decoder and sampler fields, and the constructors; until then only the worker and tests use the seam"
+    reason = "the executors use the history call, the decoder and sampler fields, and the constructors; until they do, only the worker and tests use the seam"
 )]
 pub(crate) mod executor;
 #[allow(
     dead_code,
-    reason = "decision 0035: the executor task wires the Flash-Next step; until then only tests and the Mac parity tests call it"
+    reason = "an executor wires the Flash-Next step; until it does, only tests and the Mac parity tests call it"
 )]
 pub(crate) mod flash_next;
 pub mod flint;
@@ -17,25 +17,25 @@ pub mod layer_weights;
 pub mod nemotron35;
 #[allow(
     dead_code,
-    reason = "decision 0035: the Projector seam serves the Flash-Next step and the planned CUDA adapter of decision 0040; until the executor wires them, only tests call it"
+    reason = "the Projector seam serves the Flash-Next step and the planned Qwen3.6 CUDA adapter; until an executor wires them, only tests call it"
 )]
 pub(crate) mod project;
 pub mod quantization;
 #[allow(
     dead_code,
-    reason = "decision 0046 draft: the Q36 host reference serves later packets; until they land only tests and the Mac reference run call it"
+    reason = "the Q36 host reference serves later work; until it lands, only tests and the Mac reference run call it"
 )]
 pub mod qwen36;
 pub mod recurrent;
 pub mod route;
 #[allow(
     dead_code,
-    reason = "H8 and the server jobs build samplers; until then only GenerationState and tests use them"
+    reason = "the executors and the server jobs build samplers; until they do, only GenerationState and tests use them"
 )]
 pub(crate) mod sampler;
 #[allow(
     dead_code,
-    reason = "packet Q36-F1: the Flash-Next executor (Mac only) and the Q36 executor use the session; until then only tests call it"
+    reason = "the Flash-Next executor (Mac only) and the Q36 executor use the session; until they do, only tests call it"
 )]
 pub(crate) mod session;
 pub mod spec;

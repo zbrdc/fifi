@@ -1,6 +1,5 @@
-//! Host tests of the prefill chunk loop's pure layer (CPF-7a part 2, D.1). Real dims from
-//! `common_tests::dims()`; every refusal row reaches its own guard with every other guard
-//! satisfied and asserts its own text.
+//! Host tests of the prefill chunk loop's pure layer. Real dims from `common_tests::dims()`; every
+//! refusal row reaches its own guard with every other guard satisfied and asserts its own text.
 
 use super::{
     common_tests,
@@ -139,8 +138,8 @@ fn segmented_launch_counts_are_visible_and_reset_between_jobs() {
     assert!(!report.job_line().contains("segmented_parts"));
 }
 
-/// H5: the slot column of `chunk_tensors` is a permutation of `ALL_SLOTS` at every ladder
-/// size, so a slot added to the plan without this module fails here.
+/// The slot column of `chunk_tensors` is a permutation of `ALL_SLOTS` at every ladder size, so a
+/// slot added to the plan without this module fails here.
 #[test]
 fn prefill_views_cover_every_slot_once() {
     for m_sess in M_LADDER {
@@ -154,8 +153,7 @@ fn prefill_views_cover_every_slot_once() {
     }
 }
 
-/// H6: one row per guard of `ChunkRows::new`, each with the others satisfied, plus the
-/// accepting edges. Kills 7a-M7.
+/// One row per guard of `ChunkRows::new`, each with the others satisfied, plus the accepting edges.
 #[test]
 fn chunk_rows_refuse_each_bound() {
     let (cap, m_sess) = (4_096usize, 128usize);
@@ -186,8 +184,8 @@ fn chunk_rows_refuse_each_bound() {
     );
 }
 
-/// H9: one row per guard of the view checks, each with every earlier guard satisfied; then
-/// `slot_position`. Kills 7a-V1, V2, V3, V5, V6, V7.
+/// One row per guard of the view checks, each with every earlier guard satisfied; then
+/// `slot_position`.
 #[test]
 fn view_list_refuses_each_guard() {
     let slots: Vec<_> = ALL_SLOTS.to_vec();
@@ -198,7 +196,7 @@ fn view_list_refuses_each_guard() {
         };
         text.clone()
     };
-    // The valid list (V1-V3 accepted).
+    // The valid list (V1, V2 and V3 accept it).
     assert!(check_view_list(35, &slots).is_ok());
     // V1: the arena one short of the full list.
     let v1 = text(34, &slots);
@@ -277,7 +275,7 @@ fn view_list_refuses_each_guard() {
     );
 }
 
-/// H2: the stage lists equal the plan table, and a third kind refuses.
+/// The stage lists equal the plan table, and a third kind refuses.
 #[test]
 fn prefill_stage_order_is_the_plan_table() {
     assert_eq!(
@@ -336,8 +334,8 @@ fn prefill_stage_order_is_the_plan_table() {
     );
 }
 
-/// H3: at every ladder size, each stage's phase lies inside the lifetime of every slot it
-/// reads or writes, and the phases never decrease along the embedding plus each layer list.
+/// At every ladder size, each stage's phase lies inside the lifetime of every slot it reads or
+/// writes, and the phases never decrease along the embedding plus each layer list.
 #[test]
 fn prefill_stages_touch_only_live_slots() {
     for m_sess in M_LADDER {
@@ -383,7 +381,7 @@ fn prefill_stages_touch_only_live_slots() {
     }
 }
 
-/// H7: the layout map and the mixed-buffer refusal. Kills 7a-M9 and 7a-Q1.
+/// The layout map and the mixed-buffer refusal.
 #[test]
 fn q8_layouts_refuse_a_mixed_buffer() {
     for (quant, want) in [
@@ -406,8 +404,7 @@ fn q8_layouts_refuse_a_mixed_buffer() {
     assert!(check_q8_layouts(&[(ChunkSlot::Q8S, &[QuantType::Q4K, QuantType::Q4K])]).is_ok());
 }
 
-/// H8: the up-half sub-view follows `dims.inter`, never a literal column (MAJOR-1). Kills
-/// 7a-M12.
+/// The up-half sub-view follows `dims.inter`, never a literal column.
 #[test]
 fn routed_up_view_follows_the_moe_inter() {
     use super::moe::MoeDims;
@@ -436,8 +433,8 @@ fn routed_up_view_follows_the_moe_inter() {
     );
 }
 
-/// H1: every builder at M = 130, p0 = 1,000, cap = 4,096 equals the plan's literal values
-/// field by field. Kills 7a-M1 and 7a-M1b.
+/// Every builder at M = 130, p0 = 1,000, cap = 4,096 equals the plan's literal values field by
+/// field.
 #[test]
 fn prefill_call_shapes_are_the_plan_values() {
     use super::mixer_geometry::MixerGeometry;
@@ -584,8 +581,8 @@ fn prefill_call_shapes_are_the_plan_values() {
     assert_eq!(QuantType::Q4K.weight_bytes(2_048, 512), Some(589_824));
 }
 
-/// H4: at every ladder size and a spread of chunk rows, every call's byte need fits the
-/// session slot of the stage that takes it (M1's prefix rule), from the wrappers' own pure
+/// At every ladder size and a spread of chunk rows, every call's byte need fits the session slot of
+/// the stage that takes it (the prefix promise of `chunk_tensors`), from the wrappers' own pure
 /// sizing. The 13b row uses the derived offset, never a literal column.
 #[test]
 fn prefill_stage_needs_fit_the_session_slots() {
@@ -769,8 +766,7 @@ fn prefill_stage_needs_fit_the_session_slots() {
     }
 }
 
-/// H10: one row per guard of `check_bufs`, each with the others satisfied, and the accepting
-/// edges. Kills 7a-B1..B5.
+/// One row per guard of `check_bufs`, each with the others satisfied, and the accepting edges.
 #[test]
 fn bufs_refuse_each_guard() {
     use super::prefill::{BufFacts, check_bufs};
@@ -829,8 +825,8 @@ fn bufs_refuse_each_guard() {
     );
 }
 
-/// The valid 40-layer `ModelFacts` fixture of H11 and the A1 rows: kinds and roles from the
-/// real table and geometry, every weight Native.
+/// The valid 40-layer `ModelFacts` fixture of `model_refuses_each_guard` and
+/// `run_refuses_each_bound`: kinds and roles from the real table and geometry, every weight Native.
 fn model_fixture() -> super::prefill::ModelFacts {
     use super::layer_table::LayerTable;
     use super::mixer_geometry::MixerGeometry;
@@ -894,8 +890,8 @@ fn model_fixture() -> super::prefill::ModelFacts {
     }
 }
 
-/// H11: the fixture is accepted, then one row per guard of `check_model`, each breaking one
-/// fact of layer 3 unless the guard is global. Kills 7a-D1..D9.
+/// The fixture is accepted, then one row per guard of `check_model`, each breaking one fact of
+/// layer 3 unless the guard is global.
 #[test]
 fn model_refuses_each_guard() {
     use super::prefill::check_model;
@@ -943,7 +939,7 @@ fn model_refuses_each_guard() {
     facts.layers[3].dense[1].1 = Some(QuantType::Q4K); // AttnK beside Q8_0 siblings.
     refuse(&facts, 40, "prefill chunk: q8 layout");
 }
-/// The A1 rows: one row per refusal of `ChunkRun::new`'s check.
+/// One row per refusal of `ChunkRun::new`'s check.
 #[test]
 fn run_refuses_each_bound() {
     use super::prefill::{RunFacts, check_run};
@@ -1098,12 +1094,11 @@ fn kv8_attention_part_capacity_is_bounded_and_disjoint() {
     assert!(kv8_scratch_layout(1025, CPF_ATTN_PART_CAP).is_err());
 }
 
-/// H12: each stage passes the prefill word it was given (revision 3, check 6). Mask 8 is
-/// unreachable through the body — the wrappers' own host checks refuse a bad p0/M first —
-/// and a dropped router or guard range hides behind the other's mask 1 in DV3, so the wiring
-/// is pinned on the source text of `prefill.rs` (the `start_pins` style): comments stripped,
-/// whitespace collapsed, each status argument exactly once in its own stage function.
-/// Kills 7a-S1..S4.
+/// Each stage passes the prefill word it was given. Mask 8 is unreachable through the body — the
+/// wrappers' own host checks refuse a bad p0/M first — and a dropped router or guard range hides
+/// behind the other's mask 1 in DV3, so the wiring is pinned on the source text of `prefill.rs`
+/// (the `start_pins` style): comments stripped, whitespace collapsed, each status argument exactly
+/// once in its own stage function.
 #[test]
 fn prefill_stages_pass_the_prefill_word() {
     use super::start_pins::{pinned, section_of};

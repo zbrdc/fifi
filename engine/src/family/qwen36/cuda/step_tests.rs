@@ -1,9 +1,8 @@
-//! Unit tests of the pure pieces `step.rs` uses (test seam U13). CPU only. The step itself needs
-//! a device; its evidence is the scratch run R-3 of the packet. The wirings of the step are
-//! pinned on the merged source with `include_str!` (the precedent of `step_ops_tests.rs`): the
-//! step cannot run here, so a mutant of a wiring must still fail a named test. The pinned text
-//! is stripped of line comments and string literals and its whitespace is collapsed first, so a
-//! comment cannot satisfy a pin and a rustfmt re-wrap cannot break one.
+//! Unit tests of the pure pieces `step.rs` uses. CPU only: the step itself needs a device. The
+//! wirings of the step are pinned on the source with `include_str!` (the precedent of
+//! `step_ops_tests.rs`): the step cannot run here, so a mutant of a wiring must still fail a named
+//! test. The pinned text is stripped of line comments and string literals and its whitespace is
+//! collapsed first, so a comment cannot satisfy a pin and a rustfmt re-wrap cannot break one.
 use super::run_report::CaptureOutcome;
 use super::state::StepField;
 use super::state_layout::Word;
@@ -172,8 +171,8 @@ fn a_layout_mismatch_is_refused_before_any_context_work() {
             other => panic!("a mismatched layout must be refused: {other:?}"),
         }
     }
-    // And `new` runs it before anything device-side: the wiring is pinned on the merged source
-    // (the c17 style), so a mutant that reads the layout from the options alone still fails.
+    // And `new` runs it before anything device-side: the wiring is pinned on the source text, so a
+    // mutant that reads the layout from the options alone still fails.
     let body = pinned_text(fn_section("pub(crate) fn new("));
     let length = body.len();
     let agree = body
@@ -190,9 +189,10 @@ fn a_layout_mismatch_is_refused_before_any_context_work() {
 
 #[test]
 fn the_head_resolves_its_pack_slot_inside_each_arm() {
-    // The S3c scratch defect: lm_head resolved XfFinal BEFORE the layout match, so every Native
-    // run refused ("the plan has no slot XfFinal") although the Native arm never reads it. The
-    // pinned body must carry the Tiled pack lookup inside the tiled arm and no pre-match lookup.
+    // The scratch defect this pins: lm_head resolved XfFinal BEFORE the layout match, so every
+    // Native run refused ("the plan has no slot XfFinal") although the Native arm never reads it.
+    // The pinned body must carry the Tiled pack lookup inside the tiled arm and no pre-match
+    // lookup.
     let body = pinned_text(fn_section("fn lm_head"));
     let length = body.len();
     assert!(
@@ -228,10 +228,10 @@ fn the_native_final_norm_writes_its_own_scratch_row() {
 
 #[test]
 fn the_head_launches_write_every_logits_row() {
-    // m19 (S3c): a head launch that skips its last rows leaves logits unwritten that the
-    // sampler can read (13 of the last 256 ids fall inside its 248,077-wide range), and on
-    // the qualification prompts no such id reaches the top-k, so neither the tokens nor rule C
-    // see it. Both head arms launch the head's full row count, and neither trims it.
+    // A head launch that skips its last rows leaves logits unwritten that the sampler can read (13
+    // of the last 256 ids fall inside its 248,077-wide range), and on the qualification prompts no
+    // such id reaches the top-k, so neither the tokens nor rule C see it. Both head arms launch the
+    // head's full row count, and neither trims it.
     let body = pinned_text(fn_section("fn lm_head("));
     let length = body.len();
     let native = body
@@ -349,10 +349,9 @@ fn run_body_counts_a_failed_sync_as_an_entered_op() {
 
 #[test]
 fn run_token_hands_the_decision_status_to_commit_step() {
-    // The wiring of c18: `decide` carries the pair's status in the Commit arm and the commit
-    // must take that SAME binding, not a literal clean status and not a fresh read of the
-    // pair: with a literal 0 a flagged row would commit as clean and return its filler
-    // token 0 (mutant m8).
+    // The wiring: `decide` carries the pair's status in the Commit arm and the commit must take
+    // that SAME binding, not a literal clean status and not a fresh read of the pair: with a
+    // literal 0 a flagged row would commit as clean and return its filler token 0.
     let body = pinned_text(fn_section("fn run_token_inner"));
     let length = body.len();
     let arm = body
@@ -387,9 +386,9 @@ fn run_token_hands_the_decision_status_to_commit_step() {
 
 #[test]
 fn run_token_refuses_a_bad_id_without_poisoning_or_cancelling() {
-    // The refusal of c18 leaves the state idle: between the id check and the start-block
-    // write there must be no poison, cancel or failure handling, or a refused host id would
-    // poison or take back a session whose device saw nothing (mutant m9).
+    // The refusal leaves the state idle: between the id check and the start-block write there must
+    // be no poison, cancel or failure handling, or a refused host id would poison or take back a
+    // session whose device saw nothing.
     let body = pinned_text(fn_section("fn run_token_inner"));
     let length = body.len();
     let check = body
@@ -420,9 +419,9 @@ fn run_token_refuses_a_bad_id_without_poisoning_or_cancelling() {
 
 #[test]
 fn run_token_checks_the_token_id_before_the_start_block() {
-    // The wiring of c18: the host refuses a token outside the sampler vocabulary before the
-    // start block, or a padding id would be written to the device before the refusal and the
-    // state would be poisoned by its own write.
+    // The wiring: the host refuses a token outside the sampler vocabulary before the start block,
+    // or a padding id would be written to the device before the refusal and the state would be
+    // poisoned by its own write.
     let body = pinned_text(fn_section("fn run_token_inner"));
     let length = body.len();
     let check = body
@@ -646,7 +645,10 @@ fn tiered_step_refuses_capture_with_a_typed_error() {
     match tiered_capture_refusal(true, true) {
         Err(crate::EngError::BadRequest(message)) => {
             assert!(message.contains("eager only"), "{message}");
-            assert!(message.contains("amendment of 2026-10-13"), "{message}");
+            assert!(
+                message.contains("which a captured graph cannot do"),
+                "{message}"
+            );
         }
         other => panic!("tiered with capture must be refused: {other:?}"),
     }

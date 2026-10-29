@@ -1,11 +1,11 @@
 //! Raw FFI to the mmid entries of `native/prefill/mmq_mmid.cu` (declared in
-//! `native/prefill/mmq_mmid.h`), CPF-V4 G3. Child module of `native/prefill.rs`, so it
-//! inherits the `allow(unsafe_code)` of `native.rs`.
+//! `native/prefill/mmq_mmid.h`). Child module of `native/prefill.rs`, so it inherits the
+//! `allow(unsafe_code)` of `native.rs`.
 //!
 //! Safety invariants this file relies on:
 //! - Every launch entry is called only through `CudaContext::launch_on`, on the thread that
-//!   owns the context and under the dispatch guard (decisions 0023 and 0024). It only enqueues
-//!   and returns; the stream is live for the call.
+//!   owns the context and under the dispatch guard. It only enqueues and returns; the stream
+//!   is live for the call.
 //! - Every range is a `RawRange`, proved inside a live allocation by `raw_range`. Sizes,
 //!   alignment and disjointness (`super::Span`) are proved again here, on the extents the
 //!   kernels touch, before the call; the C entry repeats the pointer, alignment, shape and
@@ -19,10 +19,7 @@
 // Test builds reach the whole launch through the device tests of `prefill::mmq_mmid`.
 #![cfg_attr(
     not(test),
-    expect(
-        dead_code,
-        reason = "staged for CPF-7, the prefill driver (decision 0049)"
-    )
+    expect(dead_code, reason = "staged for the chunked-prefill driver")
 )]
 
 use std::ffi::{c_int, c_void};
@@ -224,7 +221,7 @@ fn status_ptr(status: Option<&RawRange<'_>>) -> *mut c_void {
     status.map_or(std::ptr::null_mut(), RawRange::address)
 }
 
-/// Queues the ids guard N1 on `stream`: `ids_g` receives the router rows, every flagged row
+/// Queues the ids guard on `stream`: `ids_g` receives the router rows, every flagged row
 /// rewritten to `0..top_k`, and the status word the masks of `mmq_mmid.h`. Returns when the
 /// kernel is queued.
 pub(in crate::kernels::cuda) fn mmq_ids_guard_launch(
@@ -286,7 +283,7 @@ fn check_build(io: &BuildIdsRaw<'_>) -> Result<(), DeviceFailure> {
     Ok(())
 }
 
-/// Queues the id builder on `stream`: the guard N1 into `ids_g`, then `mm_ids_helper` on
+/// Queues the id builder on `stream`: the guard into `ids_g`, then `mm_ids_helper` on
 /// `ids_g` with the inverse map (contract in `mmq_mmid.h`). Returns when both are queued.
 pub(in crate::kernels::cuda) fn mmq_build_ids_launch(
     stream: &RawStream,
@@ -331,8 +328,8 @@ pub(in crate::kernels::cuda) struct MmidLaunchRaw<'a> {
 }
 
 /// The bytes of each range of a grouped launch, in the order x, y, ids_dst, expert_bounds,
-/// dst, fixup, from the geometry by the rules of `mmq_mmid.h` (CPF-V4 G1's sizing). `None`
-/// for a negative field, an unglued type or an overflow.
+/// dst, fixup, from the geometry by the rules of `mmq_mmid.h`. `None` for a negative field,
+/// an unglued type or an overflow.
 fn launch_needs(g: &MmidGeometry, nsm: c_int) -> Option<[usize; 6]> {
     let int = |value: i64| usize::try_from(value).ok();
     let block = match g.type_x {

@@ -1,4 +1,4 @@
-//! The fixed pool of expert page sets of the resident decoder (S2 plan sections 4.3 and 5).
+//! The fixed pool of expert page sets of the resident decoder.
 //!
 //! One set holds a layer's gate, up, and down expert stacks and its gate weights. The pool is
 //! allocated once with the decoder and never grows. A set is lent when its stacks are imported,
@@ -11,9 +11,9 @@
 //!   unevaluated, so no evaluation can read or write the pages any more.
 //!
 //! A released set becomes writable again only after the next successful synchronization on the
-//! engine thread frees its residents (decision 0041). `acquire` therefore does not wait: nothing
-//! else can free a set while it runs. With the release points above, the set of layer `L - 2` is
-//! always free at layer `L`, so two sets suffice and the third is slack.
+//! engine thread frees its residents. `acquire` therefore does not wait: nothing else can free a
+//! set while it runs. With the release points above, the set of layer `L - 2` is always free at
+//! layer `L`, so two sets suffice and the third is slack.
 
 use super::super::stored::{RoleRange, StackLayout};
 use super::prefetch::{Admission, ExpertHint};
@@ -25,7 +25,7 @@ use crate::{
     weights::StreamedCheckpoint,
 };
 
-/// Sets in the pool (coordinator answer Q4).
+/// Sets in the pool.
 pub(super) const POOL_SETS: usize = 3;
 
 /// The page layout of one layer set: three expert stacks and the F32 gates.

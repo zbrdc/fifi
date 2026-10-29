@@ -117,8 +117,8 @@ fn reshape_keeps_u32_values_in_element_order() {
     let _serial = GPU_TEST.lock().unwrap();
     let mut kernels = MlxKernels::try_new().unwrap();
     // A U32 resident keeps U32 through a reshape, as through a slice: the device chunk MoE
-    // flattens its U32 expert ids this way (packet Q36-PF-DEVROUTE). 16_777_217 (2^24 + 1) and
-    // 4_000_000_000 do not survive a trip through F32.
+    // flattens its U32 expert ids this way. 16_777_217 (2^24 + 1) and 4_000_000_000 do not
+    // survive a trip through F32.
     let ids = kernels
         .import_tensor(&u32_input(
             vec![2, 3],
@@ -162,9 +162,8 @@ fn reshape_rejects_a_dtype_other_than_f32_and_u32() {
     let rejected = kernels.reshape(&wide, &[4]);
 
     match rejected {
-        // The rejection of `check_operand` from before the U32 branch existed (packet
-        // Q36-PF-DEVROUTE fix1 K4): only U32 takes the new branch, so BF16 is rejected exactly
-        // as before, with the same text.
+        // The rejection of `check_operand` from before the U32 branch existed: only U32 takes
+        // the new branch, so BF16 is rejected exactly as before, with the same text.
         Err(EngError::BadRequest(message)) => {
             assert_eq!(message, "reshape: input dtype must be F32");
         }

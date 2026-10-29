@@ -1,5 +1,5 @@
 /*
- * RD-5: the device router of the resident Qwen3.6 decode step (decision 0047).
+ * The device router of the resident Qwen3.6 decode step.
  *
  * Routing runs on the device so that the expert ids never reach the host. The code is original
  * CUDA C for
@@ -12,7 +12,7 @@
  * take the top_k probabilities, larger first and the lower expert index first on a tie;
  * weight_i = p_i / (p_0 + ... + p_{k-1}), the sum taken sequentially in rank order. The
  * shared-expert gate is sigmoid(x . w_shared); it is optional (w_shared and shared_gate both NULL
- * for a family without a shared expert, MEL-A1). n_expert (up to 256) and top_k (up to 32) are
+ * for a family without a shared expert). n_expert (up to 256) and top_k (up to 32) are
  * run-time values.
  *
  * Two launches on one stream:

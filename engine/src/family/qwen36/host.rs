@@ -1,4 +1,4 @@
-//! Host f32 reference forward for the stepping-stone family `Qwen3.6-35B-A3B` (Q36-HR).
+//! Host f32 reference forward for `Qwen3.6-35B-A3B`.
 //!
 //! Activations stay in host `f32` vectors. Reductions accumulate in `f64`. Projections go through
 //! the [`Projector`] seam. The block rules follow mlx-lm 0.31.0 (`qwen3_5.py`, `qwen3_next.py`,

@@ -1,6 +1,5 @@
-//! The pinned result word of a resident step (CUDA-RD section 6.5, decision
-//! 0047): eight bytes of page-locked host memory that a device-to-host copy on a
-//! stream fills with a token and a status.
+//! The pinned result word of a resident step: eight bytes of page-locked host
+//! memory that a device-to-host copy on a stream fills with a token and a status.
 //!
 //! The host may read the word only after an event recorded behind the copy has
 //! completed. [`PinnedWord::read_after`] enforces it with the pending-work
@@ -16,7 +15,7 @@
 //! wait eagerly afterwards.
 //!
 //! The word is `!Send` and `!Sync`, shares the lease of its context, and follows
-//! the drop rule of decision 0022 through [`super::stream::release`].
+//! the drop rule of [`super::stream::release`].
 
 use std::{cell::Cell, marker::PhantomData, rc::Rc, sync::atomic::Ordering};
 

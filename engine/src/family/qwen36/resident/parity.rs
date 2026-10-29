@@ -1,9 +1,9 @@
-//! The parity gate of decision 0046 item 4 on the real checkpoint (packet Q36-D).
+//! The per-layer parity gate of the resident decoder on the real checkpoint.
 //!
-//! The ignored test runs the resident decoder on the 5-token prompt of the frozen Q36-HR evidence and
-//! compares it with that evidence: the residual stream after every layer for every prompt token, the
-//! last-row logits and their top 5, and 32 greedy tokens. The reference is the host forward of Q36-HR,
-//! which shares no kernel with MLX. mlx-lm is not involved. A Q36 result never satisfies Phase 0B or 1B.
+//! The ignored test runs the resident decoder on the 5-token prompt of the frozen host-reference
+//! evidence and compares it with that evidence: the residual stream after every layer for every
+//! prompt token, the last-row logits and their top 5, and 32 greedy tokens. The reference is the
+//! host forward, which shares no kernel with MLX. mlx-lm is not involved.
 //!
 //! `QWEN36_G2A_COMPILE=1` runs the DeltaNet and device-routed MoE decode steps through `mlx_compile`d
 //! closures in the activation dtype of `Q36_ACTIVATION` (unset or `f32` is the F32 control,
@@ -21,14 +21,12 @@
 //!   family::qwen36::resident::parity -- --ignored --nocapture
 //! ```
 //!
-//! `Q36_ACTIVATION=bf16` (packet Q36-BF16-a) runs the decode activations in BF16 through the
-//! product `activation_dtype` lever: the stored BF16 scales and the converted norms. Unset or `f32`
-//! is the F32 control above and its gates are unchanged. With BF16 the 0.99999 per-layer rule of
-//! decision 0046 item 4 stays report-only, but the run asserts its floor (fix5 of packet
-//! Q36-BF16-a): no cosine is NaN, the minimum layer cosine is at least 0.95, and it does not
-//! regress by more than 0.01 from the d1 value 0.9799 without a recorded decision - a
-//! report-only result is not allowed to ratchet. The report names the dtype in
-//! `activation_dtype`.
+//! `Q36_ACTIVATION=bf16` runs the decode activations in BF16 through the product
+//! `activation_dtype` lever: the stored BF16 scales and the converted norms. Unset or `f32` is the
+//! F32 control above and its gates are unchanged. With BF16 the 0.99999 per-layer rule stays
+//! report-only, but the run asserts its floor: no cosine is NaN, the minimum layer cosine is at
+//! least 0.95, and it does not regress by more than 0.01 from the anchor 0.9799 - a report-only
+//! result is not allowed to ratchet. The report names the dtype in `activation_dtype`.
 
 use sha2::{Digest, Sha256};
 
@@ -48,14 +46,14 @@ use crate::{
     kernels::MlxKernels,
 };
 
-/// SHA-256 of the frozen evidence files (`<scratch>/4c35122c/q36-hr-mac/evidence/SHA256SUMS`).
+/// SHA-256 of the frozen evidence files (the `SHA256SUMS` of the evidence directory).
 pub(super) const HOST_REF_JSON_SHA256: &str =
     "27acedbe149a50eab685299f3faa4202de0558689b681f383c19d2e16234a076";
 pub(super) const LAYERS_SHA256: &str =
     "5bc310d7accdc56fbdc464d86e50fc3e655773d338e173d5d964bbbf6b7aef02";
 pub(super) const LOGITS_SHA256: &str =
     "6b4973e208ec44aa91efb9d61ae72de941a3ac775e82b771a275227378052044";
-/// SHA-256 of the pinned `config.json` (decision 0046 item 2).
+/// SHA-256 of the pinned `config.json`.
 pub(super) const CONFIG_SHA256: &str =
     "a822a9e48b0aafbe3144ec37d4fb067e178ed96615ce6e4420b3149893cc5767";
 
@@ -105,7 +103,8 @@ pub(super) fn cosine(a: &[f32], b: &[f32]) -> f64 {
     dot / (aa.sqrt() * bb.sqrt())
 }
 
-/// The five largest logits as token ids, the lowest token first on ties (the rule of Q36-HR).
+/// The five largest logits as token ids, the lowest token first on ties (the host reference's
+/// rule).
 pub(super) fn top5(logits: &[f32]) -> Vec<u32> {
     let mut ranked: Vec<(u32, f32)> = logits
         .iter()
@@ -117,7 +116,7 @@ pub(super) fn top5(logits: &[f32]) -> Vec<u32> {
 }
 
 #[test]
-#[ignore = "needs the real checkpoint and the frozen Q36-HR evidence on the Mac; run with --ignored"]
+#[ignore = "needs the real checkpoint and the frozen host-reference evidence on the Mac"]
 fn real_checkpoint_matches_the_host_reference() {
     let _serial = crate::native_test_lock();
     let (ckpt_dir, ref_dir) = (env_path("Q36_CKPT_DIR"), env_path("Q36_REF_DIR"));
@@ -236,7 +235,7 @@ fn real_checkpoint_matches_the_host_reference() {
         ));
     }
     let stats = decoder.kernels.memory_stats().unwrap();
-    // Packet Q36-BF16-a: the agreement numbers that a BF16 run reports beside the gate.
+    // The agreement numbers that a BF16 run reports beside the gate.
     let top5_overlap = got_top5.iter().filter(|id| want_top5.contains(id)).count();
     let greedy_equal_prefix = tokens
         .iter()
@@ -289,7 +288,7 @@ fn real_checkpoint_matches_the_host_reference() {
                 BF16_LAYER_COSINE_REGRESSION
             ),
             "BF16 parity floor: min layer cosine {min_cos} is under 0.95 or regresses more than \
-             0.01 below the d1 value 0.9799 without a recorded decision"
+             0.01 below the anchor 0.9799"
         );
         println!("measurement run: {} gate misses recorded", failures.len());
     }

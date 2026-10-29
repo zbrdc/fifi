@@ -1,4 +1,4 @@
-//! Resident Q36 decode step and head (packets Q36-D and Q36-DR).
+//! Resident Q36 decode step and head.
 //!
 //! Synchronizations per token with `L` layers (`L = 40`). With `Routing::Device` (the default) the
 //! token builds one graph: the token-start import 1, one `evaluate` 1, and the readbacks. `Prompt`
@@ -8,10 +8,9 @@
 //! synchronizations (the probability readback and the index import): `Prompt` makes `2 L`,
 //! `Generate` `2 L + 3`, `Logits` `2 L + 4`, and `Record` `2 L + 5`. The real model gives 80, 83,
 //! 84, and 85. Each layer's old state drops as soon as its replacement graph exists. The state
-//! stays poisoned from the first native call until `commit` (decision 0039 amendment of
-//! 2026-10-09).
+//! stays poisoned from the first native call until `commit`.
 //!
-//! Router health (decision 0046 amendment A2). Device routing cannot read a router row before it
+//! Router health. Device routing cannot read a router row before it
 //! picks experts. Each layer returns the sum of its whole probability row, and the step adds the
 //! sums. The token readback carries the total next to the token. A NaN or infinite entry in any
 //! row makes the total non-finite, and the step returns `Backend` with operation `route_experts`
@@ -57,9 +56,9 @@ pub(super) fn step(
 }
 
 /// Reads the embedding row of `token`, imports it packed, and dequantizes it to `[1, hidden]` in
-/// the activation dtype (packet Q36-BF16-a; the dequantized row is F32 and one cast moves it to
-/// BF16). One synchronization (one `import_packed_many` call). A token outside the table returns
-/// `BadRequest` from the read.
+/// the activation dtype (the dequantized row is F32 and one cast moves it to BF16). One
+/// synchronization (one `import_packed_many` call). A token outside the table returns `BadRequest`
+/// from the read.
 fn embed_row(
     ctx: &mut Ctx<'_>,
     ckpt: &crate::weights::StreamedCheckpoint,
@@ -92,14 +91,14 @@ pub(super) fn run(
     let shape = &weights.shape;
     let pos = state.pos();
     let last = weights.layers.len().saturating_sub(1);
-    // Packet GPU-GAP-COUNT: the test-only graph probe leaves the decoder before `ctx` borrows its
+    // The test-only graph probe leaves the decoder before `ctx` borrows its
     // kernels. `None` in every run that sets no probe, so the step is what it was without this.
     #[cfg(test)]
     let mut graph_probe = decoder.graph_probe.take();
     let mut ctx = Ctx {
         kernels: &mut decoder.kernels,
         consts: &weights.consts,
-        // The `qwen36.compile` setting of the decoder (packet MX-COMPILE-1a): the one-token
+        // The `qwen36.compile` setting of the decoder: the one-token
         // decode step is the only step that compiles its DeltaNet and MoE blocks.
         compile: decoder.compile,
     };
@@ -111,8 +110,8 @@ pub(super) fn run(
     let mut chosen: Vec<ExecutionTensor> = Vec::new();
     // Host routing in `Record`: the expert ids of each layer.
     let mut host_routes: Vec<Vec<u32>> = Vec::new();
-    // Host routing in `Record`: the router probability row that each selection read (fix3 of
-    // packet Q36-BF16-a). The readback already exists, so recording it adds no synchronization.
+    // Host routing in `Record`: the router probability row that each selection read. The readback
+    // already exists, so recording it adds no synchronization.
     let mut host_probs: Vec<Vec<f32>> = Vec::new();
     // The optional layer trace: one index per non-prompt step, `None` when the trace is off or the
     // step is a prompt row.
@@ -184,7 +183,7 @@ pub(super) fn run(
         };
         h = ctx.kernels.binary(BinaryOp::Add, &mid, &routed)?;
         // MLX promotes mixed operands, so a stray F32 operand would turn BF16 activations back to
-        // F32 without an error. The check keeps a BF16 run honest (packet Q36-BF16-a).
+        // F32 without an error. The check keeps a BF16 run honest.
         check_dtype("layer output", &h, ctx.consts.act)?;
         if mode == StepMode::Record {
             // The recorded rows read back as F32.
@@ -243,10 +242,10 @@ pub(super) fn run(
     } else {
         None
     };
-    // Packet Q36-BF16-a: the recurrent state and the convolution ring stay F32 whatever the
-    // activation dtype. The key-value cache keeps its form's dtypes (packet KV8-INTEGRATE): the
-    // F32 control holds F32 keys and values, and the Q8 form holds U32 codes beside scales and
-    // biases of the activation dtype. The step refuses a graph that planned otherwise.
+    // The recurrent state and the convolution ring stay F32 whatever the activation dtype. The
+    // key-value cache keeps its form's dtypes: the F32 control holds F32 keys and values, and the
+    // Q8 form holds U32 codes beside scales and biases of the activation dtype. The step refuses a
+    // graph that planned otherwise.
     check_state_dtypes(&layers, ctx.consts.act)?;
     // One evaluate of the new state and the head outputs.
     let mut outputs: Vec<&ExecutionTensor> = Vec::new();
@@ -268,7 +267,7 @@ pub(super) fn run(
     if let Some(route_rows) = &route_rows {
         outputs.push(route_rows);
     }
-    // Packet GPU-GAP-COUNT: the test-only probe runs with the lazy outputs before the one
+    // The test-only probe runs with the lazy outputs before the one
     // `evaluate` (it describes the graph, so it adds no synchronization and no counted fault).
     // With no probe set — every build except `decode_graph_primitives` — the block is a no-op and
     // the step is byte for byte what it is without it.
@@ -300,8 +299,8 @@ pub(super) fn run(
         None if mode == StepMode::Record => Some(host_routes),
         None => None,
     };
-    // `Record` with host routing keeps the probability row of every layer (fix3 of packet
-    // Q36-BF16-a): the near-tie rule of the route-parity gate reads its gaps from it.
+    // `Record` with host routing keeps the probability row of every layer: the near-tie rule of the
+    // route-parity gate reads its gaps from it.
     let probs_out = match (mode, routing) {
         (StepMode::Record, Routing::Host) => Some(host_probs),
         _ => None,
@@ -352,10 +351,9 @@ pub(super) fn check_state_dtypes(layers: &[LayerState], act: Dtype) -> Result<()
     Ok(())
 }
 
-/// Returns `Backend` when `tensor` does not have the dtype that the step plans for it (packet
-/// Q36-BF16-a). MLX promotes mixed operands silently, so the dtype is the only honest witness of
-/// a stray F32 operand in a BF16 run. The check never fires in an F32 run. The prefill chunk loop
-/// runs the same guard (packet Q36-BF16-b).
+/// Returns `Backend` when `tensor` does not have the dtype that the step plans for it. MLX promotes
+/// mixed operands silently, so the dtype is the only honest witness of a stray F32 operand in a
+/// BF16 run. The check never fires in an F32 run. The prefill chunk loop runs the same guard.
 pub(super) fn check_dtype(
     what: &str,
     tensor: &ExecutionTensor,
@@ -560,7 +558,7 @@ mod tests {
     }
 
     /// Bytes of the stored caches, summed from the tensors themselves: the capacity buffers,
-    /// slack included (packet Q36-KV-INTEGRATE).
+    /// slack included.
     fn stored_kv_bytes(state: &ResidentState) -> u64 {
         kv_storage_bytes(state.layers())
     }
@@ -764,7 +762,7 @@ mod tests {
             }
             assert_eq!(compared, 2, "{name}: both DeltaNet layers compared");
             // The logical charge follows the position; the storage is the exact hand-derived
-            // capacity (review B finding 4): every count of this helper (8 and 40 positions) fits
+            // capacity: every count of this helper (8 and 40 positions) fits
             // one default quantum of 256, so each layer stores exactly `KV_STEP` positions.
             let logical = u64::from(count) * GROWTH;
             assert_eq!(
@@ -863,9 +861,9 @@ mod tests {
             let result = decoder.step(&mut state, token(t as u32), StepMode::Prompt);
             assert!(result.is_ok(), "step {t} must commit: {result:?}");
             assert_eq!(decoder.session_used(), t * GROWTH, "charge after step {t}");
-            // The charge is logical; the storage is the exact hand-derived capacity (review B
-            // finding 4): one to three positions fit the first default quantum of 256, so each
-            // layer stores exactly `KV_STEP` positions.
+            // The charge is logical; the storage is the exact hand-derived capacity: one to three
+            // positions fit the first default quantum of 256, so each layer stores exactly
+            // `KV_STEP` positions.
             let stored = stored_kv_bytes(&state);
             assert_eq!(
                 stored,
@@ -1172,7 +1170,7 @@ mod tests {
         assert_eq!(previous, DECODE_RETIRE_CAP);
         assert_eq!(DECODE_RETIRE_CAP, 4 << 30, "4 GiB");
     }
-    /// A BF16 decoder (packet Q36-BF16-a) steps the tiny model finitely and keeps the F32 argmax on
+    /// A BF16 decoder steps the tiny model finitely and keeps the F32 argmax on
     /// every step whose F32 top-two logit gap exceeds 0.25, the BF16 rounding scale, so the two
     /// decoders read the same tokens only where the fixture decides clearly. The test also holds
     /// the dtype itself to account: `Consts::act` is `Bf16` and a converted layer norm reads BF16,
@@ -1239,7 +1237,7 @@ mod tests {
         }
         if checked == 0 {
             // The fixture has no position whose F32 top-two gap exceeds the BF16 rounding scale,
-            // so only the finite-logit and dtype assertions bind on it (packet Q36-BF16-a fix).
+            // so only the finite-logit and dtype assertions bind on it.
             eprintln!(
                 "no step of the tiny fixture has an F32 top-two gap above 0.25; \
                  the BF16 argmax comparison did not run"
@@ -1247,19 +1245,19 @@ mod tests {
         }
     }
 
-    /// The frozen expectation of one half of the bit-equality run (packet GAP-TRIM-A 4(b)): the
-    /// tokens and the logit bits of eight `Record` steps of the tiny GQA model in one activation
-    /// dtype. The literals come from a Mac run of the test below at the BASE commit of the trims
-    /// (2253cbcc: one clamp per gather, a contiguous node after every product), taken twice with
-    /// identical output. After an intended numeric change, run the test with `GAP_TRIM_FREEZE=1`
-    /// (`--ignored` is not needed) and paste the printed block over each constant. A `u32::MAX`
-    /// token marks an unfrozen half, and the test refuses it with these instructions.
+    /// The frozen expectation of one half of the bit-equality run: the tokens and the logit bits of
+    /// eight `Record` steps of the tiny GQA model in one activation dtype. The literals come from a
+    /// Mac run of the test below on the graph before the trims (one clamp per gather, a contiguous
+    /// node after every product), taken twice with identical output. After an intended numeric
+    /// change, run the test with `GAP_TRIM_FREEZE=1` (`--ignored` is not needed) and paste the
+    /// printed block over each constant. A `u32::MAX` token marks an unfrozen half, and the test
+    /// refuses it with these instructions.
     struct Frozen {
         tokens: [u32; 8],
         logits: [[f32; 8]; 8],
     }
 
-    /// F32 expectation, frozen from a run at the base commit 2253cbcc (Mac, `GAP_TRIM_FREEZE=1`).
+    /// F32 expectation, frozen from a run on the untrimmed graph (Mac, `GAP_TRIM_FREEZE=1`).
     const FROZEN_F32: Frozen = Frozen {
         tokens: [5, 5, 5, 5, 5, 5, 5, 5],
         logits: [
@@ -1293,7 +1291,7 @@ mod tests {
         ],
     };
 
-    /// BF16 expectation, frozen from a run at the base commit 2253cbcc (Mac, `GAP_TRIM_FREEZE=1`).
+    /// BF16 expectation, frozen from a run on the untrimmed graph (Mac, `GAP_TRIM_FREEZE=1`).
     const FROZEN_BF16: Frozen = Frozen {
         tokens: [5, 5, 5, 5, 5, 5, 5, 5],
         logits: [
@@ -1344,7 +1342,7 @@ mod tests {
     }
 
     /// Runs eight `Record` steps of one activation dtype and returns the tokens and the logit
-    /// rows (packet GAP-TRIM-A 4(b)). The step input is the frozen `token` sequence, so the run
+    /// rows. The step input is the frozen `token` sequence, so the run
     /// is deterministic in both dtypes.
     fn eight_record_steps(activation: Activation) -> (Vec<u32>, Vec<Vec<f32>>) {
         let (ckpt, _) = setup();
@@ -1369,10 +1367,10 @@ mod tests {
         (tokens, logits)
     }
 
-    /// Packet GAP-TRIM-A 4(b): the end-to-end bit equality of a short decode. Eight `Record`
-    /// steps of the tiny GQA model must return the SAME tokens and the SAME logit bits on the
-    /// trimmed graph (one clamp per layer, no no-op contiguous nodes) as the frozen expectation
-    /// at the base commit, in F32 and in BF16. The comparison is on `f32::to_bits`.
+    /// The end-to-end bit equality of a short decode. Eight `Record` steps of the tiny GQA model
+    /// must return the SAME tokens and the SAME logit bits on the trimmed graph (one clamp per
+    /// layer, no no-op contiguous nodes) as the frozen expectation from the untrimmed graph, in F32
+    /// and in BF16. The comparison is on `f32::to_bits`.
     #[test]
     fn eight_decode_steps_match_the_frozen_expectation_in_f32_and_bf16() {
         let freeze = std::env::var_os("GAP_TRIM_FREEZE").is_some();

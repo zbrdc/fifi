@@ -1,10 +1,10 @@
 #![cfg(all(feature = "native-mlx", target_os = "macos", target_arch = "aarch64"))]
-//! Page imports at the public `MlxKernels` interface (decision 0041, S2 plan Z1a).
+//! Page imports at the public `MlxKernels` interface.
 //!
-//! The Z0 spike showed that the pinned MLX uses the pages in place. That identity is not visible
-//! through the public interface, so these tests check what callers rely on: correct bytes, no
-//! synchronization, page reuse only after the consuming graph completes, no donation into lent
-//! pages, owner checks, and rejection before native work.
+//! An earlier experiment showed that the pinned MLX uses the pages in place. That identity is not
+//! visible through the public interface, so these tests check what callers rely on: correct
+//! bytes, no synchronization, page reuse only after the consuming graph completes, no donation
+//! into lent pages, owner checks, and rejection before native work.
 
 use std::{
     sync::{Mutex, MutexGuard, PoisonError},
@@ -647,8 +647,8 @@ fn aligned_page_imports_are_not_counted_as_copies() {
 
 #[cfg(feature = "native-fault-qualification")]
 mod faults {
-    //! Injected failures of the page import shim (decision 0032). Each case runs in a child
-    //! process, because a native failure is terminal for the whole process.
+    //! Injected failures of the page import shim. Each case runs in a child process, because a
+    //! native failure is terminal for the whole process.
 
     use std::{
         env,

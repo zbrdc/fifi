@@ -1,6 +1,6 @@
-// RD-7b: launch shim for the vendored gated_delta_k (kern::gated_delta in ops.cu). No kernel is
+// Launch shim for the vendored gated_delta_k (kern::gated_delta in ops.cu). No kernel is
 // added; this file proves the arguments the kernel does not check and makes one extern "C" call.
-// The kernel is vendored xavier-qwen code, restored in RD-4V.
+// The kernel is vendored xavier-qwen code.
 #include <cuda_runtime.h>
 #include <stddef.h>
 #include <stdint.h>
@@ -48,8 +48,8 @@ bool shapes_ok(const inference_cuda_gdn_delta_args &a) {
     return a.conv_ld >= conv_cols && a.conv_ld <= (1 << 20) && a.ld >= need_ld && a.ld <= (1 << 22);
 }
 
-// Mirrors the Rust wrapper term by term (RD-7b.md "C and Rust refusals"); a term added here needs a
-// row there. The Rust side refuses everything this refuses, so a C refusal means a wrapper defect.
+// Mirrors the Rust wrapper term by term; a term added here needs its twin there. The Rust side
+// refuses everything this refuses, so a C refusal means a wrapper defect.
 bool valid(const inference_cuda_gdn_delta_args &a, void *stream) {
     if (a.conv == NULL || a.proj == NULL || a.a == NULL || a.dt_bias == NULL || a.norm_w == NULL ||
         a.state == NULL || a.out == NULL || stream == NULL || !shapes_ok(a)) {
@@ -91,7 +91,7 @@ extern "C" int inference_cuda_gdn_delta_launch(const inference_cuda_gdn_delta_ar
         if (args == NULL || !valid(*args, stream)) {
             return INFERENCE_CUDA_INVALID_ARGUMENT;
         }
-        // snap stays null: the speculative-rollback snapshots are not used at stage 1.
+        // snap stays null: this entry does not use the speculative-rollback snapshots.
         kern::DeltaArgs call = {};
         call.conv = (const float *)args->conv;
         call.conv_ld = args->conv_ld;

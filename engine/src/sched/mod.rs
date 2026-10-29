@@ -34,7 +34,7 @@ impl SessionBudget {
         self.used.get()
     }
 
-    /// The bytes the budget can still charge (fix EV-2): the cap over the used bytes.
+    /// The bytes the budget can still charge: the cap over the used bytes.
     /// Crate-visible only - this is the executors' pool-derived prompt ceiling, not public
     /// API. The only caller is the Mac-only Q36 resident executor, so a non-Mac build
     /// cannot see the use.
@@ -61,11 +61,10 @@ impl SessionBudget {
     }
 }
 
-/// One growth charge against a session budget. The charge is SHAREABLE (Q-R1 slice 3b,
-/// coordinator decision (a) shared-charge): `share` produces a co-owned permit that holds
-/// the SAME bytes, and the budget counts those bytes exactly once no matter how many
-/// co-owners live - only the last one's drop releases them. The shared state carries the
-/// counter and the bytes as an Option taken by the last dropper.
+/// One growth charge against a session budget. The charge is SHAREABLE: `share` produces a
+/// co-owned permit that holds the SAME bytes, and the budget counts those bytes exactly
+/// once no matter how many co-owners live - only the last one's drop releases them. The
+/// shared state carries the counter and the bytes as an Option taken by the last dropper.
 pub struct GrowthPermit {
     shared: SharedCharge,
 }
@@ -75,7 +74,7 @@ type SharedCharge = Rc<RefCell<Option<(Rc<Cell<u64>>, u64)>>>;
 
 impl GrowthPermit {
     /// A co-owned permit sharing this charge: the budget counts the bytes once while any
-    /// co-owner lives, and the last drop releases them (Q-R1 shared-charge).
+    /// co-owner lives, and the last drop releases them.
     pub fn share(&self) -> Self {
         Self {
             shared: Rc::clone(&self.shared),
@@ -240,8 +239,8 @@ mod tests {
     }
 
     /// A permit holds its own share of the counter, so it may outlive the budget that issued
-    /// it and still release its bytes (Q-R1: the counter lives in the shared tuple that
-    /// both the budget and every permit hold, so dropping the budget keeps the count).
+    /// it and still release its bytes (the counter lives in the shared tuple that both the
+    /// budget and every permit hold, so dropping the budget keeps the count).
     #[test]
     fn a_permit_may_outlive_its_budget() {
         let mut budget = SessionBudget::new(10);
@@ -259,9 +258,9 @@ mod tests {
         drop(permit);
     }
 
-    /// Q-R1 review test (c), restored: the shareable charge counts once and only the
-    /// last drop releases it - the portable pin of the shared-charge linchpin the
-    /// snapshot permits and the Q-R1 budget arithmetic rest on.
+    /// The shareable charge counts once and only the last drop releases it - the portable
+    /// pin of the shared-charge linchpin the snapshot permits and the session budget
+    /// arithmetic rest on.
     #[test]
     fn a_shared_permit_counts_once_and_releases_on_the_last_drop() {
         let mut budget = SessionBudget::new(10);

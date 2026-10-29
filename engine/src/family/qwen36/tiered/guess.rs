@@ -1,17 +1,17 @@
-//! Host-side router-guess arithmetic for expert prefetch advice (OFF-2 P9).
+//! Host-side router-guess arithmetic for expert prefetch advice.
 //!
 //! WHAT: pure arithmetic that guesses the router decision of one MoE layer from
 //! an earlier layer's hidden state, `logits = R_L . (rmsnorm(h) * w_L)`, where
 //! `R_L` is the layer's router matrix, `w_L` its post-attention-norm weight and
-//! `h` the residual after attention of an earlier layer (OFF-3 variant B = L-1,
-//! B2/B3 = L-2/L-3). WHY: OFF-3 measured that this recalls 77 percent of the
-//! true top-8 with variant B (69 with B2, 65 with B3), which is enough to
-//! prefetch expert weights before the real router runs. The guess is advice for
+//! `h` the residual after attention of an earlier layer (L-1, L-2, or L-3).
+//! WHY: a measurement showed that this recalls 77 percent of the true top-8
+//! from layer L-1 (69 from L-2, 65 from L-3), which is enough to prefetch
+//! expert weights before the real router runs. The guess is advice for
 //! prefetching only and can never affect results, so this module is pure host
 //! arithmetic: no I/O, no threads, no clock, no prefetch queues, no CUDA. The
 //! norm matches the engine's own rmsnorm and the dot uses the fixed 8-lane
 //! reduction order of the CPU kernels, so the output bits depend on nothing but
-//! the inputs. Staged for later integration (OFF-2 C6/C7).
+//! the inputs. Staged for later integration.
 
 use std::sync::Arc;
 
@@ -331,7 +331,7 @@ mod tests {
     #[test]
     fn logits_match_a_double_precision_reference() {
         // Per-logit bound: |got - ref| <= 1e-4 * sum(|term|) + 1e-6, the stated
-        // tolerance of the C5 kernel tests, where ref is an independent f64
+        // tolerance of the CPU kernel tests, where ref is an independent f64
         // pipeline: the same rmsnorm in f64 and a plain f64 matvec.
         let (hidden, experts) = (2048usize, 256usize);
         let mut rng = Lcg(0x0009_0900_0000_0001);
@@ -380,7 +380,7 @@ mod tests {
     fn the_guess_uses_the_target_layers_own_norm_weight() {
         // Two layers with one shared router but two different norm weights: the
         // logits must differ, and swapping the weights swaps the results bitwise.
-        // This is the +9-10 recall points of OFF-3 variant C over D.
+        // Using the target layer's own norm weight raised the measured recall by 9-10 points.
         let (hidden, experts) = (64usize, 6usize);
         let mut rng = Lcg(0x0009_0900_0000_0002);
         let norm = 1.0f32 / (hidden as f32).sqrt();

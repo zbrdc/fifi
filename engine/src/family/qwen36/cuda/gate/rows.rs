@@ -1,15 +1,9 @@
 //! Per-row summaries for the stage 1 gate: top-32, FNV-1a 64 hash and log-sum-exp of one logit row.
 //!
-//! Pure host code: no device type and no `CudaContext`, so the tests below run on a CPU-only host (U13).
-#![cfg_attr(
-    not(test),
-    expect(
-        dead_code,
-        reason = "staged for the gate loop, RD-10a-17 (decision 0047)"
-    )
-)]
+//! Pure host code: no device type and no `CudaContext`, so the tests below run on a CPU-only host.
+#![cfg_attr(not(test), expect(dead_code, reason = "staged for the gate loop"))]
 
-/// Number of (id, logit) pairs kept per step (REPLY-67).
+/// Number of (id, logit) pairs kept per step.
 pub(super) const TOP_K: usize = 32;
 const FNV_OFFSET: u64 = 0xcbf2_9ce4_8422_2325;
 const FNV_PRIME: u64 = 0x0000_0100_0000_01b3;

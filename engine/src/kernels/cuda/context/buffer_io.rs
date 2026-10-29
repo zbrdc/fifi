@@ -1,5 +1,5 @@
 //! The allocate entry and the stream-ordered ranged reads and writes of a device
-//! buffer (U3 and U4 of the resident step; decision 0047).
+//! buffer that the resident step uses.
 //!
 //! The resident step keeps its state in buffers it allocates itself and moves
 //! bytes in and out of them between stream work. Invariants:

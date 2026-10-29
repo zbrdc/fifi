@@ -1,4 +1,4 @@
-//! Batched QSA attention over a chunk (decision 0044 items 9 to 11; plan S4 section 3.4).
+//! Batched QSA attention over a chunk.
 //!
 //! `chunk` is the chunk form of `qsa::step`. The `T` rows of a chunk attend to the `P` cached
 //! positions and to the chunk rows before them. The mask is causal and aligned to the last key, so
@@ -7,7 +7,7 @@
 //! `tests/native_fast.rs` decides, and the chunk tests here repeat the check through the layer.
 //!
 //! The dense limit stays. A chunk whose last row passes it returns `ContextLimit` before any native
-//! call. The sparse chunk is packet PF-9.
+//! call. There is no sparse chunk yet.
 
 use super::super::ops::{Ctx, dim};
 use super::super::state::LayerState;
@@ -59,15 +59,14 @@ pub(in super::super) fn check_chunk_dense(
     match (blocks, limit) {
         (Some(blocks), Some(limit)) if blocks <= limit => Ok(()),
         _ => Err(EngError::ContextLimit(
-            "resident QSA chunk passes the dense limit; the sparse chunk is packet PF-9".into(),
+            "resident QSA chunk passes the dense limit; there is no sparse chunk".into(),
         )),
     }
 }
 
 /// The most rows that a chunk starting at `pos` can hold while `check_chunk_dense` passes: the
 /// dense limit counts `(budget / ratio + 1) * ratio - 1` visible positions. It is zero at or past
-/// the limit. The chunk step uses it to split a prompt that crosses the dense limit (decision 0044
-/// amendment of 2026-10-09).
+/// the limit. The chunk step uses it to split a prompt that crosses the dense limit.
 pub(in super::super) fn dense_rows(shape: &QsaShape, pos: u32) -> Result<u32, EngError> {
     let dims = shape.dims();
     let ratio = u64::from(dims.ratio);

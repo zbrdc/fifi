@@ -84,9 +84,9 @@ pub(crate) struct MoeWeights<'a, W> {
     pub(crate) shared_scalar: &'a W,
 }
 
-/// Selects the top `top_k` experts from router probabilities, highest first, the lowest index
-/// on ties, with gates renormalized over the selection when `shape.renorm` is set and over all
-/// probabilities otherwise (decision 0039 item 3: selection stays on the host).
+/// Selects the top `top_k` experts from router probabilities, highest first, the lowest index on
+/// ties, with gates renormalized over the selection when `shape.renorm` is set and over all
+/// probabilities otherwise. Selection stays on the host.
 pub(crate) fn select(shape: &MoeShape, probs: &[f32]) -> Result<Vec<(u32, f32)>, EngError> {
     expect_len(probs, shape.experts, "moe probabilities")?;
     if probs.iter().any(|v| !v.is_finite()) {

@@ -156,7 +156,7 @@ static int run_selected_operation(mlx_array*, mlx_stream, Run run) noexcept {
 }
 #endif
 
-// First-error capture for the mlx_compile seam (fix round 2 of the seam). mlx-c reports a
+// First-error capture for the mlx_compile seam. mlx-c reports a
 // failing closure body as the generic "mlx_closure returned a non-zero value", and that text is
 // the LAST message the error handler sees, so the real MLX exception of the failing traced call
 // is overwritten before the Rust adapter reads it. While the capture is armed, the handler below
@@ -288,14 +288,14 @@ extern "C" std::uint64_t inference_mlx_compile_delta_rows_cleanup_count() noexce
   return compile_delta_rows_cleanup_total.load(std::memory_order_relaxed);
 }
 
-// Prints the lazy graph of `outputs` into one malloced buffer (packet GPU-GAP-COUNT). The dump
-// takes part in NO selection of `run_selected_operation`, like `inference_mlx_async_eval`: it
-// fills no output array, so the null fault has no output to report and the mismatch fault has
-// no result to reshape, and the selection counts resident operation calls, which a description
-// of a pending graph is not (it neither runs work nor produces an array). `mlx_print_graph`
-// reads node names, shapes, and dtypes only: no evaluation, no synchronization, no release, so
-// the retire list of the adapter keeps its arrays. Every temporary frees on every path: the
-// output vector, the node namer, the memstream and its buffer. On success `*out` is a malloced
+// Prints the lazy graph of `outputs` into one malloced buffer. The dump takes part in NO
+// selection of `run_selected_operation`, like `inference_mlx_async_eval`: it fills no output
+// array, so the null fault has no output to report and the mismatch fault has no result to
+// reshape, and the selection counts resident operation calls, which a description of a pending
+// graph is not (it neither runs work nor produces an array). `mlx_print_graph` reads node
+// names, shapes, and dtypes only: no evaluation, no synchronization, no release, so the retire
+// list of the adapter keeps its arrays. Every temporary frees on every path: the output
+// vector, the node namer, the memstream and its buffer. On success `*out` is a malloced
 // NUL-terminated buffer of `*len` bytes that the caller owns (free it with
 // `inference_mlx_free_string`); on failure `*out` stays null and no allocation leaks.
 extern "C" int inference_mlx_graph_print(
@@ -348,12 +348,12 @@ extern "C" int inference_mlx_array_set_data(
   return mlx_array_set_data(array, data, shape, rank, dtype);
 }
 
-// Wraps caller-owned host pages as an array (decision 0041). MLX uses the memory in place when
-// Metal accepts the pointer and length. Otherwise MLX copies it and calls `dtor(payload)` before
-// the constructor returns. On the in-place path, MLX calls `dtor(payload)` once when the last
-// reference to the data drops, possibly on a Metal completion thread. A failure status means the
-// constructor did not complete, and the deleter may or may not have run. The stream serves only
-// the decision 0032 `mismatch` fault. The `call`, `null`, and `evaluate` faults also apply.
+// Wraps caller-owned host pages as an array. MLX uses the memory in place when Metal accepts the
+// pointer and length. Otherwise MLX copies it and calls `dtor(payload)` before the constructor
+// returns. On the in-place path, MLX calls `dtor(payload)` once when the last reference to the
+// data drops, possibly on a Metal completion thread. A failure status means the constructor did
+// not complete, and the deleter may or may not have run. The stream serves only the `mismatch`
+// fault. The `call`, `null`, and `evaluate` faults also apply.
 extern "C" int inference_mlx_array_new_data_managed_payload(
     mlx_array* result, void* data, const int* shape, int dim, mlx_dtype dtype, void* payload,
     void (*dtor)(void*), mlx_stream stream) noexcept {
@@ -403,7 +403,7 @@ extern "C" int inference_mlx_vector_array_free(mlx_vector_array vec) noexcept {
   return mlx_vector_array_free(vec);
 }
 
-// Process-wide MLX allocator queries and limits (decision 0039 Memory).
+// Process-wide MLX allocator queries and limits.
 extern "C" int inference_mlx_memory_stats(size_t* active, size_t* cache, size_t* peak) noexcept {
   int status = mlx_get_active_memory(active);
   if (status != 0) return status;
@@ -424,9 +424,9 @@ extern "C" int inference_mlx_eval(mlx_vector_array outputs) noexcept {
   return mlx_eval(outputs);
 }
 
-// One-shot submission fault (packet NATIVE-OPS-1 fix1): `INFERENCE_MLX_FAIL_ASYNC_EVAL=1` fails
-// the next `mlx_async_eval` without calling it. Uncounted, like a release fault, because the
-// submission takes part in no selection (see `inference_mlx_async_eval` below).
+// One-shot submission fault: `INFERENCE_MLX_FAIL_ASYNC_EVAL=1` fails the next `mlx_async_eval`
+// without calling it. Uncounted, like a release fault, because the submission takes part in no
+// selection (see `inference_mlx_async_eval` below).
 #ifdef INFERENCE_NATIVE_FAULT_QUALIFICATION
 static bool fail_async_eval_once() noexcept {
   static std::atomic_bool failed_once{false};
@@ -436,16 +436,16 @@ static bool fail_async_eval_once() noexcept {
 }
 #endif
 
-// Asynchronous evaluation (packet NATIVE-OPS-1): `mlx_async_eval` submits the graph of the
-// outputs and returns without waiting. The submission cannot run through the selection of
-// `run_selected_operation`: it fills no output array, so the null fault has no output to report
-// and the mismatch fault has no result to reshape, and the selection counts resident operation
-// calls, which an evaluation is not (the blocking `inference_mlx_eval` takes part in no selection
-// either). The submission therefore consumes no selection slot, and a counted fault aimed at the
-// selected operation after an `evaluate_async` call reaches that operation unconsumed
-// (native-failure test `evaluate_async_consumes_no_operation_fault_slot`). Only the un-counted
-// submission fault above applies to it. A submitted graph holds its arrays, so the caller may
-// release its handles; a later evaluation, readback, or synchronization completes the work.
+// Asynchronous evaluation: `mlx_async_eval` submits the graph of the outputs and returns without
+// waiting. The submission cannot run through the selection of `run_selected_operation`: it fills
+// no output array, so the null fault has no output to report and the mismatch fault has no result
+// to reshape, and the selection counts resident operation calls, which an evaluation is not (the
+// blocking `inference_mlx_eval` takes part in no selection either). The submission therefore
+// consumes no selection slot, and a counted fault aimed at the selected operation after an
+// `evaluate_async` call reaches that operation unconsumed (native-failure test
+// `evaluate_async_consumes_no_operation_fault_slot`). Only the un-counted submission fault above
+// applies to it. A submitted graph holds its arrays, so the caller may release its handles; a
+// later evaluation, readback, or synchronization completes the work.
 extern "C" int inference_mlx_async_eval(const mlx_vector_array outputs) noexcept {
 #ifdef INFERENCE_NATIVE_FAULT_QUALIFICATION
   if (fail_async_eval_once()) {
@@ -828,12 +828,11 @@ extern "C" int inference_mlx_grouped_attention(
   });
 }
 
-// Grouped-query attention over the first `len` positions of capacity buffers (packet
-// NATIVE-OPS-1). The key and value prefixes are `mlx_slice` views and are NOT made contiguous:
-// the fused attention reads the capacity buffer through the view, so no copy of the prefix is
-// built. The mask mode string follows `inference_mlx_grouped_attention`, so "causal" aligns the
-// mask to the last key of the prefix. The slice views are freed on every path; the lazy graph
-// holds what it needs.
+// Grouped-query attention over the first `len` positions of capacity buffers. The key and value
+// prefixes are `mlx_slice` views and are NOT made contiguous: the fused attention reads the
+// capacity buffer through the view, so no copy of the prefix is built. The mask mode string
+// follows `inference_mlx_grouped_attention`, so "causal" aligns the mask to the last key of the
+// prefix. The slice views are freed on every path; the lazy graph holds what it needs.
 extern "C" int inference_mlx_grouped_attention_prefix(
     mlx_array* result, mlx_array queries, mlx_array keys, mlx_array values, int len, float scale,
     bool causal, mlx_stream stream) noexcept {
@@ -864,13 +863,13 @@ extern "C" int inference_mlx_grouped_attention_prefix(
   });
 }
 
-// Affine row quantization (packet KV8-OPS): `mlx_quantize` of the last axis of `x` in groups of
-// `group_size` at `bits` bits, with mode "affine" and no global scale, so the scales and biases
-// carry the full range of each group. MLX fills one result VECTOR (codes, scales, biases); this
-// shim unpacks it into the caller's three handles and frees the vector on every path, as the
-// gated-delta shim unpacks its output vector. The codes are U32 with `bits`-wide fields packed
-// from the low end; the scales and biases take the dtype of `x`. The injected faults strike the
-// codes output.
+// Affine row quantization: `mlx_quantize` of the last axis of `x` in groups of `group_size` at
+// `bits` bits, with mode "affine" and no global scale, so the scales and biases carry the full
+// range of each group. MLX fills one result VECTOR (codes, scales, biases); this shim unpacks
+// it into the caller's three handles and frees the vector on every path, as the gated-delta
+// shim unpacks its output vector. The codes are U32 with `bits`-wide fields packed from the low
+// end; the scales and biases take the dtype of `x`. The injected faults strike the codes
+// output.
 extern "C" int inference_mlx_quantize_rows(
     mlx_array* codes, mlx_array* scales, mlx_array* biases, mlx_array x,
     mlx_optional_int group_size, mlx_optional_int bits, const char* mode,
@@ -890,19 +889,19 @@ extern "C" int inference_mlx_quantize_rows(
   });
 }
 
-// Quantized attention over the first `len` positions of quantized capacity buffers (packet
-// KV8-OPS), the form of mlx-lm's quantized KV cache. `queries` is [B, QH, L, D] and reshapes to
-// [B, KVH, rep * L, D] with `rep = QH / KVH` (the heads of one KV group are adjacent, so query
-// head h reads KV head h / rep). The scores are `mlx_quantized_matmul(q', K views, transpose =
-// true)` [B, KVH, rep * L, len] times `scale`; a causal chunk (L > 1) masks with `mlx_where`
-// over a device-built `keep` aligned to the LAST key - query row t sees keys 0..len - L + t -
-// broadcast over the repeats; the softmax runs over the last axis with the precise (F32) flag;
-// the output is `mlx_quantized_matmul(probs, V views, transpose = false)` [B, KVH, rep * L, D]
-// reshaped back to [B, QH, L, D]. All six prefix views are `mlx_slice` views with NO
-// `mlx_contiguous`, so the capacity buffers are read in place: MLX's quantized matmul reads a
-// strided prefix view without copying it (the Mac view-cost test and a probe in the MLX Python
-// package, both on 2026-10-13). Every temporary is freed on every path, as
-// `inference_mlx_grouped_attention_prefix` frees its views. The injected faults strike `result`.
+// Quantized attention over the first `len` positions of quantized capacity buffers, the form of
+// mlx-lm's quantized KV cache. `queries` is [B, QH, L, D] and reshapes to [B, KVH, rep * L, D]
+// with `rep = QH / KVH` (the heads of one KV group are adjacent, so query head h reads KV head h
+// / rep). The scores are `mlx_quantized_matmul(q', K views, transpose = true)` [B, KVH, rep * L,
+// len] times `scale`; a causal chunk (L > 1) masks with `mlx_where` over a device-built `keep`
+// aligned to the LAST key - query row t sees keys 0..len - L + t - broadcast over the repeats;
+// the softmax runs over the last axis with the precise (F32) flag; the output is
+// `mlx_quantized_matmul(probs, V views, transpose = false)` [B, KVH, rep * L, D] reshaped back
+// to [B, QH, L, D]. All six prefix views are `mlx_slice` views with NO `mlx_contiguous`, so the
+// capacity buffers are read in place: MLX's quantized matmul reads a strided prefix view without
+// copying it (shown by the Mac view-cost test and a probe in the MLX Python package). Every
+// temporary is freed on every path, as `inference_mlx_grouped_attention_prefix` frees its views.
+// The injected faults strike `result`.
 extern "C" int inference_mlx_quantized_attention_prefix(
     mlx_array* result, mlx_array queries, mlx_array k_codes, mlx_array k_scales,
     mlx_array k_biases, mlx_array v_codes, mlx_array v_scales, mlx_array v_biases, int len,
@@ -1043,14 +1042,14 @@ extern "C" int inference_mlx_quantized_attention_prefix(
   });
 }
 
-// The gated delta rule as one Metal kernel (decision 0050). `source` is the text of
+// The gated delta rule as one Metal kernel. `source` is the text of
 // `engine/vendor/mlx-lm-gated-delta/gated_delta_step.metal`. The kernel name, the input and output
 // names, the template arguments, the grid, and the threadgroup follow `_make_gated_delta_kernel`
 // and `gated_delta_kernel` of mlx-lm 0.31.0 (`gated_delta.py` lines 100 to 115 and 196 to 209).
 // `dims` holds B, T, Hk, Dk, Hv, and Dv. Every operand and both outputs are F32, so `InT` is float.
 // The kernel handle, its configuration, and the temporary arrays are freed before the call
-// returns. The lazy graph keeps what it needs. Shared with the compile closure bodies of packet
-// the compiled closures, which replay this call on tracer arrays.
+// returns. The lazy graph keeps what it needs. Shared with the bodies of the compiled closures,
+// which replay this call on tracer arrays.
 static int gated_delta_kernel_call(
     mlx_array* y, mlx_array* state_out, mlx_array q, mlx_array k, mlx_array v, mlx_array g,
     mlx_array beta, mlx_array state, const int* dims, const char* source,
@@ -1120,10 +1119,9 @@ extern "C" int inference_mlx_gated_delta(
 static const char kQ8DecodeKernelHeader[] =
     "\n#include <metal_stdlib>\n#include <metal_simdgroup>\nusing namespace metal;\n";
 // The fused-prefill header: MLX's preamble plus the precise-math helpers and
-// fp-contract-off that match MLX's own kernel rounding (the spike's HEADER).
-// The helpers use metal::precise::exp because MLX's kernels are built without
-// fast-math (the spike's diag_exact measured 0% mismatch with precise, 20-44%
-// with fast metal::exp).
+// fp-contract-off that match MLX's own kernel rounding. The helpers use
+// metal::precise::exp because MLX's kernels are built without fast-math (a
+// diagnostic measured 0% mismatch with precise, 20-44% with fast metal::exp).
 static const char kFusedPrefillHeader[] =
     "#include <metal_stdlib>\n"
     "#include <metal_simdgroup>\n"
@@ -1145,15 +1143,15 @@ static const char kFusedPrefillHeader[] =
     "}  // namespace\n";
 
 
-// The fused 8-bit KV decode attention as two Metal kernels (packet FUSED-KV8-a), modeled on
+// The fused 8-bit KV decode attention as two Metal kernels, modeled on
 // `inference_mlx_gated_delta`. `dims` holds QH, KVH, D, REP (= QH / KVH), CAP, and GSZ;
 // `len`, `nb` (the block count of `shape::decode_blocks`), and `scale` arrive as scalars, and
 // `pass1_source` / `pass2_source` are the two NUL-terminated kernel bodies of
 // `native/q8_decode_attention.metal`. The kernel and input names, the template arguments
 // (T = the query dtype, D, REP, RPH, SGS, GSZ), the grids, and the threadgroups match the
-// launcher of the two kernels: pass 1 runs the R4 structure of packet FUSED-KV8-EFF-2 -
-// RPH = the largest divisor of REP that is at most 4 query heads per simdgroup, SGS =
-// REP / RPH simdgroups per threadgroup, all on the same block of keys - with the grid
+// launcher of the two kernels: pass 1 runs RPH = the largest divisor of REP that is at most 4
+// query heads per simdgroup and SGS = REP / RPH simdgroups per threadgroup, all on the same
+// block of keys, with the grid
 // `(NB * 32, KVH * REP / RPH, 1)` and the threadgroup `(32, SGS, 1)` (the grid is in
 // THREADS, as MLX specifies: NB * 32 over 32 gives one threadgroup per block, and
 // KVH * SGS threads over SGS give the KVH threadgroup rows, one per KV head: RPH divides REP,
@@ -1173,11 +1171,11 @@ extern "C" int inference_mlx_quantized_attention_decode(
   return run_selected_operation(result, stream, [&] {
     const int qh = dims[0], kvh = dims[1], d = dims[2], rep = dims[3], cap = dims[4],
               gsz = dims[5];
-    // The R4 pass-1 structure (packet FUSED-KV8-EFF-2): RPH is the largest divisor of REP
-    // that is at most 4 (REP 8 gives RPH 4 and SGS 2; REP 4 gives 4 and 1; REP 6 gives 3
-    // and 2; REP 5 and 7 give 1 with SGS = REP; REP 1, 2, 3 give RPH = REP and SGS 1), so
-    // the per-lane q/o state covers RPH instead of all REP heads. REP is at least one, so
-    // the loop always stops at rph = 1.
+    // The pass-1 structure: RPH is the largest divisor of REP that is at most 4 (REP 8
+    // gives RPH 4 and SGS 2; REP 4 gives 4 and 1; REP 6 gives 3 and 2; REP 5 and 7 give 1
+    // with SGS = REP; REP 1, 2, 3 give RPH = REP and SGS 1), so the per-lane q/o state
+    // covers RPH instead of all REP heads. REP is at least one, so the loop always stops
+    // at rph = 1.
     int rph = 4;
     while (rep % rph != 0) {
       rph--;
@@ -1332,10 +1330,10 @@ extern "C" int inference_mlx_quantized_attention_decode(
   });
 }
 
-// The flash prefill attention as ONE fused Metal kernel (R4-5), modeled on
-// `inference_mlx_quantized_attention_decode` above, with the launch contract of the
-// r45-mma-spike LAUNCH.md. `dims` holds D, H, REP (= H / KVH), CAP, and GSZ; `rows` is
-// the query row count of this chunk, `length` the valid keys including the chunk
+// The flash prefill attention as ONE fused Metal kernel, modeled on
+// `inference_mlx_quantized_attention_decode` above. `dims` holds D, H, REP (= H / KVH),
+// CAP, and GSZ; `rows` is the query row count of this chunk, `length` the valid keys
+// including the chunk
 // (= q_offset + rows), `cap` the capacity stride of the WHOLE buffers passed as the
 // quantized operands (never a sliced prefix view - with ensure-contiguous MLX would
 // copy a non-contiguous view and the stride would be len, not cap), and `scale` the
@@ -1345,7 +1343,7 @@ extern "C" int inference_mlx_quantized_attention_decode(
 // specifies: ceil(rows / 8) threadgroups of NSG * 32 = 256 threads over the KV
 // heads, and the threadgroup is ALWAYS set explicitly (without it the first
 // dispatch after compilation returns zeros). LD is the staging leading dimension
-// D + 8 (the spike contract's 264 at D 256).
+// D + 8 (264 at D 256).
 // The shared attention's float path: the vendor fused SDPA with mask_arr, sinks,
 // and force_fused (fast.h takes all three; may-be-null optionals arrive as NULL_ARRAY).
 extern "C" int inference_mlx_fused_sdpa(
@@ -1469,12 +1467,11 @@ extern "C" int inference_mlx_q8_flash_prefill(
 }
 
 
-// The flash-delta gated rule (R4-6, Q36_FLASH_DELTA=1): the chunked WY-form kernel of the
-// r45-gdn-chunk-spike: the same operands as `inference_mlx_gated_delta` above (input
-// names q,k,v,g,beta,state_in,T; F32 outputs y/state_out), with NS 16 added and the
+// The flash-delta gated rule (Q36_FLASH_DELTA=1) as the chunked WY-form kernel: the same
+// operands as `inference_mlx_gated_delta` above (input names q,k,v,g,beta,state_in,T; F32
+// outputs y/state_out), with NS 16 added and the
 // WY grid (32*Dv/8, B*Hv, 1) threads and threadgroup (32*16, 1, 1). Supported: B 1,
-// Dk%64, Dv%128 (8*NS), Hv%Hk. `dims` holds B, T, Hk, Dk, Hv, Dv. (Removed stale
-// placeholder text.)
+// Dk%64, Dv%128 (8*NS), Hv%Hk. `dims` holds B, T, Hk, Dk, Hv, Dv.
 
 static int flash_delta_kernel_call(
     mlx_array* y, mlx_array* state_out, mlx_array q, mlx_array k, mlx_array v, mlx_array g,
@@ -1502,8 +1499,8 @@ static int flash_delta_kernel_call(
       mlx_fast_metal_kernel_config_add_output_arg(config, y_shape, 4, MLX_FLOAT32);
   if (status == 0) status =
       mlx_fast_metal_kernel_config_add_output_arg(config, state_shape, 4, MLX_FLOAT32);
-  // The chunked WY-form contract (r45-gdn-chunk-spike LAUNCH.md): the grid is in THREADS
-  // (32 * Dv / 8 over the value dim, one threadgroup of NS simdgroups per head).
+  // The chunked WY-form contract: the grid is in THREADS (32 * Dv / 8 over the value
+  // dim, one threadgroup of NS simdgroups per head).
   if (status == 0) status =
       mlx_fast_metal_kernel_config_set_grid(config, 32 * dv / 8, b * hv, 1);
   if (status == 0) status =
@@ -1545,15 +1542,15 @@ extern "C" int inference_mlx_flash_delta(
 }
 
 
-// The gdn_prep fused kernel (R4-7, Q36_FUSED_PREFILL=1): ONE kernel for the whole
+// The gdn_prep fused kernel (Q36_FUSED_PREFILL=1): ONE kernel for the whole
 // DeltaNet pre-recurrence chain of prefill/delta.rs::chunk - the causal conv, silu,
 // q/k/v split, L2 norms, gates g and beta, and the new ring - replacing ~20 MLX
-// kernels (the r45-mac-prefill-fusion-spike measured -2.63 ms per layer chunk at
-// 1024 rows). The launch contract follows the spike LAUNCH.md: input names in this
-// order, template args RB 16 + LDU/OFFU/LDA/OFFA/LDB/OFFB, the grid in THREADS
-// (16*128, ceil(rows/16), 1), and the threadgroup (128, 1, 1). The header carries
-// the precise-math helpers (fp contract off, metal::precise::exp) that match the
-// unfused MLX kernel rounding. Six outputs: q, k, v, g, beta, ring_out.
+// kernels (measured -2.63 ms per layer chunk at 1024 rows). The launch contract:
+// input names in this order, template args RB 16 + LDU/OFFU/LDA/OFFA/LDB/OFFB, the
+// grid in THREADS (16*128, ceil(rows/16), 1), and the threadgroup (128, 1, 1). The
+// header carries the precise-math helpers (fp contract off, metal::precise::exp)
+// that match the unfused MLX kernel rounding. Six outputs: q, k, v, g, beta,
+// ring_out.
 static int gdn_prep_kernel_call(
     mlx_array* q_out, mlx_array* k_out, mlx_array* v_out, mlx_array* g_out,
     mlx_array* beta_out, mlx_array* ring_out, mlx_array u_in, mlx_array a_in,
@@ -1657,10 +1654,10 @@ extern "C" int inference_mlx_gdn_prep(
 }
 
 
-// The act_mul fused kernel (R4-7, Q36_FUSED_PREFILL=1): SwiGLU activation
-// of the experts - h = bf16(bf16(g * sigmoid(g)) * u) - replacing sigmoid,
-// multiply, multiply. Follows the spike LAUNCH.md: grid (NCOL/4, rows, 1),
-// threadgroup (64, 1, 1), template args NCOL/LDG/OFFG/LDU/OFFU.
+// The act_mul fused kernel (Q36_FUSED_PREFILL=1): SwiGLU activation of the
+// experts - h = bf16(bf16(g * sigmoid(g)) * u) - replacing sigmoid,
+// multiply, multiply. Launch contract: grid (NCOL/4, rows, 1), threadgroup
+// (64, 1, 1), template args NCOL/LDG/OFFG/LDU/OFFU.
 static int act_mul_kernel_call(
     mlx_array* h_out, mlx_array g_in, mlx_array u_in, const int* dims,
     const char* source, mlx_stream stream) noexcept {
@@ -1720,11 +1717,11 @@ extern "C" int inference_mlx_act_mul(
 }
 
 
-// The gdn_post fused kernel (R4-7, Q36_FUSED_PREFILL=1): gated RMS norm and
-// output gate in one kernel - o = bf16(rms_norm(core) * silu(z)) - replacing
-// rms_norm, silu, mul, and the cast (5 kernels). Follows the spike LAUNCH.md:
-// threadgroup (128,1,1), grid (ceil(rows*32/4)*128, 1, 1) threads, template
-// args LDZ/OFFZ.
+// The gdn_post fused kernel (Q36_FUSED_PREFILL=1): gated RMS norm and output
+// gate in one kernel - o = bf16(rms_norm(core) * silu(z)) - replacing
+// rms_norm, silu, mul, and the cast (5 kernels). Launch contract: threadgroup
+// (128,1,1), grid (ceil(rows*32/4)*128, 1, 1) threads, template args
+// LDZ/OFFZ.
 static int gdn_post_kernel_call(
     mlx_array* o_out, mlx_array core, mlx_array z_in, mlx_array norm_w,
     float eps, const int* dims, const char* source, mlx_stream stream) noexcept {
@@ -1781,9 +1778,9 @@ extern "C" int inference_mlx_gdn_post(
 }
 
 
-// The attn_gate fused kernel (R4-7, Q36_FUSED_PREFILL=1): the flash-attention
-// output transpose + sigmoid gate + cast in one kernel. Follows the spike
-// LAUNCH.md: threadgroup (64,1,1), grid (QH*D/4, rows, 1) threads.
+// The attn_gate fused kernel (Q36_FUSED_PREFILL=1): the flash-attention
+// output transpose + sigmoid gate + cast in one kernel. Launch contract:
+// threadgroup (64,1,1), grid (QH*D/4, rows, 1) threads.
 static int attn_gate_kernel_call(
     mlx_array* o_out, mlx_array att, mlx_array qp, const int* dims,
     const char* source, mlx_stream stream) noexcept {
@@ -1830,12 +1827,12 @@ static int attn_gate_kernel_call(
   return status != 0 ? status : released;
 }
 
-// The moe_combine fused kernel (R4-7, Q36_FUSED_PREFILL=1): the un-sort take, the F32 gate
+// The moe_combine fused kernel (Q36_FUSED_PREFILL=1): the un-sort take, the F32 gate
 // product, the choice sum, the shared-expert sigmoid fold, and the activation cast in one
-// kernel. Follows the spike LAUNCH.md: threadgroup (128,1,1), grid (HID/4, rows, 1).
-// The moe_combine fused kernel (R4-7, Q36_FUSED_PREFILL=1): the un-sort take, the F32 gate
+// kernel. Launch contract: threadgroup (128,1,1), grid (HID/4, rows, 1).
+// The moe_combine fused kernel (Q36_FUSED_PREFILL=1): the un-sort take, the F32 gate
 // product, the choice sum, the shared-expert sigmoid fold, and the activation cast in one
-// kernel. Follows the spike LAUNCH.md: threadgroup (128,1,1), grid (HID/4, rows, 1).
+// kernel. Launch contract: threadgroup (128,1,1), grid (HID/4, rows, 1).
 static int moe_combine_kernel_call(
     mlx_array* out, mlx_array eo, mlx_array inverse, mlx_array gates,
     mlx_array so, mlx_array raw, const int* dims,
@@ -1914,10 +1911,10 @@ extern "C" int inference_mlx_slice_update(
   });
 }
 
-// `mlx_slice_update` for a target that the caller consumed (packet NATIVE-OPS-1). The call is the
-// same native operation; the caller releases its own handle of the target right after this
-// returns, so the lazy node is the only owner of the target buffer at evaluation time and MLX
-// donates the buffer and writes the rows in place instead of copying the capacity.
+// `mlx_slice_update` for a target that the caller consumed. The call is the same native
+// operation; the caller releases its own handle of the target right after this returns, so the
+// lazy node is the only owner of the target buffer at evaluation time and MLX donates the buffer
+// and writes the rows in place instead of copying the capacity.
 extern "C" int inference_mlx_kv_append(
     mlx_array* result, mlx_array target, mlx_array update, const int* start,
     const int* stop, const int* strides, size_t rank, mlx_stream stream) noexcept {
@@ -1944,9 +1941,9 @@ extern "C" int inference_mlx_concatenate_axis(
   });
 }
 
-// Device-side zeros (packet CTX32K-GROW): fills the array on the GPU with no
-// host staging vector and no import copy, so a KV plane allocation costs no
-// host memory bandwidth.
+// Device-side zeros: fills the array on the GPU with no host staging vector
+// and no import copy, so a KV plane allocation costs no host memory
+// bandwidth.
 extern "C" int inference_mlx_zeros(
     mlx_array* result, const int* shape, size_t rank, mlx_dtype dtype,
     mlx_stream stream) noexcept {
@@ -2074,8 +2071,8 @@ extern "C" const int64_t* inference_mlx_array_data_int64(mlx_array array) noexce
 }
 
 // ---------------------------------------------------------------------------
-// mlx_compile seam (packet MX-COMPILE-1a: the compiled DeltaNet and MoE decode blocks run
-// behind the engine setting `qwen36.compile`, default false). The compile probe of stage 1
+// mlx_compile seam (the compiled DeltaNet and MoE decode blocks run behind the engine setting
+// `qwen36.compile`, default false). The compile probe of stage 1
 // stays test-only. A non-zero status makes the Rust adapter mark itself failed, as every resident operation does:
 // there is no fallback to the uncompiled path after the setting turned the seam on. The two
 // block wrappers run under `run_selected_operation`, so the qualification fault hooks select
@@ -2088,12 +2085,11 @@ extern "C" const int64_t* inference_mlx_array_data_int64(mlx_array array) noexce
 // thread's cache at teardown.
 // ---------------------------------------------------------------------------
 
-// Process-wide counts of compiled closure-body entries per block kind (packet MX-COMPILE-1a,
-// fix round 1): the authoritative trace counts of the seam. A body entry means MLX traced the
-// closure — or returned the uncompiled function, which runs the body on every call — while a
-// cache hit replays the compiled tape without entering the body. The counts cover every thread;
-// relaxed loads and stores are enough because they only observe the counts, never order other
-// memory.
+// Process-wide counts of compiled closure-body entries per block kind: the authoritative trace
+// counts of the seam. A body entry means MLX traced the closure — or returned the uncompiled
+// function, which runs the body on every call — while a cache hit replays the compiled tape
+// without entering the body. The counts cover every thread; relaxed loads and stores are enough
+// because they only observe the counts, never order other memory.
 static std::atomic<uint64_t> compile_delta_body_entries_{0};
 static std::atomic<uint64_t> compile_moe_body_entries_{0};
 
@@ -2424,7 +2420,7 @@ static int compile_delta_slot(
   if (status == 0) status = inference_mlx_reshape(&alpha.value, alpha_exp.value, gate_scalar_shape, 3, s);
   if (status == 0) status = inference_mlx_sigmoid(&beta_sig.value, b_used, s);
   if (status == 0) status = inference_mlx_reshape(&beta.value, beta_sig.value, gate_scalar_shape, 3, s);
-  // The gated delta rule for one token (decision 0050).
+  // The gated delta rule for one token.
   if (status == 0) status = inference_mlx_reshape(&state4.value, rec, state_shape, 4, s);
   if (status == 0)
     status = inference_mlx_gated_delta(
@@ -2702,14 +2698,14 @@ static int compile_moe_rows(
 // calling the same inference_mlx_* shims that the uncompiled Rust path calls, in the same
 // order. A stable
 // ascending argsort of the negated probabilities keeps the lowest index first on ties, like the
-// host rule. The expert ids are clamped below the expert count ONCE per layer (packet
-// GAP-TRIM-A): the top-probability take and the three gathered products share the one
-// `mlx_minimum` node. The BF16 casts of packet Q36-BF16-a are mirrored exactly: the F32
-// `router_t` and `shared_scalar_t` promote the activation-dtype products on their own, the F32
-// gates promote the weighted expert sum, and the block total converts to the activation dtype
-// at the very end (`to_act`, conditional like `ops::to_act`). A matmul allocates a fresh
-// row-contiguous output and an axis-0 take returns the gather output as is, so GAP-TRIM-A
-// dropped the no-op `Contiguous` calls of the original closure; nothing here rebuilds them.
+// host rule. The expert ids are clamped below the expert count ONCE per layer: the
+// top-probability take and the three gathered products share the one `mlx_minimum` node. The
+// BF16 casts of the uncompiled block are mirrored exactly: the F32 `router_t` and
+// `shared_scalar_t` promote the activation-dtype products on their own, the F32 gates promote
+// the weighted expert sum, and the block total converts to the activation dtype at the very end
+// (`to_act`, conditional like `ops::to_act`). A matmul allocates a fresh row-contiguous output
+// and an axis-0 take returns the gather output as is, so the no-op `Contiguous` calls of the
+// original closure are gone; nothing here rebuilds them.
 //
 // Input order (21): x [B,H]; router_t [H,E]; payload, scales, biases of the shared gate, up, and
 // down weights; shared_scalar_t [H,1]; payload, scales, biases of the gate, up, and down expert
@@ -2767,7 +2763,7 @@ static int compile_moe_body(
   if (status == 0) status = inference_mlx_softmax(&probs.value, logits.value, true, s);
   if (status == 0) status = inference_mlx_reshape(&flat.value, probs.value, flat_shape, 1, s);
   // Device routing: stable argsort of the negated row, slice, ONE clamp below the expert count
-  // for the whole layer (packet GAP-TRIM-A), take, renormalize, health.
+  // for the whole layer, take, renormalize, health.
   if (status == 0) status = inference_mlx_negative(&negated.value, flat.value, s);
   if (status == 0) status = inference_mlx_argsort_axis(&order.value, negated.value, 0, s);
   if (status == 0) status = inference_mlx_slice(&ids.value, order.value, start, stop, strides1, 1, s);
@@ -2904,7 +2900,7 @@ static int compile_apply_block(
   return status;
 }
 
-// The DeltaNet decode block as one compiled closure (packet MX-COMPILE-1a). `dims` holds
+// The DeltaNet decode block as one compiled closure. `dims` holds
 // hidden, kh, kd, vh, vd, cd, taps, kw, kw2.
 // `quant` holds mode, group, bits per weight for qkv, z, b, a, out (15 values; group and bits -1
 // when the mode has none). Inputs follow compile_delta_body: 26 base arrays plus any
@@ -2954,7 +2950,7 @@ static int compile_delta_apply(
       );
 }
 
-// ===== Flint layer-subgraph compile probe (graph-cache slice, 2026-10-25) =====
+// ===== Flint layer-subgraph compile probe =====
 // Test builds only: the whole probe region (both probes + their counter and
 // entry points) sits behind the qualification define so production MLX
 // builds compile none of it; the Rust wrappers carry the matching cfg.
@@ -3310,7 +3306,7 @@ extern "C" int inference_mlx_compile_delta_rows(
   return status;
 }
 
-// The device-routed MoE decode block as one compiled closure (packet MX-COMPILE-1a). `dims`
+// The device-routed MoE decode block as one compiled closure. `dims`
 // holds hidden, experts, top_k, and renorm (0 or 1). `quant` holds mode, group, bits per weight for the shared gate, up, down
 // and the gate, up, down stacks (18 values). `inputs` holds the 21 arrays of the input order of
 // `compile_moe_body`. `activation` is the activation dtype of the step. The outputs are lazy.

@@ -1022,8 +1022,11 @@ fn control_cache_three_turn_append_only() {
 
     let bundle = crate::tokenizer::flint_tests::load_bundle();
     let (mut executor, mut session, enabled) = cache_single_state(4096, &bundle);
+    // Default OFF stays bit-for-bit unobservable: a
+    // closed store answers (0, 0) and no report at all.
     assert_eq!(executor.prefix_limits().roots, 0);
     assert_eq!(executor.prefix_limits().entries, 0);
+    assert!(executor.prefix_report().is_none());
     let mut expected_history = Vec::new();
     let mut turns = Vec::new();
     for prompt_len in [512, 768, 1024] {

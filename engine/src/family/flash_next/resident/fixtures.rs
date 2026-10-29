@@ -1,4 +1,4 @@
-//! In-memory packed Flash-Next checkpoint for the resident tests (S1-C plan section 4, option B).
+//! In-memory packed Flash-Next checkpoint for the resident tests.
 //!
 //! H 64, C 2, W 128, R 32, vocabulary 8; layer 0 DeltaNet, layer 1 QSA, PLE at layer 1. Every packed
 //! tensor is affine 4-bit, group 32. Every payload word is `0x7654_3210`, so element `c` of a row is

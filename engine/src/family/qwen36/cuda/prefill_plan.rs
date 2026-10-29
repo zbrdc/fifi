@@ -1,5 +1,5 @@
-//! The pure plan of chunked prefill (decision 0049, packet CPF-1 v1): the two-term chunk
-//! policy and the chunk list, the admission rule, and the arena tensor list of one chunk.
+//! The pure plan of chunked prefill: the two-term chunk policy and the chunk list, the admission
+//! rule, and the arena tensor list of one chunk.
 //!
 //! Host arithmetic only: no CUDA call. It sits in `family::qwen36::cuda`, so it compiles with
 //! that module (`native-cuda` on Linux) and not in the default feature set; it calls the
@@ -9,10 +9,10 @@
 //! are phases of one layer, as in `step_plan`: a layer runs the DeltaNet block (`D*`) or the
 //! attention block (`A*`), so their tensors may alias.
 //!
-//! Admission charges the computed `plan_arena` total plus a flat `part` (the P-b rows of 0049
-//! are inputs of the reproduction tests only). The attention `part` buffer is its own
-//! allocation outside the arena; its real size is reported in [`ChunkCost`] beside the flat
-//! 64 MiB charge, which CPF-1 keeps: lane M decides on the difference (0049 A6 item 8).
+//! Admission charges the computed `plan_arena` total plus a flat `part` (the design's rows are
+//! inputs of the reproduction tests only). The attention `part` buffer is its own allocation
+//! outside the arena; its real size is reported in [`ChunkCost`] beside the flat 64 MiB charge,
+//! which this plan keeps until a decision on the difference.
 
 use super::{
     dims::{KvMode, StepDims, StepOptions},
@@ -41,15 +41,15 @@ use crate::{
     },
 };
 
-/// The chunk sizes a session arena may be built for, largest first (0049 item 9). The largest
-/// is also the default of the `qwen36.prefill_chunk` cap: absent means no cap.
+/// The chunk sizes a session arena may be built for, largest first. The largest is also the default
+/// of the `qwen36.prefill_chunk` cap: absent means no cap.
 pub(crate) const M_LADDER: [usize; 5] = [2048, 1024, 512, 256, 128];
 /// Keep 1,024-row chunks through the warm 32K–64K range; partials remain capped at 64 MiB.
 const TIER_1024_FROM: usize = 3 * 1024;
 const TIER_512_FROM: usize = 64 * 1024;
-/// A chunk size is admitted only if at least this many device bytes stay spare (0049 item 9).
+/// A chunk size is admitted only if at least this many device bytes stay spare.
 pub(crate) const SPARE_MIN: usize = 64 << 20;
-/// The flat device charge for the attention `part` buffer in every admission row (0049 item 9).
+/// The flat device charge for the attention `part` buffer in every admission row.
 pub(crate) const PART_CHARGE: usize = CPF_ATTN_PART_CAP;
 
 fn overflow() -> EngError {
@@ -147,17 +147,16 @@ pub(crate) struct ChunkCost {
     pub(crate) m: usize,
     /// The `plan_arena` total of the chunk's tensor list.
     pub(crate) arena: usize,
-    /// Bytes of the attention `part` buffer of the `M_sess` split plan, reported for lane M's
-    /// decision on the flat charge (0049 A6 item 8). The driver allocates the buffer at
-    /// [`PART_CHARGE`] (= `CPF_ATTN_PART_CAP`), never at this figure: a smaller chunk
-    /// launched with its own split plan can need more than the `M_sess` plan (209 rows in a
-    /// 256-row session: 14,266,368 B against 12,681,216; 641 rows in a 1,024-row session:
-    /// 21,399,552 against 16,908,288), and the flat cap covers both.
+    /// Bytes of the attention `part` buffer of the `M_sess` split plan, reported for a decision on
+    /// the flat charge. The driver allocates the buffer at [`PART_CHARGE`] (= `CPF_ATTN_PART_CAP`),
+    /// never at this figure: a smaller chunk launched with its own split plan can need more than
+    /// the `M_sess` plan (209 rows in a 256-row session: 14,266,368 B against 12,681,216; 641 rows
+    /// in a 1,024-row session: 21,399,552 against 16,908,288), and the flat cap covers both.
     pub(crate) part: usize,
 }
 
-/// One extra tensor of the admission sum (seam I4): `fixed + bytes_per_token * M` bytes, such
-/// as the tiered `partial [M][2048]` f32 (8,192 B per token) or the expert bank.
+/// One extra tensor of the admission sum: `fixed + bytes_per_token * M` bytes, such as the tiered
+/// `partial [M][2048]` f32 (8,192 B per token) or the expert bank.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct Extra {
     pub(crate) name: &'static str,
@@ -180,28 +179,26 @@ fn extras_bytes(extras: &[Extra], m: usize) -> Result<usize, EngError> {
     Ok(total)
 }
 
-/// The admission inputs that do not depend on the chunk size or the window (0049 item 9).
+/// The admission inputs that do not depend on the chunk size or the window.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct Admission {
-    /// Device bytes for the resident state ([`state_bytes`]), the decode arena, the prefill
-    /// arena and `part`: free VRAM measured ONCE by the caller right after the weight load
-    /// and BEFORE the resident state (the DeltaNet pool, the KV and the words, which
-    /// `ResidentState::allocate` takes together) and the decode-arena allocations, less the
-    /// headroom (never a literal here); the state and the decode arena are then charged as
-    /// their own inputs (lane C ruling, 2026-10-14 00:18, option (b): a figure from before
-    /// the KV is from before the pool too). The snapshot must follow the loading of every
-    /// kernel module: until KV8-B B4 sets CUDA_MODULE_LOADING=EAGER (or one warm-up launch
-    /// per entry) at start, a lazily loaded module can take VRAM after the snapshot, and the
-    /// headroom has to cover it (lane C ruling, 2026-10-13 23:55). The step's small session
-    /// resources — the stream, the event, the pinned word and the kernel scratch (`step.rs`)
-    /// — also stay inside that headroom; the decode arena keeps its own separate charge
-    /// (real memory, not headroom).
+    /// Device bytes for the resident state ([`state_bytes`]), the decode arena, the prefill arena
+    /// and `part`: free VRAM measured ONCE by the caller right after the weight load and BEFORE the
+    /// resident state (the DeltaNet pool, the KV and the words, which `ResidentState::allocate`
+    /// takes together) and the decode-arena allocations, less the headroom (never a literal here);
+    /// the state and the decode arena are then charged as their own inputs (a figure from before
+    /// the KV is from before the pool too). The snapshot must follow the loading of every kernel
+    /// module: until the start sets CUDA_MODULE_LOADING=EAGER (or makes one warm-up launch per
+    /// entry), a lazily loaded module can take VRAM after the snapshot, and the headroom has to
+    /// cover it. The step's small session resources — the stream, the event, the pinned word and
+    /// the kernel scratch (`step.rs`) — also stay inside that headroom; the decode arena keeps its
+    /// own separate charge (real memory, not headroom).
     pub(crate) device_budget: usize,
-    /// `DeviceArena::bytes()` of the decode plan, read at run time (0049 A6 item 6).
+    /// `DeviceArena::bytes()` of the decode plan, read at run time.
     pub(crate) decode_arena: usize,
     /// The flat `part` charge, [`PART_CHARGE`] in every row.
     pub(crate) part_charge: usize,
-    /// Fallback buffers when one is active; 0 for Qwen3.6 Native (A4).
+    /// Fallback buffers when one is active; 0 for Qwen3.6 Native.
     pub(crate) fallback: usize,
     pub(crate) device_extras: Vec<Extra>,
     /// Pinned host bytes available, a separate budget: host extras never enter the device sum.
@@ -228,9 +225,9 @@ impl Admission {
     /// of the flat and the real `part`, the fallback and the device extras) leaves at least
     /// [`SPARE_MIN`] spare and the pinned host rows fit the host budget.
     pub(crate) fn passes(&self, state: usize, cost: &ChunkCost) -> Result<bool, EngError> {
-        // The part term is the larger of the flat charge and the chunk's real part: the flat
-        // charge is the floor, so a later lowering of `part_charge` (lane M, A6 item 8)
-        // cannot undercharge a chunk whose own split plan needs more.
+        // The part term is the larger of the flat charge and the chunk's real part: the flat charge
+        // is the floor, so a later lowering of `part_charge` cannot undercharge a chunk whose own
+        // split plan needs more.
         let part = self.part_charge.max(cost.part);
         let parts = [
             self.decode_arena,
@@ -251,13 +248,12 @@ impl Admission {
     }
 
     /// `M_sess`: the largest of `costs` that is admitted and at most `cap` (the
-    /// `qwen36.prefill_chunk` member; `None` is no cap, 2,048). `None` means no size passes
-    /// and the session keeps the per-token path. The budget is the caller's snapshot of free
-    /// VRAM after the weight load and before the resident state and the decode-arena
-    /// allocations, less the headroom (`device_budget`), and that snapshot must follow the
-    /// loading of every kernel module: until KV8-B B4 loads eagerly, a lazily loaded module
-    /// can take VRAM after it and the headroom has to cover that too (lane C ruling,
-    /// 2026-10-13 23:55).
+    /// `qwen36.prefill_chunk` member; `None` is no cap, 2,048). `None` means no size passes and the
+    /// session keeps the per-token path. The budget is the caller's snapshot of free VRAM after the
+    /// weight load and before the resident state and the decode-arena allocations, less the
+    /// headroom (`device_budget`), and that snapshot must follow the loading of every kernel
+    /// module: until the start loads modules eagerly, a lazily loaded module can take VRAM after it
+    /// and the headroom has to cover that too.
     pub(crate) fn admit(
         &self,
         state: usize,
@@ -281,23 +277,22 @@ impl Admission {
 }
 
 /// KV bytes of a session of `window` positions: the pool's exact bytes per position, without
-/// `KvPool`'s per-plane `STATE_ALIGN` rounding (at most 255 B a plane, 40 planes at
-/// `Int8G32` — about 10 KiB; zero at `Fp16` on this model, whose planes are whole multiples
-/// of the alignment). The admission state term is the whole layout ([`state_bytes`]); this
-/// exact figure is the 0049-reproduction input.
+/// `KvPool`'s per-plane `STATE_ALIGN` rounding (at most 255 B a plane, 40 planes at `Int8G32` —
+/// about 10 KiB; zero at `Fp16` on this model, whose planes are whole multiples of the alignment).
+/// The admission state term is the whole layout ([`state_bytes`]); this exact figure is the input
+/// of the design-reproduction tests.
 pub(crate) fn kv_bytes(dims: &StepDims, mode: KvMode, window: usize) -> Result<usize, EngError> {
     KvPool::bytes_per_token(dims, mode)?
         .checked_mul(window)
         .ok_or_else(overflow)
 }
 
-/// The state term of the admission sum: [`StateLayout::bytes`] of a session of `window`
-/// positions and `delta_slots` DeltaNet slots — the pool, the KV and the persistent words —
-/// because `ResidentState::allocate` allocates all three together after the budget snapshot
-/// (lane C ruling, 2026-10-14 00:18, option (b)). The KV mode flows through the layout, so
-/// `Fp16` and `Int8G32` keep their own figures; the decode arena, the workspace and a
-/// prefill arena are separate terms (the [`StateLayout::bytes`] doc). The options fields no
-/// pool reads (`forked_experts`, `tiered`, `layout`) sit at the stage-1 defaults.
+/// The state term of the admission sum: [`StateLayout::bytes`] of a session of `window` positions
+/// and `delta_slots` DeltaNet slots — the pool, the KV and the persistent words — because
+/// `ResidentState::allocate` allocates all three together after the budget snapshot. The KV mode
+/// flows through the layout, so `Fp16` and `Int8G32` keep their own figures; the decode arena, the
+/// workspace and a prefill arena are separate terms (the [`StateLayout::bytes`] doc). The options
+/// fields no pool reads (`forked_experts`, `tiered`, `layout`) sit at the stage-1 defaults.
 pub(crate) fn state_bytes(
     dims: &StepDims,
     mode: KvMode,
@@ -344,7 +339,7 @@ pub(crate) enum Phase {
     Combine,
 }
 
-/// The arena tensors of one chunk (plan section C.3).
+/// The arena tensors of one chunk.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum ChunkSlot {
     Hidden,
@@ -391,12 +386,14 @@ type Row = (ChunkSlot, usize, Phase, Phase);
 fn common_rows(g: &MixerGeometry, m: usize, nsm: usize) -> Result<Vec<Row>, EngError> {
     use {ChunkSlot as S, Phase::*};
     let hidden = row_bytes(m, g.hidden).ok_or_else(overflow)?;
-    // `xf_bytes` is not monotone in m: a chunk of at most 16 rows packs the whole fixed
-    // fragment (65,537 * 16 B, `native.rs`), so each sink planned at `m` rows also carries
-    // the 1-row figure, or a smaller chunk of the session would not fit its slot (M1).
-    // `xf_bytes` is not monotone in m: a chunk of at most 16 rows packs the whole fixed
-    // fragment (65,537 * 16 B, `native.rs`), so each sink planned at `m` rows also carries
-    // the 1-row figure, or a smaller chunk of the session would not fit its slot (M1).
+    // `xf_bytes` is not monotone in m: a chunk of at most 16 rows packs the whole fixed fragment
+    // (65,537 * 16 B, `native.rs`), so each sink planned at `m` rows also carries the 1-row figure,
+    // or a smaller chunk of the session would not fit its slot (the prefix promise of
+    // `chunk_tensors`).
+    // `xf_bytes` is not monotone in m: a chunk of at most 16 rows packs the whole fixed fragment
+    // (65,537 * 16 B, `native.rs`), so each sink planned at `m` rows also carries the 1-row figure,
+    // or a smaller chunk of the session would not fit its slot (the prefix promise of
+    // `chunk_tensors`).
     let xf = xf_bytes(m, g.hidden)
         .zip(xf_bytes(1, g.hidden))
         .map(|(bytes, fragment)| bytes.max(fragment))

@@ -13,7 +13,7 @@ use sha2::{Digest, Sha256};
 use std::{fs, io, path::Path, time::Instant};
 
 /// Which env set the probe piece size + the serving knob state, in every
-/// probe's run metadata (coordinator one-liner ask).
+/// probe's run metadata.
 fn env_snapshot() -> Value {
     json!({
         "FLINT_QUAL_CHUNK_ROWS": crate::family::flint::factory::os_setting(
@@ -28,8 +28,8 @@ fn env_snapshot() -> Value {
 }
 
 /// The probes' piece size: FLINT_QUAL_CHUNK_ROWS when set (64..=4096), else
-/// whatever the serving path would run (Opus SF-1/SF-2), so the gates qualify
-/// the default the engine actually ships.
+/// whatever the serving path would run, so the gates qualify the default the
+/// engine actually ships.
 fn probe_chunk_rows() -> io::Result<usize> {
     let resolved = probe_chunk_rows_inner()?;
     let source = if std::env::var("FLINT_QUAL_CHUNK_ROWS").is_ok() {
@@ -69,11 +69,11 @@ fn probe_chunk_rows_inner() -> io::Result<usize> {
     }
 }
 
-/// Context-32K depth probe (the flip packet's missing numbers): mean decode
-/// ms/token and engine memory at 8K/16K/32K prefix depths on the tiled frozen
-/// corpus, plus the chunked-prefill last-row logits digest per depth as the
-/// ring/wrap fingerprint. BITWISE parity across the chain arms at deep
-/// prefixes is the multirow parity guard's job — run it with
+/// Context-32K depth probe: mean decode ms/token and engine memory at
+/// 8K/16K/32K prefix depths on the tiled frozen corpus, plus the
+/// chunked-prefill last-row logits digest per depth as the ring/wrap
+/// fingerprint. BITWISE parity across the chain arms at deep prefixes is the
+/// multirow parity guard's job — run it with
 /// FLINT_QUAL_PROBE_PREFIXES=8704,16384,30720 in the same window.
 #[test]
 #[ignore = "context-32K depth probe; loads Flint; exclusive parent-owned Mac window"]
@@ -92,9 +92,30 @@ fn ctx32k_depth_probe() -> io::Result<()> {
         ));
     }
     let ids = parse_tokens(&raw)?;
+    // The corpus tiles to the stream length the sweep needs: 32K by default
+    // (the historic probe), raised via FLINT_QUAL_STREAM_TOKENS. Stream
+    // construction only - depths above 32K still need the context-limit
+    // slice (factory::context_limit admits only 8192/32768).
+    let stream_tokens = match std::env::var("FLINT_QUAL_STREAM_TOKENS") {
+        Ok(v) => v
+            .trim()
+            .parse::<usize>()
+            .map_err(|_| io::Error::other("FLINT_QUAL_STREAM_TOKENS must be a usize"))?,
+        Err(std::env::VarError::NotPresent) => 32 * 1024,
+        Err(std::env::VarError::NotUnicode(_)) => {
+            return Err(io::Error::other(
+                "FLINT_QUAL_STREAM_TOKENS must be UTF-8 (unset means the 32K default)",
+            ));
+        }
+    };
+    if stream_tokens < ids.len() || stream_tokens > 1024 * 1024 {
+        return Err(io::Error::other(
+            "FLINT_QUAL_STREAM_TOKENS must be within corpus_len..=1Mi",
+        ));
+    }
     let stream: Vec<u32> = (0..)
         .flat_map(|_| ids.iter().copied())
-        .take(32 * 1024)
+        .take(stream_tokens)
         .collect();
     let depths: Vec<usize> = match std::env::var("FLINT_QUAL_DEPTHS") {
         Ok(list) => list
@@ -122,7 +143,8 @@ fn ctx32k_depth_probe() -> io::Result<()> {
         "source_commit": git("HEAD")?,
         "probe": "ctx32k-depth",
         "token_ids_sha256": digest,
-        "corpus": "frozen-2049-tiled-32k",
+        "corpus": "frozen-2049-tiled",
+        "stream_tokens": stream_tokens,
         "chunk_rows": chunk_rows,
         "env_snapshot": {
             "FLINT_QUAL_CHUNK_ROWS": crate::family::flint::factory::os_setting(
@@ -136,7 +158,7 @@ fn ctx32k_depth_probe() -> io::Result<()> {
     let mut model = Model::open(&root).map_err(|e| io::Error::other(format!("{e:?}")))?;
     for &d in &depths {
         // Per-depth peak: reset the allocator's high-water mark so each
-        // depth's memory reflects its own footprint (SF-1).
+        // depth's memory reflects its own footprint.
         model
             .kernels
             .reset_peak_memory()
@@ -158,13 +180,16 @@ fn ctx32k_depth_probe() -> io::Result<()> {
         let start = Instant::now();
         let (tokens, _) = greedy_rows(&mut model, &mut state, logits, 64)?;
         let decode_seconds = start.elapsed().as_secs_f64();
-        // SF-3: on the tiled corpus the greedy continuation should follow the
+        // On the tiled corpus the greedy continuation should follow the
         // pattern - the fraction of the 64 decoded tokens that equal the
         // corpus continuation is the induction score (asserted >= 0.95).
         let induction_matches = tokens
             .iter()
             .enumerate()
-            .filter(|(i, tok)| stream.get(d + i) == Some(tok))
+            // Index the corpus by position modulo its length, so a depth at
+            // the stream's end still scores against the true continuation
+            // instead of comparing against nothing (stream.get -> None).
+            .filter(|&(i, tok)| ids.get((d + i) % ids.len()) == Some(tok))
             .count();
         let induction_fraction = induction_matches as f64 / tokens.len().max(1) as f64;
         // The >= 0.95 bar applies only once at least one full tiling of the
@@ -378,19 +403,18 @@ fn identity(
     let metrics = identity_metrics(&runs[1].1, &runs[0].1)?;
     let same_context = runs[0].0 == runs[1].0;
     let passed = same_context && metrics["passed"] == json!(true);
-    // Gating mode since the 2026-10-25 window-3 disposition (coordinator
-    // 01a171b5 + 01a171c5): the per-token-vs-batched drift is flag-INDEPENDENT
+    // Gating mode: the per-token-vs-batched drift is flag-INDEPENDENT
     // - fenced and chained arms fail it with metrics identical to every
     // digit and per-token/batched row digests bitwise equal across flags -
     // so the CHAIN is gated by the in-tree chained_fenced_bitwise_
     // identity_2040 guard (bitwise per-token rows across flags). This gate
-    // ratchets the drift against the fenced window-3 baseline: exceeding it
-    // means NEW numerics, not the known T=1 vs batched tile-rounding class
-    // (5f4e4601), which is tracked as its own follow-up.
-    // Applied bars on every run (pass or fail). The 1024 bars were
-    // ratified 2026-10-27 (coordinator delegation): w39 measured identity
-    // drift mean 0.050387 / max row 1.046713 / top-1 33 of 33, ~23% above
-    // the 512 magnitude, and the bars carry ~3% headroom over that.
+    // ratchets the drift against the fenced baseline: exceeding it means
+    // NEW numerics, not the known T=1 vs batched tile-rounding class, which
+    // is tracked separately.
+    // Applied bars on every run (pass or fail). For 1024-row pieces a run
+    // measured identity drift mean 0.050387 / max row 1.046713 / top-1 33
+    // of 33, ~23% above the 512 magnitude, and the bars carry ~3% headroom
+    // over that.
     let (applied_mean_bar, applied_max_bar) = match chunk_rows {
         1024 => (0.0520, 1.0800),
         _ => (0.0410, 1.008),
@@ -404,26 +428,25 @@ fn identity(
             "top1": 33,
         },
         "passed": passed,
-        "gating_mode": "ratchet vs the fenced window-3 baseline, per piece size (512: mean_kl <= 0.0410, max_row_kl <= 1.008; 1024: mean_kl <= 0.0520, max_row_kl <= 1.0800, ratified bars; top1 >= 33/33, fatal); the chain itself is gated by the in-tree chained_fenced_bitwise_identity_2040 guard",
+        "gating_mode": "ratchet vs the fenced baseline, per piece size (512: mean_kl <= 0.0410, max_row_kl <= 1.008; 1024: mean_kl <= 0.0520, max_row_kl <= 1.0800; top1 >= 33/33, fatal); the chain itself is gated by the in-tree chained_fenced_bitwise_identity_2040 guard",
     });
     metadata(out, info)?;
     if !passed {
-        // Ratchet against the fenced window-3 baseline (coordinator
-        // 01a171c5): the flag-independent drift sits at mean 0.0410 /
-        // max row 1.007 / top1 33 of 33, identical under both flags, so
-        // exceeding it means NEW numerics, not the known T=1-vs-batched
-        // drift. same_context cannot fire as a check - the batched run
-        // teacher-forces the per-token run's own tokens by construction.
+        // Ratchet against the fenced baseline: the flag-independent drift
+        // sits at mean 0.0410 / max row 1.007 / top1 33 of 33, identical
+        // under both flags, so exceeding it means NEW numerics, not the known
+        // T=1-vs-batched drift. same_context cannot fire as a check - the
+        // batched run teacher-forces the per-token run's own tokens by
+        // construction.
         let mean = metrics["mean_kl"].as_f64().unwrap_or(f64::INFINITY);
         let max = metrics["max_row_kl"].as_f64().unwrap_or(f64::INFINITY);
         let top1 = metrics["top1_matches"].as_i64().unwrap_or(-1);
-        // Bars are per piece size: the window-3 limits were calibrated on
+        // Bars are per piece size: the baseline limits were calibrated on
         // 512-row pieces (mean 0.040916 / max row 1.007338, ~0.2% headroom);
         // 1024-row pieces carry the same tile-rounding class at a larger
-        // magnitude (w39: mean 0.050387 / max 1.046713, top-1 still 33/33,
-        // ~23% more drift than 512 - the reason the 1024 bars were
-        // re-baselined and ratified). Any other piece size keeps the 512
-        // bars.
+        // magnitude (mean 0.050387 / max 1.046713, top-1 still 33/33, ~23%
+        // more drift than 512 - the reason the 1024 bars are separate). Any
+        // other piece size keeps the 512 bars.
         if mean > applied_mean_bar || max > applied_max_bar || top1 < 33 {
             return Err(io::Error::other(format!(
                 "2K/32 drift exceeded the ratchet for {chunk_rows}-row pieces: mean_kl {mean:.6} (<= {applied_mean_bar}), max_row_kl {max:.6} (<= {applied_max_bar}), top1 {top1} of 33"
@@ -452,18 +475,16 @@ fn warm_decode128(model: &mut Model, state: &mut State, first: Vec<f32>) -> io::
     }))
 }
 
-/// In-tree guard for the controller-side evidence of windows 2-3
-/// (coordinator 01a171c2): the chained and fenced commits must produce
-/// BITWISE-identical one-row logits at long context — currently proven
-/// only by the out-of-tree window controllers. Re-execs the test binary
-/// as two children (the tokenizer child-process-table pattern): child A
-/// runs the probe with the chain default (flag unset), child B with
-/// FIFI_FLINT_MLX_ASYNC_CHAIN=0, both under the parent's GO, model,
-/// corpus and output root at prefix 2040. The parent compares every row
-/// digest and fails on any difference, so a future change to the chain
-/// cannot silently regress the long-context identity.
-/// Spawns one re-exec child of the test binary running the probe under the
-/// given flag state and returns its per-token row digests at prefix 2040.
+/// In-tree guard: the chained and fenced commits must produce
+/// BITWISE-identical one-row logits at long context. Re-execs the test binary
+/// as two children (the tokenizer child-process-table pattern): child A runs
+/// the probe with the chain default (flag unset), child B with
+/// FIFI_FLINT_MLX_ASYNC_CHAIN=0, both under the parent's GO, model, corpus
+/// and output root at prefix 2040. The parent compares every row digest and
+/// fails on any difference, so a future change to the chain cannot silently
+/// regress the long-context identity. Spawns one re-exec child of the test
+/// binary running the probe under the given flag state and returns its
+/// per-token row digests at prefix 2040.
 fn spawn_probe_child(
     binary: &Path,
     probe: &str,
@@ -938,8 +959,8 @@ fn chunk_kl_probe() -> io::Result<()> {
         }
         row.ok_or_else(|| io::Error::other("kl probe prefix returned no logits"))
     };
-    // REAL KL via the tested row_kl (Opus MF-1: the pre-fix closure never
-    // exponentiated, so the old "KL ~1e-5" numbers were logit-sum noise).
+    // REAL KL via the tested row_kl (a closure that never exponentiates
+    // reports logit-sum noise, not KL).
     let compare = |a: &[f32], b: &[f32]| -> (f64, bool, usize) {
         let kl = crate::family::flint::mlx_qualification::row_kl(b, a);
         let (ea, eb): (Vec<f64>, Vec<f64>) = (
@@ -974,7 +995,7 @@ fn chunk_kl_probe() -> io::Result<()> {
         // Noise floor: 512 twice (deterministic build => expect exactly 0).
         let a2 = prefill(512, p)?;
         let (kl0, top10, top50) = compare(&a, &a2);
-        // SF-3 induction check: the corpus is a deterministic tiling, so the
+        // Induction check: the corpus is a deterministic tiling, so the
         // model's top-1 at each prefix should be the next repeated token.
         let next_token = stream.get(p).copied();
         let top1_id = a
@@ -1155,9 +1176,9 @@ fn spawn_multirow_child(
             "FLINT_QUAL_PROBE_PREFIXES",
             prefixes.unwrap_or("512,513,1024"),
         )
-        // Pin the piece size (Opus SF-1): at the 1024 engine default the
-        // 512/513/1024 prefixes would all be single-chunk and the guard would
-        // stop crossing chunk boundaries. Never inherit the parent's env.
+        // Pin the piece size: at the 1024 engine default the 512/513/1024
+        // prefixes would all be single-chunk and the guard would stop
+        // crossing chunk boundaries. Never inherit the parent's env.
         .env("FLINT_QUAL_CHUNK_ROWS", "512");
     if armed {
         command.env("FIFI_FLINT_MLX_PREFILL_CHAIN", "1");
@@ -1237,14 +1258,13 @@ fn multirow_chained_fenced_bitwise_identity() -> io::Result<()> {
     Ok(())
 }
 
-/// Flag-off chunking calibration on the real window-25 prompt texts. The
-/// same prompts that produced the E7 armed streams are tokenized with the
-/// checkpoint's own tokenizer (the production wrapper, so the id stream is
-/// the serving convention), prefilled twice at flag-off - chunk_rows=1 vs
-/// the serving piece size - and 256 greedy tokens are generated from each arm. The first
-/// divergence index per prompt is the engine-EXISTING chunking noise the
-/// armed streams must be judged against. Prefix cap keeps the per-token
-/// prefill inside the window budget.
+/// Flag-off chunking calibration on real served prompt texts. The same prompts that
+/// produced the armed streams are tokenized with the checkpoint's own tokenizer (the
+/// production wrapper, so the id stream is the serving convention), prefilled twice at
+/// flag-off - chunk_rows=1 vs the serving piece size - and 256 greedy tokens are
+/// generated from each arm. The first divergence index per prompt is the engine-EXISTING
+/// chunking noise the armed streams must be judged against. Prefix cap keeps the
+/// per-token prefill inside the window budget.
 #[test]
 #[ignore = "requires an exclusive parent-owned Mac model/timing window"]
 fn chunking_stream_calibration() -> io::Result<()> {

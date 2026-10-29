@@ -1,7 +1,6 @@
 //! Tests of `swiglu_q8` (seam 1: the Rust wrapper against the C entry against the `swiglu_q8_k`
 //! kernel), and of the two producers together (`q8_producers_*`). Device tests assume
-//! `--test-threads=1` (decision 0040) and run on the 4050 queue through lane L (KUBDAN-MSG-67
-//! condition 6).
+//! `--test-threads=1`.
 //!
 //! silu keeps the fast `__expf` of `swiglu_pack_k` (by decision; the E2 domain of the
 //! `swiglu_pack` doc), so the activation values are NOT bit-exact against an IEEE host silu:
@@ -11,8 +10,8 @@
 //! within one half code of the reference built from the f64 silu row — plus byte equality of
 //! the zero padding tail.
 
-/// The byte counts `plan_swiglu_q8` checks a call against (KUBDAN-MSG-64 item 6, mutant S4): the
-/// tight A2 footprint of `gu` and the padded `block_q8_1` rows of `q8`.
+/// The byte counts `plan_swiglu_q8` checks a call against: the tight footprint of `gu` and the
+/// padded `block_q8_1` rows of `q8`.
 #[test]
 fn swiglu_q8_needs_are_pure_and_exact() {
     // Qwen: n_ff 512, stride 1024 (exactly 2 * n_ff), 8 slots.
@@ -29,9 +28,9 @@ fn swiglu_q8_needs_are_pure_and_exact() {
     assert!(swiglu_q8_needs(512, 1024, 0).is_none());
     assert!(swiglu_q8_needs(usize::MAX, usize::MAX, 8).is_none());
     assert!(swiglu_q8_needs(usize::MAX / 2, usize::MAX, 2).is_none());
-    // A stride that WRAPS the footprint small (lane C K2 MINOR 7): two slots make the footprint
-    // stride + 2 * n_ff floats, and usize::MAX - 512 + 1024 wraps to 512 — a wrapping form
-    // would answer Some with a 2048-byte gu, so only the checked add refuses.
+    // A stride that WRAPS the footprint small: two slots make the footprint stride + 2 * n_ff
+    // floats, and usize::MAX - 512 + 1024 wraps to 512 — a wrapping form would answer Some with
+    // a 2048-byte gu, so only the checked add refuses.
     assert!(swiglu_q8_needs(512, usize::MAX - 512, 2).is_none());
 }
 
@@ -56,8 +55,8 @@ fn parse_block(bytes: &[u8], at: usize) -> (f32, f32, [i8; 32]) {
     (half(0), half(2), qs)
 }
 
-/// The f64 silu row of one slot, rounded to f32: the fp16-free reference `silu(g) * u` the packet
-/// names (an IEEE silu; the kernel's __expf differs within the stated 1e-5 relative slack).
+/// The f64 silu row of one slot, rounded to f32: the fp16-free reference `silu(g) * u` (an IEEE
+/// silu; the kernel's __expf differs within the stated 1e-5 relative slack).
 fn reference_slot(gate: &[f32], up: &[f32]) -> Vec<f32> {
     gate.iter()
         .zip(up)
@@ -79,7 +78,7 @@ fn launch_swiglu(
         gu.len() * 4 >= need.gu,
         "the test data covers the whole footprint"
     );
-    // The A2 footprint ends at slot slots-1's up half; the stride gaps are never read, so only
+    // The footprint ends at slot slots-1's up half; the stride gaps are never read, so only
     // the footprint bytes go up.
     let gu_bytes: Vec<u8> = gu.iter().flat_map(|v| v.to_le_bytes()).collect();
     let gu_dev = testkit::upload_bytes(ctx, &gu_bytes[..need.gu]);
@@ -109,13 +108,13 @@ fn slot_bytes(row: &[u8], slot: usize, blocks_per_slot: usize) -> &[u8] {
     &row[slot * blocks_per_slot * 36..(slot + 1) * blocks_per_slot * 36]
 }
 
-/// The batched producer against the host reference (packet test 5): eight slots of distinct
-/// data, the Qwen shape (n_ff 512, stride exactly 2 * n_ff), the Mellum shape (n_ff 896, stride
-/// above 2 * n_ff, padded to 32 blocks per slot with a zero tail of four blocks) and the
-/// one-slot shared-expert form. The kernel's silu keeps `__expf`, so the check is: d and s
-/// within one half code of the reference row (a relative value error of 1e-5 is far below the
-/// half spacing 2^-11), every code within `d/2 + 1e-5 * |y|` of the f64 reference rounded to
-/// f32, codes inside [-127, 127], and the zero tail exact.
+/// The batched producer against the host reference: eight slots of distinct data, the Qwen
+/// shape (n_ff 512, stride exactly 2 * n_ff), the Mellum shape (n_ff 896, stride above 2 * n_ff,
+/// padded to 32 blocks per slot with a zero tail of four blocks) and the one-slot shared-expert
+/// form. The kernel's silu keeps `__expf`, so the check is: d and s within one half code of the
+/// reference row (a relative value error of 1e-5 is far below the half spacing 2^-11), every
+/// code within `d/2 + 1e-5 * |y|` of the f64 reference rounded to f32, codes inside
+/// [-127, 127], and the zero tail exact.
 #[test]
 fn swiglu_q8_matches_the_host_reference() {
     if !testkit::device_present("swiglu_q8_matches_the_host_reference") {
@@ -212,8 +211,8 @@ fn q8_1_blocks(n_ff: usize) -> usize {
     n_ff.next_multiple_of(512) / 32
 }
 
-/// Changing slot j changes only slot j's blocks (packet test 6): the other slots' rows are
-/// byte-identical between the two launches.
+/// Changing slot j changes only slot j's blocks: the other slots' rows are byte-identical
+/// between the two launches.
 #[test]
 fn swiglu_q8_slots_are_independent() {
     if !testkit::device_present("swiglu_q8_slots_are_independent") {
@@ -250,12 +249,12 @@ fn swiglu_q8_slots_are_independent() {
     }
 }
 
-/// A1 semantics (KUBDAN-MSG-67 condition 3): a faulted router slot reaches the producer as a NaN
-/// row (the guard writes the whole slot). Its LIVE blocks carry NaN scales — any binary16 NaN;
-/// the device's `__float2half(NaN)` is 0x7fff, not the host oracle's 0x7e00 — with zero codes,
-/// no crash, no clamp to zero, and no other slot's bytes and no byte outside the output moves.
-/// Both shapes: the Qwen width 512 (no padded tail) and the Mellum width 896 whose four tail
-/// blocks are all-zero (an amax of 0 gives d = s = 0, not NaN — lane C K2 MINOR 5).
+/// NaN semantics: a faulted router slot reaches the producer as a NaN row (the guard writes the
+/// whole slot). Its LIVE blocks carry NaN scales — any binary16 NaN; the device's
+/// `__float2half(NaN)` is 0x7fff, not the host oracle's 0x7e00 — with zero codes, no crash, no
+/// clamp to zero, and no other slot's bytes and no byte outside the output moves. Both shapes:
+/// the Qwen width 512 (no padded tail) and the Mellum width 896 whose four tail blocks are
+/// all-zero (an amax of 0 gives d = s = 0, not NaN).
 #[test]
 fn swiglu_q8_propagates_nan_slots() {
     if !testkit::device_present("swiglu_q8_propagates_nan_slots") {
@@ -385,9 +384,9 @@ fn attempt(rig: &RefusalRig, other: &OtherContext, spec: Spec) -> Result<(), Eng
     )
 }
 
-/// KUBDAN-MSG-64 item 6 for `plan_swiglu_q8` and the shape rules of KUBDAN-MSG-67 condition 5:
-/// every refusal is a `BadRequest` with the text of its own check, nothing is queued, the backend
-/// stays usable, and the valid call of the same rig runs.
+/// For `plan_swiglu_q8` and its shape rules, every refusal is a `BadRequest` with the text of its
+/// own check, nothing is queued, the backend stays usable, and the valid call of the same rig
+/// runs.
 #[test]
 fn swiglu_q8_rejects_unsound_calls_before_launching() {
     if !testkit::device_present("swiglu_q8_rejects_unsound_calls_before_launching") {
@@ -547,7 +546,7 @@ fn swiglu_q8_rejects_unsound_calls_before_launching() {
 }
 
 /// Both producers queued inside one graph capture produce byte-identical outputs to the eager
-/// launches, and the graph holds exactly their two kernel nodes (packet test 7).
+/// launches, and the graph holds exactly their two kernel nodes.
 #[test]
 fn q8_producers_inside_a_capture_equal_eager() {
     if !testkit::device_present("q8_producers_inside_a_capture_equal_eager") {
@@ -652,8 +651,8 @@ fn q8_producers_inside_a_capture_equal_eager() {
     }
 }
 
-/// Two launches of each producer on the same input are byte-identical (packet test 8): the fixed
-/// reduction orders make a launch a pure function of its input.
+/// Two launches of each producer on the same input are byte-identical: the fixed reduction
+/// orders make a launch a pure function of its input.
 #[test]
 fn q8_producers_are_deterministic() {
     if !testkit::device_present("q8_producers_are_deterministic") {
@@ -716,9 +715,9 @@ fn q8_producers_are_deterministic() {
     assert_eq!(first.1, second.1, "the swiglu_q8 rows are deterministic");
 }
 
-/// The producers write only their claimed ranges (packet test 9): the bytes past `norm_out`, `q8`
-/// of both producers stay canaried, and the read-only inputs (`weight`, `gu`, and `h` without a
-/// delta) hash unchanged across the launches.
+/// The producers write only their claimed ranges: the bytes past `norm_out`, `q8` of both
+/// producers stay canaried, and the read-only inputs (`weight`, `gu`, and `h` without a delta)
+/// hash unchanged across the launches.
 #[test]
 fn q8_producers_write_only_their_range() {
     if !testkit::device_present("q8_producers_write_only_their_range") {
@@ -808,10 +807,10 @@ fn ids_buffer(ctx: &CudaContext, ids: &[i32]) -> DeviceBuffer {
     testkit::upload_bytes(ctx, &bytes)
 }
 
-/// The expert consumer (packet test 10, second half): the Q4_K expert launch on the swiglu_q8
-/// output as the down-projection input (x_per_slot) equals the launch on S1's quantize of the
-/// f64 reference silu rows, each within the S1 tolerance `64 * 2^-24 * sum(|term|)` of the f64
-/// host dot for EVERY output of every slot.
+/// The expert consumer: the Q4_K expert launch on the swiglu_q8 output as the down-projection
+/// input (x_per_slot) equals the launch on the standalone quantize of the f64 reference silu
+/// rows, each within the matvec tolerance `64 * 2^-24 * sum(|term|)` of the f64 host dot for
+/// EVERY output of every slot.
 #[test]
 fn swiglu_q8_feeds_the_expert_matvec() {
     if !testkit::device_present("swiglu_q8_feeds_the_expert_matvec") {
@@ -842,7 +841,7 @@ fn swiglu_q8_feeds_the_expert_matvec() {
             &gu[base + n_ff..base + 2 * n_ff],
         ));
     }
-    // Path A: the producer under test. Path B: S1's quantize of the reference silu rows.
+    // Path A: the producer under test. Path B: the standalone quantize of the reference silu rows.
     let q8_mine = launch_swiglu(&ctx, &stream, n_ff, stride, slots, &gu);
     let flat_ref: Vec<f32> = ref_rows
         .iter()
@@ -919,14 +918,14 @@ fn swiglu_q8_feeds_the_expert_matvec() {
         }
     }
     // And the two paths agree within the sum of their bounds PLUS one legitimate quantization
-    // flip (lane C K2 MINOR 4): the two paths quantize values that differ by __expf's slack, so
-    // their rows are byte-equal only while every amax and every roundf boundary land the same
-    // way on this SM; on another SM a single block of one row can legitimately differ — a d
-    // half-code moves that block's terms by 2^-11 relative (bounded by one block's share,
-    // 2^-11 * abs_max / blocks, of the largest row's |term| sum) and a q code flip moves one
-    // term by d * |w| (bounded by the largest stored scale times the builder's largest Q4_K
-    // value, d 2.0 x scale 63 x nibble 15 + dmin 0.21 x 63 ~ 1.9e3). Lane C estimated a ~5
-    // percent flake chance on another SM without the allowance; both bounds are explicit.
+    // flip: the two paths quantize values that differ by __expf's slack, so their rows are
+    // byte-equal only while every amax and every roundf boundary land the same way on this SM;
+    // on another SM a single block of one row can legitimately differ — a d half-code moves that
+    // block's terms by 2^-11 relative (bounded by one block's share, 2^-11 * abs_max / blocks, of
+    // the largest row's |term| sum) and a q code flip moves one term by d * |w| (bounded by the
+    // largest stored scale times the builder's largest Q4_K value, d 2.0 x scale 63 x nibble 15 +
+    // dmin 0.21 x 63 ~ 1.9e3). Without the allowance the estimated flake chance on another SM is
+    // about 5 percent; both bounds are explicit.
     let d_max = [&q8_mine, &q8_unfused]
         .iter()
         .flat_map(|bytes| (0..slots * q8_1_blocks(n_ff)).map(|b| parse_block(bytes, b * 36).0))
@@ -949,8 +948,8 @@ fn swiglu_q8_feeds_the_expert_matvec() {
 }
 
 /// The Mellum consumer: Q8_0 and Q5_0 down projections at K 896 read the producer's padded rows
-/// (32 blocks, the zero tail included) and match S1's quantize of the reference silu rows within
-/// the S1 tolerance for every output row (packet, Mellum shapes section).
+/// (32 blocks, the zero tail included) and match the standalone quantize of the reference silu
+/// rows within the matvec tolerance for every output row.
 #[test]
 fn swiglu_q8_feeds_the_dense_matvec_at_896() {
     if !testkit::device_present("swiglu_q8_feeds_the_dense_matvec_at_896") {
@@ -979,7 +978,7 @@ fn swiglu_q8_feeds_the_dense_matvec_at_896() {
         ));
     }
     let q8_mine = launch_swiglu(&ctx, &stream, n_ff, stride, slots, &gu);
-    // S1's quantize of the reference rows, one column per slot.
+    // The standalone quantize of the reference rows, one column per slot.
     let flat_ref: Vec<f32> = ref_rows
         .iter()
         .flat_map(|row| row.iter().copied())

@@ -1,4 +1,4 @@
-//! Resident decode of the stepping-stone family `Qwen3.6-35B-A3B` on MLX (decision 0046).
+//! Resident decode of the model family `Qwen3.6-35B-A3B` on MLX.
 //!
 //! All weights except the embedding table, including the 120 expert stacks, stay resident on the
 //! engine thread. The embedding table stays in the checkpoint, and the token start reads one row
@@ -8,7 +8,7 @@ mod chunk_plan;
 mod kv_plan;
 mod layout;
 
-/// The host-side class partition of the one-token decode step (#8's Flint method ported
+/// The host-side class partition of the one-token decode step (the Flint method ported
 /// to Q36): a test-only marked replica driven by `decode_timing`'s harness. The whole
 /// module is Mac-native test code — it calls the Mac-gated resident functions directly.
 #[cfg(all(
@@ -20,11 +20,10 @@ mod layout;
 ))]
 mod decode_class_partition;
 
-/// The ANE sidecar latency probe (packet ane-sidecar-1): the idle and between-steps cost of
-/// one `DecisionHead::ane` call, and the plain statement that the head is neither `Send` nor
-/// `Sync`, so the sidecar the packet asks about is serial. `cfg(test)` like `decode_timing`;
-/// the ignored Mac-only test inside carries the native feature pair, so it compiles exactly
-/// where the loader helpers it reuses do.
+/// The ANE sidecar latency probe: the idle and between-steps cost of one `DecisionHead::ane` call,
+/// and the plain statement that the head is neither `Send` nor `Sync`, so an ANE sidecar would be
+/// serial. `cfg(test)` like `decode_timing`; the ignored Mac-only test inside carries the native
+/// feature pair, so it compiles exactly where the loader helpers it reuses do.
 #[cfg(test)]
 mod ane_latency;
 #[cfg(all(feature = "native-mlx", target_os = "macos", target_arch = "aarch64"))]
@@ -38,9 +37,8 @@ mod attn;
     )
 )]
 mod batch;
-/// The Mac gate tests of the compiled decode blocks (packet MX-COMPILE-1a items 5 to 7): the
-/// tiny-model tests run with the plain test suite, the real-checkpoint tests are `#[ignore]`d
-/// like their siblings.
+/// The Mac gate tests of the compiled decode blocks: the tiny-model tests run with the plain
+/// test suite, the real-checkpoint tests are `#[ignore]`d like their siblings.
 #[cfg(all(
     test,
     feature = "native-mlx",
@@ -55,15 +53,14 @@ mod compile_gate;
 /// compile-checks it on Linux through the cfg rewrite.
 #[cfg(test)]
 mod compile_logits;
-/// The load-time compile warm-up decision (packet MX-COMPILE-1a item 6): pure, with the same cfg
-/// as this module, so its unit tests run on Linux.
+/// The load-time compile warm-up decision: pure, with the same cfg as this module, so its unit
+/// tests run on Linux.
 #[cfg(any(
     test,
     all(feature = "native-mlx", target_os = "macos", target_arch = "aarch64")
 ))]
 mod compile_plan;
-/// The `mlx_compile` probe: `cfg(test)` and Mac-only, like the modules its
-/// tests live in (packet MX-COMPILE-1a keeps the probe test-only).
+/// The `mlx_compile` probe: `cfg(test)` and Mac-only, like the modules its tests live in.
 #[cfg(all(
     test,
     feature = "native-mlx",
@@ -71,13 +68,13 @@ mod compile_plan;
     target_arch = "aarch64",
 ))]
 mod compile_probe;
-/// The compiled decode blocks behind `qwen36.compile` (packet MX-COMPILE-1a): Mac-only like
+/// The compiled decode blocks behind `qwen36.compile`: Mac-only like
 /// the blocks it wraps, and production code —
 /// `delta::step` and `moe::step_device` call it when the setting is on.
 #[cfg(all(feature = "native-mlx", target_os = "macos", target_arch = "aarch64"))]
 mod compiled;
-/// The decode-vs-prefill KL gate, the standard check of every KV8/quant/fusion change
-/// (DeepInfer review items B6/C10). `cfg(test)` like `long_context`: the pure comparison and
+/// The decode-vs-prefill KL gate, the standard check of every KV8/quant/fusion change.
+/// `cfg(test)` like `long_context`: the pure comparison and
 /// verdict carry Linux unit tests, and the model-touching arms and gates live in a `mac`
 /// module behind the native cfg, like that module's `mac` harness.
 #[cfg(test)]
@@ -96,15 +93,17 @@ mod decoder;
 mod delta;
 #[cfg(all(feature = "native-mlx", target_os = "macos", target_arch = "aarch64"))]
 pub(super) mod executor;
-/// The primitive-histogram diagnostic of packet GPU-GAP-COUNT. `cfg(test)` like `route_parity`:
+/// The primitive-histogram diagnostic. `cfg(test)` like `route_parity`:
 /// the pure parts (the `mlx_print_graph` parser and the id and activation readers) carry Linux
 /// unit tests, and the one ignored Mac run (`decode_graph_primitives`) is additionally gated on
 /// the native feature pair, so pf-typecheck.sh compile-checks it on Linux through the cfg
 /// rewrite.
 #[cfg(test)]
 mod graph_count;
-/// The long-context gate of the 8-bit KV cache (decision 0046, addendum 7, rule 4). `cfg(test)`
-/// like `decode_timing`: the prompt builder, the log-softmax comparison, and the report helpers
+#[cfg(test)]
+mod load_timing;
+/// The long-context gate of the 8-bit KV cache. `cfg(test)` like `decode_timing`: the prompt
+/// builder, the log-softmax comparison, and the report helpers
 /// carry Linux unit tests, and the Mac harness inside carries the native cfg.
 #[cfg(test)]
 mod long_context;
@@ -121,7 +120,7 @@ pub(in crate::family::qwen36) mod ops;
 mod parity;
 #[cfg(all(feature = "native-mlx", target_os = "macos", target_arch = "aarch64"))]
 mod prefill;
-/// Page bookkeeping for the Q-R1 state-only prefix entries. Pure logic with no tensor or
+/// Page bookkeeping for the state-only prefix entries. Pure logic with no tensor or
 /// platform dependency, so it builds and tests on every host; the Mac store integrates it.
 mod prefix_pages;
 #[cfg(all(
@@ -138,11 +137,10 @@ mod real;
     target_arch = "aarch64"
 ))]
 mod route_parity;
-/// The router-trace capture of the ANE plan's slice M3: one ignored Mac-only run over the real
-/// checkpoint that records the expert ids and gates of every layer and token through the
-/// production Record step. Gated like `real` and `tool_forward`, because the whole module is
-/// the one run and every helper it reuses sits behind this gate (`prefill/timing.rs` gets the
-/// same gate transitively from its parent).
+/// The router-trace capture: one ignored Mac-only run over the real checkpoint that records the
+/// expert ids and gates of every layer and token through the production Record step. Gated like
+/// `real` and `tool_forward`, because the whole module is the one run and every helper it reuses
+/// sits behind this gate (`prefill/timing.rs` gets the same gate transitively from its parent).
 #[cfg(all(
     test,
     feature = "native-mlx",
@@ -171,32 +169,30 @@ mod tool_forward;
 #[cfg(all(feature = "native-mlx", target_os = "macos", target_arch = "aarch64"))]
 mod weights;
 
-/// The shared parity bounds and the per-dtype within-mode rule of the chunk gates (fix1 of packet
-/// Q36-BF16-b). `parity` and `prefill/parity` are Mac-gated, but this module compiles on Linux in
-/// test builds, so `within_mode_passes` — the rule gate 2 asks per row — has a portable unit
-/// test. `passes` and `MIN_COSINE` are the decision-0046 item-4 gate that the decode parity
-/// asserted before; `rel_passes` and `MAX_REL_ERROR` are the decision-0044 G2 bound. Fix4 of
-/// packet Q36-BF16-b moved `env_number`, `min_with_index`, and `write_f32s` here from
-/// `prefill/parity.rs` (they need no native code), so each keeps one definition with its own
-/// unit test next to it.
+/// The shared parity bounds and the per-dtype within-mode rule of the chunk gates. `parity` and
+/// `prefill/parity` are Mac-gated, but this module compiles on Linux in test builds, so
+/// `within_mode_passes` — the rule gate 2 asks per row — has a portable unit test. `passes` and
+/// `MIN_COSINE` are the exact cosine gate that the decode parity asserted before; `rel_passes`
+/// and `MAX_REL_ERROR` are the F32 relative-error bound. `env_number`, `min_with_index`, and
+/// `write_f32s` live here rather than in `prefill/parity.rs` (they need no native code), so each
+/// keeps one definition with its own unit test next to it.
 #[cfg(test)]
 mod within_mode {
     use super::super::settings::{Activation, NO_BUDGET_PIECE};
     use crate::family::route::keeps_floored_anchor;
 
-    /// The cosine gate of every parity run (decision 0046 item 4): 0.99999.
+    /// The cosine gate of every parity run: 0.99999.
     pub(super) const MIN_COSINE: f64 = 0.999_99;
-    /// The largest relative error of the F32 chunk gates (decision 0044 G2): 1e-4.
+    /// The largest relative error of the F32 chunk gates: 1e-4.
     pub(super) const MAX_REL_ERROR: f64 = 1e-4;
-    /// The floor of the BF16 run's minimum per-layer cosine (fix5 of packet Q36-BF16-a; decision
-    /// 0046 A6): 0.95, below the 0.9799 that the d1 BF16 run observed (evidence 9dec1b7c). The
-    /// one definition that `parity.rs` imports too; fix2 of packet Q36-BF16-b moved it here so
-    /// the gate-1 verdict below reaches it without the Mac-gated `parity` module.
+    /// The floor of the BF16 run's minimum per-layer cosine: 0.95, below the 0.9799 that the
+    /// reference BF16 decode run observed. The one definition that `parity.rs` imports too; it
+    /// lives here so the gate-1 verdict below reaches it without the Mac-gated `parity` module.
     pub(super) const BF16_LAYER_COSINE_FLOOR: f64 = 0.95;
-    /// The d1 BF16 minimum layer cosine (evidence 9dec1b7c): the no-ratchet anchor of the floor.
+    /// The minimum layer cosine of the reference BF16 decode run: the no-ratchet anchor of the
+    /// floor.
     pub(super) const D1_BF16_MIN_LAYER_COSINE: f64 = 0.9799;
-    /// The largest regression below the d1 minimum that the floor allows without a recorded
-    /// decision (fix5 of packet Q36-BF16-a).
+    /// The largest regression below the anchor that the floor allows.
     pub(super) const BF16_LAYER_COSINE_REGRESSION: f64 = 0.01;
 
     /// True for a finite cosine at or above the gate. A NaN fails.
@@ -209,12 +205,12 @@ mod within_mode {
         rel.is_finite() && rel <= MAX_REL_ERROR
     }
 
-    /// True for a within-mode LAYER row of the chunk gates under `activation` (packet
-    /// Q36-BF16-b): the F32 control keeps both frozen bounds of decision 0044 G2 (cosine and
-    /// relative error); a BF16 run needs a finite cosine only. The last-row cosine of one layer
-    /// can fall far under any simple floor without moving the decisions: the slice b gate
-    /// measured 0.716 at layer 30 (600 tokens, chunk 128) and 0.842 (600 tokens, chunk 256) with
-    /// the logits cosine at 0.990 and 0.993, the top-5 sets equal and the 8 greedy tokens equal.
+    /// True for a within-mode LAYER row of the chunk gates under `activation`: the F32 control
+    /// keeps both frozen bounds (cosine and relative error); a BF16 run needs a finite cosine
+    /// only. The last-row cosine of one layer can fall far under any simple floor without moving
+    /// the decisions: a chunk gate run measured 0.716 at layer 30 (600 tokens, chunk 128) and
+    /// 0.842 (600 tokens, chunk 256) with the logits cosine at 0.990 and 0.993, the top-5 sets
+    /// equal and the 8 greedy tokens equal.
     /// The BF16 layer cosines are therefore REPORTED, with the layer of the minimum, and the
     /// floor sits on the logits row (`within_mode_logits_passes`).
     pub(super) fn within_mode_passes(activation: Activation, cos: f64, rel: f64) -> bool {
@@ -226,9 +222,9 @@ mod within_mode {
     }
 
     /// The floor of the BF16 logits cosine of gate 2 (chunk against one-token steps): 0.98. The
-    /// lowest value over seven BF16 samples of the slice b gate (64 to 1000 tokens, chunks 32 to
-    /// 256) is 0.9901, so the margin is about 0.01. PROVISIONAL (git-db, 2026-10-11): the sample
-    /// is thin and the floor is re-derived after the broad format-token eval (Q36-BF16-EVAL).
+    /// lowest value over seven BF16 samples of the chunk gate (64 to 1000 tokens, chunks 32 to
+    /// 256) is 0.9901, so the margin is about 0.01. PROVISIONAL: the sample is thin and the floor
+    /// is to be re-derived from the multi-prompt format-token eval.
     pub(super) const BF16_LOGITS_COSINE_FLOOR: f64 = 0.98;
 
     /// True for the LOGITS row of gate 2 under `activation`: as `within_mode_passes` for the F32
@@ -243,7 +239,7 @@ mod within_mode {
     }
 
     /// The minimum of `values` and the index where it falls. A NaN counts as the minimum with
-    /// its index — the FIRST NaN (fix4 of packet Q36-BF16-b), so the report of a broken run
+    /// its index — the FIRST NaN, so the report of a broken run
     /// names the first layer that broke, not the last. An empty slice states its behavior: the
     /// loop seed `(INFINITY, 0)` comes back unchanged.
     pub(super) fn min_with_index(values: &[f64]) -> (f64, usize) {
@@ -258,7 +254,7 @@ mod within_mode {
 
     /// Parses `raw`, the text of the environment variable `name`, as a number from `low` to
     /// `high`. Panics naming `name` and the range when the text is not a number or falls outside
-    /// it. Split out of `env_number` (fix4 of packet Q36-BF16-b) so the range rule has its own
+    /// it. Split out of `env_number` so the range rule has its own
     /// portable test: edition 2024 makes `std::env::set_var` unsafe and the crate denies
     /// `unsafe_code`, so a test cannot carry the variable into `env_number` itself.
     pub(super) fn number_in_range(name: &str, raw: &str, low: usize, high: usize) -> usize {
@@ -272,16 +268,15 @@ mod within_mode {
     }
 
     /// Reads `name` from the environment and parses it as a number from `low` to `high`;
-    /// unset gives `default`. Fix4 of packet Q36-BF16-b moved it here from `prefill/parity.rs`,
-    /// which passes the chunk bound `MAX_CHUNK_ROWS` and the token bound derived from the
-    /// context of its `decoder_for` call.
+    /// unset gives `default`. `prefill/parity.rs` passes the chunk bound `MAX_CHUNK_ROWS` and the
+    /// token bound derived from the context of its `decoder_for` call.
     pub(super) fn env_number(name: &str, default: usize, low: usize, high: usize) -> usize {
         std::env::var(name)
             .map(|value| number_in_range(name, &value, low, high))
             .unwrap_or(default)
     }
 
-    /// One configuration of the multi-prompt format-token eval (packet BF16-EVAL), the entry of
+    /// One configuration of the multi-prompt format-token eval, the entry of
     /// the `Q36_BANK_CONFIGS` comma list of the `bank_format_token_by_config` run: `steps` runs
     /// the prompt token by token, `chunkN` runs the serving prefill with the chunk N that the
     /// planner admits, and `tailT` runs the first N - T ids in the serving chunk plus the last
@@ -346,7 +341,7 @@ mod within_mode {
         Ok(configs)
     }
 
-    /// The default config list of the eval run (packet BF16-EVAL).
+    /// The default config list of the eval run.
     pub(super) fn default_bank_configs() -> Vec<BankConfig> {
         parse_bank_configs(
             "steps,chunk256,chunk64,tail8,tail20,tail40,tail60,tail100,tail150,tail300",
@@ -436,12 +431,11 @@ mod within_mode {
         std::fs::write(path, crate::family::qwen36::trace::f32_le_bytes(values)).unwrap();
     }
 
-    /// The verdict of gate 1 under `activation` (fix1 of packet Q36-BF16-b): the F32 control
-    /// asserts every recorded failure — the frozen gate — while a BF16 run asserts the
-    /// decision-0046 A6 fix5 floor instead and only reports its misses. Extracted from the gate
-    /// so the branch rule has its own test. Fix2 of packet Q36-BF16-b moved it here from
-    /// `prefill/parity.rs`, which is Mac-gated: the verdict needs no native code, so its test
-    /// runs on Linux too.
+    /// The verdict of gate 1 under `activation`: the F32 control asserts every recorded failure
+    /// — the frozen gate — while a BF16 run asserts the BF16 layer-cosine floor instead and only
+    /// reports its misses. Extracted from the gate so the branch rule has its own test. It lives
+    /// here, not in the Mac-gated `prefill/parity.rs`: the verdict needs no native code, so its
+    /// test runs on Linux too.
     pub(super) fn chunk_gate1_verdict(
         activation: Activation,
         failures: &[String],
@@ -470,7 +464,7 @@ mod within_mode {
             } else {
                 Err(format!(
                     "BF16 chunk parity floor: min layer cosine {min_cos} is under 0.95 or regresses \
-                     more than 0.01 below the d1 value 0.9799 without a recorded decision"
+                     more than 0.01 below the anchor 0.9799"
                 ))
             }
         }
@@ -479,7 +473,7 @@ mod within_mode {
     mod tests {
         use super::*;
 
-        /// The comma list of `Q36_BANK_CONFIGS` parses every form (packet BF16-EVAL): `steps` is
+        /// The comma list of `Q36_BANK_CONFIGS` parses every form: `steps` is
         /// token by token, `chunkN` names the serving chunk N, `tailT` the serving chunk with the
         /// last T ids as one piece. The default list is the eval run's, its names round-trip, and
         /// every malformed form is rejected with the variable named: an unknown word, a size of
@@ -539,11 +533,10 @@ mod within_mode {
         }
 
         /// The F32 branch of the gate asserts both cosine and relative error; a BF16 LAYER row needs
-        /// a finite cosine only (fix4 and fix5 of packet Q36-BF16-b): the slice b gate measured a
-        /// layer cosine of 0.716 with the logits at 0.990, so a layer floor would fail legitimate
-        /// samples. A row that keeps the cosine but misses the relative bound fails the F32 gate
-        /// and passes the BF16 gate, a finite cosine under 0.99999 fails the F32 gate only, and a
-        /// NaN cosine fails both.
+        /// a finite cosine only: a chunk gate run measured a layer cosine of 0.716 with the logits
+        /// at 0.990, so a layer floor would fail legitimate samples. A row that keeps the cosine
+        /// but misses the relative bound fails the F32 gate and passes the BF16 gate, a finite
+        /// cosine under 0.99999 fails the F32 gate only, and a NaN cosine fails both.
         #[test]
         fn within_mode_passes_gates_cosine_and_relative_error_in_f32_and_finiteness_in_bf16() {
             assert!(
@@ -623,9 +616,9 @@ mod within_mode {
             );
         }
 
-        /// `min_with_index` reports the first NaN (the first layer that broke, fix4 of packet
-        /// Q36-BF16-b), the plain minimum with its index, and — stated here because no caller
-        /// feeds an empty slice — the unchanged loop seed for an empty slice.
+        /// `min_with_index` reports the first NaN (the first layer that broke), the plain minimum
+        /// with its index, and — stated here because no caller feeds an empty slice — the
+        /// unchanged loop seed for an empty slice.
         #[test]
         fn min_with_index_reports_the_first_nan_the_minimum_and_the_empty_seed() {
             let (value, index) = min_with_index(&[1.0, f64::NAN, 0.5, f64::NAN]);
@@ -797,10 +790,9 @@ mod within_mode {
         }
 
         /// The F32 branch of the gate-1 verdict asserts every recorded failure and the BF16 branch
-        /// asserts the floor instead (fix1 of packet Q36-BF16-b): a run that missed the frozen gate
-        /// must fail in `f32` however good its floor numbers are, and a BF16 run with a broken
-        /// floor or a NaN row must fail too. Fix2 of packet Q36-BF16-b moved this test next to the
-        /// function so it runs on Linux as well.
+        /// asserts the floor instead: a run that missed the frozen gate must fail in `f32`
+        /// however good its floor numbers are, and a BF16 run with a broken floor or a NaN row must
+        /// fail too. The test sits next to the function so it runs on Linux as well.
         #[test]
         fn the_gate1_verdict_asserts_the_failures_in_f32_and_the_floor_in_bf16() {
             let misses = vec!["token 4 layer 3: cosine 0.5".to_string()];
@@ -815,7 +807,7 @@ mod within_mode {
             assert_eq!(
                 chunk_gate1_verdict(Activation::Bf16, &misses, 0.9799, 0),
                 Ok(()),
-                "a BF16 run keeps the d1 anchor and only reports its misses"
+                "a BF16 run keeps the anchor and only reports its misses"
             );
             assert!(
                 chunk_gate1_verdict(Activation::Bf16, &[], 0.5, 0).is_err(),

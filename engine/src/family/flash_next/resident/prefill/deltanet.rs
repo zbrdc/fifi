@@ -1,4 +1,4 @@
-//! Batched DeltaNet chunk, option A (plan S4 sections 3.2 and 3.3).
+//! Batched DeltaNet chunk.
 //!
 //! Projections, the causal convolution, the L2 norms, and the gates run once over `[T, ...]`
 //! tensors. The delta-rule recurrence then runs as `T` steps of the operations of `step` in
@@ -160,7 +160,7 @@ pub(super) fn chunk(
         ));
     };
     let rows = t.checked_mul(vh).ok_or_else(overflow)?;
-    // Projections over all rows, deltanet.rs:191-198. Each `qmm` takes `[T, H]` (packet PF-K).
+    // Projections over all rows, deltanet.rs:191-198. Each `qmm` takes `[T, H]`.
     let u = ctx.kernels.qmm(x, &w.qkv)?;
     let z = ctx.kernels.qmm(x, &w.z)?;
     let bb = ctx.kernels.qmm(x, &w.b)?;

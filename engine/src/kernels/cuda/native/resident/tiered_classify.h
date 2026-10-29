@@ -1,10 +1,10 @@
 /*
- * TCAP C2: launch entry of the tiered classification of one layer (native/resident/tiered_classify.h,
+ * Launch entry of the tiered classification of one layer (native/resident/tiered_classify.h,
  * the per-kernel header of the layout in kernels/cuda/resident/mod.rs; abi_resident.h stays closed).
  * Launch-only: nothing here allocates, copies or synchronizes; a fault in queued work surfaces at the
  * next synchronize. Include after abi.h in C++. Rust mirrors the struct in
- * native/resident/tiered_classify.rs. Design: ledger/plans/TCAP-DESIGN.md section 3.2, with the host
- * oracle family/qwen36/tiered/classify.rs (`classify_reference`), which this kernel must equal bit for bit.
+ * native/resident/tiered_classify.rs. The host oracle is family/qwen36/tiered/classify.rs
+ * (`classify_reference`), which this kernel must equal bit for bit.
  *
  * One block of 256 threads. Thread 0 walks the router's picks in rank order (id, weight) and writes, per pick i:
  *   log_out[i]       = (id, weight bits)                        the raw pick, always
@@ -21,7 +21,7 @@
  * publishes seq with a release store at system scope into mbox_req[0]. With no miss the mailbox is not touched and the
  * sequence does not move.
  *
- *   ids          i32 [top_k], 4-byte aligned: the router's picks (RD-5 output, rank order)
+ *   ids          i32 [top_k], 4-byte aligned: the router's picks (rank order)
  *   weights      f32 [top_k], 4-byte aligned: the router's renormalized weights
  *   slot_row     i32 [n_expert], 4-byte aligned: the layer's row of the slot table (bank slot or -1)
  *   norm_row     f32 [hidden], 16-byte aligned: the normed row the CPU experts read

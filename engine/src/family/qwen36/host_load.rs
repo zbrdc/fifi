@@ -1,4 +1,4 @@
-//! Loads the stepping-stone checkpoint for the host reference (Q36-HR).
+//! Loads the `Qwen3.6-35B-A3B` checkpoint for the host reference.
 //!
 //! Resident tensors (the dense weights, the packed projections, the router, and the output head) are
 //! read whole at load. The expert stacks and the embedding table stay in the shard files and are read

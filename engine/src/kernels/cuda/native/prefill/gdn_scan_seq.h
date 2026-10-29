@@ -1,6 +1,5 @@
-/* CPF-DN-A: launch entry of gdn_scan_seq, the P-a sequential gated-delta scan of one chunk
- * (decision 0049 design row 9), per-kernel header (the lane C ruling the resident tree
- * records); abi_resident.h stays closed.
+/* Launch entry of gdn_scan_seq, the sequential gated-delta scan of one chunk, per-kernel
+ * header; abi_resident.h stays closed.
  *
  * What it computes, per value head h (key head kh = h % n_k_heads, tiled, the GGUF layout;
  * D = head_dim = 128), per token t of m, in this order (the vendored element order,
@@ -13,33 +12,33 @@
  *   3. gates, in kernel: decay = exp(softplus(alpha[h] + dt_bias[h]) * a[h]) with a = ssm_a
  *      AS STORED (already -exp(A_log); no second exp), softplus(x) = x > 20 ? x :
  *      log1pf(expf(x)); beta = 1 / (1 + expf(-beta_logit)). expf, never __expf: this file
- *      is in the exactness-critical group (KUBDAN-MSG-32 Q1).
+ *      is in the exactness-critical group.
  *   4. state update: S *= decay; sk = S^T k (against the DECAYED state);
  *      d = (v - sk) * beta; S += k d^T; o = S^T q. State f32 [n_v_heads][128 key i][128
  *      value j], j fastest (gdn_delta.h), read and written in place, never fp16.
- *   5. o written PRE-NORM to o_out[t][h*D + j] (K1); the RMSNorm over all D columns cannot
- *      finish inside a slice, so K2 (gdn_out_gate_k) finishes it in place:
+ *   5. o written PRE-NORM to o_out[t][h*D + j] (gdn_scan_seq_k); the RMSNorm over all D
+ *      columns cannot finish inside a slice, so gdn_out_gate_k finishes it in place:
  *      o_out = o * rsqrt(mean(o^2) + eps) * norm_w[j] * silu(z), z = proj[t][z_off + h*D +
  *      j], silu(z) = z / (1 + expf(-z)), NOT sigmoid.
  *
  * Layouts (f32 unless stated): conv [m][conv_ld] with conv_ld == (2*n_k_heads +
- * n_v_heads)*128 EXACTLY (the K0 conv output has no row padding; any other conv_ld is
+ * n_v_heads)*128 EXACTLY (the conv output has no row padding; any other conv_ld is
  * refused); proj [m][ld] holding z (n_v_heads*128 at z_off), the beta logits (n_v_heads at
  * beta_off) and the alpha logits (n_v_heads at alpha_off); a, dt_bias [n_v_heads]; norm_w
- * [128]; state [n_v_heads][128][128]; o_out [m][n_v_heads*128], written by K1 and rewritten
- * in place by K2 (one buffer).
+ * [128]; state [n_v_heads][128][128]; o_out [m][n_v_heads*128], written by gdn_scan_seq_k
+ * and rewritten in place by gdn_out_gate_k (one buffer).
  *
- * p0 and m are LAUNCH ARGUMENTS (decision 0049 item 1: no StepParams field is read or
- * written); the scan math is position independent, so p0 enters only the guard. Poison rule
- * (items 2 and 10): on p0 < 0 or (long long)p0 + m > ctx_tokens the kernel loads no state,
+ * p0 and m are LAUNCH ARGUMENTS (no StepParams field is read or written); the scan math is
+ * position independent, so p0 enters only the guard. Poison rule (the device re-check of the
+ * launch arguments): on p0 < 0 or (long long)p0 + m > ctx_tokens the kernel loads no state,
  * updates nothing, writes NaN to its o_out columns for every t, and ORs mask 8
  * (INFERENCE_CUDA_PREFILL_STATUS_BOUND_VIOLATION) into *status (integer atomic, one
- * thread) when status != NULL; K2 repeats the check and NaNs its rows. The check is
- * block-uniform and precedes the first barrier.
+ * thread) when status != NULL; gdn_out_gate_k repeats the check and NaNs its rows. The check
+ * is block-uniform and precedes the first barrier.
  *
  * Limits: m 1..32768; head_dim 128 (the compiled case; a geometry value is a run-time
- * argument, lane C condition 8, and any other value is INFERENCE_CUDA_INVALID_ARGUMENT
- * before any launch, never an assertion inside a kernel); n_k_heads 1..64, n_v_heads
+ * argument, and any other value is INFERENCE_CUDA_INVALID_ARGUMENT before any launch, never
+ * an assertion inside a kernel); n_k_heads 1..64, n_v_heads
  * 1..128 and a multiple of n_k_heads; ld >= max(z_off + n_v*128, beta_off + n_v, alpha_off
  * + n_v) and <= 2^22, offsets >= 0; ctx_tokens 1..2^30 - 1 with p0 + m <= ctx_tokens (the
  * sum in 64 bits); eps exactly the f32 1e-6. Every range 4-byte aligned (no float4 loads
@@ -85,11 +84,10 @@ int inference_cuda_gdn_scan_seq_launch(const inference_cuda_gdn_scan_seq_args *a
                                        void *stream, int *out_stage);
 
 #ifdef INFERENCE_CUDA_FAULT_QUALIFICATION
-/* Qualified fault path (decision 0049 item 2's device re-check): validates every rule of
- * the entry EXCEPT the p0/m bound, then overrides p0 so the bound is violated, so the
- * KERNELS' own device guard (no state load, NaN rows, mask 8) is the code under test. The
- * validating entry above can never reach it with bad bounds; this entry changes no rule of
- * that entry. */
+/* Qualified fault path (the device re-check): validates every rule of the entry EXCEPT the
+ * p0/m bound, then overrides p0 so the bound is violated, so the KERNELS' own device guard
+ * (no state load, NaN rows, mask 8) is the code under test. The validating entry above can
+ * never reach it with bad bounds; this entry changes no rule of that entry. */
 int inference_cuda_gdn_scan_seq_fault_bad_bounds_launch(
     const inference_cuda_gdn_scan_seq_args *args, void *stream, int *out_stage);
 #endif

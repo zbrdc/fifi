@@ -270,7 +270,7 @@
       "stands_in_for": "ggml/include/ggml.h",
       "upstream_sha256": "9ac7ee3d3a957e5f7b21b104d3e3dc50b1b106f808f9d6735ead950450bfeec6",
       "path": "../../src/kernels/cuda/native/prefill/ggml_shim/ggml.h",
-      "sha256": "1671ed3077506a2bf2c657f1d88a0d4127f8d7bedf00a623596612391fc25b1f",
+      "sha256": "95184f557d3c386ac30fc756bf7dc46bc8d640a9197cef44edbdcbbd201eedda",
       "included_by": [
         "src/ggml-cuda/common.cuh"
       ]
@@ -280,7 +280,7 @@
       "stands_in_for": "ggml/src/ggml-impl.h",
       "upstream_sha256": "43564db0238aebb7ed68501e346c194866b5dac218d1d37b26baff9f458c00d3",
       "path": "../../src/kernels/cuda/native/prefill/ggml_shim/ggml-impl.h",
-      "sha256": "e7ea3de73d0a87efa60f9d0a655840e8c32abd201f793758ba5041e117400d84",
+      "sha256": "ff6cf51f27eca7700a89e7ec6962cf0223920647ac5cc368601bf4b377d091d8",
       "included_by": [
         "src/ggml-cuda/common.cuh"
       ]
@@ -290,7 +290,7 @@
       "stands_in_for": "ggml/include/ggml-cuda.h",
       "upstream_sha256": "9cbfcea49f6da4d07f41dc22fa8dbf870825faaa2a68e34e65fe30ea6c41e042",
       "path": "../../src/kernels/cuda/native/prefill/ggml_shim/ggml-cuda.h",
-      "sha256": "17f85d8251510f76e8d4e7e2adff044f180fb57707cc761432dce9f071e2b45a",
+      "sha256": "efa722e5b61877e7af6bfb2dce2ca5d9c3983977612b715bc1d557ac2c741846",
       "included_by": [
         "src/ggml-cuda/common.cuh"
       ]
@@ -300,7 +300,7 @@
       "stands_in_for": "ggml/src/ggml-cuda/unary.cuh",
       "upstream_sha256": "a6903bb02577a33b79c738e62e425867f9122d1b4981a3b228062b4f978b2858",
       "path": "../../src/kernels/cuda/native/prefill/ggml_shim/unary.cuh",
-      "sha256": "7e092c635294ceabbedfbfa0c0eda03fdf4c362e4d2b4157668f292a8d6129d2",
+      "sha256": "fac91c77789209b2cebc53ab44e04d3bb9d8925c2a85978280cb47a7a1f79932",
       "included_by": [
         "src/ggml-cuda/mmvq.cu"
       ]

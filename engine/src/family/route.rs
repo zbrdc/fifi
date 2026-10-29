@@ -22,8 +22,8 @@ pub struct Routed {
 ///   selected values cannot renormalize. A softmax row never holds these, so the model execution
 ///   that produced the row failed.
 ///   This `Backend` error ends one job only and is not terminal: the engine stays ready and no
-///   native lease becomes unusable. It differs from the terminal `Backend` errors of the MLX adapter
-///   under decision 0023.
+///   native lease becomes unusable. It differs from the terminal `Backend` errors of the MLX
+///   adapter.
 pub fn route_experts(probs: &[f32], router: &Router, top_k: u32) -> Result<Routed, EngError> {
     let renorm = match *router {
         Router::SoftmaxTopK { renorm } => renorm,
@@ -93,12 +93,12 @@ fn backend_fault(message: &str) -> EngError {
     }
 }
 
-/// Checks the stacked router-health values of a device-routed chunk (packet Q36-PF-DEVROUTE).
-/// Each layer of the chunk sums its whole `[T, E]` probability block into one F32 value, the chunk
-/// stacks the values and reads them back once, and this check replaces the finite check that
-/// `route_experts` makes per row under host routing: any non-finite value returns the same
-/// `Backend` error with the same operation label, and a finite vector passes. A softmax row sums
-/// to 1, so a NaN or infinite entry makes its layer's sum non-finite, as in `route_device`.
+/// Checks the stacked router-health values of a device-routed chunk. Each layer of the chunk sums
+/// its whole `[T, E]` probability block into one F32 value, the chunk stacks the values and reads
+/// them back once, and this check replaces the finite check that `route_experts` makes per row
+/// under host routing: any non-finite value returns the same `Backend` error with the same
+/// operation label, and a finite vector passes. A softmax row sums to 1, so a NaN or infinite entry
+/// makes its layer's sum non-finite, as in `route_device`.
 pub fn check_health(values: &[f32]) -> Result<(), EngError> {
     if values.iter().all(|value| value.is_finite()) {
         return Ok(());
@@ -109,7 +109,7 @@ pub fn check_health(values: &[f32]) -> Result<(), EngError> {
 }
 
 /// One beyond-tie difference that [`compare_top_k`] found between two selections of the same
-/// probability row (packet Q36-BF16-a fix3; decision 0046 A6).
+/// probability row.
 #[derive(Debug, Clone, PartialEq)]
 pub struct RouteFault {
     /// The compared rank position, or `None` when the fault is a set difference.
@@ -156,12 +156,11 @@ fn exclusive(ids: &[u32], others: &[u32]) -> Vec<u32> {
 /// host oracle and the device routing of the Q36 parity gate), and `probs` is the probability
 /// row that ranked `oracle`.
 ///
-/// The rule (fix5 of packet Q36-BF16-a; decision 0046 A6 item 8): a set difference or a rank
-/// swap passes only when the host-row probability gap to the nearest exchanged (or swapped)
-/// expert is <= `epsilon`; a missing exchange partner is a fault; ties at exactly equal
-/// probability must agree with the lower index; any other difference fails. An id that `probs`
-/// cannot index and a selection-width mismatch are faults whatever the epsilon. `max_gap`
-/// carries the largest gap the rule saw, tolerated or not, so a caller can report the gap
+/// The rule: a set difference or a rank swap passes only when the host-row probability gap to the
+/// nearest exchanged (or swapped) expert is <= `epsilon`; a missing exchange partner is a fault;
+/// ties at exactly equal probability must agree with the lower index; any other difference fails.
+/// An id that `probs` cannot index and a selection-width mismatch are faults whatever the epsilon.
+/// `max_gap` carries the largest gap the rule saw, tolerated or not, so a caller can report the gap
 /// distribution of the mismatching selections.
 pub fn compare_top_k(
     oracle: &[u32],
@@ -244,8 +243,7 @@ pub fn compare_top_k(
     comparison
 }
 
-/// The per-cell measurements of one differing top-k pair under the BF16 co-conditions (fix5
-/// of packet Q36-BF16-a; decision 0046 A6 item 8).
+/// The per-cell measurements of one differing top-k pair under the BF16 co-conditions.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct RouteCellDeltas {
     /// The largest `|p_a - p_b| / max(p_a, p_b)` over the pair's differing positions, where
@@ -259,12 +257,11 @@ pub struct RouteCellDeltas {
     pub signed_gap: f32,
 }
 
-/// Measures one differing pair of selections on the row that ranked `oracle`: the relative
-/// gap and the signed host-minus-device probability sum of its differing positions (fix5 of
-/// packet Q36-BF16-a; decision 0046 A6 item 8). The pair is one cell of the BF16 route gate;
-/// `compare_top_k` decides its faults, this decides its bias report and its relative-gap gate.
-/// A position whose ids the row cannot index is skipped (`compare_top_k` already faults it),
-/// and a selection width the other lacks is ignored.
+/// Measures one differing pair of selections on the row that ranked `oracle`: the relative gap and
+/// the signed host-minus-device probability sum of its differing positions. The pair is one cell of
+/// the BF16 route gate; `compare_top_k` decides its faults, this decides its bias report and its
+/// relative-gap gate. A position whose ids the row cannot index is skipped (`compare_top_k` already
+/// faults it), and a selection width the other lacks is ignored.
 pub fn route_cell_deltas(oracle: &[u32], routed: &[u32], probs: &[f32]) -> RouteCellDeltas {
     let mut deltas = RouteCellDeltas {
         max_relative_gap: 0.0,
@@ -288,16 +285,15 @@ pub fn route_cell_deltas(oracle: &[u32], routed: &[u32], probs: &[f32]) -> Route
     deltas
 }
 
-/// True when a differing cell at (`step`, `layer`) breaks the origin rule of the BF16 run (fix5
-/// of packet Q36-BF16-a; decision 0046 A6 item 8): the F32 summation-order noise starts after
-/// the first layers, so no cell of layers 0 to 2 of step 0 may differ. The d1 run first
-/// mismatched at step 0 layer 3.
+/// True when a differing cell at (`step`, `layer`) breaks the origin rule of the BF16 run: the F32
+/// summation-order noise starts after the first layers, so no cell of layers 0 to 2 of step 0 may
+/// differ. The d1 run first mismatched at step 0 layer 3.
 pub fn origin_fault(step: usize, layer: usize) -> bool {
     step == 0 && layer <= 2
 }
 
-/// True when the run's fraction of differing cells passes its gate (fix5 of packet
-/// Q36-BF16-a; decision 0046 A6 item 8). A run that compared nothing differs in nothing.
+/// True when the run's fraction of differing cells passes its gate. A run that compared nothing
+/// differs in nothing.
 pub fn differing_fraction_passes(compared: usize, differing: usize, limit: f64) -> bool {
     if compared == 0 {
         return true;
@@ -305,23 +301,22 @@ pub fn differing_fraction_passes(compared: usize, differing: usize, limit: f64) 
     differing as f64 / compared as f64 <= limit
 }
 
-/// True when the run's signed mean of the per-cell host-minus-device probability sums passes
-/// its gate (fix5 of packet Q36-BF16-a; decision 0046 A6 item 8). A NaN fails.
+/// True when the run's signed mean of the per-cell host-minus-device probability sums passes its
+/// gate. A NaN fails.
 pub fn signed_mean_passes(signed_mean: f64, limit: f64) -> bool {
     signed_mean.is_finite() && signed_mean.abs() <= limit
 }
 
-/// True for a finite cosine at or above `floor` (fix5 of packet Q36-BF16-a): the shared
-/// NaN-rejecting form of the logits-cosine floors of the route gate, the exact 0.99999 floor
-/// for the `f32` control and 0.997 for BF16. A NaN fails both.
+/// True for a finite cosine at or above `floor`: the shared NaN-rejecting form of the logits-cosine
+/// floors of the route gate, the exact 0.99999 floor for the `f32` control and 0.997 for BF16. A
+/// NaN fails both.
 pub fn cosine_passes(cosine: f64, floor: f64) -> bool {
     cosine.is_finite() && cosine >= floor
 }
 
-/// True when a measured minimum keeps its floored anchor (fix5 of packet Q36-BF16-a; decision
-/// 0046 A6): finite, at least `floor`, and no more than `regression` below `anchor`. The BF16
-/// parity minimum keeps the anchor 0.9799 that the d1 run observed with floor 0.95 and
-/// regression 0.01; a report-only rule is not allowed to ratchet.
+/// True when a measured minimum keeps its floored anchor: finite, at least `floor`, and no more
+/// than `regression` below `anchor`. The BF16 parity minimum keeps the anchor 0.9799 that the d1
+/// run observed with floor 0.95 and regression 0.01; a report-only rule is not allowed to ratchet.
 pub fn keeps_floored_anchor(value: f64, floor: f64, anchor: f64, regression: f64) -> bool {
     value.is_finite() && value >= floor && value >= anchor - regression
 }
@@ -331,33 +326,30 @@ mod tests {
     use super::*;
 
     /// The production near-tie epsilon of the BF16 route rule (`BF16_TIE_EPSILON` in
-    /// `qwen36/resident/route_parity.rs`, fix4 of packet Q36-BF16-a): a probability gap about
-    /// twice the 2.55e-3 maximum that the d1 BF16 gate observed over its 600 mismatching cells
-    /// of 1,440. A gap of 4e-3 passes it and a gap of 6e-3 fails it.
+    /// `qwen36/resident/route_parity.rs`): a probability gap about twice the 2.55e-3 maximum that
+    /// the d1 BF16 gate observed over its 600 mismatching cells of 1,440. A gap of 4e-3 passes it
+    /// and a gap of 6e-3 fails it.
     const TIE_EPSILON: f32 = 5e-3;
     /// The production relative-gap gate of the BF16 route rule (`BF16_RELATIVE_GAP_LIMIT` in
-    /// `qwen36/resident/route_parity.rs`, fix5 of packet Q36-BF16-a): 0.5, the first gate. The
-    /// d1 evidence records absolute gaps only, so the observed maximum relative gap is to
-    /// tighten it after the next Mac run.
+    /// `qwen36/resident/route_parity.rs`): 0.5, the first gate. The d1 run recorded absolute gaps
+    /// only, so the observed maximum relative gap is to tighten it after the next Mac run.
     const RELATIVE_GAP_LIMIT: f32 = 0.5;
     /// The production differing-fraction gate of the BF16 route rule
-    /// (`BF16_DIFFERING_FRACTION_LIMIT` in `qwen36/resident/route_parity.rs`, fix5 of packet
-    /// Q36-BF16-a): 60% against the 42% that the d1 run observed.
+    /// (`BF16_DIFFERING_FRACTION_LIMIT` in `qwen36/resident/route_parity.rs`): 60% against the 42%
+    /// that the d1 run observed.
     const DIFFERING_FRACTION_LIMIT: f64 = 0.6;
     /// The production signed-mean gate of the BF16 route rule (`BF16_SIGNED_MEAN_LIMIT` in
-    /// `qwen36/resident/route_parity.rs`, fix5 of packet Q36-BF16-a): epsilon/5, 1e-3.
+    /// `qwen36/resident/route_parity.rs`): epsilon/5, 1e-3.
     const SIGNED_MEAN_LIMIT: f64 = 1e-3;
-    /// The production logits-cosine floors of the route gate (`MIN_COSINE` and
-    /// `BF16_MIN_COSINE` in `qwen36/resident/route_parity.rs`): the exact 0.99999 floor of the
-    /// `f32` control and the 0.997 BF16 floor of fix5, 1.64e-3 under the 0.99864 minimum that
-    /// the d1 run observed.
+    /// The production logits-cosine floors of the route gate (`MIN_COSINE` and `BF16_MIN_COSINE` in
+    /// `qwen36/resident/route_parity.rs`): the exact 0.99999 floor of the `f32` control and the
+    /// 0.997 BF16 floor, 1.64e-3 under the 0.99864 minimum that the d1 run observed.
     const F32_LOGITS_FLOOR: f64 = 0.999_99;
     const BF16_LOGITS_FLOOR: f64 = 0.997;
     /// The production floor, anchor, and regression of the BF16 parity minimum
-    /// (`BF16_LAYER_COSINE_FLOOR`, `D1_BF16_MIN_LAYER_COSINE`, and
-    /// `BF16_LAYER_COSINE_REGRESSION` in `qwen36/resident/parity.rs`, fix5 of packet
-    /// Q36-BF16-a): 0.95 under the 0.9799 that the d1 run observed, with 0.01 of allowed
-    /// regression.
+    /// (`BF16_LAYER_COSINE_FLOOR`, `D1_BF16_MIN_LAYER_COSINE`, and `BF16_LAYER_COSINE_REGRESSION`
+    /// in `qwen36/resident/parity.rs`): 0.95 under the 0.9799 that the d1 run observed, with 0.01
+    /// of allowed regression.
     const LAYER_FLOOR: f64 = 0.95;
     const D1_LAYER_MINIMUM: f64 = 0.979_9;
     const LAYER_REGRESSION: f64 = 0.01;
@@ -565,8 +557,8 @@ mod tests {
 
     #[test]
     fn the_origin_rule_faults_only_layers_0_to_2_of_step_0() {
-        // The d1 BF16 run first mismatched at step 0 layer 3 (evidence 907030d6): the rule
-        // faults every differing cell before that and nothing else.
+        // The d1 BF16 run first mismatched at step 0 layer 3: the rule faults every differing cell
+        // before that and nothing else.
         for layer in 0..3 {
             assert!(
                 origin_fault(0, layer),
@@ -617,11 +609,11 @@ mod tests {
 
     #[test]
     fn the_logits_cosine_floor_is_finite_and_above_the_floor_of_the_dtype() {
-        // The f32 control keeps the exact 0.99999 floor of decision 0046 item 4.
+        // The f32 control keeps the exact 0.99999 floor.
         assert!(cosine_passes(F32_LOGITS_FLOOR, F32_LOGITS_FLOOR));
         assert!(!cosine_passes(0.999_98, F32_LOGITS_FLOOR));
-        // The BF16 floor is 0.997 (fix5): the d1 minimum 0.99864 passes with a 1.64e-3 margin,
-        // and a cosine below the floor fails.
+        // The BF16 floor is 0.997: the d1 minimum 0.99864 passes with a 1.64e-3 margin, and a
+        // cosine below the floor fails.
         assert!(cosine_passes(0.998_64, BF16_LOGITS_FLOOR));
         assert!(cosine_passes(BF16_LOGITS_FLOOR, BF16_LOGITS_FLOOR));
         assert!(!cosine_passes(0.996_9, BF16_LOGITS_FLOOR));

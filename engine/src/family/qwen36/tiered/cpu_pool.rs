@@ -1,4 +1,4 @@
-//! The CPU expert pool of the tiered offload, host only (OFF-2 P6).
+//! The CPU expert pool of the tiered offload, host only.
 //!
 //! The types staged here describe WHAT the pool consumes: shared mapped regions
 //! ([`MappedRegion`]), one routed expert's slices and router weight ([`ExpertJob`]),
@@ -12,7 +12,7 @@
 //! (`expert_cpu_q8k`, llama.cpp's activation grid) or the per-32 group integer kernel
 //! (`expert_cpu_q8g`, the kernel of the tier), dotted against the same mapped Q4_K bytes.
 //! Nothing about Qwen3.6 is hard-coded: all geometry comes from the kernel's
-//! [`ExpertShape`](crate::kernels::expert_cpu::ExpertShape). The tiered step (OFF-2 D5)
+//! [`ExpertShape`](crate::kernels::expert_cpu::ExpertShape). The tiered step
 //! drives it through `TieredHost`.
 
 use std::collections::VecDeque;
@@ -37,10 +37,10 @@ pub enum ExpertKernel {
     F32,
     /// Q8_K activations (llama.cpp's CPU grid, 256 values per scale), integer dot; the backend
     /// decides scalar or AVX2. NOT the tier's kernel: its rounding noise is independent of the
-    /// oracle's and failed OFF-2 gate (b) at 80 percent CPU picks.
+    /// oracle's and failed the model-level accuracy gate at 80 percent CPU picks.
     Q8k(DotBackend),
     /// Activations on the 32-value group grid of the device path, integer dot; the backend
-    /// decides scalar or AVX2. The tier's kernel: it passed gate (b) where Q8_K failed.
+    /// decides scalar or AVX2. The tier's kernel: it passed that gate where Q8_K failed.
     Q8g(DotBackend),
 }
 

@@ -1,7 +1,7 @@
-//! Tests of the context mailbox (TCAP C1b). The host-only tests run the port over ordinary memory; the device
-//! tests use the real mapping and the real classify kernel as the publisher: `mailbox_orders_the_row_before_the_
-//! sequence_under_stress` is the user-approved 10,000-request stress test (2026-10-13), the one that must kill the
-//! ordering mutants of the publication in `tiered_classify.cu`.
+//! Tests of the context mailbox. The host-only tests run the port over ordinary memory; the
+//! device tests use the real mapping and the real classify kernel as the publisher:
+//! `mailbox_orders_the_row_before_the_sequence_under_stress` is the 10,000-request stress test,
+//! the one that must kill the ordering mutants of the publication in `tiered_classify.cu`.
 //!
 //! Every device phase is a function that creates its own context, stream and buffers, has only `?` inside, drops
 //! every owner when it returns and hands back plain host records; the tests assert on those records afterwards
@@ -648,12 +648,13 @@ fn a_mailbox_is_counted_zeroed_leaked_while_a_port_lives_and_refused_inside_a_ca
 
 // ---- source pins ----
 //
-// The ordering of the publication cannot be seen on every host: on the x86 laptop and the 3090 box the device-to-host
-// writes of this kernel arrive in order even without the fences (the stress test above survives a kernel with no
-// ordering at all), and a host-side acquire/release mutant only shows on the aarch64 Jetsons. So the order the review
-// approved is pinned in the source text, whitespace-insensitively, and the protocol steps are pinned in the order the
-// design gives them. A mutant that drops a fence, weakens the release store or reorders the host steps dies here on
-// every host.
+// The ordering of the publication cannot be seen on every host: on the x86 laptop and the 3090
+// box the device-to-host writes of this kernel arrive in order even without the fences (the
+// stress test above survives a kernel with no ordering at all), and a host-side acquire/release
+// mutant only shows on the aarch64 Jetsons. So the required order is pinned in the source text,
+// whitespace-insensitively, and the protocol steps are pinned in the order the design gives
+// them. A mutant that drops a fence, weakens the release store or reorders the host steps dies
+// here on every host.
 
 /// The memory order named by the first `Ordering::` after `function` in `text`.
 fn first_ordering<'t>(text: &'t str, function: &str) -> &'t str {

@@ -1,11 +1,11 @@
 //! Raw FFI to the CUDA adapters in `native/`.
 //!
 //! `unsafe` and `extern "C"` live only in this file and its child modules
-//! (`native/resident.rs`, `native/device_info.rs`), per decision 0047. Each
-//! child module starts with a doc that lists its safety invariants. Functions here are private to the CUDA
-//! module. Each one checks every length and shape the native side relies on for
-//! memory safety before the native call. Callers hold the dispatch guard
-//! (`super::guard`) around every call.
+//! (`native/resident.rs`, `native/device_info.rs`). Each child module starts
+//! with a doc that lists its safety invariants. Functions here are private to
+//! the CUDA module. Each one checks every length and shape the native side
+//! relies on for memory safety before the native call. Callers hold the
+//! dispatch guard (`super::guard`) around every call.
 
 #![allow(unsafe_code)]
 
@@ -64,7 +64,7 @@ pub(super) enum TiledType {
     Q6K,
     Q80,
     /// Built on the host by `context::tile_q5_0`; the matmul is the own kernel of
-    /// `native/resident/matmul_q5_0.cu` (MEL-C1b), not a vendored one.
+    /// `native/resident/matmul_q5_0.cu`, not a vendored one.
     Q50,
 }
 
@@ -380,7 +380,7 @@ unsafe extern "C" {
         not(test),
         expect(
             dead_code,
-            reason = "the query entry of the KV8-B B4' pins, called by their tests only"
+            reason = "the query entry of the eager-loading pins, called by their tests only"
         )
     )]
     #[link_name = "inference_cuda_module_loading_mode"]
@@ -629,14 +629,14 @@ pub(super) fn device_count() -> Result<c_int, c_int> {
     }
 }
 
-/// The module loading mode of the driver (KV8-B B4'): `1` is `CU_MODULE_EAGER_LOADING` and
+/// The module loading mode of the driver: `1` is `CU_MODULE_EAGER_LOADING` and
 /// `2` is `CU_MODULE_LAZY_LOADING` (cuda.h of the build image), read through the adapter's
 /// own query entry. The observation point of the eager-loading pins.
 #[cfg_attr(
     not(test),
     expect(
         dead_code,
-        reason = "the query entry of the KV8-B B4' pins, called by their tests only"
+        reason = "the query entry of the eager-loading pins, called by their tests only"
     )
 )]
 pub(super) fn module_loading_mode() -> Result<c_int, c_int> {
@@ -742,7 +742,7 @@ pub(super) fn pack_bytes(tokens: usize, k: usize) -> Option<(usize, usize)> {
 
 /// Values per token row that the activation regions of a call hold. A Q5_0 weight (K = 896 is no
 /// multiple of 256) reads the vendored fragment-order `xf` of a row rounded up to the 256 grid,
-/// whose tail is zero (MEL-C1b, kernel contract); every other type uses its own `k`. Pass this
+/// whose tail is zero (the kernel contract); every other type uses its own `k`. Pass this
 /// width, not `tiled.k`, to [`activation_bytes`] and to the pack of a Q5_0 call.
 pub(super) fn activation_k(ty: TiledType, k: usize) -> usize {
     match ty {
@@ -2245,19 +2245,19 @@ mod tests {
         assert_ne!(message, "unknown status");
     }
 
-    /// KV8-B B4' (lane C amendment 2): the adapter's constructor asks for EAGER module
-    /// loading before CUDA initializes. The constructor runs before main, before this test
-    /// harness and before any thread of the process, so the variable is set while the
-    /// process is provably single-threaded. This test must NOT set the variable itself -
-    /// the constructor keeps an operator's explicit value, so a run that set the variable
-    /// could not tell the constructor's work from its own - and a test-harness environment
-    /// that carries a different value (an operator's LAZY) fails here honestly.
+    /// The adapter's constructor asks for EAGER module loading before CUDA initializes. The
+    /// constructor runs before main, before this test harness and before any thread of the
+    /// process, so the variable is set while the process is provably single-threaded. This
+    /// test must NOT set the variable itself - the constructor keeps an operator's explicit
+    /// value, so a run that set the variable could not tell the constructor's work from its
+    /// own - and a test-harness environment that carries a different value (an operator's
+    /// LAZY) fails here honestly.
     #[test]
     fn the_adapter_constructor_sets_eager_module_loading() {
         assert_eq!(std::env::var("CUDA_MODULE_LOADING"), Ok("EAGER".to_owned()));
     }
 
-    /// KV8-B B4': ONE device test, its own process, Result-only device phase. The driver
+    /// ONE device test, its own process, Result-only device phase. The driver
     /// itself must report eager loading (CU_MODULE_EAGER_LOADING 1 of cuda.h): the default
     /// of CUDA 12.2+ is lazy (2), so this pin dies if the constructor's setenv is removed.
     #[test]

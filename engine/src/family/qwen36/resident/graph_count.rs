@@ -1,15 +1,15 @@
-//! The primitive histogram of ONE Q36 decode token: fifi against mlx-lm (packet GPU-GAP-COUNT).
+//! The primitive histogram of ONE Q36 decode token: fifi against mlx-lm.
 //!
-//! The decode GPU time of the engine sits 2.7 ms per token above mlx-lm at prompt depth 16
-//! (Q36-GAP section 3c), and the cause is not decomposed. Every extra MLX primitive of the token
-//! graph costs encode and dispatch time on the GPU, so this module counts the primitives of the
-//! LAZY graph of one decode step — before it is evaluated — and the companion scripts of the
-//! packet (`mlx_graph_count.py`, `compare_histograms.py`, scratch only) do the same for mlx-lm
-//! and name the top three contributors to the difference.
+//! The decode GPU time of the engine sits 2.7 ms per token above mlx-lm at prompt depth 16, and
+//! the cause is not decomposed. Every extra MLX primitive of the token graph costs encode and
+//! dispatch time on the GPU, so this module counts the primitives of the LAZY graph of one decode
+//! step — before it is evaluated — and companion scripts (`mlx_graph_count.py`,
+//! `compare_histograms.py`, scratch only) do the same for mlx-lm and name the top three
+//! contributors to the difference.
 //!
 //! One ignored Mac-only real-checkpoint test, `decode_graph_primitives`, plus the portable unit
-//! tests of the pure parts below it. Inputs by environment (the rule set of packet GPU-GAP-COUNT,
-//! the same variables the decode-phase timing harness reads):
+//! tests of the pure parts below it. Inputs by environment (the same variables the decode-phase
+//! timing harness reads):
 //!
 //! | Variable | Meaning | Default |
 //! | --- | --- | --- |
@@ -89,8 +89,8 @@
 
 use super::super::settings::{Activation, parse_activation};
 
-/// The activation the run REQUIRES from the raw `Q36_ACTIVATION` text (packet GPU-GAP-COUNT, the
-/// rule of the decode-phase timing harness): the variable must name `bf16` or `f32`, the words
+/// The activation the run REQUIRES from the raw `Q36_ACTIVATION` text (the rule of the
+/// decode-phase timing harness): the variable must name `bf16` or `f32`, the words
 /// of `settings::parse_activation`, so a plain invocation cannot silently run the f32 control.
 fn required_activation(raw: Option<&str>) -> Result<Activation, String> {
     match raw {
@@ -155,7 +155,7 @@ fn id_list(value: &serde_json::Value, name: &str) -> Option<Vec<u32>> {
     if ids.is_empty() { None } else { Some(ids) }
 }
 
-/// The primitive histogram of the text of `mlx_print_graph` (packet GPU-GAP-COUNT): one entry per
+/// The primitive histogram of the text of `mlx_print_graph`: one entry per
 /// primitive name with its node count, sorted by count (descending) and then by name, so two
 /// dumps compare row by row and the heaviest primitive comes first. The count is the number of
 /// node lines, one per line that names a primitive; the two header lines of the format count
@@ -207,7 +207,7 @@ fn primitive_name(line: &str) -> Option<String> {
 }
 
 /// The prompt depth the run prefills before the ONE decode step: 16 tokens, the depth of the
-/// Q36-GAP decode rows this module decomposes.
+/// decode-gap measurement this module decomposes.
 #[cfg(all(
     feature = "native-mlx",
     feature = "native-fault-qualification",
@@ -294,7 +294,7 @@ fn decode_graph_primitives() {
     decoder.kernels.reset_compile_counters();
     decoder.kernels.clear_compile_cache().unwrap();
     let mut state = decoder.zero_state().unwrap();
-    // Prefill depth 16 through the chunked prefill, as the decode rows of Q36-GAP ran it.
+    // Prefill depth 16 through the chunked prefill, as the decode-gap measurement ran it.
     decoder
         .prefill(&mut state, &ids[..DEPTH], StepMode::Prompt)
         .unwrap();
@@ -464,8 +464,8 @@ mod tests {
     }
 
     /// `required_activation` refuses an unset variable with the variable's name and its two
-    /// values, accepts exactly the settings words, and names the bad text it refused (the rule
-    /// of packet GPU-GAP-COUNT: a plain invocation cannot silently run the f32 control).
+    /// values, accepts exactly the settings words, and names the bad text it refused (a plain
+    /// invocation cannot silently run the f32 control).
     #[test]
     fn required_activation_requires_one_of_the_two_words() {
         assert_eq!(

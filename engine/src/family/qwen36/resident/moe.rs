@@ -1,5 +1,4 @@
-//! Resident MoE of the Q36 family (packets Q36-C3 and Q36-DR; decision 0046 items 1 and 9 and
-//! amendment A2).
+//! Resident MoE of the Q36 family.
 //!
 //! The router runs on the device in both routing modes. Every expert stack is already resident, so
 //! `gather_qmm` reads the selected experts in place.
@@ -16,9 +15,9 @@
 //! host rule does, because `argsort` is stable. The call also returns the sum of the whole
 //! probability row (the health). A softmax row sums to 1, so a NaN or infinite entry makes the sum
 //! non-finite. The step adds the sums of all layers and checks the total at the token readback.
-//! The expert ids are clamped below the expert count ONCE per layer (`bound_indices`, packet
-//! GAP-TRIM-A): the top-probability take and the gate, up, and down products of the layer share
-//! the one clamp node, and the values stay bit for bit the values of the per-operation clamps.
+//! The expert ids are clamped below the expert count ONCE per layer (`bound_indices`): the
+//! top-probability take and the gate, up, and down products of the layer share the one clamp
+//! node, and the values stay bit for bit the values of the per-operation clamps.
 
 use super::ops::{Ctx, dim, f32_tensor, short_import, to_act, u32_tensor, values};
 use super::weights::{RDense, RMoe};
@@ -31,7 +30,7 @@ use crate::{
     tensor::{ExecutionTensor, Tensor},
 };
 
-/// How a layer picks its experts (decision 0046 amendment A2).
+/// How a layer picks its experts.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub(super) enum Routing {
     /// The host routes with `route_experts`: two synchronizations per layer. The parity reference.
@@ -59,9 +58,8 @@ pub(super) fn dense_rows(
 }
 
 /// Shared expert `sigmoid(x · s) * down(silu(gate(x)) * up(x))` as `[1, H]`.
-/// Whether the fused prefill kernels (R4-7) replace the composite ops. Default ON
-/// (the coordinator-approved ship flip on the gate evidence); Q36_FUSED_PREFILL=0 is
-/// the kill switch.
+/// Whether the fused prefill kernels replace the composite ops. Default ON after their gate
+/// passed; Q36_FUSED_PREFILL=0 is the kill switch.
 pub(super) fn fused_prefill() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| std::env::var_os("Q36_FUSED_PREFILL").is_none_or(|v| v != "0"))
@@ -91,8 +89,8 @@ pub(super) fn shared(
 /// chose the experts. It synchronizes twice: the probability readback (which also evaluates `x`)
 /// and the import of the selected indices and gates.
 ///
-/// This host-routed MoE step NEVER compiles (packet MX-COMPILE-1a): it is the parity reference
-/// of decision 0046 A2, and only the device-routed `step_device` has a compiled form. The
+/// This host-routed MoE step NEVER compiles: it is the parity reference, and only the
+/// device-routed `step_device` has a compiled form. The
 /// DeltaNet block of a host-routed decoder still compiles — its step ignores the routing.
 ///
 /// A router output with a count other than the expert count returns `BadRequest` before routing.
@@ -110,8 +108,8 @@ pub(super) fn step(
 }
 
 /// The routing of one row `x` `[1, H]`: the router probabilities read back
-/// once, the host top-k selection, the `[k]` ids (U32, clamped once - packet
-/// GAP-TRIM-A) and `[k, 1, 1]` gates (F32) imported in ONE call, plus the
+/// once, the host top-k selection, the `[k]` ids (U32, clamped once) and
+/// `[k, 1, 1]` gates (F32) imported in ONE call, plus the
 /// `Selection` tail of the solo step. Batched routing uses `route_rows`.
 fn route_row(
     ctx: &mut Ctx<'_>,
@@ -135,7 +133,7 @@ fn route_row(
     let mut imported = ctx.kernels.import_many(&[&ids, &gates])?.into_iter();
     let ids = imported.next().ok_or_else(short_import)?;
     let gates = imported.next().ok_or_else(short_import)?;
-    // One clamp for the whole layer (packet GAP-TRIM-A): the host selection is inside the expert
+    // One clamp for the whole layer: the host selection is inside the expert
     // count already, and the clamp of an already clamped tensor is the identity, so the three
     // gathered products below keep their values bit for bit.
     let bounded = ctx.kernels.bound_indices(&ids, dim(m.experts)?)?;
@@ -145,7 +143,7 @@ fn route_row(
 
 /// The selected experts and the shared expert on `x` `[1, H]`: gate and up on the shared input,
 /// SwiGLU, down per expert, the gate-weighted sum over the once-clamped `ids` `[k]` (U32,
-/// `BoundedIndices` of packet GAP-TRIM-A) and `gates` `[k, 1, 1]` (F32), and the shared expert.
+/// `BoundedIndices`) and `gates` `[k, 1, 1]` (F32), and the shared expert.
 /// Returns `[1, H]`. It makes no synchronization and builds ONE clamp node for the expert ids,
 /// the clamp that every gathered product of the layer shares.
 fn combine(
@@ -158,8 +156,8 @@ fn combine(
 ) -> Result<ExecutionTensor, EngError> {
     let experts = combine_core(ctx, shape, w, x, ids, gates)?;
     let shared_out = shared(ctx, w, x)?;
-    // Packet Q36-BF16-a: the gates are F32, so the weighted sum and the shared expert product are
-    // F32. The residual add takes the activation dtype.
+    // The gates are F32, so the weighted sum and the shared expert product are F32. The
+    // residual add takes the activation dtype.
     let total = ctx.kernels.binary(BinaryOp::Add, &experts, &shared_out)?;
     to_act(ctx, &total)
 }
@@ -178,7 +176,7 @@ fn combine_core(
     let x3 = ctx.kernels.reshape(x, &[1, 1, hidden])?;
     let hg = ctx.kernels.gather_qmm_bounded(&x3, &w.gate, ids)?;
     let hu = ctx.kernels.gather_qmm_bounded(&x3, &w.up, ids)?;
-    // The act_mul fused kernel (R4-7, Q36_FUSED_PREFILL=1) replaces silu+mul.
+    // The act_mul fused kernel (Q36_FUSED_PREFILL=1) replaces silu+mul.
     let h = if fused_prefill()
         && std::env::var_os("Q36_NO_ACTMUL").is_none()
         && hg.dtype() == Dtype::Bf16
@@ -280,7 +278,7 @@ pub(super) fn combine_rows(
     let x3 = ctx.kernels.reshape(&x3, &[pairs, 1, hidden])?;
     let hg = ctx.kernels.gather_qmm_bounded(&x3, &w.gate, ids)?;
     let hu = ctx.kernels.gather_qmm_bounded(&x3, &w.up, ids)?;
-    // The act_mul fused kernel (R4-7, Q36_FUSED_PREFILL=1) replaces silu+mul.
+    // The act_mul fused kernel (Q36_FUSED_PREFILL=1) replaces silu+mul.
     let h = if fused_prefill()
         && std::env::var_os("Q36_NO_ACTMUL").is_none()
         && hg.dtype() == Dtype::Bf16
@@ -303,9 +301,9 @@ pub(super) fn combine_rows(
 
 /// The lazy outcome of device routing for one probability row.
 pub(super) struct DeviceRoute {
-    /// The chosen experts `[k]` (U32) in rank order, clamped below the expert count ONCE
-    /// (packet GAP-TRIM-A): the top-probability take and every gathered product of the layer
-    /// read this same clamped resident, so the layer builds one `Minimum` node for its ids.
+    /// The chosen experts `[k]` (U32) in rank order, clamped below the expert count ONCE: the
+    /// top-probability take and every gathered product of the layer read this same clamped
+    /// resident, so the layer builds one `Minimum` node for its ids.
     pub(super) ids: BoundedIndices,
     /// The gates `[k, 1, 1]` (F32): the chosen probabilities, renormalized over the selection when
     /// the family asks for it.
@@ -344,7 +342,7 @@ pub(super) fn route_device(
     let negated = ctx.kernels.unary(UnaryOp::Neg, &flat)?;
     let order = ctx.kernels.argsort(&negated, 0)?;
     let ids = ctx.kernels.slice(&order, &[0], &[k])?;
-    // One clamp below the expert count for the whole layer (packet GAP-TRIM-A): the take below
+    // One clamp below the expert count for the whole layer: the take below
     // and the three gathered products of `combine` share it.
     let bounded = ctx.kernels.bound_indices(&ids, experts)?;
     let top = ctx.kernels.take_bounded(&flat, &bounded, 0)?;
@@ -375,12 +373,11 @@ pub(super) fn step_device(
     x: &ExecutionTensor,
 ) -> Result<(ExecutionTensor, DeviceRoute), EngError> {
     let m = &shape.moe;
-    // The compiled decode closure (packet MX-COMPILE-1a): the `qwen36.compile` setting (or the
-    // test override of
+    // The compiled decode closure: the `qwen36.compile` setting (or the test override of
     // `QWEN36_G2A_COMPILE`) runs the DEVICE-routed step through ONE compiled closure instead of
     // the op sequence below, in the activation dtype of the step. The host-routed `step` below
-    // never compiles: it is the parity reference of decision 0046 A2. No fallback: a failure of
-    // the compiled path is a native failure of the adapter.
+    // never compiles: it is the parity reference. No fallback: a failure of the compiled path is
+    // a native failure of the adapter.
     if super::compiled::step_requested(ctx.compile) {
         return super::compiled::moe_step_device(ctx, shape, w, x);
     }

@@ -1,7 +1,7 @@
 //! The HTTP server: authentication, validation, routing, and reply writers.
 //!
 //! Design: the server design. Contract: `api/openapi.yaml`.
-//! Decision 0043 fixes the dependency set, the hand-written wire types, and the error wrapper.
+//! The server keeps a fixed dependency set, hand-written wire types, and one error wrapper.
 
 pub(crate) mod anthropic;
 mod auth;

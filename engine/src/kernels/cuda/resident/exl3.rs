@@ -247,6 +247,12 @@ impl CudaContext {
         ffi::launch_observer::capture(run)
     }
 
+    /// Which grouped variant a captured leg actually ran: none, all shuffle,
+    /// all gather, or mixed.
+    pub(crate) fn test_routed_grouped_variant() -> Option<&'static str> {
+        ffi::launch_observer::grouped_variant()
+    }
+
     pub(crate) fn test_exl3_routed_scope() -> impl Drop {
         ffi::launch_observer::routed_scope()
     }

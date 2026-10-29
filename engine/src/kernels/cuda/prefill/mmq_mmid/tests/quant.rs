@@ -1,11 +1,10 @@
-//! Seam tests of the typed scatter and gather quantize wrappers (CPF-V4 G3 part 2, the rev 3
-//! grant's MAJOR item). The scatter test compares the q8_1 buffer of
-//! `mmq_quantize_scatter_ids` byte for byte with G4's plain quantize of the token rows laid
-//! out at their compact columns (`ids_dst`, the builder's own map), and the gather test the
+//! Tests of the typed scatter and gather quantize wrappers. The scatter test compares the q8_1
+//! buffer of `mmq_quantize_scatter_ids` byte for byte with the plain quantize of the token rows
+//! laid out at their compact columns (`ids_dst`, the builder's own map), and the gather test the
 //! buffer of `mmq_quantize_gather_ids` with the plain quantize of the rows `ids_dst` names. A
-//! wrapper that took the wrong map from the `MmidIds` (the forward map for the inverse one, or
-//! the other way) lays the columns out differently and fails the comparison; both tests first
-//! assert that the two maps differ, so the comparison can tell them apart.
+//! wrapper that took the wrong map from the `MmidIds` (the forward map for the inverse one, or the
+//! other way) lays the columns out differently and fails the comparison; both tests first assert
+//! that the two maps differ, so the comparison can tell them apart.
 //!
 //! Each test runs two `Result`-only device phases (the typed call, then the plain one), asserts
 //! after both contexts are gone, and gates first: every output id in its domain and every scale
@@ -66,7 +65,7 @@ fn typed_phase(
     })
 }
 
-/// G4's plain quantize of `ncols` rows of `x`, the oracle of the typed wrappers.
+/// The plain quantize of `ncols` rows of `x`, the oracle of the typed wrappers.
 fn plain_phase(quant: QuantType, k: usize, x: &[f32]) -> Result<Vec<u8>, EngError> {
     let ctx = CudaContext::new()?;
     let stream = ctx.stream()?;

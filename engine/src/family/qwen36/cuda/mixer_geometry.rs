@@ -1,12 +1,12 @@
 //! Column layout of the fused projection rows, the scalar arguments of the mixer kernels and the
-//! shapes of the mixer weights (packet RD-9b2). Pure host arithmetic, derived from `StepDims`; no
-//! model number is written here.
+//! shapes of the mixer weights. Pure host arithmetic, derived from `StepDims`; no model number is
+//! written here.
 //!
 //! One row of `DeltaProj` is `[qkv | z | beta | alpha]` and one row of `AttnProj` is
 //! `[per q head (q | gate) | k | v]`: the projections are separate matmuls, each writing its own
 //! `rows` columns of the SAME row, which is only possible for ONE row (a matmul writes `y` as
-//! `[m][rows]`). Stage 1 therefore runs the mixers at one row (lane C, Q3); a verify window or
-//! chunked prefill needs a matmul with a row stride or one concatenated weight (stage 2 / CPF).
+//! `[m][rows]`). Stage 1 therefore runs the mixers at one row; a verify window or chunked prefill
+//! needs a matmul with a row stride or one concatenated weight.
 
 use super::dims::StepDims;
 use crate::family::project::cuda::WeightLayout;
@@ -34,7 +34,7 @@ pub(super) struct DeltaGeometry {
     pub(super) value_width: usize,
     /// Length of `ssm_norm`.
     pub(super) value_dim: usize,
-    /// Taps of the conv weights per channel (RD-7a's kernel is fixed at 4).
+    /// Taps of the conv weights per channel (the causal conv kernel is fixed at 4).
     pub(super) conv_kernel: usize,
 }
 
@@ -65,7 +65,7 @@ pub(super) struct MixerGeometry {
     pub(super) attn: AttnGeometry,
 }
 
-/// Taps of the RD-7a conv kernel (`gdn_conv.h`: weights `[channels][4]`).
+/// Taps of the causal conv kernel (`gdn_conv.h`: weights `[channels][4]`).
 const CONV_TAPS: usize = 4;
 
 /// A dense (tiled) mixer weight: its role, output rows and input length.
@@ -89,7 +89,7 @@ impl MixerGeometry {
         let (d, a) = (&shape.delta, &shape.attn);
         if d.conv_kernel != CONV_TAPS {
             return Err(EngError::Checkpoint(format!(
-                "mixer geometry: conv_kernel is {}, the RD-7a kernel takes {CONV_TAPS}",
+                "mixer geometry: conv_kernel is {}, the causal conv kernel takes {CONV_TAPS}",
                 d.conv_kernel
             )));
         }
@@ -155,8 +155,8 @@ impl MixerGeometry {
         layout: WeightLayout,
         kind: AttentionKind,
     ) -> Result<Vec<DenseSpec>, EngError> {
-        // Same decision as the loader: fusion exists for Native weights only, so the specs
-        // never describe a wide qkv another layout's weights cannot satisfy (review F4).
+        // Same decision as the loader: fusion exists for Native weights only, so the specs never
+        // describe a wide qkv another layout's weights cannot satisfy.
         let fused =
             crate::family::project::cuda::gdn_fuse_inproj() && layout == WeightLayout::Native;
         self.dense_specs_with(fused, kind)
@@ -231,9 +231,9 @@ fn no_mixer(kind: AttentionKind) -> EngError {
     ))
 }
 
-/// Refuses a NATIVE dense weight that is not the launch's shape (MATVEC-PAR S3b): the shape rule
-/// of [`check_dense`] plus the MMVQ row-group rule of `matvec_q` (`ROWS_MULTIPLE`), `rows % 4 == 0`
-/// — the native loader accepts any row count, so the refusal belongs to the step's construction.
+/// Refuses a NATIVE dense weight that is not the launch's shape: the shape rule of [`check_dense`]
+/// plus the MMVQ row-group rule of `matvec_q` (`ROWS_MULTIPLE`), `rows % 4 == 0` — the native
+/// loader accepts any row count, so the refusal belongs to the step's construction.
 pub(super) fn check_native_dense(
     name: &str,
     have: (usize, usize),

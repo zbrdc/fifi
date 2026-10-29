@@ -1,5 +1,4 @@
-//! The engine factory for `family: "qwen3_8_flash_next"` entries of the `enginesrv` config
-//! (decision 0026; packet H8c).
+//! The engine factory for `family: "qwen3_8_flash_next"` entries of the `enginesrv` config.
 //!
 //! The server start-up code (`server/run.rs`) calls it for the entries of this family. Order of
 //! checks: the settings (`settings.rs`), then the backend. A build without `native-mlx` on Apple

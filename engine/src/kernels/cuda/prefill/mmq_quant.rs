@@ -1,25 +1,24 @@
-//! Safe wrappers of the MMQ q8_1 quantize entries (CPF-V4 G4, decision 0049 item 11): the
-//! plain and gathered `CudaContext::mmq_quantize` and `CudaContext::mmq_quantize_scatter`
-//! of `native/prefill/mmq_quant.cu`, which dispatch the explicit [`MmqPacking`] policy.
-//! Every MMQ GEMM input is requantized from f32. The weight type selects the D4/DS4 layout
-//! and the policy-specific quantizer. Q8_0/Q6_K/Q5_0/NVFP4 use D4, while Q4_K uses DS4
+//! Safe wrappers of the MMQ q8_1 quantize entries: the plain and gathered
+//! `CudaContext::mmq_quantize` and `CudaContext::mmq_quantize_scatter` of
+//! `native/prefill/mmq_quant.cu`, which dispatch the explicit [`MmqPacking`] policy. Every MMQ
+//! GEMM input is requantized from f32. The weight type selects the D4/DS4 layout and the
+//! policy-specific quantizer. Q8_0/Q6_K/Q5_0/NVFP4 use D4, while Q4_K uses DS4
 //! (mmq.cuh:61-101).
 //!
-//! The wrappers refuse every bad argument as a `BadRequest` before any native call (the
-//! house pattern; the C entry mirrors the rules so it can never latch the backend), with
-//! the error tags `mmq_quant: <rule>`. The q8_1 range is sized by [`mmq_size::q8_1_bytes`]
-//! — the one constant pad of rev 3 (MSG-85 B1) is part of the capacity: a range one byte
-//! short is refused, and the quantize never writes the pad (the GEMM's y-tile copies may
-//! read it; the determinism test pins that).
+//! The wrappers refuse every bad argument as a `BadRequest` before any native call (the house
+//! pattern; the C entry mirrors the rules so it can never latch the backend), with the error
+//! tags `mmq_quant: <rule>`. The q8_1 range is sized by [`mmq_size::q8_1_bytes`] — the one
+//! constant pad is part of the capacity: a range one byte short is refused, and the quantize
+//! never writes the pad (the GEMM's y-tile copies may read it; the determinism test pins that).
 //!
-//! Visibility (the rev-3 addendum): these raw-range wrappers are `pub(in
-//! crate::kernels::cuda::prefill)` — only the prefill tree may call them, and the scatter
-//! and gather maps reach the entries from outside this module only through G3's later typed
-//! `MmidIds` wrappers. The map VALUES are trusted device indices (plan section C.2 N1: the
-//! guarded ids builder makes them permutations); this seam checks their capacity only. The
-//! gathered call's source spans `ncols` rows (correction C1: the stage-15 `act` layout, one
-//! row per compact column); a smaller source is refused by the fit rule, and a `src_rows`
-//! field would be the extension if a caller ever needs a wider source.
+//! Visibility: these raw-range wrappers are `pub(in crate::kernels::cuda::prefill)` — only
+//! the prefill tree may call them, and the scatter and gather maps reach the entries from
+//! outside this module only through the typed `MmidIds` wrappers of `mmq_mmid`. The map
+//! VALUES are trusted device indices (the guarded ids builder makes them permutations); this
+//! wrapper checks their capacity only. The gathered call's source spans `ncols` rows (the
+//! SwiGLU `act` layout, one row per compact column); a smaller source is refused by the fit
+//! rule, and a `src_rows` field would be the extension if a caller ever needs a wider
+//! source.
 #![cfg_attr(
     not(test),
     expect(
@@ -40,13 +39,12 @@ use crate::kernels::cuda::native::prefill::mmq_quant::{
 };
 use crate::kernels::cuda::prefill::mmq_size::{MmqType, NCOLS_LIMIT, q8_1_bytes};
 
-/// The k grid of the MMQ GEMM (plan section B.3, MSG-85 M2): the k loop reads 256-value
-/// strides (`MMQ_ITER_K`) with no k clamp, so a buffer the GEMM cannot read safely is never
-/// built. Checked before every other k rule, so K = 384 (a multiple of 128 and of every
-/// flat qk) reaches this tag for every type.
+/// The k grid of the MMQ GEMM: the k loop reads 256-value strides (`MMQ_ITER_K`) with no k
+/// clamp, so a buffer the GEMM cannot read safely is never built. Checked before every other k
+/// rule, so K = 384 (a multiple of 128 and of every flat qk) reaches this tag for every type.
 ///
-/// The one definition of the K rules of the MMQ glue (CPF-V4 G3 rebase): the mmid wrapper
-/// imports this and `K_MAX` instead of keeping a copy.
+/// The one definition of the K rules of the MMQ glue: the mmid wrapper imports this and `K_MAX`
+/// instead of keeping a copy.
 pub(crate) const K_GRID: usize = 256;
 /// The k extent bound (the tree's `MAX_DIM`).
 pub(crate) const K_MAX: usize = 32_768;
@@ -55,7 +53,7 @@ const ROW_STRIDE_MAX: usize = 1 << 30;
 /// The gathered/scattered column bound: `ne_get_rows = M * top_k` at top_k 8 and the 2,048
 /// chunk cap.
 const ROWS_LIMIT: usize = 16_384;
-/// The top_k bound (the ids guard's own rule, plan section C.2 N1).
+/// The top_k bound (the ids guard's own rule).
 const TOP_K_LIMIT: usize = 32;
 
 /// A `BadRequest` that names the rule that fired (the `mmq_quant` tag).
@@ -196,7 +194,7 @@ fn check_scatter_rules(
 }
 
 /// Bytes of a quantize call's ranges: the source holds `(ncols - 1) * row_stride + k`
-/// floats (the C1 form: `ncols = M * top_k` at the gathered down call), the output
+/// floats (`ncols = M * top_k` at the gathered down call), the output
 /// `q8_1_bytes(k, ncols)` with the constant pad.
 fn quantize_needs(k: usize, row_stride: usize, ncols: usize) -> Result<(usize, usize), EngError> {
     let x = (ncols - 1)
@@ -245,7 +243,7 @@ pub(crate) enum MmqPacking {
 }
 
 /// One (optionally gathered) quantize call: `ncols` output columns over `ncols` source
-/// rows; `gather` some reads row `gather[j]` into column j (the C1 down input).
+/// rows; `gather` some reads row `gather[j]` into column j (the gathered down input).
 pub(crate) struct MmqQuantizeCall<'b> {
     pub(crate) packing: MmqPacking,
     pub(crate) ty: MmqType,

@@ -1,5 +1,5 @@
-//! Unit tests of the pure part of the export (test seam U13): `check_import` and the little-endian
-//! helpers. CPU only. The device copies are covered by the scratch device run of the packet.
+//! Unit tests of the pure part of the export: `check_import` and the little-endian helpers. CPU
+//! only. The device copies are covered by a scratch device run.
 use super::super::host::HostShape;
 use super::{
     dims::{KvMode, StepDims, StepOptions},
@@ -193,8 +193,8 @@ fn one_position_past_the_capacity_is_a_context_limit() {
 #[test]
 fn the_import_flag_lets_a_poisoned_state_in() {
     use super::{book::StateBook, state::export::IMPORT_REWRITES_WORDS};
-    // `import_state` does all of reset's work, so the book must take it from a `Poisoned` state
-    // (REPLY-76 Q1); the flag is what `import_state` passes, so flipping it fails here.
+    // `import_state` does all of reset's work, so the book must take it from a `Poisoned` state;
+    // the flag is what `import_state` passes, so flipping it fails here.
     let mut book = StateBook::new(8, 7);
     book.poison();
     book.begin_import(7, IMPORT_REWRITES_WORDS)

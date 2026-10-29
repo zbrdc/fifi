@@ -1,6 +1,6 @@
-/* RD-8k: the KV8 append entry (8-bit KV of decision 0047 item 6, the frozen format below).
- * Launch-only, like the entries of abi_resident.h. Include after abi.h in C++; Rust mirrors the
- * structs in native/resident/kv8_append.rs (child module of native/resident.rs).
+/* The KV8 append entry (8-bit KV in the frozen format below). Launch-only, like the entries of
+ * abi_resident.h. Include after abi.h in C++; Rust mirrors the structs in
+ * native/resident/kv8_append.rs (child module of native/resident.rs).
  *
  * Format (frozen; do not change): K and V are symmetric int8 with one fp16 scale per 32 values,
  * d = RNE_f32(amax / 127), h = RNE_f16(d). Codes are integerRNE(RNE_f32(x / denominator)),
@@ -12,14 +12,14 @@
  *
  * Two entries. The decode append takes m rows (1..16) of k and v, f32 [m][n_kv_head][head_dim]
  * each (k after the norm and the rope), and writes row *pos + t of both planes, reading the
- * device i32 word pos (StepParams.pos, offset 4). Poison rule (as attn_prep, RD-8a): the kernel
+ * device i32 word pos (StepParams.pos, offset 4). Poison rule (as attn_prep): the kernel
  * tests the word against the cells before any other memory access; if *pos < 0 or
  * *pos + m > cells (64-bit sum) no code and no scale is written and mask 4
  * (INFERENCE_CUDA_STATUS_INVALID_STEP_STATE of resident/step_params.h) is OR-ed into *status by
  * one thread. The chunk append takes t rows of prefill at the HOST base position pos0
  * (0 <= pos0, pos0 + t <= cells), checked here before any launch.
  *
- * All geometry is run-time (C20): n_kv_head 1..64, head_dim a multiple of 32 in 32..1024
+ * All geometry is run-time: n_kv_head 1..64, head_dim a multiple of 32 in 32..1024
  * (one warp quantizes one group of 32), cells 1..2^30 - 1. Both entries enqueue one kernel on
  * stream (NULL: the default stream; the Rust wrapper always passes one) and return
  * INFERENCE_CUDA_INVALID_ARGUMENT before any launch for a bad argument.

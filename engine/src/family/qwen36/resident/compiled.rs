@@ -1,29 +1,29 @@
-//! The compiled decode blocks of the resident Q36 decoder (packet MX-COMPILE-1a).
+//! The compiled decode blocks of the resident Q36 decoder.
 //!
 //! The engine setting `qwen36.compile` (default false) turns the seam on: `delta::step` and the
-//! device-routed `moe::step_device` run through the compiled closures of the kernels seam, and
-//! the decoder admits the whole model at load — one warm-up trace per distinct program, so a
-//! trace failure or a model the seam cannot compile is a typed load error, never a failure in
-//! the middle of a request. B2/4/8 require explicit decoder preparation after that B1 warm-up;
-//! default loading does not trace those row counts. The environment variable `QWEN36_G2A_COMPILE` stays as a
+//! device-routed `moe::step_device` run through the compiled closures of the kernels seam, and the
+//! decoder admits the whole model at load — one warm-up trace per distinct program, so a trace
+//! failure or a model the seam cannot compile is a typed load error, never a failure in the middle
+//! of a request. B2/4/8 require explicit decoder preparation after that B1 warm-up; default loading
+//! does not trace those row counts. The environment variable `QWEN36_G2A_COMPILE` stays as a
 //! TEST-only override (it is read by `step_requested` in test builds alone and never reaches a
-//! production build): a test decoder built with the setting off still compiles when the variable
-//! is `1`, which is how the measurement harness keeps running. The HOST-ROUTED `moe::step`
-//! never compiles the MoE block: it is the parity reference of decision 0046 A2 — the DeltaNet
-//! block compiles on a host-routed decoder too, because its step ignores the routing — and
-//! the chunked prefill never compiles (its chunk shapes vary).
+//! production build): a test decoder built with the setting off still compiles when the variable is
+//! `1`, which is how the measurement harness keeps running. The HOST-ROUTED `moe::step` never
+//! compiles the MoE block: it is the parity reference — the DeltaNet block compiles on a
+//! host-routed decoder too, because its step ignores the routing — and the chunked prefill never
+//! compiles (its chunk shapes vary).
 //!
 //! The compiled closures replay the two block op sequences in
 //! `engine/src/kernels/mlx/native/guard.cpp`, calling the same native shims in the same order as
 //! the uncompiled blocks of THIS branch, so the measurement compares like with like in BOTH
 //! activation dtypes: the `bb` cast to F32 before the sigmoid, the F32 recurrence state and ring,
 //! the `to_act` before the output projection, the BF16 (or F32) scales of the packed weights, the
-//! F32 router, the F32 gates, and the ONE `mlx_minimum` clamp of the expert ids per layer that
-//! GAP-TRIM-A introduced. The cache key mixes every baked constant, the activation dtype, and
-//! the scale dtype of each packed weight (`kernels::compile_key`), so the F32 and BF16 decoders
-//! keep distinct traces. The block outputs are row-contiguous MLX arrays (every block ends in a
-//! quantized matmul, a reshape view of one, or a fresh elementwise node), so later uncompiled
-//! code reads them directly and none goes through the readback net.
+//! F32 router, the F32 gates, and the ONE `mlx_minimum` clamp of the expert ids per layer. The
+//! cache key mixes every baked constant, the activation dtype, and the scale dtype of each packed
+//! weight (`kernels::compile_key`), so the F32 and BF16 decoders keep distinct traces. The block
+//! outputs are row-contiguous MLX arrays (every block ends in a quantized matmul, a reshape view of
+//! one, or a fresh elementwise node), so later uncompiled code reads them directly and none goes
+//! through the readback net.
 //!
 //! What the seam does NOT compile, and why. The attention layers, the head, the embedding, and
 //! the whole prefill stay uncompiled: the attention layers bake the RoPE position as a scalar of
@@ -273,8 +273,8 @@ pub(super) fn moe_step_device(
         got.out,
         DeviceRoute {
             // The closure body clamps the ids below the expert count with its ONE `mlx_minimum`
-            // node (packet GAP-TRIM-A), so the route wraps them as already clamped instead of
-            // building a second clamp node.
+            // node, so the route wraps them as already clamped instead of building a second clamp
+            // node.
             ids: crate::kernels::BoundedIndices::from_clamped(got.ids, experts),
             gates: got.gates,
             health: got.health,

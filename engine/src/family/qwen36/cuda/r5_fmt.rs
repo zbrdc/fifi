@@ -1,11 +1,10 @@
-//! S3c format-token probe (MATVEC-PAR S3c; lane C's ruling: committed as an ignored test). The
-//! probability of "\n" right after the tool-call opener on the 922-token pi prompt, whole model,
-//! eager, in the layout `FMT_LAYOUT` names (`native` or `tiled`, the latter by default). `FMT_IDS`
-//! is a one-line space-separated id file (the prompt ids, then `</think>`, `\n\n`,
-//! `<tool_call>`); `FMT_NL` is the id of "\n" (198); `FMT_OUT` a JSON path. The probe reports
-//! the softmax over the sampler vocabulary at the last 4 rows and gates nothing. It needs the
-//! 3090, `INFERENCE_CUDA_MODEL_GGUF` and the three `FMT_*` variables, so it is `#[ignore]`d and
-//! run by name in one baton hold:
+//! Format-token probe, committed as an ignored test. The probability of "\n" right after the
+//! tool-call opener on the 922-token pi prompt, whole model, eager, in the layout `FMT_LAYOUT`
+//! names (`native` or `tiled`, the latter by default). `FMT_IDS` is a one-line space-separated id
+//! file (the prompt ids, then `</think>`, `\n\n`, `<tool_call>`); `FMT_NL` is the id of "\n" (198);
+//! `FMT_OUT` a JSON path. The probe reports the softmax over the sampler vocabulary at the last 4
+//! rows and gates nothing. It needs the 3090, `INFERENCE_CUDA_MODEL_GGUF` and the three `FMT_*`
+//! variables, so it is `#[ignore]`d and run by name while it holds the 3090 exclusively:
 //! `<exe> --ignored --exact family::qwen36::cuda::r5_fmt::r5_format_token --test-threads=1`.
 //! The optional `FMT_TIERED` is a JSON object in the shape of the gate's `tiered` member
 //! (`{"slots": 40, "threads": 6, "preload": true}`) and runs the tiered expert mode: the layout

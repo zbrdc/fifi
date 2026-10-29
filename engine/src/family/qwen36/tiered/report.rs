@@ -1,10 +1,10 @@
-//! The per-token counters of the tiered decode (OFF-2 C1).
+//! The per-token counters of the tiered decode.
 //!
 //! One [`TokenReport`] aggregates what a decode token cost in the tier split: which
 //! routed experts their layer bank served, which the CPU served, how many serves fell
 //! through the page cache to the SSD, and the swaps the token boundary decided. The
-//! report is plain data for the caller's accounting; the tiered host fills it (OFF-2 D4) and the
-//! gate prints it (OFF-2 D5c).
+//! report is plain data for the caller's accounting; the tiered host fills it and the
+//! gate prints it.
 
 /// Counters of one decode token in the tier split.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]

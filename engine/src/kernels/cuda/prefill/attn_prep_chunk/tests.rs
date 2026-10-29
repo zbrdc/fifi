@@ -1,12 +1,11 @@
-//! Seam-1 tests of the chunk attention preparation wrapper (CPF-ATTN-A section 5; decision
-//! 0049 item 15). Device tests 4, 5 and 16 pin the math: bit equality against the vendored
-//! `attn_prep` at one row, row equality across `m`, and the fp16 rounding at the E2 boundary
-//! values. The refusal tables cover every wrapper guard, one row per rule, each asserted by
-//! the text of its own error, with every earlier check satisfied.
+//! Tests of the chunk attention preparation wrapper. Device tests 4, 5 and 16 pin the math: bit
+//! equality against the vendored `attn_prep` at one row, row equality across `m`, and the fp16
+//! rounding at the E2 boundary values. The refusal tables cover every wrapper guard, one row
+//! per rule, each asserted by the text of its own error, with every earlier check satisfied.
 //!
-//! Device-test structure (the S3b lesson): every test runs its device phase as `Result`-only
-//! (no `assert`/`expect`/`unwrap` while a device owner is alive), drops every owner, then
-//! asserts on host `Vec`s. The tests run with `--test-threads=1`.
+//! Device-test structure: every test runs its device phase as `Result`-only (no
+//! `assert`/`expect`/`unwrap` while a device owner is alive), drops every owner, then asserts
+//! on host `Vec`s. The tests run with `--test-threads=1`.
 //!
 //! Argued, not tested: (1) the mode/NULL consistency guard of the C entry — the Rust
 //! [`PrepChunkMode`] enum makes an inconsistent call unconstructible, so only C can reach it.
@@ -422,8 +421,8 @@ fn attn_prep_chunk_refuses_a_head_dim_other_than_256() {
     if !testkit::device_present("attn_prep_chunk_refuses_a_head_dim_other_than_256") {
         return;
     }
-    // Lane C condition 8: head_dim is a run-time argument; 256 is the compiled case and every
-    // other value is a typed refusal before any launch (never an assertion inside the kernel).
+    // head_dim is a run-time argument; 256 is the compiled case and every other value is a
+    // typed refusal before any launch (never an assertion inside the kernel).
     let rows: Vec<Row> = [128, 0, 512]
         .iter()
         .map(|&v| {
@@ -507,8 +506,7 @@ fn attn_prep_chunk_refuses_rows_and_p0_out_of_bounds() {
             move |fx| fx.shape.rows = v,
         ));
     }
-    // p0 negative, p0 + m above rows, p0 + m above i32-range rows: the 64-bit bound rule of
-    // decision 0049 item 2.
+    // p0 negative, p0 + m above rows, p0 + m above i32-range rows: the 64-bit bound rule.
     for (label, v) in [
         ("p0 -1", -1),
         ("p0 i64 min", i64::MIN),
@@ -905,10 +903,10 @@ fn attn_prep_chunk_rows_are_bit_equal_across_m() {
 
 // ---- device test 16: the fp16 rounding at the E2 boundary values --------------------------
 
-/// The E2 edge list (mirroring IMPL-KV8-A's): signed zeros, the subnormal edge and its
-/// halfway points, the normal edge 65504 with the overflow midpoint 65520, and the two exact
-/// ties at 1.0. Each value rides a v-head column of `proj` unchanged (a pure passthrough), so
-/// the written fp16 bits pin the kernel's round-to-nearest-even exactly.
+/// The E2 edge list: signed zeros, the subnormal edge and its halfway points, the normal edge
+/// 65504 with the overflow midpoint 65520, and the two exact ties at 1.0. Each value rides a
+/// v-head column of `proj` unchanged (a pure passthrough), so the written fp16 bits pin the
+/// kernel's round-to-nearest-even exactly.
 #[rustfmt::skip]
 fn edges() -> Vec<f32> {
     vec![
@@ -1009,7 +1007,7 @@ fn attn_prep_chunk_fp16_rows_pin_the_rounding() {
     }
 }
 
-// ---- the fault-qualification guard test (packet section 2 K1, decision 0049 item 2) -------
+// ---- the fault-qualification guard test ---------------------------------------------------
 
 #[cfg(feature = "cuda-fault-qualification")]
 #[test]

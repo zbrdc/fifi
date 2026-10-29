@@ -1,4 +1,4 @@
-//! Safe launch wrapper of the split-KV decode attention kernel (RD-8b, decision 0047, seam 1).
+//! Safe launch wrapper of the split-KV decode attention kernel.
 //!
 //! Split-KV decode attention with a fixed-order combine.
 //!
@@ -19,13 +19,13 @@
 //! - The cache rows `0..kv_len + m - 1` (or the ring cells) hold the appended K and V before the
 //!   call is queued, ordered on the same stream or by an event.
 //! - `part` is scratch that is dead after the call. Any use of its bytes on another stream (the
-//!   arena may share them, RD-9a) must be ordered by an event; the overlap check of this call
-//!   covers this call only.
+//!   arena may share them) must be ordered by an event; the overlap check of this call covers this
+//!   call only.
 //!
 //! A `kv_len` outside `1..=cache_rows - (m - 1)` (a linear cache; any value in `1..2^30` for a
 //! ring) makes `out` NaN. The host cannot check a device word, so the non-finite logit check ends
-//! the job instead: a non-finite `out` reaches the logits and is status bit 2 (Backend `sample`,
-//! REPLY-45), and an invalid `pos`/`kv_len` pair is bit 4 (Backend `step_params`, REPLY-47).
+//! the job instead: a non-finite `out` reaches the logits and is status bit 2 (Backend `sample`),
+//! and an invalid `pos`/`kv_len` pair is bit 4 (Backend `step_params`).
 //!
 //! Every other argument is checked here, before any native call, and refused as `BadRequest`:
 //! the rules below mirror `valid()` of `attn_decode.cu`, so the native entry cannot return
@@ -95,16 +95,16 @@ pub(crate) struct AttnSplit {
 }
 
 impl AttnSplit {
-    /// The stage 1 plan.
+    /// The fp16 plan.
     pub(crate) const STAGE1: Self = Self {
         max_splits: 64,
         min_keys: 32,
     };
 
-    /// The KV8 plan of the Int8G32 step (KV8-B B2): `attn_decode_q8` reads contiguous 64-cell
-    /// tiles, so its `min_keys` is a multiple of 64 and the fp16 `STAGE1` (32) is refused. The
-    /// `max_splits` is STAGE1's own 64, so the part scratch byte count is the same number; the
-    /// CONSTANT is what differs and what the plan must size with.
+    /// The KV8 plan of the Int8G32 step: `attn_decode_q8` reads contiguous 64-cell tiles, so its
+    /// `min_keys` is a multiple of 64 and the fp16 `STAGE1` (32) is refused. The `max_splits` is
+    /// STAGE1's own 64, so the part scratch byte count is the same number; the CONSTANT is what
+    /// differs and what the plan must size with.
     pub(crate) const Q8: Self = Self {
         max_splits: 64,
         min_keys: 64,

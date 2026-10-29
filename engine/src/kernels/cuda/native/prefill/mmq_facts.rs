@@ -1,5 +1,5 @@
 //! Raw FFI to the device-facts entry of `native/prefill/mmq_facts.cu` (declared in
-//! `native/prefill/mmq_facts.h`, CPF-V4 V4-0): the facts every MMQ glue launch needs (the
+//! `native/prefill/mmq_facts.h`): the facts every MMQ glue launch needs (the
 //! built architecture, the SM count, the opt-in shared memory per block). Child module of
 //! `native/prefill.rs`; the safety invariants are the parent's list — this entry is not a
 //! launch: it takes no stream, enqueues nothing and reads only the CUDA device attributes.

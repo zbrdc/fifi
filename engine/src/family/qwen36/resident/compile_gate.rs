@@ -1,9 +1,7 @@
-//! The Mac gate tests of the compiled decode blocks (packet MX-COMPILE-1a items 5 to 7, fix
-//! round 1): the warm-up, the compile scope, the program limit, the teardown clear, the
-//! tiny-model numerics of BOTH blocks, the seam wiring, and the operand refusals run with the
-//! plain suite; the real-checkpoint numerics, determinism, trace-count, snapshot-interop, and
-//! memory tests are `#[ignore]`d like their siblings. A Q36 result never satisfies Phase 0B
-//! or 1B.
+//! The Mac gate tests of the compiled decode blocks: the warm-up, the compile scope, the program
+//! limit, the teardown clear, the tiny-model numerics of BOTH blocks, the seam wiring, and the
+//! operand refusals run with the plain suite; the real-checkpoint numerics, determinism,
+//! trace-count, snapshot-interop, and memory tests are `#[ignore]`d like their siblings.
 //!
 //! Every test that introduces compiled programs zeroes the compile counters first (under the
 //! native test lock, which serializes the native tests of one process), which also zeroes the
@@ -30,18 +28,19 @@
 //! (a native failure is sticky for the whole process); the plain suite runs them through the
 //! feature set of the Mac mirror.
 //!
-//! Mutation mapping (the patches of the fix round live in the task scratch): the warm-up patch
-//! is killed by `the_warm_up_traces_both_blocks_once_before_the_first_token`;
-//! the settings-ignored patch by `the_chunked_prefill_never_compiles_and_a_one_token_step_does`;
-//! the executor-ignores-rules patch by `rules_with_compile_true_warm_the_decoder_at_open`;
-//! the start-passes-false patch by the `start` rules test; the limit patch by
+//! Mutation mapping: the warm-up patch is killed by
+//! `the_warm_up_traces_both_blocks_once_before_the_first_token`; the settings-ignored patch by
+//! `the_chunked_prefill_never_compiles_and_a_one_token_step_does`; the executor-ignores-rules patch
+//! by `rules_with_compile_true_warm_the_decoder_at_open`; the start-passes-false patch by the
+//! `start` rules test; the limit patch by
 //! `the_fifth_distinct_compiled_program_is_refused_before_any_native_call` and the Linux registry
-//! test; the teardown-clear patch by `dropping_the_adapter_clears_the_compile_cache`; the eps
-//! patch and the seam `eps_bits: 0` patch by `compiled_and_uncompiled_deltanet_blocks_agree_in_f32_tiny`
+//! test; the teardown-clear patch by `dropping_the_adapter_clears_the_compile_cache`; the eps patch
+//! and the seam `eps_bits: 0` patch by `compiled_and_uncompiled_deltanet_blocks_agree_in_f32_tiny`
 //! and `two_eps_values_and_two_activation_dtypes_trace_distinct_programs`; the clamp patch
-//! (`experts - 2`) by the expert-`E-1` case of `compiled_and_uncompiled_moe_blocks_agree_in_f32_tiny`;
-//! the biasless-check patch and the plan-limit patch by the Linux `compile_plan` tests; the
-//! F32-operand patch by `the_compiled_delta_block_refuses_non_f32_operands`.
+//! (`experts - 2`) by the expert-`E-1` case of
+//! `compiled_and_uncompiled_moe_blocks_agree_in_f32_tiny`; the biasless-check patch and the
+//! plan-limit patch by the Linux `compile_plan` tests; the F32-operand patch by
+//! `the_compiled_delta_block_refuses_non_f32_operands`.
 
 use super::compile_logits::compare_logit_rows;
 use super::compiled;
@@ -671,10 +670,10 @@ fn the_warm_up_traces_both_blocks_once_before_the_first_token() {
     reset_compile_state();
 }
 
-/// The compile scope of packet MX-COMPILE-1a item 5: a chunked prefill NEVER compiles (the chunk
-/// shapes vary), and the one-token decode step DOES when the setting is on. Mutation check (the
-/// settings-ignored patch): with the flag ignored, the single-token step leaves the counters
-/// where the chunk left them and the last two asserts fail.
+/// The compile scope: a chunked prefill NEVER compiles (the chunk shapes vary), and the one-token
+/// decode step DOES when the setting is on. Mutation check (the settings-ignored patch): with the
+/// flag ignored, the single-token step leaves the counters where the chunk left them and the last
+/// two asserts fail.
 #[test]
 fn the_chunked_prefill_never_compiles_and_a_one_token_step_does() {
     let _serial = crate::native_test_lock();
@@ -723,15 +722,14 @@ fn the_chunked_prefill_never_compiles_and_a_one_token_step_does() {
     reset_compile_state();
 }
 
-/// The adapter teardown clears the calling thread's MLX compile cache (packet MX-COMPILE-1a
-/// item 4) and the test sees the MLX SIDE of it, not only the Rust counter: after the drop, a
-/// second adapter on the same thread runs the same program key, and if the clear had not
-/// emptied the thread-local cache the call would be a cache HIT — no closure-body entry. The
-/// retrace (the native trace count rising again) proves the cache was emptied. Mutation check
-/// (the cache-clear-removed patch): the Rust clear count stays at zero and the second adapter's
-/// first call is a hit, so both asserts fail. The ORDER of the clear against the stream release
-/// is not observable by any test: no query exposes it, and the teardown order is documented in
-/// `kernels/mlx/native.rs` (`Context::drop`).
+/// The adapter teardown clears the calling thread's MLX compile cache and the test sees the MLX
+/// SIDE of it, not only the Rust counter: after the drop, a second adapter on the same thread runs
+/// the same program key, and if the clear had not emptied the thread-local cache the call would be
+/// a cache HIT — no closure-body entry. The retrace (the native trace count rising again) proves
+/// the cache was emptied. Mutation check (the cache-clear-removed patch): the Rust clear count
+/// stays at zero and the second adapter's first call is a hit, so both asserts fail. The ORDER of
+/// the clear against the stream release is not observable by any test: no query exposes it, and the
+/// teardown order is documented in `kernels/mlx/native.rs` (`Context::drop`).
 #[test]
 fn dropping_the_adapter_clears_the_compile_cache() {
     let _serial = crate::native_test_lock();
@@ -782,12 +780,12 @@ fn dropping_the_adapter_clears_the_compile_cache() {
     reset_compile_state();
 }
 
-/// The program limit of one adapter context (packet MX-COMPILE-1a item 3, fix round 1): four
-/// seam calls with four distinct epsilon constants register four programs of THIS adapter, and
-/// a call whose key is a FIFTH distinct one is refused with `BadRequest` BEFORE any native
-/// call, so the counters do not move. The portable registry logic carries its own Linux test;
-/// this one runs the refusal through the real seam. Mutation check (the registry-limit patch):
-/// with the limit raised to 5, the fifth call succeeds and the `unwrap_err` fails.
+/// The program limit of one adapter context: four seam calls with four distinct epsilon constants
+/// register four programs of THIS adapter, and a call whose key is a FIFTH distinct one is refused
+/// with `BadRequest` BEFORE any native call, so the counters do not move. The portable registry
+/// logic carries its own Linux test; this one runs the refusal through the real seam. Mutation
+/// check (the registry-limit patch): with the limit raised to 5, the fifth call succeeds and the
+/// `unwrap_err` fails.
 #[test]
 fn the_fifth_distinct_compiled_program_is_refused_before_any_native_call() {
     let _serial = crate::native_test_lock();
@@ -843,7 +841,7 @@ fn the_fifth_distinct_compiled_program_is_refused_before_any_native_call() {
     reset_compile_state();
 }
 
-/// Gate (a) of the fix round on the TINY model, DeltaNet half, plain suite: the compiled and
+/// Compiled-block numerics on the TINY model, DeltaNet half, plain suite: the compiled and
 /// the uncompiled DeltaNet block on the same random inputs agree to at most 5e-5 in every
 /// output, with equal shapes and dtypes. Mutation check (the eps-baked-wrong patch: the delta
 /// closure reads sqrt_kd where qk_eps belongs, or the seam bakes `eps_bits: 0`): the RMS norm
@@ -995,11 +993,10 @@ fn compiled_and_uncompiled_moe_blocks_agree_in_f32_tiny() {
     reset_compile_state();
 }
 
-/// The rules of the executor carry the setting (packet item 6b): `Q36Rules { compile: true }`
-/// through the `from_parts` path of `Q36Executor::open` admits the model and warms exactly one
-/// program per block kind before the first token, and `compile: false` warms nothing. Mutation
-/// check (the executor-ignores-rules patch): the `true` row warms nothing and the trace asserts
-/// fail.
+/// The rules of the executor carry the setting: `Q36Rules { compile: true }` through the
+/// `from_parts` path of `Q36Executor::open` admits the model and warms exactly one program per
+/// block kind before the first token, and `compile: false` warms nothing. Mutation check (the
+/// executor-ignores-rules patch): the `true` row warms nothing and the trace asserts fail.
 #[test]
 fn rules_with_compile_true_warm_the_decoder_at_open() {
     let _serial = crate::native_test_lock();
@@ -1387,12 +1384,12 @@ fn compiled_moe_refuses_unsupported_batches_before_admission_tiny() {
     reset_compile_state();
 }
 
-/// The seam wiring of the cache key (packet item 6c): two epsilon values and the two activation
-/// dtypes give FOUR distinct programs — distinct `fun_id`s in the counters and four native
-/// closure-body entries (each new key misses the MLX cache and traces). Mutation checks: with
-/// `eps_bits` hard-coded to 0 the two epsilons share one id and the second call is a cache hit,
-/// so both the id count and the native trace count stay at two per dtype; with the activation
-/// dtype dropped from the key the F32 and BF16 rows share ids the same way.
+/// The seam wiring of the cache key: two epsilon values and the two activation dtypes give FOUR
+/// distinct programs — distinct `fun_id`s in the counters and four native closure-body entries
+/// (each new key misses the MLX cache and traces). Mutation checks: with `eps_bits` hard-coded to 0
+/// the two epsilons share one id and the second call is a cache hit, so both the id count and the
+/// native trace count stay at two per dtype; with the activation dtype dropped from the key the F32
+/// and BF16 rows share ids the same way.
 #[test]
 fn two_eps_values_and_two_activation_dtypes_trace_distinct_programs() {
     let _serial = crate::native_test_lock();
@@ -1463,12 +1460,12 @@ fn two_eps_values_and_two_activation_dtypes_trace_distinct_programs() {
     reset_compile_state();
 }
 
-/// The operand refusals of the fix round, through the real seam, all `BadRequest` BEFORE any
-/// native call (the stored call counter stays empty): an activation dtype the adapter does not
-/// take, a layer input that does not carry the activation dtype, and a BF16 recurrent state on
-/// an adapter that allows BF16 — the seam still requires F32 there, like the uncompiled
-/// `gated_delta`. Mutation check (the F32-operand-check patch): the BF16-state row runs without
-/// the refusal, the call counter moves, and the last assert fails.
+/// The operand refusals, through the real seam, all `BadRequest` BEFORE any native call (the
+/// stored call counter stays empty): an activation dtype the adapter does not take, a layer
+/// input that does not carry the activation dtype, and a BF16 recurrent state on an adapter
+/// that allows BF16 — the seam still requires F32 there, like the uncompiled `gated_delta`.
+/// Mutation check (the F32-operand-check patch): the BF16-state row runs without the refusal,
+/// the call counter moves, and the last assert fails.
 #[test]
 fn the_compiled_delta_block_refuses_wrong_operands_before_any_native_call() {
     let _serial = crate::native_test_lock();
@@ -1560,11 +1557,10 @@ fn the_compiled_delta_block_refuses_wrong_operands_before_any_native_call() {
     reset_compile_state();
 }
 
-/// The weight-shape refusals of the fix round, through the real seam, `BadRequest` before
-/// admission: a delta projection whose logical shape disagrees with the block dimensions, and
-/// an expert stack that does not hold the baked expert count. Mutation check: with the
-/// logical-shape checks removed the calls run and the call counter moves, so the last assert
-/// fails.
+/// The weight-shape refusals, through the real seam, `BadRequest` before admission: a delta
+/// projection whose logical shape disagrees with the block dimensions, and an expert stack
+/// that does not hold the baked expert count. Mutation check: with the logical-shape checks
+/// removed the calls run and the call counter moves, so the last assert fails.
 #[test]
 fn the_compiled_blocks_refuse_inconsistent_weight_shapes_before_admission() {
     let _serial = crate::native_test_lock();
@@ -1652,10 +1648,10 @@ fn the_compiled_blocks_refuse_inconsistent_weight_shapes_before_admission() {
     reset_compile_state();
 }
 
-/// The host-routed decoder of the fix round: its DeltaNet blocks compile (their step ignores
-/// the routing), its MoE blocks NEVER do — the warm-up plans no MoE program and a one-token
-/// step leaves the MoE counters untouched. Mutation check (a compile branch added to
-/// `moe::step`): the MoE call counter moves after the step and the last assert fails.
+/// The host-routed decoder: its DeltaNet blocks compile (their step ignores the routing),
+/// its MoE blocks NEVER do — the warm-up plans no MoE program and a one-token step leaves
+/// the MoE counters untouched. Mutation check (a compile branch added to `moe::step`): the
+/// MoE call counter moves after the step and the last assert fails.
 #[test]
 fn a_host_routed_decoder_compiles_its_delta_blocks_and_never_its_moe_blocks() {
     let _serial = crate::native_test_lock();
@@ -1846,10 +1842,10 @@ fn max_abs_diff(a: &[f32], b: &[f32]) -> f32 {
         .fold(0f32, f32::max)
 }
 
-/// Gate (a) of packet MX-COMPILE-1a item 7, F32: the compiled and the uncompiled DeltaNet block
-/// on the same random inputs agree to at most 5e-5 in every output (the measured F32 bound of
-/// the measurement runs: the logits of 8 greedy steps differ by at most 4.8e-5), with equal shapes and
-/// dtypes. The fusion reorders float operations; it does not change the math.
+/// F32 numerics: the compiled and the uncompiled DeltaNet block on the same random inputs agree to
+/// at most 5e-5 in every output (the measured F32 bound of the measurement runs: the logits of 8
+/// greedy steps differ by at most 4.8e-5), with equal shapes and dtypes. The fusion reorders float
+/// operations; it does not change the math.
 #[test]
 #[ignore = "needs the real checkpoint on the Mac; run with --ignored, Q36_ACTIVATION unset"]
 fn compiled_and_uncompiled_deltanet_blocks_agree_in_f32() {
@@ -1919,19 +1915,18 @@ fn compiled_and_uncompiled_deltanet_blocks_agree_in_f32() {
     reset_compile_state();
 }
 
-/// Gate (a) of packet MX-COMPILE-1a item 7, BF16: the format-level result, through
-/// `compare_logit_rows`. NO elementwise BF16 bound is claimed on the block output: the out
-/// projection sums `vh * vd` (2048 on the real model) products, so an element that lands near
-/// zero by CANCELLATION can differ by many BF16 ulps *of itself* while both paths are valid
-/// roundings of the same F32 value — a `max(|a|, |b|) * 2^-7` bound on every element is not
-/// derived and would false-fail. What the format level guarantees and this test asserts: the
-/// greedy choice is the same (the top-1 entry of the row is equal, the packet's ask), and the
-/// probability mass behind it agrees — with every logit within about one BF16 ulp (2^-7
-/// relative) of its partner, `|ln(p_i/q_i)| <= 2 * max|a - b| <= 2 * 2^-7 * max|row|`, so the
-/// per-row KL divergence stays far below the 2^-2 headroom asserted here (cancelling elements
-/// carry only their own small probability mass). The elementwise maxima of out, rec, and ring
-/// are printed as information, not asserted: the F32 state under BF16 operands carries the same
-/// cancellation caveat, so its bound is stated against the row scale, not the element.
+/// BF16 numerics: the format-level result, through `compare_logit_rows`. NO elementwise BF16 bound
+/// is claimed on the block output: the out projection sums `vh * vd` (2048 on the real model)
+/// products, so an element that lands near zero by CANCELLATION can differ by many BF16 ulps *of
+/// itself* while both paths are valid roundings of the same F32 value — a `max(|a|, |b|) * 2^-7`
+/// bound on every element is not derived and would false-fail. What the format level guarantees and
+/// this test asserts: the greedy choice is the same (the top-1 entry of the row is equal), and the
+/// probability mass behind it agrees — with every logit within about one BF16 ulp (2^-7 relative)
+/// of its partner, `|ln(p_i/q_i)| <= 2 * max|a - b| <= 2 * 2^-7 * max|row|`, so the per-row KL
+/// divergence stays far below the 2^-2 headroom asserted here (cancelling elements carry only their
+/// own small probability mass). The elementwise maxima of out, rec, and ring are printed as
+/// information, not asserted: the F32 state under BF16 operands carries the same cancellation
+/// caveat, so its bound is stated against the row scale, not the element.
 #[test]
 #[ignore = "needs the real checkpoint on the Mac; run with --ignored and Q36_ACTIVATION=bf16"]
 fn compiled_and_uncompiled_deltanet_blocks_agree_at_the_bf16_format_level() {
@@ -2037,8 +2032,8 @@ fn compiled_and_uncompiled_deltanet_blocks_agree_at_the_bf16_format_level() {
     reset_compile_state();
 }
 
-/// Gate (b) of packet MX-COMPILE-1a item 7 (gate G6): two compiled runs of the same 8 decode
-/// steps return IDENTICAL logit bits — compile is deterministic run to run.
+/// Determinism: two compiled runs of the same 8 decode steps return IDENTICAL logit bits — compile
+/// is deterministic run to run.
 #[test]
 #[ignore = "needs the real checkpoint on the Mac; run with --ignored"]
 fn two_compiled_runs_of_the_same_steps_return_identical_logit_bits() {
@@ -2131,11 +2126,11 @@ fn two_compiled_runs_of_the_same_steps_return_identical_logit_bits() {
     reset_compile_state();
 }
 
-/// Gate (c) of packet MX-COMPILE-1a item 7: 2,000 compiled decode steps add NO trace after the
-/// first token. The trace counts are the NATIVE closure-body counts: a body entry means MLX
-/// traced (or returned the uncompiled function), so a silent retrace under the same Rust key —
-/// a shape or dtype drift, `MLX_DISABLE_COMPILE`, a second thread's own cache — would raise
-/// `traces` and fail this test, not pass vacuously.
+/// Trace count: 2,000 compiled decode steps add NO trace after the first token. The trace counts
+/// are the NATIVE closure-body counts: a body entry means MLX traced (or returned the uncompiled
+/// function), so a silent retrace under the same Rust key — a shape or dtype drift,
+/// `MLX_DISABLE_COMPILE`, a second thread's own cache — would raise `traces` and fail this test,
+/// not pass vacuously.
 #[test]
 #[ignore = "needs the real checkpoint on the Mac; run with --ignored (about a minute of decode)"]
 fn two_thousand_compiled_decode_steps_add_no_trace_after_the_first_token() {
@@ -2210,13 +2205,12 @@ fn two_thousand_compiled_decode_steps_add_no_trace_after_the_first_token() {
     reset_compile_state();
 }
 
-/// Gate (d) of packet MX-COMPILE-1a item 7: a snapshot taken after compiled steps restores and
-/// the decode continues UNCOMPILED with the same greedy tokens. The ownership rule of the
-/// adapter (decision 0024: the arrays of one owner stay inside that owner's decoder) keeps a
-/// cross-adapter restore impossible by design, so the uncompiled decoder is THIS decoder with
-/// the setting off — the honest reading of "an UNCOMPILED decoder". A second, fully uncompiled
-/// decoder replays the same prefix and continues in parallel: the two greedy token chains of the
-/// 16 suffix steps must be equal.
+/// Snapshot interop: a snapshot taken after compiled steps restores and the decode continues
+/// UNCOMPILED with the same greedy tokens. The ownership rule of the adapter (the arrays of one
+/// owner stay inside that owner's decoder) keeps a cross-adapter restore impossible by design, so
+/// the uncompiled decoder is THIS decoder with the setting off — the honest reading of "an
+/// UNCOMPILED decoder". A second, fully uncompiled decoder replays the same prefix and continues in
+/// parallel: the two greedy token chains of the 16 suffix steps must be equal.
 #[test]
 #[ignore = "needs the real checkpoint on the Mac; run with --ignored and Q36_ACTIVATION unset"]
 fn a_snapshot_after_compiled_steps_restores_into_an_uncompiled_decoder() {
@@ -2333,10 +2327,9 @@ fn a_snapshot_after_compiled_steps_restores_into_an_uncompiled_decoder() {
     reset_compile_state();
 }
 
-/// Gate (e) of packet MX-COMPILE-1a item 7: the `memory_stats` peak with compile on stays
-/// within +64 MB of the uncompiled run after 64 decode steps at depth 16. Both numbers are
-/// printed for the report; the compiled programs hold no weights, so the extra peak is the
-/// traced programs and their replay buffers.
+/// Memory: the `memory_stats` peak with compile on stays within +64 MB of the uncompiled run after
+/// 64 decode steps at depth 16. Both numbers are printed for the report; the compiled programs hold
+/// no weights, so the extra peak is the traced programs and their replay buffers.
 #[test]
 #[ignore = "needs the real checkpoint on the Mac; run with --ignored"]
 fn compile_on_peak_stays_within_64mb_of_the_uncompiled_run() {
@@ -2416,10 +2409,9 @@ fn compile_on_peak_stays_within_64mb_of_the_uncompiled_run() {
     reset_compile_state();
 }
 
-/// Gate (g) of packet MX-COMPILE-1a item 7: the fault hooks of the qualification build select
-/// the two new operations. Each fault kind runs in its own child process (a native failure is
-/// sticky for the whole process), and the child asserts the operation name, so a wrong fault
-/// index fails the test instead of passing weakly.
+/// The fault hooks of the qualification build select the two new operations. Each fault kind runs
+/// in its own child process (a native failure is sticky for the whole process), and the child
+/// asserts the operation name, so a wrong fault index fails the test instead of passing weakly.
 #[cfg(all(test, feature = "native-fault-qualification"))]
 mod fault_tests {
     use super::*;
@@ -2675,12 +2667,11 @@ mod fault_tests {
             .evaluate(&[&got.out, &got.ids, &got.gates, &got.health])
     }
 
-    /// The load-time warm-up under an injected call failure (packet item 6d): the fault strikes
-    /// the compiled delta trace inside `set_compile(true)`, so the warm-up returns the typed
-    /// `Backend` load error HERE at load, never a failure in the middle of a request. The warm-up
-    /// takes a few selected operations before the trace (the zero import and the zero state), so
-    /// the parent probes the operations after the counted index until one fails as the compiled
-    /// delta block.
+    /// The load-time warm-up under an injected call failure: the fault strikes the compiled delta
+    /// trace inside `set_compile(true)`, so the warm-up returns the typed `Backend` load error HERE
+    /// at load, never a failure in the middle of a request. The warm-up takes a few selected
+    /// operations before the trace (the zero import and the zero state), so the parent probes the
+    /// operations after the counted index until one fails as the compiled delta block.
     fn one_warm_up() -> Result<(), EngError> {
         let (ckpt, host) = tiny_host();
         let mut decoder = ResidentDecoder::new_with_activation(
@@ -2751,9 +2742,9 @@ mod fault_tests {
             "expected Backend {operation} from fault {}, got {got:?}",
             fault.1
         );
-        // A native failure fails the process-wide resident owner (decision 0023/0032): a new
-        // adapter cannot even initialize afterwards. That is the observable proof that the
-        // failing call made the adapter terminal.
+        // A native failure fails the process-wide resident owner: a new adapter cannot even
+        // initialize afterwards. That is the observable proof that the failing call made the
+        // adapter terminal.
         let later = MlxKernels::try_new();
         assert!(
             matches!(

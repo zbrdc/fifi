@@ -1,7 +1,7 @@
 //! Acquisition and completion boundary for stored tensors.
 //!
 //! A caller submits an [`AcquireRequest`], receives a [`Ticket`], and waits on
-//! it for a [`Completion`]. See `acquisition-contract.md`, in the ledger.
+//! it for a [`Completion`].
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::{io::SeekFrom, sync::Mutex};
@@ -239,12 +239,108 @@ impl StreamedWeights {
             .reader
             .lock()
             .map_err(|_| read_failure(key, "reader lock poisoned"))?;
-        reader
+        // The stamp is taken after the reader lock is held, so the measured wall is
+        // seek + read_exact; lock wait is not included.
+        let clock = read_stats::now();
+        let outcome = reader
             .seek(SeekFrom::Start(position))
             .and_then(|_| reader.read_exact(dst))
-            .map_err(|error| read_failure(key, &error.to_string()))
+            .map_err(|error| read_failure(key, &error.to_string()));
+        if let Some(clock) = clock {
+            read_stats::record(dst.len() as u64, clock.elapsed());
+        }
+        outcome
     }
 }
+
+/// The cold-load read accounting, live only in test builds (the load harness is a test): a
+/// production build compiles `now` to a constant `None` and `record` to nothing, so the
+/// production read path is behaviorally equivalent to what it was. When switched on around
+/// a load phase, every positioned tensor read accumulates its bytes, wall time, and call
+/// count, giving the phase's effective read rate without touching the read itself.
+mod read_stats {
+    use std::time::{Duration, Instant};
+
+    #[cfg(test)]
+    use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+
+    #[cfg(test)]
+    static ENABLED: AtomicBool = AtomicBool::new(false);
+    #[cfg(test)]
+    static NS: AtomicU64 = AtomicU64::new(0);
+    #[cfg(test)]
+    static BYTES: AtomicU64 = AtomicU64::new(0);
+    #[cfg(test)]
+    static CALLS: AtomicU64 = AtomicU64::new(0);
+
+    #[cfg(test)]
+    pub(super) fn now() -> Option<Instant> {
+        ENABLED.load(Ordering::Relaxed).then(Instant::now)
+    }
+
+    #[cfg(not(test))]
+    pub(super) fn now() -> Option<Instant> {
+        None
+    }
+
+    #[cfg(test)]
+    pub(super) fn record(bytes: u64, elapsed: Duration) {
+        NS.fetch_add(elapsed.as_nanos() as u64, Ordering::Relaxed);
+        BYTES.fetch_add(bytes, Ordering::Relaxed);
+        CALLS.fetch_add(1, Ordering::Relaxed);
+    }
+
+    #[cfg(not(test))]
+    pub(super) fn record(_bytes: u64, _elapsed: Duration) {}
+
+    /// Switches the accounting on or off; the load harness brackets exactly its load phases.
+    #[cfg(all(
+        test,
+        feature = "native-mlx",
+        target_os = "macos",
+        target_arch = "aarch64"
+    ))]
+    pub fn set(on: bool) {
+        ENABLED.store(on, Ordering::Relaxed);
+    }
+
+    /// The accumulated bytes, wall nanoseconds, and call count since the last reset.
+    #[cfg(all(
+        test,
+        feature = "native-mlx",
+        target_os = "macos",
+        target_arch = "aarch64"
+    ))]
+    pub fn snapshot() -> (u64, u64, u64) {
+        (
+            BYTES.load(Ordering::Relaxed),
+            NS.load(Ordering::Relaxed),
+            CALLS.load(Ordering::Relaxed),
+        )
+    }
+
+    /// Zeroes the accounting for the next phase snapshot.
+    #[cfg(all(
+        test,
+        feature = "native-mlx",
+        target_os = "macos",
+        target_arch = "aarch64"
+    ))]
+    pub fn reset() {
+        NS.store(0, Ordering::Relaxed);
+        BYTES.store(0, Ordering::Relaxed);
+        CALLS.store(0, Ordering::Relaxed);
+    }
+}
+
+/// The harness-facing surface of the accounting, visible to the load-timing test only.
+#[cfg(all(
+    test,
+    feature = "native-mlx",
+    target_os = "macos",
+    target_arch = "aarch64"
+))]
+pub(crate) use read_stats::{reset, set, snapshot};
 
 /// Streamed stores for every shard of one indexed checkpoint.
 ///

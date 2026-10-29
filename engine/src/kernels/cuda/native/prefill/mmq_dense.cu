@@ -1,12 +1,12 @@
 /*
- * The dense GEMM entry of the vendored-MMQ glue (see prefill/mmq_dense.h). CPF-V4 G2, decision
- * 0049 item 11. No vendored code is copied: the fill is derived from the vendored kernel source
- * (mmq.cuh) and the validation follows the pattern of the quantize entries; the launch is the
- * vendored `mul_mat_q_case`, called, not transcribed. `fixup_need` re-expresses the tile-width
- * selection of vendored mmq.cuh:1444-1461 and the stream-k block rule of mmq.cuh:1395-1412
- * (llama.cpp pin acecd56032ddc34bada14a2d978f110d9c987095, MIT; THIRD_PARTY_NOTICES.md), on
- * top of the vendored config helpers; a test hash-pins both passages and cross-checks it
- * against the Rust sizing.
+ * The dense GEMM entry of the vendored-MMQ glue (see prefill/mmq_dense.h). No vendored code is
+ * copied: the fill is derived from the vendored kernel source (mmq.cuh) and the validation
+ * follows the pattern of the quantize entries; the launch is the vendored `mul_mat_q_case`,
+ * called, not transcribed. `fixup_need` re-expresses the tile-width selection of vendored
+ * mmq.cuh:1444-1461 and the stream-k block rule of mmq.cuh:1395-1412 (llama.cpp pin
+ * acecd56032ddc34bada14a2d978f110d9c987095, MIT; THIRD_PARTY_NOTICES.md), on top of the
+ * vendored config helpers; a test hash-pins both passages and cross-checks it against the
+ * Rust sizing.
  */
 #include <climits>
 #include <cstdint>
@@ -27,17 +27,18 @@
 
 namespace {
 
-/* The K grid (plan section B.3, MSG-85 M2): `MMQ_ITER_K` values per k-loop iteration, read
- * with no k clamp. The extent bound is the tree's `MAX_DIM`. */
+/* The K grid: `MMQ_ITER_K` values per k-loop iteration, read with no k clamp. The extent
+ * bound is the tree's `MAX_DIM`. */
 constexpr int kKGrid = MMQ_ITER_K;
 constexpr int kKMax = 32768;
-/* The chunk cap (G1's NCOLS_LIMIT), the smallest tile width the launch can pick and the I
- * tile of every kept row; the `2^30` bound is the vendored `variable kbc` guard. */
+/* The chunk cap (`mmq_size::NCOLS_LIMIT` on the Rust side), the smallest tile width the
+ * launch can pick and the I tile of every kept row; the `2^30` bound is the vendored
+ * `variable kbc` guard. */
 constexpr int kColsMax = 2048;
 constexpr int kTileJMin = 8;
 constexpr int kTileI = 128;
 constexpr long long kGridLimit = 1LL << 30;
-/* `QK8_1_MMQ` values per q8_1 block of 144 B, and the constant pad (G1's `Q8_1_PAD`). */
+/* `QK8_1_MMQ` values per q8_1 block of 144 B, and the constant pad (`mmq_size::Q8_1_PAD`). */
 constexpr long long kQ8BlockBytes = 144;
 constexpr long long kQ8Pad = 128 * kQ8BlockBytes;
 

@@ -1,4 +1,4 @@
-//! Per-tensor reader for a single-file GGUF checkpoint (decision 0040 item 4).
+//! Per-tensor reader for a single-file GGUF checkpoint.
 //!
 //! `GgufWeights` is portable: it parses the header once, checks every tensor's
 //! type up front, and then reads tensors on request. It never maps the file.

@@ -1,5 +1,4 @@
-//! Launch-only pack and matmul entries on an owned stream (CUDA-RD section 6,
-//! decision 0047).
+//! Launch-only pack and matmul entries on an owned stream.
 //!
 //! [`CudaContext::pack`] and [`CudaContext::matmul`] queue the vendored kernels
 //! on a [`DeviceStream`] and return when they are queued. They allocate nothing,
@@ -18,12 +17,12 @@
 //! - `matmul`: when the shape splits along k, one `cudaMemset2DAsync` that zeroes
 //!   `y` for the atomic partial sums, then the kernel (for `m > 16` the tensor-core
 //!   gemm).
-//! - `matmul` of a Q5_0 weight (MEL-C1b): the own kernel of
+//! - `matmul` of a Q5_0 weight: the own kernel of
 //!   `native/resident/matmul_q5_0.cu`, one launch, no split along k, 1 to 16 tokens
-//!   (more is a `BadRequest`; prefill is V-5b). Its `xf` is the fragment-order buffer
-//!   of a row rounded up to the 256 grid with a zero tail, the width
-//!   `native::activation_k` gives, so `pack` takes that width as `k` and `x` holds
-//!   `m` rows of it. The kernel never reads `xf` beyond the weight's `k`.
+//!   (more is a `BadRequest`; Q5_0 prefill is not supported). Its `xf` is the
+//!   fragment-order buffer of a row rounded up to the 256 grid with a zero tail, the
+//!   width `native::activation_k` gives, so `pack` takes that width as `k` and `x`
+//!   holds `m` rows of it. The kernel never reads `xf` beyond the weight's `k`.
 //!
 //! Every range is a checked [`DeviceRange`]. Before any native call the wrappers
 //! prove that the stream and every buffer belong to this context, that the shape
@@ -233,8 +232,7 @@ impl TiledWeight {
 
 impl CudaContext {
     /// Test only: overwrites part of a device buffer and waits for the copy, so the ids of a
-    /// launch can change between replays. RD-2c's `DeviceBuffer::write_at` replaces it (lane C
-    /// does that once both packets are merged); until then this is the one ranged write.
+    /// launch can change between replays. `DeviceBuffer::write_at` is to replace it.
     #[cfg(test)]
     pub(in crate::kernels::cuda) fn overwrite(
         &self,

@@ -1,16 +1,16 @@
 /*
- * RD-4e: MoE combine of the resident Qwen3.6 decode step (decision 0047).
+ * MoE combine of the resident Qwen3.6 decode step.
  *
- * The combine stays a small separate kernel in stage 1, and it sums the picks in a fixed order in
- * registers so that the result does not depend on scheduling. The code is original CUDA C for
- * sm_86 (sm_72 compiles), written from
- * the shapes of this repository and the graph of the pinned llama.cpp (qwen35moe, build_moe_ffn).
+ * The combine is a small separate kernel, and it sums the picks in a fixed order in registers so
+ * that the result does not depend on scheduling. The code is original CUDA C for sm_86 (sm_72
+ * compiles), written from the shapes of this repository and the graph of the pinned llama.cpp
+ * (qwen35moe, build_moe_ffn).
  *
- * Semantics: see moe_combine.h. The weights and the shared gate are RD-5's outputs and are used as
- * given. Every operation is one intrinsic (__fmul_rn, __fadd_rn), so neither the release compiler nor
- * the debug device build (-G -O0) can contract a product and a sum into a fused multiply-add, and the
- * bits equal the host emulation of the same sequence. The first product is the start of the sum (no
- * 0 + p0), so a -0 stays -0 as in ggml.
+ * Semantics: see moe_combine.h. The weights and the shared gate are the router's outputs and are
+ * used as given. Every operation is one intrinsic (__fmul_rn, __fadd_rn), so neither the release
+ * compiler nor the debug device build (-G -O0) can contract a product and a sum into a fused
+ * multiply-add, and the bits equal the host emulation of the same sequence. The first product is
+ * the start of the sum (no 0 + p0), so a -0 stays -0 as in ggml.
  *
  * One thread owns four consecutive columns of one token (a float4), reads the top_k weights of the
  * token (a broadcast), the top_k rows of down and, when given, the shared row, and writes one float4.
@@ -102,7 +102,7 @@ bool overlaps_ok(const inference_cuda_moe_combine_args *a) {
     return ok;
 }
 
-/* Every term of this test has a twin in the Rust wrapper (the table "C and Rust refusals" of RD-4e.md). */
+/* Every term of this test has a twin in the Rust wrapper. */
 bool valid(const inference_cuda_moe_combine_args *a, void *stream) {
     return a != NULL && stream != NULL && shapes_ok(a) && pointers_ok(a) && overlaps_ok(a);
 }

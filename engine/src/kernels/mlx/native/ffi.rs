@@ -63,8 +63,8 @@ unsafe extern "C" {
     #[cfg(all(test, feature = "native-fault-qualification"))]
     #[link_name = "inference_mlx_compile_delta_rows_cleanup_count"]
     pub(super) fn mlx_compile_delta_rows_cleanup_count() -> u64;
-    /// Prints the lazy graph of `outputs` into one malloced buffer (packet GPU-GAP-COUNT). The
-    /// buffer is NUL-terminated, `len` bytes long, and owned by the caller: free it with
+    /// Prints the lazy graph of `outputs` into one malloced buffer. The buffer is
+    /// NUL-terminated, `len` bytes long, and owned by the caller: free it with
     /// `mlx_free_string`. The dump fills no output array, so — like `mlx_async_eval` — it takes
     /// part in no selection of the qualification operation faults and no counted fault applies.
     #[cfg(feature = "native-fault-qualification")]
@@ -87,8 +87,8 @@ unsafe extern "C" {
         rank: i32,
         dtype: mlx_dtype,
     ) -> i32;
-    /// Wraps `data` as an array that MLX may use in place (decision 0041). MLX calls
-    /// `dtor(payload)` once when it no longer needs the memory.
+    /// Wraps `data` as an array that MLX may use in place. MLX calls `dtor(payload)`
+    /// once when it no longer needs the memory.
     #[link_name = "inference_mlx_array_new_data_managed_payload"]
     pub(super) fn mlx_array_new_data_managed_payload(
         result: *mut mlx_array,
@@ -122,9 +122,9 @@ unsafe extern "C" {
     pub(super) fn mlx_set_cache_limit(previous: *mut usize, limit: usize) -> i32;
     #[link_name = "inference_mlx_eval"]
     pub(super) fn mlx_eval(outputs: mlx_vector_array) -> i32;
-    /// Submits the graph of `outputs` without waiting (packet NATIVE-OPS-1). The submission takes
-    /// part in no selection of the qualification hooks — it fills no output array — so it consumes
-    /// no operation-fault slot; only the un-counted submission fault of the shim applies.
+    /// Submits the graph of `outputs` without waiting. The submission takes part in no selection
+    /// of the qualification hooks — it fills no output array — so it consumes no operation-fault
+    /// slot; only the un-counted submission fault of the shim applies.
     #[link_name = "inference_mlx_async_eval"]
     pub(super) fn mlx_async_eval(outputs: mlx_vector_array) -> i32;
     #[link_name = "inference_mlx_quantized_matmul"]
@@ -385,8 +385,8 @@ unsafe extern "C" {
         rank: usize,
         stream: mlx_stream,
     ) -> i32;
-    /// `mlx_slice_update` for a target that the caller consumed (packet NATIVE-OPS-1): the node
-    /// keeps the target array alive, so the adapter releases its own handle right after the call.
+    /// `mlx_slice_update` for a target that the caller consumed: the node keeps the target array
+    /// alive, so the adapter releases its own handle right after the call.
     #[link_name = "inference_mlx_kv_append"]
     pub(super) fn mlx_kv_append(
         result: *mut mlx_array,
@@ -500,9 +500,8 @@ unsafe extern "C" {
         causal: bool,
         stream: mlx_stream,
     ) -> i32;
-    /// Grouped attention over the first `len` positions of capacity buffers (packet NATIVE-OPS-1):
-    /// the shim builds the two `mlx_slice` prefix views with no `mlx_contiguous` and runs the fused
-    /// attention on them.
+    /// Grouped attention over the first `len` positions of capacity buffers: the shim builds the
+    /// two `mlx_slice` prefix views with no `mlx_contiguous` and runs the fused attention on them.
     #[link_name = "inference_mlx_grouped_attention_prefix"]
     pub(super) fn mlx_grouped_attention_prefix(
         result: *mut mlx_array,
@@ -514,9 +513,9 @@ unsafe extern "C" {
         causal: bool,
         stream: mlx_stream,
     ) -> i32;
-    /// Affine row quantization (packet KV8-OPS): the shim unpacks the `mlx_quantize` result
-    /// vector into the three caller handles and frees the vector on every path. The injected
-    /// faults strike the codes output.
+    /// Affine row quantization: the shim unpacks the `mlx_quantize` result vector into the
+    /// three caller handles and frees the vector on every path. The injected faults strike
+    /// the codes output.
     #[link_name = "inference_mlx_quantize_rows"]
     pub(super) fn mlx_quantize_rows(
         codes: *mut mlx_array,
@@ -528,8 +527,8 @@ unsafe extern "C" {
         mode: *const c_char,
         stream: mlx_stream,
     ) -> i32;
-    /// Quantized attention over the first `len` positions of quantized capacity buffers
-    /// (packet KV8-OPS): one composite shim covers the six prefix views, the reshapes, the two
+    /// Quantized attention over the first `len` positions of quantized capacity buffers: one
+    /// composite shim covers the six prefix views, the reshapes, the two
     /// `mlx_quantized_matmul` calls, the causal chunk mask, and the F32 softmax.
     #[link_name = "inference_mlx_quantized_attention_prefix"]
     pub(super) fn mlx_quantized_attention_prefix(
@@ -549,8 +548,8 @@ unsafe extern "C" {
         mode: *const c_char,
         stream: mlx_stream,
     ) -> i32;
-    /// The gated delta rule as one Metal kernel (decision 0050). `dims` holds B, T, Hk, Dk, Hv, Dv.
-    /// `source` is NUL-terminated. Both outputs are lazy. Faults strike `y`.
+    /// The gated delta rule as one Metal kernel. `dims` holds B, T, Hk, Dk, Hv, Dv. `source` is
+    /// NUL-terminated. Both outputs are lazy. Faults strike `y`.
     #[link_name = "inference_mlx_gated_delta"]
     pub(super) fn mlx_gated_delta(
         y: *mut mlx_array,
@@ -565,16 +564,16 @@ unsafe extern "C" {
         source: *const c_char,
         stream: mlx_stream,
     ) -> i32;
-    /// The flash-delta gated rule (R4-6, Q36_FLASH_DELTA=1): the same contract as
+    /// The flash-delta gated rule (Q36_FLASH_DELTA=1): the same contract as
     /// `mlx_gated_delta` above - the same operands, dims, F32 outputs, and NUL-terminated
     /// `source` - through the `gated_delta_wy` program (the placeholder body is the vendored
     /// recurrent kernel; the chunked WY-form body lands in its place). Both outputs are lazy.
     /// Faults strike `y`.
-    /// The gdn_prep fused kernel (R4-7, Q36_FUSED_PREFILL=1): ONE kernel for the whole
+    /// The gdn_prep fused kernel (Q36_FUSED_PREFILL=1): ONE kernel for the whole
     /// DeltaNet pre-recurrence chain. `dims` holds rows. All six outputs are lazy F32.
     /// Faults strike `q_out`.
-    /// The act_mul fused kernel (R4-7, Q36_FUSED_PREFILL=1): SwiGLU activation. Output is lazy bf16.
-    /// The gdn_post fused kernel (R4-7, Q36_FUSED_PREFILL=1): gated RMS norm and gate.
+    /// The act_mul fused kernel (Q36_FUSED_PREFILL=1): SwiGLU activation. Output is lazy bf16.
+    /// The gdn_post fused kernel (Q36_FUSED_PREFILL=1): gated RMS norm and gate.
     #[link_name = "inference_mlx_gdn_post"]
     pub(super) fn mlx_gdn_post(
         o_out: *mut mlx_array,
@@ -586,7 +585,8 @@ unsafe extern "C" {
         source: *const c_char,
         stream: mlx_stream,
     ) -> i32;
-    /// The moe_combine fused kernel (R4-7, Q36_FUSED_PREFILL=1): un-sort + gate + sum + shared fold + cast.
+    /// The moe_combine fused kernel (Q36_FUSED_PREFILL=1): un-sort + gate + sum +
+    /// shared fold + cast.
     #[link_name = "inference_mlx_moe_combine"]
     pub(super) fn mlx_moe_combine(
         out: *mut mlx_array,
@@ -599,7 +599,7 @@ unsafe extern "C" {
         source: *const c_char,
         stream: mlx_stream,
     ) -> i32;
-    /// The attn_gate fused kernel (R4-7, Q36_FUSED_PREFILL=1): transpose + sigmoid gate + cast.
+    /// The attn_gate fused kernel (Q36_FUSED_PREFILL=1): transpose + sigmoid gate + cast.
     #[link_name = "inference_mlx_attn_gate"]
     pub(super) fn mlx_attn_gate(
         o_out: *mut mlx_array,
@@ -654,10 +654,10 @@ unsafe extern "C" {
         source: *const c_char,
         stream: mlx_stream,
     ) -> i32;
-    /// The fused 8-bit KV decode attention as two Metal kernels (packet FUSED-KV8-a). `dims`
-    /// holds QH, KVH, D, REP, CAP, GSZ; `len` and `nb` are the prefix length and the block
-    /// count; `pass1_source` and `pass2_source` are NUL-terminated. The output is lazy.
-    /// Faults strike `result`.
+    /// The fused 8-bit KV decode attention as two Metal kernels. `dims` holds QH, KVH, D,
+    /// REP, CAP, GSZ; `len` and `nb` are the prefix length and the block count;
+    /// `pass1_source` and `pass2_source` are NUL-terminated. The output is lazy. Faults
+    /// strike `result`.
     #[link_name = "inference_mlx_quantized_attention_decode"]
     pub(super) fn mlx_quantized_attention_decode(
         result: *mut mlx_array,
@@ -781,12 +781,12 @@ unsafe extern "C" {
     #[cfg(test)]
     #[link_name = "inference_mlx_compile_flint_tail_body_entries"]
     pub(super) fn mlx_compile_flint_tail_body_entries() -> u64;
-    /// The DeltaNet decode block as one compiled closure (packet MX-COMPILE-1a behind
-    /// `qwen36.compile`). `dims` holds hidden, kh, kd,
-    /// vh, vd, cd, taps, kw, kw2; `quant` holds mode, group, bits per weight for qkv, z, b, a,
-    /// out; `inputs` holds the 26 closure inputs of the block input order; `activation` is the
-    /// activation dtype the block casts its output to (`to_act`). The three outputs (out, rec,
-    /// ring) are lazy. A non-zero status is a native failure of the adapter.
+    /// The DeltaNet decode block as one compiled closure (behind `qwen36.compile`). `dims`
+    /// holds hidden, kh, kd, vh, vd, cd, taps, kw, kw2; `quant` holds mode, group, bits per
+    /// weight for qkv, z, b, a, out; `inputs` holds the 26 closure inputs of the block input
+    /// order; `activation` is the activation dtype the block casts its output to (`to_act`).
+    /// The three outputs (out, rec, ring) are lazy. A non-zero status is a native failure of
+    /// the adapter.
     #[link_name = "inference_mlx_compile_delta_block"]
     pub(super) fn mlx_compile_delta_block(
         out: *mut mlx_array,
@@ -819,13 +819,12 @@ unsafe extern "C" {
         fun_id: usize,
         stream: mlx_stream,
     ) -> i32;
-    /// The device-routed MoE decode block as one compiled closure (packet MX-COMPILE-1a behind
-    /// `qwen36.compile`). `dims` holds
-    /// hidden, experts, top_k, renorm (0 or 1); `quant` holds mode, group, bits per weight for
-    /// the shared gate, up, down and the gate, up, down stacks; `inputs` holds the 21 closure
-    /// inputs of the block input order; `activation` is the activation dtype the block casts its
-    /// output to. The four outputs (out, ids, gates, health) are lazy. A non-zero status is a
-    /// native failure of the adapter.
+    /// The device-routed MoE decode block as one compiled closure (behind `qwen36.compile`).
+    /// `dims` holds hidden, experts, top_k, renorm (0 or 1); `quant` holds mode, group, bits per
+    /// weight for the shared gate, up, down and the gate, up, down stacks; `inputs` holds the 21
+    /// closure inputs of the block input order; `activation` is the activation dtype the block
+    /// casts its output to. The four outputs (out, ids, gates, health) are lazy. A non-zero
+    /// status is a native failure of the adapter.
     #[link_name = "inference_mlx_compile_moe_block"]
     pub(super) fn mlx_compile_moe_block(
         out: *mut mlx_array,
@@ -840,15 +839,15 @@ unsafe extern "C" {
         fun_id: usize,
         stream: mlx_stream,
     ) -> i32;
-    /// Clears the calling thread's MLX compile cache (packet MX-COMPILE-1a): the measurement
-    /// harness between runs and the adapter teardown, after its pending work completed and
-    /// before its stream and device are released. The cache is thread-local.
+    /// Clears the calling thread's MLX compile cache: the measurement harness between runs
+    /// and the adapter teardown, after its pending work completed and before its stream and
+    /// device are released. The cache is thread-local.
     #[link_name = "inference_mlx_compile_clear_cache"]
     pub(super) fn mlx_compile_clear_cache() -> i32;
-    /// Reads the process-wide counts of compiled closure-body entries of the two block kinds
-    /// (packet MX-COMPILE-1a, fix round 1): the authoritative trace counts of the seam. A body
-    /// entry means MLX traced the closure (or returned the uncompiled function, which runs the
-    /// body on every call); a cache hit replays the compiled tape without entering the body.
+    /// Reads the process-wide counts of compiled closure-body entries of the two block kinds:
+    /// the authoritative trace counts of the seam. A body entry means MLX traced the closure
+    /// (or returned the uncompiled function, which runs the body on every call); a cache hit
+    /// replays the compiled tape without entering the body.
     #[link_name = "inference_mlx_compile_trace_counts"]
     pub(super) fn mlx_compile_trace_counts(delta: *mut u64, moe: *mut u64);
     /// Zeroes the counts of [`mlx_compile_trace_counts`]. Test builds only, from the test-only

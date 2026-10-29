@@ -1,12 +1,12 @@
-/* RD-2d: stream capture, executable graphs and their launch (CUDA-RD rev 2.3 sections 3 and 7,
- * decision 0047). One header per kernel file (lane C ruling on O2); abi_resident.h stays closed.
+/* Stream capture, executable graphs and their launch. One header per kernel file;
+ * abi_resident.h stays closed.
  *
  * A capture is begun and ended by the same thread, on a non-blocking stream, in thread-local
  * capture mode: every launch, async memset or copy, event record and event wait that the caller
  * queues on the stream between the two calls is recorded into a graph instead of running. The
  * graph is instantiated by inference_cuda_capture_end and the executable graph is replayed with
  * inference_cuda_graph_launch. Graph update (cudaGraphExecUpdate) is not used: what changes
- * between replays is buffer content, never an address (CUDA-RD 2.6).
+ * between replays is buffer content, never an address.
  *
  * Statuses. The capture statuses 900..906 (cudaErrorStreamCapture*) and an allocation failure of
  * the instantiate are reported with stage INFERENCE_CUDA_STAGE_CAPTURE; the Rust side decides which
@@ -46,7 +46,7 @@ int inference_cuda_stream_is_capturing(void *stream, int *out_capturing, int *ou
 int inference_cuda_graph_launch(void *exec, void *stream, int *out_stage);
 
 /* Synchronizes the whole device, then destroys exec; when the synchronize fails nothing is
- * destroyed (decision 0022) and the status is returned. Clears the last error before and after. */
+ * destroyed and the status is returned. Clears the last error before and after. */
 int inference_cuda_graph_exec_destroy(void *exec, int *out_stage);
 
 #ifdef INFERENCE_CUDA_FAULT_QUALIFICATION

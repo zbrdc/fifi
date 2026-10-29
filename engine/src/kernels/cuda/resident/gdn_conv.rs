@@ -1,10 +1,9 @@
 //! The DeltaNet causal conv step of the resident decode: kernel 4, depthwise, over the first
-//! `channels` columns of each projection row (RD-7a, decision 0047, stage 1).
+//! `channels` columns of each projection row.
 //!
-//! The kernel is the vendored `conv_silu_k` (xavier-qwen), restored in RD-4V; this module
-//! adds a launch shim, this wrapper and its tests, and no kernel. The ggml comparison of
-//! `conv_silu_k` found no shape match (lane M REPLY-38, which is the record of REPLY-35 condition
-//! 3).
+//! The kernel is the vendored `conv_silu_k` (xavier-qwen); this module adds a launch shim, this
+//! wrapper and its tests, and no kernel. The ggml comparison of `conv_silu_k` found no shape
+//! match.
 //!
 //! [`CudaContext::gdn_conv`] queues one kernel on a [`DeviceStream`] and returns when it is
 //! queued. It allocates nothing, copies nothing and never synchronizes; a fault in the queued work
@@ -15,12 +14,12 @@
 //!
 //! State layout. The state is planar f32 `[3][channels]` on the device, row 0 the oldest input.
 //! ggml keeps the same ring as `[channel][tap]`, the transpose of this layout: a state import or
-//! export (owner RD-9a2, tag `qwen36-gguf-xq-1` keeps the device order) must transpose it. The
-//! state is read and written in place.
+//! export (tag `qwen36-gguf-xq-1` keeps the device order) must transpose it. The state is read and
+//! written in place.
 //!
-//! Sequence start. The state must be zero at the start of a sequence (llama.cpp starts from
-//! zeros). This wrapper does not zero it, because it is launch-only; zeroing is the caller's
-//! (RD-9b/RD-2c, a `write_at` or a memset on the stream).
+//! Sequence start. The state must be zero at the start of a sequence (llama.cpp starts from zeros).
+//! This wrapper does not zero it, because it is launch-only; zeroing is the caller's (a `write_at`
+//! or a memset on the stream).
 //!
 //! What the caller guarantees: the zero state at a sequence start, `proj` rows written by an
 //! earlier launch on the same stream (one stream order) before this call, and `w` as stored by the

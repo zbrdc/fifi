@@ -1,6 +1,6 @@
-//! Resident DeltaNet step (S1-C plan section 2.2). It mirrors the host step in `flash_next/deltanet.rs`.
+//! Resident DeltaNet step. It mirrors the host step in `flash_next/deltanet.rs`.
 //!
-//! The step only builds lazy graph nodes. It never reads back or evaluates (decision 0039 item 2).
+//! The step only builds lazy graph nodes. It never reads back or evaluates.
 
 use super::super::deltanet::DeltaShape;
 use super::ops::{Ctx, dim, linear};

@@ -1,11 +1,10 @@
-//! The device test of the in-graph section timer (packet B1): mechanics only, on the 3090,
-//! report-only timing lines (the `gdn_scan_seq` precedent: the numbers are printed, not
-//! gated). Seam confirmed by Dan, 2026-10-23 21:45Z.
+//! The device test of the in-graph section timer: mechanics only, on the 3090, report-only timing
+//! lines (the `gdn_scan_seq` precedent: the numbers are printed, not gated).
 //!
-//! One test per process through the baton, like the other full-step device rows. Isolation
-//! (the latch rule): the device phase is a plain `Result` function that returns host data
-//! through `?` and drops every CUDA owner at its return; only the caller, with no device
-//! owner alive, asserts.
+//! One test per process with the GPU held exclusively, like the other full-step device rows.
+//! Isolation (the latch rule): the device phase is a plain `Result` function that returns host data
+//! through `?` and drops every CUDA owner at its return; only the caller, with no device owner
+//! alive, asserts.
 //!
 //! What is gated: the marks exist (`section_times` returns readings after a captured step),
 //! every reading is finite, the whole-token pair is positive, the marked groups ARE the
@@ -217,7 +216,7 @@ fn run_pair() -> Result<DeviceReceipt, EngError> {
 }
 
 #[test]
-#[ignore = "the 3090 through the baton (packet B1): loads the real model; run by name"]
+#[ignore = "the 3090, held exclusively: loads the real model; run by name"]
 fn section_marks_time_the_captured_step() {
     if !device_present("section_marks_time_the_captured_step") {
         return;
@@ -226,7 +225,7 @@ fn section_marks_time_the_captured_step() {
         marked_groups,
         readings,
         plain: plain_tokens,
-    } = run_pair().unwrap_or_else(|error| panic!("B1 device phase: {error:?}"));
+    } = run_pair().unwrap_or_else(|error| panic!("section-timer device phase: {error:?}"));
     assert_eq!(readings.len(), TOKENS);
     assert_eq!(plain_tokens.len(), TOKENS);
 
@@ -264,10 +263,10 @@ fn section_marks_time_the_captured_step() {
             assert!(ms.is_finite(), "token {} layer {layer}", reading.token);
             assert!(*size > 0, "token {} layer {layer}", reading.token);
         }
-        // Report-only (Dan's receipt spec): per-section GPU time, the summed section GPU
-        // time, the marked fraction, the wall time of the token, and the idle-gap fractions
-        // — `1 - whole/wall` from the measured pair, `1 - sum/wall` from the estimate.
-        // Never gated here; the claimed numbers come from an exclusive timing window.
+        // Report-only: per-section GPU time, the summed section GPU time, the marked fraction, the
+        // wall time of the token, and the idle-gap fractions — `1 - whole/wall` from the measured
+        // pair, `1 - sum/wall` from the estimate. Never gated here; the claimed numbers come from
+        // an exclusive timing window.
         let groups = reading
             .groups
             .iter()

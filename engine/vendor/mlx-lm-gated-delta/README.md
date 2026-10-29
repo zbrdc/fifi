@@ -1,7 +1,7 @@
 # mlx-lm gated delta kernel
 
 This directory holds the Metal kernel of the gated delta rule from mlx-lm 0.31.0.
-Decision 0050 allows this one custom Metal kernel. Every other custom Metal kernel still needs the Phase 3 plan.
+It is the only custom Metal kernel the engine takes from mlx-lm.
 
 | Path | Content |
 | --- | --- |

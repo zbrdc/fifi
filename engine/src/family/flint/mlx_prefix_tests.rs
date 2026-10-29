@@ -1,4 +1,4 @@
-//! Prefix-store qualification tests for the Flint MLX executor (slice 1).
+//! Prefix-store qualification tests for the Flint MLX executor.
 //!
 //! The pure tests pin the fingerprint and the store shape without weights.
 //! The ignored tests are the qualification gates on the real loader path:
@@ -7,11 +7,9 @@
 //! explicit Mac GPU allocation and run with the FLINT_QUAL_* environment of
 //! the other qualification probes. IDENTITY GATES RUN TWICE in the
 //! qualification window, once per EXPLICIT ring arm (RING_VIEW=1 and
-//! RING_VIEW=0, both set on the command line; Sol wave-1 SF4: the arms
-//! must be explicit because the DEFAULT moved - before the ring-flip
-//! merge unset resolved OFF (two disabled arms), since it unset resolves
-//! ON; either way an unset process collapses the two arms into one, so
-//! the gates ASSERT the explicit arm below — the gates ASSERT the explicit arm below): the flag is
+//! RING_VIEW=0, both set on the command line; the arms must be explicit
+//! because an unset process rides the default (ON) and collapses the two
+//! arms into one, so the gates ASSERT the explicit arm below): the flag is
 //! process-cached, so the two arms are two separate test-bin processes,
 //! exactly like t1_f32_routing.
 
@@ -20,11 +18,11 @@ use super::mlx_executor::{FlintExecutor, FlintPath, FlintSession};
 use crate::family::{executor::ExecutorOps, session::SaveKind};
 use std::path::Path;
 
-/// The fingerprint is exactly the numeric-path surface: one EFFECTIVE
-/// flag change makes a stored prefix unrestorable under the new setting.
-/// The bind is by frozen effective value (Opus r1 SF-1), so raw-string
-/// variants that resolve to the same flag ("1" vs "true" vs "on") are the
-/// same path BY CONSTRUCTION - the type is bool/usize, not OsString.
+/// The fingerprint is exactly the numeric-path surface: one EFFECTIVE flag
+/// change makes a stored prefix unrestorable under the new setting. The
+/// bind is by frozen effective value, so raw-string variants that resolve
+/// to the same flag ("1" vs "true" vs "on") are the same path BY
+/// CONSTRUCTION - the type is bool/usize, not OsString.
 #[test]
 fn a_path_binds_every_flag_it_reads() {
     use crate::family::flint::mlx_executor::FlintEnv;
@@ -133,10 +131,10 @@ fn a_path_binds_every_flag_it_reads() {
     }
 }
 
-/// Slice-1 store shape: the addendum 1 limits (one tip entry, no roots), so
-/// the worker plans exactly one tip save per job. Structural: the serving
-/// path stays off unless the config flag AND the FIFI_FLINT_PREFIX_REUSE
-/// opt-in both arm it (run.rs keeps the Flint family exclusion).
+/// Store shape: one tip entry, no roots, so the worker plans exactly one
+/// tip save per job. Structural: the serving path stays off unless the
+/// config flag AND the FIFI_FLINT_PREFIX_REUSE opt-in both arm it (run.rs
+/// keeps the Flint family exclusion).
 #[test]
 fn the_store_is_one_tip_entry_no_roots() {
     assert_eq!(
@@ -158,15 +156,13 @@ fn serving_piece_rows() -> usize {
 }
 
 /// Opens the real loader with the tokenizer's own EOS set and vocabulary.
-/// Every real gate goes through here, so this is the single choke point
-/// for the run's two environment facts: the serving opt-in must be armed
-/// (Sol wave-1 SF3: without this a gate run that forgot
-/// FIFI_FLINT_PREFIX_REUSE=1 would pass while testing the raw ops only),
-/// and the ring arm must be an EXPLICIT enable/disable word whose
-/// effective state is asserted (Sol wave-1 SF4: an unset run rides the
-/// DEFAULT — OFF before the ring-flip merge, ON since — so it would
-/// silently collapse the two documented arms into whichever the default
-/// happens to be).
+/// Every real gate goes through here, so this is the single choke point for
+/// the run's two environment facts: the serving opt-in must be armed
+/// (without this a gate run that forgot FIFI_FLINT_PREFIX_REUSE=1 would
+/// pass while testing the raw ops only), and the ring arm must be an
+/// EXPLICIT enable/disable word whose effective state is asserted (an unset
+/// run rides the DEFAULT, so it would silently collapse the two documented
+/// arms into whichever the default happens to be).
 fn open_real(root: &Path) -> (FlintExecutor, FlintSession) {
     assert!(
         super::prefix_reuse_opt_in(),
@@ -180,11 +176,11 @@ fn open_real(root: &Path) -> (FlintExecutor, FlintSession) {
 }
 
 /// The ring arm this gate process runs under, asserted against the
-/// effective resolvers (Sol wave-2 SF-4: the wave-1 check accepted
-/// arbitrary non-enable strings as an OFF arm, and an ON arm with
-/// ASYNC_CHAIN=0, where the ring route never runs). Both envs must be the
-/// literal "0" or "1"; an ON ring arm requires the chain ON, and both
-/// effective flags must match their env. Returns the arm.
+/// effective resolvers (a looser check would accept arbitrary non-enable
+/// strings as an OFF arm, and an ON arm with ASYNC_CHAIN=0, where the ring
+/// route never runs). Both envs must be the literal "0" or "1"; an ON ring
+/// arm requires the chain ON, and both effective flags must match their
+/// env. Returns the arm.
 fn assert_explicit_ring_arm() -> bool {
     let ring = std::env::var("FIFI_FLINT_MLX_RING_VIEW")
         .expect("the gates run under an explicit RING_VIEW arm");
@@ -392,8 +388,7 @@ fn a_side_request_covers_zero_and_keeps_the_tip_intact() {
             .save_prefix(&session, head, SaveKind::Tip)
             .expect("tip save")
     );
-    // The boundary row the tip must reproduce later, bitwise (Opus
-    // wave-2 Nit: "keeps the tip intact" was never compared).
+    // The boundary row the tip must reproduce later, bitwise.
     let (boundary_row, _) = row_and_greedy(&mut engine, &mut session, 1);
 
     let mut stranger: Vec<u32> = head.iter().rev().copied().collect();
@@ -418,17 +413,17 @@ fn a_side_request_covers_zero_and_keeps_the_tip_intact() {
     feed(&mut engine, &mut session, tail); // append after restore
 }
 
-/// Gate 5 (run-3ab finding, variants): a tip save must not perturb the
-/// LIVE session. One plain engine and two variant engines prefill the same
-/// 2048-token prompt; V1 saves through the prefix store (snapshot KEPT
-/// ALIVE, refcount > 1 during decode, exactly the served ON arm); V3 takes
-/// the same snapshot and DROPS it immediately (refcount back to 1, no
-/// store). 32 decode steps compare full logits rows as raw f32 bits plus
-/// the greedy draw. If V1 diverges and V3 does not, the live refcount
-/// (kv_append fresh allocation instead of buffer donation) is the cause;
-/// if V3 also diverges, the capture itself perturbs. The first divergent
-/// step, word, and bit are reported. Run in an EXPLICIT ring arm (the A/B
-/// server arms that diverged had the ring view default ON).
+/// Gate 5 (variants): a tip save must not perturb the LIVE session. One
+/// plain engine and two variant engines prefill the same 2048-token prompt;
+/// V1 saves through the prefix store (snapshot KEPT ALIVE, refcount > 1
+/// during decode, exactly the served ON arm); V3 takes the same snapshot
+/// and DROPS it immediately (refcount back to 1, no store). 32 decode steps
+/// compare full logits rows as raw f32 bits plus the greedy draw. If V1
+/// diverges and V3 does not, the live refcount (kv_append fresh allocation
+/// instead of buffer donation) is the cause; if V3 also diverges, the
+/// capture itself perturbs. The first divergent step, word, and bit are
+/// reported. Run in an EXPLICIT ring arm (the A/B server arms that diverged
+/// had the ring view default ON).
 #[test]
 #[ignore = "explicit tiny Mac GPU allocation; real loader; run via the window gate"]
 fn a_tip_save_then_continue_variants() {
@@ -515,7 +510,7 @@ fn a_tip_save_then_continue_variants() {
         drop(v1);
         drop(v1_session);
     }
-    println!("V1-OK: store-save continuation bitwise-identical for 32 steps");
+    println!("V1 OK: store-save continuation bitwise-identical for 32 steps");
 
     // ---- phase 2: V3 (share-only capture, dropped immediately) vs the
     // recorded plain rows. In-process cross-engine determinism is proven by
@@ -549,13 +544,13 @@ fn a_tip_save_then_continue_variants() {
     println!("VARIANTS-OK: V1 and V3 both bitwise-identical to plain for 32 steps");
 }
 
-/// Gate 6 (H3, run-3ab t1 divergence; owner ruling 2026-10-28): the served ON arm splits turn-1
-/// prefill at the internal tip boundary (chat.rs `with_prefix_boundary`);
-/// the OFF arm sweeps once. If a boundary-split prefill yields different
-/// numerics than a sweep of the same ids, the A/B turn-1 text divergence is
-/// the chunk partition, not a save defect. V2 (split with a tip save) vs V3
-/// (split without the save) separates the partition effect from any save
-/// perturbation. One engine live at a time (adapter lease cap).
+/// Gate 6: the served ON arm splits turn-1 prefill at the internal tip
+/// boundary (chat.rs `with_prefix_boundary`); the OFF arm sweeps once. If a
+/// boundary-split prefill yields different numerics than a sweep of the
+/// same ids, the A/B turn-1 text divergence is the chunk partition, not a
+/// save defect. V2 (split with a tip save) vs V3 (split without the save)
+/// separates the partition effect from any save perturbation. One engine
+/// live at a time (adapter lease cap).
 #[test]
 #[ignore = "explicit tiny Mac GPU allocation; real loader; run via the window gate"]
 fn a_save_is_transparent_and_partition_is_numerics() {
@@ -586,9 +581,8 @@ fn a_save_is_transparent_and_partition_is_numerics() {
         |r: &[f32]| -> Vec<u8> { r.iter().flat_map(|f| f.to_bits().to_le_bytes()).collect() };
 
     // V1: one sweep. Its final row and 8 draws are the reference, built
-    // with the shared single-feed helper (Opus delta SF1: the hand-rolled
-    // loop re-fed the pending boundary token, so sweep_draws[0] came from
-    // a different sequence than v2_draws[0] for a test-shape reason).
+    // with the shared single-feed helper, so sweep_draws[0] and v2_draws[0]
+    // come from the same token sequence.
     let (sweep_bits, sweep_draws, vocab) = {
         let (mut e, mut sess) = open_real(&root);
         feed(&mut e, &mut sess, prompt);
@@ -611,8 +605,8 @@ fn a_save_is_transparent_and_partition_is_numerics() {
         let pending = sess.pending_token().expect("split pending token");
         let mut stepper = e.stepper(&mut sess);
         let row = stepper.logits(pending).expect("split final row");
-        // Single feed (Nit-2): the boundary token is fed ONCE, above; each
-        // drawn token is fed exactly once below.
+        // Single feed: the boundary token is fed ONCE, above; each drawn
+        // token is fed exactly once below.
         let mut draws = Vec::with_capacity(8);
         let mut feed = u32::try_from(draw(&row, vocab)).expect("vocab fits u32");
         draws.push(feed);
@@ -657,12 +651,12 @@ fn a_save_is_transparent_and_partition_is_numerics() {
     );
 }
 
-/// Gate 7 (Opus r1 SF-2): a stored entry is still BIT-EXACT after a
-/// session has continued from it. The snapshot shares planes through Rc,
-/// so a continuation's `kv_append` must copy (never donate) the shared
-/// planes; this gate re-reads the stored tip AFTER the live session has
-/// decoded past it and compares the restored row to the row the live
-/// session had at the boundary, bitwise.
+/// Gate 7: a stored entry is still BIT-EXACT after a session has continued
+/// from it. The snapshot shares planes through Rc, so a continuation's
+/// `kv_append` must copy (never donate) the shared planes; this gate
+/// re-reads the stored tip AFTER the live session has decoded past it and
+/// compares the restored row to the row the live session had at the
+/// boundary, bitwise.
 #[test]
 #[ignore = "explicit tiny Mac GPU allocation; real loader; run via the window gate"]
 fn a_stored_entry_survives_a_continued_session() {
@@ -679,16 +673,16 @@ fn a_stored_entry_survives_a_continued_session() {
         e.save_prefix(&sess, prompt, SaveKind::Tip)
             .expect("tip save at the boundary")
     );
-    // The row the live session has at the boundary, from ONE feeding of
-    // the pending token (Nit-2 shape).
+    // The row the live session has at the boundary, from ONE feeding of the
+    // pending token.
     let (boundary_row, _draws) = row_and_greedy(&mut e, &mut sess, 1);
     // The live session now CONTINUES from the save: more prefilled rows
     // force kv_append (and, past the saved planes' capacity, growth) on
     // state that the store also references. A DELIBERATE MUTATION PROBE,
-    // not a served shape (Opus delta Nit-6): row_and_greedy bypasses
-    // DecodeSession, so the next feed re-feeds prompt[4095] at position
-    // 4096 — the point is to mutate the shared planes maximally, then
-    // prove the stored entry did not move.
+    // not a served shape: row_and_greedy bypasses DecodeSession, so the
+    // next feed re-feeds prompt[4095] at position 4096 — the point is to
+    // mutate the shared planes maximally, then prove the stored entry did
+    // not move.
     feed(&mut e, &mut sess, &tokens[4096..4104]);
     let _ = row_and_greedy(&mut e, &mut sess, 1);
 
@@ -705,12 +699,12 @@ fn a_stored_entry_survives_a_continued_session() {
     );
 }
 
-/// Opus wave-3 MF-1, the wiring proof (the only test that exercises the
-/// seam through open()): with the reuse opt-in unset, open() loads the
-/// real model UNCHANGED - a garbage budget env that would abort an armed
-/// engine is never even parsed, and the admitted cap is 0, so every save
-/// refuses. Run in the qualification window with FIFI_FLINT_PREFIX_REUSE
-/// unset (the one gate that must NOT set it) and the budget env garbage.
+/// The wiring proof (the only test that exercises the seam through open()):
+/// with the reuse opt-in unset, open() loads the real model UNCHANGED - a
+/// garbage budget env that would abort an armed engine is never even
+/// parsed, and the admitted cap is 0, so every save refuses. Run in the
+/// qualification window with FIFI_FLINT_PREFIX_REUSE unset (the one gate
+/// that must NOT set it) and the budget env garbage.
 #[test]
 #[ignore = "explicit Mac GPU allocation; real loader; run via the window gate with the reuse env unset and a garbage budget env"]
 fn default_off_open_is_inert_to_a_garbage_budget_env() {
@@ -736,10 +730,10 @@ fn default_off_open_is_inert_to_a_garbage_budget_env() {
     assert_eq!(engine.prefix_retention_cap, 0, "no cap derivation ran");
 }
 
-/// Sol wave-1 MF1: a retention budget that cannot hold the snapshot
-/// turns the save into a PLANNED refusal — `Ok(false)` before the store
-/// is touched, counted in `save_refusals` — and the session continues
-/// correctly with an empty store. Run in the qualification window with
+/// A retention budget that cannot hold the snapshot turns the save into a
+/// PLANNED refusal — `Ok(false)` before the store is touched, counted in
+/// `save_refusals` — and the session continues correctly with an empty
+/// store. Run in the qualification window with
 /// FIFI_FLINT_PREFIX_BUDGET_BYTES=1 beside the usual FLINT_QUAL_* env.
 #[test]
 #[ignore = "explicit tiny Mac GPU allocation; real loader; run via the window gate with FIFI_FLINT_PREFIX_BUDGET_BYTES=1"]
@@ -773,11 +767,10 @@ fn a_too_small_budget_refuses_the_save_planned() {
     );
     assert_eq!(report.entries, 0, "nothing was stored");
 
-    // The refusal must not corrupt the live session (Sol wave-2 SF-3 /
-    // Opus wave-2 SF-2): the continued row is compared BITWISE against a
-    // plain engine fed the same tokens[..4104] - same partition, same
-    // position, no store - after a reset, never against a different token
-    // history.
+    // The refusal must not corrupt the live session: the continued row is
+    // compared BITWISE against a plain engine fed the same
+    // tokens[..4104] - same partition, same position, no store - after a
+    // reset, never against a different token history.
     feed(&mut e, &mut sess, &tokens[4096..4104]);
     let (continued, _) = row_and_greedy(&mut e, &mut sess, 1);
     e.reset(&mut sess).expect("reset before the cold reference");
@@ -808,11 +801,8 @@ fn logits_row(engine: &mut FlintExecutor, session: &mut FlintSession) -> Vec<u8>
 }
 
 /// The boundary row AND `count` greedy tokens from ONE feeding of the
-/// pending token (Opus r1 Nit-2: the old `logits_row` + `greedy` pair fed
-/// the boundary token twice - once for the row, once for the first draw.
-/// Same-numerics comparisons stayed valid, but this is the served
-/// continuation: feed the boundary token, take its row, then feed each
-/// drawn token exactly once).
+/// pending token, as the served continuation does: feed the boundary token,
+/// take its row, then feed each drawn token exactly once.
 fn row_and_greedy(
     engine: &mut FlintExecutor,
     session: &mut FlintSession,
@@ -853,7 +843,7 @@ fn row_and_greedy(
 }
 
 fn engine_vocab(engine: &FlintExecutor) -> usize {
-    // The executor's own vocabulary, not a hardcoded constant (Opus
-    // wave-2 Nit): `open` validates vocab against the tokenizer's.
+    // The executor's own vocabulary, not a hardcoded constant: `open`
+    // validates vocab against the tokenizer's.
     engine.vocab
 }

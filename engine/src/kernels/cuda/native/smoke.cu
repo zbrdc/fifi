@@ -14,17 +14,15 @@
 #include "abi.h"
 #include "device.h"
 
-/* KV8-B B4' (lane C amendment 2, lazy module loading): CUDA loads a kernel's module lazily
- * by default (12.2+), and a module first needed mid-prompt can fail to load after a cache
- * that fills the VRAM has been admitted. The adapter asks for EAGER module loading before
- * CUDA ever initializes: constructors of the executable and of its static archives run
- * before main, before the Rust runtime or any server or test-harness thread exists, and
- * CUDA reads CUDA_MODULE_LOADING at its first initialization, which happens only after
- * main starts - so the environment is written while the process is provably
- * single-threaded, and no Rust `set_var` is used. The overwrite argument is 0, so an
- * operator's explicit value (LAZY, EAGER) always wins. This TU defines
- * inference_cuda_device_count, which the Rust side calls at every context build, so the
- * linker can never drop this object from the archive. */
+/* CUDA loads a kernel's module lazily by default (12.2+), and a module first needed mid-prompt can
+ * fail to load after a cache that fills the VRAM has been admitted. The adapter asks for EAGER
+ * module loading before CUDA ever initializes: constructors of the executable and of its static
+ * archives run before main, before the Rust runtime or any server or test-harness thread exists,
+ * and CUDA reads CUDA_MODULE_LOADING at its first initialization, which happens only after main
+ * starts - so the environment is written while the process is provably single-threaded, and no Rust
+ * `set_var` is used. The overwrite argument is 0, so an operator's explicit value (LAZY, EAGER)
+ * always wins. This TU defines inference_cuda_device_count, which the Rust side calls at every
+ * context build, so the linker can never drop this object from the archive. */
 __attribute__((constructor)) static void set_eager_module_loading(void) {
     setenv("CUDA_MODULE_LOADING", "EAGER", 0);
 }
@@ -204,8 +202,8 @@ extern "C" const char *inference_cuda_status_message(int status) {
 
 /* Writes the driver's module loading mode to *out_mode: the CUmoduleLoadingMode of cuda.h
  * (CU_MODULE_EAGER_LOADING 1, CU_MODULE_LAZY_LOADING 2), read through cuModuleGetLoadingMode
- * resolved with cudaGetDriverEntryPoint, so the adapter keeps linking the runtime only. The
- * observation point of the eager-loading pin of KV8-B B4'. */
+ * resolved with cudaGetDriverEntryPoint, so the adapter keeps linking the runtime only. It
+ * observes the eager module loading that set_eager_module_loading asks for. */
 extern "C" int inference_cuda_module_loading_mode(int *out_mode) {
     try {
         if (out_mode == NULL) {

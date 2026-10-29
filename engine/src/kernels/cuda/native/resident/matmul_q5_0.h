@@ -1,11 +1,11 @@
 /*
- * Launch entries of the Q5_0 decode matmul (MEL-C1b): the dense form (m <= 16 tokens against a Q5_0
- * weight) and the resident expert form (m <= 8 tokens against expert ids_dev[slot] of a stack). The
- * weight is the 8-row x 128-k tile of tile_q5_0.rs (704 bytes: d[32] fp16, qh[32] u32, qs[32][16]),
- * group-major. The kernel is lane C glue over the unmodified vendored mma884.cuh; the vendored loop
- * cannot take a 128-wide tile, so no vendored matmul is called. Launch-only, like abi_resident.h:
- * nothing here allocates, copies or synchronizes; a fault in queued work surfaces at the next
- * synchronize. This is the per-kernel header of kernels/cuda/resident/mod.rs.
+ * Launch entries of the Q5_0 decode matmul: the dense form (m <= 16 tokens against a Q5_0 weight)
+ * and the resident expert form (m <= 8 tokens against expert ids_dev[slot] of a stack). The weight
+ * is the 8-row x 128-k tile of tile_q5_0.rs (704 bytes: d[32] fp16, qh[32] u32, qs[32][16]),
+ * group-major. The kernel is glue over the unmodified vendored mma884.cuh; the vendored loop cannot
+ * take a 128-wide tile, so no vendored matmul is called. Launch-only, like abi_resident.h: nothing
+ * here allocates, copies or synchronizes; a fault in queued work surfaces at the next synchronize.
+ * This is the per-kernel header of kernels/cuda/resident/mod.rs.
  *
  * Activation contract (K = 896 is not a multiple of 256): xf is the vendored fragment-order buffer
  * on the 256 grid, ceil(k / 256) tiles wide, as inference_cuda_pack_launch writes it from a row of
@@ -36,8 +36,8 @@ int inference_cuda_matmul_q5_0_launch(int m, const void *weight, const void *xf_
 
 /* The expert form, m <= 8: expert ids_dev[slot] of `count` experts of n_rows x k back to back at
  * stack. Argument order, alignment and overlap rules of inference_cuda_matmul_expert_launch (the
- * type argument is gone); the 12 arguments mirror that RD-0b entry. An id outside [0, count) writes
- * NaN to y and reads no weight. */
+ * type argument is gone); the 12 arguments mirror that entry. An id outside [0, count) writes NaN
+ * to y and reads no weight. */
 int inference_cuda_matmul_expert_q5_0_launch(int m, const void *stack, const int *ids_dev, int slot,
                                              int count, const void *xf_dev, float *y_dev, int ldy,
                                              int n_rows, int k, void *stream, int *out_stage);

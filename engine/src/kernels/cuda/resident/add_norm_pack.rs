@@ -1,7 +1,6 @@
-//! Safe launch wrapper of the fused residual add, RMSNorm and fp16 pack (RD-4a, decision 0047,
-//! seam 1): `h += delta` in place (optional), then `norm = h * rsqrt(mean(h^2) + eps) * weight`
-//! rounded to nearest even into the matmul input `xf`, and, when asked, the f32 row `norm_out`
-//! that `xf` rounds.
+//! Safe launch wrapper of the fused residual add, RMSNorm and fp16 pack: `h += delta` in place
+//! (optional), then `norm = h * rsqrt(mean(h^2) + eps) * weight` rounded to nearest even into
+//! the matmul input `xf`, and, when asked, the f32 row `norm_out` that `xf` rounds.
 //!
 //! [`CudaContext::add_norm_pack`] queues one kernel on a [`DeviceStream`] and returns. The call
 //! allocates nothing, copies nothing and never
@@ -11,10 +10,9 @@
 //!
 //! Layouts: `h`, `delta`, `norm_out` are f32 `[m][n]`, token-major; `weight` is f32 `[n]`. `xf` is
 //! the layout `pack` writes: the fixed-size fragment-order buffer (1,048,592 bytes, of which the
-//! kernel writes the data lanes of the `m` rows and the zero tail entry the padding lanes read,
-//! MEMSET-TRIM; the bytes no consumer reads are left untouched) for `m <= 16`, fp16 `[m][n]`
-//! row-major above. `norm_out` must be 16-byte aligned
-//! because the router reads it as its input row.
+//! kernel writes the data lanes of the `m` rows and the zero tail entry the padding lanes read; the
+//! bytes no consumer reads are left untouched) for `m <= 16`, fp16 `[m][n]` row-major above.
+//! `norm_out` must be 16-byte aligned because the router reads it as its input row.
 //!
 //! Numerics: the f32 sum of squares runs in a fixed order (no atomics), so a launch is
 //! deterministic. Outside the claimed domain (finite inputs, `|h| <= 2^40`) a row whose sum of
@@ -175,12 +173,12 @@ fn check_apart(call: &AddNormCall<'_>, need: &Sizes) -> Result<(), EngError> {
 }
 
 impl CudaContext {
-    /// Queues the fused residual add, RMSNorm and fp16 pack of `call` on `stream`: `h += delta`
-    /// in place when `delta` is given, the f32 normalised row into `norm_out` when given, and the
-    /// fp16 matmul input into `xf` (fragment order for `m <= 16`, where the kernel also writes
-    /// the zero tail entry the padding lanes read and leaves the unread bytes untouched,
-    /// MEMSET-TRIM; row-major and fully written above). Returns when the work is queued; the
-    /// outputs are valid after the stream drained.
+    /// Queues the fused residual add, RMSNorm and fp16 pack of `call` on `stream`: `h += delta` in
+    /// place when `delta` is given, the f32 normalised row into `norm_out` when given, and the fp16
+    /// matmul input into `xf` (fragment order for `m <= 16`, where the kernel also writes the zero
+    /// tail entry the padding lanes read and leaves the unread bytes untouched; row-major and fully
+    /// written above). Returns when the work is queued; the outputs are valid after the stream
+    /// drained.
     ///
     /// The caller owns the order: queue the writer of `delta` on `stream` before this call, and
     /// never pass the same bytes as `delta` and `h`. A finite row whose sum of squares overflows

@@ -1,12 +1,12 @@
-//! The long-context gate of the 8-bit KV cache (decision 0046, addendum 7, rule 4).
+//! The long-context gate of the 8-bit KV cache.
 //!
-//! The user runs the engine as a coding agent, so the context length is the target. This file
+//! A coding agent sends long prompts, so the context length is the target. This file
 //! holds the Mac test that measures, per cache form and depth, in one run: whether the model
 //! still finds a needle and still writes a valid tool call at that depth, how long the prefill and
 //! the decode steps take, and how much memory the run holds. A second test compares the final
 //! prompt position of two runs (the F32 control and the Q8 cache) as full-vocabulary log-softmax
-//! rows. The tests report numbers and assert only structural facts. The coordinator reads the
-//! numbers against the gate.
+//! rows. The tests report numbers and assert only structural facts; the numbers are read
+//! against the gate.
 //!
 //! The prompt has the shape of a coding-agent request:
 //!

@@ -1,6 +1,6 @@
 //! What the host decides from the result pair of a token of the resident step, and what it does
-//! when a launch fails (decision 0047, packet RD-9d). No device type appears here, so the rules
-//! are tested on the CPU without a `CudaContext`.
+//! when a launch fails. No device type appears here, so the rules are tested on the CPU without a
+//! `CudaContext`.
 //!
 //! # Status
 //!
@@ -9,11 +9,11 @@
 //! `argmax` is the LAST kernel that writes status (`step_plan.rs` checks the phase table;
 //! `step_ops.rs` checks the launch order), so the status half of the result pair is final.
 //!
-//! In stage 1 ANY non-zero status bit (1, 2, 4, 8 or an unknown one) poisons the state and
-//! commits nothing (lane M, REPLY-76 Q2). `ResidentState::commit_step(accepted, status)` does
-//! both and returns the error of the wrapper's class (`book.rs::status_error`, precedence
-//! 4 > 8 > 1 > 2, `Backend`), so this file does not classify a status itself: [`decide`] only
-//! keeps the order "status first, token second" and the vocabulary check of a clean token.
+//! In stage 1 ANY non-zero status bit (1, 2, 4, 8 or an unknown one) poisons the state and commits
+//! nothing. `ResidentState::commit_step(accepted, status)` does both and returns the error of the
+//! wrapper's class (`book.rs::status_error`, precedence 4 > 8 > 1 > 2, `Backend`), so this file
+//! does not classify a status itself: [`decide`] only keeps the order "status first, token second"
+//! and the vocabulary check of a clean token.
 
 use crate::{EngError, kernels::cuda::resident::step_params::ResultPair};
 
@@ -63,7 +63,7 @@ pub(super) enum FailureAction {
 
 /// `entered` counts the ops of the body that were entered, the failing one included. Op 1 is
 /// `step_begin`, a single wrapper that queues nothing when it refuses; any later op may have
-/// queued work (a block is entered whole), so any `run_block` error poisons (RD-9b, binding).
+/// queued work (a block is entered whole), so any `run_block` error poisons.
 pub(super) fn action_for(entered: usize) -> FailureAction {
     if entered <= 1 {
         FailureAction::Cancel

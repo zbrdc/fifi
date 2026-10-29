@@ -1,17 +1,18 @@
-//! Device test of the NATIVE mixer block of MATVEC-PAR S3b (packet test 6), in the MSG-73
-//! isolation split: the device phase (`run_block`) returns `Result` with only `?` inside - no
-//! assert, expect or unwrap - and hands back host `Vec`s; every device owner drops when it
-//! returns, and only THEN do the asserts run. The Q8 slots are ZEROED before the run so a
-//! skipped producer (m5) leaves a known-zero pack, not stale memory.
+//! Device test of the NATIVE mixer block, in the isolation split of `native_device_rig.rs`: the
+//! device phase (`run_block`) returns `Result` with only `?` inside - no assert, expect or unwrap -
+//! and hands back host `Vec`s; every device owner drops when it returns, and only THEN do the
+//! asserts run. The Q8 slots are ZEROED before the run so a skipped producer (m5) leaves a
+//! known-zero pack, not stale memory.
 //!
-//! The block-end `NormRow` is NOT compared across layouts (MSG-73 F3: it is the epilogue norm
-//! of resid + MixOut, and MixOut differs between the layouts by design; the producer equality
-//! is packet test 10). The bounds instead: the input hops take `A` from the PROLOGUE norm
-//! computed on the host from resid and AttnNorm; the output hop takes `A` from the read-back
-//! core row; the whole-block envelope multiplies the output single hop by BLOCK_HOPS = 6
-//! (derived: the block quantizes activations at three stages - the in-pack, the core-out pack,
-//! the epilogue pack - each contributing its input-side and output-side quantization envelope
-//! at most once, the gated rule's gates and decays bounding propagation at 1).
+//! The block-end `NormRow` is NOT compared across layouts (it is the epilogue norm of resid +
+//! MixOut, and MixOut differs between the layouts by design;
+//! `the_native_norm_row_equals_the_tiled_norm_row` checks the producer equality). The bounds
+//! instead: the input hops take `A` from the PROLOGUE norm computed on the host from resid and
+//! AttnNorm; the output hop takes `A` from the read-back core row; the whole-block envelope
+//! multiplies the output single hop by BLOCK_HOPS = 6 (derived: the block quantizes activations at
+//! three stages - the in-pack, the core-out pack, the epilogue pack - each contributing its
+//! input-side and output-side quantization envelope at most once, the gated rule's gates and decays
+//! bounding propagation at 1).
 use super::super::host::HostShape;
 use super::common_tests::{dims as step_dims, inventory};
 use super::dims::StepDims;
@@ -42,7 +43,7 @@ struct BlockRun {
 
 /// The device phase (the isolation rule: only `?` inside). One mixer block of `layer` in
 /// `layout` from the same Q4_K sources - uploaded as tiles and as native blocks, OWNED in this
-/// scope (no leaks: MSG-73 F4).
+/// scope (no leaks).
 fn tiled_index(specs: &[super::mixer_geometry::DenseSpec], role: Role) -> usize {
     specs
         .iter()

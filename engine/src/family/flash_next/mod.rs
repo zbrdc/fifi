@@ -1,8 +1,7 @@
 //! Host-orchestrated forward pass for `qwen3_8_flash_next`.
 //!
 //! Activations stay in host `f32` vectors. Quantized projections go through the
-//! [`crate::family::project::Projector`] seam. Decision 0035 and the Flash-Next executor design
-//! define the blocks, their order, and the parity gate.
+//! [`crate::family::project::Projector`] seam.
 
 mod artifact;
 mod deltanet;

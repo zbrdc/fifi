@@ -1,12 +1,11 @@
-//! Resident Flash-Next decode step and head (packet C4; S1-C plan sections 2.6 and 3).
+//! Resident Flash-Next decode step and head.
 //!
 //! A `Prompt` token synchronizes `layers + 2` times (50 at 48 layers): the token-start import, the
-//! router readback of every layer, and one `evaluate`. The expert page imports do not synchronize
-//! (decision 0041). `Generate` adds the token readback (51). `Logits` adds the logits readback and
-//! no token readback (51). `Record` reads the token, the logits, and the layer rows (53). Each
-//! layer's old state drops as soon as its replacement graph exists. The state stays poisoned from
-//! the first native call until `commit` (decision 0039, amendment
-//! 2026-10-09).
+//! router readback of every layer, and one `evaluate`. The expert page imports do not synchronize.
+//! `Generate` adds the token readback (51). `Logits` adds the logits readback and no token readback
+//! (51). `Record` reads the token, the logits, and the layer rows (53). Each layer's old state
+//! drops as soon as its replacement graph exists. The state stays poisoned from the first native
+//! call until `commit`.
 //!
 //! QSA growth charge: after the host checks and before `begin`, `step` acquires one `GrowthPermit`
 //! for the step's new QSA bytes. A denial returns `MemoryPlan` and changes nothing. The permit
@@ -119,7 +118,7 @@ fn run(
         let gate = read
             .gate
             .ok_or_else(|| EngError::BadRequest("mlp hyper-connection needs inject".into()))?;
-        // Plan 2.4 and decision 0041: the router readback, one synchronization.
+        // The router readback, one synchronization.
         let (out, selection) = moe::step_paged(
             &mut ctx,
             ckpt,
@@ -128,7 +127,7 @@ fn run(
             &mut decoder.slots,
             &read.mixed,
         )?;
-        // Tests only: the S3 route recorder (packet T0) keeps the host selection of each layer.
+        // Tests only: the S3 route recorder keeps the host selection of each layer.
         #[cfg(test)]
         if let Some(trace) = decoder.route_trace.as_mut() {
             let (routes, probs) = selection;
@@ -283,7 +282,7 @@ mod tests {
         }
     }
 
-    /// Asserts cos >= 0.99999 and max |a - e| / max |e| <= 1e-4 (plan section 4, option B).
+    /// Asserts cos >= 0.99999 and max |a - e| / max |e| <= 1e-4.
     fn assert_parity(actual: &[f32], expected: &[f32], what: &str) {
         assert_eq!(actual.len(), expected.len(), "{what}: length");
         let (mut dot, mut aa, mut ee, mut diff, mut top) = (0f64, 0f64, 0f64, 0f64, 0f64);
@@ -767,9 +766,9 @@ mod tests {
         kernels.import_tensor(&zero).unwrap()
     }
 
-    /// Synchronizations per token (S2 plan section 4.5): the token-start import, one router
-    /// readback per layer, one `evaluate`, and the readbacks (the token; `Logits` reads the logits
-    /// instead of the token; `Record` reads the token, the logits, and the rows).
+    /// Synchronizations per token: the token-start import, one router readback per layer, one
+    /// `evaluate`, and the readbacks (the token; `Logits` reads the logits instead of the token;
+    /// `Record` reads the token, the logits, and the rows).
     #[cfg(feature = "native-fault-qualification")]
     fn budget(layers: u64, mode: StepMode) -> u64 {
         let base = layers + 2;
@@ -794,7 +793,7 @@ mod tests {
         assert_eq!(
             real,
             [51, 50, 53, 51],
-            "decision 0041 item 3 and user decision Q2"
+            "the synchronization budget of each step mode at 48 layers"
         );
         let _serial = crate::native_test_lock();
         let (ckpt, flash) = load();
@@ -917,7 +916,7 @@ mod tests {
                 before,
                 "no synchronization"
             );
-            // The failure is terminal (decision 0039 item 7), so reset cannot import a zero state.
+            // The failure is terminal, so reset cannot import a zero state.
             let reset = decoder.reset(&mut state);
             assert!(matches!(reset, Err(EngError::Backend { .. })), "{reset:?}");
             assert!(

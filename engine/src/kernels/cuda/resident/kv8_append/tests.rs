@@ -1,7 +1,7 @@
-//! Seam-1 device tests (3090) of the KV8 append wrapper (RD-8k, class Q8a): the codes and the
-//! fp16 scales the kernel writes are BIT EQUAL to a host reference quantizer on a fixed case
-//! list, the cells outside the appended window keep their sentinel bytes, and the poison rule of
-//! `attn_prep` (no write, mask 4 OR-ed into the status word) holds for a bad position word.
+//! Seam-1 device tests (3090) of the KV8 append wrapper: the codes and the fp16 scales the
+//! kernel writes are BIT EQUAL to a host reference quantizer on a fixed case list, the cells
+//! outside the appended window keep their sentinel bytes, and the poison rule of `attn_prep` (no
+//! write, mask 4 OR-ed into the status word) holds for a bad position word.
 //!
 //! The reference quantizer uses the explicitly selected code denominator: stored half or
 //! unrounded f32. The frozen table below independently pins both policies, including poison
@@ -82,7 +82,7 @@ impl Rig {
 /// The host reference quantizer of one group of 32 values: `(scale bits, codes)`. A group whose
 /// STORED scale is 0 — an all-zero group, or an amax below what an fp16 scale can carry — has
 /// codes 0, mirroring the kernel's branch: `x / 0` is ±inf or NaN, and the kernel's
-/// `__float2int_rn` of either is undefined (the zero-scale fix of the KV8-A review).
+/// `__float2int_rn` of either is undefined.
 fn quant_group(x: &[f32], code_scale: Kv8CodeScale) -> (u16, Vec<i8>) {
     let amax = x.iter().fold(0.0f32, |m, &v| m.max(v.abs()));
     let bits = f16_bits(amax / 127.0);
@@ -91,7 +91,7 @@ fn quant_group(x: &[f32], code_scale: Kv8CodeScale) -> (u16, Vec<i8>) {
         Kv8CodeScale::UnroundedF32 => amax / 127.0,
     };
     let codes = if bits == 0 {
-        // Stored f16 scale 0 keeps codes 0 (the KV8-A invariant): decode multiplies
+        // Stored f16 scale 0 keeps codes 0 (an invariant of the 8-bit cache): decode multiplies
         // by the stored scale, so the group dequantizes to zeros either way.
         vec![0; x.len()]
     } else {
@@ -235,7 +235,7 @@ impl Case {
     }
 }
 
-/// The fixed value menu of the bit-equality test, per group of 32: the packet's case list.
+/// The fixed value menu of the bit-equality test, per group of 32: a fixed case list.
 fn group_values(rng: &mut Rng, group: usize) -> Vec<f32> {
     let sub = 5.960_464_5e-8_f32; // 2^-24: the fp16 subnormal spacing
     match group % 8 {
@@ -391,8 +391,7 @@ struct PlanesOutcome {
 
 /// The device phase of the append cases: every case through the decode entry at its own
 /// position word, the Rig dropped with its buffers before the plain vectors return, so the
-/// asserts never run inside a live backend (the S3b lesson: a drop while panicking latches
-/// it).
+/// asserts never run inside a live backend (a drop while panicking latches it).
 fn append_phase(cases: &[Case]) -> Result<Vec<PlanesOutcome>, EngError> {
     let rig = Rig::new()?;
     let mut outcomes = Vec::new();
@@ -922,7 +921,7 @@ struct Attempt {
 /// The whole device phase of the refusal test: the base call, every refusal row (the decode or
 /// chunk entry as its row says) and every accepted row, then the base call again. Both rigs
 /// drop with every buffer before the plain attempts return, so the asserts below never run
-/// inside a live backend (S3b).
+/// inside a live backend.
 struct RefusalPhase {
     first: Attempt,
     rows: Vec<Attempt>,
@@ -1012,7 +1011,7 @@ fn kv8_append_rejects_bad_calls_before_any_launch() {
     }
 }
 
-// ---- the zero-scale groups of the format (the MINOR finding of the KV8-A review) ----
+// ---- the zero-scale groups of the format ----
 
 /// The rows of a zero-scale case: in every row block, group `g % 4 == 0` holds lanes that are
 /// ALL nonzero at an amax about 1e-40 (an f32 subnormal, far below the smallest fp16 scale),
@@ -1099,7 +1098,7 @@ fn zero_scale_run(
 
 /// The device phase of the zero-scale cases: every case through BOTH entries, the context and
 /// its stream dropped with the buffers before the plain vectors return, so the assertions below
-/// never run inside a live backend (the S3b lesson: a drop while panicking latches it).
+/// never run inside a live backend (a drop while panicking latches it).
 fn zero_scale_phase(cases: &[ZeroScaleCase]) -> Result<Vec<ZeroScaleOutcome>, EngError> {
     let ctx = CudaContext::new()?;
     let stream = ctx.stream()?;
@@ -1157,7 +1156,7 @@ fn assert_zero_scale(label: &str, c: &Case, got: &[Vec<u8>; 4]) {
 
 /// A group whose STORED fp16 scale is 0 (an amax about 1e-40, all lanes nonzero, or tiny lanes
 /// mixed with exact zeros) has codes 0 on the device and in the host reference, through both
-/// entries: `x / 0` is ±inf or NaN, whose `__float2int_rn` is undefined (the KV8-A fix).
+/// entries: `x / 0` is ±inf or NaN, whose `__float2int_rn` is undefined.
 #[test]
 fn kv8_append_writes_zero_codes_when_the_stored_scale_is_zero() {
     if !testkit::device_present("kv8_append_writes_zero_codes_when_the_stored_scale_is_zero") {
@@ -1210,7 +1209,7 @@ fn kv8_append_writes_zero_codes_when_the_stored_scale_is_zero() {
     }
 }
 
-// ---- the NaN poison of a stored group scale (G-KV8 item R-A; lane C ruling: propagate) ----
+// ---- the NaN poison of a stored group scale (the NaN propagates) ----
 
 /// One poisoned group of a scenario: `plane` 0 is K, 1 is V; `row` is the row block whose cell
 /// is `pos + row`. `stamp` is written into the group-local `lanes`, and `scale_nan` says what
@@ -1282,8 +1281,8 @@ struct PoisonOutcome {
 }
 
 /// The device phase of the poison scenarios: both runs through the scenario's entry, and every
-/// owner (context, stream, buffers) dropped before the plain outcomes return (the S3b lesson:
-/// a drop while panicking latches the backend). No assertion runs here.
+/// owner (context, stream, buffers) dropped before the plain outcomes return (a drop while
+/// panicking latches the backend). No assertion runs here.
 fn poison_phase(scenarios: &[PoisonScenario]) -> Result<Vec<PoisonOutcome>, EngError> {
     let ctx = CudaContext::new()?;
     let stream = ctx.stream()?;
@@ -1395,7 +1394,7 @@ fn assert_poison_outcome(o: &PoisonOutcome) {
 /// A NaN at dim 0, 17 or 31 of one K group and, separately, of one V group makes that group's
 /// STORED fp16 scale NaN, so every dequantized value of the group is NaN; every other group of
 /// the row, and every other row, is bit-equal to a clean run of the same rows. An all-NaN group
-/// is a NaN scale too. Both policies and entries retain this rule (G-KV8 item R-A).
+/// is a NaN scale too. Both policies and entries retain this rule.
 #[test]
 fn kv8_append_poisons_a_group_holding_nan() {
     if !testkit::device_present("kv8_append_poisons_a_group_holding_nan") {

@@ -1,14 +1,13 @@
 //! Tests of the prefill attention wrapper: the host-only plan and sizing tests (1 to 3b, the
-//! head-count row of test 20, the launch plan's 21 and 22), the refusal tables of section 4,
-//! and the device tests 6 to 10, 13 to 15, 18, 19, 23 and 24. The f64 reference reads the same
-//! fp16 K/V bits, rounds q to fp16 and computes the softmax in f64 (PA1's seam form); every
-//! bound below is derived in the test that uses it, never tuned. Sizing at the
-//! 262,144-position extent stays on the host (decision 0049 item 9).
+//! head-count row of test 20, the launch plan's 21 and 22), the refusal tables, and the device
+//! tests 6 to 10, 13 to 15, 18, 19, 23 and 24. The f64 reference reads the same fp16 K/V bits,
+//! rounds q to fp16 and computes the softmax in f64; every bound below is derived in the test
+//! that uses it, never tuned. Sizing at the 262,144-position extent stays on the host.
 //!
-//! Device-test structure (the S3b lesson): every device test runs its device phase as
-//! `Result`-only, drops every owner, then asserts on host `Vec`s. The tests run with
-//! `--test-threads=1`. Argued, not tested: the kv8 mode/NULL consistency guard of the C
-//! entry (the wrapper has no KV8 ranges yet, so only C can reach it).
+//! Device-test structure: every device test runs its device phase as `Result`-only, drops every
+//! owner, then asserts on host `Vec`s. The tests run with `--test-threads=1`. Argued, not
+//! tested: the kv8 mode/NULL consistency guard of the C entry (the wrapper has no KV8 ranges
+//! yet, so only C can reach it).
 
 mod q8;
 mod segmented;
@@ -348,9 +347,9 @@ fn cpf_attn_split_plan_refuses_a_chunk_over_the_part_cap() {
 
 #[test]
 fn cpf_attn_split_plan_takes_the_head_counts_as_arguments() {
-    // Test 20's sizing row (lane C condition 8): a Qwen3.8-like geometry, 32 query heads
-    // over 4 kv heads, is computed, not refused — sizing is generic even where the kernel is
-    // compiled for one group size. base = 64 * 4 = 256, so the 3090 target fills at 1 split.
+    // Test 20's sizing row: a Qwen3.8-like geometry, 32 query heads over 4 kv heads, is
+    // computed, not refused — sizing is generic even where the kernel is compiled for one group
+    // size. base = 64 * 4 = 256, so the 3090 target fills at 1 split.
     let geometry = CpfAttnGeometry {
         m: 512,
         n_head: 32,
@@ -415,8 +414,8 @@ fn cpf_attn_launch_plan_fills_whole_waves_at_depth() {
         59_179_008
     );
 
-    // The kv_len sweep (review MAJOR-1): every kv_len from m to m + 2,048, then every 97th
-    // up to 262,144. s_cap is the most splits whose partials fit the cap.
+    // The kv_len sweep: every kv_len from m to m + 2,048, then every 97th up to 262,144. s_cap
+    // is the most splits whose partials fit the cap.
     for (m, s_cap) in [(512_usize, 7_usize), (1_024, 3), (4_064, 1)] {
         let least = cpf_attn_split_plan(q36(m), m, CPF_ATTN_TILE_ROWS, CPF_ATTN_SM_COUNT)
             .expect("s_A")
@@ -456,10 +455,10 @@ fn cpf_attn_launch_plan_fills_whole_waves_at_depth() {
 }
 
 /// The launch plan keeps a split count only when every query tile activates all of them; with
-/// min_keys fixed at CPF_ATTN_MIN_KEYS, full activation implies s <= ceil(count / min_keys)
-/// for every tile, so the plan needs no separate bound on s (lane C's ruling on mutant MB20).
-/// Pinned over the plan's whole domain: every split count up to CPF_ATTN_MAX_SPLITS and every
-/// tile key count up to 262,144 positions.
+/// min_keys fixed at CPF_ATTN_MIN_KEYS, full activation implies s <= ceil(count / min_keys) for
+/// every tile, so the plan needs no separate bound on s. Pinned over the plan's whole domain:
+/// every split count up to CPF_ATTN_MAX_SPLITS and every tile key count up to 262,144
+/// positions.
 #[test]
 fn cpf_attn_full_activation_implies_the_min_keys_bound() {
     for s in 1..=super::CPF_ATTN_MAX_SPLITS {
@@ -1164,7 +1163,7 @@ fn attn_prefill_refuses_misaligned_ranges() {
     let mut rows: Vec<Row> = Vec::new();
     for slot in [Q, PROJ, KC, VC, PART, OUT, STATUS] {
         // The 16-byte ranges shift by 4, past the 4-byte rule, so each reaches its own
-        // 16-byte guard (review MAJOR-1: out is 16-byte aligned like the C entry's rule).
+        // 16-byte guard (out is 16-byte aligned like the C entry's rule).
         let by = if matches!(slot, Q | KC | VC | PART | OUT) {
             4
         } else {
@@ -1298,12 +1297,12 @@ fn attn_prefill_shape_rules_are_pinned() {
     assert!(check_shape(&qwen(1, 8, 0), 4).is_err());
 }
 
-// ---- the f64 reference (PA1's seam form) ---------------------------------------------------
+// ---- the f64 reference ---------------------------------------------------------------------
 
-/// The f64 reference of one (token, head) row: it reads the same fp16 K/V bits as the
-/// kernels, rounds q to fp16 (the kernel's q̂) and computes the softmax in f64 over the row's
-/// `keys` visible keys — PA1's reference form, so only the kernel's fp16 P rounding and its
-/// f32 tile depth remain as error terms.
+/// The f64 reference of one (token, head) row: it reads the same fp16 K/V bits as the kernels,
+/// rounds q to fp16 (the kernel's q̂) and computes the softmax in f64 over the row's `keys`
+/// visible keys, so only the kernel's fp16 P rounding and its f32 tile depth remain as error
+/// terms.
 fn ref_row(q_row: &[f32], k: &[u16], v: &[u16], kvh: usize, keys: usize, scale: f64) -> Vec<f64> {
     ref_row_in(q_row, k, v, kvh, 0..keys, scale)
 }
@@ -1377,17 +1376,17 @@ fn ring_cache(logical: &Data, positions: usize, ring: usize) -> Data {
 
 /// Test 6: one row against today's `attn_decode` on the same cache and the same q bits.
 ///
-/// Derived bound (rev 2, review M2 — not tuned): our kernel rounds q̂ to fp16 where
-/// attn_decode keeps f32, so per score |Δs_j| <= scale * 2^-11 * Σ_d |q_d||k_d|, and our p̂
-/// is fp16 where attn_decode's is f32 (a 2^-11 relative term on the output). First order
-/// through the softmax: |Δout| <= (2 * max_j |Δs_j| + 2^-11) * max(max|V|, 1). The test
-/// data pins scale * Σ_d |q_d||k_d| <= 0.5 for every key and ASSERTS that pin on the host
-/// before the launch, so the bound evaluates to 2^-10 * max(max|V|, 1). The bound is first
-/// order: it carries the two fp16 rounding terms, not the f32 accumulation-order difference
-/// of the two kernels (attn_decode's SIMT FMA reduction over min_keys 32 splits against the
-/// MMA fragments over the planner's splits), which is O(keys * 2^-24) relative and sits in
-/// the measured headroom (review MAJOR-2). Lane M should freeze PA1 on the measured maximum
-/// reported here, not on this as a complete derivation.
+/// Derived bound (not tuned): our kernel rounds q̂ to fp16 where attn_decode keeps f32, so per
+/// score |Δs_j| <= scale * 2^-11 * Σ_d |q_d||k_d|, and our p̂ is fp16 where attn_decode's is
+/// f32 (a 2^-11 relative term on the output). First order through the softmax:
+/// |Δout| <= (2 * max_j |Δs_j| + 2^-11) * max(max|V|, 1). The test data pins
+/// scale * Σ_d |q_d||k_d| <= 0.5 for every key and ASSERTS that pin on the host before the
+/// launch, so the bound evaluates to 2^-10 * max(max|V|, 1). The bound is first order: it
+/// carries the two fp16 rounding terms, not the f32 accumulation-order difference of the two
+/// kernels (attn_decode's SIMT FMA reduction over min_keys 32 splits against the MMA
+/// fragments over the planner's splits), which is O(keys * 2^-24) relative and sits in the
+/// measured headroom. A frozen tolerance should rest on the measured maximum reported here,
+/// not on this as a complete derivation.
 #[test]
 fn attn_prefill_matches_one_row_attn_decode_on_the_same_cache() {
     if !testkit::device_present("attn_prefill_matches_one_row_attn_decode_on_the_same_cache") {
@@ -1491,8 +1490,7 @@ fn attn_prefill_matches_one_row_attn_decode_on_the_same_cache() {
     }
 }
 
-/// Test 7: the f64 reference (PA1's seam form) on multi-tile, multi-split chunks with a late
-/// large score.
+/// Test 7: the f64 reference on multi-tile, multi-split chunks with a late large score.
 ///
 /// Derived bound: the reference and the kernel share the fp16 q̂ and the fp16 K/V bits, so
 /// the remaining error terms are the kernel's fp16 p̂ (a 2^-11 relative weight error, which
@@ -1504,11 +1502,11 @@ fn attn_prefill_matches_one_row_attn_decode_on_the_same_cache() {
 /// correction factor (mutant M4) leaves the early tiles unrescaled and overshoots by far
 /// more than the bound; the late large score row is what detects it.
 ///
-/// Every output must be finite first (a NaN delta never exceeds the running worst). At
-/// p0 = 60, m = 8 the planner's 32-key split boundary at position 64 falls inside the one
-/// query tile (rows at 60..67): split 2's only key tile holds no key of rows 60..63, which
-/// must leave their partials at zero, not NaN (review BLOCKER-1); p0 = 100, m = 40 meets the
-/// same hole at position 128 in tile 3.
+/// Every output must be finite first (a NaN delta never exceeds the running worst). At p0 = 60,
+/// m = 8 the planner's 32-key split boundary at position 64 falls inside the one query tile
+/// (rows at 60..67): split 2's only key tile holds no key of rows 60..63, which must leave
+/// their partials at zero, not NaN; p0 = 100, m = 40 meets the same hole at position 128 in
+/// tile 3.
 ///
 /// A debug build checks the 3,968-key case on every 8th row plus the last (the f64
 /// reference is too slow unoptimized for every row in one hold); release checks every row.
@@ -1711,14 +1709,14 @@ fn attn_prefill_gqa_groups_map_the_first_eight_heads_to_kv_head_zero() {
     }
 }
 
-/// Test 10: the window cuts each row to its own last `window` positions (rev2 §2 K2, review
-/// BLOCKER-2), so a query tile reads the union of its rows' windows. A window taken from the
-/// tile's last row alone drops the j oldest keys of the row j places before it, and with a
-/// window below the query tile of 8 leaves the tile's first rows no key at all (NaN). Cases:
-/// a linear cache at window 40 over two 32-key splits, window 5 (below the query tile), and
-/// a ring of 83 rows whose positions wrap (position p in row p % 83; the rows from 83 on hold
-/// fp16 NaN). Each row is checked against the f64 reference over its own window at test 7's
-/// derived bound, 2^-9 * max(max|V|, 1).
+/// Test 10: the window cuts each row to its own last `window` positions, so a query tile reads
+/// the union of its rows' windows. A window taken from the tile's last row alone drops the j
+/// oldest keys of the row j places before it, and with a window below the query tile of 8
+/// leaves the tile's first rows no key at all (NaN). Cases: a linear cache at window 40 over
+/// two 32-key splits, window 5 (below the query tile), and a ring of 83 rows whose positions
+/// wrap (position p in row p % 83; the rows from 83 on hold fp16 NaN). Each row is checked
+/// against the f64 reference over its own window at test 7's derived bound,
+/// 2^-9 * max(max|V|, 1).
 #[test]
 fn attn_prefill_window_cuts_each_row_to_its_own_window() {
     if !testkit::device_present("attn_prefill_window_cuts_each_row_to_its_own_window") {
@@ -1869,10 +1867,10 @@ fn attn_prefill_window_at_depth_reads_only_each_rows_window() {
 }
 
 /// Test 25: the fast path's two tile-boundary comparisons (`full` in the dsplit kernel, the
-/// "fully visible tile skips the mask" branch), which no earlier geometry pins (review
-/// MINOR-1). Both clauses are exact at one key tile of the geometries below; an off-by-one
-/// survives every earlier device geometry, because either error moves one key across one
-/// row's softmax weight, within ~1/(keys + 2) of the right answer:
+/// "fully visible tile skips the mask" branch), which no earlier geometry pins. Both clauses
+/// are exact at one key tile of the geometries below; an off-by-one survives every earlier
+/// device geometry, because either error moves one key across one row's softmax weight, within
+/// ~1/(keys + 2) of the right answer:
 ///
 /// - Geometry A, the causal boundary: window 0, p0 = 94, m = 8, one split over all keys.
 ///   p0 = 94 = 2 * 32 + 30, so the tile's first row P_first = 94 ≡ 30 (mod 32) and the key
@@ -2068,10 +2066,10 @@ fn attn_prefill_is_deterministic() {
     );
 }
 
-/// Test 13b: one capture of the two launches, replayed, is bitwise the eager launch (the
-/// RD-11a pattern; decision 0049 item 1 makes prefill eager, so capture is a bonus that open
-/// point 8 lets this test document as refused). The kernels are warmed before the window:
-/// a first launch loads the module, which a capture forbids.
+/// Test 13b: one capture of the two launches, replayed, is bitwise the eager launch (prefill
+/// is eager, so capture is a bonus, and this test documents a refused capture instead of
+/// failing). The kernels are warmed before the window: a first launch loads the module, which
+/// a capture forbids.
 #[test]
 fn attn_prefill_inside_a_capture_equals_eager() {
     if !testkit::device_present("attn_prefill_inside_a_capture_equals_eager") {
@@ -2119,9 +2117,9 @@ fn attn_prefill_inside_a_capture_equals_eager() {
             panic!("the replayed capture differs from the eager launch ({nodes} nodes)")
         }
         Err(error) if crate::kernels::cuda::is_capture_refusal(error) => {
-            // Open point 8: capture with more than 48 KB of dynamic shared memory refused;
-            // eager is prefill's mode (0049 item 1), so eager-only is accepted and recorded.
-            println!("capture refused (open point 8): {error:?}");
+            // A capture with more than 48 KB of dynamic shared memory is refused; eager is
+            // prefill's mode, so eager-only is accepted and recorded.
+            println!("capture refused: {error:?}");
         }
         Err(_) => panic!("the capture failed unexpectedly: {outcome:?}"),
     }
@@ -2296,10 +2294,10 @@ fn attn_prefill_fault_bad_bounds_reports_bit_8() {
 
 // ---- test 18 and the fp16 half of test 19: the timing reports -----------------------------
 
-/// Test 18: the acceptance run of section 1 — M = 1,024, p0 = 0, median of 21 launches in
-/// release, single layer. The layer-10 total is REPORTED next to the 8.2 ms acceptance line
-/// (2x the 4.09 ms compute estimate), not asserted (the gate is G-CPF1). In debug builds
-/// the timing is skipped and only the correctness row runs (the S3a lesson).
+/// Test 18: the acceptance run — M = 1,024, p0 = 0, median of 21 launches in release, single
+/// layer. The layer-10 total is REPORTED next to the 8.2 ms acceptance line (2x the 4.09 ms
+/// compute estimate), not asserted. In debug builds the timing is skipped and only the
+/// correctness row runs.
 #[test]
 fn attn_prefill_report_ms() {
     if !testkit::device_present("attn_prefill_report_ms") {
@@ -2370,13 +2368,13 @@ fn attn_prefill_report_ms() {
     let _ = m;
 }
 
-/// The fp16 half of test 19: the north-star row (lane C condition 3) — p0 = 131,072, M = 512,
-/// a single-layer fp16 rig of 131,584 rows (2 x 128.5 MiB), median of 11 launches after 2
-/// warm-ups. The per-chunk (x10) number is REPORTED next to llama.cpp's 349 ms per 512-chunk
-/// at 128K depth and the 250 ms target, not asserted. A correctness spot check on 4 rows (2
-/// heads) runs in the same process so the timed kernel is the correct one. Ignored by
-/// default: run by name in one 3090 hold. The split is the split plan's (s_A = 2); test 24
-/// runs the same rig with the launch plan's.
+/// The fp16 half of test 19: the north-star row — p0 = 131,072, M = 512, a single-layer fp16
+/// rig of 131,584 rows (2 x 128.5 MiB), median of 11 launches after 2 warm-ups. The per-chunk
+/// (x10) number is REPORTED next to llama.cpp's 349 ms per 512-chunk at 128K depth and the
+/// 250 ms target, not asserted. A correctness spot check on 4 rows (2 heads) runs in the same
+/// process so the timed kernel is the correct one. Ignored by default: run by name in one 3090
+/// hold. The split is the split plan's (s_A = 2); test 24 runs the same rig with the launch
+/// plan's.
 #[test]
 #[ignore = "the 128K north-star rig: run by name in one GPU hold"]
 fn attn_prefill_report_ms_at_128k() {
@@ -2387,12 +2385,12 @@ fn attn_prefill_report_ms_at_128k() {
     north_star_rig(plan_for(512, 2, 131_584));
 }
 
-/// Test 24: the T19 acceptance row (section 1: <= 250 ms per 512-chunk over 10 layers) by the
-/// launch plan the driver calls, `cpf_attn_launch_plan(.., 131,584, 0, 82)`: test 19's rig
-/// and row (with its 4-row f64 spot check) at the launch plan's split count, after one line
-/// with the split count, the T19 line and the per-layer floors (compute at 71 TFLOP/s, and
-/// the K/V bytes the query tiles read from L2). Reported, not asserted; release-gated like
-/// test 19 (a debug build runs the spot check only). Ignored by default: one 3090 hold.
+/// Test 24: the T19 acceptance row (<= 250 ms per 512-chunk over 10 layers) by the launch plan
+/// the driver calls, `cpf_attn_launch_plan(.., 131,584, 0, 82)`: test 19's rig and row (with
+/// its 4-row f64 spot check) at the launch plan's split count, after one line with the split
+/// count, the T19 line and the per-layer floors (compute at 71 TFLOP/s, and the K/V bytes the
+/// query tiles read from L2). Reported, not asserted; release-gated like test 19 (a debug build
+/// runs the spot check only). Ignored by default: one 3090 hold.
 #[test]
 #[ignore = "the 128K acceptance row by the launch plan: run by name in one GPU hold"]
 fn attn_prefill_report_ms_at_128k_by_the_launch_plan() {
@@ -2588,8 +2586,8 @@ fn report_north_star(
     let median = samples[samples.len() / 2];
     let flops = 4.0 * D as f64 * 16.0 * (p0 as f64 + m as f64 / 2.0) * m as f64;
     // The K and V planes once (unique), and the bytes the kernel moves: every one of a kv
-    // head's ceil(m / 8) query tiles re-reads that head's keys (review MAJOR-3; slightly
-    // high, since a tile reads only the keys up to its own last row).
+    // head's ceil(m / 8) query tiles re-reads that head's keys (slightly high, since a tile
+    // reads only the keys up to its own last row).
     let unique = 2.0 * rows as f64 * 2.0 * D as f64 * 2.0;
     let traffic = unique * m.div_ceil(CPF_ATTN_Q_TILE) as f64;
     let seconds = median * 1e-3;
@@ -2611,13 +2609,13 @@ fn report_north_star(
 }
 
 #[test]
-#[cfg(feature = "cuda-q8-reference")] // Sol follow-up SF: pins the fixture's microbench plan series
+#[cfg(feature = "cuda-q8-reference")] // pins the fixture's microbench plan series
 fn cpf_attn_launch_plan_pins_the_flint_m1_series() {
     // Flint's m1 prefill rows (H32/KVH4/D128 — the per-row calls of cuda_ffn runtime):
     // the base grid is 1 q-tile x 4 kv heads = 4 blocks, so the split plan demands
     // SM_TARGET(164)/4 = 41 splits at every depth (more cannot fill waves better), and
     // the device rule then activates ceil(depth/256)-style splits. Production has run
-    // this regime all along; the 2026-10-28 microbench mistook it for splits1.
+    // this regime all along; an earlier microbench mistook it for splits1.
     let flint_m1 = CpfAttnGeometry {
         m: 1,
         n_head: 32,

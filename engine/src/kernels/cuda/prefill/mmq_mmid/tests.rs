@@ -1,10 +1,9 @@
-//! Seam-1 tests of the mmid wrappers (CPF-V4 G3; plan rev 3 sections B.5 items 5 and 8, C.2
-//! N1). Device tests pin the ids guard N1 (the rewrite to `0..top_k`, the status masks of
-//! MSG-85 M4 with literal words, the router range untouched, seam I1) and the builder (the
-//! host sort of `mm_ids_helper` on random, skewed and poisoned ids, and the permutation
-//! property). The refusal tables cover every wrapper guard, one row per rule, each asserted by
-//! the text of its own error with every earlier check satisfied (the plan functions are
-//! called directly, so no refused row reaches a launch).
+//! Tests of the mmid wrappers. Device tests pin the ids guard (the rewrite to `0..top_k`, the
+//! status masks with literal words, the router range untouched) and the builder (the host sort
+//! of `mm_ids_helper` on random, skewed and poisoned ids, and the permutation property). The
+//! refusal tables cover every wrapper guard, one row per rule, each asserted by the text of its
+//! own error with every earlier check satisfied (the plan functions are called directly, so no
+//! refused row reaches a launch).
 //!
 //! Device-test structure: every device phase is `Result`-only (no `assert`/`expect`/`unwrap`
 //! while a device owner lives), drops every owner, then asserts on host `Vec`s. Every output
@@ -12,11 +11,11 @@
 //! value lies in its domain before any other check, so an unwritten output fails. Canary ints
 //! after every range must survive. The tests run with `--test-threads=1`.
 //!
-//! The grouped launch's device tests (the toy confirmation, Q8X, PG1b, the memcheck rows)
-//! need G4's quantize entries and are the next part's. Here the launch is covered host-side:
-//! the fill pin (finding 20's replacement), every number rule by tag, and every range rule
-//! through the plan function. Its capacity rows construct an `MmidIds` literally, which only
-//! this child module can do, because both constructors refuse those ranges first.
+//! The grouped launch's device tests (the toy confirmation, Q8X, PG1b, the memcheck rows) live
+//! in the child modules below. Here the launch is covered host-side: the fill pin, every number
+//! rule by tag, and every range rule through the plan function. Its capacity rows construct an
+//! `MmidIds` literally, which only this child module can do, because both constructors refuse
+//! those ranges first.
 //!
 //! Argued, not tested: the `shared memory` rule of the builder cannot fire on a real device
 //! (4 * 2,048 bytes against the 48 KiB every built device has, FIFI_MIN_SMPBO); it exists so
@@ -186,7 +185,7 @@ fn run_guard(shape: MmidShape, rows: &[i32], status0: Option<i32>) -> Result<Gua
 }
 
 /// The checks every guard launch passes: the HARD GATE on `ids_g`, the host guard's rows, the
-/// canaries, the router range unchanged (I1) and the status word `status0 | bits`.
+/// canaries, the router range unchanged and the status word `status0 | bits`.
 fn assert_guard(shape: &MmidShape, rows: &[i32], out: &GuardOut, status0: Option<i32>) {
     let ne = shape.ne_get_rows();
     let e = as_i32(shape.n_experts);
@@ -197,7 +196,7 @@ fn assert_guard(shape: &MmidShape, rows: &[i32], out: &GuardOut, status0: Option
     let (want, bits) = host_guard(shape, rows);
     assert_eq!(out.ids_g[..ne], want[..], "guarded rows");
     assert!(out.ids_g[ne..].iter().all(|&v| v == SENT), "ids_g canary");
-    assert_eq!(out.ids_after, le(rows), "the router ids changed (seam I1)");
+    assert_eq!(out.ids_after, le(rows), "the router ids changed");
     assert!(out.status[1..].iter().all(|&v| v == SENT), "status canary");
     assert_eq!(
         out.status[0],
@@ -206,11 +205,11 @@ fn assert_guard(shape: &MmidShape, rows: &[i32], out: &GuardOut, status0: Option
     );
 }
 
-/// The adversarial rows of plan rev 3 C.2 N1's tests, by name and row content, for `top_k` 8
+/// The adversarial rows of the ids guard tests, by name and row content, for `top_k` 8
 /// over 256 experts.
 fn poisoned_rows() -> Vec<(&'static str, [i32; 8])> {
     vec![
-        ("all -1 (RD-5's fault form)", [-1; 8]),
+        ("all -1 (the router's fault form)", [-1; 8]),
         ("id 256", [1, 2, 3, 4, 256, 6, 7, 8]),
         ("id 300", [300, 2, 3, 4, 5, 6, 7, 8]),
         ("i32::MIN", [1, 2, 3, i32::MIN, 5, 6, 7, 8]),
@@ -269,7 +268,7 @@ fn mmq_ids_guard_reports_mask_1_only_for_router_fault_rows() {
     assert_guard(&shape, &rows, &out, Some(0));
     assert_eq!(
         out.status[0], ROUTER_FAULT,
-        "an all -1 row is RD-5's fault: mask 1 only"
+        "an all -1 row is the router's fault: mask 1 only"
     );
     assert_eq!(out.ids_g[0..8], [0, 1, 2, 3, 4, 5, 6, 7]);
     assert_eq!(out.ids_g[16 * 8..17 * 8], [0, 1, 2, 3, 4, 5, 6, 7]);
@@ -482,7 +481,7 @@ fn assert_build(shape: &MmidShape, rows: &[i32], out: &BuildOut) {
         out.bounds[e + 1..].iter().all(|&v| v == SENT),
         "bounds canary"
     );
-    assert_eq!(out.ids_after, le(rows), "the router ids changed (seam I1)");
+    assert_eq!(out.ids_after, le(rows), "the router ids changed");
     assert_eq!(
         out.status,
         [bits, SENT, SENT, SENT],
@@ -620,10 +619,10 @@ fn mmq_build_ids_reports_mask_1_for_router_fault_rows() {
 
 #[test]
 fn mmq_type_of_pins_the_weight_type_mapping() {
-    // The one mapping the typed quantize wrappers of part 2 call G4's entries through: every
+    // The one mapping the typed quantize wrappers call the quantize entries through: every
     // glued weight type keeps its variant, so the q8_1 scale layout follows the weight
-    // (mmq.cuh:61-101: Q4_K takes DS4, Q6_K and Q8_0 take D4). G4's own tests pin the ggml
-    // discriminants of MmqType against the decode side.
+    // (mmq.cuh:61-101: Q4_K takes DS4, Q6_K and Q8_0 take D4). The `mmq_quant` tests pin the
+    // ggml discriminants of MmqType against the decode side.
     let rows = [
         (QuantType::Q80, MmqType::Q80),
         (QuantType::Q50, MmqType::Q50),
@@ -742,11 +741,11 @@ fn mmq_ids_wrappers_refuse_ranges_that_do_not_fit() {
         ("ids_g short", vec![(1, (1, 0, ne * 4 - 4))], false, "the CUDA ids_g range"),
         ("ids_g misaligned", vec![(1, (1, 2, ne * 4))], false, "ids_g range starts at offset 2"),
         ("status short", vec![(2, (2, 0, 2))], false, "the CUDA status range"),
-        ("ids_g over ids (I1)", vec![(1, (0, 0, ne * 4))], false, "ids_g and ids ranges overlap"),
+        ("ids_g over ids", vec![(1, (0, 0, ne * 4))], false, "ids_g and ids ranges overlap"),
         ("status inside ids_g", vec![(2, (1, 8, 4))], false, "ids_g and status ranges overlap"),
         ("ids_src1 short", vec![(3, (3, 0, ne * 4 - 4))], true, "the CUDA ids_src1 range"),
-        ("ids_dst one int short of M2", vec![(4, (4, 0, (cap - 1) * 4))], true, "the CUDA ids_dst range"),
-        ("ids_dst at the rev 2 form", vec![(4, (4, 0, (ne + 127) * 4))], true, "the CUDA ids_dst range"),
+        ("ids_dst one int short of the closed form", vec![(4, (4, 0, (cap - 1) * 4))], true, "the CUDA ids_dst range"),
+        ("ids_dst at the earlier form", vec![(4, (4, 0, (ne + 127) * 4))], true, "the CUDA ids_dst range"),
         ("expert_bounds n_experts ints", vec![(5, (5, 0, e * 4))], true, "the CUDA expert_bounds range"),
         ("expert_bounds misaligned", vec![(5, (5, 2, (e + 1) * 4))], true, "expert_bounds range starts at offset 2"),
         ("ids_dst over ids_src1", vec![(4, (3, 0, cap * 4))], true, "ids_src1 and ids_dst ranges overlap"),
@@ -852,7 +851,7 @@ type HostRow<'a> = (&'a str, &'a [i32], &'a [i32], bool, &'a str);
 type HostOut = (Result<MmidShape, EngError>, [Vec<i32>; 3]);
 
 /// Runs `from_host` into fresh `SENT` buffers sized exactly to the rules; `short_dst` makes
-/// the `ids_dst` range one int short of rule M2.
+/// the `ids_dst` range one int short of its closed form.
 fn run_from_host(
     ctx: &CudaContext,
     stream: &DeviceStream,
@@ -883,7 +882,7 @@ fn mmid_ids_from_host_uploads_what_the_builder_wrote() {
     if !testkit::device_present("mmid_ids_from_host_uploads_what_the_builder_wrote") {
         return;
     }
-    // The Qwen shape and an 8-slot bank shape (seam I2's tiered caller).
+    // The Qwen shape and an 8-slot bank shape (the tiered caller's).
     let shapes = [
         qwen(49),
         MmidShape {
@@ -956,7 +955,7 @@ fn mmid_ids_from_host_refuses_before_any_device_write() {
         ("a duplicated entry", &[0, 1, 2, 3, 4, 5, 6, 6], &good_bounds, false, "ids values: ids_dst[7] repeats"),
         ("an entry equal to m * top_k", &[0, 1, 2, 3, 4, 5, 6, 8], &good_bounds, false, "ids values: ids_dst[7] is 8"),
         ("an expert with m + 1 columns", &good_dst, &[0, 5, 6, 7, 8], false, "ids values: expert 0 holds 5"),
-        ("ids_dst one int short of M2", &good_dst, &good_bounds, true, "the CUDA ids_dst range"),
+        ("ids_dst one int short of the closed form", &good_dst, &good_bounds, true, "the CUDA ids_dst range"),
         ("a shape outside the rules", &good_dst, &good_bounds, false, "mmq_mmid: top_k"),
     ];
     let phase = || -> Result<Vec<HostOut>, EngError> {
@@ -1047,7 +1046,7 @@ fn fill_mmid_args_pins_every_field_of_the_grouped_form() {
         ..grouped(12, 2048, 512, 1024)
     };
     assert_eq!(fill_mmid_args(&gate), want);
-    // The down launch over an 8-slot Q6_K bank (seam I2) whose slots sit 4,800 blocks apart.
+    // The down launch over an 8-slot Q6_K bank whose slots sit 4,800 blocks apart.
     let down = MmidLaunchShape {
         ids: MmidShape {
             n_experts: 8,
@@ -1095,8 +1094,8 @@ fn check_launch_shape_refuses_every_number_rule() {
         stride_bytes: 32_768 * 128 * 144,
         ld: 32_768,
     };
-    // The verdict MINOR-1 witness: 358,416,384 tiles of one block reach i32::MAX when the
-    // launcher scales them by 100, while staying under the 2^30 stream-k limit.
+    // The witness: 358,416,384 tiles of one block reach i32::MAX when the launcher scales them
+    // by 100, while staying under the 2^30 stream-k limit.
     let overflow = MmidLaunchShape {
         ids: MmidShape {
             n_experts: 256,
@@ -1269,10 +1268,10 @@ fn mmq_mmid_launch_refuses_ranges_that_do_not_fit() {
         let rows: Vec<LaunchRow> = vec![
             ("weight one block short", vec![(0, (0, 0, 512 * 144 - 144))], ids, launch, "the CUDA weight range"),
             ("weight misaligned", vec![(0, (0, 4, 512 * 144))], ids, launch, "weight range starts at offset 4"),
-            ("y one byte short of rule M1", vec![(1, (1, 0, 20_735))], ids, launch, "the CUDA y range"),
+            ("y one byte short of the q8_1 pad", vec![(1, (1, 0, 20_735))], ids, launch, "the CUDA y range"),
             ("y misaligned", vec![(1, (1, 4, 20_736))], ids, launch, "y range starts at offset 4"),
-            ("ids_dst one int short of rule M2", vec![(3, (3, 0, 138 * 4))], ids, launch, "the CUDA ids_dst range"),
-            ("ids_dst at the rev 2 form", vec![(3, (3, 0, 135 * 4))], ids, launch, "the CUDA ids_dst range"),
+            ("ids_dst one int short of the closed form", vec![(3, (3, 0, 138 * 4))], ids, launch, "the CUDA ids_dst range"),
+            ("ids_dst at the earlier form", vec![(3, (3, 0, 135 * 4))], ids, launch, "the CUDA ids_dst range"),
             ("expert_bounds n_experts ints", vec![(4, (4, 0, 16))], ids, launch, "the CUDA expert_bounds range"),
             ("dst one float short", vec![(5, (5, 0, 4092))], ids, launch, "the CUDA dst range"),
             ("dst misaligned", vec![(5, (5, 2, 4096))], ids, launch, "dst range starts at offset 2"),

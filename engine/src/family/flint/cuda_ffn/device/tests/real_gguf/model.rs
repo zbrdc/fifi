@@ -269,7 +269,7 @@ fn teacher_forced_prefill_2048_diagnostic() {
 }
 
 #[test]
-#[ignore = "one admitted instrumented teacher trial; exclusive coordinator window required"]
+#[ignore = "one admitted instrumented teacher trial; exclusive GPU window required"]
 fn teacher_forced_prefill_2048_phase_profile() {
     let capture = super::super::profile::Capture::start();
     teacher_forced_prefill_2048_diagnostic();

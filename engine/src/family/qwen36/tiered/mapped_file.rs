@@ -1,26 +1,24 @@
 #![allow(unsafe_code)]
-//! The one scoped module that maps a model file read-only (OFF-2 P10).
+//! The one scoped module that maps a model file read-only.
 //!
-//! WHAT: [`MappedFile`] opens a file read-only, refuses a length the caller
-//! did not expect (the GGUF header's end of data), and maps the whole file
+//! WHAT: [`MappedFile`] opens a file read-only, refuses a length the caller did
+//! not expect (the GGUF header's end of data), and maps the whole file
 //! PROT_READ, so the CPU expert tier reads experts straight from the OS page
-//! cache with plain faults and DEFAULT advice (OFF-2.0 measured that any
+//! cache with plain faults and DEFAULT advice (a measurement showed that any
 //! madvise hint is harmful; this module never calls madvise). WHY: `memmap2`
-//! 0.9.11 marks the file-backed map constructor `unsafe` because another
-//! writer can invalidate the mapped references, and decision 0017 forbids a
-//! safe constructor that silently passes that obligation on; this file is the
-//! ONE place carrying this scoped `allow(unsafe_code)`, it opens and maps
-//! read-only only, recording length and mtime at open and re-checking them
-//! around the map and on demand, and it holds exactly ONE `unsafe` block -
+//! 0.9.11 marks the file-backed map constructor `unsafe` because another writer
+//! can invalidate the mapped references, and the crate's unsafe-code policy
+//! forbids a safe constructor that silently passes that obligation on; this
+//! file is the ONE place carrying this scoped `allow(unsafe_code)`, it opens
+//! and maps read-only only, recording length and mtime at open and re-checking
+//! them around the map and on demand, and it holds exactly ONE `unsafe` block -
 //! the `Mmap` map call - whose only view out is `AsRef<[u8]>` (a safe
 //! [`MappedRegion`](super::cpu_pool::MappedRegion)), so no pointer leaves.
-//! Residual risk: truncation under a live mapping still faults (SIGBUS) when
-//! a page past the new end is touched, and an in-place overwrite by another
+//! Residual risk: truncation under a live mapping still faults (SIGBUS) when a
+//! page past the new end is touched, and an in-place overwrite by another
 //! process changes the bytes behind the `&[u8]` without any fault; no
 //! Rust-level check closes that window, only narrows it, and model files are
-//! immutable by policy.
-//! Authority: decision 0017, Addendum 1 (2026-10-13, approved by git-db, not
-//! a user ruling). Opened by the tiered load (OFF-2 D5b).
+//! immutable by policy. Opened by the tiered load.
 
 use std::fmt;
 use std::fs::File;

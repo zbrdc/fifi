@@ -370,7 +370,7 @@ impl Drop for AllocCache {
 }
 
 fn free_error(failure: native::DeviceFailure) -> EngError {
-    // Decision 0022: any failed free is terminal, even a nonsticky allocation-stage OOM.
+    // Any failed free is terminal, even a nonsticky allocation-stage OOM.
     TERMINAL.store(true, Ordering::Release);
     device_error(failure)
 }
@@ -839,7 +839,7 @@ mod tests {
         );
         assert!(
             TERMINAL.load(Ordering::Acquire),
-            "any failed free is terminal under decision 0022"
+            "any failed free is terminal"
         );
         assert!(
             Lease::acquire(&SLOTS, &TERMINAL).is_err(),

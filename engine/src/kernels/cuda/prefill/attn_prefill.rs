@@ -1,7 +1,7 @@
-//! Pure host-side plan and sizing of the chunked-prefill attention (CPF-ATTN-A, decision
-//! 0049 items 9 and 11). No device code and no allocation: these functions pick the KV-split
-//! plan of `attn_prefill` and size its partial buffer, so the driver (CPF-7a) can admit a
-//! chunk inside the measured budget before any launch.
+//! Pure host-side plan and sizing of the chunked-prefill attention. No device code and no
+//! allocation: these functions pick the KV-split plan of `attn_prefill` and size its partial
+//! buffer, so the prefill driver can admit a chunk inside the measured budget before any
+//! launch.
 //!
 //! The partial layout is the decode layout of `attn_decode` generalised from `G` heads times
 //! `m` tokens to `G` heads times `m` rows (a query tile of 8 rows holds 8 times `G`
@@ -17,19 +17,16 @@
 //! and, at depth, raises the split count to fill whole waves of the SMs, never past the part
 //! cap. So the launched bytes grow with `kv_len`, up to [`CPF_ATTN_PART_CAP`], while the
 //! allocation does not: the driver allocates `part` at the flat cap, which admission already
-//! charges in every row (decision 0049 item 9). That keeps the no-N-squared property of
-//! decision 0049 — a deeper context never grows the workspace — and the sizing tests pin it.
+//! charges in every row. That keeps the no-N-squared property of chunked prefill — a deeper
+//! context never grows the workspace — and the sizing tests pin it.
 //!
 //! Arithmetic is checked throughout: an overflowing product is a `BadRequest` (the pattern of
 //! `resident::attn_decode::attn_part_bytes`), and a plan whose partials do not fit
 //! [`CPF_ATTN_PART_CAP`] at one split is a `MemoryPlan` refusal: the chunk is too large for
-//! the budget and must shrink (decision 0049 item 9; the driver owns admission).
+//! the budget and must shrink (the driver owns admission).
 #![cfg_attr(
     not(test),
-    expect(
-        dead_code,
-        reason = "staged for CPF-7, the prefill driver (decision 0049)"
-    )
+    expect(dead_code, reason = "staged for the chunked-prefill driver")
 )]
 
 use std::ffi::c_int;
@@ -53,8 +50,8 @@ const MAX_MIN_KEYS: usize = 1 << 20;
 /// Exclusive upper bound of the score scale.
 const SCALE_LIMIT: f32 = 1e30;
 
-/// Query rows per tile of the prefill attention kernels: the compiled tile of design section
-/// 3.7 (eight query heads of a GQA group packed with eight tokens into 64 MMA rows).
+/// Query rows per tile of the prefill attention kernels: the compiled tile (eight query heads
+/// of a GQA group packed with eight tokens into 64 MMA rows).
 pub(crate) const CPF_ATTN_TILE_ROWS: usize = 8;
 /// Keys per tile of the prefill attention kernels: the granule of a key range (the tile of
 /// `attn_decode`).
@@ -65,21 +62,20 @@ pub(crate) const CPF_ATTN_MIN_KEYS: usize = 256;
 pub(crate) const CPF_ATTN_MAX_SPLITS: usize = 128;
 /// The SM count the five-argument sizing form binds: the 3090's 82 SMs.
 pub(crate) const CPF_ATTN_SM_COUNT: usize = 82;
-/// The block target of the split plan: a 164-block target of design section 3.7 (`2 x 82` on
-/// the 3090). It is a block count, not an occupancy: the part kernel runs one block per SM
-/// ([`CPF_ATTN_BLOCKS_PER_SM`]).
+/// The block target of the split plan: 164 blocks (`2 x 82` on the 3090). It is a block
+/// count, not an occupancy: the part kernel runs one block per SM ([`CPF_ATTN_BLOCKS_PER_SM`]).
 pub(crate) const CPF_ATTN_SM_TARGET: usize = 2 * CPF_ATTN_SM_COUNT;
 /// Blocks of the part kernel resident on one SM at once: its 96 KB of shared memory and its
 /// 512 threads at 128 registers (the whole register file) each allow one. The launch plan
 /// counts waves in these slots.
 pub(crate) const CPF_ATTN_BLOCKS_PER_SM: usize = 1;
-/// The KV-split partial budget of decision 0049 item 9: 64 MiB, charged flat in every
-/// admission row. The plan-sized bytes never exceed it (the plan reduces its splits to fit).
+/// The KV-split partial budget: 64 MiB, charged flat in every admission row. The plan-sized
+/// bytes never exceed it (the plan reduces its splits to fit).
 pub(crate) const CPF_ATTN_PART_CAP: usize = 64 * 1024 * 1024;
 
 /// The geometry of one prefill attention call: a chunk of `m` rows, `n_head` query heads over
-/// `n_kv_head` kv heads, and the head dimension. Every value is a run-time argument (lane C
-/// condition 8); the sizing is generic in all of them.
+/// `n_kv_head` kv heads, and the head dimension. Every value is a run-time argument; the
+/// sizing is generic in all of them.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct CpfAttnGeometry {
     pub(crate) m: usize,
@@ -338,7 +334,7 @@ fn active_splits(count: usize, max_splits: usize, min_keys: usize) -> usize {
     count.div_ceil(chunk)
 }
 
-// ---- the safe wrapper (CPF-ATTN-A C7) -----------------------------------------------------
+// ---- the safe wrapper ---------------------------------------------------------------------
 
 /// The span rules of a call, `attn_decode`'s [`AttnSpan`] (window 0 is all positions, else the
 /// last `window`; ring 0 is a linear cache, else position p lives in row `p % ring`). A ring
@@ -350,7 +346,7 @@ pub(crate) type CpfAttnSpan = crate::kernels::cuda::resident::attn_decode::AttnS
 /// values: see [`CPF_ATTN_MIN_KEYS`] and the plan above.
 pub(crate) type CpfAttnSplit = crate::kernels::cuda::resident::attn_decode::AttnSplit;
 
-/// The compiled query tile (lane C ruling 5: fixed at 8 and refused otherwise).
+/// The compiled query tile: fixed at 8, and any other tile is refused.
 pub(crate) const CPF_ATTN_Q_TILE: usize = CPF_ATTN_TILE_ROWS;
 
 /// Span sizing permits read-only broadcasts; output admission must reject self-overlap.
@@ -632,7 +628,7 @@ pub(crate) struct AttnPrefillShape {
     pub(crate) head_dim: usize,
     pub(crate) cache_rows: usize,
     pub(crate) ld: usize,
-    /// The position of token 0: a launch argument (decision 0049 item 1), never a device word.
+    /// The position of token 0: a launch argument, never a device word.
     pub(crate) p0: i64,
 }
 
@@ -659,7 +655,7 @@ pub(crate) struct AttnPrefillSegment {
 /// - `out`: f32 `[m][n_head * head_dim]`, 16-byte aligned; NaN on device bounds failure.
 /// - `status`: `None`, or one device `i32`; device bounds failure ORs mask 8.
 ///   Host-side refusals change no device bytes; valid launches leave status untouched.
-/// - `q_tile`: the compiled tile; only 8 runs (lane C ruling 5).
+/// - `q_tile`: the compiled tile; only 8 runs.
 /// - `scale`: multiplies the scores, finite and in `(0, 1e30)`; `1/sqrt(256) = 0.0625`.
 pub(crate) struct AttnPrefillCall<'b> {
     pub(crate) storage: AttnKvStorage,
@@ -1108,9 +1104,9 @@ impl CudaContext {
         self.attn_prefill_enqueue(stream, call, AttnPrefillLaunch::Combine)
     }
 
-    /// Same-ELF fixture path (A ruling 01a18101): identical admission and args, but the
-    /// native entry launches the q8 part kernel with the pre-hoist per-element math so
-    /// tests can compare it with the hoisted kernel byte for byte. Fixture builds only.
+    /// Same-ELF fixture path: identical admission and args, but the native entry launches the
+    /// q8 part kernel with the pre-hoist per-element math so tests can compare it with the
+    /// hoisted kernel byte for byte. Fixture builds only.
     #[cfg(all(test, feature = "cuda-q8-reference"))]
     pub(crate) fn attn_prefill_q8_reference(
         &self,
@@ -1120,9 +1116,9 @@ impl CudaContext {
         self.attn_prefill_enqueue(stream, call, AttnPrefillLaunch::Q8Reference)
     }
 
-    /// Same-ELF fixture path (MF1, Opus bee8b4539): identical admission and args, but the
-    /// native entry passes the tiled opt-in — the only way to reach the step-2 kernel.
-    /// The default launch keeps the old kernel in every build. Fixture builds only.
+    /// Same-ELF fixture path: identical admission and args, but the native entry passes the
+    /// tiled opt-in — the only way to reach the tiled kernel. The default launch keeps the old
+    /// kernel in every build. Fixture builds only.
     #[cfg(all(test, feature = "cuda-q8-reference"))]
     pub(crate) fn attn_prefill_q8_tiled(
         &self,

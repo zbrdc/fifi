@@ -1,11 +1,11 @@
-// Fifi shadow header for the vendored llama.cpp MMQ sources (engine/vendor/ggml-cuda-mmq; decision 0049, CPF-V2).
+// Fifi shadow header for the vendored llama.cpp MMQ sources (engine/vendor/ggml-cuda-mmq).
 // This is glue, not a patched vendor file: it stands in for ggml/src/ggml-cuda/unary.cuh.
 // Text marked "derived" is copied from that file at llama.cpp acecd56032ddc34bada14a2d978f110d9c987095 (MIT, Copyright (c) 2023-2026
 // The ggml authors; engine/vendor/ggml-cuda-mmq/LICENSE has the notice).
 //
 // It carries only the four scalar device helpers that the GLU switch of the vendored mul_mat_vec_q
-// kernels names (MATVEC-PAR S1 c1): none of the ggml_tensor host operations of the upstream header
-// are vendored, and nothing else here defines them.
+// kernels names: none of the ggml_tensor host operations of the upstream header are vendored, and
+// nothing else here defines them.
 #pragma once
 
 #include "common.cuh"

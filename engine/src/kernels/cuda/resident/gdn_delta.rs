@@ -1,8 +1,8 @@
-//! Safe launch wrapper of the gated DeltaNet recurrence step (RD-7b, decision 0047, seam 1).
+//! Safe launch wrapper of the gated DeltaNet recurrence step.
 //!
-//! The kernel (`gated_delta_k`) is vendored xavier-qwen code, restored in RD-4V; this file and the
-//! launch shim of `native/resident/gdn_delta.cu` add no kernel. The ggml comparison of
-//! `gated_delta_k` found no shape match (REPLY-38; REPLY-35 condition 3).
+//! The kernel (`gated_delta_k`) is vendored xavier-qwen code; this file and the launch shim of
+//! `native/resident/gdn_delta.cu` add no kernel. The ggml comparison of `gated_delta_k` found
+//! no shape match.
 //!
 //! [`CudaContext::gdn_delta`] queues one kernel on a [`DeviceStream`] and returns. Per value head
 //! it L2-normalizes q and k (`x * rsqrt(sum(x^2) + eps)`, q also times `1/sqrt(128)`), forms the
@@ -15,10 +15,10 @@
 //!
 //! What the caller guarantees:
 //! - **Sequence start.** The state is zero at the start of a sequence. The call is launch-only and
-//!   in place and does not zero it; zeroing is the caller's (RD-9b, RD-2c).
+//!   in place and does not zero it; zeroing is the caller's.
 //! - **State layout.** `state` is f32 `[n_v_heads][128 key i][128 value j]`, `j` fastest. ggml keeps
 //!   the transpose, `[head][128 value j][128 key i]` with the key index fastest, so a state import
-//!   or export transposes. Its owner is RD-9a2 (tag `qwen36-gguf-xq-1` keeps the device order).
+//!   or export transposes (tag `qwen36-gguf-xq-1` keeps the device order).
 //! - `conv` is f32 `[m][conv_ld]` laid out q (`n_k_heads` x 128) | k (`n_k_heads` x 128) |
 //!   v (`n_v_heads` x 128), the output of the conv step, written before the call.
 //! - `proj` is f32 `[m][ld]` holding `z` (`n_v_heads` x 128 at `z_off`), the beta logits

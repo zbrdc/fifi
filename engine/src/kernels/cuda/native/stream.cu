@@ -59,7 +59,7 @@ extern "C" int inference_cuda_stream_destroy(void *stream, int *out_stage) {
         Failure failure;
         failure.record(cudaStreamSynchronize((cudaStream_t)stream),
                        INFERENCE_CUDA_STAGE_SYNCHRONIZE);
-        // A stream with unknown completion is not destroyed (decision 0022).
+        // A stream with unknown completion is not destroyed.
         if (failure.ok()) {
             failure.record(cudaStreamDestroy((cudaStream_t)stream), INFERENCE_CUDA_STAGE_ALLOCATE);
         }
@@ -139,10 +139,9 @@ extern "C" int inference_cuda_event_record(void *event, void *stream, int *out_s
     }
 }
 
-/* The graph-timer trio (packet B1): a timing-enabled event, an external-record that a stream
- * capture turns into an event-record node of the captured graph, and the host-side elapsed
- * query. The external-record flag and the node behavior are DeepInfer's graph-timer idea
- * (ledger deepinfer-774ce24/B-kernels-moe-attention-quant.md lines 40 and 71); the elapsed
+/* The graph-timer trio: a timing-enabled event, an external-record that a stream capture
+ * turns into an event-record node of the captured graph, and the host-side elapsed query. The
+ * external-record flag and the node behavior are DeepInfer's graph-timer idea; the elapsed
  * entry follows the bench trio of matvec_q.cu. */
 extern "C" int inference_cuda_timing_event_create(void **out_event, int *out_stage) {
     try {

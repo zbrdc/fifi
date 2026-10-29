@@ -28,8 +28,8 @@ fn options(mode: KvMode, ctx: usize) -> StepOptions {
     }
 }
 
-/// The pinned charge (packet IMPL-CUDA-SERVE-2 G1/G2): 65,863,680 B of DeltaNet export plus
-/// 20,480 B per position at Fp16 and 10,880 B per position at Int8G32.
+/// The pinned charge: 65,863,680 B of DeltaNet export plus 20,480 B per position at Fp16 and
+/// 10,880 B per position at Int8G32.
 #[test]
 fn entry_bytes_matches_the_pinned_host_charge_of_both_modes() {
     let d = dims();

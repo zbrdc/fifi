@@ -1,38 +1,34 @@
-//! The host-side class partition of the one-token decode step: #8's Flint
-//! method (task/flint-class-partition-3) ported to Q36 at the coordinator's
-//! order, after five headless xctrace attempts produced zero shader rows.
+//! The host-side class partition of the one-token decode step: the Flint class-partition
+//! method ported to Q36, because headless xctrace runs produced zero shader rows.
 //!
-//! One ignored Mac-only real-checkpoint test, `decode_class_partition`, builds
-//! the decoder exactly like `decode_timing` and runs a TEST-ONLY REPLICA of
-//! `step.rs::run`'s layer loop that calls the same resident functions with one
-//! counter-bracketed forced evaluate at every op-class boundary. The bracket is
-//! the qualification counter pair the phase harness already uses
-//! (`MlxKernels::qualification_reset_timing` / `qualification_timing`), so a
-//! class's cost is its `evaluate_ns`/`import_ns`/`readback_ns` sums, not a host
-//! wall. The classes sum to an ATTRIBUTION, not a latency (#8's
-//! `classes_sum_is_attribution_not_latency`): the forced syncs serialize the
-//! graph. The empty-sync control (a bracket holding only the forced evaluate)
-//! is measured in the same process and subtracted per sync.
+//! One ignored Mac-only real-checkpoint test, `decode_class_partition`, builds the
+//! decoder exactly like `decode_timing` and runs a TEST-ONLY REPLICA of `step.rs::run`'s
+//! layer loop that calls the same resident functions with one counter-bracketed forced
+//! evaluate at every op-class boundary. The bracket is the qualification counter pair the
+//! phase harness already uses (`MlxKernels::qualification_reset_timing` /
+//! `qualification_timing`), so a class's cost is its
+//! `evaluate_ns`/`import_ns`/`readback_ns` sums, not a host wall. The classes sum to an
+//! ATTRIBUTION, not a latency: the forced syncs serialize the graph. The empty-sync
+//! control (a bracket holding only the forced evaluate) is measured in the same process
+//! and subtracted per sync.
 //!
-//! The class boundaries split AROUND the compiled blocks, never inside them
-//! (#8's note): `delta_block` and `moe_block` time each compiled closure as one
-//! entry, and the forced sync defeats fusion only across boundaries. The
-//! compiled blocks' production cost comes from the non-split compile A/B
-//! already banked in `decode_timing`; this run attributes the EAGER remainder
-//! and the depth scaling of every class.
+//! The class boundaries split AROUND the compiled blocks, never inside them:
+//! `delta_block` and `moe_block` time each compiled closure as one entry, and
+//! the forced sync defeats fusion only across boundaries. The compiled
+//! blocks' production cost comes from the non-split compile A/B already
+//! banked in `decode_timing`; this run attributes the EAGER remainder and the
+//! depth scaling of every class.
 //!
 //! Classes: `embed`, `input_norm`, `delta_block`, `attn_qkv_proj`,
 //! `attn_core`, `attn_out_proj`, `residual`, `post_norm`, `moe_block`, `head`.
 //!
-//! Practices carried from #8: 128 forwards per depth; all prefill and growth
-//! before the timed window; the FIRST depth of a fresh process is JIT-cold, so
-//! a warm-up depth pass precedes the reported ones; `evaluate_calls` is
-//! asserted against the expected per-step count; when the summed class walls
-//! exceed the plain step wall the overlap is reported, not hidden. Parity gate:
-//! the replica's greedy token chain must equal the plain
-//! `ResidentDecoder::step` (`StepMode::Generate`) chain step for step — a
-//! mismatch means the attribution is of a different computation and fails the
-//! run.
+//! Practices carried from the Flint method: 128 forwards per depth; all prefill and growth
+//! before the timed window; the FIRST depth of a fresh process is JIT-cold, so a warm-up
+//! depth pass precedes the reported ones; `evaluate_calls` is asserted against the
+//! expected per-step count; when the summed class walls exceed the plain step wall the
+//! overlap is reported, not hidden. Parity gate: the replica's greedy token chain must
+//! equal the plain `ResidentDecoder::step` (`StepMode::Generate`) chain step for step — a
+//! mismatch means the attribution is of a different computation and fails the run.
 //!
 //! Inputs by environment: the `Q36_*`/`DT_*` knobs of `decode_timing`
 //! (`Q36_CKPT_DIR`, `Q36_OUT_DIR`, `Q36_PROMPT_IDS`, `DT_DEPTHS`,

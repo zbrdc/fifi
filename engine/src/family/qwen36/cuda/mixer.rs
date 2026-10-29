@@ -1,5 +1,5 @@
-//! The eager mixer blocks of the resident step (decision 0047, packets RD-9b3a and RD-9b3b): one
-//! DeltaNet layer or one attention layer of one decode step, queued on ONE stream.
+//! The eager mixer blocks of the resident step: one DeltaNet layer or one attention layer of one
+//! decode step, queued on ONE stream.
 //!
 //! A block runs from the residual stream to the MoE input. WHAT it launches is the op list of
 //! `mixer_ops.rs`, and every non-slot argument of a wrapper call comes from `mixer_shapes.rs`;
@@ -13,12 +13,11 @@
 //! block is a defect and the earlier kernels of the block, of the layers before it and of the
 //! step are already queued. `cancel_enqueue` is only for a failure before `run_block` was called.
 //!
-//! Status writers in a block, in queue order: `attn_prep` ORs mask 4 into `StepParams.status` on
-//! a refused position (RD-8a), and under Int8G32 the rows entry holds the same rule while
-//! `kv8_append` ORs 4 only on a word that entry already refused (KV8-B). They run after
-//! `step_begin` and before the router and `argmax`, as `step_plan.rs` requires. A block takes the
-//! `Pos`, `KvLen` and `Status` words as 4-byte ranges (`ResidentState::step_field`), never the
-//! 32-byte block.
+//! Status writers in a block, in queue order: `attn_prep` ORs mask 4 into `StepParams.status` on a
+//! refused position, and under Int8G32 the rows entry holds the same rule while `kv8_append` ORs 4
+//! only on a word that entry already refused. They run after `step_begin` and before the router and
+//! `argmax`, as `step_plan.rs` requires. A block takes the `Pos`, `KvLen` and `Status` words as
+//! 4-byte ranges (`ResidentState::step_field`), never the 32-byte block.
 
 use super::{
     dims::KvMode,
@@ -177,11 +176,11 @@ pub(super) struct MixerParts<'a> {
     pub(super) table: &'a LayerTable,
     pub(super) weights: MixerWeights<'a>,
     pub(super) views: MixerViews<'a>,
-    /// The layout the op lists and the weight lookups were built for (MATVEC-PAR S3b): taken
-    /// from the session options, which the step has checked against the loaded weights.
+    /// The layout the op lists and the weight lookups were built for: taken from the session
+    /// options, which the step has checked against the loaded weights.
     pub(super) layout: WeightLayout,
-    /// The KV mode the op lists were built for (KV8-B B3): the attention core is the fp16 pair
-    /// under `Fp16` and the KV8 rows/append/q8-decode triple under `Int8G32`.
+    /// The KV mode the op lists were built for: the attention core is the fp16 pair under `Fp16`
+    /// and the KV8 rows/append/q8-decode triple under `Int8G32`.
     pub(super) kv_mode: KvMode,
     pub(super) paged: Option<&'a PagedResources>,
 }
@@ -214,7 +213,7 @@ fn tail<'b>(range: DeviceRange<'b>, col: usize) -> Result<DeviceRange<'b>, EngEr
 }
 
 impl<'a> Mixers<'a> {
-    /// The layer weights the chunk model borrows (CPF-7b-C B.4).
+    /// The layer weights the chunk model borrows.
     pub(super) fn weights(&self) -> &MixerWeights<'a> {
         &self.parts.weights
     }
@@ -504,9 +503,9 @@ impl<'a> Mixers<'a> {
                     out: self.view(out)?,
                 },
             ),
-            // The KV8 core of the Int8G32 mode (KV8-B B3): the rows entry writes the f32 k and v
-            // rows, `kv8_append` quantizes them into the layer's code and scale planes, and the
-            // q8 decode reads the planes back at the split the plan sized its partials with.
+            // The KV8 core of the Int8G32 mode: the rows entry writes the f32 k and v rows,
+            // `kv8_append` quantizes them into the layer's code and scale planes, and the q8 decode
+            // reads the planes back at the split the plan sized its partials with.
             BlockOp::AttnPrepRows {
                 proj,
                 q,

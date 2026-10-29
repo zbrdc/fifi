@@ -254,22 +254,23 @@ fn rejects_malformed_policy_arrays_and_non_integer_token_ids() {
 }
 
 #[test]
-#[cfg(not(all(feature = "native-mlx", target_os = "macos", target_arch = "aarch64")))]
-fn flint_prefix_reuse_opt_in_is_constant_false_off_the_mlx_target() {
-    // Opus r1 SF-4: the snapshot store exists only on the MLX Mac target;
-    // on every other build (CUDA servers, host test binaries) the env +
-    // file flags must not arm a save that is a no-op. This test only
-    // compiles where that must hold, so the day the cfg gate is deleted
-    // The off-target half of the SF-4 pair (the policy lives in the
-    // mlx_prefix_tests module doc): the cfg-false body, plus an isolated
-    // CHILD run with the env actually set - the dangerous case - in the
-    // self-spawn shape of mlx_batch_profile_native.rs.
+#[cfg(not(any(
+    all(feature = "native-mlx", target_os = "macos", target_arch = "aarch64"),
+    all(feature = "native-cuda", target_os = "linux")
+)))]
+fn flint_prefix_reuse_opt_in_is_constant_false_off_the_store_targets() {
+    // The snapshot store exists on the MLX Mac target and on the native-CUDA Linux
+    // target; on every other build (plain host binaries, other servers) the env +
+    // file flags must not arm a save that is a no-op. This test only compiles where
+    // that must hold, so the host test binary carries the check. The dangerous case
+    // (the env set on an unsupported target) is the isolated child test spawned
+    // below, in the self-spawn shape of mlx_batch_profile_native.rs.
     assert!(!super::prefix_reuse_opt_in());
     let binary = std::env::current_exe().expect("test binary");
     let output = std::process::Command::new(&binary)
         .args([
             "--exact",
-            "family::flint::tests::flint_prefix_reuse_child_env_set_stays_off_mlx",
+            "family::flint::tests::flint_prefix_reuse_child_env_set",
             "--test-threads",
             "1",
         ])
@@ -277,8 +278,8 @@ fn flint_prefix_reuse_opt_in_is_constant_false_off_the_mlx_target() {
         .output()
         .expect("spawn the isolated child test");
     let stdout = String::from_utf8_lossy(&output.stdout);
-    // Opus wave-2 SF-3: exit status alone passes when --exact matches zero
-    // tests, so the child must PROVE it ran exactly one test.
+    // Exit status alone passes when --exact matches zero tests, so the
+    // child must PROVE it ran exactly one test.
     assert!(
         output.status.success() && stdout.contains("1 passed"),
         "the child must run exactly one test with the env set and pass it (status {:?})",
@@ -287,7 +288,7 @@ fn flint_prefix_reuse_opt_in_is_constant_false_off_the_mlx_target() {
 }
 
 /// The retention-cap arithmetic is pure so the host suite pins it,
-/// including the too-small-headroom refusal A's wave-2 ruling requires.
+/// including the too-small-headroom refusal.
 #[test]
 fn flint_prefix_retention_cap_math_admits_and_fails_closed() {
     use super::{
@@ -317,8 +318,8 @@ fn flint_prefix_retention_cap_math_admits_and_fails_closed() {
         !retention_admitted(1 << 30, cap, cap),
         "retained overlap refuses"
     );
-    // The faked too-small headroom (A ruling item 3): a 2 GiB cap cannot
-    // admit a snapshot whose COW doubles past it.
+    // The faked too-small headroom: a 2 GiB cap cannot admit a snapshot
+    // whose COW doubles past it.
     assert!(!retention_admitted((1 << 30) + 1, 0, 2 << 30));
 
     // Strict env parse: absent derives, unparsable or non-UTF-8 errs.
@@ -339,9 +340,9 @@ fn flint_prefix_retention_cap_math_admits_and_fails_closed() {
     }
 }
 
-/// Opus wave-2 MF-1, the host half: the cap derivation is INERT unless
-/// the reuse opt-in is armed - a default-OFF engine loads unchanged with
-/// a garbage budget env, no PATH, and no physical-memory probe.
+/// The host half: the cap derivation is INERT unless the reuse opt-in is
+/// armed - a default-OFF engine loads unchanged with a garbage budget
+/// env, no PATH, and no physical-memory probe.
 #[test]
 fn flint_prefix_cap_is_inert_when_the_opt_in_is_off() {
     use super::retention_cap_for;
@@ -387,7 +388,7 @@ fn flint_prefix_cap_is_inert_when_the_opt_in_is_off() {
         .is_err()
     );
     // An explicit zero budget would refuse every save while prefill still
-    // splits: rejected at startup, naming the var (Sol wave-3 SF-1).
+    // splits: rejected at startup, naming the var.
     let zero = retention_cap_for(true, Some(std::ffi::OsStr::new("0")), || None, || Ok(0));
     let Err(text) = zero else {
         panic!("an explicit zero budget must be a startup error");
@@ -402,26 +403,86 @@ fn flint_prefix_cap_is_inert_when_the_opt_in_is_off() {
     assert!(retention_cap_for(true, None, || Some(8 << 30), || Ok(4 << 30)).is_err());
 }
 
-/// The child half of the SF-4 coverage: a FRESH process with
-/// FIFI_FLINT_PREFIX_REUSE=1, spawned by
-/// [`flint_prefix_reuse_opt_in_is_constant_false_off_the_mlx_target`]. A
-/// plain suite run (no env) returns at the guard; only the parent-driven
-/// run makes the assertion load-bearing.
+/// The native-CUDA arm of the same coverage: the env
+/// opt-in must ARM on the store target, in a fresh process, so the
+/// OnceLock freeze cannot be shadowed by a stale parent value.
 #[test]
-fn flint_prefix_reuse_child_env_set_stays_off_mlx() {
+#[cfg(all(feature = "native-cuda", target_os = "linux"))]
+fn flint_prefix_reuse_opt_in_arms_on_native_cuda() {
+    let binary = std::env::current_exe().expect("test binary");
+    let output = std::process::Command::new(&binary)
+        .args([
+            "--exact",
+            "family::flint::tests::flint_prefix_reuse_child_env_set",
+            "--test-threads",
+            "1",
+        ])
+        .env("FIFI_FLINT_PREFIX_REUSE", "1")
+        .output()
+        .expect("spawn the isolated child test");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        output.status.success() && stdout.contains("1 passed"),
+        "with FIFI_FLINT_PREFIX_REUSE=1 exported the CUDA opt-in must arm and run exactly one test (status {:?})",
+        output.status.code()
+    );
+}
+
+/// The native-MLX arm of the same coverage: the env opt-in must ARM on
+/// the Mac store target too, in a fresh process, so the OnceLock freeze
+/// cannot be shadowed by a stale parent value there either.
+#[test]
+#[cfg(all(feature = "native-mlx", target_os = "macos", target_arch = "aarch64"))]
+fn flint_prefix_reuse_opt_in_arms_on_native_mlx() {
+    let binary = std::env::current_exe().expect("test binary");
+    let output = std::process::Command::new(&binary)
+        .args([
+            "--exact",
+            "family::flint::tests::flint_prefix_reuse_child_env_set",
+            "--test-threads",
+            "1",
+        ])
+        .env("FIFI_FLINT_PREFIX_REUSE", "1")
+        .output()
+        .expect("spawn the isolated child test");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        output.status.success() && stdout.contains("1 passed"),
+        "with FIFI_FLINT_PREFIX_REUSE=1 exported the MLX opt-in must arm and run exactly one test (status {:?})",
+        output.status.code()
+    );
+}
+
+/// The child half of the coverage: a FRESH process with
+/// FIFI_FLINT_PREFIX_REUSE=1, spawned by the parents above. A plain suite
+/// run (no env) returns at the guard; only the parent-driven run makes
+/// the assertion load-bearing.
+#[test]
+fn flint_prefix_reuse_child_env_set() {
     if std::env::var("FIFI_FLINT_PREFIX_REUSE").as_deref() != Ok("1") {
         return;
     }
-    #[cfg(not(all(feature = "native-mlx", target_os = "macos", target_arch = "aarch64")))]
+    #[cfg(not(any(
+        all(feature = "native-mlx", target_os = "macos", target_arch = "aarch64"),
+        all(feature = "native-cuda", target_os = "linux")
+    )))]
     {
-        // The cfg-false body must IGNORE the env (Sol wave-1 SF-4: this is
-        // exactly the dangerous enabled-variable case).
+        // The cfg-false body must IGNORE the env (this is exactly the
+        // dangerous enabled-variable case).
         assert!(!super::prefix_reuse_opt_in());
+    }
+    #[cfg(all(feature = "native-cuda", target_os = "linux"))]
+    {
+        // On the CUDA store target the env legitimately arms the opt-in:
+        // the arming case must be proven, not assumed.
+        assert!(super::prefix_reuse_opt_in());
     }
     #[cfg(all(feature = "native-mlx", target_os = "macos", target_arch = "aarch64"))]
     {
-        // On the MLX target the env legitimately arms the opt-in; the
-        // dangerous case is off-target builds, covered by the parent.
+        // On the MLX store target the env must arm the opt-in the same way:
+        // both store backends share the selector, so the positive case is
+        // load-bearing here too (run via the Mac parent-driven suite).
+        assert!(super::prefix_reuse_opt_in());
     }
 }
 

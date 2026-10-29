@@ -1,4 +1,4 @@
-/* RD-5: the device router, per-kernel header (native/resident/router.h). Included by router.cu
+/* The device router, per-kernel header (native/resident/router.h). Included by router.cu
  * and by the Rust FFI mirror's reader; nothing else. x is the f32 normalized row [m][hidden] (the
  * norm_out of the add+RMSNorm kernel), w the router weight f32 [n_expert][hidden] (expert-major,
  * 16-byte aligned), w_shared the shared-expert gate f32 [hidden], or NULL together with

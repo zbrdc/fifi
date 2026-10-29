@@ -1,7 +1,6 @@
 /*
- * TCAP C2: the tiered classification of one layer (decision 0047, amendment of the TCAP design). Semantics: see
- * tiered_classify.h; the host oracle is family/qwen36/tiered/classify.rs. Original CUDA C; design from
- * ledger/plans/TCAP-DESIGN.md section 3.2.
+ * The tiered classification of one layer. Semantics: see tiered_classify.h; the host oracle is
+ * family/qwen36/tiered/classify.rs. Original CUDA C.
  *
  * One block, 256 threads. Thread 0 does the classification (top_k <= 8 picks, a handful of integer compares, in pick
  * order, so the result cannot depend on scheduling) into registers and shared memory; the block then copies the normed

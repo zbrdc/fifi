@@ -1,9 +1,9 @@
 //! The speculation-verification shape of the grouped launch: M = 2, 5 and 8 rows (decode with a
-//! draft of 1-8 tokens verified per step; lane C's M1 requirement). At this edge each expert gets
-//! 0, 1 or a few rows and most of the 256 experts of the resident bank none, so the tests run the
-//! whole path (guard, builder, typed scatter or gather quantize, grouped launch) at M = 2, 5 and 8
-//! against the f64 reference under the frozen bounds, the HARD GATE first, with several experts
-//! empty in every case:
+//! draft of 1-8 tokens verified per step). At this edge each expert gets 0, 1 or a few rows and
+//! most of the 256 experts of the resident bank none, so the tests run the whole path (guard,
+//! builder, typed scatter or gather quantize, grouped launch) at M = 2, 5 and 8 against the f64
+//! reference under the frozen bounds, the HARD GATE first, with several experts empty in every
+//! case:
 //!
 //! - the toy shape (4 experts of 128 rows, K 512, two ids per token, one expert empty and one
 //!   or two with a single row),
@@ -32,7 +32,7 @@ use crate::kernels::cuda::resident::matvec_q::QuantType;
 use crate::kernels::cuda::testkit;
 use crate::kernels::cuda::{CudaContext, DeviceBuffer, DeviceStream};
 
-/// The frozen NMSE bounds of the gate/up and down classes (0049 A2).
+/// The frozen NMSE bounds of the gate/up and down classes.
 const GATE_UP_NMSE: f64 = 1e-3;
 const DOWN_NMSE: f64 = 2e-3;
 /// Timed launches per pass.

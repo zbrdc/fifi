@@ -1,8 +1,8 @@
-//! Seam-1 determinism of the expert shapes of one Qwen3.6-35B-A3B decode step (decision 0047
-//! item 7, packet RD-2e): `pack` once, then `matmul_expert` for the 8 selected slots, at m = 1,
-//! 1,000 repeats per shape, every repeat byte-identical to the first. The weights are synthetic
-//! blocks of the real type and shape (`testkit::upload_weight`); the activations are normal
-//! values, not the small integers of `testkit::input`, which make every fp32 sum exact.
+//! Seam-1 determinism of the expert shapes of one Qwen3.6-35B-A3B decode step: `pack` once, then
+//! `matmul_expert` for the 8 selected slots, at m = 1, 1,000 repeats per shape, every repeat
+//! byte-identical to the first. The weights are synthetic blocks of the real type and shape
+//! (`testkit::upload_weight`); the activations are normal values, not the small integers of
+//! `testkit::input`, which make every fp32 sum exact.
 //!
 //! The tests assume `--test-threads=1`.
 
@@ -25,7 +25,8 @@ struct Shape {
     k: usize,
 }
 
-/// E1 (`ffn_gate_exps`, `ffn_up_exps`) and E2 (`ffn_down_exps`) of the packet.
+/// The gate/up expert shape (`ffn_gate_exps`, `ffn_up_exps`) and the down expert shape
+/// (`ffn_down_exps`).
 const SHAPES: [Shape; 2] = [
     Shape {
         name: "expert_gate_up",

@@ -1,6 +1,6 @@
-//! Tests of the dense MMQ entry (CPF-V4 G2, seam 1). Host rows: the pure rule pins and the
-//! refusal tables (one case per guard, each passing every earlier check so it reaches its
-//! own tag, the sisters' rule), the size pins; device rows follow below.
+//! Tests of the dense MMQ entry. Host rows: the pure rule pins and the refusal tables (one case
+//! per guard, each passing every earlier check so it reaches its own tag, the sisters' rule),
+//! the size pins; device rows follow below.
 
 use super::{DenseNeeds, MmqDenseCall, MmqDenseInputCall, check_dense_rules, dense_needs};
 use crate::EngError;
@@ -54,9 +54,9 @@ fn mmq_dense_refuses_a_type_without_a_case_by_tag() {
 
 #[test]
 fn mmq_dense_refuses_the_k_grid_by_tag() {
-    // Rev 3's K-grid rule (MSG-85 M2): K = 384 is a multiple of 128 and of every flat qk
-    // but not of 256; it must reach THIS tag for every type, Q4_K and Q6_K included, and
-    // before the k extent rule (33,000 is off the grid AND above the extent).
+    // The K-grid rule: K = 384 is a multiple of 128 and of every flat qk but not of 256; it
+    // must reach THIS tag for every type, Q4_K and Q6_K included, and before the k extent rule
+    // (33,000 is off the grid AND above the extent).
     for ty in [QuantType::Q80, QuantType::Q4K, QuantType::Q6K] {
         for k in [384usize, 260, 130, 33_000] {
             let text = refusal(check_dense_rules(ty, k, 512, 8, 512, 0));
@@ -79,8 +79,8 @@ fn mmq_dense_refuses_the_k_extent_by_tag() {
 
 #[test]
 fn mmq_dense_pins_the_chunk_cap() {
-    // G1's domain is 1..=2,048 columns; raising the chunk cap without extending it must
-    // fail here (plan section B.3, finding 22).
+    // The sizing domain of `mmq_size` is 1..=2,048 columns; raising the chunk cap without
+    // extending it must fail here.
     assert_eq!(NCOLS_LIMIT, 2048);
     for m in [0usize, 2049, 4096] {
         let text = refusal(check_dense_rules(QuantType::Q80, 2048, 512, m, 512, 0));
@@ -158,16 +158,16 @@ fn mmq_dense_refuses_a_row_count_above_i32_by_tag() {
 
 #[test]
 fn mmq_dense_refuses_a_destination_reach_beyond_i32_by_tag() {
-    // Verdict M-1: the vendored kernels index the destination in 32-bit int, so the last
-    // element, at (m - 1) * ld + n - 1, must stay below 2^31. M = 2,048, ld = 2^20 and
-    // n = 2^20 - 1 reach exactly i32::MAX; one more row wraps. Everything before the rule
-    // passes (the grid is 16.8 M), so only the reach can refuse.
+    // The vendored kernels index the destination in 32-bit int, so the last element, at
+    // (m - 1) * ld + n - 1, must stay below 2^31. M = 2,048, ld = 2^20 and n = 2^20 - 1 reach
+    // exactly i32::MAX; one more row wraps. Everything before the rule passes (the grid is
+    // 16.8 M), so only the reach can refuse.
     let at = |m: usize, n: usize, ld: usize| check_dense_rules(QuantType::Q80, 256, n, m, ld, 0);
     at(2048, (1 << 20) - 1, 1 << 20).expect("a reach of exactly i32::MAX");
     let text = refusal(at(2048, 1 << 20, 1 << 20));
     assert!(text.contains("mmq_dense: dst reach"), "{text}");
-    // The verdict's example, which every other rule accepted before: 1,920 * 1,118,482
-    // wraps in the last column tile.
+    // An example that every other rule accepts: 1,920 * 1,118,482 wraps in the last column
+    // tile.
     let text = refusal(at(2048, 128, 1_118_482));
     assert!(text.contains("mmq_dense: dst reach"), "{text}");
     // One column never reaches past n, however wide the stride is.
@@ -176,7 +176,7 @@ fn mmq_dense_refuses_a_destination_reach_beyond_i32_by_tag() {
 
 #[test]
 fn mmq_dense_needs_pin_the_three_ranges() {
-    // Weight blocks, the q8_1 columns with G1's constant pad, the destination reach.
+    // Weight blocks, the q8_1 columns with the constant pad, the destination reach.
     let need = dense_needs(QuantType::Q80, 2048, 8192, 512, 8192, 0).expect("needs");
     assert_eq!(
         need,
@@ -200,7 +200,7 @@ fn mmq_dense_needs_pin_the_three_ranges() {
 #[test]
 fn mmq_dense_needs_refuse_zero_columns_without_panicking() {
     // `dense_needs` is `pub(crate)`: a caller that skipped the rules and passed m = 0 gets a
-    // typed refusal, not a debug panic or a wrapped reach (verdict n-4).
+    // typed refusal, not a debug panic or a wrapped reach.
     let error = dense_needs(QuantType::Q80, 2048, 512, 0, 512, 0).expect_err("no columns");
     assert!(
         format!("{error:?}").contains("mmq_dense: size overflow"),
@@ -220,9 +220,9 @@ fn mmq_dense_needs_refuse_overflow_by_tag() {
 
 #[test]
 fn mmq_fixup_bytes_follow_the_device_sm_count() {
-    // G4's facts binding owns the cc / nsm / smpbo device test; this row pins what G2 builds
-    // on it: the fixup range an arena allocates is G1's `nsm * 128 * 128` floats for the SM
-    // count the device reports, never a literal.
+    // The facts binding owns the cc / nsm / smpbo device test; this row pins what the dense
+    // wrapper builds on it: the fixup range an arena allocates is `nsm * 128 * 128` floats
+    // for the SM count the device reports, never a literal.
     const NAME: &str = "mmq_fixup_bytes_follow_the_device_sm_count";
     if !testkit::device_present(NAME) {
         return;
@@ -319,9 +319,9 @@ struct Refusals {
 
 #[test]
 fn mmq_dense_wrapper_refuses_bad_ranges_by_tag_and_changes_nothing() {
-    // The B1 row of plan section B.5 item 8 (a q8_1 range one byte short of `q8_1_bytes`
-    // with the constant pad) and the other range guards of the wrapper, each case a valid
-    // control with exactly one range changed so it reaches its own guard.
+    // The pad row (a q8_1 range one byte short of `q8_1_bytes` with the constant pad) and the
+    // other range guards of the wrapper, each case a valid control with exactly one range
+    // changed so it reaches its own guard.
     const NAME: &str = "mmq_dense_wrapper_refuses_bad_ranges_by_tag_and_changes_nothing";
     if !testkit::device_present(NAME) {
         return;
@@ -461,9 +461,9 @@ fn weight_bytes(ty: QuantType, n: usize, k: usize, seed: u64) -> Vec<u8> {
 
 // ---- the dense GEMM rows (Q8X, the fused slice, determinism) --------------------------------
 
-/// The frozen Q8X bound for dense Q8_0 (0049 A2): per-case energy-weighted NMSE, the sum of
-/// squared errors over the sum of squared references. Measured worst on real activations:
-/// 3.15e-4 over 2,340 cases (CPF-M1b section 9).
+/// The frozen Q8X bound for dense Q8_0: per-case energy-weighted NMSE, the sum of squared
+/// errors over the sum of squared references. Measured worst on real activations: 3.15e-4
+/// over 2,340 cases.
 const Q8X_DENSE_Q80: f64 = 5e-4;
 /// Bytes past every output range, poisoned the same way.
 const CANARY: usize = 64;
@@ -740,9 +740,9 @@ fn dense(name: &'static str, ty: QuantType, shape: (usize, usize, usize)) -> Cas
 
 #[test]
 fn mmq_dense_q8x_matches_the_f64_reference_per_class() {
-    // Plan section B.5 item 1 at the real Qwen dense shapes (K x N, M columns): the six
-    // Q8_0 classes of A.4. Every case is stream-k or tiling by its own shape; the 2048x32
-    // class has fallback on (32 % 128), the others off.
+    // The Q8X rows at the real Qwen dense shapes (K x N, M columns): the six Q8_0 classes.
+    // Every case is stream-k or tiling by its own shape; the 2048x32 class has fallback on
+    // (32 % 128), the others off.
     const NAME: &str = "mmq_dense_q8x_matches_the_f64_reference_per_class";
     if !testkit::device_present(NAME) {
         return;
@@ -786,8 +786,8 @@ fn mmq_dense_q8x_matches_the_f64_reference_per_class() {
 
 #[test]
 fn mmq_dense_k_quant_rows_are_gated_for_finiteness_and_reported() {
-    // Q6_K and Q4_K have no frozen dense bound (plan section A.4 item 3: report-only);
-    // the hard gate still applies to every value.
+    // Q6_K and Q4_K have no frozen dense bound (report-only); the hard gate still applies to
+    // every value.
     const NAME: &str = "mmq_dense_k_quant_rows_are_gated_for_finiteness_and_reported";
     if !testkit::device_present(NAME) {
         return;
@@ -827,7 +827,7 @@ fn mmq_dense_writes_only_its_slice_of_a_fused_destination_deterministically() {
     // A GEMM writes its slice of a fused [m][ld] destination (`dst = base + col_off`,
     // `nrows_dst = ld`): the bytes outside the slice stay poison, the slice meets the
     // frozen Q8X bound, and the same inputs twice give the same bytes (the stream-k
-    // decomposition is a function of shape and SM count only; plan section B.5 item 6).
+    // decomposition is a function of shape and SM count only).
     const NAME: &str = "mmq_dense_writes_only_its_slice_of_a_fused_destination_deterministically";
     if !testkit::device_present(NAME) {
         return;
@@ -893,8 +893,8 @@ struct Facts {
     nsm: usize,
 }
 
-/// The launch's tile plan for a dense call, from the G1 replica and the vendored rules
-/// (mmq.cuh:1396-1408): the tile width, the tile count, and whether the launch runs the
+/// The launch's tile plan for a dense call, from the `mmq_size` J replica and the vendored
+/// rules (mmq.cuh:1396-1408): the tile width, the tile count, and whether the launch runs the
 /// tiling kernel (efficiency >= 90 %) or stream-k with a fixup.
 #[derive(Debug, PartialEq, Eq)]
 struct Plan {
@@ -925,7 +925,7 @@ fn plan_of(case: &Case, facts: Facts) -> Plan {
     }
 }
 
-/// The device facts of `ctx` through G4's per-context method (read once, then cached); the
+/// The device facts of `ctx` through the per-context facts method (read once, then cached); the
 /// one place the tests ask for them.
 fn facts_of(ctx: &CudaContext) -> Result<Facts, EngError> {
     let facts = ctx.mmq_device_facts()?;
@@ -986,12 +986,12 @@ fn permuted_phase(input: &CaseInput, perms: &[Vec<usize>]) -> Result<(Vec<Run>, 
 
 #[test]
 fn mmq_dense_rows_are_invariant_within_a_tile_and_across_tiles_in_tiling_mode() {
-    // Plan section B.5 item 3 (PG1b), scope of rev 3 (MSG-85 M3): bit-exact per FIXED tile
-    // configuration, where the configuration includes the stream-k decomposition. A dense
-    // stream-k shape permutes only inside a J-tile; a tiling-mode shape (efficiency >= 90 %,
-    // no fixup) permutes across tile boundaries too. Both runs of a pair have the same M, so
-    // they are one configuration. The stream-k shape's cross-tile permutation is reported,
-    // not graded: the split tile's sum is a different addition order (mmq.cuh:1246, :1290).
+    // Bit-exact per FIXED tile configuration, where the configuration includes the stream-k
+    // decomposition. A dense stream-k shape permutes only inside a J-tile; a tiling-mode shape
+    // (efficiency >= 90 %, no fixup) permutes across tile boundaries too. Both runs of a pair
+    // have the same M, so they are one configuration. The stream-k shape's cross-tile
+    // permutation is reported, not graded: the split tile's sum is a different addition order
+    // (mmq.cuh:1246, :1290).
     const NAME: &str = "mmq_dense_rows_are_invariant_within_a_tile_and_across_tiles_in_tiling_mode";
     if !testkit::device_present(NAME) {
         return;
@@ -1016,10 +1016,7 @@ fn mmq_dense_rows_are_invariant_within_a_tile_and_across_tiles_in_tiling_mode() 
     let sk_plan = plan_of(&stream_k.case, facts);
     let tl_plan = plan_of(&tiling.case, facts);
     println!("PG1b stream-k plan {sk_plan:?}, tiling plan {tl_plan:?}");
-    assert_eq!(
-        sk_plan.j, 80,
-        "M = 130 picks J = 80 (strict <, plan section B.3)"
-    );
+    assert_eq!(sk_plan.j, 80, "M = 130 picks J = 80 (strict <)");
     assert!(
         sk_plan.fixup && !sk_plan.tiling,
         "the stream-k row must run the fixup"
@@ -1130,13 +1127,12 @@ fn coupling_phase(
 
 #[test]
 fn mmq_dense_fixup_range_follows_the_tile_width_the_launch_picks() {
-    // Plan section B.0 (c) and B.5 item 7: at ncols_opt = 24 with fallback on (N = 32) the
-    // replica's tile width is 32 while rev 2's upper bound J_ub is 24. A launch whose fixup
-    // range is sized for exactly the replica's J succeeds, and the same launch sized for
-    // J_ub is refused before any kernel is enqueued: by the C entry's own fixup rule, an
-    // invalid argument (status -1), since lane C's ruling on MSG-85 B2; the vendored require
-    // (mmq.cuh:1409, cudaErrorInvalidValue) is the backstop behind it. If the replica and
-    // the tree ever disagree, one of the two halves fails (mutant V8 sizes the first half
+    // At ncols_opt = 24 with fallback on (N = 32) the replica's tile width is 32 while the
+    // earlier upper bound J_ub is 24. A launch whose fixup range is sized for exactly the
+    // replica's J succeeds, and the same launch sized for J_ub is refused before any kernel is
+    // enqueued: by the C entry's own fixup rule, an invalid argument (status -1); the vendored
+    // require (mmq.cuh:1409, cudaErrorInvalidValue) is the backstop behind it. If the replica
+    // and the tree ever disagree, one of the two halves fails (mutant V8 sizes the first half
     // with J_ub).
     const NAME: &str = "mmq_dense_fixup_range_follows_the_tile_width_the_launch_picks";
     if !testkit::device_present(NAME) {
@@ -1261,15 +1257,15 @@ fn raw_fixup_phase(input: &CaseInput) -> Result<(Facts, RawFixup), EngError> {
 
 #[test]
 fn mmq_dense_c_entry_refuses_a_fixup_range_short_of_the_launch_need() {
-    // Lane C's ruling on MSG-85 B2: the C ABI is a boundary of its own, so the C entry sizes
-    // the stream-k fixup range itself, for the nsm it reads, and does not leave the refusal
-    // to the vendored require behind it. This row bypasses the Rust wrapper entirely (no
-    // floor, no call struct): it goes through the FFI child's `mmq_dense_launch`. At N = 32,
-    // M = 24, K = 2048 the launch runs one tile on `nsm` stream-k blocks with J = 32, so its
-    // need is `nsm * 32 * 128` floats. That exact size and the device maximum launch and give
-    // the same bytes; 16 bytes less is refused as an invalid argument (status -1, operation
-    // "cuda adapter"), where the vendored require alone would answer cudaErrorInvalidValue
-    // (status 1, operation "cuda launch"), so the status tells the two layers apart.
+    // The C ABI is a boundary of its own, so the C entry sizes the stream-k fixup range itself,
+    // for the nsm it reads, and does not leave the refusal to the vendored require behind it.
+    // This row bypasses the Rust wrapper entirely (no floor, no call struct): it goes through
+    // the FFI child's `mmq_dense_launch`. At N = 32, M = 24, K = 2048 the launch runs one tile
+    // on `nsm` stream-k blocks with J = 32, so its need is `nsm * 32 * 128` floats. That exact
+    // size and the device maximum launch and give the same bytes; 16 bytes less is refused as
+    // an invalid argument (status -1, operation "cuda adapter"), where the vendored require
+    // alone would answer cudaErrorInvalidValue (status 1, operation "cuda launch"), so the
+    // status tells the two layers apart.
     const NAME: &str = "mmq_dense_c_entry_refuses_a_fixup_range_short_of_the_launch_need";
     if !testkit::device_present(NAME) {
         return;
@@ -1325,11 +1321,10 @@ struct InputPaths {
 
 #[test]
 fn mmq_dense_input_quantizes_in_the_layout_of_the_weight() {
-    // The family-facing input path derives the q8_1 scale layout (D4 for Q8_0 and Q6_K, DS4
-    // for Q4_K) from the consuming weight: its bytes equal a direct G4 quantize with that
-    // weight's type, the layouts share their codes and differ in their scale words, Q6_K
-    // gives Q8_0's bytes, and a Q5_0 weight, which has no dense case, is refused by the dense
-    // tag.
+    // The family-facing input path derives the q8_1 scale layout (D4 for Q8_0 and Q6_K, DS4 for
+    // Q4_K) from the consuming weight: its bytes equal a direct `mmq_quantize` with that
+    // weight's type, the layouts share their codes and differ in their scale words, Q6_K gives
+    // Q8_0's bytes, and a Q5_0 weight, which has no dense case, is refused by the dense tag.
     const NAME: &str = "mmq_dense_input_quantizes_in_the_layout_of_the_weight";
     if !testkit::device_present(NAME) {
         return;
@@ -1448,10 +1443,10 @@ fn mmq_dense_input_quantizes_in_the_layout_of_the_weight() {
 
 #[test]
 fn mmq_dense_memcheck_shapes_run_inside_their_buffers() {
-    // Plan section B.5 item 4 for the dense entry: ncols_opt in {1, 5, 7, 9, 13, 14} at
-    // fallback off, {17, 18, 19} and 24 at fallback on, 130 (J = 80), plus one stream-k
-    // fixup shape. The q8_1 range is an exact-size allocation, so `compute-sanitizer
-    // --tool memcheck` sees every read past `q8_1_bytes`; the gate checks the canaries.
+    // The memcheck shapes of the dense entry: ncols_opt in {1, 5, 7, 9, 13, 14} at fallback
+    // off, {17, 18, 19} and 24 at fallback on, 130 (J = 80), plus one stream-k fixup shape. The
+    // q8_1 range is an exact-size allocation, so `compute-sanitizer --tool memcheck` sees every
+    // read past `q8_1_bytes`; the gate checks the canaries.
     const NAME: &str = "mmq_dense_memcheck_shapes_run_inside_their_buffers";
     if !testkit::device_present(NAME) {
         return;
@@ -1493,8 +1488,8 @@ fn mmq_dense_memcheck_shapes_run_inside_their_buffers() {
 
 // ---- speed rows (reported, never gated) -----------------------------------------------------
 
-/// The dense Q8_0 shapes of one 40-layer pass with their counts (CPF-M1a section 3: 30
-/// DeltaNet and 10 attention layers, the shared expert in all 40): `(name, k, n, count)`.
+/// The dense Q8_0 shapes of one 40-layer pass with their counts (30 DeltaNet and 10 attention
+/// layers, the shared expert in all 40): `(name, k, n, count)`.
 const SPEED_SHAPES: [(&str, usize, usize, usize); 9] = [
     ("attn_qkv", 2048, 8192, 30),
     ("attn_gate", 2048, 4096, 30),
@@ -1508,8 +1503,8 @@ const SPEED_SHAPES: [(&str, usize, usize, usize); 9] = [
 ];
 /// Launches per timed loop, after the warm-up.
 const SPEED_REPS: usize = 20;
-/// The shape whose output gets an NMSE spot-check in the speed process (verdict n-9; the
-/// reference of the others would cost minutes): the same entry and binary the Q8X rows grade.
+/// The shape whose output gets an NMSE spot-check in the speed process (the reference of the
+/// others would cost minutes): the same entry and binary the Q8X rows grade.
 const SPOT_SHAPE: &str = "ssm_alpha_beta";
 /// The seed of the speed rows' activations.
 const SPEED_SEED: u64 = 0x6457_0001;
@@ -1612,14 +1607,14 @@ fn timing_phase(ms: &[usize]) -> Result<Vec<Timing>, EngError> {
 
 #[test]
 fn mmq_dense_speed_rows_report() {
-    // Plan section B.7 speed rows, reported not gated and UNPAIRED: the dense Q8_0 GEMMs of
-    // one 40-layer pass at M = 512 / 1,024 / 2,048, printed beside CPF-M1a's constants
-    // 26.39 / 41.78 / 72.73 ms. Those are another day's median of synced single launches on
-    // a pinned ggml build; these are the mean of 20 back-to-back launches in this hold, so
-    // neither "close to" nor "slower than" stock follows. The paired row comes with the
-    // CPF-7c probe. Meaningful in the release profile only: the debug profile compiles the
-    // kernels with -G. The hard gate applies to every run, and the alpha/beta output of
-    // each M gets an NMSE spot-check against the frozen bound.
+    // Speed rows, reported not gated and UNPAIRED: the dense Q8_0 GEMMs of one 40-layer pass at
+    // M = 512 / 1,024 / 2,048, printed beside the stock constants 26.39 / 41.78 / 72.73 ms.
+    // Those are another day's median of synced single launches on a pinned ggml build; these
+    // are the mean of 20 back-to-back launches in this run, so neither "close to" nor "slower
+    // than" stock follows. A paired comparison needs a separate probe. Meaningful in the
+    // release profile only: the debug profile compiles the kernels with -G. The hard gate
+    // applies to every run, and the alpha/beta output of each M gets an NMSE spot-check against
+    // the frozen bound.
     const NAME: &str = "mmq_dense_speed_rows_report";
     if !testkit::device_present(NAME) {
         return;
@@ -1656,9 +1651,9 @@ fn mmq_dense_speed_rows_report() {
                 / 1e3
         };
         println!(
-            "DENSE_TOTAL M={m} (unpaired with the CPF-M1a constant, reported only): gemm only \
-             {:.2} ms, quantize+gemm {:.2} ms (CPF-M1a stock {anchor} ms; llama.cpp 1K dense \
-             bucket 42.5 ms, design section 2)",
+            "DENSE_TOTAL M={m} (unpaired with the stock constant, reported only): gemm only \
+             {:.2} ms, quantize+gemm {:.2} ms (stock {anchor} ms; llama.cpp 1K dense \
+             bucket 42.5 ms)",
             sum(|r| r.gemm_us),
             sum(|r| r.both_us)
         );
@@ -1686,11 +1681,10 @@ fn mmq_dense_speed_rows_report() {
     }
 }
 
-/// The seam identity the GDN prefill fusion rests on (2026-10-27 divergence): four
-/// SEGMENTED launches over one wide upload must be bitwise the four separate-weight
-/// launches, because the vendored MMQ schedules stream-k from (n, m, k) - only
-/// same-shape launches share a schedule. Also records (no assert: a coinciding schedule
-/// is legal) whether the ONE wide launch differs from the four.
+/// The identity the GDN prefill fusion rests on: four SEGMENTED launches over one wide upload
+/// must be bitwise the four separate-weight launches, because the vendored MMQ schedules
+/// stream-k from (n, m, k) - only same-shape launches share a schedule. Also records (no
+/// assert: a coinciding schedule is legal) whether the ONE wide launch differs from the four.
 #[test]
 fn mmq_dense_segments_over_one_upload_match_separate_weights_bitwise() {
     const NAME: &str = "mmq_dense_segments_over_one_upload_match_separate_weights_bitwise";

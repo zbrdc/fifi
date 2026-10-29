@@ -1,10 +1,10 @@
 //! Raw FFI to the device router entry `inference_cuda_router_launch` of
 //! `native/resident/router.cu` (declared in `native/resident/router.h`). Child module of
-//! `native::resident`, so it inherits the `allow(unsafe_code)` of `native.rs` (decision 0047).
+//! `native::resident`, so it inherits the `allow(unsafe_code)` of `native.rs`.
 //!
 //! Safety invariants this file relies on:
 //! - The launch entry is called only through `CudaContext::launch_on`, on the thread that owns the
-//!   context and under the dispatch guard (decisions 0023 and 0024).
+//!   context and under the dispatch guard.
 //! - Every range is a `RawRange`, which `RawRange::new` proved inside its live allocation.
 //! - Sizes, alignment and disjointness are proved again here with `super::Span` before the call,
 //!   so a bad call is refused with `invalid_argument` and never reaches the device.

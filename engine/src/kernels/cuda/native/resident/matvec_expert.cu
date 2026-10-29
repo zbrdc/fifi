@@ -1,8 +1,8 @@
 /*
- * Entries of the vendored MMVQ expert matvec (MATVEC-PAR S1 c3c) on an explicit stream. Glue
- * only: it fills the ids view of a fifi_mmvq_args (ncols_dst 1, nchannels_dst n_used, the id
- * range nchannels_x n_expert) and validates before any launch; C linkage, C types only,
- * try/catch around the body, like the projector adapter.
+ * Entries of the vendored MMVQ expert matvec on an explicit stream. Glue only: it fills the ids
+ * view of a fifi_mmvq_args (ncols_dst 1, nchannels_dst n_used, the id range nchannels_x n_expert)
+ * and validates before any launch; C linkage, C types only, try/catch around the body, like the
+ * projector adapter.
  */
 #include <cuda_runtime.h>
 
@@ -30,8 +30,7 @@ const int64_t kMatrixRowPadding = 512;
 /* The kernel loads the weight rows of one block as a group (rows_per_block: 1, 2, or up to 4 for
  * the small-k launch) and never receives nrows, so a matrix whose row count is not a multiple of
  * the group is read up to 3 rows past its end; the wrappers prove only rows x row_bytes. Limitation
- * until a guarded kernel exists (note for S3): rows must be a multiple of this, as every Qwen3.6
- * shape is. KUBDAN-MSG-64 item 4. */
+ * until a guarded kernel exists: rows must be a multiple of this, as every Qwen3.6 shape is. */
 const int kRowsGroup = 4;
 
 bool aligned(const void *p, size_t alignment) { return (uintptr_t)p % alignment == 0; }
@@ -45,7 +44,7 @@ bool mmvq_type(int type) {
            type == INFERENCE_CUDA_TYPE_Q6_K || type == INFERENCE_CUDA_TYPE_Q8_0;
 }
 
-/* The fifi_device_facts the V-MV1 entry reads (V-3b pattern), queried the device_info.cu way. */
+/* The fifi_device_facts the vendored host entry reads, queried the device_info.cu way. */
 cudaError_t query_device_facts(fifi_device_facts *out) {
     int device = 0, major = 0, minor = 0, nsm = 0, smpbo = 0;
     cudaError_t err = cudaGetDevice(&device);
@@ -135,7 +134,7 @@ extern "C" int inference_cuda_matvec_expert_launch(const inference_cuda_matvec_e
         a.ncols_x = k;
         a.nrows_x = rows;
         a.ncols_dst = 1;
-        a.nchannels_x = n_expert; /* the A1 id range */
+        a.nchannels_x = n_expert; /* the id range */
         a.nchannels_y = per_slot ? n_used : 1;
         a.nchannels_dst = n_used;
         a.stride_row_x = stride_row_x;

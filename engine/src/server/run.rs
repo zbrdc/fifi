@@ -208,8 +208,16 @@ fn start_engines(file: &Config) -> Result<(Vec<Engine>, Vec<EngineEntry>), Start
         );
         // Flint snapshots are not qualified; the config flag alone never
         // arms them. The env opt-in lifts the family exclusion for the
-        // qualification A/B so both arms run the same ELF.
-        let flint_opt_in = config.family == flint::FAMILY && flint::prefix_reuse_opt_in();
+        // qualification A/B so both arms run the same ELF. The entry flag
+        // resolves against the engine's kv profile
+        // (a q8 engine logs and arms OFF, not "on").
+        let flint_opt_in = config.family == flint::FAMILY
+            && flint::prefix_reuse_entry_enabled(
+                config
+                    .flint
+                    .as_ref()
+                    .map(|options| options.kv_profile.as_str()),
+            );
         if config.family == flint::FAMILY {
             eprintln!(
                 "flint prefix reuse: {}",
@@ -586,8 +594,7 @@ mod tests {
     /// The Flint family exclusion: the config flag alone never arms Flint
     /// prefix reuse; only the env opt-in lifts it, and other families are
     /// unaffected. Pure in (family, file flag, env result) - no engine.
-    /// The full 2x2x2 matrix (Opus r1 Nit-3 moved this test out from
-    /// under the per-entry doc comment; Nit-6 completed the matrix).
+    /// The full 2x2x2 matrix.
     #[test]
     fn flint_prefix_reuse_needs_the_env_opt_in() {
         let flint = crate::family::flint::FAMILY;
@@ -987,8 +994,8 @@ mod tests {
     }
 
     // The pinned dispatch of the builds whose Q36 settings read the MLX keys: the CUDA arm
-    // ignores `prefill_chunk` (until CPF-7a's integration commit wires it as the chunk cap,
-    // decision 0049 A6 item 2), so this error cannot occur on a native-cuda build.
+    // ignores `prefill_chunk` (until chunked CUDA prefill uses it as the chunk cap), so this
+    // error cannot occur on a native-cuda build.
     #[cfg(not(all(feature = "native-cuda", target_os = "linux")))]
     #[test]
     fn the_prefix_reuse_flag_of_the_file_reaches_the_q36_session_cap_rule() {
@@ -1273,10 +1280,9 @@ mod tests {
     }
 
     /// The block prefix-match startup line follows the backend capability, not
-    /// the family name (round-2 Sol MustFix): only an entry whose engine's
-    /// ready note reported a store with two or more entries and whose config
-    /// kept `prefix_reuse` may claim the match; a rolled-back spacing prints
-    /// the off line.
+    /// the family name: only an entry whose engine's ready note reported a
+    /// store with two or more entries and whose config kept `prefix_reuse` may
+    /// claim the match; a rolled-back spacing prints the off line.
     #[test]
     fn the_block_match_line_follows_the_backend_capability() {
         assert_eq!(

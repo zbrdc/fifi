@@ -1,6 +1,6 @@
-//! The tiered wait-add of one layer of the resident decode step: the kernel that waits, with no host
-//! synchronization, for the CPU server's answer through the mailbox and adds its partial into the
-//! residual row (TCAP C3, `ledger/plans/TCAP-DESIGN.md` section 3.2).
+//! The tiered wait-add of one layer of the resident decode step: the kernel that waits, with no
+//! host synchronization, for the CPU server's answer through the mailbox and adds its partial into
+//! the residual row.
 //!
 //! Original code; the kernel and its semantics are documented in
 //! `native/resident/tiered_wait_add.h`.
@@ -24,7 +24,7 @@
 
 #![cfg_attr(
     not(test),
-    expect(dead_code, reason = "staged for TCAP C6 (ledger/plans/TCAP-DESIGN.md)")
+    expect(dead_code, reason = "staged for the tiered decode step")
 )]
 
 use std::ffi::c_int;

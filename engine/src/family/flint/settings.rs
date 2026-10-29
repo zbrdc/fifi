@@ -8,13 +8,18 @@ use serde::Deserialize;
 pub(crate) const PREFILL_MAX_ROWS: usize = 8;
 
 #[cfg(any(test, all(feature = "native-cuda", target_os = "linux")))]
-pub(crate) fn late_health_selected(value: Option<&std::ffi::OsStr>) -> bool {
+fn default_on_selected(value: Option<&std::ffi::OsStr>) -> bool {
     match value {
         None => true,
         Some(value) => value
             .to_str()
             .is_some_and(|value| crate::tokenizer::env_allows_value(Some(value))),
     }
+}
+
+#[cfg(any(test, all(feature = "native-cuda", target_os = "linux")))]
+pub(crate) fn late_health_selected(value: Option<&std::ffi::OsStr>) -> bool {
+    default_on_selected(value)
 }
 
 #[cfg(any(test, all(feature = "native-cuda", target_os = "linux")))]
@@ -26,9 +31,7 @@ pub(crate) fn packed_pointwise_selected(value: Option<&std::ffi::OsStr>) -> bool
 
 #[cfg(any(test, all(feature = "native-cuda", target_os = "linux")))]
 pub(crate) fn grouped_gather_selected(value: Option<&std::ffi::OsStr>) -> bool {
-    value
-        .and_then(std::ffi::OsStr::to_str)
-        .is_some_and(|value| crate::tokenizer::env_allows_value(Some(value)))
+    default_on_selected(value)
 }
 
 fn default_chunk_size() -> u32 {
@@ -111,11 +114,14 @@ mod tests {
         use std::ffi::OsStr;
 
         for (value, expected) in [
-            (None, false),
+            (None, true),
             (Some("1"), true),
             (Some(" TrUe "), true),
             (Some("0"), false),
             (Some(""), false),
+            (Some("off"), false),
+            (Some(" \t\n"), false),
+            (Some("2"), false),
             (Some("yes"), false),
         ] {
             assert_eq!(
@@ -123,6 +129,11 @@ mod tests {
                 expected,
                 "{value:?}"
             );
+        }
+        #[cfg(unix)]
+        {
+            use std::os::unix::ffi::OsStrExt;
+            assert!(!grouped_gather_selected(Some(OsStr::from_bytes(b"on\xff"))));
         }
     }
 

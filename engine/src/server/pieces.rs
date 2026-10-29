@@ -1,15 +1,15 @@
 //! Maps the events of the tool-call and think-block parser to the parts of a reply.
 //!
-//! Contract: the server design ("Streaming format"). The parser in `tokenizer::toolcall`
-//! (decision 0025) owns the grammar: the think and call markers, the trimming of sections, the
-//! types of the arguments, and the check of a call body. This module owns only what the reply
-//! does with each parser event:
+//! Contract: the server design ("Streaming format"). The parser in `tokenizer::toolcall` owns
+//! the grammar: the think and call markers, the trimming of sections, the types of the
+//! arguments, and the check of a call body. This module owns only what the reply does with each
+//! parser event:
 //!
 //! - Reasoning and content events become reasoning and content parts.
 //! - A complete call becomes a call part. When the request lists no tool, the call becomes
 //!   content text instead, because the request did not allow it. A call to a function that is
 //!   not in the tool list of the request is still a call. A `number` argument written `2` stays
-//!   `2` in the call arguments (decision 0025, TC1 behavior).
+//!   `2` in the call arguments.
 //! - A malformed call stays in the content as `<tool_call>`, the raw body, and `</tool_call>`.
 //! - A call left open at the end stays in the content as `<tool_call>` and the raw body. The
 //!   `length` limit drops it instead.

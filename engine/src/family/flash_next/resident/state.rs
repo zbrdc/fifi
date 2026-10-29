@@ -1,4 +1,4 @@
-//! Resident Flash-Next session state (S1-C plan section 1), with the step's check, poison, and commit.
+//! Resident Flash-Next session state, with the step's check, poison, and commit.
 
 use super::ops::{Bytes, dim, short_import, zeros};
 use super::prefill::qsa::check_chunk_dense;
@@ -14,11 +14,10 @@ use crate::{
 /// Bytes of one F32 element, the resident QSA cache dtype.
 const F32_BYTES: u64 = 4;
 
-/// Bytes that one more token adds to the stored QSA caches (S1-C plan decision 5; decision 0039
-/// Memory). Each QSA layer adds `KVH * D` F32 values to K, the same to V, and `ID` to the raw
-/// indexer keys. The sparse step keeps the whole cache and appends the same rows at every
-/// position, so the growth does not depend on the position. It makes no native call. `commit`
-/// checks the charge against the stored bytes.
+/// Bytes that one more token adds to the stored QSA caches. Each QSA layer adds `KVH * D` F32
+/// values to K, the same to V, and `ID` to the raw indexer keys. The sparse step keeps the whole
+/// cache and appends the same rows at every position, so the growth does not depend on the
+/// position. It makes no native call. `commit` checks the charge against the stored bytes.
 pub(super) fn qsa_growth_bytes(weights: &ResidentWeights) -> Result<u64, EngError> {
     let d = weights.shape.qsa.dims();
     let layers = weights
@@ -40,7 +39,7 @@ pub(super) fn qsa_growth_bytes(weights: &ResidentWeights) -> Result<u64, EngErro
 
 /// Bytes that a chunk of `rows` tokens adds to the stored QSA caches: `rows` positions of
 /// `qsa_growth_bytes`. The growth per position is constant while the QSA path keeps its whole
-/// cache (packets C6 and PF-5). It makes no native call.
+/// cache. It makes no native call.
 pub(super) fn chunk_growth_bytes(weights: &ResidentWeights, rows: u32) -> Result<u64, EngError> {
     qsa_growth_bytes(weights)?
         .checked_mul(u64::from(rows))
@@ -107,9 +106,9 @@ fn fixed_bytes(layers: &[LayerState], ple_ring: &ExecutionTensor) -> Result<u64,
     Ok(total.total())
 }
 
-/// A committed `ResidentState` held by shared handles (decision 0036, addendum 1). Its arrays are
-/// immutable: a step builds new arrays and never writes into an existing one. One growth permit
-/// charges all its bytes to the session budget and releases them when the snapshot drops.
+/// A committed `ResidentState` held by shared handles. Its arrays are immutable: a step builds new
+/// arrays and never writes into an existing one. One growth permit charges all its bytes to the
+/// session budget and releases them when the snapshot drops.
 pub(super) struct ResidentSnapshot {
     layers: Vec<LayerState>,
     ple_ring: ExecutionTensor,
@@ -221,9 +220,9 @@ impl ResidentState {
         &self.ple_ring
     }
 
-    /// Host checks before a step (plan section 1, step 1). They make no native call. On error the
-    /// state is unchanged and not poisoned. A QSA cache that differs from the position returns
-    /// `BadRequest`, and a position at `MAX_POSITIONS` returns `ContextLimit`.
+    /// Host checks before a step. They make no native call. On error the state is unchanged and not
+    /// poisoned. A QSA cache that differs from the position returns `BadRequest`, and a position at
+    /// `MAX_POSITIONS` returns `ContextLimit`.
     pub(super) fn check_step(&self, weights: &ResidentWeights) -> Result<(), EngError> {
         if self.poisoned {
             return Err(EngError::BadRequest(
@@ -256,9 +255,9 @@ impl ResidentState {
         Ok(())
     }
 
-    /// Host checks before a chunk of `rows` tokens (decision 0044 item 9). They make no native
-    /// call. On error the state is unchanged and not poisoned. A chunk whose last row passes the
-    /// dense QSA limit returns `ContextLimit`, also when the one-token path allows that position.
+    /// Host checks before a chunk of `rows` tokens. They make no native call. On error the state is
+    /// unchanged and not poisoned. A chunk whose last row passes the dense QSA limit returns
+    /// `ContextLimit`, also when the one-token path allows that position.
     pub(super) fn check_chunk(&self, weights: &ResidentWeights, rows: u32) -> Result<(), EngError> {
         self.check_step(weights)?;
         if rows == 0 {
@@ -277,8 +276,8 @@ impl ResidentState {
         Ok(())
     }
 
-    /// Poisons the state and takes its layer states out (plan section 1, step 2). The step drops
-    /// each old layer as soon as its replacement graph exists. Only `commit` or `reset` clears it.
+    /// Poisons the state and takes its layer states out. The step drops each old layer as soon as
+    /// its replacement graph exists. Only `commit` or `reset` clears it.
     pub(super) fn begin(&mut self) -> Vec<LayerState> {
         self.poisoned = true;
         std::mem::take(&mut self.layers)

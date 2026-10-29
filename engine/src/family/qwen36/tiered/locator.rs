@@ -1,4 +1,4 @@
-//! Where the experts of a MoE layer live inside a GGUF file, host only (OFF-2 P8).
+//! Where the experts of a MoE layer live inside a GGUF file, host only.
 //!
 //! WHAT: [`ExpertLocator`] turns one parsed [`GgufHeader`] into the absolute
 //! byte ranges of single experts inside the three stacked per-layer expert
@@ -10,7 +10,7 @@
 //! token. This module does no file I/O and creates no mapping (a file-backed
 //! mmap needs `unsafe`, a separate decision): the caller supplies any
 //! `Arc<dyn MappedRegion>`. Nothing about Qwen3.6 is hard-coded; every number
-//! arrives as an argument. Used by `TieredHost` and the tiered load (OFF-2 D4/D5).
+//! arrives as an argument. Used by `TieredHost` and the tiered load.
 
 use std::ops::Range;
 use std::sync::Arc;

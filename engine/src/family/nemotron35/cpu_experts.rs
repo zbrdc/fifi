@@ -2,9 +2,9 @@
 //! [`CpuExpertKernel`] interface and the expert views over a mapped shard.
 //!
 //! The experts of a CPU-served MoE layer are never copied: the layer's shard file is mapped
-//! read-only by the shared tier (the scoped `MappedFile` of decision 0017, Addendum 1; no mlock,
-//! no madvise) and the NVFP4 pool kernel reads the packed bytes and group scales straight from
-//! the page cache. The pool is created once per engine and its workers park between tokens.
+//! read-only by the shared tier (the scoped `MappedFile`; no mlock, no madvise) and the NVFP4
+//! pool kernel reads the packed bytes and group scales straight from the page cache. The pool is
+//! created once per engine and its workers park between tokens.
 
 use std::time::Duration;
 

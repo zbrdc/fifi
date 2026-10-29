@@ -1,9 +1,9 @@
-//! Load policy of the CUDA projector for an integrated GPU (LD-1).
+//! Load policy of the CUDA projector for an integrated GPU.
 //!
 //! On a Jetson the device memory is system RAM. `cudaMemGetInfo` counts the
 //! page cache as free, yet the allocator must reclaim that cache while it
 //! allocates, and a warm cache of a 20 GiB checkpoint made a whole-model load
-//! fail once in two runs on the Xavier (`cuda allocate: out of memory`, P5-e).
+//! fail once in two runs on the Xavier (`cuda allocate: out of memory`).
 //! A discrete GPU has its own memory, so none of this applies to it.
 //!
 //! An integrated device therefore gets four rules:

@@ -1,12 +1,12 @@
-//! The Q36 executor: `ExecutorOps` over the resident Q36 decoder (decision 0046; packet Q36-F2).
+//! The Q36 executor: `ExecutorOps` over the resident Q36 decoder.
 //!
 //! It follows the Flash-Next executor (`flash_next/resident/executor.rs`) and shares the token side
 //! of the session with it (`family::session::DecodeSession`). `Q36Step` is the model side: a
 //! `Prompt` step for each prompt token except the last, and a `Logits` step for each generated
-//! token. A Q36 result never satisfies Phase 0B or Phase 1B.
+//! token.
 //!
 //! Ownership: the engine thread builds the executor and its session inside the `make` closure of
-//! `spawn_engine`. Nothing native crosses a thread boundary (decisions 0019 and 0024).
+//! `spawn_engine`. Nothing native crosses a thread boundary.
 //!
 //! Checkpoint lifetime: `ResidentDecoder<'c>` borrows its `StreamedCheckpoint`, and `spawn_engine`
 //! needs an executor without a borrowed lifetime. `open` leaks one checkpoint with `Box::leak`, as
@@ -16,34 +16,32 @@
 //!
 //! Context limit: `Q36Rules::context_limit` is the first position that the decoder refuses. A
 //! prompt of that many tokens or more fails with `ContextLimit`, and a job ends with `Length` when
-//! its next feed would need that position. The caller sets it: the default is 32,768 (decision
-//! 0046 item 6; `settings.rs`). A larger limit needs a larger `session_cap`: `from_parts` rejects
-//! a limit whose cache growth (`bytes per position * context_limit`) exceeds the cap with
-//! `MemoryPlan`, before it imports any weight. The decoder charges the same growth to its
-//! `SessionBudget`. With concurrent sessions the cap is aggregate: other live contexts and
-//! snapshots can deny growth below an individual session's context limit.
+//! its next feed would need that position. The caller sets it: the default is 32,768
+//! (`settings.rs`). A larger limit needs a larger `session_cap`: `from_parts` rejects a limit
+//! whose cache growth (`bytes per position * context_limit`) exceeds the cap with `MemoryPlan`,
+//! before it imports any weight. The decoder charges the same growth to its `SessionBudget`. With
+//! concurrent sessions the cap is aggregate: other live contexts and snapshots can deny growth
+//! below an individual session's context limit.
 //!
 //! Failure handling and teardown follow the Flash-Next executor: a native failure returns
 //! `EngError::Backend` unchanged, and the worker marks the engine `NativeFailed`. The session
 //! drops before the executor, and the decoder waits for GPU completion when it drops.
 //!
-//! Batched prefill (decisions 0044 and 0046; packet Q36-E9): the chunk path is off until
-//! `plan_prefill` stores a chunk size, and then every prompt row except the last token is fed in
-//! chunks through `ResidentDecoder::prefill` in `Prompt` mode. Without a size, every row is a
-//! one-token `Prompt` step, as before, and the results are bit for bit those of the earlier code.
-//! The executor owns the one chunk size. `plan_prefill` picks the largest candidate whose
-//! workspace (`chunk_plan::ChunkCost`) fits the engine budget after the weights and the session
-//! reserve, at most the largest chunk (`Q36Settings::prefill_chunk`). The worker piece is the
-//! planned chunk, or 16 (`NO_BUDGET_PIECE`) when no chunk is planned, so one `prefill` call never
-//! feeds more rows than a piece. It writes the size to the executor and to the decoder
-//! (`ResidentDecoder::chunk_rows`) in one place, `apply_chunk`, so the decoder never splits a
-//! chunk again and no other code sets either value. The decoder default of 512 rows serves
+//! Batched prefill: the chunk path is off until `plan_prefill` stores a chunk size, and then every
+//! prompt row except the last token is fed in chunks through `ResidentDecoder::prefill` in `Prompt`
+//! mode. Without a size, every row is a one-token `Prompt` step, as before, and the results are bit
+//! for bit those of the earlier code. The executor owns the one chunk size. `plan_prefill` picks
+//! the largest candidate whose workspace (`chunk_plan::ChunkCost`) fits the engine budget after the
+//! weights and the session reserve, at most the largest chunk (`Q36Settings::prefill_chunk`). The
+//! worker piece is the planned chunk, or 16 (`NO_BUDGET_PIECE`) when no chunk is planned, so one
+//! `prefill` call never feeds more rows than a piece. It writes the size to the executor and to the
+//! decoder (`ResidentDecoder::chunk_rows`) in one place, `apply_chunk`, so the decoder never splits
+//! a chunk again and no other code sets either value. The decoder default of 512 rows serves
 //! decoder tests only. A run of one row is a one-token step, as in the Flash-Next executor, and a
-//! chunk equals the steps within the tolerance of gate G2, not bit for bit. A chunk routes as
-//! its decoder holds (`Routing::Device`, the default, routes on the device;
-//! `Routing::Host` keeps the host-routed reference), and every decode step keeps device routing.
-//! A Q36 chunk has no page set, so the Flash-Next rule that opens page sets once has no
-//! counterpart here.
+//! chunk equals the steps within the chunk-parity tolerance, not bit for bit. A chunk routes as its
+//! decoder holds (`Routing::Device`, the default, routes on the device; `Routing::Host` keeps the
+//! host-routed reference), and every decode step keeps device routing. A Q36 chunk has no page set,
+//! so the Flash-Next rule that opens page sets once has no counterpart here.
 //!
 //! A failed prefill: a denied growth permit or a bad token in chunk k leaves chunks 1 to k - 1
 //! published (the decoder rules), and the shared session has already taken its pending token. The
@@ -53,20 +51,18 @@
 //! that is not `Backend`. A `Backend` error ends the engine (the worker makes no further call), so
 //! no native call follows it.
 //!
-//! Prefix reuse (decision 0036, addendum 2; packet Q36-PR-b): `save_prefix` snapshots the state
-//! after the held prompt, and `restore_prefix` gives it back after a reset. The executor keeps
-//! its entries in a `PrefixStore`, declared first so its arrays drop before the decoder does. The
-//! store takes its limits from `Q36Rules::prefix_store` (packet SERVE-2-c): an engine started
-//! with `prefix_reuse` keeps the addendum 2 set (two pinned roots, six LRU entries), and every
-//! other engine keeps the addendum 1 store (zero roots, one entry), so the worker saves the tip
-//! only there. Each entry
-//! carries the `PrefillPath` that built it, so an entry restores only under its own path: a restore
-//! under `Chunked(n)` matches a full recompute only within the decision 0044 G2 tolerance, and
-//! only the `Steps` path is bitwise (addendum 1 item 8).
+//! Prefix reuse: `save_prefix` snapshots the state after the held prompt, and `restore_prefix`
+//! gives it back after a reset. The executor keeps its entries in a `PrefixStore`, declared first
+//! so its arrays drop before the decoder does. The store takes its limits from
+//! `Q36Rules::prefix_store`: an engine started with `prefix_reuse` keeps the reuse set (two pinned
+//! roots, six LRU entries), and every other engine keeps the tip store (zero roots, one entry), so
+//! the worker saves the tip only there. Each entry carries the `PrefillPath` that built it, so an
+//! entry restores only under its own path: a restore under `Chunked(n)` matches a full recompute
+//! only within the chunk-parity tolerance, and only the `Steps` path is bitwise.
 //! `DecodeSession::save_prefix` and `DecodeSession::restore_prefix` own the rules, and the executor
 //! passes the two decoder calls `snapshot` and `restore`. A `MemoryPlan` from the save evicts
 //! entries, retries, and reports `false` when no victim is left; a `MemoryPlan` from the restore
-//! drops that entry and tries the next candidate (addendum item 7).
+//! drops that entry and tries the next candidate.
 
 use super::attn::growth_bytes;
 use super::chunk_plan::{ChunkCost, PREFILL_CANDIDATES, PrefillPlan, PrefillTerms, admitted_chunk};
@@ -112,31 +108,29 @@ pub(crate) struct Q36Rules {
     pub(crate) context_limit: u32,
     /// The bytes of cache growth that this engine admits: the cap of the decoder's `SessionBudget`.
     pub(crate) session_cap: u64,
-    /// The dtype of the decode activations (packet Q36-BF16-a), which also picks the scale storage
-    /// at construction. The config member defaults to `bf16`.
+    /// The dtype of the decode activations, which also picks the scale storage at construction. The
+    /// config member defaults to `bf16`.
     pub(crate) activation: Activation,
-    /// The form of the attention KV cache (packet KV8-INTEGRATE; decision 0046 A7): `F32`, the
-    /// control, or `Q8`, the 8-bit codes with activation-dtype scales and biases. The config
-    /// member `kv_dtype` defaults to `f32`.
+    /// The form of the attention KV cache: `F32`, the control, or `Q8`, the 8-bit codes with
+    /// activation-dtype scales and biases. The config member `kv_dtype` defaults to `f32`.
     pub(crate) kv_dtype: KvDtype,
-    /// `mlx_compile` on the DeltaNet and device-routed MoE decode blocks (packet MX-COMPILE-1a):
-    /// the `qwen36.compile` member, default false. When true, the decoder warms both blocks once
-    /// at load, so a trace failure fails the load instead of a request.
+    /// `mlx_compile` on the DeltaNet and device-routed MoE decode blocks: the `qwen36.compile`
+    /// member, default false. When true, the decoder warms both blocks once at load, so a trace
+    /// failure fails the load instead of a request.
     pub(crate) compile: bool,
     /// The admitted concurrent sessions. One preserves the legacy solo lifecycle.
     pub(crate) max_seqs: usize,
-    /// The limits of this executor's prefix store (decision 0036, addendum 2; packet
-    /// SERVE-2-c item 1): the start maps the `prefix_reuse` flag to two pinned roots and six
-    /// LRU entries - or the operator's exact `prefix_store_entries` override - and every
-    /// other caller keeps the addendum 1 store (zero roots, one entry), so the existing
-    /// tests keep their meaning. `from_parts` builds the store with these limits and
-    /// `prefix_limits` reports them.
+    /// The limits of this executor's prefix store: the start maps the `prefix_reuse` flag to two
+    /// pinned roots and six LRU entries - or the operator's exact `prefix_store_entries` override -
+    /// and every other caller keeps the tip store (zero roots, one entry), so the existing tests
+    /// keep their meaning. `from_parts` builds the store with these limits and `prefix_limits`
+    /// reports them.
     pub(crate) prefix_store: StoreLimits,
 }
 
-/// The numeric path of a prefill. A saved prefix restores only under the path that built it:
-/// a restore under `Chunked(n)` matches a full recompute only within the decision 0044 G2
-/// tolerance, and only the `Steps` path is bitwise (addendum 1 item 8).
+/// The numeric path of a prefill. A saved prefix restores only under the path that built it: a
+/// restore under `Chunked(n)` matches a full recompute only within the chunk-parity tolerance, and
+/// only the `Steps` path is bitwise.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum PrefillPath {
     /// One-token steps (the default).
@@ -169,14 +163,14 @@ pub(crate) struct Q36Executor {
     fixed_state_bytes: u64,
     /// The chunk size of the batched prefill, set only by `apply_chunk`. `None` means one-token steps.
     chunk: Option<u32>,
-    /// The kind of the entry that the last `restore_prefix` call restored, for
-    /// `prefix_report` (packet SERVE-2-c item 3). `Miss` until a restore takes an entry, and
-    /// a reset clears it again (fix M4), so the report of a job without a boundary is a miss.
+    /// The kind of the entry that the last `restore_prefix` call restored, for `prefix_report`.
+    /// `Miss` until a restore takes an entry, and a reset clears it again, so the report of a job
+    /// without a boundary is a miss.
     prefix_hit: PrefixHit,
     /// The `uncached_shared` count of the last `restore_prefix` call, for `prefix_report`;
     /// a reset clears it too.
     prefix_uncached: u32,
-    /// The shadow block-LCP observation of the last `restore_prefix` call (KV-v1 slice 1),
+    /// The shadow block-LCP observation of the last `restore_prefix` call,
     /// for `prefix_report`; a reset clears it too.
     prefix_shadow: Option<ShadowLcp>,
     /// Tests only: the row count of each chunk that ran through `ResidentDecoder::prefill`, in
@@ -299,10 +293,10 @@ fn open_checkpoint(dir: &Path) -> Result<StreamedCheckpoint> {
     StreamedCheckpoint::open(&index, shards, 64 << 20)
 }
 
-/// The cache bytes that one position adds over all attention layers, in the cache form `kv`
-/// with scales of the activation dtype `act` (packet KV8-INTEGRATE item 5). The admission rule
-/// calls it with the rules' own form and activation, so a Q8 engine admits its sessions by the
-/// 8-bit bytes (4,096 * layers F32, 1,088 * layers at Q8/BF16 on the real model).
+/// The cache bytes that one position adds over all attention layers, in the cache form `kv` with
+/// scales of the activation dtype `act`. The admission rule calls it with the rules' own form and
+/// activation, so a Q8 engine admits its sessions by the 8-bit bytes (4,096 * layers F32, 1,088 *
+/// layers at Q8/BF16 on the real model).
 fn growth_per_position(shape: &HostShape, kv: KvDtype, act: Activation) -> Result<u64> {
     let layers = shape
         .kinds
@@ -444,10 +438,10 @@ impl Q36Executor {
             rules.activation,
             rules.kv_dtype,
         )?;
-        // The compile seam admits the whole model and warms one layer per distinct program
-        // HERE, before the first state exists: a plan refusal or a trace failure is a typed
-        // load error (packet MX-COMPILE-1a item 6), never a failure in the middle of a request.
-        // The warm-up seconds of THIS engine land in the decoder.
+        // The compile seam admits the whole model and warms one layer per distinct program HERE,
+        // before the first state exists: a plan refusal or a trace failure is a typed load error,
+        // never a failure in the middle of a request. The warm-up seconds of THIS engine land in
+        // the decoder.
         if rules.compile {
             decoder.set_compile(true)?;
         }
@@ -486,7 +480,7 @@ impl Q36Executor {
             #[cfg(test)]
             log: std::sync::Arc::default(),
         };
-        // The shadow block-LCP observation (KV-v1 slice 1): off unless the environment
+        // The shadow block-LCP observation: off unless the environment
         // flag runs it; the observation changes no restore or save behavior.
         executor
             .prefix
@@ -501,19 +495,17 @@ impl Q36Executor {
         self.context_limit
     }
 
-    /// Reads the production counters of the compiled block calls of this executor's adapter
-    /// (packet MX-COMPILE-1a): calls, the native trace counts, the cache hits, and the seconds
-    /// of the first calls per block kind. The tests of the resident gate read them through the
-    /// executor, which owns the adapter.
+    /// Reads the production counters of the compiled block calls of this executor's adapter: calls,
+    /// the native trace counts, the cache hits, and the seconds of the first calls per block kind.
+    /// The tests of the resident gate read them through the executor, which owns the adapter.
     pub(crate) fn compile_counters(&self) -> crate::kernels::mlx::compile_stats::Stats {
         self.decoder.kernels.compile_counters()
     }
 
-    /// The seconds of THIS engine's load-time compile warm-up (packet MX-COMPILE-1a item 6),
-    /// delta first and moe second: the seconds per traced program of each block kind, empty
-    /// vectors when `qwen36.compile` is off. They are measured inside this decoder's warm-up —
-    /// not read from the process-wide counters — so the start line reports this engine alone
-    /// and labels each block kind correctly.
+    /// The seconds of THIS engine's load-time compile warm-up, delta first and moe second: the
+    /// seconds per traced program of each block kind, empty vectors when `qwen36.compile` is off.
+    /// They are measured inside this decoder's warm-up — not read from the process-wide counters —
+    /// so the start line reports this engine alone and labels each block kind correctly.
     pub(crate) fn compile_warmup_seconds(&self) -> (&[f64], &[f64]) {
         (
             &self.decoder.compile_warmup.delta,
@@ -539,14 +531,14 @@ impl Q36Executor {
         (step, limits)
     }
 
-    /// The admission cost of one prefill chunk on this model (decision 0044 item 6, Q36 terms).
+    /// The admission cost of one prefill chunk on this model (the admission rule in Q36 terms).
     fn prefill_cost(&self) -> Result<ChunkCost> {
         let heads_q = u64::try_from(self.decoder.weights.shape.attn.heads_q)
             .map_err(|_| EngError::MemoryPlan("the query head count exceeds u64".to_string()))?;
         ChunkCost::new(heads_q, self.decoder.context_limit)
     }
 
-    /// Applies the admission rule of decision 0044 item 6 and stores the chunk size.
+    /// Applies the chunk admission rule and stores the chunk size.
     ///
     /// `remaining = budget - resident weights - session_reserve`. The weights come from this
     /// executor. `session_reserve` is the sum that the caller owns: the session state at the
@@ -556,11 +548,11 @@ impl Q36Executor {
     /// `max_rows` is the largest chunk (`Q36Settings::prefill_chunk`): the chunk is never larger.
     /// The worker piece is the planned chunk, or 16 (`NO_BUDGET_PIECE`) when no chunk is planned.
     ///
-    /// It returns the chunk size, or `None` when no size above one token fits and the prefill
-    /// runs one-token steps, with the terms it charged. Call it once after construction and before
-    /// the first job. `start::plan_prefill` calls it at engine start-up when the settings carry a budget.
-    /// Both activation dtypes plan a chunk (packet Q36-BF16-b): the chunk path is dtype aware, so
-    /// only the budget or `max_rows` can keep a chunk out.
+    /// It returns the chunk size, or `None` when no size above one token fits and the prefill runs
+    /// one-token steps, with the terms it charged. Call it once after construction and before the
+    /// first job. `start::plan_prefill` calls it at engine start-up when the settings carry a
+    /// budget. Both activation dtypes plan a chunk: the chunk path is dtype aware, so only the
+    /// budget or `max_rows` can keep a chunk out.
     pub(crate) fn plan_prefill(
         &mut self,
         budget: u64,
@@ -572,9 +564,9 @@ impl Q36Executor {
             weights: self.decoder.weights.byte_len()?,
             session_reserve,
         };
-        // `chunked_prefill_allowed` stays the one authority for the dtype rule (packet
-        // Q36-BF16-b): the chunk path is dtype aware, so both activation dtypes reach
-        // `admitted_chunk`, and a dtype the rule does not know still plans no chunk.
+        // `chunked_prefill_allowed` stays the one authority for the dtype rule: the chunk path is
+        // dtype aware, so both activation dtypes reach `admitted_chunk`, and a dtype the rule does
+        // not know still plans no chunk.
         let chunk = if chunked_prefill_allowed(self.decoder.weights.consts.act) {
             admitted_chunk(&self.prefill_cost()?, terms.remaining(), max_rows)?
         } else {
@@ -780,18 +772,16 @@ impl ExecutorOps for Q36Executor {
     }
 
     /// The limits of this executor's prefix store: the store this executor was built with
-    /// (`Q36Rules::prefix_store` through `from_parts`), so a `prefix_reuse` engine reports
-    /// two pinned roots and six LRU entries (decision 0036, addendum 2) - or the
-    /// operator's exact `prefix_store_entries` override.
+    /// (`Q36Rules::prefix_store` through `from_parts`), so a `prefix_reuse` engine reports two
+    /// pinned roots and six LRU entries - or the operator's exact `prefix_store_entries` override.
     fn prefix_limits(&self) -> StoreLimits {
         self.prefix.limits()
     }
 
-    /// The prefix-store report of this executor (decision 0036, addendum 2; packet SERVE-2-c
-    /// item 3): the entries the store holds after the job's save points and their charged
-    /// bytes — each `ResidentSnapshot` holds its own growth permit, so the executor sums
-    /// `charged_bytes` over the stored states; the store never sizes a snapshot — beside the
-    /// kind of the entry the job restored and the prompt tokens shared with a stored key
+    /// The prefix-store report of this executor: the entries the store holds after the job's save
+    /// points and their charged bytes — each `ResidentSnapshot` holds its own growth permit, so the
+    /// executor sums `charged_bytes` over the stored states; the store never sizes a snapshot —
+    /// beside the kind of the entry the job restored and the prompt tokens shared with a stored key
     /// beyond the restored prefix, both taken at the restore.
     fn prefix_report(&self) -> Option<PrefixReport> {
         let stored = self.prefix.roots_len() + self.prefix.entries_len();
@@ -816,8 +806,8 @@ impl ExecutorOps for Q36Executor {
         let Q36Session { state, core, .. } = st;
         let (mut step, _) = self.split(state);
         core.reset(&mut step)?;
-        // The restore facts of the report do not survive a job (fix M4): the worker resets every
-        // job and skips the restore when the job has no boundary, so the report of such a job
+        // The restore facts of the report do not survive a job: the worker resets every job
+        // and skips the restore when the job has no boundary, so the report of such a job
         // must not carry the hit of the job before it.
         self.prefix_hit = PrefixHit::Miss;
         self.prefix_uncached = 0;
@@ -878,18 +868,15 @@ impl ExecutorOps for Q36Executor {
         Ok(covered)
     }
 
-    /// Evicts ONE LRU entry of the engine's store per the incremental denial order,
-    /// radix-compression (round 4d SF-1): dead tips first (they never match the next
-    /// turn), then redundant single-chain interior anchors, then anchor leaves, then
-    /// branch points (a shared header), oldest within each tier, with the denied
-    /// job's restored anchor (`protect`, review round 4 MF2) last - fix EV-1's blast
-    /// radius; the replay's t6 wave lost every live lineage to one denial - and
-    /// reports the bytes its snapshot released from the session budget: a dropped
-    /// snapshot's growth permit releases its charge, so a dead or idle conversation
-    /// stops pinning the pool the moment the worker asks. `None` when no LRU entry
-    /// remains (roots stay
-    /// pinned, addendum 2 rule 4), so an eviction loop that reaches `None` has freed
-    /// everything it can and the denial stands for classification.
+    /// Evicts ONE LRU entry of the engine's store per the incremental denial order of the radix
+    /// compression: dead tips first (they never match the next turn), then redundant single-chain
+    /// interior anchors, then anchor leaves, then branch points (a shared header), oldest within
+    /// each tier, with the denied job's restored anchor (`protect`) last - so one denial cannot
+    /// evict every live lineage - and reports the bytes its snapshot released from the session
+    /// budget: a dropped snapshot's growth permit releases its charge, so a dead or idle
+    /// conversation stops pinning the pool the moment the worker asks. `None` when no LRU entry
+    /// remains (roots stay pinned), so an eviction loop that reaches `None` has freed everything it
+    /// can and the denial stands for classification.
     fn evict_one_prefix_entry(&mut self, protect: Option<u64>) -> Option<u64> {
         let before = self.decoder.budget.used();
         if !self.prefix.evict_lru_one(protect) {
@@ -899,21 +886,20 @@ impl ExecutorOps for Q36Executor {
     }
 
     /// The denying session's restored anchor: the core session tracks it, so the eviction
-    /// protects the conversation the denial belongs to, not whichever restored last
-    /// (review round 4, MF2).
+    /// protects the conversation the denial belongs to, not whichever restored last.
     fn restored_anchor_of(&self, st: &Q36Session) -> Option<u64> {
         st.core.restored_anchor()
     }
 
-    /// The first entry a restart of `prompt` would restore (review round 4, MF2): the
-    /// path is the executor's own prefill path, so it is known before any session exists.
+    /// The first entry a restart of `prompt` would restore: the path is the executor's
+    /// own prefill path, so it is known before any session exists.
     fn restore_candidate(&self, prompt: &[u32]) -> Option<u64> {
         self.prefix.restore_candidate(prompt, &self.prefill_path())
     }
 
-    /// The pool-derived prompt ceiling (fix EV-2): the free budget plus the session's own
-    /// permits - which its next reset releases - over the per-position KV growth, minus the
-    /// one position the first sampled token needs.
+    /// The pool-derived prompt ceiling: the free budget plus the session's own permits - which its
+    /// next reset releases - over the per-position KV growth, minus the one position the first
+    /// sampled token needs.
     ///
     /// shortcut: permits that a still-stored snapshot shares with the session (a pinned
     /// root this session saved) are counted as releasable, so the ceiling can overstate by
@@ -1488,7 +1474,7 @@ mod tests {
         }
     }
 
-    /// The `config.json` of the pinned checkpoint (the committed copy of the Q36-A packet).
+    /// The `config.json` of the pinned checkpoint (a committed copy).
     const REAL_CONFIG: &[u8] =
         include_bytes!("../../../../tests/fixtures/qwen3_6_35b_a3b_config.json");
 
@@ -1832,10 +1818,10 @@ mod tests {
         }
     }
 
-    /// A prompt of `len` tokens: token `i` is `(i + 1) % 8`, the sequence of the Q36-E6 tests
-    /// (the fixture has 8 ids). The host reference routes this sequence, followed by `FORCED`, with
-    /// a gap of at least 0.0167 between the last chosen and the first rejected router probability
-    /// in every layer, so a chunk and a step choose the same experts.
+    /// A prompt of `len` tokens: token `i` is `(i + 1) % 8`, the sequence of the chunk tests (the
+    /// fixture has 8 ids). The host reference routes this sequence, followed by `FORCED`, with a
+    /// gap of at least 0.0167 between the last chosen and the first rejected router probability in
+    /// every layer, so a chunk and a step choose the same experts.
     fn cycle(len: usize) -> Vec<u32> {
         (0..len)
             .map(|i| u32::try_from((i + 1) % 8).unwrap())
@@ -1867,10 +1853,10 @@ mod tests {
         executor.decoder.weights.byte_len().unwrap()
     }
 
-    /// The weights bytes of an executor built with `rules` (fix2 of packet Q36-BF16-b): the
-    /// executor, its session, and their native adapter lease all drop inside the helper, so the
-    /// caller never holds a lease of a measuring build and a later `serve_with` stays within the
-    /// two-lease bound of decision 0024.
+    /// The weights bytes of an executor built with `rules`: the executor, its session, and their
+    /// native adapter lease all drop inside the helper, so the caller never holds a lease of a
+    /// measuring build and a later `serve_with` stays within the two-lease bound of the native
+    /// adapter.
     fn held_by(rules: Q36Rules) -> u64 {
         let (executor, _session) = build(rules);
         held(&executor)
@@ -1961,10 +1947,10 @@ mod tests {
     /// Row 1: 10 tokens, chunks of 4, worker pieces of 5: the calls give the rows 4, then 4 and 1
     /// (the carried pending token leads the second call, and the single row is a step). Row 2: 14
     /// tokens, chunks of 8, worker pieces of 9: the calls give 8, then 5. A chunk equals the steps
-    /// within the tolerance of gate G2 (decision 0044), not bit for bit. Both jobs get the same
-    /// token chain, and every logits row is compared with `assert_parity`. The argmax is compared
-    /// only where the stepped row's top two logits differ by more than twice the tolerance,
-    /// because a smaller gap can flip inside the tolerance.
+    /// within the chunk-parity tolerance, not bit for bit. Both jobs get the same token chain, and
+    /// every logits row is compared with `assert_parity`. The argmax is compared only where the
+    /// stepped row's top two logits differ by more than twice the tolerance, because a smaller gap
+    /// can flip inside the tolerance.
     #[test]
     fn a_chunked_prefill_leaves_the_session_of_one_token_steps() {
         let _serial = crate::native_test_lock();
@@ -2111,9 +2097,9 @@ mod tests {
         );
     }
 
-    /// Packet Q36-BF16-b: both activation dtypes plan a chunk. A BF16 executor plans the same
-    /// chunk as the F32 control on the same budget (here the largest, 256), and its worker piece
-    /// follows, so a BF16 engine serves its prompts in chunks like an F32 engine.
+    /// Both activation dtypes plan a chunk. A BF16 executor plans the same chunk as the F32 control
+    /// on the same budget (here the largest, 256), and its worker piece follows, so a BF16 engine
+    /// serves its prompts in chunks like an F32 engine.
     #[test]
     fn plan_prefill_admits_the_same_chunk_for_both_activation_dtypes() {
         let _serial = crate::native_test_lock();
@@ -2474,12 +2460,12 @@ mod tests {
         }
     }
 
-    /// A BF16 serving entry (the default of `activation_dtype`, packets Q36-BF16-a and
-    /// Q36-BF16-b) plans a chunk like the F32 control when the budget admits the largest one: the
-    /// start-up line is the chunk line of either dtype and its `weights_bytes` term is the byte
-    /// count after `convert_norms` (fix1), the prompt runs in chunks, and the job decodes. The
-    /// byte counts are measured inside `held_by` (fix2), so every lease of a measuring build
-    /// drops before `serve_with` builds its own and at most one lease is live at any time.
+    /// A BF16 serving entry (the default of `activation_dtype`) plans a chunk like the F32 control
+    /// when the budget admits the largest one: the start-up line is the chunk line of either dtype
+    /// and its `weights_bytes` term is the byte count after `convert_norms`, the prompt runs in
+    /// chunks, and the job decodes. The byte counts are measured inside `held_by`, so every lease
+    /// of a measuring build drops before `serve_with` builds its own and at most one lease is live
+    /// at any time.
     #[test]
     fn a_bf16_serving_entry_plans_a_chunk_and_runs_it() {
         let _serial = crate::native_test_lock();
@@ -2488,15 +2474,14 @@ mod tests {
         assert_eq!(f32_held, weights, "the F32 control holds the import bytes");
         let mut bf16_rules = chunk_rules();
         bf16_rules.activation = Activation::Bf16;
-        // The weights bytes of the line are the decoder's byte count AFTER `convert_norms` (fix1
-        // of packet Q36-BF16-b). The BF16 total is strictly below the F32 import because the
-        // import itself keeps the scales and biases in BF16, which saves about 2.13 GB on the
-        // real model; `convert_norms` adds only 337,920 B of savings (decision 0046 A6 item 4),
-        // so this assert pins the dtype of the import, not `convert_norms`. The mutation that
-        // removes `convert_norms` is caught by the served job itself: F32 norms against BF16
-        // activations fail the `input norm output has dtype` guard. On the real model the term
-        // is the 19,286,549,004 B of the BF16 tool-forward log; on the synthetic model the same
-        // rule shows as the smaller count.
+        // The weights bytes of the line are the decoder's byte count AFTER `convert_norms`. The
+        // BF16 total is strictly below the F32 import because the import itself keeps the scales
+        // and biases in BF16, which saves about 2.13 GB on the real model; `convert_norms` adds
+        // only 337,920 B of savings, so this assert pins the dtype of the import, not
+        // `convert_norms`. The mutation that removes `convert_norms` is caught by the served job
+        // itself: F32 norms against BF16 activations fail the `input norm output has dtype` guard.
+        // On the real model the term is the 19,286,549,004 B of the BF16 tool-forward log; on the
+        // synthetic model the same rule shows as the smaller count.
         let bf16_weights = held_by(bf16_rules);
         assert!(
             bf16_weights < weights,
@@ -2548,10 +2533,10 @@ mod tests {
 
     /// A plan that admits no chunk does not fail the engine. The path stays off, the job runs, and
     /// the line names the terms that were charged. The settings carry the explicit F32 control
-    /// (`activation_dtype`), the qualification row of the same budget arithmetic for both dtypes
-    /// (packet Q36-BF16-b). Row 1: the budget of 4 rows with a
-    /// reserve of 2 GiB plus 1024 bytes leaves nothing. Row 2: one byte below the
-    /// workspace of 4 rows. Row 3: a largest chunk of 3 is below the smallest candidate.
+    /// (`activation_dtype`), the qualification row of the same budget arithmetic for both dtypes.
+    /// Row 1: the budget of 4 rows with a reserve of 2 GiB plus 1024 bytes leaves nothing. Row 2:
+    /// one byte below the workspace of 4 rows. Row 3: a largest chunk of 3 is below the smallest
+    /// candidate.
     #[test]
     fn a_budget_that_admits_no_chunk_keeps_the_one_token_path_and_says_why() {
         let _serial = crate::native_test_lock();
@@ -2714,12 +2699,12 @@ mod tests {
     }
 
     /// The real checkpoint on the Mac: the executor with a greedy sampler must give the 32 greedy
-    /// ids of the frozen Q36-HR evidence for its 5-token prompt (decision 0046 item 4). The
-    /// coordinator runs it with `--ignored --exact` under the lock. Environment: `Q36_CKPT_DIR`
-    /// (the pinned checkpoint with `tokenizer.json`), `Q36_REF_DIR` (the directory of
-    /// `host-ref.json`), `Q36_CACHE_LIMIT` (bytes), `Q36_EXECUTOR_REPORT` (the report file).
+    /// ids of the frozen host-reference evidence for its 5-token prompt. The coordinator runs it
+    /// with `--ignored --exact` under the lock. Environment: `Q36_CKPT_DIR` (the pinned checkpoint
+    /// with `tokenizer.json`), `Q36_REF_DIR` (the directory of `host-ref.json`), `Q36_CACHE_LIMIT`
+    /// (bytes), `Q36_EXECUTOR_REPORT` (the report file).
     #[test]
-    #[ignore = "needs the pinned Q36 checkpoint and the Q36-HR evidence on the Mac"]
+    #[ignore = "needs the pinned Q36 checkpoint and the frozen host reference on the Mac"]
     fn the_executor_serves_the_real_checkpoint_with_the_frozen_greedy_ids() {
         let _serial = crate::native_test_lock();
         let (ckpt_dir, ref_dir) = (env_path("Q36_CKPT_DIR"), env_path("Q36_REF_DIR"));
@@ -2799,17 +2784,17 @@ mod tests {
         )
     }
 
-    /// The `session_reserve` of a real run (decision 0044 item 6): the session state at
-    /// `positions` (the DeltaNet state plus the cache growth of each position), the MLX cache
-    /// limit, and a pressure margin of 1 GiB.
+    /// The `session_reserve` of a real run: the session state at `positions` (the DeltaNet state
+    /// plus the cache growth of each position), the MLX cache limit, and a pressure margin of 1
+    /// GiB.
     fn real_reserve(
         executor: &Q36Executor,
         session: &Q36Session,
         positions: u64,
         cache_limit: u64,
     ) -> u64 {
-        // The form and the activation of the run's own decoder (packet KV8-INTEGRATE): an F32
-        // control run and a Q8 run each reserve their own cache bytes.
+        // The form and the activation of the run's own decoder: an F32 control run and a Q8 run
+        // each reserve their own cache bytes.
         let act = Activation::of_dtype(executor.decoder.weights.consts.act).unwrap();
         let growth = growth_per_position(
             &executor.decoder.weights.shape,
@@ -2820,19 +2805,18 @@ mod tests {
         session.state.byte_len().unwrap() + growth * positions + cache_limit + (1 << 30)
     }
 
-    /// The real checkpoint through the executor with the chunk path off and then on (packet
-    /// Q36-E9; gate 3 of decision 0046 item 4 through the executor). The 5-token prompt of the
-    /// frozen Q36-HR evidence feeds 4 rows. With the path off the 32 greedy ids must equal the
-    /// frozen ones. With a planned size the 4 rows are one chunk, and all 32 greedy ids must
-    /// equal the frozen ones, the G1 rule of decision 0044 that the Flash-Next executor test
-    /// uses. The report names the first difference and the number of equal ids. The coordinator runs it with `--ignored --exact` under the lock.
-    /// Environment: `Q36_CKPT_DIR` (with `tokenizer.json`), `Q36_REF_DIR` (with `host-ref.json`),
-    /// `Q36_CACHE_LIMIT` (bytes), `Q36_BUDGET` (bytes, default 32,212,254,720),
-    /// `Q36_ACTIVATION` (`f32` | `bf16`, unset the F32 control; read through
-    /// `real::activation_from_env`, the one definition — fix4 of packet Q36-BF16-b), and
-    /// `Q36_EXECUTOR_REPORT` (the report file).
+    /// The real checkpoint through the executor with the chunk path off and then on. The 5-token
+    /// prompt of the frozen host-reference evidence feeds 4 rows. With the path off the 32 greedy
+    /// ids must equal the frozen ones. With a planned size the 4 rows are one chunk, and all 32
+    /// greedy ids must equal the frozen ones, the rule that the Flash-Next executor test uses. The
+    /// report names the first difference and the number of equal ids. The coordinator runs it with
+    /// `--ignored --exact` under the lock. Environment: `Q36_CKPT_DIR` (with `tokenizer.json`),
+    /// `Q36_REF_DIR` (with `host-ref.json`), `Q36_CACHE_LIMIT` (bytes), `Q36_BUDGET` (bytes,
+    /// default 32,212,254,720), `Q36_ACTIVATION` (`f32` | `bf16`, unset the F32 control; read
+    /// through `real::activation_from_env`, the one definition), and `Q36_EXECUTOR_REPORT` (the
+    /// report file).
     #[test]
-    #[ignore = "needs the pinned Q36 checkpoint and the Q36-HR evidence on the Mac"]
+    #[ignore = "needs the pinned Q36 checkpoint and the frozen host reference on the Mac"]
     fn the_chunked_prefill_serves_the_real_checkpoint_like_the_one_token_steps() {
         let _serial = crate::native_test_lock();
         let (ckpt_dir, ref_dir) = (env_path("Q36_CKPT_DIR"), env_path("Q36_REF_DIR"));
@@ -2915,24 +2899,23 @@ mod tests {
         );
     }
 
-    /// SHA-256 of the first 2,048 prompt ids of the Q36-REF run as little-endian words
+    /// SHA-256 of the first 2,048 prompt ids of the reference run as little-endian words
     /// (`q36-dr4-prompt-ids.py`).
     const PROMPT_2048_SHA256: &str =
         "a2176ac355b06d384c0b8b02807d4e0f9dfcc3659c43531148e75dfe70c98180";
 
-    /// The prefill rate of the frozen 2,048-token prompt through the executor (packet Q36-E9; the
-    /// prompt gate of decision 0046 item 7 is 60 prompt tokens per second). The test runs the prompt
-    /// once for each chunk size in `Q36_CHUNKS` (default `256,512`; `0` is the one-token path and
-    /// is slow) in worker pieces of that size, and reports seconds, tokens per second, chunk runs,
-    /// the allocator peak against the planned workspace, and in a qualification build the
-    /// synchronizations, the forced flushes, and the peak retired bytes. It asserts no speed.
-    /// Every size must be admitted by the plan of `Q36_BUDGET` and at most 512 (the largest worker
-    /// piece that the settings accept). The coordinator runs it with `--ignored --exact` under the
-    /// exclusive lock. Environment: `Q36_CKPT_DIR` (with `tokenizer.json`), `Q36_PROMPT_IDS` (the
-    /// file of little-endian `u32` ids that `q36-dr4-prompt-ids.py` writes), `Q36_CACHE_LIMIT`,
-    /// `Q36_BUDGET` (default 32,212,254,720), `Q36_CHUNKS`, `Q36_ACTIVATION` (`f32` | `bf16`,
-    /// unset the F32 control; `real::activation_from_env`, the one definition — fix4 of packet
-    /// Q36-BF16-b), and `Q36_EXECUTOR_REPORT`.
+    /// The prefill rate of the frozen 2,048-token prompt through the executor (the prompt gate is
+    /// 60 prompt tokens per second). The test runs the prompt once for each chunk size in
+    /// `Q36_CHUNKS` (default `256,512`; `0` is the one-token path and is slow) in worker pieces of
+    /// that size, and reports seconds, tokens per second, chunk runs, the allocator peak against
+    /// the planned workspace, and in a qualification build the synchronizations, the forced
+    /// flushes, and the peak retired bytes. It asserts no speed. Every size must be admitted by the
+    /// plan of `Q36_BUDGET` and at most 512 (the largest worker piece that the settings accept).
+    /// The coordinator runs it with `--ignored --exact` under the exclusive lock. Environment:
+    /// `Q36_CKPT_DIR` (with `tokenizer.json`), `Q36_PROMPT_IDS` (the file of little-endian `u32`
+    /// ids that `q36-dr4-prompt-ids.py` writes), `Q36_CACHE_LIMIT`, `Q36_BUDGET` (default
+    /// 32,212,254,720), `Q36_CHUNKS`, `Q36_ACTIVATION` (`f32` | `bf16`, unset the F32 control;
+    /// `real::activation_from_env`, the one definition), and `Q36_EXECUTOR_REPORT`.
     #[test]
     #[ignore = "needs the pinned Q36 checkpoint and the frozen 2,048-token prompt on the Mac"]
     fn the_chunked_prefill_reports_the_rate_on_the_frozen_2048_token_prompt() {
@@ -2958,7 +2941,7 @@ mod tests {
         assert_eq!(
             format!("{:x}", Sha256::digest(bytes)),
             PROMPT_2048_SHA256,
-            "the first 2,048 ids differ from the Q36-REF prompt"
+            "the first 2,048 ids differ from the reference prompt"
         );
         let prompt: Vec<u32> = bytes
             .as_chunks::<4>()
@@ -3085,8 +3068,8 @@ mod tests {
     /// recurrent state `[2, 32, 32]` is 8,192 bytes and the convolution ring `[128, 3]` is 1,536
     /// (the fixture numbers of `state.rs`).
     const FIXED_BYTES: u64 = 2 * (2 * 32 * 32 * 4 + 128 * 3 * 4);
-    /// Q-R1: an entry charges the fixed DeltaNet bytes plus the page-table allowance of
-    /// its alias - one 16-byte page covers every fixture position count here.
+    /// An entry charges the fixed DeltaNet bytes plus the page-table allowance of its alias - one
+    /// 16-byte page covers every fixture position count here.
     const TABLE: u64 = 16;
 
     /// The rules of the prefix tests: `PREFIX_LIMIT` positions and room for a live session and one
@@ -3215,7 +3198,7 @@ mod tests {
             .prefill(&mut session, &PREFIX_PROMPT[KEY..])
             .unwrap();
         let pending = session.core.pending().unwrap();
-        // One-token steps are the path with bitwise equality (addendum item 8).
+        // One-token steps are the path with bitwise equality.
         for (n, token) in std::iter::once(pending).chain(FORCED).enumerate() {
             let row = executor
                 .decoder
@@ -3292,11 +3275,11 @@ mod tests {
         );
     }
 
-    /// A restore that the session budget denies drops the entry and changes nothing (decision
-    /// 0036, addendum 1 item 7). The denial comes from the cap, never from a `SessionBudget` swap
-    /// under live state: a swap after a save orphans the entry's permit and breaks the rollback
-    /// re-acquire of the target's charge, which then leaves the state with its layers but empty
-    /// permits and the next commit fails its charge check.
+    /// A restore that the session budget denies drops the entry and changes nothing. The denial
+    /// comes from the cap, never from a `SessionBudget` swap under live state: a swap after a save
+    /// orphans the entry's permit and breaks the rollback re-acquire of the target's charge, which
+    /// then leaves the state with its layers but empty permits and the next commit fails its charge
+    /// check.
     ///
     /// The cap (25,000, `denial_rules`) is fixed before the save. The save needs 22,544 bytes
     /// (the saver's three key positions 3 * GROWTH plus the entry FIXED_BYTES + TABLE) and
@@ -3306,9 +3289,9 @@ mod tests {
     ///
     /// Production reachability: the reason for the denial (the entry's charge plus its restored
     /// cache do not fit the free session cap) is the reason a real restore is denied when
-    /// `session_cap_bytes` is too small (fix round Q36-PR-1 item 1). The arrangement that reaches
-    /// the branch here with a competing live charge. Default single-session serving cannot hold
-    /// this second session; opt-in concurrent sessions can hold competing charges.
+    /// `session_cap_bytes` is too small. The arrangement that reaches the branch here with a
+    /// competing live charge. Default single-session serving cannot hold this second session;
+    /// opt-in concurrent sessions can hold competing charges.
     #[test]
     fn a_restore_denied_by_the_budget_drops_the_entry_and_changes_nothing() {
         let _serial = crate::native_test_lock();
@@ -3377,17 +3360,16 @@ mod tests {
     fn a_denied_save_while_an_older_entry_exists_leaves_the_slot_empty_and_the_next_job_recomputes()
     {
         let _serial = crate::native_test_lock();
-        // Q-R1 sharing collapsed the old short-prompt arrangement: an entry charges the
-        // same fixed bytes plus page allowance as the snapshot replacing it, so no cap can
-        // fit the prompt-with-entry peak and still deny the save after the entry drops -
-        // the two peaks are equal. The one reachable budget denial that empties a store
-        // sits at a page boundary (PAGE_POSITIONS = 2,048): the longer key crosses into a
-        // second page-table row, so its snapshot (FIXED_BYTES + 2 * 16 = 19,488) is
-        // strictly bigger than the older entry's (FIXED_BYTES + 16 = 19,472). The long
-        // prompt feeds 2,053 positions (2,053 * GROWTH = 2,102,272 live): with the older
-        // entry the peak is 2,121,744 and the cap of 2,121,750 fits it, while the tip save
-        // after the retry evicts the older entry needs 2,102,272 + 19,488 = 2,121,760 and
-        // is denied - the exact 16-byte page step is the whole window.
+        // Page sharing collapsed the old short-prompt arrangement: an entry charges the same fixed
+        // bytes plus page allowance as the snapshot replacing it, so no cap can fit the
+        // prompt-with-entry peak and still deny the save after the entry drops - the two peaks are
+        // equal. The one reachable budget denial that empties a store sits at a page boundary
+        // (PAGE_POSITIONS = 2,048): the longer key crosses into a second page-table row, so its
+        // snapshot (FIXED_BYTES + 2 * 16 = 19,488) is strictly bigger than the older entry's
+        // (FIXED_BYTES + 16 = 19,472). The long prompt feeds 2,053 positions (2,053 * GROWTH =
+        // 2,102,272 live): with the older entry the peak is 2,121,744 and the cap of 2,121,750 fits
+        // it, while the tip save after the retry evicts the older entry needs 2,102,272 + 19,488 =
+        // 2,121,760 and is denied - the exact 16-byte page step is the whole window.
         let long: Vec<u32> = (0..2_054u32).map(|i| i % 8).collect();
         let mut denial = denial_rules();
         denial.session_cap = 2_121_750;
@@ -3438,13 +3420,11 @@ mod tests {
         );
     }
 
-    /// Fix EV-1 at the real executor: stored entries charge the budget through their
-    /// snapshots' permits, and each `evict_one_prefix_entry` step drops one LRU entry - the
-    /// restored one
-    /// included - and releases exactly their charges, so a dead conversation stops pinning the
-    /// pool (the Mac daily RED). A pinned root keeps its charge. The tip the LIVE session
-    /// saved releases only its fixed and page-table bytes: its KV permits are shared with
-    /// the session, which still holds them.
+    /// At the real executor, stored entries charge the budget through their snapshots' permits, and
+    /// each `evict_one_prefix_entry` step drops one LRU entry - the restored one included - and
+    /// releases exactly their charges, so a dead conversation stops pinning the pool. A pinned root
+    /// keeps its charge. The tip the LIVE session saved releases only its fixed and page-table
+    /// bytes: its KV permits are shared with the session, which still holds them.
     #[test]
     fn evicting_the_store_releases_the_entries_charges_and_keeps_roots() {
         let _serial = crate::native_test_lock();
@@ -3603,9 +3583,8 @@ mod tests {
         );
     }
 
-    /// The default rules keep the addendum 1 store (decision 0036, addendum 1): every executor
-    /// built without the `prefix_reuse` flag reports zero roots and one entry, so the worker
-    /// saves only the tip, exactly as before the addendum 2 set existed. The literals pin the
+    /// The default rules keep the tip store: every executor built without the `prefix_reuse` flag
+    /// reports zero roots and one entry, so the worker saves only the tip. The literals pin the
     /// value, not the `Default` under test.
     #[test]
     fn the_default_rules_keep_the_addendum_one_store_limits() {
@@ -3621,9 +3600,9 @@ mod tests {
         );
     }
 
-    /// A `prefix_reuse` engine holds the addendum 2 set (packet SERVE-2-c item 1): the rules
-    /// carry the limits and the executor reports them, so the worker emits the root save point
-    /// and the store keeps two pinned roots beside six LRU entries.
+    /// A `prefix_reuse` engine holds the reuse set: the rules carry the limits and the executor
+    /// reports them, so the worker emits the root save point and the store keeps two pinned roots
+    /// beside six LRU entries.
     ///
     /// Mutation check (the limits-ignored patch): building the store with
     /// `PrefixSlot::default()` in `from_parts` makes the report read `(0, 1)` and fails.
@@ -3643,18 +3622,17 @@ mod tests {
                 roots: 2,
                 entries: 6
             },
-            "the executor holds the addendum 2 set"
+            "the executor holds the reuse set"
         );
     }
 
-    /// Decision 0036, addendum 2, item 6 (packet SERVE-2-c item 2): a root is best effort
-    /// inside the session cap. A denied root save skips only that save: the store stays empty,
-    /// the denial charges nothing, and the job runs on to its tip save and its decode like a
-    /// job without a root point. The charge grows with the position — the tip snapshot of a
-    /// longer key needs strictly more bytes than the root snapshot beside the same live
-    /// session — so no single cap can deny the earlier root and admit the later tip; the test
-    /// raises the cap between the two saves, after the reset that the `set_session_budget`
-    /// seam requires, at a point where no entry is stored (the root was skipped).
+    /// A root is best effort inside the session cap. A denied root save skips only that save: the
+    /// store stays empty, the denial charges nothing, and the job runs on to its tip save and its
+    /// decode like a job without a root point. The charge grows with the position — the tip
+    /// snapshot of a longer key needs strictly more bytes than the root snapshot beside the same
+    /// live session — so no single cap can deny the earlier root and admit the later tip; the test
+    /// raises the cap between the two saves, after the reset that the `set_session_budget` seam
+    /// requires, at a point where no entry is stored (the root was skipped).
     #[test]
     fn a_denied_root_save_skips_only_that_save_and_the_job_still_succeeds() {
         let _serial = crate::native_test_lock();
@@ -3666,13 +3644,12 @@ mod tests {
             },
             ..prefix_rules()
         });
-        // The tight cap under Q-R1 sharing: the root snapshot charges the fixed DeltaNet
-        // bytes plus a page-table allowance (never the KV of its positions), so the exact
-        // charge moves with the allowance. The denial is anchored on the invariant the
-        // the sharing keeps: fixed_bytes alone (19,456 for this fixture) exceeds the whole
-        // 10,000 cap. The continuing job still fits - its 2 prompt + 4 decode positions bring
-        // the session to 9 * GROWTH = 9,216 - so the root save is denied whatever the page
-        // allowance is.
+        // The tight cap under page sharing: the root snapshot charges the fixed DeltaNet bytes plus
+        // a page-table allowance (never the KV of its positions), so the exact charge moves with
+        // the allowance. The denial is anchored on the invariant the the sharing keeps: fixed_bytes
+        // alone (19,456 for this fixture) exceeds the whole 10,000 cap. The continuing job still
+        // fits - its 2 prompt + 4 decode positions bring the session to 9 * GROWTH = 9,216 - so the
+        // root save is denied whatever the page allowance is.
         executor
             .decoder
             .set_session_budget(SessionBudget::new(10_000));
@@ -3733,10 +3710,10 @@ mod tests {
         );
     }
 
-    /// The report of the executor (packet SERVE-2-c item 3): the entries and the charged bytes
-    /// of the store after the job's save points, and the kind of the entry a later job
-    /// restored. Every number is hand-derived from the fixture: an entry of `n` key tokens
-    /// holds `n - 1` fed positions, so it charges `FIXED_BYTES + TABLE` bytes (Q-R1).
+    /// The report of the executor: the entries and the charged bytes of the store after the job's
+    /// save points, and the kind of the entry a later job restored. Every number is hand-derived
+    /// from the fixture: an entry of `n` key tokens holds `n - 1` fed positions, so it charges
+    /// `FIXED_BYTES + TABLE` bytes.
     ///
     /// Mutation checks: the hit-always-Miss patch fails the restored rows; the byte-sum-dropped
     /// patch (bytes 0) fails the bytes rows.
@@ -3838,10 +3815,9 @@ mod tests {
         );
     }
 
-    /// The `uncached_shared` count of the report (packet SERVE-2-c item 3): a stored key that
-    /// the prompt covers but cannot restore — here one of another numeric path — leaves its
-    /// tokens shared but uncached. The chunk path refuses the steps entry, nothing restores,
-    /// and the whole stored key counts.
+    /// The `uncached_shared` count of the report: a stored key that the prompt covers but cannot
+    /// restore — here one of another numeric path — leaves its tokens shared but uncached. The
+    /// chunk path refuses the steps entry, nothing restores, and the whole stored key counts.
     ///
     /// Mutation check: returning 0 from `uncached_shared` fails the count row.
     #[test]
@@ -3898,12 +3874,11 @@ mod tests {
         let (want_a, want_b, want_e) = (chain(&prompt_a), chain(&prompt_b), chain(&prompt_e));
         // The worker piece of 3 splits the 4 key tokens into two pieces.
         let engine = spawn_engine(3, move || Ok(build(prefix_rules()))).unwrap();
-        // The report of a store with the one tip entry of `n` key tokens, which holds
-        // `n - 1` fed positions and charges `FIXED_BYTES + TABLE` bytes (Q-R1). The
-        // save-side lifetime totals: the one-entry store (addendum 1 limits) makes every
-        // later cross-key save spend the single slot - a room removal when the job
-        // restored nothing, a restored-ancestor replace (clarification 1) when the tip
-        // extends the entry this job restored - so they accumulate across the rounds.
+        // The report of a store with the one tip entry of `n` key tokens, which holds `n - 1` fed
+        // positions and charges `FIXED_BYTES + TABLE` bytes. The save-side lifetime totals: the
+        // one-entry store (tip-store limits) makes every later cross-key save spend the single
+        // slot - a room removal when the job restored nothing, a restored-ancestor replace when the
+        // tip extends the entry this job restored - so they accumulate across the rounds.
         let tip_of = |_key: usize, hit: PrefixHit, uncached: u32, save_side: SaveSideTotals| {
             Some(PrefixReport {
                 entries: 1,

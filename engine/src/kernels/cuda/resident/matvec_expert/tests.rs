@@ -1,6 +1,5 @@
 //! Device tests (3090) of `matvec_expert` (seam 1: the Rust wrapper against the C entry against
-//! the V-MV1-trimmed vendored `mul_mat_vec_q` ids path). Device tests assume `--test-threads=1`
-//! (decision 0040).
+//! the trimmed vendored `mul_mat_vec_q` ids path). Device tests assume `--test-threads=1`.
 //!
 //! The host reference is the one of `matvec_q`'s tests (`reference`), shared so the two files
 //! cannot drift: the dense per-slot oracle of test 5 is `matvec_q` itself on the selected
@@ -16,7 +15,7 @@ use crate::kernels::cuda::{CapturePlan, CudaContext, DeviceBuffer, DeviceStream}
 
 const N_EXPERT: usize = 16;
 const N_USED: usize = 8;
-/// Slots include 0 and 15 and a repeated id, per the packet.
+/// Slots include 0 and 15 and a repeated id.
 const IDS: [i32; N_USED] = [0, 15, 3, 3, 7, 15, 1, 9];
 const TYPES: [QuantType; 4] = [
     QuantType::Q4K,
@@ -27,7 +26,7 @@ const TYPES: [QuantType; 4] = [
 const GATE_UP: (usize, usize) = (2048, 512);
 const DOWN: (usize, usize) = (512, 2048);
 /// k 2304 pads to 2560: the per-slot activation rows are 80 q8_1 blocks apart, not 72 (the other
-/// shapes have k % 512 == 0, where the two strides coincide; KUBDAN-MSG-64 item 8, mutant S1).
+/// shapes have k % 512 == 0, where the two strides coincide).
 const PADDED: (usize, usize) = (2304, 64);
 const NAN_BITS: u32 = 0x7fc0_0000;
 
@@ -158,8 +157,8 @@ fn expert_launch(
     .expect("expert matvec");
 }
 
-/// The byte counts `plan_matvec_expert` checks a call against (KUBDAN-MSG-64 items 6 and 10, mutant
-/// S4): the A2 footprint of `y`, the per-slot activation rows and the checked `rows * n_expert`.
+/// The byte counts `plan_matvec_expert` checks a call against: the footprint of `y`, the
+/// per-slot activation rows and the checked `rows * n_expert`.
 #[test]
 fn expert_needs_are_pure_and_exact() {
     let shape = ExpertShape {
@@ -196,8 +195,8 @@ fn expert_needs_are_pure_and_exact() {
     };
     let need = expert_needs(&padded).expect("sizes");
     assert_eq!((need.w_stack, need.x_q8), (16 * 64 * 9 * 144, 8 * 80 * 36));
-    // Overflows are None, not a panic or a wrapped size: rows * n_expert (KUBDAN-MSG-64 F10), the
-    // y footprint, and a shape without used slots.
+    // Overflows are None, not a panic or a wrapped size: rows * n_expert, the y footprint, and a
+    // shape without used slots.
     let huge_stack = ExpertShape {
         rows: usize::MAX / 2,
         n_expert: 4,
@@ -211,14 +210,13 @@ fn expert_needs_are_pure_and_exact() {
     assert!(expert_needs(&huge_stride).is_none());
     let no_slots = ExpertShape { n_used: 0, ..shape };
     assert!(expert_needs(&no_slots).is_none());
-    // S1 follow-up 1 (KUBDAN-MSG-67 condition 2): a `rows * n_expert` that WRAPS TO ZERO while
-    // every later product stays small, so only the checked multiply refuses it. rows 1<<61 x 8
-    // experts wraps to 0 (a wrapping form would answer weight_bytes(0, k) = 0 and pass), and
-    // the y footprint (0 * stride + 1<<61, times 4 = 1<<63) still fits usize. The packet's
-    // 1<<62 x 4 form wraps as well; BOTH forms are refused by the rows.checked_mul(n_expert)
-    // multiply itself (1<<62 * 4 = 2^64 overflows it too — the second form's y footprint would
-    // also overflow its own multiply, but the w_stack field is evaluated first); both are
-    // pinned.
+    // A `rows * n_expert` that WRAPS TO ZERO while every later product stays small, so only the
+    // checked multiply refuses it. rows 1<<61 x 8 experts wraps to 0 (a wrapping form would
+    // answer weight_bytes(0, k) = 0 and pass), and the y footprint (0 * stride + 1<<61, times
+    // 4 = 1<<63) still fits usize. The 1<<62 x 4 form wraps as well; BOTH forms are refused by
+    // the rows.checked_mul(n_expert) multiply itself (1<<62 * 4 = 2^64 overflows it too — the
+    // second form's y footprint would also overflow its own multiply, but the w_stack field is
+    // evaluated first); both are pinned.
     let wrap_zero = ExpertShape {
         rows: 1 << 61,
         n_expert: 8,
@@ -246,11 +244,11 @@ fn matvec_expert_equals_the_dense_launch_per_slot() {
         for (ti, ty) in TYPES.iter().enumerate() {
             let seed = 0x8000_0000 + si as u64 * 1000 + ti as u64;
             let (stack, ids, shared, per_slot) = stack_rig(&ctx, &stream, *ty, *shape, seed);
-            // A2: y is [slot][gate|up]: one buffer of stride 2 * rows, the gate launch writes
+            // y is [slot][gate|up]: one buffer of stride 2 * rows, the gate launch writes
             // offset 0 and the up launch offset rows of each slot.
             let (_, rows) = *shape;
             let stride = 2 * rows;
-            // The full [slot][gate|up] buffer of A2: every slot has both halves, so the canary
+            // The full [slot][gate|up] buffer: every slot has both halves, so the canary
             // check can look at the up half of the last slot too.
             let y_bytes = stride * N_USED * 4;
             let gate_y = testkit::upload_filled(&ctx, 0xAA, y_bytes);
@@ -385,8 +383,8 @@ fn matvec_expert_follows_the_device_ids() {
     }
 }
 
-/// The A1 guard of one shape: ids holding -1 and `N_EXPERT` in two slots give those slots the quiet
-/// NaN in every row and leave the other slots equal to the dense oracle.
+/// The out-of-range id guard of one shape: ids holding -1 and `N_EXPERT` in two slots give those
+/// slots the quiet NaN in every row and leave the other slots equal to the dense oracle.
 fn check_out_of_range_ids(
     ctx: &CudaContext,
     stream: &DeviceStream,
@@ -429,10 +427,10 @@ fn check_out_of_range_ids(
     }
 }
 
-/// Test 10, a real device test since A1: the gate/up shape (k 2048, one row per block) and the
-/// production Q4_K down shape (k 512, 2048 rows, per-slot x): its K loop is shorter than one block
-/// iteration, so the launch is the small-k one with several rows per block and the NaN loop of the
-/// guard writes several rows there (KUBDAN-MSG-64 item 9, mutant S3: a loop that writes row 0 only).
+/// The gate/up shape (k 2048, one row per block) and the production Q4_K down shape (k 512, 2048
+/// rows, per-slot x): its K loop is shorter than one block iteration, so the launch is the
+/// small-k one with several rows per block and the NaN loop of the guard writes several rows
+/// there (a loop that writes row 0 only fails).
 #[test]
 fn matvec_expert_ids_out_of_range_are_documented() {
     if !testkit::device_present("matvec_expert_ids_out_of_range_are_documented") {
@@ -473,7 +471,7 @@ struct Spec {
     stream_of: Owner,
 }
 
-/// Q4_K, k 768 (three blocks, padded to 1024), 16 experts of 64 rows, 8 used slots, the A2
+/// Q4_K, k 768 (three blocks, padded to 1024), 16 experts of 64 rows, 8 used slots, the
 /// `[slot][gate|up]` stride of 128 floats and one shared activation row.
 const STACK_NEED: usize = 16 * 64 * 3 * 144;
 const IDS_NEED: usize = 8 * 4;
@@ -561,9 +559,9 @@ fn attempt(rig: &RefusalRig, other: &OtherContext, spec: Spec) -> Result<(), Eng
     )
 }
 
-/// KUBDAN-MSG-64 item 6 for `plan_matvec_expert`: every refusal is a `BadRequest` with the text of
-/// its own check (among them the A2 footprint of `y`), nothing is queued, the backend stays usable,
-/// and the valid call of the same rig launches.
+/// For `plan_matvec_expert`, every refusal is a `BadRequest` with the text of its own check (among
+/// them the footprint of `y`), nothing is queued, the backend stays usable, and the valid call of
+/// the same rig launches.
 #[test]
 fn matvec_expert_rejects_unsound_calls_before_launching() {
     if !testkit::device_present("matvec_expert_rejects_unsound_calls_before_launching") {
@@ -849,7 +847,7 @@ fn matvec_expert_rejects_unsound_calls_before_launching() {
 /// The poison word of the unsound-call rig (`y` is filled with 0xAB bytes).
 const POISON: u32 = 0xABAB_ABAB;
 
-/// A2 footprint check: the `rows` live f32 words of every slot differ from the poison word and
+/// Footprint check: the `rows` live f32 words of every slot differ from the poison word and
 /// the `stride - rows` gap words between slots keep it. Pure, so its own test can prove it is
 /// not vacuous (`the_stride_layout_check_catches_an_unwritten_slot_and_an_overwritten_gap`).
 fn check_stride_layout(

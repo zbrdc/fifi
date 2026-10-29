@@ -65,8 +65,8 @@ struct WindowFake {
     hold: Option<Gate>,
     failure: Option<Failure>,
     deny_session: bool,
-    /// The fake's pool-derived ceiling (fix EV-2 on the batch path): `None` means no
-    /// budget to report, like the default executor.
+    /// The fake's pool-derived ceiling, which classifies a final denial on the batch path:
+    /// `None` means no budget to report, like the default executor.
     ceiling: Option<u64>,
     fail_after_emit: bool,
     draws: bool,
@@ -74,28 +74,28 @@ struct WindowFake {
     /// The number of `prefill` calls so far, for the one-shot piece denial below.
     prefill_calls: usize,
     /// When set, the `prefill` call at this index returns a memory-plan denial once
-    /// (fix EV-1's restart test): a piece that fails after an earlier piece succeeded.
+    /// (the eviction restart test): a piece that fails after an earlier piece succeeded.
     fail_prefill_piece: Option<usize>,
-    /// Denies every prefill piece whose tokens carry this marker token, up to the
-    /// budget below (Sol round 2, SF3): a PER-JOB failure - the denied job restarts,
-    /// denies again if the budget allows, and only the spent eviction budget makes it
-    /// final, while other jobs' pieces prefill fine.
+    /// Denies every prefill piece whose tokens carry this marker token, up to the budget
+    /// below: a PER-JOB failure - the denied job restarts, denies again if the budget
+    /// allows, and only the spent eviction budget makes it final, while other jobs' pieces
+    /// prefill fine.
     deny_prefill_token: Option<u32>,
     /// The marker denial budget (usize::MAX denies every carrying piece, the exhaustion
     /// path; a small budget lets the restart succeed).
     deny_prefill_token_budget: usize,
     /// Evictions handed out so far: the fake's ceiling grows with each, modeling a pool
-    /// whose honest prompt ceiling rises as entries free (round 4c, R4-MF2).
+    /// whose honest prompt ceiling rises as entries free.
     evicted: u64,
     deny_all_prefill: bool,
-    /// How many evictions the fake can still free (review round 4, MF1): `Some(0)` is
-    /// honest progress - an entry went, zero bytes were charged to this fake - and the
-    /// count runs out, after which `None` means the store is empty and a denial is
-    /// final. The default of 8 is more than any single request should need.
+    /// How many evictions the fake can still free: `Some(0)` is honest progress - an entry
+    /// went, zero bytes were charged to this fake - and the count runs out, after which
+    /// `None` means the store is empty and a denial is final. The default of 8 is more than
+    /// any single request should need.
     evictions: usize,
-    /// When set, the `reset` call at this index returns this error once (review round 2,
-    /// MF2): a native failure inside the restart of a denied slot (reset 0 belongs to the
-    /// admission, reset 1 to the restart).
+    /// When set, the `reset` call at this index returns this error once: a native failure
+    /// inside the restart of a denied slot (reset 0 belongs to the admission, reset 1 to
+    /// the restart).
     fail_reset_call: Option<(usize, EngError)>,
     /// The number of `reset` calls so far, for the indexed failure below.
     reset_calls: usize,
@@ -183,7 +183,7 @@ impl ExecutorOps for WindowFake {
 
     fn pool_prompt_ceiling(&self, _row: &Row) -> Option<u64> {
         // Two tokens of honest ceiling per freed entry: a deficit of k entries needs
-        // k evictions before the ceiling admits (round 4c, R4-MF2).
+        // k evictions before the ceiling admits.
         self.ceiling.map(|base| base + 2 * self.evicted)
     }
 
@@ -559,8 +559,7 @@ fn a_restarted_slot_never_saves_a_snapshot() {
     let mut fake = WindowFake::new(&log);
     // Piece 1 (the 1-token tail after the tip point 4) is denied. The first attempt
     // saved the tip at its point; the restart must admit the whole prompt with no
-    // snapshot, because a snapshot that charges can starve the tail that follows it
-    // (review round 2, MF1).
+    // snapshot, because a snapshot that charges can starve the tail that follows it.
     fake.fail_prefill_piece = Some(1);
     let (engine, release) = start(fake);
     let (first, first_events) = job(&[7, 7, 7, 7, 7], 1);
@@ -603,7 +602,7 @@ fn a_native_failure_during_the_restart_fans_out_as_the_backend_error() {
     let mut fake = WindowFake::new(&log);
     // Piece 0 is denied, which routes the slot into the restart; the restart's reset
     // then fails natively. The failure - not the denied prefill's memory-plan error -
-    // must reach the job and the engine state (review round 2, MF2).
+    // must reach the job and the engine state.
     fake.fail_prefill_piece = Some(0);
     fake.fail_reset_call = Some((
         1,
@@ -785,8 +784,8 @@ fn session_admission_denial_evicts_and_retries() {
     }
     release.send(()).expect("load");
     assert_eq!(usage(&collect(first_events)).completion_tokens, 1);
-    // Fix EV-1: the one-shot admission denial is retried after the eviction, so the job
-    // runs instead of failing - a cached entry must not block session allocation.
+    // The one-shot admission denial is retried after the eviction, so the job runs
+    // instead of failing - a cached entry must not block session allocation.
     assert_eq!(usage(&collect(denied_events)).completion_tokens, 1);
     assert_eq!(usage(&collect(third_events)).completion_tokens, 1);
     // With max_seqs 2 the retried job takes the second slot of the first window; the third
@@ -801,10 +800,10 @@ fn a_retried_slots_later_denial_evicts_again_and_finishes() {
     let log = Log::default();
     let mut fake = WindowFake::new(&log);
     // One admission denial (spent on the retry that admits the job) and one prefill
-    // denial in the retried slot: under the incremental contract (review round 4, MF1)
-    // the later denial evicts one more entry and restarts the slot instead of erroring -
-    // the first denial freed one entry, and the next may need only one more. The fake's
-    // failure is one-shot, so the restarted prefill admits and the job finishes.
+    // denial in the retried slot: under the incremental contract the later denial
+    // evicts one more entry and restarts the slot instead of erroring - the first
+    // denial freed one entry, and the next may need only one more. The fake's failure
+    // is one-shot, so the restarted prefill admits and the job finishes.
     fake.deny_session = true;
     fake.fail_prefill_piece = Some(1);
     let (engine, release) = start(fake);
@@ -835,9 +834,8 @@ fn an_admission_retry_saves_no_points() {
     fake.deny_session = true;
     let (engine, release) = start(fake);
     // The seed session goes to the plain job, so the boundary job's admission is the
-    // denied-and-retried one. The retried slot must clear the points build_slot set up
-    // (MF1's admission-retry half): a job whose prompt would otherwise hit its tip save
-    // produces no save call at all.
+    // denied-and-retried one. The retried slot must clear the points build_slot set up: a
+    // job whose prompt would otherwise hit its tip save produces no save call at all.
     let (plain, plain_events) = job(&[0], 1);
     let (tip, tip_events) = job(&[1, 1, 1, 1, 1], 1);
     let tip = tip.with_prefix_boundary(4).expect("tip");
@@ -862,10 +860,10 @@ fn a_final_batch_denial_reports_the_pools_honest_ceiling() {
     let log = Log::default();
     let mut fake = WindowFake::new(&log);
     // The admission denial spends an eviction and the retried slot's EVERY piece denies
-    // (the marker token targets only that job, Sol round 2 SF3): the restart evicts one
-    // more entry, the next denial finds the budget spent - `None` - and only then is the
-    // refusal final, so fix EV-2 must classify it against the pool's honest ceiling
-    // instead of leaking the raw memory-plan error. The other job prefills untouched.
+    // (the marker token targets only that job): the restart evicts one more entry, the next
+    // denial finds the budget spent - `None` - and only then is the refusal final, so the
+    // engine must classify it against the pool's honest ceiling instead of leaking the raw
+    // memory-plan error. The other job prefills untouched.
     fake.deny_session = true;
     fake.deny_prefill_token = Some(1);
     fake.evictions = 2;
@@ -880,8 +878,8 @@ fn a_final_batch_denial_reports_the_pools_honest_ceiling() {
     assert_eq!(usage(&collect(first_events)).completion_tokens, 1);
     // The pre-pass spends both entries (ceiling 1+2*2=5, still short of the 6-token
     // prompt) and hits `None`: the TERMINAL branch classifies immediately - no restart,
-    // no re-feed (Sol round 3, SF2) - against the pool's honest ceiling (the base plus
-    // the two freed entries) instead of leaking the raw memory-plan error.
+    // no re-feed - against the pool's honest ceiling (the base plus the two freed
+    // entries) instead of leaking the raw memory-plan error.
     assert_eq!(
         collect(denied_events),
         vec![JobEvent::Error(EngError::PromptTooLong {
@@ -903,10 +901,10 @@ fn a_final_batch_denial_reports_the_pools_honest_ceiling() {
 
 #[test]
 fn an_empty_store_denial_with_room_recovers_through_one_no_save_restart() {
-    // Sol round 4, MF1: an exhausted store (no evictable entry) whose denial is
-    // recoverable - a save charge the no-save retry avoids, with ceiling to spare -
-    // must NOT be classified away by the terminal branch: the single no-save restart
-    // finishes the prompt, exactly like the single worker's gated recovery.
+    // An exhausted store (no evictable entry) whose denial is recoverable - a save
+    // charge the no-save retry avoids, with ceiling to spare - must NOT be
+    // classified away by the terminal branch: the single no-save restart finishes
+    // the prompt, exactly like the single worker's gated recovery.
     let log = Log::default();
     let mut fake = WindowFake::new(&log);
     fake.fail_prefill_piece = Some(1);
@@ -926,15 +924,15 @@ fn an_empty_store_denial_with_room_recovers_through_one_no_save_restart() {
 
 #[test]
 fn a_multi_entry_deficit_costs_one_batch_restart_not_k() {
-    // Round 4c R4-MF2 + round 4d Sol-r3 SF1/SF2: the batch prefill restart must SIZE
-    // the eviction first, like the single worker. A 3-entry deficit (the fake's ceiling
-    // needs three freed entries before it admits the 6-token prompt), a ONE-piece
-    // denial budget, and a SURPLUS eviction budget of five - the pre-pass stops the
-    // moment the ceiling admits, so exactly three evictions happen and the two spare
-    // entries stay. The note trace pins it: from the denied piece, exactly three
-    // evicts, ONE reset, then the successful re-feed. A no-pre-pass mutant evicts once
-    // before the reset; a drain-to-None mutant spends all five and never reaches a
-    // reset; a setup-twice mutant shows a second reset before the re-feed.
+    // The batch prefill restart must SIZE the eviction first, like the single worker. A
+    // 3-entry deficit (the fake's ceiling needs three freed entries before it admits
+    // the 6-token prompt), a ONE-piece denial budget, and a SURPLUS eviction budget of
+    // five - the pre-pass stops the moment the ceiling admits, so exactly three
+    // evictions happen and the two spare entries stay. The note trace pins it: from the
+    // denied piece, exactly three evicts, ONE reset, then the successful re-feed. A
+    // no-pre-pass mutant evicts once before the reset; a drain-to-None mutant spends
+    // all five and never reaches a reset; a setup-twice mutant shows a second reset
+    // before the re-feed.
     let log = Log::default();
     let mut fake = WindowFake::new(&log);
     fake.deny_prefill_token = Some(1);
@@ -988,13 +986,13 @@ fn a_multi_entry_deficit_costs_one_batch_restart_not_k() {
 
 #[test]
 fn a_persistent_denial_on_an_exhausted_store_takes_one_restart_then_classifies() {
-    // Round 4e MF1 (Opus + Sol r5 MF1): a store already exhausted whose denial the
-    // ceiling does NOT explain (the marker budget denies every carrying piece
-    // forever, the ceiling 100 fits the 5-token prompt with room) must not restart
-    // forever: the terminal branch takes the ONE no-save recovery, and the SECOND
-    // exhausted denial classifies even though the ceiling fits - exactly one reset
-    // after the denied piece, then the raw memory-plan error. The unbounded mutant
-    // restarts once per tick, never closes the job, and fails collect's deadline.
+    // A store already exhausted whose denial the ceiling does NOT explain (the
+    // marker budget denies every carrying piece forever, the ceiling 100 fits the
+    // 5-token prompt with room) must not restart forever: the terminal branch
+    // takes the ONE no-save recovery, and the SECOND exhausted denial classifies
+    // even though the ceiling fits - exactly one reset after the denied piece,
+    // then the raw memory-plan error. The unbounded mutant restarts once per tick,
+    // never closes the job, and fails collect's deadline.
     let log = Log::default();
     let mut fake = WindowFake::new(&log);
     fake.deny_prefill_token = Some(1);
@@ -1034,8 +1032,8 @@ fn a_persistent_denial_on_an_exhausted_store_takes_one_restart_then_classifies()
 
 #[test]
 fn a_persistent_denial_without_a_ceiling_takes_one_restart_then_classifies() {
-    // The ceiling-less twin (Sol r5 MF1 asked for both cases): `None` never proves a
-    // fit impossible, so only the once-only exhaustion bound stops the spin - one
+    // The ceiling-less twin of the test above: `None` never proves a fit
+    // impossible, so only the once-only exhaustion bound stops the spin - one
     // restart, then the raw memory-plan error, with not one eviction to spend.
     let log = Log::default();
     let mut fake = WindowFake::new(&log);
@@ -1068,25 +1066,24 @@ fn a_persistent_denial_without_a_ceiling_takes_one_restart_then_classifies() {
 
 #[test]
 fn a_denial_restart_restores_the_denied_jobs_own_tip_through_a_real_batch_store() {
-    // Round 4e SF-1 (Opus + Sol r5 SF2) / r6 MF1: the batch pre-pass against a REAL
-    // store (FakeExecutor + prefix limits + session budget with `max_seqs` 8, so
-    // spawn_engine selects the BATCH worker - not the WindowFake evict counter, and
-    // not the single-worker path the same fake defaults to). The denied conversation's
-    // second turn restores its own tip, the growth cannot fit, the pre-pass protects
-    // the restored anchor, and the rebuild re-restores it (reused > 0) - the
-    // integration pin that the protect id from a real restored session survives the
-    // batch restart path. A mutant that deletes the batch restart fails this fixture
-    // outright (the turn errors instead of finishing).
-    // HONEST SCOPE (both reviewers asked): this fixture does NOT discriminate a
-    // no-protect mutant - the restore moves the denied conversation's entry to MRU,
-    // so the oldest OTHER tip spends with or without protection (same for the worker
-    // twin in worker.rs, `a_denial_keeps_the_denied_jobs_own_restored_anchor_and_
-    // spends_a_dead_tip`). The arms that CAN be discriminated are pinned elsewhere:
-    // the tier order by hand-built-store mutants in family/session.rs
+    // The batch pre-pass against a REAL store (FakeExecutor + prefix limits + session
+    // budget with `max_seqs` 8, so spawn_engine selects the BATCH worker - not the
+    // WindowFake evict counter, and not the single-worker path the same fake defaults
+    // to). The denied conversation's second turn restores its own tip, the growth
+    // cannot fit, the pre-pass protects the restored anchor, and the rebuild
+    // re-restores it (reused > 0) - the integration pin that the protect id from a real
+    // restored session survives the batch restart path. A mutant that deletes the batch
+    // restart fails this fixture outright (the turn errors instead of finishing). This
+    // fixture does NOT discriminate a no-protect mutant - the restore moves the denied
+    // conversation's entry to MRU, so the oldest OTHER tip spends with or without
+    // protection (same for the worker twin in worker.rs,
+    // `a_denial_keeps_the_denied_jobs_own_restored_anchor_and_spends_a_dead_tip`). The
+    // arms that CAN be discriminated are pinned elsewhere: the tier order by
+    // hand-built-store mutants in family/session.rs
     // (`an_interior_anchor_spends_before_an_older_covering_root` and the two-path
-    // fixture). The SF1 knob test below exercises the STORE's own protect at the
-    // engine level - the worker's protect WIRING itself is not discriminated by any
-    // engine fixture (store-level tests pin the semantics); its candidate is the
+    // fixture). The adoption-denial knob test below exercises the STORE's own protect
+    // at the engine level - the worker's protect WIRING itself is not discriminated by
+    // any engine fixture (store-level tests pin the semantics); its candidate is the
     // OLDEST entry, so a drop-first or no-protect mutant spends it and reused_tokens
     // flips 100 -> 0.
     let (release, held) = mpsc::channel();
@@ -1094,9 +1091,9 @@ fn a_denial_restart_restores_the_denied_jobs_own_tip_through_a_real_batch_store(
     fake.with_max_seqs(8);
     fake.with_prefix_limits(2, 6);
     fake.with_session_budget(10_000_000, 1_024, 3_000_000);
-    // Clone the window counter BEFORE the fake moves into the factory (round 4f MF1):
-    // a positive count at the end asserts the BATCH branch ran - the single worker
-    // never advances a decode window.
+    // Clone the window counter BEFORE the fake moves into the factory: a positive
+    // count at the end asserts the BATCH branch ran - the single worker never
+    // advances a decode window.
     let windows = fake.window_counter();
     let engine = spawn_engine(4, move || {
         held.recv_timeout(WAIT).expect("release load");
@@ -1146,19 +1143,18 @@ fn a_denial_restart_restores_the_denied_jobs_own_tip_through_a_real_batch_store(
 
 #[test]
 fn an_eviction_resets_the_exhaustion_bound_so_contention_keeps_its_restarts() {
-    // Round 4f SF-3 (Opus) / r7 (Opus SF-B + Sol SF1, honest re-scope): this fixture
-    // pins the flag's PLACEMENT - set only on the EXHAUSTION path, never on an
-    // eviction-backed restart. One evictable entry, no ceiling, a persistent marker
-    // denial: the first denial spends the entry and restart #1 is eviction-backed
-    // (flag stays clear); the second denial finds the store exhausted and takes the
-    // ONE no-save recovery (flag SET); the third classifies. Correct code: exactly
-    // TWO restart resets. A mutant that sets the flag on EVERY restart classifies at
-    // the second denial - ONE reset - and fails this count (mutant verified before
-    // sealing 4f). NON-CLAIM: the eviction happens while the flag is already clear,
-    // so deleting the successful-eviction RESET would also pass - pinning a reset
-    // from an already-SET bound needs a fake whose store repopulates mid-flight
-    // (an exhausted recovery, then another slot saves an entry, then spending it
-    // refreshes eligibility); that pin is an SF1 follow-up.
+    // This fixture pins the flag's PLACEMENT - set only on the EXHAUSTION path, never
+    // on an eviction-backed restart. One evictable entry, no ceiling, a persistent
+    // marker denial: the first denial spends the entry and restart #1 is
+    // eviction-backed (flag stays clear); the second denial finds the store exhausted
+    // and takes the ONE no-save recovery (flag SET); the third classifies. Correct
+    // code: exactly TWO restart resets. A mutant that sets the flag on EVERY restart
+    // classifies at the second denial - ONE reset - and fails this count (mutant
+    // verified). It does not pin the reset: the eviction happens while the flag is
+    // already clear, so deleting the successful-eviction RESET would also pass -
+    // pinning a reset from an already-SET bound needs a fake whose store repopulates
+    // mid-flight (an exhausted recovery, then another slot saves an entry, then
+    // spending it refreshes eligibility); that pin is left to a later change.
     let log = Log::default();
     let mut fake = WindowFake::new(&log);
     fake.deny_prefill_token = Some(1);
@@ -1195,24 +1191,24 @@ fn an_eviction_resets_the_exhaustion_bound_so_contention_keeps_its_restarts() {
 
 #[test]
 fn an_adoption_denial_evicts_one_victim_and_retries_the_same_candidate_on_the_engine() {
-    // SF1 on the full engine path (batch worker, real store): the fake's
-    // `deny_restore_once` knob returns ONE adoption MemoryPlan from the restore
-    // closure - the permit the resident executor charges for the whole restored
-    // extent. The store must NOT drop the candidate: it evicts one victim with the
-    // candidate itself protected and retries the SAME candidate, so the turn reuses
-    // 100 tokens. The turn's growth still fits the budget (the SF1 victim's release
-    // leaves ~4,000,000 free for the ~3,481,600 tail): the SECOND victim is the
-    // SAVE-path snapshot denial - the boundary save at 3,499 charges its own permits
-    // and evicts one more entry - and the save replaces the restored tip@100 with the
-    // turn's own deeper tip@3499 (the lineage rule). A no-retry mutant fails the
-    // reused assertion (the drop-and-next finds no other candidate for this prompt,
-    // reused flips 100 -> 0), and a no-protect mutant IS discriminated at this tip
-    // (verified by mutant rerun): the candidate is the OLDEST entry, so without
-    // protection the retry's eviction spends it - the FIRST failing assertion is the
-    // reused-tokens one (reused flips 100 -> 0), the keys assertion fails after. The
-    // earlier not-discriminated note predates the knob fix, when this fixture was not
-    // exercising SF1 at all. The knob fires ONLY when a candidate is actually
-    // tried: a candidate-less first-turn restore leaves it armed. The
+    // The adoption-denial retry on the full engine path (batch worker, real store): the
+    // fake's `deny_restore_once` knob returns ONE adoption MemoryPlan from the restore
+    // closure - the permit the resident executor charges for the whole restored extent.
+    // The store must NOT drop the candidate: it evicts one victim with the candidate
+    // itself protected and retries the SAME candidate, so the turn reuses 100 tokens.
+    // The turn's growth still fits the budget (the retry victim's release leaves
+    // ~4,000,000 free for the ~3,481,600 tail): the SECOND victim is the SAVE-path
+    // snapshot denial - the boundary save at 3,499 charges its own permits and evicts
+    // one more entry - and the save replaces the restored tip@100 with the turn's own
+    // deeper tip@3499 (the lineage rule). A no-retry mutant fails the reused assertion
+    // (the drop-and-next finds no other candidate for this prompt, reused flips
+    // 100 -> 0), and a no-protect mutant IS discriminated at this tip (verified by
+    // mutant rerun): the candidate is the OLDEST entry, so without protection the
+    // retry's eviction spends it - the FIRST failing assertion is the reused-tokens one
+    // (reused flips 100 -> 0), the keys assertion fails after. The earlier
+    // not-discriminated note predates the knob fix, when this fixture was not
+    // exercising the adoption retry at all. The knob fires ONLY when a candidate is
+    // actually tried: a candidate-less first-turn restore leaves it armed. The
     // store-level twins are `an_adoption_denial_...` and
     // `a_persistent_denial_spends_one_victim_then_drops_the_candidate` in
     // family/session.rs.
@@ -1260,7 +1256,7 @@ fn an_adoption_denial_evicts_one_victim_and_retries_the_same_candidate_on_the_en
         matches!(events.last(), Some(JobEvent::Finished(usage)) if usage.reused_tokens == 100),
         "the retried candidate restored its own 100 tokens: {events:?}"
     );
-    // The lineage won its denial. THREE removals, ONE counted: the SF1 retry's
+    // The lineage won its denial. THREE removals, ONE counted: the adoption retry's
     // eviction (COUNTED, evict_lru_one); the boundary save at 3,499 is denied (the
     // snapshot needs ~12.48 MB against the 10 MB cap after the growth to ~9.48 MB) and
     // the SAVE's own eviction step removes a further tip - save-path removals bypass
@@ -1272,16 +1268,19 @@ fn an_adoption_denial_evicts_one_victim_and_retries_the_same_candidate_on_the_en
         vec![(3_499, false)],
         "the deeper tip of the denied lineage: {keys:?}"
     );
-    // Counter pins (Opus r1 MF-1): deleting either `+= 1` in session.rs must fail a
-    // test. This fixture: no drop (the retry adopted), exactly one COUNTED eviction -
-    // the SF1 retry's; the save-path removal and the lineage replacement do not touch
-    // the counters. The drop pin lives in the store-level twins.
+    // Counter pins: deleting either `+= 1` in session.rs must fail a test. This fixture:
+    // no drop (the retry adopted), exactly one COUNTED eviction - the adoption retry's;
+    // the save-path removal and the lineage replacement do not touch the counters. The
+    // drop pin lives in the store-level twins.
     let (drops, evictions) = {
         let store = store.lock().expect("store lock");
         (store.restore_drop_count(), store.eviction_count())
     };
     assert_eq!(drops, 0, "the retried candidate was not dropped");
-    assert_eq!(evictions, 1, "the SF1 retry's victim, the only COUNTED one");
+    assert_eq!(
+        evictions, 1,
+        "the adoption retry's victim, the only COUNTED one"
+    );
     assert!(windows.load(Ordering::SeqCst) > 0, "the batch branch ran");
     drop(handle);
     engine.shutdown();

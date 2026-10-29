@@ -32,19 +32,19 @@ use crate::{
     tensor::{Dtype, ExecutionTensor},
 };
 
-/// The NUL-terminated Metal source of the gated delta kernel (decision 0050). The file is the text
-/// that `engine/vendor/mlx-lm-gated-delta/extract_kernel.py` derives from mlx-lm 0.31.0.
+/// The NUL-terminated Metal source of the gated delta kernel. The file is the text that
+/// `engine/vendor/mlx-lm-gated-delta/extract_kernel.py` derives from mlx-lm 0.31.0.
 pub(super) const GATED_DELTA_SOURCE: &str = concat!(
     include_str!("../../../../vendor/mlx-lm-gated-delta/gated_delta_step.metal"),
     "\0"
 );
 
-/// The NUL-terminated Metal source of the flash-delta kernel (R4-6, Q36_FLASH_DELTA=1): the
+/// The NUL-terminated Metal source of the flash-delta kernel (Q36_FLASH_DELTA=1): the
 /// placeholder is the vendored recurrent body verbatim, launched through the flash-delta
-/// chain; the chunked WY-form body of the r45-gdn-chunk-spike (4.1x at 1024 rows).
+/// chain; the chunked WY-form body (4.1x at 1024 rows).
 pub(super) const FLASH_DELTA_SOURCE: &str = concat!(include_str!("gated_delta_wy.metal"), "\0");
 
-/// The NUL-terminated Metal source of the gdn_prep kernel (R4-7, Q36_FUSED_PREFILL=1).
+/// The NUL-terminated Metal source of the gdn_prep kernel (Q36_FUSED_PREFILL=1).
 pub(super) const GDN_PREP_SOURCE: &str = concat!(include_str!("gdn_prep.body.metal"), "\0");
 
 /// The NUL-terminated Metal source of the act_mul kernel.
@@ -56,13 +56,12 @@ pub(super) const GDN_POST_SOURCE: &str = concat!(include_str!("gdn_post.body.met
 /// The NUL-terminated Metal source of the attn_gate kernel.
 pub(super) const ATTN_GATE_SOURCE: &str = concat!(include_str!("attn_gate.body.metal"), "\0");
 
-/// The Metal source of the fused MoE combine (R4-7, Q36_FUSED_PREFILL=1): the
-/// spike-validated body; the prefill chunk tail (un-sort, gate, sum, shared fold, cast)
-/// in one kernel.
+/// The Metal source of the fused MoE combine (Q36_FUSED_PREFILL=1): the spike-validated
+/// body; the prefill chunk tail (un-sort, gate, sum, shared fold, cast) in one kernel.
 pub(super) const MOE_COMBINE_SOURCE: &str = concat!(include_str!("moe_combine.body.metal"), "\0");
 
-/// The Metal source of the fused 8-bit KV decode attention (packet FUSED-KV8-a): the two
-/// kernel bodies, separated by the marker line that `shape::Q8_DECODE_PASS_MARKER` names.
+/// The Metal source of the fused 8-bit KV decode attention: the two kernel bodies,
+/// separated by the marker line that `shape::Q8_DECODE_PASS_MARKER` names.
 /// `q8_decode_sources` splits it; the properties of the split are pinned by the portable
 /// unit test `kernels::shape::tests::q8_decode_attention_metal_splits_into_two_passes`.
 const Q8_DECODE_SOURCE: &str = include_str!("q8_decode_attention.metal");
@@ -100,7 +99,7 @@ fn q8_decode_sources() -> Result<(CString, CString), EngError> {
 /// constant, as with the decode kernels.
 const Q8_FLASH_PREFILL_SOURCE: &str = include_str!("q8_flash_prefill_mma.metal");
 
-/// The flash-prefill MMA body's staging envelope (the spike LAUNCH.md): D and the
+/// The flash-prefill MMA body's staging envelope: D and the
 /// Q8 group size must be multiples of 16 and D a multiple of the group. Quantization
 /// only builds groups 32/64/128 today, so reachable caches always satisfy it; the
 /// check guards future callers passing other group sizes straight to the wrapper.
@@ -130,7 +129,7 @@ type BinaryElementwise = unsafe extern "C" fn(
 type ReduceAxis =
     unsafe extern "C" fn(*mut ffi::mlx_array, ffi::mlx_array, i32, bool, ffi::mlx_stream) -> i32;
 
-/// The expert ids of one gathered product (packet GAP-TRIM-A).
+/// The expert ids of one gathered product.
 enum GatherIds<'a> {
     /// Clamp the ids to the last expert on the device, the rule of the public operations.
     Clamp(&'a ExecutionTensor),
@@ -142,7 +141,7 @@ enum GatherIds<'a> {
     },
 }
 
-/// The ids of one `take` (packet GAP-TRIM-A).
+/// The ids of one `take`.
 enum TakeIds<'a> {
     /// Clamp the ids to the last element of the axis, the rule of `take`.
     Clamp(&'a ExecutionTensor),
@@ -340,10 +339,10 @@ impl Context {
         self.check_ready()?;
         let state = self.state.as_mut().unwrap();
         // A U32 input keeps its dtype, as `slice` does, and the layout's 4-byte elements are
-        // exact for it: the device chunk MoE flattens its U32 expert ids (packet
-        // Q36-PF-DEVROUTE). Only U32 takes that branch; every other input keeps the rejection of
-        // `check_operand` from before the branch existed, so a BF16 input is rejected exactly as
-        // before (and F32, or BF16 after `allow_bf16`, keeps the promoting wrapper below).
+        // exact for it: the device chunk MoE flattens its U32 expert ids. Only U32 takes that
+        // branch; every other input keeps the rejection of `check_operand` from before the
+        // branch existed, so a BF16 input is rejected exactly as before (and F32, or BF16 after
+        // `allow_bf16`, keeps the promoting wrapper below).
         let u32_input = x.dtype() == Dtype::U32;
         if u32_input {
             check_owner(label, state, x)?;
@@ -548,8 +547,8 @@ impl Context {
         Ok(promoting_elementwise_result(state, output, layout))
     }
 
-    /// `grouped_attention_prefix` (packet NATIVE-OPS-1): attention over the first `len` positions
-    /// of capacity buffers. The shim builds the two `mlx_slice` views with no `mlx_contiguous`
+    /// `grouped_attention_prefix`: attention over the first `len` positions of capacity buffers.
+    /// The shim builds the two `mlx_slice` views with no `mlx_contiguous`
     /// and runs the fused attention on them, so the prefix is never copied. The causal mask mode
     /// string is the one of `grouped_attention`, so the mask aligns to the last key of the prefix.
     pub(in crate::kernels::mlx) fn grouped_attention_prefix(
@@ -585,7 +584,7 @@ impl Context {
         // at most 8, the decode step); the full mode of a chunk allocates it with the strides
         // of the transposed layout. So the result is NOT guaranteed row-contiguous and carries
         // no `Contiguous` node: a strided result is copied once at `readback`, and every
-        // consumer in this tree accepts a strided input (packet GAP-TRIM-A).
+        // consumer in this tree accepts a strided input.
         let expected = ExpectedOutput {
             operation: label,
             stream,
@@ -611,11 +610,11 @@ impl Context {
         Ok(promoting_elementwise_result(state, output, layout))
     }
 
-    /// `quantize_rows` (packet KV8-OPS): affine quantization of the last axis of `x` in groups of
-    /// `group_size`, at `bits` bits (8 only for now). Returns the codes U32 `[.., D * bits / 32]`
-    /// and the scales and biases `[.., D / group]` of the dtype of `x`. The shim unpacks the
-    /// `mlx_quantize` result vector into the three handles and frees the vector on every path;
-    /// the injected faults strike the codes output.
+    /// `quantize_rows`: affine quantization of the last axis of `x` in groups of `group_size`, at
+    /// `bits` bits (8 only for now). Returns the codes U32 `[.., D * bits / 32]` and the scales
+    /// and biases `[.., D / group]` of the dtype of `x`. The shim unpacks the `mlx_quantize`
+    /// result vector into the three handles and frees the vector on every path; the injected
+    /// faults strike the codes output.
     pub(in crate::kernels::mlx) fn quantize_rows(
         &mut self,
         x: &ExecutionTensor,
@@ -679,15 +678,15 @@ impl Context {
         ))
     }
 
-    /// `quantized_attention_prefix` (packet KV8-OPS): attention over the first `len` positions of
-    /// quantized capacity buffers, the form of mlx-lm's quantized KV cache. The one composite
+    /// `quantized_attention_prefix`: attention over the first `len` positions of quantized
+    /// capacity buffers, the form of mlx-lm's quantized KV cache. The one composite
     /// shim builds the six prefix views (no `mlx_contiguous`), reshapes the queries to
     /// `[B, KVH, rep * L, D]`, runs the two `mlx_quantized_matmul` calls, applies the causal chunk
     /// mask, softmaxes over the last axis in F32, and reshapes back, so its temporaries free on
     /// every path as `grouped_attention_prefix` does.
     #[allow(
         clippy::too_many_arguments,
-        reason = "the packet fixes this signature: len, scale, and causal name the attention, \
+        reason = "len, scale, and causal name the attention, \
                  group_size and bits name the quantization of the buffers"
     )]
     pub(in crate::kernels::mlx) fn quantized_attention_prefix(
@@ -776,7 +775,7 @@ impl Context {
         Ok(promoting_elementwise_result(state, output, layout))
     }
 
-    /// `quantized_attention_decode` (packet FUSED-KV8-a): the fused 8-bit KV decode attention,
+    /// `quantized_attention_decode`: the fused 8-bit KV decode attention,
     /// `quantized_attention_prefix` for one query row (`L = 1`, non-causal) as ONE pair of Metal
     /// kernels instead of two `quantized_matmul` calls and a softmax. The shim builds the two
     /// kernels of `native/q8_decode_attention.metal` per call and frees every handle on every
@@ -786,7 +785,7 @@ impl Context {
     /// (the kernel casts it), so the expected-output record is strict, not promoting.
     #[allow(
         clippy::too_many_arguments,
-        reason = "the packet fixes this signature: len and scale name the attention, \
+        reason = "len and scale name the attention, \
                  group_size and bits name the quantization of the buffers"
     )]
     pub(in crate::kernels::mlx) fn quantized_attention_decode(
@@ -898,8 +897,8 @@ impl Context {
         Ok(state.resident(output, dtype, layout.shape, byte_len))
     }
 
-    /// `q8_flash_prefill` (R4-5): the flash prefill attention as ONE fused Metal kernel -
-    /// the classic scalar FlashAttention form (one thread per query row and head, online
+    /// `q8_flash_prefill`: the flash prefill attention as ONE fused Metal kernel - the
+    /// classic scalar FlashAttention form (one thread per query row and head, online
     /// softmax state in registers, one causal pass over the Q8 KV cache with the dequant
     /// fused into the loads). The query arrives UNSCALED and `scale` carries 1/sqrt(d);
     /// `len` names the valid keys including this chunk (= q_offset + rows), so one compiled
@@ -909,7 +908,7 @@ impl Context {
     /// does.
     #[allow(
         clippy::too_many_arguments,
-        reason = "the decode packet fixes this signature family: len, group_size, and bits \
+        reason = "the signature family of the decode attention: len, group_size, and bits \
                  name the same quantities and q_offset names the chunk position"
     )]
     /// The shared attention float path: the vendor fused SDPA (mask_arr + sinks +
@@ -1039,9 +1038,9 @@ impl Context {
         Ok(state.resident(output, dtype, vec![1, hq, rows, d], byte_len))
     }
 
-    /// The LARGE-BATCH float path (the 16577 ruling (b)): the same flash kernel,
-    /// kvq8 = 0 - keys/values are the bf16 (or f16/f32) KV PLANES [1, Hkv, cap, D];
-    /// the quant slots carry null dummies. K staging retains T; FLOAT P/V use
+    /// The LARGE-BATCH float path: the same flash kernel, kvq8 = 0 - keys/values
+    /// are the bf16 (or f16/f32) KV PLANES [1, Hkv, cap, D]; the quant slots carry
+    /// null dummies. K staging retains T; FLOAT P/V use
     /// F32 to avoid tile-dependent BF16 probability rounding and half range loss.
     /// Validation is total BEFORE any import or native call: batch 1, exact ranks,
     /// matching float dtypes (the float gate), D in the kernel envelope, GQA
@@ -1093,10 +1092,10 @@ impl Context {
         }
         // SAFETY: REPS is hardcoded 8 - any other GQA reads/writes EIGHT heads
         // per KV head into smaller buffers (out of bounds). Refuse pre-native
-        // until the generic-GQA kernel lands (the coordinator's (1) order).
+        // until the generic-GQA kernel lands.
         if hq / hkv != 8 {
             return Err(EngError::BadRequest(
-                "flash prefill float: the kernel serves GQA == 8 today (REP-8); generic GQA is pending"
+                "flash prefill float: the kernel serves GQA == 8 today; generic GQA is pending"
                     .into(),
             ));
         }
@@ -1326,18 +1325,18 @@ impl Context {
         Ok(state.resident(output, dtype, layout.shape, byte_len))
     }
 
-    /// `kv_append` (packet NATIVE-OPS-1): `slice_update` that consumes `target`. The lazy node
-    /// must hold the only owner of the target's buffer when the graph runs, so MLX donates the
-    /// buffer and writes the rows in place. The adapter releases its own native handle of the
-    /// target right after the node is built, outside the retire list: a retired entry would keep
+    /// `kv_append`: `slice_update` that consumes `target`. The lazy node must hold the only owner
+    /// of the target's buffer when the graph runs, so MLX donates the buffer and writes the rows
+    /// in place. The adapter releases its own native handle of the target right after the node is
+    /// built, outside the retire list: a retired entry would keep
     /// a second owner of the buffer until the next synchronization, and MLX would copy the whole
     /// capacity instead. The node holds the array until the GPU completes, so the release is as
     /// safe as a retire-list entry. A caller that keeps a `share()` of `target` loses the donation
     /// but stays correct. The result keeps the dtype and shape of `target`. The target and the
-    /// update may also be U32 - the packed codes of the quantized KV cache (packet KV8-OPS) -
-    /// whose byte width equals F32, so the byte-length scaling below changes nothing for them. A
-    /// failed release of the taken handle is terminal (decision 0022) and this call reports it as
-    /// `Backend` with label `kv append`, as `evaluate` reports a failed vector release.
+    /// update may also be U32 - the packed codes of the quantized KV cache - whose byte width
+    /// equals F32, so the byte-length scaling below changes nothing for them. A failed release of
+    /// the taken handle is terminal and this call reports it as `Backend` with label `kv append`,
+    /// as `evaluate` reports a failed vector release.
     pub(in crate::kernels::mlx) fn kv_append(
         &mut self,
         mut target: ExecutionTensor,
@@ -1350,9 +1349,8 @@ impl Context {
         let state = self.state.as_mut().unwrap();
         check_owner(label, state, &target)?;
         check_owner(label, state, update)?;
-        // The dtype rule of `kv_append` (packet KV8-OPS): F32, BF16 after `allow_bf16`, and U32
-        // for the codes of the quantized cache; `float_operands` keeps its old rule for the float
-        // operations.
+        // The dtype rule of `kv_append`: F32, BF16 after `allow_bf16`, and U32 for the codes of
+        // the quantized cache; `float_operands` keeps its old rule for the float operations.
         shape::kv_append_operands(label, state.allow_bf16, &[target.dtype(), update.dtype()])?;
         if target.dtype() != update.dtype() {
             return Err(EngError::BadRequest(format!(
@@ -1393,8 +1391,7 @@ impl Context {
             )
         });
         // The failure path keeps the resident rule: `complete` marks the owner failed before any
-        // temporary drops, so the consumed target retains its array (decision 0022) and the
-        // adapter is terminal.
+        // temporary drops, so the consumed target retains its array and the adapter is terminal.
         expected.complete(&output, built)?;
         // The node is built and holds its own reference to the target array. Release the
         // adapter's own handle once, now: the wrapper drop runs `mlx_array_free`, the refcount
@@ -1402,19 +1399,19 @@ impl Context {
         // With a caller-held `share()` the take finds no exclusive resident, the handle retires
         // with the last share as usual, and only the donation is lost.
         drop(Rc::get_mut(&mut target.storage).and_then(Resident::take_array));
-        // A failed release marks the owner terminal inside the drop (decision 0022). Report it
-        // here, as the neighbors report a failed temporary release, instead of returning `Ok`
-        // from an adapter that rejects all further work.
+        // A failed release marks the owner terminal inside the drop. Report it here, as the
+        // neighbors report a failed temporary release, instead of returning `Ok` from an
+        // adapter that rejects all further work.
         if has_failed() {
             return Err(failure(label));
         }
         Ok(state.resident(output, dtype, layout.shape, byte_len))
     }
 
-    /// Builds an unevaluated BF16 [4, capacity, 128] plane of device zeros
-    /// (packet CTX32K-GROW). No host staging vector and no import copy: MLX
-    /// fills the array on the device. Only `allow_bf16` may open a BF16
-    /// result, as everywhere else.
+    /// Builds an unevaluated BF16 [4, capacity, 128] plane of device zeros.
+    /// No host staging vector and no import copy: MLX fills the array on
+    /// the device. Only `allow_bf16` may open a BF16 result, as everywhere
+    /// else.
     pub(in crate::kernels::mlx) fn kv_zeros(
         &mut self,
         capacity: u32,
@@ -1598,8 +1595,8 @@ impl Context {
         Ok(elementwise_result(state, output, layout))
     }
 
-    /// Converts a float resident to F32 or BF16 with the shim of `u32_to_f32` (packet Q36-BF16-a).
-    /// The input and the target must be F32, or BF16 after `Context::allow_bf16`.
+    /// Converts a float resident to F32 or BF16 with the shim of `u32_to_f32`. The input and the
+    /// target must be F32, or BF16 after `Context::allow_bf16`.
     pub(in crate::kernels::mlx) fn cast(
         &mut self,
         x: &ExecutionTensor,
@@ -1639,9 +1636,9 @@ impl Context {
         self.take_with(x, TakeIds::Clamp(indices), axis)
     }
 
-    /// `take` over ids that `bound_indices` clamped once (packet GAP-TRIM-A): the clamp is
-    /// skipped while the recorded bound covers the axis length and rebuilt when it does not, so
-    /// an id at or above the axis length still clamps to the last element of the axis.
+    /// `take` over ids that `bound_indices` clamped once: the clamp is skipped while the
+    /// recorded bound covers the axis length and rebuilt when it does not, so an id at or above
+    /// the axis length still clamps to the last element of the axis.
     pub(in crate::kernels::mlx) fn take_bounded(
         &mut self,
         x: &ExecutionTensor,
@@ -1656,7 +1653,7 @@ impl Context {
     /// the taken axis into place (only when `axis` is not 0), and a squeeze. The gather output is
     /// a fresh row-contiguous array and the squeeze of it keeps that, so an axis-0 take returns
     /// the gather output as is; a take along another axis can end in the strided transpose view,
-    /// so that case still makes the result contiguous (packet GAP-TRIM-A).
+    /// so that case still makes the result contiguous.
     fn take_with(
         &mut self,
         x: &ExecutionTensor,
@@ -1675,7 +1672,7 @@ impl Context {
         check_index(label, state, ids)?;
         let layout = shape::take(label, x.shape(), ids.shape(), axis)?;
         // After the layout check the axis exists. The skip is value-neutral: the clamp of an
-        // already clamped tensor is the identity (packet GAP-TRIM-A).
+        // already clamped tensor is the identity.
         let skip_clamp =
             bound.is_some_and(|bound| shape::bound_covers(bound, x.shape()[axis as usize]));
         let native_axis = native_ints(label, &[axis])?[0];
@@ -1713,8 +1710,8 @@ impl Context {
         .and_then(|()| {
             if axis == 0 {
                 // The gather output of an axis-0 take is row-contiguous by construction; hand it
-                // through without a `Contiguous` node (packet GAP-TRIM-A). The null that stays
-                // in `product` frees nothing.
+                // through without a `Contiguous` node. The null that stays in `product` frees
+                // nothing.
                 output = std::mem::replace(&mut product, Array::null());
                 Ok(())
             } else {
@@ -1735,13 +1732,13 @@ impl Context {
         Ok(promoting_elementwise_result(state, output, layout))
     }
 
-    /// `take_along_axis` (packet Q36-PF-DEVROUTE): gathers along `axis` with U32 indices of the
-    /// input rank, as `numpy.take_along_axis` does. The input is F32, BF16 after `allow_bf16`, or
-    /// U32 (the device chunk MoE gathers its sorted expert ids, and `take` rejects a U32 input);
-    /// the output keeps the input dtype and takes the indices shape. Indices above the axis
-    /// length are clamped to the last element of the axis on the device, as `take` does. The
-    /// gather is one fresh MLX `GatherAxis` output with no trailing view, so it is row-contiguous
-    /// by construction and the method adds no `Contiguous` node (packet GAP-TRIM-A).
+    /// `take_along_axis`: gathers along `axis` with U32 indices of the input rank, as
+    /// `numpy.take_along_axis` does. The input is F32, BF16 after `allow_bf16`, or U32 (the
+    /// device chunk MoE gathers its sorted expert ids, and `take` rejects a U32 input); the
+    /// output keeps the input dtype and takes the indices shape. Indices above the axis length
+    /// are clamped to the last element of the axis on the device, as `take` does. The gather is
+    /// one fresh MLX `GatherAxis` output with no trailing view, so it is row-contiguous by
+    /// construction and the method adds no `Contiguous` node.
     pub(in crate::kernels::mlx) fn take_along_axis(
         &mut self,
         x: &ExecutionTensor,
@@ -1795,11 +1792,11 @@ impl Context {
         Ok(state.resident(output, dtype, layout.shape, byte_len))
     }
 
-    /// Clamps U32 `ids` below the exclusive `bound` with ONE `mlx_minimum` node (packet
-    /// GAP-TRIM-A): the single clamp that the bounded gather and take variants of one layer
-    /// share. The output keeps the shape of `ids` and the U32 dtype; `output_bytes` counts
-    /// 4-byte elements, exact for U32. A `bound` of zero is a `BadRequest` before the first
-    /// native call; a native failure follows the resident rule and makes the adapter terminal.
+    /// Clamps U32 `ids` below the exclusive `bound` with ONE `mlx_minimum` node: the single
+    /// clamp that the bounded gather and take variants of one layer share. The output keeps
+    /// the shape of `ids` and the U32 dtype; `output_bytes` counts 4-byte elements, exact for
+    /// U32. A `bound` of zero is a `BadRequest` before the first native call; a native failure
+    /// follows the resident rule and makes the adapter terminal.
     pub(in crate::kernels::mlx) fn bound_indices(
         &mut self,
         ids: &ExecutionTensor,
@@ -1871,8 +1868,8 @@ impl Context {
         self.gather_qmm_with(x, stack, GatherIds::Clamp(indices), true)
     }
 
-    /// `gather_qmm` over ids that `bound_indices` clamped once (packet GAP-TRIM-A): the clamp is
-    /// skipped while the recorded bound covers the expert count and rebuilt when it does not.
+    /// `gather_qmm` over ids that `bound_indices` clamped once: the clamp is skipped while the
+    /// recorded bound covers the expert count and rebuilt when it does not.
     pub(in crate::kernels::mlx) fn gather_qmm_bounded(
         &mut self,
         x: &ExecutionTensor,
@@ -1883,9 +1880,9 @@ impl Context {
         self.gather_qmm_with(x, stack, GatherIds::Bounded { ids, bound }, false)
     }
 
-    /// `gather_qmm_sorted` over ids that `bound_indices` clamped once (packet GAP-TRIM-A): the
-    /// clamp is skipped while the recorded bound covers the expert count and rebuilt when it does
-    /// not, and the sortedness duty is the one of `gather_qmm_sorted`.
+    /// `gather_qmm_sorted` over ids that `bound_indices` clamped once: the clamp is skipped while
+    /// the recorded bound covers the expert count and rebuilt when it does not, and the
+    /// sortedness duty is the one of `gather_qmm_sorted`.
     pub(in crate::kernels::mlx) fn gather_qmm_sorted_bounded(
         &mut self,
         x: &ExecutionTensor,
@@ -1898,8 +1895,8 @@ impl Context {
 
     /// The one body of the `gather_qmm` family: `sorted` is the value passed to MLX's
     /// `sorted_indices` flag, which changes the kernel choice only, not the checks or the layout,
-    /// and `indices` names the ids and whether this call clamps them itself (packet GAP-TRIM-A:
-    /// `Bounded` ids skip the clamp exactly while their bound covers the expert count).
+    /// and `indices` names the ids and whether this call clamps them itself (`Bounded` ids skip
+    /// the clamp exactly while their bound covers the expert count).
     fn gather_qmm_with(
         &mut self,
         x: &ExecutionTensor,
@@ -1921,7 +1918,7 @@ impl Context {
         let layout = shape::gather_qmm(label, x.shape(), stack.logical_shape(), ids.shape())?;
         // After the layout check the expert axis exists; the skip is value-neutral either way:
         // the clamp of an already clamped tensor is the identity, so the gathered rows are bit for
-        // bit the rows the per-call clamp reads (packet GAP-TRIM-A).
+        // bit the rows the per-call clamp reads.
         let skip_clamp =
             bound.is_some_and(|bound| shape::bound_covers(bound, stack.logical_shape()[0]));
         let quant = quant_args(stack.quantization())?;
@@ -1997,10 +1994,10 @@ impl Context {
         self.check_ready()?;
         let state = self.state.as_mut().unwrap();
         check_packed(label, state, weight)?;
-        // F32 only (packet Q36-BF16-a fix): the call pins the output dtype to F32, and the strict
-        // result check below rejects anything else. The scales and biases may be stored BF16, as
-        // the embedding rows are: the shim casts them to the output dtype first, so the F32 result
-        // stays exact (kernels.md).
+        // F32 only: the call pins the output dtype to F32, and the strict result check below
+        // rejects anything else. The scales and biases may be stored BF16, as the embedding rows
+        // are: the shim casts them to the output dtype first, so the F32 result stays exact
+        // (kernels.md).
         let layout = shape::dequantize(label, weight.logical_shape())?;
         let quant = quant_args(weight.quantization())?;
         let biases = weight
@@ -2168,8 +2165,7 @@ impl Context {
         // MLX scaled dot-product attention allocates one fresh output. It is row-contiguous in
         // the vector mode (a query length of at most 8, the decode step) and has the strides of
         // the transposed layout in the full mode of a chunk, so the result carries no
-        // `Contiguous` node and a strided result is copied once at `readback` (packet
-        // GAP-TRIM-A).
+        // `Contiguous` node and a strided result is copied once at `readback`.
         let expected = ExpectedOutput {
             operation: label,
             stream,
@@ -2195,8 +2191,7 @@ impl Context {
     }
 
     /// Runs the gated delta rule kernel of mlx-lm over `T` tokens and returns `y` and the new
-    /// recurrent state (decision 0050). Both outputs are lazy. The shapes are those of
-    /// `gated_delta::layout`.
+    /// recurrent state. Both outputs are lazy. The shapes are those of `gated_delta::layout`.
     pub(in crate::kernels::mlx) fn gated_delta(
         &mut self,
         q: &ExecutionTensor,
@@ -2210,10 +2205,9 @@ impl Context {
         let _dispatch = DispatchGuard::enter();
         self.check_ready()?;
         let state = self.state.as_mut().unwrap();
-        // The Metal kernel reads every operand as plain F32 bytes (decision 0050: `InT` is float,
-        // both outputs F32), so a BF16 operand is silent garbage, not a promoted operand. The
-        // strict check keeps the old rejection text even with `allow_bf16` on (packet Q36-BF16-a
-        // fix).
+        // The Metal kernel reads every operand as plain F32 bytes (`InT` is float, both outputs
+        // F32), so a BF16 operand is silent garbage, not a promoted operand. The strict check
+        // keeps the old rejection text even with `allow_bf16` on.
         for operand in [q, k, v, g, beta, recurrent] {
             check_f32_operand(label, state, operand)?;
         }
@@ -2266,7 +2260,7 @@ impl Context {
         ))
     }
 
-    /// Runs the fused MoE combine (R4-7, `Q36_FUSED_PREFILL=1`): out[t] = bf16(sum_k
+    /// Runs the fused MoE combine (`Q36_FUSED_PREFILL=1`): out[t] = bf16(sum_k
     /// gates[t][k] * eo[inverse[t*K+k]] + sigmoid(raw[t]) * so[t]) - the un-sort take, the
     /// F32 gate product, the choice sum, the shared-expert sigmoid fold, and the activation
     /// cast in one kernel (the spike-validated `moe_combine_v1`).
@@ -2321,7 +2315,7 @@ impl Context {
         Ok(state.resident(out, Dtype::Bf16, vec![rows, hidden], byte_len))
     }
 
-    /// Runs the flash-delta gated rule (R4-6, `Q36_FLASH_DELTA=1`): the same contract as
+    /// Runs the flash-delta gated rule (`Q36_FLASH_DELTA=1`): the same contract as
     /// `gated_delta` - the same strict F32 operands, the same layout validation, the same lazy
     /// F32 outputs `y` and the new recurrent state - through the `gated_delta_wy` program. The
     /// placeholder body is the vendored recurrent kernel, so the results are identical; the
@@ -2352,7 +2346,7 @@ impl Context {
             beta.share(),
             recurrent.share(),
         ];
-        // The WY envelope (the spike LAUNCH.md): B 1, Dk % 64, Dv % 128.
+        // The WY envelope: B 1, Dk % 64, Dv % 128.
         if qs[0] != 1 || ks[3] % 64 != 0 || vs[3] % 128 != 0 || vs[2] % ks[2] != 0 {
             return Err(EngError::BadRequest(
                 "flash delta needs batch one, Dk % 64, Dv % 128, Hv % Hk (the WY envelope)".into(),
@@ -2397,9 +2391,9 @@ impl Context {
         ))
     }
 
-    /// Runs the gdn_prep fused kernel (R4-7, `Q36_FUSED_PREFILL=1`): ONE Metal kernel
-    /// for the whole DeltaNet pre-recurrence chain (causal conv, silu, split, L2 norms,
-    /// gates g and beta, and the new ring). All outputs are lazy F32.
+    /// Runs the gdn_prep fused kernel (`Q36_FUSED_PREFILL=1`): ONE Metal kernel for the
+    /// whole DeltaNet pre-recurrence chain (causal conv, silu, split, L2 norms, gates g
+    /// and beta, and the new ring). All outputs are lazy F32.
     #[allow(clippy::too_many_arguments, reason = "the fused kernel contract")]
     pub(in crate::kernels::mlx) fn gdn_prep(
         &mut self,
@@ -2521,7 +2515,7 @@ impl Context {
         })
     }
 
-    /// Runs the act_mul fused kernel (R4-7): SwiGLU h = bf16(bf16(g * sigmoid(g)) * u).
+    /// Runs the act_mul fused kernel: SwiGLU h = bf16(bf16(g * sigmoid(g)) * u).
     pub(in crate::kernels::mlx) fn act_mul(
         &mut self,
         g_in: &ExecutionTensor,
@@ -2561,7 +2555,7 @@ impl Context {
         Ok(state.resident(h, Dtype::Bf16, vec![rows, ncol], byte_len))
     }
 
-    /// Runs the gdn_post fused kernel (R4-7): o = bf16(rms_norm(core) * silu(z)).
+    /// Runs the gdn_post fused kernel: o = bf16(rms_norm(core) * silu(z)).
     pub(in crate::kernels::mlx) fn gdn_post(
         &mut self,
         core: &ExecutionTensor,
@@ -2605,7 +2599,7 @@ impl Context {
         Ok(state.resident(o, Dtype::Bf16, vec![rows, 4096], byte_len))
     }
 
-    /// Runs the attn_gate fused kernel (R4-7): o = bf16(transpose(att) * sigmoid(gate)).
+    /// Runs the attn_gate fused kernel: o = bf16(transpose(att) * sigmoid(gate)).
     #[allow(clippy::too_many_arguments, reason = "the fused kernel contract")]
     pub(in crate::kernels::mlx) fn attn_gate(
         &mut self,
@@ -2893,8 +2887,8 @@ impl Context {
     ///
     /// The call builds both outputs and checks their metadata before it assigns either handle. A
     /// failure at any build step returns before the first assignment, so neither handle rebinds.
-    /// Evaluation and synchronization happen at `readback` (decision 0032). A caller that holds
-    /// no share of the old `q` or `k` releases them when the handles rebind.
+    /// Evaluation and synchronization happen at `readback`. A caller that holds no share of the
+    /// old `q` or `k` releases them when the handles rebind.
     pub(in crate::kernels::mlx) fn rope(
         &mut self,
         q: &mut ExecutionTensor,
@@ -2991,8 +2985,8 @@ struct ExpectedOutput<'a> {
     byte_len: u64,
     dtype: Dtype,
     /// Whether a BF16 result with half the bytes may replace the F32 one. Only a wrapper that
-    /// `allow_bf16` opened for operands may set it (packet Q36-BF16-a fix): an F32-only wrapper
-    /// that sees a BF16 result has a dtype bug, and the check must reject it, not absorb it.
+    /// `allow_bf16` opened for operands may set it: an F32-only wrapper that sees a BF16 result
+    /// has a dtype bug, and the check must reject it, not absorb it.
     promotes: bool,
 }
 
@@ -3000,9 +2994,9 @@ impl ExpectedOutput<'_> {
     /// Checks the metadata of the lazy `output` without evaluating it.
     ///
     /// `built` holds the outcome of the native calls that produced `output`. Evaluation and
-    /// synchronization happen at `readback` (decision 0032). Every failure marks the adapter
-    /// terminal before this function returns, so the caller can drop its temporary arrays
-    /// afterwards and `Array::drop` retains them instead of freeing them (decision 0023).
+    /// synchronization happen at `readback`. Every failure marks the adapter terminal before
+    /// this function returns, so the caller can drop its temporary arrays afterwards and
+    /// `Array::drop` retains them instead of freeing them.
     fn complete(&self, output: &Array, built: Result<(), EngError>) -> Result<(), EngError> {
         let result = built.and_then(|()| self.validate(output));
         if result.is_err() {
@@ -3066,7 +3060,7 @@ pub(super) fn produce(
 
 /// Builds one lazy elementwise operation and validates its output metadata.
 ///
-/// The call does not evaluate. Evaluation happens at `readback` (decision 0032).
+/// The call does not evaluate. Evaluation happens at `readback`.
 fn dispatch_typed(
     operation: &'static str,
     layout: &ElementwiseLayout,
@@ -3100,7 +3094,7 @@ fn dispatch_elementwise(
 }
 
 /// Builds one lazy F32 operation of a wrapper that `allow_bf16` opened for BF16 operands: the
-/// result may be BF16 with half the F32 bytes, as MLX promotes the operands (packet Q36-BF16-a).
+/// result may be BF16 with half the F32 bytes, as MLX promotes the operands.
 fn dispatch_promoting_elementwise(
     operation: &'static str,
     layout: &ElementwiseLayout,
@@ -3123,10 +3117,10 @@ fn dispatch_promoting_elementwise(
 
 /// Rotates one tensor with the static-offset RoPE call.
 ///
-/// The call builds the graph and checks metadata. It does not evaluate (decision 0032).
+/// The call builds the graph and checks metadata. It does not evaluate.
 ///
 /// The output has the shape of `x`. A failure marks the adapter terminal before this function
-/// returns, so the caller can drop its temporary arrays afterwards (decision 0023).
+/// returns, so the caller can drop its temporary arrays afterwards.
 fn dispatch_rope(
     x: &ExecutionTensor,
     byte_len: u64,
@@ -3160,11 +3154,11 @@ fn dispatch_rope(
 /// Builds a lazy product, makes it contiguous, and validates the output metadata.
 ///
 /// The callers are the operations whose MLX primitive can return a strided view — `transpose`,
-/// `slice`, and `repeat` (packet GAP-TRIM-A). Every operation with a fresh, row-contiguous output
-/// by construction validates its product directly instead, and `readback` itself copies a
+/// `slice`, and `repeat`. Every operation with a fresh, row-contiguous output by construction
+/// validates its product directly instead, and `readback` itself copies a
 /// strided array at the read, so a missed case fails no read.
 ///
-/// The call does not evaluate. Evaluation happens at `readback` (decision 0032).
+/// The call does not evaluate. Evaluation happens at `readback`.
 fn dispatch_contiguous(
     expected: &ExpectedOutput<'_>,
     product_call: impl FnOnce(*mut ffi::mlx_array) -> i32,
@@ -3184,7 +3178,7 @@ fn elementwise_result(state: &State, output: Array, layout: ElementwiseLayout) -
 }
 
 /// The result form of a wrapper that `allow_bf16` opened for BF16 operands: an all-BF16 operand
-/// set gives a BF16 result with half the F32 bytes (packet Q36-BF16-a). Every other wrapper uses
+/// set gives a BF16 result with half the F32 bytes. Every other wrapper uses
 /// `elementwise_result`, whose F32 result is exact.
 fn promoting_elementwise_result(
     state: &State,
@@ -3197,10 +3191,10 @@ fn promoting_elementwise_result(
 
 /// The dtype and byte length of a float result whose layout counts F32 bytes.
 ///
-/// Only a wrapper that `allow_bf16` opened for BF16 operands calls this (packet Q36-BF16-a fix):
-/// such a wrapper gets a BF16 result when every operand is BF16, because MLX promotes mixed F32
-/// and BF16 operands to F32. With the switch off, every float operand is F32, so the result is
-/// F32 and the byte length is the layout's own count.
+/// Only a wrapper that `allow_bf16` opened for BF16 operands calls this: such a wrapper gets a
+/// BF16 result when every operand is BF16, because MLX promotes mixed F32 and BF16 operands to
+/// F32. With the switch off, every float operand is F32, so the result is F32 and the byte
+/// length is the layout's own count.
 fn float_result(output: &Array, f32_byte_len: u64) -> (Dtype, u64) {
     if !output.0.ctx.is_null()
         && unsafe { ffi::mlx_array_dtype(output.0) } == native_dtype(Dtype::Bf16)
@@ -3271,7 +3265,7 @@ fn dispatch_qmm(
         .map(|biases| biases.storage.native_array())
         .unwrap_or(ffi::NULL_ARRAY);
     // MLX `quantized_matmul` allocates one fresh output array, row-contiguous by construction,
-    // so the product needs no `Contiguous` node after it (packet GAP-TRIM-A).
+    // so the product needs no `Contiguous` node after it.
     let mut output = Array::null();
     let built = produce(&mut output, expected.operation, |slot| unsafe {
         ffi::mlx_quantized_matmul(
@@ -3321,7 +3315,7 @@ fn dispatch_mm(
 ) -> Result<Array, EngError> {
     // MLX `matmul` of rank-at-least-two operands allocates one fresh output (a squeeze or
     // reshape view of it stays row-contiguous), so the product needs no `Contiguous` node after
-    // it (packet GAP-TRIM-A).
+    // it.
     let mut output = Array::null();
     let built = produce(&mut output, expected.operation, |slot| unsafe {
         ffi::mlx_matmul(
@@ -3445,10 +3439,10 @@ pub(super) fn check_operand(
 }
 
 /// Rejects an input of another owner or a dtype other than F32, before any native call. The
-/// wrappers whose native path is F32 by construction use this even with `allow_bf16` on (packet
-/// Q36-BF16-a fix): the gated delta Metal kernel reads plain F32 bytes (`InT` is float, decision
-/// 0050), and a BF16 operand there is silent garbage, not a promoted operand. The rejection text
-/// is the text of `check_operand` from before the switch existed.
+/// wrappers whose native path is F32 by construction use this even with `allow_bf16` on: the
+/// gated delta Metal kernel reads plain F32 bytes (`InT` is float), and a BF16 operand there is
+/// silent garbage, not a promoted operand. The rejection text is the text of `check_operand`
+/// from before the switch existed.
 pub(super) fn check_f32_operand(
     operation: &'static str,
     state: &State,
@@ -3741,7 +3735,7 @@ mod rebind_tests {
 
 #[cfg(test)]
 mod cast_tests {
-    //! The `cast` and `allow_bf16` surface of packet Q36-BF16-a. These tests need the GPU.
+    //! The `cast` and `allow_bf16` surface. These tests need the GPU.
 
     use crate::{
         EngError,
@@ -3908,8 +3902,8 @@ mod cast_tests {
 
 #[cfg(test)]
 mod f32_only_tests {
-    //! The wrappers that stay F32 only even with `allow_bf16` on (packet Q36-BF16-a fix; the rev
-    //! 55 text of the kernels design): a BF16 operand of theirs is `BadRequest` with the
+    //! The wrappers that stay F32 only even with `allow_bf16` on: a BF16 operand of theirs is
+    //! `BadRequest` with the
     //! text that rejected it before the switch existed, because their native path is F32 by
     //! construction. These tests need the GPU.
 
@@ -3948,8 +3942,8 @@ mod f32_only_tests {
         let k = f32_resident(&mut kernels, &[1, 1, 1, 32], &[1.0; 32]);
         let v = f32_resident(&mut kernels, &[1, 1, 1, 1], &[1.0]);
         let g = f32_resident(&mut kernels, &[1, 1, 1], &[0.5]);
-        // The Metal kernel reads every operand as plain F32 bytes (decision 0050), so a BF16 beta
-        // would be read as F32 garbage, not promoted.
+        // The Metal kernel reads every operand as plain F32 bytes, so a BF16 beta would be read
+        // as F32 garbage, not promoted.
         let beta = bf16_resident(&mut kernels, &[1, 1, 1], &[0.5]);
         let state = f32_resident(&mut kernels, &[1, 1, 1, 32], &[0.0; 32]);
         let refused = kernels.gated_delta(&q, &k, &v, &g, &beta, &state);
@@ -4108,11 +4102,11 @@ mod f32_only_tests {
 
 #[cfg(test)]
 mod gather_sorted_tests {
-    //! `gather_qmm_sorted` against `gather_qmm` on identical inputs (packet Q36-PF-SORTED): the
-    //! `sorted_indices` flag must not change the values, and the device clamp must hold for it
-    //! too. These tests need the GPU. Every index list holds at least 16 pairs and at least 4
-    //! pairs per expert on average, the shape for which the pinned MLX picks its sorted kernel,
-    //! so the sorted call does not silently run the kernel of the unsorted call.
+    //! `gather_qmm_sorted` against `gather_qmm` on identical inputs: the `sorted_indices` flag
+    //! must not change the values, and the device clamp must hold for it too. These tests need
+    //! the GPU. Every index list holds at least 16 pairs and at least 4 pairs per expert on
+    //! average, the shape for which the pinned MLX picks its sorted kernel, so the sorted call
+    //! does not silently run the kernel of the unsorted call.
 
     use crate::{
         kernels::{
@@ -4122,7 +4116,7 @@ mod gather_sorted_tests {
     };
 
     /// The stack of the tests: six experts of three rows and 64 columns, so the index lists can
-    /// give rows to several experts and leave one expert with no rows (packet Q36-PF-SORTED).
+    /// give rows to several experts and leave one expert with no rows.
     const EXPERTS: u32 = 6;
     const ROWS: u32 = 3;
     const COLUMNS: u32 = 64;
@@ -4263,8 +4257,8 @@ mod gather_sorted_tests {
         5, 5, 5, 5, 5, 5, 5, 5, // expert 5
     ];
 
-    /// The absolute oracle of the agreement tests (fix B2b). The pinned MLX dequantizes the int4
-    /// word affinely as `code * scale + bias`, so the output of pair `p` at column `r` is
+    /// The absolute oracle of the agreement tests. The pinned MLX dequantizes the int4 word
+    /// affinely as `code * scale + bias`, so the output of pair `p` at column `r` is
     /// `scale_e * sum_c x[c] code(c) + bias_r * sum_c x[c]`: with `x[c] = (p + c) % 2` over 64
     /// columns the code sum is 128 for even `p` and 96 for odd `p`, and the activation sum is 32,
     /// so the element is `(8 or 6) * (4 + e) + 4 r`, an integer from 24 to 80 that F32 and BF16
@@ -4428,11 +4422,11 @@ mod gather_sorted_tests {
 
 #[cfg(test)]
 mod bounded_tests {
-    //! The `*_bounded` operations of packet GAP-TRIM-A against their clamping siblings: the same
-    //! values bit for bit while the recorded bound covers the operand axis, the operand's own
-    //! clamp rebuilt when it does not, and the once-clamped resident safe against out-of-range
-    //! ids. `take` along axis 1 also covers the transpose-view contiguity rule of `take_with`.
-    //! These tests need the GPU.
+    //! The `*_bounded` operations against their clamping siblings: the same values bit for bit
+    //! while the recorded bound covers the operand axis, the operand's own clamp rebuilt when it
+    //! does not, and the once-clamped resident safe against out-of-range ids. `take` along axis
+    //! 1 also covers the transpose-view contiguity rule of `take_with`. These tests need the
+    //! GPU.
 
     use crate::{
         EngError,
@@ -4539,10 +4533,10 @@ mod bounded_tests {
     ];
 
     /// `gather_qmm_bounded` equals `gather_qmm` bit for bit on the same raw ids for every bound
-    /// rule (packet GAP-TRIM-A 4a): a bound at the expert count skips the clamp, a bound past the
-    /// count rebuilds the operand's own clamp, and a tighter bound that covers the count skips
-    /// too. Ids above the bound never read outside the stack: the `OVER` run of every rule equals
-    /// the `ALL` run, because 9 clamps to the last expert on both paths.
+    /// rule: a bound at the expert count skips the clamp, a bound past the count rebuilds the
+    /// operand's own clamp, and a tighter bound that covers the count skips too. Ids above the
+    /// bound never read outside the stack: the `OVER` run of every rule equals the `ALL` run,
+    /// because 9 clamps to the last expert on both paths.
     #[test]
     fn gather_qmm_bounded_equals_gather_qmm_under_every_bound_rule() {
         let _serial = crate::native_test_lock();
@@ -4584,8 +4578,8 @@ mod bounded_tests {
     }
 
     /// `gather_qmm_sorted_bounded` equals `gather_qmm_sorted` bit for bit on sorted ids under the
-    /// same bound rules (packet GAP-TRIM-A 4a). The 24 pairs over six experts reach the pinned
-    /// MLX's sorted kernel (24 pairs, four per expert on average).
+    /// same bound rules. The 24 pairs over six experts reach the pinned MLX's sorted kernel (24
+    /// pairs, four per expert on average).
     #[test]
     fn gather_qmm_sorted_bounded_equals_the_sorted_sibling() {
         let _serial = crate::native_test_lock();
@@ -4610,11 +4604,11 @@ mod bounded_tests {
         }
     }
 
-    /// The bound is checked against the EXPERT axis, not any other axis of the stack (packet
-    /// GAP-TRIM-A mutation "apply the bound to the wrong axis"): this stack has three experts and
-    /// six rows, and the bound 4 covers the row count but not the expert count, so the gather
-    /// must rebuild its own clamp — id 9 reads expert 2, exactly as the sibling does. A check
-    /// against the row axis would skip the clamp and read the out-of-range expert 3.
+    /// The bound is checked against the EXPERT axis, not any other axis of the stack (the test
+    /// catches the mutation that applies the bound to the wrong axis): this stack has three
+    /// experts and six rows, and the bound 4 covers the row count but not the expert count, so
+    /// the gather must rebuild its own clamp — id 9 reads expert 2, exactly as the sibling does.
+    /// A check against the row axis would skip the clamp and read the out-of-range expert 3.
     #[test]
     fn the_gather_bound_covers_the_expert_axis_not_the_row_axis() {
         let _serial = crate::native_test_lock();
@@ -4637,10 +4631,10 @@ mod bounded_tests {
         );
     }
 
-    /// `take_bounded` equals `take` bit for bit under the same bound rules (packet GAP-TRIM-A 4a)
-    /// on a take along axis 1, whose output is the transpose view of the gather (the contiguity
-    /// rule of `take_with`), and on a take along axis 0, whose output is the raw gather. Ids
-    /// above the axis clamp to the last element.
+    /// `take_bounded` equals `take` bit for bit under the same bound rules on a take along axis
+    /// 1, whose output is the transpose view of the gather (the contiguity rule of `take_with`),
+    /// and on a take along axis 0, whose output is the raw gather. Ids above the axis clamp to
+    /// the last element.
     #[test]
     fn take_bounded_equals_take_under_every_bound_rule() {
         let _serial = crate::native_test_lock();
@@ -4681,11 +4675,11 @@ mod bounded_tests {
         );
     }
 
-    /// The take bound is checked against the TAKEN axis, not axis 0 (packet GAP-TRIM-A mutation
-    /// "apply the bound to the wrong axis"): a take along axis 1 of a `[4, 2]` table with the
-    /// bound 3 sits above the axis length 2 and below the row count 4, so the take must rebuild
-    /// its clamp and id 9 reads column 1. A check against axis 0 would skip the clamp and read
-    /// the out-of-range column 2.
+    /// The take bound is checked against the TAKEN axis, not axis 0 (the test catches the
+    /// mutation that applies the bound to the wrong axis): a take along axis 1 of a `[4, 2]`
+    /// table with the bound 3 sits above the axis length 2 and below the row count 4, so the
+    /// take must rebuild its clamp and id 9 reads column 1. A check against axis 0 would skip
+    /// the clamp and read the out-of-range column 2.
     #[test]
     fn the_take_bound_covers_the_taken_axis_not_axis_zero() {
         let _serial = crate::native_test_lock();
@@ -4710,9 +4704,9 @@ mod bounded_tests {
         );
     }
 
-    /// The constructor rules of `BoundedIndices` (packet GAP-TRIM-A 4): a bound of zero is a
-    /// `BadRequest` before the first native call, the ids keep their shape and dtype through the
-    /// clamp, and the recorded bound is the constructor's bound.
+    /// The constructor rules of `BoundedIndices`: a bound of zero is a `BadRequest` before the
+    /// first native call, the ids keep their shape and dtype through the clamp, and the recorded
+    /// bound is the constructor's bound.
     #[test]
     fn bound_indices_rejects_zero_and_keeps_the_id_layout() {
         let _serial = crate::native_test_lock();
@@ -4744,10 +4738,10 @@ mod bounded_tests {
         assert_eq!(words, [2, 3], "9 clamps below the bound 4 to 3");
     }
 
-    /// The clamp runs once per layer (packet GAP-TRIM-A): three bounded gathers that share one
-    /// `BoundedIndices` (the gate, up and down products of one layer) hold exactly one `Minimum`
-    /// primitive, the one `bound_indices` built, while three clamping siblings on the same raw
-    /// ids hold three. The bounded gather itself adds none. Qualification builds only, like
+    /// The clamp runs once per layer: three bounded gathers that share one `BoundedIndices` (the
+    /// gate, up and down products of one layer) hold exactly one `Minimum` primitive, the one
+    /// `bound_indices` built, while three clamping siblings on the same raw ids hold three. The
+    /// bounded gather itself adds none. Qualification builds only, like
     /// `decode_graph_primitives` reads the graph.
     #[cfg(feature = "native-fault-qualification")]
     #[test]
@@ -4789,9 +4783,9 @@ mod bounded_tests {
 #[cfg(test)]
 mod view_readback_tests {
     //! Readback of the view-producing operations after the contiguity guarantee moved to the
-    //! read (packet GAP-TRIM-A 4c): `slice`, `transpose`, `repeat`, `broadcast`, and a reshape
-    //! of a view all read back through `Resident::readback`, which copies a strided array at the
-    //! read when one reaches it. These tests need the GPU.
+    //! read: `slice`, `transpose`, `repeat`, `broadcast`, and a reshape of a view all read back
+    //! through `Resident::readback`, which copies a strided array at the read when one reaches
+    //! it. These tests need the GPU.
 
     use crate::{
         kernels::MlxKernels,
@@ -4820,9 +4814,9 @@ mod view_readback_tests {
             .collect()
     }
 
-    /// Every view-producing operation reads back in row-major order (packet GAP-TRIM-A 4c): a
-    /// slice of a wider table, the transpose of it, a repeat of both axes, a broadcast row, and
-    /// reshapes OF those views. Each expected vector follows from the operation's definition.
+    /// Every view-producing operation reads back in row-major order: a slice of a wider table,
+    /// the transpose of it, a repeat of both axes, a broadcast row, and reshapes OF those
+    /// views. Each expected vector follows from the operation's definition.
     #[test]
     fn view_operations_read_back_in_row_major_order() {
         let _serial = crate::native_test_lock();

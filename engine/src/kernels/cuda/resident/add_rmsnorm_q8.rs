@@ -1,18 +1,18 @@
-//! The fused residual add, RMSNorm and q8_1 quantize of the resident step (MATVEC-PAR S3a K1,
-//! decision 0047, stage 1): [`CudaContext::add_rmsnorm_q8`] queues ONE kernel on a
-//! [`DeviceStream`] for the step's single row (m = 1) and returns when it is queued. It allocates
-//! nothing, copies nothing and never synchronizes.
+//! The fused residual add, RMSNorm and q8_1 quantize of the resident step:
+//! [`CudaContext::add_rmsnorm_q8`] queues ONE kernel on a [`DeviceStream`] for the step's single
+//! row (m = 1) and returns when it is queued. It allocates nothing, copies nothing and never
+//! synchronizes.
 //!
-//! Outputs: `norm_out` holds the f32 normalized row, byte-identical to what `add_norm_pack`
-//! writes on the same input (the native kernel restates `add_rmsnorm_pack_k`'s strided sum of
-//! squares, its block reduction order, its `rsqrtf` and its expression `row[i] * rstd * w[i]`;
-//! the router keeps reading it). `q8` holds the `block_q8_1` quantization of the same values,
-//! one warp per 32-value block over the row padded to [`MATRIX_ROW_PADDING`] (512) values, the
-//! tail past `n` written as zeros. The quantizer rule is the vendored `quantize_q8_1`'s (`d =
-//! amax/127`, `q = amax == 0 ? 0 : roundf(x/d)`, `ds = half2(d, sum x)` with the warp butterfly
-//! sum) computed in IEEE arithmetic: the native TU is in the warnings-into-errors group WITHOUT
-//! `-use_fast_math` (decision 0049 item 5 names the vendored objects only), so `d` is the IEEE
-//! division and the `q8` bytes are bit-checkable against a host reference.
+//! Outputs: `norm_out` holds the f32 normalized row, byte-identical to what `add_norm_pack` writes
+//! on the same input (the native kernel restates `add_rmsnorm_pack_k`'s strided sum of squares, its
+//! block reduction order, its `rsqrtf` and its expression `row[i] * rstd * w[i]`; the router keeps
+//! reading it). `q8` holds the `block_q8_1` quantization of the same values, one warp per 32-value
+//! block over the row padded to [`MATRIX_ROW_PADDING`] (512) values, the tail past `n` written as
+//! zeros. The quantizer rule is the vendored `quantize_q8_1`'s (`d = amax/127`,
+//! `q = amax == 0 ? 0 : roundf(x/d)`, `ds = half2(d, sum x)` with the warp butterfly sum) computed
+//! in IEEE arithmetic: the native TU is in the warnings-into-errors group WITHOUT `-use_fast_math`
+//! (only the vendored objects use it), so `d` is the IEEE division and the `q8` bytes are
+//! bit-checkable against a host reference.
 //!
 //! Every refusal is a `BadRequest` and happens before any native call. In order: the backend is
 //! usable; `n` is a multiple of 256 in `256..=32768` (the bounds of today's `add_norm_pack`); `eps`

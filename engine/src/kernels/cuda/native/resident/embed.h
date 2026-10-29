@@ -1,5 +1,5 @@
 /*
- * RD-4c: launch entry of the embedding row gather (native/resident/embed.h, the per-kernel header of
+ * Launch entry of the embedding row gather (native/resident/embed.h, the per-kernel header of
  * the layout in kernels/cuda/resident/mod.rs; abi_resident.h stays closed). Launch-only: nothing here
  * allocates, copies or synchronizes; a fault in queued work surfaces at the next synchronize.
  * Include after abi.h in C++. Rust mirrors the struct in native/resident/embed.rs.
@@ -15,11 +15,12 @@
  *              is uploaded; this device path is for ids the host cannot see.
  *   x          f32 [m][k], 16-byte aligned, written in full. It may not overlap ids, status or the tiles.
  *   status     one device i32, 4-byte aligned, the step status word (StepParams.status, offset 16;
- *              ResidentState::step_status()). When any id of the call is outside [0, n_rows) the kernel
- *              ORs INFERENCE_CUDA_STATUS_INVALID_STEP_STATE (4) into it with one integer atomicOr from
- *              one thread of the block that saw the id (idempotent, order independent; the RD-8a0
- *              pattern). It writes nothing else and never clears a bit, so the host cannot tell this cause from
- *              an invalid step state by the word alone (the host message names both). Valid ids leave it alone.
+ *              ResidentState::step_status()). When any id of the call is outside [0, n_rows) the
+ *              kernel ORs INFERENCE_CUDA_STATUS_INVALID_STEP_STATE (4) into it with one integer
+ *              atomicOr from one thread of the block that saw the id (idempotent, order
+ *              independent; the pattern of attn_prep's poison guard). It writes nothing else and
+ *              never clears a bit, so the host cannot tell this cause from an invalid step state by
+ *              the word alone (the host message names both). Valid ids leave it alone.
  *   n_rows     multiple of 8, 8 .. 2^28;  k  multiple of 256, 256 .. 32768;  m in [1, 4096].
  * stream must not be NULL. A rejected argument returns INFERENCE_CUDA_INVALID_ARGUMENT before any CUDA
  * call; otherwise the launch status of the kernel (one launch).
@@ -66,7 +67,7 @@ _Static_assert(sizeof(inference_cuda_embed_args) == 48 && offsetof(inference_cud
 int inference_cuda_embed_launch(const inference_cuda_embed_args *args, void *stream, int *out_stage);
 
 /*
- * MATVEC-PAR S2: the native twin of the entry above, against the file's own Q4_K blocks. Same
+ * The native twin of the entry above, against the file's own Q4_K blocks. Same
  * ids/x/status contract (one id outside [0, n_rows) writes a NaN row, reads no weight and ORs
  * status bit 4), same numerics bit for bit. blocks is the row-major native table: n_rows rows of
  * k / 256 blocks of 144 bytes (d, dmin, 12 scale bytes, 128 qs bytes), 16-byte aligned. Q4_K only;

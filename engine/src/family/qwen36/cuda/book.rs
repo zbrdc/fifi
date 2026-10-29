@@ -1,4 +1,4 @@
-//! The bookkeeping of the resident state, as pure host code (decision 0047 item 4, packet RD-9b1).
+//! The bookkeeping of the resident state, as pure host code.
 //!
 //! [`StateBook`] holds the numbers the device owner must never let drift apart: the committed row
 //! count `tokens`, the steps enqueued and not yet committed (`pending`), the [`Health`] of the
@@ -8,28 +8,28 @@
 //! tested on the CPU without a `CudaContext`.
 //!
 //! # Rules
-//! 1. A step may be enqueued only while `tokens + pending + advance <= capacity` (`ensure_rows`,
-//!    RD-4d), the sum before the call is the host mirror `admit_pos` of the device `pos` word,
-//!    and the advance is at most `MAX_ADVANCE`. Only a `Valid` state enqueues, and not while a
-//!    start block is owed (after a reset, an import or a prefill).
+//! 1. A step may be enqueued only while `tokens + pending + advance <= capacity` (`ensure_rows`),
+//!    the sum before the call is the host mirror `admit_pos` of the device `pos` word, and the
+//!    advance is at most `MAX_ADVANCE`. Only a `Valid` state enqueues, and not while a start block
+//!    is owed (after a reset, an import or a prefill).
 //! 2. `commit(accepted, status)` retires the oldest pending step after the host read its result
 //!    pair. **In stage 1 ANY non-zero status bit (1, 2, 4, 8 or an unknown bit, alone or in any
-//!    combination) poisons the state** and retires nothing (lane M REPLY-76 Q2; relaxing bits 1
-//!    and 2 needs a later rule with evidence and lane M's sign-off). The refusal keeps the status
-//!    class of the wrapper: `StepStatus::error()` (`Backend`, precedence 4 > 8 > 1 > 2), not
-//!    `BadRequest` text. `accepted` must equal the step's advance; a lower count means the step
-//!    already ran and the DeltaNet slot is ahead of `tokens` (no per-row snapshot until RD-7c),
-//!    so the typed `Partial` refusal POISONS too: the step cannot be undone.
-//! 3. Health is a tri-state. `Poisoned` is entered by a status report, a `Partial` commit, a
-//!    failed device operation, a reset or an import in progress, and by `allocate` before its
-//!    first reset. Only `finish_overwrite` leaves it, reached from `reset` and from
-//!    `import_state`; `import_state` may leave a poisoned state ONLY when it does all of
-//!    reset's work (the words block rewritten with `StepParams` and status zeroed, the other
-//!    slots cleared, a full overwrite from a snapshot `check_import` accepted); `begin_import`
-//!    refuses a `Poisoned` state otherwise (REPLY-76 Q1), and a failure after `check_import`
-//!    leaves it `Poisoned`, never a partly imported `Valid` state. `PrefillOpen` is entered by
-//!    `begin_prefill` from `Valid` and idle; only `revalidate` leaves it, and only from there. A
-//!    mask-4 defect therefore stays until reset: `revalidate` cannot clear it.
+//!    combination) poisons the state** and retires nothing (relaxing bits 1 and 2 needs a later
+//!    rule backed by evidence). The refusal keeps the status class of the wrapper:
+//!    `StepStatus::error()` (`Backend`, precedence 4 > 8 > 1 > 2), not `BadRequest` text.
+//!    `accepted` must equal the step's advance; a lower count means the step already ran and the
+//!    DeltaNet slot is ahead of `tokens` (the step keeps no per-row snapshot), so the typed
+//!    `Partial` refusal POISONS too: the step cannot be undone.
+//! 3. Health is a tri-state. `Poisoned` is entered by a status report, a `Partial` commit, a failed
+//!    device operation, a reset or an import in progress, and by `allocate` before its first reset.
+//!    Only `finish_overwrite` leaves it, reached from `reset` and from `import_state`;
+//!    `import_state` may leave a poisoned state ONLY when it does all of reset's work (the words
+//!    block rewritten with `StepParams` and status zeroed, the other slots cleared, a full
+//!    overwrite from a snapshot `check_import` accepted); `begin_import` refuses a `Poisoned` state
+//!    otherwise, and a failure after `check_import` leaves it `Poisoned`, never a partly imported
+//!    `Valid` state. `PrefillOpen` is entered by `begin_prefill` from `Valid` and idle; only
+//!    `revalidate` leaves it, and only from there. A mask-4 defect therefore stays until reset:
+//!    `revalidate` cannot clear it.
 //! 4. Export, `revalidate`, `begin_prefill` and a start block need `pending == 0`: a state copied
 //!    with work in flight is ahead of `tokens`, imports cleanly and decodes plausible wrong text.
 //! 5. Every device copy and every block goes through the stream that owns the state
@@ -51,7 +51,7 @@ use crate::{
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum Health {
     Valid,
-    /// A prefill chunk is writing the pools in place (decision 0049).
+    /// A prefill chunk is writing the pools in place.
     PrefillOpen,
     /// Untrustworthy until a reset or a successful import.
     Poisoned,
@@ -118,7 +118,7 @@ impl fmt::Display for CommitRefusal {
             ),
             Self::Partial { advance, accepted } => write!(
                 f,
-                "a step of {advance} rows cannot commit {accepted}: partial accept needs the DeltaNet snapshots of RD-7c, and the state is poisoned"
+                "a step of {advance} rows cannot commit {accepted}: partial accept needs per-row DeltaNet snapshots, which the step does not keep, and the state is poisoned"
             ),
         }
     }
@@ -288,12 +288,12 @@ impl StateBook {
 
     /// Guards of `import_state` after `check_import` accepted the value: the owning stream, and
     /// `rewrites_words` - whether the import does ALL of reset's work (the words block rewritten
-    /// with `StepParams` and status zeroed, the other slots cleared). A `Poisoned` state is
-    /// refused unless it does (REPLY-76 Q1); a `Valid` or `PrefillOpen` one may be replaced
-    /// either way. The state is `Poisoned` until `finish_overwrite`, so a failure after this call
-    /// never leaves a partly imported `Valid` state. `import_state` always passes `true`
-    /// (`IMPORT_REWRITES_WORDS`), so the `false` refusal below is unreachable in production: it
-    /// is a guard for future callers that import without rewriting the words.
+    /// with `StepParams` and status zeroed, the other slots cleared). A `Poisoned` state is refused
+    /// unless it does; a `Valid` or `PrefillOpen` one may be replaced either way. The state is
+    /// `Poisoned` until `finish_overwrite`, so a failure after this call never leaves a partly
+    /// imported `Valid` state. `import_state` always passes `true` (`IMPORT_REWRITES_WORDS`), so
+    /// the `false` refusal below is unreachable in production: it is a guard for future callers
+    /// that import without rewriting the words.
     pub(super) fn begin_import(
         &mut self,
         stream_id: u64,
@@ -412,9 +412,9 @@ impl StateBook {
         self.require_prefill_open("revalidate")
     }
 
-    /// Guards of the prefill status word copies of decision 0049 item 10 (`what` names the
-    /// caller): the owning stream and an open prefill chunk, so the word is zeroed at chunk
-    /// open and read at chunk close, inside the chunk only.
+    /// Guards of the prefill status word copies (`what` names the caller): the owning stream and an
+    /// open prefill chunk, so the word is zeroed at chunk open and read at chunk close, inside the
+    /// chunk only.
     pub(super) fn begin_prefill_word(&self, stream_id: u64, what: &str) -> Result<(), EngError> {
         self.check_owner(stream_id, what)?;
         self.require_prefill_open(what)

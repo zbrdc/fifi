@@ -1,11 +1,11 @@
-//! Command-line tests of the `qwen3_6_35b_a3b` entry of `enginesrv` (packet Q36-F3c).
+//! Command-line tests of the `qwen3_6_35b_a3b` entry of `enginesrv`.
 //! No test loads weights. Every run stops at a configuration or backend error before an engine
-//! thread starts. Q36 results never satisfy Phase 0B or Phase 1B.
+//! thread starts.
 //! The tests whose premise is the MLX reading (the cache-limit requirement, the chunked-prefill
 //! keys, the `native-mlx` fallback) are cfg'd off on the `native-cuda` Linux build, where the
-//! premise is false by design, and each has its CUDA twin there (KUBDAN-MSG-71 item 1): no
-//! cache limit needed, the allocator keys ignored with a start line, the budget keys refused
-//! by name, the CUDA start's own tokenizer pin.
+//! premise is false by design, and each has its CUDA twin there: no cache limit needed, the
+//! allocator keys ignored with a start line, the budget keys refused by name, the CUDA start's
+//! own tokenizer pin.
 
 use std::process::{Command, Output};
 
@@ -68,7 +68,7 @@ fn an_entry_without_a_cache_limit_stops_startup_and_names_the_engine_and_the_key
 }
 
 /// The CUDA twin: the arm needs no cache limit, so the entry passes the settings and stops at
-/// the CUDA start's own tokenizer pin (KUBDAN-MSG-71 item 1).
+/// the CUDA start's own tokenizer pin.
 #[cfg(all(feature = "native-cuda", target_os = "linux"))]
 #[test]
 fn an_entry_without_a_cache_limit_needs_none_on_the_cuda_arm() {
@@ -179,7 +179,7 @@ fn a_prefill_reserve_without_a_budget_stops_startup_and_names_both_keys() {
     );
 }
 
-/// The CUDA twin: the reserve key is refused by name too (KUBDAN-MSG-71 item 1).
+/// The CUDA twin: the reserve key is refused by name too.
 #[cfg(all(feature = "native-cuda", target_os = "linux"))]
 #[test]
 fn a_prefill_reserve_without_a_budget_is_refused_by_name_on_the_cuda_arm() {
@@ -210,7 +210,7 @@ fn a_prefill_budget_without_a_reserve_stops_startup_and_names_both_keys() {
     );
 }
 
-/// The CUDA twin: a budget alone is refused by the same named rule (KUBDAN-MSG-71 item 1).
+/// The CUDA twin: a budget alone is refused by the same named rule.
 #[cfg(all(feature = "native-cuda", target_os = "linux"))]
 #[test]
 fn a_prefill_budget_without_a_reserve_is_refused_by_name_on_the_cuda_arm() {
@@ -355,7 +355,7 @@ fn a_complete_entry_with_a_missing_tokenizer_directory_stops_startup_and_names_t
 /// stops at the next step. That step is the backend check without the native backend
 /// (`native-mlx`), the tokenizer file on the Mac build with it, and on the CUDA build the named
 /// refusal of `prefill_budget_bytes` — the first chunked-prefill key the shipped Mac config
-/// carries that the CUDA arm refuses (KUBDAN-MSG-71 item 1, line-217 case).
+/// carries that the CUDA arm refuses.
 #[test]
 fn the_shipped_mac_studio_config_passes_every_check_before_the_backend() {
     let path =

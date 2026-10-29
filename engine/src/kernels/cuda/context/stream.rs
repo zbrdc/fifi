@@ -1,32 +1,31 @@
-//! Non-blocking streams and timing-free events of a CUDA context (CUDA-RD
-//! section 6, decision 0047).
+//! Non-blocking streams and timing-free events of a CUDA context.
 //!
 //! A [`DeviceStream`] or [`DeviceEvent`] owns one native handle and shares the
 //! lease of the context that made it, like a [`super::DeviceBuffer`]. Invariants:
 //!
 //! - Both are `!Send` and `!Sync` (`PhantomData<*const ()>`), so the creating
-//!   thread is the only one that calls them (decisions 0023 and 0024).
+//!   thread is the only one that calls them.
 //! - Every method reports a terminal backend first, then checks its arguments
 //!   (an owner of another adapter is a `BadRequest`), then enters the dispatch
 //!   guard and makes the one native call. The raw calls stay in
 //!   `native::resident`; this module has none.
-//! - Drop follows decision 0022 ([`release`]): after a terminal failure it makes
+//! - Drop goes through [`release`]: after a terminal failure it makes
 //!   no native call and leaves the owner counted; a failed destroy latches the
 //!   backend. The native destroy of a stream synchronizes it first. Drop never
 //!   panics.
 //! - Inside a capture window ([`super::graph`]) only `record`, `wait`, and the section marks'
-//!   `record_timing` with its `is_capturing` query (packet B1) of this module run:
-//!   creating a stream or event and both synchronizes are refused with `BadRequest`, and a drop is
-//!   deferred. An event records whether its last record was made inside a window (`captured`); a
-//!   host wait on such an event is refused before any native call, because CUDA answers it with
-//!   an unlisted CUDA error (status 1 on the 12.2 runtime; 907 is the documented one), which would
-//!   latch the backend.
+//!   `record_timing` with its `is_capturing` query of this module run: creating a stream or
+//!   event and both synchronizes are refused with `BadRequest`, and a drop is deferred. An event
+//!   records whether its last record was made inside a window (`captured`); a host wait on such
+//!   an event is refused before any native call, because CUDA answers it with an unlisted CUDA
+//!   error (status 1 on the 12.2 runtime; 907 is the documented one), which would latch the
+//!   backend.
 //! - Each stream counts the operations enqueued through the context. An event
 //!   remembers the count at its last record, which lets [`super::pinned`]
 //!   refuse to read memory before the event that follows its copy.
 #![cfg_attr(
     not(test),
-    expect(dead_code, reason = "staged for RD-9a (decision 0047)")
+    expect(dead_code, reason = "staged for the resident decode step")
 )]
 
 use std::{
@@ -243,7 +242,7 @@ impl DeviceEvent {
     }
 }
 
-/// One CUDA timing event of a captured graph's section marks (packet B1). Timing is enabled,
+/// One CUDA timing event of a captured graph's section marks. Timing is enabled,
 /// so an elapsed query works; there is no ordering bookkeeping, because nothing waits on it.
 /// Created before the capture that records it, so its address is stable across replays.
 pub(crate) struct TimingEvent {
@@ -253,7 +252,7 @@ pub(crate) struct TimingEvent {
 }
 
 impl CudaContext {
-    /// Creates a timing-enabled event (packet B1). Refused inside a capture window, like an
+    /// Creates a timing-enabled event. Refused inside a capture window, like an
     /// ordering event: the timer's events exist before the capture that records them.
     pub(crate) fn event_timing(&self) -> Result<TimingEvent, EngError> {
         self.ensure_usable()?;
@@ -270,11 +269,11 @@ impl CudaContext {
 }
 
 impl DeviceStream {
-    /// Records the timing event after the work queued so far, as a mark of the graph timer
-    /// (packet B1). Inside a capture window the record carries the external-record flag and
-    /// becomes an event-record node of the captured graph, so every replay re-records it;
-    /// outside a window (the warm-up token, the eager fallback of a refused capture) a plain
-    /// record runs, because `cudaEventRecordExternal` is valid only while capturing (CUDA 401,
+    /// Records the timing event after the work queued so far, as a mark of the graph timer.
+    /// Inside a capture window the record carries the external-record flag and becomes an
+    /// event-record node of the captured graph, so every replay re-records it; outside a
+    /// window (the warm-up token, the eager fallback of a refused capture) a plain record
+    /// runs, because `cudaEventRecordExternal` is valid only while capturing (CUDA 401,
     /// found by the device row).
     pub(crate) fn record_timing(&self, event: &TimingEvent) -> Result<(), EngError> {
         ensure_usable(&TERMINAL)?;
@@ -335,7 +334,7 @@ pub(super) fn same_adapter(
     )))
 }
 
-/// Destroys one native owner under decision 0022, for `Drop`.
+/// Destroys one native owner, for `Drop`.
 ///
 /// After a terminal failure nothing is destroyed and the owner stays counted in
 /// `live`, because the memory or the handle is left to the process exit. A

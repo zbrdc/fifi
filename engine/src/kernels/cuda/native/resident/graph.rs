@@ -1,14 +1,14 @@
 //! Raw entries of `native/resident/graph.cu`: stream capture, instantiate and launch of executable
-//! graphs (RD-2d, decision 0047, child modules of `native.rs`).
+//! graphs.
 //!
 //! Safety invariants this file relies on:
 //! - A graph handle (`RawGraphExec`) is opaque. It is created once, by `capture_end`, and consumed
 //!   once, by `exec_destroy`. It has no `Drop`: the owner in `context::graph` calls the destroy so
-//!   that a failed destroy is reported and latches the backend (decision 0022).
+//!   that a failed destroy is reported and latches the backend.
 //! - A capture is begun and ended on one thread, on a stream that this thread owns, under the
-//!   process dispatch guard (decisions 0023 and 0024); `capture_begin` uses thread-local capture
-//!   mode, so the other threads of the process are unaffected. The guard of the caller keeps a
-//!   window from interleaving with a native call of another thread.
+//!   process dispatch guard; `capture_begin` uses thread-local capture mode, so the other threads
+//!   of the process are unaffected. The guard of the caller keeps a window from interleaving with a
+//!   native call of another thread.
 //! - `capture_end` leaves no graph behind except the returned executable one: the captured graph is
 //!   destroyed in C on every path, and the entry refuses (an adapter failure) when the stream is
 //!   still capturing afterwards.
@@ -21,7 +21,7 @@
 //! not declared here: what changes between replays is buffer content, never an address.
 #![cfg_attr(
     not(test),
-    expect(dead_code, reason = "staged for RD-9a (decision 0047)")
+    expect(dead_code, reason = "staged for the resident decode step")
 )]
 
 use std::ffi::{c_int, c_void};

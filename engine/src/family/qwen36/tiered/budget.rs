@@ -1,4 +1,4 @@
-//! The admission arithmetic of the tiered offload (OFF-2 B7).
+//! The admission arithmetic of the tiered offload.
 //!
 //! WHAT: two pure planners that decide, in bytes, how the machine is split at
 //! load. [`plan_vram`] gives the KV cache of the configured context VRAM first
@@ -13,8 +13,7 @@
 //! caller; no model constant lives here. All sizes are bytes (`u64`), every
 //! operation is checked (an absurd input is refused as [`BudgetError`] — never
 //! wrapped, never a panic), and the split is deterministic: no I/O, no clocks,
-//! no randomness, no threads. The tiered load uses its VRAM plan
-//! (OFF-2 D5b).
+//! no randomness, no threads. The tiered load uses its VRAM plan.
 
 use super::TieredConfig;
 

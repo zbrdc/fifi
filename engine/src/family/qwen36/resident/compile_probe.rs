@@ -1,12 +1,11 @@
 //! Stage 1 of the compile seam: one `mlx_compile`d closure around the gated delta kernel.
 //!
-//! Decision 0039 item 8 keeps `mlx_compile` off, and decision 0046 A5 names Q36-G2 as the
-//! measurement that can ask for an amendment. The ignored test below compiles one closure that
-//! replays the gated delta kernel of decision 0050 on tiny deterministic operands, applies it
-//! twice, and compares both outputs bit for bit with the uncompiled
+//! `mlx_compile` is off by default. The ignored test below compiles one closure that replays the
+//! gated delta kernel on tiny deterministic operands, applies it twice, and compares both outputs
+//! bit for bit with the uncompiled
 //! [`MlxKernels::gated_delta`](crate::kernels::MlxKernels::gated_delta) result. Reaching the
 //! comparison means MLX traced the custom kernel; a native failure at the compiled call means it
-//! refused, and the packet stops after stage 1. A Q36 result never satisfies Phase 0B or 1B.
+//! refused, and the probe stops after stage 1.
 //!
 //! ```text
 //! Q36_OUT_DIR=<a path that does not exist yet> \

@@ -155,6 +155,144 @@ impl State {
         self.poisoned = false;
         Ok(())
     }
+
+    /// Snapshots the committed KV planes for the shared prefix store (slice
+    /// P1): quiesce, then read whole planes and the health buffer. A save
+    /// must not write or drain health or perturb the alloc-cache — it only
+    /// reads.
+    pub(crate) fn snapshot_prefix(
+        &self,
+        ctx: &CudaContext,
+        stream: &DeviceStream,
+    ) -> Result<crate::family::flint::cuda_prefix::CudaPrefixSnapshot> {
+        if self.poisoned {
+            return Err(EngError::BadRequest(
+                "flint cuda prefix save refuses a poisoned ring".into(),
+            ));
+        }
+        if self.kv.iter().any(|c| c.scales.is_some()) {
+            return Err(EngError::BadRequest(
+                "flint cuda prefix save refuses q8 scale planes: snapshots are f16-only".into(),
+            ));
+        }
+        let committed = self.prefix_committed()?;
+        stream.synchronize()?;
+        let health_len: u64 = self
+            .health
+            .as_ref()
+            .map_or(0, |h| u64::try_from(h.bytes_len()).unwrap_or(u64::MAX));
+        // Admission before allocating: the snapshot pins host
+        // memory for as long as the entry lives — every layer's committed
+        // planes PLUS the State's single health buffer — so it reserves
+        // against the same host/cgroup budget the expert cache admits on,
+        // and the allocation is fallible (try_reserve), refusing the save
+        // planned and logged instead of aborting the process on a vec!.
+        let per_layer = self
+            .kv
+            .iter()
+            .map(|c| c.committed_data_bytes(committed))
+            .collect::<Vec<_>>();
+        let charge: u64 = per_layer
+            .iter()
+            .map(|bytes| 2u64.saturating_mul(u64::try_from(*bytes).unwrap_or(u64::MAX)))
+            .fold(0u64, u64::saturating_add)
+            .saturating_add(health_len);
+        let budget = crate::family::flint::exl3_resident::HostBudget::probe()?;
+        budget
+            .admit_for(charge, "flint cuda prefix snapshot")
+            .inspect_err(|_| {
+                eprintln!(
+                    "flint cuda prefix save refused: committed {committed} rows, host charge {charge} bytes"
+                );
+            })?;
+        let mut layers = Vec::with_capacity(self.kv.len());
+        for cache in &self.kv {
+            let bytes = cache.committed_data_bytes(committed);
+            let mut keys = Vec::<u8>::new();
+            let mut values = Vec::<u8>::new();
+            keys.try_reserve_exact(bytes)
+                .and_then(|()| values.try_reserve_exact(bytes))
+                .map_err(|_| {
+                    EngError::MemoryPlan(format!(
+                        "flint cuda prefix snapshot cannot reserve {bytes} bytes per plane"
+                    ))
+                })?;
+            keys.resize(bytes, 0);
+            values.resize(bytes, 0);
+            ctx.download(&cache.keys, &mut keys)?;
+            ctx.download(&cache.values, &mut values)?;
+            layers.push(crate::family::flint::cuda_prefix::CudaLayerPlanes { keys, values });
+        }
+        let health = match &self.health {
+            Some(health) => Some(health.snapshot_bytes(stream)?),
+            None => None,
+        };
+        // One line per process, not per save: the wall
+        // audit needs the charge once; every-save printing would flood a
+        // serving loop.
+        static SAVED_ONCE: std::sync::OnceLock<()> = std::sync::OnceLock::new();
+        SAVED_ONCE.get_or_init(|| {
+            eprintln!(
+                "flint cuda prefix save: committed {committed} rows, host charge {charge} bytes"
+            );
+        });
+        Ok(crate::family::flint::cuda_prefix::CudaPrefixSnapshot {
+            layers,
+            health,
+            committed,
+        })
+    }
+
+    /// Installs a snapshot as the live state: reset (quiesce, health clear,
+    /// cursors zero), validate geometry, refill the committed plane prefix,
+    /// then re-commit the cursors.
+    pub(crate) fn restore_prefix(
+        &mut self,
+        ctx: &CudaContext,
+        stream: &DeviceStream,
+        snapshot: &crate::family::flint::cuda_prefix::CudaPrefixSnapshot,
+    ) -> Result<()> {
+        self.reset(stream)?;
+        let keys_len: Vec<usize> = self
+            .kv
+            .iter()
+            .map(|c| c.committed_data_bytes(snapshot.committed))
+            .collect();
+        let values_len = keys_len.clone();
+        snapshot.validate_against(
+            &keys_len,
+            &values_len,
+            self.health.as_ref().map(|h| h.bytes_len()),
+        )?;
+        for (cache, planes) in self.kv.iter_mut().zip(&snapshot.layers) {
+            ctx.upload_at(&cache.keys, 0, &planes.keys)?;
+            ctx.upload_at(&cache.values, 0, &planes.values)?;
+        }
+        if let (Some(health), Some(bytes)) = (&self.health, snapshot.health.as_deref()) {
+            health.restore_bytes(stream, bytes)?;
+        }
+        let committed = snapshot.committed;
+        for cache in &mut self.kv {
+            cache.cursor.restore_committed(committed)?;
+        }
+        Ok(())
+    }
+
+    /// The one committed boundary every layer must agree on at a save.
+    fn prefix_committed(&self) -> Result<usize> {
+        let committed = self.kv.first().map_or(0, |c| c.cursor.committed_prefix());
+        if committed == 0
+            || self
+                .kv
+                .iter()
+                .any(|c| c.cursor.committed_prefix() != committed)
+        {
+            return Err(EngError::BadRequest(
+                "flint cuda prefix save needs one committed boundary across layers".into(),
+            ));
+        }
+        Ok(committed)
+    }
 }
 
 pub(crate) struct Decoder<'a> {

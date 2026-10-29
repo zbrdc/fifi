@@ -1,5 +1,5 @@
-//! Reference run of the host forward over the real checkpoint (Q36-HR). The test is ignored: it
-//! needs the checkpoint on the Mac, uses the CPU only, and writes its evidence to `Q36_OUT_DIR`.
+//! Reference run of the host forward over the real checkpoint. The test is ignored: it needs the
+//! checkpoint on the Mac, uses the CPU only, and writes its evidence to `Q36_OUT_DIR`.
 //!
 //! ```text
 //! Q36_CKPT_DIR=<model_dir> Q36_OUT_DIR=<a path that does not exist yet> \
@@ -14,11 +14,11 @@
 //! and SHA-256 and the source commit.
 //!
 //! Limit of this evidence: the oracle, the unit tests, and a later resident decoder all follow one
-//! reading of the mlx-lm sources. A shared misreading passes all of them. Examples are the plain norm
-//! convention on the real values, the value-to-key head map, the per-head `[query, gate]` row order,
-//! the rotary pair layout at rotary 64, and the packed-slice offsets shared with the Flash-Next path.
-//! The external check is the one-time mlx-lm top-5 sanity check of decision 0046, which the user
-//! approved as a sanity check only. A Q36 result does not satisfy Phase 0B or 1B.
+//! reading of the mlx-lm sources. A shared misreading passes all of them. Examples are the plain
+//! norm convention on the real values, the value-to-key head map, the per-head `[query, gate]` row
+//! order, the rotary pair layout at rotary 64, and the packed-slice offsets shared with the
+//! Flash-Next path. The external check is a one-time mlx-lm top-5 comparison, and it serves as a
+//! sanity check only.
 
 use std::{
     fs::File,
@@ -338,7 +338,7 @@ mod tests {
     fn the_pinned_files_pass_and_the_pins_match_decision_0046() {
         let files = pinned_files();
         assert_eq!(check_pins(ENVIRONMENT_RECORD, &files), Ok(()));
-        // Prefixes and suffixes of decision 0046 item 2.
+        // Prefixes and suffixes of the pinned digests.
         let sha = |name: &str| {
             files
                 .iter()

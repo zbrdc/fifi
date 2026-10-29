@@ -1,4 +1,4 @@
-//! Starts the Q36 engine of one `enginesrv` config entry (packet Q36-F3b).
+//! Starts the Q36 engine of one `enginesrv` config entry.
 //!
 //! The tokenizer bundle loads on the calling thread. It carries only portable data. The engine
 //! thread builds everything native inside the `make` closure (`Q36Executor::open`), so no native
@@ -6,20 +6,18 @@
 //! against the pinned digests of `settings::tokenizer_pin`, so another template or tokenizer
 //! fails at load. The EOS ids (248046 and 248044) come from the pinned `generation_config.json`.
 //!
-//! Chunked prefill (decision 0044; packet Q36-E10): the chunk path stays off unless the settings
-//! carry `prefill_budget_bytes`. Then the engine thread calls `Q36Executor::plan_prefill` once,
-//! after the weights are resident and before the first job, with `prefill_chunk` as the largest
-//! chunk. The plan result decides the worker piece: the executor reports the planned chunk through
-//! `ExecutorOps::prefill_piece`, so a planned chunk is never larger than a piece. Without a plan,
-//! or with a plan that admits no chunk, the piece is 16 (`NO_BUDGET_PIECE`), the fallback that
-//! `spawn_engine` receives. A plan that admits no chunk is not an error: the engine runs
-//! one-token steps and the start-up line says why.
+//! Chunked prefill: the chunk path stays off unless the settings carry `prefill_budget_bytes`. Then
+//! the engine thread calls `Q36Executor::plan_prefill` once, after the weights are resident and
+//! before the first job, with `prefill_chunk` as the largest chunk. The plan result decides the
+//! worker piece: the executor reports the planned chunk through `ExecutorOps::prefill_piece`, so a
+//! planned chunk is never larger than a piece. Without a plan, or with a plan that admits no chunk,
+//! the piece is 16 (`NO_BUDGET_PIECE`), the fallback that `spawn_engine` receives. A plan that
+//! admits no chunk is not an error: the engine runs one-token steps and the start-up line says why.
 //!
-//! The activation dtype (packet Q36-BF16-a) travels with the rules into
-//! `ResidentDecoder::new_with_kv`, and the cache form (packet KV8-INTEGRATE) with them:
-//! `kv_dtype` `f32` is the control and `q8` keeps the 8-bit codes. The chunk path is dtype aware
-//! (packet Q36-BF16-b), so a BF16 engine plans its chunk exactly like an F32 engine when the
-//! budget allows one.
+//! The activation dtype travels with the rules into `ResidentDecoder::new_with_kv`, and the cache
+//! form with them: `kv_dtype` `f32` is the control and `q8` keeps the 8-bit codes. The chunk path
+//! is dtype aware, so a BF16 engine plans its chunk exactly like an F32 engine when the budget
+//! allows one.
 
 use super::resident::executor::{Q36Executor, Q36Rules};
 use super::settings::{NO_BUDGET_PIECE, Q36Settings, tokenizer_pin};
@@ -29,11 +27,11 @@ use crate::{
     tokenizer::TokenizerBundle,
 };
 
-/// The rules of one engine, built from the settings and the pinned tokenizer facts. Every
-/// setting that the decoder reads travels here in one place: `compile` is the `qwen36.compile`
-/// member, so a settings change reaches the decoder exactly through this function, and
-/// `prefix_reuse` (set by the factory after `Q36Settings::new`) picks the prefix-store limits:
-/// the addendum 2 set with the flag on, the addendum 1 store without it.
+/// The rules of one engine, built from the settings and the pinned tokenizer facts. Every setting
+/// that the decoder reads travels here in one place: `compile` is the `qwen36.compile` member, so a
+/// settings change reaches the decoder exactly through this function, and `prefix_reuse` (set by
+/// the factory after `Q36Settings::new`) picks the prefix-store limits: two pinned roots and six
+/// LRU entries with the flag on, the one-entry store without it.
 fn rules_of(settings: &Q36Settings, eos: Vec<u32>, sampler_vocab: usize) -> Q36Rules {
     Q36Rules {
         eos,
@@ -44,8 +42,7 @@ fn rules_of(settings: &Q36Settings, eos: Vec<u32>, sampler_vocab: usize) -> Q36R
         kv_dtype: settings.kv,
         compile: settings.compile,
         max_seqs: settings.max_seqs,
-        // The eviction-cliff reshape: the default stays the addendum 2 six for every spec
-        // (an entry's real cost grows with its depth - the review's memory-safety case -
+        // The default stays six entries for every spec (an entry's real cost grows with its depth,
         // so no budget-derived default ships before the replay measurement); the exact
         // `prefix_store_entries` override reaches every spec through here.
         prefix_store: super::settings::prefix_store_limits_of(
@@ -64,7 +61,7 @@ pub(crate) fn start(
 ) -> Result<(Engine, TokenizerBundle), EngError> {
     if settings.capture {
         // `capture` is a CUDA key; one config schema serves both arms, so the MLX arm reads
-        // it, ignores it, and says so on start-up (CUDA-SERVE-1 2.3).
+        // it, ignores it, and says so on start-up.
         eprintln!("q36: capture is a CUDA key and is ignored on this arm");
     }
     let bundle = TokenizerBundle::load(&settings.tokenizer_dir, &tokenizer_pin()?)?;
@@ -120,8 +117,8 @@ pub(crate) fn start(
 /// `prefill_budget` it does nothing and returns `None`, and the executor stays on one-token steps.
 /// With a budget, a single-session plan that admits no chunk also succeeds. Concurrent serving
 /// requires an admitted chunk; it never falls back to single-token prefill. Both activation dtypes
-/// plan a chunk (packet Q36-BF16-b): the chunk path is dtype aware, and only the budget or the
-/// largest chunk can keep a chunk out.
+/// plan a chunk: the chunk path is dtype aware, and only the budget or the largest chunk can keep a
+/// chunk out.
 pub(super) fn plan_prefill(
     executor: &mut Q36Executor,
     settings: &Q36Settings,
@@ -267,11 +264,10 @@ mod tests {
         );
     }
 
-    /// The rules carry the prefix-store limits of the `prefix_reuse` flag (packet SERVE-2-c
-    /// item 1; decision 0036, addendum 2): the factory sets the flag on the settings after
-    /// `new`, and `rules_of` maps it to the addendum 2 limits (two pinned roots, six LRU
-    /// entries); with the flag off the rules keep the addendum 1 store (zero roots, one
-    /// entry), so every engine started without the flag behaves exactly as before.
+    /// The rules carry the prefix-store limits of the `prefix_reuse` flag: the factory sets the
+    /// flag on the settings after `new`, and `rules_of` maps it to two pinned roots and six LRU
+    /// entries; with the flag off the rules keep the one-entry store (zero roots, one entry), so
+    /// every engine started without the flag behaves exactly as before.
     ///
     /// Mutation check (the limits-ignored patch): with `StoreLimits::default()` in both arms,
     /// the (2, 6) row fails.
@@ -299,7 +295,7 @@ mod tests {
                 roots: 2,
                 entries: 6
             },
-            "a prefix_reuse engine keeps the addendum 2 set (a literal, not the constant)"
+            "a prefix_reuse engine keeps two roots and six entries (a literal, not the constant)"
         );
         assert_eq!(
             rules_of(&settings(false), vec![248_046], 8).prefix_store,
@@ -307,14 +303,13 @@ mod tests {
                 roots: 0,
                 entries: 1
             },
-            "a literal, not the default under test: off keeps the addendum 1 store"
+            "a literal, not the default under test: off keeps the one-entry store"
         );
     }
 
-    /// The eviction-cliff wiring, reshaped: the DEFAULT stays the addendum 2 six through
-    /// `rules_of` for every spec and whatever the budget is, and the exact
-    /// `prefix_store_entries` override reaches every spec - dense Qwen3.8 included - with
-    /// a valid explicit session cap (dense admission refuses the fixture without one).
+    /// The DEFAULT stays six entries through `rules_of` for every spec and whatever the budget is,
+    /// and the exact `prefix_store_entries` override reaches every spec - dense Qwen3.8 included -
+    /// with a valid explicit session cap (dense admission refuses the fixture without one).
     #[test]
     fn the_rules_carry_the_default_six_and_the_exact_override_for_every_spec() {
         let built = |spec: FamilySpec, set: Option<usize>| {
@@ -360,7 +355,7 @@ mod tests {
                 roots: 2,
                 entries: 6
             },
-            "dense keeps the addendum 2 cap too: the default changed for no spec"
+            "dense keeps six entries too: the default changed for no spec"
         );
         assert_eq!(
             built(QWEN3_8_27B_DENSE, Some(32)),

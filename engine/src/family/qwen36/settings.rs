@@ -1,9 +1,9 @@
-//! Settings of one Q36 engine entry in the `enginesrv` config (decision 0046; packet Q36-F3a).
+//! Settings of one Q36 engine entry in the `enginesrv` config.
 //!
 //! The entry carries `id`, `family`, `model_dir`, `tokenizer_dir`, and `model` (server config) plus
 //! the `qwen36` object, which `Q36Options` reads. A key that is absent takes its default or its
 //! environment fallback. This file only reads and checks values. It opens no file and starts no
-//! thread. Q36 results never satisfy Phase 0B or Phase 1B.
+//! thread.
 //!
 //! The dense Qwen3.8 family uses these settings on MLX and expects the same pinned tokenizer
 //! bundle as Q36. Its session cap is explicit and includes its attention and DeltaNet state.
@@ -18,15 +18,15 @@ use std::path::{Path, PathBuf};
 
 /// Vocabulary size of the pinned `tokenizer.json` with its added tokens.
 const TOKENIZER_VOCAB_SIZE: u32 = 248_077;
-/// Positions of the default context limit of the CUDA arm (decision 0046 item 6). The CUDA arm
-/// sizes its default F32 cache by the limit, so it keeps 32,768 until the G-KV8 default flip (it
-/// builds the 8-bit cache when `kv_dtype` is `q8`).
+/// Positions of the default context limit of the CUDA arm. The CUDA arm sizes its default F32 cache
+/// by the limit, so it keeps 32,768 until the 8-bit cache becomes its default form (it builds the
+/// 8-bit cache when `kv_dtype` is `q8`).
 pub(crate) const DEFAULT_CONTEXT_LIMIT: u32 = 32_768;
-/// Positions of the default context limit of the MLX arm: 262,144, the headline of decision 0046
-/// A7. The 8-bit cache holds them in 2.85 GB (10,880 bytes per position with BF16 scales). The
-/// gate of record Q36-KV8-GATE measured the fit, the retrieval, and the tool-call format on the
-/// 36 GB Mac Studio. The default form is the 8-bit cache, so the limit belongs to that form: an
-/// explicit `kv_dtype` of `f32` needs an explicit `context_limit` and `session_cap_bytes` too.
+/// Positions of the default context limit of the MLX arm: 262,144. The 8-bit cache holds them in
+/// 2.85 GB (10,880 bytes per position with BF16 scales). A qualification run measured the fit, the
+/// retrieval, and the tool-call format at this limit on the 36 GB Mac Studio. The default form is
+/// the 8-bit cache, so the limit belongs to that form: an explicit `kv_dtype` of `f32` needs an
+/// explicit `context_limit` and `session_cap_bytes` too.
 pub(crate) const MLX_DEFAULT_CONTEXT_LIMIT: u32 = 262_144;
 /// The default cache cap of the MLX arm: 4 GiB admits 262,144 positions of the 8-bit form
 /// (2,852,126,720 bytes with BF16 scales, 3,019,898,880 with F32 scales) plus the DeltaNet state
@@ -37,12 +37,11 @@ pub(crate) const DEFAULT_SESSION_CAP: u64 = 4 << 30;
 /// the worker piece (`ExecutorOps::prefill_piece`). Without a plan, or when the plan admits no
 /// chunk, the piece is `NO_BUDGET_PIECE`.
 pub(crate) const DEFAULT_PREFILL_CHUNK: u32 = 256;
-/// The default chunk of a BF16 engine (decision 0046 A6 item 11, amendment of 2026-10-11): 256,
-/// the same as an F32 engine. Fix 5 of packet Q36-BF16-b had pinned it to 1 (no chunked prefill)
-/// while the chunk-size dependence of the BF16 prefill was open; the serving shapes (chunk 256 and
-/// the tails after a 256 head) measured inside the range of mlx-lm, and the pin cost about 14x on
-/// prompt speed. The constant stays separate so that a re-pin is a one-line change. An explicit
-/// `prefill_chunk` in the config always wins.
+/// The default chunk of a BF16 engine: 256, the same as an F32 engine. An earlier fix had pinned it
+/// to 1 (no chunked prefill) while the chunk-size dependence of the BF16 prefill was open; the
+/// serving shapes (chunk 256 and the tails after a 256 head) measured inside the range of mlx-lm,
+/// and the pin cost about 14x on prompt speed. The constant stays separate so that a re-pin is a
+/// one-line change. An explicit `prefill_chunk` in the config always wins.
 pub(crate) const BF16_DEFAULT_PREFILL_CHUNK: u32 = 256;
 /// The fallback worker piece for an executor that plans no chunk: no budget, or a plan that admits
 /// none. The executor then runs one token per step.
@@ -54,8 +53,8 @@ pub(crate) const NO_BUDGET_PIECE: u32 = 16;
 pub(crate) const MAX_PREFILL_CHUNK: u32 = 2048;
 /// The smallest multi-token candidate in Q36's prefill admission ladder.
 pub(crate) const MIN_PREFILL_CHUNK_ROWS: u32 = 4;
-/// The CUDA arm cap of M_sess (lane C, decision 0049 A6 item 2): the largest chunk the
-/// prefill ladder admits, independent of the MLX prefill_chunk ceiling above.
+/// The CUDA arm cap of M_sess: the largest chunk the prefill ladder admits, independent of the MLX
+/// prefill_chunk ceiling above.
 pub(crate) const DEFAULT_CUDA_PREFILL_CHUNK: u32 = 2048;
 
 /// SHA-256 of the pinned files of `<model_dir>`
@@ -69,32 +68,29 @@ const CHAT_TEMPLATE_SHA256: &str =
 const GENERATION_CONFIG_SHA256: &str =
     "e70c136c1b78ddc1fb0905bac8e733a4dc448d4f852a5dd75143fffc70be550e";
 
-/// The backend a build serves Q36 from (CUDA-SERVE-1 2.4): MLX on Apple Silicon, CUDA on
-/// Linux with `native-cuda`; a build with neither keeps the MLX reading, as before.
+/// The backend a build serves Q36 from: MLX on Apple Silicon, CUDA on Linux with `native-cuda`; a
+/// build with neither keeps the MLX reading, as before.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum Backend {
     Mlx,
     Cuda,
 }
 
-/// The prefix-store limits of a `prefix_reuse` engine (decision 0036, addendum 2): two
-/// pinned roots and six LRU entries. An engine without the flag keeps the addendum 1
-/// store.
+/// The prefix-store limits of a `prefix_reuse` engine: two pinned roots and six LRU entries. An
+/// engine without the flag keeps the one-entry store.
 const PREFIX_STORE_LIMITS: StoreLimits = StoreLimits {
     roots: 2,
     entries: 6,
 };
 
-/// The prefix-store limits of an engine with the given process-wide `prefix_reuse` flag
-/// (the one mapping the MLX rules build on, `start::rules_of`): the worker plans
-/// intermediate save points only when the store holds at least two LRU entries, and the
-/// engine's ready note reports that same limit from the built executor. The DEFAULT for
-/// every spec stays the addendum 2 six (the eviction-cliff review verified that an
-/// entry's real cost grows with its depth - a snapshot holds a zero-copy share of the
-/// attention buffers and owns a depth-sized copy after the next append, while its own
-/// charge is the DeltaNet state only - so a budget-derived default waits for the replay
-/// measurement); `entries_override` is the operator's exact opt-in count, honored for
-/// every spec that reaches the store.
+/// The prefix-store limits of an engine with the given process-wide `prefix_reuse` flag (the one
+/// mapping the MLX rules build on, `start::rules_of`): the worker plans intermediate save points
+/// only when the store holds at least two LRU entries, and the engine's ready note reports that
+/// same limit from the built executor. The DEFAULT for every spec stays six entries (an entry's
+/// real cost grows with its depth - a snapshot holds a zero-copy share of the attention buffers and
+/// owns a depth-sized copy after the next append, while its own charge is the DeltaNet state only -
+/// so a budget-derived default waits for the replay measurement); `entries_override` is the
+/// operator's exact opt-in count, honored for every spec that reaches the store.
 pub(crate) fn prefix_store_limits_of(
     prefix_reuse: bool,
     entries_override: Option<usize>,
@@ -115,8 +111,8 @@ pub(crate) struct Q36Options {
     /// The MLX allocator cache limit in bytes. Fallback: `Q36_CACHE_LIMIT`. There is no default.
     pub(crate) cache_limit_bytes: Option<u64>,
     /// The first position that the engine refuses, from 2. The default is 262,144 on the MLX arm
-    /// (the 8-bit cache, decision 0046 A7) and 32,768 on the CUDA arm. The executor rejects a
-    /// limit whose cache does not fit `session_cap_bytes`.
+    /// (the 8-bit cache) and 32,768 on the CUDA arm. The executor rejects a limit whose cache does
+    /// not fit `session_cap_bytes`.
     pub(crate) context_limit: Option<u32>,
     /// The bytes of session state that the engine admits. Q36 defaults to 4 GiB.
     /// The dense family requires an explicit cap covering its configured context.
@@ -125,55 +121,49 @@ pub(crate) struct Q36Options {
     /// for a BF16 engine (`BF16_DEFAULT_PREFILL_CHUNK`). It is the largest
     /// chunk that the planner may choose; the worker piece is the planned chunk, or 16
     /// (`NO_BUDGET_PIECE`) when no chunk is planned: no budget, or a budget that admits none.
-    /// CUDA: ignored with one start line until lane M's CPF-7a integration commit wires it
-    /// as the cap of `M_sess` (decision 0049, A6 item 2; lane C's ruling of 2026-10-14).
+    /// CUDA: ignored with one start line until the chunked CUDA prefill accepts it as the cap of
+    /// `M_sess`.
     pub(crate) prefill_chunk: Option<u32>,
-    /// The engine memory budget in bytes for the admission of the chunked prefill (decision 0044
-    /// item 6), from 1. Absent means off: every prompt token is one step. The executor picks the
-    /// largest chunk of at most `prefill_chunk` rows whose workspace fits the budget after the
-    /// weights and the reserve.
+    /// The engine memory budget in bytes for the admission of the chunked prefill, from 1. Absent
+    /// means off: every prompt token is one step. The executor picks the largest chunk of at most
+    /// `prefill_chunk` rows whose workspace fits the budget after the weights and the reserve.
     pub(crate) prefill_budget_bytes: Option<u64>,
     /// The bytes that the planner keeps free for the session state, the MLX cache, and the
     /// pressure margin. It has no default: it is required with `prefill_budget_bytes` and refused
     /// without it. A value of 0 is allowed and admits a larger chunk than the memory plan allows.
     pub(crate) prefill_session_reserve_bytes: Option<u64>,
-    /// The dtype of the decode activations (packet Q36-BF16-a): `f32` or `bf16`. The default is
-    /// `bf16`. It also picks the scale storage: `bf16` keeps the stored BF16 scales and biases,
-    /// `f32` keeps the G0 widening, and the decoder constructor refuses any other pairing.
+    /// The dtype of the decode activations: `f32` or `bf16`. The default is `bf16`. It also picks
+    /// the scale storage: `bf16` keeps the stored BF16 scales and biases, `f32` keeps the scales
+    /// widened to F32, and the decoder constructor refuses any other pairing.
     pub(crate) activation_dtype: Option<String>,
-    /// The form of the attention KV cache (packet KV8-INTEGRATE, decision 0046 A7): `f32`, the
-    /// pair of F32 capacity buffers, or `q8`, the 8-bit affine codes with scales and biases of
-    /// the activation dtype. The default is `q8` on the MLX arm (the user's decision of
-    /// 2026-10-13 after the A7 rule-4 Mac gate, record Q36-KV8-GATE) and `f32` on the CUDA arm
-    /// until the G-KV8 default flip; the CUDA arm builds the 8-bit cache (Int8G32) when the value is
-    /// `q8` (KV8-B). `f32` stays the control on the MLX arm.
+    /// The form of the attention KV cache: `f32`, the pair of F32 capacity buffers, or `q8`, the
+    /// 8-bit affine codes with scales and biases of the activation dtype. The default is `q8` on
+    /// the MLX arm, where the 8-bit cache passed its quality gate, and `f32` on the CUDA arm until
+    /// it passes there; the CUDA arm builds the 8-bit cache (Int8G32) when the value is `q8`. `f32`
+    /// stays the control on the MLX arm.
     pub(crate) kv_dtype: Option<String>,
     /// Opt-in host-backed CUDA Q8 KV budget, including pinned staging and owned metadata.
     pub(crate) kv_offload_host_bytes: Option<u64>,
-    /// Graph capture of the CUDA arm (default false, gate G1 eager); the MLX arm ignores it.
+    /// Graph capture of the CUDA arm (default false: eager launches); the MLX arm ignores it.
     pub(crate) capture: Option<bool>,
-    /// `mlx_compile` on the Q36 DeltaNet and device-routed MoE decode blocks (packet
-    /// MX-COMPILE-1; the amendment of decision 0039 item 8 that decision 0046 A5 reopened): the
-    /// engine traces both blocks once after the weights load and runs every one-token decode
-    /// step through the compiled closures, which gains 9.6 to 13.0 percent of decode speed
-    /// (measured at depths 30,000 to 16) and moves F32 logits by at most 5e-5 (compile is
-    /// deterministic run to run but not bit-identical to the uncompiled path). The default is
-    /// `false`; the shipped Mac config sets `true` (user decision 2026-10-14 after the Mac gates
-    /// of MX-COMPILE-1a). The MLX arm reads it; the CUDA arm records it as ignored.
+    /// `mlx_compile` on the Q36 DeltaNet and device-routed MoE decode blocks: the engine traces
+    /// both blocks once after the weights load and runs every one-token decode step through the
+    /// compiled closures, which gains 9.6 to 13.0 percent of decode speed (measured at depths
+    /// 30,000 to 16) and moves F32 logits by at most 5e-5 (compile is deterministic run to run but
+    /// not bit-identical to the uncompiled path). The default is `false`; the shipped Mac config
+    /// sets `true`. The MLX arm reads it; the CUDA arm records it as ignored.
     pub(crate) compile: Option<bool>,
     /// Concurrent MLX sessions, from 1 to 8. The default is 1; larger windows require compile.
     pub(crate) max_seqs: Option<usize>,
-    /// The exact LRU entry count of the prefix store of a `prefix_reuse` engine, as the
-    /// operator's OPT-IN override (the eviction-cliff slice). The default for every spec
-    /// stays the fixed six of decision 0036 addendum 2 - an entry's real cost grows with
-    /// its depth (a snapshot holds a share of the attention buffers and owns a depth-sized
-    /// copy after the next append; its own charge is the DeltaNet state only), so a
-    /// budget-derived default waits for the replay measurement. Validated from 1 to 4096
-    /// at parse; ignored with a start line when `prefix_reuse` is off, and by the CUDA arm
-    /// (an MLX key).
+    /// The exact LRU entry count of the prefix store of a `prefix_reuse` engine, as the operator's
+    /// OPT-IN override. The default for every spec stays the fixed six - an entry's real cost grows
+    /// with its depth (a snapshot holds a share of the attention buffers and owns a depth-sized
+    /// copy after the next append; its own charge is the DeltaNet state only), so a budget-derived
+    /// default waits for the replay measurement. Validated from 1 to 4096 at parse; ignored with a
+    /// start line when `prefix_reuse` is off, and by the CUDA arm (an MLX key).
     pub(crate) prefix_store_entries: Option<usize>,
-    /// The tiered expert mode of the CUDA arm (OFF-2). Absent means off: the routed experts are
-    /// all resident on the device, as before. The MLX arm refuses the member.
+    /// The tiered expert mode of the CUDA arm. Absent means off: the routed experts are all
+    /// resident on the device, as before. The MLX arm refuses the member.
     pub(crate) tiered: Option<TieredOptions>,
 }
 
@@ -213,10 +203,9 @@ pub(crate) struct Q36Env {
     pub(crate) cache_limit: Option<String>,
 }
 
-/// The dtype of the Q36 decode activations (packet Q36-BF16-a): the hidden state between blocks,
-/// the inputs of the quantized matmuls, and the converted layer norms. `bf16` is the serving
-/// default (user decision of 2026-10-10; decision 0046 A6); `f32` is the qualification control.
-/// Scale storage follows the same setting, so the two are one lever.
+/// The dtype of the Q36 decode activations: the hidden state between blocks, the inputs of the
+/// quantized matmuls, and the converted layer norms. `bf16` is the serving default; `f32` is the
+/// qualification control. Scale storage follows the same setting, so the two are one lever.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum Activation {
     F32,
@@ -241,9 +230,9 @@ impl Activation {
         }
     }
 
-    /// The activation whose resident dtype is `dtype`, the inverse of `dtype` (packet
-    /// KV8-INTEGRATE): the resident state reads the activation back from `Consts::act` when it
-    /// charges the cache. Any other dtype is `None`.
+    /// The activation whose resident dtype is `dtype`, the inverse of `dtype`: the resident state
+    /// reads the activation back from `Consts::act` when it charges the cache. Any other dtype is
+    /// `None`.
     pub(crate) fn of_dtype(dtype: Dtype) -> Option<Self> {
         match dtype {
             Dtype::F32 => Some(Self::F32),
@@ -253,23 +242,21 @@ impl Activation {
     }
 }
 
-/// The group size of the Q8 cache form, along the head dimension (decision 0046 A7): 64 lanes
-/// share one scale and one bias. `head_dim` must be a multiple of this; the decoder constructor
-/// refuses a Q8 engine whose head dimension is not (packet KV8-INTEGRATE item 2). The one
-/// definition: the byte charge below, and the quantize, the append, and the attention of the Q8
-/// form, all read it.
+/// The group size of the Q8 cache form, along the head dimension: 64 lanes share one scale and one
+/// bias. `head_dim` must be a multiple of this; the decoder constructor refuses a Q8 engine whose
+/// head dimension is not. The one definition: the byte charge below, and the quantize, the append,
+/// and the attention of the Q8 form, all read it.
 pub(crate) const Q8_GROUP: u32 = 64;
 
-/// The bits of the Q8 cache form (decision 0046 A7): 8-bit affine codes, four per U32 word. The
-/// code width also sits in the shapes of the cache buffers (`attn.rs` divides the head dimension
-/// by 4) and in the byte charge of `kv_growth_per_position` (one byte per code), so a change of
-/// this constant needs those places and the portable check of `quantize_rows` (packet KV8-OPS).
+/// The bits of the Q8 cache form: 8-bit affine codes, four per U32 word. The code width also sits
+/// in the shapes of the cache buffers (`attn.rs` divides the head dimension by 4) and in the byte
+/// charge of `kv_growth_per_position` (one byte per code), so a change of this constant needs those
+/// places and the portable check of `quantize_rows`.
 pub(crate) const Q8_BITS: u32 = 8;
 
-/// The LOGICAL bytes that one more position adds to the cache of ONE attention layer (packet
-/// KV8-INTEGRATE item 5), from the cache form and the activation dtype — the one byte authority:
-/// `attn::growth_bytes` (which `state::kv_growth_bytes` calls) and `cache_growth_per_position`
-/// reach it.
+/// The LOGICAL bytes that one more position adds to the cache of ONE attention layer, from the
+/// cache form and the activation dtype — the one byte authority: `attn::growth_bytes` (which
+/// `state::kv_growth_bytes` calls) and `cache_growth_per_position` reach it.
 ///
 /// - `F32`: keys and values `[1, KVH, 1, D]` F32, `KVH * D * 2 * 4` bytes. The real model
 ///   (KVH 2, D 256) adds 4,096 bytes per layer and position and 40,960 over its 10 attention
@@ -322,8 +309,8 @@ pub(crate) fn kv_growth_per_position(
     bytes.ok_or_else(|| EngError::MemoryPlan("attention growth bytes overflow u64".into()))
 }
 
-/// Parses the `activation_dtype` member (packet Q36-BF16-a): `f32` or `bf16`. Any other text is
-/// refused in the style of the numeric members.
+/// Parses the `activation_dtype` member: `f32` or `bf16`. Any other text is refused in the style of
+/// the numeric members.
 pub(crate) fn parse_activation(text: &str) -> Result<Activation, EngError> {
     match text {
         "f32" => Ok(Activation::F32),
@@ -342,11 +329,11 @@ pub(crate) fn activation_of(text: Option<&str>) -> Result<Activation, EngError> 
     }
 }
 
-/// The scale-pairing rule of packet Q36-BF16-a: the stored scales and biases (counted by
+/// The scale-pairing rule: the stored scales and biases (counted by
 /// `ResidentWeights::scale_census`) must all have the dtype that matches `activation`, because the
 /// setting is one lever. A `bf16` engine over F32 scales promotes every `qmm` back to F32, and an
-/// `f32` engine over BF16 scales makes MLX cast the scales on every call (about 31.6 tok/s, the
-/// trap that the G0 measurement closed). Returns the refusal text of a mismatched pair.
+/// `f32` engine over BF16 scales makes MLX cast the scales on every call (about 31.6 tok/s).
+/// Returns the refusal text of a mismatched pair.
 pub(crate) fn scale_pairing_error(
     weights: u64,
     f32_parts: u64,
@@ -366,14 +353,13 @@ pub(crate) fn scale_pairing_error(
     })
 }
 
-/// The form of the attention KV cache of one engine (packet KV8-INTEGRATE; decision 0046 A7):
-/// `F32` keeps the pair of F32 capacity buffers `[1, KVH, cap, D]` (4,096 bytes per layer and
-/// position on the real model, 40,960 over its 10 attention layers); `Q8` keeps the 8-bit affine
-/// codes `[1, KVH, cap, D/4]` beside scales and biases `[1, KVH, cap, D/64]` of the ACTIVATION
-/// dtype (1,088 bytes per layer and position at BF16 scales, 1,152 at F32 scales; 10,880 and
-/// 11,520 over the 10 attention layers). `F32` is the default and the control that the A7
-/// quality gate compares against; the shipped default flips to `Q8` only after that gate
-/// passes (A7 rule 4).
+/// The form of the attention KV cache of one engine: `F32` keeps the pair of F32 capacity buffers
+/// `[1, KVH, cap, D]` (4,096 bytes per layer and position on the real model, 40,960 over its 10
+/// attention layers); `Q8` keeps the 8-bit affine codes `[1, KVH, cap, D/4]` beside scales and
+/// biases `[1, KVH, cap, D/64]` of the ACTIVATION dtype (1,088 bytes per layer and position at BF16
+/// scales, 1,152 at F32 scales; 10,880 and 11,520 over the 10 attention layers). `F32` is the
+/// default and the control that the quality gate of the 8-bit form compares against; the shipped
+/// default flips to `Q8` only after that gate passes.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum KvDtype {
     /// The F32 capacity buffers, the control.
@@ -397,8 +383,8 @@ pub(crate) fn kv_dtype_name(kv: KvDtype) -> &'static str {
     }
 }
 
-/// Parses the `kv_dtype` member (packet KV8-INTEGRATE): `f32` or `q8`. Any other text is refused
-/// in the style of the numeric members.
+/// Parses the `kv_dtype` member: `f32` or `q8`. Any other text is refused in the style of the
+/// numeric members.
 pub(crate) fn parse_kv_dtype(text: &str) -> Result<KvDtype, EngError> {
     match text {
         "f32" => Ok(KvDtype::F32),
@@ -411,8 +397,8 @@ pub(crate) fn parse_kv_dtype(text: &str) -> Result<KvDtype, EngError> {
 }
 
 /// The cache form of `text`, the raw member value. `None` is the default of the arm: the 8-bit
-/// cache on the MLX arm (decision 0046 A7, gate of record Q36-KV8-GATE) and the F32 cache on the
-/// CUDA arm until the G-KV8 default flip. An explicit `q8` is valid on both arms.
+/// cache on the MLX arm, where it passed its quality gate, and the F32 cache on the CUDA arm until
+/// it passes there. An explicit `q8` is valid on both arms.
 pub(crate) fn kv_dtype_of(text: Option<&str>, backend: Backend) -> Result<KvDtype, EngError> {
     match (text, backend) {
         (Some(text), _) => parse_kv_dtype(text),
@@ -421,12 +407,12 @@ pub(crate) fn kv_dtype_of(text: Option<&str>, backend: Backend) -> Result<KvDtyp
     }
 }
 
-/// Whether the chunked prefill may run with the activation dtype `act` (packet Q36-BF16-b): the
-/// chunk path is dtype aware — its blocks run the same boundary casts as the decode step and the
-/// chunk loop guards every dtype — so both activation dtypes plan a chunk and only the budget and
-/// the largest chunk can keep one out. This is the one authority for the rule:
-/// `Q36Executor::plan_prefill` asks it with `Consts::act`, and the start-up line of
-/// `start::plan_prefill` follows the plan and names no dtype rule.
+/// Whether the chunked prefill may run with the activation dtype `act`: the chunk path is dtype
+/// aware — its blocks run the same boundary casts as the decode step and the chunk loop guards
+/// every dtype — so both activation dtypes plan a chunk and only the budget and the largest chunk
+/// can keep one out. This is the one authority for the rule: `Q36Executor::plan_prefill` asks it
+/// with `Consts::act`, and the start-up line of `start::plan_prefill` follows the plan and names no
+/// dtype rule.
 pub(crate) fn chunked_prefill_allowed(act: Dtype) -> bool {
     matches!(act, Dtype::F32 | Dtype::Bf16)
 }
@@ -448,49 +434,46 @@ pub(crate) struct Q36Settings {
     /// The bytes of cache growth that the engine admits.
     pub(crate) session_cap: u64,
     /// The prompt tokens per `prefill` call. MLX: with a budget it is also the largest planned
-    /// chunk. CUDA: always 0 (the key is ignored with one start line until CPF-7a's
-    /// integration commit, decision 0049 A6 item 2); the chunk cap the step holds is
-    /// `DEFAULT_CUDA_PREFILL_CHUNK`, set through `QwenResidentStep::set_m_sess_cap`.
+    /// chunk. CUDA: always 0 (the key is ignored with one start line until the chunked CUDA prefill
+    /// accepts it); the chunk cap the step holds is `DEFAULT_CUDA_PREFILL_CHUNK`, set through
+    /// `QwenResidentStep::set_m_sess_cap`.
     pub(crate) prefill_chunk: u32,
     /// The budget of the chunked prefill, or `None` when the chunked prefill is off.
     pub(crate) prefill_budget: Option<u64>,
     /// The bytes that the planner keeps free. It is used only when `prefill_budget` is set.
     pub(crate) prefill_reserve: u64,
-    /// The dtype of the decode activations (packet Q36-BF16-a), which also picks the scale storage.
-    /// The default is `bf16`.
+    /// The dtype of the decode activations, which also picks the scale storage. The default is
+    /// `bf16`.
     pub(crate) activation: Activation,
-    /// The form of the attention KV cache (packet KV8-INTEGRATE). The default is `f32`, the
-    /// control.
+    /// The form of the attention KV cache. The default is `f32`, the control.
     pub(crate) kv: KvDtype,
     /// Host-backed CUDA Q8 KV is disabled when this budget is absent.
     pub(crate) kv_offload_host_bytes: Option<u64>,
     /// Graph capture of the CUDA arm; the MLX arm ignores it with one start line.
     pub(crate) capture: bool,
-    /// `mlx_compile` on the DeltaNet and device-routed MoE decode blocks (packet MX-COMPILE-1).
+    /// `mlx_compile` on the DeltaNet and device-routed MoE decode blocks.
     /// The default is `false`; the MLX arm reads it, admits the model at load, and warms one
     /// program per distinct compiled block, and the CUDA arm records the key as ignored.
     pub(crate) compile: bool,
     /// Maximum concurrent sessions. One preserves the original single-job worker.
     pub(crate) max_seqs: usize,
-    /// The exact LRU entry count override of the prefix store, or `None` for the default
-    /// addendum 2 cap of six (the eviction-cliff slice). Validated by the parse;
-    /// `prefix_store_limits_of` applies it.
+    /// The exact LRU entry count override of the prefix store, or `None` for the default cap of
+    /// six. Validated by the parse; `prefix_store_limits_of` applies it.
     pub(crate) prefix_store_entries: Option<usize>,
     /// The backend these settings were read for. The `prefix_reuse` cap rule applies to the MLX
     /// arm only.
     pub(crate) backend: Backend,
-    /// The process-wide `prefix_reuse` flag (decision 0036), set by the factory after `new`:
-    /// with the flag on, this engine's prefix store keeps the addendum 2 limits (two pinned
-    /// roots, six LRU entries); with it off, the addendum 1 store (zero roots, one entry). No
-    /// config member reads it: the flag belongs to the server configuration file, and `new`
-    /// leaves it false.
+    /// The process-wide `prefix_reuse` flag, set by the factory after `new`: with the flag on, this
+    /// engine's prefix store keeps two pinned roots and six LRU entries; with it off, the one-entry
+    /// store (zero roots, one entry). No config member reads it: the flag belongs to the server
+    /// configuration file, and `new` leaves it false.
     pub(crate) prefix_reuse: bool,
     /// The tiered expert mode, or `None` for the plain engine. Never on without the member.
     pub(crate) tiered: Option<TieredSettings>,
     /// The MLX allocator and session keys the CUDA arm ignores (the KV cache is sized by
-    /// `context_limit` alone, the prefill runs one token per step): the start logs one line
-    /// each. Empty on the MLX arm. `prefill_chunk` is among them until lane M's CPF-7a
-    /// integration commit accepts it as the cap of `M_sess` (decision 0049, A6 item 2).
+    /// `context_limit` alone, the prefill runs one token per step): the start logs one line each.
+    /// Empty on the MLX arm. `prefill_chunk` is among them until the chunked CUDA prefill accepts
+    /// it as the cap of `M_sess`.
     pub(crate) ignored_mlx_keys: Vec<&'static str>,
 }
 
@@ -592,12 +575,12 @@ fn delta_state_bytes(spec: &FamilySpec) -> Result<u64, EngError> {
         .ok_or_else(|| bad("the DeltaNet state bytes overflow u64".into()))
 }
 
-/// The cache bytes that one position adds over every full-attention layer, in the cache form
-/// `kv` (packet KV8-INTEGRATE): the F32 control is keys and values `[1, heads_kv, 1, head_dim]`
-/// F32, and the Q8 form is the 8-bit codes beside scales and biases of the activation dtype
-/// (`kv_growth_per_position`, the one authority). It is derived from the family spec, never a
-/// literal: `QWEN3_6_35B_A3B` adds 40,960 bytes per position in its 10 attention layers in the
-/// F32 form, 10,880 at Q8 with BF16 scales, and 11,520 at Q8 with F32 scales.
+/// The cache bytes that one position adds over every full-attention layer, in the cache form `kv`:
+/// the F32 control is keys and values `[1, heads_kv, 1, head_dim]` F32, and the Q8 form is the
+/// 8-bit codes beside scales and biases of the activation dtype (`kv_growth_per_position`, the one
+/// authority). It is derived from the family spec, never a literal: `QWEN3_6_35B_A3B` adds 40,960
+/// bytes per position in its 10 attention layers in the F32 form, 10,880 at Q8 with BF16 scales,
+/// and 11,520 at Q8 with F32 scales.
 fn cache_growth_per_position(
     spec: &FamilySpec,
     kv: KvDtype,
@@ -618,7 +601,7 @@ fn cache_growth_per_position(
 /// The tiered member, checked: CUDA only, `slots` required, no capture (the tiered step waits for
 /// the host inside every layer, which a captured graph cannot do), no chunked prefill (the CUDA
 /// arm refuses the budget keys by name above, and the tiered prefill runs one token per step;
-/// `chunk_ready` keeps a tiered session off the chunk path, plan rev 3 §C.4).
+/// `chunk_ready` keeps a tiered session off the chunk path).
 fn tiered_settings(
     options: &Q36Options,
     backend: Backend,
@@ -659,10 +642,10 @@ fn refuse_cuda_key(key: &str, value: Option<u64>) -> Result<(), EngError> {
 }
 
 /// The MLX allocator, compile, and session keys the CUDA arm ignores (the KV cache is sized by
-/// `context_limit` alone, the prefill runs one token per step, and the CUDA arm does not build
-/// the MLX compile seam): the start logs one line each. `prefill_chunk` stays ignored until
-/// lane M's CPF-7a integration commit accepts it as the cap of `M_sess` (decision 0049, A6
-/// item 2; lane C's ruling of 2026-10-14: the key promises no speed the arm does not have).
+/// `context_limit` alone, the prefill runs one token per step, and the CUDA arm does not build the
+/// MLX compile seam): the start logs one line each. `prefill_chunk` stays ignored until the chunked
+/// CUDA prefill accepts it as the cap of `M_sess`: until then the key would promise a speed the arm
+/// does not have.
 fn ignored_mlx_keys_of(options: &Q36Options) -> Vec<&'static str> {
     [
         (options.cache_limit_bytes.is_some(), "cache_limit_bytes"),
@@ -762,18 +745,18 @@ impl Q36Settings {
                         options.prefill_session_reserve_bytes,
                     )?;
                     let activation = activation_of(options.activation_dtype.as_deref())?;
-                    // KV8-B B4: unlike main, the arm does NOT refuse `q8` here — the CUDA
-                    // start maps the parsed form onto the step's `KvMode` (F32 to the fp16
-                    // control cache, Q8 to Int8G32) and refuses the Tiled layout there.
+                    // Unlike the MLX arm, the CUDA arm does NOT refuse `q8` here — the CUDA start
+                    // maps the parsed form onto the step's `KvMode` (F32 to the fp16 control cache,
+                    // Q8 to Int8G32) and refuses the Tiled layout there.
                     let kv = kv_dtype_of(options.kv_dtype.as_deref(), Backend::Cuda)?;
                     (None, 0, activation, kv, 0, ignored_mlx_keys_of(options))
                 }
             };
-        // The MLX error order of the base: budget, reserve, activation_dtype, kv_dtype, cache_limit,
-        // context_limit, session_cap, prefill_chunk (KUBDAN-MSG-71 item 4). `cache_limit` is
-        // computed in the match above, BEFORE `context_limit` and the second match, so a config
-        // with both faults names the cache-limit fault first; the CUDA arm refuses its keys in
-        // the first match, reads no cache limit, and takes only `context_limit` below.
+        // The MLX error order of the base: budget, reserve, activation_dtype, kv_dtype,
+        // cache_limit, context_limit, session_cap, prefill_chunk. `cache_limit` is computed in the
+        // match above, BEFORE `context_limit` and the second match, so a config with both faults
+        // names the cache-limit fault first; the CUDA arm refuses its keys in the first match,
+        // reads no cache limit, and takes only `context_limit` below.
         let context_limit = ranged(
             "context_limit",
             options.context_limit,
@@ -824,9 +807,9 @@ impl Q36Settings {
                     MAX_PREFILL_CHUNK,
                 )?,
             ),
-            // Inert: the CUDA arm reads none of them (the KV is sized by `context_limit`,
-            // the worker piece is `NO_BUDGET_PIECE`, `prefill_chunk` is ignored with its
-            // start line until CPF-7a's integration commit, decision 0049 A6 item 2).
+            // Inert: the CUDA arm reads none of them (the KV is sized by `context_limit`, the
+            // worker piece is `NO_BUDGET_PIECE`, `prefill_chunk` is ignored with its start line
+            // until the chunked CUDA prefill accepts it).
             Backend::Cuda => (0, 0),
         };
         let tiered = tiered_settings(options, backend)?;
@@ -892,7 +875,7 @@ impl Q36Settings {
         })
     }
 
-    /// The `prefix_reuse` cap rule (decision 0036, addendum 1 item 7; fix round Q36-PR-1 item 1).
+    /// The `prefix_reuse` cap rule.
     /// With the process-wide `prefix_reuse` flag on, one saved entry and the live session share
     /// this engine's `SessionBudget`: the entry charges its attention caches plus the fixed
     /// DeltaNet state, and the live session can hold the same caches again up to the context
@@ -903,11 +886,10 @@ impl Q36Settings {
     /// same job succeeds with `prefix_reuse` off. Engine start refuses a smaller cap and answers
     /// with the cap, the requirement, the context limit, and the hint `raise session_cap_bytes`.
     /// With the flag off the rule does not apply. It does not apply to the CUDA arm either: that
-    /// arm ignores `session_cap_bytes` (the value is 0), and its entry lives in host RAM bounded
-    /// by `context_limit` (decision 0036, addendum 2, CUDA arm). Roots and periodic entries
-    /// (decision 0036, addendum 2, item 6) do not raise this requirement: they are best effort
-    /// inside the cap, a denied save skips only that save, and the requirement keeps covering
-    /// exactly the live session plus the one tip entry at the context limit.
+    /// arm ignores `session_cap_bytes` (the value is 0), and its entry lives in host RAM bounded by
+    /// `context_limit`. Roots and periodic entries do not raise this requirement: they are best
+    /// effort inside the cap, a denied save skips only that save, and the requirement keeps
+    /// covering exactly the live session plus the one tip entry at the context limit.
     pub(crate) fn check_prefix_reuse_cap(&self, prefix_reuse: bool) -> Result<(), EngError> {
         if prefix_reuse && self.kv_offload_host_bytes.is_some() {
             return Err(bad(
@@ -1247,7 +1229,7 @@ mod tests {
     }
 
     /// The rule derives its byte counts from the family spec and the cache form, never from a
-    /// literal (packet KV8-INTEGRATE item 5).
+    /// literal.
     #[test]
     fn the_prefix_reuse_bytes_are_derived_from_the_family_spec() {
         // 30 DeltaNet layers of a `[32, 128, 128]` state and an `[8192, 3]` ring, F32.
@@ -1487,9 +1469,9 @@ mod tests {
         );
     }
 
-    /// The `prefix_reuse` member of the settings (packet SERVE-2-c item 1): `new` leaves it
-    /// false on both backends, because no config member or environment key carries the flag;
-    /// the factory sets it after `new` from the process-wide flag of the configuration file.
+    /// The `prefix_reuse` member of the settings: `new` leaves it false on both backends, because
+    /// no config member or environment key carries the flag; the factory sets it after `new` from
+    /// the process-wide flag of the configuration file.
     #[test]
     fn the_settings_default_prefix_reuse_to_false() {
         for backend in [Backend::Mlx, Backend::Cuda] {
@@ -1504,9 +1486,9 @@ mod tests {
         }
     }
 
-    /// BF16 serving policy (decision 0046 A6 item 11, amendment of 2026-10-11): without a
-    /// `prefill_chunk` the default chunk is 256 for a BF16 engine and for an F32 engine; an
-    /// explicit `prefill_chunk` wins for both. The shipped config leaves the member absent.
+    /// BF16 serving policy: without a `prefill_chunk` the default chunk is 256 for a BF16 engine
+    /// and for an F32 engine; an explicit `prefill_chunk` wins for both. The shipped config leaves
+    /// the member absent.
     #[test]
     fn the_default_chunk_depends_on_the_activation_and_an_explicit_chunk_wins() {
         let bf16 = settings(Some(&with_limit()), &Q36Env::default()).unwrap();
@@ -1582,10 +1564,9 @@ mod tests {
         assert_eq!(got.tokenizer_dir, PathBuf::from("/t"));
     }
 
-    /// The compile key of packet MX-COMPILE-1a: the default is false (the shipped Mac file sets
-    /// true, pinned by `the_shipped_mac_studio_config_passes_every_check_before_the_backend`),
-    /// the MLX arm reads the member, and the CUDA arm
-    /// keeps false and records the key for its start line.
+    /// The compile key: the default is false (the shipped Mac file sets true, pinned by
+    /// `the_shipped_mac_studio_config_passes_every_check_before_the_backend`), the MLX arm reads
+    /// the member, and the CUDA arm keeps false and records the key for its start line.
     #[test]
     fn the_compile_key_defaults_to_false_the_mlx_arm_reads_it_and_the_cuda_arm_ignores_it() {
         let off = settings_for(Some(&with_limit()), &Q36Env::default(), Backend::Mlx).unwrap();
@@ -1799,11 +1780,11 @@ mod tests {
 
     #[test]
     fn the_mlx_first_error_order_is_budget_reserve_cache_context_session_chunk() {
-        // The base order (KUBDAN-MSG-71 item 4): budget, reserve, cache_limit, context_limit,
-        // session_cap, prefill_chunk. `cache_limit` is computed before `context_limit`, so a
-        // config with BOTH faults names the cache-limit fault first — a missing limit (no
-        // key, no env) or a zero one against `context_limit: 1` — and
-        // `{context_limit: 1, prefill_chunk: 0}` names `context_limit` before the chunk.
+        // The base order: budget, reserve, cache_limit, context_limit, session_cap, prefill_chunk.
+        // `cache_limit` is computed before `context_limit`, so a config with BOTH faults names the
+        // cache-limit fault first — a missing limit (no key, no env) or a zero one against
+        // `context_limit: 1` — and `{context_limit: 1, prefill_chunk: 0}` names `context_limit`
+        // before the chunk.
         let both = Q36Options {
             context_limit: Some(1),
             prefill_chunk: Some(0),
@@ -1961,19 +1942,19 @@ mod tests {
                 .unwrap()
                 .activation,
             super::Activation::Bf16,
-            "the serving default of the user decision of 2026-10-10"
+            "bf16 is the serving default"
         );
         assert_eq!(activation_of(None).unwrap(), super::Activation::Bf16);
         assert_eq!(activation_name(super::Activation::Bf16), "bf16");
         assert_eq!(activation_name(super::Activation::F32), "f32");
     }
 
-    /// Packet KV8-INTEGRATE item 5, hand-derived: the per-layer, per-position charge of both
-    /// cache forms. The real model is KVH 2, D 256 — codes `2 * 256 * 2 = 1,024` bytes, scales
-    /// and biases `2 sides * 2 arrays * 2 * 4 groups * scale_bytes`, so 64 bytes at BF16 scales
-    /// (2) and 128 at F32 scales (4): 1,088 and 1,152 per layer and position, 10,880 and 11,520
-    /// over the 10 attention layers. The F32 form stays the control at 4,096 and 40,960, and a
-    /// head dimension below the group (TINY_GQA's 32) refuses the Q8 form.
+    /// Hand-derived: the per-layer, per-position charge of both cache forms. The real model is KVH
+    /// 2, D 256 — codes `2 * 256 * 2 = 1,024` bytes, scales and biases
+    /// `2 sides * 2 arrays * 2 * 4 groups * scale_bytes`, so 64 bytes at BF16 scales (2) and 128 at
+    /// F32 scales (4): 1,088 and 1,152 per layer and position, 10,880 and 11,520 over the 10
+    /// attention layers. The F32 form stays the control at 4,096 and 40,960, and a head dimension
+    /// below the group (TINY_GQA's 32) refuses the Q8 form.
     #[test]
     fn the_growth_bytes_derive_both_cache_forms_by_hand() {
         use super::{Activation, KvDtype, kv_growth_per_position};
@@ -2018,7 +1999,7 @@ mod tests {
             10 * kv_growth_per_position(2, 256, KvDtype::Q8, Activation::F32).unwrap(),
             11_520
         );
-        // Decision 0046 A7 sizing: 2.85 GB at 262,144 positions instead of 10.7 GB.
+        // The 8-bit cache sizing: 2.85 GB at 262,144 positions instead of 10.7 GB.
         assert_eq!(10_880u64 * 262_144, 2_852_126_720);
         assert_eq!(40_960u64 * 262_144, 10_737_418_240);
         // A head dimension below the group refuses the Q8 form (TINY_GQA's 32), naming the
@@ -2035,7 +2016,7 @@ mod tests {
     }
 
     /// The `kv_dtype` pairs with `activation_dtype` freely: the Q8 scales follow the activation
-    /// dtype, so all four combinations are legal settings (packet KV8-INTEGRATE items 1 and 3).
+    /// dtype, so all four combinations are legal settings.
     #[test]
     fn every_kv_dtype_pairs_with_every_activation_dtype() {
         for kv in [super::KvDtype::F32, super::KvDtype::Q8] {
@@ -2076,10 +2057,10 @@ mod tests {
         assert_eq!(options.activation_dtype.as_deref(), Some("bf16"));
     }
 
-    /// Packet KV8-INTEGRATE item 1: `kv_dtype` parses `f32` and `q8`, reads from JSON, and refuses
-    /// any other text in the style of its neighbors. The default is `q8` on the MLX arm (the
-    /// user's decision of 2026-10-13 after the gate of record Q36-KV8-GATE; the F32 control stays
-    /// one member away) and `f32` on the CUDA arm (the default flips to q8 only after G-KV8).
+    /// `kv_dtype` parses `f32` and `q8`, reads from JSON, and refuses any other text in the style
+    /// of its neighbors. The default is `q8` on the MLX arm (where the 8-bit cache passed its
+    /// quality gate; the F32 control stays one member away) and `f32` on the CUDA arm (the default
+    /// flips to q8 only after the 8-bit cache passes the gate there).
     #[test]
     fn kv_dtype_parses_f32_and_q8_and_the_default_is_q8_on_mlx_and_f32_on_cuda() {
         for (text, want) in [("f32", super::KvDtype::F32), ("q8", super::KvDtype::Q8)] {
@@ -2114,7 +2095,7 @@ mod tests {
         assert_eq!(
             kv_dtype_of(Some("q8"), Backend::Cuda).unwrap(),
             super::KvDtype::Q8,
-            "parsing does not decide availability; the CUDA start maps q8 onto Int8G32 (KV8-B B4)"
+            "parsing does not decide availability; the CUDA start maps q8 onto Int8G32"
         );
         assert_eq!(kv_dtype_name(super::KvDtype::F32), "f32");
         assert_eq!(kv_dtype_name(super::KvDtype::Q8), "q8");
@@ -2139,7 +2120,7 @@ mod tests {
         }
     }
 
-    /// KV8-B B4-F: the CUDA arm refuses an unknown `kv_dtype` text at its own arm too.
+    /// The CUDA arm refuses an unknown `kv_dtype` text at its own arm too.
     #[test]
     fn the_cuda_arm_refuses_an_unknown_kv_dtype_text_at_its_own_member() {
         let options = Q36Options {
@@ -2194,10 +2175,10 @@ mod tests {
         }
     }
 
-    /// The chunk rule of packet Q36-BF16-b: the chunk path is dtype aware, so both activation
-    /// dtypes plan a chunk. `Q36Executor::plan_prefill` asks the rule with `Consts::act`, which
-    /// the setting maps through `Activation::dtype`, and the start-up line of `start::plan_prefill`
-    /// follows the plan and names no dtype rule.
+    /// The chunk rule: the chunk path is dtype aware, so both activation dtypes plan a chunk.
+    /// `Q36Executor::plan_prefill` asks the rule with `Consts::act`, which the setting maps through
+    /// `Activation::dtype`, and the start-up line of `start::plan_prefill` follows the plan and
+    /// names no dtype rule.
     #[test]
     fn the_chunk_rule_plans_a_chunk_for_both_activation_dtypes() {
         assert!(
@@ -2206,11 +2187,11 @@ mod tests {
         );
         assert!(
             chunked_prefill_allowed(Dtype::Bf16),
-            "the chunk path is dtype aware (packet Q36-BF16-b)"
+            "the chunk path is dtype aware"
         );
         assert!(
             !chunked_prefill_allowed(Dtype::F16),
-            "a dtype the decoder cannot hold plans no chunk (fix1 of packet Q36-BF16-b): the rule
+            "a dtype the decoder cannot hold plans no chunk: the rule
             stays a rule, not a constant true"
         );
         assert_eq!(
@@ -2249,9 +2230,9 @@ mod tests {
 
     #[test]
     fn the_cuda_arm_parses_the_8_bit_form_and_the_start_maps_it() {
-        // KV8-B B4 (merged with main): the CUDA arm no longer refuses `q8` at the settings —
-        // the start maps the parsed form onto the step's `KvMode` (F32 to the fp16 control
-        // cache, Q8 to Int8G32) and refuses the Tiled layout there.
+        // The CUDA arm does not refuse `q8` at the settings — the start maps the parsed form onto
+        // the step's `KvMode` (F32 to the fp16 control cache, Q8 to Int8G32) and refuses the Tiled
+        // layout there.
         let q8: Q36Options = serde_json::from_str("{\"kv_dtype\": \"q8\"}").unwrap();
         assert_eq!(
             settings_for(Some(&q8), &Q36Env::default(), Backend::Cuda)
@@ -2293,8 +2274,8 @@ mod tests {
             (got.context_limit, got.cache_limit, got.capture),
             (DEFAULT_CONTEXT_LIMIT, 0, false)
         );
-        // Default options set no MLX key, so NOTHING is recorded for the start lines
-        // (KUBDAN-MSG-71 item 5: the empty case pins the filter of `ignored_mlx_keys_of`).
+        // Default options set no MLX key, so NOTHING is recorded for the start lines (the empty
+        // case pins the filter of `ignored_mlx_keys_of`).
         assert!(
             got.ignored_mlx_keys.is_empty(),
             "default cuda options record no ignored key: {:?}",
@@ -2325,11 +2306,10 @@ mod tests {
     #[test]
     fn the_cuda_arm_ignores_prefill_chunk_until_cpf_7a_wires_it() {
         use super::DEFAULT_CUDA_PREFILL_CHUNK;
-        // Lane C's ruling of 2026-10-14 (option (a) on the review's B-2/B-1): the CUDA arm
-        // keeps ignoring the key, with its start line, until lane M's CPF-7a integration
-        // commit accepts it as the cap of `M_sess` (decision 0049, A6 item 2). Any value is
-        // taken — 0 included, the CLI twin's case — and the field stays the inert 0; the
-        // step's cap is `DEFAULT_CUDA_PREFILL_CHUNK` until the config is wired.
+        // The CUDA arm keeps ignoring the key, with its start line, until the chunked CUDA prefill
+        // accepts it as the cap of `M_sess`. Any value is taken — 0 included, the CLI twin's case —
+        // and the field stays the inert 0; the step's cap is `DEFAULT_CUDA_PREFILL_CHUNK` until the
+        // config is wired.
         let value = Q36Options {
             prefill_chunk: Some(0),
             ..Q36Options::default()
@@ -2432,12 +2412,11 @@ mod tests {
         );
     }
 
-    /// The eviction-cliff slice, reshaped by the review: the default LRU entry count of a
-    /// `prefix_reuse` store stays the fixed addendum 2 six for EVERY spec (an entry's real
-    /// cost grows with its depth - a snapshot owns a depth-sized copy of the attention
-    /// buffers after the next append while its own charge is the DeltaNet state only - so
-    /// no budget-derived default ships before the replay measurement); the operator's
-    /// exact override is honored for every spec that reaches the store.
+    /// The default LRU entry count of a `prefix_reuse` store stays the fixed six for EVERY spec (an
+    /// entry's real cost grows with its depth - a snapshot owns a depth-sized copy of the attention
+    /// buffers after the next append while its own charge is the DeltaNet state only - so no
+    /// budget-derived default ships before the replay measurement); the operator's exact override
+    /// is honored for every spec that reaches the store.
     #[test]
     fn the_prefix_store_entry_count_stays_six_unless_overridden() {
         let limits = |flag: bool, set: Option<usize>| super::prefix_store_limits_of(flag, set);
@@ -2447,7 +2426,7 @@ mod tests {
                 roots: 2,
                 entries: 6
             },
-            "the default stays the addendum 2 cap for every spec"
+            "the default stays six for every spec"
         );
         assert_eq!(
             limits(true, Some(32)),
@@ -2468,7 +2447,7 @@ mod tests {
         assert_eq!(
             limits(false, Some(32)),
             StoreLimits::default(),
-            "the flag off keeps the addendum 1 store, override and all"
+            "the flag off keeps the one-entry store, override and all"
         );
     }
 

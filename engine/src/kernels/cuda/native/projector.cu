@@ -63,7 +63,7 @@ bool tiled_shape(int n_rows, int k) {
     return n_rows > 0 && n_rows % 8 == 0 && k > 0 && k % 256 == 0 && k <= kMaxDim;
 }
 
-/* ggml type code of a call; Q5_0 (MEL-C1b) has its own kernel and is not a vendored GgmlType. */
+/* ggml type code of a call; Q5_0 has its own kernel and is not a vendored GgmlType. */
 struct LinearCall {
     int ggml_type;
     const uint4 *weight;

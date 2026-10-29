@@ -1,4 +1,4 @@
-//! Executes every Q4_K tile width that vendor patch V-5 turned into a tiling config.
+//! Executes every Q4_K tile width that the vendored Q4_K tiling patch turned into a tiling config.
 //!
 //! The suite's other device tests reach whatever width the hint picks for their shape, which was
 //! J=8 only. This test forces each flipped width in turn through the test-only override, launches
@@ -14,10 +14,10 @@ use crate::kernels::cuda::prefill::mmq_mmid::{MmidShape, set_hint_override};
 use crate::kernels::cuda::resident::matvec_q::QuantType;
 use crate::kernels::cuda::testkit;
 
-/// The widths patch V-5 made tiling configs; every one must execute.
+/// The widths the vendored Q4_K tiling patch made tiling configs; every one must execute.
 const FLIPPED_J: [i64; 7] = [8, 16, 24, 32, 40, 48, 64];
 
-/// The frozen NMSE bound of a Q4_K expert gate/up launch (0049 A2, Q8X class).
+/// The frozen NMSE bound of a Q4_K expert gate/up launch (Q8X class).
 const GATE_UP_NMSE: f64 = 1e-3;
 
 #[test]

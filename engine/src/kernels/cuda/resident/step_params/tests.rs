@@ -2,17 +2,15 @@
 //! entries against the kernels. Every output is an integer word, so the check is word equality
 //! against a host model (class E1x, bit exact). The tests run with `--test-threads=1`.
 //!
-//! The host models are written here from the rules of the packet, not from the kernel:
-//! `cpu_argmax` is a literal copy of `family/sampler.rs::argmax` (`kernels::cuda` must not depend
-//! on `family`), `cpu_rejects` is the predicate of its `check_logits`, `ref_row` is the device
-//! rule for a row `check_logits` rejects, and `sim_advance` and `sim_begin` are the step words.
-//! Argued, not tested: (0) T13, the latched context, per lane C's ruling: `fault.rs` is lane C's,
-//! and lane C adds one resident-wrapper call to its fault child in a later packet. (1) T9's freed-buffer row: a `DeviceRange` borrows its buffer, so the
+//! The host models are written here from the contract rules, not from the kernel: `cpu_argmax`
+//! is a literal copy of `family/sampler.rs::argmax` (`kernels::cuda` must not depend on
+//! `family`), `cpu_rejects` is the predicate of its `check_logits`, `ref_row` is the device rule
+//! for a row `check_logits` rejects, and `sim_advance` and `sim_begin` are the step words.
+//! Argued, not tested: (1) T9's freed-buffer row: a `DeviceRange` borrows its buffer, so the
 //! compiler forbids freeing the buffer early. (2) T13, the latched context: every resident
 //! wrapper enters through `launch_on`, whose `ensure_usable` refusal after a latch is covered by
-//! the fault child of `fault.rs` (feature `cuda-fault-qualification`); lane C adds one
-//! resident-wrapper call to that child in a later packet. (3) T10 (graph capture) is deferred to
-//! RD-11a, which must list it as owed (`write_at` and `GraphExec` are absent at bc7f391).
+//! the fault child of `fault.rs` (feature `cuda-fault-qualification`); that child does not yet
+//! call a resident wrapper.
 
 use std::mem::{offset_of, size_of};
 
@@ -470,7 +468,7 @@ fn pair_call<'b>(
     }
 }
 
-/// R-C2b: a second argmax that writes `status` after the pair was made leaves the pair stale.
+/// A second argmax that writes `status` after the pair was made leaves the pair stale.
 fn late_writer_is_detected(fx: &Fx, clean: &[f32], nan_row: &[f32]) {
     let logits = testkit::upload_f32(&fx.ctx, clean);
     let late = testkit::upload_f32(&fx.ctx, nan_row);
@@ -1084,9 +1082,9 @@ fn step_status_maps_as_the_replies_say() {
     }
 }
 
-// ---------------------------------------------------------------- T10 (RD-11a)
+// ---------------------------------------------------------------- T10: graph capture
 
-/// The capture plan of the owed test: the rig owns every buffer, so no pin and no hold.
+/// The capture plan of the capture test: the rig owns every buffer, so no pin and no hold.
 fn no_pins() -> CapturePlan<'static> {
     CapturePlan {
         pins: &[],
@@ -1191,11 +1189,11 @@ impl Chain {
     }
 }
 
-/// T10 (RD-4d, owed): the step chain `step_begin`, embed, pack, matmul, argmax, `step_advance`
-/// captured once and replayed eight times with NO host write between replays (each replay's
-/// argmax token feeds the next replay's embed through the token word, the positions advance
-/// through `step_advance`) equals the eager chain byte for byte: the step block (32 bytes) and
-/// the result pair after every step.
+/// T10: the step chain `step_begin`, embed, pack, matmul, argmax, `step_advance` captured once
+/// and replayed eight times with NO host write between replays (each replay's argmax token feeds
+/// the next replay's embed through the token word, the positions advance through
+/// `step_advance`) equals the eager chain byte for byte: the step block (32 bytes) and the
+/// result pair after every step.
 #[test]
 fn step_chain_inside_a_capture_equals_eager() {
     if !testkit::device_present("step_chain_inside_a_capture_equals_eager") {

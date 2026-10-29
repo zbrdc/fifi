@@ -1,4 +1,4 @@
-//! Unit tests of the executor rules (test seam U13). CPU only.
+//! Unit tests of the executor rules. CPU only.
 use super::{
     dims::{KvMode, StepOptions},
     rules::{QwenRules, check_token_id, check_vocab, validate_step_inputs},
@@ -114,8 +114,8 @@ fn check_token_id_accepts_every_id_inside_the_sampler_vocabulary() {
 
 #[test]
 fn check_token_id_refuses_the_padding_and_head_ids_naming_the_id() {
-    // 248_077 is the first padding row INSIDE the padded table (the R-3 poison path), 248_319
-    // the last padded row, 248_320 the first row above the table.
+    // 248_077 is the first padding row INSIDE the padded table (an id that would embed and run),
+    // 248_319 the last padded row, 248_320 the first row above the table.
     for id in [
         SAMPLER_VOCAB as u32,
         HEAD_ROWS as u32 - 1,

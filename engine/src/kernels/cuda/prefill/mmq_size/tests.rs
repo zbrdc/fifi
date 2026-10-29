@@ -1,12 +1,11 @@
-//! Host-only tests of the MMQ sizing module (CPF-V4 G1): the exhaustive pad, ids and fixup
-//! assertions over the whole chunk domain (rules M1-M3, rev 3), the strict cross-check that
-//! re-parses both vendored config headers, the J-replica pins (the strict-`<` row, the table
-//! gaps, the synthetic `smpbo` skip), the exact-equality pad contract, the Qwen width pins,
-//! the recomputed under-pad windows of the old upstream rule, the ncols domain guard and the
-//! typed overflow refusals. GPU-free but under `kernels::cuda`, which the crate compiles
-//! only with `native-cuda` (kernels/mod.rs:26): the rows run with
-//! `cargo test --features native-cuda`, never touching a device (the sister device tests
-//! also need the feature, and a GPU besides).
+//! Host-only tests of the MMQ sizing module: the exhaustive pad, ids and fixup assertions over
+//! the whole chunk domain, the strict cross-check that re-parses both vendored config headers,
+//! the J-replica pins (the strict-`<` row, the table gaps, the synthetic `smpbo` skip), the
+//! exact-equality pad contract, the Qwen width pins, the recomputed under-pad windows of the
+//! old upstream rule, the ncols domain guard and the typed overflow refusals. GPU-free but
+//! under `kernels::cuda`, which the crate compiles only with `native-cuda` (kernels/mod.rs:26):
+//! the rows run with `cargo test --features native-cuda`, never touching a device (the sister
+//! device tests also need the feature, and a GPU besides).
 
 use super::*;
 
@@ -25,7 +24,7 @@ type CaseRow = (
 );
 
 /// The strict `CASE(...)` field parser: any line of a config header that mentions CASE must
-/// parse completely, or the test fails (finding 7: a vendor patch cannot pass silently).
+/// parse completely, or the test fails (a vendor patch cannot pass silently).
 fn parse_cases(text: &str) -> Vec<CaseRow> {
     let mut rows = Vec::new();
     for line in text.lines() {
@@ -232,10 +231,10 @@ fn j_best_models_the_shared_memory_skip() {
     assert_eq!(j_best(MmqType::Q4K, false, 860, 1_000, 2048), None);
 }
 
-/// The exact-equality pad contract (rev 3, finding 19): `Q8_1_PAD == 18,432` and
-/// `q8_1_bytes == (Kpad/128)*ncols*144 + 18,432`, at dense, grouped and non-multiple K
-/// shapes. V18 (floored Kpad) dies at K = 600; V2/V3 die at the dense (2048, 1) row, where
-/// their `ncols_opt`-sized pad is 2,048 B against the contract's 18,432 B.
+/// The exact-equality pad contract: `Q8_1_PAD == 18,432` and
+/// `q8_1_bytes == (Kpad/128)*ncols*144 + 18,432`, at dense, grouped and non-multiple K shapes.
+/// V18 (floored Kpad) dies at K = 600; V2/V3 die at the dense (2048, 1) row, where their
+/// `ncols_opt`-sized pad is 2,048 B against the contract's 18,432 B.
 #[test]
 fn q8_1_pad_contract_is_exact() {
     assert_eq!(Q8_1_PAD, 18_432);
@@ -305,8 +304,8 @@ fn exhaustive_dense_pad_rule() {
 }
 
 /// The exhaustive grouped assertion: the last tile can hold a single-column top expert, so
-/// `S(J_best(M)) - 144 <= Q8_1_PAD` for every M in 1..=2048. The B1 witness: M = 49..56 at
-/// fallback = false picks J = 64, needs 9,072 B, and rev 2's pad covered only 8,192 B.
+/// `S(J_best(M)) - 144 <= Q8_1_PAD` for every M in 1..=2048. The witness: M = 49..56 at
+/// fallback = false picks J = 64, needs 9,072 B, and the earlier pad covered only 8,192 B.
 #[test]
 fn exhaustive_grouped_pad_rule() {
     for cc in [720, 860] {
@@ -323,14 +322,13 @@ fn exhaustive_grouped_pad_rule() {
             assert_eq!(j, 64, "M={m}");
             assert_eq!(y_tile_span_bytes(256, 64) - 144, 9_072);
             let rev2 = pad_up(j_ub(m) * 144, SRC1_LOAD_CHUNK);
-            assert_eq!(rev2, 8_192, "rev 2's pad at M={m}");
-            assert_eq!(9_072 - rev2, 880, "the B1 shortfall at M={m}");
+            assert_eq!(rev2, 8_192, "the earlier pad at M={m}");
+            assert_eq!(9_072 - rev2, 880, "the shortfall at M={m}");
         }
     }
 }
 
-/// The typed underflow text of `ids_gather_ints(0, 0)` (review NIT-5): its own rule, not the
-/// overflow text.
+/// The typed underflow text of `ids_gather_ints(0, 0)`: its own rule, not the overflow text.
 #[test]
 fn ids_gather_zero_extents_have_their_own_text() {
     let err = ids_gather_ints(0, 0).unwrap_err();
@@ -348,7 +346,7 @@ fn ids_gather_zero_extents_have_their_own_text() {
 /// The exhaustive ids and fixup forms over the reachable domain (M up to 2,048,
 /// `ne_get_rows` up to 16,384): the shipped closed form bounds both gathers at the J the
 /// launch picks, for every M, fallback and arch. The V1 regression: at `ncols_opt = 24`
-/// with fallback, `J_ub = 24` but `J_best = 32`, so rev 2's `ne_get_rows + J_ub - 1` form
+/// with fallback, `J_ub = 24` but `J_best = 32`, so the earlier `ne_get_rows + J_ub - 1` form
 /// is 8 ints short of the fixup gather's exact reach.
 #[test]
 fn exhaustive_ids_and_fixup_forms() {
@@ -375,17 +373,16 @@ fn exhaustive_ids_and_fixup_forms() {
     assert_eq!(
         exact - short,
         8,
-        "rev 2's form is 8 ints short at ncols_opt=24"
+        "the earlier form is 8 ints short at ncols_opt=24"
     );
     assert!(fixup_floats_max(82).unwrap() >= fixup_floats_exact(82, 128, 128).unwrap());
     assert!(fixup_floats_max(82).unwrap() > fixup_floats_exact(61, 80, 128).unwrap());
 }
 
-/// The recomputed trigger windows (finding 9): the old helper under-pads exactly
-/// `{1..7, 9..13}` at fallback = false and adds `{17, 18, 19}` at fallback = true, over the
-/// whole domain, on both build archs. The old rule is wrong exactly on these rows: 14 and
-/// 20 stay safe, and the fb=true gap identity of finding 3 holds (`J_max = 16` against
-/// `J_best = 32` at 24).
+/// The recomputed trigger windows: the old helper under-pads exactly `{1..7, 9..13}` at
+/// fallback = false and adds `{17, 18, 19}` at fallback = true, over the whole domain, on both
+/// build archs. The old rule is wrong exactly on these rows: 14 and 20 stay safe, and the
+/// fb=true gap identity holds (`J_max = 16` against `J_best = 32` at 24).
 #[test]
 fn overread_windows_recomputed() {
     let plain: Vec<usize> = (1..=7).chain(9..=13).collect();
@@ -408,8 +405,8 @@ fn overread_windows_recomputed() {
     assert!(legacy_j_max(false, 860, 14) >= 8); // 14 is safe: the old pad covers the need
 }
 
-/// The domain guard (finding 22): 1..=2048 passes, 0 and 2049 are typed refusals that a
-/// wrapper refusal test can pin.
+/// The domain guard: 1..=2048 passes, 0 and 2049 are typed refusals that a wrapper refusal test
+/// can pin.
 #[test]
 fn ncols_domain_guard() {
     assert!(check_ncols_domain(1).is_ok());
@@ -443,11 +440,10 @@ fn overflow_refusals_are_typed() {
     }
 }
 
-/// The table function of a config header must be EXACTLY the known shape (lane C's
-/// completeness rule): no preprocessor line and no block comment may appear, and every
-/// non-blank line is the one signature line, a CASE row, the known separator comment, or
-/// the two-line footer. A vendor edit that hides a row behind `#ifdef` or a comment fails
-/// here even when every CASE line still parses.
+/// The table function of a config header must be EXACTLY the known shape: no preprocessor line
+/// and no block comment may appear, and every non-blank line is the one signature line, a CASE
+/// row, the known separator comment, or the two-line footer. A vendor edit that hides a row
+/// behind `#ifdef` or a comment fails here even when every CASE line still parses.
 #[test]
 fn config_headers_have_no_hidden_lines() {
     let headers = [
@@ -571,9 +567,9 @@ fn vendored_mmq_range_hash(first: usize, last: usize, head: &str) -> String {
 }
 
 /// The vendored stream-k launch rule (mmq.cuh:1395-1412): the 90 % tiling test, the `2^30`
-/// limit, the fixup test and the fixup byte need. G2's `fixup_need` (C) and the Rust
-/// mirrors of the 2^30 limit re-express exactly this passage, so a vendor change to it
-/// must fail CI (lane C's ruling on the G2 verdict, m-1).
+/// limit, the fixup test and the fixup byte need. The dense C entry's `fixup_need` and the
+/// Rust mirrors of the 2^30 limit re-express exactly this passage, so a vendor change to it
+/// must fail CI.
 #[test]
 fn vendored_stream_k_launch_rule_is_pinned() {
     assert_eq!(
@@ -607,7 +603,7 @@ fn vendored_launch_grid_and_stream_k_branch_are_pinned() {
 
 /// The vendored case function (mmq.cuh:1500-1510): the device check and the fallback rule,
 /// `nrows_x % 128 != 0`, that picks the J set. Every sizing row names the fallback axis from
-/// it (plan section B.3), so a vendor change to it must fail CI.
+/// it, so a vendor change to it must fail CI.
 #[test]
 fn vendored_mmq_case_fallback_rule_is_pinned() {
     assert_eq!(
@@ -617,12 +613,11 @@ fn vendored_mmq_case_fallback_rule_is_pinned() {
     );
 }
 
-/// `COMPILED_ARCHS` is pinned to the build (lane C's item 4): every architecture THIS build
-/// compiled — the list build.rs wrote into its generated `__CUDA_ARCH_LIST__` header — must
-/// appear in the constant, so a build whose arch set grows past it fails here instead of
-/// silently taking the wrong config table. (Deriving the constant from
-/// `INFERENCE_CUDA_ARCHS` at run time is not possible: the test exes run outside the build
-/// environment, where the variable is absent.)
+/// `COMPILED_ARCHS` is pinned to the build: every architecture THIS build compiled — the list
+/// build.rs wrote into its generated `__CUDA_ARCH_LIST__` header — must appear in the constant,
+/// so a build whose arch set grows past it fails here instead of silently taking the wrong
+/// config table. (Deriving the constant from `INFERENCE_CUDA_ARCHS` at run time is not
+/// possible: the test exes run outside the build environment, where the variable is absent.)
 #[test]
 fn compiled_archs_cover_the_build() {
     // Embedded at build time, not read at run time: a test exe copied away from its target

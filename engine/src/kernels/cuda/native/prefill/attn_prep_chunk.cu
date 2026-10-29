@@ -1,16 +1,14 @@
-/* CPF-ATTN-A K1: argument validation and the one launch of attn_prep_chunk, the chunk KV
- * write of the prefill attention (decision 0049 item 2). The
- * math is a byte-for-byte re-expression of the vendored attn_prep (RD-4V,
- * vendor/xavier-qwen/src/ops.cu attn_prep_k) — the same
- * per-head RMSNorm expression and 256-thread block-reduction order (ops.cu:184-185), the
- * same NEOX rope over the first n_rot dimensions (ops.cu:188-194), the same fp16
- * nearest-even cache writes (ops.cu:179/198) and the same launch shape (ops.cu:231-234) —
- * re-stated here because the vendored helpers sit in an anonymous namespace of ops.cu. The
- * vendored kernel stays decode-only (it reads the device pos word, ops.cu:166, and ORs mask
- * 4 of StepParams.status, attn_prep.cu:23); this chunk form takes p0 as a launch argument
- * (0049 item 1), writes post-rope f32 rows for the KV8 writer in the RowsOut mode, and ORs
- * mask 8 of the prefill status word (0049 item 10). Test 4 of the wrapper pins the bit
- * equality against the vendored entry. Contract: prefill/attn_prep_chunk.h. */
+/* Argument validation and the one launch of attn_prep_chunk, the chunk KV write of the prefill
+ * attention. The math is a byte-for-byte re-expression of the vendored attn_prep
+ * (vendor/xavier-qwen/src/ops.cu attn_prep_k) — the same per-head RMSNorm expression and 256-thread
+ * block-reduction order (ops.cu:184-185), the same NEOX rope over the first n_rot dimensions
+ * (ops.cu:188-194), the same fp16 nearest-even cache writes (ops.cu:179/198) and the same launch
+ * shape (ops.cu:231-234) — re-stated here because the vendored helpers sit in an anonymous
+ * namespace of ops.cu. The vendored kernel stays decode-only (it reads the device pos word,
+ * ops.cu:166, and ORs mask 4 of StepParams.status, attn_prep.cu:23); this chunk form takes p0 as a
+ * launch argument, writes post-rope f32 rows for the KV8 writer in the RowsOut mode, and ORs mask 8
+ * of the prefill status word. Test 4 of the wrapper pins the bit equality against the vendored
+ * entry. Contract: prefill/attn_prep_chunk.h. */
 #include "prefill/attn_prep_chunk.h"
 
 #include <cuda_fp16.h>
@@ -38,7 +36,7 @@ struct ChunkArgs {
     float *q;       // [m][n_head][D] out
     float *k_rows;  // ROWS_OUT mode: [m][n_kv_head][D]
     float *v_rows;
-    int *status;  // optional prefill status word (decision 0049 item 10)
+    int *status;  // optional prefill status word
     int ld, p0, m, n_head, n_kv_head, n_rot, rows, mode;
     float eps, rope_base;
 };
@@ -73,15 +71,15 @@ bool valid_shape_sans_bounds(const inference_cuda_attn_prep_chunk_args *a) {
                        a->n_kv_head <= kMaxKvHeads;
     const bool tokens = a->m >= 1 && a->m <= kMaxGridY;
     const bool rope = a->n_rot >= 2 && a->n_rot <= kHeadDim &&
-                      (a->n_rot & (a->n_rot - 1)) == 0;  // a power of two: RP1's domain
+                      (a->n_rot & (a->n_rot - 1)) == 0;  // a power of two (rope tolerance domain)
     const bool cache = a->rows >= 1 && a->rows <= kMaxRows;
     const long long row_width =
         ((long long)a->n_head * 2 + (long long)a->n_kv_head * 2) * kHeadDim;
     return a->head_dim == kHeadDim && heads && tokens && rope && cache && a->ld >= row_width;
 }
 
-/* The p0 bound the wrapper, this entry and the kernel all check (0049 item 2): p0 >= 0 and
- * p0 + m <= rows, the sum in 64 bits. */
+/* The p0 bound the wrapper, this entry and the kernel all check: p0 >= 0 and p0 + m <= rows, the
+ * sum in 64 bits. */
 bool valid_bounds(const inference_cuda_attn_prep_chunk_args *a) {
     return a->p0 >= 0 && (long long)a->p0 + a->m <= a->rows;
 }
@@ -121,11 +119,11 @@ __global__ void attn_prep_chunk_k(ChunkArgs a) {
     constexpr int D = kHeadDim;
     __shared__ float x[D];
     int head = blockIdx.x, t = blockIdx.y, d = threadIdx.x;
-    // The device re-check of the launch arguments (decision 0049 item 2), the vendored form
-    // (ops.cu:166-172): the answer is the same for every block, so the early return is block
-    // uniform and happens before the first barrier. A refused launch writes no cache row and
-    // no k/v row, sets q to NaN so the attention that reads it cannot yield a plausible
-    // value, and ORs mask 8 into the optional prefill status word (item 10).
+    // The device re-check of the launch arguments, the vendored form (ops.cu:166-172): the answer
+    // is the same for every block, so the early return is block uniform and happens before the
+    // first barrier. A refused launch writes no cache row and no k/v row, sets q to NaN so the
+    // attention that reads it cannot yield a plausible value, and ORs mask 8 into the optional
+    // prefill status word.
     if ((long long)a.p0 < 0 || (long long)a.p0 + a.m > a.rows) {
         if (a.status && blockIdx.x == 0 && blockIdx.y == 0 && threadIdx.x == 0)
             atomicOr(a.status, INFERENCE_CUDA_PREFILL_STATUS_BOUND_VIOLATION);

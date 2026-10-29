@@ -1,11 +1,11 @@
-/* RD-8k: the KV8 append kernel of the resident decode step (decision 0047 item 6): quantizes the
- * post-norm, post-rope k rows and the v rows of one step to the frozen 8-bit KV format and
- * appends them to the code and scale planes.
+/* The KV8 append kernel of the resident decode step: quantizes the post-norm, post-rope k rows
+ * and the v rows of one step to the frozen 8-bit KV format and appends them to the code and scale
+ * planes.
  *
  * The layout (separate K and V code and scale arrays, cell-major per KV head, one quantizer for
  * decode and prefill) follows Strata's k34-kv8 layout (`laguna_kv8_view.hpp`); the code
  * is original CUDA C written from the shapes of this repository. The poison rule mirrors the
- * vendored attn_prep of RD-8a (this repository's own kernel).
+ * one this repository added to the vendored attn_prep.
  *
  * One thread per value, one warp per group of 32: the warp reduces |x| to the group amax, stores
  * the fp16 scale from lane 0 and the int8 code of its own value from every lane. The code is
@@ -33,7 +33,7 @@ constexpr int kMaxKvHeads = 64;
 constexpr int kMinHead = 32;      // one warp quantizes one group
 constexpr int kMaxHead = 1024;
 constexpr int kMaxCells = (1 << 30) - 1;
-// Mask 4 of StepParams.status (invalid step state, REPLY-47); equals
+// Mask 4 of StepParams.status (invalid step state); equals
 // INFERENCE_CUDA_STATUS_INVALID_STEP_STATE of resident/step_params.h, as attn_prep.cu.
 constexpr int kStatusInvalidStepState = 4;
 
@@ -72,12 +72,12 @@ __device__ inline float warp_max_a(float v) {
 __device__ inline float h2f(unsigned short bits) { return __half2float(__ushort_as_half(bits)); }
 
 // scale = amax / 127 rounded to fp16 (half even). An all-zero group stores 0.
-// Poison rule (G-KV8 item R-A, lane C ruling): a NaN anywhere among the group's 32 values
-// reaches `warp_max_a` and makes amax NaN, so the stored scale is an fp16 NaN. The codes may be
-// anything `quant_code` gives, but every dequantized value `code * f32(scale)` of that group is
-// then NaN, so the poison cannot vanish from the int8 KV (the fp16 KV path keeps the NaN, and
-// the argmax status mask 2 catches it downstream). A group whose values are all ±Inf keeps the
-// old behavior: scale +Inf, and every dequantized value is non-finite (0 * Inf = NaN).
+// Poison rule: a NaN anywhere among the group's 32 values reaches `warp_max_a` and makes amax
+// NaN, so the stored scale is an fp16 NaN. The codes may be anything `quant_code` gives, but
+// every dequantized value `code * f32(scale)` of that group is then NaN, so the poison cannot
+// vanish from the int8 KV (the fp16 KV path keeps the NaN, and the argmax status mask 2 catches
+// it downstream). A group whose values are all ±Inf keeps the old behavior: scale +Inf, and every
+// dequantized value is non-finite (0 * Inf = NaN).
 __device__ inline unsigned short quant_scale(float d) {
     return __half_as_ushort(__float2half_rn(d));
 }
@@ -92,7 +92,7 @@ __device__ inline int quant_code(float x, float s) {
 
 __global__ void kv8_append_k(Args a) {
     const int kvh = blockIdx.x, t = blockIdx.y, d = threadIdx.x;
-    // Poison rule (RD-8a, REPLY-47): the position of token 0 is read from the device (decode) or
+    // Poison rule, as in attn_prep: the position of token 0 is read from the device (decode) or
     // validated here (chunk) and tested, in 64 bits, against the cells before any other memory
     // access. The answer is block uniform (while no other stream writes the word), so the early
     // return happens before any barrier. A refused launch writes no code, no scale, and ORs

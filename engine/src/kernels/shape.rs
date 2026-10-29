@@ -1,4 +1,4 @@
-//! Output layouts of resident reductions and layout operations (decision 0039).
+//! Output layouts of resident reductions and layout operations.
 //!
 //! Each function checks one F32 input shape and returns the output shape and byte length.
 //! Callers check the owner and dtype first. Every error is `BadRequest` with the operation label.
@@ -213,7 +213,7 @@ pub(crate) fn take(
 
 /// Gathers along `axis` with an index tensor of the input rank, as `numpy.take_along_axis` does:
 /// the indices shape equals the input shape except on `axis`, and the output takes the indices
-/// shape (packet Q36-PF-DEVROUTE; the device chunk MoE reads the top-k probability of each row).
+/// shape (the device chunk MoE reads the top-k probability of each row this way).
 pub(crate) fn take_along_axis(
     operation: &'static str,
     shape: &[u32],
@@ -238,7 +238,7 @@ pub(crate) fn take_along_axis(
 }
 
 /// The inclusive maximum of the single `mlx_minimum` clamp that `bound_indices` builds for the
-/// exclusive `bound` (packet GAP-TRIM-A): every id of the clamped resident is `<= bound - 1`,
+/// exclusive `bound`: every id of the clamped resident is `<= bound - 1`,
 /// that is `< bound`. A bound of zero clamps nothing (no id is below zero), so it is a
 /// `BadRequest` before any native call.
 pub(crate) fn clamp_max(operation: &'static str, bound: u32) -> Result<u32, EngError> {
@@ -249,7 +249,7 @@ pub(crate) fn clamp_max(operation: &'static str, bound: u32) -> Result<u32, EngE
 
 /// Whether ids that `bound_indices` clamped below the exclusive `bound` can never read outside
 /// an axis of `axis_len` entries, so a bounded gather or take along that axis can skip its own
-/// clamp (packet GAP-TRIM-A). A bound past the axis leaves the clamp in place, so the safety
+/// clamp. A bound past the axis leaves the clamp in place, so the safety
 /// rule of the public operations holds for every `BoundedIndices`, whatever bound it records.
 pub(crate) fn bound_covers(bound: u32, axis_len: u32) -> bool {
     bound <= axis_len
@@ -385,7 +385,7 @@ pub(crate) fn attention(
     layout(operation, queries.to_vec())
 }
 
-/// Prefix attention (packet NATIVE-OPS-1): attention of `queries` `[B, Hq, Tq, D]` over the first
+/// Prefix attention: attention of `queries` `[B, Hq, Tq, D]` over the first
 /// `len` positions of the capacity buffers `keys` and `values` `[B, Hkv, CAP, D]`. The head
 /// grouping and the other checks are those of `attention`; `len` must be at least one and at most
 /// the capacity. The output is the query shape.
@@ -409,7 +409,7 @@ pub(crate) fn attention_prefix(
     Ok(layout)
 }
 
-/// The dtype rule shared by `kv_append` and `grouped_attention_prefix` (packet NATIVE-OPS-1):
+/// The dtype rule shared by `kv_append` and `grouped_attention_prefix`:
 /// every operand is F32, or BF16 after `allow_bf16` opens the resident float operations to BF16.
 /// The rejection text matches `check_operand` of the native adapter.
 pub(crate) fn float_operands(
@@ -426,7 +426,7 @@ pub(crate) fn float_operands(
     Ok(())
 }
 
-/// The dtype rule of `kv_append` (packet KV8-OPS): F32, BF16 after `allow_bf16`, and now U32 —
+/// The dtype rule of `kv_append`: F32, BF16 after `allow_bf16`, and U32 —
 /// the quantized KV cache appends its U32 code rows beside the F32 and BF16 rows it already
 /// served. The caller still requires the two dtypes to be equal. `float_operands` keeps its old
 /// rule for the float-only operations.
@@ -445,7 +445,7 @@ pub(crate) fn kv_append_operands(
     Ok(())
 }
 
-/// The dtype rule of `quantized_attention_prefix` (packet KV8-OPS): the queries and the four
+/// The dtype rule of `quantized_attention_prefix`: the queries and the four
 /// scale and bias residents are F32, or BF16 after `allow_bf16` (the stored scale dtype of the
 /// quantized cache, as `gather_qmm` takes it), and the two code residents are U32. The scales
 /// and biases of one side must share one dtype, and the two sides must agree.
@@ -475,7 +475,7 @@ pub(crate) fn quantized_kv_operands(
     Ok(())
 }
 
-/// The output layouts of `quantize_rows` (packet KV8-OPS).
+/// The output layouts of `quantize_rows`.
 pub(crate) struct QuantizeRowsLayout {
     /// The packed codes, U32 `[.., D * bits / 32]`. The byte count of 4-byte elements is exact.
     pub(crate) codes: ElementwiseLayout,
@@ -484,7 +484,7 @@ pub(crate) struct QuantizeRowsLayout {
     pub(crate) groups: ElementwiseLayout,
 }
 
-/// The portable checks of `quantize_rows` (packet KV8-OPS): `x` has rank at least two, its last
+/// The portable checks of `quantize_rows`: `x` has rank at least two, its last
 /// axis is a multiple of `group_size`, and the packed width `D * bits` fills whole U32 words.
 /// `bits` is 8 only for now; widening to 4 bits is the one-line change of this check. The
 /// outputs are codes U32 `[.., D * bits / 32]` and scales and biases `[.., D / group]`.
@@ -533,7 +533,7 @@ pub(crate) fn quantize_rows(
     })
 }
 
-/// The portable checks of `quantized_attention_prefix` (packet KV8-OPS): `queries` is
+/// The portable checks of `quantized_attention_prefix`: `queries` is
 /// `[B, QH, L, D]`, each quantized buffer is `[B, KVH, CAP, last]` with the codes packing
 /// `D * bits / 32` U32 words and the scales and biases holding `D / group` groups per row on
 /// both sides, the two sides agree, `QH` is a multiple of `KVH`, `len` is 1 to `CAP` and, for
@@ -542,8 +542,8 @@ pub(crate) fn quantize_rows(
 /// query shape.
 #[allow(
     clippy::too_many_arguments,
-    reason = "the packet fixes this signature: len and causal name the attention, group_size \
-             and bits name the quantization of the buffers"
+    reason = "len and causal name the attention, group_size and bits name the quantization \
+             of the buffers"
 )]
 pub(crate) fn quantized_attention_prefix(
     operation: &'static str,
@@ -647,20 +647,20 @@ pub(crate) fn quantized_attention_prefix(
     layout(operation, queries.to_vec())
 }
 
-/// The line that separates the two kernel bodies of the fused decode Metal source (packet
-/// FUSED-KV8-a). `native/q8_decode_attention.metal` holds pass 1 and pass 2 as plain Metal
-/// text with exactly one marker line between them; `resident_ops.rs` includes that file with
+/// The line that separates the two kernel bodies of the fused decode Metal source.
+/// `native/q8_decode_attention.metal` holds pass 1 and pass 2 as plain Metal text with
+/// exactly one marker line between them; `resident_ops.rs` includes that file with
 /// `include_str!` and splits it here.
 pub(crate) const Q8_DECODE_PASS_MARKER: &str = "// ---- PASS 2 ----";
 
-/// The block-count rule NB of the fused decode attention (packet FUSED-KV8-a; the tiers
-/// re-measured for the R4 structure by packet FUSED-KV8-EFF-2): at most 8,192 keys 64
-/// blocks; at most 32,768 keys 128 (64 when the query heads per KV head stay below 6);
-/// above that 256 (128 below 6); always `min(NB, len)`, and at least one block. The rule
-/// can leave EMPTY tail blocks (len 130 gives NB 64 and a block size
-/// of 3, so blocks 44 to 63 hold no key): pass 1 writes them a partial of max -FLT_MAX,
-/// sum 0, and zeros, and pass 2 weights them by `exp(-FLT_MAX - m*) = 0` under MLX's
-/// default safe math. Pure: the shim receives the result as a scalar.
+/// The block-count rule NB of the fused decode attention, with tiers measured on the current
+/// kernel structure: at most 8,192 keys 64 blocks; at most 32,768 keys 128 (64 when the
+/// query heads per KV head stay below 6); above that 256 (128 below 6); always
+/// `min(NB, len)`, and at least one block. The rule can leave EMPTY tail blocks (len 130
+/// gives NB 64 and a block size of 3, so blocks 44 to 63 hold no key): pass 1 writes them a
+/// partial of max -FLT_MAX, sum 0, and zeros, and pass 2 weights them by
+/// `exp(-FLT_MAX - m*) = 0` under MLX's default safe math. Pure: the shim receives the
+/// result as a scalar.
 pub(crate) fn decode_blocks(len: u32, rep: u32) -> u32 {
     let nb = if len <= 8192 {
         64
@@ -674,7 +674,7 @@ pub(crate) fn decode_blocks(len: u32, rep: u32) -> u32 {
     nb.min(len).max(1)
 }
 
-/// The portable checks of `quantized_attention_decode` (packet FUSED-KV8-a): the checks of
+/// The portable checks of `quantized_attention_decode`: the checks of
 /// `quantized_attention_prefix` with `causal = false`, plus the limits of the fused kernel -
 /// batch one and exactly one query row (the shim builds a `[1, QH, 1, D]` output and the
 /// kernels carry no batch stride), 8-bit codes, group 64, a head dim of 64, 128, or 256
@@ -776,7 +776,7 @@ mod tests {
     }
 
     /// `clamp_max` is one below the exclusive bound and rejects zero: the clamp of the MoE names
-    /// the last expert `E - 1` for the expert count `E` (hand-derived, packet GAP-TRIM-A).
+    /// the last expert `E - 1` for the expert count `E` (hand-derived).
     #[test]
     fn clamp_max_is_one_below_the_exclusive_bound() {
         assert_eq!(
@@ -804,9 +804,9 @@ mod tests {
         }
     }
 
-    /// `bound_covers` holds exactly while the clamped ids stay inside the axis (hand-derived,
-    /// packet GAP-TRIM-A): a bound equal to the axis covers it (the last id is inside), a tighter
-    /// bound covers it too, and one past the axis does not.
+    /// `bound_covers` holds exactly while the clamped ids stay inside the axis (hand-derived):
+    /// a bound equal to the axis covers it (the last id is inside), a tighter bound covers it
+    /// too, and one past the axis does not.
     #[test]
     fn bound_covers_only_while_the_bound_fits_the_axis() {
         assert!(
@@ -1353,8 +1353,7 @@ mod tests {
 
     #[test]
     fn kv_append_operands_take_u32_rows_beside_the_floats() {
-        // The U32 codes of the quantized cache append beside F32, and BF16 still needs the
-        // switch (packet KV8-OPS).
+        // The U32 codes of the quantized cache append beside F32, and BF16 still needs the switch.
         assert!(kv_append_operands("kv append", false, &[Dtype::F32, Dtype::F32]).is_ok());
         assert!(kv_append_operands("kv append", false, &[Dtype::U32, Dtype::U32]).is_ok());
         assert!(kv_append_operands("kv append", true, &[Dtype::Bf16, Dtype::Bf16]).is_ok());
@@ -1810,7 +1809,7 @@ mod tests {
         };
     }
 
-    /// The valid shapes of the decode check (packet FUSED-KV8-a): the real model (QH 16 over
+    /// The valid shapes of the decode check: the real model (QH 16 over
     /// KVH 2, D 256, REP 8, capacity 1024, len 1000), the test shape (QH 4 over KVH 2, D 64,
     /// REP 2), D 128 (QH 8 over KVH 2, REP 4), and the smallest repeat REP 1 (QH 2 over
     /// KVH 2, D 64) give the query shape back, with the F32 byte count of the layout.
@@ -1897,7 +1896,7 @@ mod tests {
         );
     }
 
-    /// Every added limit of the decode check refuses its shape (packet FUSED-KV8-a): a batch
+    /// Every added limit of the decode check refuses its shape: a batch
     /// above one (the shim builds a `[1, QH, 1, D]` output and the kernels carry no batch
     /// stride), two query rows, bits 4, group 32 (with buffers that WOULD match a group-32
     /// layout, so only the group rule refuses), a head dim outside the validated set - 96,
@@ -2042,11 +2041,10 @@ mod tests {
         }
     }
 
-    /// The NB table of the block-count rule (packet FUSED-KV8-a, the tiers of packet
-    /// FUSED-KV8-EFF-2): at len 8192 the small tier ends (64 blocks), 8193 and 32768 take
-    /// the middle tier (128 for REP 8, 64 for REP 4), 32769, 131072, and 262000 the large
-    /// tier (256 for REP 8, 128 for REP 4), and the small lengths clamp NB to len (len 1
-    /// gives one block; len 130 gives 64 with the empty tail blocks of blocks 44 to 63).
+    /// The NB table of the block-count rule: at len 8192 the small tier ends (64 blocks), 8193
+    /// and 32768 take the middle tier (128 for REP 8, 64 for REP 4), 32769, 131072, and 262000
+    /// the large tier (256 for REP 8, 128 for REP 4), and the small lengths clamp NB to len
+    /// (len 1 gives one block; len 130 gives 64 with the empty tail blocks of blocks 44 to 63).
     /// The REP 8 and REP 4 rows pin every tier edge for both sides of the `rep >= 6`
     /// halving of the two upper tiers, derived by hand: len 1 clamps to one block, len 100
     /// and 130 clamp to the 64-block floor of the small tier, len 8192 ends the small tier
@@ -2089,7 +2087,7 @@ mod tests {
         }
     }
 
-    /// The fused decode Metal source splits at its marker (packet FUSED-KV8-a):
+    /// The fused decode Metal source splits at its marker:
     /// `native/q8_decode_attention.metal` holds exactly one marker line, both parts hold a
     /// real kernel body - each part carries its kernel's anchor lines, the partial writes of
     /// pass 1 and the output write and the global-max reduction of pass 2, not only

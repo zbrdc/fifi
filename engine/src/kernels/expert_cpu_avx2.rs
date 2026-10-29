@@ -1,15 +1,14 @@
 #![allow(unsafe_code)]
 //! AVX2 integer row dots for Q4_K weights against Q8_K rows and against per-32 group rows
-//! (the CPU tier of OFF-2 dispatches to it through `DotBackend`).
+//! (the CPU expert tier dispatches to it through `DotBackend`).
 //!
 //! Scope: the repo's second scoped intrinsics module, confined to this file by the
-//! `unsafe_is_confined_to_the_avx2_module` test. Authority: decision 0017, Addendum 2
-//! (recorded by lane M on 2026-10-13, approved by git-db, not a user ruling);
-//! Addendum 1 set the scoped-module pattern for the tiered mapped storage. What lives
-//! here: two AVX2 row dots (`q4k_q8k_row_dot_avx2` for the Q8_K grid and
-//! `q4k_q8g_row_dot_avx2` for the 32-value group grid of the device path) plus their
-//! safe entry wrappers; the safe scalar paths in `expert_cpu_q8k` and `expert_cpu_q8g`
-//! stay the references and the fallbacks, and the f32 `expert_forward` remains the overall reference.
+//! `unsafe_is_confined_to_the_avx2_module` test; the first, the tiered mapped storage,
+//! set the scoped-module pattern. What lives here: two AVX2 row dots
+//! (`q4k_q8k_row_dot_avx2` for the Q8_K grid and `q4k_q8g_row_dot_avx2` for
+//! the 32-value group grid of the device path) plus their safe entry wrappers; the safe
+//! scalar paths in `expert_cpu_q8k` and `expert_cpu_q8g` stay the references and the
+//! fallbacks, and the f32 `expert_forward` remains the overall reference.
 //!
 //! Numerics: the SIMD part computes only EXACT integers. Per 256-value block, 8 i32
 //! lanes accumulate the scale-weighted partial sums of the 8 sub-blocks: nibbles are

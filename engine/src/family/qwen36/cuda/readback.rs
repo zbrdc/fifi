@@ -1,6 +1,5 @@
-//! How the host reads one token of the resident step back, and the mode switches around it
-//! (decision 0047, packet RD-9d). No device type appears here, so the rules are tested on the CPU
-//! without a `CudaContext`.
+//! How the host reads one token of the resident step back, and the mode switches around it. No
+//! device type appears here, so the rules are tested on the CPU without a `CudaContext`.
 //!
 //! # Read-back
 //!
@@ -154,7 +153,7 @@ pub(super) fn with_host_syncs(mut report: RunReport, extra: HostSyncs) -> RunRep
     report
 }
 
-/// The report of a token that ran eagerly (RD-9d runs nothing else).
+/// The report of a token that ran eagerly.
 pub(super) fn eager_report(plan: &ReadbackPlan) -> RunReport {
     RunReport {
         capture: CaptureOutcome::default(),

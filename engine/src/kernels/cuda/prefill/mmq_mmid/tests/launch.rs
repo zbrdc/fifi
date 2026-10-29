@@ -1,14 +1,13 @@
-//! Device tests of the grouped launch (CPF-V4 G3 part 2; plan rev 3 section B.5 items 1, 3, 5, 6
-//! and 8). Every test runs one `Result`-only device phase through `rig::launch_once` (ids by the
-//! guarded builder, the scatter or gather quantize through the typed wrappers, the grouped GEMM
-//! over native Q4_K or Q6_K blocks), drops every owner, then asserts on host values. The HARD
-//! GATE comes first: `dst` is prefilled with a NaN payload, so every output must be finite
-//! before any other check, and the pad columns and the canary must still hold the prefill.
+//! Device tests of the grouped launch. Every test runs one `Result`-only device phase through
+//! `rig::launch_once` (ids by the guarded builder, the scatter or gather quantize through the typed
+//! wrappers, the grouped GEMM over native Q4_K or Q6_K blocks), drops every owner, then asserts on
+//! host values. The HARD GATE comes first: `dst` is prefilled with a NaN payload, so every output
+//! must be finite before any other check, and the pad columns and the canary must still hold the
+//! prefill.
 //!
 //! The reference is the f64 product of the host-dequantized weights with the unquantized f32
-//! activations. The bounds are the frozen per-class energy-weighted NMSE of decision 0049 A2
-//! (`CPF-M1b.md` section 9 measured 3.15e-4 / 6.17e-4 / 9.60e-4 worst on real activations); a
-//! test never sets or widens one.
+//! activations. The bounds are the frozen per-class energy-weighted NMSE (3.15e-4 / 6.17e-4 /
+//! 9.60e-4 measured worst on real activations); a test never sets or widens one.
 
 use super::rig::{
     Errors, LaunchSpec, Launched, dequantized, errors, expert_blocks, gate_dst, heavy_rows,
@@ -20,9 +19,9 @@ use crate::kernels::cuda::prefill::mmq_mmid::MmidShape;
 use crate::kernels::cuda::resident::matvec_q::QuantType;
 use crate::kernels::cuda::testkit;
 
-/// The frozen NMSE bound of a Q4_K expert gate/up launch (0049 A2, Q8X class).
+/// The frozen NMSE bound of a Q4_K expert gate/up launch (Q8X class).
 const GATE_UP_NMSE: f64 = 1e-3;
-/// The frozen NMSE bound of a Q4_K expert down launch (0049 A2, Q8X class).
+/// The frozen NMSE bound of a Q4_K expert down launch (Q8X class).
 const DOWN_NMSE: f64 = 2e-3;
 
 /// Slack after the weights of the toy: a stride in the wrong unit (floats or bytes for blocks)
@@ -129,8 +128,8 @@ fn run_cases(weights: &[u8], specs: &[LaunchSpec<'_>]) -> Result<Vec<Launched>, 
         .collect()
 }
 
-/// Gates, scores and prints every case of one Q8X class; returns the cases. `bound` None means
-/// the class is reported only (Q6_K, 0049 A4 item 3).
+/// Gates, scores and prints every case of one Q8X class; returns the cases. `bound` None means the
+/// class is reported only (Q6_K).
 fn score(
     quant: QuantType,
     weights: &[u8],
@@ -232,7 +231,7 @@ fn mmq_mmid_q8x_expert_down_stays_within_the_frozen_bound() {
         return;
     }
     // Qwen's expert down: K 512, N 2,048 per expert, the input in token-slot order gathered
-    // through ids_dst (correction C1), dst rows of 2,048 floats.
+    // through ids_dst, dst rows of 2,048 floats.
     let shape = MmidShape {
         n_experts: 16,
         m: 32,
@@ -276,9 +275,9 @@ fn mmq_mmid_q8x_q6k_expert_launches_report_their_error() {
     if !testkit::device_present("mmq_mmid_q8x_q6k_expert_launches_report_their_error") {
         return;
     }
-    // Q6_K (a ffn_down_exps layer of a Q4_K_M file can be Q6_K): no frozen bound yet (0049 A6
-    // item 4), so the numbers are printed and only the gates and finiteness are asserted. The
-    // gate/up shape scatters (D4 scales), the down shape gathers.
+    // Q6_K (a ffn_down_exps layer of a Q4_K_M file can be Q6_K): no frozen bound yet, so the
+    // numbers are printed and only the gates and finiteness are asserted. The gate/up shape
+    // scatters (D4 scales), the down shape gathers.
     let shape = MmidShape {
         n_experts: 16,
         m: 32,

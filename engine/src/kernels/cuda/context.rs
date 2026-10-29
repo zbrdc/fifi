@@ -1,6 +1,6 @@
 //! Device memory and projections behind one CUDA adapter lease.
 //!
-//! A [`CudaContext`] holds one of the two process leases (decision 0024).
+//! A [`CudaContext`] holds one of the two process leases.
 //! Every buffer it creates shares that lease, so the slot stays reserved until
 //! the context and all its buffers are gone. Context and buffers stay on the
 //! creating thread. Each native call runs inside the process dispatch guard.
@@ -23,7 +23,7 @@
 //! most the chunk limit ([`CHUNK_LIMIT`] in production) however large the
 //! tensor is. The device buffer is allocated once and each chunk lands at the
 //! byte offset of its first group. Host memory stays near twice the chunk
-//! limit, far inside the 1 GiB host bound of decision 0040.
+//! limit, far inside the 1 GiB host bound of the CUDA loader.
 //!
 //! Every context owns one activation workspace (see `workspace`): the device
 //! regions that a linear call reads its input from and writes its output to.
@@ -319,14 +319,14 @@ impl CudaContext {
         Ok(MemoryInfo { free, total })
     }
 
-    /// The driver's module loading mode (KV8-B B4'): 1 is `CU_MODULE_EAGER_LOADING` and 2 is
+    /// The driver's module loading mode: 1 is `CU_MODULE_EAGER_LOADING` and 2 is
     /// `CU_MODULE_LAZY_LOADING` (cuda.h of the build image), through the adapter's own query
     /// entry. The device-side observation point of the adapter's eager-loading constructor.
     #[cfg_attr(
         not(test),
         expect(
             dead_code,
-            reason = "the query entry of the KV8-B B4' pins, called by their tests only"
+            reason = "the query entry of the eager-loading pins, called by their tests only"
         )
     )]
     pub(crate) fn module_loading_mode(&self) -> Result<i32, EngError> {
@@ -400,6 +400,32 @@ impl CudaContext {
         }
         let raw = native::upload(bytes).map_err(device_error)?;
         Ok(self.wrap(raw))
+    }
+
+    /// Writes `bytes` into an existing device buffer at `offset` (the
+    /// prefix snapshot restore refills planes without reallocating).
+    pub(crate) fn upload_at(
+        &self,
+        buffer: &DeviceBuffer,
+        offset: usize,
+        bytes: &[u8],
+    ) -> Result<(), EngError> {
+        self.ensure_usable()?;
+        graph::ensure_closed("an upload")?;
+        let raw = self.owned(buffer)?;
+        let in_range = offset
+            .checked_add(bytes.len())
+            .is_some_and(|end| end <= raw.bytes());
+        if bytes.is_empty() || !in_range {
+            return Err(EngError::BadRequest(format!(
+                "cuda upload of {} bytes at {} into a buffer of {} bytes",
+                bytes.len(),
+                offset,
+                raw.bytes()
+            )));
+        }
+        let _dispatch = self.enter()?;
+        native::upload_at(raw, offset, bytes).map_err(device_error)
     }
 
     /// Copies a device buffer back to the host. `out` must not be longer than
@@ -630,7 +656,7 @@ impl CudaContext {
 
     /// Synchronously computes one BF16 matvec from a resident code buffer.
     /// The device widens the stored 16-bit codes, so the host never
-    /// materializes the F32 matrix (M2 rule).
+    /// materializes the F32 matrix.
     pub(crate) fn bf16_matvec(
         &self,
         codes: &DeviceBuffer,
@@ -852,7 +878,7 @@ impl CudaContext {
 
     /// Synchronously computes one F8_E4M3 matvec from a resident code buffer.
     /// The device decodes the stored codes, so the host never materializes the
-    /// F32 matrix (M2 rule: no F32 weight materialization on host or device).
+    /// F32 matrix (no F32 weight materialization on host or device).
     pub(crate) fn f8_matvec(
         &self,
         codes: &DeviceBuffer,
@@ -1101,7 +1127,8 @@ impl Drop for DeviceBuffer {
     }
 }
 
-/// Frees one allocation under decision 0022, for `Drop` and for the frees a capture window kept.
+/// Frees one allocation, for `Drop` and for the frees a capture window kept. A failed free is
+/// terminal: it latches the backend, and after that no free runs.
 fn release_buffer(raw: RawDevice) {
     let _dispatch = DispatchGuard::enter(&TERMINAL);
     // The context may be poisoned after a terminal failure. `RawDevice` has
@@ -1249,7 +1276,7 @@ fn checked_tiled(tensor: QuantTensor<'_>) -> Result<Tiled, EngError> {
 }
 
 /// Rejects a Q6_K tensor whose `d * scale` would overflow the fp16 scale of
-/// the repacked tile (REPLY-17 item 1). The vendored repack would store
+/// the repacked tile. The vendored repack would store
 /// infinity there. `CudaProjector::load` runs it for every Q6_K tensor
 /// before the first upload, so `upload_tiled` does not repeat it.
 ///
@@ -1283,7 +1310,7 @@ pub(crate) fn check_q6k_scales(
 const Q8_0_BLOCK_BYTES: usize = 34;
 
 /// Rejects a Q8_0 tensor whose `d * q` would leave the fp16 range when the
-/// device dequantizes it (REPLY-20 item 3): `|d| * max|q| > 65504` over the
+/// device dequantizes it: `|d| * max|q| > 65504` over the
 /// block's quants, with `q = -128` counted as 128, or a NaN or infinite `d`.
 /// `CudaProjector::load` runs it for every Q8_0 tensor before the first upload.
 ///
@@ -1319,9 +1346,9 @@ const Q5_0_BLOCK_BYTES: usize = 22;
 const Q5_0_MAX_QUANT: f32 = 16.0;
 
 /// Rejects a Q5_0 tensor whose `(q5 - 16) * d` would leave the fp16 range when the device
-/// dequantizes it (MEL-C1b, B-L4): `16 |d| > 65504`, or a NaN or infinite `d`. The quants are
-/// unconstrained, so the bound is on `d` alone (`|d| <= 4094`). `CudaProjector::load` runs it
-/// for every Q5_0 tensor before the first upload.
+/// dequantizes it: `16 |d| > 65504`, or a NaN or infinite `d`. The quants are unconstrained,
+/// so the bound is on `d` alone (`|d| <= 4094`). `CudaProjector::load` runs it for every Q5_0
+/// tensor before the first upload.
 ///
 /// `blocks` may be one chunk of the tensor that starts at block `first_block`; the error names
 /// the block by its index from the start of the tensor.
@@ -1359,7 +1386,7 @@ pub(crate) fn f16_to_f32(bits: u16) -> f32 {
 
 /// Repacks one chunk of whole groups into `staging`. Q5_0 is a host byte
 /// permutation; the other types go through the vendored repack. A future
-/// repack-time conversion (MEL-C2) is a new arm here, never a decode-path branch.
+/// repack-time conversion is a new arm here, never a decode-path branch.
 fn repack_chunk(
     name: &str,
     part: Tiled,
@@ -1373,7 +1400,7 @@ fn repack_chunk(
 }
 
 /// A repack failure is an adapter rejection or exception, which is terminal
-/// (decision 0040 item 9) even though no CUDA call ran.
+/// even though no CUDA call ran.
 fn repack_error(name: &str, status: c_int) -> EngError {
     match native_error(&TERMINAL, ADAPTER_OPERATION, status) {
         EngError::Backend { operation, message } => EngError::Backend {
@@ -1437,12 +1464,13 @@ fn row_range(tiled: Tiled, first: usize, rows: usize) -> Result<(Tiled, usize), 
 
 /// `BadRequest` unless a Q5_0 weight is asked for 1 to 16 tokens, the most its decode kernel takes.
 /// Raised in Rust before any native call, because a native rejection latches the backend
-/// terminal. Other types are unaffected. Prefill on a Q5_0 weight waits for the MMQ read patch (V-5b).
+/// terminal. Other types are unaffected. Prefill on a Q5_0 weight waits for a Q5_0 read in the
+/// vendored MMQ.
 fn check_q5_0_tokens(ty: TiledType, tokens: usize) -> Result<(), EngError> {
     if ty == TiledType::Q50 && !(1..=MAX_DENSE_TOKENS).contains(&tokens) {
         return Err(EngError::BadRequest(format!(
             "the CUDA Q5_0 decode matmul takes 1 to {MAX_DENSE_TOKENS} tokens, got {tokens}; \
-             prefill is V-5b"
+             Q5_0 prefill is not supported"
         )));
     }
     Ok(())

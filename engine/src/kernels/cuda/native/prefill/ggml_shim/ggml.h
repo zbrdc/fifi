@@ -1,4 +1,4 @@
-// Fifi shadow header for the vendored llama.cpp MMQ sources (engine/vendor/ggml-cuda-mmq; decision 0049, CPF-V2).
+// Fifi shadow header for the vendored llama.cpp MMQ sources (engine/vendor/ggml-cuda-mmq).
 // This is glue, not a patched vendor file: it stands in for ggml/include/ggml.h.
 // Text marked "derived" is copied from that file at llama.cpp acecd56032ddc34bada14a2d978f110d9c987095 (MIT, Copyright (c) 2023-2026
 // The ggml authors; engine/vendor/ggml-cuda-mmq/LICENSE has the notice).
@@ -22,9 +22,9 @@ __host__ __device__ constexpr inline void ggml_unused_vars_impl(Args&&...) noexc
 
 #define GGML_PAD(x, n) (((x) + (n) - 1) & ~((n) - 1)) // derived; n must be a power of two
 
-// derived: copied verbatim from ggml/include/ggml.h at the pin (MATVEC-PAR S1 c1); the GLU switch
-// of the vendored mul_mat_vec_q kernels and the fusion struct name the op. Nothing else of the
-// upstream enum block is carried.
+// derived: copied verbatim from ggml/include/ggml.h at the pin; the GLU switch of the vendored
+// mul_mat_vec_q kernels and the fusion struct name the op. Nothing else of the upstream enum block
+// is carried.
 enum ggml_glu_op {
     GGML_GLU_OP_REGLU,
     GGML_GLU_OP_GEGLU,

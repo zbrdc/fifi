@@ -25,17 +25,16 @@ struct Slot<S> {
     ready: bool,
     finished: bool,
     slow: bool,
-    /// Whether the eviction restart already ran for this slot (fix EV-1): a restarted
-    /// slot saves nothing. Later denials are NOT final by that alone (review round 4,
-    /// MF1): they evict one more entry and restart again - final only through
-    /// `exhausted_restart` below, the classify gate, or a failing rebuild.
+    /// Whether the eviction restart already ran for this slot: a restarted slot saves
+    /// nothing. Later denials are NOT final by that alone: they evict one more entry and
+    /// restart again - final only through `exhausted_restart` below, the classify gate, or
+    /// a failing rebuild.
     retried: bool,
-    /// Whether the store was already EXHAUSTED for this slot and the unclassified
-    /// no-save restart was taken anyway (round 4e MF1): a persistent denial that no
-    /// eviction has relieved since must not restart again - the next exhausted denial
-    /// classifies regardless of the ceiling, exactly one bounded recovery. Any
-    /// successful eviction resets it, so contention that frees entries keeps its
-    /// sized restarts.
+    /// Whether the store was already EXHAUSTED for this slot and the unclassified no-save
+    /// restart was taken anyway: a persistent denial that no eviction has relieved since
+    /// must not restart again - the next exhausted denial classifies regardless of the
+    /// ceiling, exactly one bounded recovery. Any successful eviction resets it, so
+    /// contention that frees entries keeps its sized restarts.
     exhausted_restart: bool,
 }
 
@@ -109,8 +108,8 @@ fn cancelled<S>(slot: &mut Slot<S>) {
 
 /// Rebuilds a slot's prefill state from a reset session: restore, boundary, save points,
 /// cursor, and usage. A prefill piece that was denied leaves the session partially fed -
-/// the pending token taken, earlier split parts published - so the eviction restart (fix
-/// EV-1) must rebuild the slot the way `admit` built it, never re-feed the failed piece.
+/// the pending token taken, earlier split parts published - so the eviction restart must
+/// rebuild the slot the way `admit` built it, never re-feed the failed piece.
 fn setup_slot<E: ExecutorOps>(
     executor: &mut E,
     slot: &mut Slot<E::Session>,
@@ -136,7 +135,7 @@ fn setup_slot<E: ExecutorOps>(
         root: slot.job.root_boundary,
     };
     slot.points = if slot.retried {
-        // The eviction restart admits the prompt with no save points (review round 2, MF1):
+        // The eviction restart admits the prompt with no save points:
         // a snapshot that charges successfully at its own point can still starve the
         // prefill tail that follows it, so a restarted slot never saves.
         VecDeque::new()
@@ -208,27 +207,24 @@ fn admit<E: ExecutorOps>(
     match build_slot(executor, seed, job, prefill_chunk) {
         Ok(slot) => Ok(slot),
         Err((EngError::MemoryPlan(message), job_back)) => {
-            // Fix EV-1 for admission itself, incrementally: `new_session` charges fixed
-            // state and the restore charges its entry before any prefill runs, so cached
-            // entries can block the admission of any session at all. Evict ONE entry at a
-            // time - a dead tip first, oldest first, this prompt's own restore candidate
-            // last (review round 4, MF2/MF3) - and rebuild after each, so a denial with a
-            // one-entry deficit costs
-            // one anchor, not every live lineage (the replay's t6 cliff). This admission
-            // path is NOT ceiling-sized (round 4d SF-3): no session exists yet to measure
-            // a ceiling from, and `new_session`'s charge arithmetic bounds each rebuild
-            // tightly, so the one-entry-per-rebuild loop here is the sized form for this
-            // path. When the last
-            // entry is gone and the build still denies, the refusal is not about this
+            // The eviction restart for admission itself, incrementally: `new_session`
+            // charges fixed state and the restore charges its entry before any prefill
+            // runs, so cached entries can block the admission of any session at all. Evict
+            // ONE entry at a time - a dead tip first, oldest first, this prompt's own
+            // restore candidate last - and rebuild after each, so a denial with a one-entry
+            // deficit costs one anchor, not every live lineage. This admission path is NOT
+            // ceiling-sized: no session exists yet to measure a ceiling from, and
+            // `new_session`'s charge arithmetic bounds each rebuild tightly, so the
+            // one-entry-per-rebuild loop here is the sized form for this path. When the
+            // last entry is gone and the build still denies, the refusal is not about this
             // prompt - no session survives to measure a ceiling from - so the memory-plan
             // refusal stands as-is. The denial belongs to no live session, so the eviction
-            // protects the entry THIS prompt would restore next (review round 4, MF2) -
-            // never the store-global last-restore marker, which names ANOTHER conversation
-            // in an interleaved batch.
+            // protects the entry THIS prompt would restore next - never the store-global
+            // last-restore marker, which names ANOTHER conversation in an interleaved
+            // batch.
             let protect = executor.restore_candidate(&job_back.prompt);
-            // Terminal when nothing can be freed (review round 4, MF2 / Sol round 2,
-            // MF2): an empty store cannot admit a rebuild either, so the refusal stands
-            // as-is instead of one dead `build_slot`.
+            // Terminal when nothing can be freed: an empty store cannot admit a rebuild
+            // either, so the refusal stands as-is instead of one dead `build_slot`.
             if executor.evict_one_prefix_entry(protect).is_none() {
                 return Err(EngError::MemoryPlan(message));
             }
@@ -237,11 +233,10 @@ fn admit<E: ExecutorOps>(
             loop {
                 match retried {
                     Ok(slot) => {
-                        // The admission retry spent this request's first eviction (review
-                        // round 2, low): mark it retried, so the slot - like every retried
-                        // slot - saves nothing. It MAY still evict incrementally on a later
-                        // denial (review round 4, MF1): the first denial freed one entry,
-                        // and the next may need only one more.
+                        // The admission retry spent this request's first eviction: mark it
+                        // retried, so the slot - like every retried slot - saves nothing.
+                        // It MAY still evict incrementally on a later denial: the first
+                        // denial freed one entry, and the next may need only one more.
                         return Ok(Slot {
                             retried: true,
                             points: VecDeque::new(),
@@ -399,47 +394,43 @@ pub(super) fn work<E: ExecutorOps>(
                         return;
                     }
                     if let EngError::MemoryPlan(_) = error {
-                        // Fix EV-1 in the batched path: evict the LRU prefixes once and
-                        // rebuild the slot from a reset session - re-feeding the denied
+                        // The eviction restart in the batched path: evict the LRU prefixes once
+                        // and rebuild the slot from a reset session - re-feeding the denied
                         // piece would corrupt it, because the denial left it partially fed.
-                        // The eviction is INCREMENTAL
-                        // (review round 4, MF1): a retried slot's later denial evicts one
-                        // more entry and restarts again - the first denial freed one entry,
-                        // the next may need only one more - until an admission fits or no
-                        // entry remains; the refusal then reaches the client as the
+                        // The eviction is INCREMENTAL: a retried slot's later denial evicts
+                        // one more entry and restarts again - the first denial freed one
+                        // entry, the next may need only one more - until an admission fits
+                        // or no entry remains; the refusal then reaches the client as the
                         // over-length form only when the pool's ceiling honestly explains
-                        // it (fix EV-2). The eviction protects THIS slot's restored anchor
-                        // - the denial belongs to it, not to whichever conversation restored
-                        // last (review round 4, MF2). The restart saves nothing (retried).
-                        // Recovery after EXHAUSTION is once-only (round 4e MF1): the
-                        // second denial that no eviction relieved classifies, so a
-                        // persistent denial the ceiling does not explain can never
-                        // restart forever. Only this slot leaves; the batch's other slots
-                        // keep decoding. A retry-time native failure fails the engine
-                        // exactly like a first-attempt one.
+                        // it. The eviction protects THIS slot's restored anchor: the denial
+                        // belongs to it, not to whichever conversation restored last. The
+                        // restart saves nothing (retried). Recovery after EXHAUSTION is
+                        // once-only: the second denial that no eviction relieved
+                        // classifies, so a persistent denial the ceiling does not explain
+                        // can never restart forever. Only this slot leaves; the batch's
+                        // other slots keep decoding. A retry-time native failure fails the
+                        // engine exactly like a first-attempt one.
                         slots[index].retried = true;
-                        // Size the eviction before the ONE restart (round 4c, R4-MF2,
-                        // mirroring the single worker's SF2 pre-pass): evict while the
-                        // pool's honest ceiling still cannot admit this whole prompt, so a
-                        // k-entry deficit costs ONE restart - not k partial prefills, each
-                        // re-feeding every piece since the restore point (the 4-agent
-                        // replay runs this batch path: k restarts at ~31K re-prefill each
-                        // beat the base's one clear-all from k ~ 3). The loop's first
-                        // `None` is the MF1 terminal check (review round 4): no restart
-                        // can ever admit, so the refusal classifies now. A `None` ceiling
-                        // sizes nothing: stop after ONE eviction and let the residual
-                        // one-at-a-time loop below spend more as denials recur - never a
-                        // clear-all.
+                        // Size the eviction before the ONE restart, mirroring the single
+                        // worker's pre-pass: evict while the pool's honest ceiling still
+                        // cannot admit this whole prompt, so a k-entry deficit costs ONE
+                        // restart - not k partial prefills, each re-feeding every piece
+                        // since the restore point (multi-agent traffic runs this batch
+                        // path: at ~31K tokens of re-prefill each, k restarts cost more
+                        // than one clear-all from k ~ 3). The loop's first `None` is the
+                        // terminal check: no restart can ever admit, so the refusal
+                        // classifies now. A `None` ceiling sizes nothing: stop after ONE
+                        // eviction and let the residual one-at-a-time loop below spend more
+                        // as denials recur - never a clear-all.
                         let mut terminal = false;
-                        // Round 4e MF1: a store already exhausted for THIS slot whose
-                        // no-save restart did not admit the piece would spin forever on
-                        // a persistent denial the ceiling does not explain (a save
-                        // charge, an invariant, a growth overflow): the restart
-                        // re-enters this branch, the empty store's eviction returns
-                        // None again, and the fitting ceiling defers classification.
-                        // Exhausted TWICE = final: classify now, `classified` passing
-                        // the raw MemoryPlan through when the ceiling explains nothing -
-                        // the single worker's fallback shape.
+                        // A store already exhausted for THIS slot whose no-save restart did
+                        // not admit the piece would spin forever on a persistent denial the
+                        // ceiling does not explain (a save charge, an invariant, a growth
+                        // overflow): the restart re-enters this branch, the empty store's
+                        // eviction returns None again, and the fitting ceiling defers
+                        // classification. Exhausted TWICE = final: classify now,
+                        // `classified` passing the raw MemoryPlan through when the ceiling
+                        // explains nothing - the single worker's fallback shape.
                         let exhausted_once = slots[index].exhausted_restart;
                         loop {
                             let protect = match executor.restored_anchor_of(&slots[index].session) {
@@ -465,13 +456,12 @@ pub(super) fn work<E: ExecutorOps>(
                         }
                         if terminal {
                             // Classify only when the ceiling PROVES the piece cannot fit
-                            // (the honest over-length form, fix EV-2); an exhausted
-                            // store whose denial was a save charge with room to grow -
-                            // the Sol r4 MF1 shape - still takes the ONE no-save restart
-                            // below, mirroring the single worker's gated classify
-                            // (round 4d, Sol r3 MF1) - but only ONCE (round 4e MF1): a
-                            // second exhausted denial is final even when the ceiling
-                            // fits, or a persistent denial restarts forever.
+                            // (the honest over-length form); an exhausted store whose
+                            // denial was a save charge with room to grow still takes the
+                            // ONE no-save restart below, mirroring the single worker's
+                            // gated classify - but only ONCE: a second exhausted denial is
+                            // final even when the ceiling fits, or a persistent denial
+                            // restarts forever.
                             let fits_not = executor
                                 .pool_prompt_ceiling(&slots[index].session)
                                 .is_some_and(|ceiling| {

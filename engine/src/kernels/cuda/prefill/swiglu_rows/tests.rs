@@ -1,23 +1,22 @@
-//! Seam-1 tests of the swiglu_rows wrapper (CPF-7a part 1; CPF-V4-CPF7-PLAN section C.2, N2;
-//! decision 0049 item 15). The plan's list: (1) the f64 reference under SW0, with the
-//! finiteness clause to |g| = 88 and the flush-to-zero cases reported; (2) the layout rows with
-//! canaries in the gaps; (3) shapes of 1, 7 and 16,384 rows; (4) bit equality of two runs; (5)
-//! canaries around `act` (every value test checks every byte of the act buffer); (6) the refusal
-//! tables, each guard reached and asserted by its own text. Lane C adds the numerics row against
-//! the decode path's `swiglu_q8` and the NaN/inf pass-through row.
+//! Tests of the swiglu_rows wrapper: (1) the f64 reference under SW0, with the finiteness clause to
+//! |g| = 88 and the flush-to-zero cases reported; (2) the layout rows with canaries in the gaps;
+//! (3) shapes of 1, 7 and 16,384 rows; (4) bit equality of two runs; (5) canaries around `act`
+//! (every value test checks every byte of the act buffer); (6) the refusal tables, each guard
+//! reached and asserted by its own text; plus the numerics row against the decode path's
+//! `swiglu_q8` and the NaN/inf pass-through row.
 //!
-//! SW0 (decision 0049 A5 item 3 and A6 item 3, PROVISIONAL until this packet's measured maximum
-//! freezes it): relative error at most 2^-18 against the f64 `silu(g) * u` of the f32 inputs for
-//! |g| <= 12, normal inputs and a normal exact value; a finite output for |g| <= 88. A case where
-//! flush-to-zero fires is reported with its absolute error and not graded. The bound is lane M's,
-//! not set here; the tests print the measured maximum on lines that start with SWIGLU-REPORT.
+//! SW0 (PROVISIONAL until a measured maximum freezes it): relative error at most 2^-18 against the
+//! f64 `silu(g) * u` of the f32 inputs for |g| <= 12, normal inputs and a normal exact value; a
+//! finite output for |g| <= 88. A case where flush-to-zero fires is reported with its absolute
+//! error and not graded. The bound is not set here; the tests print the measured maximum on lines
+//! that start with SWIGLU-REPORT.
 //!
-//! Device-test structure (the S3b lesson): every device phase is `Result`-only (only `?` while a
-//! device owner lives), every owner is dropped, then the asserts run on host `Vec`s. The tests run
-//! with `--test-threads=1`. Lane C's merge gate: after the device phase and before any bound
-//! check, every output value is asserted finite ([`assert_finite`]; the NaN/inf row asserts its
-//! exact non-finite bits instead). `act` is prefilled with a NaN pattern, so an output the kernel
-//! never wrote fails that gate, which a max-of-deltas judge (`f64::max` drops NaN) could not see.
+//! Device-test structure: every device phase is `Result`-only (only `?` while a device owner
+//! lives), every owner is dropped, then the asserts run on host `Vec`s. The tests run with
+//! `--test-threads=1`. The finiteness gate: after the device phase and before any bound check,
+//! every output value is asserted finite ([`assert_finite`]; the NaN/inf row asserts its exact
+//! non-finite bits instead). `act` is prefilled with a NaN pattern, so an output the kernel never
+//! wrote fails that gate, which a max-of-deltas judge (`f64::max` drops NaN) could not see.
 //!
 //! Argued, not tested: the `rows` and `n_ff` i32 refusals of `check_shape` (their range rules come
 //! first and lie far below i32::MAX); the wrapper's `size` refusal (after `check_shape` every factor
@@ -215,7 +214,7 @@ struct Worst {
     graded: usize,
 }
 
-/// Lane C's merge gate, run after the device phase and before any bound check: EVERY output value
+/// The finiteness gate, run after the device phase and before any bound check: EVERY output value
 /// (row r < rows, column c < n_ff of an act range that starts at PAD) is finite. An output the
 /// kernel never wrote keeps the NaN fill and fails here, so no max-of-deltas judge can drop it.
 fn assert_finite(shape: &SwigluRowsShape, act: &[u8], what: &str) {
@@ -741,7 +740,7 @@ fn swiglu_rows_refuses_foreign_buffers_and_streams() {
     }
 }
 
-// ---- lane C's rows: swiglu_q8 and NaN/inf ---------------------------------------------------
+// ---- the swiglu_q8 and NaN/inf rows ---------------------------------------------------------
 
 /// The most two SW0-bounded values of one exact product differ by, relative to either one:
 /// 2 * 2^-18 / (1 - 2^-18).
@@ -815,9 +814,9 @@ fn assert_block_in_window(x: &[f32; 32], stored: &[u8], block: usize, tally: &mu
     tally.s += usize::from(stored[2..4] != host[2..4]);
 }
 
-/// Lane C's numerics row against the decode path's SwiGLU, `swiglu_q8` (MATVEC-PAR S3a K2:
-/// `x / (1 + __expf(-x))` with IEEE division, no flush to zero, then the q8_1 block rule in IEEE
-/// arithmetic). swiglu_q8 stores only q8_1 blocks, never its f32 value, so the f32 outputs cannot
+/// The numerics row against the decode path's SwiGLU, `swiglu_q8` (`x / (1 + __expf(-x))`
+/// with IEEE division, no flush to zero, then the q8_1 block rule in IEEE arithmetic).
+/// swiglu_q8 stores only q8_1 blocks, never its f32 value, so the f32 outputs cannot
 /// be compared directly. The design: both kernels run on the SAME device gu bytes (the Qwen
 /// layout, 2,048 rows; swiglu_q8 in launches of 8 slots), and the host passes swiglu_rows' f32
 /// outputs x through `q8_ref::block`, the byte-exact host form of swiglu_q8's block rule. Where
@@ -933,7 +932,7 @@ const SPECIALS: [(f32, f32); 18] = [
 /// arithmetic, whatever the payload of the input NaN.
 const DEVICE_NAN: u32 = 0x7fff_ffff;
 
-/// Lane C's pass-through row: NaN and infinities in g or u come out as IEEE evaluates the
+/// The pass-through row: NaN and infinities in g or u come out as IEEE evaluates the
 /// expression `g / (1 + exp(-g)) * u` in f32 (exp(+inf) = inf, -inf / inf = NaN, 0 * inf = NaN,
 /// inf * u = +-inf), asserted bit for bit: an infinity with its sign, a NaN as the device's
 /// canonical NaN.

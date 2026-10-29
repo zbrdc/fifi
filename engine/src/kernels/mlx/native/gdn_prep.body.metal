@@ -1,7 +1,7 @@
 // gdn_prep -- ONE kernel for the whole DeltaNet pre-recurrence chain of prefill/delta.rs::chunk:
 //   causal conv (ring + 3 taps + last tap) -> silu -> split q|k|v -> L2 norm of q and k -> gates g and beta -> new ring.
 // Replaces ~35 MLX kernels and ~1 GB of F32 round trips per 1024-row layer chunk (see REPORT.md).
-// Written for fifi; design reference only: llama.cpp / mlx-lm gated-delta decode kernels (no code copied).
+// Written for fifi, following the llama.cpp and mlx-lm gated-delta decode kernels.
 //
 // Rounding mirrors the unfused op sequence: every product and every sum is rounded to F32 separately
 // (fp contract off), sigmoid / logaddexp / exp use the same Metal functions as MLX's unary / binary kernels;

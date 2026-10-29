@@ -5,7 +5,7 @@
 //! `|gpu - exact| / max(|exact|, 1)` against the f64 formula is printed as information. Tables are
 //! built from random blocks with normal, subnormal, +0 and -0 scales and fixed `Rng` seeds, so no
 //! test reads an oracle file or an environment variable. The device tests assume
-//! `--test-threads=1` (decision 0040).
+//! `--test-threads=1`.
 
 use super::{
     EMBED_MAX_TOKENS, EmbedCall, EmbedNativeCall, check_host_ids, check_native_shape, check_shape,
@@ -722,7 +722,7 @@ fn embed_is_deterministic() {
     }
 }
 
-// --- MATVEC-PAR S2 c3: the native Q4_K gather -----------------------------------
+// --- the native Q4_K gather -----------------------------------
 
 /// Uploads a Q4_K table's source blocks natively: the bytes land as the file holds them.
 fn native_table(ctx: &CudaContext, n_rows: usize, k: usize, source: &[u8]) -> NativeWeight {
@@ -930,7 +930,7 @@ fn q8_0_native(ctx: &CudaContext) -> NativeWeight {
 }
 
 /// A Q4_K native weight of 8 rows marked as a 4-expert stack: the gather refuses it (an
-/// embedding table is a plain matrix; KUBDAN-MSG-68 item 7).
+/// embedding table is a plain matrix).
 fn native_stack(ctx: &CudaContext) -> NativeWeight {
     let source = vec![0_u8; 8 * 2 * 144];
     let tensor = QuantTensor {
@@ -951,8 +951,8 @@ fn native_stack(ctx: &CudaContext) -> NativeWeight {
 #[test]
 fn native_shape_and_blocks_bytes_rules_need_no_device() {
     // `check_native_shape` has no 8-row rule: one row and 12 rows are gather shapes, and
-    // the bound is inclusive at 2^28 rows (KUBDAN-MSG-68 item 6; the tiled twin refuses
-    // 12 rows and stops at a multiple of 8).
+    // the bound is inclusive at 2^28 rows (the tiled twin refuses 12 rows and stops at a
+    // multiple of 8).
     check_native_shape(1, 256).expect("one row");
     check_native_shape(12, 256).expect("12 rows: no 8-row rule");
     check_native_shape(1 << 28, 256).expect("the largest table");
@@ -1021,8 +1021,8 @@ fn embed_native_rejects_bad_calls_before_any_launch() {
     let before = snapshot();
     let w = &native;
     // Every case reaches its OWN guard of `plan_embed_native` with every earlier check
-    // satisfied (the S2b lesson): the three ranges resolve first, the type second, then the
-    // m range, the ids/x/status fits and alignments in order, and the five overlap checks.
+    // satisfied: the three ranges resolve first, the type second, then the m range, the
+    // ids/x/status fits and alignments in order, and the five overlap checks.
     let try_call = |weight: &NativeWeight,
                     m,
                     ids: DeviceRange<'_>,
@@ -1197,9 +1197,9 @@ fn native_gather_is_deterministic_and_takes_one_token() {
     assert_eq!(count, table.k, "{NAME}");
 }
 
-// ---------------------------------------------------------------- T6 (RD-11a)
+// ---------------------------------------------------------------- T6: graph capture
 
-/// The capture plan of the owed test: the rig owns every buffer, so no pin and no hold.
+/// The capture plan of the capture test: the rig owns every buffer, so no pin and no hold.
 fn no_pins() -> CapturePlan<'static> {
     CapturePlan {
         pins: &[],
@@ -1207,11 +1207,11 @@ fn no_pins() -> CapturePlan<'static> {
     }
 }
 
-/// T6 (RD-4c, owed): one captured `embed` replayed with the id rewritten between replays (7,
-/// 511, -1, 300, 512 over a table of exactly 512 rows) reads the new id every time: each replay
-/// equals the eager launch at that id bit for bit, and the status word (which the rig CLEARS
-/// between replays, because `embed` ORs bit 4 and never clears it) holds bit 4 exactly for the
-/// two ids outside the table, -1 and 512.
+/// T6: one captured `embed` replayed with the id rewritten between replays (7, 511, -1, 300,
+/// 512 over a table of exactly 512 rows) reads the new id every time: each replay equals the
+/// eager launch at that id bit for bit, and the status word (which the rig CLEARS between
+/// replays, because `embed` ORs bit 4 and never clears it) holds bit 4 exactly for the two ids
+/// outside the table, -1 and 512.
 #[test]
 fn embed_inside_a_capture_reads_the_new_id_between_replays() {
     if !testkit::device_present("embed_inside_a_capture_reads_the_new_id_between_replays") {

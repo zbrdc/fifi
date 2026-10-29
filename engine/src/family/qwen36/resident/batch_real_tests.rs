@@ -448,13 +448,13 @@ fn compiled_device_teacher_forced_identity_covers_all_row_sizes_and_growth() {
 }
 
 #[test]
-#[ignore = "real weights: fresh MAC-GO and Q36_CKPT_DIR required; correctness only"]
+#[ignore = "real weights: Q36_CKPT_DIR required; correctness only"]
 fn real_weights_bf16_teacher_forced_distinct_prompts() {
     real_identity(false);
 }
 
 #[test]
-#[ignore = "real weights: fresh MAC-GO and Q36_CKPT_DIR required; compiled ON/OFF correctness only"]
+#[ignore = "real weights: Q36_CKPT_DIR required; compiled ON/OFF correctness only"]
 fn real_weights_compiled_device_identity_vs_off() {
     real_identity(true);
 }

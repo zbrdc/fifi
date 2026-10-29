@@ -1,6 +1,5 @@
 //! Tests of `add_rmsnorm_q8` (seam 1: the Rust wrapper against the C entry against the
-//! `add_rmsnorm_q8_k` kernel). Device tests assume `--test-threads=1` (decision 0040) and run on
-//! the 4050 queue through lane L (KUBDAN-MSG-67 condition 6).
+//! `add_rmsnorm_q8_k` kernel). Device tests assume `--test-threads=1`.
 //!
 //! The kernel's group is the warnings-into-errors build WITHOUT `-use_fast_math`, so both outputs
 //! are exact against the right host reference: `norm_out` against the kernel's reduction order
@@ -32,7 +31,7 @@ pub(in crate::kernels::cuda) fn butterfly32(lanes: &mut [f32; 32]) {
     }
 }
 
-/// The host restatement of the producer kernels' q8_1 block rule (MATVEC-PAR S3a): `amax` over
+/// The host restatement of the producer kernels' q8_1 block rule: `amax` over
 /// `fabsf` with `fmaxf` NaN-skipping semantics, `d = amax/127` (IEEE division), `q = amax == 0 ?
 /// 0 : roundf(x/d)` (roundf rounds halfway cases away from zero; a NaN casts to 0 like the PTX
 /// cvt), and `ds` = the halves of `d` and of the butterfly sum. The producers run in the
@@ -257,8 +256,8 @@ fn add_rmsnorm_q8_matches_the_host_reference() {
     let eps = 1e-6f32;
     let mut rng = testkit::Rng::new(0x5eed_a17e);
     // Random rows at the three widths (Qwen 2048 and 4096, Mellum 2304 with its padded tail of
-    // eight zero blocks), then the special rows the packet names at n 2048: all-zero, one
-    // outlier, denormal-small.
+    // eight zero blocks), then the special rows at n 2048: all-zero, one outlier,
+    // denormal-small.
     // (name, h, delta, weight) of one row.
     type Case = (&'static str, Vec<f32>, Option<Vec<f32>>, Vec<f32>);
     let mut cases: Vec<Case> = Vec::new();
@@ -278,8 +277,8 @@ fn add_rmsnorm_q8_matches_the_host_reference() {
     h[1000] = outlier;
     cases.push(("outlier", h, Some(delta), w.clone()));
     // Denormal-small WITHOUT delta: with delta the add lifts the row to normal magnitude and
-    // the row proves nothing denormal (lane C K1 MINOR-3); alone, 4.2e-40 squares underflow to
-    // zero, so the norm is rsqrtf(eps) * h * w and the q8 scales round to zero halves.
+    // the row proves nothing denormal; alone, 4.2e-40 squares underflow to zero, so the norm is
+    // rsqrtf(eps) * h * w and the q8 scales round to zero halves.
     let denormal = 4.2e-40f32;
     cases.push(("denormal-small", vec![denormal; n], None, w));
     for (name, h, delta, w) in cases {
@@ -326,8 +325,8 @@ fn add_rmsnorm_q8_matches_the_host_reference() {
     }
 }
 
-/// The byte counts `plan_add_rmsnorm_q8` checks a call against (KUBDAN-MSG-64 item 6, mutant S4):
-/// `n` floats for each f32 range and the padded `block_q8_1` row for `q8`.
+/// The byte counts `plan_add_rmsnorm_q8` checks a call against: `n` floats for each f32 range and
+/// the padded `block_q8_1` row for `q8`.
 #[test]
 fn add_rmsnorm_q8_needs_are_pure_and_exact() {
     let need = add_rmsnorm_q8_needs(2048).expect("sizes");
@@ -387,10 +386,9 @@ fn add_rmsnorm_q8_with_and_without_delta() {
     assert_eq!(q8_pre, q8_yes, "the q8_1 rows of the two forms are equal");
 }
 
-/// A1 semantics (KUBDAN-MSG-67 condition 3): a NaN row reaches the producer; `norm_out` is NaN
-/// the way `add_norm_pack_k` writes it today (one NaN value poisons the sum of squares, so every
-/// norm value is NaN), the q8_1 blocks carry NaN scales (d and s) with zero codes, and nothing
-/// outside the outputs moves.
+/// NaN semantics: a NaN row reaches the producer; `norm_out` is NaN the way `add_norm_pack_k`
+/// writes it today (one NaN value poisons the sum of squares, so every norm value is NaN), the
+/// q8_1 blocks carry NaN scales (d and s) with zero codes, and nothing outside the outputs moves.
 #[test]
 fn add_rmsnorm_q8_propagates_a_nan_row() {
     if !testkit::device_present("add_rmsnorm_q8_propagates_a_nan_row") {
@@ -542,10 +540,10 @@ fn attempt(rig: &RefusalRig, other: &OtherContext, spec: Spec) -> Result<(), cra
     )
 }
 
-/// KUBDAN-MSG-64 item 6 for `plan_add_rmsnorm_q8`: every refusal is a `BadRequest` with the text
-/// of its own check, nothing is queued, the backend stays usable, the valid call of the same rig
-/// runs, and a second valid call with delta and weight on one buffer runs too (the plan never
-/// compares the two read ranges).
+/// For `plan_add_rmsnorm_q8`, every refusal is a `BadRequest` with the text of its own check,
+/// nothing is queued, the backend stays usable, the valid call of the same rig runs, and a second
+/// valid call with delta and weight on one buffer runs too (the plan never compares the two read
+/// ranges).
 #[test]
 fn add_rmsnorm_q8_rejects_unsound_calls_before_launching() {
     if !testkit::device_present("add_rmsnorm_q8_rejects_unsound_calls_before_launching") {
@@ -749,10 +747,11 @@ fn parse_block(bytes: &[u8], at: usize) -> (f32, f32, [i8; 32]) {
     (half(0), half(2), qs)
 }
 
-/// The fused producer's q8_1 row against S1's `quantize_q8_1` on the same f32 `norm_out`: the
-/// vendored quantizer is built with `-use_fast_math`, so the rows are NOT byte-equal; the test
-/// asserts the S1 invariants (d and s within one half code of the IEEE reference, codes within
-/// `d/2 + 0.07 * d` of the input) and reports the bit-equal share (packet test 3).
+/// The fused producer's q8_1 row against the standalone `quantize_q8_1` on the same f32
+/// `norm_out`: the vendored quantizer is built with `-use_fast_math`, so the rows are NOT
+/// byte-equal; the test asserts the `quantize_q8_1` invariants (d and s within one half code of
+/// the IEEE reference, codes within `d/2 + 0.07 * d` of the input) and reports the bit-equal
+/// share.
 #[test]
 fn add_rmsnorm_q8_matches_unfused_quantize() {
     if !testkit::device_present("add_rmsnorm_q8_matches_unfused_quantize") {
@@ -772,7 +771,7 @@ fn add_rmsnorm_q8_matches_unfused_quantize() {
         q8_ref::row(&norm),
         "the fused row is the IEEE host row"
     );
-    // The unfused S1 quantize of the same norm row.
+    // The unfused `quantize_q8_1` of the same norm row.
     let need = add_rmsnorm_q8_needs(n).expect("sizes");
     let norm_dev = testkit::upload_bytes(&ctx, &norm_bytes);
     let unfused = testkit::upload_filled(&ctx, 0xA5, need.q8 + 64);
@@ -811,8 +810,8 @@ fn add_rmsnorm_q8_matches_unfused_quantize() {
         assert!(codes_s <= 1, "block {block}: unfused s {s} vs {ref_s}");
         // The 0.07 slack subsumes the half store of d as well: the dequantized q * d_half
         // carries |q| * d * 2^-11 on top of the half step, and |q| <= 127 gives at most
-        // 127 * 2^-11 ~ 0.062 of d (the swiglu reference test spells the term out; S1's stated
-        // 0.07 invariant needs no extra term here).
+        // 127 * 2^-11 ~ 0.062 of d (the swiglu reference test spells the term out; the stated
+        // 0.07 invariant of `quantize_q8_1` needs no extra term here).
         let eps_q = 0.07 * d.abs() + 1e-30;
         for (i, q) in qs.iter().enumerate() {
             let input = norm[block * 32 + i];
@@ -831,10 +830,9 @@ fn add_rmsnorm_q8_matches_unfused_quantize() {
     );
 }
 
-/// The end-to-end consumer check (packet test 10, first half): `matvec_q` on the producer's q8_1
-/// output equals `matvec_q` on S1's quantize of the same `norm_out`, both within the S1
-/// tolerance `64 * 2^-24 * sum(|term|)` of the f64 host reference, for a Q8_0 2048 -> 8192
-/// projection.
+/// The end-to-end consumer check: `matvec_q` on the producer's q8_1 output equals `matvec_q` on
+/// the standalone quantize of the same `norm_out`, both within the matvec tolerance
+/// `64 * 2^-24 * sum(|term|)` of the f64 host reference, for a Q8_0 2048 -> 8192 projection.
 #[test]
 fn add_rmsnorm_q8_feeds_matvec_q() {
     if !testkit::device_present("add_rmsnorm_q8_feeds_matvec_q") {
@@ -907,7 +905,7 @@ fn add_rmsnorm_q8_feeds_matvec_q() {
         println!("{name}: worst error {} of the tolerance", worst);
         results.push((name.to_owned(), values, tolerances));
     }
-    // The packet's equality: the two matvecs agree within the stated tolerance (each side is
+    // The equality check: the two matvecs agree within the stated tolerance (each side is
     // within its own bound of the same f64 reference, so their distance is within the sum).
     let (_, fused, tol_fused) = &results[0];
     let (_, unfused_y, tol_unfused) = &results[1];

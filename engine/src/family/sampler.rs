@@ -1,4 +1,4 @@
-//! Host-side token sampling behind the executor seam (decision 0033, item 5).
+//! Host-side token sampling behind the executor seam.
 //!
 //! A `Sampler` lives in the per-job `GenerationState`. The executor draws the next token from it
 //! inside `decode`, after it has read back the next-token logits. The sampler is pure host code:
@@ -40,9 +40,8 @@ pub(crate) const DEFAULT_TEMPERATURE: f64 = 0.7;
 /// The contract default for `top_p`.
 pub(crate) const DEFAULT_TOP_P: f64 = 1.0;
 
-/// The contract maximum for `temperature` (the canonical request encoding of
-/// `kernels/sample_canon` names the same bound; a unit test pins the two together until
-/// DEVSAMPLE-1 C3a gives them one home).
+/// The contract maximum for `temperature` (the canonical request encoding of `kernels/sample_canon`
+/// names the same bound; a unit test pins the two together until they share one definition).
 pub(crate) const MAX_TEMPERATURE: f64 = 2.0;
 
 /// The size cap of `generation_config.json`: 1 MiB.
@@ -279,7 +278,7 @@ impl SamplingParams {
     /// The softmax temperature; 0 selects greedy decoding.
     #[cfg_attr(
         not(test),
-        expect(dead_code, reason = "staged for the CUDA device sampler (DEVSAMPLE-1)")
+        expect(dead_code, reason = "staged for the CUDA device sampler")
     )]
     pub(crate) fn temperature(&self) -> f64 {
         self.temperature
@@ -288,7 +287,7 @@ impl SamplingParams {
     /// The cumulative mass kept by nucleus sampling.
     #[cfg_attr(
         not(test),
-        expect(dead_code, reason = "staged for the CUDA device sampler (DEVSAMPLE-1)")
+        expect(dead_code, reason = "staged for the CUDA device sampler")
     )]
     pub(crate) fn top_p(&self) -> f64 {
         self.top_p
@@ -297,7 +296,7 @@ impl SamplingParams {
     /// The number of best candidates kept; 0 keeps every token.
     #[cfg_attr(
         not(any(test, all(feature = "native-cuda", target_os = "linux"))),
-        expect(dead_code, reason = "staged for the CUDA device sampler (DEVSAMPLE-1)")
+        expect(dead_code, reason = "staged for the CUDA device sampler")
     )]
     pub(crate) fn top_k(&self) -> u32 {
         self.top_k
@@ -348,7 +347,7 @@ pub(crate) struct Sampler {
     params: SamplingParams,
     #[cfg_attr(
         not(test),
-        expect(dead_code, reason = "staged for the CUDA device sampler (DEVSAMPLE-1)")
+        expect(dead_code, reason = "staged for the CUDA device sampler")
     )]
     seed: u64,
     rng: SplitMix64,
@@ -387,7 +386,7 @@ impl Sampler {
     /// The seed that the generator started from. The generator state is not exposed.
     #[cfg_attr(
         not(test),
-        expect(dead_code, reason = "staged for the CUDA device sampler (DEVSAMPLE-1)")
+        expect(dead_code, reason = "staged for the CUDA device sampler")
     )]
     pub(crate) fn seed(&self) -> u64 {
         self.seed
@@ -451,7 +450,7 @@ impl Sampler {
     /// `sample_with_keep`.
     #[cfg_attr(
         not(test),
-        expect(dead_code, reason = "staged for the CUDA device sampler (DEVSAMPLE-1)")
+        expect(dead_code, reason = "staged for the CUDA device sampler")
     )]
     pub(crate) fn pick_with_unit(
         &self,
@@ -1232,8 +1231,8 @@ mod tests {
         );
     }
 
-    /// The `generation_config.json` of the pinned checkpoint, quoted from the
-    /// coordinator's copy of `<model_dir>/generation_config.json`.
+    /// The `generation_config.json` of the pinned checkpoint, quoted from a copy of
+    /// `<model_dir>/generation_config.json`.
     const EDGE0_GENERATION_CONFIG: &str = r#"{
     "bos_token_id": 248044,
     "do_sample": true,
@@ -2270,12 +2269,11 @@ mod tests {
 
     // Timing harness, not part of the normal suite. Run:
     //   cargo test --release --offline timing_248077_row -- --ignored --nocapture
-    // It prints microseconds per sample for a 248,077-entry row, the reference against the
-    // sampler, at the four points this fix round measures: (T0.7, P0.95, K0), (T1.0, P0.95, K20),
-    // (T0.7, P1.0, K0), and (T0.7, P0.95, K20). The server defaults verified in
-    // server/validate.rs:46-50 and family/sampler.rs are temperature 0.7 and top_p 1.0; the
-    // packet requested these points, so they are what the harness measures. The top_k 20 rows
-    // must stay under 1.5 ms per sample on this host.
+    // It prints microseconds per sample for a 248,077-entry row, the reference against the sampler,
+    // at four points: (T0.7, P0.95, K0), (T1.0, P0.95, K20), (T0.7, P1.0, K0), and
+    // (T0.7, P0.95, K20). The server defaults verified in server/validate.rs:46-50 and
+    // family/sampler.rs are temperature 0.7 and top_p 1.0. The top_k 20 rows must stay under
+    // 1.5 ms per sample on this host.
     #[test]
     #[ignore = "timing harness; run with --ignored --nocapture"]
     fn timing_248077_row_reference_against_partial_selection() {

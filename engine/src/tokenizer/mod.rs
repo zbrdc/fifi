@@ -1,8 +1,4 @@
 //! Tokenizer and chat-template ownership for the engine.
-//!
-//! Interface and rules: the tokenizer design.
-//! Test seams: `tokenizer/seams.md`, in the ledger.
-//! Dependency decision: decision 0025.
 
 mod bundle;
 mod decode;

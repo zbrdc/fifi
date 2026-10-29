@@ -1,12 +1,11 @@
-//! What one run of the resident step reports beside its token (decision 0047, packet RD-9d; the
-//! `captured` flag of RD-10a/RD-10b). Pure host values: no device type, no CUDA call.
+//! What one run of the resident step reports beside its token, including the `captured` flag that
+//! the decode gate (`cuda/gate`) checks. Pure host values: no device type, no CUDA call.
 //!
-//! [`CaptureOutcome`] says how the step body ran. RD-9d only ever runs it eagerly, so the value is
-//! always [`CaptureOutcome::Eager`] (the default). The slim RD-11a (lane C) is the packet that
-//! captures the step: it sets [`CaptureOutcome::Captured`] or
-//! [`CaptureOutcome::RefusedFellBackToEager`], and it widens `is_capture_refusal` to `pub(crate)`
-//! for that purpose (lane C, Q13). The RD-10 gate reads `RunReport::capture` of the step's last
-//! run (`QwenResidentStep::last_report`) and never calls `is_capture_refusal` itself. Any other
+//! [`CaptureOutcome`] says how the step body ran. An eager run reports [`CaptureOutcome::Eager`]
+//! (the default). A capturing step sets [`CaptureOutcome::Captured`] or
+//! [`CaptureOutcome::RefusedFellBackToEager`], and `is_capture_refusal` decides which capture
+//! errors count as a refusal. The gate reads `RunReport::capture` of the step's last run
+//! (`QwenResidentStep::last_report`) and never calls `is_capture_refusal` itself. Any other
 //! capture error is an error of the run, never a fallback.
 
 use crate::{family::session::PrefixSlot, sched::job::PrefixReport};
@@ -14,7 +13,7 @@ use crate::{family::session::PrefixSlot, sched::job::PrefixReport};
 /// How the step body of a run was executed.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub(crate) enum CaptureOutcome {
-    /// Every launch was queued one by one. The only value RD-9d produces.
+    /// Every launch was queued one by one.
     #[default]
     Eager,
     /// The body was captured into a graph and the graph was replayed.
@@ -25,7 +24,7 @@ pub(crate) enum CaptureOutcome {
 }
 
 impl CaptureOutcome {
-    /// True only when the graph was captured and replayed: the RD-10 `captured` flag.
+    /// True only when the graph was captured and replayed: the gate's `captured` flag.
     pub(crate) const fn captured(self) -> bool {
         matches!(self, Self::Captured)
     }
@@ -64,9 +63,9 @@ impl HostSyncs {
 pub(crate) struct RunReport {
     /// How the body ran.
     pub(crate) capture: CaptureOutcome,
-    /// Host waits for the run to finish, per token (the "syncs per token" of RD-10b). A plain step
-    /// makes one. A tiered token adds the waits of every layer's block and of its bank fills (see
-    /// [`HostSyncs`]), each blocking write counted as a sync too.
+    /// Host waits for the run to finish, per token. A plain step makes one. A tiered token adds
+    /// the waits of every layer's block and of its bank fills (see [`HostSyncs`]), each blocking
+    /// write counted as a sync too.
     pub(crate) syncs: u32,
     /// Blocking host-to-device copies before the launches (the start block of the step).
     pub(crate) host_writes: u32,
@@ -79,8 +78,8 @@ pub(crate) enum StepKind {
     Feed,
 }
 
-/// One prefill step of the report (CPF-7b-C B.8): its first row, its rows, its kind, its host
-/// wall time from the chunk open to the status read, and the status word it read.
+/// One prefill step of the report: its first row, its rows, its kind, its host wall time from the
+/// chunk open to the status read, and the status word it read.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct StepRecord {
     pub(crate) p0: usize,
@@ -90,15 +89,15 @@ pub(crate) struct StepRecord {
     pub(crate) status: i32,
 }
 
-/// One ExecutorOps::prefill call of the served path (CPF-7b-C B.8, OQ-13).
+/// One ExecutorOps::prefill call of the served path.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct PieceRecord {
     pub(crate) tokens: usize,
     pub(crate) ns: u64,
 }
 
-/// The plain tag of one chunk-gate verdict (CPF-7b-C B.8): the verdict enum itself is
-/// pub(super) in the step, so the report keeps the label only.
+/// The plain tag of one chunk-gate verdict: the verdict enum itself is pub(super) in the step, so
+/// the report keeps the label only.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum ChunkVerdictTag {
     Ready,
@@ -110,7 +109,7 @@ pub(crate) enum ChunkVerdictTag {
 }
 
 impl ChunkVerdictTag {
-    /// The CPF-8a string of the verdict.
+    /// The job-line string of the verdict.
     pub(crate) const fn label(self) -> &'static str {
         match self {
             Self::Ready => "Ready",
@@ -135,7 +134,7 @@ impl ChunkVerdictTag {
     }
 }
 
-/// The arm one feed_rows call took (CPF-7b-C B.8).
+/// The arm one feed_rows call took.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum PathTag {
     Chunk,
@@ -143,7 +142,7 @@ pub(crate) enum PathTag {
 }
 
 impl PathTag {
-    /// The CPF-8a string of the arm.
+    /// The job-line string of the arm.
     pub(crate) const fn label(self) -> &'static str {
         match self {
             Self::Chunk => "chunk",
@@ -165,7 +164,7 @@ fn bracket(items: &[String]) -> String {
     text
 }
 
-/// The prefill report of one session, accumulated until a reset or an import (CPF-7b-C B.8).
+/// The prefill report of one session, accumulated until a reset or an import.
 /// Pure host values, so it is its own type: RunReport stays Copy.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub(crate) struct PrefillReport {
@@ -212,8 +211,7 @@ impl PrefillReport {
     }
 
     /// Records one step: a chunk's rows count as prefilled, a feed's as fed. A step whose status
-    /// word was non-zero is still recorded: the record is pushed before the state is revalidated
-    /// (CPF-7b-C B.4 3.7).
+    /// word was non-zero is still recorded: the record is pushed before the state is revalidated.
     pub(crate) fn push_step(&mut self, record: StepRecord) {
         match record.kind {
             StepKind::Chunk => self.n_prefilled += record.rows,
@@ -287,7 +285,7 @@ impl PrefillReport {
         self.pieces.push(PieceRecord { tokens, ns });
     }
 
-    /// Records one feed_rows call and the verdict it routed on (CPF-7b-C B.8).
+    /// Records one feed_rows call and the verdict it routed on.
     pub(crate) fn note_feed_rows(&mut self, verdict: &super::step::ChunkVerdict, rows: usize) {
         self.verdict = Some(ChunkVerdictTag::of(verdict));
         self.path_taken = Some(match verdict {
@@ -343,7 +341,7 @@ impl PrefillReport {
         Some(self.job_line())
     }
 
-    /// The one engine log line of a prefill job (CPF-7b-C B.8, OQ-13).
+    /// The one engine log line of a prefill job.
     pub(crate) fn job_line(&self) -> String {
         let m_sess = match self.m_sess {
             Some(rows) => rows.to_string(),

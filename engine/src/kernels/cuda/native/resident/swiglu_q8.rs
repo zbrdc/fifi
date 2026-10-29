@@ -1,10 +1,10 @@
 //! Raw FFI to `inference_cuda_swiglu_q8_launch` of `native/resident/swiglu_q8.cu` (declared in
 //! `native/resident/swiglu_q8.h`). Child of `native::resident`, so it inherits the
-//! `allow(unsafe_code)` of `native.rs` (decision 0047, child modules of `native.rs`).
+//! `allow(unsafe_code)` of `native.rs`.
 //!
 //! Safety invariants this module relies on:
 //! - A device range is proved in bounds by `RawRange::new` before it gets here. This module
-//!   proves, again and on the sizes of the call, that `gu` holds the A2 footprint
+//!   proves, again and on the sizes of the call, that `gu` holds the strided footprint
 //!   `(slots - 1) * y_slot_stride + 2 * n_ff` floats, that `q8` holds `slots` padded
 //!   `block_q8_1` rows, that both are 4-byte aligned, and that `q8`, which the kernel writes,
 //!   shares no byte with `gu`. The C entry repeats these checks on the addresses.
@@ -12,8 +12,7 @@
 //!   status; a fault in the kernel surfaces at the next synchronize.
 //! - The allocations stay valid until the queued launch finishes because `inference_cuda_free`
 //!   synchronizes the whole device before `cudaFree`.
-//! - Every call runs under the process dispatch guard and on the thread that owns the context
-//!   (decisions 0023 and 0024).
+//! - Every call runs under the process dispatch guard and on the thread that owns the context.
 //! - No raw pointer and no unsafe function leaves this module.
 
 use std::ffi::{c_int, c_void};
@@ -69,7 +68,7 @@ fn q8_bytes_native(n_ff: usize, slots: usize) -> Option<usize> {
 }
 
 /// Proves a launch before the native call: `n_ff` a multiple of 32 in `32..=32768`, `slots` in
-/// `1..=8`, `y_slot_stride >= 2 * n_ff`, `gu` the A2 footprint and `q8` the padded rows, both
+/// `1..=8`, `y_slot_stride >= 2 * n_ff`, `gu` the strided footprint and `q8` the padded rows, both
 /// 4-byte aligned, and `q8` disjoint from `gu`.
 fn check_swiglu_q8(call: &SwigluQ8Raw<'_>) -> Result<(), DeviceFailure> {
     let slot_gaps = call.slots.checked_sub(1).ok_or_else(invalid_argument)?;
@@ -146,7 +145,7 @@ mod tests {
         stream: usize,
     }
 
-    /// Bytes the entry sizes for GOOD: 8 slots of stride 1024, so the A2 footprint of gu is
+    /// Bytes the entry sizes for GOOD: 8 slots of stride 1024, so the strided footprint of gu is
     /// (7 * 1024 + 2 * 512) floats.
     const GU: usize = (7 * 1024 + 2 * 512) * 4;
 
@@ -242,9 +241,9 @@ mod tests {
         })
     }
 
-    /// Host only (KUBDAN-MSG-64 items 6 and 10): the native check against the ranges of an
-    /// unbacked allocation. The valid layout passes (stride 2048 > 2 * 896); each case changes
-    /// one thing and is refused, among them the tight A2 footprint of `gu` and the padded
+    /// Host only: the native check against the ranges of an unbacked allocation. The valid
+    /// layout passes (stride 2048 > 2 * 896); each case changes one thing and is refused,
+    /// among them the tight strided footprint of `gu` and the padded
     /// 32-block rows at the Mellum width.
     #[test]
     fn check_swiglu_q8_refuses_short_unpadded_misaligned_and_overlapping_ranges() {

@@ -3,7 +3,7 @@
 //! The forward blocks keep activations as host `f32` vectors. Every quantized
 //! projection goes through [`Projector`]. The Mac adapter executes packed weights
 //! through the MLX kernels. The test adapter multiplies dense `f32` matrices so
-//! the block math runs in portable tests. Decision 0035 records this seam.
+//! the block math runs in portable tests.
 
 use crate::EngError;
 

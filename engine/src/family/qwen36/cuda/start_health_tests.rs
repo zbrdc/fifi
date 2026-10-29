@@ -1,10 +1,10 @@
-//! The health pins of the CUDA serve start (CUDA-SERVE-1 2.5) and its ignored device test
-//! (section 3). The health pins need no device: a real engine worker whose executor fails
-//! with the terminal-latch error of `kernels::cuda::ensure_usable`, and one whose load fails,
-//! pin the worker's own rules — `Backend` is process-scoped (`NativeFailed`, queued jobs
-//! rejected, no hang), a load failure leaves `Error` with the message, `Loading` until `make`
-//! returns. Requirement 4 needs no production code: these pins hold the mapping in place.
-//! The device test is ignored and runs only on the 3090 through the baton (gate G1).
+//! The health pins of the CUDA serve start and its ignored device test. The health pins need no
+//! device: a real engine worker whose executor fails with the terminal-latch error of
+//! `kernels::cuda::ensure_usable`, and one whose load fails, pin the worker's own rules —
+//! `Backend` is process-scoped (`NativeFailed`, queued jobs rejected, no hang), a load failure
+//! leaves `Error` with the message, `Loading` until `make` returns. The mapping needs no
+//! production code: these pins hold it in place. The device test is ignored and runs only on
+//! the 3090, held exclusively.
 
 use crate::EngError;
 use crate::exec_fake::FakeExecutor;
@@ -40,10 +40,10 @@ fn wait_until(what: &str, condition: impl Fn() -> bool) {
     }
 }
 
-/// One job event with a wall-clock cap (KUBDAN-MSG-72 NIT): tokio's receiver has no blocking
-/// `recv_timeout`, so the wait parks on the shared current-thread runtime under `timeout_at` —
-/// no loop of the device test waits without a deadline. `None` (the channel closed) passes
-/// through; only the clock panics.
+/// One job event with a wall-clock cap: tokio's receiver has no blocking `recv_timeout`, so the
+/// wait parks on the shared current-thread runtime under `timeout_at` — no loop of the device
+/// test waits without a deadline. `None` (the channel closed) passes through; only the clock
+/// panics.
 fn event_before<T>(
     runtime: &tokio::runtime::Runtime,
     events: &mut tokio::sync::mpsc::Receiver<T>,
@@ -253,7 +253,7 @@ fn p5_ids() -> Vec<u32> {
 }
 
 #[test]
-#[ignore = "the 3090 through the baton (CUDA-SERVE-1 gate G1): starts the real engine"]
+#[ignore = "the 3090, held exclusively: starts the real engine"]
 fn cuda_engine_streams_the_gate_tokens() {
     // Tie-break rules, from the sources. HOST (family/sampler.rs `argmax`): greedy draws the
     // LOWEST index among the largest logits (`value > best_value` replaces, so an equal value
@@ -320,7 +320,7 @@ fn cuda_engine_streams_the_gate_tokens() {
     }
 
     eprintln!(
-        "G1 {:.1} s: the engine is Ready",
+        "{:.1} s: the engine is Ready",
         began.elapsed().as_secs_f64()
     );
     // Stream P5 greedily: the default job sampler IS greedy (temperature 0), so every id
@@ -358,9 +358,9 @@ fn cuda_engine_streams_the_gate_tokens() {
     });
     // Compare with the reference chain: the first divergence names the position, both ids and
     // the logit gap from the reference's own top list, or reports an exact tie as such.
-    // The whole chain, up front (KUBDAN-MSG-72 item 2): the P5 oracle has 128 steps and no
-    // EOG, so the reference must carry at least 128 and the stream must cover it EXACTLY — an
-    // early finish (or a short reference file) is itself a divergence, not an excuse.
+    // The whole chain, up front: the P5 oracle has 128 steps and no EOG, so the reference must
+    // carry at least 128 and the stream must cover it EXACTLY — an early finish (or a short
+    // reference file) is itself a divergence, not an excuse.
     assert!(
         reference.ids.len() >= 128,
         "the reference chain is too short: {} steps",
@@ -396,7 +396,7 @@ fn cuda_engine_streams_the_gate_tokens() {
     }
 
     eprintln!(
-        "G1 {:.1} s: P5 streamed and compared",
+        "{:.1} s: P5 streamed and compared",
         began.elapsed().as_secs_f64()
     );
     // Cancel mid-decode: a long job stops after its current piece, the next job still runs.
@@ -421,11 +421,11 @@ fn cuda_engine_streams_the_gate_tokens() {
                 }
             }
             JobEvent::Finished(_) => break,
-            // An error is a FAILURE, not an end (KUBDAN-MSG-72 item 4).
+            // An error is a FAILURE, not an end.
             JobEvent::Error(error) => panic!("the long job failed: {error:?}"),
         }
     }
-    // The long job ended BY THE CANCEL: its terminal batch says so (KUBDAN-MSG-72 item 4).
+    // The long job ended BY THE CANCEL: its terminal batch says so.
     assert_eq!(
         long_finish,
         Some(DecodeFinish::Cancelled),
@@ -454,7 +454,7 @@ fn cuda_engine_streams_the_gate_tokens() {
     });
 
     eprintln!(
-        "G1 {:.1} s: the cancel and the next job are done",
+        "{:.1} s: the cancel and the next job are done",
         began.elapsed().as_secs_f64()
     );
     // A prompt at the context limit is refused cleanly: the typed over-length form, no

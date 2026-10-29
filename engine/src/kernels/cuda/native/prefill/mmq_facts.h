@@ -1,13 +1,13 @@
 /*
- * Device facts of the vendored MMQ entries (CPF-V4 V4-0, decision 0049 items 3 and 5). The V-3b
- * launches read a fifi_device_facts (vendored common.cuh): device ordinal, architecture, SM count
- * and opt-in shared memory per block. This translation unit is the one producer for the MMQ glue,
- * queried the device_info.cu way: no allocation, no synchronization, no stream work.
+ * Device facts of the vendored MMQ entries. The launches of the stream-fixup patch read a
+ * fifi_device_facts (vendored common.cuh): device ordinal, architecture, SM count and opt-in
+ * shared memory per block. This translation unit is the one producer for the MMQ glue, queried
+ * the device_info.cu way: no allocation, no synchronization, no stream work.
  *
  * The architecture is the BUILT one whose cubin runs on the device (resident/mmvq_arch.h), so an
  * sm_89 GPU runs the sm_86 cubins and a device no built cubin runs on is refused with the runtime's
  * own cudaErrorNoKernelImageForDevice. The Rust side reads the same facts through the C entry:
- * the fixup range of a launch is sized from nsm (CPF-V4 G1), never from a literal.
+ * the fixup range of a launch is sized from nsm, never from a literal.
  */
 #ifndef INFERENCE_CUDA_PREFILL_MMQ_FACTS_H
 #define INFERENCE_CUDA_PREFILL_MMQ_FACTS_H

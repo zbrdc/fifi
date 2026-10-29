@@ -1,6 +1,5 @@
-    // The fused 8-bit KV decode attention (packet FUSED-KV8-a; the pass-1 structure R4 of
-    // packet FUSED-KV8-EFF-2). Pass 1: one simdgroup computes RPH of the REP query heads of
-    // one KV head over one block of keys, and one threadgroup holds SGS = REP / RPH
+    // The fused 8-bit KV decode attention. Pass 1: one simdgroup computes RPH of the REP query
+    // heads of one KV head over one block of keys, and one threadgroup holds SGS = REP / RPH
     // simdgroups that all work on the SAME block of keys (blk = threadgroup_position_in_grid.x),
     // each simdgroup loading the same K and V rows - the repeats hit the cache. RPH is the
     // largest divisor of REP that is at most 4 (REP 8 runs RPH 4 with SGS 2; REP 4 runs
@@ -8,31 +7,28 @@
     // RPH = REP with SGS 1), so the per-lane live state is q/o[RPH][DPT] - 64 floats at
     // REP 8, D 256 - instead of the q/o[REP][DPT] = 128 floats of the first fused kernel,
     // whose roughly 170-register pass 1 (an estimate; the toolchain reports no register
-    // counts) was latency bound: 102 GB/s at 131,072 keys against a 320 GB/s load-only
-    // floor. Cutting the per-lane state to RPH heads was measured in the FUSED-KV8-EFF-1
-    // standalone spike (its REPORT.md under the fused-kv8-eff/eff1 scratch directory; Mac,
-    // p50 of the attention of 10 layers per decode token, QH 16, KVH 2, D 256, REP 8, with
-    // the correctness gate of 290/290 entries and per-head arithmetic identical to the
-    // first kernel): 8,192 keys 1.148 -> 0.835 ms with the half block count; 32,768 keys
-    // 4.012 -> 2.671 ms (1.50x); 131,072 keys 13.949 -> 9.683 ms (1.44x, 147 GB/s);
-    // 262,000 keys 26.187 -> 18.889 ms (1.39x). The register bound is evidenced by that
-    // report's measured slope over the per-lane state (8/4/2/1 heads per simdgroup:
-    // 13.95 / 10.27 / 10.41 / 17.22 ms at 131,072 keys - halving the state pays 1.36x,
-    // halving again pays nothing, and one head per simdgroup loses 24 percent to the
-    // per-key dependency chain), not by a toolchain report. Each lane owns D / 32
-    // consecutive dims, loads its slice of the 8-bit key and value code words once per row
-    // (little-endian bytes: the first value sits in the lowest byte of a word), and forms
-    // the key dot product through the per-group factoring
-    // `scale_g * sum(q_i * code_i) + bias_g * sum(q_i)`, all in F32, beside an online
-    // softmax per head (running max m, running sum dd, running mix o, rescaled by
-    // `exp(m - new_m)` at every key). Every block - including an EMPTY tail block, which
-    // occurs whenever the block-count rule leaves blocks whose first key is at or past
-    // `len` (len 130 gives NB 64 and a block size of 3, so blocks 44 to 63 hold no key) -
-    // writes its unnormalized F32 partials po [QH, nb, D], psum [QH, nb], and pmax
-    // [QH, nb]; an empty block writes max -FLT_MAX, sum 0, and a zero partial, and pass 2
-    // weights it by `exp(-FLT_MAX - m*) = 0` under MLX's default safe math. Pass 2: one
-    // simdgroup merges the nb block partials of one head by log-sum-exp around the global
-    // max m* (simd_max), so no exponent ever overflows, and casts to the query dtype T.
+    // counts) was latency bound: 102 GB/s at 131,072 keys against a 320 GB/s load-only floor.
+    // Cutting the per-lane state to RPH heads was measured in a standalone benchmark (Mac, p50
+    // of the attention of 10 layers per decode token, QH 16, KVH 2, D 256, REP 8, with the
+    // correctness gate of 290/290 entries and per-head arithmetic identical to the first
+    // kernel): 8,192 keys 1.148 -> 0.835 ms with the half block count; 32,768 keys 4.012 ->
+    // 2.671 ms (1.50x); 131,072 keys 13.949 -> 9.683 ms (1.44x, 147 GB/s); 262,000 keys 26.187
+    // -> 18.889 ms (1.39x). The register bound is evidenced by that benchmark's measured slope
+    // over the per-lane state (8/4/2/1 heads per simdgroup: 13.95 / 10.27 / 10.41 / 17.22 ms at
+    // 131,072 keys - halving the state pays 1.36x, halving again pays nothing, and one head per
+    // simdgroup loses 24 percent to the per-key dependency chain), not by a toolchain report.
+    // Each lane owns D / 32 consecutive dims, loads its slice of the 8-bit key and value code
+    // words once per row (little-endian bytes: the first value sits in the lowest byte of a
+    // word), and forms the key dot product through the per-group factoring `scale_g * sum(q_i *
+    // code_i) + bias_g * sum(q_i)`, all in F32, beside an online softmax per head (running max
+    // m, running sum dd, running mix o, rescaled by `exp(m - new_m)` at every key). Every
+    // block - including an EMPTY tail block, which occurs whenever the block-count rule leaves
+    // blocks whose first key is at or past `len` (len 130 gives NB 64 and a block size of 3, so
+    // blocks 44 to 63 hold no key) - writes its unnormalized F32 partials po [QH, nb, D], psum
+    // [QH, nb], and pmax [QH, nb]; an empty block writes max -FLT_MAX, sum 0, and a zero
+    // partial, and pass 2 weights it by `exp(-FLT_MAX - m*) = 0` under MLX's default safe math.
+    // Pass 2: one simdgroup merges the nb block partials of one head by log-sum-exp around the
+    // global max m* (simd_max), so no exponent ever overflows, and casts to the query dtype T.
     // The template arguments are T (the query dtype: float or bfloat16_t), D, REP, and
     // GSZ, plus RPH and SGS of pass 1; the scalars length, cap, nb, and scale are kernel
     // INPUTS, so one compiled program serves every length. This file holds the two kernel

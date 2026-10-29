@@ -1,20 +1,18 @@
 /*
- * CPF-V4 G3: the mmid entries of the MMQ glue (decision 0049 items 3, 10 and 11; plan rev 3
- * sections B.4 and C.2 N1; seam I2 of OFF-7). Each entry is its own ABI in this one translation
- * unit, with its own argument struct; abi_resident.h stays closed.
+ * The mmid entries of the MMQ glue. Each entry is its own ABI in this one translation unit, with
+ * its own argument struct; abi_resident.h stays closed.
  *
- * inference_cuda_mmq_ids_guard (N1): copies the router ids [m][top_k] (contiguous, read only:
- * the router's tensor is never written, seam I1) into ids_g [m][top_k]. A row is FLAGGED when an
- * id lies outside [0, n_experts) or two of its ids are equal; its copy is {0, 1, ..., top_k - 1}.
+ * inference_cuda_mmq_ids_guard: copies the router ids [m][top_k] (contiguous, read only: the
+ * router's tensor is never written) into ids_g [m][top_k]. A row is FLAGGED when an id lies
+ * outside [0, n_experts) or two of its ids are equal; its copy is {0, 1, ..., top_k - 1}.
  * A single dummy value would itself repeat an id, and vendored mm_ids_helper turns a repeated id
  * into unwritten ids_dst and inverse entries that later serve as store indices (mmid.cu:80,
  * :83, :110, :113; mmq.cuh:470; quantize.cu:529-538). An unflagged row is copied unchanged.
- * Status (rev 3, MSG-85 M4): a flagged row whose every slot is -1 (RD-5's fault form,
- * router.rs:24) ORs INFERENCE_CUDA_MMQ_IDS_ROUTER_FAULT (mask 1: route_experts); any other
- * flagged row ORs INFERENCE_CUDA_MMQ_IDS_BAD_ROW (mask 8: prefill_chunk). Mask 8 outranks mask 1
- * (book.rs:96-101), so a chunk with both reads 9. status is NULL or the prefill status word of
- * decision 0049 item 10, never StepParams.status; a launch with no flagged row leaves it
- * untouched.
+ * Status: a flagged row whose every slot is -1 (the router's fault form, router.rs:24) ORs
+ * INFERENCE_CUDA_MMQ_IDS_ROUTER_FAULT (mask 1: route_experts); any other flagged row ORs
+ * INFERENCE_CUDA_MMQ_IDS_BAD_ROW (mask 8: prefill_chunk). Mask 8 outranks mask 1
+ * (book.rs:96-101), so a chunk with both reads 9. status is NULL or the prefill status word,
+ * never StepParams.status; a launch with no flagged row leaves it untouched.
  *
  * inference_cuda_mmq_build_ids: the guard above, ALWAYS enqueued first (no argument skips it),
  * then the vendored mm_ids_helper (mmid.cu:153-176) on ids_g, with si1 = top_k (contiguous rows)
@@ -30,14 +28,14 @@
  *
  * inference_cuda_mmq_mmid_launch: one grouped GEMM over a weight stack through the vendored
  * mul_mat_q_case (mmq.cuh:1500-1510) with the ids of an MmidIds. The geometry fields are the
- * vendored mmq_args (mmq.cuh:1326-1340) as the Rust fill_mmid_args fills them (plan rev 3
- * section B.4, the pin's mmq.cu:255-261), and the entry refuses anything but this grouped form:
+ * vendored mmq_args (mmq.cuh:1326-1340) as the Rust fill_mmid_args fills them (the pin's
+ * mmq.cu:255-261), and the entry refuses anything but this grouped form:
  *   type_x                     Q4_K (12) or Q6_K (14); a grouped Q8_0 or Q5_0 has no arm here
- *   ncols_x = K                a multiple of 256, 256..32768 (the K grid, MSG-85 M2: the k loop
+ *   ncols_x = K                a multiple of 256, 256..32768 (the K grid: the k loop
  *                              reads whole ITER_K = 256 rows with no k clamp, mmq.cuh:856)
  *   stride_row_x               K / 256, the blocks of one weight row
  *   nrows_x = N                the rows of one expert matrix, >= 1
- *   ncols_max = ncols_opt = m  the token count (MSG-85 M1), within the shared shape rules
+ *   ncols_max = ncols_opt = m  the token count, within the shared shape rules
  *   ncols_dst = ncols_y        m * top_k, the compact columns
  *   nchannels_x = nchannels_y  n_experts: the expert is the channel index of the grid
  *   stride_channel_x           the per-expert stride in weight blocks, >= N * K / 256
@@ -50,24 +48,23 @@
  * launcher can pick), the weight index
  * (n_experts - 1) * stride_channel_x + N * K / 256 <= INT_MAX blocks and the dst index
  * (m * top_k - 1) * ld + N <= INT_MAX floats.
- * Capacities in byte (CPF-V4 G1): x >= that weight index in blocks of the type; y >=
- * K / 128 * m * top_k * 144 + 18,432 (rule M1, the constant pad); ids_dst >= m * top_k + m + 127
- * ints (rule M2, the stream-k fixup gather of mmq.cuh:1295-1302); expert_bounds >= n_experts + 1
- * ints; dst >= the dst index in floats; fixup >= nsm * 128 * 128 floats, nsm from the device
- * facts. x, y and fixup are 16-byte aligned, the rest 4. dst shares no byte with another range,
- * and fixup none with x, y, ids_dst or expert_bounds.
+ * Capacities in byte: x >= that weight index in blocks of the type; y >= K / 128 * m * top_k *
+ * 144 + 18,432 (the constant pad); ids_dst >= m * top_k + m + 127 ints (the stream-k fixup
+ * gather of mmq.cuh:1295-1302); expert_bounds >= n_experts + 1 ints; dst >= the dst index in
+ * floats; fixup >= nsm * 128 * 128 floats, nsm from the device facts. x, y and fixup are
+ * 16-byte aligned, the rest 4. dst shares no byte with another range, and fixup none with x,
+ * y, ids_dst or expert_bounds.
  * One more int index of the vendored kernels, bounded only by the shape caps: the y-tile copies
  * compute ncols_y * (kb0 * qk / 128) * 36 in int (mmq.cuh:859, :875), at most
  * 65,536 * 256 * 36 = 603,979,776 under m <= 2048, top_k <= 32 and K <= 32768. Raising a cap
  * reopens it, so it is recorded here rather than left implicit in the caps.
  * Output: dst[ids_dst[j] * ld + i] for compact column j and row i < N (mmq.cuh:470), so row
- * t * top_k + r holds pick r of token t. The ids must carry the values of an MmidIds (plan rev 3
- * section C.2 C2: ids_dst a permutation of [0, m * top_k), monotone bounds ending at
- * m * top_k, at most m columns per expert); this entry checks their capacities, the Rust type
- * proves the values.
+ * t * top_k + r holds pick r of token t. The ids must carry the values of an MmidIds (ids_dst a
+ * permutation of [0, m * top_k), monotone bounds ending at m * top_k, at most m columns per
+ * expert); this entry checks their capacities, the Rust type proves the values.
  *
  * Shape rules every entry shares: 1 <= n_experts <= 65535 (the z extent of the MMQ tiling grid),
- * 1 <= m <= 2048 (the chunk cap, CPF-V4 G1), 1 <= top_k <= min(n_experts, 32). Pointers are
+ * 1 <= m <= 2048 (the chunk cap), 1 <= top_k <= min(n_experts, 32). Pointers are
  * 4-byte aligned, and every written range shares no byte with any other range of the call. A
  * violated rule is INFERENCE_CUDA_INVALID_ARGUMENT before any CUDA call. The launches are
  * asynchronous on stream and never synchronize.

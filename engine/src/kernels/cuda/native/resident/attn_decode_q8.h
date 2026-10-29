@@ -1,9 +1,9 @@
 /*
- * RD-8l: the KV8 split-KV decode attention entry (native/resident/attn_decode_q8.h, per-kernel
+ * The KV8 split-KV decode attention entry (native/resident/attn_decode_q8.h, per-kernel
  * header). Launch-only, like the entries of abi_resident.h. Include after abi.h in C++; Rust
  * mirrors the struct in native/resident/attn_decode_q8.rs (child module of native/resident.rs).
  *
- * The same contract as attn_decode.h, over the 8-bit KV planes of RD-8k: q is f32
+ * The same contract as attn_decode.h, over the 8-bit KV planes that kv8_append writes: q is f32
  * [m][n_head][head_dim] (attn_prep's q; m <= 16), query heads grouped 8 per kv head
  * (n_head == 8 * n_kv_head), head_dim 128 or 256, proj NULL (no output gate) or the f32
  * projection row [m][ld] whose head h gate is at column h * 2 * head_dim + head_dim. K and V are

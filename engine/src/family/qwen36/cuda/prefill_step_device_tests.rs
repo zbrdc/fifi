@@ -1,8 +1,7 @@
-//! Device rows of CPF-7b-C D.2 (T1), one test per process on the 3090 through the baton. They
-//! load the pinned 20 GB model, so they are ignored by default and run by name.
-//!
-//! DV-B1 and DV-B2 only: DV-B3 (the injected router fault), DV-B4 (the stale word), DV-B5 (the
-//! ids), DV-B6 and DV-B7 (T2) are not written yet. Nothing here is a substitute for them.
+//! Device rows of the chunked-prefill driver, one test per process on the 3090, held exclusively.
+//! They load the pinned 20 GB model, so they are ignored by default and run by name. The rows cover
+//! a clean chunk, continuation at the committed rows, an injected router fault, a stale prefill
+//! word, the token ids of the chunk rows, an unadmitted session and the worker's pieces.
 
 use super::book::Health;
 use super::common_tests::{dims as step_dims, inventory};
@@ -150,13 +149,13 @@ fn observe(
     })
 }
 
-/// The step's own stream, for the one direct device write DV-B4 needs.
+/// The step's own stream, for the one direct device write of the stale-word row.
 fn step_stream<'s>(step: &'s QwenResidentStep<'static>) -> &'s crate::kernels::cuda::DeviceStream {
     step.stream_for_tests()
 }
 
 #[test]
-#[ignore = "the 3090 through the baton (CPF-7b-C DV-B3): loads the real model; run by name"]
+#[ignore = "the 3090, held exclusively: loads the real model; run by name"]
 fn a_router_fault_in_a_chunk_poisons_and_publishes_nothing() {
     let p5 = prompt_ids("P5");
     let (projector, weights) = load().expect("load");
@@ -234,7 +233,7 @@ fn a_router_fault_in_a_chunk_poisons_and_publishes_nothing() {
 }
 
 #[test]
-#[ignore = "the 3090 through the baton (CPF-7b-C DV-B4): loads the real model; run by name"]
+#[ignore = "the 3090, held exclusively: loads the real model; run by name"]
 fn a_stale_prefill_word_cannot_fail_a_clean_chunk() {
     use super::state_layout::Word;
 
@@ -263,7 +262,7 @@ fn a_stale_prefill_word_cannot_fail_a_clean_chunk() {
 }
 
 #[test]
-#[ignore = "the 3090 through the baton (CPF-7b-C DV-B5): loads the real model; run by name"]
+#[ignore = "the 3090, held exclusively: loads the real model; run by name"]
 fn chunk_rows_carry_their_token_ids() {
     let p5 = prompt_ids("P5");
     let p1 = prompt_ids("P1");
@@ -305,7 +304,7 @@ fn chunk_rows_carry_their_token_ids() {
 }
 
 #[test]
-#[ignore = "the 3090 through the baton (CPF-7b-C DV-B6): loads the real model; run by name"]
+#[ignore = "the 3090, held exclusively: loads the real model; run by name"]
 fn an_unadmitted_session_keeps_the_per_token_path() {
     use super::run_report::{PathTag, StepKind};
     use super::step::ChunkVerdict;
@@ -359,8 +358,9 @@ fn an_unadmitted_session_keeps_the_per_token_path() {
 /// report held afterwards.
 type SeenCalls = std::sync::Arc<std::sync::Mutex<Vec<(usize, Vec<usize>)>>>;
 
-/// The engine-side observer of DV-B7: it delegates every ExecutorOps method and records, after
-/// each prefill call, the tokens it received and the pieces the report had recorded. Test only.
+/// The engine-side observer of `the_worker_feeds_m_sess_tokens_per_piece`: it delegates every
+/// ExecutorOps method and records, after each prefill call, the tokens it received and the pieces
+/// the report had recorded. Test only.
 struct PieceObserver {
     inner: QwenResidentStep<'static>,
     seen: SeenCalls,
@@ -402,7 +402,7 @@ impl crate::family::executor::ExecutorOps for PieceObserver {
 }
 
 #[test]
-#[ignore = "the 3090 through the baton (CPF-7b-C DV-B7): loads the real model; run by name"]
+#[ignore = "the 3090, held exclusively: loads the real model; run by name"]
 fn the_worker_feeds_m_sess_tokens_per_piece() {
     use crate::family::executor::GenerationState;
     use crate::family::session::DecodeSession;
@@ -481,7 +481,7 @@ fn the_worker_feeds_m_sess_tokens_per_piece() {
 }
 
 #[test]
-#[ignore = "the 3090 through the baton (CPF-7b-C DV-B1): loads the real model; run by name"]
+#[ignore = "the 3090, held exclusively: loads the real model; run by name"]
 fn a_clean_chunk_publishes_and_hands_off_to_decode() {
     let p5 = prompt_ids("P5");
     let head = &p5[..200];
@@ -515,7 +515,7 @@ fn a_clean_chunk_publishes_and_hands_off_to_decode() {
 }
 
 #[test]
-#[ignore = "the 3090 through the baton (CPF-7b-C DV-B2): loads the real model; run by name"]
+#[ignore = "the 3090, held exclusively: loads the real model; run by name"]
 fn chunks_continue_at_the_committed_rows() {
     let p5 = prompt_ids("P5");
     let (projector, weights) = load().expect("load");

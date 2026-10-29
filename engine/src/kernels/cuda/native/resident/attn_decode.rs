@@ -1,10 +1,10 @@
 //! Raw FFI to the split-KV decode attention entry of `native/resident/attn_decode.cu` (declared
-//! in `native/resident/attn_decode.h`), RD-8b. Child module of `native/resident.rs`, so it
-//! inherits the `allow(unsafe_code)` of `native.rs`.
+//! in `native/resident/attn_decode.h`). Child module of `native/resident.rs`, so it inherits
+//! the `allow(unsafe_code)` of `native.rs`.
 //!
 //! Safety invariants this file relies on:
 //! - The launch entry is called only through `CudaContext::launch_on`, on the thread that owns
-//!   the context and under the dispatch guard (decisions 0023 and 0024).
+//!   the context and under the dispatch guard.
 //! - Every range is a `RawRange`, proved inside its live allocation. Sizes, alignment and
 //!   disjointness (`super::Span`) are proved again here before the call. The C entry checks
 //!   pointer/scalar/alignment conditions, not allocation extents or overlap.

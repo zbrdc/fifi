@@ -1,17 +1,17 @@
-//! Test-only route recorder for the S3 expert-cache trace (S3 plan section 3.2, packet T0).
+//! Test-only route recorder for the S3 expert-cache trace.
 //!
 //! `step` pushes one row per MoE layer after the router readback. A row holds the host selection
-//! and the host probabilities that `moe::select` already used, moved out of the step. The
-//! recorder makes no native call, no synchronization, and no readback. Release builds contain no
-//! recorder. The portable tests below check the rows, the T0-P1 row checks, and the TSV line.
+//! and the host probabilities that `moe::select` already used, moved out of the step. The recorder
+//! makes no native call, no synchronization, and no readback. Release builds contain no recorder.
+//! The portable tests below check the rows, the row checks, and the TSV line.
 
 use super::super::moe::{MoeShape, select};
 use crate::EngError;
 
-/// Schema of `trace.tsv` (S3 plan section 3.4).
+/// Schema of `trace.tsv`.
 pub(super) const TRACE_SCHEMA: &str = "s3-route-trace/1";
 
-/// Gate sums of a renormalized selection must be 1 within this bound (T0-P1).
+/// Gate sums of a renormalized selection must be 1 within this bound.
 const GATE_SUM_TOLERANCE: f32 = 1e-5;
 
 /// The kind of a traced step.
@@ -130,8 +130,8 @@ impl RouteRow {
     }
 }
 
-/// The T0-P1 checks of one step's rows: one row per layer in layer order, all of `step`; each row
-/// has `top_k` distinct ids below the expert count, finite probabilities, the exact selection of
+/// The checks of one step's rows: one row per layer in layer order, all of `step`; each row has
+/// `top_k` distinct ids below the expert count, finite probabilities, the exact selection of
 /// `moe::select` on its own probabilities, and gates that sum to 1 when the selection renormalizes.
 pub(super) fn check_step(
     rows: &[RouteRow],

@@ -1,9 +1,8 @@
 //! Pure tests of the canonical sampler reference and the request encoding.
 //!
-//! The known answers come from three independent sources: the published Random123 vectors, the
-//! packet's C programs (`philox_kat.c`, `exp_canon.c`, `canon_ref.c` — kept durably in the
-//! knowledge store at /home/dan/fifi/knowledge/projects/inference-engine/devsample-packet/),
-//! and hand arithmetic in the comments of each case.
+//! The known answers come from three independent sources: the published Random123 vectors,
+//! standalone C programs (`philox_kat.c`, `exp_canon.c`, `canon_ref.c`, not part of this
+//! repository), and hand arithmetic in the comments of each case.
 
 use super::reference_tests::{
     CanonDraw, MAX_N, PATH_ARGMAX, PATH_DRAW, ceil_shr, exp_canon, floor_shr, philox4x32_10,

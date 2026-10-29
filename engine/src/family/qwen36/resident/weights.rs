@@ -1,10 +1,10 @@
-//! Resident Q36 weights, imported once at load (decision 0046 item 6).
+//! Resident Q36 weights, imported once at load.
 //!
 //! Non-expert matrices, plain norms, split convolutions, and the F32 router and shared gate become
-//! residents with `layers + 2` synchronizations. The 120 expert stacks are read once with positioned
-//! reads into page-aligned anonymous pages and wrapped without a copy (decision 0041). They need no
-//! synchronization and no page pool, because every expert stays resident for the life of the engine.
-//! The embedding table stays in the checkpoint; the token start reads one row per token.
+//! residents with `layers + 2` synchronizations. The 120 expert stacks are read once with
+//! positioned reads into page-aligned anonymous pages and wrapped without a copy. They need no
+//! synchronization and no page pool, because every expert stays resident for the life of the
+//! engine. The embedding table stays in the checkpoint; the token start reads one row per token.
 
 use super::super::settings::{Activation, scale_pairing_error};
 use super::layout::{
@@ -43,7 +43,7 @@ fn sliced_of(weight: &StoredWeight) -> Result<SlicedWeight, EngError> {
 }
 
 /// A packed weight in a batch: as stored, or with its scales and biases widened to F32 (the
-/// default of decision 0046, lever Q36-G0).
+/// default).
 enum Queued<'w> {
     Stored(&'w PackedWeight),
     Widened(Box<PackedWeight>),
@@ -60,8 +60,8 @@ impl Queued<'_> {
 
 /// Packed weights and plain tensors that import with one synchronization.
 ///
-/// With `f32_scales` every packed weight queues with F32 scales and biases (the default of lever
-/// Q36-G0). Otherwise the batch queues the stored weights (BF16 in the Q36 checkpoint).
+/// With `f32_scales` every packed weight queues with F32 scales and biases (the default). Otherwise
+/// the batch queues the stored weights (BF16 in the Q36 checkpoint).
 struct Batch<'w> {
     packed: Vec<Queued<'w>>,
     plain: Vec<Tensor>,
@@ -466,7 +466,7 @@ pub(super) struct ResidentWeights {
     pub(super) final_norm: ExecutionTensor,
     pub(super) layers: Vec<RLayer>,
     pub(super) consts: Consts,
-    /// The form of the attention KV cache (packet KV8-INTEGRATE): `F32` at import; the decoder
+    /// The form of the attention KV cache: `F32` at import; the decoder
     /// constructor sets `Q8` for a Q8 engine after the head-dimension check, and nothing mutates
     /// it afterwards. `ResidentState::zero_with` reads it for every cache, and `check_step`
     /// refuses a cache of another form.
@@ -474,8 +474,7 @@ pub(super) struct ResidentWeights {
 }
 
 impl ResidentWeights {
-    /// Imports `host` in two phases and consumes it. Every scale and bias is stored as F32
-    /// (decision 0046, lever Q36-G0).
+    /// Imports `host` in two phases and consumes it. Every scale and bias is stored as F32.
     ///
     /// Phase 1 imports every non-expert tensor with `layers + 2` synchronizations: the head, one per
     /// layer, and the constants. The host copies drop before phase 2, so the host copies and the
@@ -496,8 +495,8 @@ impl ResidentWeights {
     }
 
     /// Like `import`, with the scales and biases kept as stored (BF16). The BF16 half of the one
-    /// activation lever of packet Q36-BF16-a: the decoder constructor picks it for BF16
-    /// activations, and `ensure_scale_pairing` refuses any other pairing.
+    /// activation lever: the decoder constructor picks it for BF16 activations, and
+    /// `ensure_scale_pairing` refuses any other pairing.
     pub(super) fn import_bf16_scales(
         kernels: &mut MlxKernels,
         ckpt: &StreamedCheckpoint,
@@ -562,7 +561,7 @@ impl ResidentWeights {
         })
     }
 
-    /// Converts the layer norms to `dtype` and evaluates them once (packet Q36-BF16-a): the input
+    /// Converts the layer norms to `dtype` and evaluates them once: the input
     /// and post-attention norm of every layer and the query and key norm of every attention layer
     /// (100 tensors on the real model). One synchronization. The checkpoint stores these weights
     /// in BF16, so the conversion from the F32 copies loses nothing. The final norm, the DeltaNet
@@ -594,9 +593,9 @@ impl ResidentWeights {
         Ok(())
     }
 
-    /// Checks the scale pairing of packet Q36-BF16-a: every scale and bias of every packed weight
-    /// must have the dtype that matches `activation` (862 parts over 431 packed weights on the
-    /// real model). `settings::scale_pairing_error` owns the rule; a mismatched pair returns
+    /// Checks the scale pairing of the activation lever: every scale and bias of every packed
+    /// weight must have the dtype that matches `activation` (862 parts over 431 packed weights on
+    /// the real model). `settings::scale_pairing_error` owns the rule; a mismatched pair returns
     /// `BadRequest` before the constructor changes anything else.
     pub(super) fn ensure_scale_pairing(&self, activation: Activation) -> Result<(), EngError> {
         let census = self.scale_census();
@@ -1268,7 +1267,7 @@ mod tests {
         let import_seconds = started.elapsed().as_secs_f64();
         let stats = kernels.memory_stats().unwrap();
         let rss_after = rss_kb();
-        // Sums from the pinned shard headers (decision 0046 item 6). With BF16 scales and biases
+        // Sums from the pinned shard headers. With BF16 scales and biases
         // (the comparison run): expert stacks 18,119,393,280 B; every resident tensor
         // 19,286,886,924 B (stored 19,508,787,456 B, minus the embedding 286,064,640 B and the
         // int8 router and shared gate, plus F32 dense tensors and routers). The default F32
@@ -1347,7 +1346,7 @@ mod tests {
             )
             .unwrap();
         }
-        // Packet Q36-BF16-a, the 337,920 B reconciliation: the totals above count the norms as
+        // The 337,920 B reconciliation: the totals above count the norms as
         // imported (F32). The product BF16 constructor converts the 100 norm tensors (40 input
         // and 40 post norms of 2048, 10 query and 10 key norms of 256: 168,960 elements) to BF16,
         // which saves 337,920 B: 19,286,886,924 - 337,920 = 19,286,549,004 B, the `weights_bytes`

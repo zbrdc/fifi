@@ -1,5 +1,4 @@
-//! The resident state owner (decision 0047 items 3 and 10, packet RD-9b1; the device half of the
-//! former RD-9a2).
+//! The resident state owner.
 //!
 //! [`ResidentState`] holds the three device buffers of [`StateLayout`] for one session: DeltaNet
 //! recurrent and convolution state, the KV cache, and the persistent words (`StepParams`, the
@@ -9,11 +8,11 @@
 //! rows, the pending steps and the health live in the pure [`StateBook`]; the host export lives in
 //! `export`.
 //!
-//! Every host copy goes through `DeviceBuffer::read_at` / `write_at` (RD-2c, `buffer_io.rs`), which
-//! take the `DeviceStream` that owns the work on the buffer, queue the copy behind that work and
-//! wait for that stream only. Every state call checks that the stream is the one the state was
-//! allocated with (`DeviceStream::id`, `context/stream.rs`). Bytes produced on another stream (a
-//! forked expert branch) must be joined into the owning stream with [`join_branches`] first.
+//! Every host copy goes through `DeviceBuffer::read_at` / `write_at` (`buffer_io.rs`), which take
+//! the `DeviceStream` that owns the work on the buffer, queue the copy behind that work and wait
+//! for that stream only. Every state call checks that the stream is the one the state was allocated
+//! with (`DeviceStream::id`, `context/stream.rs`). Bytes produced on another stream (a forked
+//! expert branch) must be joined into the owning stream with [`join_branches`] first.
 //!
 //! The device is little endian, so every value is read and written as little-endian bytes.
 
@@ -61,8 +60,8 @@ const _: () = assert!(OFFSET_KV_LEN == OFFSET_POS + 4 && OFFSET_KV_SLOT == OFFSE
 
 /// One 4-byte field of the `StepParams` block. A kernel that reads or writes a single field takes
 /// that 4-byte range and never the 32-byte block: the router would otherwise OR its bit into
-/// `token_id` (byte 0). `TokenId` is the id the
-/// embedding of RD-4c gathers; `kv_slot` gets a variant when a kernel takes it.
+/// `token_id` (byte 0). `TokenId` is the id the embedding gathers; `kv_slot` gets a variant when a
+/// kernel takes it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum StepField {
     TokenId,
@@ -72,7 +71,7 @@ pub(crate) enum StepField {
 }
 
 impl StepField {
-    /// Byte offset inside `StepParams`, from the merged RD-4d constants.
+    /// Byte offset inside `StepParams`, from the shared `StepParams` offset constants.
     pub(crate) const fn offset(self) -> usize {
         match self {
             Self::TokenId => OFFSET_TOKEN_ID,
@@ -403,13 +402,13 @@ impl ResidentState {
         self.book.cancel_last()
     }
 
-    /// Commits the oldest pending step after the host read its result pair; `status` is the
-    /// pair's status word. **In stage 1 any non-zero status bit (1, 2, 4, 8 or unknown) poisons
-    /// the state** and commits nothing; the refusal is the wrapper's status class (`Backend`,
+    /// Commits the oldest pending step after the host read its result pair; `status` is the pair's
+    /// status word. **In stage 1 any non-zero status bit (1, 2, 4, 8 or unknown) poisons the
+    /// state** and commits nothing; the refusal is the wrapper's status class (`Backend`,
     /// `StepStatus::error()`, precedence 4 > 8 > 1 > 2) behind `CommitRefusal::Status`, which
-    /// converts to `EngError` with that class. Stage 1 commits whole steps only (`accepted`
-    /// equals the step's advance): a lower count means the step already ran, the DeltaNet slot
-    /// is ahead of `tokens` (no per-row snapshot until RD-7c) and the step cannot be undone, so
+    /// converts to `EngError` with that class. Stage 1 commits whole steps only (`accepted` equals
+    /// the step's advance): a lower count means the step already ran, the DeltaNet slot is ahead of
+    /// `tokens` (there is no per-row snapshot) and the step cannot be undone, so
     /// `CommitRefusal::Partial` POISONS too. Any other refusal changes nothing.
     pub(crate) fn commit_step(
         &mut self,
@@ -421,9 +420,9 @@ impl ResidentState {
 
     /// Marks the state untrustworthy until the next `reset` or a successful `import_state`: the
     /// executor calls it for ANY non-zero status bit of a step or prefill report (1, 2, 4, 8 or
-    /// unknown bits; REPLY-76 Q2) and for any error after the first launch of a step. Host flag
-    /// only: it stops new work at `enqueue_rows` and gates commit, export and `revalidate`. It
-    /// cannot cancel kernels already queued; see `poison_device`.
+    /// unknown bits) and for any error after the first launch of a step. Host flag only: it stops
+    /// new work at `enqueue_rows` and gates commit, export and `revalidate`. It cannot cancel
+    /// kernels already queued; see `poison_device`.
     pub(crate) fn poison(&mut self) {
         self.resident_tip = None;
         self.book.poison();
@@ -445,7 +444,7 @@ impl ResidentState {
             .write_at(stream, Word::StepParams.offset() + OFFSET_POS, &poison)
     }
 
-    /// Opens a prefill chunk (decision 0049): decode steps are refused until `revalidate`.
+    /// Opens a prefill chunk: decode steps are refused until `revalidate`.
     pub(crate) fn begin_prefill(&mut self) -> Result<(), EngError> {
         self.book.begin_prefill()?;
         self.invalidate_tip_before_write();
@@ -469,20 +468,17 @@ impl ResidentState {
         self.book.revalidate(tokens, prefill_status)
     }
 
-    /// Zeroes the prefill status word (decision 0049 item 10): a 4-byte `write_at` of
-    /// `Word::PrefillStatus`, ordered on `stream` behind the work already queued there. Called
-    /// at chunk open, right after `begin_prefill`: the stream is drained at a chunk boundary
-    /// (the previous chunk ended with its status read), so the write queues behind nothing, and
-    /// a bit left by an earlier chunk cannot fail this one. Blocking like every `write_at` of
-    /// this type. A failed write leaves the state `PrefillOpen`, not poisoned: an open chunk
-    /// already refuses decode, commit, export and a new `begin_prefill`, `reset` accepts any
-    /// health, and the driver poisons on any error of the chunk body (§C.4 step 2).
+    /// Zeroes the prefill status word: a 4-byte `write_at` of `Word::PrefillStatus`, ordered on
+    /// `stream` behind the work already queued there. Called at chunk open, right after
+    /// `begin_prefill`: the stream is drained at a chunk boundary (the previous chunk ended with
+    /// its status read), so the write queues behind nothing, and a bit left by an earlier chunk
+    /// cannot fail this one. Blocking like every `write_at` of this type. A failed write leaves the
+    /// state `PrefillOpen`, not poisoned: an open chunk already refuses decode, commit, export and
+    /// a new `begin_prefill`, `reset` accepts any health, and the driver poisons on any error of
+    /// the chunk body.
     #[cfg_attr(
         not(test),
-        expect(
-            dead_code,
-            reason = "first caller: the CPF-7 prefill driver (decision 0049)"
-        )
+        expect(dead_code, reason = "first caller: the chunked prefill driver")
     )]
     pub(crate) fn clear_prefill_status(&self, stream: &DeviceStream) -> Result<(), EngError> {
         self.book
@@ -500,10 +496,7 @@ impl ResidentState {
     /// for the same reasons as a failed clear.
     #[cfg_attr(
         not(test),
-        expect(
-            dead_code,
-            reason = "first caller: the CPF-7 prefill driver (decision 0049)"
-        )
+        expect(dead_code, reason = "first caller: the chunked prefill driver")
     )]
     pub(crate) fn read_prefill_status(&self, stream: &DeviceStream) -> Result<i32, EngError> {
         self.book
@@ -538,8 +531,8 @@ impl ResidentState {
         self.book.begin_block(stream.id())
     }
 
-    /// The book guard of the chunk body (CPF-7a part 2, B.3): the owning stream and an open
-    /// prefill chunk; `check_block` requires `Valid` and refuses every chunk.
+    /// The book guard of the chunk body: the owning stream and an open prefill chunk; `check_block`
+    /// requires `Valid` and refuses every chunk.
     pub(super) fn check_chunk(&self, stream: &DeviceStream) -> Result<(), EngError> {
         self.book.begin_prefill_word(stream.id(), "run_chunk")
     }
@@ -547,13 +540,13 @@ impl ResidentState {
     /// Zeroes every DeltaNet slot and the words in place, ordered on `stream`, and forgets the KV
     /// positions and the pending steps (the copies run behind all work queued on the stream).
     ///
-    /// Reset invariant under Int8G32 (KV8-B, design item 5): a reset leaves the STALE codes and
-    /// scales in every cell >= the new kv_len — nothing rewrites or clears them. That is
-    /// correct only because `attn_decode_q8` reads cells `[0, kv_len)` and every cell it does
-    /// read was appended in the CURRENT session before it is read: `pos` restarts at 0 after
-    /// the reset, so the decode at position p (kv_len = p + 1) reads exactly the cells the
-    /// tokens 0..=p of this session appended. The step device test of B5 pins it: 64 tokens of
-    /// a foreign prompt, a reset, then P5 is bitwise a fresh session's P5.
+    /// Reset invariant under Int8G32: a reset leaves the STALE codes and scales in every cell >=
+    /// the new kv_len — nothing rewrites or clears them. That is correct only because
+    /// `attn_decode_q8` reads cells `[0, kv_len)` and every cell it does read was appended in the
+    /// CURRENT session before it is read: `pos` restarts at 0 after the reset, so the decode at
+    /// position p (kv_len = p + 1) reads exactly the cells the tokens 0..=p of this session
+    /// appended. The step device test pins it: 64 tokens of a foreign prompt, a reset, then P5 is
+    /// bitwise a fresh session's P5.
     pub(crate) fn reset(&mut self, stream: &DeviceStream) -> Result<(), EngError> {
         let valid = self.health() == Health::Valid;
         self.book.begin_reset(stream.id())?;
@@ -640,7 +633,7 @@ impl ResidentState {
 /// a caller that ran a forked step (stage 1b) joins first, also before a reset after a poison.
 /// The record and its wait are queued next to each other, so one event may serve several
 /// branches.
-#[expect(dead_code, reason = "first caller: RD-11b (stage 1b)")]
+#[expect(dead_code, reason = "first caller: the forked step (stage 1b)")]
 pub(crate) fn join_branches(
     state: &ResidentState,
     main: &DeviceStream,

@@ -1,15 +1,16 @@
-//! Seam-1 device tests (3090) of the gated DeltaNet wrapper (RD-7b): the Rust wrapper against the C shim against
-//! `gated_delta_k`, compared with an f64 host reference written for the Qwen3.6 GGUF semantics; the RD-M6 llama.cpp
-//! dumps are the oracle data of the six `delta_oracle_*` tests. Run with `--test-threads=1` (decision 0040).
+//! Seam-1 device tests (3090) of the gated DeltaNet wrapper: the Rust wrapper against the C shim
+//! against `gated_delta_k`, compared with an f64 host reference written for the Qwen3.6 GGUF
+//! semantics; the llama.cpp dumps are the oracle data of the six `delta_oracle_*` tests. Run with
+//! `--test-threads=1`.
 //!
-//! E4 is lane M's REPLY-55 (2^-12, E-form, provisional until the first GPU step; domain one DeltaNet layer, 128 to
-//! 1,152 steps). Every group prints its UNROUNDED maximum with the head and the step; a failed comparison is reported,
-//! never widened. Argued, not tested: T6 (graph capture) is deferred to RD-11a (no `GraphExec` at the base); a freed
-//! buffer cannot be written as a row (a `DeviceRange` borrows its buffer); the kernel reads no position word
+//! E4 is 2^-12 (E-form, provisional until the first GPU step; domain one DeltaNet layer, 128 to
+//! 1,152 steps). Every group prints its UNROUNDED maximum with the head and the step; a failed
+//! comparison is reported, never widened. Argued, not tested: a freed buffer cannot be written as
+//! a row (a `DeviceRange` borrows its buffer); the kernel reads no position word
 //! (`check_no_position.py`), so no poisoned `StepParams` test applies.
 #![allow(
     non_snake_case,
-    reason = "the oracle test names carry the layer and prompt exactly as the packet names them"
+    reason = "the oracle test names carry the layer and prompt as `L<n>_P<n>`"
 )]
 
 use std::path::{Path, PathBuf};
@@ -19,10 +20,10 @@ use crate::EngError;
 use crate::kernels::cuda::testkit::{self, Rng, fnv1a64, read_f32_file, silu_f64, softplus_f64};
 use crate::kernels::cuda::{CapturePlan, CudaContext, DeviceBuffer, DeviceRange, DeviceStream};
 
-/// E4, provisional (REPLY-55): `max |d| <= E4 * max(max |ref|, 1)` per step vector and for the end state; lane M
-/// tightens it after the first GPU step.
+/// E4, provisional: `max |d| <= E4 * max(max |ref|, 1)` per step vector and for the end state;
+/// it is tightened after the first GPU step.
 const E4: f64 = 1.0 / 4096.0;
-/// x <= X_STOP (2^-14) makes E4 final; above it the packet says STOP and report.
+/// x <= X_STOP (2^-14) makes E4 final; above it E4 is not final.
 const X_STOP: f64 = 1.0 / 16384.0;
 /// The reference proves itself against `attn_output` within 2^-18.
 const SELF_CHECK: f64 = 1.0 / 262_144.0;
@@ -58,7 +59,7 @@ impl Layout {
         }
     }
 
-    /// Odd offsets and padded rows, as the RD-4V harness.
+    /// Odd offsets and padded rows.
     fn odd(nk: usize, nv: usize) -> Self {
         let (alpha_off, z_off) = (3, 3 + nv + 5);
         let beta_off = z_off + nv * D + 7;
@@ -138,7 +139,7 @@ fn uniform(rng: &mut Rng, lo: f64, hi: f64) -> f64 {
     lo + (hi - lo) * rng.unit()
 }
 
-/// The T1 generator of the packet: conv q, k ~ N(0,1), v ~ N(0,7^2), z ~ N(0,3^2), beta logit ~ N(0,2.5^2),
+/// The T1 generator: conv q, k ~ N(0,1), v ~ N(0,7^2), z ~ N(0,3^2), beta logit ~ N(0,2.5^2),
 /// `a = -exp(U(-4, 4.3))`, `dt_bias ~ U(-5.3, 15.6)`, a target decay exponent `10^U(-5, 1.5)` per head times
 /// `exp(0.3 N)` per step, start state N(0, 0.1^2). With `forced` and 32 heads, heads 29 to 31 get 3e-8, 1e-6, 1e-5.
 fn generate(nk: usize, nv: usize, m: usize, lay: Layout, seed: u64, forced: bool) -> Inputs {
@@ -434,7 +435,7 @@ fn judge(label: &str, inp: &Inputs, run: &Run, heads: &[usize]) -> Group {
 
 fn stop_rule(label: &str, x: f64) {
     println!(
-        "STOP-RULE: x = {x:e} ({label}; <= X_STOP {X_STOP:e}: final; above: STOP and report) holds={}",
+        "stop rule: x = {x:e} ({label}; <= X_STOP {X_STOP:e}: final; above: not final) holds={}",
         x <= X_STOP
     );
 }
@@ -763,10 +764,7 @@ fn delta_matches_the_f64_reference_1152() {
         return;
     }
     let group = long_rollout(&Rig::new(), 1152, "T1c (16,32,1152) reported only");
-    println!(
-        "T1c reported only (REPLY-59 Q1): maximum {}",
-        group.late.show()
-    );
+    println!("T1c reported only: maximum {}", group.late.show());
 }
 
 #[test]
@@ -1551,9 +1549,9 @@ oracle_tests! {
     delta_oracle_L5_P1: 5, "P1";
 }
 
-// ---------------------------------------------------------------- T6 (RD-11a)
+// ---------------------------------------------------------------- T6: graph capture
 
-/// The capture plan of the owed test: the rig owns every buffer, so no pin and no hold.
+/// The capture plan of the capture test: the rig owns every buffer, so no pin and no hold.
 fn no_pins() -> CapturePlan<'static> {
     CapturePlan {
         pins: &[],
@@ -1561,9 +1559,9 @@ fn no_pins() -> CapturePlan<'static> {
     }
 }
 
-/// T6 (RD-7b, owed): one `gdn_delta` call captured and replayed twice equals the eager run bit
-/// for bit (out and end state), on a one-node graph. The warm-up launch and the eager reference
-/// run on scratch buffers, so the captured buffers still hold their start state.
+/// T6: one `gdn_delta` call captured and replayed twice equals the eager run bit for bit (out
+/// and end state), on a one-node graph. The warm-up launch and the eager reference run on scratch
+/// buffers, so the captured buffers still hold their start state.
 #[test]
 fn delta_inside_a_capture_equals_eager() {
     if !testkit::device_present("delta_inside_a_capture_equals_eager") {

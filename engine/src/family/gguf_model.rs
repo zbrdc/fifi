@@ -1,12 +1,12 @@
-//! GGUF model opener for Qwen3.6-35B-A3B (decision 0040, packet 5).
+//! GGUF model opener for Qwen3.6-35B-A3B.
 //!
-//! `open_qwen3_6_35b_a3b` opens one single-file GGUF under the item 4 limits, checks
-//! `general.architecture` and the block, embedding, expert and used-expert counts,
-//! matches the tensor set against the `inventory` exactly, checks every tensor's type
-//! and dims, and checks the CUDA tile rules of the `DeviceTiled` tensors. The open is
-//! strict: a tensor of any type the role does not allow, an extra or missing tensor,
-//! or a wrong count fails and names the tensor or key. There is no skip mode. The
-//! public surface is `open_qwen3_6_35b_a3b`, `GgufModel`, `ModelPlan` and `TensorPath`.
+//! `open_qwen3_6_35b_a3b` opens one single-file GGUF under the `LIMITS` header and tensor limits,
+//! checks `general.architecture` and the block, embedding, expert and used-expert counts, matches
+//! the tensor set against the `inventory` exactly, checks every tensor's type and dims, and checks
+//! the CUDA tile rules of the `DeviceTiled` tensors. The open is strict: a tensor of any type the
+//! role does not allow, an extra or missing tensor, or a wrong count fails and names the tensor or
+//! key. There is no skip mode. The public surface is `open_qwen3_6_35b_a3b`, `GgufModel`,
+//! `ModelPlan` and `TensorPath`.
 
 use std::{
     collections::HashMap,
@@ -31,7 +31,7 @@ pub use inventory::TensorPath;
 
 /// `general.architecture` of the llama.cpp conversion of Qwen3.6-35B-A3B.
 const ARCHITECTURE: &str = "qwen35moe";
-/// Decision 0040 item 4 limits.
+/// The header and per-tensor size limits of the GGUF open.
 const LIMITS: GgufLimits = GgufLimits {
     max_header_bytes: 100_000_000,
     max_tensor_bytes: 1 << 30,

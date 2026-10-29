@@ -562,10 +562,10 @@ mod tests {
         }
     }
 
-    /// The bf16 coverage of the identity gate (review MustFix 1): the batched
-    /// path under the daily-engine activation must match its own solo loop
-    /// exactly too - this is the dtype plumbing the F32 fixture does not reach
-    /// (the embed stack's activation cast most of all).
+    /// The bf16 coverage of the identity gate: the batched path under the
+    /// daily-engine activation must match its own solo loop exactly too - this
+    /// is the dtype plumbing the F32 fixture does not reach (the embed stack's
+    /// activation cast most of all).
     #[test]
     fn step_rows_matches_the_solo_loop_per_slot_bf16() {
         let _serial = crate::native_test_lock();
@@ -609,9 +609,9 @@ mod tests {
         }
     }
 
-    /// The admission atomicity of `step_rows` (review MustFix 2): a later
-    /// slot's refusal must leave EVERY state usable - no slot pays for another
-    /// slot's context-limit breach. A state at its context limit refuses
+    /// The admission atomicity of `step_rows`: a later slot's refusal must
+    /// leave EVERY state usable - no slot pays for another slot's
+    /// context-limit breach. A state at its context limit refuses
     /// `check_step`; the healthy state must still step afterwards.
     #[test]
     fn step_rows_refusal_leaves_every_state_unchanged() {
@@ -641,12 +641,12 @@ mod tests {
         assert!(r.token.is_some());
     }
 
-    /// Real-weight diagnostic; requires a new MAC-GO for each run.
-    /// Checks greedy tokens at B=2/4/8 against solo streams with distinct
-    /// initial tokens; it does not establish logit identity. Reports uncompiled
-    /// BF16 host-routing decode timing and serial prefill service time, not
-    /// integrated scheduler TTFT or a compiled daily-engine comparison.
-    /// Ignored by default: set Q36_CKPT_DIR to the real checkpoint.
+    /// Real-weight diagnostic, run by name only. Checks greedy tokens at
+    /// B=2/4/8 against solo streams with distinct initial tokens; it does not
+    /// establish logit identity. Reports uncompiled BF16 host-routing decode
+    /// timing and serial prefill service time, not integrated scheduler TTFT or
+    /// a compiled daily-engine comparison. Ignored by default: set Q36_CKPT_DIR
+    /// to the real checkpoint.
     #[test]
     #[ignore = "real weights: set Q36_CKPT_DIR"]
     fn real_weights_identity_distinct_prompts_and_timing() {

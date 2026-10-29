@@ -40,8 +40,8 @@ extern "C" {
 int inference_cuda_device_count(int *out_count);
 
 /* Writes the driver's module loading mode to *out_mode (the CUmoduleLoadingMode of cuda.h:
- * CU_MODULE_EAGER_LOADING 1, CU_MODULE_LAZY_LOADING 2). The observation point of the
- * eager-loading pin of KV8-B B4'. */
+ * CU_MODULE_EAGER_LOADING 1, CU_MODULE_LAZY_LOADING 2). It observes the eager module
+ * loading that smoke.cu sets before CUDA initializes. */
 int inference_cuda_module_loading_mode(int *out_mode);
 
 /* Stage of the first failure in a device call. The Rust caller turns the
@@ -117,13 +117,13 @@ int inference_cuda_free(void *device, int *out_stage);
 /* Host only, no CUDA call: posix_fadvise(fd, offset, len,
  * POSIX_FADV_DONTNEED). Returns INFERENCE_CUDA_INVALID_ARGUMENT for a
  * negative argument or a failed call; *out_errno holds the error number of
- * a failed call and 0 otherwise. Decision 0040 item 5 measures whether
- * dropping the page cache of uploaded ranges frees unified memory. */
+ * a failed call and 0 otherwise. It measures whether dropping the page
+ * cache of uploaded ranges frees unified memory. */
 int inference_cuda_drop_page_cache(int fd, long long offset, long long len,
                                    int *out_errno);
 
 /* GGML type codes the tiled weight functions accept. Q5_0 is accepted only by
- * inference_cuda_linear_ws (MEL-C1b); its tiles are built on the host, not by repack. */
+ * inference_cuda_linear_ws; its tiles are built on the host, not by repack. */
 #define INFERENCE_CUDA_TYPE_Q5_0 6
 #define INFERENCE_CUDA_TYPE_Q8_0 8
 #define INFERENCE_CUDA_TYPE_Q4_K 12
@@ -168,7 +168,7 @@ int inference_cuda_linear_workspace_bytes(int m, int k, int n_rows, size_t *out_
  * m * n_rows floats, both host memory; workspace holds the device scratch and
  * is not freed or retained. Nothing is allocated or freed. The call copies x
  * in, packs, multiplies, waits for the device, and copies y back.
- * Q5_0 (type 6, MEL-C1b): k is a multiple of 128, m is at most 16, and the
+ * Q5_0 (type 6, own kernel): k is a multiple of 128, m is at most 16, and the
  * workspace is sized by inference_cuda_linear_workspace_bytes for k rounded
  * up to a multiple of 256 (x holds m rows of that width); the call zeroes the
  * tail of each staged row. */

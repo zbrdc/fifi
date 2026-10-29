@@ -2,7 +2,7 @@
 // operands and f32 accumulation, ONE kernel.  KERNEL BODY ONLY (MLX fast metal_kernel generates the signature from the
 // input / output names and the template arguments; the grid is in THREADS).
 // Inputs, in this order: q k v g beta state_in T.   Outputs: y state_out.   Exactly the contract of the vendored mlx-lm
-// kernel gated_delta_step (decision 0050): all F32, B = 1;
+// kernel gated_delta_step: all F32, B = 1;
 //   q [1,T,Hk,Dk] after L2 norm and the 1/sqrt(Dk) scale, k [1,T,Hk,Dk] after L2 norm, v [1,T,Hv,Dv],
 //   g [1,T,Hv] decay FACTOR, beta [1,T,Hv], state_in [1,Hv,Dv,Dk] (key index fastest), T int scalar input,
 //   y [1,T,Hv,Dv], state_out [1,Hv,Dv,Dk].   Value head h reads key head h / (Hv / Hk).

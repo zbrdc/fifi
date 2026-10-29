@@ -1,13 +1,11 @@
-//! Where the persistent state of the resident step lives: byte offsets of the DeltaNet pool, the
-//! KV pool and the persistent words, and the order of every element inside them (decision 0047
-//! items 3 and 10).
+//! Where the persistent state of the resident step lives: byte offsets of the DeltaNet pool, the KV
+//! pool and the persistent words, and the order of every element inside them.
 //!
-//! Pure host arithmetic; the device owner is `state.rs`. The orders below are the CONTRACT that
-//! the DeltaNet kernels (RD-7a, RD-7b), the attention kernels (RD-8a, RD-8b, RD-8k) and
-//! `export_state` / `import_state` share. They follow the GGUF semantics of llama.cpp
-//! `acecd5603` (tiled key heads, `ssm_a` as stored, `silu(z)`), but two orders are the
-//! TRANSPOSE of the reference ones (the kernels' own documentation, `gdn_delta.h` and
-//! `gdn_conv.h`, says the same):
+//! Pure host arithmetic; the device owner is `state.rs`. The orders below are the CONTRACT that the
+//! DeltaNet kernels, the attention kernels and `export_state` / `import_state` share. They follow
+//! the GGUF semantics of llama.cpp `acecd5603` (tiled key heads, `ssm_a` as stored, `silu(z)`), but
+//! two orders are the TRANSPOSE of the reference ones (the kernels' own documentation,
+//! `gdn_delta.h` and `gdn_conv.h`, says the same):
 //!
 //! - DeltaNet recurrent state, per layer, f32, element `(h, i, j)` of value head `h`, key row `i`,
 //!   value column `j` at index `(h * key_dim + i) * value_dim + j` (the value column is the
@@ -17,43 +15,43 @@
 //!   oldest first, channel fastest. ggml and the host ring of the Q36 reference are
 //!   `[channel][tap]`.
 //! - KV, `Fp16`: per attention layer a K plane and a V plane, fp16 `[position][kv head][head_dim]`.
-//! - KV, `Int8G32` (lossy; allocated from RD-8k): codes `i8 [kv head][cell][head_dim]` and
+//! - KV, `Int8G32` (lossy): codes `i8 [kv head][cell][head_dim]` and
 //!   scales fp16 `[kv head][cell][head_dim / 32]`, separate K and V planes, `cell = position`,
 //!   `scale = amax / 127`.
 //!
 //! The kernel headers `gdn_delta.h` and `gdn_conv.h` say an import or export "transposes": that
 //! means a conversion TO the reference order transposes. The export in this contract copies the
-//! device order verbatim and never converts; no converter exists, so a llama.cpp or Q36-HR state
-//! cannot be imported, and a transposing export would break the layout tag.
+//! device order verbatim and never converts; no converter exists, so a llama.cpp or host-reference
+//! state cannot be imported, and a transposing export would break the layout tag.
 //!
 //! # Persistent words
 //!
 //! Three small regions live in their own block, not in a step arena, because their address must be
-//! the same for every captured graph of every row count and for the prefill path: `StepParams`
-//! (RD-4d, 32 bytes), the result pair `{token, status}` (RD-4d, 8 bytes, 8-byte aligned; room
-//! for 32 pairs) and the prefill status word (decision 0049, 4 bytes, mask 8). Each region is
-//! `STATE_ALIGN` bytes apart, so a later word is appended at the end and never moves another.
-//! `reset` zeroes the block, which is an invalid `StepParams` (`kv_len != pos + 1`): the host
-//! writes a valid block before the first step.
+//! the same for every captured graph of every row count and for the prefill path: `StepParams` (32
+//! bytes), the result pair `{token, status}` (8 bytes, 8-byte aligned; room for 32 pairs) and the
+//! prefill status word (4 bytes, mask 8). Each region is `STATE_ALIGN` bytes apart, so a later word
+//! is appended at the end and never moves another. `reset` zeroes the block, which is an invalid
+//! `StepParams` (`kv_len != pos + 1`): the host writes a valid block before the first step.
 //!
-//! # Export contract (REPLY-43 item 4)
+//! # Export contract
 //!
 //! The export carries the device orders above verbatim and the layout tag `LAYOUT_TAG`
 //! (`qwen36-gguf-xq-1`, in `state.rs`) with the KV mode and the geometry. `import_state` refuses a
 //! different tag, mode or geometry before the first device write. No code converts to the host
-//! order of llama.cpp or of Q36-HR implicitly; such a conversion is a separate, explicit step.
+//! order of llama.cpp or of the host reference implicitly; such a conversion is a separate,
+//! explicit step.
 //!
 //! # Prefill and verify windows
 //!
-//! Prefill (decision 0049) has its own arena, sized by `family/qwen36/cuda/prefill_plan.rs`, with
-//! no overlay on the decode arena. It writes the KV rows `[p0, p0 + M)` and the DeltaNet state of
-//! slot 0 IN PLACE, through the offsets of this file, so nothing here changes when it lands. The
-//! handoff to decode is: the committed token count `ResidentState::tokens()` equals the `pos` of
-//! the first decode token, and the host writes `StepParams` with that `pos`; prefill reads and
-//! writes no `StepParams` field. A verify window of M rows (MEL-PLAN 6.5, M up to 8) writes KV
-//! rows `pos .. pos + M` before it knows how many are accepted; a rollback is a lower committed
-//! count (the KV cache is never cleared) plus the DeltaNet slot the window needs (RD-7c).
-//! `KvPool::capacity` is the `rows` argument of RD-4d's `ensure_rows`.
+//! Prefill has its own arena, sized by `family/qwen36/cuda/prefill_plan.rs`, with no overlay on the
+//! decode arena. It writes the KV rows `[p0, p0 + M)` and the DeltaNet state of slot 0 IN PLACE,
+//! through the offsets of this file, so nothing here changes when it lands. The handoff to decode
+//! is: the committed token count `ResidentState::tokens()` equals the `pos` of the first decode
+//! token, and the host writes `StepParams` with that `pos`; prefill reads and writes no
+//! `StepParams` field. A verify window of M rows (M up to 8) writes KV rows `pos .. pos + M` before
+//! it knows how many are accepted; a rollback is a lower committed count (the KV cache is never
+//! cleared) plus the DeltaNet slot the window needs. `KvPool::capacity` is the `rows` argument of
+//! `step_params::ensure_rows`.
 //!
 //! Sizing is per component, and the DeltaNet pool is indexed by slot.
 
@@ -326,12 +324,12 @@ impl KvPool {
 /// A persistent device word (see the module doc).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Word {
-    /// RD-4d `StepParams`.
+    /// The `StepParams` block.
     StepParams,
-    /// RD-4d result pair `{token, status}`; the host copies these 8 bytes after a step.
+    /// The result pair `{token, status}`; the host copies these 8 bytes after a step.
     ResultPair,
-    /// Decision 0049 prefill status word; the host zeroes it at chunk open
-    /// (`ResidentState::clear_prefill_status`), replacing 0049 item 10's first-kernel rule.
+    /// The prefill status word; the host zeroes it at chunk open
+    /// (`ResidentState::clear_prefill_status`), not the first kernel of the chunk.
     PrefillStatus,
 }
 
@@ -348,8 +346,8 @@ const _: () = assert!(
 );
 
 impl Word {
-    /// Bytes the kernels use: RD-4d's `STEP_PARAMS_BYTES` (32) and `RESULT_PAIR_BYTES` (8), taken
-    /// from the merged wrapper, and one i32 for the prefill status.
+    /// Bytes the kernels use: `STEP_PARAMS_BYTES` (32) and `RESULT_PAIR_BYTES` (8), taken from the
+    /// kernel wrapper, and one i32 for the prefill status.
     pub(crate) const fn bytes(self) -> usize {
         match self {
             Self::StepParams => STEP_PARAMS_BYTES,
@@ -391,9 +389,9 @@ pub(crate) struct StateLayout {
 }
 
 impl StateLayout {
-    /// Device bytes of the pools and the words, the state term of the admission sum (decision
-    /// 0047 item 6). The decode arena (`StepPlan::arena_bytes`), the workspace (`Admission`) and
-    /// a prefill arena are separate terms.
+    /// Device bytes of the pools and the words, the state term of the admission sum. The decode
+    /// arena (`StepPlan::arena_bytes`), the workspace (`Admission`) and a prefill arena are
+    /// separate terms.
     pub(crate) fn bytes(&self) -> Result<usize, EngError> {
         add(add(self.delta.total, self.kv.total)?, self.words.total)
     }

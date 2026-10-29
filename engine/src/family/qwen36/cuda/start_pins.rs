@@ -1,15 +1,15 @@
-//! The text pins of the CUDA serve start (CUDA-SERVE-1 test 6): the capture setting must
-//! reach the step after its construction and before the return, and the rules must be built
-//! from the loaded bundle BEFORE every device call. The step cannot run on a CPU, so the
-//! wiring is pinned on the source text of `start.rs`, and for the tiered mode (OFF-2-F) also
-//! of `tiered_load.rs` and of the capture backstop in `step.rs`, in the gate's c17 style:
-//! comments stripped, whitespace collapsed, so only the real calls match.
+//! The text pins of the CUDA serve start: the capture setting must reach the step after its
+//! construction and before the return, and the rules must be built from the loaded bundle BEFORE
+//! every device call. The step cannot run on a CPU, so the wiring is pinned on the source text of
+//! `start.rs`, and for the tiered mode also of `tiered_load.rs` and of the capture backstop in
+//! `step.rs`, in the gate's style: comments stripped, whitespace collapsed, so only the real calls
+//! match.
 
 #[test]
 fn serve_hands_the_capture_setting_to_the_step() {
-    // The step cannot run on the CPU, so the wiring is pinned on start.rs's own text (the c17
-    // style of the gate's build_step pin): comments stripped, whitespace collapsed, so only
-    // the real call with its `?` matches and a comment or a dead spelling cannot.
+    // The step cannot run on the CPU, so the wiring is pinned on start.rs's own text (the style of
+    // the gate's build_step pin): comments stripped, whitespace collapsed, so only the real call
+    // with its `?` matches and a comment or a dead spelling cannot.
     let body = pinned(fn_section("fn make("));
     let length = body.len();
     let call = body.find("set_capture_config(CaptureConfig{capture:settings.capture");
@@ -29,9 +29,9 @@ fn serve_hands_the_capture_setting_to_the_step() {
 
 #[test]
 fn load_options_writes_the_native_layout_outright() {
-    // The S2 seam admits two layouts; the serve load carries the native one IN ITS OWN TEXT
-    // (MSG-70 condition 8), not through a derived default: the S3c-qualified flip is this one
-    // field of `load_options`, and a mutant back to Tiled (or to a default) fails here.
+    // The load admits two layouts; the serve load carries the native one IN ITS OWN TEXT, not
+    // through a derived default: the switch to the qualified native layout is this one field of
+    // `load_options`, and a mutant back to Tiled (or to a default) fails here.
     let body = pinned(fn_section("fn load_options("));
     assert!(
         body.contains("LoadOptions{"),
@@ -44,10 +44,10 @@ fn load_options_writes_the_native_layout_outright() {
 
 #[test]
 fn the_guard_is_committed_between_the_leaks_and_the_step() {
-    // KUBDAN-MSG-72 item 3: the commit pins the one-engine flag right after the LAST leak and
-    // BEFORE the step and the capture call, so a failure from either keeps the flag up (the
-    // process is restarted, not rebuilt) and a success does not release it. Mutants "commit
-    // removed" and "commit moved after the step or capture" break this order pin.
+    // The commit pins the one-engine flag right after the LAST leak and BEFORE the step and the
+    // capture call, so a failure from either keeps the flag up (the process is restarted, not
+    // rebuilt) and a success does not release it. Mutants "commit removed" and "commit moved after
+    // the step or capture" break this order pin.
     let make = pinned(fn_section("fn make("));
     let leaks = make.rfind("Box::leak(").expect("make leaks its owners");
     let commit = make
@@ -67,18 +67,17 @@ fn the_guard_is_committed_between_the_leaks_and_the_step() {
 
 #[test]
 fn make_takes_the_step_layout_from_the_loaded_weights() {
-    // KUBDAN-MSG-72 item 1 (the S3b merge): make builds the step options AFTER the load, from
-    // the loaded weights' own layout, and BEFORE the step resources; never from a layout
-    // constant or from the load options. Mutant m20 "layout read from the load options" breaks
-    // the call this pin finds.
+    // make builds the step options AFTER the load, from the loaded weights' own layout, and BEFORE
+    // the step resources; never from a layout constant or from the load options. The mutant "layout
+    // read from the load options" breaks the call this pin finds.
     let make = pinned(fn_section("fn make("));
     let load = make.find("load_model(").expect("make loads the model");
     let layout = make
         .find("device.layout()?")
         .expect("make reads the loaded weights' own layout");
-    let kv = make.find("kv_mode_of(settings.kv,layout)?").expect(
-        "make derives the KV mode from the parsed form and that layout (B4-F: not a constant)",
-    );
+    let kv = make
+        .find("kv_mode_of(settings.kv,layout)?")
+        .expect("make derives the KV mode from the parsed form and that layout (not a constant)");
     let options = make
         .find("step_options(settings.context_limit,layout,kv_mode)?")
         .expect("make builds the options from that layout and the resolved KV mode");
@@ -159,9 +158,9 @@ fn the_non_tiered_flag_off_path_keeps_the_one_entry_default_store() {
 
 #[test]
 fn the_step_backstop_refuses_the_tiered_capture_pair_before_the_session_runs() {
-    // OFF-2-F4: the settings, the start, the gate and the block each refuse tiered together with a
-    // capture; this is the step's own backstop, the one a caller that builds the step by hand meets.
-    // It runs after the sync-each check and before the "capture mode is fixed" check, so deleting it or
+    // The settings, the start, the gate and the block each refuse tiered together with a capture;
+    // this is the step's own backstop, the one a caller that builds the step by hand meets. It runs
+    // after the sync-each check and before the "capture mode is fixed" check, so deleting it or
     // moving it behind the started test fails here.
     let body = pinned(section_of(
         include_str!("step.rs"),
@@ -184,9 +183,9 @@ fn the_step_backstop_refuses_the_tiered_capture_pair_before_the_session_runs() {
 
 #[test]
 fn the_tiered_load_builds_its_pool_through_tier_pool_and_names_no_kernel() {
-    // OFF-2-F3: the kernel of the tier is chosen in ONE place (tier_kernel, behind tier_pool). A
-    // build_tiered that named a kernel or built the pool itself would bypass the choice the gate (b)
-    // runs and the device rule-C tests pin.
+    // The kernel of the tier is chosen in ONE place (tier_kernel, behind tier_pool). A build_tiered
+    // that named a kernel or built the pool itself would bypass the choice the gate runs and the
+    // device rule-C tests pin.
     let body = pinned(section_of(
         include_str!("tiered_load.rs"),
         "tiered_load.rs",
@@ -331,9 +330,9 @@ fn the_rules_are_built_before_the_first_device_call() {
 
 #[test]
 fn the_ignored_key_lines_print_through_the_helper_before_the_bundle() {
-    // KUBDAN-MSG-71 item 5: start() prints one line per ignored MLX key THROUGH the pure
-    // helper, before it reads the tokenizer bundle. Deleting the loop, or printing a constant
-    // instead of calling the helper, breaks the pin.
+    // start() prints one line per ignored MLX key THROUGH the pure helper, before it reads the
+    // tokenizer bundle. Deleting the loop, or printing a constant instead of calling the helper,
+    // breaks the pin.
     let start = pinned(fn_section("fn start("));
     let lines = start
         .find("ignored_mlx_line(key)")
@@ -350,10 +349,10 @@ fn the_ignored_key_lines_print_through_the_helper_before_the_bundle() {
 
 #[test]
 fn the_sha256_toggle_is_resolved_in_start_not_in_make() {
-    // SERVE-1-F F4: a bad Q36_VERIFY_GGUF_SHA256 spelling must fail FAST, at startup —
-    // start() resolves the toggle before the bundle, the guard and the spawn — while make()
-    // receives only the resolved bool (a mutant that moves the read or the validation onto
-    // the engine thread, after the projector exists, breaks both halves of the pin).
+    // A bad Q36_VERIFY_GGUF_SHA256 spelling must fail FAST, at startup — start() resolves the
+    // toggle before the bundle, the guard and the spawn — while make() receives only the resolved
+    // bool (a mutant that moves the read or the validation onto the engine thread, after the
+    // projector exists, breaks both halves of the pin).
     let start = pinned(fn_section("fn start("));
     let resolve = start
         .find("sha256_wanted(std::env::var(VERIFY_SHA256_VAR).ok().as_deref())?")
@@ -401,14 +400,14 @@ fn code_only_strips_comments_and_literals_and_never_loops() {
     assert!(code_only("fn f(step: &mut QwenResidentStep<'_>) {}").contains("QwenResidentStep<'_>"));
 }
 
-/// The text of one `fn` item of start.rs's production code, from the line that holds `start`
-/// to the next line that opens a `fn` item (the hardened c17 `gate/run.rs` style).
+/// The text of one `fn` item of start.rs's production code, from the line that holds `start` to the
+/// next line that opens a `fn` item (the hardened `gate/run.rs` style).
 fn fn_section(start: &str) -> &'static str {
     section_of(include_str!("start.rs"), "start.rs", start)
 }
 
-/// The same for any source file: `file` names it in the panic message. Shared with the
-/// other test modules of the family (the chunk-gate pins of `executor_tests`, review B-4).
+/// The same for any source file: `file` names it in the panic message. Shared with the other test
+/// modules of the family (the chunk-gate pins of `executor_tests`).
 pub(super) fn section_of(source: &'static str, file: &str, start: &str) -> &'static str {
     let at = source
         .find(start)
@@ -519,8 +518,7 @@ fn opens_char_literal(bytes: &[u8], at: usize) -> bool {
 }
 
 /// Code only, whitespace REMOVED (the gate's own form): a rustfmt re-wrap cannot break a pin.
-/// Shared with the other test modules of the family (the chunk-gate pins of
-/// `executor_tests`, review B-4).
+/// Shared with the other test modules of the family (the chunk-gate pins of `executor_tests`).
 pub(super) fn pinned(section: &str) -> String {
     code_only(section).split_whitespace().collect::<String>()
 }

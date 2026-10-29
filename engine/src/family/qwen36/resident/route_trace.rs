@@ -1,7 +1,7 @@
-//! The router traces of the real Q36 model (ANE plan, slice M3; Mac, ignored, real checkpoint).
+//! The router traces of the real Q36 model (Mac, ignored, real checkpoint).
 //!
 //! The question: which experts does the real router select, per layer and per token, over a real
-//! prompt? The decision head's only sanctioned role is predicting experts for speculative SSD
+//! prompt? The decision head's only role is predicting experts for speculative SSD
 //! prefetch, and every later accuracy claim needs these traces plus a lookahead baseline.
 //! Nothing exists yet, so this harness records the ground truth once.
 //!
@@ -9,7 +9,7 @@
 //! one-token step `ResidentDecoder::step` in `Record` mode with `Routing::Host`, the seam the
 //! parity gates already use: `StepResult.routes` holds the expert ids of every layer in rank
 //! order and `StepResult.probs` the router probability row `[experts]` behind each recorded
-//! route (fix3 of packet Q36-BF16-a). The gates come from `route::route_experts`, the function
+//! route. The gates come from `route::route_experts`, the function
 //! the step itself routed with, run on the exact recorded rows, so the derived ids equal the
 //! reported ids by construction; the report carries that equality as the summary field
 //! `ids_equal_step_routes` instead of an assert.

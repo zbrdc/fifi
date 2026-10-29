@@ -1,6 +1,6 @@
-//! Command-line tests of the `qwen3_8_flash_next` entry of `enginesrv` (packet H8c).
+//! Command-line tests of the `qwen3_8_flash_next` entry of `enginesrv`.
 //! No test loads weights. Every run stops at a configuration or backend error before an engine
-//! thread starts. Serving does not qualify Phase 0B or Phase 1B.
+//! thread starts.
 
 use std::process::{Command, Output};
 

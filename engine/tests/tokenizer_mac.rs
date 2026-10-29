@@ -1,8 +1,8 @@
 //! Mac reference rows for the tokenizer seams.
 //!
 //! These tests skip unless the pinned checkpoint directory is present.
-//! They cover S1-T6 file pins, S2-T8 golden id vectors, S2-T9 eos ids,
-//! and S4-T5 the rendered smoke prompt vector. They load no model and use no GPU.
+//! They cover the file pins, the golden id vectors, the eos ids, and the rendered smoke
+//! prompt vector. They load no model and use no GPU.
 use inference_engine::tokenizer::{
     DecodeBatch, DecodeFinish, IncrementalDecoder, OutputAssembler, PromptMessage, Role, Thinking,
     TokenizerBundle, TokenizerPin, ToolCallSpec, ToolSpec,
@@ -234,7 +234,7 @@ fn streamed_output_equals_the_one_shot_decode() {
         let ids = golden_ids(row);
         let expected = bundle.tokenizer().decode(&ids).expect("one-shot decode");
         // This loop mirrors `Executor::decode`: one batch per token, then the
-        // decoder tail on the EOS batch. S8-T4 replaces it with the real executor.
+        // decoder tail on the EOS batch. A test with the real executor can replace it.
         let mut decoder = IncrementalDecoder::new(bundle.tokenizer());
         let mut assembler =
             OutputAssembler::new(vec!["<<never-generated>>".to_string()]).expect("assembler");
@@ -326,9 +326,9 @@ fn golden_message(row: &serde_json::Value) -> PromptMessage {
     }
 }
 
-// Decision 0029: the checkpoint template, rendered with OpenAI tools as sent,
-// must match transformers 5.17.0 byte for byte, and the prompt ids must match
-// the ids of that reference text.
+// The checkpoint template, rendered with OpenAI tools as sent, must match
+// transformers 5.17.0 byte for byte, and the prompt ids must match the ids of
+// that reference text.
 #[test]
 fn tool_prompts_match_the_reference_on_the_real_bundle() {
     let Some((_dir, bundle)) = pinned_bundle() else {

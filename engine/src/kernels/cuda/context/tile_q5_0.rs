@@ -1,4 +1,4 @@
-//! Host repack of GGUF Q5_0 weights into the device tile (MEL-C1a).
+//! Host repack of GGUF Q5_0 weights into the device tile.
 //!
 //! A tile is 8 rows by 128 values: 4 blocks per row, 32 ggml `block_q5_0`
 //! of 22 bytes (`d`: 2 bytes, `qh`: 4, `qs`: 16), 704 bytes in all. Block

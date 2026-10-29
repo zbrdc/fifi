@@ -1,5 +1,5 @@
 //! Raw FFI to the dense MMQ GEMM entry of `native/prefill/mmq_dense.cu` (its header holds the
-//! full contract), CPF-V4 G2. Child module of `native/prefill.rs`, so it inherits the
+//! full contract). Child module of `native/prefill.rs`, so it inherits the
 //! `allow(unsafe_code)` of `native.rs`; the safety invariants are the parent's list.
 //! Addition of this entry: the launch only enqueues; the stream-k fixup range is sized by the
 //! safe wrapper (the device's maximum), and a range the vendored launch finds too short for

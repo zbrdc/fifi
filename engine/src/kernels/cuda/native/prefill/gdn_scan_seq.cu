@@ -1,16 +1,15 @@
-// CPF-DN-B K1/K2: the value-sliced sequential gated-delta scan over one chunk and the gated
-// output RMSNorm (decision 0049 design row 9, P-a; K1 restructured by CPF-DN-B). The
-// per-token math and its expression order are the vendored
-// kern::gated_delta (vendor/xavier-qwen/src/ops.cu gated_delta_k,
-// RD-4V); the launch idea (the per-column loop reading q/k rows that are already
-// L2-normalized and gates that are already computed, one warp per value column with 4 state
-// rows per lane) was read from the pinned llama.cpp gated_delta_net.cu for geometry only —
-// here the norms and gates are computed once per block into shared memory instead of once
-// per column warp. K1: grid (H, 1, D/32), block (32, 8), one block owns 32 value columns
-// and scans kTile-token tiles; the blocks share nothing (their state and o_out columns are
-// disjoint), so a multi-wave launch is still correct (one wave on the 3090; sm_72/sm_89 run
-// multi-wave). fp32 SIMT only: no MMA, no fp16, so the same source compiles unchanged for
-// sm_72. Contract: prefill/gdn_scan_seq.h.
+// The value-sliced sequential gated-delta scan over one chunk (gdn_scan_seq_k) and the gated
+// output RMSNorm (gdn_out_gate_k). The per-token math and its expression order are the
+// vendored kern::gated_delta (vendor/xavier-qwen/src/ops.cu gated_delta_k); the launch idea
+// (the per-column loop reading q/k rows that are already L2-normalized and gates that are
+// already computed, one warp per value column with 4 state rows per lane) was read from the
+// pinned llama.cpp gated_delta_net.cu for geometry only — here the norms and gates are
+// computed once per block into shared memory instead of once per column warp. The scan: grid
+// (H, 1, D/32), block (32, 8), one block owns 32 value columns and scans kTile-token tiles;
+// the blocks share nothing (their state and o_out columns are disjoint), so a multi-wave
+// launch is still correct (one wave on the 3090; sm_72/sm_89 run multi-wave). fp32 SIMT
+// only: no MMA, no fp16, so the same source compiles unchanged for sm_72. Contract:
+// prefill/gdn_scan_seq.h.
 #include "prefill/gdn_scan_seq.h"
 
 #include <cuda_runtime.h>
@@ -23,17 +22,17 @@
 namespace {
 
 constexpr int kMaxM = 32768;         // the vendored kMaxM (gdn_conv.cu:16 / gdn_delta.cu:16)
-constexpr int kMaxKHeads = 64;       // the RD-7b policy limits (gdn_delta.cu:14-15)
+constexpr int kMaxKHeads = 64;       // the decode scan's policy limits (gdn_delta.cu:14-15)
 constexpr int kMaxVHeads = 128;
 constexpr int kMaxLd = 1 << 22;      // gdn_delta.cu:41-52
 constexpr int kMaxCtxTokens = (1 << 30) - 1;
 constexpr float kEps = 1e-6f;        // the vendored pin (gdn_delta.cu:21)
 constexpr int D = 128;               // the compiled head size (kern::kStateDim)
 constexpr int kLanes = 32;           // threads per warp
-// CPF-DN-B's launch (section 2.1): one block owns kBlockCols value columns of one head, so
-// the grid is (n_v_heads, 1, D / kBlockCols); within a warp, kGroupLanes lanes share one
-// column and the warp serves kLanes / kGroupLanes = 4 columns.
-constexpr int kTile = 16;            // tokens staged per block iteration (section 2.2)
+// The launch: one block owns kBlockCols value columns of one head, so the grid is
+// (n_v_heads, 1, D / kBlockCols); within a warp, kGroupLanes lanes share one column and the
+// warp serves kLanes / kGroupLanes = 4 columns.
+constexpr int kTile = 16;            // tokens staged per block iteration
 constexpr int kWarps = 8;            // warps per block (threadIdx.y)
 constexpr int kGroupLanes = 8;       // lanes sharing one value column (g = lane & 7)
 constexpr int kBlockCols = 32;       // value columns per block: kWarps * 4
@@ -75,8 +74,7 @@ bool apart(const Span &a, const Span &b) {
     return pa + a.bytes <= pb || pb + b.bytes <= pa;
 }
 
-/* The p0 bound the wrapper, this entry and the kernels all check (decision 0049 item 2),
- * the sum in 64 bits. */
+/* The p0 bound the wrapper, this entry and the kernels all check, the sum in 64 bits. */
 bool bounds_ok(const inference_cuda_gdn_scan_seq_args &a) {
     return a.p0 >= 0 && (long long)a.p0 + a.m <= a.ctx_tokens;
 }
@@ -215,7 +213,7 @@ __device__ float block_sum(float v) {
 __device__ float silu_e(float x) { return x / (1.f + expf(-x)); }
 __device__ float softplus_e(float x) { return x > 20.f ? x : log1pf(expf(x)); }
 
-// K1 (CPF-DN-B): one block of kWarps warps owns kBlockCols = 32 value columns of one head
+// The scan: one block of kWarps warps owns kBlockCols = 32 value columns of one head
 // (D / kBlockCols = 4 blocks per head, 128 blocks for Qwen3.6: one wave on the 3090). Within
 // a warp, g = lane & 7 picks the row group and cg = lane >> 3 the column, so 8 lanes share
 // one column and the warp serves 4 columns; each lane holds the 16 state entries at rows
@@ -223,11 +221,11 @@ __device__ float softplus_e(float x) { return x > 20.f ? x : log1pf(expf(x)); }
 // loaded once before the tile loop, written back once after it). The block-uniform tile
 // loop stages kTile = 16 tokens per trip — P writes the L2-normalized q/k rows, the
 // (decay, beta) gates and the v row to shared memory once per block — then a barrier, then
-// S scans the slots with A's elementwise expressions, then a barrier before the next tile
-// overwrites the stage. No thread leaves before the last barrier. The summation order of the
-// two 128-term dots differs from CPF-DN-A's (four accumulators, a pairwise combine and a
-// 3-level tree over the 8 lanes of a column, against one accumulator and a 5-level tree over
-// 32 lanes); the rounding depth is 9 in both.
+// S scans the slots with the header's elementwise expressions, then a barrier before the next
+// tile overwrites the stage. No thread leaves before the last barrier. The summation order of
+// the two 128-term dots differs from a one-warp-per-column scan's (four accumulators, a
+// pairwise combine and a 3-level tree over the 8 lanes of a column, against one accumulator
+// and a 5-level tree over 32 lanes); the rounding depth is 9 in both.
 __global__ void __launch_bounds__(kLanes * kWarps, 2) gdn_scan_seq_k(ScanArgs a) {
     // qk_s is float4 so the type itself guarantees the 16-byte alignment of S's LDS.128
     // loads; P1's scalar stores go through the float view qk_f (element (j, plane, e) at
@@ -241,11 +239,11 @@ __global__ void __launch_bounds__(kLanes * kWarps, 2) gdn_scan_seq_k(ScanArgs a)
     const int g = lane & 7, cg = lane >> 3;
     const int col = blockIdx.z * kBlockCols + w * 4 + cg;
     float *st = a.state + (size_t)h * D * D;
-    // The device re-check of the launch arguments (decision 0049 item 2): block uniform,
-    // before the state load and the first barrier. A refused launch loads no state, updates
-    // nothing, NaNs its o_out columns for every t and ORs mask 8 into the optional status
-    // word (item 10); the g == 0 lanes hold the block's 32 columns (one per warp), so every
-    // NaN write hits one column exactly once.
+    // The device re-check of the launch arguments: block uniform, before the state load and
+    // the first barrier. A refused launch loads no state, updates nothing, NaNs its o_out
+    // columns for every t and ORs mask 8 into the optional status word; the g == 0 lanes
+    // hold the block's 32 columns (one per warp), so every NaN write hits one column exactly
+    // once.
     if ((long long)a.p0 < 0 || (long long)a.p0 + a.m > a.ctx_tokens) {
         if (a.status && blockIdx.x == 0 && blockIdx.z == 0 && threadIdx.x == 0 &&
             threadIdx.y == 0) {
@@ -271,19 +269,18 @@ __global__ void __launch_bounds__(kLanes * kWarps, 2) gdn_scan_seq_k(ScanArgs a)
     for (int t0 = 0; t0 < a.m; t0 += kTile) {
         const int len = min(kTile, a.m - t0);
         // P1, the normalized q/k rows, once per block per token: warp w stages slots j = w
-        // and j = w + kWarps in CPF-DN-A's lane order and A's expression order. Every global
-        // load of the tile (P1's two slots, P3's two v values, P2's two logits) is issued
-        // before the first shuffle of the norms, so no warp serializes a global round trip
-        // between its loads (Amendment 1, MINOR 4).
+        // and j = w + kWarps, lane l holding elements 32r + l, in the header's expression
+        // order. Every global load of the tile (P1's two slots, P3's two v values, P2's two
+        // logits) is issued before the first shuffle of the norms, so no warp serializes a
+        // global round trip between its loads.
         const float *row_w = a.conv + (size_t)(t0 + w) * a.conv_ld;
         // The slot-(w + kWarps) row pointer is clamped to the last conv row: on a short
         // last tile that row sits past the conv object, and even forming the pointer would
-        // be undefined (review item n4); the clamped value is read only when live_w8,
-        // where the clamp is a no-op (t0 + w + kWarps < m). The sibling row_w is
-        // deliberately left unclamped: when the last tile holds fewer than 8 slots
-        // (m = 1, 65), row_w of a dead warp is still formed past the conv object and is
-        // never dereferenced — kept so that a lost live_w guard stays visible to memcheck
-        // on exact-size uploads.
+        // be undefined; the clamped value is read only when live_w8, where the clamp is a
+        // no-op (t0 + w + kWarps < m). The sibling row_w is deliberately left unclamped:
+        // when the last tile holds fewer than 8 slots (m = 1, 65), row_w of a dead warp is
+        // still formed past the conv object and is never dereferenced — kept so that a lost
+        // live_w guard stays visible to memcheck on exact-size uploads.
         const float *row_w8 =
             a.conv + (size_t)min(t0 + w + kWarps, a.m - 1) * a.conv_ld;
         const bool live_w = w < len, live_w8 = w + kWarps < len;
@@ -319,8 +316,8 @@ __global__ void __launch_bounds__(kLanes * kWarps, 2) gdn_scan_seq_k(ScanArgs a)
         // P's reductions and shared stores.
         if (live_w) {
             // L2 norms in the ggml form (norm.cu:273), the norm and q's 1/sqrt(D) folded
-            // into one multiplier (the vendored form of ops.cu:122): A's expressions
-            // verbatim, now run once per slot instead of once per slice warp.
+            // into one multiplier (the vendored form of ops.cu:122): the header's
+            // expressions verbatim, run once per slot instead of once per slice warp.
             float sq = 0.f, ss = 0.f;
 #pragma unroll
             for (int r = 0; r < 4; ++r) {
@@ -354,8 +351,8 @@ __global__ void __launch_bounds__(kLanes * kWarps, 2) gdn_scan_seq_k(ScanArgs a)
         }
         if (w == 1 && lane < len) {
             // Gates from the projection row, in kernel; a is ssm_a as stored (no second
-            // exp). A's expressions verbatim, with a[h] and dt_bias[h] read once before
-            // the tile loop.
+            // exp). The header's expressions verbatim, with a[h] and dt_bias[h] read once
+            // before the tile loop.
             g_s[lane] = make_float2(expf(softplus_e(alpha_l + dt_h) * a_h),
                                     1.f / (1.f + expf(-beta_l)));
         }
@@ -366,7 +363,7 @@ __global__ void __launch_bounds__(kLanes * kWarps, 2) gdn_scan_seq_k(ScanArgs a)
         // as one LDS.32, and k-hat/q-hat as 4 + 4 LDS.128 (float4 index 8 * k + g: the 8
         // lanes of a group read the same 16 bytes and the 4 groups of the warp read the
         // same 128 bytes per k). q-hat is loaded before the sk reduction so its latency
-        // hides behind it. State update in the design's order: decay first, the sk dot
+        // hides behind it. State update in the vendored order: decay first, the sk dot
         // against the DECAYED state, then the rank-one write and the o dot (ops.cu:132-139).
         for (int j = 0; j < len; ++j) {
             const float2 gb = g_s[j];
@@ -419,9 +416,10 @@ __global__ void __launch_bounds__(kLanes * kWarps, 2) gdn_scan_seq_k(ScanArgs a)
     }
 }
 
-// K2: the gated output RMSNorm of m rows, in place on the o_out rows K1 wrote (the vendored
-// mean+eps form, ops.cu:141; the ggml L2 form applies to the q/k norms only). One block per
-// (token, head), one thread per column; each block reads its D values before writing them.
+// The gated output RMSNorm of m rows, in place on the o_out rows gdn_scan_seq_k wrote (the
+// vendored mean+eps form, ops.cu:141; the ggml L2 form applies to the q/k norms only). One
+// block per (token, head), one thread per column; each block reads its D values before
+// writing them.
 __global__ void gdn_out_gate_k(ScanArgs a) {
     const int h = blockIdx.x, t = blockIdx.y, j = threadIdx.x;
     if ((long long)a.p0 < 0 || (long long)a.p0 + a.m > a.ctx_tokens) {

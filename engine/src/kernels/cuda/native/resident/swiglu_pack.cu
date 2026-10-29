@@ -1,11 +1,10 @@
 /*
- * RD-4b: launch entry of the vendored swiglu_pack (RD-4V), with the padded width k_pad of MEL-A1.
+ * Launch entry of the vendored swiglu_pack, with the padded width k_pad.
  *
- * The activation is fused into the pack, as in RD-4a. The kernel is vendored xavier-qwen
- * code (MIT); this file validates, zeroes the padded tails of gu and
- * makes one kern:: call on the given stream; the kernel itself writes the zero tail entry of
- * the fragment-order xf that the padding-token lanes read (MEMSET-TRIM), so no whole-buffer
- * memset of xf is queued here.
+ * The activation is fused into the pack, as in add_norm_pack. The kernel is vendored xavier-qwen
+ * code (MIT); this file validates, zeroes the padded tails of gu and makes one kern:: call on the
+ * given stream; the kernel itself writes the zero tail entry of the fragment-order xf that the
+ * padding-token lanes read, so no whole-buffer memset of xf is queued here.
  */
 #include <cuda_runtime.h>
 #include <stddef.h>
@@ -74,7 +73,7 @@ extern "C" int inference_cuda_swiglu_pack_launch(const inference_cuda_swiglu_pac
         const cudaStream_t s = (cudaStream_t)stream;
         Failure failure;
         zero_tails(in, s, failure);
-        // MEMSET-TRIM: the kernel writes the zero tail entry the padding lanes read; the rest of
+        // The kernel writes the zero tail entry the padding lanes read; the rest of
         // the padding bytes is never read by any consumer, so no whole-buffer memset runs here.
         if (failure.ok()) {
             failure.record(

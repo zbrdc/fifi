@@ -1,4 +1,4 @@
-//! Unit tests of the run report (test seam U13). CPU only.
+//! Unit tests of the run report. CPU only.
 use super::run_report::{CaptureOutcome, PrefillReport, RunReport};
 use crate::{
     EngError,
@@ -60,7 +60,8 @@ fn feed(p0: usize, ns: u64) -> super::run_report::StepRecord {
     }
 }
 
-/// H-B10, storage core (CPF-7b-C): the records it keeps, the two row counts, and the clear.
+/// The storage core of the prefill report: the records it keeps, the two row counts, and the
+/// clear.
 #[test]
 fn the_prefill_report_accumulates_until_a_reset() {
     let mut report = super::run_report::PrefillReport::default();
@@ -98,8 +99,8 @@ fn the_prefill_report_accumulates_until_a_reset() {
     );
 }
 
-/// The fixture report of CPF-7b-C B.8, H-B12: two pieces of 128 and 1 tokens, which feed 127 and
-/// 1 rows, so one chunk of 127 rows and one one-row feed.
+/// The fixture report: two pieces of 128 and 1 tokens, which feed 127 and 1 rows, so one chunk of
+/// 127 rows and one one-row feed.
 fn fixture_report() -> super::run_report::PrefillReport {
     use super::run_report::{StepKind, StepRecord};
     use super::step::ChunkVerdict;
@@ -135,7 +136,7 @@ fn fixture_report() -> super::run_report::PrefillReport {
     report
 }
 
-/// H-B12, the job line of the B.8 fixture (condition 9).
+/// The job line of the fixture report.
 #[test]
 fn the_job_line_names_the_pieces_and_the_steps() {
     let line = fixture_report().job_line();
@@ -145,7 +146,7 @@ fn the_job_line_names_the_pieces_and_the_steps() {
     );
 }
 
-/// H-B10, the once-per-job guard: Some once, then None until a refill, then Some again.
+/// The once-per-job guard: Some once, then None until a refill, then Some again.
 #[test]
 fn take_job_line_returns_once_until_a_reset() {
     let mut report = fixture_report();

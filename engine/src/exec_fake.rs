@@ -1,13 +1,11 @@
 //! The scripted test fake of the executor seam.
 //!
 //! The trait and `GenerationState` live in `crate::family::executor`.
-//! Design: the family descriptor design ("Executor trait"), decision 0033.
 //!
-//! The fake keeps the real prefix rules (decision 0036, addendum 2): its session holds a real
-//! `DecodeSession` for the token side, and `save_prefix` / `restore_prefix` run through
-//! `DecodeSession::save_prefix` / `restore_prefix` and a real `PrefixStore`, the same code path
-//! the resident executors use. The saved state is `()`: the fake has no model, and the store
-//! never inspects a state.
+//! The fake keeps the real prefix rules: its session holds a real `DecodeSession` for the token
+//! side, and `save_prefix` / `restore_prefix` run through `DecodeSession::save_prefix` /
+//! `restore_prefix` and a real `PrefixStore`, the same code path the resident executors use. The
+//! saved state is `()`: the fake has no model, and the store never inspects a state.
 
 use crate::EngError;
 use crate::family::executor::{ExecutorOps, GenerationState};
@@ -30,18 +28,18 @@ fn lock_store(
     store.lock().unwrap_or_else(PoisonError::into_inner)
 }
 
-/// The saved state of a fake prefix entry (fix EV-1): it holds the entry's budget permit, like
-/// the resident executors' snapshots, so dropping an entry releases its charge. Without a
-/// budget it holds nothing.
+/// The saved state of a fake prefix entry: it holds the entry's budget permit, like the resident
+/// executors' snapshots, so dropping an entry releases its charge. Without a budget it holds
+/// nothing.
 pub(crate) struct FakeSnapshot {
     #[allow(dead_code)]
     charge: Option<TestPermit>,
 }
 
-/// The fake's own test budget (fix EV-1): unlike the production `SessionBudget`, whose
-/// `Rc` cells confine it to one thread from construction, this one is built with atomics so
-/// the fake can be created on the test thread and moved into the engine's worker thread. The
-/// worker drives it single-threaded, so the check-then-add of `acquire` sees no races.
+/// The fake's own test budget: unlike the production `SessionBudget`, whose `Rc` cells confine it
+/// to one thread from construction, this one is built with atomics so the fake can be created on
+/// the test thread and moved into the engine's worker thread. The worker drives it single-threaded,
+/// so the check-then-add of `acquire` sees no races.
 struct TestBudget {
     cap: u64,
     used: std::sync::Arc<std::sync::atomic::AtomicU64>,
@@ -142,18 +140,16 @@ pub(crate) struct FakeSession {
     core: DecodeSession,
     /// The model side of the session: the count of fed positions.
     step: CountingStepper,
-    /// The growth permits of the committed tokens (fix EV-1): one per prefilled or
-    /// decoded token batch, like the resident state's permits. `reset` and drop release
-    /// them.
+    /// The growth permits of the committed tokens: one per prefilled or decoded token batch, like
+    /// the resident state's permits. `reset` and drop release them.
     permits: Vec<TestPermit>,
     finished: bool,
 }
 
-/// Returns scripted token batches and applies the `decode` finish rules:
-/// EOS, output limit, and cancellation. It never matches stop strings.
-/// The output limit is the lower of the constructor cap and the job limit in `GenerationState`.
-/// Its prefix store is a real `PrefixStore` with the addendum 1 limits by default (zero roots,
-/// one entry) and the limits that `with_prefix_limits` sets.
+/// Returns scripted token batches and applies the `decode` finish rules: EOS, output limit, and
+/// cancellation. It never matches stop strings. The output limit is the lower of the constructor
+/// cap and the job limit in `GenerationState`. Its prefix store is a real `PrefixStore` with the
+/// default limits (zero roots, one entry) or the limits that `with_prefix_limits` sets.
 pub(crate) struct FakeExecutor {
     script: VecDeque<Vec<u32>>,
     eos: Vec<u32>,
@@ -170,10 +166,9 @@ pub(crate) struct FakeExecutor {
     /// `save_prefix` itself: the denial surfaces as a `MemoryPlan` error, unlike
     /// `deny_saves`, which the store degrades to a skipped save.
     deny_save_charge: bool,
-    /// Denies the charge of the first `n` save calls only (fix L6), so a test can deny one
-    /// save point of a job (a root) and let the later ones (the tip) run. A save call that the
-    /// store serves as a use of a duplicate key never reaches the snapshot closure but still
-    /// counts.
+    /// Denies the charge of the first `n` save calls only, so a test can deny one save point of a
+    /// job (a root) and let the later ones (the tip) run. A save call that the store serves as a
+    /// use of a duplicate key never reaches the snapshot closure but still counts.
     deny_first_saves: usize,
     /// The number of save calls so far: one per `save_prefix` call, counted before the store
     /// decides whether a snapshot is needed. A save call that the store serves as a use of a
@@ -181,40 +176,38 @@ pub(crate) struct FakeExecutor {
     save_calls: usize,
     /// Fails the next snapshot with this error, before the store sees its result.
     fail_snapshot: Option<EngError>,
-    /// The kind of the entry that the last `restore_prefix` call restored, for
-    /// `prefix_report` (packet SERVE-2-c item 3). A reset clears it (fix M4), so the report
-    /// of a job without a boundary is a miss.
+    /// The kind of the entry that the last `restore_prefix` call restored, for `prefix_report`. A
+    /// reset clears it, so the report of a job without a boundary is a miss.
     prefix_hit: PrefixHit,
     /// The `uncached_shared` count of the last `restore_prefix` call, for `prefix_report`;
     /// a reset clears it too.
     prefix_uncached: u32,
-    /// The session budget that prefill, decode, and prefix saves charge (fix EV-1). `None`
-    /// (the default) keeps the uncharged behavior of earlier tests.
+    /// The session budget that prefill, decode, and prefix saves charge. `None` (the default) keeps
+    /// the uncharged behavior of earlier tests.
     budget: Option<TestBudget>,
-    /// The bytes one prefilled or decoded token charges when a budget is set (fix EV-1).
+    /// The bytes one prefilled or decoded token charges when a budget is set.
     token_bytes: u64,
-    /// The bytes one stored prefix entry charges when a budget is set (fix EV-1).
+    /// The bytes one stored prefix entry charges when a budget is set.
     entry_bytes: u64,
-    /// Whether the shadow block-LCP observation runs (KV-v1 slice 1). A test turns it on
-    /// with `with_shadow_block_lcp`, which runs before the conversation, because it rebuilds
-    /// the store like `with_prefix_limits`.
+    /// Whether the shadow block-LCP observation runs. A test turns it on with
+    /// `with_shadow_block_lcp`, which runs before the conversation, because it rebuilds the store
+    /// like `with_prefix_limits`.
     shadow_block_lcp: bool,
-    /// The shadow observation of the last `restore_prefix` call, for `prefix_report` (KV-v1
-    /// slice 1); a reset clears it, like `prefix_hit`.
+    /// The shadow observation of the last `restore_prefix` call, for `prefix_report`; a reset
+    /// clears it, like `prefix_hit`.
     prefix_shadow: Option<ShadowLcp>,
-    /// The block prefix-match spacing (KV-v1 slice 2): `None` keeps the save lattice
-    /// unchanged; `Some(tokens)` cuts one rolling intermediate entry per lineage. A test sets
-    /// it with `with_block_match` before the conversation.
+    /// The block prefix-match spacing: `None` keeps the save lattice unchanged; `Some(tokens)` cuts
+    /// one rolling intermediate entry per lineage. A test sets it with `with_block_match` before
+    /// the conversation.
     block_spacing: Option<usize>,
-    /// The reported `max_seqs` (round 4f MF1): the default 1 keeps the single-worker
-    /// path - a test that wants its real store to run through the BATCH worker sets
-    /// this above one before spawning the engine.
+    /// The reported `max_seqs`: the default 1 keeps the single-worker path - a test that wants its
+    /// real store to run through the BATCH worker sets this above one before spawning the engine.
     max_seqs: usize,
-    /// `decode_window` calls so far (round 4f MF1): the single worker never advances a
-    /// window, so a positive count proves the batch branch ran.
+    /// `decode_window` calls so far: the single worker never advances a window, so a positive count
+    /// proves the batch branch ran.
     window_calls: Arc<std::sync::atomic::AtomicUsize>,
-    /// Denies the next restore's adoption once (SF1). Set through `deny_restore_once`;
-    /// consumed by the first restore whose closure runs.
+    /// Denies the next restore's adoption once. Set through `deny_restore_once`; consumed by the
+    /// first restore whose closure runs.
     deny_restore_once: bool,
 }
 
@@ -246,39 +239,37 @@ impl FakeExecutor {
         }
     }
 
-    /// Runs the engine on the BATCH worker path with this fake's real store (round 4f
-    /// MF1): any value above one makes `spawn_engine` select `batch_worker::work`, so a
-    /// real-store fixture exercises the batch pre-pass and restart wiring.
+    /// Runs the engine on the BATCH worker path with this fake's real store: any value above one
+    /// makes `spawn_engine` select `batch_worker::work`, so a real-store fixture exercises the
+    /// batch pre-pass and restart wiring.
     pub(crate) fn with_max_seqs(&mut self, max_seqs: usize) {
         self.max_seqs = max_seqs;
     }
 
-    /// The shared `decode_window` counter, so a test can ASSERT the batch branch ran
-    /// even after the fake moves into the engine factory: the single worker never
-    /// advances a window (round 4f MF1).
+    /// The shared `decode_window` counter, so a test can ASSERT the batch branch ran even after the
+    /// fake moves into the engine factory: the single worker never advances a window.
     pub(crate) fn window_counter(&self) -> Arc<std::sync::atomic::AtomicUsize> {
         Arc::clone(&self.window_calls)
     }
 
-    /// Denies the NEXT restore's adoption once (SF1): the restore closure returns one
-    /// `MemoryPlan` denial before succeeding, exercising the store's
-    /// evict-one-victim-and-retry-same-candidate step through the full worker path.
+    /// Denies the NEXT restore's adoption once: the restore closure returns one `MemoryPlan` denial
+    /// before succeeding, exercising the store's evict-one-victim-and-retry-same-candidate step
+    /// through the full worker path.
     pub(crate) fn deny_restore_once(&mut self) {
         self.deny_restore_once = true;
     }
 
-    /// Turns the block prefix-match on with the given spacing (KV-v1 slice 2): the worker's
-    /// save lattice then cuts one rolling intermediate entry per lineage at the last block
-    /// boundary below the tip. Runs before the conversation, like
-    /// `with_prefix_limits`.
+    /// Turns the block prefix-match on with the given spacing: the worker's save lattice then cuts
+    /// one rolling intermediate entry per lineage at the last block boundary below the tip. Runs
+    /// before the conversation, like `with_prefix_limits`.
     pub(crate) fn with_block_match(&mut self, tokens: usize) {
         self.block_spacing = Some(tokens);
     }
 
-    /// Installs a session budget with the given cap and charges (fix EV-1): every prefilled
-    /// and decoded token charges `token_bytes`, every stored prefix entry `entry_bytes`. The
-    /// charges model the resident executor's pre-mutation rule: the permit is acquired before
-    /// any session state changes, so a denial leaves the session unchanged.
+    /// Installs a session budget with the given cap and charges: every prefilled and decoded token
+    /// charges `token_bytes`, every stored prefix entry `entry_bytes`. The charges model the
+    /// resident executor's pre-mutation rule: the permit is acquired before any session state
+    /// changes, so a denial leaves the session unchanged.
     pub(crate) fn with_session_budget(&mut self, cap: u64, token_bytes: u64, entry_bytes: u64) {
         self.budget = Some(TestBudget::new(cap));
         self.token_bytes = token_bytes;
@@ -286,7 +277,7 @@ impl FakeExecutor {
     }
 
     /// Acquires `bytes` of growth from the installed budget, if any. A denial returns the
-    /// memory-plan error unchanged (fix EV-1).
+    /// memory-plan error unchanged.
     fn charge(&mut self, bytes: u64) -> Result<Option<TestPermit>> {
         match &self.budget {
             Some(budget) => Ok(Some(budget.acquire(bytes)?)),
@@ -294,16 +285,14 @@ impl FakeExecutor {
         }
     }
 
-    /// Sets the limits of the prefix store (decision 0036, addendum 2). The default limits are
-    /// the addendum 1 limits: zero roots, one entry.
+    /// Sets the limits of the prefix store. The default limits are zero roots and one entry.
     pub(crate) fn with_prefix_limits(&mut self, roots: usize, entries: usize) {
         self.limits = StoreLimits { roots, entries };
         *lock_store(&self.prefix) = PrefixStore::with_limits(self.limits);
     }
 
-    /// Turns the shadow block-LCP observation on (KV-v1 slice 1). Like
-    /// `with_prefix_limits`, it runs before the conversation holds entries, because it
-    /// rebuilds the store.
+    /// Turns the shadow block-LCP observation on. Like `with_prefix_limits`, it runs before
+    /// the conversation holds entries, because it rebuilds the store.
     pub(crate) fn with_shadow_block_lcp(&mut self) {
         self.shadow_block_lcp = true;
         let mut store = PrefixStore::with_limits(self.limits);
@@ -341,10 +330,9 @@ impl FakeExecutor {
         self.deny_save_charge = true;
     }
 
-    /// Denies the charge of the first `n` save calls only (fix L6), so a test can deny one
-    /// save point of a job (a root) while the later ones (the tip) still run. A save call that
-    /// the store serves as a use of a duplicate key never reaches the snapshot closure but
-    /// still counts.
+    /// Denies the charge of the first `n` save calls only, so a test can deny one save point of a
+    /// job (a root) while the later ones (the tip) still run. A save call that the store serves as
+    /// a use of a duplicate key never reaches the snapshot closure but still counts.
     pub(crate) fn deny_first_saves(&mut self, n: usize) {
         self.deny_first_saves = n;
     }
@@ -364,19 +352,18 @@ impl ExecutorOps for FakeExecutor {
         self.max_seqs
     }
 
-    /// One independent session per batch slot (round 4f MF1): the scripted steps live in
-    /// the fake's `script` queue, and a default `FakeSession` starts each new
-    /// conversation empty - exactly what the batch worker needs to admit more slots.
+    /// One independent session per batch slot: the scripted steps live in the fake's `script`
+    /// queue, and a default `FakeSession` starts each new conversation empty - exactly what the
+    /// batch worker needs to admit more slots.
     fn new_session(&mut self) -> Result<FakeSession> {
         Ok(FakeSession::default())
     }
 
-    /// Row-by-row window advance (round 4f MF1), with every error surfaced as an OUTER
-    /// error (Sol r7 MF1): the window contract permits an inner, row-local error only
-    /// BEFORE that row feeds, and this fake cannot classify where a row's decode
-    /// failed - an inner wrap would claim a clean refusal for a row that had already
-    /// advanced. Outer is always contract-legal: it invalidates every affected
-    /// session instead of lying about one.
+    /// Row-by-row window advance, with every error surfaced as an OUTER error: the window contract
+    /// permits an inner, row-local error only BEFORE that row feeds, and this fake cannot classify
+    /// where a row's decode failed - an inner wrap would claim a clean refusal for a row that had
+    /// already advanced. Outer is always contract-legal: it invalidates every affected session
+    /// instead of lying about one.
     fn decode_window(
         &mut self,
         sessions: &mut [&mut FakeSession],
@@ -399,9 +386,9 @@ impl ExecutorOps for FakeExecutor {
         st.history.clear();
         st.permits.clear();
         st.finished = false;
-        // The restore facts of the report do not survive a job (fix M4): the worker resets every
-        // job and skips the restore when the job has no boundary, so the report of such a job
-        // must not carry the hit of the job before it.
+        // The restore facts of the report do not survive a job: the worker resets every job and
+        // skips the restore when the job has no boundary, so the report of such a job must not
+        // carry the hit of the job before it.
         self.prefix_hit = PrefixHit::Miss;
         self.prefix_uncached = 0;
         self.prefix_shadow = None;
@@ -409,8 +396,8 @@ impl ExecutorOps for FakeExecutor {
     }
 
     fn prefill(&mut self, st: &mut FakeSession, toks: &[u32]) -> Result<()> {
-        // The fake models no context limit, so every prompt fits. The growth charge runs
-        // before any session change, like the resident executor's pre-mutation rule (fix EV-1).
+        // The fake models no context limit, so every prompt fits. The growth charge runs before any
+        // session change, like the resident executor's pre-mutation rule.
         let bytes = u64::try_from(toks.len())
             .unwrap_or(u64::MAX)
             .saturating_mul(self.token_bytes);
@@ -434,8 +421,8 @@ impl ExecutorOps for FakeExecutor {
         if st.history.is_empty() {
             return Err(EngError::BadRequest("decode before prefill".to_string()));
         }
-        // The growth charge for the batch runs before any history change (fix EV-1), like the
-        // resident executor's pre-mutation rule.
+        // The growth charge for the batch runs before any history change, like the resident
+        // executor's pre-mutation rule.
         let permit = self.charge(self.token_bytes)?;
         if let Some(permit) = permit {
             st.permits.push(permit);
@@ -463,7 +450,7 @@ impl ExecutorOps for FakeExecutor {
                 match generation.decoder.push(id) {
                     Ok(piece) => text.push_str(&piece),
                     Err(error) => {
-                        // Decision D8: an error resets the session.
+                        // An error resets the session.
                         let _ = self.reset(st);
                         return Err(error);
                     }
@@ -485,7 +472,7 @@ impl ExecutorOps for FakeExecutor {
                 }
             }
             if finish == Some(DecodeFinish::Cancelled) {
-                // Decision D8: a cancelled job resets the session.
+                // A cancelled job resets the session.
                 let _ = self.reset(st);
             } else {
                 st.finished = true;
@@ -504,15 +491,15 @@ impl ExecutorOps for FakeExecutor {
         self.limits
     }
 
-    /// The test knob's spacing (KV-v1 slice 2); the default reads the environment.
+    /// The test knob's spacing; the default reads the environment.
     fn prefix_block_spacing(&self) -> Option<usize> {
         self.block_spacing
     }
 
-    /// The report of the fake's real store (packet SERVE-2-c item 3): the entries it holds,
-    /// charged at a flat 1,000 bytes per entry (fix L3 — the fake's saved state is `()`, so the
-    /// charge is synthetic, but the plumbing that sums and logs it is real), beside the kind of
-    /// the entry the last restore took and the shared tokens of that restore.
+    /// The report of the fake's real store: the entries it holds, charged at a flat 1,000 bytes per
+    /// entry (the fake's saved state is `()`, so the charge is synthetic, but the plumbing that
+    /// sums and logs it is real), beside the kind of the entry the last restore took and the shared
+    /// tokens of that restore.
     fn prefix_report(&self) -> Option<PrefixReport> {
         let store = lock_store(&self.prefix);
         let entries = u32::try_from(store.roots_len() + store.entries_len()).unwrap_or(u32::MAX);
@@ -528,10 +515,9 @@ impl ExecutorOps for FakeExecutor {
         })
     }
 
-    /// Evicts one LRU entry of the fake's real store per the incremental denial order and
-    /// reports the bytes its permits released (fix EV-1). Without an installed budget the
-    /// eviction still runs; it frees nothing to report. `None` when the store holds no LRU
-    /// entry.
+    /// Evicts one LRU entry of the fake's real store per the incremental denial order and reports
+    /// the bytes its permits released. Without an installed budget the eviction still runs; it
+    /// frees nothing to report. `None` when the store holds no LRU entry.
     fn evict_one_prefix_entry(&mut self, protect: Option<u64>) -> Option<u64> {
         let before = self
             .budget
@@ -549,21 +535,20 @@ impl ExecutorOps for FakeExecutor {
         Some(before.saturating_sub(after))
     }
 
-    /// The denying fake session's restored anchor, from its real core session (review
-    /// round 4, MF2): the eviction protects the conversation the denial belongs to.
+    /// The denying fake session's restored anchor, from its real core session: the eviction
+    /// protects the conversation the denial belongs to.
     fn restored_anchor_of(&self, st: &FakeSession) -> Option<u64> {
         st.core.restored_anchor()
     }
 
-    /// The fake's own revision is its path, so the candidate is known without a session
-    /// (review round 4, MF2).
+    /// The fake's own revision is its path, so the candidate is known without a session.
     fn restore_candidate(&self, prompt: &[u32]) -> Option<u64> {
         lock_store(&self.prefix).restore_candidate(prompt, &self.revision)
     }
 
-    /// The fake's pool-derived ceiling (fix EV-2): the free budget plus the session's own
-    /// permits - which its next reset releases - over the per-token charge, minus the one
-    /// token the first sampled step needs. Without a budget there is no ceiling to report.
+    /// The fake's pool-derived ceiling: the free budget plus the session's own permits - which its
+    /// next reset releases - over the per-token charge, minus the one token the first sampled step
+    /// needs. Without a budget there is no ceiling to report.
     fn pool_prompt_ceiling(&self, st: &FakeSession) -> Option<u64> {
         let budget = self.budget.as_ref()?;
         let session = st
@@ -616,15 +601,13 @@ impl ExecutorOps for FakeExecutor {
 
     fn restore_prefix(&mut self, st: &mut FakeSession, prompt: &[u32]) -> Result<usize> {
         let path = self.revision;
-        // The SF1 knob: deny the adoption ONCE - the executor-side permit the restore
-        // path charges - so the store's evict-one-victim-and-retry-same-candidate step
-        // runs exactly as in the resident executor, whose restore charges the pool for
-        // the whole restored extent. The flag rides an atomic the closure swaps only
-        // when a candidate is actually tried: a candidate-less restore (a first turn)
-        // must NOT consume the denial.
-        // Copy (not take): a candidate-less restore - a first turn - leaves the knob
-        // armed; only a denial the closure actually fires consumes it, written back
-        // below.
+        // The deny-once knob: deny the adoption ONCE - the executor-side permit the restore path
+        // charges - so the store's evict-one-victim-and-retry-same-candidate step runs exactly as
+        // in the resident executor, whose restore charges the pool for the whole restored extent.
+        // The flag rides an atomic the closure swaps only when a candidate is actually tried: a
+        // candidate-less restore (a first turn) must NOT consume the denial. Copy (not take): a
+        // candidate-less restore - a first turn - leaves the knob armed; only a denial the closure
+        // actually fires consumes it, written back below.
         let deny_once =
             std::sync::Arc::new(std::sync::atomic::AtomicBool::new(self.deny_restore_once));
         let closure_deny = Arc::clone(&deny_once);
@@ -745,12 +728,11 @@ mod tests {
 
     #[test]
     fn a_decode_window_failure_is_outer_not_row_local() {
-        // Sol r7 MF1: the window contract permits an inner, row-local error only BEFORE
-        // that row feeds. This fake cannot classify where a row's decode failed, so
-        // `decode_window` must surface every failure as an OUTER error - an inner wrap
-        // would claim a clean row refusal for a row that may already have advanced
-        // (Sol's example: a mid-row vocab failure after consuming token 0). Two rows,
-        // the second un-prefilled: the result is one outer `Err`, never
+        // The window contract permits an inner, row-local error only BEFORE that row feeds. This
+        // fake cannot classify where a row's decode failed, so `decode_window` must surface every
+        // failure as an OUTER error - an inner wrap would claim a clean row refusal for a row that
+        // may already have advanced (for example a mid-row vocab failure after consuming token 0).
+        // Two rows, the second un-prefilled: the result is one outer `Err`, never
         // `Ok([Ok(..), Err(..)])`.
         use crate::family::executor::ExecutorOps;
         let (mut executor, mut first) = prefilled(vec![vec![0]], 100);
@@ -955,11 +937,10 @@ mod prefix_tests {
         );
     }
 
-    /// The report of the fake (packet SERVE-2-c item 3): the entries of its real store, each
-    /// charged a flat 1,000 bytes (fix L3), and the kind of the entry the last restore took.
-    /// A prompt that diverges from the stored tip restores the root; the tip still shares its
-    /// first four tokens with the prompt, which equals the restored root, so nothing is
-    /// uncached.
+    /// The report of the fake: the entries of its real store, each charged a flat 1,000 bytes, and
+    /// the kind of the entry the last restore took. A prompt that diverges from the stored tip
+    /// restores the root; the tip still shares its first four tokens with the prompt, which equals
+    /// the restored root, so nothing is uncached.
     ///
     /// Mutation check (the hit-always-Miss patch): the hit rows fail; zeroing the bytes fails
     /// the bytes rows.
@@ -1028,8 +1009,8 @@ mod prefix_tests {
             }),
             "the root hit; the tip shares exactly the restored four tokens"
         );
-        // A reset clears the restore facts (fix M4): the report of the next job starts from a
-        // miss even though the job before it restored a root.
+        // A reset clears the restore facts: the report of the next job starts from a miss even
+        // though the job before it restored a root.
         executor.reset(&mut second).expect("reset");
         assert_eq!(
             executor.prefix_report(),
@@ -1049,9 +1030,9 @@ mod prefix_tests {
 
     #[test]
     fn the_fake_saves_a_root_and_a_tip_through_the_real_store() {
-        // The addendum 2 limits hold two roots and six entries. A Root save of the key of a
-        // stored tip promotes that entry to a pinned root (clarification 1, item 3), so the
-        // store ends with one pinned root and no entry.
+        // The limits hold two roots and six entries. A Root save of the key of a stored tip
+        // promotes that entry to a pinned root, so the store ends with one pinned root and no
+        // entry.
         let (mut executor, session) = fake_with_prefilled(&[1, 2, 3, 4]);
         executor.with_prefix_limits(2, 6);
         executor
@@ -1086,9 +1067,9 @@ mod prefix_tests {
         assert!(executor.stored_prefixes().is_empty(), "the store changed");
     }
 
-    /// The shadow knob (KV-v1 slice 1): with the knob on, a restore stashes the shadow and
-    /// the report carries it; the restore itself is unchanged. The knob, like
-    /// `with_prefix_limits`, resets the store, so it runs before the conversation.
+    /// The shadow knob: with the knob on, a restore stashes the shadow and the report carries
+    /// it; the restore itself is unchanged. The knob, like `with_prefix_limits`, resets the
+    /// store, so it runs before the conversation.
     #[test]
     fn the_shadow_knob_carries_the_shadow_into_the_report() {
         let (mut executor, mut session) = fake_with_prefilled(&[1]);

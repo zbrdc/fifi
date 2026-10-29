@@ -3,9 +3,8 @@
 //! Failure policy. See "Native failure policy" in the kernels design.
 //!
 //! - A failure with unknown completion is terminal. The adapter calls [`mark_failed`] before any
-//!   temporary array can drop, so `Array::drop` retains the array instead of freeing it
-//!   (decisions 0022 and 0023).
-//! - A completed-host method recovers when its synchronization succeeds (decision 0011).
+//!   temporary array can drop, so `Array::drop` retains the array instead of freeing it.
+//! - A completed-host method recovers when its synchronization succeeds.
 //! - A resident method makes every native failure terminal, including a failure before submission.
 //!
 //! The flag is sticky for the whole process. Later calls return `Backend`, and adapter replacement
@@ -26,7 +25,7 @@ use std::{
 use super::ffi;
 use crate::{EngError, tensor::OwnerKey};
 
-/// The most adapter leases that the process admits at once (decision 0024).
+/// The most adapter leases that the process admits at once.
 const MAX_LEASES: usize = 2;
 
 static LIVE_OWNERS: AtomicUsize = AtomicUsize::new(0);
@@ -50,7 +49,7 @@ pub(super) fn has_failed() -> bool {
     RESIDENT_FAILED.load(Ordering::Acquire)
 }
 
-/// Serializes native work across threads (decision 0023).
+/// Serializes native work across threads.
 ///
 /// The guard nests on one thread. An inner guard holds no lock and still runs its cleanup.
 /// Mutex poison and unwinding mark the owner terminal before any further native call.

@@ -1,4 +1,4 @@
-//! Caller-owned host pages that MLX reads in place (decision 0041).
+//! Caller-owned host pages that MLX reads in place.
 //!
 //! Ownership and lifetime:
 //!
@@ -23,10 +23,10 @@
 //!   `Arc::get_mut`. It succeeds only when no MLX share exists, which is after every reference and
 //!   every completion handler is gone. So no host write overlaps a GPU read, and no page is
 //!   unmapped while MLX uses it.
-//! - Decision 0022: after a terminal failure, residents and pins never release their arrays, so
-//!   the shares never drop and `try_write` returns `None` until process exit. A failed import
-//!   whose deleter state is unknown keeps its share.
-//! - Decision 0019: `HostPages` holds resident shares, so it is neither `Send` nor `Sync`.
+//! - After a terminal failure, residents and pins never release their arrays, so the shares
+//!   never drop and `try_write` returns `None` until process exit. A failed import whose
+//!   deleter state is unknown keeps its share.
+//! - `HostPages` holds resident shares, so it is neither `Send` nor `Sync`.
 
 #[cfg(feature = "native-fault-qualification")]
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -48,7 +48,7 @@ use crate::{
     tensor::{Backing, Dtype, ExecutionTensor, Tensor},
 };
 
-/// Page imports that MLX served with its copy path (qualification builds only, decision 0041 Q3).
+/// Page imports that MLX served with its copy path (qualification builds only).
 #[cfg(feature = "native-fault-qualification")]
 static PAGE_COPIES: AtomicU64 = AtomicU64::new(0);
 
@@ -63,8 +63,8 @@ struct PageStorage {
 /// each imported resident until `release` or drop, so MLX never writes into lent pages.
 ///
 /// The pin list grows with every import and is unbounded until `release`. Each pin is a resident
-/// share, so it holds its adapter's retire list and lease (decision 0024): pages with pins that
-/// outlive their `MlxKernels` keep that adapter slot, and a third adapter cannot start.
+/// share, so it holds its adapter's retire list and lease: pages with pins that outlive their
+/// `MlxKernels` keep that adapter slot, and a third adapter cannot start.
 ///
 /// Dropping `HostPages` drops its pins, like `release`. That is memory-safe at any time, but if a
 /// consuming graph is still unevaluated, MLX may write into the pages and their contents are lost.
@@ -323,7 +323,7 @@ fn data_address(array: ffi::mlx_array, dtype: Dtype) -> usize {
 impl State {
     /// Wraps one checked range without a copy and without a synchronization, and pins the result.
     ///
-    /// Every failure marks the adapter terminal before any temporary array drops (decision 0022).
+    /// Every failure marks the adapter terminal before any temporary array drops.
     fn import_range(
         &self,
         pages: &HostPages,

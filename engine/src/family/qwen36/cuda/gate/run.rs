@@ -1,17 +1,16 @@
-//! The device loop of the stage 1 gate (RD-10a-17): one `QwenResidentStep` per call, one untimed
-//! prompt pass (the warm-up), then the 128 timed decode steps of every run. The loop is thin:
-//! `rows`/`steps`/`phases`/`raw` compute the numbers, and the step's own `RunReport` supplies
-//! the capture outcome and the per-token sync and host-write counts, never the setting. On the
-//! merged RD-9d step API `replay` brackets the `run_token` call (the device step with its ONE
-//! synchronize; the pair and row copies the same call performs sit inside it), `readback` the
-//! copy of the 993 KB row into the preallocated host buffer, `host` the loop bookkeeping; the
-//! top-32, hash and log-sum-exp run after the clock stops (`analysis_ns`). The ~127 MB row
-//! buffers are allocated BEFORE the timer starts, so no allocation sits inside a timed region.
-//! The tokenizer bundle beside the GGUF supplies `QwenRules` (Q-M7): the eos ids and the
-//! sampler vocabulary come from the SAME loaded bundle, and the bundle is loaded BEFORE any
-//! device work (a missing tokenizer file fails in seconds, not after a 20 GB upload). The raw
-//! identities echo the settings' full-file `gguf_sha256` for the evaluator, and
-//! `INFERENCE_CUDA_SYNC_EACH=1` is refused unconditionally (RD-10a-17b): it changes the timing
+//! The device loop of the stage 1 gate: one `QwenResidentStep` per call, one untimed prompt pass
+//! (the warm-up), then the 128 timed decode steps of every run. The loop is thin:
+//! `rows`/`steps`/`phases`/`raw` compute the numbers, and the step's own `RunReport` supplies the
+//! capture outcome and the per-token sync and host-write counts, never the setting. On the step
+//! API, `replay` brackets the `run_token` call (the device step with its ONE synchronize; the pair
+//! and row copies the same call performs sit inside it), `readback` the copy of the 993 KB row into
+//! the preallocated host buffer, `host` the loop bookkeeping; the top-32, hash and log-sum-exp run
+//! after the clock stops (`analysis_ns`). The ~127 MB row buffers are allocated BEFORE the timer
+//! starts, so no allocation sits inside a timed region. The tokenizer bundle beside the GGUF
+//! supplies `QwenRules`: the eos ids and the sampler vocabulary come from the SAME loaded bundle,
+//! and the bundle is loaded BEFORE any device work (a missing tokenizer file fails in seconds, not
+//! after a 20 GB upload). The raw identities echo the settings' full-file `gguf_sha256` for the
+//! evaluator, and `INFERENCE_CUDA_SYNC_EACH=1` is refused unconditionally: it changes the timing
 //! the gate measures.
 
 use super::{
@@ -100,9 +99,9 @@ fn check_settings(s: &GateSettings) -> Result<Mode, EngError> {
     ))
 }
 
-/// A gate run is never a debug run: `INFERENCE_CUDA_SYNC_EACH=1` synchronizes after every
-/// launch, which changes the timing the gate measures, so the gate refuses it unconditionally,
-/// capture or not (RD-10a-17b item 2).
+/// A gate run is never a debug run: `INFERENCE_CUDA_SYNC_EACH=1` synchronizes after every launch,
+/// which changes the timing the gate measures, so the gate refuses it unconditionally, capture or
+/// not.
 fn refuse_sync_each(sync_each: bool) -> Result<(), EngError> {
     if sync_each {
         return Err(bad(&format!(
@@ -164,8 +163,8 @@ fn gate_doc(mode: Mode, identities: Value, prompts: Vec<Value>) -> Value {
 }
 
 /// The identity fields of the memory admission plus the settings' full-file GGUF hash, echoed
-/// for the evaluator (0040 A2; `rawcheck.py` requires `identities.gguf_sha256`). The KV mode is
-/// the REAL mode of the session (KV8-B B4), never a constant.
+/// for the evaluator (`rawcheck.py` requires `identities.gguf_sha256`). The KV mode is the
+/// REAL mode of the session, never a constant.
 fn identities_of(s: &GateSettings, total: usize, before: usize, after: usize) -> Value {
     let mut identities = json!({
         "capture_requested": if s.capture { "graph" } else { "eager" },
@@ -198,11 +197,10 @@ fn report(doc: Value) -> Result<GateReport, EngError> {
     })
 }
 
-/// The session options of the call: the settings' KV mode, one committed DeltaNet slot, no
-/// forked experts, a cache that holds every prompt plus the decode rows, and the layout
-/// DERIVED from the loaded weights (`CudaWeights::layout()`), never configured twice: the
-/// settings' `layout` chose the load, the step follows what landed (MATVEC-PAR S3b,
-/// KUBDAN-MSG-70 condition 4).
+/// The session options of the call: the settings' KV mode, one committed DeltaNet slot, no forked
+/// experts, a cache that holds every prompt plus the decode rows, and the layout DERIVED from the
+/// loaded weights (`CudaWeights::layout()`), never configured twice: the settings' `layout` chose
+/// the load, the step follows what landed.
 fn session_options(s: &GateSettings, layout: WeightLayout) -> Result<StepOptions, EngError> {
     Ok(StepOptions {
         kv_mode: s.kv_mode,
@@ -236,10 +234,10 @@ fn bundle_dir(gguf: &Path) -> Result<PathBuf, EngError> {
         .ok_or_else(|| bad("the gguf path has no directory to read the tokenizer from"))
 }
 
-/// The pure seam of the tokenizer wiring (Q-M7, RD-10a-17b item 5): the eos ids and the sampler
-/// vocabulary come from the SAME loaded bundle — never hard-coded ids, never the padded head
-/// width — and the tokenizer directory is the GGUF's parent directory, never the GGUF path
-/// itself. `device_gate` calls this seam with the loaded bundle's own numbers.
+/// The pure seam of the tokenizer wiring: the eos ids and the sampler vocabulary come from the SAME
+/// loaded bundle — never hard-coded ids, never the padded head width — and the tokenizer directory
+/// is the GGUF's parent directory, never the GGUF path itself. `device_gate` calls this seam with
+/// the loaded bundle's own numbers.
 fn rules_from_bundle(
     eos: &[u32],
     vocab_size: usize,
@@ -252,10 +250,10 @@ fn rules_from_bundle(
     ))
 }
 
-/// The resident step over the loaded weights and the rules built from the tokenizer bundle
-/// BEFORE any device work (KUBDAN-MSG-56; Q-M7: same bundle, no constants). `tokenizer_pin`
-/// checked the bundle's digests when it was loaded. The gate's capture setting is handed to
-/// the step here, before its first token, so a graph-mode call actually captures.
+/// The resident step over the loaded weights and the rules built from the tokenizer bundle BEFORE
+/// any device work (same bundle, no constants). `tokenizer_pin` checked the bundle's digests when
+/// it was loaded. The gate's capture setting is handed to the step here, before its first token, so
+/// a graph-mode call actually captures.
 fn build_step<'a>(
     projector: &'a CudaProjector,
     res: &'a StepResources,
@@ -308,8 +306,8 @@ enum Region {
     Expired { steps_done: usize },
 }
 
-/// The untimed prompt pass: every prompt token but the last runs the step (the logits are
-/// computed, the row is not read). This pass is the warm-up (REPLY-72 Q8).
+/// The untimed prompt pass: every prompt token but the last runs the step (the logits are computed,
+/// the row is not read). This pass is the warm-up.
 fn prefill(step: &mut QwenResidentStep<'_>, x: &RunInputs<'_>) -> Result<u32, EngError> {
     step.reset_state()?;
     let last = *x
@@ -322,10 +320,10 @@ fn prefill(step: &mut QwenResidentStep<'_>, x: &RunInputs<'_>) -> Result<u32, En
     Ok(last)
 }
 
-/// The row buffers and `fed`, allocated BEFORE `PhaseTimer::start` so no allocation sits
-/// inside a timed region (RD-10a-17b item 3): one zeroed logits row per timed step and the
-/// fed vector at its full capacity. The caller passes the row length (`step.row_bytes()`),
-/// so the helper runs and is checked on the CPU, with no device.
+/// The row buffers and `fed`, allocated BEFORE `PhaseTimer::start` so no allocation sits inside a
+/// timed region: one zeroed logits row per timed step and the fed vector at its full capacity. The
+/// caller passes the row length (`step.row_bytes()`), so the helper runs and is checked on the CPU,
+/// with no device.
 fn alloc_rows(row_len: usize) -> (Vec<Vec<u8>>, Vec<u32>) {
     let rows: Vec<Vec<u8>> = (0..N_STEPS).map(|_| vec![0u8; row_len]).collect();
     (rows, Vec::with_capacity(N_STEPS))
@@ -482,8 +480,8 @@ pub(super) fn device_gate(s: &GateSettings) -> Result<GateReport, EngError> {
     let mode = check_settings(s)?;
     let sync_each = parse_sync_each(std::env::var(SYNC_EACH_VAR).ok().as_deref())?;
     refuse_sync_each(sync_each)?;
-    // The tokenizer bundle and the rules come BEFORE any device work (KUBDAN-MSG-56): a
-    // missing tokenizer file fails in seconds, not after a 20 GB upload.
+    // The tokenizer bundle and the rules come BEFORE any device work: a missing tokenizer file
+    // fails in seconds, not after a 20 GB upload.
     let head_rows = head_rows_of()?;
     let dir = bundle_dir(&s.gguf)?;
     let bundle = TokenizerBundle::load(&dir, &tokenizer_pin()?)?;
@@ -707,14 +705,14 @@ mod tests {
             capture_flags(CaptureOutcome::Eager, false),
             Ok((false, false))
         );
-        // The STOP of a graph-mode run that stayed eager: the merged step exists, so the text
-        // must name the real failure (the setting never reached the step), not an absent
-        // packet.
+        // The STOP of a graph-mode run that stayed eager: the capturing step exists, so the text
+        // must name the real failure (the setting never reached the step), not a missing capture
+        // path.
         match capture_flags(CaptureOutcome::Eager, true) {
             Err(EngError::BadRequest(message)) => {
                 assert!(
-                    !message.contains("RD-11a"),
-                    "the STOP text still names RD-11a after the merge: {message}"
+                    message.contains("the capture setting did not reach the step"),
+                    "the STOP text does not name the real failure: {message}"
                 );
                 assert!(
                     message.contains("capture was requested"),
@@ -727,9 +725,9 @@ mod tests {
 
     #[test]
     fn build_step_hands_the_capture_setting_to_the_step() {
-        // The step cannot run on the CPU, so the wiring is pinned on this file's own text
-        // (the c17 style): comments are stripped and whitespace is removed entirely, so only
-        // the real call with its `?` matches, and a comment or a dead spelling cannot.
+        // The step cannot run on the CPU, so the wiring is pinned on this file's own text: comments
+        // are stripped and whitespace is removed entirely, so only the real call with its `?`
+        // matches, and a comment or a dead spelling cannot.
         let body = code_only(fn_section("fn build_step"))
             .split_whitespace()
             .collect::<String>();
@@ -770,9 +768,9 @@ mod tests {
 
     /// The text of one `fn` item of this file's own production code, from the line that holds
     /// `start` to the next line that opens a `fn` item at the same indentation or the
-    /// `#[cfg(test)]` line, whatever the `pub` prefix (the hardened c17 `step_tests.rs` style,
-    /// pinned on `run.rs` itself): the step cannot run on the CPU, so a mutant of a wiring must
-    /// still fail a named test.
+    /// `#[cfg(test)]` line, whatever the `pub` prefix (the hardened `step_tests.rs` style, pinned
+    /// on `run.rs` itself): the step cannot run on the CPU, so a mutant of a wiring must still fail
+    /// a named test.
     fn fn_section(start: &str) -> &'static str {
         let source = include_str!("run.rs");
         let at = source
@@ -1177,9 +1175,9 @@ mod tests {
 
     #[test]
     fn the_identities_and_the_session_echo_the_real_kv_mode() {
-        // KV8-B B4: the raw document echoes the mode the call runs, never a constant, and the
-        // session options carry the same mode (the fp16 control keeps its byte-for-byte text,
-        // pinned by the tests above).
+        // The raw document echoes the mode the call runs, never a constant, and the session
+        // options carry the same mode (the fp16 control keeps its byte-for-byte text, pinned
+        // by the tests above).
         let q8: GateSettings = FREE
             .replace("\"kv_mode\":\"fp16\"", "\"kv_mode\":\"int8g32\"")
             .parse()

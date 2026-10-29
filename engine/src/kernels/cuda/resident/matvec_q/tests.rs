@@ -1,11 +1,10 @@
 //! Device tests (3090) of `matvec_q` (seam 1: the Rust wrapper against the C entry against the
-//! V-MV1-trimmed vendored `mul_mat_vec_q` kernel). Device tests assume `--test-threads=1`
-//! (decision 0040).
+//! trimmed vendored `mul_mat_vec_q` kernel). Device tests assume `--test-threads=1`.
 //!
 //! The host reference decodes the native GGUF blocks exactly as `ggml-common.h` lays them out and
 //! the stored `block_q8_1` values exactly as the vendored kernel reads them, and accumulates in
 //! f64. The kernel accumulates f32 in a fixed warp order, so the tolerance of test 2 is
-//! `64 * 2^-24 * sum(|term|)` per output (the packet's stated bound); the max error and the max
+//! `64 * 2^-24 * sum(|term|)` per output (the stated bound); the max error and the max
 //! error ratio are reported.
 //!
 //! Q5_0 note: the vendored kernel subtracts the q8_1 block's raw f32 input sum `s` (the stored
@@ -29,10 +28,9 @@ pub(in crate::kernels::cuda) const SHAPES: [(usize, usize); 5] = [
     (2048, 8192),
 ];
 
-/// k 2304 (nine K-blocks, on every type's grid) pads to 2560: the activation columns of an `ncols`
-/// launch are 80 q8_1 blocks apart, not 72. Every shape of `SHAPES` has k % 512 == 0, where the padded
-/// and the unpadded stride coincide, so this one pins the column stride (KUBDAN-MSG-64 item 8,
-/// mutant S1).
+/// k 2304 (nine K-blocks, on every type's grid) pads to 2560: the activation columns of an
+/// `ncols` launch are 80 q8_1 blocks apart, not 72. Every shape of `SHAPES` has k % 512 == 0,
+/// where the padded and the unpadded stride coincide, so this one pins the column stride.
 pub(in crate::kernels::cuda) const PADDED_SHAPE: (usize, usize) = (2304, 64);
 
 const TYPES: [QuantType; 4] = [
@@ -42,7 +40,7 @@ const TYPES: [QuantType; 4] = [
     QuantType::Q80,
 ];
 
-/// Host-side block layout and reference of the four S1 types, shared with the expert tests.
+/// Host-side block layout and reference of the four matvec types, shared with the expert tests.
 pub(in crate::kernels::cuda) mod reference {
     use super::*;
 
@@ -250,7 +248,7 @@ fn quant_sizes_are_pure_and_exact() {
     assert_eq!(MATRIX_ROW_PADDING, 512);
 }
 
-/// The byte counts `plan_matvec` checks a call against (KUBDAN-MSG-64 item 6, mutant S4).
+/// The byte counts `plan_matvec` checks a call against.
 #[test]
 fn matvec_needs_are_pure_and_exact() {
     let need = matvec_needs(QuantType::Q4K, 2048, 512, 2).expect("sizes");
@@ -443,9 +441,9 @@ fn matvec_q_columns_do_not_depend_on_ncols() {
             }
         }
     }
-    // Decision 0037 / KUBDAN-MSG-62 A5: columns 2..4 must be bit-identical to the 1-column
-    // launch; a difference there is a STOP after the report. Columns 5..8 are reported only
-    // (lane C's ruling: verify windows then run the ncols-1 kernel once per row).
+    // Columns 2..4 must be bit-identical to the 1-column launch; a difference there fails the
+    // test after the report. Columns 5..8 are reported only (verify windows then run the ncols-1
+    // kernel once per row).
     assert!(
         stop_worthy.is_empty(),
         "row-invariance failures at n = 2..4: {stop_worthy:?}"
@@ -571,9 +569,9 @@ fn matvec_writes_only_its_rows() {
 /// k 2304 is on every type's grid (9 x 256) and pads to 2560, so each live column ends in 8 padded
 /// q8_1 blocks. The buffer is exactly the live columns (no unused capacity columns: those are
 /// never read whatever they hold) and starts as 0xFF. After the quantize the tail of every live
-/// column must be zero (the quantizer writes it; mutant m3 skips the write), and the result of the
-/// matvec must be bit-identical after that tail is overwritten with poison (a matvec that read the
-/// padded width would change) (KUBDAN-MSG-64 item 7).
+/// column must be zero (the quantizer writes it), and the result of the matvec must be
+/// bit-identical after that tail is overwritten with poison (a matvec that read the padded width
+/// would change).
 #[test]
 fn matvec_q_is_not_affected_by_stale_activation_padding() {
     if !testkit::device_present("matvec_q_is_not_affected_by_stale_activation_padding") {
@@ -696,9 +694,9 @@ fn matvec_report_gbps() {
     }
     let ctx = CudaContext::new().expect("context");
     let stream = ctx.stream().expect("stream");
-    // S1 follow-up 3 (KUBDAN-MSG-67 condition 2): the debug cargo profile runs unoptimised
-    // device code (lane L measured it about 100x slower: qkv 3350 us, lm_head 191 ms), so its
-    // timings are meaningless. The loops shrink to a smoke pass; every correctness check stays.
+    // The debug cargo profile runs unoptimised device code (about 100x slower: qkv 3350 us,
+    // lm_head 191 ms), so its timings are meaningless. The loops shrink to a smoke pass; every
+    // correctness check stays.
     let (warm_iters, cold_iters) = if cfg!(debug_assertions) {
         (5, 3)
     } else {
@@ -717,18 +715,18 @@ fn matvec_report_gbps() {
         ("shared down", QuantType::Q80, 512, 2048),
         ("alpha / beta", QuantType::Q80, 2048, 32),
     ];
-    // The lm_head row: 417 MB of Q6_K. Skipped when less than 2 GiB stay free (the packet's
-    // rule); the free-memory query rides the test-support entry of the same .cu.
+    // The lm_head row: 417 MB of Q6_K. Skipped when less than 2 GiB stay free; the free-memory
+    // query rides the test-support entry of the same .cu.
     let free = matvec_q::free_bytes_raw().unwrap_or(0);
     if free >= 2 * 1024 * 1024 * 1024 {
         shapes.push(("lm_head (Q6_K)", QuantType::Q6K, 2048, 248_320));
     } else {
         println!("lm_head row skipped: only {free} bytes free");
     }
-    // The L2 flush of the cold numbers (KUBDAN-MSG-64 item 11): a dense Q8_0 matvec over ALL
-    // FLUSH_ROWS rows of a 272 MB weight buffer, so the launch reads every byte of it and evicts
-    // the 3090's 6 MB L2. (The first version passed this buffer with rows: 1 and read 1 KB of it.)
-    // The flush owns its activation and output, so it never borrows a shape's buffers.
+    // The L2 flush of the cold numbers: a dense Q8_0 matvec over ALL FLUSH_ROWS rows of a 272 MB
+    // weight buffer, so the launch reads every byte of it and evicts the 3090's 6 MB L2. (The
+    // first version passed this buffer with rows: 1 and read 1 KB of it.) The flush owns its
+    // activation and output, so it never borrows a shape's buffers.
     let flush_w_bytes = QuantType::Q80
         .weight_bytes(FLUSH_ROWS, FLUSH_K)
         .expect("size");
@@ -810,9 +808,9 @@ fn matvec_report_gbps() {
             gbs(cold_us) / 936.0 * 100.0
         );
     }
-    // The three expert rows of the design table (KUBDAN-MSG-62 A6): a 256-expert stack when
-    // the device has room (else 64 experts, said in the output), n_used 8, the ids rotated
-    // over all experts for the cold numbers and fixed for the warm ones, both reported.
+    // The three expert rows of the design table: a 256-expert stack when the device has room
+    // (else 64 experts, said in the output), n_used 8, the ids rotated over all experts for the
+    // cold numbers and fixed for the warm ones, both reported.
     let n_expert = if free >= 600 * 1024 * 1024 { 256 } else { 64 };
     println!("expert rows: {n_expert} experts (of the 256 of the model when memory allows)");
     for (name, shape) in [
@@ -1014,8 +1012,8 @@ fn attempt(rig: &RefusalRig, other: &OtherContext, spec: Spec) -> Result<(), Eng
     )
 }
 
-/// KUBDAN-MSG-64 item 6 for `plan_matvec`: every refusal is a `BadRequest` with the text of its own
-/// check, nothing is queued, the backend stays usable, and the valid call of the same rig launches.
+/// For `plan_matvec`, every refusal is a `BadRequest` with the text of its own check, nothing is
+/// queued, the backend stays usable, and the valid call of the same rig launches.
 #[test]
 fn matvec_q_rejects_unsound_calls_before_launching() {
     if !testkit::device_present("matvec_q_rejects_unsound_calls_before_launching") {
@@ -1198,12 +1196,12 @@ fn matvec_q_rejects_unsound_calls_before_launching() {
     );
 }
 
-/// The GDN input-projection fusion A/B (2026-10-27 roofline correction's cheap ms): production
-/// launches the four Q8_0 siblings that read one q8_1 row (attn_qkv 8192 rows, attn_gate 4096,
-/// ssm_beta 32, ssm_alpha 32, k 2048) as four `matvec_q` calls; the fused arm concatenates the
-/// weights row-wise into one 12352-row matrix (a load-time repack, no kernel change) and
-/// launches once. Gate: bitwise per segment before any timing (`rows` batching cannot change a
-/// row's dot), then exclusive timing, 30 interleaved reps per arm.
+/// The GDN input-projection fusion A/B: production launches the four Q8_0 siblings that read one
+/// q8_1 row (attn_qkv 8192 rows, attn_gate 4096, ssm_beta 32, ssm_alpha 32, k 2048) as four
+/// `matvec_q` calls; the fused arm concatenates the weights row-wise into one 12352-row matrix (a
+/// load-time repack, no kernel change) and launches once. Gate: bitwise per segment before any
+/// timing (`rows` batching cannot change a row's dot), then exclusive timing, 30 interleaved reps
+/// per arm.
 #[test]
 #[ignore = "bench: exclusive timing slot"]
 fn matvec_q_gdn_sibling_fusion_ab_bench() {

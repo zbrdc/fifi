@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
-"""Capture tojson goldens from the pinned reference stack (decision 0029).
+"""Capture tojson goldens from the pinned reference stack.
 
-Runs on the Mac with the Edge0 virtual environment (transformers 5.17.0,
-jinja2 3.1.6). CPU only. It reads the pinned model directory and writes
+Runs on the Mac in a virtual environment with transformers 5.17.0 and
+jinja2 3.1.6. CPU only. It reads the pinned model directory and writes
 p1-tokenizer-tojson-goldens-1 JSON. Every expected string is the output of
 transformers itself: `tokenizer.apply_chat_template` for the full renders and
 `render_jinja_template` for the filter rows.

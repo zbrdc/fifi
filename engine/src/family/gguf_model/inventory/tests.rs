@@ -277,9 +277,9 @@ fn the_qwen3_6_inventory_matches_the_28_role_table_of_the_real_header() {
 #[test]
 fn the_qwen3_6_inventory_has_432_tiled_and_301_f32_device_tensors_with_the_real_byte_totals() {
     // The tiled device total 20,347,535,360 B (Q6_K tiles are larger than their source) needs
-    // `kernels::cuda::plan::device_bytes`, which is CUDA-only, so the real-file test of
-    // packet 5 asserts it. An F32 tensor uploads as read, so its device bytes are the
-    // source bytes below and the device total is 20,436,388,352 B (decision 0047 A1).
+    // `kernels::cuda::plan::device_bytes`, which is CUDA-only, so the real-file test of the
+    // GGUF opener asserts it. An F32 tensor uploads as read, so its device bytes are the
+    // source bytes below and the device total is 20,436,388,352 B.
     let inventory = qwen_inventory();
     let mut tiled = 0u32;
     let mut f32_count = 0u32;

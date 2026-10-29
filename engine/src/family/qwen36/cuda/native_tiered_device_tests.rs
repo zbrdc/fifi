@@ -1,4 +1,4 @@
-//! Device tests of the TIERED MoE block of OFF-2 D3, in the isolation split of the native MoE
+//! Device tests of the TIERED MoE block, in the isolation split of the native MoE
 //! tests: each device phase creates its own context, stream, bank, weights and buffers, has only
 //! `?` inside, drops every owner when it returns, and only then does the test assert on host
 //! data (a drop while panicking would latch the backend for the rest of a one-process suite).
@@ -154,10 +154,10 @@ fn bits(values: &[f32]) -> Vec<u32> {
     values.iter().map(|v| v.to_bits()).collect()
 }
 
-/// Packet test (git-db's anchor): with every expert resident the tiered block IS the native
-/// block, bit for bit - the strongest check of the wiring (the slot ids and weights buffers, the
-/// unchanged nine ops over the bank). The empty CPU list adds nothing observable here: a second combine
-/// of a zero partial would be bitwise the same, so the launch itself is not pinned by this test.
+/// With every expert resident the tiered block IS the native block, bit for bit - the strongest
+/// check of the wiring (the slot ids and weights buffers, the unchanged nine ops over the bank).
+/// The empty CPU list adds nothing observable here: a second combine of a zero partial would be
+/// bitwise the same, so the launch itself is not pinned by this test.
 #[test]
 fn tiered_block_with_everything_resident_equals_the_native_block() -> Result<(), EngError> {
     if !device_present("tiered_block_with_everything_resident_equals_the_native_block") {
@@ -467,7 +467,7 @@ fn the_rule_c_bound_sits_between_the_per_32_and_the_q8_k_measurements() {
     assert!(rule_c_bound(4, 8) < rule_c_bound(8, 8));
 }
 
-/// The half bank of F5: `HALF_SLOTS` slots for the 16 experts, the geometry the 4050 runs.
+/// The half bank: `HALF_SLOTS` slots for the 16 experts, the geometry the 4050 runs.
 const HALF_SLOTS: usize = 8;
 /// The seed of the half-bank test.
 const HALF_BANK_SEED: u64 = 0x7125_0008;
@@ -528,7 +528,7 @@ fn tiered_block_with_cpu_served_experts_matches_the_native_block_within_rule_c()
     assert!(tiered.resid_out.iter().all(|v| v.is_finite()));
     let error = delta_error(&s.resid, &native.resid_out, &tiered.resid_out);
     println!(
-        "RULE-C MEASURED mixed (4 of 16 experts on the CPU): max|tiered-native| / max|native delta| = {error:e}"
+        "MEASURED mixed (4 of 16 experts on the CPU): max|tiered-native| / max|native delta| = {error:e}"
     );
     let bound = rule_c_bound(4, DIMS.top_k);
     assert!(
@@ -543,13 +543,14 @@ fn tiered_block_with_cpu_served_experts_matches_the_native_block_within_rule_c()
     Ok(())
 }
 
-/// A bank of 8 slots for 16 experts (F5), the geometry the 4050 runs. The mixed and all-skipped banks above
-/// already have a real expert in slot 0 and send their CPU picks there; what this test adds is the 8-slot
-/// geometry: `check_plan` refuses slot ids of 8 and above, and experts 8..16 are absent from the bank. The
-/// resident experts are `half_bank_slot_of`'s rotation of 0..8, with the first resident pick of the route in
-/// slot 0, so slot id 0 appears twice in the pick list (the pick's own and the dummy reads of the CPU picks,
-/// weight 0.0). The CPU picks are bounded by their REALIZED count. This test pins the dummy-slot geometry,
-/// not the kernel choice: that is the pure pin of the bound above and the mixed test.
+/// A bank of 8 slots for 16 experts, the geometry the 4050 runs. The mixed and all-skipped banks
+/// above already have a real expert in slot 0 and send their CPU picks there; what this test adds
+/// is the 8-slot geometry: `check_plan` refuses slot ids of 8 and above, and experts 8..16 are
+/// absent from the bank. The resident experts are `half_bank_slot_of`'s rotation of 0..8, with the
+/// first resident pick of the route in slot 0, so slot id 0 appears twice in the pick list (the
+/// pick's own and the dummy reads of the CPU picks, weight 0.0). The CPU picks are bounded by their
+/// REALIZED count. This test pins the dummy-slot geometry, not the kernel choice: that is the pure
+/// pin of the bound above and the mixed test.
 #[test]
 fn a_half_size_bank_with_a_real_expert_in_slot_zero_agrees_with_the_native_block_by_rule_c()
 -> Result<(), EngError> {
@@ -588,7 +589,7 @@ fn a_half_size_bank_with_a_real_expert_in_slot_zero_agrees_with_the_native_block
     );
     let error = delta_error(&s.resid, &native.resid_out, &tiered.resid_out);
     println!(
-        "RULE-C MEASURED half bank (8 slots, expert {first} in slot 0, {cpu_picks} CPU picks): max|tiered-native| / max|native delta| = {error:e}"
+        "MEASURED half bank (8 slots, expert {first} in slot 0, {cpu_picks} CPU picks): max|tiered-native| / max|native delta| = {error:e}"
     );
     let bound = rule_c_bound(cpu_picks, DIMS.top_k);
     assert!(
@@ -658,7 +659,7 @@ fn an_all_skipped_list_is_finite_and_agrees_with_the_native_block_by_rule_c() ->
     assert!(tiered.resid_out.iter().all(|v| v.is_finite()));
     let error = delta_error(&s.resid, &native.resid_out, &tiered.resid_out);
     println!(
-        "RULE-C MEASURED all skipped (16 of 16 experts on the CPU): max|tiered-native| / max|native delta| = {error:e}"
+        "MEASURED all skipped (16 of 16 experts on the CPU): max|tiered-native| / max|native delta| = {error:e}"
     );
     let bound = rule_c_bound(DIMS.n_expert, DIMS.top_k);
     assert!(

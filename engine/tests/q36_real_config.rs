@@ -3,8 +3,7 @@
 //! Source: `<model_dir>` on the Mac (base shards only). The tests read the
 //! committed `config.json` copy and the committed shard headers (the 8-byte prefix and the JSON
 //! header of each shard). They read no tensor data. Every expected number below comes from the
-//! shard headers, the index, and `config.json`, as recorded in the packet Q36-A. None comes from
-//! the code under test.
+//! shard headers, the index, and `config.json`. None comes from the code under test.
 
 use std::{collections::BTreeMap, io::Cursor};
 

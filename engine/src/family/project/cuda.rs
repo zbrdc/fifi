@@ -1,31 +1,26 @@
-//! CUDA adapter of the projection seam (decision 0040 packet 3).
+//! CUDA adapter of the projection seam.
 //!
-//! [`CudaProjector`] loads Q4_K, Q6_K and Q8_0 tensors of a GGUF file into the
-//! vendored tile layout and runs `linear` through the tiled matmul — or, when
-//! `LoadOptions::layout` says `Native` (MATVEC-PAR S2), uploads the file's own
-//! blocks for the S1 MMVQ kernels: one layout per load, never both, and the
-//! default stays `Tiled`, so no existing caller changes behaviour. F32 and
-//! F16 tensors load as raw device copies for later norms and tables, and
-//! `linear` rejects them. A rank-3 tensor is a stack of experts: it loads as
-//! one tiled weight of `out * experts` rows, `expert_linear` runs the matmul
-//! on the tiles of one expert in place, and `linear` rejects the stack. Row gathers follow in a later
-//! packet, so `rows` returns `BadRequest`.
+//! [`CudaProjector`] loads Q4_K, Q6_K and Q8_0 tensors of a GGUF file into the vendored tile
+//! layout and runs `linear` through the tiled matmul — or, when `LoadOptions::layout` says
+//! `Native`, uploads the file's own blocks for the MMVQ kernels: one layout per load, never
+//! both, and the default stays `Tiled`, so no existing caller changes behaviour. F32 and F16
+//! tensors load as raw device copies for later norms and tables, and `linear` rejects them.
+//! A rank-3 tensor is a stack of experts: it loads as one tiled weight of `out * experts`
+//! rows, `expert_linear` runs the matmul on the tiles of one expert in place, and `linear`
+//! rejects the stack. Row gathers are not implemented, so `rows` returns `BadRequest`.
 //!
-//! A load checks every tensor and admits the whole device demand before the first
-//! upload. A tiled load also scans the fp16 scale range of every Q6_K, Q8_0 and Q5_0
-//! tensor first; a native load scans nothing, because a native block keeps its exact
-//! scales (R-S2-4). A quantized tensor is read, repacked and uploaded in chunks of whole 8-row
-//! groups, and the scale scan reads in chunks of the same size, so host memory
-//! is one chunk of source blocks plus one chunk of repacked tiles (each at
-//! most [`CHUNK_LIMIT`], 64 MiB) however large the tensor is. The tensor size
-//! itself is bounded only by the cap of `GgufWeights::open` (1 GiB, decision
-//! 0040). An F32 or F16 tensor is staged whole, which that cap also bounds.
-//! Uploaded weights are freed in reverse load order, also when a load fails
-//! midway.
+//! A load checks every tensor and admits the whole device demand before the first upload. A
+//! tiled load also scans the fp16 scale range of every Q6_K, Q8_0 and Q5_0 tensor first; a
+//! native load scans nothing, because a native block keeps its exact scales. A quantized
+//! tensor is read, repacked and uploaded in chunks of whole 8-row groups, and the scale scan
+//! reads in chunks of the same size, so host memory is one chunk of source blocks plus one
+//! chunk of repacked tiles (each at most [`CHUNK_LIMIT`], 64 MiB) however large the tensor
+//! is. The tensor size itself is bounded only by the cap of `GgufWeights::open` (1 GiB). An
+//! F32 or F16 tensor is staged whole, which that cap also bounds. Uploaded weights are freed
+//! in reverse load order, also when a load fails midway.
 //!
-//! [`CudaProjector::load_model`] loads a whole [`GgufModel`]: every tensor of
-//! its plan goes to the device, the tiled ones as tiles and the F32 ones as
-//! raw copies (decision 0047 A1).
+//! [`CudaProjector::load_model`] loads a whole [`GgufModel`]: every tensor of its plan goes
+//! to the device, the tiled ones as tiles and the F32 ones as raw copies.
 //!
 //! On an integrated GPU (Jetson) the device memory is system RAM, so a load
 //! also evicts the model file before admission and after the scale scan, drops
@@ -64,16 +59,16 @@ pub(crate) struct Reserve {
     pub(crate) headroom: u64,
 }
 
-/// The device layout of the quantized tensors of one load (MATVEC-PAR S2): the vendored tiles
-/// (the default; every merged reader) or the file's own native blocks, which the S1 MMVQ
-/// kernels and the native embedding gather read. One layout per load, never both; a load in
-/// one layout serves only readers of that layout (R-S2-2). The default keeps every existing
-/// caller and test on the tiled path.
+/// The device layout of the quantized tensors of one load: the vendored tiles (the default;
+/// every merged reader) or the file's own native blocks, which the MMVQ kernels and the
+/// native embedding gather read. One layout per load, never both; a load in one layout
+/// serves only readers of that layout. The default keeps every existing caller and test on
+/// the tiled path.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub(crate) enum WeightLayout {
     #[default]
     Tiled,
-    /// Read by the resident step of MATVEC-PAR S3 through [`CudaWeights::layout`].
+    /// Read by the resident step through [`CudaWeights::layout`].
     Native,
     Exl3,
 }
@@ -83,12 +78,12 @@ pub(crate) enum WeightLayout {
 pub(crate) struct LoadOptions<'a> {
     pub(crate) reserve: Reserve,
     /// The checkpoint file whose page cache is dropped for each uploaded range
-    /// (`posix_fadvise(DONTNEED)`), or `None` to keep the page cache. Decision
-    /// 0040 item 5 keeps the call only if the Xavier measurement shows a gain.
+    /// (`posix_fadvise(DONTNEED)`), or `None` to keep the page cache. The call stays only if
+    /// a measurement on the Xavier shows a gain.
     pub(crate) drop_page_cache: Option<&'a File>,
-    /// The device layout of the quantized tensors of this load (MATVEC-PAR S2). `Tiled` by
-    /// default; `Native` applies to resident-step loads only — the host `Projector` oracle
-    /// reads tiles and refuses a native weight with a typed error (R-S2-2).
+    /// The device layout of the quantized tensors of this load. `Tiled` by default; `Native`
+    /// applies to resident-step loads only — the host `Projector` oracle reads tiles and
+    /// refuses a native weight with a typed error.
     pub(crate) layout: WeightLayout,
 }
 
@@ -102,9 +97,9 @@ pub(crate) enum CudaWeight {
         weight: TiledWeight,
         experts: Option<usize>,
     },
-    /// A quantized matrix in the file's native block layout (MATVEC-PAR S2): the S1 MMVQ
-    /// matvec kernels and the native embedding gather read it. The stack depth of a rank-3
-    /// tensor rides `weight.experts()`.
+    /// A quantized matrix in the file's native block layout: the MMVQ matvec kernels and the
+    /// native embedding gather read it. The stack depth of a rank-3 tensor rides
+    /// `weight.experts()`.
     Native { name: String, weight: NativeWeight },
     Exl3 {
         name: String,
@@ -184,8 +179,8 @@ impl CudaWeights {
         self.weights.iter().map(CudaWeight::device_bytes).sum()
     }
 
-    /// Every device buffer of the load, in load order: the leaked pin slice of a
-    /// resident step reads them (RD-11a), beside the arena slot.
+    /// Every device buffer of the load, in load order: the leaked pin slice of a resident
+    /// step reads them, beside the arena slot.
     pub(crate) fn device_buffers(&self) -> impl Iterator<Item = &DeviceBuffer> {
         self.weights.iter().flat_map(|weight| {
             let extra = match weight {
@@ -210,8 +205,8 @@ impl CudaWeights {
         self.times
     }
 
-    /// The one device layout of this load's quantized tensors (MATVEC-PAR S3b): the resident
-    /// step derives its mode from it, and a mixed load is a typed refusal naming the tensor.
+    /// The one device layout of this load's quantized tensors: the resident step derives its
+    /// mode from it, and a mixed load is a typed refusal naming the tensor.
     pub(crate) fn layout(&self) -> Result<WeightLayout, EngError> {
         load_layout(
             self.weights
@@ -227,8 +222,8 @@ impl Drop for CudaWeights {
     }
 }
 
-/// The layout kind of one checkpoint tensor as a layout input (MATVEC-PAR S3b): the vendored
-/// tiles, the file's own native blocks, or a raw F32/F16 copy, which no layout rule reads.
+/// The layout kind of one checkpoint tensor as a layout input: the vendored tiles, the
+/// file's own native blocks, or a raw F32/F16 copy, which no layout rule reads.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum TensorKind {
     Tiled,
@@ -249,10 +244,10 @@ impl CudaWeight {
     }
 }
 
-/// The one device layout of a load's quantized tensors (MATVEC-PAR S3b): every quantized tensor
-/// of a load is `Tiled` or every one is `Native` — one layout per load, never both (R-S2-2). A
-/// mix is a `Checkpoint` naming the tensor that broke it; a load of raw tensors only has no
-/// quantized reader and answers `Tiled`. Pure: no context, no device.
+/// The one device layout of a load's quantized tensors: every quantized tensor of a load is
+/// `Tiled` or every one is `Native` — one layout per load, never both. A mix is a
+/// `Checkpoint` naming the tensor that broke it; a load of raw tensors only has no quantized
+/// reader and answers `Tiled`. Pure: no context, no device.
 pub(crate) fn load_layout<'a>(
     tensors: impl Iterator<Item = (&'a str, TensorKind)>,
 ) -> Result<WeightLayout, EngError> {
@@ -279,14 +274,14 @@ pub(crate) fn load_layout<'a>(
 pub(crate) struct LoadedModel {
     /// All tensors of the plan, on the device.
     pub(crate) device: CudaWeights,
-    /// The layout the quantized tensors were loaded in (MATVEC-PAR S2), so the resident step
-    /// can assert it: one layout per load, never both. Staged (KUBDAN-MSG-68 M-1): no
-    /// production reader yet; the S3 resident step asserts it.
+    /// The layout the quantized tensors were loaded in, so the resident step can assert it: one
+    /// layout per load, never both. Staged: no production reader yet; the resident step asserts
+    /// it.
     #[cfg_attr(
         not(test),
         expect(
             dead_code,
-            reason = "the S3 resident step asserts the layout of its weights"
+            reason = "the resident step asserts the layout of its weights"
         )
     )]
     pub(crate) layout: WeightLayout,
@@ -299,7 +294,7 @@ struct LoadPlan<'a> {
     index: HashMap<String, usize>,
     policy: LoadPolicy,
     drop_file: Option<&'a File>,
-    /// The device layout of the quantized tensors (MATVEC-PAR S2).
+    /// The device layout of the quantized tensors.
     layout: WeightLayout,
     /// The fused GDN input-projection groups of this load, as `(qkv position, [sibling
     /// positions in column order])`; empty unless the fusion flag is set. The sibling
@@ -385,8 +380,8 @@ impl CudaProjector {
         self.context.memory_info()
     }
 
-    /// The CUDA context that this projector's weights live on. The resident step (decision
-    /// 0047, RD-9a) is built from it and a `&CudaWeights`, so both share one adapter lease.
+    /// The CUDA context that this projector's weights live on. The resident step is built from
+    /// it and a `&CudaWeights`, so both share one adapter lease.
     pub(crate) fn context(&self) -> &CudaContext {
         &self.context
     }
@@ -474,12 +469,11 @@ impl CudaProjector {
     /// Scans, then uploads the planned tensors. Tests call it to reach the upload
     /// loop with a tensor that admission would refuse.
     ///
-    /// Ownership: a tensor joins `loaded` only after its upload returned `Ok`.
-    /// Any `?` drops `loaded`, which frees its tensors in reverse load order
-    /// (decision 0022). A failed attempt owns nothing and leaves the live byte
-    /// count unchanged, so a retry starts from the same state. No retry runs
-    /// after a terminal latch, because the attempt then returns `Backend`
-    /// `execute`, which is never retried.
+    /// Ownership: a tensor joins `loaded` only after its upload returned `Ok`. Any `?` drops
+    /// `loaded`, which frees its tensors in reverse load order. A failed attempt owns
+    /// nothing and leaves the live byte count unchanged, so a retry starts from the same
+    /// state. No retry runs after a terminal latch, because the attempt then returns
+    /// `Backend` `execute`, which is never retried.
     fn transfer(&self, weights: &GgufWeights, plan: LoadPlan<'_>) -> Result<CudaWeights, EngError> {
         let LoadPlan {
             tensors,
@@ -491,13 +485,13 @@ impl CudaProjector {
         } = plan;
         let scan_began = Instant::now();
         // The fp16 scale scans guard the tile dequantisation (fp16(d * scale)); a native load
-        // keeps the file's exact scales and scans nothing (R-S2-4).
+        // keeps the file's exact scales and scans nothing.
         if layout == WeightLayout::Tiled {
             check_scale_ranges(weights, &tensors, self.chunk_limit)?;
         }
         let scan = scan_began.elapsed();
         // A tiled load's scan read every Q6_K, Q8_0 and Q5_0 tensor once and refilled the
-        // cache; a native load ran no scan (R-S2-4).
+        // cache; a native load ran no scan.
         if policy.evict_file {
             evict_model(weights.file())?;
         }
@@ -585,7 +579,7 @@ impl CudaProjector {
     /// all four parts share the quant type and input width, and is only called on the Native
     /// layout for a full four-name group (`gdn_inproj_groups`). The device holds exactly the
     /// same bytes the four separate uploads would hold - VRAM delta zero - and every output row
-    /// keeps its dot, so the fused launch is bitwise per segment (pinned by the 2026-10-27 A/B).
+    /// keeps its dot, so the fused launch is bitwise per segment (pinned by an A/B run).
     fn upload_fused_inproj(
         &self,
         weights: &GgufWeights,
@@ -703,8 +697,8 @@ impl CudaProjector {
 
     /// Uploads one quantized tensor in `layout`: the repacked tiles through `upload_tiled`
     /// (whose dequantisation the fp16 scale scans guard) or the file's own blocks through
-    /// `upload_native` (no repack, no scan, R-S2-4), with the stack depth of a rank-3
-    /// tensor riding the weight.
+    /// `upload_native` (no repack, no scan), with the stack depth of a rank-3 tensor riding
+    /// the weight.
     fn upload_quant(
         &self,
         weights: &GgufWeights,
@@ -739,7 +733,7 @@ impl CudaProjector {
                 })
             }
             WeightLayout::Native => {
-                // The file's own blocks, no repack and no scale scan (R-S2-4).
+                // The file's own blocks, no repack and no scale scan.
                 let weight = self
                     .context
                     .upload_native(quant, self.chunk_limit, &mut |at, buf| {
@@ -815,16 +809,14 @@ impl Projector for CudaProjector {
 
     fn rows(&mut self, _table: &CudaWeight, _rows: &[u32]) -> Result<Vec<f32>, EngError> {
         self.context.ensure_usable()?;
-        Err(EngError::BadRequest(
-            "cuda rows is not implemented in packet 3".into(),
-        ))
+        Err(EngError::BadRequest("cuda rows is not implemented".into()))
     }
 }
 
 /// Returns the tiles of a weight that the projection `operation` executes. A raw tensor
 /// fails before any native call with a `Checkpoint` naming the operation, and the backend
-/// stays usable (REPLY-17 item 2). A native weight fails the same way: the host projection
-/// reads tiles and never reinterprets the other layout (R-S2-2).
+/// stays usable. A native weight fails the same way: the host projection reads tiles and
+/// never reinterprets the other layout.
 fn tiled<'w>(weight: &'w CudaWeight, operation: &str) -> Result<&'w TiledWeight, EngError> {
     match weight {
         CudaWeight::Tiled { weight, .. } => Ok(weight),
@@ -860,7 +852,7 @@ fn expert_stack(stack: &CudaWeight) -> Result<(&str, &TiledWeight, usize), EngEr
 
 /// The opt-in GDN input-projection fusion (default OFF). The four Q8_0 siblings that read one
 /// q8_1 row (`attn_qkv` | `attn_gate` | `ssm_beta` | `ssm_alpha`, in DeltaProj column order)
-/// upload as ONE row-concatenated matrix and launch once; the 2026-10-27 exclusive A/B
+/// upload as ONE row-concatenated matrix and launch once; an exclusive A/B run
 /// (`matvec_q_gdn_sibling_fusion_ab_bench`) showed the fused launch bitwise-identical per
 /// segment and ~20% faster on the sibling set. Read once per load and per step construction,
 /// like the `INFERENCE_CUDA_ATTN_Q8_MMA` precedent.
@@ -910,10 +902,10 @@ fn load_index(names: &[&str]) -> Result<HashMap<String, usize>, EngError> {
     Ok(index)
 }
 
-/// Looks up a tensor and returns its device bytes after upload, counted for `layout`
-/// (MATVEC-PAR S2: the tiles and the native blocks differ only for Q6_K). A tiled rank-3
-/// stack whose experts do not start on 8-row tile groups fails here, before any upload; a
-/// native stack has no such rule (the S1 expert kernel reads the device-side id).
+/// Looks up a tensor and returns its device bytes after upload, counted for `layout` (the
+/// tiles and the native blocks differ only for Q6_K). A tiled rank-3 stack whose experts do
+/// not start on 8-row tile groups fails here, before any upload; a native stack has no such
+/// rule (the MMVQ expert kernel reads the device-side id).
 fn planned<'w>(
     weights: &'w GgufWeights,
     name: &str,

@@ -1,17 +1,16 @@
-//! Raw-FFI refusal rows of the grouped launch (lane C's ruling on the part 1 question: every
-//! C-side launch check of `mmq_mmid.cu` gets a row that reaches it with the Rust wrapper AND
-//! the FFI mirror's own `check_mmid` out of the way, each row killing a single-check mutant of
-//! the C source). The Rust side refuses first in production, so without this table a C check
-//! could be deleted and nothing would notice.
+//! Raw-FFI refusal rows of the grouped launch: every C-side launch check of `mmq_mmid.cu` gets a
+//! row that reaches it with the Rust wrapper AND the FFI mirror's own `check_mmid` out of the
+//! way, each row killing a single-check mutant of the C source. The Rust side refuses first in
+//! production, so without this table a C check could be deleted and nothing would notice.
 //!
 //! A row is the legal base call (4 experts, 4 tokens of 2 ids, Q4_K, K 256, N 128, `ld` 128, every
 //! range in its own device allocation) with ONE edit: a geometry field, a capacity, or a
 //! pointer. The capacities are first fitted to the edited geometry by the Rust mirror of the
-//! sizing rules (`launch_needs`, built on G1's functions, independent of the C expressions), so a
-//! row violates only its own check and satisfies every check after it: a C check deleted from
-//! the source then lets the call through to the launch, and the row fails on `rc != -1`.
-//! The rows follow the C order: `valid_grouped`, `valid_limits`, `valid_ranges`. They are
-//! issued with no wrapper, through `mmq_mmid_launch_raw`.
+//! sizing rules (`launch_needs`, built on the `mmq_size` functions, independent of the C
+//! expressions), so a row violates only its own check and satisfies every check after it: a C
+//! check deleted from the source then lets the call through to the launch, and the row fails on
+//! `rc != -1`. The rows follow the C order: `valid_grouped`, `valid_limits`, `valid_ranges`.
+//! They are issued with no wrapper, through `mmq_mmid_launch_raw`.
 //!
 //! Not reachable by a row, and argued: `e >= 1` (subsumed by `ne / m <= e` with `ne / m >= 1`),
 //! `nrows_x <= INT_MAX` (subsumed by `nrows_dst >= nrows_x` with `nrows_dst <= INT_MAX`), and
@@ -257,10 +256,10 @@ fn rows(fx: &Fx) -> Vec<Row> {
         then(fx, "x capacity (blocks * block bytes)", |c| c.x_bytes -= 1),
         then(fx, "x alignment 16", |c| c.x = at(X, 4).cast_const()),
         then(fx, "y null", |c| c.y = ptr::null()),
-        then(fx, "y capacity (rule M1 pad)", |c| c.y_bytes -= 1),
+        then(fx, "y capacity (the constant pad)", |c| c.y_bytes -= 1),
         then(fx, "y alignment 16", |c| c.y = at(Y, 4).cast_const()),
         then(fx, "ids_dst null", |c| c.ids_dst = ptr::null()),
-        then(fx, "ids_dst capacity (rule M2, B2)", |c| {
+        then(fx, "ids_dst capacity (the fixup gather)", |c| {
             c.ids_dst_bytes -= 1
         }),
         then(fx, "ids_dst alignment 4", |c| {

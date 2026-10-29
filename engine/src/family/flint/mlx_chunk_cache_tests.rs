@@ -129,9 +129,9 @@ fn batch_chunk_cache_preserves_union_and_final_ring_without_row_writes() {
     }
 }
 
-/// CTX32K-GROW: growing a full plane must preserve every committed row and
-/// keep chunking across the old capacity identical to a plane that started
-/// big. The grown plane and the direct plane must read back equal.
+/// Growing a full plane must preserve every committed row and keep chunking
+/// across the old capacity identical to a plane that started big. The grown
+/// plane and the direct plane must read back equal.
 #[test]
 fn batch_chunk_cache_grow_preserves_rows_across_the_old_capacity() {
     let _serial = crate::native_test_lock();
@@ -192,9 +192,9 @@ fn batch_chunk_cache_grow_preserves_rows_across_the_old_capacity() {
     }
 }
 
-/// SF-3 (ctx32k): the cache must cross the legacy 8192 boundary cleanly at
-/// the 32768 default - full layers keep origin 0, ring layers clamp to the
-/// 512-row window, on both sides of 8192.
+/// The cache must cross the legacy 8192 boundary cleanly at the 32768
+/// default - full layers keep origin 0, ring layers clamp to the 512-row
+/// window, on both sides of 8192.
 #[test]
 fn batch_chunk_cache_crosses_legacy_8192_at_32k() {
     let _serial = crate::native_test_lock();
@@ -398,14 +398,13 @@ fn batch_cache_matches_t1_bytes_and_eight_decode_fixture_steps_on_every_layer() 
     }
 }
 
-/// D2 async chain (design scrch/7c82644c/flint-async-chain/DESIGN.md): the
-/// chained commit must EXECUTE (the dependency edge must pass the adapter
-/// validators — a source-review MF class that host gates cannot catch) and
-/// leave the plane bytes bitwise identical to the fenced commit when the
-/// attention consumer is read back after the group-root evaluate. Four
-/// planes stand in for a 4-layer group; three one-row steps per plane cross
-/// the group boundary exactly like the forward loop. No model weights; the
-/// counter/parity/speed contract stays with d2_async_chain_counter_target.
+/// Async chain: the chained commit must EXECUTE (the dependency edge must pass the
+/// adapter validators — a failure class that host-side checks cannot catch) and
+/// leave the plane bytes bitwise identical to the fenced commit when the attention
+/// consumer is read back after the group-root evaluate. Four planes stand in for a
+/// 4-layer group; three one-row steps per plane cross the group boundary exactly
+/// like the forward loop. No model weights; the counter/parity/speed contract stays
+/// with d2_async_chain_counter_target.
 #[test]
 #[ignore = "bounded native cache diagnosis; no model weights"]
 fn chained_commit_executes_and_matches_fenced_bytes() {

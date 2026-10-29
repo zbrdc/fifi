@@ -1,9 +1,8 @@
-//! Host tests of the chunked-prefill driver's pure pieces (CPF-7b-C D.1): the admission
-//! inputs and their planned-against-allocated equality, the cap, decode-arena and extras
-//! terms of the admission, the pre-arena verdict, the zero spans of the arena fill, the
-//! gate's fifth condition, and the start line of the prefill path. Real dimensions from
-//! `common_tests`; no device anywhere — the device rows are the `prefill_step_device_tests`
-//! of T1/T2.
+//! Host tests of the chunked-prefill driver's pure pieces: the admission inputs and their
+//! planned-against-allocated equality, the cap, decode-arena and extras terms of the admission, the
+//! pre-arena verdict, the zero spans of the arena fill, the gate's fifth condition, and the start
+//! line of the prefill path. Real dimensions from `common_tests`; no device anywhere — the device
+//! rows are in `prefill_step_device_tests`.
 
 use super::common_tests;
 use super::dims::{KvMode, StepOptions};
@@ -203,7 +202,7 @@ fn kv8_extended_staging_fits_the_available_budget() {
     }
 }
 
-/// The SM count of the 3090, the device the costs rows of the packet run on.
+/// The SM count of the 3090, the device the cost rows run on.
 const NSM: usize = 82;
 
 /// The options of a plain session of `window` positions under `mode`: the fields the state
@@ -220,11 +219,10 @@ fn options_of(mode: KvMode, window: usize) -> StepOptions {
     }
 }
 
-/// H-B1: the admission state term is the WHOLE resident layout — the planned figure equals
-/// the allocated one — and a planned term that is not the allocated state (the KV bytes
-/// alone, the 7b-A1 input, about 62.8 MiB short at the 16K window) is refused by its text
-/// before anything else. Kills 7b-A1b (the equality guard dropped) and keeps the equality
-/// text pinned for the device refusal kill of 7b-A1 (DV-B1).
+/// The admission state term is the WHOLE resident layout — the planned figure equals the allocated
+/// one — and a planned term that is not the allocated state (the KV bytes alone, about 62.8 MiB
+/// short at the 16K window) is refused by its text before anything else. Dropping the equality
+/// guard fails this test, and the pinned equality text is the one the device refusal row expects.
 #[test]
 fn admission_charges_the_whole_resident_state() {
     let dims = common_tests::dims();
@@ -282,9 +280,9 @@ fn admission_charges_the_whole_resident_state() {
     }
 }
 
-/// H-B2: the admission takes the cap, the decode arena and the extras. Every budget
-/// boundary is computed from the `chunk_costs` rows in this test, never a literal. Kills
-/// 7b-A2 (the cap dropped) and 7b-A6 (the decode-arena charge dropped).
+/// The admission takes the cap, the decode arena and the extras. Every budget boundary is computed
+/// from the `chunk_costs` rows in this test, never a literal. Dropping the cap or the decode-arena
+/// charge fails it.
 #[test]
 fn admission_takes_the_cap_the_decode_arena_and_the_extras() {
     let dims = common_tests::dims();
@@ -318,11 +316,11 @@ fn admission_takes_the_cap_the_decode_arena_and_the_extras() {
     };
     // A budget that admits 2048 with cap 2048 gives 2048 ...
     assert_eq!(admits(boundary(0), 0, M_LADDER[0], &[]), Some(2048));
-    // ... and with cap 128 gives 128 (the cap narrows the ladder, 7b-A2).
+    // ... and with cap 128 gives 128 (the cap narrows the ladder).
     assert_eq!(admits(boundary(0), 0, 128, &[]), Some(128));
     // Charging the decode arena lowers the budget the ladder sees by exactly that many
     // bytes, so the SAME budget admits the next size down only when the arena is charged
-    // (7b-A6: with the charge dropped, the row below returns the top again).
+    // (with the charge dropped, the row below returns the top again).
     let decode = 1 << 20;
     assert_eq!(
         admits(boundary(0), decode, M_LADDER[0], &[]),
@@ -347,8 +345,8 @@ fn admission_takes_the_cap_the_decode_arena_and_the_extras() {
     );
 }
 
-/// H-B3: the zero spans cover `[0, total)` exactly once, contiguous from 0, each span
-/// `1..=ZERO_CHUNK` long; a zero-byte span chunk is refused. Kills 7b-A4 (one span short).
+/// The zero spans cover `[0, total)` exactly once, contiguous from 0, each span `1..=ZERO_CHUNK`
+/// long; a zero-byte span chunk is refused. A fill one span short fails it.
 #[test]
 fn zero_spans_cover_the_arena_once() {
     for total in [
@@ -388,8 +386,8 @@ fn zero_spans_cover_the_arena_once() {
     }
 }
 
-/// H-B4: the gate refuses without an arena AFTER the Q6_K scan, and the accept verdict
-/// carries the ADMITTED size, never the cap. Kills 7b-V1 and 7b-V2.
+/// The gate refuses without an arena AFTER the Q6_K scan, and the accept verdict carries the
+/// ADMITTED size, never the cap.
 #[test]
 fn the_gate_refuses_without_an_arena_after_the_q6k_check() {
     let otherwise_ready = || ChunkFacts {
@@ -412,7 +410,7 @@ fn the_gate_refuses_without_an_arena_after_the_q6k_check() {
             ..otherwise_ready()
         }),
         ChunkVerdict::Ready { m_sess: 512 },
-        "the accept verdict carries the admitted size, never the cap (7b-V2)"
+        "the accept verdict carries the admitted size, never the cap"
     );
     assert_eq!(
         chunk_verdict(&ChunkFacts {
@@ -433,8 +431,8 @@ fn the_gate_refuses_without_an_arena_after_the_q6k_check() {
     );
 }
 
-/// H-B5: only an otherwise-ready session plans an arena — one false row per condition of
-/// the pre-arena half. Kills 7b-V3.
+/// Only an otherwise-ready session plans an arena — one false row per condition of the pre-arena
+/// half.
 #[test]
 fn only_an_otherwise_ready_session_plans_an_arena() {
     assert!(needs_arena(
@@ -506,8 +504,7 @@ fn kv8_opt_in_plans_an_arena_without_bypassing_layout_or_weight_guards() {
     ));
 }
 
-/// H-B6 (R3): the start line names the prefill path of every verdict, the accept with its
-/// admitted size. Kills 7b-R3.
+/// The start line names the prefill path of every verdict, the accept with its admitted size.
 #[test]
 fn the_start_line_names_the_prefill_path() {
     assert_eq!(
@@ -536,9 +533,8 @@ fn the_start_line_names_the_prefill_path() {
     );
 }
 
-/// H-B13 (condition 8a): the two admission guards of `admit_prefill` refuse by their exact
-/// texts, each with the other guard satisfied; both clear is `Ok`. Kills 7b-A7 (guard 2
-/// dropped: the second row would return `Ok`).
+/// The two admission guards of `admit_prefill` refuse by their exact texts, each with the other
+/// guard satisfied; both clear is `Ok`. Without the second guard the second row would return `Ok`.
 #[test]
 fn the_admission_guards_refuse_by_text() {
     assert_eq!(
@@ -556,7 +552,7 @@ fn the_admission_guards_refuse_by_text() {
     assert_eq!(admit_guard(false, false), Ok(()));
 }
 
-// CPF-7b-C B.4: continuation must start at the committed position.
+// Continuation must start at the committed position.
 #[test]
 fn chunk_start_must_equal_the_committed_position() {
     use super::prefill_driver::check_chunk_start;
@@ -576,7 +572,7 @@ fn chunk_start_must_equal_the_committed_position() {
     );
 }
 
-// H-B9: sampler padding is invalid even when an embedding row exists.
+// Sampler padding is invalid even when an embedding row exists.
 #[test]
 fn chunk_ids_check_vocabulary_before_signed_conversion() {
     use super::prefill_driver::chunk_ids;
@@ -602,8 +598,8 @@ fn chunk_ids_check_vocabulary_before_signed_conversion() {
     );
 }
 
-/// H-B8 (CPF-7b-C D.1): every step gets its own rows at its own position, a feed step exactly
-/// one, and an empty call drives nothing.
+/// Every step gets its own rows at its own position, a feed step exactly one, and an empty call
+/// drives nothing.
 #[test]
 fn drive_chunks_slices_rows_at_their_positions() {
     for &start in &[0usize, 130] {
@@ -929,7 +925,7 @@ fn fixed_live_room_has_an_exact_boundary_without_recharging_resident_owners() {
     );
 }
 
-// ---- Q36_CUDA_CPF_STAGE_128K (wide CPF staging candidate, flag ON by default since the 2026-10-25 flip; =0 rolls back) ----
+// ---- Q36_CUDA_CPF_STAGE_128K (wide CPF staging candidate, on by default; =0 rolls back) ----
 
 /// The live bytes `require_fixed_room` demands for a given stage: the pinned charge law.
 fn live_required(cost: &ChunkCost, staging_bytes: usize) -> usize {
@@ -1073,8 +1069,7 @@ fn wide_flag_propagates_non_memory_errors_from_the_wide_admission() {
     // A non-Memory error from the wide arm must surface unchanged — pinned here as a
     // text/class regression pin: this BadRequest is identical to the one the default
     // arm would produce, so it cannot discriminate fallback from propagation on its
-    // own (the equivalence is the documented MUT-B evidence); it does pin that the
-    // wide attempt never swallows or rewraps the tier error.
+    // own; it does pin that the wide attempt never swallows or rewraps the tier error.
     case.facts.cap = 1;
     let error = admit_fixed_staged(
         &case.facts,

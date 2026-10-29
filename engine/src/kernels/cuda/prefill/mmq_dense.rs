@@ -1,25 +1,23 @@
-//! The dense MMQ GEMM wrapper (CPF-V4 G2, decision 0049 item 11): [`CudaContext::mmq_dense`]
-//! queues one launch of `native/prefill/mmq_dense.cu`, which calls the vendored
-//! `mul_mat_q_case<Q8_0|Q4_K|Q6_K>` (mmq.cuh) on a Native weight and the q8_1 columns of
-//! `mmq_quant`, and writes `dst[j * ld + col_off + i]` for `i < n`, `j < m`. It allocates
-//! nothing, copies nothing and never synchronizes. The shape rules below are mirrored by the
-//! C entry so a native call can never be refused as an invalid argument, which would latch
-//! the backend; the byte sizes are the wrapper's alone, because the C ABI carries no
-//! capacities (it adds the alignment, overlap and fixup-size checks that need none, or read
-//! the device). The stream-k fixup range is scratch
-//! that a launch writes and reads back: two launches on different streams must not share
-//! one, and the wrapper requires the device maximum ([`CudaContext::mmq_fixup_bytes`]).
+//! The dense MMQ GEMM wrapper: [`CudaContext::mmq_dense`] queues one launch of
+//! `native/prefill/mmq_dense.cu`, which calls the vendored `mul_mat_q_case<Q8_0|Q4_K|Q6_K>`
+//! (mmq.cuh) on a Native weight and the q8_1 columns of `mmq_quant`, and writes
+//! `dst[j * ld + col_off + i]` for `i < n`, `j < m`. It allocates nothing, copies nothing and never
+//! synchronizes. The shape rules below are mirrored by the C entry so a native call can never be
+//! refused as an invalid argument, which would latch the backend; the byte sizes are the wrapper's
+//! alone, because the C ABI carries no capacities (it adds the alignment, overlap and fixup-size
+//! checks that need none, or read the device). The stream-k fixup range is scratch that a launch
+//! writes and reads back: two launches on different streams must not share one, and the wrapper
+//! requires the device maximum ([`CudaContext::mmq_fixup_bytes`]).
 //!
-//! Every refusal is a `BadRequest` tagged `mmq_dense: <rule>`, in this order: the weight type
-//! (Q5_0 has no dense case in this packet), the K grid (`K % 256`, plan section B.3 rule M2,
-//! before any other k rule so K = 384 reaches this tag for every type; it also implies
-//! `K % qk` for the three cases, so no separate qk rule exists), the k extent, the column
-//! count `M` (the 2,048 chunk cap, G1's `NCOLS_LIMIT`), the row count, the destination
-//! stride, the `2^30` tile-grid limit of the vendored launch (mmq.cuh:1402), bounded with the
-//! smallest tile width J = 8 because the launch picks J, the conversions to the C ABI's
-//! `int`, and the destination reach (`dst reach`: `(m - 1) * ld + n` must not exceed
+//! Every refusal is a `BadRequest` tagged `mmq_dense: <rule>`, in this order: the weight type (Q5_0
+//! has no dense case), the K grid (`K % 256`, before any other k rule so K = 384 reaches this tag
+//! for every type; it also implies `K % qk` for the three cases, so no separate qk rule exists),
+//! the k extent, the column count `M` (the 2,048 chunk cap, `mmq_size`'s `NCOLS_LIMIT`), the row
+//! count, the destination stride, the `2^30` tile-grid limit of the vendored launch (mmq.cuh:1402),
+//! bounded with the smallest tile width J = 8 because the launch picks J, the conversions to the C
+//! ABI's `int`, and the destination reach (`dst reach`: `(m - 1) * ld + n` must not exceed
 //! `i32::MAX`, because the kernels index the destination in 32-bit `int`). The byte sizes are
-//! G1's: the q8_1 range `q8_1_bytes(K, M)` carries the one constant pad.
+//! `mmq_size`'s: the q8_1 range `q8_1_bytes(K, M)` carries the one constant pad.
 #![cfg_attr(
     not(test),
     expect(
@@ -103,7 +101,7 @@ pub(super) fn check_dense_mmq_rules(
     col_off: usize,
 ) -> Result<DenseInts, EngError> {
     if ty == MmqType::Q50 {
-        return Err(rule("type", "Q5_0 has no dense case in this packet"));
+        return Err(rule("type", "Q5_0 has no dense case"));
     }
     if !k.is_multiple_of(K_GRID) {
         return Err(rule(
@@ -229,7 +227,7 @@ fn mmq_type_of(ty: QuantType) -> Result<MmqType, EngError> {
         QuantType::Q80 => Ok(MmqType::Q80),
         QuantType::Q4K => Ok(MmqType::Q4K),
         QuantType::Q6K => Ok(MmqType::Q6K),
-        QuantType::Q50 => Err(rule("type", "Q5_0 has no dense case in this packet")),
+        QuantType::Q50 => Err(rule("type", "Q5_0 has no dense case")),
     }
 }
 
@@ -242,9 +240,8 @@ pub(crate) struct MmqDenseCall<'b> {
     /// An optional `(row_offset, rows)` SEGMENT of `weight` instead of its whole row
     /// extent. Segmented calls exist so a wide fused upload can back several launches of
     /// the exact per-segment shapes: the vendored MMQ picks its stream-k schedule from
-    /// `(n, m, k)`, so one wide launch is NOT bitwise the four narrow ones it replaces
-    /// (the GDN fusion divergence, 2026-10-27); same-shape launches over the same bytes
-    /// are.
+    /// `(n, m, k)`, so one wide launch is NOT bitwise the four narrow ones it replaces;
+    /// same-shape launches over the same bytes are.
     pub(crate) w_seg: Option<(usize, usize)>,
     pub(crate) m: usize,
     pub(crate) q8_1: DeviceRange<'b>,
@@ -260,7 +257,7 @@ impl CudaContext {
     /// are private to the prefill tree. The scale layout comes from `call.weight`, and `k`
     /// is its own, so the input cannot disagree with the GEMM that consumes it. Every
     /// refusal of `mmq_quantize` applies (the K grid, the chunk cap, the capacity of `y` with
-    /// G1's pad, alignment, overlap).
+    /// the q8_1 pad, alignment, overlap).
     pub(crate) fn mmq_dense_input(
         &self,
         stream: &DeviceStream,
@@ -295,10 +292,10 @@ impl CudaContext {
     }
 
     /// The checked launch, with the fixup range's floor as an argument: production passes
-    /// the device maximum; the coupling row of plan section B.0 (c) passes a smaller one to
-    /// get past the wrapper. A range below the launch's exact need then meets the C entry's
-    /// own refusal (an invalid argument, status -1), not the vendored require of plan section
-    /// B.0 (c), which stays as the backstop behind it (lane C's ruling on MSG-85 B2).
+    /// the device maximum; the coupling test passes a smaller one to get past the wrapper. A
+    /// range below the launch's exact need then meets the C entry's own refusal (an invalid
+    /// argument, status -1), not the vendored fixup require (mmq.cuh:1409), which stays as the
+    /// backstop behind it.
     fn launch_dense(
         &self,
         stream: &DeviceStream,

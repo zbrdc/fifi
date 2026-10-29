@@ -81,7 +81,8 @@ int inference_cuda_exl3_grouped(const inference_cuda_exl3_linear_args *calls,
 /* Same contract and emissions as inference_cuda_exl3_grouped; the small
  * projection runs the per-warp shared-table gather variant with identical
  * arithmetic and reduction order (FIFI_FLINT_CUDA_GROUPED_GATHER, default
- * off; the default shuffle kernel stays untouched). */
+ * ON since 2026-10-28; any non-enable value rolls back to the shuffle kernel,
+ * which stays untouched). */
 int inference_cuda_exl3_grouped_gathered(const inference_cuda_exl3_linear_args *calls,
                                          size_t count, void *stream, int *out_stage);
 /* Explicit tensor-core projection for rows9..144, one F32 Z bank.

@@ -753,7 +753,7 @@ const ROPE: Operation = Operation {
 };
 // The `q` readback synchronizes third. The `k` readback synchronizes fourth, so a failure there
 // strands both evaluated outputs. A build fault in the `k` call leaves none.
-// The `rope` and `rope_k` evaluation suites both stay (R-13). They strike the same point, the
+// The `rope` and `rope_k` evaluation suites both stay. They strike the same point, the
 // first `q` readback, but they select different build calls for the call, null, and mismatch
 // faults, so each keeps its own coverage. `imports: 3` sets the synchronization ordinal to 4. It
 // is not an import count.
@@ -1004,11 +1004,11 @@ const SLICE_UPDATE: Operation = Operation {
             .and_then(|output| kernels.readback(&output).map(drop))
     },
 };
-// `kv_append` (packet NATIVE-OPS-1) consumes its target, so each call imports a fresh one: the
-// driver runs the closure twice, and the second call runs on the already terminal adapter, whose
-// import rejects with `Backend{execute}`. The closure returns that error instead of unwrapping
-// the import, so the driver observes the expected terminal rejection of the second call. The
-// update import of `prepare` and the target import of the call synchronize before the readback.
+// `kv_append` consumes its target, so each call imports a fresh one: the driver runs the closure
+// twice, and the second call runs on the already terminal adapter, whose import rejects with
+// `Backend{execute}`. The closure returns that error instead of unwrapping the import, so the
+// driver observes the expected terminal rejection of the second call. The update import of
+// `prepare` and the target import of the call synchronize before the readback.
 fn prepare_kv_append(kernels: &mut MlxKernels) -> Operands {
     Operands {
         tensors: vec![import_f32(kernels, vec![1])],
@@ -1165,8 +1165,7 @@ const TAKE_CLAMP: Operation = Operation {
 
 // `take_along_axis` of one row of [2, N] on axis 0 with [1, N] U32 indices returns [1, N]:
 // `RETAINED_ELEMENTS` values, as `prepare_take` builds for `take` (the indices carry the input
-// rank here). The clamp of the indices is native call 1 and the gather is call 2 (packet
-// Q36-PF-DEVROUTE fix1 K1).
+// rank here). The clamp of the indices is native call 1 and the gather is call 2.
 fn prepare_take_along_axis(kernels: &mut MlxKernels) -> Operands {
     Operands {
         tensors: vec![
@@ -1309,8 +1308,8 @@ const GROUPED_ATTENTION: Operation = Operation {
     },
 };
 
-// `grouped_attention_prefix` (packet NATIVE-OPS-1): the same output layout, and the one composite
-// shim call covers the two prefix views and the fused attention, so it is selected call 1.
+// `grouped_attention_prefix`: the same output layout, and the one composite shim call covers the
+// two prefix views and the fused attention, so it is selected call 1.
 const GROUPED_ATTENTION_PREFIX: Operation = Operation {
     label: "grouped attention prefix",
     call: |kernels, operands| {
@@ -1328,11 +1327,11 @@ const GROUPED_ATTENTION_PREFIX: Operation = Operation {
     ..GROUPED_ATTENTION
 };
 
-// `evaluate_async` (packet NATIVE-OPS-1) fills no output array and does not go through the
-// counted selection hooks, so only its own un-counted submission fault
-// (`INFERENCE_MLX_FAIL_ASYNC_EVAL`) applies to its submission; the evaluation, null, and
-// mismatch faults have no point to strike (the output tensor stays lazy and readback-complete synchronizations are the
-// blocking `evaluate` fault suite's own cases).
+// `evaluate_async` fills no output array and does not go through the counted selection hooks, so
+// only its own un-counted submission fault (`INFERENCE_MLX_FAIL_ASYNC_EVAL`) applies to its
+// submission; the evaluation, null, and mismatch faults have no point to strike (the output
+// tensor stays lazy and readback-complete synchronizations are the blocking `evaluate` fault
+// suite's own cases).
 const EVALUATE_ASYNC: Operation = Operation {
     label: "evaluate",
     imports: 1,
@@ -1730,10 +1729,10 @@ fault_suite!(grouped_attention_heads, GROUPED_ATTENTION);
 fault_suite!(grouped_attention_prefix_heads, GROUPED_ATTENTION_PREFIX);
 fault_suite!(gated_delta_rule, GATED_DELTA);
 
-// Only the un-counted submission fault applies to the async submission of `evaluate_async`
-// (packet NATIVE-OPS-1 fix1): the submission fills no output array, so the null, evaluation, and
-// mismatch faults of the selection have no strike point on it, and the submission consumes no
-// operation-fault slot (guard.cpp documents why).
+// Only the un-counted submission fault applies to the async submission of `evaluate_async`: the
+// submission fills no output array, so the null, evaluation, and mismatch faults of the selection
+// have no strike point on it, and the submission consumes no operation-fault slot (guard.cpp
+// documents why).
 #[test]
 fn evaluate_async_native_call_failure_is_terminal_and_retains_output() {
     fault_test!(
@@ -1744,10 +1743,10 @@ fn evaluate_async_native_call_failure_is_terminal_and_retains_output() {
 }
 
 /// A counted fault aimed at the selected operation after an `evaluate_async` call reaches that
-/// operation unconsumed (fix1 task 2a): the submission takes part in no selection, so `call:2`
-/// strikes the second `silu` build while the `evaluate_async` between the builds succeeds. With
-/// the old shim, which spent a selection slot on the submission, the `evaluate_async` call
-/// itself failed instead and the aimed fault never struck.
+/// operation unconsumed: the submission takes part in no selection, so `call:2` strikes the
+/// second `silu` build while the `evaluate_async` between the builds succeeds. With the old shim,
+/// which spent a selection slot on the submission, the `evaluate_async` call itself failed
+/// instead and the aimed fault never struck.
 #[test]
 fn evaluate_async_consumes_no_operation_fault_slot() {
     if env::var_os("INFERENCE_NATIVE_FAILURE_CHILD").is_none() {
@@ -1797,10 +1796,10 @@ fn evaluate_async_consumes_no_operation_fault_slot() {
     ));
 }
 
-/// The release of the consumed target handle inside `kv_append` follows decision 0022 (fix1
-/// task 2b): the injected release failure makes the adapter terminal and the call reports
-/// `Backend` with label `kv append` instead of returning `Ok` from a terminal adapter. The
-/// taken handle and the built output stay retained.
+/// A failed release of the consumed target handle inside `kv_append` is terminal: the
+/// injected release failure makes the adapter terminal and the call reports `Backend` with
+/// label `kv append` instead of returning `Ok` from a terminal adapter. The taken handle and
+/// the built output stay retained.
 #[test]
 fn kv_append_release_failure_is_terminal_and_reported() {
     if env::var_os("INFERENCE_NATIVE_RELEASE_CHILD").is_none() {
@@ -1825,7 +1824,7 @@ fn kv_append_release_failure_is_terminal_and_reported() {
             ..
         })
     ));
-    // The failed release retained the taken handle (decision 0022).
+    // The failed release retained the taken handle.
     assert_active_bytes_stay_at_least(before, "after the failed release");
     assert!(matches!(
         kernels.import_tensor(&small_f32(vec![1])),

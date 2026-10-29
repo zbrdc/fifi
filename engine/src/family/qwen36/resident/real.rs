@@ -14,7 +14,7 @@ pub(super) fn env_path(name: &str) -> PathBuf {
     PathBuf::from(std::env::var(name).unwrap_or_else(|_| panic!("set {name}")))
 }
 
-/// The decode activation dtype named by `value`, the raw `Q36_ACTIVATION` text (packet Q36-BF16-a):
+/// The decode activation dtype named by `value`, the raw `Q36_ACTIVATION` text:
 /// the words are the setting's own `f32` | `bf16`, parsed by `settings::parse_activation`, so the
 /// knob and the `activation_dtype` config member cannot drift apart. Unset is NOT the config
 /// default here: the knob's unset means the F32 control, so a plain run of the ignored tests is
@@ -27,7 +27,7 @@ pub(super) fn parse_activation(value: Option<&str>) -> Result<Activation, String
     }
 }
 
-/// The cache form named by `value`, the raw `Q36_KV_DTYPE` text (packet KV8-INTEGRATE): the
+/// The cache form named by `value`, the raw `Q36_KV_DTYPE` text: the
 /// words are the setting's own `f32` | `q8`, parsed by `settings::parse_kv_dtype`, so the knob
 /// and the `kv_dtype` config member cannot drift apart. Unset is the config default, the F32
 /// control. Any other text is an error that names the variable.
@@ -39,9 +39,8 @@ pub(super) fn parse_kv_dtype(value: Option<&str>) -> Result<KvDtype, String> {
     }
 }
 
-/// Reads `Q36_KV_DTYPE`, the knob of the ignored runs that selects the product `kv_dtype` lever
-/// (packet KV8-INTEGRATE). Unset gives the F32 control, so an unset run is the run of before.
-/// An invalid value panics.
+/// Reads `Q36_KV_DTYPE`, the knob of the ignored runs that selects the product `kv_dtype` lever.
+/// Unset gives the F32 control, so an unset run is unchanged by the knob. An invalid value panics.
 pub(super) fn kv_dtype_from_env() -> KvDtype {
     parse_kv_dtype(env_text("Q36_KV_DTYPE").as_deref()).unwrap_or_else(|error| panic!("{error}"))
 }
@@ -121,7 +120,7 @@ mod tests {
         );
     }
 
-    /// The knob parses its words with the settings parser (one authority, packet Q36-BF16-a fix)
+    /// The knob parses its words with the settings parser (one authority)
     /// and keeps its own unset rule: unset means the F32 control, not the config default `bf16`,
     /// so a plain run of the ignored tests is the frozen F32 gate run.
     #[test]

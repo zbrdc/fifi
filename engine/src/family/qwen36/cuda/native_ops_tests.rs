@@ -1,7 +1,6 @@
-//! CPU tests of the NATIVE mixer op lists of MATVEC-PAR S3b (test seam U13): the Tiled lists
-//! pinned by LITERAL fixtures captured from a4ca4075's code (never the function under edit),
-//! and the same list-vs-plan checks the Tiled lists have. The construction guards live in
-//! `native_guard_tests.rs`. CPU only.
+//! CPU tests of the NATIVE mixer op lists: the Tiled lists pinned by LITERAL fixtures captured from
+//! the code before the native layout (never the function under edit), and the same list-vs-plan
+//! checks the Tiled lists have. The construction guards live in `native_guard_tests.rs`. CPU only.
 use super::common_tests::{dims, plan_of};
 use super::dims::{KvMode, StepOptions};
 use super::mixer_geometry::MixerGeometry;
@@ -22,8 +21,8 @@ fn ops_of(kind: AttentionKind, layout: WeightLayout) -> Vec<BlockOp> {
     block_ops(kind, &geometry(), layout, KvMode::Fp16).expect("ops")
 }
 
-/// The NATIVE Int8G32 attention list (KV8-B B3), whose slots the Int8G32 plan of
-/// `native_plan_tests.rs` carries.
+/// The NATIVE Int8G32 attention list, whose slots the Int8G32 plan of `native_plan_tests.rs`
+/// carries.
 fn int8_ops() -> Vec<BlockOp> {
     block_ops(
         AttentionKind::Full,
@@ -34,7 +33,7 @@ fn int8_ops() -> Vec<BlockOp> {
     .expect("ops")
 }
 
-/// The literal a4ca4075 lists: the Tiled `block_ops` outputs for the two kinds, written out once
+/// The literal Tiled lists: the Tiled `block_ops` outputs for the two kinds, written out once
 /// from the code at the integration base and never derived from the function under edit, so any
 /// behaviour change of the Tiled path fails here by name.
 #[test]
@@ -238,12 +237,12 @@ fn native_lists_ascend_and_stay_inside_their_slot_lifetimes() {
     }
 }
 
-// ---- KV8-B B3: the Int8G32 attention op list ----------------------------------------------
+// ---- the Int8G32 attention op list --------------------------------------------------------
 
-/// The Int8G32 attention list, written out literally like the a4ca4075 fixtures above: the NATIVE
-/// list with the fp16 attention core swapped for the KV8 triple (the rows entry, the append, the
-/// q8 decode at the Q8 split). Every field is pinned, so a wrong slot, word, plane, split or
-/// order fails here by name.
+/// The Int8G32 attention list, written out literally like the fixtures above: the NATIVE list with
+/// the fp16 attention core swapped for the KV8 triple (the rows entry, the append, the q8 decode at
+/// the Q8 split). Every field is pinned, so a wrong slot, word, plane, split or order fails here by
+/// name.
 #[test]
 fn the_int8_attention_list_is_pinned() {
     let want: Vec<BlockOp> = vec![
@@ -346,9 +345,9 @@ fn the_int8_attention_list_is_pinned() {
         .expect("ops"),
         ops_of(AttentionKind::DeltaNet, WeightLayout::Native)
     );
-    // The typed refusal the plan owns (B2/B3 review item 4): the builder refuses the Tiled
-    // Int8G32 attention list itself, naming the mode and the layout, with every earlier check
-    // satisfied (the geometry and the prologue build fine).
+    // The typed refusal the plan owns: the builder refuses the Tiled Int8G32 attention list itself,
+    // naming the mode and the layout, with every earlier check satisfied (the geometry and the
+    // prologue build fine).
     match block_ops(
         AttentionKind::Full,
         &geometry(),
@@ -365,10 +364,10 @@ fn the_int8_attention_list_is_pinned() {
     }
 }
 
-/// The dataflow order of the KV8 core (KV8-B B3): the rows entry writes the f32 rows, the append
-/// reads them and fills the code and scale planes, and only then does the q8 decode read the
-/// planes and the kv_len word. Pinned on its own so a reorder dies here even if a field edit
-/// keeps the list length.
+/// The dataflow order of the KV8 core: the rows entry writes the f32 rows, the append reads them
+/// and fills the code and scale planes, and only then does the q8 decode read the planes and the
+/// kv_len word. Pinned on its own so a reorder dies here even if a field edit keeps the list
+/// length.
 #[test]
 fn the_int8_kv_core_is_ordered_prep_append_decode() {
     let ops = int8_ops();
@@ -392,7 +391,7 @@ fn the_int8_kv_core_is_ordered_prep_append_decode() {
 
 /// The Int8G32 list obeys the `ops_tests.rs` rules against the Int8G32 plan: phases ascend,
 /// every slot is written before it is read, and every touch sits inside the slot's lifetime
-/// (KRows/VRows live ATTN_PREP..KV8_APPEND, the phase table of B2).
+/// (KRows/VRows live ATTN_PREP..KV8_APPEND in the Int8G32 phase table).
 #[test]
 fn the_int8_list_ascends_and_stays_inside_the_int8_slots() {
     let d = dims();

@@ -1,6 +1,6 @@
-//! The CPU-expert mailbox of the tiered decode step (TCAP C1, `ledger/plans/TCAP-DESIGN.md` sections 3.1 and
-//! 3.3): one page-locked, device-mapped block through which a layer's kernels hand the CPU server a request and
-//! the server hands back an answer, with no host synchronization inside the token.
+//! The CPU-expert mailbox of the tiered decode step: one page-locked, device-mapped block
+//! through which a layer's kernels hand the CPU server a request and the server hands back an
+//! answer, with no host synchronization inside the token.
 //!
 //! ```text
 //!   0    request line, 128 B   seq u64 (the release word) | layer u32 | count u32 | ids i32[8] @16 | weights f32[8] @48
@@ -12,30 +12,33 @@
 //! WHAT: [`Mailbox`] owns the mapping and is `!Send`; [`MailboxPort`] is the `Send + Sync` handle a server thread
 //! polls and answers with, and holds no CUDA type. WHY a port: the server must run without touching the context.
 //!
-//! Protocol, one request in flight: the device writes row and header, then releases `seq`; the port acquires
-//! `seq`, reads header and row, writes the partial and `code`, then releases `done = seq`. The one-in-flight
-//! invariant is stream order: the next layer's classify runs after the wait kernel (C3) of the previous request
-//! has returned, and a layer without a miss publishes nothing, so no word is read while it is written. Until C3
-//! exists nothing on the device enforces it and the callers serialize on the host (the stress test does). A wait
-//! that times out poisons the token and the mailbox is not reused before the reset (design 3.6).
-//! Soundness (KUBDAN-MSG-84): the memory is written by the device, so no `&[f32]` or `&mut [f32]` is ever formed
-//! over it; every access goes through the atomic word accessors of `native::resident::mailbox`, which export no
-//! slice or pointer. Both ends are real atomics, because the Jetson hosts are aarch64 and not TSO.
-//! Memory model: the host's `Release` and `Acquire` are CPU-thread-scope atomics and std has no scope operand,
-//! while the device uses system scope (`st.release.sys`, `ld.acquire.sys`). The pairing rests on the platform
-//! (x86 TSO posted writes; aarch64 `STLR`/`LDAR` observed through the coherent fabric), not on a proof in the
-//! PTX model; C3 reviews the device loads against these accessors on the Jetson, and the Xavier window kills the
+//! Protocol, one request in flight: the device writes row and header, then releases `seq`; the
+//! port acquires `seq`, reads header and row, writes the partial and `code`, then releases
+//! `done = seq`. The one-in-flight invariant is stream order: the next layer's classify runs after
+//! the wait kernel of the previous request has returned, and a layer without a miss publishes
+//! nothing, so no word is read while it is written. Until the step queues the wait kernel nothing
+//! on the device enforces it and the callers serialize on the host (the stress test does). A wait
+//! that times out poisons the token and the mailbox is not reused before the reset.
+//! Soundness: the memory is written by the device, so no `&[f32]` or `&mut [f32]` is ever formed
+//! over it; every access goes through the atomic word accessors of `native::resident::mailbox`,
+//! which export no slice or pointer. Both ends are real atomics, because the Jetson hosts are
+//! aarch64 and not TSO.
+//! Memory model: the host's `Release` and `Acquire` are CPU-thread-scope atomics and std has no
+//! scope operand, while the device uses system scope (`st.release.sys`, `ld.acquire.sys`). The
+//! pairing rests on the platform (x86 TSO posted writes; aarch64 `STLR`/`LDAR` observed through
+//! the coherent fabric), not on a proof in the PTX model; the device loads of the wait kernel are
+//! reviewed against these accessors on the Jetson, and a test run on the Xavier kills the
 //! host-side ordering mutants that the x86 hosts cannot show.
 //!
 //! There is no read-modify-write on the mapping, ever: the Tegra pinned pages are uncached without I/O coherence, so an
 //! atomic RMW there is not guaranteed, and the protocol needs only loads and stores.
 //!
-//! Dropping the [`Mailbox`] frees the mapping (after a device wait, decision 0022) only when no port is alive;
+//! Dropping the [`Mailbox`] frees the mapping (after a device wait) only when no port is alive;
 //! otherwise the pages are leaked, because a server thread may still read them.
 
 #![cfg_attr(
     not(test),
-    expect(dead_code, reason = "staged for TCAP C6 (ledger/plans/TCAP-DESIGN.md)")
+    expect(dead_code, reason = "staged for the captured tiered decode step")
 )]
 
 use std::{array, marker::PhantomData, rc::Rc, sync::Arc, sync::atomic::Ordering};
@@ -214,12 +217,12 @@ impl Mailbox {
         self.range(self.layout.row_offset(), self.layout.row_bytes())
     }
 
-    /// The answer line as a device range, for the wait-add launch's `mbox_ans` (TCAP C3).
+    /// The answer line as a device range, for the wait-add launch's `mbox_ans`.
     pub(in crate::kernels::cuda) fn answer_range(&self) -> Result<RawRange<'_>, EngError> {
         self.range(self.layout.answer_offset(), ANSWER_BYTES)
     }
 
-    /// The partial as a device range, for the wait-add launch's `mbox_partial` (TCAP C3).
+    /// The partial as a device range, for the wait-add launch's `mbox_partial`.
     pub(in crate::kernels::cuda) fn partial_range(&self) -> Result<RawRange<'_>, EngError> {
         self.range(self.layout.partial_offset(), self.layout.row_bytes())
     }

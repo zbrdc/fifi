@@ -1,4 +1,4 @@
-/** SF-A tests: the panel's recent-rows state under injected fakes (no
+/** Tests of the panel's recent-rows state under injected fakes (no
  * global mocks, no real timers), the probe merge, and the poll's per-tick
  * decision (node:test; no DOM). */
 
@@ -118,9 +118,9 @@ test("a failed probe fully replaces the panel: no last-good ok survives a fresh 
 });
 
 test("the poll refreshes the monitor whenever the view is visible — including offline (the round-1 regression)", () => {
-  // The round-1 code gated the refresh on the last known server state
+  // An earlier version gated the refresh on the last known server state
   // (serverReady), so the visible-offline row below refreshed nothing and
-  // the panel froze on its last good values (SF-A). Pin every row.
+  // the panel froze on its last good values. Pin every row.
   const table: Array<{
     monitorVisible: boolean;
     lastKnownServerReady: boolean;

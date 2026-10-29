@@ -1,16 +1,15 @@
-//! Batched MoE with one expert wave (decision 0044 items 3 to 5; packet PF-4).
+//! Batched MoE with one expert wave.
 //!
 //! The chunk form of `R/moe.rs::step_paged` for `T` token rows. The router runs on the device and
-//! one readback of `[T, E]` probabilities is the only synchronization (decision 0041 item 3). The
-//! host selects the experts of each row with `moe::select`, merges the choices into the sorted
-//! union of the chunk (`prefill_plan::union_and_remap`), and reads the union once into a page set
-//! of the prefill pool. `gather_qmm_sorted` then runs over all `T * top_k` (token, choice) pairs:
-//! `split_waves` orders the pairs of each wave by local rank, the non-decreasing order that MLX's
-//! `sorted_indices` flag requires, and `pool.import_wave` proves that order on the host before
-//! the import, because the method cannot read the device indices (packet FN-PF-SORTED; on the Q36
-//! model the flag cut the expert products of a 512-row chunk from about 457 ms to 207 ms,
-//! Q36-GAP 3a; the decode path keeps `gather_qmm` with `false`). The gate-weighted rows of a
-//! token are summed in choice order, as the decode step sums them.
+//! one readback of `[T, E]` probabilities is the only synchronization. The host selects the experts
+//! of each row with `moe::select`, merges the choices into the sorted union of the chunk
+//! (`prefill_plan::union_and_remap`), and reads the union once into a page set of the prefill pool.
+//! `gather_qmm_sorted` then runs over all `T * top_k` (token, choice) pairs: `split_waves` orders
+//! the pairs of each wave by local rank, the non-decreasing order that MLX's `sorted_indices` flag
+//! requires, and `pool.import_wave` proves that order on the host before the import, because the
+//! method cannot read the device indices (on the Q36 model the flag cut the expert products of a
+//! 512-row chunk from about 457 ms to 207 ms; the decode path keeps `gather_qmm` with `false`). The
+//! gate-weighted rows of a token are summed in choice order, as the decode step sums them.
 
 use super::super::super::{
     moe::{MoeShape, select},
@@ -64,11 +63,11 @@ fn chunk_route(
 /// Returns the gate-weighted expert rows `[n, H]` of the `n` pairs of one wave.
 ///
 /// Row `i` is the token row `tokens[i]` of `x` through the expert `ranks[i]` of the wave, times
-/// `gates[i]`. The three expert products run `gather_qmm_sorted` with `pages.ranks`: the wave
-/// pairs arrive from `split_waves` sorted by local rank, the non-decreasing order that MLX's
-/// `sorted_indices` flag requires, and `pool.import_wave` proved that order before the import
-/// (packet FN-PF-SORTED). A rank above the wave's expert count would clamp to the last expert on
-/// the device, so the ranks must come from `split_waves`.
+/// `gates[i]`. The three expert products run `gather_qmm_sorted` with `pages.ranks`: the wave pairs
+/// arrive from `split_waves` sorted by local rank, the non-decreasing order that MLX's
+/// `sorted_indices` flag requires, and `pool.import_wave` proved that order before the import. A
+/// rank above the wave's expert count would clamp to the last expert on the device, so the ranks
+/// must come from `split_waves`.
 fn wave_rows(
     ctx: &mut Ctx<'_>,
     pages: &WavePages,
@@ -142,8 +141,8 @@ fn routed_rows(
     ctx.kernels.reduce(ReduceOp::Sum, &ordered, 1, false)
 }
 
-/// Shared expert `sigmoid(x · s) * down(silu(gate(x)) * up(x))` for `x` `[T, H]`, giving
-/// `[T, H]`. It is the chunk form of `R/moe.rs::shared`: `qmm` takes the `T` rows (PF-K).
+/// Shared expert `sigmoid(x · s) * down(silu(gate(x)) * up(x))` for `x` `[T, H]`, giving `[T, H]`.
+/// It is the chunk form of `R/moe.rs::shared`: `qmm` takes the `T` rows.
 fn shared_rows(
     ctx: &mut Ctx<'_>,
     w: &RMoe,
@@ -421,16 +420,15 @@ mod tests {
         }
     }
 
-    /// Packet FN-PF-SORTED task 4b and the fix round: twelve token rows over the four test
-    /// tokens make 24 pairs (the union is the experts 0, 1, and 3). Hand-derived pair counts:
-    /// tokens 0, 2, and 3 take the experts 0 and 1 and token 1 takes 3 and 1, so over the twelve
-    /// rows (three copies of each token) rank 0 has 3 * 3 = 9 pairs, rank 1 has 12 * 1 = 12, and
-    /// rank 2 has 3 * 1 = 3, which the fixture route confirms (the `rank_idx` of
-    /// `chunk_route_breaks_ties...` repeated three times). Cap 4 holds the union in one wave of
-    /// those 24 pairs, which reaches the sorted kernel of the pinned MLX: 24 pairs are at least
-    /// 16 and 24 / 3 = 8 pairs per expert are at least 4. Cap 2 splits the same pairs into the
-    /// waves {0, 1} with 9 + 12 = 21 pairs over 2 experts (21 is at least 16 and 21 / 2 = 10 is
-    /// at least 4, so this wave runs the sorted kernel) and {3} with 3 pairs (below 16, the
+    /// Twelve token rows over the four test tokens make 24 pairs (the union is the experts 0, 1,
+    /// and 3). Hand-derived pair counts: tokens 0, 2, and 3 take the experts 0 and 1 and token 1
+    /// takes 3 and 1, so over the twelve rows (three copies of each token) rank 0 has 3 * 3 = 9
+    /// pairs, rank 1 has 12 * 1 = 12, and rank 2 has 3 * 1 = 3, which the fixture route confirms
+    /// (the `rank_idx` of `chunk_route_breaks_ties...` repeated three times). Cap 4 holds the union
+    /// in one wave of those 24 pairs, which reaches the sorted kernel of the pinned MLX: 24 pairs
+    /// are at least 16 and 24 / 3 = 8 pairs per expert are at least 4. Cap 2 splits the same pairs
+    /// into the waves {0, 1} with 9 + 12 = 21 pairs over 2 experts (21 is at least 16 and 21 / 2 =
+    /// 10 is at least 4, so this wave runs the sorted kernel) and {3} with 3 pairs (below 16, the
     /// unsorted kernel), so several waves, a sorted wave, and the inverse `take` run together.
     /// Every wave lists non-decreasing local ranks, and every output row matches its one-token
     /// decode block, which runs the unsorted `gather_qmm` of the decode path, within the parity

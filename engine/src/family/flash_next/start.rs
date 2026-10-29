@@ -1,4 +1,4 @@
-//! Starts the Flash-Next engine of one `enginesrv` config entry (packet H8c).
+//! Starts the Flash-Next engine of one `enginesrv` config entry.
 //!
 //! The tokenizer bundle loads on the calling thread. It carries only portable data. The engine
 //! thread builds everything native inside the `make` closure (`FlashExecutor::open`), so no native

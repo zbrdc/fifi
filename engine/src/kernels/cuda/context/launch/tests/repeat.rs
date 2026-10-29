@@ -1,8 +1,7 @@
-//! Seam-1 determinism of the dense projection shapes of one Qwen3.6-35B-A3B decode step
-//! (decision 0047 item 7, packet RD-2e): `pack` + `matmul` at m = 1, 1,000 repeats per shape,
-//! every repeat byte-identical to the first. The weights come from `testkit::upload_weight` and
-//! the activations are normal values, not the small integers of `testkit::input`: those make
-//! every fp32 sum exact, which hides any change of reduction order.
+//! Determinism of the dense projection shapes of one Qwen3.6-35B-A3B decode step: `pack` + `matmul`
+//! at m = 1, 1,000 repeats per shape, every repeat byte-identical to the first. The weights come
+//! from `testkit::upload_weight` and the activations are normal values, not the small integers of
+//! `testkit::input`: those make every fp32 sum exact, which hides any change of reduction order.
 //!
 //! Shapes: `engine/src/family/spec.rs` `QWEN3_6_35B_A3B` and the real header table in
 //! `family/gguf_model/inventory/tests.rs`. The tests assume `--test-threads=1`.
@@ -31,7 +30,7 @@ const fn shape(name: &'static str, ty: GgufType, rows: usize, k: usize, partials
     }
 }
 
-/// D1 to D7 of the packet: every dense projection of a decode step.
+/// Every dense projection of a decode step.
 const DENSE: [Shape; 7] = [
     shape("q_qkv", GgufType::Q80, 8192, 2048, 1),
     shape("kv_shared_gate_up", GgufType::Q80, 512, 2048, 1),
@@ -42,7 +41,7 @@ const DENSE: [Shape; 7] = [
     shape("lm_head", GgufType::Q6K, 248_320, 2048, 1),
 ];
 
-/// E1 and E2 of the packet as (rows of one expert, k, partials); the device test of the expert
+/// The two expert shapes as (rows of one expert, k, partials); the device test of the expert
 /// shapes keeps the same numbers in `resident/matmul_expert/tests/repeat.rs`.
 const EXPERT: [(usize, usize, usize); 2] = [(512, 2048, 1), (2048, 512, 1)];
 
@@ -102,7 +101,7 @@ fn stale_y(ctx: &CudaContext, bytes: usize) -> DeviceBuffer {
     testkit::upload_bytes(ctx, &stale)
 }
 
-/// Repeats one shape on lane A; at repeat 50 lane B runs the same work on its own stream,
+/// Repeats one shape on stream A; at repeat 50 stream B runs the same work on its own stream,
 /// overlapped with A's chunk, and its output must equal A's.
 fn repeat_dense(ctx: &CudaContext, index: usize, shape: &Shape) {
     let Shape {
@@ -112,17 +111,20 @@ fn repeat_dense(ctx: &CudaContext, index: usize, shape: &Shape) {
     let x = testkit::upload_f32(ctx, &activations(0x52D2_E000 + index as u64, k));
     let need = native::activation_bytes(rows, k, 1).expect("sizes of the call");
     assert_eq!(need.y, rows * 4, "{name}: y holds one f32 per row");
-    let (a, b) = (ctx.stream().expect("lane A"), ctx.stream().expect("lane B"));
+    let (a, b) = (
+        ctx.stream().expect("stream A"),
+        ctx.stream().expect("stream B"),
+    );
     let (xf_a, xf_b) = (
-        ctx.allocate(need.xf).expect("xf of lane A"),
-        ctx.allocate(need.xf).expect("xf of lane B"),
+        ctx.allocate(need.xf).expect("xf of stream A"),
+        ctx.allocate(need.xf).expect("xf of stream B"),
     );
     let y_b = stale_y(ctx, need.y);
     let run = (&weight, &x);
     let want = testkit::run_repeats(ctx, &a, need.y, |repeat, y| {
         queue_projection(ctx, &a, run, &xf_a, y);
         if repeat == 50 {
-            let y_b = y_b.range(0, need.y).expect("y range of lane B");
+            let y_b = y_b.range(0, need.y).expect("y range of stream B");
             queue_projection(ctx, &b, run, &xf_b, y_b);
         }
     })
@@ -132,9 +134,9 @@ fn repeat_dense(ctx: &CudaContext, index: usize, shape: &Shape) {
             index / 4
         )
     });
-    b.synchronize().expect("drain lane B");
+    b.synchronize().expect("drain stream B");
     let mut got = vec![0u8; need.y];
-    y_b.read_at(&b, 0, &mut got).expect("read lane B");
+    y_b.read_at(&b, 0, &mut got).expect("read stream B");
     assert_eq!(
         testkit::first_difference(&want, &got),
         None,

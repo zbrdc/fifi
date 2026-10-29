@@ -1,4 +1,4 @@
-//! Structural KV8 coverage of the five-layer synthetic chunk body, not G-KV8 acceptance.
+//! Structural KV8 coverage of the five-layer synthetic chunk body, not KV8 acceptance.
 //!
 //! The reference is sixteen one-row CHUNK bodies, not production decode. The existing
 //! `QwenResidentStep::new` requires complete `CudaWeights`, every table layer and global

@@ -1,4 +1,4 @@
-//! The host side of the tiered decode step (OFF-2 D4): classify the routed experts of a
+//! The host side of the tiered decode step: classify the routed experts of a
 //! layer against the residency table, start the CPU jobs of the missed ones, and decide
 //! the bank changes of the token boundary.
 //!
@@ -7,13 +7,13 @@
 //! trait ([`BankDevice`]), so everything here runs and is tested without CUDA. WHY: the
 //! engine must decide, per layer and between the router and the expert launches, which
 //! picks the GPU bank serves and which the CPU serves, without a second place that could
-//! disagree with the ledger. Design: `ledger/plans/OFF-2-DEVICE-WIRING.md` sections 2-3.
+//! disagree with the ledger.
 //!
-//! The rules of one layer (a missed pick maps to bank slot 0 with device weight 0.0 so the
-//! existing expert launches stay unchanged; the router-fault id `-1` passes through) and
-//! of the token boundary (every swap goes through the full residency state machine; all
-//! publication happens here, never inside a layer) are fixed by the ruling of
-//! 2026-10-13. Driven by the tiered step (OFF-2 D5).
+//! The rules of one layer: a missed pick maps to bank slot 0 with device weight 0.0 so the
+//! existing expert launches stay unchanged, and the router-fault id `-1` passes through.
+//! The rules of the token boundary: every swap goes through the full residency state
+//! machine, and all publication happens here, never inside a layer. Driven by the tiered
+//! step.
 
 use std::fmt;
 use std::sync::Arc;
@@ -73,7 +73,7 @@ impl fmt::Display for HostError {
 impl std::error::Error for HostError {}
 
 /// The device half of a bank change: copies the three slices of one expert into a slot.
-/// The real implementation (D5) writes them with blocking copies; tests use a mock.
+/// The real implementation writes them with blocking copies; tests use a mock.
 pub trait BankDevice {
     /// Fills `slot` of the bank of `layer` with the expert whose bytes `ranges` locate
     /// inside `region`. Returns when the bytes are on the device.
@@ -110,9 +110,9 @@ fn weight_ppm(weight: f32) -> u64 {
 
 /// The picks of every layer of one token as the device logged them: `(id, weight)` in rank order,
 /// exactly `top_k` per layer (`id == -1` is the router-fault value, any other negative id is
-/// refused). WHY (TCAP): the classification moves onto the device, so the host learns a token's
+/// refused). WHY: the classification moves onto the device, so the host learns a token's
 /// routes after it ran and accounts for them at the boundary with [`TieredHost::account_token`].
-/// First caller: TCAP C6.
+/// First caller: the mailbox's CUDA adapter.
 #[derive(Clone, Debug, PartialEq)]
 pub struct RouteLog {
     layers: usize,
@@ -290,7 +290,7 @@ impl TieredHost {
     /// `routes` per layer as [`Self::begin_layer`] leaves, without starting any CPU job (the device
     /// classified and a server ran the jobs). Every layer is validated first, so a refused log
     /// changes nothing. Refuses while a v1 layer is in flight. A log must hold exactly the config's
-    /// `top_k` picks per layer. First caller: TCAP C6.
+    /// `top_k` picks per layer. First caller: the mailbox's CUDA adapter.
     pub fn account_token(&mut self, log: &RouteLog) -> Result<(), HostError> {
         if let Some(open) = &self.in_flight {
             return Err(HostError::Order(format!(
@@ -331,7 +331,7 @@ impl TieredHost {
 
     /// The device slot table row of `layer`: for every expert its bank slot while it is published,
     /// else -1 (a miss; never 0, which is a real slot). `Err(BadRoute)` for a layer outside the
-    /// model. First caller: TCAP C6.
+    /// model. First caller: the mailbox's CUDA adapter.
     pub fn slot_row(&self, layer: usize) -> Result<Vec<i32>, HostError> {
         if layer >= self.cfg.layers {
             return Err(HostError::BadRoute(format!(

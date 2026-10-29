@@ -1,8 +1,7 @@
 /*
  * The device facts of the vendored MMQ entries (see mmq_facts.h). The first translation unit of
- * the MMQ glue build group (decision 0049 item 5: the vendor group's flags, warnings as errors).
- * The query follows device_info.cu and the MMVQ wrappers'
- * pattern in this tree.
+ * the MMQ glue build group (the vendor group's flags, warnings as errors). The query follows
+ * device_info.cu and the MMVQ wrappers' pattern in this tree.
  */
 #include <cuda_runtime.h>
 

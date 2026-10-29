@@ -1,6 +1,6 @@
-//! Unit tests of the pure section-timing algebra (packet B1, in-graph section timer): which
-//! layers carry timing marks and how the marked sections extrapolate to a whole token. CPU
-//! only, no device call.
+//! Unit tests of the pure section-timing algebra of the in-graph section timer: which layers
+//! carry timing marks and how the marked sections extrapolate to a whole token. CPU only, no
+//! device call.
 use super::section_timing::{MarkedGroup, section_plan};
 use crate::family::AttentionKind::{DeltaNet, Full, Qsa};
 

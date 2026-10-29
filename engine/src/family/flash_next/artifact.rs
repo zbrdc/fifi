@@ -1,4 +1,4 @@
-//! Files of the Flash-Next artifact directory that the server loads (decision 0033; packet H8).
+//! Files of the Flash-Next artifact directory that the server loads.
 //!
 //! The artifact manifest (`download-manifest.json`) maps each file name to `{"sha256", "size"}`.
 //! The manifest is the authority for the tokenizer files. `TokenizerBundle::load` checks each file

@@ -1,6 +1,6 @@
-//! Safe launch wrapper of the KV8 split-KV decode attention kernel (RD-8l, decision 0047 item
-//! 6, seam 1): the split-KV decode attention of `attn_decode` over the int8 code and fp16 scale
-//! planes of the KV8 format, read in contiguous 64-cell tiles and dequantized in registers.
+//! Safe launch wrapper of the KV8 split-KV decode attention kernel: the split-KV decode
+//! attention of `attn_decode` over the int8 code and fp16 scale planes of the KV8 format, read
+//! in contiguous 64-cell tiles and dequantized in registers.
 //!
 //! The packed-int8 layout follows Strata's laguna_kv8 flash decode.
 //!

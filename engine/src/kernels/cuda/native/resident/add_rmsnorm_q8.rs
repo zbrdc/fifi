@@ -1,6 +1,6 @@
 //! Raw FFI to `inference_cuda_add_rmsnorm_q8_launch` of `native/resident/add_rmsnorm_q8.cu`
 //! (declared in `native/resident/add_rmsnorm_q8.h`). Child of `native::resident`, so it inherits
-//! the `allow(unsafe_code)` of `native.rs` (decision 0047, child modules of `native.rs`).
+//! the `allow(unsafe_code)` of `native.rs`.
 //!
 //! Safety invariants this module relies on:
 //! - A device range is proved in bounds by `RawRange::new` before it gets here. This module
@@ -13,8 +13,7 @@
 //!   status; a fault in the kernel surfaces at the next synchronize.
 //! - The allocations stay valid until the queued launch finishes because `inference_cuda_free`
 //!   synchronizes the whole device before `cudaFree`.
-//! - Every call runs under the process dispatch guard and on the thread that owns the context
-//!   (decisions 0023 and 0024).
+//! - Every call runs under the process dispatch guard and on the thread that owns the context.
 //! - No raw pointer and no unsafe function leaves this module.
 
 use std::ffi::{c_int, c_void};
@@ -304,13 +303,13 @@ mod tests {
         })
     }
 
-    /// Host only (KUBDAN-MSG-64 items 6 and 10, lane C's K1 verdict): the native check against
-    /// the ranges of an unbacked allocation, with and without `delta`. The VALID ranges sit
-    /// 2 * ROW_N apart, so a case that moves or resizes one overlaps exactly the range it
-    /// names. The valid layout passes; each row reaches ITS OWN guard with every earlier check
-    /// satisfied: the five fit guards (short and misaligned, one row per range), the n guards
-    /// (every range resized for the case's n), and the apart pairs incl. the written-written
-    /// pairs h/norm_out and norm_out/q8; the eps guards run through `verdict`'s eps parameter.
+    /// Host only: the native check against the ranges of an unbacked allocation, with and
+    /// without `delta`. The VALID ranges sit 2 * ROW_N apart, so a case that moves or resizes
+    /// one overlaps exactly the range it names. The valid layout passes; each row reaches ITS
+    /// OWN guard with every earlier check satisfied: the five fit guards (short and misaligned,
+    /// one row per range), the n guards (every range resized for the case's n), and the apart
+    /// pairs incl. the written-written pairs h/norm_out and norm_out/q8; the eps guards run
+    /// through `verdict`'s eps parameter.
     #[test]
     fn check_add_rmsnorm_q8_refuses_short_unpadded_misaligned_and_overlapping_ranges() {
         let device = RawDevice::unbacked(1 << 21);

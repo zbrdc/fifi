@@ -1,5 +1,5 @@
-//! Native tests of the three NATIVE-OPS-1 operations: the consuming `kv_append`, the
-//! prefix-view `grouped_attention_prefix`, and `evaluate_async`.
+//! Native tests of three operations: the consuming `kv_append`, the prefix-view
+//! `grouped_attention_prefix`, and `evaluate_async`.
 
 #![cfg(all(feature = "native-mlx", target_os = "macos", target_arch = "aarch64"))]
 
@@ -77,7 +77,7 @@ fn kv_parts() -> (Tensor, Tensor) {
 }
 
 /// `kv_append` writes the update at `start` and leaves every other row unchanged, bit for bit
-/// as `slice_update` on the same inputs (packet NATIVE-OPS-1 test a).
+/// as `slice_update` on the same inputs.
 #[test]
 fn kv_append_matches_slice_update_bit_for_bit() {
     let _serial = GPU_TEST.lock().unwrap();
@@ -131,7 +131,7 @@ fn kv_append_matches_slice_update_bit_for_bit() {
 
 /// A validation failure of `kv_append` returns `BadRequest`, frees the consumed handle once
 /// through the retire list, and leaves the adapter usable: an unrelated resident still reads
-/// its old values afterwards, and a later `kv_append` on the same adapter works (fix1 task 2c).
+/// its old values afterwards, and a later `kv_append` on the same adapter works.
 #[test]
 fn kv_append_validation_failure_frees_once_and_keeps_the_adapter_usable() {
     let _serial = GPU_TEST.lock().unwrap();
@@ -201,9 +201,9 @@ fn kv_append_validation_failure_frees_once_and_keeps_the_adapter_usable() {
     }
 }
 
-/// A caller that keeps a `share()` of the target loses the in-place donation but stays correct
-/// (fix1 task 2c): the appended result holds the new row, and the kept share still reads the
-/// OLD rows, because the append copies the buffer instead of donating it under a held share.
+/// A caller that keeps a `share()` of the target loses the in-place donation but stays correct:
+/// the appended result holds the new row, and the kept share still reads the OLD rows, because
+/// the append copies the buffer instead of donating it under a held share.
 #[test]
 fn kv_append_with_a_kept_share_reads_the_old_rows_from_the_share() {
     let _serial = GPU_TEST.lock().unwrap();
@@ -286,15 +286,15 @@ fn one_kv_row(kernels: &mut MlxKernels) -> ExecutionTensor {
     )
 }
 
-/// `kv_append` donates the buffer (packet NATIVE-OPS-1 test b, fix1 task 3a): 200 appends of
-/// one row into one `[1, 2, 16384, 256]` F32 buffer (33,554,432 bytes, at least 32 MB) grow the
-/// allocator peak by less than a quarter of one buffer. A donating append writes the row in
-/// place, so the expected growth is about one row (2 KiB) plus scratch; any whole-buffer copy
-/// that is live at the peak adds at least one full buffer and fails the bound. The same loop
-/// with the retained `slice_update` runs under the same 8 GiB retire cap and must grow by at
-/// least two buffers: the retire list holds every intermediate of the eight-append window until
-/// the evaluate flushes it, which proves the metric sees a copy. After the loop the buffer is
-/// read back and the written rows and an untouched row are checked.
+/// `kv_append` donates the buffer: 200 appends of one row into one `[1, 2, 16384, 256]` F32
+/// buffer (33,554,432 bytes, at least 32 MB) grow the allocator peak by less than a quarter of
+/// one buffer. A donating append writes the row in place, so the expected growth is about one
+/// row (2 KiB) plus scratch; any whole-buffer copy that is live at the peak adds at least one
+/// full buffer and fails the bound. The same loop with the retained `slice_update` runs under
+/// the same 8 GiB retire cap and must grow by at least two buffers: the retire list holds every
+/// intermediate of the eight-append window until the evaluate flushes it, which proves the
+/// metric sees a copy. After the loop the buffer is read back and the written rows and an
+/// untouched row are checked.
 #[test]
 fn kv_append_donates_the_buffer_over_200_appends() {
     let _serial = GPU_TEST.lock().unwrap();
@@ -405,10 +405,10 @@ fn attention_parts(queries: u32, capacity: u32, width: u32) -> (Tensor, Tensor, 
 }
 
 /// `grouped_attention_prefix` over a capacity buffer equals `grouped_attention` over a contiguous
-/// copy of the prefix bit for bit, at short and full prefixes, GQA 16 over 2 heads (packet
-/// NATIVE-OPS-1 test c, fix1 task 3e: the causal `Tq = 1` decode shape and a capacity beyond
-/// 16). The causal sweep uses `len >= Tq`: a shorter causal prefix masks every key of the
-/// earlier queries, so those rows hold no defined value to compare.
+/// copy of the prefix bit for bit, at short and full prefixes, GQA 16 over 2 heads (with the
+/// causal `Tq = 1` decode shape and a capacity beyond 16). The causal sweep uses `len >= Tq`: a
+/// shorter causal prefix masks every key of the earlier queries, so those rows hold no defined
+/// value to compare.
 #[test]
 fn grouped_attention_prefix_matches_the_contiguous_prefix() {
     let _serial = GPU_TEST.lock().unwrap();
@@ -456,9 +456,8 @@ fn grouped_attention_prefix_matches_the_contiguous_prefix() {
 }
 
 /// `grouped_attention_prefix` over BF16 buffers equals `grouped_attention` over the contiguous
-/// BF16 prefix bit for bit after `allow_bf16` (fix1 task 3d). The contiguous reference slices
-/// the F32 buffers and casts each prefix, so both paths see bitwise-identical BF16 keys and
-/// values.
+/// BF16 prefix bit for bit after `allow_bf16`. The contiguous reference slices the F32 buffers
+/// and casts each prefix, so both paths see bitwise-identical BF16 keys and values.
 #[test]
 fn grouped_attention_prefix_matches_the_contiguous_prefix_in_bf16() {
     let _serial = GPU_TEST.lock().unwrap();
@@ -546,8 +545,8 @@ fn expected_attention(
 }
 
 /// The causal mask of the prefix aligns to the last key of the prefix, as `grouped_attention`
-/// aligns it (packet NATIVE-OPS-1: follow the mode string and test it). The buffers are the
-/// fixture of `native_fast::grouped_attention_aligns_the_causal_mask_to_the_last_key`, so the
+/// aligns it. The buffers are the fixture of
+/// `native_fast::grouped_attention_aligns_the_causal_mask_to_the_last_key`, so the
 /// full-capacity case reproduces that test's frozen values; a mask aligned to the first key
 /// would instead give query 0 only key 0, `(10, 0)`.
 #[test]
@@ -588,15 +587,16 @@ fn grouped_attention_prefix_aligns_the_causal_mask_to_the_last_key_of_the_prefix
     );
 }
 
-/// The prefix views are not copied (fix1 task 3b): at CAP 8,192 the attention over the first
+/// The prefix views are not copied: at CAP 8,192 the attention over the first
 /// `len = CAP / 2 = 4,096` rows reads views that are strided across the head axis, so making
 /// them contiguous would copy two prefixes of `2 * 4096 * 256` F32 values each:
 /// `2 * 8,388,608 = 16,777,216` bytes (about 16.8 MiB) of extra allocator bytes. The view path
 /// allocates only the `[1, 16, 1, 256]` F32 output (16,384 bytes) and the fused attention's
 /// workspace, so its peak growth stays under 4 MiB. A full-range slice is already row
-/// contiguous and cannot tell a view from a copy, which is why the length is half the capacity.
-/// The contiguous control copies both prefixes and must grow by at least the two copies, which
-/// proves the metric sees them. The wall times of both paths are printed for the report.
+/// contiguous and cannot tell a view from a copy, which is why the length is half the
+/// capacity. The contiguous control copies both prefixes and must grow by at least the two
+/// copies, which proves the metric sees them. The wall times of both paths are printed for the
+/// report.
 #[test]
 fn grouped_attention_prefix_does_not_copy_the_prefix_at_half_capacity() {
     let _serial = GPU_TEST.lock().unwrap();
@@ -683,18 +683,18 @@ fn grouped_attention_prefix_does_not_copy_the_prefix_at_half_capacity() {
     );
 }
 
-/// The pipelined decode case (fix1 task 4, sizes of the Q36 decode after review C): 100
-/// iterations of `kv_append` of a new row into the two chain buffers, `grouped_attention_prefix`
-/// over the new length, `evaluate_async` of the attention output, and the next iteration built
-/// from the still-lazy chains before any wait; every tenth iteration synchronizes and reads the
-/// attention output back. The chains are decode-sized (`[1, 2, 4096, 256]` F32, 8 MiB each, head
-/// dimension 256 as the fused kernel of the real model), so a copy of a chain per append is far
-/// above scratch and allocator rounding in the printed peak growth. Correctness is asserted at
-/// every synchronization point (the attention output at that length against an independent f64
-/// host reference), so a write-after-read race that corrupts an intermediate step fails; the peak
-/// growth and the wall time per iteration are printed for the coordinator, with no performance
-/// assertion: donation may fail while the previous token is still in flight, and if so the
-/// numbers show it (a donating loop grows the peak by far less than one chain, 8,388,608 bytes).
+/// The pipelined decode case at the sizes of the Q36 decode: 100 iterations of `kv_append` of a
+/// new row into the two chain buffers, `grouped_attention_prefix` over the new length,
+/// `evaluate_async` of the attention output, and the next iteration built from the still-lazy
+/// chains before any wait; every tenth iteration synchronizes and reads the attention output
+/// back. The chains are decode-sized (`[1, 2, 4096, 256]` F32, 8 MiB each, head dimension 256 as
+/// the fused kernel of the real model), so a copy of a chain per append is far above scratch and
+/// allocator rounding in the printed peak growth. Correctness is asserted at every
+/// synchronization point (the attention output at that length against an independent f64 host
+/// reference), so a write-after-read race that corrupts an intermediate step fails; the peak
+/// growth and the wall time per iteration are printed, with no performance assertion: donation
+/// may fail while the previous token is still in flight, and if so the numbers show it (a
+/// donating loop grows the peak by far less than one chain, 8,388,608 bytes).
 #[test]
 fn kv_append_in_a_pipelined_loop() {
     let _serial = GPU_TEST.lock().unwrap();
@@ -820,9 +820,9 @@ fn kv_append_in_a_pipelined_loop() {
     );
 }
 
-/// `evaluate_async` submits the graph, and MLX allocates the output at submission (fix1
-/// task 3c): right after the call returns, before any synchronization, the active bytes grew by
-/// about the 16 MiB output. A no-op submission allocates nothing and fails the bound.
+/// `evaluate_async` submits the graph, and MLX allocates the output at submission: right after
+/// the call returns, before any synchronization, the active bytes grew by about the 16 MiB
+/// output. A no-op submission allocates nothing and fails the bound.
 #[test]
 fn evaluate_async_allocates_the_output_at_submission() {
     let _serial = GPU_TEST.lock().unwrap();
@@ -859,10 +859,10 @@ fn evaluate_async_allocates_the_output_at_submission() {
     );
 }
 
-/// `evaluate_async` never flushes the retire list (fix1 task 3c): a retired 16 MiB resident
-/// stays allocated across the submission and frees only at the next completed synchronization,
-/// the blocking `evaluate` below. A submission that flushed the list itself would free the
-/// retired bytes at once and fail the first bound.
+/// `evaluate_async` never flushes the retire list: a retired 16 MiB resident stays allocated
+/// across the submission and frees only at the next completed synchronization, the blocking
+/// `evaluate` below. A submission that flushed the list itself would free the retired bytes at
+/// once and fail the first bound.
 #[test]
 fn evaluate_async_never_flushes_the_retire_list() {
     let _serial = GPU_TEST.lock().unwrap();
@@ -901,7 +901,7 @@ fn evaluate_async_never_flushes_the_retire_list() {
 }
 
 /// `evaluate_async` submits without waiting and a later `readback` blocks until the values are
-/// complete (packet NATIVE-OPS-1 test d).
+/// complete.
 #[test]
 fn evaluate_async_then_readback_returns_the_right_values() {
     let _serial = GPU_TEST.lock().unwrap();
@@ -927,8 +927,8 @@ fn evaluate_async_then_readback_returns_the_right_values() {
 
 /// An async evaluation followed by dropping its outputs and a blocking evaluate of another graph
 /// neither crashes nor leaks: after a forced flush the allocator returns to the start within
-/// 1 MB (packet NATIVE-OPS-1 test d, fix1 task 3c: three 16 MiB tensors, so any array the
-/// submission or the drop leaks exceeds the bound).
+/// 1 MB (three 16 MiB tensors, so any array the submission or the drop leaks exceeds the
+/// bound).
 #[test]
 fn evaluate_async_drop_then_blocking_evaluate_neither_crashes_nor_leaks() {
     let _serial = GPU_TEST.lock().unwrap();
@@ -1011,9 +1011,9 @@ fn bf16_of(kernels: &mut MlxKernels, tensor: &Tensor) -> ExecutionTensor {
     kernels.cast(&source, Dtype::Bf16).unwrap()
 }
 
-/// `kv_append` keeps BF16 buffers (fix1 task 3d): the byte length halves with the dtype, the
-/// dtype-equality branch accepts a BF16 target and update and the values survive, and a mixed
-/// F32/BF16 pair is `BadRequest` before any native call.
+/// `kv_append` keeps BF16 buffers: the byte length halves with the dtype, the dtype-equality
+/// branch accepts a BF16 target and update and the values survive, and a mixed F32/BF16 pair
+/// is `BadRequest` before any native call.
 #[test]
 fn kv_append_keeps_bf16_buffers_and_rejects_mixed_dtypes() {
     let _serial = GPU_TEST.lock().unwrap();

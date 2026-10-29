@@ -2,17 +2,16 @@
 //! entry against the vendored kernel, compared with a float64 host reference.
 //!
 //! The reference is `silu_f64(gate) * up` in f64 from the exact f32 inputs, and the bound is the
-//! lane M class E2 (REPLY-44, REPLY-73): the fp16 result equals the round to nearest even of the
-//! reference, or the adjacent value with the reference within 2^-20 (relative) of the rounding
-//! midpoint (`testkit::e2_holds`). It is a measured domain, not an analytic bound: any finite `up`
-//! for `|gate| <= 12`, and `up` of sd up to 100 for `12 < |gate| <= 219`. The 15 E2 misses at `up`
-//! sd 10^4 in `|gate|` [-30, -12] (expf probe, rev 3 evidence) are recorded as the measured edge
-//! of the domain, not tuned away. The kernel assumption is any finite up for |gate| <= 12, and up
-//! sd <= 100 for 12 < |gate| <= 219 (lane M, 2026-10-10).
+//! class E2: the fp16 result equals the round to nearest even of the reference, or the adjacent
+//! value with the reference within 2^-20 (relative) of the rounding midpoint
+//! (`testkit::e2_holds`). It is a measured domain, not an analytic bound: any finite `up` for
+//! `|gate| <= 12`, and `up` of sd up to 100 for `12 < |gate| <= 219`. The 15 E2 misses at `up`
+//! sd 10^4 in `|gate|` [-30, -12] (expf probe) are recorded as the measured edge of the domain,
+//! not tuned away. The kernel assumption is any finite up for |gate| <= 12, and up sd <= 100 for
+//! 12 < |gate| <= 219.
 //!
-//! The device suite runs with `--test-threads=1` (decision 0040). A NaN is tested with
-//! `f32::is_nan`, never bitwise; everything else with `to_bits`; whole byte buffers through
-//! `testkit::fnv1a64`.
+//! The device suite runs with `--test-threads=1`. A NaN is tested with `f32::is_nan`, never
+//! bitwise; everything else with `to_bits`; whole byte buffers through `testkit::fnv1a64`.
 //!
 //! Every printed maximum is labelled with the build profile: the cargo debug profile gives nvcc
 //! `-G -O0`, so the release run is the one that speaks for the shipped kernel.
@@ -115,8 +114,8 @@ fn to_bytes(values: &[f32]) -> Vec<u8> {
 }
 
 /// The 16 bytes of the shared zero tail entry `xf[kXfEntries]` (65,536 data entries, then the
-/// tail): every padding lane of `mma884::load_x` reads it. MEMSET-TRIM: the pack kernel writes
-/// it itself, so no whole-buffer memset runs.
+/// tail): every padding lane of `mma884::load_x` reads it. The pack kernel writes it itself, so
+/// no whole-buffer memset runs.
 fn tail(xf: &[u8]) -> [u8; 16] {
     let mut out = [0u8; 16];
     out.copy_from_slice(&xf[65_536 * 16..65_536 * 16 + 16]);
@@ -282,7 +281,7 @@ fn swiglu_pack_bounds_are_pinned() {
     pin_testkit_helpers();
 }
 
-/// The shared helpers this packet relies on, pinned at their edges.
+/// The shared helpers these tests rely on, pinned at their edges.
 fn pin_testkit_helpers() {
     let tie_up = 1.0 + 2f64.powi(-11) + 2f64.powi(-40);
     assert_eq!(f64_to_f16_bits(tie_up), 0x3c01);
@@ -385,9 +384,9 @@ fn consumer_y(dev: &Dev, weight: &TiledWeight, xf: &[u8], m: usize) -> Vec<u8> {
     read_bytes(&dev.ctx, &y_buffer, y_len)
 }
 
-/// One shape of the padded-width contract (MEL-C1b): tails of `gu` zeroed, tail of `xf` exactly
-/// `0x0000`, bytes equal to the pack of `[h | 0]`, the same result onto two garbage patterns and
-/// the same consumer output.
+/// One shape of the padded-width contract: tails of `gu` zeroed, tail of `xf` exactly `0x0000`,
+/// bytes equal to the pack of `[h | 0]`, the same result onto two garbage patterns and the same
+/// consumer output.
 fn check_padded(dev: &Dev, shape: Shape, stats: &mut Stats) {
     let mut rng = Rng::new(0x7ad0_0000 + (shape.n_ff * 7 + shape.m) as u64);
     let gu = make_gu(&mut rng, shape, Scale { gate: 1.5, up: 1.0 });
@@ -402,15 +401,15 @@ fn check_padded(dev: &Dev, shape: Shape, stats: &mut Stats) {
     }
     let first = run_case(dev, shape, &gu, 0xFF);
     let second = run_case(dev, shape, &gu, 0x5A);
-    // MEMSET-TRIM: only the data lanes and the tail are written, so the two fills are compared on
-    // what a reader consumes (the unpacked rows and the tail), not on the unread fill bytes.
+    // Only the data lanes and the tail are written, so the two fills are compared on what a
+    // reader consumes (the unpacked rows and the tail), not on the unread fill bytes.
     assert_eq!(
         unpack_xf(&first.xf, shape.m, shape.k_pad),
         unpack_xf(&second.xf, shape.m, shape.k_pad),
         "{shape:?}: the 0xFF and 0x5A data lanes"
     );
-    // MEMSET-TRIM: the tail entry exists only in the fragment-order buffer (m <= 16); above that
-    // the buffer is row-major and fully written.
+    // The tail entry exists only in the fragment-order buffer (m <= 16); above that the buffer
+    // is row-major and fully written.
     if shape.m <= 16 {
         assert_eq!(
             tail(&first.xf),
@@ -437,8 +436,8 @@ fn check_padded(dev: &Dev, shape: Shape, stats: &mut Stats) {
         }
     }
     check_live(shape, &gu, &first.xf, stats);
-    // MEMSET-TRIM: `pack` still zeroes its whole output buffer, so the comparison with the pack
-    // of `[h | 0]` covers the unpacked rows and the tail, the bytes a reader consumes.
+    // `pack` still zeroes its whole output buffer, so the comparison with the pack of `[h | 0]`
+    // covers the unpacked rows and the tail, the bytes a reader consumes.
     let reference = pack_reference(dev, &x, shape);
     assert_eq!(
         unpack_xf(&first.xf, shape.m, shape.k_pad),
@@ -491,8 +490,8 @@ fn swiglu_pack_pads_with_exact_zeros_for_mellum_shapes() {
 }
 
 /// Packs `gu` of `shape` into the given `xf` buffer and returns its bytes: the buffer keeps its
-/// old bytes wherever the kernel writes none (MEMSET-TRIM: the lanes of an earlier call stay
-/// stale, exactly as in an aliased arena slot).
+/// old bytes wherever the kernel writes none (the lanes of an earlier call stay stale, exactly as
+/// in an aliased arena slot).
 fn pack_into(dev: &Dev, shape: Shape, gu: &[f32], xf: &DeviceBuffer) -> Vec<u8> {
     let gu_buffer = upload_f32(&dev.ctx, gu);
     let xf_len = xf_bytes(shape.m, shape.k_pad).expect("xf size");
@@ -512,12 +511,12 @@ fn pack_into(dev: &Dev, shape: Shape, gu: &[f32], xf: &DeviceBuffer) -> Vec<u8> 
     read_bytes(&dev.ctx, xf, xf_len)
 }
 
-/// MEMSET-TRIM test 1: with the whole `xf` buffer pre-filled with garbage (0xFF, the tail
-/// included) the pack itself must leave (a) the shared zero tail entry zero, (b) the live columns
-/// at the float64 reference, and (c) a following `matmul` bitwise equal to the same matmul over a
-/// buffer prepared the old way (zeroed, then packed). `m = 16` at `k_pad = 32768` covers the top
-/// data entry `kXfEntries - 1` (token 15's last tile), which an off-by-one tail write would
-/// clobber; the padded shape covers the 2-D tail memsets path.
+/// With the whole `xf` buffer pre-filled with garbage (0xFF, the tail included) the pack itself
+/// must leave (a) the shared zero tail entry zero, (b) the live columns at the float64 reference,
+/// and (c) a following `matmul` bitwise equal to the same matmul over a buffer prepared the old
+/// way (zeroed, then packed). `m = 16` at `k_pad = 32768` covers the top data entry
+/// `kXfEntries - 1` (token 15's last tile), which an off-by-one tail write would clobber; the
+/// padded shape covers the 2-D tail memsets path.
 #[test]
 fn swiglu_pack_writes_the_zero_tail_over_garbage() {
     if !testkit::device_present("swiglu_pack_writes_the_zero_tail_over_garbage") {
@@ -567,7 +566,7 @@ fn swiglu_pack_writes_the_zero_tail_over_garbage() {
                 "{shape:?}: the matmul over garbage differs by {worst:e} (scale {scale:e})"
             );
             println!(
-                "[{PROFILE}] MEMSET-TRIM swiglu_pack {shape:?}: split-K matmul, max |d| {worst:e} of scale {scale:e}"
+                "[{PROFILE}] swiglu_pack over garbage {shape:?}: split-K matmul, max |d| {worst:e} of scale {scale:e}"
             );
         } else {
             assert_eq!(
@@ -579,9 +578,9 @@ fn swiglu_pack_writes_the_zero_tail_over_garbage() {
     assert_eq!(report("memset-trim garbage", &stats), 0, "E2 misses");
 }
 
-/// MEMSET-TRIM test 2: a pack of `m = 3` straight into a pack of `m = 1` on the same buffer, with
-/// no re-zeroing between the calls; the `m = 1` live columns, the tail and the matmul must not
-/// depend on the stale lanes of tokens 1 and 2.
+/// A pack of `m = 3` straight into a pack of `m = 1` on the same buffer, with no re-zeroing
+/// between the calls; the `m = 1` live columns, the tail and the matmul must not depend on the
+/// stale lanes of tokens 1 and 2.
 #[test]
 fn swiglu_pack_ignores_stale_padding_between_launches() {
     if !testkit::device_present("swiglu_pack_ignores_stale_padding_between_launches") {
@@ -892,7 +891,7 @@ fn swiglu_pack_rejects_bad_arguments_before_any_launch() {
 }
 
 /// A buffer of another context, as `gu` and as `xf`, is refused by the ownership check that
-/// converts the ranges. (A stream of another context is checked by `launch_on`, which lane C's
+/// converts the ranges. (A stream of another context is checked by `launch_on`, which the context
 /// tests cover: context/launch/tests.rs:690-717, :429 and :1236, and context/stream/tests.rs:166.
 /// The buffer case is also covered at context/launch/tests.rs:434. A zero-byte range is not
 /// representable from safe code, covered by context/stream/tests.rs:226; neither is a freed
@@ -936,7 +935,7 @@ struct Chain {
 }
 
 /// pack -> gate matmul and up matmul into the two halves of one `gu` -> `swiglu_pack` -> down
-/// matmul, all on one stream: the RD-9c shape at seam 1.
+/// matmul, all on one stream: the expert shape of the decode step's MoE block at seam 1.
 fn run_chain(dev: &Dev, weights: (&TiledWeight, &TiledWeight), x: &[f32]) -> Chain {
     let (ctx, stream) = (&dev.ctx, &dev.stream);
     let x_buffer = upload_f32(ctx, x);
@@ -1020,7 +1019,7 @@ fn swiglu_pack_expert_chain_equals_the_host_reference() {
         0,
         "E2 misses on the chain inputs"
     );
-    // Printed, not asserted: no lane M rule exists for the chain error.
+    // Printed, not asserted: no bound is defined for the chain error.
     let gate = blocking(&dev.ctx, &gate_up, (0, CHAIN_FF), &x);
     let up = blocking(&dev.ctx, &gate_up, (CHAIN_FF, CHAIN_FF), &x);
     // Both paths run the same matmul kernel, so each half of gu equals its projection bit for bit;
@@ -1056,8 +1055,8 @@ fn swiglu_pack_inside_a_capture_equals_eager() {
         return;
     }
     let dev = Dev::new();
-    // The nodes of a call: the kernel (the whole-xf memset is gone, MEMSET-TRIM), plus two more
-    // 2-D memsets for the padded width.
+    // The nodes of a call: the kernel (no whole-xf memset runs), plus two more 2-D memsets for
+    // the padded width.
     let padded = Shape {
         m: 1,
         n_ff: 896,

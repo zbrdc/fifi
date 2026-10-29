@@ -42,9 +42,9 @@ pub(crate) struct RunningJob {
     /// the `Finished` event, which the pump reads after a job that ended by itself. A reply that a
     /// stop string ended reports 0, because the pump does not wait for the cancelled job.
     reused: u32,
-    /// The prefix-store report of the job (packet SERVE-2-c item 3, fix M3), read from the same
-    /// `Finished` event as `reused`, with the same fallback: it stays `None` unless the pump read
-    /// the event, so a cancelled, failed, refused, or stop-string reply logs no prefix keys.
+    /// The prefix-store report of the job, read from the same `Finished` event as `reused`, with
+    /// the same fallback: it stays `None` unless the pump read the event, so a cancelled, failed,
+    /// refused, or stop-string reply logs no prefix keys.
     prefix: Option<PrefixReport>,
     calls: u32,
     /// The log of the request. A writer that ends the request without a step writes through it.
@@ -416,7 +416,7 @@ mod tests {
         );
     }
 
-    /// The pump hands the prefix report of the `Finished` event to the request log (fix L3):
+    /// The pump hands the prefix report of the `Finished` event to the request log:
     /// the value flows worker → `JobUsage` → this pump → the log line. The fake charges a flat
     /// 1,000 bytes per stored entry, and this boundary job stores one tip of two tokens, so
     /// the line of the finished request carries the four prefix keys with `prefix_bytes` 1000.

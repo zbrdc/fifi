@@ -1,7 +1,6 @@
-//! PG1b row invariance of the grouped launch (plan rev 3 section B.5 item 3, scope corrected by
-//! MSG-85 M3). The claim is bit equality per FIXED tile configuration, where the configuration
-//! includes the stream-k decomposition: a token's output rows must not depend on which compact
-//! column it lands in. Two cases follow from the plan:
+//! Row invariance of the grouped launch. The claim is bit equality per FIXED tile configuration,
+//! where the configuration includes the stream-k decomposition: a token's output rows must not
+//! depend on which compact column it lands in. Two cases follow:
 //!
 //! - **Tiling mode** (the 256-expert resident launch, tile efficiency at least 90 %, no fixup):
 //!   tokens permuted across expert boundaries and across J-column tiles keep their rows
@@ -12,8 +11,8 @@
 //!   differ in the last bit: reported, never asserted.
 //!
 //! Each test first asserts that its shape really is in the mode it claims (the launcher's tiling
-//! decision, mmq.cuh:1390-1434, replicated from the J replica of G1), so it cannot pass in the
-//! wrong mode, and that two runs of the same inputs are bit-equal (determinism).
+//! decision, mmq.cuh:1390-1434, replicated from the J replica of `mmq_size`), so it cannot pass in
+//! the wrong mode, and that two runs of the same inputs are bit-equal (determinism).
 
 use super::device_facts;
 use super::rig::{

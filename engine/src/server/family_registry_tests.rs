@@ -1,5 +1,4 @@
-//! Family registry tests (RED first: `family_starter` and `StartedEngine`
-//! do not exist yet). The registry is a lookup — no starter runs here.
+//! Family registry tests. The registry is a lookup — no starter runs here.
 
 use super::config::EngineConfig;
 use super::run::{StartedEngine, family_starter};
@@ -39,11 +38,11 @@ fn starter_signature_takes_config_prefix_reuse_and_ready_note() {
     let _ = f; // not called: signature pin only
 }
 
-/// Opus SF (registry round): no test pinned the nemotron35 ROW to the
-/// nemotron factory — a wrong row would pass every other test. This
-/// drives the starter with a gate-valid config whose `nemotron` options
-/// are absent and asserts the factory's OWN refusal (factory.rs:89), so
-/// the row provably reaches the nemotron start path and nothing else.
+/// No other test pins the nemotron35 ROW to the nemotron factory — a
+/// wrong row would pass every other test. This drives the starter with a
+/// gate-valid config whose `nemotron` options are absent and asserts the
+/// factory's OWN refusal (factory.rs:89), so the row provably reaches
+/// the nemotron start path and nothing else.
 #[test]
 fn nemotron35_row_pins_to_the_nemotron_factory_refusal() {
     let dir = tempfile::tempdir().expect("tempdir");

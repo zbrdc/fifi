@@ -1,9 +1,8 @@
 //! The MoE combine of the resident decode step: the residual plus the picks summed in pick order
-//! plus the optional gated shared term, in one launch (decision 0047, stage 1, RD-4e).
+//! plus the optional gated shared term, in one launch.
 //!
-//! The combine is a small separate kernel in stage 1 (fusion into the expert kernel is RD-6b),
-//! and it sums the picks in a fixed order in registers so that the result does not depend on
-//! scheduling.
+//! The combine is a small separate kernel, not fused into the expert kernel, and it sums the
+//! picks in a fixed order in registers so that the result does not depend on scheduling.
 //!
 //! [`CudaContext::moe_combine`] queues one kernel on a [`DeviceStream`] and returns. It allocates
 //! nothing, copies nothing and never synchronizes; a fault in the queued work surfaces at the next
@@ -18,9 +17,9 @@
 //! `out[t][j] = res[t][j] + s`. This is the association of the pinned llama.cpp graph,
 //! `res + (S + g * shared)` with `S` the pick-order sum.
 //!
-//! The weights and the gate are applied as RD-5 wrote them: the router has already applied the
-//! softmax, the renormalization and the sigmoid of the shared gate (and, for a family that has
-//! one, the expert-weights scale). The combine applies no second sigmoid, no softmax and no
+//! The weights and the gate are applied as the router wrote them: it has already applied the
+//! softmax, the renormalization and the sigmoid of the shared gate (and, for a family that has one,
+//! the expert-weights scale). The combine applies no second sigmoid, no softmax and no
 //! renormalization, tests no weight for zero and clamps nothing.
 //!
 //! NaN is preserved by IEEE propagation. A faulty router row has ids -1, weights 0 and gate 0;
@@ -66,7 +65,7 @@ pub(crate) struct CombineShape {
 
 /// The gated shared-expert term: a gate and a row, given together or not at all.
 pub(crate) struct SharedTerm<'b> {
-    /// f32 `[m]`, 4-byte aligned: RD-5's `shared_gate`, already a sigmoid, used as given.
+    /// f32 `[m]`, 4-byte aligned: the router's `shared_gate`, already a sigmoid, used as given.
     pub(crate) gate: DeviceRange<'b>,
     /// f32 `[m][n]`, 16-byte aligned: the shared expert's down output.
     pub(crate) row: DeviceRange<'b>,
@@ -89,7 +88,7 @@ pub(crate) struct CombineCall<'b> {
     /// f32 rows `t * top_k + i` of `n` values at a stride of `ld_down` floats, 16-byte aligned:
     /// the `y` rows of `top_k` `matmul_expert` calls in pick (rank) order.
     pub(crate) down: DeviceRange<'b>,
-    /// f32 `[m][top_k]`, 4-byte aligned, rank order: RD-5's `weights`, used as given.
+    /// f32 `[m][top_k]`, 4-byte aligned, rank order: the router's `weights`, used as given.
     pub(crate) weights: DeviceRange<'b>,
     /// The gated shared term, or `None` for a model without a shared expert.
     pub(crate) shared: Option<SharedTerm<'b>>,

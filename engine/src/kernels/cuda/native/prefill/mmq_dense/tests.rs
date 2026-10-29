@@ -1,10 +1,9 @@
-//! Host tests of the C side of the dense MMQ entry (CPF-V4 G2, seam 1): the field-by-field pin
-//! of the vendored `mmq_args` fill (`fill_dense_args`, plan section B.4; mutants V9 and V17)
-//! and the refusal table of the entry's validation. Both go through
-//! `inference_cuda_mmq_dense_fill`, which validates exactly like the launching entry and then
-//! writes the fill, with no CUDA call: it compares addresses and never dereferences them, so
-//! the fake pointers below are safe, and a case that is refused differs from the valid base
-//! call in exactly one field, so it reaches its own guard.
+//! Host tests of the C side of the dense MMQ entry: the field-by-field pin of the vendored
+//! `mmq_args` fill (`fill_dense_args`) and the refusal table of the entry's validation. Both go
+//! through `inference_cuda_mmq_dense_fill`, which validates exactly like the launching entry
+//! and then writes the fill, with no CUDA call: it compares addresses and never dereferences
+//! them, so the fake pointers below are safe, and a case that is refused differs from the valid
+//! base call in exactly one field, so it reaches its own guard.
 
 use std::ffi::{c_int, c_void};
 use std::mem::{offset_of, size_of};
@@ -263,7 +262,7 @@ fn the_dense_entry_refuses_each_bad_argument_at_its_own_guard() {
         ),
         ("tile grid at 2^30", tiles(1 << 20)),
         ("dst reach one past INT_MAX", far(1 << 20, 1 << 20)),
-        ("dst reach, the verdict's example", far(128, 1_118_482)),
+        ("dst reach past INT_MAX, n 128", far(128, 1_118_482)),
         (
             "w misaligned",
             MmqDenseArgsRaw {
@@ -367,7 +366,7 @@ fn c_fixup_need(ty: c_int, n: usize, m: usize, facts: &FactsRaw) -> usize {
     unsafe { inference_cuda_mmq_dense_fixup_need(&args, facts) }
 }
 
-/// G1's side of the cross-pin: the tile width from the Rust replica `j_best`, then the
+/// The Rust side of the cross-pin: the tile width from the Rust replica `j_best`, then the
 /// vendored launch's tile count, tiling-mode test and block count (mmq.cuh:1395-1408), then
 /// `fixup_floats_exact`. Every kept config row has I = 128 and stream-k on.
 fn rust_fixup_need(ty: MmqType, n: usize, m: usize, facts: &FactsRaw) -> usize {
@@ -411,12 +410,12 @@ fn compiled_archs() -> Vec<i32> {
 
 #[test]
 fn the_c_fixup_need_agrees_with_the_rust_sizing_everywhere() {
-    // Lane C's cross-pin of the two J-loop replicas (MSG-85 B2 ruling; verdict m-1): the C
-    // function that sizes the fixup refusal and G1's Rust replica must give the same bytes,
-    // including the "0 when the launch tiles" and "no tile width fits" cases, for every
-    // M in 1..=2048, the Qwen dense row counts (fallback off) and the partial-tile ones
-    // (fallback on), all three weight types, and device facts of the sm_86, sm_89 and sm_72
-    // classes plus a one-SM device and a device whose shared memory fits no tile width.
+    // The cross-pin of the two J-loop replicas: the C function that sizes the fixup refusal
+    // and the Rust replica must give the same bytes, including the "0 when the launch tiles"
+    // and "no tile width fits" cases, for every M in 1..=2048, the Qwen dense row counts
+    // (fallback off) and the partial-tile ones (fallback on), all three weight types, and
+    // device facts of the sm_86, sm_89 and sm_72 classes plus a one-SM device and a device
+    // whose shared memory fits no tile width.
     let sets: [(&str, i32, i32, usize); 6] = [
         ("sm_86, 82 SMs", 860, 82, 101_376),
         ("sm_89, 20 SMs", 860, 20, 101_376),
@@ -472,8 +471,8 @@ fn the_c_fixup_need_agrees_with_the_rust_sizing_everywhere() {
 
 #[test]
 fn the_c_fixup_need_is_zero_for_arguments_the_entry_refuses() {
-    // A pure function must not divide by an SM count of zero (verdict n-1) or read a type
-    // it has no row for.
+    // A pure function must not divide by an SM count of zero or read a type it has no row
+    // for.
     let good = FactsRaw {
         device: 0,
         cc: 860,

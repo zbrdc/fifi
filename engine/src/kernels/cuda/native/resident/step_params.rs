@@ -1,9 +1,9 @@
 //! Raw entries of `native/resident/step_params.cu`: `step_begin`, `step_advance` and the greedy
-//! `argmax` (RD-4d, decision 0047).
+//! `argmax`.
 //!
 //! Safety invariants this file relies on:
 //! - Each entry is called only through `CudaContext::launch_on`, on the owning thread and under the
-//!   dispatch guard (decisions 0023 and 0024). The entries only enqueue and return.
+//!   dispatch guard. The entries only enqueue and return.
 //! - Every range is a `RawRange`, proved inside a live allocation by `RawRange::new`. Sizes,
 //!   alignment and disjointness (`super::Span`) are proved again here, before the call, on the
 //!   extents the kernels touch; the C entries repeat the alignment checks on the addresses.
@@ -31,7 +31,7 @@ pub(in crate::kernels::cuda) const MAX_LOGITS: usize = 1 << 30;
 
 /// Alignment of every `StepParams`, logits and scratch pointer.
 const WORD_ALIGN: usize = 4;
-/// Alignment of the result pair (condition R-C2a of the packet).
+/// Alignment of the result pair.
 const PAIR_ALIGN: usize = 8;
 
 /// Mirror of `inference_cuda_step_advance_args`.

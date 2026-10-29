@@ -30,7 +30,7 @@
 //! one row at a time when the plan admits no chunk), each piece split into chunk parts by
 //! `kv_plan::depth_ranges` under the production `prefill_score_bound` — unbounded under flash
 //! prefill with Q8 KV, so the planned chunk holds at every depth exactly as the serving path
-//! splits it; the F32-KV leg still halves deep chunks past 16,384, and the per-depth
+//! splits it; the F32 KV cache still halves deep chunks past 16,384, and the per-depth
 //! `chunk_schedule_valid` flag makes any halving visible instead of silent. Every part
 //! runs the timed chunk step below in `Prompt` mode, the mode of the serving prefill. The
 //! harness does not reproduce the one-token pending shift of `DecodeSession` (the first serving
@@ -578,7 +578,7 @@ fn prefill_stage_breakdown() {
     let cost = ChunkCost::new(heads_q, CONTEXT_LIMIT).unwrap();
     // The production score bound, not the plain 512 MiB budget: under flash prefill
     // with Q8 KV it is unbounded, so the requested chunk holds at every depth exactly as the
-    // serving path splits it; the F32-KV leg still halves deep chunks, and the per-depth
+    // serving path splits it; the F32 KV cache still halves deep chunks, and the per-depth
     // `chunk_schedule_valid` flag makes any halving visible instead of silent.
     let score_bound = prefill_score_bound(
         decoder.weights.shape.attn.heads_q as u32,

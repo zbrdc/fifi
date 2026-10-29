@@ -1,5 +1,5 @@
 //! A generic device arena that hands out only checked views, and the hold that
-//! keeps an arena from being replaced (CUDA-RD section 2, decision 0047).
+//! keeps an arena from being replaced.
 //!
 //! A [`DeviceArena`] is ONE device allocation, planned once from a list of
 //! [`ArenaTensor`]s by [`plan_arena`]. Invariants:
@@ -15,14 +15,14 @@
 //!   which sits behind a `RefCell`. While a hold lives, `reserve_workspace`
 //!   refuses to replace the allocation (see `workspace`). The counter is `Rc`
 //!   based, so holds are `!Send` like the context.
-//! - Dropping the arena drops its `DeviceBuffer`, which follows decision 0022
-//!   (after a terminal failure nothing is freed). The arena has no `Drop` of its
+//! - Dropping the arena drops its `DeviceBuffer`, which follows the terminal-release
+//!   rule (after a terminal failure nothing is freed). The arena has no `Drop` of its
 //!   own and does not look at the hold count: the holder keeps the arena alive by
 //!   borrowing it, so the step cannot drop an arena that a graph still uses. The
 //!   counter protects the one path that replaces an allocation behind a borrow.
 #![cfg_attr(
     not(test),
-    expect(dead_code, reason = "staged for RD-9a (decision 0047)")
+    expect(dead_code, reason = "staged for the resident decode step")
 )]
 
 use std::{cell::Cell, rc::Rc};

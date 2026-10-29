@@ -8,9 +8,7 @@
 //! body and tokenizes the rendered prompt through the chat pipeline's
 //! tokenizer bundle; no engine job runs for it.
 //!
-//! Slice 1 covers the non-streaming reply and slice 2 the SSE event
-//! stream. The capture fixtures and the Claude Code smoke test follow in
-//! slice 3.
+//! The module covers the non-streaming reply and the SSE event stream.
 
 use super::chat::{self, MAX_BODY_BYTES};
 use super::error::{BACKEND_MESSAGE, ServerError};
@@ -1382,10 +1380,10 @@ mod tests {
         );
     }
 
-    /// MF pin: message_start's usage carries the whole prompt with zero
-    /// cache fields on both shapes; the split arrives only in
-    /// message_delta (input + cache_read + creation sums to the same
-    /// whole prompt at both sites).
+    /// message_start's usage carries the whole prompt with zero cache
+    /// fields on both shapes; the split arrives only in message_delta
+    /// (input + cache_read + creation sums to the same whole prompt at
+    /// both sites).
     #[test]
     fn the_message_start_usage_carries_the_whole_prompt_on_both_shapes() {
         assert_eq!(
@@ -1414,7 +1412,7 @@ mod tests {
         assert_eq!(sum, 5, "{value}");
     }
 
-    /// MF integration (child, switch ON): a warm streamed conversation
+    /// Integration (child, switch ON): a warm streamed conversation
     /// reports the whole prompt in message_start's usage (cache fields
     /// zero) and the split in message_delta's; the three fields sum to
     /// the same whole prompt (2,139) at both sites, so a client that
@@ -1482,13 +1480,13 @@ mod tests {
         println!("child-warm-stream-ok");
     }
 
-    /// SF4: the switch's byte effect on the ANTHROPIC surface through
-    /// the real environment, in fresh children — the non-stream message
-    /// body, message_start, and message_delta. Hardwiring `true` at any
-    /// of the three production `cache_fields_on()` call sites fails the
-    /// off child; hardwiring `false` fails the on child. Each child
-    /// prints a sentinel; each parent requires the runner's `1 passed`
-    /// line, so a child that ran zero tests cannot pass.
+    /// The switch's byte effect on the ANTHROPIC surface through the real
+    /// environment, in fresh children — the non-stream message body,
+    /// message_start, and message_delta. Hardwiring `true` at any of the
+    /// three production `cache_fields_on()` call sites fails the off
+    /// child; hardwiring `false` fails the on child. Each child prints a
+    /// sentinel; each parent requires the runner's `1 passed` line, so a
+    /// child that ran zero tests cannot pass.
     #[tokio::test]
     async fn the_switch_shapes_the_anthropic_usage_bytes_through_the_environment() {
         const CHILD: &str = "ENGINESRV_TEST_ANTHROPIC_SHAPES_CHILD";
@@ -2299,13 +2297,13 @@ mod tests {
 
     #[tokio::test]
     async fn pool_exhaustion_is_the_anthropic_over_length_error() {
-        // RED provenance, daily.log 2026-10-24 requests 0018/0019 (stream then
-        // non-stream, 118,930 prompt tokens): the pool denied session growth
-        // with "session growth requires 11141120 bytes, available 7696432" and
-        // the opaque 400 killed the Claude Code session instead of letting it
-        // compact. The engine now reports the denial typed, and this route must
-        // answer with the exact Anthropic over-length form Claude Code matches
-        // to auto-compact: prompt is too long: N tokens > M maximum.
+        // A 118,930-token prompt, streamed and not streamed, once met a pool
+        // denial of session growth ("session growth requires 11141120 bytes,
+        // available 7696432"), and the opaque 400 killed the Claude Code session
+        // instead of letting it compact. The engine reports the denial typed,
+        // and this route must answer with the exact Anthropic over-length form
+        // Claude Code matches to auto-compact: prompt is too long: N tokens > M
+        // maximum.
         let engine = testkit::refusing_engine(EngError::PromptTooLong {
             prompt_tokens: 118_930,
             limit_tokens: 110_000,
@@ -2321,11 +2319,10 @@ mod tests {
 
     #[tokio::test]
     async fn a_fresh_session_denied_admission_is_the_over_length_error() {
-        // RED provenance, daily.log 2026-10-24 requests 001a/001b: a fresh
-        // 17,479-token session could not admit because a dead session's cached
-        // prefixes pinned the pool. After eviction, a denial that still cannot
-        // be served reports the same over-length form. The effective ceiling
-        // sat below even this fresh prompt.
+        // A fresh 17,479-token session could not admit because a dead session's
+        // cached prefixes pinned the pool. After eviction, a denial that still
+        // cannot be served reports the same over-length form. The effective
+        // ceiling sat below even this fresh prompt.
         let engine = testkit::refusing_engine(EngError::PromptTooLong {
             prompt_tokens: 17_479,
             limit_tokens: 16_384,
@@ -2945,10 +2942,9 @@ mod tests {
 
     #[tokio::test]
     async fn pool_exhaustion_on_a_stream_is_the_over_length_error_event() {
-        // RED provenance, daily.log 2026-10-24 request 0018: the stream had
-        // already sent its 200 headers when the pool denial arrived, so the
-        // over-length report must reach Claude Code as the error event — the
-        // exact form it matches to auto-compact mid-session.
+        // The stream has already sent its 200 headers when the pool denial
+        // arrives, so the over-length report must reach Claude Code as the error
+        // event — the exact form it matches to auto-compact mid-session.
         let engine = testkit::refusing_engine(EngError::PromptTooLong {
             prompt_tokens: 118_930,
             limit_tokens: 110_000,

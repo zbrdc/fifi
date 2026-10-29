@@ -1,34 +1,34 @@
-/* CPF-V4 G4: the q8_1 quantize entries of the vendored-MMQ glue (decision 0049 items 3 and
- * 11; plan section B.4). Every MMQ GEMM input is requantized from f32 into `block_q8_1_mmq`
- * (mmq.cuh:28-47: 128 values, 144 B, k-block-major columns, `ib = k_block*ne1 + column`,
- * quantize.cu:530-533), with the D4/DS4 scale layout selected by the WEIGHT type the GEMM
- * reads (mmq.cuh:61-101: Q8_0/Q6_K/Q5_0 take D4, Q4_K takes DS4). One header per kernel
- * file (the lane C ruling the resident tree records); no shared ABI header.
+/* The q8_1 quantize entries of the vendored-MMQ glue. Every MMQ GEMM input is requantized
+ * from f32 into `block_q8_1_mmq` (mmq.cuh:28-47: 128 values, 144 B, k-block-major columns,
+ * `ib = k_block*ne1 + column`, quantize.cu:530-533), with the D4/DS4 scale layout selected by
+ * the WEIGHT type the GEMM reads (mmq.cuh:61-101: Q8_0/Q6_K/Q5_0 take D4, Q4_K takes DS4).
+ * One header per kernel file; no shared ABI header.
  *
  * Two entries, both asynchronous on the caller's stream, never synchronizing, allocating
  * nothing and reading no status word:
  *   inference_cuda_mmq_quantize         quantize.cu:576-604 `quantize_mmq_q8_1_cuda`.
  *     x f32 [rows][row_stride] (16-byte aligned base, float4 loads, quantize.cu:485-492,
  *     zero past ne00) -> y, one column per source row, or - with ids != NULL - one column
- *     per map entry: column j quantizes source row ids[j] (the C1 gather of the down input;
- *     the map VALUES are trusted device indices, guarded upstream by the ids builder N1).
+ *     per map entry: column j quantizes source row ids[j] (the gather of the down-projection
+ *     input; the map VALUES are trusted device indices, guarded upstream by the ids builder).
  *   inference_cuda_mmq_quantize_scatter quantize.cu:607-634 `quantize_scatter_mmq_q8_1_cuda`.
  *     Each token is quantized once and the block written to all `top_k` compact rows its
- *     inverse-map slots name (quantize.cu:524-530); the map values are trusted (N1).
+ *     inverse-map slots name (quantize.cu:524-530); the map values are trusted (the ids
+ *     builder guards them).
  *
- * Sizing (plan section B.3, G1): y holds `q8_1_bytes(k, ncols)` bytes =
- * `(kpad/128)*ncols*144 + 18,432` with the ONE constant pad (rev 3, MSG-85 B1: the GEMM's
- * y-tile copies read past the last column; quantize never writes the pad); the source holds
- * `(ncols - 1)*row_stride + k` floats, ids `ncols` ints, ids_src1_inv `m*top_k` ints.
+ * Sizing: y holds `q8_1_bytes(k, ncols)` bytes = `(kpad/128)*ncols*144 + 18,432` with the
+ * ONE constant pad (the GEMM's y-tile copies read past the last column; quantize never writes
+ * the pad); the source holds `(ncols - 1)*row_stride + k` floats, ids `ncols` ints,
+ * ids_src1_inv `m*top_k` ints.
  *
  * Refusals (INFERENCE_CUDA_INVALID_ARGUMENT before any CUDA call; the Rust wrapper mirrors
  * every rule so the native entry cannot latch the backend): k off the 256-value K grid or
- * above 32768 (MMQ_ITER_K, plan section B.3: the GEMM reads 256-value k strides with no k
- * clamp, so a buffer it cannot read safely is never built), row_stride not a multiple of 4
- * or below k or above 2^30 (float4 row alignment), ncols/m/top_k outside the domain
- * (1..=2048 columns plain and tokens, `m*top_k` in 1..=16384 gathered and scattered, top_k
- * in 1..=32), a weight type with no q8_1 ds layout (MMQ_Q8_1_DS_LAYOUT_INVALID), a NULL or
- * misaligned pointer, and an output range that overlaps an input range.
+ * above 32768 (MMQ_ITER_K: the GEMM reads 256-value k strides with no k clamp, so a buffer it
+ * cannot read safely is never built), row_stride not a multiple of 4 or below k or above 2^30
+ * (float4 row alignment), ncols/m/top_k outside the domain (1..=2048 columns plain and
+ * tokens, `m*top_k` in 1..=16384 gathered and scattered, top_k in 1..=32), a weight type with
+ * no q8_1 ds layout (MMQ_Q8_1_DS_LAYOUT_INVALID), a NULL or misaligned pointer, and an output
+ * range that overlaps an input range.
  */
 #ifndef INFERENCE_CUDA_PREFILL_MMQ_QUANT_H
 #define INFERENCE_CUDA_PREFILL_MMQ_QUANT_H

@@ -1,7 +1,7 @@
 //! The engines that the server routes to, and the shared state of the routes.
 //!
 //! Routing rules: the scheduler design ("Request flow") and the server design
-//! ("Session handling"). Phase 1 has anonymous sessions only.
+//! ("Session handling"). The server has anonymous sessions only.
 
 use super::error::ServerError;
 use super::reqlog::{RecentRing, Sink, default_sink};
@@ -149,7 +149,7 @@ impl AppState {
     }
 
     /// Picks the engine of a request.
-    /// Phase 1 has no sessions, so every `x-session` value is `NotFound`.
+    /// The server keeps no sessions, so every `x-session` value is `NotFound`.
     /// Without a session, `x-engine` wins over `model`.
     pub(crate) fn resolve(
         &self,

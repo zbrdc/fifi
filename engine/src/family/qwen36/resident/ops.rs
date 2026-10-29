@@ -1,8 +1,8 @@
 //! Shared resident helpers: constants, the operation context, projections, and host tensors.
 //!
-//! These helpers follow `flash_next/resident/ops.rs`. Q36 keeps its own copy so that no packet edits
-//! a Flash-Next file (decision 0046). The constants differ: DeltaNet scales the query and key
-//! epsilon by the key dimension.
+//! These helpers follow `flash_next/resident/ops.rs`. Q36 keeps its own copy so that a Q36 change
+//! never edits a Flash-Next file. The constants differ: DeltaNet scales the query and key epsilon
+//! by the key dimension.
 
 use crate::{
     EngError,
@@ -112,7 +112,7 @@ pub(super) struct Consts {
     pub(super) qk_eps: ExecutionTensor,
     /// `sqrt(key_dim)`: the extra divisor of the DeltaNet query.
     pub(super) sqrt_kd: ExecutionTensor,
-    /// The dtype of the decode activations (packet Q36-BF16-a): the hidden state between blocks,
+    /// The dtype of the decode activations: the hidden state between blocks,
     /// the inputs of the quantized matmuls, and the converted layer norms. `F32` at import; the
     /// decoder constructor sets `Bf16` for a BF16 engine, and nothing mutates it afterwards.
     pub(super) act: Dtype,
@@ -151,7 +151,7 @@ pub(in crate::family::qwen36) struct Ctx<'k> {
     /// borrows), so it carries the module-group scope; `consts` and `compile` stay resident-only.
     pub(in crate::family::qwen36) kernels: &'k mut MlxKernels,
     pub(super) consts: &'k Consts,
-    /// `mlx_compile` on the DeltaNet and device-routed MoE decode steps (packet MX-COMPILE-1a):
+    /// `mlx_compile` on the DeltaNet and device-routed MoE decode steps:
     /// the decoder's `qwen36.compile` setting, copied by `step::run`. `delta::step` and
     /// `moe::step_device` run their compiled closure when it is true; every other block — the
     /// attention layers, the head, the embedding, and every chunk of the chunked prefill, whose
@@ -160,7 +160,7 @@ pub(in crate::family::qwen36) struct Ctx<'k> {
 }
 
 /// Converts `x` to `dtype`. A tensor that has `dtype` already is shared and makes no native call, so
-/// a step with F32 activations builds the same graph as before packet Q36-BF16-a.
+/// a step with F32 activations builds no extra node.
 pub(in crate::family::qwen36) fn cast_to(
     ctx: &mut Ctx<'_>,
     x: &ExecutionTensor,
@@ -203,7 +203,7 @@ pub(super) fn linear(
 }
 
 /// The rank-2 form of `linear`: every row of `[rows, input]` meets the weight in
-/// ONE qmm - the M1 row-batched projection (the head and the dense projections).
+/// ONE qmm - the row-batched projection (the head and the dense projections).
 /// Requires a non-empty rank-2 activation with the weight's input width.
 pub(super) fn linear_rows(
     ctx: &mut Ctx<'_>,
@@ -242,7 +242,7 @@ pub(super) fn assert_close(actual: &[f32], expected: &[f32], tol: f32, what: &st
 }
 
 /// Asserts cosine at least 0.99999 and max error over max magnitude at most 1e-4 (test helper).
-/// This is the metric of the Flash-Next resident tests and of decision 0046 item 4.
+/// This is the metric of the Flash-Next resident tests and of the Q36 per-layer parity gate.
 #[cfg(test)]
 pub(super) fn assert_parity(actual: &[f32], expected: &[f32], what: &str) {
     assert_eq!(actual.len(), expected.len(), "{what}: length");

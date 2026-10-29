@@ -1,4 +1,4 @@
-//! JSON shapes of the replies. The types are hand-written under decision 0043.
+//! JSON shapes of the replies. The types are hand-written.
 //!
 //! Each type matches a schema of `api/openapi.yaml`, and the tests check the match.
 //! The types are private to the server module.
@@ -717,11 +717,11 @@ mod tests {
         }
     }
 
-    /// SF3/SF4: the switch's byte effect through the real environment,
-    /// in fresh children — chat-path serialization both ways. OFF sets
-    /// the exact 0 value; ON sets the exact enable value (the unset
-    /// default is the ON shape, pinned by the default test). Each child
-    /// prints a sentinel; each parent requires `1 passed`.
+    /// The switch's byte effect through the real environment, in fresh
+    /// children — chat-path serialization both ways. OFF sets the exact
+    /// 0 value; ON sets the exact enable value (the unset default is
+    /// the ON shape, pinned by the default test). Each child prints a
+    /// sentinel; each parent requires `1 passed`.
     #[test]
     fn the_switch_shapes_the_chat_usage_bytes_through_the_environment() {
         const CHILD: &str = "ENGINESRV_TEST_CACHE_USAGE_SHAPES_CHILD";

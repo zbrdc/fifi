@@ -10,10 +10,10 @@
 //! | `handles.rs` | Owning wrappers for devices, streams, and arrays, and the resident storage. |
 //! | `transfer.rs` | Import of host tensors, readback of resident tensors, and the blocking and asynchronous evaluation of resident graphs. |
 //! | `host.rs` | Completed-host operations that return host bytes. |
-//! | `resident_ops.rs` | Resident `qmm`, `mm`, the elementwise methods, `rms_norm`, `rope`, the gated delta kernel (decision 0050), the consuming `kv_append`, the prefix attention (packet NATIVE-OPS-1), and the fused 8-bit KV decode attention (packet FUSED-KV8-a). |
-//! | `q8_decode_attention.metal` | The two kernel bodies of the fused 8-bit KV decode attention (packet FUSED-KV8-a), split at the pass marker and compiled per call by the shim. |
+//! | `resident_ops.rs` | Resident `qmm`, `mm`, the elementwise methods, `rms_norm`, `rope`, the gated delta kernel, the consuming `kv_append`, the prefix attention, and the fused 8-bit KV decode attention. |
+//! | `q8_decode_attention.metal` | The two kernel bodies of the fused 8-bit KV decode attention, split at the pass marker and compiled per call by the shim. |
 //! | `attention.rs` | The resident dense-attention caller. |
-//! | `pages.rs` | Caller-owned host pages and their in-place import (decision 0041). |
+//! | `pages.rs` | Caller-owned host pages and their in-place import. |
 //!
 //! Failure policy. See "Native failure policy" in the kernels design and `guard.rs`.
 
@@ -24,10 +24,10 @@ use std::{marker::PhantomData, rc::Rc};
 mod attention;
 #[cfg(test)]
 pub(crate) mod attn_dispatch;
-/// The `mlx_compile` seam (packet MX-COMPILE-1a): the compiled DeltaNet and device-routed MoE
-/// decode steps behind `qwen36.compile`, the test-only gated-delta probe, and the teardown clear
-/// of the calling thread's MLX compile cache (the cache is thread-local; the per-adapter program
-/// registry lives in `State`).
+/// The `mlx_compile` seam: the compiled DeltaNet and device-routed MoE decode steps behind
+/// `qwen36.compile`, the test-only gated-delta probe, and the teardown clear of the calling
+/// thread's MLX compile cache (the cache is thread-local; the per-adapter program registry lives
+/// in `State`).
 pub(crate) mod compile;
 mod ffi;
 mod guard;
@@ -98,17 +98,17 @@ struct State {
     pending_attention: Option<attention::PendingAttention>,
     stream: Stream,
     _device: Device,
-    /// Held only for drop order: the adapter slot outlives the stream and the device (decision 0024).
+    /// Held only for drop order: the adapter slot outlives the stream and the device.
     _lease: Rc<Lease>,
     owner: OwnerKey,
-    /// Whether the resident float operations take BF16 operands (packet Q36-BF16-a). `false` until
+    /// Whether the resident float operations take BF16 operands. `false` until
     /// `Context::allow_bf16` sets it, so a caller that never calls it rejects BF16 exactly as before.
     allow_bf16: bool,
     max_threadgroup_memory: u64,
-    /// The compiled-program registry of THIS adapter context (packet MX-COMPILE-1a, fix round 1):
-    /// the MLX compile cache is thread-local and dies with its thread, so the registry lives and
-    /// dies with the adapter. The compile seam admits every cache key here before any native
-    /// call; a fifth distinct key of one adapter is a non-terminal `BadRequest`.
+    /// The compiled-program registry of THIS adapter context: the MLX compile cache is
+    /// thread-local and dies with its thread, so the registry lives and dies with the adapter.
+    /// The compile seam admits every cache key here before any native call; a fifth distinct key
+    /// of one adapter is a non-terminal `BadRequest`.
     programs: crate::kernels::compile_key::ProgramRegistry,
 }
 
@@ -121,7 +121,7 @@ impl State {
 
     /// Wraps an output as a resident tensor that holds this adapter's retire core, which holds the lease.
     ///
-    /// The output can still be lazy. `readback` evaluates it (decision 0032).
+    /// The output can still be lazy. `readback` evaluates it.
     fn resident(
         &self,
         array: handles::Array,
@@ -180,8 +180,8 @@ impl Context {
         handles::qualification_reset_flush_stats();
     }
 
-    /// Lets the resident float operations take BF16 operands and return BF16 results (packet
-    /// Q36-BF16-a). It makes no native call. Mixed F32 and BF16 operands promote to F32 in MLX.
+    /// Lets the resident float operations take BF16 operands and return BF16 results. It makes
+    /// no native call. Mixed F32 and BF16 operands promote to F32 in MLX.
     pub(super) fn allow_bf16(&mut self, allow: bool) {
         self.state.as_mut().unwrap().allow_bf16 = allow;
     }
@@ -227,7 +227,7 @@ impl Context {
         Ok(previous)
     }
 
-    /// Sets the retire cap of this adapter and returns the previous cap (decision 0044 item 8).
+    /// Sets the retire cap of this adapter and returns the previous cap.
     pub(super) fn set_retire_cap(&mut self, bytes: u64) -> Result<u64, EngError> {
         let _dispatch = DispatchGuard::enter();
         self.check_ready()?;
@@ -313,12 +313,12 @@ impl Drop for Context {
             }
             state.retire.flush_after_sync();
             // The thread-local MLX compile cache outlives this adapter's compiled programs, so
-            // the teardown clears it HERE (packet MX-COMPILE-1a item 4): after the synchronize
-            // above completed every pending evaluation and drained the retire list, and BEFORE
-            // `state` below releases the stream and the device (field order is drop order). The
-            // clear empties the calling thread's cache — MLX keeps one cache per thread — and is
-            // idempotent (emptying an already empty cache changes nothing); a failure of it
-            // changes no completion state, so it only drops the count.
+            // the teardown clears it HERE: after the synchronize above completed every pending
+            // evaluation and drained the retire list, and BEFORE `state` below releases the
+            // stream and the device (field order is drop order). The clear empties the calling
+            // thread's cache — MLX keeps one cache per thread — and is idempotent (emptying an
+            // already empty cache changes nothing); a failure of it changes no completion state,
+            // so it only drops the count.
             compile::teardown_clear();
         }
     }

@@ -1,12 +1,12 @@
 //! Raw FFI to `inference_cuda_tiered_classify_launch` of `native/resident/tiered_classify.cu` (declared in
 //! `native/resident/tiered_classify.h`). Child module of `native::resident`, so it inherits the
-//! `allow(unsafe_code)` of `native.rs` (decision 0047, child modules of `native.rs`).
+//! `allow(unsafe_code)` of `native.rs`.
 //!
-//! Original code; design from `ledger/plans/TCAP-DESIGN.md` section 3.2 (TCAP C2).
+//! Original code.
 //!
 //! Safety invariants this file relies on:
 //! - The launch entry is called only through `CudaContext::launch_on`, on the thread that owns the
-//!   context and under the dispatch guard (decisions 0023 and 0024).
+//!   context and under the dispatch guard.
 //! - Every range is a `RawRange`, which `RawRange::new` proved inside its live allocation.
 //! - Shape, sizes, alignment and disjointness are proved again here (`super::Span` for the
 //!   overlaps), so a bad call is refused with `invalid_argument` and never reaches the device. The
@@ -20,7 +20,7 @@
 
 #![cfg_attr(
     not(test),
-    expect(dead_code, reason = "staged for TCAP C6 (ledger/plans/TCAP-DESIGN.md)")
+    expect(dead_code, reason = "staged for the tiered decode step")
 )]
 
 use std::ffi::{c_int, c_void};

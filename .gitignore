@@ -1,5 +1,6 @@
 /target
 /engine/target
+/qualification/*/target/
 .env
 *.log
 .DS_Store
@@ -7,3 +8,19 @@
 *.swo
 __pycache__/
 *.py[cod]
+
+# The ledger and process documents live in the internal ledger.
+/WORK_LOG.md
+/docs/
+/specs/
+/research/
+/AGENTS.md
+/CLAUDE.md
+/CONVENTIONS.md
+/PLAN.md
+/scripts/
+/qualification/
+.pi-dsh/
+.pi-glla/
+engine/.pi-dsh/
+.pi/

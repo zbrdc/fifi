@@ -1,5 +1,5 @@
 //! The tool-forward diagnostic: the next-token distribution of the 922-token tool prompt on
-//! the product `activation_dtype` setting of packet Q36-BF16-a, with the format-token gate.
+//! the product `activation_dtype` setting, with the format-token gate.
 //!
 //! The mlx-lm 0.31.0 reference on the same int4 weights gives P("\\n") = 0.999555 after the 919
 //! prompt ids of `IDS_FILE` plus the 3 suffix ids of `"</think>\\n\\n<tool_call>"` (922 ids), but
@@ -23,12 +23,12 @@
 //! - M2 `m2_chunk_16`: the same with a largest chunk of 16, in both activations.
 //! - M3 `m3_token_by_token`: no chunked prefill (no planned chunk): every prompt token is a
 //!   one-token step through the resident decode path, as the engine runs without a prefill budget.
-//! - M4 `m4_host_reference`: the Q36-D host forward of the crate, only with `Q36_HOST_REF=1`.
+//! - M4 `m4_host_reference`: the host forward of the crate, only with `Q36_HOST_REF=1`.
 //!   `Q36_HOST_REF` accepts unset, 0, or 1 (an earlier defect rejected a set `0`).
 //!   It is skipped by default: 922 CPU forward steps are not known to finish in reasonable time
 //!   on the Mac.
-//! - M5 (chunk 256 with the MK1 gated delta kernel disabled) does not exist: no switch in the
-//!   crate disables the kernel of decision 0050. `resident/delta.rs` (the decode step) and
+//! - M5 (chunk 256 with the custom gated delta kernel disabled) does not exist: no switch in the
+//!   crate disables that kernel. `resident/delta.rs` (the decode step) and
 //!   `resident/prefill/delta.rs` (the prefill chunk) call `MlxKernels::gated_delta`
 //!   unconditionally, so the fallback cannot be selected.
 //!
@@ -42,7 +42,7 @@
 //! chunk, and `decode` runs the logits step of the pending token).
 //!
 //! The activation comes from `Q36_ACTIVATION` through the product constructor: `bf16` keeps the
-//! stored BF16 scales and the converted norms, `f32` keeps the G0 widening. The variable is
+//! stored BF16 scales and the converted norms, `f32` keeps F32 scales. The variable is
 //! REQUIRED here, in the bank run below, and in `decode_timing` — one rule for the whole chain:
 //! an unset run panics before the load with a message that names the variable and its two
 //! accepted values, `bf16` and `f32`. The F32 control must equal the recorded results: "\\n"
@@ -100,7 +100,7 @@
 //! come from the field `suffix_ids` of `REF_JSON`; the lengths are checked against `prompt_tokens`
 //! and `total_tokens` of `REF_JSON`.
 //!
-//! The second ignored test, `bank_format_token_by_config` (packet BF16-EVAL), runs the same
+//! The second ignored test, `bank_format_token_by_config`, runs the same
 //! measurement over a BANK of prompts instead of the one 922-token prompt: it reads
 //! `Q36_BANK_FILE`, a JSON bank file of rendered prompts (one `ids` list per prompt, built
 //! outside this repository) with the schema
@@ -472,7 +472,7 @@ fn serve_run(
     serve_run_pieces(decoder, state, ids.len(), &pieces, chunk)
 }
 
-/// `serve_run` over explicit pieces (packet Q36-BF16-SENS): the pieces are fed in order, so a short
+/// `serve_run` over explicit pieces: the pieces are fed in order, so a short
 /// piece after full ones is a short chunk appended to a cached state, as a tool result is in a
 /// multi-turn session. `total` is the number of ids in all pieces.
 fn serve_run_pieces(
@@ -557,7 +557,7 @@ impl ChunkLabel {
     }
 }
 
-/// The Q36-D host reference over `ids`: a second weight load (the resident import consumed the
+/// The host reference over `ids`: a second weight load (the resident import consumed the
 /// first), one CPU step per id, and the logits row of the step after the last id.
 fn host_reference_run(real: &RealCheckpoint, ids: &[u32]) -> (Vec<f32>, f64, f64) {
     let started = Instant::now();
@@ -788,9 +788,9 @@ fn next_token_logits_by_forward_path_on_the_922_token_tool_prompt() {
     let kv_charge_bytes = decoder.budget.used();
     let rss = rss_kb();
     let routing = format!("{:?}", decoder.routing);
-    // Q36-BF16-SENS: more chunk sizes (`Q36_TOOLFWD_CHUNKS`, a comma list from 2 to 512, default
-    // none) and appended tails (`Q36_TOOLFWD_TAILS`, a comma list, default none: the first
-    // `N - t` ids in chunks of the serving chunk, then the last `t` ids as ONE short piece).
+    // The chunk-sensitivity runs: more chunk sizes (`Q36_TOOLFWD_CHUNKS`, a comma list from 2 to
+    // 512, default none) and appended tails (`Q36_TOOLFWD_TAILS`, a comma list, default none: the
+    // first `N - t` ids in chunks of the serving chunk, then the last `t` ids as ONE short piece).
     let list = |name: &str, low: usize, high: usize| -> Vec<usize> {
         std::env::var(name)
             .ok()
@@ -1051,7 +1051,7 @@ fn next_token_logits_by_forward_path_on_the_922_token_tool_prompt() {
         "format_token_by_mode": format_by_mode,
         "m5_gated_delta_fallback":
             "skipped: no switch exists; resident/delta.rs and resident/prefill/delta.rs call \
-             MlxKernels::gated_delta (decision 0050) unconditionally"
+             MlxKernels::gated_delta unconditionally"
                 .to_string(),
     });
     std::fs::write(
@@ -1104,7 +1104,7 @@ fn bank_configs() -> Vec<BankConfig> {
     }
 }
 
-/// The result row of one bank (prompt, config) run (packet BF16-EVAL): the probability of the
+/// The result row of one bank (prompt, config) run: the probability of the
 /// format token at temperature 1, the top-1 id and whether it IS the format token, the
 /// format-token logit, the seconds of the run, the `fed_row_runs` of the config, and, for a
 /// chunk-shaped config, `requested_chunk` with `effective_chunk` and the `fallback` marker of a

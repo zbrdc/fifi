@@ -1,5 +1,4 @@
-//! The capture window and executable graphs of a CUDA context (CUDA-RD rev 2.3 sections 3, 6.5, 6.6
-//! and 7, decision 0047).
+//! The capture window and executable graphs of a CUDA context.
 //!
 //! [`CudaContext::capture`] opens a window on one owned stream, runs a body that queues work through
 //! the ordinary launch wrappers, closes the window and turns what was recorded into a [`GraphExec`]
@@ -13,9 +12,10 @@
 //!   its whole length, in `cudaStreamCaptureModeThreadLocal`. It is not reentrant.
 //! - A drop inside a window is deferred ([`run_or_defer`]): the free of a buffer, stream, event,
 //!   pinned word or graph synchronizes, which a capture forbids. The owner's own free path runs
-//!   when the window closes, in order, and applies decision 0022 itself (return if terminal, latch
-//!   on a failed free). After a terminal failure inside the body the deferred list is dropped
-//!   without running (the handles are left to the process exit, the counters stay).
+//!   when the window closes, in order, and applies the terminal-release rule itself (return if
+//!   terminal, latch on a failed free). After a terminal failure inside the body the deferred
+//!   list is dropped without running (the handles are left to the process exit, the counters
+//!   stay).
 //!   Cached buffers retain their backing owner and lease: healthy close frees without
 //!   caching; abandonment runs its terminal Drop to record quarantine, with no native call.
 //! - The closed list of capture statuses (`mod.rs`, `is_capture_status`) is non-terminal; any other
@@ -27,11 +27,11 @@
 //! - Drop order of a resident step: graphs, then the arena and step state, then the pinned word,
 //!   then the events, then the stream; the caller then drops the weights and the context.
 //! - Graph update (`cudaGraphExecUpdate`, 12.x form `(exec, graph, &resultInfo)`) is not wrapped: a
-//!   changed address means a new arena and new graphs (CUDA-RD 2.6). It would need a second
-//!   capture and its own closed-list ruling.
+//!   changed address means a new arena and new graphs. It would need a second capture and its
+//!   own closed list of non-terminal statuses.
 #![cfg_attr(
     not(test),
-    expect(dead_code, reason = "staged for RD-9a (decision 0047)")
+    expect(dead_code, reason = "staged for the resident decode step")
 )]
 
 use std::cell::RefCell;
@@ -247,16 +247,16 @@ fn begin_window<'s>(
     })
 }
 
-/// Ends the capture and closes the window (decision 7 of the packet): an `Ok` body gets a graph; an
-/// `Err` body gets its own error back; a latch inside the body makes no native call at all.
+/// Ends the capture and closes the window: an `Ok` body gets a graph; an `Err` body gets its own
+/// error back; a latch inside the body makes no native call at all.
 fn finish_window<'p, R>(
     open: OpenWindow<'_>,
     plan: CapturePlan<'p>,
     body: Result<R, EngError>,
 ) -> Result<(GraphExec<'p>, R), EngError> {
     if let Err(terminal) = ensure_usable(&TERMINAL) {
-        // Decision 0022: nothing more is touched; the stream is left to the process exit and the
-        // deferred frees are dropped unrun.
+        // After a terminal failure nothing more is touched; the stream is left to the process exit
+        // and the deferred frees are dropped unrun.
         drop(open.scope.close());
         return Err(body.err().unwrap_or(terminal));
     }

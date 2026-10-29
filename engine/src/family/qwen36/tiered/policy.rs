@@ -1,12 +1,12 @@
-//! The tier policy of the per-layer expert banks (OFF-2 C1, packet policy P).
+//! The tier policy of the per-layer expert banks.
 //!
 //! WHAT: decayed popularity scores per (layer, expert), the resident set of every
 //! layer bank, and a swap credit that buys a bounded number of swaps per token.
 //! WHY: a 6 GiB GPU cannot hold 40 x 256 experts, so the engine keeps the hot few
 //! of each layer on the GPU and pays a fixed swap budget for the rest. The
 //! semantics mirror the python model `tier_adaptive.adaptive_per_layer` whose
-//! numbers the off-t trace replay checks. Deterministic: no clock, no randomness,
-//! no threads. Driven by `TieredHost` (OFF-2 D4/D5).
+//! numbers a trace replay checks. Deterministic: no clock, no randomness, no
+//! threads. Driven by `TieredHost`.
 
 use super::{PolicyMode, TieredConfig};
 

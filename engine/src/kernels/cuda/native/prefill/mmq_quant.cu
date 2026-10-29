@@ -1,7 +1,6 @@
 /*
- * The q8_1 quantize entries of the vendored-MMQ glue (see prefill/mmq_quant.h). CPF-V4 G4,
- * decision 0049 item 11. The validation follows the
- * pattern of the prefill kernels of this tree; the launches are the vendored entries
+ * The q8_1 quantize entries of the vendored-MMQ glue (see prefill/mmq_quant.h). The validation
+ * follows the pattern of the prefill kernels of this tree; the launches are the vendored entries
  * (quantize.cu), called, not transcribed.
  */
 #include <cstdint>
@@ -98,13 +97,14 @@ int launch_q8k_mmq(Q8kMmqCall a, void *stream, int *out_stage) {
 }
 
 
-/* The K grid of the MMQ GEMM (plan section B.3, MSG-85 M2): `MMQ_ITER_K` k values per loop
- * iteration, read with no k clamp, so the quantize refuses to build a buffer the GEMM
- * cannot read safely. The extent bound matches the tree's `MAX_DIM`. */
+/* The K grid of the MMQ GEMM: `MMQ_ITER_K` k values per loop iteration, read with no k clamp,
+ * so the quantize refuses to build a buffer the GEMM cannot read safely. The extent bound
+ * matches the tree's `MAX_DIM`. */
 constexpr int kKGrid = 256;
 constexpr int kKMax = 32768;
 constexpr long long kStrideMax = 1LL << 30;
-/* The chunk cap (G1's NCOLS_LIMIT) and its gathered form (`m * top_k` at top_k 8). */
+/* The chunk cap (`mmq_size::NCOLS_LIMIT` on the Rust side) and its gathered form
+ * (`m * top_k` at top_k 8). */
 constexpr int kRowLimit = 2048;
 constexpr long long kRowsMax = 16384;
 constexpr int kTopKMax = 32;
@@ -124,9 +124,9 @@ bool k_ok(int k, int row_stride) {
            row_stride % 4 == 0 && row_stride <= kStrideMax;
 }
 
-/* NIT-7 (review): only the types the glue serves reach the vendored switch — the
- * wrapper's MmqType is exactly these, and no other int is ever cast to ggml_type. Each one
- * has a q8_1 ds layout (mmq.cuh:61-101), so the vendored default refusal stays dead. */
+/* Only the types the glue serves reach the vendored switch — the wrapper's MmqType is exactly
+ * these, and no other int is ever cast to ggml_type. Each one has a q8_1 ds layout
+ * (mmq.cuh:61-101), so the vendored default refusal stays dead. */
 bool served_type(int type) {
     return type == 8 /* Q8_0 */ || type == 6 /* Q5_0 */ || type == 12 /* Q4_K */ ||
            type == 14 /* Q6_K */ || type == 40 /* NVFP4 */;
@@ -141,7 +141,8 @@ bool valid_quantize(const inference_cuda_mmq_quantize_args *a) {
     if (!served_type(a->type) || !k_ok(a->k, a->row_stride)) return false;
     if (a->packing != 0 && a->packing != 1) return false;
     /* ids == NULL: the plain dense call, ncols = M. ids != NULL: the gathered down call,
-     * ncols = ne_get_rows (the map's values are trusted device indices, guarded by N1). */
+     * ncols = ne_get_rows (the map's values are trusted device indices, guarded by the ids
+     * builder). */
     if (a->ncols < 1 || a->ncols > (a->ids == NULL ? kRowLimit : kRowsMax)) return false;
     const long long blocks_per_col = (a->k + 127) / 128;
     const long long y_bytes = blocks_per_col * (long long)a->ncols * 144;

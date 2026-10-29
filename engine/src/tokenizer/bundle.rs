@@ -24,7 +24,7 @@ pub struct TokenizerPin {
     pub vocab_size: u32,
 }
 
-/// The message-boundary token counts of one encoded prompt (decision 0036, addenda 1 and 2).
+/// The message-boundary token counts of one encoded prompt.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct PromptBoundaries {
     /// The number of prompt tokens that end at the last message boundary, when the prompt ids
@@ -52,17 +52,17 @@ pub struct TokenizerBundle {
     counts: std::sync::Mutex<(usize, usize)>,
 }
 
-/// Per-session warm-turn cache (approved 01a17235 + A 01a1723a): the
-/// previous turn's head render and its ids, keyed by the system opener,
-/// the tool list, and the thinking mode. A warm turn re-renders (full and
-/// head), tokenizes ONLY the appended delta and the generation prompt,
-/// and concatenates — exact because every junction sits at a complete
-/// added token (the AddedVocabulary splits added tokens out of the raw
-/// text atomically, so no BPE merge crosses them). Any doubt — key
-/// change, edited history (prefix mismatch), a delta without an added
-/// token at the seam, a head ending inside a partial added token, an
-/// ineligible tokenizer, or a seeding failure — falls back to the full
-/// derived path and is COUNTED, never guessed.
+/// Per-session warm-turn cache: the previous turn's head render and its
+/// ids, keyed by the system opener, the tool list, and the thinking mode.
+/// A warm turn re-renders (full and head), tokenizes ONLY the appended
+/// delta and the generation prompt, and concatenates — exact because
+/// every junction sits at a complete added token (the AddedVocabulary
+/// splits added tokens out of the raw text atomically, so no BPE merge
+/// crosses them). Any doubt — key change, edited history (prefix
+/// mismatch), a delta without an added token at the seam, a head ending
+/// inside a partial added token, an ineligible tokenizer, or a seeding
+/// failure — falls back to the full derived path and is COUNTED, never
+/// guessed.
 ///
 /// Bounded memory: `accounted_bytes()` is the live cost — the head
 /// render string, the cached head ids, and the completed turn's kept
@@ -97,20 +97,20 @@ pub struct WarmTurnCache {
     /// The `first_message_end` value `first_head_len` was derived at —
     /// the endpoint's derivation basis. A hit whose raw first-turn
     /// selector MOVED (render-preserving role edits can do this) must
-    /// refresh or clear the endpoint, never keep it stale (Sol r1 MF).
+    /// refresh or clear the endpoint, never keep it stale.
     first_head_end: Option<usize>,
     /// True when the cached endpoint covers the WHOLE cached head
     /// (`first_head_len == head_render.len()`): such an endpoint is
     /// re-derivable from the hit's own head render, so every hit whose
     /// boundary covers the whole current head refreshes it — all-system
-    /// heads advancing turn by turn (Sol-6 MF) and content growth with an
-    /// unchanged selector included (Sol r2 MF).
+    /// heads advancing turn by turn and content growth with an unchanged
+    /// selector included.
     boundary_whole_head: bool,
     self_check: bool,
     /// The last completed turn's ids and boundaries plus the SHA-256 of
     /// the exact request (messages, tools, thinking) that produced them —
     /// one unit, dropped together whenever the slot reseeds or empties,
-    /// so a stale result can never outlive its fingerprint (Sol r2 SF).
+    /// so a stale result can never outlive its fingerprint.
     /// A resend whose digest and key match reuses the stored ids
     /// outright (see `encode_prompt_warm`); any edit, reorder, tool,
     /// thinking, or identity change lands in the digest or the key and
@@ -217,7 +217,7 @@ impl WarmTurnCache {
     /// Maps a warm refusal to its fixed cause string. A divergence before
     /// the boundary render's end means the conversation itself differs —
     /// an unrelated request, or a slot another conversation reseeded —
-    /// which the replay report must not count as a seam miss.
+    /// which the serving log must not count as a seam miss.
     fn cause_of(&self, refusal: &WarmRefusal) -> &'static str {
         match refusal {
             WarmRefusal::Render => "render",
@@ -231,7 +231,7 @@ impl WarmTurnCache {
                     // grew past the first turn, or a template reflow): a
                     // bare position cannot classify the divergence, and a
                     // guess would make the label depend on history — the
-                    // replay report gets an honest bucket instead.
+                    // serving log gets an honest bucket instead.
                     "unresolved"
                 } else if *diverge < self.first_head_len {
                     "other-conversation"
@@ -280,7 +280,7 @@ impl WarmTurnCache {
     /// The live cache footprint in bytes: the head render's and key
     /// strings' CAPACITY plus four bytes per id CAPACITY — capacity, not
     /// len, so a cleared-but-retained buffer cannot report zero while
-    /// holding its allocation (Sol round 2 SF2).
+    /// holding its allocation.
     pub fn accounted_bytes(&self) -> usize {
         self.head_render.capacity()
             + 4 * self.head_ids.capacity()
@@ -339,7 +339,7 @@ impl TokenizerBundle {
     /// render flags (replay / notice wrap) fold in too: same pins with
     /// different effective rendering must never share a slot — the
     /// resend shortcut bypasses the render/prefix comparison that used
-    /// to catch this (Sol r2 MF3).
+    /// to catch this.
     fn identity_fold(&self) -> u64 {
         use std::hash::{Hash, Hasher};
         let mut hasher = std::collections::hash_map::DefaultHasher::new();
@@ -426,12 +426,12 @@ impl TokenizerBundle {
         self.counted_encode(&rendered)
     }
 
-    /// Encodes the prompt like `encode_prompt` and also returns its message boundaries
-    /// (decision 0036, addenda 1 and 2): the `tip` is the prompt length at the last message
-    /// boundary, the prompt without its generation tail, and the `root` is the prompt length
-    /// at the end of the first system message. A boundary is `None` unless the ids of its
-    /// render are the first ids of the prompt. A set boundary always has `0 < n < ids.len()`,
-    /// and the root is always shorter than the tip.
+    /// Encodes the prompt like `encode_prompt` and also returns its message boundaries: the
+    /// `tip` is the prompt length at the last message boundary, the prompt without its
+    /// generation tail, and the `root` is the prompt length at the end of the first system
+    /// message. A boundary is `None` unless the ids of its render are the first ids of the
+    /// prompt. A set boundary always has `0 < n < ids.len()`, and the root is always shorter
+    /// than the tip.
     pub fn encode_prompt_with_boundary(
         &self,
         msgs: &[PromptMessage],
@@ -540,9 +540,8 @@ impl TokenizerBundle {
     /// and the same head encode as the three-pass path — and reports
     /// `tip_derived == false`. One exception: an added-text suffix that the
     /// cheap pre-screen lets through but a guard refuses costs one extra
-    /// suffix encode before the fallback. The ids and root semantics
-    /// (decision 0036 addenda 1-2) are identical to
-    /// [`Self::encode_prompt_with_boundary`] on every path.
+    /// suffix encode before the fallback. The ids and root semantics are
+    /// identical to [`Self::encode_prompt_with_boundary`] on every path.
     pub fn encode_prompt_with_derived_boundary(
         &self,
         msgs: &[PromptMessage],
@@ -567,8 +566,8 @@ impl TokenizerBundle {
         // At most one tools serialization and one digest per request: the
         // key reuses the JSON string, the digest hashes it, and `warm_turn`
         // stores the already-computed digest instead of re-deriving it
-        // (Opus SF1: two whole-conversation passes cost 1.5-3 ms at
-        // 108K tokens against a 3.3 ms measured warm turn).
+        // (two whole-conversation passes cost 1.5-3 ms at 108K tokens
+        // against a 3.3 ms measured warm turn).
         let tools_json = serde_json::to_string(tools).unwrap_or_default();
         let key = warm_key(msgs, thinking, self.identity_fold(), &tools_json);
         // The digest only matters when the key already matches AND the
@@ -586,7 +585,7 @@ impl TokenizerBundle {
                 }
                 resend_digest(msgs, &tools_json, thinking)
             });
-        // Resend-HIT (the replay report's repeat turn): byte-identical
+        // Resend-HIT (an agent's repeat turn): byte-identical
         // render inputs to the request that filled `last_turn`. The key
         // above pins system + tools + thinking + bundle identity and
         // effective flags; the digest pins every message through an
@@ -609,9 +608,9 @@ impl TokenizerBundle {
             // Production defaults do NOT re-verify: byte-exactness rests
             // on the deterministic tokenizer + fingerprint arguments. The
             // diagnostic cross-check (test builds always; production via
-            // opt-in self_check) re-checks what it serves, so an
-            // MF1-class fingerprint bug cannot hide behind the shortcut
-            // in any test or diagnostic build (Opus N4, Sol F4).
+            // opt-in self_check) re-checks what it serves, so a
+            // fingerprint bug cannot hide behind the shortcut in any
+            // test or diagnostic build.
             if resend_verify_enabled(cache.self_check, cfg!(test))
                 && self
                     .encode_prompt(msgs, tools, thinking)
@@ -634,7 +633,7 @@ impl TokenizerBundle {
         let eligible = self.tokenizer.boundary_eligible();
         // The head-partial vocab scan runs only past the cheap gates (key,
         // eligibility) — the cold, key-change, and ineligible refusals must
-        // not pay for it (Sol-6 SF).
+        // not pay for it.
         let mut head_partial = false;
         let attempt = if cache.key.as_ref() == Some(&key) && eligible {
             head_partial = self.tokenizer.ends_inside_added_token(&cache.head_render);
@@ -729,7 +728,7 @@ impl TokenizerBundle {
         // Junction B needs its own guard: the NEW head must end outside
         // any partial added token. The suffix proof only shows the suffix
         // starts with a complete added token; it cannot see one that
-        // starts INSIDE the head and ends inside the suffix (Opus MF1).
+        // starts INSIDE the head and ends inside the suffix.
         if self.tokenizer.ends_inside_added_token(head.as_str()) {
             return Err(WarmRefusal::HeadPartial);
         }
@@ -748,10 +747,10 @@ impl TokenizerBundle {
         let tip = Some(head_ids.len()).filter(|&tip| tip > 0 && tip < ids.len());
         let bounds = PromptBoundaries {
             tip,
-            // Sol MF (root boundary): re-derive the root for THIS prompt —
-            // the cached root is the seed's, and a system-only seed stored
-            // None even though the appended prompt derives Some(root).
-            // Same oracle as the derived path; ids are unchanged.
+            // Re-derive the root for THIS prompt — the cached root is the
+            // seed's, and a system-only seed stored None even though the
+            // appended prompt derives Some(root). Same oracle as the
+            // derived path; ids are unchanged.
             root: self.root_boundary(msgs, tools, thinking, &ids, tip),
         };
         if (cache.self_check || cfg!(test))
@@ -768,29 +767,28 @@ impl TokenizerBundle {
             bounds,
             inputs: resend_inputs,
         });
-        // Sol-6 MF: a system-only seed's boundary covered its whole head
-        // with no turn. This hit appends one and re-derives the boundary
-        // from what it already rendered — no extra render on the hit path.
-        // An ALL-SYSTEM head (Opus MF2b): the template demotes every
-        // non-initial system to a user turn, so the whole head STAYS the
-        // boundary region and the endpoint must ADVANCE with the head, or
-        // a later divergence in the demoted region mislabels as seam while
-        // a direct seed of the same history says other-conversation.
+        // A system-only seed's boundary covered its whole head with no
+        // turn. This hit appends one and re-derives the boundary from what
+        // it already rendered — no extra render on the hit path.
+        // An ALL-SYSTEM head: the template demotes every non-initial system
+        // to a user turn, so the whole head STAYS the boundary region and
+        // the endpoint must ADVANCE with the head, or a later divergence in
+        // the demoted region mislabels as seam while a direct seed of the
+        // same history says other-conversation.
         // Endpoint maintenance, three cases. (1) The boundary covers the
-        // whole current head (all-system histories advancing turn by turn
-        // — Sol-6 MF; the appended turn being the first non-system row;
-        // content growth that byte-extends the head with an unchanged
-        // selector — Sol r2 MF; role edits that alias the render and move
-        // the selector — Sol r1 MF): the hit's own head render IS the
-        // boundary render, exactly what directly seeding this history
-        // would store. (2) The selector MOVED and the boundary is now
-        // interior: re-derivation needs a render the hit path does not
+        // whole current head (all-system histories advancing turn by turn;
+        // the appended turn being the first non-system row; content growth
+        // that byte-extends the head with an unchanged selector; role edits
+        // that alias the render and move the selector): the hit's own head
+        // render IS the boundary render, exactly what directly seeding this
+        // history would store. (2) The selector MOVED and the boundary is
+        // now interior: re-derivation needs a render the hit path does not
         // have — honestly unknown, and later Prefix refusals label
-        // "unresolved", never seam (Opus MF2a). (3) An interior endpoint
-        // with an unchanged selector needs NO refresh: its bytes are a
-        // strict prefix of the old head, and a warm hit only ever
-        // byte-extends the head (the strip-prefix proof), so they are
-        // still the boundary render's bytes.
+        // "unresolved", never seam. (3) An interior endpoint with an
+        // unchanged selector needs NO refresh: its bytes are a strict
+        // prefix of the old head, and a warm hit only ever byte-extends the
+        // head (the strip-prefix proof), so they are still the boundary
+        // render's bytes.
         let end_now = first_message_end(msgs);
         if end_now == Some(msgs.len()) {
             cache.first_head_len = cache.head_render.len();
@@ -825,23 +823,21 @@ impl TokenizerBundle {
                     // key already pins the system text, so a foreign
                     // conversation that shares it still diverges AT its first
                     // user turn — the boundary must therefore sit past that
-                    // turn, or every agent (system-first traffic, the whole
-                    // point of the replay report) would classify as a seam
-                    // miss. An edit INSIDE this conversation's first user
-                    // turn is byte-indistinguishable from a foreign turn and
-                    // also reports other-conversation — the cheap length
-                    // compare's known limit.
-                    // A SYSTEM-ONLY seed has no turn: the boundary covers the
-                    // whole head for now (flagged), and the first warm hit
-                    // that appends a turn re-derives it (Sol-6 MF) — without
-                    // a render on the hit path.
+                    // turn, or every agent (system-first traffic) would
+                    // classify as a seam miss. An edit INSIDE this
+                    // conversation's first user turn is byte-indistinguishable
+                    // from a foreign turn and also reports other-conversation
+                    // — the cheap length compare's known limit.
+                    // A SYSTEM-ONLY seed has no turn: the boundary covers
+                    // the whole head for now (flagged), and the first warm
+                    // hit that appends a turn re-derives it — without a
+                    // render on the hit path.
                     // When the boundary is the whole head (end == len), the
-                    // head render IS the boundary render — no second render
-                    // (Sol-6 SF).
+                    // head render IS the boundary render — no second render.
                     // Honest cost otherwise: this render runs on EVERY
                     // re-seeding fallback (most non-warm turns), not only a
                     // cold seed — one template render and one String. By the
-                    // measured warm-turn scale (3.3 ms at 108K, Opus SF1 note)
+                    // measured warm-turn scale (3.3 ms at 108K tokens)
                     // the render is small but nonzero; never measured in
                     // isolation on this path.
                     let end = first_message_end(msgs);
@@ -866,8 +862,7 @@ impl TokenizerBundle {
                     cache.first_head_end = end;
                     // whole_head alone: the flag means "endpoint covers the
                     // whole cached head", whatever the head's roles — an
-                    // all-system head is one case of it, not the definition
-                    // (Sol r2 MF).
+                    // all-system head is one case of it, not the definition.
                     cache.boundary_whole_head = whole_head;
                     cache.head_render = head_render;
                     cache.head_ids = ids[..tip].to_vec();
@@ -891,7 +886,7 @@ impl TokenizerBundle {
         }
         // No last_turn store here: the fallback's own return carries the
         // ids, and only a warm success (or a resend of one) ever reads
-        // the stored copy (Opus SF6).
+        // the stored copy.
         Ok((ids, bounds))
     }
 
@@ -989,10 +984,10 @@ impl TokenizerBundle {
         if !self.tokenizer.any_added_text_starts(suffix) {
             return None;
         }
-        // Sol MF (round 2): a first EMITTED id that is added does not prove
-        // an added-token match at suffix byte 0 — normalizers can drop
-        // leading bytes (they emit nothing). Require the added first token
-        // to start at offset 0 of the suffix text.
+        // A first EMITTED id that is added does not prove an added-token
+        // match at suffix byte 0 — normalizers can drop leading bytes (they
+        // emit nothing). Require the added first token to start at offset 0
+        // of the suffix text.
         let (ids, offsets) = self.counted_encode_with_offsets(suffix).ok()?;
         ids.first()
             .zip(offsets.first())
@@ -1231,7 +1226,7 @@ mod tests {
     fn a_render_failure_labels_itself_render_not_seam() {
         // The fallback cause feeds the serving log's reason= field; a render
         // failure (empty or erroring template render) is not a junction
-        // divergence and must not be counted as one (Sol follow-up).
+        // divergence and must not be counted as one.
         let cache = WarmTurnCache::new();
         assert_eq!(cache.cause_of(&super::WarmRefusal::Render), "render");
         assert_eq!(cache.cause_of(&super::WarmRefusal::Seam), "seam");
@@ -1248,10 +1243,10 @@ mod tests {
         }
     }
 
-    /// The boundary rule as a table (Opus delta SF2): a Developer opener
-    /// counts as system-like; several leading system messages all skip;
-    /// a system-only history makes the WHOLE head the boundary; empty
-    /// input is None (the caller keeps the boundary unknown).
+    /// The boundary rule as a table: a Developer opener counts as
+    /// system-like; several leading system messages all skip; a system-only
+    /// history makes the WHOLE head the boundary; empty input is None (the
+    /// caller keeps the boundary unknown).
     #[test]
     fn first_message_end_covers_leading_system_messages_plus_one_turn() {
         let cases: &[(&str, Vec<PromptMessage>, Option<usize>)] = &[

@@ -29,7 +29,7 @@ Transformers Python-JSON filter, not Jinja's HTML-escaping built-in. Encode the
 render with `tokenizers.Tokenizer.from_file('tokenizer.json').encode(rendered,
 add_special_tokens=False).ids`. No automatic BOS/EOS is used.
 
-Grammar selection is conservative: only the exact pinned template hash enables
-Flint's argument grammar and developer/reasoning replay. Other templates retain
-the existing Qwen/default request-rendering and parsing behavior. A future
-publisher template revision requires explicit review of this identity binding.
+Only the exact pinned template hash enables Flint's tool-call argument grammar
+and the replay of developer and reasoning messages. Other templates keep the
+Qwen/default request rendering and parsing. A new publisher template revision
+needs a review before the engine accepts its hash.

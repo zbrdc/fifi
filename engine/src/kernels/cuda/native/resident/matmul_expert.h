@@ -1,5 +1,5 @@
 /*
- * Launch entry of kern::matmul_expert (RD-0b): the tiled matmul against one expert of a stack, with the
+ * Launch entry of kern::matmul_expert: the tiled matmul against one expert of a stack, with the
  * expert id read from device memory when the kernel runs. Launch-only, like abi_resident.h: nothing here
  * allocates, copies or synchronizes; a fault in queued work surfaces at the next synchronize. This header
  * is the per-kernel header of the layout in kernels/cuda/resident/mod.rs; abi_resident.h stays closed.

@@ -1,4 +1,4 @@
-//! Batched dense attention over a chunk (packet Q36-E4; decision 0044 item 11).
+//! Batched dense attention over a chunk.
 //!
 //! `chunk` is the chunk form of `attn::step`. The `T` rows of a chunk attend to the `P` cached
 //! positions and to the chunk rows before them. The mask is causal and aligned to the last key, so
@@ -9,13 +9,12 @@
 //! as stored, RoPE rotates the first `rotary_dim` dimensions, and the head output is multiplied
 //! by `sigmoid(gate)`. There is no indexer and no block selection.
 //!
-//! The cache keeps the decode layout — capacity buffers written in place by `kv_append`
-//! (packets Q36-KV-INTEGRATE and KV8-INTEGRATE) — so a chunk and a decode step share it. The
-//! F32 control converts its new keys and values to F32 before the append (packet Q36-BF16-b, as
-//! the decode step of `attn.rs`); the Q8 form keeps the activation dtype and `quantize_rows`
-//! packs the rows. The attention runs `quantized_attention_prefix` over the quantized buffers,
-//! causal for a chunk of more than one row (packet KV8-INTEGRATE item 4), and the block output
-//! converts to the activation dtype at the o-projection.
+//! The cache keeps the decode layout — capacity buffers written in place by `kv_append` — so a
+//! chunk and a decode step share it. The F32 control converts its new keys and values to F32 before
+//! the append (as the decode step of `attn.rs`); the Q8 form keeps the activation dtype and
+//! `quantize_rows` packs the rows. The attention runs `quantized_attention_prefix` over the
+//! quantized buffers, causal for a chunk of more than one row, and the block output converts to the
+//! activation dtype at the o-projection.
 
 use super::super::attn::{AttnStep, KvBuffers, KvCache, append};
 use super::super::kv_plan::{flash_prefill_enabled, query_block_ranges, query_slice_rows};
@@ -124,10 +123,10 @@ pub(super) fn chunk_sliced(
     let vp = m.reshape(&vp, &[rows, kv_heads, width])?;
     let v_new = m.transpose(&vp, &[1, 0, 2])?;
     let v_new = m.reshape(&v_new, &[1, kv_heads, rows, width])?;
-    // The cache form (packet KV8-INTEGRATE, as the decode step of `attn.rs`): the F32 control
-    // keeps its cast to F32 whatever the activation dtype (packet Q36-BF16-b; the cast runs
-    // before the append so that a cache which starts with this chunk is F32 too), and the Q8
-    // form keeps the activation dtype, so the quantized scales and biases hold it.
+    // The cache form (as the decode step of `attn.rs`): the F32 control keeps its cast to F32
+    // whatever the activation dtype (the cast runs before the append so that a cache which starts
+    // with this chunk is F32 too), and the Q8 form keeps the activation dtype, so the quantized
+    // scales and biases hold it.
     let (k_new, v_new) = match cache.kv {
         KvDtype::F32 => (
             cast_to(ctx, &k_new, Dtype::F32)?,
@@ -144,7 +143,7 @@ pub(super) fn chunk_sliced(
     // 6. Causal attention over the valid prefix, as a copy-free view of the capacity buffers;
     // head h reads KV head h / (QH / KVH). The Q8 form runs the mlx-lm quantized attention over
     // the codes, scales, and biases - causal for a chunk of more than one row, and a one-row
-    // chunk is the decode case (packet KV8-INTEGRATE item 4).
+    // chunk is the decode case.
     let scale = 1.0 / (width as f32).sqrt();
     let blocks = query_block_ranges(rows, slice);
     let att = match cache.buffers.as_ref() {
@@ -169,7 +168,7 @@ pub(super) fn chunk_sliced(
                 scales: &v.scales,
                 biases: &v.biases,
             };
-            // R4-5: the fused flash kernel replaces the composite under the flag, inside
+            // The fused flash kernel replaces the composite under the flag, inside
             // its validated D envelope; the composite stays the default (and the D 64 form).
             let rep = heads / kv_heads;
             if flash_prefill_enabled()
@@ -207,9 +206,9 @@ pub(super) fn chunk_sliced(
     };
     // 7. Back to rows, sigmoid output gate, and output projection. The attention output is F32
     // over the F32 cache and follows the query dtype over the Q8 cache; the projection takes the
-    // activation dtype (packet Q36-BF16-b).
-    // The attn_gate fused kernel (R4-7, Q36_FUSED_PREFILL=1) replaces the
-    // transpose+sigmoid+mul chain in one kernel; the composite stays the default.
+    // activation dtype.
+    // The attn_gate fused kernel (Q36_FUSED_PREFILL=1) replaces the transpose+sigmoid+mul
+    // chain in one kernel; the composite stays the default.
     let o = if crate::family::qwen36::resident::prefill::delta::fused_prefill_enabled()
         && std::env::var_os("Q36_NO_ATTNGATE").is_none()
         && width == 256
@@ -387,7 +386,7 @@ mod tests {
         out
     }
 
-    /// The chunk step exactly as it was before packet Q36-KV-INTEGRATE (test-only): the cache is
+    /// The chunk step exactly as it was before the capacity buffers (test-only): the cache is
     /// `[1, KVH, len, D]` (see `attn::ConcatCache`) and every chunk rebuilds it with
     /// `concatenate`. The bit equality of this formulation and the capacity buffers proves that
     /// the new cache changes no numerics.
@@ -483,7 +482,7 @@ mod tests {
     /// Runs positions `warm..warm + count` as one chunk after `warm` decode steps and compares the
     /// outputs and the whole valid prefix with the host run over `warm + count` positions. The
     /// caches grow in quanta of 4, and `want_cap` is the exact hand-derived capacity after the
-    /// chunk (review B finding 4): round_up(warm + count, 4).
+    /// chunk: round_up(warm + count, 4).
     fn chunk_matches_the_host(warm: u32, count: u32, want_cap: usize) {
         let (ckpt, oracle, w, mut kernels) = setup();
         let shape = oracle.shape().clone();
@@ -516,7 +515,7 @@ mod tests {
         assert_eq!(next.cache.len, total, "cache length");
         assert_eq!(
             next.cache.cap, want_cap,
-            "the exact capacity after the chunk (review B finding 4)"
+            "the exact capacity after the chunk"
         );
         assert!(
             want_cap >= total,
@@ -578,7 +577,7 @@ mod tests {
         chunk_matches_the_host(5, 4, 12);
     }
 
-    /// Packet Q36-KV-INTEGRATE 6(b): a chunk of 5 rows that crosses a growth (the buffers hold 2
+    /// A chunk of 5 rows that crosses a growth (the buffers hold 2
     /// of 4 positions, the chunk needs 7, so they grow to 8), then decode steps that fill 8
     /// exactly and grow to 12. Every output is bit-equal to the old concatenate formulation and
     /// within the parity bounds of the host run.
@@ -850,7 +849,7 @@ mod tests {
         }
     }
 
-    /// Layer 1 of the four-layer tiny KV8 model (packet KV8-INTEGRATE): head dimension 64, the
+    /// Layer 1 of the four-layer tiny KV8 model: head dimension 64, the
     /// multiple of the Q8 group, so the Q8 form is available.
     fn setup_kv8() -> (StreamedCheckpoint, HostWeights, ResidentWeights, MlxKernels) {
         let ckpt = tiny::checkpoint(&tiny::TINY_KV8);
@@ -1060,7 +1059,7 @@ mod tests {
         );
     }
 
-    /// Packet KV8-INTEGRATE test (d), causality: in the Q8 chunk a row reads no later row. Two
+    /// Causality: in the Q8 chunk a row reads no later row. Two
     /// chunks of five rows after three cached positions have the same rows 0 to 2 and different
     /// rows 3 and 4. The masked keys get the probability 0 exactly and every other step of a
     /// row (projection, norm, RoPE, quantization of its own K and V, softmax, output
@@ -1098,7 +1097,7 @@ mod tests {
         );
     }
 
-    /// Packet KV8-INTEGRATE test (d), alignment: a Q8 chunk row sees EVERY cached position and
+    /// Alignment: a Q8 chunk row sees EVERY cached position and
     /// the chunk rows up to itself (the mask is aligned to the last key). Changing the input of
     /// cached position 1 changes the output of every chunk row, row 0 included: with a mask
     /// aligned to the first key, row 0 would see position 0 alone and ignore position 1.
@@ -1123,7 +1122,7 @@ mod tests {
         }
     }
 
-    /// Packet KV8-INTEGRATE test (d), agreement: the Q8 chunk of five rows after three cached
+    /// Agreement: the Q8 chunk of five rows after three cached
     /// positions and five Q8 decode steps from the same cache quantize the same rows, so they
     /// differ only by float reduction order and, rarely, by one code that a one-ulp change moves
     /// across a rounding boundary. Both paths must agree at least as well as the Q8 chunk agrees
@@ -1222,7 +1221,7 @@ mod tests {
             "evaluate adds one"
         );
     }
-    /// R4-5: the flash-prefill kernel at the Qwen3.6-35B-A3B production shape (QH 16, KVH 2,
+    /// The flash-prefill kernel at the Qwen3.6-35B-A3B production shape (QH 16, KVH 2,
     /// D 256, REP 8) matches an F32 reference at least as well as the composite prefix
     /// attention. One chunk of 16,389 rows (not a multiple of eight; q_offset 0; depth
     /// 16K+) over a synthetic Q8 cache. The reference is the attention over the

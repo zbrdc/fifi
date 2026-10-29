@@ -1,10 +1,10 @@
 //! Raw FFI to `inference_cuda_moe_combine_launch` of `native/resident/moe_combine.cu` (declared in
 //! `native/resident/moe_combine.h`). Child module of `native::resident`, so it inherits the
-//! `allow(unsafe_code)` of `native.rs` (decision 0047, child modules of `native.rs`).
+//! `allow(unsafe_code)` of `native.rs`.
 //!
 //! Safety invariants this file relies on:
 //! - The launch entry is called only through `CudaContext::launch_on`, on the thread that owns the
-//!   context and under the dispatch guard (decisions 0023 and 0024).
+//!   context and under the dispatch guard.
 //! - Every range is a `RawRange`, which `RawRange::new` proved inside its live allocation.
 //! - Shape, sizes, alignment and disjointness are proved again here (`super::Span` for the
 //!   overlaps), so a bad call is refused with `invalid_argument` and never reaches the device.

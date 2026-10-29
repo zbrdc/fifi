@@ -1,6 +1,6 @@
 /*
- * MATVEC-PAR S3a K2: the batched SwiGLU + q8_1 pack entry (native/resident/swiglu_q8.h, per-kernel
- * header of the layout in kernels/cuda/resident/mod.rs). Launch-only, like the other resident
+ * The batched SwiGLU + q8_1 pack entry (native/resident/swiglu_q8.h, per-kernel header of the
+ * layout in kernels/cuda/resident/mod.rs). Launch-only, like the other resident
  * headers: nothing here allocates, copies, synchronizes or memsets; a fault in queued work
  * surfaces at the next synchronize. abi_resident.h stays closed.
  */
@@ -14,13 +14,13 @@ extern "C" {
 #endif
 
 /* For each of `slots` expert-slot rows of `gu` (slot s at gu + s * y_slot_stride ELEMENTS, the
- * A2 [slot][gate|up] layout of the step's ExpertGu): q8 row s = the block_q8_1 quantization of
+ * [slot][gate|up] layout of the step's ExpertGu): q8 row s = the block_q8_1 quantization of
  * silu(gate) * up over the n_ff live values, with the vendored quantize_q8_1 block rule (per 32
  * values amax, d = amax/127, q = amax == 0 ? 0 : roundf(x/d), ds = half2(d, sum x) with the warp
  * butterfly sum) computed in IEEE arithmetic — this entry's translation unit is in the
  * warnings-into-errors group WITHOUT -use_fast_math, unlike the vendored quantize.cu object —
- * except silu itself, which keeps swiglu_pack_k's fast form x / (1 + __expf(-x)) (the E2 numerics
- * domain of the swiglu_pack doc; __expf stays by decision). Each q8 row is padded to
+ * except silu itself, which keeps swiglu_pack_k's fast form x / (1 + __expf(-x)) (the numerics
+ * domain of the swiglu_pack doc; __expf stays on purpose). Each q8 row is padded to
  * MATRIX_ROW_PADDING (512) values; the tail blocks past n_ff are written as zeros, so
  * q8 holds slots * pad(n_ff, 512)/32 blocks of 36 bytes back to back. ONE kernel, grid = slots,
  * 256 threads; gu is read only (no tail zeroing: the kernel never reads past n_ff of each half).

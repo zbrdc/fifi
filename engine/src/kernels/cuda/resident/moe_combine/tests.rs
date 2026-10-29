@@ -1,10 +1,10 @@
 //! Device tests (3090) of the MoE combine wrapper at seam 1, against `emu` (the sequence in plain
 //! f32, one operation per statement, which Rust never contracts) and `ref_f64` (the same f32
-//! inputs in f64). Inputs are RD-5-shaped, built here with `testkit::Rng`: no oracle data, no
-//! environment variable, no `#[ignore]`; the chain router, `matmul_expert`, combine is owed to
-//! RD-9c. Bound: class E3 of lane M (REPLY-71, final), per token row, never widened:
-//! `max |got - ref| <= 2^-17 * max(max |ref|, 1)`. Bit equality with `emu` is extra. Run with
-//! `--test-threads=1`.
+//! inputs in f64). Inputs are shaped like the router's output, built here with `testkit::Rng`:
+//! no oracle data, no environment variable, no `#[ignore]`; the chain router, `matmul_expert`,
+//! combine is tested with the MoE block of the decode step. Bound: class E3 (final), per token
+//! row, never widened: `max |got - ref| <= 2^-17 * max(max |ref|, 1)`. Bit equality with `emu`
+//! is extra. Run with `--test-threads=1`.
 
 use crate::EngError;
 use crate::kernels::cuda::context::{CudaContext, DeviceRange, DeviceStream};
@@ -78,7 +78,7 @@ fn gaussian(rng: &mut Rng, len: usize, sigma: f64) -> Vec<f32> {
     (0..len).map(|_| (rng.normal() * sigma) as f32).collect()
 }
 
-/// RD-5-shaped weights: softmax of `top_k` normals, descending.
+/// Router-shaped weights: softmax of `top_k` normals, descending.
 fn softmax_weights(rng: &mut Rng, top_k: usize) -> Vec<f32> {
     let mut logits: Vec<f64> = (0..top_k).map(|_| rng.normal()).collect();
     logits.sort_by(|a, b| b.total_cmp(a));
@@ -760,9 +760,9 @@ fn combine_rejects_bad_calls_before_any_launch() {
         .expect("the backend is usable after the refusals");
 }
 
-// ---------------------------------------------------------------- T6 (RD-11a)
+// ---------------------------------------------------------------- T6: graph capture
 
-/// The capture plan of the owed test: the rig owns every buffer, so no pin and no hold.
+/// The capture plan of the capture test: the rig owns every buffer, so no pin and no hold.
 fn no_pins() -> CapturePlan<'static> {
     CapturePlan {
         pins: &[],
@@ -770,10 +770,9 @@ fn no_pins() -> CapturePlan<'static> {
     }
 }
 
-/// T6 (RD-4e, owed): one captured `moe_combine` replayed three times with the weights and the
-/// shared gate rewritten between replays reads the new values every time: each replay equals
-/// the eager launch on those values byte for byte and the host sequence bit for bit, on a
-/// one-node graph.
+/// T6: one captured `moe_combine` replayed three times with the weights and the shared gate
+/// rewritten between replays reads the new values every time: each replay equals the eager
+/// launch on those values byte for byte and the host sequence bit for bit, on a one-node graph.
 #[test]
 fn combine_inside_a_capture_reads_the_new_values_between_replays() {
     let Some((ctx, stream)) = rig("combine_inside_a_capture_reads_the_new_values_between_replays")

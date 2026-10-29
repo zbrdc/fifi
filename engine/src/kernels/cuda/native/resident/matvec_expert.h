@@ -1,7 +1,7 @@
 /*
- * Launch entry of the vendored MMVQ expert matvec (MATVEC-PAR S1 c3c): one launch for the used
- * slots of an expert stack, the per-slot expert ids read on the DEVICE when the kernel runs,
- * through fifi_mmvq_launch of the V-MV1-trimmed mmvq.cu (ids path, the A1 range guard inside).
+ * Launch entry of the vendored MMVQ expert matvec: one launch for the used slots of an expert
+ * stack, the per-slot expert ids read on the DEVICE when the kernel runs, through
+ * fifi_mmvq_launch of the trimmed vendored mmvq.cu (ids path, the id range guard inside).
  * Launch-only: nothing here allocates, copies or synchronizes. Per-kernel header of the layout
  * in kernels/cuda/resident/mod.rs; abi_resident.h stays closed.
  */
@@ -21,9 +21,9 @@ typedef struct inference_cuda_matvec_expert_args {
     const void *x_q8; /* block_q8_1: one shared padded row (x_per_slot 0) or n_used rows */
     int x_per_slot;   /* 0: one shared vector (gate/up), 1: one per slot (down) */
     float *y;         /* f32 out [n_used][y_slot_stride], rows used per slot */
-    int y_slot_stride;/* elements between slots, >= rows (A2: the step's ExpertGu is [slot][gate|up]) */
+    int y_slot_stride;/* elements between slots, >= rows (the step's ExpertGu is [slot][gate|up]) */
     int k;            /* a multiple of the type's block size */
-    int rows;         /* a multiple of 4 (KUBDAN-MSG-64 item 4: the kernel reads whole row groups) */
+    int rows;         /* a multiple of 4 (the kernel reads whole row groups) */
     int n_expert;
     int n_used;       /* 1..8 */
 } inference_cuda_matvec_expert_args;
@@ -40,7 +40,7 @@ _Static_assert(sizeof(inference_cuda_matvec_expert_args) == 72 && offsetof(infer
  * y_slot_stride + rows) against expert ids[s]'s weights and x_q8 row (s if x_per_slot else 0).
  * The ids are read on the device at execution time, so a captured graph replay follows a
  * rewritten ids word; an id outside [0, n_expert) (the router writes -1 on a fault) makes the
- * kernel write the quiet NaN 0x7fc00000 to that slot's rows and read no weight (the V-MV1 A1
+ * kernel write the quiet NaN 0x7fc00000 to that slot's rows and read no weight (the id range
  * guard). Returns INFERENCE_CUDA_INVALID_ARGUMENT before any CUDA call for a bad argument,
  * else the launch status. */
 int inference_cuda_matvec_expert_launch(const inference_cuda_matvec_expert_args *args,

@@ -1,11 +1,10 @@
-//! Real-checkpoint oracle gates and the decode measurement of the resident path (packet C5;
-//! decision 0039 gates 3, 5, and 6; S1-C plan section 4).
+//! Real-checkpoint oracle gates and the decode measurement of the resident path.
 //!
 //! The three real-checkpoint tests are ignored. They need the Flash-Next artifact on the Mac, and
-//! the coordinator runs them through the resident-decode qualification harness. The teacher-forced and
-//! end-to-end tests reuse the frozen tolerances and the `Gate` of `flash_next/mlx.rs`. The decode
-//! test measures and writes its report; the runner applies the gate 5 and gate 6 rules. The other
-//! tests check the helpers and run in the normal Mac suite.
+//! they run through the resident-decode qualification harness. The teacher-forced and end-to-end
+//! tests reuse the frozen tolerances and the `Gate` of `flash_next/mlx.rs`. The decode test
+//! measures and writes its report; the runner applies the token-match and decode-run rules. The
+//! other tests check the helpers and run in the normal Mac suite.
 
 use super::super::hyper::HyperShape;
 use super::super::load::FlashWeights;
@@ -36,9 +35,9 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Instant;
 
-/// Generated tokens in the decode run (decision 0039 gates 5 and 6).
+/// Generated tokens in the decode run.
 const GENERATED: usize = 512;
-/// Host tokens compared with the resident tokens (decision 0039 gate 5).
+/// Host tokens compared with the resident tokens.
 const MATCH: usize = 32;
 /// Generated-token counts after which the decode test records the process RSS.
 const RSS_AT: [usize; 5] = [16, 128, 256, 384, 512];
@@ -128,7 +127,7 @@ fn syncs(kernels: &MlxKernels) -> Option<u64> {
 }
 
 /// Forced retire flushes (process total) and the peak retired bytes since the last reset, in
-/// qualification builds (S1-K1).
+/// qualification builds.
 fn retire_stats(kernels: &MlxKernels) -> Option<(u64, u64)> {
     #[cfg(feature = "native-fault-qualification")]
     {
@@ -227,7 +226,7 @@ fn host_greedy(logits: &[f32]) -> (u32, f32) {
     (best as u32, logits[best] - second)
 }
 
-/// `after - before`, element by element: the PLE update from the block's `hyper + update` (D7).
+/// `after - before`, element by element: the PLE update from the block's `hyper + update`.
 fn minus(after: &[f32], before: &[f32]) -> Vec<f32> {
     after.iter().zip(before).map(|(a, b)| a - b).collect()
 }
@@ -338,8 +337,8 @@ fn block_attention(
 
 /// One paged MoE step on an oracle `mixed` row: the input import, the router readback, and the
 /// output readback. The output readback evaluates the only consumer of the step's page set, so the
-/// set is released after it (decision 0041 release contract). After an error the step's graph is
-/// dropped unevaluated, so the release is safe as well.
+/// set is released after it (the release contract of the page pool). After an error the step's
+/// graph is dropped unevaluated, so the release is safe as well.
 fn block_moe(
     ctx: &mut Ctx<'_>,
     ckpt: &StreamedCheckpoint,
@@ -355,7 +354,7 @@ fn block_moe(
     result
 }
 
-/// The PLE block on an oracle `[C * H]` row. It returns the update (D7) and the new ring.
+/// The PLE block on an oracle `[C * H]` row. It returns the update and the new ring.
 fn block_ple(
     ctx: &mut Ctx<'_>,
     shape: &ModelShape,
@@ -819,7 +818,7 @@ fn resident_decode_reports_speed_memory_and_host_tokens() {
         join(&PROMPT)
     );
 
-    // Load and import (coordinator decision D9, steps 1 and 2).
+    // Load and import.
     let started = Instant::now();
     let flash = FlashWeights::load(&ckpt, &config).unwrap();
     let load_seconds = started.elapsed().as_secs_f64();
@@ -852,7 +851,7 @@ fn resident_decode_reports_speed_memory_and_host_tokens() {
         expert_bytes_per_token(&ckpt, &decoder.weights),
     ));
 
-    // Four `Prompt` steps, then 512 `Generate` steps (D9 step 3). Only `step` is timed.
+    // Four `Prompt` steps, then 512 `Generate` steps. Only `step` is timed.
     let mut resident: Vec<u32> = Vec::with_capacity(GENERATED);
     let mut next = 0;
     let copies_before = page_copies(&decoder.kernels);
@@ -917,7 +916,7 @@ fn resident_decode_reports_speed_memory_and_host_tokens() {
     ));
     std::fs::write(&report_path, &lines).unwrap();
 
-    // The host path on the same tokens (D9 steps 4 to 6). Two leases never coexist.
+    // The host path on the same tokens. Two leases never coexist.
     drop(state);
     drop(decoder);
     let flash = FlashWeights::load(&ckpt, &config).unwrap();
@@ -953,8 +952,8 @@ fn resident_decode_reports_speed_memory_and_host_tokens() {
 /// Generated tokens in the profile window.
 const PROFILE_TOKENS: usize = 64;
 
-/// Splits the resident decode time per generated token (speed profile P1). Qualification builds
-/// only: it reads the S1-K3 call timing, the S1-K1 retire counters, and the counted reader.
+/// Splits the resident decode time per generated token. Qualification builds only: it reads the
+/// call timing, the retire counters, and the counted reader.
 #[cfg(feature = "native-fault-qualification")]
 #[test]
 #[ignore = "needs the Flash-Next artifact on the Mac"]
@@ -1017,19 +1016,16 @@ fn resident_decode_profile() {
     );
     std::fs::write(&report_path, &lines).unwrap();
     assert_eq!(s1 - s0, 51 * PROFILE_TOKENS as u64, "{lines}");
-    assert_eq!(
-        copies, 0,
-        "decision 0041 gate 5: no page import takes the copy path"
-    );
+    assert_eq!(copies, 0, "no page import takes the copy path");
 }
 
-/// The C5 G5 resident tokens: the first 32 greedy tokens after `PROMPT` (decision 0039 gate 5).
+/// The reference resident tokens: the first 32 greedy tokens after `PROMPT`.
 const C5_TOKENS: [u32; MATCH] = [
     11751, 13, 11751, 369, 279, 6511, 314, 9338, 13, 271, 27775, 24660, 383, 279, 1414, 3294, 11,
     1092, 369, 279, 6511, 314, 9338, 30, 271, 248068, 198, 760, 1156, 369, 9859, 728,
 ];
 
-/// One prompt of the trace prompts file (S3 plan section 3.3).
+/// One prompt of the trace prompts file.
 struct TracePrompt {
     id: u32,
     tokens: Vec<u32>,
@@ -1105,8 +1101,8 @@ fn swap_usage() -> String {
         )
 }
 
-/// Stored bytes of one expert in each layer: one slice of `gate`, `up`, and `down` with scales
-/// and biases, from the checkpoint headers (decision 0038: no fixed expert size). No reads.
+/// Stored bytes of one expert in each layer: one slice of `gate`, `up`, and `down` with scales and
+/// biases, from the checkpoint headers (there is no fixed expert size). No reads.
 fn expert_bytes_per_layer(ckpt: &StreamedCheckpoint, weights: &ResidentWeights) -> Vec<usize> {
     let page = HostPages::page_size();
     weights
@@ -1126,18 +1122,18 @@ fn expert_bytes_per_layer(ckpt: &StreamedCheckpoint, weights: &ResidentWeights) 
         .collect()
 }
 
-/// Records the exact resident routing of every step of the prompts file (S3 plan section 3, T0)
-/// and checks T0-P1 on every step. Each prompt starts from a zero state; its prompt tokens run in
-/// `Prompt` mode except the last, which runs in `Generate` mode as in the decode test, and then
-/// `generate - 1` more greedy tokens follow. End of sequence does not stop a prompt.
+/// Records the exact resident routing of every step of the prompts file and checks the reference
+/// tokens on the way. Each prompt starts from a zero state; its prompt tokens run in `Prompt` mode
+/// except the last, which runs in `Generate` mode as in the decode test, and then `generate - 1`
+/// more greedy tokens follow. End of sequence does not stop a prompt.
 ///
 /// Environment: `FLASH_NEXT_ARTIFACT`, `FLASH_NEXT_CACHE_LIMIT`, `FLASH_NEXT_TRACE_PROMPTS` (the
 /// prompts file), `FLASH_NEXT_TRACE_DIR` (output directory, outside Git), optional
-/// `FLASH_NEXT_TRACE_ONLY` (comma-separated prompt ids), optional `FLASH_NEXT_TRACE_FULL=1`
-/// (also writes `probs.bin`, little-endian F32 `[rows, experts]` in trace row order), and optional
+/// `FLASH_NEXT_TRACE_ONLY` (comma-separated prompt ids), optional `FLASH_NEXT_TRACE_FULL=1` (also
+/// writes `probs.bin`, little-endian F32 `[rows, experts]` in trace row order), and optional
 /// `FLASH_NEXT_ARTIFACT_MANIFEST` (a manifest file of the artifact, for example its `SHA256SUMS`;
 /// the header records its SHA-256 as `artifact_manifest_sha256`, or `unset` without it, and the
-/// coordinator then fills the value from the `SHA256SUMS` of the artifact).
+/// value can then be filled from the `SHA256SUMS` of the artifact).
 #[test]
 #[ignore = "needs the Flash-Next artifact on the Mac"]
 fn resident_route_trace() {
@@ -1165,13 +1161,13 @@ fn resident_route_trace() {
         .filter(|p| only.as_ref().is_none_or(|ids| ids.contains(&p.id)))
         .collect();
     assert!(!prompts.is_empty(), "no prompt selected");
-    // T0-P1 compares the C5 prompt with the C5 G5 tokens, so a full run must contain it.
+    // The reference check compares `PROMPT` with `C5_TOKENS`, so a full run must contain it.
     assert!(
         only.is_some()
             || prompts
                 .iter()
                 .any(|p| p.tokens == PROMPT && p.generate >= MATCH),
-        "the prompts file has no C5 prompt with at least {MATCH} generated tokens"
+        "the prompts file has no `PROMPT` entry with at least {MATCH} generated tokens"
     );
     std::fs::create_dir_all(&out_dir).unwrap();
     let index = std::fs::read(artifact.join("model.safetensors.index.json")).unwrap();
@@ -1304,9 +1300,9 @@ fn resident_route_trace() {
                 let token = out.token.expect("a generated step returns a token");
                 generated.push(token);
                 next = token;
-                // T0-P1: the C5 prompt repeats the C5 G5 tokens. Checked as soon as they exist.
+                // `PROMPT` repeats `C5_TOKENS`. Checked as soon as they exist.
                 if is_c5 && generated.len() == MATCH {
-                    assert_eq!(generated, C5_TOKENS, "the first 32 C5 tokens");
+                    assert_eq!(generated, C5_TOKENS, "the first 32 reference tokens");
                     meta.push_str("c5_tokens_match=true\n");
                 }
             }

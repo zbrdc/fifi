@@ -126,7 +126,7 @@ fn widen_tensor(tensor: &Tensor) -> Result<Tensor, EngError> {
 
 /// Returns `weight` with its scales and biases stored as F32. The payload tensor is shared.
 ///
-/// This is the default storage of decision 0046 (lever Q36-G0): MLX casts BF16 scales and
+/// This is the default storage: MLX casts BF16 scales and
 /// biases to the F32 of the activation on every call of `qmm` and `gather_qmm`, and an F32
 /// operand skips the cast. The values are the same, so the products do not change. Only affine
 /// weights with BF16 scales and biases are accepted; others return `BadRequest`.

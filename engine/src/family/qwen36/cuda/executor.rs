@@ -1,10 +1,10 @@
-//! The `ExecutorOps` adapter of the resident Qwen3.6 step (decision 0033, packet RD-9d).
+//! The `ExecutorOps` adapter of the resident Qwen3.6 step.
 //!
 //! `QwenResidentStep` is the adapter itself, not a new trait. It is the model side of the shared
-//! decode session (`family/session.rs`, packet Q36-F1): it implements [`TokenStepper`], and the
-//! session type is the shared [`DecodeSession`], which owns the committed tokens, the pending
-//! token, the finish flag, EOS, the output limit, the context limit and cancellation. This file
-//! holds no finish rule of its own. The device state lives in the step.
+//! decode session (`family/session.rs`): it implements [`TokenStepper`], and the session type is
+//! the shared [`DecodeSession`], which owns the committed tokens, the pending token, the finish
+//! flag, EOS, the output limit, the context limit and cancellation. This file holds no finish rule
+//! of its own. The device state lives in the step.
 //!
 //! The call order and behaviour are those of the Flash-Next and Q36 executors: `reset`,
 //! `boundary`, `prefill` for each chunk, then `decode` until a finish. A prompt feeds every token
@@ -21,10 +21,10 @@
 //! `Projector` stays the parity oracle for `linear` and `expert_linear`, and `rows` keeps
 //! returning `BadRequest`: nothing here touches either.
 //!
-//! Prefix reuse (decision 0036, addendum 1) adds no rule of its own: the two methods below are
-//! the same glue as the Mac arm, and the shared session rules decide everything. What differs is
-//! the state value. The CUDA export COPIES slot 0 and the first `tokens` KV rows to host bytes
-//! and the restore copies them back into the same buffers (the base decision's item 5).
+//! Prefix reuse adds no rule of its own: the two methods below are the same glue as the Mac arm,
+//! and the shared session rules decide everything. What differs is the state value. The CUDA export
+//! COPIES slot 0 and the first `tokens` KV rows to host bytes and the restore copies them back into
+//! the same buffers.
 //! These copies preserve saved bytes, but chunk partitioning can change after a restore.
 //! Comparisons against cold chunked prefill use numerical tolerances, not bitwise equality.
 //! A tiered step never saves: its numbers follow
@@ -52,11 +52,10 @@ use std::time::Instant;
 
 type Result<T> = std::result::Result<T, EngError>;
 
-/// The prefill arm `feed_rows` takes for one chunk-gate verdict. THE ONE SWITCH of the chunk
-/// path (plan §C.4): until the chunk driver lands with CPF-7a, every verdict — each refusal
-/// and the accept — maps to the per-token arm, so no session's behaviour changes. CPF-7a's
-/// integration commit adds the `Chunked` arm (the `m_sess` cap of the accept verdict) and the
-/// driver call in `feed_rows`; the exhaustive match there is what makes the switch one call.
+/// The prefill arm `feed_rows` takes for one chunk-gate verdict. THE ONE SWITCH of the chunk path:
+/// every refusal maps to the per-token arm, and the accept maps to the `Chunked` arm (the `m_sess`
+/// cap of the accept verdict) and the driver call in `feed_rows`; the exhaustive match there is
+/// what makes the switch one call.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum ChunkPath {
     /// One token per step: the default `TokenStepper::feed_rows` loop's own arm.
@@ -65,8 +64,8 @@ pub(super) enum ChunkPath {
     Chunked { m_sess: usize },
 }
 
-/// The prefill path of one chunk-gate verdict: every verdict keeps the per-token loop until
-/// the chunk driver lands with CPF-7a (decision 0049; see `ChunkPath`).
+/// The prefill path of one chunk-gate verdict: the accept takes the chunk driver at its admitted
+/// `m_sess`, and every refusal keeps the per-token loop (see `ChunkPath`).
 pub(super) fn chunk_path_of(verdict: &ChunkVerdict) -> ChunkPath {
     match verdict {
         ChunkVerdict::Ready { m_sess } => ChunkPath::Chunked { m_sess: *m_sess },
@@ -97,11 +96,10 @@ impl TokenStepper for QwenResidentStep<'_> {
         self.run_token(token, false).map(|_| ())
     }
 
-    /// Feeds `tokens` in order as prompt rows, routed through the chunk gate (plan §C.4; the
-    /// Flash-Next precedent). Until the chunk driver lands with CPF-7a every verdict takes the
-    /// per-token arm — the default loop's own body — so every session behaves exactly as the
-    /// default `TokenStepper::feed_rows`; when it lands, `chunk_path_of` is the one call that
-    /// flips the accept verdict to the chunk arm.
+    /// Feeds `tokens` in order as prompt rows, routed through the chunk gate, as in the Flash-Next
+    /// executor. A refusal takes the per-token arm — the default loop's own body — so the session
+    /// behaves exactly as the default `TokenStepper::feed_rows`; `chunk_path_of` is the one call
+    /// that sends the accept verdict to the chunk arm.
     fn feed_rows(&mut self, tokens: &[u32]) -> Result<()> {
         let verdict = self.chunk_ready();
         self.note_feed_rows(&verdict, tokens.len());
@@ -226,11 +224,10 @@ impl ExecutorOps for QwenResidentStep<'_> {
     /// No transient routing or draft state exists: the step keeps nothing between turns.
     fn boundary(&mut self, _st: &mut DecodeSession) {}
 
-    /// Exports committed state into the bounded prefix store (decision 0036). Pinned CUDA
-    /// stages Block and Tip entries; the admitted limits determine how many entries remain.
-    /// The caller supplies `kind`, and the session rules validate the save point. A tiered
-    /// step cannot save: its numbers follow the bank state, so a restored turn would not
-    /// match a cold one bitwise.
+    /// Exports committed state into the bounded prefix store. Pinned CUDA stages Block and Tip
+    /// entries; the admitted limits determine how many entries remain. The caller supplies `kind`,
+    /// and the session rules validate the save point. A tiered step cannot save: its numbers follow
+    /// the bank state, so a restored turn would not match a cold one bitwise.
     fn save_prefix(&mut self, st: &DecodeSession, key: &[u32], kind: SaveKind) -> Result<bool> {
         if self.is_tiered() || self.prefix.limits().entries == 0 {
             return Ok(false);
@@ -293,10 +290,10 @@ impl ExecutorOps for QwenResidentStep<'_> {
 
 impl QwenResidentStep<'_> {
     /// The prefill path every entry of this step is saved and restored under: the one value a
-    /// `CudaPrefillPath` holds today, from one place, so a second variant (chunked prefill,
-    /// decision 0049) changes only this body — exactly like the Mac glue.
+    /// `CudaPrefillPath` holds today, from one place, so a second variant (chunked prefill) changes
+    /// only this body — exactly like the Mac glue.
     /// Writes the one prefill line of a job, once: the first decode after the prefill, or
-    /// the next reset when no decode ran (plan CPF-7b-C B.8, OQ-13).
+    /// the next reset when no decode ran.
     fn log_prefill_job(&mut self) {
         // A session that has not fed a row yet has nothing to report: an empty line at the
         // first reset would name no path and no pieces.
@@ -312,11 +309,11 @@ impl QwenResidentStep<'_> {
         CudaPrefillPath::Steps(self.state_layout().kv.mode)
     }
 
-    /// One stderr line per saved or restored entry; the G3 turn gate parses the copy times. The
-    /// save or restore it reports has already completed, so the line cannot fail the call: a
-    /// charge that cannot be computed is named in the line instead. The line's `positions` is
-    /// the entry's COMMITTED row count, `key.len() - 1` (the pending token is not a row), while
-    /// the request log's `reused_tokens` is `key.len()`: G3's parser adds one to this line's
+    /// One stderr line per saved or restored entry; the turn gate's log parser reads the copy
+    /// times. The save or restore it reports has already completed, so the line cannot fail the
+    /// call: a charge that cannot be computed is named in the line instead. The line's `positions`
+    /// is the entry's COMMITTED row count, `key.len() - 1` (the pending token is not a row), while
+    /// the request log's `reused_tokens` is `key.len()`: that parser adds one to this line's
     /// `positions` to get the reused count.
     fn log_prefix(&self, what: &str, began: Instant) {
         let positions = self.tokens();

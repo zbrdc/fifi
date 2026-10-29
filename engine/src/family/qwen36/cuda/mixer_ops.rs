@@ -1,5 +1,5 @@
-//! The launches of one mixer block as DATA (packets RD-9b3a, RD-9b3b): an ordered list of
-//! [`BlockOp`] that `Mixers::run_block` executes one by one. Pure host code.
+//! The launches of one mixer block as DATA: an ordered list of [`BlockOp`] that `Mixers::run_block`
+//! executes one by one. Pure host code.
 //!
 //! The list is the single source of what a block does: the order of the launches, every plan slot
 //! each launch reads and writes, the weight roles it names, the `StepParams` words it takes and
@@ -30,8 +30,8 @@ const F32: usize = size_of::<f32>();
 /// One launch of a block.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum BlockOp {
-    /// RD-4a: `resid += delta` (when given), then `xf = pack(RMSNorm(resid) * weight)` and, when
-    /// asked, the f32 normalized row.
+    /// `resid += delta` (when given), then `xf = pack(RMSNorm(resid) * weight)` and, when asked,
+    /// the f32 normalized row.
     NormPack {
         phase: Phase,
         weight: Role,
@@ -39,11 +39,11 @@ pub(super) enum BlockOp {
         xf: Slot,
         norm_out: Option<Slot>,
     },
-    /// The NATIVE twin of [`BlockOp::NormPack`] (MATVEC-PAR S3b): the same fused add and norm
-    /// through `add_rmsnorm_q8`, writing the padded q8_1 row `q8` (the matvec input) beside the
-    /// f32 normalized row `norm_out` — the S3a producer always writes both, so every `NormQ8`
-    /// names `NormRow` (the router's input at the epilogue, dead scratch at the prologue and the
-    /// final norm, which is why the NATIVE plan holds `NormRow` live across the whole layer).
+    /// The NATIVE twin of [`BlockOp::NormPack`]: the same fused add and norm through
+    /// `add_rmsnorm_q8`, writing the padded q8_1 row `q8` (the matvec input) beside the f32
+    /// normalized row `norm_out` — the producer always writes both, so every `NormQ8` names
+    /// `NormRow` (the router's input at the epilogue, dead scratch at the prologue and the final
+    /// norm, which is why the NATIVE plan holds `NormRow` live across the whole layer).
     NormQ8 {
         phase: Phase,
         weight: Role,
@@ -59,9 +59,9 @@ pub(super) enum BlockOp {
         y: Slot,
         col: usize,
     },
-    /// The NATIVE twin of [`BlockOp::Project`] (MATVEC-PAR S3b): one `matvec_q` launch against
-    /// the native blocks of `role`, reading the padded q8_1 row `x_q8` and writing `rows` f32
-    /// values at column `col` of `y`'s row (one row only, the matvec's `y[j * rows + r]`).
+    /// The NATIVE twin of [`BlockOp::Project`]: one `matvec_q` launch against the native blocks of
+    /// `role`, reading the padded q8_1 row `x_q8` and writing `rows` f32 values at column `col` of
+    /// `y`'s row (one row only, the matvec's `y[j * rows + r]`).
     ProjectQ {
         phase: Phase,
         role: Role,
@@ -86,21 +86,21 @@ pub(super) enum BlockOp {
         xf: Slot,
         k: usize,
     },
-    /// The NATIVE twin of [`BlockOp::Pack`] (MATVEC-PAR S3b): the q8_1 quantize of the f32 row
-    /// `x` (`k` values) into the padded row `q8`.
+    /// The NATIVE twin of [`BlockOp::Pack`]: the q8_1 quantize of the f32 row `x` (`k` values) into
+    /// the padded row `q8`.
     QuantizeQ8 {
         phase: Phase,
         x: Slot,
         q8: Slot,
         k: usize,
     },
-    /// RD-7a causal conv: the qkv columns of `proj` -> `out`, with the conv weights `weights`.
+    /// Causal conv: the qkv columns of `proj` -> `out`, with the conv weights `weights`.
     Conv {
         proj: Slot,
         out: Slot,
         weights: Role,
     },
-    /// RD-7b gated delta rule: `conv` and the z, beta, alpha columns of `proj` -> `out`.
+    /// Gated delta rule: `conv` and the z, beta, alpha columns of `proj` -> `out`.
     Delta {
         conv: Slot,
         proj: Slot,
@@ -109,8 +109,8 @@ pub(super) enum BlockOp {
         dt_bias: Role,
         norm: Role,
     },
-    /// RD-8a: `proj` -> `q`, and the K and V rows into the cache at the `pos` word; a refused
-    /// position ORs mask 4 into the `status` word.
+    /// Attention prep: `proj` -> `q`, and the K and V rows into the cache at the `pos` word; a
+    /// refused position ORs mask 4 into the `status` word.
     AttnPrep {
         proj: Slot,
         q: Slot,
@@ -119,8 +119,8 @@ pub(super) enum BlockOp {
         pos: StepField,
         status: StepField,
     },
-    /// RD-8b: `q`, the gate columns of `proj` and the cache (up to the `kv_len` word) -> `part`
-    /// partials -> `out`.
+    /// Decode attention: `q`, the gate columns of `proj` and the cache (up to the `kv_len` word) ->
+    /// `part` partials -> `out`.
     AttnDecode {
         q: Slot,
         proj: Slot,
@@ -128,10 +128,10 @@ pub(super) enum BlockOp {
         out: Slot,
         kv_len: StepField,
     },
-    /// The Int8G32 twin of [`BlockOp::AttnPrep`] (KV8-B B3): the same per-head RMSNorm and
-    /// rope through the rows entry of `attn_prep`, but the post-rope k and the unchanged v go
-    /// to the f32 rows slots `k_rows`/`v_rows` (indexed by the token) and no fp16 cache byte is
-    /// written; a refused position ORs mask 4 into the `status` word.
+    /// The Int8G32 twin of [`BlockOp::AttnPrep`]: the same per-head RMSNorm and rope through the
+    /// rows entry of `attn_prep`, but the post-rope k and the unchanged v go to the f32 rows slots
+    /// `k_rows`/`v_rows` (indexed by the token) and no fp16 cache byte is written; a refused
+    /// position ORs mask 4 into the `status` word.
     AttnPrepRows {
         proj: Slot,
         q: Slot,
@@ -142,9 +142,9 @@ pub(super) enum BlockOp {
         pos: StepField,
         status: StepField,
     },
-    /// RD-8k: the KV8 append of the Int8G32 step (KV8-B B3): the f32 `k`/`v` rows of the prep
-    /// op, quantized into the four code and scale `planes` of this layer's KV pool at cells
-    /// `*pos ..`; a refused position ORs mask 4 into the `status` word.
+    /// The KV8 append of the Int8G32 step: the f32 `k`/`v` rows of the prep op, quantized into the
+    /// four code and scale `planes` of this layer's KV pool at cells `*pos ..`; a refused position
+    /// ORs mask 4 into the `status` word.
     Kv8Append {
         k: Slot,
         v: Slot,
@@ -155,9 +155,9 @@ pub(super) enum BlockOp {
         pos: StepField,
         status: StepField,
     },
-    /// RD-8l: the KV8 split-KV decode attention (KV8-B B3): `q`, the gate columns of `proj` and
-    /// the code and scale `planes` (up to the `kv_len` word) -> `part` partials -> `out`, at the
-    /// `split` the plan sized the partials with (Q8).
+    /// The KV8 split-KV decode attention: `q`, the gate columns of `proj` and the code and scale
+    /// `planes` (up to the `kv_len` word) -> `part` partials -> `out`, at the `split` the plan
+    /// sized the partials with (Q8).
     AttnDecodeQ8 {
         q: Slot,
         proj: Slot,
@@ -240,12 +240,12 @@ impl BlockOp {
     }
 }
 
-/// The byte offset of column `col` inside a fused f32 row, checked for every `ProjectQ` pair of
-/// the geometry at block construction (a typed refusal here, never a launch-time wrapper error
-/// inside a token): `col * 4` must not overflow and `rows` must fit the fused row's rest. The
-/// 4-byte alignment arm was DELETED (MSG-74 item 3): `col * 4` is a multiple of 4 for every
-/// integer `col`, the arm was unreachable and its test line a tautology; the wrapper's own
-/// alignment check on the (always 4-aligned, because 256-byte arena offsets) slot remains.
+/// The byte offset of column `col` inside a fused f32 row, checked for every `ProjectQ` pair of the
+/// geometry at block construction (a typed refusal here, never a launch-time wrapper error inside a
+/// token): `col * 4` must not overflow and `rows` must fit the fused row's rest. There is no 4-byte
+/// alignment arm: `col * 4` is a multiple of 4 for every integer `col`, so such an arm could never
+/// fire; the wrapper's own alignment check on the (always 4-aligned, because 256-byte arena
+/// offsets) slot remains.
 pub(super) fn check_native_column(
     role: Role,
     col: usize,
@@ -266,7 +266,7 @@ pub(super) fn check_native_column(
 }
 
 /// The projection twin of one fused-row launch (one role, one column): `Project` against the
-/// fp16 pack `xf` or `ProjectQ` against the padded q8_1 row `x_q8` (MATVEC-PAR S3b).
+/// fp16 pack `xf` or `ProjectQ` against the padded q8_1 row `x_q8`.
 /// The input tuple holds the FP16, Q8 and original F32 views of the same activation.
 fn project_op(
     phase: Phase,
@@ -302,7 +302,7 @@ fn project_op(
 }
 
 /// The pack twin of one core-output launch: `Pack` into the fp16 `xf` or `QuantizeQ8` into the
-/// padded q8_1 row `q8` (MATVEC-PAR S3b).
+/// padded q8_1 row `q8`.
 fn pack_op(
     phase: Phase,
     x: Slot,
@@ -443,10 +443,10 @@ fn attn_ops(g: &MixerGeometry, layout: WeightLayout, kv_mode: KvMode) -> Vec<Blo
             layout,
         )
     };
-    // The KV core of the mode (KV8-B B3): the fp16 pair writes the cache rows inside prep and
-    // decodes over the fp16 planes; the Int8G32 list hands f32 rows from the rows entry of
-    // `attn_prep` to `kv8_append`, which quantizes them into the code and scale planes the q8
-    // decode then reads (at the Q8 split, whose min_keys is a multiple of the 64-cell tile).
+    // The KV core of the mode: the fp16 pair writes the cache rows inside prep and decodes over the
+    // fp16 planes; the Int8G32 list hands f32 rows from the rows entry of `attn_prep` to
+    // `kv8_append`, which quantizes them into the code and scale planes the q8 decode then reads
+    // (at the Q8 split, whose min_keys is a multiple of the 64-cell tile).
     let core = match kv_mode {
         KvMode::Fp16 => vec![
             BlockOp::AttnPrep {
@@ -555,20 +555,20 @@ fn native_columns(
 }
 
 /// The launches of one block for a layer of `kind`, in queue order. With `Tiled` the list is
-/// byte-identical to the a4ca4075 lists (pinned by the literal fixture test); with `Native` the
-/// `NormPack`/`Project`/`Pack` triples become `NormQ8`/`ProjectQ`/`QuantizeQ8` and the fused-row
-/// column offsets are checked first (`check_native_column`), so a bad offset is a typed refusal
-/// here at construction, never a launch-time wrapper error inside a token. Under `Int8G32`
-/// (Native only, `check_layout_rows`) the attention core becomes the KV8 pair of B3 (the rows
-/// entry, the append, the q8 decode).
+/// byte-identical to the earlier Tiled lists (pinned by the literal fixture test); with `Native`
+/// the `NormPack`/`Project`/`Pack` triples become `NormQ8`/`ProjectQ`/`QuantizeQ8` and the
+/// fused-row column offsets are checked first (`check_native_column`), so a bad offset is a typed
+/// refusal here at construction, never a launch-time wrapper error inside a token. Under `Int8G32`
+/// (Native only, `check_layout_rows`) the attention core becomes the KV8 path (the rows entry, the
+/// append, the q8 decode).
 pub(super) fn block_ops(
     kind: AttentionKind,
     g: &MixerGeometry,
     layout: WeightLayout,
     kv_mode: KvMode,
 ) -> Result<Vec<BlockOp>, EngError> {
-    // The loader fuses only Native weights, so the op list must make the SAME decision -
-    // fusion on another layout would plan a wide qkv the weights cannot satisfy (review F4).
+    // The loader fuses only Native weights, so the op list must make the SAME decision - fusion on
+    // another layout would plan a wide qkv the weights cannot satisfy.
     let fuse_inproj =
         crate::family::project::cuda::gdn_fuse_inproj() && layout == WeightLayout::Native;
     block_ops_with(fuse_inproj, kind, g, layout, kv_mode)
@@ -598,9 +598,9 @@ pub(super) fn block_ops_with(
     match kind {
         AttentionKind::DeltaNet => ops.extend(delta_ops(g, layout, fuse_inproj)),
         AttentionKind::Full => {
-            // The plan owns the refusal (`check_layout_rows`); the builder states it too
-            // (B2/B3 review item 4): the Int8G32 core's `KRows`/`VRows` slots exist in Native
-            // plans only, so a Tiled Int8G32 list could never be planned.
+            // The plan owns the refusal (`check_layout_rows`); the builder states it too: the
+            // Int8G32 core's `KRows`/`VRows` slots exist in Native plans only, so a Tiled Int8G32
+            // list could never be planned.
             if kv_mode == KvMode::Int8G32 && layout == WeightLayout::Tiled {
                 return Err(EngError::BadRequest(
                     "step ops: the Int8G32 KV mode takes the native layout; Tiled is the fp16 \

@@ -1,4 +1,4 @@
-//! Device-memory admission for the CUDA loader (decision 0040 item 5).
+//! Device-memory admission for the CUDA loader.
 //!
 //! Pure arithmetic over byte counts: nothing here calls CUDA, so the admission
 //! test also runs on hosts without a driver. The loader computes the device
@@ -91,7 +91,7 @@ const fn native_block(ty: GgufType) -> Option<(u64, u64)> {
     }
 }
 
-/// Device bytes of the tensor `name` after a native upload (MATVEC-PAR S2): the file's own
+/// Device bytes of the tensor `name` after a native upload: the file's own
 /// blocks, row-major, exactly the source bytes. Q4_K, Q5_0, Q6_K and Q8_0 only. There is no
 /// 8-row rule and no tile-column rule: any row count from one up loads, and `dims[0]` must be
 /// a positive multiple of the type's block size up to `MAX_COLS`. The count differs from the

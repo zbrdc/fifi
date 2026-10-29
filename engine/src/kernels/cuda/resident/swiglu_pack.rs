@@ -1,7 +1,7 @@
-//! Safe launch wrapper of the SwiGLU + fp16 pack of one expert (RD-4b, decision 0047, seam 1):
-//! from the f32 gate and up rows `gu` the fp16 matmul input `xf = fp16(silu(gate) * up)`, in the
-//! layout [`CudaContext::pack`] writes (fragment order for `m <= 16`, row-major above), with an
-//! optional padded width `k_pad >= n_ff` whose tail is exactly zero (MEL-A1, MEL-C1b).
+//! Safe launch wrapper of the SwiGLU + fp16 pack of one expert: from the f32 gate and up rows `gu`
+//! the fp16 matmul input `xf = fp16(silu(gate) * up)`, in the layout [`CudaContext::pack`] writes
+//! (fragment order for `m <= 16`, row-major above), with an optional padded width `k_pad >= n_ff`
+//! whose tail is exactly zero.
 //!
 //! [`CudaContext::swiglu_pack`] and [`CudaContext::swiglu_pack_padded`] queue their work on a
 //! [`DeviceStream`] and return. They allocate nothing, copy nothing and never synchronize; a fault
@@ -9,29 +9,29 @@
 //! there. The caller owns the order: `gu` must hold its data before the call, and `xf` is read by
 //! the matmul queued behind it.
 //!
-//! What a call queues, in order: for `n_ff < k_pad` two 2-D memsets that zero columns
-//! `n_ff..k_pad` of both halves of every row of `gu`; then the kernel (with `n_ff = k_pad`, so
-//! `silu(0) * 0 = +0` fills the tail of `xf`, and with the zero tail entry of a fragment-order
-//! `xf` written by the kernel itself, MEMSET-TRIM).
+//! What a call queues, in order: for `n_ff < k_pad` two 2-D memsets that zero columns `n_ff..k_pad`
+//! of both halves of every row of `gu`; then the kernel (with `n_ff = k_pad`, so `silu(0) * 0 = +0`
+//! fills the tail of `xf`, and with the zero tail entry of a fragment-order `xf` written by the
+//! kernel itself).
 //!
 //! Layout of `gu`: f32 `[m][2 * k_pad]`, 4-byte aligned. Row `t` holds the gate in columns
 //! `0..k_pad` (live `0..n_ff`) and the up values in columns `k_pad..2 * k_pad` (live
 //! `k_pad..k_pad + n_ff`). For `m = 1` the gate and up matmuls write the two halves as two
-//! `MatmulIo.y` ranges of one buffer; `m > 1` is a capability of this entry that stage 1 does not
-//! call (the matmul wrapper writes `ldy = rows`). **The call overwrites the tails of `gu` with
-//! zeros**; the live columns are only read.
+//! `MatmulIo.y` ranges of one buffer; `m > 1` is a capability of this entry that the resident step
+//! does not call (the matmul wrapper writes `ldy = rows`). **The call overwrites the tails of `gu`
+//! with zeros**; the live columns are only read.
 //!
 //! `xf` is `native::xf_bytes(m, k_pad)` bytes (1,048,592 for `m <= 16`), 16-byte aligned; for
 //! `m <= 16` the kernel writes the data lanes of the `m` rows and the zero tail entry the padding
-//! lanes read, and the bytes no consumer reads are left untouched (MEMSET-TRIM); above 16 rows it
-//! is written in full. `gu` and `xf` must not overlap.
+//! lanes read, and the bytes no consumer reads are left untouched; above 16 rows it is written in
+//! full. `gu` and `xf` must not overlap.
 //!
-//! Numerics (lane M REPLY-44 class E2, REPLY-73): the fp16 result equals the round to nearest even
-//! of the float64 `silu(gate) * up`, or the adjacent value when the reference lies within 2^-20
-//! (relative) of the rounding midpoint. The kernel uses the fast `__expf`; the statement is a
-//! measured domain, not an analytic bound: any finite `up` for `|gate| <= 12`, and `up` of sd up
-//! to 100 for `12 < |gate| <= 219`. The 15 E2 misses at `up` sd 10^4 in `|gate|` [-30, -12]
-//! (expf probe, rev 3 evidence) are recorded as the measured edge of the domain, not tuned away.
+//! Numerics: the fp16 result equals the round to nearest even of the float64 `silu(gate) * up`, or
+//! the adjacent value when the reference lies within 2^-20 (relative) of the rounding midpoint. The
+//! kernel uses the fast `__expf`; the statement is a measured domain, not an analytic bound: any
+//! finite `up` for `|gate| <= 12`, and `up` of sd up to 100 for `12 < |gate| <= 219`. The 15 misses
+//! at `up` sd 10^4 in `|gate|` [-30, -12] (found by an expf probe) are recorded as the measured
+//! edge of the domain, not tuned away.
 //!
 //! Every argument is checked here, before any native call: shape rules carry the tag
 //! `swiglu_pack: <rule>`; sizes and alignment come from `require_fit` and overlap from
@@ -39,7 +39,7 @@
 //! answers the latch error (`launch_on` checks the terminal flag itself).
 #![cfg_attr(
     not(test),
-    expect(dead_code, reason = "staged for RD-9a (decision 0047)")
+    expect(dead_code, reason = "staged for the resident decode step")
 )]
 
 use std::ffi::c_int;

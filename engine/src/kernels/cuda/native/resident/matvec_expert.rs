@@ -1,6 +1,6 @@
 //! Raw FFI to `inference_cuda_matvec_expert_launch` of `native/resident/matvec_expert.cu`
 //! (declared in `native/resident/matvec_expert.h`). Child of `native::resident`, so it inherits
-//! the `allow(unsafe_code)` of `native.rs` (decision 0047, child modules of `native.rs`).
+//! the `allow(unsafe_code)` of `native.rs`.
 //!
 //! Safety invariants this module relies on:
 //! - A device range is proved in bounds by `RawRange::new` before it gets here. This module
@@ -10,13 +10,12 @@
 //!   aligned, and that `y`, which the kernel writes, shares no byte with `w_stack`, `x_q8` or
 //!   `ids`. The C entry repeats these checks on the addresses.
 //! - The ids are read by the kernel when it runs; an id outside `[0, n_expert)` writes the quiet
-//!   NaN to that slot's rows and reads no weight (the V-MV1 A1 guard).
+//!   NaN to that slot's rows and reads no weight (the id range guard).
 //! - The launch entry only queues work on the stream it is given and returns the launch status;
 //!   a fault in the kernel surfaces at the next synchronize.
 //! - The allocations stay valid until the queued launch finishes because `inference_cuda_free`
 //!   synchronizes the whole device before `cudaFree`.
-//! - Every call runs under the process dispatch guard and on the thread that owns the context
-//!   (decisions 0023 and 0024).
+//! - Every call runs under the process dispatch guard and on the thread that owns the context.
 //! - No raw pointer and no unsafe function leaves this module.
 
 use std::ffi::{c_int, c_void};
@@ -184,7 +183,7 @@ mod tests {
 
     /// The ranges of an expert matvec inside one unbacked allocation (numbers only): Q4_K, k 768
     /// (three blocks, padded to 1024), 16 experts of 64 rows, 8 used slots, a y stride of 128 (the
-    /// A2 [slot][gate|up] layout) and one shared activation row.
+    /// [slot][gate|up] layout) and one shared activation row.
     #[derive(Clone, Copy)]
     struct Layout {
         w_stack: (usize, usize),
@@ -236,9 +235,9 @@ mod tests {
         })
     }
 
-    /// Host only (KUBDAN-MSG-64 items 6 and 10): the native check against the ranges of an unbacked
-    /// allocation. The valid layout passes; each case changes one thing and is refused, among them
-    /// the A2 footprint of `y` and the checked `rows * n_expert`.
+    /// Host only: the native check against the ranges of an unbacked allocation. The valid
+    /// layout passes; each case changes one thing and is refused, among them the strided
+    /// footprint of `y` and the checked `rows * n_expert`.
     #[test]
     fn check_expert_refuses_short_unpadded_misaligned_and_overlapping_ranges() {
         let device = RawDevice::unbacked(1 << 23);
@@ -249,7 +248,7 @@ mod tests {
             ("x one byte short", |l| l.x_q8.1 = X_ROW_BYTES - 1),
             ("x unpadded: 24 blocks", |l| l.x_q8.1 = 24 * 36),
             ("per-slot x with the shared size", |l| l.x_per_slot = true),
-            ("y without the rows of the last slot (A2)", |l| {
+            ("y without the rows of the last slot", |l| {
                 l.y.1 = 7 * 128 * 4;
             }),
             ("y one float short", |l| l.y.1 = Y_FOOTPRINT - 4),
@@ -282,7 +281,7 @@ mod tests {
                 l.y.1 = (8 * 128 + 64) * 4;
             }),
             ("more used slots than experts", |l| l.n_expert = 4),
-            ("rows * n_expert overflows (F10)", |l| {
+            ("rows * n_expert overflows", |l| {
                 l.rows = (usize::MAX / 8) & !3;
                 l.y_slot_stride = l.rows;
             }),
@@ -333,7 +332,7 @@ mod tests {
     /// GOOD is a call every check of the entry accepts, so each case below changes one thing and is
     /// refused for that thing only. Its four ranges are pairwise apart (see the sizes below); `y`
     /// used to lie inside the 9.4 MB stack range, which made every case fail the overlap check
-    /// whatever the check under test did (KUBDAN-MSG-64 item 5).
+    /// whatever the check under test did.
     const GOOD: Args = Args {
         ty: 12,
         w_stack: 0x10_0000,
@@ -384,11 +383,10 @@ mod tests {
 
     /// Host only: the expert rows of the argument table, refused before any CUDA call. Every case
     /// must answer `INVALID_ARGUMENT`; a case that is not refused reaches the CUDA runtime (status
-    /// 35 on the CPU runner), so the failure message lists each such case with its status. The
-    /// control mutants E1 (the four alignment checks), E2 (the y/x_q8 and y/w_stack overlap checks)
-    /// and E3 (the `y_slot_stride < rows` check) each flip named cases of this table, and the
-    /// stack-guard mutants S2b (both int64 guards), S2b1 (guard 1 only) and S2b2 (guard 2 only)
-    /// each flip the two wrap-to-zero rows.
+    /// 35 on the CPU runner), so the failure message lists each such case with its status.
+    /// Deleting the four alignment checks, the y/x_q8 and y/w_stack overlap checks or the
+    /// `y_slot_stride < rows` check flips named cases of this table, and deleting either int64
+    /// stack guard or both flips the two wrap-to-zero rows.
     #[test]
     fn matvec_expert_arguments_are_checked_before_any_launch() {
         let ranges = [
@@ -446,14 +444,13 @@ mod tests {
                 a.rows = 1 << 26;
                 a.y_slot_stride = c_int::MAX;
             }),
-            // S2b (lane C's S2 review): the two stack-byte overflow guards, reached with every
-            // EARLIER check satisfied — the "stack bytes overflow" case above is also caught by
-            // the apart guard once the guards are deleted (its n_expert x c_int::MAX stride y
-            // footprint ~60 GB and the wrapped stack bytes ~1.8e19 both overlap), so it kills
-            // nothing. Both cases below wrap the product to EXACTLY zero without the guards
-            // (2^30 x 2^30 x 144 = 9 x 2^64, and 2^52 x 2^20 = 2^72), keep y at 1 << 40 so its
-            // 2^35-byte footprint overlaps nothing, and pass rows % 4, k % 256, n_used <= 8,
-            // the alignments and the c_int ranges.
+            // The two stack-byte overflow guards, reached with every EARLIER check satisfied — the
+            // "stack bytes overflow" case above is also caught by the apart guard once the guards
+            // are deleted (its n_expert x c_int::MAX stride y footprint ~60 GB and the wrapped
+            // stack bytes ~1.8e19 both overlap), so it kills nothing. Both cases below wrap the
+            // product to EXACTLY zero without the guards (2^30 x 2^30 x 144 = 9 x 2^64, and
+            // 2^52 x 2^20 = 2^72), keep y at 1 << 40 so its 2^35-byte footprint overlaps nothing,
+            // and pass rows % 4, k % 256, n_used <= 8, the alignments and the c_int ranges.
             ("stack bytes wrap to zero (guard 2)", |a| {
                 a.k = 256;
                 a.rows = 1 << 30;
@@ -497,12 +494,11 @@ mod tests {
         );
     }
 
-    /// S5c (lane C's K2 verdict): no `check_expert` row can tell a wrapping `call_sizes` from
-    /// the checked one — the c_int ranges refuse the huge rows before the sizes are computed —
-    /// so the wrap is pinned directly. rows 1<<61 x 8 experts wraps to 2^64 == 0 in the
-    /// stack-rows product while every other count of this call stays inside usize (y:
-    /// 0 * stride + 1<<61 floats, one shared activation row, 16 padded blocks), so a wrapping
-    /// form would answer `Some` and this assert fails.
+    /// No `check_expert` row can tell a wrapping `call_sizes` from the checked one — the c_int
+    /// ranges refuse the huge rows before the sizes are computed — so the wrap is pinned directly.
+    /// rows 1<<61 x 8 experts wraps to 2^64 == 0 in the stack-rows product while every other count
+    /// of this call stays inside usize (y: 0 * stride + 1<<61 floats, one shared activation row, 16
+    /// padded blocks), so a wrapping form would answer `Some` and this assert fails.
     #[test]
     fn call_sizes_refuses_a_rows_n_expert_that_wraps_to_zero() {
         let device = RawDevice::unbacked(64);

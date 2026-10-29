@@ -1,14 +1,12 @@
-//! The engine factory for Q36 and dense Qwen3.8 entries of the `enginesrv` config
-//! (decision 0046; packet Q36-F3b).
+//! The engine factory for Q36 and dense Qwen3.8 entries of the `enginesrv` config.
 //!
 //! It follows the interface of the Flash-Next factory (`flash_next/factory.rs`) and returns the
 //! same `StartedEngine`. The server start-up code (`server/run.rs`) calls it for the entries of
 //! this family with the process-wide `prefix_reuse` flag of the configuration file. Order of
 //! checks: the settings (`settings.rs`), the `prefix_reuse` session-cap rule when the flag is on
-//! and the arm is MLX (`Q36Settings::check_prefix_reuse_cap`), then the backend. A build with neither `native-mlx`
-//! on Apple Silicon nor `native-cuda` on Linux stops at the backend check with a clear error
-//! naming both features and never touches a file. Q36 results never satisfy Phase 0B or Phase
-//! 1B.
+//! and the arm is MLX (`Q36Settings::check_prefix_reuse_cap`), then the backend. A build with
+//! neither `native-mlx` on Apple Silicon nor `native-cuda` on Linux stops at the backend check with
+//! a clear error naming both features and never touches a file.
 
 use super::settings::{Backend, Q36Env, Q36Options, Q36Settings};
 use crate::{
@@ -95,11 +93,11 @@ fn backend_of_build() -> Backend {
     }
 }
 
-/// The settings of an entry with the process-wide `prefix_reuse` flag applied (packet
-/// SERVE-2-c item 1, fix M1): `Q36Settings::new` builds the checked settings and leaves the
-/// flag false, because no config member or environment key carries the process-wide flag, so
-/// the flag travels in the settings from here — the MLX `start` reads it into the
-/// `prefix_store` limits of the rules. The builder is pure: the factory and its test share it.
+/// The settings of an entry with the process-wide `prefix_reuse` flag applied:
+/// `Q36Settings::new` builds the checked settings and leaves the flag false, because no config
+/// member or environment key carries the process-wide flag, so the flag travels in the settings
+/// from here — the MLX `start` reads it into the `prefix_store` limits of the rules. The
+/// builder is pure: the factory and its test share it.
 fn settings_with_prefix_reuse(
     model_dir: &Path,
     tokenizer_dir: &Path,
@@ -244,7 +242,7 @@ mod tests {
     }
 
     // The CUDA arm ignores `session_cap_bytes` (an MLX-only key), so the cap rule has no CUDA
-    // premise (decision 0036, addendum 2, CUDA arm).
+    // premise.
     #[cfg(not(all(feature = "native-cuda", target_os = "linux")))]
     #[test]
     fn a_prefix_reuse_entry_below_the_required_session_cap_is_refused_with_the_numbers_and_the_hint()
@@ -267,7 +265,7 @@ mod tests {
     }
 
     // The CUDA arm ignores `session_cap_bytes` (an MLX-only key), so the cap rule has no CUDA
-    // premise (decision 0036, addendum 2, CUDA arm).
+    // premise.
     #[cfg(not(all(feature = "native-cuda", target_os = "linux")))]
     #[test]
     fn a_prefix_reuse_entry_at_the_required_session_cap_passes_the_rule() {
@@ -291,9 +289,9 @@ mod tests {
         assert!(!text.contains("raise session_cap_bytes"), "{text}");
     }
 
-    /// The pure settings builder carries the flag for both values (fix M1): deleting the line
-    /// that sets `settings.prefix_reuse` kept every other test green, so the flag is asserted
-    /// here, on the builder the factory itself uses.
+    /// The pure settings builder carries the flag for both values: deleting the line that sets
+    /// `settings.prefix_reuse` kept every other test green, so the flag is asserted here, on
+    /// the builder the factory itself uses.
     ///
     /// Mutation check: removing `settings.prefix_reuse = prefix_reuse;` fails the `true` row.
     #[test]
@@ -424,9 +422,9 @@ mod tests {
     )))]
     #[test]
     fn a_complete_entry_in_a_build_without_the_backend_names_both_features() {
-        // The FULL fallback text, by equality (KUBDAN-MSG-71 item 2): an include_str! pin of
-        // this file's own literals cannot fail, so the no-backend build — where the text is
-        // the error — pins it outright. The old single-feature spelling fails here.
+        // The FULL fallback text, by equality: an include_str! pin of this file's own literals
+        // cannot fail, so the no-backend build — where the text is the error — pins it
+        // outright. The old single-feature spelling fails here.
         let options = Q36Options {
             cache_limit_bytes: Some(1024),
             ..Q36Options::default()
@@ -452,7 +450,7 @@ mod tests {
         assert!(!text.contains("no Q36 backend"), "{text}");
         // The fallback arm is not compiled in this build: its full text is pinned by equality
         // in `a_complete_entry_in_a_build_without_the_backend_names_both_features`, which runs
-        // on the no-backend build where the text IS the error (KUBDAN-MSG-71 item 2 — an
-        // include_str! pin of this file's own literals cannot fail).
+        // on the no-backend build where the text IS the error (an include_str! pin of this
+        // file's own literals cannot fail).
     }
 }

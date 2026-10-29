@@ -1,19 +1,18 @@
-//! Bitwise old-vs-new fixture for the q8 group-scalar hoist (A ruling 01a18101, plan
-//! PREFILL-COST-1 step 1): the hoisted kernel and the pre-hoist per-element math are two
-//! template instantiations in one ELF, run on identical device inputs, and every output
-//! byte (out, part, guards, slack) must be equal. Determinism is the property under test:
-//! same accumulation order, only the scalar loads move. Full-attn mode only; the segmented
-//! mode shares the same kernel body and stays covered by the numerical tests.
+//! Bitwise old-vs-new fixture for the q8 group-scalar hoist: the hoisted kernel and the
+//! pre-hoist per-element math are two template instantiations in one ELF, run on identical
+//! device inputs, and every output byte (out, part, guards, slack) must be equal. Determinism
+//! is the property under test: same accumulation order, only the scalar loads move. Full-attn
+//! mode only; the segmented mode shares the same kernel body and stays covered by the numerical
+//! tests.
 
 use super::*;
 
 /// One run's snapshot: out bytes, part bytes, status word, whole status buffer.
 type RunSnapshot = (Vec<u8>, Vec<u8>, i32, Vec<u8>);
 
-/// Enrich a plane's scales with the 7/3/5 hash (Sol follow-up SF): q8.rs's plane() keeps
-/// main's 4-value hash for the ungated oracle test, so the fixture rewrites scale bytes
-/// here (and the mirrored f64 values, signed-aware like spike_v) for the wider per-row
-/// variety the tolerance evidence wants.
+/// Enrich a plane's scales with the 7/3/5 hash: q8.rs's plane() keeps its 4-value hash for the
+/// ungated oracle test, so the fixture rewrites scale bytes here (and the mirrored f64 values,
+/// signed-aware like spike_v) for the wider per-row variety the tolerance evidence wants.
 fn enrich_scales(p: &mut Plane, shape: AttnPrefillShape, signed: bool, role: usize) {
     let AttnKvStorage::Q8Affine { group_size, .. } = p.layout.storage else {
         panic!("test storage")
@@ -49,8 +48,8 @@ fn enrich_scales(p: &mut Plane, shape: AttnPrefillShape, signed: bool, role: usi
     }
 }
 
-/// Plant whole-row V code spikes (Opus SF5): window-boundary errors that leak an invisible
-/// key, or miss a visible one, move the output by whole units instead of rounding noise.
+/// Plant whole-row V code spikes: window-boundary errors that leak an invisible key, or miss a
+/// visible one, move the output by whole units instead of rounding noise.
 fn spike_v(v: &mut Plane, shape: AttnPrefillShape, rows: &[usize], signed: bool) {
     let AttnKvStorage::Q8Affine { group_size, .. } = v.layout.storage else {
         panic!("test storage")
@@ -86,8 +85,7 @@ fn spike_v(v: &mut Plane, shape: AttnPrefillShape, rows: &[usize], signed: bool)
 
 /// The Rust mirror of the C enqueue predicate (attn_prefill.cu enqueue_q8): the tiled
 /// kernel serves full-span D128 launches with both planes in 32-dim groups and G <= 8.
-/// One definition for the launch choice, the comparison class and the test filters
-/// (Opus delta nit: the predicate was copied three times).
+/// One definition for the launch choice, the comparison class and the test filters.
 fn routes_tiled(shape: &AttnPrefillShape, group_size: usize, segmented: bool) -> bool {
     shape.head_dim == 128 && group_size == 32 && !segmented && shape.n_head / shape.n_kv_head <= 8
 }
@@ -106,8 +104,8 @@ fn hoist_case(
     };
     let mut k = plane(shape, storage, case.scalar, 0);
     let mut v = plane(shape, storage, case.scalar, 1);
-    // Sol follow-up SF: the 7/3/5 scale hash lives HERE now (q8.rs's plane keeps main's
-    // 4-value hash for the ungated oracle test).
+    // The 7/3/5 scale hash lives here (q8.rs's plane keeps its 4-value hash for the ungated
+    // oracle test).
     enrich_scales(&mut k, shape, case.signed, 0);
     enrich_scales(&mut v, shape, case.signed, 1);
     if !v_spikes.is_empty() {
@@ -116,8 +114,8 @@ fn hoist_case(
     let q_len = shape.m * shape.n_head * shape.head_dim;
     let kv_len = shape.cache_rows * shape.n_kv_head * shape.head_dim;
     let input = Data {
-        // Sol MF1 regression lever: finite q at -FLT_MAX overflows the dot product to
-        // -inf, so a visible key's score is non-finite and the row must poison (NaN).
+        // Regression lever: finite q at -FLT_MAX overflows the dot product to -inf, so a
+        // visible key's score is non-finite and the row must poison (NaN).
         q: if q_overflow {
             vec![-f32::MAX; q_len]
         } else {
@@ -150,9 +148,9 @@ fn hoist_case(
         Ok(call)
     };
     let mut snapshots = Vec::new();
-    // MF1 (Opus bee8b4539): the tiled kernel is reachable only through the fixture entry —
-    // and only when the CALLER asks for it (the hoist bit-identity test keeps the old
-    // kernel). The shape guards still apply inside the launch predicate.
+    // The tiled kernel is reachable only through the fixture entry — and only when the CALLER
+    // asks for it (the hoist bit-identity test keeps the old kernel). The shape guards still
+    // apply inside the launch predicate.
     let tiled = use_tiled && routes_tiled(&shape, case.group_size, case.segmented);
     for reference in [false, false, true] {
         fx.reset_outputs()?;
@@ -164,8 +162,8 @@ fn hoist_case(
             fx.ctx.attn_prefill(&fx.stream, call()?)?;
         }
         fx.stream.synchronize()?;
-        // Sol SF: the PART slack tail must stay pristine on the tiled branch too — a tiled
-        // write past the combine's real extent would land here.
+        // The PART slack tail must stay pristine on the tiled branch too — a tiled write past
+        // the combine's real extent would land here.
         assert!(
             fx.bytes(PART)[fx.base[PART].2..]
                 .iter()
@@ -296,8 +294,8 @@ fn q8_group_scalar_hoist_is_bit_identical_to_per_element_math() {
                 gate: false,
                 segmented: false,
             },
-            // Sol SF1: a D128 unsigned+bias ROUTING case (the only other unsigned+bias
-            // arm is D256, which the predicate never routes tiled).
+            // A D128 unsigned+bias ROUTING case (the only other unsigned+bias arm is D256,
+            // which the predicate never routes tiled).
             Case {
                 shape: AttnPrefillShape {
                     m: 8,
@@ -319,10 +317,10 @@ fn q8_group_scalar_hoist_is_bit_identical_to_per_element_math() {
             },
         ]
     };
-    // Opus delta SF1: EVERY hoist case — ring wrap, sliding, sinks, the D64 gate arm,
-    // unsigned codes, D256 bias — now also runs the tiled routing (check_hoist_case
-    // re-classifies: routing shapes get tolerance + determinism, the non-routing
-    // controls — segmented, group 64, D256 — stay bitwise on the old kernel).
+    // EVERY hoist case — ring wrap, sliding, sinks, the D64 gate arm, unsigned codes, D256
+    // bias — also runs the tiled routing (check_hoist_case re-classifies: routing shapes get
+    // tolerance + determinism, the non-routing controls — segmented, group 64, D256 — stay
+    // bitwise on the old kernel).
     for case in list() {
         check_hoist_case(case, 32, &[], false);
     }
@@ -332,10 +330,10 @@ fn q8_group_scalar_hoist_is_bit_identical_to_per_element_math() {
 }
 
 /// One classification + assertion pass over a case's three runs (tiled, tiled repeat,
-/// reference). MF6: shapes the enqueue predicate routes to attn_prefill_part_q8_tile_k
-/// reorder the summation (per-tile softmax), so old-vs-new is a stated tolerance (MF7:
-/// 2^-14 * max|out_row| against the reference arm) plus a two-run determinism check;
-/// everything else keeps the bitwise contract.
+/// reference). Shapes the enqueue predicate routes to attn_prefill_part_q8_tile_k reorder the
+/// summation (per-tile softmax), so old-vs-new is a stated tolerance (2^-14 * max|out_row|
+/// against the reference arm) plus a two-run determinism check; everything else keeps the
+/// bitwise contract.
 fn check_hoist_case(case: Case, min_keys: usize, v_spikes: &[usize], use_tiled: bool) {
     let shape = case.shape;
     let tiled = use_tiled && routes_tiled(&shape, case.group_size, case.segmented);
@@ -345,10 +343,10 @@ fn check_hoist_case(case: Case, min_keys: usize, v_spikes: &[usize], use_tiled: 
         let (o, p, s, sb) = result.pop().expect("reference run");
         (o, p, s, sb)
     };
-    // MF4 (Opus bee8b4539): index the two non-reference runs explicitly. The old
-    // pop-then-last order compared the SECOND snapshot with itself, so the determinism
-    // assert was vacuous. Sol SF: run 1's whole snapshot (out + part + status bytes)
-    // is compared — discarding the part bytes hid combine-input drift.
+    // Index the two non-reference runs explicitly: a pop-then-last order would compare the
+    // SECOND snapshot with itself and make the determinism assert vacuous. Run 1's whole
+    // snapshot (out + part + status bytes) is compared — discarding the part bytes would hide
+    // combine-input drift.
     let (out_h, part_h, status_h, status_bytes_h) = result.pop().expect("second run");
     let (out_n2, part_n2, _, status_bytes_n2) = result.pop().expect("first run");
     let label = format!(
@@ -363,9 +361,9 @@ fn check_hoist_case(case: Case, min_keys: usize, v_spikes: &[usize], use_tiled: 
     assert_eq!(status_h, 0, "hoisted status {label}");
     assert_eq!(status_r, 0, "reference status {label}");
     assert_eq!(status_bytes_h, status_bytes_r, "status bytes {label}");
-    // MF3 (Opus): the OUT buffer carries a 0x55 slack tail whose bytes read as ~1.47e13
-    // f32 — a bound folded over the WHOLE buffer is ~9e8 and only NaN can fail it. The
-    // slack must stay pristine (guard bytes) and the tolerance only sees real rows.
+    // The OUT buffer carries a 0x55 slack tail whose bytes read as ~1.47e13 f32 — a bound
+    // folded over the WHOLE buffer is ~9e8 and only NaN can fail it. The slack must stay
+    // pristine (guard bytes) and the tolerance only sees real rows.
     let out_bytes = shape.m * shape.n_head * shape.head_dim * 4;
     for (name, out) in [
         ("first", &out_n2),
@@ -390,15 +388,15 @@ fn check_hoist_case(case: Case, min_keys: usize, v_spikes: &[usize], use_tiled: 
             ),
             "determinism: two tiled runs {label}"
         );
-        // Per-row bound (Opus SF6): each row's tolerance is scaled by that row's own
-        // maximum magnitude, so one huge row cannot mask another's error.
+        // Per-row bound: each row's tolerance is scaled by that row's own maximum magnitude, so
+        // one huge row cannot mask another's error.
         let rows = shape.m * shape.n_head;
         fn row_window(b: &[u8], row: usize, head_dim: usize) -> &[u8] {
             &b[row * head_dim * 4..(row + 1) * head_dim * 4]
         }
-        // SF6 report: the 2^-14 bound is empirical — print the observed worst
-        // |diff|/bound and the smallest bound so a near-miss row is visible, not just
-        // pass/fail (low-magnitude m1 rows are the suspected tight case).
+        // The 2^-14 bound is empirical — print the observed worst |diff|/bound and the smallest
+        // bound so a near-miss row is visible, not just pass/fail (low-magnitude m1 rows are
+        // the suspected tight case).
         let (mut worst, mut worst_row, mut min_bound) = (0.0f32, 0usize, f32::INFINITY);
         for row in 0..rows {
             let (hr, rr) = (
@@ -420,8 +418,8 @@ fn check_hoist_case(case: Case, min_keys: usize, v_spikes: &[usize], use_tiled: 
                 .zip(rr.as_chunks::<4>().0.iter())
             {
                 let d = (f32::from_le_bytes(*h) - f32::from_le_bytes(*r)).abs();
-                // Finiteness (Sol): a NaN on either side must fail HERE, not inside the
-                // bound compare where NaN <= bound reads as a confusing near-miss.
+                // Finiteness: a NaN on either side must fail HERE, not inside the bound compare
+                // where NaN <= bound reads as a confusing near-miss.
                 assert!(
                     f32::from_le_bytes(*h).is_finite() && f32::from_le_bytes(*r).is_finite(),
                     "non-finite output float in row {row} {label}"
@@ -444,19 +442,18 @@ fn check_hoist_case(case: Case, min_keys: usize, v_spikes: &[usize], use_tiled: 
         );
     } else {
         assert_eq!(out_h, out_r, "out bytes {label}");
-        // MF5 (Opus): the PART snapshot comparison is part of the old-kernel contract —
-        // the combine consumes these bytes, so they must match byte for byte too.
+        // The PART snapshot comparison is part of the old-kernel contract — the combine
+        // consumes these bytes, so they must match byte for byte too.
         assert_eq!(part_h, part_r, "part bytes {label}");
     }
 }
 
-/// Step-2 tiled-kernel sensitivity cases (Opus SF5): the production GQA (32/4, G=8 — a
-/// different warp-to-head mapping than the hoist cases' G=4) at the m=1 partial tile, and
-/// V spikes planted at the window boundary rows p-513/p-512 where an off-by-one visibility
-/// rule must fail loudly instead of inside rounding noise. Ring wrap, m8, sliding and
-/// sinks ride the hoist test's tiled second pass above; the arm below adds the
-/// production-plan geometry itself (41 splits, min_keys 256 — cpf_attn_launch_plan's
-/// m1/KVH4 answer, pinned by the host planner test).
+/// Tiled-kernel sensitivity cases: the production GQA (32/4, G=8 — a different warp-to-head
+/// mapping than the hoist cases' G=4) at the m=1 partial tile, and V spikes planted at the
+/// window boundary rows p-513/p-512 where an off-by-one visibility rule must fail loudly
+/// instead of inside rounding noise. Ring wrap, m8, sliding and sinks ride the hoist test's
+/// tiled second pass above; the arm below adds the production-plan geometry itself (41 splits,
+/// min_keys 256 — cpf_attn_launch_plan's m1/KVH4 answer, pinned by the host planner test).
 #[test]
 fn q8_tiled_kernel_old_vs_new_tolerance_with_window_spikes() {
     if !testkit::device_present("q8_tiled_kernel_old_vs_new_tolerance_with_window_spikes") {
@@ -481,10 +478,10 @@ fn q8_tiled_kernel_old_vs_new_tolerance_with_window_spikes() {
         gate: false,
         segmented: false,
     };
-    // last = p0 + m - 1 = 3199: rows 2686 (=p-513, invisible) and 2687 (=p-512, first
-    // visible) carry whole-row spikes. The m8 GQA8 and m17 GQA8 arms are the MF2
-    // cross-token shapes (Opus bee8b4539): odd tiles per split with padding warps that
-    // must still reach the per-token barrier; m8 GQA4 covers the four-active-warp grid.
+    // last = p0 + m - 1 = 3199: rows 2686 (=p-513, invisible) and 2687 (=p-512, first visible)
+    // carry whole-row spikes. The m8 GQA8 and m17 GQA8 arms are the cross-token shapes: odd
+    // tiles per split with padding warps that must still reach the per-token barrier; m8 GQA4
+    // covers the four-active-warp grid.
     let window513 = CpfAttnSpan {
         window: 513,
         ring: 0,
@@ -513,8 +510,8 @@ fn q8_tiled_kernel_old_vs_new_tolerance_with_window_spikes() {
         (flint(8, 3192, window513, 2), &[2686, 2687][..]),
         (g4(8, 3192, window513, 2), &[2686, 2687][..]),
         (flint(17, 3183, window513, 3), &[2686, 2687][..]),
-        // Opus SF5: the production plan itself — 41 splits at min_keys 256, the geometry
-        // the v3 lease's Q8Hoisted arm measures.
+        // The production plan itself — 41 splits at min_keys 256, the geometry the
+        // microbench's Q8Hoisted arm measures.
         (flint(1, 3199, CpfAttnSpan::FULL, 41), &[][..]),
     ] {
         let keys = if case.splits == 41 { 256 } else { 32 };
@@ -522,12 +519,12 @@ fn q8_tiled_kernel_old_vs_new_tolerance_with_window_spikes() {
     }
 }
 
-/// Sol MF1 (owed Opus SF2) regression: a visible key whose score overflows to -inf on
-/// FINITE inputs (q = -FLT_MAX) must poison the row to NaN exactly like the old kernel —
-/// the tiled path once returned a silent 0 weight instead, which reads as a clean (wrong)
-/// answer downstream. UNSIGNED codes and no sinks/bias keep every dot term a clean -inf
-/// (Sol MF2: signed codes give mixed-sign lane partials, NaN in the shuffle reduction,
-/// which the old -inf sentinel skip would ALSO have poisoned — no regression power).
+/// Regression: a visible key whose score overflows to -inf on FINITE inputs (q = -FLT_MAX) must
+/// poison the row to NaN exactly like the old kernel — the tiled path once returned a silent 0
+/// weight instead, which reads as a clean (wrong) answer downstream. UNSIGNED codes and no
+/// sinks/bias keep every dot term a clean -inf (signed codes give mixed-sign lane partials, NaN
+/// in the shuffle reduction, which the old -inf sentinel skip would ALSO have poisoned — no
+/// regression power).
 #[test]
 fn q8_tiled_visible_overflow_poisons_like_the_old_kernel() {
     if !testkit::device_present("q8_tiled_visible_overflow_poisons_like_the_old_kernel") {
@@ -552,8 +549,8 @@ fn q8_tiled_visible_overflow_poisons_like_the_old_kernel() {
         gate: false,
         segmented: false,
     };
-    // Sol MF1: min_keys must satisfy the wrapper contract (multiple of 32, >= 32) —
-    // min_keys 2 errors in the wrapper before any kernel runs.
+    // min_keys must satisfy the wrapper contract (multiple of 32, >= 32) — min_keys 2 errors in
+    // the wrapper before any kernel runs.
     let out_bytes = case.shape.m * case.shape.n_head * case.shape.head_dim * 4;
     for use_tiled in [true, false] {
         let mut runs =
@@ -563,7 +560,7 @@ fn q8_tiled_visible_overflow_poisons_like_the_old_kernel() {
         let second = runs.pop().expect("second run");
         let first = runs.pop().expect("first run");
         assert_eq!(first, second, "determinism (tiled={use_tiled})");
-        // Status + OUT slack guards (Sol): same contract as the tolerance path.
+        // Status + OUT slack guards: same contract as the tolerance path.
         assert_eq!(second.2, 0, "status (tiled={use_tiled})");
         assert_eq!(status_r, 0, "reference status (tiled={use_tiled})");
         assert_eq!(second.3, status_bytes_r, "status bytes (tiled={use_tiled})");
@@ -592,13 +589,12 @@ fn q8_tiled_visible_overflow_poisons_like_the_old_kernel() {
     }
 }
 
-/// Report-only microbench v2 (A 01a18165 order): the kernel is ~140x off the bandwidth
-/// floor at m=1 (~26 MB unique bytes vs 4.26 ms), so the cost is latency/parallelism,
-/// not instruction issue. These arms measure the gaps before any redesign is picked:
-/// dtype gap (q8 reference vs the F16 kernel), row batching (m=8 one launch vs 8 x m=1),
-/// split parallelism (max_splits=8). Host-timed per launch with explicit sync (the
-/// engine has no CUDA-event API; kernels are ~ms). Asserts NOTHING - the design decision
-/// belongs to the reviewers.
+/// Report-only microbench: the kernel is ~140x off the bandwidth floor at m=1 (~26 MB unique
+/// bytes vs 4.26 ms), so the cost is latency/parallelism, not instruction issue. These arms
+/// measure the gaps before any redesign is picked: dtype gap (q8 reference vs the F16 kernel),
+/// row batching (m=8 one launch vs 8 x m=1), split parallelism (max_splits=8). Host-timed per
+/// launch with explicit sync (the engine has no CUDA-event API; kernels are ~ms). Asserts
+/// NOTHING - the design decision belongs to the reviewers.
 #[test]
 fn q8_prefill_parallelism_microbench_report() {
     use std::time::Instant;
@@ -631,10 +627,9 @@ fn q8_prefill_parallelism_microbench_report() {
         (Arm::Q8Reference, 1, 1, 32),
         (Arm::Q8Reference, 1, 41, 256),
         (Arm::Q8Reference, 1, 41, 128),
-        // The tiled step-2 kernel at the production plan: the enqueue predicate routes this
-        // arm to attn_prefill_part_q8_tile_k, so its number IS the <=3x-F16 kernel bar
-        // measurement; (Q8Reference stays the old-path baseline — the DEFAULT kernel on
-        // this branch, A ruling 01a1839f). B 01a18290: the receipt must
+        // The tiled kernel at the production plan: the enqueue predicate routes this arm to
+        // attn_prefill_part_q8_tile_k, so its number IS the <=3x-F16 kernel bar measurement
+        // (Q8Reference stays the old-path baseline — the DEFAULT kernel). The report must
         // name the kernel actually selected, and the test asserts the routing.
         (Arm::Q8Hoisted, 1, 41, 256),
         (Arm::F16, 1, 41, 256),
@@ -711,8 +706,8 @@ fn q8_prefill_parallelism_microbench_report() {
                     .attn_prefill_q8_reference(&fx.stream, call())
                     .expect("reference launch");
             } else if matches!(arm, Arm::Q8Hoisted) {
-                // MF1 (Opus bee8b4539): the tiled kernel is reachable only through the
-                // fixture entry; the default launch keeps the old kernel.
+                // The tiled kernel is reachable only through the fixture entry; the default
+                // launch keeps the old kernel.
                 fx.ctx
                     .attn_prefill_q8_tiled(&fx.stream, call())
                     .expect("tiled launch");
@@ -755,8 +750,8 @@ fn q8_prefill_parallelism_microbench_report() {
             Arm::Q8Hoisted => "attn_prefill_part_q8_tile_k<128>",
             Arm::F16 => "attn_prefill_part_dsplit_k<128,8>",
         };
-        // B 01a18290: assert the routing so the label can never lie — the flint bench shape
-        // (D128, group 32, GQA 32/4, mode 0) must satisfy the enqueue predicate verbatim.
+        // Assert the routing so the label can never lie — the flint bench shape (D128, group
+        // 32, GQA 32/4, mode 0) must satisfy the enqueue predicate verbatim.
         assert!(
             !tiled
                 || (shape.head_dim == 128
@@ -809,11 +804,10 @@ fn q8_prefill_parallelism_microbench_report() {
     assert_eq!(reported, expected, "microbench arms missing or refused");
 }
 
-/// The production-plan arm of A ruling 01a181df: a split-count change reorders f32
-/// partial sums only — both arms read identical quantized bytes — so the bound is pure
-/// reduction reorder over the case depth (max_abs 1e-3 on attention outputs of O(30),
-/// max_rel 1e-4
-/// against a magnitude floor of 1), plus run-to-run bit-equality at the same plan.
+/// The production-plan arm: a split-count change reorders f32 partial sums only — both arms
+/// read identical quantized bytes — so the bound is pure reduction reorder over the case depth
+/// (max_abs 1e-3 on attention outputs of O(30), max_rel 1e-4 against a magnitude floor of 1),
+/// plus run-to-run bit-equality at the same plan.
 #[test]
 fn q8_reference_at_planner_splits_stays_within_reduction_reorder_tolerance() {
     if !testkit::device_present("q8_reference_at_planner_splits") {
@@ -849,8 +843,8 @@ fn q8_reference_at_planner_splits_stays_within_reduction_reorder_tolerance() {
                 ring: 2048,
             },
         ),
-        // B 01a181e9: a sliding layer before the cache reaches the ring depth — the
-        // span.window planner branch without the ring wrap.
+        // A sliding layer before the cache reaches the ring depth — the span.window planner
+        // branch without the ring wrap.
         Case {
             shape: AttnPrefillShape {
                 m: 8,

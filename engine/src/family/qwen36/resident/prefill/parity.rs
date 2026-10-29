@@ -1,44 +1,41 @@
-//! The chunk gates on the real checkpoint (packet Q36-E8). Ignored tests; the Mac coordinator runs them.
+//! The chunk gates on the real checkpoint. Ignored tests; they run on the Mac.
 //!
-//! 1. `real_checkpoint_chunk_matches_the_host_reference`: the 5-token prompt of the frozen Q36-HR
-//!    evidence runs as one chunk. The gate of decision 0046 item 4 applies: the residual stream of
-//!    the last row after each of the 40 layers, the last-row logits and their top 5, and 32 greedy
-//!    tokens (one from the chunk and 31 one-token steps) against the frozen evidence.
+//! 1. `real_checkpoint_chunk_matches_the_host_reference`: the 5-token prompt of the frozen
+//!    host-reference evidence runs as one chunk. The per-layer parity gate applies: the residual
+//!    stream of the last row after each of the 40 layers, the last-row logits and their top 5,
+//!    and 32 greedy tokens (one from the chunk and 31 one-token steps) against the frozen evidence.
 //! 2. `real_checkpoint_chunks_match_the_one_token_path`: the 37 tokens of the prompt and the greedy
 //!    text, repeated to 296 tokens, run in chunks of 128 and as one-token steps. The last-row
-//!    residuals, the logits, and the next 8 greedy tokens must agree. The bounds are the frozen
-//!    bounds of decision 0044 G2, as in Flash-Next H8b, not proposals. Each of the 40 last-row
-//!    layer outputs and the logits need a cosine of at least 0.99999 and a relative error
-//!    `max|got - want| / max|want|` of at most 1e-4. The top 5 and the 8 greedy tokens must be equal.
-//!    The one-token path still runs with `Routing::Host` as the parity reference (packet
-//!    Q36-PF-DEVROUTE: the chunk follows the decoder's routing, `Routing::Device` by default), so
-//!    the gate compares a device chunk with host steps. Both paths select experts from the same
-//!    F32 probability bits with the same tie rule, so only the accumulation of M > 1 against
-//!    M = 1 differs between the two paths. The report records the experts of the stepped last token.
+//!    residuals, the logits, and the next 8 greedy tokens must agree. The bounds are the frozen F32
+//!    bounds, not proposals. Each of the 40 last-row layer outputs and the logits need a cosine of
+//!    at least 0.99999 and a relative error `max|got - want| / max|want|` of at most 1e-4. The
+//!    top 5 and the 8 greedy tokens must be equal. The one-token path still runs with
+//!    `Routing::Host` as the parity reference (the chunk follows the decoder's routing,
+//!    `Routing::Device` by default), so the gate compares a device chunk with host steps. Both
+//!    paths select experts from the same F32 probability bits with the same tie rule, so only the
+//!    accumulation of M > 1 against M = 1 differs between the two paths. The report records the
+//!    experts of the stepped last token.
 //! 3. `real_checkpoint_prompt_speed`: a 2,048-token prompt in chunks of each size in `Q36_CHUNKS`.
 //!    It reports seconds, tokens per second, memory, and the peak retired bytes of each run. With
 //!    the `native-fault-qualification` feature it also reports synchronizations and forced
-//!    flushes. Without the feature those fields are null. It asserts no speed. A Q36 result never
-//!    satisfies Phase 0B or 1B.
+//!    flushes. Without the feature those fields are null. It asserts no speed.
 //!
-//! The activation dtype (packet Q36-BF16-b): `Q36_ACTIVATION=bf16` runs every test of this file
-//! through the product `activation_dtype` lever (`scale_knob::new_decoder`), and the chunk path is
-//! dtype aware, so the tests run rather than refuse. Unset or `f32` is the F32 control above and
-//! its gates are unchanged. In BF16 the gates follow the within-mode rule of the packet: gate 2
-//! (the chunk against the one-token path of the same decoder) gates the top 5, the 8 greedy
+//! The activation dtype: `Q36_ACTIVATION=bf16` runs every test of this file through the product
+//! `activation_dtype` lever (`scale_knob::new_decoder`), and the chunk path is dtype aware, so the
+//! tests run rather than refuse. Unset or `f32` is the F32 control above and its gates are
+//! unchanged. In BF16 the gates follow the within-mode rule (`within_mode::within_mode_passes`):
+//! gate 2 (the chunk against the one-token path of the same decoder) gates the top 5, the 8 greedy
 //! tokens, a finite cosine on every layer row and the logits cosine at the provisional floor 0.98
-//! (fix5 of packet Q36-BF16-b: a layer cosine fell to 0.716 with the logits at 0.990), reports
-//! the layer cosines with the layer of the minimum and the max relative error, and
-//! reads the optional variables Q36_G2_TOKENS and Q36_G2_CHUNK. The same test also reads
-//! Q36_G2_DUMP_DIR (an F32 run writes its last-row vectors and a `meta.txt` that records the run)
-//! and Q36_G2_REF_DIR (a BF16 run reads them and reports the triangulation of git-db: BF16 chunk
-//! against F32, BF16 steps against F32, chunk against steps; the dump is validated before any
-//! native object exists — the same tokens and chunk, the `f32` activation, whole 40-layer files,
-//! and one logits row of the vocabulary). Gate 1 (the
-//! chunk against the frozen F32 evidence) keeps the 0.99999 rule report-only and asserts its
-//! floor instead (decision 0046 A6 fix5): no NaN cosine, a minimum layer cosine of at least 0.95,
-//! and no regression of more than 0.01 below the d1 value 0.9799 without a recorded decision. The
-//! report names the dtype in `activation_dtype`.
+//! (a layer cosine fell to 0.716 with the logits at 0.990), reports the layer cosines with the
+//! layer of the minimum and the max relative error, and reads the optional variables Q36_G2_TOKENS
+//! and Q36_G2_CHUNK. The same test also reads Q36_G2_DUMP_DIR (an F32 run writes its last-row
+//! vectors and a `meta.txt` that records the run) and Q36_G2_REF_DIR (a BF16 run reads them and
+//! reports the triangulation: BF16 chunk against F32, BF16 steps against F32, chunk against steps;
+//! the dump is validated before any native object exists — the same tokens and chunk, the `f32`
+//! activation, whole 40-layer files, and one logits row of the vocabulary). Gate 1 (the chunk
+//! against the frozen F32 evidence) keeps the 0.99999 rule report-only and asserts its floor
+//! instead: no NaN cosine, a minimum layer cosine of at least 0.95, and no regression of more
+//! than 0.01 below the anchor 0.9799. The report names the dtype in `activation_dtype`.
 //!
 //! Run each test alone with its own `Q36_OUT_DIR`, which is required and must not exist yet:
 //!
@@ -77,7 +74,7 @@ const LAYERS: usize = 40;
 const HIDDEN: usize = 2048;
 const VOCAB: usize = 248_320;
 
-/// The largest prompt the one-token-path test accepts (fix4 of packet Q36-BF16-b): the 1024-token
+/// The largest prompt the one-token-path test accepts: the 1024-token
 /// context that its `decoder_for` call names, minus the 8 greedy tokens the test generates after
 /// the prompt, minus a margin of 16 tokens so the prompt and its greedy tail stay inside the
 /// context. 1024 - 8 - 16 = 1000, the bound the test accepted before the named constant.
@@ -148,7 +145,7 @@ fn evidence(ref_dir: &std::path::Path, ckpt_dir: &std::path::Path) -> Evidence {
 }
 
 /// Opens the checkpoint, checks `config.json`, and builds a decoder with `context_limit` in the
-/// dtype that `Q36_ACTIVATION` names (packet Q36-BF16-b; `scale_knob::new_decoder` also checks the
+/// dtype that `Q36_ACTIVATION` names (`scale_knob::new_decoder` also checks the
 /// scale census and prints the load report). Unset is `f32`, the qualification control of the
 /// frozen gates below.
 fn decoder_for<'c>(
@@ -183,7 +180,7 @@ fn read_dump(path: &std::path::Path) -> Vec<u8> {
         .unwrap_or_else(|_| panic!("the G2 dump file {} is unreadable", path.display()))
 }
 
-/// Reads `meta.txt` of a G2 dump (fix4 of packet Q36-BF16-b): the three lines `tokens=<n>`,
+/// Reads `meta.txt` of a G2 dump: the three lines `tokens=<n>`,
 /// `chunk=<c>`, and `activation=<f32|bf16>` that the dump run wrote next to its four vector
 /// files. A missing line names the file; a value that is not a number names the line.
 fn dump_meta(dir: &std::path::Path) -> (usize, usize, String) {
@@ -214,7 +211,7 @@ fn dump_meta(dir: &std::path::Path) -> (usize, usize, String) {
 }
 
 /// Validates the F32 dump that `Q36_G2_REF_DIR` names against this run before any native object
-/// exists (fix4 of packet Q36-BF16-b): `meta.txt` must record this run's `tokens` and `chunk` — a
+/// exists: `meta.txt` must record this run's `tokens` and `chunk` — a
 /// dump of another shape cannot be compared — and the dump's activation must be `f32`, because
 /// the reference is the F32 run; each layer file must hold a whole number of `LAYERS`-layer rows,
 /// and each logits file must hold exactly one row of `QWEN3_6_35B_A3B.vocab` floats, the length
@@ -289,7 +286,7 @@ fn reset_retire_peak(kernels: &mut MlxKernels) {
 #[cfg(not(feature = "native-fault-qualification"))]
 fn reset_retire_peak(_kernels: &mut MlxKernels) {}
 
-/// The peak of retired bytes since the last reset (decision 0044 item 8), or `None` without the
+/// The peak of retired bytes since the last reset, or `None` without the
 /// qualification feature.
 #[cfg(feature = "native-fault-qualification")]
 fn peak_retired_bytes(kernels: &MlxKernels) -> Option<u64> {
@@ -302,7 +299,7 @@ fn peak_retired_bytes(_kernels: &MlxKernels) -> Option<u64> {
 }
 
 #[test]
-#[ignore = "needs the real checkpoint and the frozen Q36-HR evidence on the Mac; run with --ignored"]
+#[ignore = "needs the real checkpoint and the frozen host-reference evidence on the Mac"]
 fn real_checkpoint_chunk_matches_the_host_reference() {
     let _serial = crate::native_test_lock();
     let (ckpt_dir, ref_dir) = (env_path("Q36_CKPT_DIR"), env_path("Q36_REF_DIR"));
@@ -361,7 +358,7 @@ fn real_checkpoint_chunk_matches_the_host_reference() {
             ev.greedy
         ));
     }
-    // Packet Q36-BF16-b fix1: the agreement counters of the decode parity, recorded for both
+    // The agreement counters of the decode parity, recorded for both
     // dtypes so a BF16 report shows how close the frozen F32 reference came.
     let top5_overlap = got_top5
         .iter()
@@ -383,10 +380,9 @@ fn real_checkpoint_chunk_matches_the_host_reference() {
     });
     write_report(&out, "chunk-parity.json", &report);
     if act != Activation::F32 {
-        // BF16 (packet Q36-BF16-b): the chunk runs BF16 activations against the frozen F32
-        // evidence, so the 0.99999 rule is report-only with its floor (decision 0046 A6 fix5).
-        // The d1 anchor 0.9799 is the decode parity's minimum over all five prompt tokens
-        // (evidence 9dec1b7c); this gate measures the last row of the chunk only, so the
+        // BF16: the chunk runs BF16 activations against the frozen F32 evidence, so the 0.99999
+        // rule is report-only with its floor. The anchor 0.9799 is the decode parity's minimum over
+        // all five prompt tokens; this gate measures the last row of the chunk only, so the
         // no-ratchet check is the weaker sample of the two.
         assert!(
             logits_cos.is_finite(),
@@ -398,7 +394,7 @@ fn real_checkpoint_chunk_matches_the_host_reference() {
 }
 
 #[test]
-#[ignore = "needs the real checkpoint and the frozen Q36-HR evidence on the Mac; run with --ignored"]
+#[ignore = "needs the real checkpoint and the frozen host-reference evidence on the Mac"]
 fn real_checkpoint_chunks_match_the_one_token_path() {
     let _serial = crate::native_test_lock();
     let (ckpt_dir, ref_dir) = (env_path("Q36_CKPT_DIR"), env_path("Q36_REF_DIR"));
@@ -408,7 +404,7 @@ fn real_checkpoint_chunks_match_the_one_token_path() {
     let ev = evidence(&ref_dir, &ckpt_dir);
     let n = env_number("Q36_G2_TOKENS", 296, 16, G2_TOKENS_HIGH);
     let chunk = env_number("Q36_G2_CHUNK", 128, 1, MAX_CHUNK_ROWS as usize);
-    // Fix4 of packet Q36-BF16-b: the triangulation inputs are checked and the dump directory is
+    // The triangulation inputs are checked and the dump directory is
     // created here, before any native object exists — the checkpoint open and the decoder below.
     if let Some(dir) = ref_dump.as_deref() {
         check_ref_dump(std::path::Path::new(dir), n, chunk);
@@ -446,7 +442,7 @@ fn real_checkpoint_chunks_match_the_one_token_path() {
     // path runs on the host as the parity reference, so the gate compares a device chunk with
     // host steps. Both select experts from the same F32 probability bits with the same tie rule,
     // so only the accumulation of M > 1 against M = 1 differs. Device routing parity of the
-    // decode path is gated by Q36-DR4.
+    // decode path is gated by `route_parity`.
     decoder.set_routing(Routing::Host);
     for &t in before {
         decoder.step(&mut stepped, t, StepMode::Prompt).unwrap();
@@ -516,12 +512,11 @@ fn real_checkpoint_chunks_match_the_one_token_path() {
             "greedy token {at} after the prompt differs: chunk {a:?}, steps {b:?}"
         ));
     }
-    // The triangulation of git-db against an F32 run of this test: with Q36_G2_DUMP_DIR this run
+    // The triangulation against an F32 run of this test: with Q36_G2_DUMP_DIR this run
     // writes its last-row vectors for a later BF16 run, and with Q36_G2_REF_DIR it reads an F32
     // dump and reports this dtype's chunk and steps against it.
     if let Some(dir) = dump_dir.as_deref() {
-        // Created new before the runs (fix4): only this run's four dumps and its meta.txt land
-        // in it.
+        // Created new before the runs: only this run's four dumps and its meta.txt land in it.
         let dir = std::path::Path::new(dir);
         for (name, rows) in [
             ("steps-layers.f32", &want.layer_out),
@@ -578,7 +573,10 @@ fn real_checkpoint_chunks_match_the_one_token_path() {
         "tokens": tokens.len(), "chunk_rows": chunk, "routing_steps": "host",
         "activation_dtype": activation_name(act),
         "bounds": {"min_cosine": MIN_COSINE, "max_relative_error": MAX_REL_ERROR, "max_relative_error_gated": act == Activation::F32, "min_cosine_gated": act == Activation::F32, "bf16_layer_cosine_gated": false, "bf16_logits_cosine_floor": BF16_LOGITS_COSINE_FLOOR},
-        "bound_note": "f32 gates cosine and max relative error; bf16 gates the top 5, the 8 greedy tokens, a finite cosine on every layer row and the logits cosine at bf16_logits_cosine_floor, and reports the layer cosines (with the layer of the minimum) and the max relative error (packet Q36-BF16-b; the floor is provisional until Q36-BF16-SENS)",
+        "bound_note": "f32 gates cosine and max relative error; bf16 gates the top 5, the 8 \
+                       greedy tokens, a finite cosine on every layer row and the logits cosine at \
+                       bf16_logits_cosine_floor, and reports the layer cosines (with the layer of \
+                       the minimum) and the max relative error (the floor is provisional)",
         "min_layer_cosine": min_cos, "max_layer_rel": max_layer_rel,
         "logits_cosine": logits_cos, "logits_rel": logits_rel,
         "top5_chunk": got_top5, "top5_steps": want_top5,

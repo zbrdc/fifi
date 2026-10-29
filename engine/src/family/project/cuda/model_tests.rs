@@ -1,4 +1,4 @@
-//! Real-file tests of the whole-model load (decision 0040 packet 5).
+//! Real-file tests of the whole-model load.
 //!
 //! Every test is `#[ignore]` and returns with `SKIPPED <name>: <var> unset` when
 //! the variable that names its file is unset, like the measurement tests of
@@ -42,12 +42,12 @@ const F32_COUNT: usize = 301;
 const TILED_SOURCE_BYTES: u64 = 20_319_723_520;
 const F32_SOURCE_BYTES: u64 = 88_852_992;
 const TILED_DEVICE_BYTES: usize = 20_347_535_360;
-/// The tiles plus the F32 tensors, which upload as read (decision 0047 A1).
+/// The tiles plus the F32 tensors, which upload as read.
 const DEVICE_BYTES: usize = 20_436_388_352;
 const _: () = assert!(TILED_DEVICE_BYTES + F32_SOURCE_BYTES as usize == DEVICE_BYTES);
 /// Rows dequantized and multiplied at a time by the dense reference.
 const REFERENCE_CHUNK_ROWS: usize = 4096;
-/// A real tensor above this NMSE is reported before the packet goes on.
+/// A real tensor above this NMSE is reported before the test goes on.
 const REPORT_NMSE: f64 = 1e-6;
 /// Output lengths from which the argmax of a token is compared.
 const ARGMAX_MIN_ROWS: usize = 64;
@@ -80,8 +80,8 @@ fn open_model(test: &str) -> Option<GgufModel> {
     Some(model)
 }
 
-/// Loads with a zero headroom, the packet 5 value: the provisional 4 GiB is
-/// marginal on a 24 GiB card that also drives a desktop.
+/// Loads with a zero headroom: the provisional 4 GiB is marginal on a 24 GiB card that
+/// also drives a desktop.
 fn options_without_headroom() -> LoadOptions<'static> {
     LoadOptions {
         reserve: Reserve {
@@ -253,11 +253,10 @@ fn the_whole_model_loads_and_the_counts_match_the_header() {
     live_after_drop(&projector, start, "the model load");
 }
 
-/// `load_model` records the layout of its options in `LoadedModel.layout` (MATVEC-PAR S2,
-/// KUBDAN-MSG-68 M-4): one native whole-model load - `load_model` was covered only by the
-/// scratch route before. The native device bytes are the tiled totals minus the 27,811,840
-/// Q6_K tile padding (the plan tests pin the difference), every quantized tensor arrives as
-/// a `CudaWeight::Native`, and the drop frees the load. The Tiled side of the assertion is
+/// `load_model` records the layout of its options in `LoadedModel.layout`: one native
+/// whole-model load. The native device bytes are the tiled totals minus the 27,811,840 Q6_K
+/// tile padding (the plan tests pin the difference), every quantized tensor arrives as a
+/// `CudaWeight::Native`, and the drop frees the load. The Tiled side of the assertion is
 /// `the_whole_model_loads_and_the_counts_match_the_header` (the default options).
 #[test]
 #[ignore = "real file: needs INFERENCE_CUDA_MODEL_GGUF and a device with 20 GiB free"]
@@ -318,7 +317,7 @@ fn a_refused_whole_model_load_leaves_the_live_bytes_unchanged_and_the_next_load_
         Err(EngError::MemoryPlan(text)) => {
             assert!(text.contains("cuda admission"), "refusal text: {text}");
             println!("REFUSAL {text}");
-            // The admission sum is the tiles plus the F32 tensors (decision 0047 A1).
+            // The admission sum is the tiles plus the F32 tensors.
             assert!(
                 text.contains(&format!("(tensors {DEVICE_BYTES},")),
                 "refusal text: {text}"
@@ -1204,8 +1203,8 @@ fn measure_headroom_bytes() -> u64 {
 }
 
 /// One `load_model` between the `after_open` and `after_load` stages. The F32 tensors are
-/// inside that load since decision 0047 A1, so `U`, `free_after_load` and `alloc_overhead`
-/// of the summary line are the numbers to compare with the run before A1.
+/// inside that load, so `U`, `free_after_load` and `alloc_overhead` of the summary line
+/// include them.
 #[test]
 #[ignore = "real file: needs INFERENCE_CUDA_MEASURE_MODEL_GGUF and a device with 20 GiB free"]
 fn measure_model_load_headroom() {

@@ -1,7 +1,6 @@
-//! The pure pieces of the one-entry prefix reuse of the CUDA arm (decision 0036, addendum 1):
-//! the numeric path tag a saved entry carries, and the host-byte charge of an entry. The glue
-//! itself lives in `executor.rs` (the two closures around the shared session rules); the device
-//! behaviour is `prefix_device_tests.rs`.
+//! The pure pieces of the one-entry prefix reuse of the CUDA arm: the numeric path tag a saved
+//! entry carries, and the host-byte charge of an entry. The glue itself lives in `executor.rs` (the
+//! two closures around the shared session rules); the device behaviour is `prefix_device_tests.rs`.
 
 use super::state::{
     export::ExportedState,
@@ -25,12 +24,10 @@ pub(super) struct PendingPrefix {
     pub(super) path: CudaPrefillPath,
     pub(super) state: PendingPinned,
 }
-
 /// The numeric prefill path that built a saved entry: a state restores only under the path that
-/// built it, because a batched prefill matches one-token steps only within a tolerance (decision
-/// 0036, item 7). The key also binds the actual KV format before native restore validation;
-/// chunked prefill (decision 0049) must add `Chunked(n)` and pass it here, exactly like the
-/// Flash-Next twin.
+/// built it, because a batched prefill matches one-token steps only within a tolerance. The key
+/// also binds the actual KV format before native restore validation; chunked prefill must add
+/// `Chunked(n)` and pass it here, exactly like the Flash-Next twin.
 ///
 /// Neither this path nor `StateIdentity` covers the WEIGHT LAYOUT: an entry matches the device
 /// buffers it was exported from only while it lives in memory, inside one step's lifetime (one

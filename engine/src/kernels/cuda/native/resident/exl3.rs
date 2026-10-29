@@ -395,8 +395,12 @@ pub(in crate::kernels::cuda) fn grouped(
     let mut stage = STAGE_NONE;
     #[cfg(all(test, feature = "native-cuda", target_os = "linux"))]
     if launch_observer::recording() {
-        // The gather variant emits the identical launch plan.
-        return checked(launch_observer::grouped(&args, stream, &mut stage), stage);
+        // Identical launch plan either way; the observed entry records which
+        // variant actually ran so tests cannot claim gather without running it.
+        return checked(
+            launch_observer::grouped(&args, stream, &mut stage, gather),
+            stage,
+        );
     }
     // SAFETY: every record has live bounded owners and validated local extents.
     // C validates all group shapes, contiguous writes and cross-group aliases before ANY enqueue.
@@ -423,6 +427,8 @@ pub(in crate::kernels::cuda) mod launch_observer {
     thread_local! {
         static COUNT: Cell<Option<u64>> = const { Cell::new(None) };
         static ROUTED: Cell<bool> = const { Cell::new(false) };
+        /// 0 none, 1 shuffle, 2 gather, 3 mixed across a leg's dispatches.
+        static GATHERED: Cell<u8> = const { Cell::new(0) };
     }
 
     #[repr(C)]
@@ -467,6 +473,15 @@ pub(in crate::kernels::cuda) mod launch_observer {
             stream: *mut c_void,
             stage: *mut c_int,
             launches: *mut u64,
+            variant: *mut u32,
+        ) -> c_int;
+        fn inference_cuda_exl3_grouped_observed_gathered(
+            args: *const LinearArgs,
+            count: usize,
+            stream: *mut c_void,
+            stage: *mut c_int,
+            launches: *mut u64,
+            variant: *mut u32,
         ) -> c_int;
         fn inference_cuda_exl3_linear_observed(
             args: *const LinearArgs,
@@ -503,20 +518,52 @@ pub(in crate::kernels::cuda) mod launch_observer {
         ))
     }
 
-    pub(super) fn grouped(args: &[LinearArgs], stream: &RawStream, stage: &mut c_int) -> c_int {
+    pub(super) fn grouped(
+        args: &[LinearArgs],
+        stream: &RawStream,
+        stage: &mut c_int,
+        gather: bool,
+    ) -> c_int {
         let mut launches = 0;
+        let mut variant = 0u32;
         // SAFETY: live validated records and owners; C checks cross-group aliases
-        // before launch. Both writable host outputs remain live through this call.
+        // before launch. All three writable host outputs remain live through this
+        // call; C writes the variant only after a successful projection enqueue.
         let status = unsafe {
-            inference_cuda_exl3_grouped_observed(
-                args.as_ptr(),
-                args.len(),
-                stream.as_ptr(),
-                stage,
-                &mut launches,
-            )
+            if gather {
+                inference_cuda_exl3_grouped_observed_gathered(
+                    args.as_ptr(),
+                    args.len(),
+                    stream.as_ptr(),
+                    stage,
+                    &mut launches,
+                    &mut variant,
+                )
+            } else {
+                inference_cuda_exl3_grouped_observed(
+                    args.as_ptr(),
+                    args.len(),
+                    stream.as_ptr(),
+                    stage,
+                    &mut launches,
+                    &mut variant,
+                )
+            }
         };
         COUNT.with(|count| count.set(Some(count.get().unwrap().checked_add(launches).unwrap())));
+        // The variant comes from the device launch, never the request; a refusal
+        // or zero launches records nothing and fails the leg's assert.
+        if status == 0 && variant != 0 {
+            GATHERED.with(|used| {
+                let code = variant as u8;
+                let seen = used.get();
+                if seen == 0 {
+                    used.set(code);
+                } else if seen != code {
+                    used.set(3);
+                }
+            });
+        }
         status
     }
 
@@ -561,6 +608,8 @@ pub(in crate::kernels::cuda) mod launch_observer {
             assert!(count.get().is_none(), "nested EXL3 launch capture");
             count.set(Some(0));
         });
+        // Reset here, not in Drop: callers read the variant after capture returns.
+        GATHERED.with(|used| used.set(0));
         let guard = Capture;
         let result = run();
         let count = COUNT.with(|count| count.get().unwrap());
@@ -581,6 +630,17 @@ pub(in crate::kernels::cuda) mod launch_observer {
 
     pub(super) fn recording() -> bool {
         ROUTED.with(Cell::get) && COUNT.with(|count| count.get().is_some())
+    }
+
+    /// Which grouped variant a captured leg actually ran: none, all shuffle,
+    /// all gather, or mixed. Written by C at the successful projection enqueue.
+    pub(in crate::kernels::cuda) fn grouped_variant() -> Option<&'static str> {
+        match GATHERED.with(Cell::get) {
+            0 => None,
+            1 => Some("shuffle"),
+            2 => Some("gather"),
+            _ => Some("mixed"),
+        }
     }
 
     pub(super) fn linear(

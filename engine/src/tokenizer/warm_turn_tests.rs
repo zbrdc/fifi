@@ -1,9 +1,9 @@
-//! RED pin for the warm-turn incremental encoder (approved 01a17235):
+//! Tests for the warm-turn incremental encoder:
 //! a per-session cache that reuses the previous turn's head render + ids
 //! and tokenizes only the appended delta, with byte-exact ids on every
 //! turn and a full-encode fallback on ANY doubt.
 //!
-//! Conditions pinned here (B's approval):
+//! Conditions pinned here:
 //! (1) EXACT — every warm turn's ids are byte-identical to a full encode;
 //!     the corpus test walks each real multi-turn session turn by turn;
 //!     the self-check variant cross-checks every call in test builds.
@@ -28,8 +28,8 @@ use crate::tokenizer::{
 
 /// The real pinned-template bundle, same loader as the boundary corpus
 /// test. None (skip) when the model dir is absent — portable hosts run
-/// everything else; the gate host sets FIFI_QWEN36_MODEL_DIR or uses the
-/// pinu default.
+/// everything else; a host with the model sets FIFI_QWEN36_MODEL_DIR or
+/// uses the default path.
 fn qwen_bundle() -> Option<TokenizerBundle> {
     let dir = super::boundary_derive_tests::qwen_model_dir()?;
     let read = |n: &str| std::fs::read(dir.join(n)).unwrap();
@@ -112,7 +112,7 @@ fn warm_corpus_turns_are_byte_identical_to_full_encodes() {
         }
         assert!(
             cache.reuses() >= 1,
-            "corpus {} must exercise at least one actual reuse (SF1)",
+            "corpus {} must exercise at least one actual reuse",
             conv["name"]
         );
     }
@@ -135,8 +135,8 @@ fn tool_named(name: &str) -> ToolSpec {
 }
 
 /// The cache key binds the system opener, the tool list, and the thinking
-/// mode — ONE render-neutral variable at a time (Sol round 3 SF1). Each
-/// case runs TWO identically seeded caches through the SAME append on
+/// mode — ONE render-neutral variable at a time. Each case runs TWO
+/// identically seeded caches through the SAME append on
 /// TEMPLATE_TURN_BODY_ONLY, where system, tools, and thinking never
 /// render: the control (same key) MUST reuse, the probe (one key input
 /// different) MUST fall back with byte-identical ids and boundaries to
@@ -285,12 +285,11 @@ fn warm_cannot_tell_a_first_turn_edit_from_a_foreign_conversation() {
     );
 }
 
-/// Sol MF (root boundary, revival round): after a system-only seed the
-/// cached root is None (the seed's root equals its tip, so the derivation
-/// filter rejects it), but the first warm append's prompt DOES derive a
-/// root. The warm path must re-derive the root for the appended prompt
-/// instead of returning the stale cached None — the derived path is the
-/// oracle, and ids stay exact either way.
+/// After a system-only seed the cached root is None (the seed's root
+/// equals its tip, so the derivation filter rejects it), but the first
+/// warm append's prompt DOES derive a root. The warm path must re-derive
+/// the root for the appended prompt instead of returning the stale cached
+/// None — the derived path is the oracle, and ids stay exact either way.
 #[test]
 fn warm_re_derives_the_root_after_a_system_only_seed() {
     let (_d, bundle) = fixture_bundle(TEMPLATE_TURN);
@@ -317,12 +316,12 @@ fn warm_re_derives_the_root_after_a_system_only_seed() {
     );
 }
 
-/// Sol-6 MF: a SYSTEM-ONLY seed (allowed by parse_messages and the plain
-/// templates, though the pinned Qwen template rejects it). The seed's
-/// boundary covers its whole head with no turn; the first warm hit that
-/// appends the turn must re-derive the boundary from the renders it already
-/// has (no hit-path render), so the THIRD request — a foreign first turn —
-/// still labels other-conversation, not seam. Ids exact throughout.
+/// A SYSTEM-ONLY seed (allowed by parse_messages and the plain templates,
+/// though the pinned Qwen template rejects it). The seed's boundary covers
+/// its whole head with no turn; the first warm hit that appends the turn
+/// must re-derive the boundary from the renders it already has (no hit-path
+/// render), so the THIRD request — a foreign first turn — still labels
+/// other-conversation, not seam. Ids exact throughout.
 #[test]
 fn warm_updates_the_boundary_after_a_system_only_seed_appends_a_turn() {
     let (_d, bundle) = fixture_bundle(TEMPLATE_TURN);
@@ -372,12 +371,12 @@ fn warm_updates_the_boundary_after_a_system_only_seed_appends_a_turn() {
     );
 }
 
-/// Opus MF2a: after a system-only seed, the boundary's derivability still
-/// depends on history. A head that grew PAST the first turn in one warm
-/// hit leaves the boundary render underivable from that hit's renders —
-/// the next divergence must report "unresolved", never a guessed
-/// "seam". The direct-seed control (same middle request, seeded fresh)
-/// DOES derive the boundary and reports other-conversation: the pair
+/// After a system-only seed, the boundary's derivability still depends
+/// on history. A head that grew PAST the first turn in one warm hit
+/// leaves the boundary render underivable from that hit's renders — the
+/// next divergence must report "unresolved", never a guessed "seam".
+/// The direct-seed control (same middle request, seeded fresh) DOES
+/// derive the boundary and reports other-conversation: the pair
 /// documents the history-dependence honestly instead of hiding it.
 #[test]
 fn warm_names_an_unresolved_boundary_after_a_head_grew_past_the_first_turn() {
@@ -447,11 +446,11 @@ fn warm_names_an_unresolved_boundary_after_a_head_grew_past_the_first_turn() {
     );
 }
 
-/// Opus MF2b: the pinned Qwen template demotes non-initial system
-/// messages to user turns, so an ALL-SYSTEM head's whole render is
-/// boundary region. The endpoint must ADVANCE with every all-system hit
-/// — a stale endpoint mislabeled a divergence in the demoted region as
-/// seam, while a direct seed of the same history says other-conversation.
+/// The pinned Qwen template demotes non-initial system messages to user
+/// turns, so an ALL-SYSTEM head's whole render is boundary region. The
+/// endpoint must ADVANCE with every all-system hit — a stale endpoint
+/// mislabeled a divergence in the demoted region as seam, while a direct
+/// seed of the same history says other-conversation.
 #[test]
 fn warm_advances_the_boundary_for_all_system_heads() {
     let Some(bundle) = qwen_bundle() else {
@@ -520,8 +519,8 @@ fn warm_advances_the_boundary_for_all_system_heads() {
 }
 
 /// A resend AFTER A HIT reuses the stored result outright: no render, no
-/// encode, no fallback (the replay report's repeat-turn shape). The RED
-/// pin: today a resend is refused (`reason=resend`) and pays the derived
+/// encode, no fallback (an agent's repeat-turn shape). Without the stored
+/// result a resend is refused (`reason=resend`) and pays the derived
 /// fallback — ~4 full-conversation renders + a full encode at 128K.
 #[test]
 fn warm_serves_a_resend_after_a_hit_without_rework() {
@@ -555,7 +554,7 @@ fn warm_serves_a_resend_after_a_hit_without_rework() {
         "a resend is a counted reuse, never a fallback"
     );
     // In test builds the resend shortcut's diagnostic cross-check runs
-    // ONE full encode (Opus N4); production (self_check off) does none.
+    // ONE full encode; production (self_check off) does none.
     assert_eq!(
         bundle.counts(),
         (1, 1),
@@ -574,11 +573,11 @@ fn warm_serves_a_resend_after_a_hit_without_rework() {
     assert_eq!(bundle.counts(), (1, 1));
 }
 
-/// Sol r2 MF (absent vs empty): the pinned Qwen template treats an
-/// ABSENT reasoning_content differently from a present empty one, but
-/// the old digest hashed both as length-0 + "" — the resend returned
-/// another request's ids. Both directions must MISS here, with ids from
-/// the fallback matching the full oracle.
+/// Absent vs empty: the pinned Qwen template treats an ABSENT
+/// reasoning_content differently from a present empty one, but the old
+/// digest hashed both as length-0 + "" — the resend returned another
+/// request's ids. Both directions must MISS here, with ids from the
+/// fallback matching the full oracle.
 #[test]
 fn warm_resend_misses_when_only_reasoning_presence_changes() {
     for (first_reasoning, second_reasoning) in [(None, Some("")), (Some(""), None)] {
@@ -615,10 +614,10 @@ fn warm_resend_misses_when_only_reasoning_presence_changes() {
     }
 }
 
-/// Sol r2 MF (field boundaries): the old digest concatenated tool-call
-/// id + name + arguments with no framing, so shifting text across field
-/// boundaries ("call_1"+"Read" == "call_1R"+"ead") hashed identically
-/// while the template renders different calls. Both shifts must MISS.
+/// Field boundaries: the old digest concatenated tool-call id + name +
+/// arguments with no framing, so shifting text across field boundaries
+/// ("call_1"+"Read" == "call_1R"+"ead") hashed identically while the
+/// template renders different calls. Both shifts must MISS.
 #[test]
 fn warm_resend_misses_when_tool_call_field_boundaries_shift() {
     let shifts = [
@@ -657,11 +656,11 @@ fn warm_resend_misses_when_tool_call_field_boundaries_shift() {
     }
 }
 
-/// Sol r2 MF3 / Sol-final F1 (effective flags, each pinned alone): two
-/// bundles from the SAME pins with different effective rendering share
-/// file identity, so only the flag fold in the key keeps their caches
-/// apart. The pairs cover replay-only and wrap-only differences, so
-/// deleting EITHER flag-hash line in `identity_fold` breaks its case.
+/// Effective flags, each pinned alone: two bundles from the SAME pins
+/// with different effective rendering share file identity, so only the
+/// flag fold in the key keeps their caches apart. The pairs cover
+/// replay-only and wrap-only differences, so deleting EITHER flag-hash
+/// line in `identity_fold` breaks its case.
 #[test]
 fn warm_resend_misses_when_effective_flags_differ_on_same_pins() {
     let (_d, mut plain) = fixture_bundle(TEMPLATE_FIELDS);
@@ -843,14 +842,14 @@ fn warm_resend_misses_when_any_render_input_changes() {
     );
 }
 
-/// Sol-6 SF: a work-counter oracle for the warm paths. Render counts
-/// (slot 0 of `counts()`): the mid-history re-seed pays the derivation's
-/// full + head renders, the re-seed's head render, and the first-turn
-/// boundary render (4); an appended HIT pays only its own full + head
-/// renders plus the test-build cross-check's two (4) — NO boundary
-/// render, pinning the fold's no-extra-render fix; a head that ENDS at
-/// the first turn re-seeds without the boundary render (3) — the head
-/// render IS the boundary render, pinning that R1 fix.
+/// A work-counter oracle for the warm paths. Render counts (slot 0 of
+/// `counts()`): the mid-history re-seed pays the derivation's full +
+/// head renders, the re-seed's head render, and the first-turn boundary
+/// render (4); an appended HIT pays only its own full + head renders
+/// plus the test-build cross-check's two (4) — NO boundary render,
+/// pinning the fold's no-extra-render fix; a head that ENDS at the first
+/// turn re-seeds without the boundary render (3) — the head render IS
+/// the boundary render, pinning that shortcut.
 #[test]
 fn warm_counts_renders_on_the_hit_and_reseed_paths() {
     let (_d, bundle) = fixture_bundle(TEMPLATE_TURN);
@@ -907,10 +906,10 @@ fn warm_counts_renders_on_the_hit_and_reseed_paths() {
     );
 }
 
-/// MF2 (Opus round 1): the agents' traffic is SYSTEM-FIRST, and the warm key
-/// already pins the system text — so the boundary must sit past the first
-/// NON-system message, or a same-system foreign conversation (exactly the
-/// replay report's side-request shape) would classify as a seam miss.
+/// Agent traffic is SYSTEM-FIRST, and the warm key already pins the system
+/// text — so the boundary must sit past the first NON-system message, or a
+/// same-system foreign conversation (exactly the shape of an agent's side
+/// request) would classify as a seam miss.
 #[test]
 fn warm_names_a_system_first_foreign_conversation_not_a_seam_miss() {
     let Some(bundle) = qwen_bundle() else {
@@ -1048,10 +1047,10 @@ fn warm_uses_the_boundary_eligibility_gate() {
         Some("seed"),
         "an empty slot names its seed first, whatever the tokenizer"
     );
-    // Warm case (Sol round 3 SF1): the fallback still SEEDS the cache, so
-    // an APPENDED turn on the seeded cache must refuse again — the
-    // eligibility gate holds warm, not just cold, and the append rules
-    // out an empty-delta/prefix explanation.
+    // Warm case: the fallback still SEEDS the cache, so an APPENDED
+    // turn on the seeded cache must refuse again — the eligibility
+    // gate holds warm, not just cold, and the append rules out an
+    // empty-delta/prefix explanation.
     let turn_two = msgs(&[
         ("system", "You are careful."),
         ("user", "hello"),
@@ -1075,11 +1074,11 @@ fn warm_uses_the_boundary_eligibility_gate() {
     assert_eq!(
         cache.digest_calls(),
         0,
-        "an ineligible tokenizer is never hashed, key match or not (Opus delta5 SF2)"
+        "an ineligible tokenizer is never hashed, key match or not"
     );
-    // Opus delta SF: "key" beats the gates — on this ineligible fixture,
-    // a request whose KEY differs (foreign system opener) must name the
-    // key change, not the eligibility gate (or the head-partial scan it
+    // "key" beats the gates — on this ineligible fixture, a request
+    // whose KEY differs (foreign system opener) must name the key
+    // change, not the eligibility gate (or the head-partial scan it
     // never reaches).
     let foreign_key = msgs(&[("system", "You are terse."), ("user", "hello")]);
     let (warm_ids, _) = bundle
@@ -1096,10 +1095,10 @@ fn warm_uses_the_boundary_eligibility_gate() {
     );
 }
 
-/// Opus delta SF3: when a KEY change and a refusing gate occur together
-/// (a foreign conversation whose tool list ALSO differs), the classifier's
-/// order decides the name — key before the warm attempt's gates. The pins
-/// fail if the order ever flips (a foreign tool-less request would then be
+/// When a KEY change and a refusing gate occur together (a foreign
+/// conversation whose tool list ALSO differs), the classifier's order
+/// decides the name — key before the warm attempt's gates. The pins fail
+/// if the order ever flips (a foreign tool-less request would then be
 /// miscounted as other-conversation instead of key).
 #[test]
 fn warm_names_a_key_change_even_when_the_history_is_foreign() {
@@ -1177,17 +1176,17 @@ const TEMPLATE_TURN_BODY_ONLY: &str = concat!(
 );
 
 /// The fixture tokenizer plus the eligible added token `o<|end|>` and the
-/// letters the role names need — Opus's MF1 counterexample vocabulary:
+/// letters the role names need — the counterexample vocabulary:
 /// leftmost-longest merges the "o" at the end of a head ending in "hello"
 /// with the `<|end|>` that opens the generation prompt into ONE token.
 const TOKENIZER_JSON_SPAN: &str = r#"{"version":"1.0","truncation":null,"padding":null,"added_tokens":[{"id":100,"content":" world","special":false,"single_word":false,"lstrip":false,"rstrip":false,"normalized":false},{"id":101,"content":"<|end|>","special":true,"single_word":false,"lstrip":false,"rstrip":false,"normalized":false},{"id":102,"content":"o<|end|>","special":false,"single_word":false,"lstrip":false,"rstrip":false,"normalized":false}],"normalizer":null,"pre_tokenizer":{"type":"ByteLevel","add_prefix_space":false,"trim_offsets":false,"use_regex":true},"post_processor":{"type":"ByteLevel","add_prefix_space":false,"trim_offsets":false,"use_regex":false},"decoder":{"type":"ByteLevel","add_prefix_space":false,"trim_offsets":false,"use_regex":false},"model":{"type":"BPE","dropout":null,"unk_token":null,"continuing_subword_prefix":null,"end_of_word_suffix":null,"fuse_unk":false,"byte_fallback":false,"ignore_merges":false,"vocab":{"h":0,"e":1,"l":2,"o":3,"Ġ":4,"w":5,"r":6,"d":7,"hello":8,"a":9,"b":10,"he":11,"hel":12,"hell":13,":":14,"u":15,"s":16,"t":17,"m":18,"i":19,"n":20,"y":21,"c":22},"merges":[["h","e"],["he","l"],["hel","l"],["hell","o"]]}}"#;
 
-/// MF1 (Opus): the new head ends inside a proper prefix of the added
-/// token `o<|end|>` (it ends in "hello"), the generation prompt starts
-/// with the complete `<|end|>`, and every other precondition passes. The
-/// suffix proof cannot see the token that spans the join, so the head
-/// guard must refuse the seam and the warm path must fall back — with ids
-/// exactly equal to the full encode (which merges `o<|end|>`).
+/// The new head ends inside a proper prefix of the added token `o<|end|>`
+/// (it ends in "hello"), the generation prompt starts with the complete
+/// `<|end|>`, and every other precondition passes. The suffix proof
+/// cannot see the token that spans the join, so the head guard must
+/// refuse the seam and the warm path must fall back — with ids exactly
+/// equal to the full encode (which merges `o<|end|>`).
 #[test]
 fn warm_falls_back_when_a_token_spans_the_head_generation_join() {
     let (_d, bundle) = fixture_bundle_with(TOKENIZER_JSON_SPAN, TEMPLATE_TURN);
@@ -1220,7 +1219,7 @@ fn warm_falls_back_when_a_token_spans_the_head_generation_join() {
     );
 }
 
-/// SF2: the module doc promises refusal on partial-added-token heads. The
+/// The module doc promises refusal on partial-added-token heads. The
 /// head ends in " ", a proper prefix of the added token ` world` — the
 /// old-head guard must refuse reuse (counted) and stay exact.
 #[test]
@@ -1248,7 +1247,7 @@ fn warm_refuses_a_head_ending_inside_a_partial_added_token() {
     assert!(cache.fallbacks() >= 2, "each refusal is counted");
 }
 
-/// SF1: a two-turn pure append on the turn-separated template — the
+/// A two-turn pure append on the turn-separated template — the
 /// second turn MUST take the warm path (exactly one reuse), so a
 /// regression that makes warm_turn always return false fails here.
 #[test]
@@ -1297,7 +1296,7 @@ fn warm_reuses_on_a_pure_appended_turn() {
     assert_eq!(cache.fallbacks(), 1, "no second fallback");
 }
 
-/// SF1: the self-check must run on a WARM call, not on the seed fallback.
+/// The self-check must run on a WARM call, not on the seed fallback.
 #[test]
 fn warm_self_check_runs_on_a_reused_turn() {
     let Some(bundle) = qwen_bundle() else {
@@ -1349,12 +1348,12 @@ fn warm_cache_reports_accounted_bytes() {
     );
 }
 
-/// Sol r1 MF (render-preserving role edits): a marked-user seed and its
-/// demoted-system twin render byte-identically under the Qwen template, so
-/// the twin warm-hits. But the raw first-turn selector MOVED (2 -> 3
-/// rows); the hit must not keep the seed's endpoint — the foreign twin
-/// (same key, unrelated final turn) must classify other-conversation,
-/// exactly what directly seeding the same history reports.
+/// Render-preserving role edits: a marked-user seed and its demoted-system
+/// twin render byte-identically under the Qwen template, so the twin
+/// warm-hits. But the raw first-turn selector MOVED (2 -> 3 rows); the hit
+/// must not keep the seed's endpoint — the foreign twin (same key,
+/// unrelated final turn) must classify other-conversation, exactly what
+/// directly seeding the same history reports.
 #[test]
 fn warm_hit_refreshes_the_endpoint_when_roles_alias_the_render() {
     let Some(bundle) = qwen_bundle() else {
@@ -1411,10 +1410,10 @@ fn warm_hit_refreshes_the_endpoint_when_roles_alias_the_render() {
     );
 }
 
-/// Sol r2 MF (unchanged selector, content growth): a whole-head endpoint
-/// must track the head it covers. Seed [system "hello", user "hello"];
-/// the middle request grows the user content to "hello world" — same raw
-/// rows, byte-extend head, eligible one-token delta, so it warm-hits while
+/// Unchanged selector, content growth: a whole-head endpoint must track
+/// the head it covers. Seed [system "hello", user "hello"]; the middle
+/// request grows the user content to "hello world" — same raw rows,
+/// byte-extend head, eligible one-token delta, so it warm-hits while
 /// first_message_end stays 2. The endpoint must then cover the NEW whole
 /// head (what directly seeding the middle history stores), or the third
 /// request ("hello war", diverging inside it) mislabels seam.
@@ -1524,10 +1523,10 @@ fn flag_conv() -> Vec<PromptMessage> {
     appended_with_reasoning(Some("secret"))
 }
 
-/// SF-C: different TEMPLATE BYTES with identical flags must miss — the
-/// pin digests in the identity fold are the only guard left once the
-/// flags agree, and dropping `self.identity.hash` from the fold breaks
-/// exactly this test (Opus delta SF3).
+/// Different TEMPLATE BYTES with identical flags must miss — the pin
+/// digests in the identity fold are the only guard left once the flags
+/// agree, and dropping `self.identity.hash` from the fold breaks
+/// exactly this test.
 #[test]
 fn warm_resend_misses_when_template_bytes_differ_flags_equal() {
     let (_d, plain) = fixture_bundle(TEMPLATE_FIELDS);
@@ -1562,14 +1561,14 @@ fn warm_resend_misses_when_template_bytes_differ_flags_equal() {
     );
 }
 
-/// Sol r2 lifecycle: a reseed (a truncated conversation here) must
-/// DISCARD the stored last turn. Returning to the old, longer
-/// conversation afterwards is a legitimate APPEND against the reseeded
-/// head — and that is exactly the observable proof the discard
-/// happened: had the stored result survived, the resend gate (same key,
-/// same digest) would fire the shortcut, which renders only the
-/// test-build cross-check (1 render); the append pays the full append
-/// shape (4). Either way the ids must be byte-exact.
+/// Lifecycle: a reseed (a truncated conversation here) must DISCARD the
+/// stored last turn. Returning to the old, longer conversation
+/// afterwards is a legitimate APPEND against the reseeded head — and
+/// that is exactly the observable proof the discard happened: had the
+/// stored result survived, the resend gate (same key, same digest)
+/// would fire the shortcut, which renders only the test-build
+/// cross-check (1 render); the append pays the full append shape (4).
+/// Either way the ids must be byte-exact.
 #[test]
 fn warm_reseed_discards_the_stored_resend_result() {
     let (_d, bundle) = fixture_bundle(TEMPLATE_FIELDS);
@@ -1613,10 +1612,9 @@ fn warm_reseed_discards_the_stored_resend_result() {
     );
 }
 
-/// Sol-final F2: the cross-check predicate's PRODUCTION arm (both
-/// switches off) must stay off — replacing the condition with `true`
-/// would make every production resend pay a full encode.
-/// KNOWN GAP (recorded, accepted by review): the wiring
+/// The cross-check predicate's PRODUCTION arm (both switches off)
+/// must stay off — replacing the condition with `true` would make
+/// every production resend pay a full encode. KNOWN GAP: the wiring
 /// `resend_verify_enabled(cache.self_check, cfg!(test))` cannot be
 /// pinned in-process — `cfg!(test)` is true in every test build, so
 /// replacing the second argument with `true` changes no test-build
@@ -1628,11 +1626,11 @@ fn resend_verify_predicate_off_in_production() {
     assert!(resend_verify_enabled(false, true));
 }
 
-/// Sol-final F2 / Opus delta4 SF / Sol7 MF3: the accounting must count
-/// a POPULATED LastTurn (ids + 32-byte digest) EXACTLY. The
-/// head_and_key_bytes seam recomputes the non-last-turn part
-/// independently, so the split equality catches an undercount in either
-/// half — head growth cannot mask a dropped digest term.
+/// The accounting must count a POPULATED LastTurn (ids + 32-byte
+/// digest) EXACTLY. The head_and_key_bytes seam recomputes the
+/// non-last-turn part independently, so the split equality catches an
+/// undercount in either half — head growth cannot mask a dropped digest
+/// term.
 #[test]
 fn warm_cache_accounts_the_stored_resend_result() {
     let (_d, bundle) = fixture_bundle(TEMPLATE_FIELDS);
@@ -1667,16 +1665,15 @@ fn warm_cache_accounts_the_stored_resend_result() {
     );
 }
 
-/// Sol5 MF (stochastic tokenizers): a BPE with dropout != 0 encodes the
-/// same bytes differently per call. It must be ineligible — no warm
-/// reuse, no resend shortcut, no boundary derivation — even with every
-/// OTHER eligibility flag clean.
+/// Stochastic tokenizers: a BPE with dropout != 0 encodes the same
+/// bytes differently per call. It must be ineligible — no warm reuse,
+/// no resend shortcut, no boundary derivation — even with every OTHER
+/// eligibility flag clean.
 ///
-/// Determinism note (COO requirement): NO assertion here depends on
-/// dropout luck. The eligibility gate, the refusal mapping, the digest
-/// counter, and the reuse counter are all deterministic functions of
-/// the eligibility flag; the stochastic ids are computed but never
-/// compared; the commit message records the repeated-run verification.
+/// Determinism: NO assertion here depends on dropout luck. The
+/// eligibility gate, the refusal mapping, the digest counter, and the
+/// reuse counter are all deterministic functions of the eligibility
+/// flag; the stochastic ids are computed but never compared.
 #[test]
 fn warm_rejects_stochastic_dropout_tokenizer() {
     let json = TOKENIZER_JSON.replace("\"dropout\":null", "\"dropout\":0.5");
@@ -1719,8 +1716,8 @@ fn warm_rejects_stochastic_dropout_tokenizer() {
     assert_eq!(cache.reuses(), 0, "no shortcut on a stochastic tokenizer");
 }
 
-/// COO SF: the digest call site is pinned by the invocation counter —
-/// a cold request, a key-changed request, and an ineligible same-key
+/// The digest call site is pinned by the invocation counter — a cold
+/// request, a key-changed request, and an ineligible same-key
 /// request each compute ZERO digests; only the eligible key-matched
 /// candidate computes exactly one.
 #[test]
@@ -1769,10 +1766,10 @@ fn warm_digest_is_computed_only_for_eligible_key_matched_requests() {
     );
 }
 
-/// COO SF (identity): SAME template bytes and SAME flags, DIFFERENT
-/// tokenizer bytes — only the tokenizer pins in the identity fold keep
-/// the two bundles apart, so replacing `identity.hash` with a
-/// template-only hash breaks exactly this test.
+/// Identity: SAME template bytes and SAME flags, DIFFERENT tokenizer
+/// bytes — only the tokenizer pins in the identity fold keep the two
+/// bundles apart, so replacing `identity.hash` with a template-only
+/// hash breaks exactly this test.
 #[test]
 fn warm_resend_misses_when_only_tokenizer_bytes_differ() {
     // Same vocab-plus-an-unused-token: eligible, renders identically,
@@ -1807,9 +1804,9 @@ fn warm_resend_misses_when_only_tokenizer_bytes_differ() {
     let _ = hit_ids;
 }
 
-/// Sol6 test-adequacy: a ROLE-ONLY edit of the FIRST message (content
-/// identical, non-system key unchanged) must miss — pinning that the
-/// digest covers msgs[0] (a `&msgs[1..]` hash passes every other test).
+/// A ROLE-ONLY edit of the FIRST message (content identical, non-system
+/// key unchanged) must miss — pinning that the digest covers msgs[0] (a
+/// `&msgs[1..]` hash passes every other test).
 #[test]
 fn warm_resend_misses_on_first_message_role_only_change() {
     let (_d, bundle) = fixture_bundle(TEMPLATE_FIELDS);
@@ -1854,12 +1851,12 @@ fn warm_resend_misses_on_first_message_role_only_change() {
 /// test — forcing a fallback error needs a fault-injection seam that
 /// does not exist; adding one is deferred as follow-up surface.
 ///
-/// COO SF (lifecycle): with a POPULATED last turn (a hit happened), an
-/// unrelated head request must not SERVE the stored result — its changed
-/// first message means a KEY miss, so it refuses before any digest work
-/// and reseeds (documented: the stored last turn is discarded); the
-/// original conversation's next request then re-seeds byte-exact rather
-/// than consuming a stale shortcut.
+/// Lifecycle: with a POPULATED last turn (a hit happened), an unrelated
+/// head request must not SERVE the stored result — its changed first
+/// message means a KEY miss, so it refuses before any digest work and
+/// reseeds (documented: the stored last turn is discarded); the original
+/// conversation's next request then re-seeds byte-exact rather than
+/// consuming a stale shortcut.
 #[test]
 fn warm_unrelated_head_reseeds_and_discards_the_stored_result() {
     let (_d, bundle) = fixture_bundle(TEMPLATE_FIELDS);
@@ -1907,16 +1904,16 @@ fn oracle_of(bundle: &TokenizerBundle, turn: &[PromptMessage], tools: &[ToolSpec
         .expect("oracle")
 }
 
-/// Sol8 HIGH / Opus delta6 SF1 (id-rewriting post-processors): a
-/// TemplateProcessing that repeats its input sequence DUPLICATES every
-/// encode — loadable in tokenizers 0.21.4 once "special_tokens":{} is
-/// present — and a MISTAGGED JSON (type "ByteLevel", missing
-/// trim_offsets, carrying the duplicating template body) deserializes
-/// as that same TemplateProcessing because PostProcessorWrapper is
-/// untagged and ignores the tag. Both must be INELIGIBLE: the load-time
-/// behavioral probe sees parts double ([8,8] + [14,14] against a whole
-/// of [8,14,8,14]) and refuses. The ids assertions pin the duplication
-/// itself, so the probe's refusal is attributable.
+/// Id-rewriting post-processors: a TemplateProcessing that repeats its
+/// input sequence DUPLICATES every encode — loadable in tokenizers
+/// 0.21.4 once "special_tokens":{} is present — and a MISTAGGED JSON
+/// (type "ByteLevel", missing trim_offsets, carrying the duplicating
+/// template body) deserializes as that same TemplateProcessing because
+/// PostProcessorWrapper is untagged and ignores the tag. Both must be
+/// INELIGIBLE: the load-time behavioral probe sees parts double
+/// ([8,8] + [14,14] against a whole of [8,14,8,14]) and refuses. The
+/// ids assertions pin the duplication itself, so the probe's refusal is
+/// attributable.
 #[test]
 fn warm_rejects_duplicating_post_processors_behaviorally() {
     let base_pp = r#""post_processor":{"type":"ByteLevel","add_prefix_space":false,"trim_offsets":false,"use_regex":false}"#;
@@ -1951,8 +1948,8 @@ fn warm_rejects_duplicating_post_processors_behaviorally() {
     }
 }
 
-/// Opus delta6 SF1 negative: a template whose single sequence references
-/// the PAIR input (`B`) is not a sane single-encoding template; it
+/// Negative case: a template whose single sequence references the
+/// PAIR input (`B`) is not a sane single-encoding template; it
 /// PANICS inside tokenizers encode, so the load itself is rejected
 /// (see the assertion inside).
 #[test]
@@ -1974,22 +1971,20 @@ fn warm_rejects_pair_sequence_in_single_template() {
     }
 }
 
-/// Opus delta7 SF1 / delta8 SF1 (SentencePiece-style): a normalizer
-/// that PREPENDS a marker to any standalone encode (Prepend "▁" +
-/// Replace " "→"▁", as in Llama-2/Mistral). The fixture vocab carries
-/// the byte-level spelling of ▁ ("â", "ĸ", "ģ"), so the marker really
-/// reaches the ids — the plain-text seam genuinely MISMATCHES (a
-/// standalone " beta" gains a second marker), while the warm seam —
-/// the right chunk STARTING with the plain added token — concatenates
-/// exactly. The probe tests only warm-shaped seams, so this tokenizer
-/// stays ELIGIBLE; a delta7-style plain-seam probe would have wrongly
-/// excluded it.
+/// SentencePiece-style: a normalizer that PREPENDS a marker to any
+/// standalone encode (Prepend "▁" + Replace " "→"▁", as in
+/// Llama-2/Mistral). The fixture vocab carries the byte-level
+/// spelling of ▁ ("â", "ĸ", "ģ"), so the marker really reaches the
+/// ids — the plain-text seam genuinely MISMATCHES (a standalone "
+/// beta" gains a second marker), while the warm seam — the right
+/// chunk STARTING with the plain added token — concatenates exactly.
+/// The probe tests only warm-shaped seams, so this tokenizer stays
+/// ELIGIBLE; a plain-seam probe would wrongly exclude it.
 #[test]
 fn warm_sentencepiece_style_normalizer_stays_eligible() {
     // Byte-level chars of U+2581, added with fresh ids so the Prepend
-    // marker is observable (Opus delta8 SF1: without them the BPE
-    // silently drops the marker and the test passes for the wrong
-    // reason).
+    // marker is observable (without them the BPE silently drops the
+    // marker and the test passes for the wrong reason).
     let mut doc: serde_json::Value = serde_json::from_str(TOKENIZER_JSON).expect("fixture json");
     *doc.get_mut("post_processor").expect("pp") = serde_json::json!({
         "type": "TemplateProcessing",
@@ -2051,12 +2046,12 @@ fn warm_sentencepiece_style_normalizer_stays_eligible() {
     assert_eq!([head, tail].concat(), whole);
 }
 
-/// Opus delta8 SF2: the synthetic post-processor check must catch a
-/// duplicating template on a tokenizer with NO plain special added
-/// tokens (the seam loop is empty and would catch nothing). Chat
-/// markers registered with special:false are exactly such a case, and
-/// the warm path still cuts on non-special added tokens, so this
-/// fixture pins the check that carries the proof.
+/// The synthetic post-processor check must catch a duplicating
+/// template on a tokenizer with NO plain special added tokens (the
+/// seam loop is empty and would catch nothing). Chat markers
+/// registered with special:false are exactly such a case, and the
+/// warm path still cuts on non-special added tokens, so this fixture
+/// pins the check that carries the proof.
 #[test]
 fn warm_synthetic_check_catches_duplication_without_plain_specials() {
     let base_pp = r#""post_processor":{"type":"ByteLevel","add_prefix_space":false,"trim_offsets":false,"use_regex":false}"#;
@@ -2083,10 +2078,10 @@ fn warm_synthetic_check_catches_duplication_without_plain_specials() {
     );
 }
 
-/// Opus delta6 SF2: the ByteLevel post-processor never inserts or
-/// rewrites ids (offset trimming only), so NVFP4/Nemotron-style
-/// add_prefix_space=true tokenizers stay warm-ELIGIBLE — the behavioral
-/// probe decides on behavior, not on the JSON field.
+/// The ByteLevel post-processor never inserts or rewrites ids (offset
+/// trimming only), so NVFP4/Nemotron-style add_prefix_space=true
+/// tokenizers stay warm-ELIGIBLE — the behavioral probe decides on
+/// behavior, not on the JSON field.
 #[test]
 fn warm_byte_level_prefix_space_post_processor_stays_eligible() {
     let json = TOKENIZER_JSON.replace(
@@ -2096,7 +2091,7 @@ fn warm_byte_level_prefix_space_post_processor_stays_eligible() {
     let (_d, bundle) = fixture_bundle_with(&json, TEMPLATE_TURN);
     assert!(
         bundle.tokenizer().boundary_eligible(),
-        "ByteLevel post-processing trims offsets only — eligible (Opus SF2)"
+        "ByteLevel post-processing trims offsets only — eligible"
     );
     let whole = bundle.tokenizer().encode("hello world").expect("whole");
     let head = bundle.tokenizer().encode("hello").expect("head");
@@ -2107,8 +2102,8 @@ fn warm_byte_level_prefix_space_post_processor_stays_eligible() {
 /// The Gemma4-style post-processor (specials + one input sequence in the
 /// structured template) is loadable AND id-preserving at
 /// add_special_tokens=false (specials are skipped), so the behavioral
-/// probe keeps it warm-ELIGIBLE and chunked encodes stay byte-exact
-/// (COO: the [BOS] $A positive fixture).
+/// probe keeps it warm-ELIGIBLE and chunked encodes stay byte-exact (the
+/// [BOS] $A positive fixture).
 #[test]
 fn warm_bos_template_post_processor_stays_eligible_and_chunk_exact() {
     let json = TOKENIZER_JSON.replace(
@@ -2148,10 +2143,10 @@ fn warm_bos_template_post_processor_stays_eligible_and_chunk_exact() {
     );
 }
 
-/// COO (a): the PINNED Qwen3.6 tokenizer stays ELIGIBLE under the
-/// full gate. Checks the real file when it is on disk (env override or
-/// the known model dir) and skips otherwise; prints the loaded value so
-/// the receipt shows it either way.
+/// The PINNED Qwen3.6 tokenizer stays ELIGIBLE under the full gate.
+/// Checks the real file when it is on disk (env override or the known
+/// model dir) and skips otherwise; prints the loaded value so the test
+/// output shows it either way.
 #[test]
 fn pinned_qwen_tokenizer_stays_eligible() {
     let Some(dir) = super::boundary_derive_tests::qwen_model_dir() else {

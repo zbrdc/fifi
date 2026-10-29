@@ -100,7 +100,7 @@ impl State {
         Ok(self.pending_import.take().unwrap().array)
     }
 
-    /// Imports several host tensors and completes them with one synchronization (decision 0039).
+    /// Imports several host tensors and completes them with one synchronization.
     fn import_batch(
         &mut self,
         sources: &[&Tensor],
@@ -246,7 +246,7 @@ impl Context {
         }
         state.retire.flush_after_sync();
         // The stream goes along for the strided case: a non-row-contiguous array is made
-        // contiguous inside the read and synchronized there (packet GAP-TRIM-A).
+        // contiguous inside the read and synchronized there.
         let result = source.storage.readback(state.stream.0);
         if result.is_err() {
             mark_failed();
@@ -254,7 +254,7 @@ impl Context {
         result
     }
 
-    /// Evaluates several resident outputs with one synchronization (decision 0039).
+    /// Evaluates several resident outputs with one synchronization.
     pub(in crate::kernels::mlx) fn evaluate(
         &mut self,
         outputs: &[&ExecutionTensor],
@@ -314,9 +314,9 @@ impl Context {
         Ok(())
     }
 
-    /// Submits the graph of several resident outputs without waiting for the GPU (packet
-    /// NATIVE-OPS-1): one `mlx_vector_array`, one `mlx_async_eval`, no synchronization. A later
-    /// `evaluate`, `readback`, or any other synchronization completes it.
+    /// Submits the graph of several resident outputs without waiting for the GPU: one
+    /// `mlx_vector_array`, one `mlx_async_eval`, no synchronization. A later `evaluate`,
+    /// `readback`, or any other synchronization completes it.
     ///
     /// An async submission is NOT a completed synchronization, so it never flushes the retire
     /// list: retired arrays free after the next completed synchronization as before. The
@@ -378,7 +378,7 @@ impl Context {
         Ok(())
     }
 
-    /// Imports several host tensors with one synchronization (decision 0039).
+    /// Imports several host tensors with one synchronization.
     pub(in crate::kernels::mlx) fn import_many(
         &mut self,
         sources: &[&Tensor],
@@ -400,13 +400,13 @@ impl Context {
     }
 
     /// Returns the lazy graph of `outputs` as the text of `mlx_print_graph`, a
-    /// qualification-only graph dump (packet GPU-GAP-COUNT). The graph is DESCRIBED, never run:
-    /// the dump reads node names, shapes, and dtypes of the pending graph, so it evaluates,
-    /// synchronizes, and releases nothing, and the retire list keeps its arrays (a dump never
-    /// flushes). Like `evaluate_async` the shim fills no output array, so it takes part in no
-    /// selection of the qualification operation faults and consumes no operation-fault slot; no
-    /// counted fault applies to it. A native failure is terminal. The caller owns nothing: the
-    /// shim frees its buffer and the text lives in the returned `String`.
+    /// qualification-only graph dump. The graph is DESCRIBED, never run: the dump reads node
+    /// names, shapes, and dtypes of the pending graph, so it evaluates, synchronizes, and
+    /// releases nothing, and the retire list keeps its arrays (a dump never flushes). Like
+    /// `evaluate_async` the shim fills no output array, so it takes part in no selection of the
+    /// qualification operation faults and consumes no operation-fault slot; no counted fault
+    /// applies to it. A native failure is terminal. The caller owns nothing: the shim frees its
+    /// buffer and the text lives in the returned `String`.
     #[cfg(feature = "native-fault-qualification")]
     pub(in crate::kernels::mlx) fn qualification_graph_text(
         &mut self,

@@ -1,10 +1,10 @@
 //! Q4_K expert kernels on the CPU with activations on the 32-value group grid (the q8_1 grid
-//! of the device path), safe Rust (the kernel of the OFF-2 tier).
+//! of the device path), safe Rust (the kernel of the CPU expert tier).
 //!
 //! WHY this grid: the Q8_K kernel of [`super::expert_cpu_q8k`] quantizes activations per
 //! 256 values, llama.cpp's CPU scheme. Its rounding noise is 1.7 to 3.5 percent of an expert
-//! output and, once the layer inputs differ by a hair, independent of the oracle's. The model
-//! level gate (b) of OFF-2 failed at 80 percent CPU-served picks with that grid (p95 0.686
+//! output and, once the layer inputs differ by a hair, independent of the oracle's. The
+//! model-level accuracy gate failed at 80 percent CPU-served picks with that grid (p95 0.686
 //! against the bound 0.651) and passed with this one (0.478), better than the all-device run:
 //! 32-value groups bound the noise of an outlier to its own group. A Q4_K sub-block is 32
 //! values wide, so each activation group lines up with exactly one weight sub-block.

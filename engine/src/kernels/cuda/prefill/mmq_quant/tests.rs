@@ -1,19 +1,17 @@
-//! Tests of the MMQ quantize wrappers (CPF-V4 G4, seam 1): the pure rule pins, the refusal
-//! tables, and the device rows — the quantizer sub-check of 0049 A2 item 5 (codes within 1
-//! of the IEEE reference and only near a rounding midpoint, the D4 f32 scale within 3 ulp
-//! under fast math, the DS4 half scale with its equality rate, both layouts on identical
-//! activations), determinism with the pad canary (quantize never writes the `Q8_1_PAD` tail
-//! the GEMM's y-tile copies may read), correction C1's gather (column j is byte-equal to
-//! the plain quantize of row `gather[j]`) and the scatter (every compact column is
-//! byte-equal to the plain quantize of its token's row). The anchors the numbers sit beside
-//! are CPF-M1b section 5's: 2 of 2,097,152 codes differ (both by 1, at 8.6e-7 of a
-//! midpoint, below 2^-20), D4 67% bit-equal with max 3 ulp, DS4 65,535/65,536.
+//! Tests of the MMQ quantize wrappers: the pure rule pins, the refusal tables, and the device
+//! rows — the frozen quantizer sub-check (codes within 1 of the IEEE reference and only near a
+//! rounding midpoint, the D4 f32 scale within 3 ulp under fast math, the DS4 half scale with
+//! its equality rate, both layouts on identical activations), determinism with the pad canary
+//! (quantize never writes the `Q8_1_PAD` tail the GEMM's y-tile copies may read), the gather
+//! (column j is byte-equal to the plain quantize of row `gather[j]`) and the scatter (every
+//! compact column is byte-equal to the plain quantize of its token's row). The anchors the
+//! numbers sit beside are an earlier measurement's: 2 of 2,097,152 codes differ (both by 1, at
+//! 8.6e-7 of a midpoint, below 2^-20), D4 67% bit-equal with max 3 ulp, DS4 65,535/65,536.
 //!
-//! Device-test structure (the S3b lesson): every device test runs its device phase as
-//! `Result`-only, drops every owner, then asserts on host `Vec`s; before any bound check
-//! every output scale word is asserted finite (a skipped store leaves the 0xFF poison, whose
-//! scale words are NaN — a NaN delta never beats a running max). The tests run with
-//! `--test-threads=1`.
+//! Device-test structure: every device test runs its device phase as `Result`-only, drops every
+//! owner, then asserts on host `Vec`s; before any bound check every output scale word is
+//! asserted finite (a skipped store leaves the 0xFF poison, whose scale words are NaN — a NaN
+//! delta never beats a running max). The tests run with `--test-threads=1`.
 
 use super::{
     MmqQuantizeCall, MmqQuantizeScatterCall, check_quantize_rules, check_scatter_rules, ggml_of,
@@ -33,8 +31,8 @@ const CANARY: usize = 32;
 /// Values per block and per scale group (mmq.cuh: `QK8_1_MMQ` 128, `vals_per_scale` 32).
 const VALS: usize = 128;
 const GROUP: usize = 32;
-/// The frozen A2 midpoint window (0049 A2 item 5): a code may differ from the reference
-/// only within this distance of a rounding midpoint.
+/// The frozen midpoint window: a code may differ from the reference only within this distance
+/// of a rounding midpoint.
 const MIDPOINT_WINDOW: f64 = 1.0 / (1 << 20) as f64;
 
 /// Source rows f32 `[rows][row_stride]`, finite and sd-scaled from one seed.
@@ -78,11 +76,11 @@ fn permutation(n: usize, seed: u64) -> Vec<i32> {
     p
 }
 
-/// The IEEE reference of one 32-value scale group, evaluated in f64: the scale is
-/// `amax / 127` rounded to f32, and the reference codes round-half-away the rescaled values
+/// The IEEE reference of one 32-value scale group, evaluated in f64: the scale is `amax / 127`
+/// rounded to f32, and the reference codes round-half-away the rescaled values
 /// `x * (127 / amax)` with no f32 rounding, the exact real that the kernel's f32 `d_inv`
-/// approximates. CPF-M1b section 5 rounded `d_inv` to f32 first, so the anchors beside the
-/// measurements compare outcomes (differing codes, ulp), not the form of the reference.
+/// approximates. The earlier measurement rounded `d_inv` to f32 first, so the anchors beside
+/// the measurements compare outcomes (differing codes, ulp), not the form of the reference.
 fn ref_group(values: &[f32]) -> (f32, Vec<f64>) {
     let amax = values
         .iter()
@@ -122,8 +120,8 @@ fn nvfp4_quantization_uses_float_d4_and_the_existing_padded_layout() {
 
 #[test]
 fn mmq_quant_rule_pins_convert_the_integers() {
-    // The fill pin (finding 20's G4 half): one plain, one gathered and one scatter call of
-    // the real shapes, every converted integer checked.
+    // The fill pin: one plain, one gathered and one scatter call of the real shapes, every
+    // converted integer checked.
     let dense = check_quantize_rules(MmqType::Q80, 2048, 2048, 49, false).expect("dense");
     assert_eq!(
         (dense.ty, dense.k, dense.row_stride, dense.ncols),
@@ -159,8 +157,8 @@ fn mmq_quant_type_discriminants_match_the_decode_side() {
 
 #[test]
 fn mmq_quant_refuses_the_k_grid_by_tag() {
-    // Rev 3's K-grid rule (MSG-85 M2): K = 384 is a multiple of 128 and of every flat qk
-    // but not of 256, and it must reach THIS tag for every entry.
+    // The K-grid rule: K = 384 is a multiple of 128 and of every flat qk but not of 256, and it
+    // must reach THIS tag for every entry.
     let dense = |k| check_quantize_rules(MmqType::Q80, k, 32_768, 8, false);
     for k in [384usize, 260, 130] {
         let err = format!("{:?}", dense(k).expect_err("off the k grid"));
@@ -227,9 +225,9 @@ fn mmq_quant_refuses_domain_violations_by_tag() {
 
 #[test]
 fn mmq_quant_needs_pin_the_c1_source_form() {
-    // The output is `q8_1_bytes` (G1's constant pad inside); the source is correction C1's
-    // `(M * top_k - 1) * row_stride + K` floats, with ncols = M * top_k at the gathered
-    // down call; the inverse map holds m * top_k ints.
+    // The output is `q8_1_bytes` (the constant pad inside); the source is the gathered form's
+    // `(M * top_k - 1) * row_stride + K` floats, with ncols = M * top_k at the gathered down
+    // call; the inverse map holds m * top_k ints.
     let (x, y) = quantize_needs(2048, 2048, 2048).expect("dense");
     assert_eq!((x, y), (2048 * 2048 * 4, 2304 * 2048 + Q8_1_PAD));
     let (x, y) = quantize_needs(512, 512, 16_384).expect("gathered");
@@ -286,7 +284,7 @@ fn quantize_phase(
 enum Entry {
     /// Column j is source row j.
     Plain,
-    /// Column j is source row `map[j]` (correction C1).
+    /// Column j is source row `map[j]`.
     Gathered,
     /// Source row t is quantized once into column `map[t]` (`top_k` 1).
     Scattered,
@@ -477,16 +475,15 @@ fn sub_check(
 
 #[test]
 fn mmq_quant_sub_check_matches_the_host_reference() {
-    // 0049 A2 item 5, frozen: codes within 1 of the IEEE reference and only near a
-    // midpoint; the D4 f32 scale within 3 ulp under fast math; the DS4 half scale's
-    // equality rate reported beside CPF-M1b's anchors. Both layouts run on identical
-    // activations: identical codes, different scale words. Where the mutants die, in the
-    // order of the checks: V14 (the Q4_K type served with the D4 layout) at the DS4
-    // finiteness gate, because the D4 f32 words read as half pairs contain NaN halves; V13
-    // (a wrong scale constant) at the code check inside `sub_check`; VQ (the Q8_0 type
-    // served with the DS4 layout, so both runs hold the same words) at the layout row, which
-    // sits above the ulp clause because the ulp clause would fire first; VL2 (D4 words
-    // written as half pairs) at the ulp clause.
+    // The frozen sub-check: codes within 1 of the IEEE reference and only near a midpoint; the
+    // D4 f32 scale within 3 ulp under fast math; the DS4 half scale's equality rate reported
+    // beside the earlier measurement's anchors. Both layouts run on identical activations:
+    // identical codes, different scale words. Where the mutants die, in the order of the
+    // checks: V14 (the Q4_K type served with the D4 layout) at the DS4 finiteness gate, because
+    // the D4 f32 words read as half pairs contain NaN halves; V13 (a wrong scale constant) at
+    // the code check inside `sub_check`; VQ (the Q8_0 type served with the DS4 layout, so both
+    // runs hold the same words) at the layout row, which sits above the ulp clause because the
+    // ulp clause would fire first; VL2 (D4 words written as half pairs) at the ulp clause.
     if !testkit::device_present("mmq_quant_sub_check_matches_the_host_reference") {
         return;
     }
@@ -510,13 +507,13 @@ fn mmq_quant_sub_check_matches_the_host_reference() {
     let (diffs, dists, _, _, equals) = sub_check(&ds4_bytes, &data, rows, k, false);
     let groups = rows * (k / VALS) * 4;
     println!(
-        "G4 sub-check: D4 codes {diff4}/{} differ (anchor 2/2,097,152), max midpoint \
+        "Q8 sub-check: D4 codes {diff4}/{} differ (anchor 2/2,097,152), max midpoint \
          distance {dist4:.3e} (anchor 8.6e-7, window {MIDPOINT_WINDOW:.3e}); D4 scale \
          bit-equal {equal4}/{groups} (anchor 67%), max ulp {ulp4} (frozen bound 3)",
         rows * k
     );
     println!(
-        "G4 sub-check: DS4 codes {diffs}/{} differ, max midpoint distance {dists:.3e}; \
+        "Q8 sub-check: DS4 codes {diffs}/{} differ, max midpoint distance {dists:.3e}; \
          DS4 half scale bit-equal {equals}/{groups} (anchor 65,535/65,536, report-only)",
         rows * k
     );
@@ -544,7 +541,7 @@ fn mmq_quant_sub_check_matches_the_host_reference() {
          selected for the Q4_K weight type"
     );
     println!(
-        "G4 layout row: {same} of {blocks_total} blocks have byte-equal scale regions \
+        "Q8 layout row: {same} of {blocks_total} blocks have byte-equal scale regions \
          (the rule allows at most 90 percent)"
     );
     // Last, so that the layout row above fires first for a mutant that serves one type with
@@ -638,10 +635,10 @@ fn assert_zero_group(bytes: &[u8], base: usize, d4: bool, kind: usize, label: &s
 
 #[test]
 fn mmq_quant_zero_amax_groups_write_exact_zeros() {
-    // Lane C ruling 2 and review NIT-1: a scale group of amax == 0 through EVERY entry, in
-    // both scale layouts. The vendored kernel has no zero branch, so the bytes follow from
-    // its arithmetic (quantize.cu at the pin; the PTX of `quantize_mmq_q8_1` in the
-    // `-use_fast_math` vendor group, read with cuobjdump from the release archive):
+    // A scale group of amax == 0 through EVERY entry, in both scale layouts. The vendored
+    // kernel has no zero branch, so the bytes follow from its arithmetic (quantize.cu at the
+    // pin; the PTX of `quantize_mmq_q8_1` in the `-use_fast_math` vendor group, read with
+    // cuobjdump from the release archive):
     //  - :493-501 amax = max.ftz over abs.ftz values: +0.0 (a denormal flushes to zero);
     //  - :515 d_inv = div.approx.ftz.f32(127, amax): +inf, as a zero or denormal divisor is
     //    zero under ftz;
@@ -691,7 +688,7 @@ fn mmq_quant_zero_amax_groups_write_exact_zeros() {
                 assert_zero_group(&bytes, base, d4, kind, &format!("{entry:?} {ty:?} {name}"));
             }
             println!(
-                "G4 amax == 0: {entry:?} {ty:?}: {kinds} zero groups hold codes 0, scale bits 0"
+                "Q8 amax == 0: {entry:?} {ty:?}: {kinds} zero groups hold codes 0, scale bits 0"
             );
         }
     }
@@ -793,14 +790,14 @@ fn ds4_sum_bound(sum_ref: f64, abs_sum: f64) -> f64 {
 
 #[test]
 fn mmq_quant_ds4_halves_match_the_f64_reference() {
-    // Lane C's ruling: the DS4 d and sum halves are compared with a host f64 reference of the
-    // kernel's own definition on real-valued data, through EVERY entry that emits DS4 (the
-    // plain, the gathered and the scatter quantize of a Q4_K weight type). The finiteness
-    // gate runs first; then each half of each group must lie within the bound derived in
-    // `ds4_d_bound` and `ds4_sum_bound` (PTX error of the two approximate instructions, the
-    // depth of the f32 add tree, the half-ulp of the f16 store). The bounds are formulas of the
-    // data, not tuned; the printed ratios show how much of each is used. A mutant that sums 16
-    // values, or takes d from the neighbouring group, misses them by orders of magnitude.
+    // The DS4 d and sum halves are compared with a host f64 reference of the kernel's own
+    // definition on real-valued data, through EVERY entry that emits DS4 (the plain, the
+    // gathered and the scatter quantize of a Q4_K weight type). The finiteness gate runs first;
+    // then each half of each group must lie within the bound derived in `ds4_d_bound` and
+    // `ds4_sum_bound` (PTX error of the two approximate instructions, the depth of the f32 add
+    // tree, the half-ulp of the f16 store). The bounds are formulas of the data, not tuned; the
+    // printed ratios show how much of each is used. A mutant that sums 16 values, or takes d
+    // from the neighbouring group, misses them by orders of magnitude.
     if !testkit::device_present("mmq_quant_ds4_halves_match_the_f64_reference") {
         return;
     }
@@ -862,7 +859,7 @@ fn mmq_quant_ds4_halves_match_the_f64_reference() {
             }
         }
         println!(
-            "G4 DS4 halves ({entry:?}): {groups} groups; d error at most {worst_d:.3} of its \
+            "Q8 DS4 halves ({entry:?}): {groups} groups; d error at most {worst_d:.3} of its \
              bound, sum error at most {worst_sum:.3} of its bound"
         );
     }
@@ -870,10 +867,10 @@ fn mmq_quant_ds4_halves_match_the_f64_reference() {
 
 #[test]
 fn mmq_quant_is_deterministic_and_never_writes_the_pad() {
-    // 0049's determinism + canary row, on every entry: the same call twice gives equal bytes
+    // The determinism + canary row, on every entry: the same call twice gives equal bytes
     // (fixed-order reductions), the `Q8_1_PAD` tail the GEMM's y-tile copies may READ stays
-    // untouched (the 0xFF poison survives), as do the bytes past the range. M = 49 is the B1
-    // window's shape (a 49..56-token chunk picks J = 64 and reads 9,072 B of pad). The
+    // untouched (the 0xFF poison survives), as do the bytes past the range. M = 49 is the
+    // under-pad window's shape (a 49..56-token chunk picks J = 64 and reads 9,072 B of pad). The
     // gathered and the scattered store addresses come from map values (`ib = k_block * ne1 +
     // column`), so a wrong column count would land in the pad; the scatter runs at top_k 8
     // (392 compact columns), where `ne1 = m * top_k` differs from `m`.
@@ -913,7 +910,7 @@ fn mmq_quant_is_deterministic_and_never_writes_the_pad() {
             "the {entry:?} quantize wrote past the range"
         );
         println!(
-            "G4 determinism ({entry:?}): fnv1a64 {:#x} of {y_len} bytes; the {Q8_1_PAD}-byte \
+            "Q8 determinism ({entry:?}): fnv1a64 {:#x} of {y_len} bytes; the {Q8_1_PAD}-byte \
              pad and the {CANARY}-byte canary survived",
             testkit::fnv1a64(&first[..y_len])
         );
@@ -1006,11 +1003,11 @@ fn mmq_quantize_gathers_the_down_rows() {
         identity * 4 < src_rows,
         "the permutation is too close to the identity"
     );
-    println!("G4 gather: all {src_rows} columns follow the map ({identity} fixed points)");
+    println!("Q8 gather: all {src_rows} columns follow the map ({identity} fixed points)");
 
-    // review n-3: padded source rows (`row_stride = k + 4`, every pad float huge). The plain and
-    // the gathered output must equal those of the tightly packed rows, so a call that ignored
-    // the stride, or read a pad float, fails here (quantize.cu:482, `i01 * s01`).
+    // Padded source rows (`row_stride = k + 4`, every pad float huge). The plain and the
+    // gathered output must equal those of the tightly packed rows, so a call that ignored the
+    // stride, or read a pad float, fails here (quantize.cu:482, `i01 * s01`).
     let stride = k + 4;
     let packed = rows(src_rows, k, 0x640d_100b, 1.0);
     let padded: Vec<f32> = packed
@@ -1050,7 +1047,7 @@ fn mmq_quantize_gathers_the_down_rows() {
         );
     }
     println!(
-        "G4 gather: the padded-stride (k + 4) plain and gathered columns match the packed rows"
+        "Q8 gather: the padded-stride (k + 4) plain and gathered columns match the packed rows"
     );
 }
 
@@ -1139,7 +1136,7 @@ fn mmq_quantize_scatter_writes_every_compact_row() {
             );
         }
     }
-    println!("G4 scatter: all {ncols} compact columns hold their token's quantize");
+    println!("Q8 scatter: all {ncols} compact columns hold their token's quantize");
 }
 
 #[test]

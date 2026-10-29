@@ -1,4 +1,4 @@
-//! Portable chunk planning of the Q36 prefill (packet Q36-E1).
+//! Portable chunk planning of the Q36 prefill.
 //!
 //! The pair plan sorts the (token, choice) pairs of a chunk by expert. The chunk MoE gathers its
 //! rows in that order and restores the token-major order with the inverse permutation. The ranges
@@ -8,12 +8,12 @@
 use super::{super::settings::MIN_PREFILL_CHUNK_ROWS, kv_plan::SCORE_BUDGET_BYTES};
 use crate::{EngError, family::route::Routed};
 
-/// The reserve that `delta_subchunk` keeps below the retire cap, and the default cap of the adapter:
-/// 64 MiB (decision 0039). The decoder's decode cap is `DECODE_RETIRE_CAP` (4 GiB).
+/// The reserve that `delta_subchunk` keeps below the retire cap, and the default cap of the
+/// adapter: 64 MiB. The decoder's decode cap is `DECODE_RETIRE_CAP` (4 GiB).
 pub(super) const RETIRE_CAP_BASE: u64 = 64 << 20;
 
-/// The retire cap of the adapter while a prefill chunk runs: a flat 512 MiB (decision 0044 item 8
-/// as amended on 2026-10-09). The adapter returns to its previous cap after the chunk.
+/// The retire cap of the adapter while a prefill chunk runs: a flat 512 MiB. The adapter returns
+/// to its previous cap after the chunk.
 pub(super) const PREFILL_RETIRE_CAP: u64 = 512 << 20;
 
 /// State-sized tensors that the unrolled DeltaNet loop drops per token and layer: the replaced
@@ -88,7 +88,7 @@ pub(super) fn pair_plan(
 
 /// Proves on the host the order that `gather_qmm_sorted` requires: `experts` must be
 /// non-decreasing. An inversion returns `BadRequest`; an empty slice passes. The caller is the
-/// chunk MoE, which checks its pair plan before the import (packet Q36-PF-SORTED, fix N1).
+/// chunk MoE, which checks its pair plan before the import.
 pub(super) fn require_sorted_experts(experts: &[u32]) -> Result<(), EngError> {
     if experts.is_sorted() {
         Ok(())
@@ -126,11 +126,10 @@ pub(super) fn delta_subchunk(rows: u32, cap: u64, per_token: u64) -> Result<u32,
     Ok(u32::try_from(fit).unwrap_or(u32::MAX).clamp(1, rows))
 }
 
-/// The chunk sizes that the admission rule tries, largest first (the list of decision 0044 item 6;
-/// Q36 keeps its own copy, decision 0046). The largest is the most rows that
-/// `ResidentDecoder::set_chunk_rows` accepts (`decoder::MAX_CHUNK_ROWS`). A compile-time check in
-/// `executor.rs` fails the build if the two differ. A size of 1 is the one-token path and is never
-/// a chunk.
+/// The chunk sizes that the admission rule tries, largest first (Q36 keeps its own copy of the
+/// list). The largest is the most rows that `ResidentDecoder::set_chunk_rows` accepts
+/// (`decoder::MAX_CHUNK_ROWS`). A compile-time check in `executor.rs` fails the build if the two
+/// differ. A size of 1 is the one-token path and is never a chunk.
 pub(super) const PREFILL_CANDIDATES: [u32; 11] = [
     2048,
     1024,
@@ -146,8 +145,8 @@ pub(super) const PREFILL_CANDIDATES: [u32; 11] = [
 ];
 
 /// Activation bytes per chunk token outside the attention scores, a planning value [A]: the mixer
-/// projections, the 8 routed pairs of each token (about 0.4 MB [D]), and the shared expert. Gate
-/// G7 compares the workspace with the allocator peak of a real run.
+/// projections, the 8 routed pairs of each token (about 0.4 MB [D]), and the shared expert. The
+/// real-checkpoint prefill test reports the workspace against the allocator peak of a real run.
 const PLAN_PER_TOKEN: u64 = 1 << 20;
 
 /// Attention score copies that live at once for each chunk token: the scores and their softmax.
@@ -156,8 +155,8 @@ const SCORE_COPIES: u64 = 2;
 /// Chunk bytes that do not depend on the chunk size, a planning value [A]. The retire cap comes on top.
 const PLAN_FIXED: u64 = 100_000_000;
 
-/// The admission cost of a prefill chunk (decision 0044 item 6 without the page sets: every Q36
-/// expert is resident). The workspace of `rows` rows is
+/// The admission cost of a prefill chunk (the shared admission rule without the page sets: every
+/// Q36 expert is resident). The workspace of `rows` rows is
 /// `rows * activation_per_token + min(rows * score_per_token, score_cap) + fixed`.
 ///
 /// The attention scores of a chunk grow with the chunk and with the context, but the prefill cuts
@@ -356,7 +355,7 @@ mod tests {
 
     /// The order check of the sorted prefill gather, next to the plan that must satisfy it: a
     /// sorted slice passes, the empty slice passes, and one inversion is a bad request that
-    /// names the moe prefill (fix N1).
+    /// names the moe prefill.
     #[test]
     fn the_order_check_passes_sorted_and_empty_and_fails_one_inversion() {
         assert!(

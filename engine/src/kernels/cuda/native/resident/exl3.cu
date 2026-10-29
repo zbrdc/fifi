@@ -586,9 +586,9 @@ __global__ void grouped_input_rotate(const __grid_constant__ GroupArgs p) {
     a.xh[index] = finite_or_flag(rotate128(value, values), p.flag);
 }
 
-// Default grouped projection kernel: the unchanged shuffle gather. Stays the
-// unconditional default (incl. single-token decode); the flag-gated table gather
-// lives in grouped_project_small_gather.
+// Shuffle-gather grouped projection kernel: the unchanged rollback path for
+// any non-enable FIFI_FLINT_CUDA_GROUPED_GATHER value (the default since
+// 2026-10-28 is the table gather in grouped_project_small_gather).
 __global__ void grouped_project_small(const __grid_constant__ GroupArgs p) {
     __shared__ float partial[8][16];
     const GroupEntry &a = p.entries[p.row_to_group[blockIdx.y]];
@@ -641,9 +641,10 @@ __global__ void grouped_project_small(const __grid_constant__ GroupArgs p) {
 }
 
 
-// Flag-gated projection (FIFI_FLINT_CUDA_GROUPED_GATHER, default OFF): gathers trellis
-// words through a per-warp doubled shared
-// table instead of four shuffles per column. wtab[warp][i] and [i+words] hold lane i's
+// Table-gather projection (FIFI_FLINT_CUDA_GROUPED_GATHER, default ON since
+// 2026-10-28; any non-enable value rolls back to the shuffle kernel): gathers
+// trellis words through a per-warp doubled shared table instead of four
+// shuffles per column. wtab[warp][i] and [i+words] hold lane i's
 // word (plus its i+32 twin for bits_twice > 8), so successor reads never wrap; the
 // column geometry is tile-invariant (even rates: index advances by bits/2 per column,
 // deliberately unwrapped against the duplicate table, and the window shift is constant;
@@ -803,7 +804,8 @@ static inline __attribute__((always_inline)) bool emit_grouped(
 template<bool Observe = false, bool Gather = false>
 static inline __attribute__((always_inline)) int grouped_launch(
     const inference_cuda_exl3_linear_args *calls, size_t count,
-    void *stream, int *out_stage, uint64_t *launches = nullptr) {
+    void *stream, int *out_stage, uint64_t *launches = nullptr,
+    unsigned *variant = nullptr) {
     try {
         report_stage(out_stage, INFERENCE_CUDA_STAGE_NONE);
         GroupArgs args;
@@ -822,7 +824,13 @@ static inline __attribute__((always_inline)) int grouped_launch(
             else grouped_output_rotate<<<grid,block,0,(cudaStream_t)stream>>>(args);
             failure.record(cudaGetLastError(), INFERENCE_CUDA_STAGE_LAUNCH);
             if constexpr (Observe) {
-                if (failure.err == cudaSuccess) ++*launches;
+                if (failure.err == cudaSuccess) {
+                    ++*launches;
+                    // Record which projection kernel actually enqueued: the
+                    // observer must observe the launch, not echo the request.
+                    if (e.kind == LinearKind::Small && variant)
+                        *variant = Gather ? 2u : 1u;
+                }
             }
             return failure.err == cudaSuccess;
         });
@@ -846,10 +854,22 @@ extern "C" int inference_cuda_exl3_grouped_gathered(const inference_cuda_exl3_li
 
 extern "C" __attribute__((section(".text.inference_cuda_exl3_observer"), visibility("hidden")))
 int inference_cuda_exl3_grouped_observed(const inference_cuda_exl3_linear_args *calls,
-    size_t count, void *stream, int *out_stage, uint64_t *launches) {
-    if (!launches) return INFERENCE_CUDA_INVALID_ARGUMENT;
+    size_t count, void *stream, int *out_stage, uint64_t *launches,
+    unsigned *variant) {
+    if (!launches || !variant) return INFERENCE_CUDA_INVALID_ARGUMENT;
     *launches = 0;
-    return grouped_launch<true>(calls, count, stream, out_stage, launches);
+    *variant = 0;
+    return grouped_launch<true>(calls, count, stream, out_stage, launches, variant);
+}
+
+extern "C" __attribute__((section(".text.inference_cuda_exl3_observer"), visibility("hidden")))
+int inference_cuda_exl3_grouped_observed_gathered(const inference_cuda_exl3_linear_args *calls,
+    size_t count, void *stream, int *out_stage, uint64_t *launches,
+    unsigned *variant) {
+    if (!launches || !variant) return INFERENCE_CUDA_INVALID_ARGUMENT;
+    *launches = 0;
+    *variant = 0;
+    return grouped_launch<true, true>(calls, count, stream, out_stage, launches, variant);
 }
 
 extern "C" __attribute__((section(".text.inference_cuda_exl3_observer"), visibility("hidden")))

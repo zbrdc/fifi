@@ -1,12 +1,12 @@
-//! What the resident step owns for a session and the weights it resolves beyond the mixers
-//! (decision 0047, packet RD-9d): the arena of one row, the layer table, the shapes of the MoE,
-//! embedding and head weights, and the lookups that turn them into typed weights.
+//! What the resident step owns for a session and the weights it resolves beyond the mixers: the
+//! arena of one row, the layer table, the shapes of the MoE, embedding and head weights, and the
+//! lookups that turn them into typed weights.
 //!
 //! The shapes are pure host arithmetic from `StepDims` (no model number is written here) and are
 //! tested on the CPU. The lookups read `CudaWeights` and are covered by the scratch device run.
 //!
-//! One row only: the MoE block takes `m = 1` (lane C, RD-9c C-L7), so the plan, the arena and every
-//! launch of the step are made for [`STEP_ROWS`] row.
+//! One row only: the MoE block takes `m = 1`, so the plan, the arena and every launch of the step
+//! are made for [`STEP_ROWS`] row.
 
 use super::{
     dims::{StepDims, StepOptions},
@@ -99,13 +99,13 @@ impl MoeSpecs {
     }
 }
 
-/// The dimensions RD-9c's block takes, from the layout record, for the one row of the step.
+/// The dimensions the MoE block takes, from the layout record, for the one row of the step.
 pub(super) fn moe_dims(dims: &StepDims) -> MoeDims {
     MoeDims::new(dims, STEP_ROWS)
 }
 
-/// Refuses a NATIVE expert stack that is not the launch's shape (MATVEC-PAR S3b): the rule of
-/// [`check_stack`] plus the MMVQ row-group rule on the PER-EXPERT rows (`rows / experts % 4`).
+/// Refuses a NATIVE expert stack that is not the launch's shape: the rule of [`check_stack`] plus
+/// the MMVQ row-group rule on the PER-EXPERT rows (`rows / experts % 4`).
 pub(super) fn check_native_stack(
     name: &str,
     have: (usize, usize, Option<usize>),
@@ -461,9 +461,9 @@ fn dense<'w>(
     Ok(weight)
 }
 
-/// Resolves one expert stack in `layout` (MATVEC-PAR S3b): the tiles (shape rule of
-/// `check_stack`) or the file's own blocks (the same shape rule plus the per-expert `rows % 4`
-/// of `check_native_stack`), and a tensor of the other layout is a `Checkpoint` naming it.
+/// Resolves one expert stack in `layout`: the tiles (shape rule of `check_stack`) or the file's own
+/// blocks (the same shape rule plus the per-expert `rows % 4` of `check_native_stack`), and a
+/// tensor of the other layout is a `Checkpoint` naming it.
 fn stack_of<'w>(
     weights: &'w CudaWeights,
     name: &str,
@@ -566,9 +566,9 @@ pub(super) fn moe_layer_parts<'w>(
     })
 }
 
-/// One of the two global gathers of the step (MATVEC-PAR S3b): the tiles of the Tiled load or
-/// the file's own blocks of the Native load (the native embedding gather reads Q4_K blocks, the
-/// native head is one `matvec_q` over the Q6_K blocks).
+/// One of the two global gathers of the step: the tiles of the Tiled load or the file's own blocks
+/// of the Native load (the native embedding gather reads Q4_K blocks, the native head is one
+/// `matvec_q` over the Q6_K blocks).
 #[derive(Clone, Copy)]
 pub(super) enum GlobalWeight<'w> {
     Tiled(&'w TiledWeight),
@@ -604,8 +604,8 @@ impl GlobalWeight<'_> {
     }
 }
 
-/// Refuses a NATIVE embedding table of a type the gather does not read (MATVEC-PAR S3b): the
-/// native gather takes Q4_K blocks exactly.
+/// Refuses a NATIVE embedding table of a type the gather does not read: the native gather takes
+/// Q4_K blocks exactly.
 pub(super) fn check_native_embed(name: &str, quant: QuantType) -> Result<(), EngError> {
     if quant == QuantType::Q4K {
         return Ok(());

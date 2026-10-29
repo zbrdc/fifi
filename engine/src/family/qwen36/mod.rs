@@ -1,5 +1,8 @@
 #[cfg(all(feature = "native-cuda", target_os = "linux"))]
-#[expect(dead_code, reason = "staged for RD-9b to RD-9d (decision 0047)")]
+#[expect(
+    dead_code,
+    reason = "staged for the resident step's mixers, MoE block and token loop"
+)]
 pub mod cuda;
 #[cfg(test)]
 mod exl3_admission;

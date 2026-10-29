@@ -1,22 +1,22 @@
-//! The batched SwiGLU + q8_1 quantize of the expert slots (MATVEC-PAR S3a K2, decision 0047,
-//! stage 1): [`CudaContext::swiglu_q8`] queues ONE kernel on a [`DeviceStream`] for all
-//! `slots` rows and returns when it is queued. It allocates nothing, copies nothing, memsets
-//! nothing and never synchronizes (the old `swiglu_pack` needed tail memsets; this producer
-//! quantizes the padded width directly, so its input is read only).
+//! The batched SwiGLU + q8_1 quantize of the expert slots: [`CudaContext::swiglu_q8`] queues
+//! ONE kernel on a [`DeviceStream`] for all `slots` rows and returns when it is queued. It
+//! allocates nothing, copies nothing, memsets nothing and never synchronizes (the old
+//! `swiglu_pack` needed tail memsets; this producer quantizes the padded width directly, so its
+//! input is read only).
 //!
-//! `gu` holds the step's `ExpertGu` rows, the A2 layout: slot `s` at `gu + s * y_slot_stride`
+//! `gu` holds the step's `ExpertGu` rows, the strided layout: slot `s` at `gu + s * y_slot_stride`
 //! ELEMENTS, gate at columns `0..n_ff` and up at `n_ff..2*n_ff` of that row. `q8` holds `slots`
 //! padded `block_q8_1` rows back to back (`q8_1_bytes(n_ff, slots)` bytes); the shared expert is
 //! the same call with `slots = 1` on its own buffer. The activation is `silu(gate) * up` with
-//! `swiglu_pack_k`'s fast form `x / (1 + __expf(-x))` — `__expf` kept by decision, the E2
-//! numerics domain of the `swiglu_pack` doc is the stated tolerance basis — and the block rule
-//! is the vendored `quantize_q8_1`'s computed in IEEE arithmetic (the native TU is in the
-//! warnings-into-errors group WITHOUT `-use_fast_math`), so given the kernel's silu values the
-//! `q8` bytes are bit-checkable against a host reference.
+//! `swiglu_pack_k`'s fast form `x / (1 + __expf(-x))` — `__expf` kept on purpose, the numerics
+//! domain of the `swiglu_pack` doc is the stated tolerance basis — and the block rule is the
+//! vendored `quantize_q8_1`'s computed in IEEE arithmetic (the native TU is in the
+//! warnings-into-errors group WITHOUT `-use_fast_math`), so given the kernel's silu values the `q8`
+//! bytes are bit-checkable against a host reference.
 //!
 //! Every refusal is a `BadRequest` and happens before any native call. In order: the backend is
-//! usable; `n_ff` is a multiple of 32 in `32..=32768`; `slots` is in `1..=8`; `y_slot_stride` is
-//! at least `2 * n_ff`; `gu` holds the A2 footprint and `q8` the padded rows, both 4-byte
+//! usable; `n_ff` is a multiple of 32 in `32..=32768`; `slots` is in `1..=8`; `y_slot_stride` is at
+//! least `2 * n_ff`; `gu` holds the strided footprint and `q8` the padded rows, both 4-byte
 //! aligned; `q8` overlaps no byte of `gu`. A refused call changes nothing.
 
 use crate::EngError;
@@ -38,7 +38,7 @@ pub(crate) const MAX_SLOTS: usize = 8;
 /// - `gu`: f32 `[slots][y_slot_stride]` (read only the first `2 * n_ff` columns of each row).
 /// - `q8`: [`q8_1_bytes`]`(n_ff, slots)` bytes, 4-byte aligned.
 /// - `n_ff`: live values per half, a multiple of 32 in `32..=32768`.
-/// - `y_slot_stride`: elements between slot rows, at least `2 * n_ff` (KUBDAN-MSG-62 A2).
+/// - `y_slot_stride`: elements between slot rows, at least `2 * n_ff`.
 /// - `slots`: expert slots, `1..=8`.
 pub(crate) struct SwigluQ8Call<'b> {
     pub(crate) gu: DeviceRange<'b>,
@@ -55,7 +55,7 @@ pub(crate) struct SwigluQ8Needs {
     pub(crate) q8: usize,
 }
 
-/// The byte counts the wrapper checks a call against: `gu` the tight A2 footprint
+/// The byte counts the wrapper checks a call against: `gu` the tight strided footprint
 /// `(slots - 1) * y_slot_stride + 2 * n_ff` floats, `q8` the padded `block_q8_1` rows. Pure: no
 /// context, no device.
 pub(crate) fn swiglu_q8_needs(

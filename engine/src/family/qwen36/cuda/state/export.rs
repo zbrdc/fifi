@@ -1,15 +1,13 @@
-//! `export_state` and `import_state`: the host value of the committed session state (decision
-//! 0047 item 3, packet RD-9b1).
+//! `export_state` and `import_state`: the host value of the committed session state.
 //!
-//! [`ExportedState`] is a plain host value (`Send`) for the checkpoint store of decision 0036. It
-//! carries the device element orders unchanged (see `state_layout.rs` for the orders and for the
-//! transposes against llama.cpp and the Q36 host reference), the committed position count, and an
-//! identity that includes the KV mode. `import_state` refuses a value whose identity differs and
-//! checks every length before the first device write. Export reads slot 0 and the first `tokens` KV
-//! positions only and never the words. `import_state` writes the same range from the snapshot and
-//! does the rest of reset's work (the words block rewritten with zeros, the other slots cleared), so
-//! it may leave a poisoned state; the host writes `StepParams` (`write_step_params`) before the
-//! next step.
+//! [`ExportedState`] is a plain host value (`Send`) for the checkpoint store. It carries the device
+//! element orders unchanged (see `state_layout.rs` for the orders and for the transposes against
+//! llama.cpp and the Q36 host reference), the committed position count, and an identity that
+//! includes the KV mode. `import_state` refuses a value whose identity differs and checks every
+//! length before the first device write. Export reads slot 0 and the first `tokens` KV positions
+//! only and never the words. `import_state` writes the same range from the snapshot and does the
+//! rest of reset's work (the words block rewritten with zeros, the other slots cleared), so it may
+//! leave a poisoned state; the host writes `StepParams` (`write_step_params`) before the next step.
 //!
 //! Each copy is stream ordered (`DeviceBuffer::read_at` / `write_at`): it runs behind the work
 //! queued on the given stream and waits for that stream only. The caller passes the stream that
@@ -52,23 +50,21 @@ const _: () = {
 };
 
 /// What `import_state` passes to `StateBook::begin_import`: it does ALL of reset's work (words
-/// rewritten, status zeroed, the other slots cleared), so a `Poisoned` state may be imported
-/// (REPLY-76 Q1).
+/// rewritten, status zeroed, the other slots cleared), so a `Poisoned` state may be imported.
 pub(crate) const IMPORT_REWRITES_WORDS: bool = true;
 
 /// Refuses an export that does not fit `layout` and `identity`; reads no device memory.
 ///
-/// **Contract (lane C, Xavier XS-1 and depth timings).** It validates STRUCTURE only: the layout
-/// tag, the KV mode and the geometry (the identity), the DeltaNet layer count and vector lengths,
-/// the attention layer count, the plane lengths for `tokens` positions, and `tokens <= capacity`.
-/// It accepts ANY finite snapshot of that shape at any depth `N <= capacity` (the start block of
-/// such a state is `pos = N`, `kv_len = N + 1`, written by `write_step_params`), and it never
-/// compares values against a real run. It does not inspect values at all: this packet promises NO
-/// finiteness check, so a snapshot holding NaN or infinity also passes (a non-finite state is
-/// caught by the status word of the first step, which poisons). A depth past the capacity is
-/// refused as `ContextLimit` before any plane length is looked at. A state imported at
-/// `N = capacity` is accepted but cannot take a decode step; decoding at depth `D` needs
-/// `capacity >= D + 1` (lane C).
+/// **Contract.** It validates STRUCTURE only: the layout tag, the KV mode and the geometry (the
+/// identity), the DeltaNet layer count and vector lengths, the attention layer count, the plane
+/// lengths for `tokens` positions, and `tokens <= capacity`. It accepts ANY finite snapshot of that
+/// shape at any depth `N <= capacity` (the start block of such a state is `pos = N`,
+/// `kv_len = N + 1`, written by `write_step_params`), and it never compares values against a real
+/// run. It does not inspect values at all: it promises NO finiteness check, so a snapshot holding
+/// NaN or infinity also passes (a non-finite state is caught by the status word of the first step,
+/// which poisons). A depth past the capacity is refused as `ContextLimit` before any plane length
+/// is looked at. A state imported at `N = capacity` is accepted but cannot take a decode step;
+/// decoding at depth `D` needs `capacity >= D + 1`.
 pub(crate) fn check_import(
     layout: &StateLayout,
     identity: &StateIdentity,
@@ -124,12 +120,11 @@ pub(crate) fn plane_sizes(
         .collect())
 }
 
-/// A zeroed host buffer of `len` bytes. `try_reserve_exact` returns an error (a capacity
-/// overflow or an allocation failure) where `vec![0u8; len]` and `Vec::resize` abort the
-/// process, so a huge or denied export becomes a `MemoryPlan` refusal -- which a prefix save
-/// turns into `Ok(false)` (decision 0036 addendum 1 item 7) instead of killing the engine.
-/// `f32_from_le` and `f32_to_le` stay as they are: they allocate at most one layer's vectors
-/// (about 2 MB per layer) from bytes the caller already holds.
+/// A zeroed host buffer of `len` bytes. `try_reserve_exact` returns an error (a capacity overflow
+/// or an allocation failure) where `vec![0u8; len]` and `Vec::resize` abort the process, so a huge
+/// or denied export becomes a `MemoryPlan` refusal -- which a prefix save turns into `Ok(false)`
+/// instead of killing the engine. `f32_from_le` and `f32_to_le` stay as they are: they allocate at
+/// most one layer's vectors (about 2 MB per layer) from bytes the caller already holds.
 pub(crate) fn host_zeroed(len: usize) -> Result<Vec<u8>, EngError> {
     let mut bytes = Vec::new();
     bytes.try_reserve_exact(len).map_err(|error| {
@@ -186,11 +181,11 @@ impl ResidentState {
             kv,
         })
     }
-    /// Replaces the committed state with `exported`, doing ALL of reset's work: the words block
-    /// is rewritten with zeros (so `StepParams` and `status` are zeroed and a start block is owed:
+    /// Replaces the committed state with `exported`, doing ALL of reset's work: the words block is
+    /// rewritten with zeros (so `StepParams` and `status` are zeroed and a start block is owed:
     /// `write_step_params` must follow), the DeltaNet slots above 0 are cleared, slot 0 and the
     /// first `tokens` KV positions come from the snapshot. That is what lets it leave a `Poisoned`
-    /// state (lane M REPLY-76 Q1); the book would refuse a poisoned state otherwise.
+    /// state; the book would refuse a poisoned state otherwise.
     ///
     /// Every check runs before the first device write, so a refused value changes nothing. A
     /// device failure after `check_import` leaves the state `Poisoned` (never a partly imported

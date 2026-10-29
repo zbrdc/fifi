@@ -1,8 +1,8 @@
 /*
- * MATVEC-PAR S3a K1: the add + RMSNorm + q8_1 pack entry (native/resident/add_rmsnorm_q8.h,
- * per-kernel header of the layout in kernels/cuda/resident/mod.rs). Launch-only, like the other
- * resident headers: nothing here allocates, copies or synchronizes; a fault in queued work
- * surfaces at the next synchronize. abi_resident.h stays closed.
+ * The add + RMSNorm + q8_1 pack entry (native/resident/add_rmsnorm_q8.h, per-kernel header of
+ * the layout in kernels/cuda/resident/mod.rs). Launch-only, like the other resident headers:
+ * nothing here allocates, copies or synchronizes; a fault in queued work surfaces at the next
+ * synchronize. abi_resident.h stays closed.
  */
 #ifndef INFERENCE_CUDA_RESIDENT_ADD_RMSNORM_Q8_H
 #define INFERENCE_CUDA_RESIDENT_ADD_RMSNORM_Q8_H

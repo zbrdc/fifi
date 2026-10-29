@@ -1,9 +1,9 @@
 //! Seam-1 device tests (3090) of the fused add, RMSNorm and fp16 pack wrapper against a float64
 //! host reference written from the contract (`norm = r * (1 / sqrt(sum(r^2) / n + eps)) * w`,
-//! `r` the stored f32 residual). Lane M REPLY-73: `norm_out` is class E3 at 2^-17 per vector,
-//! `xf` class E2, the residual add bit equal; the E1 form is printed and never asserted. The
-//! suite runs with `--test-threads=1`; every statistic line names the build profile (the cargo
-//! debug profile compiles the kernels with `-G -O0`).
+//! `r` the stored f32 residual). `norm_out` is class E3 at 2^-17 per vector, `xf` class E2, the
+//! residual add bit equal; the E1 form is printed and never asserted. The suite runs with
+//! `--test-threads=1`; every statistic line names the build profile (the cargo debug profile
+//! compiles the kernels with `-G -O0`).
 
 use std::collections::BTreeMap;
 
@@ -20,7 +20,7 @@ use crate::kernels::cuda::{
 };
 use crate::weights::GgufType;
 
-/// E3, lane M REPLY-73: 2^-17 per vector for an f32 reduction.
+/// E3: 2^-17 per vector for an f32 reduction.
 const NORM_OUT_E3: f64 = 1.0 / 131_072.0;
 /// The byte that fills `xf` and `norm_out` before a launch: a NaN pattern, never a result.
 const FILL: u8 = 0xff;
@@ -96,8 +96,8 @@ fn range(buffer: &DeviceBuffer, bytes: usize) -> DeviceRange<'_> {
 }
 
 /// The 16 bytes of the shared zero tail entry `xf[kXfEntries]` (65,536 data entries, then the
-/// tail): every padding lane of `mma884::load_x` reads it. MEMSET-TRIM: the pack kernels write
-/// it themselves, so no whole-buffer memset runs.
+/// tail): every padding lane of `mma884::load_x` reads it. The pack kernels write it themselves,
+/// so no whole-buffer memset runs.
 fn tail(xf: &[u8]) -> [u8; 16] {
     let mut out = [0u8; 16];
     out.copy_from_slice(&xf[65_536 * 16..65_536 * 16 + 16]);
@@ -205,7 +205,7 @@ impl Report {
         };
         for (group, w) in &self.0 {
             println!(
-                "RD4A-T1 profile={profile} group={group} e3={:.3e} (limit {NORM_OUT_E3:.3e}) \
+                "add_norm_pack profile={profile} group={group} e3={:.3e} (limit {NORM_OUT_E3:.3e}) \
                  e1_ratio={:.4} (printed, not a gate) fp16_one_step={} elements={}",
                 w.e3, w.e1, w.one_step, w.elements
             );
@@ -337,8 +337,8 @@ fn sweep_wide_and_seeds(rig: &Rig, report: &mut Report) {
     }
 }
 
-/// Pinned, not a claim (RD-4a A-1): a finite row whose sum of squares overflows f32 gives finite
-/// zeros, and one `+inf` among large values gives one NaN and zeros elsewhere.
+/// Pinned, not a claim: a finite row whose sum of squares overflows f32 gives finite zeros, and
+/// one `+inf` among large values gives one NaN and zeros elsewhere.
 fn pin_overflow(rig: &Rig) {
     let mut inp = inputs(MODEL, 1, 256, 0x4a40);
     inp.h = vec![1e30; 256];
@@ -347,8 +347,8 @@ fn pin_overflow(rig: &Rig) {
         got.out.iter().all(|&b| b == 0),
         "overflowing finite row: norm_out is not zero"
     );
-    // MEMSET-TRIM: only the data lanes and the tail entry are written; the unread bytes keep the
-    // fill, so the zeros are asserted on what a reader consumes.
+    // Only the data lanes and the tail entry are written; the unread bytes keep the fill, so the
+    // zeros are asserted on what a reader consumes.
     let packed = unpack_xf(&got.xf, 1, 256);
     assert!(
         packed.iter().all(|&b| b & 0x7fff == 0),
@@ -459,9 +459,9 @@ fn pack_and_matmul(rig: &Rig, m: usize, n: usize) {
         read_bytes(ctx, &fused, xf_len),
         read_bytes(ctx, &packed, xf_len),
     );
-    // MEMSET-TRIM: below 17 rows only the data lanes and the tail are written, so the fused and
-    // the `pack` buffers are compared on what a reader consumes (the tables and the tail), not on
-    // the unread fill; above they are row-major and fully written.
+    // Below 17 rows only the data lanes and the tail are written, so the fused and the `pack`
+    // buffers are compared on what a reader consumes (the tables and the tail), not on the unread
+    // fill; above they are row-major and fully written.
     if m <= 16 {
         assert_eq!(
             unpack_xf(&a, m, n),
@@ -503,8 +503,8 @@ fn add_norm_pack_xf_equals_the_pack_wrapper_and_feeds_the_matmul() {
 }
 
 /// One pack of `inp` into a fresh `xf` buffer preloaded with `fill` bytes, keeping the buffer on
-/// the device for a following matmul (MEMSET-TRIM: the fill stands in for the garbage an aliased
-/// arena slot can hold, `fill = 0` for the old way, a zeroed buffer).
+/// the device for a following matmul (the fill stands in for the garbage an aliased arena slot
+/// can hold, `fill = 0` for the old way, a zeroed buffer).
 fn trim_pack(rig: &Rig, inp: &Inputs, fill: u8, run: (bool, bool)) -> (DeviceBuffer, Vec<u8>) {
     let ctx = &rig.ctx;
     let row = row_bytes(inp.m, inp.n).expect("row bytes");
@@ -530,12 +530,11 @@ fn trim_pack(rig: &Rig, inp: &Inputs, fill: u8, run: (bool, bool)) -> (DeviceBuf
     (xf, bytes)
 }
 
-/// MEMSET-TRIM test 1: with the whole `xf` buffer pre-filled with garbage (0xFF, the tail
-/// included) the pack itself must leave (a) the shared zero tail entry zero, (b) the data lanes
-/// of the tokens below `m` at the float64 reference, and (c) a following `matmul` bitwise equal
-/// to the same matmul over a buffer prepared the old way (zeroed, then packed). `m = 16` at
-/// `n = 32768` covers the top data entry `kXfEntries - 1` (token 15's last tile), which an
-/// off-by-one tail write would clobber.
+/// With the whole `xf` buffer pre-filled with garbage (0xFF, the tail included) the pack itself
+/// must leave (a) the shared zero tail entry zero, (b) the data lanes of the tokens below `m` at
+/// the float64 reference, and (c) a following `matmul` bitwise equal to the same matmul over a
+/// buffer prepared the old way (zeroed, then packed). `m = 16` at `n = 32768` covers the top data
+/// entry `kXfEntries - 1` (token 15's last tile), which an off-by-one tail write would clobber.
 #[test]
 fn add_norm_pack_writes_the_zero_tail_over_garbage() {
     if !testkit::device_present("add_norm_pack_writes_the_zero_tail_over_garbage") {
@@ -601,7 +600,7 @@ fn add_norm_pack_writes_the_zero_tail_over_garbage() {
                     "m={m} n={n}: the matmul over garbage differs by {worst:e} (scale {scale:e})"
                 );
                 println!(
-                    "MEMSET-TRIM add_norm_pack m={m} n={n}: split-K matmul, max |d| {worst:e} of scale {scale:e}"
+                    "add_norm_pack over garbage m={m} n={n}: split-K matmul, max |d| {worst:e} of scale {scale:e}"
                 );
             } else {
                 assert_eq!(
@@ -612,13 +611,13 @@ fn add_norm_pack_writes_the_zero_tail_over_garbage() {
         }
     }
     println!(
-        "MEMSET-TRIM add_norm_pack: {elements} data lanes, {one_step} one-step fp16 roundings"
+        "add_norm_pack over garbage: {elements} data lanes, {one_step} one-step fp16 roundings"
     );
 }
 
-/// MEMSET-TRIM test 2: a pack of `m = 3` straight into a pack of `m = 1` on the same buffer, with
-/// no re-zeroing between the calls (an aliased arena slot reuses the bytes); the `m = 1` data
-/// lanes, the tail and the matmul must not depend on the stale lanes of tokens 1 and 2.
+/// A pack of `m = 3` straight into a pack of `m = 1` on the same buffer, with no re-zeroing
+/// between the calls (an aliased arena slot reuses the bytes); the `m = 1` data lanes, the tail
+/// and the matmul must not depend on the stale lanes of tokens 1 and 2.
 #[test]
 fn add_norm_pack_ignores_stale_padding_between_launches() {
     if !testkit::device_present("add_norm_pack_ignores_stale_padding_between_launches") {
@@ -815,8 +814,8 @@ fn dump_rows(phase: &str, key: &str, idx: &[usize]) -> Vec<f32> {
 
 /// One call against the dump: `h` must come back bit equal to `want_h` (when the call adds),
 /// `norm_out` must be finite; its E3 value and the E2 misses of `xf` against the dump, and the
-/// host reference against the dump, are printed, not asserted (no lane M rule exists for a bound
-/// against the llama.cpp dump).
+/// host reference against the dump, are printed, not asserted (no bound against the llama.cpp
+/// dump is defined).
 fn against_dump(
     rig: &Rig,
     label: &str,
@@ -847,7 +846,7 @@ fn against_dump(
     let host = ref_norm(&residual(inp, with_delta), inp);
     let e3_dev = e3_value(&dev, &reference, inp.n);
     println!(
-        "RD4A-T4 {label}: e3(device vs dump)={:.3e} e3(host reference vs dump)={:.3e} xf_e2_misses_vs_dump={misses}/{}",
+        "{label}: e3(device vs dump)={:.3e} e3(host reference vs dump)={:.3e} xf_e2_misses_vs_dump={misses}/{}",
         e3_dev,
         e3_value(
             &host.iter().map(|&v| v as f32).collect::<Vec<_>>(),
@@ -856,7 +855,7 @@ fn against_dump(
         ),
         packed.len()
     );
-    // Gross sanity, not a tolerance claim: lane M still owns the real bound against the dump. It
+    // Gross sanity, not a tolerance claim: the real bound against the dump is still undefined. It
     // catches a wrong weight, layer or row (E3 about 3), which the report-only numbers hide.
     assert!(
         e3_dev < 0.1,
@@ -864,9 +863,9 @@ fn against_dump(
     );
 }
 
-/// The three calls RD-9 makes for `layer`: the first norm of the embedding row (layer 0), the
-/// mid-layer call (to `attn_residual` and `attn_post_norm`) and the boundary call (to `l_out`
-/// and the next `attn_norm`).
+/// The three calls the decode step makes for `layer`: the first norm of the embedding row
+/// (layer 0), the mid-layer call (to `attn_residual` and `attn_post_norm`) and the boundary call
+/// (to `l_out` and the next `attn_norm`).
 fn oracle_layer(rig: &Rig, phase: &str, rows: &[usize], fixture: &[f32], j: usize) {
     let layer = ORACLE_LAYERS[j];
     let weight = |block: usize| fixture[block * 2048..(block + 1) * 2048].to_vec();
@@ -1217,8 +1216,8 @@ fn add_norm_pack_reports_a_bad_range_before_a_latched_context() {
     println!("latch child: done");
 }
 
-/// One captured call replays to the bytes of the eager call, as one graph node (the kernel; the
-/// whole-buffer memset is gone, MEMSET-TRIM).
+/// One captured call replays to the bytes of the eager call, as one graph node (the kernel; no
+/// whole-buffer memset runs).
 #[test]
 fn add_norm_pack_inside_a_capture_equals_eager() {
     if !testkit::device_present("add_norm_pack_inside_a_capture_equals_eager") {
@@ -1257,7 +1256,7 @@ fn add_norm_pack_inside_a_capture_equals_eager() {
             rig.ctx.add_norm_pack(&rig.stream, call_on(&b, &inp, 1))
         })
         .expect("capture");
-    assert_eq!(graph.nodes(), 1, "one kernel, no memset (MEMSET-TRIM)");
+    assert_eq!(graph.nodes(), 1, "one kernel, no memset");
     assert_eq!(read()[1], vec![FILL; xf_len], "the capture ran nothing");
     graph.launch(&rig.stream).expect("replay");
     rig.stream.synchronize().expect("drain the replay");

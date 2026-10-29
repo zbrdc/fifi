@@ -1,29 +1,27 @@
-//! Pure sizing of every buffer the vendored MMQ launches read or write (CPF-V4 G1, decision
-//! 0049 item 11): the q8_1 scratch (M1), the ids ranges (M2), the grouped column rule (M3),
-//! the fixup range, the J replica, and the under-pad windows of the wrong upstream helper.
-//! Host-only, pure, checked throughout: an overflowing product is a `BadRequest` (the
-//! pattern of `prefill::attn_prefill`). Terminology, binding
-//! on G2-G4: `K` is the input width in values, `Kpad` rounds it to 128, `blocks_per_col =
-//! Kpad/128` (one 144-B `block_q8_1_mmq` per 128 values), and the buffer holds
-//! `blocks_per_col * ncols` blocks k-block-major (`ib = k_block*ne1 + column`,
+//! Pure sizing of every buffer the vendored MMQ launches read or write: the q8_1 scratch, the
+//! ids ranges, the grouped column rule, the fixup range, the J replica, and the under-pad
+//! windows of the wrong upstream helper. Host-only, pure, checked throughout: an overflowing
+//! product is a `BadRequest` (the pattern of `prefill::attn_prefill`). Terminology, binding on
+//! the GEMM and quantize wrappers: `K` is the input width in values, `Kpad` rounds it to 128,
+//! `blocks_per_col = Kpad/128` (one 144-B `block_q8_1_mmq` per 128 values), and the buffer
+//! holds `blocks_per_col * ncols` blocks k-block-major (`ib = k_block*ne1 + column`,
 //! quantize.cu:530-533): `ncols = M` dense, `ncols = ne_get_rows = M*top_k` grouped.
 //!
 //! The J/config tables are MIT-derived constants transcribed from the vendored tree at
 //! llama.cpp pin `acecd56032ddc34bada14a2d978f110d9c987095` (mmq-config-ampere.cuh,
 //! mmq-config-pascal-dp4a.cuh; engine/vendor/ggml-cuda-mmq/LICENSE holds the notice,
-//! THIRD_PARTY_NOTICES.md names this file). No other code is copied, and the cross-check
-//! test re-parses both headers, so a vendor patch that changes a CASE row fails CI without
-//! a device. Not padded, with reasons (rule M2): x-tile loads
-//! (only weight ROWS are clamped and only with fallback on, mmq-load-tiles.cuh:498-499,
-//! :736-737; the k extent never is — the K-grid precondition the entries own, not a rule
-//! here); write-back stores (bounded by `j_max`/`i_max`); the
-//! fixup range (write-only until the fixup kernel reads it back). NVFP4 plans separately
-//! pad `y_scale` with J_MAX-1 factors because stream-k writes full temporary tiles.
+//! THIRD_PARTY_NOTICES.md names this file). The cross-check test re-parses both headers, so a
+//! vendor patch that changes a CASE row fails CI without a device.
+//! Not padded, with reasons: x-tile loads (only weight ROWS are clamped and only with fallback
+//! on, mmq-load-tiles.cuh:498-499, :736-737; the k extent never is — the K-grid precondition
+//! the entries own, not a rule here); write-back stores (bounded by `j_max`/`i_max`); the fixup
+//! range (write-only until the fixup kernel reads it back). NVFP4 plans separately pad
+//! `y_scale` with J_MAX - 1 factors because stream-k writes full temporary tiles.
 #![cfg_attr(
     not(test),
     expect(
         dead_code,
-        reason = "staged for CPF-V4's glue entries and CPF-1 (decision 0049)"
+        reason = "staged for the MMQ glue entries and their callers"
     )
 )]
 
@@ -32,22 +30,23 @@ use crate::EngError;
 /// Values per `block_q8_1_mmq` (`QK8_1_MMQ`, mmq.cuh:25) and its bytes (:28-47, :57-58).
 const QK8_1_MMQ: usize = 128;
 pub(crate) const Q8_1_BLOCK_BYTES: usize = 144;
-/// The PAD's rounding granularity, a deliberate over-bound (KUBDAN-MSG-85 B1, rev 3): the
-/// y-tile copies' own loop steps by `nwarps * warp_size = 256` ints, so a copy spans
-/// `round_up(144 * J, 1024)` bytes (mmq.cuh:859-865) — the pad rounds `128 * 144` up to
-/// multiples of 2048 instead, the plan's one-line safety margin over the exact need.
+/// The PAD's rounding granularity, a deliberate over-bound: the y-tile copies' own loop steps
+/// by `nwarps * warp_size = 256` ints, so a copy spans `round_up(144 * J, 1024)` bytes
+/// (mmq.cuh:859-865) — the pad rounds `128 * 144` up to multiples of 2048 instead, a one-line
+/// safety margin over the exact need.
 pub(crate) const SRC1_LOAD_CHUNK: usize = 2048;
-/// Rule M1 (rev 3, MSG-85 B1): the one constant pad on every q8_1 buffer, dense and
-/// grouped, `round_up(128 * 144, 2048)`. The two unconditional y-tile copies read
-/// `round_up(144 * J, 1024)` bytes from the first column of a J-column tile with no column
-/// bound (mmq.cuh:859-865, :875-881), so the worst need over every reachable J is
-/// `S(128) - 144 = 18,288 B`; a grouped top expert with one column reaches it whatever J
-/// the launch picked, so no `ncols_opt` function is safe (worst-row margin 144 B).
+/// The one constant pad on every q8_1 buffer, dense and grouped, `round_up(128 * 144, 2048)`.
+/// The two unconditional y-tile copies read `round_up(144 * J, 1024)` bytes from the first
+/// column of a J-column tile with no column bound (mmq.cuh:859-865, :875-881), so the worst
+/// need over every reachable J is `S(128) - 144 = 18,288 B`; a grouped top expert with one
+/// column reaches it whatever J the launch picked, so no `ncols_opt` function is safe
+/// (worst-row margin 144 B).
 pub(crate) const Q8_1_PAD: usize = 128 * Q8_1_BLOCK_BYTES;
-/// The chunk-column domain of every sizing function (0049 item 9 caps chunks at 2,048
-/// rows); wrappers refuse more through [`check_ncols_domain`].
+/// The chunk-column domain of every sizing function (chunks are capped at 2,048 rows);
+/// wrappers refuse more through [`check_ncols_domain`].
 pub(crate) const NCOLS_LIMIT: usize = 2048;
-/// The architectures the engine compiles (V-4, mmq.cuh:221-222): both at least Volta.
+/// The architectures the engine compiles (the vendored trim, mmq.cuh:221-222): both at least
+/// Volta.
 const COMPILED_ARCHS: [i32; 2] = [720, 860];
 const CC_VOLTA: i32 = 700;
 const CC_TURING: i32 = 750;
@@ -67,8 +66,8 @@ fn pad_up(n: usize, m: usize) -> usize {
 }
 
 /// The MMQ weight type tags: per-tensor dispatch, never role.
-/// The widest Q4_K tile the vendored table implements as a tiling config (patch V-5). Above
-/// this width the Q4_K rows are stream-k configs.
+/// The widest Q4_K tile the vendored table implements as a tiling config (the vendored Q4_K
+/// tiling patch). Above this width the Q4_K rows are stream-k configs.
 pub(crate) const Q4K_TILING_MAX_J: usize = 64;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -172,9 +171,9 @@ impl MmqConfig {
         self.config().j_sets[usize::from(fallback)].contains(&j)
     }
 
-    /// Whether the table's row for this (type, J) runs stream-k. Patch V-5 turns the Q4_K rows for
-    /// J at or below [`Q4K_TILING_MAX_J`] into tiling configs, which need no fixup; every other
-    /// Ampere row is stream-k, and the pascal table has no stream-k rows.
+    /// Whether the table's row for this (type, J) runs stream-k. The vendored Q4_K tiling patch
+    /// turns the Q4_K rows for J at or below [`Q4K_TILING_MAX_J`] into tiling configs, which need
+    /// no fixup; every other Ampere row is stream-k, and the pascal table has no stream-k rows.
     pub(crate) fn stream_k(self, mmq_type: MmqType, j: usize) -> bool {
         self == Self::Ampere && !(mmq_type == MmqType::Q4K && j <= Q4K_TILING_MAX_J)
     }
@@ -212,8 +211,8 @@ pub(crate) fn y_tile_span_bytes(nthreads: usize, j: usize) -> usize {
     pad_up(j * Q8_1_BLOCK_BYTES, nthreads * 4)
 }
 
-/// The tail r of `n` columns under tile width J (rev 3): `n - J*floor((n-1)/J)`, so
-/// `r` is in `1..=J` and equals J when `n % J == 0`.
+/// The tail r of `n` columns under tile width J: `n - J*floor((n-1)/J)`, so `r` is in `1..=J`
+/// and equals J when `n % J == 0`.
 pub(crate) fn tail_r(n: usize, j: usize) -> usize {
     n - j * ((n - 1) / j)
 }
@@ -262,7 +261,7 @@ pub(crate) fn legacy_j_max(fallback: bool, cc: i32, ncols: usize) -> usize {
 
 /// The `ncols_opt` where a q8_1 buffer sized by the old rule (`pad = legacy_j_max * 144`,
 /// the pin's mmq.cu:136-137 and :206) under-pads the launch's need (`y_tile_span - r*144`),
-/// recomputed over the whole domain 1..=2048 (finding 9), never taken from a sweep.
+/// recomputed over the whole domain 1..=2048, never taken from a sweep.
 pub(crate) fn overread_window(
     mmq_type: MmqType,
     fallback: bool,
@@ -281,14 +280,14 @@ pub(crate) fn overread_window(
         .collect()
 }
 
-/// Rev 2's upper bound J (`min(128, 8*ceil(n/8))`), kept for the coupling row and its
+/// An earlier upper bound on J (`min(128, 8*ceil(n/8))`), kept for the coupling test and its
 /// mutant: it is NOT the launch's J in the table gaps.
 pub(crate) fn j_ub(n: usize) -> usize {
     J_MAX.min(8 * n.div_ceil(8))
 }
 
-/// Rule M1 (rev 3, MSG-85 B1): `blocks_per_col * ncols * 144 + Q8_1_PAD`, the one constant
-/// pad on every q8_1 buffer, dense (`ncols = M`) and grouped (`ncols = ne_get_rows`).
+/// The q8_1 buffer bytes, `blocks_per_col * ncols * 144 + Q8_1_PAD`: the one constant pad on
+/// every q8_1 buffer, dense (`ncols = M`) and grouped (`ncols = ne_get_rows`).
 pub(crate) fn q8_1_bytes(k: usize, ncols: usize) -> Result<usize, EngError> {
     if k == 0 || ncols == 0 {
         return Err(rule("zero extent", "K and ncols must be at least 1"));
@@ -300,7 +299,7 @@ pub(crate) fn q8_1_bytes(k: usize, ncols: usize) -> Result<usize, EngError> {
         .ok_or_else(|| rule("size overflow", "the q8_1 scratch size overflows"))
 }
 
-/// Rule M2 (rev 3, MSG-85 B2), the shipped closed form: `ids_dst` holds at least
+/// The `ids_dst` capacity in its closed form: `ids_dst` holds at least
 /// `ne_get_rows + ncols_max + 127` ints (`9M + 127` at Qwen's top_k 8, `ncols_max = M`),
 /// because the stream-k fixup gather (mmq.cuh:1295-1302) has no `jt*J >= col_diff` exit.
 pub(crate) fn ids_dst_ints(ne_get_rows: usize, ncols_max: usize) -> Result<usize, EngError> {
@@ -361,7 +360,7 @@ pub(crate) fn fixup_floats_exact(
 }
 
 /// The ncols domain guard: every rule above holds for `ncols` in `1..=2048`, and a caller
-/// that raises the chunk cap must extend this domain first (finding 22).
+/// that raises the chunk cap must extend this domain first.
 pub(crate) fn check_ncols_domain(ncols: usize) -> Result<(), EngError> {
     if ncols == 0 || ncols > NCOLS_LIMIT {
         return Err(rule(

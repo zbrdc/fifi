@@ -1,7 +1,7 @@
 /*
- * Launch entry of the vendored MMVQ matvec (MATVEC-PAR S1 c3b): y = x_q8 . W^T against native
- * GGUF-layout weight blocks, through fifi_mmvq_launch of the V-MV1-trimmed mmvq.cu. Launch-only:
- * nothing here allocates, copies or synchronizes. Per-kernel header of the layout in
+ * Launch entry of the vendored MMVQ matvec: y = x_q8 . W^T against native GGUF-layout weight
+ * blocks, through fifi_mmvq_launch of the trimmed vendored mmvq.cu. Launch-only: nothing here
+ * allocates, copies or synchronizes. Per-kernel header of the layout in
  * kernels/cuda/resident/mod.rs; abi_resident.h stays closed.
  */
 #ifndef INFERENCE_CUDA_RESIDENT_MATVEC_Q_H
@@ -19,7 +19,7 @@ typedef struct inference_cuda_matvec_q_args {
     const void *x_q8;/* block_q8_1 [ncols][pad(k, 512)/32] */
     float *y;        /* f32 out [ncols][rows], column j at y + j*rows */
     int k;           /* a multiple of the type's block size */
-    int rows;        /* a multiple of 4 (KUBDAN-MSG-64 item 4: the kernel reads whole row groups) */
+    int rows;        /* a multiple of 4 (the kernel reads whole row groups) */
     int ncols;       /* 1..8 */
 } inference_cuda_matvec_q_args;
 
@@ -31,11 +31,10 @@ _Static_assert(sizeof(inference_cuda_matvec_q_args) == 48 && offsetof(inference_
                "inference_cuda_matvec_q_args layout");
 #endif
 
-/* One launch on stream (must not be NULL). The weights are read in the file's native block
- * layout; x_q8 is the padded quantize_q8_1 output of ncols activation rows. Returns
- * INFERENCE_CUDA_INVALID_ARGUMENT before any CUDA call for a bad argument, else the launch
- * status. The kernel's column j is computed from x_q8 row j alone (the S1 row-invariance
- * contract, decision 0037). */
+/* One launch on stream (must not be NULL). The weights are read in the file's native block layout;
+ * x_q8 is the padded quantize_q8_1 output of ncols activation rows. Returns
+ * INFERENCE_CUDA_INVALID_ARGUMENT before any CUDA call for a bad argument, else the launch status.
+ * The kernel's column j is computed from x_q8 row j alone (the row-invariance contract). */
 int inference_cuda_matvec_q_launch(const inference_cuda_matvec_q_args *args, void *stream,
                                    int *out_stage);
 

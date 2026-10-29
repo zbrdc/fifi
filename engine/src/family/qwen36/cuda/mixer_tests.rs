@@ -1,5 +1,5 @@
-//! Unit tests of the pure part of the op executor (test seam U13). CPU only. The launch wiring
-//! against real wrappers is covered by the scratch device run of RD-9b3b.
+//! Unit tests of the pure part of the op executor. CPU only. The launch wiring against real
+//! wrappers is covered by a scratch device run.
 use super::mixer::tail_extent;
 
 #[test]

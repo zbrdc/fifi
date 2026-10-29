@@ -1,15 +1,14 @@
-//! Safe wrapper of the step parameter kernels (RD-4d, decision 0047): the `StepParams` block,
-//! `step_begin`, `step_advance` and the greedy `argmax` with token chaining.
+//! Safe wrapper of the step parameter kernels: the `StepParams` block, `step_begin`, `step_advance`
+//! and the greedy `argmax` with token chaining.
 //!
-//! Per-launch data lives in a small device table, so one captured graph serves every position,
-//! and the next token is written on the device (greedy only, no device sampler, decision 0047
-//! item 8).
+//! Per-launch data lives in a small device table, so one captured graph serves every position, and
+//! the next token is written on the device (greedy only, no device sampler).
 //!
-//! The order of one resident step, which the caller (RD-9d) must keep: `step_begin` first, the
-//! layers, then `argmax` as the LAST kernel that writes `status`, then `step_advance`, then one
-//! 8-byte copy of the result pair. Before every launch the caller checks [`ensure_rows`] for the
-//! whole look-ahead window: a device word out of range is a silent out-of-bounds access in a
-//! consumer kernel that nothing can repair.
+//! The order of one resident step, which the caller must keep: `step_begin` first, the layers, then
+//! `argmax` as the LAST kernel that writes `status`, then `step_advance`, then one 8-byte copy of
+//! the result pair. Before every launch the caller checks [`ensure_rows`] for the whole look-ahead
+//! window: a device word out of range is a silent out-of-bounds access in a consumer kernel that
+//! nothing can repair.
 //!
 //! Every call checks all arguments first and answers `BadRequest`; the ranges are converted with
 //! `raw_range` before `launch_on`, so on a latched context a call with a bad range or argument
@@ -17,7 +16,7 @@
 //! (`launch_on` checks the terminal flag itself).
 #![cfg_attr(
     not(test),
-    expect(dead_code, reason = "staged for RD-9a (decision 0047)")
+    expect(dead_code, reason = "staged for the resident decode step")
 )]
 
 use std::ffi::c_int;
@@ -27,7 +26,7 @@ use crate::kernels::cuda::context::{Claim, require_apart, require_fit};
 use crate::kernels::cuda::native::resident::step_params as raw;
 use crate::kernels::cuda::{CudaContext, DeviceRange, DeviceStream};
 
-/// Status mask 1: a router fault (OR-ed in by the router kernel, RD-5).
+/// Status mask 1: a router fault (OR-ed in by the router kernel).
 pub(crate) const STATUS_ROUTER_FAULT: i32 = 1;
 /// Status mask 2: at least one logit is not finite (OR-ed in by `argmax`).
 pub(crate) const STATUS_NON_FINITE_LOGITS: i32 = 2;
@@ -178,9 +177,9 @@ pub(crate) fn ensure_rows(pos: usize, advance: usize, rows: usize) -> Result<(),
 /// The status word of a step, by mask: 1 router fault, 2 non-finite logits, 4 invalid step state.
 ///
 /// Mask 4 has two sources: a defect (the host check [`ensure_rows`] missed a case), or the
-/// embedding gather, which sets it for a token id outside the vocabulary (RD-4c). The word cannot
-/// tell the causes apart. Either way the resident state of the session is invalid until the
-/// executor resets it. The wrapper never latches on a status word; it only returns the error value.
+/// embedding gather, which sets it for a token id outside the vocabulary. The word cannot tell the
+/// causes apart. Either way the resident state of the session is invalid until the executor resets
+/// it. The wrapper never latches on a status word; it only returns the error value.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct StepStatus(pub(crate) i32);
 
@@ -229,8 +228,8 @@ impl StepStatus {
 
 /// The two words one 8-byte device-to-host copy gives the host after `argmax`.
 ///
-/// Three conditions hold (lane C, C2). (a) `result` is 8-byte aligned in its buffer. (b) `argmax`
-/// is the LAST kernel that writes `status` in the step; a late writer makes the pair stale, and
+/// Three conditions hold. (a) `result` is 8-byte aligned in its buffer. (b) `argmax` is the LAST
+/// kernel that writes `status` in the step; a late writer makes the pair stale, and
 /// [`ResultPair::matches_params`] detects it in tests. (c) The [`StepParams`] fields stay the
 /// device source of truth; the pair is a copy, nothing on the device reads it, and no call writes
 /// `StepParams` from a pair.

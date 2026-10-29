@@ -1,5 +1,4 @@
-//! Device tests of the prefix store of the Qwen3.6 CUDA executor (decision 0036, addendum
-//! 1; packet IMPL-CUDA-SERVE-2, C3).
+//! Device tests of the prefix store of the Qwen3.6 CUDA executor.
 //!
 //! D0 rounds a seeded `ExportedState` through `import_state`/`export_state` on a real state
 //! pool in both KV modes and refuses a wrong-mode value (no model load). The model tests load
@@ -16,12 +15,12 @@
 //! import cannot pass on the rows the earlier turns happened to leave there), and every
 //! capture-on turn asserts its last token really replayed the captured graph.
 //!
-//! Isolation (the MSG-73 latch rule): the device phase of every test is a
+//! Isolation (the latch rule of `native_device_rig.rs`): the device phase of every test is a
 //! `fn ... -> Result<Obs, EngError>` that builds every owner locally, returns plain host data
-//! through `?` and drops every owner at its return; only the caller, with no device owner
-//! alive, asserts. The seeded values of D0 are finite by construction (they come from small
-//! integers), so the float comparison of the round trip is safe; the model tests compare ids,
-//! hashes and bytes, never floats. One test per process through the baton.
+//! through `?` and drops every owner at its return; only the caller, with no device owner alive,
+//! asserts. The seeded values of D0 are finite by construction (they come from small integers), so
+//! the float comparison of the round trip is safe; the model tests compare ids, hashes and bytes,
+//! never floats. One test per process, with the 3090 held exclusively.
 
 use super::super::host::HostShape;
 use super::book::Health;
@@ -54,9 +53,9 @@ use crate::{
 use sha2::{Digest, Sha256};
 use std::path::{Path, PathBuf};
 
-/// The worker's prefill piece (A5).
+/// The worker's prefill piece.
 const PIECE: usize = 16;
-/// The greedy decode budget; a reference chain must reach 16 ids (the packet's rule).
+/// The greedy decode budget; a reference chain must reach 16 ids.
 const DECODE: u32 = 24;
 /// The context of the model tests: 1,024 positions, Native layout, one DeltaNet slot.
 const CONTEXT: usize = 1_024;
@@ -142,7 +141,7 @@ fn rules_for(bundle: &TokenizerBundle) -> Result<QwenRules, EngError> {
     // The eos set is a PROBE CHOICE, not the bundle's: every truncation of P5 greedily emits
     // the bundle's eos after one or two ids (probed at 77, 100, 140, 200, 340 and 560 tokens),
     // so no turn would reach the 16-id rule, and only the full 612-token prompt continues (the
-    // G1 health test). An empty set is refused by `QwenRules::new`, and 612-token prompts push
+    // health test). An empty set is refused by `QwenRules::new`, and 612-token prompts push
     // the debug runs past the 280-s window. Id 0 is never the greedy argmax of these chains
     // (the passing turns are the probe), so every finish is `Length` at the token limit and
     // the bitwise comparison carries 24 rows instead of one.
@@ -298,7 +297,7 @@ fn assert_same_bits(what: &str, got: &Turn, want: &Turn) {
     assert_eq!(got.finish, want.finish, "{what}: the finish differs");
 }
 
-/// The packet's chain rule: every reference turn reaches 16 ids.
+/// The chain rule: every reference turn reaches 16 ids.
 fn assert_chain_length(what: &str, got: &Turn) {
     assert!(
         got.ids.len() >= PIECE,
@@ -307,8 +306,8 @@ fn assert_chain_length(what: &str, got: &Turn) {
     );
 }
 
-/// MINOR-2: a turn that ran with capture on really replayed the captured graph; a capture
-/// refused to eager (`RefusedFellBackToEager`) fails the test instead of passing silently.
+/// A turn that ran with capture on really replayed the captured graph; a capture refused to eager
+/// (`RefusedFellBackToEager`) fails the test instead of passing silently.
 fn assert_captured(what: &str, got: &Turn) {
     assert!(
         got.captured,
@@ -468,8 +467,8 @@ fn mid_piece_phase(capture: bool) -> Result<(Vec<u32>, Vec<Turn>), EngError> {
     let mut session = DecodeSession::default();
     let p5 = p5_ids()?;
     let prompt = head(&p5, 77)?.to_vec();
-    // The unrelated turn Z = P5[300..380] runs between the save and the restore (MINOR-1): the
-    // restore must overwrite KV rows that hold Z's data, not the rows T's own cold turn left.
+    // The unrelated turn Z = P5[300..380] runs between the save and the restore: the restore must
+    // overwrite KV rows that hold Z's data, not the rows T's own cold turn left.
     let z = range_of(&p5, 300..380)?.to_vec();
     let turns = vec![
         turn(&mut step, &mut session, &bundle, &prompt, Some(37))?,
@@ -481,7 +480,7 @@ fn mid_piece_phase(capture: bool) -> Result<(Vec<u32>, Vec<Turn>), EngError> {
 }
 
 #[test]
-#[ignore = "the 3090 through the baton: loads the real model"]
+#[ignore = "the 3090, held exclusively: loads the real model"]
 fn restore_mid_piece_is_bitwise_eager() {
     if !device_present("restore_mid_piece_is_bitwise_eager") {
         return;
@@ -498,15 +497,11 @@ fn restore_mid_piece_is_bitwise_eager() {
     assert_eq!(cold.key_len, Some(37), "the entry holds the boundary key");
     assert_eq!(z.covered, 0, "Z does not extend the key");
     assert_eq!(z.saved, None, "Z has no boundary, so it never saves");
-    assert_eq!(
-        z.key_len,
-        Some(37),
-        "the unrelated turn keeps the entry (A8)"
-    );
+    assert_eq!(z.key_len, Some(37), "the unrelated turn keeps the entry");
     assert_eq!(restored.covered, 37);
     assert_eq!(
         restored.saved, None,
-        "the worker skips the save when the boundary is already restored (A5)"
+        "the worker skips the save when the boundary is already restored"
     );
     assert_eq!(
         restored.key_len,
@@ -533,7 +528,7 @@ fn restore_mid_piece_is_bitwise_eager() {
 }
 
 #[test]
-#[ignore = "the 3090 through the baton: loads the real model"]
+#[ignore = "the 3090, held exclusively: loads the real model"]
 fn restore_mid_piece_is_bitwise_captured() {
     if !device_present("restore_mid_piece_is_bitwise_captured") {
         return;
@@ -604,7 +599,7 @@ fn chain_phase(kv_mode: KvMode) -> Result<Vec<Turn>, EngError> {
 }
 
 #[test]
-#[ignore = "the 3090 through the baton: loads the real model"]
+#[ignore = "the 3090, held exclusively: loads the real model"]
 fn a_turn_chain_restores_a_restored_entry() {
     if !device_present("a_turn_chain_restores_a_restored_entry") {
         return;
@@ -615,11 +610,7 @@ fn a_turn_chain_restores_a_restored_entry() {
     assert_eq!(t1.saved, Some(true), "T1 saves at 300");
     assert_eq!(z.covered, 0, "Z does not extend T1's key");
     assert_eq!(z.saved, None, "Z has no boundary, so it never saves");
-    assert_eq!(
-        z.key_len,
-        Some(300),
-        "the unrelated turn keeps T1's entry (A8)"
-    );
+    assert_eq!(z.key_len, Some(300), "the unrelated turn keeps T1's entry");
     assert_eq!(first.covered, 300, "T2 restores T1's entry");
     assert_eq!(
         first.saved,
@@ -644,7 +635,7 @@ fn a_turn_chain_restores_a_restored_entry() {
 }
 
 #[test]
-#[ignore = "the 3090 through the baton: loads the real model"]
+#[ignore = "the 3090, held exclusively: loads the real model"]
 fn int8g32_turn_chain_restores_bitwise() {
     if !device_present("int8g32_turn_chain_restores_bitwise") {
         return;
@@ -732,7 +723,7 @@ struct FallbackObs {
 }
 
 #[test]
-#[ignore = "the 3090 through the baton: loads the real model"]
+#[ignore = "the 3090, held exclusively: loads the real model"]
 fn a_prompt_that_does_not_extend_the_key_falls_back() {
     if !device_present("a_prompt_that_does_not_extend_the_key_falls_back") {
         return;
@@ -827,7 +818,7 @@ struct ResidueObs {
 }
 
 #[test]
-#[ignore = "the 3090 through the baton: loads the real model"]
+#[ignore = "the 3090, held exclusively: loads the real model"]
 fn reset_after_restore_leaves_no_residue() {
     if !device_present("reset_after_restore_leaves_no_residue") {
         return;
@@ -848,10 +839,7 @@ fn reset_after_restore_leaves_no_residue() {
     assert_chain_length("the Z turn after the reset", &obs.after);
     assert_captured("the Z turn after the reset", &obs.after);
     assert_same_bits("a reset leaves no residue", &obs.after, &obs.reference);
-    assert_eq!(
-        obs.final_probe.covered, 100,
-        "the reset keeps the entry (A8)"
-    );
+    assert_eq!(obs.final_probe.covered, 100, "the reset keeps the entry");
     assert_eq!(obs.final_probe.key_len, Some(100));
 }
 
@@ -887,7 +875,7 @@ fn tiered_phase() -> Result<Turn, EngError> {
 }
 
 #[test]
-#[ignore = "the 3090 through the baton: loads the real model"]
+#[ignore = "the 3090, held exclusively: loads the real model"]
 fn a_tiered_step_never_saves() {
     if !device_present("a_tiered_step_never_saves") {
         return;
@@ -1072,19 +1060,19 @@ fn assert_pinned_ready(expected: usize) {
 }
 
 #[test]
-#[ignore = "the 3090 through the baton: loads the real model; zero-byte pinned cap"]
+#[ignore = "the 3090, held exclusively: loads the real model; zero-byte pinned cap"]
 fn pinned_ready_zero() {
     assert_pinned_ready(0);
 }
 
 #[test]
-#[ignore = "the 3090 through the baton: loads the real model; one retained pinned entry"]
+#[ignore = "the 3090, held exclusively: loads the real model; one retained pinned entry"]
 fn pinned_ready_one() {
     assert_pinned_ready(1);
 }
 
 #[test]
-#[ignore = "the 3090 through the baton: loads the real model; two retained pinned entries"]
+#[ignore = "the 3090, held exclusively: loads the real model; two retained pinned entries"]
 fn pinned_ready_two() {
     assert_pinned_ready(2);
 }

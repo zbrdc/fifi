@@ -16,6 +16,17 @@ pub use acquire::{
     AcquireRequest, CancelHandle, Completion, Priority, Selection, StreamedCheckpoint,
     StreamedWeights, Ticket,
 };
+/// The cold-load read accounting for the load-timing harness: acquire's `read_stats` module
+/// under a stable name, Mac test builds only.
+#[cfg(all(
+    test,
+    feature = "native-mlx",
+    target_os = "macos",
+    target_arch = "aarch64"
+))]
+pub(crate) mod acquire_read {
+    pub(crate) use super::acquire::{reset, set, snapshot};
+}
 pub use gguf::{
     ArrayMeta, GgufHeader, GgufTensor, GgufType, MetaValue, SplitInfo, check_split_set, sha256_hex,
     sha256_stream, verify_sha256,

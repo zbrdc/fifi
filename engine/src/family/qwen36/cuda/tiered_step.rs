@@ -1,12 +1,12 @@
-//! The tiered runtime of the resident step (OFF-2 D5): what the step needs, beyond the plain
-//! weights, to run the tiered MoE block of `moe/tiered.rs` in every layer.
+//! The tiered runtime of the resident step: what the step needs, beyond the plain weights, to run
+//! the tiered MoE block of `moe/tiered.rs` in every layer.
 //!
 //! WHAT: [`TieredRuntime`] owns the per-layer expert banks, the scratch buffers and the host
 //! (`TieredHost`: policy, residency ledger, CPU pool), and borrows each layer's router and shared
 //! expert weights from the loaded model ([`LayerParts`]); the routed expert stacks are NOT loaded
 //! in this mode (the bank holds the hot experts). [`TieredRuntime::run_layer`] runs one layer's
 //! block, [`TieredRuntime::end_token`] runs the token boundary: policy P decides the swaps and the
-//! bank slots are filled with blocking writes (design `ledger/plans/OFF-2-DEVICE-WIRING.md`).
+//! bank slots are filled with blocking writes.
 
 use std::ops::Range;
 use std::sync::Arc;

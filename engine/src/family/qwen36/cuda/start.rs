@@ -1,13 +1,13 @@
-//! Starts the Q36 CUDA engine of one `enginesrv` config entry (CUDA-SERVE-1): the tokenizer
-//! bundle and the rules on the calling thread, then the engine thread builds everything CUDA
-//! inside `make` (no CUDA value crosses a thread boundary, decisions 0023/0024).
+//! Starts the Q36 CUDA engine of one `enginesrv` config entry: the tokenizer bundle and the
+//! rules on the calling thread, then the engine thread builds everything CUDA inside `make` (no
+//! CUDA value crosses a thread boundary).
 //!
-//! Lifetime (CUDA-SERVE-1 2.1, git-db's design condition): `spawn_engine` needs an executor
-//! without a lifetime and `QwenResidentStep` borrows its owners, so the projector, the weights
-//! and the step resources are `Box::leak`ed once per engine, giving `QwenResidentStep<'static>`
-//! (an owning `Arc` variant would rewrite the qualified step, >= 1,000 lines). ONE CUDA engine
-//! is built per process: `BuildGuard` pins the flag before `spawn_engine`, commits it right
-//! after the leaks, and every retry in the same process is refused.
+//! Lifetime: `spawn_engine` needs an executor without a lifetime and `QwenResidentStep` borrows
+//! its owners, so the projector, the weights and the step resources are `Box::leak`ed once per
+//! engine, giving `QwenResidentStep<'static>` (an owning `Arc` variant would rewrite the
+//! qualified step, >= 1,000 lines). ONE CUDA engine is built per process: `BuildGuard` pins the
+//! flag before `spawn_engine`, commits it right after the leaks, and every retry in the same
+//! process is refused.
 
 use super::super::settings::{
     DEFAULT_CUDA_PREFILL_CHUNK, KvDtype, NO_BUDGET_PIECE, Q36Settings, tokenizer_pin,
@@ -220,9 +220,8 @@ impl StartupPlan {
 
 /// The pinned checkpoint of the CUDA arm: the file NAME inside `model_dir` and its exact SIZE,
 /// both matching the pinned identity the qualification tool checks before every gated run. The
-/// full-file SHA-256 beside them is checked only when `Q36_VERIFY_GGUF_SHA256` is `1`
-/// (KUBDAN-MSG-69 condition 3): hashing 20 GB costs about 15-40 s per start (ESTIMATE) and the
-/// qualification script checks it.
+/// full-file SHA-256 beside them is checked only when `Q36_VERIFY_GGUF_SHA256` is `1`: hashing
+/// 20 GB costs about 15-40 s per start (ESTIMATE) and the qualification script checks it.
 pub(super) const GGUF_NAME: &str = "Qwen3.6-35B-A3B-Q4_K_M.gguf";
 pub(super) const GGUF_BYTES: u64 = 20_419_565_568;
 const GGUF_SHA256: &str = "671e47e0ec53c665d048b98c3ecbfd5236b5ca9c3e02ed19fc8f81f7b85140c7";
@@ -230,7 +229,7 @@ const GGUF_SHA256: &str = "671e47e0ec53c665d048b98c3ecbfd5236b5ca9c3e02ed19fc8f8
 /// leaves the check off, and every OTHER spelling — `true`, `yes`, an empty value — is a
 /// typed refusal (raised in `make`, after the CUDA context exists), so a misspelled promise
 /// cannot silently skip the check. A value Rust cannot read as UTF-8 reads as unset (std's
-/// `env::var`), so it leaves the check off (KUBDAN-MSG-72 NIT).
+/// `env::var`), so it leaves the check off.
 const VERIFY_SHA256_VAR: &str = "Q36_VERIFY_GGUF_SHA256";
 const CHUNK_PREFILL_VAR: &str = "Q36_CUDA_CHUNK_PREFILL";
 const CHUNK_ROWS_VAR: &str = "Q36_CUDA_CHUNK_ROWS";
@@ -286,10 +285,9 @@ fn context_staging_wanted(value: Option<&std::ffi::OsStr>) -> Result<bool, EngEr
     prefill_flag(CONTEXT_STAGING_VAR, true, value)
 }
 
-/// The wide 131072-row staged-split candidate is DEFAULT ON (the 2026-10-25
-/// flip: -7.4% TTFT at 128K, token-identical at 149731 and 127788 tokens,
-/// same binary, cold boots). `Q36_CUDA_CPF_STAGE_128K=0` rolls it back to
-/// the 32768-row default stage.
+/// The wide 131072-row staged-split candidate is DEFAULT ON (against the 32768-row stage:
+/// -7.4% TTFT at 128K, token-identical at 149731 and 127788 tokens, same binary, cold boots).
+/// `Q36_CUDA_CPF_STAGE_128K=0` rolls it back to the 32768-row default stage.
 fn wide_stage_wanted(value: Option<&std::ffi::OsStr>) -> Result<bool, EngError> {
     prefill_flag(WIDE_STAGE_VAR, true, value)
 }
@@ -362,14 +360,14 @@ const HEADROOM: u64 = 1 << 30;
 /// The process-wide one-engine flag: `true` from the first leak of a build onwards.
 pub(super) static CUDA_ENGINE_BUILT: AtomicBool = AtomicBool::new(false);
 
-/// The refusal of a second build in one process (the packet's documented text, 2.1).
+/// The refusal of a second build in one process (the documented text).
 pub(super) fn already_built() -> EngError {
     EngError::BadRequest("engine config: the CUDA Q36 backend builds one engine per process: its weights are leaked for the process lifetime and an in-process restart would leak 20 GB again; configure a single qwen3_6_35b_a3b entry and restart the process to reload".to_string())
 }
 
-/// The one-engine guard (condition 2): `acquire` takes the flag before `spawn_engine`,
-/// `commit` pins it right after the first leak, and the `Drop` releases it only for a failure
-/// BEFORE the first leak, when nothing is on the device and a retry may build.
+/// The one-engine guard: `acquire` takes the flag before `spawn_engine`, `commit` pins it
+/// right after the first leak, and the `Drop` releases it only for a failure BEFORE the first
+/// leak, when nothing is on the device and a retry may build.
 pub(super) struct BuildGuard {
     committed: bool,
 }
@@ -398,9 +396,9 @@ impl Drop for BuildGuard {
     }
 }
 
-/// The start line of one MLX-only key the CUDA arm ignores (the settings record the names in
-/// the order of `Q36Options`). `prefill_chunk` keeps its line until lane M's CPF-7a
-/// integration commit accepts the key as the cap of `M_sess` (decision 0049, A6 item 2).
+/// The start line of one MLX-only key the CUDA arm ignores (the settings record the names in the
+/// order of `Q36Options`). `prefill_chunk` keeps its line until chunked CUDA prefill accepts the
+/// key as the cap of `M_sess`.
 pub(crate) fn ignored_mlx_line(key: &str) -> &'static str {
     match key {
         "cache_limit_bytes" => "q36 cuda: cache_limit_bytes is an MLX allocator key and is ignored",
@@ -413,14 +411,12 @@ pub(crate) fn ignored_mlx_line(key: &str) -> &'static str {
     }
 }
 
-/// The start line of the session's prefill path (lane C R3, CPF-7b-C B.11): one line per
-/// session build, printed after the arena admission — the accept names the ADMITTED
-/// `M_sess`, every refusal names its reason, and the match is exhaustive (no `_` arm), so a
-/// new verdict cannot go unlabelled. `make` prints it once `admit_prefill` returns
-/// (CPF-7b-C C5); the text is pinned by the host rows of `prefill_driver_tests`.
-/// `pub(super)` like the enum it takes: a `pub(crate)` fn cannot expose the `pub(super)`
-/// verdict type (B.8), and every caller — `make`, the host row, the device row — is in
-/// `cuda`.
+/// The start line of the session's prefill path: one line per session build, printed after the
+/// arena admission — the accept names the ADMITTED `M_sess`, every refusal names its reason, and
+/// the match is exhaustive (no `_` arm), so a new verdict cannot go unlabelled. `make` prints it
+/// once `admit_prefill` returns; the text is pinned by the host rows of `prefill_driver_tests`.
+/// `pub(super)` like the enum it takes: a `pub(crate)` fn cannot expose the `pub(super)` verdict
+/// type, and every caller — `make`, the host row, the device row — is in `cuda`.
 pub(super) fn prefill_start_line(verdict: &ChunkVerdict) -> String {
     match verdict {
         ChunkVerdict::Ready { m_sess } => format!("q36 cuda: prefill chunk M_sess {m_sess}"),
@@ -484,9 +480,8 @@ pub(super) fn file_sha256(path: &Path) -> Result<String, EngError> {
         .collect())
 }
 
-/// The full-file digest check, with the digest-and-elapsed log line of condition 3, printed
-/// only AFTER the compare (KUBDAN-MSG-72 NIT): a mismatch logs nothing here — its refusal
-/// names both digests.
+/// The full-file digest check, with the digest-and-elapsed log line printed only AFTER the
+/// compare: a mismatch logs nothing here — its refusal names both digests.
 pub(super) fn check_sha256(path: &Path, expected: &str) -> Result<(), EngError> {
     let began = Instant::now();
     let digest = file_sha256(path)?;
@@ -504,9 +499,9 @@ pub(super) fn check_sha256(path: &Path, expected: &str) -> Result<(), EngError> 
 }
 
 /// Checks the pinned identity of the GGUF: the NAME by construction (`pinned_gguf`), the exact
-/// SIZE always (the metadata alone), the full-file SHA-256 only when `verify` asks for it.
-/// The toggle value itself is resolved by the caller (`start()`, SERVE-1-F F4), so a bad
-/// spelling is refused at startup, before any device work; unset stays OFF with no error.
+/// SIZE always (the metadata alone), the full-file SHA-256 only when `verify` asks for it. The
+/// toggle value itself is resolved by the caller (`start()`), so a bad spelling is refused at
+/// startup, before any device work; unset stays OFF with no error.
 pub(super) fn check_gguf_identity(path: &Path, verify: bool) -> Result<(), EngError> {
     let metadata = std::fs::metadata(path).map_err(|_| {
         EngError::Checkpoint(format!(
@@ -549,11 +544,10 @@ pub(super) fn check_tiered_start(settings: &Q36Settings) -> Result<(), EngError>
     Ok(())
 }
 
-/// The checked KV mode of the parsed `kv_dtype` member and the layout the step runs (KV8-B
-/// B4): absent or `f32` is `Fp16` — main's "f32" names the CONTROL cache, and on the CUDA arm
-/// the control cache is the fp16 cache — and `q8` is `Int8G32`, which exists as Native op lists
-/// only, so the Tiled layout is a typed refusal here (the plan refuses it again,
-/// `check_layout_rows`).
+/// The checked KV mode of the parsed `kv_dtype` member and the layout the step runs: absent or
+/// `f32` is `Fp16` — the shared "f32" names the CONTROL cache, and on the CUDA arm the control
+/// cache is the fp16 cache — and `q8` is `Int8G32`, which exists as Native op lists only, so
+/// the Tiled layout is a typed refusal here (the plan refuses it again, `check_layout_rows`).
 pub(super) fn kv_mode_of(kv: KvDtype, layout: WeightLayout) -> Result<KvMode, EngError> {
     match (kv, layout) {
         (_, WeightLayout::Exl3) => Err(EngError::BadRequest(
@@ -586,8 +580,8 @@ pub(super) fn serve_kv_mode(settings: &Q36Settings) -> Result<KvMode, EngError> 
 /// The session options: one committed DeltaNet slot, no forked experts, the fixed KV
 /// capacity of `context_limit` positions (the step's context limit IS this number), the KV
 /// mode of the config, and the step layout. `make` calls it AFTER the load with the loaded
-/// weights' own layout (`device.layout()?`, KUBDAN-MSG-72 item 1), so the step always runs the
-/// layout the device holds.
+/// weights' own layout (`device.layout()?`), so the step always runs the layout the device
+/// holds.
 pub(super) fn step_options(
     context_limit: u32,
     layout: WeightLayout,
@@ -620,7 +614,7 @@ pub(super) fn context_tokens(context_limit: u32, kv_mode: KvMode) -> Result<usiz
 /// The KV bytes of ONE position under `kv_mode`, straight from the pool's own layout
 /// arithmetic (`KvPool::bytes_per_token`, 20,480 under Fp16 and 10,880 under Int8G32, pinned
 /// by the start tests), never a constant: the admission must follow the KV mode the config
-/// picked (KV8-B B4).
+/// picked.
 pub(super) fn kv_bytes_per_position(kv_mode: KvMode) -> Result<u64, EngError> {
     let inventory = Inventory::for_spec(&QWEN3_6_35B_A3B)?;
     let shape = HostShape::from_spec(&QWEN3_6_35B_A3B, ROTARY_DIM)?;
@@ -643,11 +637,10 @@ pub(super) fn kv_cache_bytes(context_tokens: usize, kv_mode: KvMode) -> Result<u
 }
 
 /// The load options of the engine: THE ONE PLACE the reserve terms and the load layout live
-/// (MSG-70 condition 8: the layout is written outright, never through a derived default). The
-/// layout is `Native` since the S3c qualification of MATVEC-PAR S3b on the 3090 (lane C's
-/// ruling); the step follows the loaded weights, so this one field is the whole switch. `work: 0` is right: `CudaProjector::new`
-/// allocates the matmul workspace BEFORE the admission reads the free figure, so counting it
-/// in `work` too would double-count it.
+/// (the layout is written outright, never through a derived default). The layout is `Native`,
+/// qualified on the 3090; the step follows the loaded weights, so this one field is the whole
+/// switch. `work: 0` is right: `CudaProjector::new` allocates the matmul workspace BEFORE the
+/// admission reads the free figure, so counting it in `work` too would double-count it.
 pub(super) fn load_options(kv_cache: u64, fixed_admission: bool) -> LoadOptions<'static> {
     LoadOptions {
         reserve: Reserve {
@@ -668,10 +661,9 @@ pub(crate) fn start(
     settings: &Q36Settings,
     ready_note: ReadyNote,
 ) -> Result<(Engine, TokenizerBundle), EngError> {
-    // The toggle is resolved HERE, before any work (SERVE-1-F F4): a bad
-    // `Q36_VERIFY_GGUF_SHA256` spelling is refused at startup, not on the engine thread after
-    // the projector exists; unset stays OFF with no error (`sha256_wanted(None)` is
-    // `Ok(false)`, pinned in start_tests).
+    // The toggle is resolved HERE, before any work: a bad `Q36_VERIFY_GGUF_SHA256` spelling is
+    // refused at startup, not on the engine thread after the projector exists; unset stays OFF
+    // with no error (`sha256_wanted(None)` is `Ok(false)`, pinned in start_tests).
     let verify = sha256_wanted(std::env::var(VERIFY_SHA256_VAR).ok().as_deref())?;
     let chunked =
         chunk_prefill_wanted(settings.kv, std::env::var_os(CHUNK_PREFILL_VAR).as_deref())?;
@@ -819,13 +811,12 @@ fn make(
         Some(plan) => StepResources::allocate_paged(projector.context(), plan)?,
         None => StepResources::new(projector.context(), dims, &inventory, &options)?,
     };
-    // LEAK (CUDA-SERVE-1 2.1, condition 2): the three owners are leaked for the process
-    // lifetime, giving `QwenResidentStep<'static>`; an owning `Arc` variant would rewrite the
-    // qualified step (>= 1,000 lines). `guard.commit()` right below pins the one-engine flag,
-    // so a retry after ANY failure from here on — a `QwenResidentStep::new` or
-    // `set_capture_config` error leaves the ~20 GB on the device — is refused with the
-    // documented text. A process whose engine ended in Error or NativeFailed is restarted,
-    // not rebuilt.
+    // LEAK: the three owners are leaked for the process lifetime, giving
+    // `QwenResidentStep<'static>`; an owning `Arc` variant would rewrite the qualified step
+    // (>= 1,000 lines). `guard.commit()` right below pins the one-engine flag, so a retry after
+    // ANY failure from here on — a `QwenResidentStep::new` or `set_capture_config` error leaves
+    // the ~20 GB on the device — is refused with the documented text. A process whose engine
+    // ended in Error or NativeFailed is restarted, not rebuilt.
     let projector: &'static CudaProjector = Box::leak(Box::new(projector));
     let weights: &'static CudaWeights = Box::leak(Box::new(device));
     let res: &'static StepResources = Box::leak(Box::new(res));
@@ -833,8 +824,8 @@ fn make(
     let mut step = QwenResidentStep::new(projector.context(), res, weights, &options, rules)?;
     step.set_capture_config(CaptureConfig {
         capture: settings.capture,
-        // Packet B1 marks stay off on the serve path: the timer is a measurement harness, not
-        // a serving feature.
+        // The section-timing marks stay off on the serve path: the timer is a measurement harness,
+        // not a serving feature.
         section_marks: false,
     })?;
     // Q8 chunking defaults on at 1024 rows; overrides use the supported row ladder.
@@ -847,9 +838,9 @@ fn make(
         DEFAULT_CUDA_PREFILL_CHUNK
     });
 
-    // The prefill arena (CPF-7b-C B.1): ONE admission after the load and the step build,
-    // from the post-load snapshot less the selected headroom. Fixed mode also checks live
-    // free VRAM and refuses an undersized plan; legacy mode may keep the per-token arm.
+    // The prefill arena: ONE admission after the load and the step build, from the post-load
+    // snapshot less the selected headroom. Fixed mode also checks live free VRAM and refuses an
+    // undersized plan; legacy mode may keep the per-token arm.
     if let Some(host_limit) = settings.kv_offload_host_bytes {
         if device_first {
             if let Some(rows) = res

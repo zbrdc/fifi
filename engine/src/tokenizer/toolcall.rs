@@ -6,10 +6,10 @@
 //!
 //! The pinned chat templates render an assistant tool call as
 //! `<tool_call>\n<function=NAME>\n<parameter=KEY>\nVALUE\n</parameter>\n</function>\n</tool_call>`
-//! (`engine/testdata/chat_template.jinja`, decision 0025 decision 5). A call without arguments
-//! has no parameter block. Reasoning sits between `<think>` and `</think>`. The generation prompt
-//! already ends with `<think>\n` when thinking is on, so the generated text then starts inside
-//! the reasoning ([`Start::Reasoning`]).
+//! (`engine/testdata/chat_template.jinja`). A call without arguments has no parameter block.
+//! Reasoning sits between `<think>` and `</think>`. The generation prompt already ends with
+//! `<think>\n` when thinking is on, so the generated text then starts inside the reasoning
+//! ([`Start::Reasoning`]).
 //!
 //! The parser works on decoded text, not on token ids. `<think>`, `</think>`, `<tool_call>`, and
 //! `</tool_call>` are ordinary added tokens (ids 248068, 248069, 248058, 248059) and decode to
@@ -1036,7 +1036,7 @@ mod tests {
         );
     }
 
-    /// R4: control spellings QUOTED in model prose stay text — the parser
+    /// Control spellings QUOTED in model prose stay text — the parser
     /// only honors the structural grammar, so a mid-text <parameter=...>
     /// or a bare <function=...> never opens a call. Mutation receipt: gut
     /// the grammar check (treat any spelling as a call open) and this pin

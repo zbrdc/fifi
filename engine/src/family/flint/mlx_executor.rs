@@ -18,10 +18,9 @@ use std::path::{Path, PathBuf};
 
 type Result<T> = std::result::Result<T, EngError>;
 
-/// The addendum 1 store shape this executor pins: zero roots, one tip
-/// entry (the worker plans exactly one tip save per job). A named constant
-/// so the store-shape test pins what the EXECUTOR builds, not the default
-/// (Opus r1 Nit-5).
+/// The store shape this executor pins: zero roots, one tip entry (the worker
+/// plans exactly one tip save per job). A named constant so the store-shape
+/// test pins what the EXECUTOR builds, not the default.
 pub(super) const PREFIX_STORE_LIMITS: StoreLimits = StoreLimits {
     roots: 0,
     entries: 1,
@@ -29,26 +28,24 @@ pub(super) const PREFIX_STORE_LIMITS: StoreLimits = StoreLimits {
 
 pub(super) struct FlintExecutor {
     // Declared first so the STORE drops before the model and its kernels
-    // (the Flash/Q36 field order; Opus r1 Nit-1, reworded by the delta's
-    // Nit-1: the earlier comment inverted the intended order).
+    // (the Flash/Q36 field order).
     prefix: PrefixStore<PrefixSnapshot, FlintPath>,
     model: Model,
     eos: Vec<u32>,
     pub(super) vocab: usize,
     root: PathBuf,
-    /// The restore fact of the CURRENT job for `prefix_report` (the M4
-    /// rule: cleared on reset so a job without a restore never reports
-    /// the job before it).
+    /// The restore fact of the CURRENT job for `prefix_report` (cleared on
+    /// reset so a job without a restore never reports the job before it).
     prefix_hit: PrefixHit,
-    /// The last restore's uncached-shared observation (Sol wave-1 SF1):
-    /// set by `restore_prefix`, cleared with `prefix_hit` in `reset`.
+    /// The last restore's uncached-shared observation: set by
+    /// `restore_prefix`, cleared with `prefix_hit` in `reset`.
     prefix_uncached_shared: u32,
-    /// Lifetime count of saves refused by the retention budget (Sol
-    /// wave-1 MF1); rides `save_refusals` in the report.
+    /// Lifetime count of saves refused by the retention budget; rides
+    /// `save_refusals` in the report.
     prefix_budget_refusals: u64,
-    /// The retention cap this executor admits saves against (Sol wave-2
-    /// MF-1): the explicit env value, or the derived one. Always finite -
-    /// `open` refuses to start when neither can be established.
+    /// The retention cap this executor admits saves against: the explicit
+    /// env value, or the derived one. Always finite - `open` refuses to
+    /// start when neither can be established.
     pub(super) prefix_retention_cap: u64,
 }
 
@@ -132,13 +129,12 @@ impl FlintExecutor {
                 "Flint tokenizer vocabulary or EOS set is invalid".into(),
             ));
         }
-        // Retention cap (Sol wave-2 MF-1, Opus wave-2 MF-1): computed ONLY
-        // when the reuse opt-in is armed - a default-OFF engine must load
-        // unchanged (no sysctl probe, no env validation, no new failure
-        // modes) - and before the model load so a cap failure costs
-        // nothing. Opt-in OFF admits a cap of 0: every save refused. The
-        // probes are CLOSURES so the opt-in gate is not merely branched
-        // around but never executed when OFF.
+        // Retention cap: computed ONLY when the reuse opt-in is armed - a
+        // default-OFF engine must load unchanged (no sysctl probe, no env
+        // validation, no new failure modes) - and before the model load so
+        // a cap failure costs nothing. Opt-in OFF admits a cap of 0: every
+        // save refused. The probes are CLOSURES so the opt-in gate is not
+        // merely branched around but never executed when OFF.
         let retention_cap = super::retention_cap_for(
             super::prefix_reuse_opt_in(),
             std::env::var_os("FIFI_FLINT_PREFIX_BUDGET_BYTES").as_deref(),
@@ -156,7 +152,7 @@ impl FlintExecutor {
                 eos,
                 vocab,
                 root: root.to_path_buf(),
-                // The addendum 1 store: one tip entry, no roots.
+                // The store: one tip entry, no roots.
                 prefix: PrefixStore::with_limits(PREFIX_STORE_LIMITS),
                 prefix_hit: PrefixHit::Miss,
                 prefix_uncached_shared: 0,
@@ -183,8 +179,8 @@ impl ExecutorOps for FlintExecutor {
     }
 
     fn reset(&mut self, st: &mut FlintSession) -> Result<()> {
-        // M4 rule: the job-scoped restore fact dies with the job, so a
-        // job without a restore never reports the job before it.
+        // The job-scoped restore fact dies with the job, so a job without
+        // a restore never reports the job before it.
         self.prefix_hit = PrefixHit::Miss;
         self.prefix_uncached_shared = 0;
         st.core.reset(&mut Step {
@@ -233,25 +229,24 @@ impl ExecutorOps for FlintExecutor {
     }
 
     fn prefix_limits(&self) -> StoreLimits {
-        // The store is the addendum 1 shape: zero roots, one tip entry, so
-        // the worker plans exactly one tip save per job. Overridden so the
-        // worker's plan and the store's limits agree by construction, not
-        // by both happening to default to (0, 1) (Opus delta Nit-2).
+        // The store shape is zero roots, one tip entry, so the worker plans
+        // exactly one tip save per job. Overridden so the worker's plan and
+        // the store's limits agree by construction, not by both happening to
+        // default to (0, 1).
         PREFIX_STORE_LIMITS
     }
 
     fn save_prefix(&mut self, st: &FlintSession, key: &[u32], kind: SaveKind) -> Result<bool> {
-        // Retention admission (Sol wave-2 MF-1, enforced default): the
-        // worst case a save commits - the new entry, the transient overlap
-        // with the entry it displaces, and the COW the continuing session
-        // needs on the shared planes - must fit the cap BEFORE the store
-        // is touched. The check runs before `core.save_prefix` so an
-        // over-cap save is a planned Ok(false) at zero store work (the
-        // one accepted tradeoff, Opus wave-2 Nit: a duplicate-use re-save
-        // under a tight cap counts as a refusal); the release is the Rc
-        // drop when the store drops the entry. The refusal is counted in
-        // save_refusals and logged once per refused save (at most one per
-        // job).
+        // Retention admission (enforced by default): the worst case a save
+        // commits - the new entry, the transient overlap with the entry it
+        // displaces, and the COW the continuing session needs on the
+        // shared planes - must fit the cap BEFORE the store is touched.
+        // The check runs before `core.save_prefix` so an over-cap save is
+        // a planned Ok(false) at zero store work (the one accepted
+        // tradeoff: a duplicate-use re-save under a tight cap counts as a
+        // refusal); the release is the Rc drop when the store drops the
+        // entry. The refusal is counted in save_refusals and logged once
+        // per refused save (at most one per job).
         let charge = st.state.snapshot_prefix().charged_bytes();
         let retained: u64 = self
             .prefix
@@ -286,8 +281,8 @@ impl ExecutorOps for FlintExecutor {
         if let Ok(n) = restored {
             // The store holds only tips (one-tip limits), so a non-zero
             // restore is a Tip hit. The uncached-shared observation is
-            // taken HERE, where the prompt is in hand (Sol wave-1 SF1),
-            // and rides the report of this job only.
+            // taken HERE, where the prompt is in hand, and rides the
+            // report of this job only.
             self.prefix_hit = if n > 0 {
                 PrefixHit::Tip
             } else {
@@ -298,17 +293,17 @@ impl ExecutorOps for FlintExecutor {
         restored
     }
 
-    /// The prefix-store facts of one job (Opus r1 SF-3): entries and their
-    /// charged KV bytes after the job's save points, beside the job's own
-    /// restore hit and its uncached-shared observation (Sol wave-1 SF1:
-    /// taken at the restore that saw the prompt, not a stale 0).
+    /// The prefix-store facts of one job: entries and their charged KV bytes
+    /// after the job's save points, beside the job's own restore hit and its
+    /// uncached-shared observation (taken at the restore that saw the prompt,
+    /// not a stale 0).
     fn prefix_report(&self) -> Option<PrefixReport> {
         let stored = self.prefix.roots_len() + self.prefix.entries_len();
         let entries = u32::try_from(stored).unwrap_or(u32::MAX);
         let mut save_side = self.prefix.save_side_totals();
         // An executor-side retention-budget refusal is also a save that
-        // returned without storing (Sol wave-1 MF1), so it rides the same
-        // counter instead of a new report field.
+        // returned without storing, so it rides the same counter instead
+        // of a new report field.
         save_side.save_refusals = save_side
             .save_refusals
             .saturating_add(self.prefix_budget_refusals);
@@ -330,10 +325,10 @@ impl ExecutorOps for FlintExecutor {
 }
 
 /// Physical memory in bytes via `/usr/sbin/sysctl` -n hw.memsize` - the
-/// ABSOLUTE path (Opus wave-2 MF-1: a PATH lookup breaks under a
-/// restricted PATH or sandbox, which would refuse engine loads; the
-/// absolute binary needs no PATH at all). `None` when the probe fails,
-/// which the cap seam treats as underivable (fail closed, opt-in only).
+/// ABSOLUTE path (a PATH lookup breaks under a restricted PATH or sandbox,
+/// which would refuse engine loads; the absolute binary needs no PATH at
+/// all). `None` when the probe fails, which the cap seam treats as
+/// underivable (fail closed, opt-in only).
 fn physical_memory_bytes() -> Option<u64> {
     std::process::Command::new("/usr/sbin/sysctl")
         .args(["-n", "hw.memsize"])
@@ -351,10 +346,10 @@ fn physical_memory_bytes() -> Option<u64> {
 /// The loaded-weights charge: the safetensors bytes under the model root,
 /// charged the way the loader actually opens them (weights.rs): a
 /// non-recursive root listing, each shard OPENED so a symlinked shard
-/// charges its target's true length (Sol wave-3 MF-2 - a no-follow walk
-/// would charge symlink length and overstate headroom), every error
-/// propagated (fail closed, never a swallowed undercount), sums checked.
-/// File size is the resident proxy for the MLX load; no tensors touched.
+/// charges its target's true length (a no-follow walk would charge symlink
+/// length and overstate headroom), every error propagated (fail closed,
+/// never a swallowed undercount), sums checked. File size is the resident
+/// proxy for the MLX load; no tensors touched.
 fn weights_charge(root: &Path) -> std::result::Result<u64, String> {
     let entries = std::fs::read_dir(root)
         .map_err(|e| format!("weights charge: cannot read {root:?}: {e}"))?;
@@ -378,19 +373,17 @@ fn weights_charge(root: &Path) -> std::result::Result<u64, String> {
 }
 
 /// The environment flags a [`FlintPath`] binds as their FROZEN EFFECTIVE
-/// values, not the raw env strings (Opus r1 SF-1): the numerics depend only
-/// on the effective flag, so "1", "true", and "on" collapse to one
-/// fingerprint, and unset and garbage that resolve to the same default are
-/// the same path. Every flag that can move prefill or decode numerics is
-/// bound by its effective value; a future flag whose raw string matters
-/// beyond its effective value must not be added here as a raw string.
+/// values, not the raw env strings: the numerics depend only on the
+/// effective flag, so "1", "true", and "on" collapse to one fingerprint, and
+/// unset and garbage that resolve to the same default are the same path.
+/// Every flag that can move prefill or decode numerics is bound by its
+/// effective value; a future flag whose raw string matters beyond its
+/// effective value must not be added here as a raw string.
 /// `FIFI_FLINT_MLX_COMPILE_MOE` is deliberately NOT bound: nothing on the
 /// prefill/decode path reads it. `FIFI_FLINT_MLX_ASYNC_CHAIN` and
-/// `FIFI_FLINT_MLX_COALESCE_RESIDUAL` ARE bound (Opus delta Nit-4: the
-/// chain flag gates the ring-view and prefill-chain routes, so it moves
-/// numerics, and the earlier "every movable flag is bound" doc
-/// overclaimed while they were unbound). Grouped so the pure constructor
-/// stays at three arguments (clippy::too_many_arguments).
+/// `FIFI_FLINT_MLX_COALESCE_RESIDUAL` ARE bound (the chain flag gates the
+/// ring-view and prefill-chain routes, so it moves numerics). Grouped so the
+/// pure constructor stays at three arguments (clippy::too_many_arguments).
 #[derive(Debug, PartialEq, Eq)]
 pub(super) struct FlintEnv {
     pub(super) batch_prefill: usize,

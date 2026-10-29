@@ -1,17 +1,17 @@
 //! Raw FFI to `inference_cuda_mapped_alloc` and `inference_cuda_mailbox_caps` of `native/resident/mailbox.cu`
 //! (declared in `native/resident/mailbox.h`), and the only code that touches the memory they return. Child
-//! module of `native::resident`, so it inherits the `allow(unsafe_code)` of `native.rs` (decision 0047).
+//! module of `native::resident`, so it inherits the `allow(unsafe_code)` of `native.rs`.
 //!
-//! Original code; design from `ledger/plans/TCAP-DESIGN.md` sections 3.1 and 3.3 (TCAP C1).
+//! Original code.
 //!
 //! Safety invariants this file relies on:
 //! - A [`RawMapped`] is created once by [`mapped_alloc`] and consumed once by [`mapped_free`]. It has no `Drop`:
-//!   the owner in `context` frees it, so that a failed free is reported (decision 0022).
+//!   the owner in `context` frees it, so that a failed free is reported.
 //! - The device writes this memory while the host reads it, so every access is an atomic word access: acquire
 //!   and release for the 8-byte sequence words, relaxed for the 4-byte payload words. No plain (non-atomic)
 //!   reference or slice over the mapping is ever formed and no pointer or slice escapes; the only references are the
-//!   `&AtomicU32` / `&AtomicU64` of `from_ptr` (KUBDAN-MSG-84, mailbox soundness). Reading a payload only after an
-//!   acquire load of the word the device releases it with is the caller's protocol, documented in
+//!   `&AtomicU32` / `&AtomicU64` of `from_ptr`. Reading a payload only after an acquire load of
+//!   the word the device releases it with is the caller's protocol, documented in
 //!   `context/mailbox.rs`; so is keeping the 4-byte payload regions and the 8-byte sequence words disjoint, because
 //!   atomic accesses of different sizes to the same bytes do not synchronize with each other.
 //! - Offsets and lengths are proved inside the allocation and word-aligned before any access (`cudaHostAlloc`
@@ -21,7 +21,7 @@
 
 #![cfg_attr(
     not(test),
-    expect(dead_code, reason = "staged for TCAP C6 (ledger/plans/TCAP-DESIGN.md)")
+    expect(dead_code, reason = "staged for the tiered decode step")
 )]
 
 use std::ffi::{c_int, c_void};

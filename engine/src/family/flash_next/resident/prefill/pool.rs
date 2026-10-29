@@ -1,20 +1,19 @@
-//! Prefill expert page pool (decision 0044 items 5 and 7; packet PF-4).
+//! Prefill expert page pool.
 //!
 //! A prefill allocates one pool when it starts and drops it after its last chunk. The pool holds
 //! two page sets. A set holds one wave of a layer, in this order: the gate, up, and down stacks of
 //! the wave's experts (`SetLayout`), then the route page. The route page holds the U32 wave-local
 //! rank, the U32 token row, and the F32 gate of each pair of the wave, and the U32 inverse
-//! permutation of the chunk (the last wave of a layer only).
-//! The pairs of a wave arrive sorted by local rank (`prefill_plan::split_waves`), and
-//! `import_wave` proves that order with `require_sorted_ranks` before any page write, because the
-//! expert products of the wave run `gather_qmm_sorted` with MLX's `sorted_indices` flag (packet
-//! FN-PF-SORTED).
-//! The release rule of decision 0041 is unchanged: the last set of a layer is released after the
-//! router readback of the next layer (`release_lent`), and `acquire` never waits. A wave before
-//! the last is released right after the `evaluate` that covers its graph (packet PF-7b).
+//! permutation of the chunk (the last wave of a layer only). The pairs of a wave arrive sorted by
+//! local rank (`prefill_plan::split_waves`), and `import_wave` proves that order with
+//! `require_sorted_ranks` before any page write, because the expert products of the wave run
+//! `gather_qmm_sorted` with MLX's `sorted_indices` flag. The release rule of the decode pool is
+//! unchanged: the last set of a layer is released after the router readback of the next layer
+//! (`release_lent`), and `acquire` never waits. A wave before the last is released right after the
+//! `evaluate` that covers its graph.
 //!
 //! Every byte that a chunk imports is written by that chunk. The pool never reads the S3 expert
-//! cache and never writes to it (decision 0044 item 7).
+//! cache and never writes to it.
 
 #[cfg(feature = "native-fault-qualification")]
 use super::super::super::stored::record_page_import;
@@ -367,7 +366,7 @@ mod tests {
         assert_eq!(layout.end, 13 * page, "set end");
     }
 
-    /// The route of the P2 and P4 tests: 8 pairs of 2 choices over the experts 0, 1, and 3.
+    /// The route of the pool tests: 8 pairs of 2 choices over the experts 0, 1, and 3.
     fn route() -> ChunkRoute {
         ChunkRoute {
             distinct: vec![0, 1, 3],
@@ -503,13 +502,12 @@ mod tests {
         );
     }
 
-    /// Packet FN-PF-SORTED task 2 and the fix round: the import proves the wave order before any
-    /// device work of the wave. A wave whose local ranks fall (one inversion suffices) is a
-    /// `BadRequest` of the same pre-write group, whatever built the wave, and a sorted wave
-    /// imports into the same pool right after the rejection, which shows that the rejected
-    /// import checked the ranks before it acquired a set or wrote a page and left the pool
-    /// usable. The checks assert rather than `panic!` on the wrong shape, per decision 0032 (a
-    /// panicking native test marks the shared native owner failed and cascades).
+    /// The import proves the wave order before any device work of the wave. A wave whose local
+    /// ranks fall (one inversion suffices) is a `BadRequest` of the same pre-write group, whatever
+    /// built the wave, and a sorted wave imports into the same pool right after the rejection,
+    /// which shows that the rejected import checked the ranks before it acquired a set or wrote a
+    /// page and left the pool usable. The checks assert rather than `panic!` on the wrong shape,
+    /// because a panicking native test marks the shared native owner failed and cascades.
     #[test]
     fn an_unsorted_wave_is_rejected_before_any_page_write() {
         let _serial = crate::native_test_lock();

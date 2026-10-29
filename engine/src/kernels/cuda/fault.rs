@@ -1,5 +1,4 @@
-//! Child-process fault qualification for the CUDA backend (decision 0040 item 2
-//! and REPLY-16 item 1).
+//! Child-process fault qualification for the CUDA backend.
 //!
 //! A sticky CUDA error poisons the whole process, so the fault runs in a child
 //! process. The parent re-runs this test binary with `--exact` on the child
@@ -13,9 +12,9 @@
 //! is never reported at the launch stage.
 //!
 //! The vendored launch reaches the GEMM launch path in `gemm.cuh`, the site
-//! whose failure REPLY-16 patched: before the patch a failed launch or
-//! shared-memory opt-in ended the whole process from inside the vendored code
-//! (REPLY-16 lists `gemm.cuh:350`), so the child would never print
+//! whose failure handling a patch of the vendored copy changes: before the patch
+//! a failed launch or shared-memory opt-in ended the whole process from inside
+//! the vendored code (at `gemm.cuh:350`), so the child would never print
 //! `fault child: done`.
 
 use std::ffi::c_int;
@@ -144,7 +143,7 @@ pub(crate) fn assert_child_finishes(test: &str) {
     );
 }
 
-/// The failed-destroy half of decision 0022. The fault is not mapped through
+/// A failed destroy is terminal. The fault is not mapped through
 /// `backend_error`, so the latch is still clear when the owners drop: the first
 /// destroy runs, fails at its synchronize and latches, and the rest are skipped.
 /// The stream is the first field of `Owners`, so it is the one dropped first.
@@ -184,7 +183,7 @@ fn failed_destroy_child_latches_terminal() {
 }
 
 /// A fault inside a replayed graph surfaces at the next synchronize, latches the backend, and the
-/// graph is then skipped by its drop: no native destroy and the live count stays (decision 0022).
+/// graph is then skipped by its drop: no native destroy and the live count stays.
 #[test]
 fn fault_replay_child_latches_terminal() {
     if !std::env::var(CHILD_ENV).is_ok_and(|value| value == "1") {

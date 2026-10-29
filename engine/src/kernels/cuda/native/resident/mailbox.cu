@@ -1,6 +1,6 @@
 /*
- * TCAP C1: mapped page-locked host memory and the device attributes the CPU-expert mailbox depends on
- * (semantics: see mailbox.h). Original CUDA C; design from ledger/plans/TCAP-DESIGN.md section 3.1.
+ * Mapped page-locked host memory and the device attributes the CPU-expert mailbox depends on
+ * (semantics: see mailbox.h). Original CUDA C.
  *
  * Like the lifecycle entries of stream.cu: C linkage, C types only, the body in try/catch, the thread's
  * pending non-sticky CUDA error cleared before and after the calls.

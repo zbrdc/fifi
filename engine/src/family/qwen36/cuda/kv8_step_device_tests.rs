@@ -1,20 +1,19 @@
-//! KV8-B B5: the device tests of the Int8G32 step on the 3090 (one test per process, through
-//! the baton). Each test's device phase is a plain `Result` function (only `?` inside; no
-//! assert, expect or unwrap while a CUDA owner is alive) that returns host data; the caller
-//! drops every owner simply by receiving them, and only THEN asserts (the isolation rule of
+//! The device tests of the Int8G32 step on the 3090 (one test per process, with the GPU held
+//! exclusively). Each test's device phase is a plain `Result` function (only `?` inside; no assert,
+//! expect or unwrap while a CUDA owner is alive) that returns host data; the caller drops every
+//! owner simply by receiving them, and only THEN asserts (the isolation rule of
 //! `native_device_rig.rs`).
 //!
 //! The full-step tests (a), (b) and (e) build the step the way `r5_fmt.rs` and the gate's
 //! `build_step` do — the pinned GGUF, a Native load, `StepDims`, `StepResources` and
-//! `QwenResidentStep::new` — with `StepOptions { kv_mode: Int8G32, layout: Native, .. }`
-//! (`start.rs` still hard-codes Fp16 until B4 lands, so the options are constructed here).
-//! The rig tests (c) and (d) reuse the mixer-block rig of `native_mixer_device_tests.rs` for
-//! ONE full-attention layer: (c) proves the four planes equal the phase A host reference
-//! quantizer applied to the kernel's own f32 rows, (d) drives a bad `pos` word through the
-//! step's real Int8G32 op list (the full step's host path cannot inject one: `write_start`
-//! rewrites `StepParams` from the book mirror before every token, so the poisoned word of the
-//! production path — `ResidentState::poison_device` of the prefill packet — is injected here
-//! as the same 4-byte write, into the real `Mixers::run_block`).
+//! `QwenResidentStep::new` — with `StepOptions { kv_mode: Int8G32, layout: Native, .. }` (the
+//! options are constructed here, not taken from `start.rs`). The rig tests (c) and (d) reuse the
+//! mixer-block rig of `native_mixer_device_tests.rs` for ONE full-attention layer: (c) proves the
+//! four planes equal the phase A host reference quantizer applied to the kernel's own f32 rows, (d)
+//! drives a bad `pos` word through the step's real Int8G32 op list (the full step's host path
+//! cannot inject one: `write_start` rewrites `StepParams` from the book mirror before every token,
+//! so the poisoned word of the production path — `ResidentState::poison_device` of chunked prefill
+//! — is injected here as the same 4-byte write, into the real `Mixers::run_block`).
 
 use super::common_tests::{dims as step_dims, inventory};
 use super::mixer::{BlockIo, MixerParts, MixerViews, Mixers};
@@ -74,7 +73,7 @@ fn prompt_ids(name: &str) -> Vec<u32> {
 }
 
 /// The pinned checkpoint loaded once, in the Native layout the Int8G32 step requires (the
-/// `r5_fmt.rs` path; `start.rs` stays Fp16 until B4).
+/// `r5_fmt.rs` path).
 fn load_full_native() -> Result<(CudaProjector, CudaWeights), EngError> {
     let dir = required_dir();
     let gguf_path = std::path::Path::new(&dir).join("Qwen3.6-35B-A3B-Q4_K_M.gguf");
@@ -208,7 +207,7 @@ fn f16_bits(x: f32) -> u16 {
 /// (a) The Int8G32 step with capture off and on over 32 tokens of P5: the captured replays'
 /// logits rows are bitwise the eager step's, and the device argmax agrees.
 #[test]
-#[ignore = "the 3090 through the baton (KV8-B B5): loads the real model; run by name"]
+#[ignore = "the 3090, held exclusively: loads the real model; run by name"]
 fn int8_step_capture_on_equals_capture_off_over_32_p5_tokens() {
     if !device_present("int8_step_capture_on_equals_capture_off_over_32_p5_tokens") {
         return;
@@ -301,7 +300,7 @@ fn capture_on_off_rows(ids: &[u32]) -> Result<CaptureOnOff, EngError> {
 /// because `attn_decode_q8` reads cells `[0, kv_len)` only and every cell below kv_len was
 /// appended in the new session (`pos` restarts at 0).
 #[test]
-#[ignore = "the 3090 through the baton (KV8-B B5): loads the real model; run by name"]
+#[ignore = "the 3090, held exclusively: loads the real model; run by name"]
 fn int8_step_reset_leaves_a_fresh_sessions_rows() {
     if !device_present("int8_step_reset_leaves_a_fresh_sessions_rows") {
         return;
@@ -786,7 +785,7 @@ fn a_bad_pos_word_poisons_the_int8_step() {
 /// P5, teacher-forced on the Fp16 greedy tokens over 128 tokens. Prints the top-1 agreement
 /// and the max |Δlogit| of the argmax.
 #[test]
-#[ignore = "the 3090 through the baton (KV8-B B5): loads the real model; run by name"]
+#[ignore = "the 3090, held exclusively: loads the real model; run by name"]
 fn int8_vs_fp16_step_row_on_p5_is_reported() {
     if !device_present("int8_vs_fp16_step_row_on_p5_is_reported") {
         return;
@@ -822,7 +821,7 @@ fn int8_vs_fp16_step_row_on_p5_is_reported() {
     }
     let total = report.fp16_rows.len();
     println!(
-        "KV8-B B5 (e): int8g32 vs fp16 on P5 over {total} teacher-forced tokens: \
+        "(e): int8g32 vs fp16 on P5 over {total} teacher-forced tokens: \
          top-1 agreement {agree}/{total} ({:.2}%), max |dlogit| at the argmax {max_delta:.6}",
         100.0 * agree as f32 / total as f32
     );

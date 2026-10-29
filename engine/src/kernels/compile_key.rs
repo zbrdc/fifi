@@ -1,5 +1,5 @@
 //! The compile-cache keys, the checked block dimensions, and the compiled-program registry of
-//! the MLX compile seam (packet MX-COMPILE-1a). Everything here is pure integer arithmetic over
+//! the MLX compile seam. Everything here is pure integer arithmetic over
 //! plain structs, so it carries the same cfg as `shape` and its unit tests run on Linux: the MLX
 //! arm builds the keys from its checked arguments and admits them into the per-adapter registry
 //! before any native call.
@@ -19,7 +19,7 @@ use crate::tensor::Dtype;
 pub(crate) const DELTA_TAG: u64 = 0x0036_5147_a5a0_0002;
 /// The cache-key tag of the device-routed MoE decode closure.
 pub(crate) const MOE_TAG: u64 = 0x0036_5147_a5a0_0003;
-/// The cache-key tag of the compiled Flint decode-tail closure (graph-cache slice 1).
+/// The cache-key tag of the compiled Flint decode-tail closure.
 pub(crate) const FLINT_TAIL_TAG: u64 = 0x0036_5147_a5a0_0004;
 
 /// The cache-key discriminant of a dtype: the activation dtype and the scale dtype of every
@@ -98,7 +98,7 @@ pub(crate) fn checked_delta_dims(dims: [u32; 6]) -> Result<[u32; 8], EngError> {
     Ok([kh, kd, vh, vd, cd, taps, kw, kw2])
 }
 
-/// The baked constants of one compiled DeltaNet decode step (packet MX-COMPILE-1a item 2): a
+/// The baked constants of one compiled DeltaNet decode step: a
 /// small plain struct of integers, so the key compiles and tests on Linux. The field order is the
 /// mix order; every field is a baked constant of the closure body in `guard.cpp`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -120,8 +120,7 @@ pub(crate) struct DeltaBaked {
     pub(crate) quant: [[i32; 3]; 5],
 }
 
-/// The baked constants of one compiled device-routed MoE decode step (packet MX-COMPILE-1a
-/// item 2).
+/// The baked constants of one compiled device-routed MoE decode step.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct MoeBaked {
     /// The hidden width `H`.
@@ -157,7 +156,7 @@ pub(crate) fn delta_fun_id(baked: &DeltaBaked) -> u64 {
     mix_fun_id(DELTA_TAG, &parts)
 }
 
-/// The baked constants of one compiled Flint decode tail (graph-cache slice 1): the
+/// The baked constants of one compiled Flint decode tail: the
 /// post-attention residual add, the RMS norm, and the dense SwiGLU, all in one closure.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct FlintTailBaked {
@@ -209,14 +208,14 @@ pub(crate) fn moe_fun_id(baked: &MoeBaked) -> u64 {
     mix_fun_id(MOE_TAG, &parts)
 }
 
-/// The most baked keys that one adapter context may admit (packet MX-COMPILE-1a item 3):
+/// The most baked keys that one adapter context may admit:
 /// DeltaNet and device-routed MoE in at most two activation dtypes need four keys. A fifth
 /// distinct key is an unapproved configuration change. This does not count MLX tapes: one
 /// MoE key permits B=1/2/4/8, so one adapter context can approve at most sixteen key/batch
 /// pairs. Other contexts, cache clears and other threads are not bounded by this registry.
 pub(crate) const PROGRAM_LIMIT: usize = 4;
 
-/// The compiled-program registry of ONE adapter context (packet MX-COMPILE-1a, fix round 1):
+/// The compiled-program registry of ONE adapter context:
 /// the MLX compile cache is thread-local and dies with its thread, so the registry lives in the
 /// adapter state and dies with it — a fresh adapter starts with an empty registry and its own
 /// limit. The seam consults it BEFORE any native call, so a refused key compiles nothing.

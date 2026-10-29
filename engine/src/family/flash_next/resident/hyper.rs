@@ -1,4 +1,4 @@
-//! Resident hyper-connection read, mixer read, and apply (packet C3a; S1-C plan section 2.1).
+//! Resident hyper-connection read, mixer read, and apply.
 //!
 //! The residual stays `[C, H]` for the whole step. These functions mirror `read` and `apply` in
 //! `flash_next/hyper.rs`. They build lazy resident graphs and never read back or evaluate.
@@ -98,7 +98,7 @@ fn inject_gate(
     k.reshape(&doubled, &[branches, 1])
 }
 
-/// Reads a hyper-connection (hyper.rs:89-143, plan 2.1 steps 1-6). `h` is the `[C, H]` residual.
+/// Reads a hyper-connection (hyper.rs:89-143). `h` is the `[C, H]` residual.
 pub(super) fn read(
     ctx: &mut Ctx<'_>,
     shape: &HyperShape,
@@ -127,7 +127,7 @@ pub(super) fn mixer_read(
     Ok(mixed)
 }
 
-/// Returns `h + gate * block` as `[C, H]` (hyper.rs:145-163, plan 2.1 step 7).
+/// Returns `h + gate * block` as `[C, H]` (hyper.rs:145-163).
 pub(super) fn apply(
     ctx: &mut Ctx<'_>,
     shape: &HyperShape,
@@ -175,7 +175,7 @@ mod tests {
             .unwrap()
     }
 
-    /// Asserts cosine >= 0.99999 and max |a - e| / max |e| <= 1e-4 (plan section 4, option B).
+    /// Asserts cosine >= 0.99999 and max |a - e| / max |e| <= 1e-4.
     fn assert_parity(actual: &[f32], expected: &[f32], what: &str) {
         assert_eq!(actual.len(), expected.len(), "{what}: length");
         let (mut dot, mut aa, mut ee, mut err, mut scale) = (0f64, 0f64, 0f64, 0f64, 0f64);

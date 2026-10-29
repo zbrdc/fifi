@@ -1,9 +1,10 @@
 //! Process-wide serialization and adapter leases of the CUDA backend.
 //!
-//! Decision 0040 item 4 applies the rules of decisions 0023 and 0024 to CUDA:
-//! one dispatch guard serializes every native call across threads, and the
-//! process admits at most two adapter leases at once. Device buffers share
-//! their adapter's lease, so a slot stays held until the last buffer is freed.
+//! The CUDA backend follows the dispatch and lease rules of the other native
+//! backends: one dispatch guard serializes every native call across threads,
+//! and the process admits at most two adapter leases at once. Device buffers
+//! share their adapter's lease, so a slot stays held until the last buffer is
+//! freed.
 //!
 //! The failure flag is passed in, not global here, so the tests can use their
 //! own flag and counter while other tests run native calls in parallel.
@@ -19,7 +20,7 @@ use std::{
 
 use crate::EngError;
 
-/// The most adapter leases that the process admits at once (decision 0024).
+/// The most adapter leases that the process admits at once.
 pub(super) const MAX_LEASES: usize = 2;
 
 static DISPATCH: Mutex<()> = Mutex::new(());
@@ -28,7 +29,7 @@ thread_local! {
     static DISPATCH_HELD: Cell<bool> = const { Cell::new(false) };
 }
 
-/// Serializes native work across threads (decision 0023).
+/// Serializes native work across threads.
 ///
 /// The guard nests on one thread. An inner guard holds no lock and still runs
 /// its cleanup. Mutex poison and unwinding latch `failed` before any further
@@ -105,7 +106,7 @@ impl Drop for Lease {
     fn drop(&mut self) {
         let _dispatch = DispatchGuard::enter(self.failed);
         // A terminal backend may still own device memory of this lease, so the
-        // slot stays reserved for the rest of the process (decision 0024).
+        // slot stays reserved for the rest of the process.
         if !self.failed.load(Ordering::Acquire) {
             self.slots.fetch_sub(1, Ordering::Release);
         }

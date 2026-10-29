@@ -1,5 +1,5 @@
-//! Unit tests of the pure host planning (decision 0047, packet RD-9a; test seam approved by the
-//! user as U13, 2026-10-10): dims, state layout and step plan. CPU only, no device call.
+//! Unit tests of the pure host planning: dims, state layout and step plan. CPU only, no device
+//! call.
 use super::super::host::HostShape;
 use super::{
     dims::{KvMode, KvRequest, StepDims, StepOptions},
@@ -10,7 +10,8 @@ use crate::family::project::cuda::WeightLayout;
 use crate::family::{AttentionKind, QWEN3_6_35B_A3B, gguf_model::Inventory};
 use crate::kernels::cuda::{ArenaTensor, plan_arena};
 
-/// Router scratch the way RD-5 states it: `4 * rows * (experts + 1)` (1,028 bytes at one row).
+/// Router scratch the way the router wrapper states it: `4 * rows * (experts + 1)` (1,028 bytes
+/// at one row).
 fn router_bytes(d: &StepDims, rows: usize) -> usize {
     4 * rows * (d.shape.moe.experts + 1)
 }
@@ -156,10 +157,11 @@ fn plan_lifetimes_are_pinned() {
     assert_eq!(got, want);
 }
 
-/// RD-9c's contract, phase ordered on one stream: (1) router; (2) all expert gate/up matmuls and
-/// the shared gate/up; (3) shared swiglu; (4) per slot s: swiglu_pack(s) into the one `XfDown`, then
-/// down(s); (5) shared down; (6) combine. Every buffer's real first and last use is derived from
-/// this list; the plan must cover it, and buffers whose uses overlap in time must not share bytes.
+/// The MoE block's contract, phase ordered on one stream: (1) router; (2) all expert gate/up
+/// matmuls and the shared gate/up; (3) shared swiglu; (4) per slot s: swiglu_pack(s) into the one
+/// `XfDown`, then down(s); (5) shared down; (6) combine. Every buffer's real first and last use is
+/// derived from this list; the plan must cover it, and buffers whose uses overlap in time must not
+/// share bytes.
 #[test]
 fn phase_ordered_expert_buffers_never_alias() {
     use Phase as P;
@@ -184,8 +186,8 @@ fn phase_ordered_expert_buffers_never_alias() {
         ops.push((P::Down, vec![S::ExpertGu, S::XfDown(0)])); // swiglu_pack(s)
         ops.push((P::Down, vec![S::XfDown(0), S::ExpertDown, S::TopkId])); // down(s)
     }
-    // `SharedGu` is last read by the shared swiglu (phase Swiglu); its `..Down` end is lane C's
-    // conservative rule, pinned by `plan_lifetimes_are_pinned` (m29) and by no op of this list.
+    // `SharedGu` is last read by the shared swiglu (phase Swiglu); its `..Down` end is a
+    // conservative rule, pinned by `plan_lifetimes_are_pinned` and by no op of this list.
     ops.push((P::Down, vec![S::XfShared, S::SharedOut])); // shared down
     ops.push((
         P::Combine,
@@ -296,9 +298,9 @@ fn only_the_documented_phases_write_status_and_argmax_is_last() {
         .copied()
         .filter(|&phase| writes_status(phase))
         .collect();
-    // step_begin first, the embedding (RD-4c ORs mask 4 for a bad id), attn_prep (RD-8a ORs mask 4),
-    // kv8_append (KV8-B ORs mask 4 on a bad pos word; redundant, see `writes_status`),
-    // the router (mask 1), argmax (mask 2).
+    // step_begin first, the embedding (ORs mask 4 for a bad id), attn_prep (ORs mask 4),
+    // kv8_append (ORs mask 4 on a bad pos word; redundant, see `writes_status`), the router
+    // (mask 1), argmax (mask 2).
     assert_eq!(
         writers,
         [
@@ -429,7 +431,7 @@ fn kv_request_resolves() {
         KvMode::Int8G32
     );
     assert_eq!(KvRequest::Fp16.resolve(11, Some(10)).unwrap(), KvMode::Fp16);
-    // No frozen budget: Auto is an error, an explicit request still works (REPLY-43 item 6).
+    // No frozen budget: Auto is an error, an explicit request still works.
     assert!(KvRequest::Auto.resolve(1, None).is_err());
     assert_eq!(KvRequest::Fp16.resolve(1, None).unwrap(), KvMode::Fp16);
     assert_eq!(dims().layers_of(AttentionKind::Full), 10);

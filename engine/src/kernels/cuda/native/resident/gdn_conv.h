@@ -1,12 +1,12 @@
-/* RD-7a: the DeltaNet causal conv step, per-kernel header (native/resident/gdn_conv.h). Included by
+/* The DeltaNet causal conv step, per-kernel header (native/resident/gdn_conv.h). Included by
  * gdn_conv.cu and read by the Rust FFI mirror; nothing else. Wraps the vendored kern::conv_silu
- * (engine/vendor/xavier-qwen/src/ops.cu, RD-4V) and adds no kernel.
+ * (engine/vendor/xavier-qwen/src/ops.cu) and adds no kernel.
  *
  * out[t][c] = silu(w[c][0]*s0 + w[c][1]*s1 + w[c][2]*s2 + w[c][3]*x) with x = proj[t][c] and
  * (s0, s1, s2) the three previous inputs of channel c, oldest first; the window then shifts. The
  * state is planar f32 [3][channels] (row 0 the oldest input) and is read and written in place.
  * ggml keeps the same ring as [channel][tap] (ne0 = 3 fastest), the transpose of this layout: a state
- * import or export (RD-9a2, tag qwen36-gguf-xq-1 keeps the device order) must transpose it.
+ * import or export (layout tag qwen36-gguf-xq-1 keeps the device order) must transpose it.
  * proj is f32 [m][ld] (only the first `channels` columns of a row are read), w is the GGUF
  * ssm_conv1d tensor as stored, f32 [channels][4] (tap 0 multiplies the oldest input), 16-byte
  * aligned. out is f32 [m][channels]. Limits: m in [1, 32768], channels in [1, 65536],

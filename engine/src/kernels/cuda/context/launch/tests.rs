@@ -1,5 +1,5 @@
-//! Device tests (3090) of the `pack` and `matmul` entries on a stream (seam 1:
-//! the Rust wrapper against the C entry against the vendored kernels).
+//! Device tests (3090) of the `pack` and `matmul` entries on a stream: the Rust
+//! wrapper against the C entry against the vendored kernels.
 //!
 //! "Bytes equal" means `to_bits()` equality of every f32. The reference is the
 //! blocking path, `CudaContext::linear_rows`, which runs the same kernels on the
@@ -8,7 +8,7 @@
 //! synchronize tests read the pinned word without any other wait for that.
 //!
 //! The owner counts and the queued work are process-wide, so these tests assume
-//! `--test-threads=1`, as the device suite is always run (decision 0040).
+//! `--test-threads=1`, as the device suite is always run.
 //!
 //! Each refusal is checked by the text of its error as well as its variant, so a
 //! test fails when another check refuses the call instead of the one under test.
@@ -875,9 +875,9 @@ fn adjacent_ranges_larger_than_the_call_needs_are_accepted() {
     assert_eq!(bits(&streamed), bits(&reference));
 }
 
-// ---- Q5_0 (MEL-C1b): the own kernel behind `matmul` -------------------------------------------
+// ---- Q5_0: the repository's own kernel behind `matmul` ----------------------------------------
 
-/// Decision 0047 item 9, class T3 (f16-input products): the NMSE bound per output vector.
+/// Tolerance class T3 (products with f16 inputs): the NMSE bound per output vector.
 const NMSE_BOUND: f64 = 1e-5;
 /// Output lengths from which the argmax of a token is compared (the T3 rule: 64 and up).
 const ARGMAX_MIN_ROWS: usize = 64;
@@ -916,8 +916,8 @@ fn upload_q5_0(ctx: &CudaContext, source: &[u8], rows: usize, k: usize) -> Tiled
     .expect("upload of the Q5_0 test weight")
 }
 
-/// `x · Wᵀ` per token in f64: the exactly dequantized weights (the CPU decode of MEL-C1a) times the
-/// fp16-rounded activations the pack writes, which is what lane M ruled the T3 reference to be.
+/// `x · Wᵀ` per token in f64: the exactly dequantized weights (the CPU Q5_0 decode) times the
+/// fp16-rounded activations the pack writes, which is the T3 reference.
 fn q5_0_reference(source: &[u8], rows: usize, k: usize, x: &[f32]) -> Vec<f64> {
     let weights = dequantize(GgufType::Q50, source).expect("dequantize the source");
     let mut out = Vec::with_capacity(x.len() / k * rows);

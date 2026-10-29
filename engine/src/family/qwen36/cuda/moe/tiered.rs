@@ -1,4 +1,4 @@
-//! The tiered MoE block of one layer (OFF-2 D3, design `ledger/plans/OFF-2-DEVICE-WIRING.md`).
+//! The tiered MoE block of one layer.
 //!
 //! WHAT: [`run_moe_block_tiered`] runs the native ten-op block with a host decision between the
 //! router and the expert launches. The router runs as usual; its normed row, ids and weights
@@ -14,7 +14,7 @@
 //! The block syncs with the host: the event wait after the router outputs are copied, and the
 //! blocking writes of the slot list and of the CPU partial. It is therefore eager only (a
 //! captured window refuses every one of these calls with a typed error) and never part of the
-//! captured step (decision 0047, amendment of 2026-10-13).
+//! captured step.
 //!
 //! `check_block` stays as it is. Its router checks run against the real expert count with the
 //! stack facts of the bank replaced by full-depth facts (the real stacks are not in VRAM); the

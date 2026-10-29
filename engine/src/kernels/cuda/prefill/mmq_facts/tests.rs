@@ -1,8 +1,7 @@
-//! The device test of the MMQ facts binding (lane C's Amendment 1 item A): the first glue
-//! FFI child proves the glue archive links and resolves by reading the 3090's own facts
-//! through the V4-0 C entry. The asserted values are the 3090's: sm_86 cubins (the built
-//! architecture the facts report, not the device's capability), 82 SMs, 99 KiB of opt-in
-//! shared memory per block.
+//! The device test of the MMQ facts binding: the first glue FFI child proves the glue archive
+//! links and resolves by reading the 3090's own facts through the C entry. The asserted values
+//! are the 3090's: sm_86 cubins (the built architecture the facts report, not the device's
+//! capability), 82 SMs, 99 KiB of opt-in shared memory per block.
 
 use crate::kernels::cuda::testkit;
 
@@ -12,8 +11,8 @@ fn mmq_facts_read_the_3090() {
         return;
     }
     let phase = || -> Result<(i32, usize, usize), crate::EngError> {
-        // The fixed API (review MINOR-2): a context method with the usable check and the
-        // dispatch guard, like `device_is_integrated`.
+        // The fixed API: a context method with the usable check and the dispatch guard, like
+        // `device_is_integrated`.
         let ctx = crate::kernels::cuda::CudaContext::new()?;
         let facts = ctx.mmq_device_facts()?;
         Ok((facts.cc, facts.nsm, facts.smpbo))
@@ -30,14 +29,14 @@ fn mmq_facts_read_the_3090() {
     assert_eq!(cc, 860, "the 3090 runs the sm_86 cubins");
     assert_eq!(nsm, 82, "the 3090 has 82 SMs");
     assert_eq!(smpbo, 101_376, "the 3090 offers 99 KiB opt-in per block");
-    println!("G4 facts: cc {cc}, nsm {nsm}, smpbo {smpbo}");
+    println!("MMQ facts: cc {cc}, nsm {nsm}, smpbo {smpbo}");
 }
 
 #[test]
 fn mmq_facts_are_queried_once_per_context() {
-    // Lane C's ruling: the facts are read from the device once per context and every later
-    // call returns the cached value, so a launch does not pay five attribute calls. The
-    // cache is per context, not per process: a second context queries again.
+    // The facts are read from the device once per context and every later call returns the
+    // cached value, so a launch does not pay five attribute calls. The cache is per context,
+    // not per process: a second context queries again.
     if !testkit::device_present("mmq_facts_are_queried_once_per_context") {
         return;
     }
@@ -66,5 +65,5 @@ fn mmq_facts_are_queried_once_per_context() {
         (first.0, 1),
         "a new context queries once itself"
     );
-    println!("G4 facts: three calls, one query; a fresh context one query");
+    println!("MMQ facts: three calls, one query; a fresh context one query");
 }

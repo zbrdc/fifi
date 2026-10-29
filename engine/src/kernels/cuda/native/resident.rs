@@ -1,11 +1,11 @@
 //! Raw FFI to the resident-decode entries of `native/stream.cu` and `native/projector.cu`
 //! (declared in `native/abi_resident.h`). Child module of `native`, so it inherits the
-//! `allow(unsafe_code)` of `native.rs` (decision 0047, child modules of `native.rs`).
+//! `allow(unsafe_code)` of `native.rs`.
 //!
 //! Safety invariants every wrapper here relies on:
 //! - A handle (`RawStream`, `RawEvent`, `RawPinned`) is created once and consumed once by its
 //!   destroy function. It has no `Drop`: the owner in `context` calls destroy so that a failed
-//!   destroy is reported and latches the backend (decision 0022).
+//!   destroy is reported and latches the backend.
 //! - A device range is proved in bounds before the native call (`RawRange::new`). The launch
 //!   wrappers (`pack_launch`, `matmul_launch`) also prove sizes, alignment and, between the ranges
 //!   one call writes and the ranges it reads, disjointness; the native entries repeat these checks
@@ -13,11 +13,12 @@
 //!   `inference_cuda_free` synchronizes the whole device before `cudaFree`.
 //! - Launch-only wrappers return the launch status only. A fault in queued work surfaces at
 //!   the next synchronize.
-//! - Every call runs under the process dispatch guard and on the thread that owns the context
-//!   (decisions 0023 and 0024). Pinned memory is read only by that thread and only after an
-//!   event recorded after the copy completed.
-//! - Stream capture and executable graphs (`RawGraphExec`) live in the child `graph` (RD-2d), which
-//!   states its own invariants: a capture begins and ends on one thread, and a graph is consumed once.
+//! - Every call runs under the process dispatch guard and on the thread that owns the context.
+//!   Pinned memory is read only by that thread and only after an event recorded after the copy
+//!   completed.
+//! - Stream capture and executable graphs (`RawGraphExec`) live in the child `graph`, which
+//!   states its own invariants: a capture begins and ends on one thread, and a graph is consumed
+//!   once.
 //! - No raw pointer and no unsafe function leaves this module; handles are opaque.
 //!
 //! Per-kernel entries live in child modules `native/resident/<n>.rs`, one per kernel, declared
@@ -27,7 +28,7 @@
 
 #![cfg_attr(
     not(test),
-    expect(dead_code, reason = "staged for RD-9a (decision 0047)")
+    expect(dead_code, reason = "staged for the resident decode step")
 )]
 
 use std::ffi::{c_int, c_void};
@@ -333,7 +334,7 @@ pub(in crate::kernels::cuda) fn event_record(
     checked(status, stage)
 }
 
-/// Creates a timing-enabled event (the graph timer of packet B1).
+/// Creates a timing-enabled event (the graph timer).
 pub(in crate::kernels::cuda) fn event_create_timing() -> Result<RawEvent, DeviceFailure> {
     let mut handle: *mut c_void = std::ptr::null_mut();
     let mut stage = STAGE_NONE;
@@ -347,7 +348,7 @@ pub(in crate::kernels::cuda) fn event_create_timing() -> Result<RawEvent, Device
 }
 
 /// Records the timing event with the external-record flag: inside a stream capture the record
-/// becomes an event-record node of the captured graph, so replays re-record it (packet B1).
+/// becomes an event-record node of the captured graph, so replays re-record it.
 pub(in crate::kernels::cuda) fn event_record_external(
     event: &RawEvent,
     stream: &RawStream,
@@ -882,7 +883,7 @@ pub(in crate::kernels::cuda) fn matmul_launch(
     checked(status, stage)
 }
 
-// ---- KV8-B B1: the f32 rows entry of attn_prep (the Int8G32 KV handoff) ----------------------
+// ---- The f32 rows entry of attn_prep (the Int8G32 KV handoff) --------------------------------
 //
 // Raw FFI to `inference_cuda_attn_prep_rows_launch` of `native/resident/attn_prep.cu` (declared in
 // `native/resident/attn_prep.h`): the same kernel's f32 rows instance, which indexes the k and v

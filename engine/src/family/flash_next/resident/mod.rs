@@ -1,4 +1,4 @@
-//! Resident Flash-Next decode on MLX (decision 0039; `s1c-resident-decode.md`, in the ledger).
+//! Resident Flash-Next decode on MLX.
 //!
 //! Weights, constants, and session state stay resident on the engine thread. `ResidentDecoder` runs
 //! one token per `step` in a `StepMode`. `fixtures` is portable so that Linux tests check the synthetic
@@ -57,7 +57,7 @@ use crate::{
     weights::StreamedCheckpoint,
 };
 
-/// What one step computes and reads back (plan section 2.6, step 3).
+/// What one step computes and reads back.
 #[cfg(all(feature = "native-mlx", target_os = "macos", target_arch = "aarch64"))]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum StepMode {
@@ -92,17 +92,17 @@ struct ResidentDecoder<'c> {
     kernels: MlxKernels,
     ckpt: &'c StreamedCheckpoint,
     weights: ResidentWeights,
-    /// The fixed expert page pool: `POOL_SETS` sets sized for the largest layer (decision 0041).
+    /// The fixed expert page pool: `POOL_SETS` sets sized for the largest layer.
     slots: ExpertSlots,
     /// Default-off, record-only expert hints. Never changes the demand path.
     expert_prefetch: prefetch::Prefetch,
-    /// The prefill page sets (decision 0044 item 5), open from `open_prefill` to `close_prefill`.
-    /// They drop after the adapter like the decode pool.
+    /// The prefill page sets, open from `open_prefill` to `close_prefill`. They drop after the
+    /// adapter like the decode pool.
     prefill_pages: Option<prefill::step::Open>,
-    /// The engine's session budget. Each step charges its QSA growth here (S1-C decision 5).
-    /// The cap is `u64::MAX` until the executor sets the admitted value.
+    /// The engine's session budget. Each step charges its QSA growth here. The cap is `u64::MAX`
+    /// until the executor sets the admitted value.
     budget: SessionBudget,
-    /// Tests only: the route recorder of the S3 trace (packet T0). `None` records nothing.
+    /// Tests only: the route recorder of the S3 trace. `None` records nothing.
     #[cfg(test)]
     route_trace: Option<trace::RouteTrace>,
 }
@@ -163,8 +163,8 @@ impl<'c> ResidentDecoder<'c> {
         self.expert_prefetch.enabled = on;
     }
 
-    /// Mapped bytes of the expert page pool, fixed at `new` (decision 0041 Memory). MLX active
-    /// memory also counts the lent pages, so a report must not add both.
+    /// Mapped bytes of the expert page pool, fixed at `new`. MLX active memory also counts the lent
+    /// pages, so a report must not add both.
     fn pool_bytes(&self) -> u64 {
         self.slots.byte_len()
     }

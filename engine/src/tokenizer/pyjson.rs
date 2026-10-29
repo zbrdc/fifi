@@ -3,11 +3,11 @@
 //! `transformers` replaces the Jinja filter with
 //! `tojson(x, ensure_ascii=False, indent=None, separators=None, sort_keys=False)`,
 //! which calls `json.dumps`. This module ports that call for values that come from
-//! JSON: null, booleans, numbers, strings, arrays, and objects. Decision 0029
-//! records the choice. Object keys keep their insertion order unless `sort_keys`
-//! is true. Floats print as Python `repr` does. Integers above `u64::MAX` parse
-//! as floats (the crate does not enable `arbitrary_precision`), so they print as
-//! floats where Python prints every digit. Decision 0029 records that divergence.
+//! JSON: null, booleans, numbers, strings, arrays, and objects. Object keys keep
+//! their insertion order unless `sort_keys` is true. Floats print as Python
+//! `repr` does. Integers above `u64::MAX` parse as floats (the crate does not
+//! enable `arbitrary_precision`), so they print as floats where Python prints
+//! every digit. That divergence is accepted.
 
 use minijinja::value::{Kwargs, Rest, Value, ValueKind, from_args};
 use minijinja::{Error, ErrorKind};

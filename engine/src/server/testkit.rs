@@ -90,8 +90,8 @@ pub(super) fn engine(script: Vec<Vec<u32>>) -> Engine {
     .expect("spawn engine")
 }
 
-/// Starts an engine thread on the scripted fake executor with the prefix store limits of
-/// decision 0036, addendum 2 (the default limits are zero roots and one entry).
+/// Starts an engine thread on the scripted fake executor with the given prefix store limits
+/// (the default limits are zero roots and one entry).
 pub(super) fn engine_with_prefix_limits(
     script: Vec<Vec<u32>>,
     roots: usize,

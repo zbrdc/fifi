@@ -1,4 +1,4 @@
-//! Resident Flash-Next weights, imported once at load (decision 0039; S1-C plan section 1).
+//! Resident Flash-Next weights, imported once at load.
 //!
 //! Non-expert matrices, `1 + w` norms, split convolutions, and F32 routers transposed to `[H, E]`
 //! become residents. Expert stacks, the embedding, and the PLE tables stay streamed (`SlicedWeight`).

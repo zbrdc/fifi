@@ -1,17 +1,15 @@
 //! Raw FFI to the sequential scan entry of `native/prefill/gdn_scan_seq.cu` (declared in
-//! `native/prefill/gdn_scan_seq.h`), CPF-DN-A. Child module of `native/prefill.rs`, so it
-//! inherits the `allow(unsafe_code)` of `native.rs` (decision 0047, child modules of
-//! `native.rs`).
+//! `native/prefill/gdn_scan_seq.h`). Child module of `native/prefill.rs`, so it inherits
+//! the `allow(unsafe_code)` of `native.rs`.
 //!
-//! The kernels are the vendored per-token math (RD-4V, xavier-qwen)
-//! restated in a value-sliced launch with the q/k L2 norms in the ggml form; the wrapper's
-//! tests pin both against an f64 reference and against the decode kernel.
+//! The kernels are the vendored xavier-qwen per-token math restated in a value-sliced launch
+//! with the q/k L2 norms in the ggml form; the wrapper's tests pin both against an f64
+//! reference and against the decode kernel.
 //!
 //! Safety invariants this file relies on:
 //! - The launch entry is called only through `CudaContext::launch_on`, on the thread that
-//!   owns the context and under the process dispatch guard (decisions 0023 and 0024). It
-//!   only enqueues the two kernels (the scan, then the out-gate) and returns; the stream is
-//!   live for the call.
+//!   owns the context and under the process dispatch guard. It only enqueues the two
+//!   kernels (the scan, then the out-gate) and returns; the stream is live for the call.
 //! - Every range is a `RawRange`, proved inside a live allocation by `raw_range`. Sizes,
 //!   alignment and disjointness (`super::resident::Span`) are proved again here, on the
 //!   extents the kernels touch, before the call; the C entry repeats them on the addresses.
@@ -111,10 +109,10 @@ pub(in crate::kernels::cuda) struct GdnScanSeqInts {
     pub(in crate::kernels::cuda) head_dim: c_int,
 }
 
-/// What one scan launch reads and writes: `conv` the K0 output rows, `proj` the projection
+/// What one scan launch reads and writes: `conv` the conv output rows, `proj` the projection
 /// rows (z, beta, alpha), the per-head weights, the in-place `state`, the `o_out` rows
-/// (written pre-norm by K1, rewritten in place by K2), the optional prefill status word and
-/// the integers.
+/// (written pre-norm by the scan kernel, rewritten in place by the out-gate kernel), the
+/// optional prefill status word and the integers.
 pub(in crate::kernels::cuda) struct GdnScanSeqRaw<'a> {
     pub(in crate::kernels::cuda) conv: RawRange<'a>,
     pub(in crate::kernels::cuda) proj: RawRange<'a>,
@@ -258,9 +256,9 @@ fn c_args(io: &GdnScanSeqRaw<'_>) -> GdnScanSeqArgsRaw {
     }
 }
 
-/// Queues the scan kernels on `stream`: K1 (the value-sliced sequential scan, the state
-/// updated in place, the pre-norm rows written) then K2 (the gated output RMSNorm in place
-/// on the same rows). Returns when both are queued.
+/// Queues the scan kernels on `stream`: the value-sliced sequential scan (the state updated
+/// in place, the pre-norm rows written), then the gated output RMSNorm in place on the same
+/// rows. Returns when both are queued.
 pub(in crate::kernels::cuda) fn gdn_scan_seq_launch(
     stream: &RawStream,
     io: GdnScanSeqRaw<'_>,
@@ -281,9 +279,9 @@ pub(in crate::kernels::cuda) fn gdn_scan_seq_launch(
 }
 
 /// Queues the same two kernels with a deliberately violated p0 bound, so the kernels' own
-/// device re-check (decision 0049 item 2: no state load, NaN rows, mask 8) is the code under
-/// test; every other rule of the call holds, so the guard's writes touch valid memory.
-/// Qualified fault path only.
+/// device re-check (no state load, NaN rows, mask 8) is the code under test; every other
+/// rule of the call holds, so the guard's writes touch valid memory. Qualified fault path
+/// only.
 #[cfg(all(test, feature = "cuda-fault-qualification"))]
 pub(in crate::kernels::cuda) fn gdn_scan_seq_fault_bad_bounds(
     stream: &RawStream,

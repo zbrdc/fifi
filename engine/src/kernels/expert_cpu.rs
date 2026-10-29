@@ -1,4 +1,5 @@
-//! Q4_K expert forward on the CPU, safe Rust (the reference and the f32 pool kernel of the OFF-2 tier).
+//! Q4_K expert forward on the CPU, safe Rust (the reference and the f32 pool kernel of the CPU
+//! tier).
 //!
 //! One routed expert of Qwen3.6-35B-A3B is three Q4_K matrices (gate/up `inter x hidden`,
 //! down `hidden x inter`) as raw 144-byte ggml blocks; this module computes
@@ -668,7 +669,7 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "timing probe: lane L runs it with --ignored --nocapture in a release build"]
+    #[ignore = "timing probe: run it with --ignored --nocapture in a release build"]
     fn expert_cpu_rate_is_recorded() {
         use std::time::Instant;
 

@@ -1,5 +1,5 @@
 /*
- * RD-4b: SwiGLU + fp16 pack entry (native/resident/swiglu_pack.h, per-kernel header).
+ * SwiGLU + fp16 pack entry (native/resident/swiglu_pack.h, per-kernel header).
  * Launch-only, like the entries of abi_resident.h. Include after abi.h in C++; Rust mirrors the
  * struct in native/resident/swiglu_pack.rs (child module of native/resident.rs).
  */
@@ -14,7 +14,7 @@ extern "C" {
 
 /* For each of m rows: xf = fp16( silu(gate) * up ) in the layout kern::pack_f32 writes (fragment
  * order for m <= 16, with the data lanes and the zero tail entry written by the kernel itself
- * and the unread bytes left untouched, MEMSET-TRIM; row-major fp16 [m][k_pad]
+ * and the unread bytes left untouched; row-major fp16 [m][k_pad]
  * above). gu is f32 [m][2 * k_pad]: row t holds the gate in columns 0 .. k_pad - 1 and the up
  * values in columns k_pad .. 2 * k_pad - 1; the gate and up matmuls write only the first n_ff
  * columns of each half. For n_ff < k_pad the entry first zeroes columns n_ff .. k_pad - 1 of both

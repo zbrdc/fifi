@@ -168,16 +168,15 @@ pub(crate) async fn submit(
     // The monitor's ring rides the same lines (count_tokens is filtered
     // out inside the ring, so the count route needs no wiring).
     log.set_ring(state.recent_ring());
-    // The prompt digests and the LCP with this model's previous request:
-    // the server's own view of render stability, independent of the engine
-    // store (packet REPREFIX-1).
+    // The prompt digests and the LCP with this model's previous request: the
+    // server's own view of render stability, independent of the engine store.
     let lcp = state.note_prompt(&entry.model, &prompt);
     log.set_prompt_digests(&prompt, lcp);
     if prompt_tokens >= entry.context_limit {
         // The wire names the largest prompt this entry admits — one below
         // the limit the gate compares against — so every statement on the
         // wire is true and the invariant prompt > limit holds at the
-        // boundary too (owner ruling, 2026-10-24).
+        // boundary too.
         return Err(failed(
             &mut log,
             EngError::ContextLimit(EngError::prompt_too_long_message(
@@ -229,8 +228,8 @@ pub(crate) async fn submit(
                 )
             })?;
         }
-        // The line of this request carries the prefix fields (packet SERVE-2-c item 4); a
-        // request without a boundary keeps the old line byte for byte.
+        // The line of this request carries the prefix fields; a request without a boundary
+        // keeps the old line byte for byte.
         log.set_prefix_boundary();
     }
     entry
@@ -730,8 +729,8 @@ mod tests {
             }
         }
         let _reset_warm_flag = ResetWarmFlag;
-        // Phase 1: flag OFF — the post-flip rollback state, forced via
-        // the test override (the default is now ON).
+        // Step 1: flag OFF — the rollback state, forced via the test
+        // override (the default is ON).
         super::TEST_WARM_TURNS.store(-1, std::sync::atomic::Ordering::Relaxed);
         let probes = testkit::probe_engine_with_sampling();
         let bundle = testkit::bundle_with_pinned_template();
@@ -758,7 +757,7 @@ mod tests {
             "flag off must never create the warm cache"
         );
 
-        // Phase 2: flag ON (the override guard from phase 1 still holds).
+        // Step 2: flag ON (the override guard from step 1 still holds).
         super::TEST_WARM_TURNS.store(1, std::sync::atomic::Ordering::Relaxed);
         // Reuse the SAME engine and cache slot: request one seeds, the
         // appended request two is a warm reuse.
@@ -792,12 +791,12 @@ mod tests {
         }
     }
 
-    /// SF2 scope pin: the warm branch needs the engine entry's
-    /// `prefix_reuse`; with the flag off, the default-ON warm rule never
-    /// engages the cache (today the serving evidence is Qwen3.6 only —
-    /// see the README scope note). No test override is written: the
-    /// process-global static races the parallel e2e phases, and the
-    /// default is already ON while the env stays unset.
+    /// Scope pin: the warm branch needs the engine entry's `prefix_reuse`;
+    /// with the flag off, the default-ON warm rule never engages the cache
+    /// (serving is verified on Qwen3.6 only — see the README scope note).
+    /// No test override is written: the process-global static races the
+    /// parallel e2e phases, and the default is already ON while the env
+    /// stays unset.
     #[tokio::test]
     async fn warm_needs_prefix_reuse_even_when_the_flag_is_on() {
         assert!(
@@ -827,7 +826,7 @@ mod tests {
         );
     }
 
-    /// SF1 end-to-end with the REAL env var, in fresh child processes (the
+    /// End-to-end with the REAL env var, in fresh child processes (the
     /// crate denies unsafe env mutation): `ENGINESRV_WARM_TURNS=0` must keep
     /// the derived path with no cache; unset must default ON and seed the
     /// cache. Both children pin id exactness against the derived reference.

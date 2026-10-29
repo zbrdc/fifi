@@ -1,6 +1,6 @@
-//! Tests of `gdn_scan_seq` (CPF-DN-A section 5): tests 1, 2 and the host row of 16 (pure
-//! sizing, host only), and the refusal table of test 14 with the head_dim row of test 16
-//! (device tests: the device phase is Result-only, owners drop, then asserts on host Vecs).
+//! Tests of `gdn_scan_seq`: tests 1, 2 and the host row of 16 (pure sizing, host only), and the
+//! refusal table of test 14 with the head_dim row of test 16 (device tests: the device phase is
+//! Result-only, owners drop, then asserts on host Vecs).
 
 use super::{
     CpfDnGeometry, GDN_SCAN_EPS, GdnScanSeqCall, ScanShape, ScanWeights, cpf_dn_chunk_bytes,
@@ -30,7 +30,7 @@ const QWEN36: CpfDnGeometry = CpfDnGeometry {
 /// multiply, so the refusal is exercised without near-`usize::MAX` intermediates.
 const HUGE: usize = usize::MAX / 2;
 
-/// The products are exact, the three worked examples pin the packet's numbers, and the
+/// The products are exact, the three worked examples pin the expected numbers, and the
 /// bytes grow linearly in `m` (test 1).
 #[test]
 fn cpf_dn_chunk_bytes_is_exact_and_linear() {
@@ -598,20 +598,19 @@ fn gdn_scan_seq_refuses_fit() {
 // bound is therefore an assumption about the data on those rows, checked by the measured
 // maxima every test prints, not a proof.
 //
-// The pre-norm rows the packet asks test 3 to compare are NOT observable through this entry:
-// K2's RMSNorm rewrites them in place, and it cancels a uniform scale of the pre-norm row
-// while mean(o^2) >> eps (o -> a·o gives rstd -> rstd/a and the gated row is unchanged up to
-// the eps term), so a comparison of the gated rows plus the state is everything the seam
-// exposes. M6 (the q scale 1/sqrt(128) dropped) scales only the pre-norm rows, so it is
-// visible only where the eps term does not cancel: a row with mean(o^2) near eps, where
-// rsqrt(128·mean + eps) is not rstd/sqrt(128). Round 2 killed M6 through such a row of test
-// 3's own data ((16,32,8), step 6, head 6: gated rows 5.33 relative), and test 3 pins the
-// kill on the host so a generator change cannot silently remove it: its data keeps at least
-// one row with mean(o^2) < 4·eps, and the reference with the q scale dropped differs from
-// the reference by more than 2·E3 on the gated rows. 2·E3 is what guarantees the kill (the
-// triangle inequality): the clean kernel is within E3 of the reference and a mutant kernel
-// within E3 of the dropped-scale reference, so a gap above 2·E3 puts the mutant more than E3
-// from the reference. The measured gap is 5.332, far above 2·E3 = 2.4e-4.
+// The pre-norm rows of test 3 are NOT observable through this entry: K2's RMSNorm rewrites them
+// in place, and it cancels a uniform scale of the pre-norm row while mean(o^2) >> eps (o -> a·o
+// gives rstd -> rstd/a and the gated row is unchanged up to the eps term), so a comparison of
+// the gated rows plus the state is everything the entry exposes. M6 (the q scale 1/sqrt(128)
+// dropped) scales only the pre-norm rows, so it is visible only where the eps term does not
+// cancel: a row with mean(o^2) near eps, where rsqrt(128·mean + eps) is not rstd/sqrt(128).
+// Test 3 kills M6 through such a row of its own data ((16,32,8), step 6, head 6: gated rows
+// 5.33 relative), and test 3 pins the kill on the host so a generator change cannot silently
+// remove it: its data keeps at least one row with mean(o^2) < 4·eps, and the reference with the
+// q scale dropped differs from the reference by more than 2·E3 on the gated rows. 2·E3 is what
+// guarantees the kill (the triangle inequality): the clean kernel is within E3 of the reference
+// and a mutant kernel within E3 of the dropped-scale reference, so a gap above 2·E3 puts the
+// mutant more than E3 from the reference. The measured gap is 5.332, far above 2·E3 = 2.4e-4.
 
 /// fp32 unit roundoff (2^-24).
 const U: f64 = 1.0 / 16_777_216.0;
@@ -619,17 +618,17 @@ const U: f64 = 1.0 / 16_777_216.0;
 const C_DOTS: f64 = 8.0;
 /// The derived bound of tests 3, 7, 8, 9, 10, 11: `2·C·2^-17 = 2^-13`.
 const E3: f64 = 2.0 * C_DOTS * 128.0 * U;
-/// Test 4's derived bound (the three sources below, compounded by the same decay lemma):
-/// the L2-norm form difference `rsqrt(s + eps)` vs `rsqrt(fmax(s, eps^2))` is at most
+/// Test 4's derived bound (the three sources below, compounded by the same decay lemma): the
+/// L2-norm form difference `rsqrt(s + eps)` vs `rsqrt(fmax(s, eps^2))` is at most
 /// `eps / (2·s_min) = 5e-5` at the asserted `s_min >= 1e-2` (the binomial expansion of
 /// rsqrt(s + eps)), the reduction-order difference of the two kernels is at most
 /// `2·128·u = 2^-16` per dot, over the same `C_DOTS` dots per step as E3, and the
 /// transcendental difference (`expf`/`log1pf(expf)` here against the decode kernel's
 /// `__expf`/`log1pf(__expf)`, ops.cu:31-33/127) is at most ~1e-6 relative on decay and beta
 /// after the `|a|·softplus` multiply; with decay <= 0.5 asserted (sum <= 2):
-/// `E4 = 2·(5e-5 + C_DOTS·2^-16 + 1e-6)`, about 3.46e-4. This corrects round 1's derivation,
-/// which stated the order term per dot but applied it once per step (`E4 = 1.325e-4`); round
-/// 1 measured 1.220e-6, so no test outcome changes.
+/// `E4 = 2·(5e-5 + C_DOTS·2^-16 + 1e-6)`, about 3.46e-4. An earlier derivation stated the
+/// order term per dot but applied it once per step (`E4 = 1.325e-4`); the measured value is
+/// 1.220e-6, so no test outcome depends on the difference.
 const E4: f64 = 2.0 * (5e-5 + C_DOTS * 2.0 * 128.0 * U + 1e-6);
 /// The row sum-of-squares floor the data asserts for q and k rows (test 4's `s_min`).
 const S_MIN: f64 = 1e-2;
@@ -1170,7 +1169,7 @@ fn judge_scan(inp: &ScanInputs, got: &[f32], state: &[f32], label: &str) -> (f64
     (worst.0, state_err)
 }
 
-/// `M` decode steps through RD-7b `gdn_delta` (m = 1 per call) on the same conv and proj
+/// `M` decode steps through the decode `gdn_delta` (m = 1 per call) on the same conv and proj
 /// rows and a copied state; returns the gated rows and the final state.
 fn run_decode(rig: &Rig, inp: &ScanInputs) -> Result<(Vec<f32>, Vec<f32>), EngError> {
     let lay = inp.lay;
@@ -1229,15 +1228,15 @@ fn seed_of(nk: usize, nv: usize, m: usize, salt: u64) -> u64 {
 }
 
 /// Test 3: the entry against the host f64 reference of the recurrence in the ggml L2 form,
-/// per-token order exactly the packet's (norms, gates, decay-first update, o, gate). The
-/// bound is the derived E3 (the module comment above states the derivation); a measured
-/// value above it is STOP and report, never widened. The pre-norm rows are not observable
-/// through this entry (K2 rewrites them in place and its RMSNorm cancels a uniform scale of
-/// them up to the eps term); the gated rows and the state are, and the measured maxima are
-/// reported to lane M for the PD1b row. The eps-dominated rows of its data are M6's kill and
-/// are pinned on the host before the device phase (the module comment above): at least one
-/// such row, and the reference with the q scale dropped more than 2·E3 from the reference
-/// (the gap that guarantees the kill by the triangle inequality; measured 5.332).
+/// per-token order exactly the kernel's (norms, gates, decay-first update, o, gate). The bound
+/// is the derived E3 (the module comment above states the derivation); a measured value above
+/// it is STOP and report, never widened. The pre-norm rows are not observable through this
+/// entry (K2 rewrites them in place and its RMSNorm cancels a uniform scale of them up to the
+/// eps term); the gated rows and the state are, and the measured maxima are reported. The
+/// eps-dominated rows of its data are M6's kill and are pinned on the host before the device
+/// phase (the module comment above): at least one such row, and the reference with the q scale
+/// dropped more than 2·E3 from the reference (the gap that guarantees the kill by the triangle
+/// inequality; measured 5.332).
 #[test]
 fn gdn_scan_seq_matches_the_f64_sequential_reference() -> Result<(), EngError> {
     let cases = [(16, 32, 8), (2, 4, 9), (4, 8, 17), (1, 1, 3)];
@@ -1248,7 +1247,7 @@ fn gdn_scan_seq_matches_the_f64_sequential_reference() -> Result<(), EngError> {
         m6_gap = m6_gap.max(m6_reference_gap(&inp));
     }
     println!(
-        "REPORTED to lane M: test 3 rows with mean(o^2) < 4*eps: {eps_rows}; the reference with the q scale dropped (M6) is off by {m6_gap:.3e}"
+        "REPORTED: test 3 rows with mean(o^2) < 4*eps: {eps_rows}; the reference with the q scale dropped (M6) is off by {m6_gap:.3e}"
     );
     assert!(
         eps_rows >= 1,
@@ -1293,15 +1292,15 @@ fn gdn_scan_seq_matches_the_f64_sequential_reference() -> Result<(), EngError> {
             "test 3 ({nk},{nv},{m}): state {state:.3e} above E3 {E3:.3e}"
         );
     }
-    println!("REPORTED to lane M: {}", measured.join("; "));
+    println!("REPORTED: {}", measured.join("; "));
     Ok(())
 }
 
-/// Test 4: one chunk call against `m` decode steps of RD-7b on the same rows and a copied
-/// state. NOT bit-exact by design (the L2-norm forms differ, the reduction orders differ,
-/// and this kernel's `expf`/`log1pf(expf)` differs from the decode kernel's `__expf`
-/// forms); the derived bound E4 (its three terms and the decay lemma in the module comment
-/// above) holds at every M under the same asserted constraints.
+/// Test 4: one chunk call against `m` decode steps of `gdn_delta` on the same rows and a copied
+/// state. NOT bit-exact by design (the L2-norm forms differ, the reduction orders differ, and
+/// this kernel's `expf`/`log1pf(expf)` differs from the decode kernel's `__expf` forms); the
+/// derived bound E4 (its three terms and the decay lemma in the module comment above) holds at
+/// every M under the same asserted constraints.
 #[test]
 fn gdn_scan_seq_chunk_equals_m_decode_steps() -> Result<(), EngError> {
     if !testkit::device_present("gdn_scan_seq_chunk_equals_m_decode_steps") {
@@ -1331,7 +1330,7 @@ fn gdn_scan_seq_chunk_equals_m_decode_steps() -> Result<(), EngError> {
         let rows_err = rel(&rows, &decode.0);
         let state_err = rel(&state, &decode.1);
         println!(
-            "REPORTED to lane M: test 4 m {m}: gated rows {rows_err:.3e}, state {state_err:.3e} [derived bound {E4:.3e}]"
+            "REPORTED: test 4 m {m}: gated rows {rows_err:.3e}, state {state_err:.3e} [derived bound {E4:.3e}]"
         );
         assert!(
             rows_err <= E4,
@@ -1646,14 +1645,14 @@ fn gdn_scan_seq_reads_ssm_a_as_stored() -> Result<(), EngError> {
     Ok(())
 }
 
-// ---- tests 5, 6, 12, 13, the device re-check and the drift row (packet C5) ----------------
+// ---- tests 5, 6, 12, 13, the device re-check and the drift row ----------------------------
 
-/// Test 5: the conv ring across chunk boundaries, through the RD-7a wrapper with `m = M`
-/// (the K0 reuse): chunk m = 3 then m = 2 on the carried ring, against one m = 5 call and
-/// five m = 1 calls — the out rows and the final ring bytes are bit-equal, because the ring
-/// update is pure data movement (`s0 = s1; s1 = s2; s2 = x`, ops.cu:90-92), for a first
-/// chunk of fewer than 3 rows at the sequence start (the older slots keep the zeroed state)
-/// and for a mid-sequence tail of 2 rows after 3.
+/// Test 5: the conv ring across chunk boundaries, through the decode conv wrapper with `m = M`
+/// (the K0 reuse): chunk m = 3 then m = 2 on the carried ring, against one m = 5 call and five
+/// m = 1 calls — the out rows and the final ring bytes are bit-equal, because the ring update
+/// is pure data movement (`s0 = s1; s1 = s2; s2 = x`, ops.cu:90-92), for a first chunk of fewer
+/// than 3 rows at the sequence start (the older slots keep the zeroed state) and for a
+/// mid-sequence tail of 2 rows after 3.
 #[test]
 fn gdn_conv_ring_carries_across_a_chunk_boundary() -> Result<(), EngError> {
     if !testkit::device_present("gdn_conv_ring_carries_across_a_chunk_boundary") {
@@ -1923,12 +1922,11 @@ fn gdn_scan_seq_writes_only_its_ranges() -> Result<(), EngError> {
     Ok(())
 }
 
-/// The device re-check of the launch arguments (decision 0049 items 2 and 10, lane C's
-/// condition in KUBDAN-MSG-78): reached through the `cuda-fault-qualification` bypass
-/// entry, which validates every rule of the call and then forces `p0 = ctx_tokens`, so the
-/// KERNELS' own guard is the code under test and the C entry's validation stays intact. The
-/// guard must load no state (the state bytes unchanged), NaN every o_out element, OR mask 8
-/// of the prefill status word, and leave the backend usable.
+/// The device re-check of the launch arguments: reached through the `cuda-fault-qualification`
+/// bypass entry, which validates every rule of the call and then forces `p0 = ctx_tokens`, so
+/// the KERNELS' own guard is the code under test and the C entry's validation stays intact. The
+/// guard must load no state (the state bytes unchanged), NaN every o_out element, OR mask 8 of
+/// the prefill status word, and leave the backend usable.
 #[cfg(feature = "cuda-fault-qualification")]
 #[test]
 fn gdn_scan_seq_fault_bad_bounds_reports_bit_8() -> Result<(), EngError> {
@@ -2019,26 +2017,25 @@ fn gdn_scan_seq_fault_bad_bounds_reports_bit_8() -> Result<(), EngError> {
     Ok(())
 }
 
-/// Test 16 (lane C condition 2, KUBDAN-MSG-78): the chunk-vs-decode drift of the chunked
-/// path against token-by-token decode on a realistic 512-token chunk,
-/// one layer, the scales of test 3 (not the near-zero rows of test 8). The chunk side runs
-/// the real seam (K0 conv m = 512 then this packet's scan m = 512 from the same starting
-/// ring and state); the decode side runs 512 steps of RD-7a conv m = 1 + RD-7b delta m = 1
-/// on the carried ring. The conv rows are bit-identical on both sides either way (test 5
-/// pins it), so the drift measured is the scan's own: the ggml L2-norm form against the
-/// decode HF form, the reduction order, and `expf` against `__expf`.
+/// Test 16: the chunk-vs-decode drift of the chunked path against token-by-token decode on a
+/// realistic 512-token chunk, one layer, the scales of test 3 (not the near-zero rows of test
+/// 8). The chunk side runs the real chunk path (K0 conv m = 512 then this scan m = 512 from the
+/// same starting ring and state); the decode side runs 512 steps of the decode conv and the
+/// decode delta, each with m = 1, on the carried ring. The conv rows are bit-identical on both
+/// sides either way (test 5 pins it), so the drift measured is the scan's own: the ggml L2-norm
+/// form against the decode HF form, the reduction order, and `expf` against `__expf`.
 ///
 /// The drift numbers are REPORT ONLY, not a gate; the finiteness of every row and state
 /// value on both sides IS a gate (the test panics on a non-finite value before reporting).
 ///
-/// Report scope for lane M: one layer, one seed, synthetic data, so this drift does not
-/// freeze PD1b; PD1b stays PROVISIONAL until CPF-M3 runs on real inputs. The next-token
-/// logits difference is NOT reported: this rig ends at the gated rows, and the output
-/// projection and LM head belong to the driver (CPF-7), not to the seam. The chunk and
-/// per-token paths are not bit-comparable, so by lane C's comparability rule PL1/PL2 against
-/// the A5 references are the authority on prefill correctness, not this drift.
+/// Report scope: one layer, one seed, synthetic data, so this drift does not freeze a drift
+/// tolerance; that stays PROVISIONAL until a run on real inputs. The next-token logits
+/// difference is NOT reported: this rig ends at the gated rows, and the output projection and
+/// LM head belong to the prefill driver, not to the scan. The chunk and per-token paths are
+/// not bit-comparable, so end-to-end prefill checks against reference outputs are the
+/// authority on prefill correctness, not this drift.
 #[test]
-#[ignore = "the reported drift row for lane M (CPF-DN-A section 5 test 16); run by name"]
+#[ignore = "the reported drift row of test 16; run by name"]
 fn gdn_chunk_vs_decode_state_drift_is_reported() -> Result<(), EngError> {
     if !testkit::device_present("gdn_chunk_vs_decode_state_drift_is_reported") {
         return Ok(());
@@ -2069,7 +2066,7 @@ fn gdn_chunk_vs_decode_state_drift_is_reported() -> Result<(), EngError> {
             rig.ctx.upload(&le_bytes(&w))?,
         );
         let ring_b = rig.ctx.upload(&le_bytes(&ring))?;
-        // The chunk side: K0 (conv m = 512) then this packet's scan m = 512.
+        // The chunk side: K0 (conv m = 512) then this scan m = 512.
         let (conv_chunk, state_chunk, out_chunk) = (
             rig.ctx.upload(&vec![0xFF_u8; conv_bytes])?,
             rig.ctx.upload(&le_bytes(&inp.state0))?,
@@ -2184,7 +2181,7 @@ fn gdn_chunk_vs_decode_state_drift_is_reported() -> Result<(), EngError> {
             mx.max((f64::from(*a) - f64::from(*b)).abs())
         });
         println!(
-            "REPORTED for lane M: test 16 {label}: max relative difference {:.4e} (scale {:.4e})",
+            "REPORTED: test 16 {label}: max relative difference {:.4e} (scale {:.4e})",
             worst / scale,
             scale
         );
@@ -2197,13 +2194,13 @@ fn gdn_chunk_vs_decode_state_drift_is_reported() -> Result<(), EngError> {
     );
     let o_drift = rel(&got.0, &got.1, "the 512 gated o rows");
     println!(
-        "REPORTED for lane M: test 16 next-token logits: not measurable in this rig (the seam ends at the gated rows; the output projection and LM head are the driver's, CPF-7)"
+        "REPORTED: test 16 next-token logits: not measurable in this rig (it ends at the gated rows; the output projection and LM head are the driver's)"
     );
     let _ = (state_drift, o_drift);
     Ok(())
 }
 
-// ---- test 15 (the timing row) and the capture row of test 12 (packet C6) ------------------
+// ---- test 15 (the timing row) and the capture row of test 12 ------------------------------
 
 /// The median of `reps` samples of `launch` (which queues and synchronizes), in microseconds,
 /// after `warmups` warm-up runs.
@@ -2311,19 +2308,18 @@ impl TimingRig {
     }
 }
 
-/// Test 15, the timing row of section 1 (a reported target, not a gate): on the 3090 in
-/// release, the median of 11 launches after 2 warm-ups on a single-layer rig (state 2 MiB +
-/// conv_out + scan_out, ~26 MiB of kernel-side scratch at M = 512). The rows: the conv us
-/// (K0) and the scan+out-gate us (ONE `gdn_scan_seq` call — the entry enqueues K1 and K2 on
-/// one stream, so their split is not directly measurable through the seam), printed x30 for
-/// the per-chunk figure, next to llama.cpp's 58.5 ms per 1,024 tokens and 130.8 ms per 2,048
-/// (the DeltaNet bucket of the pinned nsys, 0049 section 2, 30 layers), plus the raw entry
-/// time at nv = 1 (the sweep point of the failed K1/K2 split attempt; see the body for why
-/// the split's assumption is refuted). The events of this tree are timing-free, so the wall
-/// clock around a drained stream stands in (a printed deviation). A correctness spot check
-/// on 4 rows against the f64 reference runs in the same process so the timed entry is the
-/// correct one. In a debug build the timing rows are skipped (the S3a lesson) and the
-/// correctness rows stand.
+/// Test 15, the timing row (a reported target, not a gate): on the 3090 in release, the median
+/// of 11 launches after 2 warm-ups on a single-layer rig (state 2 MiB + conv_out + scan_out,
+/// ~26 MiB of kernel-side scratch at M = 512). The rows: the conv us (K0) and the scan+out-gate
+/// us (ONE `gdn_scan_seq` call — the entry enqueues K1 and K2 on one stream, so their split is
+/// not directly measurable through the entry), printed x30 for the per-chunk figure, next to
+/// llama.cpp's 58.5 ms per 1,024 tokens and 130.8 ms per 2,048 (the DeltaNet bucket of the
+/// pinned nsys profile, 30 layers), plus the raw entry time at nv = 1 (the sweep point of the
+/// failed K1/K2 split attempt; see the body for why the split's assumption is refuted). The
+/// events of this tree are timing-free, so the wall clock around a drained stream stands in (a
+/// printed deviation). A correctness spot check on 4 rows against the f64 reference runs in the
+/// same process so the timed entry is the correct one. In a debug build the timing rows are
+/// skipped and the correctness rows stand.
 #[test]
 fn gdn_scan_seq_report_ms() -> Result<(), EngError> {
     if !testkit::device_present("gdn_scan_seq_report_ms") {
@@ -2354,15 +2350,15 @@ fn gdn_scan_seq_report_ms() -> Result<(), EngError> {
                 30.0 * entry_us / 1e3,
             ));
         }
-        // The out-gate row is NOT splittable through this seam: the entry enqueues K1 and
-        // K2 on one stream and only their sum is measurable. An nv = 1 sweep was tried to
-        // split it (K1 latency-bound and nv-independent, K2 linear in the head count), and
-        // the data REFUTES the assumption — the entry at nv = 1 runs 442 us against 1,404 us
-        // at nv = 32 for the same M = 512, so K1's per-token latency itself depends on the
-        // head count (L2 pressure of the redundant per-slice q/k loads), and the linear
-        // decomposition would be meaningless. The sweep is reported as its raw number; the
-        // out-gate share stays bounded by the entry total (open point 1 takes the norms and
-        // gates out of the loop at P-b, where the split becomes measurable).
+        // The out-gate row is NOT splittable through this entry: it enqueues K1 and K2 on one
+        // stream and only their sum is measurable. An nv = 1 sweep was tried to split it (K1
+        // latency-bound and nv-independent, K2 linear in the head count), and the data REFUTES
+        // the assumption — the entry at nv = 1 runs 442 us against 1,404 us at nv = 32 for the
+        // same M = 512, so K1's per-token latency itself depends on the head count (L2 pressure
+        // of the redundant per-slice q/k loads), and the linear decomposition would be
+        // meaningless. The sweep is reported as its raw number; the out-gate share stays
+        // bounded by the entry total (a chunkwise kernel that takes the norms and gates out of
+        // the loop would make the split measurable).
         let t1_us = {
             let (nk, nv, m) = (1_usize, 1, 512);
             let inp = generate_scan(nk, nv, m, ScanLayout::of(nk, nv), seed_of(nk, nv, m, 0x15));
@@ -2384,7 +2380,7 @@ fn gdn_scan_seq_report_ms() -> Result<(), EngError> {
             println!("TIMING {line}");
         }
     } else {
-        println!("timing skipped (debug build, the S3a lesson); the correctness rows stand");
+        println!("timing skipped (debug build); the correctness rows stand");
     }
     // The correctness spot check, in the same process and against the same entry that was
     // timed: one scan of the reference's own conv rows (the f64 reference consumes
@@ -2424,10 +2420,9 @@ fn gdn_scan_seq_report_ms() -> Result<(), EngError> {
     Ok(())
 }
 
-/// Test 12, the capture row (the RD-11a pattern): one `gdn_scan_seq` call captured on a
-/// one-layer graph and replayed twice equals the eager run bit for bit (out rows and state).
-/// Expected trivially equal — the entry queues two launches and opts into no dynamic shared
-/// memory — and still run.
+/// Test 12, the capture row: one `gdn_scan_seq` call captured on a one-layer graph and replayed
+/// twice equals the eager run bit for bit (out rows and state). Expected trivially equal — the
+/// entry queues two launches and opts into no dynamic shared memory — and still run.
 #[test]
 fn gdn_scan_seq_inside_a_capture_equals_eager() -> Result<(), EngError> {
     if !testkit::device_present("gdn_scan_seq_inside_a_capture_equals_eager") {
@@ -2491,14 +2486,14 @@ fn gdn_scan_seq_inside_a_capture_equals_eager() -> Result<(), EngError> {
     Ok(())
 }
 
-// ---- test 17 and test 18 (CPF-DN-B: the token-tile edges and the speed row) ----------------
+// ---- test 17 and test 18 (the token-tile edges and the speed row) --------------------------
 
-/// Test 17: rows across the token-tile edges of the CPF-DN-B K1. The rewritten kernel stages
-/// the tokens of one chunk in tiles of `kTile = 16` (the `.cu` constant of `gdn_scan_seq.cu`,
-/// CPF-DN-B section 2.2); the arithmetic of a token must not depend on its tile slot, its tile
-/// index, `m` or `p0`, and a partial last tile must neither overread its inputs nor leave an
-/// output row unwritten. Landed at C1 on the CPF-DN-A kernel (which has no tiles), where it
-/// must already be green: it pins the rewrite, it does not only follow it.
+/// Test 17: rows across the token-tile edges of the tiled scan kernel K1. The kernel stages the
+/// tokens of one chunk in tiles of `kTile = 16` (the `.cu` constant of `gdn_scan_seq.cu`); the
+/// arithmetic of a token must not depend on its tile slot, its tile index, `m` or `p0`, and a
+/// partial last tile must neither overread its inputs nor leave an output row unwritten. The
+/// test also passes on the earlier sequential kernel (which has no tiles): it pins the tiled
+/// rewrite, it does not only follow it.
 /// (a) The f64 reference with E3 (the `judge_scan` path) at `(nk, nv, m)` = (16,32,15),
 /// (16,32,16), (16,32,17), (16,32,31), (16,32,32), (16,32,33), (4,8,48), (1,1,17): one below,
 /// at and above every multiple of `kTile` inside the tested range, plus two non-Qwen
@@ -2506,7 +2501,7 @@ fn gdn_scan_seq_inside_a_capture_equals_eager() -> Result<(), EngError> {
 /// (b) Bit-exact self-split across tile boundaries: (16,32,40) as one call against three calls
 /// m = 16, 7, 17 at `row0` = 0, 16, 23 with p0 = `row0` and the state carried in its buffer
 /// (the test 4b pattern, which m = 9 never crosses a tile): the gated rows and the state must
-/// be bit-equal. Prints its measured maxima for lane M.
+/// be bit-equal. Prints its measured maxima.
 #[test]
 fn gdn_scan_seq_tile_edges() -> Result<(), EngError> {
     if !testkit::device_present("gdn_scan_seq_tile_edges") {
@@ -2546,7 +2541,7 @@ fn gdn_scan_seq_tile_edges() -> Result<(), EngError> {
             "test 17 ({nk},{nv},{m}): state {state:.3e} above E3 {E3:.3e}"
         );
     }
-    println!("REPORTED to lane M: {}", measured.join("; "));
+    println!("REPORTED: {}", measured.join("; "));
     // (b) The self-split: 16 + 7 + 17 = 40, the seams at 16 (a tile boundary) and 23 (mid-tile).
     let (nk, nv, m) = (16_usize, 32, 40);
     let inp = generate_scan(nk, nv, m, ScanLayout::qwen36(), seed_of(nk, nv, m, 0x17));
@@ -2580,27 +2575,27 @@ fn gdn_scan_seq_tile_edges() -> Result<(), EngError> {
     Ok(())
 }
 
-/// Test 18 (CPF-DN-B): the speed qualification row. A PRINTED REPORT ONLY — never a wall-clock
-/// assert (Amendment 1 MAJOR 1: the tree has no SM-count or device-name query, `kernels/cuda/
-/// mod.rs:111-125`, so an assert cannot be limited to the 3090; a 1,104-us line from one hold
-/// would fail correct code on the Xavier (8 waves) or the 4050 (~3.2 waves)). Release-only and
-/// `#[ignore]`d: run by name inside the baton hold next to the C1 (kernel A) executable. The
-/// speed judgement itself — B >= 1.67x A in the same hold, the packet's STOP 6 — is made in the
-/// REPORT from the paired A/B medians, not in this test; what the test prints is B's rows next
-/// to A's round-1 MEASURED rows (ROUND-1-REPORT.md:126; single-run timings of this entry moved
-/// 1,256-1,578 us under contention, so the printed A/B ratio is indicative, the hold's is the
-/// judgement). Rows: the entry (one `gdn_scan_seq` call, K1+K2) at M = 512/1,024/2,048 next to
-/// the x30 path figures; the tail-chunk rows M = 1, 16, 17 (the tile overhead); the entry at
-/// nv = 1, M = 512 (the latency floor; A 442.4 us). The correctness spot check of test 15 runs
-/// in the same process in BOTH profiles, so the timed kernel is the correct one.
+/// Test 18: the speed qualification row of the tiled kernel (B) against the sequential kernel
+/// (A). A PRINTED REPORT ONLY — never a wall-clock assert (the tree has no SM-count or
+/// device-name query, `kernels/cuda/mod.rs:111-125`, so an assert cannot be limited to the
+/// 3090; a 1,104-us line from one run would fail correct code on the Xavier (8 waves) or the
+/// 4050 (~3.2 waves)). Release-only and `#[ignore]`d: run by name on an otherwise idle GPU next
+/// to the executable of kernel A. The speed judgement itself — B >= 1.67x A in the same run —
+/// is made from the paired A/B medians, not in this test; what the test prints is B's rows next
+/// to A's MEASURED rows (single-run timings of this entry moved 1,256-1,578 us under
+/// contention, so the printed A/B ratio is indicative, the paired run's is the judgement).
+/// Rows: the entry (one `gdn_scan_seq` call, K1+K2) at M = 512/1,024/2,048 next to the x30 path
+/// figures; the tail-chunk rows M = 1, 16, 17 (the tile overhead); the entry at nv = 1, M = 512
+/// (the latency floor; A 442.4 us). The correctness spot check of test 15 runs in the same
+/// process in BOTH profiles, so the timed kernel is the correct one.
 #[test]
-#[ignore = "timing rows; run by name in a baton hold"]
+#[ignore = "timing rows; run by name on an otherwise idle GPU"]
 fn gdn_scan_seq_speed_rows() -> Result<(), EngError> {
     if !testkit::device_present("gdn_scan_seq_speed_rows") {
         return Ok(());
     }
-    // CPF-DN-A's round-1 rows (3090 release, median of 11 after 2 warm-ups; MEASURED,
-    // CPF-DN-A ROUND-1-REPORT.md:122-131): the comparison constants of the printed rows.
+    // Kernel A's measured rows (3090 release, median of 11 after 2 warm-ups): the comparison
+    // constants of the printed rows.
     const A_ENTRY_M512: f64 = 1380.2;
     const A_ENTRY_M1024: f64 = 3078.7;
     const A_ENTRY_M2048: f64 = 5779.2;
@@ -2638,8 +2633,8 @@ fn gdn_scan_seq_speed_rows() -> Result<(), EngError> {
             );
         }
         println!(
-            "SPEED B/A at M 512: A round-1 {A_ENTRY_M512} us, B {:.1} us, ratio {:.2}x \
-             (indicative; the paired in-hold medians are the judgement, STOP 6: B >= 1.67x A)",
+            "SPEED B/A at M 512: A {A_ENTRY_M512} us, B {:.1} us, ratio {:.2}x \
+             (indicative; the paired medians of one run are the judgement: B >= 1.67x A)",
             entries[0].2,
             A_ENTRY_M512 / entries[0].2,
         );
@@ -2684,7 +2679,7 @@ fn gdn_scan_seq_speed_rows() -> Result<(), EngError> {
              {A_ENTRY_M2048} us at M 512/1,024/2,048"
         );
     } else {
-        println!("timing skipped (debug build, the S3a lesson)");
+        println!("timing skipped (debug build)");
     }
     // The correctness spot check, in the same process and against the same entry that was
     // timed (test 15's pattern): 4 rows x 3 heads against E3, in BOTH profiles.

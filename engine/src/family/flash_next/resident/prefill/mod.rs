@@ -1,9 +1,9 @@
-//! Batched prefill blocks of the resident Flash-Next decoder (decision 0044; plan S4).
+//! Batched prefill blocks of the resident Flash-Next decoder.
 //!
-//! Each function is the chunk form of a block in the parent module. It takes `T` token rows,
-//! builds lazy graphs, and never reads back or evaluates, so a whole chunk keeps the
-//! synchronization budget of one token. `step` wires the blocks into `ResidentDecoder::prefill`
-//! (packet PF-5). The decode blocks in the parent module stay unchanged.
+//! Each function is the chunk form of a block in the parent module. It takes `T` token rows, builds
+//! lazy graphs, and never reads back or evaluates, so a whole chunk keeps the synchronization
+//! budget of one token. `step` wires the blocks into `ResidentDecoder::prefill`. The decode blocks
+//! in the parent module stay unchanged.
 
 mod conv;
 mod deltanet;

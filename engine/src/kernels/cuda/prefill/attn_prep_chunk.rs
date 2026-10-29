@@ -1,27 +1,25 @@
-//! Safe launch wrapper of the chunk attention preparation (CPF-ATTN-A K1, decision 0049
-//! items 1, 2 and 10; seam 1 of item 15): per-head RMSNorm of the q and k rows with the
-//! learned weights, NEOX rope over the first `n_rot` dimensions at the position `p0 + t` of
-//! token `t`, the f32 `q` output, and the k rows (after the norm and the rope) plus the
-//! unchanged v rows written to the fp16 cache planes ([`PrepChunkMode::AppendFp16`]) or to
-//! f32 rows ([`PrepChunkMode::RowsOut`], the input contract of `kv8_append`'s chunk entry,
-//! IMPL-KV8-A).
+//! Safe launch wrapper of the chunk attention preparation: per-head RMSNorm of the q and k
+//! rows with the learned weights, NEOX rope over the first `n_rot` dimensions at the position
+//! `p0 + t` of token `t`, the f32 `q` output, and the k rows (after the norm and the rope)
+//! plus the unchanged v rows written to the fp16 cache planes ([`PrepChunkMode::AppendFp16`])
+//! or to f32 rows ([`PrepChunkMode::RowsOut`], the input contract of `kv8_append`'s chunk
+//! entry).
 //!
-//! The math is a byte-for-byte re-expression of the vendored `attn_prep` (RD-4V), which stays
+//! The math is a byte-for-byte re-expression of the vendored `attn_prep`, which stays
 //! decode-only: it reads the device `pos` word and ORs mask 4 of `StepParams.status`
-//! (`attn_prep.cu:23`). This chunk form takes `p0` and `m` as launch arguments (decision
-//! 0049 item 1: prefill reads and writes no `StepParams` field), and the row layout and byte
-//! helpers are `attn_prep`'s (shared, not duplicated).
+//! (`attn_prep.cu:23`). This chunk form takes `p0` and `m` as launch arguments (prefill reads
+//! and writes no `StepParams` field), and the row layout and byte helpers are `attn_prep`'s
+//! (shared, not duplicated).
 //!
 //! [`CudaContext::attn_prep_chunk`] queues one kernel on a [`DeviceStream`] and returns. The
 //! call allocates nothing, copies nothing and never synchronizes; a fault in the queued work
 //! surfaces at the next synchronize of the stream and latches the backend there.
 //!
-//! The device re-check (decision 0049 item 2, the vendored form): a `p0` outside
-//! `0..=rows - m` makes the launch write no cache row and no k/v row, sets every `q` element
-//! to NaN and ORs mask 8 of the optional prefill status word (item 10; the word is NOT
-//! `StepParams.status`). The host cannot reach that path with bad bounds — this wrapper and
-//! the C entry each refuse them first — so the fault-qualification child of the native module
-//! exercises it in the tests.
+//! The device re-check (the vendored form): a `p0` outside `0..=rows - m` makes the launch
+//! write no cache row and no k/v row, sets every `q` element to NaN and ORs mask 8 of the
+//! optional prefill status word (the word is NOT `StepParams.status`). The host cannot reach
+//! that path with bad bounds — this wrapper and the C entry each refuse them first — so the
+//! fault-qualification child of the native module exercises it in the tests.
 //!
 //! Every argument is checked here, before any native call, and refused as `BadRequest`:
 //! the rules below mirror `valid_attn_prep_chunk` of `attn_prep_chunk.cu`, so the native
@@ -32,10 +30,7 @@
 
 #![cfg_attr(
     not(test),
-    expect(
-        dead_code,
-        reason = "staged for CPF-7, the prefill driver (decision 0049)"
-    )
+    expect(dead_code, reason = "staged for the chunked-prefill driver")
 )]
 
 use std::ffi::c_int;
@@ -77,8 +72,8 @@ pub(crate) struct AttnPrepChunkShape {
     pub(crate) n_rot: usize,
     pub(crate) rows: usize,
     pub(crate) ld: usize,
-    /// The position of token 0: a launch argument (decision 0049 item 1), never a device
-    /// word, so it is authoritative here and on the device alike.
+    /// The position of token 0: a launch argument, never a device word, so it is
+    /// authoritative here and on the device alike.
     pub(crate) p0: i64,
 }
 
@@ -107,8 +102,8 @@ pub(crate) enum PrepChunkMode<'b> {
 ///   the v heads. The row layout is `attn_prep`'s.
 /// - `q_norm`, `k_norm`: f32 256 each, 4-byte aligned; they may alias each other.
 /// - `q`: f32 `[m][n_head][256]`, 16-byte aligned; NaN on a refused launch.
-/// - `status`: `None`, or one device `i32` — the prefill status word of decision 0049 item
-///   10 — that receives mask 8 on a refused launch and is untouched by a valid one.
+/// - `status`: `None`, or one device `i32` — the prefill status word — that receives mask 8
+///   on a refused launch and is untouched by a valid one.
 pub(crate) struct AttnPrepChunkCall<'b> {
     pub(crate) shape: AttnPrepChunkShape,
     pub(crate) rope: RopeParams,
@@ -140,7 +135,7 @@ fn ranged(tag: &str, value: usize, low: usize, high: usize) -> Result<c_int, Eng
 
 /// Checks every shape rule and converts the integers once, so that no conversion can fail
 /// inside the launch closure. Each refusal carries the tag `attn_prep_chunk: <rule>`; the
-/// p0 bound is the 64-bit sum rule of decision 0049 item 2.
+/// p0 bound is checked on the 64-bit sum `p0 + m`.
 pub(in crate::kernels::cuda) fn check_shape(
     shape: &AttnPrepChunkShape,
     mode: c_int,

@@ -1,12 +1,11 @@
-//! The load path of the tiered step (OFF-2 D5b): which tensors a tiered load uploads, what the
-//! bank sizes are checked against, and the host side built over the mapped GGUF.
+//! The load path of the tiered step: which tensors a tiered load uploads, what the bank sizes are
+//! checked against, and the host side built over the mapped GGUF.
 //!
 //! WHAT: [`names_without_experts`] drops the routed expert stacks from the device tensor list (the
 //! banks hold the hot experts instead), [`admit_banks`] refuses a bank that does not fit the free
 //! device memory through the admission arithmetic of `tiered/budget.rs`, and [`build_tiered`]
 //! allocates the banks and builds the [`TieredHost`] over a read-only mapping of the checkpoint.
-//! WHY: the 20 GB checkpoint cannot be resident in 6 GiB; everything but the experts still is
-//! (design `ledger/plans/OFF-2-DEVICE-WIRING.md`).
+//! WHY: the 20 GB checkpoint cannot be resident in 6 GiB; everything but the experts still is.
 
 use std::path::Path;
 use std::sync::Arc;

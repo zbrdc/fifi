@@ -1,11 +1,11 @@
 //! Raw FFI to the M-row SwiGLU entry of `native/prefill/swiglu_rows.cu` (declared in
-//! `native/prefill/swiglu_rows.h`), CPF-7a part 1. Child module of `native/prefill.rs`, so it
-//! inherits the `allow(unsafe_code)` of `native.rs`.
+//! `native/prefill/swiglu_rows.h`). Child module of `native/prefill.rs`, so it inherits the
+//! `allow(unsafe_code)` of `native.rs`.
 //!
 //! Safety invariants this file relies on:
 //! - The launch entry is called only through `CudaContext::launch_on`, on the thread that
-//!   owns the context and under the dispatch guard (decisions 0023 and 0024). It only
-//!   enqueues and returns; the stream is live for the call.
+//!   owns the context and under the dispatch guard. It only enqueues and returns; the
+//!   stream is live for the call.
 //! - Both ranges are `RawRange`s, proved inside a live allocation by `raw_range`. Their sizes,
 //!   their 16-byte alignment and the disjointness of the written `act` extent from the read
 //!   `gu` extent (`super::Span`) are proved again here before the call; the C entry repeats

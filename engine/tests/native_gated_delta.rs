@@ -1,6 +1,6 @@
 #![cfg(all(feature = "native-mlx", target_os = "macos", target_arch = "aarch64"))]
 
-//! Behavior of `MlxKernels::gated_delta` against an f64 reference (decision 0050).
+//! Behavior of `MlxKernels::gated_delta` against an f64 reference.
 //!
 //! The reference follows `_gated_delta_step_ops` of mlx-lm 0.31.0, written for one batch row. It
 //! shares no code with the Metal kernel.

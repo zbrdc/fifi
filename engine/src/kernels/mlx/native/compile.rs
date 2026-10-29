@@ -1,14 +1,14 @@
-//! The `mlx_compile` seam of the adapter (packet MX-COMPILE-1a): the compiled DeltaNet and
-//! device-routed MoE decode steps behind the engine setting `qwen36.compile` (default false),
-//! and the teardown clear of the thread-local MLX compile cache (MLX keeps one cache per
-//! thread, so the clear empties the dropping thread's cache). The stage 1 probe
-//! (`compile_probe_gated_delta`) and the measurement harness around it stay test-only.
+//! The `mlx_compile` seam of the adapter: the compiled DeltaNet and device-routed MoE decode
+//! steps behind the engine setting `qwen36.compile` (default false), and the teardown clear
+//! of the thread-local MLX compile cache (MLX keeps one cache per thread, so the clear
+//! empties the dropping thread's cache). The stage 1 probe (`compile_probe_gated_delta`) and
+//! the measurement harness around it stay test-only.
 //!
-//! Each B=1 compiled step replays the uncompiled op sequence call for call, including every
-//! cast of packet Q36-BF16-a (the `bb` cast to F32, the F32 recurrence state and ring, the
-//! `to_act` before the out projection, the ONE `mlx_minimum` clamp of the expert ids) — so a
-//! B=1 compiled run and an uncompiled run issue the same MLX calls in the same order in both
-//! activation dtypes. Activation and packed-weight scale dtypes belong to the compile cache key
+//! Each B=1 compiled step replays the uncompiled op sequence call for call, including every dtype
+//! cast (the `bb` cast to F32, the F32 recurrence state and ring, the `to_act` before the out
+//! projection, the ONE `mlx_minimum` clamp of the expert ids) — so a B=1 compiled run and an
+//! uncompiled run issue the same MLX calls in the same order in both activation dtypes.
+//! Activation and packed-weight scale dtypes belong to the compile cache key
 //! (`kernels::compile_key`), keeping the F32 and BF16 decoders on distinct baked keys. One
 //! adapter context admits at most 4 keys before any native call; its `ProgramRegistry` dies
 //! with it. B>1 MoE vectorizes its sequence. Staged B>1 DeltaNet batches
@@ -25,9 +25,9 @@
 //! successful handles with invalid metadata follow that retention policy too.
 //! There is NO fallback to the uncompiled
 //! path: after the engine turned the setting on, a failure of the compiled step is a native
-//! failure (decision 0032/0023), because a silent fallback would change the numerics between
-//! two tokens of one request. The fault hooks of the qualification build (call failure, null
-//! output, output mismatch) select the two block calls like every other resident operation.
+//! failure, because a silent fallback would change the numerics between two tokens of one
+//! request. The fault hooks of the qualification build (call failure, null output, output
+//! mismatch) select the two block calls like every other resident operation.
 
 use super::super::ResidentPackedWeight;
 use super::{
@@ -113,8 +113,8 @@ pub(crate) fn quant_triples<const N: usize>(
     Ok(triples)
 }
 
-/// The flat input list and the baked constants of one compiled DeltaNet decode step (packet
-/// MX-COMPILE-1a). Every tensor must belong to this adapter.
+/// The flat input list and the baked constants of one compiled DeltaNet decode step. Every
+/// tensor must belong to this adapter.
 pub(crate) struct CompileDeltaArgs<'a> {
     /// The layer input: `[1, H]` for the step seam or `[B, H]` for staged rows.
     pub(crate) x: &'a ExecutionTensor,
@@ -134,8 +134,8 @@ pub(crate) struct CompileDeltaArgs<'a> {
     pub(crate) dims: [u32; 6],
     /// The RMS norm epsilon.
     pub(crate) eps: f32,
-    /// The activation dtype of the step (packet Q36-BF16-a): the dtype of the layer input and of
-    /// the block output (`to_act` before the out projection), and part of the compile cache key.
+    /// The activation dtype of the step: the dtype of the layer input and of the block output
+    /// (`to_act` before the out projection), and part of the compile cache key.
     pub(crate) act: Dtype,
 }
 
@@ -157,8 +157,8 @@ pub(crate) struct CompiledDeltaRows {
     pub(crate) states: Vec<(ExecutionTensor, ExecutionTensor)>,
 }
 
-/// The flat input list and the baked constants of one compiled device-routed MoE decode step
-/// (packet MX-COMPILE-1a). Every tensor must belong to this adapter.
+/// The flat input list and the baked constants of one compiled device-routed MoE decode
+/// step. Every tensor must belong to this adapter.
 pub(crate) struct CompileMoeArgs<'a> {
     /// The layer input `[B, H]`, with `B` in 1, 2, 4, or 8.
     pub(crate) x: &'a ExecutionTensor,
@@ -178,8 +178,8 @@ pub(crate) struct CompileMoeArgs<'a> {
     pub(crate) top_k: u32,
     /// Whether the gates renormalize over the selection.
     pub(crate) renorm: bool,
-    /// The activation dtype of the step (packet Q36-BF16-a): the dtype of the layer input and of
-    /// the block output (the final `to_act`), and part of the compile cache key.
+    /// The activation dtype of the step: the dtype of the layer input and of the block output
+    /// (the final `to_act`), and part of the compile cache key.
     pub(crate) act: Dtype,
 }
 
@@ -265,12 +265,12 @@ fn native_dim(label: &'static str, value: u32) -> Result<i32, EngError> {
 
 impl Context {
     /// Stage 1 of the compile seam, kept as the measurement probe it was: runs the gated delta
-    /// kernel (decision 0050) through one `mlx_compile`d closure and returns `y` `[B, T, Hv, Dv]`
-    /// and the new state `[B, Hv, Dv, Dk]`, both lazy, exactly as [`Context::gated_delta`] does.
-    /// The closure is compiled with the fixed cache key [`PROBE_FUN_ID`] and `shapeless = false`,
-    /// so the second call hits the compile cache and the first call is the compile. A native
-    /// failure is terminal, as for every resident operation. Test builds only: the probe
-    /// answered the first compile question and no production path calls it.
+    /// kernel through one `mlx_compile`d closure and returns `y` `[B, T, Hv, Dv]` and the new
+    /// state `[B, Hv, Dv, Dk]`, both lazy, exactly as [`Context::gated_delta`] does. The closure
+    /// is compiled with the fixed cache key [`PROBE_FUN_ID`] and `shapeless = false`, so the
+    /// second call hits the compile cache and the first call is the compile. A native failure is
+    /// terminal, as for every resident operation. Test builds only: the probe answered the first
+    /// compile question and no production path calls it.
     #[cfg(test)]
     pub(in crate::kernels::mlx) fn compile_probe_gated_delta(
         &mut self,
@@ -355,10 +355,10 @@ impl Context {
     /// the same constants shares one compiled program, and the per-adapter registry admits the
     /// key BEFORE any native call: a fifth distinct key of one adapter is `BadRequest`.
     ///
-    /// Dtype rules (packet Q36-BF16-a): the block output carries the activation dtype (the block
-    /// ends in `to_act`); the recurrence state and the ring stay F32; the closure mirrors every
-    /// cast of the uncompiled step, so both activation dtypes build the same computation as
-    /// their uncompiled counterparts.
+    /// Dtype rules: the block output carries the activation dtype (the block ends in `to_act`);
+    /// the recurrence state and the ring stay F32; the closure mirrors every cast of the
+    /// uncompiled step, so both activation dtypes build the same computation as their uncompiled
+    /// counterparts.
     ///
     /// No fallback: a failure is a native failure. The call runs under the dispatch guard, every
     /// temporary is freed on every path, a native error makes the adapter terminal (decision
@@ -592,7 +592,7 @@ impl Context {
         });
         super::super::compile_stats::record(true, fun_id, started.elapsed().as_secs_f64());
         // The layer output carries the activation dtype (the block ends in `to_act`); the
-        // recurrence state and the ring stay F32 (packet Q36-BF16-a).
+        // recurrence state and the ring stay F32.
         let hidden_bytes = u64::from(batch) * u64::from(args.hidden) * args.act.byte_width();
         let state_bytes = u64::from(vh) * u64::from(vd) * u64::from(kd) * 4;
         let ring_bytes = u64::from(cd) * u64::from(taps) * 4;
@@ -662,9 +662,8 @@ impl Context {
     /// any native call, and a fifth distinct key of one adapter is `BadRequest`. B is not baked;
     /// the nonshapeless MLX cache specializes input shapes under the same key.
     ///
-    /// Dtype rules (packet Q36-BF16-a): the block output carries the activation dtype (the final
-    /// `to_act`); the router arithmetic, the gates, and the health row stay F32; the ids stay
-    /// U32.
+    /// Dtype rules: the block output carries the activation dtype (the final `to_act`); the
+    /// router arithmetic, the gates, and the health row stay F32; the ids stay U32.
     ///
     /// No fallback: a failure is a native failure, with the same discipline as
     /// [`Context::compiled_delta_step`] (dispatch guard, ownership checks, temporaries freed on
@@ -945,13 +944,13 @@ pub(in crate::kernels::mlx) fn native_trace_reset() {
     unsafe { ffi::mlx_compile_reset_trace_counts() };
 }
 
-/// Clears the calling thread's MLX compile cache at adapter teardown (packet MX-COMPILE-1a
-/// item 4). `Context::drop` calls this after its synchronize completed every pending evaluation
-/// and the retire list is drained, and before the stream and the device are released; the
-/// caller already holds the dispatch guard. The MLX compile cache is thread-local, so the clear
-/// covers this adapter's thread and its compiled programs die with it. The clear is idempotent
-/// — it empties a possibly empty cache — and a failure changes no completion state of the dying
-/// adapter, so it only goes uncounted: the programs of the cache stay until the thread exits.
+/// Clears the calling thread's MLX compile cache at adapter teardown. `Context::drop` calls
+/// this after its synchronize completed every pending evaluation and the retire list is
+/// drained, and before the stream and the device are released; the caller already holds the
+/// dispatch guard. The MLX compile cache is thread-local, so the clear covers this adapter's
+/// thread and its compiled programs die with it. The clear is idempotent — it empties a
+/// possibly empty cache — and a failure changes no completion state of the dying adapter, so it
+/// only goes uncounted: the programs of the cache stay until the thread exits.
 pub(in crate::kernels::mlx) fn teardown_clear() {
     if unsafe { ffi::mlx_compile_clear_cache() } == 0 {
         super::super::compile_stats::counted_clear();
@@ -1096,8 +1095,8 @@ impl Context {
     /// (`kernels::compile_key::flint_tail_fun_id`) covers the row count, the hidden width, the
     /// eps bits, the activation dtype, and the scale dtype and quantization triple of each
     /// packed weight, and the per-adapter registry admits it before any native call. There is
-    /// NO fallback to the uncompiled path once the caller routed here (decision 0032/0023): a
-    /// failure of the compiled call is a native failure.
+    /// NO fallback to the uncompiled path once the caller routed here: a failure of the
+    /// compiled call is a native failure.
     pub(in crate::kernels::mlx) fn flint_compiled_tail(
         &mut self,
         args: &FlintTailArgs<'_>,

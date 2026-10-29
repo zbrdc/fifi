@@ -1,12 +1,11 @@
-//! Speed rows of the grouped launch (plan rev 3 section B.7, items (b) and (c)): UNPAIRED and
-//! REPORTED ONLY, never gated. At M = 512, 1,024 and 2,048 tokens on the 3090 (release profile)
-//! they print the three mmid launches of one MoE layer (gate, up, down; 256 experts, top 8,
-//! uniform random ids; Q4_K; K 2,048 / N 512, K 2,048 / N 512, K 512 / N 2,048) in
-//! milliseconds per layer and times 40 layers, beside the anchors of the plan:
-//! `PF-M5a.md`'s probe (gate 870 us + up 870 us + down 1,117 us = 2.86 ms per layer at T = 1,024,
-//! MEASURED) and llama.cpp's expert bucket (92.4 ms at 1K, MEASURED), and the builder (guard
-//! plus `mm_ids_helper`) in microseconds at each M, 2,048 being (c). The numbers are host
-//! wall-clock over 20 launches of a synchronized stream, after 3 warm-up launches.
+//! Speed rows of the grouped launch: UNPAIRED and REPORTED ONLY, never gated. At M = 512, 1,024 and
+//! 2,048 tokens on the 3090 (release profile) they print the three mmid launches of one MoE layer
+//! (gate, up, down; 256 experts, top 8, uniform random ids; Q4_K; K 2,048 / N 512, K 2,048 / N 512,
+//! K 512 / N 2,048) in milliseconds per layer and times 40 layers, beside two anchors: an earlier
+//! probe (gate 870 us + up 870 us + down 1,117 us = 2.86 ms per layer at T = 1,024, MEASURED) and
+//! llama.cpp's expert bucket (92.4 ms at 1K, MEASURED), and the builder (guard plus
+//! `mm_ids_helper`) in microseconds at each M. The numbers are host wall-clock over 20 launches of
+//! a synchronized stream, after 3 warm-up launches.
 //!
 //! The timed kernels are the correct ones: the same process spot-checks eight slots of the gate
 //! and of the down output against the f64 reference under the frozen bounds, after the HARD GATE
@@ -29,7 +28,7 @@ use crate::kernels::cuda::resident::matvec_q::QuantType;
 use crate::kernels::cuda::testkit;
 use crate::kernels::cuda::{CudaContext, DeviceBuffer};
 
-/// The frozen NMSE bounds of the gate/up and down classes (0049 A2).
+/// The frozen NMSE bounds of the gate/up and down classes.
 const GATE_UP_NMSE: f64 = 1e-3;
 const DOWN_NMSE: f64 = 2e-3;
 /// Layers of the model: the per-layer time is multiplied by this for the comparison.
@@ -325,7 +324,7 @@ fn mmq_mmid_speed_rows_are_reported_unpaired() {
         );
         if release {
             println!(
-                "speed M {} (unpaired, reported only): gate+up+down {:.3} ms/layer, x40 = {:.1} ms (PF-M5a probe 2.86 ms/layer at T 1,024; llama.cpp expert bucket 92.4 ms at 1K); ids build (guard + mm_ids_helper) {:.1} us",
+                "speed M {} (unpaired, reported only): gate+up+down {:.3} ms/layer, x40 = {:.1} ms (earlier probe 2.86 ms/layer at T 1,024; llama.cpp expert bucket 92.4 ms at 1K); ids build (guard + mm_ids_helper) {:.1} us",
                 t.m,
                 t.layer_ms,
                 t.layer_ms * LAYERS,

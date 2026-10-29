@@ -1,14 +1,11 @@
-/* CPF-ATTN-A K2 and CPF-ATTN-B: the kernels and the launch entry of attn_prefill, the
- * flash-style chunked-prefill attention (decision 0049 items 1, 2 and 10; the CPF-5a/5b kernel
- * of design section 3.7). The split rule, the
- * visible/cache_row span rules and the combine pattern restate the resident attn_decode
- * (RD-8b, this tree); the online-softmax recurrence and the query-tile geometry (8 tokens x 8
- * GQA heads = 64 rows, key tiles of 32) follow design section 3.7; the sm_80+ part kernel's
- * head_dim split with a fixed-order exchange, cp.async with an XOR swizzle, Q in registers and
- * ldmatrix follow the CPF-ATTN-B packet (Strata's micro-architecture and llama.cpp's MMA
- * kernel as described there, nothing read or copied). The device checks p0/m again (item 2)
- * and ORs mask 8 of the prefill status word (item 10).
- * Contract: prefill/attn_prefill.h. */
+/* The kernels and the launch entry of attn_prefill, the flash-style chunked-prefill
+ * attention. The split rule, the visible/cache_row span rules and the combine pattern restate
+ * the resident attn_decode of this tree; the kernels run the online-softmax recurrence over
+ * query tiles of 8 tokens x 8 GQA heads = 64 rows and key tiles of 32; the sm_80+ part
+ * kernel's head_dim split with a fixed-order exchange, cp.async with an XOR swizzle, Q in
+ * registers and ldmatrix follow written descriptions of Strata's micro-architecture and
+ * llama.cpp's MMA kernel (nothing read or copied). The device checks p0/m again and ORs mask 8
+ * of the prefill status word. Contract: prefill/attn_prefill.h. */
 #include "prefill/attn_prefill.h"
 
 #include <cuda_fp16.h>
@@ -79,7 +76,7 @@ __device__ inline void visible(const Args &a, int p_first, int n_keys, int &firs
 }
 
 /* Whether the row at position p sees the key at position pos: causal, and with a window,
- * among the row's last `window` positions (rev2 §2 K2). p - window cannot overflow: p >= 0. */
+ * among the row's last `window` positions. p - window cannot overflow: p >= 0. */
 __device__ inline bool sees(const Args &a, int pos, int p) {
     return pos <= p && (a.window == 0 || pos > p - a.window) &&
            (a.mode != 1 || pos < a.key_origin + a.key_rows);
@@ -91,8 +88,8 @@ __device__ inline int cache_row(const Args &a, int first, int i) {
     return a.ring > 0 ? (first + i) % a.ring : first + i;
 }
 
-/* The device re-check of the launch arguments (decision 0049 item 2): block-uniform, before
- * the first barrier. ORs mask 8 once; the caller's writes (or their absence) are the callers'. */
+/* The device re-check of the launch arguments: block-uniform, before the first barrier. ORs mask 8
+ * once; the caller's writes (or their absence) are the callers'. */
 __device__ inline bool bounds_ok(const Args &a) {
     const long long end = (long long)a.p0 + a.m;
     if (a.p0 < 0 || a.m < 1 || end > (a.mode == 0 && a.ring == 0 ? a.cache_rows : kMaxRows)) return false;
@@ -195,11 +192,11 @@ __device__ inline void load_kv_tile(const Args &a, const Block &b, int kvh, int 
 }
 #endif
 
-/* The fp32 SIMT kernel of sm_72 (compile-only in this packet, decision 0049 item 14), the
- * same block and partial cell as attn_prefill_part_dsplit_k: 128 threads, two per row (each owning
- * one half of the row's 256 dims), the same loaders, masking and part layout; the score halves
- * join with one shuffle, so both halves of a row see the same statistics in the same order.
- * An sm_80+ build traps here (the entry launches the tensor-core kernel there). */
+/* The fp32 SIMT kernel of sm_72 (compile-only: no board run), the same block and partial cell as
+ * attn_prefill_part_dsplit_k: 128 threads, two per row (each owning one half of the row's 256
+ * dims), the same loaders, masking and part layout; the score halves join with one shuffle, so both
+ * halves of a row see the same statistics in the same order. An sm_80+ build traps here (the entry
+ * launches the tensor-core kernel there). */
 template <int kHeadDim, int kGroup>
 __global__ void __launch_bounds__(128) attn_prefill_part_simt_k(Args a) {
 #if __CUDA_ARCH__ >= 800
@@ -301,7 +298,7 @@ __device__ inline void ldsm_x4(unsigned addr, unsigned (&r)[4]) {
                  : "r"(addr));
 }
 
-/* The same, transposed: lane T gets rows 2(T%4), 2(T%4)+1 of column T/4. */
+/* The same, transposed: lane number T gets rows 2(T%4), 2(T%4)+1 of column T/4. */
 __device__ inline void ldsm_x4_trans(unsigned addr, unsigned (&r)[4]) {
     asm volatile("ldmatrix.sync.aligned.m8n8.x4.trans.shared.b16 {%0,%1,%2,%3}, [%4];\n"
                  : "=r"(r[0]), "=r"(r[1]), "=r"(r[2]), "=r"(r[3])
@@ -334,9 +331,9 @@ __device__ inline void issue_kv_tile(const Args &a, const Block &b, int kvh, int
     cp_async_commit();
 }
 
-/* The lane's Q̂ A-fragments for rows r0 = 16 rg + g (token t0 + 2 rg) and r1 = r0 + 8 (the
- * next token), head G kvh + g, dims (D/4) dq + 16 ks + {c, c+1, c+8, c+9}: rounded to fp16
- * once, as CPF-ATTN-A's q̂; a token at or past tile_end loads zeros and reads no q. */
+/* The lane's Q̂ A-fragments for rows r0 = 16 rg + g (token t0 + 2 rg) and r1 = r0 + 8 (the next
+ * token), head G kvh + g, dims (D/4) dq + 16 ks + {c, c+1, c+8, c+9}: rounded to fp16 once (q̂); a
+ * token at or past tile_end loads zeros and reads no q. */
 template <int kHeadDim, int kGroup>
 __device__ inline void load_q_frags(const Args &a, const Block &b, int kvh, int rg, int dq,
                                     unsigned (&qf)[4][4]) {
@@ -361,15 +358,14 @@ __device__ inline void load_q_frags(const Args &a, const Block &b, int kvh, int 
 }
 #endif
 
-/* One block of the head_dim-quarter kernel (sm_80+): the block unit of CPF-ATTN-A's part kernel
- * (one query tile of 64 rows, one kv head, one split's keys; the same partial cell) over 16
- * warps. Warp w holds row group rg = w >> 2 (rows 16 rg .. +15) and head_dim quarter
- * dq = w & 3 (D/4 dimensions each): Q̂ in registers, its quarter of S = Q̂·K^T, and O for its
- * rows and dims. The four quarter partials of S are summed through shared memory in one
- * fixed order, so the four warps of a row group hold identical statistics and P̂.
- * K and V arrive by cp.async into two swizzled stages (one block barrier per tile) and
- * reach the MMAs by ldmatrix. Grid (q_tiles, n_kv_head, max_splits), the heaviest causal
- * tiles first; an sm_72 build traps here. */
+/* One block of the head_dim-quarter kernel (sm_80+): one query tile of 64 rows, one kv head and one
+ * split's keys, with the same partial cell as the other part kernels, over 16 warps. Warp w holds
+ * row group rg = w >> 2 (rows 16 rg .. +15) and head_dim quarter dq = w & 3 (D/4 dimensions each):
+ * Q̂ in registers, its quarter of S = Q̂·K^T, and O for its rows and dims. The four quarter
+ * partials of S are summed through shared memory in one fixed order, so the four warps of a row
+ * group hold identical statistics and P̂. K and V arrive by cp.async into two swizzled stages (one
+ * block barrier per tile) and reach the MMAs by ldmatrix. Grid (q_tiles, n_kv_head, max_splits),
+ * the heaviest causal tiles first; an sm_72 build traps here. */
 template <int kHeadDim, int kGroup>
 __global__ void __launch_bounds__(kThreadsD, 1) attn_prefill_part_dsplit_k(Args a) {
 #if __CUDA_ARCH__ >= 800
@@ -395,7 +391,7 @@ __global__ void __launch_bounds__(kThreadsD, 1) attn_prefill_part_dsplit_k(Args 
     load_q_frags<kHeadDim, kGroup>(a, b, kvh, rg, dq, qf);
     const int p_row0 = a.p0 + b.t0 + 2 * rg, p_row1 = p_row0 + 1;  // rows r0, r1
     /* Raw sinks and real-key maxima share natural units; convert only normalized deltas.
-     * Keep score products explicitly rounded in both mask paths (lane C MINOR-1). */
+     * Keep score products explicitly rounded in both mask paths. */
     const float score_scale = a.scale;
     /* ldmatrix lane roles: matrix mi = lane >> 3, row rr = lane & 7. K: key 16 np + 8 (mi >> 1)
      * + rr, chunk 8 dq + 2 ks + (mi & 1). V: key 16 ks + 8 (mi & 1) + rr, chunk 8 dq + 2 jp +
@@ -503,8 +499,8 @@ __global__ void __launch_bounds__(kThreadsD, 1) attn_prefill_part_dsplit_k(Args 
         const float mx[2] = {fmaxf(fmaxf(mq0.x, mq0.y), fmaxf(mq0.z, mq0.w)),
                              fmaxf(fmaxf(mq1.x, mq1.y), fmaxf(mq1.z, mq1.w))};
         const float m_new[2] = {fmaxf(m_run[0], mx[0]), fmaxf(m_run[1], mx[1])};
-        /* The no-key-yet rule (review BLOCKER-1, the B1 guard): exponentiate against 0 while
-         * the max is still -inf, so p = 0 and corr = 0 instead of NaN (exp2f(-inf) = 0). */
+        /* The no-key-yet rule: exponentiate against 0 while the max is still -inf, so p = 0 and
+         * corr = 0 instead of NaN (exp2f(-inf) = 0). */
         const float m_ref[2] = {m_new[0] == -INFINITY ? 0.f : m_new[0],
                                 m_new[1] == -INFINITY ? 0.f : m_new[1]};
         const float p[4] = {exp_score_delta(s2[0] - m_ref[0]), exp_score_delta(s2[1] - m_ref[0]),
@@ -882,10 +878,9 @@ PartArm arm_part() {
     return arm;
 }
 
-/* Enqueues both kernels. The part kernel is chosen and armed once per process, by a
- * function-local static with C++11 thread-safe initialisation (review m3). A failed arm is
- * cached too, so a transient failure stays permanent for the process; that assumes one
- * device per process, the engine's model. */
+/* Enqueues both kernels. The part kernel is chosen and armed once per process, by a function-local
+ * static with C++11 thread-safe initialisation. A failed arm is cached too, so a transient failure
+ * stays permanent for the process; that assumes one device per process, the engine's model. */
 template <int kHeadDim, int kGroup>
 Failure enqueue_typed(const Args &k, void *stream) {
     Failure failure;
@@ -910,14 +905,14 @@ Failure enqueue_typed(const Args &k, void *stream) {
 }
 
 #ifdef INFERENCE_CUDA_Q8_REFERENCE
-/* Everything in this block is FIXTURE-ONLY (A ruling 01a1839f): the production
- * enqueue and every non-test code path are byte-identical to main; this ifdef compiles
- * away in every production build. The tiled step-2 kernel and its helpers exist only so
- * the same-ELF fixture can drive them through inference_cuda_attn_prefill_q8_tiled_launch. */
+/* Everything in this block is fixture-only: this ifdef compiles away in every production build, so
+ * the production enqueue and every non-test code path never see it. The tiled step-2 kernel and its
+ * helpers exist only so the same-ELF fixture can drive them through
+ * inference_cuda_attn_prefill_q8_tiled_launch. */
 /* The group scalars depend only on (row, head, d/32). With group_size 32 a whole warp is one
  * group, so lane 0 can load them once per key and the per-element reloads disappear.
  * Addresses, conversions and the fmaf(scale, code, bias) formula stay identical to q8_value,
- * so every value is bit-identical; only the loads move (A ruling 01a18101). */
+ * so every value is bit-identical; only the loads move. */
 struct Q8GroupScalars {
     float scale, bias;
 };
@@ -941,18 +936,17 @@ __device__ inline float q8_code(const inference_cuda_attn_kv_view &v, int row, i
 }
 
 
-/* Tiled q8 part kernel (mode 0; enqueue_q8 selects it when kHeadDim == 128, both planes'
- * group_size is 32 and G <= 8 — Opus design review MF5): one block per (query tile, kv head,
- * split), the F16 dsplit shape, so the G query-head blocks that share a kv head stop
- * re-dequanting the same keys. kTile keys are cooperatively dequantized to smem f32,
- * double-buffered: tile n+1's raw bytes are prefetched into registers before tile n is
- * consumed (byte-granular loads; q8 bytes cannot cp.async on the fixtures' odd strides —
- * SF2). Warp g = GQA head g (padding warps g >= group only keep the barriers, SF3) and scans
- * the tile's tokens; each token's softmax is per key TILE (SF1): kTile butterfly-reduced
- * scores sit in registers, one tile max, one rescale, one expf per key — the per-key serial
- * chain of the scalar kernel is gone. Masking/poison rules, the (maximum, normalizer,
- * accumulator) contract, cell layout rr = (t - t0) * group + g and index order match
- * attn_prefill_part_q8_k; no atomics. */
+/* Tiled q8 part kernel (mode 0; enqueue_q8 selects it when kHeadDim == 128, both planes' group_size
+ * is 32 and G <= 8): one block per (query tile, kv head, split), the F16 dsplit shape, so the G
+ * query-head blocks that share a kv head stop re-dequanting the same keys. kTile keys are
+ * cooperatively dequantized to smem f32, double-buffered: tile n+1's raw bytes are prefetched into
+ * registers before tile n is consumed (byte-granular loads; q8 bytes cannot cp.async on the
+ * fixtures' odd strides). Warp g = GQA head g (padding warps g >= group only keep the barriers) and
+ * scans the tile's tokens; each token's softmax is per key TILE: kTile butterfly-reduced scores sit
+ * in registers, one tile max, one rescale, one expf per key — the per-key serial chain of the
+ * scalar kernel is gone. Masking/poison rules, the (maximum, normalizer, accumulator) contract,
+ * cell layout rr = (t - t0) * group + g and index order match attn_prefill_part_q8_k; no
+ * atomics. */
 template <int kHeadDim>
 __global__ void __launch_bounds__(256) attn_prefill_part_q8_tile_k(Args a,
                                                                   inference_cuda_attn_kv_pair views) {
@@ -999,13 +993,13 @@ __global__ void __launch_bounds__(256) attn_prefill_part_q8_tile_k(Args a,
             }
         }
     };
-    /* Dequant the PREFETCHED register bytes into one stage's k/v planes (SF1: consuming
+    /* Dequant the PREFETCHED register bytes into one stage's k/v planes (consuming
      * rawk/rawv here is what makes the double buffer real — reloading the globals would
      * leave the prefetch dead code). With group_size 32 each 4-float run stays inside one
      * group (same-group locality; q8_group_scalars still loads per element). Stores are
-     * float4-vectorized (SF3/Sol SF2): kRun 4 puts each lane's run at a 16 B stride, so
-     * a quarter-warp phase's 8 lanes touch all 32 banks exactly once — the 8-float runs
-     * of the previous respin left a measured-on-paper 2-way conflict, now removed. */
+     * float4-vectorized: kRun 4 puts each lane's run at a 16 B stride, so a quarter-warp
+     * phase's 8 lanes touch all 32 banks exactly once (8-float runs would leave a 2-way
+     * bank conflict). */
     auto store_tile = [&](int base, int stage) {
         const int end = min(base + kTileKey, b.k_end);
         float *kout = reinterpret_cast<float *>(q8tile + stage * kStageBytes);
@@ -1072,9 +1066,9 @@ __global__ void __launch_bounds__(256) attn_prefill_part_q8_tile_k(Args a,
             if (g < group) {
                 for (int j = 0; j < kTileKey; ++j) {
                     const int position = b.first + base + j;
-                    /* Sol MF1 (owed Opus SF2): skip by VISIBILITY, never by score value —
-                     * a visible key whose dot overflows to -inf must poison like the old
-                     * kernel (attn_prefill_part_q8_k), not be skipped to a silent 0. */
+                    /* Skip by VISIBILITY, never by score value — a visible key whose dot overflows
+                     * to -inf must poison like the old kernel (attn_prefill_part_q8_k), not be
+                     * skipped to a silent 0. */
                     const bool visible = base + j < b.k_end && position <= last &&
                                          (a.window <= 0 || position >= last - a.window + 1);
                     if (!visible) {
@@ -1088,7 +1082,7 @@ __global__ void __launch_bounds__(256) attn_prefill_part_q8_tile_k(Args a,
                         dot = fmaf(qf[i], ks[(size_t)j * kHeadDim + lane + i * kLanes], dot);
 #pragma unroll
                     for (int shift = kLanes / 2; shift > 0; shift >>= 1)
-                        dot += __shfl_xor_sync(0xffffffff, dot, shift);  // MF4: every lane scores
+                        dot += __shfl_xor_sync(0xffffffff, dot, shift);  // every lane scores
                     scores[j] = dot * a.scale;  // keep the visible value, even ±inf
                     tile_max = fmaxf(tile_max, scores[j]);
                 }
@@ -1131,11 +1125,10 @@ __global__ void __launch_bounds__(256) attn_prefill_part_q8_tile_k(Args a,
             for (int i = 0; i < kDims; ++i)
                 b.accs[(size_t)rr * kHeadDim + lane + i * kLanes] = acc[i];
         }
-        /* MF2 (Opus bee8b4539): the LAST tile of a token has no barrier of its own (the
-         * `more` barrier only fires between tiles), so the next token's store_tile into
-         * stage 0 could overwrite data slower warps are still reading. Every warp —
-         * padding warps included, hence the guard above instead of `continue` — must
-         * reach this barrier once per token. */
+        /* The LAST tile of a token has no barrier of its own (the `more` barrier only fires between
+         * tiles), so the next token's store_tile into stage 0 could overwrite data slower warps are
+         * still reading. Every warp — padding warps included, hence the guard above instead of
+         * `continue` — must reach this barrier once per token. */
         __syncthreads();
     }
 }
@@ -1312,10 +1305,9 @@ extern "C" int inference_cuda_attn_prefill_fault_bad_bounds_launch(
 }
 #endif
 #ifdef INFERENCE_CUDA_Q8_REFERENCE
-/* Same-ELF fixture entry (A ruling 01a18101): the OLD-path baseline. On this branch the
- * per-warp hoist is gone (A ruling 01a1839f), so the reference arm IS the default
- * production enqueue — identical admission, identical kernels. Kept as a separate symbol
- * so the fixture's arm routing and receipts stay stable. */
+/* Same-ELF fixture entry: the OLD-path baseline. The per-warp hoist is gone, so the reference arm
+ * IS the default production enqueue — identical admission, identical kernels. Kept as a separate
+ * symbol so the fixture's arm routing and receipts stay stable. */
 extern "C" int inference_cuda_attn_prefill_q8_reference_launch(
     const inference_cuda_attn_prefill_args *a, void *stream, int *out_stage) {
     try {
@@ -1333,10 +1325,9 @@ extern "C" int inference_cuda_attn_prefill_q8_reference_launch(
 }
 #endif
 #ifdef INFERENCE_CUDA_Q8_REFERENCE
-/* Same-ELF fixture entry (MF1, Opus bee8b4539): the ONLY caller that can reach the tiled
- * kernel; production launches never do. Fixture builds only (A ruling 01a1839f: the
- * production enqueue is byte-identical to main; this entry drives the fixture-only
- * enqueue_q8_tiled). The entry REFUSES shapes the tiled predicate would reject, so a
+/* Same-ELF fixture entry: the ONLY caller that can reach the tiled kernel; production launches
+ * never do. Fixture builds only (the production enqueue does not change; this entry drives the
+ * fixture-only enqueue_q8_tiled). The entry REFUSES shapes the tiled predicate would reject, so a
  * fixture run can never silently measure the old kernel under a tiled label. */
 extern "C" int inference_cuda_attn_prefill_q8_tiled_launch(
     const inference_cuda_attn_prefill_args *a, void *stream, int *out_stage) {

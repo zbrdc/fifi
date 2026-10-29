@@ -119,13 +119,12 @@ fn observe(
     fs::write(out.join("logits.f32le"), bytes)
 }
 
-// The original D1 RED target (`d1_decode_step_counter_target`, 49 evaluates
-// once per layer) retired at the flip fold: its expectation matches no
-// current regime (chain on = 13 group roots, unchained coalesced = 98, all
-// fences = 147) and the coalesce target below pins the live counts per arm.
+// No target pins one evaluate per layer (49): no current regime has that count (chain
+// on = 13 group roots, unchained coalesced = 98, all fences = 147), and the coalesce
+// target below pins the live counts per arm.
 
 #[test]
-#[ignore = "D1 first slice; loads Flint; run once with FIFI_FLINT_MLX_COALESCE_RESIDUAL=0 and once with =1 (default on), BOTH with FIFI_FLINT_MLX_ASYNC_CHAIN=0 (the chain subsumes the coalesce counts at 13 group roots); the harness compares the two metadata.json logits hashes for bitwise parity"]
+#[ignore = "residual coalesce; loads Flint; run once with FIFI_FLINT_MLX_COALESCE_RESIDUAL=0 and once with =1 (default on), BOTH with FIFI_FLINT_MLX_ASYNC_CHAIN=0 (the chain subsumes the coalesce counts at 13 group roots); the harness compares the two metadata.json logits hashes for bitwise parity"]
 fn d1_residual_coalesce_counter_target() -> io::Result<()> {
     let switched = crate::family::flint::mlx_forward::coalesce_residual_flagged();
     let chained = crate::family::flint::mlx_forward::async_chain_flagged();
@@ -151,15 +150,14 @@ fn d1_residual_coalesce_counter_target() -> io::Result<()> {
     Ok(())
 }
 
-/// D2 target (design scrch/7c82644c/flint-async-chain/DESIGN.md): the async chain
-/// evaluates layers N..N+3 as ONE graph, so `commit_chunk` loses its two host-ordered
-/// fences per layer (49x2 = 98 evaluates) and the route-health readbacks batch into the
-/// group roots (48 readbacks -> 1). Run once with FIFI_FLINT_MLX_ASYNC_CHAIN=0
-/// (the rollback env; the default is ON since the 2026-10-25 window) and once
-/// with =1 or unset; the harness compares the two metadata.json logits hashes
-/// for bitwise parity.
+/// Async-chain target: the async chain evaluates layers N..N+3 as ONE graph, so
+/// `commit_chunk` loses its two host-ordered fences per layer (49x2 = 98 evaluates) and
+/// the route-health readbacks batch into the group roots (48 readbacks -> 1). Run once
+/// with FIFI_FLINT_MLX_ASYNC_CHAIN=0 (the rollback env; the default is ON) and once with
+/// =1 or unset; the harness compares the two metadata.json logits hashes for bitwise
+/// parity.
 #[test]
-#[ignore = "D2 target; loads Flint and requires a separate parent-owned model window"]
+#[ignore = "async-chain target; loads Flint and requires a separate parent-owned model window"]
 fn d2_async_chain_counter_target() -> io::Result<()> {
     let chained = crate::family::flint::mlx_forward::async_chain_flagged();
     one_token_sync_profile()?;
@@ -170,19 +168,19 @@ fn d2_async_chain_counter_target() -> io::Result<()> {
     if chained {
         assert_eq!(
             profile["evaluate_calls"], 13,
-            "D2 roots one evaluate per 4-layer group: 49 layers -> 13 groups, not 98 fences"
+            "the chain roots one evaluate per 4-layer group: 49 layers -> 13 groups, not 98 fences"
         );
         assert_eq!(
             profile["readback_calls"], 1,
-            "D2 batches the route-health readbacks into the group roots: 48 -> 1"
+            "the chain batches the route-health readbacks into the group roots: 48 -> 1"
         );
-        // No import_calls assert: the 144 imports are D1-remaining scope; D2 owns
-        // evaluates, readbacks, and syncs only.
+        // No import_calls assert: the async chain changes evaluates, readbacks, and
+        // syncs only, not the 144 imports.
         assert!(
             profile["native_synchronizations"]
                 .as_u64()
                 .is_some_and(|syncs| syncs <= D2_SYNC_BOUND),
-            "D2 sync bound (run3-calibrated); unchained baseline is 290"
+            "async-chain sync bound; the unchained baseline is 290"
         );
     } else {
         assert_eq!(
@@ -199,9 +197,9 @@ fn d2_async_chain_counter_target() -> io::Result<()> {
     Ok(())
 }
 
-/// The unchained profile at the D2 design baseline measured 290 native synchronizations
-/// (98 evaluate fences + 48 health readbacks + 144 imports). The chain removes the fence
-/// and readback syncs (98 + 47) and adds 13 group roots + 1 readback, leaving the import
-/// syncs untouched: 290 - 145 + 14 = 159. Calibrated against the mac-attr3 run3
-/// per-class sync sums; revisit if run3 revises the 290 decomposition.
+/// The unchained profile measured 290 native synchronizations (98 evaluate fences + 48
+/// health readbacks + 144 imports). The chain removes the fence and readback syncs
+/// (98 + 47) and adds 13 group roots + 1 readback, leaving the import syncs untouched:
+/// 290 - 145 + 14 = 159. Calibrated against the per-class sync sums of a Mac run;
+/// revisit if a new run changes the 290 decomposition.
 const D2_SYNC_BOUND: u64 = 160;

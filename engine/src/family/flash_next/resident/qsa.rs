@@ -1,4 +1,4 @@
-//! Resident QSA step (S1-C plan section 2.3; decision 0039 item 6).
+//! Resident QSA step.
 //!
 //! A step appends one position and attends to the positions that the host rule selects
 //! (`flash_next/qsa.rs` lines 279-319). While every complete indexer block is selected (dense),
@@ -9,10 +9,10 @@
 //! synchronization. The raw indexer keys are appended in both cases.
 //!
 //! Retired bytes. A layer's step drops its old cache and its temporary tensors before the router
-//! readback of the same layer, which is the next synchronization (decision 0039). The retire list
-//! counts the full `byte_len` of every dropped tensor, so a view (slice, reshape, transpose) counts
-//! as much as a copy. The table gives the bytes per position of the real model (KVH 2, D 256, QH 24,
-//! ID 128, IQ 4, ratio 4, F32). `T` is the visible positions, and `blocks` is about `T / 4`.
+//! readback of the same layer, which is the next synchronization. The retire list counts the full
+//! `byte_len` of every dropped tensor, so a view (slice, reshape, transpose) counts as much as a
+//! copy. The table gives the bytes per position of the real model (KVH 2, D 256, QH 24, ID 128,
+//! IQ 4, ratio 4, F32). `T` is the visible positions, and `blocks` is about `T / 4`.
 //!
 //! | Tensor dropped in one layer step | Bytes per position |
 //! | --- | --- |
@@ -44,9 +44,9 @@ use crate::{
     tensor::ExecutionTensor,
 };
 
-/// The largest context of the resident QSA path: the 32,768 positions of the memory table in the
-/// S1-C plan. A step at this position or beyond returns `ContextLimit`. The load-time block
-/// constants cover exactly this many positions.
+/// The largest context of the resident QSA path: 32,768 positions, the size that the memory plan
+/// covers. A step at this position or beyond returns `ContextLimit`. The load-time block constants
+/// cover exactly this many positions.
 pub(super) const MAX_POSITIONS: u32 = 32_768;
 
 /// The additive attention mask of a dropped block. `exp` of it underflows to 0 in F32.
@@ -389,7 +389,7 @@ mod tests {
             .collect()
     }
 
-    /// Asserts cos >= 0.99999 and max |a - e| / max |e| <= 1e-4 (plan section 4, option B).
+    /// Asserts cos >= 0.99999 and max |a - e| / max |e| <= 1e-4.
     fn assert_parity(actual: &[f32], expected: &[f32], what: &str) {
         assert_eq!(actual.len(), expected.len(), "{what}: length");
         let (mut dot, mut aa, mut ee, mut diff, mut top) = (0f64, 0f64, 0f64, 0f64, 0f64);
@@ -1006,13 +1006,14 @@ mod tests {
         }
     }
 
-    /// Decision 0039 gate 4, layer level. The first QSA layer of the real model runs on
+    /// The resident QSA parity check, layer level. The first QSA layer of the real model runs on
     /// pseudo-random inputs through the host path and the resident path for more than 2,060
-    /// positions. The test compares outputs at the block tolerance and classifies each sparse step by
-    /// its selection margin: the score gap between the last kept and the first dropped block, in the
-    /// host score scale (the device sum divided by sqrt(ID)). A margin above 1e-5 is strict. Two
-    /// exact zeros are an exact tie, which both paths resolve to the lower block index. Any other gap
-    /// is ambiguous and fails the test, because float rounding could rank such blocks differently.
+    /// positions. The test compares outputs at the block tolerance and classifies each sparse step
+    /// by its selection margin: the score gap between the last kept and the first dropped block, in
+    /// the host score scale (the device sum divided by sqrt(ID)). A margin above 1e-5 is strict.
+    /// Two exact zeros are an exact tie, which both paths resolve to the lower block index. Any
+    /// other gap is ambiguous and fails the test, because float rounding could rank such blocks
+    /// differently.
     #[test]
     #[ignore = "needs the Flash-Next artifact on the Mac"]
     fn resident_sparse_qsa_layer_matches_the_host_past_2060_positions() {
@@ -1112,9 +1113,9 @@ mod tests {
         assert!(gate.failures.is_empty(), "{:?}", gate.failures);
     }
 
-    /// Decision 0039 gate 4, model level. The resident path and the host path run the same
-    /// synthetic prompt of `FLASH_NEXT_QSA_TOKENS` tokens (default 2,070). The last 4 resident steps
-    /// run in `Record` mode and the others in `Prompt` mode. Qualification builds check the
+    /// The resident QSA parity check, model level. The resident path and the host path run the same
+    /// synthetic prompt of `FLASH_NEXT_QSA_TOKENS` tokens (default 2,070). The last 4 resident
+    /// steps run in `Record` mode and the others in `Prompt` mode. Qualification builds check the
     /// synchronization budget of every sparse step: `L + 2` in `Prompt` and `L + 5` in `Record`.
     /// The test compares the logits of the last 4 steps at the end-to-end tolerance, and the greedy
     /// token when the host margin is above 0.1. It also checks that each step charges 55,296 bytes

@@ -1,6 +1,6 @@
-//! What the executor needs to know about the model beyond the step (decision 0033, packet
-//! RD-9d): the end-of-sequence ids and the width of the vocabulary the sampler draws from. They
-//! become the `Limits` of the shared `DecodeSession` (`family/session.rs`). Pure host values.
+//! What the executor needs to know about the model beyond the step: the end-of-sequence ids and
+//! the width of the vocabulary the sampler draws from. They become the `Limits` of the shared
+//! `DecodeSession` (`family/session.rs`). Pure host values.
 //!
 //! The ids are shared (`Arc<[u32]>`), so a `decode` call can hold them while it borrows the step
 //! mutably, without copying the list.
@@ -18,8 +18,7 @@ pub(crate) struct QwenRules {
 impl QwenRules {
     /// `sampler_vocab` must lie in `1..=head_vocab`, the width of the model head, and `eos`
     /// must be a non-empty list of distinct ids inside `0..sampler_vocab`: an id the sampler
-    /// can never draw is not an end-of-sequence id (the RD-9d1 c6 message promises both
-    /// refusals).
+    /// can never draw is not an end-of-sequence id.
     pub(crate) fn new(
         eos: Vec<u32>,
         sampler_vocab: usize,
@@ -90,9 +89,8 @@ pub(super) struct StepWidths {
 /// Refuses a token id outside the sampler vocabulary before any device write. The embedding
 /// table is padded to `head_rows` rows and its own guard refuses only ids at or above the table,
 /// so an id in `sampler_vocab..head_rows` (a padding row inside the table) would embed and run;
-/// the argmax can never choose such an id, so the host input is refused here instead (R-3
-/// report, section 5). `sampler_width` is the width the step wires in (`StepWidths`), never the
-/// padded head width.
+/// the argmax can never choose such an id, so the host input is refused here instead.
+/// `sampler_width` is the width the step wires in (`StepWidths`), never the padded head width.
 pub(super) fn check_token_id(token: u32, sampler_width: usize) -> Result<(), EngError> {
     if usize::try_from(token).is_ok_and(|token| token >= sampler_width) {
         return Err(EngError::BadRequest(format!(
@@ -105,7 +103,7 @@ pub(super) fn check_token_id(token: u32, sampler_width: usize) -> Result<(), Eng
 /// Every refusal `QwenResidentStep::new` makes before it touches the context, in one pure seam:
 /// the session options ([`check_stage1_options`]), then the head width ([`check_vocab`]), then
 /// the widths the step wires in. The step itself needs a `CudaContext` and cannot run on the
-/// CPU, so these refusals are tested here instead (lane C review, RD-9d c16).
+/// CPU, so these refusals are tested here instead.
 pub(super) fn validate_step_inputs(
     options: &StepOptions,
     head_rows: usize,

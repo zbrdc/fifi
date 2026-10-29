@@ -1,13 +1,12 @@
 //! Seam-1 device tests (3090) of the DeltaNet conv wrapper: the Rust wrapper against the C shim
 //! against the vendored `conv_silu_k`, compared with an f64 host reference written for the
 //! Qwen3.6 GGUF semantics (window `(s0, s1, s2, x)`, tap 0 on the oldest input, then SiLU) and
-//! with the RD-M6 llama.cpp dumps.
+//! with the llama.cpp dumps.
 //!
 //! Every device buffer carries 256 floats of NaN sentinel before and after the used bytes; the
 //! sentinels, the unused pad columns of `proj` and the inputs must be unchanged after a launch.
 //! Each refusal is checked by the text of its error, so a test fails when another check refuses
-//! the call instead of the one under test. The suite runs with `--test-threads=1` (decision
-//! 0040).
+//! the call instead of the one under test. The suite runs with `--test-threads=1`.
 
 use std::path::{Path, PathBuf};
 
@@ -16,7 +15,7 @@ use crate::EngError;
 use crate::kernels::cuda::testkit::{self, Rng};
 use crate::kernels::cuda::{CudaContext, DeviceBuffer, DeviceRange, DeviceStream};
 
-/// Class E1 (frozen, lane M REPLY-44): `max|d| <= 2^-20 * max(max|ref|, 1)` per output vector
+/// Class E1 (frozen): `max|d| <= 2^-20 * max(max|ref|, 1)` per output vector
 /// against an f64 reference; the conv is a 4-term dot plus `x / (1 + __expf(-x))`.
 const E1: f64 = 1.0 / 1_048_576.0;
 /// Floats of sentinel before and after every buffer's used bytes.
@@ -27,9 +26,9 @@ const SENT: u32 = 0x7fc0_dead;
 const L2_EPS: f64 = 1e-6;
 /// Decode rows of the oracle dump that the Q8_0 emulation of the fixture misses (layer, first
 /// row, last row): the quantization of one `attn_norm` input there differs from llama.cpp's, so
-/// the fixture input is wrong at that step (RD-7a.md "Evidence status"; the propagation fit of
-/// `conv_check.py` confirms one wrong conv input). Only the comparison with the dump skips these
-/// rows; the kernel is held to `ref_conv` on every row, these included.
+/// the fixture input is wrong at that step (the propagation fit of `conv_check.py` confirms one
+/// wrong conv input). Only the comparison with the dump skips these rows; the kernel is held to
+/// `ref_conv` on every row, these included.
 const MASKED: &[(usize, usize, usize)] = &[(38, 91, 94)];
 
 struct Rig {

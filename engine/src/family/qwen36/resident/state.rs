@@ -1,20 +1,19 @@
-//! Resident Q36 session state (packet Q36-D), with the step's check, poison, and commit.
+//! Resident Q36 session state, with the step's check, poison, and commit.
 //!
 //! DeltaNet layers keep a recurrent state `[VH, VD, KD]` and a convolution ring `[CD, CK - 1]`.
-//! Attention layers keep a key-value cache in preallocated capacity buffers written in place
-//! (packets Q36-KV-INTEGRATE and KV8-INTEGRATE): in the F32 control `[1, KVH, cap, D]` per key
-//! and value tensor, in the Q8 form the codes `[1, KVH, cap, D/4]` beside scales and biases
-//! `[1, KVH, cap, D/64]` of the activation dtype, `len` valid positions, growth in `KV_STEP`
-//! quanta. The growth charge covers the cache only, as in the Flash-Next decoder (decision
-//! 0039 amendment), and stays LOGICAL — `len` positions of growth bytes per layer, from the
-//! cache form and the activation dtype — so the capacity slack, bounded by one `KV_STEP` of
-//! growth bytes per attention layer (256 * 4,096 * 10 = 10,485,760 bytes on the real model in
-//! the F32 form; 256 * 1,088 * 10 = 2,785,280 at Q8 with BF16 scales), never enters a permit;
-//! `kv_storage_bytes` reports the stored bytes. The slack bound excludes the growth TRANSIENT —
-//! the old buffer, its slice copy, and the new buffer alive together at a growth, about 100 MB
-//! per layer at depth 8,192 in the F32 form — which the session reserve margin and the retire
-//! cap cover. The fixed DeltaNet state of 65,863,680 bytes is not charged by the steps; a
-//! snapshot charges it once with its entry (decision 0036, addendum 1).
+//! Attention layers keep a key-value cache in preallocated capacity buffers written in place: in
+//! the F32 control `[1, KVH, cap, D]` per key and value tensor, in the Q8 form the codes
+//! `[1, KVH, cap, D/4]` beside scales and biases `[1, KVH, cap, D/64]` of the activation dtype,
+//! `len` valid positions, growth in `KV_STEP` quanta. The growth charge covers the cache only, as
+//! in the Flash-Next decoder, and stays LOGICAL — `len` positions of growth bytes per layer, from
+//! the cache form and the activation dtype — so the capacity slack, bounded by one `KV_STEP` of
+//! growth bytes per attention layer (256 * 4,096 * 10 = 10,485,760 bytes on the real model in the
+//! F32 form; 256 * 1,088 * 10 = 2,785,280 at Q8 with BF16 scales), never enters a permit;
+//! `kv_storage_bytes` reports the stored bytes. The slack bound excludes the growth TRANSIENT — the
+//! old buffer, its slice copy, and the new buffer alive together at a growth, about 100 MB per
+//! layer at depth 8,192 in the F32 form — which the session reserve margin and the retire cap
+//! cover. The fixed DeltaNet state of 65,863,680 bytes is not charged by the steps; a snapshot
+//! charges it once with its entry.
 
 use super::attn::{KvCache, growth_bytes};
 use super::kv_plan::{KV_STEP, session_bytes};
@@ -29,7 +28,7 @@ use crate::{
 };
 use std::sync::atomic::{AtomicU64, Ordering};
 
-/// The global lineage counter of attention-buffer sets (Q-R1): every `zero_with` draws a
+/// The global lineage counter of attention-buffer sets: every `zero_with` draws a
 /// fresh unique generation, so a snapshot restores only into the state whose buffers it
 /// aliased - a separately-zeroed state never matches, and a reset draws a new generation for
 /// its fresh buffers.
@@ -60,7 +59,7 @@ impl LayerState {
 }
 
 /// Bytes that one more token adds to the stored caches of all attention layers, from the cache
-/// form and the activation dtype (packet KV8-INTEGRATE item 5): the F32 control charges
+/// form and the activation dtype: the F32 control charges
 /// `layers * KVH * D * 2 * 4` and the Q8 form the codes plus the activation-dtype scales and
 /// biases.
 pub(super) fn kv_growth_bytes(weights: &ResidentWeights) -> Result<u64, EngError> {
@@ -96,7 +95,7 @@ pub(super) fn chunk_growth_bytes(weights: &ResidentWeights, rows: u32) -> Result
         .ok_or_else(|| EngError::MemoryPlan("kv chunk growth bytes overflow u64".into()))
 }
 
-/// The LOGICAL bytes of the attention caches in `layers` (packet Q36-KV-INTEGRATE): one
+/// The LOGICAL bytes of the attention caches in `layers`: one
 /// `kv_plan::session_bytes` charge — the attention layer count, the valid length they hold, and
 /// the PER-LAYER growth — because every attention layer of a committed, snapshotted, or restored
 /// state holds the same valid length, the position (`check_step` before a step,
@@ -134,7 +133,7 @@ fn kv_bytes_at_len(layers: &[LayerState], len_override: Option<usize>, per_layer
 }
 
 /// Bytes that the attention cache tensors of `layers` store: the capacity buffers summed from
-/// the tensors' own sizes, slack included (packet Q36-KV-INTEGRATE). Reports and tests read this;
+/// the tensors' own sizes, slack included. Reports and tests read this;
 /// the admission charge is `kv_bytes`.
 pub(super) fn kv_storage_bytes(layers: &[LayerState]) -> u64 {
     layers
@@ -184,8 +183,8 @@ fn check_saved_layer(
             }
         }
         (RMixer::Attn(_), LayerState::Attn(cache)) => {
-            // The form and the shapes of every buffer, with no native call (packet
-            // KV8-INTEGRATE: a saved cache of another form or shape is refused).
+            // The form and the shapes of every buffer, with no native call: a saved cache of
+            // another form or shape is refused.
             let form_ok = cache
                 .check_buffers(dim(a.heads_kv)?, dim(a.head_dim)?, weights.kv)
                 .is_ok();
@@ -212,12 +211,12 @@ fn check_saved_layer(
 pub(super) struct ResidentSnapshot {
     /// Every layer state shared (Delta tensors AND the attention caches' capacity buffers,
     /// zero-copy handles): an adoption restore takes them wholesale, so a snapshot of one
-    /// conversation restores into another whose state was reset (Q-R1 slice 3b).
+    /// conversation restores into another whose state was reset.
     layers: Vec<LayerState>,
     pos: u32,
     /// The entry's own charge: the fixed DeltaNet bytes plus the page-table allowance.
     charge: GrowthPermit,
-    /// Co-owned shares of the source state's KV growth permits (Q-R1 shared-charge, (a)):
+    /// Co-owned shares of the source state's KV growth permits:
     /// the budget counts the KV bytes once while the source state or this snapshot lives,
     /// and the last holder's drop releases them.
     kv_permits: Vec<GrowthPermit>,
@@ -253,12 +252,12 @@ pub(super) struct ResidentState {
     layers: Vec<LayerState>,
     pos: u32,
     poisoned: bool,
-    /// The identity of this state's attention-cache buffers for the Q-R1 generation guard: a
+    /// The identity of this state's attention-cache buffers for the generation guard: a
     /// snapshot restores only into a state whose buffers still hold its positions, so `reset`
     /// and `restore` bump this counter and a stale snapshot is refused instead of silently
     /// aliasing a rewritten cache.
     generation: u64,
-    /// The highest position this state's buffers have ever held (Q-R1 slice 3b): a commit
+    /// The highest position this state's buffers have ever held: a commit
     /// that writes below it rewrites previously-published ground (a rewind followed by a
     /// divergent step), so it draws a fresh generation and every older snapshot of the
     /// rewritten positions stops restoring. A commit at or above it extends new ground and
@@ -269,13 +268,11 @@ pub(super) struct ResidentState {
     permits: Vec<GrowthPermit>,
     /// The LOGICAL growth bytes of ONE position of ONE attention layer
     /// (`attn::growth_bytes(&weights.shape, weights.kv, activation)`), fixed at `zero`. `kv_bytes`
-    /// multiplies it by the
-    /// attention layer count and the valid length, so a state at `pos` charges exactly
-    /// `pos * kv_growth_bytes(weights)` — the all-layer growth — which the permits hold (packet
-    /// Q36-KV-INTEGRATE fix1 item 1).
+    /// multiplies it by the attention layer count and the valid length, so a state at `pos` charges
+    /// exactly `pos * kv_growth_bytes(weights)` — the all-layer growth — which the permits hold.
     kv_growth_per_layer: u64,
     /// The growth quantum of the attention caches, in positions: `KV_STEP` for `zero` and the
-    /// test step for `zero_with_step`. `reset` keeps it (fix1 item 3.5).
+    /// test step for `zero_with_step`. `reset` keeps it.
     kv_step: usize,
 }
 
@@ -356,8 +353,8 @@ impl ResidentState {
     }
 
     /// Test-only: leaves the state as a failed step leaves it — poisoned, its layer states taken
-    /// out, and the permits of its committed steps kept — without a native failure, which decision
-    /// 0032 makes terminal for the whole process.
+    /// out, and the permits of its committed steps kept — without a native failure, which is
+    /// terminal for the whole process.
     #[cfg(test)]
     pub(super) fn poison_for_test(&mut self) {
         self.poisoned = true;
@@ -375,7 +372,7 @@ impl ResidentState {
     /// `ContextLimit`. A layer kind, cache length, or attention buffer shape — the `[1, KVH, cap, D]`
     /// pair with `cap >= len`, the same check as `KvCache::check_buffers` — that differs from the
     /// weights or the position returns `BadRequest`, so every host validation of the step runs
-    /// before the first native call and before any buffer is consumed (fix1 item 3.3).
+    /// before the first native call and before any buffer is consumed.
     pub(super) fn check_step(
         &self,
         weights: &ResidentWeights,
@@ -455,7 +452,7 @@ impl ResidentState {
     }
 
     /// Bytes held by the permits of the committed steps. Public to the executor for the
-    /// pool-derived prompt ceiling (fix EV-2): the bytes the session's next reset releases.
+    /// pool-derived prompt ceiling: the bytes the session's next reset releases.
     pub(super) fn charged_bytes(&self) -> Result<u64, EngError> {
         self.permits
             .iter()
@@ -476,7 +473,7 @@ impl ResidentState {
 
     /// Publishes a step of `rows` tokens after its `evaluate` and readbacks succeeded. It keeps
     /// `permit` only if the total charge equals the LOGICAL cache bytes (`len` positions of
-    /// growth per layer; packet Q36-KV-INTEGRATE). Otherwise it returns `MemoryPlan`, drops
+    /// growth per layer). Otherwise it returns `MemoryPlan`, drops
     /// `permit`, and changes nothing.
     pub(super) fn commit_rows(
         &mut self,
@@ -485,7 +482,7 @@ impl ResidentState {
         permit: GrowthPermit,
     ) -> Result<(), EngError> {
         let pos = self.check_commit_rows(rows, &layers, &permit)?;
-        // Q-R1 slice 3b: writing below the high-water mark rewrites published ground - draw
+        // Writing below the high-water mark rewrites published ground - draw
         // a fresh generation so snapshots of the rewritten positions stop restoring.
         if self.pos < self.high_water {
             self.generation = BUFFER_GENERATION.fetch_add(1, Ordering::Relaxed);
@@ -535,7 +532,7 @@ impl ResidentState {
                 "a poisoned resident state cannot be saved".into(),
             ));
         }
-        // Q-R1: the entry charges the fixed DeltaNet bytes plus the bounded page-table
+        // The entry charges the fixed DeltaNet bytes plus the bounded page-table
         // allowance of its alias - never the KV of its positions.
         let pages = allowance_pages(self.pos);
         let allowance = pages
@@ -556,7 +553,7 @@ impl ResidentState {
         })
     }
 
-    /// Rewinds this live state to the snapshot's position (Q-R1). It makes no native call and
+    /// Rewinds this live state to the snapshot's position. It makes no native call and
     /// copies no array: the attention caches stay exactly as they are (the generation guard
     /// proved this state's buffers still hold the snapshot's positions, and the cache only
     /// appends), the DeltaNet tensors swap to the snapshot's shared handles (a step on a
@@ -572,20 +569,19 @@ impl ResidentState {
         budget: &mut SessionBudget,
     ) -> Result<(), EngError> {
         if snapshot.generation != self.generation {
-            // Q-R1 slice 3b (option (e), the guard is not too coarse - it is ADOPTIVE): a
-            // mismatched generation means the live state is NOT the one the snapshot came
-            // from (the executor's prefix reuse restores into a RESET session, a fresh
-            // generation). The snapshot shares EVERY layer - the attention caches' capacity
-            // buffers included - so the live state ADOPTS them wholesale: its own layers,
-            // position, and generation become the snapshot's, and the permits rebuild to
-            // the adopted extent. This replaces the refusal that broke the 12-turn replay.
-            // The layer layout must still match the model weights before adoption.
+            // A mismatched generation means the live state is NOT the one the snapshot came from
+            // (the executor's prefix reuse restores into a RESET session, a fresh generation). The
+            // snapshot shares EVERY layer - the attention caches' capacity buffers included - so
+            // the live state ADOPTS them wholesale: its own layers, position, and generation become
+            // the snapshot's, and the permits rebuild to the adopted extent. A refusal here would
+            // break prefix reuse across turns. The layer layout must still match the model weights
+            // before adoption.
             if snapshot.layers.len() != weights.layers.len() {
                 return Err(EngError::BadRequest(
                     "snapshot layers do not match the model weights".into(),
                 ));
             }
-            // Acquire BEFORE release (review B2): a MemoryPlan denial must leave the
+            // Acquire BEFORE release: a MemoryPlan denial must leave the
             // state unchanged (the documented error contract). The adopted extent's
             // permit is acquired first; only on success are the old layers replaced and
             // the old permits dropped.
@@ -597,11 +593,11 @@ impl ResidentState {
             // Success: replace the state (the old permits drop, releasing their charge).
             self.layers = adopted_layers;
             self.pos = adopted_pos;
-            // Q-R1 review blocker 1: adoption MINTS a fresh generation instead of rejoining
-            // the snapshot old one. A rejoined generation let a later restore of a larger
-            // same-lineage snapshot take the rewind fast path over the adoptee own rewritten
-            // caches - fabricated history with no error. A minted generation is held by no
-            // existing snapshot, so every later restore adopts wholesale.
+            // Adoption MINTS a fresh generation instead of rejoining the snapshot's old one. A
+            // rejoined generation would let a later restore of a larger same-lineage snapshot take
+            // the rewind fast path over the adoptee's own rewritten caches - fabricated history
+            // with no error. A minted generation is held by no existing snapshot, so every later
+            // restore adopts wholesale.
             self.generation = BUFFER_GENERATION.fetch_add(1, Ordering::Relaxed);
             drop(std::mem::take(&mut self.permits));
             self.permits = vec![new_permit];
@@ -646,11 +642,11 @@ impl ResidentState {
                 "snapshot layers do not match the model weights".into(),
             ));
         }
-        // Q-R1 review blocker 2: acquire the rewound permit BEFORE any mutation. The old
-        // order (swap, rewind pos and lens, then drop and acquire) could be denied
-        // mid-restore under shared-charge pins - permits pinned by surviving snapshots
-        // release nothing on drop - leaving a half-rewound state. A denial now returns
-        // before the first mutation, with pos, layers, and permits exactly as they were.
+        // Acquire the rewound permit BEFORE any mutation. The opposite order (swap, rewind pos and
+        // lens, then drop and acquire) could be denied mid-restore under shared-charge pins -
+        // permits pinned by surviving snapshots release nothing on drop - leaving a half-rewound
+        // state. A denial returns before the first mutation, with pos, layers, and permits exactly
+        // as they were.
         let rewind_len = usize::try_from(snapshot.pos)
             .map_err(|_| EngError::BadRequest("the rewind position overflows usize".into()))?;
         let rewound = kv_bytes_at_len(&self.layers, Some(rewind_len), self.kv_growth_per_layer);
@@ -690,10 +686,9 @@ impl ResidentState {
     }
 
     /// Replaces this state with a fresh zero state. On error the state is unchanged. The state
-    /// keeps its growth quantum: a state made with `zero_with_step` resets to the same step, not
-    /// to `KV_STEP` (fix1 item 3.5). A reset REWRITES the attention buffers (a fresh zero holds
-    /// new arrays), so it bumps the generation and every snapshot of the old generation stops
-    /// restoring (Q-R1).
+    /// keeps its growth quantum: a state made with `zero_with_step` resets to the same step, not to
+    /// `KV_STEP`. A reset REWRITES the attention buffers (a fresh zero holds new arrays), so it
+    /// bumps the generation and every snapshot of the old generation stops restoring.
     pub(super) fn reset(
         &mut self,
         kernels: &mut MlxKernels,
@@ -701,7 +696,7 @@ impl ResidentState {
     ) -> Result<(), EngError> {
         let kv_step = self.kv_step;
         // A reset builds fresh zero buffers, and `zero_with` draws a fresh unique generation,
-        // so every snapshot of the old buffers stops restoring (Q-R1).
+        // so every snapshot of the old buffers stops restoring.
         *self = Self::zero_with(kernels, weights, kv_step)?;
         Ok(())
     }
@@ -749,7 +744,7 @@ mod snapshot_tests {
         (ckpt, host)
     }
 
-    /// The tiny KV8 checkpoint and its host weights (packet KV8-INTEGRATE): head dimension 64.
+    /// The tiny KV8 checkpoint and its host weights: head dimension 64.
     fn load_kv8() -> (StreamedCheckpoint, HostWeights) {
         let ckpt = tiny::checkpoint(&tiny::TINY_KV8);
         let host =
@@ -829,7 +824,7 @@ mod snapshot_tests {
     }
 
     /// The per-element 8-bit affine error bound and the largest magnitude of the valid F32 cache
-    /// rows of one state (packet KV8-INTEGRATE): per group of 64 lanes the error is about
+    /// rows of one state: per group of 64 lanes the error is about
     /// `(max - min) / 510`, measured over the valid positions of both key-value heads of both
     /// attention caches. A buffer is `[1, KVH, cap, D]`, so element (g, t, d) sits at
     /// `(g * cap + t) * D + d`, and the slack above `len` does not count.
@@ -936,7 +931,7 @@ mod snapshot_tests {
 
     /// Reads back the state that `layers` holds, in the order of `arrays`. An attention cache
     /// reads only its first `len` positions: the rows beyond `len` are capacity slack with no
-    /// value (packet Q36-KV-INTEGRATE).
+    /// value.
     /// The DeltaNet arrays of a state selected by kind: the layer layout interleaves Delta
     /// and attention layers, so a positional slice cannot pick them.
     fn live_delta(dec: &mut ResidentDecoder<'_>, state: &ResidentState) -> Vec<Vec<f32>> {
@@ -1000,7 +995,7 @@ mod snapshot_tests {
         let alias_allowance = 3 * KV_PER_TOKEN / 100;
         assert!(
             snapshot.charged_bytes() <= FIXED_BYTES + alias_allowance,
-            "Q-R1: snapshot charged {} bytes; expected at most fixed {} plus alias allowance {}",
+            "snapshot charged {} bytes; expected at most fixed {} plus alias allowance {}",
             snapshot.charged_bytes(),
             FIXED_BYTES,
             alias_allowance
@@ -1065,7 +1060,7 @@ mod snapshot_tests {
         let mut state = decoder.zero_state().unwrap();
         prefill(&mut decoder, &mut state, &[1]);
         // A poisoned state without a failed step: a real native failure marks the process-wide
-        // native owner terminal (decision 0032), so the test sets the poison directly.
+        // native owner terminal, so the test sets the poison directly.
         state.poison_for_test();
         assert!(state.is_poisoned(), "the state is poisoned for the test");
         let saved = decoder.snapshot(&state);
@@ -1106,7 +1101,7 @@ mod snapshot_tests {
             live.check_step(&decoder.weights, 32).is_ok(),
             "check_step after the rewind"
         );
-        // The rewind under shared-charge (Q-R1 3b (a)): the live state drops its permits
+        // The rewind under shared-charge: the live state drops its permits
         // and re-acquires the rewound extent, but the snapshot's co-owned shares of [0, 3)
         // keep the base charged, so the net budget change is zero - the growth above the
         // rewind point releases, and the snapshot's base re-charges through the new permit.
@@ -1185,7 +1180,7 @@ mod snapshot_tests {
         assert_eq!(after, saved_before, "the rewind returns the saved values");
     }
 
-    /// Packet Q36-KV-INTEGRATE item 4: a snapshot taken before further steps keeps its own
+    /// A snapshot taken before further steps keeps its own
     /// values. The caches grow in quanta of 3, so the snapshot at position 2 shares a buffer
     /// whose next append on the live state would write in place (the operation copies a shared
     /// buffer once), the fourth token grows the buffers to 6, and the seventh to 9. The rows
@@ -1215,7 +1210,7 @@ mod snapshot_tests {
         // The live state really crossed the growth boundaries: caps 3 -> 6 -> 9.
         assert_eq!(kv_caps(live.layers()), vec![9, 9], "both caches grew twice");
         // Rewinding the live state to the snapshot and running the same suffix gives the
-        // straight run (Q-R1: the restore rewinds this state, it does not build a new one).
+        // straight run (the restore rewinds this state, it does not build a new one).
         decoder.restore(&mut live, &snapshot).unwrap();
         assert_eq!(live.pos(), 2, "the rewind returns to the snapshot position");
         for (index, &token) in suffix.iter().enumerate() {
@@ -1232,9 +1227,9 @@ mod snapshot_tests {
         assert_eq!(live.pos(), 9, "position after the suffix");
     }
 
-    /// Packet Q36-KV-INTEGRATE item 6(d): after 30 steps with the default quantum (the test decoder's context limit is 32 positions) the actual
-    /// storage (the sum of the tensors' `byte_len`) is exactly one quantum of capacity per
-    /// attention layer, that is the logical bytes plus the unused `KV_STEP - 30` positions.
+    /// After 30 steps with the default quantum (the test decoder's context limit is 32 positions)
+    /// the actual storage (the sum of the tensors' `byte_len`) is exactly one quantum of capacity
+    /// per attention layer, that is the logical bytes plus the unused `KV_STEP - 30` positions.
     #[test]
     fn the_cache_storage_exceeds_the_logical_bytes_by_exactly_the_unused_quantum() {
         let _serial = crate::native_test_lock();
@@ -1250,7 +1245,7 @@ mod snapshot_tests {
             vec![30, 30],
             "both caches hold the run"
         );
-        // The exact hand-derived storage (review B finding 4): 30 positions of the default
+        // The exact hand-derived storage: 30 positions of the default
         // quantum 256 round up to one step of capacity per layer, so the buffers hold exactly
         // `KV_STEP * KV_PER_TOKEN` bytes, not any capacity in [30, 30 + 256].
         assert_eq!(
@@ -1279,7 +1274,7 @@ mod snapshot_tests {
         prefill(&mut decoder, &mut live, &[1, 2, 3]);
         let snapshot = decoder.snapshot(&live).unwrap();
         // A poisoned live state without a failed step: a real native failure marks the
-        // process-wide native owner terminal (decision 0032), so the test poisons directly,
+        // process-wide native owner terminal, so the test poisons directly,
         // with the layer states taken out as a failed step leaves them.
         live.poison_for_test();
         assert!(live.is_poisoned(), "the state is poisoned for the test");
@@ -1290,9 +1285,9 @@ mod snapshot_tests {
             rejected.err()
         );
         assert!(live.is_poisoned(), "the refusal keeps the poison");
-        // A reset builds a fresh generation; the restore ADOPTS the snapshot wholesale
-        // (Q-R1 slice 3b option (e)): layers, position, and generation become the
-        // snapshot's, so the state is live at the snapshot's position again.
+        // A reset builds a fresh generation; the restore ADOPTS the snapshot wholesale: layers,
+        // position, and generation become the snapshot's, so the state is live at the snapshot's
+        // position again.
         decoder.reset(&mut live).unwrap();
         let adopted = decoder.restore(&mut live, &snapshot);
         assert!(
@@ -1315,7 +1310,7 @@ mod snapshot_tests {
         let mut decoder = decoder_with_cap(&ckpt, host, 100_000);
         let mut live = decoder.zero_state().unwrap();
         prefill(&mut decoder, &mut live, &[1, 2, 3]);
-        // A snapshot of a DIFFERENT state is ADOPTED (Q-R1 3b option (e)): the live state
+        // A snapshot of a DIFFERENT state is ADOPTED: the live state
         // takes its layers, position, and generation wholesale.
         let mut foreign_state = decoder.zero_state().unwrap();
         prefill(&mut decoder, &mut foreign_state, &[1, 2, 3]);
@@ -1342,10 +1337,9 @@ mod snapshot_tests {
             rejected.err()
         );
         assert_eq!(live.pos(), 3, "the live state is unchanged after a pop");
-        // A rejection charges no permit: the live 3,072 and the two snapshots of 19,472
-        // each, PLUS the foreign snapshot's co-owned KV permits (Q-R1 3b shared-charge: the
-        // foreign state was dropped, but its snapshot's shared permits keep its 3,072 KV
-        // bytes alive in the budget).
+        // A rejection charges no permit: the live 3,072 and the two snapshots of 19,472 each, PLUS
+        // the foreign snapshot's co-owned KV permits (shared-charge: the foreign state was dropped,
+        // but its snapshot's shared permits keep its 3,072 KV bytes alive in the budget).
         assert_eq!(
             decoder.session_used(),
             3 * KV_PER_TOKEN
@@ -1355,7 +1349,7 @@ mod snapshot_tests {
         );
     }
 
-    /// Packet KV8-INTEGRATE test (a) at the decoder level: eight decode steps of a Q8-cache
+    /// At the decoder level: eight decode steps of a Q8-cache
     /// engine against the F32-cache control, both in F32 activation. The tolerance derivation
     /// (stated): the 8-bit affine error of one cached element is `e = R / 510` (`R` the largest
     /// group range over the valid rows of both heads of the control's caches, measured in the
@@ -1425,7 +1419,7 @@ mod snapshot_tests {
         assert_eq!(q8_state.pos(), 8, "the Q8 run holds 8 positions");
     }
 
-    /// Packet KV8-INTEGRATE test (b): the same comparison under BF16 activation, where the Q8
+    /// The same comparison under BF16 activation, where the Q8
     /// scales and biases are BF16. Rounding a scale `s` and a bias `b` to BF16 moves a
     /// reconstructed element `q * s + b` by at most `(255 * |s| + |b|) / 256`, which is
     /// `(R + |b|) / 256` for a group of range `R` (`255 * |s|` is about `R`) and at most
@@ -1487,7 +1481,7 @@ mod snapshot_tests {
         }
     }
 
-    /// Packet KV8-INTEGRATE test (c) at the decoder level: a Q8 run that crosses two capacity
+    /// At the decoder level, a Q8 run that crosses two capacity
     /// growth boundaries (the step quantum 3 against the default 256) is BIT-IDENTICAL to the
     /// same run that never grows: the quantization of a row and the prefix views never depend on
     /// the capacity.
@@ -1537,7 +1531,7 @@ mod snapshot_tests {
         );
     }
 
-    /// Packet KV8-INTEGRATE test (e), first half: a snapshot taken before further Q8 steps keeps
+    /// A snapshot taken before further Q8 steps keeps
     /// its own rows across an in-place append and two growths, and restoring it and running the
     /// same suffix is bit-identical to the first continuation.
     #[test]
@@ -1596,7 +1590,7 @@ mod snapshot_tests {
         assert_eq!(live.pos(), 9, "position after the suffix");
     }
 
-    /// Packet KV8-INTEGRATE test (e), second half, under Q-R1: the A, B, A isolation of the Q8
+    /// The A, B, A isolation of the Q8
     /// path. The ONE live state rewinds to one snapshot, steps divergent tokens, rewinds again,
     /// and steps a different continuation; every rewound run is compared bit for bit with an
     /// independent straight run of the same tokens.
@@ -1649,7 +1643,7 @@ mod snapshot_tests {
         assert_eq!(live.pos(), 3, "run B ends one step past the rewind");
     }
 
-    /// Packet KV8-INTEGRATE test (f): the stored bytes of a whole Q8 state equal the logical
+    /// The stored bytes of a whole Q8 state equal the logical
     /// charge of its positions plus at most one `KV_STEP` of slack per attention layer. `per_layer`
     /// is the hand-derived charge of one layer and position on the fixture (two key-value heads of
     /// width 64, one group per head): per side the codes take 2 * 64 bytes and the scales and
@@ -1714,7 +1708,7 @@ mod snapshot_tests {
         q8_state_stores_the_logical_charge(crate::family::qwen36::settings::Activation::Bf16, 272);
     }
 
-    /// Packet KV8-INTEGRATE test (g): a Q8 decoder refuses a state whose attention cache holds
+    /// A Q8 decoder refuses a state whose attention cache holds
     /// the F32 form at `check_step`, with no native call (the host validation of the step, which
     /// runs before the first native call and before any buffer is consumed).
     #[test]
@@ -1809,10 +1803,9 @@ mod snapshot_tests {
         assert_eq!(live.pos(), 1, "position after one step");
     }
 
-    /// The A/B/A isolation gate: decode away from a snapshot, rewind, decode differently,
-    /// rewind again - the Delta values return to the saved set after every cycle. The
-    /// earlier "shorter rewound read" defect note was stale at slice 3: these tests pass
-    /// deterministically on the Mac (three runs), so they joined the suite.
+    /// The A/B/A isolation gate: decode away from a snapshot, rewind, decode differently, rewind
+    /// again - the Delta values return to the saved set after every cycle. These tests pass
+    /// deterministically on the Mac (three runs).
     #[test]
     fn two_restores_of_one_snapshot_stay_independent_when_one_state_steps() {
         let _serial = crate::native_test_lock();
@@ -1846,7 +1839,7 @@ mod snapshot_tests {
         );
     }
 
-    /// Q-R1: two entries of one live state rewind to their own saved Delta values
+    /// Two entries of one live state rewind to their own saved Delta values
     /// however the live state stepped between the saves.
     #[test]
     fn two_restores_that_step_different_tokens_match_independent_straight_runs() {
@@ -1920,10 +1913,9 @@ mod snapshot_tests {
         );
         assert_eq!(live.pos(), 8, "position after prefix and suffix");
     }
-    /// Q-R1 3c (coordinator order 1): cache GROWTH relocates the buffer and preserves
-    /// positions [0, n), so a snapshot of length n survives the growth: restoring it gives
-    /// bit-identical Delta values to a fresh prefill of the same tokens. The growth never
-    /// bumps the generation (option (e)).
+    /// Cache GROWTH relocates the buffer and preserves positions [0, n), so a snapshot of length n
+    /// survives the growth: restoring it gives bit-identical Delta values to a fresh prefill of the
+    /// same tokens. The growth never bumps the generation.
     #[test]
     fn growth_then_restore_is_bit_identical_to_a_fresh_prefill() {
         let _serial = crate::native_test_lock();
@@ -1954,12 +1946,11 @@ mod snapshot_tests {
         );
     }
 
-    /// Q-R1 review test (b), denial is atomic: a rewind whose permit acquire is denied
-    /// leaves pos, cache lens, and permits exactly as they were (the documented on-error
-    /// contract) and the next step still commits. The old acquire-after-mutation ordering
-    /// half-rewound the state on this denial - pos and lens rewound, permits dropped - and
-    /// wedged every later commit on the charge-equality check, so this test fails on the
-    /// old ordering.
+    /// Denial is atomic: a rewind whose permit acquire is denied leaves pos, cache lens, and
+    /// permits exactly as they were (the documented on-error contract) and the next step still
+    /// commits. An acquire-after-mutation ordering would half-rewind the state on this denial - pos
+    /// and lens rewound, permits dropped - and wedge every later commit on the charge-equality
+    /// check, so this test fails on that ordering.
     #[test]
     fn a_rewind_denied_by_the_budget_changes_nothing_and_the_next_step_commits() {
         let _serial = crate::native_test_lock();
@@ -1994,9 +1985,9 @@ mod snapshot_tests {
         prefill(&mut decoder, &mut live, &[1, 2]);
         let snap2 = decoder.snapshot(&live).unwrap();
         prefill(&mut decoder, &mut live, &[3, 4, 5, 6]);
-        // A live pos-6 snapshot PINS all six permits: the old drop-then-acquire released
-        // nothing (the review pass-2 finding), so its rewound acquire was genuinely
-        // denied mid-mutation and the half-rewound damage below is what old code left.
+        // A live pos-6 snapshot PINS all six permits: a drop-then-acquire order would release
+        // nothing, so the rewound acquire is genuinely denied, and the checks below would catch the
+        // half-rewound state that order left.
         let snap6 = decoder.snapshot(&live).unwrap();
         let before = decoder.session_used();
         let denied = decoder.restore(&mut live, &snap2);
@@ -2015,7 +2006,7 @@ mod snapshot_tests {
         drop(snap6);
     }
 
-    /// Q-R1 review test (a), the adoption read: snapshot@4, rewind to 2, two divergent
+    /// The adoption read: snapshot@4, rewind to 2, two divergent
     /// steps below high_water, then the pos-4 snapshot ADOPTS (a minted generation can
     /// never take the rewind fast path). The adopted rows [0,4) - attention caches
     /// included - equal the snapshot-time values bitwise, and a suffix run equals an
@@ -2059,7 +2050,7 @@ mod snapshot_tests {
             "the suffix after adoption equals the independent straight run"
         );
 
-        // The DISCRIMINATING form (review pass 2): the adoption lands in a FRESH state
+        // The DISCRIMINATING form: the adoption lands in a FRESH state
         // whose high_water is zero, so the divergent steps bump nothing on the old
         // gen-rejoining code and the big same-lineage snapshot then reached it through
         // the REWIND fast path over fabricated rows. The mint makes that restore adopt
@@ -2077,10 +2068,10 @@ mod snapshot_tests {
         );
     }
 
-    /// Q-R1 3c (coordinator order 2): a commit that writes BELOW the snapshot's length
-    /// (a rewind followed by a divergent step) rewrites published ground and draws a fresh
-    /// generation; restoring the older snapshot then ADOPTS (option (e)): the snapshot's
-    /// pre-rewrite shared handles come back wholesale, discarding the divergent writes.
+    /// A commit that writes BELOW the snapshot's length (a rewind followed by a divergent step)
+    /// rewrites published ground and draws a fresh generation; restoring the older snapshot then
+    /// ADOPTS: the snapshot's pre-rewrite shared handles come back wholesale, discarding the
+    /// divergent writes.
     #[test]
     fn a_write_below_the_snapshot_length_adopts_the_pre_rewrite_state() {
         let _serial = crate::native_test_lock();
@@ -2128,7 +2119,7 @@ mod snapshot_tests {
         );
     }
 
-    /// Q-R1 3c (coordinator order 3): a commit that writes AT or ABOVE the snapshot's
+    /// A commit that writes AT or ABOVE the snapshot's
     /// length extends new ground (no generation bump), so the snapshot still restores
     /// through the fast rewind path with bit-identical values.
     #[test]

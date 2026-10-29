@@ -1,9 +1,9 @@
 /*
- * MATVEC-PAR S3a K2: the swiglu_q8 kernel and its launch entry. One kernel batches the SwiGLU of
- * the expert slots and the q8_1 quantization of its result: block s handles slot s (grid =
- * slots), reads gate at columns 0..n_ff and up at n_ff..2*n_ff of the slot's row of gu (the A2
- * stride layout), computes silu(gate) * up with swiglu_pack_k's fast form (x / (1 + __expf(-x)),
- * kept by decision; the E2 domain of the swiglu_pack doc), and quantizes per 32 values with the
+ * The swiglu_q8 kernel and its launch entry. One kernel batches the SwiGLU of the expert slots
+ * and the q8_1 quantization of its result: block s handles slot s (grid = slots), reads gate at
+ * columns 0..n_ff and up at n_ff..2*n_ff of the slot's row of gu (the strided [slot][gate|up]
+ * layout), computes silu(gate) * up with swiglu_pack_k's fast form (x / (1 + __expf(-x)), kept
+ * on purpose; the numerics domain of the swiglu_pack doc), and quantizes per 32 values with the
  * vendored quantize_q8_1 block rule in IEEE arithmetic (this TU is in the warnings-into-errors
  * group WITHOUT -use_fast_math, unlike the vendored quantize.cu object), one warp per block over
  * the padded width whose tail is written as zeros. Glue only: every exported function has C
@@ -35,7 +35,7 @@ constexpr int kMaxWidth = 32768;
 constexpr int64_t kMatrixRowPadding = 512; // common.cuh, the MMVQ activation padding
 constexpr int64_t kQk8_1 = 32;             // QK8_1
 
-/* silu with the fast __expf of swiglu_pack_k (ops.cu), kept by decision: the E2 numerics
+/* silu with the fast __expf of swiglu_pack_k (ops.cu), kept on purpose: the numerics
  * statement of the swiglu_pack doc is the domain, and the tests state the tolerance. */
 __device__ __forceinline__ float silu(float x) { return x / (1.f + __expf(-x)); }
 
@@ -88,8 +88,8 @@ extern "C" int inference_cuda_swiglu_q8_launch(const inference_cuda_swiglu_q8_ar
             stride < 2 * (int64_t)n_ff || !aligned(args->gu, 4) || !aligned(args->q8, 4)) {
             return INFERENCE_CUDA_INVALID_ARGUMENT;
         }
-        // The kernel reads the A2 footprint ((slots - 1) * stride + 2 * n_ff floats) and writes
-        // the padded block rows; both counts must not wrap.
+        // The kernel reads the strided footprint ((slots - 1) * stride + 2 * n_ff floats) and
+        // writes the padded block rows; both counts must not wrap.
         const int64_t gu_floats = (int64_t)(slots - 1) * stride + 2 * (int64_t)n_ff;
         const int64_t padded =
             ((int64_t)n_ff + kMatrixRowPadding - 1) / kMatrixRowPadding * kMatrixRowPadding;

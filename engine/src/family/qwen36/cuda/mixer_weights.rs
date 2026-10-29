@@ -1,17 +1,15 @@
-//! The weights of the mixer blocks, resolved by name once (packet RD-9b3a; REPLY-43 item 7).
+//! The weights of the mixer blocks, resolved by name once.
 //!
 //! `MixerWeights::new` walks the dense and raw specs of `MixerGeometry` for each wanted layer,
 //! finds the tensor by the name `LayerTable` gives, and refuses a tensor of another shape, type or
 //! stack depth with a `Checkpoint` error at session build, never at launch. A block then asks a
 //! layer for a weight by role. There is no pure part to test on the CPU beyond the specs and
-//! `check_dense` (RD-9b2); the resolution against a real `CudaWeights` is covered by the scratch
-//! device run of RD-9b3b.
+//! `check_dense`; the resolution against a real `CudaWeights` is covered by a scratch device run.
 //!
-//! MATVEC-PAR S3b: a dense entry is [`DenseWeight`], the tiles of the Tiled load or the file's
-//! own blocks of the Native load; `new` takes the session's layout and refuses a tensor of the
-//! other layout by name, so a mixed load cannot reach a launch (beside
-//! `CudaWeights::layout`'s own mixed refusal). The Native rows%4 rule is
-//! `mixer_geometry::check_native_dense`.
+//! A dense entry is [`DenseWeight`], the tiles of the Tiled load or the file's own blocks of the
+//! Native load; `new` takes the session's layout and refuses a tensor of the other layout by name,
+//! so a mixed load cannot reach a launch (beside `CudaWeights::layout`'s own mixed refusal). The
+//! Native rows%4 rule is `mixer_geometry::check_native_dense`.
 
 use super::{
     layer_table::LayerTable,
@@ -29,8 +27,8 @@ use crate::{
 
 const F32: usize = size_of::<f32>();
 
-/// One dense projection weight of a layer (MATVEC-PAR S3b): the tiles of the Tiled load that
-/// `matmul` reads, or the file's own blocks of the Native load that `matvec_q` reads.
+/// One dense projection weight of a layer: the tiles of the Tiled load that `matmul` reads, or the
+/// file's own blocks of the Native load that `matvec_q` reads.
 #[derive(Clone, Copy)]
 pub(super) enum DenseWeight<'w> {
     Tiled(&'w TiledWeight),
@@ -144,7 +142,7 @@ impl<'w> MixerWeights<'w> {
         Ok(Self { layers })
     }
 
-    /// The ready weight sets of the device rigs (the resident block tests of MATVEC-PAR S3b):
+    /// The ready weight sets of the device rigs (the resident block tests of the native layout):
     /// one entry per layer in order, `None` for an unresolved layer, exactly what `new` builds.
     #[cfg(test)]
     pub(super) fn from_layers(layers: Vec<Option<LayerWeights<'w>>>) -> Self {
@@ -230,8 +228,8 @@ pub(super) fn dense_weight<'w>(
 
 #[cfg(test)]
 impl<'w> LayerWeights<'w> {
-    /// The device-rig seam (MATVEC-PAR S3b): a layer's weights from ready entries, exactly the
-    /// shape `Self::layer` builds (the private fields stay private to production).
+    /// The device-rig seam: a layer's weights from ready entries, exactly the shape `Self::layer`
+    /// builds (the private fields stay private to production).
     pub(super) fn for_tests(
         dense: Vec<(Role, DenseWeight<'w>)>,
         raw: Vec<(Role, DeviceRange<'w>)>,

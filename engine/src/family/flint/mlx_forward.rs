@@ -16,8 +16,8 @@ use crate::{
     tensor::ExecutionTensor,
 };
 
-/// Graph-cache slice 1 routing: the compiled tail serves only one-row chunks (decode steps
-/// and single-row prefill pieces) with the flag armed. Multi-row prefill chunks keep the
+/// Graph-cache routing: the compiled tail serves only one-row chunks (decode steps and
+/// single-row prefill pieces) with the flag armed. Multi-row prefill chunks keep the
 /// eager tail unconditionally (their row counts would multiply the compile cache keys).
 pub(in crate::family::flint) fn compiled_tail_routes(rows: u32) -> bool {
     crate::kernels::mlx::compile_layer_flagged() && rows == 1
@@ -62,17 +62,16 @@ fn stage_fence(k: &mut MlxKernels, label: &str, tensor: &ExecutionTensor) -> Res
     Ok(())
 }
 
-/// D2 async chain (design scrch/7c82644c/flint-async-chain/DESIGN.md): decode
-/// layers per evaluate group when the chain is on. 49 layers -> 13 roots.
+/// Async chain: decode layers per evaluate group when the chain is on. 49 layers -> 13
+/// roots.
 const GROUP_LAYERS: usize = 4;
 
-/// Async-chain switch (D2, design scrch/7c82644c/flint-async-chain/DESIGN.md):
-/// one-row chunks (decode steps and single-row prefill pieces) are grouped
-/// into `GROUP_LAYERS`-layer evaluate chains. Default ON since the
-/// 2026-10-25 A/B window (step 0.1038 -> 0.0774 s, bitwise-identical
-/// logits); the fail-safe rollback is `FIFI_FLINT_MLX_ASYNC_CHAIN=0` (or
-/// any non-enable value — see `tokenizer::env_allows_default_on`). Read
-/// once per process, and the effective state is logged once at that read.
+/// Async-chain switch: one-row chunks (decode steps and single-row prefill pieces) are
+/// grouped into `GROUP_LAYERS`-layer evaluate chains. Default ON (an A/B run measured
+/// step 0.1038 -> 0.0774 s with bitwise-identical logits); the fail-safe rollback is
+/// `FIFI_FLINT_MLX_ASYNC_CHAIN=0` (or any non-enable value — see
+/// `tokenizer::env_allows_default_on`). Read once per process, and the effective state
+/// is logged once at that read.
 pub(in crate::family::flint) fn async_chain_flagged() -> bool {
     static FLAG: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *FLAG.get_or_init(|| {
@@ -83,10 +82,10 @@ pub(in crate::family::flint) fn async_chain_flagged() -> bool {
     })
 }
 
-/// D1 residual-coalesce switch: same fail-safe default-on polarity and
-/// once-per-process read as the async chain. Default on since the
-/// 2026-10-24 A/B window (83.0 -> 72.1 ms/forward, bitwise-identical
-/// trajectories); the rollback is any non-enable value, `=0` documented.
+/// Residual-coalesce switch: same fail-safe default-on polarity and once-per-process
+/// read as the async chain. Default on (an A/B run measured 83.0 -> 72.1 ms/forward with
+/// bitwise-identical trajectories); the rollback is any non-enable value, `=0`
+/// documented.
 pub(in crate::family::flint) fn coalesce_residual_flagged() -> bool {
     static FLAG: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *FLAG.get_or_init(|| {
@@ -96,22 +95,18 @@ pub(in crate::family::flint) fn coalesce_residual_flagged() -> bool {
     })
 }
 
-/// FIFI_FLINT_MLX_RING_VIEW routes full-attention KV planes onto the Qwen
-/// Q36-KV-INTEGRATE shape: the plane is appended in place and attention
-/// consumes the whole plane (the kernel receives len = p0+1 separately from
-/// the plane's row count), instead of materializing the chronological union
-/// per step (~227k KV rows/step at a 4k prefix, window-12 measurement; the
-/// history side of that union was already a view). SWA planes keep their
-/// bounded two-slice union; safety rests on MLX donating in place only when
-/// the handle is unique, never on any capacity change. Default ON since
-/// the 2026-10-28 flip; the fail-safe rollback (`=0`, any non-enable
-/// value, non-UTF-8) stays off so a mis-set rollback cannot fail
-/// silently.
-/// Pure mapping from the environment value to the flag, testable without
-/// poisoning the process-wide OnceLock: absent keeps the default ON; once
-/// set, only the explicit enable words stay on; non-UTF-8 and every other
-/// value roll back OFF (the `env_allows_default_on` polarity, so a mis-set
-/// rollback cannot silently fail).
+/// FIFI_FLINT_MLX_RING_VIEW routes full-attention KV planes onto the shape of the
+/// Qwen3.6 KV path: the plane is appended in place and attention consumes the whole
+/// plane (the kernel receives len = p0+1 separately from the plane's row count), instead
+/// of materializing the chronological union per step (~227k KV rows/step measured at a
+/// 4k prefix; the history side of that union was already a view). SWA planes keep their
+/// bounded two-slice union; safety rests on MLX donating in place only when the handle
+/// is unique, never on any capacity change. Default ON; the fail-safe rollback (`=0`,
+/// any non-enable value, non-UTF-8) stays off so a mis-set rollback cannot fail
+/// silently. Pure mapping from the environment value to the flag, testable without
+/// poisoning the process-wide OnceLock: absent keeps the default ON; once set, only the
+/// explicit enable words stay on; non-UTF-8 and every other value roll back OFF (the
+/// `env_allows_default_on` polarity, so a mis-set rollback cannot silently fail).
 pub(in crate::family::flint) fn ring_view_env_flag(
     value: std::result::Result<String, std::env::VarError>,
 ) -> bool {
@@ -171,14 +166,14 @@ pub(in crate::family::flint) fn ring_view_routes(geo: RingViewGeometry) -> bool 
     ring_view_routes_with(geo, ring_view_flagged())
 }
 
-/// Prefill-group chaining switch (window-34/35 attribution: the fenced
-/// `Plane::commit_chunk` costs 8.4 ms x 392 on pp4096 while the chained
-/// commit is graph-ordered and fence-free). Default OFF: multi-row chunks
-/// keep the reviewed per-layer-fence path until the A/B proves >=+10%
-/// pp4096 tok/s. Rollback is `FIFI_FLINT_MLX_PREFILL_CHAIN=0` (or any
-/// non-enable value). Memory note: a chained multi-row group holds up to
-/// GROUP_LAYERS layers of un-rooted graph (chunk-sized activations) before
-/// the boundary evaluate retires them — the retire cap still bounds it.
+/// Prefill-group chaining switch (an attribution run measured the fenced
+/// `Plane::commit_chunk` costs 8.4 ms x 392 on pp4096 while the chained commit is
+/// graph-ordered and fence-free). Default OFF: multi-row chunks keep the reviewed
+/// per-layer-fence path until the A/B proves >=+10% pp4096 tok/s. Rollback is
+/// `FIFI_FLINT_MLX_PREFILL_CHAIN=0` (or any non-enable value). Memory note: a chained
+/// multi-row group holds up to GROUP_LAYERS layers of un-rooted graph (chunk-sized
+/// activations) before the boundary evaluate retires them — the retire cap still bounds
+/// it.
 pub(in crate::family::flint) fn prefill_chain_flagged() -> bool {
     static FLAG: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *FLAG.get_or_init(|| {
@@ -251,8 +246,8 @@ impl Model {
         logits: bool,
     ) -> Result<Option<Vec<f32>>> {
         let rows = tokens.len() as u32;
-        // D2 chains only one-row chunks (see `chain_routes`):
-        // multi-row chunks run the flag-off per-layer-fence path.
+        // The async chain takes only one-row chunks (see `chain_routes`): multi-row
+        // chunks run the flag-off per-layer-fence path.
         let chain = chain_routes(rows);
         #[cfg(test)]
         let span = Span::begin("embedding_read", state.pos, None, None);
@@ -283,19 +278,18 @@ impl Model {
         drop(embedding);
         drop(packed);
         let mut health = Vec::new();
-        // D1 first slice (147->98 evaluates): with the switch on, the per-layer residual root
+        // Residual coalesce (147->98 evaluates): with the switch on, the per-layer residual root
         // is skipped for every layer that a later existing root completes anyway - the next
         // layer's attention-consumer evaluate in `commit_chunk` pulls this x through the graph,
         // and the head readback roots the last x on the head path. The no-head path keeps the
-        // final layer's root: the health export alone may not execute the final FFN.
-        // The switch itself is `coalesce_residual_flagged` above.
+        // final layer's root: the health export alone may not execute the final FFN. The switch
+        // itself is `coalesce_residual_flagged` above.
         let coalesce_residual = coalesce_residual_flagged();
-        // D2 async chain (design scrch/7c82644c/flint-async-chain/DESIGN.md):
-        // with the switch on, the per-layer commit fences are replaced by
-        // graph-ordered appends (see `Plane::commit_chunk_chained`) and one
-        // evaluate at each 4-layer group boundary roots the accumulated graph.
-        // The group roots also carry the residual x, so the D1 per-layer root
-        // above is skipped entirely when chained.
+        // Async chain: with the switch on, the per-layer commit fences are replaced by
+        // graph-ordered appends (see `Plane::commit_chunk_chained`) and one evaluate at
+        // each 4-layer group boundary roots the accumulated graph. The group roots also
+        // carry the residual x, so the coalesced per-layer root above is skipped
+        // entirely when chained.
         let group = GROUP_LAYERS;
         for (index, layer) in self.layers.iter().enumerate() {
             #[cfg(test)]
@@ -312,8 +306,8 @@ impl Model {
                 Some(index),
                 Some((x.dtype(), x.shape())),
             );
-            // CTX32K-GROW: full planes carry the grown capacity, so the
-            // plan's ring/origin math matches the planes that exist.
+            // Full planes carry the grown capacity, so the plan's ring/origin math
+            // matches the planes that exist.
             state.ensure_full_capacity(&mut self.kernels, state.pos + rows)?;
             let plan = ChunkCachePlan::new(index, state.pos, rows, state.full_capacity)?;
             #[cfg(test)]
@@ -362,11 +356,11 @@ impl Model {
             // them earlier or in the other order would change flag-off synchronization
             // and retirement ordering (the else branch is flag-off; base holds both).
             let eager_tail_keepalive: (Option<ExecutionTensor>, Option<ExecutionTensor>);
-            // Graph-cache slice 1: the flagged decode tail replays the eager op sequence
-            // (residual add, post-attention RMS, dense SwiGLU, residual add) as one compiled
-            // closure. Only the production decode shape routes here: one row, a dense FFN,
-            // in the layer's activation dtype (F32 fixtures, BF16 on the served path).
-            // MoE layers and every multi-row prefill chunk keep the eager tail.
+            // Graph cache: the flagged decode tail replays the eager op sequence (residual
+            // add, post-attention RMS, dense SwiGLU, residual add) as one compiled closure.
+            // Only the production decode shape routes here: one row, a dense FFN, in the
+            // layer's activation dtype (F32 fixtures, BF16 on the served path). MoE layers
+            // and every multi-row prefill chunk keep the eager tail.
             let compiled_tail = compiled_tail_routes(rows) && matches!(layer.ffn, Ffn::Dense(_));
             if compiled_tail {
                 eager_tail_keepalive = (None, None);

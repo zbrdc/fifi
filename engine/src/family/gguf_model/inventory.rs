@@ -15,7 +15,7 @@ use crate::{
 pub enum TensorPath {
     /// Quantized matrix that the CUDA projector tiles on the device.
     DeviceTiled,
-    /// Small F32 tensor that the CUDA loader uploads as a raw device copy (decision 0047 A1).
+    /// Small F32 tensor that the CUDA loader uploads as a raw device copy.
     DeviceF32,
 }
 

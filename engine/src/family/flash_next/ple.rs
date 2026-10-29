@@ -205,8 +205,7 @@ fn locate_row(shard_rows: &[u64], row: u64) -> Option<(usize, u64)> {
     None
 }
 
-/// The table rows of one token and the n-gram history after it. Hashing stays on the host
-/// (decision 0039 item 5).
+/// The table rows of one token and the n-gram history after it. Hashing stays on the host.
 #[derive(Debug, PartialEq, Eq)]
 pub(crate) struct RowPlan {
     /// `(table index, local row)` for each head, in head order.

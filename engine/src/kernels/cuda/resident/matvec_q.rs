@@ -1,13 +1,12 @@
-//! The dense MMVQ matvec against native GGUF-layout weights (MATVEC-PAR S1 c3b, decision 0047,
-//! stage 1): [`CudaContext::matvec_q`] queues one launch of the vendored `mul_mat_vec_q` kernel
-//! through the V-MV1 host entry and returns when it is queued. It allocates nothing, copies
-//! nothing and never synchronizes.
+//! The dense MMVQ matvec against native GGUF-layout weights: [`CudaContext::matvec_q`] queues one
+//! launch of the vendored `mul_mat_vec_q` kernel through the vendored host entry and returns when
+//! it is queued. It allocates nothing, copies nothing and never synchronizes.
 //!
 //! `w` holds the file's native blocks (`[rows][k / block_size]`, one [`QuantType`] for the whole
-//! stack), `x_q8` the padded `quantize_q8_1` output of `ncols` activation rows, `y` the f32
-//! result with column `j` at `y + j * rows`. The kernel computes column `j` from `x_q8` row `j`
-//! alone; the row-invariance contract (decision 0037: column `j` of an `ncols` launch is
-//! bit-identical to the 1-column launch) is pinned by test 4.
+//! stack), `x_q8` the padded `quantize_q8_1` output of `ncols` activation rows, `y` the f32 result
+//! with column `j` at `y + j * rows`. The kernel computes column `j` from `x_q8` row `j` alone; the
+//! row-invariance contract (column `j` of an `ncols` launch is bit-identical to the 1-column
+//! launch) is pinned by test 4.
 //!
 //! Every refusal is a `BadRequest` and happens before any native call. In order: the backend is
 //! usable; `k` is a multiple of the type's block size; `rows` is a positive multiple of 4
@@ -25,7 +24,7 @@ use crate::kernels::cuda::resident::quantize_q8_1::q8_1_bytes;
 #[cfg(test)]
 use crate::kernels::cuda::{ADAPTER_OPERATION, TERMINAL, native_error};
 
-/// The four weight formats the V-MV1-trimmed MMVQ instantiates (Qwen3.6 and Mellum). The
+/// The four weight formats the trimmed vendored MMVQ instantiates (Qwen3.6 and Mellum). The
 /// discriminants are the `ggml_type` values of the shim `ggml.h` (`GGML_TYPE_Q4_K = 12`,
 /// `Q5_0 = 6`, `Q6_K = 14`, `Q8_0 = 8`), not numbers from memory.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -78,8 +77,7 @@ impl QuantType {
 
 /// Rows must be a multiple of this: the MMVQ kernel loads the weight rows of a block as a group of
 /// up to 4 and never receives the row count, so a matrix of other height would be read past its
-/// end. A limitation until a guarded kernel exists (KUBDAN-MSG-64 item 4, note for S3); every
-/// Qwen3.6 shape is a multiple of 4.
+/// end. A limitation until a guarded kernel exists; every Qwen3.6 shape is a multiple of 4.
 pub(crate) const ROWS_MULTIPLE: usize = 4;
 
 /// One dense matvec: `y[j * rows + r] = sum_k x_q8[j][k] * w[r][k]`.
@@ -173,7 +171,7 @@ impl CudaContext {
         })
     }
 
-    /// Test support of the seam-1 microbench (test 11): records a raw timing event behind the
+    /// Test support of the matvec microbench (test 11): records a raw timing event behind the
     /// work queued on `stream` and returns its opaque handle, for
     /// [`native::resident::matvec_q::event_elapsed_ms_raw`]. The handle is destroyed by
     /// [`Self::bench_destroy`]. This rides `launch_on` so the raw stream never leaves the native

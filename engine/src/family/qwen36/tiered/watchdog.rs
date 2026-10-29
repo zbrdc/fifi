@@ -1,19 +1,19 @@
-//! The watchdog clamp of the tiered mailbox wait (TCAP C1c).
+//! The watchdog clamp of the tiered mailbox wait.
 //!
-//! WHAT: pure arithmetic that turns a requested CPU-server timeout into the pair
-//! (server timeout, device deadline) the tiered step runs with, clamped strictly
-//! below an assumed display-watchdog limit when the device reports one. WHY: a
-//! graph-captured `tiered_wait_add` kernel spins on host-mapped memory until the
-//! CPU server answers (design `ledger/plans/TCAP-DESIGN.md` sections 3.2 and
-//! 3.6), and on a device whose display watchdog is on, a kernel that outruns the
-//! driver's unnamed limit is killed with the whole context — terminal — while
-//! the CUDA runtime exposes only the on/off boolean. So the device deadline is
-//! held a margin below the assumed limit, the server's own timeout fires first
-//! by a second margin, and where the arithmetic leaves no room the caller
-//! refuses option E and falls back to option B (KUBDAN-MSG-84 condition 1).
-//! Both of our GPUs report no watchdog; the clamp ships anyway. Deterministic:
-//! no clock read, no device query — `watchdog_on` arrives as a parameter. This
-//! module is staged for TCAP C6 (ledger/plans/TCAP-DESIGN.md).
+//! WHAT: pure arithmetic that turns a requested CPU-server timeout into the
+//! pair (server timeout, device deadline) the tiered step runs with, clamped
+//! strictly below an assumed display-watchdog limit when the device reports
+//! one. WHY: a graph-captured `tiered_wait_add` kernel spins on host-mapped
+//! memory until the CPU server answers, and on a device whose display watchdog
+//! is on, a kernel that outruns the driver's unnamed limit is killed with the
+//! whole context — terminal — while the CUDA runtime exposes only the on/off
+//! boolean. So the device deadline is held a margin below the assumed limit,
+//! the server's own timeout fires first by a second margin, and where the
+//! arithmetic leaves no room the caller refuses the in-graph wait and falls
+//! back to the path without it. Both of our GPUs report no watchdog; the clamp
+//! ships anyway. Deterministic: no clock read, no device query — `watchdog_on`
+//! arrives as a parameter. This module is staged for the CUDA adapter of the
+//! mailbox.
 
 /// Longest time a kernel may run before the display watchdog kills it, ASSUMED
 /// when the watchdog is on (the runtime only says on or off). Milliseconds.
@@ -26,16 +26,16 @@ pub const ASSUMED_WATCHDOG_MS: u64 = 2000;
 pub const WATCHDOG_MARGIN_MS: u64 = 500;
 
 /// How much longer than the server's timeout the device waits, so that the
-/// server's own timeout fires first (design 3.2). Milliseconds. WHY: a typed
+/// server's own timeout fires first. Milliseconds. WHY: a typed
 /// server-side error is recoverable poison, while a device deadline miss is the
 /// last line of defence.
 pub const WAIT_MARGIN_MS: u64 = 1000;
 
 /// The smallest server-timeout CAP worth running with, in milliseconds. WHY: when
-/// the assumed watchdog limit leaves less than this for the server's timeout,
-/// option E is refused ([`Refusal::NoRoom`]) and the caller falls back to option
-/// B. It applies to the cap, not to a request: a request below it is kept as
-/// asked, because the caller asked for it.
+/// the assumed watchdog limit leaves less than this for the server's timeout, the
+/// in-graph wait is refused ([`Refusal::NoRoom`]) and the caller falls back to
+/// the path without it. It applies to the cap, not to a request: a request below
+/// it is kept as asked, because the caller asked for it.
 pub const MIN_SERVER_TIMEOUT_MS: u64 = 100;
 
 /// The pair of deadlines the tiered step runs with, in milliseconds: the CPU
@@ -44,10 +44,10 @@ pub const MIN_SERVER_TIMEOUT_MS: u64 = 100;
 pub struct Timeouts {
     /// The CPU server's own timeout in milliseconds; it fires at least
     /// `wait_margin_ms` before the device deadline, so the server's typed error
-    /// (design 3.6) usually wins the race.
+    /// usually wins the race.
     pub server_ms: u64,
     /// The `tiered_wait_add` deadline in milliseconds: how long the kernel
-    /// spins before it sets `WAIT_TIMEOUT` and NaNs the row (design 3.2).
+    /// spins before it sets `WAIT_TIMEOUT` and NaNs the row.
     pub device_ms: u64,
 }
 
@@ -57,9 +57,9 @@ pub enum Refusal {
     /// The caller asked for a zero timeout; nothing can be waited for.
     ZeroTimeout,
     /// The assumed watchdog limit leaves less than `min_server_ms` of server
-    /// timeout under it, so option E is refused in favour of option B
-    /// (KUBDAN-MSG-84 condition 1). Carries the largest server timeout in
-    /// milliseconds that would have fit.
+    /// timeout under it, so the in-graph wait is refused in favour of the
+    /// fallback path. Carries the largest server timeout in milliseconds that
+    /// would have fit.
     NoRoom {
         /// The largest server timeout that fits under the assumed watchdog
         /// limit, in milliseconds; smaller than `min_server_ms`.
@@ -128,7 +128,7 @@ pub(crate) struct Limits {
     /// milliseconds ([`WAIT_MARGIN_MS`]).
     pub wait_margin_ms: u64,
     /// The smallest server-timeout cap in milliseconds ([`MIN_SERVER_TIMEOUT_MS`]): a watchdog cap below it
-    /// refuses option E; a request below it is kept as asked.
+    /// refuses the in-graph wait; a request below it is kept as asked.
     pub min_server_ms: u64,
 }
 
@@ -267,7 +267,7 @@ mod tests {
     fn the_default_limits_leave_room() {
         assert!(clamp_timeouts(60_000, true).is_ok());
         // The wrapper is exactly the default limits, so the shipped constants
-        // can never refuse option E.
+        // can never refuse the in-graph wait.
         for &requested in &[60_000u64, MIN_SERVER_TIMEOUT_MS, 1] {
             assert_eq!(
                 clamp_timeouts(requested, true),

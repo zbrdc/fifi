@@ -1,4 +1,4 @@
-//! The resident Q36 decoder (packet Q36-D): weights, session budget, and the step entry point.
+//! The resident Q36 decoder: weights, session budget, and the step entry point.
 //!
 //! `ResidentDecoder` runs one token per `step` in a `StepMode`. It owns the adapter and the weights.
 //! It holds no session: the caller owns each `ResidentState` and passes it to `step`.
@@ -21,8 +21,8 @@ use crate::{
     weights::StreamedCheckpoint,
 };
 
-/// The test-only graph probe of packet GPU-GAP-COUNT: it runs after the token graph is built
-/// and before the step's single `evaluate`, with the kernels handle and the lazy outputs.
+/// The test-only graph probe: it runs after the token graph is built and before the step's single
+/// `evaluate`, with the kernels handle and the lazy outputs.
 #[cfg(test)]
 type GraphProbe = Box<dyn FnMut(&mut MlxKernels, &[&ExecutionTensor]) -> Result<(), EngError>>;
 
@@ -51,22 +51,21 @@ pub(super) struct StepResult {
     /// The experts of each layer in rank order, `top_k` per layer. `Record` only.
     pub(super) routes: Option<Vec<Vec<u32>>>,
     /// The router probability row `[experts]` behind each recorded host route, the oracle of the
-    /// near-tie rule of the route-parity gate (fix3 of packet Q36-BF16-a; decision 0046 A6).
-    /// `Record` with `Routing::Host` only: the row is already on the host there, so recording it
-    /// adds no synchronization.
+    /// near-tie rule of the route-parity gate. `Record` with `Routing::Host` only: the row is
+    /// already on the host there, so recording it adds no synchronization.
     pub(super) probs: Option<Vec<Vec<f32>>>,
 }
 
-/// The default context limit of decision 0046 item 6.
+/// The default context limit.
 pub(super) const DEFAULT_CONTEXT_LIMIT: u32 = 32_768;
 
-/// The retire cap of the decoder's adapter: 4 GiB. With device routing a token builds one graph
-/// and every dropped temporary stays retired until the token's `evaluate`. The default cap of
-/// 64 MiB would force a flush synchronization inside the token (decision 0039 retire list). The
-/// retired arrays are inputs of the pending graph, so the flush would free nothing.
+/// The retire cap of the decoder's adapter: 4 GiB. With device routing a token builds one graph and
+/// every dropped temporary stays retired until the token's `evaluate`. The default cap of 64 MiB
+/// would force a flush synchronization inside the token. The retired arrays are inputs of the
+/// pending graph, so the flush would free nothing.
 pub(super) const DECODE_RETIRE_CAP: u64 = 4 << 30;
 
-/// The default rows of one prefill chunk (plan item Q36-E: 256 to 512 first).
+/// The default rows of one prefill chunk.
 pub(super) const DEFAULT_CHUNK_ROWS: u32 = 512;
 
 /// The most rows that `set_chunk_rows` accepts.
@@ -89,9 +88,9 @@ pub(super) struct ResidentDecoder<'c> {
     pub(super) chunk_rows: u32,
     /// How the layers pick their experts. `Device` unless a parity run asks for `Host`.
     pub(super) routing: Routing,
-    /// `mlx_compile` on the DeltaNet and device-routed MoE decode blocks (packet MX-COMPILE-1a):
-    /// the `qwen36.compile` setting, false until `set_compile` turns it on. `step` copies it
-    /// into its `Ctx`, `delta::step` and `moe::step_device` read it, and no other path compiles.
+    /// `mlx_compile` on the DeltaNet and device-routed MoE decode blocks: the `qwen36.compile`
+    /// setting, false until `set_compile` turns it on. `step` copies it into its `Ctx`,
+    /// `delta::step` and `moe::step_device` read it, and no other path compiles.
     pub(super) compile: bool,
     /// The seconds of this decoder's load-time compile warm-up, per block kind: empty until
     /// `set_compile(true)` traces the programs. `WarmupSeconds` documents the shape.
@@ -101,19 +100,18 @@ pub(super) struct ResidentDecoder<'c> {
     /// The calling thread's cache generation and the prepared B2/4/8 bit mask.
     prepared_compiled_rows: Option<(u64, u8)>,
     /// A test-only probe that runs after the token graph is built and before the step's single
-    /// `evaluate` (packet GPU-GAP-COUNT): the graph dump of `decode_graph_primitives` reads the
-    /// lazy outputs there without evaluating them. `None` unless a test sets it, so every other
-    /// build and test runs the same step as before; the probe makes no native call of its own
-    /// except through the kernels handle it receives.
+    /// `evaluate`: the graph dump of `decode_graph_primitives` reads the lazy outputs there without
+    /// evaluating them. `None` unless a test sets it, so every other build and test runs the same
+    /// step as before; the probe makes no native call of its own except through the kernels handle
+    /// it receives.
     #[cfg(test)]
     pub(super) graph_probe: Option<GraphProbe>,
 }
 
-/// The seconds of the load-time compile warm-up, per block kind (packet MX-COMPILE-1a, fix
-/// round 1): `delta` holds one entry per traced DeltaNet program and `moe` one entry per traced
-/// device-routed MoE program, each covering the whole warm step (the trace call and its
-/// evaluation). They are measured inside THIS decoder, so the start line never reports another
-/// engine's seconds, and the two lists are labeled separately.
+/// The seconds of the load-time compile warm-up, per block kind: `delta` holds one entry per traced
+/// DeltaNet program and `moe` one entry per traced device-routed MoE program, each covering the
+/// whole warm step (the trace call and its evaluation). They are measured inside THIS decoder, so
+/// the start line never reports another engine's seconds, and the two lists are labeled separately.
 #[derive(Clone, Debug, Default, PartialEq)]
 pub(super) struct WarmupSeconds {
     /// One entry per traced DeltaNet program, in plan order.
@@ -122,10 +120,10 @@ pub(super) struct WarmupSeconds {
     pub(super) moe: Vec<f64>,
 }
 
-/// Dispatches the flash-prefill kernel once on a tiny synthetic call at engine startup
-/// (R4-5): MLX JIT-compiles the fast kernel at its first dispatch, and the warm-up moves
-/// that cost off the first request. A no-op under the kill switch `Q36_FLASH_PREFILL=0`
-/// and outside the kernel's validated envelope (D >= 128, Q8 cache, REP 8).
+/// Dispatches the flash-prefill kernel once on a tiny synthetic call at engine startup: MLX
+/// JIT-compiles the fast kernel at its first dispatch, and the warm-up moves that cost off the
+/// first request. A no-op under the kill switch `Q36_FLASH_PREFILL=0` and outside the kernel's
+/// validated envelope (D >= 128, Q8 cache, REP 8).
 fn warm_up_flash_prefill(
     kernels: &mut MlxKernels,
     heads_q: u32,
@@ -196,19 +194,19 @@ impl<'c> ResidentDecoder<'c> {
         Ok(Self::with_weights(kernels, ckpt, weights, context_limit))
     }
 
-    /// Builds the decoder for `activation` (packet Q36-BF16-a), the one setting that pairs the
-    /// scale storage with the activation dtype. `Activation::F32` is the qualification
-    /// control and equals `new`. `Activation::Bf16` keeps the stored BF16 scales and biases, then
-    /// lets the adapter take BF16 operands, converts the 100 layer norms to BF16 with one
-    /// synchronization, and sets `Consts::act`; the key-value cache, the DeltaNet state and ring,
-    /// the router, the final norm, and the logits stay F32. `ensure_scale_pairing` refuses a
-    /// mismatched scale pair before any of that. The chunked prefill runs the same activation
-    /// dtype (packet Q36-BF16-b: the chunk blocks cast at their boundaries and guard their dtypes).
+    /// Builds the decoder for `activation`, the one setting that pairs the scale storage with the
+    /// activation dtype. `Activation::F32` is the qualification control and equals `new`.
+    /// `Activation::Bf16` keeps the stored BF16 scales and biases, then lets the adapter take BF16
+    /// operands, converts the 100 layer norms to BF16 with one synchronization, and sets
+    /// `Consts::act`; the key-value cache, the DeltaNet state and ring, the router, the final norm,
+    /// and the logits stay F32. `ensure_scale_pairing` refuses a mismatched scale pair before any
+    /// of that. The chunked prefill runs the same activation dtype (the chunk blocks cast at their
+    /// boundaries and guard their dtypes).
     ///
-    /// The head keeps an F32 activation over BF16 scales (packet Q36-BF16-a, documented, not
-    /// changed): the final norm promotes the BF16 hidden state against the F32 final-norm weight,
-    /// so the `lm_head` qmm runs F32 over the stored BF16 scales, and MLX casts the scales per
-    /// token (about 64 MB of temporaries). A speed-table row for the Mac run.
+    /// The head keeps an F32 activation over BF16 scales (documented, not changed): the final norm
+    /// promotes the BF16 hidden state against the F32 final-norm weight, so the `lm_head` qmm runs
+    /// F32 over the stored BF16 scales, and MLX casts the scales per token (about 64 MB of
+    /// temporaries). A speed-table row for the Mac run.
     pub(super) fn new_with_activation(
         kernels: MlxKernels,
         ckpt: &'c StreamedCheckpoint,
@@ -217,8 +215,8 @@ impl<'c> ResidentDecoder<'c> {
         activation: Activation,
     ) -> Result<Self, EngError> {
         // The product path: the scale import follows the activation, so the census always matches.
-        // The cache form is the F32 control (packet KV8-INTEGRATE: the shipped default stays F32
-        // until the A7 rule-4 gate).
+        // The cache form is the F32 control: the shipped default stays F32 until the Q8 cache
+        // passes its gate.
         Self::new_paired(
             kernels,
             ckpt,
@@ -230,14 +228,13 @@ impl<'c> ResidentDecoder<'c> {
         )
     }
 
-    /// Builds the decoder for the cache form `kv` (packet KV8-INTEGRATE; decision 0046 A7):
-    /// `KvDtype::F32` is the control and equals `new_with_activation`, and `KvDtype::Q8` keeps
-    /// the attention cache as 8-bit affine codes beside scales and biases of the activation
-    /// dtype - the new K and V rows stay in the activation dtype and `quantize_rows` packs them,
-    /// so BF16 activations give BF16 scales (1,088 bytes per layer and position on the real
-    /// model) and F32 activations give F32 scales (1,152). A Q8 engine whose `head_dim` is not a
-    /// multiple of the group (64) is refused at load with `BadRequest` naming the setting, before
-    /// any weight imports.
+    /// Builds the decoder for the cache form `kv`: `KvDtype::F32` is the control and equals
+    /// `new_with_activation`, and `KvDtype::Q8` keeps the attention cache as 8-bit affine codes
+    /// beside scales and biases of the activation dtype - the new K and V rows stay in the
+    /// activation dtype and `quantize_rows` packs them, so BF16 activations give BF16 scales (1,088
+    /// bytes per layer and position on the real model) and F32 activations give F32 scales (1,152).
+    /// A Q8 engine whose `head_dim` is not a multiple of the group (64) is refused at load with
+    /// `BadRequest` naming the setting, before any weight imports.
     pub(super) fn new_with_kv(
         kernels: MlxKernels,
         ckpt: &'c StreamedCheckpoint,
@@ -257,10 +254,9 @@ impl<'c> ResidentDecoder<'c> {
         )
     }
 
-    /// The test form of `new_with_activation` (packet Q36-BF16-a fix): the scale import follows the
-    /// `Q36_SCALE_DTYPE` knob instead of `activation`, which is the only way to drive the
-    /// mismatched pair that `ensure_scale_pairing` refuses, because the product constructor
-    /// cannot build it.
+    /// The test form of `new_with_activation`: the scale import follows the `Q36_SCALE_DTYPE` knob
+    /// instead of `activation`, which is the only way to drive the mismatched pair that
+    /// `ensure_scale_pairing` refuses, because the product constructor cannot build it.
     #[cfg(test)]
     pub(super) fn new_with_scale_override(
         kernels: MlxKernels,
@@ -320,9 +316,9 @@ impl<'c> ResidentDecoder<'c> {
             weights.consts.act = Dtype::Bf16;
         }
         weights.kv = kv;
-        // R4-5: compile the flash-prefill kernel at startup when the flag is on, AFTER the
-        // activation setup (a BF16 engine must warm the BF16 program: MLX keys the fast
-        // kernel on the dtype template arg), and in the engine's activation dtype.
+        // Compile the flash-prefill kernel at startup when the flag is on, AFTER the activation
+        // setup (a BF16 engine must warm the BF16 program: MLX keys the fast kernel on the dtype
+        // template arg), and in the engine's activation dtype.
         {
             warm_up_flash_prefill(
                 &mut kernels,
@@ -359,9 +355,9 @@ impl<'c> ResidentDecoder<'c> {
         }
     }
 
-    /// Sets the test-only graph probe (packet GPU-GAP-COUNT), the hook that sees the lazy
-    /// outputs of one step before its `evaluate`. Test builds only; production code has no
-    /// setter, so no product path can install a probe.
+    /// Sets the test-only graph probe, the hook that sees the lazy outputs of one step before its
+    /// `evaluate`. Test builds only; production code has no setter, so no product path can install
+    /// a probe.
     #[cfg(test)]
     pub(super) fn set_graph_probe(&mut self, probe: GraphProbe) {
         self.graph_probe = Some(probe);
@@ -374,19 +370,18 @@ impl<'c> ResidentDecoder<'c> {
         self.routing = routing;
     }
 
-    /// Turns the compiled decode blocks on or off (packet MX-COMPILE-1a item 6, fix round 1).
-    /// Turning them on admits the WHOLE model first — every DeltaNet layer and every
-    /// device-routed MoE layer's weight facts over the warm-up plan — and refuses the load with
-    /// `EngError::Backend { operation: "compile_warm_up", .. }` when the plan refuses (a packed
-    /// weight without biases, more than four distinct programs), so no compiled call can fail in
-    /// the middle of a request. The warm-up then traces ONE layer per distinct cache key on zero
-    /// tensors, evaluates the traced results, and records the per-block seconds in
-    /// `compile_warmup`, so the first token of the first request replays a compiled program
-    /// instead of tracing one. A trace failure is a native `Backend` HERE, at load, and the
-    /// adapter is terminal afterwards. Turning the setting off runs the warm-up never and
-    /// changes nothing else; the executor calls this once, right after construction, before the
-    /// first state exists. A Host-routed decoder warms its DeltaNet blocks and not its MoE
-    /// blocks (the host-routed MoE never compiles).
+    /// Turns the compiled decode blocks on or off. Turning them on admits the WHOLE model first
+    /// — every DeltaNet layer and every device-routed MoE layer's weight facts over the warm-up
+    /// plan — and refuses the load with `EngError::Backend { operation: "compile_warm_up", .. }`
+    /// when the plan refuses (a packed weight without biases, more than four distinct programs),
+    /// so no compiled call can fail in the middle of a request. The warm-up then traces ONE
+    /// layer per distinct cache key on zero tensors, evaluates the traced results, and records
+    /// the per-block seconds in `compile_warmup`, so the first token of the first request
+    /// replays a compiled program instead of tracing one. A trace failure is a native `Backend`
+    /// HERE, at load, and the adapter is terminal afterwards. Turning the setting off runs the
+    /// warm-up never and changes nothing else; the executor calls this once, right after
+    /// construction, before the first state exists. A Host-routed decoder warms its DeltaNet
+    /// blocks and not its MoE blocks (the host-routed MoE never compiles).
     pub(super) fn set_compile(&mut self, on: bool) -> Result<(), EngError> {
         self.prepared_compiled_rows = None;
         self.compile = on;
@@ -610,7 +605,7 @@ impl<'c> ResidentDecoder<'c> {
         };
         // The zero input of the layer, imported with one synchronization; it converts to the
         // activation dtype of the decoder. The zero DeltaNet state and ring follow the checked
-        // dimensions of the plan (LOW-2: no unchecked subtraction or product).
+        // dimensions of the plan (no unchecked subtraction or product).
         let u32_of = |n: usize| {
             u32::try_from(n).map_err(|_| {
                 EngError::BadRequest("the compile warm-up dimension exceeds u32".into())
@@ -773,8 +768,8 @@ impl<'c> ResidentDecoder<'c> {
     /// the last chunk: the head reads the last row of the prompt.
     ///
     /// A prompt of one token runs as a chunk of one row, not as `step`. A chunk routes as this
-    /// decoder holds (`Routing::Host` or `Routing::Device`, packet Q36-PF-DEVROUTE), so the result
-    /// has `routes: None` in every mode. `step` returns `Some(routes)` in `Record` mode.
+    /// decoder holds (`Routing::Host` or `Routing::Device`), so the result has `routes: None` in
+    /// every mode. `step` returns `Some(routes)` in `Record` mode.
     ///
     /// The host checks of the whole prompt (a poisoned state, an empty prompt, and the context
     /// limit) run first and change nothing on error. Each chunk repeats the host checks and takes
@@ -811,12 +806,12 @@ mod tests {
         HostWeights::load(ckpt, &TINY_GQA, &tiny::config(&TINY_GQA)).unwrap()
     }
 
-    /// The BF16 constructor of packet Q36-BF16-a keeps the stored BF16 scales and biases, converts
-    /// the 100-shaped norm set (here 8 layer norms and 4 head norms) to BF16, and holds `Bf16` as
-    /// the activation dtype. The F32 constructor widens every scale and bias and keeps the norms
-    /// F32. The two censuses have the same shape (43 packed weights of 2 parts each), so a wiring
-    /// that imports F32 scales for BF16 activations shows here as an F32 part or a construction
-    /// refusal from `ensure_scale_pairing`.
+    /// The BF16 constructor keeps the stored BF16 scales and biases, converts the 100-shaped norm
+    /// set (here 8 layer norms and 4 head norms) to BF16, and holds `Bf16` as the activation dtype.
+    /// The F32 constructor widens every scale and bias and keeps the norms F32. The two censuses
+    /// have the same shape (43 packed weights of 2 parts each), so a wiring that imports F32 scales
+    /// for BF16 activations shows here as an F32 part or a construction refusal from
+    /// `ensure_scale_pairing`.
     #[test]
     fn the_activation_dtype_pairs_the_scales_and_converts_the_norms() {
         let _serial = crate::native_test_lock();
@@ -894,11 +889,11 @@ mod tests {
     }
 
     /// The pairing refusal of `ensure_scale_pairing`, driven through the `Q36_SCALE_DTYPE` test
-    /// knob (packet Q36-BF16-a fix): the knob picks the scale import independently of the
-    /// activation, which is the only way to build the mismatched pair, because the product
-    /// constructor cannot. `std::env::set_var` is denied outside the kernels modules, so each
-    /// direction runs in a child process that carries the knob, as the rebind tests of the
-    /// kernels adapter do; the child asserts the refusal text and the parent requires its pass.
+    /// knob: the knob picks the scale import independently of the activation, which is the only way
+    /// to build the mismatched pair, because the product constructor cannot. `std::env::set_var` is
+    /// denied outside the kernels modules, so each direction runs in a child process that carries
+    /// the knob, as the rebind tests of the kernels adapter do; the child asserts the refusal text
+    /// and the parent requires its pass.
     #[test]
     fn the_constructor_refuses_the_mismatched_scale_pair_from_the_knob() {
         const CHILD: &str = "INFERENCE_Q36_PAIRING_CHILD";
@@ -910,7 +905,7 @@ mod tests {
         }
         let rows = [
             Mismatch {
-                // BF16 scales under an `f32` activation: the 31.6 tok/s trap that Q36-G0 closed.
+                // BF16 scales under an `f32` activation: the 31.6 tok/s trap this refusal closes.
                 knob: ("Q36_SCALE_DTYPE", "bf16"),
                 activation: Activation::F32,
                 want: "activation_dtype f32 needs F32 scales and biases; the census holds \

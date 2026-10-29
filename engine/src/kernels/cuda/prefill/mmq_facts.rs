@@ -1,11 +1,10 @@
-//! The device facts of the MMQ glue (CPF-V4 V4-0's C entry, wrapped): the built
-//! architecture the cubins run under, the SM count and the opt-in shared memory per block.
-//! The later G2/G3 wrappers size the fixup range from `nsm` through this query, never from
-//! a literal (finding 8), and the J replica selects its config table from `cc`.
+//! The device facts of the MMQ glue (its C entry, wrapped): the built architecture the
+//! cubins run under, the SM count and the opt-in shared memory per block. The dense and
+//! grouped GEMM wrappers size the fixup range from `nsm` through this query, never from a
+//! literal, and the J replica selects its config table from `cc`.
 //!
 //! Not a launch: no stream, no allocation, no synchronization — the method only needs a
-//! usable backend and the dispatch guard, the `device_is_integrated` shape (decision 0023
-//! and 0024).
+//! usable backend and the dispatch guard, the `device_is_integrated` shape.
 #![cfg_attr(
     not(test),
     expect(
@@ -50,14 +49,12 @@ pub(in crate::kernels::cuda) struct MmqFactsCache {
 }
 
 impl CudaContext {
-    /// Reads the MMQ device facts of this context's device through the V4-0 C entry: the
-    /// built architecture, the SM count and the opt-in shared memory per block. G2/G3 size
-    /// the fixup range and pick the J config from these. The device is queried once per
+    /// Reads the MMQ device facts of this context's device through the C entry: the built
+    /// architecture, the SM count and the opt-in shared memory per block. The GEMM wrappers
+    /// size the fixup range and pick the J config from these. The device is queried once per
     /// context and every later call returns the cached facts (a launch reads them, so they
     /// must not cost five attribute calls each); a failed CUDA query is the backend's own
     /// error and latches there exactly as a launch failure would.
-    ///
-    /// The name is fixed by lane S (review MINOR-2) so G2/G3 build on it unchanged.
     pub(crate) fn mmq_device_facts(&self) -> Result<MmqFacts, EngError> {
         self.ensure_usable()?;
         if let Some(facts) = self.mmq_facts.facts.get() {
@@ -82,7 +79,7 @@ impl CudaContext {
 
 impl CudaContext {
     /// Bytes of the stream-k fixup range every MMQ launch on this device may need,
-    /// `nsm * 128 * 128` floats (mmq.cuh:1334-1338, G1's `fixup_floats_max`): the size an
+    /// `nsm * 128 * 128` floats (mmq.cuh:1334-1338, `mmq_size::fixup_floats_max`): the size an
     /// arena allocates once, from the runtime SM count and never from a literal. It reads the
     /// facts through [`Self::mmq_device_facts`], so after the first call it is a cache hit.
     pub(crate) fn mmq_fixup_bytes(&self) -> Result<usize, EngError> {

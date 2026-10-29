@@ -1,6 +1,6 @@
 //! Raw FFI to `inference_cuda_quantize_q8_1_launch` of `native/resident/quantize_q8_1.cu`
 //! (declared in `native/resident/quantize_q8_1.h`). Child of `native::resident`, so it inherits
-//! the `allow(unsafe_code)` of `native.rs` (decision 0047, child modules of `native.rs`).
+//! the `allow(unsafe_code)` of `native.rs`.
 //!
 //! Safety invariants this module relies on:
 //! - A device range is proved in bounds by `RawRange::new` before it gets here. This module
@@ -11,8 +11,7 @@
 //!   a fault in the kernel surfaces at the next synchronize.
 //! - The allocations stay valid until the queued launch finishes because `inference_cuda_free`
 //!   synchronizes the whole device before `cudaFree`.
-//! - Every call runs under the process dispatch guard and on the thread that owns the context
-//!   (decisions 0023 and 0024).
+//! - Every call runs under the process dispatch guard and on the thread that owns the context.
 //! - No raw pointer and no unsafe function leaves this module.
 
 use std::ffi::{c_int, c_void};
@@ -184,8 +183,8 @@ mod tests {
         })
     }
 
-    /// Host only (KUBDAN-MSG-64 items 6 and 10): the native check against the ranges of an unbacked
-    /// allocation. The valid layout passes; each case changes one thing and is refused.
+    /// Host only: the native check against the ranges of an unbacked allocation. The valid
+    /// layout passes; each case changes one thing and is refused.
     #[test]
     fn check_quantize_refuses_short_unpadded_misaligned_and_overlapping_ranges() {
         let device = RawDevice::unbacked(1 << 20);

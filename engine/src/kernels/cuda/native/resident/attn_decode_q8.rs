@@ -1,12 +1,12 @@
 //! Raw FFI to the KV8 split-KV decode attention entry of `native/resident/attn_decode_q8.cu`
-//! (declared in `native/resident/attn_decode_q8.h`), RD-8l. Child module of
-//! `native/resident.rs`, so it inherits the `allow(unsafe_code)` of `native.rs`.
+//! (declared in `native/resident/attn_decode_q8.h`). Child module of `native/resident.rs`, so it
+//! inherits the `allow(unsafe_code)` of `native.rs`.
 //!
 //! The packed-int8 layout follows Strata's laguna_kv8 flash decode.
 //!
 //! Safety invariants this file relies on:
 //! - The launch entry is called only through `CudaContext::launch_on`, on the thread that owns
-//!   the context and under the dispatch guard (decisions 0023 and 0024).
+//!   the context and under the dispatch guard.
 //! - Every range is a `RawRange`, proved inside a live allocation. Sizes, alignment and
 //!   disjointness (`super::Span`) are proved again here before the call. The C entry checks
 //!   its available pointer/scalar/alignment conditions, not allocation extents or overlap.
@@ -64,6 +64,39 @@ unsafe extern "C" {
         head_dim: c_int,
         max_splits: c_int,
     ) -> usize;
+    #[cfg(all(test, feature = "cuda-arms-qualification"))]
+    #[link_name = "inference_cuda_attn_decode_q8_set_arms"]
+    fn attn_decode_q8_set_arms_raw(prefetch: c_int) -> c_int;
+    #[cfg(all(test, feature = "cuda-arms-qualification"))]
+    #[link_name = "inference_cuda_attn_decode_q8_arm_attrs"]
+    fn attn_decode_q8_arm_attrs_raw(prefetch: c_int, regs: *mut c_int, smem: *mut c_int) -> c_int;
+    #[cfg(all(test, feature = "cuda-arms-qualification"))]
+    #[link_name = "inference_cuda_attn_decode_q8_dispatched"]
+    fn attn_decode_q8_dispatched_raw() -> c_int;
+    #[cfg(all(test, feature = "cuda-arms-qualification"))]
+    #[link_name = "inference_cuda_attn_decode_q8_kernel_identity_reset"]
+    fn attn_decode_q8_kernel_identity_reset_raw() -> c_int;
+    #[cfg(all(test, feature = "cuda-arms-qualification"))]
+    #[link_name = "inference_cuda_attn_decode_q8_kernel_identity"]
+    fn attn_decode_q8_kernel_identity_raw(ran: *mut c_int) -> c_int;
+    #[cfg(all(test, feature = "cuda-arms-qualification"))]
+    #[link_name = "inference_cuda_attn_decode_q8_split_plan_device"]
+    fn attn_decode_q8_split_plan_device_raw(
+        n_keys: c_int,
+        max_splits: c_int,
+        min_keys: c_int,
+        chunk: *mut c_int,
+        n_active: *mut c_int,
+    ) -> c_int;
+    #[cfg(all(test, feature = "cuda-arms-qualification"))]
+    #[link_name = "inference_cuda_attn_decode_q8_split_plan"]
+    fn attn_decode_q8_split_plan_raw(
+        n_keys: c_int,
+        max_splits: c_int,
+        min_keys: c_int,
+        chunk: *mut c_int,
+        n_active: *mut c_int,
+    ) -> c_int;
     #[link_name = "inference_cuda_attn_decode_q8_launch"]
     fn attn_decode_q8_launch_raw(
         args: *const AttnDecodeQ8ArgsRaw,
@@ -77,6 +110,104 @@ unsafe extern "C" {
         stream: *mut c_void,
         out_stage: *mut c_int,
     ) -> c_int;
+}
+
+/// Zero the device-written kernel identity before a fixture leg.
+#[cfg(all(test, feature = "cuda-arms-qualification"))]
+pub(in crate::kernels::cuda) fn attn_decode_q8_kernel_identity_reset() -> Result<(), i32> {
+    // Safety: writes one device symbol int through the runtime API.
+    let code = unsafe { attn_decode_q8_kernel_identity_reset_raw() };
+    if code == 0 { Ok(()) } else { Err(code) }
+}
+
+/// Which kernel last wrote its identity ON DEVICE (1 legacy, 2 prefetch): unlike the
+/// host dispatch tag, a launch that resolves to the wrong kernel cannot produce this.
+#[cfg(all(test, feature = "cuda-arms-qualification"))]
+pub(in crate::kernels::cuda) fn attn_decode_q8_kernel_identity() -> Result<i32, i32> {
+    let mut ran: c_int = 0;
+    // Safety: passes a valid pointer to one int; no device pointers involved.
+    let code = unsafe { attn_decode_q8_kernel_identity_raw(&mut ran) };
+    if code == 0 { Ok(ran) } else { Err(code) }
+}
+
+/// The split plan computed by the DEVICE helper itself (1 thread), for pinning the
+/// device copy against the host mirror.
+#[cfg(all(test, feature = "cuda-arms-qualification"))]
+pub(in crate::kernels::cuda) fn attn_decode_q8_split_plan_device(
+    n_keys: i32,
+    max_splits: i32,
+    min_keys: i32,
+) -> Result<(i32, i32), i32> {
+    let (mut chunk, mut n_active): (c_int, c_int) = (0, 0);
+    // Safety: passes valid pointers to two ints; the FFI allocates and frees its own
+    // device buffer and rejects degenerate inputs before launching.
+    let code = unsafe {
+        attn_decode_q8_split_plan_device_raw(
+            n_keys,
+            max_splits,
+            min_keys,
+            &mut chunk,
+            &mut n_active,
+        )
+    };
+    if code == 0 {
+        Ok((chunk, n_active))
+    } else {
+        Err(code)
+    }
+}
+
+#[cfg(all(test, feature = "cuda-arms-qualification"))]
+pub(in crate::kernels::cuda) fn attn_decode_q8_dispatched() -> i32 {
+    // Safety: a relaxed atomic load; no pointers or device state involved.
+    unsafe { attn_decode_q8_dispatched_raw() }
+}
+
+/// Explicit arm control for the register-V decode attention:
+/// `prefetch` -1 follows `INFERENCE_CUDA_KV8_ATTN_V_PREFETCH` while 0/1 force the
+/// legacy/prefetch arm. A test or harness call site uses this instead of mutating the
+/// environment (edition 2024 denies `set_var` in this crate).
+#[cfg(all(test, feature = "cuda-arms-qualification"))]
+pub(in crate::kernels::cuda) fn attn_decode_q8_set_arms(prefetch: i32) -> Result<(), i32> {
+    // Safety: writes one thread-local int; no pointers or device state involved.
+    let code = unsafe { attn_decode_q8_set_arms_raw(prefetch) };
+    if code == 0 { Ok(()) } else { Err(code) }
+}
+
+/// The register count and static shared-memory bytes of one D=256 register-V instantiation
+/// (test-only): the fixture asserts the legacy and prefetch arms are two DIFFERENT kernels
+/// before comparing their outputs, so an arm toggle that silently compares a kernel with
+/// itself fails instead of passing vacuously.
+#[cfg(all(test, feature = "cuda-arms-qualification"))]
+pub(in crate::kernels::cuda) fn attn_decode_q8_arm_attrs(
+    prefetch: i32,
+) -> Result<(i32, i32), DeviceFailure> {
+    let (mut regs, mut smem) = (0_i32, 0_i32);
+    // Safety: two writable out-pointers of the declared width; no device state involved.
+    let rc = unsafe { attn_decode_q8_arm_attrs_raw(prefetch, &mut regs, &mut smem) };
+    if rc != 0 {
+        return Err(invalid_argument());
+    }
+    Ok((regs, smem))
+}
+
+/// The exact (chunk, n_active) split plan the kernel will use (test-only): the fixture pins
+/// that the caps 64/61/41 give distinct plans at 65,536 keys before any device leg.
+#[cfg(all(test, feature = "cuda-arms-qualification"))]
+pub(in crate::kernels::cuda) fn attn_decode_q8_split_plan(
+    n_keys: i32,
+    max_splits: i32,
+    min_keys: i32,
+) -> Result<(i32, i32), DeviceFailure> {
+    let (mut chunk, mut n_active) = (0_i32, 0_i32);
+    // Safety: two writable out-pointers of the declared width; pure arithmetic inside.
+    let rc = unsafe {
+        attn_decode_q8_split_plan_raw(n_keys, max_splits, min_keys, &mut chunk, &mut n_active)
+    };
+    if rc != 0 {
+        return Err(invalid_argument());
+    }
+    Ok((chunk, n_active))
 }
 
 /// Every integer argument of the launch, already bounded and converted by the wrapper before

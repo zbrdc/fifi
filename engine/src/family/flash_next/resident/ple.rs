@@ -1,4 +1,4 @@
-//! Resident PLE: the token-start row import and the PLE block (S1-C plan section 2.5; decision 0039 item 5).
+//! Resident PLE: the token-start row import and the PLE block.
 //!
 //! Hashing and row reads stay on the host. The embedding row and the PLE rows import packed with one
 //! synchronization and dequantize on the device. The block performs no synchronization.
@@ -187,7 +187,7 @@ mod tests {
     use crate::family::project::Projector;
     use crate::kernels::MlxKernels;
 
-    /// Asserts cosine >= 0.99999 and max relative error <= 1e-4 (plan section 4 option B).
+    /// Asserts cosine >= 0.99999 and max relative error <= 1e-4.
     fn assert_parity(got: &[f32], want: &[f32], what: &str) {
         let (mut err, mut scale, mut dot, mut gg, mut ww) =
             (0.0f64, 0.0f64, 0.0f64, 0.0f64, 0.0f64);

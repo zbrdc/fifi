@@ -1,6 +1,6 @@
-/* RD-4d: the per-step parameter block of the resident decode step, and the kernels that begin
- * a step, choose the greedy token and advance the position. One header per kernel file
- * (lane C ruling on O2); abi_resident.h stays closed.
+/* The per-step parameter block of the resident decode step, and the kernels that begin
+ * a step, choose the greedy token and advance the position. One header per kernel file;
+ * abi_resident.h stays closed.
  *
  * inference_cuda_step_params is the device image of StepParams: 32 bytes, 256-byte aligned in
  * the arena (the kernels need only 4-byte alignment). Other kernels take a 4-byte DeviceRange
@@ -8,9 +8,9 @@
  *   token_id  offset  0  read by the embedding gather; written by argmax (token chaining)
  *   pos       offset  4  read by attn_prep (rope angle)
  *   kv_len    offset  8  read by attn_decode; kv_len == pos + 1 once the step has appended
- *   kv_slot   offset 12  reserved; equals pos (REPLY-44)
- *   status    offset 16  flags by mask: 1 router fault (RD-5); 2 non-finite logits row (RD-4d);
- *                        4 invalid step state (RD-4d, step_begin; a defect when it appears, REPLY-47)
+ *   kv_slot   offset 12  reserved; equals pos
+ *   status    offset 16  flags by mask: 1 router fault; 2 non-finite logits row (argmax);
+ *                        4 invalid step state (step_begin; a defect when it appears)
  * A valid state is 0 <= pos <= 2^30 - 2, kv_len == pos + 1, kv_slot == pos.
  * token_id and status stay the device source of truth; the result pair of argmax is a copy.
  *
@@ -45,13 +45,13 @@ static_assert(sizeof(inference_cuda_step_params) == 32, "StepParams is 32 bytes"
 _Static_assert(sizeof(inference_cuda_step_params) == 32, "StepParams is 32 bytes");
 #endif
 
-/* Clears params->status: the status is zeroed at each step start (REPLY-44), then mask 4
+/* Clears params->status: the status is zeroed at each step start, then mask 4
  * (invalid step state) is set when the state is not valid (see above). First kernel of a step; the bits of the step
  * before were published to the host (result pair of argmax) at its end. One launch. */
 int inference_cuda_step_begin_launch(void *params, void *stream, int *out_stage);
 
 /* Last kernel of a step: pos += m, kv_len += m, and kv_slot += m (kv_slot is reserved and
- * equals pos, REPLY-44) when the state is valid and pos + m <= 2^30 - 2, so kv_len == pos + 1
+ * equals pos) when the state is valid and pos + m <= 2^30 - 2, so kv_len == pos + 1
  * holds after every advance. Otherwise all three words become -1 (never clamped to row 0) and
  * the next step_begin sets mask 4. token_id and status are never touched (argmax is the last
  * kernel that writes status). m in [1, 4096]. One launch. */

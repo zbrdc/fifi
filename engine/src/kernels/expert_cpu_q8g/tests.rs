@@ -220,8 +220,8 @@ fn extreme_rows(k: usize, rows: usize) -> (Vec<u8>, Vec<Vec<f32>>) {
     (w, vec![alternating, positive, negative])
 }
 
-/// On a host without AVX2 this prints "skipped" and passes, because then the scalar path is the only path
-/// there is; on a host with it (the danlap and kubdan CPUs) it compares every bit.
+/// On a host without AVX2 this prints "skipped" and passes, because then the scalar path is the
+/// only path there is; on a host with it, it compares every bit.
 #[test]
 fn avx2_equals_scalar_bitwise() {
     if DotBackend::detect() == DotBackend::scalar() {

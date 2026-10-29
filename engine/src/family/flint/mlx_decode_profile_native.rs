@@ -26,7 +26,7 @@ fn four_k_decode_sync_profile() -> io::Result<()> {
         || !crate::family::flint::mlx_forward::coalesce_residual_flagged()
     {
         return Err(io::Error::other(
-            "profile requires the serving piece-size env unset (it pins its own S4 512-row worker pieces) and D1 ON",
+            "profile requires the serving piece-size env unset (it pins its own 512-row worker pieces) and the residual coalesce ON",
         ));
     }
     let chained = crate::family::flint::mlx_forward::async_chain_flagged();
@@ -41,7 +41,7 @@ fn four_k_decode_sync_profile() -> io::Result<()> {
     let digest = format!("{:x}", Sha256::digest(&raw));
     if digest != "d72c7b49525c2c5fda9e60f6b6e5b1573a83c52199380524315d62a189185843" {
         return Err(io::Error::other(
-            "profile requires the frozen S4 4097-ID speed stimulus",
+            "profile requires the frozen 4097-ID speed stimulus",
         ));
     }
     let ids: Vec<u32> = serde_json::from_slice(&raw)?;
@@ -67,8 +67,9 @@ fn four_k_decode_sync_profile() -> io::Result<()> {
 }
 
 fn prefix(model: &mut Model, state: &mut State, ids: &[u32]) -> io::Result<()> {
-    // The S4 worker shapes, NOT the serving default: pinned [511, 512, ...,
-    // 512] pieces so the profile reproduces the S4 measurement exactly.
+    // Fixed worker shapes, NOT the serving default: pinned
+    // [511, 512, ..., 512] pieces so the profile reproduces the reference
+    // measurement exactly.
     for start in (0usize..4096).step_by(512) {
         let begin = start.saturating_sub(1);
         let end = (start + 512).min(4096) - 1;
@@ -219,14 +220,14 @@ fn observe(root: &Path, out: &Path, ids: &[u32], info: &mut Value) -> io::Result
         "ignores_eos":true,"production_eos_throughput":false,"prefix_fed_untimed":4095});
     Ok(())
 }
-// KV-plane copy-scale measurement (2026-10-25, window 9): how many plane rows
-// the decode path copies per step through concatenate/kv-append, split by
-// site and window (SWA) vs full-attention layers, at a 4k and an 8k prefix
-// (the model context limit). One row of one plane is 1 KiB (4x128 BF16), so
-// rows/step is KiB/step moved; every site records per keys/values call
-// separately. One `decode` call is 128 forwards; the timed window counts
-// only those. Synthetic deterministic ids (no frozen stimulus: no logits are
-// asserted). Mac GPU allocation via the parent-owned window protocol.
+// KV-plane copy-scale measurement: how many plane rows the decode path copies
+// per step through concatenate/kv-append, split by site and window (SWA) vs
+// full-attention layers, at a 4k and an 8k prefix (the model context limit).
+// One row of one plane is 1 KiB (4x128 BF16), so rows/step is KiB/step moved;
+// every site records per keys/values call separately. One `decode` call is
+// 128 forwards; the timed window counts only those. Synthetic deterministic
+// ids (no frozen stimulus: no logits are asserted). Mac GPU allocation via
+// the parent-owned window protocol.
 
 /// The four_k `prefix` helper hardcodes the 4096-token stimulus; this generic
 /// version feeds any length in the same [511, 512, ..., pending-last] worker
@@ -312,11 +313,11 @@ fn kv_plane_copy_scale() -> io::Result<()> {
     metadata(&out, &info)
 }
 
-/// Ring-view gate (2026-10-25, base-failing RED): with FIFI_FLINT_MLX_RING_VIEW
-/// forced on, a 4k-prefix decode must not materialize ANY full-plane union
-/// copy (union_concat/full and union_head_tail/full rows/step == 0) while the
-/// SWA planes keep their bounded two-slice union (> 0 rows/step). Pins the
-/// window-12 baseline (299,628 KiB/step total at 4k) until the slice lands.
+/// Ring-view gate: with FIFI_FLINT_MLX_RING_VIEW forced on, a 4k-prefix
+/// decode must not materialize ANY full-plane union copy (union_concat/full
+/// and union_head_tail/full rows/step == 0) while the SWA planes keep their
+/// bounded two-slice union (> 0 rows/step). The copy total without the ring
+/// view was 299,628 KiB/step at 4k.
 #[test]
 #[ignore = "requires exclusive parent-owned Mac window and native-fault-qualification"]
 fn ring_view_eliminates_full_plane_union_copies() -> io::Result<()> {
@@ -357,8 +358,8 @@ fn ring_view_eliminates_full_plane_union_copies() -> io::Result<()> {
             full_rows += u64::from(*rows);
         }
     }
-    // The report lands BEFORE the asserts so a failing run still leaves
-    // its evidence on disk (Opus SF-D).
+    // The report lands BEFORE the asserts so a failing run still leaves its
+    // evidence on disk.
     fs::write(
         out.join("ring-view-gate.json"),
         serde_json::to_vec_pretty(&json!({
@@ -386,16 +387,15 @@ fn ring_view_eliminates_full_plane_union_copies() -> io::Result<()> {
     Ok(())
 }
 
-/// Ring-view boundary sweep (2026-10-25 window 16): one model load per arm;
-/// the run wrapper executes this once flag-off and once flag-on and the
-/// comparison is host-side. Covers: per-prefix greedy logits digests at the
-/// ring/chunk/context boundaries (p0 = 0, 511-514, 2048, 4095-4097, 8064 =
-/// the last 128 rows to 8191, 8191, and the legacy 8192 context limit
-/// (sweep coverage predates the 32768 default)); a
-/// continuation (4k prefix -> decode -> 256-row multi-row chunk -> decode);
-/// a 600-token token-by-token prefill; per-phase device peak memory and
-/// process retire/flush/sync stats (the Opus O-2 watch item); and one
-/// 128-decode timing sample at 4k and at the 8k boundary.
+/// Ring-view boundary sweep: one model load per arm; the run wrapper executes
+/// this once flag-off and once flag-on and the comparison is host-side.
+/// Covers: per-prefix greedy logits digests at the ring/chunk/context
+/// boundaries (p0 = 0, 511-514, 2048, 4095-4097, 8064 = the last 128 rows to
+/// 8191, 8191, and the legacy 8192 context limit (sweep coverage predates the
+/// 32768 default)); a continuation (4k prefix -> decode -> 256-row multi-row
+/// chunk -> decode); a 600-token token-by-token prefill; per-phase device
+/// peak memory and process retire/flush/sync stats; and one 128-decode timing
+/// sample at 4k and at the 8k boundary.
 #[test]
 #[ignore = "requires exclusive parent-owned Mac window and native-fault-qualification"]
 fn ring_view_boundary_sweep() -> io::Result<()> {

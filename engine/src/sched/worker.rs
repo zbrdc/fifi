@@ -519,16 +519,16 @@ struct PromptPlan<'a> {
     root: Option<usize>,
 }
 
-/// The shortest root that a save point accepts (decision 0036, addendum 2, item 2a).
+/// The shortest root that a save point accepts.
 const MIN_ROOT_TOKENS: usize = 2_048;
 
-/// The stride of the periodic save points (decision 0036, addendum 2, item 2b): one entry at
-/// every multiple of this many positions counted from the start of the prompt.
+/// The stride of the periodic save points: one entry at every multiple of this many positions
+/// counted from the start of the prompt.
 const PERIODIC_TOKENS: usize = 16_384;
 
-/// The ordered save points of a job (decision 0036, addendum 2, item 2): the root at the end
-/// of the first system message, one periodic entry at every multiple of `PERIODIC_TOKENS`
-/// positions counted from the start of the prompt, and the tip at the last message boundary.
+/// The ordered save points of a job: the root at the end of the first system message, one
+/// periodic entry at every multiple of `PERIODIC_TOKENS` positions counted from the start of
+/// the prompt, and the tip at the last message boundary.
 /// The root runs only when the store keeps roots (`limits.roots > 0`), it reaches
 /// `MIN_ROOT_TOKENS`, lies strictly inside the tip, and the restore covered none of it. Without
 /// roots a root point would only split the prefill and change its chunk grouping for a save
@@ -537,7 +537,7 @@ const PERIODIC_TOKENS: usize = 16_384;
 /// (`limits.entries >= 2`): with one entry a periodic save would be replaced by the tip at
 /// once and spend a snapshot for nothing. Of the periodic points only the deepest
 /// `limits.entries - 1` are emitted, because the tip takes the last LRU place. The tip runs only
-/// when the restore covered none of it, today's rule.
+/// when the restore covered none of it.
 ///
 /// The prefill runs in chunks of `piece` tokens that start at the current cursor: the cursor
 /// starts at `restored` and moves to every point that this function emits, so a root at an
@@ -569,16 +569,16 @@ fn save_points(
     }
     if let Some(tip) = plan.boundary.filter(|_| cuts_intermediate(limits)) {
         debug_assert!(piece > 0, "the prefill piece is positive");
-        // The intermediate candidates: the periodic multiples below the tip and, when the
-        // block prefix-match is on (KV-v1 slice 2), the last block boundary strictly below
-        // the tip - the ruled rolling cut of the lineage. The walk visits the targets in
-        // order, a periodic first at a tie, so a boundary the lattice already cuts stays one
-        // save of the periodic kind; the block candidate rides the same move-to-chunk-end
-        // and below-the-tip rules, so it never shifts the periodic positions. The tie rule
-        // also holds after the move to the chunk end: a block target whose chunk end an
-        // unprocessed periodic target reaches is skipped, because every target in
-        // (block_target, moved] projects onto `moved`, and the shared position must keep the
-        // periodic kind, which a later rolling K=1 replacement cannot remove.
+        // The intermediate candidates: the periodic multiples below the tip and, when the block
+        // prefix-match is on, the last block boundary strictly below the tip - the ruled
+        // rolling cut of the lineage. The walk visits the targets in order, a periodic first at
+        // a tie, so a boundary the lattice already cuts stays one save of the periodic kind;
+        // the block candidate rides the same move-to-chunk-end and below-the-tip rules, so it
+        // never shifts the periodic positions. The tie rule also holds after the move to the
+        // chunk end: a block target whose chunk end an unprocessed periodic target reaches is
+        // skipped, because every target in (block_target, moved] projects onto `moved`, and the
+        // shared position must keep the periodic kind, which a later rolling K=1 replacement
+        // cannot remove.
         let mut targets: Vec<(usize, bool)> = (PERIODIC_TOKENS..tip)
             .step_by(PERIODIC_TOKENS)
             .map(|target| (target, false))
@@ -664,38 +664,34 @@ fn run_job<E: ExecutorOps>(
     ) {
         Ok(reused) => reused,
         Err(EngError::MemoryPlan(message)) => {
-            // Fix EV-1: a dead or idle conversation's cached prefixes must not pin the pool
-            // (the Mac daily RED: six entries of ~395 MB blocked a fresh 17,479-token session
-            // that needed 11,141,120 bytes with 7,696,432 available). Evict ONE entry at
-            // a time - a dead tip first, oldest first, the denied job's own anchor last
-            // (round 4d SF-1, radix tiers) - and retry after each, so a denial with a
-            // one-entry deficit costs one anchor, not every live lineage (the replay's
-            // t6 wave: the base's clear-all lost all sixteen entries to a ~3-6 entry
-            // deficit; the second miss there - request 0x18 - was a restore-time drop,
-            // split to the SF1 slice, not this eviction's doing). Each retry admits the
-            // prompt with no snapshots at all, so caching cannot re-block a
-            // prompt the pool can grow. When the last entry is gone and the admission still
-            // denies, the refusal only becomes the over-length form (fix EV-2) when the
-            // pool's ceiling honestly explains it - a client then compacts to a size that
-            // fits instead of losing the session to the RED's requests-0018/0019 growth
-            // errors - and the session still resets either way.
+            // A dead or idle conversation's cached prefixes must not pin the pool (six
+            // entries of ~395 MB once blocked a fresh 17,479-token session that needed
+            // 11,141,120 bytes with 7,696,432 available). Evict ONE entry at a time - a
+            // dead tip first, oldest first, the denied job's own anchor last (radix tiers)
+            // - and retry after each, so a denial with a one-entry deficit costs one
+            // anchor, not every live lineage (a clear-all once lost all sixteen entries to
+            // a ~3-6 entry deficit). Each retry admits the prompt with no snapshots at all,
+            // so caching cannot re-block a prompt the pool can grow. When the last entry is
+            // gone and the admission still denies, the refusal only becomes the over-length
+            // form when the pool's ceiling honestly explains it - a client then compacts to
+            // a size that fits instead of losing the session to repeated growth errors -
+            // and the session still resets either way.
             //
-            // Size the eviction before the restart (review round 4, SF2): evict while the
-            // pool's honest ceiling (fix EV-2) still cannot admit this prompt, so a
-            // k-entry deficit costs ONE restart, not k partial prefills. The ceiling
-            // covers the free budget plus this session's own permits, and every eviction
-            // keeps the denied job's own anchor for its last resort (review round 4, MF2).
-            // A `None` ceiling sizes nothing: stop after the first eviction and let the
-            // residual one-at-a-time loop below spend more as denials recur. The loop's
-            // FIRST `None` is terminal (Sol round 3, MF1): nothing can be freed, so no
-            // restart can ever admit this prompt - classify now instead of one dead
-            // restart (the batch worker's admission loop does the same).
+            // Size the eviction before the restart: evict while the pool's honest ceiling
+            // still cannot admit this prompt, so a k-entry deficit costs ONE restart, not k
+            // partial prefills. The ceiling covers the free budget plus this session's own
+            // permits, and every eviction keeps the denied job's own anchor for its last
+            // resort. A `None` ceiling sizes nothing: stop after the first eviction and let
+            // the residual one-at-a-time loop below spend more as denials recur. The loop's
+            // FIRST `None` is terminal: nothing can be freed, so no restart can ever admit
+            // this prompt - classify now instead of one dead restart (the batch worker's
+            // admission loop does the same).
             let mut terminal = false;
             loop {
                 let protect = match executor.restored_anchor_of(&*session) {
                     Some(id) => Some(id),
                     // No restore ran yet (an admission refusal inside `start`): the
-                    // entry this restart would restore goes last (review round 4, MF2).
+                    // entry this restart would restore goes last.
                     None => executor.restore_candidate(plan.tokens),
                 };
                 if executor.evict_one_prefix_entry(protect).is_none() {
@@ -710,10 +706,9 @@ fn run_job<E: ExecutorOps>(
                 }
             }
             if terminal {
-                // Classify only when the ceiling PROVES the prompt cannot fit (the
-                // honest over-length form, fix EV-2); a save-denial recovery with room
-                // to grow still takes the one no-save retry below (Sol round 3, MF1,
-                // preserves the fitting recovery of round 2).
+                // Classify only when the ceiling PROVES the prompt cannot fit (the honest
+                // over-length form); a save-denial recovery with room to grow still takes
+                // the one no-save retry below.
                 let fits_not = executor
                     .pool_prompt_ceiling(&*session)
                     .is_some_and(|ceiling| ceiling < u64::from(prompt_tokens));
@@ -758,7 +753,7 @@ fn run_job<E: ExecutorOps>(
                 Err(EngError::MemoryPlan(message)) => {
                     // The retry's refusal names the post-eviction pool, so it - not the first
                     // attempt's message with its pre-eviction availability - is what a client
-                    // sees when the ceiling does not explain the failure (review round 2).
+                    // sees when the ceiling does not explain the failure.
                     let error = classified(
                         executor,
                         &*session,
@@ -774,9 +769,9 @@ fn run_job<E: ExecutorOps>(
         Err(error) => return fail(executor, session, events, error, shared),
     };
     let reused_tokens = u32::try_from(reused).unwrap_or(u32::MAX);
-    // The report of the job's prefix store, taken after the prefill and before the first decode
-    // (packet SERVE-2-c item 3): the entries and bytes then include this job's save points.
-    // `None` is the report of an executor that keeps none (fix M3).
+    // The report of the job's prefix store, taken after the prefill and before the first decode:
+    // the entries and bytes then include this job's save points. `None` is the report of an
+    // executor that keeps none.
     let prefix = executor.prefix_report();
     let mut completion_tokens: u32 = 0;
     loop {
@@ -810,11 +805,11 @@ fn run_job<E: ExecutorOps>(
     }
 }
 
-/// The final error for an admission the pool refused (fix EV-2): the over-length form only
-/// when the pool's ceiling honestly explains the refusal - a ceiling that would admit this
-/// prompt is not why it failed, so the original refusal stands. A ceiling below the prompt
-/// names the largest prompt a fresh attempt could charge, which never exceeds the configured
-/// limit because `check_prompt` already refused prompts at or beyond it.
+/// The final error for an admission the pool refused: the over-length form only when the pool's
+/// ceiling honestly explains the refusal - a ceiling that would admit this prompt is not why it
+/// failed, so the original refusal stands. A ceiling below the prompt names the largest prompt
+/// a fresh attempt could charge, which never exceeds the configured limit because
+/// `check_prompt` already refused prompts at or beyond it.
 fn classified<E: ExecutorOps>(
     executor: &E,
     session: &E::Session,
@@ -831,17 +826,16 @@ fn classified<E: ExecutorOps>(
 }
 
 /// Resets the session, restores a saved prefix when the job has a boundary, runs `boundary`,
-/// and prefills the rest of the prompt in chunks. It prefills up to every save point of the
-/// job in turn (decision 0036, addendum 2: the root, the periodic entries, then the tip) and
-/// saves the prefix state at each point. Each segment is chunked from its own start, which is
-/// the cursor that `save_points` moved to the previous point, so the chunk sequence of the
-/// prefill is the one that `save_points` assumed. Returns the number of prompt tokens that the
-/// restore covered.
+/// and prefills the rest of the prompt in chunks. It prefills up to every save point of the job
+/// in turn (the root, the periodic entries, then the tip) and saves the prefix state at each
+/// point. Each segment is chunked from its own start, which is the cursor that `save_points`
+/// moved to the previous point, so the chunk sequence of the prefill is the one that
+/// `save_points` assumed. Returns the number of prompt tokens that the restore covered.
 ///
-/// `retrying` marks the eviction retry (fix EV-1), which runs with no save points at all: a
-/// snapshot that charges successfully at its own point can still starve the prefill tail that
-/// follows it (review round 2, MF1), so the retry admits the prompt with no snapshots and the
-/// next job rebuilds its cache from scratch.
+/// `retrying` marks the eviction retry, which runs with no save points at all: a snapshot that
+/// charges successfully at its own point can still starve the prefill tail that follows it, so
+/// the retry admits the prompt with no snapshots and the next job rebuilds its cache from
+/// scratch.
 fn start<E: ExecutorOps>(
     executor: &mut E,
     session: &mut E::Session,
@@ -1301,7 +1295,7 @@ mod tests {
     }
 
     /// The `Finished` event of a job whose executor reported `prefix`: the fake always reports
-    /// its store, so the value is `Some` even without a restore (fix M3).
+    /// its store, so the value is `Some` even without a restore.
     fn finished_with_prefix(
         prompt: u32,
         completion: u32,
@@ -1316,8 +1310,8 @@ mod tests {
         })
     }
 
-    /// The report of the fake's store: `entries` entries at a flat 1,000 charged bytes each
-    /// (fix L3), the hit of this job's restore, and its uncached count.
+    /// The report of the fake's store: `entries` entries at a flat 1,000 charged bytes each,
+    /// the hit of this job's restore, and its uncached count.
     fn fake_report(entries: u32, hit: PrefixHit, uncached: u32) -> Option<PrefixReport> {
         Some(PrefixReport {
             entries,
@@ -1385,8 +1379,8 @@ mod tests {
         store.lock().expect("store lock").keys()
     }
 
-    /// Starts an engine on a spy whose fake holds the addendum 2 limits and the block
-    /// prefix-match with the given spacing (KV-v1 slice 2), and returns the store view.
+    /// Starts an engine on a spy whose fake holds the two-root, six-entry limits and the block
+    /// prefix-match with the given spacing, and returns the store view.
     fn start_block_spy(
         chunk: usize,
         script: Vec<Vec<u32>>,
@@ -1400,8 +1394,8 @@ mod tests {
         (start_spy(chunk, spy), store)
     }
 
-    /// Starts an engine on a spy whose fake holds the addendum 2 limits (two roots, six
-    /// entries), and returns the store view for assertions.
+    /// Starts an engine on a spy whose fake holds the prefix limits of two roots and six
+    /// entries, and returns the store view for assertions.
     fn start_limited_spy(
         chunk: usize,
         script: Vec<Vec<u32>>,
@@ -1617,7 +1611,7 @@ mod tests {
             collect(queued_events),
             vec![
                 batch(&[], "", Some(DecodeFinish::Cancelled)),
-                // A queued job never ran, so it carries no executor report at all (fix M3).
+                // A queued job never ran, so it carries no executor report at all.
                 finished_with_prefix(2, 0, 0, None)
             ]
         );
@@ -2268,7 +2262,7 @@ mod tests {
             finished(1, 0),
         ];
         assert_eq!(collect(running_events), cancelled);
-        // The queued job never reached the executor, so its usage carries no report (fix M3).
+        // The queued job never reached the executor, so its usage carries no report.
         assert_eq!(
             collect(queued_events),
             vec![
@@ -2306,7 +2300,7 @@ mod tests {
             collect(late_events),
             vec![
                 batch(&[], "", Some(DecodeFinish::Cancelled)),
-                // The late job never ran: no executor report (fix M3).
+                // The late job never ran: no executor report.
                 finished_with_prefix(1, 0, 0, None)
             ]
         );
@@ -2379,7 +2373,7 @@ mod tests {
         // Every refused prompt starts with the saved key and carries a boundary, so a check that
         // ran only after the restore would have spent the entry before refusing the prompt.
         // The over-limit refusals carry both numbers in the machine-readable fields of the
-        // over-length form (fix EV-2): the message text is the server's rendering.
+        // over-length form: the message text is the server's rendering.
         for (name, len, prompt_tokens, limit_tokens) in [
             ("the limit", LIMIT, 8, 7),
             ("one over the limit", LIMIT + 1, 9, 7),
@@ -2514,7 +2508,7 @@ mod tests {
         );
         let (second, second_events) = job(&[2, 2, 2, 2, 2]);
         // The second job has no boundary: it reports the store the first job filled, with the
-        // miss of its own restore-free run (fix M4).
+        // miss of its own restore-free run.
         assert_eq!(
             run_one(&handle, second, second_events),
             stop_events_with_prefix(5, 0, fake_report(1, PrefixHit::Miss, 0))
@@ -2529,11 +2523,11 @@ mod tests {
         engine.shutdown();
     }
 
-    /// The report of a job without a boundary carries the store, not the previous job's hit
-    /// (fix M4): the worker resets every job and skips the restore when the job has no
-    /// boundary, so the reset must clear the restore facts. Job 1 stores a root and a tip, job
-    /// 2 restores the root and shares 52 tokens with the stored tip beyond it, job 3 runs
-    /// without a boundary and must report a miss with nothing uncached.
+    /// The report of a job without a boundary carries the store, not the previous job's hit:
+    /// the worker resets every job and skips the restore when the job has no boundary, so the
+    /// reset must clear the restore facts. Job 1 stores a root and a tip, job 2 restores the
+    /// root and shares 52 tokens with the stored tip beyond it, job 3 runs without a boundary
+    /// and must report a miss with nothing uncached.
     ///
     /// Mutation check: not clearing `prefix_hit` and `prefix_uncached` in the fake's `reset`
     /// makes job 3 report the root hit and job 2's 52 shared tokens.
@@ -2551,7 +2545,7 @@ mod tests {
         );
         // Job 2 shares the system prefix and 52 tokens more with the stored tip, but diverges
         // before it: it restores the root, and the 52 tokens it shares with the tip beyond the
-        // root are uncached (fix M2's longest common prefix).
+        // root are uncached (the longest common prefix).
         let mut second_prompt = vec![2; 2_100];
         second_prompt.extend(std::iter::repeat_n(7, 50));
         let (second, second_events) = job_with_points(&second_prompt, 2_100, ROOT);
@@ -2699,8 +2693,8 @@ mod tests {
         engine.shutdown();
     }
 
-    /// Starts an engine on a spy whose fake holds the addendum 2 limits and a session budget
-    /// (fix EV-1): every prefilled or decoded token charges `token_bytes`, every stored entry
+    /// Starts an engine on a spy whose fake holds the two-root, six-entry limits and a session
+    /// budget: every prefilled or decoded token charges `token_bytes`, every stored entry
     /// `entry_bytes`, against the cap.
     fn start_budgeted_spy(
         chunk: usize,
@@ -2731,11 +2725,10 @@ mod tests {
         );
     }
 
-    /// Fix EV-1, RED from the Mac daily log (mac-daily-log-red-evidence.md, requests 001a and
-    /// 001b): a fresh session could not admit - 11,141,120 bytes needed, 7,696,432 available -
-    /// while dead conversations' prefix entries held the pool. The worker sizes the eviction
-    /// against the pool's ceiling first and then retries the admission ONCE (round 4c,
-    /// R4-MF2 mirrors this in the batch worker).
+    /// A fresh session cannot admit while dead conversations' prefix entries hold the pool (one
+    /// observed case: 11,141,120 bytes needed, 7,696,432 available). The worker sizes the
+    /// eviction against the pool's ceiling first and then retries the admission ONCE (the batch
+    /// worker mirrors this).
     ///
     /// Mutation check: without the eviction call the fourth conversation fails with
     /// `memory_plan` and the assertion on its finished event fails.
@@ -2766,27 +2759,24 @@ mod tests {
             stored(&store).len(),
             1,
             "the two-anchor deficit cost the two oldest dead tips; the third survives (the \
-             contract change: clear-all became evict-until-fits, fix EV-1's blast radius)"
+             eviction runs until the prompt fits, it does not clear all)"
         );
         drop(handle);
         engine.shutdown();
     }
 
-    /// Fix EV-1's blast radius (the replay's t6 cliff, run override-16): a denied admission
-    /// in the BASE clears the WHOLE LRU - every live conversation's anchor included - and
-    /// retries with no snapshots, so the conversations that looked up after the denial find
-    /// nothing and re-prefill in full (the t6 wave: agents 0 and 2, reused_tokens 0,
-    /// 410/421 s against 235 s; note the clear-all did NOT cause BOTH misses - request
-    /// 0x18's loss was the restore-time adoption drop, split to the SF1 slice). The
-    /// eviction must free what the denial needs: one entry at a time, so a denial with a
-    /// one-entry deficit costs one anchor, not every lineage's. The admission-time
-    /// protection (`restore_candidate`) is weaker than the session one. Since SF1 a
-    /// denied restore no longer drops the anchor outright - it evicts one victim and
-    /// retries the same candidate - but the weak protect still loses it on a SECOND
-    /// denial, or when the candidate is the only LRU entry (the tier-4 last resort
-    /// spends it).
+    /// A clear-all on a denied admission empties the WHOLE LRU - every live conversation's
+    /// anchor included - and retries with no snapshots, so the conversations that look up
+    /// after the denial find nothing and re-prefill in full (on a multi-agent replay, two
+    /// agents restored 0 tokens and took 410 and 421 s against 235 s). The eviction must
+    /// free what the denial needs: one entry at a time, so a denial with a one-entry
+    /// deficit costs one anchor, not every lineage's. The admission-time protection
+    /// (`restore_candidate`) is weaker than the session one. A denied restore does not drop
+    /// the anchor outright - it evicts one victim and retries the same candidate - but the
+    /// weak protect still loses it on a SECOND denial, or when the candidate is the only
+    /// LRU entry (the tier-4 last resort spends it).
     ///
-    /// Mutation check: with today's clear-all the fourth conversation still finishes (the
+    /// Mutation check: with a clear-all the fourth conversation still finishes (the
     /// retry admits against the fully freed pool), but every anchor is gone and
     /// conversation 3's survival turn restores nothing - its assertion fails.
     #[test]
@@ -2815,8 +2805,8 @@ mod tests {
         );
         // The first conversation's second turn extends its own tip: the denial's ONE
         // eviction spent a LEAF (every entry here is a tip of its own lineage, so the
-        // oldest tip goes first - review round 4, MF3), and the
-        // two newer anchors must survive (today the clear-all wiped all three).
+        // oldest tip goes first), and the two newer anchors must survive (a clear-all wipes
+        // all three).
         let (job, events) = job_with_boundary(&vec![2; 152], 151);
         handle.try_submit(job).expect("submit");
         let events = collect(events);
@@ -2824,10 +2814,10 @@ mod tests {
             matches!(events.last(), Some(JobEvent::Finished(usage)) if usage.reused_tokens == 0),
             "the oldest anchor was the one the denial spent: {events:?}"
         );
-        // The newer anchors survive: conversation 3's second turn extends its own tip and
-        // must restore it (today the clear-all wiped every anchor and this restores
-        // nothing). Conversation 4 sits on the same store; one survivor discriminates the
-        // contract, and the oldest-sacrifice above pins the victim order.
+        // The newer anchors survive: conversation 3's second turn extends its own tip and must
+        // restore it (a clear-all wipes every anchor and this restores nothing). Conversation 4
+        // sits on the same store; one survivor discriminates the contract, and the
+        // oldest-sacrifice above pins the victim order.
         let (job, events) = job_with_boundary(&vec![3; 152], 151);
         handle.try_submit(job).expect("submit");
         let events = collect(events);
@@ -2839,22 +2829,20 @@ mod tests {
         engine.shutdown();
     }
 
-    /// Round 4d SF-5 / 4e SF-1 (Opus + Sol): the single worker's restored-anchor
-    /// protection fixture. The denied conversation's second turn restores its own
-    /// tip, the growth cannot fit, the pre-pass protects the restored anchor, and the
-    /// restart re-restores it (reused > 0) while the oldest OTHER dead tip spends and
-    /// the newest survives.
-    /// HONEST SCOPE (Opus round 4e SF-1 / Sol r5 SF2): this fixture does NOT
-    /// discriminate a no-protect mutant - the start RESTORES before it prefills
-    /// (exec_fake's restore always succeeds), which moves the denied conversation's
+    /// The single worker's restored-anchor protection fixture. The denied conversation's
+    /// second turn restores its own tip, the growth cannot fit, the pre-pass protects the
+    /// restored anchor, and the restart re-restores it (reused > 0) while the oldest OTHER
+    /// dead tip spends and the newest survives.
+    /// This fixture does NOT discriminate a no-protect mutant - the start RESTORES before it
+    /// prefills (exec_fake's restore always succeeds), which moves the denied conversation's
     /// entry to MRU, so the oldest other tip spends with or without protection. It
     /// exercises the wiring only (protect = the session's own restored anchor,
     /// `restored_anchor_of`); the per-slot-vs-global confusion is discriminated at
     /// store level by `an_eviction_protects_the_denied_lineage_not_the_last_restore`
     /// and `a_session_without_a_restore_does_not_protect_another_sessions_root`
-    /// (family/session.rs), and the SF1 knob test
-    /// `an_adoption_denial_evicts_one_victim_and_retries_the_same_candidate_on_the_
-    /// engine` (batch_worker_tests) exercises the STORE's own protect at the engine
+    /// (family/session.rs), and the adoption-denial knob test
+    /// `an_adoption_denial_evicts_one_victim_and_retries_the_same_candidate_on_the_engine`
+    /// (batch_worker_tests) exercises the STORE's own protect at the engine
     /// level: its candidate is the OLDEST entry, so a drop-first or no-protect mutant
     /// spends it and reused_tokens flips 100 -> 0. The worker's protect WIRING is not
     /// discriminated at engine level - this fixture covers the wiring only.
@@ -2900,12 +2888,12 @@ mod tests {
         engine.shutdown();
     }
 
-    /// Fix EV-2, the second half of the Mac daily log RED (requests 0018 and 0019): a request
-    /// that cannot fit even in an empty pool must fail in the typed over-length form - the
-    /// kind a client answers by compacting the conversation - not as a session-killer.
+    /// A request that cannot fit even in an empty pool must fail in the typed over-length
+    /// form - the kind a client answers by compacting the conversation - not as a
+    /// session-killer.
     ///
-    /// Mutation check: without the classification the event is `MemoryPlan` - the session
-    /// killer of the RED - and the assertion fails.
+    /// Mutation check: without the classification the event is `MemoryPlan` - a session
+    /// killer - and the assertion fails.
     #[test]
     fn an_admission_that_cannot_fit_even_after_eviction_fails_in_the_over_length_form() {
         let log = new_log();
@@ -2936,12 +2924,12 @@ mod tests {
         engine.shutdown();
     }
 
-    /// Review round 2, MF1 (Sol R2-1's exact scenario): a snapshot that charges
-    /// successfully on the retry can starve the prefill tail that follows it, so the
-    /// eviction retry admits the prompt with NO save points. The tip's entry charge
-    /// (3,000,000) beside the prompt (6,145,024) exceeds the cap (8,000,000): the first
-    /// attempt saves the tip and is denied mid-tail, and the retry - which without this
-    /// fix would save the tip again and deny at the same chunk - finishes the prompt.
+    /// A snapshot that charges successfully on the retry can starve the prefill tail that
+    /// follows it, so the eviction retry admits the prompt with NO save points. The tip's
+    /// entry charge (3,000,000) beside the prompt (6,145,024) exceeds the cap (8,000,000):
+    /// the first attempt saves the tip and is denied mid-tail, and the retry - which with
+    /// save points would save the tip again and deny at the same chunk - finishes the
+    /// prompt.
     ///
     /// Mutation checks: without the no-points retry the event is
     /// `Error(PromptTooLong { 6001, 4881 })`; without the eviction at all the first
@@ -2969,18 +2957,17 @@ mod tests {
         engine.shutdown();
     }
 
-    /// R6 of the RED list: the eviction retry runs with no save points at all, so the block
-    /// cut cannot fire in the retry window either - the cut flows through `save_points`,
-    /// which the retry empties, and the next job rebuilds from scratch (the 1f56bf74 rule
-    /// covers the new kind structurally). Sol SF2: spacing 1,024 (not 4) so the cut target
-    /// 1,024 is a chunk end strictly below the tip 2,000 - with spacing 4 the target 1,996
-    /// projected onto the tip itself and the block candidate never emitted, so the test
-    /// proved nothing about the retry window. Now the first attempt reaches the Block save
-    /// and stores it; the tip save's first charge fails (2,048,000 + 2 x 3,000,000 >
-    /// 8,000,000), it evicts the unprotected Block and succeeds on retry (2,048,000 +
-    /// 3,000,000 = 5,048,000), and the tip then starves the tail: the pool exhausts
-    /// mid-tail, and the retry resets, attempts a restore on the store the eviction already
-    /// emptied, re-feeds the whole prompt, and attempts no new saves. (Sol round-2 SF1.)
+    /// The eviction retry runs with no save points at all, so the block cut cannot fire in the
+    /// retry window either - the cut flows through `save_points`, which the retry empties, and
+    /// the next job rebuilds from scratch (the retry's no-save rule covers the new kind
+    /// structurally). The spacing is 1,024 (not 4) so the cut target 1,024 is a chunk end
+    /// strictly below the tip 2,000 - with spacing 4 the target 1,996 projected onto the tip
+    /// itself and the block candidate never emitted, so the test proved nothing about the retry
+    /// window. The first attempt reaches the Block save and stores it; the tip save's first
+    /// charge fails (2,048,000 + 2 x 3,000,000 > 8,000,000), it evicts the unprotected Block
+    /// and succeeds on retry (2,048,000 + 3,000,000 = 5,048,000), and the tip then starves the
+    /// tail: the pool exhausts mid-tail, and the retry resets, attempts a restore on the store
+    /// the eviction already emptied, re-feeds the whole prompt, and attempts no new saves.
     #[test]
     fn no_block_cuts_during_an_eviction_retry() {
         let log = new_log();
@@ -3051,9 +3038,9 @@ mod tests {
         engine.shutdown();
     }
 
-    /// Review round 2 (Sol P1-3): an executor that charges the pool for a snapshot inside
-    /// `save_prefix` denies every save with a memory-plan error: the first attempt fails
-    /// at its save, and the retry - which never saves at all (MF1) - finishes the prompt.
+    /// An executor that charges the pool for a snapshot inside `save_prefix` denies every
+    /// save with a memory-plan error: the first attempt fails at its save, and the retry -
+    /// which never saves at all - finishes the prompt.
     ///
     /// Mutation check: without the eviction retry the job fails with the save's
     /// memory-plan error.
@@ -3079,7 +3066,7 @@ mod tests {
             "the retry never saves and finishes the prompt: {events:?}"
         );
         assert_eq!(stored(&store).len(), 0, "no snapshot was stored");
-        // The retry fed its whole prompt in one pass with no save points (MF1): the two
+        // The retry fed its whole prompt in one pass with no save points: the two
         // attempts together fed 2,000 (the first attempt's head, up to the denied save)
         // + 6,001 (the retry's whole prompt) tokens. A retry that re-fed the head would
         // add 8,001 instead of 6,001.
@@ -3095,8 +3082,9 @@ mod tests {
         engine.shutdown();
     }
 
-    /// decision 0036 addendum 2 item 6: roots are best effort inside the cap). The fake denies
-    /// the charge of the first snapshot call only, which is the root.
+    /// A denied root save skips only the root and the tip still saves: roots are best effort
+    /// inside the cap. The fake denies the charge of the first snapshot call only, which is
+    /// the root.
     ///
     /// Mutation check: denying every charge instead makes the store and report rows fail.
     #[test]
@@ -3372,7 +3360,7 @@ mod tests {
     }
 
     /// The save points of a plan over eight tokens with the given tip and root, for a store
-    /// with the addendum 2 limits (two roots, six entries).
+    /// with two roots and six entries.
     fn points(
         boundary: Option<usize>,
         root: Option<usize>,
@@ -3417,7 +3405,7 @@ mod tests {
         super::save_points(&plan, restored, limits, piece, None)
     }
 
-    /// The limits of the addendum 2 store: two roots, six entries.
+    /// The limits of a store with two roots and six entries.
     const WIDE: StoreLimits = StoreLimits {
         roots: 2,
         entries: 6,
@@ -3489,10 +3477,10 @@ mod tests {
         );
     }
 
-    // --- KV-v1 slice 2: the block prefix-match cut in the save lattice ---
+    // --- the block prefix-match cut in the save lattice ---
 
-    /// `points_full` with the block prefix-match spacing (KV-v1 slice 2): `Some(spacing)` cuts
-    /// one rolling intermediate entry at the last block boundary strictly below the tip.
+    /// `points_full` with the block prefix-match spacing: `Some(spacing)` cuts one rolling
+    /// intermediate entry at the last block boundary strictly below the tip.
     fn points_block(
         boundary: Option<usize>,
         root: Option<usize>,
@@ -3633,11 +3621,11 @@ mod tests {
 
     #[test]
     fn a_block_target_below_a_periodic_that_reaches_its_chunk_end_yields_the_periodic() {
-        // Sol MF1: spacing 4,095, tip 16,400, piece 256. The block target
-        // floor(16,399 / 4,095) * 4,095 = 16,380 is below the periodic 16,384, but both reach
-        // the chunk end 16,384 = 64 * 256, so the tie happens after the projection. Emitting
-        // the Block there would give the shared position the replaceable kind, so the block
-        // is skipped and the periodic saves 16,384: the output equals the no-cut run.
+        // Spacing 4,095, tip 16,400, piece 256. The block target floor(16,399 / 4,095) * 4,095
+        // = 16,380 is below the periodic 16,384, but both reach the chunk end 16,384 = 64 *
+        // 256, so the tie happens after the projection. Emitting the Block there would give the
+        // shared position the replaceable kind, so the block is skipped and the periodic saves
+        // 16,384: the output equals the no-cut run.
         assert_eq!(
             points_block(
                 Some(16_400),
@@ -3950,12 +3938,12 @@ mod tests {
         engine.shutdown();
     }
 
-    /// R7 of the RED list: the tokens a rewritten prompt restores from a block cut count as
-    /// `reused_tokens` like any restore, and the report names the class `block`. The first
-    /// prompt (chunk 4, spacing 4) cuts a block entry at 2,144, the last 4-token boundary
-    /// below its tip 2,148; the rewrite shares the head to 2,146 tokens, so the tip is not a
-    /// prefix of it but the cut is, and the cut wins the restore. The restored cut stays
-    /// stored (rule (f) drops only a restored tip), so the next rewrite finds it again.
+    /// The tokens a rewritten prompt restores from a block cut count as `reused_tokens` like
+    /// any restore, and the report names the class `block`. The first prompt (chunk 4, spacing
+    /// 4) cuts a block entry at 2,144, the last 4-token boundary below its tip 2,148; the
+    /// rewrite shares the head to 2,146 tokens, so the tip is not a prefix of it but the cut
+    /// is, and the cut wins the restore. The restored cut stays stored (rule (f) drops only a
+    /// restored tip), so the next rewrite finds it again.
     #[test]
     fn block_restored_tokens_count_as_reused() {
         let log = new_log();
@@ -3991,7 +3979,7 @@ mod tests {
         engine.shutdown();
     }
 
-    /// The recall-cluster shape of the 176K attribution log (Sol round 2): warm append turns
+    /// The recall-cluster shape of a logged 176K-token conversation: warm append turns
     /// restore the tip and replace it, and a recall that rewrites the last ~23 tokens of the
     /// stable conversation finds no full-prefix tip - the divergence sits above the rolled
     /// block, so the restore reaches the block instead of restoring nothing (the log's

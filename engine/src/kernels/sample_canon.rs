@@ -1,6 +1,6 @@
-//! The request side of the canonical device sampler (IMPL-DEVSAMPLE-1, Design 2 and 4).
+//! The request side of the canonical device sampler.
 //!
-//! The CUDA kernels (landing with DEVSAMPLE-1 C3a) and the Rust reference in
+//! The CUDA kernels (not yet landed) and the Rust reference in
 //! `reference_tests` are to implement ONE definition of a draw and agree bit for bit. This
 //! file holds the part the executor needs at run time: the exact encoding of a request's
 //! `temperature` and `top_p` that the start block carries to the device.
@@ -11,7 +11,7 @@
 
 #![cfg_attr(
     not(test),
-    expect(dead_code, reason = "staged for DEVSAMPLE-1 C3a (SampleParams::draw)")
+    expect(dead_code, reason = "staged for the CUDA sampler (SampleParams::draw)")
 )]
 
 use crate::EngError;

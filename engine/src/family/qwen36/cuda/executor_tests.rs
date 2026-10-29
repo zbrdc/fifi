@@ -1,8 +1,7 @@
-//! Unit tests of the chunk gate and the `feed_rows` routing of the CUDA executor
-//! (CPF-7b part B; decision 0049, plan rev 3 section C.4). The step itself needs the
-//! CUDA device and the pinned 20 GB model, so the gate is pinned on its pure pieces, the
-//! routing on its one switch, the per-token identity on the shared `DecodeSession` over
-//! host steppers, and the device-only wiring on the merged source (the `start_pins` style).
+//! Unit tests of the chunk gate and the `feed_rows` routing of the CUDA executor. The step itself
+//! needs the CUDA device and the pinned 20 GB model, so the gate is pinned on its pure pieces, the
+//! routing on its one switch, the per-token identity on the shared `DecodeSession` over host
+//! steppers, and the device-only wiring on the merged source (the `start_pins` style).
 
 use super::common_tests;
 use super::dims::KvMode;
@@ -42,8 +41,8 @@ fn the_gate_accepts_a_native_fp16_plain_session_and_carries_the_admitted_m() {
         ChunkVerdict::Ready { m_sess: 2048 },
         "the accept case"
     );
-    // The ADMITTED size rides the accept verdict, never the cap (CPF-7b-C B.2): a session
-    // whose arena admitted 512 of a 2,048 cap reports 512.
+    // The ADMITTED size rides the accept verdict, never the cap: a session whose arena admitted 512
+    // of a 2,048 cap reports 512.
     let admitted = ChunkFacts {
         arena: Some(512),
         ..ready()
@@ -57,9 +56,8 @@ fn the_gate_accepts_a_native_fp16_plain_session_and_carries_the_admitted_m() {
 
 #[test]
 fn the_gate_refuses_each_condition_with_its_typed_reason() {
-    // Plan §C.4, one row per condition: the Tiled layout (decision 0049 A4 item 2), the
-    // KV8 cache (v1 has no KV8 prefill), the tiered session, and the Q6_K MMQ weight of
-    // the chunk (A6 item 4).
+    // One row per condition: the Tiled layout, the KV8 cache (v1 has no KV8 prefill), the tiered
+    // session, and the Q6_K MMQ weight of the chunk.
     let tiled = ChunkFacts {
         layout: WeightLayout::Tiled,
         ..ready()
@@ -84,7 +82,7 @@ fn the_gate_refuses_each_condition_with_its_typed_reason() {
 
 #[test]
 fn the_gate_reports_the_earliest_refusal() {
-    // The order of plan §C.4: Native, then Fp16, then tiered, then the Q6_K scan.
+    // The refusal order: Native, then Fp16, then tiered, then the Q6_K scan.
     let tiled_and_kv8 = ChunkFacts {
         layout: WeightLayout::Tiled,
         kv_mode: KvMode::Int8G32,
@@ -149,9 +147,9 @@ fn kv8_chunking_is_opt_in_and_keeps_the_other_refusals() {
 
 #[test]
 fn the_chunk_scan_covers_the_routed_stacks_and_the_shared_expert() {
-    // The MMQ weights of the chunk beside the dense projections (plan §A.4): the three
-    // routed expert stacks and the three shared-expert projections. The router (raw f32),
-    // the embedding gather and the decode-only head are not scanned.
+    // The MMQ weights of the chunk beside the dense projections: the three routed expert stacks and
+    // the three shared-expert projections. The router (raw f32), the embedding gather and the
+    // decode-only head are not scanned.
     assert_eq!(
         CHUNK_MOE_ROLES,
         [
@@ -223,9 +221,8 @@ fn the_chunk_scan_finds_a_q6_k_expert_stack() {
 
 #[test]
 fn the_chunk_scan_passes_a_load_whose_only_q6_k_is_the_head() {
-    // The pinned file's only Q6_K tensor is `output.weight` (the head), which never meets
-    // the chunk's MMQs (0049 item 2): the scan must not ask for it, so a load whose only
-    // Q6_K is the head accepts.
+    // The pinned file's only Q6_K tensor is `output.weight` (the head), which never meets the
+    // chunk's MMQs: the scan must not ask for it, so a load whose only Q6_K is the head accepts.
     let (table, geometry) = scan_fixtures();
     let quant_of = |name: &str| {
         if name == "output.weight" {
@@ -256,9 +253,8 @@ fn absent_moe_stacks_read_as_not_q6_k_under_a_tiered_load() {
 
 #[test]
 fn an_absent_dense_projection_is_refused_by_name() {
-    // Review B-3 with review MINOR-2 folded in: dense projections load in every mode, so a
-    // missing one is a `Checkpoint` refusal naming the tensor, never a silent skip that
-    // would under-report the gate.
+    // Dense projections load in every mode, so a missing one is a `Checkpoint` refusal naming the
+    // tensor, never a silent skip that would under-report the gate.
     let (table, geometry) = scan_fixtures();
     let kind = table.slot(0).expect("layer 0").kind;
     let role = geometry
@@ -282,8 +278,8 @@ fn an_absent_dense_projection_is_refused_by_name() {
 
 #[test]
 fn the_chunk_path_takes_the_admitted_m_sess() {
-    // THE switch (plan §C.4): until CPF-7a lands the chunk driver, every verdict — each
-    // refusal and the accept — keeps the per-token arm, so no session's behaviour changes.
+    // THE switch: every refusal keeps the per-token arm, and only the accept takes the chunk arm at
+    // its admitted `m_sess`.
     for verdict in [
         ChunkVerdict::TiledLayout,
         ChunkVerdict::Kv8,
@@ -509,10 +505,10 @@ fn c2_staging_preserves_store_and_reporting_is_read_only() {
 
 #[test]
 fn feed_rows_routes_through_the_chunk_gate() {
-    // The step cannot run on the CPU, so the wiring is pinned on the merged source through
-    // the `start_pins` matcher (comments stripped, whitespace collapsed, so a comment or a
-    // dead spelling cannot satisfy a pin; review B-4): the override routes every batch
-    // through `chunk_ready` and takes its arm through the per-token loop.
+    // The step cannot run on the CPU, so the wiring is pinned on the merged source through the
+    // `start_pins` matcher (comments stripped, whitespace collapsed, so a comment or a dead
+    // spelling cannot satisfy a pin): the override routes every batch through `chunk_ready` and
+    // takes its arm through the per-token loop.
     let body = pinned(section_of(
         include_str!("executor.rs"),
         "executor.rs",
@@ -565,9 +561,9 @@ fn the_step_builds_its_chunk_facts_and_the_start_hands_the_cap_over() {
 
 #[test]
 fn a_commented_out_cap_call_does_not_satisfy_the_pin() {
-    // Review B-4: the pins strip comments through the `start_pins` matcher, so commenting
-    // out the cap handover must FAIL the pin. The row runs the matcher on a doctored
-    // `make`: the commented call is gone after stripping, the live call stays.
+    // The pins strip comments through the `start_pins` matcher, so commenting out the cap handover
+    // must FAIL the pin. The row runs the matcher on a doctored `make`: the commented call is gone
+    // after stripping, the live call stays.
     let doctored = "fn make(rules: QwenRules) -> Result<()> {
     let mut step = QwenResidentStep::new(context, res, weights, options, rules)?;
     // step.set_m_sess_cap(DEFAULT_CUDA_PREFILL_CHUNK);
@@ -627,8 +623,8 @@ fn default_worker_regrouping_preserves_the_cuda_chunk_plan() {
     }
 }
 
-/// H-B7 (CPF-7b-C D.1): the initial worker piece is the admitted M_sess, and every refusal
-/// answers None so the caller's fallback stands.
+/// The initial worker piece is the admitted M_sess, and every refusal answers None so the caller's
+/// fallback stands.
 #[test]
 fn the_worker_piece_follows_the_verdict() {
     for m_sess in [2048usize, 1024, 512, 256, 128] {

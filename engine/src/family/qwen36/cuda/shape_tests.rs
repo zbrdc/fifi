@@ -1,4 +1,4 @@
-//! Unit tests of the shape builders of the mixer wrappers (test seam U13). CPU only.
+//! Unit tests of the shape builders of the mixer wrappers. CPU only.
 use super::{
     common_tests::dims,
     mixer_geometry::MixerGeometry,
@@ -54,10 +54,10 @@ fn the_attention_shapes_pin_every_scalar_argument() {
 
 #[test]
 fn the_attention_shapes_forward_the_kv_capacity_they_are_given() {
-    // Packet RD-9b3b section 2 pins `rows == KV capacity` and `cache_rows == capacity`: the
-    // builders must forward the capacity the executor passes (`layout().kv.capacity`), not a
-    // constant. The pin uses a capacity unlike the plan fixture's 1024 (`context_tokens`), so a
-    // hard-coded 1024 cannot pass it.
+    // The attention shapes require `rows == KV capacity` and `cache_rows == capacity`: the builders
+    // must forward the capacity the executor passes (`layout().kv.capacity`), not a constant. The
+    // pin uses a capacity unlike the plan fixture's 1024 (`context_tokens`), so a hard-coded 1024
+    // cannot pass it.
     let capacity = 1536;
     let p = attn_prep_shape(&geometry(), capacity);
     assert_eq!(p.rows, capacity, "prep must forward the KV capacity");
@@ -68,10 +68,10 @@ fn the_attention_shapes_forward_the_kv_capacity_they_are_given() {
     );
 }
 
-/// The Int8G32 attention shapes (KV8-B B3, pinned per the B2/B3 review item 2): every scalar
-/// argument of the append and the q8 decode, the capacity forwarding, and the equality the
-/// step's status argument depends on: the append bounds the pos word by the SAME cell count
-/// the rows entry of `attn_prep` bounds it by (`kv8_shape.cells == attn_prep_shape.rows`).
+/// The Int8G32 attention shapes: every scalar argument of the append and the q8 decode, the
+/// capacity forwarding, and the equality the step's status argument depends on: the append bounds
+/// the pos word by the SAME cell count the rows entry of `attn_prep` bounds it by
+/// (`kv8_shape.cells == attn_prep_shape.rows`).
 #[test]
 fn the_int8_attention_shapes_pin_every_scalar_argument() {
     let g = geometry();

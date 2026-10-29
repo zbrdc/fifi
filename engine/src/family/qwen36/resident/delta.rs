@@ -1,12 +1,12 @@
-//! Resident DeltaNet step of the Q36 family (packet Q36-C2).
+//! Resident DeltaNet step of the Q36 family.
 //!
-//! The graph follows `flash_next/resident/deltanet.rs` with the rules of `qwen36/host.rs::delta_step`:
-//! the output gate is `silu(z)` (Flash-Next: `sigmoid(z)`), and the query and key norm adds
-//! `key_dim * 1e-6` to the sum of squares (Flash-Next: `1e-6`). The delta rule itself runs in the
-//! gated delta kernel of decision 0050, which takes the key heads without repetition and keeps the
-//! state as `[VH, VD, KD]`, the layout of the host reference.
+//! The graph follows `flash_next/resident/deltanet.rs` with the rules of
+//! `qwen36/host.rs::delta_step`: the output gate is `silu(z)` (Flash-Next: `sigmoid(z)`), and the
+//! query and key norm adds `key_dim * 1e-6` to the sum of squares (Flash-Next: `1e-6`). The delta
+//! rule itself runs in the gated delta kernel, which takes the key heads without repetition and
+//! keeps the state as `[VH, VD, KD]`, the layout of the host reference.
 //!
-//! The step only builds lazy graph nodes. It never reads back or evaluates (decision 0039 item 2).
+//! The step only builds lazy graph nodes. It never reads back or evaluates.
 
 use super::ops::{Ctx, cast_to, dim, linear, to_act};
 use super::weights::RDelta;
@@ -56,11 +56,10 @@ pub(super) fn step(
     x: &ExecutionTensor,
 ) -> Result<DeltaStep, EngError> {
     check_state_shapes(shape, rec, ring)?;
-    // The compiled decode closure (packet MX-COMPILE-1a): the `qwen36.compile` setting (or the
-    // test override of
-    // `QWEN36_G2A_COMPILE`) runs this step through ONE compiled closure instead of the op
-    // sequence below, in the activation dtype of the step. There is no fallback: a failure of
-    // the compiled path is a native failure of the adapter.
+    // The compiled decode closure: the `qwen36.compile` setting (or the test override of
+    // `QWEN36_G2A_COMPILE`) runs this step through ONE compiled closure instead of the op sequence
+    // below, in the activation dtype of the step. There is no fallback: a failure of the compiled
+    // path is a native failure of the adapter.
     if super::compiled::step_requested(ctx.compile) {
         return super::compiled::delta_step(ctx, shape, w, rec, ring, x);
     }
@@ -133,9 +132,9 @@ pub(super) fn step_projected(
     let taps = dim(d.conv_kernel)?.checked_sub(1).ok_or_else(overflow)?;
     let kw = kh.checked_mul(kd).ok_or_else(overflow)?;
     let kw2 = kw.checked_mul(2).ok_or_else(overflow)?;
-    // Packet Q36-BF16-a: the recurrence, its state, and the convolution ring stay F32. `u`, `z`,
-    // and `aa` meet an F32 weight or state first and promote on their own. `bb` feeds a sigmoid
-    // alone and the gated delta kernel takes F32 `beta`, so it converts here.
+    // Under a BF16 activation the recurrence, its state, and the convolution ring stay F32. `u`,
+    // `z`, and `aa` meet an F32 weight or state first and promote on their own. `bb` feeds a
+    // sigmoid alone and the gated delta kernel takes F32 `beta`, so it converts here.
     let bb = cast_to(ctx, bb, Dtype::F32)?;
     let consts = ctx.consts;
     let m = &mut *ctx.kernels;

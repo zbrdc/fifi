@@ -1,18 +1,17 @@
-//! Device tests of the NATIVE MoE block of MATVEC-PAR S3b (packet tests 7, 9 and 10), in the
-//! MSG-73 isolation split: the device phase of tests 7 and 9 (`tiled_and_native`,
-//! `eager_and_captured`, both built on `run_block`) creates its own context, stream, weights and
-//! buffers, has only `?` inside - no assert, expect or unwrap - and hands back host `Vec`s; every
-//! device owner drops when the phase returns, and only THEN do the asserts run. The tests return
-//! `Result`, so a device error is the test's `Err` rather than a panic with a live owner
-//! (MSG-76 N2): a drop while panicking would latch the backend terminal for the rest of a
-//! one-process suite. Test 9 captures for real: `ctx.capture` records `run_moe_block`, one
-//! `graph.launch` replays it (MSG-76 N1).
+//! Device tests of the NATIVE MoE block, in the isolation split of `native_device_rig.rs`: the
+//! device phase of the layout and capture tests (`tiled_and_native`, `eager_and_captured`, both
+//! built on `run_block`) creates its own context, stream, weights and buffers, has only `?`
+//! inside - no assert, expect or unwrap - and hands back host `Vec`s; every device owner drops when
+//! the phase returns, and only THEN do the asserts run. The tests return `Result`, so a device
+//! error is the test's `Err` rather than a panic with a live owner: a drop while panicking would
+//! latch the backend terminal for the rest of a one-process suite. The capture test captures for
+//! real: `ctx.capture` records `run_moe_block`, one `graph.launch` replays it.
 //!
-//! Test 7's bounds are DERIVED per hop (MSG-73 F6): the gate/up hop's input row is the router's
-//! norm row, the down hop's input is the swiglu output whose per-block scales the phase reads
-//! back from the produced q8 pack (each hop's own `A`, the shared down hop's from the shared
-//! pack), and some shared row's signal is asserted at 3x ITS OWN bound so a zeroed or swapped
-//! shared term (m9) cannot hide inside the bounds.
+//! The layout test's bounds are DERIVED per hop: the gate/up hop's input row is the router's norm
+//! row, the down hop's input is the swiglu output whose per-block scales the phase reads back from
+//! the produced q8 pack (each hop's own `A`, the shared down hop's from the shared pack), and some
+//! shared row's signal is asserted at 3x ITS OWN bound so a zeroed or swapped shared term (m9)
+//! cannot hide inside the bounds.
 use super::moe::{ExpertBufs, Launch, MoeBuffers, Packs, RouteBufs, run_moe_block};
 use super::native_device_rig::{
     DIMS, Sources, assert_finite, device_present, f32_buf, hop_bound, host_router, q8_1_bytes,
@@ -275,9 +274,9 @@ pub(super) fn run_block(
     read_back(stream, &b)
 }
 
-/// Test 7's device phase: one upload of the rig weights, the Tiled and the Native run. Every
-/// device owner (context, stream, weights, buffers) drops when this returns; the test asserts
-/// on the returned host data only (MSG-76 N2).
+/// The device phase of `native_moe_block_matches_the_tiled_block`: one upload of the rig weights,
+/// the Tiled and the Native run. Every device owner (context, stream, weights, buffers) drops when
+/// this returns; the test asserts on the returned host data only.
 fn tiled_and_native(s: &Sources) -> Result<(BlockRun, BlockRun), EngError> {
     let ctx = CudaContext::new()?;
     let stream = ctx.stream()?;
@@ -287,10 +286,10 @@ fn tiled_and_native(s: &Sources) -> Result<(BlockRun, BlockRun), EngError> {
     Ok((tiled, native))
 }
 
-/// Test 9's device phase: an eager Native run (which also loads every kernel module the
-/// capture records: a first launch inside a window is refused), then a REAL capture of
-/// `run_moe_block` over fresh buffers - the producer queued eagerly before the window, the
-/// block recorded, the graph launched once - and the read-back of the replay (MSG-76 N1).
+/// The device phase of `native_block_inside_a_capture_equals_eager`: an eager Native run (which
+/// also loads every kernel module the capture records: a first launch inside a window is refused),
+/// then a REAL capture of `run_moe_block` over fresh buffers - the producer queued eagerly before
+/// the window, the block recorded, the graph launched once - and the read-back of the replay.
 fn eager_and_captured(s: &Sources) -> Result<(BlockRun, BlockRun), EngError> {
     let ctx = CudaContext::new()?;
     let stream = ctx.stream()?;
@@ -325,7 +324,7 @@ fn eager_and_captured(s: &Sources) -> Result<(BlockRun, BlockRun), EngError> {
     Ok((eager, captured))
 }
 
-/// Packet test 7: the synthetic block twice - the tiles of one upload and the native blocks of
+/// The synthetic block twice - the tiles of one upload and the native blocks of
 /// another, the SAME random sources - with the router checked against the f64 host reference
 /// (order and weights: 16 experts, 8 picks), the derived per-hop bounds on the gate/up halves,
 /// the shared row and the combined residual, and some shared row's signal asserted at 3x its
@@ -339,8 +338,8 @@ fn native_moe_block_matches_the_tiled_block() -> Result<(), EngError> {
     assert_finite("the norm row input", &s.norm);
     assert_finite("the residual input", &s.resid);
     assert_finite("the router matrix", &s.router);
-    // The device phase returns host data with every device owner already dropped; a device
-    // error is this test's Err, never a panic with a live owner (MSG-76 N2).
+    // The device phase returns host data with every device owner already dropped; a device error is
+    // this test's Err, never a panic with a live owner.
     let (tiled, native) = tiled_and_native(&s)?;
     // Everything below runs on host data only (the isolation split).
     for run in [&tiled, &native] {
@@ -455,7 +454,7 @@ fn native_moe_block_matches_the_tiled_block() -> Result<(), EngError> {
     Ok(())
 }
 
-/// Packet test 9: the Native block inside a REAL capture (`ctx.capture`, then one
+/// The Native block inside a REAL capture (`ctx.capture`, then one
 /// `graph.launch`) equals the eager run bitwise. The graph bakes the buffer addresses; the
 /// router writes the ids INSIDE the graph, so the replay follows them.
 #[test]
@@ -465,7 +464,7 @@ fn native_block_inside_a_capture_equals_eager() -> Result<(), EngError> {
     }
     let s = sources(0x5eed_9ca9);
     assert_finite("the norm row input", &s.norm);
-    // Device phase: owners drop inside; errors are this test's Err (MSG-76 N1, N2).
+    // Device phase: owners drop inside; errors are this test's Err.
     let (eager, cap) = eager_and_captured(&s)?;
     assert_finite("the eager residual", &eager.resid_out);
     assert_finite("the captured residual", &cap.resid_out);
@@ -482,7 +481,7 @@ fn native_block_inside_a_capture_equals_eager() -> Result<(), EngError> {
     Ok(())
 }
 
-/// Packet test 10: the router input must not change - the NATIVE producer's f32 `NormRow`
+/// The router input must not change - the NATIVE producer's f32 `NormRow`
 /// bytes equal the Tiled `norm_out` bytes of `add_norm_pack` on the same (h, delta, weight),
 /// with and without the delta add. The DEVICE phase queues the four launches and reads all six
 /// rows back; the asserts compare host bytes only.

@@ -1,7 +1,7 @@
-//! Pure builders of the shape arguments of the mixer wrappers (packets RD-9b3a, RD-9b3b): plain
-//! structs without device ranges, so a CPU test pins every scalar argument of a launch, and the
-//! epsilon rule of the DeltaNet kernels. The executor calls these and nothing else for the
-//! non-slot arguments of the wrapper calls.
+//! Pure builders of the shape arguments of the mixer wrappers: plain structs without device ranges,
+//! so a CPU test pins every scalar argument of a launch, and the epsilon rule of the DeltaNet
+//! kernels. The executor calls these and nothing else for the non-slot arguments of the wrapper
+//! calls.
 
 use super::{mixer_geometry::MixerGeometry, mixer_ops::BLOCK_ROWS};
 use crate::{
@@ -77,8 +77,8 @@ pub(super) fn attn_decode_shape(g: &MixerGeometry, rows: usize) -> AttnShape {
     }
 }
 
-/// The KV8 append of the Int8G32 step (KV8-B B3): `cells` is the plane cell count (the KV
-/// capacity of the state), which bounds the device pos word.
+/// The KV8 append of the Int8G32 step: `cells` is the plane cell count (the KV capacity of the
+/// state), which bounds the device pos word.
 pub(super) fn kv8_shape(g: &MixerGeometry, cells: usize) -> Kv8Shape {
     Kv8Shape {
         rows: BLOCK_ROWS,
@@ -89,7 +89,7 @@ pub(super) fn kv8_shape(g: &MixerGeometry, cells: usize) -> Kv8Shape {
     }
 }
 
-/// The KV8 decode attention of the Int8G32 step (KV8-B B3): `cells` is the plane cell count.
+/// The KV8 decode attention of the Int8G32 step: `cells` is the plane cell count.
 pub(super) fn attn_q8_shape(g: &MixerGeometry, cells: usize) -> AttnQ8Shape {
     let a = &g.attn;
     AttnQ8Shape {

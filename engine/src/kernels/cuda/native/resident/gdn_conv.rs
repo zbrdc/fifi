@@ -1,13 +1,12 @@
 //! Raw FFI to `inference_cuda_gdn_conv_launch` of `native/resident/gdn_conv.cu` (declared in
-//! `native/resident/gdn_conv.h`): the launch shim of the vendored `conv_silu_k` (RD-7a, decision
-//! 0047, stage 1). Child of `native::resident`, so it inherits the `allow(unsafe_code)` of
-//! `native.rs` (decision 0047, child modules of `native.rs`).
+//! `native/resident/gdn_conv.h`): the launch shim of the vendored `conv_silu_k`. Child of
+//! `native::resident`, so it inherits the `allow(unsafe_code)` of `native.rs`.
 //!
-//! The kernel is vendored xavier-qwen code, restored in RD-4V.
+//! The kernel is vendored xavier-qwen code.
 //!
 //! Safety invariants this file relies on:
 //! - The entry is called only through `CudaContext::launch_on`, on the owning thread and under the
-//!   dispatch guard (decisions 0023 and 0024). It only enqueues and returns the launch status.
+//!   dispatch guard. It only enqueues and returns the launch status.
 //! - Every range is a `RawRange`, proved inside a live allocation by `RawRange::new`. Sizes,
 //!   alignment and disjointness (`super::Span`) are proved again here, before the call, on the
 //!   extents the kernel touches; the C entry repeats the checks on the addresses.
@@ -18,7 +17,7 @@
 //!   here and pinned by a `const` assert to the field order of `gdn_conv.h`. No raw pointer and no
 //!   unsafe function leaves this module.
 //! - The conv state is planar `[3][channels]` on the device; ggml keeps `[channel][tap]`. Import
-//!   and export of a state (owner RD-9a2) must transpose it.
+//!   and export of a state must transpose it.
 
 use std::ffi::{c_int, c_void};
 use std::mem::{offset_of, size_of};

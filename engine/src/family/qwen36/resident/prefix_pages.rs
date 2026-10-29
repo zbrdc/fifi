@@ -1,4 +1,4 @@
-//! The page-table allowance of the Q-R1 state-only prefix entries (one rule, review (e)):
+//! The page-table allowance of the state-only prefix entries (one rule):
 //! an entry charges the fixed DeltaNet bytes plus the bounded page-table allowance of its
 //! alias - never the KV of its positions. The allowance is a pure position-to-pages rule,
 //! pinned by a portable test; the earlier PagePool/Alias bookkeeping never reached
@@ -18,7 +18,7 @@ pub(super) struct Page {
 }
 
 /// THE allowance rule: the page-table rows an alias of `pos` positions covers. Exactly one
-/// formula for the whole engine (review (e): never two); the snapshot charges this, nothing
+/// formula for the whole engine, never two; the snapshot charges this, nothing
 /// else re-derives it.
 pub(super) fn allowance_pages(pos: u32) -> u64 {
     (u64::from(pos) / PAGE_POSITIONS as u64 + 1).max(1)

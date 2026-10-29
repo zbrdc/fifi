@@ -1,7 +1,7 @@
-// ane_bridge.mm — ANE decision-head bridge (ANE-RE-01 findings applied).
+// ane_bridge.mm — ANE decision-head bridge.
 // Private AppleNeuralEngine APIs via objc_msgSend. One static MIL program per
 // handle built only from numerically verified ops (matmul, bias add,
-// sigmoid+mul SiLU), with ANE-RE-01 layout rules:
+// sigmoid+mul SiLU), with these layout rules:
 //   1. CONST tensors live in ONE FILE PER TENSOR (w1.bin, b1.bin, w2.bin,
 //      b2.bin) — the pattern the probe's training pipeline used; a single
 //      multi-chunk blob scrambles consts after the first.

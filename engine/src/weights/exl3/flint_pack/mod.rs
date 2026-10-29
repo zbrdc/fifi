@@ -11,9 +11,6 @@
 //! sizes, the 16-bit non-quantized roles, and the scale vectors. It reads only headers and the
 //! small scale, marker, norm, sink and router ranges; trellis payloads are read only for a
 //! caller-bounded sample admitted through `Matrix::load`.
-//!
-//! Study references (ideas only, no code taken): the TandemLLM Flint EXL3 record in
-//! `ledger/research/tandemllm-flint-exl3-8d2b2c1/REPORT.md`.
 
 mod audit;
 mod factor;

@@ -1,12 +1,12 @@
 //! Raw FFI to the KV8 append entries of `native/resident/kv8_append.cu` (declared in
-//! `native/resident/kv8_append.h`), RD-8k. Child module of `native/resident.rs`, so it inherits
+//! `native/resident/kv8_append.h`). Child module of `native/resident.rs`, so it inherits
 //! the `allow(unsafe_code)` of `native.rs`.
 //!
 //! The layout follows Strata's k34-kv8 `laguna_kv8_view.hpp` (int8 variant only).
 //!
 //! Safety invariants this file relies on:
 //! - The launch entries are called only through `CudaContext::launch_on`, on the thread that owns
-//!   the context and under the dispatch guard (decisions 0023 and 0024). They only enqueue.
+//!   the context and under the dispatch guard. They only enqueue.
 //! - Every range is a `RawRange`, proved inside a live allocation. Sizes, alignment and
 //!   disjointness (`super::Span`) are proved again here, on the extents the kernel touches,
 //!   before the call; the C entries repeat the alignment and shape checks on the addresses.

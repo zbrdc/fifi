@@ -760,7 +760,7 @@ fn output_assembler_stops_on_any_eos_id() {
     );
 }
 
-// S8-T1: a scripted executor yields the expected delta texts and finish.
+// A scripted executor yields the expected delta texts and finish.
 #[test]
 fn s8_t1_scripted_executor_yields_deltas_and_finish() {
     let mut j = job(
@@ -783,8 +783,8 @@ fn s8_t1_scripted_executor_yields_deltas_and_finish() {
     assert_eq!(j.executor.history(&j.session), &[1, 0, 0, 0, OUTPUT_EOS]);
 }
 
-// S8-T2: the stop text stays in the batch text and tokens. The assembler hides it.
-// The tokens after the stop stay committed until Phase 2 defines the discard rule
+// The stop text stays in the batch text and tokens. The assembler hides it. The tokens
+// after the stop stay committed until a later change defines the discard rule
 // (`family-descriptor.md`, consumed prefix).
 #[test]
 fn s8_t2_batch_keeps_the_stop_text_and_the_assembler_hides_it() {
@@ -796,7 +796,7 @@ fn s8_t2_batch_keeps_the_stop_text_and_the_assembler_hides_it() {
     assert_eq!(d, delta("a", STOP_FINISH));
 }
 
-// S8-T3: batch text minus the stop text equals the concatenated delta texts.
+// The batch text minus the stop text equals the concatenated delta texts.
 #[test]
 fn s8_t3_batch_text_minus_the_stop_equals_the_delta_texts() {
     let mut j = job(
@@ -1321,15 +1321,15 @@ fn a_notice_after_an_open_tool_loop_breaks_the_prefix() {
 }
 
 /// A resent Claude Code tool loop must not shrink the previous request's
-/// saved stream (coordinator contract, 2026-10-24): the engine decodes the
-/// turn with its thinking (`<think>\n` generation prompt + reasoning +
-/// `</think>\n\n` + the tool call the template itself formats), the client
-/// resends that turn as a thinking block plus tool call, and the next
-/// request's rendered prompt must extend the previous request's rendered
-/// stream plus the decoded bytes byte-for-byte. With replay off the resent
-/// turn loses its think block (the trailing demoted notice moves the
-/// template's last_query_index past the loop) — the mid-session prefix loss
-/// the n9 dogfood session showed as 7-11 s full re-prefills.
+/// saved stream: the engine decodes the turn with its thinking (`<think>\n`
+/// generation prompt + reasoning + `</think>\n\n` + the tool call the
+/// template itself formats), the client resends that turn as a thinking
+/// block plus tool call, and the next request's rendered prompt must extend
+/// the previous request's rendered stream plus the decoded bytes
+/// byte-for-byte. With replay off the resent turn loses its think block
+/// (the trailing demoted notice moves the template's last_query_index past
+/// the loop) — the mid-session prefix loss that showed as 7-11 s full
+/// re-prefills.
 #[test]
 fn a_resent_tool_loop_extends_the_previous_request_stream() {
     let mut template = pinned_template();
@@ -1506,7 +1506,7 @@ fn assistant_tool_call(id: &str, reasoning: &str, command: &str) -> PromptMessag
     }
 }
 
-/// R1: attacker spellings in user and tool_result content render with the
+/// Attacker spellings in user and tool_result content render with the
 /// row bytes EXACTLY as without them — the chatml trio arrives escaped as
 /// data, the grammar-level spellings verbatim but inert — and no content
 /// copy can vanish into the framing.
@@ -1551,7 +1551,7 @@ fn attacker_spellings_in_content_render_as_data() {
     );
 }
 
-/// R2: with replay and the toolwrap both on and an assistant tool-call row
+/// With replay and the toolwrap both on and an assistant tool-call row
 /// present (the real notice path), a poisoned tool result does not
 /// disturb the wrapped notice: the notice renders in the tool-response
 /// shape and the poisoned content stays escaped inside its own row.
@@ -1594,7 +1594,7 @@ fn the_notice_row_survives_attacker_content_in_the_tool_result() {
     );
 }
 
-/// R3: a resent transcript whose tool_result poisons the stream with
+/// A resent transcript whose tool_result poisons the stream with
 /// control spellings still EXTENDS the previous request stream.
 #[test]
 fn a_poisoned_resent_tool_loop_still_extends_the_previous_stream() {
@@ -1638,7 +1638,7 @@ fn a_poisoned_resent_tool_loop_still_extends_the_previous_stream() {
     );
 }
 
-/// R6: attacker spellings in the FIRST user turn and the system block do
+/// Attacker spellings in the FIRST user turn and the system block do
 /// not change the stable prefix property — appending a later turn keeps
 /// the rendered bytes a strict prefix extension.
 #[test]
@@ -1725,7 +1725,7 @@ fn template_processing_bundle(template: &str) -> (TokenizerBundle, String) {
     (bundle, fixture_json)
 }
 
-/// R5: prompt encoding never AUTO-INSERTS special tokens. The fixture's
+/// Prompt encoding never AUTO-INSERTS special tokens. The fixture's
 /// post-processor appends the special id only when add_special_tokens is
 /// on (the positive control proves the flag matters in this tokenizers
 /// version, so the pin can kill a flip of it), and the prompt path —
@@ -2888,11 +2888,11 @@ fn tojson_goldens() -> serde_json::Value {
     goldens
 }
 
-// Decision 0029: the reference `tojson` is `json.dumps(x, ensure_ascii=False,
-// sort_keys=False)`. The goldens come from `tokenizer.apply_chat_template` of
-// transformers 5.17.0 on the Mac (`testdata/capture-tojson-goldens.py`). Their
-// tools keep the OpenAI wrapper and an unsorted key order, and their text has
-// non-ASCII characters, apostrophes, angle brackets, ampersands, and DEL.
+// The reference `tojson` is `json.dumps(x, ensure_ascii=False, sort_keys=False)`. The
+// goldens come from `tokenizer.apply_chat_template` of transformers 5.17.0 on the Mac
+// (`testdata/capture-tojson-goldens.py`). Their tools keep the OpenAI wrapper and an
+// unsorted key order, and their text has non-ASCII characters, apostrophes, angle
+// brackets, ampersands, and DEL.
 #[test]
 fn tool_prompts_match_the_reference_renders() {
     let goldens = tojson_goldens();
@@ -2916,8 +2916,8 @@ fn tool_prompts_match_the_reference_renders() {
 
 // Each row renders its template with `render_jinja_template`. A row with an
 // `error` is a Python exception, which is a template defect here. A row with
-// `known_divergence` records a difference that decision 0029 accepts. The
-// table below pins what the engine prints for it.
+// `known_divergence` records an accepted difference. The table below pins what the
+// engine prints for it.
 const KNOWN_DIVERGENCES: &[(&str, Option<&str>)] = &[
     ("big-integer", Some("{\"n\": 1.2345678901234568e+22}")),
     ("string-bad-indent", None),
@@ -3618,12 +3618,12 @@ fn the_pinned_template_gives_a_root_that_covers_the_tools_block() {
     assert_eq!(ids[..system_ids.len()], system_ids[..], "root ids lead");
 }
 
-/// A system message with empty or whitespace-only content still gives a root (packet
-/// SERVE-2-c item 5, left open by the SERVE-2-b review): the pinned template trims the
-/// content of a system message (`render_content(...)|trim`), so every whitespace-only
-/// content renders as the empty system block `<|im_start|>system\n<|im_end|>\n`, and the
-/// root equals that text's encoded length. Hand-derived from the template text: the marker
-/// (1 id), "system\n" (7 bytes), the end marker (1 id), and the newline (1 byte).
+/// A system message with empty or whitespace-only content still gives a root: the pinned
+/// template trims the content of a system message (`render_content(...)|trim`), so every
+/// whitespace-only content renders as the empty system block
+/// `<|im_start|>system\n<|im_end|>\n`, and the root equals that text's encoded length.
+/// Hand-derived from the template text: the marker (1 id), "system\n" (7 bytes), the end
+/// marker (1 id), and the newline (1 byte).
 #[test]
 fn the_pinned_template_gives_a_root_for_an_empty_system_message() {
     let bundle = pinned_bundle();
@@ -3649,10 +3649,10 @@ fn the_pinned_template_gives_a_root_for_an_empty_system_message() {
     }
 }
 
-/// The root is identical for the three `Thinking` settings (packet SERVE-2-c item 5): the
-/// settings change only the generation prompt that the template appends (`<think>\n` with
-/// thinking on or default, `<think>\n\n</think>\n\n` with it off), never the head or the
-/// system block inside it, so the root cannot depend on them.
+/// The root is identical for the three `Thinking` settings: the settings change only the
+/// generation prompt that the template appends (`<think>\n` with thinking on or default,
+/// `<think>\n\n</think>\n\n` with it off), never the head or the system block inside it, so
+/// the root cannot depend on them.
 #[test]
 fn the_root_is_identical_for_the_three_thinking_settings() {
     let bundle = pinned_bundle();
@@ -3673,10 +3673,10 @@ fn the_root_is_identical_for_the_three_thinking_settings() {
     }
 }
 
-/// Tools with a non-system first message give no root (packet SERVE-2-c item 5): the template
-/// writes its tools block inside a system block even when the first message is a user
-/// message, but the root is the end of the first MESSAGE, and only a system message opens
-/// one, so the root stays `None` while the tip is set.
+/// Tools with a non-system first message give no root: the template writes its tools block
+/// inside a system block even when the first message is a user message, but the root is the
+/// end of the first MESSAGE, and only a system message opens one, so the root stays `None`
+/// while the tip is set.
 #[test]
 fn tools_with_a_non_system_first_message_give_no_root() {
     let bundle = pinned_bundle();

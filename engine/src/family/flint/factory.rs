@@ -13,12 +13,12 @@ use crate::{
     test,
     all(feature = "native-mlx", target_os = "macos", target_arch = "aarch64")
 ))]
-/// Mac MLX serving context limit. Default 32768 since 2026-10-27 (full-attention
-/// KV planes grow on demand and reach +0.656 GiB BF16 over 8192 only at the
-/// full 32K depth: 14 full layers keep the whole prefix, the
-/// ring layers clamp to WINDOW=513). Rollback: FIFI_FLINT_MLX_CONTEXT_LIMIT=8192
-/// (read once per process at first use; changes require a restart);
-/// an unrecognized SET value fails safe to 8192, not 32768.
+/// Mac MLX serving context limit. Default 32768 (full-attention KV planes grow
+/// on demand and reach +0.656 GiB BF16 over 8192 only at the full 32K depth: 14
+/// full layers keep the whole prefix, the ring layers clamp to WINDOW=513).
+/// Rollback: FIFI_FLINT_MLX_CONTEXT_LIMIT=8192 (read once per process at first
+/// use; changes require a restart); an unrecognized SET value fails safe to
+/// 8192, not 32768.
 pub(crate) fn context_limit() -> u32 {
     use std::sync::OnceLock;
     static LIMIT: OnceLock<u32> = OnceLock::new();
@@ -59,12 +59,11 @@ pub(super) fn os_setting(value: Option<&std::ffi::OsStr>) -> Option<&str> {
     all(feature = "native-mlx", target_os = "macos", target_arch = "aarch64")
 ))]
 pub(super) fn prefill_chunk_rows(setting: Option<&str>) -> usize {
-    // w37/w38 evidence: chunk 1024 is the ratified default (+9.31% pp4096,
-    // KL <=1.3e-4 vs 512 (log-sum-exp, 2026-10-27 probe fix) with top-1
-    // equal, +0.14 GiB peak; w39 ratchet re-baseline per the ratified bars).
+    // Chunk 1024 is the default: against 512 it measured +9.31% pp4096 and
+    // KL <= 1.3e-4 (log-sum-exp) with equal top-1, at +0.14 GiB peak.
     // Rollback = FIFI_FLINT_MLX_BATCH_PREFILL=512. An explicitly SET but
-    // unrecognized value (non-UTF-8, empty, mistyped) fails safe to the old
-    // 512 default.
+    // unrecognized value (non-UTF-8, empty, mistyped) fails safe to the old 512
+    // default.
     match setting.map(str::trim) {
         None => 1024,
         Some("0") => 1,
@@ -250,7 +249,7 @@ mod tests {
         assert_eq!(super::context_limit_with(None), 32768);
         assert_eq!(super::context_limit_with(Some("8192")), 8192);
         assert_eq!(super::context_limit_with(Some("32768")), 32768);
-        // Fail-safe: an unrecognized SET value rolls back to 8192 (SF-2).
+        // Fail-safe: an unrecognized SET value rolls back to 8192.
         assert_eq!(super::context_limit_with(Some("invalid")), 8192);
     }
 

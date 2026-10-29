@@ -1,5 +1,5 @@
 /*
- * Device-property queries of the CUDA adapter (LD-1). Host only: nothing here
+ * Device-property queries of the CUDA adapter. Host only: nothing here
  * allocates, copies or launches. Like abi.h, a function returns an int status
  * (INFERENCE_CUDA_OK, a negative adapter status, or a positive cudaError_t) and
  * clears the thread's pending non-sticky CUDA error before it returns.

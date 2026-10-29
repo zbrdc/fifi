@@ -1,11 +1,11 @@
-//! The launches of one decode token as DATA (decision 0047, packet RD-9d): the order in which the
-//! resident step queues its kernels, written once so the CPU tests can check it against the phase
-//! table of `step_plan.rs`. Pure host code.
+//! The launches of one decode token as DATA: the order in which the resident step queues its
+//! kernels, written once so the CPU tests can check it against the phase table of `step_plan.rs`.
+//! Pure host code.
 //!
-//! One token is: `step_begin`, the embedding, for every layer the mixer block (RD-9b) and the MoE
-//! block (RD-9c), the final norm, the `lm_head` projection, `argmax`, `step_advance`. The device
-//! runner executes the list op by op; the same list is what a graph capture records (RD-11a), so
-//! eager and captured runs share one order.
+//! One token is: `step_begin`, the embedding, for every layer the mixer block and the MoE block,
+//! the final norm, the `lm_head` projection, `argmax`, `step_advance`. The device runner executes
+//! the list op by op; the same list is what a graph capture records, so eager and captured runs
+//! share one order.
 //!
 //! # The residual stream
 //!
@@ -17,12 +17,11 @@
 //! # Poisoned step words
 //!
 //! The words `pos`, `kv_len` and `kv_slot` are read by a fixed set of kernels
-//! ([`POS_WORD_READERS`]). Each range-checks the word before it touches memory and has a merged
-//! test that runs the poisoned word (the poison-consumer rule of the stage 1 plan). The Fp16
-//! step reads the words through `attn_prep` and `attn_decode` alone; the Int8G32 mode of KV8-B
-//! adds three readers (B5 owns this table and its pin): the rows entry `attn_prep_rows` and
-//! `kv8_append` read `pos`, and `attn_decode_q8` reads `kv_len`. The embedding reads
-//! `token_id` only, and its own bad-id path (NaN row and status mask 4) belongs to RD-4c.
+//! ([`POS_WORD_READERS`]). Each range-checks the word before it touches memory and has a test
+//! that runs the poisoned word (the poison-consumer rule). The Fp16 step reads the words through
+//! `attn_prep` and `attn_decode` alone; the Int8G32 mode adds three readers: the rows entry
+//! `attn_prep_rows` and `kv8_append` read `pos`, and `attn_decode_q8` reads `kv_len`. The
+//! embedding reads `token_id` only and has its own bad-id path (NaN row and status mask 4).
 
 use super::step_plan::{Phase, Slot, writes_status};
 use crate::family::AttentionKind;
@@ -32,19 +31,19 @@ use crate::family::AttentionKind;
 pub(super) enum StepOp {
     /// `step_begin`: clears `status`, flags an invalid step state with mask 4.
     Begin,
-    /// RD-4c: the embedding row of `token_id` into `ResidA`.
+    /// The embedding row of `token_id` into `ResidA`.
     Embed,
-    /// RD-9b `run_block` of the layer: residual to the MoE input.
+    /// `run_block` of the layer: residual to the MoE input.
     Mixer(usize),
-    /// RD-9c `run_moe_block` of the layer: MoE input to the layer output.
+    /// `run_moe_block` of the layer: MoE input to the layer output.
     Moe(usize),
-    /// RD-4a: the output norm of the last residual, packed for `lm_head`.
+    /// The output norm of the last residual, packed for `lm_head`.
     FinalNorm,
     /// The vendored Q6_K projection into the logits row.
     LmHead,
-    /// RD-4d: greedy argmax, the result pair, the LAST status writer.
+    /// Greedy argmax, the result pair, the LAST status writer.
     Argmax,
-    /// RD-4d: `pos`, `kv_len` and `kv_slot` move on by one; the last kernel.
+    /// `pos`, `kv_len` and `kv_slot` move on by one; the last kernel.
     Advance,
 }
 
@@ -84,7 +83,7 @@ impl StepOp {
                 Phase::MixPack,
                 Phase::AttnIn,
                 Phase::AttnPrep,
-                // The KV8 append of the Int8G32 mode (KV8-B B2): no kernel of the Fp16 path
+                // The KV8 append of the Int8G32 mode: no kernel of the Fp16 path
                 // enters this phase, and the Int8G32 op list runs `kv8_append` in it.
                 Phase::Kv8Append,
                 Phase::AttnCore,
@@ -154,9 +153,9 @@ pub(super) struct PosReader {
 }
 
 /// Every kernel of the step that touches `pos`, `kv_len` or `kv_slot`, in launch order. The
-/// Int8G32 kernels sit beside the Fp16 pair they replace (KV8-B B5): `attn_prep_rows` and
-/// `kv8_append` read `pos` (the append is never the first or only mask-4 writer: its guard
-/// equals the rows entry's, one launch earlier), and `attn_decode_q8` reads `kv_len`.
+/// Int8G32 kernels sit beside the Fp16 pair they replace: `attn_prep_rows` and `kv8_append`
+/// read `pos` (the append is never the first or only mask-4 writer: its guard equals the
+/// rows entry's, one launch earlier), and `attn_decode_q8` reads `kv_len`.
 pub(super) const POS_WORD_READERS: [PosReader; 7] = [
     PosReader {
         kernel: "step_begin",

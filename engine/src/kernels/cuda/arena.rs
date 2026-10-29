@@ -1,4 +1,4 @@
-//! Static device-arena planning (CUDA-RD section 2, packet RD-1).
+//! Static device-arena planning.
 //!
 //! [`plan_arena`] gives every tensor a byte offset inside one allocation.
 //! Tensors that are live in the same step never share an address; tensors
@@ -8,7 +8,7 @@
 //!
 //! The planner is pure arithmetic and calls no CUDA function, so it runs and
 //! is tested on any host. Its owner is `context::workspace`; the types and the
-//! planner are re-exported from `kernels::cuda` for the resident step (RD-9a).
+//! planner are re-exported from `kernels::cuda` for the resident decode step.
 
 use std::cmp::Reverse;
 

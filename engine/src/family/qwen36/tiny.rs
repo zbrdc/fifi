@@ -4,7 +4,7 @@
 //! attention with 2 query heads and 1 key-value head. `TINY_GQA` has four layers (DeltaNet, attention,
 //! DeltaNet, attention) and 4 query heads over 2 key-value heads, so that the head grouping is visible.
 //! `TINY_WIDE` is `TINY` with a wider DeltaNet. `TINY_KV8` is `TINY_GQA` with a head dimension of 64,
-//! the multiple of the Q8 cache group (64) that the 8-bit cache form of packet KV8-INTEGRATE needs —
+//! the multiple of the Q8 cache group (64) that the 8-bit cache form needs —
 //! a 32-lane head cannot quantize. `TINY`, `TINY_GQA`, and `TINY_WIDE` use hidden 64, quantization
 //! groups of 32, vocabulary 8, 4 experts with top 2, head dimension 32, and a rotary dimension of 16
 //! (the config's partial factor of 0.5); `TINY_KV8` keeps every other number, takes head dimension 64
@@ -108,9 +108,9 @@ pub(super) const TINY_GQA: FamilySpec = model(
     ],
 );
 
-/// Four layers like `TINY_GQA` with a head dimension of 64 (packet KV8-INTEGRATE): the multiple
-/// of the Q8 cache group (64) that lets the 8-bit cache quantize its keys and values. The
-/// rotary dimension follows the config's partial factor of 0.5, so it is 32.
+/// Four layers like `TINY_GQA` with a head dimension of 64: the multiple of the Q8 cache group (64)
+/// that lets the 8-bit cache quantize its keys and values. The rotary dimension follows the
+/// config's partial factor of 0.5, so it is 32.
 pub(super) const TINY_KV8: FamilySpec = model(
     "q36_tiny_kv8",
     4,
@@ -403,8 +403,8 @@ mod tests {
         assert_eq!((attn.heads_q, attn.heads_kv, attn.rotary_dim), (4, 2, 16));
     }
 
-    /// The KV8 fixture of packet KV8-INTEGRATE: a head dimension of 64, the multiple of the Q8
-    /// cache group, with the rotary dimension the config's partial factor gives (32).
+    /// The KV8 fixture: a head dimension of 64, the multiple of the Q8 cache group, with the rotary
+    /// dimension the config's partial factor gives (32).
     #[test]
     fn the_kv8_model_has_a_head_dimension_of_64() {
         let weights =

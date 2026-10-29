@@ -9,7 +9,7 @@
 //! both ranges hold n floats at 4-byte alignment, and out overlaps no byte of x.
 #![cfg_attr(
     not(test),
-    expect(dead_code, reason = "staged for RD-9a (decision 0047)")
+    expect(dead_code, reason = "staged for the resident decode step")
 )]
 
 use crate::EngError;

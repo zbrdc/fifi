@@ -1,6 +1,6 @@
 //! The tiered classification of one layer of the resident decode step: the router's picks mapped
-//! through the layer's slot table row, in one launch (TCAP C2, `ledger/plans/TCAP-DESIGN.md`
-//! section 3.2). The host oracle is `family::qwen36::tiered::classify::classify_reference`.
+//! through the layer's slot table row, in one launch. The host oracle is
+//! `family::qwen36::tiered::classify::classify_reference`.
 //!
 //! Original code; the kernel and its semantics are documented in
 //! `native/resident/tiered_classify.h`.
@@ -20,7 +20,7 @@
 
 #![cfg_attr(
     not(test),
-    expect(dead_code, reason = "staged for TCAP C6 (ledger/plans/TCAP-DESIGN.md)")
+    expect(dead_code, reason = "staged for the tiered decode step")
 )]
 
 use std::ffi::c_int;

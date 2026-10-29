@@ -1,11 +1,12 @@
-//! The activation workspace of a CUDA context (CUDA-RD section 2, item 7).
+//! The activation workspace of a CUDA context.
 //!
 //! The tiled matmul reads the fp16 buffer `xf`, which it packs from the f32
 //! input `x`, and writes the f32 output `y`. A [`Workspace`] keeps these three
 //! device regions in ONE allocation at the offsets of [`place`], so a linear
-//! call allocates and frees nothing (P6-M1: the three `cudaMalloc`/`cudaFree`
-//! pairs were 58 percent of a token). It is the seed of the resident decode's
-//! static arena; RD-2 adds streams, holds and admission sizing to this owner.
+//! call allocates and frees nothing (per-call `cudaMalloc`/`cudaFree` pairs for
+//! the three regions took 58 percent of a token). It is the seed of the resident
+//! decode's static arena; the resident decode adds streams, holds and admission
+//! sizing to this owner.
 //!
 //! Size. A context allocates its workspace when it is created, with the sizes
 //! of its [`Admission`] (the shapes the caller admits; the model's numbers live
@@ -26,13 +27,13 @@
 //! `BadRequest` before it allocates, so the old allocation is never freed under a
 //! graph. The caller builds a new arena (and new graphs) instead. A grow that no
 //! hold prevents frees the old allocation at once (it holds old plus new bytes for
-//! a moment); a retired list for growing under graphs is not built (CUDA-RD 2.6).
+//! a moment); a retired list for growing under graphs is not built.
 //!
 //! Serialization. A context is `!Send` and `!Sync`, so one thread owns its
-//! workspace. `linear_rows` enters the process dispatch guard first (decision
-//! 0023), then borrows the workspace for the length of one call, so the native
-//! call, a grow and the free of the old allocation are serialized with the
-//! native calls of every other context. Nothing between the borrow and its
+//! workspace. `linear_rows` enters the process dispatch guard first, then
+//! borrows the workspace for the length of one call, so the native call, a grow
+//! and the free of the old allocation are serialized with the native calls of
+//! every other context. Nothing between the borrow and its
 //! release calls back into the context; a nested borrow is still a typed error.
 
 use std::rc::Rc;
@@ -224,8 +225,7 @@ impl CudaContext {
     }
 
     /// Takes a hold on the current workspace allocation, so a grow is refused
-    /// until the hold is dropped. The capture of a graph (RD-2d) is the first
-    /// caller.
+    /// until the hold is dropped. The capture of a graph is the first caller.
     pub(crate) fn workspace_hold(&self) -> Result<ArenaHold, EngError> {
         self.ensure_usable()?;
         let workspace = self

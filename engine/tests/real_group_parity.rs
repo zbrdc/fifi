@@ -190,7 +190,7 @@ fn check_counts(fixture: &serde_json::Value, cells: &[serde_json::Value]) {
         negative,
         "negative bias count"
     );
-    assert!(negative > 0, "decision 0015 requires negative biases");
+    assert!(negative > 0, "the fixture must cover negative biases");
 }
 
 fn check_cell(cell: &serde_json::Value) {

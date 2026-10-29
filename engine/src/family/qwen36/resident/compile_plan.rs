@@ -1,8 +1,7 @@
-//! The load-time compile warm-up decision (packet MX-COMPILE-1a item 6, fix round 1), pure so
-//! it compiles and tests on Linux: the decoder collects the weight facts of every layer, asks
-//! this module which programs the model needs, and refuses the load when the model cannot run
-//! compiled — BEFORE the first token, never in the middle of a request. The warm-up itself
-//! needs the Mac GPU and lives in `decoder.rs`.
+//! The load-time compile warm-up decision, pure so it compiles and tests on Linux: the decoder
+//! collects the weight facts of every layer, asks this module which programs the model needs, and
+//! refuses the load when the model cannot run compiled — BEFORE the first token, never in the
+//! middle of a request. The warm-up itself needs the Mac GPU and lives in `decoder.rs`.
 
 use crate::EngError;
 use crate::kernels::compile_key::{self, DeltaBaked, MoeBaked};

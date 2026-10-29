@@ -1,6 +1,5 @@
-//! Unit tests of the op lists of the mixer blocks against the real Qwen3.6 plan (test seam U13).
-//! They check the list the executor runs, not a copy of it. Lifetimes are read from `StepPlan`.
-//! CPU only.
+//! Unit tests of the op lists of the mixer blocks against the real Qwen3.6 plan. They check the
+//! list the executor runs, not a copy of it. Lifetimes are read from `StepPlan`. CPU only.
 use super::{
     common_tests::{dims, plan},
     dims::KvMode,
@@ -201,8 +200,8 @@ fn every_role_an_op_names_has_a_weight_spec() {
 
 #[test]
 fn the_deltanet_op_list_matches_the_packet_table() {
-    // Packet RD-9b3a section 2, launch sequence: every weight role, projection column and delta
-    // argument the DeltaNet block names, in queue order (`Conv` and `Pack` name none of them).
+    // The expected launch sequence: every weight role, projection column and delta argument the
+    // DeltaNet block names, in queue order (`Conv` and `Pack` name none of them).
     #[derive(Debug, PartialEq, Eq)]
     enum Expect {
         NormPack(Role),
@@ -236,17 +235,18 @@ fn the_deltanet_op_list_matches_the_packet_table() {
     );
 }
 
-/// The width the delta-rule output packs (packet RD-9b3a section 2): `k` of the `PackCall` is
-/// `value_width`, pinned here as a number so the op cannot drift to the row length `ld`.
+/// The width the delta-rule output packs: `k` of the `PackCall` is `value_width`, pinned here as a
+/// number so the op cannot drift to the row length `ld`.
 const PACKET_DELTA_VALUE_WIDTH: usize = 4096;
 
 #[test]
 fn the_deltanet_pack_op_reads_the_value_width_of_the_packet() {
-    // Packet RD-9b3a section 2, D7: `pack(S, PackCall{x: DeltaCore, xf: XfDeltaOut, m:1,
-    // k: value_width})`. Section 2 pins the projection columns of D1-D4 (`attn_gate` (z) at 8192,
-    // `ssm_beta` at 12288) and `n_v_heads 32`, and the kernel's head size is 128 (RD-7b), so
-    // `value_width` = the z gate block 12288 - 8192 = 32 x 128 = 4096 f32 values: `DeltaCore`
-    // and `XfDeltaOut` hold one value-width row, never a whole `ld` projection row.
+    // The delta-rule pack is
+    // `pack(S, PackCall{x: DeltaCore, xf: XfDeltaOut, m:1, k: value_width})`. The projection
+    // columns put `attn_gate` (z) at 8192 and `ssm_beta` at 12288, `n_v_heads` is 32, and the gated
+    // delta kernel's head size is 128, so `value_width` = the z gate block 12288 - 8192 = 32 x 128
+    // = 4096 f32 values: `DeltaCore` and `XfDeltaOut` hold one value-width row, never a whole `ld`
+    // projection row.
     let pack = ops_of(AttentionKind::DeltaNet)
         .into_iter()
         .find(|op| {
@@ -267,7 +267,7 @@ fn the_deltanet_pack_op_reads_the_value_width_of_the_packet() {
             xf: Slot::XfDeltaOut,
             k: PACKET_DELTA_VALUE_WIDTH,
         },
-        "k must stay the packet's value width, not the projection row length"
+        "k must stay the pinned value width, not the projection row length"
     );
 }
 
@@ -292,11 +292,11 @@ fn the_attention_ops_name_the_step_words_they_take() {
     assert_eq!((kv_len, part), (StepField::KvLen, Slot::AttnPart));
 }
 
-/// Packet RD-9b3b section 2, A1-A3: the role -> column association of the three `AttnIn`
-/// projections. `attn_q` writes col 0 with 8192 columns (per head `[q 256 | gate 256]` over
-/// `n_head` 16), `attn_k` col 8192 and `attn_v` col 8704 with 512 columns each (`n_kv_head` 2 of
-/// `head_dim` 256; `k_off` 8192, `v_off` 8704). k and v are the same width, so a role swap
-/// between them leaves the column tiling exact: only this pin binds each role to its column.
+/// The role -> column association of the three `AttnIn` projections. `attn_q` writes col 0 with
+/// 8192 columns (per head `[q 256 | gate 256]` over `n_head` 16), `attn_k` col 8192 and `attn_v`
+/// col 8704 with 512 columns each (`n_kv_head` 2 of `head_dim` 256; `k_off` 8192, `v_off` 8704). k
+/// and v are the same width, so a role swap between them leaves the column tiling exact: only this
+/// pin binds each role to its column.
 #[test]
 fn the_attnin_projections_bind_each_role_to_its_column() {
     let g = MixerGeometry::new(&dims()).expect("geometry");
@@ -330,14 +330,14 @@ fn the_attnin_projections_bind_each_role_to_its_column() {
         .collect();
     assert_eq!(
         got, expected,
-        "each AttnIn role must stay on the column the packet names"
+        "each AttnIn role must stay on the pinned column"
     );
 }
 
-/// Packet RD-9b3b section 2, A4: the prep op carries its two slots, its two norm weights and its
-/// two step words exactly. The wrapper norms q with `q_norm` and k with `k_norm` (RD-8a module
-/// doc: per-head RMSNorm of q and k, the weight of each head applied to its own half), so the
-/// role each field names is pinned, not just that both roles appear somewhere in the list.
+/// The prep op carries its two slots, its two norm weights and its two step words exactly. The
+/// wrapper norms q with `q_norm` and k with `k_norm` (the `attn_prep` module doc: per-head RMSNorm
+/// of q and k, the weight of each head applied to its own half), so the role each field names is
+/// pinned, not just that both roles appear somewhere in the list.
 #[test]
 fn the_attention_prep_op_pins_its_slots_and_norm_weights() {
     let prep = ops_of(AttentionKind::Full)
@@ -354,15 +354,15 @@ fn the_attention_prep_op_pins_its_slots_and_norm_weights() {
             pos: StepField::Pos,
             status: StepField::Status,
         },
-        "the q norm belongs to q and the k norm to k (packet A4)"
+        "the q norm belongs to q and the k norm to k"
     );
 }
 
-/// Packet RD-9b3b section 2, A5: the decode op carries its four slots and its step word exactly:
-/// `q` is the normed and roped query of prep, `proj` the gated projection row (the wrapper reads
-/// head `h`'s gate from it), `part` the partials scratch and `out` the pre-projection core. Both
-/// `q` and `proj` are written and live at `AttnCore`, so a swap between them passes every
-/// lifetime test: only this pin tells them apart.
+/// The decode op carries its four slots and its step word exactly: `q` is the normed and roped
+/// query of prep, `proj` the gated projection row (the wrapper reads head `h`'s gate from it),
+/// `part` the partials scratch and `out` the pre-projection core. Both `q` and `proj` are written
+/// and live at `AttnCore`, so a swap between them passes every lifetime test: only this pin tells
+/// them apart.
 #[test]
 fn the_attention_decode_op_pins_its_slots() {
     let decode = ops_of(AttentionKind::Full)
@@ -378,21 +378,20 @@ fn the_attention_decode_op_pins_its_slots() {
             out: Slot::AttnCore,
             kv_len: StepField::KvLen,
         },
-        "q is the normed query, proj the gate row (packet A5)"
+        "q is the normed query, proj the gate row"
     );
 }
 
-/// The width the attention output packs (packet RD-9b3b section 2): `k` of the attention `Pack`
-/// is `q_width`, pinned here as a number so the op cannot drift to the row length `ld`.
+/// The width the attention output packs: `k` of the attention `Pack` is `q_width`, pinned here as a
+/// number so the op cannot drift to the row length `ld`.
 const PACKET_ATTN_Q_WIDTH: usize = 4096;
 
 #[test]
 fn the_attention_pack_op_reads_the_query_width_of_the_packet() {
-    // Packet RD-9b3b section 2, A6: `pack(.. x: AttnCore, xf: XfAttnOut, k: q_width)`. A1 makes
-    // `attn_q` col 0 of the shared row, 8192 columns per head `[q 256 | gate 256]` over `n_head`
-    // 16, and decode's `out` is f32 `[m][n_head * head_dim]` (RD-8b), so one q half is
-    // 16 x 256 = 4096 f32 values: `AttnCore` and `XfAttnOut` hold one q-width row, never the
-    // 9216-float projection row `ld`.
+    // The attention pack is `pack(.. x: AttnCore, xf: XfAttnOut, k: q_width)`. `attn_q` is col 0 of
+    // the shared row, 8192 columns per head `[q 256 | gate 256]` over `n_head` 16, and decode's
+    // `out` is f32 `[m][n_head * head_dim]`, so one q half is 16 x 256 = 4096 f32 values:
+    // `AttnCore` and `XfAttnOut` hold one q-width row, never the 9216-float projection row `ld`.
     let pack = ops_of(AttentionKind::Full)
         .into_iter()
         .find(|op| {
@@ -413,7 +412,7 @@ fn the_attention_pack_op_reads_the_query_width_of_the_packet() {
             xf: Slot::XfAttnOut,
             k: PACKET_ATTN_Q_WIDTH,
         },
-        "k must stay the packet's q width, not the projection row length"
+        "k must stay the pinned q width, not the projection row length"
     );
 }
 

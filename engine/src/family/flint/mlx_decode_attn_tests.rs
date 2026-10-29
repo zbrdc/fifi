@@ -27,13 +27,12 @@ fn t1_sinks(k: &mut MlxKernels) -> ExecutionTensor {
 
 /// The routing contract of the decode-attention slice, driven by the flag the
 /// way FIFI_FLINT_MLX_COALESCE_RESIDUAL tests are: run once with
-/// FIFI_FLINT_MLX_DECODE_ATTN=1 or the env unset (the flagged default
-/// since the 2026-10-27 flip; a rows == 1 BF16 call with raw F32 sinks
-/// must route to the VENDOR fused SDPA and NOT the prefill-shaped float
-/// flash) and once with =0 (pins the flag-off path on the prefill-shaped
-/// flash). Each run is a SEPARATE process invocation: the
-/// flag is process-cached (`decode_attn_flagged`'s OnceLock), so in-process
-/// toggling cannot be observed by design.
+/// FIFI_FLINT_MLX_DECODE_ATTN=1 or the env unset (the flagged default; a
+/// rows == 1 BF16 call with raw F32 sinks must route to the VENDOR fused SDPA
+/// and NOT the prefill-shaped float flash) and once with =0 (pins the
+/// flag-off path on the prefill-shaped flash). Each run is a SEPARATE process
+/// invocation: the flag is process-cached (`decode_attn_flagged`'s OnceLock),
+/// so in-process toggling cannot be observed by design.
 #[test]
 #[ignore = "explicit tiny Mac GPU allocation; no model; run twice via the flag"]
 fn t1_decode_routing_follows_the_decode_attn_flag() {
@@ -81,14 +80,13 @@ fn t1_decode_routing_follows_the_decode_attn_flag() {
     println!("T1_DECODE_ATTN flagged={} logits_sha256={hash:x}", flagged);
 }
 
-/// The routing contract of the T1-flash drift slice (S3, 2026-10-25): the
-/// F32 one-row sink-bearing shape - exactly the Flint per-token arm - stays
-/// on vendor SDPA by default and moves to the prefill float-flash kernel
-/// when FIFI_FLINT_MLX_T1_FLASH is set, so the per-token arm runs the SAME
-/// kernel as the B512 prefill arm. Separate processes per flag state (the
-/// flag is process-cached by design). The shared `input()` helper casts to
-/// BF16; this shape needs F32 planes to match the production F32 arm, so it
-/// builds them locally.
+/// The routing contract of the T1-flash switch: the F32 one-row sink-bearing
+/// shape - exactly the Flint per-token arm - stays on vendor SDPA by default
+/// and moves to the prefill float-flash kernel when FIFI_FLINT_MLX_T1_FLASH
+/// is set, so the per-token arm runs the SAME kernel as the B512 prefill
+/// arm. Separate processes per flag state (the flag is process-cached by
+/// design). The shared `input()` helper casts to BF16; this shape needs F32
+/// planes to match the production F32 arm, so it builds them locally.
 #[test]
 #[ignore = "explicit tiny Mac GPU allocation; no model; run twice via the flag"]
 fn t1_f32_routing_follows_the_t1_flash_flag() {
@@ -149,22 +147,22 @@ fn t1_f32_routing_follows_the_t1_flash_flag() {
         "FIFI_FLINT_MLX_T1_FLASH={} routing at the F32 rows == 1 shape",
         flagged
     );
-    // Hash harness for the window: the flagged run's logits must match the
-    // B512 flash arm's numerics, not the vendor arm's.
+    // Hash harness: the flagged run's logits must match the B512 flash arm's
+    // numerics, not the vendor arm's.
     let host_out = k.readback(&out).unwrap();
     let bytes = host_out.host_bytes().unwrap();
     let hash = Sha256::digest(bytes);
     println!("T1_FLASH flagged={flagged} logits_sha256={hash:x}");
 }
 
-/// Graph-cache probe (2026-10-25): HOST wall time of one fixed-shape rows=1
-/// layer-subgraph stand-in (rms_norm + 4 projections + residual + rms_norm +
-/// silu-FFN + residual; 13 adapter ops), run op-by-op (eager) vs through the
-/// compiled closure with a fixed cache key. Prints per-call microseconds for
-/// both arms plus the compile counters; asserts the two outputs are bitwise
-/// identical (compile must not change numerics) and that the compiled arm
-/// replayed from cache (body entries == 1). Weights are closure INPUTS, so
-/// nothing bakes and no invalidation exists. Mac GPU allocation, no model.
+/// Graph-cache probe: HOST wall time of one fixed-shape rows=1 layer-subgraph
+/// stand-in (rms_norm + 4 projections + residual + rms_norm + silu-FFN +
+/// residual; 13 adapter ops), run op-by-op (eager) vs through the compiled
+/// closure with a fixed cache key. Prints per-call microseconds for both arms
+/// plus the compile counters; asserts the two outputs are bitwise identical
+/// (compile must not change numerics) and that the compiled arm replayed from
+/// cache (body entries == 1). Weights are closure INPUTS, so nothing bakes and
+/// no invalidation exists. Mac GPU allocation, no model.
 #[cfg(feature = "native-fault-qualification")]
 #[test]
 #[ignore = "explicit tiny Mac GPU allocation; no model; graph-cache timing probe"]
@@ -235,7 +233,8 @@ fn flint_layer_compile_probe_host_time() {
 
     // The body runs only while TRACING: a steady replay leaves the body-entry
     // count at its warm value. If it grew per iteration, MLX re-traced every
-    // call (the Qwen-B1 failure mode) and the timing below would be invalid.
+    // call (a failure mode seen on the Qwen path) and the timing below would
+    // be invalid.
     let bodies_before = kernels::mlx::native::flint_layer_probe_body_entries();
     let n_iters = 1000_u32;
     let start = Instant::now();
@@ -261,11 +260,11 @@ fn flint_layer_compile_probe_host_time() {
     );
 }
 
-/// Per-kernel-floor calibration (2026-10-25, quiet follow-up to the graph-cache
-/// probe): HOST build + evaluate wall of M back-to-back tiny adds ([1,2048]
-/// F32), op-by-op eager vs ONE compiled closure replayed from cache, R
-/// repetitions each. Prints us per kernel for both arms; calibration input for
-/// the op-count lever estimates. Mac GPU allocation, no model.
+/// Per-kernel-floor calibration (a follow-up to the graph-cache probe): HOST
+/// build + evaluate wall of M back-to-back tiny adds ([1,2048] F32), op-by-op
+/// eager vs ONE compiled closure replayed from cache, R repetitions each.
+/// Prints us per kernel for both arms; calibration input for the op-count
+/// lever estimates. Mac GPU allocation, no model.
 #[cfg(feature = "native-fault-qualification")]
 #[test]
 #[ignore = "explicit tiny Mac GPU allocation; no model; per-kernel floor calibration"]
@@ -380,13 +379,13 @@ fn ring_view_flag_polarity_and_routes() {
     );
 }
 
-/// Weights-free whole-plane parity gate (ring view, 2026-10-25 review): at
-/// every probe position the whole-plane call - rows at or beyond len
-/// POISONED with NaN - must be bitwise equal to the exactly-sized union
-/// call, proving the kernel consumes len = p0+1 and never reads retired
-/// ring rows. BF16 planes with raw F32 sinks is the production decode
-/// shape. Non-periodic generator (row_value); ~34 MB GPU, no model weights:
-/// safe to run any time, daily engine up or down.
+/// Weights-free whole-plane parity gate (ring view): at every probe position
+/// the whole-plane call - rows at or beyond len POISONED with NaN - must be
+/// bitwise equal to the exactly-sized union call, proving the kernel
+/// consumes len = p0+1 and never reads retired ring rows. BF16 planes with
+/// raw F32 sinks is the production decode shape. Non-periodic generator
+/// (row_value); ~34 MB GPU, no model weights: safe to run any time, daily
+/// engine up or down.
 #[test]
 #[ignore = "explicit tiny Mac GPU allocation; no model; any time"]
 fn whole_plane_attention_matches_union_bitwise() {
@@ -398,18 +397,18 @@ fn whole_plane_attention_matches_union_bitwise() {
     let sinks = t1_sinks(&mut k);
     // The flash kernel guards loads by key < length, so a NaN-poisoned
     // capacity tail is invisible to it. For the vendor arm the poison stays
-    // NaN too (MLX 64ea011c reads K/V only inside `if (use_key)`, and the
-    // W24 armed run produced finite, near-equal outputs) - BUT the two arms
-    // then take the vendor 1-pass and 2-pass kernels at different S, which
-    // round the output independently: the armed comparison is therefore
-    // ulp-tolerance (observed <= 1 bf16 output ulp at p0=511 in W24), while
-    // the unflagged flash arms stay BITWISE (same kernel, poison contract).
-    // The capacity-plane guard (s == q_off + rows) puts the ARMED whole-plane
-    // arm on the FLASH kernel - the ring-view shape whose garbage tail must
-    // not reach the vendor kernel - so armed the comparison is CROSS-ROUTE
-    // (vendor 1-pass union vs flash whole): route tolerance, not one ulp.
-    // The p0 == cap-1 plane has no garbage tail (len == cap is an exact
-    // plane), so both arms stay on the vendor kernel there and stay bitwise.
+    // NaN too (MLX 64ea011c reads K/V only inside `if (use_key)`, and an
+    // armed run produced finite, near-equal outputs) - BUT the two arms then
+    // take the vendor 1-pass and 2-pass kernels at different S, which round
+    // the output independently: the armed comparison is therefore
+    // ulp-tolerance (observed <= 1 bf16 output ulp at p0=511), while the
+    // unflagged flash arms stay BITWISE (same kernel, poison contract). The
+    // capacity-plane guard (s == q_off + rows) puts the ARMED whole-plane arm
+    // on the FLASH kernel - the ring-view shape whose garbage tail must not
+    // reach the vendor kernel - so armed the comparison is CROSS-ROUTE
+    // (vendor 1-pass union vs flash whole): route tolerance, not one ulp. The
+    // p0 == cap-1 plane has no garbage tail (len == cap is an exact plane),
+    // so both arms stay on the vendor kernel there and stay bitwise.
     let armed = crate::kernels::mlx::decode_attn_flagged();
     let max_diff = if armed { 0.05f32 } else { f32::NAN };
     // (p0, key_origin): origin 0 sweeps the vendor kernel widths and the
@@ -620,8 +619,8 @@ fn import_f32(k: &mut MlxKernels, shape: Vec<u32>, data: &[f32]) -> ExecutionTen
 }
 
 /// Real checkpoint sink magnitudes (model.layers.*.self_attn.softmax_offset,
-/// 2026-10-25 table: range -9.0..+12.375): the model-wide max plus layer-0
-/// heads 1..7. All BF16-exact - the checkpoint stores the sinks AS BF16.
+/// range -9.0..+12.375): the model-wide max plus layer-0 heads 1..7. All
+/// BF16-exact - the checkpoint stores the sinks AS BF16.
 const REAL_SINKS: [f32; 8] = [
     12.375,
     7.906_25,
@@ -761,13 +760,13 @@ fn t1_attention_matches_the_host_oracle_under_either_route() {
         (8192, None, 0),
         (64, Some(16), 0),
         (1024, Some(16), 0),
-        // Ring geometries (E9): a wrapped plane whose oldest rows retired.
+        // Ring geometries: a wrapped plane whose oldest rows retired.
         // key_origin > 0, decode at p0 = origin + rows - 1; the oracle's
         // visibility math must follow the LOGICAL positions. These cover:
         // the window fully inside the resident plane, the same shape at a
-        // larger origin (geometry must not depend on where the wrap was),
-        // a window older than the plane head (every resident row visible:
-        // the s == q_off + rows capacity plane), and a retired tail with no
+        // larger origin (geometry must not depend on where the wrap was), a
+        // window older than the plane head (every resident row visible: the
+        // s == q_off + rows capacity plane), and a retired tail with no
         // window at all.
         (64, Some(16), 32),
         (64, Some(16), 80),

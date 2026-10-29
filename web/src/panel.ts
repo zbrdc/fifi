@@ -74,7 +74,7 @@ export function applyProbe(probe: ProbeOutcome): PanelData {
 /** The poll's per-tick decision (Sol MF2): which refresh runs. The last
  * known server state is an input ONLY so the decision owns it — the
  * correct answer consults it for nothing, because the full sweep probes
- * health itself. Gating the monitor refresh on readiness was the SF-A
+ * health itself. Gating the monitor refresh on readiness was a
  * bug: the view froze when the engine was down or still starting. */
 export function pollPlan(opts: {
   monitorVisible: boolean;

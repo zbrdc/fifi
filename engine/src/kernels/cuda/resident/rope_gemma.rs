@@ -13,7 +13,7 @@
 //! and q shares no byte with k. A refused call changes nothing.
 #![cfg_attr(
     not(test),
-    expect(dead_code, reason = "staged for RD-9a (decision 0047)")
+    expect(dead_code, reason = "staged for the resident decode step")
 )]
 
 use crate::EngError;

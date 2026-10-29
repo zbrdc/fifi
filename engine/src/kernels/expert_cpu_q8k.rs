@@ -1,15 +1,15 @@
-//! Q8_K integer-dot expert kernels on the CPU, safe Rust (a reference kernel of OFF-2: the tier
-//! runs the per-32 kernel of `expert_cpu_q8g`, see there for why).
+//! Q8_K integer-dot expert kernels on the CPU, safe Rust (a reference kernel of the CPU expert
+//! tier: the tier runs the per-32 kernel of `expert_cpu_q8g`, see there for why).
 //!
 //! The safe f32 kernel in [`super::expert_cpu`] is DRAM-bound at ~2.6 GB/s per thread
-//! (lane L, 2026-10-13) because it expands every Q4_K nibble to f32 before the dot.
+//! because it expands every Q4_K nibble to f32 before the dot.
 //! This module keeps the activation in llama.cpp's Q8_K integer form and dots it
 //! against the raw nibbles: per 256-value block, `sumi = sum_j sc_j * isum_j` and
 //! `summ = sum_j m_j * (bsums[2j] + bsums[2j+1])` are exact i32 sums, then the float
 //! tail `d_x * (d_w * sumi - dmin_w * summ)` of [`q8k_block_value`]. That is the same
 //! numerics class the GPU path already uses (q8_1 activations). The scalar path here
 //! is the reference and the fallback; [`DotBackend`] dispatches to the scoped AVX2
-//! module `expert_cpu_avx2` (decision 0017, Addendum 2), which reproduces the exact
+//! module `expert_cpu_avx2`, which reproduces the exact
 //! integers and shares the float tail, so both backends are bitwise identical. The
 //! f32 `expert_forward` stays unchanged and remains the reference.
 

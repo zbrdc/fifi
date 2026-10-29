@@ -1,11 +1,11 @@
 /*
- * RD-4a: launch entry of the vendored add_rmsnorm_pack (RD-4V, with the norm_out patch).
+ * Launch entry of the vendored add_rmsnorm_pack, patched to also store the f32 normalized row
+ * (norm_out).
  *
  * The kernel fuses the residual add, the RMSNorm and the fp16 pack so the activations make
  * one trip through memory. The kernel is vendored xavier-qwen code (MIT); this file validates
- * and makes one kern:: call on the given stream; the
- * kernel itself writes the zero tail entry that the padding-token lanes read (MEMSET-TRIM), so no
- * whole-buffer memset is queued here.
+ * and makes one kern:: call on the given stream; the kernel itself writes the zero tail entry
+ * that the padding-token lanes read, so no whole-buffer memset is queued here.
  */
 #include <cuda_runtime.h>
 #include <cmath>
@@ -84,8 +84,8 @@ extern "C" int inference_cuda_add_norm_pack_launch(const inference_cuda_add_norm
             return INFERENCE_CUDA_INVALID_ARGUMENT;
         }
         const cudaStream_t s = (cudaStream_t)stream;
-        // MEMSET-TRIM: the kernel writes the zero tail entry the padding lanes read; the rest of
-        // the padding bytes is never read by any consumer, so no whole-buffer memset runs here.
+        // The kernel writes the zero tail entry the padding lanes read; the rest of the padding
+        // bytes is never read by any consumer, so no whole-buffer memset runs here.
         Failure failure;
         failure.record(kern::add_rmsnorm_pack((float *)in->h, (const float *)in->delta,
                                               (const float *)in->w, in->m, in->n, in->eps,

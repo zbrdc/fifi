@@ -277,18 +277,18 @@ fn per_head_sinks_differ_on_the_float_path() {
 
 #[test]
 #[ignore = "requires an explicit Mac GPU allocation; no model weights"]
-/// The BATCH BF16 matrix (the 16577 (b) contract): real shared_attention on BF16
-/// tensors at D=128, Hq=32/Hkv=4 (GQA 8), a SHIFTED key origin, both full and
-/// window-513 modes, T=2/7/17/512/1024 - T=2 rides the vendor fused SDPA (16 <= 32),
-/// every larger T rides the FLASH float arm (the shape dispatch). Compared against
-/// the f64 oracle fed the exact BF16-ROUNDED values WITH the layout transposes:
-/// the native tensors are head-major [1, H, T, D], the oracle is row-major
-/// [T, H, D], and the output comparison maps the indices - the axis debt #4
-/// caught (a [T, H, D] slice of a head-major buffer reads 3.8125 where 1 is true).
+/// The BATCH BF16 matrix: real shared_attention on BF16 tensors at D=128,
+/// Hq=32/Hkv=4 (GQA 8), a SHIFTED key origin, both full and window-513 modes,
+/// T=2/7/17/512/1024 - T=2 rides the vendor fused SDPA (16 <= 32), every larger T
+/// rides the FLASH float arm (the shape dispatch). Compared against the f64 oracle
+/// fed the exact BF16-ROUNDED values WITH the layout transposes: the native tensors
+/// are head-major [1, H, T, D], the oracle is row-major [T, H, D], and the output
+/// comparison maps the indices (a [T, H, D] slice of a head-major buffer reads
+/// 3.8125 where 1 is true).
 ///
-/// Mixed-sign inputs use the coordinator's row-scaled 2-ULP gate for both paths.
-/// Every element is checked against the reference row's maximum magnitude.
-/// Detailed per-path error analysis is a follow-up, not a store-only claim.
+/// Mixed-sign inputs use a row-scaled 2-ULP gate for both paths. Every element
+/// is checked against the reference row's maximum magnitude. Detailed per-path
+/// error analysis is a follow-up, not a store-only claim.
 fn bf16_batch_rows_match_the_rounded_oracle() {
     let _serial = crate::native_test_lock();
     let mut k = MlxKernels::try_new().unwrap();
@@ -527,11 +527,11 @@ fn the_w513_boundary_is_loud_not_diffuse() {
     }
 }
 
-/// PER-QUERY-HEAD sinks ON THE FLASH ARM (the adoption bar's cell): GQA 8, T=7,
-/// zero Q/K, V = BF16 2^30, sink_h = (30 + h%4)*ln2 per head. Expected EXACT:
-/// out[h][i][c] = (i+1) * 2^(-(h%4)) - row i sees i+1 keys, each key's mass
-/// 2^-(30+h%4) against the sink's 1, times V = 2^30 leaves (i+1)/2^(h%4),
-/// exact in bf16 (small integers scaled by binary powers).
+/// PER-QUERY-HEAD sinks ON THE FLASH ARM: GQA 8, T=7, zero Q/K, V = BF16 2^30,
+/// sink_h = (30 + h%4)*ln2 per head. Expected EXACT: out[h][i][c] = (i+1) *
+/// 2^(-(h%4)) - row i sees i+1 keys, each key's mass 2^-(30+h%4) against the
+/// sink's 1, times V = 2^30 leaves (i+1)/2^(h%4), exact in bf16 (small integers
+/// scaled by binary powers).
 #[test]
 #[ignore = "requires an explicit Mac GPU allocation; no model weights"]
 fn per_head_sinks_on_the_flash_arm() {
@@ -574,8 +574,8 @@ fn per_head_sinks_on_the_flash_arm() {
             for c in 0..d {
                 let want = (i + 1) as f32 * scale;
                 let idx = (h * t + i) * d + c;
-                // EXACT per the ruling: (i+1)*2^(-(h%4)) is dyadic - exactly
-                // representable in bf16 - so every element is assert_eq.
+                // EXACT: (i+1)*2^(-(h%4)) is dyadic - exactly representable
+                // in bf16 - so every element is assert_eq.
                 assert_eq!(
                     got[idx], want,
                     "h={h} i={i} c={c}: dyadic expectation must be EXACT"
@@ -778,8 +778,8 @@ fn small_bf16_float_keeps_raw_f32_sinks() {
 /// PROMOTED only when every value is BF16-exact (API-side readback) and
 /// NON-exact values REFUSE with BadRequest. Pinned through the real
 /// dispatch with the route counters; the no-sink arm proves the sink
-/// mass still moves the output. Armed by default since the 2026-10-27
-/// flip (a =0 process skips this).
+/// mass still moves the output. Armed by default (a =0 process skips
+/// this).
 #[test]
 #[ignore = "requires an explicit Mac GPU allocation; armed by default, =0 skips it"]
 fn flagged_sink_dtype_gates_decode_vendor() {
@@ -847,10 +847,10 @@ fn flagged_sink_dtype_gates_decode_vendor() {
         "the BF16-sink decode shape must not fall back to flash"
     );
     // Exact raw F32 sinks: the API-side check promotes and the vendor arm
-    // still serves the shape (float flash is REP-8; checked promotion is
-    // the only exact route for displaced GQA geometries) - and the promoted
-    // output must match the stored-BF16 output bitwise (same values, same
-    // kernel).
+    // still serves the shape (float flash serves only GQA 8; checked
+    // promotion is the only exact route for displaced GQA geometries) - and
+    // the promoted output must match the stored-BF16 output bitwise (same
+    // values, same kernel).
     crate::kernels::mlx::native::attn_dispatch::reset();
     let with_f32 = run(Some(&sinks)).expect("BF16-exact F32 sinks promote cleanly");
     let (flash, vendor) = crate::kernels::mlx::native::attn_dispatch::counts();
@@ -886,12 +886,12 @@ fn flagged_sink_dtype_gates_decode_vendor() {
     );
 }
 
-/// GQA4 promotion pin (flagged route): float flash refuses hq/hkv != 8
-/// (REP-8), so a one-row BF16 call at GQA 4 with raw F32 sinks has NO
-/// flash route - the API-side exactness-checked promotion is what keeps
-/// this geometry executable. Exact values ride the vendor arm and match
+/// GQA4 promotion pin (flagged route): float flash refuses hq/hkv != 8,
+/// so a one-row BF16 call at GQA 4 with raw F32 sinks has NO flash
+/// route - the API-side exactness-checked promotion is what keeps this
+/// geometry executable. Exact values ride the vendor arm and match
 /// stored-BF16 sinks bitwise; non-exact values refuse with zero
-/// dispatches. Runs armed (the default since the 2026-10-27 flip).
+/// dispatches. Runs armed (the default).
 #[test]
 #[ignore = "requires an explicit Mac GPU allocation; armed by default, =0 skips it"]
 fn gqa4_sink_promotion_keeps_vendor_route() {
@@ -996,8 +996,8 @@ fn gqa4_sink_promotion_keeps_vendor_route() {
 /// which up-casts BF16-stored sinks to F32 exactly. BF16-REPRESENTABLE
 /// published values must produce BITWISE identical outputs either way -
 /// storage must not perturb the flash arm's sink mass. Runs armed (the
-/// default since the 2026-10-27 flip); the unflagged API refuses BF16
-/// sinks outright (pinned elsewhere).
+/// default); the unflagged API refuses BF16 sinks outright (pinned
+/// elsewhere).
 #[test]
 #[ignore = "requires an explicit Mac GPU allocation; runs armed by default, =0 skips it"]
 fn flash_route_bf16_sink_storage_upcasts_exactly() {
@@ -1209,8 +1209,8 @@ fn the_first_block_short_prefix_w513_is_valid() {
         })
         .unwrap();
     let got = readback_f32(&mut k, &out);
-    // EXACT per the ruling: the uniform mean of all-ones V is exactly 1.0 in
-    // bf16 - every element, every channel, assert_eq.
+    // EXACT: the uniform mean of all-ones V is exactly 1.0 in bf16 - every
+    // element, every channel, assert_eq.
     for h in 0..hq {
         for i in 0..t {
             for c in 0..d {
@@ -1224,10 +1224,10 @@ fn the_first_block_short_prefix_w513_is_valid() {
     }
 }
 
-/// THE PREFLIGHT PROOFS (the agreed owner-usability debt): every typed
-/// rejection returns BadRequest (never a panic, never a poisoning Backend
-/// error), and a VALID operation still works on the same adapter right after
-/// each rejection - the resident owner stays usable.
+/// THE PREFLIGHT PROOFS: every typed rejection returns BadRequest (never a
+/// panic, never a poisoning Backend error), and a VALID operation still
+/// works on the same adapter right after each rejection - the resident owner
+/// stays usable.
 #[test]
 #[ignore = "requires an explicit Mac GPU allocation; no model weights"]
 fn rejections_are_bad_requests_and_the_owner_stays_usable() {
@@ -1286,7 +1286,7 @@ fn rejections_are_bad_requests_and_the_owner_stays_usable() {
             scale: 0.1,
         })
         .err()
-        .expect("GQA-2 at flash-dispatch size must refuse");
+        .expect("GQA 2 at flash-dispatch size must refuse");
     assert!(
         matches!(&refused, EngError::BadRequest(m) if m.contains("GQA == 8")),
         "{refused:?}"

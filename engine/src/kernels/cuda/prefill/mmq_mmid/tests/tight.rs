@@ -1,20 +1,20 @@
 //! Tight-buffer launches of the grouped GEMM: the device rows that `compute-sanitizer` runs to
-//! prove the rev 3 capacity rules (plan rev 3 section B.5 item 4: the B1 and B2 rows and the
-//! per-expert tails). Each test builds the ids and the q8_1 columns the ordinary way in ample
+//! prove the capacity rules (the `b1` rows of the q8_1 pad, the `b2` row of the fixup gather and
+//! the per-expert tails). Each test builds the ids and the q8_1 columns the ordinary way in ample
 //! buffers, then PROBES the launch wrapper for the smallest `y`, `ids_dst` and `expert_bounds`
 //! ranges it accepts (a bisection on the plan function, the others held ample), copies the data
 //! into device allocations of exactly those sizes, and launches over them. With the shipped rules
-//! those sizes are the rev 3 forms (the constant q8_1 pad, `ne_get_rows + ncols_max + 127` ids,
+//! those sizes are the closed forms (the constant q8_1 pad, `ne_get_rows + ncols_max + 127` ids,
 //! `n_experts + 1` bounds) and memcheck finds nothing; a mutant that lowers a rule lowers the
 //! probed size, the launch then reads past its allocation, and memcheck reports it. Without a
 //! sanitizer the tests check values only, so a capacity mutant dies in the sanitizer run alone:
 //! that is the memcheck half of V1, V2, V3, V12, V23 and V24 (the refusal rows of the wrapper are
 //! their CPU half).
 //!
-//! Every shape asserts what it is for before launching: the tile width of the J replica, the
-//! tails, the empty experts, and for the B2 row the host precondition of the rev 3 grant (some
-//! stream-k boundary falls in an empty top-expert tile whose ids gather reaches past
-//! `ne_get_rows + 126`, the capacity of rev 2). The HARD GATE and the f64 reference follow.
+//! Every shape asserts what it is for before launching: the tile width of the J replica, the tails,
+//! the empty experts, and for the `b2` row the host precondition (some stream-k boundary falls in
+//! an empty top-expert tile whose ids gather reaches past `ne_get_rows + 126`, the earlier
+//! capacity). The HARD GATE and the f64 reference follow.
 
 use super::rig::{
     IdBufs, LaunchSpec, Mode, POISON, dequantized, errors, expert_blocks, f32_bytes, f32s,
@@ -30,7 +30,7 @@ use crate::kernels::cuda::resident::matvec_q::QuantType;
 use crate::kernels::cuda::testkit::{self, Rng};
 use crate::kernels::cuda::{CudaContext, DeviceBuffer, DeviceRange};
 
-/// The frozen NMSE bound of a Q4_K expert gate/up launch (0049 A2), the class of every row here.
+/// The frozen NMSE bound of a Q4_K expert gate/up launch, the class of every row here.
 const GATE_UP_NMSE: f64 = 1e-3;
 
 /// The smallest `size` in `1..=hi` for which `accepts(size)` holds. `accepts` must be monotone
@@ -278,11 +278,11 @@ fn mmq_mmid_tight_buffers_b1_single_token_top_expert_at_m_49() {
     if !testkit::device_present("mmq_mmid_tight_buffers_b1_single_token_top_expert_at_m_49") {
         return;
     }
-    // MSG-85 B1: the Qwen expert shape (Q4_K, N 512, K 2,048, fallback off), M 49. The unhinted
-    // chooser would pick J = 64; with the tile hint on by default the launch aims at the average
-    // expert count and picks J = 32, so the bounds asserted below hold for the narrower tile. The
-    // y-tile copies of the last tile run past the last valid column when the highest expert holds
-    // one token: 880 B more than the pad of rev 2.
+    // The Qwen expert shape (Q4_K, N 512, K 2,048, fallback off), M 49. The unhinted chooser would
+    // pick J = 64; with the tile hint on by default the launch aims at the average expert count and
+    // picks J = 32, so the bounds asserted below hold for the narrower tile. The y-tile copies of
+    // the last tile run past the last valid column when the highest expert holds one token: 880 B
+    // more than the earlier, smaller pad.
     let shape = MmidShape {
         n_experts: 16,
         m: 49,
@@ -357,9 +357,8 @@ fn mmq_mmid_tight_buffers_b2_fixup_gathers_an_empty_top_expert() {
     if !testkit::device_present("mmq_mmid_tight_buffers_b2_fixup_gathers_an_empty_top_expert") {
         return;
     }
-    // MSG-85 B2: 8 experts, the highest empty, two column tiles (J 80 at M 130), K 2,048 (eight
-    // k-blocks), 64 tiles over 82 SMs: stream-k with the fixup, whose ids gather has no exit for
-    // an empty tile.
+    // 8 experts, the highest empty, two column tiles (J 80 at M 130), K 2,048 (eight k-blocks), 64
+    // tiles over 82 SMs: stream-k with the fixup, whose ids gather has no exit for an empty tile.
     let shape = MmidShape {
         n_experts: 8,
         m: 130,
@@ -443,9 +442,9 @@ fn mmq_mmid_tight_buffers_fallback_tail_at_m_24() {
     if !testkit::device_present("mmq_mmid_tight_buffers_fallback_tail_at_m_24") {
         return;
     }
-    // The table-gap row of finding 1: fallback on (N 160 is not a multiple of 128), M 24, so J is
-    // 32 where rev 2's upper bound J_ub is 24, and the last expert holds one column: the main
-    // kernel's ids gather runs to `ne_get_rows + 30`, 8 ints past `ne_get_rows + J_ub - 1`.
+    // The table-gap row: fallback on (N 160 is not a multiple of 128), M 24, so J is 32 where the
+    // earlier upper bound J_ub is 24, and the last expert holds one column: the main kernel's ids
+    // gather runs to `ne_get_rows + 30`, 8 ints past `ne_get_rows + J_ub - 1`.
     let shape = MmidShape {
         n_experts: 8,
         m: 24,

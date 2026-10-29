@@ -1,7 +1,7 @@
-//! Unit tests of the CUDA serve start (CUDA-SERVE-1 tests 2b-5): the guard semantics of
-//! KUBDAN-MSG-69 condition 2, the ignored-key start lines, the GGUF identity and the session
-//! and reserve sizing. The text pins live in `start_pins.rs`; the health pins and the ignored
-//! device test live in `start_health_tests.rs`.
+//! Unit tests of the CUDA serve start: the semantics of the one-engine guard, the ignored-key
+//! start lines, the GGUF identity and the session and reserve sizing. The text pins live in
+//! `start_pins.rs`; the health pins and the ignored device test live in
+//! `start_health_tests.rs`.
 
 use super::dims::{KvMode, StepDims};
 use super::pinned::ROTARY_DIM;
@@ -43,8 +43,8 @@ fn the_second_cuda_build_is_refused_with_the_documented_text() {
     let _lock = GUARD_LOCK.lock().unwrap_or_else(|p| p.into_inner());
     reset();
     let first = BuildGuard::acquire().expect("the first build takes the flag");
-    // The refusal is the packet's documented text (2.1), pinned as a LITERAL — comparing
-    // `already_built()` with itself cannot fail (KUBDAN-MSG-72 item 5).
+    // The refusal is the documented text, pinned as a LITERAL — comparing `already_built()`
+    // with itself cannot fail.
     let want = "engine config: the CUDA Q36 backend builds one engine per process: its \
                 weights are leaked for the process lifetime and an in-process restart would \
                 leak 20 GB again; configure a single qwen3_6_35b_a3b entry and restart the \
@@ -83,7 +83,7 @@ fn a_failure_after_the_leak_keeps_the_guard_committed() {
         let mut guard = BuildGuard::acquire().expect("the flag is down");
         guard.commit();
         // The leaks happened: a later step error unwinds `make` and drops the guard
-        // COMMITTED (condition 2).
+        // COMMITTED.
     }
     assert!(
         CUDA_ENGINE_BUILT.load(Ordering::Acquire),
@@ -135,7 +135,7 @@ fn ignored_mlx_keys_produce_a_start_line() {
         assert_eq!(ignored_mlx_line(key), line);
     }
     // The settings record only the four names; a foreign name still has its line (the pure
-    // function is total, KUBDAN-MSG-71 item 5).
+    // function is total).
     assert_eq!(
         ignored_mlx_line("capture"),
         "q36 cuda: an unknown key of the object is ignored"
@@ -175,9 +175,8 @@ fn the_gguf_identity_is_checked_by_name_and_size() {
     for (raw, want) in [(None, false), (Some("0"), false), (Some("1"), true)] {
         assert_eq!(sha256_wanted(raw), Ok(want));
     }
-    // Every other spelling is a typed refusal naming the variable (KUBDAN-MSG-72 NIT): only
-    // `1` turns the check on, `0` and unset leave it off, and `true`/`yes`/`` cannot promise
-    // an unchecked check.
+    // Every other spelling is a typed refusal naming the variable: only `1` turns the check
+    // on, `0` and unset leave it off, and `true`/`yes`/`` cannot promise an unchecked check.
     for raw in ["yes", "true", ""] {
         let text = match sha256_wanted(Some(raw)) {
             Err(EngError::BadRequest(text)) => text,
@@ -213,9 +212,8 @@ fn the_file_digest_and_the_mismatch_text_come_from_one_pass() {
 
 #[test]
 fn the_step_options_follow_the_context_limit_and_the_given_layout_and_mode() {
-    // KUBDAN-MSG-72 item 1: step_options is pure in (limit, layout, kv_mode); make passes the
-    // loaded weights' layout and the resolved mode, so the options carry whichever pair they
-    // are given, unchanged.
+    // step_options is pure in (limit, layout, kv_mode); make passes the loaded weights' layout
+    // and the resolved mode, so the options carry whichever pair they are given, unchanged.
     for layout in [WeightLayout::Tiled, WeightLayout::Native] {
         let options = step_options(32_768, layout, KvMode::Fp16).expect("the serve default");
         assert_eq!(options.context_tokens, 32_768);
@@ -263,10 +261,9 @@ fn the_step_options_follow_the_context_limit_and_the_given_layout_and_mode() {
 
 #[test]
 fn the_kv_bytes_per_position_is_the_pool_figure_of_the_pinned_shape_in_both_modes() {
-    // KUBDAN-MSG-72 item 6, carried to both modes (KV8-B B4): the admission's per-position
-    // term is the SAME figure the state layout computes for the pinned shape — 20,480 B under
-    // Fp16 and 10,880 B under Int8G32 — never an independent constant: the layout is the
-    // source, the two literals are the pin.
+    // In both KV modes the admission's per-position term is the SAME figure the state layout
+    // computes for the pinned shape — 20,480 B under Fp16 and 10,880 B under Int8G32 — never
+    // an independent constant: the layout is the source, the two literals are the pin.
     let dims = StepDims::new(
         &HostShape::from_spec(&QWEN3_6_35B_A3B, ROTARY_DIM).expect("shape"),
         &Inventory::for_spec(&QWEN3_6_35B_A3B).expect("inventory"),
@@ -386,8 +383,8 @@ fn the_load_reserve_covers_the_kv_cache() {
         (671_088_640, 1 << 30, 0)
     );
     assert!(options.drop_page_cache.is_none());
-    // MSG-70 condition 8: the load layout is written outright; since the S3c qualification
-    // (KUBDAN-MSG-77) it is `Native`, and this one field of `load_options` is the switch.
+    // The load layout is written outright: it is `Native`, and this one field of
+    // `load_options` is the switch.
     assert_eq!(options.layout, WeightLayout::Native);
 }
 

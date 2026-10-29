@@ -1,10 +1,10 @@
 //! Raw FFI to the attention preparation entry of `native/resident/attn_prep.cu` (declared in
-//! `native/resident/attn_prep.h`), RD-8a. Child module of `native/resident.rs`, so it inherits the
+//! `native/resident/attn_prep.h`). Child module of `native/resident.rs`, so it inherits the
 //! `allow(unsafe_code)` of `native.rs`.
 //!
 //! Safety invariants this file relies on:
 //! - The launch entry is called only through `CudaContext::launch_on`, on the thread that owns the
-//!   context and under the dispatch guard (decisions 0023 and 0024). It only enqueues and returns.
+//!   context and under the dispatch guard. It only enqueues and returns.
 //! - Every range is a `RawRange`, proved inside a live allocation by `raw_range`. Sizes, alignment
 //!   and disjointness (`super::Span`) are proved again here, on the extents the kernel touches,
 //!   before the call; the C entry repeats the alignment and shape checks on the addresses.

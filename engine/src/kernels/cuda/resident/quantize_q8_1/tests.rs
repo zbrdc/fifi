@@ -1,10 +1,10 @@
 //! Tests (3090) of `quantize_q8_1` (seam 1: the Rust wrapper against the C entry against the
-//! vendored `quantize_q8_1` kernel). Device tests assume `--test-threads=1` (decision 0040).
+//! vendored `quantize_q8_1` kernel). Device tests assume `--test-threads=1`.
 //!
-//! The vendored objects are built with `-use_fast_math` (decision 0049 item 5, KUBDAN-MSG-62
-//! A4): the f32 scale `d = amax/127` is computed with the approximate division (up to 3 ulp from
-//! the IEEE value) and codes can differ at rounding boundaries, and the half rounding happens on
-//! that value. The device test therefore asserts INVARIANTS, not bytes:
+//! The vendored objects are built with `-use_fast_math`: the f32 scale `d = amax/127` is computed
+//! with the approximate division (up to 3 ulp from the IEEE value) and codes can differ at
+//! rounding boundaries, and the half rounding happens on that value. The device test therefore
+//! asserts INVARIANTS, not bytes:
 //! - `|q*d - x| <= d/2 + eps` with `eps = 0.07*|d| + 1e-30`: `d/2` is the roundf bound; `eps`
 //!   covers 3 f32 ulp of approximate division scaled by |q| <= 127 and the one half-ulp of
 //!   storing `d` as a half (127 * 2^-11 ~ 0.062 |d|);
@@ -94,7 +94,7 @@ fn q8_1_bytes_is_pure_and_exact() {
     assert_eq!(q8_1_bytes(usize::MAX, 8), None);
 }
 
-/// The byte counts `plan_quantize` checks a call against (KUBDAN-MSG-64 item 6, mutant S4).
+/// The byte counts `plan_quantize` checks a call against.
 #[test]
 fn quantize_needs_are_pure_and_exact() {
     // x: ncols rows of k f32 values; y: the padded block_q8_1 rows.
@@ -292,8 +292,8 @@ fn attempt(rig: &RefusalRig, other: &OtherContext, spec: Spec) -> Result<(), Eng
     )
 }
 
-/// KUBDAN-MSG-64 item 6 for `plan_quantize`: every refusal is a `BadRequest` with the text of its
-/// own check, nothing is queued, the backend stays usable, and the valid call of the same rig runs.
+/// For `plan_quantize`, every refusal is a `BadRequest` with the text of its own check, nothing is
+/// queued, the backend stays usable, and the valid call of the same rig runs.
 #[test]
 fn quantize_rejects_unsound_calls_before_launching() {
     if !testkit::device_present("quantize_rejects_unsound_calls_before_launching") {

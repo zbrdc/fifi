@@ -6,7 +6,7 @@
 //! and the blocking path, `testkit::blocking`.
 //!
 //! The owner counts and the queued work are process-wide, so these tests assume
-//! `--test-threads=1`, as the device suite is always run (decision 0040).
+//! `--test-threads=1`, as the device suite is always run.
 //!
 //! Each refusal is checked by the text of its error as well as its variant, so a test fails when
 //! another check refuses the call instead of the one under test.
@@ -565,9 +565,9 @@ fn the_wrapper_rejects_unsound_calls_before_launching() {
     );
 }
 
-// ---- Q5_0 (MEL-C1b): the own kernel behind `matmul_expert` ----------------------------------
+// ---- Q5_0: the own kernel behind `matmul_expert` ---------------------------------------------
 
-/// Decision 0047 item 9, class T3 (f16-input products): the NMSE bound per output vector.
+/// Class T3 (f16-input products): the NMSE bound per output vector.
 const NMSE_BOUND: f64 = 1e-5;
 /// Output lengths from which the argmax of a token is compared (the T3 rule: 64 and up).
 const ARGMAX_MIN_ROWS: usize = 64;
@@ -783,9 +783,9 @@ fn q5_0_expert_matmul_equals_the_dense_matmul_at_the_expert_offset() {
             let id = usize::try_from(id).expect("a valid id");
             let got = rig.expert(slot);
             let case = format!("q5_0 m={m} slot={slot} id={id}");
-            // The dense and expert launches are bit-equal only while both paths use the same mma884
-            // fragment and reduction order. A failure here is a defect of the kernel, never a
-            // reason to widen the bound or to drop this assertion (lane M ruling on MEL-C1b).
+            // The dense and expert launches are bit-equal only while both paths use the same
+            // mma884 fragment and reduction order. A failure here is a defect of the kernel, never
+            // a reason to widen the bound or to drop this assertion.
             assert_eq!(bits(&got), bits(&rig.direct(id)), "{case}: against direct");
             let blocking = testkit::blocking(&rig.ctx, &rig.weight, (id * ROWS, ROWS), &rig.x);
             assert_eq!(bits(&got), bits(&blocking), "{case}: against blocking");

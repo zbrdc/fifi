@@ -11,7 +11,7 @@
 //! 16-byte (out) and 4-byte (w, ids) alignment; out overlaps neither w nor ids.
 #![cfg_attr(
     not(test),
-    expect(dead_code, reason = "staged for RD-9a (decision 0047)")
+    expect(dead_code, reason = "staged for the resident decode step")
 )]
 
 use crate::EngError;

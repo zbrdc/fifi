@@ -1,10 +1,10 @@
 /*
- * RD-8l: the KV8 split-KV decode attention kernel of the resident decode step (decision 0047
- * item 6): the same split-KV decode attention as attn_decode.cu, reading the int8 codes and the
- * fp16 scales of the frozen KV8 planes (RD-8k) instead of an fp16 cache.
+ * The KV8 split-KV decode attention kernel of the resident decode step: the same split-KV
+ * decode attention as attn_decode.cu, reading the int8 codes and the fp16 scales of the frozen
+ * KV8 planes that kv8_append writes instead of an fp16 cache.
  *
  * The split-KV scheme with a fixed-order combine follows
- * this repository's own attn_decode.cu (RD-8b; the technique is public, Flash-Decoding, Dao et
+ * this repository's own attn_decode.cu (the technique is public, Flash-Decoding, Dao et
  * al. 2023); the packed int8 layout with one fp16 scale per 32 values read in contiguous
  * 64-cell tiles and dequantized in registers is the design idea of Strata's laguna_kv8 flash
  * decode. The code is original CUDA C
@@ -31,6 +31,10 @@
 #include <stddef.h>
 #include <stdint.h>
 #include <cstdlib>
+#ifdef INFERENCE_CUDA_ARMS_QUALIFICATION
+#include <atomic>
+#include <cstdio>
+#endif
 
 #include "abi.h"
 #include "device.h"
@@ -62,6 +66,8 @@ struct Args {
 
 // Key range plan from the number of keys alone, as attn_decode.cu: n_split splits of `chunk`
 // keys (a multiple of the tile) cover n_keys; split s owns [s * chunk, min(n_keys, (s+1)*chunk)).
+// The qualification FFI keeps a separate HOST mirror of this arithmetic; the pin
+// test pins both to exact values so the two copies cannot drift.
 __device__ inline void split_plan(int n_keys, int max_splits, int min_keys, int &chunk,
                                   int &n_active) {
     const int want = (n_keys + min_keys - 1) / min_keys;
@@ -291,6 +297,14 @@ __global__ void __launch_bounds__(256) attn_q8_part_k(Args a) {
     }
 }
 
+#ifdef INFERENCE_CUDA_ARMS_QUALIFICATION
+// Which kernel ACTUALLY executed on the device: the first thread of block (0,0,0)
+// writes its identity here before any early return, and the fixture reads
+// the word back after each leg. Unlike the host-side dispatch tag, this cannot pass
+// if a launch statement resolves to a different kernel than intended.
+__device__ int g_kernel_ran = 0;
+#endif
+
 // Separate variant preserves legacy register allocation and flag-off performance.
 template <int D>
 __global__ void __launch_bounds__(256, 2) attn_q8_register_v_part_k(Args a) {
@@ -301,6 +315,9 @@ __global__ void __launch_bounds__(256, 2) attn_q8_register_v_part_k(Args a) {
     __shared__ float s_corr[G];
     const int s = blockIdx.x, kvh = blockIdx.y, t = blockIdx.z;
     const int tid = threadIdx.x, lane = tid & 31, warp = tid >> 5;
+#ifdef INFERENCE_CUDA_ARMS_QUALIFICATION
+    if (s == 0 && kvh == 0 && t == 0 && tid == 0) { g_kernel_ran = 1; }
+#endif
     const int kv_len = *a.kv_len;
     if (!kv_ok(a, kv_len)) {
         return;
@@ -381,6 +398,233 @@ __global__ void __launch_bounds__(256, 2) attn_q8_register_v_part_k(Args a) {
                 }
             }
         }
+        __syncthreads();
+        // Phase 2: softmax statistics of head `warp` over the whole 64-key tile, in two 32-lane
+        // passes with a fixed order: the exact max first, then the probabilities under it.
+        {
+            float m_new = m_run;
+            for (int half = 0; half < kTile / 32; ++half) {
+                const int j = half * 32 + lane;
+                const float sc = j < nvalid ? s_sc[warp][j] : -INFINITY;
+                m_new = fmaxf(m_new, warp_max_a(sc));
+            }
+            const float corr = expf(m_run - m_new);
+            float psum = 0.f;
+            for (int half = 0; half < kTile / 32; ++half) {
+                const int j = half * 32 + lane;
+                const float sc = j < nvalid ? s_sc[warp][j] : -INFINITY;
+                const float p = j < nvalid ? expf(sc - m_new) : 0.f;
+                psum += p;  // reduced below, in lane order within each half
+                s_p[j][warp] = p;
+            }
+            l_run = l_run * corr + warp_sum_a(psum);
+            m_run = m_new;
+            if (lane == 0) {
+                s_corr[warp] = corr;
+            }
+        }
+        __syncthreads();
+        // Phase 3: acc[g] (dimension tid of head g) += p[g][j] * V[j][tid], dequantized here.
+#pragma unroll
+        for (int g = 0; g < G; ++g) {
+            acc[g] *= s_corr[g];
+        }
+        const signed char *vcol = a.v_codes + (size_t)kvh * code_stride + tid;
+        const unsigned short *vrow =
+            a.v_scales + (size_t)kvh * scale_stride + (tid / kQuant);
+        // Eight constant-index values fit registers without changing the ascending-key FMA chain.
+#pragma unroll 1
+        for (int first_j = 0; first_j < kTile; first_j += 8) {
+            float values[8];
+#pragma unroll
+            for (int i = 0; i < 8; ++i) {
+                const int j = first_j + i;
+                values[i] = 0.f;
+                if (own && j < nvalid) {
+                    const int row = cache_cell(a, first, base + j);
+                    values[i] = h2f(vrow[(size_t)row * groups]) *
+                                (float)vcol[(size_t)row * D];
+                }
+            }
+#pragma unroll
+            for (int i = 0; i < 8; ++i) {
+                const int j = first_j + i;
+                const float v = values[i];
+                const float4 pa = *reinterpret_cast<const float4 *>(&s_p[j][0]);
+                const float4 pb = *reinterpret_cast<const float4 *>(&s_p[j][4]);
+                acc[0] = fmaf(pa.x, v, acc[0]); acc[1] = fmaf(pa.y, v, acc[1]);
+                acc[2] = fmaf(pa.z, v, acc[2]); acc[3] = fmaf(pa.w, v, acc[3]);
+                acc[4] = fmaf(pb.x, v, acc[4]); acc[5] = fmaf(pb.y, v, acc[5]);
+                acc[6] = fmaf(pb.z, v, acc[6]); acc[7] = fmaf(pb.w, v, acc[7]);
+            }
+        }
+    }
+    // Partial of (token t, kv head, split s): all stats first, then all accumulators, as attn_decode.
+    const size_t cell = ((size_t)t * a.n_kv_head + kvh) * a.max_splits + s;
+    const size_t n_cells = (size_t)a.m * a.n_kv_head * a.max_splits;
+    float *ml = a.part + cell * G * 2;
+    float *ac = a.part + n_cells * G * 2 + cell * G * D;
+    if (lane == 0) {
+        ml[warp * 2] = m_run;
+        ml[warp * 2 + 1] = l_run;
+    }
+    if (own) {
+#pragma unroll
+        for (int g = 0; g < G; ++g) {
+            ac[(size_t)g * D + tid] = acc[g];
+        }
+    }
+}
+
+// Prefetch variant: a SEPARATE copy of the register-V kernel that
+// keeps the eight GQA heads' query chunks in shared memory (the 4160-byte tile buffers
+// leave ample room) and holds key j+8's raw code words in registers before key j's dot
+// chain, so the latency-bound serial scan (measured 127 regs, 2 blocks/SM) overlaps loads
+// with compute. The multiply/fmaf order per head is unchanged, so it is bitwise-equal to
+// the legacy kernel; INFERENCE_CUDA_KV8_ATTN_V_PREFETCH=1 (exactly "1", read once)
+// selects it. The legacy kernel above is untouched.
+template <int D>
+__global__ void __launch_bounds__(256, 2) attn_q8_register_v_prefetch_k(Args a) {
+    constexpr int G = kGroup, NCH = D / 128;  // chunks of 4 dims per lane: 2 (D 256) or 1 (D 128)
+    static_assert(D == 256, "register V is qualified for head_dim 256");
+    __shared__ float s_sc[G][kTile + 1];      // scores of the tile, head-major, padded
+    __shared__ __align__(16) float s_p[kTile][G];  // probabilities, key-major (float4 reads)
+    __shared__ float s_corr[G];
+    const int s = blockIdx.x, kvh = blockIdx.y, t = blockIdx.z;
+    const int tid = threadIdx.x, lane = tid & 31, warp = tid >> 5;
+#ifdef INFERENCE_CUDA_ARMS_QUALIFICATION
+    if (s == 0 && kvh == 0 && t == 0 && tid == 0) { g_kernel_ran = 2; }
+#endif
+    const int kv_len = *a.kv_len;
+    if (!kv_ok(a, kv_len)) {
+        return;
+    }
+    const int n_keys = kv_len + t;
+    int first, count;
+    visible(a, n_keys, first, count);
+    int chunk, n_active;
+    split_plan(count, a.max_splits, a.min_keys, chunk, n_active);
+    if (s >= n_active) {
+        return;
+    }
+    const int k_begin = s * chunk, k_end = min(count, k_begin + chunk);
+    const int groups = D / kQuant;
+    const size_t code_stride = (size_t)a.cells * D;    // cells of one kv head of codes
+    const size_t scale_stride = (size_t)a.cells * groups;
+    const bool own = tid < D;  // one dimension per thread; with D 128 only threads 0..127 own one
+
+    // This lane's dims are 4 * lane .. +3, and for D 256 also 128 + 4 * lane .. +3; the group
+    // of chunk c is 4c + lane / 8. q is pre-scaled once. This variant stages every head's
+    // chunk in shared memory (one float4 per lane per chunk, written once); the stored f32
+    // bits are those the register path computes, so the dot chains stay bitwise-identical.
+    __shared__ __align__(16) float s_q[G][NCH][32][4];
+
+    // Warp w fills tile w (G == 8 tiles, 8 warps): distinct smem cells per warp, no
+    // write/write overlap. The values written are identical to the pre-change all-warp
+    // fill, so the syncthreads barrier plus the reads below see the same bits.
+    for (int g = warp; g < G; g += 8) {
+        const float *qh = a.q + ((size_t)t * a.n_head + (size_t)kvh * G + g) * D;
+#pragma unroll
+        for (int c = 0; c < NCH; ++c) {
+            const float4 qq = *reinterpret_cast<const float4 *>(qh + 128 * c + 4 * lane);
+            s_q[g][c][lane][0] = qq.x * a.scale;
+            s_q[g][c][lane][1] = qq.y * a.scale;
+            s_q[g][c][lane][2] = qq.z * a.scale;
+            s_q[g][c][lane][3] = qq.w * a.scale;
+        }
+    }
+    __syncthreads();
+    float acc[G];
+#pragma unroll
+    for (int g = 0; g < G; ++g) {
+        acc[g] = 0.f;
+    }
+    float m_run = -INFINITY, l_run = 0.f;  // head `warp`'s running max and sum, same in every lane
+
+    for (int base = k_begin; base < k_end; base += kTile) {
+        const int nvalid = min(kTile, k_end - base);
+        // Phase 1: scores. Warp w scores keys w, w + 8, ... of the tile; each lane dequantizes
+        // its 4 dims of each key in registers against the key's stored fp16 scale. This loads
+        // key j+8's raw words before key j's dot chain (the headroom the q move freed); the
+        // arithmetic of both paths is the same multiply-then-fmaf sequence over the same bits.
+
+        int kc_next[NCH] = {};
+        unsigned short ks_next[NCH] = {};
+        {
+            const int j = warp;
+            if (j < nvalid) {
+                const int row = cache_cell(a, first, base + j);
+                const signed char *kc =
+                    a.k_codes + (size_t)kvh * code_stride + (size_t)row * D;
+                const unsigned short *ks =
+                    a.k_scales + (size_t)kvh * scale_stride + (size_t)row * groups;
+#pragma unroll
+                for (int c = 0; c < NCH; ++c) {
+                    kc_next[c] = *reinterpret_cast<const int *>(kc + 128 * c + 4 * lane);
+                    ks_next[c] = ks[4 * c + (lane >> 3)];
+                }
+            }
+        }
+#pragma unroll 1
+        for (int i = 0; i < kTile / 8; ++i) {
+            const int j = warp + 8 * i;
+            if (j < nvalid) {
+                const bool more = j + 8 < nvalid;
+                int kc_hold[NCH];
+                unsigned short ks_hold[NCH];
+                if (more) {
+                    const int row = cache_cell(a, first, base + j + 8);
+                    const signed char *kc =
+                        a.k_codes + (size_t)kvh * code_stride + (size_t)row * D;
+                    const unsigned short *ks =
+                        a.k_scales + (size_t)kvh * scale_stride + (size_t)row * groups;
+#pragma unroll
+                    for (int c = 0; c < NCH; ++c) {
+                        kc_hold[c] = *reinterpret_cast<const int *>(kc + 128 * c + 4 * lane);
+                        ks_hold[c] = ks[4 * c + (lane >> 3)];
+                    }
+                }
+                float kf[8];
+#pragma unroll
+                for (int c = 0; c < NCH; ++c) {
+                    const float sv = h2f(ks_next[c]);
+                    const int word = kc_next[c];
+                    kf[4 * c] = sv * (float)(signed char)(word & 0xff);
+                    kf[4 * c + 1] = sv * (float)(signed char)((word >> 8) & 0xff);
+                    kf[4 * c + 2] = sv * (float)(signed char)((word >> 16) & 0xff);
+                    kf[4 * c + 3] = sv * (float)(signed char)((word >> 24) & 0xff);
+                }
+                if (more) {
+#pragma unroll
+                    for (int c = 0; c < NCH; ++c) {
+                        kc_next[c] = kc_hold[c];
+                        ks_next[c] = ks_hold[c];
+                    }
+                }
+                float dots[8];
+#pragma unroll
+                for (int g = 0; g < G; ++g) {
+                    float p = s_q[g][0][lane][0] * kf[0];
+                    p = fmaf(s_q[g][0][lane][1], kf[1], p);
+                    p = fmaf(s_q[g][0][lane][2], kf[2], p);
+                    p = fmaf(s_q[g][0][lane][3], kf[3], p);
+#pragma unroll
+                    for (int c = 1; c < NCH; ++c) {
+                        p = fmaf(s_q[g][c][lane][0], kf[4 * c], p);
+                        p = fmaf(s_q[g][c][lane][1], kf[4 * c + 1], p);
+                        p = fmaf(s_q[g][c][lane][2], kf[4 * c + 2], p);
+                        p = fmaf(s_q[g][c][lane][3], kf[4 * c + 3], p);
+                    }
+                    dots[g] = p;
+                }
+                int head;
+                const float sum = reduce8(dots, lane, head);
+                if ((lane & 3) == 0) {
+                    s_sc[head][j] = sum;
+                }
+            }
+        }
+
         __syncthreads();
         // Phase 2: softmax statistics of head `warp` over the whole 64-key tile, in two 32-lane
         // passes with a fixed order: the exact max first, then the probabilities under it.
@@ -547,6 +791,9 @@ bool valid(const inference_cuda_attn_decode_q8_args *a) {
            aligned_to(a->part, 16) && aligned_to(a->out, 4);
 }
 
+// Explicit arm control lives under INFERENCE_CUDA_ARMS_QUALIFICATION below (t_force_prefetch,
+// set_arms): feature-disabled builds compile none of it.
+
 bool register_v_enabled() {
     // Set INFERENCE_CUDA_KV8_ATTN_R1=0 before startup to restore the original kernel.
     static const bool enabled = [] {
@@ -556,12 +803,90 @@ bool register_v_enabled() {
     return enabled;
 }
 
+bool v_prefetch_enabled() {
+    // INFERENCE_CUDA_KV8_ATTN_V_PREFETCH=1 (exactly "1") selects the prefetch kernel.
+    // Read ONCE per process, like register_v_enabled: production pays one getenv at
+    // startup, not one per launch; qualification builds toggle arms per launch through
+    // the thread-local set_arms entry below.
+    static const bool enabled = [] {
+        const char *value = std::getenv("INFERENCE_CUDA_KV8_ATTN_V_PREFETCH");
+        return value != nullptr && value[0] == '1' && value[1] == '\0';
+    }();
+    return enabled;
+}
+
+#ifdef INFERENCE_CUDA_ARMS_QUALIFICATION
+// ---- Qualification-only machinery (cargo feature cuda-arms-qualification). Feature-disabled
+// builds compile none of this: the receipt, the forced-arm override, the dispatch tag,
+// and the test FFIs all live behind the define. ----
+
+// Thread-local on purpose: only the thread that forces an arm sees the override, so a
+// forced arm can never leak into another thread's launches (the device fixture
+// additionally runs in a child process).
+thread_local int t_force_prefetch = -1;
+
+// Which kernel the LAST register-V launch dispatched: 0 none, 1 the legacy kernel,
+// 2 the prefetch kernel. The fixture reads it after each leg, so a leg that silently
+// resolved to the wrong kernel (or to the original non-register-V kernel) fails.
+static std::atomic<int> g_dispatched{0};
+
+// The prefetch kernel's launch receipt: an instantiation with local-memory spills or a
+// 256-thread limit refuses to launch, loudly, printing regs/smem/spills once.
+bool arm_receipt() {
+    static const bool ok = [] {
+        const void *kernel = reinterpret_cast<const void *>(attn_q8_register_v_prefetch_k<256>);
+        cudaFuncAttributes attr{};
+        const cudaError_t err = cudaFuncGetAttributes(&attr, kernel);
+        int sms = -1;
+        cudaDeviceGetAttribute(&sms, cudaDevAttrMultiProcessorCount, 0);
+        std::fprintf(stderr,
+                     "attn_q8 register_v prefetch receipt: %s regs=%d smem=%d spill=%d "
+                     "maxThreads=%d SMs=%d\n",
+                     cudaGetErrorString(err), attr.numRegs,
+                     (int)attr.sharedSizeBytes, (int)attr.localSizeBytes,
+                     attr.maxThreadsPerBlock, sms);
+        return err == cudaSuccess && attr.localSizeBytes == 0 && attr.maxThreadsPerBlock >= 256;
+    }();
+    if (!ok) {
+        std::fprintf(stderr, "attn_q8 register_v prefetch receipt: REFUSING to launch\n");
+    }
+    return ok;
+}
+#endif
+
 template <int D>
 Failure enqueue(const Args &a, cudaStream_t s) {
     Failure failure;
     if constexpr (D == 256) {
         if (register_v_enabled()) {
+            const bool pre =
+#ifdef INFERENCE_CUDA_ARMS_QUALIFICATION
+                t_force_prefetch >= 0 ? t_force_prefetch == 1 :
+#endif
+                v_prefetch_enabled();
+            if (pre) {
+#ifdef INFERENCE_CUDA_ARMS_QUALIFICATION
+                if (!arm_receipt()) {
+                    failure.record(cudaErrorLaunchOutOfResources, INFERENCE_CUDA_STAGE_LAUNCH);
+                    return failure;
+                }
+#endif
+                attn_q8_register_v_prefetch_k<D><<<dim3(a.max_splits, a.n_kv_head, a.m), 256, 0, s>>>(a);
+#ifdef INFERENCE_CUDA_ARMS_QUALIFICATION
+                g_dispatched.store(2, std::memory_order_relaxed);
+#endif
+                failure.record(cudaGetLastError(), INFERENCE_CUDA_STAGE_LAUNCH);
+                if (failure.ok()) {
+                    attn_q8_combine_k<D><<<dim3(a.n_head, a.m), D, 0, s>>>(a);
+                    failure.record(cudaGetLastError(), INFERENCE_CUDA_STAGE_LAUNCH);
+                }
+                return failure;
+            }
+            // The statement below is main's launch, verbatim (same indentation).
             attn_q8_register_v_part_k<D><<<dim3(a.max_splits, a.n_kv_head, a.m), 256, 0, s>>>(a);
+#ifdef INFERENCE_CUDA_ARMS_QUALIFICATION
+            g_dispatched.store(1, std::memory_order_relaxed);
+#endif
         } else {
             attn_q8_part_k<D><<<dim3(a.max_splits, a.n_kv_head, a.m), 256, 0, s>>>(a);
         }
@@ -620,10 +945,151 @@ static int launch_decode(const inference_cuda_attn_decode_q8_args *in,
     }
 }
 
+
 extern "C" int inference_cuda_attn_decode_q8_launch(const inference_cuda_attn_decode_q8_args *in,
     void *stream, int *out_stage) {
     return launch_decode(in, nullptr, stream, out_stage);
 }
+#ifdef INFERENCE_CUDA_ARMS_QUALIFICATION
+// Test/harness-only arm control, on THIS thread only (see t_force_prefetch).
+extern "C" int inference_cuda_attn_decode_q8_set_arms(int prefetch) {
+    if (prefetch < -1 || prefetch > 1) {
+        return INFERENCE_CUDA_INVALID_ARGUMENT;
+    }
+    t_force_prefetch = prefetch;
+    return 0;
+}
+#endif
+
+#ifdef INFERENCE_CUDA_ARMS_QUALIFICATION
+// The register count and static shared-memory bytes of the two register-V kernels: the
+// fixture asserts they are DIFFERENT kernels before comparing their outputs.
+extern "C" int inference_cuda_attn_decode_q8_arm_attrs(int prefetch, int *regs, int *smem) {
+    if (regs == nullptr || smem == nullptr || (prefetch != 0 && prefetch != 1)) {
+        return INFERENCE_CUDA_INVALID_ARGUMENT;
+    }
+    const void *kernel = prefetch
+                             ? reinterpret_cast<const void *>(attn_q8_register_v_prefetch_k<256>)
+                             : reinterpret_cast<const void *>(attn_q8_register_v_part_k<256>);
+    cudaFuncAttributes attr{};
+    const cudaError_t err = cudaFuncGetAttributes(&attr, kernel);
+    if (err != cudaSuccess) {
+        return INFERENCE_CUDA_INVALID_ARGUMENT;
+    }
+    *regs = attr.numRegs;
+    *smem = (int)attr.sharedSizeBytes;
+    return 0;
+}
+
+// Which kernel the last register-V launch dispatched (0 none, 1 legacy, 2 prefetch).
+extern "C" int inference_cuda_attn_decode_q8_dispatched() {
+    return g_dispatched.load(std::memory_order_relaxed);
+}
+
+// Reset/read the device-written kernel identity around each fixture leg.
+extern "C" int inference_cuda_attn_decode_q8_kernel_identity_reset() {
+    const int zero = 0;
+    if (cudaMemcpyToSymbol(g_kernel_ran, &zero, sizeof(int)) != cudaSuccess) {
+        return INFERENCE_CUDA_INVALID_ARGUMENT;
+    }
+    // The copy rides the default stream while fixture legs launch on the context
+    // stream: order the reset against the following leg explicitly.
+    return cudaDeviceSynchronize() == cudaSuccess ? 0 : INFERENCE_CUDA_INVALID_ARGUMENT;
+}
+
+extern "C" int inference_cuda_attn_decode_q8_kernel_identity(int *ran) {
+    if (ran == nullptr) {
+        return INFERENCE_CUDA_INVALID_ARGUMENT;
+    }
+    return cudaMemcpyFromSymbol(ran, g_kernel_ran, sizeof(int)) == cudaSuccess
+               ? 0
+               : INFERENCE_CUDA_INVALID_ARGUMENT;
+}
+
+// Device-side split-plan probe: calls the same __device__ helper the kernels call,
+// so the fixture can pin BOTH copies, not just the host mirror.
+__global__ void attn_q8_split_plan_probe_k(int n_keys, int max_splits, int min_keys,
+                                           int *chunk, int *n_active) {
+    int c, n;
+    split_plan(n_keys, max_splits, min_keys, c, n);
+    *chunk = c;
+    *n_active = n;
+}
+
+// The device split_plan computes its sums in int: any intermediate wider than INT_MAX
+// wraps on device, so BOTH the host mirror and the probe below reject those inputs
+// before the arithmetic, instead of accepting them and computing the wrong plan.
+static bool split_plan_fits(int n_keys, int max_splits, int min_keys) {
+    const long long kMax = 2147483647LL;
+    const long long want = ((long long)n_keys + min_keys - 1) / min_keys;
+    const long long n_split = want < 1 ? 1 : (want > max_splits ? (long long)max_splits : want);
+    const long long c0 = ((long long)n_keys + n_split - 1) / n_split;
+    const long long c = (c0 + kTile - 1) / kTile * kTile;
+    // Every bound is on the ADDITION, not on a + b - 1: C evaluates (a + b) - 1,
+    // so a + b must itself fit or the device overflows before the subtraction.
+    return (long long)n_keys + min_keys <= kMax       // want's sum
+        && (long long)n_keys + n_split <= kMax        // chunk's sum
+        && c0 + kTile <= kMax                         // the tile round-up
+        && (long long)n_keys + c <= kMax;             // n_active's sum
+}
+
+extern "C" int inference_cuda_attn_decode_q8_split_plan_device(int n_keys, int max_splits,
+                                                               int min_keys, int *chunk,
+                                                               int *n_active) {
+    if (chunk == nullptr || n_active == nullptr || n_keys < 1 || max_splits < 1
+        || min_keys < 1 || !split_plan_fits(n_keys, max_splits, min_keys)) {
+        return INFERENCE_CUDA_INVALID_ARGUMENT;
+    }
+    int *device_out = nullptr;
+    if (cudaMalloc(&device_out, 2 * sizeof(int)) != cudaSuccess) {
+        return INFERENCE_CUDA_INVALID_ARGUMENT;
+    }
+    attn_q8_split_plan_probe_k<<<1, 1>>>(n_keys, max_splits, min_keys, device_out,
+                                         device_out + 1);
+    const cudaError_t launch_err = cudaGetLastError();
+    const cudaError_t sync_err = cudaDeviceSynchronize();
+    int host_out[2] = {0, 0};
+    const cudaError_t copy_err =
+        cudaMemcpy(host_out, device_out, 2 * sizeof(int), cudaMemcpyDeviceToHost);
+    cudaFree(device_out);
+    if (launch_err != cudaSuccess || sync_err != cudaSuccess || copy_err != cudaSuccess) {
+        return INFERENCE_CUDA_INVALID_ARGUMENT;
+    }
+    *chunk = host_out[0];
+    *n_active = host_out[1];
+    return 0;
+}
+
+extern "C" int inference_cuda_attn_decode_q8_split_plan(int n_keys, int max_splits, int min_keys,
+                                                        int *chunk, int *n_active) {
+    if (chunk == nullptr || n_active == nullptr || n_keys < 1 || max_splits < 1
+        || min_keys < 1) {
+        return INFERENCE_CUDA_INVALID_ARGUMENT;
+    }
+    // Test-only host mirror of the __device__ split_plan above (which cannot be called
+    // from host code), so the fixture can assert the caps 64/61/41 give distinct
+    // (chunk, n_active) plans at 65,536 keys before running any device leg. Degenerate
+    // inputs (n_keys < 1, max_splits < 1, min_keys < 1) are rejected HERE: the device
+    // helper divides by zero on them and stays byte-identical to base.
+    // Widened arithmetic throughout, and split_plan_fits rejects inputs whose int
+    // intermediates would overflow on device: the mirror must not accept a plan the
+    // device copy computes wrongly. The pin test asserts exact values for the shipped
+    // caps, so any drift between the two copies fails loudly.
+    if (!split_plan_fits(n_keys, max_splits, min_keys)) {
+        return INFERENCE_CUDA_INVALID_ARGUMENT;
+    }
+    const long long want = ((long long)n_keys + min_keys - 1) / min_keys;
+    const long long n_split = want < 1 ? 1 : (want > max_splits ? (long long)max_splits : want);
+    const long long c = ((((long long)n_keys + n_split - 1) / n_split) + kTile - 1) / kTile * kTile;
+    const long long n = ((long long)n_keys + c - 1) / c;
+    if (c > 2147483647LL || n > 2147483647LL || c < 1 || n < 1) {
+        return INFERENCE_CUDA_INVALID_ARGUMENT;
+    }
+    *chunk = (int)c;
+    *n_active = (int)n;
+    return 0;
+}
+#endif
 
 extern "C" int inference_cuda_attn_decode_q8_sinks_launch(const inference_cuda_attn_decode_q8_args *in,
     const float *sinks, void *stream, int *out_stage) {

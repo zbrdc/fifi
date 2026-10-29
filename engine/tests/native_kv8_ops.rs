@@ -1,5 +1,5 @@
-//! Native tests of the KV8-OPS operations: `quantize_rows`, the U32 `kv_append`, and
-//! `quantized_attention_prefix` over the 8-bit KV cache (packet KV8-OPS).
+//! Native tests of the 8-bit KV cache operations: `quantize_rows`, the U32 `kv_append`, and
+//! `quantized_attention_prefix`.
 
 #![cfg(all(feature = "native-mlx", target_os = "macos", target_arch = "aarch64"))]
 
@@ -113,8 +113,8 @@ fn affine(group: u32) -> QuantizationSpec {
 /// Dequantizes one whole quantized block through the existing `dequantize` operation: the three
 /// residents are read back to host tensors and imported as one `PackedWeight` of logical shape
 /// `logical` (whose last axis is the F32 width), and `dequantize` returns the F32
-/// reconstruction. This is the independent oracle the packet names: it runs MLX's own
-/// dequantize on MLX's own quantize outputs.
+/// reconstruction. This is the independent oracle: it runs MLX's own dequantize on MLX's own
+/// quantize outputs.
 fn dequantized_block(
     kernels: &mut MlxKernels,
     codes: &ExecutionTensor,
@@ -188,11 +188,11 @@ fn dequantized_prefix(
     kernels.dequantize(&resident).unwrap()
 }
 
-/// `quantize_rows` (packet KV8-OPS test a) against an independent f64 host check. MLX's affine
-/// definition is not the plain `scale = (max - min) / 255`, `bias = min`: it moves the larger
-/// edge of each group of 64 lanes onto a code, so the scale can come out negative and its
-/// magnitude differs from the plain figure by at most 0.5 / 127 (first Mac run, 2026-10-13: scale
-/// -2.4710e-4 against the plain 2.4706e-4). The test pins what any such definition must satisfy:
+/// `quantize_rows` against an independent f64 host check. MLX's affine definition is not the
+/// plain `scale = (max - min) / 255`, `bias = min`: it moves the larger edge of each group of 64
+/// lanes onto a code, so the scale can come out negative and its magnitude differs from the
+/// plain figure by at most 0.5 / 127 (measured on the Mac: scale -2.4710e-4 against the plain
+/// 2.4706e-4). The test pins what any such definition must satisfy:
 /// the magnitude of the scale within one percent of `(max - min) / 255`; the packed code of each
 /// lane (four 8-bit codes per U32 word, the low lane first) equal to the rounded quotient
 /// `(x - bias) / scale` of the scale and bias that the call returned; the existing `dequantize`
@@ -339,21 +339,20 @@ fn quantized_capacity(
 }
 
 /// `quantized_attention_prefix` against `grouped_attention` over the DEQUANTIZED keys and
-/// values (packet KV8-OPS test b): the dequantized prefix is the independent oracle - the same
-/// math on the same numbers - so the two agree within float accumulation, and the tolerance
-/// of `assert_within` covers that error, derived: every F32 product and partial sum rounds to
-/// 2^-24 relative, and the mixed-sign patterns (period 7 over period 5, whose 35-lane period
-/// sums to exactly zero) keep the partial sums within about 2, so the D <= 256 lane score dot
-/// of each path wanders at most sqrt(256) · 2^-24 · 2 ≈ 2e-6 and the two paths (the quantized
-/// matmul and the fused tiling) stay ≈ 4e-6 apart per score, ≈ 5e-7 per logit after the scale
-/// multiply (scale <= 1/8). The softmax damps a logit error eps into a probability error of at
-/// most 2 · eps · p, so the |v| <= 1 value mix moves <= 1e-6, and the len <= 16 lane value mix
-/// and the two output roundings add about sqrt(16) · 2^-24 ≈ 2.4e-7 each - under 2e-6 in
-/// total, five times below the 1e-5 relative-to-max(1, |expected|) tolerance. L = 1 non-causal
-/// and L = 7 causal, len 1, 5, CAP - 1, CAP, GQA 16 over 2 heads and a small 4 over 2, head
-/// dim 64 and one case at 256, group 64. A causal chunk needs len >= L - the portable check
-/// rejects a shorter one, whose earliest rows would see no key - so the sweep keeps
-/// len >= L as before.
+/// values: the dequantized prefix is the independent oracle - the same math on the same
+/// numbers - so the two agree within float accumulation, and the tolerance of `assert_within`
+/// covers that error, derived: every F32 product and partial sum rounds to 2^-24 relative, and
+/// the mixed-sign patterns (period 7 over period 5, whose 35-lane period sums to exactly zero)
+/// keep the partial sums within about 2, so the D <= 256 lane score dot of each path wanders
+/// at most sqrt(256) · 2^-24 · 2 ≈ 2e-6 and the two paths (the quantized matmul and the fused
+/// tiling) stay ≈ 4e-6 apart per score, ≈ 5e-7 per logit after the scale multiply (scale <=
+/// 1/8). The softmax damps a logit error eps into a probability error of at most 2 · eps · p,
+/// so the |v| <= 1 value mix moves <= 1e-6, and the len <= 16 lane value mix and the two
+/// output roundings add about sqrt(16) · 2^-24 ≈ 2.4e-7 each - under 2e-6 in total, five times
+/// below the 1e-5 relative-to-max(1, |expected|) tolerance. L = 1 non-causal and L = 7 causal,
+/// len 1, 5, CAP - 1, CAP, GQA 16 over 2 heads and a small 4 over 2, head dim 64 and one case
+/// at 256, group 64. A causal chunk needs len >= L - the portable check rejects a shorter one,
+/// whose earliest rows would see no key - so the sweep keeps len >= L as before.
 #[test]
 fn quantized_attention_prefix_matches_the_dequantized_prefix() {
     let _serial = GPU_TEST.lock().unwrap();
@@ -598,14 +597,14 @@ fn check_causal_alignment(
 }
 
 /// The causal alignment of the quantized prefix against an f64 host softmax over the
-/// DEQUANTIZED keys and values (packet KV8-OPS test c, the form of the
-/// `grouped_attention_prefix` alignment test): the mask aligns to the LAST key of the prefix,
-/// so query row `t` of `L` sees keys `0..len - L + t`. A mask aligned to the FIRST key would
-/// let query 0 see only key 0. Three cases at QH 2 over KVH 1, head dim 64, group 64: F32
-/// with L 2, len 3 of a capacity 4 (one key more than the rows); F32 with L 3, len 6 of a
-/// capacity 8 (the gap len - L larger than one, the alignment exercised with rows > 2); and a
-/// BF16 prefix - BF16 queries and BF16 scales and biases - with L 3, len 5 of a capacity 8,
-/// whose `where`-masked scores keep BF16 and whose result stays BF16.
+/// DEQUANTIZED keys and values (in the form of the `grouped_attention_prefix` alignment
+/// test): the mask aligns to the LAST key of the prefix, so query row `t` of `L` sees keys
+/// `0..len - L + t`. A mask aligned to the FIRST key would let query 0 see only key 0. Three
+/// cases at QH 2 over KVH 1, head dim 64, group 64: F32 with L 2, len 3 of a capacity 4 (one
+/// key more than the rows); F32 with L 3, len 6 of a capacity 8 (the gap len - L larger than
+/// one, the alignment exercised with rows > 2); and a BF16 prefix - BF16 queries and BF16
+/// scales and biases - with L 3, len 5 of a capacity 8, whose `where`-masked scores keep BF16
+/// and whose result stays BF16.
 #[test]
 fn quantized_attention_prefix_aligns_the_causal_mask_to_the_last_key() {
     let _serial = GPU_TEST.lock().unwrap();
@@ -616,7 +615,8 @@ fn quantized_attention_prefix_aligns_the_causal_mask_to_the_last_key() {
     check_causal_alignment(&mut kernels, 3, 5, 8, 64, group, true);
 }
 
-/// Appends row `t` of `source` into `target` at position `t` (the pipeline loop of test d).
+/// Appends row `t` of `source` into `target` at position `t` (the loop of the pipeline round
+/// trip test).
 fn append_row(
     kernels: &mut MlxKernels,
     target: ExecutionTensor,
@@ -630,10 +630,10 @@ fn append_row(
     kernels.kv_append(target, &row, &[0, 0, t, 0]).unwrap()
 }
 
-/// The pipeline round trip (packet KV8-OPS test d): `quantize_rows` of 20 rows, `kv_append` of
-/// the three outputs row by row into three capacity buffers of 32 (the codes through the new
-/// U32 rule), and attention over the first 20 rows equals attention over the DEQUANTIZED 20
-/// rows of the original quantization. KVH 2, QH 16, head dim 256, group 64, decode queries.
+/// The pipeline round trip: `quantize_rows` of 20 rows, `kv_append` of the three outputs row
+/// by row into three capacity buffers of 32 (the codes through the new U32 rule), and
+/// attention over the first 20 rows equals attention over the DEQUANTIZED 20 rows of the
+/// original quantization. KVH 2, QH 16, head dim 256, group 64, decode queries.
 #[test]
 fn quantized_attention_prefix_round_trips_quantize_append_and_attention() {
     let _serial = GPU_TEST.lock().unwrap();
@@ -732,30 +732,30 @@ fn timed_rounds(
     milliseconds
 }
 
-/// The VIEW COST measurement (packet KV8-OPS test f): CAP 32,768, len 16,384, two KV heads,
-/// head dim 256, 8-bit, group 64. What the numbers mean: the six prefix views are strided
-/// across the head axis (a head's stride is CAP * last, not len * last), so a
-/// `quantized_matmul` that copies a non-row-contiguous operand would copy about 8 MiB of K
-/// codes plus 0.5 MiB each of K scales and biases, and the same for V - about 18 MiB - on
-/// EVERY call, which at 262K positions would defeat the whole 8-bit cache. The strided call
-/// itself allocates only the output (16 KiB), the scores, the scaled scores, and the
-/// probabilities (three `[1, 2, 8, 16384]` F32 buffers, 1 MiB each) plus softmax scratch, so
-/// its peak growth stays far below 16 MiB; the asserted bound is loose - it sits above that
-/// honest scratch and below the 18 MiB that one view copy would add. The contiguous control
-/// copies the six prefixes first (`slice` makes them row-contiguous) and must show the copies
-/// in the same metric, which proves the metric sees a copy; the len = CAP call measures the
-/// full-range view, whose head stride equals the row span, so it is row-contiguous everywhere.
-/// The wall times of all three paths are printed for the coordinator; only the peak bounds are
-/// asserted. If the strided call is not much slower than the contiguous copy-free time and its
-/// peak growth stays below the bound, MLX did not copy the views.
+/// The VIEW COST measurement: CAP 32,768, len 16,384, two KV heads, head dim 256, 8-bit, group
+/// 64. What the numbers mean: the six prefix views are strided across the head axis (a head's
+/// stride is CAP * last, not len * last), so a `quantized_matmul` that copies a
+/// non-row-contiguous operand would copy about 8 MiB of K codes plus 0.5 MiB each of K scales
+/// and biases, and the same for V - about 18 MiB - on EVERY call, which at 262K positions
+/// would defeat the whole 8-bit cache. The strided call itself allocates only the output (16
+/// KiB), the scores, the scaled scores, and the probabilities (three `[1, 2, 8, 16384]` F32
+/// buffers, 1 MiB each) plus softmax scratch, so its peak growth stays far below 16 MiB; the
+/// asserted bound is loose - it sits above that honest scratch and below the 18 MiB that one
+/// view copy would add. The contiguous control copies the six prefixes first (`slice` makes
+/// them row-contiguous) and must show the copies in the same metric, which proves the metric
+/// sees a copy; the len = CAP call measures the full-range view, whose head stride equals the
+/// row span, so it is row-contiguous everywhere. The wall times of all three paths are
+/// printed; only the peak bounds are asserted. If the strided call is not much slower than the
+/// contiguous copy-free time and its peak growth stays below the bound, MLX did not copy the
+/// views.
 ///
-/// History (Mac, 2026-10-13): the first run read a peak growth of 38.8 MB and concluded that MLX
-/// copies the strided views. That was a measurement error: the six buffers were still lazy, so
-/// the first call also materialized the quantization of the cache. A probe in the MLX Python
-/// package on the same shapes (a quantized matmul over the full capacity, over the prefix slices
-/// of all heads, and over per-head slices) grew the peak by 1 to 2 MB in every form and ran
-/// faster on the prefix than on the full buffer: `quantized_matmul` reads a strided prefix view
-/// in place. The buffers are now evaluated before the first measurement.
+/// A measurement pitfall: while the six buffers are still lazy, the first call also materializes
+/// the quantization of the cache, and its peak growth (38.8 MB on the Mac) looks like a copy of
+/// the strided views. A probe in the MLX Python package on the same shapes (a quantized matmul
+/// over the full capacity, over the prefix slices of all heads, and over per-head slices) grew
+/// the peak by 1 to 2 MB in every form and ran faster on the prefix than on the full buffer:
+/// `quantized_matmul` reads a strided prefix view in place. The buffers are therefore evaluated
+/// before the first measurement.
 #[test]
 fn quantized_attention_prefix_view_cost_at_half_capacity() {
     let _serial = GPU_TEST.lock().unwrap();
@@ -791,7 +791,7 @@ fn quantized_attention_prefix_view_cost_at_half_capacity() {
     // The six buffers and the queries are LAZY until the first evaluation: without this
     // evaluation the first measured call would also materialize the quantization of the whole
     // cache (the F32 source and the three outputs of each side) and its peak would read as a
-    // copy of the views. The first Mac run of this test made exactly that mistake (38.8 MB).
+    // copy of the views (38.8 MB on the Mac).
     kernels
         .evaluate(&[
             &q, &k_codes, &k_scales, &k_biases, &v_codes, &v_scales, &v_biases,
@@ -945,11 +945,11 @@ fn quantized_attention_prefix_view_cost_at_half_capacity() {
     );
 }
 
-/// `kv_append` on U32 codes is bit-equal to `slice_update` on the same inputs (packet
-/// KV8-OPS): `slice_update` takes float operands, so the control imports the SAME bytes as F32
-/// (U32 and F32 share the 4-byte width and both operations only move bytes), and the
-/// readback bytes of the two appends must be equal. The landed row and an untouched row are
-/// checked from the U32 values.
+/// `kv_append` on U32 codes is bit-equal to `slice_update` on the same inputs:
+/// `slice_update` takes float operands, so the control imports the SAME bytes as F32 (U32
+/// and F32 share the 4-byte width and both operations only move bytes), and the readback
+/// bytes of the two appends must be equal. The landed row and an untouched row are checked
+/// from the U32 values.
 #[test]
 fn kv_append_u32_matches_slice_update_bit_for_bit() {
     let _serial = GPU_TEST.lock().unwrap();
@@ -1010,8 +1010,8 @@ fn kv_append_u32_matches_slice_update_bit_for_bit() {
 }
 
 /// A mixed U32/F32 pair is `BadRequest` before any native call, in both directions, and the
-/// adapter stays usable (packet KV8-OPS). A refusal consumes no buffer work, and each refusal
-/// gets a fresh target because `kv_append` takes its target by value.
+/// adapter stays usable. A refusal consumes no buffer work, and each refusal gets a fresh
+/// target because `kv_append` takes its target by value.
 #[test]
 fn kv_append_rejects_mixed_u32_and_f32_dtypes() {
     let _serial = GPU_TEST.lock().unwrap();
@@ -1057,15 +1057,15 @@ fn kv_append_rejects_mixed_u32_and_f32_dtypes() {
     assert_eq!(values[3 * 4], 100, "a later matching append still works");
 }
 
-/// `kv_append` donates a U32 buffer (packet KV8-OPS): 200 appends of one U32 row into one
-/// `[1, 2, 16384, 256]` U32 buffer (33,554,432 bytes, twice the 16 MiB the packet asks for)
-/// grow the allocator peak by less than a quarter of one buffer - a donating append writes the
-/// row in place, so the expected growth is one row (2 KiB) plus scratch. The control keeps a
-/// `share()` of the target on the same cadence: the handle is never unique, no append
-/// donates, every append copies the whole buffer, and the retire list holds the intermediates
-/// of the eight-append window until the evaluate flushes them, so the control must grow by at
-/// least two buffers, which proves the metric sees a copy (the F32 control of
-/// `native_kv_ops.rs` proves the same through the retained `slice_update`).
+/// `kv_append` donates a U32 buffer: 200 appends of one U32 row into one `[1, 2, 16384, 256]`
+/// U32 buffer (33,554,432 bytes, twice 16 MiB) grow the allocator peak by less than a quarter
+/// of one buffer - a donating append writes the row in place, so the expected growth is one
+/// row (2 KiB) plus scratch. The control keeps a `share()` of the target on the same cadence:
+/// the handle is never unique, no append donates, every append copies the whole buffer, and
+/// the retire list holds the intermediates of the eight-append window until the evaluate
+/// flushes them, so the control must grow by at least two buffers, which proves the metric
+/// sees a copy (the F32 control of `native_kv_ops.rs` proves the same through the retained
+/// `slice_update`).
 #[test]
 fn kv_append_donates_a_u32_buffer_over_200_appends() {
     let _serial = GPU_TEST.lock().unwrap();
@@ -1153,10 +1153,9 @@ fn kv_append_donates_a_u32_buffer_over_200_appends() {
     kernels.set_retire_cap(previous_cap).unwrap();
 }
 
-/// The decision 0032 fault hooks of the two new shims (packet KV8-OPS test e): `call`,
-/// `null`, and `mismatch` on the first selected call of each. Every native failure is
-/// terminal for the process, so each case runs in its own child process, as the rebind tests
-/// of the adapter do.
+/// The injected-fault hooks of the two shims: `call`, `null`, and `mismatch` on the first
+/// selected call of each. Every native failure is terminal for the process, so each case
+/// runs in its own child process, as the rebind tests of the adapter do.
 #[cfg(feature = "native-fault-qualification")]
 mod fault_hooks {
     use std::{

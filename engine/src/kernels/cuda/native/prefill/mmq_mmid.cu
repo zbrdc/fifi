@@ -1,7 +1,7 @@
 /*
- * CPF-V4 G3: argument validation and the launches of the mmid entries of the MMQ glue. Contract:
- * prefill/mmq_mmid.h. The ids guard (plan rev 3 section
- * C.2 N1) is our own kernel; the vendored entries are called, not transcribed.
+ * Argument validation and the launches of the mmid entries of the MMQ glue. Contract:
+ * prefill/mmq_mmid.h. The ids guard is our own kernel; the vendored entries are called, not
+ * transcribed.
  */
 #include "prefill/mmq_mmid.h"
 
@@ -35,7 +35,7 @@ constexpr int64_t kGridLimit = (int64_t)1 << 30;
  * (J = 8, I = 128) is the largest the launch can pick, and valid_limits computes exactly
  * that form, so this bound holds for every J the launcher chooses. */
 constexpr int64_t kTilesLimit = INT_MAX / 100;
-/* Rule M1 (CPF-V4 G1, MSG-85 B1): the one constant pad on every q8_1 buffer, 128 blocks. */
+/* The one constant pad on every q8_1 buffer, 128 blocks. */
 constexpr int64_t kQ81Block = 144;
 constexpr int64_t kQ81Pad = 128 * kQ81Block;
 /* The documented fixup maximum per SM, J * I = 128 * 128 floats (mmq.cuh:1334-1338). */
@@ -55,7 +55,7 @@ bool valid_ids_shape(int n_experts, int m, int top_k) {
            top_k <= INFERENCE_CUDA_MMQ_MMID_MAX_TOP_K && top_k <= n_experts;
 }
 
-/* N1, one thread per row: at most 32 ids and 496 compares, no float operation. */
+/* The ids guard, one thread per row: at most 32 ids and 496 compares, no float operation. */
 __global__ void mmq_ids_guard_k(const int *__restrict__ ids, int *__restrict__ ids_g, int *status,
                                 int n_experts, int m, int top_k) {
     const int row = blockIdx.x * blockDim.x + threadIdx.x;

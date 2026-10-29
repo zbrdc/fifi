@@ -1,10 +1,10 @@
-//! Resident MoE with host routing (S1-C plan section 2.4; decision 0039 items 2 to 4).
+//! Resident MoE with host routing.
 //!
 //! The router runs on the device. The host reads the probabilities once and selects the experts
 //! with `moe::select`. `step_paged` reads the selected expert slices into one page set of the pool
-//! and imports them in place with the gates (decision 0041), so each call synchronizes exactly
-//! once: the router readback. It returns the host selection and probabilities with its output, so
-//! that the test-only route recorder (S3 plan section 3.2) needs no extra readback.
+//! and imports them in place with the gates, so each call synchronizes exactly once: the router
+//! readback. It returns the host selection and probabilities with its output, so that the test-only
+//! route recorder needs no extra readback.
 
 use super::super::moe::{MoeShape, select};
 use super::super::stored::read_stack_into;
@@ -140,7 +140,7 @@ fn shared(ctx: &mut Ctx<'_>, w: &RMoe, x: &ExecutionTensor) -> Result<ExecutionT
 
 /// Runs one resident MoE step on `x` `[1, H]` with the expert stacks in a page set of `slots` and
 /// returns `[1, H]` (moe.rs:156-190) with the host selection that chose the experts. It
-/// synchronizes exactly once: the router readback (decision 0041 item 3).
+/// synchronizes exactly once: the router readback.
 ///
 /// The router readback evaluates `x`. Every set that `slots` lent before is released right after
 /// it, so the caller must make every earlier MoE output that is not yet evaluated an ancestor of

@@ -1,9 +1,9 @@
 //! Raw FFI to the q8_1 quantize entries of `native/prefill/mmq_quant.cu` (its header holds
-//! the full contract), CPF-V4 G4. Child module of `native/prefill.rs`, so it inherits the
+//! the full contract). Child module of `native/prefill.rs`, so it inherits the
 //! `allow(unsafe_code)` of `native.rs`; the safety invariants are the parent's list.
 //! Additions of this entry: both launches only enqueue; the gather and inverse maps' VALUES
-//! are trusted device indices (plan section C.2 N1, the guarded ids builder), so only their
-//! capacity is checked here.
+//! are trusted device indices (the guarded ids builder writes them), so only their capacity
+//! is checked here.
 
 #![cfg_attr(
     not(test),

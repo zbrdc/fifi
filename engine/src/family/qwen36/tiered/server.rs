@@ -1,8 +1,8 @@
-//! The CPU-expert server of the tiered mailbox (TCAP C5, staged for TCAP C6 (ledger/plans/TCAP-DESIGN.md)): the host
-//! thread that answers the device's per-layer expert requests while the device waits inside its graph (TCAP C3), by
-//! polling the mailbox through the [`RequestPort`] trait (the only bridge to the device; the CUDA adapter
-//! implementing it is C6) and serving the missed experts on the CPU pool in pick order, answering with the pool's
-//! job-order sum bit for bit.
+//! The CPU-expert server of the tiered mailbox, staged for the CUDA adapter: the host thread that
+//! answers the device's per-layer expert requests while the device waits inside its graph, by
+//! polling the mailbox through the [`RequestPort`] trait (the only bridge to the device; the CUDA
+//! adapter implements it) and serving the missed experts on the CPU pool in pick order, answering
+//! with the pool's job-order sum bit for bit.
 //! Threads and the clock live here because bounded waits and busy time are the point: every condvar wait carries a
 //! timeout, every loop a stop flag, and a caught panic never poisons a lock, so nothing here can hang.
 
@@ -29,13 +29,14 @@ pub struct ServerRequest {
     pub weights: [f32; 8],
 }
 
-/// The server's side of the mailbox: the CUDA port's mirror as a trait (the adapter that implements it for the device is
-/// TCAP C6, the only bridge). The protocol's ordering that an implementation must keep: `poll` ACQUIRES the sequence
-/// word, so the header it returns and the row are those the device wrote before releasing it; `read_row` is valid only
-/// for the request just polled (the device writes the next one only after it has seen the answer); `answer` writes the
-/// partial and the code first and RELEASES `done = seq` last, so a device that acquires `done` sees both. No call may
-/// block past `collect`'s bound (`timeout + 1 s`): a request still inside a port call when the next token is armed
-/// would count toward that token.
+/// The server's side of the mailbox: the CUDA port's mirror as a trait (the adapter that implements
+/// it for the device is the only bridge). The protocol's ordering that an implementation must keep:
+/// `poll` ACQUIRES the sequence word, so the header it returns and the row are those the device
+/// wrote before releasing it; `read_row` is valid only for the request just polled (the device
+/// writes the next one only after it has seen the answer); `answer` writes the partial and the code
+/// first and RELEASES `done = seq` last, so a device that acquires `done` sees both. No call may
+/// block past `collect`'s bound (`timeout + 1 s`): a request still inside a port call when the next
+/// token is armed would count toward that token.
 pub trait RequestPort: Send + 'static {
     /// Width of the normed row in floats; must equal the pool's `shape().hidden`.
     fn hidden(&self) -> usize;

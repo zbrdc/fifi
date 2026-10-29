@@ -1,5 +1,5 @@
 /*
- * RD-4e: launch entry of the MoE combine (native/resident/moe_combine.h, the per-kernel header of the
+ * Launch entry of the MoE combine (native/resident/moe_combine.h, the per-kernel header of the
  * layout in kernels/cuda/resident/mod.rs; abi_resident.h stays closed). Launch-only: nothing here
  * allocates, copies or synchronizes; a fault in queued work surfaces at the next synchronize.
  * Include after abi.h in C++. Rust mirrors the struct in native/resident/moe_combine.rs.
@@ -12,19 +12,20 @@
  * Every product and every sum is rounded alone (no fused multiply-add) and the order is fixed: this
  * is the sequence of the pinned llama.cpp qwen35moe graph (ggml_mul of the expert outputs by the
  * weights, ggml_add of the picks in pick order, ggml_add of the gated shared expert, ggml_add of the
- * residual). The weights and the gate are applied AS GIVEN: RD-5 already softmaxes and renormalizes
- * the weights and applies the sigmoid to the shared gate; this kernel applies no second sigmoid or
- * softmax and no renormalization. NaN propagates: a faulty router row (ids -1, weights 0) makes
- * matmul_expert write NaN to every down row, and 0 * NaN is NaN, so the output row is NaN; no weight
- * is tested for zero and nothing is clamped. (A router fault whose down rows are finite would give
- * res; the kernel trusts the NaN of matmul_expert.)
+ * residual). The weights and the gate are applied AS GIVEN: the router already softmaxes and
+ * renormalizes the weights and applies the sigmoid to the shared gate; this kernel applies no
+ * second sigmoid or softmax and no renormalization. NaN propagates: a faulty router row (ids -1,
+ * weights 0) makes matmul_expert write NaN to every down row, and 0 * NaN is NaN, so the output
+ * row is NaN; no weight is tested for zero and nothing is clamped. (A router fault whose down rows
+ * are finite would give res; the kernel trusts the NaN of matmul_expert.)
  *
  *   res          f32 [m][n], 16-byte aligned
  *   down         f32 rows (t * top_k + i) of n values at a stride of ld_down floats (ld_down >= n,
- *                multiple of 4), 16-byte aligned: the i-th pick of token t is row t * top_k + i. Stage 1
- *                is m = 1: the top_k outputs of matmul_expert, in pick (rank) order.
- *   weights      f32 [m][top_k], 4-byte aligned (RD-5 output, rank order)
- *   shared_gate  f32 [m] (RD-5 output, already a sigmoid), 4-byte aligned, or NULL
+ *                multiple of 4), 16-byte aligned: the i-th pick of token t is row t * top_k + i.
+ *                The decode step uses m = 1: the top_k outputs of matmul_expert, in pick (rank)
+ *                order.
+ *   weights      f32 [m][top_k], 4-byte aligned (router output, rank order)
+ *   shared_gate  f32 [m] (router output, already a sigmoid), 4-byte aligned, or NULL
  *   shared       f32 [m][n], 16-byte aligned, or NULL; shared_gate and shared are both given or both NULL
  *   out          f32 [m][n], 16-byte aligned, written in full. It is either exactly res (in place) or
  *                shares no byte with res; it shares no byte with any other input.

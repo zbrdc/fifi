@@ -1,4 +1,4 @@
-//! The decode session shared by the resident executors (decision 0033; packet Q36-F1).
+//! The decode session shared by the resident executors.
 //!
 //! The Flash-Next executor and the Q36 executor use one `DecodeSession`. It owns the token side of
 //! a session: the committed tokens, the pending token, and the finish flag. The model side stays
@@ -11,16 +11,15 @@
 //! pending. One token leaves per call.
 //!
 //! The finish rules are pure functions in this file. The session owns EOS, the output limit, the
-//! context limit, and cancellation (decision 0030, D7).
+//! context limit, and cancellation.
 //!
-//! Prefix reuse (decision 0036, addendum 2): `DecodeSession::save_prefix` and
-//! `DecodeSession::restore_prefix` are the one authority for the reuse rules of every family. An
-//! engine owns one `PrefixStore`: pinned roots beside an LRU list of entries, each entry tagged
-//! with the numeric path that built it and with its `SaveKind`. The rules decide when to save,
-//! which entry a restore takes (the longest stored key that the prompt extends under the same
-//! numeric path), and how the token side changes. The closures only copy or share model state:
-//! the store never inspects a saved state, and the byte accounting of the entries stays with the
-//! executor.
+//! Prefix reuse: `DecodeSession::save_prefix` and `DecodeSession::restore_prefix` are the one
+//! authority for the reuse rules of every family. An engine owns one `PrefixStore`: pinned roots
+//! beside an LRU list of entries, each entry tagged with the numeric path that built it and with
+//! its `SaveKind`. The rules decide when to save, which entry a restore takes (the longest stored
+//! key that the prompt extends under the same numeric path), and how the token side changes. The
+//! closures only copy or share model state: the store never inspects a saved state, and the byte
+//! accounting of the entries stays with the executor.
 
 use crate::{
     EngError,
@@ -39,7 +38,7 @@ pub(crate) trait TokenStepper {
     /// Feeds one prompt token. No head runs and nothing is read back.
     fn feed(&mut self, token: u32) -> Result<()>;
     /// Feeds `tokens` in order as prompt rows. The default feeds them one by one. A model that
-    /// feeds a prompt in chunks (the Flash-Next executor, packet H8b) overrides it.
+    /// feeds a prompt in chunks (the Flash-Next executor) overrides it.
     fn feed_rows(&mut self, tokens: &[u32]) -> Result<()> {
         tokens.iter().try_for_each(|&token| self.feed(token))
     }
@@ -159,9 +158,9 @@ impl DecodeSession {
         Ok(())
     }
 
-    /// The entry this session restored. The eviction callers pass it as the denied job's
-    /// protected lineage (review round 4, MF2): the store-global marker names whichever
-    /// session restored last, which is another conversation in an interleaved batch.
+    /// The entry this session restored. The eviction callers pass it as the denied job's protected
+    /// lineage: the store-global marker names whichever session restored last, which is another
+    /// conversation in an interleaved batch.
     pub(crate) fn restored_anchor(&self) -> Option<u64> {
         self.restored_prefix
     }
@@ -310,7 +309,7 @@ impl DecodeSession {
     }
 
     /// Ends the job: adds the decoder tail, and either resets a cancelled session or marks the
-    /// session finished. A failed tail resets the session and returns the error (decision D8).
+    /// session finished. A failed tail resets the session and returns the error.
     fn end(
         &mut self,
         step: &mut impl TokenStepper,
@@ -346,21 +345,19 @@ impl DecodeSession {
     /// position of the key, returns `BadRequest` and keeps the store unchanged.
     ///
     /// A stored entry with the same key and the same path is a use: it becomes the most recently
-    /// used entry of its list and `snapshot` does not run. A `Root` save whose key equals a
-    /// stored LRU entry promotes that entry to a pinned root in the same way (clarification 1,
-    /// item 3). An entry with the same key and another path is dropped. A `Root` save fills the
-    /// pinned root list, the other kinds the LRU list, each bounded by `StoreLimits`. A
-    /// `MemoryPlan` error from `snapshot` drops one eligible victim (the least recently used LRU
-    /// entry that this session did not restore and the retention policy does not protect;
-    /// the least recently used root other than this
-    /// session's restored root only for a `Root` save) before the next `snapshot` call, until
-    /// the save succeeds or no victim is left, which returns `Ok(false)`. Any other error propagates. The
-    /// entries dropped before either end stay dropped. A tip whose key extends the key of the
-    /// Tip entry that this session restored drops that entry after the save succeeds, also
-    /// when the tip key repeats a stored key. In a protected store, a full Tip save drops its
-    /// restored ancestor Tip before any other room victim, preserving a newly saved Block.
-    /// Legacy stores drop that ancestor before the snapshot only when no other entry can go
-    /// (clarification 1, item 1). The session never changes.
+    /// used entry of its list and `snapshot` does not run. A `Root` save whose key equals a stored
+    /// LRU entry promotes that entry to a pinned root in the same way. An entry with the same key
+    /// and another path is dropped. A `Root` save fills the pinned root list, the other kinds the
+    /// LRU list, each bounded by `StoreLimits`. A `MemoryPlan` error from `snapshot` drops one
+    /// eligible victim (the least recently used LRU entry that this session did not restore and the
+    /// retention policy does not protect; the least recently used root other than this session's
+    /// restored root only for a `Root` save) before the next `snapshot` call, until the save
+    /// succeeds or no victim is left, which returns `Ok(false)`. Any other error propagates. The
+    /// entries dropped before either end stay dropped. A tip whose key extends the key of the Tip
+    /// entry that this session restored drops that entry after the save succeeds, also when the tip
+    /// key repeats a stored key. In a protected store, a full Tip save drops its restored ancestor
+    /// Tip before any other room victim, preserving a newly saved Block. Legacy stores drop that
+    /// ancestor before the snapshot only when no other entry can go. The session never changes.
     pub(crate) fn save_prefix<S, P: PartialEq>(
         &self,
         store: &mut PrefixStore<S, P>,
@@ -435,9 +432,9 @@ impl DecodeSession {
         store.begin_request();
         store.restored = None;
         store.restored_kind = None;
-        // The shadow observation of this lookup (KV-v1 slice 1), taken over the store exactly
-        // as the lookup sees it, before the restore moves an entry or drops a candidate. It
-        // changes nothing: the walk only reads keys and paths.
+        // The shadow observation of this lookup, taken over the store exactly as the lookup sees
+        // it, before the restore moves an entry or drops a candidate. It changes nothing: the walk
+        // only reads keys and paths.
         if store.shadow_enabled {
             store.shadow = Some(store.block_lcp_shadow(prompt, &path));
         }
@@ -463,11 +460,11 @@ impl DecodeSession {
 }
 
 impl<S, P: PartialEq> PrefixStore<S, P> {
-    /// The shadow block-LCP of one lookup (KV-v1 slice 1, shadow only): the longest token
-    /// run that any same-path entry shares with `prompt`, floored to the 128- and 256-token
-    /// block granularities, beside the greatest checkpoint the exact-key contract could use
-    /// (the longest same-path key that is a full prefix of `prompt` and strictly shorter than
-    /// it, the `q < prompt_len` rule). The unfloored shared length is the divergence offset.
+    /// The shadow block-LCP of one lookup (shadow only): the longest token run that any same-path
+    /// entry shares with `prompt`, floored to the 128- and 256-token block granularities, beside
+    /// the greatest checkpoint the exact-key contract could use (the longest same-path key that is
+    /// a full prefix of `prompt` and strictly shorter than it, the `q < prompt_len` rule). The
+    /// unfloored shared length is the divergence offset.
     ///
     /// Cost: one early-exit walk per held entry, the sum of `min(key length, prompt length)`
     /// token comparisons over the entries — never a re-walk per block. The report carries
@@ -527,10 +524,10 @@ impl<S, P: PartialEq> PrefixStore<S, P> {
     }
 }
 
-/// What kind of save produced a stored entry (decision 0036, addendum 2): a pinned root, a
-/// periodic checkpoint of a long prompt, or the tip of the last prompt. The block cut (KV-v1
-/// slice 2) is a fourth kind: the one rolling intermediate entry per lineage that the block
-/// prefix-match flag captures at the last block boundary below the tip.
+/// What kind of save produced a stored entry: a pinned root, a periodic checkpoint of a long
+/// prompt, or the tip of the last prompt. The block cut is a fourth kind: the one rolling
+/// intermediate entry per lineage that the block prefix-match flag captures at the last block
+/// boundary below the tip.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum SaveKind {
     /// The state at the end of the first system message of a prompt.
@@ -539,9 +536,9 @@ pub(crate) enum SaveKind {
     Periodic,
     /// The state at the last message boundary of a prompt.
     Tip,
-    /// The rolling block cut of a lineage (KV-v1 slice 2): an LRU entry like a periodic one,
-    /// except that a no-shorter `Block` save on the same path replaces the previous `Block`
-    /// entry, so one lineage holds at most one cut at a time.
+    /// The rolling block cut of a lineage: an LRU entry like a periodic one, except that a
+    /// no-shorter `Block` save on the same path replaces the previous `Block` entry, so one lineage
+    /// holds at most one cut at a time.
     Block,
 }
 
@@ -555,7 +552,7 @@ pub(crate) struct StoreLimits {
 }
 
 impl Default for StoreLimits {
-    /// The addendum 1 limits: zero roots and one entry.
+    /// Zero roots and one entry.
     fn default() -> Self {
         Self {
             roots: 0,
@@ -564,9 +561,9 @@ impl Default for StoreLimits {
     }
 }
 
-/// Whether the shadow block-LCP observation runs (KV-v1 slice 1): off unless
-/// `ENGINESRV_SHADOW_BLOCK_LCP` is `1`, `true`, or `on`. The shadow is a read-only
-/// observation for the request log; the flag never changes restore or save behavior.
+/// Whether the shadow block-LCP observation runs: off unless `ENGINESRV_SHADOW_BLOCK_LCP` is `1`,
+/// `true`, or `on`. The shadow is a read-only observation for the request log; the flag never
+/// changes restore or save behavior.
 pub(crate) fn shadow_block_lcp_enabled() -> bool {
     static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ENABLED.get_or_init(|| {
@@ -578,11 +575,10 @@ pub(crate) fn shadow_block_lcp_enabled() -> bool {
     })
 }
 
-/// The block prefix-match spacing (KV-v1 slice 2; default ON since slice 3): `None`
-/// only on the explicit rollback — a set `ENGINESRV_PREFIX_BLOCK_MATCH` keeps the
-/// feature on solely for `1`/`true`/`on` (trimmed, case-folded), while every other
-/// value, including empty, garbage, and non-UTF-8, disables it (the `env_allows`
-/// fail-safe rule). An unset variable keeps the default ON.
+/// The block prefix-match spacing (default ON): `None` only on the explicit rollback — a set
+/// `ENGINESRV_PREFIX_BLOCK_MATCH` keeps the feature on solely for `1`/`true`/`on` (trimmed,
+/// case-folded), while every other value, including empty, garbage, and non-UTF-8, disables it (the
+/// `env_allows` fail-safe rule). An unset variable keeps the default ON.
 ///
 /// The save planner targets
 /// the last spacing boundary strictly before the tip. `save_points` moves that
@@ -620,9 +616,8 @@ pub(crate) fn prefix_block_spacing() -> Option<usize> {
     })
 }
 
-/// Why a shadow block-LCP observation stands where it does (KV-v1 slice 1): the class of
-/// the gap between what a block-granular restore could use and what the exact-key contract
-/// holds.
+/// Why a shadow block-LCP observation stands where it does: the class of the gap between what a
+/// block-granular restore could use and what the exact-key contract holds.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum ShadowReason {
     /// No same-path entry shares even one token with the prompt; an empty store included.
@@ -656,9 +651,9 @@ impl ShadowReason {
     }
 }
 
-/// The shadow block-LCP observation of one lookup (KV-v1 slice 1, shadow only): what a
-/// block-granular restore could have used, beside what the exact-key contract holds. The
-/// observation changes no behavior; it rides the prefix report to the request log.
+/// The shadow block-LCP observation of one lookup (shadow only): what a block-granular restore
+/// could have used, beside what the exact-key contract holds. The observation changes no behavior;
+/// it rides the prefix report to the request log.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct ShadowLcp {
     /// The longest token run any same-path entry shares with the prompt, floored to a whole
@@ -694,14 +689,13 @@ impl Default for ShadowLcp {
     }
 }
 
-/// The prefix store of an engine (decision 0036, addendum 2): up to `limits.roots` pinned roots
-/// and up to `limits.entries` entries in an LRU list. `S` is the model state that the executor
-/// saves, and `P` names the numeric path that built it. A state restores only under the path that
-/// built it, because a batched prefill matches one-token steps only within a tolerance (decision
-/// 0036, item 7). The store holds each entry as its own value: it never clones, copies, inspects,
-/// or sizes an `S`, and the byte accounting of the entries stays with the executor. The executor
-/// owns the store and declares it before its decoder, so the saved arrays drop before the decoder
-/// starts its teardown.
+/// The prefix store of an engine: up to `limits.roots` pinned roots and up to `limits.entries`
+/// entries in an LRU list. `S` is the model state that the executor saves, and `P` names the
+/// numeric path that built it. A state restores only under the path that built it, because a
+/// batched prefill matches one-token steps only within a tolerance. The store holds each entry as
+/// its own value: it never clones, copies, inspects, or sizes an `S`, and the byte accounting of
+/// the entries stays with the executor. The executor owns the store and declares it before its
+/// decoder, so the saved arrays drop before the decoder starts its teardown.
 pub(crate) struct PrefixStore<S, P> {
     /// The pinned roots, from the least to the most recently used.
     roots: Vec<Stored<S, P>>,
@@ -716,40 +710,38 @@ pub(crate) struct PrefixStore<S, P> {
     /// The last restore observation, temporarily replaced by the saving session's lineage.
     restored: Option<u64>,
     /// The kind of the entry that the last `restore_prefix` call restored. It is kept beside
-    /// `restored`, because the lineage rule may drop the restored entry before a report reads
-    /// the id back (packet SERVE-2-c item 3).
+    /// `restored`, because the lineage rule may drop the restored entry before a report reads the
+    /// id back.
     restored_kind: Option<SaveKind>,
-    /// Whether the shadow block-LCP observation runs (KV-v1 slice 1). Off by default; the
-    /// flag never changes restore or save behavior.
+    /// Whether the shadow block-LCP observation runs. Off by default; the flag never changes
+    /// restore or save behavior.
     shadow_enabled: bool,
     /// The shadow observation of the last `restore_prefix` call on an enabled store, stashed
     /// over the store exactly as the lookup saw it, before any restore moved an entry.
     shadow: Option<ShadowLcp>,
-    /// SF1 attribution counters: candidates dropped after an adoption `MemoryPlan`
-    /// denial, and entries spent by `evict_lru_one` (the EV-1 order). LIFETIME store totals,
+    /// Restore-side attribution counters: candidates dropped after an adoption `MemoryPlan` denial,
+    /// and entries spent by `evict_lru_one` (the tiered eviction order). LIFETIME store totals,
     /// never reset. Each request line carries ONE sample, taken right after the request's own
     /// (last) restore on the batch worker and after its prefill on the single worker; lines are
-    /// written at completion, so attribute a request's own restore drops against the sample of
-    /// the restore that ran just before it (`restore_drops` rises only at restores, so ordering
-    /// samples by value recovers restore order) - never against the previous line. `evictions`
-    /// counts only `evict_lru_one` spends and also rises between samples through other slots'
-    /// denial evictions; a self-spend counts BOTH counters once, so drops + evictions over-counts
-    /// entries lost by the number of self-evictions.
-    /// (Opus r1 MF-1, r2 MF-1: the earlier delta-across-two-lines rule was false - a
-    /// request writes exactly one line.) They ride the store's `PrefixReport`.
+    /// written at completion, so attribute a request's own restore drops against the sample of the
+    /// restore that ran just before it (`restore_drops` rises only at restores, so ordering samples
+    /// by value recovers restore order) - never against the previous line. `evictions` counts only
+    /// `evict_lru_one` spends and also rises between samples through other slots' denial evictions;
+    /// a self-spend counts BOTH counters once, so drops + evictions over-counts entries lost by the
+    /// number of self-evictions. A delta across two request lines attributes nothing, because a
+    /// request writes exactly one line. They ride the store's `PrefixReport`.
     restore_drops: u64,
     evictions: u64,
-    /// B2 attribution counters (the save side). `room_removals` counts entries silently
-    /// removed to admit OTHER saves (the room loop and the denial retry inside `save`):
-    /// these removals are NOT `evictions` - that counter only counts `evict_lru_one`
-    /// spends - so a store that churns entries under save pressure reports `evictions` 0.
-    /// `save_refusals` counts saves that returned without storing (room full with every
-    /// entry protected, a zero limit, no victim left for a denial retry, or a root
-    /// promotion that found no victim). `duplicate_uses` counts saves that were a use,
-    /// not a snapshot (rule a). `block_rolls` counts Block cuts that rolled the lineage's
-    /// previous cut away (rule b2). `restored_replaces` counts tips that replaced the
+    /// Save-side attribution counters. `room_removals` counts entries silently removed to admit
+    /// OTHER saves (the room loop and the denial retry inside `save`): these removals are NOT
+    /// `evictions` - that counter only counts `evict_lru_one` spends - so a store that churns
+    /// entries under save pressure reports `evictions` 0. `save_refusals` counts saves that
+    /// returned without storing (room full with every entry protected, a zero limit, no victim left
+    /// for a denial retry, or a root promotion that found no victim). `duplicate_uses` counts saves
+    /// that were a use, not a snapshot (rule a). `block_rolls` counts Block cuts that rolled the
+    /// lineage's previous cut away (rule b2). `restored_replaces` counts tips that replaced the
     /// restored entry in place (rules a/f). LIFETIME totals with the same one-sample-per-
-    /// request-line attribution rule as the SF1 pair.
+    /// request-line attribution rule as the restore-side pair.
     room_removals: u64,
     save_refusals: u64,
     duplicate_uses: u64,
@@ -757,14 +749,12 @@ pub(crate) struct PrefixStore<S, P> {
     restored_replaces: u64,
 }
 
-/// The old name of `PrefixStore` (decision 0036, addendum 1), kept for the executors' field
-/// declarations.
+/// The old name of `PrefixStore`, kept for the executors' field declarations.
 pub(crate) type PrefixSlot<S, P> = PrefixStore<S, P>;
 
-/// The B2 save-side counter snapshot carried by `PrefixReport`: flat lifetime totals of
-/// the store's save decisions, so a request line can attribute a lineage's lost marks to
-/// a mechanism (room churn, refusal, duplicate use, block roll, or an in-place replace)
-/// instead of guessing.
+/// The save-side counter snapshot carried by `PrefixReport`: flat lifetime totals of the store's
+/// save decisions, so a request line can attribute a lineage's lost marks to a mechanism (room
+/// churn, refusal, duplicate use, block roll, or an in-place replace) instead of guessing.
 #[derive(Debug, Default, PartialEq, Eq, Clone, Copy)]
 pub(crate) struct SaveSideTotals {
     pub(crate) room_removals: u64,
@@ -843,21 +833,21 @@ impl<S, P> PrefixStore<S, P> {
         self.limits
     }
 
-    /// SF1 attribution: candidates dropped after an adoption denial, and entries spent by
-    /// the radix-order eviction. LIFETIME totals - the attribution rule is the field docs'
-    /// (one sample per request line; compare against the PREVIOUS RESTORE's sample, not
-    /// the previous line).
+    /// Restore-side attribution: candidates dropped after an adoption denial, and entries spent by
+    /// the radix-order eviction. LIFETIME totals - the attribution rule is the field docs' (one
+    /// sample per request line; compare against the PREVIOUS RESTORE's sample, not the previous
+    /// line).
     pub(crate) fn restore_drop_count(&self) -> u32 {
         u32::try_from(self.restore_drops).unwrap_or(u32::MAX)
     }
 
-    /// SF1 attribution twin of `restore_drop_count`.
+    /// The restore-side attribution twin of `restore_drop_count`.
     pub(crate) fn eviction_count(&self) -> u32 {
         u32::try_from(self.evictions).unwrap_or(u32::MAX)
     }
 
-    /// B2 attribution: the save-side counter snapshot for `PrefixReport` (flat lifetime
-    /// totals; the attribution rule is the field docs' - one sample per request line).
+    /// Save-side attribution: the counter snapshot for `PrefixReport` (flat lifetime totals; the
+    /// attribution rule is the field docs' - one sample per request line).
     pub(crate) fn save_side_totals(&self) -> SaveSideTotals {
         // u64 end-to-end: these are lifetime totals, and a clamped u32 readout would
         // silently stop reflecting the store's history once it saturates.
@@ -877,8 +867,8 @@ impl<S, P> PrefixStore<S, P> {
         self.restored_kind
     }
 
-    /// Turns the shadow block-LCP observation on (KV-v1 slice 1). It runs before a
-    /// conversation holds entries, beside the limits.
+    /// Turns the shadow block-LCP observation on. It runs before a conversation holds entries,
+    /// beside the limits.
     pub(crate) fn set_shadow_enabled(&mut self, enabled: bool) {
         self.shadow_enabled = enabled;
     }
@@ -889,9 +879,8 @@ impl<S, P> PrefixStore<S, P> {
         self.shadow
     }
 
-    /// Every stored state, roots first, each list from the least to the most recently used.
-    /// The store never sizes a state: the executor sums the charge of its own snapshots
-    /// (packet SERVE-2-c item 3).
+    /// Every stored state, roots first, each list from the least to the most recently used. The
+    /// store never sizes a state: the executor sums the charge of its own snapshots.
     pub(crate) fn snapshots(&self) -> impl Iterator<Item = &S> {
         self.roots
             .iter()
@@ -899,13 +888,12 @@ impl<S, P> PrefixStore<S, P> {
             .map(|stored| &stored.saved.state)
     }
 
-    /// The prompt tokens shared with a stored key beyond the `restored` tokens (packet
-    /// SERVE-2-c item 3): the longest common prefix length between `prompt` and ANY stored
-    /// key, of any numeric path, minus `restored`, saturating at 0. The literal common
-    /// prefix counts, not a full stored key: a conversation that diverges from a stored tip
-    /// at token 30,000 still shares 30,000 tokens with it, and the tokens between the restore
-    /// and the divergence are exactly the ones no checkpoint covers (lesson L2 of the
-    /// vllm-kvcache study). A restore that took the longest common prefix reports 0.
+    /// The prompt tokens shared with a stored key beyond the `restored` tokens: the longest common
+    /// prefix length between `prompt` and ANY stored key, of any numeric path, minus `restored`,
+    /// saturating at 0. The literal common prefix counts, not a full stored key: a conversation
+    /// that diverges from a stored tip at token 30,000 still shares 30,000 tokens with it, and the
+    /// tokens between the restore and the divergence are exactly the ones no checkpoint covers. A
+    /// restore that took the longest common prefix reports 0.
     pub(crate) fn uncached_shared(&self, prompt: &[u32], restored: usize) -> u32 {
         // `restored` is the floor: the count saturates at 0 when every key shares less.
         let mut longest = restored;
@@ -960,10 +948,10 @@ impl<S, P: PartialEq> PrefixStore<S, P> {
         Some(stored.saved.state)
     }
 
-    /// Steps (a) to (f) of a save, after `DecodeSession::save_prefix` validated the session. The
-    /// order is the order of decision 0036, addendum 2: use a duplicate (or promote it to a
-    /// root), drop a same-key entry of another path, make room, take the snapshot with eviction
-    /// retries on a denied permit, and apply the lineage rule.
+    /// Steps (a) to (f) of a save, after `DecodeSession::save_prefix` validated the session, in
+    /// this order: use a duplicate (or promote it to a root), drop a same-key entry of another
+    /// path, make room, take the snapshot with eviction retries on a denied permit, and apply the
+    /// lineage rule.
     fn save(
         &mut self,
         key: &[u32],
@@ -1047,8 +1035,8 @@ impl<S, P: PartialEq> PrefixStore<S, P> {
                             self.room_removals += 1;
                         }
                         None => {
-                            // Last resort (clarification 1, item 1): the restored entry goes,
-                            // before the snapshot, when the tip extends it.
+                            // Last resort: the restored entry goes, before the snapshot, when the
+                            // tip extends it.
                             if kind == SaveKind::Tip && self.drop_restored_ancestor(key) {
                                 self.restored_replaces += 1;
                                 continue;
@@ -1168,21 +1156,18 @@ impl<S, P: PartialEq> PrefixStore<S, P> {
         })
     }
 
-    /// Drops one LRU entry per call - never more than one - in the radix-compression
-    /// order (round 4d SF-1, over review rounds 4/4c): (0) dead TIP leaves - they never
-    /// match the next turn of any conversation; (1) single-chain interior anchors -
-    /// entries with exactly one maximal same-path extender (per32 under per49), fully
-    /// redundant; (2) anchor leaves - each lineage's deepest entry, its best restore;
-    /// (3) branch points - entries two or more incomparable branches extend (a shared
-    /// header); oldest first within each tier; the DENIED job's own lineage is the
-    /// explicit `protect` and spends last (review round 4 MF2), never the store-global
-    /// last-restore marker, which names another conversation in an interleaved batch.
-    /// Dropping the restored entry is safe because the session that restored it holds
-    /// its own permit for the shared arrays; the cost is one cache miss for that
+    /// Drops one LRU entry per call - never more than one - in the radix-compression order: (0)
+    /// dead TIP leaves - they never match the next turn of any conversation; (1) single-chain
+    /// interior anchors - entries with exactly one maximal same-path extender (per32 under per49),
+    /// fully redundant; (2) anchor leaves - each lineage's deepest entry, its best restore;
+    /// (3) branch points - entries two or more incomparable branches extend (a shared header);
+    /// oldest first within each tier; the DENIED job's own lineage is the explicit `protect` and
+    /// spends last, never the store-global last-restore marker, which names another conversation
+    /// in an interleaved batch. Dropping the restored entry is safe because the session that
+    /// restored it holds its own permit for the shared arrays; the cost is one cache miss for that
     /// conversation, never a correctness change. Returns whether an entry was removed.
     pub(crate) fn evict_lru_one(&mut self, protect: Option<u64>) -> bool {
-        // Radix-compression order (round 4d, SF-1, ranking review rounds 4c R4-MF3):
-        // spend what the radix tree can regrow before what it cannot.
+        // Radix-compression order: spend what the radix tree can regrow before what it cannot.
         //   tier 0: dead TIP leaves - they never match the next turn of any conversation;
         //   tier 1: single-chain interior anchors - entries with exactly ONE maximal
         //           same-path extender (per32 under per49): fully redundant, the chain's
@@ -1270,18 +1255,18 @@ impl<S, P: PartialEq> PrefixStore<S, P> {
         })
     }
 
-    /// Step (f) and the last-resort drop of clarification 1: when the saving session restored an
-    /// LRU entry of kind `Tip` that is still stored and the new tip extends its key, that entry
-    /// is dropped and the call reports `true`.
+    /// Step (f) and the last-resort drop of the room step: when the saving session restored an LRU
+    /// entry of kind `Tip` that is still stored and the new tip extends its key, that entry is
+    /// dropped and the call reports `true`.
     ///
-    /// Rule 4 of addendum 2 says that periodic entries and roots are never dropped this way, so a
-    /// restored `Periodic` entry stays, and a restored root is not in the LRU list at all. The
-    /// last resort of clarification 1 uses the same filter. It matters only for a store with one
-    /// LRU entry, whose default limits (0 roots, 1 entry) never hold a periodic entry because the
-    /// worker emits no periodic point below two entries. With limits (2, 1) the worker emits no
-    /// periodic point either, so no periodic entry can share the list with the tip. A direct
-    /// `save_prefix` call that stores a periodic entry in a one-entry list is outside the rules:
-    /// the restored periodic entry then stays and the tip save is skipped.
+    /// Periodic entries and roots are never dropped this way, so a restored `Periodic` entry stays,
+    /// and a restored root is not in the LRU list at all. The last resort of the room step uses the
+    /// same filter. It matters only for a store with one LRU entry, whose default limits (0 roots,
+    /// 1 entry) never hold a periodic entry because the worker emits no periodic point below two
+    /// entries. With limits (2, 1) the worker emits no periodic point either, so no periodic entry
+    /// can share the list with the tip. A direct `save_prefix` call that stores a periodic entry in
+    /// a one-entry list is outside the rules: the restored periodic entry then stays and the tip
+    /// save is skipped.
     fn drop_restored_ancestor(&mut self, key: &[u32]) -> bool {
         let Some(id) = self.restored else {
             return false;
@@ -1318,9 +1303,9 @@ impl<S, P: PartialEq> PrefixStore<S, P> {
         found
     }
 
-    /// The first candidate a `restore_prefix` for `prompt` under `path` would try (review
-    /// round 4, MF2): an admission-rebuild eviction protects it while no session exists,
-    /// so the rebuild does not free the very anchor its next attempt restores.
+    /// The first candidate a `restore_prefix` for `prompt` under `path` would try: an
+    /// admission-rebuild eviction protects it while no session exists, so the rebuild does not free
+    /// the very anchor its next attempt restores.
     pub(crate) fn restore_candidate(&self, prompt: &[u32], path: &P) -> Option<u64> {
         self.candidates(prompt, path).first().map(|&(id, _, _)| id)
     }
@@ -1338,14 +1323,13 @@ impl<S, P: PartialEq> PrefixStore<S, P> {
         is_root: bool,
         restore: &mut dyn FnMut(&S) -> Result<()>,
     ) -> Result<Option<(Vec<u32>, u32)>> {
-        // Two attempts at most. The first adoption `MemoryPlan` denial does NOT drop the
-        // candidate (SF1, from the override-16 trace: request 0x18's periodic anchor was
-        // the candidate its 90K turn restores, and dropping it made t6 a 410 s re-prefill
-        // instead of a 235 s restore): mirror the save path's step (d) - evict ONE victim
-        // in the radix order with the failed candidate itself protected, then RETRY THE
-        // SAME candidate. Only a second denial (no victim existed, or the pool freed by
-        // one victim still could not adopt) runs the drop-and-next behavior. Re-locate
-        // the entry after the eviction: the victim may share this list.
+        // Two attempts at most. The first adoption `MemoryPlan` denial does NOT drop the candidate
+        // (in a replayed trace, the periodic anchor that a 90K turn restores was the candidate, and
+        // dropping it made the sixth turn a 410 s re-prefill instead of a 235 s restore): mirror
+        // the save path's step (d) - evict ONE victim in the radix order with the failed candidate
+        // itself protected, then RETRY THE SAME candidate. Only a second denial (no victim existed,
+        // or the pool freed by one victim still could not adopt) runs the drop-and-next behavior.
+        // Re-locate the entry after the eviction: the victim may share this list.
         for attempt in 0..2 {
             let list = if is_root {
                 &mut self.roots
@@ -1369,11 +1353,10 @@ impl<S, P: PartialEq> PrefixStore<S, P> {
                 }
                 Err(EngError::MemoryPlan(_)) => {
                     if attempt == 0 && self.evict_lru_one(Some(id)) {
-                        // The freed victim lets the SAME candidate retry - unless
-                        // EV-1's tier-4 last resort spent the candidate ITSELF
-                        // (nothing else existed), which IS the legacy drop: the
-                        // anchor died to its own denial, so count it and stop (Sol
-                        // SF1-r1 MF1: a singleton's report must not say zero drops).
+                        // The freed victim lets the SAME candidate retry - unless the tier-4 last
+                        // resort spent the candidate ITSELF (nothing else existed), which IS the
+                        // legacy drop: the anchor died to its own denial, so count it and stop (a
+                        // singleton's report must not say zero drops).
                         let still_present = if is_root {
                             self.roots.iter().any(|stored| stored.id == id)
                         } else {
@@ -2801,13 +2784,11 @@ mod tests {
         // by their tips, tier 1 - wait: a later turn restores exactly a periodic anchor
         // while a tip never matches again.
         //
-        // Mutation check (round 4e SF-A, honestly scoped): a PURE LRU order drops
-        // lineage 1's PERIODIC anchor first - the oldest entry - and the sequence
-        // below fails. The tier discriminations this fixture CANNOT make (its
-        // periodics are all tier 1, its tips all tier 0, and no key crosses paths)
-        // are pinned by a_covered_interior_anchor_spends_before_an_older_anchor_leaf
-        // (tier 1 vs tier 2) and a_foreign_deeper_key_of_another_path_does_not_demote_
-        // the_anchor (path scoping).
+        // Mutation check: a PURE LRU order drops lineage 1's PERIODIC anchor first - the oldest
+        // entry - and the sequence below fails. The tier discriminations this fixture CANNOT make
+        // (its periodics are all tier 1, its tips all tier 0, and no key crosses paths) are pinned
+        // by a_covered_interior_anchor_spends_before_an_older_anchor_leaf (tier 1 vs tier 2) and
+        // a_foreign_deeper_key_of_another_path_does_not_demote_the_anchor (path scoping).
         // One held session per save: a prefix save requires the session's held prompt to
         // BE the key (the pending token is the entry's).
         let (step_a, session_a) = held(&[1, 2]);
@@ -2836,10 +2817,10 @@ mod tests {
         .unwrap();
         save(&session_d, &mut slot, &step_d, &[2, 2, 2, 3, 3], 2).unwrap();
         let lens = |slot: &Slot| slot.keys().iter().map(|key| key.0).collect::<Vec<_>>();
-        // No protection: the oldest leaf, lineage 1's tip, goes first. With the tip gone,
-        // Dead tips first, oldest first: lineage 1's tip, then lineage 2's tip. Kind is
-        // what ranks them (round 4c, R4-MF3): a lineage spends its dead tip before ANY
-        // lineage's anchor; a leaf-age order would drop lineage 1's anchor second.
+        // No protection: the oldest leaf, lineage 1's tip, goes first. With the tip gone, Dead tips
+        // first, oldest first: lineage 1's tip, then lineage 2's tip. Kind is what ranks them: a
+        // lineage spends its dead tip before ANY lineage's anchor; a leaf-age order would drop
+        // lineage 1's anchor second.
         assert!(slot.evict_lru_one(None));
         assert_eq!(lens(&slot), vec![2, 3, 5]);
         assert!(slot.evict_lru_one(None));
@@ -2857,12 +2838,11 @@ mod tests {
 
     #[test]
     fn a_foreign_deeper_key_of_another_path_does_not_demote_the_anchor() {
-        // Round 4d SF-4: the two-path discriminator. Path 1 holds a dead tip and - the
-        // YOUNGEST entry - an anchor [1,2]; path 2 holds an OLDER anchor [1,2,3] that
-        // extends [1,2] across paths. Extension counting is PATH-SCOPED, so [1,2] has
-        // no same-path extender: it is its lineage's anchor leaf (tier 2) and - being
-        // the youngest of the tier - survives while the older path-2 anchor spends.
-        // A foreign deeper key must not change what a lineage's own tree owes it.
+        // The two-path discriminator. Path 1 holds a dead tip and - the YOUNGEST entry - an anchor
+        // [1,2]; path 2 holds an OLDER anchor [1,2,3] that extends [1,2] across paths. Extension
+        // counting is PATH-SCOPED, so [1,2] has no same-path extender: it is its lineage's anchor
+        // leaf (tier 2) and - being the youngest of the tier - survives while the older path-2
+        // anchor spends. A foreign deeper key must not change what a lineage's own tree owes it.
         //
         // Mutation check: dropping the path comparison in `branches_of` counts the
         // foreign [1,2,3] as an extender, demotes [1,2] to a redundant interior
@@ -2904,13 +2884,12 @@ mod tests {
 
     #[test]
     fn a_covered_interior_anchor_spends_before_an_older_anchor_leaf() {
-        // Round 4e (Opus SF-A/B-i, Sol r4 SF1): the tier discriminator. Lineage B's
-        // anchor [9,9] is saved FIRST - the OLDEST entry - and is its lineage's only
-        // entry: an anchor LEAF (tier 2). Lineage A holds a CHAIN {per@3, per@4}, so
-        // per@3 is a redundant interior (tier 1: one maximal extender, per@4) and
-        // per@4 - with its cover gone after per@3 spends - is A's anchor leaf (tier 2).
-        // The real order: per@3 FIRST (tier 1 beats tier 2 even though B is OLDER),
-        // then B, then per@4. Distinct lengths keep every step unambiguous.
+        // The tier discriminator. Lineage B's anchor [9,9] is saved FIRST - the OLDEST entry - and
+        // is its lineage's only entry: an anchor LEAF (tier 2). Lineage A holds a CHAIN {per@3,
+        // per@4}, so per@3 is a redundant interior (tier 1: one maximal extender, per@4) and
+        // per@4 - with its cover gone after per@3 spends - is A's anchor leaf (tier 2). The real
+        // order: per@3 FIRST (tier 1 beats tier 2 even though B is OLDER), then B, then per@4.
+        // Distinct lengths keep every step unambiguous.
         //
         // Mutation checks: collapsing tiers 1 and 2 to one age order spends B first
         // (it is the oldest) and the first assertion fails; a pure-LRU order does the
@@ -2953,15 +2932,14 @@ mod tests {
 
     #[test]
     fn an_eviction_protects_the_denied_lineage_not_the_last_restore() {
-        // The interleave of review round 4, MF2: lineage A saves its anchor, lineage B
-        // saves its own, and B restores - so the store-global `restored` marker names B.
-        // A's denial must protect A's anchor, not the marker's: the eviction with
-        // `protect` = A's entry drops B's and keeps A's.
+        // The interleave: lineage A saves its anchor, lineage B saves its own, and B restores - so
+        // the store-global `restored` marker names B. A's denial must protect A's anchor, not the
+        // marker's: the eviction with `protect` = A's entry drops B's and keeps A's.
         //
-        // Mutation check: filtering on the store-global `restored` marker instead of the
-        // passed lineage protects B and drops A, so the keys assertion fails; deleting
-        // the protect filter entirely spends whichever entry is oldest, which is A's.
-        // Distinct lengths (round 4c, SF-b): lens==[2] cannot tell A from B.
+        // Mutation check: filtering on the store-global `restored` marker instead of the passed
+        // lineage protects B and drops A, so the keys assertion fails; deleting the protect filter
+        // entirely spends whichever entry is oldest, which is A's. Distinct lengths: lens==[2]
+        // cannot tell A from B.
         let (step, session) = held(&[1, 2]);
         let (mut other_step, mut other) = held(&[2, 2, 2]);
         let mut slot = store(0, 2);
@@ -3023,10 +3001,10 @@ mod tests {
     fn save_side_totals_count_duplicate_uses_and_block_rolls() {
         use super::SaveSideTotals;
 
-        // The two save-side counters the sched pins leave at zero: a repeated same-key
-        // save of the same kind and path counts one duplicate use (a use, not a second
-        // snapshot), and a Block cut that a later Block of the same path extends rolls
-        // the stored cut away (the KV-v1 rolling lineage cut).
+        // The two save-side counters the sched pins leave at zero: a repeated same-key save of
+        // the same kind and path counts one duplicate use (a use, not a second snapshot), and a
+        // Block cut that a later Block of the same path extends rolls the stored cut away (the
+        // rolling lineage cut).
         let mut slot = store(0, 6);
         let path = 7u8;
         let a = vec![2u32; 8];
@@ -3067,9 +3045,9 @@ mod tests {
     fn a_root_promotion_that_spends_an_unrelated_root_counts_a_room_removal() {
         use super::SaveSideTotals;
 
-        // Sol round-2 hole: promoting an LRU entry to a full root set drops the least
-        // recently used other root. That lost root is room churn exactly like the room
-        // loop's spends, so it must count - not hide behind the duplicate-use counter.
+        // Promoting an LRU entry to a full root set drops the least recently used other root. That
+        // lost root is room churn exactly like the room loop's spends, so it must count - not hide
+        // behind the duplicate-use counter.
         let mut slot = store(1, 1);
         let (step_a, session_a) = held(&[2, 2, 2, 2]);
         assert!(
@@ -3468,17 +3446,16 @@ mod tests {
 
     #[test]
     fn an_adoption_denial_evicts_one_victim_and_retries_the_same_candidate() {
-        // SF1 (the next slice), RED from the override-16 trace: request 0x18's periodic
-        // anchor at 49,152 was the candidate its 90K turn restores, and the adoption
-        // MemoryPlan denial dropped it - the entry that would have made t6 a 235 s
-        // restore instead of a 410 s re-prefill. The fix mirrors the save path's step
-        // (d): deny -> evict ONE victim (the candidate itself protected, leaf-first) ->
-        // retry the SAME candidate; only a second denial drops it. Here the closure is
-        // the budget: it denies ONCE (the pool was one victim short) and succeeds after,
-        // and the older spendable leaf of the same path is the victim.
+        // From a replayed trace: the periodic anchor at 49,152 was the candidate a 90K turn
+        // restores, and the adoption MemoryPlan denial dropped it - the entry that would have made
+        // the sixth turn a 235 s restore instead of a 410 s re-prefill. The store mirrors the save
+        // path's step (d): deny -> evict ONE victim (the candidate itself protected, leaf-first) ->
+        // retry the SAME candidate; only a second denial drops it. Here the closure is the budget:
+        // it denies ONCE (the pool was one victim short) and succeeds after, and the older
+        // spendable leaf of the same path is the victim.
         //
-        // RED on the base: the drop happens without any eviction, the retry never runs,
-        // and the restore covers 0 while the anchor is GONE.
+        // Without the retry, the drop happens without any eviction and the restore covers 0 while
+        // the anchor is GONE.
         let (old_step, old) = held(&[1, 2]);
         let (tip_step, tip) = held(&[1, 2, 3, 4]);
         let (anchor_step, mut anchor) = held(&[1, 2, 9]);
@@ -3513,10 +3490,10 @@ mod tests {
 
     #[test]
     fn a_singleton_candidate_denied_adoption_is_dropped_and_counted() {
-        // SF1-r1 MF1: with no other victim, EV-1's tier-4 last resort spends the
-        // candidate ITSELF. That is the legacy drop-and-next outcome - the anchor
-        // died to its own denial - so `restore_drops` must count it; a silent
-        // disappearance would report zero drops and misattribute the replay miss.
+        // With no other victim, the tier-4 last resort spends the candidate ITSELF. That is the
+        // legacy drop-and-next outcome - the anchor died to its own denial - so `restore_drops`
+        // must count it; a silent disappearance would report zero drops and misattribute the replay
+        // miss.
         let (step, mut session) = held(&[1, 2]);
         let mut slot = store(0, 3);
         save_as(&session, &mut slot, &step, &[1, 2], 1, SaveKind::Periodic).unwrap();
@@ -3538,7 +3515,7 @@ mod tests {
 
     #[test]
     fn a_persistent_denial_spends_one_victim_then_drops_the_candidate() {
-        // SF1-r1 SF2: denial -> one victim -> SAME candidate retried -> denied AGAIN
+        // Denial -> one victim -> SAME candidate retried -> denied AGAIN
         // -> the legacy drop-and-next: the candidate leaves, the next (shorter)
         // candidate restores, and both counters tell the story. Exactly two adoption
         // attempts on the first candidate, never more.
@@ -3816,8 +3793,8 @@ mod tests {
         (step, session, slot)
     }
 
-    /// With the default limits (no root, one entry) a tip that extends the restored entry
-    /// replaces it (clarification 1, item 1). This is the normal flow of every worker job.
+    /// With the default limits (no root, one entry) a tip that extends the restored entry replaces
+    /// it. This is the normal flow of every worker job.
     ///
     /// Mutation check: removing the last-resort drop of the restored entry in the room step makes
     /// the save return `Ok(false)` and keeps the old key, so both assertions fail.
@@ -3845,8 +3822,7 @@ mod tests {
         );
     }
 
-    /// The restored entry goes before the snapshot, so a denied snapshot leaves the store empty
-    /// (the behavior of decision 0036, addendum 1).
+    /// The restored entry goes before the snapshot, so a denied snapshot leaves the store empty.
     ///
     /// Mutation check: keeping the restored entry in the room step makes the save return
     /// `Ok(false)` without a snapshot call and leaves one entry, so the call count and the key
@@ -3913,8 +3889,8 @@ mod tests {
         (saved, calls.get(), slot)
     }
 
-    /// Rule 4 of addendum 2: a periodic entry is never dropped by the lineage rule. The tip of 5
-    /// tokens extends the restored periodic entry of 4 tokens, and the list has room for both.
+    /// A periodic entry is never dropped by the lineage rule. The tip of 5 tokens extends the
+    /// restored periodic entry of 4 tokens, and the list has room for both.
     ///
     /// Mutation check: removing the `Tip` kind test from `drop_restored_ancestor` drops the
     /// periodic entry, so the key list is `[(5, false)]`.
@@ -4222,8 +4198,8 @@ mod tests {
         );
     }
 
-    /// A tip that repeats a stored key is a use, and when it extends the restored entry the
-    /// lineage rule still drops that entry (clarification 1, item 4).
+    /// A tip that repeats a stored key is a use, and when it extends the restored entry the lineage
+    /// rule still drops that entry.
     ///
     /// Mutation check: returning at the duplicate branch without the lineage drop leaves the
     /// restored entry of 3 tokens in the list, so the key list assertion fails.
@@ -4526,10 +4502,10 @@ mod tests {
         assert_eq!(slot.entries_len(), 0, "no LRU entry either");
     }
 
-    /// The report accessors of the store (packet SERVE-2-c item 3): `restored_kind` names the
-    /// entry the last restore took, of either list, and `None` after a restore that took
-    /// nothing. The kind survives the lineage drop of the restored entry: the tip that replaces
-    /// the restored entry erases the id but not the kind.
+    /// The report accessors of the store: `restored_kind` names the entry the last restore took, of
+    /// either list, and `None` after a restore that took nothing. The kind survives the lineage
+    /// drop of the restored entry: the tip that replaces the restored entry erases the id but not
+    /// the kind.
     ///
     /// Mutation check: clearing `restored_kind` in the lineage drop makes the kind row fail.
     #[test]
@@ -4605,11 +4581,11 @@ mod tests {
         );
     }
 
-    /// `uncached_shared` takes the literal longest common prefix with any stored key (packet
-    /// SERVE-2-c item 3, fix M2): a prompt that diverges from the stored tip after the first
-    /// token still shares that token with it, a prompt that diverges after three tokens shares
-    /// three, and a restore that took the longest common prefix reports 0. A key of another
-    /// numeric path counts too: its tokens are shared but no checkpoint could serve them.
+    /// `uncached_shared` takes the literal longest common prefix with any stored key: a prompt that
+    /// diverges from the stored tip after the first token still shares that token with it, a prompt
+    /// that diverges after three tokens shares three, and a restore that took the longest common
+    /// prefix reports 0. A key of another numeric path counts too: its tokens are shared but no
+    /// checkpoint could serve them.
     ///
     /// Mutation check: restoring the old `prompt.starts_with(key)` filter makes the divergent
     /// rows report 0.
@@ -4725,7 +4701,7 @@ mod tests {
         );
     }
 
-    // --- KV-v1 slice 1: the shadow block-LCP of one lookup (shadow only, no behavior change) ---
+    // --- The shadow block-LCP of one lookup (shadow only, no behavior change) ---
 
     /// The shadow of a full hit: the stored key is a strict prefix of the prompt, the real
     /// restore takes it, and the shadow reports the same usable checkpoint with the raw
@@ -4750,9 +4726,9 @@ mod tests {
         assert_eq!(shadow.reason, ShadowReason::SameAsActual);
     }
 
-    /// The core case of KV-v1: the prompt diverges from every stored key mid-conversation, so
-    /// the exact-key restore finds nothing, but a block-granular restore could use the shared
-    /// blocks. 200 shared tokens floor to one 128 block and no 256 block.
+    /// The core case of block prefix-match: the prompt diverges from every stored key
+    /// mid-conversation, so the exact-key restore finds nothing, but a block-granular restore could
+    /// use the shared blocks. 200 shared tokens floor to one 128 block and no 256 block.
     #[test]
     fn the_shadow_floors_a_mid_conversation_divergence_to_the_block_granularity() {
         let key: Vec<u32> = (1..=300u32).map(|i| i * 2).collect();
@@ -5223,11 +5199,11 @@ mod tests {
         assert_eq!(slot.keys(), vec![(6, false), (3, false)]);
     }
 
-    // --- KV-v1 slice 2: the block prefix-match cut (flag-gated capture, one rolling per lineage) ---
+    // --- The block prefix-match cut (flag-gated capture, one rolling per lineage) ---
 
-    /// The ruled K=1: one rolling Block cut per lineage. A new `Block` save on a path drops
-    /// the `Block` entry that path held before, in the same save, so a lineage's cut tracks
-    /// its conversation end without a third entry.
+    /// K=1: one rolling Block cut per lineage. A new `Block` save on a path drops the `Block` entry
+    /// that path held before, in the same save, so a lineage's cut tracks its conversation end
+    /// without a third entry.
     #[test]
     fn a_new_block_cut_replaces_the_lineages_previous_one() {
         let mut slot = store(0, 4);
@@ -5365,10 +5341,9 @@ mod tests {
         assert_eq!(slot.restored_kind(), Some(SaveKind::Block));
     }
 
-    /// R2 of the RED list: when a block cut makes the rewrite restorable, the shadow agrees
-    /// with the actual restore - the same-as-actual class on the very case (a mid-key
-    /// divergence) that without the cut would stand as the no-usable-checkpoint gap the
-    /// shadow was built to measure.
+    /// When a block cut makes the rewrite restorable, the shadow agrees with the actual restore -
+    /// the same-as-actual class on the very case (a mid-key divergence) that without the cut would
+    /// stand as the no-usable-checkpoint gap the shadow was built to measure.
     #[test]
     fn the_shadow_agrees_when_a_block_cut_restores() {
         let mut slot = store(0, 4);
@@ -5409,9 +5384,9 @@ mod tests {
         assert_eq!(shadow.reason, ShadowReason::SameAsActual);
     }
 
-    /// R2's flag-off column: without the cut, the same rewrite stands as the gap
-    /// (`NoUsableCheckpoint`) the shadow exists to measure - the pin that the shadow does
-    /// not silently start agreeing once the entries exist but the flag is off.
+    /// The flag-off case of the test above: without the cut, the same rewrite stands as the gap
+    /// (`NoUsableCheckpoint`) the shadow exists to measure - the pin that the shadow does not
+    /// silently start agreeing once the entries exist but the flag is off.
     #[test]
     fn the_shadow_keeps_reporting_the_gap_when_the_cut_is_absent() {
         let mut slot = store(0, 4);
@@ -5436,17 +5411,15 @@ mod tests {
         assert_eq!(shadow.reason, ShadowReason::NoUsableCheckpoint);
     }
 
-    /// The environment parser behind `prefix_block_spacing` (Sol SF3): the `OnceLock`
-    /// caches the first read process-wide, so every case runs in a fresh child process
-    /// with its own uninitialized lock. The parent spawns the test binary per case with
-    /// the case's variables (both removed first, so the parent's environment cannot leak
-    /// in) and asserts the spacing the child prints for both calls - parsing plus
-    /// repeated-read coverage; both reads see unchanged variables, so this does not
-    /// isolate the OnceLock caching itself (the expected values hold with the lock
-    /// removed). (Sol round-2 SF2.) The flip (KV-v1 slice 3): block prefix-match is ON
-    /// by default, fail-safe: a set value keeps it on only for `1`/`true`/`on`
-    /// (trimmed, case-folded); every other value — `0`/`false`/`off`, empty, garbage,
-    /// non-UTF-8 — rolls it back (Opus MustFix, the env_allows convention).
+    /// The environment parser behind `prefix_block_spacing`: the `OnceLock` caches the first read
+    /// process-wide, so every case runs in a fresh child process with its own uninitialized lock.
+    /// The parent spawns the test binary per case with the case's variables (both removed first, so
+    /// the parent's environment cannot leak in) and asserts the spacing the child prints for both
+    /// calls - parsing plus repeated-read coverage; both reads see unchanged variables, so this
+    /// does not isolate the OnceLock caching itself (the expected values hold with the lock
+    /// removed). Block prefix-match is ON by default, fail-safe: a set value keeps it on only for
+    /// `1`/`true`/`on` (trimmed, case-folded); every other value — `0`/`false`/`off`, empty,
+    /// garbage, non-UTF-8 — rolls it back (the env_allows convention).
     #[test]
     fn the_prefix_block_environment_parses_in_child_processes() {
         let cases: &[(&[(&str, &str)], &str)] = &[
@@ -5792,14 +5765,13 @@ mod tests {
         );
     }
 
-    /// The 90K eviction cliff (root cause: the fixed six-entry LRU of the `prefix_reuse`
-    /// store), at the store level with the limits the engine really ships. Four paths at
-    /// 90K-equivalent depths stagger their saves (deepest anchor, then tip) as a
-    /// concurrent turn-group does. At the DEFAULT addendum 2 cap of six the first path's
-    /// entries evict wholesale - it restores zero tokens and re-prefills everything (the
-    /// arm-1 replay: 391 s TTFT at t6; three of the four paths survive in this shape).
-    /// With the operator's exact `prefix_store_entries` override every path keeps its
-    /// TIP - its deepest restorable state - and no agent re-prefills. The default stays
+    /// The 90K eviction cliff (root cause: the fixed six-entry LRU of the `prefix_reuse` store), at
+    /// the store level with the limits the engine really ships. Four paths at 90K-equivalent depths
+    /// stagger their saves (deepest anchor, then tip) as a concurrent turn-group does. At the
+    /// DEFAULT cap of six the first path's entries evict wholesale - it restores zero tokens and
+    /// re-prefills everything (in a replay: 391 s TTFT at the sixth turn; three of the four paths
+    /// survive in this shape). With the operator's exact `prefix_store_entries` override every path
+    /// keeps its TIP - its deepest restorable state - and no agent re-prefills. The default stays
     /// six (an entry's real cost grows with its depth), so the override is the opt-in.
     #[test]
     fn four_paths_at_ninety_k_depths_the_default_wipes_the_first_and_the_override_keeps_all() {

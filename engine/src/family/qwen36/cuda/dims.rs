@@ -1,10 +1,8 @@
-//! The checked dimensions of one resident step and the options fixed for a session (decision
-//! 0047 item 3, packet RD-9a).
+//! The checked dimensions of one resident step and the options fixed for a session.
 //!
-//! Pure host arithmetic. Geometry comes from the layout record ([`HostShape`], lane M's
-//! `family/qwen36`); the widths of the fused projection outputs come from the output rows of the
-//! tensor roles in the inventory (lane C), checked against the geometry. No model number is
-//! written here.
+//! Pure host arithmetic. Geometry comes from the layout record ([`HostShape`] of `family/qwen36`);
+//! the widths of the fused projection outputs come from the output rows of the tensor roles in the
+//! inventory, checked against the geometry. No model number is written here.
 
 use super::super::host::HostShape;
 use crate::{
@@ -33,9 +31,8 @@ pub(crate) enum KvRequest {
 
 impl KvRequest {
     /// `Auto` takes `Fp16` when its KV bytes fit `budget`, else `Int8G32`. `budget` is the frozen
-    /// headroom of the host (decision 0047 A2), passed by the admission caller; there is no
-    /// default number here, and `Auto` without a frozen budget is an error, not a guess
-    /// (REPLY-43 item 6).
+    /// headroom of the host, passed by the admission caller; there is no default number here, and
+    /// `Auto` without a frozen budget is an error, not a guess.
     pub(crate) fn resolve(
         self,
         fp16_bytes: usize,
@@ -60,20 +57,19 @@ pub(crate) struct StepOptions {
     pub(crate) kv_mode: KvMode,
     /// Positions the KV cache holds; allocated once, never grown.
     pub(crate) context_tokens: usize,
-    /// DeltaNet state slots; slot 0 is the committed state (stage 1 uses one). A verify window of
-    /// M rows (MEL-PLAN 6.5) may need one more slot per row for rollback; that count is RD-7c's
-    /// decision, and every slot costs one `DeltaPool` slot (62.8125 MiB on Qwen3.6-35B-A3B).
+    /// DeltaNet state slots; slot 0 is the committed state (stage 1 uses one). A verify window of M
+    /// rows may need one more slot per row for rollback; the per-row snapshot design sets that
+    /// count, and every slot costs one `DeltaPool` slot (62.8125 MiB on Qwen3.6-35B-A3B).
     pub(crate) delta_slots: usize,
     /// Stage 1b: one `xf` buffer per routed expert, so the experts can run on branch streams.
     pub(crate) forked_experts: bool,
-    /// The device layout the step runs (MATVEC-PAR S3b): the q8_1 producers and MMVQ matvecs of
-    /// `Native`, or today's fp16 packs and tiled matmuls of `Tiled`. DERIVED from
-    /// `CudaWeights::layout()` of the loaded model by every production caller (the gate); the
-    /// step refuses a mismatch of the two, and the default keeps every caller on the tiled path.
+    /// The device layout the step runs: the q8_1 producers and MMVQ matvecs of `Native`, or today's
+    /// fp16 packs and tiled matmuls of `Tiled`. DERIVED from `CudaWeights::layout()` of the loaded
+    /// model by every production caller (the gate); the step refuses a mismatch of the two, and the
+    /// default keeps every caller on the tiled path.
     pub(crate) layout: WeightLayout,
-    /// The tiered expert mode (OFF-2): `None` is the plain native step. Set only by an explicit
-    /// config key; the step then runs eager with a host decision in every layer (decision 0047,
-    /// amendment of 2026-10-13).
+    /// The tiered expert mode: `None` is the plain native step. Set only by an explicit config key;
+    /// the step then runs eager with a host decision in every layer.
     pub(crate) tiered: Option<TieredPlan>,
 }
 
@@ -98,7 +94,7 @@ pub(crate) struct TieredPlan {
 }
 
 impl TieredPlan {
-    /// The thread cap (git-db, 2026-10-13: the machine is on its thermal limit).
+    /// The thread cap: the machine already runs at its thermal limit.
     pub(crate) const MAX_THREADS: usize = 8;
 
     /// The defaults of the measurements: the caller chooses the slots and the thread count (6 in

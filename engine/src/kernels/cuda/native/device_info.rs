@@ -1,6 +1,6 @@
 //! Raw FFI to the device-property query of `native/device_info.cu` (declared in
 //! `native/abi_device.h`). Child module of `native`, so it inherits the
-//! `allow(unsafe_code)` of `native.rs` (decision 0047, child modules of `native.rs`).
+//! `allow(unsafe_code)` of `native.rs`.
 //!
 //! Safety invariants every wrapper here relies on:
 //! - The one extern is host only: it reads a device attribute and allocates, copies and
@@ -8,8 +8,8 @@
 //! - The out pointer is a live, writable `c_int` for the whole call and the adapter keeps no
 //!   pointer after it returns.
 //! - No raw pointer and no unsafe function leaves this module.
-//! - The call runs under the process dispatch guard on the thread that owns the context
-//!   (decisions 0023 and 0024); the caller in `mod.rs` enters the guard.
+//! - The call runs under the process dispatch guard on the thread that owns the context;
+//!   the caller in `mod.rs` enters the guard.
 
 use std::ffi::c_int;
 

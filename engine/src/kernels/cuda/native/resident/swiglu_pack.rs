@@ -1,10 +1,10 @@
 //! Raw FFI to the SwiGLU + fp16 pack entry of `native/resident/swiglu_pack.cu` (declared in
-//! `native/resident/swiglu_pack.h`), RD-4b. Child module of `native/resident.rs`, so it inherits
+//! `native/resident/swiglu_pack.h`). Child module of `native/resident.rs`, so it inherits
 //! the `allow(unsafe_code)` of `native.rs`.
 //!
 //! Safety invariants this file relies on:
 //! - The launch entry is called only through `CudaContext::launch_on`, on the thread that owns the
-//!   context and under the dispatch guard (decisions 0023 and 0024). It only enqueues and returns.
+//!   context and under the dispatch guard. It only enqueues and returns.
 //! - Every range is a `RawRange`, proved inside a live allocation by `raw_range`. Sizes, alignment
 //!   and disjointness (`super::Span`, `super::pack_bytes`) are proved again here, on the extents
 //!   the kernel touches, before the call; the C entry repeats the alignment, shape and overlap

@@ -1,11 +1,11 @@
-//! Tests of the capture window and executable graphs (seam 1: the Rust wrappers against the C
-//! entries against the vendored kernels, inside a capture).
+//! Tests of the capture window and executable graphs: the Rust wrappers against the C entries
+//! against the vendored kernels, inside a capture.
 //!
 //! "Bytes equal" means `to_bits()` equality of every f32; every comparison against the blocking
 //! path is exact. A kernel's first launch loads its module, which a capture forbids, so every
 //! device test runs its body once eagerly before it captures (`warm`). The owner counts, the
 //! terminal flag and the queued work are process-wide, so these tests assume `--test-threads=1`,
-//! as the device suite is always run (decision 0040).
+//! as the device suite is always run.
 //!
 //! The assertions on a refusal run after `capture` returns: a panic inside a body would unwind
 //! through the window and latch the backend for every later test.

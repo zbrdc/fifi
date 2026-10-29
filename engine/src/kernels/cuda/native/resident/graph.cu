@@ -1,14 +1,13 @@
 /*
- * RD-2d: stream capture, instantiate and launch of executable graphs behind the C ABI in graph.h
- * (decision 0047). One graph per step (CUDA-RD rev 2.3); the code uses the ordinary CUDA
- * runtime capture and graph API.
+ * Stream capture, instantiate and launch of executable graphs behind the C ABI in graph.h. One
+ * graph per step; the code uses the ordinary CUDA runtime capture and graph API.
  *
  * Every exported function has C linkage, takes and returns C types only, and wraps its body in
  * try/catch, like the other adapter files. capture_begin and capture_end report their failures at
  * INFERENCE_CUDA_STAGE_CAPTURE; the Rust side keeps the closed list of statuses that do not latch
  * the backend. graph_launch is launch-only. The only synchronize here is the one in
- * graph_exec_destroy (decision 0022: an executable graph is destroyed only after the device is
- * known to be idle).
+ * graph_exec_destroy (an executable graph is destroyed only after the device is known to be
+ * idle).
  */
 #include <cuda_runtime.h>
 
@@ -166,7 +165,7 @@ extern "C" int inference_cuda_graph_exec_destroy(void *exec, int *out_stage) {
         (void)cudaGetLastError();
         Failure failure;
         failure.record(cudaDeviceSynchronize(), INFERENCE_CUDA_STAGE_SYNCHRONIZE);
-        // A replay with unknown completion is not destroyed (decision 0022).
+        // A replay with unknown completion is not destroyed.
         if (failure.ok()) {
             failure.record(cudaGraphExecDestroy((cudaGraphExec_t)exec),
                            INFERENCE_CUDA_STAGE_ALLOCATE);

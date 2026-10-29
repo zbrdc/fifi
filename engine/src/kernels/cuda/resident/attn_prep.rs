@@ -1,7 +1,7 @@
-//! Safe launch wrapper of the attention preparation of one full-attention layer (RD-8a, decision
-//! 0047, seam 1): per-head RMSNorm of q and k, NEOX rope over the first `n_rot` dimensions at the
-//! position `*pos + t` read from the device, the f32 `q` output, and the append of the normed and
-//! rotated k and the unchanged v to the fp16 KV cache at the same rows.
+//! Safe launch wrapper of the attention preparation of one full-attention layer: per-head
+//! RMSNorm of q and k, NEOX rope over the first `n_rot` dimensions at the position `*pos + t`
+//! read from the device, the f32 `q` output, and the append of the normed and rotated k and the
+//! unchanged v to the fp16 KV cache at the same rows.
 //!
 //! [`CudaContext::attn_prep`] queues one kernel on a [`DeviceStream`] and returns. The call
 //! allocates nothing, copies nothing and never synchronizes; a fault in the queued work surfaces
@@ -10,22 +10,22 @@
 //! The device `pos` word (`StepParams.pos`) is authoritative. The kernel reads only that word:
 //! token `t` goes to row `*pos + t` of both caches. The host value `admit_pos` is advisory: it is
 //! used for the admission check [`ensure_rows`] and for nothing else, and it never reaches the
-//! kernel. RD-9d owns the host mirror of the word and runs the admission check per replay window;
-//! in a captured graph `admit_pos` is checked once, at capture. If the host value and the word
-//! disagree in range, the kernel writes the row the word names. A word outside
+//! kernel. The caller owns the host mirror of the word and runs the admission check per replay
+//! window; in a captured graph `admit_pos` is checked once, at capture. If the host value and
+//! the word disagree in range, the kernel writes the row the word names. A word outside
 //! `0..=rows - m` is refused on the device: no KV row is written, every `q` element is NaN and
 //! mask 4 is OR-ed into the status word (`StepParams.status`), so the host may see status bits 1,
 //! 2 and 4 in any combination (precedence 4, 1, 2).
 //!
 //! Layouts: `proj` is f32 `[m][ld]`; per q head `[q 256 | gate 256]`, then `n_kv_head` k heads of
-//! 256, then `n_kv_head` v heads of 256. The gate half is not read here: the decode attention
-//! reads head `h`'s gate from the same row at column `h * 512 + 256 + d`. `q` is f32
-//! `[m][n_head][256]`, normed times weight, then rotated, not scaled. The caches are fp16
-//! `[rows][n_kv_head][256]`, rounded to nearest even; fp16 is the only path of stage 1.
+//! 256, then `n_kv_head` v heads of 256. The gate half is not read here: the decode attention reads
+//! head `h`'s gate from the same row at column `h * 512 + 256 + d`. `q` is f32 `[m][n_head][256]`,
+//! normed times weight, then rotated, not scaled. The caches are fp16 `[rows][n_kv_head][256]`,
+//! rounded to nearest even.
 //!
 //! Only head size 256 with an output gate and a linear cache (`SlotMode::Position`) run. Mellum
-//! (head 128, no gate, a ring on 21 layers) needs MEL-K1, a new kernel behind this API, and is
-//! refused as `BadRequest` before any native call.
+//! (head 128, no gate, a ring on 21 layers) needs a new kernel behind this API, and is refused as
+//! `BadRequest` before any native call.
 //!
 //! Every argument is checked here, before any native call: the rules mirror `valid_attn_prep` of
 //! `attn_prep.cu`, so the native entry cannot return `INVALID_ARGUMENT` (which would latch the
@@ -34,17 +34,16 @@
 //! latched context a call with a bad range or argument still answers `BadRequest`, and a call
 //! with good arguments answers the latch error (`launch_on` checks the terminal flag itself).
 //!
-//! RoPE accuracy: the kernel computes the angle in f32. The tests hold it to the class RP1 (lane
-//! M REPLY-53): f32 RoPE angle; not checked against an f64 reference above position 1,150; A5
-//! covers positions up to about 1,150 only.
+//! RoPE accuracy: the kernel computes the angle in f32. The tests hold it to the class RP1: f32
+//! RoPE angle, checked against an f64 reference only up to about position 1,150.
 //!
-//! [`CudaContext::attn_prep_rows`] (KV8-B B1) is the f32 rows entry of the same kernel, the
-//! Int8G32 KV handoff: the same math stores the post-rope k and the unchanged v as f32 at
+//! [`CudaContext::attn_prep_rows`] is the f32 rows entry of the same kernel, the Int8G32 KV
+//! handoff: the same math stores the post-rope k and the unchanged v as f32 at
 //! `[t][n_kv_head][256]` of `k_rows`/`v_rows`, indexed by the token `t` instead of the position,
 //! and no fp16 cache byte is written. The device `pos` word is bounded by the Int8G32 plane cell
-//! count (`shape.rows`), the poison rule is the same (no row, NaN `q`, mask 4), and `m` is at
-//! most the decode bound of `kv8_append` (16): chunk prefill under Int8G32 uses the CPF-ATTN-A
-//! chunk entry (CPF-7), not this one. The step op list wires it in KV8-B B3.
+//! count (`shape.rows`), the poison rule is the same (no row, NaN `q`, mask 4), and `m` is at most
+//! the decode bound of `kv8_append` (16): chunk prefill under Int8G32 uses the chunk entry of
+//! `prefill/attn_prep_chunk.rs`, not this one. The step op list wires it.
 
 use std::ffi::c_int;
 
@@ -73,11 +72,11 @@ const NORM_BYTES: usize = HEAD_DIM * 4;
 pub(crate) enum SlotMode {
     /// The row is the position (Qwen3.6, a linear cache).
     Position,
-    /// The row is the position modulo the ring length (Mellum, MEL-K1). Refused today; built by
-    /// the refusal tests only until that kernel exists.
+    /// The row is the position modulo the ring length (Mellum). Refused today; built by the refusal
+    /// tests only until that kernel exists.
     #[cfg_attr(
         not(test),
-        expect(dead_code, reason = "built by the refusal tests only until MEL-K1")
+        expect(dead_code, reason = "built by the refusal tests until a Mellum kernel")
     )]
     Ring(u32),
 }
@@ -142,7 +141,7 @@ fn rule(tag: &str, detail: &str) -> EngError {
 fn needs_mel_k1(tag: &str, detail: &str) -> EngError {
     rule(
         tag,
-        &format!("{detail}; this configuration needs the Mellum kernel MEL-K1"),
+        &format!("{detail}; this configuration needs the Mellum kernel"),
     )
 }
 
@@ -189,7 +188,7 @@ pub(crate) fn q_bytes(m: usize, n_head: usize) -> usize {
         .saturating_mul(4)
 }
 
-/// The most tokens one rows call takes: the decode bound of `kv8_append` (KV8-B B1).
+/// The most tokens one rows call takes: the decode bound of `kv8_append`.
 pub(crate) const MAX_DECODE_ROWS: usize = 16;
 
 /// Bytes of each rows buffer: `m` rows of `n_kv_head` f32 heads of 256.
@@ -310,7 +309,7 @@ fn check_apart(call: &AttnPrepCall<'_>) -> Result<(), EngError> {
     Ok(())
 }
 
-// ---- KV8-B B1: the f32 rows entry (the Int8G32 KV handoff) -----------------------------------
+// ---- The f32 rows entry (the Int8G32 KV handoff) ---------------------------------------------
 
 /// One rows attention preparation call: as [`AttnPrepCall`] with the f32 rows buffers in place of
 /// the fp16 caches. Token `t` goes to `[t]` of `k_rows`/`v_rows` (f32 `[m][n_kv_head][256]`,
@@ -490,15 +489,14 @@ impl CudaContext {
         })
     }
 
-    /// Queues the f32 rows attention preparation of `call` on `stream` (KV8-B B1, the Int8G32 KV
-    /// handoff): the same RMSNorm and rope math as [`Self::attn_prep`], but the post-rope k and
-    /// the unchanged v go to f32 rows `[t]` of `k_rows`/`v_rows`, indexed by the token, and no
-    /// cache byte is written. Returns when the kernel is queued; the outputs are valid after the
-    /// stream drained.
+    /// Queues the f32 rows attention preparation of `call` on `stream` (the Int8G32 KV handoff):
+    /// the same RMSNorm and rope math as [`Self::attn_prep`], but the post-rope k and the unchanged
+    /// v go to f32 rows `[t]` of `k_rows`/`v_rows`, indexed by the token, and no cache byte is
+    /// written. Returns when the kernel is queued; the outputs are valid after the stream drained.
     ///
     /// The device word `*pos` is authoritative; a word outside `0..=rows - m` (with `rows` the
     /// plane cell count) writes no row, NaNs every `q` element and ORs mask 4 into the status
-    /// word. `m` is at most [`MAX_DECODE_ROWS`]; the B3 step op list is the first caller.
+    /// word. `m` is at most [`MAX_DECODE_ROWS`]; the step op list is its caller.
     ///
     /// Returns `BadRequest`, before any native call and with the backend unchanged, for a buffer
     /// or stream of another context, a freed buffer, a shape, rope scalar or configuration the

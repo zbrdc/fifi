@@ -3,7 +3,7 @@
 //!
 //! The owner counts (`live_owners`, `destroy_calls`) are process-global, like
 //! `LIVE_BYTES`, and every test makes its own contexts, so these tests assume
-//! `--test-threads=1`, as the device suite is always run (decision 0040).
+//! `--test-threads=1`, as the device suite is always run.
 //!
 //! Each refusal is checked by the text of its error as well as its variant, so
 //! a test fails when another check refuses the call instead of the one under

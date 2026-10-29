@@ -12,17 +12,16 @@ mod contract_tests;
 pub(crate) mod native;
 mod staging;
 
-/// Process-wide production counters of the compiled block calls of the `mlx_compile` seam
-/// (packet MX-COMPILE-1a). The trace counts come from the NATIVE seam: the body of a compiled
-/// closure runs once per trace — and on every call when MLX returns the uncompiled function —
-/// while a cache hit replays the compiled tape without entering the body, so `traces` is the
-/// count of closure-body entries that the native side keeps and `cache_hits` is `calls -
-/// traces`. Closure-body entries under one key include approved MoE B=1/2/4/8 specializations,
-/// unexpected shape or dtype drift, `MLX_DISABLE_COMPILE`, and a second engine thread with its
-/// own thread-local cache. More traces than keys alone does not prove unexpected retracing.
-/// `call_seconds` times the first calls, so the first entry after a clear is the compile itself;
-/// the load-time
-/// warm-up's seconds land here too.
+/// Process-wide production counters of the compiled block calls of the `mlx_compile` seam. The
+/// trace counts come from the NATIVE seam: the body of a compiled closure runs once per trace —
+/// and on every call when MLX returns the uncompiled function — while a cache hit replays the
+/// compiled tape without entering the body, so `traces` is the count of closure-body entries
+/// that the native side keeps and `cache_hits` is `calls - traces`. Closure-body entries under
+/// one key include approved MoE B=1/2/4/8 specializations, unexpected shape or dtype drift,
+/// `MLX_DISABLE_COMPILE`, and a second engine thread with its own thread-local cache. More
+/// traces than keys alone does not prove unexpected retracing. `call_seconds` times the first
+/// calls, so the first entry after a clear is the compile itself; the load-time warm-up's
+/// seconds land here too.
 pub(crate) mod compile_stats {
     use std::cell::Cell;
     use std::sync::{Mutex, OnceLock};
@@ -372,8 +371,8 @@ use crate::{
 };
 use staging::StagedBytes;
 
-/// Process-wide MLX allocator byte counts (decision 0039 Memory). They cover every adapter
-/// in the process, not only this one.
+/// Process-wide MLX allocator byte counts. They cover every adapter in the process, not
+/// only this one.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct MemoryStats {
     pub active: u64,
@@ -382,7 +381,7 @@ pub struct MemoryStats {
 }
 
 /// The outputs of [`MlxKernels::gated_delta`]. Both are lazy F32 residents.
-/// The six outputs of the `gdn_prep` fused kernel (R4-7): the pre-recurrence DeltaNet
+/// The six outputs of the `gdn_prep` fused kernel: the pre-recurrence DeltaNet
 /// chain in one call. All F32.
 pub struct GdnPrepOutput {
     pub q: ExecutionTensor,
@@ -400,7 +399,7 @@ pub struct GatedDeltaOutput {
     pub state: ExecutionTensor,
 }
 
-/// A U32 id resident plus the exclusive bound it was clamped below (packet GAP-TRIM-A).
+/// A U32 id resident plus the exclusive bound it was clamped below.
 ///
 /// `MlxKernels::bound_indices` clamps the ids on the device with one `mlx_minimum` node, so
 /// one layer can pass the SAME clamped ids to every gather over the same axis instead of paying
@@ -430,21 +429,20 @@ impl BoundedIndices {
     }
 
     /// Wraps ids that the caller already clamped below `bound` with its own ONE `mlx_minimum`
-    /// node (packet MX-COMPILE-1a): the compiled decode blocks clamp their expert ids inside
-    /// the traced closure body — exactly the clamp `bound_indices` builds — so the seam hands
-    /// the ids straight to the layer instead of clamping a second time. The caller owns the
-    /// truth of the clamp.
+    /// node: the compiled decode blocks clamp their expert ids inside the traced closure body
+    /// — exactly the clamp `bound_indices` builds — so the seam hands the ids straight to the
+    /// layer instead of clamping a second time. The caller owns the truth of the clamp.
     pub(crate) fn from_clamped(ids: ExecutionTensor, bound: u32) -> Self {
         Self { ids, bound }
     }
 }
 
-/// One side of the quantized KV cache of packet KV8-OPS: the three residents of one tensor
-/// (keys or values) as `quantize_rows` produces them and `kv_append` appends row by row into
-/// capacity buffers. The three buffers share one shape `[B, KVH, CAP, ·]` whose last axis is
-/// `D * bits / 32` U32 words for the codes and `D / group` values for the scales and the
-/// biases; the codes are U32 and the scales and biases share the dtype the cache was quantized
-/// in (F32, or BF16 after `allow_bf16`).
+/// One side of the quantized KV cache: the three residents of one tensor (keys or values) as
+/// `quantize_rows` produces them and `kv_append` appends row by row into capacity buffers. The
+/// three buffers share one shape `[B, KVH, CAP, ·]` whose last axis is `D * bits / 32` U32
+/// words for the codes and `D / group` values for the scales and the biases; the codes are U32
+/// and the scales and biases share the dtype the cache was quantized in (F32, or BF16 after
+/// `allow_bf16`).
 #[derive(Clone, Copy)]
 pub struct QuantizedKv<'a> {
     /// The packed codes, U32 `[B, KVH, CAP, D * bits / 32]`, `bits`-wide fields from the low
@@ -474,17 +472,16 @@ pub enum KvBlock<'a> {
     },
 }
 
-/// FIFI_FLINT_MLX_DECODE_ATTN (default ON since the 2026-10-27 flip)
-/// routes the production T=1 decode shape (one row, BF16, sinks, exact-
-/// len or bounded key span) to the vendor fused SDPA with exactness-checked
-/// BF16 sinks. Read once per process (`OnceLock`, the
-/// family/session.rs:541-550 convention) so the decode hot path pays no
-/// env read per attention call. Polarity is the shared default-on reader
-/// `tokenizer::env_allows_default_on` (pinned by the child-process
-/// rollback test): only an absent variable or an explicit enable word
-/// keeps it on; "0" (the rollback), any other value, or a value that is
-/// not UTF-8 restores the pre-flip float-flash small-block path - a
-/// mis-set rollback can never silently fail.
+/// FIFI_FLINT_MLX_DECODE_ATTN (default ON) routes the production T=1 decode
+/// shape (one row, BF16, sinks, exact- len or bounded key span) to the
+/// vendor fused SDPA with exactness-checked BF16 sinks. Read once per
+/// process (`OnceLock`, the family/session.rs:541-550 convention) so the
+/// decode hot path pays no env read per attention call. Polarity is the
+/// shared default-on reader `tokenizer::env_allows_default_on` (pinned by
+/// the child-process rollback test): only an absent variable or an explicit
+/// enable word keeps it on; "0" (the rollback), any other value, or a value
+/// that is not UTF-8 restores the float-flash small-block path - a mis-set
+/// rollback can never silently fail.
 pub fn decode_attn_flagged() -> bool {
     static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ENABLED.get_or_init(|| {
@@ -537,11 +534,11 @@ pub(crate) fn bf16_round_trip(value: f32) -> f32 {
 /// The vendor decode route takes sinks in the output dtype: the loader
 /// casts at load time, the shared API promotes only after this check. The
 /// production checkpoint stores its 49x32 softmax_offset values AS BF16
-/// (2026-10-25 table: all 1568 round-trip F32->BF16->F32 exactly, range
-/// -9.0..+12.375), so on real weights the cast is bit-exact. A checkpoint
-/// whose sinks are NOT BF16-representable would silently round learned
-/// logits, so a flagged load runs this check once per layer and refuses,
-/// naming the first offending layer/head.
+/// (all 1568 round-trip F32->BF16->F32 exactly, range -9.0..+12.375), so
+/// on real weights the cast is bit-exact. A checkpoint whose sinks are
+/// NOT BF16-representable would silently round learned logits, so a
+/// flagged load runs this check once per layer and refuses, naming the
+/// first offending layer/head.
 pub fn assert_sinks_bf16_exact(values: &[f32], provenance: &str) -> Result<(), EngError> {
     for (head, &value) in values.iter().enumerate() {
         if !value.is_finite() || bf16_round_trip(value).to_bits() != value.to_bits() {
@@ -558,11 +555,11 @@ pub fn assert_sinks_bf16_exact(values: &[f32], provenance: &str) -> Result<(), E
 /// FIFI_FLINT_MLX_T1_FLASH routes the ONE-ROW F32-with-sinks shape (the
 /// Flint per-token arm) onto the same float-flash kernel the batched
 /// prefill uses, closing the vendor-SDPA-vs-flash inter-kernel drift (KL
-/// 0.041 at 2K/32; root cause 2026-10-25). Default OFF until the window
-/// measures identity and decode tok/s. Fail-safe polarity (default-off, so
-/// the pure `env_allows_value(None) == true` half CANNOT be used here):
-/// absent, non-UTF-8, or any value other than the explicit enable words
-/// keeps it off - a mis-set rollback cannot fail silently.
+/// 0.041 at 2K/32). Default OFF until the window measures identity and
+/// decode tok/s. Fail-safe polarity (default-off, so the pure
+/// `env_allows_value(None) == true` half CANNOT be used here): absent,
+/// non-UTF-8, or any value other than the explicit enable words keeps it
+/// off - a mis-set rollback cannot fail silently.
 pub(crate) fn t1_flash_flagged() -> bool {
     static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ENABLED.get_or_init(|| match std::env::var("FIFI_FLINT_MLX_T1_FLASH") {
@@ -587,12 +584,11 @@ fn t1_flash_routes(rows: u32, dtype: Dtype, has_sinks: bool, flagged: bool) -> b
 /// decode route is off; with FIFI_FLINT_MLX_DECODE_ATTN armed Flint passes
 /// BF16 storage (load-cast after assert_sinks_bf16_exact) and the
 /// flash paths up-cast either storage exactly.
-/// ARMED CONTRACT (FIFI_FLINT_MLX_DECODE_ATTN, the default since the
-/// 2026-10-27 flip): on the vendor-eligible one-row BF16 shape, raw F32
-/// sinks cost a HOST READBACK and stream sync PER CALL and refuse loudly
-/// if any value is not BF16-exact; families should store BF16 sinks at
-/// load (the Flint loader does) to bypass both the readback and the
-/// refusal risk.
+/// ARMED CONTRACT (FIFI_FLINT_MLX_DECODE_ATTN, on by default): on the
+/// vendor-eligible one-row BF16 shape, raw F32 sinks cost a HOST READBACK
+/// and stream sync PER CALL and refuse loudly if any value is not
+/// BF16-exact; families should store BF16 sinks at load (the Flint loader
+/// does) to bypass both the readback and the refusal risk.
 /// Families select options, never a kernel.
 pub struct SharedAttention<'a> {
     pub q: &'a ExecutionTensor,
@@ -647,8 +643,8 @@ impl MlxKernels {
     }
 
     /// Returns the forced retire-cap flush attempts in this process, which never reset, and the
-    /// largest retired byte total of any single adapter since the last peak reset (decision 0039
-    /// gate 6). Qualification builds only.
+    /// largest retired byte total of any single adapter since the last peak reset. Qualification
+    /// builds only.
     #[cfg(feature = "native-fault-qualification")]
     pub fn qualification_retire_stats(&self) -> (u64, u64) {
         self.context.qualification_retire_stats()
@@ -705,11 +701,11 @@ impl MlxKernels {
         timing::reset();
     }
 
-    /// Returns the lazy graph of `outputs` as the text of `mlx_print_graph` (packet
-    /// GPU-GAP-COUNT). Qualification builds ONLY: the product build must not contain the dump.
-    /// The call describes the pending graph — it evaluates, synchronizes, and releases nothing,
-    /// and it takes part in no selection of the qualification operation faults, like
-    /// `evaluate_async`. A native failure is terminal.
+    /// Returns the lazy graph of `outputs` as the text of `mlx_print_graph`. Qualification
+    /// builds ONLY: the product build must not contain the dump. The call describes the pending
+    /// graph — it evaluates, synchronizes, and releases nothing, and it takes part in no
+    /// selection of the qualification operation faults, like `evaluate_async`. A native failure
+    /// is terminal.
     #[cfg(feature = "native-fault-qualification")]
     pub fn qualification_graph_text(
         &mut self,
@@ -747,7 +743,7 @@ impl MlxKernels {
 
     /// Sets the retire cap of this adapter in bytes and returns the previous cap. The default is
     /// 64 MiB. A cap of zero is a `BadRequest`. A lower cap does not flush at once; it applies
-    /// from the next retire. The chunk step of decision 0044 uses it.
+    /// from the next retire. The chunked prefill step uses it.
     pub fn set_retire_cap(&mut self, bytes: u64) -> Result<u64, EngError> {
         if bytes == 0 {
             return Err(EngError::BadRequest("retire cap must exceed zero".into()));
@@ -835,9 +831,9 @@ impl MlxKernels {
         timing::timed(timing::Kind::Evaluate, || self.context.evaluate(outputs))
     }
 
-    /// Submits the graph of several resident outputs without waiting for the GPU (packet
-    /// NATIVE-OPS-1). A later `evaluate`, `readback`, or any other synchronization completes it;
-    /// a read of a pending output blocks until then.
+    /// Submits the graph of several resident outputs without waiting for the GPU. A later
+    /// `evaluate`, `readback`, or any other synchronization completes it; a read of a pending
+    /// output blocks until then.
     ///
     /// An async submission is not a completed synchronization: it never flushes the retire list
     /// (retired arrays free after the next completed synchronization, as before) and it adds no
@@ -880,7 +876,7 @@ impl MlxKernels {
     }
 
     /// Imports several packed weights and plain tensors with one synchronization
-    /// (decision 0039 item 4: a layer's expert stacks and its gate weights).
+    /// (a layer's expert stacks and its gate weights).
     pub fn import_packed_many_with(
         &mut self,
         weights: &[&PackedWeight],
@@ -906,8 +902,7 @@ impl MlxKernels {
         assemble_packed(layouts, residents, plain.len())
     }
 
-    /// Wraps page ranges as resident tensors without copying and without synchronizing
-    /// (decision 0041).
+    /// Wraps page ranges as resident tensors without copying and without synchronizing.
     ///
     /// The checks run before any native call and return `BadRequest`: an empty slice, an offset
     /// that is not a page multiple, a zero or overflowing byte length, a range past the end, and a
@@ -924,8 +919,8 @@ impl MlxKernels {
     }
 
     /// Wraps packed weights and plain ranges of `pages` without copying and without
-    /// synchronizing (decision 0041). Each weight follows the `PackedWeight::try_new` layout
-    /// rules, checked before any native call; a violation returns `BadRequest`.
+    /// synchronizing. Each weight follows the `PackedWeight::try_new` layout rules, checked
+    /// before any native call; a violation returns `BadRequest`.
     pub fn import_packed_pages(
         &mut self,
         pages: &HostPages,
@@ -954,13 +949,13 @@ impl MlxKernels {
     }
 
     /// Page imports that MLX served with its copy path since process start. Qualification
-    /// builds only (decision 0041 Q3: such an import succeeds and is counted).
+    /// builds only. Such an import succeeds and is counted.
     #[cfg(feature = "native-fault-qualification")]
     pub fn qualification_page_copies(&self) -> u64 {
         self.context.qualification_page_copies()
     }
 
-    /// Imports several packed weights with one synchronization (decision 0039 item 4).
+    /// Imports several packed weights with one synchronization.
     pub fn import_packed_many(
         &mut self,
         weights: &[&PackedWeight],
@@ -1015,12 +1010,12 @@ impl MlxKernels {
     }
 
     /// Multiplies each activation row by the expert that its index names in one native call, with
-    /// MLX's `sorted_indices` flag set (packet Q36-PF-SORTED). The indices must be non-decreasing
-    /// along the flat axis: with unsorted indices MLX may return wrong values, and this method
-    /// cannot read the device indices, so the caller proves the order on the host. In the pinned
-    /// MLX the flag changes the kernel only for at least 16 pairs with at least 4 pairs per expert
-    /// on average. The checks and the output layout are those of `gather_qmm`, and indices at or
-    /// above the expert count are clamped to the last expert on the device.
+    /// MLX's `sorted_indices` flag set. The indices must be non-decreasing along the flat axis:
+    /// with unsorted indices MLX may return wrong values, and this method cannot read the device
+    /// indices, so the caller proves the order on the host. In the pinned MLX the flag changes the
+    /// kernel only for at least 16 pairs with at least 4 pairs per expert on average. The checks
+    /// and the output layout are those of `gather_qmm`, and indices at or above the expert count
+    /// are clamped to the last expert on the device.
     pub fn gather_qmm_sorted(
         &mut self,
         x: &ExecutionTensor,
@@ -1031,11 +1026,11 @@ impl MlxKernels {
     }
 
     /// Multiplies each activation row by the expert that its index names in one native call, with
-    /// ids that `bound_indices` clamped once (packet GAP-TRIM-A). The checks and the output layout
-    /// are those of `gather_qmm`. While the recorded bound covers the expert count the method
-    /// builds no clamp node (the once-clamped ids are already inside the stack); with a bound past
-    /// the expert count it clamps on the device itself, so ids at or above the expert count clamp
-    /// to the last expert exactly as `gather_qmm` does.
+    /// ids that `bound_indices` clamped once. The checks and the output layout are those of
+    /// `gather_qmm`. While the recorded bound covers the expert count the method builds no clamp
+    /// node (the once-clamped ids are already inside the stack); with a bound past the expert
+    /// count it clamps on the device itself, so ids at or above the expert count clamp to the last
+    /// expert exactly as `gather_qmm` does.
     pub fn gather_qmm_bounded(
         &mut self,
         x: &ExecutionTensor,
@@ -1046,9 +1041,9 @@ impl MlxKernels {
             .gather_qmm_bounded(x, stack, indices.ids(), indices.bound())
     }
 
-    /// `gather_qmm_bounded` with MLX's `sorted_indices` flag set (packet GAP-TRIM-A): the checks,
-    /// the sortedness duty, and the clamp rule are those of `gather_qmm_bounded`, and the flag
-    /// semantics are those of `gather_qmm_sorted`.
+    /// `gather_qmm_bounded` with MLX's `sorted_indices` flag set: the checks, the sortedness
+    /// duty, and the clamp rule are those of `gather_qmm_bounded`, and the flag semantics are
+    /// those of `gather_qmm_sorted`.
     pub fn gather_qmm_sorted_bounded(
         &mut self,
         x: &ExecutionTensor,
@@ -1059,11 +1054,10 @@ impl MlxKernels {
             .gather_qmm_sorted_bounded(x, stack, indices.ids(), indices.bound())
     }
 
-    /// Gathers along `axis` with ids that `bound_indices` clamped once (packet GAP-TRIM-A). The
-    /// checks and the output layout are those of `take`. While the recorded bound covers the axis
-    /// length the method builds no clamp node; with a bound past the axis length it clamps on the
-    /// device itself, so an id at or above the axis length clamps to the last element exactly as
-    /// `take` does.
+    /// Gathers along `axis` with ids that `bound_indices` clamped once. The checks and the output
+    /// layout are those of `take`. While the recorded bound covers the axis length the method
+    /// builds no clamp node; with a bound past the axis length it clamps on the device itself, so
+    /// an id at or above the axis length clamps to the last element exactly as `take` does.
     pub fn take_bounded(
         &mut self,
         x: &ExecutionTensor,
@@ -1075,12 +1069,11 @@ impl MlxKernels {
     }
 
     /// Clamps a U32 id resident below the exclusive `upper` with ONE `mlx_minimum` node and
-    /// returns it with the bound it was clamped below (packet GAP-TRIM-A): the single clamp that
-    /// the bounded gather and take variants of one layer share. The output keeps the shape of
-    /// `ids`; the clamp of an already clamped tensor is the identity, so a graph that routes once
-    /// and gathers several times keeps its values bit for bit. `upper` of zero is a `BadRequest`
-    /// before the first native call; a native failure follows the resident rule and makes the
-    /// adapter terminal.
+    /// returns it with the bound it was clamped below: the single clamp that the bounded gather
+    /// and take variants of one layer share. The output keeps the shape of `ids`; the clamp of an
+    /// already clamped tensor is the identity, so a graph that routes once and gathers several
+    /// times keeps its values bit for bit. `upper` of zero is a `BadRequest` before the first
+    /// native call; a native failure follows the resident rule and makes the adapter terminal.
     pub fn bound_indices(
         &mut self,
         ids: &ExecutionTensor,
@@ -1234,26 +1227,24 @@ impl MlxKernels {
         self.context.slice_update(target, update, start)
     }
 
-    /// `slice_update` that consumes `target` (packet NATIVE-OPS-1): the update is written at
-    /// `start` and the result keeps the dtype and shape of `target`. The adapter releases its own
-    /// native handle of `target` right after the lazy node is built, so the node holds the only
-    /// owner of the target's buffer when the graph runs and MLX donates the buffer, writing the
-    /// rows in place instead of copying the whole capacity. Pass the only handle of `target`: a
-    /// caller that keeps a `share()` loses the in-place donation but stays correct.
+    /// `slice_update` that consumes `target`: the update is written at `start` and the result
+    /// keeps the dtype and shape of `target`. The adapter releases its own native handle of
+    /// `target` right after the lazy node is built, so the node holds the only owner of the
+    /// target's buffer when the graph runs and MLX donates the buffer, writing the rows in place
+    /// instead of copying the whole capacity. Pass the only handle of `target`: a caller that
+    /// keeps a `share()` loses the in-place donation but stays correct.
     ///
-    /// That release is the one exception to decision 0039 item 1 ("no resident releases without
-    /// GPU completion", a user decision of 2026-10-08), approved by the user on 2026-10-11: a
-    /// consuming `kv_append` hands the KV buffer to the lazy graph node, the resident's own
-    /// reference moves into the graph, and MLX frees the buffer only after the GPU is done with
-    /// the graph. Every other drop keeps the retire list.
+    /// That release is the one exception to the rule that no resident releases its array before
+    /// GPU completion: a consuming `kv_append` hands the KV buffer to the lazy graph node, the
+    /// resident's own reference moves into the graph, and MLX frees the buffer only after the
+    /// GPU is done with the graph. Every other drop keeps the retire list.
     ///
     /// The target and the update are F32 residents of this adapter, BF16 after `allow_bf16`, or
-    /// U32 - the packed codes of the quantized KV cache (packet KV8-OPS), whose byte width equals
-    /// F32 - and share one dtype. A validation failure returns `BadRequest` before the first native
-    /// call and frees the consumed handle once through the retire list; the adapter stays usable.
-    /// A native failure follows the resident rule and makes the adapter terminal; a failed
-    /// release of the taken handle is terminal (decision 0022) and returns `Backend` with label
-    /// `kv append`.
+    /// U32 - the packed codes of the quantized KV cache, whose byte width equals F32 - and share
+    /// one dtype. A validation failure returns `BadRequest` before the first native call and frees
+    /// the consumed handle once through the retire list; the adapter stays usable. A native failure
+    /// follows the resident rule and makes the adapter terminal; a failed release of the taken
+    /// handle is terminal and returns `Backend` with label `kv append`.
     pub fn kv_append(
         &mut self,
         target: ExecutionTensor,
@@ -1263,8 +1254,8 @@ impl MlxKernels {
         self.context.kv_append(target, update, start)
     }
 
-    /// Builds an unevaluated BF16 [4, capacity, 128] KV plane of device zeros
-    /// (packet CTX32K-GROW); no host staging vector, no import copy.
+    /// Builds an unevaluated BF16 [4, capacity, 128] KV plane of device
+    /// zeros; no host staging vector, no import copy.
     pub fn kv_zeros(&mut self, capacity: u32) -> Result<ExecutionTensor, EngError> {
         self.context.kv_zeros(capacity)
     }
@@ -1284,19 +1275,19 @@ impl MlxKernels {
         self.context.u32_to_f32(x)
     }
 
-    /// Converts an F32 resident to `dtype`, or a BF16 resident to F32 or BF16, with the same shape
-    /// (packet Q36-BF16-a). `dtype` is F32, or BF16 after `allow_bf16`; a BF16 input also needs
-    /// that call. Another dtype is `BadRequest`. It returns an unevaluated resident. It uses the
-    /// shim of `u32_to_f32`.
+    /// Converts an F32 resident to `dtype`, or a BF16 resident to F32 or BF16, with the same
+    /// shape. `dtype` is F32, or BF16 after `allow_bf16`; a BF16 input also needs that call.
+    /// Another dtype is `BadRequest`. It returns an unevaluated resident. It uses the shim of
+    /// `u32_to_f32`.
     pub fn cast(&mut self, x: &ExecutionTensor, dtype: Dtype) -> Result<ExecutionTensor, EngError> {
         self.context.cast(x, dtype)
     }
 
-    /// Lets the resident float operations take BF16 operands and return BF16 results (packet
-    /// Q36-BF16-a). The default is off: `qmm`, `gather_qmm`, `mm`, and the elementwise, shape,
-    /// norm, RoPE, and attention operations then reject BF16 as before, so Flash-Next and every
-    /// other caller that never calls this see no change. An operation promotes mixed F32 and BF16
-    /// operands to F32, as MLX does. Quantized weights keep their stored scale dtype.
+    /// Lets the resident float operations take BF16 operands and return BF16 results. The default
+    /// is off: `qmm`, `gather_qmm`, `mm`, and the elementwise, shape, norm, RoPE, and attention
+    /// operations then reject BF16 as before, so Flash-Next and every other caller that never
+    /// calls this see no change. An operation promotes mixed F32 and BF16 operands to F32, as MLX
+    /// does. Quantized weights keep their stored scale dtype.
     pub fn allow_bf16(&mut self, allow: bool) {
         self.context.allow_bf16(allow);
     }
@@ -1327,7 +1318,7 @@ impl MlxKernels {
     /// above the axis length are clamped to the last element. The method does not read the indices.
     /// A take along axis 0 returns the fresh gather output of MLX `take` as is (row-contiguous by
     /// construction); a take along another axis can end in the transpose view that MLX `take`
-    /// builds, so it still makes the result contiguous (packet GAP-TRIM-A).
+    /// builds, so it still makes the result contiguous.
     pub fn take(
         &mut self,
         x: &ExecutionTensor,
@@ -1341,7 +1332,7 @@ impl MlxKernels {
     /// the indices shape equals the input shape except on `axis`, and the output takes the indices
     /// shape. The input is F32, BF16 after `allow_bf16`, or U32, and the output keeps the input
     /// dtype. Indices above the axis length are clamped to the last element of the axis, as `take`
-    /// does. The method does not read the indices (packet Q36-PF-DEVROUTE).
+    /// does. The method does not read the indices.
     pub fn take_along_axis(
         &mut self,
         x: &ExecutionTensor,
@@ -1410,13 +1401,13 @@ impl MlxKernels {
             .grouped_attention(queries, keys, values, scale, causal)
     }
 
-    /// Runs scaled dot-product attention over the first `len` positions of capacity buffers
-    /// (packet NATIVE-OPS-1). `queries` is `[B, QH, Tq, D]`; `keys` and `values` are capacity
-    /// buffers `[B, KVH, CAP, D]` with `QH` a multiple of `KVH` and `1 <= len <= CAP`. The prefix
-    /// is an MLX `slice` view with no `mlx_contiguous`, so the capacity buffer is read in place
-    /// and the prefix is never copied. With `causal` and `Tq > 1` the mask mode string is the one
-    /// of `grouped_attention`, so the causal mask aligns to the last key of the prefix. The
-    /// output is the query shape, F32, or BF16 after `allow_bf16` as `grouped_attention` returns.
+    /// Runs scaled dot-product attention over the first `len` positions of capacity buffers.
+    /// `queries` is `[B, QH, Tq, D]`; `keys` and `values` are capacity buffers `[B, KVH, CAP, D]`
+    /// with `QH` a multiple of `KVH` and `1 <= len <= CAP`. The prefix is an MLX `slice` view
+    /// with no `mlx_contiguous`, so the capacity buffer is read in place and the prefix is never
+    /// copied. With `causal` and `Tq > 1` the mask mode string is the one of `grouped_attention`,
+    /// so the causal mask aligns to the last key of the prefix. The output is the query shape,
+    /// F32, or BF16 after `allow_bf16` as `grouped_attention` returns.
     pub fn grouped_attention_prefix(
         &mut self,
         queries: &ExecutionTensor,
@@ -1430,15 +1421,15 @@ impl MlxKernels {
             .grouped_attention_prefix(queries, keys, values, len, scale, causal)
     }
 
-    /// Quantizes the last axis of `x` row by row with MLX affine quantization (packet KV8-OPS):
-    /// per group of `group_size` lanes, `scale = (max - min) / (2^bits - 1)`, `bias = min`, and
-    /// the codes are `round((x - bias) / scale)` packed `32 / bits` per U32 word from the low
-    /// end. `bits` is 8 only for now (the one portable check rejects the rest, so a later 4-bit
-    /// is a one-line change). `x` is an F32 resident of this adapter, or BF16 after `allow_bf16`,
-    /// of rank at least two whose last axis is a multiple of `group_size`. Returns
-    /// `(codes, scales, biases)`, all lazy: codes U32 `[.., D * bits / 32]`, scales and biases
-    /// `[.., D / group]` of the dtype of `x`. A validation failure returns `BadRequest`; a native
-    /// failure follows the resident rule and makes the adapter terminal.
+    /// Quantizes the last axis of `x` row by row with MLX affine quantization: per group of
+    /// `group_size` lanes, `scale = (max - min) / (2^bits - 1)`, `bias = min`, and the codes are
+    /// `round((x - bias) / scale)` packed `32 / bits` per U32 word from the low end. `bits` is 8
+    /// only for now (the one portable check rejects the rest, so a later 4-bit is a one-line
+    /// change). `x` is an F32 resident of this adapter, or BF16 after `allow_bf16`, of rank at
+    /// least two whose last axis is a multiple of `group_size`. Returns `(codes, scales,
+    /// biases)`, all lazy: codes U32 `[.., D * bits / 32]`, scales and biases `[.., D / group]`
+    /// of the dtype of `x`. A validation failure returns `BadRequest`; a native failure follows
+    /// the resident rule and makes the adapter terminal.
     pub fn quantize_rows(
         &mut self,
         x: &ExecutionTensor,
@@ -1449,24 +1440,24 @@ impl MlxKernels {
     }
 
     /// Runs scaled dot-product attention over the first `len` positions of QUANTIZED capacity
-    /// buffers (packet KV8-OPS), the form of mlx-lm's quantized KV cache: no F32 copy of the
-    /// prefix is built. `queries` is `[B, QH, L, D]`; `keys` and `values` are the three
-    /// quantized residents of each side, with `QH` a multiple of `KVH` and `1 <= len <= CAP`.
-    /// The heads of one KV group are adjacent, so query head `h` reads KV head `h / rep` with
-    /// `rep = QH / KVH`: the queries reshape to `[B, KVH, rep * L, D]`, the scores are
-    /// `quantized_matmul(q', K, transpose = true) * scale`, a causal chunk (`L > 1`) adds a mask
-    /// aligned to the LAST key - query row `t` sees keys `0..len - L + t`, broadcast over the
-    /// repeats - the softmax runs over the last axis in F32 (precise), and the output is
-    /// `quantized_matmul(probs, V, transpose = false)` reshaped back to `[B, QH, L, D]`. All six
-    /// prefix views are MLX slice views with no `mlx_contiguous`, so the capacity buffers are
-    /// read in place: MLX's quantized matmul reads a strided prefix view without copying it (the
-    /// Mac view-cost test measures the peak growth). `group_size` and `bits` must
-    /// match the quantization of the buffers (`bits` is 8 only). The result is F32 for F32
-    /// queries, or BF16 after `allow_bf16` as the operand promotion goes. A validation failure
-    /// returns `BadRequest`; a native failure follows the resident rule and is terminal.
+    /// buffers, the form of mlx-lm's quantized KV cache: no F32 copy of the prefix is built.
+    /// `queries` is `[B, QH, L, D]`; `keys` and `values` are the three quantized residents of
+    /// each side, with `QH` a multiple of `KVH` and `1 <= len <= CAP`. The heads of one KV group
+    /// are adjacent, so query head `h` reads KV head `h / rep` with `rep = QH / KVH`: the
+    /// queries reshape to `[B, KVH, rep * L, D]`, the scores are `quantized_matmul(q', K,
+    /// transpose = true) * scale`, a causal chunk (`L > 1`) adds a mask aligned to the LAST
+    /// key - query row `t` sees keys `0..len - L + t`, broadcast over the repeats - the softmax
+    /// runs over the last axis in F32 (precise), and the output is `quantized_matmul(probs, V,
+    /// transpose = false)` reshaped back to `[B, QH, L, D]`. All six prefix views are MLX slice
+    /// views with no `mlx_contiguous`, so the capacity buffers are read in place: MLX's
+    /// quantized matmul reads a strided prefix view without copying it (the Mac view-cost test
+    /// measures the peak growth). `group_size` and `bits` must match the quantization of the
+    /// buffers (`bits` is 8 only). The result is F32 for F32 queries, or BF16 after `allow_bf16`
+    /// as the operand promotion goes. A validation failure returns `BadRequest`; a native
+    /// failure follows the resident rule and is terminal.
     #[allow(
         clippy::too_many_arguments,
-        reason = "the packet fixes this signature: len, scale, and causal name the attention, \
+        reason = "len, scale, and causal name the attention, \
                  group_size and bits name the quantization of the buffers"
     )]
     pub fn quantized_attention_prefix(
@@ -1485,14 +1476,13 @@ impl MlxKernels {
     }
 
     /// Runs the FUSED 8-bit KV decode attention over the first `len` positions of QUANTIZED
-    /// capacity buffers (packet FUSED-KV8-a): exactly the semantics of
-    /// [`Self::quantized_attention_prefix`] for one query row (`L = 1`, non-causal), computed
-    /// by one pair of custom Metal kernels instead of two `quantized_matmul` calls and a
-    /// softmax. `queries` is `[1, QH, 1, D]` in F32, or BF16 after `allow_bf16`; `keys` and
-    /// `values` are the three quantized residents of each side over buffers of shape
-    /// `[1, KVH, CAP, ..]`, read through the first `len` positions with the head stride CAP (no
-    /// prefix copy, and no read at or beyond `len`). The output is `[1, QH, 1, D]` in the dtype
-    /// of the queries.
+    /// capacity buffers: exactly the semantics of [`Self::quantized_attention_prefix`] for one
+    /// query row (`L = 1`, non-causal), computed by one pair of custom Metal kernels instead of
+    /// two `quantized_matmul` calls and a softmax. `queries` is `[1, QH, 1, D]` in F32, or BF16
+    /// after `allow_bf16`; `keys` and `values` are the three quantized residents of each side
+    /// over buffers of shape `[1, KVH, CAP, ..]`, read through the first `len` positions with
+    /// the head stride CAP (no prefix copy, and no read at or beyond `len`). The output is `[1,
+    /// QH, 1, D]` in the dtype of the queries.
     ///
     /// Limits of the fused kernel, on top of the composite checks: batch one, exactly one
     /// query row, `bits == 8`, `group_size == 64`, `D` one of 64, 128, or 256 (each of the 32
@@ -1505,11 +1495,10 @@ impl MlxKernels {
     /// No fallback: a failure is a native failure. There is no silent return to the composite
     /// `quantized_attention_prefix`; a validation failure returns `BadRequest` before the first
     /// native call and leaves the adapter usable, and a native failure returns `Backend` with
-    /// label `quantized attention decode` and makes the adapter terminal (decision 0023/0032
-    /// rules).
+    /// label `quantized attention decode` and makes the adapter terminal.
     #[allow(
         clippy::too_many_arguments,
-        reason = "the packet fixes this signature: len and scale name the attention, \
+        reason = "len and scale name the attention, \
                  group_size and bits name the quantization of the buffers"
     )]
     pub fn quantized_attention_decode(
@@ -1536,12 +1525,11 @@ impl MlxKernels {
     /// after `assert_sinks_bf16_exact`, up-cast bit-exactly here).
     /// None omits the float sink; Q8 retains its -1e30 sentinel.
     ///
-    /// ARMED CONTRACT (FIFI_FLINT_MLX_DECODE_ATTN, the default since the
-    /// 2026-10-27 flip): on the vendor-eligible one-row BF16 shape, raw F32
-    /// sinks cost a HOST READBACK and stream sync PER CALL and refuse loudly
-    /// if any value is not BF16-exact; families should store BF16 sinks at
-    /// load (the Flint loader does) to bypass both the readback and the
-    /// refusal risk.
+    /// ARMED CONTRACT (FIFI_FLINT_MLX_DECODE_ATTN, on by default): on the
+    /// vendor-eligible one-row BF16 shape, raw F32 sinks cost a HOST
+    /// READBACK and stream sync PER CALL and refuse loudly if any value is
+    /// not BF16-exact; families should store BF16 sinks at load (the Flint
+    /// loader does) to bypass both the readback and the refusal risk.
     /// Output is [1, Hq, T, D] in query dtype.
     pub fn shared_attention(
         &mut self,
@@ -1639,8 +1627,8 @@ impl MlxKernels {
                 // readback proves every value BF16-exact - non-representable
                 // sinks refuse loudly here instead of rounding silently.
                 // This stays the only F32 entry: the one-row shape that
-                // flash cannot serve (float flash is REP-8, GQA != 8
-                // geometries) keeps an exact executable route.
+                // flash cannot serve (the GQA != 8 geometries, as float
+                // flash serves only GQA 8) keeps an exact executable route.
                 let sink_arg_dtype_ok = req.sinks.is_some_and(|s| s.dtype() == Dtype::Bf16);
                 let decode_vendor = rows == 1
                     && dtype == Dtype::Bf16
@@ -1839,9 +1827,9 @@ impl MlxKernels {
         }
     }
 
-    /// `q8_flash_prefill` (R4-5): the flash prefill attention as ONE fused Metal kernel
-    /// (one thread per query row and head, online softmax in registers, one causal pass
-    /// over the Q8 KV cache with fused dequant). The query arrives UNSCALED and `scale`
+    /// `q8_flash_prefill`: the flash prefill attention as ONE fused Metal kernel (one
+    /// thread per query row and head, online softmax in registers, one causal pass over
+    /// the Q8 KV cache with fused dequant). The query arrives UNSCALED and `scale`
     /// carries 1/sqrt(d); the kernel applies it. `len` is the valid key count including
     /// this chunk (= q_offset + rows). The output is [1, H, rows, D] in the query dtype.
     /// `sinks`: raw sink logits per query head ([1, Hq] F32, NOT QK-scaled - the family
@@ -1851,7 +1839,8 @@ impl MlxKernels {
     /// decode: `BadRequest` on validation, `Backend` on native failure, no fallback.
     #[allow(
         clippy::too_many_arguments,
-        reason = "the decode packet fixes this signature family: len, group_size, and bits                  name the same quantities and q_offset names the chunk position"
+        reason = "the signature family of the decode attention: len, group_size, and bits \
+                 name the same quantities and q_offset names the chunk position"
     )]
     pub fn q8_flash_prefill(
         &mut self,
@@ -1926,8 +1915,8 @@ impl MlxKernels {
         .is_ok()
     }
 
-    /// Runs the gated delta rule of mlx-lm 0.31.0 as one Metal kernel over `T` tokens
-    /// (decision 0050). Every operand is an F32 resident of this adapter.
+    /// Runs the gated delta rule of mlx-lm 0.31.0 as one Metal kernel over `T`
+    /// tokens. Every operand is an F32 resident of this adapter.
     ///
     /// `q` and `k` are `[B, T, Hk, Dk]`. `v` is `[B, T, Hv, Dv]`. `g` (the decay applied to the
     /// state before the write) and `beta` (the write strength) are `[B, T, Hv]`. `state` is
@@ -1952,7 +1941,7 @@ impl MlxKernels {
         Ok(GatedDeltaOutput { y, state })
     }
 
-    /// The flash-delta gated rule (R4-6, `Q36_FLASH_DELTA=1`): the same shapes and contract as
+    /// The flash-delta gated rule (`Q36_FLASH_DELTA=1`): the same shapes and contract as
     /// [`Self::gated_delta`], the chunked WY-form kernel (4.1x) with the same shapes and outputs.
     pub fn flash_delta(
         &mut self,
@@ -1967,7 +1956,7 @@ impl MlxKernels {
         Ok(GatedDeltaOutput { y, state })
     }
 
-    /// The gdn_prep fused kernel (R4-7, `Q36_FUSED_PREFILL=1`): ONE kernel for the whole
+    /// The gdn_prep fused kernel (`Q36_FUSED_PREFILL=1`): ONE kernel for the whole
     /// DeltaNet pre-recurrence chain (causal conv, silu, split, L2, gates, ring).
     #[allow(clippy::too_many_arguments, reason = "the fused kernel contract")]
     pub fn gdn_prep(
@@ -1997,7 +1986,7 @@ impl MlxKernels {
         )
     }
 
-    /// The act_mul fused kernel (R4-7): SwiGLU activation.
+    /// The act_mul fused kernel: SwiGLU activation.
     pub fn act_mul(
         &mut self,
         g_in: &ExecutionTensor,
@@ -2006,7 +1995,7 @@ impl MlxKernels {
         self.context.act_mul(g_in, u_in)
     }
 
-    /// The moe_combine fused kernel (R4-7): the un-sort, gate, choice sum, shared fold, cast.
+    /// The moe_combine fused kernel: the un-sort, gate, choice sum, shared fold, cast.
     #[allow(clippy::too_many_arguments)]
     pub fn moe_combine(
         &mut self,
@@ -2020,7 +2009,7 @@ impl MlxKernels {
         self.context.moe_combine(eo, inverse, gates, so, raw, rows)
     }
 
-    /// The gdn_post fused kernel (R4-7): gated RMS norm and output gate.
+    /// The gdn_post fused kernel: gated RMS norm and output gate.
     pub fn gdn_post(
         &mut self,
         core: &ExecutionTensor,
@@ -2031,7 +2020,7 @@ impl MlxKernels {
         self.context.gdn_post(core, z_in, norm_w, eps)
     }
 
-    /// The attn_gate fused kernel (R4-7): transpose + sigmoid gate + cast.
+    /// The attn_gate fused kernel: transpose + sigmoid gate + cast.
     pub fn attn_gate(
         &mut self,
         att: &ExecutionTensor,
@@ -2040,11 +2029,10 @@ impl MlxKernels {
         self.context.attn_gate(att, qp)
     }
 
-    /// Stage 1 of the compile seam, kept as the measurement probe it was: the gated delta kernel of
-    /// decision 0050 through one `mlx_compile`d closure, so a Mac run can answer whether MLX
-    /// traces the custom kernel and compare the result bit for bit with
-    /// [`MlxKernels::gated_delta`]. Test builds only: no production path calls the probe.
-    /// no production path calls it.
+    /// Stage 1 of the compile seam, kept as the measurement probe it was: the gated delta kernel
+    /// through one `mlx_compile`d closure, so a Mac run can answer whether MLX traces the custom
+    /// kernel and compare the result bit for bit with [`MlxKernels::gated_delta`]. Test builds
+    /// only: no production path calls the probe.
     #[cfg(test)]
     pub(crate) fn compile_probe_gated_delta(
         &mut self,
@@ -2095,11 +2083,10 @@ impl MlxKernels {
             .compile_probe_flint_layer(x, wq, wk, wv, wo, wg, wu, wd, gamma1, gamma2, eps)
     }
 
-    /// One DeltaNet decode step through one `mlx_compile`d closure (packet MX-COMPILE-1a): the
-    /// `qwen36.compile` product seam behind the resident decoder. The closure, its cache key,
-    /// its inputs, its baked constants, its dtype rules, and its no-fallback failure discipline
-    /// are documented on the `Context` method of the same name in
-    /// `kernels/mlx/native/compile.rs`.
+    /// One DeltaNet decode step through one `mlx_compile`d closure: the `qwen36.compile`
+    /// product seam behind the resident decoder. The closure, its cache key, its inputs, its
+    /// baked constants, its dtype rules, and its no-fallback failure discipline are documented
+    /// on the `Context` method of the same name in `kernels/mlx/native/compile.rs`.
     pub(crate) fn compiled_delta_step(
         &mut self,
         args: &native::compile::CompileDeltaArgs<'_>,
@@ -2118,11 +2105,11 @@ impl MlxKernels {
         self.context.compiled_delta_rows(args, extra_states)
     }
 
-    /// One device-routed MoE decode step through one `mlx_compile`d closure (packet
-    /// MX-COMPILE-1a): the `qwen36.compile` product seam behind the resident decoder. The
-    /// closure, its cache key, its inputs, its baked constants, its dtype rules, and its
-    /// no-fallback failure discipline are documented on the `Context` method of the same name
-    /// in `kernels/mlx/native/compile.rs`.
+    /// One device-routed MoE decode step through one `mlx_compile`d closure: the
+    /// `qwen36.compile` product seam behind the resident decoder. The closure, its cache key,
+    /// its inputs, its baked constants, its dtype rules, and its no-fallback failure
+    /// discipline are documented on the `Context` method of the same name in
+    /// `kernels/mlx/native/compile.rs`.
     pub(crate) fn compiled_moe_step(
         &mut self,
         args: &native::compile::CompileMoeArgs<'_>,
@@ -2142,11 +2129,10 @@ impl MlxKernels {
         self.context.flint_compiled_tail(args)
     }
 
-    /// Reads the process-wide production counters of the compiled block calls (packet
-    /// MX-COMPILE-1a): calls, traces (the native closure-body counts), cache hits, and the
-    /// seconds of the first calls per block kind, plus the seam cache clears. The load-time
-    /// warm-up and the teardown clear land here too, so a report separates the one-time compile
-    /// from the steady decode.
+    /// Reads the process-wide production counters of the compiled block calls: calls, traces
+    /// (the native closure-body counts), cache hits, and the seconds of the first calls per
+    /// block kind, plus the seam cache clears. The load-time warm-up and the teardown clear
+    /// land here too, so a report separates the one-time compile from the steady decode.
     pub fn compile_counters(&self) -> compile_stats::Stats {
         compile_stats::read()
     }
@@ -2159,9 +2145,9 @@ impl MlxKernels {
     }
 
     /// Clears the calling thread's MLX compile cache and counts it, so the next block call
-    /// compiles again (packet MX-COMPILE-1a). The measurement harness of the test builds runs it
-    /// between runs; production clears the cache at adapter teardown, on its own path after the
-    /// pending work completed and before the stream and device are released.
+    /// compiles again. The measurement harness of the test builds runs it between runs;
+    /// production clears the cache at adapter teardown, on its own path after the pending work
+    /// completed and before the stream and device are released.
     #[cfg(test)]
     pub(crate) fn clear_compile_cache(&mut self) -> Result<(), EngError> {
         self.context.compile_clear_cache()

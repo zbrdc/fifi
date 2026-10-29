@@ -1,11 +1,10 @@
 /*
- * RD-4d: the step parameter kernels of the resident Qwen3.6 decode step (decision 0047):
+ * The step parameter kernels of the resident Qwen3.6 decode step:
  * step_begin, step_advance and the greedy argmax with token chaining.
  *
  * Per-launch data lives in a small device table, so one captured graph serves every position, and
- * the next input token is written on the device (greedy only, no device sampler, decision 0047
- * item 8). The code
- * is original CUDA C for sm_86 (sm_72 compiles), written from the shapes of this repository.
+ * the next input token is written on the device (greedy only, no device sampler). The code is
+ * original CUDA C for sm_86 (sm_72 compiles), written from the shapes of this repository.
  *
  * Argmax rule. It is the rule of family/sampler.rs::argmax (the largest value, the lowest index
  * on a tie) for every row that Sampler::sample accepts. Sampler::sample first runs check_logits
@@ -27,12 +26,12 @@
  * state is valid and pos + m <= kPosMax, so kv_len == pos + 1 holds after every advance. In any
  * other case it writes -1 into all three words: a word is never clamped to row 0, and the next
  * step_begin reports the poison through the status. The host checks pos + m <= rows before every
- * launch (REPLY-44), so this path is reached only by a corrupt word.
+ * launch, so this path is reached only by a corrupt word.
  *
  * Two launches on one stream: argmax_partial_k (kBlocks blocks of kThreads threads; a
  * grid-stride loop, then one candidate and one flag per block) and argmax_final_k (one block of
  * kBlocks threads, one partial per thread). One block of 1024 threads measured 32 to 33 us
- * against 4.45 us for this shape on the same cold row (STAGE1-KERNELS-PLAN-files).
+ * against 4.45 us for this shape on the same cold row.
  */
 
 #include <cuda_runtime.h>
@@ -164,7 +163,7 @@ __global__ void step_advance_k(inference_cuda_step_params *p, int m) {
     }
     p->pos = (int)((long long)p->pos + add);
     p->kv_len = (int)((long long)p->kv_len + add);
-    p->kv_slot = (int)((long long)p->kv_slot + add);  // kv_slot is reserved and equals pos (REPLY-44)
+    p->kv_slot = (int)((long long)p->kv_slot + add);  // kv_slot is reserved and equals pos
 }
 
 bool aligned_to(const void *p, size_t n) { return ((uintptr_t)p % n) == 0; }

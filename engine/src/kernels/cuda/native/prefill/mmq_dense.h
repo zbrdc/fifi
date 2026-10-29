@@ -1,5 +1,5 @@
-/* CPF-V4 G2: the dense GEMM entry of the vendored-MMQ glue (decision 0049 items 3 and 11; plan
- * section B.4 "G2"). One launch of the vendored `mul_mat_q_case<type>` (mmq.cuh) computes
+/* The dense GEMM entry of the vendored-MMQ glue. One launch of the vendored
+ * `mul_mat_q_case<type>` (mmq.cuh) computes
  *   dst[j*ld + col_off + i] = sum_k w[i][k] * x[j][k]      i < n, j < m
  * from the Native weight blocks (GGUF layout, row-major, read as they lie: the stock loaders)
  * and the q8_1 columns of `inference_cuda_mmq_quantize` (the D4/DS4 scale layout must be the
@@ -12,17 +12,16 @@
  * one sample, zero strides, `stride_row_x = k / qk` blocks, `nrows_dst = ld`, and
  * `dst = base + col_off` so a GEMM can write its slice of a fused [m][ld] destination.
  *
- * Sizing (plan section B.3): w holds n*(k/qk) blocks; y `q8_1_bytes(k, m)` =
+ * Sizing: w holds n*(k/qk) blocks; y `q8_1_bytes(k, m)` =
  * (k/128)*m*144 + 18,432 (the GEMM's y-tile copies may read the pad, never write it); dst
  * ((m-1)*ld + col_off + n) floats; fixup at most nsm*128*128 floats (mmq.cuh:1334-1338),
  * which the Rust wrapper enforces as a floor. The C entry also refuses, as an invalid
  * argument, a fixup range below the exact bytes the launch demands for the tile width it
  * picks on the device it reads (`blocks * J * I` floats, 0 when the launch tiles): the C
- * ABI is a boundary of its own (MSG-85 B2). That rule needs the device facts, so only the
- * launching entry applies it, after the facts query (a CUDA attribute read, the one CUDA call
- * before it) and before anything is enqueued; the vendored require (mmq.cuh:1409) stays as
- * the backstop. Plan section B.0 (c) said a short range reaches that require; since lane C's
- * ruling it meets this refusal first (status -1, not cudaErrorInvalidValue).
+ * ABI is a boundary of its own. That rule needs the device facts, so only the launching entry
+ * applies it, after the facts query (a CUDA attribute read, the one CUDA call before it) and
+ * before anything is enqueued; the vendored require (mmq.cuh:1409) stays as the backstop. A
+ * short range meets this refusal first (status -1, not cudaErrorInvalidValue).
  *
  * Refusals (INFERENCE_CUDA_INVALID_ARGUMENT before any CUDA call; the Rust wrapper mirrors
  * every rule so the native entry cannot latch the backend): a weight type with no dense case

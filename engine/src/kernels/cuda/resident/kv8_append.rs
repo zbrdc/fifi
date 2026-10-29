@@ -1,8 +1,7 @@
-//! Safe launch wrapper of the KV8 append (RD-8k, decision 0047 item 6, seam 1): quantizes the
-//! post-norm, post-rope k rows and the v rows of one step to the frozen 8-bit KV format
-//! (symmetric int8 codes, one fp16 scale per 32 values stored as f16(amax / 127), codes
-//! quantized against the explicitly selected stored-half or unrounded-f32 scale; a group whose
-//! stored scale is 0 stores codes 0) and appends them to the
+//! Safe launch wrapper of the KV8 append: quantizes the post-norm, post-rope k rows and the v rows
+//! of one step to the frozen 8-bit KV format (symmetric int8 codes, one fp16 scale per 32 values
+//! stored as f16(amax / 127), codes quantized against the explicitly selected stored-half or
+//! unrounded-f32 scale; a group whose stored scale is 0 stores codes 0) and appends them to the
 //! code and scale planes of `state_layout.rs` (`codes [kv head][cell][head_dim]`,
 //! `scales [kv head][cell][head_dim / 32]`, `cell = position`, separate arrays for K and V).
 //!

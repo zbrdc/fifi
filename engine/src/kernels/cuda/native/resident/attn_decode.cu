@@ -1,9 +1,9 @@
 /*
- * RD-8b: decode attention of the resident Qwen3.6 decode step (decision 0047).
+ * Decode attention of the resident Qwen3.6 decode step.
  *
  * Split-KV decode attention with a fixed-order combine and a tuned minimum number of keys per
  * split (Flash-Decoding, Dao et al. 2023). The cache layout and the q/gate row layout are those of
- * the vendored attn_prep (xavier-qwen, RD-4V). The code is original CUDA C for
+ * the vendored attn_prep (xavier-qwen). The code is original CUDA C for
  * sm_86 (sm_72 compiles), written from the shapes of this repository.
  *
  * What it computes, per token t of m and query head h (kv head h / G, G = n_head / n_kv_head):
@@ -12,7 +12,7 @@
  * heads. q and the gate come from attn_prep (q after RMSNorm and rope; the gate is the second
  * half of each q row of the projection). Accumulation is f32.
  * Parameters beyond the Qwen3.6 configuration (head 256, gate, linear cache), kept so that a
- * second family needs no rewrite (MEL-A1): head_dim 128 or 256 (template), proj == NULL for no
+ * second family needs no rewrite: head_dim 128 or 256 (template), proj == NULL for no
  * output gate, and window / ring for sliding-window layers: with window W > 0 token t sees only
  * the last min(kv_len + t, W) positions (the key at the query's own position counts as the first of
  * them), and with ring R > 0 (window + m - 1 <= R <= cache_rows) position p lives in cell p % R.

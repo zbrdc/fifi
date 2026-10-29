@@ -1,11 +1,10 @@
-//! The P2 parity test of the canonical sampler reference against the host sampler
-//! (IMPL-DEVSAMPLE-1, Design 1, test M3).
+//! The P2 parity test of the canonical sampler reference against the host sampler.
 //!
 //! Level P2: for one 53-bit unit U (the host draw is `u = U * 2^-53`), the canonical
 //! [`reference_sample`] and the host [`Sampler::pick_with_unit`] must draw the same token.
 //! Greedy cells (temperature 0, `top_k` 1, `top_p` 0) must return exactly the argmax token on
 //! both sides, with no certificate. Every other token mismatch is allowed only when
-//! CERTIFIED as Design 1 defines: the host's own margin at the deciding boundary is at most
+//! CERTIFIED: the host's own margin at the deciding boundary is at most
 //! `s = (keep_max + 4) * (2^-45 + 2^-52 * mass)`. With `top_p < 1` the kept counts must match
 //! unless the difference carries the same certificate; with `top_p = 1` they may differ only
 //! across the vanishing tail. The deciding boundaries of a mismatch are the cumulative
@@ -76,7 +75,7 @@ fn canon_params(temperature: f64, top_p: f64) -> CanonParams {
     derive(temperature, top_p).unwrap_or_else(|error| panic!("valid settings: {error:?}"))
 }
 
-/// The host draw of one cell with a sampler of seed 0, as the packet prescribes.
+/// The host draw of one cell with a sampler of seed 0.
 fn pick(
     logits: &[f32],
     temperature: f64,
@@ -226,7 +225,7 @@ fn host_walk(logits: &[f32], temperature: f64, top_p: f64, top_k: u32, unit: f64
     }
 }
 
-/// Design 1's certificate bound `s = (keep_max + 4) * (2^-45 + 2^-52 * mass)`.
+/// The certificate bound `s = (keep_max + 4) * (2^-45 + 2^-52 * mass)`.
 fn certificate_bound(keep_max: usize, mass: f64) -> f64 {
     (keep_max as f64 + 4.0) * (QUANTUM + f64::EPSILON * mass)
 }
@@ -306,7 +305,7 @@ fn keep_margin(walk: &HostWalk, reference_keep: usize) -> f64 {
 }
 
 /// Whether a `top_p = 1` keep difference spans only the vanishing tail: every host weight
-/// past the smaller keep is either at most one quantum (`2^-45`, the packet's condition) or
+/// past the smaller keep is either at most one quantum (`2^-45`, the base condition) or
 /// is invisible to the host's own f64 walk (adding it leaves the running mass bit-identical,
 /// which is exactly the host's early-exit criterion). The second prong is a deviation the
 /// exact emulation of this very grid forced: a spread row at temperature 1 or 2 totals about
@@ -499,7 +498,7 @@ fn check_exact(
     );
 }
 
-// ---- the row generators of the SAMPLER-FAST grid, copied from the test module of
+// ---- the row generators of the host sampler's test grid, copied from the test module of
 // `family/sampler.rs` (they are private there), so the parity runs on the same rows.
 
 /// Uniform logits in [-8, 8).
@@ -552,7 +551,7 @@ fn cell_seed(tag: u64, size: usize, cell: u64) -> u64 {
     rng.next_u64()
 }
 
-/// The packet's parameter grid: temperature x top_p x top_k (`top_k = n` included).
+/// The parameter grid: temperature x top_p x top_k (`top_k = n` included).
 fn combos(size: usize) -> Vec<(f64, f64, u32)> {
     let mut combos = Vec::new();
     for temperature in [0.05, 0.7, 1.0, 2.0] {
@@ -1231,7 +1230,7 @@ fn a_keep_difference_over_a_visible_weight_does_not_span_the_vanishing_tail() {
     assert!(!spans_vanishing_tail(&walk, 1, &row, 1.0));
 }
 
-// The exhaustive P2 grid: every cell of the packet's grid at both sizes over all six row
+// The exhaustive P2 grid: every cell of the parameter grid at both sizes over all six row
 // generators, 64 draws per cell. The reference full-sorts each row, so the full-size half
 // takes about 10 minutes in release; run it with `--ignored` in a release build.
 #[test]

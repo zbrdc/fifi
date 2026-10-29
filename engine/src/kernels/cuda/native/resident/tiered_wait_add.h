@@ -1,11 +1,11 @@
 /*
- * TCAP C3: launch entry of the tiered wait-add of one layer (native/resident/tiered_wait_add.h, the
+ * Launch entry of the tiered wait-add of one layer (native/resident/tiered_wait_add.h, the
  * per-kernel header of the layout in kernels/cuda/resident/mod.rs; abi_resident.h stays closed).
  * Launch-only: nothing here allocates, copies or synchronizes; a fault in queued work surfaces at the
  * next synchronize. Include after abi.h in C++. Rust mirrors the struct in
- * native/resident/tiered_wait_add.rs. Design: ledger/plans/TCAP-DESIGN.md section 3.2, the device half
- * of the CPU-expert answer; the publisher of the request is tiered_classify (C2) and the host half of
- * the protocol is context/mailbox.rs (C1). The arithmetic is the second moe_combine of the v1 tiered
+ * native/resident/tiered_wait_add.rs. This is the device half of the CPU-expert answer; the
+ * publisher of the request is tiered_classify and the host half of the protocol is
+ * context/mailbox.rs. The arithmetic is the second moe_combine of the v1 tiered
  * block (m 1, top_k 1, weight 1.0), so a served layer is bitwise the v1 step.
  *
  * One block of 256 threads. Thread 0 reads ctrl[0]: when it is 0 (no miss) the kernel writes NOTHING,

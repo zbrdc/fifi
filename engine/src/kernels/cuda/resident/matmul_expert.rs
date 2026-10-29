@@ -1,5 +1,5 @@
 //! The tiled matmul against one expert of a stack, with the expert id read from device memory
-//! when the kernel runs (RD-0b `kern::matmul_expert`, decision 0047, stage 1).
+//! when the kernel runs (`kern::matmul_expert`).
 //!
 //! [`CudaContext::matmul_expert`] queues the vendored kernel on a [`DeviceStream`] and returns
 //! when it is queued. It allocates nothing, copies nothing and never synchronizes; a fault in the
@@ -17,7 +17,7 @@
 //! `y`, which the kernel writes, overlaps neither `xf`, the experts' tiles nor the ids. A refused
 //! call changes nothing.
 //!
-//! The weight type picks the kernel (MEL-C1b): a Q5_0 stack runs the own kernel of
+//! The weight type picks the kernel: a Q5_0 stack runs the own kernel of
 //! `native/resident/matmul_q5_0.cu`, every other type the vendored `matmul_expert`. Q5_0 is a
 //! weight format, not another operation, so the resident step calls this one method whatever the
 //! type. The checks above are shared; only the shape rule differs (`q5_0_shape_ok`: k a multiple

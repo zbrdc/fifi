@@ -1,8 +1,8 @@
 //! Private CPF target row: one m16 body versus sixteen production Int8G32 steps.
 //!
-//! This child of `step.rs` uses private fields and the existing chunk protocol. It does not
-//! open the public KV8 gate or change the Q6_K guard. The comparison is KV8 route equivalence,
-//! not FP16 G-KV8 acceptance, a full-body E3 bound, or a 256-row qualification.
+//! This child of `step.rs` uses private fields and the existing chunk protocol. It does not open
+//! the public KV8 gate or change the Q6_K guard. The comparison is KV8 route equivalence, not KV8
+//! acceptance against FP16, a full-body error bound, or a 256-row qualification.
 
 use super::super::{
     book::Health,
@@ -460,7 +460,7 @@ fn save_rows(
         "schema": "cpf-kv8-target16/2", "model_path": observed.model_path,
         "reference": { "route": "production_run_token", "want_logits": true, "kv_mode": "Int8G32" },
         "candidate": { "route": "private_chunk", "kv_mode": "Int8G32", "tail": "production_final_norm_lm_head_per_row" },
-        "scope": "KV8 route equivalence, NOT FP16 G-KV8, full-body E3, or full256 acceptance",
+        "scope": "KV8 route equivalence, NOT KV8-against-FP16, full-body error-bound, or 256-row acceptance",
         "capture": false, "tiered": false, "layout": "Native",
         "prompt": "P5", "prompt_sha256": PROMPT_SHA256, "canonical_first17_ids": ids,
         "rows": ROWS, "p0": 0, "layers": observed.layers,
@@ -553,7 +553,7 @@ fn inspect_rows(
         "private CPF KV8 target reference=production_run_token_true kv=Int8G32 layout=Native \
          capture=off tiered=off prompt=P5 sha256={PROMPT_SHA256} rows={ROWS} p0=0 layers={} \
          arena_rows={} arena_bytes={} part_bytes={} budget={} state={:?} prefilled={} fed={} \
-         status={} length_word=1; KV8 route equivalence only; no FP16 G-KV8/full-body E3/full256 claim",
+         status={} length_word=1; KV8 route equivalence only; no KV8-against-FP16/full-body error-bound/256-row claim",
         observed.layers,
         observed.arena_rows,
         observed.arena_bytes,
@@ -668,7 +668,7 @@ fn inspect_rows(
         &serde_json::json!({
             "reference": { "route": "production_run_token", "kv_mode": "Int8G32" },
             "candidate": { "route": "private_chunk", "kv_mode": "Int8G32", "kernel_class": format!("{:?}", observed.kernel_class) },
-            "scope": "KV8 route equivalence, NOT FP16 G-KV8 or full256 acceptance",
+            "scope": "KV8 route equivalence, NOT KV8-against-FP16 or 256-row acceptance",
             "rows": row_reports, "top1_agreement": agree, "raw_equal_rows": exact_rows,
             "mean_signed_delta_nll": mean_delta_nll,
             "mean_absolute_delta_nll": sum_abs_delta_nll / ROWS as f64,
@@ -702,7 +702,7 @@ fn private_kv8_m16_all_layer_rows_match_production_p5() {
 }
 
 #[test]
-#[ignore = "full Q36 weights; projection-class diagnostics only, not G-KV8 acceptance"]
+#[ignore = "full Q36 weights; projection-class diagnostics only, not KV8 acceptance"]
 fn private_kv8_m16_projection_kernel_class_diagnostic_p5() {
     if !super::super::native_device_rig::device_present(
         "private_kv8_m16_projection_kernel_class_diagnostic_p5",

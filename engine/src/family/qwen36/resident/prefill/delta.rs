@@ -1,11 +1,11 @@
-//! Batched DeltaNet chunk of the Q36 family (packet Q36-E3; decision 0044 item 2).
+//! Batched DeltaNet chunk of the Q36 family.
 //!
 //! The projections, the causal convolution, the L2 norms, and the gates run once over `[T, ...]`
 //! tensors. The delta-rule recurrence then runs inside `gated_delta_recurrence`, which equals `T`
 //! steps of `delta::step`. The rules are those of `delta.rs`: the output gate is `silu(z)`, and the
 //! query and key norm adds `key_dim * 1e-6` to the sum of squares.
 //!
-//! The activation dtype (packet Q36-BF16-b): the projections over `x` run in the activation
+//! The activation dtype: the projections over `x` run in the activation
 //! dtype, while the recurrence, its state, and the convolution ring stay F32, as the decode step
 //! of `delta.rs` keeps them. `bb` converts to F32 before its sigmoid because the gated delta
 //! kernel takes an F32 `beta`; the query, the key, the value, and the decay meet an F32 constant
@@ -14,9 +14,9 @@
 //!
 //! `gated_delta_recurrence` is the one seam of this file. The normalized query and key, the value,
 //! the write strength `beta`, the decay factor `g`, and the state go in; the readout of every token
-//! and the new state come out. It is one call of the gated delta kernel adapted from mlx-lm 0.31.0
-//! (decision 0050), which loops over the tokens inside the kernel. The recurrent state is
-//! `[VH, VD, KD]`, the layout of the kernel and of the host reference.
+//! and the new state come out. It is one call of the gated delta kernel adapted from mlx-lm 0.31.0,
+//! which loops over the tokens inside the kernel. The recurrent state is `[VH, VD, KD]`, the layout
+//! of the kernel and of the host reference.
 
 use super::super::ops::{Ctx, dim, to_act};
 use super::super::weights::RDelta;
@@ -72,7 +72,7 @@ fn l2_den(
     m.unary(UnaryOp::Sqrt, &sum)
 }
 
-/// Whether the flash-delta gated rule (R4-6) replaces the recurrent kernel. DEFAULT ON
+/// Whether the flash-delta gated rule replaces the recurrent kernel. DEFAULT ON
 /// since the gates passed (cohort: dNLL -0.000281, top-1 98.534%, KL 0.003540; robust
 /// depths: KL 2-4e-6, top-1 8/8; the T >= 16 threshold keeps decode identical): set
 /// `Q36_FLASH_DELTA=0` as the kill switch. The chunked WY-form kernel (4.1x) runs for
@@ -82,16 +82,14 @@ fn flash_delta_enabled() -> bool {
     *ON.get_or_init(|| !std::env::var_os("Q36_FLASH_DELTA").is_some_and(|v| v == "0"))
 }
 
-/// Whether the fused prefill kernels (R4-7) replace the composite ops: set
-/// Default ON (the coordinator-approved ship flip on the gate evidence: every kernel
-/// bit-exact in isolation, all gates green); `Q36_FUSED_PREFILL=0` is the kill switch.
+/// Whether the fused prefill kernels replace the composite ops. Default ON (every kernel is
+/// bit-exact in isolation, and all gates passed); `Q36_FUSED_PREFILL=0` is the kill switch.
 pub(super) fn fused_prefill_enabled() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| std::env::var_os("Q36_FUSED_PREFILL").is_none_or(|v| v != "0"))
 }
 
-/// The gated delta rule over a chunk of `T` tokens as one call of the gated delta kernel
-/// (decision 0050).
+/// The gated delta rule over a chunk of `T` tokens as one call of the gated delta kernel.
 ///
 /// Inputs `GatedInputs`, all lazy F32 (`KH` key heads, `VH` value heads, `VH` a multiple of `KH`):
 /// - `q` and `k`, `[T, KH, KD]`: the query after its L2 norm and the `1 / sqrt(KD)` scale, and the
@@ -205,7 +203,7 @@ pub(super) fn chunk(
     let u = ctx.kernels.qmm(x, &w.qkv)?;
     let z = ctx.kernels.qmm(x, &w.z)?;
     let bb = ctx.kernels.qmm(x, &w.b)?;
-    // Packet Q36-BF16-b, as the decode step of `delta.rs`: the recurrence, its state, and the
+    // As in the decode step of `delta.rs`, the recurrence, its state, and the
     // convolution ring stay F32. `u`, `z`, and `aa` meet an F32 weight or state first and promote
     // on their own. `bb` feeds a sigmoid alone and the gated delta kernel takes F32 `beta`, so it
     // converts here.
@@ -216,8 +214,8 @@ pub(super) fn chunk(
     let sqrt_kd = ctx.consts.sqrt_kd.share();
     let consts = ctx.consts;
     let m = &mut *ctx.kernels;
-    // The fused gdn_prep kernel (R4-7, Q36_FUSED_PREFILL=1) replaces the ~20-op
-    // prep chain with one Metal kernel; the composite stays the default.
+    // The fused gdn_prep kernel (Q36_FUSED_PREFILL=1) replaces the ~20-op prep chain with one Metal
+    // kernel; the composite stays the default.
     let (q, k, v, g, beta, ring_next): (
         ExecutionTensor,
         ExecutionTensor,
@@ -277,8 +275,8 @@ pub(super) fn chunk(
     let (core, state) = gated_delta_recurrence(m, &inputs, rec)?;
     let core = m.reshape(&core, &[rows, vd])?;
     // Output: silu(z) * rms_norm(core, norm). The norm weight applies as stored.
-    // The gdn_post fused kernel (R4-7, Q36_FUSED_PREFILL=1) replaces the
-    // norm+gate chain in one kernel; the composite stays the default.
+    // The gdn_post fused kernel (Q36_FUSED_PREFILL=1) replaces the norm+gate chain in one kernel;
+    // the composite stays the default.
     let o = if fused_prefill_enabled()
         && std::env::var_os("Q36_NO_GDNPOST").is_none()
         && vd == 128
@@ -292,7 +290,7 @@ pub(super) fn chunk(
         let o = m.binary(BinaryOp::Mul, &normed, &gate)?;
         m.reshape(&o, &[t, vw])?
     };
-    // The out-projection takes the activation dtype (packet Q36-BF16-b).
+    // The out-projection takes the activation dtype.
     let o = to_act(ctx, &o)?;
     let out = ctx.kernels.qmm(&o, &w.out)?;
     Ok(DeltaChunk {
@@ -317,7 +315,7 @@ mod tests {
 
     /// Input of position `n`: `x[i] = (((i + 5 n) % 11) - 5) / 160`. The small scale keeps the query
     /// and key sums of squares near the epsilon `D * 1e-6`, so that the epsilon rule changes the
-    /// output by several percent (packet Q36-C2 measured 9 percent of the largest output).
+    /// output by several percent (9 percent of the largest output, measured).
     fn input(n: u32) -> Vec<f32> {
         (0..64u32)
             .map(|i| (((i + 5 * n) % 11) as f32 - 5.0) / 160.0)
@@ -589,12 +587,13 @@ mod tests {
         assert!(out.is_err(), "Hv 3 with Hk 2 must fail the WY envelope");
     }
 
-    /// R4-6: the flash-delta chain (Q36_FLASH_DELTA, the chunked WY-form kernel) matches the
-    /// recurrent kernel within the spike's tolerance bound on the production shape (KH 16,
-    /// VH 32, KD 128, VD 128) with a NON-ZERO initial state, at rows 1, 37, 256, and 1024 -
-    /// including the non-multiple-of-eight tails. The WY form reassociates the math, so the
-    /// outputs differ from the recurrent kernel's by a few e-6 absolute (the spike's
-    /// measured 1.2e-6 on its data; this harness measures 2.4e-6 at rows 37 - the same f32 noise at a different scale; the 5e-6 bound is synthetic-data-only, real acceptance is the cohort KL gate).
+    /// The flash-delta chain (Q36_FLASH_DELTA, the chunked WY-form kernel) matches the recurrent
+    /// kernel within the spike's tolerance bound on the production shape (KH 16, VH 32, KD 128,
+    /// VD 128) with a NON-ZERO initial state, at rows 1, 37, 256, and 1024 - including the
+    /// non-multiple-of-eight tails. The WY form reassociates the math, so the outputs differ from
+    /// the recurrent kernel's by a few e-6 absolute (the spike's measured 1.2e-6 on its data; this
+    /// harness measures 2.4e-6 at rows 37 - the same f32 noise at a different scale; the 5e-6 bound
+    /// is synthetic-data-only, real acceptance is the cohort KL gate).
     #[cfg(all(feature = "native-mlx", target_os = "macos", target_arch = "aarch64"))]
     #[test]
     fn flash_delta_matches_the_recurrent_kernel() {

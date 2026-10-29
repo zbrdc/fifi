@@ -1,8 +1,8 @@
 /*
- * Entries of the vendored MMVQ matvec (MATVEC-PAR S1 c3b) on an explicit stream. Glue only: it
- * fills a fifi_mmvq_args (the V-MV1 host entry's argument set) for the dense one-sample view
- * and validates before any launch; every exported function has C linkage, takes and returns C
- * types only, and wraps its body in try/catch, like the projector adapter.
+ * Entries of the vendored MMVQ matvec on an explicit stream. Glue only: it fills a fifi_mmvq_args
+ * (the vendored host entry's argument set) for the dense one-sample view and validates before any
+ * launch; every exported function has C linkage, takes and returns C types only, and wraps its body
+ * in try/catch, like the projector adapter.
  */
 #include <cuda_runtime.h>
 
@@ -30,8 +30,7 @@ const int64_t kMatrixRowPadding = 512;
 /* The kernel loads the weight rows of one block as a group (rows_per_block: 1, 2, or up to 4 for
  * the small-k launch) and never receives nrows, so a matrix whose row count is not a multiple of
  * the group is read up to 3 rows past its end; the wrappers prove only rows x row_bytes. Limitation
- * until a guarded kernel exists (note for S3): rows must be a multiple of this, as every Qwen3.6
- * shape is. KUBDAN-MSG-64 item 4. */
+ * until a guarded kernel exists: rows must be a multiple of this, as every Qwen3.6 shape is. */
 const int kRowsGroup = 4;
 
 bool aligned(const void *p, size_t alignment) { return (uintptr_t)p % alignment == 0; }
@@ -45,7 +44,7 @@ bool mmvq_type(int type) {
            type == INFERENCE_CUDA_TYPE_Q6_K || type == INFERENCE_CUDA_TYPE_Q8_0;
 }
 
-/* The fifi_device_facts the V-MV1 entry reads (V-3b pattern), queried the device_info.cu way:
+/* The fifi_device_facts the vendored host entry reads, queried the device_info.cu way:
  * no allocation, no sync, no stream work. */
 cudaError_t query_device_facts(fifi_device_facts *out) {
     int device = 0, major = 0, minor = 0, nsm = 0, smpbo = 0;
@@ -157,10 +156,9 @@ extern "C" int inference_cuda_matvec_q_launch(const inference_cuda_matvec_q_args
     }
 }
 
-/* Test support of the seam-1 microbench (MATVEC-PAR S1 test 11): a raw timing event recorded on
- * a stream, the elapsed milliseconds between two of them, and the destroy. The context tree's
- * DeviceEvent carries no elapsed query and stays closed for this packet, so the bench times its
- * queued launches through these three entries. */
+/* Test support of the matvec microbench: a raw timing event recorded on a stream, the elapsed
+ * milliseconds between two of them, and the destroy. The context tree's DeviceEvent carries no
+ * elapsed query, so the bench times its queued launches through these three entries. */
 extern "C" int inference_cuda_event_record_create(void *stream, void **out_event, int *out_stage) {
     try {
         report_stage(out_stage, INFERENCE_CUDA_STAGE_NONE);
@@ -214,7 +212,7 @@ extern "C" int inference_cuda_event_destroy_test(void *event, int *out_stage) {
 }
 
 /* Test support: free and total device memory, so the microbench can skip the 417 MB lm_head
- * shape when the device is nearly full (MATVEC-PAR S1 test 11). */
+ * shape when the device is nearly full. */
 extern "C" int inference_cuda_mem_info(size_t *out_free, size_t *out_total, int *out_stage) {
     try {
         report_stage(out_stage, INFERENCE_CUDA_STAGE_NONE);

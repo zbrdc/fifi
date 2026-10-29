@@ -1,11 +1,11 @@
-//! Raw FFI to the chunked-prefill attention entry of `native/prefill/attn_prefill.cu`
-//! (declared in `native/prefill/attn_prefill.h`), CPF-ATTN-A K2. Child module of
-//! `native/prefill.rs`, so it inherits the `allow(unsafe_code)` of `native.rs`.
+//! Raw FFI to the chunked-prefill attention entry of `native/prefill/attn_prefill.cu` (declared in
+//! `native/prefill/attn_prefill.h`). Child module of `native/prefill.rs`, so it inherits the
+//! `allow(unsafe_code)` of `native.rs`.
 //!
 //! Safety invariants this file relies on:
 //! - The launch entry is called only through `CudaContext::launch_on`, on the thread that
-//!   owns the context and under the dispatch guard (decisions 0023 and 0024). It only
-//!   enqueues the selected phase(s) and returns; the stream is live for the call.
+//!   owns the context and under the dispatch guard. It only enqueues the selected phase(s)
+//!   and returns; the stream is live for the call.
 //! - Every range is a `RawRange`, proved inside a live allocation by `raw_range`. Sizes,
 //!   alignment and disjointness (`super::Span`) are proved again here, on the extents the
 //!   kernels touch, before the call; the C entry repeats the pointer, alignment and shape
@@ -18,10 +18,7 @@
 
 #![cfg_attr(
     not(test),
-    expect(
-        dead_code,
-        reason = "staged for CPF-7, the prefill driver (decision 0049)"
-    )
+    expect(dead_code, reason = "staged for the chunked-prefill driver")
 )]
 
 use core::mem::{align_of, offset_of, size_of};
@@ -31,7 +28,7 @@ use super::{DeviceFailure, RawRange, RawStream, STAGE_NONE, Span, checked, inval
 use crate::kernels::cuda::prefill::attn_prefill::{AttnKvLayout, AttnKvStorage, AttnScalarLayout};
 use crate::tensor::Dtype;
 
-/// The fp16 KV mode of `attn_prefill.h` (the KV8 loader arrives with IMPL-KV8-A).
+/// The fp16 KV mode of `attn_prefill.h` (the KV8 loader arrives with the KV8 cache path).
 pub(in crate::kernels::cuda) const KV_FP16: c_int = 0;
 
 /// Shared tagged-plane ABI; only Q8 affine is submitted through this carrier.
@@ -193,14 +190,14 @@ pub(in crate::kernels::cuda) enum AttnPrefillLaunch {
         part_index: c_int,
     },
     #[cfg(all(test, feature = "cuda-q8-reference"))]
-    /// Same-ELF fixture entry (A ruling 01a18101): the pre-hoist per-element q8 math, so
-    /// tests compare the hoisted kernel against the original byte for byte. Fixture builds
-    /// only (feature `cuda-q8-reference`).
+    /// Same-ELF fixture entry: the pre-hoist per-element q8 math, so tests compare the hoisted
+    /// kernel against the original byte for byte. Fixture builds only (feature
+    /// `cuda-q8-reference`).
     Q8Reference,
     #[cfg(all(test, feature = "cuda-q8-reference"))]
-    /// Same-ELF fixture entry (MF1, Opus bee8b4539): the tiled step-2 kernel — the ONLY
-    /// caller that can reach it; the default launch keeps the old kernel. Fixture builds
-    /// only (feature `cuda-q8-reference`).
+    /// Same-ELF fixture entry: the tiled step-2 kernel — the ONLY caller that can reach it;
+    /// the default launch keeps the old kernel. Fixture builds only (feature
+    /// `cuda-q8-reference`).
     Q8Tiled,
     Combine,
 }
@@ -627,9 +624,9 @@ pub(in crate::kernels::cuda) fn attn_prefill_launch(
     checked(status, stage)
 }
 
-/// Queues the same two kernels with p0 = -1, invalid for both linear and ring positions.
-/// The device re-checks (decision 0049 item 2: no partial, NaN out, mask 8) are under test;
-/// every other rule of the call holds. Qualified fault path only.
+/// Queues the same two kernels with p0 = -1, invalid for both linear and ring positions. The device
+/// re-checks (no partial, NaN out, mask 8) are under test; every other rule of the call holds.
+/// Qualified fault path only.
 #[cfg(all(test, feature = "cuda-fault-qualification"))]
 pub(in crate::kernels::cuda) fn attn_prefill_fault_bad_bounds(
     stream: &RawStream,

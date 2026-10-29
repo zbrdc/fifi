@@ -1,11 +1,10 @@
-//! The `(layer, role) -> tensor name` lookup and the per-kind layer ordinals of the resident step
-//! (REPLY-43 item 7, packet RD-9b).
+//! The `(layer, role) -> tensor name` lookup and the per-kind layer ordinals of the resident step.
 //!
-//! Pure host code. The inventory (lane C) lists every expected tensor with its role and its GGUF
-//! name `blk.<layer>.<suffix>`; this table groups them by layer once, so a launch asks for
+//! Pure host code. The inventory lists every expected tensor with its role and its GGUF name
+//! `blk.<layer>.<suffix>`; this table groups them by layer once, so a launch asks for
 //! `(layer, Role)` and gets the name to look up in `CudaWeights::get`, and for the ordinal of the
-//! layer among the layers of its kind, which is the index of its DeltaNet state or KV planes.
-//! The suffix text stays private to the inventory: the layer number is read from the name prefix.
+//! layer among the layers of its kind, which is the index of its DeltaNet state or KV planes. The
+//! suffix text stays private to the inventory: the layer number is read from the name prefix.
 
 use super::dims::StepDims;
 use crate::{

@@ -1,4 +1,4 @@
-//! Settings of one Flash-Next engine entry in the `enginesrv` config (decision 0026; packet H8c).
+//! Settings of one Flash-Next engine entry in the `enginesrv` config.
 //!
 //! The entry carries `id`, `family`, `model_dir`, `tokenizer_dir`, and `model` (server config) plus
 //! the `flash_next` object, which `FlashOptions` reads. A key that is absent takes its default or

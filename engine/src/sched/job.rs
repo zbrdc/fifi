@@ -32,17 +32,17 @@ pub(crate) struct JobUsage {
     pub(crate) prompt_tokens: u32,
     /// Tokens in the batches that the executor committed, including a final EOS token.
     pub(crate) completion_tokens: u32,
-    /// Prompt tokens served from the saved prefix state (decision 0036, addendum 1). It is 0
-    /// unless the job carries a prefix boundary and the executor restored a saved prefix.
+    /// Prompt tokens served from the saved prefix state. It is 0 unless the job carries a
+    /// prefix boundary and the executor restored a saved prefix.
     pub(crate) reused_tokens: u32,
-    /// The prefix-store report of the job (decision 0036, addendum 2; packet SERVE-2-c item
-    /// 3), taken after the prefill: the store of a job with a prefix boundary, or `None`
-    /// when the executor keeps no prefix report (the default of `ExecutorOps::prefix_report`).
+    /// The prefix-store report of the job, taken after the prefill: the store of a job with a
+    /// prefix boundary, or `None` when the executor keeps no prefix report (the default of
+    /// `ExecutorOps::prefix_report`).
     pub(crate) prefix: Option<PrefixReport>,
 }
 
-/// The kind of the stored prefix entry that a job restored (decision 0036, addendum 2; packet
-/// SERVE-2-c item 3), for the request-log field `prefix_hit`.
+/// The kind of the stored prefix entry that a job restored, for the request-log field
+/// `prefix_hit`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum PrefixHit {
     /// No stored entry matched the prompt.
@@ -53,8 +53,8 @@ pub(crate) enum PrefixHit {
     Periodic,
     /// The job restored a tip entry.
     Tip,
-    /// The job restored a block cut (KV-v1 slice 2): the rolling intermediate entry of the
-    /// lineage, so a rewritten prompt's reuse is distinguishable from a tip's exact extension.
+    /// The job restored a block cut: the rolling intermediate entry of the lineage, so a
+    /// rewritten prompt's reuse is distinguishable from a tip's exact extension.
     Block,
 }
 
@@ -71,7 +71,7 @@ impl PrefixHit {
     }
 }
 
-/// The prefix-hit class of the entry a restore took (fix L5): `Some(kind)` maps to its own
+/// The prefix-hit class of the entry a restore took: `Some(kind)` maps to its own
 /// class and `None` (nothing restored) to `Miss`. The one mapping that the executors share.
 impl From<Option<SaveKind>> for PrefixHit {
     fn from(kind: Option<SaveKind>) -> Self {
@@ -85,9 +85,9 @@ impl From<Option<SaveKind>> for PrefixHit {
     }
 }
 
-/// The prefix-store facts of one job (decision 0036, addendum 2; packet SERVE-2-c item 3):
-/// what the engine's store holds after the job's save points and what the job restored. The
-/// worker takes it after the prefill, before the first decode, and carries it in `JobUsage`.
+/// The prefix-store facts of one job: what the engine's store holds after the job's save points
+/// and what the job restored. The worker takes it after the prefill, before the first decode,
+/// and carries it in `JobUsage`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct PrefixReport {
     /// The entries the store holds after the job's save points, pinned roots and LRU entries
@@ -104,13 +104,13 @@ pub(crate) struct PrefixReport {
     /// that were shared with a stored key but not covered by a checkpoint. It is 0 when the
     /// longest stored key equals the restored prefix.
     pub(crate) uncached_shared: u32,
-    /// The shadow block-LCP observation of the job's lookup (KV-v1 slice 1), or `None` when
-    /// the shadow stayed off. It rides beside the restore facts: what a block-granular
-    /// restore could have used, for the request log.
+    /// The shadow block-LCP observation of the job's lookup, or `None` when the shadow stayed
+    /// off. It rides beside the restore facts: what a block-granular restore could have used,
+    /// for the request log.
     pub(crate) shadow: Option<crate::family::session::ShadowLcp>,
-    /// SF1 attribution: candidates the store dropped after an adoption `MemoryPlan`
+    /// Restore attribution: candidates the store dropped after an adoption `MemoryPlan`
     /// denial, and entries spent by the radix-order eviction. Zero on executors without
-    /// a store - and the CUDA path reports 0 by design: its store still runs the SF1
+    /// a store - and the CUDA path reports 0 by design: its store still runs the adoption
     /// retry, but it does not surface the counters into its report. LIFETIME store totals, never
     /// reset. Each request line carries ONE sample, taken right after the request's own (last)
     /// restore on the batch worker and after its prefill on the single worker; lines are written
@@ -125,9 +125,9 @@ pub(crate) struct PrefixReport {
     /// the anchor.
     pub(crate) restore_drops: u32,
     pub(crate) evictions: u32,
-    /// B2 attribution: the store's save-side lifetime totals (room churn, refusals,
+    /// Save attribution: the store's save-side lifetime totals (room churn, refusals,
     /// duplicate uses, block rolls, in-place replaces). Zero on executors without a
-    /// store. The same one-sample-per-request-line attribution rule as the SF1 pair;
+    /// store. The same one-sample-per-request-line attribution rule as the restore pair;
     /// `save_side.room_removals` is the churn `evictions` cannot see - a store can lose
     /// every mark of a lineage to other saves' room pressure while reporting
     /// `evictions` 0.
@@ -227,11 +227,10 @@ impl Job {
         Ok(self)
     }
 
-    /// Marks the first `root` prompt tokens as the root save point of decision 0036, addendum
-    /// 2: the engine saves them as a pinned root after prefilling them. A root needs a prefix
-    /// boundary first (`with_prefix_boundary`) and must lie inside it: `0 < root <
-    /// prefix_boundary`. The 2,048-token minimum of the decision is the worker's rule, not the
-    /// job's.
+    /// Marks the first `root` prompt tokens as the root save point: the engine saves them as a
+    /// pinned root after prefilling them. A root needs a prefix boundary first
+    /// (`with_prefix_boundary`) and must lie inside it: `0 < root < prefix_boundary`. The
+    /// 2,048-token minimum of a root is the worker's rule, not the job's.
     pub(crate) fn with_root_boundary(mut self, root: usize) -> Result<Job, EngError> {
         let Some(boundary) = self.prefix_boundary else {
             return Err(EngError::BadRequest(
@@ -324,7 +323,7 @@ mod tests {
     }
 
     /// The default report of an executor that keeps no prefix state is all zero with a `Miss`,
-    /// and each hit kind carries its request-log name (packet SERVE-2-c item 3).
+    /// and each hit kind carries its request-log name.
     #[test]
     fn a_default_prefix_report_is_all_zero_with_a_miss_and_the_hits_have_names() {
         assert_eq!(
@@ -352,7 +351,7 @@ mod tests {
         }
     }
 
-    /// The `From` mapping of the restored kind (fix L5): every `SaveKind` names its own class
+    /// The `From` mapping of the restored kind: every `SaveKind` names its own class
     /// and `None` names a `Miss`. The `Periodic` row is the one no other test reaches, because
     /// the store-level tests restore roots and tips only.
     ///

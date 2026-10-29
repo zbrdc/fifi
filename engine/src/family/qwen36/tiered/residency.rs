@@ -1,12 +1,11 @@
-//! The residency tables of the expert bank slots (OFF-2 C1).
+//! The residency tables of the expert bank slots.
 //!
 //! WHAT: the generation/ledger protocol of the per-layer VRAM banks. A slot walks
 //! `Free -> Filling -> Ready -> Published -> Draining -> Free`, with `Poisoned` as
 //! the dead end of a fill that missed its deadline. WHY: the GPU fill and the CPU
 //! serve run asynchronously, and a stale read of a swapped expert corrupts the
 //! decode; the per-slot generations make every lookup self-verifying. Events are
-//! plain ids and time arrives as a parameter. Driven by `TieredHost`
-//! (OFF-2 D4/D5).
+//! plain ids and time arrives as a parameter. Driven by `TieredHost`.
 
 use super::TieredConfig;
 

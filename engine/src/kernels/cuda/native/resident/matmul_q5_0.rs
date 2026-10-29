@@ -1,6 +1,6 @@
 //! Raw FFI to the Q5_0 decode matmul entries of `native/resident/matmul_q5_0.cu` (declared in
-//! `native/resident/matmul_q5_0.h`, MEL-C1b). Child of `native::resident`, so it inherits the
-//! `allow(unsafe_code)` of `native.rs` (decision 0047, child modules of `native.rs`).
+//! `native/resident/matmul_q5_0.h`). Child of `native::resident`, so it inherits the
+//! `allow(unsafe_code)` of `native.rs`.
 //!
 //! Safety invariants this module relies on:
 //! - A device range is proved in bounds by `RawRange::new` (or a `DeviceView` check) before it
@@ -17,8 +17,7 @@
 //!   synchronizes the whole device before `cudaFree`.
 //! - The launch entries only queue work on the stream they are given and return the launch status;
 //!   a fault in the kernel surfaces at the next synchronize.
-//! - Every call runs under the process dispatch guard and on the thread that owns the context
-//!   (decisions 0023 and 0024).
+//! - Every call runs under the process dispatch guard and on the thread that owns the context.
 //! - No raw pointer and no unsafe function leaves this module.
 
 use std::ffi::{c_int, c_void};
@@ -43,7 +42,7 @@ unsafe extern "C" {
     #[link_name = "inference_cuda_matmul_expert_q5_0_launch"]
     #[allow(
         clippy::too_many_arguments,
-        reason = "mirrors the C declaration in matmul_q5_0.h, which mirrors the RD-0b expert entry"
+        reason = "mirrors the C declaration in matmul_q5_0.h, which mirrors the matmul_expert entry"
     )]
     fn matmul_expert_q5_0_launch_raw(
         m: c_int,

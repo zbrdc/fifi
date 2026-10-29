@@ -1,8 +1,7 @@
-//! Native tests of the fused 8-bit KV decode attention (packet FUSED-KV8-a):
-//! `quantized_attention_decode` against the composite `quantized_attention_prefix` and the
-//! dequantized `grouped_attention` oracle, the poisoned tail beyond `len`, the block
-//! partition of `decode_blocks`, the decision 0032 fault hooks, and the peak-memory bound of
-//! one call.
+//! Native tests of the fused 8-bit KV decode attention: `quantized_attention_decode`
+//! against the composite `quantized_attention_prefix` and the dequantized
+//! `grouped_attention` oracle, the poisoned tail beyond `len`, the block partition of
+//! `decode_blocks`, the injected-fault hooks, and the peak-memory bound of one call.
 
 #![cfg(all(feature = "native-mlx", target_os = "macos", target_arch = "aarch64"))]
 
@@ -289,22 +288,20 @@ fn query_value() -> impl Fn(usize) -> f32 {
     move |index| (((index % 7) as f32) - 3.0) / 4.0
 }
 
-/// The F32 tolerance of the fused output against a reference (packet FUSED-KV8-a test a,
-/// derived here): the fused kernel and the
-/// reference see the SAME F32 dequantized values (the codes are integers and the scales and
-/// biases widen to F32 exactly), so only the F32 accumulation order differs. The score dot
-/// over D <= 256 lanes with partial sums bounded by about 8 wanders by
+/// The F32 tolerance of the fused output against a reference (derived here): the fused
+/// kernel and the reference see the SAME F32 dequantized values (the codes are integers and
+/// the scales and biases widen to F32 exactly), so only the F32 accumulation order differs.
+/// The score dot over D <= 256 lanes with partial sums bounded by about 8 wanders by
 /// sqrt(256) · 2^-24 · 8 ≈ 8e-6; the softmax turns a score error eps into a probability
 /// error of at most 2 · eps · p; the value mix over len <= 131,072 keys runs through the
-/// online-softmax rescaling and the block merges, an effective depth of about
-/// sqrt(len) · 2^-24 · |v| ≈ 362 · 6e-8 · 8.25 ≈ 1.8e-4 at the longest sweep (the outlier
-/// rows reach |v| = 8.25 with the head offsets). The total stays under 2e-4, an order of
-/// magnitude below the asserted bounds:
-/// `F32_ORACLE_TOL` = 2e-3 against the dequantized oracle and `F32_COMPOSITE_TOL` = 5e-3
-/// against the composite, whose `quantized_matmul` accumulates in yet another order, each as
-/// atol and rtol (`tol · max(1, |reference|)`). A real failure - a wrong code byte order,
-/// group index, block merge, or length overrun - moves outputs by O(0.1..1) or produces NaN,
-/// far beyond both bounds.
+/// online-softmax rescaling and the block merges, an effective depth of about sqrt(len) ·
+/// 2^-24 · |v| ≈ 362 · 6e-8 · 8.25 ≈ 1.8e-4 at the longest sweep (the outlier rows reach
+/// |v| = 8.25 with the head offsets). The total stays under 2e-4, an order of magnitude
+/// below the asserted bounds: `F32_ORACLE_TOL` = 2e-3 against the dequantized oracle and
+/// `F32_COMPOSITE_TOL` = 5e-3 against the composite, whose `quantized_matmul` accumulates
+/// in yet another order, each as atol and rtol (`tol · max(1, |reference|)`). A real
+/// failure - a wrong code byte order, group index, block merge, or length overrun - moves
+/// outputs by O(0.1..1) or produces NaN, far beyond both bounds.
 const F32_ORACLE_TOL: f32 = 2e-3;
 const F32_COMPOSITE_TOL: f32 = 5e-3;
 
@@ -325,12 +322,12 @@ fn bf16_tolerance(row: &[f32]) -> f32 {
     (4.0 * magnitude / 128.0).max(F32_ORACLE_TOL)
 }
 
-/// Runs one accuracy case (packet FUSED-KV8-a test a): the fused output against the composite
-/// `quantized_attention_prefix` (L = 1, non-causal) and against `grouped_attention` over the
-/// dequantized prefix on the same quantized buffers, printing the maximum observed error of
-/// every comparison and, on a `q8-decode-gap` line, the observed KV-head gap with its
-/// guard. Every compared value must be finite: a NaN never exceeds a tolerance bound, so
-/// the explicit finiteness assert is what catches one.
+/// Runs one accuracy case: the fused output against the composite
+/// `quantized_attention_prefix` (L = 1, non-causal) and against `grouped_attention` over
+/// the dequantized prefix on the same quantized buffers, printing the maximum observed
+/// error of every comparison and, on a `q8-decode-gap` line, the observed KV-head gap with
+/// its guard. Every compared value must be finite: a NaN never exceeds a tolerance bound,
+/// so the explicit finiteness assert is what catches one.
 fn check_decode_case(
     kernels: &mut MlxKernels,
     (heads, kv_heads, width): (u32, u32, u32),
@@ -525,17 +522,17 @@ fn check_decode_case(
     }
 }
 
-/// The fused output against BOTH references on the same quantized buffers (packet
-/// FUSED-KV8-a test a): the composite `quantized_attention_prefix` with `L = 1` and
-/// non-causal, and `grouped_attention` over the dequantized prefix as the independent
-/// oracle. Configs QH/KVH/D = 16/2/256 (the real model, REP 8) and 4/2/64 (the test shape,
-/// REP 2), group 64, lengths 1, 2, 63, 64, 65, 255, 256, 257, 4,095, 4,096, and 32,768 at
-/// capacity 32,768, F32 and BF16 queries, normal rows and rows with one outlier group -
-/// every comparison runs both, because only the outlier rows make a wrong bias or scale
-/// visible - plus one capacity-131,072 run at len 131,072 in each dtype with both row kinds
-/// (the deep run is where the 256/128-block tier applies). The tolerances are derived in
-/// the docs of [`F32_ORACLE_TOL`] and [`bf16_tolerance`], and every comparison prints its
-/// observed maximum error and largest output magnitude on one `q8-decode-error` line.
+/// The fused output against BOTH references on the same quantized buffers (the accuracy
+/// test): the composite `quantized_attention_prefix` with `L = 1` and non-causal, and
+/// `grouped_attention` over the dequantized prefix as the independent oracle. Configs
+/// QH/KVH/D = 16/2/256 (the real model, REP 8) and 4/2/64 (the test shape, REP 2), group
+/// 64, lengths 1, 2, 63, 64, 65, 255, 256, 257, 4,095, 4,096, and 32,768 at capacity
+/// 32,768, F32 and BF16 queries, normal rows and rows with one outlier group - every
+/// comparison runs both, because only the outlier rows make a wrong bias or scale visible -
+/// plus one capacity-131,072 run at len 131,072 in each dtype with both row kinds (the deep
+/// run is where the 256/128-block tier applies). The tolerances are derived in the docs of
+/// [`F32_ORACLE_TOL`] and [`bf16_tolerance`], and every comparison prints its observed
+/// maximum error and largest output magnitude on one `q8-decode-error` line.
 #[test]
 fn quantized_attention_decode_matches_the_composite_and_the_dequantized_oracle() {
     let _serial = GPU_TEST.lock().unwrap_or_else(|poison| poison.into_inner());
@@ -579,14 +576,14 @@ fn quantized_attention_decode_matches_the_composite_and_the_dequantized_oracle()
     }
 }
 
-/// The buffer tail beyond `len` never feeds the output (packet FUSED-KV8-a test b): with
-/// all-ones codes and NaN scales and biases at every position `t >= len`, the output stays
-/// finite and equals, value for value, the run over buffers whose tail is zero - the kernel
-/// reads only `t < len`. Two geometries: the small one (QH 4 over KVH 2, D 64) at len 1001
-/// of capacity 1024, and the real-model one (QH 16 over KVH 2, D 256, REP 8) at len 1001
-/// AND len 1000 - the block size is 8 and divides 1000 but not 1001, so a partial final
-/// block and empty tail blocks both occur - in F32 and BF16. A read past `len` would pull a
-/// NaN scale into a score and surface as NaN or a shifted value, far beyond the equality.
+/// The buffer tail beyond `len` never feeds the output: with all-ones codes and NaN scales
+/// and biases at every position `t >= len`, the output stays finite and equals, value for
+/// value, the run over buffers whose tail is zero - the kernel reads only `t < len`. Two
+/// geometries: the small one (QH 4 over KVH 2, D 64) at len 1001 of capacity 1024, and the
+/// real-model one (QH 16 over KVH 2, D 256, REP 8) at len 1001 AND len 1000 - the block
+/// size is 8 and divides 1000 but not 1001, so a partial final block and empty tail blocks
+/// both occur - in F32 and BF16. A read past `len` would pull a NaN scale into a score and
+/// surface as NaN or a shifted value, far beyond the equality.
 #[test]
 fn quantized_attention_decode_never_reads_beyond_len() {
     let _serial = GPU_TEST.lock().unwrap_or_else(|poison| poison.into_inner());
@@ -709,14 +706,14 @@ fn quantized_attention_decode_never_reads_beyond_len() {
     }
 }
 
-/// The block partition (packet FUSED-KV8-a test c): lengths that straddle the thresholds of
-/// `decode_blocks` - 8,192 (the last 64-block length), 8,193 and 32,768 (the 128-block tier
-/// for REP 8, 64 blocks for REP 2), and 32,769 (the 256-block tier, 128 for REP 2) at
-/// capacity 33,024, plus len 5 where `NB = len` for REP 8 - against the dequantized oracle,
-/// so every block-count branch and the merge run for both REP 8 (QH 16 over KVH 2, D 256)
-/// and REP 2 (4 over 2, D 64), with normal AND outlier
-/// rows: only the outlier rows make a wrong bias or scale visible at these block tiers. The
-/// tolerance is the derived F32 oracle bound of test a.
+/// The block partition: lengths that straddle the thresholds of `decode_blocks` - 8,192
+/// (the last 64-block length), 8,193 and 32,768 (the 128-block tier for REP 8, 64 blocks
+/// for REP 2), and 32,769 (the 256-block tier, 128 for REP 2) at capacity 33,024, plus len
+/// 5 where `NB = len` for REP 8 - against the dequantized oracle, so every block-count
+/// branch and the merge run for both REP 8 (QH 16 over KVH 2, D 256) and REP 2 (4 over 2, D
+/// 64), with normal AND outlier rows: only the outlier rows make a wrong bias or scale
+/// visible at these block tiers. The tolerance is the derived F32 oracle bound of the
+/// accuracy test.
 #[test]
 fn quantized_attention_decode_partitions_straddle_the_block_thresholds() {
     let _serial = GPU_TEST.lock().unwrap_or_else(|poison| poison.into_inner());
@@ -740,12 +737,12 @@ fn quantized_attention_decode_partitions_straddle_the_block_thresholds() {
     }
 }
 
-/// The small-repeat geometries (packet FUSED-KV8-a): (QH, KVH, D) = (2, 2, 64)
-/// with REP 1, (8, 2, 128) with REP 4, and (6, 2, 64) with REP 3, at len 100 and 1001 of
-/// capacity 1024 - both a length the block size divides (100 = 12 blocks of 8 plus a block
-/// of 4) and one it does not (1001) - F32 and BF16 queries, normal and outlier rows, against
-/// the dequantized oracle (and the composite): the repeat range the shape check admits below
-/// the REP 8 of the real model, including the D 128 head dim.
+/// The small-repeat geometries: (QH, KVH, D) = (2, 2, 64) with REP 1, (8, 2, 128) with REP
+/// 4, and (6, 2, 64) with REP 3, at len 100 and 1001 of capacity 1024 - both a length the
+/// block size divides (100 = 12 blocks of 8 plus a block of 4) and one it does not (1001) -
+/// F32 and BF16 queries, normal and outlier rows, against the dequantized oracle (and the
+/// composite): the repeat range the shape check admits below the REP 8 of the real model,
+/// including the D 128 head dim.
 #[test]
 fn quantized_attention_decode_covers_the_small_repeat_geometries() {
     let _serial = GPU_TEST.lock().unwrap_or_else(|poison| poison.into_inner());
@@ -770,17 +767,17 @@ fn quantized_attention_decode_covers_the_small_repeat_geometries() {
     }
 }
 
-/// Every repeat of the layout under the R4 partition (packet FUSED-KV8-EFF-2 test a):
-/// REP 1 through 8 - here QH = 2 · REP over KVH 2 at D 64 - at the lengths 1 (one block),
-/// 130 (NB 64 with twenty EMPTY tail blocks), 8,192 (the last 64-block length), and
-/// 32,768 (the 128-block tier), against the composite `quantized_attention_prefix` and
-/// the dequantized oracle with the tolerances of test a of FUSED-KV8-a, F32 and BF16
-/// queries, normal and outlier rows. The partition differs per repeat - RPH 4 with SGS 2
-/// at REP 8, RPH 3 with SGS 2 at REP 6, RPH = REP with SGS 1 at REP 1, 2, 3, and 4, RPH 1
-/// with SGS 5 and 7 at the primes - so a head range, a simdgroup stride, or a launch row
-/// that is wrong at exactly one repeat shows here. The sweep runs at D 64 (one quantization
-/// group per row); test a covers D 256 at REP 8 and REP 2, and the group indexing of a
-/// lane does not depend on the simdgroup, so the other repeats are not repeated at D 256.
+/// Every repeat of the layout under the RPH/SGS partition of the query heads: REP 1 through
+/// 8 - here QH = 2 · REP over KVH 2 at D 64 - at the lengths 1 (one block), 130 (NB 64 with
+/// twenty EMPTY tail blocks), 8,192 (the last 64-block length), and 32,768 (the 128-block
+/// tier), against the composite `quantized_attention_prefix` and the dequantized oracle
+/// with the tolerances of the accuracy test, F32 and BF16 queries, normal and outlier rows.
+/// The partition differs per repeat - RPH 4 with SGS 2 at REP 8, RPH 3 with SGS 2 at REP 6,
+/// RPH = REP with SGS 1 at REP 1, 2, 3, and 4, RPH 1 with SGS 5 and 7 at the primes - so a
+/// head range, a simdgroup stride, or a launch row that is wrong at exactly one repeat
+/// shows here. The sweep runs at D 64 (one quantization group per row); the accuracy test
+/// covers D 256 at REP 8 and REP 2, and the group indexing of a lane does not depend on the
+/// simdgroup, so the other repeats are not repeated at D 256.
 #[test]
 fn quantized_attention_decode_covers_every_repeat_of_the_r4_partition() {
     let _serial = GPU_TEST.lock().unwrap_or_else(|poison| poison.into_inner());
@@ -795,11 +792,11 @@ fn quantized_attention_decode_covers_every_repeat_of_the_r4_partition() {
     }
 }
 
-/// The deep tier of the R4 partition on the real shape (packet FUSED-KV8-EFF-2 test b):
-/// REP 8 at 131,072 keys with QH 16 over KVH 2 at D 256, the tier where `decode_blocks`
-/// gives NB 256 and pass 1 runs 512 threadgroups (256 block rows over 2 KV heads) of two
-/// simdgroups over the same blocks, against the composite and the dequantized oracle, F32
-/// and BF16 queries, normal and outlier rows, the tolerances of test a of FUSED-KV8-a.
+/// The deep tier of the RPH/SGS partition on the real shape: REP 8 at 131,072 keys with QH
+/// 16 over KVH 2 at D 256, the tier where `decode_blocks` gives NB 256 and pass 1 runs 512
+/// threadgroups (256 block rows over 2 KV heads) of two simdgroups over the same blocks,
+/// against the composite and the dequantized oracle, F32 and BF16 queries, normal and
+/// outlier rows, the tolerances of the accuracy test.
 #[test]
 fn quantized_attention_decode_rep8_deep_context_matches_the_references() {
     let _serial = GPU_TEST.lock().unwrap_or_else(|poison| poison.into_inner());
@@ -819,13 +816,12 @@ fn quantized_attention_decode_rep8_deep_context_matches_the_references() {
     }
 }
 
-/// The empty tail blocks of the new partition (packet FUSED-KV8-EFF-2 test c): len 130
-/// gives NB 64 and a block size of 3, so blocks 44 to 63 hold no key and pass 1 writes
-/// them the EMPTY partial - max -FLT_MAX, sum 0, zeros - that pass 2 must weight by
-/// `exp(-FLT_MAX - m*) = 0`. Both partitions at once: REP 8 on the real shape (RPH 4,
-/// SGS 2, D 256) and REP 4 (RPH 4, SGS 1, D 64), F32 and BF16 queries, normal and outlier
-/// rows, against both references at capacity 1024; the poisoned-tail test covers the same
-/// rule at len 1001.
+/// The empty tail blocks of the partition: len 130 gives NB 64 and a block size of 3, so
+/// blocks 44 to 63 hold no key and pass 1 writes them the EMPTY partial - max -FLT_MAX, sum
+/// 0, zeros - that pass 2 must weight by `exp(-FLT_MAX - m*) = 0`. Both partitions at once:
+/// REP 8 on the real shape (RPH 4, SGS 2, D 256) and REP 4 (RPH 4, SGS 1, D 64), F32 and
+/// BF16 queries, normal and outlier rows, against both references at capacity 1024; the
+/// poisoned-tail test covers the same rule at len 1001.
 #[test]
 fn quantized_attention_decode_merges_the_empty_tail_blocks() {
     let _serial = GPU_TEST.lock().unwrap_or_else(|poison| poison.into_inner());
@@ -1012,17 +1008,15 @@ fn quantized_attention_decode_survives_large_scores() {
     }
 }
 
-/// The peak growth of one call (packet FUSED-KV8-a test e, at the block tier of packet
-/// FUSED-KV8-EFF-2): at capacity 32,768 and len 32,768 with QH 16 over KVH 2 and D 256,
-/// the block count is 128 and the call's scratch is the F32 partials `po` [16, 128, 256]
-/// = 2,097,152 bytes plus `psum` and `pmax` [16, 128] = 8,192 bytes each, 2,113,536 bytes
-/// in all, and the output [1, 16, 1, 256] is 16,384 bytes. The asserted bound is the
-/// partials' total plus 1 MiB = 3,162,112 bytes: the
-/// call reads the quantized buffers in place (no F32 prefix is built) and copies nothing
-/// else, so a growth past the bound would mean a hidden copy of the prefix or of the
-/// partials. The six buffers and the query are evaluated before the measurement, so the
-/// measured call does not also materialize the quantization (the lesson of the KV8-OPS
-/// view-cost test).
+/// The peak growth of one call: at capacity 32,768 and len 32,768 with QH 16 over KVH 2 and
+/// D 256, the block count is 128 and the call's scratch is the F32 partials `po` [16, 128,
+/// 256] = 2,097,152 bytes plus `psum` and `pmax` [16, 128] = 8,192 bytes each, 2,113,536
+/// bytes in all, and the output [1, 16, 1, 256] is 16,384 bytes. The asserted bound is the
+/// partials' total plus 1 MiB = 3,162,112 bytes: the call reads the quantized buffers in
+/// place (no F32 prefix is built) and copies nothing else, so a growth past the bound would
+/// mean a hidden copy of the prefix or of the partials. The six buffers and the query are
+/// evaluated before the measurement, so the measured call does not also materialize the
+/// quantization (the lesson of the 8-bit prefix view-cost test).
 #[test]
 fn quantized_attention_decode_peak_growth_stays_below_the_partials_plus_1mib() {
     let _serial = GPU_TEST.lock().unwrap_or_else(|poison| poison.into_inner());
@@ -1108,8 +1102,8 @@ fn quantized_attention_decode_peak_growth_stays_below_the_partials_plus_1mib() {
     );
 }
 
-/// The operands of the negative tests below (packet FUSED-KV8-a): a small pair
-/// of capacity 64 at width 64, F32 scales, head-dependent rows, and an F32 query.
+/// The operands of the negative tests below: a small pair of capacity 64 at width 64, F32
+/// scales, head-dependent rows, and an F32 query.
 fn negative_case(
     kernels: &mut MlxKernels,
 ) -> (
@@ -1140,9 +1134,9 @@ fn negative_case(
     (query, keys, values)
 }
 
-/// An operand that belongs to another adapter is refused before any native call (packet
-/// FUSED-KV8-a), and the refusal leaves the adapter usable: a valid decode on the
-/// same adapter right after it succeeds.
+/// An operand that belongs to another adapter is refused before any native call, and the
+/// refusal leaves the adapter usable: a valid decode on the same adapter right after it
+/// succeeds.
 #[test]
 fn quantized_attention_decode_refuses_an_operand_of_another_adapter() {
     let _serial = GPU_TEST.lock().unwrap_or_else(|poison| poison.into_inner());
@@ -1189,9 +1183,8 @@ fn quantized_attention_decode_refuses_an_operand_of_another_adapter() {
     assert_finite_readback(&mut kernels, Dtype::F32, &got);
 }
 
-/// BF16 queries are refused while the adapter has not enabled `allow_bf16` (packet
-/// FUSED-KV8-a), and the refusal leaves the adapter usable: after `allow_bf16`
-/// the SAME call succeeds and returns BF16.
+/// BF16 queries are refused while the adapter has not enabled `allow_bf16`, and the refusal
+/// leaves the adapter usable: after `allow_bf16` the SAME call succeeds and returns BF16.
 #[test]
 fn quantized_attention_decode_refuses_bf16_queries_until_allow_bf16() {
     let _serial = GPU_TEST.lock().unwrap_or_else(|poison| poison.into_inner());
@@ -1242,13 +1235,13 @@ fn quantized_attention_decode_refuses_bf16_queries_until_allow_bf16() {
     assert_finite_readback(&mut kernels, Dtype::Bf16, &got);
 }
 
-/// `supports_quantized_attention_decode` says what the operation accepts, with no native call
-/// and no state change (packet FUSED-KV8-b): the decoder chooses between the fused kernel and
-/// the composite by this predicate, so it must agree with the operation on every shape it can
-/// be asked about. The supported geometry (4 query heads over 2 KV heads, D 64, group 64, 8
-/// bits, `len` inside the capacity) gives true and the operation succeeds; a length of 0, a
-/// length above the capacity, bits 4, and group 32 give false and the operation refuses with
-/// `BadRequest`; a D of 96 (not a multiple of 64) gives false.
+/// `supports_quantized_attention_decode` says what the operation accepts, with no native
+/// call and no state change: the decoder chooses between the fused kernel and the composite
+/// by this predicate, so it must agree with the operation on every shape it can be asked
+/// about. The supported geometry (4 query heads over 2 KV heads, D 64, group 64, 8 bits,
+/// `len` inside the capacity) gives true and the operation succeeds; a length of 0, a
+/// length above the capacity, bits 4, and group 32 give false and the operation refuses
+/// with `BadRequest`; a D of 96 (not a multiple of 64) gives false.
 #[test]
 fn supports_quantized_attention_decode_agrees_with_the_operation() {
     let _serial = GPU_TEST.lock().unwrap_or_else(|poison| poison.into_inner());
@@ -1327,8 +1320,8 @@ fn supports_quantized_attention_decode_agrees_with_the_operation() {
     assert_finite_readback(&mut kernels, Dtype::F32, &got);
 }
 
-/// A `scale` of zero and a negative scale are refused (packet FUSED-KV8-a), and
-/// each refusal leaves the adapter usable: the same call with a positive scale succeeds.
+/// A `scale` of zero and a negative scale are refused, and each refusal leaves the adapter
+/// usable: the same call with a positive scale succeeds.
 #[test]
 fn quantized_attention_decode_refuses_nonpositive_scale() {
     let _serial = GPU_TEST.lock().unwrap_or_else(|poison| poison.into_inner());
@@ -1372,14 +1365,13 @@ fn quantized_attention_decode_refuses_nonpositive_scale() {
     assert_finite_readback(&mut kernels, Dtype::F32, &got);
 }
 
-/// Mixed float dtypes follow the documented rule of `shape::quantized_kv_operands` (packet
-/// FUSED-KV8-a): the queries and the four scale and bias residents are each F32,
-/// or BF16 after `allow_bf16` - INDEPENDENTLY, so an F32 query over BF16 scales and a BF16
-/// query over F32 scales are both accepted - while the codes stay U32 and the scale and bias
-/// dtypes must agree within each side and across the two sides. The test asserts exactly
-/// that rule: the two mixed pairs decode, a keys side of BF16 scales beside a values side of
-/// F32 scales is refused, and a valid call right after the refusal proves the adapter stayed
-/// usable.
+/// Mixed float dtypes follow the documented rule of `shape::quantized_kv_operands`: the
+/// queries and the four scale and bias residents are each F32, or BF16 after `allow_bf16` -
+/// INDEPENDENTLY, so an F32 query over BF16 scales and a BF16 query over F32 scales are
+/// both accepted - while the codes stay U32 and the scale and bias dtypes must agree within
+/// each side and across the two sides. The test asserts exactly that rule: the two mixed
+/// pairs decode, a keys side of BF16 scales beside a values side of F32 scales is refused,
+/// and a valid call right after the refusal proves the adapter stayed usable.
 #[test]
 fn quantized_attention_decode_follows_the_documented_mixed_dtype_rule() {
     let _serial = GPU_TEST.lock().unwrap_or_else(|poison| poison.into_inner());
@@ -1499,10 +1491,9 @@ fn quantized_attention_decode_follows_the_documented_mixed_dtype_rule() {
     assert_finite_readback(&mut kernels, Dtype::F32, &got);
 }
 
-/// The decision 0032 fault hooks of the fused decode shim (packet FUSED-KV8-a test d):
-/// `call`, `null`, and `mismatch` on the first selected call. Every native failure is
-/// terminal for the process, so each case runs in its own child process, as the fault tests
-/// of the KV8-OPS operations do.
+/// The injected-fault hooks of the fused decode shim: `call`, `null`, and `mismatch` on the
+/// first selected call. Every native failure is terminal for the process, so each case runs
+/// in its own child process, as the fault tests of the 8-bit KV cache operations do.
 #[cfg(feature = "native-fault-qualification")]
 mod fault_hooks {
     use std::{

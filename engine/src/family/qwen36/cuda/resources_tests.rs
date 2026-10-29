@@ -1,5 +1,5 @@
-//! Unit tests of the step shapes and the name lookups (test seam U13). CPU only. The weight
-//! lookups that read `CudaWeights` are covered by the scratch device run.
+//! Unit tests of the step shapes and the name lookups. CPU only. The weight lookups that read
+//! `CudaWeights` are covered by the scratch device run.
 use super::{
     common_tests::{dims, inventory},
     dims::{KvMode, StepOptions, TieredPlan},
@@ -163,10 +163,9 @@ fn the_moe_block_gets_the_dimensions_of_the_layout_record() {
     );
 }
 
-/// The NATIVE stack guard (MATVEC-PAR S3b, MSG-70 condition 5): the shape rule passes first,
-/// then the per-expert `rows % 4` rule refuses a stack whose per-expert height is ragged (every
-/// earlier check satisfied), `experts: None` refuses as "not an expert stack", and the valid
-/// multiples-of-4 form passes.
+/// The NATIVE stack guard: the shape rule passes first, then the per-expert `rows % 4` rule refuses
+/// a stack whose per-expert height is ragged (every earlier check satisfied), `experts: None`
+/// refuses as "not an expert stack", and the valid multiples-of-4 form passes.
 #[test]
 fn a_native_stack_with_ragged_per_expert_rows_is_refused() {
     let want = StackSpec {
@@ -248,7 +247,7 @@ fn the_global_names_come_from_the_inventory() {
 
 #[test]
 fn the_step_runs_one_row() {
-    assert_eq!(STEP_ROWS, 1, "the MoE block takes one row (RD-9c)");
+    assert_eq!(STEP_ROWS, 1, "the MoE block takes one row");
 }
 
 #[test]

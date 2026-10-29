@@ -1,14 +1,14 @@
-//! Safe launch wrappers of the resident-decode kernels (decision 0047, stage 1).
+//! Safe launch wrappers of the resident-decode kernels.
 //!
 //! One file per kernel, `resident/<n>.rs`, declared at the end of this file by one line. A wrapper
 //! checks every argument, then queues its kernel on a `DeviceStream` and returns; it allocates
 //! nothing, copies nothing and never synchronizes. This tree holds no `unsafe` and no `extern "C"`:
-//! both stay in the `native` tree (decision 0047, child modules of `native.rs`).
+//! both stay in the `native` tree.
 //!
 //! # How to add a kernel `<n>`
 //!
-//! `<n>` is a snake_case name such as `attn_decode`. A kernel packet adds new files and one line
-//! to each of four lists, and edits no other shared line. Paths are under `engine/src/kernels/cuda/`
+//! `<n>` is a snake_case name such as `attn_decode`. A new kernel adds new files and one line to
+//! each of four lists, and edits no other shared line. Paths are under `engine/src/kernels/cuda/`
 //! unless they start with `engine/`.
 //!
 //! 1. CUDA source and header: new files `native/resident/<n>.cu` and `native/resident/<n>.h`.
@@ -27,7 +27,7 @@
 //!    doc that lists the safety invariants it relies on, then (mandatory, in every native child
 //!    and every wrapper file, each with its own copy; a parent and a child both carrying it
 //!    builds clean)
-//!    `#![cfg_attr(not(test), expect(dead_code, reason = "staged for RD-9a (decision 0047)"))]`
+//!    `#![cfg_attr(not(test), expect(dead_code, reason = "staged for the resident decode step"))]`
 //!    until the resident step calls it. It holds the `unsafe extern "C"` declaration and one
 //!    `pub(in crate::kernels::cuda)` safe function that takes `&RawStream` and a struct of
 //!    `RawRange`s, proves sizes, alignment and overlap again, calls the entry under a
@@ -41,13 +41,13 @@
 //!    `DeviceStream` and a `<N>Call<'_>` struct of `DeviceRange`s. The method calls
 //!    `ensure_usable`, rejects every bad argument as `BadRequest` before any native call, turns
 //!    each `DeviceRange` into a native range with `raw_range`, and queues with
-//!    `self.launch_on(stream, |raw| <native child function>(raw, &native_call))`. `launch_on`
-//!    (in `context/launch.rs`, RD-2a-2) checks the terminal flag and that the stream belongs to
-//!    this context, enters the dispatch guard, runs the closure with the raw stream, and counts
-//!    one enqueue on the stream when the closure succeeds. The closure must only queue work, and
-//!    the raw stream cannot leave it. The file starts with the same staging attribute as step 3.
-//!    Call types are named by path (`kernels::cuda::resident::<n>::<N>Call`); nothing is
-//!    re-exported from `kernels::cuda`.
+//!    `self.launch_on(stream, |raw| <native child function>(raw, &native_call))`. `launch_on` (in
+//!    `context/launch.rs`) checks the terminal flag and that the stream belongs to this context,
+//!    enters the dispatch guard, runs the closure with the raw stream, and counts one enqueue on
+//!    the stream when the closure succeeds. The closure must only queue work, and the raw stream
+//!    cannot leave it. The file starts with the same staging attribute as step 3. Call types are
+//!    named by path (`kernels::cuda::resident::<n>::<N>Call`); nothing is re-exported from
+//!    `kernels::cuda`.
 //!
 //!    Shared helpers (defined in `context/launch.rs`, re-exported at `kernels::cuda::context` with
 //!    visibility `pub(in crate::kernels::cuda)`): a wrapper proves that the range a launch writes
@@ -58,22 +58,22 @@
 //!    `#[expect(unused_imports)]` staging line on that re-export in `context.rs` once clippy
 //!    reports it as unfulfilled, because an `expect` that nothing fulfils fails
 //!    `clippy -D warnings`.
-//! 5. Tests, seam 1 only (decision 0047, REPLY-29): `resident/<n>/tests.rs`, declared by
+//! 5. Tests, at the wrapper boundary only: `resident/<n>/tests.rs`, declared by
 //!    `#[cfg(test)] mod tests;` at the end of `resident/<n>.rs`. The tree is compiled only with
 //!    `native-cuda`. Start each device test with `testkit::device_present("<test name>")` (a host
 //!    with no device skips; `INFERENCE_CUDA_REQUIRE_DEVICE=1` turns that into a failure). Keep
 //!    helpers in the tests file, not in `testkit.rs`. Random test data comes from the shared
-//!    `testkit::Rng` (xorshift64*, `Rng::new(seed)`, `next_u64`, `below`), never from a local
-//!    copy of a generator. The first user deletes each `#[expect(dead_code)]` staging line on
-//!    `Rng` and its `impl` in `testkit.rs` that clippy then reports as unfulfilled (the `impl`
-//!    one stays fulfilled while any method, such as `below`, is unused). Compare against a host reference,
-//!    with tolerances frozen by lane M, and check each rejection of the wrapper by its error
-//!    text. One mutation per test. Device runs go through `gpu_run.sh` only.
+//!    `testkit::Rng` (xorshift64*, `Rng::new(seed)`, `next_u64`, `below`), never from a local copy
+//!    of a generator. The first user deletes each `#[expect(dead_code)]` staging line on `Rng` and
+//!    its `impl` in `testkit.rs` that clippy then reports as unfulfilled (the `impl` one stays
+//!    fulfilled while any method, such as `below`, is unused). Compare against a host reference,
+//!    with frozen tolerances, and check each rejection of the wrapper by its error text. One
+//!    mutation per test. Device runs go through `gpu_run.sh` only.
 //!
 //! A missing `mod <n>;` line here does not fail the build: the file is not compiled and its tests
-//! vanish. A kernel packet's gate therefore lists its test names with
-//! `cargo test --features native-cuda --lib -- --list`. A missing line in `native/resident.rs`
-//! or `build.rs` does fail the build (unresolved module, undefined symbol).
+//! vanish. So list the test names of a new kernel with
+//! `cargo test --features native-cuda --lib -- --list`. A missing line in `native/resident.rs` or
+//! `build.rs` does fail the build (unresolved module, undefined symbol).
 
 // One `pub(crate) mod <n>;` line per kernel, alphabetical, below this line.
 pub(crate) mod add_norm_pack;

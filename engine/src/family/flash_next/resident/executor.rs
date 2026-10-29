@@ -1,36 +1,35 @@
-//! The Flash-Next executor: `ExecutorOps` over `ResidentDecoder` (decision 0033; packet H8).
+//! The Flash-Next executor: `ExecutorOps` over `ResidentDecoder`.
 //!
 //! Ownership: the engine thread builds the executor and its session inside the `make` closure of
-//! `spawn_engine`. Nothing native crosses a thread boundary. `ResidentDecoder` and
-//! `MlxKernels` are thread-confined by compile-time checks (decisions 0019 and 0024).
+//! `spawn_engine`. Nothing native crosses a thread boundary. `ResidentDecoder` and `MlxKernels` are
+//! thread-confined by compile-time checks.
 //!
 //! Checkpoint lifetime: `ResidentDecoder<'c>` borrows its `StreamedCheckpoint`, and `spawn_engine`
-//! needs an executor without a borrowed lifetime. `open` leaks one checkpoint with `Box::leak`.
-//! The leaked checkpoint stays open until the process ends, which is later than any GPU work that
-//! reads it. Known limit: each call to `open` leaks one checkpoint handle, so each engine reload
-//! leaks one more. A decoder that owns an `Arc<StreamedCheckpoint>` removes the leak and is a
-//! later packet (it edits the files of `resident/` and waits for the snapshot work).
+//! needs an executor without a borrowed lifetime. `open` leaks one checkpoint with `Box::leak`. The
+//! leaked checkpoint stays open until the process ends, which is later than any GPU work that reads
+//! it. Known limit: each call to `open` leaks one checkpoint handle, so each engine reload leaks
+//! one more. A decoder that owns an `Arc<StreamedCheckpoint>` would remove the leak; that change
+//! edits the files of `resident/`.
 //!
 //! Context limit: the executor reads the number of positions from the decoder's own authority,
 //! `qsa::MAX_POSITIONS`, which `qsa::check_cache` applies to every step through
-//! `ResidentState::check_step`. With sparse QSA (packet C6) the decoder accepts positions 0 to
-//! `MAX_POSITIONS - 1` and returns `ContextLimit` at `MAX_POSITIONS`. The prompt check, the
-//! finish rule, and `context_limit()` use that one value. No formula is copied here. The Mac test
+//! `ResidentState::check_step`. With sparse QSA the decoder accepts positions 0 to
+//! `MAX_POSITIONS - 1` and returns `ContextLimit` at `MAX_POSITIONS`. The prompt check, the finish
+//! rule, and `context_limit()` use that one value. No formula is copied here. The Mac test
 //! `the_context_limit_is_the_first_position_that_the_decoder_rejects` pins the value to
 //! `check_cache`.
 //!
 //! Prompt length: `prefill` rejects a prompt only when the chunk that crosses the limit arrives.
-//! Earlier chunks are already fed by then, and each fed token costs device time. The server (H4)
-//! must therefore compare the prompt length with `context_limit()` before it admits the job. A
-//! prompt of `context_limit()` tokens or more fails with `ContextLimit`. During generation the job
-//! ends with `Length` when the next feed would need position `context_limit()`.
+//! Earlier chunks are already fed by then, and each fed token costs device time. The server must
+//! therefore compare the prompt length with `context_limit()` before it admits the job. A prompt of
+//! `context_limit()` tokens or more fails with `ContextLimit`. During generation the job ends with
+//! `Length` when the next feed would need position `context_limit()`.
 //!
-//! Failure handling and the open native-failure gate (decision 0022): a native failure returns
-//! `EngError::Backend` unchanged from `prefill` or `decode`. The worker then marks the engine
-//! `NativeFailed` and makes no further executor call. The holder that keeps native state alive
-//! after such a failure is not built. The unwind drops the state instead, so this gate stays open.
-//! An error that is not `Backend` (for example `ContextLimit`, or a failed token decode) fails only
-//! the job: the executor resets the session where it can and the engine stays `Ready`.
+//! Failure handling: a native failure returns `EngError::Backend` unchanged from `prefill` or
+//! `decode`. The worker then marks the engine `NativeFailed` and makes no further executor call. No
+//! holder keeps native state alive after such a failure: the unwind drops the state. An error that
+//! is not `Backend` (for example `ContextLimit`, or a failed token decode) fails only the job: the
+//! executor resets the session where it can and the engine stays `Ready`.
 //!
 //! Teardown: `work` in `sched/worker.rs` drops the session before the executor. The session drops
 //! its resident state first, then the executor drops the decoder, whose fields wait for GPU
@@ -41,30 +40,29 @@
 //! Each `decode` feeds the pending token through a `Logits` step, draws the next token from the
 //! job's sampler, and keeps that token pending. One token leaves per call.
 //!
-//! Batched prefill (decision 0044, packet H8b): `plan_prefill` applies the admission rule of item
-//! 6 to the engine budget and stores the chunk size. Until it runs, and when no chunk size fits,
-//! every `Prompt` row is a one-token step. With a chunk size, `prefill` runs its rows through
-//! `ResidentDecoder::prefill` in chunks of at most that size. A chunk of one row is a one-token
-//! step, and the decoder runs the rows past the dense QSA limit as one-token steps itself. The
-//! page sets of the chunks open at the first chunk of a prompt and close at the first `decode` or
-//! at a `reset`. A chunk equals the one-token steps within the tolerance of gate G2, not bit for
-//! bit, so a state saved by one path is not a state of the other (decision 0036 addendum 1). The
-//! worker's `prefill_chunk` should be at least the planned size, or the chunks stay small.
+//! Batched prefill: `plan_prefill` applies the chunk admission rule to the engine budget and stores
+//! the chunk size. Until it runs, and when no chunk size fits, every `Prompt` row is a one-token
+//! step. With a chunk size, `prefill` runs its rows through `ResidentDecoder::prefill` in chunks of
+//! at most that size. A chunk of one row is a one-token step, and the decoder runs the rows past
+//! the dense QSA limit as one-token steps itself. The page sets of the chunks open at the first
+//! chunk of a prompt and close at the first `decode` or at a `reset`. A chunk equals the one-token
+//! steps within the chunk parity tolerance, not bit for bit, so a state saved by one path is not a
+//! state of the other. The worker's `prefill_chunk` should be at least the planned size, or the
+//! chunks stay small.
 //!
 //! The token side of the session (history, pending token, finish rules, EOS, output and context
 //! limits, cancellation) lives in `family::session::DecodeSession`, which the Q36 executor shares
-//! (packet Q36-F1). `FlashStep` is the model side: it runs the `Prompt` and `Logits` steps, owns
-//! the chunk path of the batched prefill, and closes the prefill page sets at a reset.
+//! `FlashStep` is the model side: it runs the `Prompt` and `Logits` steps, owns the chunk path of
+//! the batched prefill, and closes the prefill page sets at a reset.
 //!
-//! Prefix reuse (decision 0036, addendum 1; packet PR1c): `save_prefix` snapshots the state after
-//! the held prompt, and `restore_prefix` gives it back after a reset. The executor keeps its
-//! entries in a `PrefixStore` with the addendum 1 limits (one tip entry, saved by the worker); the
-//! roots and the periodic points of addendum 2 come with the SERVE-2 packets.
-//! `DecodeSession::save_prefix` and `DecodeSession::restore_prefix` own the rules (the held
-//! prompt, the strict extension, the denied restore), and the executor passes the two calls that
-//! share the resident state. The entry carries the `PrefillPath` that built it. The one-token
-//! steps and each chunk size are separate paths, because a chunk matches the steps only within
-//! the tolerance of gate G2, so an entry restores only under its own path.
+//! Prefix reuse: `save_prefix` snapshots the state after the held prompt, and `restore_prefix`
+//! gives it back after a reset. The executor keeps its entries in a `PrefixStore` with the default
+//! limits (one tip entry, saved by the worker), so it keeps no roots and no periodic points.
+//! `DecodeSession::save_prefix` and `DecodeSession::restore_prefix` own the rules (the held prompt,
+//! the strict extension, the denied restore), and the executor passes the two calls that share the
+//! resident state. The entry carries the `PrefillPath` that built it. The one-token steps and each
+//! chunk size are separate paths, because a chunk matches the steps only within the chunk parity
+//! tolerance, so an entry restores only under its own path.
 
 use super::super::{
     load::FlashWeights,
@@ -361,8 +359,8 @@ impl FlashExecutor {
         (step, limits)
     }
 
-    /// The admission cost of one prefill chunk on this model (decision 0044 item 6). One expert
-    /// costs the page-rounded set of all experts of the largest layer, divided by the expert count.
+    /// The admission cost of one prefill chunk on this model. One expert costs the page-rounded set
+    /// of all experts of the largest layer, divided by the expert count.
     fn prefill_cost(&self) -> Result<ChunkCost> {
         let too_big =
             |what: &str| EngError::MemoryPlan(format!("{what} exceeds the platform size"));
@@ -383,27 +381,26 @@ impl FlashExecutor {
         prefill_plan::admission_cost(experts, top_k, set_bytes.div_ceil(u64::from(experts)), page)
     }
 
-    /// Applies the admission rule of decision 0044 item 6 and stores the chunk size.
+    /// Applies the chunk admission rule and stores the chunk size.
     ///
-    /// Item 6 is `remaining = B - resident weights - session state - S3 cache - MLX cache limit -
+    /// The rule is `remaining = B - resident weights - session state - S3 cache - MLX cache limit -
     /// pressure margin`. The terms of this call, all in bytes:
     ///
-    /// - `budget` is `B`, the engine memory budget (32,212,254,720 B in the decision).
+    /// - `budget` is `B`, the engine memory budget (32,212,254,720 B in the memory plan).
     /// - The resident weights come from this executor (`FlashWeights` byte length).
     /// - `s3_cache` is the S3 cache (0 while no S3 cache exists).
     /// - `session_reserve` holds three terms that the caller sums: the session state (QSA,
-    ///   DeltaNet, and rings; 245,471,984 B at 2,304 positions in the decision), the MLX cache
-    ///   limit (1 GiB in the decision), and the pressure margin (1 GiB in the decision). The
+    ///   DeltaNet, and rings; 245,471,984 B at 2,304 positions in the memory plan), the MLX cache
+    ///   limit (1 GiB in the plan), and the pressure margin (1 GiB in the plan). The
     ///   executor does not know the position count, the cache limit setting, or the margin, so a
     ///   caller that passes 0 admits a larger chunk than the memory plan allows.
-    /// - The decode pool is an extra term. Item 6 counts it as idle during prefill. This call
-    ///   charges it anyway, which is conservative by 83,214,336 B on the real model (the
-    ///   coordinator decision of packet H8b).
+    /// - The decode pool is an extra term. The rule counts it as idle during prefill. This call
+    ///   charges it anyway, which is conservative by 83,214,336 B on the real model.
     ///
-    /// It returns the chunk size, or `None` when no size above one token fits and the prefill
-    /// runs one-token steps, together with the terms it charged (item 6: the executor records
-    /// which terms it charged). Call it once after construction and before the first job. It
-    /// closes open prefill pages.
+    /// It returns the chunk size, or `None` when no size above one token fits and the prefill runs
+    /// one-token steps, together with the terms it charged (the executor records which terms it
+    /// charged). Call it once after construction and before the first job. It closes open prefill
+    /// pages.
     pub(crate) fn plan_prefill(
         &mut self,
         budget: u64,
@@ -752,16 +749,16 @@ mod tests {
         assert_eq!(expected_chunks(0, 4), Vec::<usize>::new(), "no row");
     }
 
-    /// The session state at the positions of decision 0044 item 6 (2,304) in bytes, as the decision
-    /// documents it. A run prints it beside the measured value.
+    /// The session state at the 2,304 planned positions in bytes, as the memory plan documents it.
+    /// A run prints it beside the measured value.
     const DOCUMENTED_STATE_BYTES: u64 = 245_471_984;
 
-    /// The positions at which decision 0044 item 6 counts the session state.
+    /// The positions at which the memory plan counts the session state.
     const STATE_POSITIONS: u64 = 2_304;
 
-    /// The terms of `session_reserve` (decision 0044 item 6): the session state, the MLX cache
-    /// limit, and the pressure margin. The state is the bytes of the zero state that the decoder
-    /// holds plus the QSA growth per position times `positions`. A margin with no value is `None`.
+    /// The terms of `session_reserve`: the session state, the MLX cache limit, and the pressure
+    /// margin. The state is the bytes of the zero state that the decoder holds plus the QSA growth
+    /// per position times `positions`. A margin with no value is `None`.
     struct Reserve {
         zero_state: u64,
         growth_per_position: u64,
@@ -1163,10 +1160,10 @@ mod tests {
     /// Row 1: 10 tokens, chunks of 4, worker pieces of 5: calls give the rows 4, then 4 and 1 (the
     /// carried pending token leads the second call, and the single row is a step). Row 2: 25
     /// tokens, chunks of 8, worker pieces of 15: the second call starts at position 14, so its
-    /// chunk of 8 straddles the 19 dense positions of the fixture, and the last call runs steps.
-    /// A chunk equals the steps within the gate G2 tolerance (not bit for bit). Both sessions get
-    /// the same token chain, and every logits row is compared with `assert_parity`. The argmax is
-    /// compared only where the stepped row's top two logits differ by more than twice the G2
+    /// chunk of 8 straddles the 19 dense positions of the fixture, and the last call runs steps. A
+    /// chunk equals the steps within the chunk parity tolerance (not bit for bit). Both sessions
+    /// get the same token chain, and every logits row is compared with `assert_parity`. The argmax
+    /// is compared only where the stepped row's top two logits differ by more than twice that
     /// tolerance, because a smaller gap can flip inside the tolerance. A seeded sampler is not
     /// compared for the same reason.
     #[test]
@@ -1543,13 +1540,13 @@ mod tests {
         }
     }
 
-    /// Pins the step modes through the executor by the synchronization count (decision 0041
-    /// item 3). `step.rs` gives `base = layers + 2` and: Prompt `base`, Logits `base + 1`, Record
-    /// `base + 3`. The synthetic model has 2 layers, so base is 4, Prompt costs 4, Logits costs 5,
-    /// and Record costs 7. A prompt of 3 tokens feeds 2 tokens by Prompt steps and keeps the last
-    /// one pending: 2 * 4 = 8. Each decode feeds one pending token by a Logits step: 5. A
-    /// `Generate` step would also cost 5, but it reads back a token and no logits, so the token
-    /// chain tests in this module cover it.
+    /// Pins the step modes through the executor by the synchronization count. `step.rs` gives
+    /// `base = layers + 2` and: Prompt `base`, Logits `base + 1`, Record `base + 3`. The synthetic
+    /// model has 2 layers, so base is 4, Prompt costs 4, Logits costs 5, and Record costs 7. A
+    /// prompt of 3 tokens feeds 2 tokens by Prompt steps and keeps the last one pending: 2 * 4 = 8.
+    /// Each decode feeds one pending token by a Logits step: 5. A `Generate` step would also cost
+    /// 5, but it reads back a token and no logits, so the token chain tests in this module cover
+    /// it.
     #[cfg(feature = "native-fault-qualification")]
     #[test]
     fn the_executor_uses_prompt_steps_for_the_prompt_and_logits_steps_for_decode() {
@@ -1670,7 +1667,7 @@ mod tests {
             .prefill(&mut session, &PREFIX_PROMPT[KEY..])
             .unwrap();
         let pending = session.core.pending().unwrap();
-        // One-token steps are the path with bitwise equality (addendum item 8).
+        // One-token steps are the path with bitwise equality.
         for (n, token) in std::iter::once(pending).chain(FORCED).enumerate() {
             let row = executor
                 .decoder
@@ -1848,7 +1845,7 @@ mod tests {
             })
             .collect();
         assert_eq!(rows.len(), want.rows.len(), "row count");
-        // The chunk boundaries differ, so the rows match within the tolerance of gate G2.
+        // The chunk boundaries differ, so the rows match within the chunk parity tolerance.
         for (n, (got, want)) in rows.iter().zip(&want.rows).enumerate() {
             assert_parity(got, want, &format!("logits row {n}"));
         }
@@ -1917,9 +1914,9 @@ mod tests {
                     prompt_tokens: u32::try_from(prompt.len()).unwrap(),
                     completion_tokens: 4,
                     reused_tokens: reused,
-                    // The Flash-Next executor keeps the default `prefix_report` (`None`, fix
-                    // M3): although it saves and restores tips, it reports no store facts, so
-                    // its request lines omit the four `prefix_*` keys.
+                    // The Flash-Next executor keeps the default `prefix_report` (`None`): although
+                    // it saves and restores tips, it reports no store facts, so its request lines
+                    // omit the four `prefix_*` keys.
                     prefix: None
                 }),
                 "round {round}: usage"
@@ -2023,14 +2020,14 @@ mod tests {
         );
     }
 
-    /// The real artifact: a saved prefix of 250 of 300 prompt tokens gives the same 32 greedy tokens
-    /// as a full prefill. The prompt tokens are synthetic ids, so the text is meaningless; the test
-    /// compares ids. The coordinator runs it with `--ignored --exact` under the lock (about 4 minutes).
-    /// Environment: `FLASH_NEXT_ARTIFACT`, `FLASH_NEXT_ARTIFACT_MANIFEST`, `FLASH_NEXT_CACHE_LIMIT`,
-    /// `FLASH_NEXT_PREFIX_REPORT` (the report file). `FLASH_NEXT_PREFIX_CHUNK` (rows, optional) runs
-    /// the batched prefill of that chunk size on both runs. Without it the run uses one-token steps,
-    /// the path with bitwise equality (addendum item 8). With it, the chunk boundaries of the two
-    /// runs differ, and the result is the evidence for the tolerance gate that the addendum requires.
+    /// The real artifact: a saved prefix of 250 of 300 prompt tokens gives the same 32 greedy
+    /// tokens as a full prefill. The prompt tokens are synthetic ids, so the text is meaningless;
+    /// the test compares ids. Run it with `--ignored --exact` (about 4 minutes). Environment:
+    /// `FLASH_NEXT_ARTIFACT`, `FLASH_NEXT_ARTIFACT_MANIFEST`, `FLASH_NEXT_CACHE_LIMIT`,
+    /// `FLASH_NEXT_PREFIX_REPORT` (the report file). `FLASH_NEXT_PREFIX_CHUNK` (rows, optional)
+    /// runs the batched prefill of that chunk size on both runs. Without it the run uses one-token
+    /// steps, the path with bitwise equality. With it, the chunk boundaries of the two runs differ,
+    /// and the result checks the chunked path against the parity tolerance.
     #[test]
     #[ignore = "needs the Flash-Next artifact on the Mac"]
     fn a_restored_prefix_gives_the_same_32_greedy_tokens_on_the_real_artifact() {
@@ -2204,10 +2201,10 @@ mod tests {
         );
     }
 
-    /// The real artifact on the Mac. The coordinator runs it with `--ignored --exact` under the lock.
-    /// Environment: `FLASH_NEXT_ARTIFACT`, `FLASH_NEXT_ARTIFACT_MANIFEST`, `FLASH_NEXT_CACHE_LIMIT`,
-    /// `FLASH_NEXT_EXECUTOR_REPORT` (the report file). `FLASH_NEXT_EXECUTOR_BUDGET` (bytes, optional)
-    /// plans the batched prefill (packet H8b): the run then uses chunks, and the report names the
+    /// The real artifact on the Mac. Run it with `--ignored --exact`. Environment:
+    /// `FLASH_NEXT_ARTIFACT`, `FLASH_NEXT_ARTIFACT_MANIFEST`, `FLASH_NEXT_CACHE_LIMIT`,
+    /// `FLASH_NEXT_EXECUTOR_REPORT` (the report file). `FLASH_NEXT_EXECUTOR_BUDGET` (bytes,
+    /// optional) plans the batched prefill: the run then uses chunks, and the report names the
     /// chunk size. Without it the run uses one-token steps, as before.
     #[test]
     #[ignore = "needs the Flash-Next artifact on the Mac"]
@@ -2403,16 +2400,16 @@ mod tests {
         }
     }
 
-    /// The prefill rate of a long prompt on the real artifact (packet H8b; the gate of decision 0044
-    /// is 60 prompt tokens per second on 2,048 tokens, measured cold). The coordinator evicts the
-    /// checkpoint pages first (`prefill-speed coldprep`). The test runs the prompt twice with
-    /// worker pieces of the planned chunk size: `first` is the cold run, `repeat` the warm one.
-    /// Environment: `FLASH_NEXT_ARTIFACT`, `FLASH_NEXT_CACHE_LIMIT`, `FLASH_NEXT_EXECUTOR_PROMPT`
-    /// (a fixture JSON with `tokens`), `FLASH_NEXT_EXECUTOR_BUDGET`, `FLASH_NEXT_EXECUTOR_S3_CACHE`
-    /// and `FLASH_NEXT_EXECUTOR_RESERVE` (bytes, default 0), `FLASH_NEXT_EXECUTOR_CHUNK` (optional,
+    /// The prefill rate of a long prompt on the real artifact (the target is 60 prompt tokens per
+    /// second on 2,048 tokens, measured cold). Evict the checkpoint pages first
+    /// (`prefill-speed coldprep`). The test runs the prompt twice with worker pieces of the planned
+    /// chunk size: `first` is the cold run, `repeat` the warm one. Environment:
+    /// `FLASH_NEXT_ARTIFACT`, `FLASH_NEXT_CACHE_LIMIT`, `FLASH_NEXT_EXECUTOR_PROMPT` (a fixture
+    /// JSON with `tokens`), `FLASH_NEXT_EXECUTOR_BUDGET`, `FLASH_NEXT_EXECUTOR_S3_CACHE` and
+    /// `FLASH_NEXT_EXECUTOR_RESERVE` (bytes, default 0), `FLASH_NEXT_EXECUTOR_CHUNK` (optional,
     /// forces the chunk size for a sweep), `FLASH_NEXT_EXECUTOR_REPORT`. The report names every
-    /// term of the plan, and in a qualification build the forced flushes and the peak retired
-    /// bytes of each run (decision 0044 review, F4).
+    /// term of the plan, and in a qualification build the forced flushes and the peak retired bytes
+    /// of each run.
     ///
     /// Each run also reports the MLX allocator peak, active, and cache bytes (process-wide; the
     /// peak starts at the active bytes after the session reset). A qualification build also

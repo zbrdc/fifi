@@ -1,12 +1,12 @@
 //! Raw FFI to the gated DeltaNet launch entry of `native/resident/gdn_delta.cu` (declared in
-//! `native/resident/gdn_delta.h`), RD-7b. Child module of `native/resident.rs`, so it inherits the
+//! `native/resident/gdn_delta.h`). Child module of `native/resident.rs`, so it inherits the
 //! `allow(unsafe_code)` of `native.rs`.
 //!
-//! The kernel behind the entry is vendored xavier-qwen code, restored in RD-4V.
+//! The kernel behind the entry is vendored xavier-qwen code.
 //!
 //! Safety invariants this file relies on:
 //! - The launch entry is called only through `CudaContext::launch_on`, on the thread that owns
-//!   the context and under the dispatch guard (decisions 0023 and 0024).
+//!   the context and under the dispatch guard.
 //! - Every range is a `RawRange`, proved inside its live allocation. Sizes, alignment and
 //!   disjointness (`super::Span`) are proved again here before the call; the C entry repeats them
 //!   on the addresses.

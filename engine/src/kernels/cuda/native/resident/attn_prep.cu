@@ -1,5 +1,5 @@
-/* RD-8a: argument validation and the one launch of the vendored attn_prep (RD-4V, patched by
- * RD-8a-attn-prep-poison-guard). No kernel is written here.
+/* Argument validation and the one launch of the vendored attn_prep (with its poison-guard
+ * patch). No kernel is written here.
  * Contract: resident/attn_prep.h. */
 #include "resident/attn_prep.h"
 
@@ -17,8 +17,8 @@ constexpr int kMaxHeads = 256;
 constexpr int kMaxKvHeads = 64;
 constexpr int kMaxGridY = 65535;
 constexpr int kMaxRows = (1 << 30) - 1;
-// Mask 4 of StepParams.status (invalid step state, REPLY-47); equals INFERENCE_CUDA_STATUS_INVALID_STEP_STATE
-// of resident/step_params.h. Repeated here so that this file needs neither RD-4d nor its header.
+// Mask 4 of StepParams.status (invalid step state); equals INFERENCE_CUDA_STATUS_INVALID_STEP_STATE
+// of resident/step_params.h. Repeated here so that this file does not depend on that header.
 constexpr int kStatusInvalidStepState = 4;
 
 bool aligned_to(const void *p, uintptr_t a) { return ((uintptr_t)p & (a - 1)) == 0; }
@@ -31,7 +31,7 @@ bool valid_pointers(const inference_cuda_attn_prep_args *a) {
            aligned_to(a->q, 16) && aligned_to(a->k_cache, 16) && aligned_to(a->v_cache, 16);
 }
 
-/* The configurations the vendored kernel does not support (Mellum: MEL-K1) are refused here. */
+/* The configurations the vendored kernel does not support (the Mellum ones) are refused here. */
 bool supported_configuration(const inference_cuda_attn_prep_args *a) {
     return a->head_dim == kHead && a->has_gate == 1 && a->slot_mode == INFERENCE_CUDA_SLOT_POSITION &&
            a->slot_ring == 0;
@@ -42,7 +42,7 @@ bool valid_shape(const inference_cuda_attn_prep_args *a) {
                        a->n_kv_head <= kMaxKvHeads;
     const bool tokens = a->m >= 1 && a->m <= kMaxGridY;
     const bool rope = a->n_rot >= 2 && a->n_rot <= kHead &&
-                      (a->n_rot & (a->n_rot - 1)) == 0;  // a power of two: RP1's domain (REPLY-53)
+                      (a->n_rot & (a->n_rot - 1)) == 0;  // a power of two
     const bool cache = a->rows >= a->m && a->rows <= kMaxRows;
     const long long row_width = ((long long)a->n_head * 2 + (long long)a->n_kv_head * 2) * kHead;
     return heads && tokens && rope && cache && a->ld >= row_width;
@@ -94,8 +94,8 @@ extern "C" int inference_cuda_attn_prep_launch(const inference_cuda_attn_prep_ar
     }
 }
 
-/* KV8-B B1: the f32 rows entry of the same kernel (the Int8G32 KV handoff), for the Rust wrapper
- * of KV8-B B1b. Contract: resident/attn_prep.h. */
+/* The f32 rows entry of the same kernel (the Int8G32 KV handoff), for its Rust wrapper.
+ * Contract: resident/attn_prep.h. */
 namespace {
 
 constexpr int kMaxDecodeTokens = 16;  // kv8_append's decode bound: rows 1..=16 only
@@ -118,7 +118,7 @@ bool valid_attn_prep_rows(const inference_cuda_attn_prep_rows_args *a) {
                        a->n_kv_head <= kMaxKvHeads;
     const bool tokens = a->m >= 1 && a->m <= kMaxDecodeTokens;
     const bool rope = a->n_rot >= 2 && a->n_rot <= kHead &&
-                      (a->n_rot & (a->n_rot - 1)) == 0;  // a power of two: RP1's domain (REPLY-53)
+                      (a->n_rot & (a->n_rot - 1)) == 0;  // a power of two
     const bool cells = a->cells >= a->m && a->cells <= kMaxRows;
     const long long row_width = ((long long)a->n_head * 2 + (long long)a->n_kv_head * 2) * kHead;
     return pointers && config && heads && tokens && rope && cells &&

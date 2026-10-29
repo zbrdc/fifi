@@ -422,7 +422,7 @@ fn cache_error(message: &str) -> EngError {
     EngError::BadRequest(format!("Flint expert cache: {message}"))
 }
 
-pub(super) struct HostBudget {
+pub(crate) struct HostBudget {
     pub(super) mem_available: u64,
     // None means a confirmed unlimited cgroup, never a failed limit read.
     pub(super) cgroup_remaining: Option<u64>,
@@ -430,7 +430,7 @@ pub(super) struct HostBudget {
 }
 
 impl HostBudget {
-    pub(super) fn probe() -> Result<Self, EngError> {
+    pub(crate) fn probe() -> Result<Self, EngError> {
         Self::probe_in(
             std::path::Path::new("/proc"),
             std::path::Path::new("/sys/fs/cgroup"),
@@ -470,7 +470,14 @@ impl HostBudget {
         })
     }
 
-    pub(super) fn admit(&self, required: u64) -> Result<(), EngError> {
+    pub(crate) fn admit(&self, required: u64) -> Result<(), EngError> {
+        self.admit_for(required, "Flint expert cache")
+    }
+
+    /// [`admit`] with the caller's name in the refusal, so a prefix
+    /// snapshot refusal does not masquerade as an expert-cache one
+    /// (the refusal names the caller).
+    pub(crate) fn admit_for(&self, required: u64, what: &str) -> Result<(), EngError> {
         let available = self
             .cgroup_remaining
             .map_or(self.mem_available, |remaining| {
@@ -481,7 +488,7 @@ impl HostBudget {
             .is_none_or(|needed| needed > available)
         {
             return Err(EngError::MemoryPlan(format!(
-                "Flint expert cache needs {required} bytes plus {} bytes for the OS floor. Available host/cgroup budget: {available} bytes.",
+                "{what} needs {required} bytes plus {} bytes for the OS floor. Available host/cgroup budget: {available} bytes.",
                 self.os_floor
             )));
         }

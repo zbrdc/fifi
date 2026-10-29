@@ -1,7 +1,6 @@
 //! Raw FFI to `inference_cuda_matmul_expert_launch` and its helper entries of
 //! `native/resident/matmul_expert.cu` (declared in `native/resident/matmul_expert.h`). Child of
-//! `native::resident`, so it inherits the `allow(unsafe_code)` of `native.rs` (decision 0047,
-//! child modules of `native.rs`).
+//! `native::resident`, so it inherits the `allow(unsafe_code)` of `native.rs`.
 //!
 //! Safety invariants this module relies on:
 //! - A device range is proved in bounds by `RawRange::new` before it gets here. This module
@@ -15,8 +14,7 @@
 //!   synchronizes the whole device before `cudaFree`.
 //! - The launch entry only queues work on the stream it is given and returns the launch status;
 //!   a fault in the kernel surfaces at the next synchronize.
-//! - Every call runs under the process dispatch guard and on the thread that owns the context
-//!   (decisions 0023 and 0024).
+//! - Every call runs under the process dispatch guard and on the thread that owns the context.
 //! - No raw pointer and no unsafe function leaves this module.
 
 use std::ffi::{c_int, c_void};

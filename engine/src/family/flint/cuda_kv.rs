@@ -50,6 +50,17 @@ impl LayerKvAllocation {
         self.data_bytes + self.scale_bytes
     }
 
+    /// Host bytes of one data plane covering the committed rows
+    /// `[0, committed)`: the prefix-snapshot copy bound.
+    /// Rows below the first wrap sit at slots `[0, committed)` (slot =
+    /// position % cache_rows), so they are a plane-prefix byte range; a
+    /// wrapped ring (committed >= cache_rows) needs the whole plane.
+    /// Scales are excluded: f16-only snapshots carry none.
+    #[cfg(all(feature = "native-cuda", target_os = "linux"))]
+    pub(crate) fn committed_data_bytes(&self, committed: usize) -> usize {
+        self.data_bytes * committed.min(self.cache_rows) / self.cache_rows
+    }
+
     #[cfg(test)]
     pub(crate) fn plane_components(&self) -> (usize, usize) {
         (self.data_bytes, self.scale_bytes)
@@ -177,10 +188,36 @@ impl KvAppend<'_> {
     }
 }
 
+impl KvCursor {
+    /// Installs a restored committed boundary (prefix snapshot restore):
+    /// planes were refilled whole, so the cursor only needs the count.
+    /// Only the native-cuda restore path calls it (portable test builds
+    /// compile the cursor but never restore).
+    #[cfg(all(feature = "native-cuda", target_os = "linux"))]
+    pub(crate) fn restore_committed(&mut self, committed: usize) -> Result<(), EngError> {
+        if self.poisoned || self.committed_prefix != 0 {
+            return Err(EngError::BadRequest(
+                "flint cuda prefix restore needs a reset cursor".into(),
+            ));
+        }
+        self.committed_prefix = committed;
+        Ok(())
+    }
+}
+
 #[cfg(all(feature = "native-cuda", target_os = "linux"))]
 pub(crate) struct LayerKv {
     pub(crate) keys: crate::kernels::cuda::DeviceBuffer,
     pub(crate) values: crate::kernels::cuda::DeviceBuffer,
     pub(crate) scales: Option<[crate::kernels::cuda::DeviceBuffer; 2]>,
     pub(crate) cursor: KvCursor,
+}
+
+#[cfg(all(feature = "native-cuda", target_os = "linux"))]
+impl LayerKv {
+    /// The committed-bounds data-plane byte size (see
+    /// [`LayerKvAllocation::committed_data_bytes`]) for this layer's planes.
+    pub(crate) fn committed_data_bytes(&self, committed: usize) -> usize {
+        self.cursor.allocation.committed_data_bytes(committed)
+    }
 }

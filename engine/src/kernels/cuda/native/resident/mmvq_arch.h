@@ -1,9 +1,9 @@
 /*
- * Which built architecture the vendored MMVQ objects run on for a device (MATVEC-PAR S1 fix
- * round, KUBDAN-MSG-64 item 1). fifi_check_device (vendored common.cuh) accepts a cc only when it
- * is exactly one of the built architectures, so an sm_89 GPU with a 72,86 build was refused
- * although the sm_86 cubin runs on it. The two wrappers clamp the device's cc to the architecture
- * of the cubin that runs there before they fill fifi_device_facts, and refuse when none does.
+ * Which built architecture the vendored MMVQ objects run on for a device. fifi_check_device
+ * (vendored common.cuh) accepts a cc only when it is exactly one of the built architectures, so
+ * an sm_89 GPU with a 72,86 build was refused although the sm_86 cubin runs on it. The two
+ * wrappers clamp the device's cc to the architecture of the cubin that runs there before they
+ * fill fifi_device_facts, and refuse when none does.
  */
 #ifndef INFERENCE_CUDA_RESIDENT_MMVQ_ARCH_H
 #define INFERENCE_CUDA_RESIDENT_MMVQ_ARCH_H

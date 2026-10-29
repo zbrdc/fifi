@@ -1,15 +1,15 @@
-//! Weights in the GGUF file's own block layout, resident on the device (MATVEC-PAR S2, decision
-//! 0047): [`CudaContext::upload_native`] reads a Q4_K, Q5_0, Q6_K or Q8_0 tensor through a
+//! Weights in the GGUF file's own block layout, resident on the device:
+//! [`CudaContext::upload_native`] reads a Q4_K, Q5_0, Q6_K or Q8_0 tensor through a
 //! [`BlockReader`] in chunks of WHOLE ROWS and uploads each chunk at its byte offset into ONE
 //! device allocation made up front. No repack runs: the bytes land as the file holds them,
-//! row-major blocks, and the S1 MMVQ kernels (`matvec_q`, `matvec_expert`) and the native
+//! row-major blocks, and the MMVQ kernels (`matvec_q`, `matvec_expert`) and the native
 //! embedding gather read them there.
 //!
 //! A chunk holds as many rows as fit `chunk_limit` bytes and at least one, so a row wider than
 //! the limit is its own chunk and the last chunk may be short; host memory stays at one chunk.
 //! Rows may be ANY count from one up: the 8-row group rule is a tile rule, not a property of
 //! the file. The fp16 scale scans of the tiled path do not apply (a native block keeps its
-//! exact scales; the scans exist for tile dequantisation, R-S2-4), so `upload_native` runs
+//! exact scales; the scans exist for tile dequantisation), so `upload_native` runs
 //! none. A failed read or upload drops the device owner, as a failed tiled upload does.
 //! Cleanup is skipped after terminal failure. Admission behaviour is the tiled path's.
 
@@ -22,8 +22,8 @@ use super::{BlockReader, CudaContext, DeviceBuffer, QuantTensor, device_error, h
 
 /// A quantized weight in the GGUF file's own block layout, resident on the device: one
 /// allocation of `n_rows` rows of `k / block_size` blocks each, `experts` the stack depth of a
-/// rank-3 tensor (`None` for a plain matrix). The S1 `matvec_q`/`matvec_expert` and the native
-/// `embed` read it; the tiled readers refuse it with a typed error (R-S2-2).
+/// rank-3 tensor (`None` for a plain matrix). The `matvec_q`/`matvec_expert` kernels and the
+/// native `embed` read it; the tiled readers refuse it with a typed error.
 pub(crate) struct NativeWeight {
     buffer: DeviceBuffer,
     quant: QuantType,
@@ -78,7 +78,7 @@ impl CudaContext {
         let quant = checked_native(tensor)?;
         let name = tensor.name;
         // Unreachable in practice (`checked_native` proved k on the block grid), still a
-        // typed error: the load path never panics (KUBDAN-MSG-68 item 7).
+        // typed error: the load path never panics.
         let row_bytes = quant.weight_bytes(1, tensor.k).ok_or_else(|| {
             EngError::Checkpoint(format!(
                 "tensor {name} has {} values, which the native block grid cannot hold",
@@ -119,7 +119,7 @@ impl NativeWeight {
     }
 
     /// The stack depth of a rank-3 tensor, `None` for a plain matrix. Read by the resident
-    /// step's native stack lookups (MATVEC-PAR S3b).
+    /// step's native stack lookups.
     pub(crate) fn experts(&self) -> Option<usize> {
         self.experts
     }
@@ -143,7 +143,7 @@ impl NativeWeight {
     }
 }
 
-/// Checks the tensor of a native upload: the type must be one of the four the S1 MMVQ kernels
+/// Checks the tensor of a native upload: the type must be one of the four the MMVQ kernels
 /// read, `k` a positive multiple of the type's block size up to `native::MAX_DIM`, `n_rows` at
 /// least one (any count: no 8-row rule), and the source length exactly the native byte count.
 fn checked_native(tensor: QuantTensor<'_>) -> Result<QuantType, EngError> {

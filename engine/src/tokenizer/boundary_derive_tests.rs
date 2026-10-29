@@ -14,8 +14,8 @@ fn digest(bytes: &[u8]) -> [u8; 32] {
 /// The tiny in-repo fixture (same strings as tests.rs) for fast units.
 /// The real Qwen3.6 model dir for on-disk corpus tests: the
 /// `FIFI_QWEN36_MODEL_DIR` env override (a directory, or a
-/// `tokenizer.json` file — its parent is used) when set, else the pinu
-/// default. Returns None (and prints why) when the dir is absent, so
+/// `tokenizer.json` file — its parent is used) when set, else the
+/// default path. Returns None (and prints why) when the dir is absent, so
 /// hosts without the weights SKIP these tests instead of failing them.
 pub(crate) fn qwen_model_dir() -> Option<std::path::PathBuf> {
     let dir = match std::env::var_os("FIFI_QWEN36_MODEL_DIR") {
@@ -70,16 +70,16 @@ const TEMPLATE_WRAPPED: &str = concat!(
     r#"{% if add_generation_prompt %}<|end|>hello{% endif %}ab"#,
 );
 
-/// Sol MF1: a template whose generation block is CONTENT-CONDITIONAL. The
-/// probe suffix observed for [user "x"] is `<|end|>hello`, and user content
+/// A template whose generation block is CONTENT-CONDITIONAL. The probe
+/// suffix observed for [user "x"] is `<|end|>hello`, and user content
 /// `hello<|end|>hello` makes every alignment guard pass while the marker
 /// sits inside USER CONTENT, not at a generation boundary. The old method
 /// returns no tip there (head equals full); the derivation must NEVER claim
 /// exactness in that request — derive exactly or fall back.
 const TEMPLATE_CONDITIONAL: &str = r#"{{ messages[0].content }}{% if add_generation_prompt and messages[0].content == 'x' %}<|end|>hello{% endif %}"#;
-/// Opus SF: the same vocabulary with the boundary token lstrip=true — the
-/// matcher may consume preceding whitespace, so the added-token split is
-/// not byte-faithful at the seam. Membership alone must not count as
+/// The same vocabulary with the boundary token lstrip=true — the matcher
+/// may consume preceding whitespace, so the added-token split is not
+/// byte-faithful at the seam. Membership alone must not count as
 /// isolation.
 pub(crate) const TOKENIZER_JSON_LSTRIP: &str = r#"{"version":"1.0","truncation":null,"padding":null,"added_tokens":[{"id":100,"content":" world","special":false,"single_word":false,"lstrip":false,"rstrip":false,"normalized":false},{"id":101,"content":"<|end|>","special":true,"single_word":false,"lstrip":true,"rstrip":false,"normalized":false}],"normalizer":null,"pre_tokenizer":{"type":"ByteLevel","add_prefix_space":false,"trim_offsets":false,"use_regex":true},"post_processor":{"type":"ByteLevel","add_prefix_space":false,"trim_offsets":false,"use_regex":false},"decoder":{"type":"ByteLevel","add_prefix_space":false,"trim_offsets":false,"use_regex":false},"model":{"type":"BPE","dropout":null,"unk_token":null,"continuing_subword_prefix":null,"end_of_word_suffix":null,"fuse_unk":false,"byte_fallback":false,"ignore_merges":false,"vocab":{"h":0,"e":1,"l":2,"o":3,"Ġ":4,"w":5,"r":6,"d":7,"hello":8,"a":9,"b":10,"he":11,"hel":12,"hell":13},"merges":[["h","e"],["he","l"],["hel","l"],["hell","o"]]}}"#;
 
@@ -294,12 +294,12 @@ fn wrapped_generation_prompt_falls_back_to_three_pass() {
 /// The real-corpus equivalence: recorded Claude Code conversation shapes
 /// (pure-append prefixes, tool results, tool_use, thinking) rendered with
 /// the REAL pinned template and tokenizer; requires the model dir (fails
-/// loudly when absent — the gate host provides it).
+/// loudly when absent — the test host provides it).
 #[test]
 fn derived_boundaries_match_three_pass_on_the_real_corpus() {
     // The model dir resolves through the shared helper (env override or
-    // the pinu default); absent means SKIP with a printed reason so
-    // portable hosts (the Mac gate) run everything else meaningfully.
+    // the default path); absent means SKIP with a printed reason so
+    // portable hosts (the Mac) run everything else meaningfully.
     let Some(dir) = qwen_model_dir() else {
         return;
     };
@@ -316,14 +316,14 @@ fn derived_boundaries_match_three_pass_on_the_real_corpus() {
     // The corpus carries ANTHROPIC WIRE requests (system prompt, real
     // tool_use ids/names/input, tool_result references, thinking blocks,
     // input_schema tools). Every conversation goes through the PRODUCTION
-    // converter (Sol SF1, round 2) — no hand adapter anywhere.
+    // converter — no hand adapter anywhere.
     let corpus: serde_json::Value =
         serde_json::from_str(include_str!("testdata/boundary-corpus.json")).expect("corpus");
     // At least one conversation carries a merged assistant message with a
     // thinking block AND a tool_use block (the production CC shape), and
     // the thinking payload must be a NON-EMPTY string — an absent, empty,
     // or non-string payload parses as absent thinking, which would make
-    // the merged-case pin below vacuous (#6 SF, round 1).
+    // the merged-case pin below vacuous.
     assert!(
         corpus["conversations"]
             .as_array()
@@ -366,8 +366,8 @@ fn derived_boundaries_match_three_pass_on_the_real_corpus() {
         );
         // The merged thinking+tool_use assistant message must survive the
         // production parse with BOTH payloads: non-empty reasoning_content
-        // and its tool calls (#6 SF, round 1). Only real-full carries the
-        // merged wire shape, so the pin is corpus-wide.
+        // and its tool calls. Only real-full carries the merged wire
+        // shape, so the pin is corpus-wide.
         converted_merged |= messages.iter().any(|m| {
             matches!(m.role, Role::Assistant)
                 && m.reasoning_content
@@ -420,11 +420,11 @@ fn derived_boundaries_match_three_pass_on_the_real_corpus() {
     assert_eq!(checked, 15, "corpus must exercise every conversation");
 }
 
-/// Sol MF1 regression: the conditional template with user content carrying
-/// the end token. Every alignment guard passes at the CURRENT tree (the
-/// probe suffix <|end|>hello matches the tail), the marker sits inside user
-/// content, and the old method yields no tip (head equals full render).
-/// The derivation must report derived=false and return the old result.
+/// Regression: the conditional template with user content carrying the end
+/// token. Every alignment guard passes at the CURRENT tree (the probe
+/// suffix <|end|>hello matches the tail), the marker sits inside user
+/// content, and the old method yields no tip (head equals full render). The
+/// derivation must report derived=false and return the old result.
 #[test]
 fn end_token_inside_user_content_never_derives() {
     let (_d, bundle) = fixture_bundle(TEMPLATE_CONDITIONAL);
@@ -442,9 +442,9 @@ fn end_token_inside_user_content_never_derives() {
     assert_eq!(three.1.root, derived.root);
 }
 
-/// Opus SF regression: lstrip=true on the boundary token lets the matcher
-/// eat head whitespace (user content `hello ` loses its trailing space),
-/// so the added-token split is not byte-faithful. Must fall back.
+/// Regression: lstrip=true on the boundary token lets the matcher eat
+/// head whitespace (user content `hello ` loses its trailing space), so
+/// the added-token split is not byte-faithful. Must fall back.
 #[test]
 fn lstrip_added_token_never_derives() {
     let (_d, bundle) = fixture_bundle_with(&lstrip_tokenizer_json(), TEMPLATE_CONTENT);
@@ -462,7 +462,7 @@ fn lstrip_added_token_never_derives() {
     assert_eq!(three.1.root, derived.root);
 }
 
-/// SF coverage: system/tool roles and multi-message conversations through
+/// Coverage: system/tool roles and multi-message conversations through
 /// the derived path WITHOUT suffix_override, counting that the suite sees
 /// both derived and fallback outcomes on the fixture template.
 #[test]
@@ -495,12 +495,12 @@ fn system_and_tool_roles_cover_the_derived_path() {
     assert!(exact, "system/tool/multi-message conversations must derive");
 }
 
-/// Opus round-3 SF, seam guard: a forced suffix the ids genuinely end
-/// with, at a VALID candidate index, but whose first token sits INSIDE the
-/// head render (the user content ends with the end token, so the pair
-/// straddles the seam). Only the byte-offset seam check can refuse this —
-/// every other guard passes. Mutant receipt: seam check -> true derives
-/// Some(len-3) where the reference tip is the head length.
+/// Seam guard: a forced suffix the ids genuinely end with, at a VALID
+/// candidate index, but whose first token sits INSIDE the head render (the
+/// user content ends with the end token, so the pair straddles the seam).
+/// Only the byte-offset seam check can refuse this — every other guard
+/// passes. Mutant receipt: seam check -> true derives Some(len-3) where
+/// the reference tip is the head length.
 #[test]
 fn forced_suffix_straddling_the_seam_is_refused_by_the_offset_check_only() {
     let (_d, bundle) = fixture_bundle(TEMPLATE_SPECIAL);
@@ -527,12 +527,12 @@ fn forced_suffix_straddling_the_seam_is_refused_by_the_offset_check_only() {
     assert_eq!(three.1.root, derived.root, "root must equal the reference");
 }
 
-/// Byte offsets, not char offsets (coordinator item): a multibyte emoji
-/// right before the generation suffix. The seam check compares the
-/// candidate token's offset against head.len() in BYTES ("user:hi" +
-/// 4-byte emoji); if a tokenizers version ever reported char offsets, the
-/// comparison would miss, derivation would silently fall back, and this
-/// test would go RED. It must derive.
+/// Byte offsets, not char offsets: a multibyte emoji right before the
+/// generation suffix. The seam check compares the candidate token's
+/// offset against head.len() in BYTES ("user:hi" + 4-byte emoji); if a
+/// tokenizers version ever reported char offsets, the comparison would
+/// miss, derivation would silently fall back, and this test would fail.
+/// It must derive.
 #[test]
 fn multibyte_seam_still_derives_with_byte_offsets() {
     let (_d, bundle) = fixture_bundle(TEMPLATE_SPECIAL);
@@ -552,9 +552,9 @@ fn multibyte_seam_still_derives_with_byte_offsets() {
     assert_eq!(three.1.root, derived.root);
 }
 
-/// Opus SF (round 2): rstrip=true lets the matcher consume whitespace
-/// AFTER the token's text, so the split is not byte-faithful. Load-time
-/// eligibility must refuse; ids and boundaries still equal the three-pass.
+/// `rstrip=true` lets the matcher consume whitespace AFTER the token's
+/// text, so the split is not byte-faithful. Load-time eligibility must
+/// refuse; ids and boundaries still equal the three-pass.
 #[test]
 fn rstrip_tokenizer_never_derives() {
     let (_d, bundle) = fixture_bundle_with(TOKENIZER_JSON_RSTRIP, TEMPLATE_CONTENT);
@@ -575,9 +575,9 @@ fn rstrip_tokenizer_never_derives() {
     assert_eq!(three.1.root, derived.root);
 }
 
-/// Opus SF (round 2): a configured padding (Fixed) appends pad ids, so the
-/// id stream is not the plain encoding. Load-time eligibility must refuse;
-/// ids and boundaries still equal the three-pass.
+/// A configured padding (Fixed) appends pad ids, so the id stream is not
+/// the plain encoding. Load-time eligibility must refuse; ids and
+/// boundaries still equal the three-pass.
 #[test]
 fn padded_tokenizer_never_derives() {
     let (_d, bundle) = fixture_bundle_with(TOKENIZER_JSON_PADDED, TEMPLATE_CONTENT);
@@ -598,9 +598,9 @@ fn padded_tokenizer_never_derives() {
     assert_eq!(three.1.root, derived.root);
 }
 
-/// Opus SF (round 2), work leg: on an ELIGIBLE tokenizer whose suffix
-/// never starts with an added token (TEMPLATE_PLAIN), the pre-screen skips
-/// the suffix encode and the fallback does no more work than three-pass.
+/// Work leg: on an ELIGIBLE tokenizer whose suffix never starts with an
+/// added token (TEMPLATE_PLAIN), the pre-screen skips the suffix encode
+/// and the fallback does no more work than three-pass.
 #[test]
 fn plain_suffix_eligible_fallback_does_no_more_work_than_three_pass() {
     let (_d, bundle) = fixture_bundle(TEMPLATE_PLAIN);
@@ -628,16 +628,16 @@ fn plain_suffix_eligible_fallback_does_no_more_work_than_three_pass() {
     );
 }
 
-/// Sol round-2 MF, exact counterexample (Replace "ox" -> ""): the user
-/// turn ends 'o', the generation prompt starts 'x<|end|>hello', so the
-/// deleted bytes straddle the head/suffix seam. The suffix's emitted ids
-/// START with the added end token (the dropped 'x' emits nothing), so an
-/// id-only check derives Some(1) where the reference tip is None (the
-/// head encode "helloo" -> [hello, o] is not a prefix of the full
+/// Exact counterexample (Replace "ox" -> ""): the user turn ends 'o',
+/// the generation prompt starts 'x<|end|>hello', so the deleted bytes
+/// straddle the head/suffix seam. The suffix's emitted ids START with
+/// the added end token (the dropped 'x' emits nothing), so an id-only
+/// check derives Some(1) where the reference tip is None (the head
+/// encode "helloo" -> [hello, o] is not a prefix of the full
 /// "hello<|end|>hello" ids). The raw-text pre-screen refuses the suffix
 /// ("x..." starts with no added text) and, with the screen bypassed, the
 /// byte-0 offset guard is what refuses (the first token starts at suffix
-/// byte 1, not 0) — see the mutant receipts in the packet.
+/// byte 1, not 0).
 #[test]
 fn normalized_away_seam_bytes_never_derives() {
     let template =
@@ -660,9 +660,9 @@ fn normalized_away_seam_bytes_never_derives() {
     assert_eq!(three.1.root, derived.root, "root must equal the reference");
 }
 
-/// Opus SF5: normalized=true on the boundary token — normalized matching
-/// can rewrite the token's text (case folding and the like), so the split
-/// is not byte-faithful. Must fall back.
+/// `normalized=true` on the boundary token — normalized matching can
+/// rewrite the token's text (case folding and the like), so the split is
+/// not byte-faithful. Must fall back.
 #[test]
 fn normalized_added_token_never_derives() {
     let (_d, bundle) = fixture_bundle_with(TOKENIZER_JSON_NORMALIZED, TEMPLATE_CONTENT);
@@ -683,9 +683,9 @@ fn normalized_added_token_never_derives() {
     assert_eq!(three.1.root, derived.root);
 }
 
-/// Opus SF4/SF5: single_word=true on the boundary token — word-boundary
-/// matching is contextual, so the seam is not inert. Must fall back (the
-/// `<|` start does not rescue it: the flag itself is the hazard).
+/// `single_word=true` on the boundary token — word-boundary matching is
+/// contextual, so the seam is not inert. Must fall back (the `<|` start
+/// does not rescue it: the flag itself is the hazard).
 #[test]
 fn single_word_added_token_never_derives() {
     let (_d, bundle) = fixture_bundle_with(TOKENIZER_JSON_SINGLE_WORD, TEMPLATE_CONTENT);
@@ -706,8 +706,8 @@ fn single_word_added_token_never_derives() {
     assert_eq!(three.1.root, derived.root);
 }
 
-/// Opus SF4: a single_word token in the vocabulary with a word-character
-/// suffix start — the seam could feed a word-boundary match across the
+/// A single_word token in the vocabulary with a word-character suffix
+/// start — the seam could feed a word-boundary match across the
 /// head/suffix boundary. The seam guard must refuse (no derivation), even
 /// though the boundary token itself matches cleanly.
 #[test]
@@ -733,11 +733,11 @@ fn word_start_suffix_with_single_word_vocab_never_derives() {
     assert_eq!(three.1.root, derived.root);
 }
 
-/// Sol MF1 (this round): a single_word token IN THE HEAD — 'aa' matches at
-/// the head's end (word boundary), but the full string's following word
-/// char 'b' invalidates that match, so encode(full) !=
-/// encode(head)++encode(suffix). The load-time eligibility (any single_word
-/// token disqualifies) must refuse the fast path: tip None, derived false.
+/// A single_word token IN THE HEAD — 'aa' matches at the head's end (word
+/// boundary), but the full string's following word char 'b' invalidates
+/// that match, so encode(full) != encode(head)++encode(suffix). The
+/// load-time eligibility (any single_word token disqualifies) must refuse
+/// the fast path: tip None, derived false.
 #[test]
 fn single_word_head_token_never_derives() {
     // Added 'aa' with single_word=true (id 14 in the fixture vocab), 'b'
@@ -764,9 +764,9 @@ fn single_word_head_token_never_derives() {
     assert_eq!(three.1.root, derived.root);
 }
 
-/// Sol MF2 (this round): a configured LEFT truncation rewrites the id
-/// stream (max_length 4), so suffix subtraction proves nothing. The
-/// load-time eligibility (truncation configured disqualifies) must refuse.
+/// A configured LEFT truncation rewrites the id stream (max_length 4), so
+/// suffix subtraction proves nothing. The load-time eligibility
+/// (truncation configured disqualifies) must refuse.
 #[test]
 fn left_truncated_tokenizer_never_derives() {
     let (_d, bundle) = fixture_bundle_with(TOKENIZER_JSON_TRUNCATED, TEMPLATE_CONTENT);
@@ -791,10 +791,10 @@ fn left_truncated_tokenizer_never_derives() {
     assert_eq!(three.1.root, derived.root);
 }
 
-/// Opus SF2 / COO (C): the derived path does no more bundle-level render
-/// and encode work than the three-pass reference — on the deriving path
-/// AND the fallback path. Counters are instrumented on every bundle-level
-/// render/encode call site.
+/// The derived path does no more bundle-level render and encode work than
+/// the three-pass reference — on the deriving path AND the fallback path.
+/// Counters are instrumented on every bundle-level render/encode call
+/// site.
 #[test]
 fn derived_path_does_no_more_work_than_three_pass() {
     let (_d, bundle) = fixture_bundle(TEMPLATE_SPECIAL);

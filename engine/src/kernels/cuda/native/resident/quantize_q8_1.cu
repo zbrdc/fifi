@@ -1,7 +1,7 @@
 /*
- * Entries of the vendored quantize_row_q8_1 (MATVEC-PAR S1 c3a) on an explicit stream. Glue only:
- * no kernel and no device logic of its own; every exported function has C linkage, takes and
- * returns C types only, and wraps its body in try/catch, like the projector adapter.
+ * Entries of the vendored quantize_row_q8_1 on an explicit stream. Glue only: no kernel and no
+ * device logic of its own; every exported function has C linkage, takes and returns C types only,
+ * and wraps its body in try/catch, like the projector adapter.
  */
 #include <cuda_runtime.h>
 

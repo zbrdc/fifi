@@ -1,6 +1,6 @@
 //! Raw FFI to inference_cuda_row_scale_launch of native/resident/row_scale.cu
 //! (declared in native/resident/row_scale.h). Child of native::resident, so it inherits
-//! the allow(unsafe_code) of native.rs (decision 0047, child modules of native.rs).
+//! the allow(unsafe_code) of native.rs.
 //!
 //! Safety invariants this module relies on:
 //! - A device range is proved in bounds by RawRange::new before it gets here. This module
@@ -12,7 +12,7 @@
 //! - The allocations stay valid until the queued launch finishes because
 //!   inference_cuda_free synchronizes the whole device before cudaFree.
 //! - Every call runs under the process dispatch guard and on the thread that owns the
-//!   context (decisions 0023 and 0024).
+//!   context.
 //! - No raw pointer and no unsafe function leaves this module.
 
 use std::ffi::{c_int, c_void};

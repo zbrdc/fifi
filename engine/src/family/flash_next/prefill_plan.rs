@@ -1,4 +1,4 @@
-//! Pure planning helpers for chunked prefill (decision 0044).
+//! Pure planning helpers for chunked prefill.
 //!
 //! These functions hold no tensors and make no native call. The resident prefill step uses them to
 //! merge the expert choices of a chunk, to plan positioned reads, and to pick the chunk size that
@@ -11,7 +11,7 @@ fn bad(message: &str) -> EngError {
     EngError::BadRequest(message.into())
 }
 
-/// Expert page sets lent at the same time during a prefill (decision 0044 item 5).
+/// Expert page sets lent at the same time during a prefill.
 const PREFILL_SETS: u32 = 2;
 
 /// Route ranges in one prefill page set: wave-local rank, token row, gate, inverse permutation.
@@ -131,15 +131,15 @@ pub(crate) fn coalesce_runs(distinct: &[u32]) -> Result<Vec<ExpertRun>, EngError
     Ok(runs)
 }
 
-/// The retire cap of a decode step and the base of the prefill retire cap: 64 MiB (decision 0039).
+/// The retire cap of a decode step and the base of the prefill retire cap: 64 MiB.
 pub(crate) const RETIRE_CAP_BASE: u64 = 64 << 20;
 
-/// The retire cap of the adapter while a prefill chunk runs: a flat 512 MiB (decision 0044 item 8
-/// as amended on 2026-10-09). The adapter returns to its previous cap after the chunk.
+/// The retire cap of the adapter while a prefill chunk runs: a flat 512 MiB. The adapter returns to
+/// its previous cap after the chunk.
 pub(crate) const PREFILL_RETIRE_CAP: u64 = 512 << 20;
 
 /// State-sized tensors that the unrolled DeltaNet loop drops per token and layer: the decayed
-/// state, the outer product, and the replaced state (packet PF-3).
+/// state, the outer product, and the replaced state.
 pub(crate) const DELTA_RETIRED_STATES: u64 = 3;
 
 /// Retired bytes of one chunk token in one DeltaNet layer: `3 * VH * KD * VD * 4` (F32 state).
@@ -200,7 +200,7 @@ pub(crate) fn delta_extra_syncs(delta_layers: u32, tokens: u32, sub: u32) -> Res
 
 /// Experts that each prefill page set holds for a chunk of `tokens` tokens when the union runs in
 /// waves of at most `wave_cap` experts. The pool is sized from `ChunkCost` so that admission and
-/// the pool use one rule (decision 0044 items 5 and 6): `min(experts, wave_cap, tokens * top_k)`.
+/// the pool use one rule: `min(experts, wave_cap, tokens * top_k)`.
 pub(crate) fn prefill_set_experts(
     experts: u32,
     top_k: u32,
@@ -282,7 +282,7 @@ impl ChunkCost {
 
     /// Adds the prefill retire cap to the cost: `PREFILL_RETIRE_CAP` (512 MiB) to `fixed`.
     ///
-    /// The cap is flat, so `per_token` does not change (decision 0044 item 8 as amended).
+    /// The cap is flat, so `per_token` does not change.
     pub(crate) fn with_retire_cap(self) -> Result<Self, EngError> {
         Ok(Self {
             fixed: self.fixed.checked_add(PREFILL_RETIRE_CAP).ok_or_else(|| {
@@ -339,19 +339,17 @@ pub(crate) fn largest_chunk(
     Ok(best)
 }
 
-/// The candidate chunk sizes of the admission rule (decision 0044 item 6). Packet PF-G can change
-/// the list.
+/// The candidate chunk sizes of the admission rule.
 pub(crate) const PREFILL_CANDIDATES: [u32; 11] = [2048, 1024, 512, 256, 128, 64, 32, 16, 8, 4, 1];
 
-/// Experts per wave, `U_w` (decision 0044 item 6). The first release runs one wave: 512 is the
-/// expert count of a layer. Packet PF-G can lower it.
+/// Experts per wave, `U_w`. The first release runs one wave: 512 is the expert count of a layer.
 pub(crate) const PREFILL_WAVE_CAP: u32 = 512;
 
-/// Activation bytes per chunk token, a planning value [A] of decision 0044.
+/// Activation bytes per chunk token, a planning value.
 const PLAN_PER_TOKEN: u64 = 800_000;
 
-/// Chunk bytes that do not depend on the chunk size, a planning value [A] of decision 0044. The
-/// retire cap and the route pages come on top.
+/// Chunk bytes that do not depend on the chunk size, a planning value. The retire cap and the route
+/// pages come on top.
 const PLAN_FIXED: u64 = 100_000_000;
 
 /// The admission cost of a prefill chunk on a model with `experts` experts per layer, `top_k`
@@ -378,16 +376,15 @@ pub(crate) fn admission_cost(
     .with_route_pages(page)
 }
 
-/// The bytes left for a prefill chunk (`remaining` of decision 0044 item 6): the engine budget
-/// minus the resident weights, the decode pool, the S3 cache, and the session reserve. A negative
-/// result is zero.
+/// The bytes left for a prefill chunk (`remaining` of the admission rule): the engine budget minus
+/// the resident weights, the decode pool, the S3 cache, and the session reserve. A negative result
+/// is zero.
 ///
-/// Item 6 lists `B - resident weights - session state - S3 cache - MLX cache limit - pressure
-/// margin`. The session reserve holds the last three terms that the caller owns: the session
-/// state, the MLX cache limit, and the pressure margin (see `FlashExecutor::plan_prefill`). The
-/// decode pool is an extra term: item 6 counts it as idle during prefill, and this function
-/// charges it anyway (the coordinator decision of packet H8b: conservative by 83,214,336 B on the
-/// real model).
+/// The admission rule is `B - resident weights - session state - S3 cache - MLX cache limit -
+/// pressure margin`. The session reserve holds the last three terms that the caller owns: the
+/// session state, the MLX cache limit, and the pressure margin (see `FlashExecutor::plan_prefill`).
+/// The decode pool is an extra term: the rule counts it as idle during prefill, and this function
+/// charges it anyway (conservative by 83,214,336 B on the real model).
 pub(crate) fn prefill_remaining(
     budget: u64,
     weights: u64,
@@ -402,16 +399,16 @@ pub(crate) fn prefill_remaining(
         .saturating_sub(session_reserve)
 }
 
-/// The terms that one admission charged, in bytes (decision 0044 item 6: the executor records
-/// which terms it charged). `Display` gives one `name=bytes` line per term and ends with the
-/// resulting `remaining_bytes`, so a report can print it unchanged.
+/// The terms that one admission charged, in bytes: the executor records which terms it charged.
+/// `Display` gives one `name=bytes` line per term and ends with the resulting `remaining_bytes`, so
+/// a report can print it unchanged.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct PrefillTerms {
     /// The engine budget `B`.
     pub(crate) budget: u64,
     /// The resident weights of this executor.
     pub(crate) weights: u64,
-    /// The decode pool: an extra term beyond item 6.
+    /// The decode pool: an extra term beyond the admission rule.
     pub(crate) decode_pool: u64,
     /// The S3 cache.
     pub(crate) s3_cache: u64,
@@ -452,9 +449,9 @@ pub(crate) struct PrefillPlan {
     pub(crate) terms: PrefillTerms,
 }
 
-/// The chunk size that the prefill runs, or `None` when it runs one-token steps (decision 0044
-/// item 6). It is the largest candidate that fits `remaining`. A chunk of one token is the
-/// one-token path, so a result of 1 is `None`.
+/// The chunk size that the prefill runs, or `None` when it runs one-token steps. It is the largest
+/// candidate that fits `remaining`. A chunk of one token is the one-token path, so a result of 1 is
+/// `None`.
 pub(crate) fn admitted_chunk(cost: &ChunkCost, remaining: u64) -> Result<Option<u32>, EngError> {
     Ok(largest_chunk(cost, &PREFILL_CANDIDATES, remaining)?.filter(|&tokens| tokens > 1))
 }
@@ -497,13 +494,12 @@ pub(crate) fn wave_count(union: u32, wave_cap: u32) -> Result<u32, EngError> {
 /// Splits the experts of a chunk route into waves of at most `wave_cap` experts.
 ///
 /// Wave `i` takes ranks `i * wave_cap` to `(i + 1) * wave_cap - 1` of `route.distinct`. Each pair
-/// joins the wave of its rank, and the pairs of a wave are ordered by (local rank, pair index):
-/// a stable sort by rank keeps the pair index ascending inside one rank, so every wave lists
+/// joins the wave of its rank, and the pairs of a wave are ordered by (local rank, pair index): a
+/// stable sort by rank keeps the pair index ascending inside one rank, so every wave lists
 /// non-decreasing local ranks and the concatenation of the wave pair lists holds the pairs in
-/// (rank, pair) order, the non-decreasing index order that `gather_qmm_sorted` requires (packet
-/// FN-PF-SORTED). The route must come from `union_and_remap`: ascending distinct experts, ranks
-/// below their count, one gate per pair, a whole number of tokens, and every expert used by at
-/// least one pair.
+/// (rank, pair) order, the non-decreasing index order that `gather_qmm_sorted` requires. The route
+/// must come from `union_and_remap`: ascending distinct experts, ranks below their count, one gate
+/// per pair, a whole number of tokens, and every expert used by at least one pair.
 pub(crate) fn split_waves(route: &ChunkRoute, wave_cap: u32) -> Result<WavePlan, EngError> {
     let union =
         u32::try_from(route.distinct.len()).map_err(|_| bad("prefill union exceeds u32"))?;
@@ -532,10 +528,10 @@ pub(crate) fn split_waves(route: &ChunkRoute, wave_cap: u32) -> Result<WavePlan,
             gates: Vec::new(),
         });
     }
-    // The pairs in (rank, pair) order: a stable sort by rank keeps the pair index ascending
-    // inside one rank, so each wave receives its pairs already ordered by (local rank, pair
-    // index) and the concatenation of the wave pair lists is the (rank, pair) order that the
-    // inverse permutation inverts (packet FN-PF-SORTED).
+    // The pairs in (rank, pair) order: a stable sort by rank keeps the pair index ascending inside
+    // one rank, so each wave receives its pairs already ordered by (local rank, pair index) and the
+    // concatenation of the wave pair lists is the (rank, pair) order that the inverse permutation
+    // inverts.
     let mut order: Vec<(u32, usize)> = route
         .rank_idx
         .iter()
@@ -583,11 +579,10 @@ pub(crate) fn split_waves(route: &ChunkRoute, wave_cap: u32) -> Result<WavePlan,
     Ok(WavePlan { waves, inverse })
 }
 
-/// Proves on the host the order that `gather_qmm_sorted` requires of one wave: the wave-local
-/// ranks of its pairs must be non-decreasing (packet FN-PF-SORTED). The wave import runs this
-/// check before it writes any page, because the method cannot read the device indices. An
-/// inversion returns a `BadRequest` whose text starts `flash-next prefill:`; an empty slice
-/// passes.
+/// Proves on the host the order that `gather_qmm_sorted` requires of one wave: the wave-local ranks
+/// of its pairs must be non-decreasing. The wave import runs this check before it writes any page,
+/// because the method cannot read the device indices. An inversion returns a `BadRequest` whose
+/// text starts `flash-next prefill:`; an empty slice passes.
 pub(crate) fn require_sorted_ranks(ranks: &[u32]) -> Result<(), EngError> {
     if ranks.is_sorted() {
         Ok(())
@@ -915,11 +910,11 @@ mod tests {
         }
     }
 
-    /// Packet FN-PF-SORTED task 2 and the fix round: the order proof that the wave import runs
-    /// before any device work of the wave. Hand derivations: `[0, 1, 1, 3, 5]` never falls and
-    /// the empty list has no adjacent pair, so both pass; `[0, 2, 1]` falls at the last window
-    /// (2 > 1), `[2, 1, 3]` falls at the first window (2 > 1), and the strictly descending
-    /// `[5, 4, 3, 2, 1]` falls at every window, so all three fail.
+    /// The order proof that the wave import runs before any device work of the wave. Hand
+    /// derivations: `[0, 1, 1, 3, 5]` never falls and the empty list has no adjacent pair, so both
+    /// pass; `[0, 2, 1]` falls at the last window (2 > 1), `[2, 1, 3]` falls at the first window
+    /// (2 > 1), and the strictly descending `[5, 4, 3, 2, 1]` falls at every window, so all three
+    /// fail.
     #[test]
     fn require_sorted_ranks_passes_sorted_and_empty_and_fails_one_inversion() {
         assert!(
@@ -943,8 +938,8 @@ mod tests {
     /// A hand-written route of the property test: token-major rows of (expert, gate) pairs.
     type Selections = Vec<Vec<(u32, f32)>>;
 
-    /// The hand-written route family of the property test (packet FN-PF-SORTED task 4a): seven
-    /// token-major routes over experts below 64, no RNG.
+    /// The hand-written route family of the property test: seven token-major routes over experts
+    /// below 64, no RNG.
     fn property_routes() -> Vec<(&'static str, Selections)> {
         vec![
             ("one token one expert", vec![vec![(5, 1.0)]]),
@@ -999,10 +994,10 @@ mod tests {
         ]
     }
 
-    /// Packet FN-PF-SORTED task 4a: for every route of the family and every wave cap, each wave
-    /// lists its pairs with non-decreasing local ranks that still name the pair's rank, token,
-    /// and gate in the route, the concatenated pair lists taken at `inverse` restore the
-    /// token-major pair order, and the multiset of (token, gate, rank) triples is unchanged.
+    /// For every route of the family and every wave cap, each wave lists its pairs with
+    /// non-decreasing local ranks that still name the pair's rank, token, and gate in the route,
+    /// the concatenated pair lists taken at `inverse` restore the token-major pair order, and the
+    /// multiset of (token, gate, rank) triples is unchanged.
     #[test]
     fn split_waves_sorts_ranks_and_keeps_the_inverse_and_the_multiset_over_a_family() {
         for (name, selections) in property_routes() {
@@ -1488,7 +1483,7 @@ mod tests {
         );
     }
 
-    /// The terms print in the order of decision 0044 item 6 with the decode pool as an extra term,
+    /// The terms print in the order of the admission rule with the decode pool as an extra term,
     /// and `remaining_bytes` equals the budget minus every charged term.
     #[test]
     fn the_charged_terms_print_every_byte_value_and_the_remaining_bytes() {

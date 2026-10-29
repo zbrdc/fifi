@@ -1,4 +1,4 @@
-//! Portable layout checks of the gated delta rule kernel (decision 0050).
+//! Portable layout checks of the gated delta rule kernel.
 //!
 //! The kernel is the Metal kernel of mlx-lm 0.31.0 (`engine/vendor/mlx-lm-gated-delta/`). It reads
 //! its operands as plain row-major arrays with these shapes, where `Hk` key heads serve `Hv` value

@@ -1,4 +1,4 @@
-//! Checkpoint-backed weights for the Flash-Next forward pass (decision 0035).
+//! Checkpoint-backed weights for the Flash-Next forward pass.
 
 use crate::{
     EngError,
@@ -309,7 +309,7 @@ pub(crate) fn read_slice(
 }
 
 /// Reads slices `indices` of `weight` in the given order and stacks them as
-/// `[indices.len(), slice_rows, cols]` (decision 0039 item 4).
+/// `[indices.len(), slice_rows, cols]`.
 pub(crate) fn read_stack(
     ckpt: &StreamedCheckpoint,
     weight: &SlicedWeight,
@@ -363,7 +363,7 @@ pub(crate) struct RoleRange {
     pub(crate) shape: Vec<u32>,
 }
 
-/// Page-aligned layout of one `count`-slice stack of a `SlicedWeight` (S2 plan section 4.4).
+/// Page-aligned layout of one `count`-slice stack of a `SlicedWeight`.
 ///
 /// The layout comes from the stored dtypes and shapes. Each role starts at a page multiple, and
 /// `end` is the next page multiple after the last role.

@@ -1,8 +1,8 @@
-/* CPF-7a part 1: argument validation and the one launch of swiglu_rows (contract:
- * prefill/swiglu_rows.h). The entry follows
- * attn_prep_chunk.cu (validate everything before any CUDA call, try/catch, C types only), and
- * the element is the upstream ggml_cuda_op_silu_single, called through the shim. In the MMQ
- * glue group (KUBDAN-MSG-85 ruling (b)): it is the silu half of PG3's composed reference. */
+/* Argument validation and the one launch of swiglu_rows (contract: prefill/swiglu_rows.h).
+ * The entry follows attn_prep_chunk.cu (validate everything before any CUDA call, try/catch,
+ * C types only), and the element is the upstream ggml_cuda_op_silu_single, called through the
+ * shim. In the MMQ glue group, because it is the silu half of the composed llama.cpp
+ * reference. */
 #include "prefill/swiglu_rows.h"
 
 #include <cuda_runtime.h>

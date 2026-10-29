@@ -1,4 +1,4 @@
-//! Chunk step assembly (packet Q36-E6; decision 0044 items 1, 4, 8, and 9 without the page pool).
+//! Chunk step assembly, without a page pool.
 //!
 //! `prefill` runs `T` prompt tokens. It splits them into chunks of at most `chunk_rows` tokens
 //! (each part at most the depth-aware size of `kv_plan::depth_ranges`, so the score matrix of a deep
@@ -10,7 +10,7 @@
 //! of the recurrence (`delta::gated_delta_recurrence`): the token-start import 1, then the routing
 //! mode of the decoder. `Routing::Host` (the reference) reads the probabilities and imports the
 //! sorted pairs of every layer (2 per layer, none for the last layer of a `Prompt` chunk);
-//! `Routing::Device` (the default, packet Q36-PF-DEVROUTE) makes none in a layer and instead
+//! `Routing::Device` (the default) makes none in a layer and instead
 //! evaluates the layer output every `EVAL_CADENCE` layers (see below) plus the one health readback
 //! of the chunk (the stacked router sums). Then `S` per DeltaNet layer when `S > 1` (one evaluation
 //! of the operands and `S - 1` part boundaries) and none when `S = 1`, one final `evaluate`, and
@@ -28,16 +28,15 @@
 //! poisoned before its first native call and publishes the new state only after the final
 //! `evaluate` and the readbacks succeed. A host check that fails first changes nothing.
 //!
-//! The activation dtype (packet Q36-BF16-b): a chunk runs the same boundary casts as the decode
-//! step of `step.rs` — the concatenated embedding rows, `bb`, the new keys and values, and the MoE
-//! combine convert at the block edges — and the same dtype guard runs after each norm, after each
-//! layer, and on every state tensor before the final `evaluate`; on the last layer of a `Prompt`
-//! chunk, where the head and the post norm are skipped, the guard runs on the layer's `mid` itself
-//! (fix1 of packet Q36-BF16-b). The DeltaNet state and the convolution ring stay F32 whatever
-//! the activation dtype, the key-value cache keeps its form's dtypes (packet KV8-INTEGRATE: F32
-//! keys and values, or U32 codes beside activation-dtype scales and biases), and the recorded
-//! rows read back as F32. An F32 decoder with the F32 cache form builds the same graph as before
-//! the packet: every cast shares the tensor it would have copied.
+//! The activation dtype: a chunk runs the same boundary casts as the decode step of `step.rs` — the
+//! concatenated embedding rows, `bb`, the new keys and values, and the MoE combine convert at the
+//! block edges — and the same dtype guard runs after each norm, after each layer, and on every
+//! state tensor before the final `evaluate`; on the last layer of a `Prompt` chunk, where the head
+//! and the post norm are skipped, the guard runs on the layer's `mid` itself. The DeltaNet state
+//! and the convolution ring stay F32 whatever the activation dtype, the key-value cache keeps its
+//! form's dtypes (F32 keys and values, or U32 codes beside activation-dtype scales and biases), and
+//! the recorded rows read back as F32. An F32 decoder with the F32 cache form builds the same graph
+//! as without the casts: every cast shares the tensor it would have copied.
 
 use super::super::attn::KvBuffers;
 use super::super::chunk_plan::{PREFILL_RETIRE_CAP, delta_retire_per_token, delta_subchunk};
@@ -60,8 +59,8 @@ use crate::{
     weights::StreamedCheckpoint,
 };
 
-/// Layers of a device-routed chunk between two evaluations of the layer output (packet
-/// Q36-PF-DEVROUTE). The value is 1: without the host routing synchronizations the retired bytes
+/// Layers of a device-routed chunk between two evaluations of the layer output. The value
+/// is 1: without the host routing synchronizations the retired bytes
 /// of the chunk would grow by one layer of MoE temporaries per layer (the `repeat`, the gathered
 /// products, and the un-sorted rows are about 208 MB per 512-row layer, on top of the projections
 /// of the mixer), and a wider cadence would cross the flat 512 MiB `PREFILL_RETIRE_CAP` of the
@@ -86,7 +85,7 @@ fn row_count(tokens: &[u32]) -> Result<u32, EngError> {
 }
 
 /// The query repeats per key-value head (`QH / KVH`, 8 on the real model): the width of the
-/// score matrix that the depth-aware chunk bound plans with (packet KV8-INTEGRATE item 6).
+/// score matrix that the depth-aware chunk bound plans with.
 fn repeat_count(shape: &crate::family::qwen36::host::HostShape) -> Result<u64, EngError> {
     let (heads_q, heads_kv) = (shape.attn.heads_q, shape.attn.heads_kv);
     if heads_kv == 0 || heads_q % heads_kv != 0 {
@@ -104,7 +103,7 @@ fn repeat_count(shape: &crate::family::qwen36::host::HostShape) -> Result<u64, E
 /// A failed host check or a denied growth permit (`MemoryPlan`) in a later chunk comes before
 /// `begin`. It leaves the state clean, with the earlier chunks published and `state.pos()` after
 /// the last of them. An error after `begin` poisons the state until `reset`. A chunk routes as its
-/// decoder holds (`Routing::Host` or `Routing::Device`, packet Q36-PF-DEVROUTE) and its result
+/// decoder holds (`Routing::Host` or `Routing::Device`) and its result
 /// has `routes: None`.
 pub(in super::super) fn prefill(
     decoder: &mut ResidentDecoder<'_>,
@@ -114,10 +113,10 @@ pub(in super::super) fn prefill(
 ) -> Result<StepResult, EngError> {
     let rows = row_count(tokens)?;
     state.check_chunk(&decoder.weights, decoder.context_limit, rows)?; // the whole prompt
-    // The depth-aware split (packet KV8-INTEGRATE item 6): a deterministic function of the
+    // The depth-aware split: a deterministic function of the
     // prompt length, the start position, and the chunk setting, so snapshots and prefix reuse
     // see the same boundaries on a recompute. It applies to both KV forms.
-    // The flash-prefill kernel (R4-5) materializes no score matrix, so under its whole
+    // The flash-prefill kernel materializes no score matrix, so under its whole
     // eligibility the budget split is moot and an unbounded budget keeps full chunks. Without
     // it, `Q36_PREFILL_QUERY_SLICE` (opt-in) moves the budget from the chunk to the query
     // block that `attn::chunk` runs.
@@ -183,9 +182,8 @@ pub(in super::super) fn chunk_with_cap(
 }
 
 /// Reads the embedding row of every token, imports the rows packed with one synchronization, and
-/// dequantizes them to `[T, hidden]` in the activation dtype (packet Q36-BF16-b; the dequantized
-/// rows are F32 and one cast moves them to BF16). A token outside the table returns `BadRequest`
-/// from the read.
+/// dequantizes them to `[T, hidden]` in the activation dtype (the dequantized rows are F32 and one
+/// cast moves them to BF16). A token outside the table returns `BadRequest` from the read.
 pub(in crate::family::qwen36::resident) fn embed_rows(
     ctx: &mut Ctx<'_>,
     ckpt: &StreamedCheckpoint,
@@ -201,7 +199,7 @@ pub(in crate::family::qwen36::resident) fn embed_rows(
         .iter()
         .map(|&token| stored::read_slice(ckpt, embed, token))
         .collect::<Result<Vec<PackedWeight>, _>>()?;
-    // The batched form (R4-7, Q36_FUSED_PREFILL=1): one host-side concat of the rows'
+    // The batched form (Q36_FUSED_PREFILL=1): one host-side concat of the rows'
     // payload/scales/biases bytes builds a single [T, hidden] PackedWeight, so ONE import and
     // ONE dequantize kernel replace the T per-row kernels and the concatenate pass. The
     // dequantize op is the same one the per-row path runs, so the rounding is identical by
@@ -319,13 +317,13 @@ fn run(
     let mut h = embed_rows(&mut ctx, ckpt, &weights.embed, tokens)?;
     let mut layers = Vec::with_capacity(old.len());
     let mut records = Vec::new();
-    // The device routing of packet Q36-PF-DEVROUTE collects one health node per layer and checks
+    // The device routing collects one health node per layer and checks
     // the stacked vector once at the chunk end. The host path checks every row inside
     // `route_experts` and holds no node.
     let mut healths: Vec<ExecutionTensor> = Vec::new();
     for (index, (layer, old_layer)) in weights.layers.iter().zip(old).enumerate() {
         let normed = ctx.kernels.rms_norm(&h, &layer.input_norm, shape.eps)?;
-        // Packet Q36-BF16-b: the same dtype guard as the decode step. MLX promotes mixed operands,
+        // The same dtype guard as the decode step. MLX promotes mixed operands,
         // so a stray F32 operand would turn BF16 activations back to F32 without an error.
         check_dtype("input norm output", &normed, ctx.consts.act)?;
         // The old layer state moves into its arm: an attention cache is consumed by `kv_append`
@@ -354,7 +352,7 @@ fn run(
             // The last layer's MoE output feeds only the head, which `Prompt` skips, so no post
             // norm runs after this `mid` and the recorded rows are gone: without this guard a
             // dropped `to_act` at a mixer out-projection would pass unnoticed on the last layer
-            // of a Prompt chunk (fix1 of packet Q36-BF16-b). Every other layer, and every other
+            // of a Prompt chunk. Every other layer, and every other
             // mode, is already covered: its `mid` meets the guarded post norm below.
             check_dtype("last layer mid", &mid, ctx.consts.act)?;
             h = mid;
@@ -406,9 +404,9 @@ fn run(
     } else {
         None
     };
-    // Packet Q36-BF16-b: the recurrent state and the convolution ring stay F32 whatever the
-    // activation dtype; the key-value cache keeps its form's dtypes (packet KV8-INTEGRATE), and
-    // the chunk refuses a graph that planned otherwise.
+    // The recurrent state and the convolution ring stay F32 whatever the activation dtype; the
+    // key-value cache keeps its form's dtypes, and the chunk refuses a graph that planned
+    // otherwise.
     for layer in &layers {
         match layer {
             LayerState::Delta { rec, ring } => {
@@ -444,7 +442,7 @@ fn run(
     }
     // One evaluate of the new state and the head outputs. A device-routed chunk also evaluates
     // the stacked health of its router blocks, so the readback of the stack that follows the
-    // evaluate is the one extra synchronization per chunk (packet Q36-PF-DEVROUTE).
+    // evaluate is the one extra synchronization per chunk.
     let health_stack = if healths.is_empty() {
         None
     } else {
@@ -678,7 +676,7 @@ mod tests {
             }
             assert_eq!(compared, 2, "{what}: both DeltaNet layers compared");
             // The logical charge follows the position; the storage is the exact hand-derived
-            // capacity (review B finding 4): every count of this helper (1, 8, and 40 positions)
+            // capacity: every count of this helper (1, 8, and 40 positions)
             // fits one default quantum of 256, so each layer stores exactly `KV_STEP` positions.
             let logical = u64::from(count) * GROWTH;
             let stored = kv_storage_bytes(state.layers());
@@ -746,7 +744,7 @@ mod tests {
         crate::family::qwen36::fixtures::checkpoint(entries)
     }
 
-    /// Packet Q36-PF-DEVROUTE: a chunk whose first row dequantizes to NaN has NaN router blocks.
+    /// A chunk whose first row dequantizes to NaN has NaN router blocks.
     /// The device path cannot check a row before it picks experts, so it fails at the chunk-end
     /// health readback with the `Backend` error of `route_experts`, after `begin`, and the state
     /// is poisoned until `reset`; the growth permit is released and the retire cap restored, as
@@ -808,7 +806,7 @@ mod tests {
         );
     }
 
-    /// Packet Q36-PF-DEVROUTE T6: the same 8-token chunk under both routings. Both select experts
+    /// The same 8-token chunk under both routings. Both select experts
     /// from the same F32 probability bits with the same tie rule, so every recorded layer row and
     /// the logits agree within 1e-6 relative (stated; the only differences are the F32 summation
     /// order of the gate renormalization and the place of the gate product). The device run goes
@@ -1024,13 +1022,13 @@ mod tests {
     }
 
     /// Synchronizations on the tiny model: 4 layers, 2 DeltaNet layers. Device routing (the
-    /// default, packet Q36-PF-DEVROUTE): one chunk of 8 rows makes the token-start import 1, one
+    /// default): one chunk of 8 rows makes the token-start import 1, one
     /// cadence evaluate per layer except the last 3, the final evaluate 1, and the health readback
     /// 1: `Prompt` 6, `Generate` 7 (plus the token), `Logits` 8 (plus the logits), `Record` 9
     /// (plus the layer rows). The gated delta kernel makes no synchronization, so `CAP_FOR_TWO`
     /// adds none: the counts stay `Prompt` 6 and `Record` 9. Eight rows in chunks of 3,
     /// 3, and 2 run `Prompt`, `Prompt`, and the requested mode: `6 + 6 + 9`. Host routing (the
-    /// reference) keeps the counts before the packet: `Prompt` 8 and `Generate`/`Logits`/`Record`
+    /// reference) makes more: `Prompt` 8 and `Generate`/`Logits`/`Record`
     /// 11/12/13.
     #[cfg(feature = "native-fault-qualification")]
     #[test]
@@ -1090,17 +1088,17 @@ mod tests {
         if top > 0.0 { diff / top } else { f64::INFINITY }
     }
 
-    /// Packet Q36-BF16-b: a BF16 decoder runs the chunk path, and the chunk equals the BF16
-    /// one-token steps within the mode: every recorded layer row and the logits keep a cosine of
-    /// at least 0.99999, the top 5 and the argmax are equal, and the next 8 greedy tokens are
-    /// equal. The max relative error is reported, not gated: BF16 rounding moves a row by more
-    /// than the 1e-4 of the F32 gates without changing the mode's decisions. The committed state
-    /// is F32 in every part with the position and charge of the chunk itself (fix1: asserted
-    /// right after the chunk, before the one-token steps and the greedy loop move them on), a
-    /// `Prompt` chunk commits the same F32 state through the last-layer mid guard, and the chunk
-    /// runs the default `Routing::Device` against `Host` one-token steps (the shape of the E8 g2
-    /// gate after packet Q36-PF-DEVROUTE): both paths select experts from the same F32 probability
-    /// bits with the same tie rule, so no device-routing near tie can flake the comparison.
+    /// A BF16 decoder runs the chunk path, and the chunk equals the BF16 one-token steps within the
+    /// mode: every recorded layer row and the logits keep a cosine of at least 0.99999, the top 5
+    /// and the argmax are equal, and the next 8 greedy tokens are equal. The max relative error is
+    /// reported, not gated: BF16 rounding moves a row by more than the 1e-4 of the F32 gates
+    /// without changing the mode's decisions. The committed state is F32 in every part with the
+    /// position and charge of the chunk itself (asserted right after the chunk, before the
+    /// one-token steps and the greedy loop move them on), a `Prompt` chunk commits the same F32
+    /// state through the last-layer mid guard, and the chunk runs the default `Routing::Device`
+    /// against `Host` one-token steps (the shape of the real-checkpoint gate 2): both paths select
+    /// experts from the same F32 probability bits with the same tie rule, so no device-routing near
+    /// tie can flake the comparison.
     #[test]
     fn a_bf16_chunk_matches_the_bf16_one_token_steps_within_the_mode() {
         let _serial = crate::native_test_lock();
@@ -1128,7 +1126,7 @@ mod tests {
             "the BF16 chunk",
         );
         // The state of the chunk itself, before the one-token steps and the greedy loop below
-        // move the position and the charge on (fix1 of packet Q36-BF16-b).
+        // move the position and the charge on.
         assert_eq!(chunked.pos(), tokens.len() as u32, "position");
         assert!(!chunked.is_poisoned(), "the chunk committed");
         assert_eq!(
@@ -1152,7 +1150,7 @@ mod tests {
         let mut stepped = decoder.zero_state().unwrap();
         let (last, before) = tokens.split_last().unwrap();
         // The chunk above ran the default device routing; the one-token path routes on the host
-        // (fix1, as the real gate): both select from the same probability bits, so only the
+        // (as in the real gate): both select from the same probability bits, so only the
         // accumulation of M > 1 against M = 1 differs, and no device near tie can flake the
         // top-5 and greedy equality below.
         decoder.set_routing(Routing::Host);
@@ -1203,7 +1201,7 @@ mod tests {
         }
         assert_eq!(a, b, "the next 8 greedy tokens of the mode");
         // A `Prompt` chunk runs the same guards without the head and without the last layer's
-        // MoE, so the last layer's `mid` carries the guard alone (fix1): it commits an F32 state
+        // MoE, so the last layer's `mid` carries the guard alone: it commits an F32 state
         // at the same position and returns nothing.
         let mut prompt = decoder.zero_state().unwrap();
         let got = ok(
@@ -1238,7 +1236,7 @@ mod tests {
         }
     }
 
-    /// Fix1 of packet Q36-BF16-b: the state guards are pinned separately from the casts. A BF16
+    /// The state guards are pinned separately from the casts. A BF16
     /// convolution ring handed to the chunk makes the mixed concatenate produce a BF16 new ring,
     /// and the chunk refuses it before the `evaluate` with the dtype guard text; the error leaves
     /// the state poisoned, because it happens after `begin`.
@@ -1298,7 +1296,7 @@ mod tests {
         );
     }
 
-    /// The Q8 form through the decoder's chunked prefill (packet KV8-INTEGRATE), in both
+    /// The Q8 form through the decoder's chunked prefill, in both
     /// activation dtypes: eight tokens in chunks of 3 rows (3, 3, 2) commit without a dtype-guard
     /// refusal, leave every attention cache in the Q8 form with U32 codes and scales and biases of
     /// the ACTIVATION dtype, hold all eight positions, charge the hand-derived Q8 bytes to the

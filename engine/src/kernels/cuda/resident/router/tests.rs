@@ -4,13 +4,12 @@
 //! rule of `route_experts` (libm `exp`, sequential sums) applied to the logits the device wrote.
 //! The test does not call `family::route_experts`: `kernels::cuda` never depends on `family`.
 //!
-//! The bounds are the class R1 of lane M: the margin `2^-10`, the weight and the gate `2^-17`.
-//! Rows whose selected set differs from the f64 set inside the margin are counted and reported,
-//! they do not fail (S1 and A5 handle real flips). The device `expf` and tree sum differ from libm
-//! by rounding, so a rank swap between probabilities within 4 ulp is counted as near-equal.
+//! The bounds are the class R1: the margin `2^-10`, the weight and the gate `2^-17`. Rows whose
+//! selected set differs from the f64 set inside the margin are counted and reported, they do not
+//! fail (later stages handle real flips). The device `expf` and tree sum differ from libm by
+//! rounding, so a rank swap between probabilities within 4 ulp is counted as near-equal.
 //!
-//! The device tests assume `--test-threads=1`, as the device suite is always run (decision 0040).
-//! T6 (a capture) is deferred to RD-11a: this base has no capture window (V9).
+//! The device tests assume `--test-threads=1`, as the device suite is always run.
 
 use crate::EngError;
 use crate::kernels::cuda::context::{CudaContext, DeviceRange, DeviceStream};
@@ -20,11 +19,11 @@ use crate::kernels::cuda::resident::router::{
 use crate::kernels::cuda::testkit::{self, Rng};
 use crate::kernels::cuda::{CapturePlan, DeviceBuffer};
 
-/// The R1 margin, `2^-10` (lane M REPLY-44, final by REPLY-50, decision 0047).
+/// The R1 margin, `2^-10` (final).
 const R1_MARGIN: f64 = 1.0 / 1024.0;
-/// The R1 bound on a weight, `2^-17` (REPLY-44, final by REPLY-50).
+/// The R1 bound on a weight, `2^-17` (final).
 const R1_WEIGHT: f64 = 1.0 / 131_072.0;
-/// The R1 bound on the shared gate, `2^-17` (REPLY-44, final by REPLY-50).
+/// The R1 bound on the shared gate, `2^-17` (final).
 const R1_GATE: f64 = 1.0 / 131_072.0;
 const POISON: u8 = 0x55;
 const SLACK: usize = 64;
@@ -1393,9 +1392,9 @@ fn router_logits_bytes_pins_the_scratch_rule() {
     assert!(router_logits_bytes(shape(2048, 256, 8, usize::MAX)).is_err());
 }
 
-// ---------------------------------------------------------------- T6 (RD-11a)
+// ---------------------------------------------------------------- T6: graph capture
 
-/// The capture plan of the owed tests: the rig owns every buffer, so no pin and no hold.
+/// The capture plan of the capture tests: the rig owns every buffer, so no pin and no hold.
 fn no_pins() -> CapturePlan<'static> {
     CapturePlan {
         pins: &[],
@@ -1428,8 +1427,8 @@ fn repoison(rig: &Rig<'_>) {
     }
 }
 
-/// T6 (RD-5, owed): one `router` call captured and replayed twice equals the eager run byte for
-/// byte, on a two-node graph (`router_logits_k` and `router_select_k`).
+/// T6: one `router` call captured and replayed twice equals the eager run byte for byte, on a
+/// two-node graph (`router_logits_k` and `router_select_k`).
 #[test]
 fn router_inside_a_capture_equals_eager() {
     if !testkit::device_present("router_inside_a_capture_equals_eager") {

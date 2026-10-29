@@ -1,22 +1,22 @@
 {
- "x-source-sha256": "9083fac4280bc38f3fdf886ed5f862d4321e294a740f4b67ca2d485fbb4fa927",
+ "x-source-sha256": "af2d7333f3d55de941c1a0a94f3fa383f34c86ba7269c86ee576725ef5b626a2",
  "components": {
   "securitySchemes": {
    "apiKey": {
     "type": "http",
     "scheme": "bearer",
-    "description": "When the server configures an API key, every request must carry that bearer token except routes whose security array is empty."
+    "description": "Send `Authorization: Bearer <key>`. Every path except /health and /ready requires the key. The server reads the key at startup from the environment variable that the `api_key_env` configuration key names, and it does not start without a key. A request with more than one Authorization header gets 401."
    },
    "apiKeyHeader": {
     "type": "apiKey",
     "in": "header",
     "name": "x-api-key",
-    "description": "The Anthropic client header. Only /v1/messages accepts it, as an alternative to the bearer form. A request that sets it must match the configured key; a set key that is wrong, not readable header text, or one of several rejects the request without fallback."
+    "description": "The Anthropic client header. /v1/messages and /v1/messages/count_tokens accept it as an alternative to the bearer token. When a request sets x-api-key, the server checks only that header: a wrong or unreadable value, or more than one x-api-key header, gets 401 even when the bearer token is valid."
    }
   },
   "responses": {
    "Unauthorized": {
-    "description": "The configured bearer credential is missing or invalid.",
+    "description": "The bearer token is missing or wrong. The code is unauthorized.",
     "content": {
      "application/json": {
       "schema": {
@@ -26,7 +26,7 @@
     }
    },
    "BadRequest": {
-    "description": "The request fails schema or bounds checks. A bounds failure names the field in error.message.",
+    "description": "Code bad_request: the request fails a schema or bounds check, and error.message names the field. A body larger than 16 MiB also gets bad_request. Code context_length_exceeded: the prompt is below the context limit of the engine but larger than its memory pool can hold now. error.message then reads \"prompt is too long: N tokens > M maximum\", where M is the largest prompt that fits now.",
     "content": {
      "application/json": {
       "schema": {
@@ -36,7 +36,7 @@
     }
    },
    "NotFound": {
-    "description": "The requested model, engine, or session does not exist.",
+    "description": "Code not_found: no engine serves the requested model, no engine has the x-engine id, or the request sets x-session.",
     "content": {
      "application/json": {
       "schema": {
@@ -46,7 +46,7 @@
     }
    },
    "CapacityConflict": {
-    "description": "MemoryPlan or ContextLimit rejects the requested capacity. MemoryPlan returns code memory_plan. ContextLimit returns code context_limit when the prompt exceeds the position limit of the engine. The resident Flash-Next path allows 2,051 positions today, so a prompt of 2,051 tokens or more returns 409. The status is never 400. The server checks this limit before admission.",
+    "description": "The request does not fit the engine. Code context_limit: the prompt has as many tokens as the context limit of the engine, or more. The server checks this before it queues the job, and error.message reads \"prompt is too long: N tokens > M maximum\", where M is the context limit minus one. Code memory_plan: the engine cannot reserve the memory that the request needs.",
     "content": {
      "application/json": {
       "schema": {
@@ -56,7 +56,7 @@
     }
    },
    "CheckpointFailure": {
-    "description": "A checkpoint or snapshot failed identity or load.",
+    "description": "Code checkpoint_failure: saved model or cache state failed to load or failed its identity check.",
     "content": {
      "application/json": {
       "schema": {
@@ -66,7 +66,7 @@
     }
    },
    "Overloaded": {
-    "description": "The bounded job queue cannot admit the request.",
+    "description": "Code overloaded: the queue of the engine is full, or the engine is stopped.",
     "content": {
      "application/json": {
       "schema": {
@@ -76,7 +76,7 @@
     }
    },
    "BackendFailure": {
-    "description": "Native initialization or model execution failed before response headers.",
+    "description": "Code backend_error: model execution failed, or the engine failed to load or stopped after a native backend failure. The message is always \"Model execution failed.\"",
     "content": {
      "application/json": {
       "schema": {
@@ -105,7 +105,7 @@
        },
        "code": {
         "type": "string",
-        "description": "Stable machine code for the failure class. The mapping from EngError variant to code is normative and lives in the server design, section Error codes. Only the /ready handler produces not_ready. No chat route returns it.",
+        "description": "The failure class. Only GET /ready returns not_ready.",
         "enum": [
          "bad_request",
          "unauthorized",
@@ -156,12 +156,13 @@
      "id",
      "object",
      "created",
-     "owned_by"
+     "owned_by",
+     "engines"
     ],
     "properties": {
      "id": {
       "type": "string",
-      "description": "Model name. Use this value in the \"model\" field of a chat request."
+      "description": "Model name. Send this value as the model field of a request."
      },
      "object": {
       "type": "string",
@@ -169,46 +170,18 @@
      },
      "created": {
       "type": "integer",
-      "description": "Unix time in seconds when the server started. OpenAI clients require this field."
+      "description": "Unix time in seconds when the server started."
      },
      "owned_by": {
-      "type": "string"
+      "type": "string",
+      "const": "local"
      },
      "engines": {
       "type": "array",
       "items": {
        "$ref": "#/components/schemas/Engine"
       },
-      "description": "Engines that hold this model right now."
-     }
-    }
-   },
-   "EngineOptions": {
-    "type": "object",
-    "properties": {
-     "cache_budget_mb": {
-      "type": "integer",
-      "minimum": 1,
-      "description": "Aggregate session-state reservation in MiB for this engine. All active and idle sessions share this cap, including KV, indexer, recurrent, auxiliary, history, and logit storage. Omission uses a cap derived from the engine memory plan."
-     },
-     "quantize_kv": {
-      "type": "boolean",
-      "default": false,
-      "description": "Store the key-value cache at 8 bits. The rope component of each key stays unquantized."
-     },
-     "memory_budget_mb": {
-      "type": "integer",
-      "minimum": 256,
-      "description": "Upper bound on memory this engine may hold. The server rejects the engine when the fleet plan cannot fit it."
-     },
-     "expert_tier": {
-      "type": "string",
-      "enum": [
-       "resident",
-       "ssd"
-      ],
-      "default": "resident",
-      "description": "\"ssd\" streams mixture-of-experts weights from disk. \"resident\" holds all weights in memory."
+      "description": "Server extension. The engines that serve this model, in the order of the configuration file."
      }
     }
    },
@@ -221,7 +194,8 @@
     ],
     "properties": {
      "id": {
-      "type": "string"
+      "type": "string",
+      "description": "The engine id from the configuration file. Send it as x-engine to select this engine."
      },
      "model": {
       "type": "string"
@@ -236,96 +210,7 @@
        "stopped",
        "native-failed"
       ],
-      "description": "A native failure is process-scoped (decision 0022). When it occurs, every engine becomes native-failed, drains, and the process exits. The engine_state gauge uses the integers loading=0, ready=1, busy=2, error=3, stopped=4, native-failed=5."
-     },
-     "options": {
-      "$ref": "#/components/schemas/EngineOptions"
-     },
-     "cache": {
-      "$ref": "#/components/schemas/CacheStats"
-     }
-    }
-   },
-   "EngineSpec": {
-    "type": "object",
-    "required": [
-     "model"
-    ],
-    "properties": {
-     "model": {
-      "type": "string"
-     },
-     "options": {
-      "$ref": "#/components/schemas/EngineOptions"
-     }
-    }
-   },
-   "CacheStats": {
-    "type": "object",
-    "required": [
-     "kv_bytes",
-     "prefix_hits",
-     "prefix_misses"
-    ],
-    "properties": {
-     "kv_bytes": {
-      "type": "integer",
-      "description": "Key-value cache bytes now held in memory."
-     },
-     "prefix_hits": {
-      "type": "integer",
-      "description": "Turns that reused a cached prefix."
-     },
-     "prefix_misses": {
-      "type": "integer"
-     },
-     "snapshot_bytes": {
-      "type": "integer",
-      "description": "Snapshot bytes now held on disk for this engine."
-     }
-    }
-   },
-   "Session": {
-    "type": "object",
-    "required": [
-     "id",
-     "engine",
-     "created_at"
-    ],
-    "properties": {
-     "id": {
-      "type": "string"
-     },
-     "engine": {
-      "type": "string"
-     },
-     "created_at": {
-      "type": "string",
-      "format": "date-time"
-     },
-     "persist": {
-      "type": "boolean",
-      "default": false,
-      "description": "True writes a snapshot after each turn. The session resumes after a server restart."
-     },
-     "tokens_held": {
-      "type": "integer",
-      "description": "Tokens the engine holds for this session."
-     }
-    }
-   },
-   "SessionSpec": {
-    "type": "object",
-    "required": [
-     "engine"
-    ],
-    "properties": {
-     "engine": {
-      "type": "string"
-     },
-     "persist": {
-      "type": "boolean",
-      "default": false
+      "description": "loading: the engine is starting. ready: it is idle. busy: it is running a job. error: it failed to load. stopped: it has shut down. native-failed: the native backend failed, and the engine takes no more jobs. A request to an engine in state error or native-failed gets 500 backend_error."
      }
     }
    },
@@ -337,10 +222,11 @@
     "properties": {
      "model": {
       "type": "string",
-      "description": "Without x-session, route to the first engine that holds this model unless x-engine selects an engine. With x-session, a model that conflicts with the session binding returns BadRequest from Phase 2. In Phase 1, a request with x-session that passes authentication, body size, and schema checks returns NotFound before the model is checked. A request that sets none of model, x-engine, and x-session returns BadRequest."
+      "description": "A model name from GET /v1/models. The server sends the request to the first engine that serves this model. x-engine overrides it. A request that sets none of model, x-engine, and x-session gets 400."
      },
      "messages": {
       "type": "array",
+      "minItems": 1,
       "items": {
        "$ref": "#/components/schemas/ChatMessage"
       }
@@ -361,23 +247,24 @@
       "type": "number",
       "minimum": 0,
       "maximum": 2,
-      "description": "The engine default from generation_config.json in the model directory of the engine that serves the request, else 0.7. A request that sets the field keeps its value."
+      "description": "0 selects greedy decoding. The default is the value in generation_config.json of the serving model, else 0.7."
      },
      "top_p": {
       "type": "number",
       "minimum": 0,
       "maximum": 1,
-      "description": "The engine default from generation_config.json in the model directory of the engine that serves the request, else 1.0. A request that sets the field keeps its value."
+      "description": "The default is the value in generation_config.json of the serving model, else 1.0."
      },
      "top_k": {
       "type": "integer",
       "minimum": 0,
-      "description": "The engine default from generation_config.json in the model directory of the engine that serves the request, else 0 (off). A request that sets the field keeps its value."
+      "description": "0 turns top-k off. The default is the value in generation_config.json of the serving model, else 0."
      },
      "max_tokens": {
       "type": "integer",
       "default": 2048,
-      "minimum": 1
+      "minimum": 1,
+      "description": "The server lowers it when the prompt plus max_tokens would pass the context limit of the engine."
      },
      "stream": {
       "type": "boolean",
@@ -391,10 +278,20 @@
        "off"
       ],
       "default": "default",
-      "description": "Maps to the chat template enable_thinking flag of the family."
+      "description": "Server extension. Sets the enable_thinking flag of the chat template of the model. default keeps the default of the template."
+     },
+     "chat_template_kwargs": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+       "enable_thinking": {
+        "type": "boolean"
+       }
+      },
+      "description": "The thinking switch in the form that vLLM and SGLang accept. enable_thinking true acts as x-thinking on, and false as x-thinking off. Any other key gets 400. An enable_thinking value that disagrees with an x-thinking of on or off gets 400."
      },
      "stop": {
-      "description": "Stop sequences match on decoded text.",
+      "description": "Stop strings. They match on the decoded text.",
       "type": "array",
       "items": {
        "type": "string"
@@ -402,11 +299,11 @@
      },
      "x-engine": {
       "type": "string",
-      "description": "Without x-session, this engine id takes precedence over model. With x-session, an engine that conflicts with the session binding returns BadRequest from Phase 2. In Phase 1, a request with x-session that passes authentication, body size, and schema checks returns NotFound."
+      "description": "Server extension. The id of the engine to use (see GET /v1/models). When it is set, the server ignores model. An unknown id gets 404."
      },
      "x-session": {
       "type": "string",
-      "description": "In Phase 1, no session registry exists. A request with x-session that passes authentication, body size, and schema checks returns NotFound. From Phase 2, resolve this session and its engine binding. A missing session returns NotFound. From Phase 2, a conflicting model or x-engine returns BadRequest. Prefix reuse follows the cache rules, not unconditional processing of unheld tokens. Without x-session, create one anonymous session with empty private state. Release it after completion and GPU teardown."
+      "description": "Reserved. This server keeps no named sessions, so a request that sets x-session gets 404."
      }
     }
    },
@@ -428,12 +325,12 @@
      "strict": {
       "type": "boolean",
       "default": false,
-      "description": "Requests typed argument values that follow parameters. Until the grammar packets of decision 0045 land, the server accepts this field and applies no constraint. The server parses tool calls from the output in all cases."
+      "description": "Accepted but not enforced: the server does not constrain decoding to the parameters schema. It parses tool calls from the model output in all cases."
      }
     }
    },
    "ResponseFormat": {
-    "description": "Output format. The type text is the default and applies no constraint. Until the grammar packets of decision 0045 land, the types json_object and json_schema return 400 bad_request. The server never ignores them silently.",
+    "description": "Output format. text is the default and applies no constraint. json_object and json_schema get 400 bad_request, because the server has no constrained decoding.",
     "oneOf": [
      {
       "type": "object",
@@ -512,7 +409,7 @@
     }
    },
    "ToolChoice": {
-    "description": "none disables tool calls. auto permits tool calls. required requires a tool call. The object selects one named function. Until the grammar packets of decision 0045 land, the server cannot enforce required or a named function. It returns 400 bad_request for both and never treats them as a prompt hint.",
+    "description": "none removes the tools from the prompt. auto, the default, lets the model decide. required and a named function get 400 bad_request, because the server cannot force a tool call.",
     "oneOf": [
      {
       "type": "string",
@@ -577,7 +474,7 @@
        },
        "arguments": {
         "type": "string",
-        "description": "JSON encoded arguments. A completed call carries a JSON object as text."
+        "description": "The arguments as JSON text. A completed call carries a JSON object."
        }
       }
      }
@@ -588,7 +485,7 @@
     "required": [
      "index"
     ],
-    "description": "One tool call fragment in a stream. Clients group fragments by index. The first fragment of a call carries id, type, and function.name. Later fragments of the same call carry function.arguments only. A client concatenates the arguments strings in stream order.",
+    "description": "One tool call entry in a stream. The server sends each completed call as two entries with the same index. The first carries id, type, function.name, and an empty function.arguments. The second carries the whole function.arguments. A client that joins the arguments strings of one index in stream order gets the full text.",
     "properties": {
      "index": {
       "type": "integer",
@@ -610,7 +507,7 @@
        },
        "arguments": {
         "type": "string",
-        "description": "A fragment of the JSON encoded arguments."
+        "description": "A fragment of the arguments JSON text."
        }
       }
      }
@@ -736,7 +633,13 @@
         }
        }
       },
-      "description": "A string, or an array of text parts whose text the server concatenates in order with no separator. Null is valid on an assistant message that carries tool calls."
+      "description": "A string, or an array of text parts whose text the server joins in order with no separator. Null is valid on an assistant message that carries tool calls."
+     },
+     "name": {
+      "description": "A participant name, passed to the chat template. The server ignores a value that is not a string."
+     },
+     "reasoning_content": {
+      "description": "The reasoning text of an earlier assistant turn. The server passes it to the chat template of the model, which decides whether to render it. The server ignores a value that is not a string."
      },
      "tool_call_id": {
       "type": "string",
@@ -759,7 +662,8 @@
     ],
     "properties": {
      "prompt_tokens": {
-      "type": "integer"
+      "type": "integer",
+      "description": "All prompt tokens, including the ones that a cached prefix served."
      },
      "completion_tokens": {
       "type": "integer"
@@ -770,7 +674,7 @@
      },
      "reused_tokens": {
       "type": "integer",
-      "description": "Prompt tokens served from the saved prefix state; 0 when a stop string ended the reply."
+      "description": "Server extension. Prompt tokens that a cached prefix served, so the engine did not compute them again. It is 0 when a stop string ended the reply before the engine finished the job."
      },
      "prompt_tokens_details": {
       "type": "object",
@@ -780,10 +684,10 @@
       "properties": {
        "cached_tokens": {
         "type": "integer",
-        "description": "The served prefix count, clamped to prompt_tokens (min(reused_tokens, prompt_tokens)); equals reused_tokens whenever the reuse accounting is consistent. prompt_tokens INCLUDES cached tokens (OpenAI semantics), unlike the Anthropic input_tokens contract."
+        "description": "reused_tokens, capped at prompt_tokens."
        }
       },
-      "description": "Present by default; any ENGINESRV_CACHE_USAGE value other than the exact 1, true, or on removes it (the switch also governs the Anthropic cache fields)."
+      "description": "One of the cache usage fields: absent when ENGINESRV_CACHE_USAGE turns them off (see the API description)."
      }
     }
    },
@@ -803,15 +707,15 @@
        "string",
        "null"
       ],
-      "description": "Null is valid when the message carries tool calls. This field never contains the text of a think block."
+      "description": "Null when the message has tool calls and no text. It never contains the text of a think block."
      },
      "reasoning_content": {
       "type": "string",
-      "description": "Optional extension. The text of the think block, without the think tags. The server omits the field when the reply has no think block."
+      "description": "Server extension. The text of the think block, without the think tags. Absent when the reply has no think block."
      },
      "tool_calls": {
       "type": "array",
-      "description": "Present when the model completed at least one tool call. Each call has a server generated id.",
+      "description": "Present when the model completed at least one tool call. The server generates the id of each call.",
       "items": {
        "$ref": "#/components/schemas/ToolCall"
       }
@@ -838,7 +742,8 @@
        "stop",
        "length",
        "tool_calls"
-      ]
+      ],
+      "description": "stop: end of sequence or a stop string matched. length: the reply reached max_tokens or the context limit of the engine. tool_calls: at least one tool call completed."
      }
     }
    },
@@ -849,6 +754,7 @@
      "object",
      "created",
      "model",
+     "engine",
      "choices",
      "usage"
     ],
@@ -869,10 +775,8 @@
       "description": "Name of the model that served the request."
      },
      "engine": {
-      "type": "string"
-     },
-     "session": {
-      "type": "string"
+      "type": "string",
+      "description": "Server extension. The id of the engine that served the request."
      },
      "choices": {
       "type": "array",
@@ -895,15 +799,15 @@
      },
      "content": {
       "type": "string",
-      "description": "Never contains the text of a think block."
+      "description": "Answer text. It never contains the text of a think block."
      },
      "reasoning_content": {
       "type": "string",
-      "description": "Optional extension. A fragment of the think block text, without the think tags. Fragments come before the first content fragment."
+      "description": "Server extension. A fragment of the think block text, without the think tags."
      },
      "tool_calls": {
       "type": "array",
-      "description": "Tool call fragments. The server sends no part of the tool call markup as content. A call appears here after the server has parsed it, with its id, name, and arguments. The final chunk carries finish_reason tool_calls when at least one call completed.",
+      "description": "Tool call entries. A call appears here only after the server has parsed all of it, and completed calls never appear in content. A malformed call, or a call when the request lists no tools, stays in content as raw text.",
       "items": {
        "$ref": "#/components/schemas/ToolCallDelta"
       }
@@ -930,7 +834,7 @@
        "length",
        "tool_calls"
       ],
-      "description": "Present on the final chunk only."
+      "description": "Present on the final chunk only. The values are those of Choice.finish_reason."
      }
     }
    },
@@ -941,6 +845,7 @@
      "object",
      "created",
      "model",
+     "engine",
      "choices"
     ],
     "properties": {
@@ -960,10 +865,8 @@
       "description": "Name of the model that served the request."
      },
      "engine": {
-      "type": "string"
-     },
-     "session": {
-      "type": "string"
+      "type": "string",
+      "description": "Server extension. The id of the engine that served the request."
      },
      "choices": {
       "type": "array",
@@ -1028,7 +931,7 @@
     "properties": {
      "id": {
       "type": "string",
-      "description": "msg_ followed by the completion id of the chat pipeline."
+      "description": "A unique id that starts with msg_."
      },
      "type": {
       "type": "string",
@@ -1059,7 +962,7 @@
        "tool_use",
        null
       ],
-      "description": "end_turn on end of sequence, stop_sequence when a stop string matched, max_tokens on the output limit, tool_use when an assembled tool call completed."
+      "description": "end_turn: end of sequence. stop_sequence: a stop string matched. max_tokens: the reply reached max_tokens or the context limit of the engine. tool_use: at least one tool call completed. Null only in the message_start event of a stream."
      },
      "stop_sequence": {
       "type": [
@@ -1108,7 +1011,7 @@
        },
        "signature": {
         "type": "string",
-        "description": "Empty. This engine signs nothing."
+        "description": "Always empty. The server does not sign thinking blocks."
        }
       }
      },
@@ -1147,18 +1050,18 @@
     "properties": {
      "input_tokens": {
       "type": "integer",
-      "description": "With the split on (the shipped default; any ENGINESRV_CACHE_USAGE value other than the exact 1, true, or on \u2014 empty, 0, false, TRUE included \u2014 forces the legacy whole-prompt shape), the final usage \u2014 the message body and message_delta \u2014 carries exactly the prompt tokens not served from the saved prefix (the Anthropic contract EXCLUDES cached tokens from input_tokens), and input_tokens + cache_read_input_tokens + cache_creation_input_tokens equals the whole prompt on every row the engine produces; a reader that consumes input_tokens alone then sees less than the full prompt \u2014 that is the contract, not a bug. message_start always carries the WHOLE prompt (the split is not known yet). After a stop string ended the reply the cache fields are 0 and input_tokens is the whole prompt."
+      "description": "With the cache usage fields on (the default), the prompt tokens that no cached prefix served, so input_tokens + cache_read_input_tokens + cache_creation_input_tokens is the whole prompt. With the fields off, the whole prompt. The message_start event of a stream always reports the whole prompt, because the cached count is known only at the end."
      },
      "output_tokens": {
       "type": "integer"
      },
      "cache_read_input_tokens": {
       "type": "integer",
-      "description": "Present by default; any ENGINESRV_CACHE_USAGE value other than the exact 1, true, or on removes it. Prompt tokens served from the saved prefix state; 0 in message_start (the split is not known until the job finishes) and on cold rows."
+      "description": "Prompt tokens that a cached prefix served. 0 in message_start, and 0 when a stop string ended the reply before the engine finished the job. Absent when the cache usage fields are off."
      },
      "cache_creation_input_tokens": {
       "type": "integer",
-      "description": "Present by default; any ENGINESRV_CACHE_USAGE value other than the exact 1, true, or on removes it; always 0 \u2014 the engine stores prefixes but never bills creation."
+      "description": "Always 0. Absent when the cache usage fields are off."
      }
     }
    },
@@ -1171,7 +1074,8 @@
     ],
     "properties": {
      "model": {
-      "type": "string"
+      "type": "string",
+      "description": "A model name from GET /v1/models. The server sends the request to the first engine that serves this model."
      },
      "messages": {
       "type": "array",
@@ -1183,10 +1087,10 @@
      "max_tokens": {
       "type": "integer",
       "minimum": 1,
-      "description": "Required, unlike the chat path."
+      "description": "Required. The server lowers it when the prompt plus max_tokens would pass the context limit of the engine."
      },
      "system": {
-      "description": "A string or text blocks. Plain string items are accepted as an extension and join like text blocks. It becomes a leading system message. An explicit null counts as omitted."
+      "description": "A string, or an array of text blocks. Plain strings are also accepted as array items. It becomes a leading system message. Null counts as omitted."
      },
      "stop_sequences": {
       "type": [
@@ -1195,25 +1099,34 @@
       ],
       "items": {
        "type": "string"
-      }
+      },
+      "description": "Stop strings. An empty string gets 400."
      },
      "temperature": {
       "type": [
        "number",
        "null"
-      ]
+      ],
+      "minimum": 0,
+      "maximum": 2,
+      "description": "Same bounds and defaults as on the chat path."
      },
      "top_p": {
       "type": [
        "number",
        "null"
-      ]
+      ],
+      "minimum": 0,
+      "maximum": 1,
+      "description": "Same bounds and defaults as on the chat path."
      },
      "top_k": {
       "type": [
        "integer",
        "null"
-      ]
+      ],
+      "minimum": 0,
+      "description": "Same bounds and defaults as on the chat path."
      },
      "stream": {
       "type": [
@@ -1221,7 +1134,7 @@
        "null"
       ],
       "default": false,
-      "description": "Selects the SSE event stream. Null counts as omitted."
+      "description": "Selects the Messages event stream. Null counts as omitted."
      },
      "thinking": {
       "type": [
@@ -1239,14 +1152,15 @@
          "adaptive",
          "disabled"
         ],
-        "description": "Adaptive is Claude Code's default: the model decides. It maps to enabled; the engine's own thinking control owns the budget."
+        "description": "enabled and adaptive turn thinking on. disabled turns it off. Without the thinking field, the default of the chat template applies."
        },
        "budget_tokens": {
         "type": [
          "integer",
          "null"
         ],
-        "minimum": 1
+        "minimum": 1,
+        "description": "Checked to be a positive integer. The server does not limit thinking length by it."
        }
       }
      },
@@ -1291,10 +1205,11 @@
        "user",
        "assistant",
        "system"
-      ]
+      ],
+      "description": "system is an extension. It adds a system message at its position."
      },
      "content": {
-      "description": "A string, or an array of text, image, document, tool_result, thinking, and tool_use blocks. Image and document blocks become text notes. A tool_result becomes its own tool message in order. Assistant thinking blocks are dropped."
+      "description": "A string, or an array of blocks. Text blocks join with a blank line. user content takes text, image, document, and tool_result blocks. Each tool_result becomes a tool message in its position; is_error true puts \"Error: \" before its text. assistant content takes text, thinking, redacted_thinking, and tool_use blocks. Thinking text goes to the chat template of the model as reasoning history, and the template decides whether to render it. The server reads text only: a document with a text source adds its text, and image blocks and other document blocks become short text notes."
      }
     }
    },
@@ -1315,7 +1230,8 @@
       ]
      },
      "input_schema": {
-      "type": "object"
+      "type": "object",
+      "description": "Becomes the function parameters in the chat template."
      }
     }
    },
@@ -1333,7 +1249,7 @@
        "none",
        "tool"
       ],
-      "description": "any and tool return 400 until forced tool calls exist."
+      "description": "auto, the default, lets the model decide. none removes the tools from the prompt. any and tool get 400, because the server cannot force a tool call."
      },
      "disable_parallel_tool_use": {
       "type": [
@@ -1364,10 +1280,10 @@
      "max_tokens": {
       "type": "integer",
       "minimum": 1,
-      "description": "Accepted and ignored. Validated like on /v1/messages (an integer of at least 1) and then ignored \u2014 count_tokens schedules no generation."
+      "description": "Optional. Checked as on /v1/messages (an integer of at least 1), then ignored."
      },
      "system": {
-      "description": "A string or text blocks. Plain string items are accepted as an extension and join like text blocks. It becomes a leading system message. An explicit null counts as omitted."
+      "description": "A string, or an array of text blocks. Plain strings are also accepted as array items. It becomes a leading system message. Null counts as omitted."
      },
      "stop_sequences": {
       "type": [
@@ -1382,19 +1298,24 @@
       "type": [
        "number",
        "null"
-      ]
+      ],
+      "minimum": 0,
+      "maximum": 2
      },
      "top_p": {
       "type": [
        "number",
        "null"
-      ]
+      ],
+      "minimum": 0,
+      "maximum": 1
      },
      "top_k": {
       "type": [
        "integer",
        "null"
-      ]
+      ],
+      "minimum": 0
      },
      "stream": {
       "type": [
@@ -1402,7 +1323,7 @@
        "null"
       ],
       "default": false,
-      "description": "Accepted and ignored. count_tokens never streams."
+      "description": "Checked, then ignored. count_tokens never streams."
      },
      "thinking": {
       "type": [
@@ -1420,7 +1341,7 @@
          "adaptive",
          "disabled"
         ],
-        "description": "Adaptive is Claude Code's default: the model decides. It maps to enabled; the engine's own thinking control owns the budget."
+        "description": "enabled and adaptive turn thinking on. disabled turns it off. The setting can change the rendered prompt and so the count."
        },
        "budget_tokens": {
         "type": [
@@ -1467,7 +1388,7 @@
     "properties": {
      "input_tokens": {
       "type": "integer",
-      "description": "The number of tokens in the prompt."
+      "description": "The number of tokens in the rendered prompt."
      }
     }
    }
@@ -1511,7 +1432,7 @@
     "security": [],
     "responses": {
      "200": {
-      "description": "At least one engine is ready.",
+      "description": "At least one engine is in state ready or busy.",
       "content": {
        "application/json": {
         "schema": {
@@ -1530,7 +1451,7 @@
       }
      },
      "503": {
-      "description": "No engine is ready. Only this handler builds the body with code not_ready.",
+      "description": "No engine is in state ready or busy. The code is not_ready, and error.message lists the state of each engine.",
       "content": {
        "application/json": {
         "schema": {
@@ -1551,7 +1472,7 @@
       "$ref": "#/components/responses/Unauthorized"
      },
      "200": {
-      "description": "Models with their engines.",
+      "description": "The models of the configured engines, with their engines.",
       "content": {
        "application/json": {
         "schema": {
@@ -1583,9 +1504,9 @@
    "post": {
     "operationId": "createChatCompletion",
     "summary": "Chat completion",
-    "description": "Set stream to true for server-sent events. From Phase 2, session routing preserves the session binding. The stream field selects the response media type. The server ignores Accept. Before response headers, all listed errors return JSON even when stream is true. A streaming response sends its headers and the role chunk when the server admits the job, before prefill starts. Until the first data event, the server sends the SSE comment line \": keep-alive\" every 15 seconds. After headers, any error sends exactly one event: error whose JSON data matches Error (BackendError for a backend failure), then closes the stream without a success finish event, usage event, or [DONE]. A prompt above the position limit of the engine returns 409 context_limit before admission. The server returns 400 bad_request for response_format of type json_object or json_schema, and for tool_choice required or a named function, until the grammar packets of decision 0045 land. Client disconnect cancels the job. The server closes that stream without [DONE] and without an error event. A job whose bounded output channel is full with no reader is cancelled. The server closes that stream as on disconnect. No timeout applies. Tokens do not cross jobs. finish_reason is stop on end of sequence or a stop-sequence match, length on the max_tokens limit, and tool_calls when an assembled tool call completes.",
+    "description": "OpenAI-compatible chat completion. Set stream to true for server-sent\nevents. The stream field alone selects the response type; the server\nignores Accept.\n\nEvery error before the response headers is a JSON reply with one of\nthe statuses below, also when stream is true. A streaming response\nsends its headers and the first chunk as soon as the engine queue\naccepts the job, before the prompt is processed. After that, an\nerror arrives as one `event: error` in the stream. For example, a\nprompt that does not fit the memory pool then arrives as an error\nevent with code context_length_exceeded, not as a 400.\n\nA client disconnect cancels the job. When a client reads a stream\ntoo slowly and the output buffer of the job fills, the server also\ncancels the job. In both cases the stream closes without [DONE] and\nwithout an error event. No request timeout applies.",
     "requestBody": {
-     "description": "The chat body has a 16 MiB cap. Larger bodies return BadRequest.",
+     "description": "The body may be at most 16 MiB. A larger body gets 400 bad_request.",
      "required": true,
      "content": {
       "application/json": {
@@ -1611,7 +1532,7 @@
            "$ref": "#/components/schemas/ChatCompletionChunk"
           }
          ],
-         "description": "Each token event has this shape:\ndata: {\"id\":\"...\",\"object\":\"chat.completion.chunk\",\"created\":1700000000,\"model\":\"...\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"...\"}}]}\nThe first event carries delta.role assistant. Later events omit it.\nThe server sends the headers and this first event at admission.\nUntil the first data event, the server sends the comment line\n\": keep-alive\" followed by a blank line every 15 seconds.\nClients ignore comment lines.\nThink block text arrives in delta.reasoning_content. It never\narrives in delta.content.\nTool calls arrive in delta.tool_calls. Each entry has an index.\nThe first entry of a call has id, type, and function.name.\nEntries carry function.arguments fragments.\nA blank line ends each event.\nThe final event carries usage. Its choice carries finish_reason.\nfinish_reason is tool_calls when at least one call completed.\nA successful stream ends with data: [DONE].\nAfter response headers, any error sends exactly one\nevent: error event whose JSON data matches Error\n(BackendError for a backend failure). Example:\nevent: error\ndata: {\"error\":{\"message\":\"Model execution failed.\",\"code\":\"backend_error\"}}\nThe server then closes the stream without a success\nfinish event, usage event, or [DONE] marker."
+         "description": "Each event is one data line with a ChatCompletionChunk as JSON, then a blank line:\ndata: {\"id\":\"...\",\"object\":\"chat.completion.chunk\",\"created\":1700000000,\"model\":\"...\",\"engine\":\"...\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"...\"}}]}\nThe first chunk carries delta.role assistant and empty content.\nThink block text arrives in delta.reasoning_content, never in delta.content.\nEach completed tool call arrives in delta.tool_calls as two entries (see ToolCallDelta).\nThe final chunk has an empty delta, finish_reason, and usage.\nA successful stream ends with data: [DONE].\nAfter any 15 seconds without an event, the server sends the comment\nline \": keep-alive\" and a blank line. Clients ignore comment lines.\nAn error after the response headers sends one event, for example:\nevent: error\ndata: {\"error\":{\"message\":\"Model execution failed.\",\"code\":\"backend_error\"}}\nIts data matches Error, or BackendError for a backend failure. The\nserver then closes the stream without a final chunk or [DONE]."
         }
        }
       }
@@ -1644,7 +1565,7 @@
    "post": {
     "operationId": "createMessage",
     "summary": "Anthropic Messages",
-    "description": "The Anthropic client path. A request carries the same bearer credential or the Anthropic x-api-key header. The body converts into the chat pipeline: system becomes a leading system message, text blocks join with a blank line, image and document blocks become text notes, tool_result blocks become tool messages in order, and assistant thinking blocks in history are dropped, because the chat template has no reasoning history. tool_choice any and tool return 400 until forced tool calls exist. With stream true the reply is the Messages event stream; a failure before the headers stays a JSON status reply even when streaming was requested, and a client disconnect or engine abort closes the stream with no error event and no message_stop. Capacity failures (memory plan, context limit) return 400 invalid_request_error, not 409: the Messages contract has no 409. The beta query parameter is accepted and ignored.",
+    "description": "Anthropic-compatible Messages. Authenticate with the bearer token or\nthe x-api-key header. The model field selects the engine; x-engine is\nnot available on this path. The server converts the request into a\nchat request: system becomes a leading system message, and each\ntool_result block becomes a tool message in its position (see\nMessageRequestMessage). The server ignores query parameters such as\nbeta.\n\nWith stream true, the reply is the Messages event stream. Every error\nbefore the response headers is a JSON reply, also when streaming. A\nclient disconnect or an aborted job closes the stream with no error\nevent and no message_stop.\n\nContext and memory failures get 400 invalid_request_error; this path\nhas no 409. For a prompt that is too long, error.message reads\n\"prompt is too long: N tokens > M maximum\". A checkpoint failure gets\n500 api_error.",
     "security": [
      {
       "apiKey": []
@@ -1654,7 +1575,7 @@
      }
     ],
     "requestBody": {
-     "description": "The body has the same 16 MiB cap as the chat path.",
+     "description": "The body may be at most 16 MiB.",
      "required": true,
      "content": {
       "application/json": {
@@ -1676,13 +1597,13 @@
        "text/event-stream": {
         "schema": {
          "type": "string",
-         "description": "Each event is a named SSE event whose data holds one JSON\nobject. The sequence is message_start, then\ncontent_block_start, content_block_delta, and\ncontent_block_stop for each content block, then\nmessage_delta with the stop reason and the usage totals,\nthen message_stop. The usage of message_start counts the\ninput tokens of the accepted request; message_delta carries\nthe final totals. A failure after the headers is one error\nevent in the Anthropic error shape, and the stream ends.\nAfter any quiet 15-second interval, the server sends the\ncomment line \": keep-alive\" followed by a blank line."
+         "description": "Each event is a named SSE event whose data holds one JSON\nobject. The sequence is message_start, then\ncontent_block_start, content_block_delta, and\ncontent_block_stop for each content block, then\nmessage_delta with the stop reason and the final usage,\nthen message_stop. The usage of message_start reports the\nwhole prompt as input_tokens. A failure after the headers\nis one error event in the AnthropicError shape, and the\nstream ends. After any 15 seconds without an event, the\nserver sends the comment line \": keep-alive\" and a blank\nline."
         }
        }
       }
      },
      "400": {
-      "description": "The request fails a schema or bounds check, or fails a capacity check. error.type is invalid_request_error.",
+      "description": "The request fails a schema or bounds check, or it does not fit the context limit or the memory of the engine. error.type is invalid_request_error.",
       "content": {
        "application/json": {
         "schema": {
@@ -1702,7 +1623,7 @@
       }
      },
      "404": {
-      "description": "The model does not exist. error.type is not_found_error.",
+      "description": "No engine serves the model. error.type is not_found_error.",
       "content": {
        "application/json": {
         "schema": {
@@ -1722,7 +1643,7 @@
       }
      },
      "500": {
-      "description": "Model execution or its checkpoint setup failed. error.type is api_error.",
+      "description": "Model execution failed, or saved state failed to load. error.type is api_error, and error.message is \"Model execution failed.\"",
       "content": {
        "application/json": {
         "schema": {
@@ -1732,7 +1653,7 @@
       }
      },
      "503": {
-      "description": "The queue refuses the job. error.type is overloaded_error.",
+      "description": "The queue of the engine is full, or the engine is stopped. error.type is overloaded_error.",
       "content": {
        "application/json": {
         "schema": {
@@ -1748,7 +1669,7 @@
    "post": {
     "operationId": "countTokens",
     "summary": "Anthropic count_tokens",
-    "description": "The Anthropic token-counting path. A request carries the same bearer credential or the Anthropic x-api-key header and the same 16 MiB body cap as /v1/messages. The body parses the same way, except max_tokens is not a parameter of count_tokens: a body may omit it, and a provided value is accepted and ignored. The prompt renders and tokenizes through the same tokenizer path as the chat pipeline; no engine job runs and nothing streams. The reply is the input token count of the rendered prompt.",
+    "description": "Anthropic-compatible token counting. Authentication, the 16 MiB body cap, and body parsing are the same as on /v1/messages, except that max_tokens is optional and ignored. The server renders the prompt with the chat template of the model and tokenizes it. No engine job runs, and nothing streams.",
     "security": [
      {
       "apiKey": []
@@ -1758,7 +1679,7 @@
      }
     ],
     "requestBody": {
-     "description": "The body has the same 16 MiB cap as the chat path.",
+     "description": "The body may be at most 16 MiB.",
      "required": true,
      "content": {
       "application/json": {
@@ -1770,7 +1691,7 @@
     },
     "responses": {
      "200": {
-      "description": "The input token count of the rendered prompt.",
+      "description": "The token count of the rendered prompt.",
       "content": {
        "application/json": {
         "schema": {
@@ -1800,7 +1721,7 @@
       }
      },
      "404": {
-      "description": "The model does not exist. error.type is not_found_error.",
+      "description": "No engine serves the model. error.type is not_found_error.",
       "content": {
        "application/json": {
         "schema": {
@@ -1820,314 +1741,11 @@
       }
      },
      "500": {
-      "description": "Tokenizer execution failed. error.type is api_error.",
+      "description": "Tokenization failed. error.type is api_error.",
       "content": {
        "application/json": {
         "schema": {
          "$ref": "#/components/schemas/AnthropicError"
-        }
-       }
-      }
-     }
-    }
-   }
-  },
-  "/v1/engines": {
-   "get": {
-    "operationId": "listEngines",
-    "summary": "List engines",
-    "responses": {
-     "401": {
-      "$ref": "#/components/responses/Unauthorized"
-     },
-     "200": {
-      "description": "The fleet.",
-      "content": {
-       "application/json": {
-        "schema": {
-         "type": "object",
-         "required": [
-          "data"
-         ],
-         "properties": {
-          "data": {
-           "type": "array",
-           "items": {
-            "$ref": "#/components/schemas/Engine"
-           }
-          }
-         }
-        }
-       }
-      }
-     }
-    }
-   },
-   "post": {
-    "operationId": "createEngine",
-    "summary": "Create an engine",
-    "requestBody": {
-     "required": true,
-     "content": {
-      "application/json": {
-       "schema": {
-        "$ref": "#/components/schemas/EngineSpec"
-       }
-      }
-     }
-    },
-    "responses": {
-     "201": {
-      "description": "Engine created and loading.",
-      "content": {
-       "application/json": {
-        "schema": {
-         "$ref": "#/components/schemas/Engine"
-        }
-       }
-      }
-     },
-     "400": {
-      "$ref": "#/components/responses/BadRequest"
-     },
-     "401": {
-      "$ref": "#/components/responses/Unauthorized"
-     },
-     "500": {
-      "$ref": "#/components/responses/BackendFailure"
-     },
-     "409": {
-      "description": "The memory plan cannot fit this engine, or the context limit rejects the request.",
-      "content": {
-       "application/json": {
-        "schema": {
-         "$ref": "#/components/schemas/Error"
-        }
-       }
-      }
-     },
-     "422": {
-      "description": "The checkpoint failed identity or load.",
-      "content": {
-       "application/json": {
-        "schema": {
-         "$ref": "#/components/schemas/Error"
-        }
-       }
-      }
-     }
-    }
-   }
-  },
-  "/v1/engines/{engineId}": {
-   "parameters": [
-    {
-     "name": "engineId",
-     "in": "path",
-     "required": true,
-     "schema": {
-      "type": "string"
-     }
-    }
-   ],
-   "get": {
-    "operationId": "getEngine",
-    "summary": "Read one engine",
-    "responses": {
-     "401": {
-      "$ref": "#/components/responses/Unauthorized"
-     },
-     "200": {
-      "description": "The engine.",
-      "content": {
-       "application/json": {
-        "schema": {
-         "$ref": "#/components/schemas/Engine"
-        }
-       }
-      }
-     },
-     "404": {
-      "$ref": "#/components/responses/NotFound"
-     }
-    }
-   },
-   "delete": {
-    "operationId": "deleteEngine",
-    "summary": "Stop one engine",
-    "description": "Stops the engine and frees its memory. Sessions that point at this engine stop. Snapshots stay on disk.",
-    "responses": {
-     "204": {
-      "description": "Engine stopped."
-     },
-     "401": {
-      "$ref": "#/components/responses/Unauthorized"
-     },
-     "404": {
-      "$ref": "#/components/responses/NotFound"
-     }
-    }
-   }
-  },
-  "/v1/engines/{engineId}/cache": {
-   "parameters": [
-    {
-     "name": "engineId",
-     "in": "path",
-     "required": true,
-     "schema": {
-      "type": "string"
-     }
-    }
-   ],
-   "get": {
-    "operationId": "getEngineCache",
-    "summary": "Cache statistics",
-    "responses": {
-     "401": {
-      "$ref": "#/components/responses/Unauthorized"
-     },
-     "404": {
-      "$ref": "#/components/responses/NotFound"
-     },
-     "200": {
-      "description": "Current cache state.",
-      "content": {
-       "application/json": {
-        "schema": {
-         "$ref": "#/components/schemas/CacheStats"
-        }
-       }
-      }
-     }
-    }
-   },
-   "delete": {
-    "operationId": "deleteEngineCache",
-    "summary": "Clear the in-memory cache",
-    "description": "Drops all held prefixes and key-value state. Disk snapshots stay.",
-    "responses": {
-     "204": {
-      "description": "Cache cleared."
-     },
-     "401": {
-      "$ref": "#/components/responses/Unauthorized"
-     },
-     "404": {
-      "$ref": "#/components/responses/NotFound"
-     }
-    }
-   }
-  },
-  "/v1/sessions": {
-   "post": {
-    "operationId": "createSession",
-    "summary": "Create a session",
-    "requestBody": {
-     "required": true,
-     "content": {
-      "application/json": {
-       "schema": {
-        "$ref": "#/components/schemas/SessionSpec"
-       }
-      }
-     }
-    },
-    "responses": {
-     "201": {
-      "description": "Session created. Phase 1 does not ship this route (the server design, Phase 1 session scope).",
-      "content": {
-       "application/json": {
-        "schema": {
-         "$ref": "#/components/schemas/Session"
-        }
-       }
-      }
-     },
-     "400": {
-      "$ref": "#/components/responses/BadRequest"
-     },
-     "401": {
-      "$ref": "#/components/responses/Unauthorized"
-     },
-     "404": {
-      "$ref": "#/components/responses/NotFound"
-     },
-     "409": {
-      "description": "The engine lacks capacity for another session state.",
-      "content": {
-       "application/json": {
-        "schema": {
-         "$ref": "#/components/schemas/Error"
-        }
-       }
-      }
-     }
-    }
-   }
-  },
-  "/v1/sessions/{sessionId}": {
-   "parameters": [
-    {
-     "name": "sessionId",
-     "in": "path",
-     "required": true,
-     "schema": {
-      "type": "string"
-     }
-    }
-   ],
-   "get": {
-    "operationId": "getSession",
-    "summary": "Read one session",
-    "responses": {
-     "401": {
-      "$ref": "#/components/responses/Unauthorized"
-     },
-     "200": {
-      "description": "The session. Phase 1 does not ship this route (the server design, Phase 1 session scope).",
-      "content": {
-       "application/json": {
-        "schema": {
-         "$ref": "#/components/schemas/Session"
-        }
-       }
-      }
-     },
-     "404": {
-      "$ref": "#/components/responses/NotFound"
-     }
-    }
-   },
-   "delete": {
-    "operationId": "deleteSession",
-    "summary": "Delete one session",
-    "description": "Drops the held state and its memory reservation. Phase 1 does not ship this route (the server design, Phase 1 session scope). Deletes the disk snapshot when no other session references it.",
-    "responses": {
-     "204": {
-      "description": "Session deleted."
-     },
-     "401": {
-      "$ref": "#/components/responses/Unauthorized"
-     },
-     "404": {
-      "$ref": "#/components/responses/NotFound"
-     }
-    }
-   }
-  },
-  "/metrics": {
-   "get": {
-    "operationId": "getMetrics",
-    "summary": "Process metrics",
-    "security": [],
-    "responses": {
-     "200": {
-      "description": "Prometheus text format. The metrics inventory is:\n\n| Metric | Type | Labels |\n|---|---|---|\n| requests_total | counter | engine, code |\n| generate_seconds_total | counter | engine |\n| tokens_out_total | counter | engine |\n| reused_tokens_total | counter | engine |\n| draft_passes_total | counter | engine |\n| draft_accepted_total | counter | engine |\n| weights_faults_total | counter | engine |\n| kv_bytes | gauge | engine |\n| mlx_retained_bytes | gauge | none |\n| engine_state | gauge, 0 to 5: loading=0, ready=1, busy=2, error=3, stopped=4, native-failed=5 | engine |",
-      "content": {
-       "text/plain": {
-        "schema": {
-         "type": "string"
         }
        }
       }

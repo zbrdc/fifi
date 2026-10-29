@@ -26,7 +26,7 @@ pub mod expert_cpu_q8k;
 mod gated_delta;
 mod packed;
 mod rope;
-// The CUDA sampler of DEVSAMPLE-1 C3a will consume the request encoding; until then
+// The CUDA sampler will consume the request encoding; until then
 // portable builds compile it for unit tests only.
 #[cfg(any(test, all(feature = "native-cuda", target_os = "linux")))]
 pub(crate) mod sample_canon;
@@ -111,7 +111,7 @@ impl QuantizationSpec {
     }
 }
 
-/// Resident unary elementwise operation (decision 0039).
+/// Resident unary elementwise operation.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum UnaryOp {
     Sigmoid,
@@ -123,7 +123,7 @@ pub enum UnaryOp {
     Sign,
 }
 
-/// Resident binary elementwise operation with broadcasting (decision 0039).
+/// Resident binary elementwise operation with broadcasting.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum BinaryOp {
     Add,
@@ -134,7 +134,7 @@ pub enum BinaryOp {
     LogAddExp,
 }
 
-/// Resident reduction over one axis (decision 0039).
+/// Resident reduction over one axis.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ReduceOp {
     Sum,

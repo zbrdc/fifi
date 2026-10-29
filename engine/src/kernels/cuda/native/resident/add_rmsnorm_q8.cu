@@ -1,9 +1,9 @@
 /*
- * MATVEC-PAR S3a K1: the add_rmsnorm_q8 kernel and its launch entry. The kernel restates the
- * math of the vendored add_rmsnorm_pack_k (xavier-qwen ops.cu, MIT) for the
- * f32 norm row — the same strided sum of squares, the same block reduction order, the same
- * rsqrtf and the same expression row[i] * rstd * w[i], so norm_out is byte-identical to what
- * add_rmsnorm_pack_k writes on the same input — and quantizes that normalized row to
+ * The add_rmsnorm_q8 kernel and its launch entry. The kernel restates the math of the vendored
+ * add_rmsnorm_pack_k (xavier-qwen ops.cu, MIT) for the f32 norm row — the same strided sum of
+ * squares, the same block reduction order, the same rsqrtf and the same expression
+ * row[i] * rstd * w[i], so norm_out is byte-identical to what add_rmsnorm_pack_k writes on the
+ * same input — and quantizes that normalized row to
  * block_q8_1 with the vendored quantize_q8_1 block rule in IEEE arithmetic (this TU is in the
  * warnings-into-errors group WITHOUT -use_fast_math, unlike the vendored quantize.cu object).
  * Glue only: every exported function has C linkage, takes and returns C types only, and wraps

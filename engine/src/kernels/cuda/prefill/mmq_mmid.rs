@@ -1,34 +1,33 @@
-//! Safe wrappers of the mmid entries of the MMQ glue (CPF-V4 G3; plan rev 3 sections B.4 and
-//! C.2 N1; decision 0049 items 3, 10 and 11; seam I2 of OFF-7). Each call queues work on a
-//! [`DeviceStream`] and returns; none allocates, copies or synchronizes:
+//! Safe wrappers of the mmid entries of the MMQ glue: the grouped (per-expert) GEMM and the
+//! id tensors it reads. Each call queues work on a [`DeviceStream`] and returns; none
+//! allocates, copies or synchronizes:
 //!
-//! - [`CudaContext::mmq_ids_guard`], N1 as its own entry (MSG-85 M5): the router ids into a
+//! - [`CudaContext::mmq_ids_guard`], the ids guard as its own entry: the router ids into a
 //!   guarded copy, every flagged row (an id outside `0..n_experts`, or two equal ids)
 //!   rewritten to `0..top_k`, mask 1 of the optional prefill status word for a row whose
-//!   every slot is -1 (RD-5's fault form, `route_experts`) and mask 8 for any other flagged row
-//!   (`prefill_chunk`; MSG-85 M4). The tiered arm runs it on the router ids before its D2H
-//!   copy, so I7's check before planning sees the flags.
+//!   every slot is -1 (the device router's fault form, `route_experts`) and mask 8 for any
+//!   other flagged row (`prefill_chunk`). The tiered arm runs it on the router ids before its
+//!   D2H copy, so the tiered planner's check sees the flags.
 //! - [`CudaContext::mmq_build_ids`]: the same guard, always, then the vendored `mm_ids_helper`
 //!   on the guarded copy. It returns the [`MmidIds`] of the call.
 //! - [`CudaContext::mmq_mmid_launch`]: one grouped GEMM over a weight stack, a `NativeWeight`
-//!   or a bank of slots (seam I2), through the vendored `mul_mat_q_case<Q4_K|Q6_K>`, with its
-//!   ids taken only as an [`MmidIds`]. The `mmq_args` fill is the pure [`fill_mmid_args`], the
-//!   pin's grouped assignment (mmq.cu:255-261; MSG-85 M1), and the launch validates the I2
-//!   padding itself (rules M1 and M2 of CPF-V4 G1, MSG-85 B1 and B2), the K grid (M2) and the
-//!   stream-k grid limit, so ids over a slot bank get the same guards.
+//!   or a bank of slots, through the vendored `mul_mat_q_case<Q4_K|Q6_K>`, with its ids taken
+//!   only as an [`MmidIds`]. The `mmq_args` fill is the pure [`fill_mmid_args`], the pin's
+//!   grouped assignment (mmq.cu:255-261), and the launch validates the padding itself (the
+//!   q8_1 pad of `y` and the fixup-gather pad of `ids_dst`, both sized by `mmq_size`), the K
+//!   grid and the stream-k grid limit, so ids over a slot bank get the same guards.
 //!
 //! - [`CudaContext::mmq_quantize_scatter_ids`] and [`CudaContext::mmq_quantize_gather_ids`]: the
-//!   thin typed wrappers over G4's quantize entries (the rev 3 grant's MAJOR item). They take
-//!   the scatter map (`ids_src1`) and the gather map (`ids_dst`) from an [`MmidIds`] and from
-//!   nowhere else, so a store index of the quantize kernels is never caller-supplied; G4's
-//!   raw-range wrappers are visible to the prefill tree only.
+//!   thin typed wrappers over the quantize entries of `mmq_quant`. They take the scatter map
+//!   (`ids_src1`) and the gather map (`ids_dst`) from an [`MmidIds`] and from nowhere else, so
+//!   a store index of the quantize kernels is never caller-supplied; the raw-range quantize
+//!   wrappers are visible to the prefill tree only.
 //!
-//! [`MmidIds`] is constructor-only (rev 3, MSG-85 M5): its fields are private, and the builder
-//! and the checked host constructor are the only ways to make one, so a grouped launch never
-//! trusts caller-built id values. It carries `ids_src1`, the inverse map the scatter quantizer
-//! stores through (the rev 3 grant's MAJOR item). The type proves which code wrote the ids; it
-//! does not prove that the bytes are intact when a launch reads them, which rests on stream
-//! order and on the arena plan.
+//! [`MmidIds`] is constructor-only: its fields are private, and the builder and the checked
+//! host constructor are the only ways to make one, so a grouped launch never trusts
+//! caller-built id values. It carries `ids_src1`, the inverse map the scatter quantizer stores
+//! through. The type proves which code wrote the ids; it does not prove that the bytes are
+//! intact when a launch reads them, which rests on stream order and on the arena plan.
 //!
 //! Every argument is checked here, before any native call, and refused as `BadRequest`: the
 //! rules mirror the C entries' (`mmq_mmid.h`), so a native entry cannot return
@@ -38,10 +37,7 @@
 
 #![cfg_attr(
     not(test),
-    expect(
-        dead_code,
-        reason = "staged for CPF-7, the prefill driver (decision 0049)"
-    )
+    expect(dead_code, reason = "staged for the chunked-prefill driver")
 )]
 
 use std::ffi::c_int;
@@ -70,9 +66,9 @@ pub(crate) const MAX_EXPERTS: usize = 65_535;
 pub(crate) const MAX_TOP_K: usize = 32;
 /// The stream-k limit, `ntiles * blocks_per_ne00 < 2^30` (mmq.cuh:1402).
 const GRID_LIMIT: usize = 1 << 30;
-/// The tile count at the smallest J the launcher picks (verdict MINOR-1): mmq.cuh:1399 computes
-/// `100 * ntiles_dst` in `int` for the tiling decision, so the tile count must stay at or below
-/// `i32::MAX / 100`; J = 8 gives the largest count, which the mirror below bounds for every J.
+/// The tile count at the smallest J the launcher picks: mmq.cuh:1399 computes `100 * ntiles_dst` in
+/// `int` for the tiling decision, so the tile count must stay at or below `i32::MAX / 100`; J = 8
+/// gives the largest count, which the mirror below bounds for every J.
 const TILES_LIMIT: usize = 0x7fff_ffff / 100;
 /// The smallest tile width the launch can pick (it picks J itself) and the row tile of every
 /// kept config row.
@@ -83,7 +79,7 @@ const INT_MAX: usize = 0x7fff_ffff;
 
 /// The shape every id tensor of one mmid call shares: `m` tokens of `top_k` ids over
 /// `n_experts` experts. The rules: `1..=65_535` experts, `1..=2_048` tokens (the chunk cap,
-/// CPF-V4 G1), `1..=min(n_experts, 32)` ids per token.
+/// `mmq_size::NCOLS_LIMIT`), `1..=min(n_experts, 32)` ids per token.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct MmidShape {
     pub(crate) n_experts: usize,
@@ -101,11 +97,10 @@ impl MmidShape {
 
 /// One guard call. All ranges are device ranges of this context.
 ///
-/// - `ids`: the router ids, i32 `[m][top_k]` contiguous, 4-byte aligned; read only (seam I1).
+/// - `ids`: the router ids, i32 `[m][top_k]` contiguous, 4-byte aligned; read only.
 /// - `ids_g`: the guarded copy, i32 `[m][top_k]`, 4-byte aligned.
-/// - `status`: `None`, or one device `i32`, the prefill status word of decision 0049 item 10
-///   (never `StepParams.status`): ORed with mask 1 or 8 as above, untouched when no row is
-///   flagged.
+/// - `status`: `None`, or one device `i32`, the prefill status word (never
+///   `StepParams.status`): ORed with mask 1 or 8 as above, untouched when no row is flagged.
 pub(crate) struct IdsGuardCall<'b> {
     pub(crate) shape: MmidShape,
     pub(crate) ids: DeviceRange<'b>,
@@ -117,7 +112,7 @@ pub(crate) struct IdsGuardCall<'b> {
 ///
 /// - `ids_src1`: `m * top_k` ints, the inverse map: token slot `t * top_k + r` to its compact
 ///   column.
-/// - `ids_dst`: at least `m * top_k + m + 127` ints (rule M2, the stream-k fixup gather,
+/// - `ids_dst`: at least `m * top_k + m + 127` ints (the stream-k fixup gather pad,
 ///   mmq.cuh:1295-1302); the first `m * top_k` map compact column to token slot.
 /// - `expert_bounds`: `n_experts + 1` ints; expert `e` owns the compact columns
 ///   `expert_bounds[e]..expert_bounds[e + 1]`.
@@ -128,7 +123,7 @@ pub(crate) struct MmidIdsOut<'b> {
 }
 
 /// The ids of one grouped launch, made only by [`CudaContext::mmq_build_ids`] or the checked
-/// host constructor. Its values meet plan rev 3 C2: `ids_dst` is a permutation of
+/// host constructor. Its values meet the id invariants: `ids_dst` is a permutation of
 /// `0..m * top_k`, `ids_src1` its inverse, the bounds rise from 0 to `m * top_k`, and no expert
 /// holds more than `m` columns.
 pub(crate) struct MmidIds<'b> {
@@ -136,24 +131,23 @@ pub(crate) struct MmidIds<'b> {
     shape: MmidShape,
 }
 
-/// Caller-built ids on the host (the tiered planner's, OFF-7, seam I2): `ids_dst`, compact
-/// column to token slot, and `expert_bounds`, in the layout of [`MmidIdsOut`].
+/// Caller-built ids on the host (the tiered planner's): `ids_dst`, compact column to token
+/// slot, and `expert_bounds`, in the layout of [`MmidIdsOut`].
 pub(crate) struct HostIds<'h> {
     pub(crate) ids_dst: &'h [i32],
     pub(crate) expert_bounds: &'h [i32],
 }
 
 impl<'b> MmidIds<'b> {
-    /// The checked host constructor (plan rev 3 section B.4, constructor 2): checks every C2
-    /// value invariant of `host` ([`check_host_ids`]) and the `out` ranges before any device
-    /// write, derives the inverse map `ids_src1[ids_dst[c]] = c` itself (a caller never
-    /// supplies it: the scatter quantizer stores through it, the rev 3 grant's MAJOR item),
-    /// then uploads `ids_dst`, `ids_src1` and `expert_bounds` with ordered `write_at` on
-    /// `stream`, each returning when its bytes landed. Only the first `m * top_k` ints of
+    /// The checked host constructor: checks every value invariant of `host` ([`check_host_ids`])
+    /// and the `out` ranges before any device write, derives the inverse map
+    /// `ids_src1[ids_dst[c]] = c` itself (a caller never supplies it: the scatter quantizer stores
+    /// through it), then uploads `ids_dst`, `ids_src1` and `expert_bounds` with ordered `write_at`
+    /// on `stream`, each returning when its bytes landed. Only the first `m * top_k` ints of
     /// `ids_dst` are written.
     ///
     /// Returns `BadRequest`, before any device write, for a shape outside the rules of
-    /// [`MmidShape`], a value that breaks C2 (tag `mmq_mmid: ids values`), and `out` ranges that
+    /// [`MmidShape`], a value that breaks them (tag `mmq_mmid: ids values`), and `out` ranges that
     /// are too short, misaligned or overlapping; `write_at` refuses a stream or buffer of
     /// another context, also before its copy.
     pub(crate) fn from_host(
@@ -179,9 +173,9 @@ impl MmidIds<'_> {
     }
 }
 
-/// The `MmqType` of G4's quantize entries for a weight `QuantType` (the rebase's one mapping
-/// between the launch-side weight type and the quantize-side type; the typed scatter and gather
-/// wrappers of part 2 call G4's entries through it). The four glued types map one for one, so
+/// The `MmqType` of the `mmq_quant` entries for a weight `QuantType` (the one mapping between
+/// the launch-side weight type and the quantize-side type; the typed scatter and gather
+/// wrappers call the quantize entries through it). The four glued types map one for one, so
 /// the D4/DS4 scale layout of every q8_1 buffer follows its weight (mmq.cuh:61-101).
 pub(crate) fn mmq_type_of(quant: QuantType) -> MmqType {
     match quant {
@@ -194,8 +188,8 @@ pub(crate) fn mmq_type_of(quant: QuantType) -> MmqType {
 
 /// The activations of one typed quantize call. `x` holds f32 rows of `row_stride >= k` floats
 /// (the token rows of the gate/up input for the scatter, the `m * top_k` rows of the gate/up
-/// output in token-slot order for the gather), `y` the q8_1 columns G4's entry writes
-/// (`q8_1_bytes(k, m * top_k)` bytes, rule M1's constant pad included). The scale layout
+/// output in token-slot order for the gather), `y` the q8_1 columns the quantize entry writes
+/// (`q8_1_bytes(k, m * top_k)` bytes, the constant q8_1 pad included). The scale layout
 /// follows `quant`, the type of the weight that will read `y`.
 pub(crate) struct MmidQuantCall<'b> {
     pub(crate) packing: crate::kernels::cuda::prefill::mmq_quant::MmqPacking,
@@ -211,12 +205,11 @@ fn values(detail: &str) -> EngError {
     rule("ids values", detail)
 }
 
-/// The C2 value invariants of caller-built ids (plan rev 3 sections B.4 and C.2 C2; 0049 A6
-/// item 9), checked on the host: `expert_bounds` holds `n_experts + 1` values rising from 0 to
-/// `m * top_k`, with at most `m` columns per expert (M1's grid computes `ceil(m / J)` tiles of
-/// each expert, so a column past them would never be written); `ids_dst` holds `m * top_k`
-/// entries below `m * top_k`, each exactly once. Returns the inverse map those entries imply,
-/// after [`check_ids_shape`].
+/// The value invariants of caller-built ids, checked on the host: `expert_bounds` holds
+/// `n_experts + 1` values rising from 0 to `m * top_k`, with at most `m` columns per expert (the
+/// grouped launch's grid computes `ceil(m / J)` tiles of each expert, so a column past them would
+/// never be written); `ids_dst` holds `m * top_k` entries below `m * top_k`, each exactly once.
+/// Returns the inverse map those entries imply, after [`check_ids_shape`].
 pub(crate) fn check_host_ids(shape: &MmidShape, host: &HostIds<'_>) -> Result<Vec<i32>, EngError> {
     let (ne, e) = (shape.ne_get_rows(), shape.n_experts);
     let (n_dst, n_bounds) = (host.ids_dst.len(), host.expert_bounds.len());
@@ -359,9 +352,9 @@ fn out_claims<'a>(out: &MmidIdsOut<'a>, shape: &MmidShape) -> Result<[Claim<'a>;
 }
 
 /// A weight stack: `n_experts` matrices of `n` rows by `k` values in the native GGUF blocks of
-/// `quant`, the first at the start of `base`, each `stride_bytes` after the one before (seam
-/// I2: a `NativeWeight`'s buffer, or a bank of slots with `n_experts = slots`). `base` is
-/// 16-byte aligned.
+/// `quant`, the first at the start of `base`, each `stride_bytes` after the one before (a
+/// `NativeWeight`'s buffer, or a bank of slots with `n_experts = slots`). `base` is 16-byte
+/// aligned.
 pub(crate) struct MmidWeight<'b> {
     pub(crate) base: DeviceRange<'b>,
     pub(crate) quant: QuantType,
@@ -373,8 +366,8 @@ pub(crate) struct MmidWeight<'b> {
 /// One grouped launch. All ranges are device ranges of this context.
 ///
 /// - `ids`: an [`MmidIds`] of exactly `shape`.
-/// - `y`: the q8_1 compact columns of G4's quantize, `q8_1_bytes(k, m * top_k)` bytes (rule
-///   M1, the constant pad), 16-byte aligned; read only.
+/// - `y`: the q8_1 compact columns of the gather quantize, `q8_1_bytes(k, m * top_k)` bytes
+///   (the constant pad included), 16-byte aligned; read only.
 /// - `dst`: f32 rows of `ld >= n` floats, `(m * top_k - 1) * ld + n` floats, 4-byte aligned:
 ///   row `t * top_k + r` receives pick `r` of token `t` (mmq.cuh:470, mmid.cu:110).
 /// - `fixup`: f32 scratch of the stream-k fixup, `fixup_floats_max(nsm)` floats with `nsm` from
@@ -422,11 +415,11 @@ impl MmidLaunchShape {
     }
 }
 
-/// Checks every number rule of a grouped launch (`mmq_mmid.h`) in this order: the id shape,
-/// the type (Q4_K and Q6_K; a grouped Q8_0 or Q5_0 has no arm in this packet), the K grid
-/// (before any per-type rule, MSG-85 M2), K's range, N, ld, the stream-k grid limit bounded
-/// with J = 8, the stride (whole blocks, at least one matrix, an `int`), and the `int` weight
-/// and dst indexes. Each bound keeps every product below 2^56, so the sums cannot overflow.
+/// Checks every number rule of a grouped launch (`mmq_mmid.h`) in this order: the id shape, the
+/// type (Q4_K and Q6_K; a grouped Q8_0 or Q5_0 has no arm), the K grid (before any per-type rule),
+/// K's range, N, ld, the stream-k grid limit bounded with J = 8, the stride (whole blocks, at least
+/// one matrix, an `int`), and the `int` weight and dst indexes. Each bound keeps every product
+/// below 2^56, so the sums cannot overflow.
 pub(crate) fn check_launch_shape(s: &MmidLaunchShape) -> Result<(), EngError> {
     check_ids_shape(&s.ids)?;
     if !matches!(s.quant, QuantType::Q4K | QuantType::Q6K) {
@@ -468,13 +461,12 @@ pub(crate) fn check_launch_shape(s: &MmidLaunchShape) -> Result<(), EngError> {
     Ok(())
 }
 
-/// The `mmq_args` geometry of a grouped launch: the pin's assignment (mmq.cu:255-261; MSG-85
-/// M1), after [`check_launch_shape`], which bounds every field far below `i64::MAX`. The token
-/// count is the grid width (`ncols_max = ncols_opt = m`, upstream `ne12`), the expert is the
-/// channel (`nchannels_x = nchannels_y = n_experts`, stride `s02` in weight blocks), `y` and
-/// `dst` carry the `m * top_k` compact columns, and the channel and sample strides of `y` and
-/// `dst` are 0 (every grouped path zeroes those offsets, mmq.cuh:966-967, :1054-1055,
-/// :1143-1144).
+/// The `mmq_args` geometry of a grouped launch: the pin's assignment (mmq.cu:255-261), after
+/// [`check_launch_shape`], which bounds every field far below `i64::MAX`. The token count is the
+/// grid width (`ncols_max = ncols_opt = m`, upstream `ne12`), the expert is the channel
+/// (`nchannels_x = nchannels_y = n_experts`, stride `s02` in weight blocks), `y` and `dst` carry
+/// the `m * top_k` compact columns, and the channel and sample strides of `y` and `dst` are 0
+/// (every grouped path zeroes those offsets, mmq.cuh:966-967, :1054-1055, :1143-1144).
 /// The widest tile the grouped launch may ask for. Above it the vendored Q4_K table has no tiling
 /// config, and under stream-k a column's reduction order follows its index inside the tile, which
 /// is the property pg1b pins.
@@ -499,9 +491,9 @@ fn hint_cols(ne: usize, experts: usize) -> i64 {
 /// width changes the k tiling and therefore the accumulation grouping.
 fn mmid_geometry(s: &MmidLaunchShape) -> MmidGeometry {
     let mut g = fill_mmid_args(s);
-    // The tiling rows patch V-5 added exist for Q4_K only. Every other type keeps its stream-k
-    // configs, and under stream-k a narrower tile changes the per-column reduction order without
-    // the tiling guarantee, so the hint must not reach those types.
+    // The tiling rows of the vendored Q4_K tiling patch exist for Q4_K only. Every other type keeps
+    // its stream-k configs, and under stream-k a narrower tile changes the per-column reduction
+    // order without the tiling guarantee, so the hint must not reach those types.
     if s.quant == QuantType::Q4K
         && let Some(hint) = cols_hint(s)
     {
@@ -579,9 +571,9 @@ pub(in crate::kernels::cuda) fn fill_mmid_args(s: &MmidLaunchShape) -> MmidGeome
     }
 }
 
-/// The sizes and alignment of the ranges of a grouped launch (rule M1's pad for `y`, rule M2's
-/// form for `ids_dst`, the fixup maximum of `nsm`), then their claims in the order weight, y,
-/// ids_dst, expert_bounds, dst, fixup.
+/// The sizes and alignment of the ranges of a grouped launch (the q8_1 pad for `y`, the
+/// fixup-gather pad for `ids_dst`, the fixup maximum of `nsm`), then their claims in the order
+/// weight, y, ids_dst, expert_bounds, dst, fixup.
 fn launch_claims<'a>(
     call: &MmidLaunchCall<'a, '_>,
     s: &MmidLaunchShape,
@@ -613,7 +605,7 @@ fn launch_claims<'a>(
 }
 
 impl CudaContext {
-    /// Queues the ids guard N1 of `call` on `stream` and returns; `ids_g` and the status word
+    /// Queues the ids guard of `call` on `stream` and returns; `ids_g` and the status word
     /// are valid after the stream drained.
     ///
     /// Returns `BadRequest`, before any native call and with the backend unchanged, for a
@@ -630,13 +622,13 @@ impl CudaContext {
         self.launch_on(stream, move |s| mmq_ids_guard_launch(s, raw))
     }
 
-    /// Queues the id builder on `stream`: the guard N1 of `guard`, then `mm_ids_helper` on the
+    /// Queues the id builder on `stream`: the ids guard of `guard`, then `mm_ids_helper` on the
     /// guarded copy into `out`. Returns the [`MmidIds`] when both are queued; its ranges hold
     /// the ids after the stream drained, and a launch queued behind them on the same stream
     /// reads them in order.
     ///
     /// Returns `BadRequest` before any native call for the conditions of
-    /// [`Self::mmq_ids_guard`], for `out` ranges that are too short (the rule M2 form for
+    /// [`Self::mmq_ids_guard`], for `out` ranges that are too short (the fixup-gather pad of
     /// `ids_dst`), misaligned or overlapping any range of the call, and for an `m` whose
     /// `4 * m` bytes of helper shared memory exceed the device's opt-in limit (mmid.cu:147).
     pub(crate) fn mmq_build_ids<'b>(
@@ -656,7 +648,7 @@ impl CudaContext {
 
     /// Queues the scatter quantize of `call` on `stream` (the gate/up input of a grouped launch):
     /// each of the `m` token rows is quantized once into its `top_k` compact columns, through
-    /// the inverse map `ids_src1` of `ids`. Refusals and status are G4's
+    /// the inverse map `ids_src1` of `ids`. Refusals and status are those of
     /// [`Self::mmq_quantize_scatter`]; the shape comes from `ids`.
     pub(crate) fn mmq_quantize_scatter_ids(
         &self,
@@ -681,9 +673,9 @@ impl CudaContext {
         )
     }
 
-    /// Queues the gathered quantize of `call` on `stream` (correction C1: the down input): column
-    /// `j` of `y` is the quantize of row `ids_dst[j]` of `x`, the forward map of `ids`, so rows
-    /// in token-slot order come out in the compact order the down launch reads.
+    /// Queues the gathered quantize of `call` on `stream` (the down input): column `j` of `y` is
+    /// the quantize of row `ids_dst[j]` of `x`, the forward map of `ids`, so rows in token-slot
+    /// order come out in the compact order the down launch reads.
     pub(crate) fn mmq_quantize_gather_ids(
         &self,
         stream: &DeviceStream,
@@ -805,7 +797,7 @@ impl CudaContext {
             dst,
             fixup,
             geometry: mmid_geometry(&shape),
-            // The one `usize` -> `c_int` edge of the facts (G4's binding reads `nsm` as
+            // The one `usize` -> `c_int` edge of the facts (the Rust binding reads `nsm` as
             // `usize`; the C entry takes it as `int`), checked so a driver reporting more
             // than 2^31 SMs is refused instead of wrapped.
             nsm: c_int::try_from(nsm)

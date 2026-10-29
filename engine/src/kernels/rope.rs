@@ -9,7 +9,7 @@ pub struct RopeStep {
     pub part: u32,
 }
 
-/// One rotary embedding over the last axis (decision 0039): half-stride pairing on the first
+/// One rotary embedding over the last axis: half-stride pairing on the first
 /// `dims` values, angle position `scale × (row + offset)` along axis -2, frequency base `base`.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct RopeSpec {

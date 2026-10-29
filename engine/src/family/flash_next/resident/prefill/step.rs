@@ -1,28 +1,28 @@
-//! Chunk step assembly (decision 0044 items 1, 4, 5, 8, and 9; plan S4 section 3).
+//! Chunk step assembly.
 //!
 //! `prefill` runs `T` prompt tokens. Up to the dense QSA limit it runs them as one chunk through
 //! `chunk_with_cap`, layer by layer. Tokens past the limit run as one-token `Prompt` steps on the
-//! sparse decode path, and the last one runs in the requested mode (decision 0044 amendment of
-//! 2026-10-09). A chunk makes the synchronizations of one token: the token-start import, one
-//! router readback per layer, and one `evaluate`. `Generate` and `Record` add the readbacks of the
-//! one-token step, for the last row of the chunk only. Two groups add planned synchronizations on
-//! top, and the qualification build counts them exactly:
+//! sparse decode path, and the last one runs in the requested mode. A chunk makes the
+//! synchronizations of one token: the token-start import, one router readback per layer, and one
+//! `evaluate`. `Generate` and `Record` add the readbacks of the one-token step, for the last row
+//! of the chunk only. Two groups add planned synchronizations on top, and the qualification build
+//! counts them exactly:
 //!
 //! - DeltaNet sub-chunks. The unrolled recurrence retires about 9 MiB per token and layer at real
 //!   dimensions, so a layer runs over sub-chunks of `s` tokens and evaluates its new state between
 //!   them. That is `delta_layers * (ceil(T / s) - 1)` evaluations. `s` comes from
 //!   `prefill_plan::delta_subchunk`.
-//! - Expert waves (packet PF-7b): `ChunkStats::waves_extra`, the sum of `waves - 1` over the layers.
+//! - Expert waves: `ChunkStats::waves_extra`, the sum of `waves - 1` over the layers.
 //!
 //! The retire cap of the adapter is a flat 512 MiB while a chunk runs and the previous cap (64 MiB)
 //! afterwards. The tail drops of `run` (the residual and the other chunk graphs) retire under the
 //! 512 MiB cap, before the restore. A tail above 64 MiB, such as a `[2048, C, H]` residual, makes
-//! the first retire of the next call force one flush. Packet PF-G measures that flush.
-//! Qualification test builds can override both caps for a sweep (`PrefillCapOverride`).
+//! the first retire of the next call force one flush. Qualification test builds can override both
+//! caps for a sweep (`PrefillCapOverride`).
 //!
-//! A chunk marks the state poisoned before its first native call and publishes the new
-//! state only after the final `evaluate` and the readbacks succeed. The route recorder of packet
-//! T0 sees no chunk.
+//! A chunk marks the state poisoned before its first native call and publishes the new state only
+//! after the final `evaluate` and the readbacks succeed. The test-only route recorder sees no
+//! chunk.
 //!
 //! The prefill page sets belong to the decoder from `open` to `close`. `close` releases the
 //! lent sets through `PrefillPool::finish`, so no caller can skip the release.
@@ -52,7 +52,7 @@ fn bad(message: &str) -> EngError {
 
 /// The open prefill page sets of a decoder and the largest chunk that they serve.
 pub(in super::super) struct Open {
-    /// Two page sets sized from `ChunkCost` (decision 0044 items 5 and 6).
+    /// Two page sets sized from `ChunkCost`.
     pool: PrefillPool,
     /// The chunk size that the sets were sized for.
     max_tokens: u32,
@@ -66,11 +66,11 @@ pub(in super::super) struct ChunkStats {
     pub(in super::super) waves_extra: u64,
 }
 
-/// Maps the prefill page sets for chunks of up to `max_tokens` tokens (decision 0044 item 5).
-/// The union of a chunk runs in waves of at most `wave_cap` experts; `None` means the expert count
-/// of the layer, which is one wave. The sets hold `ChunkCost::with_wave_cap(wave_cap)
-/// .set_experts(max_tokens)` experts (`prefill_plan::prefill_set_experts`). A set that is already
-/// open is closed first. Call it once per prompt, before its first chunk.
+/// Maps the prefill page sets for chunks of up to `max_tokens` tokens. The union of a chunk runs
+/// in waves of at most `wave_cap` experts; `None` means the expert count of the layer, which is
+/// one wave. The sets hold `ChunkCost::with_wave_cap(wave_cap).set_experts(max_tokens)` experts
+/// (`prefill_plan::prefill_set_experts`). A set that is already open is closed first. Call it once
+/// per prompt, before its first chunk.
 pub(in super::super) fn open(
     decoder: &mut ResidentDecoder<'_>,
     max_tokens: u32,
@@ -557,7 +557,7 @@ mod tests {
         }
     }
 
-    /// Asserts equal position and history, and equal tensors within the G2 tolerance.
+    /// Asserts equal position and history, and equal tensors within the chunk parity tolerance.
     fn assert_same_state(
         decoder: &mut ResidentDecoder<'_>,
         a: &ResidentState,
@@ -620,10 +620,10 @@ mod tests {
         );
     }
 
-    /// G2. After a chunk of `T` tokens the state equals the state after `T` `Prompt` steps, for
-    /// `P` cached positions of 0 and 5 and `T` of 1, 2, 3, 4, 7, and 10 (`P + T` stays within the
-    /// 19 dense positions). A chunk of 10 replaces all 9 columns of the PLE ring. The next
-    /// `Record` step of both states agrees as well.
+    /// After a chunk of `T` tokens the state equals the state after `T` `Prompt` steps, for `P`
+    /// cached positions of 0 and 5 and `T` of 1, 2, 3, 4, 7, and 10 (`P + T` stays within the 19
+    /// dense positions). A chunk of 10 replaces all 9 columns of the PLE ring. The next `Record`
+    /// step of both states agrees as well.
     #[test]
     fn a_chunk_leaves_the_state_of_t_prompt_steps() {
         let _serial = crate::native_test_lock();
@@ -681,7 +681,7 @@ mod tests {
         }
     }
 
-    /// G2, chunk-boundary independence: chunks of 3 and 5 equal one chunk of 8.
+    /// Chunk-boundary independence: chunks of 3 and 5 equal one chunk of 8.
     #[test]
     fn two_chunks_equal_one_chunk() {
         let _serial = crate::native_test_lock();
@@ -701,7 +701,7 @@ mod tests {
         assert_same_state(&mut decoder, &split, &whole, "chunks (3, 5) and (8)");
     }
 
-    /// G1. The head, the token, and the recorded layer rows of a chunk are those of the one-token
+    /// The head, the token, and the recorded layer rows of a chunk are those of the one-token
     /// `Record` step at the last token.
     #[test]
     fn the_last_row_of_a_chunk_matches_the_one_token_record_step() {
@@ -736,7 +736,7 @@ mod tests {
         }
     }
 
-    /// G8. Ratio 4 and budget 16 give 19 dense positions. A dense chunk to position 20 returns
+    /// Ratio 4 and budget 16 give 19 dense positions. A dense chunk to position 20 returns
     /// `ContextLimit` and changes nothing: no synchronization, no poison, no charge. A chunk to
     /// position 19 runs. (`prefill` splits such a prompt instead; see the crossing test.)
     #[test]
@@ -778,9 +778,9 @@ mod tests {
         assert_eq!(state.pos(), 19, "the last dense position");
     }
 
-    /// G8. A failure inside the chunk poisons the state, releases the permit, and restores the
-    /// base retire cap. `reset` recovers. Token 8 is outside the 8-row embedding, so the
-    /// token-start import fails on the host after `begin` and after the cap is raised.
+    /// A failure inside the chunk poisons the state, releases the permit, and restores the base
+    /// retire cap. `reset` recovers. Token 8 is outside the 8-row embedding, so the token-start
+    /// import fails on the host after `begin` and after the cap is raised.
     #[test]
     fn a_failed_chunk_poisons_the_state_until_reset() {
         let _serial = crate::native_test_lock();
@@ -934,9 +934,9 @@ mod tests {
         assert_eq!(used, 4 + 5 * 4 + 5, "one chunk of 9 and six steps");
     }
 
-    /// G2 with expert waves. With a wave cap of 1 every layer runs one wave per distinct expert,
-    /// so each chunk reads its experts in at least two waves. The state equals the state after `T`
-    /// `Prompt` steps.
+    /// Chunk parity with expert waves. With a wave cap of 1 every layer runs one wave per distinct
+    /// expert, so each chunk reads its experts in at least two waves. The state equals the state
+    /// after `T` `Prompt` steps.
     #[test]
     fn waves_leave_the_state_of_t_prompt_steps() {
         let _serial = crate::native_test_lock();
@@ -1324,7 +1324,7 @@ mod tests {
                 before,
                 "no synchronization"
             );
-            // The failure is terminal (decision 0039 item 7), so reset cannot import a zero state.
+            // The failure is terminal, so reset cannot import a zero state.
             let reset = decoder.reset(&mut state);
             assert!(matches!(reset, Err(EngError::Backend { .. })), "{reset:?}");
             assert!(

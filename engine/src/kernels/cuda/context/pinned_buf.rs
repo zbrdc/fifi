@@ -1,4 +1,4 @@
-//! Owned page-locked storage for stream-ordered device/host transfers (OFF-2 D1).
+//! Owned page-locked storage for stream-ordered device/host transfers.
 //!
 //! WHAT: [`PinnedBuf`] generalises [`super::pinned::PinnedWord`] from 8 bytes to any size and from
 //! one copy to several copies into disjoint ranges before one event. WHY: the tiered step
@@ -10,7 +10,7 @@
 //! while a transfer is outstanding. [`PinnedBuf::wait`] clears the outstanding state only for an event
 //! recorded on that stream at or after the last copy, after synchronizing it. All copies in
 //! flight must share one stream (a copy on another stream is refused), so one event proves
-//! them all. Dropping the buffer follows decision 0022 through [`super::stream::release`]: the
+//! them all. Dropping the buffer goes through [`super::stream::release`]: the
 //! native free waits for the whole device first, and when that wait fails nothing is freed
 //! (the pages are leaked) and the backend latches terminal, exactly as for the pinned word.
 //!
@@ -481,7 +481,7 @@ mod tests {
         );
     }
 
-    /// The stream guard of `wait` (MSG-79 soundness condition): an event recorded on ANOTHER stream
+    /// The stream guard of `wait`: an event recorded on ANOTHER stream
     /// proves nothing about a copy queued on this one, however many launches the other stream has seen,
     /// so it is refused and the copy stays outstanding; so is an event of another context. The event of
     /// the other stream is recorded five times so that its sequence number is past the copy's: without
@@ -650,7 +650,7 @@ mod tests {
         ctx.copy_to_pinned(&stream, src, &mut buf, 0)
             .expect("queue the big copy");
         // The native free waits for the whole device first, so the drop cannot free memory
-        // the copy is still writing; lane L runs this test once under compute-sanitizer.
+        // the copy is still writing; a compute-sanitizer run of this test checks that.
         drop(buf);
         assert_eq!(
             ctx.live_owners().pinned,

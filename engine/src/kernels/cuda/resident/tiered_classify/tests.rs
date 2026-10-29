@@ -1,7 +1,7 @@
 //! Device tests of the tiered classification wrapper at seam 1, against the host oracle
-//! `classify_reference` (TCAP C2, test seam approved by the user 2026-10-13). Inputs are built here with
-//! `testkit::Rng`: no oracle data, no environment variable, no `#[ignore]`. The mailbox is plain device
-//! memory here (the mapped memory and the server are C1 and C5). Run with `--test-threads=1`.
+//! `classify_reference`. Inputs are built here with `testkit::Rng`: no oracle data, no environment
+//! variable, no `#[ignore]`. The mailbox is plain device memory here (the mapped memory and the
+//! server are not part of these tests). Run with `--test-threads=1`.
 //!
 //! Every device phase is a function that creates its own context, stream and buffers, has only `?` inside,
 //! drops every owner when it returns and hands back plain host records; the tests assert on those records
