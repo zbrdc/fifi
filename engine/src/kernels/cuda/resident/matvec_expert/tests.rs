@@ -7,7 +7,9 @@
 
 use super::{ExpertMatvecCall, ExpertShape, expert_needs};
 use crate::EngError;
-use crate::kernels::cuda::resident::matvec_q::tests::{Owner, assert_bad_request, reference};
+use crate::kernels::cuda::resident::matvec_q::tests::{
+    Owner, assert_bad_request, bench, nan_filled, reference,
+};
 use crate::kernels::cuda::resident::matvec_q::{MatvecCall, QuantType};
 use crate::kernels::cuda::resident::quantize_q8_1::{QuantizeCall, q8_1_bytes};
 use crate::kernels::cuda::testkit;
@@ -976,4 +978,195 @@ fn the_stride_layout_check_catches_an_unwritten_slot_and_an_overwritten_gap() {
             .contains("stride gap of slot 0")
     );
     assert!(check_stride_layout(&good[..stride], n_used, stride, rows).is_err());
+}
+
+/// The expert matvec bandwidth bench (timing only; run on the device with `--ignored`).
+///
+/// The serve section marks attributed ~35 GB/s to the expert matvec against ~82 GB/s for the
+/// dense one, but the dense bench shapes are Q8_0 while the expert stacks are Q4_K, so the pair
+/// mixed kernel types. This bench measures the REAL moe shapes - Q4_K gate/up (k 2048, rows 512,
+/// shared x) and down (k 512, rows 2048, per-slot x), 8 of 16 experts - against a dense Q4_K
+/// launch reading the same weight bytes, so the only difference is the type and the ids scatter.
+/// GB/s counts the weight bytes the launch reads (n_used x rows x row bytes); cold = the launch
+/// alone right after a 68 MB dense matvec that evicts the L2, which is the serving state (the
+/// stacks are not touched between tokens).
+#[test]
+#[ignore = "the expert matvec bench: timing only, run on the device with --ignored"]
+fn the_expert_matvec_bandwidth_bench() {
+    if !testkit::device_present("the_expert_matvec_bandwidth_bench") {
+        return;
+    }
+    let ctx = CudaContext::new().expect("context");
+    let stream = ctx.stream().expect("stream");
+    let (warm_iters, cold_iters) = if cfg!(debug_assertions) {
+        (8, 2)
+    } else {
+        (200, 9)
+    };
+
+    // The L2 flush: a dense Q8_0 matvec streaming 64k rows of k 1024 (68 MB).
+    let (flush_k, flush_rows) = (1024_usize, 64_000_usize);
+    let flush_w_bytes = QuantType::Q80
+        .weight_bytes(flush_rows, flush_k)
+        .expect("size");
+    let (flush_w, flush_x, flush_y) = (
+        testkit::upload_filled(&ctx, 0x5A, flush_w_bytes),
+        testkit::upload_filled(&ctx, 0x5A, q8_1_bytes(flush_k, 1).expect("size")),
+        testkit::upload_filled(&ctx, 0x5A, flush_rows * 4),
+    );
+    let flush = || {
+        ctx.matvec_q(
+            &stream,
+            MatvecCall {
+                ty: QuantType::Q80,
+                w: flush_w.range(0, flush_w_bytes).expect("flush w"),
+                x_q8: flush_x
+                    .range(0, q8_1_bytes(flush_k, 1).expect("size"))
+                    .expect("flush x"),
+                y: flush_y.range(0, flush_rows * 4).expect("flush y"),
+                k: flush_k,
+                rows: flush_rows,
+                ncols: 1,
+            },
+        )
+        .expect("flush matvec");
+    };
+
+    println!(
+        "warm = {warm_iters} launches between two events; cold = one launch timed alone \
+             right after the 68 MB flush (L2 evicted); GB/s counts the weight bytes read"
+    );
+    println!("shape                          warm_us  cold_us   GB/s_warm GB/s_cold");
+
+    // The expert rows: (name, k, rows, x_per_slot). The stack rig uploads 16 experts, 8 used.
+    let expert_shapes: [(&str, usize, usize, bool); 2] = [
+        ("gate/up 2048x512 shared", 2048, 512, false),
+        ("down 512x2048 per-slot", 512, 2048, true),
+    ];
+    for (name, k, rows, per_slot) in expert_shapes {
+        let (stack, ids, shared, per_slot_x) = stack_rig(
+            &ctx,
+            &stream,
+            QuantType::Q4K,
+            (k, rows),
+            0xB000_0000 + rows as u64,
+        );
+        let x = if per_slot { &per_slot_x } else { &shared };
+        let x_bytes = q8_1_bytes(k, if per_slot { N_USED } else { 1 }).expect("size");
+        let y_bytes = N_USED * rows * 4;
+        let y = nan_filled(&ctx, y_bytes);
+        let launch = || {
+            ctx.matvec_expert(
+                &stream,
+                ExpertMatvecCall {
+                    ty: QuantType::Q4K,
+                    w_stack: stack
+                        .range(
+                            0,
+                            QuantType::Q4K
+                                .weight_bytes(rows * N_EXPERT, k)
+                                .expect("size"),
+                        )
+                        .expect("stack"),
+                    glu_gate: None,
+                    ids: ids.range(0, N_USED * 4).expect("ids"),
+                    x_q8: x.range(0, x_bytes).expect("x"),
+                    x_per_slot: per_slot,
+                    y: y.range(0, y_bytes).expect("y"),
+                    y_slot_stride: rows,
+                    k,
+                    rows,
+                    n_expert: N_EXPERT,
+                    n_used: N_USED,
+                },
+            )
+            .expect("expert matvec");
+        };
+        let warm_us = bench(&ctx, &stream, warm_iters, &launch);
+        let mut cold = Vec::new();
+        for _ in 0..cold_iters {
+            flush();
+            let start = ctx.bench_mark(&stream).expect("start");
+            launch();
+            let end = ctx.bench_mark(&stream).expect("end");
+            stream.synchronize().expect("drain");
+            cold.push(ctx.bench_elapsed_ms(start, end).expect("elapsed") * 1000.0);
+            ctx.bench_destroy(start).expect("destroy");
+            ctx.bench_destroy(end).expect("destroy");
+        }
+        cold.sort_by(|a, b| a.total_cmp(&b));
+        let cold_us = cold[cold.len() / 2];
+        let read_bytes =
+            N_USED as f64 * rows as f64 * QuantType::Q4K.weight_bytes(1, k).expect("size") as f64;
+        println!(
+            "{name:30} {warm_us:8.1} {cold_us:8.1} {:9.0} {:9.0}",
+            read_bytes / (warm_us as f64 * 1000.0),
+            read_bytes / (cold_us as f64 * 1000.0)
+        );
+    }
+
+    // The dense comparators: a contiguous Q4_K w of the SAME total bytes the expert launch
+    // reads (8 x rows), so warm/cold and GB/s compare like for like.
+    for (name, k, rows) in [
+        ("dense Q4K 2048x4096", 2048_usize, 4096_usize),
+        ("dense Q4K 512x16384", 512, 16384),
+    ] {
+        let mut rng = testkit::Rng::new(0xC000_0000 + rows as u64);
+        let w_bytes = QuantType::Q4K.weight_bytes(rows, k).expect("size");
+        let w = testkit::upload_bytes(
+            &ctx,
+            &reference::build_weight(QuantType::Q4K, rows, k, &mut rng),
+        );
+        let x: Vec<f32> = (0..k).map(|_| (rng.normal() as f32) * 0.05).collect();
+        let x_dev = testkit::upload_f32(&ctx, &x);
+        let x_q8 = testkit::upload_filled(&ctx, 0xAA, q8_1_bytes(k, 1).expect("size"));
+        ctx.quantize_q8_1(
+            &stream,
+            QuantizeCall {
+                x: x_dev.range(0, x.len() * 4).expect("x"),
+                y: x_q8.range(0, q8_1_bytes(k, 1).expect("size")).expect("y"),
+                k,
+                ncols: 1,
+            },
+        )
+        .expect("quantize");
+        stream.synchronize().expect("drain");
+        let y_bytes = rows * 4;
+        let y = nan_filled(&ctx, y_bytes);
+        let launch = || {
+            ctx.matvec_q(
+                &stream,
+                MatvecCall {
+                    ty: QuantType::Q4K,
+                    w: w.range(0, w_bytes).expect("w"),
+                    x_q8: x_q8.range(0, q8_1_bytes(k, 1).expect("size")).expect("x"),
+                    y: y.range(0, y_bytes).expect("y"),
+                    k,
+                    rows,
+                    ncols: 1,
+                },
+            )
+            .expect("dense matvec");
+        };
+        let warm_us = bench(&ctx, &stream, warm_iters, &launch);
+        let mut cold = Vec::new();
+        for _ in 0..cold_iters {
+            flush();
+            let start = ctx.bench_mark(&stream).expect("start");
+            launch();
+            let end = ctx.bench_mark(&stream).expect("end");
+            stream.synchronize().expect("drain");
+            cold.push(ctx.bench_elapsed_ms(start, end).expect("elapsed") * 1000.0);
+            ctx.bench_destroy(start).expect("destroy");
+            ctx.bench_destroy(end).expect("destroy");
+        }
+        cold.sort_by(|a, b| a.total_cmp(&b));
+        let cold_us = cold[cold.len() / 2];
+        let read_bytes = w_bytes as f64;
+        println!(
+            "{name:30} {warm_us:8.1} {cold_us:8.1} {:9.0} {:9.0}",
+            read_bytes / (warm_us as f64 * 1000.0),
+            read_bytes / (cold_us as f64 * 1000.0)
+        );
+    }
 }

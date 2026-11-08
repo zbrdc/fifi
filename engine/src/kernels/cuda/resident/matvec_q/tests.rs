@@ -658,7 +658,7 @@ const FLUSH_ROWS: usize = 250_000;
 
 /// A device buffer of `bytes` bytes (a multiple of 4) filled with the quiet NaN 0x7fc00000, the
 /// poison of the bench outputs: unlike 0xAA, which is the finite -3.0e-13, it fails a non-NaN assert.
-fn nan_filled(ctx: &CudaContext, bytes: usize) -> DeviceBuffer {
+pub(in crate::kernels::cuda) fn nan_filled(ctx: &CudaContext, bytes: usize) -> DeviceBuffer {
     let pattern = 0x7fc0_0000_u32.to_le_bytes();
     let fill: Vec<u8> = pattern.iter().copied().cycle().take(bytes).collect();
     testkit::upload_bytes(ctx, &fill)
@@ -666,7 +666,12 @@ fn nan_filled(ctx: &CudaContext, bytes: usize) -> DeviceBuffer {
 
 /// Times `launch` `iters` times between two events and returns the microseconds per launch; the
 /// warmup before the window is `iters.min(10)` launches.
-fn bench(ctx: &CudaContext, stream: &DeviceStream, iters: usize, launch: &dyn Fn()) -> f32 {
+pub(in crate::kernels::cuda) fn bench(
+    ctx: &CudaContext,
+    stream: &DeviceStream,
+    iters: usize,
+    launch: &dyn Fn(),
+) -> f32 {
     for _ in 0..iters.min(10) {
         launch();
     }
