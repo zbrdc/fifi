@@ -89,6 +89,7 @@ fn launch_swiglu(
             n_ff,
             y_slot_stride: stride,
             slots,
+            glu_done: false,
         },
     )
     .expect("queue swiglu_q8");
@@ -374,6 +375,7 @@ fn attempt(rig: &RefusalRig, other: &OtherContext, spec: Spec) -> Result<(), Eng
             n_ff: spec.n_ff,
             y_slot_stride: spec.y_slot_stride,
             slots: spec.slots,
+            glu_done: false,
         },
     )
 }
@@ -591,6 +593,7 @@ fn q8_producers_inside_a_capture_equal_eager() {
                 n_ff,
                 y_slot_stride: stride,
                 slots,
+                glu_done: false,
             },
         )
     };
@@ -688,6 +691,7 @@ fn q8_producers_are_deterministic() {
                 n_ff,
                 y_slot_stride: stride,
                 slots,
+                glu_done: false,
             },
         )
         .expect("swiglu producer");
@@ -758,6 +762,7 @@ fn q8_producers_write_only_their_range() {
             n_ff,
             y_slot_stride: stride,
             slots,
+            glu_done: false,
         },
     )
     .expect("swiglu producer");
@@ -870,6 +875,7 @@ fn swiglu_q8_feeds_the_expert_matvec() {
                 rows,
                 n_expert,
                 n_used: slots,
+                glu_gate: None,
             },
         )
         .expect("expert matvec");

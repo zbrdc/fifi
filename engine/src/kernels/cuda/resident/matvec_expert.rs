@@ -42,6 +42,10 @@ pub(crate) struct ExpertMatvecCall<'b> {
     pub(crate) rows: usize,
     pub(crate) n_expert: usize,
     pub(crate) n_used: usize,
+    /// The fused GLU gate stack (`None` = plain dot). When `Some` the launch writes
+    /// silu(gate)*up per y element; it must carry the same type, k, rows and n_expert as
+    /// `w_stack`, and only the shared-x view (`x_per_slot == false`) may take it.
+    pub(crate) glu_gate: Option<DeviceRange<'b>>,
 }
 
 #[derive(Clone, Copy)]
@@ -154,6 +158,15 @@ impl CudaContext {
         require_apart(&written, &Claim::of("w_stack", &call.w_stack, need.w_stack))?;
         require_apart(&written, &Claim::of("ids", &call.ids, need.ids))?;
         require_apart(&written, &Claim::of("x_q8", &call.x_q8, need.x_q8))?;
+        if let Some(gate) = &call.glu_gate {
+            if call.x_per_slot {
+                return Err(EngError::BadRequest(
+                    "the CUDA expert GLU fusion takes the shared-x view only".to_owned(),
+                ));
+            }
+            require_fit("glu_gate", gate, need.w_stack, 4)?;
+            require_apart(&written, &Claim::of("glu_gate", gate, need.w_stack))?;
+        }
         Ok(ExpertMatvecRaw {
             ty: call.ty,
             w_stack: w_raw,
@@ -166,6 +179,11 @@ impl CudaContext {
             rows: call.rows,
             n_expert: call.n_expert,
             n_used: call.n_used,
+            glu_gate: call
+                .glu_gate
+                .as_ref()
+                .map(|g| self.raw_range(g))
+                .transpose()?,
         })
     }
 }

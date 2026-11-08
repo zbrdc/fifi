@@ -39,10 +39,11 @@ struct ExpertArgsRepr {
     rows: c_int,
     n_expert: c_int,
     n_used: c_int,
+    glu_gate: *const c_void,
 }
 
 const _: () = assert!(
-    size_of::<ExpertArgsRepr>() == 72
+    size_of::<ExpertArgsRepr>() == 80
         && offset_of!(ExpertArgsRepr, ty) == 0
         && offset_of!(ExpertArgsRepr, w_stack) == 8
         && offset_of!(ExpertArgsRepr, ids) == 16
@@ -54,6 +55,7 @@ const _: () = assert!(
         && offset_of!(ExpertArgsRepr, rows) == 56
         && offset_of!(ExpertArgsRepr, n_expert) == 60
         && offset_of!(ExpertArgsRepr, n_used) == 64
+        && offset_of!(ExpertArgsRepr, glu_gate) == 72
 );
 
 unsafe extern "C" {
@@ -77,6 +79,10 @@ pub(in crate::kernels::cuda) struct ExpertMatvecRaw<'a> {
     pub(in crate::kernels::cuda) rows: usize,
     pub(in crate::kernels::cuda) n_expert: usize,
     pub(in crate::kernels::cuda) n_used: usize,
+    /// The fused GLU gate stack: `Some` proves the kernel may index it with `w_stack`'s own
+    /// strides (same type, k, rows and n_expert), so the launch writes silu(gate)*up per element;
+    /// `None` is the plain dot.
+    pub(in crate::kernels::cuda) glu_gate: Option<RawRange<'a>>,
 }
 
 struct Sizes {
@@ -121,6 +127,16 @@ fn check_expert(call: &ExpertMatvecRaw<'_>) -> Result<(), DeviceFailure> {
         && call.x_q8.offset.is_multiple_of(4)
         && call.y.offset.is_multiple_of(4);
     let y = Span::of(&call.y, need.y);
+    let gate_ok = match &call.glu_gate {
+        // the fused GLU view is the shared-x view only (the C entry refuses a per-slot gate)
+        Some(gate) => {
+            !call.x_per_slot
+                && gate.bytes >= need.w_stack
+                && gate.offset.is_multiple_of(4)
+                && y.apart(&Span::of(gate, need.w_stack))
+        }
+        None => true,
+    };
     let apart = y.apart(&Span::of(&call.w_stack, need.w_stack))
         && y.apart(&Span::of(&call.x_q8, need.x_q8))
         && y.apart(&Span::of(&call.ids, need.ids));
@@ -136,6 +152,7 @@ fn check_expert(call: &ExpertMatvecRaw<'_>) -> Result<(), DeviceFailure> {
         || call.n_used > call.n_expert
         || call.y_slot_stride < call.rows
         || !call.k.is_multiple_of(call.ty.block_size())
+        || !gate_ok
     {
         return Err(invalid_argument());
     }
@@ -159,6 +176,10 @@ pub(in crate::kernels::cuda) fn matvec_expert_launch(
         rows: c_int::try_from(call.rows).map_err(|_| invalid_argument())?,
         n_expert: c_int::try_from(call.n_expert).map_err(|_| invalid_argument())?,
         n_used: c_int::try_from(call.n_used).map_err(|_| invalid_argument())?,
+        glu_gate: match &call.glu_gate {
+            Some(gate) => gate.address().cast_const(),
+            None => std::ptr::null(),
+        },
     };
     let mut stage = STAGE_NONE;
     // SAFETY: `check_expert` proved every range inside its live allocation, large enough,
@@ -226,6 +247,7 @@ mod tests {
             rows: layout.rows,
             n_expert: layout.n_expert,
             n_used: layout.n_used,
+            glu_gate: None,
         })
     }
 
@@ -361,6 +383,7 @@ mod tests {
             rows: args.rows,
             n_expert: args.n_expert,
             n_used: args.n_used,
+            glu_gate: std::ptr::null(),
         };
         let mut stage = STAGE_NONE;
         // SAFETY: only called with arguments the entry refuses before it uses any pointer or
@@ -503,6 +526,7 @@ mod tests {
                 rows: 1 << 61,
                 n_expert: 8,
                 n_used: 1,
+                glu_gate: None,
             })
             .is_none()
         );

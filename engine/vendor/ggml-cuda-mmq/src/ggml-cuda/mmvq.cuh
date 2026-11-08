@@ -42,6 +42,12 @@ struct fifi_mmvq_args {
     int64_t stride_channel_x;    // weight blocks per expert
     int64_t stride_channel_y;    // q8_1 blocks per activation vector
     int64_t stride_channel_dst;  // floats per dst slot (A2: y_slot_stride, >= nrows_x)
+    // The GLU fusion (Q36 MoE gate+up): a second weight stack of the SAME type and shape as vx
+    // the kernel dot-products with the same y in the same pass, writing dst = up*silu(gate)
+    // per element instead of the plain dot. Null (default) = the S1 no-fusion launch. The
+    // kernel indexes vgate with vx's own strides (kbx_offset), so a mismatched shape reads out
+    // of bounds - the glue proves both stacks identically before setting it.
+    const void * vgate = nullptr;
     fifi_device_facts dev;       // the device the launch is for (fifi_check_device)
 };
 

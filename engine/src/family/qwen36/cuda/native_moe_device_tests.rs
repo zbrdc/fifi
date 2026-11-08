@@ -480,6 +480,138 @@ fn native_block_inside_a_capture_equals_eager() -> Result<(), EngError> {
     Ok(())
 }
 
+/// The fused GLU block (`INFERENCE_CUDA_MOE_GLU_FUSE=1`): the gate+up matvec computes
+/// silu(gate)*up inside the kernel (the shim's `expf` silu) while the unfused block applies
+/// swiglu_q8's `__expf` form, so the arms are NOT bitwise - the pin is a tolerance: every
+/// element within 1% relative and 99.9% within 1e-4 (a flipped q8 rounding moves one block's
+/// quantize by 1/255, which the 1% headroom covers). The ids must match exactly. The flag is
+/// process-global, so the parent drives both arms as children (the GDN `FUSED_AB_ARM` pattern).
+#[test]
+fn fused_glu_moe_block_matches_the_unfused_within_silu_precision() -> Result<(), EngError> {
+    const NAME: &str = "fused_glu_moe_block_matches_the_unfused_within_silu_precision";
+    if let Ok(arm) = std::env::var("GLU_FUSE_ARM") {
+        if !device_present(NAME) {
+            panic!("{NAME}: child arm {arm} has no device");
+        }
+        let run = run_block_own(&sources(0x5eed_f05e))?;
+        let bits = |v: &f32| format!("{:08x}", v.to_bits());
+        println!(
+            "GLU_FUSE_IDS {arm} {}",
+            run.ids
+                .iter()
+                .map(i32::to_string)
+                .collect::<Vec<_>>()
+                .join(",")
+        );
+        println!(
+            "GLU_FUSE_RESID {arm} {}",
+            run.resid_out.iter().map(bits).collect::<Vec<_>>().join(" ")
+        );
+        println!(
+            "GLU_FUSE_SCALES {arm} {}",
+            run.down_scales
+                .iter()
+                .map(bits)
+                .collect::<Vec<_>>()
+                .join(" ")
+        );
+        return Ok(());
+    }
+    if !device_present(NAME) {
+        return Ok(());
+    }
+    let exe = std::env::current_exe().expect("the test binary path");
+    let mut resid = std::collections::HashMap::new();
+    let mut scales = std::collections::HashMap::new();
+    let mut ids = std::collections::HashMap::new();
+    for (arm, flag) in [("off", None), ("on", Some("1"))] {
+        let mut command = std::process::Command::new(&exe);
+        command
+            .args([
+                "--exact",
+                // module_path!() carries the crate name, which libtest's --exact does not match
+                &format!(
+                    "{}::{NAME}",
+                    std::module_path!()
+                        .split_once("::")
+                        .map_or(std::module_path!(), |(_, rest)| rest)
+                ),
+                "--nocapture",
+                "--test-threads=1",
+            ])
+            .env("GLU_FUSE_ARM", arm)
+            .env_remove("INFERENCE_CUDA_MOE_GLU_FUSE");
+        if let Some(value) = flag {
+            command.env("INFERENCE_CUDA_MOE_GLU_FUSE", value);
+        }
+        let output = command.output().expect("spawn the child arm");
+        assert!(
+            output.status.success(),
+            "{NAME}: the {arm} child exited with {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let text = String::from_utf8_lossy(&output.stdout);
+        let plane = |tag: &str| -> Vec<f32> {
+            text.lines()
+                .find(|l| l.starts_with(tag) && l.split(' ').nth(1) == Some(arm))
+                .unwrap_or_else(|| panic!("{NAME}: the {arm} child printed no {tag}"))
+                .split_whitespace()
+                .skip(2)
+                .map(|w| f32::from_bits(u32::from_str_radix(w, 16).expect("hex bits")))
+                .collect()
+        };
+        resid.insert(arm, plane("GLU_FUSE_RESID"));
+        scales.insert(arm, plane("GLU_FUSE_SCALES"));
+        let line = text
+            .lines()
+            .find(|l| l.starts_with("GLU_FUSE_IDS") && l.split(' ').nth(1) == Some(arm))
+            .unwrap_or_else(|| panic!("{NAME}: the {arm} child printed no ids"));
+        ids.insert(
+            arm,
+            line.split_whitespace()
+                .nth(2)
+                .unwrap_or_default()
+                .split(',')
+                .filter(|w| !w.is_empty())
+                .map(|w| w.parse::<i32>().expect("id int"))
+                .collect::<Vec<i32>>(),
+        );
+    }
+    assert_eq!(ids["off"], ids["on"], "{NAME}: the picks must not change");
+    for (what, a, b) in [
+        ("resid", &resid["off"], &resid["on"]),
+        ("scales", &scales["off"], &scales["on"]),
+    ] {
+        assert_eq!(a.len(), b.len(), "{NAME}: {what} plane lengths");
+        let mut beyond = 0;
+        for (i, (x, y)) in a.iter().zip(b).enumerate() {
+            let diff = (x - y).abs();
+            assert!(
+                diff <= 1e-2 * (1.0 + x.abs()),
+                "{NAME}: {what}[{i}] {x} vs {y} (diff {diff})"
+            );
+            if diff > 1e-4 * (1.0 + x.abs()) {
+                beyond += 1;
+            }
+        }
+        assert!(
+            beyond * 1000 <= a.len(),
+            "{NAME}: {what}: {beyond} of {} elements beyond 1e-4 relative",
+            a.len()
+        );
+    }
+    Ok(())
+}
+
+/// One full Native block on its own context (the child arm of the fused-GLU test): the device
+/// phase owns everything, drops it, and returns the plain `BlockRun`.
+fn run_block_own(s: &Sources) -> Result<BlockRun, EngError> {
+    let ctx = CudaContext::new()?;
+    let stream = ctx.stream()?;
+    let weights = rig_weights(&ctx, s)?;
+    run_block(&ctx, &stream, s, WeightLayout::Native, &weights)
+}
+
 /// The router input must not change - the NATIVE producer's f32 `NormRow`
 /// bytes equal the Tiled `norm_out` bytes of `add_norm_pack` on the same (h, delta, weight),
 /// with and without the delta add. The DEVICE phase queues the four launches and reads all six

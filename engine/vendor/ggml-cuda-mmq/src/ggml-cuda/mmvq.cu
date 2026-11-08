@@ -1186,7 +1186,14 @@ cudaError_t fifi_mmvq_launch(const fifi_mmvq_args & a, cudaStream_t stream) {
         FIFI_REQUIRE(value <= INT32_MAX);
     }
 
-    const ggml_cuda_mm_fusion_args_device fusion{}; // S1 launches with no fusion (V-MV1 d)
+    // V-MV1 (d) + the GLU fusion: S1 launched with no fusion; when a.vgate names a second stack
+    // the kernel fuses dst = up*silu(gate) (SWIGLU, the only op this lane serves), which the
+    // switch itself restricts to ncols_dst == 1 (the ids expert view) - stated here so a dense
+    // call is refused before the kernel choice.
+    FIFI_REQUIRE(a.vgate == nullptr || a.ncols_dst == 1);
+    ggml_cuda_mm_fusion_args_device fusion{}; // S1 launches with no fusion (V-MV1 d)
+    fusion.gate = a.vgate;
+    fusion.glu_op = GGML_GLU_OP_SWIGLU;
     return mul_mat_vec_q_switch_type(
         a.vx, a.type, a.vy_q8_1, a.ids, fusion, a.dst,
         (int) a.ncols_x, (int) a.nrows_x, (int) a.ncols_dst,

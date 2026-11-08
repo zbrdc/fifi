@@ -2953,6 +2953,7 @@ mod kernel_diagnostics {
                     rows: dims.inter,
                     n_expert: dims.n_expert,
                     n_used: dims.top_k,
+                    glu_gate: None,
                 },
                 m,
             )?;
@@ -2990,6 +2991,7 @@ mod kernel_diagnostics {
                 rows: dims.hidden,
                 n_expert: dims.n_expert,
                 n_used: dims.top_k,
+                glu_gate: None,
             },
             m,
         )

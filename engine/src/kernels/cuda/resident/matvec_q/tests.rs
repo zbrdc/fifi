@@ -857,6 +857,7 @@ fn matvec_report_gbps() {
                     rows,
                     n_expert,
                     n_used: 8,
+                    glu_gate: None,
                 },
             )
             .expect("expert matvec");

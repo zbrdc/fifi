@@ -920,6 +920,15 @@ pub(crate) fn gdn_fuse_inproj() -> bool {
         == Some("1")
 }
 
+/// The opt-in fused MoE gate+up+SwiGLU matvec (default OFF). When set, a Native qwen36 load's
+/// expert gate and up matvecs launch as ONE `matvec_expert` call whose kernel applies
+/// up*silu(gate) per element (`glu_gate`), and the expert swiglu then only quantizes that
+/// result (`glu_done`). Read per step construction, like the `INFERENCE_CUDA_GDN_FUSE_INPROJ`
+/// precedent.
+pub(crate) fn moe_glu_fuse() -> bool {
+    std::env::var("INFERENCE_CUDA_MOE_GLU_FUSE").ok().as_deref() == Some("1")
+}
+
 /// The decode-only tiled-head hybrid: tensor names (comma-separated) that a `Native` load
 /// uploads in the `Tiled` layout instead, so the qwen36 step runs the vendored tiled head
 /// matmul beside its native ops. Read per load and per `CudaWeights::layout()`, like the

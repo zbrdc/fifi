@@ -125,6 +125,13 @@ extern "C" int inference_cuda_matvec_expert_launch(const inference_cuda_matvec_e
             !apart(args->y, y_bytes, args->ids, (size_t)n_used * sizeof(int32_t))) {
             return INFERENCE_CUDA_INVALID_ARGUMENT;
         }
+        if (args->glu_gate != NULL &&
+            (!aligned(args->glu_gate, 4) || !apart(args->y, y_bytes, args->glu_gate, w_bytes) ||
+             args->x_per_slot != 0)) {
+            /* the fused GLU view: the gate stack carries the same proof sizes as w_stack (the
+             * kernel indexes it with vx's own strides) and the shared-x view only */
+            return INFERENCE_CUDA_INVALID_ARGUMENT;
+        }
         fifi_mmvq_args a{};
         a.type = type;
         a.vx = args->w_stack;
@@ -143,6 +150,7 @@ extern "C" int inference_cuda_matvec_expert_launch(const inference_cuda_matvec_e
         a.stride_channel_x = expert_blocks;
         a.stride_channel_y = per_slot ? blocks_y : 1;
         a.stride_channel_dst = args->y_slot_stride;
+        a.vgate = args->glu_gate;
         fifi_device_facts dev{};
         const cudaError_t facts = query_device_facts(&dev);
         if (facts != cudaSuccess) {

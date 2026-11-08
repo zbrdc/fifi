@@ -331,6 +331,7 @@ mod tests {
                 rows,
                 n_expert,
                 n_used: 8,
+                glu_gate: None,
             },
         )
         .unwrap();

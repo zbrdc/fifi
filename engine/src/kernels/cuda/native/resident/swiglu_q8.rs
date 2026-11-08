@@ -38,6 +38,9 @@ struct SwigluQ8ArgsRepr {
     n_ff: c_int,
     y_slot_stride: c_int,
     slots: c_int,
+    /// 0 = compute silu(gate)*up from both halves; 1 = the first half of each slot row is
+    /// already the activation (the fused gate+up matvec wrote it), quantize it directly.
+    glu_done: c_int,
 }
 
 const _: () = assert!(
@@ -47,6 +50,7 @@ const _: () = assert!(
         && offset_of!(SwigluQ8ArgsRepr, n_ff) == 16
         && offset_of!(SwigluQ8ArgsRepr, y_slot_stride) == 20
         && offset_of!(SwigluQ8ArgsRepr, slots) == 24
+        && offset_of!(SwigluQ8ArgsRepr, glu_done) == 28
 );
 
 pub(in crate::kernels::cuda) struct SwigluQ8Raw<'a> {
@@ -55,6 +59,8 @@ pub(in crate::kernels::cuda) struct SwigluQ8Raw<'a> {
     pub(in crate::kernels::cuda) n_ff: usize,
     pub(in crate::kernels::cuda) y_slot_stride: usize,
     pub(in crate::kernels::cuda) slots: usize,
+    /// The fused-gate+up flag the kernel gets verbatim: when set, only the quantize runs.
+    pub(in crate::kernels::cuda) glu_done: bool,
 }
 
 /// Bytes of the `block_q8_1` output of one row of `n_ff` values: padded to 512, one 36-byte
@@ -108,6 +114,7 @@ pub(in crate::kernels::cuda) fn swiglu_q8_launch(
         n_ff: c_int::try_from(call.n_ff).map_err(|_| invalid_argument())?,
         y_slot_stride: c_int::try_from(call.y_slot_stride).map_err(|_| invalid_argument())?,
         slots: c_int::try_from(call.slots).map_err(|_| invalid_argument())?,
+        glu_done: c_int::from(call.glu_done),
     };
     let mut stage = STAGE_NONE;
     // SAFETY: `check_swiglu_q8` proved the `gu` and `q8` ranges inside their live allocations,
@@ -161,6 +168,7 @@ mod tests {
             n_ff: args.n_ff,
             y_slot_stride: args.y_slot_stride,
             slots: args.slots,
+            glu_done: 0,
         };
         let mut stage = STAGE_NONE;
         // SAFETY: only called with arguments the entry refuses before it uses any pointer or
@@ -228,6 +236,7 @@ mod tests {
             n_ff: layout.n_ff,
             y_slot_stride: layout.y_slot_stride,
             slots: layout.slots,
+            glu_done: false,
         })
     }
 

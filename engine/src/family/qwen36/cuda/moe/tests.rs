@@ -408,6 +408,55 @@ fn the_native_moe_sequence_is_the_ten_merged_ops() {
     assert_eq!(moe_sequence(4, WeightLayout::Native), want);
 }
 
+/// With `INFERENCE_CUDA_MOE_GLU_FUSE=1` the gate+up pair collapses to the fused GLU launch and
+/// the expert pack becomes the quantize-only form, so the Native block is nine ops. The flag is
+/// process-global, so the parent drives one child with the env set and pins the printed order
+/// (the GDN `FUSED_AB_ARM` pattern, CPU-only).
+#[test]
+fn the_fused_glu_native_moe_sequence_is_the_nine_ops() {
+    const NAME: &str = "the_fused_glu_native_moe_sequence_is_the_nine_ops";
+    if std::env::var("GLU_SEQ_ARM").is_ok() {
+        for op in moe_sequence(8, WeightLayout::Native) {
+            println!("GLU_SEQ_OP {op:?}");
+        }
+        return;
+    }
+    let exe = std::env::current_exe().expect("the test binary path");
+    // module_path!() carries the crate name, which libtest's --exact does not match; strip it
+    // (the GDN pattern).
+    let path = std::module_path!();
+    let stripped = path.split_once("::").map_or(path, |(_, rest)| rest);
+    let output = std::process::Command::new(exe)
+        .args(["--exact", &format!("{stripped}::{NAME}"), "--nocapture"])
+        .env("GLU_SEQ_ARM", "on")
+        .env("INFERENCE_CUDA_MOE_GLU_FUSE", "1")
+        .output()
+        .expect("spawn the child arm");
+    assert!(
+        output.status.success(),
+        "{NAME}: the child exited with {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout).into_owned();
+    let got: Vec<&str> = stdout
+        .lines()
+        .filter_map(|line| line.strip_prefix("GLU_SEQ_OP "))
+        .collect();
+    let want = [
+        "Router",
+        "ExpertGluQ",
+        "SharedGateQ",
+        "SharedUpQ",
+        "SwigluSharedQ",
+        "SwigluExpertsGlu",
+        "ExpertDownQ",
+        "SharedDownQ",
+        "Combine",
+    ];
+    assert_eq!(got, want, "{NAME}: the fused sequence order");
+    assert_eq!(got.len(), 9, "{NAME}: nine ops, not ten");
+}
+
 /// The card sequence keeps the Native order and inserts the two ring markers where the
 /// token plan of `multi.rs` places them: the picks broadcast right after the router on
 /// card 0 (and at the same place as a receive on every other card), the partial sum

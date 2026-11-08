@@ -38,6 +38,9 @@ pub(crate) struct SwigluQ8Call<'b> {
     pub(crate) n_ff: usize,
     pub(crate) y_slot_stride: usize,
     pub(crate) slots: usize,
+    /// The fused-gate+up flag: each slot row's first half already holds the activation the
+    /// fused matvec wrote, so only the quantize runs.
+    pub(crate) glu_done: bool,
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -113,6 +116,7 @@ impl CudaContext {
             n_ff: call.n_ff,
             y_slot_stride: call.y_slot_stride,
             slots: call.slots,
+            glu_done: call.glu_done,
         })
     }
 }

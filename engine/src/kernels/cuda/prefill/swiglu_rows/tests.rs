@@ -859,6 +859,7 @@ fn swiglu_rows_reproduces_swiglu_q8_through_its_block_rule() {
                 n_ff: 512,
                 y_slot_stride: 1_024,
                 slots: 8,
+                glu_done: false,
             };
             rig.ctx.swiglu_q8(&rig.stream, call)?;
         }

@@ -39,8 +39,11 @@ constexpr int64_t kQk8_1 = 32;             // QK8_1
  * statement of the swiglu_pack doc is the domain, and the tests state the tolerance. */
 __device__ __forceinline__ float silu(float x) { return x / (1.f + __expf(-x)); }
 
-/* The batched producer: one block per slot, one warp per 32-value block of the padded width. */
-__global__ void swiglu_q8_k(const float *gu, int n_ff, int64_t slot_stride, block_q8_1 *y) {
+/* The batched producer: one block per slot, one warp per 32-value block of the padded width.
+ * With glu_done set the first half of each slot row already holds the activation (the fused
+ * gate+up matvec wrote it), so only the quantize applies. */
+__global__ void swiglu_q8_k(const float *gu, int n_ff, int64_t slot_stride, block_q8_1 *y,
+                            int glu_done) {
   const float *g = gu + (int64_t)blockIdx.x * slot_stride;
   const int64_t padded =
       ((int64_t)n_ff + kMatrixRowPadding - 1) / kMatrixRowPadding * kMatrixRowPadding;
@@ -51,7 +54,7 @@ __global__ void swiglu_q8_k(const float *gu, int n_ff, int64_t slot_stride, bloc
   const int warp = threadIdx.x / 32, lane = threadIdx.x % 32;
   for (int64_t b = warp; b < padded / kQk8_1; b += nwarps) {
     const int i = (int)(b * kQk8_1) + lane;
-    const float xi = i < n_ff ? silu(g[i]) * g[n_ff + i] : 0.0f;
+    const float xi = i < n_ff ? (glu_done ? g[i] : silu(g[i]) * g[n_ff + i]) : 0.0f;
     float amax = fabsf(xi);
     float sum = xi;
 #pragma unroll
@@ -85,7 +88,8 @@ extern "C" int inference_cuda_swiglu_q8_launch(const inference_cuda_swiglu_q8_ar
         const int slots = args->slots;
         const int64_t stride = args->y_slot_stride;
         if (n_ff < 32 || n_ff > kMaxWidth || n_ff % 32 != 0 || slots < 1 || slots > 8 ||
-            stride < 2 * (int64_t)n_ff || !aligned(args->gu, 4) || !aligned(args->q8, 4)) {
+            stride < 2 * (int64_t)n_ff || !aligned(args->gu, 4) || !aligned(args->q8, 4) ||
+            (args->glu_done != 0 && args->glu_done != 1)) {
             return INFERENCE_CUDA_INVALID_ARGUMENT;
         }
         // The kernel reads the strided footprint ((slots - 1) * stride + 2 * n_ff floats) and
@@ -100,7 +104,7 @@ extern "C" int inference_cuda_swiglu_q8_launch(const inference_cuda_swiglu_q8_ar
             return INFERENCE_CUDA_INVALID_ARGUMENT;
         }
         swiglu_q8_k<<<slots, kThreads, 0, (cudaStream_t)stream>>>(
-            (const float *)args->gu, n_ff, stride, (block_q8_1 *)args->q8);
+            (const float *)args->gu, n_ff, stride, (block_q8_1 *)args->q8, args->glu_done);
         Failure failure;
         failure.record(cudaGetLastError(), INFERENCE_CUDA_STAGE_LAUNCH);
         report_stage(out_stage, failure.stage);

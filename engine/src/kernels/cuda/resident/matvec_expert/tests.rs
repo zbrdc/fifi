@@ -151,6 +151,7 @@ fn expert_launch(
             rows,
             n_expert: N_EXPERT,
             n_used: N_USED,
+            glu_gate: None,
         },
     )
     .expect("expert matvec");
@@ -627,6 +628,7 @@ fn attempt(rig: &RefusalRig, other: &OtherContext, spec: Spec) -> Result<(), Eng
             rows: spec.rows,
             n_expert: spec.n_expert,
             n_used: spec.n_used,
+            glu_gate: None,
         },
     )
 }

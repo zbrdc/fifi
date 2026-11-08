@@ -26,13 +26,16 @@ typedef struct inference_cuda_matvec_expert_args {
     int rows;         /* a multiple of 4 (the kernel reads whole row groups) */
     int n_expert;
     int n_used;       /* 1..8 */
+    const void *glu_gate; /* the gate stack of the SAME type, k, rows and n_expert as w_stack; when
+                             non-NULL the kernel writes y = up*silu(gate) per element (the fused
+                             Q36 MoE gate+up+SwiGLU), w_stack itself being the UP stack */
 } inference_cuda_matvec_expert_args;
 
 #ifdef __cplusplus
-static_assert(sizeof(inference_cuda_matvec_expert_args) == 72 && offsetof(inference_cuda_matvec_expert_args, type) == 0 && offsetof(inference_cuda_matvec_expert_args, w_stack) == 8 && offsetof(inference_cuda_matvec_expert_args, ids) == 16 && offsetof(inference_cuda_matvec_expert_args, x_q8) == 24 && offsetof(inference_cuda_matvec_expert_args, x_per_slot) == 32 && offsetof(inference_cuda_matvec_expert_args, y) == 40 && offsetof(inference_cuda_matvec_expert_args, y_slot_stride) == 48 && offsetof(inference_cuda_matvec_expert_args, k) == 52 && offsetof(inference_cuda_matvec_expert_args, rows) == 56 && offsetof(inference_cuda_matvec_expert_args, n_expert) == 60 && offsetof(inference_cuda_matvec_expert_args, n_used) == 64,
+static_assert(sizeof(inference_cuda_matvec_expert_args) == 80 && offsetof(inference_cuda_matvec_expert_args, type) == 0 && offsetof(inference_cuda_matvec_expert_args, w_stack) == 8 && offsetof(inference_cuda_matvec_expert_args, ids) == 16 && offsetof(inference_cuda_matvec_expert_args, x_q8) == 24 && offsetof(inference_cuda_matvec_expert_args, x_per_slot) == 32 && offsetof(inference_cuda_matvec_expert_args, y) == 40 && offsetof(inference_cuda_matvec_expert_args, y_slot_stride) == 48 && offsetof(inference_cuda_matvec_expert_args, k) == 52 && offsetof(inference_cuda_matvec_expert_args, rows) == 56 && offsetof(inference_cuda_matvec_expert_args, n_expert) == 60 && offsetof(inference_cuda_matvec_expert_args, n_used) == 64 && offsetof(inference_cuda_matvec_expert_args, glu_gate) == 72,
               "inference_cuda_matvec_expert_args layout");
 #else
-_Static_assert(sizeof(inference_cuda_matvec_expert_args) == 72 && offsetof(inference_cuda_matvec_expert_args, type) == 0 && offsetof(inference_cuda_matvec_expert_args, w_stack) == 8 && offsetof(inference_cuda_matvec_expert_args, ids) == 16 && offsetof(inference_cuda_matvec_expert_args, x_q8) == 24 && offsetof(inference_cuda_matvec_expert_args, x_per_slot) == 32 && offsetof(inference_cuda_matvec_expert_args, y) == 40 && offsetof(inference_cuda_matvec_expert_args, y_slot_stride) == 48 && offsetof(inference_cuda_matvec_expert_args, k) == 52 && offsetof(inference_cuda_matvec_expert_args, rows) == 56 && offsetof(inference_cuda_matvec_expert_args, n_expert) == 60 && offsetof(inference_cuda_matvec_expert_args, n_used) == 64,
+_Static_assert(sizeof(inference_cuda_matvec_expert_args) == 80 && offsetof(inference_cuda_matvec_expert_args, type) == 0 && offsetof(inference_cuda_matvec_expert_args, w_stack) == 8 && offsetof(inference_cuda_matvec_expert_args, ids) == 16 && offsetof(inference_cuda_matvec_expert_args, x_q8) == 24 && offsetof(inference_cuda_matvec_expert_args, x_per_slot) == 32 && offsetof(inference_cuda_matvec_expert_args, y) == 40 && offsetof(inference_cuda_matvec_expert_args, y_slot_stride) == 48 && offsetof(inference_cuda_matvec_expert_args, k) == 52 && offsetof(inference_cuda_matvec_expert_args, rows) == 56 && offsetof(inference_cuda_matvec_expert_args, n_expert) == 60 && offsetof(inference_cuda_matvec_expert_args, n_used) == 64 && offsetof(inference_cuda_matvec_expert_args, glu_gate) == 72,
                "inference_cuda_matvec_expert_args layout");
 #endif
 
@@ -41,7 +44,9 @@ _Static_assert(sizeof(inference_cuda_matvec_expert_args) == 72 && offsetof(infer
  * The ids are read on the device at execution time, so a captured graph replay follows a
  * rewritten ids word; an id outside [0, n_expert) (the router writes -1 on a fault) makes the
  * kernel write the quiet NaN 0x7fc00000 to that slot's rows and read no weight (the id range
- * guard). Returns INFERENCE_CUDA_INVALID_ARGUMENT before any CUDA call for a bad argument,
+ * guard). With glu_gate non-NULL (x_per_slot 0 view only) each y element is the fused
+ * up*silu(gate) of the two stacks at the same expert id; a NULL gate is the plain dot.
+ * Returns INFERENCE_CUDA_INVALID_ARGUMENT before any CUDA call for a bad argument,
  * else the launch status. */
 int inference_cuda_matvec_expert_launch(const inference_cuda_matvec_expert_args *args,
                                         void *stream, int *out_stage);

@@ -20,7 +20,8 @@ extern "C" {
  * butterfly sum) computed in IEEE arithmetic — this entry's translation unit is in the
  * warnings-into-errors group WITHOUT -use_fast_math, unlike the vendored quantize.cu object —
  * except silu itself, which keeps swiglu_pack_k's fast form x / (1 + __expf(-x)) (the numerics
- * domain of the swiglu_pack doc; __expf stays on purpose). Each q8 row is padded to
+ * domain of the swiglu_pack doc; __expf stays on purpose). With glu_done set, silu is not
+ * applied either: each slot row's first half is quantized as the ready activation. Each q8 row is padded to
  * MATRIX_ROW_PADDING (512) values; the tail blocks past n_ff are written as zeros, so
  * q8 holds slots * pad(n_ff, 512)/32 blocks of 36 bytes back to back. ONE kernel, grid = slots,
  * 256 threads; gu is read only (no tail zeroing: the kernel never reads past n_ff of each half).
@@ -33,13 +34,16 @@ typedef struct inference_cuda_swiglu_q8_args {
     int n_ff;             /* live values per slot half, a multiple of 32 */
     int y_slot_stride;    /* elements between slot rows, >= 2 * n_ff */
     int slots;            /* expert slots, 1..8 */
+    int glu_done;         /* 1: gu's first half of each slot row already holds the SwiGLU
+                             activation (the fused gate+up matvec wrote it), so this entry only
+                             quantizes it; 0: compute silu(gate)*up from both halves */
 } inference_cuda_swiglu_q8_args;
 
 #ifdef __cplusplus
-static_assert(sizeof(inference_cuda_swiglu_q8_args) == 32 && offsetof(inference_cuda_swiglu_q8_args, gu) == 0 && offsetof(inference_cuda_swiglu_q8_args, q8) == 8 && offsetof(inference_cuda_swiglu_q8_args, n_ff) == 16 && offsetof(inference_cuda_swiglu_q8_args, y_slot_stride) == 20 && offsetof(inference_cuda_swiglu_q8_args, slots) == 24,
+static_assert(sizeof(inference_cuda_swiglu_q8_args) == 32 && offsetof(inference_cuda_swiglu_q8_args, gu) == 0 && offsetof(inference_cuda_swiglu_q8_args, q8) == 8 && offsetof(inference_cuda_swiglu_q8_args, n_ff) == 16 && offsetof(inference_cuda_swiglu_q8_args, y_slot_stride) == 20 && offsetof(inference_cuda_swiglu_q8_args, slots) == 24 && offsetof(inference_cuda_swiglu_q8_args, glu_done) == 28,
               "inference_cuda_swiglu_q8_args layout");
 #else
-_Static_assert(sizeof(inference_cuda_swiglu_q8_args) == 32 && offsetof(inference_cuda_swiglu_q8_args, gu) == 0 && offsetof(inference_cuda_swiglu_q8_args, q8) == 8 && offsetof(inference_cuda_swiglu_q8_args, n_ff) == 16 && offsetof(inference_cuda_swiglu_q8_args, y_slot_stride) == 20 && offsetof(inference_cuda_swiglu_q8_args, slots) == 24,
+_Static_assert(sizeof(inference_cuda_swiglu_q8_args) == 32 && offsetof(inference_cuda_swiglu_q8_args, gu) == 0 && offsetof(inference_cuda_swiglu_q8_args, q8) == 8 && offsetof(inference_cuda_swiglu_q8_args, n_ff) == 16 && offsetof(inference_cuda_swiglu_q8_args, y_slot_stride) == 20 && offsetof(inference_cuda_swiglu_q8_args, slots) == 24 && offsetof(inference_cuda_swiglu_q8_args, glu_done) == 28,
                "inference_cuda_swiglu_q8_args layout");
 #endif
 
