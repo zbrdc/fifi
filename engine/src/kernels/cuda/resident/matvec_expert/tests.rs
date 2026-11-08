@@ -15,6 +15,12 @@ use crate::kernels::cuda::resident::quantize_q8_1::{QuantizeCall, q8_1_bytes};
 use crate::kernels::cuda::testkit;
 use crate::kernels::cuda::{CapturePlan, CudaContext, DeviceBuffer, DeviceStream};
 
+#[allow(unsafe_code)]
+unsafe extern "C" {
+    /// the vendored mmvq.cu test-only arm override for INFERENCE_CUDA_MVQ_WPR.
+    safe fn inference_cuda_test_arm_mvq_wpr(on: i32);
+}
+
 const N_EXPERT: usize = 16;
 const N_USED: usize = 8;
 const IDS: [i32; N_USED] = [0, 15, 3, 3, 7, 15, 1, 9];
@@ -1169,4 +1175,86 @@ fn the_expert_matvec_bandwidth_bench() {
             read_bytes / (cold_us as f64 * 1000.0)
         );
     }
+}
+
+/// `INFERENCE_CUDA_MVQ_WPR=1` (cc 7.2, default off) reassociates the Q4_K expert matvec's
+/// reduction - one warp per row - so it cannot equal the dense launch's bits; the flag-on arm
+/// must stay within a handful of ULPs of the dense oracle on every slot and both halves. The
+/// flag is read per call, so the test arms it around its launches only (device tests run with
+/// --test-threads=1, so the process-global env is safe here).
+#[test]
+fn matvec_expert_wpr_mode_matches_dense_within_reassociation() {
+    const NAME: &str = "matvec_expert_wpr_mode_matches_dense_within_reassociation";
+    if !testkit::device_present(NAME) {
+        return;
+    }
+    let ctx = CudaContext::new().expect("context");
+    let stream = ctx.stream().expect("stream");
+    let ty = QuantType::Q4K;
+    inference_cuda_test_arm_mvq_wpr(1);
+    for (si, shape) in [GATE_UP, DOWN, PADDED].iter().enumerate() {
+        let (_, rows) = *shape;
+        let stride = 2 * rows;
+        let seed = 0x8200_0000 + si as u64;
+        let (stack, ids, shared, per_slot) = stack_rig(&ctx, &stream, ty, *shape, seed);
+        for (half, x, y_off, col) in [
+            ("gate", &shared, 0usize, 0usize),
+            ("up", &per_slot, rows * 4, 1),
+        ] {
+            let y = testkit::upload_filled(&ctx, 0xAA, stride * N_USED * 4);
+            expert_launch(
+                &ctx,
+                &stream,
+                ty,
+                &stack,
+                &ids,
+                x,
+                &y,
+                y_off,
+                *shape,
+                half == "up",
+                stride,
+            );
+            stream.synchronize().expect("drain");
+            let got = testkit::read_bytes(&ctx, &y, stride * N_USED * 4);
+            for (slot, id) in IDS.iter().enumerate() {
+                // gate (shared x): every slot reads row 0; up (per-slot x): slot s reads row s.
+                let want = dense_slot(
+                    &ctx,
+                    &stream,
+                    ty,
+                    &stack,
+                    x,
+                    *shape,
+                    *id as usize,
+                    if col == 0 { 0 } else { slot },
+                );
+                let got_f = &got[slot * stride * 4 + y_off..slot * stride * 4 + y_off + rows * 4];
+                let mut worst = 0.0f32;
+                let mut worst_ulps = 0u32;
+                for (g, w) in got_f.chunks_exact(4).zip(want.chunks_exact(4)) {
+                    let g = f32::from_le_bytes(g.try_into().expect("f32"));
+                    let w = f32::from_le_bytes(w.try_into().expect("f32"));
+                    assert!(
+                        g.is_finite() && w.is_finite(),
+                        "{NAME}: non-finite at {shape:?} slot {slot}"
+                    );
+                    // reassociation error scales with the term count and the cancellation, not
+                    // the ULP of the result: the k 2048/512 shapes hold 0 ULPs, the padded
+                    // k 2304 row legitimately drifts tens of ULPs, so the bound is relative.
+                    let rel = (g - w).abs() / w.abs().max(1.0);
+                    worst = worst.max(rel);
+                    worst_ulps = worst_ulps.max(g.to_bits().abs_diff(w.to_bits()));
+                    assert!(
+                        rel <= 1e-4,
+                        "{NAME}: {shape:?} {half} slot {slot} reassociated beyond 1e-4 rel ({rel})"
+                    );
+                }
+                println!(
+                    "{NAME}: {shape:?} {half} slot {slot} worst {worst:.2e} rel, {worst_ulps} ulps"
+                );
+            }
+        }
+    }
+    inference_cuda_test_arm_mvq_wpr(0);
 }

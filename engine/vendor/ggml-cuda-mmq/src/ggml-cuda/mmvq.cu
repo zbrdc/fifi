@@ -4,6 +4,7 @@
 #include "vecdotq.cuh"
 
 #include <cstdint>
+#include <cstdlib>
 #include <type_traits>
 
 // only enabled on DGX Spark, where it is a gain on every type below. On the higher-bandwidth parts the kernel
@@ -852,6 +853,108 @@ static std::pair<dim3, dim3> calc_launch_params(
     return {block_nums, block_dims};
 }
 
+// FIFI-MVQ72 (warp-per-row): the cc 7.2 (Xavier GV11B) shape for the ncols_dst == 1 Q4_K matvec.
+// The GENERIC shape spends a whole 128-thread block plus a cross-warp shared reduction on ONE
+// row - 1152 weight bytes at k 2048 - and at k 512 (two K-blocks per row) idles three quarters
+// of the block. One warp per row with a shuffle-only reduction measured 85 GB/s vs the generic
+// 58 GB/s at k 2048 and 64 vs 19 GB/s at k 512 on idle silicon at ramped clocks (bench-mvq.cu,
+// every variant exact against a CPU oracle), which reconstructs the serve's 0.455 ms/MoE-group
+// attribution. rows_per_block 2 is optimal-or-tied at both shapes; no GLU fusion (the fused
+// launch keeps the generic kernel), and the ids poison rule of V-MV1 (A1) is replicated.
+template<ggml_type type, int rows_per_block>
+__launch_bounds__(rows_per_block*ggml_cuda_get_physical_warp_size(), 1)
+static __global__ void mul_mat_vec_q_wpr(
+        const void * vx_ptr, const void * vy_ptr, const int32_t * ids_ptr, float * dst_ptr,
+        const uint32_t ncols_x, const uint3 nchannels_y, const uint32_t nchannels_x, const uint32_t stride_row_x,
+        const uint32_t stride_col_y, const uint32_t stride_col_dst, const uint3 channel_ratio,
+        const uint32_t stride_channel_x, const uint32_t stride_channel_y, const uint32_t stride_channel_dst,
+        const uint3 sample_ratio, const uint32_t stride_sample_x, const uint32_t stride_sample_y,
+        const uint32_t stride_sample_dst, const uint32_t ids_stride) {
+    const void    * GGML_CUDA_RESTRICT vx  = vx_ptr;
+    const void    * GGML_CUDA_RESTRICT vy  = vy_ptr;
+    const int32_t * GGML_CUDA_RESTRICT ids = ids_ptr;
+    float         * GGML_CUDA_RESTRICT dst = dst_ptr;
+    GGML_UNUSED(stride_col_y);
+    GGML_UNUSED(ids_stride);
+
+    constexpr int qk  = ggml_cuda_type_traits<type>::qk;
+    constexpr int qi  = ggml_cuda_type_traits<type>::qi;
+    constexpr int vdr = get_vdr_mmvq(type);
+    constexpr int warp_size = ggml_cuda_get_physical_warp_size();
+    constexpr vec_dot_q_cuda_t vec_dot_q_cuda = get_vec_dot_q_cuda(type);
+    GGML_UNUSED(stride_col_y);
+    GGML_UNUSED(ids_stride);
+
+    const uint32_t channel_dst = blockIdx.y;
+    uint32_t channel_x;
+    uint32_t channel_y;
+    uint32_t sample_dst;
+
+    ggml_cuda_pdl_sync();
+    channel_x  = ids ? ids[channel_dst]                     : fastdiv(channel_dst, channel_ratio);
+    channel_y  = ids ? fastmodulo(channel_dst, nchannels_y) : channel_dst;
+    sample_dst = blockIdx.z;
+
+    const uint32_t sample_x = fastdiv(sample_dst, sample_ratio);
+    const uint32_t sample_y = sample_dst;
+
+    const int row = blockIdx.x*rows_per_block + threadIdx.y;
+    dst += sample_dst*stride_sample_dst + channel_dst*stride_channel_dst;
+    const bool row_live = uint32_t(row) < stride_col_dst;
+
+    if (ids != nullptr && channel_x >= nchannels_x) {
+        if (threadIdx.x == 0 && row_live) {
+            dst[row] = __int_as_float(0x7fc00000);
+        }
+        return;
+    }
+
+    const block_q8_1 * y = ((const block_q8_1 *) vy) + sample_y*stride_sample_y + channel_y*stride_channel_y;
+    const int kbx_offset = sample_x*stride_sample_x + channel_x*stride_channel_x + row*stride_row_x;
+    const int blocks_per_row_x = ncols_x / qk;
+    const int blocks_per_iter  = vdr * warp_size / qi;
+    const int lane  = threadIdx.x;
+    const int kbx0  = lane / (qi/vdr);
+    const int kqs   = vdr * (lane % (qi/vdr));
+
+    float tmp = 0.0f;
+    for (int kbx = kbx0; kbx < blocks_per_row_x; kbx += blocks_per_iter) {
+        const int kby = kbx * (qk/QK8_1);
+        tmp += vec_dot_q_cuda(vx, &y[kby], kbx_offset + kbx, kqs);
+    }
+
+    tmp = warp_reduce_sum(tmp);
+    if (lane == 0 && row_live) {
+        dst[row] = tmp;
+    }
+}
+
+// FIFI-MVQ72: the host half - grid (ceil(nrows/2), channels, samples), block (32, 2).
+template<ggml_type type>
+static cudaError_t mul_mat_vec_q_wpr_launch(
+        const void * vx, const void * vy, const int32_t * ids, float * dst,
+        const int ncols_x, const uint3 nchannels_y_fd, const int nchannels_x, const int nrows_x,
+        const int stride_row_x, const int stride_col_dst, const uint3 channel_ratio_fd,
+        const int nchannels_dst, const int stride_channel_x, const int stride_channel_y,
+        const int stride_channel_dst, const int nsamples_dst, const uint3 sample_ratio_fd,
+        const int stride_sample_x, const int stride_sample_y, const int stride_sample_dst,
+        cudaStream_t stream) {
+    constexpr int rows_per_block = 2;
+    const int nblocks = (nrows_x + rows_per_block - 1) / rows_per_block;
+    const dim3 block_nums(nblocks, nchannels_dst, nsamples_dst);
+    const dim3 block_dims(WARP_SIZE, rows_per_block, 1);
+    mul_mat_vec_q_wpr<type, rows_per_block><<<block_nums, block_dims, 0, stream>>>(
+        vx, vy, ids, dst, ncols_x, nchannels_y_fd, nchannels_x, stride_row_x, 0, stride_col_dst,
+        channel_ratio_fd, stride_channel_x, stride_channel_y, stride_channel_dst, sample_ratio_fd,
+        stride_sample_x, stride_sample_y, stride_sample_dst, 0);
+    return cudaGetLastError();
+}
+
+// FIFI-MVQ72: the test-only arm override; the env var stays the operator's control and the
+// dedicated tolerance test (which cannot touch the env: -D unsafe-code) flips this instead.
+static int g_mvq_wpr_test_arm = 0;
+extern "C" void inference_cuda_test_arm_mvq_wpr(const int on) { g_mvq_wpr_test_arm = on; }
+
 // V-MV1 (b): returns cudaError_t; the fusion assert is a returned cudaErrorInvalidValue and the
 // ggml_cuda_kernel_launch result is returned, never swallowed.
 template<ggml_type type, int c_ncols_dst, bool small_k = false, bool halve_iters = false>
@@ -1030,6 +1133,27 @@ static cudaError_t mul_mat_vec_q_switch_ncols_dst(
         case 1: {
             // static, else MSVC lambda capture breaks the constexpr uses below
             static constexpr int c_ncols_dst = 1;
+
+            // FIFI-MVQ72: the Xavier warp-per-row shape (see mul_mat_vec_q_wpr). cc 7.2 only,
+            // ids path only, default OFF behind INFERENCE_CUDA_MVQ_WPR: the reduction order
+            // differs from the generic kernel, so the seam's bit-level contracts (single vs
+            // multi-column dense, ids vs dense per slot) hold only while every path uses the
+            // generic kernel; flag-on the ids path is oracle-exact (2.9e-08) and the dedicated
+            // tolerance test covers it. No GLU fusion (the fused launch needs the generic
+            // kernel's two-stack loop). The flag is read per call (no static cache) so a
+            // test process can arm it around individual launches; one getenv is noise against
+            // a 100 microsecond launch. The constexpr keeps the kernel Q4_K-only.
+            if constexpr (type == GGML_TYPE_Q4_K) {
+                if (ids != nullptr && fusion.gate == nullptr && cc == 720 &&
+                    (g_mvq_wpr_test_arm != 0 ||
+                     std::getenv("INFERENCE_CUDA_MVQ_WPR") != nullptr)) {
+                    return mul_mat_vec_q_wpr_launch<type>(
+                        vx, vy, ids, dst, ncols_x, nchannels_y_fd, nchannels_x, nrows_x,
+                        stride_row_x, stride_col_dst, channel_ratio_fd, nchannels_dst,
+                        stride_channel_x, stride_channel_y, stride_channel_dst, nsamples_dst,
+                        sample_ratio_fd, stride_sample_x, stride_sample_y, stride_sample_dst, stream);
+                }
+            }
 
             // Tag types keep the flags compile-time, so __launch_bounds__ matches what is launched.
             const auto launch = [&](auto small_k_tag, auto halve_iters_tag) {
