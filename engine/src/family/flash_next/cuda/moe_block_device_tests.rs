@@ -682,3 +682,147 @@ fn a_chunk_of_rows_over_a_partial_bank_matches_the_all_resident_block() {
         }
     }
 }
+
+/// `run_rows` when the chunk's distinct picks fit the bank (2 rows against 20 slots): the
+/// union admit runs and every row rides the flat resident pass — no per-row `step`, which the
+/// pass counter proves (decode passes stay flat). Every row matches the all-resident block
+/// within the split bound, every pick of the union is resident afterwards, and the same chunk
+/// again changes nothing.
+#[test]
+#[ignore = "needs a GPU (about 3 GiB), about 3 GiB of pinned host memory and FIFI_FLASH_NEXT_EXL3_PACK"]
+fn a_chunk_whose_picks_fit_the_bank_admits_the_union_in_one_pass() {
+    assert!(
+        device_present("Flash-Next split MoE block"),
+        "a GPU is required"
+    );
+    let layer = moe_layer();
+    let layers = vec![layer];
+    let files = FlashPackFiles::open(&pack_dir()).expect("open the pack");
+    let checkpoint = &files.checkpoint;
+    inspect_flash_pack(&checkpoint.source, &checkpoint.model_config)
+        .expect("the pack matches its config");
+    let (model, _) = model_shape(&checkpoint.model_config).expect("the model shape");
+    let shape = model.moe;
+    let one_row = MoeDims {
+        rows: 1,
+        hidden: model.hyper.hidden(),
+        n_expert: shape.experts(),
+        top_k: shape.top_k(),
+        inter: shape.inter(),
+        shared_inter: shape.shared_inter(),
+    };
+    assert_eq!((one_row.n_expert, one_row.top_k), (512, 10));
+    let m = 2;
+    let chunk = MoeDims { rows: m, ..one_row };
+    let projector = CudaProjector::new().expect("projector");
+    let ctx = projector.context();
+    let stream = ctx.stream().expect("stream");
+    let launch = Launch {
+        ctx,
+        stream: &stream,
+    };
+    let source = PackRecordSource::new(checkpoint).expect("the record source");
+    let layout = source.layout().clone();
+
+    let router = Router::read(checkpoint, layer, &one_row).expect("router");
+    let weights = upload(&projector, checkpoint, (layer, &router), &one_row).expect("upload");
+    let keys = keys(layer);
+    let row_inputs: Vec<Vec<f32>> = (0..m)
+        .map(|seed| input(one_row.hidden, seed + 31))
+        .collect();
+    let block = Exl3MoeWeights::resolve_by(&weights, layer, &one_row, |role| {
+        keys.iter()
+            .find(|(candidate, _)| *candidate == role)
+            .map(|(_, key)| key.as_str())
+            .ok_or_else(|| EngError::BadRequest(format!("no key for {role:?}")))
+    })
+    .expect("the all-resident block resolves");
+    let mut wants = Vec::with_capacity(m);
+    let mut residents = Vec::with_capacity(m);
+    for row in &row_inputs {
+        wants.push(reference(checkpoint, (layer, &router), &one_row, row).expect("fp64 reference"));
+        let rig = Rig::new(&projector, &one_row, row).expect("rig");
+        run_exl3_moe(
+            &launch,
+            &block,
+            &rig.bufs().expect("bufs"),
+            &one_row,
+            true,
+            None,
+        )
+        .expect("the all-resident block");
+        launch.stream.synchronize().expect("sync");
+        residents.push(rig.out_bytes(&projector));
+    }
+
+    // The fill holds all 10 of row 0's picks of 20 slots; the chunk's union (at most 20
+    // distinct) always fits, so run_rows takes the union-admit path, never the per-row tail.
+    let mut held: Vec<u16> = wants[0].ids.iter().take(10).map(|&e| e as u16).collect();
+    held.extend(others(&wants[0].ids, 10));
+    let bank = build_bank(&projector, &source, &layers, &[held]);
+    let key = |role: Role| {
+        keys.iter()
+            .find(|(candidate, _)| *candidate == role)
+            .map(|(_, key)| key.as_str())
+            .unwrap_or_else(|| panic!("no key for {role:?}"))
+    };
+    let trunk = SplitMoeTrunk {
+        router: raw(&weights, key(Role::FfnGateInp)),
+        router_shared: raw(&weights, key(Role::FfnGateInpShexp)),
+        shared_gate: exl3(&weights, key(Role::FfnGateShexp)),
+        shared_up: exl3(&weights, key(Role::FfnUpShexp)),
+        shared_down: exl3(&weights, key(Role::FfnDownShexp)),
+    };
+    let mut split = SplitMoe::new(ctx, vec![trunk], bank, &layout, &chunk).expect("split");
+
+    let union: Vec<u16> = {
+        let mut seen = [false; 512];
+        let mut union = Vec::new();
+        for want in &wants {
+            for &id in &want.ids {
+                if !seen[id] {
+                    seen[id] = true;
+                    union.push(id as u16);
+                }
+            }
+        }
+        union
+    };
+    assert!(
+        union.len() <= 20,
+        "the two rows pick at most 20 distinct experts"
+    );
+    for run in 0..2 {
+        let rig = RigRows::new(&projector, &chunk, &row_inputs).expect("rig");
+        let passes = split.bank().state().stats().passes;
+        split
+            .run_rows(&launch, 0, &rig.bufs().expect("bufs"), &chunk)
+            .expect("the chunked block");
+        stream.synchronize().expect("sync");
+        let tag = format!("run {run}");
+        // The admit is not decode traffic and never moves the pass counter; a per-row `step`
+        // would. This is the assertion that the union-admit path ran, not the tail.
+        assert_eq!(
+            split.bank().state().stats().passes,
+            passes,
+            "{tag}: no per-row bank steps"
+        );
+        for r in 0..m {
+            let got = rig.out_row(&projector, r);
+            assert!(
+                relative_l2(&floats(&got), &floats_f64(&residents[r])) < SPLIT_BOUND,
+                "{tag}, row {r}: the all-resident bound"
+            );
+            assert!(
+                relative_l2(&floats(&got), &wants[r].out) < OUTPUT_BOUND,
+                "{tag}, row {r}: the fp64 bound"
+            );
+        }
+        for &pick in &union {
+            assert!(
+                split.bank().state().slot_row(0)[pick as usize] >= 0,
+                "{tag}: pick {pick} of the union is in the bank"
+            );
+        }
+    }
+}

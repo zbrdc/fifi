@@ -7,7 +7,7 @@ use super::{
     bank::{BankGeometry, ExpertBankState, HostMode, ReplaceOnMissLru},
     moe_block::{
         PassInputs, ScratchLayout, SlotSpans, classify_picks, first_poisoned_filler, parse_log,
-        plan_second_pass,
+        pick_union, plan_second_pass,
     },
 };
 use crate::{EngError, family::flash_next::moe::slot_bank::SlotBankLayout};
@@ -412,4 +412,12 @@ fn a_non_finite_filler_row_is_found_by_pick() {
     let negative = [-0.0f32, 0.0, 0.4, 0.0];
     let first = le_rows(&[nan, finite.clone(), finite.clone(), finite.clone()]);
     assert_eq!(first_poisoned_filler(&first, HIDDEN, &negative), Some(0));
+}
+
+#[test]
+fn pick_union_keeps_each_distinct_id_first_use_first() {
+    let rows: Vec<&[i32]> = vec![&[7, 3, 7], &[3, 9], &[]];
+    assert_eq!(pick_union(&rows, 16), vec![7, 3, 9]);
+    // Duplicates inside one row and across rows collapse to the first use.
+    assert_eq!(pick_union(&[&[5, 0, 5], &[0, 5]], 8), vec![5, 0]);
 }

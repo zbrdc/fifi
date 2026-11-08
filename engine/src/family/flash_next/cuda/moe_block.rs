@@ -318,7 +318,7 @@ pub(in crate::family::flash_next) use device::{SplitMoe, SplitMoeTrunk};
 mod device {
     use super::{
         CTRL_BYTES, F32, I32, LOG_ENTRY, REQUEST_BYTES, ScratchLayout, SlotSpans, classify_picks,
-        first_poisoned_filler, parse_log, plan_second_pass, refuse,
+        first_poisoned_filler, parse_log, pick_union, plan_second_pass, refuse,
     };
     use crate::{
         EngError,
@@ -660,21 +660,24 @@ mod device {
         }
 
         /// The MoE block of a chunk of `dims.rows` rows (`2..=8`), the batched shape of
-        /// [`Self::run`]: one router launch over every row, one classify per row against the
-        /// layer's slot row as the chunk found it (all before the single host read of the
-        /// picks), the resident passes of every row in flat grouped launches with the shared
-        /// expert and the first combine over all rows, and then, one row at a time, that row's
-        /// bank copies and miss pass.
+        /// [`Self::run`]: one router launch over every row, then — when the chunk's distinct
+        /// picks fit the bank and any of them is missing — one `admit` of their union, so
+        /// every row's picks ride the flat resident pass in grouped launches with the shared
+        /// expert and the first combine over all rows, and no per-row tail runs (the classify's
+        /// chunk-initial slot row is the post-admit row; an already-resident union skips the
+        /// admit too). When the union overflows the bank (small-slot banks), the union admit
+        /// is skipped and, one row at a time, that row's bank copies and miss pass run against
+        /// the chunk-initial slot row instead.
         ///
         /// Ordering: the bank's copies run on the bank's own stream, unordered against this
-        /// stream, and their victim slots are chosen from row `r`'s picks alone — so they must
-        /// not start while ANY launch of this chunk is still reading the bank. Each row's
-        /// `step` is therefore preceded by a full drain of this stream (the flat pass, or the
-        /// previous row's miss pass), which serializes execution row by row. A pick that was a
-        /// chunk-initial hit but was evicted by an earlier row's step is re-admitted by this
-        /// row's step (one wasted copy); its contribution stays in the first pass, so the
-        /// chunked sums can associate differently than the one-row-at-a-time block — within the
-        /// two-pass tolerance, like a miss.
+        /// stream. The union `admit` copies behind same-layer passes of earlier chunks that
+        /// may still be queued here, and, on the fallback path, each row's `step` picks victim
+        /// slots this chunk's own passes read; each is preceded by a full drain of this stream,
+        /// which serializes execution (one drain per chunk, or per dirty row).
+        /// On the fallback a pick that was a chunk-initial hit but was evicted by an earlier
+        /// row's step is re-admitted by this row's step (one wasted copy); its contribution
+        /// stays in the first pass, so the chunked sums can associate differently than the
+        /// one-row-at-a-time block — within the two-pass tolerance, like a miss.
         pub(in crate::family::flash_next) fn run_rows(
             &mut self,
             launch: &Launch<'_>,
@@ -763,9 +766,30 @@ mod device {
                 picks.push((ids, weights));
             }
 
+            // Chunk-admit: when the chunk's distinct picks fit the bank, admit their union in
+            // one pass before the classify — every row's picks then ride the flat resident
+            // pass and no per-row tail runs. Nothing before this point reads the bank's
+            // slots, but the drain keeps the ordering rule (the copies are unordered against
+            // this stream) uniform with `step`.
+            let picks_rows: Vec<&[i32]> = picks.iter().map(|(ids, _)| ids.as_slice()).collect();
+            let union = pick_union(&picks_rows, e);
+            let fits = union.len() <= geometry.slots;
+            let missing = {
+                let slot_row_now = self.bank.slot_row(layer)?;
+                union
+                    .iter()
+                    .filter(|&&id| slot_row_now[usize::from(id)] < 0)
+                    .count()
+            };
+            if fits && missing > 0 {
+                launch.stream.synchronize()?;
+                self.bank.admit(ctx, layer, &union)?;
+            }
+
             // One classify per row against the slot row as the chunk found it: a pick another
             // row of the chunk missed still rides this row's own second pass.
             let slot_row: Vec<i32> = self.bank.slot_row(layer)?.to_vec();
+
             scratch.write_at(stream, sc.slot_row, &le_i32(&slot_row))?;
             let mut classified = Vec::with_capacity(m);
             for (r, pick) in picks.iter().enumerate() {
@@ -1109,4 +1133,21 @@ mod device {
             )
         }
     }
+}
+
+/// The distinct expert ids of a chunk's picks, first use first. The order only matters when
+/// the union overflows the bank (the oldest uses stay); on the admit path it always fits.
+pub(in crate::family::flash_next) fn pick_union(rows: &[&[i32]], n_expert: usize) -> Vec<u16> {
+    let mut seen = vec![false; n_expert];
+    let mut union = Vec::with_capacity(rows.first().map_or(0, |row| row.len()));
+    for row in rows {
+        for &id in *row {
+            // run_rows refuses ids outside 0..n_expert before the first pick_union call.
+            if !seen[id as usize] {
+                seen[id as usize] = true;
+                union.push(id as u16);
+            }
+        }
+    }
+    union
 }
