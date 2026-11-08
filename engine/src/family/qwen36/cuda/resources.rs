@@ -614,6 +614,8 @@ fn stack_of<'w>(
         | (_, WeightLayout::Exl3) => Err(EngError::Checkpoint(format!(
             "moe weights: {name} needs EXL3 per-expert dispatch"
         ))),
+        // (Tiled, Native) never reaches here: the first arm already accepted it (the hybrid
+        // seam serves Tiled expert stacks in a Native session).
         (Some(CudaWeight::Native { .. }), WeightLayout::Tiled) => Err(EngError::Checkpoint(
             format!("moe weights: {name} is loaded in the other layout than the session"),
         )),

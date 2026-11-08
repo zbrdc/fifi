@@ -230,6 +230,8 @@ pub(super) fn dense_weight<'w>(
         | (_, WeightLayout::Exl3) => Err(EngError::Checkpoint(format!(
             "mixer weights: {name} does not match the requested EXL3 layout"
         ))),
+        // (Tiled, Native) never reaches here: the first arm already accepted it (a dense Tiled
+        // weight runs in a Native session - the hybrid seam), so only the reverse refuses.
         (Some(CudaWeight::Native { .. }), WeightLayout::Tiled) => Err(EngError::Checkpoint(
             format!("mixer weights: {name} is loaded in the native layout, the step runs tiled"),
         )),
