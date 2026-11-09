@@ -172,7 +172,7 @@ impl CardChunkDevice {
 
     /// The bank's statistics line, as 's.
     pub(super) fn bank_misses(&self) -> u64 {
-        self.moe.bank().stats().misses
+        self.moe.bank().state().stats().misses
     }
 }
 
@@ -251,6 +251,6 @@ impl super::driver::chunk::ChunkDevice for CardChunkDevice {
     }
 
     fn bank_misses(&self) -> Option<u64> {
-        Some(self.moe.bank().stats().misses)
+        Some(self.moe.bank().state().stats().misses)
     }
 }

@@ -1058,7 +1058,7 @@ pub(super) mod device {
     };
     use crate::{
         EngError,
-        kernels::cuda::{CudaContext, DeviceBuffer, DeviceStream, PinnedBuf},
+        kernels::cuda::{CudaContext, DeviceBuffer, DeviceRange, DeviceStream, PinnedBuf},
     };
 
     pub(in crate::family::flash_next) struct DeviceBank {
@@ -1138,7 +1138,7 @@ pub(super) mod device {
             &self,
             layer: usize,
         ) -> Result<&[i32], EngError> {
-            self.check_usable()?;
+            self.state.check_usable()?;
             let row = self.state.slot_row(layer);
             if row.is_empty() {
                 return Err(EngError::BadRequest(format!(
@@ -1159,7 +1159,7 @@ pub(super) mod device {
             place: u32,
             dst: DeviceRange<'_>,
         ) -> Result<(), EngError> {
-            self.check_usable()?;
+            self.state.check_usable()?;
             let geometry = self.state.geometry();
             let store = self.store.get_mut(layer).ok_or_else(|| {
                 EngError::BadRequest(format!("layer {layer} is outside the bank"))

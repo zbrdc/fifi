@@ -46,6 +46,11 @@ pub(crate) struct FlashOptions {
     /// CUDA only: routed-expert slots per layer in video memory, from 11 to 512. Default: what the
     /// load plan leaves at the context.
     pub(crate) slots: Option<u32>,
+    /// CUDA only: rows of one device step during prefill, from 1 to 8. The default, 1, is the
+    /// decode shape: one row per device call, exactly as before. A value above one runs the
+    /// prompt as device chunks of that many rows (one PLE host roundtrip per chunk), with decode
+    /// unchanged at one row.
+    pub(crate) prefill_rows: Option<u32>,
 }
 
 /// The K/V storage formats a `kv_format` value names.
@@ -72,6 +77,8 @@ pub(crate) struct CudaSettings {
     pub(crate) kv_format: KvFormatName,
     /// `None`: the load plan decides.
     pub(crate) slots: Option<u32>,
+    /// Rows of one device prefill step (1 = the decode shape). From `prefill_rows`.
+    pub(crate) prefill_rows: u32,
 }
 
 /// Default positions of the CUDA K/V caches.
@@ -159,6 +166,7 @@ fn cuda_settings(options: &FlashOptions) -> Result<Option<CudaSettings>, EngErro
             ("context", options.context.is_some()),
             ("kv_format", options.kv_format.is_some()),
             ("slots", options.slots.is_some()),
+            ("prefill_rows", options.prefill_rows.is_some()),
         ];
         return match stray.iter().find(|(_, set)| *set) {
             Some((key, _)) => Err(bad(format!("{key} needs cuda_decode set to true"))),
@@ -193,10 +201,14 @@ fn cuda_settings(options: &FlashOptions) -> Result<Option<CudaSettings>, EngErro
         .slots
         .map(|slots| bounded("slots", slots, MIN_CUDA_SLOTS, MAX_CUDA_SLOTS))
         .transpose()?;
+    // The step's rows are capped by the merged expert launches; `MAX_STEP_ROWS` in
+    // `cuda/step_plan.rs` is the same 8.
+    let prefill_rows = ranged("prefill_rows", options.prefill_rows, 1, 1, 8)?;
     Ok(Some(CudaSettings {
         context,
         kv_format,
         slots,
+        prefill_rows,
     }))
 }
 
@@ -557,6 +569,7 @@ mod tests {
                 context: 4096,
                 kv_format: KvFormatName::F16,
                 slots: None,
+                prefill_rows: 1,
             })
         );
         // The manifest is still required: it pins the tokenizer.
@@ -584,6 +597,7 @@ mod tests {
                 context: 65536,
                 kv_format: KvFormatName::F16,
                 slots: Some(48),
+                prefill_rows: 1,
             })
         );
         assert_eq!(KvFormatName::Int8.format(), KvFormat::Int8);

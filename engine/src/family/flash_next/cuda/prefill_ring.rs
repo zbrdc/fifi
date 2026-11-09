@@ -94,7 +94,7 @@ pub(super) mod device {
                     "the prefill ring needs at least one slot".into(),
                 ));
             }
-            let geometry: BankGeometry = *bank.geometry();
+            let geometry: BankGeometry = *bank.state().geometry();
             let layers = geometry.layers as usize;
             let experts = geometry.experts as usize;
             let slot_rows: Vec<&[i32]> = (0..layers)

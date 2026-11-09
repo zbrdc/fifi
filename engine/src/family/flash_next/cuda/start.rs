@@ -34,8 +34,9 @@ use super::{
         ReplaceOnMissLru, device::DeviceBank,
     },
     bank_source::PackRecordSource,
-    device::CardDevice,
-    driver::{DriverShape, TokenDriver},
+    device::{CardChunkDevice, CardDevice},
+    driver::chunk::ChunkDriver,
+    driver::{DriverShape, StepperPositions, TokenDriver, TokenTimes},
     executor::{CudaRules, FlashCudaExecutor},
     feeds::StartShape,
     load::{TrunkList, upload::trunk_weights},
@@ -386,7 +387,7 @@ fn make(
     wanted: &CudaSettings,
     rules: CudaRules,
     guard: BuildGuard,
-) -> Result<(FlashCudaExecutor<CardDevice, PackFeeds>, DecodeSession), EngError> {
+) -> Result<(FlashCudaExecutor<StepDriver>, DecodeSession), EngError> {
     let driver = build_driver(
         &|name| stages.begin(name),
         artifact,
@@ -405,7 +406,7 @@ pub(super) fn build_driver(
     wanted: &CudaSettings,
     sampler_vocab: usize,
     mut guard: Option<BuildGuard>,
-) -> Result<TokenDriver<CardDevice, PackFeeds>, EngError> {
+) -> Result<StepDriver, EngError> {
     let began = Instant::now();
     stage("initializing CUDA");
     let projector = CudaProjector::new()?;
@@ -600,6 +601,9 @@ pub(super) fn build_driver(
     );
 
     stage("building the step");
+    // `prefill_rows` above one builds the step's plans at that width, so a prompt chunk runs as
+    // device chunks of that many rows; one (the default) is the decode shape of before.
+    let rows = wanted.prefill_rows as usize;
     let stream = Box::leak(Box::new(ctx.stream()?));
     let step = FlashStep::new(
         ctx,
@@ -607,6 +611,7 @@ pub(super) fn build_driver(
         weights,
         &checkpoint.model_config,
         wanted.context as usize,
+        rows,
         0..layers,
     )?;
     let block = SplitMoe::new(
@@ -614,11 +619,10 @@ pub(super) fn build_driver(
         moe_trunks(weights, layers)?,
         bank,
         source.layout(),
-        &step.moe_dims(),
+        &step.moe_dims(rows),
     )?;
     let model_layers: Vec<usize> = (0..layers).collect();
     let moe = SplitMoeAt::new(block, &model_layers)?;
-    let device = CardDevice::new(step, moe);
 
     stage("opening the n-gram table");
     let (vectors, projection) =
@@ -643,12 +647,106 @@ pub(super) fn build_driver(
             ple_embed,
         },
     };
-    let driver = TokenDriver::new(device, feeds, shape)?;
-    eprintln!(
-        "flash-next cuda: ready in {:.1} s",
-        began.elapsed().as_secs_f64()
-    );
+    let driver = if rows > 1 {
+        let mut chunked = ChunkDriver::new(CardChunkDevice::new(step, moe), feeds, shape)?;
+        chunked.chunk_cap = rows;
+        eprintln!(
+            "flash-next cuda: ready in {:.1} s, prefill chunks of {rows} rows",
+            began.elapsed().as_secs_f64()
+        );
+        StepDriver::Chunk(chunked)
+    } else {
+        eprintln!(
+            "flash-next cuda: ready in {:.1} s",
+            began.elapsed().as_secs_f64()
+        );
+        StepDriver::Token(TokenDriver::new(CardDevice::new(step, moe), feeds, shape)?)
+    };
     Ok(driver)
+}
+
+/// The one driver type at the engine boundary: the plain token driver of decode, or the chunk
+/// driver `prefill_rows` builds. Forwards the stepper and the device-test surface.
+pub(in crate::family::flash_next::cuda) enum StepDriver {
+    Token(TokenDriver<CardDevice, PackFeeds>),
+    Chunk(ChunkDriver<CardChunkDevice, PackFeeds>),
+}
+
+impl crate::family::session::TokenStepper for StepDriver {
+    const OPERATION: &'static str = "flash_next_cuda";
+
+    fn feed(&mut self, token: u32) -> Result<(), EngError> {
+        match self {
+            Self::Token(driver) => driver.feed(token),
+            Self::Chunk(driver) => driver.feed(token),
+        }
+    }
+
+    /// Forwarded, not defaulted: the chunk driver's whole point is the chunked `feed_rows`.
+    fn feed_rows(&mut self, tokens: &[u32]) -> Result<(), EngError> {
+        match self {
+            Self::Token(driver) => driver.feed_rows(tokens),
+            Self::Chunk(driver) => driver.feed_rows(tokens),
+        }
+    }
+
+    fn logits(&mut self, token: u32) -> Result<Vec<f32>, EngError> {
+        match self {
+            Self::Token(driver) => driver.logits(token),
+            Self::Chunk(driver) => driver.logits(token),
+        }
+    }
+
+    fn fed(&self) -> usize {
+        match self {
+            Self::Token(driver) => driver.fed(),
+            Self::Chunk(driver) => driver.fed(),
+        }
+    }
+
+    fn reset(&mut self) -> Result<(), EngError> {
+        match self {
+            Self::Token(driver) => driver.reset(),
+            Self::Chunk(driver) => driver.reset(),
+        }
+    }
+}
+
+impl StepperPositions for StepDriver {
+    fn positions(&self) -> usize {
+        match self {
+            Self::Token(driver) => driver.positions(),
+            Self::Chunk(driver) => driver.positions(),
+        }
+    }
+}
+
+impl StepDriver {
+    /// The bank's miss count for the per-job report.
+    pub(super) fn bank_misses(&self) -> u64 {
+        match self {
+            Self::Token(driver) => driver.device().bank_misses(),
+            Self::Chunk(driver) => driver.device().bank_misses(),
+        }
+    }
+
+    /// The single-row kernel name, for the device tests (both devices expose it).
+    #[cfg(test)]
+    pub(super) fn single_row_kernel_name(&self) -> Result<&'static str, EngError> {
+        match self {
+            Self::Token(driver) => driver.device().single_row_kernel_name(),
+            Self::Chunk(driver) => driver.device().single_row_kernel_name(),
+        }
+    }
+
+    /// The last step's stage times, for the driver device tests. The chunk driver does not
+    /// track stage times; the stage table runs on the token driver.
+    pub(super) fn last_times(&self) -> TokenTimes {
+        match self {
+            Self::Token(driver) => driver.last_times(),
+            Self::Chunk(_) => TokenTimes::default(),
+        }
+    }
 }
 
 #[cfg(test)]
