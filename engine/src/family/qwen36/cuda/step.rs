@@ -47,8 +47,8 @@ use super::{
     mixer_geometry::MixerGeometry,
     mixer_weights::MixerWeights,
     moe::{
-        ExpertBufs, Launch, MoeBuffers, MoeDims, MoeLayerWeights, Packs, RouteBufs, StackWeights,
-        run_moe_block, tiered::TieredScratch,
+        ExpertBufs, Launch, MoeBuffers, MoeDims, MoeLayerWeights, MoeOp, Packs, RouteBufs,
+        StackWeights, run_moe_block_marked, tiered::TieredScratch,
     },
     prefill_driver::{
         AdmitFacts, FIXED_ADMISSION_MARGIN, FULL_STAGE_TIER_ROWS, Kv8StagingPlan, LedgerFigures,
@@ -150,6 +150,13 @@ struct SectionMarks {
     /// mixer half (the `Conv`/`AttnPrep` start to the `Delta`/`AttnDecode` end).
     mixer_end: Vec<TimingEvent>,
     core: Vec<(TimingEvent, TimingEvent)>,
+    /// The finer MoE split: one event per marked group at the `Router` end and one at the
+    /// `ExpertDownQ` end, recorded through `run_moe_block_marked`'s hook. Armed only for the
+    /// native resident path (`moe_subs`); other layouts never record these events, and a
+    /// never-recorded event must never be queried.
+    router_end: Vec<TimingEvent>,
+    experts_end: Vec<TimingEvent>,
+    moe_subs: bool,
     head_start: TimingEvent,
     head_end: TimingEvent,
     tail_start: TimingEvent,
@@ -162,15 +169,23 @@ struct SectionMarks {
 }
 
 impl SectionMarks {
-    fn new(context: &CudaContext, kinds: &[AttentionKind]) -> Result<Self, EngError> {
+    fn new(
+        context: &CudaContext,
+        kinds: &[AttentionKind],
+        moe_subs: bool,
+    ) -> Result<Self, EngError> {
         let plan = section_plan(kinds);
         let mut groups = Vec::with_capacity(plan.groups.len());
         let mut mixer_end = Vec::with_capacity(plan.groups.len());
         let mut core = Vec::with_capacity(plan.groups.len());
+        let mut router_end = Vec::with_capacity(plan.groups.len());
+        let mut experts_end = Vec::with_capacity(plan.groups.len());
         for _ in &plan.groups {
             groups.push((context.event_timing()?, context.event_timing()?));
             mixer_end.push(context.event_timing()?);
             core.push((context.event_timing()?, context.event_timing()?));
+            router_end.push(context.event_timing()?);
+            experts_end.push(context.event_timing()?);
         }
         Ok(Self {
             whole_start: context.event_timing()?,
@@ -179,6 +194,9 @@ impl SectionMarks {
             groups,
             mixer_end,
             core,
+            router_end,
+            experts_end,
+            moe_subs,
             head_start: context.event_timing()?,
             head_end: context.event_timing()?,
             tail_start: context.event_timing()?,
@@ -237,6 +255,16 @@ impl SectionMarks {
             .groups
             .iter()
             .position(|group| group.layer == layer)
+    }
+
+    /// Records the MoE sub-split events of the marked group `at`: the `Router` end and the
+    /// `ExpertDownQ` end, fired after those ops inside `run_moe_block_marked`.
+    fn record_moe_sub(&self, op: MoeOp, at: usize, stream: &DeviceStream) -> Result<(), EngError> {
+        match op {
+            MoeOp::Router => stream.record_timing(&self.router_end[at]),
+            MoeOp::ExpertDownQ => stream.record_timing(&self.experts_end[at]),
+            _ => Ok(()),
+        }
     }
 }
 
@@ -1103,7 +1131,13 @@ impl<'a> QwenResidentStep<'a> {
         // Created here, before the first token: the events must exist before the capture that
         // records them, and their addresses stay stable for the session's life.
         self.marks = if config.section_marks {
-            Some(SectionMarks::new(self.context, &self.res.dims.shape.kinds)?)
+            // The MoE sub-split exists only on the native resident path: the exl3 and tiered
+            // arms never run `run_moe_block_marked`, so their sub events would never record.
+            Some(SectionMarks::new(
+                self.context,
+                &self.res.dims.shape.kinds,
+                self.layout == WeightLayout::Native && !self.tiered_mode,
+            )?)
         } else {
             None
         };
@@ -2094,6 +2128,26 @@ impl<'a> QwenResidentStep<'a> {
             vec![0.0; marks.core.len()]
         };
         let head_ms = marks.head_start.elapsed_ms_since(&marks.head_end)?;
+        let (router_ms, experts_ms) = if marks.moe_subs {
+            (
+                marks
+                    .mixer_end
+                    .iter()
+                    .zip(&marks.router_end)
+                    .map(|(moe_start, router_end)| moe_start.elapsed_ms_since(router_end))
+                    .collect::<Result<Vec<_>, _>>()?,
+                marks
+                    .router_end
+                    .iter()
+                    .zip(&marks.experts_end)
+                    .map(|(router_end, experts_end)| router_end.elapsed_ms_since(experts_end))
+                    .collect::<Result<Vec<_>, _>>()?,
+            )
+        } else {
+            // The MoE sub-split was not armed: empty readings (a never-recorded event must
+            // never be queried).
+            (Vec::new(), Vec::new())
+        };
         marks
             .plan
             .reconcile(
@@ -2104,6 +2158,8 @@ impl<'a> QwenResidentStep<'a> {
                     mixer_ms,
                     core_ms,
                     head_ms,
+                    router_ms,
+                    experts_ms,
                 },
                 whole,
             )
@@ -2471,7 +2527,16 @@ impl<'a> QwenResidentStep<'a> {
                 if let Some(step) = trace_step {
                     self.trace_moe_row(&launch, bufs, step, layer)?;
                 }
-                let block = run_moe_block(&launch, weights, bufs, &self.moe_dims);
+                let sub = self
+                    .marks
+                    .as_ref()
+                    .filter(|m| m.moe_subs)
+                    .and_then(|m| m.group_index(layer).map(|at| (m, at)));
+                let block =
+                    run_moe_block_marked(&launch, weights, bufs, &self.moe_dims, |op| match &sub {
+                        Some((m, at)) => m.record_moe_sub(op, *at, s),
+                        None => Ok(()),
+                    });
                 if block.is_ok() {
                     if let Some(stage) = &self.route_stage {
                         stage_route_layer(ctx, s, stage, layer, &bufs.route)?;

@@ -36,6 +36,13 @@ pub(super) struct FineSplit {
     /// the mixer reading minus it.
     pub(super) core_ms: Vec<f32>,
     pub(super) head_ms: f32,
+    /// The router half of each marked layer's MoE section (`Moe` start to the `Router` end);
+    /// empty when the marks' MoE sub-split was not armed (non-native layouts, tiered).
+    pub(super) router_ms: Vec<f32>,
+    /// The expert-matvec span of each marked layer's MoE section (`Router` end to the
+    /// `ExpertDownQ` end), shared expert and combine included; the shared+combine tail of the
+    /// MoE section is the group reading minus mixer, router and this. Empty like `router_ms`.
+    pub(super) experts_ms: Vec<f32>,
 }
 
 #[derive(Debug, Clone)]
@@ -124,6 +131,18 @@ impl SectionPlan {
         for (at, ms) in fine.core_ms.iter().enumerate() {
             check(&format!("core {at}"), *ms)?;
         }
+        for (what, readings) in [("router", &fine.router_ms), ("experts", &fine.experts_ms)] {
+            if !readings.is_empty() && readings.len() != self.groups.len() {
+                return Err(EngError::BadRequest(format!(
+                    "section timing: {} {what} readings for {} marked groups",
+                    readings.len(),
+                    self.groups.len()
+                )));
+            }
+            for (at, ms) in readings.iter().enumerate() {
+                check(&format!("{what} {at}"), *ms)?;
+            }
+        }
         check("head", fine.head_ms)?;
         check("whole token", whole_ms)?;
         if whole_ms <= 0.0 {
@@ -187,6 +206,18 @@ impl SectionTimes {
     /// The `LmHead` op alone, split out of the tail section.
     pub(super) fn head_ms(&self) -> f32 {
         self.fine.head_ms
+    }
+
+    /// The router half of each marked layer's MoE section, in mark order; empty when the
+    /// MoE sub-split was not armed.
+    pub(super) fn router_marked_ms(&self) -> &[f32] {
+        &self.fine.router_ms
+    }
+
+    /// The expert-matvec span of each marked layer's MoE section, in mark order; empty when
+    /// the MoE sub-split was not armed.
+    pub(super) fn experts_marked_ms(&self) -> &[f32] {
+        &self.fine.experts_ms
     }
     /// The summed section GPU time: the embed and tail sections as read, every marked group
     /// scaled by its run size. No unmarked remainder is extrapolated — the span between the

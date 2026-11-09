@@ -61,6 +61,8 @@ struct Reading {
     /// attention core inside it, and the `LmHead` op alone.
     mixer_ms: Vec<f32>,
     core_ms: Vec<f32>,
+    router_ms: Vec<f32>,
+    experts_ms: Vec<f32>,
     head_ms: f32,
     wall_ms: f32,
 }
@@ -182,6 +184,8 @@ fn run_pair() -> Result<DeviceReceipt, EngError> {
             groups,
             mixer_ms: times.mixer_marked_ms().to_vec(),
             core_ms: times.core_marked_ms().to_vec(),
+            router_ms: times.router_marked_ms().to_vec(),
+            experts_ms: times.experts_marked_ms().to_vec(),
             head_ms: times.head_ms(),
             wall_ms,
         });
@@ -278,6 +282,13 @@ fn section_marks_time_the_captured_step() {
         // wall time of the token, and the idle-gap fractions — `1 - whole/wall` from the measured
         // pair, `1 - sum/wall` from the estimate. Never gated here; the claimed numbers come from
         // an exclusive timing window.
+        let at = |layer: &usize| {
+            reading
+                .groups
+                .iter()
+                .position(|(l, _, _)| l == layer)
+                .unwrap_or(0)
+        };
         let groups = reading
             .groups
             .iter()
@@ -292,14 +303,30 @@ fn section_marks_time_the_captured_step() {
             })
             .collect::<Vec<_>>()
             .join(",");
+        let subs = reading
+            .groups
+            .iter()
+            .zip(&reading.router_ms)
+            .zip(&reading.experts_ms)
+            .map(|(((layer, _, _), router), experts)| {
+                let i = at(layer);
+                let moe = reading.groups[i].2 - reading.mixer_ms[i];
+                format!(
+                    "l{layer}:moe {moe:.4}[rte {router:.4}/exp {experts:.4}/shd+cb {:.4}]",
+                    moe - router - experts
+                )
+            })
+            .collect::<Vec<_>>()
+            .join(",");
         println!(
-            "SECTION TIMING token={} embed={:.4}ms tail={:.4}ms(head {:.4}) whole={:.4}ms groups=[{}] sum={:.4}ms fraction={:.4} wall={:.4}ms idle_gap={:.4} sum_gap={:.4} (report-only)",
+            "SECTION TIMING token={} embed={:.4}ms tail={:.4}ms(head {:.4}) whole={:.4}ms groups=[{}] moe_subs=[{}] sum={:.4}ms fraction={:.4} wall={:.4}ms idle_gap={:.4} sum_gap={:.4} (report-only)",
             reading.token,
             reading.embed_ms,
             reading.tail_ms,
             reading.head_ms,
             reading.whole_ms,
             groups,
+            subs,
             reading.sum_ms,
             reading.fraction,
             reading.wall_ms,

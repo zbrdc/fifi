@@ -1470,9 +1470,22 @@ pub(super) fn run_moe_block(
     bufs: &MoeBuffers<'_>,
     dims: &MoeDims,
 ) -> Result<(), EngError> {
+    run_moe_block_marked(launch, weights, bufs, dims, |_| Ok(()))
+}
+
+/// [`run_moe_block`] with a hook fired after each op: the step's section marks record the
+/// in-graph MoE sub-split (the `Router` end and the expert-matvec end) through it.
+pub(super) fn run_moe_block_marked(
+    launch: &Launch<'_>,
+    weights: &MoeLayerWeights<'_>,
+    bufs: &MoeBuffers<'_>,
+    dims: &MoeDims,
+    mut mark_after: impl FnMut(MoeOp) -> Result<(), EngError>,
+) -> Result<(), EngError> {
     check_block(dims, &weights.facts(), &bufs.facts())?;
     for op in moe_sequence(dims.top_k, bufs.expert.packs.kind().layout()) {
         launch_op(launch, weights, bufs, op)?;
+        mark_after(op)?;
     }
     Ok(())
 }

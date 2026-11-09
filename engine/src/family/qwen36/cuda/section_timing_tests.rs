@@ -48,6 +48,8 @@ fn extrapolation_scales_groups_and_reconciles_with_whole() {
                 mixer_ms: vec![0.6, 1.1],
                 core_ms: vec![0.3, 0.3],
                 head_ms: 0.2,
+                router_ms: vec![],
+                experts_ms: vec![],
             },
             7.75,
         )
@@ -66,6 +68,8 @@ fn reconcile_rejects_non_finite_or_negative_sections() {
         mixer_ms: vec![0.5],
         core_ms: vec![0.3],
         head_ms: 0.2,
+        router_ms: vec![],
+        experts_ms: vec![],
     };
     assert!(plan.reconcile(-0.1, 0.2, &[1.0], fine(), 3.0).is_err());
     assert!(plan.reconcile(0.1, 0.2, &[f32::NAN], fine(), 3.0).is_err());
@@ -84,12 +88,16 @@ fn reconcile_rejects_non_finite_or_negative_sections() {
         mixer_ms: vec![],
         core_ms: vec![],
         head_ms: 0.2,
+        router_ms: vec![],
+        experts_ms: vec![],
     };
     assert!(plan.reconcile(0.1, 0.2, &[1.0], mismatched, 3.0).is_err());
     let negative_mixer = FineSplit {
         mixer_ms: vec![-0.1],
         core_ms: vec![0.3],
         head_ms: 0.2,
+        router_ms: vec![],
+        experts_ms: vec![],
     };
     assert!(
         plan.reconcile(0.1, 0.2, &[1.0], negative_mixer, 3.0)
@@ -99,6 +107,8 @@ fn reconcile_rejects_non_finite_or_negative_sections() {
         mixer_ms: vec![0.5],
         core_ms: vec![0.3],
         head_ms: f32::NAN,
+        router_ms: vec![],
+        experts_ms: vec![],
     };
     assert!(plan.reconcile(0.1, 0.2, &[1.0], nan_head, 3.0).is_err());
 }
@@ -112,6 +122,8 @@ fn reconcile_rejects_overflowing_derived_totals() {
         mixer_ms: vec![1e38],
         core_ms: vec![0.3],
         head_ms: 1e38,
+        router_ms: vec![],
+        experts_ms: vec![],
     };
     assert!(plan.reconcile(1e38, 1e38, &[1e38], huge, 1e-38).is_err());
     // A finite sum alone is not enough: the ratio against a tiny whole overflows too.
@@ -119,6 +131,8 @@ fn reconcile_rejects_overflowing_derived_totals() {
         mixer_ms: vec![0.5],
         core_ms: vec![0.3],
         head_ms: 0.2,
+        router_ms: vec![],
+        experts_ms: vec![],
     };
     assert!(plan.reconcile(1.0, 1.0, &[1.0], ok, 1e-38).is_err());
 }
