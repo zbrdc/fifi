@@ -964,6 +964,9 @@ mod device {
                 )?;
                 classified.push(classify_picks(&slot_row, geometry.slots, &pick.0, &pick.1)?);
             }
+            // Every pick resident against the chunk-initial row: the union admit made the
+            // whole chunk clean, the common case after `a688f3af9`.
+            let all_clean = classified.iter().all(|c| c.misses.is_empty());
             tick(28);
 
             // The resident pass of every row in flat launches: pick `r * k + p` indexes the
@@ -1047,14 +1050,26 @@ mod device {
                         gate: bufs.route.shared_gate,
                         row: bufs.shared_out,
                     }),
-                    out: CombineOut::To(partial),
+                    out: if all_clean {
+                        // An all-clean chunk has no second pass, so the resident sum is the
+                        // block output: write it straight to `resid_out` and skip the per-row
+                        // tail (8 zero-weight writes plus 8 m=1 combines per layer-chunk).
+                        CombineOut::To(bufs.route.resid_out)
+                    } else {
+                        CombineOut::To(partial)
+                    },
                 },
             )?;
             tick(31);
 
             // Per row: the copies for its picks, then its miss pass — or, when every pick was
             // resident, the one combine that moves the resident result to the block output.
+            // An all-clean chunk skips the loop whole: every tail combine would only copy
+            // `partial` to `resid_out` at zero miss weights.
             for r in 0..m {
+                if all_clean {
+                    break;
+                }
                 if classified[r].misses.is_empty() {
                     scratch.write_at(
                         stream,
