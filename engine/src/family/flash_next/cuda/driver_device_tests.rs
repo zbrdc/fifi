@@ -182,6 +182,7 @@ fn the_first_real_tokens_match_the_oracle() {
         kv_format: KvFormatName::F16,
         slots: var("FIFI_FLASH_NEXT_DRIVER_SLOTS").map(|v| v.parse().expect("slots")),
         prefill_rows: 1,
+        expert_stats: None,
     };
     let began = std::time::Instant::now();
     let mut driver = build_driver(
@@ -449,6 +450,7 @@ fn teacher_forced_steps_follow_the_oracle_on_every_prompt() {
         kv_format: KvFormatName::F16,
         slots: var("FIFI_FLASH_NEXT_DRIVER_SLOTS").map(|v| v.parse().expect("slots")),
         prefill_rows: 1,
+        expert_stats: None,
     };
     let mut driver = build_driver(
         &|stage| println!("stage: {stage}"),
@@ -713,6 +715,7 @@ fn single_row_kernel_receipt_run() {
         kv_format: KvFormatName::F16,
         slots: var("FIFI_FLASH_NEXT_DRIVER_SLOTS").map(|v| v.parse().expect("slots")),
         prefill_rows: 1,
+        expert_stats: None,
     };
     let mut driver = build_driver(&|_| {}, &pack, &wanted, actual_vocab, None).expect("driver");
     let kernel = driver.single_row_kernel_name().expect("kernel name");
@@ -813,6 +816,7 @@ fn the_chunked_prefill_driver_matches_the_oracle() {
         kv_format: KvFormatName::F16,
         slots: None,
         prefill_rows: var("FIFI_FLASH_NEXT_DRIVER_ROWS").map_or(4, |v| v.parse().expect("rows")),
+        expert_stats: None,
     };
     let mut driver = build_driver(&|_| {}, &pack, &wanted, actual_vocab, None).expect("driver");
 

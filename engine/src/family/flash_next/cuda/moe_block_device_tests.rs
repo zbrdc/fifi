@@ -742,8 +742,15 @@ fn a_chunk_whose_picks_fit_the_bank_admits_the_union_in_one_pass() {
     for row in &row_inputs {
         wants.push(reference(checkpoint, (layer, &router), &one_row, row).expect("fp64 reference"));
         let rig = Rig::new(&projector, &one_row, row).expect("rig");
-        run_exl3_moe(&launch, &block, &rig.bufs().expect("bufs"), &one_row, true)
-            .expect("the all-resident block");
+        run_exl3_moe(
+            &launch,
+            &block,
+            &rig.bufs().expect("bufs"),
+            &one_row,
+            true,
+            None,
+        )
+        .expect("the all-resident block");
         launch.stream.synchronize().expect("sync");
         residents.push(rig.out_bytes(&projector));
     }
