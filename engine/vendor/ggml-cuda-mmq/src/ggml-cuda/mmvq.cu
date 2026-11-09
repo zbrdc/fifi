@@ -1135,18 +1135,30 @@ static cudaError_t mul_mat_vec_q_switch_ncols_dst(
             static constexpr int c_ncols_dst = 1;
 
             // FIFI-MVQ72: the Xavier warp-per-row shape (see mul_mat_vec_q_wpr). cc 7.2 only,
-            // ids path only, default OFF behind INFERENCE_CUDA_MVQ_WPR: the reduction order
-            // differs from the generic kernel, so the seam's bit-level contracts (single vs
-            // multi-column dense, ids vs dense per slot) hold only while every path uses the
-            // generic kernel; flag-on the ids path is oracle-exact (2.9e-08) and the dedicated
-            // tolerance test covers it. No GLU fusion (the fused launch needs the generic
-            // kernel's two-stack loop). The flag is read per call (no static cache) so a
-            // test process can arm it around individual launches; one getenv is noise against
-            // a 100 microsecond launch. The constexpr keeps the kernel Q4_K-only.
+            // default OFF. The ids arm is INFERENCE_CUDA_MVQ_WPR; the dense ncols-1 arm (the
+            // per-token projections and the head, which dominate the decode step) is
+            // INFERENCE_CUDA_MVQ_WPR_DENSE - separate gates because the dense arm changes the
+            // bits of every dense matvec while the ids arm only touches the expert launches,
+            // so each can be qualified alone. Both arms' reduction order differs from the
+            // generic kernel, so the seam's bit-level contracts (single vs multi-column dense,
+            // ids vs dense per slot) hold only while every path uses the generic kernel;
+            // flag-on the ids path is oracle-exact (2.9e-08) and the dense arm is ULP-bounded
+            // against the integer reference (0.007 of the stated tolerance); dedicated
+            // tolerance tests cover both. No GLU fusion (the fused launch needs the generic
+            // kernel's two-stack loop). The flags are read per call (no static cache) so a
+            // test process can arm them around individual launches; one getenv is noise
+            // against a 100 microsecond launch. The constexpr keeps the kernel Q4_K-only.
             if constexpr (type == GGML_TYPE_Q4_K) {
-                if (ids != nullptr && fusion.gate == nullptr && cc == 720 &&
-                    (g_mvq_wpr_test_arm != 0 ||
-                     std::getenv("INFERENCE_CUDA_MVQ_WPR") != nullptr)) {
+                const bool fusion_none = fusion.gate == nullptr && fusion.x_bias == nullptr &&
+                                         fusion.gate_bias == nullptr && fusion.x_scale == nullptr &&
+                                         fusion.gate_scale == nullptr;
+                const bool ids_arm =
+                    ids != nullptr &&
+                    (g_mvq_wpr_test_arm != 0 || std::getenv("INFERENCE_CUDA_MVQ_WPR") != nullptr);
+                const bool dense_arm =
+                    ids == nullptr && (g_mvq_wpr_test_arm != 0 ||
+                                       std::getenv("INFERENCE_CUDA_MVQ_WPR_DENSE") != nullptr);
+                if (fusion_none && cc == 720 && (ids_arm || dense_arm)) {
                     return mul_mat_vec_q_wpr_launch<type>(
                         vx, vy, ids, dst, ncols_x, nchannels_y_fd, nchannels_x, nrows_x,
                         stride_row_x, stride_col_dst, channel_ratio_fd, nchannels_dst,

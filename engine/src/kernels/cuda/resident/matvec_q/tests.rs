@@ -19,6 +19,12 @@ use crate::kernels::cuda::resident::quantize_q8_1::{MATRIX_ROW_PADDING, Quantize
 use crate::kernels::cuda::testkit;
 use crate::kernels::cuda::{CapturePlan, CudaContext, DeviceBuffer, DeviceRange, DeviceStream};
 
+#[allow(unsafe_code)]
+unsafe extern "C" {
+    /// the vendored mmvq.cu test-only arm override for INFERENCE_CUDA_MVQ_WPR (dense arm).
+    safe fn inference_cuda_test_arm_mvq_wpr(on: i32);
+}
+
 /// The shapes of tests 2 and 4: (k, rows).
 pub(in crate::kernels::cuda) const SHAPES: [(usize, usize); 5] = [
     (2048, 512),
@@ -324,6 +330,73 @@ fn matvec_q_matches_the_integer_reference() {
         }
     }
     println!("matvec_q reference: max error ratio {max_ratio:.3} of the tolerance");
+}
+
+/// `INFERENCE_CUDA_MVQ_WPR=1` (cc 7.2, default off) routes the dense ncols-1 Q4_K matvec to
+/// the warp-per-row kernel, whose reduction order differs from the generic kernel's, so the
+/// flag-on arm cannot equal the flag-off bits; it must stay within the same stated tolerance
+/// of the integer reference on every shape. The flag is read per call, so the test arms it
+/// around its launches only (device tests run with --test-threads=1).
+#[test]
+fn matvec_q_wpr_dense_mode_matches_reference_within_reassociation() {
+    const NAME: &str = "matvec_q_wpr_dense_mode_matches_reference_within_reassociation";
+    if !testkit::device_present(NAME) {
+        return;
+    }
+    let ctx = CudaContext::new().expect("context");
+    let stream = ctx.stream().expect("stream");
+    inference_cuda_test_arm_mvq_wpr(1);
+    let mut max_ratio = 0.0f64;
+    for (k, rows) in SHAPES.into_iter().chain([PADDED_SHAPE]) {
+        let seed = 0x9000_0000 + k as u64 + rows as u64;
+        let (w, x_q8, row_bytes) = rig(&ctx, &stream, QuantType::Q4K, k, rows, 1, seed);
+        let y_bytes = rows * 4;
+        let y = testkit::upload_filled(&ctx, 0xAA, y_bytes);
+        ctx.matvec_q(
+            &stream,
+            MatvecCall {
+                ty: QuantType::Q4K,
+                w: w.range(0, QuantType::Q4K.weight_bytes(rows, k).expect("size"))
+                    .expect("w"),
+                x_q8: x_q8.range(0, q8_1_bytes(k, 1).expect("size")).expect("x"),
+                y: y.range(0, y_bytes).expect("y"),
+                k,
+                rows,
+                ncols: 1,
+            },
+        )
+        .expect("matvec");
+        stream.synchronize().expect("drain");
+        let got = read_f32(&ctx, &y, y_bytes);
+        let w_bytes = testkit::read_bytes(
+            &ctx,
+            &w,
+            QuantType::Q4K.weight_bytes(rows, k).expect("size"),
+        );
+        let x_bytes = testkit::read_bytes(&ctx, &x_q8, row_bytes);
+        for row in 0..rows {
+            let (reference, abs) = reference::reference_dot(
+                QuantType::Q4K,
+                &w_bytes[row * (k / QuantType::Q4K.block_size()) * QuantType::Q4K.block_bytes()..],
+                &x_bytes,
+                k,
+            );
+            let tolerance = 64.0 * 2f64.powi(-24) * abs;
+            let error = (got[row] as f64 - reference).abs();
+            let ratio = if tolerance > 0.0 {
+                error / tolerance
+            } else {
+                error
+            };
+            max_ratio = max_ratio.max(ratio);
+            assert!(
+                error <= tolerance,
+                "Q4K k {k} rows {rows} row {row}: error {error} over tol {tolerance} (reference {reference})"
+            );
+        }
+    }
+    inference_cuda_test_arm_mvq_wpr(0);
+    println!("{NAME}: max error ratio {max_ratio:.3} of the tolerance");
 }
 
 #[test]
