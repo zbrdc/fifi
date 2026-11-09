@@ -73,6 +73,8 @@ pub(super) mod device {
         entries: Vec<StreamEntry>,
         /// Boundary per layer: entries[layer_start[l]..layer_start[l + 1]] are layer l's.
         layer_start: Vec<usize>,
+        /// The most streamed experts any one layer needs (a layer's pass reads them all at once).
+        per_layer: usize,
         /// The first layer whose `free_layer` has not run yet (the consumed point).
         freed: usize,
         issued: usize,
@@ -81,12 +83,12 @@ pub(super) mod device {
     }
 
     impl PrefillRing {
-        /// Plans the stream from the frozen bank (every non-resident expert, layer-major) and
-        /// allocates the ring. Strata measured 384 slots as the optimum on a 24 GB card,
-        /// ~1.2 GiB at flash-next's 3.23 MiB records.
+        /// Allocates `ring` record slots laid out like one bank layer and the copy stream's
+        /// events. The plan is empty until [`Self::replan`]; Strata measured 384 slots as the
+        /// optimum on a 24 GB card, ~1.2 GiB at flash-next's 3.23 MiB records.
         pub(in crate::family::flash_next) fn build(
             ctx: &CudaContext,
-            bank: &DeviceBank,
+            geometry: BankGeometry,
             ring: usize,
         ) -> Result<Self, EngError> {
             if ring == 0 {
@@ -94,12 +96,39 @@ pub(super) mod device {
                     "the prefill ring needs at least one slot".into(),
                 ));
             }
+            let layers = geometry.layers as usize;
+            Ok(Self {
+                slots: ctx.allocate(ring * geometry.record_bytes)?,
+                copy: ctx.stream()?,
+                copied: (0..ring)
+                    .map(|_| ctx.event())
+                    .collect::<Result<Vec<_>, _>>()?,
+                used: (0..ring)
+                    .map(|_| ctx.event())
+                    .collect::<Result<Vec<_>, _>>()?,
+                live: vec![false; ring],
+                entries: Vec::new(),
+                layer_start: vec![0; layers + 1],
+                per_layer: 0,
+                freed: 0,
+                issued: 0,
+                record: geometry.record_bytes,
+                ring,
+            })
+        }
+
+        /// Re-plans the stream against the bank as it stands now (the decode steps between
+        /// prompts admit and evict, so the plan is per prompt): every non-resident expert,
+        /// layer-major. The slot buffer and events survive; a slot whose last copy is still in
+        /// flight keeps `live`, and the next issue waits its `used` event as usual.
+        pub(in crate::family::flash_next) fn replan(&mut self, bank: &DeviceBank) {
             let geometry: BankGeometry = *bank.state().geometry();
             let layers = geometry.layers as usize;
             let experts = geometry.experts as usize;
             let slot_rows: Vec<&[i32]> = (0..layers)
                 .map(|l| bank.slot_row(l))
-                .collect::<Result<Vec<_>, _>>()?;
+                .collect::<Result<Vec<_>, _>>()
+                .unwrap_or_default();
             let place_rows: Vec<Vec<u32>> = (0..layers)
                 .map(|l| {
                     (0..experts)
@@ -113,7 +142,7 @@ pub(super) mod device {
                 })
                 .collect();
             let place_refs: Vec<&[u32]> = place_rows.iter().map(|v| v.as_slice()).collect();
-            let entries = plan_from_rows(&slot_rows, &place_refs, experts, ring);
+            let entries = plan_from_rows(&slot_rows, &place_refs, experts, self.ring);
             let mut layer_start = vec![entries.len(); layers + 1];
             for (i, entry) in entries.iter().enumerate() {
                 let l = usize::from(entry.layer);
@@ -121,37 +150,21 @@ pub(super) mod device {
                     layer_start[l] = i;
                 }
             }
-            // A layer's grouped pass reads every streamed expert of the layer at once, so the
-            // ring must hold one full layer while the next streams in behind it.
-            let per_layer = layer_start
+            self.per_layer = layer_start
                 .windows(2)
                 .map(|w| w[1] - w[0])
                 .max()
                 .unwrap_or(0);
-            if ring < 2 * per_layer {
-                return Err(EngError::BadRequest(format!(
-                    "the prefill ring needs {}/{} slots to hold a layer and the next, has {ring}",
-                    per_layer,
-                    2 * per_layer
-                )));
-            }
-            Ok(Self {
-                slots: ctx.allocate(ring * geometry.record_bytes)?,
-                copy: ctx.stream()?,
-                copied: (0..ring)
-                    .map(|_| ctx.event())
-                    .collect::<Result<Vec<_>, _>>()?,
-                used: (0..ring)
-                    .map(|_| ctx.event())
-                    .collect::<Result<Vec<_>, _>>()?,
-                live: vec![false; ring],
-                entries,
-                layer_start,
-                freed: 0,
-                issued: 0,
-                record: geometry.record_bytes,
-                ring,
-            })
+            self.entries = entries;
+            self.layer_start = layer_start;
+            self.freed = 0;
+            self.issued = 0;
+        }
+
+        /// The most streamed experts any one layer needs: the ring must hold at least this
+        /// many slots, because a layer's grouped pass reads all of them at once.
+        pub(in crate::family::flash_next) fn per_layer(&self) -> usize {
+            self.per_layer
         }
 
         /// Enqueues H2D copies until `ahead` entries past the consumed point (the driver calls
@@ -196,6 +209,32 @@ pub(super) mod device {
                 self.issued += 1;
             }
             Ok(())
+        }
+
+        /// Resets the per-chunk cursors for the next chunk of the same prompt: layers free in
+        /// order again from 0. The slot events and `live` survive, so a wrap onto a slot whose
+        /// copy is still in flight still waits its `used` event.
+        pub(in crate::family::flash_next) fn begin_chunk(&mut self) {
+            self.freed = 0;
+            self.issued = 0;
+        }
+
+        /// Issues every entry through the end of `layer` (inclusive): the driver calls this at
+        /// the start of layer `l`'s MoE half with `layer = l + 1`, so the next layer's experts
+        /// stream during this layer's compute and the next attention.
+        pub(in crate::family::flash_next) fn issue_through(
+            &mut self,
+            ctx: &CudaContext,
+            bank: &mut DeviceBank,
+            layer: usize,
+        ) -> Result<(), EngError> {
+            let target = self
+                .layer_start
+                .get(layer + 1)
+                .copied()
+                .unwrap_or(self.entries.len());
+            let start = self.layer_start[self.freed];
+            self.issue_until(ctx, bank, target.saturating_sub(start))
         }
 
         /// Makes `stream` wait every copy of `layer`'s entries, so the grouped launches that
@@ -248,6 +287,11 @@ pub(super) mod device {
         /// The ring buffer, laid out like one bank layer for the grouped launch.
         pub(in crate::family::flash_next) fn slots(&self) -> &DeviceBuffer {
             &self.slots
+        }
+
+        /// The ring's slot count (the `members` bound of a ring-sourced launch).
+        pub(in crate::family::flash_next) fn ring_slots(&self) -> usize {
+            self.ring
         }
 
         fn layer_entries(&self, layer: usize) -> &[StreamEntry] {

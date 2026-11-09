@@ -203,7 +203,13 @@ impl super::driver::chunk::ChunkDevice for CardChunkDevice {
     }
 
     fn begin_chunk(&mut self) -> Result<(), EngError> {
+        self.moe.begin_chunk();
         self.step.begin_chunk(self.m)
+    }
+
+    fn begin_prefill(&mut self) -> Result<(), EngError> {
+        self.moe.begin_prefill();
+        Ok(())
     }
 
     fn layers(

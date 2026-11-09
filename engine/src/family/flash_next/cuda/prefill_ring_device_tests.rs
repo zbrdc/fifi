@@ -62,7 +62,8 @@ fn the_ring_streams_every_non_resident_expert_in_layer_order() {
     let mut bank = DeviceBank::build(ctx, state, &Pattern, &plan).expect("build the bank");
 
     let compute = ctx.stream().expect("compute stream");
-    let mut ring = PrefillRing::build(ctx, &bank, 16).expect("plan the ring");
+    let mut ring = PrefillRing::build(ctx, geometry, 16).expect("build the ring");
+    ring.replan(&bank);
     assert_eq!(ring.slot_of(0, 4), Some(0));
     assert_eq!(ring.slot_of(0, 11), Some(7));
     assert_eq!(ring.slot_of(1, 4), Some(8));
@@ -143,6 +144,7 @@ fn freeing_out_of_order_is_refused() {
     .expect("the host plan");
     let bank = DeviceBank::build(ctx, state, &Pattern, &plan).expect("build the bank");
     let compute = ctx.stream().expect("compute stream");
-    let mut ring = PrefillRing::build(ctx, &bank, 16).expect("plan the ring");
+    let mut ring = PrefillRing::build(ctx, geometry, 16).expect("build the ring");
+    ring.replan(&bank);
     assert!(ring.free_layer(&compute, 1).is_err());
 }

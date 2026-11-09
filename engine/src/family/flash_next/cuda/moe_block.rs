@@ -76,6 +76,8 @@ fn align_up(value: usize) -> usize {
 /// inputs. One allocation, regions at aligned offsets. About 24 KiB at the real sizes.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) struct ScratchLayout {
+    /// The chunk row count this layout is sized for; run_rows admits at most this many rows.
+    pub(super) rows: usize,
     /// i32 `[n_expert]`: the layer's slot row, uploaded before each classification.
     pub(super) slot_row: usize,
     /// i32 `[top_k]`: the bank slot of each pick for the resident pass.
@@ -145,6 +147,7 @@ impl ScratchLayout {
             partial,
         ] = offsets;
         Ok(Self {
+            rows,
             slot_row,
             slot_ids,
             weights,
@@ -366,6 +369,9 @@ mod device {
         scratch: DeviceBuffer,
         book: Codebook,
         verify_finite_filler: bool,
+        /// The prefill expert ring: `None` until [`SplitMoe::plan_ring`] funds one; the
+        /// multi-row path streams through it instead of admitting into the bank.
+        ring: Option<crate::family::flash_next::cuda::prefill_ring::device::PrefillRing>,
     }
 
     /// One pass over the bank.
@@ -471,7 +477,53 @@ mod device {
                 scratch,
                 book,
                 verify_finite_filler: false,
+                ring: None,
             })
+        }
+
+        /// Tries to fund the prefill ring: `budget` record slots of device memory, clamped to
+        /// twice the streamed experts per layer (the ideal horizon) and never above it. A ring
+        /// smaller than one full layer is not usable (a layer's grouped pass reads every
+        /// streamed expert at once) and is not built. Returns the slot count funded, `0` when
+        /// none. Call once, after the constructor.
+        pub(in crate::family::flash_next) fn plan_ring(
+            &mut self,
+            ctx: &CudaContext,
+            budget: usize,
+        ) -> Result<usize, EngError> {
+            let geometry = *self.bank.geometry();
+            let streamed = geometry
+                .experts
+                .checked_sub(geometry.slots)
+                .unwrap_or(geometry.experts) as usize;
+            let want = budget.min(2 * streamed).max(1);
+            let mut ring =
+                crate::family::flash_next::cuda::prefill_ring::device::PrefillRing::build(
+                    ctx, geometry, want,
+                )?;
+            ring.replan(&self.bank);
+            if ring.ring_slots() < ring.per_layer() {
+                return Ok(0);
+            }
+            let slots = ring.ring_slots();
+            self.ring = Some(ring);
+            Ok(slots)
+        }
+
+        /// Re-plans the ring against the bank as decode left it, at the start of every prompt's
+        /// chunked prefill.
+        pub(in crate::family::flash_next) fn begin_prefill(&mut self) {
+            if let Some(ring) = &mut self.ring {
+                ring.replan(&self.bank);
+                ring.begin_chunk();
+            }
+        }
+
+        /// Resets the ring's per-chunk cursors (the chunk driver's `begin_chunk`).
+        pub(in crate::family::flash_next) fn begin_chunk(&mut self) {
+            if let Some(ring) = &mut self.ring {
+                ring.begin_chunk();
+            }
         }
 
         pub(in crate::family::flash_next) fn bank(&self) -> &DeviceBank {
@@ -659,56 +711,18 @@ mod device {
             })
         }
 
-        /// The MoE block of a chunk of `dims.rows` rows (`2..=8`), the batched shape of
-        /// [`Self::run`]: one router launch over every row, then — when the chunk's distinct
-        /// picks fit the bank and any of them is missing — one `admit` of their union, so
-        /// every row's picks ride the flat resident pass in grouped launches with the shared
-        /// expert and the first combine over all rows, and no per-row tail runs (the classify's
-        /// chunk-initial slot row is the post-admit row; an already-resident union skips the
-        /// admit too). When the union overflows the bank (small-slot banks), the union admit
-        /// is skipped and, one row at a time, that row's bank copies and miss pass run against
-        /// the chunk-initial slot row instead.
-        ///
-        /// Ordering: the bank's copies run on the bank's own stream, unordered against this
-        /// stream. The union `admit` copies behind same-layer passes of earlier chunks that
-        /// may still be queued here, and, on the fallback path, each row's `step` picks victim
-        /// slots this chunk's own passes read; each is preceded by a full drain of this stream,
-        /// which serializes execution (one drain per chunk, or per dirty row).
-        /// On the fallback a pick that was a chunk-initial hit but was evicted by an earlier
-        /// row's step is re-admitted by this row's step (one wasted copy); its contribution
-        /// stays in the first pass, so the chunked sums can associate differently than the
-        /// one-row-at-a-time block — within the two-pass tolerance, like a miss.
-        pub(in crate::family::flash_next) fn run_rows(
-            &mut self,
+        /// One router launch over every row of the chunk, then one read-back: `(ids, weights)`
+        /// per row. Shared by the admit path and the ring path of `run_rows`.
+        fn route_rows(
+            &self,
             launch: &Launch<'_>,
             layer: usize,
             bufs: &Exl3MoeBufs<'_>,
             dims: &MoeDims,
-        ) -> Result<(), EngError> {
+        ) -> Result<Vec<(Vec<i32>, Vec<f32>)>, EngError> {
             let m = dims.rows;
-            if !(2..=8).contains(&m) {
-                return Err(refuse(format!("the block takes 2 to 8 rows, got {m}")));
-            }
-            let geometry = *self.bank.state().geometry();
-            if dims.n_expert != geometry.experts
-                || dims.top_k != geometry.top_k
-                || layer >= geometry.layers
-            {
-                return Err(refuse(format!(
-                    "layer {layer} with {} experts and {} picks does not fit a bank of {} layers, \
-                     {} experts and {} picks",
-                    dims.n_expert, dims.top_k, geometry.layers, geometry.experts, geometry.top_k
-                )));
-            }
+            let (h, k, e) = (dims.hidden, dims.top_k, dims.n_expert);
             let (ctx, stream) = (launch.ctx, launch.stream);
-            let sc = self.layout;
-            let (h, i, k, e) = (dims.hidden, dims.inter, dims.top_k, dims.n_expert);
-            let scratch = &self.scratch;
-            let slot_ids = scratch.range(sc.slot_ids, m * k * I32)?;
-            let slot_weights = scratch.range(sc.weights, m * k * F32)?;
-            let partial = scratch.range(sc.partial, m * h * F32)?;
-
-            // One router over every row; its picks drive the host bank, so they come back once.
             let trunk = &self.trunks[layer];
             ctx.router_rows(
                 stream,
@@ -765,6 +779,63 @@ mod device {
                     .collect();
                 picks.push((ids, weights));
             }
+            Ok(picks)
+        }
+
+        /// The MoE block of a chunk of `dims.rows` rows (`2..=8`), the batched shape of
+        /// [`Self::run`]: one router launch over every row, then — when the chunk's distinct
+        /// picks fit the bank and any of them is missing — one `admit` of their union, so
+        /// every row's picks ride the flat resident pass in grouped launches with the shared
+        /// expert and the first combine over all rows, and no per-row tail runs (the classify's
+        /// chunk-initial slot row is the post-admit row; an already-resident union skips the
+        /// admit too). When the union overflows the bank (small-slot banks), the union admit
+        /// is skipped and, one row at a time, that row's bank copies and miss pass run against
+        /// the chunk-initial slot row instead.
+        ///
+        /// Ordering: the bank's copies run on the bank's own stream, unordered against this
+        /// stream. The union `admit` copies behind same-layer passes of earlier chunks that
+        /// may still be queued here, and, on the fallback path, each row's `step` picks victim
+        /// slots this chunk's own passes read; each is preceded by a full drain of this stream,
+        /// which serializes execution (one drain per chunk, or per dirty row).
+        /// On the fallback a pick that was a chunk-initial hit but was evicted by an earlier
+        /// row's step is re-admitted by this row's step (one wasted copy); its contribution
+        /// stays in the first pass, so the chunked sums can associate differently than the
+        /// one-row-at-a-time block — within the two-pass tolerance, like a miss.
+        pub(in crate::family::flash_next) fn run_rows(
+            &mut self,
+            launch: &Launch<'_>,
+            layer: usize,
+            bufs: &Exl3MoeBufs<'_>,
+            dims: &MoeDims,
+        ) -> Result<(), EngError> {
+            let m = dims.rows;
+            if !(2..=8).contains(&m) {
+                return Err(refuse(format!("the block takes 2 to 8 rows, got {m}")));
+            }
+            let geometry = *self.bank.state().geometry();
+            if dims.n_expert != geometry.experts
+                || dims.top_k != geometry.top_k
+                || layer >= geometry.layers
+            {
+                return Err(refuse(format!(
+                    "layer {layer} with {} experts and {} picks does not fit a bank of {} layers, \
+                     {} experts and {} picks",
+                    dims.n_expert, dims.top_k, geometry.layers, geometry.experts, geometry.top_k
+                )));
+            }
+            if self.ring.is_some() {
+                return self.run_rows_ring(launch, layer, bufs, dims);
+            }
+            let (ctx, stream) = (launch.ctx, launch.stream);
+            let sc = self.layout;
+            let (h, i, k, e) = (dims.hidden, dims.inter, dims.top_k, dims.n_expert);
+            let scratch = &self.scratch;
+            let slot_ids = scratch.range(sc.slot_ids, m * k * I32)?;
+            let slot_weights = scratch.range(sc.weights, m * k * F32)?;
+            let partial = scratch.range(sc.partial, m * h * F32)?;
+
+            // One router over every row; its picks drive the host bank, so they come back once.
+            let picks = self.route_rows(launch, layer, bufs, dims)?;
 
             // Chunk-admit: when the chunk's distinct picks fit the bank, admit their union in
             // one pass before the classify — every row's picks then ride the flat resident
@@ -867,9 +938,9 @@ mod device {
             shared_rows(
                 launch,
                 &SharedWeights {
-                    gate: trunk.shared_gate,
-                    up: trunk.shared_up,
-                    down: trunk.shared_down,
+                    gate: self.trunks[layer].shared_gate,
+                    up: self.trunks[layer].shared_up,
+                    down: self.trunks[layer].shared_down,
                 },
                 &SharedRowsIo {
                     norm_row: bufs.route.norm_row,
@@ -991,22 +1062,245 @@ mod device {
             }
         }
 
-        /// One id-indexed launch group over the bank buffer of `layer`, chunked at the launch
-        /// capacity; every chunk starts again at row 0 of the scratch.
-        fn grouped<'a>(
-            &'a self,
+        /// The MoE block of a chunk over the prefill ring: every pick reads either its bank
+        /// slot (the bank is frozen read-only for the whole prefill) or the ring slot the copy
+        /// stream filled, so there is no admit, no classify and no miss pass — one flat grouped
+        /// launch per source per part, the shared expert and one combine straight to the block
+        /// output. At the start of layer `l`'s half the ring issues layer `l + 1`'s experts, so
+        /// the copies run behind this half's compute and the next layer's attention.
+        ///
+        /// Ordering: the ring's copies run on its own copy stream; the compute stream waits
+        /// the `copied` events of this layer's entries before the grouped launches and records
+        /// their `used` events after, the same discipline as the bank's tail. The router's
+        /// read-back drains the compute stream once per layer; the copies keep streaming
+        /// through it.
+        ///
+        /// Accuracy: a streamed record's bits equal its banked bits (the same pinned-store
+        /// bytes), and the combine runs once over every pick, so the sum is the resident
+        /// reference's association exactly.
+        fn run_rows_ring(
+            &mut self,
             launch: &Launch<'_>,
             layer: usize,
-            items: &[Item<'a>],
-            (ids, scratch): (DeviceRange<'a>, &Scratch<'a>),
+            bufs: &Exl3MoeBufs<'_>,
+            dims: &MoeDims,
         ) -> Result<(), EngError> {
-            let bank = self.bank.slots(layer)?;
+            let m = dims.rows;
+            let (ctx, stream) = (launch.ctx, launch.stream);
+            let sc = self.layout;
+            let (h, i, k) = (dims.hidden, dims.inter, dims.top_k);
+            let geometry = *self.bank.geometry();
+            let scratch = &self.scratch;
+
+            // The next layer's experts stream now, behind this half's compute.
+            let ring_slots = self
+                .ring
+                .as_ref()
+                .expect("the ring branch is taken only with a ring")
+                .ring_slots();
+            self.ring
+                .as_mut()
+                .expect("the ring branch is taken only with a ring")
+                .issue_through(ctx, &mut self.bank, layer + 1)?;
+
+            let picks = self.route_rows(launch, layer, bufs, dims)?;
+            let slot_row: Vec<i32> = self.bank.slot_row(layer)?.to_vec();
+
+            // Host classification against the frozen row: bank picks keep their bank slot id,
+            // ring picks get their ring slot id; the combine weights are the router's own.
+            let mut bank_ids = vec![0i32; m * k];
+            let mut ring_ids = vec![0i32; m * k];
+            let mut weights = vec![0f32; m * k];
+            let mut banked = [false; 2];
+            for r in 0..m {
+                let (ids, row_weights) = &picks[r];
+                classify_picks(&slot_row, geometry.slots, ids, row_weights)?;
+                for (p, &id) in ids.iter().enumerate() {
+                    let at = r * k + p;
+                    weights[at] = row_weights[p];
+                    match slot_row[id as usize] {
+                        slot if slot >= 0 => {
+                            bank_ids[at] = slot;
+                            banked[0] = true;
+                        }
+                        _ => {
+                            let slot = self.ring.as_ref().and_then(|ring| ring.slot_of(layer, id as u16)).ok_or_else(|| refuse(format!(
+                                "expert {id} of layer {layer} has neither a bank slot nor a ring slot"
+                            )))?;
+                            ring_ids[at] = i32::from(slot);
+                            banked[1] = true;
+                        }
+                    }
+                }
+            }
+            scratch.write_at(stream, sc.slot_ids, &le_i32(&bank_ids))?;
+            scratch.write_at(stream, sc.miss_ids, &le_i32(&ring_ids))?;
+            scratch.write_at(stream, sc.weights, &le_f32(&weights))?;
+
+            // The flat grouped passes, one per source; each list's items index its own ids row.
+            let (mut gu, mut down) = (Vec::with_capacity(m * k), Vec::with_capacity(m * k));
+            let (mut ring_gu, mut ring_down) =
+                (Vec::with_capacity(m * k), Vec::with_capacity(m * k));
+            let bank_ids_range = scratch.range(sc.slot_ids, m * k * I32)?;
+            let ring_ids_range = scratch.range(sc.miss_ids, m * k * I32)?;
+            for r in 0..m {
+                for pick in 0..k {
+                    let (gu_list, down_list) = if slot_row[picks[r].0[pick] as usize] >= 0 {
+                        (&mut gu, &mut down)
+                    } else {
+                        (&mut ring_gu, &mut ring_down)
+                    };
+                    for part in 0..2usize {
+                        gu_list.push(Item {
+                            part,
+                            pick: (r * k + pick) as u32,
+                            x: row(&bufs.route.norm_row, h * F32, r)?,
+                            out: row(&bufs.expert_gu, i * F32, 2 * (r * k + pick) + part)?,
+                        });
+                    }
+                    down_list.push(Item {
+                        part: 2,
+                        pick: (r * k + pick) as u32,
+                        x: row(&bufs.expert_act, i * F32, r * k + pick)?,
+                        out: row(&bufs.expert_down, h * F32, r * k + pick)?,
+                    });
+                }
+            }
+
+            // The compute waits this layer's copies before any grouped read of a ring slot.
+            self.ring
+                .as_ref()
+                .expect("the ring branch is taken only with a ring")
+                .wait_layer(stream, layer)?;
+            let members = u32::try_from(geometry.slots)
+                .map_err(|_| refuse("the bank has too many slots".into()))?;
+            let ring_members =
+                u32::try_from(ring_slots).map_err(|_| refuse("the ring is too large".into()))?;
+            if banked[0] {
+                self.grouped_at(
+                    launch,
+                    &gu,
+                    self.bank.slots(layer)?,
+                    bank_ids_range,
+                    members,
+                    &bufs.scratch,
+                )?;
+            }
+            if banked[1] {
+                let weights = self
+                    .ring
+                    .as_ref()
+                    .expect("the ring branch is taken only with a ring")
+                    .slots();
+                self.grouped_at(
+                    launch,
+                    &ring_gu,
+                    weights,
+                    ring_ids_range,
+                    ring_members,
+                    &bufs.scratch,
+                )?;
+            }
+            ctx.swiglu_rows(
+                stream,
+                SwigluRowsCall {
+                    shape: SwigluRowsShape {
+                        rows: m * k,
+                        n_ff: i,
+                        up_off: i,
+                        ld_in: 2 * i,
+                        ld_out: i,
+                    },
+                    gu: bufs.expert_gu,
+                    act: bufs.expert_act,
+                },
+            )?;
+            if banked[0] {
+                self.grouped_at(
+                    launch,
+                    &down,
+                    self.bank.slots(layer)?,
+                    bank_ids_range,
+                    members,
+                    &bufs.scratch,
+                )?;
+            }
+            if banked[1] {
+                let weights = self
+                    .ring
+                    .as_ref()
+                    .expect("the ring branch is taken only with a ring")
+                    .slots();
+                self.grouped_at(
+                    launch,
+                    &ring_down,
+                    weights,
+                    ring_ids_range,
+                    ring_members,
+                    &bufs.scratch,
+                )?;
+            }
+
+            // The shared expert of every row, then the one combine over every pick.
+            shared_rows(
+                launch,
+                &SharedWeights {
+                    gate: self.trunks[layer].shared_gate,
+                    up: self.trunks[layer].shared_up,
+                    down: self.trunks[layer].shared_down,
+                },
+                &SharedRowsIo {
+                    norm_row: bufs.route.norm_row,
+                    gu: bufs.shared_gu,
+                    act: bufs.shared_act,
+                    out: bufs.shared_out,
+                    scratch: bufs.scratch,
+                },
+                (h, dims.shared_inter, m),
+            )?;
+            ctx.moe_combine(
+                stream,
+                CombineCall {
+                    shape: CombineShape {
+                        m,
+                        n: h,
+                        top_k: k,
+                        ld_down: h,
+                    },
+                    res: bufs.route.resid_in,
+                    down: bufs.expert_down,
+                    weights: scratch.range(sc.weights, m * k * F32)?,
+                    shared: Some(SharedTerm {
+                        gate: bufs.route.shared_gate,
+                        row: bufs.shared_out,
+                    }),
+                    out: CombineOut::To(bufs.route.resid_out),
+                },
+            )?;
+
+            // The slots of this layer free for the copies behind us.
+            self.ring
+                .as_mut()
+                .expect("the ring branch is taken only with a ring")
+                .free_layer(stream, layer)
+        }
+
+        /// One id-indexed launch group over `weights` (a bank layer or the ring, both laid out
+        /// as `members` records), chunked at the launch capacity; every chunk starts again at
+        /// row 0 of the scratch.
+        fn grouped_at<'a>(
+            &'a self,
+            launch: &Launch<'_>,
+            items: &[Item<'a>],
+            weights: &DeviceBuffer,
+            ids: DeviceRange<'_>,
+            members: u32,
+            scratch: &Scratch<'a>,
+        ) -> Result<(), EngError> {
             let first = items
                 .first()
                 .ok_or_else(|| refuse("an indexed launch without pairs".into()))?;
             let [k, n] = self.spans.parts[first.part].shape;
-            let members = u32::try_from(self.spans.slots)
-                .map_err(|_| refuse("the bank has too many slots".into()))?;
             for chunk in items.chunks(launch.ctx.exl3_indexed_capacity()) {
                 let mut calls = Vec::with_capacity(chunk.len());
                 for (index, item) in chunk.iter().enumerate() {
@@ -1016,9 +1310,9 @@ mod device {
                     }
                     calls.push(Exl3IndexedCall {
                         call: Exl3LinearCall {
-                            trellis: bank.range(span.trellis.start, span.trellis.len())?,
-                            suh: bank.range(span.suh.start, span.suh.len())?,
-                            svh: bank.range(span.svh.start, span.svh.len())?,
+                            trellis: weights.range(span.trellis.start, span.trellis.len())?,
+                            suh: weights.range(span.suh.start, span.suh.len())?,
+                            svh: weights.range(span.svh.start, span.svh.len())?,
                             bias: None,
                             x: item.x,
                             xh: row(&scratch.xh, k * F32, index)?,
@@ -1048,6 +1342,27 @@ mod device {
                 )?;
             }
             Ok(())
+        }
+
+        /// One id-indexed launch group over the bank buffer of `layer`, chunked at the launch
+        /// capacity; every chunk starts again at row 0 of the scratch.
+        fn grouped<'a>(
+            &'a self,
+            launch: &Launch<'_>,
+            layer: usize,
+            items: &[Item<'a>],
+            (ids, scratch): (DeviceRange<'a>, &Scratch<'a>),
+        ) -> Result<(), EngError> {
+            let members = u32::try_from(self.spans.slots)
+                .map_err(|_| refuse("the bank has too many slots".into()))?;
+            self.grouped_at(
+                launch,
+                items,
+                self.bank.slots(layer)?,
+                ids,
+                members,
+                scratch,
+            )
         }
 
         /// One pass over the bank of `pass.layer`: gate and up of the picks, SwiGLU, down, the

@@ -46,7 +46,7 @@ pub(crate) struct FlashOptions {
     /// CUDA only: routed-expert slots per layer in video memory, from 11 to 512. Default: what the
     /// load plan leaves at the context.
     pub(crate) slots: Option<u32>,
-    /// CUDA only: rows of one device step during prefill, from 1 to 8. The default, 1, is the
+    /// CUDA only: rows of one device step during prefill, from 1 to 2048. The default, 1, is the
     /// decode shape: one row per device call, exactly as before. A value above one runs the
     /// prompt as device chunks of that many rows (one PLE host roundtrip per chunk), with decode
     /// unchanged at one row.
@@ -219,7 +219,7 @@ fn cuda_settings(options: &FlashOptions) -> Result<Option<CudaSettings>, EngErro
     }
     // The step's rows are capped by the merged expert launches; `MAX_STEP_ROWS` in
     // `cuda/step_plan.rs` is the same 8.
-    let prefill_rows = ranged("prefill_rows", options.prefill_rows, 1, 1, 8)?;
+    let prefill_rows = ranged("prefill_rows", options.prefill_rows, 1, 1, 2048)?;
     Ok(Some(CudaSettings {
         context,
         kv_format,

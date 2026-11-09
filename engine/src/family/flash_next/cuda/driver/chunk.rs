@@ -45,6 +45,11 @@ pub(in crate::family::flash_next::cuda) trait ChunkDevice {
     /// Clears the per-chunk flags (the EXL3 flag and the status word). Called once per chunk,
     /// after the start is written and before the first layer.
     fn begin_chunk(&mut self) -> Result<()>;
+    /// Re-plans the prefill expert ring against the bank as decode left it. Called once at the
+    /// start of a chunked prefill (a `feed_rows` call), before the first chunk.
+    fn begin_prefill(&mut self) -> Result<()> {
+        Ok(())
+    }
     /// Queues layers `range` for the chunk of `m` rows at `pos`.
     fn layers(&mut self, range: Range<usize>, pos: usize, m: usize) -> Result<()>;
     /// The `m` stream rows, read back behind the queued work.
@@ -246,6 +251,7 @@ impl<D: ChunkDevice, F: TokenFeeds> TokenStepper for ChunkDriver<D, F> {
             return Ok(());
         }
         let cap = self.chunk_cap.max(1);
+        self.device.begin_prefill()?;
         for chunk in tokens.chunks(cap) {
             self.run_chunk(chunk, false).map(|_| ())?;
         }

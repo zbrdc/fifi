@@ -984,6 +984,16 @@ impl<'w> SplitMoeAt<'w> {
     pub(super) fn bank(&self) -> &super::bank::device::DeviceBank {
         self.inner.bank()
     }
+
+    /// Re-plans the prefill ring of the inner block against the bank as decode left it.
+    pub(super) fn begin_prefill(&mut self) {
+        self.inner.begin_prefill();
+    }
+
+    /// Resets the prefill ring's per-chunk cursors.
+    pub(super) fn begin_chunk(&mut self) {
+        self.inner.begin_chunk();
+    }
 }
 
 impl MoeBlock for SplitMoeAt<'_> {

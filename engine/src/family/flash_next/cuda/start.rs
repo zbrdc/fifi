@@ -434,6 +434,16 @@ pub(super) fn build_driver(
         report.expert_bytes,
     )?;
     let (mem_total, mem_available) = read_meminfo()?;
+    // The prefill ring's budget, carved out before the load plan so the bank sizes itself
+    // into what remains: at most 1.5 GiB and 30% of the free card, only for chunked prefill.
+    // A ring below one streamed layer is not built (the multi-row path then keeps its
+    // union-admit shape, correct and slower).
+    let record_bytes = PackRecordSource::new(&checkpoint)?.layout().record_bytes();
+    let ring_budget = if wanted.prefill_rows > 1 {
+        (free_vram * 3 / 10).min(1_610_612_736)
+    } else {
+        0
+    };
     // `FlashLoadPlan::new` replaces the trunk and state bytes (the `(0, 0)`) and the K/V (the
     // placeholder positions) with the numbers the pack and the context give.
     let card = TierInputs::measured(
@@ -443,7 +453,7 @@ pub(super) fn build_driver(
             positions: 1,
             bytes_per_position: 1,
         },
-        free_vram,
+        free_vram - ring_budget,
         (mem_total, mem_available),
     );
     let load_plan = FlashLoadPlan::new(&report, &checkpoint.model_config, ngram_bytes, card)?;
@@ -474,7 +484,6 @@ pub(super) fn build_driver(
     // The host side is admitted before anything is uploaded: the pinned store of the bank, the
     // engine heap and margin of `HostTerms`, and the two PLE projection matrices that
     // `PleVectors::read` holds in F32 (`HostTerms::engine_heap` does not count them).
-    let record_bytes = PackRecordSource::new(&checkpoint)?.layout().record_bytes();
     let geometry = BankGeometry::new(
         layers,
         model.moe.experts(),
@@ -614,13 +623,31 @@ pub(super) fn build_driver(
         rows,
         0..layers,
     )?;
-    let block = SplitMoe::new(
+    let mut block = SplitMoe::new(
         ctx,
         moe_trunks(weights, layers)?,
         bank,
         source.layout(),
         &step.moe_dims(rows),
     )?;
+    if rows > 1 {
+        let slots = block.plan_ring(
+            ctx,
+            (ring_budget / u64::try_from(record_bytes).unwrap_or(u64::MAX)) as usize,
+        )?;
+        if slots == 0 {
+            eprintln!(
+                "flash-next cuda: prefill ring not funded ({} bytes reserved); the union-admit \
+             path serves prefill",
+                ring_budget
+            );
+        } else {
+            eprintln!(
+                "flash-next cuda: prefill ring of {slots} slots ({:.2} GiB) behind the bank",
+                slots as f64 * record_bytes as f64 / (1024.0 * 1024.0 * 1024.0)
+            );
+        }
+    }
     let model_layers: Vec<usize> = (0..layers).collect();
     let moe = SplitMoeAt::new(block, &model_layers)?;
 

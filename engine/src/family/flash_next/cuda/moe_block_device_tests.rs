@@ -528,6 +528,167 @@ impl RigRows {
 /// the split bound and fp64 within the output bound, and the same chunk again finds no miss.
 #[test]
 #[ignore = "needs a GPU (about 4 GiB), about 2 GiB of pinned host memory per bank and FIFI_FLASH_NEXT_EXL3_PACK"]
+/// `run_rows` with the prefill ring funded: every pick reads its bank slot or its ring slot,
+/// the bank's miss counter stays flat (the ring path never steps or admits the bank), and
+/// every row matches the all-resident block within the split bound and fp64 within the output
+/// bound, run after run (the ring re-arms per chunk like the driver cadence).
+#[test]
+#[ignore = "needs a GPU (about 3 GiB of ring and bank, about 2 GiB of pinned host memory per bank and FIFI_FLASH_NEXT_EXL3_PACK"]
+fn a_chunk_over_the_prefill_ring_matches_the_all_resident_block() {
+    assert!(
+        device_present("Flash-Next split MoE block"),
+        "a GPU is required"
+    );
+    let first = moe_layer();
+    let layers = vec![first, first + 1];
+    let files = FlashPackFiles::open(&pack_dir()).expect("open the pack");
+    let checkpoint = &files.checkpoint;
+    inspect_flash_pack(&checkpoint.source, &checkpoint.model_config)
+        .expect("the pack matches its config");
+    let (model, _) = model_shape(&checkpoint.model_config).expect("the model shape");
+    let shape = model.moe;
+    let one_row = MoeDims {
+        rows: 1,
+        hidden: model.hyper.hidden(),
+        n_expert: shape.experts(),
+        top_k: shape.top_k(),
+        inter: shape.inter(),
+        shared_inter: shape.shared_inter(),
+    };
+    let m = 8;
+    let chunk = MoeDims { rows: m, ..one_row };
+    let projector = CudaProjector::new().expect("projector");
+    let ctx = projector.context();
+    let stream = ctx.stream().expect("stream");
+    let launch = Launch {
+        ctx,
+        stream: &stream,
+    };
+    let source = PackRecordSource::new(checkpoint).expect("the record source");
+    let layout = source.layout().clone();
+
+    // Per bank layer: uploads, the chunk's rows, and per-row fp64 and all-resident references.
+    struct Arm {
+        row_inputs: Vec<Vec<f32>>,
+        weights: CudaWeights,
+        keys: Vec<(Role, String)>,
+        wants: Vec<Reference>,
+        residents: Vec<Vec<u8>>,
+    }
+    let mut arms: Vec<Arm> = Vec::with_capacity(layers.len());
+    for (index, &layer) in layers.iter().enumerate() {
+        let router = Router::read(checkpoint, layer, &one_row).expect("router");
+        let weights = upload(&projector, checkpoint, (layer, &router), &one_row).expect("upload");
+        let keys = keys(layer);
+        let row_inputs: Vec<Vec<f32>> = (0..m)
+            .map(|seed| input(one_row.hidden, seed + 7 * (index + 1)))
+            .collect();
+        let block = Exl3MoeWeights::resolve_by(&weights, layer, &one_row, |role| {
+            keys.iter()
+                .find(|(candidate, _)| *candidate == role)
+                .map(|(_, key)| key.as_str())
+                .ok_or_else(|| EngError::BadRequest(format!("no key for {role:?}")))
+        })
+        .expect("the all-resident block resolves");
+        let mut wants = Vec::with_capacity(m);
+        let mut residents = Vec::with_capacity(m);
+        for row in &row_inputs {
+            wants.push(
+                reference(checkpoint, (layer, &router), &one_row, row).expect("fp64 reference"),
+            );
+            let rig = Rig::new(&projector, &one_row, row).expect("rig");
+            run_exl3_moe(
+                &launch,
+                &block,
+                &rig.bufs().expect("bufs"),
+                &one_row,
+                true,
+                None,
+            )
+            .expect("the all-resident block");
+            launch.stream.synchronize().expect("sync");
+            residents.push(rig.out_bytes(&projector));
+        }
+        arms.push(Arm {
+            row_inputs,
+            weights,
+            keys,
+            wants,
+            residents,
+        });
+    }
+
+    // The bank holds six of row 0's picks per layer: row 0 is mixed, every later row misses.
+    let held: Vec<Vec<u16>> = arms
+        .iter()
+        .map(|arm| {
+            let mut held: Vec<u16> = arm.wants[0].ids.iter().take(6).map(|&e| e as u16).collect();
+            held.extend(others(&arm.wants[0].ids, SLOTS - 6));
+            held
+        })
+        .collect();
+    let bank = build_bank(&projector, &source, &layers, &held);
+    let trunks: Vec<SplitMoeTrunk<'_>> = arms
+        .iter()
+        .map(|arm| {
+            let key = |role: Role| {
+                arm.keys
+                    .iter()
+                    .find(|(candidate, _)| *candidate == role)
+                    .map(|(_, key)| key.as_str())
+                    .unwrap_or_else(|| panic!("no key for {role:?}"))
+            };
+            SplitMoeTrunk {
+                router: raw(&arm.weights, key(Role::FfnGateInp)),
+                router_shared: raw(&arm.weights, key(Role::FfnGateInpShexp)),
+                shared_gate: exl3(&arm.weights, key(Role::FfnGateShexp)),
+                shared_up: exl3(&arm.weights, key(Role::FfnUpShexp)),
+                shared_down: exl3(&arm.weights, key(Role::FfnDownShexp)),
+            }
+        })
+        .collect();
+    let mut split = SplitMoe::new(ctx, trunks, bank, &layout, &chunk).expect("split");
+    let streamed = (shape.experts() - SLOTS) as usize;
+    let slots = split.plan_ring(ctx, streamed).expect("fund the ring");
+    assert!(slots >= streamed, "the ring holds one full streamed layer");
+    split.begin_prefill();
+
+    for (bank_layer, arm) in arms.iter().enumerate() {
+        for run in 0..2 {
+            split.begin_chunk();
+            let rig = RigRows::new(&projector, &chunk, &arm.row_inputs).expect("rig");
+            let before = split.bank().state().stats().misses;
+            split
+                .run_rows(&launch, bank_layer, &rig.bufs().expect("bufs"), &chunk)
+                .expect("the ring block");
+            stream.synchronize().expect("sync");
+            let misses = (split.bank().state().stats().misses - before) as usize;
+            let tag = format!(
+                "bank layer {bank_layer} (pack layer {}), run {run}",
+                layers[bank_layer]
+            );
+            // The ring path never steps or admits the bank: the miss counter cannot move.
+            assert_eq!(misses, 0, "{tag}: the ring path does not touch the bank");
+            for r in 0..m {
+                let got = rig.out_row(&projector, r);
+                let resident_error = relative_l2(&floats(&got), &floats_f64(&arm.residents[r]));
+                let fp64_error = relative_l2(&floats(&got), &arm.wants[r].out);
+                println!(
+                    "{tag}, row {r}: vs all-resident {resident_error:.3e}, vs fp64 {fp64_error:.3e}"
+                );
+                assert!(
+                    fp64_error < OUTPUT_BOUND,
+                    "{tag}, row {r}: fp64 {fp64_error}"
+                );
+                assert!(
+                    resident_error < SPLIT_BOUND,
+                    "{tag}, row {r}: all-resident {resident_error}"
+                );
+            }
+        }
+    }
+}
+
 fn a_chunk_of_rows_over_a_partial_bank_matches_the_all_resident_block() {
     assert!(
         device_present("Flash-Next split MoE block"),
