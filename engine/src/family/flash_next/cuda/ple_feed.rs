@@ -444,6 +444,8 @@ impl PleFeed {
         stream: &[f32],
     ) -> Result<Vec<f32>, EngError> {
         let mut next = self.state.clone();
+        let profile = crate::family::flash_next::cuda::driver::chunk::prof::on();
+        let mut t = std::time::Instant::now();
         let out = {
             let mut projector = FeedProjector {
                 gathered,
@@ -451,6 +453,10 @@ impl PleFeed {
                 value: None,
             };
             let weights = step_weights(&self.rows, &self.vectors, &self.table, &self.table_rows);
+            if profile {
+                crate::family::flash_next::cuda::driver::chunk::prof::add(14, t.elapsed());
+                t = std::time::Instant::now();
+            }
             ple::step(
                 &mut projector,
                 &self.shape,
@@ -460,6 +466,9 @@ impl PleFeed {
                 stream,
             )?
         };
+        if profile {
+            crate::family::flash_next::cuda::driver::chunk::prof::add(15, t.elapsed());
+        }
         self.state = next;
         Ok(out)
     }

@@ -41,7 +41,7 @@ pub(in crate::family::flash_next) mod prof {
     use super::*;
 
     /// The phases of `queue` plus the inside of one layer, in call order.
-    pub(super) const NAMES: [&str; 14] = [
+    pub(super) const NAMES: [&str; 16] = [
         "begin(host feeds)",
         "start writes",
         "layers<PLE",
@@ -56,8 +56,10 @@ pub(in crate::family::flash_next) mod prof {
         "    moe route",
         "    moe admit",
         "    moe launch",
+        "    ple ngram gather",
+        "    ple step math",
     ];
-    pub(super) static NS: [AtomicU64; 14] = [const { AtomicU64::new(0) }; 14];
+    pub(super) static NS: [AtomicU64; 16] = [const { AtomicU64::new(0) }; 16];
     pub(super) static ROWS: AtomicU64 = AtomicU64::new(0);
     static ON: OnceLock<bool> = OnceLock::new();
 
