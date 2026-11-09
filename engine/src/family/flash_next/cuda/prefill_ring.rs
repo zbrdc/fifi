@@ -122,7 +122,7 @@ pub(super) mod device {
         /// layer-major. The slot buffer and events survive; a slot whose last copy is still in
         /// flight keeps `live`, and the next issue waits its `used` event as usual.
         pub(in crate::family::flash_next) fn replan(&mut self, bank: &DeviceBank) {
-            let geometry: BankGeometry = *bank.state().geometry();
+            let geometry: BankGeometry = *bank.geometry();
             let layers = geometry.layers as usize;
             let experts = geometry.experts as usize;
             let slot_rows: Vec<&[i32]> = (0..layers)
@@ -133,10 +133,7 @@ pub(super) mod device {
                 .map(|l| {
                     (0..experts)
                         .map(|e| {
-                            bank.state()
-                                .places()
-                                .place_of(l, e as u16)
-                                .unwrap_or(NO_PLACE)
+                            bank.place_of(l, e as u16).unwrap_or(NO_PLACE)
                         })
                         .collect()
                 })

@@ -1299,6 +1299,16 @@ pub(super) mod device {
 
         /// Queues the bytes of one expert place from the pinned store into `dst` on `stream` (the
         /// prefill ring's copy stream). The host model is not changed.
+        /// The pinned host place of an expert's record, for the prefill ring's plan (a
+        /// non-resident expert without a place cannot stream and rides the miss pass).
+        pub(in crate::family::flash_next) fn place_of(
+            &self,
+            layer: usize,
+            expert: u16,
+        ) -> Option<u32> {
+            self.state.places().place_of(layer, expert)
+        }
+
         pub(in crate::family::flash_next) fn stream_place(
             &mut self,
             ctx: &CudaContext,

@@ -852,7 +852,7 @@ mod device {
             if !(2..=8).contains(&m) {
                 return Err(refuse(format!("the block takes 2 to 8 rows, got {m}")));
             }
-            let geometry = *self.bank.state().geometry();
+            let geometry = *self.bank.geometry();
             if dims.n_expert != geometry.experts
                 || dims.top_k != geometry.top_k
                 || layer >= geometry.layers
