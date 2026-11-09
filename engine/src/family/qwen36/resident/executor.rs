@@ -258,6 +258,43 @@ impl TokenStepper for Q36Step<'_> {
     }
 }
 
+/// Probe taps of the verify-window path (`Q36_WINDOW_TAPS=1`, one `eprintln` per committed
+/// window): the wall split of the snapshot, the window prefill (which includes the lazy graph
+/// evaluation of the logits materialization — its readback is the first sync of the call, so
+/// host taps attribute the queued GPU work to it), the host draws, and the commit replay.
+#[derive(Default)]
+struct WindowTaps {
+    calls: usize,
+    replays: usize,
+    rows: usize,
+    kept: usize,
+    discarded: usize,
+    snapshot_us: u128,
+    prefill_us: u128,
+    draw_us: u128,
+    commit_us: u128,
+}
+
+std::thread_local! {
+    static WINDOW_TAPS: std::cell::RefCell<WindowTaps> = const {
+        std::cell::RefCell::new(WindowTaps {
+            calls: 0,
+            replays: 0,
+            rows: 0,
+            kept: 0,
+            discarded: 0,
+            snapshot_us: 0,
+            prefill_us: 0,
+            draw_us: 0,
+            commit_us: 0,
+        })
+    };
+}
+
+fn window_taps_on() -> bool {
+    std::env::var_os("Q36_WINDOW_TAPS").is_some_and(|v| v == "1")
+}
+
 /// The verify-window model of one speculative decode call: the solo step plus the pending window.
 /// `run_window` feeds every row as ONE chunk (`StepMode::Window`), so a window of `k + 1` rows
 /// costs one chunk pass, not `k + 1` steps. The rollback is the shared-handle snapshot of
@@ -313,28 +350,48 @@ impl WindowModel for Q36WindowStep<'_> {
                 "the verify window does not fit the context limit".into(),
             ));
         }
-        let snapshot = decoder.snapshot(state)?;
-        match decoder.prefill(state, inputs, StepMode::Window) {
-            Ok(result) => {
-                self.logits = result
-                    .window_logits
-                    .ok_or_else(|| window_output_error("the window step returned no logits"))?;
-                self.inputs = inputs.to_vec();
-                self.snapshot = Some(snapshot);
-                Ok(())
+        let snapshot = {
+            let started = std::time::Instant::now();
+            let snapshot = decoder.snapshot(state)?;
+            if window_taps_on() {
+                WINDOW_TAPS.with_borrow_mut(|t| t.snapshot_us += started.elapsed().as_micros());
             }
-            // The chunk's own contract leaves the state poisoned after its first native call;
-            // the snapshot drops with its charge.
-            Err(error) => Err(error),
+            snapshot
+        };
+        {
+            let started = std::time::Instant::now();
+            let run = decoder.prefill(state, inputs, StepMode::Window);
+            if window_taps_on() {
+                WINDOW_TAPS.with_borrow_mut(|t| {
+                    t.prefill_us += started.elapsed().as_micros();
+                    t.rows = inputs.len();
+                });
+            }
+            match run {
+                Ok(result) => {
+                    self.logits = result
+                        .window_logits
+                        .ok_or_else(|| window_output_error("the window step returned no logits"))?;
+                    self.inputs = inputs.to_vec();
+                    self.snapshot = Some(snapshot);
+                    Ok(())
+                }
+                Err(error) => Err(error),
+            }
         }
     }
 
     fn draw(&mut self, row: usize, sampler: &mut Sampler, sampler_vocab: usize) -> Result<u32> {
-        let logits = self
+        let started = std::time::Instant::now();
+        let drawn = self
             .logits
             .get(row)
-            .ok_or_else(|| window_output_error("the window drew past its rows"))?;
-        sample_logits(Self::OPERATION, logits, sampler, sampler_vocab)
+            .ok_or_else(|| window_output_error("the window drew past its rows"))
+            .and_then(|logits| sample_logits(Self::OPERATION, logits, sampler, sampler_vocab));
+        if window_taps_on() {
+            WINDOW_TAPS.with_borrow_mut(|t| t.draw_us += started.elapsed().as_micros());
+        }
+        drawn
     }
 
     fn commit_window(&mut self, commit: &Commit) -> Result<()> {
@@ -348,11 +405,37 @@ impl WindowModel for Q36WindowStep<'_> {
             return Ok(());
         }
         let kept = commit.kept_rows;
+        let replay = commit.discarded_rows > 0;
+        let started = std::time::Instant::now();
         let Q36Step { decoder, state, .. } = &mut self.step;
-        decoder.restore(state, &snapshot)?;
-        decoder
-            .prefill(state, &inputs[..kept], StepMode::Prompt)
-            .map(|_| ())
+        if replay {
+            decoder.restore(state, &snapshot)?;
+        }
+        let run = if replay {
+            decoder
+                .prefill(state, &inputs[..kept], StepMode::Prompt)
+                .map(|_| ())
+        } else {
+            Ok(())
+        };
+        if window_taps_on() {
+            WINDOW_TAPS.with_borrow_mut(|t| {
+                t.calls += 1;
+                t.replays += usize::from(replay);
+                t.discarded += commit.discarded_rows;
+                t.kept += kept;
+                let commit_us = started.elapsed().as_micros();
+                eprintln!(
+                    "WINDOW_TAP call={} rows={} kept={} discarded={} snapshot_us={} prefill_us={} draw_us={} commit_us={} replays={}",
+                    t.calls, t.rows, kept, commit.discarded_rows, t.snapshot_us, t.prefill_us,
+                    t.draw_us, commit_us, t.replays
+                );
+                t.snapshot_us = 0;
+                t.prefill_us = 0;
+                t.draw_us = 0;
+            });
+        }
+        run
     }
 }
 
