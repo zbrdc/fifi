@@ -45,7 +45,7 @@ pub(in crate::family::flash_next) mod prof {
     /// The phases of `queue` plus the inside of one layer, in call order. Slots 22-27 walk the
     /// interior of the ring rows-block, which the one-row block's taps (slots 11-13) never
     /// reach: the ring issues no admit and no miss pass.
-    pub(super) const NAMES: [&str; 28] = [
+    pub(super) const NAMES: [&str; 34] = [
         "begin(host feeds)",
         "start writes",
         "layers<PLE",
@@ -74,8 +74,14 @@ pub(in crate::family::flash_next) mod prof {
         "  ring wait+gu",
         "  ring swiglu+down",
         "  ring shared+combine",
+        "  rows classify",
+        "  rows grouped gu",
+        "  rows swiglu+down",
+        "  rows shared+combine",
+        "  rows dirty sync+step",
+        "  rows miss+clean tails",
     ];
-    pub(super) static NS: [AtomicU64; 28] = [const { AtomicU64::new(0) }; 28];
+    pub(super) static NS: [AtomicU64; 34] = [const { AtomicU64::new(0) }; 34];
     pub(super) static ROWS: AtomicU64 = AtomicU64::new(0);
     static ON: OnceLock<bool> = OnceLock::new();
 

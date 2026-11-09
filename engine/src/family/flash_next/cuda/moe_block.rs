@@ -964,6 +964,7 @@ mod device {
                 )?;
                 classified.push(classify_picks(&slot_row, geometry.slots, &pick.0, &pick.1)?);
             }
+            tick(28);
 
             // The resident pass of every row in flat launches: pick `r * k + p` indexes the
             // flat slot ids the classifies wrote.
@@ -990,6 +991,7 @@ mod device {
                 }
             }
             self.grouped(launch, layer, &gu, (slot_ids, &bufs.scratch))?;
+            tick(29);
             ctx.swiglu_rows(
                 stream,
                 SwigluRowsCall {
@@ -1005,6 +1007,7 @@ mod device {
                 },
             )?;
             self.grouped(launch, layer, &down, (slot_ids, &bufs.scratch))?;
+            tick(30);
             if self.verify_finite_filler {
                 for (r, class) in classified.iter().enumerate() {
                     self.check_filler(launch, bufs, dims, r, &class.weights)?;
@@ -1047,6 +1050,7 @@ mod device {
                     out: CombineOut::To(partial),
                 },
             )?;
+            tick(31);
 
             // Per row: the copies for its picks, then its miss pass — or, when every pick was
             // resident, the one combine that moves the resident result to the block output.
@@ -1084,6 +1088,7 @@ mod device {
                 let slot_row_after = self.bank.slot_row(layer)?.to_vec();
                 let second =
                     plan_second_pass(&picks[r].0, &picks[r].1, &classified[r], &slot_row_after)?;
+                tick(32);
                 if let Some((miss_slots, miss_weights)) = second.miss {
                     scratch.write_at(stream, sc.miss_ids + r * k * I32, &le_i32(&miss_slots))?;
                     scratch.write_at(
@@ -1110,6 +1115,7 @@ mod device {
                     }
                 }
             }
+            tick(33);
             tick(13);
             Ok(())
         }
