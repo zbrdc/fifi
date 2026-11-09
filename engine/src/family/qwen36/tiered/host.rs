@@ -114,6 +114,33 @@ fn weight_ppm(weight: f32) -> u64 {
     (f64::from(weight).max(0.0) * 1e6).round() as u64
 }
 
+/// One row of a chunk's route: the token-width inputs of `begin_layer`, one row of
+/// the M the chunk feeds at once. `hidden` is the NORMED row that row's CPU experts read.
+#[derive(Clone, Debug, PartialEq)]
+pub struct ChunkRouteRow {
+    pub ids: Vec<i32>,
+    pub weights: Vec<f32>,
+    pub hidden: Vec<f32>,
+}
+
+/// The device plan of one chunk layer: `rows.len() * top_k` entries, row-major (row r's
+/// picks at `r * top_k..(r+1) * top_k`), the M-row twin of [`LayerPlanHost`].
+#[derive(Clone, Debug, PartialEq)]
+pub struct ChunkLayerPlanHost {
+    pub slot_ids: Vec<i32>,
+    pub device_weights: Vec<f32>,
+}
+
+/// The CPU work of one chunk layer, grouped by expert: one entry per DISTINCT missed
+/// expert, carrying the rows that routed to it with their per-row weights — the shape
+/// the grouped pool job (slice 4) consumes.
+#[derive(Clone, Debug, PartialEq)]
+pub struct ChunkMissGroup {
+    pub expert: u16,
+    pub rows: Vec<usize>,
+    pub row_weights: Vec<f32>,
+}
+
 /// The picks of every layer of one token as the device logged them: `(id, weight)` in rank order,
 /// exactly `top_k` per layer (`id == -1` is the router-fault value, any other negative id is
 /// refused). WHY: the classification moves onto the device, so the host learns a token's
@@ -357,6 +384,80 @@ impl TieredHost {
         self.report.routed_weight_ppm += routed_ppm;
         self.report.cpu_weight_ppm += cpu_ppm;
         Ok(plan)
+    }
+
+    /// Classifies the picks of `rows.len()` rows of `layer` at once and returns the device
+    /// plan plus the grouped misses. The M-row twin of [`Self::begin_layer`]: validate
+    /// EVERY row first (the `account_token` pattern — a refusal changes nothing), then
+    /// classify all rows' picks against the table, stash the routes per row for the chunk
+    /// boundary, and group the missed picks by expert for the grouped pool (slice 4
+    /// serves them; until then the caller treats a non-empty miss list as an error).
+    pub fn begin_chunk_layer(
+        &mut self,
+        layer: usize,
+        rows: &[ChunkRouteRow],
+    ) -> Result<(ChunkLayerPlanHost, Vec<ChunkMissGroup>), HostError> {
+        if let Some(open) = &self.in_flight {
+            return Err(HostError::Order(format!(
+                "begin_chunk_layer({layer}) while layer {} is in flight",
+                open.layer
+            )));
+        }
+        // Validate every row before classifying any: a bad row changes nothing.
+        for (row_at, row) in rows.iter().enumerate() {
+            match self.check_route(layer, &row.ids, &row.weights) {
+                Ok(()) => {}
+                Err(error) => {
+                    return Err(HostError::BadRoute(format!("row {row_at}: {error:?}")));
+                }
+            }
+        }
+        let mut plan = ChunkLayerPlanHost {
+            slot_ids: Vec::with_capacity(rows.len() * self.cfg.top_k),
+            device_weights: Vec::with_capacity(rows.len() * self.cfg.top_k),
+        };
+        let mut misses: Vec<ChunkMissGroup> = Vec::new();
+        let mut row_routes: Vec<Vec<u16>> = Vec::with_capacity(rows.len());
+        for row in rows {
+            let mut route = Vec::with_capacity(row.ids.len());
+            for (&id, &weight) in row.ids.iter().zip(&row.weights) {
+                if id < 0 {
+                    plan.slot_ids.push(id);
+                    plan.device_weights.push(weight);
+                    continue;
+                }
+                let expert = id as u16;
+                if let Some((slot, _)) = self.table.lookup(layer, expert) {
+                    plan.slot_ids.push(slot as i32);
+                    plan.device_weights.push(weight);
+                } else {
+                    plan.slot_ids.push(0);
+                    plan.device_weights.push(0.0);
+                    let row_at = row_routes.len();
+                    match misses.iter_mut().find(|g| g.expert == expert) {
+                        Some(group) => {
+                            group.rows.push(row_at);
+                            group.row_weights.push(weight);
+                        }
+                        None => misses.push(ChunkMissGroup {
+                            expert,
+                            rows: vec![row_at],
+                            row_weights: vec![weight],
+                        }),
+                    }
+                }
+                route.push(expert);
+            }
+            row_routes.push(route);
+        }
+        self.routes[layer] = row_routes.into_iter().flatten().collect();
+        Ok((plan, misses))
+    }
+
+    /// Joins the grouped CPU jobs of a chunk layer (slice 4 wires the pool; until then
+    /// a layer with misses must not be finished, so the chunk arm refuses at begin).
+    pub fn finish_chunk_layer(&mut self, layer: usize) -> Result<Option<Vec<f32>>, HostError> {
+        self.finish_layer(layer)
     }
 
     /// Accounts for a whole token from the device's route log: the same counters and the same
