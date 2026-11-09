@@ -26,11 +26,73 @@
 //! chunked prefill step (`step`/`mixer` at `m` rows).
 
 use std::ops::Range;
+use std::sync::OnceLock;
+use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
+use std::time::Instant;
 
 use super::{DriverShape, TokenFeeds};
 use crate::{EngError, family::session::TokenStepper};
 
 type Result<T> = std::result::Result<T, EngError>;
+
+/// Coarse per-phase timing of the chunked prefill (INFERENCE_FLASH_NEXT_PROFILE=1): where a
+/// chunk's wall time goes, accumulated over a prompt and dumped at its sampling row.
+pub(in crate::family::flash_next) mod prof {
+    use super::*;
+
+    /// The phases of `queue` plus the inside of one layer, in call order.
+    pub(super) const NAMES: [&str; 14] = [
+        "begin(host feeds)",
+        "start writes",
+        "layers<PLE",
+        "read_stream",
+        "ple_update(host)",
+        "write_stream_back",
+        "layers>=PLE",
+        "head+read",
+        "  hyper conn",
+        "  mixer(attn)",
+        "  moe_block",
+        "    moe route",
+        "    moe admit",
+        "    moe launch",
+    ];
+    pub(super) static NS: [AtomicU64; 14] = [const { AtomicU64::new(0) }; 14];
+    pub(super) static ROWS: AtomicU64 = AtomicU64::new(0);
+    static ON: OnceLock<bool> = OnceLock::new();
+
+    pub(in crate::family::flash_next) fn on() -> bool {
+        *ON.get_or_init(|| std::env::var("INFERENCE_FLASH_NEXT_PROFILE").is_ok_and(|v| v != "0"))
+    }
+
+    pub(in crate::family::flash_next) fn add(slot: usize, spent: std::time::Duration) {
+        NS[slot].fetch_add(spent.as_nanos() as u64, AtomicOrdering::Relaxed);
+    }
+
+    /// Prints one line per phase and resets; call once per prompt, after its sampling row.
+    pub(super) fn dump_and_reset(total_rows: u64) {
+        let spent: Vec<u64> = NS.iter().map(|n| n.load(AtomicOrdering::Relaxed)).collect();
+        let sum: u64 = spent.iter().sum();
+        if sum == 0 {
+            return;
+        }
+        for (name, ns) in NAMES.iter().zip(&spent) {
+            eprintln!(
+                "flash-next chunk profile: {name:18} {:9.0} ms {:5.1}%",
+                *ns as f64 / 1e6,
+                100.0 * *ns as f64 / sum as f64
+            );
+        }
+        eprintln!(
+            "flash-next chunk profile: {total_rows} rows, phases sum {:.1} s",
+            sum as f64 / 1e9
+        );
+        for n in &NS {
+            n.store(0, AtomicOrdering::Relaxed);
+        }
+        ROWS.store(0, AtomicOrdering::Relaxed);
+    }
+}
 
 /// The device side of a chunk. The start writes are the sink of the host feeds at chunk
 /// granularity; every buffer holds `m` rows where the token step holds one.
@@ -159,7 +221,13 @@ impl<D: ChunkDevice, F: TokenFeeds> ChunkDriver<D, F> {
             )));
         }
         // Host reads only: a failure here leaves the state as it was.
+        let t0 = Instant::now();
+        let profile = prof::on();
         let starts = self.feeds.begin_chunk(tokens)?;
+        if profile {
+            prof::add(0, t0.elapsed());
+            prof::ROWS.fetch_add(m as u64, AtomicOrdering::Relaxed);
+        }
         let outcome = self.queue(tokens, &starts, want_logits);
         match outcome {
             Ok(logits) => {
@@ -184,6 +252,14 @@ impl<D: ChunkDevice, F: TokenFeeds> ChunkDriver<D, F> {
         let pos = self.pos;
         let shape = self.shape;
 
+        let profile = prof::on();
+        let mut t = Instant::now();
+        let mut tick = |slot: usize| {
+            if profile {
+                prof::add(slot, t.elapsed());
+                t = Instant::now();
+            }
+        };
         self.device
             .write_chunk_params(tokens[0] as i32, pos as i32, m as i32)?;
         let mut stream_rows = Vec::with_capacity(m * shape.start.stream);
@@ -195,9 +271,11 @@ impl<D: ChunkDevice, F: TokenFeeds> ChunkDriver<D, F> {
         self.device.write_chunk_stream(&stream_rows)?;
         self.device.write_chunk_ple(&ple_rows)?;
         self.device.begin_chunk()?;
-
+        tick(1);
         self.device.layers(0..shape.ple_layer, pos, m)?;
+        tick(2);
         let mut rows = self.device.read_stream()?;
+        tick(3);
         let width = shape.start.stream;
         if rows.len() != m * width {
             return Err(EngError::Backend {
@@ -222,16 +300,21 @@ impl<D: ChunkDevice, F: TokenFeeds> ChunkDriver<D, F> {
                 *value += delta;
             }
         }
+        tick(4);
         self.device.write_stream_back(&rows)?;
+        tick(5);
         self.device.layers(shape.ple_layer..shape.layers, pos, m)?;
+        tick(6);
         let logits = if want_logits {
             self.device.head()?;
             let row = self.device.read_logits()?;
+            tick(7);
             Some(row)
         } else {
             None
         };
         self.device.check_health()?;
+        drop(tick);
         Ok(logits)
     }
 }
@@ -273,6 +356,9 @@ impl<D: ChunkDevice, F: TokenFeeds> TokenStepper for ChunkDriver<D, F> {
         // The sampling row closed the prefill: the ring's window ends with it, and every
         // later single-token step takes the decode path.
         self.device.end_prefill()?;
+        if prof::on() {
+            prof::dump_and_reset(prof::ROWS.load(AtomicOrdering::Relaxed));
+        }
         Ok(logits)
     }
 

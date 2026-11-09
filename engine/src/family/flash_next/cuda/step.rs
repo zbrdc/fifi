@@ -670,12 +670,25 @@ impl<'a> FlashStep<'a> {
     ) -> Result<(), EngError> {
         self.ensure_usable()?;
         let result = (|| {
+            let profile = super::driver::chunk::prof::on();
+            let mut t = std::time::Instant::now();
+            let mut tick = |slot: usize| {
+                if profile {
+                    super::driver::chunk::prof::add(slot, t.elapsed());
+                    t = std::time::Instant::now();
+                }
+            };
             self.hyper_read(Site::Attn, &layer_name(layer, "attn_hyper_connection"), m)?;
             self.mixer(layer, pos, m)?;
+            tick(9);
             self.hyper_apply(Site::Attn, m)?;
             self.hyper_read(Site::Mlp, &layer_name(layer, "mlp_hyper_connection"), m)?;
+            tick(8);
             self.moe_block(layer, moe, m)?;
-            self.hyper_apply(Site::Mlp, m)
+            tick(10);
+            let r = self.hyper_apply(Site::Mlp, m);
+            tick(8);
+            r
         })();
         self.poison_on(result)
     }

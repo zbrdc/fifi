@@ -900,7 +900,16 @@ mod device {
             let partial = scratch.range(sc.partial, m * h * F32)?;
 
             // One router over every row; its picks drive the host bank, so they come back once.
+            let profile = crate::family::flash_next::cuda::driver::chunk::prof::on();
+            let mut t = std::time::Instant::now();
+            let mut tick = |slot: usize| {
+                if profile {
+                    crate::family::flash_next::cuda::driver::chunk::prof::add(slot, t.elapsed());
+                    t = std::time::Instant::now();
+                }
+            };
             let picks = self.route_rows(launch, layer, bufs, dims)?;
+            tick(11);
 
             // Chunk-admit: when the chunk's distinct picks fit the bank, admit their union in
             // one pass before the classify — every row's picks then ride the flat resident
@@ -921,6 +930,7 @@ mod device {
                 launch.stream.synchronize()?;
                 self.bank.admit(ctx, layer, &union)?;
             }
+            tick(12);
 
             // One classify per row against the slot row as the chunk found it: a pick another
             // row of the chunk missed still rides this row's own second pass.
@@ -1100,6 +1110,7 @@ mod device {
                     }
                 }
             }
+            tick(13);
             Ok(())
         }
 
