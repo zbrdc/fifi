@@ -1,7 +1,6 @@
 //! The expert bank of the Qwen3.8 Flash-Next CUDA step: which routed experts sit in the device slots
 //! of every layer, which pinned host place holds every other expert, and the copies a token's picks
-//! cause. The policy, the host places and the budget are pure host code; the device owner at the end
-//! of the file only allocates, fills and copies.
+//! cause. Host half (S5); the device owner at the end of the file only allocates, fills and copies.
 //!
 //! WHAT, in the order of a decode layer:
 //!
@@ -28,20 +27,20 @@
 //!   that are not on the card, 25.6 to 31.1 GiB instead of the 43.07 GiB of an inclusive store. When
 //!   an expert leaves a slot, its record goes back into the host place its successor just left
 //!   (one spare place per layer makes the order work: demote first, then free the incoming place).
-//!   The write-back (D2H) leg is not measured yet. [`HostMode::Inclusive`] keeps every expert in the
+//!   The D2H leg is unmeasured (knowledge M4). [`HostMode::Inclusive`] keeps every expert in the
 //!   store and drops the D2H leg; [`HostPinPlan`] prices both.
 //! - One record per expert and one device buffer per layer: the record layout is `SlotBankLayout`'s
 //!   (equal strides for the id-indexed launch), the policy and the placement are pure and tested on
 //!   the host.
 //!
-//! A shared slot cache in `expert_tier` can replace [`ReplaceOnMissLru`] behind [`SlotPolicy`]
+//! P1 (the shared `SlotCache` in `expert_tier`) replaces [`ReplaceOnMissLru`] behind [`SlotPolicy`]
 //! and nothing else: the interface is `plan_pass(layer, picks) -> PassPlan`,
 //! `admit(layer, experts_by_use) -> PassPlan`, `slot_row(layer)` and `expert_in_slot(layer, slot)`.
 //! Host places, copies, budget and the device owner do not change. The policy must keep three rules:
 //! the experts of a pass are never victims, slot 0 is not a victim in a pass with a miss, and the
 //! slot row it publishes is the classifier's table.
 //!
-//! Nothing here is called by a model step yet; the decode step wires it in a later change.
+//! Nothing here is called by a model step yet (S6 wires it; the device test is S5-device).
 
 // Staged: the Flash-Next CUDA step is the first caller.
 #![cfg_attr(not(test), allow(dead_code))]
@@ -226,43 +225,24 @@ pub(super) struct HostTerms {
     /// Kept free so the plan does not ride the line (exllamav3 keeps 2 GiB as well).
     pub(super) margin: u64,
     /// The least page cache the n-gram table's random reads must keep. A floor, not a target: all
-    /// RAM the plan leaves free is page cache. The default is 0, from measured cold n-gram row
-    /// reads on the real file: 52 us median per row (read-only bench), 160-200 us per 16-row decode
-    /// token (about 1% of a token, and the reads can start before the first layer) and 242 ms per
-    /// 4096-token chunk (production reader).
-    /// A warm page is a bonus, not a requirement, so the pinned store may take the RAM. At 0 the
-    /// floor check never refuses; a nonzero floor needs a measured low hit rate on real traffic.
-    /// The n-gram feed's own reserve constant, also 0, replaces this literal when that feed is
-    /// merged.
+    /// RAM the plan leaves free is page cache. PROVISIONAL: the default of 8 GiB (a quarter of the
+    /// 30.4 GiB table) came from the author's choice, not from a measurement. The coordinator
+    /// accepted it as provisional; it is to be set once the n-gram read latency on the 990 PRO is
+    /// measured.
     pub(super) ngram_cache_min: u64,
-    /// Rows of n-gram embedding in flight at once in host memory: the staging of the row reader.
-    /// A 4096-token chunk reads 65,536 rows and a double-buffered chunk worker holds two blocks.
-    pub(super) ngram_staging_rows: u64,
     /// Metadata allowance charged to each of the two stream-bank slots besides the payload.
     pub(super) stream_slot_metadata: u64,
 }
 
-/// Host bytes per n-gram row in flight: 160 decoded F32 values plus the row id and its sort key.
-/// 656 bytes. The n-gram feed's staging function gives the same figure and replaces this constant
-/// when that feed is merged.
-pub(super) const NGRAM_STAGING_BYTES_PER_ROW: u64 = 160 * 4 + 8 + 8;
-
 impl HostTerms {
-    /// The defaults for the 62 GiB host: 3 GiB heap, 2 GiB margin, no n-gram page-cache floor
-    /// (measured, see the field), two 4096-token chunks of n-gram staging (86 MB).
+    /// The defaults for the 62 GiB host. `ngram_cache_min` is a provisional choice (8 GiB, a
+    /// quarter of the 30.4 GiB table), not a measurement; the plan reports what is left above it.
     pub(super) const DEFAULT: Self = Self {
         engine_heap: 3 * GIB,
         margin: 2 * GIB,
-        ngram_cache_min: 0,
-        ngram_staging_rows: 2 * 65_536,
+        ngram_cache_min: 8 * GIB,
         stream_slot_metadata: MIB,
     };
-
-    /// Host bytes the n-gram row reader holds in flight.
-    pub(super) fn ngram_staging_bytes(&self) -> Option<u64> {
-        self.ngram_staging_rows
-            .checked_mul(NGRAM_STAGING_BYTES_PER_ROW)
-    }
 }
 
 /// What the host must hold for a bank, and what that leaves.
@@ -276,13 +256,11 @@ pub(super) struct HostPinPlan {
     /// re-plan the host: both slots, each a full record plus metadata
     /// (`stream-bank-scratch-is-two-slot-total`: the argument of `StreamBankPlan` is the total).
     pub(super) scratch_bytes: u64,
-    /// The n-gram row reader's host staging (`HostTerms::ngram_staging_rows` rows).
-    pub(super) ngram_staging_bytes: u64,
     pub(super) os_floor: u64,
-    /// Store, scratch, n-gram staging, heap and margin: what this process takes.
+    /// Store, scratch, heap and margin: what this process takes.
     pub(super) process_bytes: u64,
     /// RAM left for the page cache: `MemAvailable` (other processes' holds already out) minus what
-    /// this plan needs now (store, scratch, n-gram staging, heap, margin and the OS floor).
+    /// this plan needs now (store, scratch, heap, margin and the OS floor).
     pub(super) page_cache_left: u64,
 }
 
@@ -308,19 +286,16 @@ impl HostPinPlan {
             .ok_or_else(overflow)?;
         let scratch_bytes = 2 * (geometry.record_bytes as u64 + terms.stream_slot_metadata);
         let os_floor = memory.os_floor();
-        let ngram_staging_bytes = terms.ngram_staging_bytes().ok_or_else(overflow)?;
         let process_bytes = store_bytes
             .checked_add(scratch_bytes)
-            .and_then(|sum| sum.checked_add(ngram_staging_bytes))
             .and_then(|sum| sum.checked_add(terms.engine_heap))
             .and_then(|sum| sum.checked_add(terms.margin))
             .ok_or_else(overflow)?;
         let needed_now = process_bytes.checked_add(os_floor).ok_or_else(overflow)?;
         if needed_now > memory.available {
             return Err(plan_error(format!(
-                "{store_bytes} pinned store bytes, {scratch_bytes} stream scratch, \
-                 {ngram_staging_bytes} n-gram staging, {} heap and {} margin plus the {os_floor} \
-                 byte OS floor need {needed_now} bytes, {} are available",
+                "{store_bytes} pinned store bytes, {scratch_bytes} stream scratch, {} heap and {} \
+                 margin plus the {os_floor} byte OS floor need {needed_now} bytes, {} are available",
                 terms.engine_heap, terms.margin, memory.available
             )));
         }
@@ -329,7 +304,7 @@ impl HostPinPlan {
         if page_cache_left < terms.ngram_cache_min {
             return Err(plan_error(format!(
                 "{page_cache_left} bytes of page cache are left of {} available; the n-gram \
-                 page-cache floor is {}",
+                 page-cache floor is {} (provisional, an author choice, not a measurement)",
                 memory.available, terms.ngram_cache_min
             )));
         }
@@ -338,7 +313,6 @@ impl HostPinPlan {
             places_per_layer,
             store_bytes,
             scratch_bytes,
-            ngram_staging_bytes,
             os_floor,
             process_bytes,
             page_cache_left,
@@ -446,7 +420,7 @@ pub(super) struct PassPlan {
     pub(super) moves: Vec<SlotMove>,
 }
 
-/// The seam a shared policy fills in. Every method keeps the rules in the module doc.
+/// The seam P1 fills with the shared policy. Every method keeps the rules in the module doc.
 pub(super) trait SlotPolicy {
     /// Plans the copies of one layer for the router's picks. `picks` holds every pick of the token
     /// in this layer, hits included (`-1`, the router fault, is skipped; any other id outside the
@@ -526,15 +500,6 @@ impl LayerLru {
 pub(super) struct ReplaceOnMissLru {
     geometry: BankGeometry,
     layers: Vec<LayerLru>,
-    /// Per-layer pick counts, written to `usage_out` on drop so a run can produce the popularity
-    /// profile of its own workload (the read side is `FIFI_FLASH_NEXT_EXPERT_STATS`, or the
-    /// `expert_stats` engine key). `None` when no write path is set.
-    usage: Option<Vec<Vec<u64>>>,
-    /// Where the dump goes: the `FIFI_FLASH_NEXT_EXPERT_USAGE_OUT` value, or the engine's
-    /// `expert_stats` path (which then also feeds the next start's fill).
-    usage_out: Option<std::path::PathBuf>,
-    /// Per-layer miss counts of the same dump: where the slot capacity actually binds.
-    miss_counts: Vec<u64>,
 }
 
 impl ReplaceOnMissLru {
@@ -545,7 +510,6 @@ impl ReplaceOnMissLru {
         geometry: BankGeometry,
         rows: &[&[i32]],
         counts: &[Vec<u64>],
-        usage_out: Option<&std::path::Path>,
     ) -> Result<Self, EngError> {
         if rows.len() != geometry.layers || counts.len() != geometry.layers {
             return Err(bank_error(format!(
@@ -592,56 +556,7 @@ impl ReplaceOnMissLru {
                 recency,
             });
         }
-        let usage_out = usage_out.map(std::path::Path::to_path_buf);
-        let usage = usage_out
-            .as_ref()
-            .map(|_| vec![vec![0u64; geometry.experts]; geometry.layers]);
-        let miss_counts = vec![0u64; geometry.layers];
-        Ok(Self {
-            geometry,
-            layers,
-            usage,
-            usage_out,
-            miss_counts,
-        })
-    }
-
-    /// Writes the collected pick counts in the `expert_stats` layer-key format the profile
-    /// reader takes, so the file feeds straight back through `FIFI_FLASH_NEXT_EXPERT_STATS`.
-    fn dump_usage(&self) {
-        let Some(path) = self.usage_out.as_deref() else {
-            return;
-        };
-        let Some(usage) = &self.usage else { return };
-        let layers: serde_json::Map<String, serde_json::Value> = usage
-            .iter()
-            .enumerate()
-            .map(|(layer, counts)| {
-                (
-                    format!("model.language_model.layers.{layer}.mlp"),
-                    serde_json::json!(counts),
-                )
-            })
-            .collect();
-        let usage_misses = self.miss_counts.clone();
-        let body =
-            serde_json::json!({"schema": "fifi-usage/1", "layers": layers, "misses": usage_misses});
-        // Write-and-rename: a crash mid-dump must not leave a truncated file the next start
-        // refuses. The temp file sits next to the target so the rename stays on one filesystem.
-        let temp = path.with_extension("json.tmp");
-        match serde_json::to_vec(&body) {
-            Ok(bytes) => {
-                let written =
-                    std::fs::write(&temp, bytes).and_then(|()| std::fs::rename(&temp, path));
-                if let Err(e) = written {
-                    std::fs::remove_file(&temp).ok();
-                    eprintln!("flash-next cuda: expert usage dump {}: {e}", path.display());
-                }
-            }
-            // The body is maps of u64 vectors: serialization cannot fail. Skip the write
-            // instead of emitting an empty file a next start would refuse.
-            Err(e) => eprintln!("flash-next cuda: expert usage dump {}: {e}", path.display()),
-        }
+        Ok(Self { geometry, layers })
     }
 
     fn layer(&self, layer: usize) -> Result<&LayerLru, EngError> {
@@ -659,25 +574,16 @@ impl ReplaceOnMissLru {
     }
 }
 
-impl Drop for ReplaceOnMissLru {
-    fn drop(&mut self) {
-        self.dump_usage();
-    }
-}
-
 impl SlotPolicy for ReplaceOnMissLru {
     fn plan_pass(&mut self, layer: usize, picks: &[i32]) -> Result<PassPlan, EngError> {
         let current = self.layer(layer)?;
         let mut demanded = vec![false; self.geometry.experts];
         let mut order = Vec::with_capacity(picks.len());
-        // Pick ids deferred to after `current`'s borrow ends, for the usage profile.
-        let mut picked = Vec::with_capacity(picks.len());
         for &id in picks {
             if id == -1 {
                 continue;
             }
             let expert = self.check_expert(id)?;
-            picked.push(usize::from(expert));
             if !std::mem::replace(&mut demanded[usize::from(expert)], true) {
                 order.push(expert);
             }
@@ -697,14 +603,7 @@ impl SlotPolicy for ReplaceOnMissLru {
             )));
         }
         let mut next = current.clone();
-        let _ = current; // end the borrow: the write-back below takes the layer slot
-        if let Some(usage) = &mut self.usage {
-            for expert in picked {
-                usage[layer][expert] += 1;
-            }
-        }
         let plan = next.apply(&order, &demanded)?;
-        self.miss_counts[layer] += plan.moves.len() as u64;
         self.layers[layer] = next;
         Ok(plan)
     }
@@ -938,7 +837,7 @@ impl ExpertBankState<ReplaceOnMissLru> {
         let rows: Vec<&[i32]> = (0..geometry.layers)
             .map(|layer| hot.table.row(layer))
             .collect();
-        let policy = ReplaceOnMissLru::from_fill(geometry, &rows, counts, None)?;
+        let policy = ReplaceOnMissLru::from_fill(geometry, &rows, counts)?;
         Self::with_policy(geometry, mode, policy)
     }
 }
@@ -1027,12 +926,6 @@ impl<P: SlotPolicy> ExpertBankState<P> {
     /// device owner calls it when the copies of a planned pass failed.
     pub(super) fn poison(&mut self) {
         self.poisoned = true;
-    }
-
-    /// Whether the host model may no longer match the device. Readers of the slot row check it
-    /// (`DeviceBank::slot_row` refuses once it is set).
-    pub(super) fn is_poisoned(&self) -> bool {
-        self.poisoned
     }
 
     fn check_usable(&self) -> Result<(), EngError> {
@@ -1161,12 +1054,11 @@ pub(super) mod device {
     //! They are allocated once and held: dropping one synchronizes the device.
 
     use super::{
-        BankGeometry, BankStats, ExpertBankState, HostPinPlan, PassCopies, RecordSource,
-        ReplaceOnMissLru,
+        BankGeometry, ExpertBankState, HostPinPlan, PassCopies, RecordSource, ReplaceOnMissLru,
     };
     use crate::{
         EngError,
-        kernels::cuda::{CudaContext, DeviceBuffer, DeviceRange, DeviceStream, PinnedBuf},
+        kernels::cuda::{CudaContext, DeviceBuffer, DeviceStream, PinnedBuf},
     };
 
     pub(in crate::family::flash_next) struct DeviceBank {
@@ -1189,19 +1081,12 @@ pub(super) mod device {
         ) -> Result<Self, EngError> {
             let geometry: BankGeometry = *state.geometry();
             let places = state.mode().places_per_layer(&geometry);
-            let store_bytes = (geometry.layers as u64)
-                .checked_mul(places as u64)
-                .and_then(|places| places.checked_mul(geometry.record_bytes as u64));
-            if plan.mode != state.mode()
-                || plan.places_per_layer != places
-                || Some(plan.store_bytes) != store_bytes
-            {
+            if plan.mode != state.mode() || plan.places_per_layer != places {
                 return Err(EngError::BadRequest(format!(
-                    "Flash-Next expert bank: the host plan is for {:?} with {} places per layer and \
-                     {} store bytes, the bank is {:?} with {places} places and {store_bytes:?} bytes",
+                    "Flash-Next expert bank: the host plan is for {:?} with {} places per layer, \
+                     the bank is {:?} with {places}",
                     plan.mode,
                     plan.places_per_layer,
-                    plan.store_bytes,
                     state.mode()
                 )));
             }
@@ -1234,90 +1119,64 @@ pub(super) mod device {
             })
         }
 
-        /// The host model, for tests only: it still answers after a failed copy, when it is ahead
-        /// of the device. Production code reads [`Self::slot_row`], [`Self::stats`] and
-        /// [`Self::geometry`].
-        #[cfg(test)]
         pub(in crate::family::flash_next) fn state(&self) -> &ExpertBankState<ReplaceOnMissLru> {
             &self.state
         }
 
-        /// The counters of the passes so far (hits, misses, write-backs, miss histogram).
-        pub(in crate::family::flash_next) fn stats(&self) -> &BankStats {
-            self.state.stats()
-        }
-
-        /// The sizes of the bank: layers, experts, top-k, slots per layer and the record size.
-        pub(in crate::family::flash_next) fn geometry(&self) -> &BankGeometry {
-            self.state.geometry()
-        }
-
-        /// Whether a failed copy left the device out of step with the host model. Every later
-        /// `step`, `admit`, `slot_row`, `slots` and `read_place` is refused.
-        pub(in crate::family::flash_next) fn is_poisoned(&self) -> bool {
-            self.state.is_poisoned()
-        }
-
-        fn check_usable(&self) -> Result<(), EngError> {
-            if self.state.is_poisoned() {
-                return Err(EngError::BadRequest(
-                    "Flash-Next expert bank: a failed copy left the device out of step with the \
-                     host model; drop the bank and build a new one"
-                        .into(),
-                ));
-            }
-            Ok(())
-        }
-
-        /// The classifier's slot row of `layer` (upload it after every pass that moved a slot).
-        /// Refused once the bank is poisoned, so a launch cannot classify against a table the
-        /// device does not hold.
-        pub(in crate::family::flash_next) fn slot_row(
-            &self,
-            layer: usize,
-        ) -> Result<&[i32], EngError> {
-            self.check_usable()?;
-            match self.state.slot_row(layer) {
-                [] => Err(EngError::BadRequest(format!(
-                    "layer {layer} is outside the bank"
-                ))),
-                row => Ok(row),
-            }
-        }
-
-        /// The bank buffer of `layer`: slot `s` starts at `s * record_bytes`. Refused once the
-        /// bank is poisoned.
-        pub(in crate::family::flash_next) fn slots(
-            &self,
-            layer: usize,
-        ) -> Result<&DeviceBuffer, EngError> {
-            self.check_usable()?;
-            self.slots
-                .get(layer)
-                .ok_or_else(|| EngError::BadRequest(format!("layer {layer} is outside the bank")))
+        /// The bank buffer of `layer`: slot `s` starts at `s * record_bytes`.
+        pub(in crate::family::flash_next) fn slots(&self, layer: usize) -> Option<&DeviceBuffer> {
+            self.slots.get(layer)
         }
 
         pub(in crate::family::flash_next) fn stream(&self) -> &DeviceStream {
             &self.stream
         }
 
+        /// The host model's slot row of `layer` (expert -> slot or -1), for read-only callers
+        /// like the prefill ring.
+        pub(in crate::family::flash_next) fn slot_row(
+            &self,
+            layer: usize,
+        ) -> Result<&[i32], EngError> {
+            self.check_usable()?;
+            let row = self.state.slot_row(layer);
+            if row.is_empty() {
+                return Err(EngError::BadRequest(format!(
+                    "layer {layer} is outside the bank"
+                )));
+            }
+            Ok(row)
+        }
+
+        /// Streams one expert record from the pinned store into `dst` on the prefill ring's
+        /// copy stream. The ring's whole chunk holds the bank frozen read-only, so the places
+        /// stay valid; only the ring calls this.
+        pub(in crate::family::flash_next) fn stream_place(
+            &mut self,
+            ctx: &CudaContext,
+            stream: &DeviceStream,
+            layer: usize,
+            place: u32,
+            dst: DeviceRange<'_>,
+        ) -> Result<(), EngError> {
+            self.check_usable()?;
+            let geometry = self.state.geometry();
+            let store = self.store.get_mut(layer).ok_or_else(|| {
+                EngError::BadRequest(format!("layer {layer} is outside the bank"))
+            })?;
+            ctx.copy_from_pinned(stream, store, geometry.offset(place as usize), dst)
+        }
+
         /// One decode layer: plans the copies for the router's picks (all of them, hits included),
         /// runs them and returns when they have finished. The only way to move a slot, so the
         /// device cannot lag the host model; if a copy fails the state is poisoned and every later
-        /// step is refused. A `ctx` of another adapter than the one that built the bank fails in
-        /// the first copy, after the host model has moved, so it poisons the bank too: pass the
-        /// context of the build.
-        ///
-        /// The copies run on the bank's own stream, unordered against the caller's stream, so a
-        /// caller with reads of the banked bytes still pending on its own stream must drain it
-        /// before every `step` (`SplitMoe::run_rows` does; `run` relies on its caller's drains).
+        /// step is refused.
         pub(in crate::family::flash_next) fn step(
             &mut self,
             ctx: &CudaContext,
             layer: usize,
             picks: &[i32],
         ) -> Result<PassCopies, EngError> {
-            self.check_usable()?;
             let copies = self.state.begin_pass(layer, picks)?;
             self.finish(ctx, copies)
         }
@@ -1329,7 +1188,6 @@ pub(super) mod device {
             layer: usize,
             experts_by_use: &[u16],
         ) -> Result<PassCopies, EngError> {
-            self.check_usable()?;
             let copies = self.state.admit(layer, experts_by_use)?;
             self.finish(ctx, copies)
         }
@@ -1390,31 +1248,11 @@ pub(super) mod device {
             place: u32,
             out: &mut [u8],
         ) -> Result<(), EngError> {
-            self.check_usable()?;
             let geometry = self.state.geometry();
             self.store
                 .get(layer)
                 .ok_or_else(|| EngError::BadRequest(format!("layer {layer} is outside the bank")))?
                 .read(geometry.offset(place as usize), out)
-        }
-
-        /// Streams one expert record from the pinned store into `dst` on the prefill ring's
-        /// copy stream. The ring's whole chunk holds the bank frozen read-only, so the places
-        /// stay valid; only the ring calls this.
-        pub(in crate::family::flash_next) fn stream_place(
-            &mut self,
-            ctx: &CudaContext,
-            stream: &DeviceStream,
-            layer: usize,
-            place: u32,
-            dst: DeviceRange<'_>,
-        ) -> Result<(), EngError> {
-            self.check_usable()?;
-            let geometry = self.state.geometry();
-            let store = self.store.get_mut(layer).ok_or_else(|| {
-                EngError::BadRequest(format!("layer {layer} is outside the bank"))
-            })?;
-            ctx.copy_from_pinned(stream, store, geometry.offset(place as usize), dst)
         }
     }
 }

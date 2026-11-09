@@ -44,7 +44,7 @@ fn the_ring_streams_every_non_resident_expert_in_layer_order() {
     let row: Vec<i32> = (0..12).map(|e| if e < 4 { e } else { -1 }).collect();
     let counts = vec![(0..12u64).collect::<Vec<_>>(); 3];
     let rows: Vec<&[i32]> = vec![row.as_slice(); 3];
-    let policy = ReplaceOnMissLru::from_fill(geometry, &rows, &counts, None).unwrap();
+    let policy = ReplaceOnMissLru::from_fill(geometry, &rows, &counts).unwrap();
     let state = ExpertBankState::with_policy(geometry, HostMode::Exclusive, policy).unwrap();
 
     let projector = crate::family::project::cuda::CudaProjector::new().expect("projector");
@@ -127,7 +127,7 @@ fn freeing_out_of_order_is_refused() {
     let row: Vec<i32> = (0..12).map(|e| if e < 4 { e } else { -1 }).collect();
     let counts = vec![(0..12u64).collect::<Vec<_>>(); 2];
     let rows: Vec<&[i32]> = vec![row.as_slice(); 2];
-    let policy = ReplaceOnMissLru::from_fill(geometry, &rows, &counts, None).unwrap();
+    let policy = ReplaceOnMissLru::from_fill(geometry, &rows, &counts).unwrap();
     let state = ExpertBankState::with_policy(geometry, HostMode::Exclusive, policy).unwrap();
     let projector = crate::family::project::cuda::CudaProjector::new().expect("projector");
     let ctx = projector.context();
