@@ -215,7 +215,7 @@ impl super::driver::chunk::ChunkDevice for CardChunkDevice {
     /// they depend only on the embeddings, so the two launches ride ahead of the layers and are
     /// done when `ple_project_chunk` reads them back. Without the route there is nothing to
     /// stage; the projections run on the host inside `ple_update`.
-    fn write_chunk_ple(&mut self, rows: &[f32]) -> Result<()> {
+    fn write_chunk_ple(&mut self, rows: &[f32]) -> Result<(), EngError> {
         let Some(ple) = self.ple.as_mut() else {
             return Ok(());
         };
@@ -223,7 +223,7 @@ impl super::driver::chunk::ChunkDevice for CardChunkDevice {
         ple.enqueue_chunk(&self.step.ctx, &self.step.stream, rows, m)
     }
 
-    fn ple_project_chunk(&mut self) -> Result<Vec<PleKeyValue>> {
+    fn ple_project_chunk(&mut self) -> Result<Vec<PleKeyValue>, EngError> {
         let m = self.m;
         let Some(ple) = self.ple.as_ref() else {
             return Err(EngError::Backend {

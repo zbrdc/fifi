@@ -67,6 +67,7 @@ pub(in crate::family) struct DevicePle {
     width: usize,
     hidden: usize,
     embed: usize,
+    rows_max: usize,
 }
 
 impl DevicePle {
@@ -124,6 +125,7 @@ impl DevicePle {
             width,
             hidden,
             embed,
+            rows_max,
         })
     }
 
@@ -134,7 +136,7 @@ impl DevicePle {
 
     /// The most rows one [`Self::enqueue_chunk`] takes.
     pub(in crate::family) fn rows_max(&self) -> usize {
-        self.keys.len() / (self.width * 4)
+        self.rows_max
     }
 
     /// Writes `embedding` and queues both projections on `stream`. The results stay on the device

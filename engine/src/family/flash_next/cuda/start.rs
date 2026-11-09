@@ -727,14 +727,15 @@ pub(super) fn build_driver(
     };
     let driver = if rows > 1 {
         let ple_route = device_ple;
+        let ple_on_card = ple_route.is_some();
         let mut chunked =
             ChunkDriver::new(CardChunkDevice::with_ple(step, moe, ple_route), feeds, shape)?;
         chunked.chunk_cap = rows;
-        chunked.ple_device = ple_route.is_some();
+        chunked.ple_device = ple_on_card;
         eprintln!(
             "flash-next cuda: ready in {:.1} s, prefill chunks of {rows} rows{}",
             began.elapsed().as_secs_f64(),
-            if chunked.ple_device {
+            if ple_on_card {
                 ", PLE projections on the card"
             } else {
                 ""
