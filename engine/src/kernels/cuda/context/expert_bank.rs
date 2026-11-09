@@ -154,6 +154,12 @@ impl ExpertBank {
         self.slots
     }
 
+    /// Slots per layer, for the tiered runtime's chunk arm (MR #20): the grouped MMQ
+    /// launch's `n_experts` is the bank depth, so the chunk code asks the bank.
+    pub(crate) fn slots_of(&self) -> usize {
+        self.slots
+    }
+
     /// The gate stack: `slots` experts of `inter` rows of `hidden` values.
     pub(crate) fn gate(&self) -> &NativeWeight {
         &self.gate

@@ -119,6 +119,8 @@ pub(super) struct TieredRuntime<'w> {
     banks: Vec<ExpertBank>,
     scratch: TieredScratch,
     host: TieredHost,
+    /// The bank depth (slots per layer) every bank was built with.
+    slot_count: usize,
     /// The host waits of the token so far: the layers' and, after `end_token`, the bank fills'.
     syncs: HostSyncs,
 }
@@ -137,16 +139,46 @@ impl<'w> TieredRuntime<'w> {
                 banks.len()
             )));
         }
+        let slot_count = banks.first().map(ExpertBank::slots_of).unwrap_or(0);
         Ok(Self {
             parts,
             banks,
             scratch,
             host,
+            slot_count,
             syncs: HostSyncs::default(),
         })
     }
 
+    /// The weights of `layer` for any MoE launch — the per-token block today, the chunk
+    /// arm of batched prefill (MR #20 slice 4) tomorrow: the router and shared parts from
+    /// the loaded model, the three BANK stacks in place of the full-depth stacks.
+    pub(super) fn layer_weights(&self, layer: usize) -> Result<MoeLayerWeights<'_>, EngError> {
+        let missing = || EngError::BadRequest(format!("tiered runtime: layer {layer} has no bank"));
+        let (parts, bank) = (
+            self.parts.get(layer).ok_or_else(missing)?,
+            self.banks.get(layer).ok_or_else(missing)?,
+        );
+        Ok(MoeLayerWeights {
+            router: parts.router,
+            router_shared: parts.router_shared,
+            gate: StackWeights::Native(bank.gate()),
+            up: StackWeights::Native(bank.up()),
+            down: StackWeights::Native(bank.down()),
+            shared_gate: parts.shared_gate,
+            shared_up: parts.shared_up,
+            shared_down: parts.shared_down,
+        })
+    }
+
+    /// The bank depth every layer was built with (the tiered plan's slots per layer).
+    pub(super) fn slots(&self) -> usize {
+        self.banks.first().map(|_| self.slot_count).unwrap_or(0)
+    }
+
     /// Runs the MoE block of `layer` with the host decision between the router and the experts.
+    /// The weights construction stays inline: block borrow of `scratch`/`host` beside an
+    /// immutable `self` is the disjoint-field shape the accessor cannot express.
     pub(super) fn run_layer(
         &mut self,
         launch: &Launch<'_>,
