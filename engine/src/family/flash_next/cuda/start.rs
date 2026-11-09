@@ -75,8 +75,16 @@ use crate::{
     weights::exl3::Checkpoint,
 };
 
-/// Threads of the host PLE projections (rows split over them).
-const PLE_THREADS: usize = 8;
+/// Threads of the host PLE projections (rows split over them). The two projection matvecs are
+/// DRAM-bandwidth-bound (131 MB per token), so more threads helps until the socket saturates;
+/// `INFERENCE_FLASH_NEXT_PLE_THREADS` overrides the default.
+fn ple_threads() -> usize {
+    std::env::var("INFERENCE_FLASH_NEXT_PLE_THREADS")
+        .ok()
+        .and_then(|text| text.parse::<usize>().ok())
+        .map(|n| n.clamp(1, 128))
+        .unwrap_or(8)
+}
 
 /// The id-indexed options Flash-Next serves its routed experts with: the DP4A decode of codebook 2
 /// (the codebook of this pack) and one launch for the 20 gate and up pairs of ten picks. Both write
@@ -654,8 +662,12 @@ pub(super) fn build_driver(
     let moe = SplitMoeAt::new(block, &model_layers)?;
 
     stage("opening the n-gram table");
-    let (vectors, projection) =
-        PleVectors::read(&checkpoint.source, model.ple_layer, &model.ple, PLE_THREADS)?;
+    let (vectors, projection) = PleVectors::read(
+        &checkpoint.source,
+        model.ple_layer,
+        &model.ple,
+        ple_threads(),
+    )?;
     let ple = PleFeed::new(
         model.ple,
         NgramRows::new(ngram)?,

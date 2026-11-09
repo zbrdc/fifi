@@ -312,6 +312,14 @@ pub(crate) fn step<P: Projector>(
             "ple weight scale must be finite".to_owned(),
         ));
     }
+    let profile = step_prof::on();
+    let mut t = std::time::Instant::now();
+    let mut tick = |slot: usize| {
+        if profile {
+            step_prof::add(slot, t.elapsed());
+            t = std::time::Instant::now();
+        }
+    };
     let plan = plan_rows(shape, weights, &state.history, token)?;
     let mut emb = Vec::with_capacity(shape.embed);
     for &(table, local) in &plan.rows {
@@ -320,11 +328,14 @@ pub(crate) fn step<P: Projector>(
         emb.extend(values.iter().map(|v| v * weights.weight_scale));
     }
     let new_history = plan.history;
+    tick(16);
 
     let keys = projector.linear(weights.key, &emb)?;
     expect_len(&keys, width, "ple key")?;
+    tick(17);
     let value = projector.linear(weights.value, &emb)?;
     expect_len(&value, hidden, "ple value")?;
+    tick(18);
 
     let mut gated = vec![0.0f32; width];
     let mut normed = vec![0.0f32; width];
@@ -342,6 +353,7 @@ pub(crate) fn step<P: Projector>(
         let block = rms0(&gated[lo..hi], &weights.norm_conv[lo..hi], eps)?;
         normed[lo..hi].copy_from_slice(&block);
     }
+    tick(19);
 
     let mut out = vec![0.0f32; width];
     for (c, out_c) in out.iter_mut().enumerate() {
@@ -353,6 +365,7 @@ pub(crate) fn step<P: Projector>(
         }
         *out_c = gated[c] + silu(a);
     }
+    tick(20);
 
     let mut new_ring = vec![0.0f32; shape.ring_len];
     for (c, &n) in normed.iter().enumerate() {
@@ -364,7 +377,27 @@ pub(crate) fn step<P: Projector>(
 
     state.history = new_history;
     state.ring = new_ring;
+    tick(21);
     Ok(out)
+}
+
+/// The prefill profiler's slots, when the CUDA driver that dumps them is compiled in.
+#[cfg(feature = "native-cuda")]
+mod step_prof {
+    pub(super) fn on() -> bool {
+        crate::family::flash_next::cuda::driver::chunk::prof::on()
+    }
+    pub(super) fn add(slot: usize, spent: std::time::Duration) {
+        crate::family::flash_next::cuda::driver::chunk::prof::add(slot, spent);
+    }
+}
+
+#[cfg(not(feature = "native-cuda"))]
+mod step_prof {
+    pub(super) fn on() -> bool {
+        false
+    }
+    pub(super) fn add(_: usize, _: std::time::Duration) {}
 }
 
 #[cfg(test)]

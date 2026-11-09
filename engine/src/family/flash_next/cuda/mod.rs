@@ -115,7 +115,7 @@ mod step_tests;
 mod device;
 #[cfg(any(test, all(feature = "native-cuda", target_os = "linux")))]
 #[cfg_attr(not(test), allow(dead_code, reason = "staged for the engine start"))]
-mod driver;
+pub(in crate::family::flash_next) mod driver;
 #[cfg(all(test, feature = "native-cuda", target_os = "linux"))]
 mod driver_device_tests;
 #[cfg(any(test, all(feature = "native-cuda", target_os = "linux")))]

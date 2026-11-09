@@ -325,7 +325,7 @@ impl<D: TokenDevice, F: TokenFeeds> TokenStepper for TokenDriver<D, F> {
     not(test),
     allow(dead_code, reason = "staged for the chunked prefill step")
 )]
-pub(in crate::family::flash_next::cuda) mod chunk;
+pub(in crate::family::flash_next) mod chunk;
 #[cfg(test)]
 pub(super) mod fakes;
 #[cfg(test)]
