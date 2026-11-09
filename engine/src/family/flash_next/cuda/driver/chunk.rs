@@ -50,6 +50,11 @@ pub(in crate::family::flash_next::cuda) trait ChunkDevice {
     fn begin_prefill(&mut self) -> Result<()> {
         Ok(())
     }
+    /// Closes the prefill window after the sampling row ran. The single-token step of later
+    /// decode uses the bank's miss path again; a no-op when no window is open.
+    fn end_prefill(&mut self) -> Result<()> {
+        Ok(())
+    }
     /// Queues layers `range` for the chunk of `m` rows at `pos`.
     fn layers(&mut self, range: Range<usize>, pos: usize, m: usize) -> Result<()>;
     /// The `m` stream rows, read back behind the queued work.
@@ -259,11 +264,16 @@ impl<D: ChunkDevice, F: TokenFeeds> TokenStepper for ChunkDriver<D, F> {
     }
 
     fn logits(&mut self, token: u32) -> Result<Vec<f32>> {
-        self.run_chunk(&[token], true)?
+        let logits = self
+            .run_chunk(&[token], true)?
             .ok_or_else(|| EngError::Backend {
                 operation: Self::OPERATION,
                 message: "the logits step returned no logits".to_string(),
-            })
+            })?;
+        // The sampling row closed the prefill: the ring's window ends with it, and every
+        // later single-token step takes the decode path.
+        self.device.end_prefill()?;
+        Ok(logits)
     }
 
     fn fed(&self) -> usize {

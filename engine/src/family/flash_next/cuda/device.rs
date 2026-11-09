@@ -212,6 +212,10 @@ impl super::driver::chunk::ChunkDevice for CardChunkDevice {
         Ok(())
     }
 
+    fn end_prefill(&mut self) -> Result<(), EngError> {
+        self.moe.end_prefill()
+    }
+
     fn layers(
         &mut self,
         range: std::ops::Range<usize>,
@@ -253,6 +257,9 @@ impl super::driver::chunk::ChunkDevice for CardChunkDevice {
 
     fn reset(&mut self) -> Result<(), EngError> {
         self.m = 1;
+        // A reset can land inside an open prefill window; close it so the next single-row
+        // step does not ride a stale plan.
+        self.moe.end_prefill()?;
         self.step.reset()
     }
 

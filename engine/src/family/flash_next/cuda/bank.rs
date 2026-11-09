@@ -1269,6 +1269,20 @@ pub(super) mod device {
             Ok(())
         }
 
+        /// Waits every copy `stream` may still hold on layer `layer`'s pinned store and
+        /// clears its pending record: the prefill ring's window hands the stores back to the
+        /// decode path this way.
+        pub(in crate::family::flash_next) fn synchronize_store(
+            &mut self,
+            layer: usize,
+            stream: &DeviceStream,
+        ) -> Result<(), EngError> {
+            let store = self.store.get_mut(layer).ok_or_else(|| {
+                EngError::BadRequest(format!("layer {layer} is outside the bank"))
+            })?;
+            store.synchronize(stream)
+        }
+
         /// The classifier's slot row of `layer` (upload it after every pass that moved a slot).
         /// Refused once the bank is poisoned, so a launch cannot classify against a table the
         /// device does not hold.

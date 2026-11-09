@@ -990,6 +990,11 @@ impl<'w> SplitMoeAt<'w> {
         self.inner.begin_prefill();
     }
 
+    /// Closes the prefill window; the decode steps after it use the bank's miss path again.
+    pub(super) fn end_prefill(&mut self) -> Result<(), EngError> {
+        self.inner.end_prefill()
+    }
+
     /// Resets the prefill ring's per-chunk cursors.
     pub(super) fn begin_chunk(&mut self) {
         self.inner.begin_chunk();

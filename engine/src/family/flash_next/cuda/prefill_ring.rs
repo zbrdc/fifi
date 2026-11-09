@@ -80,6 +80,9 @@ pub(super) mod device {
         issued: usize,
         record: usize,
         ring: usize,
+        /// Whether a chunked prefill window is open: the single-row step rides the ring only
+        /// then (decode keeps the bank's miss path).
+        active: bool,
     }
 
     impl PrefillRing {
@@ -114,6 +117,7 @@ pub(super) mod device {
                 issued: 0,
                 record: geometry.record_bytes,
                 ring,
+                active: false,
             })
         }
 
@@ -132,9 +136,7 @@ pub(super) mod device {
             let place_rows: Vec<Vec<u32>> = (0..layers)
                 .map(|l| {
                     (0..experts)
-                        .map(|e| {
-                            bank.place_of(l, e as u16).unwrap_or(NO_PLACE)
-                        })
+                        .map(|e| bank.place_of(l, e as u16).unwrap_or(NO_PLACE))
                         .collect()
                 })
                 .collect();
@@ -214,6 +216,20 @@ pub(super) mod device {
         pub(in crate::family::flash_next) fn begin_chunk(&mut self) {
             self.freed = 0;
             self.issued = 0;
+        }
+
+        /// Whether a prefill window is open (armed by the owning block's `begin_prefill`).
+        pub(in crate::family::flash_next) fn active(&self) -> bool {
+            self.active
+        }
+
+        pub(in crate::family::flash_next) fn set_active(&mut self, on: bool) {
+            self.active = on;
+        }
+
+        /// The stream the ring's H2D copies run on; the owner syncs it when the window closes.
+        pub(in crate::family::flash_next) fn copy_stream(&self) -> &DeviceStream {
+            &self.copy
         }
 
         /// Issues every entry through the end of `layer` (inclusive): the driver calls this at

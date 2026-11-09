@@ -555,8 +555,26 @@ mod device {
         pub(in crate::family::flash_next) fn begin_prefill(&mut self) {
             if let Some(ring) = &mut self.ring {
                 ring.replan(&self.bank);
+                ring.set_active(true);
                 ring.begin_chunk();
             }
+        }
+
+        /// Closes the prefill window: waits the ring's copies out and hands the pinned stores
+        /// back to the decode path, whose miss copies run on the bank's own stream.
+        pub(in crate::family::flash_next) fn end_prefill(&mut self) -> Result<(), EngError> {
+            let Some(ring) = self.ring.as_mut() else {
+                return Ok(());
+            };
+            if !ring.active() {
+                return Ok(());
+            }
+            let layers = self.bank.geometry().layers as usize;
+            for layer in 0..layers {
+                self.bank.synchronize_store(layer, ring.copy_stream())?;
+            }
+            ring.set_active(false);
+            Ok(())
         }
 
         /// Resets the ring's per-chunk cursors (the chunk driver's `begin_chunk`).
@@ -607,6 +625,13 @@ mod device {
                      {} experts and {} picks",
                     dims.n_expert, dims.top_k, geometry.layers, geometry.experts, geometry.top_k
                 )));
+            }
+            // The single row of a chunked prefill's sampling step rides the ring like the
+            // chunk rows: its picks are inside the prompt's plan, and the decode miss path
+            // it would otherwise take copies the same pinned stores the ring streams on
+            // another stream.
+            if self.ring.as_ref().is_some_and(|ring| ring.active()) {
+                return self.run_rows_ring(launch, layer, bufs, dims);
             }
             let (ctx, stream) = (launch.ctx, launch.stream);
             let sc = self.layout;
@@ -1239,22 +1264,29 @@ mod device {
             self.grouped_at(launch, &down, bank, ring, ids_range, &bufs.scratch)?;
 
             // The shared expert of every row, then the one combine over every pick.
-            shared_rows(
-                launch,
-                &SharedWeights {
-                    gate: self.trunks[layer].shared_gate,
-                    up: self.trunks[layer].shared_up,
-                    down: self.trunks[layer].shared_down,
-                },
-                &SharedRowsIo {
-                    norm_row: bufs.route.norm_row,
-                    gu: bufs.shared_gu,
-                    act: bufs.shared_act,
-                    out: bufs.shared_out,
-                    scratch: bufs.scratch,
-                },
-                (h, dims.shared_inter, m),
-            )?;
+            let shared_weights = SharedWeights {
+                gate: self.trunks[layer].shared_gate,
+                up: self.trunks[layer].shared_up,
+                down: self.trunks[layer].shared_down,
+            };
+            if m > 1 {
+                shared_rows(
+                    launch,
+                    &shared_weights,
+                    &SharedRowsIo {
+                        norm_row: bufs.route.norm_row,
+                        gu: bufs.shared_gu,
+                        act: bufs.shared_act,
+                        out: bufs.shared_out,
+                        scratch: bufs.scratch,
+                    },
+                    (h, dims.shared_inter, m),
+                )?;
+            } else {
+                // The K-row kernel takes 2 to 8 rows; the sampling row runs the one-row
+                // variant over its single-row buffers.
+                shared_of(launch, &shared_weights, bufs, dims)?;
+            }
             ctx.moe_combine(
                 stream,
                 CombineCall {

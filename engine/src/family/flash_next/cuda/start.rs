@@ -439,10 +439,12 @@ pub(super) fn build_driver(
     // A ring below one streamed layer is not built (the multi-row path then keeps its
     // union-admit shape, correct and slower).
     let record_bytes = PackRecordSource::new(&checkpoint)?.layout().record_bytes();
-    let ring_budget = if wanted.prefill_rows > 1 {
-        (free_vram * 3 / 10).min(1_610_612_736)
-    } else {
-        0
+    // INFERENCE_FLASH_NEXT_RING_BUDGET sets the ring's bytes. The ring measures a serve
+    // regression today (it re-issues its copies every chunk while the union-admit path
+    // copies once), so the default is off; the flag keeps the lane's experiments open.
+    let ring_budget = match std::env::var("INFERENCE_FLASH_NEXT_RING_BUDGET") {
+        Ok(bytes) => bytes.trim().parse::<u64>().unwrap_or(0),
+        Err(_) => 0,
     };
     // `FlashLoadPlan::new` replaces the trunk and state bytes (the `(0, 0)`) and the K/V (the
     // placeholder positions) with the numbers the pack and the context give.
@@ -630,7 +632,7 @@ pub(super) fn build_driver(
         source.layout(),
         &step.moe_dims(rows),
     )?;
-    if rows > 1 {
+    if rows > 1 && ring_budget > 0 {
         let slots = block.plan_ring(
             ctx,
             (ring_budget / u64::try_from(record_bytes).unwrap_or(u64::MAX)) as usize,
