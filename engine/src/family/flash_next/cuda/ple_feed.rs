@@ -21,7 +21,6 @@
 
 use crate::{
     EngError,
-    tensor::Dtype,
     family::{
         exl3_pack::Root,
         flash_next::{
@@ -30,6 +29,7 @@ use crate::{
         },
         project::Projector,
     },
+    tensor::Dtype,
     weights::{
         StreamedCheckpoint,
         exl3::ngram::{NgramAux, NgramDecoder, ROW_DIM},

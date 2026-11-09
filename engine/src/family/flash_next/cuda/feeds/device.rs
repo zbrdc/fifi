@@ -226,7 +226,12 @@ impl DevicePle {
         self.embedding.write_at(stream, 0, &f32_bytes(embeddings))?;
         for (rows, weight, y, y_len) in [
             (self.width, &self.key_weight, &self.keys, m * self.width),
-            (self.hidden, &self.value_weight, &self.value, m * self.hidden),
+            (
+                self.hidden,
+                &self.value_weight,
+                &self.value,
+                m * self.hidden,
+            ),
         ] {
             context.dense_gemv(
                 stream,

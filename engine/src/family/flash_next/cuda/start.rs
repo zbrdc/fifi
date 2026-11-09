@@ -707,7 +707,12 @@ pub(super) fn build_driver(
         None => None,
     };
     let ple = if device_ple.is_some() {
-        PleFeed::with_fixed(model.ple, ngram_rows, vectors, Rc::new(FixedProjection::new()))
+        PleFeed::with_fixed(
+            model.ple,
+            ngram_rows,
+            vectors,
+            Rc::new(FixedProjection::new()),
+        )
     } else {
         PleFeed::new(model.ple, ngram_rows, vectors, Box::new(projection))
     };
@@ -728,8 +733,11 @@ pub(super) fn build_driver(
     let driver = if rows > 1 {
         let ple_route = device_ple;
         let ple_on_card = ple_route.is_some();
-        let mut chunked =
-            ChunkDriver::new(CardChunkDevice::with_ple(step, moe, ple_route), feeds, shape)?;
+        let mut chunked = ChunkDriver::new(
+            CardChunkDevice::with_ple(step, moe, ple_route),
+            feeds,
+            shape,
+        )?;
         chunked.chunk_cap = rows;
         chunked.ple_device = ple_on_card;
         eprintln!(

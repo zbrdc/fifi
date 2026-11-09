@@ -258,7 +258,8 @@ impl TokenFeeds for FakeFeeds {
     }
 
     fn set_ple_pair(&mut self, pair: PleKeyValue) -> Result<(), EngError> {
-        self.pairs.push(pair.keys.first().copied().unwrap_or(f32::NAN));
+        self.pairs
+            .push(pair.keys.first().copied().unwrap_or(f32::NAN));
         Ok(())
     }
 

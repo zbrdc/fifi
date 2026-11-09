@@ -2,12 +2,12 @@
 //! fakes.
 
 use super::ChunkDriver;
+use crate::family::flash_next::cuda::ple_feed::PleKeyValue;
 use crate::{
     EngError,
     family::{flash_next::cuda::driver::fakes, session::TokenStepper},
 };
 use fakes::{FakeChunkDevice, FakeFeeds, LOGITS, SAMPLER_VOCAB, STREAM, shape};
-use crate::family::flash_next::cuda::ple_feed::PleKeyValue;
 
 fn chunk_driver() -> ChunkDriver<FakeChunkDevice, FakeFeeds> {
     ChunkDriver::new(FakeChunkDevice::default(), FakeFeeds::default(), shape()).unwrap()
@@ -82,11 +82,13 @@ fn the_device_ple_route_projects_on_the_device_and_hands_the_pairs_over() {
     // The plain route never projects on the device.
     let mut plain = chunk_driver();
     plain.run_chunk(&[3, 4], false).unwrap();
-    assert!(!plain
-        .device()
-        .log
-        .iter()
-        .any(|call| call.starts_with("chunk_ple_project")));
+    assert!(
+        !plain
+            .device()
+            .log
+            .iter()
+            .any(|call| call.starts_with("chunk_ple_project"))
+    );
     assert!(plain.feeds().pairs.is_empty());
 }
 
