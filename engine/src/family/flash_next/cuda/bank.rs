@@ -56,7 +56,7 @@ use crate::{
 
 const GIB: u64 = 1 << 30;
 const MIB: u64 = 1 << 20;
-const NO_PLACE: u32 = u32::MAX;
+pub(super) const NO_PLACE: u32 = u32::MAX;
 
 fn plan_error(detail: String) -> EngError {
     EngError::MemoryPlan(format!("Flash-Next expert bank: {detail}"))
@@ -1166,7 +1166,7 @@ pub(super) mod device {
     };
     use crate::{
         EngError,
-        kernels::cuda::{CudaContext, DeviceBuffer, DeviceStream, PinnedBuf},
+        kernels::cuda::{CudaContext, DeviceBuffer, DeviceRange, DeviceStream, PinnedBuf},
     };
 
     pub(in crate::family::flash_next) struct DeviceBank {
@@ -1396,6 +1396,25 @@ pub(super) mod device {
                 .get(layer)
                 .ok_or_else(|| EngError::BadRequest(format!("layer {layer} is outside the bank")))?
                 .read(geometry.offset(place as usize), out)
+        }
+
+        /// Streams one expert record from the pinned store into `dst` on the prefill ring's
+        /// copy stream. The ring's whole chunk holds the bank frozen read-only, so the places
+        /// stay valid; only the ring calls this.
+        pub(in crate::family::flash_next) fn stream_place(
+            &mut self,
+            ctx: &CudaContext,
+            stream: &DeviceStream,
+            layer: usize,
+            place: u32,
+            dst: DeviceRange<'_>,
+        ) -> Result<(), EngError> {
+            self.check_usable()?;
+            let geometry = self.state.geometry();
+            let store = self.store.get_mut(layer).ok_or_else(|| {
+                EngError::BadRequest(format!("layer {layer} is outside the bank"))
+            })?;
+            ctx.copy_from_pinned(stream, store, geometry.offset(place as usize), dst)
         }
     }
 }

@@ -22,6 +22,11 @@ mod moe_block;
 mod moe_block_device_tests;
 #[cfg(test)]
 mod moe_block_tests;
+mod prefill_ring;
+#[cfg(all(test, feature = "native-cuda", target_os = "linux"))]
+mod prefill_ring_device_tests;
+#[cfg(test)]
+mod prefill_ring_tests;
 // S3: the state and decode arena plans size device memory with the kernel wrappers, so they build
 // with the native CUDA backend only. Staged: the decode step (S4) is the first caller.
 #[cfg(all(feature = "native-cuda", target_os = "linux"))]
