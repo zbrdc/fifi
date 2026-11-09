@@ -21,11 +21,12 @@
 
 use crate::{
     EngError,
+    tensor::Dtype,
     family::{
         exl3_pack::Root,
         flash_next::{
             ple::{self, PleShape, PleState, PleWeights, RowPlan},
-            stored::host_f32,
+            stored::{host_f32, stored_bytes},
         },
         project::Projector,
     },
@@ -342,6 +343,28 @@ impl PleVectors {
         };
         Ok((vectors, projection))
     }
+
+    /// The two projections as stored (dtype and raw bytes, no conversion): the device route
+    /// uploads them to the card as the pack holds them, F16 or BF16.
+    pub(in crate::family) fn raw_projections(
+        source: &StreamedCheckpoint,
+        layer: usize,
+        shape: &PleShape,
+    ) -> Result<(Dtype, Vec<u8>, Vec<u8>), EngError> {
+        let dims = shape.dims();
+        let width = (dims.hidden * dims.branches) as usize;
+        let embed = shape.embed();
+        let at = |suffix: &str| Root::Layers.name(layer, &format!("ple.{suffix}"));
+        let raw = |suffix: &str, rows: usize| stored_bytes(source, &at(suffix), rows * embed);
+        let (key_dtype, key) = raw("key_proj.weight", width)?;
+        let (value_dtype, value) = raw("value_proj.weight", dims.hidden as usize)?;
+        if key_dtype != value_dtype {
+            return Err(EngError::Checkpoint(format!(
+                "the PLE projections are stored as {key_dtype:?} and {value_dtype:?}"
+            )));
+        }
+        Ok((key_dtype, key, value))
+    }
 }
 
 /// The weights `ple::step` and `ple::plan_rows` read, borrowed field by field so that the
@@ -374,9 +397,59 @@ pub(in crate::family) struct PleFeed {
     rows: NgramRows,
     vectors: PleVectors,
     projection: Box<dyn PleProjection>,
+    /// The device route's hand-off: when set, [`PleFeed::set_fixed`] installs a precomputed
+    /// key/value pair and `ple_update` returns it instead of running the projection.
+    fixed: Option<std::rc::Rc<FixedProjection>>,
     table: [FeedWeight; 1],
     table_rows: [u64; 1],
     state: PleState,
+}
+
+/// A [`PleProjection`] that returns pairs set from outside: the device route computes the
+/// chunk's projections on the card and hands each row's pair over before the host step runs.
+pub(in crate::family) struct FixedProjection {
+    pair: std::cell::RefCell<Option<PleKeyValue>>,
+}
+
+impl FixedProjection {
+    pub(in crate::family) fn new() -> Self {
+        Self {
+            pair: std::cell::RefCell::new(None),
+        }
+    }
+
+    /// Installs the pair the next `project` returns; the last write wins.
+    pub(in crate::family) fn set(&self, pair: PleKeyValue) {
+        *self.pair.borrow_mut() = Some(pair);
+    }
+
+    /// Takes the installed pair (the `&self` form: the shared handle delegates here, because an
+    /// `Rc` alias is the design, not an error).
+    fn take(&self) -> Option<PleKeyValue> {
+        self.pair.borrow_mut().take()
+    }
+}
+
+impl PleProjection for FixedProjection {
+    fn project(&mut self, _embedding: &[f32]) -> Result<PleKeyValue, EngError> {
+        self.take().ok_or_else(|| EngError::Backend {
+            operation: "flash_next_ple_device",
+            message: "the device PLE pair was not set for this row".to_string(),
+        })
+    }
+}
+
+/// The boxed half of a [`FixedProjection`] the feed owns: delegating so the feed's `Box<dyn>` and
+/// the driver's `Rc` see the same cell.
+struct SharedFixed(std::rc::Rc<FixedProjection>);
+
+impl PleProjection for SharedFixed {
+    fn project(&mut self, _embedding: &[f32]) -> Result<PleKeyValue, EngError> {
+        self.0.take().ok_or_else(|| EngError::Backend {
+            operation: "flash_next_ple_device",
+            message: "the device PLE pair was not set for this row".to_string(),
+        })
+    }
 }
 
 impl PleFeed {
@@ -393,6 +466,7 @@ impl PleFeed {
             rows,
             vectors,
             projection,
+            fixed: None,
             table: [FeedWeight::Table],
             table_rows,
         }
@@ -401,6 +475,48 @@ impl PleFeed {
     /// The n-gram table, which a caller may read from another thread (`NgramRows` is `Sync`).
     pub(in crate::family) fn rows(&self) -> &NgramRows {
         &self.rows
+    }
+
+    /// A feed whose projections come from [`FixedProjection::set`]: the device route installs
+    /// each row's pair there, and the host step consumes it unchanged.
+    pub(in crate::family) fn with_fixed(
+        shape: PleShape,
+        rows: NgramRows,
+        vectors: PleVectors,
+        fixed: std::rc::Rc<FixedProjection>,
+    ) -> Self {
+        let projection = Box::new(SharedFixed(std::rc::Rc::clone(&fixed)));
+        let table_rows = [rows.rows()];
+        Self {
+            state: PleState::new(&shape),
+            shape,
+            rows,
+            vectors,
+            projection,
+            fixed: Some(fixed),
+            table: [FeedWeight::Table],
+            table_rows,
+        }
+    }
+
+    /// Whether [`Self::with_fixed`] built this feed.
+    pub(in crate::family) fn is_fixed(&self) -> bool {
+        self.fixed.is_some()
+    }
+
+    /// Installs the pair the next update of this row consumes. Only a fixed feed takes pairs.
+    pub(in crate::family) fn set_fixed(&self, pair: PleKeyValue) -> Result<(), EngError> {
+        self.fixed.as_ref().map_or_else(
+            || {
+                Err(EngError::BadRequest(
+                    "PLE pairs can only be set on a fixed-projection feed".to_string(),
+                ))
+            },
+            |fixed| {
+                fixed.set(pair);
+                Ok(())
+            },
+        )
     }
 
     fn weights(&self) -> PleWeights<'_, FeedWeight> {

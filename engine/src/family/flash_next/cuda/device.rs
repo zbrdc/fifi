@@ -15,9 +15,11 @@ use std::ops::Range;
 use super::{
     driver::TokenDevice,
     feeds::StartSink,
+    ple_feed::PleKeyValue,
     step::{FlashStep, SplitMoeAt},
     step_plan::Slot,
 };
+use crate::family::flash_next::cuda::feeds::device::DevicePle;
 use crate::{
     EngError, family::qwen36::exl3_tensors::f32_le_bytes,
     kernels::cuda::resident::step_params::StepParams,
@@ -139,6 +141,9 @@ impl TokenDevice for CardDevice {
 pub(super) struct CardChunkDevice {
     step: FlashStep<'static>,
     moe: SplitMoeAt<'static>,
+    /// The PLE projections on the card, when the device route is on: `write_chunk_ple` stages the
+    /// chunk's embeddings here and `ple_project_chunk` runs them.
+    ple: Option<DevicePle>,
     stream_width: usize,
     logits_width: usize,
     /// The rows of the chunk in flight, set by `write_chunk_params`.
@@ -147,11 +152,20 @@ pub(super) struct CardChunkDevice {
 
 impl CardChunkDevice {
     pub(super) fn new(step: FlashStep<'static>, moe: SplitMoeAt<'static>) -> Self {
+        Self::with_ple(step, moe, None)
+    }
+
+    pub(super) fn with_ple(
+        step: FlashStep<'static>,
+        moe: SplitMoeAt<'static>,
+        ple: Option<DevicePle>,
+    ) -> Self {
         let stream_width = step.geometry.branches * step.geometry.hidden;
         let logits_width = step.model.vocab;
         Self {
             step,
             moe,
+            ple,
             stream_width,
             logits_width,
             m: 1,
@@ -197,9 +211,28 @@ impl super::driver::chunk::ChunkDevice for CardChunkDevice {
             .write_at(self.step.stream, range.offset(), &f32_le_bytes(rows))
     }
 
-    /// The PLE projections stage their own embedding; the chunk start needs no copy of it.
-    fn write_chunk_ple(&mut self, _rows: &[f32]) -> Result<(), EngError> {
-        Ok(())
+    /// The device route stages the chunk's embeddings and queues both projections right away:
+    /// they depend only on the embeddings, so the two launches ride ahead of the layers and are
+    /// done when `ple_project_chunk` reads them back. Without the route there is nothing to
+    /// stage; the projections run on the host inside `ple_update`.
+    fn write_chunk_ple(&mut self, rows: &[f32]) -> Result<()> {
+        let Some(ple) = self.ple.as_mut() else {
+            return Ok(());
+        };
+        let m = self.m;
+        ple.enqueue_chunk(&self.step.ctx, &self.step.stream, rows, m)
+    }
+
+    fn ple_project_chunk(&mut self) -> Result<Vec<PleKeyValue>> {
+        let m = self.m;
+        let Some(ple) = self.ple.as_ref() else {
+            return Err(EngError::Backend {
+                operation: "flash_next_cuda_chunk",
+                message: "the PLE device route was armed but this device has no projections"
+                    .to_string(),
+            });
+        };
+        ple.collect_chunk(&self.step.stream, m)
     }
 
     fn begin_chunk(&mut self) -> Result<(), EngError> {

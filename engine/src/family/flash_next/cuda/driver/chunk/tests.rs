@@ -7,6 +7,7 @@ use crate::{
     family::{flash_next::cuda::driver::fakes, session::TokenStepper},
 };
 use fakes::{FakeChunkDevice, FakeFeeds, LOGITS, SAMPLER_VOCAB, STREAM, shape};
+use crate::family::flash_next::cuda::ple_feed::PleKeyValue;
 
 fn chunk_driver() -> ChunkDriver<FakeChunkDevice, FakeFeeds> {
     ChunkDriver::new(FakeChunkDevice::default(), FakeFeeds::default(), shape()).unwrap()
@@ -54,6 +55,48 @@ fn the_logits_chunk_runs_the_head_over_the_last_row() {
     for (i, value) in row.iter().enumerate() {
         assert_eq!(*value, 18.5 * i as f32);
     }
+}
+
+#[test]
+fn the_device_ple_route_projects_on_the_device_and_hands_the_pairs_over() {
+    let mut driver = chunk_driver();
+    driver.ple_device = true;
+    driver.device_mut().ple_pairs = Some(
+        (0..2)
+            .map(|r| PleKeyValue {
+                keys: vec![r as f32; STREAM],
+                value: vec![r as f32; 1],
+            })
+            .collect(),
+    );
+    driver.run_chunk(&[3, 4], false).unwrap();
+    assert!(
+        driver
+            .device()
+            .log
+            .iter()
+            .any(|call| call.starts_with("chunk_ple_project"))
+    );
+    // The pairs reach the step in row order.
+    assert_eq!(driver.feeds().pairs, [0.0, 1.0]);
+    // The plain route never projects on the device.
+    let mut plain = chunk_driver();
+    plain.run_chunk(&[3, 4], false).unwrap();
+    assert!(!plain
+        .device()
+        .log
+        .iter()
+        .any(|call| call.starts_with("chunk_ple_project")));
+    assert!(plain.feeds().pairs.is_empty());
+}
+
+#[test]
+fn the_device_route_without_a_projection_is_refused_and_poisons() {
+    let mut driver = chunk_driver();
+    driver.ple_device = true;
+    // The fake has no pairs, so `ple_project_chunk` fails; the driver must poison, not limp on.
+    assert!(driver.run_chunk(&[3], false).is_err());
+    assert!(driver.feed(4).is_err());
 }
 
 #[test]

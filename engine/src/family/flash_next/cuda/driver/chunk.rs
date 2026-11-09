@@ -31,7 +31,9 @@ use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
 use std::time::Instant;
 
 use super::{DriverShape, TokenFeeds};
-use crate::{EngError, family::session::TokenStepper};
+use crate::EngError;
+use crate::family::flash_next::cuda::ple_feed::PleKeyValue;
+use crate::family::session::TokenStepper;
 
 type Result<T> = std::result::Result<T, EngError>;
 
@@ -112,6 +114,15 @@ pub(in crate::family::flash_next::cuda) trait ChunkDevice {
     fn write_chunk_stream(&mut self, rows: &[f32]) -> Result<()>;
     /// Writes the `m` PLE embedding rows (`m * ple_embed`).
     fn write_chunk_ple(&mut self, rows: &[f32]) -> Result<()>;
+    /// Runs the chunk's PLE projections on the device and returns each row's keys and value,
+    /// behind the queued layers. Only a device with the PLE projections answers; the default
+    /// refuses so a driver with the device route on cannot silently fall back to the host
+    /// projections.
+    fn ple_project_chunk(&mut self) -> Result<Vec<PleKeyValue>> {
+        Err(EngError::BadRequest(
+            "this device has no PLE projection route".to_string(),
+        ))
+    }
     /// Clears the per-chunk flags (the EXL3 flag and the status word). Called once per chunk,
     /// after the start is written and before the first layer.
     fn begin_chunk(&mut self) -> Result<()>;
@@ -157,6 +168,8 @@ pub(in crate::family::flash_next::cuda) struct ChunkDriver<D: ChunkDevice, F: To
     poisoned: bool,
     /// The most rows one device chunk runs; the caller sets it from the memory plan.
     pub(in crate::family::flash_next::cuda) chunk_cap: usize,
+    /// Whether the PLE projections run on the device (`ChunkDevice::ple_project_chunk`).
+    pub(in crate::family::flash_next::cuda) ple_device: bool,
 }
 
 impl<D: ChunkDevice, F: TokenFeeds> ChunkDriver<D, F> {
@@ -178,6 +191,7 @@ impl<D: ChunkDevice, F: TokenFeeds> ChunkDriver<D, F> {
             pos: 0,
             poisoned: false,
             chunk_cap: 1,
+            ple_device: false,
         })
     }
 
@@ -188,6 +202,11 @@ impl<D: ChunkDevice, F: TokenFeeds> ChunkDriver<D, F> {
 
     pub(in crate::family::flash_next::cuda) fn device(&self) -> &D {
         &self.device
+    }
+
+    /// The device for tests that arm its fakes before a run.
+    pub(in crate::family::flash_next::cuda) fn device_mut(&mut self) -> &mut D {
+        &mut self.device
     }
 
     pub(super) fn feeds(&self) -> &F {
@@ -294,7 +313,18 @@ impl<D: ChunkDevice, F: TokenFeeds> ChunkDriver<D, F> {
                 ),
             });
         }
+        // The device route projects the chunk's embeddings on the card (one m-row launch pair)
+        // and hands each row's keys/value to the host step, which then runs unchanged; the host
+        // route runs its own projections inside `ple_update`.
+        let pairs = if self.ple_device {
+            Some(self.device.ple_project_chunk()?)
+        } else {
+            None
+        };
         for (i, token) in tokens.iter().enumerate() {
+            if let Some(pair) = pairs.as_ref().and_then(|p| p.get(i)) {
+                self.feeds.set_ple_pair(pair.clone())?;
+            }
             let update = self
                 .feeds
                 .ple_update(*token, &rows[i * width..(i + 1) * width])?;

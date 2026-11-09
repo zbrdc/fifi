@@ -59,6 +59,20 @@ fn whole_with_len(ckpt: &StreamedCheckpoint, key: &str, len: usize) -> Result<Te
     }
 }
 
+/// Reads a tensor's stored dtype and bytes without conversion: the device PLE upload wants the
+/// pack's F16/BF16 exactly as stored.
+pub(crate) fn stored_bytes(
+    ckpt: &StreamedCheckpoint,
+    key: &str,
+    len: usize,
+) -> Result<(Dtype, Vec<u8>), EngError> {
+    let tensor = whole_with_len(ckpt, key, len)?;
+    let bytes = tensor
+        .host_bytes()
+        .ok_or_else(|| EngError::Checkpoint(format!("tensor {key} has no host bytes")))?;
+    Ok((tensor.dtype(), bytes.to_vec()))
+}
+
 /// Reads a BF16, F16 or F32 tensor of `len` elements as host f32 values (the EXL3 pack stores
 /// the router and the shared-expert gate in F16).
 pub(crate) fn host_f32(

@@ -33,6 +33,7 @@ use std::{
 };
 
 use super::feeds::{StartShape, StartSink, write_start};
+use super::ple_feed::PleKeyValue;
 use crate::{EngError, family::session::TokenStepper};
 
 type Result<T> = std::result::Result<T, EngError>;
@@ -98,6 +99,13 @@ pub(super) trait TokenFeeds {
     /// The PLE update for `token` given the stream at the PLE layer's input (`branches * hidden`).
     /// Advances the PLE history and ring: called once per fed token, after [`Self::begin`].
     fn ple_update(&mut self, token: u32, stream: &[f32]) -> Result<Vec<f32>>;
+    /// Installs the key/value pair a device-projected row returns, for the next `ple_update`.
+    /// The default refuses: only the device PLE route takes pairs.
+    fn set_ple_pair(&mut self, _pair: PleKeyValue) -> Result<()> {
+        Err(EngError::BadRequest(
+            "this feed does not take device PLE pairs".to_string(),
+        ))
+    }
     /// Forgets the history and the ring: a new sequence.
     fn reset(&mut self);
 }

@@ -21,6 +21,7 @@
 use std::{
     cell::Cell,
     path::Path,
+    rc::Rc,
     sync::{
         Arc,
         atomic::{AtomicBool, Ordering},
@@ -39,10 +40,11 @@ use super::{
     driver::{DriverShape, StepperPositions, TokenDriver, TokenTimes},
     executor::{CudaRules, FlashCudaExecutor},
     feeds::StartShape,
+    feeds::device::DevicePle,
     load::{TrunkList, upload::trunk_weights},
     moe_block::{SplitMoe, SplitMoeTrunk},
     pack_feeds::PackFeeds,
-    ple_feed::{NgramRows, PleFeed, PleVectors},
+    ple_feed::{FixedProjection, NgramRows, PleFeed, PleVectors},
     step::{FlashStep, SplitMoeAt},
 };
 use crate::{
@@ -84,6 +86,14 @@ fn ple_threads() -> usize {
         .and_then(|text| text.parse::<usize>().ok())
         .map(|n| n.clamp(1, 128))
         .unwrap_or(8)
+}
+
+/// Whether the chunked prefill runs its two PLE projections on the card (the staged
+/// `dense_gemv` pair): `INFERENCE_FLASH_NEXT_PLE_DEVICE=1` opts in, the default keeps the host
+/// matvecs. The card reads the stored F16/BF16 weights once per chunk instead of the host's
+/// 131 MB DRAM sweep per token; the rest of the PLE block stays on the host.
+fn ple_device() -> bool {
+    std::env::var("INFERENCE_FLASH_NEXT_PLE_DEVICE").is_ok_and(|text| text == "1")
 }
 
 /// The id-indexed options Flash-Next serves its routed experts with: the DP4A decode of codebook 2
@@ -668,12 +678,39 @@ pub(super) fn build_driver(
         &model.ple,
         ple_threads(),
     )?;
-    let ple = PleFeed::new(
-        model.ple,
-        NgramRows::new(ngram)?,
-        vectors,
-        Box::new(projection),
-    );
+    let ngram_rows = NgramRows::new(ngram)?;
+    // The device route (chunked prefill only): the projections upload to the card and the feed
+    // takes precomputed pairs; the host projection still backs the flag-off path.
+    let device_ple = match ple_device().then_some(rows > 1) {
+        Some(true) => {
+            stage("uploading the PLE projections");
+            let dims = model.ple.dims();
+            let (dtype, key, value) =
+                PleVectors::raw_projections(&checkpoint.source, model.ple_layer, &model.ple)?;
+            Some(DevicePle::upload(
+                &ctx,
+                dtype,
+                &key,
+                &value,
+                (dims.hidden * dims.branches) as usize,
+                dims.hidden as usize,
+                model.ple.embed(),
+                rows,
+            )?)
+        }
+        Some(false) => {
+            eprintln!(
+                "flash-next cuda: INFERENCE_FLASH_NEXT_PLE_DEVICE ignored (prefill rows = 1)"
+            );
+            None
+        }
+        None => None,
+    };
+    let ple = if device_ple.is_some() {
+        PleFeed::with_fixed(model.ple, ngram_rows, vectors, Rc::new(FixedProjection::new()))
+    } else {
+        PleFeed::new(model.ple, ngram_rows, vectors, Box::new(projection))
+    };
     let hidden = model.hyper.hidden();
     let branches = model.hyper.branches();
     let ple_embed = model.ple.embed();
@@ -689,11 +726,19 @@ pub(super) fn build_driver(
         },
     };
     let driver = if rows > 1 {
-        let mut chunked = ChunkDriver::new(CardChunkDevice::new(step, moe), feeds, shape)?;
+        let ple_route = device_ple;
+        let mut chunked =
+            ChunkDriver::new(CardChunkDevice::with_ple(step, moe, ple_route), feeds, shape)?;
         chunked.chunk_cap = rows;
+        chunked.ple_device = ple_route.is_some();
         eprintln!(
-            "flash-next cuda: ready in {:.1} s, prefill chunks of {rows} rows",
-            began.elapsed().as_secs_f64()
+            "flash-next cuda: ready in {:.1} s, prefill chunks of {rows} rows{}",
+            began.elapsed().as_secs_f64(),
+            if chunked.ple_device {
+                ", PLE projections on the card"
+            } else {
+                ""
+            }
         );
         StepDriver::Chunk(chunked)
     } else {

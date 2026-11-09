@@ -82,6 +82,7 @@ impl DevicePle {
         width: usize,
         hidden: usize,
         embed: usize,
+        rows_max: usize,
     ) -> Result<Self, EngError> {
         let dtype = match stored {
             Dtype::F16 => DenseDtype::F16,
@@ -116,9 +117,9 @@ impl DevicePle {
         Ok(Self {
             key_weight: place(key)?,
             value_weight: place(value)?,
-            embedding: context.allocate(embed * 4)?,
-            keys: context.allocate(width * 4)?,
-            value: context.allocate(hidden * 4)?,
+            embedding: context.allocate(rows_max * embed * 4)?,
+            keys: context.allocate(rows_max * width * 4)?,
+            value: context.allocate(rows_max * hidden * 4)?,
             dtype,
             width,
             hidden,
@@ -129,6 +130,11 @@ impl DevicePle {
     /// Device bytes held by this object.
     pub(in crate::family) fn device_bytes(&self) -> usize {
         (self.width + self.hidden) * self.embed * 2 + (self.embed + self.width + self.hidden) * 4
+    }
+
+    /// The most rows one [`Self::enqueue_chunk`] takes.
+    pub(in crate::family) fn rows_max(&self) -> usize {
+        self.keys.len() / (self.width * 4)
     }
 
     /// Writes `embedding` and queues both projections on `stream`. The results stay on the device
@@ -190,6 +196,68 @@ impl DevicePle {
     ) -> Result<PleKeyValue, EngError> {
         self.enqueue(context, stream, embedding)?;
         self.collect(stream)
+    }
+
+    /// Writes the `m` embeddings of one chunk (already scaled) and queues both projections as
+    /// one `m`-row launch each, so the weights stream once for the whole chunk instead of once
+    /// per row. The results stay on the device until [`Self::collect_chunk`].
+    pub(in crate::family) fn enqueue_chunk(
+        &mut self,
+        context: &CudaContext,
+        stream: &DeviceStream,
+        embeddings: &[f32],
+        m: usize,
+    ) -> Result<(), EngError> {
+        if embeddings.len() != m * self.embed {
+            return Err(EngError::BadRequest(format!(
+                "the PLE chunk holds {} embedding values for {m} rows of {}",
+                embeddings.len(),
+                self.embed
+            )));
+        }
+        if m > self.rows_max() {
+            return Err(EngError::BadRequest(format!(
+                "a PLE chunk of {m} rows exceeds the {} the device buffers hold",
+                self.rows_max()
+            )));
+        }
+        self.embedding.write_at(stream, 0, &f32_bytes(embeddings))?;
+        for (rows, weight, y, y_len) in [
+            (self.width, &self.key_weight, &self.keys, m * self.width),
+            (self.hidden, &self.value_weight, &self.value, m * self.hidden),
+        ] {
+            context.dense_gemv(
+                stream,
+                DenseGemvCall {
+                    shape: DenseGemvShape::packed(m, rows, self.embed),
+                    dtype: self.dtype,
+                    w: weight.range(0, rows * self.embed * 2)?,
+                    x: self.embedding.range(0, m * self.embed * 4)?,
+                    y: y.range(0, y_len * 4)?,
+                },
+            )?;
+        }
+        Ok(())
+    }
+
+    /// Reads the key and value rows of the last [`Self::enqueue_chunk`], behind the queued work.
+    pub(in crate::family) fn collect_chunk(
+        &self,
+        stream: &DeviceStream,
+        m: usize,
+    ) -> Result<Vec<PleKeyValue>, EngError> {
+        let mut key_bytes = vec![0u8; m * self.width * 4];
+        let mut value_bytes = vec![0u8; m * self.hidden * 4];
+        self.keys.read_at(stream, 0, &mut key_bytes)?;
+        self.value.read_at(stream, 0, &mut value_bytes)?;
+        let keys = f32_values(&key_bytes);
+        let values = f32_values(&value_bytes);
+        Ok((0..m)
+            .map(|r| PleKeyValue {
+                keys: keys[r * self.width..(r + 1) * self.width].to_vec(),
+                value: values[r * self.hidden..(r + 1) * self.hidden].to_vec(),
+            })
+            .collect())
     }
 }
 

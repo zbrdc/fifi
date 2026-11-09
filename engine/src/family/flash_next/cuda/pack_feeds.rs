@@ -12,7 +12,7 @@
 use super::{
     driver::{StartVectors, TokenFeeds},
     embedding::stream_row,
-    ple_feed::{Gathered, PleFeed},
+    ple_feed::{Gathered, PleFeed, PleKeyValue},
 };
 use crate::{EngError, weights::StreamedCheckpoint};
 
@@ -93,6 +93,10 @@ impl TokenFeeds for PackFeeds {
     fn ple_update(&mut self, token: u32, stream: &[f32]) -> Result<Vec<f32>, EngError> {
         let rows = take_pending(&mut self.pending, token)?;
         self.ple.update(token, &rows, stream)
+    }
+
+    fn set_ple_pair(&mut self, pair: PleKeyValue) -> Result<(), EngError> {
+        self.ple.set_fixed(pair)
     }
 
     fn reset(&mut self) {

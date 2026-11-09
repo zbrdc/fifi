@@ -7,6 +7,7 @@
 use std::ops::Range;
 
 use super::{DriverShape, StartVectors, TokenDevice, TokenFeeds, chunk::ChunkDevice};
+use crate::family::flash_next::cuda::ple_feed::PleKeyValue;
 use crate::{
     EngError,
     family::flash_next::cuda::feeds::{StartShape, StartSink},
@@ -127,6 +128,8 @@ pub(in crate::family::flash_next::cuda) struct FakeChunkDevice {
     /// Every call, in order.
     pub(in crate::family::flash_next::cuda) log: Vec<String>,
     pub(in crate::family::flash_next::cuda) stream: Vec<f32>,
+    /// The device PLE pairs `ple_project_chunk` returns, one per row.
+    pub(in crate::family::flash_next::cuda) ple_pairs: Option<Vec<PleKeyValue>>,
     /// The call that fails (its log name), once.
     pub(in crate::family::flash_next::cuda) fail: Option<&'static str>,
     pub(in crate::family::flash_next::cuda) resets: usize,
@@ -159,6 +162,13 @@ impl ChunkDevice for FakeChunkDevice {
 
     fn write_chunk_ple(&mut self, _rows: &[f32]) -> Result<(), EngError> {
         self.step("chunk_ple", String::new())
+    }
+
+    fn ple_project_chunk(&mut self) -> Result<Vec<PleKeyValue>, EngError> {
+        self.step("chunk_ple_project", String::new())?;
+        self.ple_pairs
+            .clone()
+            .ok_or_else(|| EngError::BadRequest("the fake has no PLE pairs".to_string()))
     }
 
     fn begin_chunk(&mut self) -> Result<(), EngError> {
@@ -217,6 +227,8 @@ impl ChunkDevice for FakeChunkDevice {
 pub(in crate::family::flash_next::cuda) struct FakeFeeds {
     /// The updates asked for: the token and the stream it saw.
     pub(in crate::family::flash_next::cuda) updates: Vec<(u32, Vec<f32>)>,
+    /// The first key of every device pair set (the device route hands them over in order).
+    pub(in crate::family::flash_next::cuda) pairs: Vec<f32>,
     pub(in crate::family::flash_next::cuda) resets: usize,
     /// The token whose `begin` fails.
     pub(in crate::family::flash_next::cuda) fail_begin: Option<u32>,
@@ -243,6 +255,11 @@ impl TokenFeeds for FakeFeeds {
         }
         self.updates.push((token, stream.to_vec()));
         Ok(vec![0.5; self.update_width.unwrap_or(stream.len())])
+    }
+
+    fn set_ple_pair(&mut self, pair: PleKeyValue) -> Result<(), EngError> {
+        self.pairs.push(pair.keys.first().copied().unwrap_or(f32::NAN));
+        Ok(())
     }
 
     fn reset(&mut self) {
