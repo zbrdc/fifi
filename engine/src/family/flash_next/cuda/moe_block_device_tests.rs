@@ -653,9 +653,13 @@ fn a_chunk_over_the_prefill_ring_matches_the_all_resident_block() {
     assert!(slots >= streamed, "the ring holds one full streamed layer");
     split.begin_prefill();
 
-    for (bank_layer, arm) in arms.iter().enumerate() {
-        for run in 0..2 {
-            split.begin_chunk();
+    // One chunk per run, every layer of it in order — the driver cadence the ring's free
+    // cursor assumes.
+    for run in 0..2 {
+        for (bank_layer, arm) in arms.iter().enumerate() {
+            if bank_layer == 0 {
+                split.begin_chunk();
+            }
             let rig = RigRows::new(&projector, &chunk, &arm.row_inputs).expect("rig");
             let before = split.bank().state().stats().misses;
             split

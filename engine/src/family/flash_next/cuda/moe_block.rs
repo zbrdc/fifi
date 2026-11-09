@@ -264,6 +264,44 @@ impl SlotSpans {
                 .map_err(|_| refuse("three parts expected".into()))?,
         })
     }
+
+    /// The same record layout spanning `slots` slots instead of this one's — the prefill
+    /// ring's staging holds a different record count than the bank's slot row.
+    pub(super) fn for_slots(&self, slots: usize) -> Result<Self, EngError> {
+        let grow = slots
+            .checked_sub(self.slots)
+            .ok_or_else(|| refuse("fewer slots than the spans cover".into()))?;
+        let scale_grow = grow
+            .checked_mul(self.scale_stride * 4)
+            .ok_or_else(|| refuse("the span overflows".into()))?;
+        let trellis_grow = grow
+            .checked_mul(self.trellis_stride)
+            .ok_or_else(|| refuse("the span overflows".into()))?;
+        let mut parts = self.parts.clone();
+        for part in &mut parts {
+            part.trellis.end = part
+                .trellis
+                .end
+                .checked_add(trellis_grow)
+                .ok_or_else(|| refuse("the span overflows".into()))?;
+            part.suh.end = part
+                .suh
+                .end
+                .checked_add(scale_grow)
+                .ok_or_else(|| refuse("the span overflows".into()))?;
+            part.svh.end = part
+                .svh
+                .end
+                .checked_add(scale_grow)
+                .ok_or_else(|| refuse("the span overflows".into()))?;
+        }
+        Ok(Self {
+            slots,
+            trellis_stride: self.trellis_stride,
+            scale_stride: self.scale_stride,
+            parts,
+        })
+    }
 }
 
 /// The first pick whose weight is +0.0 (a filler pick) and whose down row holds an infinity or a NaN:
@@ -395,6 +433,8 @@ mod device {
         pick: u32,
         x: DeviceRange<'a>,
         out: DeviceRange<'a>,
+        /// True when this pick's weights live in the prefill ring, not the bank.
+        ring: bool,
     }
 
     fn whole(buffer: &DeviceBuffer) -> Result<DeviceRange<'_>, EngError> {
@@ -902,6 +942,7 @@ mod device {
                             pick: (r * k + pick) as u32,
                             x: row(&bufs.route.norm_row, h * F32, r)?,
                             out: row(&bufs.expert_gu, i * F32, 2 * (r * k + pick) + part)?,
+                            ring: false,
                         });
                     }
                     down.push(Item {
@@ -909,6 +950,7 @@ mod device {
                         pick: (r * k + pick) as u32,
                         x: row(&bufs.expert_act, i * F32, r * k + pick)?,
                         out: row(&bufs.expert_down, h * F32, r * k + pick)?,
+                        ring: false,
                     });
                 }
             }
@@ -1106,63 +1148,64 @@ mod device {
             let picks = self.route_rows(launch, layer, bufs, dims)?;
             let slot_row: Vec<i32> = self.bank.slot_row(layer)?.to_vec();
 
-            // Host classification against the frozen row: bank picks keep their bank slot id,
-            // ring picks get their ring slot id; the combine weights are the router's own.
-            let mut bank_ids = vec![0i32; m * k];
-            let mut ring_ids = vec![0i32; m * k];
+            // Host classification against the frozen row: every pick keeps a slot id in its
+            // own source — the bank's slot for a resident pick, the ring's slot otherwise.
+            // One ids array serves both: the indexed launch reads `ids[pick]` against the
+            // members of the item's own source (the kernel skips values out of range).
+            let mut ids = vec![0i32; m * k];
             let mut weights = vec![0f32; m * k];
-            let mut banked = [false; 2];
+            let mut is_ring = vec![false; m * k];
             for r in 0..m {
-                let (ids, row_weights) = &picks[r];
-                classify_picks(&slot_row, geometry.slots, ids, row_weights)?;
-                for (p, &id) in ids.iter().enumerate() {
+                let (row_ids, row_weights) = &picks[r];
+                classify_picks(&slot_row, geometry.slots, row_ids, row_weights)?;
+                for (p, &id) in row_ids.iter().enumerate() {
                     let at = r * k + p;
                     weights[at] = row_weights[p];
                     match slot_row[id as usize] {
-                        slot if slot >= 0 => {
-                            bank_ids[at] = slot;
-                            banked[0] = true;
-                        }
+                        slot if slot >= 0 => ids[at] = slot,
                         _ => {
-                            let slot = self.ring.as_ref().and_then(|ring| ring.slot_of(layer, id as u16)).ok_or_else(|| refuse(format!(
-                                "expert {id} of layer {layer} has neither a bank slot nor a ring slot"
-                            )))?;
-                            ring_ids[at] = i32::from(slot);
-                            banked[1] = true;
+                            let slot = self
+                                .ring
+                                .as_ref()
+                                .and_then(|ring| ring.slot_of(layer, id as u16))
+                                .ok_or_else(|| {
+                                    refuse(format!(
+                                        "expert {id} of layer {layer} has neither a bank slot nor a ring slot"
+                                    ))
+                                })?;
+                            ids[at] = i32::from(slot);
+                            is_ring[at] = true;
                         }
                     }
                 }
             }
-            scratch.write_at(stream, sc.slot_ids, &le_i32(&bank_ids))?;
-            scratch.write_at(stream, sc.miss_ids, &le_i32(&ring_ids))?;
+            scratch.write_at(stream, sc.slot_ids, &le_i32(&ids))?;
             scratch.write_at(stream, sc.weights, &le_f32(&weights))?;
+            let ids_range = scratch.range(sc.slot_ids, m * k * I32)?;
 
-            // The flat grouped passes, one per source; each list's items index its own ids row.
-            let (mut gu, mut down) = (Vec::with_capacity(m * k), Vec::with_capacity(m * k));
-            let (mut ring_gu, mut ring_down) =
-                (Vec::with_capacity(m * k), Vec::with_capacity(m * k));
-            let bank_ids_range = scratch.range(sc.slot_ids, m * k * I32)?;
-            let ring_ids_range = scratch.range(sc.miss_ids, m * k * I32)?;
+            // The flat launches of both passes: every pick rides the list in `r * k + p`
+            // order (the indexed launch requires contiguous out rows), each item carrying
+            // its source.
+            let mut gu = Vec::with_capacity(2 * m * k);
+            let mut down = Vec::with_capacity(m * k);
             for r in 0..m {
                 for pick in 0..k {
-                    let (gu_list, down_list) = if slot_row[picks[r].0[pick] as usize] >= 0 {
-                        (&mut gu, &mut down)
-                    } else {
-                        (&mut ring_gu, &mut ring_down)
-                    };
+                    let at = r * k + pick;
                     for part in 0..2usize {
-                        gu_list.push(Item {
+                        gu.push(Item {
                             part,
-                            pick: (r * k + pick) as u32,
+                            pick: at as u32,
                             x: row(&bufs.route.norm_row, h * F32, r)?,
-                            out: row(&bufs.expert_gu, i * F32, 2 * (r * k + pick) + part)?,
+                            out: row(&bufs.expert_gu, i * F32, 2 * at + part)?,
+                            ring: is_ring[at],
                         });
                     }
-                    down_list.push(Item {
+                    down.push(Item {
                         part: 2,
-                        pick: (r * k + pick) as u32,
-                        x: row(&bufs.expert_act, i * F32, r * k + pick)?,
-                        out: row(&bufs.expert_down, h * F32, r * k + pick)?,
+                        pick: at as u32,
+                        x: row(&bufs.expert_act, i * F32, at)?,
+                        out: row(&bufs.expert_down, h * F32, at)?,
+                        ring: is_ring[at],
                     });
                 }
             }
@@ -1176,31 +1219,9 @@ mod device {
                 .map_err(|_| refuse("the bank has too many slots".into()))?;
             let ring_members =
                 u32::try_from(ring_slots).map_err(|_| refuse("the ring is too large".into()))?;
-            if banked[0] {
-                self.grouped_at(
-                    launch,
-                    &gu,
-                    self.bank.slots(layer)?,
-                    bank_ids_range,
-                    members,
-                    &bufs.scratch,
-                )?;
-            }
-            if banked[1] {
-                let weights = self
-                    .ring
-                    .as_ref()
-                    .expect("the ring branch is taken only with a ring")
-                    .slots();
-                self.grouped_at(
-                    launch,
-                    &ring_gu,
-                    weights,
-                    ring_ids_range,
-                    ring_members,
-                    &bufs.scratch,
-                )?;
-            }
+            let bank = (self.bank.slots(layer)?, members);
+            let ring = self.ring.as_ref().map(|ring| (ring.slots(), ring_members));
+            self.grouped_at(launch, &gu, bank, ring, ids_range, &bufs.scratch)?;
             ctx.swiglu_rows(
                 stream,
                 SwigluRowsCall {
@@ -1215,31 +1236,7 @@ mod device {
                     act: bufs.expert_act,
                 },
             )?;
-            if banked[0] {
-                self.grouped_at(
-                    launch,
-                    &down,
-                    self.bank.slots(layer)?,
-                    bank_ids_range,
-                    members,
-                    &bufs.scratch,
-                )?;
-            }
-            if banked[1] {
-                let weights = self
-                    .ring
-                    .as_ref()
-                    .expect("the ring branch is taken only with a ring")
-                    .slots();
-                self.grouped_at(
-                    launch,
-                    &ring_down,
-                    weights,
-                    ring_ids_range,
-                    ring_members,
-                    &bufs.scratch,
-                )?;
-            }
+            self.grouped_at(launch, &down, bank, ring, ids_range, &bufs.scratch)?;
 
             // The shared expert of every row, then the one combine over every pick.
             shared_rows(
@@ -1292,19 +1289,32 @@ mod device {
             &'a self,
             launch: &Launch<'_>,
             items: &[Item<'a>],
-            weights: &DeviceBuffer,
+            bank: (&DeviceBuffer, u32),
+            ring: Option<(&DeviceBuffer, u32)>,
             ids: DeviceRange<'_>,
-            members: u32,
             scratch: &Scratch<'a>,
         ) -> Result<(), EngError> {
             let first = items
                 .first()
                 .ok_or_else(|| refuse("an indexed launch without pairs".into()))?;
             let [k, n] = self.spans.parts[first.part].shape;
+            let ring_spans = ring
+                .map(|(_, members)| self.spans.for_slots(members as usize))
+                .transpose()?;
             for chunk in items.chunks(launch.ctx.exl3_indexed_capacity()) {
                 let mut calls = Vec::with_capacity(chunk.len());
                 for (index, item) in chunk.iter().enumerate() {
-                    let span = &self.spans.parts[item.part];
+                    // The bank and the ring staging are both record-strided; the item's
+                    // source picks its weights, members and the spans over them.
+                    let (weights, members, spans) = if item.ring {
+                        let ((buffer, members), spans) = ring
+                            .zip(ring_spans.as_ref())
+                            .ok_or_else(|| refuse("a ring item without a ring".into()))?;
+                        (buffer, members, spans)
+                    } else {
+                        (bank.0, bank.1, &self.spans)
+                    };
+                    let span = &spans.parts[item.part];
                     if span.shape != [k, n] {
                         return Err(refuse("a launch group mixes matrix shapes".into()));
                     }
@@ -1358,9 +1368,9 @@ mod device {
             self.grouped_at(
                 launch,
                 items,
-                self.bank.slots(layer)?,
+                (self.bank.slots(layer)?, members),
+                None,
                 ids,
-                members,
                 scratch,
             )
         }
@@ -1383,6 +1393,7 @@ mod device {
                         pick: pick as u32,
                         x: bufs.route.norm_row,
                         out: row(&bufs.expert_gu, i * F32, 2 * pick + part)?,
+                        ring: false,
                     });
                 }
             }
@@ -1408,6 +1419,7 @@ mod device {
                     pick: pick as u32,
                     x: row(&bufs.expert_act, i * F32, pick)?,
                     out: row(&bufs.expert_down, h * F32, pick)?,
+                    ring: false,
                 });
             }
             self.grouped(launch, pass.layer, &items, (pass.ids, &bufs.scratch))?;
