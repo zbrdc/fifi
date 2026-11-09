@@ -1170,6 +1170,17 @@ mod device {
             let geometry = *self.bank.geometry();
             let scratch = &self.scratch;
 
+            // The profiler's ring taps walk this body in call order; the route read-back is
+            // the one drain of the layer, so it also absorbs the prior layer's queued compute.
+            let profile = crate::family::flash_next::cuda::driver::chunk::prof::on();
+            let mut t = std::time::Instant::now();
+            let mut tick = |slot: usize| {
+                if profile {
+                    crate::family::flash_next::cuda::driver::chunk::prof::add(slot, t.elapsed());
+                    t = std::time::Instant::now();
+                }
+            };
+
             // The next layer's experts stream now, behind this half's compute.
             let ring_slots = self
                 .ring
@@ -1180,9 +1191,11 @@ mod device {
                 .as_mut()
                 .expect("the ring branch is taken only with a ring")
                 .issue_through(ctx, &mut self.bank, layer + 1)?;
+            tick(22);
 
             let picks = self.route_rows(launch, layer, bufs, dims)?;
             let slot_row: Vec<i32> = self.bank.slot_row(layer)?.to_vec();
+            tick(23);
 
             // Host classification against the frozen row: every pick keeps a slot id in its
             // own source — the bank's slot for a resident pick, the ring's slot otherwise.
@@ -1218,6 +1231,7 @@ mod device {
             scratch.write_at(stream, sc.slot_ids, &le_i32(&ids))?;
             scratch.write_at(stream, sc.weights, &le_f32(&weights))?;
             let ids_range = scratch.range(sc.slot_ids, m * k * I32)?;
+            tick(24);
 
             // The flat launches of both passes: every pick rides the list in `r * k + p`
             // order (the indexed launch requires contiguous out rows), each item carrying
@@ -1258,6 +1272,7 @@ mod device {
             let bank = (self.bank.slots(layer)?, members);
             let ring = self.ring.as_ref().map(|ring| (ring.slots(), ring_members));
             self.grouped_at(launch, &gu, bank, ring, ids_range, &bufs.scratch)?;
+            tick(25);
             ctx.swiglu_rows(
                 stream,
                 SwigluRowsCall {
@@ -1273,6 +1288,7 @@ mod device {
                 },
             )?;
             self.grouped_at(launch, &down, bank, ring, ids_range, &bufs.scratch)?;
+            tick(26);
 
             // The shared expert of every row, then the one combine over every pick.
             let shared_weights = SharedWeights {
@@ -1322,7 +1338,9 @@ mod device {
             self.ring
                 .as_mut()
                 .expect("the ring branch is taken only with a ring")
-                .free_layer(stream, layer)
+                .free_layer(stream, layer)?;
+            tick(27);
+            Ok(())
         }
 
         /// One id-indexed launch group over `weights` (a bank layer or the ring, both laid out

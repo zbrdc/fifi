@@ -42,8 +42,10 @@ type Result<T> = std::result::Result<T, EngError>;
 pub(in crate::family::flash_next) mod prof {
     use super::*;
 
-    /// The phases of `queue` plus the inside of one layer, in call order.
-    pub(super) const NAMES: [&str; 22] = [
+    /// The phases of `queue` plus the inside of one layer, in call order. Slots 22-27 walk the
+    /// interior of the ring rows-block, which the one-row block's taps (slots 11-13) never
+    /// reach: the ring issues no admit and no miss pass.
+    pub(super) const NAMES: [&str; 28] = [
         "begin(host feeds)",
         "start writes",
         "layers<PLE",
@@ -66,8 +68,14 @@ pub(in crate::family::flash_next) mod prof {
         "      ple branch norms",
         "      ple conv",
         "      ple ring",
+        "  ring issue",
+        "  ring route+drain",
+        "  ring classify+ids",
+        "  ring wait+gu",
+        "  ring swiglu+down",
+        "  ring shared+combine",
     ];
-    pub(super) static NS: [AtomicU64; 22] = [const { AtomicU64::new(0) }; 22];
+    pub(super) static NS: [AtomicU64; 28] = [const { AtomicU64::new(0) }; 28];
     pub(super) static ROWS: AtomicU64 = AtomicU64::new(0);
     static ON: OnceLock<bool> = OnceLock::new();
 
