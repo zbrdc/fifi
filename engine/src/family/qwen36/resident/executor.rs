@@ -295,6 +295,15 @@ fn window_taps_on() -> bool {
     std::env::var_os("Q36_WINDOW_TAPS").is_some_and(|v| v == "1")
 }
 
+/// Arms the step-window verify path (`Q36_SPEC_STEP_WINDOW=1`): each window row runs as ONE
+/// compiled `Logits` step with a shared-handle checkpoint before every row, and commit adopts
+/// the checkpoint at the kept boundary — no kept-prefix replay. Default off (the chunk window
+/// stays the reference). A checkpoint-charge refusal falls back to the chunk path.
+fn step_window() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("Q36_SPEC_STEP_WINDOW").is_some_and(|v| v == "1"))
+}
+
 /// The verify-window model of one speculative decode call: the solo step plus the pending window.
 /// `run_window` feeds every row as ONE chunk (`StepMode::Window`), so a window of `k + 1` rows
 /// costs one chunk pass, not `k + 1` steps. The rollback is the shared-handle snapshot of
@@ -305,7 +314,11 @@ fn window_taps_on() -> bool {
 struct Q36WindowStep<'a> {
     step: Q36Step<'a>,
     context_limit: usize,
+    /// The single snapshot of the chunk window path.
     snapshot: Option<ResidentSnapshot>,
+    /// Marks a window that ran the step path (`Q36_SPEC_STEP_WINDOW`): commit replays the
+    /// kept rows as compiled one-row steps instead of the eager Prompt chunk.
+    stepped_window: bool,
     inputs: Vec<u32>,
     logits: Vec<Vec<f32>>,
 }
@@ -334,22 +347,17 @@ impl TokenStepper for Q36WindowStep<'_> {
     }
 }
 
-impl WindowModel for Q36WindowStep<'_> {
-    fn run_window(&mut self, inputs: &[u32]) -> Result<()> {
+impl Q36WindowStep<'_> {
+    fn run_window_impl(&mut self, inputs: &[u32]) -> Result<()> {
         self.snapshot = None;
+        self.stepped_window = false;
         self.inputs.clear();
         self.logits.clear();
-        let Q36Step { decoder, state, .. } = &mut self.step;
-        let limit = u32::try_from(self.context_limit)
-            .map_err(|_| EngError::BadRequest("context limit overflows u32".into()))?;
-        let rows = u32::try_from(inputs.len())
-            .map_err(|_| EngError::BadRequest("the verify window exceeds u32 rows".into()))?;
-        state.check_step(&decoder.weights, limit)?;
-        if state.pos().saturating_add(rows) > limit {
-            return Err(EngError::BadRequest(
-                "the verify window does not fit the context limit".into(),
-            ));
+        self.window_fits(inputs)?;
+        if step_window() && self.run_window_steps(inputs)?.is_some() {
+            return Ok(());
         }
+        let Q36Step { decoder, state, .. } = &mut self.step;
         let snapshot = {
             let started = std::time::Instant::now();
             let snapshot = decoder.snapshot(state)?;
@@ -380,6 +388,82 @@ impl WindowModel for Q36WindowStep<'_> {
             }
         }
     }
+}
+
+impl Q36WindowStep<'_> {
+    /// The host checks of one verify window: the state step-invariants and the context-limit
+    /// fit, before any snapshot or native call.
+    fn window_fits(&self, inputs: &[u32]) -> Result<()> {
+        let Q36Step { decoder, state, .. } = &self.step;
+        let limit = u32::try_from(self.context_limit)
+            .map_err(|_| EngError::BadRequest("context limit overflows u32".into()))?;
+        let rows = u32::try_from(inputs.len())
+            .map_err(|_| EngError::BadRequest("the verify window exceeds u32 rows".into()))?;
+        state.check_step(&decoder.weights, limit)?;
+        if state.pos().saturating_add(rows) > limit {
+            return Err(EngError::BadRequest(
+                "the verify window does not fit the context limit".into(),
+            ));
+        }
+        Ok(())
+    }
+
+    /// The step window: one compiled `Logits` step per row, checkpointed before every row.
+    /// Returns `Ok(Some(()))` when the window ran, and `Ok(None)` when a checkpoint-charge
+    /// `MemoryPlan` refusal sent it back to the chunk path (with the state restored to the
+    /// pre-window checkpoint). Any other error propagates: a native step failure poisons the
+    /// state, and the worker's reset is the only sound recovery, as in the chunk path's contract.
+    fn run_window_steps(&mut self, inputs: &[u32]) -> Result<Option<()>> {
+        let started = std::time::Instant::now();
+        let Q36Step { decoder, state, .. } = &mut self.step;
+        // ONE pre-window snapshot, exactly the chunk path's charge contract. A refusal of that
+        // single charge falls back to the chunk path (which would refuse the same way).
+        let base = match decoder.snapshot(state) {
+            Ok(base) => base,
+            Err(EngError::MemoryPlan(_)) => return Ok(None),
+            Err(error) => return Err(error),
+        };
+        let snapshot_us = started.elapsed().as_micros();
+        let steps_started = std::time::Instant::now();
+        let mut logits: Vec<Vec<f32>> = Vec::with_capacity(inputs.len());
+        for &token in inputs {
+            let row = decoder
+                .step(state, token, StepMode::Logits)
+                .and_then(|result| {
+                    result
+                        .logits
+                        .ok_or_else(|| window_output_error("the step window returned no logits"))
+                });
+            match row {
+                Ok(row) => logits.push(row),
+                // A growth refusal mid-window leaves the state clean: restore the base and let
+                // the chunk path try its one-shot admission of the whole window.
+                Err(EngError::MemoryPlan(_)) => {
+                    decoder.restore(state, &base)?;
+                    return Ok(None);
+                }
+                Err(error) => return Err(error),
+            }
+        }
+        if window_taps_on() {
+            WINDOW_TAPS.with_borrow_mut(|t| {
+                t.snapshot_us += snapshot_us;
+                t.prefill_us += steps_started.elapsed().as_micros();
+                t.rows = inputs.len();
+            });
+        }
+        self.logits = logits;
+        self.inputs = inputs.to_vec();
+        self.snapshot = Some(base);
+        self.stepped_window = true;
+        Ok(Some(()))
+    }
+}
+
+impl WindowModel for Q36WindowStep<'_> {
+    fn run_window(&mut self, inputs: &[u32]) -> Result<()> {
+        self.run_window_impl(inputs)
+    }
 
     fn draw(&mut self, row: usize, sampler: &mut Sampler, sampler_vocab: usize) -> Result<u32> {
         let started = std::time::Instant::now();
@@ -395,6 +479,42 @@ impl WindowModel for Q36WindowStep<'_> {
     }
 
     fn commit_window(&mut self, commit: &Commit) -> Result<()> {
+        if self.stepped_window {
+            let snapshot = self
+                .snapshot
+                .take()
+                .ok_or_else(|| window_output_error("commit without a window"))?;
+            self.stepped_window = false;
+            self.logits.clear();
+            let inputs = std::mem::take(&mut self.inputs);
+            if commit.discarded_rows == 0 {
+                return Ok(());
+            }
+            let kept = commit.kept_rows;
+            let started = std::time::Instant::now();
+            let Q36Step { decoder, state, .. } = &mut self.step;
+            // The step window replays the kept rows as compiled one-row steps; the eager
+            // `Prompt` chunk replay of the chunk path is the measured cost this removes.
+            decoder.restore(state, &snapshot)?;
+            for &token in &inputs[..kept] {
+                decoder.step(state, token, StepMode::Logits)?;
+            }
+            if window_taps_on() {
+                WINDOW_TAPS.with_borrow_mut(|t| {
+                    t.calls += 1;
+                    let commit_us = started.elapsed().as_micros();
+                    eprintln!(
+                        "WINDOW_TAP call={} rows={} kept={} discarded={} snapshot_us={} prefill_us={} draw_us={} commit_us={} replays={} steps=1",
+                        t.calls, t.rows, kept, commit.discarded_rows, t.snapshot_us, t.prefill_us,
+                        t.draw_us, commit_us, t.replays
+                    );
+                    t.snapshot_us = 0;
+                    t.prefill_us = 0;
+                    t.draw_us = 0;
+                });
+            }
+            return Ok(());
+        }
         let snapshot = self
             .snapshot
             .take()
@@ -1044,6 +1164,7 @@ impl ExecutorOps for Q36Executor {
             step,
             context_limit: limits.context_limit,
             snapshot: None,
+            stepped_window: false,
             inputs: Vec::new(),
             logits: Vec::new(),
         };
@@ -1658,6 +1779,7 @@ mod tests {
             step,
             context_limit: limits.context_limit,
             snapshot: None,
+            stepped_window: false,
             inputs: Vec::new(),
             logits: Vec::new(),
         };
