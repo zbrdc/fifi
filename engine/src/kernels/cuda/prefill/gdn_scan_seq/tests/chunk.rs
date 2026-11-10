@@ -107,7 +107,10 @@ fn gdn_scan_chunk_matches_the_f64_reference() -> Result<(), EngError> {
             rows <= EC_S,
             "{label}: gated rows {rows:.3e} above EC_S {EC_S:.3e}"
         );
-        assert!(state <= EC_S, "{label}: state {state:.3e} above EC_S {EC_S:.3e}");
+        assert!(
+            state <= EC_S,
+            "{label}: state {state:.3e} above EC_S {EC_S:.3e}"
+        );
     }
     println!("REPORTED: {}", measured.join("; "));
     Ok(())
@@ -130,8 +133,14 @@ fn gdn_scan_chunk_m_edges() -> Result<(), EngError> {
         };
         let label = format!("chunk m {m}");
         let (rows, state) = judged(&inp, &got, &label, RefOpts::default());
-        assert!(rows <= EC_S, "{label}: rows {rows:.3e} above EC_S {EC_S:.3e}");
-        assert!(state <= EC_S, "{label}: state {state:.3e} above EC_S {EC_S:.3e}");
+        assert!(
+            rows <= EC_S,
+            "{label}: rows {rows:.3e} above EC_S {EC_S:.3e}"
+        );
+        assert!(
+            state <= EC_S,
+            "{label}: state {state:.3e} above EC_S {EC_S:.3e}"
+        );
     }
     Ok(())
 }
@@ -168,7 +177,10 @@ fn gdn_scan_chunk_every_form_matches_its_reference_and_no_neighbour() -> Result<
         let label = format!("chunk forms bits {b}");
         let opts = super::forms::opts_of(form);
         let (rows, st) = judge_scan_with(&inp, (out, state), &label, opts);
-        assert!(rows <= EC_S, "{label}: rows {rows:.3e} above EC_S {EC_S:.3e}");
+        assert!(
+            rows <= EC_S,
+            "{label}: rows {rows:.3e} above EC_S {EC_S:.3e}"
+        );
         assert!(st <= EC_S, "{label}: state {st:.3e} above EC_S {EC_S:.3e}");
         for flip in [1u8, 2, 4] {
             let off = super::forms::rows_off(
@@ -239,7 +251,10 @@ fn gdn_scan_chunk_splits_and_tokens_each_match_the_reference() -> Result<(), Eng
     };
     let pair = rel(&whole.out, &split.out).max(rel(&whole.state, &split.state));
     println!("REPORTED: chunk whole vs split max gap {pair:.3e} (EC_S {EC_S:.3e})");
-    assert!(pair <= 2.0 * EC_S, "whole vs split gap {pair:.3e} above 2*EC_S");
+    assert!(
+        pair <= 2.0 * EC_S,
+        "whole vs split gap {pair:.3e} above 2*EC_S"
+    );
     Ok(())
 }
 

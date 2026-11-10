@@ -676,19 +676,18 @@ constexpr int kCols = 64;       // value columns per block (grid.z = D / kCols =
 constexpr int kDpad = D + 4;    // row stride of the r-major rows (16-byte aligned, bank-varying)
 constexpr int kCpad = kC + 4;   // row stride of the value-major matrices
 constexpr int kHpad = 136;      // halves per r-major row: D + 8 so 16B rows and a 272B bank-varying stride
+constexpr int kCHpad = 40;      // halves per value-major split row of U: kC + 8, 80B bank-varying 16B rows
 // The shared bytes of one launch: fp16 hi/lo split rows for K̂, Q̂ and the state slice S —
 // the tensor-core form (a split pair reconstructs to ~2^-22 relative, so every fp32 reader
 // below joins hi+lo exactly) — plus the fp32 value-major matrices U, G, A, seen and the
 // three gate vectors.
 constexpr size_t kChunkSmem =
     (4 * kC + 2 * kCols) * kHpad * sizeof(__half) +
-    (2 * kCols * kCpad + 2 * kC * kCpad + 3 * kC) * sizeof(float);
+    (2 * kC + 2 * kCols) * kCHpad * sizeof(__half) +
+    (2 * kC * kCpad + 3 * kC) * sizeof(float);
 static_assert(kChunkSmem < 96 * 1024, "sm_72 caps opt-in shared memory at 96KB per block");
 static_assert(kHpad >= D, "r-major half rows must hold a full D row");
 
-__device__ __forceinline__ float dot4(float4 x, float4 y) {
-    return x.x * y.x + x.y * y.y + x.z * y.z + x.w * y.w;
-}
 
 // Split a float into an fp16 hi/lo pair (joint residual ~2^-22 relative) and join it back.
 __device__ __forceinline__ void f2s(float x, __half *hi, __half *lo) {
@@ -698,6 +697,11 @@ __device__ __forceinline__ void f2s(float x, __half *hi, __half *lo) {
 }
 __device__ __forceinline__ float j2(const __half *hi, const __half *lo, int i) {
     return __half2float(hi[i]) + __half2float(lo[i]);
+}
+__device__ __forceinline__ void f2s_at(float x, __half *hib, __half *lob, int i) {
+    const __half h = __float2half_rn(x);
+    hib[i] = h;
+    lob[i] = __float2half_rn(x - __half2float(h));
 }
 
 #if __CUDA_ARCH__ >= 800
@@ -749,11 +753,13 @@ __global__ void __launch_bounds__(kLanes * kChunkWarps, 1) gdn_scan_chunk_k(Scan
     __half *const q_l = q_h + kC * kHpad;                 // Q̂ lo
     __half *const S_h = q_l + kC * kHpad;                 // the state slice hi [kCols][kHpad]
     __half *const S_l = S_h + kCols * kHpad;              // the state slice lo
-    float *const U_s = reinterpret_cast<float *>(S_l + kCols * kHpad);  // U [kCols][kCpad], value-major: staged V, solved in place
-    float *const G_s = U_s + kCols * kCpad;        // G[t][s] = b_t·(B_t/B_s)·(k_t·k_s), s < t
+    __half *const U_h = S_l + kCols * kHpad;              // U hi [kCols][kCHpad], value-major: staged V, folded and solved in place
+    __half *const U_l = U_h + kCols * kCHpad;             // U lo
+    __half *const A_h = U_l + kCols * kCHpad;             // A hi [kC][kCHpad] (upper zero, rows ≥ len zero)
+    __half *const A_l = A_h + kC * kCHpad;                // A lo
+    float *const G_s = reinterpret_cast<float *>(A_l + kC * kCHpad);  // G[t][s] = b_t·(B_t/B_s)·(k_t·k_s), s < t
     float *const A_s = G_s + kC * kCpad;           // A[t][s] = (B_t/B_s)·(q_t·k_s), s ≤ t (upper zeroed)
-    float *const seen_s = A_s + kC * kCpad;        // B_t·(Sᵀk̂_t) [kCols][kCpad], value-major
-    float *const dec_s = seen_s + kCols * kCpad;   // the decay gates a_t
+    float *const dec_s = A_s + kC * kCpad;         // the decay gates a_t
     float *const b_s = dec_s + kC;                 // the beta gates
     float *const B_s = b_s + kC;                   // the prefix products B_t
     const int h = blockIdx.x, kh = key_head<kGrouped>(h, a);
@@ -786,6 +792,17 @@ __global__ void __launch_bounds__(kLanes * kChunkWarps, 1) gdn_scan_chunk_k(Scan
     for (int i = tid; i < 2 * kC * kCpad; i += kLanes * kChunkWarps) {
         const int t = i / kCpad, s = i % kCpad;
         if (s > t) (i < kC * kCpad ? A_s : G_s)[i % (kC * kCpad)] = 0.f;
+    }
+    // U and the A splits stay zero outside the written window for the whole launch: the
+    // phases that walk the full kC window pair those slots with zeros (finite halves),
+    // and Gram overwrites the written lower triangle of the A splits every sub-chunk.
+    for (int i = tid; i < kCols * kCHpad; i += kLanes * kChunkWarps) {
+        U_h[i] = __half(0);
+        U_l[i] = __half(0);
+    }
+    for (int i = tid; i < kC * kCHpad; i += kLanes * kChunkWarps) {
+        A_h[i] = __half(0);
+        A_l[i] = __half(0);
     }
     __syncthreads();
     for (int t0 = 0; t0 < a.m; t0 += kC) {
@@ -823,8 +840,9 @@ __global__ void __launch_bounds__(kLanes * kChunkWarps, 1) gdn_scan_chunk_k(Scan
 #pragma unroll
             for (int cv = 0; cv < (kCols + kLanes - 1) / kLanes; ++cv) {
                 if (cv * kLanes + lane < kCols) {
-                    U_s[(cv * kLanes + lane) * kCpad + j] =
-                        rw[2 * a.n_k_heads * D + h * D + col0 + cv * kLanes + lane];
+                    f2s_at(
+                        rw[2 * a.n_k_heads * D + h * D + col0 + cv * kLanes + lane], U_h, U_l,
+                        (cv * kLanes + lane) * kCHpad + j);
                 }
             }
         }
@@ -879,12 +897,15 @@ __global__ void __launch_bounds__(kLanes * kChunkWarps, 1) gdn_scan_chunk_k(Scan
                 float ratio = 1.f;
                 for (int i = s + 1; i <= t; ++i) ratio *= dec_s[i];
                 if (s != t) {
-                    if (is_kk)
+                    if (is_kk) {
                         G_s[t * kCpad + s] = b_s[t] * ratio * d[e];
-                    else
+                    } else {
                         A_s[t * kCpad + s] = ratio * d[e];
+                        f2s_at(ratio * d[e], A_h, A_l, t * kCHpad + s);
+                    }
                 } else if (!is_kk) {
                     A_s[t * kCpad + t] = d[e];
+                    f2s_at(d[e], A_h, A_l, t * kCHpad + t);
                 }
             }
         }
@@ -914,8 +935,10 @@ __global__ void __launch_bounds__(kLanes * kChunkWarps, 1) gdn_scan_chunk_k(Scan
             if (s != t) {
                 G_s[t * kCpad + s] = b_s[t] * ratio * kk;
                 A_s[t * kCpad + s] = ratio * qk;
+                f2s_at(ratio * qk, A_h, A_l, t * kCHpad + s);
             } else {
                 A_s[t * kCpad + t] = qk;
+                f2s_at(qk, A_h, A_l, t * kCHpad + t);
             }
         }
 #endif
@@ -944,7 +967,9 @@ __global__ void __launch_bounds__(kLanes * kChunkWarps, 1) gdn_scan_chunk_k(Scan
             for (int e = 0; e < 4; ++e) {
                 const int t = t0w + r0 + 8 * (e >> 1);
                 const int c = c0w + cc + (e & 1);
-                if (t < len) seen_s[c * kCpad + t] = B_s[t] * d[e];
+                if (t < len)
+                    f2s_at(j2(U_h, U_l, c * kCHpad + t) - B_s[t] * d[e], U_h, U_l,
+                           c * kCHpad + t);
             }
         }
 #else
@@ -957,7 +982,8 @@ __global__ void __launch_bounds__(kLanes * kChunkWarps, 1) gdn_scan_chunk_k(Scan
                 float acc = 0.f;
                 for (int r = 0; r < D; ++r)
                     acc += j2(kh_h, kh_l, t * kHpad + r) * j2(S_h, S_l, c * kHpad + r);
-                seen_s[c * kCpad + t] = B_s[t] * acc;
+                f2s_at(j2(U_h, U_l, c * kCHpad + t) - B_s[t] * acc, U_h, U_l,
+                       c * kCHpad + t);
             }
         }
 #endif
@@ -970,43 +996,52 @@ __global__ void __launch_bounds__(kLanes * kChunkWarps, 1) gdn_scan_chunk_k(Scan
             const int c = cl;
             for (int t = 0; t < len; ++t) {
                 const float4 *g = reinterpret_cast<const float4 *>(G_s + t * kCpad);
-                const float4 *uc = reinterpret_cast<const float4 *>(U_s + c * kCpad);
                 float4 back = make_float4(0.f, 0.f, 0.f, 0.f);
 #pragma unroll 2
                 for (int s = 0; s < t / 4; ++s) {
-                    const float4 gs = g[s], us = uc[s];
-                    back.x += gs.x * us.x;
-                    back.y += gs.y * us.y;
-                    back.z += gs.z * us.z;
-                    back.w += gs.w * us.w;
+                    const float4 gs = g[s];
+                    const int b4 = c * kCHpad + 4 * s;
+                    back.x += gs.x * j2(U_h, U_l, b4);
+                    back.y += gs.y * j2(U_h, U_l, b4 + 1);
+                    back.z += gs.z * j2(U_h, U_l, b4 + 2);
+                    back.w += gs.w * j2(U_h, U_l, b4 + 3);
                 }
                 float tail = 0.f;
                 for (int s = 4 * (t / 4); s < t; ++s)
-                    tail += G_s[t * kCpad + s] * U_s[c * kCpad + s];
+                    tail += G_s[t * kCpad + s] * j2(U_h, U_l, c * kCHpad + s);
                 float b = back.x + back.y + back.z + back.w + tail;
-                const float u =
-                    b_s[t] * (U_s[c * kCpad + t] - seen_s[c * kCpad + t]) - b;
-                U_s[c * kCpad + t] = u;
+                const float u = b_s[t] * j2(U_h, U_l, c * kCHpad + t) - b;
+                f2s_at(u, U_h, U_l, c * kCHpad + t);
             }
         }
         __syncthreads();  // the solved U rows are visible to M2 and the update
-        // M2, the outputs. sm_80+: the inter term B_t·q̂ᵀS as one mma pass (M1's shape with
-        // Q̂ in the A slot) stores B_t·inter to o_out, and the masked intra sum A·U then adds
-        // in as the same float4 walk (A's zeroed upper bounds it at the diagonal quad).
-        // sm_72 keeps the joined SIMT walk.
+        // M2, the outputs. sm_80+: both terms on the tensor cores in one warp tile — the
+        // inter pass B_t·q̂ᵀS (M1's shape, Q̂ in the A slot) and the intra pass A·U over the
+        // full kC window (A's zeroed upper swallows the masked tail) — fused into one
+        // scatter, one global write per element. sm_72 keeps the joined SIMT walk.
 #if __CUDA_ARCH__ >= 800
         {
             const int t0w = 16 * (w >> 3), c0w = 8 * (w & 7);
-            float d[4] = {0.f, 0.f, 0.f, 0.f};
+            float di[4] = {0.f, 0.f, 0.f, 0.f}, da[4] = {0.f, 0.f, 0.f, 0.f};
             for (int r0 = 0; r0 < D; r0 += 16) {
                 unsigned aH[4], aL[4], bH[2], bL[2];
                 ldm_a<kHpad>(q_h, t0w, r0, aH);
                 ldm_a<kHpad>(q_l, t0w, r0, aL);
                 ldm_b<kHpad>(S_h, c0w, r0, bH);
                 ldm_b<kHpad>(S_l, c0w, r0, bL);
-                mma_16816(d, aH, bH[0], bH[1]);
-                mma_16816(d, aH, bL[0], bL[1]);
-                mma_16816(d, aL, bH[0], bH[1]);
+                mma_16816(di, aH, bH[0], bH[1]);
+                mma_16816(di, aH, bL[0], bL[1]);
+                mma_16816(di, aL, bH[0], bH[1]);
+            }
+            for (int s0 = 0; s0 < kC; s0 += 16) {
+                unsigned aH[4], aL[4], bH[2], bL[2];
+                ldm_a<kCHpad>(A_h, t0w, s0, aH);
+                ldm_a<kCHpad>(A_l, t0w, s0, aL);
+                ldm_b<kCHpad>(U_h, c0w, s0, bH);
+                ldm_b<kCHpad>(U_l, c0w, s0, bL);
+                mma_16816(da, aH, bH[0], bH[1]);
+                mma_16816(da, aH, bL[0], bL[1]);
+                mma_16816(da, aL, bH[0], bH[1]);
             }
             const int r0 = lane >> 2, cc = 2 * (lane & 3);
 #pragma unroll
@@ -1014,22 +1049,8 @@ __global__ void __launch_bounds__(kLanes * kChunkWarps, 1) gdn_scan_chunk_k(Scan
                 const int t = t0w + r0 + 8 * (e >> 1);
                 const int c = c0w + cc + (e & 1);
                 if (t < len)
-                    a.o_out[((size_t)(t0 + t) * a.n_v_heads + h) * D + col0 + c] = B_s[t] * d[e];
-            }
-        }
-        __syncthreads();  // the intra walk adds into the mma scatter's stores, cross-warp
-        {
-            const int c = tid % kCols, tg = tid / kCols;
-            const int tgs = kLanes * kChunkWarps / kCols;
-            for (int i = 0; i < kC / tgs; ++i) {
-                const int t = tg + tgs * i;
-                if (t >= len) break;
-                const float4 *at = reinterpret_cast<const float4 *>(A_s + t * kCpad);
-                const float4 *uc = reinterpret_cast<const float4 *>(U_s + c * kCpad);
-                float intra = 0.f;
-#pragma unroll 2
-                for (int s = 0; s <= t / 4; ++s) intra += dot4(at[s], uc[s]);
-                a.o_out[((size_t)(t0 + t) * a.n_v_heads + h) * D + col0 + c] += intra;
+                    a.o_out[((size_t)(t0 + t) * a.n_v_heads + h) * D + col0 + c] =
+                        B_s[t] * di[e] + da[e];
             }
         }
 #else
@@ -1043,10 +1064,14 @@ __global__ void __launch_bounds__(kLanes * kChunkWarps, 1) gdn_scan_chunk_k(Scan
                 for (int r = 0; r < D; ++r)
                     inter += j2(q_h, q_l, t * kHpad + r) * j2(S_h, S_l, c * kHpad + r);
                 const float4 *at = reinterpret_cast<const float4 *>(A_s + t * kCpad);
-                const float4 *uc = reinterpret_cast<const float4 *>(U_s + c * kCpad);
                 float intra = 0.f;
 #pragma unroll 2
-                for (int s = 0; s <= t / 4; ++s) intra += dot4(at[s], uc[s]);
+                for (int s = 0; s <= t / 4; ++s) {
+                    const float4 as = at[s];
+                    const int b4 = c * kCHpad + 4 * s;
+                    intra += as.x * j2(U_h, U_l, b4) + as.y * j2(U_h, U_l, b4 + 1) +
+                             as.z * j2(U_h, U_l, b4 + 2) + as.w * j2(U_h, U_l, b4 + 3);
+                }
                 a.o_out[((size_t)(t0 + t) * a.n_v_heads + h) * D + col0 + c] =
                     B_s[t] * inter + intra;
             }
@@ -1072,7 +1097,7 @@ __global__ void __launch_bounds__(kLanes * kChunkWarps, 1) gdn_scan_chunk_k(Scan
                 const int c = cg + 4 * i;
                 float acc = 0.f;
                 for (int s = 0; s < len; ++s) {
-                    acc += B_s[s] * j2(kh_h, kh_l, s * kHpad + r) * U_s[c * kCpad + s];
+                    acc += B_s[s] * j2(kh_h, kh_l, s * kHpad + r) * j2(U_h, U_l, c * kCHpad + s);
                 }
                 f2s(j2(S_h, S_l, c * kHpad + r) * b_end + acc, &S_h[c * kHpad + r],
                     &S_l[c * kHpad + r]);
