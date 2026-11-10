@@ -275,6 +275,9 @@ struct WindowTaps {
     commit_us: u128,
     /// The native dispatch count at the start of the window (the tap prints the delta).
     ops_base: u64,
+    /// The compiled-block call counts (delta, moe, attn) at the window start: the printed
+    /// deltas split the window's ops into compiled entries and eager glue.
+    compiled_base: (u64, u64, u64),
 }
 
 std::thread_local! {
@@ -290,6 +293,7 @@ std::thread_local! {
             draw_us: 0,
             commit_us: 0,
             ops_base: 0,
+            compiled_base: (0, 0, 0),
         })
     };
 }
@@ -371,7 +375,11 @@ impl Q36WindowStep<'_> {
         self.stepped_window = false;
         self.checkpoints = None;
         if window_taps_on() {
-            WINDOW_TAPS.with_borrow_mut(|t| t.ops_base = crate::kernels::mlx::dispatch_count());
+            let stats = crate::kernels::mlx::compile_stats::read();
+            WINDOW_TAPS.with_borrow_mut(|t| {
+                t.ops_base = crate::kernels::mlx::dispatch_count();
+                t.compiled_base = (stats.delta.calls, stats.moe.calls, stats.attn.calls);
+            });
         }
         self.inputs.clear();
         self.logits.clear();
@@ -566,11 +574,18 @@ impl WindowModel for Q36WindowStep<'_> {
                 WINDOW_TAPS.with_borrow_mut(|t| {
                     t.calls += 1;
                     let commit_us = started.elapsed().as_micros();
+                    let stats = crate::kernels::mlx::compile_stats::read();
+                    let cmp = (
+                        stats.delta.calls.saturating_sub(t.compiled_base.0),
+                        stats.moe.calls.saturating_sub(t.compiled_base.1),
+                        stats.attn.calls.saturating_sub(t.compiled_base.2),
+                    );
                     eprintln!(
-                        "WINDOW_TAP call={} rows={} kept={} discarded={} snapshot_us={} prefill_us={} draw_us={} commit_us={} replays={} steps=ckpt ops={}",
+                        "WINDOW_TAP call={} rows={} kept={} discarded={} snapshot_us={} prefill_us={} draw_us={} commit_us={} replays={} steps=ckpt ops={} cmp=D{}/M{}/A{}",
                         t.calls, t.rows, kept, commit.discarded_rows, t.snapshot_us, t.prefill_us,
                         t.draw_us, commit_us, t.replays,
-                        crate::kernels::mlx::dispatch_count().saturating_sub(t.ops_base)
+                        crate::kernels::mlx::dispatch_count().saturating_sub(t.ops_base),
+                        cmp.0, cmp.1, cmp.2
                     );
                     t.snapshot_us = 0;
                     t.prefill_us = 0;
@@ -603,11 +618,18 @@ impl WindowModel for Q36WindowStep<'_> {
                 WINDOW_TAPS.with_borrow_mut(|t| {
                     t.calls += 1;
                     let commit_us = started.elapsed().as_micros();
+                    let stats = crate::kernels::mlx::compile_stats::read();
+                    let cmp = (
+                        stats.delta.calls.saturating_sub(t.compiled_base.0),
+                        stats.moe.calls.saturating_sub(t.compiled_base.1),
+                        stats.attn.calls.saturating_sub(t.compiled_base.2),
+                    );
                     eprintln!(
-                        "WINDOW_TAP call={} rows={} kept={} discarded={} snapshot_us={} prefill_us={} draw_us={} commit_us={} replays={} steps=1 ops={}",
+                        "WINDOW_TAP call={} rows={} kept={} discarded={} snapshot_us={} prefill_us={} draw_us={} commit_us={} replays={} steps=1 ops={} cmp=D{}/M{}/A{}",
                         t.calls, t.rows, kept, commit.discarded_rows, t.snapshot_us, t.prefill_us,
                         t.draw_us, commit_us, t.replays,
-                        crate::kernels::mlx::dispatch_count().saturating_sub(t.ops_base)
+                        crate::kernels::mlx::dispatch_count().saturating_sub(t.ops_base),
+                        cmp.0, cmp.1, cmp.2
                     );
                     t.snapshot_us = 0;
                     t.prefill_us = 0;
@@ -646,11 +668,18 @@ impl WindowModel for Q36WindowStep<'_> {
                 t.discarded += commit.discarded_rows;
                 t.kept += kept;
                 let commit_us = started.elapsed().as_micros();
+                let stats = crate::kernels::mlx::compile_stats::read();
+                let cmp = (
+                    stats.delta.calls.saturating_sub(t.compiled_base.0),
+                    stats.moe.calls.saturating_sub(t.compiled_base.1),
+                    stats.attn.calls.saturating_sub(t.compiled_base.2),
+                );
                 eprintln!(
-                    "WINDOW_TAP call={} rows={} kept={} discarded={} snapshot_us={} prefill_us={} draw_us={} commit_us={} replays={} ops={}",
+                    "WINDOW_TAP call={} rows={} kept={} discarded={} snapshot_us={} prefill_us={} draw_us={} commit_us={} replays={} ops={} cmp=D{}/M{}/A{}",
                     t.calls, t.rows, kept, commit.discarded_rows, t.snapshot_us, t.prefill_us,
                     t.draw_us, commit_us, t.replays,
-                    crate::kernels::mlx::dispatch_count().saturating_sub(t.ops_base)
+                    crate::kernels::mlx::dispatch_count().saturating_sub(t.ops_base),
+                    cmp.0, cmp.1, cmp.2
                 );
                 t.snapshot_us = 0;
                 t.prefill_us = 0;
