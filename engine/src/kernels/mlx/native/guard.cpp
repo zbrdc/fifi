@@ -2309,7 +2309,7 @@ struct CompileScopeArray {
 
 // Owns the borrowed input copies that mlx_vector_array_get returned.
 struct CompileScopeInputs {
-  static constexpr size_t kMax = 41;  // 27 canonical DeltaNet operands (26 + folded input norm) + 2 * (8 - 1) states.
+  static constexpr size_t kMax = 64;  // 46 delta-layer operands (whole-layer closure) >= the 27+states delta block.
   mlx_array values[kMax] = {};
   size_t count{0};
   ~CompileScopeInputs() {
@@ -4056,6 +4056,361 @@ extern "C" int inference_mlx_compile_moe_block(
     *out = outputs[0];
     *ids = outputs[1];
     *gates = outputs[2];
+    *health = outputs[3];
+    return status;
+  });
+}
+
+// === The whole-layer DeltaNet chunk closure (B1) ==============================
+//
+// One compiled closure for one DELTA-mixer layer of the chunk prefill: the input RMS norm,
+// the four projections, the fused gdn_prep kernel, the gated-delta chunk recurrence, the
+// fused gdn_post output gate, the out projection, the mixer residual add, and the folded
+// device-routed MoE sequence of `compile_moe_rows` (post norm, router, gathered experts,
+// shared expert, output residual). The eager chunk path spends ~395 uncompiled dispatches
+// per layer; this closure replaces the whole layer with ONE native entry, so a window of
+// T rows costs ~40 entries plus the outer glue instead of ~1,100 per row.
+//
+// The op sequence replays `prefill/delta.rs` `chunk` (fused branch, production dims) and the
+// batched rows of `moe.rs` `chunk_device` through the same inference_mlx_* shims the eager
+// path calls, in the same order, so a compiled run and an eager run trace identical MLX
+// graphs. T (the row count of `h`) is an INPUT SHAPE, not a baked constant: the nonshapeless
+// MLX cache specializes it under the one fun_id, exactly like the B axis of the decode
+// blocks. The row-index operands of the two gathered products arrive as closure inputs
+// (indexes 44/45) because their shapes depend on T, which the payload must not bake.
+//
+// Input order (46):
+//   0  h [T, H] activation dtype (the RAW residual stream in)
+//   1  rec [VH, VD, KD] F32, 2 ring [CD, taps] F32
+//   3..17   payload, scales, biases of the qkv, z, b, a, out packed weights (5 x 3)
+//   18 conv_taps, 19 conv_last, 20 neg_exp_a_log, 21 dt_bias, 22 delta norm [vd] (F32/plain)
+//   23 qk_eps scalar, 24 sqrt_kd scalar (F32)
+//   25 input norm [H], 26 post norm [H] (activation dtype)
+//   27 router_t [H, E] F32
+//   28..36  payload, scales, biases of the shared gate, up, down packed weights (3 x 3)
+//   37 shared_scalar_t [H, 1] F32
+//   38..43  payload, scales, biases of the gate/up stack and the down stack (2 x 3)
+//   44 rows_lhs, 45 flat_lhs: the gathered-product row-index operands of shape [T*k] (Rust
+//      builds them per window, mirroring `compile_moe_lhs_load` at batch T)
+// Output order (4): out [T, H] activation dtype (both residual adds folded),
+//   rec_next [VH, VD, KD] F32, ring_next [CD, taps] F32, health [T] F32.
+struct CompileDeltaLayerPayload {
+  int hidden, kh, kd, vh, vd, cd, taps, kw, kw2;
+  int experts, top_k, renorm;
+  float eps;
+  mlx_dtype act;
+  const char *prep_source, *delta_source, *post_source, *router_source;
+  // Ten packed weights: qkv, z, b, a, out, shared gate, shared up, shared down, gate/up
+  // stack, down stack.
+  int mode[10], group[10], bits[10];
+  mlx_stream stream;
+};
+
+static void compile_delta_layer_payload_free(void* raw) noexcept {
+  CompileDeltaLayerPayload* payload = static_cast<CompileDeltaLayerPayload*>(raw);
+  if (payload != nullptr) {
+    mlx_stream_free(payload->stream);
+    std::free(payload);
+  }
+}
+
+static std::atomic<uint64_t> compile_delta_layer_body_entries_{0};
+
+static int compile_delta_layer_body(
+    mlx_vector_array* res, const mlx_vector_array input, void* raw) noexcept {
+  compile_delta_layer_body_entries_.fetch_add(1, std::memory_order_relaxed);
+  const CompileDeltaLayerPayload* p = static_cast<const CompileDeltaLayerPayload*>(raw);
+  compile_touching("delta layer closure input vector");
+  if (p == nullptr || res == nullptr || mlx_vector_array_size(input) != 46) {
+    return 1;
+  }
+  compile_touching("delta layer closure input element");
+  CompileScopeInputs in;
+  for (; in.count < 46; ++in.count) {
+    if (mlx_vector_array_get(&in.values[in.count], input, in.count) != 0) {
+      return 1;
+    }
+  }
+  const int* h_shape = mlx_array_shape(in.values[0]);
+  if (mlx_array_ndim(in.values[0]) != 2 || h_shape == nullptr || h_shape[1] != p->hidden) {
+    return 1;
+  }
+  const int rows = h_shape[0];
+  if (rows < 2 || rows > 1024) {
+    // The closure serves the chunk window (T >= 2); a one-row window keeps the eager path.
+    return 1;
+  }
+  const mlx_stream s = p->stream;
+  CompileScopeArray normed, u, z, bb, aa;
+  CompileScopeArray q4, k4, v4, g4, beta4, ring_next;
+  CompileScopeArray state4, y4, state_out4, core, o, o_act, mixed, mid;
+  CompileScopeArray x_normed, logits, probs, health, negated, order, ids, clamped, top;
+  CompileScopeArray renorm_sum, gates0, gates, x3, stacked, hg, hu, act, hprod;
+  CompileScopeArray eo, weighted, expert_rows, experts;
+  CompileScopeArray sg, su, act2, sh, so, scalar_logit, factor, shared_out;
+  CompileScopeArray total, total_act, resid_out, rec_next;
+  // Input RMS norm of the raw residual stream (activation dtype).
+  int status = inference_mlx_rms_norm(&normed.value, in.values[0], in.values[25], p->eps, s);
+  // Four projections over all rows; each meets an F32-capable packed weight and promotes on
+  // its own exactly as the eager chunk (`u`, `z`, `aa` meet F32 later, `bb` feeds sigmoid).
+  if (status == 0)
+    status = inference_mlx_quantized_matmul(
+        &u.value, normed.value, in.values[3], in.values[4], in.values[5], true,
+        compile_quant_optional(p->group[0]), compile_quant_optional(p->bits[0]),
+        compile_quant_mode(p->mode[0]), s);
+  if (status == 0)
+    status = inference_mlx_quantized_matmul(
+        &z.value, normed.value, in.values[6], in.values[7], in.values[8], true,
+        compile_quant_optional(p->group[1]), compile_quant_optional(p->bits[1]),
+        compile_quant_mode(p->mode[1]), s);
+  if (status == 0)
+    status = inference_mlx_quantized_matmul(
+        &bb.value, normed.value, in.values[9], in.values[10], in.values[11], true,
+        compile_quant_optional(p->group[2]), compile_quant_optional(p->bits[2]),
+        compile_quant_mode(p->mode[2]), s);
+  if (status == 0)
+    status = inference_mlx_quantized_matmul(
+        &aa.value, normed.value, in.values[12], in.values[13], in.values[14], true,
+        compile_quant_optional(p->group[3]), compile_quant_optional(p->bits[3]),
+        compile_quant_mode(p->mode[3]), s);
+  // Fused prep kernel over the whole chunk: causal conv + silu + q/k/v split + head norms +
+  // decay/beta gates + the shifted ring, in ONE launch. dims holds the row count.
+  const int prep_dims[1] = {rows};
+  if (status == 0)
+    status = inference_mlx_gdn_prep(
+        &q4.value, &k4.value, &v4.value, &g4.value, &beta4.value, &ring_next.value, u.value,
+        aa.value, bb.value, in.values[2], in.values[18], in.values[19], in.values[20],
+        in.values[21], prep_dims, in.values[23], in.values[24], p->prep_source, s);
+  // The prep outputs are already [T, kh, kd] / [T, vh, vd] / [T, vh]; the recurrence takes
+  // them reshaped to the [1, T, ...] layout of `gated_delta_recurrence`. dims of the kernel:
+  // batch, time, key heads, key dim, value heads, value dim.
+  const int qk4[4] = {1, rows, p->kh, p->kd};
+  const int v4shape[4] = {1, rows, p->vh, p->vd};
+  const int gate4[3] = {1, rows, p->vh};
+  const int state4shape[4] = {1, p->vh, p->vd, p->kd};
+  const int kernel_dims[6] = {1, rows, p->kh, p->kd, p->vh, p->vd};
+  CompileScopeArray q_r, k_r, v_r, g_r, beta_r;
+  if (status == 0)
+    status = inference_mlx_reshape(&q_r.value, q4.value, qk4, 4, s);
+  if (status == 0)
+    status = inference_mlx_reshape(&k_r.value, k4.value, qk4, 4, s);
+  if (status == 0)
+    status = inference_mlx_reshape(&v_r.value, v4.value, v4shape, 4, s);
+  if (status == 0)
+    status = inference_mlx_reshape(&g_r.value, g4.value, gate4, 3, s);
+  if (status == 0)
+    status = inference_mlx_reshape(&beta_r.value, beta4.value, gate4, 3, s);
+  if (status == 0)
+    status = inference_mlx_reshape(&state4.value, in.values[1], state4shape, 4, s);
+  if (status == 0)
+    status = inference_mlx_gated_delta(
+        &y4.value, &state_out4.value, q_r.value, k_r.value, v_r.value, g_r.value, beta_r.value,
+        state4.value, kernel_dims, p->delta_source, s);
+  const int core_shape[2] = {rows * p->vh, p->vd};
+  if (status == 0)
+    status = inference_mlx_reshape(&core.value, y4.value, core_shape, 2, s);
+  // Fused output gate: silu(z) * rms_norm(core, norm) in ONE launch; dims hold the chunk row
+  // count (core rows / value heads) and the z row width, like the eager wrapper.
+  const int* z_shape = mlx_array_shape(z.value);
+  if (status == 0 && (z_shape == nullptr || mlx_array_ndim(z.value) != 2)) {
+    status = 1;
+  }
+  const int post_dims[2] = {core_shape[0] / p->vh,
+                            z_shape != nullptr ? z_shape[1] : p->vh * p->vd};
+  if (status == 0)
+    status = inference_mlx_gdn_post(
+        &o.value, core.value, z.value, in.values[22], p->eps, post_dims, p->post_source, s);
+  if (status == 0) status = compile_cast_to(&o_act.value, o.value, p->act, s);
+  {
+    const mlx_array o_used = o_act.value.ctx != nullptr ? o_act.value : o.value;
+    if (status == 0)
+      status = inference_mlx_quantized_matmul(
+          &mixed.value, o_used, in.values[15], in.values[16], in.values[17], true,
+          compile_quant_optional(p->group[4]), compile_quant_optional(p->bits[4]),
+          compile_quant_mode(p->mode[4]), s);
+  }
+  // Mixer residual: `mid` stays the activation dtype like the eager loop's checked add.
+  if (status == 0) status = inference_mlx_add(&mid.value, in.values[0], mixed.value, s);
+  // === folded MoE rows sequence of compile_moe_rows, batched branch (T >= 2) ===
+  if (status == 0)
+    status = inference_mlx_rms_norm(&x_normed.value, mid.value, in.values[26], p->eps, s);
+  if (status == 0)
+    status = inference_mlx_matmul(&logits.value, x_normed.value, in.values[27], s);
+  if (status == 0) status = inference_mlx_softmax(&probs.value, logits.value, true, s);
+  if (status == 0) status = inference_mlx_sum_axis(&health.value, probs.value, 1, false, s);
+  const int top_start[2] = {0, 0};
+  const int top_stop[2] = {rows, p->top_k};
+  const int top_strides[2] = {1, 1};
+  const uint32_t expert_upper = static_cast<uint32_t>(p->experts - 1);
+  if (status == 0) status = inference_mlx_negative(&negated.value, probs.value, s);
+  if (status == 0) status = inference_mlx_argsort_axis(&order.value, negated.value, 1, s);
+  if (status == 0)
+    status = inference_mlx_slice(&ids.value, order.value, top_start, top_stop, top_strides, 2, s);
+  if (status == 0)
+    status = inference_mlx_clamp_indices(&clamped.value, ids.value, expert_upper, s);
+  if (status == 0)
+    status = inference_mlx_resident_take_along_axis(&top.value, probs.value, clamped.value, 1, s);
+  if (status == 0 && p->renorm != 0) {
+    status = inference_mlx_sum_axis(&renorm_sum.value, top.value, 1, true, s);
+    if (status == 0) status = inference_mlx_divide(&gates0.value, top.value, renorm_sum.value, s);
+  }
+  const int gates_shape[4] = {rows, p->top_k, 1, 1};
+  if (status == 0)
+    status = inference_mlx_reshape(
+        &gates.value, p->renorm != 0 ? gates0.value : top.value, gates_shape, 4, s);
+  const int x3_shape[3] = {rows, 1, p->hidden};
+  if (status == 0) status = inference_mlx_reshape(&x3.value, x_normed.value, x3_shape, 3, s);
+  if (status == 0)
+    status = inference_mlx_resident_gather_qmm(
+        &stacked.value, x3.value, in.values[38], in.values[39], in.values[40], in.values[44],
+        clamped.value, true, compile_quant_optional(p->group[8]),
+        compile_quant_optional(p->bits[8]), compile_quant_mode(p->mode[8]), false, s);
+  if (status == 0 && stacked.value.ctx == nullptr) {
+    status = 1;  // Fail closed: a null stacked product must not reach the split.
+  }
+  if (status == 0) {
+    const int* stacked_shape = mlx_array_shape(stacked.value);
+    if (stacked_shape == nullptr || mlx_array_ndim(stacked.value) != 4 ||
+        stacked_shape[3] % 2 != 0) {
+      status = 1;
+    } else {
+      const int rows0 = stacked_shape[0];
+      const int rows1 = stacked_shape[1];
+      const int half = stacked_shape[3] / 2;
+      const int split_start[4] = {0, 0, 0, 0};
+      const int split_strides[4] = {1, 1, 1, 1};
+      const int gate_stop[4] = {rows0, rows1, 1, half};
+      const int up_start[4] = {0, 0, 0, half};
+      const int up_stop[4] = {rows0, rows1, 1, half * 2};
+      status = inference_mlx_slice(
+          &hg.value, stacked.value, split_start, gate_stop, split_strides, 4, s);
+      if (status == 0)
+        status = inference_mlx_slice(
+            &hu.value, stacked.value, up_start, up_stop, split_strides, 4, s);
+    }
+  }
+  if (status == 0) status = inference_mlx_silu(&act.value, hg.value, s);
+  if (status == 0) status = inference_mlx_multiply(&hprod.value, act.value, hu.value, s);
+  if (status == 0)
+    status = inference_mlx_resident_gather_qmm(
+        &eo.value, hprod.value, in.values[41], in.values[42], in.values[43], in.values[45],
+        clamped.value, true, compile_quant_optional(p->group[9]),
+        compile_quant_optional(p->bits[9]), compile_quant_mode(p->mode[9]), false, s);
+  if (status == 0) status = inference_mlx_multiply(&weighted.value, eo.value, gates.value, s);
+  if (status == 0) status = inference_mlx_sum_axis(&expert_rows.value, weighted.value, 1, false, s);
+  {
+    const int* eo_shape = mlx_array_shape(eo.value);
+    if (status == 0 && (eo_shape == nullptr || mlx_array_ndim(eo.value) != 3)) {
+      status = 1;
+    } else if (status == 0) {
+      const int experts_shape[2] = {rows, eo_shape[2]};
+      status = inference_mlx_reshape(&experts.value, expert_rows.value, experts_shape, 2, s);
+    }
+  }
+  // Shared expert: sigmoid(x . scalar) * down(silu(gate(x)) * up(x)), folded like the rows body.
+  if (status == 0)
+    status = inference_mlx_quantized_matmul(
+        &sg.value, x_normed.value, in.values[28], in.values[29], in.values[30], true,
+        compile_quant_optional(p->group[5]), compile_quant_optional(p->bits[5]),
+        compile_quant_mode(p->mode[5]), s);
+  if (status == 0)
+    status = inference_mlx_quantized_matmul(
+        &su.value, x_normed.value, in.values[31], in.values[32], in.values[33], true,
+        compile_quant_optional(p->group[6]), compile_quant_optional(p->bits[6]),
+        compile_quant_mode(p->mode[6]), s);
+  if (status == 0) status = inference_mlx_silu(&act2.value, sg.value, s);
+  if (status == 0) status = inference_mlx_multiply(&sh.value, act2.value, su.value, s);
+  if (status == 0)
+    status = inference_mlx_quantized_matmul(
+        &so.value, sh.value, in.values[34], in.values[35], in.values[36], true,
+        compile_quant_optional(p->group[7]), compile_quant_optional(p->bits[7]),
+        compile_quant_mode(p->mode[7]), s);
+  if (status == 0)
+    status = inference_mlx_matmul(&scalar_logit.value, x_normed.value, in.values[37], s);
+  if (status == 0) status = inference_mlx_sigmoid(&factor.value, scalar_logit.value, s);
+  if (status == 0) status = inference_mlx_multiply(&shared_out.value, factor.value, so.value, s);
+  if (status == 0) status = inference_mlx_add(&total.value, experts.value, shared_out.value, s);
+  if (status == 0) status = compile_cast_to(&total_act.value, total.value, p->act, s);
+  {
+    const mlx_array total_used = total_act.value.ctx != nullptr ? total_act.value : total.value;
+    if (status == 0)
+      status = inference_mlx_add(&resid_out.value, mid.value, total_used, s);
+  }
+  const int rec_shape[3] = {p->vh, p->vd, p->kd};
+  if (status == 0)
+    status = inference_mlx_reshape(&rec_next.value, state_out4.value, rec_shape, 3, s);
+  // Collected in a body-owned vector and moved into the caller's null slot at the end, like
+  // every other block body (appending to `*res` directly is wrong).
+  mlx_vector_array results = mlx_vector_array_new();
+  if (results.ctx == nullptr) {
+    return 1;
+  }
+  compile_touching("delta layer closure output vector");
+  if (status == 0) status = mlx_vector_array_append_value(results, resid_out.value);
+  if (status == 0) status = mlx_vector_array_append_value(results, rec_next.value);
+  if (status == 0) status = mlx_vector_array_append_value(results, ring_next.value);
+  if (status == 0) status = mlx_vector_array_append_value(results, health.value);
+  compile_touching("delta layer closure result vector");
+  if (status == 0) status = mlx_vector_array_set(res, results);
+  const int release = mlx_vector_array_free(results);
+  return status != 0 ? status : release;
+}
+
+// The whole-layer DeltaNet chunk closure entry. `dims` holds hidden, kh, kd, vh, vd, cd,
+// taps, kw, kw2, experts, top_k, renorm; `quant` holds mode, group, bits per weight for the
+// ten packed weights (30 values). See the payload comment above for the 46-input contract.
+// Output slots arrive null; a non-zero status frees nothing (the body's scoped arrays own
+// their handles), and the Rust wrapper marks the adapter terminal.
+extern "C" int inference_mlx_compile_delta_layer(
+    mlx_array* out, mlx_array* rec, mlx_array* ring, mlx_array* health,
+    const mlx_array* inputs, size_t inputs_num, const int* dims, const int* quant, float eps,
+    mlx_dtype activation, const char* prep_source, const char* delta_source,
+    const char* post_source, const char* router_source, uintptr_t fun_id,
+    mlx_stream stream) noexcept {
+  return run_selected_operation(out, stream, [&]() noexcept {
+    if (inputs_num != 46 || dims == nullptr || quant == nullptr) {
+      return 1;
+    }
+    CompileDeltaLayerPayload* payload =
+        static_cast<CompileDeltaLayerPayload*>(std::malloc(sizeof(CompileDeltaLayerPayload)));
+    if (payload == nullptr) {
+      return 1;
+    }
+    payload->hidden = dims[0];
+    payload->kh = dims[1];
+    payload->kd = dims[2];
+    payload->vh = dims[3];
+    payload->vd = dims[4];
+    payload->cd = dims[5];
+    payload->taps = dims[6];
+    payload->kw = dims[7];
+    payload->kw2 = dims[8];
+    payload->experts = dims[9];
+    payload->top_k = dims[10];
+    payload->renorm = dims[11];
+    payload->eps = eps;
+    payload->act = activation;
+    payload->prep_source = prep_source;
+    payload->delta_source = delta_source;
+    payload->post_source = post_source;
+    payload->router_source = router_source;
+    const int stream_status = compile_copy_stream(&payload->stream, stream);
+    if (stream_status != 0) {
+      std::free(payload);
+      return stream_status;
+    }
+    for (int i = 0; i < 10; ++i) {
+      payload->mode[i] = quant[3 * i];
+      payload->group[i] = quant[3 * i + 1];
+      payload->bits[i] = quant[3 * i + 2];
+    }
+    mlx_array outputs[4] = {{nullptr}, {nullptr}, {nullptr}, {nullptr}};
+    const int status = compile_apply_block(
+        outputs, 4, compile_delta_layer_body, payload, compile_delta_layer_payload_free, inputs,
+        inputs_num, fun_id);
+    *out = outputs[0];
+    *rec = outputs[1];
+    *ring = outputs[2];
     *health = outputs[3];
     return status;
   });
