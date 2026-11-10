@@ -570,8 +570,8 @@ pub(in crate::kernels::cuda) fn grouped_indexed_option(
     options: u32,
 ) -> Result<(), DeviceFailure> {
     let limit = match options {
-        1 => 16,
-        2 | 3 => 20,
+        1 | 4 | 5 => 16,
+        2 | 3 | 6 | 7 => 20,
         _ => return Err(invalid_argument()),
     };
     let (args, indexes) = indexed_records(calls, index, limit)?;

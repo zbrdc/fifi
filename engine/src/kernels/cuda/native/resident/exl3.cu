@@ -961,7 +961,7 @@ __device__ __forceinline__ unsigned load_word(const uint16_t *tile, unsigned ind
 // (115 before): the decode of the eight weights is 64 of them, the rest is loop and address work.
 // Dp4a (the DP4A option of the id-indexed launch) decodes book 2 with decode_book2_dp4a; the
 // other books ignore it.
-template <int Book, int Bits, bool Aligned, class Args, bool Dp4a = false>
+template <int Book, int Bits, bool Aligned, class Args, bool Dp4a = false, bool Pipe = false>
 __device__ __forceinline__ void grouped_projection_one_tile(
     const Args &p, const GroupEntry &a, unsigned (&wtab)[128], float (&partial)[8][16],
     uint32_t split_k) {
@@ -984,32 +984,70 @@ __device__ __forceinline__ void grouped_projection_one_tile(
     const bool even = (bits & 1u) == 0;
     const unsigned next_lane = (lane + 1u) & 31u;
     float sums[8] = {};
+    auto word_at = [&](const uint16_t *base, unsigned w) -> unsigned {
+        if constexpr (Aligned) return *reinterpret_cast<const unsigned *>(base + 2 * w);
+        else return word32(base, w);
+    };
+    // Pipe carries the next iteration's words and input in registers, issued before the
+    // barriers of the current one, so the load latency overlaps the decode instead of stalling
+    // at each __syncwarp. The words staged and the order of every fma are those of the default
+    // loop, so the bytes written are too.
+    unsigned low_cur = 0, next_cur = 0, high_cur = 0;
+    float x_cur = 0.0f;
+    if (iterations) {
+        x_cur = *input;
+        if constexpr (Bits == 8) {
+            low_cur = word_at(packed, lane);
+            next_cur = word_at(packed, next_lane);
+        } else {
+            if (lane < words) low_cur = word_at(packed, lane);
+            if (lane + 32u < words) high_cur = word_at(packed, lane + 32u);
+        }
+    }
     for (unsigned it = 0; it < iterations; ++it) {
-        auto word = [&](unsigned w) -> unsigned {
-            if constexpr (Aligned) return *reinterpret_cast<const unsigned *>(packed + 2 * w);
-            else return word32(packed, w);
-        };
-        const float x = *input;
+        unsigned low_nxt = 0, next_nxt = 0, high_nxt = 0;
+        float x_nxt = 0.0f;
+        if constexpr (Pipe) {
+            if (it + 1 < iterations) {
+                const uint16_t *ahead = packed + tile_step;
+                x_nxt = input[128];
+                if constexpr (Bits == 8) {
+                    low_nxt = word_at(ahead, lane);
+                    next_nxt = word_at(ahead, next_lane);
+                } else {
+                    if (lane < words) low_nxt = word_at(ahead, lane);
+                    if (lane + 32u < words) high_nxt = word_at(ahead, lane + 32u);
+                }
+            }
+        } else {
+            if constexpr (Bits == 8) {
+                low_cur = word_at(packed, lane);
+                next_cur = word_at(packed, next_lane);
+            } else {
+                if (lane < words) low_cur = word_at(packed, lane);
+                if (lane + 32u < words) high_cur = word_at(packed, lane + 32u);
+            }
+            x_cur = *input;
+        }
         if constexpr (Bits == 8) {
             // 32 words per tile: entry i of the doubled table holds words i and i + 1, so one
             // 64-bit read gives the two words of a state window.
-            const unsigned low = word(lane), next = word(next_lane);
+            const uint2 staged = make_uint2(low_cur, next_cur);
             uint2 *pair = reinterpret_cast<uint2 *>(&wtab[0]);
-            pair[lane] = make_uint2(low, next);
-            pair[lane + 32] = make_uint2(low, next);
+            pair[lane] = staged;
+            pair[lane + 32] = staged;
         } else {
             if (lane < words) {
-                const unsigned low = word(lane);
-                wtab[lane] = low;
-                wtab[lane + words] = low;
+                wtab[lane] = low_cur;
+                wtab[lane + words] = low_cur;
             }
             if (lane + 32u < words) {
-                const unsigned high = word(lane + 32u);
-                wtab[lane + 32u] = high;
-                wtab[lane + 32u + words] = high;
+                wtab[lane + 32u] = high_cur;
+                wtab[lane + 32u + words] = high_cur;
             }
         }
         __syncwarp();
+        const float x = x_cur;
         #pragma unroll
         for (unsigned col = 0; col < 8; ++col) {
             unsigned index, shift;
@@ -1036,6 +1074,10 @@ __device__ __forceinline__ void grouped_projection_one_tile(
                 sums[col] = fmaf(x, decode_float<Book>(state, consts), sums[col]);
         }
         __syncwarp();
+        low_cur = low_nxt;
+        next_cur = next_nxt;
+        high_cur = high_nxt;
+        x_cur = x_nxt;
         packed += tile_step;
         input += 128;
     }
@@ -1169,20 +1211,20 @@ __device__ __forceinline__ void grouped_projection_wide(
 }
 
 // The one-tile body with the loop copy that matches the trellis alignment.
-template <int Book, int Bits, class Args, bool Dp4a = false>
+template <int Book, int Bits, class Args, bool Dp4a = false, bool Pipe = false>
 __device__ __forceinline__ void one_tile_by_alignment(const Args &p, const GroupEntry &a,
                                                       unsigned (&wtab)[128],
                                                       float (&partial)[8][16],
                                                       uint32_t split_k) {
     if ((reinterpret_cast<uintptr_t>(a.trellis) & 3u) == 0)
-        grouped_projection_one_tile<Book, Bits, true, Args, Dp4a>(p, a, wtab, partial, split_k);
+        grouped_projection_one_tile<Book, Bits, true, Args, Dp4a, Pipe>(p, a, wtab, partial, split_k);
     else
-        grouped_projection_one_tile<Book, Bits, false, Args, Dp4a>(p, a, wtab, partial, split_k);
+        grouped_projection_one_tile<Book, Bits, false, Args, Dp4a, Pipe>(p, a, wtab, partial, split_k);
 }
 
 // 8 is 4.0 bpw (every projection of the Qwen3.6 pack except the head), 12 is 6.0 bpw (the
 // head); any other rate runs the generic body.
-template <int Book, int Cols, bool LeanAnyRate, class Args, bool Dp4a = false>
+template <int Book, int Cols, bool LeanAnyRate, class Args, bool Dp4a = false, bool Pipe = false>
 __device__ __forceinline__ void wide_by_rate(const Args &p, const GroupEntry &a,
                                              unsigned (&wtab)[Cols][128],
                                              float (&partial)[8][16 * Cols]) {
@@ -1190,13 +1232,13 @@ __device__ __forceinline__ void wide_by_rate(const Args &p, const GroupEntry &a,
     static_assert(!Dp4a || (Cols == 1 && LeanAnyRate), "the DP4A decode runs one tile per block");
     if constexpr (Cols == 1) {
         switch (a.bits_twice) {
-            case 8: one_tile_by_alignment<Book, 8, Args, Dp4a>(p, a, wtab[0], partial, p.split_k); break;
-            case 12: one_tile_by_alignment<Book, 12, Args, Dp4a>(p, a, wtab[0], partial, p.split_k); break;
+            case 8: one_tile_by_alignment<Book, 8, Args, Dp4a, Pipe>(p, a, wtab[0], partial, p.split_k); break;
+            case 12: one_tile_by_alignment<Book, 12, Args, Dp4a, Pipe>(p, a, wtab[0], partial, p.split_k); break;
             default:
                 // The dense kernel keeps the generic body for the rates the model does not use:
                 // the lean body at an unknown rate spills there; the indexed kernel does not.
                 if constexpr (LeanAnyRate)
-                    one_tile_by_alignment<Book, 0, Args, Dp4a>(p, a, wtab[0], partial, p.split_k);
+                    one_tile_by_alignment<Book, 0, Args, Dp4a, Pipe>(p, a, wtab[0], partial, p.split_k);
                 else
                     grouped_projection_wide<Book, 1, 0>(p, a, wtab, partial);
                 break;
@@ -1559,15 +1601,15 @@ __device__ __forceinline__ void indexed_input_rotate_body(const P &p, float (&va
     a.xh[index] = finite_or_flag(rotate128(value, values), p.flag);
 }
 
-template <int Cols, bool Dp4a, class P>
+template <int Cols, bool Dp4a, bool Pipe, class P>
 __device__ __forceinline__ void indexed_project_body(const P &p, float (&partial)[8][16 * Cols],
                                                      unsigned (&wtab)[8][Cols][128]) {
     GroupEntry a;
     if (!resolve_indexed(p, a)) return;
     switch (a.book) {
-        case 0: wide_by_rate<0, Cols, true, P, Dp4a>(p, a, wtab[threadIdx.x / 32], partial); break;
-        case 1: wide_by_rate<1, Cols, true, P, Dp4a>(p, a, wtab[threadIdx.x / 32], partial); break;
-        default: wide_by_rate<2, Cols, true, P, Dp4a>(p, a, wtab[threadIdx.x / 32], partial); break;
+        case 0: wide_by_rate<0, Cols, true, P, Dp4a, Pipe>(p, a, wtab[threadIdx.x / 32], partial); break;
+        case 1: wide_by_rate<1, Cols, true, P, Dp4a, Pipe>(p, a, wtab[threadIdx.x / 32], partial); break;
+        default: wide_by_rate<2, Cols, true, P, Dp4a, Pipe>(p, a, wtab[threadIdx.x / 32], partial); break;
     }
 }
 
@@ -1596,7 +1638,7 @@ __global__ void __launch_bounds__(256, wide_min_blocks<Cols>) indexed_project_wi
     const __grid_constant__ IndexedArgs p) {
     __shared__ float partial[8][16 * Cols];
     __shared__ __align__(8) unsigned wtab[8][Cols][128];
-    indexed_project_body<Cols, false>(p, partial, wtab);
+    indexed_project_body<Cols, false, false>(p, partial, wtab);
 }
 
 __global__ void indexed_output_rotate(const __grid_constant__ IndexedArgs p) {
@@ -1613,12 +1655,12 @@ __global__ void option_input_rotate(const __grid_constant__ P p) {
     indexed_input_rotate_body(p, values);
 }
 
-template <class P, bool Dp4a>
+template <class P, bool Dp4a, bool Pipe = false>
 __global__ void __launch_bounds__(256, wide_min_blocks<1>) option_project(
     const __grid_constant__ P p) {
     __shared__ float partial[8][16];
     __shared__ __align__(8) unsigned wtab[8][1][128];
-    indexed_project_body<1, Dp4a>(p, partial, wtab);
+    indexed_project_body<1, Dp4a, Pipe>(p, partial, wtab);
 }
 
 template <class P>
@@ -1817,7 +1859,7 @@ static int indexed_launch(const inference_cuda_exl3_linear_args *calls,
 }
 
 // The id-indexed launch of an option on parameter block P, one tile per block.
-template <class P, bool Dp4a>
+template <class P, bool Dp4a, bool Pipe = false>
 static int option_launch(const inference_cuda_exl3_linear_args *calls,
     const inference_cuda_exl3_index_args *index, size_t count, void *stream, int *out_stage) {
     try {
@@ -1831,7 +1873,7 @@ static int option_launch(const inference_cuda_exl3_linear_args *calls,
             if (e.kind == LinearKind::Input)
                 option_input_rotate<P><<<grid,block,0,(cudaStream_t)stream>>>(args);
             else if (e.kind == LinearKind::Small)
-                option_project<P, Dp4a><<<grid,block,0,(cudaStream_t)stream>>>(args);
+                option_project<P, Dp4a, Pipe><<<grid,block,0,(cudaStream_t)stream>>>(args);
             else option_output_rotate<P><<<grid,block,0,(cudaStream_t)stream>>>(args);
             failure.record(cudaGetLastError(), INFERENCE_CUDA_STAGE_LAUNCH);
             return failure.err == cudaSuccess;
@@ -1940,8 +1982,9 @@ extern "C" int inference_cuda_exl3_grouped_indexed(const inference_cuda_exl3_lin
 }
 
 // The id-indexed launch with opt-in options, one tile per block. `options` bit 0 decodes book 2
-// with DP4A; bit 1 takes up to 20 calls in one launch (else up to 16). Options 0 is the default
-// launch (inference_cuda_exl3_grouped_indexed) and is refused here.
+// with DP4A; bit 1 takes up to 20 calls in one launch (else up to 16); bit 2 pipelines the tile
+// loop (the next tile's loads issued before the current one's barriers; same bytes). Options 0
+// is the default launch (inference_cuda_exl3_grouped_indexed) and is refused here.
 extern "C" int inference_cuda_exl3_grouped_indexed_option(
     const inference_cuda_exl3_linear_args *calls, const inference_cuda_exl3_index_args *index,
     size_t count, void *stream, int *out_stage, unsigned options) {
@@ -1951,6 +1994,12 @@ extern "C" int inference_cuda_exl3_grouped_indexed_option(
             return option_launch<IndexedOptionArgs, false>(calls, index, count, stream, out_stage);
         case 3:
             return option_launch<IndexedOptionArgs, true>(calls, index, count, stream, out_stage);
+        case 4: return option_launch<IndexedArgs, false, true>(calls, index, count, stream, out_stage);
+        case 5: return option_launch<IndexedArgs, true, true>(calls, index, count, stream, out_stage);
+        case 6:
+            return option_launch<IndexedOptionArgs, false, true>(calls, index, count, stream, out_stage);
+        case 7:
+            return option_launch<IndexedOptionArgs, true, true>(calls, index, count, stream, out_stage);
         default: return INFERENCE_CUDA_INVALID_ARGUMENT;
     }
 }

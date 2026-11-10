@@ -112,48 +112,95 @@ pub(crate) const DP4A_VAR: &str = "FIFI_EXL3_DP4A";
 /// pairs, `20` takes up to 20 pairs in one launch. Same bytes. A set value wins over the default a
 /// session registered (the Flash-Next CUDA decode takes 20). Process-wide, read once, strict.
 pub(crate) const INDEXED_PAIRS_VAR: &str = "FIFI_EXL3_INDEXED_PAIRS";
+/// Opt-in switch of the pipelined tile loop of the id-indexed launch: unset or `0` keeps the
+/// default loop, `1` issues the next tile's loads before the current one's barriers so the load
+/// latency overlaps the decode. Same bytes. A set value wins over the default a session
+/// registered. Process-wide, read once, strict: any other value is refused.
+pub(crate) const PIPE_VAR: &str = "FIFI_EXL3_PIPELINE";
 
 /// The opt-in options of the id-indexed launch, each selected on its own: the DP4A decode of
-/// book 2 ([`DP4A_VAR`]) and one launch of up to 20 pairs ([`INDEXED_PAIRS_VAR`]). Both off is
-/// the default launch, which stays the fallback. Every byte an option writes equals the default
-/// launch of the same calls; both options run one tile per block.
+/// book 2 ([`DP4A_VAR`]), one launch of up to 20 pairs ([`INDEXED_PAIRS_VAR`]) and the pipelined
+/// tile loop ([`PIPE_VAR`]). All off is the default launch, which stays the fallback. Every byte
+/// an option writes equals the default launch of the same calls; every option runs one tile per
+/// block.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub(crate) struct IndexedOptions {
     pub(crate) dp4a: bool,
     pub(crate) pairs20: bool,
+    pub(crate) pipeline: bool,
 }
 
 impl IndexedOptions {
     pub(crate) const OFF: Self = Self {
         dp4a: false,
         pairs20: false,
+        pipeline: false,
     };
     #[cfg(test)]
     pub(crate) const DP4A: Self = Self {
         dp4a: true,
         pairs20: false,
+        pipeline: false,
     };
     #[cfg(test)]
     pub(crate) const PAIRS20: Self = Self {
         dp4a: false,
         pairs20: true,
+        pipeline: false,
     };
     #[cfg(test)]
     pub(crate) const BOTH: Self = Self {
         dp4a: true,
         pairs20: true,
+        pipeline: false,
     };
     #[cfg(test)]
-    pub(crate) const ALL: [Self; 4] = [Self::OFF, Self::DP4A, Self::PAIRS20, Self::BOTH];
+    pub(crate) const PIPE: Self = Self {
+        dp4a: false,
+        pairs20: false,
+        pipeline: true,
+    };
+    #[cfg(test)]
+    pub(crate) const PAIRS20_PIPE: Self = Self {
+        dp4a: false,
+        pairs20: true,
+        pipeline: true,
+    };
+    #[cfg(test)]
+    pub(crate) const BOTH_PIPE: Self = Self {
+        dp4a: true,
+        pairs20: true,
+        pipeline: true,
+    };
+    #[cfg(test)]
+    pub(crate) const ALL: [Self; 8] = [
+        Self::OFF,
+        Self::DP4A,
+        Self::PAIRS20,
+        Self::BOTH,
+        Self::PIPE,
+        Self {
+            dp4a: true,
+            pairs20: false,
+            pipeline: true,
+        },
+        Self::PAIRS20_PIPE,
+        Self::BOTH_PIPE,
+    ];
 
-    /// A short label for test and bench records: `off`, `dp4a`, `pairs20` or `both`.
+    /// A short label for test and bench records: `off`, `dp4a`, `pairs20`, `both`, `pipe`, or
+    /// those joined by `+`.
     #[cfg(test)]
     pub(crate) fn name(self) -> &'static str {
-        match (self.dp4a, self.pairs20) {
-            (false, false) => "off",
-            (true, false) => "dp4a",
-            (false, true) => "pairs20",
-            (true, true) => "both",
+        match (self.dp4a, self.pairs20, self.pipeline) {
+            (false, false, false) => "off",
+            (true, false, false) => "dp4a",
+            (false, true, false) => "pairs20",
+            (true, true, false) => "both",
+            (false, false, true) => "pipe",
+            (true, false, true) => "dp4a+pipe",
+            (false, true, true) => "pairs20+pipe",
+            (true, true, true) => "all",
         }
     }
 
@@ -166,16 +213,18 @@ impl IndexedOptions {
         }
     }
 
-    /// The native options for a launch of `calls` pairs (bit 0 DP4A, bit 1 the 20-pair block), or
-    /// `None` for the default launch: the 20-pair option changes only launches of more than 16
-    /// pairs, so the launches of a 16-pair model keep the default kernels under it.
+    /// The native options for a launch of `calls` pairs (bit 0 DP4A, bit 1 the 20-pair block,
+    /// bit 2 the pipelined tile loop), or `None` for the default launch: the 20-pair option
+    /// changes only launches of more than 16 pairs, so the launches of a 16-pair model keep the
+    /// default kernels under it.
     fn native(self, calls: usize) -> Option<u32> {
         let wide = self.pairs20 && calls > INDEXED_CAPACITY;
-        let bits = u32::from(self.dp4a) | (u32::from(wide) << 1);
+        let bits =
+            u32::from(self.dp4a) | (u32::from(wide) << 1) | (u32::from(self.pipeline) << 2);
         (bits != 0).then_some(bits)
     }
 
-    /// The load-line suffix of the options: empty when both are off, so the default line is
+    /// The load-line suffix of the options: empty when all are off, so the default line is
     /// unchanged.
     fn suffix(self) -> String {
         let mut suffix = String::new();
@@ -184,6 +233,9 @@ impl IndexedOptions {
         }
         if self.pairs20 {
             suffix.push_str(" exl3_indexed_pairs=20");
+        }
+        if self.pipeline {
+            suffix.push_str(" exl3_pipeline=on");
         }
         suffix
     }
@@ -217,16 +269,34 @@ pub(crate) fn indexed_pairs_from_env(
     }
 }
 
-/// What the environment says about the DP4A option and the 20-pair option (`None`: unset).
-type IndexedExplicit = (Option<bool>, Option<bool>);
+/// Parses [`PIPE_VAR`]: `None` when unset, else whether the pipelined loop is on.
+pub(crate) fn pipe_from_env(value: Option<&std::ffi::OsStr>) -> Result<Option<bool>, String> {
+    let Some(value) = value else {
+        return Ok(None);
+    };
+    match value.to_str().map(str::trim) {
+        Some("0") => Ok(Some(false)),
+        Some("1") => Ok(Some(true)),
+        _ => Err(format!("{PIPE_VAR} must be unset, \"0\" or \"1\"")),
+    }
+}
 
-/// What the values of [`DP4A_VAR`] and [`INDEXED_PAIRS_VAR`] say about each option (`None`: unset),
-/// or the refusal of the first bad value. The environment read and the tests both go through it.
+/// What the environment says about each option (`None`: unset).
+type IndexedExplicit = (Option<bool>, Option<bool>, Option<bool>);
+
+/// What the values of [`DP4A_VAR`], [`INDEXED_PAIRS_VAR`] and [`PIPE_VAR`] say about each option
+/// (`None`: unset), or the refusal of the first bad value. The environment read and the tests
+/// both go through it.
 fn indexed_from_env(
     dp4a: Option<&std::ffi::OsStr>,
     pairs: Option<&std::ffi::OsStr>,
+    pipe: Option<&std::ffi::OsStr>,
 ) -> Result<IndexedExplicit, String> {
-    Ok((dp4a_from_env(dp4a)?, indexed_pairs_from_env(pairs)?))
+    Ok((
+        dp4a_from_env(dp4a)?,
+        indexed_pairs_from_env(pairs)?,
+        pipe_from_env(pipe)?,
+    ))
 }
 
 /// What the environment says about each option, or the refusal of a bad value. Read once per
@@ -239,6 +309,7 @@ fn indexed_explicit() -> Result<IndexedExplicit, EngError> {
             indexed_from_env(
                 std::env::var_os(DP4A_VAR).as_deref(),
                 std::env::var_os(INDEXED_PAIRS_VAR).as_deref(),
+                std::env::var_os(PIPE_VAR).as_deref(),
             )
         })
         .clone()
@@ -251,6 +322,7 @@ fn merge_indexed(default: IndexedOptions, explicit: IndexedExplicit) -> IndexedO
     IndexedOptions {
         dp4a: explicit.0.unwrap_or(default.dp4a),
         pairs20: explicit.1.unwrap_or(default.pairs20),
+        pipeline: explicit.2.unwrap_or(default.pipeline),
     }
 }
 
@@ -263,6 +335,7 @@ fn check_indexed_with(kernel: SingleRow, options: IndexedOptions) -> Result<(), 
     let on: Vec<String> = [
         (options.dp4a, format!("{DP4A_VAR}=1")),
         (options.pairs20, format!("{INDEXED_PAIRS_VAR}=20")),
+        (options.pipeline, format!("{PIPE_VAR}=1")),
     ]
     .into_iter()
     .filter_map(|(set, name)| set.then_some(name))
@@ -274,7 +347,7 @@ fn check_indexed_with(kernel: SingleRow, options: IndexedOptions) -> Result<(), 
     };
     Err(EngError::BadRequest(format!(
         "{} {verb} one tile per block: set {SINGLE_GATHER_VAR} to unset, \"off\", \"1\" or \
-         \"wide1\" with {them}, or turn {them} off ({DP4A_VAR}=0, {INDEXED_PAIRS_VAR}=16)",
+         \"wide1\" with {them}, or turn {them} off ({DP4A_VAR}=0, {INDEXED_PAIRS_VAR}=16, {PIPE_VAR}=0)",
         on.join(" and ")
     )))
 }
@@ -1428,7 +1501,7 @@ impl CudaContext {
         if let Some(native) = options.native(calls.len()) {
             if cols != 1 {
                 return Err(refuse(
-                    "the DP4A and 20-pair options run one tile per block",
+                    "the DP4A, 20-pair and pipeline options run one tile per block",
                 ));
             }
             return self.launch_on(stream, |s| {

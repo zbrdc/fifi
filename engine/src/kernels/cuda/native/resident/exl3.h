@@ -152,8 +152,9 @@ int inference_cuda_exl3_grouped_indexed(const inference_cuda_exl3_linear_args *c
                                         unsigned cols);
 /* The id-indexed launch with opt-in options, one tile per block. `options` bit 0 decodes book 2
  * with one packed byte dot product (DP4A), bit 1 takes up to 20 calls in one launch (else up to
- * 16); options 0 is refused (that is inference_cuda_exl3_grouped_indexed). Every byte written
- * equals the default launch of the same calls. */
+ * 16), bit 2 pipelines the tile loop (the next tile's loads issued before the current one's
+ * barriers); options 0 is refused (that is inference_cuda_exl3_grouped_indexed). Every byte
+ * written equals the default launch of the same calls. */
 int inference_cuda_exl3_grouped_indexed_option(const inference_cuda_exl3_linear_args *calls,
                                                const inference_cuda_exl3_index_args *index,
                                                size_t count, void *stream, int *out_stage,

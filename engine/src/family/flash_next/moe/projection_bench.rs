@@ -1,7 +1,8 @@
 //! The id-indexed EXL3 projection launch of the routed experts of one real Qwen3.8 Flash-Next
 //! layer on one GPU: the default launch against its opt-in options (`IndexedOptions`: the DP4A
-//! decode of book 2, one launch of the 20 gate and up pairs, both). Measurement only: the bench
-//! sets the options on its own context, and no executor, default or limit changes.
+//! decode of book 2, one launch of the 20 gate and up pairs, the pipelined tile loop, and their
+//! combinations). Measurement only: the bench sets the options on its own context, and no
+//! executor, default or limit changes.
 //!
 //! The launch (`CudaContext::exl3_grouped_indexed`: input rotation, the projection kernel, output
 //! rotation, one column tile per block) is timed for the layer's two expert shapes:
@@ -55,7 +56,7 @@ use crate::{
     },
     kernels::cuda::{
         CudaContext, DeviceBuffer, DeviceStream, TimingEvent,
-        resident::exl3::{DP4A_VAR, INDEXED_PAIRS_VAR, IndexedOptions},
+        resident::exl3::{DP4A_VAR, INDEXED_PAIRS_VAR, IndexedOptions, PIPE_VAR},
     },
 };
 
@@ -121,9 +122,11 @@ const GATEUP_20: &[Variant] = &[
     ("dp4a", IndexedOptions::DP4A, SPLIT),
     ("pairs20", IndexedOptions::PAIRS20, SINGLE),
     ("both", IndexedOptions::BOTH, SINGLE),
+    ("pipe", IndexedOptions::PIPE, SPLIT),
+    ("both_pipe", IndexedOptions::BOTH_PIPE, SINGLE),
 ];
 
-const CASES: [Case; 14] = [
+const CASES: [Case; 15] = [
     case("gateup_p2", Shape::GateUp, decode!(&[(0, 2)]), false),
     case("gateup_p4", Shape::GateUp, decode!(&[(0, 4)]), false),
     case("gateup_p8", Shape::GateUp, decode!(&[(0, 8)]), false),
@@ -135,6 +138,12 @@ const CASES: [Case; 14] = [
     case("down_p4", Shape::Down, decode!(&[(0, 4)]), false),
     case("down_p8", Shape::Down, decode!(&[(0, 8)]), false),
     case("down_p10", Shape::Down, decode!(&[(0, 10)]), false),
+    case(
+        "down_p10_pipe",
+        Shape::Down,
+        &[("base", IndexedOptions::OFF, &[(0, 10)]), ("pipe", IndexedOptions::PIPE, &[(0, 10)])],
+        false,
+    ),
     case("gateup_p16_warm", Shape::GateUp, decode!(&[(0, 16)]), true),
     case("gateup_20_warm", Shape::GateUp, GATEUP_20, true),
     case("down_p10_warm", Shape::Down, decode!(&[(0, 10)]), true),
@@ -425,12 +434,12 @@ fn run() -> Res<()> {
     if moe.top_k != PICKS {
         return Err(fail("the cases assume ten picks"));
     }
-    if [DP4A_VAR, INDEXED_PAIRS_VAR]
+    if [DP4A_VAR, INDEXED_PAIRS_VAR, PIPE_VAR]
         .iter()
         .any(|var| std::env::var_os(var).is_some())
     {
         return Err(fail(format!(
-            "the bench chooses its options itself: {DP4A_VAR} and {INDEXED_PAIRS_VAR} must be unset"
+            "the bench chooses its options itself: {DP4A_VAR}, {INDEXED_PAIRS_VAR} and {PIPE_VAR} must be unset"
         )));
     }
     let projector = CudaProjector::new()?;

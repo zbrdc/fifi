@@ -97,12 +97,14 @@ fn ple_device() -> bool {
 }
 
 /// The id-indexed options Flash-Next serves its routed experts with: the DP4A decode of codebook 2
-/// (the codebook of this pack) and one launch for the 20 gate and up pairs of ten picks. Both write
-/// the bytes of the default launches; a set `FIFI_EXL3_DP4A` or `FIFI_EXL3_INDEXED_PAIRS` still wins
-/// for its own option.
+/// (the codebook of this pack) and one launch for the 20 gate and up pairs of ten picks. All write
+/// the bytes of the default launches; a set `FIFI_EXL3_DP4A`, `FIFI_EXL3_INDEXED_PAIRS` or
+/// `FIFI_EXL3_PIPELINE` still wins for its own option. The pipelined tile loop stays off until it
+/// is qualified on device.
 const SERVED_INDEXED: IndexedOptions = IndexedOptions {
     dp4a: true,
     pairs20: true,
+    pipeline: false,
 };
 
 /// Registers the kernels the Flash-Next decode runs on its context: the wide single-row kernel for

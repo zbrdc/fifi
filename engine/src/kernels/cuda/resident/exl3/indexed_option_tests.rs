@@ -18,8 +18,8 @@ use std::ffi::OsStr;
 
 use super::{
     DP4A_VAR, Exl3IndexedCall, Exl3LinearCall, INDEXED_CAPACITY, INDEXED_PAIRS_VAR, IndexedOptions,
-    SINGLE_GATHER_VAR, SingleRow, check_indexed_with, dp4a_from_env, indexed_from_env,
-    indexed_pairs_from_env, merge_indexed,
+    PIPE_VAR, SINGLE_GATHER_VAR, SingleRow, check_indexed_with, dp4a_from_env, indexed_from_env,
+    indexed_pairs_from_env, merge_indexed, pipe_from_env,
 };
 use crate::kernels::cuda::{CudaContext, DeviceBuffer, DeviceStream, testkit};
 use crate::weights::exl3::Codebook;
@@ -31,6 +31,9 @@ const OFF: IndexedOptions = IndexedOptions::OFF;
 const DP4A: IndexedOptions = IndexedOptions::DP4A;
 const PAIRS20: IndexedOptions = IndexedOptions::PAIRS20;
 const BOTH: IndexedOptions = IndexedOptions::BOTH;
+const PIPE: IndexedOptions = IndexedOptions::PIPE;
+const PAIRS20_PIPE: IndexedOptions = IndexedOptions::PAIRS20_PIPE;
+const BOTH_PIPE: IndexedOptions = IndexedOptions::BOTH_PIPE;
 
 #[test]
 fn the_switches_parse_strictly() {
@@ -38,6 +41,14 @@ fn the_switches_parse_strictly() {
         |f: fn(Option<&OsStr>) -> Result<Option<bool>, String>, v: &str| f(Some(OsStr::new(v)));
     assert_eq!(dp4a_from_env(None), Ok(None));
     assert_eq!(indexed_pairs_from_env(None), Ok(None));
+    assert_eq!(pipe_from_env(None), Ok(None));
+    for (value, on) in [("0", false), ("1", true), (" 1 ", true)] {
+        assert_eq!(parse(pipe_from_env, value), Ok(Some(on)), "{value:?}");
+    }
+    for bad in ["", "on", "2", "01", "pipe"] {
+        let error = parse(pipe_from_env, bad).expect_err(bad);
+        assert!(error.contains(PIPE_VAR), "{bad:?}: {error}");
+    }
     for (value, on) in [("0", false), ("1", true), (" 1 ", true)] {
         assert_eq!(parse(dp4a_from_env, value), Ok(Some(on)), "{value:?}");
     }
@@ -62,13 +73,16 @@ fn the_switches_parse_strictly() {
 /// own option alone: `0` and `16` switch a registered default off, `1` and `20` switch one on.
 #[test]
 fn a_set_variable_wins_over_the_context_default_for_its_own_option() {
-    assert_eq!(merge_indexed(OFF, (None, None)), OFF);
-    assert_eq!(merge_indexed(BOTH, (None, None)), BOTH);
-    assert_eq!(merge_indexed(BOTH, (Some(false), None)), PAIRS20);
-    assert_eq!(merge_indexed(BOTH, (None, Some(false))), DP4A);
-    assert_eq!(merge_indexed(BOTH, (Some(false), Some(false))), OFF);
-    assert_eq!(merge_indexed(OFF, (Some(true), None)), DP4A);
-    assert_eq!(merge_indexed(DP4A, (None, Some(true))), BOTH);
+    assert_eq!(merge_indexed(OFF, (None, None, None)), OFF);
+    assert_eq!(merge_indexed(BOTH, (None, None, None)), BOTH);
+    assert_eq!(merge_indexed(BOTH, (Some(false), None, None)), PAIRS20);
+    assert_eq!(merge_indexed(BOTH, (None, Some(false), None)), DP4A);
+    assert_eq!(merge_indexed(BOTH, (Some(false), Some(false), None)), OFF);
+    assert_eq!(merge_indexed(OFF, (Some(true), None, None)), DP4A);
+    assert_eq!(merge_indexed(DP4A, (None, Some(true), None)), BOTH);
+    assert_eq!(merge_indexed(OFF, (None, None, Some(true))), PIPE);
+    assert_eq!(merge_indexed(BOTH_PIPE, (Some(false), Some(false), None)), PIPE);
+    assert_eq!(merge_indexed(BOTH, (None, None, Some(false))), BOTH);
 }
 
 /// The pair of switches the environment read goes through (the function the production read
@@ -77,21 +91,26 @@ fn a_set_variable_wins_over_the_context_default_for_its_own_option() {
 #[test]
 fn the_two_switches_select_their_options_independently() {
     let os = |v: &'static str| Some(OsStr::new(v));
-    let read =
-        |dp4a, pairs| indexed_from_env(dp4a, pairs).map(|explicit| merge_indexed(OFF, explicit));
-    assert_eq!(read(None, None), Ok(OFF));
-    assert_eq!(read(os("1"), None), Ok(DP4A));
-    assert_eq!(read(None, os("20")), Ok(PAIRS20));
-    assert_eq!(read(os("1"), os("20")), Ok(BOTH));
-    assert_eq!(read(os("0"), os("16")), Ok(OFF));
-    for (dp4a, pairs, var) in [
-        (os("on"), None, DP4A_VAR),
-        (os("1"), os("32"), INDEXED_PAIRS_VAR),
-        (None, os(""), INDEXED_PAIRS_VAR),
-        (os("2"), os("20"), DP4A_VAR),
+    let read = |dp4a, pairs, pipe| {
+        indexed_from_env(dp4a, pairs, pipe).map(|explicit| merge_indexed(OFF, explicit))
+    };
+    assert_eq!(read(None, None, None), Ok(OFF));
+    assert_eq!(read(os("1"), None, None), Ok(DP4A));
+    assert_eq!(read(None, os("20"), None), Ok(PAIRS20));
+    assert_eq!(read(os("1"), os("20"), None), Ok(BOTH));
+    assert_eq!(read(os("0"), os("16"), None), Ok(OFF));
+    assert_eq!(read(None, None, os("1")), Ok(PIPE));
+    assert_eq!(read(os("1"), os("20"), os("1")), Ok(BOTH_PIPE));
+    for (dp4a, pairs, pipe, var) in [
+        (os("on"), None, None, DP4A_VAR),
+        (os("1"), os("32"), None, INDEXED_PAIRS_VAR),
+        (None, os(""), None, INDEXED_PAIRS_VAR),
+        (os("2"), os("20"), None, DP4A_VAR),
+        (None, None, os("yes"), PIPE_VAR),
+        (os("1"), None, os("2"), PIPE_VAR),
     ] {
-        let error = read(dp4a, pairs).expect_err("a bad value");
-        assert!(error.contains(var), "{dp4a:?} {pairs:?}: {error}");
+        let error = read(dp4a, pairs, pipe).expect_err("a bad value");
+        assert!(error.contains(var), "{dp4a:?} {pairs:?} {pipe:?}: {error}");
     }
 }
 
@@ -103,12 +122,18 @@ fn an_option_changes_only_the_launches_it_names() {
         assert_eq!(DP4A.native(calls), Some(1));
         assert_eq!(PAIRS20.native(calls), over.then_some(2));
         assert_eq!(BOTH.native(calls), Some(if over { 3 } else { 1 }));
+        assert_eq!(PIPE.native(calls), Some(4));
+        assert_eq!(PAIRS20_PIPE.native(calls), Some(if over { 6 } else { 4 }));
+        assert_eq!(BOTH_PIPE.native(calls), Some(if over { 7 } else { 5 }));
     }
     for (options, capacity, name) in [
         (OFF, 16, "off"),
         (DP4A, 16, "dp4a"),
         (PAIRS20, 20, "pairs20"),
         (BOTH, 20, "both"),
+        (PIPE, 16, "pipe"),
+        (PAIRS20_PIPE, 20, "pairs20+pipe"),
+        (BOTH_PIPE, 20, "all"),
     ] {
         assert_eq!(options.capacity(), capacity, "{options:?}");
         assert_eq!(options.name(), name);
@@ -129,7 +154,7 @@ fn an_option_refuses_a_wide_kernel_of_more_than_one_tile() {
     for kernel in [SingleRow::Wide(2), SingleRow::Wide(4)] {
         assert!(check_indexed_with(kernel, OFF).is_ok(), "{kernel:?}");
         // The refusal names the switches that are on, and the kernel switch to change.
-        for options in [DP4A, PAIRS20, BOTH] {
+        for options in [DP4A, PAIRS20, BOTH, PIPE, BOTH_PIPE] {
             let error = check_indexed_with(kernel, options).expect_err("a wide kernel");
             let whole = format!("{error:?}");
             // The first part names the options that are on; the tail names both off values.
@@ -148,9 +173,15 @@ fn an_option_refuses_a_wide_kernel_of_more_than_one_tile() {
                 options.pairs20,
                 "{options:?}: {whole}"
             );
+            assert_eq!(
+                text.contains(PIPE_VAR),
+                options.pipeline,
+                "{options:?}: {whole}"
+            );
             assert!(
                 tail.contains(&format!("{DP4A_VAR}=0"))
-                    && tail.contains(&format!("{INDEXED_PAIRS_VAR}=16")),
+                    && tail.contains(&format!("{INDEXED_PAIRS_VAR}=16"))
+                    && tail.contains(&format!("{PIPE_VAR}=0")),
                 "{options:?}: {whole}"
             );
         }
@@ -163,6 +194,11 @@ fn the_load_line_names_exactly_the_options_that_are_on() {
     assert_eq!(DP4A.suffix(), " exl3_dp4a=on");
     assert_eq!(PAIRS20.suffix(), " exl3_indexed_pairs=20");
     assert_eq!(BOTH.suffix(), " exl3_dp4a=on exl3_indexed_pairs=20");
+    assert_eq!(PIPE.suffix(), " exl3_pipeline=on");
+    assert_eq!(
+        BOTH_PIPE.suffix(),
+        " exl3_dp4a=on exl3_indexed_pairs=20 exl3_pipeline=on"
+    );
 }
 
 /// The session check and the load line read the context's options: a two-tile single-row kernel
@@ -201,7 +237,7 @@ fn a_registered_default_reaches_the_session_check_and_stays_on_its_context() {
     if !testkit::device_present("EXL3 indexed default session check") {
         return;
     }
-    let set: Vec<&str> = [SINGLE_GATHER_VAR, DP4A_VAR, INDEXED_PAIRS_VAR]
+    let set: Vec<&str> = [SINGLE_GATHER_VAR, DP4A_VAR, INDEXED_PAIRS_VAR, PIPE_VAR]
         .into_iter()
         .filter(|var| std::env::var_os(var).is_some())
         .collect();
@@ -492,7 +528,7 @@ fn indexed_options_write_the_bytes_of_the_default_launch() {
         let mut bad = ids;
         bad[17] = bank.members as i32;
         bad[19] = -1;
-        for options in [DP4A, PAIRS20, BOTH] {
+        for options in [DP4A, PAIRS20, BOTH, PIPE, PAIRS20_PIPE, BOTH_PIPE] {
             ctx.set_indexed_options(Some(options));
             let got = bank.run(&ctx, &stream, &ids);
             assert_eq!(got, want, "{kind:?} {options:?}");
@@ -537,7 +573,7 @@ fn only_the_twenty_pair_option_takes_twenty_calls_in_one_launch() {
     let ids: [i32; PAIRS] = std::array::from_fn(|p| (p * 5 % bank.members) as i32);
     ctx.set_indexed_options(Some(OFF));
     let want = bank.run(&ctx, &stream, &ids);
-    for options in [OFF, DP4A] {
+    for options in [OFF, DP4A, PIPE] {
         ctx.set_indexed_options(Some(options));
         assert_eq!(ctx.exl3_indexed_capacity(), INDEXED_CAPACITY);
         assert!(
@@ -545,7 +581,7 @@ fn only_the_twenty_pair_option_takes_twenty_calls_in_one_launch() {
             "{options:?} took 20 calls"
         );
     }
-    for options in [PAIRS20, BOTH] {
+    for options in [PAIRS20, BOTH, PAIRS20_PIPE, BOTH_PIPE] {
         ctx.set_indexed_options(Some(options));
         assert_eq!(ctx.exl3_indexed_capacity(), PAIRS);
         let got = bank.run_in(&ctx, &stream, &ids, (PAIRS, 1)).unwrap();
