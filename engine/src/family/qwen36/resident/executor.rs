@@ -306,7 +306,19 @@ fn window_taps_on() -> bool {
 /// layer of a device-routed chunk window runs as ONE `mlx_compile`d closure (input norm,
 /// mixer, both residual adds, and the folded MoE rows sequence) instead of ~395 eager native
 /// entries. Default off; the eager chunk stays the reference and the parity oracle.
+///
+/// The test override exists because edition 2024 makes `set_var` unsafe and the crate denies
+/// `unsafe_code`: the parity test flips the AtomicBool instead of the environment, inside the
+/// native test lock, and a production build reads the variable alone.
+#[cfg(test)]
+pub(super) static COMPILED_LAYER_TEST: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
 pub(super) fn compiled_layer_on() -> bool {
+    #[cfg(test)]
+    if COMPILED_LAYER_TEST.load(std::sync::atomic::Ordering::Relaxed) {
+        return true;
+    }
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| std::env::var_os("Q36_COMPILED_LAYER").is_some_and(|v| v == "1"))
 }
