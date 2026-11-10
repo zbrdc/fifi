@@ -1137,6 +1137,7 @@ impl Context {
         let f32_operands: Vec<&ExecutionTensor> = args
             .plain
             .iter()
+            .copied()
             .chain(std::iter::once(args.qk_eps))
             .chain(std::iter::once(args.sqrt_kd))
             .chain(std::iter::once(args.router_t))
@@ -1147,7 +1148,10 @@ impl Context {
         check_norm_operand(label, adapter, args.post_norm, hidden, args.act)?;
         check_operand(label, adapter, args.rec)?;
         check_operand(label, adapter, args.ring)?;
-        let triples: Vec<[i32; 3]> = packed_all.iter().map(|w| quant_triple(w)).collect::<Result<_, _>>()?;
+        let triples: Vec<[i32; 3]> = packed_all
+            .iter()
+            .map(|w| quant_triple(w))
+            .collect::<Result<_, _>>()?;
         let quant: Vec<i32> = triples.iter().flat_map(|t| t.iter().copied()).collect();
         let fun_id = compile_key::delta_layer_fun_id(&compile_key::DeltaLayerBaked {
             hidden: args.hidden,
@@ -1163,9 +1167,7 @@ impl Context {
                 .collect::<Vec<_>>()
                 .try_into()
                 .expect("ten packed weights"),
-            quant: triples
-                .try_into()
-                .expect("ten quantization triples"),
+            quant: triples.try_into().expect("ten quantization triples"),
         });
         adapter.programs.admit(fun_id)?;
         let dims: [i32; 12] = [
