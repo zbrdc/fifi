@@ -683,8 +683,8 @@ constexpr int kCHpad = 40;      // halves per value-major split row of U: kC + 8
 // three gate vectors.
 constexpr size_t kChunkSmem =
     (4 * kC + 2 * kCols) * kHpad * sizeof(__half) +
-    (2 * kC + 2 * kCols) * kCHpad * sizeof(__half) +
-    (2 * kC * kCpad + 3 * kC) * sizeof(float);
+    (2 * kC * kCHpad + 2 * kCols * kCHpad) * sizeof(__half) +
+    (kC * kCpad + 3 * kC) * sizeof(float);
 static_assert(kChunkSmem < 96 * 1024, "sm_72 caps opt-in shared memory at 96KB per block");
 static_assert(kHpad >= D, "r-major half rows must hold a full D row");
 
@@ -758,8 +758,7 @@ __global__ void __launch_bounds__(kLanes * kChunkWarps, 1) gdn_scan_chunk_k(Scan
     __half *const A_h = U_l + kCols * kCHpad;             // A hi [kC][kCHpad] (upper zero, rows ≥ len zero)
     __half *const A_l = A_h + kC * kCHpad;                // A lo
     float *const G_s = reinterpret_cast<float *>(A_l + kC * kCHpad);  // G[t][s] = b_t·(B_t/B_s)·(k_t·k_s), s < t
-    float *const A_s = G_s + kC * kCpad;           // A[t][s] = (B_t/B_s)·(q_t·k_s), s ≤ t (upper zeroed)
-    float *const dec_s = A_s + kC * kCpad;         // the decay gates a_t
+    float *const dec_s = G_s + kC * kCpad;         // the decay gates a_t
     float *const b_s = dec_s + kC;                 // the beta gates
     float *const B_s = b_s + kC;                   // the prefix products B_t
     const int h = blockIdx.x, kh = key_head<kGrouped>(h, a);
@@ -789,9 +788,9 @@ __global__ void __launch_bounds__(kLanes * kChunkWarps, 1) gdn_scan_chunk_k(Scan
     // A rows in 128-bit steps past the diagonal, and the zeros swallow the unwritten U
     // entries of a short tail. G's upper and padding stay zero for the same reason: the
     // serial pass reads its rows in 128-bit steps past the diagonal.
-    for (int i = tid; i < 2 * kC * kCpad; i += kLanes * kChunkWarps) {
+    for (int i = tid; i < kC * kCpad; i += kLanes * kChunkWarps) {
         const int t = i / kCpad, s = i % kCpad;
-        if (s > t) (i < kC * kCpad ? A_s : G_s)[i % (kC * kCpad)] = 0.f;
+        if (s > t) G_s[i] = 0.f;
     }
     // U and the A splits stay zero outside the written window for the whole launch: the
     // phases that walk the full kC window pair those slots with zeros (finite halves),
@@ -900,11 +899,9 @@ __global__ void __launch_bounds__(kLanes * kChunkWarps, 1) gdn_scan_chunk_k(Scan
                     if (is_kk) {
                         G_s[t * kCpad + s] = b_s[t] * ratio * d[e];
                     } else {
-                        A_s[t * kCpad + s] = ratio * d[e];
                         f2s_at(ratio * d[e], A_h, A_l, t * kCHpad + s);
                     }
                 } else if (!is_kk) {
-                    A_s[t * kCpad + t] = d[e];
                     f2s_at(d[e], A_h, A_l, t * kCHpad + t);
                 }
             }
@@ -934,10 +931,8 @@ __global__ void __launch_bounds__(kLanes * kChunkWarps, 1) gdn_scan_chunk_k(Scan
             }
             if (s != t) {
                 G_s[t * kCpad + s] = b_s[t] * ratio * kk;
-                A_s[t * kCpad + s] = ratio * qk;
                 f2s_at(ratio * qk, A_h, A_l, t * kCHpad + s);
             } else {
-                A_s[t * kCpad + t] = qk;
                 f2s_at(qk, A_h, A_l, t * kCHpad + t);
             }
         }
@@ -1063,15 +1058,9 @@ __global__ void __launch_bounds__(kLanes * kChunkWarps, 1) gdn_scan_chunk_k(Scan
                 float inter = 0.f;
                 for (int r = 0; r < D; ++r)
                     inter += j2(q_h, q_l, t * kHpad + r) * j2(S_h, S_l, c * kHpad + r);
-                const float4 *at = reinterpret_cast<const float4 *>(A_s + t * kCpad);
                 float intra = 0.f;
-#pragma unroll 2
-                for (int s = 0; s <= t / 4; ++s) {
-                    const float4 as = at[s];
-                    const int b4 = c * kCHpad + 4 * s;
-                    intra += as.x * j2(U_h, U_l, b4) + as.y * j2(U_h, U_l, b4 + 1) +
-                             as.z * j2(U_h, U_l, b4 + 2) + as.w * j2(U_h, U_l, b4 + 3);
-                }
+                for (int s = 0; s <= t; ++s)
+                    intra += j2(A_h, A_l, t * kCHpad + s) * j2(U_h, U_l, c * kCHpad + s);
                 a.o_out[((size_t)(t0 + t) * a.n_v_heads + h) * D + col0 + c] =
                     B_s[t] * inter + intra;
             }
