@@ -96,6 +96,7 @@ fn projections_match_f64(dtype: Dtype, gate: &str) {
         WIDTH,
         HIDDEN,
         EMBED,
+        2,
     )
     .unwrap();
     assert_eq!(
@@ -144,9 +145,9 @@ fn the_projections_refuse_a_wrong_size_before_any_launch() {
     }
     let context = CudaContext::new().expect("context");
     let stream = context.stream().expect("stream");
-    assert!(DevicePle::upload(&context, Dtype::F16, &[0; 6], &[0; 8], 2, 2, 2).is_err());
+    assert!(DevicePle::upload(&context, Dtype::F16, &[0; 6], &[0; 8], 2, 2, 2, 2).is_err());
     for other in [Dtype::F32, Dtype::I32] {
-        match DevicePle::upload(&context, other, &[0; 16], &[0; 16], 2, 2, 2) {
+        match DevicePle::upload(&context, other, &[0; 16], &[0; 16], 2, 2, 2, 2) {
             Err(EngError::Checkpoint(message)) => {
                 assert!(message.contains("F16 or BF16"), "{message}")
             }
@@ -154,7 +155,7 @@ fn the_projections_refuse_a_wrong_size_before_any_launch() {
             Ok(_) => panic!("{other:?} was accepted"),
         }
     }
-    let mut ple = DevicePle::upload(&context, Dtype::F16, &[0; 8], &[0; 8], 2, 2, 2).unwrap();
+    let mut ple = DevicePle::upload(&context, Dtype::F16, &[0; 8], &[0; 8], 2, 2, 2, 2).unwrap();
     assert!(matches!(
         ple.enqueue(&context, &stream, &[0.0; 3]),
         Err(EngError::BadRequest(_))
@@ -265,6 +266,7 @@ fn the_route_agrees_with_the_host_projection_of_the_same_stored_values() {
             WIDTH,
             HIDDEN,
             EMBED,
+            2,
         )
         .unwrap(),
         context,

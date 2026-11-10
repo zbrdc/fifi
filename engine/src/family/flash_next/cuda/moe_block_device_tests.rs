@@ -604,6 +604,7 @@ fn a_chunk_over_the_prefill_ring_matches_the_all_resident_block() {
                 &one_row,
                 true,
                 None,
+                false,
             )
             .expect("the all-resident block");
             launch.stream.synchronize().expect("sync");
@@ -914,6 +915,7 @@ fn a_chunk_whose_picks_fit_the_bank_admits_the_union_in_one_pass() {
             &one_row,
             true,
             None,
+            false,
         )
         .expect("the all-resident block");
         launch.stream.synchronize().expect("sync");
