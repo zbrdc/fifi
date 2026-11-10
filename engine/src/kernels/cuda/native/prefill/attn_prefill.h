@@ -49,13 +49,12 @@
  * writes NaN to out, and each ORs mask 8 (INFERENCE_CUDA_PREFILL_STATUS_BOUND_VIOLATION) into
  * *status when status != NULL. A valid launch touches neither.
  *
- * The D256 MMA part uses 96 KB of dynamic shared memory; D128 uses 64 KB (two cp.async K/V stages
- * and a 32 KB score exchange). The entry opts in above the 48 KB default with cudaFuncSetAttribute
- * once per variant (the vendored gemm.cuh pattern), one block per SM. Code compiled for sm_72
- * (__CUDA_ARCH__ < 800; the entry selects by the loaded code's PTX arch) runs an fp32 SIMT part
- * kernel instead, attn_prefill_part_simt_k (grid (max_splits, n_kv_head, q_tiles), 128 threads),
- * requesting 96/48 KB for D256/D128; it computes the same result within the prefill-attention
- * tolerance, not bit for bit. It is compile-only (no board run).
+ * The default selects by loaded PTX and preserves the existing launch path. The D256 MMA part
+ * uses 96 KiB of dynamic shared memory; D128 uses 64 KiB. The SIMT arm uses a single K/V stage
+ * and requests 64/32 KiB for D256/D128. SIMT computes within the prefill-attention tolerance,
+ * not bit for bit. With FIFI_CUDA_ATTN_PREFILL_ADAPT=1, the launch also checks the current
+ * device's per-block shared-memory and thread limits and the compiled kernels' attributes;
+ * successful choices are cached per device and model geometry. Query or opt-in failures propagate.
  *
  * Legacy F16 NaN isolation is per 64-row query tile, not per row: a NaN V cell inside a tile's key range
  * reaches every row of that tile (a row that does not see the key still multiplies p = 0 by

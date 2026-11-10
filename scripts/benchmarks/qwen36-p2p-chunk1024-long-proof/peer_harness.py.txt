@@ -1,0 +1,185 @@
+#!/usr/bin/env python3
+"""Pinned P2P parity checks called only by the guarded reservation harness."""
+import fcntl
+import hashlib
+import json
+import os
+from pathlib import Path
+import re
+import shutil
+import subprocess
+import sys
+
+TASK=Path('/home/ben/fifi-scratch/725f186d7122/p2p-chunk1024')
+SOURCE=TASK/'wt'
+ROOT=Path(__file__).resolve().parent
+COMMIT='3a0e82c26a7a2259ac11ff6cd915018946598264'
+SOURCE_HEAD='48125d3d5344d44bfb1bbc29777809cfb3a72393'
+EVIDENCE_DELTA={
+ 'doc/qwen36-p2p-chunked-prefill.md',
+ 'scripts/benchmarks/qwen36-p2p-chunk1024-proof/bench_p2p_decode.py',
+ 'scripts/benchmarks/qwen36-p2p-chunk1024-proof/bench_p2p_prefill.py',
+ 'scripts/benchmarks/qwen36-p2p-chunk1024-proof/benchmark_harness.py.txt',
+ 'scripts/benchmarks/qwen36-p2p-chunk1024-proof/compare_prefill.py',
+ 'scripts/benchmarks/qwen36-p2p-chunk1024-proof/generate_evidence.py',
+ 'scripts/benchmarks/qwen36-p2p-chunk1024-proof/peer_harness.py.txt',
+ 'scripts/benchmarks/qwen36-p2p-chunk1024-results.json',
+}
+LOCK=Path('/home/ben/fifi-qwen36/gpu.lock')
+DEVICE='GPU-282e266a-24ac-6fa8-a16d-4281e52b4c0a'
+PAIR_VISIBLE='GPU-704fef60-5280-9b88-fa3d-d11135caf576,GPU-282e266a-24ac-6fa8-a16d-4281e52b4c0a'
+TESTS=(('family::qwen36::cuda::card_chunk_device_tests::card_chunk_matches_the_per_token_path_on_physical_peers', True), ('family::qwen36::cuda::card_chunk_device_tests::max_card_chunk_matches_the_per_token_path_on_physical_peers', True), ('family::qwen36::cuda::card_chunk_device_tests::wide_card_chunk_matches_the_per_token_path_on_physical_peers', True), ('kernels::cuda::peer_ring::device_tests::wide_f32_exchanges_reuse_slots_on_physical_peers', True))
+SMOKE_CASE=('chunk-smoke', TESTS[0][0], False)
+CASES=(('wide-ring-reuse', TESTS[3][0], False), ('chunk512', TESTS[1][0], False), ('chunk1024', TESTS[2][0], False))
+HOST_TESTS=('family::qwen36::cuda::card_prefill::config_tests::chunk_setting_is_explicit_and_bounded', 'family::qwen36::cuda::card_prefill::config_tests::mailbox_covers_both_chunk_sums_and_eager_decode', 'family::qwen36::cuda::card_prefill::config_tests::chunk_admission_preserves_the_free_vram_floor', 'family::qwen36::cuda::card_prefill::config_tests::card_staging_respects_shard_geometry_and_live_floor', 'family::qwen36::cuda::prefill_plan::card_tests::card_chunk_arenas_are_narrower_and_complete', 'family::qwen36::cuda::prefill_plan::card_tests::card_combine_output_is_disjoint_from_its_inputs', 'kernels::cuda::peer_ring::tests::wide_f32_exchange_does_not_extend_the_fp16_bound', 'kernels::cuda::native::peer_ring::tests::fp16_retains_its_old_native_limit_before_launch', 'kernels::cuda::native::peer_ring::tests::fp32_refuses_payloads_above_the_wide_limit_before_launch', 'kernels::cuda::peer_ring::tests::the_layout_aligns_every_slot_for_odd_capacities')
+ENUMERATED_PEER_TESTS=['family::qwen36::cuda::card_chunk_device_tests::card_chunk_matches_the_per_token_path_on_physical_peers', 'family::qwen36::cuda::card_chunk_device_tests::max_card_chunk_matches_the_per_token_path_on_physical_peers', 'family::qwen36::cuda::card_chunk_device_tests::wide_card_chunk_matches_the_per_token_path_on_physical_peers', 'kernels::cuda::peer_ring::device_tests::wide_f32_exchanges_reuse_slots_on_physical_peers']
+
+def sha(path):
+ with Path(path).open('rb') as stream: return hashlib.file_digest(stream,'sha256').hexdigest()
+
+def validate_host_results(results):
+ if len(results)!=len(HOST_TESTS):
+  raise ValueError('host test result count mismatch')
+ for expected,result in zip(HOST_TESTS,results):
+  log=Path(result.get('log',''))
+  if (result.get('name')!=expected or result.get('pass') is not True or result.get('exit')!=0
+      or log.is_symlink() or not log.is_file() or log.parent.resolve()!=(TASK/'logs').resolve()
+      or sha(log)!=result.get('sha256')
+      or 'test result: ok. 1 passed; 0 failed; 0 ignored;' not in log.read_text()):
+   raise ValueError('host test result or log mismatch: '+expected)
+
+def preflight():
+ def git(*args): return subprocess.check_output(['git','-C',str(SOURCE),*args],text=True,timeout=10).strip()
+ if (git('rev-parse','HEAD')!=SOURCE_HEAD or git('status','--porcelain','--untracked-files=all')
+     or set(git('diff','--name-only',COMMIT,SOURCE_HEAD).splitlines())!=EVIDENCE_DELTA
+     or git('merge-base','--is-ancestor',COMMIT,SOURCE_HEAD)!=''):
+  raise ValueError('source differs from the pinned evidence-only descendant of the built commit')
+ receipt=Path(os.environ.get('FIFI_P2P_BUILD_RECEIPT',''))
+ if (not receipt.is_absolute() or receipt.is_symlink() or not receipt.is_file()
+     or receipt.parent.resolve()!=(TASK/'logs').resolve()
+     or not re.fullmatch(r'verified-build-[0-9]+\.json',receipt.name)):
+  raise ValueError('missing or unsafe exact-tip build receipt')
+ stamp=json.loads(receipt.read_text())
+ if (stamp.get('commit')!=COMMIT or stamp.get('target')!='native-cuda linux sm86 release'
+     or stamp.get('device_tests_run') is not False
+     or stamp.get('physical_peer_tests_enumerated')!=ENUMERATED_PEER_TESTS):
+  raise ValueError('build receipt mismatch, failed host checks or missing peer tests')
+ validate_host_results(stamp.get('host_results',[]))
+ binary=Path(stamp.get('test_binary',''))
+ if (binary.is_symlink() or not binary.is_file() or not os.access(binary,os.X_OK)
+     or binary.parent.resolve()!=(TASK/'target/release/deps').resolve()
+     or not re.fullmatch(r'inference_engine-[0-9a-f]+',binary.name)
+     or sha(binary)!=stamp.get('test_binary_sha256')):
+  raise ValueError('test executable path or hash mismatch')
+ build=Path(stamp.get('test_build_log',''))
+ if (build.is_symlink() or not build.is_file() or build.parent.resolve()!=(TASK/'logs').resolve()
+     or sha(build)!=stamp.get('test_build_log_sha256')):
+  raise ValueError('test build log path or hash mismatch')
+ events=[]
+ for line in build.read_text().splitlines():
+  try: events.append(json.loads(line))
+  except json.JSONDecodeError: pass
+ matches=[e for e in events if e.get('reason')=='compiler-artifact' and e.get('executable')==str(binary)
+          and e.get('target',{}).get('name')=='inference_engine' and e.get('profile',{}).get('test') is True
+          and e.get('profile',{}).get('opt_level')=='3' and e.get('fresh') is False
+          and e.get('manifest_path')==str(SOURCE/'engine/Cargo.toml') and 'native-cuda' in e.get('features',[])]
+ if [e.get('success') for e in events if e.get('reason')=='build-finished']!=[True] or len(matches)!=1:
+  raise ValueError('Cargo log lacks a successful exact test build')
+ env={**os.environ,'CUDA_VISIBLE_DEVICES':'-1'}
+ listing=subprocess.check_output([str(binary),'--list'],cwd=SOURCE/'engine',text=True,timeout=60,env=env).splitlines()
+ ignored=subprocess.check_output([str(binary),'--list','--ignored'],cwd=SOURCE/'engine',text=True,timeout=60,env=env).splitlines()
+ for name,is_ignored in TESTS:
+  if listing.count(name+': test')!=1 or (ignored.count(name+': test')==1)!=is_ignored:
+   raise ValueError('missing or incorrectly ignored device test: '+name)
+ cuobjdump=shutil.which('cuobjdump')
+ if not cuobjdump or '.sm_86.cubin' not in subprocess.check_output([cuobjdump,'-all','-lelf',str(binary)],text=True,timeout=120):
+  raise ValueError('test executable lacks a native sm86 image')
+ if shutil.disk_usage(TASK).free < 1_000_000_000:
+  raise ValueError('less than 1 GB scratch available')
+ return {'commit':COMMIT,'gpu_uuids':PAIR_VISIBLE.split(','),'arch':'sm86','gate':'p2p',
+         'binary':str(binary),'binary_sha256':sha(binary),'receipt_sha256':sha(receipt),
+         'build_log_sha256':sha(build),'tests':[list(x) for x in TESTS],
+         'ring_multiblock':'1', 'sync_broadcast':'1', 'scope':'Synthetic wide-chunk and peer correctness only; no served-model performance or qualification claim.'}
+
+def validate(name,out):
+ if ('SKIPPED' in out or not re.search(r'CUDA devices visible: 2\b',out)
+     or not re.search(r'^test result: ok\. 1 passed; 0 failed; 0 ignored;',out,re.M)
+     or not re.search(r'^test '+re.escape(name)+r' \.\.\. ',out,re.M)):
+  raise ValueError('test missing, skipped, failed, or did not see two GPUs: '+name)
+ if name in (TESTS[0][0], TESTS[1][0], TESTS[2][0]):
+  rows, stage = {TESTS[0][0]:(8,256), TESTS[1][0]:(512,2048), TESTS[2][0]:(1024,4096)}[name]
+  if any(f'card {card} KV8 staging: {stage} rows' not in out for card in (0,1)):
+   raise ValueError('both cards did not admit expected staging')
+  if f'{rows} rows, winner' not in out:
+   raise ValueError('chunk comparison result missing')
+ elif name != TESTS[3][0]:
+  raise ValueError('unknown device test')
+
+def validate_failure(name,out):
+ if ('SKIPPED' in out or not re.search(r'CUDA devices visible: 2\b',out)
+     or not re.search(r'^test result: FAILED\. 0 passed; 1 failed;',out,re.M)
+     or not re.search(r'^test '+re.escape(name)+r' \.\.\. ',out,re.M)):
+  raise ValueError('diagnostic failure is incomplete or lacks both GPUs: '+name)
+
+def validate_smoke_receipt(path,info):
+ campaign=Path(path)
+ if (not campaign.is_absolute() or campaign.is_symlink() or campaign.parent.resolve()!=ROOT.resolve()
+     or not re.fullmatch(r'pair-reserved-[a-z0-9_]+',campaign.name)):
+  raise ValueError('invalid smoke campaign path')
+ files=[campaign/'complete.json',campaign/'restore.json',campaign/'attention/summary.json',campaign/'attention/00.log',campaign/'guard.jsonl']
+ if any(p.is_symlink() or not p.is_file() or not p.resolve().is_relative_to(campaign.resolve()) for p in files):
+  raise ValueError('missing or unsafe smoke artifacts')
+ complete,restore,summary=(json.loads(p.read_text()) for p in files[:3])
+ if (complete.get('restored') is not True or complete.get('result_type')!='p2p_correctness_tests'
+     or restore.get('restored') is not True or summary.get('mode')!='smoke'
+     or summary.get('tests_passed')!=[TESTS[0][0]] or summary.get('inputs')!=info
+     or len(summary.get('outcomes',[]))!=1 or summary['outcomes'][0].get('sha256')!=sha(files[3])):
+  raise ValueError('smoke receipt does not prove same inputs and restored service')
+ validate(TESTS[0][0],files[3].read_text())
+ samples=[json.loads(line) for line in files[4].read_text().splitlines()]
+ if (not samples or any(s['builders'] or s['other_jobs'] or s['unexpected'] or not s['states_ok']
+       or s['clients'] or s['listeners'] or any(s['non_target_utilization'].values()) for s in samples)):
+  raise ValueError('smoke guard samples were not clear')
+ hashes={str(p.relative_to(campaign)):sha(p) for p in files}
+ return hashlib.sha256(json.dumps(hashes,sort_keys=True).encode()).hexdigest()
+
+def run(out,mode):
+ actual,expected=os.fstat(9),LOCK.stat()
+ if (actual.st_dev,actual.st_ino)!=(expected.st_dev,expected.st_ino):
+  raise RuntimeError('shared lease identity mismatch')
+ fcntl.flock(9,fcntl.LOCK_EX|fcntl.LOCK_NB)
+ if os.environ.get('CUDA_VISIBLE_DEVICES')!=PAIR_VISIBLE or os.environ.get('INFERENCE_CUDA_REQUIRE_DEVICE')!='1':
+  raise RuntimeError('device pair or required-device setting mismatch')
+ info=preflight()
+ out.mkdir(parents=True,exist_ok=False)
+ cases=(SMOKE_CASE,) if mode=='smoke' else CASES
+ outcomes=[]
+ for i,(label,name,adaptive) in enumerate(cases):
+  if sha(info['binary'])!=info['binary_sha256']: raise RuntimeError('binary changed during campaign')
+  env=os.environ.copy()
+  env['INFERENCE_CUDA_P2P_RING_MULTIBLOCK']='1'
+  env['Q36_P2P_SYNC_BROADCAST']='1'
+  env.pop('FIFI_CUDA_ATTN_PREFILL_ADAPT',None)
+  if adaptive: env['FIFI_CUDA_ATTN_PREFILL_ADAPT']='1'
+  cmd=[info['binary'],'--exact',name]
+  if dict(TESTS)[name]: cmd.append('--ignored')
+  cmd.extend(['--test-threads=1','--nocapture'])
+  result=subprocess.run(cmd,cwd=SOURCE/'engine',env=env,text=True,stdout=subprocess.PIPE,stderr=subprocess.STDOUT,timeout=900)
+  (out/f'{i:02d}.log').write_text(result.stdout)
+  if result.returncode:
+   validate_failure(name,result.stdout)
+   raise RuntimeError('required device test failed: '+name)
+  else:
+   validate(name,result.stdout)
+  outcomes.append({'case':label,'test':name,'adaptive':adaptive,'exit':result.returncode,
+                   'passed':result.returncode==0,'log':f'{i:02d}.log',
+                   'sha256':sha(out/f'{i:02d}.log')})
+ (out/'summary.json').write_text(json.dumps({'inputs':info,'mode':mode,
+  'tests_passed':[x['test'] for x in outcomes if x['passed']],
+  'tests_failed':[x['test'] for x in outcomes if not x['passed']], 'outcomes':outcomes,
+  'gate':'p2p','caveat':'Device correctness only; no served-model or performance claim.'},indent=2)+'\n')
+
+if __name__=='__main__':
+ if len(sys.argv)!=3 or sys.argv[1] not in ('smoke','full'):
+  raise SystemExit('usage: attention_device.py smoke|full OUTPUT')
+ run(Path(sys.argv[2]),sys.argv[1])

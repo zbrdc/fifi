@@ -1,0 +1,76 @@
+{
+  "scope": "Native-CUDA build and host checks only; no device or performance test.",
+  "source_commit": "f6d1c506f4e7ebe0ad3daa69290417c8e92639f2",
+  "target": "native-cuda linux sm86 release",
+  "build_device_visibility": "CUDA_VISIBLE_DEVICES empty",
+  "receipt_sha256": "d74baa028d01f69ec2510736b8dadbeaff95335ab2dc95deea9bb5a16c5965d7",
+  "test_binary_sha256": "f958cd2b83b12a1fa721330f5ca0236e4291e4d97ff8c5e21c2ba414bd138384",
+  "server_binary_sha256": "c50bad6e3f6e9044b013dd4f10d6a9bef15c32255a797f16bbd716b0fc6afcf5",
+  "test_build_log_sha256": "75e0d12abaf0b8a89d269b9c431f91bf6683b4e2badc28a756cff0a5a2954eb7",
+  "server_build_log_sha256": "39b5078e8edcb35e0283fd9515f1d884a7f7f8a274a10a2056fe2b1e1d4c7ff8",
+  "host_checks": [
+    {
+      "name": "family::qwen36::cuda::card_prefill::config_tests::chunk_setting_is_explicit_and_bounded",
+      "log_sha256": "e685652ad02e9516e39f0e40ebf00ef8d49b49cafb2719e7ec5ad4c80ee91010",
+      "output": "\nrunning 1 test\ntest family::qwen36::cuda::card_prefill::config_tests::chunk_setting_is_explicit_and_bounded ... ok\n\ntest result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 5928 filtered out; finished in 0.00s\n\n"
+    },
+    {
+      "name": "family::qwen36::cuda::card_prefill::config_tests::mailbox_covers_both_chunk_sums_and_eager_decode",
+      "log_sha256": "4a99445726a160288cd61e5640b23743f560fd7bfb1963349fda38f11d45cc96",
+      "output": "\nrunning 1 test\ntest family::qwen36::cuda::card_prefill::config_tests::mailbox_covers_both_chunk_sums_and_eager_decode ... ok\n\ntest result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 5928 filtered out; finished in 0.00s\n\n"
+    },
+    {
+      "name": "family::qwen36::cuda::card_prefill::config_tests::chunk_admission_preserves_the_free_vram_floor",
+      "log_sha256": "980a6fa8cc7eb9c6df5e10d7e5e1d385f3e6839673f34ffc3f40ef43c746ae22",
+      "output": "\nrunning 1 test\ntest family::qwen36::cuda::card_prefill::config_tests::chunk_admission_preserves_the_free_vram_floor ... ok\n\ntest result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 5928 filtered out; finished in 0.00s\n\n"
+    },
+    {
+      "name": "family::qwen36::cuda::card_prefill::config_tests::card_staging_respects_shard_geometry_and_live_floor",
+      "log_sha256": "a6075393065889473e765c5a18431a659c0b2ba9272b0aef1f441451c08068cb",
+      "output": "\nrunning 1 test\ntest family::qwen36::cuda::card_prefill::config_tests::card_staging_respects_shard_geometry_and_live_floor ... ok\n\ntest result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 5928 filtered out; finished in 0.00s\n\n"
+    },
+    {
+      "name": "family::qwen36::cuda::prefill_plan::card_tests::card_chunk_arenas_are_narrower_and_complete",
+      "log_sha256": "7ed379ec99ab8d9ae393e9f54e883e8d1b21bc85f55adb40b2374bbf0bbbc5ac",
+      "output": "\nrunning 1 test\ntest family::qwen36::cuda::prefill_plan::card_tests::card_chunk_arenas_are_narrower_and_complete ... ok\n\ntest result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 5928 filtered out; finished in 0.00s\n\n"
+    },
+    {
+      "name": "family::qwen36::cuda::prefill_plan::card_tests::card_combine_output_is_disjoint_from_its_inputs",
+      "log_sha256": "fb09f4b28d332db57b1d269f841c6f88aa3210208aeae1762cf1897e174bf589",
+      "output": "\nrunning 1 test\ntest family::qwen36::cuda::prefill_plan::card_tests::card_combine_output_is_disjoint_from_its_inputs ... ok\n\ntest result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 5928 filtered out; finished in 0.00s\n\n"
+    },
+    {
+      "name": "kernels::cuda::peer_ring::tests::wide_f32_exchange_does_not_extend_the_fp16_bound",
+      "log_sha256": "69f176a3397d9101e71defbd9970685fab42eb567120c67be8c58b3d656dcea8",
+      "output": "\nrunning 1 test\ntest kernels::cuda::peer_ring::tests::wide_f32_exchange_does_not_extend_the_fp16_bound ... ok\n\ntest result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 5928 filtered out; finished in 0.00s\n\n"
+    },
+    {
+      "name": "kernels::cuda::native::peer_ring::tests::fp16_retains_its_old_native_limit_before_launch",
+      "log_sha256": "f25703221fc67e9e468e7f91dcfd87876eac526069ca5976e86ef4d4b27d7606",
+      "output": "\nrunning 1 test\ntest kernels::cuda::native::peer_ring::tests::fp16_retains_its_old_native_limit_before_launch ... ok\n\ntest result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 5928 filtered out; finished in 0.00s\n\n"
+    },
+    {
+      "name": "kernels::cuda::native::peer_ring::tests::fp32_refuses_payloads_above_the_wide_limit_before_launch",
+      "log_sha256": "9768d9de72190294a85bc1348cdc074fcb0ba90c3063203abfc5bfa2e916c2fd",
+      "output": "\nrunning 1 test\ntest kernels::cuda::native::peer_ring::tests::fp32_refuses_payloads_above_the_wide_limit_before_launch ... ok\n\ntest result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 5928 filtered out; finished in 0.00s\n\n"
+    },
+    {
+      "name": "kernels::cuda::peer_ring::tests::the_layout_aligns_every_slot_for_odd_capacities",
+      "log_sha256": "539e4ecc139a19cfb78b4493dc37c9afbf7b1913c87726e3f73414a2337b9cce",
+      "output": "\nrunning 1 test\ntest kernels::cuda::peer_ring::tests::the_layout_aligns_every_slot_for_odd_capacities ... ok\n\ntest result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 5928 filtered out; finished in 0.00s\n\n"
+    }
+  ],
+  "physical_peer_tests_enumerated": [
+    "family::qwen36::cuda::card_chunk_device_tests::card_chunk_matches_the_per_token_path_on_physical_peers",
+    "family::qwen36::cuda::card_chunk_device_tests::max_card_chunk_matches_the_per_token_path_on_physical_peers",
+    "family::qwen36::cuda::card_chunk_device_tests::wide_card_chunk_matches_the_per_token_path_on_physical_peers",
+    "family::qwen36::cuda::card_chunk_device_tests::wider_card_chunk_matches_the_per_token_path_on_physical_peers",
+    "kernels::cuda::peer_ring::device_tests::wide_f32_exchanges_reuse_slots_on_physical_peers"
+  ],
+  "device_preflight_sha256": "d6fde176bccc8a3b75b5b5a0d173fec0b764a822dc27e2020d4de52ca2bd470e",
+  "device_tests_run": false,
+  "limitations": [
+    "The 2,048-row candidate has not been tested on physical GPUs or measured for throughput.",
+    "The host checks and test enumeration do not qualify device behavior, memory use, or long-context quality."
+  ]
+}

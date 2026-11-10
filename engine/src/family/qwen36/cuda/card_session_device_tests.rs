@@ -34,7 +34,7 @@ use crate::weights::{GgufLimits, GgufWeights};
 /// paths cover, at a vocabulary the file can afford twice.
 static TWO_LAYERS: [AttentionKind; 2] = [AttentionKind::DeltaNet, AttentionKind::Full];
 
-fn rig_spec() -> FamilySpec {
+pub(super) fn rig_spec() -> FamilySpec {
     FamilySpec {
         layers: 2,
         vocab: 4096,
@@ -96,10 +96,29 @@ fn prefill_without_head_matches_normal_logits_on_peer_gpus() {
     run_session_rig(NAME, devices).expect("two-GPU session parity");
 }
 
+pub(super) fn build_rig_session_for_chunk(
+    devices: [usize; 2],
+    context_tokens: usize,
+    prefix_limits: crate::family::session::StoreLimits,
+    chunk_rows: usize,
+) -> Result<
+    (
+        CardSession,
+        &'static CardStack,
+        &'static [&'static crate::family::project::cuda::CudaWeights],
+        GlobalNames,
+        usize,
+    ),
+    EngError,
+> {
+    build_rig_session(devices, context_tokens, prefix_limits, Some(chunk_rows))
+}
+
 fn build_rig_session(
     devices: [usize; 2],
     context_tokens: usize,
     prefix_limits: crate::family::session::StoreLimits,
+    chunk_rows: Option<usize>,
 ) -> Result<
     (
         CardSession,
@@ -272,7 +291,13 @@ fn build_rig_session(
     let admission = served_admission();
     let shard = ShardTable::new(&d.shape, 2, 32)?;
     let loads = card_loads(&shard, &inv, GgufType::Q4K)?;
-    let (mut stack, states) = CardStack::new(&d, &options, &devices, &admission)?;
+    let payload = chunk_rows
+        .map(|rows| {
+            super::card_prefill::chunk_mailbox_values(rows, d.shape.hidden, d.shape.moe.top_k)
+        })
+        .transpose()?;
+    let (mut stack, states) =
+        CardStack::with_payload(&d, &options, &devices, &admission, &shard, payload)?;
     stack.enable_broadcast_sync_for_test();
     let load_options = LoadOptions {
         layout: WeightLayout::Native,
@@ -307,6 +332,7 @@ fn build_rig_session(
         eos,
         vocab,
         prefix_limits,
+        None,
     )?;
     session.set_skip_prefill_head_for_test(false);
 
@@ -314,8 +340,12 @@ fn build_rig_session(
 }
 
 fn run_session_rig(name: &'static str, devices: [usize; 2]) -> Result<(), EngError> {
-    let (mut session, stack, loaded, names, vocab) =
-        build_rig_session(devices, 8, crate::family::session::StoreLimits::default())?;
+    let (mut session, stack, loaded, names, vocab) = build_rig_session(
+        devices,
+        8,
+        crate::family::session::StoreLimits::default(),
+        None,
+    )?;
     let limit = session.context_limit();
     if limit < 4 {
         return Err(EngError::Checkpoint(format!(
@@ -447,6 +477,7 @@ fn run_card_prefix_turn_chain(name: &'static str, devices: [usize; 2]) {
             roots: 0,
             entries: 2,
         },
+        None,
     )
     .expect("the rig session");
 
@@ -553,5 +584,56 @@ fn run_card_prefix_turn_chain(name: &'static str, devices: [usize; 2]) {
             }
         }
         assert_eq!(got.kv, want.kv, "{name}: card {card} KV plane bytes");
+    }
+}
+
+/// The chunk-driver keystone: the card session's per-card weight views
+/// construct the single-device chunk machinery's ChunkModel under the CARD
+/// geometry - the constructor is where card/single-device compatibility is
+/// decided (every weight check runs against the geometry's specs, and the
+/// card's views satisfy them by construction). If this holds, the card
+/// chunk driver reuses the stage functions unchanged and only adds the
+/// per-layer ring sums.
+#[test]
+fn card_views_construct_chunk_models() {
+    const NAME: &str = "card_views_construct_chunk_models";
+    if !device_present(NAME) {
+        return;
+    }
+    let _ = NAME;
+    let (session, stack, _loaded, _names, _vocab) = build_rig_session(
+        [0, 0],
+        256,
+        crate::family::session::StoreLimits::default(),
+        None,
+    )
+    .expect("the rig session");
+    let spec = rig_spec();
+    let inv = Inventory::for_spec(&spec).expect("inventory");
+    let shape = HostShape::from_spec(&spec, 64).expect("shape");
+    let d = StepDims::new(&shape, &inv).expect("dims");
+    let table = LayerTable::new(&d, &inv).expect("layers");
+    for card in 0..2 {
+        let geometry = MixerGeometry::for_card(&d, stack.table(), card).expect("card geometry");
+        let (mixer, moe) = session.chunk_views_for_test(card);
+        let weights = super::prefill::ChunkWeights::new(mixer, &moe, session.embed_for_test());
+        let inter = stack.table().expert_inter(card).expect("card inter").len();
+        let shared_inter = stack
+            .table()
+            .shared_inter(card)
+            .expect("card shared inter")
+            .len();
+        let model =
+            super::prefill::ChunkModel::card(&table, &geometry, &d, weights, inter, shared_inter);
+        assert!(
+            model.is_ok(),
+            "{NAME}: card {card} views must construct the CARD chunk model: {:?}",
+            model.err()
+        );
+        assert_eq!(
+            model.expect("checked above").moe_dims().inter,
+            inter,
+            "{NAME}: card {card} dims carry its inter slice"
+        );
     }
 }

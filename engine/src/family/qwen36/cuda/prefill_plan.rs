@@ -355,6 +355,12 @@ pub(crate) enum Phase {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum ChunkSlot {
     Hidden,
+    /// The card plans' permanent zero row (`m * hidden` f32): the arena is
+    /// zero-filled at build and nothing ever writes this slot, so card 1's
+    /// MoE combine reads it as the residual of its `CombineOut::To`
+    /// partial - the exchange then sums card 0's residual-included output
+    /// with card 1's partial alone.
+    Zero,
     IdsTok,
     X,
     X2,
@@ -412,7 +418,7 @@ type Row = (ChunkSlot, usize, Phase, Phase);
 
 /// The tensors that live across blocks: the residual stream, the norm rows and their `xf`
 /// sinks (written, never read in prefill), the first quantize and the stream-k fixup range.
-fn common_rows(g: &MixerGeometry, m: usize, nsm: usize) -> Result<Vec<Row>, EngError> {
+fn common_rows(g: &MixerGeometry, m: usize, nsm: usize, card: bool) -> Result<Vec<Row>, EngError> {
     use {ChunkSlot as S, Phase::*};
     let hidden = row_bytes(m, g.hidden).ok_or_else(overflow)?;
     // `xf_bytes` is not monotone in m: a chunk of at most 16 rows packs the whole fixed fragment
@@ -429,7 +435,10 @@ fn common_rows(g: &MixerGeometry, m: usize, nsm: usize) -> Result<Vec<Row>, EngE
         (S::X, hidden, NormA, QuantA),
         (S::XfA, xf, NormA, NormA),
         (S::Q8X, q8_1_bytes(g.hidden, m)?, QuantA, AProj),
-        (S::Delta, hidden, DOut, NormF),
+        // A non-primary card reuses Delta for the output of the MoE combine;
+        // its routed and shared inputs must remain disjoint from that output.
+        // The single-device path combines into Hidden and keeps its shorter lifetime.
+        (S::Delta, hidden, DOut, if card { Combine } else { NormF }),
         (S::X2, hidden, NormF, Scatter),
         (S::XfF, xf, NormF, NormF),
         (
@@ -469,9 +478,13 @@ fn mixer_rows(g: &MixerGeometry, m: usize) -> Result<Vec<Row>, EngError> {
 
 /// The Resident MoE block: router, shared expert, ids, scatter quantize, gate/up, down.
 /// `routed` is the grouped column count `M * top_k`.
-fn moe_rows(dims: &StepDims, m: usize) -> Result<Vec<Row>, EngError> {
+fn moe_rows_with(
+    dims: &StepDims,
+    e: &crate::family::qwen36::host::MoeDims,
+    m: usize,
+) -> Result<Vec<Row>, EngError> {
     use {ChunkSlot as S, Phase::*};
-    let (h, e) = (dims.shape.hidden, &dims.shape.moe);
+    let h = dims.shape.hidden;
     let routed = m.checked_mul(e.top_k).ok_or_else(overflow)?;
     let picks = word_bytes(&[m, e.top_k])?;
     let router = RouterShape {
@@ -778,21 +791,65 @@ pub(crate) fn chunk_tensors(
     m: usize,
     nsm: usize,
 ) -> Result<Vec<(ChunkSlot, ArenaTensor)>, EngError> {
+    chunk_tensors_inner(
+        dims,
+        &MixerGeometry::new(dims)?,
+        &dims.shape.moe,
+        m,
+        nsm,
+        false,
+    )
+}
+
+/// The card twin: the same slot plan over the CARD's geometry and the
+/// card's inter-dimensional MoE facts (its slices of the projections and
+/// expert stacks), so each card's arena carries exactly its narrower
+/// buffers.
+pub(crate) fn chunk_tensors_for(
+    dims: &StepDims,
+    g: &MixerGeometry,
+    moe: &crate::family::qwen36::host::MoeDims,
+    m: usize,
+    nsm: usize,
+) -> Result<Vec<(ChunkSlot, ArenaTensor)>, EngError> {
+    chunk_tensors_inner(dims, g, moe, m, nsm, true)
+}
+
+fn chunk_tensors_inner(
+    dims: &StepDims,
+    g: &MixerGeometry,
+    moe: &crate::family::qwen36::host::MoeDims,
+    m: usize,
+    nsm: usize,
+    card: bool,
+) -> Result<Vec<(ChunkSlot, ArenaTensor)>, EngError> {
     check_ncols_domain(m)?;
     if nsm == 0 {
         return Err(EngError::BadRequest(format!(
             "prefill plan: nsm {nsm} is below 1; the fixup range needs the device SM count"
         )));
     }
-    let g = MixerGeometry::new(dims)?;
-    let rows = [
-        common_rows(&g, m, nsm)?,
-        mixer_rows(&g, m)?,
-        moe_rows(dims, m)?,
-    ];
+    let mut rows: Vec<Row> = [
+        common_rows(g, m, nsm, card)?,
+        mixer_rows(g, m)?,
+        moe_rows_with(dims, moe, m)?,
+    ]
+    .into_iter()
+    .flatten()
+    .collect();
+    if card {
+        let hidden = dims.shape.hidden;
+        rows.push((
+            ChunkSlot::Zero,
+            m.checked_mul(hidden)
+                .and_then(|v| v.checked_mul(4))
+                .ok_or_else(overflow)?,
+            Phase::Embed,
+            Phase::Combine,
+        ));
+    }
     Ok(rows
         .into_iter()
-        .flatten()
         .map(|(slot, bytes, first, last)| {
             let (first, last) = (first as usize, last as usize);
             (slot, ArenaTensor { bytes, first, last })
@@ -819,4 +876,138 @@ pub(crate) fn chunk_cost(dims: &StepDims, m: usize, nsm: usize) -> Result<ChunkC
 /// The costs of every size of [`M_LADDER`]: the candidates [`Admission::admit`] chooses from.
 pub(crate) fn chunk_costs(dims: &StepDims, nsm: usize) -> Result<Vec<ChunkCost>, EngError> {
     M_LADDER.iter().map(|&m| chunk_cost(dims, m, nsm)).collect()
+}
+
+#[cfg(test)]
+mod card_tests {
+    use super::*;
+    use crate::family::gguf_model::Inventory;
+    use crate::family::qwen36::host::HostShape;
+    use crate::family::spec::QWEN3_6_35B_A3B;
+    use crate::kernels::cuda::plan_arena;
+
+    /// Each card's chunk arena carries its narrower slots: the plan over
+    /// the card's geometry and inter facts is strictly smaller than the
+    /// single-device plan, keeps every slot the stage list needs, and the
+    /// two cards' plans together stay under one single-device arena plus
+    /// the shared rows' slack.
+    #[test]
+    fn card_chunk_arenas_are_narrower_and_complete() {
+        let inv = Inventory::for_spec(&QWEN3_6_35B_A3B).expect("inventory");
+        let shape = HostShape::from_spec(
+            &QWEN3_6_35B_A3B,
+            crate::family::qwen36::cuda::pinned::ROTARY_DIM,
+        )
+        .expect("shape");
+        let dims = super::super::dims::StepDims::new(&shape, &inv).expect("dims");
+        let m = 512;
+        let nsm = 28; // the slower card's SM count sizes the shared plans
+        let full = chunk_tensors(&dims, m, nsm).expect("full plan");
+        let full_total: usize = plan_arena(&full.iter().map(|(_, t)| *t).collect::<Vec<_>>())
+            .expect("full arena")
+            .total;
+        let table = super::super::shard::ShardTable::new(&shape, 2, 32).expect("table");
+        let mut card_totals = Vec::new();
+        for card in 0..2 {
+            let geometry =
+                super::super::mixer_geometry::MixerGeometry::for_card(&dims, &table, card)
+                    .expect("card geometry");
+            let moe = crate::family::qwen36::host::MoeDims {
+                inter: table.expert_inter(card).expect("inter").len(),
+                shared_inter: table.shared_inter(card).expect("shared").len(),
+                ..shape.moe
+            };
+            let plan = chunk_tensors_for(&dims, &geometry, &moe, m, nsm).expect("card plan");
+            let total: usize = plan_arena(&plan.iter().map(|(_, t)| *t).collect::<Vec<_>>())
+                .expect("card arena")
+                .total;
+            assert!(
+                total < full_total,
+                "card {card} arena {total} must be smaller than the full {full_total}"
+            );
+            let slots_full: Vec<_> = full.iter().map(|(s, _)| *s).collect();
+            let mut slots_card: Vec<_> = plan.iter().map(|(s, _)| *s).collect();
+            slots_card.sort_by_key(|s| format!("{s:?}"));
+            let mut slots_full_sorted = slots_full.clone();
+            assert!(!slots_full_sorted.contains(&ChunkSlot::Zero));
+            slots_full_sorted.push(ChunkSlot::Zero);
+            slots_full_sorted.sort_by_key(|s| format!("{s:?}"));
+            assert_eq!(
+                slots_full_sorted, slots_card,
+                "card {card} adds only its permanent zero row"
+            );
+            card_totals.push(total);
+        }
+        let both: usize = card_totals.iter().sum();
+        assert!(
+            both < 2 * full_total,
+            "the pair's arenas {both} stay under two full arenas"
+        );
+    }
+
+    /// The non-primary card writes its partial MoE combine into Delta while all of the
+    /// combine's inputs are still live. The arena must keep that output apart from them.
+    #[test]
+    fn card_combine_output_is_disjoint_from_its_inputs() {
+        let inv = Inventory::for_spec(&QWEN3_6_35B_A3B).expect("inventory");
+        let shape = HostShape::from_spec(
+            &QWEN3_6_35B_A3B,
+            crate::family::qwen36::cuda::pinned::ROTARY_DIM,
+        )
+        .expect("shape");
+        let dims = super::super::dims::StepDims::new(&shape, &inv).expect("dims");
+        let table = super::super::shard::ShardTable::new(&shape, 2, 32).expect("table");
+        let single = chunk_tensors(&dims, 512, 28).expect("single-device plan");
+        let single_delta = single
+            .iter()
+            .find(|(slot, _)| *slot == ChunkSlot::Delta)
+            .expect("single-device Delta")
+            .1;
+        assert_eq!(single_delta.last, Phase::NormF as usize);
+        for card in 0..2 {
+            let geometry =
+                super::super::mixer_geometry::MixerGeometry::for_card(&dims, &table, card)
+                    .expect("card geometry");
+            let moe = crate::family::qwen36::host::MoeDims {
+                inter: table.expert_inter(card).expect("inter").len(),
+                shared_inter: table.shared_inter(card).expect("shared").len(),
+                ..shape.moe
+            };
+            for nsm in [28, 68] {
+                for m in [1, 15, 16, 31, 32, 64, 96, 128, 256, 512] {
+                    let tensors =
+                        chunk_tensors_for(&dims, &geometry, &moe, m, nsm).expect("card plan");
+                    let plan = plan_arena(&tensors.iter().map(|(_, t)| *t).collect::<Vec<_>>())
+                        .expect("card arena");
+                    let index = |slot| {
+                        tensors
+                            .iter()
+                            .position(|(candidate, _)| *candidate == slot)
+                            .expect("slot in card arena")
+                    };
+                    let out = index(ChunkSlot::Delta);
+                    let output = tensors[out].1;
+                    assert!(
+                        (output.first..=output.last).contains(&(Phase::Combine as usize)),
+                        "card {card}, m {m}, nsm {nsm}: combine output is not live"
+                    );
+                    for slot in [
+                        ChunkSlot::Zero,
+                        ChunkSlot::Down,
+                        ChunkSlot::TopkWeight,
+                        ChunkSlot::SharedGate,
+                        ChunkSlot::ShOut,
+                    ] {
+                        let input = index(slot);
+                        let apart = plan.offsets[out] + output.bytes <= plan.offsets[input]
+                            || plan.offsets[input] + tensors[input].1.bytes <= plan.offsets[out];
+                        assert!(
+                            apart,
+                            "card {card}, m {m}, nsm {nsm}: Delta overlaps {slot:?}"
+                        );
+                    }
+                }
+            }
+        }
+    }
 }

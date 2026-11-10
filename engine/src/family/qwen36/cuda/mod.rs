@@ -19,11 +19,14 @@ mod card_attn_device_tests;
 mod card_block;
 #[cfg(test)]
 mod card_block_device_tests;
+#[cfg(test)]
+mod card_chunk_device_tests;
 mod card_load;
 #[cfg(test)]
 mod card_load_tests;
 #[cfg(test)]
 mod card_moe_device_tests;
+mod card_prefill;
 mod card_session;
 #[cfg(test)]
 mod card_session_device_tests;
