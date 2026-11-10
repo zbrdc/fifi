@@ -27,5 +27,6 @@ it is not a device-memory guarantee. Admission does not qualify a new model or
 budget on hardware. No larger-budget Mac hardware qualification is claimed.
 
 Portable regressions cover the registry, whole-model planning, option validation,
-settings-to-rules mapping, and a source wiring/order pin through the native
-adapter. Metal execution remains a separate physical gate.
+effective settings, and a source check of native configuration order.
+The executable settings-to-rules test requires the Mac build.
+Native type checking and Metal execution remain separate physical checks.

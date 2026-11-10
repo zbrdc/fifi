@@ -284,32 +284,7 @@ pub(crate) fn moe_fun_id(baked: &MoeBaked) -> u64 {
     mix_fun_id(MOE_TAG, &parts)
 }
 
-/// Explicit per-adapter budget of distinct baked keys, not MLX tapes or bytes. One key can
-/// have several batch specializations. Raising the budget requires an operator opt-in.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) struct ProgramLimit(usize);
-
-impl Default for ProgramLimit {
-    fn default() -> Self {
-        Self(8)
-    }
-}
-
-impl ProgramLimit {
-    pub(crate) fn new(value: usize) -> Result<Self, EngError> {
-        // Vec<u64> must be addressable even if the registry eventually fills the budget.
-        if value == 0 || value > isize::MAX as usize / size_of::<u64>() {
-            return Err(EngError::BadRequest(
-                "compile_program_limit must be positive and fit the registry address space".into(),
-            ));
-        }
-        Ok(Self(value))
-    }
-
-    pub(crate) fn get(self) -> usize {
-        self.0
-    }
-}
+pub(crate) use super::ProgramLimit;
 
 /// The compiled-program registry of ONE adapter context:
 /// the MLX compile cache is thread-local and dies with its thread, so the registry lives in the

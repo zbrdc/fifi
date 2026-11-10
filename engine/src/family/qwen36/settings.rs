@@ -881,7 +881,7 @@ pub(crate) struct Q36Settings {
     /// The default is `false`; the MLX arm reads it, admits the model at load, and warms one
     /// program per distinct compiled block, and the CUDA arm records the key as ignored.
     pub(crate) compile: bool,
-    pub(crate) compile_program_limit: crate::kernels::compile_key::ProgramLimit,
+    pub(crate) compile_program_limit: crate::kernels::ProgramLimit,
     /// Maximum concurrent sessions. One preserves the original single-job worker.
     pub(crate) max_seqs: usize,
     /// The exact LRU entry count override of the prefix store, or `None` for the default cap of
@@ -1378,8 +1378,8 @@ impl Q36Settings {
             Some(_) if backend != Backend::Mlx => {
                 return Err(bad("compile_program_limit requires the MLX backend".into()));
             }
-            Some(value) => crate::kernels::compile_key::ProgramLimit::new(value)?,
-            None => crate::kernels::compile_key::ProgramLimit::default(),
+            Some(value) => crate::kernels::ProgramLimit::new(value)?,
+            None => crate::kernels::ProgramLimit::default(),
         };
         let max_seqs = ranged("max_seqs", options.max_seqs, 1, 1, 8)?;
         // The override validates at boot through `ranged` (the same message shape as every
@@ -1591,15 +1591,21 @@ mod tests {
             assert!(!settings.compile, "budget does not enable compilation");
         }
         for value in [0, usize::MAX] {
-            let error =
-                settings_for(Some(&options(Some(value))), &Q36Env::default(), Backend::Mlx)
-                    .unwrap_err();
+            let error = settings_for(
+                Some(&options(Some(value))),
+                &Q36Env::default(),
+                Backend::Mlx,
+            )
+            .unwrap_err();
             assert!(format!("{error:?}").contains("compile_program_limit"));
         }
         for value in [8, 12] {
-            let error =
-                settings_for(Some(&options(Some(value))), &Q36Env::default(), Backend::Cuda)
-                    .unwrap_err();
+            let error = settings_for(
+                Some(&options(Some(value))),
+                &Q36Env::default(),
+                Backend::Cuda,
+            )
+            .unwrap_err();
             assert!(format!("{error:?}").contains("compile_program_limit requires the MLX"));
         }
         for json in [

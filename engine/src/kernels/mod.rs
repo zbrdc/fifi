@@ -86,6 +86,33 @@ pub use rope::{RopeSpec, RopeStep};
 
 use crate::EngError;
 
+/// Per-adapter budget of distinct baked keys, not tapes or bytes. Settings need this
+/// checked value on every backend, even when the native compile registry is absent.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct ProgramLimit(usize);
+
+impl Default for ProgramLimit {
+    fn default() -> Self {
+        Self(8)
+    }
+}
+
+impl ProgramLimit {
+    pub(crate) fn new(value: usize) -> Result<Self, EngError> {
+        // Vec<u64> must be addressable even if the registry eventually fills the budget.
+        if value == 0 || value > isize::MAX as usize / size_of::<u64>() {
+            return Err(EngError::BadRequest(
+                "compile_program_limit must be positive and fit the registry address space".into(),
+            ));
+        }
+        Ok(Self(value))
+    }
+
+    pub(crate) fn get(self) -> usize {
+        self.0
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum QuantizationMode {
     Affine,

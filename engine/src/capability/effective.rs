@@ -14,7 +14,11 @@
 //! values computed from other resolved settings by the resolver itself
 //! (today: the MLX prefill reserve and the dense session cap).
 //! `Ignored` is for members the active backend reads past, reported
-//! from the resolver's own `ignored_mlx_keys` list.
+//! from the resolver's own `ignored_mlx_keys` list. One exception is
+//! computed here rather than disclosed by the resolver: `compile_program_limit`
+//! refuses an explicit CUDA value instead of ignoring it, so it can never
+//! appear in `ignored_mlx_keys`; its row reports `IgnoredOnThisBackend` on
+//! CUDA by construction (only the default is CUDA-reachable).
 
 use serde::Serialize;
 
@@ -176,6 +180,15 @@ pub(crate) fn q36_effective(
             "compile",
             settings.compile.to_string(),
             on_arm("compile", present(&options.compile)),
+        ),
+        row(
+            "compile_program_limit",
+            settings.compile_program_limit.get().to_string(),
+            if backend == Backend::Cuda {
+                Origin::IgnoredOnThisBackend
+            } else {
+                present(&options.compile_program_limit)
+            },
         ),
         row(
             "capture",
@@ -384,6 +397,35 @@ mod tests {
             .find(|r| r.key == key)
             .unwrap_or_else(|| panic!("no row {key}"))
             .origin
+    }
+
+    #[test]
+    fn q36_program_budget_reports_the_resolved_limit_and_origin() {
+        for (limit, expected, source) in [
+            (None, "8", Origin::Default),
+            (Some(12), "12", Origin::ConfigFile),
+        ] {
+            let options = Q36Options {
+                cache_limit_bytes: Some(1024),
+                compile_program_limit: limit,
+                ..Q36Options::default()
+            };
+            let settings = resolve(&options, Backend::Mlx);
+            let rows = q36_effective(&options, None, Backend::Mlx, &settings);
+            let row = rows
+                .iter()
+                .find(|row| row.key == "compile_program_limit")
+                .unwrap();
+            assert_eq!(row.value, expected);
+            assert_eq!(row.origin, source);
+        }
+        let options = Q36Options::default();
+        let settings = resolve(&options, Backend::Cuda);
+        let rows = q36_effective(&options, None, Backend::Cuda, &settings);
+        assert_eq!(
+            origin(&rows, "compile_program_limit"),
+            Origin::IgnoredOnThisBackend
+        );
     }
 
     #[test]

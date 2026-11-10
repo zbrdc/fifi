@@ -1243,8 +1243,10 @@ fn rules_with_compile_true_warm_the_decoder_at_open() {
         "no warm-up seconds with the setting off"
     );
     drop(off);
+    let mut on_rules = rules(true);
+    on_rules.compile_program_limit = crate::kernels::ProgramLimit::new(12).unwrap();
     let (on, session) =
-        Q36Executor::from_parts(MlxKernels::try_new().unwrap(), ckpt, host(), rules(true)).unwrap();
+        Q36Executor::from_parts(MlxKernels::try_new().unwrap(), ckpt, host(), on_rules).unwrap();
     drop(session);
     let stats = on.compile_counters();
     assert_eq!(
@@ -1264,6 +1266,27 @@ fn rules_with_compile_true_warm_the_decoder_at_open() {
         "this engine's warm-up seconds are labeled per block kind"
     );
     drop(on);
+    reset_compile_state();
+
+    let mut limited_rules = rules(true);
+    limited_rules.compile_program_limit = crate::kernels::ProgramLimit::new(1).unwrap();
+    let error = match Q36Executor::from_parts(
+        MlxKernels::try_new().unwrap(),
+        ckpt,
+        host(),
+        limited_rules,
+    ) {
+        Ok(_) => panic!("a one-program budget must refuse the tiny model's four programs"),
+        Err(error) => error,
+    };
+    assert!(
+        matches!(
+            &error,
+            EngError::Backend { operation: "compile_warm_up", message }
+                if message.contains("at most 1 fit one adapter")
+        ),
+        "{error:?}"
+    );
     reset_compile_state();
 }
 
