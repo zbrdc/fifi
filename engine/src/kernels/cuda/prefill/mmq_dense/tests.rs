@@ -2087,3 +2087,94 @@ fn mmq_dense_segments_over_one_upload_match_separate_weights_bitwise() {
         out.separate.len() / 4
     );
 }
+
+/// The prefill ceiling probe: achieved TFLOPS of the dense MMQ at the
+/// deployment's projection shape (Q4_K, k = hidden = 2048) across chunk
+/// row counts, on every visible device. Prints one line per (device, m):
+/// ms per launch, TFLOPS, and the projected whole-model prefill rate if
+/// every GEMM of a token ran at that efficiency (a card owns half of the
+/// 2 * 3.5B active-parameter FLOPs of Qwen3.6-35B-A3B, so a full-model
+/// chunk costs R * 1.75 GFLOP per card at this kernel's rate).
+#[test]
+#[ignore = "timing probe: run alone in an admitted device window"]
+fn mmq_prefill_ceiling_probe() {
+    const NAME: &str = "mmq_prefill_ceiling_probe";
+    if !testkit::device_present(NAME) {
+        return;
+    }
+    let k = 2048;
+    let n = 2048;
+    let bytes = weight_bytes(QuantType::Q4K, n, k, 0x5E55);
+    let admission = crate::family::project::cuda::served_admission();
+    for device in 0..2 {
+        let Ok(ctx) = CudaContext::with_admission_on(device, &admission) else {
+            continue;
+        };
+        let Ok(stream) = ctx.stream() else { continue };
+        let Ok(weight) = upload_weight(&ctx, QuantType::Q4K, (n, k), &bytes) else {
+            continue;
+        };
+        let fixup_bytes = ctx.mmq_fixup_bytes().unwrap_or(0);
+        let fixup = fixup_buffer(&ctx, fixup_bytes);
+        let x: Vec<f32> = (0..2048 * k).map(|i| (i % 97) as f32 * 0.01).collect();
+        let xb = testkit::upload_f32(&ctx, &x);
+        let Ok(need) = dense_needs(QuantType::Q4K, k, n, 2048, n, 0) else {
+            continue;
+        };
+        let y = ctx.allocate(need.y).expect("q8_1");
+        let dst = ctx.allocate(need.dst).expect("dst");
+        for m in [64usize, 256, 512, 1024, 2048] {
+            let Ok(need_m) = dense_needs(QuantType::Q4K, k, n, m, n, 0) else {
+                continue;
+            };
+            ctx.mmq_dense_input(
+                &stream,
+                MmqDenseInputCall {
+                    packing: crate::kernels::cuda::prefill::mmq_quant::MmqPacking::Vendor,
+                    weight: &weight,
+                    m,
+                    row_stride: k,
+                    x: xb.range(0, xb.bytes()).expect("x"),
+                    y: y.range(0, need_m.y).expect("y"),
+                },
+            )
+            .expect("quantize");
+            // Warm up, then time an inner loop of launches.
+            let make = || MmqDenseCall {
+                weight: &weight,
+                w_seg: None,
+                m,
+                q8_1: y.range(0, need_m.y).expect("y"),
+                dst: dst.range(0, need_m.dst).expect("dst"),
+                ld: n,
+                col_off: 0,
+                fixup: fixup.range(0, fixup_bytes).expect("fixup"),
+            };
+            if let Err(error) = ctx.mmq_dense(&stream, make()) {
+                // A refused launch latches this context's backend; skip the
+                // rest of the sweep on this device (the number we have is
+                // already the datum).
+                println!("{NAME}: device {device} m {m}: launch refused: {error:?}");
+                break;
+            }
+            stream.synchronize().expect("sync");
+            let repeats = 20;
+            let began = std::time::Instant::now();
+            for _ in 0..repeats {
+                ctx.mmq_dense(&stream, make()).expect("mmq");
+            }
+            stream.synchronize().expect("sync");
+            let per_launch = began.elapsed().as_secs_f64() / repeats as f64;
+            let gflops_launch = 2.0 * (m as f64) * (n as f64) * (k as f64) / 1e9;
+            let tflops = gflops_launch / per_launch / 1e3;
+            // Whole-model projection: R rows cost R * 1.75 GFLOP on a card.
+            let chunk_seconds = m as f64 * 1.75 / (gflops_launch / per_launch);
+            let projected = m as f64 / chunk_seconds;
+            let ms = per_launch * 1e3;
+            println!(
+                "{NAME}: device {device} m {m:5}: {ms:8.3} ms, {tflops:6.2} TFLOPS, \
+                 projected whole-model prefill {projected:8.0} tok/s (card-limited)"
+            );
+        }
+    }
+}

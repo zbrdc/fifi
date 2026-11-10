@@ -1,0 +1,39 @@
+{
+  "purpose": "Characterize host wall time inside synchronization calls in an earlier traced run; not a CPU utilization or throughput measurement.",
+  "input": {
+    "source_commit": "76dec8a61d040efa97beefe273bed8dc9e68ff57",
+    "server_binary_sha256": "efac9000d75f7fddddfa5c50882837f60915dbcfdfa6afa51433fe56da9fd69d",
+    "report_sha256": "56093385c391712e858f35f4aa5056c33ae8912551675cdd3220eb41cfe9a358",
+    "sqlite_sha256": "8acde7211ac96e73f6024e200c517f6888a5e1760fe0612da51de3eed4ff5744",
+    "model_sha256": "671e47e0ec53c665d048b98c3ecbfd5236b5ca9c3e02ed19fc8f81f7b85140c7",
+    "prompt_tokens": 4274,
+    "reused_tokens": 0,
+    "chunk_rows": 256,
+    "gpu_pair": [
+      "RTX 3060 12 GB",
+      "RTX 3080 10 GB"
+    ],
+    "capture": "Nsight Systems CUDA software trace; CPU sampling and context-switch collection disabled"
+  },
+  "query": "SELECT r.start, r.end, r.globalTid FROM CUPTI_ACTIVITY_KIND_RUNTIME r JOIN StringIds s ON r.nameId = s.id WHERE s.value = 'cudaStreamSynchronize_v3020' ORDER BY r.start",
+  "synchronization_calls": {
+    "count": 9892,
+    "distinct_host_threads": 1,
+    "summed_wall_seconds": 12.649670866,
+    "union_wall_seconds": 12.649670866,
+    "first_start_to_last_end_seconds": 14.252417152,
+    "duration_ms": {
+      "median": 0.000902,
+      "p90_nearest_rank": 0.39829,
+      "p99_nearest_rank": 33.249128,
+      "max": 66.259428
+    },
+    "calls_under_0_1_ms": 8834
+  },
+  "limitations": [
+    "CUDA tracing changes execution timing; these values are not an uninstrumented performance result.",
+    "Call duration is host wall time inside the runtime call, not CPU compute or utilization.",
+    "The trace has no CPU sampling or CUDA call stacks and does not identify the source or removability of these waits.",
+    "A single short synthetic request does not qualify long-context behavior."
+  ]
+}

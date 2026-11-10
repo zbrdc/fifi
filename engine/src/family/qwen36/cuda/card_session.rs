@@ -2,7 +2,7 @@
 //! behind the shared [`DecodeSession`] seam, and the start-level enum that
 //! keeps one executor type over the single-device and multi-device steps.
 //!
-//! v1 is deliberately the eager whole-token driver ([`run_card_token`]):
+//! The default is the eager whole-token driver ([`run_card_token`]):
 //! per token, every card runs its mixer and MoE blocks with the ring
 //! exchanges inside, the tail head projection covers each card's vocabulary
 //! shard, and the host reads back the status words and the logits shards.
@@ -12,9 +12,9 @@
 //! corrupted token is returned, and after a failure every later call
 //! refuses by name.
 //!
-//! What this session does not do (each is a refusal at start, not a silent
-//! degradation): chunked prefill (per-token feeding only), prefix
-//! save/restore, speculation, tiered experts, host-paged KV, EXL3.
+//! Experimental chunked prefill is opt-in; prefix reuse is disabled while it
+//! is active, pending numeric-path and turn-chain qualification. Speculation,
+//! tiered experts, host-paged KV, and EXL3 are refused at start.
 //!
 //! Lifetime: like `QwenResidentStep`, the owners the views borrow - the
 //! [`CardStack`], the per-card [`CudaWeights`] - are leaked for the process
@@ -84,6 +84,10 @@ pub(crate) struct CardSession {
     prefix: PrefixSlot<Vec<ExportedState>, CudaPrefillPath>,
     /// The numeric path every entry of this session saves and restores under.
     prefix_path: CudaPrefillPath,
+    /// The chunk resources, built at start when Q36_P2P_CHUNK is set:
+    /// the session is the stepper the worker drives, so the chunk
+    /// dispatch lives here.
+    chunk: Option<super::card_prefill::CardChunk>,
     /// Set by a prefix import: the word block was zeroed, so the next feed
     /// writes the full step params (token id AND position) again.
     full_params_next: bool,
@@ -110,6 +114,7 @@ impl CardSession {
         eos: Arc<[u32]>,
         sampler_vocab: usize,
         prefix_limits: StoreLimits,
+        chunk_rows: Option<usize>,
     ) -> Result<Self, EngError> {
         let cards = stack.shards().len();
         if weights.len() != cards {
@@ -238,6 +243,13 @@ impl CardSession {
                 states.len()
             )));
         }
+        let chunk = Self::build_chunk_if_asked(
+            stack, weights, inventory, dims, table, options, chunk_rows,
+        )?;
+        let effective_limits = chunk_safe_prefix_limits(prefix_limits, chunk.is_some());
+        if chunk.is_some() && effective_limits != prefix_limits {
+            eprintln!("q36 cuda: prefix reuse disabled for experimental P2P chunked prefill");
+        }
         Ok(Self {
             stack,
             states,
@@ -258,8 +270,9 @@ impl CardSession {
             poisoned: false,
             skip_prefill_head: std::env::var_os("Q36_P2P_SKIP_PREFILL_HEAD")
                 .is_some_and(|value| value == "1"),
-            prefix: PrefixSlot::with_limits(prefix_limits),
+            prefix: PrefixSlot::with_limits(effective_limits),
             prefix_path: CudaPrefillPath::Steps(options.kv_mode),
+            chunk,
             full_params_next: false,
             eos,
             sampler_vocab,
@@ -273,6 +286,90 @@ impl CardSession {
     #[cfg(test)]
     pub(super) fn set_skip_prefill_head_for_test(&mut self, enabled: bool) {
         self.skip_prefill_head = enabled;
+    }
+
+    #[cfg(test)]
+    pub(super) fn set_chunk_for_test(&mut self, chunk: super::card_prefill::CardChunk) {
+        self.chunk = Some(chunk);
+    }
+
+    #[cfg(test)]
+    pub(super) fn set_sampler_vocab_for_test(&mut self, sampler_vocab: usize) {
+        assert!((1..=self.vocab).contains(&sampler_vocab));
+        self.sampler_vocab = sampler_vocab;
+    }
+
+    fn build_chunk_if_asked(
+        stack: &'static CardStack,
+        weights: &'static [&'static crate::family::project::cuda::CudaWeights],
+        inventory: &crate::family::gguf_model::Inventory,
+        dims: &super::dims::StepDims,
+        table: &'static LayerTable,
+        options: &super::dims::StepOptions,
+        chunk_rows: Option<usize>,
+    ) -> Result<Option<super::card_prefill::CardChunk>, EngError> {
+        let Some(rows) = chunk_rows else {
+            return Ok(None);
+        };
+        let embed_name: &'static str = Box::leak(
+            super::resources::GlobalNames::new(inventory)?
+                .embed
+                .into_boxed_str(),
+        );
+        match super::card_prefill::build_card_chunk(
+            stack,
+            dims,
+            table,
+            super::card_prefill::CardChunkInputs {
+                weights,
+                embed_name,
+            },
+            options,
+            rows,
+        ) {
+            Ok(chunk) => {
+                eprintln!("q36 cuda: chunked prefill engaged at {rows} rows");
+                Ok(Some(chunk))
+            }
+            Err(error) => {
+                eprintln!("q36 cuda: chunked prefill refused: {error:?}");
+                Ok(None)
+            }
+        }
+    }
+
+    #[cfg(test)]
+    pub(super) fn states_mut(&mut self) -> &mut [ResidentState] {
+        &mut self.states
+    }
+
+    #[cfg(test)]
+    pub(super) fn note_chunk_rows(&mut self, rows: usize) {
+        self.fed += rows;
+        // The chunk's revalidate left the states needing a start block,
+        // exactly like a prefix import: the next feed writes the full step
+        // params (token id AND position).
+        self.full_params_next = true;
+    }
+
+    /// Card 0's embedding table: the reference ChunkWeights carries.
+    #[cfg(test)]
+    pub(super) fn embed_for_test(&self) -> &'static crate::kernels::cuda::NativeWeight {
+        self.embed
+    }
+
+    /// The chunk-driver seam: this card's mixer views and its per-layer
+    /// MoE views, transposed to the [card][layer] order ChunkWeights takes.
+    #[cfg(test)]
+    pub(super) fn chunk_views_for_test(
+        &self,
+        card: usize,
+    ) -> (
+        &super::mixer_weights::MixerWeights<'static>,
+        Vec<super::moe::MoeLayerWeights<'static>>,
+    ) {
+        let moe = self.moe.iter().map(|set| set[card]).collect::<Vec<_>>();
+        (self.mixers[card].weights(), moe)
     }
 
     /// The prefix rig's comparison vehicle: one export per card of the
@@ -453,11 +550,59 @@ fn card_token_id(token: u32) -> Result<i32, EngError> {
         .map_err(|_| EngError::BadRequest(format!("token id {token} does not fit an i32")))
 }
 
+/// Chunked and per-token states are numerically different. Keep prefix reuse
+/// off until the chunk path has its own qualified identity and turn-chain gate.
+fn chunk_safe_prefix_limits(limits: StoreLimits, chunk_enabled: bool) -> StoreLimits {
+    if chunk_enabled {
+        StoreLimits {
+            roots: 0,
+            entries: 0,
+        }
+    } else {
+        limits
+    }
+}
+
 impl TokenStepper for CardSession {
     const OPERATION: &'static str = "qwen36_cards";
 
     fn feed(&mut self, token: u32) -> Result<(), EngError> {
         self.run_token(token, false).map(|_| ())
+    }
+
+    fn feed_rows(&mut self, tokens: &[u32]) -> Result<(), EngError> {
+        let Some(chunk) = self.chunk.as_ref() else {
+            return tokens.iter().try_for_each(|&t| self.feed(t));
+        };
+        if tokens.len() < 2 || self.poisoned {
+            return tokens.iter().try_for_each(|&t| self.feed(t));
+        }
+        // Match the single-device chunk path: validate the sampler vocabulary and
+        // signed kernel-index range for the whole batch before any card changes
+        // state. The embedding table can contain rows beyond the sampler vocabulary.
+        let _ = super::prefill_driver::chunk_ids(tokens, self.sampler_vocab)?;
+        let (rows, tail) = tokens.split_at(tokens.len() - 1);
+        let [last] = tail else {
+            unreachable!("len checked above");
+        };
+        for piece in rows.chunks(chunk.rows()) {
+            if let Err(error) = super::card_prefill::run_card_chunk(
+                self.stack,
+                &mut self.states,
+                chunk,
+                piece,
+                self.fed,
+            ) {
+                self.poisoned = true;
+                for state in &mut self.states {
+                    state.poison();
+                }
+                return Err(error);
+            }
+            self.fed += piece.len();
+        }
+        self.full_params_next = true;
+        self.feed(*last)
     }
 
     fn logits(&mut self, token: u32) -> Result<Vec<f32>, EngError> {
@@ -495,6 +640,12 @@ impl ExecutorOps for CardSession {
 
     fn prefill(&mut self, st: &mut DecodeSession, toks: &[u32]) -> Result<(), EngError> {
         st.prefill(self, toks, self.context_limit)
+    }
+
+    /// Advertise the admitted chunk size only when experimental card chunking is active.
+    /// Otherwise the worker keeps its existing per-token-path fallback.
+    fn prefill_piece(&self) -> Option<usize> {
+        self.chunk.as_ref().map(|chunk| chunk.rows())
     }
 
     fn decode(
@@ -649,6 +800,13 @@ impl ExecutorOps for Q36CudaStep {
         }
     }
 
+    fn prefill_piece(&self) -> Option<usize> {
+        match self {
+            Self::Single(step) => step.prefill_piece(),
+            Self::Cards(session) => session.prefill_piece(),
+        }
+    }
+
     fn decode(
         &mut self,
         st: &mut DecodeSession,
@@ -695,5 +853,26 @@ impl ExecutorOps for Q36CudaStep {
             Self::Single(step) => step.boundary(st),
             Self::Cards(session) => session.boundary(st),
         }
+    }
+}
+
+#[cfg(test)]
+mod chunk_prefix_tests {
+    use super::{StoreLimits, chunk_safe_prefix_limits};
+
+    #[test]
+    fn experimental_chunking_refuses_unqualified_prefix_reuse() {
+        let configured = StoreLimits {
+            roots: 2,
+            entries: 3,
+        };
+        assert_eq!(chunk_safe_prefix_limits(configured, false), configured);
+        assert_eq!(
+            chunk_safe_prefix_limits(configured, true),
+            StoreLimits {
+                roots: 0,
+                entries: 0,
+            },
+        );
     }
 }

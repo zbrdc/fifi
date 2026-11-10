@@ -38,9 +38,10 @@ use crate::family::qwen36::cuda::shard::ShardTable;
 use crate::family::qwen36::cuda::state::ResidentState;
 use crate::family::qwen36::cuda::step_plan::{KernelScratch, StepPlan};
 use crate::kernels::cuda::peer_ring::{PeerRing, RingMode};
+use std::cell::Cell;
 
 use crate::kernels::cuda::{
-    Admission, CudaContext, DeviceArena, DeviceBuffer, DeviceRange, DeviceStream,
+    Admission, CudaContext, DeviceArena, DeviceBuffer, DeviceEvent, DeviceRange, DeviceStream,
 };
 
 /// One card's device allocations. Field order is drop order; every buffer
@@ -103,10 +104,14 @@ pub(crate) struct CardStack {
     table: ShardTable,
     plans: Vec<StepPlan>,
     streams: Vec<DeviceStream>,
+    /// Reusable completion events, one owned by each consumer's context.
+    broadcast_events: Vec<DeviceEvent>,
     contexts: Vec<CudaContext>,
     /// A broadcast has only one publisher, so its following broadcast cannot
     /// acknowledge that every peer has consumed a double-buffered slot.
     sync_broadcasts: bool,
+    /// Experimental device-side consumer barrier for broadcast slot reuse.
+    async_broadcasts: Cell<bool>,
 }
 
 impl CardStack {
@@ -126,6 +131,21 @@ impl CardStack {
         Self::with_table(dims, options, devices, admission, &table)
     }
 
+    /// The ring's mailbox payload cap: the default covers the eager step's
+    /// exchanges (hidden*top_k for the fused MoE block); a chunked session
+    /// passes m*hidden so every layer sum of a chunk is one sequence.
+    pub(crate) fn with_payload(
+        dims: &StepDims,
+        options: &StepOptions,
+        devices: &[usize],
+        admission: &Admission,
+        table: &ShardTable,
+        payload: Option<usize>,
+    ) -> Result<(Self, Vec<ResidentState>), EngError> {
+        let ring_payload = payload.unwrap_or(dims.shape.hidden * dims.shape.moe.top_k.max(1));
+        Self::with_table_payload(dims, options, devices, admission, table, ring_payload)
+    }
+
     /// The stack over an explicit shard table: the placement planner's
     /// table, whose runs the loader must have used for the same cards.
     pub(crate) fn with_table(
@@ -134,6 +154,24 @@ impl CardStack {
         devices: &[usize],
         admission: &Admission,
         table: &ShardTable,
+    ) -> Result<(Self, Vec<ResidentState>), EngError> {
+        Self::with_table_payload(
+            dims,
+            options,
+            devices,
+            admission,
+            table,
+            dims.shape.hidden * dims.shape.moe.top_k.max(1),
+        )
+    }
+
+    pub(crate) fn with_table_payload(
+        dims: &StepDims,
+        options: &StepOptions,
+        devices: &[usize],
+        admission: &Admission,
+        table: &ShardTable,
+        ring_payload: usize,
     ) -> Result<(Self, Vec<ResidentState>), EngError> {
         if devices.is_empty() {
             return Err(EngError::BadRequest(
@@ -152,7 +190,17 @@ impl CardStack {
         // bare contexts before anything else borrows them. The payload cap
         // covers the MoE all-reduce, which exchanges every `expert_down`
         // pick row (`top_k` hidden rows) in one sequence.
-        let ring = PeerRing::new(&contexts, dims.shape.hidden * dims.shape.moe.top_k.max(1))?;
+        let ring = PeerRing::new(&contexts, ring_payload)?;
+        let async_broadcasts =
+            std::env::var_os("Q36_P2P_ASYNC_BROADCAST").is_some_and(|value| value == "1");
+        let broadcast_events = if async_broadcasts {
+            contexts
+                .iter()
+                .map(CudaContext::event)
+                .collect::<Result<Vec<_>, _>>()?
+        } else {
+            Vec::new()
+        };
         let sync_broadcasts =
             std::env::var_os("Q36_P2P_SYNC_BROADCAST").is_some_and(|value| value == "1");
         let mut plans = Vec::with_capacity(devices.len());
@@ -181,8 +229,10 @@ impl CardStack {
                 table: table.clone(),
                 plans,
                 streams,
+                broadcast_events,
                 contexts,
                 sync_broadcasts,
+                async_broadcasts: Cell::new(async_broadcasts),
             },
             states,
         ))
@@ -239,6 +289,37 @@ impl CardStack {
         self.sync_broadcasts = true;
     }
 
+    #[cfg(test)]
+    pub(super) fn prepare_async_broadcasts_for_test(&mut self) -> Result<(), EngError> {
+        if self.broadcast_events.is_empty() {
+            self.broadcast_events = self
+                .contexts
+                .iter()
+                .map(CudaContext::event)
+                .collect::<Result<Vec<_>, _>>()?;
+        }
+        self.async_broadcasts.set(false);
+        Ok(())
+    }
+
+    #[cfg(test)]
+    pub(super) fn new_for_async_broadcast_test(
+        dims: &StepDims,
+        options: &StepOptions,
+        devices: &[usize],
+        admission: &Admission,
+    ) -> Result<(Self, Vec<ResidentState>), EngError> {
+        let (mut stack, states) = Self::new(dims, options, devices, admission)?;
+        stack.prepare_async_broadcasts_for_test()?;
+        Ok((stack, states))
+    }
+
+    #[cfg(test)]
+    pub(super) fn set_async_broadcasts_for_test(&self, enabled: bool) {
+        assert!(!enabled || self.broadcast_events.len() == self.contexts.len());
+        self.async_broadcasts.set(enabled);
+    }
+
     /// One ring sum over every card: `partials[card]` in, `outs[card]`
     /// out, `statuses[card]` ORed. The executor's per-op entry point; the
     /// caller keeps the gather-pair gate and the end-of-token fold.
@@ -280,10 +361,41 @@ impl CardStack {
             statuses,
             count,
         )?;
-        if self.sync_broadcasts {
+        if self.async_broadcasts.get() {
+            // A publisher waits on each peer's post-copy event before it can
+            // reuse a mailbox parity slot for a later broadcast.
+            for (card, (stream, event)) in
+                self.streams.iter().zip(&self.broadcast_events).enumerate()
+            {
+                if card != source_card {
+                    stream.record(event)?;
+                    self.streams[source_card].wait_peer_event(event)?;
+                }
+            }
+        } else if self.sync_broadcasts {
             // A producer can otherwise reuse its parity slot while a slower
             // peer is still waiting for the preceding broadcast. Wait until
             // every consumer has copied the payload before any later publish.
+            for stream in &self.streams {
+                stream.synchronize()?;
+            }
+        }
+        Ok(())
+    }
+
+    /// A broadcast followed by a consumer barrier, regardless of the eager
+    /// path's optional synchronization setting. Use this when another
+    /// broadcast can reuse the same mailbox parity before a sum or gather.
+    pub(crate) fn broadcast_synchronized(
+        &self,
+        source_card: usize,
+        src: DeviceRange<'_>,
+        outs: &[DeviceRange<'_>],
+        statuses: &[DeviceRange<'_>],
+        count: usize,
+    ) -> Result<(), EngError> {
+        self.broadcast(source_card, src, outs, statuses, count)?;
+        if !self.sync_broadcasts && !self.async_broadcasts.get() {
             for stream in &self.streams {
                 stream.synchronize()?;
             }
@@ -347,7 +459,7 @@ mod device_tests {
         crate::kernels::cuda::peer::enable_peer_access(&devices).expect("enable peers");
         let (mut stack, _states) =
             CardStack::new(&dims(), &options(), &devices, &served_admission()).expect("stack");
-        stack.sync_broadcasts = true;
+        stack.prepare_async_broadcasts_for_test().expect("events");
         let mut inputs = Vec::new();
         let mut outputs = [Vec::new(), Vec::new()];
         let mut expected = Vec::new();
@@ -369,44 +481,141 @@ mod device_tests {
             }
             expected.push(bytes);
         }
-        for _ in 0..32 {
-            for message in 0..3 {
-                let outs = [
-                    outputs[0][message].range(0, 16).unwrap(),
-                    outputs[1][message].range(0, 16).unwrap(),
-                ];
-                let statuses = [
-                    stack.shards()[0].ring_status().unwrap(),
-                    stack.shards()[1].ring_status().unwrap(),
-                ];
-                stack
-                    .broadcast(
-                        0,
-                        inputs[message].range(0, 16).unwrap(),
-                        &outs,
-                        &statuses,
-                        4,
-                    )
-                    .expect("broadcast");
-            }
-            for (card, card_outputs) in outputs.iter().enumerate() {
-                let mut status = [0; 4];
-                stack.shards()[card]
-                    .ring_word()
-                    .read_at(&stack.streams()[card], 0, &mut status)
-                    .unwrap();
-                assert_eq!(u32::from_le_bytes(status), 0, "card {card} ring status");
+        for (sync_broadcasts, async_broadcasts) in
+            [(false, false), (true, false), (false, true), (true, true)]
+        {
+            stack.sync_broadcasts = sync_broadcasts;
+            stack.set_async_broadcasts_for_test(async_broadcasts);
+            for _ in 0..32 {
                 for message in 0..3 {
-                    let mut actual = [0; 16];
-                    card_outputs[message]
-                        .read_at(&stack.streams()[card], 0, &mut actual)
-                        .unwrap();
-                    assert_eq!(
-                        actual.as_slice(),
-                        expected[message],
-                        "card {card}, message {message}"
-                    );
+                    let outs = [
+                        outputs[0][message].range(0, 16).unwrap(),
+                        outputs[1][message].range(0, 16).unwrap(),
+                    ];
+                    let statuses = [
+                        stack.shards()[0].ring_status().unwrap(),
+                        stack.shards()[1].ring_status().unwrap(),
+                    ];
+                    stack
+                        .broadcast_synchronized(
+                            0,
+                            inputs[message].range(0, 16).unwrap(),
+                            &outs,
+                            &statuses,
+                            4,
+                        )
+                        .expect("broadcast");
                 }
+                for (card, card_outputs) in outputs.iter().enumerate() {
+                    let mut status = [0; 4];
+                    stack.shards()[card]
+                        .ring_word()
+                        .read_at(&stack.streams()[card], 0, &mut status)
+                        .unwrap();
+                    assert_eq!(u32::from_le_bytes(status), 0, "card {card} ring status");
+                    for message in 0..3 {
+                        let mut actual = [0; 16];
+                        card_outputs[message]
+                            .read_at(&stack.streams()[card], 0, &mut actual)
+                            .unwrap();
+                        assert_eq!(
+                            actual.as_slice(),
+                            expected[message],
+                            "card {card}, message {message}"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    #[ignore = "requires two peer-enabled CUDA devices; run under the GPU lease"]
+    fn asynchronous_broadcasts_preserve_reused_slots_on_two_gpus() {
+        const NAME: &str = "asynchronous_broadcasts_preserve_reused_slots_on_two_gpus";
+        assert!(device_present(NAME));
+        let devices = [0, 1];
+        let facts = crate::kernels::cuda::peer::probe_device_set(&devices).expect("probe devices");
+        crate::kernels::cuda::peer::check_peer_facts(&facts).expect("peer-capable devices");
+        crate::kernels::cuda::peer::enable_peer_access(&devices).expect("enable peers");
+        let (stack, _states) = CardStack::new_for_async_broadcast_test(
+            &dims(),
+            &options(),
+            &devices,
+            &served_admission(),
+        )
+        .expect("stack");
+        let unrecorded = stack.contexts()[1].event().expect("unrecorded event");
+        assert!(matches!(
+            stack.streams()[0].wait_peer_event(&unrecorded),
+            Err(EngError::BadRequest(message)) if message.contains("never recorded")
+        ));
+        stack.set_async_broadcasts_for_test(true);
+
+        // The first half repeatedly uses one publisher; the second alternates
+        // publishers. Queue every message before reading anything back, so
+        // both mailbox slots and the reusable events are stressed in flight.
+        const MESSAGES: usize = 128;
+        let mut inputs = Vec::with_capacity(MESSAGES);
+        let mut outputs = [Vec::new(), Vec::new()];
+        let mut expected = Vec::with_capacity(MESSAGES);
+        for message in 0..MESSAGES {
+            let source = if message < MESSAGES / 2 {
+                0
+            } else {
+                message % 2
+            };
+            let bytes: Vec<u8> = (0..4)
+                .flat_map(|i| ((message * 10 + i) as f32).to_le_bytes())
+                .collect();
+            let input = stack.contexts()[source]
+                .allocate(bytes.len())
+                .expect("input");
+            input
+                .write_at(&stack.streams()[source], 0, &bytes)
+                .expect("seed");
+            inputs.push(input);
+            for (card, card_outputs) in outputs.iter_mut().enumerate() {
+                card_outputs.push(stack.contexts()[card].allocate(16).expect("output"));
+            }
+            expected.push(bytes);
+        }
+        let statuses = [
+            stack.shards()[0].ring_status().unwrap(),
+            stack.shards()[1].ring_status().unwrap(),
+        ];
+        for (message, input) in inputs.iter().enumerate() {
+            let source = if message < MESSAGES / 2 {
+                0
+            } else {
+                message % 2
+            };
+            let outs = [
+                outputs[0][message].range(0, 16).unwrap(),
+                outputs[1][message].range(0, 16).unwrap(),
+            ];
+            stack
+                .broadcast(source, input.range(0, 16).unwrap(), &outs, &statuses, 4)
+                .expect("async broadcast");
+        }
+        for (card, card_outputs) in outputs.iter().enumerate() {
+            stack.streams()[card].synchronize().expect("drain stream");
+            let mut status = [0; 4];
+            stack.shards()[card]
+                .ring_word()
+                .read_at(&stack.streams()[card], 0, &mut status)
+                .unwrap();
+            assert_eq!(u32::from_le_bytes(status), 0, "card {card} ring status");
+            for (message, output) in card_outputs.iter().enumerate() {
+                let mut actual = [0; 16];
+                output
+                    .read_at(&stack.streams()[card], 0, &mut actual)
+                    .unwrap();
+                assert_eq!(
+                    actual.as_slice(),
+                    expected[message],
+                    "card {card} message {message}"
+                );
             }
         }
     }

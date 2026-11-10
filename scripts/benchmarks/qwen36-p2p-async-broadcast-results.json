@@ -1,0 +1,323 @@
+{
+  "date_local": "2026-11-08 America/New_York",
+  "method": "Same binary, model and configuration, sequential engine loads: host-synchronized broadcasts versus cross-device event barriers, with expert fusion enabled in both. Prefill rate divides prompt tokens by wall time through a complete two-token reply. Decode rate is server-reported completion tokens after the first batch divided by the time between the first and last batch.",
+  "hardware": {
+    "cpu": "AMD Ryzen 9 3900X",
+    "gpu_order": [
+      "NVIDIA GeForce RTX 3060 12 GB (PCIe 4.0 x4)",
+      "NVIDIA GeForce RTX 3080 10 GB (PCIe 4.0 x8)"
+    ],
+    "driver": "615.78.08 with local P2P patch",
+    "kernel": "7.0.0-42-generic"
+  },
+  "model": {
+    "file": "Qwen3.6-35B-A3B-Q4_K_M.gguf",
+    "sha256": "671e47e0ec53c665d048b98c3ecbfd5236b5ca9c3e02ed19fc8f81f7b85140c7",
+    "context_tokens": 131072,
+    "kv_dtype": "q8",
+    "prefix_reuse": false,
+    "synchronized_broadcasts": true,
+    "skip_prefill_head": true,
+    "preallocated_kv_admission": false,
+    "expert_sum_fusion": true
+  },
+  "provenance": {
+    "tested_source_commit": "ef5115c50521787123b57374cbd860cd80278a32",
+    "proposed_code_commit": "089b4e3c79243ac493ef8e8e9579843eca47cb29",
+    "identical_engine_tree": "36cef41237fb1f5c9c110a80160ae9c6ca8b19fe",
+    "binary_sha256": "fc4d7c3ae45db7b074489ff0eaa80ea584eb12f09fdd67ac83c38879c3db0e2f",
+    "test_binary_sha256": "882c0e1440710403267ba3d163316197e79237a3a6766ec8944c208cb08fe8eb",
+    "prefill_driver_sha256": "cc8d51af6d67f75200a6582d4235efdc94bccb36c1eb45ea5fe868344956516f",
+    "decode_driver_sha256": "18784169af16a62928618bccacb475ceb311f79ba180b8011d8c6850323edf6f",
+    "reply_driver_sha256": "2f4d1350e983033e951ee73f7e0e7bf6fd8d5a91c8a21be76b35d64ea8418582"
+  },
+  "requested_host_expert_bytes_by_card": [
+    1342177280,
+    3489660928
+  ],
+  "mapped_expert_bytes_by_card": [
+    1358954496,
+    3548381184
+  ],
+  "free_bytes_by_card_after_load": [
+    1536753664,
+    1726611456
+  ],
+  "control": {
+    "prefill": {
+      "model": "fifi-q36",
+      "repeat": 100,
+      "payload_sha256": "30d2e3484b1f4583f6e329fe9f8f9263e51894aa7898aa11fe107829277ee8ab",
+      "samples": [
+        {
+          "prompt_tokens": 524,
+          "completion_tokens": 2,
+          "answer": "4",
+          "seconds": 13.005085,
+          "estimated_prompt_tokens_per_second": 40.292,
+          "context_limit": 131072,
+          "request_id": "chatcmpl-0000000000000005"
+        },
+        {
+          "prompt_tokens": 524,
+          "completion_tokens": 2,
+          "answer": "4",
+          "seconds": 12.994141,
+          "estimated_prompt_tokens_per_second": 40.326,
+          "context_limit": 131072,
+          "request_id": "chatcmpl-0000000000000006"
+        },
+        {
+          "prompt_tokens": 524,
+          "completion_tokens": 2,
+          "answer": "4",
+          "seconds": 12.99559,
+          "estimated_prompt_tokens_per_second": 40.321,
+          "context_limit": 131072,
+          "request_id": "chatcmpl-0000000000000007"
+        }
+      ],
+      "median_seconds": 12.99559,
+      "median_prompt_tokens_per_second": 40.321
+    },
+    "decode": {
+      "model": "fifi-q36",
+      "repeat": 0,
+      "payload_sha256": "bacd82b581ce7dd5cb38dde1bb3004787b2327dab7ae6d4d6b3d25a6df747f3e",
+      "samples": [
+        {
+          "request_id": "chatcmpl-0000000000000008",
+          "prompt_tokens": 31,
+          "completion_tokens": 128,
+          "finish_reason": "length",
+          "answer_sha256": "ef5d7dd6bee907301e7cdb774195e953c37a82af6e8bde4afacc7b1ed065113b",
+          "answer_prefix": "1\n2\n3\n4\n5\n6\n7\n8\n9\n10\n11\n12\n13\n14\n15\n16\n17\n18\n19\n20\n21\n22\n23\n24\n25\n26\n27\n28\n29\n30",
+          "time_to_first_token_ms": 790.1,
+          "decode_tokens_per_second": 38.44,
+          "total_seconds": 4.095155
+        },
+        {
+          "request_id": "chatcmpl-0000000000000009",
+          "prompt_tokens": 31,
+          "completion_tokens": 128,
+          "finish_reason": "length",
+          "answer_sha256": "ef5d7dd6bee907301e7cdb774195e953c37a82af6e8bde4afacc7b1ed065113b",
+          "answer_prefix": "1\n2\n3\n4\n5\n6\n7\n8\n9\n10\n11\n12\n13\n14\n15\n16\n17\n18\n19\n20\n21\n22\n23\n24\n25\n26\n27\n28\n29\n30",
+          "time_to_first_token_ms": 792.6,
+          "decode_tokens_per_second": 38.63,
+          "total_seconds": 4.081875
+        },
+        {
+          "request_id": "chatcmpl-000000000000000a",
+          "prompt_tokens": 31,
+          "completion_tokens": 128,
+          "finish_reason": "length",
+          "answer_sha256": "ef5d7dd6bee907301e7cdb774195e953c37a82af6e8bde4afacc7b1ed065113b",
+          "answer_prefix": "1\n2\n3\n4\n5\n6\n7\n8\n9\n10\n11\n12\n13\n14\n15\n16\n17\n18\n19\n20\n21\n22\n23\n24\n25\n26\n27\n28\n29\n30",
+          "time_to_first_token_ms": 787.7,
+          "decode_tokens_per_second": 38.66,
+          "total_seconds": 4.073663
+        }
+      ],
+      "median_decode_tokens_per_second": 38.63
+    },
+    "prefill_telemetry": [
+      {
+        "request_id": "chatcmpl-0000000000000005",
+        "status": 200,
+        "outcome": "ok",
+        "prompt_tokens": 524,
+        "completion_tokens": 2,
+        "reused_tokens": 0,
+        "time_to_first_token_ms": 12976.9,
+        "decode_tokens_per_second": 38.71
+      },
+      {
+        "request_id": "chatcmpl-0000000000000006",
+        "status": 200,
+        "outcome": "ok",
+        "prompt_tokens": 524,
+        "completion_tokens": 2,
+        "reused_tokens": 0,
+        "time_to_first_token_ms": 12966.2,
+        "decode_tokens_per_second": 38.46
+      },
+      {
+        "request_id": "chatcmpl-0000000000000007",
+        "status": 200,
+        "outcome": "ok",
+        "prompt_tokens": 524,
+        "completion_tokens": 2,
+        "reused_tokens": 0,
+        "time_to_first_token_ms": 12967.5,
+        "decode_tokens_per_second": 38.63
+      }
+    ]
+  },
+  "event_barrier": {
+    "prefill": {
+      "model": "fifi-q36",
+      "repeat": 100,
+      "payload_sha256": "30d2e3484b1f4583f6e329fe9f8f9263e51894aa7898aa11fe107829277ee8ab",
+      "samples": [
+        {
+          "prompt_tokens": 524,
+          "completion_tokens": 2,
+          "answer": "4",
+          "seconds": 12.657997,
+          "estimated_prompt_tokens_per_second": 41.397,
+          "context_limit": 131072,
+          "request_id": "chatcmpl-0000000000000005"
+        },
+        {
+          "prompt_tokens": 524,
+          "completion_tokens": 2,
+          "answer": "4",
+          "seconds": 12.637043,
+          "estimated_prompt_tokens_per_second": 41.465,
+          "context_limit": 131072,
+          "request_id": "chatcmpl-0000000000000006"
+        },
+        {
+          "prompt_tokens": 524,
+          "completion_tokens": 2,
+          "answer": "4",
+          "seconds": 12.64013,
+          "estimated_prompt_tokens_per_second": 41.455,
+          "context_limit": 131072,
+          "request_id": "chatcmpl-0000000000000007"
+        }
+      ],
+      "median_seconds": 12.64013,
+      "median_prompt_tokens_per_second": 41.455
+    },
+    "decode": {
+      "model": "fifi-q36",
+      "repeat": 0,
+      "payload_sha256": "bacd82b581ce7dd5cb38dde1bb3004787b2327dab7ae6d4d6b3d25a6df747f3e",
+      "samples": [
+        {
+          "request_id": "chatcmpl-0000000000000008",
+          "prompt_tokens": 31,
+          "completion_tokens": 128,
+          "finish_reason": "length",
+          "answer_sha256": "ef5d7dd6bee907301e7cdb774195e953c37a82af6e8bde4afacc7b1ed065113b",
+          "answer_prefix": "1\n2\n3\n4\n5\n6\n7\n8\n9\n10\n11\n12\n13\n14\n15\n16\n17\n18\n19\n20\n21\n22\n23\n24\n25\n26\n27\n28\n29\n30",
+          "time_to_first_token_ms": 769.3,
+          "decode_tokens_per_second": 39.55,
+          "total_seconds": 3.982025
+        },
+        {
+          "request_id": "chatcmpl-0000000000000009",
+          "prompt_tokens": 31,
+          "completion_tokens": 128,
+          "finish_reason": "length",
+          "answer_sha256": "ef5d7dd6bee907301e7cdb774195e953c37a82af6e8bde4afacc7b1ed065113b",
+          "answer_prefix": "1\n2\n3\n4\n5\n6\n7\n8\n9\n10\n11\n12\n13\n14\n15\n16\n17\n18\n19\n20\n21\n22\n23\n24\n25\n26\n27\n28\n29\n30",
+          "time_to_first_token_ms": 769.9,
+          "decode_tokens_per_second": 39.61,
+          "total_seconds": 3.977668
+        },
+        {
+          "request_id": "chatcmpl-000000000000000a",
+          "prompt_tokens": 31,
+          "completion_tokens": 128,
+          "finish_reason": "length",
+          "answer_sha256": "ef5d7dd6bee907301e7cdb774195e953c37a82af6e8bde4afacc7b1ed065113b",
+          "answer_prefix": "1\n2\n3\n4\n5\n6\n7\n8\n9\n10\n11\n12\n13\n14\n15\n16\n17\n18\n19\n20\n21\n22\n23\n24\n25\n26\n27\n28\n29\n30",
+          "time_to_first_token_ms": 770.7,
+          "decode_tokens_per_second": 39.59,
+          "total_seconds": 3.979639
+        }
+      ],
+      "median_decode_tokens_per_second": 39.59
+    },
+    "prefill_telemetry": [
+      {
+        "request_id": "chatcmpl-0000000000000005",
+        "status": 200,
+        "outcome": "ok",
+        "prompt_tokens": 524,
+        "completion_tokens": 2,
+        "reused_tokens": 0,
+        "time_to_first_token_ms": 12630.9,
+        "decode_tokens_per_second": 39.65
+      },
+      {
+        "request_id": "chatcmpl-0000000000000006",
+        "status": 200,
+        "outcome": "ok",
+        "prompt_tokens": 524,
+        "completion_tokens": 2,
+        "reused_tokens": 0,
+        "time_to_first_token_ms": 12609.9,
+        "decode_tokens_per_second": 39.63
+      },
+      {
+        "request_id": "chatcmpl-0000000000000007",
+        "status": 200,
+        "outcome": "ok",
+        "prompt_tokens": 524,
+        "completion_tokens": 2,
+        "reused_tokens": 0,
+        "time_to_first_token_ms": 12612.9,
+        "decode_tokens_per_second": 39.53
+      }
+    ]
+  },
+  "four_deterministic_replies": {
+    "model": "fifi-q36",
+    "prompts": [
+      "Compute 19 plus 23. Reply with only the number.",
+      "Name the capital of Japan in one word.",
+      "What are the three letters immediately after D? Reply with just those letters.",
+      "What is the opposite of cold? Reply with one word."
+    ],
+    "results": [
+      {
+        "content": "42",
+        "finish_reason": "stop",
+        "prompt_tokens": 27,
+        "completion_tokens": 3
+      },
+      {
+        "content": "Tokyo",
+        "finish_reason": "stop",
+        "prompt_tokens": 21,
+        "completion_tokens": 3
+      },
+      {
+        "content": "EFG",
+        "finish_reason": "stop",
+        "prompt_tokens": 27,
+        "completion_tokens": 3
+      },
+      {
+        "content": "Hot",
+        "finish_reason": "stop",
+        "prompt_tokens": 24,
+        "completion_tokens": 2
+      }
+    ]
+  },
+  "changes": {
+    "prefill_percent": 2.81,
+    "decode_percent": 2.49
+  },
+  "verification": {
+    "broadcast_stress": "1 passed: 128 queued messages, one source repeated then alternating sources, both physical GPUs, every output and ring status checked",
+    "session_parity": "1 passed: first and later logits rows match on two peer GPUs with fusion enabled",
+    "existing_ownership": "1 passed: the existing same-adapter wait refusal remains in force",
+    "test_threads": 1,
+    "release_test_and_engine_builds": "passed",
+    "clippy_native_cuda_deny_warnings": "passed",
+    "rustfmt": "passed",
+    "measurement_driver_self_tests": "passed",
+    "previous_decode_driver_mock_and_real_engine_smoke": "passed"
+  },
+  "limitations": [
+    "Three samples per arm on one host and one model; arms ran sequentially, so these are not a general performance guarantee.",
+    "The 131072-token context was configured but not filled in this comparison.",
+    "Cross-device event ordering is experimental, disabled by default and not qualified."
+  ]
+}

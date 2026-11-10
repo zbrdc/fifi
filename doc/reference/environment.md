@@ -12,7 +12,9 @@ Two kinds of values appear below:
 
 | Variable | Default | Meaning |
 | --- | --- | --- |
-| `INFERENCE_CUDA_ARCHS` | `86` (`72` on aarch64) | Comma-separated GPU architectures for the CUDA kernels, for example `89` for RTX 40-series cards or `86,89` for both. Read by `cargo build --features native-cuda`. |
+| `INFERENCE_CUDA_ARCHS` | `86` (`72` on aarch64) | Comma-separated native GPU architecture targets for CUDA kernels, read by `cargo build --features native-cuda`. For example, `75,86,89` targets RTX 20, 30 and 40 series with CUDA 12.4. The build also includes PTX for the highest listed target, which a suitable newer driver may compile for a newer GPU; PTX does not run on an older architecture. CUDA 12.8 or newer is needed to compile a native `120` target for RTX 50 series. These targets and PTX compatibility do not by themselves qualify the engine on a GPU. See [CUDA FP16 prefill attention](configuration.md#cuda-fp16-prefill-attention). |
+
+NVIDIA documents the [GPU compute capabilities](https://developer.nvidia.com/cuda/gpus), [PTX compatibility rules](https://docs.nvidia.com/cuda/archive/12.8.1/blackwell-compatibility-guide/index.html), and [CUDA 12.8 compiler support for SM 120](https://docs.nvidia.com/cuda/archive/12.8.2/cuda-features-archive/index.html).
 
 ## Server
 
@@ -38,6 +40,12 @@ Two kinds of values appear below:
 | `Q36_PREFILL_QUERY_SLICE` | none | Opt-in query-block rows for sliced prefill attention, read once. Applies only where the composite attention runs, so it has no effect while the flash kernel serves the chunk. |
 | `Q36_NO_ACTMUL` (and siblings) | unset | Kill switches for the individual fused-prefill kernels while `Q36_FUSED_PREFILL` stays on: `Q36_NO_ACTMUL`, `Q36_NO_ATTNGATE`, `Q36_NO_EMBEDDED`, `Q36_NO_GDNPREP`, `Q36_NO_GDNPOST`, `Q36_NO_MOECOMBINE`. The variable's presence alone disables that one fusion. |
 
+## CUDA
+
+| Variable | Default | Accepted values | Meaning |
+| --- | --- | --- | --- |
+| `FIFI_CUDA_ATTN_PREFILL_ADAPT` | `0` | `0`, `1` | Experimental FP16 prefill attention selection for supported model geometries. `1` chooses a kernel using the current device's per-block shared-memory and thread limits; unset, `0` and unrecognized values retain the original launch path. Read once per process; restart to change it. The adaptive path is not yet qualified across RTX 20, 30, 40 and 50 series. See [CUDA FP16 prefill attention](configuration.md#cuda-fp16-prefill-attention). |
+
 ## Qwen3.6 on NVIDIA CUDA
 
 The Flash-Next CUDA step runs one row per launch, which is under the 64-row threshold of the two `FIFI_GDN_*` rows at the end of the table, so they do not change it today; its geometry is covered by their tests.
@@ -48,7 +56,9 @@ The Flash-Next CUDA step runs one row per launch, which is under the 64-row thre
 | `Q36_VERIFY_GGUF_SHA256` | `0` | `0`, `1` | `1` checks the model file's SHA-256 while it loads. |
 | `Q36_CUDA_CHUNK_PREFILL` | on (chunked prefill) | `0`, `1` | `0` processes the prompt one token at a time, with the `q8` cache and with the default `f32` cache (FP16 storage). Checked on an EXL3 pack with both caches; a GGUF file with Q6_K weights never chunks. Unset or `1` leaves the chunk path on. |
 | `Q36_CUDA_CHUNK_ROWS` | `1024` | `16`, `128`, `512`, `1024` | Largest prompt chunk of the `q8` cache when chunking is on. Ignored with the default `f32` cache (FP16 storage), whose chunks are 2,048 rows for the first 3,072 positions and 1,024 after that. |
+| `Q36_P2P_CHUNK` | unset | `0` or a positive row count | Experimental multi-device prompt batching. Unset or `0` keeps the eager path; positive values are capped by the peer transport. Prefix reuse is disabled when the chunk path is active. The path is not yet qualified. See [chunked P2P prefill](../qwen36-p2p-chunked-prefill.md). |
 | `Q36_P2P_SKIP_PREFILL_HEAD` | `0` | only `1` is on | Experimental multi-device GGUF path: skip the unused vocabulary projection for prompt-only feeds; logits and non-finite output-head checks still run when a prediction is needed. Set at engine startup. See [prompt-only head skipping](../qwen36-p2p-prefill.md). |
+| `Q36_P2P_ASYNC_BROADCAST` | `0` | only `1` is on | Experimental multi-device GGUF path: order each broadcast publisher after its consumers with cross-device events. Read at engine startup. See [asynchronous broadcasts](../qwen36-p2p-async-broadcast.md). |
 | `INFERENCE_CUDA_P2P_RING_MULTIBLOCK` | `0` | only `1` is on | Experimental multi-block peer-ring f32 publishes and f32/FP16 reductions above 2,048 values; FP16 publishes stay single-block. Unset or any value other than `1` keeps the single-block path. Set before startup; changing it requires a restart. This path is not yet qualified. See [multi-block P2P ring](../qwen36-p2p-ring-multiblock.md). |
 | `Q36_CUDA_KV8_STAGE_CONTEXT` | `1` | `0`, `1` | `0` limits the FP16 attention staging buffer to 65,536 rows. |
 | `Q36_CUDA_KV8_FIXED_ADMISSION` | `1` | `0`, `1` | `0` returns to the older way of choosing chunk sizes, which may pick smaller chunks or one token at a time. On a 24 GB card, use the 131K profile with it. The shrink ladder degrades the stage instead of refusing the boot within its reach — above 131,072 rows up to 48 MiB of headroom over the 32,768-row default stage (plus the existing 192 MiB wide fallback when a wide stage was offered and refused); at or below 131,072 rows it runs from the full-context stage down to the floor instead; it does not create free VRAM. The floor is max(8192, ceil(context / 128)) — 8192 everywhere shipped — and odd stages or halves that cross the floor stop the ladder earlier (at context 2,097,152 the floor is 16,384, a 32 MiB relief; at 131,071 the initial stage is odd so nothing shrinks). Measured on a 24 GiB card with a 1.2 GiB desktop, prefix reuse off (charges as the admission gate computes them: the max part charge and the 64 MiB spare minimum included): the unballasted 262144 profile misses the boot by 393.5 MiB at the 32768-row default stage and still 345.5 MiB at the 8192-row floor rung (exactly the 48 MiB the ladder relieves); with the shipped prefix profile (prefix reuse on) the flat device-prefix extra adds about 62.8 MiB (65,863,680 B, ledger extras_fixed) — 456.3 MiB at the default stage and 408.3 MiB at the floor, derived from the same prefix-off snapshot (a measured prefix-on refusal at a later snapshot missed by 383.7 MiB); how much the miss really is depends on how much VRAM the desktop holds at boot — the 262144 profile needs 393.5 MiB (prefix off; 456.3 MiB with the shipped prefix profile) more free VRAM than measured to boot at the default stage. Making 262K boot on such a card is a budget/profile decision, not a ladder behavior. |
