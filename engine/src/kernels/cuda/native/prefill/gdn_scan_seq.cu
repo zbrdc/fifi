@@ -950,9 +950,49 @@ __global__ void __launch_bounds__(kLanes * kChunkWarps, 1) gdn_scan_chunk_k(Scan
             }
         }
         __syncthreads();  // the solved U rows are visible to M2 and the update
-        // M2, the outputs: thread (t, c) adds the inter term B_t·q̂ᵀS (an r walk like M1) and
-        // the masked intra sum A·U (an s walk; both operands are 128-bit streams, A's zeroed
-        // upper bounds the walk at the diagonal quad).
+        // M2, the outputs. sm_80+: the inter term B_t·q̂ᵀS as one mma pass (M1's shape with
+        // Q̂ in the A slot) stores B_t·inter to o_out, and the masked intra sum A·U then adds
+        // in as the same float4 walk (A's zeroed upper bounds it at the diagonal quad).
+        // sm_72 keeps the joined SIMT walk.
+#if __CUDA_ARCH__ >= 800
+        {
+            const int t0w = 16 * (w >> 3), c0w = 8 * (w & 7);
+            float d[4] = {0.f, 0.f, 0.f, 0.f};
+            for (int r0 = 0; r0 < D; r0 += 16) {
+                unsigned aH[4], aL[4], bH[2], bL[2];
+                ldm_a(q_h, t0w, r0, aH);
+                ldm_a(q_l, t0w, r0, aL);
+                ldm_b(S_h, c0w, r0, bH);
+                ldm_b(S_l, c0w, r0, bL);
+                mma_16816(d, aH, bH[0], bH[1]);
+                mma_16816(d, aH, bL[0], bL[1]);
+                mma_16816(d, aL, bH[0], bH[1]);
+            }
+            const int r0 = lane >> 2, cc = 2 * (lane & 3);
+#pragma unroll
+            for (int e = 0; e < 4; ++e) {
+                const int t = t0w + r0 + 8 * (e >> 1);
+                const int c = c0w + cc + (e & 1);
+                if (t < len)
+                    a.o_out[((size_t)(t0 + t) * a.n_v_heads + h) * D + col0 + c] = B_s[t] * d[e];
+            }
+        }
+        __syncthreads();  // the intra walk adds into the mma scatter's stores, cross-warp
+        {
+            const int c = tid % kCols, tg = tid / kCols;
+            const int tgs = kLanes * kChunkWarps / kCols;
+            for (int i = 0; i < kC / tgs; ++i) {
+                const int t = tg + tgs * i;
+                if (t >= len) break;
+                const float4 *at = reinterpret_cast<const float4 *>(A_s + t * kCpad);
+                const float4 *uc = reinterpret_cast<const float4 *>(U_s + c * kCpad);
+                float intra = 0.f;
+#pragma unroll 2
+                for (int s = 0; s <= t / 4; ++s) intra += dot4(at[s], uc[s]);
+                a.o_out[((size_t)(t0 + t) * a.n_v_heads + h) * D + col0 + c] += intra;
+            }
+        }
+#else
         {
             const int c = tid % kCols, tg = tid / kCols;
             const int tgs = kLanes * kChunkWarps / kCols;
@@ -971,6 +1011,7 @@ __global__ void __launch_bounds__(kLanes * kChunkWarps, 1) gdn_scan_chunk_k(Scan
                     B_s[t] * inter + intra;
             }
         }
+#endif
         __syncthreads();  // M2's reads of S, A and U are done before the update writes S
         // The sub-chunk's single state update: S ← B_end·S + Σ_s (B_end/B_s)·k_s u_sᵀ, with
         // the tail ratios staged into B_s by thread 0 (B_s's prefix products are spent).
