@@ -42,6 +42,7 @@
 use super::super::attn::KvBuffers;
 use super::super::chunk_plan::{PREFILL_RETIRE_CAP, delta_retire_per_token, delta_subchunk};
 use super::super::decoder::{ResidentDecoder, StepMode, StepResult};
+use super::super::executor::compiled_layer_on;
 use super::super::kv_plan::{depth_ranges, prefill_score_bound};
 use super::super::moe::Routing;
 use super::super::ops::{Ctx, cast_to, dim, linear, linear_rows, short_import, to_act, values};
@@ -50,6 +51,7 @@ use super::super::step::{check_dtype, read_token, split_rows};
 use super::super::weights::{RFeedForward, RMixer};
 use super::{attn, delta, moe};
 use crate::family::qwen36::settings::KvDtype;
+use crate::kernels::mlx::native::compile::CompileDeltaLayerArgs;
 use crate::{
     EngError,
     family::flash_next::stored::{self, SlicedWeight},
@@ -322,6 +324,68 @@ fn run(
     // `route_experts` and holds no node.
     let mut healths: Vec<ExecutionTensor> = Vec::new();
     for (index, (layer, old_layer)) in weights.layers.iter().zip(old).enumerate() {
+        // B1 (`Q36_COMPILED_LAYER=1`): one DELTA-mixer layer with a device-routed MoE runs as
+        // ONE compiled closure instead of ~395 eager native entries. The states the closure
+        // does not cover keep the eager body below: `Record` (its recorded rows), the last
+        // layer of a `Prompt` chunk (it skips its MoE), host routing, and any non-Delta or
+        // non-Moe layer.
+        if mode != StepMode::Record
+            && !(mode == StepMode::Prompt && index == last)
+            && decoder.routing == Routing::Device
+            && compiled_layer_on()
+        {
+            if let (
+                RMixer::Delta(w),
+                LayerState::Delta { rec, ring },
+                RFeedForward::Moe(moe_w),
+            ) = (&layer.mixer, &old_layer, &layer.feed_forward)
+            {
+                let d = &shape.delta;
+                let s = ctx.kernels.compiled_delta_layer(&CompileDeltaLayerArgs {
+                    x: &h,
+                    rec,
+                    ring,
+                    dims: [
+                        d.key_heads as u32,
+                        d.key_dim as u32,
+                        d.value_heads as u32,
+                        d.value_dim as u32,
+                        d.conv_dim() as u32,
+                        (d.conv_kernel - 1) as u32,
+                    ],
+                    packed: [&w.qkv, &w.z, &w.b, &w.a, &w.out],
+                    plain: [
+                        &w.conv_taps,
+                        &w.conv_last,
+                        &w.neg_exp_a_log,
+                        &w.dt_bias,
+                        &w.norm,
+                    ],
+                    qk_eps: &ctx.consts.qk_eps,
+                    sqrt_kd: &ctx.consts.sqrt_kd,
+                    in_norm: &layer.input_norm,
+                    post_norm: &layer.post_norm,
+                    router_t: &moe_w.router_t,
+                    shared: [&moe_w.shared_gate, &moe_w.shared_up, &moe_w.shared_down],
+                    shared_scalar_t: &moe_w.shared_scalar_t,
+                    stacks: [&moe_w.gate_up, &moe_w.down],
+                    hidden: shape.hidden as u32,
+                    experts: shape.moe.experts as u32,
+                    top_k: shape.moe.top_k as u32,
+                    renorm: shape.moe.renorm,
+                    eps: shape.eps,
+                    act: ctx.consts.act,
+                })?;
+                h = s.out;
+                healths.push(s.health);
+                layers.push(LayerState::Delta {
+                    rec: s.rec,
+                    ring: s.ring,
+                });
+                check_dtype("compiled layer output", &h, ctx.consts.act)?;
+                continue;
+            }
+        }
         let normed = ctx.kernels.rms_norm(&h, &layer.input_norm, shape.eps)?;
         // The same dtype guard as the decode step. MLX promotes mixed operands,
         // so a stray F32 operand would turn BF16 activations back to F32 without an error.

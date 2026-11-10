@@ -302,6 +302,15 @@ fn window_taps_on() -> bool {
     std::env::var_os("Q36_WINDOW_TAPS").is_some_and(|v| v == "1")
 }
 
+/// Arms the compiled whole-layer chunk closure (`Q36_COMPILED_LAYER=1`, B1): a DELTA-mixer
+/// layer of a device-routed chunk window runs as ONE `mlx_compile`d closure (input norm,
+/// mixer, both residual adds, and the folded MoE rows sequence) instead of ~395 eager native
+/// entries. Default off; the eager chunk stays the reference and the parity oracle.
+pub(super) fn compiled_layer_on() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("Q36_COMPILED_LAYER").is_some_and(|v| v == "1"))
+}
+
 /// Arms the step-window verify path (`Q36_SPEC_STEP_WINDOW`): each window row runs as ONE
 /// compiled `Logits` step instead of the eager Window chunk. `=1` takes one pre-window
 /// snapshot - the chunk window's exact charge contract - and commit replays the kept rows as
