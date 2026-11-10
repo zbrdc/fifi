@@ -67,7 +67,7 @@
 use super::attn::growth_bytes;
 use super::chunk_plan::{ChunkCost, PREFILL_CANDIDATES, PrefillPlan, PrefillTerms, admitted_chunk};
 use super::decoder::{MAX_CHUNK_ROWS, ResidentDecoder, StepMode};
-use super::state::{ResidentSnapshot, ResidentState};
+use super::state::{ResidentSnapshot, ResidentState, chunk_growth_bytes};
 use crate::{
     EngError,
     family::{
@@ -273,6 +273,8 @@ struct WindowTaps {
     prefill_us: u128,
     draw_us: u128,
     commit_us: u128,
+    /// The native dispatch count at the start of the window (the tap prints the delta).
+    ops_base: u64,
 }
 
 std::thread_local! {
@@ -287,6 +289,7 @@ std::thread_local! {
             prefill_us: 0,
             draw_us: 0,
             commit_us: 0,
+            ops_base: 0,
         })
     };
 }
@@ -295,13 +298,25 @@ fn window_taps_on() -> bool {
     std::env::var_os("Q36_WINDOW_TAPS").is_some_and(|v| v == "1")
 }
 
-/// Arms the step-window verify path (`Q36_SPEC_STEP_WINDOW=1`): each window row runs as ONE
-/// compiled `Logits` step with a shared-handle checkpoint before every row, and commit adopts
-/// the checkpoint at the kept boundary — no kept-prefix replay. Default off (the chunk window
-/// stays the reference). A checkpoint-charge refusal falls back to the chunk path.
+/// Arms the step-window verify path (`Q36_SPEC_STEP_WINDOW`): each window row runs as ONE
+/// compiled `Logits` step instead of the eager Window chunk. `=1` takes one pre-window
+/// snapshot - the chunk window's exact charge contract - and commit replays the kept rows as
+/// compiled steps. `=2` checkpoints before every row and commit adopts the checkpoint at the
+/// kept boundary, trading T snapshot charges for zero replay; a mid-window charge refusal
+/// restores the base, drops the checkpoints (releasing their charges), and falls back to the
+/// chunk path. Default off (the chunk window stays the reference).
 fn step_window() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var_os("Q36_SPEC_STEP_WINDOW").is_some_and(|v| v == "1"))
+    *ON.get_or_init(|| {
+        std::env::var_os("Q36_SPEC_STEP_WINDOW").is_some_and(|v| v == "1" || v == "2")
+    })
+}
+
+/// The `=2` form: a shared-handle checkpoint before every window row, so commit adopts the
+/// kept boundary instead of replaying it.
+fn checkpoint_window() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("Q36_SPEC_STEP_WINDOW").is_some_and(|v| v == "2"))
 }
 
 /// The verify-window model of one speculative decode call: the solo step plus the pending window.
@@ -319,6 +334,9 @@ struct Q36WindowStep<'a> {
     /// Marks a window that ran the step path (`Q36_SPEC_STEP_WINDOW`): commit replays the
     /// kept rows as compiled one-row steps instead of the eager Prompt chunk.
     stepped_window: bool,
+    /// The `=2` per-row checkpoints: entry `i` is the state before row `i`, so commit adopts
+    /// entry `kept_rows` instead of replaying. `None` on the `=1` and chunk paths.
+    checkpoints: Option<Vec<ResidentSnapshot>>,
     inputs: Vec<u32>,
     logits: Vec<Vec<f32>>,
 }
@@ -351,6 +369,10 @@ impl Q36WindowStep<'_> {
     fn run_window_impl(&mut self, inputs: &[u32]) -> Result<()> {
         self.snapshot = None;
         self.stepped_window = false;
+        self.checkpoints = None;
+        if window_taps_on() {
+            WINDOW_TAPS.with_borrow_mut(|t| t.ops_base = crate::kernels::mlx::dispatch_count());
+        }
         self.inputs.clear();
         self.logits.clear();
         self.window_fits(inputs)?;
@@ -408,25 +430,63 @@ impl Q36WindowStep<'_> {
         Ok(())
     }
 
-    /// The step window: one compiled `Logits` step per row, checkpointed before every row.
-    /// Returns `Ok(Some(()))` when the window ran, and `Ok(None)` when a checkpoint-charge
-    /// `MemoryPlan` refusal sent it back to the chunk path (with the state restored to the
-    /// pre-window checkpoint). Any other error propagates: a native step failure poisons the
-    /// state, and the worker's reset is the only sound recovery, as in the chunk path's contract.
+    /// The step window: one compiled `Logits` step per row. `=1` takes one pre-window
+    /// snapshot (the chunk window's exact charge contract); `=2` checkpoints before every row
+    /// so commit adopts the kept boundary. Returns `Ok(Some(()))` when the window ran, and
+    /// `Ok(None)` when a `MemoryPlan` refusal sent it back to the chunk path with the state
+    /// restored to the pre-window base and every checkpoint charge released. Any other error
+    /// propagates: a native step failure poisons the state, and the worker's reset is the only
+    /// sound recovery, as in the chunk path's contract.
     fn run_window_steps(&mut self, inputs: &[u32]) -> Result<Option<()>> {
         let started = std::time::Instant::now();
         let Q36Step { decoder, state, .. } = &mut self.step;
-        // ONE pre-window snapshot, exactly the chunk path's charge contract. A refusal of that
-        // single charge falls back to the chunk path (which would refuse the same way).
-        let base = match decoder.snapshot(state) {
-            Ok(base) => base,
-            Err(EngError::MemoryPlan(_)) => return Ok(None),
-            Err(error) => return Err(error),
-        };
-        let snapshot_us = started.elapsed().as_micros();
-        let steps_started = std::time::Instant::now();
+        let checkpoints = checkpoint_window();
+        if checkpoints {
+            // Upfront admission: the checkpoint window needs T snapshots plus T one-row
+            // growths, and its commit rewinds under the FULL set of held charges - the rewind
+            // acquires the rewound KV extent before it releases the old permits - so the
+            // probe reserves that transient too. Declining BEFORE any charge leaves the
+            // budget exactly as the chunk path expects it; a mid-window fallback cannot,
+            // because restored rows keep their growth permits.
+            let per_snapshot = decoder.snapshot_bytes(state)?;
+            let per_row = chunk_growth_bytes(&decoder.weights, 1)?;
+            let rows = u64::try_from(inputs.len())
+                .map_err(|_| EngError::BadRequest("the verify window exceeds u64 rows".into()))?;
+            let rewind = u64::from(state.pos())
+                .saturating_add(rows)
+                .saturating_sub(1)
+                .saturating_mul(per_row);
+            let need = rows
+                .saturating_mul(per_snapshot.saturating_add(per_row))
+                .saturating_add(rewind);
+            if decoder.budget.free() < need {
+                return Ok(None);
+            }
+        }
+        let mut snaps: Vec<ResidentSnapshot> =
+            Vec::with_capacity(if checkpoints { inputs.len() } else { 1 });
+        let mut snapshot_us = 0u128;
         let mut logits: Vec<Vec<f32>> = Vec::with_capacity(inputs.len());
         for &token in inputs {
+            // `=1` snapshots once before row 0; `=2` before every row.
+            if checkpoints || snaps.is_empty() {
+                let snap_started = std::time::Instant::now();
+                match decoder.snapshot(state) {
+                    Ok(snap) => snaps.push(snap),
+                    // A charge refusal is clean: when a row already ran, the base (row 0's
+                    // checkpoint) restores the pre-window state and every held charge releases
+                    // with the drop, so the chunk path re-runs its own one-shot admission of
+                    // the whole window. A refusal of the first charge changed nothing.
+                    Err(EngError::MemoryPlan(_)) => {
+                        if let Some(base) = snaps.first() {
+                            decoder.restore(state, base)?;
+                        }
+                        return Ok(None);
+                    }
+                    Err(error) => return Err(error),
+                }
+                snapshot_us += snap_started.elapsed().as_micros();
+            }
             let row = decoder
                 .step(state, token, StepMode::Logits)
                 .and_then(|result| {
@@ -439,23 +499,29 @@ impl Q36WindowStep<'_> {
                 // A growth refusal mid-window leaves the state clean: restore the base and let
                 // the chunk path try its one-shot admission of the whole window.
                 Err(EngError::MemoryPlan(_)) => {
-                    decoder.restore(state, &base)?;
+                    let base = snaps.first().expect("row 0 has a checkpoint");
+                    decoder.restore(state, base)?;
                     return Ok(None);
                 }
                 Err(error) => return Err(error),
             }
         }
+        let steps_us = started.elapsed().as_micros() - snapshot_us;
         if window_taps_on() {
             WINDOW_TAPS.with_borrow_mut(|t| {
                 t.snapshot_us += snapshot_us;
-                t.prefill_us += steps_started.elapsed().as_micros();
+                t.prefill_us += steps_us;
                 t.rows = inputs.len();
             });
         }
         self.logits = logits;
         self.inputs = inputs.to_vec();
-        self.snapshot = Some(base);
         self.stepped_window = true;
+        if checkpoints {
+            self.checkpoints = Some(snaps);
+        } else {
+            self.snapshot = Some(snaps.swap_remove(0));
+        }
         Ok(Some(()))
     }
 }
@@ -479,6 +545,40 @@ impl WindowModel for Q36WindowStep<'_> {
     }
 
     fn commit_window(&mut self, commit: &Commit) -> Result<()> {
+        // The `=2` window first: adopt the checkpoint at the kept boundary.
+        if let Some(checkpoints) = self.checkpoints.take() {
+            self.stepped_window = false;
+            self.logits.clear();
+            let _inputs = std::mem::take(&mut self.inputs);
+            if commit.discarded_rows == 0 {
+                return Ok(());
+            }
+            let kept = commit.kept_rows;
+            let started = std::time::Instant::now();
+            let Q36Step { decoder, state, .. } = &mut self.step;
+            // Entry `kept` is the state right before the first discarded row. No replay and no
+            // native call; the remaining checkpoints release their charges with the drop.
+            let adopted = checkpoints
+                .get(kept)
+                .ok_or_else(|| window_output_error("the kept boundary has no checkpoint"))?;
+            decoder.restore(state, adopted)?;
+            if window_taps_on() {
+                WINDOW_TAPS.with_borrow_mut(|t| {
+                    t.calls += 1;
+                    let commit_us = started.elapsed().as_micros();
+                    eprintln!(
+                        "WINDOW_TAP call={} rows={} kept={} discarded={} snapshot_us={} prefill_us={} draw_us={} commit_us={} replays={} steps=ckpt ops={}",
+                        t.calls, t.rows, kept, commit.discarded_rows, t.snapshot_us, t.prefill_us,
+                        t.draw_us, commit_us, t.replays,
+                        crate::kernels::mlx::dispatch_count().saturating_sub(t.ops_base)
+                    );
+                    t.snapshot_us = 0;
+                    t.prefill_us = 0;
+                    t.draw_us = 0;
+                });
+            }
+            return Ok(());
+        }
         if self.stepped_window {
             let snapshot = self
                 .snapshot
@@ -504,9 +604,10 @@ impl WindowModel for Q36WindowStep<'_> {
                     t.calls += 1;
                     let commit_us = started.elapsed().as_micros();
                     eprintln!(
-                        "WINDOW_TAP call={} rows={} kept={} discarded={} snapshot_us={} prefill_us={} draw_us={} commit_us={} replays={} steps=1",
+                        "WINDOW_TAP call={} rows={} kept={} discarded={} snapshot_us={} prefill_us={} draw_us={} commit_us={} replays={} steps=1 ops={}",
                         t.calls, t.rows, kept, commit.discarded_rows, t.snapshot_us, t.prefill_us,
-                        t.draw_us, commit_us, t.replays
+                        t.draw_us, commit_us, t.replays,
+                        crate::kernels::mlx::dispatch_count().saturating_sub(t.ops_base)
                     );
                     t.snapshot_us = 0;
                     t.prefill_us = 0;
@@ -546,9 +647,10 @@ impl WindowModel for Q36WindowStep<'_> {
                 t.kept += kept;
                 let commit_us = started.elapsed().as_micros();
                 eprintln!(
-                    "WINDOW_TAP call={} rows={} kept={} discarded={} snapshot_us={} prefill_us={} draw_us={} commit_us={} replays={}",
+                    "WINDOW_TAP call={} rows={} kept={} discarded={} snapshot_us={} prefill_us={} draw_us={} commit_us={} replays={} ops={}",
                     t.calls, t.rows, kept, commit.discarded_rows, t.snapshot_us, t.prefill_us,
-                    t.draw_us, commit_us, t.replays
+                    t.draw_us, commit_us, t.replays,
+                    crate::kernels::mlx::dispatch_count().saturating_sub(t.ops_base)
                 );
                 t.snapshot_us = 0;
                 t.prefill_us = 0;
@@ -1165,6 +1267,7 @@ impl ExecutorOps for Q36Executor {
             context_limit: limits.context_limit,
             snapshot: None,
             stepped_window: false,
+            checkpoints: None,
             inputs: Vec::new(),
             logits: Vec::new(),
         };
@@ -1780,6 +1883,7 @@ mod tests {
             context_limit: limits.context_limit,
             snapshot: None,
             stepped_window: false,
+            checkpoints: None,
             inputs: Vec::new(),
             logits: Vec::new(),
         };

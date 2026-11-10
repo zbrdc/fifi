@@ -31,6 +31,16 @@ pub(crate) mod attn_dispatch;
 pub(crate) mod compile;
 mod ffi;
 mod guard;
+
+/// The calling thread's native-dispatch count (the `Q36_WINDOW_TAPS` probe).
+pub(crate) fn dispatch_count() -> u64 {
+    guard::dispatch_count()
+}
+
+/// Zeroes the calling thread's native-dispatch count (the `Q36_WINDOW_TAPS` probe).
+pub(crate) fn reset_dispatch_count() {
+    guard::reset_dispatch_count()
+}
 mod handles;
 mod host;
 mod pages;

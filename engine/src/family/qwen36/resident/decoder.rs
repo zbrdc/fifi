@@ -820,6 +820,12 @@ impl<'c> ResidentDecoder<'c> {
         state.snapshot(&mut self.budget)
     }
 
+    /// The bytes one snapshot of `state` would charge, without charging them: the admission
+    /// probe of the checkpoint window (`Q36_SPEC_STEP_WINDOW=2`).
+    pub(super) fn snapshot_bytes(&self, state: &ResidentState) -> Result<u64, EngError> {
+        state.snapshot_bytes()
+    }
+
     /// Replaces `state` with `snapshot`. See `ResidentState::restore`.
     pub(super) fn restore(
         &mut self,

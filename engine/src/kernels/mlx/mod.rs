@@ -12,6 +12,16 @@ mod contract_tests;
 pub(crate) mod native;
 mod staging;
 
+/// The calling thread's native-dispatch count (the `Q36_WINDOW_TAPS` probe).
+pub(crate) fn dispatch_count() -> u64 {
+    native::dispatch_count()
+}
+
+/// Zeroes the calling thread's native-dispatch count (the `Q36_WINDOW_TAPS` probe).
+pub(crate) fn reset_dispatch_count() {
+    native::reset_dispatch_count()
+}
+
 /// Process-wide production counters of the compiled block calls of the `mlx_compile` seam. The
 /// trace counts come from the NATIVE seam: the body of a compiled closure runs once per trace —
 /// and on every call when MLX returns the uncompiled function — while a cache hit replays the

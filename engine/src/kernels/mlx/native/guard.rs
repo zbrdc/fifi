@@ -36,6 +36,19 @@ static DISPATCH: Mutex<()> = Mutex::new(());
 thread_local! {
     static MESSAGE: RefCell<([u8; 2048], usize)> = const { RefCell::new(([0; 2048], 0)) };
     static DISPATCH_HELD: Cell<bool> = const { Cell::new(false) };
+    /// The native-call counter of the window taps (`Q36_WINDOW_TAPS`): every `DispatchGuard::enter`
+    /// is one native call, so the delta over a step or a chunk window counts its dispatches.
+    static DISPATCHES: Cell<u64> = const { Cell::new(0) };
+}
+
+/// The thread's native-call count (the window-tap probe).
+pub(crate) fn dispatch_count() -> u64 {
+    DISPATCHES.with(Cell::get)
+}
+
+/// Zeroes the thread's native-call count (the window-tap probe).
+pub(crate) fn reset_dispatch_count() {
+    DISPATCHES.with(|count| count.set(0));
 }
 
 pub(super) fn mark_failed() {
@@ -60,6 +73,7 @@ pub(super) struct DispatchGuard {
 
 impl DispatchGuard {
     pub(super) fn enter() -> Self {
+        DISPATCHES.with(|count| count.set(count.get().saturating_add(1)));
         let lock = if DISPATCH_HELD.with(Cell::get) {
             None
         } else {

@@ -18,7 +18,7 @@
 use super::attn::{KvCache, growth_bytes};
 use super::kv_plan::{KV_STEP, session_bytes};
 use super::ops::{Bytes, dim, short_import, zeros};
-use super::prefix_pages::{Page, allowance_pages};
+use super::prefix_pages::{Page, allowance_bytes, allowance_pages};
 use super::weights::{RMixer, ResidentWeights};
 use crate::{
     EngError,
@@ -511,6 +511,15 @@ impl ResidentState {
             )));
         }
         Ok(pos)
+    }
+
+    /// The bytes one snapshot of this state would charge (the fixed DeltaNet bytes plus the
+    /// bounded page-table allowance of its alias): the admission probe of the checkpoint
+    /// window (`Q36_SPEC_STEP_WINDOW=2`). It makes no charge and no native call.
+    pub(super) fn snapshot_bytes(&self) -> Result<u64, EngError> {
+        Ok(fixed_bytes(&self.layers)?
+            .checked_add(allowance_bytes(self.pos))
+            .ok_or_else(|| EngError::MemoryPlan("snapshot bytes overflow u64".into()))?)
     }
 
     /// Shares the committed state as a snapshot. It makes no native call and copies no array. One
