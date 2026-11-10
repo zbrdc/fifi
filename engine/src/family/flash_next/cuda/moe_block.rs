@@ -357,6 +357,8 @@ pub(in crate::family::flash_next) use device::{SplitMoe, SplitMoeTrunk};
 
 #[cfg(all(feature = "native-cuda", target_os = "linux"))]
 mod device {
+    /// The router's picks per row: each row's expert ids and their weights.
+    type RoutedPicks = Vec<(Vec<i32>, Vec<f32>)>;
     use super::{
         CTRL_BYTES, F32, I32, LOG_ENTRY, REQUEST_BYTES, ScratchLayout, SlotSpans, classify_picks,
         first_poisoned_filler, parse_log, pick_union, plan_second_pass, refuse,
@@ -535,7 +537,7 @@ mod device {
             let streamed = geometry
                 .experts
                 .checked_sub(geometry.slots)
-                .unwrap_or(geometry.experts) as usize;
+                .unwrap_or(geometry.experts);
             let want = budget.min(2 * streamed).max(1);
             let mut ring =
                 crate::family::flash_next::cuda::prefill_ring::device::PrefillRing::build(
@@ -569,7 +571,7 @@ mod device {
             if !ring.active() {
                 return Ok(());
             }
-            let layers = self.bank.geometry().layers as usize;
+            let layers = self.bank.geometry().layers;
             for layer in 0..layers {
                 self.bank.synchronize_store(layer, ring.copy_stream())?;
             }
@@ -784,7 +786,7 @@ mod device {
             layer: usize,
             bufs: &Exl3MoeBufs<'_>,
             dims: &MoeDims,
-        ) -> Result<Vec<(Vec<i32>, Vec<f32>)>, EngError> {
+        ) -> Result<RoutedPicks, EngError> {
             let m = dims.rows;
             let (h, k, e) = (dims.hidden, dims.top_k, dims.n_expert);
             let (ctx, stream) = (launch.ctx, launch.stream);
@@ -1225,8 +1227,7 @@ mod device {
             let mut ids = vec![0i32; m * k];
             let mut weights = vec![0f32; m * k];
             let mut is_ring = vec![false; m * k];
-            for r in 0..m {
-                let (row_ids, row_weights) = &picks[r];
+            for (r, (row_ids, row_weights)) in picks.iter().enumerate() {
                 classify_picks(&slot_row, geometry.slots, row_ids, row_weights)?;
                 for (p, &id) in row_ids.iter().enumerate() {
                     let at = r * k + p;

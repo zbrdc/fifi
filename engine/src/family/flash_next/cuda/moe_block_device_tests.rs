@@ -521,13 +521,6 @@ impl RigRows {
     }
 }
 
-/// `run_rows` over a partial bank with eviction pressure: a chunk of `m` rows of distinct
-/// inputs, whose distinct picks far exceed the bank's slots, so rows evict each other's
-/// chunk-initial hits and every per-row miss pass runs behind earlier rows' bank copies — the
-/// ordering the chunked block must serialize. Every row matches the all-resident block within
-/// the split bound and fp64 within the output bound, and the same chunk again finds no miss.
-#[test]
-#[ignore = "needs a GPU (about 4 GiB), about 2 GiB of pinned host memory per bank and FIFI_FLASH_NEXT_EXL3_PACK"]
 /// `run_rows` with the prefill ring funded: every pick reads its bank slot or its ring slot,
 /// the bank's miss counter stays flat (the ring path never steps or admits the bank), and
 /// every row matches the all-resident block within the split bound and fp64 within the output
@@ -649,7 +642,7 @@ fn a_chunk_over_the_prefill_ring_matches_the_all_resident_block() {
         })
         .collect();
     let mut split = SplitMoe::new(ctx, trunks, bank, &layout, &chunk).expect("split");
-    let streamed = (shape.experts() - SLOTS) as usize;
+    let streamed = shape.experts() - SLOTS;
     let slots = split.plan_ring(ctx, streamed).expect("fund the ring");
     assert!(slots >= streamed, "the ring holds one full streamed layer");
     split.begin_prefill();

@@ -56,6 +56,15 @@ fn f32_values(bytes: &[u8]) -> Vec<f32> {
         .collect()
 }
 
+/// The shape of one uploaded projection set: `key` is `width x embed` values of the stored
+/// dtype, `value` is `hidden x embed`, and `rows_max` caps the per-chunk staging buffers.
+pub(in crate::family) struct PleUpload {
+    pub(in crate::family) width: usize,
+    pub(in crate::family) hidden: usize,
+    pub(in crate::family) embed: usize,
+    pub(in crate::family) rows_max: usize,
+}
+
 /// The PLE projections resident on the device.
 pub(in crate::family) struct DevicePle {
     key_weight: DeviceBuffer,
@@ -80,11 +89,14 @@ impl DevicePle {
         stored: Dtype,
         key: &[u8],
         value: &[u8],
-        width: usize,
-        hidden: usize,
-        embed: usize,
-        rows_max: usize,
+        shape: PleUpload,
     ) -> Result<Self, EngError> {
+        let PleUpload {
+            width,
+            hidden,
+            embed,
+            rows_max,
+        } = shape;
         let dtype = match stored {
             Dtype::F16 => DenseDtype::F16,
             Dtype::Bf16 => DenseDtype::Bf16,

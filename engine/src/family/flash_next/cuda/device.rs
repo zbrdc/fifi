@@ -220,7 +220,7 @@ impl super::driver::chunk::ChunkDevice for CardChunkDevice {
             return Ok(());
         };
         let m = self.m;
-        ple.enqueue_chunk(&self.step.ctx, &self.step.stream, rows, m)
+        ple.enqueue_chunk(self.step.ctx, self.step.stream, rows, m)
     }
 
     fn ple_project_chunk(&mut self) -> Result<Vec<PleKeyValue>, EngError> {
@@ -232,7 +232,7 @@ impl super::driver::chunk::ChunkDevice for CardChunkDevice {
                     .to_string(),
             });
         };
-        ple.collect_chunk(&self.step.stream, m)
+        ple.collect_chunk(self.step.stream, m)
     }
 
     fn begin_chunk(&mut self) -> Result<(), EngError> {

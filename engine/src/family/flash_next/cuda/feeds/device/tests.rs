@@ -9,7 +9,7 @@
 //! - The start sink writes the `StepParams` block, the stream and the PLE embedding to their
 //!   offsets and nothing around them; a negative token or position is refused with nothing written.
 
-use super::{DevicePle, DevicePleRoute, DeviceStart, f32_bytes, f32_values};
+use super::{DevicePle, DevicePleRoute, DeviceStart, PleUpload, f32_bytes, f32_values};
 use crate::{
     EngError,
     family::flash_next::cuda::{
@@ -93,10 +93,12 @@ fn projections_match_f64(dtype: Dtype, gate: &str) {
         dtype,
         &half_bytes(&key),
         &half_bytes(&value),
-        WIDTH,
-        HIDDEN,
-        EMBED,
-        2,
+        PleUpload {
+            width: WIDTH,
+            hidden: HIDDEN,
+            embed: EMBED,
+            rows_max: 2,
+        },
     )
     .unwrap();
     assert_eq!(
@@ -145,9 +147,34 @@ fn the_projections_refuse_a_wrong_size_before_any_launch() {
     }
     let context = CudaContext::new().expect("context");
     let stream = context.stream().expect("stream");
-    assert!(DevicePle::upload(&context, Dtype::F16, &[0; 6], &[0; 8], 2, 2, 2, 2).is_err());
+    assert!(
+        DevicePle::upload(
+            &context,
+            Dtype::F16,
+            &[0; 6],
+            &[0; 8],
+            PleUpload {
+                width: 2,
+                hidden: 2,
+                embed: 2,
+                rows_max: 2,
+            },
+        )
+        .is_err()
+    );
     for other in [Dtype::F32, Dtype::I32] {
-        match DevicePle::upload(&context, other, &[0; 16], &[0; 16], 2, 2, 2, 2) {
+        match DevicePle::upload(
+            &context,
+            other,
+            &[0; 16],
+            &[0; 16],
+            PleUpload {
+                width: 2,
+                hidden: 2,
+                embed: 2,
+                rows_max: 2,
+            },
+        ) {
             Err(EngError::Checkpoint(message)) => {
                 assert!(message.contains("F16 or BF16"), "{message}")
             }
@@ -155,7 +182,19 @@ fn the_projections_refuse_a_wrong_size_before_any_launch() {
             Ok(_) => panic!("{other:?} was accepted"),
         }
     }
-    let mut ple = DevicePle::upload(&context, Dtype::F16, &[0; 8], &[0; 8], 2, 2, 2, 2).unwrap();
+    let mut ple = DevicePle::upload(
+        &context,
+        Dtype::F16,
+        &[0; 8],
+        &[0; 8],
+        PleUpload {
+            width: 2,
+            hidden: 2,
+            embed: 2,
+            rows_max: 2,
+        },
+    )
+    .unwrap();
     assert!(matches!(
         ple.enqueue(&context, &stream, &[0.0; 3]),
         Err(EngError::BadRequest(_))
@@ -263,10 +302,12 @@ fn the_route_agrees_with_the_host_projection_of_the_same_stored_values() {
             Dtype::F16,
             &half_bytes(&key),
             &half_bytes(&value),
-            WIDTH,
-            HIDDEN,
-            EMBED,
-            2,
+            PleUpload {
+                width: WIDTH,
+                hidden: HIDDEN,
+                embed: EMBED,
+                rows_max: 2,
+            },
         )
         .unwrap(),
         context,

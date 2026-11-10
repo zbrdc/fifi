@@ -563,10 +563,10 @@ impl<'w> Exl3SlotResolver<'w> {
     /// Drains the overlap copy stream (see [`LayerResolver::fence_copy_stream`]); a no-op
     /// without the pair armed.
     pub(crate) fn fence_copy_stream(&mut self) {
-        if let Some((copy, _)) = &self.overlap {
-            if let Err(error) = copy.synchronize() {
-                eprintln!("q36 cuda: overlap fence failed: {error:?}");
-            }
+        if let Some((copy, _)) = &self.overlap
+            && let Err(error) = copy.synchronize()
+        {
+            eprintln!("q36 cuda: overlap fence failed: {error:?}");
         }
     }
 
@@ -598,6 +598,10 @@ pub(crate) struct LayerResolver<'r, 'w> {
     resolver: &'r mut Exl3SlotResolver<'w>,
     layer: usize,
 }
+
+/// The slot for every pick, the picks gated on a refill of their slot, and the refill's event
+/// when one fired (absent when nothing refilled).
+type ResolveOutcome<'a> = Result<(Vec<usize>, Vec<usize>, Option<&'a DeviceEvent>), EngError>;
 
 impl LayerResolver<'_, '_> {
     /// Whether this resolver's calls refill on the copy stream (the arming of the resolver
@@ -642,7 +646,7 @@ impl LayerResolver<'_, '_> {
         stream: &DeviceStream,
         picks: &[usize],
         overlap: bool,
-    ) -> Result<(Vec<usize>, Vec<usize>, Option<&DeviceEvent>), EngError> {
+    ) -> ResolveOutcome<'_> {
         let (slots, refilled, event) = self.resolve_mapped(stream, picks, overlap)?;
         // A pick gates on the event when its SLOT refilled this call, not when the pick
         // itself reported the miss: a duplicate pick of a just-refilled expert reads the
@@ -661,7 +665,7 @@ impl LayerResolver<'_, '_> {
         stream: &DeviceStream,
         picks: &[usize],
         split: bool,
-    ) -> Result<(Vec<usize>, Vec<usize>, Option<&DeviceEvent>), EngError> {
+    ) -> ResolveOutcome<'_> {
         #[cfg(test)]
         let began = std::time::Instant::now();
         let (table, parts) = &mut self.resolver.layers[self.layer];

@@ -284,7 +284,7 @@ fn run_block_rounded(
         buffers: vec![
             upload(projector, &resid),
             zeros(projector, h),
-            upload(projector, &row),
+            upload(projector, row),
             zeros(projector, logits),
             zeros(projector, moe.top_k * 4),
             zeros(projector, moe.top_k * F32),
@@ -409,21 +409,14 @@ fn banked_block_parity(overlap: bool) {
         }
         let rows = rounded_rows(&checkpoint, layer, moe.hidden, moe.top_k);
         let (mut saw_miss, mut saw_mixed) = (false, false);
-        for round in 0..rows.len() {
-            let want = run_block_rounded(&projector, &block, &moe, false, &rows[round], None)
+        for (round, row) in rows.iter().enumerate() {
+            let want = run_block_rounded(&projector, &block, &moe, false, row, None)
                 .expect("the resident block");
             let before = resolver.stats();
             let got = {
                 let mut bank = resolver.layer(0);
-                run_block_rounded(
-                    &projector,
-                    &banked_block,
-                    &moe,
-                    false,
-                    &rows[round],
-                    Some(&mut bank),
-                )
-                .expect("the banked block")
+                run_block_rounded(&projector, &banked_block, &moe, false, row, Some(&mut bank))
+                    .expect("the banked block")
             };
             assert_eq!(got.ids, want.ids, "layer {layer} round {round}: the picks");
             assert_eq!(

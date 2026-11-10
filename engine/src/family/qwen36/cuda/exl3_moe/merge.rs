@@ -430,7 +430,7 @@ pub(in crate::family) fn run_exl3_moe_merged(
             .map(|(event, missed)| (*event, missed.as_slice()));
         if let Err(error) = merged_on_host(launch, (weights, bufs, &r), (&plan, &picks), gate, dims)
         {
-            if let Some(bank) = bank.as_deref_mut() {
+            if let Some(bank) = bank {
                 // The block queues no wait on its way out with an error; its refills keep
                 // writing with no fence (LayerResolver::fence_copy_stream).
                 bank.fence_copy_stream();

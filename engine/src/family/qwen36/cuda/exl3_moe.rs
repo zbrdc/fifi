@@ -309,7 +309,7 @@ fn grouped(launch: &Launch<'_>, pairs: &[Pair<'_>], scratch: &Scratch<'_>) -> Re
 /// [`grouped`] as one launch over the whole set: the C side of the grouped kernels takes
 /// scattered out rows (each group's extent is validated per call), so a resident/refilling
 /// split - or a hit pick inside a miss run - no longer needs one launch per contiguous slice.
-pub(super) fn grouped_runs(
+fn grouped_runs(
     launch: &Launch<'_>,
     pairs: &[Pair<'_>],
     scratch: &Scratch<'_>,
@@ -733,7 +733,7 @@ pub(in crate::family) fn run_exl3_moe(
             .as_ref()
             .map(|(event, missed)| (*event, missed.as_slice()));
         if let Err(error) = routed(launch, weights, bufs, (&picks, dims), gate) {
-            if let Some(bank) = bank.as_deref_mut() {
+            if let Some(bank) = bank {
                 // The block queues no wait on its way out with an error; its refills keep
                 // writing with no fence (LayerResolver::fence_copy_stream).
                 bank.fence_copy_stream();

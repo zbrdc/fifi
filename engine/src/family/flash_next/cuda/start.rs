@@ -40,7 +40,7 @@ use super::{
     driver::{DriverShape, StepperPositions, TokenDriver, TokenTimes},
     executor::{CudaRules, FlashCudaExecutor},
     feeds::StartShape,
-    feeds::device::DevicePle,
+    feeds::device::{DevicePle, PleUpload},
     load::{TrunkList, upload::trunk_weights},
     moe_block::{SplitMoe, SplitMoeTrunk},
     pack_feeds::PackFeeds,
@@ -691,14 +691,16 @@ pub(super) fn build_driver(
             let (dtype, key, value) =
                 PleVectors::raw_projections(&checkpoint.source, model.ple_layer, &model.ple)?;
             Some(DevicePle::upload(
-                &ctx,
+                ctx,
                 dtype,
                 &key,
                 &value,
-                (dims.hidden * dims.branches) as usize,
-                dims.hidden as usize,
-                model.ple.embed(),
-                rows,
+                PleUpload {
+                    width: (dims.hidden * dims.branches) as usize,
+                    hidden: dims.hidden as usize,
+                    embed: model.ple.embed(),
+                    rows_max: rows,
+                },
             )?)
         }
         Some(false) => {

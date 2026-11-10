@@ -99,7 +99,7 @@ pub(super) mod device {
                     "the prefill ring needs at least one slot".into(),
                 ));
             }
-            let layers = geometry.layers as usize;
+            let layers = geometry.layers;
             Ok(Self {
                 slots: ctx.allocate(ring * geometry.record_bytes)?,
                 copy: ctx.stream()?,
@@ -127,8 +127,8 @@ pub(super) mod device {
         /// flight keeps `live`, and the next issue waits its `used` event as usual.
         pub(in crate::family::flash_next) fn replan(&mut self, bank: &DeviceBank) {
             let geometry: BankGeometry = *bank.geometry();
-            let layers = geometry.layers as usize;
-            let experts = geometry.experts as usize;
+            let layers = geometry.layers;
+            let experts = geometry.experts;
             let slot_rows: Vec<&[i32]> = (0..layers)
                 .map(|l| bank.slot_row(l))
                 .collect::<Result<Vec<_>, _>>()
