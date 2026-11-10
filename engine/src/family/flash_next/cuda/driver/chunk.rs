@@ -98,6 +98,7 @@ pub(in crate::family::flash_next) mod prof {
         let spent: Vec<u64> = NS.iter().map(|n| n.load(AtomicOrdering::Relaxed)).collect();
         let sum: u64 = spent.iter().sum();
         if sum == 0 {
+            ROWS.store(0, AtomicOrdering::Relaxed);
             return;
         }
         for (name, ns) in NAMES.iter().zip(&spent) {
@@ -405,8 +406,12 @@ impl<D: ChunkDevice, F: TokenFeeds> TokenStepper for ChunkDriver<D, F> {
                 message: "the logits step returned no logits".to_string(),
             })?;
         // The sampling row closed the prefill: the ring's window ends with it, and every
-        // later single-token step takes the decode path.
-        self.device.end_prefill()?;
+        // later single-token step takes the decode path. A failure here leaves the prefill
+        // window open on an advanced position: poison, so a reset is required.
+        if let Err(error) = self.device.end_prefill() {
+            self.poisoned = true;
+            return Err(error);
+        }
         if prof::on() {
             prof::dump_and_reset(prof::ROWS.load(AtomicOrdering::Relaxed));
         }

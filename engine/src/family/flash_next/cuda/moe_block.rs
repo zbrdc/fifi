@@ -934,7 +934,7 @@ mod device {
             }
             tick(12);
 
-            // One classify per row against the slot row as the chunk found it: a pick another
+            // One classify per row against the slot row after the admit above: a pick another
             // row of the chunk missed still rides this row's own second pass.
             let slot_row: Vec<i32> = self.bank.slot_row(layer)?.to_vec();
 
@@ -1332,7 +1332,7 @@ mod device {
                     (h, dims.shared_inter, m),
                 )?;
             } else {
-                // The K-row kernel takes 2 to 8 rows; the sampling row runs the one-row
+                // The K-row kernel takes 2 to 32 rows; the sampling row runs the one-row
                 // variant over its single-row buffers.
                 shared_of(launch, &shared_weights, bufs, dims)?;
             }

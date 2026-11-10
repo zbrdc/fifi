@@ -46,7 +46,7 @@ pub(crate) struct FlashOptions {
     /// CUDA only: routed-expert slots per layer in video memory, from 11 to 512. Default: what the
     /// load plan leaves at the context.
     pub(crate) slots: Option<u32>,
-    /// CUDA only: rows of one device step during prefill, from 1 to 2048. The default, 1, is the
+    /// CUDA only: rows of one device step during prefill, from 1 to 32. The default, 1, is the
     /// decode shape: one row per device call, exactly as before. A value above one runs the
     /// prompt as device chunks of that many rows (one PLE host roundtrip per chunk), with decode
     /// unchanged at one row.

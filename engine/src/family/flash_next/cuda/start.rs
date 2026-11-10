@@ -91,9 +91,16 @@ fn ple_threads() -> usize {
 /// Whether the chunked prefill runs its two PLE projections on the card (the staged
 /// `dense_gemv` pair): `INFERENCE_FLASH_NEXT_PLE_DEVICE=1` opts in, the default keeps the host
 /// matvecs. The card reads the stored F16/BF16 weights once per chunk instead of the host's
-/// 131 MB DRAM sweep per token; the rest of the PLE block stays on the host.
-fn ple_device() -> bool {
-    std::env::var("INFERENCE_FLASH_NEXT_PLE_DEVICE").is_ok_and(|text| text == "1")
+/// 131 MB DRAM sweep per token; the rest of the PLE block stays on the host. Strict: any set
+/// value other than `1` is refused.
+fn ple_device() -> Result<bool, EngError> {
+    match std::env::var("INFERENCE_FLASH_NEXT_PLE_DEVICE") {
+        Ok(text) if text == "1" => Ok(true),
+        Ok(_) => Err(EngError::BadRequest(
+            "INFERENCE_FLASH_NEXT_PLE_DEVICE must be unset or \"1\"".into(),
+        )),
+        Err(_) => Ok(false),
+    }
 }
 
 /// The id-indexed options Flash-Next serves its routed experts with: the DP4A decode of codebook 2
@@ -463,8 +470,11 @@ pub(super) fn build_driver(
     // INFERENCE_FLASH_NEXT_RING_BUDGET sets the ring's bytes. The ring measures a serve
     // regression today (it re-issues its copies every chunk while the union-admit path
     // copies once), so the default is off; the flag keeps the lane's experiments open.
+    // A budget above the free VRAM is clamped, not wrapped: the plan then fits the card.
     let ring_budget = match std::env::var("INFERENCE_FLASH_NEXT_RING_BUDGET") {
-        Ok(bytes) => bytes.trim().parse::<u64>().unwrap_or(0),
+        Ok(bytes) => bytes.trim().parse::<u64>().map_err(|_| {
+            EngError::BadRequest("INFERENCE_FLASH_NEXT_RING_BUDGET must be a byte count".into())
+        })?,
         Err(_) => 0,
     };
     // `FlashLoadPlan::new` replaces the trunk and state bytes (the `(0, 0)`) and the K/V (the
@@ -476,7 +486,7 @@ pub(super) fn build_driver(
             positions: 1,
             bytes_per_position: 1,
         },
-        free_vram - ring_budget,
+        free_vram.saturating_sub(ring_budget),
         (mem_total, mem_available),
     );
     let load_plan = FlashLoadPlan::new(&report, &checkpoint.model_config, ngram_bytes, card)?;
@@ -684,7 +694,7 @@ pub(super) fn build_driver(
     let ngram_rows = NgramRows::new(ngram)?;
     // The device route (chunked prefill only): the projections upload to the card and the feed
     // takes precomputed pairs; the host projection still backs the flag-off path.
-    let device_ple = match ple_device().then_some(rows > 1) {
+    let device_ple = match ple_device()?.then_some(rows > 1) {
         Some(true) => {
             stage("uploading the PLE projections");
             let dims = model.ple.dims();
@@ -827,6 +837,15 @@ impl StepDriver {
         match self {
             Self::Token(driver) => driver.device().bank_misses(),
             Self::Chunk(driver) => driver.device().bank_misses(),
+        }
+    }
+
+    /// The single-row kernel counters, for the device tests.
+    #[cfg(test)]
+    pub(super) fn kernel_launches(&self) -> crate::kernels::single_row::SingleRowLaunches {
+        match self {
+            Self::Token(driver) => driver.device().kernel_launches(),
+            Self::Chunk(driver) => driver.device().kernel_launches(),
         }
     }
 
