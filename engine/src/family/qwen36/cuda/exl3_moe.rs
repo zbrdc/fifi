@@ -48,6 +48,10 @@ use crate::{
 };
 
 const F32: usize = size_of::<f32>();
+
+/// The most rows one down-projection group of the rows kernel takes (`grouped_max_rows`,
+/// exl3.cu `grouped_project_rows`); a wider window splits at this width.
+const GROUPED_MAX_ROWS: usize = 8;
 const I32: usize = size_of::<i32>();
 
 pub(in crate::family) struct Exl3MoeWeights<'w> {
@@ -183,6 +187,18 @@ fn row<'b>(
     index: usize,
 ) -> Result<DeviceRange<'b>, EngError> {
     range.buffer().range(range.offset() + index * width, width)
+}
+
+/// The `width` rows of `range` starting at row `r0` of `row_bytes` each.
+fn span<'b>(
+    range: &DeviceRange<'b>,
+    row_bytes: usize,
+    r0: usize,
+    width: usize,
+) -> Result<DeviceRange<'b>, EngError> {
+    range
+        .buffer()
+        .range(range.offset() + r0 * row_bytes, width * row_bytes)
 }
 
 /// The first `bytes` bytes of `range`.
@@ -581,9 +597,9 @@ pub(in crate::family) fn shared_rows(
     io: &SharedRowsIo<'_>,
     (hidden, shared_inter, rows): (usize, usize, usize),
 ) -> Result<(), EngError> {
-    if !(2..=8).contains(&rows) {
+    if !(2..=16).contains(&rows) {
         return Err(refuse(format!(
-            "the K-row shared expert takes 2 to 8 rows, got {rows}"
+            "the K-row shared expert takes 2 to 16 rows, got {rows}"
         )));
     }
     let s = shared_inter;
@@ -599,21 +615,28 @@ pub(in crate::family) fn shared_rows(
     }
     grouped(launch, &group, &io.scratch)?;
     swiglu(launch, io.gu, io.act, (rows, s))?;
-    // One group of `rows` rows: the rotated input and the partials of all rows are contiguous.
+    // The down projection's rows kernel takes one group of at most `GROUPED_MAX_ROWS` rows
+    // (`grouped_project_rows`, exl3.cu). Gate and up above are one-row groups, so only the
+    // down splits: `ceil(rows / 8)` row-disjoint groups, each exactly the computation the
+    // one-group launch ran for those rows. A window of at most 8 rows keeps the single call.
     let view = weights.down.view()?;
     let [k, n] = view.shape;
-    let down = Exl3Io {
-        x: io.act,
-        xh: leading(&io.scratch.xh, rows * k * F32)?,
-        z: leading(&io.scratch.z, rows * n * F32)?,
-        out: io.out,
-        flag: io.scratch.flag,
-        rows,
-        fused: false,
-    };
-    launch
-        .ctx
-        .exl3_grouped_step(launch.stream, &[view.linear_call(&down)])
+    for r0 in (0..rows).step_by(GROUPED_MAX_ROWS) {
+        let width = (rows - r0).min(GROUPED_MAX_ROWS);
+        let down = Exl3Io {
+            x: span(&io.act, s * F32, r0, width)?,
+            xh: span(&io.scratch.xh, k * F32, r0, width)?,
+            z: span(&io.scratch.z, n * F32, r0, width)?,
+            out: span(&io.out, n * F32, r0, width)?,
+            flag: io.scratch.flag,
+            rows: width,
+            fused: false,
+        };
+        launch
+            .ctx
+            .exl3_grouped_step(launch.stream, &[view.linear_call(&down)])?;
+    }
+    Ok(())
 }
 
 /// `resid_out = resid_in + (picks in pick order + gate * shared)`, as the GGUF block combines.
