@@ -1,0 +1,376 @@
+{
+  "description": "Synthetic physical-peer parity at the maximum P2P chunk size. Device correctness evidence, not throughput or long-context qualification.",
+  "tested_source_commit": "7142c14bf321238e9d5850a7afa640f7e26a6fb8",
+  "tested_source_url": "https://github.com/BColsey/fifi/commit/7142c14bf321238e9d5850a7afa640f7e26a6fb8",
+  "parent_integration_commit": "76dec8a61d040efa97beefe273bed8dc9e68ff57",
+  "binary_sha256": "99378859c009c91a3df8d9085e5019e60c13fdb1dc572b944f4ef40d11a1ade0",
+  "build_log_sha256": "20ee36a5fbbbfe1a22d98ed0e4781e826814359036648096f257ea0a5b32dc6f",
+  "target": "native-cuda linux sm86 release",
+  "host_checks": [
+    {
+      "name": "family::qwen36::cuda::card_prefill::config_tests::chunk_setting_is_explicit_and_bounded",
+      "exit": 0,
+      "pass": true,
+      "sha256": "f3b9d8357827eb994466985f8e934310a49521500708b5e90331be6ffa933061"
+    },
+    {
+      "name": "family::qwen36::cuda::card_prefill::config_tests::mailbox_covers_both_chunk_sums_and_eager_decode",
+      "exit": 0,
+      "pass": true,
+      "sha256": "10877f8bad25a06a94800bd74f2d571203b9eca082054da37d6ad09dcef372de"
+    },
+    {
+      "name": "family::qwen36::cuda::card_prefill::config_tests::chunk_admission_preserves_the_free_vram_floor",
+      "exit": 0,
+      "pass": true,
+      "sha256": "62bbf135e33e8ebbce6cb65267b472075cedaca43d54e314de4dc406d8612c03"
+    },
+    {
+      "name": "family::qwen36::cuda::card_prefill::config_tests::card_staging_respects_shard_geometry_and_live_floor",
+      "exit": 0,
+      "pass": true,
+      "sha256": "63269b29b1c2f43f3b2ef78a30a7bb6112a1d8643bae128b1b4db7f00ad033c0"
+    },
+    {
+      "name": "family::qwen36::cuda::prefill_plan::card_tests::card_chunk_arenas_are_narrower_and_complete",
+      "exit": 0,
+      "pass": true,
+      "sha256": "d397b40b6f131e866b7e9df780fd8e88781d0896ed37f3b230e26753d3c10595"
+    },
+    {
+      "name": "family::qwen36::cuda::prefill_plan::card_tests::card_combine_output_is_disjoint_from_its_inputs",
+      "exit": 0,
+      "pass": true,
+      "sha256": "f1bf4bb625f894eff52147f9b4599d8a3e01e885fec6aa1a07c9f417fb1d7b93"
+    },
+    {
+      "name": "family::qwen36::cuda::prefill_tests::zero_row_is_optional_only_for_native_card_views",
+      "exit": 0,
+      "pass": true,
+      "sha256": "b1eb66a18122b24b489edeea058523d09ec9e9b6c6e45fb6a984bbc5c2ddfd73"
+    },
+    {
+      "name": "family::qwen36::settings::tests::the_pin_holds_the_digest_of_each_tokenizer_file",
+      "exit": 0,
+      "pass": true,
+      "sha256": "95fdbd50df5a7899a622cb4920aa2e6f7c541e06674b374f0699af0705dfb838"
+    },
+    {
+      "name": "family::qwen36::settings::tests::tokenizer_pin_selection_keeps_dense_and_moe_bundles_separate",
+      "exit": 0,
+      "pass": true,
+      "sha256": "6f6b3604cef568fe2d5ee4d61ee9921e51245b1e8426da3429bd0f69299fc13c"
+    }
+  ],
+  "peer_uuids": [
+    "GPU-704fef60-5280-9b88-fa3d-d11135caf576",
+    "GPU-282e266a-24ac-6fa8-a16d-4281e52b4c0a"
+  ],
+  "fixture": {
+    "layers": 2,
+    "hidden_width": 2048,
+    "row_limit": 512,
+    "context_capacity": 2048,
+    "kv_dtype": "q8",
+    "staging_rows_per_card": 2048,
+    "staging_bytes_per_card": 2097152,
+    "comparison": "Final greedy winner and top-two margin against the per-token path for one 512-row chunk and a two-chunk-plus-tail sequence; it does not compare every logit."
+  },
+  "tools": {
+    "source_url": "https://github.com/BColsey/fifi/tree/3020284f246de344b3df26dfc945b581ad33cbca/scripts/benchmarks/qwen36-p2p-chunk512-proof",
+    "cpu_runner_tests_passed": 33,
+    "smoke_artifacts_digest_sha256": "7137760699edc5d3d95750f1a99bd798ce3f0da2ccea63b22d68aefff0389638"
+  },
+  "smoke": {
+    "test": "family::qwen36::cuda::card_chunk_device_tests::card_chunk_matches_the_per_token_path_on_physical_peers",
+    "log": "\nrunning 1 test\ntest family::qwen36::cuda::card_chunk_device_tests::card_chunk_matches_the_per_token_path_on_physical_peers ... CUDA devices visible: 2\nq36 cuda: card 0 KV8 staging: 256 rows, 262144 bytes\nq36 cuda: card 1 KV8 staging: 256 rows, 262144 bytes\ngdn_delta qualification partitioned=false\ncard_chunk_matches_the_per_token_path: 8 rows, winner 3256, chunk margin 37.4643/34.8862\nok\n\ntest result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 5922 filtered out; finished in 10.70s\n\n",
+    "log_sha256": "7444a68dee2125d397c858a191e2d3c53855ab9e15d4eed35658b2362051aee3",
+    "guard_samples": [
+      {
+        "time": 1794308234.111942,
+        "other_jobs": [],
+        "builders": [],
+        "unexpected": [],
+        "non_target_utilization": {
+          "GPU-699004f8-e2f0-747e-5c02-30141e9d4b7c": 0
+        },
+        "states_ok": true,
+        "clients": false,
+        "listeners": false
+      },
+      {
+        "time": 1794308235.3398952,
+        "other_jobs": [],
+        "builders": [],
+        "unexpected": [],
+        "non_target_utilization": {
+          "GPU-699004f8-e2f0-747e-5c02-30141e9d4b7c": 0
+        },
+        "states_ok": true,
+        "clients": false,
+        "listeners": false
+      },
+      {
+        "time": 1794308236.577143,
+        "other_jobs": [],
+        "builders": [],
+        "unexpected": [],
+        "non_target_utilization": {
+          "GPU-699004f8-e2f0-747e-5c02-30141e9d4b7c": 0
+        },
+        "states_ok": true,
+        "clients": false,
+        "listeners": false
+      },
+      {
+        "time": 1794308237.8065934,
+        "other_jobs": [],
+        "builders": [],
+        "unexpected": [],
+        "non_target_utilization": {
+          "GPU-699004f8-e2f0-747e-5c02-30141e9d4b7c": 0
+        },
+        "states_ok": true,
+        "clients": false,
+        "listeners": false
+      },
+      {
+        "time": 1794308239.0413215,
+        "other_jobs": [],
+        "builders": [],
+        "unexpected": [],
+        "non_target_utilization": {
+          "GPU-699004f8-e2f0-747e-5c02-30141e9d4b7c": 0
+        },
+        "states_ok": true,
+        "clients": false,
+        "listeners": false
+      },
+      {
+        "time": 1794308240.282426,
+        "other_jobs": [],
+        "builders": [],
+        "unexpected": [],
+        "non_target_utilization": {
+          "GPU-699004f8-e2f0-747e-5c02-30141e9d4b7c": 0
+        },
+        "states_ok": true,
+        "clients": false,
+        "listeners": false
+      },
+      {
+        "time": 1794308241.5175693,
+        "other_jobs": [],
+        "builders": [],
+        "unexpected": [],
+        "non_target_utilization": {
+          "GPU-699004f8-e2f0-747e-5c02-30141e9d4b7c": 0
+        },
+        "states_ok": true,
+        "clients": false,
+        "listeners": false
+      },
+      {
+        "time": 1794308242.7501814,
+        "other_jobs": [],
+        "builders": [],
+        "unexpected": [],
+        "non_target_utilization": {
+          "GPU-699004f8-e2f0-747e-5c02-30141e9d4b7c": 0
+        },
+        "states_ok": true,
+        "clients": false,
+        "listeners": false
+      },
+      {
+        "time": 1794308243.9813848,
+        "other_jobs": [],
+        "builders": [],
+        "unexpected": [],
+        "non_target_utilization": {
+          "GPU-699004f8-e2f0-747e-5c02-30141e9d4b7c": 0
+        },
+        "states_ok": true,
+        "clients": false,
+        "listeners": false
+      },
+      {
+        "time": 1794308245.1999915,
+        "other_jobs": [],
+        "builders": [],
+        "unexpected": [],
+        "non_target_utilization": {
+          "GPU-699004f8-e2f0-747e-5c02-30141e9d4b7c": 0
+        },
+        "states_ok": true,
+        "clients": false,
+        "listeners": false
+      }
+    ],
+    "summary_sha256": "658814563da43b27ef4c501208158341e17d8e7bbdb3515e87b6b84a3c528d6c",
+    "restore": {
+      "restored": true,
+      "reason": "original pair service ready"
+    },
+    "complete": {
+      "restored": true,
+      "summary": "summary.json",
+      "result_type": "p2p_correctness_tests"
+    }
+  },
+  "max_chunk": {
+    "test": "family::qwen36::cuda::card_chunk_device_tests::max_card_chunk_matches_the_per_token_path_on_physical_peers",
+    "log": "\nrunning 1 test\ntest family::qwen36::cuda::card_chunk_device_tests::max_card_chunk_matches_the_per_token_path_on_physical_peers ... CUDA devices visible: 2\nq36 cuda: card 0 KV8 staging: 2048 rows, 2097152 bytes\nq36 cuda: card 1 KV8 staging: 2048 rows, 2097152 bytes\ngdn_delta qualification partitioned=false\ncard_chunk_matches_the_per_token_path: 512 rows, winner 3256, chunk margin 37.4657/34.8859\nok\n\ntest result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 5922 filtered out; finished in 12.04s\n\n",
+    "log_sha256": "2abbd3774926573fe4cd9c7961dc097831470089b59f8370cd4eca3ee3e21f0c",
+    "guard_samples": [
+      {
+        "time": 1794308463.3414364,
+        "other_jobs": [],
+        "builders": [],
+        "unexpected": [],
+        "non_target_utilization": {
+          "GPU-699004f8-e2f0-747e-5c02-30141e9d4b7c": 0
+        },
+        "states_ok": true,
+        "clients": false,
+        "listeners": false
+      },
+      {
+        "time": 1794308464.569316,
+        "other_jobs": [],
+        "builders": [],
+        "unexpected": [],
+        "non_target_utilization": {
+          "GPU-699004f8-e2f0-747e-5c02-30141e9d4b7c": 0
+        },
+        "states_ok": true,
+        "clients": false,
+        "listeners": false
+      },
+      {
+        "time": 1794308465.800411,
+        "other_jobs": [],
+        "builders": [],
+        "unexpected": [],
+        "non_target_utilization": {
+          "GPU-699004f8-e2f0-747e-5c02-30141e9d4b7c": 0
+        },
+        "states_ok": true,
+        "clients": false,
+        "listeners": false
+      },
+      {
+        "time": 1794308467.0260317,
+        "other_jobs": [],
+        "builders": [],
+        "unexpected": [],
+        "non_target_utilization": {
+          "GPU-699004f8-e2f0-747e-5c02-30141e9d4b7c": 0
+        },
+        "states_ok": true,
+        "clients": false,
+        "listeners": false
+      },
+      {
+        "time": 1794308468.2517414,
+        "other_jobs": [],
+        "builders": [],
+        "unexpected": [],
+        "non_target_utilization": {
+          "GPU-699004f8-e2f0-747e-5c02-30141e9d4b7c": 0
+        },
+        "states_ok": true,
+        "clients": false,
+        "listeners": false
+      },
+      {
+        "time": 1794308469.4931297,
+        "other_jobs": [],
+        "builders": [],
+        "unexpected": [],
+        "non_target_utilization": {
+          "GPU-699004f8-e2f0-747e-5c02-30141e9d4b7c": 0
+        },
+        "states_ok": true,
+        "clients": false,
+        "listeners": false
+      },
+      {
+        "time": 1794308470.7261584,
+        "other_jobs": [],
+        "builders": [],
+        "unexpected": [],
+        "non_target_utilization": {
+          "GPU-699004f8-e2f0-747e-5c02-30141e9d4b7c": 0
+        },
+        "states_ok": true,
+        "clients": false,
+        "listeners": false
+      },
+      {
+        "time": 1794308471.960151,
+        "other_jobs": [],
+        "builders": [],
+        "unexpected": [],
+        "non_target_utilization": {
+          "GPU-699004f8-e2f0-747e-5c02-30141e9d4b7c": 0
+        },
+        "states_ok": true,
+        "clients": false,
+        "listeners": false
+      },
+      {
+        "time": 1794308473.1897218,
+        "other_jobs": [],
+        "builders": [],
+        "unexpected": [],
+        "non_target_utilization": {
+          "GPU-699004f8-e2f0-747e-5c02-30141e9d4b7c": 0
+        },
+        "states_ok": true,
+        "clients": false,
+        "listeners": false
+      },
+      {
+        "time": 1794308474.425021,
+        "other_jobs": [],
+        "builders": [],
+        "unexpected": [],
+        "non_target_utilization": {
+          "GPU-699004f8-e2f0-747e-5c02-30141e9d4b7c": 0
+        },
+        "states_ok": true,
+        "clients": false,
+        "listeners": false
+      },
+      {
+        "time": 1794308475.748529,
+        "other_jobs": [],
+        "builders": [],
+        "unexpected": [],
+        "non_target_utilization": {
+          "GPU-699004f8-e2f0-747e-5c02-30141e9d4b7c": 0
+        },
+        "states_ok": true,
+        "clients": false,
+        "listeners": false
+      }
+    ],
+    "summary_sha256": "efaf307fa014c88f849b388922542b5839ce4317f0947b5706841531cb4112eb",
+    "restore": {
+      "restored": true,
+      "reason": "original pair service ready"
+    },
+    "complete": {
+      "restored": true,
+      "summary": "summary.json",
+      "result_type": "p2p_diagnostic_matrix"
+    }
+  },
+  "limits": [
+    "The fixture uses two synthetic model layers and a 2048-token KV capacity, not the full served model.",
+    "Only final greedy winner and top-two logits were compared; this does not establish full-logit equivalence.",
+    "The test does not measure performance, 128k/256k prompts, retrieval, or coding quality.",
+    "The confirmed router-poll exception cannot prove absence of every hidden user request; the guard sampled ownership and activity."
+  ]
+}

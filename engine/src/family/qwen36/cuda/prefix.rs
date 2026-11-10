@@ -36,6 +36,9 @@ pub(super) struct PendingPrefix {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum CudaPrefillPath {
     Steps(KvMode),
+    /// Diagnostic identity only. The production chunk path still disables reuse.
+    #[cfg(test)]
+    ChunkedForTest(KvMode, usize),
 }
 
 fn overflow() -> EngError {
