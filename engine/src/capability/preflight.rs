@@ -1312,23 +1312,31 @@ fn largest_resident_context(
 /// that inject the backend.
 #[cfg(all(feature = "native-cuda", target_os = "linux"))]
 fn pinned_gguf_check(model_dir: &Path, _inspection: &ModelInspection) -> Check {
+    use crate::family::qwen36::cuda::start::ALLOW_UNPINNED_VAR;
+    gguf_admission_check(model_dir, std::env::var(ALLOW_UNPINNED_VAR).ok().as_deref())
+}
+
+/// The pure core of [`pinned_gguf_check`]: the raw switch value arrives resolved by the
+/// caller, so the branches (a bad spelling, a refused selection, the pinned and the admitted
+/// checkpoint) test without touching process-global state.
+#[cfg(all(feature = "native-cuda", target_os = "linux"))]
+fn gguf_admission_check(model_dir: &Path, raw: Option<&str>) -> Check {
     use crate::family::qwen36::cuda::start::{
         ALLOW_UNPINNED_VAR, GGUF_NAME, allow_unpinned_wanted, check_gguf_identity, select_gguf,
     };
-    let allow_unpinned =
-        match allow_unpinned_wanted(std::env::var(ALLOW_UNPINNED_VAR).ok().as_deref()) {
-            Ok(wanted) => wanted,
-            Err(error) => {
-                return Check::new(
-                    "weight format",
-                    CheckStatus::Fail,
-                    format!(
-                        "the loader would refuse this start: {}",
-                        super::describe_error(&error)
-                    ),
-                );
-            }
-        };
+    let allow_unpinned = match allow_unpinned_wanted(raw) {
+        Ok(wanted) => wanted,
+        Err(error) => {
+            return Check::new(
+                "weight format",
+                CheckStatus::Fail,
+                format!(
+                    "the loader would refuse this start: {}",
+                    super::describe_error(&error)
+                ),
+            );
+        }
+    };
     let (gguf, pinned) = match select_gguf(model_dir, allow_unpinned) {
         Ok(pair) => pair,
         Err(error) => {
@@ -2311,5 +2319,43 @@ mod tests {
         assert!(Verdict::Experimental.servable());
         assert!(!Verdict::ResourceConstrained.servable());
         assert!(!Verdict::Unsupported.servable());
+    }
+
+    // The preflight mirror of the loader's GGUF admission: every branch of
+    // `gguf_admission_check` without touching process-global state.
+    #[cfg(all(feature = "native-cuda", target_os = "linux"))]
+    #[test]
+    fn gguf_admission_check_mirrors_the_loader_branches() {
+        use super::gguf_admission_check;
+        let dir = tempfile::tempdir().expect("temp dir");
+        let foreign = dir.path().join("Qwen3.6-35B-A3B-Q5_K_M.gguf");
+        std::fs::write(&foreign, b"").expect("write");
+        // Switch off, pinned file absent: Fail naming the pinned identity and the switch.
+        let off = gguf_admission_check(dir.path(), None);
+        assert_eq!(off.name, "weight format");
+        assert_eq!(off.status, super::CheckStatus::Fail);
+        assert!(
+            off.detail.contains("Qwen3.6-35B-A3B-Q4_K_M.gguf")
+                && off.detail.contains("Q36_ALLOW_UNPINNED_GGUF"),
+            "{}",
+            off.detail
+        );
+        // Switch on, one foreign file: Pass with the admitted-checkpoint note.
+        let on = gguf_admission_check(dir.path(), Some("1"));
+        assert_eq!(on.status, super::CheckStatus::Pass);
+        assert!(
+            on.detail.contains("Q5_K_M") && on.detail.contains("Q36_ALLOW_UNPINNED_GGUF=1"),
+            "{}",
+            on.detail
+        );
+        // A bad spelling: Fail before any selection, naming the refusal.
+        let bad = gguf_admission_check(dir.path(), Some("yes"));
+        assert_eq!(bad.status, super::CheckStatus::Fail);
+        assert!(bad.detail.contains("must be 0 or 1"), "{}", bad.detail);
+        // Switch on, two candidates: Fail on the ambiguity.
+        std::fs::write(dir.path().join("Qwen3.6-35B-A3B-Q8_0.gguf"), b"").expect("write");
+        let many = gguf_admission_check(dir.path(), Some("1"));
+        assert_eq!(many.status, super::CheckStatus::Fail);
+        assert!(many.detail.contains("exactly one .gguf"), "{}", many.detail);
     }
 }
