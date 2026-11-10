@@ -141,7 +141,10 @@ const CASES: [Case; 15] = [
     case(
         "down_p10_pipe",
         Shape::Down,
-        &[("base", IndexedOptions::OFF, &[(0, 10)]), ("pipe", IndexedOptions::PIPE, &[(0, 10)])],
+        &[
+            ("base", IndexedOptions::OFF, &[(0, 10)]),
+            ("pipe", IndexedOptions::PIPE, &[(0, 10)]),
+        ],
         false,
     ),
     case("gateup_p16_warm", Shape::GateUp, decode!(&[(0, 16)]), true),

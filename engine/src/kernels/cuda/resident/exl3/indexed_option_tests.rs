@@ -81,7 +81,10 @@ fn a_set_variable_wins_over_the_context_default_for_its_own_option() {
     assert_eq!(merge_indexed(OFF, (Some(true), None, None)), DP4A);
     assert_eq!(merge_indexed(DP4A, (None, Some(true), None)), BOTH);
     assert_eq!(merge_indexed(OFF, (None, None, Some(true))), PIPE);
-    assert_eq!(merge_indexed(BOTH_PIPE, (Some(false), Some(false), None)), PIPE);
+    assert_eq!(
+        merge_indexed(BOTH_PIPE, (Some(false), Some(false), None)),
+        PIPE
+    );
     assert_eq!(merge_indexed(BOTH, (None, None, Some(false))), BOTH);
 }
 

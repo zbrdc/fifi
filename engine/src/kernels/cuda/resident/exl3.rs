@@ -219,8 +219,7 @@ impl IndexedOptions {
     /// default kernels under it.
     fn native(self, calls: usize) -> Option<u32> {
         let wide = self.pairs20 && calls > INDEXED_CAPACITY;
-        let bits =
-            u32::from(self.dp4a) | (u32::from(wide) << 1) | (u32::from(self.pipeline) << 2);
+        let bits = u32::from(self.dp4a) | (u32::from(wide) << 1) | (u32::from(self.pipeline) << 2);
         (bits != 0).then_some(bits)
     }
 

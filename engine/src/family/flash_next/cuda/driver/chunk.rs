@@ -366,7 +366,6 @@ impl<D: ChunkDevice, F: TokenFeeds> ChunkDriver<D, F> {
             None
         };
         self.device.check_health()?;
-        drop(tick);
         Ok(logits)
     }
 }
