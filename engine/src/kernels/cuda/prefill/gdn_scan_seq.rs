@@ -475,8 +475,9 @@ fn scan_cols_setting() -> Option<usize> {
 }
 
 /// The value of `FIFI_GDN_SCAN_CHUNK`: `1` selects `gdn_scan_chunk_k` (the chunk-parallel
-/// WY scan) for launches of at least [`SCAN_MIN_ROWS`] rows; unset or any other value runs
-/// a sequential kernel. `1` (not `on`) so a misspelt value can never silently enable a
+/// WY scan) for launches of at least [`SCAN_MIN_ROWS`] rows on sm_80+ built architectures;
+/// unset, any other value, a smaller launch, or an older built architecture runs a
+/// sequential kernel. `1` (not `on`) so a misspelt value can never silently enable a
 /// numerics-different kernel.
 fn parse_scan_chunk(raw: Option<&OsStr>) -> Option<()> {
     let text = raw?.to_str()?;
@@ -538,8 +539,11 @@ impl CudaContext {
     ///
     /// `FIFI_GDN_SCAN_CHUNK` (see [`parse_scan_chunk`]) selects the chunk-parallel WY scan
     /// kernel ([`Self::gdn_scan_chunk_form`]) for launches of at least [`SCAN_MIN_ROWS`]
-    /// rows, taking precedence over the cols switch; every launch by default, and every
-    /// launch below the row floor, runs a sequential kernel. The bytes written are the
+    /// rows on sm_80+ built architectures (the kernel's tensor-core form; its sm_72
+    /// fallbacks are compiled but not device-qualified, so below sm_80 the switch falls
+    /// back to the sequential kernels), taking precedence over the cols switch; every
+    /// launch by default, every launch below the row floor, and every launch on an older
+    /// built architecture runs a sequential kernel. The bytes written are the
     /// same; the scan VALUES differ from the sequential kernel's by rounding only (both are
     /// pinned to the same f64 reference by the tests, each with its own derived bound).
     pub(crate) fn gdn_scan_seq_form(
@@ -568,12 +572,24 @@ impl CudaContext {
         chunk: Option<()>,
         cols: Option<usize>,
     ) -> Result<(), EngError> {
-        if chunk.is_some() && call.shape.m >= SCAN_MIN_ROWS {
+        if chunk.is_some() && call.shape.m >= SCAN_MIN_ROWS && self.chunk_scan_hosted() {
             #[cfg(test)]
             CHUNK_CALLS.with(|calls| calls.set(calls.get() + 1));
             return self.gdn_scan_chunk_form(stream, call, form);
         }
         self.gdn_scan_seq_with(stream, call, form, cols)
+    }
+
+    /// Whether the built architecture this context runs is sm_80+, the homes of the chunk
+    /// kernel's tensor-core cubins ([`CudaContext::mmq_device_facts`], cached per context;
+    /// `cc` is the BUILT architecture, 860 on the 3090). The sm_72 fallback paths are
+    /// compiled but not device-qualified, so below sm_80 the chunk switch falls back to
+    /// the sequential kernels. A failed facts probe also falls back: the sequential launch
+    /// reports its own error, and the always-correct path needs no facts.
+    fn chunk_scan_hosted(&self) -> bool {
+        self.mmq_device_facts()
+            .map(|facts| facts.cc >= 800)
+            .unwrap_or(false)
     }
 
     /// Queues the chunk-parallel WY scan of `call` on `stream` with the rules of `form`

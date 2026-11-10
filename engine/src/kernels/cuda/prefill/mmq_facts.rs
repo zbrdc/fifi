@@ -5,13 +5,6 @@
 //!
 //! Not a launch: no stream, no allocation, no synchronization — the method only needs a
 //! usable backend and the dispatch guard, the `device_is_integrated` shape.
-#![cfg_attr(
-    not(test),
-    expect(
-        dead_code,
-        reason = "no caller yet: the chunk driver does not call this kernel; drop the expect when it does"
-    )
-)]
 
 use std::cell::OnceCell;
 
@@ -28,8 +21,22 @@ pub(crate) struct MmqFacts {
     /// device's own capability.
     pub(crate) cc: i32,
     /// Streaming multiprocessors.
+    #[cfg_attr(
+        not(test),
+        expect(
+            dead_code,
+            reason = "read by the GEMM fixup sizing when that wrapper lands"
+        )
+    )]
     pub(crate) nsm: usize,
     /// Opt-in shared memory per block, in bytes.
+    #[cfg_attr(
+        not(test),
+        expect(
+            dead_code,
+            reason = "read by the GEMM fixup sizing when that wrapper lands"
+        )
+    )]
     pub(crate) smpbo: usize,
 }
 

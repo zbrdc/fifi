@@ -652,15 +652,16 @@ __global__ void gdn_out_gate_k(ScanArgs a) {
 //
 // Launch: grid (n_v_heads, 1, D / kCols), block (kLanes, kChunkWarps) = 512 threads; one
 // block owns kCols value columns of one head and walks the m rows in kC-token
-// sub-chunks. All hot reads are 128-bit: K̂/Q̂/S rows live with row stride D + 4 (a multiple
-// of four floats, so rows stay 16-byte aligned and the +4 varies the bank across the eight
-// lanes of an LDS.128 phase group), and every U/G/A/seen matrix is stored value-major with
-// row stride kC + 4 for the same reason. Per sub-chunk: stage K̂/Q̂/V and the gates (P),
+// sub-chunks. All hot reads are 128-bit: K̂/Q̂/S live as fp16 hi/lo split rows — the
+// r-major rows (K̂, Q̂, the state slice S) XOR-swizzled at kHpad halves (swr below, no pad
+// column: the swizzle alone spreads ldmatrix's 8-row loads over all 32 banks), the
+// value-major rows (U, A, UB) at kCHpad halves (16-byte aligned, bank-varying). Per
+// sub-chunk: stage K̂/Q̂/V and the gates (P),
 // the two kC×kC coefficient matrices (G), all kC state-seen dots as one parallel pass (M1:
 // seen = B_t·Sᵀk̂_t for every (t, c) pair), the forward substitution as a lean serial pass
 // (serial: one lane per value column, warps 0–1, each token one broadcast G read, one
 // per-lane seen read and a t-term in-lane back sum — no cross-lane traffic at all), the
-// outputs (M2: B_t·q̂ᵀS + the masked A·U sum, both operands float4 streams) and the single
+// outputs (M2: B_t·q̂ᵀS + the masked A·U sum, both products on the tensor cores) and the single
 // decayed rank-kC state update across all threads (update). The ratio B_t/B_s is a running
 // product per Gram element, never a division: B_t itself underflows fp32 around 0.5^32
 // while the ratios stay in range. No thread leaves before the barrier of the phase it reads.
@@ -673,8 +674,7 @@ __global__ void gdn_out_gate_k(ScanArgs a) {
 constexpr int kC = 32;          // sub-chunk tokens (the solve's kC-step chain)
 constexpr int kChunkWarps = 16; // warps per block (512 threads; the serial pass uses 2)
 constexpr int kCols = 64;       // value columns per block (grid.z = D / kCols = 2: 32 blocks)
-constexpr int kDpad = D + 4;    // row stride of the r-major rows (16-byte aligned, bank-varying)
-constexpr int kCpad = kC + 4;   // row stride of the value-major matrices
+constexpr int kCpad = kC + 4;   // row stride of the fp32 G rows
 constexpr int kHpad = 128;      // halves per r-major row: exactly D, XOR-swizzled 16B chunks
 __device__ __forceinline__ int swr(int row, int r) {
     // chunk j of row k lives at chunk j ^ (k & 7): ldmatrix's 8-row loads span all 32
@@ -684,8 +684,8 @@ __device__ __forceinline__ int swr(int row, int r) {
 constexpr int kCHpad = 40;      // halves per value-major split row of U: kC + 8, 80B bank-varying 16B rows
 // The shared bytes of one launch: fp16 hi/lo split rows for K̂, Q̂ and the state slice S —
 // the tensor-core form (a split pair reconstructs to ~2^-22 relative, so every fp32 reader
-// below joins hi+lo exactly) — plus the fp32 value-major matrices U, G, A, seen and the
-// three gate vectors.
+// below joins hi+lo exactly) — plus the fp16 split value-major rows of U, A and UB, the
+// fp32 G rows and the gate vectors.
 constexpr size_t kChunkSmem =
     (4 * kC + 2 * kCols) * kHpad * sizeof(__half) +
     (2 * kC + 4 * kCols) * kCHpad * sizeof(__half) +
@@ -693,6 +693,10 @@ constexpr size_t kChunkSmem =
 static_assert(kChunkSmem < 96 * 1024, "sm_72 caps opt-in shared memory at 96KB per block");
 static_assert(kHpad >= D, "r-major half rows must hold a full D row");
 static_assert(kHpad % 8 == 0, "swizzled r-major rows need 16B chunks");
+static_assert(kC == kLanes, "the gate staging writes one gate per lane of warp 0");
+static_assert(kC % kChunkWarps == 0, "the sm_72 walks tile the sub-chunk rows across the block");
+static_assert(kC % 16 == 0, "the mma tiles span the sub-chunk in 16-row steps");
+static_assert(D % 32 == 0, "the update's r tiles span the state rows in 32-column steps");
 
 
 // Split a float into an fp16 hi/lo pair (joint residual ~2^-22 relative) and join it back.
@@ -1345,6 +1349,29 @@ extern "C" int inference_cuda_gdn_scan_seq_fault_bad_bounds_launch(
         ScanArgs k = to_args(args);
         k.p0 = k.ctx_tokens;  // ctx_tokens + m > ctx_tokens: the violation, p0 still an int
         const Failure failure = launch_scan(k, args->form, 0, stream);
+        report_stage(out_stage, failure.stage);
+        return (int)failure.err;
+    } catch (...) {
+        return INFERENCE_CUDA_NATIVE_EXCEPTION;
+    }
+}
+
+/* The chunk-parallel twin of the entry above: same sans-bounds validation, same forced p0
+ * violation, but the CHUNK kernel's own device guard (no state load, NaN of its full
+ * (m x kCols) o_out tile per block, mask 8) is the code under test. */
+extern "C" int inference_cuda_gdn_scan_chunk_fault_bad_bounds_launch(
+    const inference_cuda_gdn_scan_seq_args *args, void *stream, int *out_stage) {
+    try {
+        report_stage(out_stage, INFERENCE_CUDA_STAGE_NONE);
+        if (args == NULL || !valid_sans_bounds(*args, stream)) {
+            return INFERENCE_CUDA_INVALID_ARGUMENT;
+        }
+        ScanArgs k = to_args(args);
+        k.p0 = k.ctx_tokens;
+        const Failure failure =
+            (args->form & INFERENCE_CUDA_GDN_FORM_GROUPED_HEADS)
+                ? launch_chunk_l2<true>(k, args->form, stream)
+                : launch_chunk_l2<false>(k, args->form, stream);
         report_stage(out_stage, failure.stage);
         return (int)failure.err;
     } catch (...) {

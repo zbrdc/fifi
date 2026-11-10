@@ -4,17 +4,23 @@
 //! sequential ones by rounding only, so every test here judges it against the same
 //! reference with the chunk kernel's own derived bound `EC_S`; the sequential kernels' own
 //! tests (their bounds E3/E4) are untouched. The wrapper refusals are shared code and are
-//! exercised once here; the p0 device guard mirrors the sequential kernels' line for line
-//! and has no fault entry of its own (the fault-qualification entries target the
-//! sequential launches), so it is not re-tested on device.
+//! exercised once here; the p0 device guard is new code of this kernel (its NaN sweep
+//! covers the block's own o_out tile), so it has its own fault entry below — the twin of
+//! the sequential kernels' fault-qualification test.
 
 use super::{
-    D, RefOpts, Rig, ScanInputs, ScanLayout, ScanRig, assert_constraints, assert_scan_finite,
-    generate_scan, judge_scan_with, seed_of,
+    D, RefOpts, Rig, ScanInputs, ScanLayout, ScanRig, assert_constraints, assert_scan_finite, f32s,
+    generate_scan, judge_scan_with, le_bytes, seed_of,
 };
 use crate::EngError;
+#[cfg(feature = "cuda-fault-qualification")]
+use crate::kernels::cuda::PREFILL_STATUS_BOUND_VIOLATION;
+#[cfg(feature = "cuda-fault-qualification")]
+use crate::kernels::cuda::native::prefill::gdn_scan_seq::{
+    GdnScanSeqRaw, gdn_scan_chunk_fault_bad_bounds,
+};
 use crate::kernels::cuda::prefill::gdn_scan_seq::{
-    GDN_SCAN_EPS, GdnForm, GdnScanSeqCall, ScanShape, ScanWeights, scan_bytes,
+    GDN_SCAN_EPS, GdnForm, GdnScanSeqCall, ScanShape, ScanWeights, scan_bytes, scan_ints,
 };
 use crate::kernels::cuda::testkit;
 
@@ -43,6 +49,9 @@ const EC: f64 = 2.0 * (C_DOTS + KC) * 128.0 * U;
 /// is unchanged. Measured ~7.0e-4 sits ~8× under it, the same worst-case profile the fp32
 /// form has under `EC`; dropping the lo half measured 7.1e-2 (the lo term is load-bearing).
 const EC_S: f64 = 2.0 * (C_DOTS + KC) * 128.0 * (U + 1.0 / 2_097_152.0);
+// Below the fp16 normal floor (|x| < 6.1e-5) the hi half turns denormal and the split
+// residual degrades from ~2^-22 relative to an absolute ~2^-25 floor; the tested input
+// profile keeps every element above the floor, and the 8x margin would absorb it anyway.
 
 /// [`ScanRig::run_form`] for the chunk kernel: the same buffers, the chunk launch.
 fn run_chunk_form(
@@ -468,5 +477,101 @@ fn gdn_scan_chunk_speed_rows() -> Result<(), EngError> {
             best(&seq_ms) / best(&chunk_ms),
         );
     }
+    Ok(())
+}
+
+/// The chunk kernel's own p0 guard on device, the twin of the sequential kernels'
+/// `gdn_scan_seq_fault_bad_bounds_reports_bit_8`: the fault entry violates only the p0
+/// bound, so the guard must load no state, NaN every o_out element (the sweep covers each
+/// block's (m x kCols) tile), OR mask 8 of the prefill status word, and leave the backend
+/// usable (a good wrapper call succeeds right after).
+#[cfg(feature = "cuda-fault-qualification")]
+#[test]
+fn gdn_scan_chunk_fault_bad_bounds_reports_bit_8() -> Result<(), EngError> {
+    if !testkit::device_present("gdn_scan_chunk_fault_bad_bounds_reports_bit_8") {
+        return Ok(());
+    }
+    let (nk, nv, m) = (2, 4, 4);
+    let inp = generate_scan(nk, nv, m, ScanLayout::of(nk, nv), seed_of(nk, nv, m, 0xe));
+    assert_constraints(&inp, &[]);
+    let shape = inp.shape(m, 0, 1024);
+    let need = scan_bytes(shape)?;
+    let got = {
+        let rig = Rig::new()?;
+        let (conv, proj) = (
+            rig.ctx.upload(&le_bytes(&inp.conv))?,
+            rig.ctx.upload(&le_bytes(&inp.proj))?,
+        );
+        let (a, dt) = (
+            rig.ctx.upload(&le_bytes(&inp.a))?,
+            rig.ctx.upload(&le_bytes(&inp.dt))?,
+        );
+        let (nw, state) = (
+            rig.ctx.upload(&le_bytes(&inp.nw))?,
+            rig.ctx.upload(&le_bytes(&inp.state0))?,
+        );
+        let (o_out, status) = (
+            rig.ctx.upload(&vec![0xFF_u8; need.o_out])?,
+            rig.ctx.upload(&[0_u8; 4])?,
+        );
+        let ints = scan_ints(&shape)?;
+        let io = GdnScanSeqRaw {
+            conv: rig.ctx.raw_range(&conv.range(0, need.conv)?)?,
+            proj: rig.ctx.raw_range(&proj.range(0, need.proj)?)?,
+            a: rig.ctx.raw_range(&a.range(0, need.a)?)?,
+            dt_bias: rig.ctx.raw_range(&dt.range(0, need.dt_bias)?)?,
+            norm_w: rig.ctx.raw_range(&nw.range(0, need.norm_w)?)?,
+            state: rig.ctx.raw_range(&state.range(0, need.state)?)?,
+            o_out: rig.ctx.raw_range(&o_out.range(0, need.o_out)?)?,
+            status: Some(rig.ctx.raw_range(&status.range(0, 4)?)?),
+            ints,
+            eps: GDN_SCAN_EPS,
+            form: 0,
+        };
+        rig.ctx
+            .launch_on(&rig.stream, |raw| gdn_scan_chunk_fault_bad_bounds(raw, io))?;
+        rig.stream.synchronize()?;
+        let mut out = vec![0_u8; need.o_out];
+        o_out.read_at(&rig.stream, 0, &mut out)?;
+        let mut st = vec![0_u8; need.state];
+        state.read_at(&rig.stream, 0, &mut st)?;
+        let mut word = [0_u8; 4];
+        status.read_at(&rig.stream, 0, &mut word)?;
+        // The backend stays usable: a good call through the wrapper succeeds after the guard.
+        rig.ctx.gdn_scan_seq(
+            &rig.stream,
+            GdnScanSeqCall {
+                shape,
+                eps: GDN_SCAN_EPS,
+                conv: conv.range(0, need.conv)?,
+                proj: proj.range(0, need.proj)?,
+                weights: ScanWeights {
+                    a: a.range(0, need.a)?,
+                    dt_bias: dt.range(0, need.dt_bias)?,
+                    norm_w: nw.range(0, need.norm_w)?,
+                },
+                state: state.range(0, need.state)?,
+                o_out: o_out.range(0, need.o_out)?,
+                status: None,
+            },
+        )?;
+        rig.stream.synchronize()?;
+        drop((conv, proj, a, dt, nw, state, o_out, status, rig));
+        (f32s(&out), st, word)
+    };
+    assert!(
+        got.0.iter().all(|v| v.is_nan()),
+        "a refused chunk launch must NaN every o_out element"
+    );
+    assert_eq!(
+        got.1,
+        le_bytes(&inp.state0),
+        "a refused chunk launch must not touch the state"
+    );
+    assert_eq!(
+        i32::from_le_bytes(got.2),
+        PREFILL_STATUS_BOUND_VIOLATION,
+        "mask 8 of the prefill status word"
+    );
     Ok(())
 }

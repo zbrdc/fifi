@@ -127,6 +127,12 @@ int inference_cuda_gdn_scan_chunk_launch(const inference_cuda_gdn_scan_seq_args 
  * never reach it with bad bounds; this entry changes no rule of that entry. */
 int inference_cuda_gdn_scan_seq_fault_bad_bounds_launch(
     const inference_cuda_gdn_scan_seq_args *args, void *stream, int *out_stage);
+
+/* The chunk-parallel twin of the entry above: same sans-bounds validation and forced p0
+ * violation, so the CHUNK kernel's own device guard (no state load, NaN of its full o_out
+ * tile, mask 8) is the code under test. */
+int inference_cuda_gdn_scan_chunk_fault_bad_bounds_launch(
+    const inference_cuda_gdn_scan_seq_args *args, void *stream, int *out_stage);
 #endif
 
 #ifdef __cplusplus
