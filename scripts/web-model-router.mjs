@@ -11,6 +11,7 @@ const RUN_2080TI = process.env.FIFI_SECONDARY_RUN ?? '/home/ben/fifi-scratch/a81
 const HOST = '127.0.0.1';
 const PORT = Number(process.env.FIFI_MODEL_ROUTER_PORT ?? 18795);
 const MAX_BODY = 20 * 1024 * 1024;
+const CLOSE_BACKEND_CONNECTIONS = process.env.FIFI_ROUTER_CLOSE_BACKEND_CONNECTIONS === '1';
 
 // ponytail: static backend table; add a third engine by appending here.
 const BACKENDS = [
@@ -31,7 +32,10 @@ function forward(req, body, backend, res) {
   if (req.headers.accept) headers['accept'] = req.headers.accept;
   if (body.length) headers['content-length'] = String(body.length);
   headers['authorization'] = 'Bearer ' + backend.key;
-  const preq = request(backend.origin + pathname + (search ?? ''), { method: req.method, headers }, pres => {
+  // The opt-in policy avoids pooling completed sockets; streams stay open until completion.
+  const preq = request(backend.origin + pathname + (search ?? ''), {
+    method: req.method, headers, ...(CLOSE_BACKEND_CONNECTIONS ? { agent: false } : {}),
+  }, pres => {
     const hop = { connection: 1, 'transfer-encoding': 1, 'keep-alive': 1 };
     const out = {}; for (const [k, v] of Object.entries(pres.headers)) if (!hop[k.toLowerCase()]) out[k] = v;
     res.writeHead(pres.statusCode ?? 502, out);
@@ -57,8 +61,12 @@ function readBody(req) {
 }
 
 async function mergedModels(res) {
+  // The opt-in policy avoids retaining idle model-list sockets on each backend.
   const lists = await Promise.all(BACKENDS.map(b =>
-    fetch(b.origin + '/v1/models', { headers: { authorization: 'Bearer ' + b.key }, signal: AbortSignal.timeout(4000) })
+    fetch(b.origin + '/v1/models', {
+      headers: { authorization: 'Bearer ' + b.key, ...(CLOSE_BACKEND_CONNECTIONS ? { connection: 'close' } : {}) },
+      signal: AbortSignal.timeout(4000),
+    })
       .then(r => r.json()).catch(() => null)));
   const data = lists.flatMap((l, i) => l?.data ?? [{ id: BACKENDS[i].model, object: 'model', owned_by: 'fifi' }]);
   // The GUI selects the first model when it has no saved choice. Prefer the P2P engine.
