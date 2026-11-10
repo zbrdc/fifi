@@ -1034,6 +1034,30 @@ mod tests {
     }
 
     #[test]
+    fn qk_norm_distinguishes_sparse_near_zero_formulas() {
+        let mut x = [0.0f32; 128];
+        x[0] = 1e-5;
+        let (q, k) = qk_norm(&x, &x);
+        let value = f64::from(x[0]);
+        let sum = value * value;
+        let host = value / (sum + 128.0e-6).sqrt();
+        let reference = crate::kernels::gdn_reference::normalize(
+            &x,
+            1e-6,
+            1.0,
+            crate::kernels::gdn_reference::Norm::QwenRms,
+        );
+        assert!((reference[0] - host).abs() < 1e-12);
+        let ggml = value / sum.max(1e-12).sqrt();
+        let add_eps = value / (sum + 1e-6).sqrt();
+        assert!((f64::from(k[0]) - host).abs() < 1e-8);
+        assert!((f64::from(q[0]) - host / 128.0f64.sqrt()).abs() < 1e-8);
+        assert!((f64::from(k[0]) - ggml).abs() > 0.1);
+        assert!((f64::from(k[0]) - add_eps).abs() > 0.001);
+        assert!(q[1..].iter().chain(&k[1..]).all(|&v| v == 0.0));
+    }
+
+    #[test]
     fn delta_matches_the_oracle_and_value_heads_follow_their_key_head() {
         let shape = shape(vec![AttentionKind::DeltaNet]);
         let fx = DeltaFx::new(0);
@@ -1072,6 +1096,33 @@ mod tests {
         );
         assert_eq!(rec, [17.0 / 32.0, 15.0 / 32.0, 35.0 / 32.0, 29.0 / 32.0]);
         assert_eq!(out, [47.0 / 32.0, 93.0 / 32.0]);
+
+        // The shared reference uses key-major state, the transpose of `rec`.
+        let mut reference = [1.0, 3.0, 2.0, 4.0];
+        crate::kernels::gdn_reference::step(
+            &mut reference,
+            &[0.0, 1.0],
+            &[1.0, 0.0],
+            &[2.0, 4.0],
+            0.5,
+            0.5,
+        );
+        let reference_out = crate::kernels::gdn_reference::step(
+            &mut reference,
+            &[1.0, 2.0],
+            &[1.0, 1.0],
+            &[1.0, 2.0],
+            0.25,
+            0.5,
+        );
+        assert_eq!(
+            reference,
+            [rec[0] as f64, rec[2] as f64, rec[1] as f64, rec[3] as f64]
+        );
+        assert_eq!(
+            reference_out,
+            out.into_iter().map(f64::from).collect::<Vec<_>>()
+        );
     }
 
     #[test]

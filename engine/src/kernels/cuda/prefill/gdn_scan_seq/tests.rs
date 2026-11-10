@@ -17,6 +17,7 @@ use crate::kernels::cuda::resident::gdn_conv::{ConvCall, ConvShape};
 use crate::kernels::cuda::resident::gdn_delta::{DeltaCall, DeltaShape, DeltaWeights, delta_bytes};
 use crate::kernels::cuda::testkit::{self, Rng};
 use crate::kernels::cuda::{CudaContext, DeviceBuffer, DeviceRange, DeviceStream};
+use crate::kernels::gdn_reference::{Norm, normalize, step as ref_step};
 
 /// The Qwen3.6 geometry: 16 key heads, 32 value heads, D 128, so
 /// `channels = (2 * 16 + 32) * 128 = 8192` (mixer_geometry.rs).
@@ -836,36 +837,14 @@ struct RefRun {
     state: Vec<f64>,
 }
 
-/// One step of the delta rule in the reference state layout `s[i * D + j]`.
-fn ref_step(s: &mut [f64], q: &[f64], k: &[f64], v: &[f64], decay: f64, beta: f64) -> Vec<f64> {
-    let mut sk = vec![0.0; D];
-    for i in 0..D {
-        for j in 0..D {
-            s[i * D + j] *= decay;
-            sk[j] += s[i * D + j] * k[i];
-        }
-    }
-    let d: Vec<f64> = (0..D).map(|j| (v[j] - sk[j]) * beta).collect();
-    let mut o = vec![0.0; D];
-    for i in 0..D {
-        for j in 0..D {
-            s[i * D + j] += k[i] * d[j];
-            o[j] += s[i * D + j] * q[i];
-        }
-    }
-    o
-}
-
 /// `x * scale / sqrt(form(s))` in f64, the form chosen by `opts`.
 fn ref_l2(x: &[f32], eps: f64, scale: f64, decode_form: bool) -> Vec<f64> {
-    let s: f64 = x.iter().map(|&v| f64::from(v).powi(2)).sum();
-    let denom = if decode_form {
-        s + eps
+    let form = if decode_form {
+        Norm::AddEps
     } else {
-        s.max(eps * eps)
-    }
-    .sqrt();
-    x.iter().map(|&v| f64::from(v) * scale / denom).collect()
+        Norm::Ggml
+    };
+    normalize(x, eps, scale, form)
 }
 
 /// The scan in f64: the ggml L2 norms (or the decode form), the tiled key map (or MLX's),

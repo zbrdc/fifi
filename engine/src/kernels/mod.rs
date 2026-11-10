@@ -1,5 +1,7 @@
 #[cfg(test)]
 pub(crate) mod attention_reference;
+#[cfg(test)]
+pub(crate) mod gdn_reference;
 
 #[cfg(test)]
 mod evaluate_wall;
