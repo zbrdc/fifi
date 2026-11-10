@@ -32,7 +32,9 @@ use super::resident::{RawRange, RawStream};
 use super::{DeviceFailure, checked, invalid_argument};
 
 /// Matches `kMaxValues` in `native/peer_ring.cu`.
-pub(in crate::kernels::cuda) const MAX_VALUES: usize = 1 << 20;
+pub(in crate::kernels::cuda) const MAX_VALUES: usize = 1 << 21;
+/// The single-block FP16 publisher retains its previously supported bound.
+pub(in crate::kernels::cuda) const MAX_F16_VALUES: usize = 1 << 20;
 /// Matches `kMaxPeers` in `native/peer_ring.cu`.
 pub(in crate::kernels::cuda) const MAX_PEERS: usize = 3;
 /// The wait-sum status bit for a peer that never published.
@@ -120,6 +122,9 @@ pub(in crate::kernels::cuda) fn publish(
     seq: u32,
     f32_payload: bool,
 ) -> Result<(), DeviceFailure> {
+    if !f32_payload && count > MAX_F16_VALUES {
+        return Err(invalid_argument());
+    }
     let count = checked_count(count, &[src])?;
     if seq == 0 || !dst_slot.is_multiple_of(16) {
         return Err(invalid_argument());
@@ -153,6 +158,9 @@ pub(in crate::kernels::cuda) fn wait_sum(
     timeout_cycles: u64,
     status_word: RawRange<'_>,
 ) -> Result<(), DeviceFailure> {
+    if !f32_payload && count > MAX_F16_VALUES {
+        return Err(invalid_argument());
+    }
     let count = checked_count(count, &[out, own])?;
     if seq == 0
         || peer_slots.len() > MAX_PEERS
@@ -245,6 +253,55 @@ pub(in crate::kernels::cuda) fn wait_copy(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn fp16_retains_its_old_native_limit_before_launch() {
+        // SAFETY: aligned, non-null sentinel addresses are never dereferenced;
+        // the payload limit rejects both calls before any CUDA launch.
+        let status = unsafe {
+            publish_f16_raw(
+                std::ptr::null_mut(),
+                16usize as *const f32,
+                16usize as *mut c_void,
+                (MAX_F16_VALUES + 1) as c_int,
+                1,
+            )
+        };
+        assert_eq!(status, super::super::STATUS_INVALID_ARGUMENT);
+        // SAFETY: as above, the adapter rejects the count before a launch.
+        let status = unsafe {
+            wait_sum_f16_raw(
+                std::ptr::null_mut(),
+                16usize as *mut f32,
+                16usize as *const f32,
+                std::ptr::null(),
+                std::ptr::null(),
+                std::ptr::null(),
+                0,
+                (MAX_F16_VALUES + 1) as c_int,
+                1,
+                0,
+                16usize as *mut c_uint,
+            )
+        };
+        assert_eq!(status, super::super::STATUS_INVALID_ARGUMENT);
+    }
+
+    #[test]
+    fn fp32_refuses_payloads_above_the_wide_limit_before_launch() {
+        // SAFETY: the aligned sentinels are never dereferenced; the count
+        // is above the native limit and is rejected before any CUDA launch.
+        let status = unsafe {
+            publish_f32_raw(
+                std::ptr::null_mut(),
+                16usize as *const f32,
+                16usize as *mut c_void,
+                (MAX_VALUES + 1) as c_int,
+                1,
+            )
+        };
+        assert_eq!(status, super::super::STATUS_INVALID_ARGUMENT);
+    }
 
     #[test]
     fn the_native_entry_rejects_bad_arguments_before_any_cuda_call() {

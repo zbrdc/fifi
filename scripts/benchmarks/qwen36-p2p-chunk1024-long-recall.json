@@ -1,0 +1,129 @@
+{
+  "scope": "One completed synthetic cold 128k recall request before a later guarded interruption; no coding or warm-cache qualification.",
+  "model": "Qwen3.6 35B A3B Q4_K_M",
+  "model_sha256": "671e47e0ec53c665d048b98c3ecbfd5236b5ca9c3e02ed19fc8f81f7b85140c7",
+  "devices": [
+    "RTX 3060 12 GB",
+    "RTX 3080 10 GB"
+  ],
+  "context_limit": 262144,
+  "kv_cache": "q8",
+  "prefix_reuse": false,
+  "chunk_rows": 1024,
+  "settings": {
+    "INFERENCE_CUDA_P2P_RING_MULTIBLOCK": "1",
+    "Q36_P2P_SYNC_BROADCAST": "1"
+  },
+  "tested_source_commit": "3a0e82c26a7a2259ac11ff6cd915018946598264",
+  "source_head_during_test": "48125d3d5344d44bfb1bbc29777809cfb3a72393",
+  "source_head_delta": "Documentation and benchmark evidence only; pinned in the peer harness.",
+  "server_binary_sha256": "ce78f8e8c7b098312793fab4a8150d6e7a998b4c34b45041865795bf5950fa88",
+  "driver_source": {
+    "commit": "90f1de648b4b18cb76e1e2f43218be9b6890a8d8",
+    "files": {
+      "bench_long_context.py": "67adb062bb6e2b73d6830cf69625f3f7657d959aa7426025bb4bbf3f9d5c6803",
+      "bench_engines.py": "09f42c1f164c2c6479bc5a200dd3c127d0c36082e02f35e865b4ce2d109904a2"
+    }
+  },
+  "runner_sources": {
+    "attention_device.py": "afe57632ba6daf086be999560e04db6a964fb74c5e145962133abcaca2fd907b",
+    "benchmark_device.py": "cab149a10ab8797a88955d51830fa327673bea942aa971e56aa743537e4d82a8",
+    "reserve_pair_attention.py": "3515b16aa5aa817ce4ebdcdc545173a15a5cf26578b10bafd946c503cb3f5a18",
+    "scope_guard.py": "14d7aec72002f2d4b067609e98bf397f7e080ea7fdb9ab5337f836325f9b8cb2",
+    "peer_evidence.py": "af9a1fc293a5b4f680331acc27978c2794e8deb6a30cc0399183479c0952bae7",
+    "shared_guard_sha256": "e7022df0efde4a270e50836697403cb147d7526443512050bfe13ed770fa3ef3"
+  },
+  "peer_proof": {
+    "summary_sha256": "8765a127d57020b929075ce3df3d3de923303f8d19e65fc3dcf3e5fd32d55991",
+    "guard_sha256": "ae59a801bdaa4e33106a84d7a575ac3bb15e475554b17ec09e930a56e95e6645",
+    "guard_samples": 22
+  },
+  "result": {
+    "target": 131072,
+    "prompt_tokens": 131195,
+    "completion_tokens": 21,
+    "request_id": "chatcmpl-0000000000000005",
+    "recall_passed": true,
+    "marker_checks": [
+      {
+        "name": "MAPLE",
+        "approx_depth_fraction": 0.1,
+        "expected": "312402",
+        "reported": "312402",
+        "correct": true
+      },
+      {
+        "name": "COBALT",
+        "approx_depth_fraction": 0.5,
+        "expected": "391308",
+        "reported": "391308",
+        "correct": true
+      },
+      {
+        "name": "FJORD",
+        "approx_depth_fraction": 0.9,
+        "expected": "407189",
+        "reported": "407189",
+        "correct": true
+      }
+    ],
+    "server_prefill_ms": 157777.2,
+    "server_first_batch_tokens_per_second": 831.5206506390023,
+    "first_visible_seconds": 157.92935421399307,
+    "decode_tokens_per_second": 29.87,
+    "finish_reason": "stop",
+    "max_completion_tokens": 64,
+    "raw_result_sha256": "6d4894fa1819c37cf0b495037b8cb7824b92d6f18d6bf048ae9ca14724717e95"
+  },
+  "smoke": {
+    "receipt_sha256": "09be7efb74dae74f65aa8eaa02652a752615257700ff9047caa36bb717feeba6",
+    "guard_samples": 88,
+    "guard_sha256": "c879630681a9694f78f0a23a24d66780a62be2852b5608aafd8af5293b2767b1",
+    "restored": true
+  },
+  "interrupted_campaign": {
+    "clear_samples_before_interruption": 337,
+    "final_guard_sample": {
+      "time": 1794344822.014978,
+      "other_jobs": [],
+      "builders": [],
+      "unexpected": [],
+      "non_target_utilization": {
+        "GPU-699004f8-e2f0-747e-5c02-30141e9d4b7c": 41
+      },
+      "states_ok": false,
+      "pair_free_mib": {
+        "GPU-282e266a-24ac-6fa8-a16d-4281e52b4c0a": 1409,
+        "GPU-704fef60-5280-9b88-fa3d-d11135caf576": 1302
+      },
+      "clients": false,
+      "listeners": false
+    },
+    "guard_sha256": "623050a38e69b34f554f816f64180cf904ae0f2fb14a7e3e6cd2014fdc6b2f88",
+    "minimum_free_mib": 1302,
+    "completed_request_before_interruption": true,
+    "near_256k": "Interrupted; prompt counted but no completion or recall result.",
+    "near_256k_prompt_tokens": 262010,
+    "partial_result_sha256": "e20d12d23884d0d2cd11ea2d3e8e1683ea2e2513673c278d28e8487e36103c2e",
+    "server_log_sha256": "f437d6fabc67e39a6750b66c7a0285dcd42c1aadf351c5fa12703707cc92f55b",
+    "runner_log_sha256": "4ccbeee787671ac3ab33957a24ecaffa8a5b4b79018a623d26109e8f0cdb0df8",
+    "restore_sha256": "ec8531c48de7e4b199aa41197040a5fa2ca12bb1cfe82410d3117e7642e3194d",
+    "restored": true
+  },
+  "secondary_service": {
+    "ready_after": true,
+    "process_restarted": true,
+    "binary_and_config_sha256_unchanged": {
+      "executable": "7ecc29185c3ff4b0cf29df8d6e39f1be5446f93bbf8128f8d8049377fcef1490",
+      "start": "67fce39d8ed2ec714da6f252e9bd0fd0e1dbc30dc6e0b83bf101b49f10c8000f",
+      "config": "821a91e6d0a763a31f4676d6bab5c8bfd5f2739737e05c612deece673cbd430f"
+    }
+  },
+  "limitations": [
+    "One cold synthetic prompt with three markers is not a coding-quality benchmark.",
+    "No prefix reuse or multi-turn behavior was tested.",
+    "The near-256k run was interrupted after the 2080 service restarted; it has no completion result.",
+    "Server prefill timing includes first emitted-batch work.",
+    "This result does not qualify the experimental chunk or the main base for default use."
+  ]
+}

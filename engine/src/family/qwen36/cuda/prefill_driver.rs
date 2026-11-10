@@ -566,7 +566,7 @@ impl PrefillArena {
         Self::allocate_list(ctx, stream, list, (m_sess, facts, budget))
     }
 
-    fn allocate_list(
+    pub(super) fn allocate_list(
         ctx: &CudaContext,
         stream: &DeviceStream,
         list: Vec<(ChunkSlot, ArenaTensor)>,

@@ -16,8 +16,8 @@
   "targets": {
     "lib": {
       "path": "src/lib.rs",
-      "test_fns": 6651,
-      "ignored": 583,
+      "test_fns": 6672,
+      "ignored": 592,
       "env_gates": [
         "CUDA_MODULE_LOADING",
         "DEFAULT_ON_CHILD",
@@ -304,6 +304,7 @@
         "Q36_NO_GDNPREP",
         "Q36_NO_MOECOMBINE",
         "Q36_OUT_DIR",
+        "Q36_P2P_CHUNK",
         "Q36_P2P_HOST_EXPERT_BYTES",
         "Q36_P2P_HOST_EXPERT_BYTES_0",
         "Q36_P2P_PREFIX",

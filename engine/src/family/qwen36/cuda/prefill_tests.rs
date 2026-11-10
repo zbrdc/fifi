@@ -153,6 +153,17 @@ fn prefill_views_cover_every_slot_once() {
     }
 }
 
+#[test]
+fn zero_row_is_optional_only_for_native_card_views() {
+    use super::prefill_plan::{ChunkSlot, EXL3_SLOTS};
+    let mut native = ALL_SLOTS.to_vec();
+    native.push(ChunkSlot::Zero);
+    assert!(check_view_list(native.len(), &native).is_ok());
+    let mut exl3 = EXL3_SLOTS.to_vec();
+    exl3.push(ChunkSlot::Zero);
+    assert!(check_view_list(exl3.len(), &exl3).is_err());
+}
+
 /// One row per guard of `ChunkRows::new`, each with the others satisfied, plus the accepting edges.
 #[test]
 fn chunk_rows_refuse_each_bound() {

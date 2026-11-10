@@ -984,15 +984,45 @@ fn make_multi(
         p2p_host_expert_bytes(first_var, std::env::var_os(first_var).as_deref())?,
         p2p_host_expert_bytes(second_var, std::env::var_os(second_var).as_deref())?,
     ];
-    let (stack, states) = match planned.as_ref() {
-        Some(plan) => CardStack::with_table(
+    // The chunked session's layer sums carry m*hidden values, so the
+    // mailbox payload grows past the eager cap when Q36_P2P_CHUNK is set
+    // (capped at the transport's MAX_VALUES by max_chunk_rows).
+    let chunk_rows = super::card_prefill::configured_chunk_rows(
+        std::env::var_os("Q36_P2P_CHUNK").as_deref(),
+        dims.shape.hidden,
+    )?;
+    let chunk_payload = chunk_rows
+        .map(|rows| {
+            super::card_prefill::chunk_mailbox_values(rows, dims.shape.hidden, dims.shape.moe.top_k)
+        })
+        .transpose()?;
+    let (stack, states) = match (planned.as_ref(), chunk_payload) {
+        (Some(plan), None) => CardStack::with_table(
             &dims,
             &options,
             &settings.cuda_devices,
             &served_admission(),
             &plan.table,
         )?,
-        None => CardStack::new(&dims, &options, &settings.cuda_devices, &served_admission())?,
+        (None, None) => {
+            CardStack::new(&dims, &options, &settings.cuda_devices, &served_admission())?
+        }
+        (Some(plan), Some(payload)) => CardStack::with_table_payload(
+            &dims,
+            &options,
+            &settings.cuda_devices,
+            &served_admission(),
+            &plan.table,
+            payload,
+        )?,
+        (None, Some(payload)) => CardStack::with_payload(
+            &dims,
+            &options,
+            &settings.cuda_devices,
+            &served_admission(),
+            &ShardTable::new(&dims.shape, settings.cuda_devices.len(), 32)?,
+            Some(payload),
+        )?,
     };
     stages.begin("loading weights");
     let mut loaded = Vec::with_capacity(loads.len());
@@ -1059,7 +1089,14 @@ fn make_multi(
                 entries: 0,
             }
         },
+        chunk_rows,
     )?;
+    // Experimental and default off: chunked prefill through both cards
+    // (card_prefill.rs). Q36_P2P_CHUNK=<rows> sets the chunk size, capped
+    // at MAX_VALUES/hidden; the views are freshly resolved from the same
+    // leaked weights the session holds, so the chunk models live beside
+    // the session in the enum. A refusal logs and leaves the per-token
+    // path in place.
     Ok((
         Q36CudaStep::Cards(Box::new(session)),
         DecodeSession::default(),

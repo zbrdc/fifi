@@ -1,0 +1,714 @@
+{
+  "scope": "Guarded synthetic Qwen3.6 512 versus 1024 row P2P chunk comparison; no production qualification.",
+  "source_commit": "3a0e82c26a7a2259ac11ff6cd915018946598264",
+  "model": "Qwen3.6 35B A3B Q4_K_M",
+  "model_sha256": "671e47e0ec53c665d048b98c3ecbfd5236b5ca9c3e02ed19fc8f81f7b85140c7",
+  "devices": [
+    "RTX 3060 12 GB",
+    "RTX 3080 10 GB"
+  ],
+  "kv_cache": "q8",
+  "configured_context_tokens": 262144,
+  "prefix_reuse": false,
+  "chunk_rows_by_arm": {
+    "control": 512,
+    "candidate": 1024
+  },
+  "samples_per_arm_per_order": 3,
+  "arm_difference": {
+    "control": {
+      "Q36_P2P_CHUNK": "512"
+    },
+    "candidate": {
+      "Q36_P2P_CHUNK": "1024"
+    }
+  },
+  "common_sync_broadcast": "1",
+  "common_multiblock_ring": "1",
+  "host_expert_bytes_requested": [
+    1395864370,
+    3489660928
+  ],
+  "host_expert_bytes_selected": [
+    1434451968,
+    3548381184
+  ],
+  "build": {
+    "target": "native-cuda linux sm86 release",
+    "test_binary_sha256": "2a3933624bf16eaac96f948582dbc153e58e85c04297c971b00a79fc6df91224",
+    "server_binary_sha256": "ce78f8e8c7b098312793fab4a8150d6e7a998b4c34b45041865795bf5950fa88",
+    "receipt_sha256": "f733645ff9bb2a89f99c09a49332bb0518c3aba5d4d34eba03e1cbb6a2e3db94",
+    "test_build_log_sha256": "7b37f220f0d4dfcae1e3dc7504c8dbfe5340d9800c65f153d789c9db17b95eb5",
+    "server_build_log_sha256": "f9b6be9396b5d38e2aa8d814ebc9a8160534309a64f53dc8665ea0906afb3aa9",
+    "selected_host_tests": [
+      {
+        "name": "family::qwen36::cuda::card_prefill::config_tests::chunk_setting_is_explicit_and_bounded",
+        "log_sha256": "e375770c17aca3e503e3e208aaa78ac706ef6061fa0102b9b396da47f1f03afd",
+        "output": "\nrunning 1 test\ntest family::qwen36::cuda::card_prefill::config_tests::chunk_setting_is_explicit_and_bounded ... ok\n\ntest result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 5927 filtered out; finished in 0.00s\n\n"
+      },
+      {
+        "name": "family::qwen36::cuda::card_prefill::config_tests::mailbox_covers_both_chunk_sums_and_eager_decode",
+        "log_sha256": "8916e06fa78442bc286bd290f3d8cd6036dfe47787778c1976d7551496680ca7",
+        "output": "\nrunning 1 test\ntest family::qwen36::cuda::card_prefill::config_tests::mailbox_covers_both_chunk_sums_and_eager_decode ... ok\n\ntest result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 5927 filtered out; finished in 0.00s\n\n"
+      },
+      {
+        "name": "family::qwen36::cuda::card_prefill::config_tests::chunk_admission_preserves_the_free_vram_floor",
+        "log_sha256": "5801220512a3e31995ad5124c6da8a1da1603c6de531ca551975fe0696f1264b",
+        "output": "\nrunning 1 test\ntest family::qwen36::cuda::card_prefill::config_tests::chunk_admission_preserves_the_free_vram_floor ... ok\n\ntest result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 5927 filtered out; finished in 0.00s\n\n"
+      },
+      {
+        "name": "family::qwen36::cuda::card_prefill::config_tests::card_staging_respects_shard_geometry_and_live_floor",
+        "log_sha256": "fd577c8bcf336006cec4a9fbe2b8a0f688af20b3ed815a1a50512f5ed31fc2c0",
+        "output": "\nrunning 1 test\ntest family::qwen36::cuda::card_prefill::config_tests::card_staging_respects_shard_geometry_and_live_floor ... ok\n\ntest result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 5927 filtered out; finished in 0.00s\n\n"
+      },
+      {
+        "name": "family::qwen36::cuda::prefill_plan::card_tests::card_chunk_arenas_are_narrower_and_complete",
+        "log_sha256": "9326f5ce8d64609a90988be408d04fee948aef9aa79484beb186ba6af0b97563",
+        "output": "\nrunning 1 test\ntest family::qwen36::cuda::prefill_plan::card_tests::card_chunk_arenas_are_narrower_and_complete ... ok\n\ntest result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 5927 filtered out; finished in 0.00s\n\n"
+      },
+      {
+        "name": "family::qwen36::cuda::prefill_plan::card_tests::card_combine_output_is_disjoint_from_its_inputs",
+        "log_sha256": "9ddbb349210a619ea1f303094aa29d33ea36d801cc60694d0516cf52619cc68c",
+        "output": "\nrunning 1 test\ntest family::qwen36::cuda::prefill_plan::card_tests::card_combine_output_is_disjoint_from_its_inputs ... ok\n\ntest result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 5927 filtered out; finished in 0.00s\n\n"
+      },
+      {
+        "name": "kernels::cuda::peer_ring::tests::wide_f32_exchange_does_not_extend_the_fp16_bound",
+        "log_sha256": "6b2c778e90f0b18c5d6f51f4f60daefd3e3461652cbd246ec94df9ba61e4ac65",
+        "output": "\nrunning 1 test\ntest kernels::cuda::peer_ring::tests::wide_f32_exchange_does_not_extend_the_fp16_bound ... ok\n\ntest result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 5927 filtered out; finished in 0.00s\n\n"
+      },
+      {
+        "name": "kernels::cuda::native::peer_ring::tests::fp16_retains_its_old_native_limit_before_launch",
+        "log_sha256": "30c74a3070d7a7c3f2b6b95b2ff866c5753f5e52373d00f661855732348478e0",
+        "output": "\nrunning 1 test\ntest kernels::cuda::native::peer_ring::tests::fp16_retains_its_old_native_limit_before_launch ... ok\n\ntest result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 5927 filtered out; finished in 0.00s\n\n"
+      },
+      {
+        "name": "kernels::cuda::native::peer_ring::tests::fp32_refuses_payloads_above_the_wide_limit_before_launch",
+        "log_sha256": "b6a6d2fdcf3697d849c4f7f4dd6f3b124966207a76091043aab4c9112a365d88",
+        "output": "\nrunning 1 test\ntest kernels::cuda::native::peer_ring::tests::fp32_refuses_payloads_above_the_wide_limit_before_launch ... ok\n\ntest result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 5927 filtered out; finished in 0.00s\n\n"
+      },
+      {
+        "name": "kernels::cuda::peer_ring::tests::the_layout_aligns_every_slot_for_odd_capacities",
+        "log_sha256": "1bef7a5dbdf06a4ec585c03b9f0ea2df8aabc8ddb018dbbbe587f252e1b77a65",
+        "output": "\nrunning 1 test\ntest kernels::cuda::peer_ring::tests::the_layout_aligns_every_slot_for_odd_capacities ... ok\n\ntest result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 5927 filtered out; finished in 0.00s\n\n"
+      }
+    ]
+  },
+  "peer_correctness": {
+    "cases": [
+      {
+        "case": "wide-ring-reuse",
+        "test": "kernels::cuda::peer_ring::device_tests::wide_f32_exchanges_reuse_slots_on_physical_peers",
+        "log_sha256": "309da88a1bf32848efde94ef3561e56c61b196df971fe0296a6a2be04c0fbb8c",
+        "output": "\nrunning 1 test\ntest kernels::cuda::peer_ring::device_tests::wide_f32_exchanges_reuse_slots_on_physical_peers ... CUDA devices visible: 2\nok\n\ntest result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 5927 filtered out; finished in 0.72s\n\n"
+      },
+      {
+        "case": "chunk512",
+        "test": "family::qwen36::cuda::card_chunk_device_tests::max_card_chunk_matches_the_per_token_path_on_physical_peers",
+        "log_sha256": "95c716eeee40614f51be761ded3dda4709a2149e256350eb35c09449ef793467",
+        "output": "\nrunning 1 test\ntest family::qwen36::cuda::card_chunk_device_tests::max_card_chunk_matches_the_per_token_path_on_physical_peers ... CUDA devices visible: 2\nq36 cuda: card 0 KV8 staging: 2048 rows, 2097152 bytes\nq36 cuda: card 1 KV8 staging: 2048 rows, 2097152 bytes\ngdn_delta qualification partitioned=false\ncard_chunk_matches_the_per_token_path: 512 rows, winner 3256, chunk margin 37.4657/34.8859\nok\n\ntest result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 5927 filtered out; finished in 11.95s\n\n"
+      },
+      {
+        "case": "chunk1024",
+        "test": "family::qwen36::cuda::card_chunk_device_tests::wide_card_chunk_matches_the_per_token_path_on_physical_peers",
+        "log_sha256": "9dd362e3e3cf431869faf6007edb9fd6512e4f5bc490a23e02b073aff6d34281",
+        "output": "\nrunning 1 test\ntest family::qwen36::cuda::card_chunk_device_tests::wide_card_chunk_matches_the_per_token_path_on_physical_peers ... CUDA devices visible: 2\nq36 cuda: card 0 KV8 staging: 4096 rows, 4194304 bytes\nq36 cuda: card 1 KV8 staging: 4096 rows, 4194304 bytes\ngdn_delta qualification partitioned=false\ncard_chunk_matches_the_per_token_path: 1024 rows, winner 3256, chunk margin 37.4648/34.8862\nok\n\ntest result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 5927 filtered out; finished in 13.13s\n\n"
+      }
+    ],
+    "guard": {
+      "samples": 22,
+      "sha256": "ae59a801bdaa4e33106a84d7a575ac3bb15e475554b17ec09e930a56e95e6645",
+      "minimum_free_mib": null
+    },
+    "restoration": {
+      "reason": "original pair service ready",
+      "complete_sha256": "4504254b08166ddf68afcb00f829c8d99d8cef0f9e49114b7ec37a4cd5d25b24",
+      "restore_sha256": "ec8531c48de7e4b199aa41197040a5fa2ca12bb1cfe82410d3117e7642e3194d"
+    },
+    "summary_sha256": "8765a127d57020b929075ce3df3d3de923303f8d19e65fc3dcf3e5fd32d55991",
+    "preceding_smoke": {
+      "receipt_sha256": "e0d23c8b0fdfb88d0ce8ea164d71830d592495d3c4d85ee35503c9c2e0e9b460",
+      "guard": {
+        "samples": 10,
+        "sha256": "fb0131f3fb5cabce36633ec7453b378545fbda5e9fe6c7a837852fb273a6c065",
+        "minimum_free_mib": null
+      },
+      "restoration": {
+        "reason": "original pair service ready",
+        "complete_sha256": "b04bf9539c44c53d3c4cedb8355c630aad2cf21fa74f59e00eb8b64d91cbf79c",
+        "restore_sha256": "ec8531c48de7e4b199aa41197040a5fa2ca12bb1cfe82410d3117e7642e3194d"
+      }
+    }
+  },
+  "served_smoke": {
+    "guard": {
+      "samples": 86,
+      "sha256": "7be52c5b03384cd935eae106c5d6cc89d33da08b9828d2880055afcc98a411dd",
+      "minimum_free_mib": 1302
+    },
+    "restoration": {
+      "reason": "original pair service ready",
+      "complete_sha256": "b04bf9539c44c53d3c4cedb8355c630aad2cf21fa74f59e00eb8b64d91cbf79c",
+      "restore_sha256": "ec8531c48de7e4b199aa41197040a5fa2ca12bb1cfe82410d3117e7642e3194d"
+    },
+    "summary_sha256": "dfae9277d3d8184af82e30dd53aa6b5982ac118f0144218dd8ccb7c3d4034969"
+  },
+  "runs": [
+    {
+      "order": "control-first",
+      "comparisons": {
+        "short": {
+          "payload_sha256": "30d2e3484b1f4583f6e329fe9f8f9263e51894aa7898aa11fe107829277ee8ab",
+          "control": {
+            "samples": [
+              {
+                "request_id": "chatcmpl-0000000000000002",
+                "prompt_tokens": 524,
+                "completion_tokens": 2,
+                "reused_tokens": 0,
+                "prefill_ms": 1102.3,
+                "started_to_first_token_prompt_tokens_per_second": 475.3696815748889,
+                "complete_reply_prompt_tokens_per_second": 463.75046684803675,
+                "decode_tokens_per_second": 38.88
+              },
+              {
+                "request_id": "chatcmpl-0000000000000003",
+                "prompt_tokens": 524,
+                "completion_tokens": 2,
+                "reused_tokens": 0,
+                "prefill_ms": 1101.4,
+                "started_to_first_token_prompt_tokens_per_second": 475.75812602142724,
+                "complete_reply_prompt_tokens_per_second": 464.4879463605065,
+                "decode_tokens_per_second": 39.25
+              },
+              {
+                "request_id": "chatcmpl-0000000000000004",
+                "prompt_tokens": 524,
+                "completion_tokens": 2,
+                "reused_tokens": 0,
+                "prefill_ms": 1100.4,
+                "started_to_first_token_prompt_tokens_per_second": 476.19047619047615,
+                "complete_reply_prompt_tokens_per_second": 464.8761247074563,
+                "decode_tokens_per_second": 39.25
+              }
+            ],
+            "median_started_to_first_token_prompt_tokens_per_second": 475.75812602142724,
+            "median_complete_reply_prompt_tokens_per_second": 464.4879463605065
+          },
+          "candidate": {
+            "samples": [
+              {
+                "request_id": "chatcmpl-0000000000000002",
+                "prompt_tokens": 524,
+                "completion_tokens": 2,
+                "reused_tokens": 0,
+                "prefill_ms": 855.5,
+                "started_to_first_token_prompt_tokens_per_second": 612.5073056691994,
+                "complete_reply_prompt_tokens_per_second": 593.0043592610532,
+                "decode_tokens_per_second": 37.63
+              },
+              {
+                "request_id": "chatcmpl-0000000000000003",
+                "prompt_tokens": 524,
+                "completion_tokens": 2,
+                "reused_tokens": 0,
+                "prefill_ms": 852.2,
+                "started_to_first_token_prompt_tokens_per_second": 614.8791363529688,
+                "complete_reply_prompt_tokens_per_second": 595.8364224343784,
+                "decode_tokens_per_second": 39.01
+              },
+              {
+                "request_id": "chatcmpl-0000000000000004",
+                "prompt_tokens": 524,
+                "completion_tokens": 2,
+                "reused_tokens": 0,
+                "prefill_ms": 851.1,
+                "started_to_first_token_prompt_tokens_per_second": 615.6738338620609,
+                "complete_reply_prompt_tokens_per_second": 596.4882324482768,
+                "decode_tokens_per_second": 39.04
+              }
+            ],
+            "median_started_to_first_token_prompt_tokens_per_second": 614.8791363529688,
+            "median_complete_reply_prompt_tokens_per_second": 595.8364224343784
+          },
+          "started_to_first_token_speedup": 1.292419619807557,
+          "timing_note": "Server timing runs from job start to first emitted batch and includes first-token generation; client timing runs to the complete reply.",
+          "answer_sha256": "4b227777d4dd1fc61c6f884f48641d02b4d121d3fd328cb08b5531fcacdabf8a"
+        },
+        "long": {
+          "payload_sha256": "83bc090b8c20bbf350317d552c592dd83fd0f8a0e9505c1ed895b914be94e890",
+          "control": {
+            "samples": [
+              {
+                "request_id": "chatcmpl-0000000000000005",
+                "prompt_tokens": 4274,
+                "completion_tokens": 2,
+                "reused_tokens": 0,
+                "prefill_ms": 7827.6,
+                "started_to_first_token_prompt_tokens_per_second": 546.0166590014819,
+                "complete_reply_prompt_tokens_per_second": 543.8742629892928,
+                "decode_tokens_per_second": 38.89
+              },
+              {
+                "request_id": "chatcmpl-0000000000000006",
+                "prompt_tokens": 4274,
+                "completion_tokens": 2,
+                "reused_tokens": 0,
+                "prefill_ms": 7826.8,
+                "started_to_first_token_prompt_tokens_per_second": 546.0724689528288,
+                "complete_reply_prompt_tokens_per_second": 543.9684727378758,
+                "decode_tokens_per_second": 38.77
+              },
+              {
+                "request_id": "chatcmpl-0000000000000007",
+                "prompt_tokens": 4274,
+                "completion_tokens": 2,
+                "reused_tokens": 0,
+                "prefill_ms": 7831.2,
+                "started_to_first_token_prompt_tokens_per_second": 545.7656553274084,
+                "complete_reply_prompt_tokens_per_second": 543.6467990091738,
+                "decode_tokens_per_second": 38.53
+              }
+            ],
+            "median_started_to_first_token_prompt_tokens_per_second": 546.0166590014819,
+            "median_complete_reply_prompt_tokens_per_second": 543.8742629892928
+          },
+          "candidate": {
+            "samples": [
+              {
+                "request_id": "chatcmpl-0000000000000005",
+                "prompt_tokens": 4274,
+                "completion_tokens": 2,
+                "reused_tokens": 0,
+                "prefill_ms": 4686.8,
+                "started_to_first_token_prompt_tokens_per_second": 911.9228471451736,
+                "complete_reply_prompt_tokens_per_second": 905.4444028748812,
+                "decode_tokens_per_second": 37.91
+              },
+              {
+                "request_id": "chatcmpl-0000000000000006",
+                "prompt_tokens": 4274,
+                "completion_tokens": 2,
+                "reused_tokens": 0,
+                "prefill_ms": 4694.4,
+                "started_to_first_token_prompt_tokens_per_second": 910.4464894342195,
+                "complete_reply_prompt_tokens_per_second": 904.4847970792378,
+                "decode_tokens_per_second": 38.68
+              },
+              {
+                "request_id": "chatcmpl-0000000000000007",
+                "prompt_tokens": 4274,
+                "completion_tokens": 2,
+                "reused_tokens": 0,
+                "prefill_ms": 4682.2,
+                "started_to_first_token_prompt_tokens_per_second": 912.8187604117722,
+                "complete_reply_prompt_tokens_per_second": 906.5383174699733,
+                "decode_tokens_per_second": 38.91
+              }
+            ],
+            "median_started_to_first_token_prompt_tokens_per_second": 911.9228471451736,
+            "median_complete_reply_prompt_tokens_per_second": 905.4444028748812
+          },
+          "started_to_first_token_speedup": 1.6701374071861397,
+          "timing_note": "Server timing runs from job start to first emitted batch and includes first-token generation; client timing runs to the complete reply.",
+          "answer_sha256": "4b227777d4dd1fc61c6f884f48641d02b4d121d3fd328cb08b5531fcacdabf8a"
+        },
+        "decode": {
+          "control_median_tokens_per_second": 38.91,
+          "candidate_median_tokens_per_second": 38.95,
+          "speedup": 1.0010280133641738,
+          "payload_sha256": "bacd82b581ce7dd5cb38dde1bb3004787b2327dab7ae6d4d6b3d25a6df747f3e",
+          "samples": {
+            "control": [
+              {
+                "request_id": "chatcmpl-0000000000000008",
+                "prompt_tokens": 31,
+                "completion_tokens": 128,
+                "finish_reason": "length",
+                "answer_sha256": "ef5d7dd6bee907301e7cdb774195e953c37a82af6e8bde4afacc7b1ed065113b",
+                "time_to_first_token_ms": 266.1,
+                "decode_tokens_per_second": 38.88,
+                "total_seconds": 3.53388
+              },
+              {
+                "request_id": "chatcmpl-0000000000000009",
+                "prompt_tokens": 31,
+                "completion_tokens": 128,
+                "finish_reason": "length",
+                "answer_sha256": "ef5d7dd6bee907301e7cdb774195e953c37a82af6e8bde4afacc7b1ed065113b",
+                "time_to_first_token_ms": 265.6,
+                "decode_tokens_per_second": 38.93,
+                "total_seconds": 3.528763
+              },
+              {
+                "request_id": "chatcmpl-000000000000000a",
+                "prompt_tokens": 31,
+                "completion_tokens": 128,
+                "finish_reason": "length",
+                "answer_sha256": "ef5d7dd6bee907301e7cdb774195e953c37a82af6e8bde4afacc7b1ed065113b",
+                "time_to_first_token_ms": 266.6,
+                "decode_tokens_per_second": 38.91,
+                "total_seconds": 3.531208
+              }
+            ],
+            "candidate": [
+              {
+                "request_id": "chatcmpl-0000000000000008",
+                "prompt_tokens": 31,
+                "completion_tokens": 128,
+                "finish_reason": "length",
+                "answer_sha256": "ef5d7dd6bee907301e7cdb774195e953c37a82af6e8bde4afacc7b1ed065113b",
+                "time_to_first_token_ms": 277.4,
+                "decode_tokens_per_second": 38.83,
+                "total_seconds": 3.54932
+              },
+              {
+                "request_id": "chatcmpl-0000000000000009",
+                "prompt_tokens": 31,
+                "completion_tokens": 128,
+                "finish_reason": "length",
+                "answer_sha256": "ef5d7dd6bee907301e7cdb774195e953c37a82af6e8bde4afacc7b1ed065113b",
+                "time_to_first_token_ms": 274.6,
+                "decode_tokens_per_second": 39.03,
+                "total_seconds": 3.529291
+              },
+              {
+                "request_id": "chatcmpl-000000000000000a",
+                "prompt_tokens": 31,
+                "completion_tokens": 128,
+                "finish_reason": "length",
+                "answer_sha256": "ef5d7dd6bee907301e7cdb774195e953c37a82af6e8bde4afacc7b1ed065113b",
+                "time_to_first_token_ms": 274.6,
+                "decode_tokens_per_second": 38.95,
+                "total_seconds": 3.536317
+              }
+            ]
+          }
+        }
+      },
+      "artifact_sha256": {
+        "control-short.json": "c0cf45a9c4136739106431a49f0ccb4e72a2f7578c2c231743618b56861eeb7c",
+        "candidate-short.json": "d1440f2f27d7a3d6899c1c3b1710ca4394772d4da54b09be7176abdfd2a44a16",
+        "control-long.json": "b3c5f716940e8f637650079de427decc28489f7f3909df98c041f27b88f59417",
+        "candidate-long.json": "212e9f981192ef515e8be46e8b78316134c7c9b73f1ced50305ac337883302de",
+        "control-decode.json": "7f4574e9a08521215ea5a6f3d0d592b3b38be6abf033ce57905a36021ff0c7f1",
+        "control-engine.log": "3a9ca368111edf8341087dd2c64ede4a2a191faf14110142c1d4b292e5c3a4f5",
+        "candidate-decode.json": "c3eae4b52bc49611ecbc34e3f2898197af8753257a4ccbba5f584ef0cbbdceaf",
+        "candidate-engine.log": "e21f8ddcbf0fac6b1875efd8f9cd87073beb0b3ba8fad0c38a7ba7f00c98aadc"
+      },
+      "free_mib_after_warmup": {
+        "control": {
+          "GPU-282e266a-24ac-6fa8-a16d-4281e52b4c0a": 1475,
+          "GPU-704fef60-5280-9b88-fa3d-d11135caf576": 1368
+        },
+        "candidate": {
+          "GPU-282e266a-24ac-6fa8-a16d-4281e52b4c0a": 1409,
+          "GPU-704fef60-5280-9b88-fa3d-d11135caf576": 1302
+        }
+      },
+      "guard": {
+        "samples": 221,
+        "sha256": "57ca06237975ed3b6cc7827879fb29af5033dbfd5455bc0815dddae08b3c524b",
+        "minimum_free_mib": 1302
+      },
+      "restoration": {
+        "reason": "original pair service ready",
+        "complete_sha256": "4504254b08166ddf68afcb00f829c8d99d8cef0f9e49114b7ec37a4cd5d25b24",
+        "restore_sha256": "ec8531c48de7e4b199aa41197040a5fa2ca12bb1cfe82410d3117e7642e3194d"
+      },
+      "summary_sha256": "bbb754b14fc3d5639805569c52f03922cbfde9099d522d6b176477e8882c59bc"
+    },
+    {
+      "order": "candidate-first",
+      "comparisons": {
+        "short": {
+          "payload_sha256": "30d2e3484b1f4583f6e329fe9f8f9263e51894aa7898aa11fe107829277ee8ab",
+          "control": {
+            "samples": [
+              {
+                "request_id": "chatcmpl-0000000000000002",
+                "prompt_tokens": 524,
+                "completion_tokens": 2,
+                "reused_tokens": 0,
+                "prefill_ms": 1104.3,
+                "started_to_first_token_prompt_tokens_per_second": 474.5087385674183,
+                "complete_reply_prompt_tokens_per_second": 463.2404553901209,
+                "decode_tokens_per_second": 39.43
+              },
+              {
+                "request_id": "chatcmpl-0000000000000003",
+                "prompt_tokens": 524,
+                "completion_tokens": 2,
+                "reused_tokens": 0,
+                "prefill_ms": 1100.4,
+                "started_to_first_token_prompt_tokens_per_second": 476.19047619047615,
+                "complete_reply_prompt_tokens_per_second": 464.86210273807325,
+                "decode_tokens_per_second": 39.14
+              },
+              {
+                "request_id": "chatcmpl-0000000000000004",
+                "prompt_tokens": 524,
+                "completion_tokens": 2,
+                "reused_tokens": 0,
+                "prefill_ms": 1101.5,
+                "started_to_first_token_prompt_tokens_per_second": 475.71493418066274,
+                "complete_reply_prompt_tokens_per_second": 464.3060308391357,
+                "decode_tokens_per_second": 38.6
+              }
+            ],
+            "median_started_to_first_token_prompt_tokens_per_second": 475.71493418066274,
+            "median_complete_reply_prompt_tokens_per_second": 464.3060308391357
+          },
+          "candidate": {
+            "samples": [
+              {
+                "request_id": "chatcmpl-0000000000000002",
+                "prompt_tokens": 524,
+                "completion_tokens": 2,
+                "reused_tokens": 0,
+                "prefill_ms": 845.8,
+                "started_to_first_token_prompt_tokens_per_second": 619.5318042090329,
+                "complete_reply_prompt_tokens_per_second": 600.1383525056922,
+                "decode_tokens_per_second": 38.8
+              },
+              {
+                "request_id": "chatcmpl-0000000000000003",
+                "prompt_tokens": 524,
+                "completion_tokens": 2,
+                "reused_tokens": 0,
+                "prefill_ms": 846.6,
+                "started_to_first_token_prompt_tokens_per_second": 618.946373730215,
+                "complete_reply_prompt_tokens_per_second": 599.895819619112,
+                "decode_tokens_per_second": 38.99
+              },
+              {
+                "request_id": "chatcmpl-0000000000000004",
+                "prompt_tokens": 524,
+                "completion_tokens": 2,
+                "reused_tokens": 0,
+                "prefill_ms": 845.3,
+                "started_to_first_token_prompt_tokens_per_second": 619.8982609724359,
+                "complete_reply_prompt_tokens_per_second": 600.6694483928653,
+                "decode_tokens_per_second": 38.94
+              }
+            ],
+            "median_started_to_first_token_prompt_tokens_per_second": 619.5318042090329,
+            "median_complete_reply_prompt_tokens_per_second": 600.1383525056922
+          },
+          "started_to_first_token_speedup": 1.3023173327027666,
+          "timing_note": "Server timing runs from job start to first emitted batch and includes first-token generation; client timing runs to the complete reply.",
+          "answer_sha256": "4b227777d4dd1fc61c6f884f48641d02b4d121d3fd328cb08b5531fcacdabf8a"
+        },
+        "long": {
+          "payload_sha256": "83bc090b8c20bbf350317d552c592dd83fd0f8a0e9505c1ed895b914be94e890",
+          "control": {
+            "samples": [
+              {
+                "request_id": "chatcmpl-0000000000000005",
+                "prompt_tokens": 4274,
+                "completion_tokens": 2,
+                "reused_tokens": 0,
+                "prefill_ms": 7823.7,
+                "started_to_first_token_prompt_tokens_per_second": 546.2888403185194,
+                "complete_reply_prompt_tokens_per_second": 544.116325297539,
+                "decode_tokens_per_second": 38.98
+              },
+              {
+                "request_id": "chatcmpl-0000000000000006",
+                "prompt_tokens": 4274,
+                "completion_tokens": 2,
+                "reused_tokens": 0,
+                "prefill_ms": 7824.4,
+                "started_to_first_token_prompt_tokens_per_second": 546.2399672818364,
+                "complete_reply_prompt_tokens_per_second": 544.140293983443,
+                "decode_tokens_per_second": 38.91
+              },
+              {
+                "request_id": "chatcmpl-0000000000000007",
+                "prompt_tokens": 4274,
+                "completion_tokens": 2,
+                "reused_tokens": 0,
+                "prefill_ms": 7826.9,
+                "started_to_first_token_prompt_tokens_per_second": 546.0654920849889,
+                "complete_reply_prompt_tokens_per_second": 543.9161376507429,
+                "decode_tokens_per_second": 38.78
+              }
+            ],
+            "median_started_to_first_token_prompt_tokens_per_second": 546.2399672818364,
+            "median_complete_reply_prompt_tokens_per_second": 544.116325297539
+          },
+          "candidate": {
+            "samples": [
+              {
+                "request_id": "chatcmpl-0000000000000005",
+                "prompt_tokens": 4274,
+                "completion_tokens": 2,
+                "reused_tokens": 0,
+                "prefill_ms": 4674.1,
+                "started_to_first_token_prompt_tokens_per_second": 914.4006332769944,
+                "complete_reply_prompt_tokens_per_second": 908.37331465295,
+                "decode_tokens_per_second": 39.0
+              },
+              {
+                "request_id": "chatcmpl-0000000000000006",
+                "prompt_tokens": 4274,
+                "completion_tokens": 2,
+                "reused_tokens": 0,
+                "prefill_ms": 4674.8,
+                "started_to_first_token_prompt_tokens_per_second": 914.2637118165483,
+                "complete_reply_prompt_tokens_per_second": 908.3939726338346,
+                "decode_tokens_per_second": 38.89
+              },
+              {
+                "request_id": "chatcmpl-0000000000000007",
+                "prompt_tokens": 4274,
+                "completion_tokens": 2,
+                "reused_tokens": 0,
+                "prefill_ms": 4679.2,
+                "started_to_first_token_prompt_tokens_per_second": 913.4040006838776,
+                "complete_reply_prompt_tokens_per_second": 907.5971016351612,
+                "decode_tokens_per_second": 38.94
+              }
+            ],
+            "median_started_to_first_token_prompt_tokens_per_second": 914.2637118165483,
+            "median_complete_reply_prompt_tokens_per_second": 908.37331465295
+          },
+          "started_to_first_token_speedup": 1.6737400530503976,
+          "timing_note": "Server timing runs from job start to first emitted batch and includes first-token generation; client timing runs to the complete reply.",
+          "answer_sha256": "4b227777d4dd1fc61c6f884f48641d02b4d121d3fd328cb08b5531fcacdabf8a"
+        },
+        "decode": {
+          "control_median_tokens_per_second": 38.99,
+          "candidate_median_tokens_per_second": 39.01,
+          "speedup": 1.0005129520389842,
+          "payload_sha256": "bacd82b581ce7dd5cb38dde1bb3004787b2327dab7ae6d4d6b3d25a6df747f3e",
+          "samples": {
+            "control": [
+              {
+                "request_id": "chatcmpl-0000000000000008",
+                "prompt_tokens": 31,
+                "completion_tokens": 128,
+                "finish_reason": "length",
+                "answer_sha256": "ef5d7dd6bee907301e7cdb774195e953c37a82af6e8bde4afacc7b1ed065113b",
+                "time_to_first_token_ms": 265.8,
+                "decode_tokens_per_second": 38.99,
+                "total_seconds": 3.523887
+              },
+              {
+                "request_id": "chatcmpl-0000000000000009",
+                "prompt_tokens": 31,
+                "completion_tokens": 128,
+                "finish_reason": "length",
+                "answer_sha256": "ef5d7dd6bee907301e7cdb774195e953c37a82af6e8bde4afacc7b1ed065113b",
+                "time_to_first_token_ms": 267.0,
+                "decode_tokens_per_second": 38.92,
+                "total_seconds": 3.530864
+              },
+              {
+                "request_id": "chatcmpl-000000000000000a",
+                "prompt_tokens": 31,
+                "completion_tokens": 128,
+                "finish_reason": "length",
+                "answer_sha256": "ef5d7dd6bee907301e7cdb774195e953c37a82af6e8bde4afacc7b1ed065113b",
+                "time_to_first_token_ms": 265.6,
+                "decode_tokens_per_second": 39.07,
+                "total_seconds": 3.516807
+              }
+            ],
+            "candidate": [
+              {
+                "request_id": "chatcmpl-0000000000000008",
+                "prompt_tokens": 31,
+                "completion_tokens": 128,
+                "finish_reason": "length",
+                "answer_sha256": "ef5d7dd6bee907301e7cdb774195e953c37a82af6e8bde4afacc7b1ed065113b",
+                "time_to_first_token_ms": 274.9,
+                "decode_tokens_per_second": 39.09,
+                "total_seconds": 3.524664
+              },
+              {
+                "request_id": "chatcmpl-0000000000000009",
+                "prompt_tokens": 31,
+                "completion_tokens": 128,
+                "finish_reason": "length",
+                "answer_sha256": "ef5d7dd6bee907301e7cdb774195e953c37a82af6e8bde4afacc7b1ed065113b",
+                "time_to_first_token_ms": 273.9,
+                "decode_tokens_per_second": 39.01,
+                "total_seconds": 3.530625
+              },
+              {
+                "request_id": "chatcmpl-000000000000000a",
+                "prompt_tokens": 31,
+                "completion_tokens": 128,
+                "finish_reason": "length",
+                "answer_sha256": "ef5d7dd6bee907301e7cdb774195e953c37a82af6e8bde4afacc7b1ed065113b",
+                "time_to_first_token_ms": 274.6,
+                "decode_tokens_per_second": 38.87,
+                "total_seconds": 3.542562
+              }
+            ]
+          }
+        }
+      },
+      "artifact_sha256": {
+        "control-short.json": "5489cfb760379bf856992c63bb4a43d306b7c56a6b5fc7a7932cdcc26b31551f",
+        "candidate-short.json": "080a29d769fd5246db78f0fa211ff6677d6c64bdc7e3fb9053ede3ec125da105",
+        "control-long.json": "d99f667bc2116aace74294eeecf3a15f3c25a152c49d88d7c0cc7c0f59d8bf4b",
+        "candidate-long.json": "1fdef52c7037c65917e62bbb2b79ef9ab68408b8c22db85a615f224ea7ce6476",
+        "control-decode.json": "1983befefd450981e7fd4d7bdd9749ab5d520a08243a46e0369739a4d007c79f",
+        "control-engine.log": "2b0a32474879eb8f7e2f1492c4f9c0c2c0dec963e555d0934d3b13e99052a5c8",
+        "candidate-decode.json": "3a80a392b7aac2daacf79ca79e84c0deea6adebaece2955de0d159e20acbb623",
+        "candidate-engine.log": "8f7713bb0e0b79a559a157297df9b95405ed3f1594354d8c2faed7803d6a315e"
+      },
+      "free_mib_after_warmup": {
+        "candidate": {
+          "GPU-282e266a-24ac-6fa8-a16d-4281e52b4c0a": 1409,
+          "GPU-704fef60-5280-9b88-fa3d-d11135caf576": 1302
+        },
+        "control": {
+          "GPU-282e266a-24ac-6fa8-a16d-4281e52b4c0a": 1475,
+          "GPU-704fef60-5280-9b88-fa3d-d11135caf576": 1368
+        }
+      },
+      "guard": {
+        "samples": 219,
+        "sha256": "0b8e085bbea6d4a7d342ebae8812836162392d325e926b6371f32ba692b86b4f",
+        "minimum_free_mib": 1302
+      },
+      "restoration": {
+        "reason": "original pair service ready",
+        "complete_sha256": "4504254b08166ddf68afcb00f829c8d99d8cef0f9e49114b7ec37a4cd5d25b24",
+        "restore_sha256": "ec8531c48de7e4b199aa41197040a5fa2ca12bb1cfe82410d3117e7642e3194d"
+      },
+      "summary_sha256": "d1f8a2f55aaadceadc11e027c60021f8cc0c16e6c073e2cae9812ec744d4fdef"
+    }
+  ],
+  "secondary_service_unchanged": {
+    "ready": true,
+    "fingerprint_sha256": {
+      "executable": "7ecc29185c3ff4b0cf29df8d6e39f1be5446f93bbf8128f8d8049377fcef1490",
+      "start": "67fce39d8ed2ec714da6f252e9bd0fd0e1dbc30dc6e0b83bf101b49f10c8000f",
+      "config": "821a91e6d0a763a31f4676d6bab5c8bfd5f2739737e05c612deece673cbd430f"
+    }
+  },
+  "measurement_driver_sha256": {
+    "scripts/bench_p2p_prefill.py": "90ae74c68eaa3f0c92aa212965818f3dbe6f4cd89c9c0843f6d40e93880b9c1b",
+    "scripts/bench_p2p_decode.py": "be5013449dc88b24e6fbc67dbfe323518ba6a30e281dfbd9d0a3638d58f11ee7",
+    "compare_prefill.py": "60c46fbd0bf5441ba0858c250cebcdb412d1ec31f8b74ce4e3ac202e2efd1218"
+  },
+  "proof_snapshot_sha256": {
+    "benchmark_harness.py.txt": "96dcf2e633b14e43c40156e6c93177b6a72c1f1f5f0565f9455fbfad6094e80b",
+    "compare_prefill.py": "60c46fbd0bf5441ba0858c250cebcdb412d1ec31f8b74ce4e3ac202e2efd1218",
+    "bench_p2p_decode.py": "be5013449dc88b24e6fbc67dbfe323518ba6a30e281dfbd9d0a3638d58f11ee7",
+    "bench_p2p_prefill.py": "90ae74c68eaa3f0c92aa212965818f3dbe6f4cd89c9c0843f6d40e93880b9c1b",
+    "peer_harness.py.txt": "d925ee008ed77a70106d894585e9c8382629815ad189b0d38990a2347706b1bc"
+  },
+  "limitations": [
+    "Synthetic single prompts; three samples per arm and order do not characterize general workloads.",
+    "Server prefill timing runs from job start through the first emitted batch, including first-token generation.",
+    "The decode sample is a deterministic 31-token prompt with 128 completion tokens; matching hashes cover only this output.",
+    "Configured 262144 context was not filled. No 128k/256k recall, coding-session quality, or production qualification is established.",
+    "The peer matrix order was changed after the peer smoke to run wide ring reuse first; the smoke test, source binary and settings were unchanged. Benchmark harness hashes were recorded before the served smoke and checked after each order.",
+    "The snapshot is host-specific and depends on local guarded-runner infrastructure and scratch artifacts; it is not a portable standalone benchmark.",
+    "The tiered-upload main base has separate unresolved broad-test history; these P2P checks do not qualify that base. The 1024-row candidate was not tested at 128k or 256k."
+  ]
+}
