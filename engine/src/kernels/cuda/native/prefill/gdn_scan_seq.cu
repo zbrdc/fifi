@@ -709,10 +709,11 @@ __device__ __forceinline__ unsigned smem_addr(const void *p) {
 // The A fragment (16x16 halves, row-major source): lanes 0-7 name the rows of the
 // (rows 0-7, cols 0-7) block, lanes 8-15 rows 8-15, lanes 16-23 the col+8 halves of rows
 // 0-7, lanes 24-31 the same of rows 8-15.
+template <int Stride>
 __device__ __forceinline__ void ldm_a(const __half *m, int row, int col, unsigned (&r)[4]) {
     const int lr = row + (threadIdx.x & 7) + 8 * ((threadIdx.x >> 3) & 1);
     const int lc = col + 8 * (threadIdx.x >> 4);
-    const unsigned addr = smem_addr(m + (size_t)lr * kHpad + lc);
+    const unsigned addr = smem_addr(m + (size_t)lr * Stride + lc);
     asm volatile("ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%0,%1,%2,%3}, [%4];\n"
                  : "=r"(r[0]), "=r"(r[1]), "=r"(r[2]), "=r"(r[3])
                  : "r"(addr));
@@ -720,10 +721,11 @@ __device__ __forceinline__ void ldm_a(const __half *m, int row, int col, unsigne
 // The B fragment (16x8 halves, from a row-major [n][k] source): the non-trans load already
 // lands lane l on {B[2(l%4)][n0+l/4], B[2(l%4)+1][n0+l/4]} — the trans form is for [k][n]
 // sources. Lanes 0-7 name source rows n0..n0+7 at k, lanes 8-15 the same rows at k+8.
+template <int Stride>
 __device__ __forceinline__ void ldm_b(const __half *m, int row, int col, unsigned (&r)[2]) {
     const int lr = row + (threadIdx.x & 7);
     const int lc = col + 8 * ((threadIdx.x >> 3) & 1);
-    const unsigned addr = smem_addr(m + (size_t)lr * kHpad + lc);
+    const unsigned addr = smem_addr(m + (size_t)lr * Stride + lc);
     asm volatile("ldmatrix.sync.aligned.m8n8.x2.shared.b16 {%0,%1}, [%2];\n"
                  : "=r"(r[0]), "=r"(r[1])
                  : "r"(addr));
@@ -846,10 +848,47 @@ __global__ void __launch_bounds__(kLanes * kChunkWarps, 1) gdn_scan_chunk_k(Scan
             B_s[lane] = pre;
         }
         __syncthreads();  // P's writes are visible to G, M1 and the serial pass
-        // G, the two kC×kC coefficient matrices, as an element list: thread e owns element
-        // e (e < kC is A's diagonal t = e; e ≥ kC is the strict-lower pair (t, s) numbered
-        // down from (kC−1, kC−2)). Each element takes its own running ratio product — never
-        // a division: B_t underflows fp32 long before the ratio does.
+        // G, the two kC×kC coefficient matrices. sm_80+: both dots on the tensor cores —
+        // warps 0-7 own the kk tiles (K-hat rows × K-hatᵀ), warps 8-15 the qk tiles (Q-hat
+        // rows × K-hatᵀ; K-hatᵀ comes from the same row-major splits through the non-trans B
+        // load), and each lane folds its own running ratio product — never a division: B_t
+        // underflows fp32 long before the ratio does. sm_72 keeps the joined element walk.
+#if __CUDA_ARCH__ >= 800
+        {
+            const int t0w = 16 * ((w & 7) >> 2), s0w = 8 * (w & 3);
+            float d[4] = {0.f, 0.f, 0.f, 0.f};
+            const __half *ar_h = (w < 8) ? kh_h : q_h;
+            const __half *ar_l = (w < 8) ? kh_l : q_l;
+            for (int r0 = 0; r0 < D; r0 += 16) {
+                unsigned aH[4], aL[4], bH[2], bL[2];
+                ldm_a<kHpad>(ar_h, t0w, r0, aH);
+                ldm_a<kHpad>(ar_l, t0w, r0, aL);
+                ldm_b<kHpad>(kh_h, s0w, r0, bH);
+                ldm_b<kHpad>(kh_l, s0w, r0, bL);
+                mma_16816(d, aH, bH[0], bH[1]);
+                mma_16816(d, aH, bL[0], bL[1]);
+                mma_16816(d, aL, bH[0], bH[1]);
+            }
+            const bool is_kk = w < 8;
+            const int r0 = lane >> 2, cc = 2 * (lane & 3);
+#pragma unroll
+            for (int e = 0; e < 4; ++e) {
+                const int t = t0w + r0 + 8 * (e >> 1);
+                const int s = s0w + cc + (e & 1);
+                if (s > t || t >= len) continue;
+                float ratio = 1.f;
+                for (int i = s + 1; i <= t; ++i) ratio *= dec_s[i];
+                if (s != t) {
+                    if (is_kk)
+                        G_s[t * kCpad + s] = b_s[t] * ratio * d[e];
+                    else
+                        A_s[t * kCpad + s] = ratio * d[e];
+                } else if (!is_kk) {
+                    A_s[t * kCpad + t] = d[e];
+                }
+            }
+        }
+#else
         for (int e = tid; e < kC * (kC + 1) / 2; e += kLanes * kChunkWarps) {
             int t, s;
             if (e < kC) {
@@ -879,6 +918,7 @@ __global__ void __launch_bounds__(kLanes * kChunkWarps, 1) gdn_scan_chunk_k(Scan
                 A_s[t * kCpad + t] = qk;
             }
         }
+#endif
         __syncthreads();  // G's writes are visible to the serial pass and M2
         // M1, every state-seen term of the sub-chunk in one pass. sm_80+: one tensor-core
         // tile per warp — warp w owns the 16x8 (t, c) block t0 = 16·(w>>3), c0 = 8·(w&7);
@@ -890,10 +930,10 @@ __global__ void __launch_bounds__(kLanes * kChunkWarps, 1) gdn_scan_chunk_k(Scan
             float d[4] = {0.f, 0.f, 0.f, 0.f};
             for (int r0 = 0; r0 < D; r0 += 16) {
                 unsigned aH[4], aL[4], bH[2], bL[2];
-                ldm_a(kh_h, t0w, r0, aH);
-                ldm_a(kh_l, t0w, r0, aL);
-                ldm_b(S_h, c0w, r0, bH);
-                ldm_b(S_l, c0w, r0, bL);
+                ldm_a<kHpad>(kh_h, t0w, r0, aH);
+                ldm_a<kHpad>(kh_l, t0w, r0, aL);
+                ldm_b<kHpad>(S_h, c0w, r0, bH);
+                ldm_b<kHpad>(S_l, c0w, r0, bL);
                 mma_16816(d, aH, bH[0], bH[1]);
                 mma_16816(d, aH, bL[0], bL[1]);
                 mma_16816(d, aL, bH[0], bH[1]);
@@ -960,10 +1000,10 @@ __global__ void __launch_bounds__(kLanes * kChunkWarps, 1) gdn_scan_chunk_k(Scan
             float d[4] = {0.f, 0.f, 0.f, 0.f};
             for (int r0 = 0; r0 < D; r0 += 16) {
                 unsigned aH[4], aL[4], bH[2], bL[2];
-                ldm_a(q_h, t0w, r0, aH);
-                ldm_a(q_l, t0w, r0, aL);
-                ldm_b(S_h, c0w, r0, bH);
-                ldm_b(S_l, c0w, r0, bL);
+                ldm_a<kHpad>(q_h, t0w, r0, aH);
+                ldm_a<kHpad>(q_l, t0w, r0, aL);
+                ldm_b<kHpad>(S_h, c0w, r0, bH);
+                ldm_b<kHpad>(S_l, c0w, r0, bL);
                 mma_16816(d, aH, bH[0], bH[1]);
                 mma_16816(d, aH, bL[0], bL[1]);
                 mma_16816(d, aL, bH[0], bH[1]);
