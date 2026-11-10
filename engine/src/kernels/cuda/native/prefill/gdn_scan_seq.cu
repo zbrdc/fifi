@@ -688,7 +688,7 @@ constexpr int kCHpad = 40;      // halves per value-major split row of U: kC + 8
 // three gate vectors.
 constexpr size_t kChunkSmem =
     (4 * kC + 2 * kCols) * kHpad * sizeof(__half) +
-    (2 * kC * kCHpad + 2 * kCols * kCHpad) * sizeof(__half) +
+    (2 * kC + 4 * kCols) * kCHpad * sizeof(__half) +
     (kC * kCpad + 3 * kC) * sizeof(float);
 static_assert(kChunkSmem < 96 * 1024, "sm_72 caps opt-in shared memory at 96KB per block");
 static_assert(kHpad >= D, "r-major half rows must hold a full D row");
@@ -759,6 +759,17 @@ __device__ __forceinline__ void ldm_bs(const __half *m, int row, int col, unsign
                  : "=r"(r[0]), "=r"(r[1])
                  : "r"(addr));
 }
+// The trans B load for a row-major [k][n] source (the update's K-hat rows), swizzled:
+// the x2 load's two 8x8 tiles stack along k, so the 16 lanes address 16 source rows at
+// one n chunk — not the same 8 rows at two chunks like the non-trans form.
+template <int Stride>
+__device__ __forceinline__ void ldm_bts(const __half *m, int row, int col, unsigned (&r)[2]) {
+    const int lr = row + (threadIdx.x & 15);
+    const unsigned addr = smem_addr(m + swr(lr, col));
+    asm volatile("ldmatrix.sync.aligned.m8n8.x2.trans.shared.b16 {%0,%1}, [%2];\n"
+                 : "=r"(r[0]), "=r"(r[1])
+                 : "r"(addr));
+}
 // D (16x8 f32) += A (16x16 f16, row) * B (16x8 f16, col).
 __device__ __forceinline__ void mma_16816(float *d, const unsigned *a, unsigned b0, unsigned b1) {
     asm volatile(
@@ -782,7 +793,9 @@ __global__ void __launch_bounds__(kLanes * kChunkWarps, 1) gdn_scan_chunk_k(Scan
     __half *const U_l = U_h + kCols * kCHpad;             // U lo
     __half *const A_h = U_l + kCols * kCHpad;             // A hi [kC][kCHpad] (upper zero, rows ≥ len zero)
     __half *const A_l = A_h + kC * kCHpad;                // A lo
-    float *const G_s = reinterpret_cast<float *>(A_l + kC * kCHpad);  // G[t][s] = b_t·(B_t/B_s)·(k_t·k_s), s < t
+    __half *const UB_h = A_l + kC * kCHpad;              // tail-ratio-scaled U hi [kCols][kCHpad]
+    __half *const UB_l = UB_h + kCols * kCHpad;          // ... lo (zero past the ragged tail)
+    float *const G_s = reinterpret_cast<float *>(UB_l + kCols * kCHpad);  // G[t][s] = b_t·(B_t/B_s)·(k_t·k_s), s < t
     float *const dec_s = G_s + kC * kCpad;         // the decay gates a_t
     float *const b_s = dec_s + kC;                 // the beta gates
     float *const B_s = b_s + kC;                   // the prefix products B_t
@@ -1103,6 +1116,44 @@ __global__ void __launch_bounds__(kLanes * kChunkWarps, 1) gdn_scan_chunk_k(Scan
         }
         __syncthreads();
         const float b_end = B_s[0] * dec_s[0];
+#if __CUDA_ARCH__ >= 800
+        // Stage the tail-ratio-scaled U as splits; rows past the ragged tail pair the
+        // stale K-hat clones with exact zeros, so the full-window contraction is clean.
+        for (int i = tid; i < kCols * kC; i += kLanes * kChunkWarps) {
+            const int c = i / kC, s = i % kC;
+            f2s_at(s < len ? B_s[s] * j2(U_h, U_l, c * kCHpad + s) : 0.f, UB_h, UB_l,
+                   c * kCHpad + s);
+        }
+        __syncthreads();
+        {
+            // the update on the tensor cores: S ← b_end·S + K̂ᵀ·UB as m16n8k16 tiles —
+            // warp w owns the c rows c0w = 16·(w>>2) and the r tiles r0w = 8·(w&3) + 32·i,
+            // with UB's value-major rows in the A fragments and K-hat's [s][r] rows in the
+            // trans B fragments. The epilogue folds b_end·S_old in and re-splits S in place.
+            const int c0w = 16 * (w >> 2);
+            for (int i = 0; i < D / 32; ++i) {
+                const int r0w = 8 * (w & 3) + 32 * i;
+                float d[4] = {0.f, 0.f, 0.f, 0.f};
+                for (int s0 = 0; s0 < kC; s0 += 16) {
+                    unsigned aH[4], aL[4], bH[2], bL[2];
+                    ldm_a<kCHpad>(UB_h, c0w, s0, aH);
+                    ldm_a<kCHpad>(UB_l, c0w, s0, aL);
+                    ldm_bts<kHpad>(kh_h, s0, r0w, bH);
+                    ldm_bts<kHpad>(kh_l, s0, r0w, bL);
+                    mma_16816(d, aH, bH[0], bH[1]);
+                    mma_16816(d, aH, bL[0], bL[1]);
+                    mma_16816(d, aL, bH[0], bH[1]);
+                }
+                const int r0 = lane >> 2, cc = 2 * (lane & 3);
+#pragma unroll
+                for (int e = 0; e < 4; ++e) {
+                    const int c = c0w + r0 + 8 * (e >> 1);
+                    const int r = r0w + cc + (e & 1);
+                    f2s_at(j2(S_h, S_l, swr(c, r)) * b_end + d[e], S_h, S_l, swr(c, r));
+                }
+            }
+        }
+#else
         {
             // thread (c, r): U and B are warp broadcasts, K̂'s column is the lane's own r —
             // one full-width shared read per term.
@@ -1117,6 +1168,7 @@ __global__ void __launch_bounds__(kLanes * kChunkWarps, 1) gdn_scan_chunk_k(Scan
                     &S_l[swr(c, r)]);
             }
         }
+#endif
         __syncthreads();  // the update's writes are visible to the next sub-chunk's phases
     }
     for (int i = tid; i < D * kCols; i += kLanes * kChunkWarps) {
