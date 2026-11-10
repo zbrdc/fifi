@@ -2641,6 +2641,153 @@ pub(super) fn run_chunk_body(launch: &Launch<'_>, run: &ChunkRun<'_, '_>) -> Res
     Ok(())
 }
 
+/// Test-only phase attribution of one chunk body: [`run_chunk_body`] with a timing event
+/// after every stage of every layer. Mirrors the production body arm-for-arm; the
+/// production loop is the source of truth — keep the two in sync when a stage changes.
+#[cfg(test)]
+pub(super) mod phase_timing {
+    use super::*;
+    use crate::kernels::cuda::{CudaContext, DeviceStream, TimingEvent};
+
+    /// The recorded marks of one body run: one event per stage boundary, tagged by stage.
+    pub(crate) struct PhaseMarks {
+        events: Vec<TimingEvent>,
+        tags: Vec<&'static str>,
+        next: usize,
+    }
+
+    impl PhaseMarks {
+        /// `capacity` must cover every mark of one body run (2 + layers x stages + slack).
+        pub(crate) fn new(ctx: &CudaContext, capacity: usize) -> Result<Self, EngError> {
+            let events = (0..capacity)
+                .map(|_| ctx.event_timing())
+                .collect::<Result<Vec<_>, _>>()?;
+            Ok(Self {
+                events,
+                tags: Vec::with_capacity(capacity),
+                next: 0,
+            })
+        }
+
+        fn mark(&mut self, stream: &DeviceStream, tag: &'static str) -> Result<(), EngError> {
+            let at = self.next;
+            self.next += 1;
+            self.tags.push(tag);
+            stream.record_timing(&self.events[at])
+        }
+
+        /// Milliseconds between consecutive marks, tagged by the mark that ended the span.
+        /// Legal only after the caller synchronized the stream.
+        pub(crate) fn shares(&self) -> Result<Vec<(&'static str, f32)>, EngError> {
+            let mut out = Vec::with_capacity(self.next.saturating_sub(1));
+            for at in 1..self.next {
+                let span = self.events[at - 1].elapsed_ms_since(&self.events[at])?;
+                out.push((self.tags[at], span));
+            }
+            Ok(out)
+        }
+    }
+
+    fn stage_name(stage: Stage) -> &'static str {
+        match stage {
+            Stage::NormA => "norma",
+            Stage::QuantA => "quanta",
+            Stage::DeltaProj => "deltaproj",
+            Stage::Conv => "conv",
+            Stage::Scan => "scan",
+            Stage::QuantDOut => "quantdout",
+            Stage::SsmOut => "ssmout",
+            Stage::AttnProj => "attnproj",
+            Stage::Prep => "prep",
+            Stage::Flash => "flash",
+            Stage::QuantAOut => "quantaout",
+            Stage::AttnOut => "attnout",
+            Stage::NormF => "normf",
+            Stage::Route => "route",
+            Stage::Moe => "moe",
+        }
+    }
+
+    /// [`run_chunk_layer`] with a mark after every stage (the native arm only; the rig never
+    /// runs EXL3 chunks).
+    fn run_chunk_layer_timed(
+        launch: &Launch<'_>,
+        run: &ChunkRun<'_, '_>,
+        status: DeviceRange<'_>,
+        layer: usize,
+        marks: &mut PhaseMarks,
+    ) -> Result<(), EngError> {
+        let slot = run.model.table.slot(layer)?;
+        let moe = match &run.model.weights {
+            ChunkWeights::Native { moe, .. } => LayerMoe::Native(chunk_layer(moe, layer)?),
+            ChunkWeights::Exl3 { .. } => {
+                return Err(EngError::BadRequest(
+                    "phase_timing: the EXL3 chunk arm is not mirrored".to_owned(),
+                ));
+            }
+        };
+        let ctx = LayerCtx {
+            launch,
+            weights: run.model.weights.mixer().layer_weights(layer)?,
+            moe,
+            ord: slot.ordinal,
+            layer,
+            kind: slot.kind,
+            status,
+        };
+        for stage in layer_stages(slot.kind)? {
+            match stage {
+                Stage::NormA => norm_a(run, &ctx)?,
+                Stage::QuantA => quant_a(run, &ctx)?,
+                Stage::DeltaProj => delta_proj(run, &ctx)?,
+                Stage::Conv => delta_conv(run, &ctx)?,
+                Stage::Scan => delta_scan(run, &ctx)?,
+                Stage::QuantDOut => quant_d_out(run, &ctx)?,
+                Stage::SsmOut => ssm_out(run, &ctx)?,
+                Stage::AttnProj => attn_proj(run, &ctx)?,
+                Stage::Prep => attn_prep(run, &ctx)?,
+                Stage::Flash => attn_flash(run, &ctx)?,
+                Stage::QuantAOut => quant_a_out(run, &ctx)?,
+                Stage::AttnOut => attn_out(run, &ctx)?,
+                Stage::NormF => norm_f(run, &ctx)?,
+                Stage::Route => chunk_route(run, &ctx)?,
+                Stage::Moe => chunk_moe(run, &ctx)?,
+            }
+            marks.mark(launch.stream, stage_name(stage))?;
+        }
+        Ok(())
+    }
+
+    /// [`run_chunk_body`] with marks: `start`, `embed`, then every stage of every layer.
+    pub(crate) fn run_chunk_body_timed(
+        launch: &Launch<'_>,
+        run: &ChunkRun<'_, '_>,
+        marks: &mut PhaseMarks,
+    ) -> Result<(), EngError> {
+        run.state.check_chunk(launch.stream)?;
+        if run.rows.end() > run.state.layout().kv.capacity {
+            return Err(EngError::ContextLimit(format!(
+                "phase_timing chunk: rows: p0 {} + m {} passes the context cap {}",
+                run.rows.p0(),
+                run.rows.m(),
+                run.state.layout().kv.capacity
+            )));
+        }
+        if run.state.layout().kv.mode == KvMode::Int8G32 {
+            kv8_parts(run)?;
+        }
+        let status = run.state.word(Word::PrefillStatus)?;
+        marks.mark(launch.stream, "start")?;
+        chunk_embed(launch, run, status)?;
+        marks.mark(launch.stream, "embed")?;
+        for layer in 0..run.model.layers {
+            run_chunk_layer_timed(launch, run, status, layer, marks)?;
+        }
+        marks.mark(launch.stream, "end")?;
+        Ok(())
+    }
+}
+
 /// Test-only native MMVQ projections over the existing chunk slots. These functions never
 /// interpret MMQ-packed bytes as native q8_1. They preserve chunk norms, SwiGLU and routing.
 #[cfg(test)]

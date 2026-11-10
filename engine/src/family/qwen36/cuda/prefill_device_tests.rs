@@ -18,6 +18,7 @@ use super::native_device_rig::{
 };
 use super::prefill::{
     ChunkBufs, ChunkModel, ChunkRows, ChunkRun, ChunkViews, ChunkWeights, MoeChunkIo, RouteIo,
+    phase_timing::{PhaseMarks, run_chunk_body_timed},
     run_chunk_body, run_chunk_moe, run_chunk_route,
 };
 use super::prefill_plan::{ChunkSlot, chunk_tensors};
@@ -2512,4 +2513,113 @@ fn fused_gdn_prefill_chunk_is_bitwise_the_unfused_launches() {
         digests[0], digests[1],
         "{NAME}: the fused prefill chunk is NOT bitwise the unfused launches"
     );
+}
+
+/// The class of a phase-timing tag: the GDN mixer half, the attention half, or the MoE block.
+fn phase_class(tag: &str) -> &'static str {
+    match tag {
+        "embed" => "embed",
+        "norma" | "quanta" | "deltaproj" | "conv" | "scan" | "quantdout" | "ssmout"
+        | "attnproj" => "gdn",
+        "prep" | "flash" | "quantaout" | "attnout" => "attn",
+        _ => "moe",
+    }
+}
+
+/// The phase shares of one full-rig chunk (five layers, m=512, real dims and real kernels,
+/// synthetic weights): the attribution row of the prefill lane, not a correctness pin. One
+/// unmarked warm body, then three marked bodies; per-class and per-stage milliseconds of the
+/// last three, averaged.
+fn phase_shares_row(name: &str, kv_mode: KvMode) {
+    let rig = build_rig().expect("rig");
+    let mut state = rig_state(&rig, kv_mode).expect("state");
+    let nsm = rig.ctx.mmq_device_facts().expect("facts").nsm;
+    let (tensors, arena, part) =
+        rig_session(&rig, RIG_CAP, nsm, CPF_ATTN_PART_CAP).expect("session");
+    let bufs = rig_bufs(&rig, &tensors, &arena, &part, RIG_CAP).expect("bufs");
+    let mixer = rig_mixer(&rig, false).expect("mixer");
+    let moe = rig_moe_slice(&rig, false).expect("moe");
+    let weights = ChunkWeights::new(&mixer, &moe, &rig.embed);
+    let model = ChunkModel::leading(&rig.table, &rig.geometry, &rig.dims, weights, RIG_LAYERS)
+        .expect("model");
+    open_chunk(&mut state, &rig.stream).expect("open");
+    let rows = ChunkRows::new(0, RIG_CAP, RIG_CAP, RIG_CAP).expect("rows");
+    let run = ChunkRun::new(&state, &model, &bufs, rows).expect("run");
+    let mut rng = Rng::new(0x5EED_0000_0000_0001);
+    let ids = clean_ids(RIG_CAP, &mut rng);
+    let view = slot_view(&arena, &tensors, ChunkSlot::IdsTok).expect("ids view");
+    view.buffer()
+        .write_at(
+            &rig.stream,
+            view.offset(),
+            &ids.iter()
+                .flat_map(|id| id.to_le_bytes())
+                .collect::<Vec<_>>(),
+        )
+        .expect("ids write");
+    let launch = Launch {
+        ctx: &rig.ctx,
+        stream: &rig.stream,
+    };
+    run_chunk_body(&launch, &run).expect("warm body");
+    rig.stream.synchronize().expect("warm sync");
+    let mut class_totals: [(&str, f32); 4] =
+        [("gdn", 0.0), ("attn", 0.0), ("moe", 0.0), ("embed", 0.0)];
+    let mut stage_totals: Vec<(&str, f32)> = Vec::new();
+    const RUNS: usize = 3;
+    for _ in 0..RUNS {
+        let mut marks = PhaseMarks::new(&rig.ctx, 4 + RIG_LAYERS * 16).expect("marks");
+        run_chunk_body_timed(&launch, &run, &mut marks).expect("timed body");
+        rig.stream.synchronize().expect("run sync");
+        let shares = marks.shares().expect("shares");
+        for &(tag, ms) in &shares {
+            let class = phase_class(tag);
+            if let Some(slot) = class_totals.iter_mut().find(|(known, _)| *known == class) {
+                slot.1 += ms;
+            }
+            match stage_totals.iter_mut().find(|(known, _)| *known == tag) {
+                Some(slot) => slot.1 += ms,
+                None => stage_totals.push((tag, ms)),
+            }
+        }
+    }
+    let whole: f32 = class_totals.iter().map(|(_, ms)| ms).sum::<f32>() / RUNS as f32;
+    let mut line = String::new();
+    for (class, slot) in class_totals.iter_mut() {
+        *slot /= RUNS as f32;
+        line.push_str(&format!(
+            " {class}={:.2}ms({:.0}%)",
+            *slot,
+            100.0 * *slot / whole
+        ));
+    }
+    eprintln!("PHASE {name}:{line} whole={whole:.2}ms (m={RIG_CAP}, {RIG_LAYERS} layers)");
+    stage_totals.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+    let top = stage_totals
+        .iter()
+        .take(6)
+        .map(|(tag, ms)| format!("{tag}={:.2}", ms / RUNS as f32))
+        .collect::<Vec<_>>()
+        .join(" ");
+    eprintln!("PHASE {name}: top stages {top}");
+}
+
+/// The phase shares of one chunk in FP16 KV mode (the cleanest attention path).
+#[test]
+#[ignore = "a CUDA device, held exclusively: the rig; run by name"]
+fn chunk_phase_shares_fp16() {
+    if !device_present("chunk_phase_shares_fp16") {
+        return;
+    }
+    phase_shares_row("fp16", KvMode::Fp16);
+}
+
+/// The phase shares of one chunk in Int8G32 KV mode (the production prefill mode).
+#[test]
+#[ignore = "a CUDA device, held exclusively: the rig; run by name"]
+fn chunk_phase_shares_kv8() {
+    if !device_present("chunk_phase_shares_kv8") {
+        return;
+    }
+    phase_shares_row("kv8", KvMode::Int8G32);
 }
