@@ -50,6 +50,7 @@ pub(crate) struct ExpertSelect<'b> {
 }
 
 /// A stack of `experts` experts of equal shape, back to back in one tiled weight.
+#[derive(Clone, Copy)]
 pub(crate) struct ExpertStack<'a> {
     pub(crate) weight: &'a TiledWeight,
     pub(crate) experts: usize,

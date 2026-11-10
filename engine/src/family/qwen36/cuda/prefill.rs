@@ -121,7 +121,7 @@ pub(super) const ALL_SLOTS: [ChunkSlot; 35] = [
 /// planned for `m_sess` rows. Constructed against the caller's `cap` and `m_sess`; the body
 /// re-checks the state's own cap (a chunk built against a larger cap than the state's).
 #[derive(Debug)]
-pub(super) struct ChunkRows {
+pub(crate) struct ChunkRows {
     p0: usize,
     m: usize,
 }
@@ -182,8 +182,9 @@ fn required_slots(slots: &[ChunkSlot]) -> &'static [ChunkSlot] {
 }
 
 /// (V1) the arena holds exactly the list's tensors; (V2) no slot twice; (V3) every slot of
-/// [`ALL_SLOTS`] (or [`EXL3_SLOTS`] for an EXL3 list) present, and no slot of the other set. The
-/// order is binding: every refusal names its guard.
+/// [`ALL_SLOTS`] (or [`EXL3_SLOTS`] for an EXL3 list) present, and no slot of the other set. A
+/// native card plan may additionally carry `Zero`; a single-device plan does not need it.
+/// The order is binding: every refusal names its guard.
 pub(super) fn check_view_list(arena_len: usize, slots: &[ChunkSlot]) -> Result<(), EngError> {
     if arena_len != slots.len() {
         return Err(EngError::BadRequest(format!(
@@ -206,7 +207,10 @@ pub(super) fn check_view_list(arena_len: usize, slots: &[ChunkSlot]) -> Result<(
             )));
         }
     }
-    if let Some(extra) = slots.iter().find(|slot| !required.contains(slot)) {
+    if let Some(extra) = slots.iter().find(|slot| {
+        !required.contains(slot)
+            && !(**slot == ChunkSlot::Zero && !slots.contains(&ChunkSlot::Exl3Flag))
+    }) {
         return Err(EngError::BadRequest(format!(
             "prefill chunk: slots: {extra:?} does not belong to this arena"
         )));
@@ -239,6 +243,7 @@ pub(super) fn check_view_layout(
 
 /// The arena views of one chunk's slots: built from the same `chunk_tensors` list the arena was
 /// planned from, slots and tensors together.
+#[derive(Clone)]
 pub(super) struct ChunkViews<'a> {
     views: Vec<(ChunkSlot, DeviceRange<'a>)>,
 }
@@ -958,6 +963,20 @@ fn model_facts(
     weights: &ChunkWeights<'_, '_>,
     layers: usize,
 ) -> Result<ModelFacts, EngError> {
+    model_facts_with(table, geometry, dims, weights, layers, None)
+}
+
+/// The card twin's seam: `moe` overrides the inter-dimensional facts (the
+/// card's inter and shared-inter slices) while every other dimension and
+/// every weight check stays the single-device rule.
+fn model_facts_with(
+    table: &LayerTable,
+    geometry: &MixerGeometry,
+    dims: &StepDims,
+    weights: &ChunkWeights<'_, '_>,
+    layers: usize,
+    card_moe: Option<crate::family::qwen36::host::MoeDims>,
+) -> Result<ModelFacts, EngError> {
     let mut facts = Vec::with_capacity(layers);
     for layer in 0..layers {
         let kind = table.slot(layer)?.kind;
@@ -1017,10 +1036,14 @@ fn model_facts(
             shared,
         });
     }
+    let inter = match &card_moe {
+        Some(card) => card.inter,
+        None => dims.shape.moe.inter,
+    };
     Ok(ModelFacts {
         eps_bits: geometry.eps.to_bits(),
         hidden: dims.shape.hidden,
-        inter: dims.shape.moe.inter,
+        inter,
         experts: dims.shape.moe.experts,
         layers: facts,
     })
@@ -1146,6 +1169,41 @@ impl<'a, 'w> ChunkModel<'a, 'w> {
         })
     }
 
+    /// The card twin: the same model with the CARD's inter dimensions (the
+    /// shard table's deal for this card) and the card's per-layer MoE views.
+    /// Every stack check then validates the card's slices, and `dims_at`
+    /// shapes the chunk MoE stages for them.
+    pub(super) fn card(
+        table: &'a LayerTable,
+        geometry: &'a MixerGeometry,
+        dims: &StepDims,
+        weights: ChunkWeights<'a, 'w>,
+        inter: usize,
+        shared_inter: usize,
+    ) -> Result<Self, EngError> {
+        let host_moe = crate::family::qwen36::host::MoeDims {
+            inter,
+            shared_inter,
+            ..dims.shape.moe
+        };
+        let facts = model_facts_with(table, geometry, dims, &weights, table.len(), Some(host_moe))?;
+        check_model(&facts, table.len())?;
+        let moe_dims = super::moe::MoeDims::new(dims, 1);
+        let moe_dims = super::moe::MoeDims {
+            inter,
+            shared_inter,
+            ..moe_dims
+        };
+        Ok(Self {
+            table,
+            geometry,
+            moe_dims,
+            weights,
+            layers: table.len(),
+            vocab: dims.shape.vocab,
+        })
+    }
+
     /// The same checks over the first `n` layers (the rig seam).
     #[cfg(test)]
     pub(super) fn leading(
@@ -1164,6 +1222,26 @@ impl<'a, 'w> ChunkModel<'a, 'w> {
             layers: n,
             vocab: dims.shape.vocab,
         })
+    }
+
+    /// The MoE dims this model shapes its chunk stages for (the rig seam).
+    pub(super) fn moe_dims(&self) -> MoeDims {
+        self.moe_dims
+    }
+
+    /// The layer table the model walks (the card driver's loop).
+    pub(super) fn table(&self) -> &'a LayerTable {
+        self.table
+    }
+
+    /// The weights the model resolves layers through.
+    pub(super) fn weights(&self) -> &ChunkWeights<'a, 'w> {
+        &self.weights
+    }
+
+    /// `dims_at` for callers outside this module (the card driver's MoE io).
+    pub(super) fn model_dims_at(&self, m: usize) -> MoeDims {
+        self.dims_at(m)
     }
 
     fn dims_at(&self, m: usize) -> MoeDims {
@@ -1192,7 +1270,7 @@ impl<'a, 'w> ChunkWeights<'a, 'w> {
         Self::Exl3 { mixer, moe, embed }
     }
 
-    fn mixer(&self) -> &'a MixerWeights<'w> {
+    pub(super) fn mixer(&self) -> &'a MixerWeights<'w> {
         match self {
             Self::Native { mixer, .. } | Self::Exl3 { mixer, .. } => mixer,
         }
@@ -1276,6 +1354,16 @@ impl<'r> ChunkSparse<'r> {
 }
 
 impl<'r, 'w> ChunkRun<'r, 'w> {
+    /// The run's scratch views (the card driver's MoE io seam).
+    pub(super) fn views(&self) -> &'r ChunkViews<'r> {
+        &self.bufs.views
+    }
+
+    /// The model the run resolves weights through (the card driver's seam).
+    pub(super) fn model(&self) -> &'r ChunkModel<'r, 'w> {
+        self.model
+    }
+
     pub(super) fn new(
         state: &'r ResidentState,
         model: &'r ChunkModel<'r, 'w>,
@@ -1334,18 +1422,18 @@ impl<'r, 'w> ChunkRun<'r, 'w> {
 
 // ---- the stage functions: P1 and the two mixer blocks ----------------------------------------
 
-struct LayerCtx<'a, 'w> {
-    launch: &'a Launch<'a>,
-    weights: &'a LayerWeights<'w>,
-    moe: LayerMoe<'a, 'w>,
-    ord: usize,
-    layer: usize,
-    kind: AttentionKind,
-    status: DeviceRange<'a>,
+pub(super) struct LayerCtx<'a, 'w> {
+    pub(super) launch: &'a Launch<'a>,
+    pub(super) weights: &'a LayerWeights<'w>,
+    pub(super) moe: LayerMoe<'a, 'w>,
+    pub(super) ord: usize,
+    pub(super) layer: usize,
+    pub(super) kind: AttentionKind,
+    pub(super) status: DeviceRange<'a>,
 }
 
 #[derive(Clone, Copy)]
-enum LayerMoe<'a, 'w> {
+pub(super) enum LayerMoe<'a, 'w> {
     Native(&'a MoeLayerWeights<'w>),
     Exl3(&'a Exl3MoeWeights<'w>),
 }
@@ -1361,7 +1449,7 @@ impl<'a, 'w> LayerMoe<'a, 'w> {
 }
 
 impl ChunkRun<'_, '_> {
-    fn v(&self, slot: ChunkSlot) -> Result<DeviceRange<'_>, EngError> {
+    pub(super) fn v(&self, slot: ChunkSlot) -> Result<DeviceRange<'_>, EngError> {
         self.bufs.views.get(slot)
     }
 
@@ -1397,7 +1485,7 @@ impl ChunkRun<'_, '_> {
 }
 
 /// P1, the embedding.
-fn chunk_embed(
+pub(super) fn chunk_embed(
     launch: &Launch<'_>,
     run: &ChunkRun<'_, '_>,
     status: DeviceRange<'_>,
@@ -1434,7 +1522,7 @@ fn chunk_embed(
 }
 
 /// Stage 1, `NormA`.
-fn norm_a(run: &ChunkRun<'_, '_>, ctx: &LayerCtx<'_, '_>) -> Result<(), EngError> {
+pub(super) fn norm_a(run: &ChunkRun<'_, '_>, ctx: &LayerCtx<'_, '_>) -> Result<(), EngError> {
     let launch = ctx.launch;
     let g = run.model.geometry;
     launch.ctx.add_norm_pack(
@@ -1453,7 +1541,7 @@ fn norm_a(run: &ChunkRun<'_, '_>, ctx: &LayerCtx<'_, '_>) -> Result<(), EngError
 }
 
 /// Stage 2, `QuantA`: one quantize on the group representative role of the kind.
-fn quant_a(run: &ChunkRun<'_, '_>, ctx: &LayerCtx<'_, '_>) -> Result<(), EngError> {
+pub(super) fn quant_a(run: &ChunkRun<'_, '_>, ctx: &LayerCtx<'_, '_>) -> Result<(), EngError> {
     let launch = ctx.launch;
     let rep = match ctx.kind {
         AttentionKind::DeltaNet => Role::AttnQkv,
@@ -1483,7 +1571,7 @@ fn call_weight_k(weight: &crate::kernels::cuda::NativeWeight) -> usize {
     weight.k()
 }
 
-fn delta_proj(run: &ChunkRun<'_, '_>, ctx: &LayerCtx<'_, '_>) -> Result<(), EngError> {
+pub(super) fn delta_proj(run: &ChunkRun<'_, '_>, ctx: &LayerCtx<'_, '_>) -> Result<(), EngError> {
     let launch = ctx.launch;
     let (m, g) = (run.rows.m(), run.model.geometry);
     // The wide upload concatenates the siblings in DeltaProj column order, so a segment's
@@ -1562,7 +1650,7 @@ fn delta_proj(run: &ChunkRun<'_, '_>, ctx: &LayerCtx<'_, '_>) -> Result<(), EngE
 }
 
 /// Stage 4d, the causal conv: the ring state of the layer's own ordinal.
-fn delta_conv(run: &ChunkRun<'_, '_>, ctx: &LayerCtx<'_, '_>) -> Result<(), EngError> {
+pub(super) fn delta_conv(run: &ChunkRun<'_, '_>, ctx: &LayerCtx<'_, '_>) -> Result<(), EngError> {
     let launch = ctx.launch;
     launch.ctx.gdn_conv(
         launch.stream,
@@ -1577,7 +1665,7 @@ fn delta_conv(run: &ChunkRun<'_, '_>, ctx: &LayerCtx<'_, '_>) -> Result<(), EngE
 }
 
 /// Stage 5d, the scan: the recurrent state of the layer's own ordinal, in place.
-fn delta_scan(run: &ChunkRun<'_, '_>, ctx: &LayerCtx<'_, '_>) -> Result<(), EngError> {
+pub(super) fn delta_scan(run: &ChunkRun<'_, '_>, ctx: &LayerCtx<'_, '_>) -> Result<(), EngError> {
     let launch = ctx.launch;
     let status = ctx.status;
     launch.ctx.gdn_scan_seq(
@@ -1604,7 +1692,7 @@ fn delta_scan(run: &ChunkRun<'_, '_>, ctx: &LayerCtx<'_, '_>) -> Result<(), EngE
 }
 
 /// Stage 6d, `QuantDOut`.
-fn quant_d_out(run: &ChunkRun<'_, '_>, ctx: &LayerCtx<'_, '_>) -> Result<(), EngError> {
+pub(super) fn quant_d_out(run: &ChunkRun<'_, '_>, ctx: &LayerCtx<'_, '_>) -> Result<(), EngError> {
     let launch = ctx.launch;
     run.dense_input(
         launch,
@@ -1620,7 +1708,7 @@ fn quant_d_out(run: &ChunkRun<'_, '_>, ctx: &LayerCtx<'_, '_>) -> Result<(), Eng
 }
 
 /// Stage 7d, `SsmOut`.
-fn ssm_out(run: &ChunkRun<'_, '_>, ctx: &LayerCtx<'_, '_>) -> Result<(), EngError> {
+pub(super) fn ssm_out(run: &ChunkRun<'_, '_>, ctx: &LayerCtx<'_, '_>) -> Result<(), EngError> {
     let launch = ctx.launch;
     run.dense(
         launch,
@@ -1637,7 +1725,7 @@ fn ssm_out(run: &ChunkRun<'_, '_>, ctx: &LayerCtx<'_, '_>) -> Result<(), EngErro
     )
 }
 /// Stage 3a, the three attention projections.
-fn attn_proj(run: &ChunkRun<'_, '_>, ctx: &LayerCtx<'_, '_>) -> Result<(), EngError> {
+pub(super) fn attn_proj(run: &ChunkRun<'_, '_>, ctx: &LayerCtx<'_, '_>) -> Result<(), EngError> {
     let launch = ctx.launch;
     let (m, g) = (run.rows.m(), run.model.geometry);
     for (role, _n, col_off) in attn_proj_cols(g) {
@@ -1753,9 +1841,15 @@ fn part_view<'a>(
 fn kv8_parts<'a>(run: &ChunkRun<'a, '_>) -> Result<Kv8Parts<'a>, EngError> {
     let g = run.model.geometry;
     let m = run.rows.m();
-    if g.attn.head_dim != 256 || g.attn.heads_q != 16 || g.attn.heads_kv != 2 {
+    // The single-device step pins the whole Q36 head geometry; a CARD
+    // geometry halves the heads (heads_q 8, heads_kv 1) at the same
+    // head_dim 256, and every downstream shape passes the geometry's own
+    // counts, so both halves of the pair are admitted here.
+    let heads_ok =
+        (g.attn.heads_q, g.attn.heads_kv) == (16, 2) || (g.attn.heads_q, g.attn.heads_kv) == (8, 1);
+    if g.attn.head_dim != 256 || !heads_ok {
         return Err(EngError::BadRequest(
-            "prefill chunk: kv mode: the KV8 body requires Q36 D256".to_owned(),
+            "prefill chunk: kv mode: the KV8 body requires Q36 D256 heads".to_owned(),
         ));
     }
     kv8_attention_tile(run.rows.p0(), m, 0)?;
@@ -1771,7 +1865,7 @@ fn kv8_parts<'a>(run: &ChunkRun<'a, '_>) -> Result<Kv8Parts<'a>, EngError> {
 }
 
 /// Stage 4a, preparation and the mode-specific KV append of the layer's ordinal.
-fn attn_prep(run: &ChunkRun<'_, '_>, ctx: &LayerCtx<'_, '_>) -> Result<(), EngError> {
+pub(super) fn attn_prep(run: &ChunkRun<'_, '_>, ctx: &LayerCtx<'_, '_>) -> Result<(), EngError> {
     let launch = ctx.launch;
     let (g, status) = (run.model.geometry, ctx.status);
     let kv8 = if run.state.layout().kv.mode == KvMode::Int8G32 {
@@ -1955,7 +2049,7 @@ fn attn_flash_kv8(run: &ChunkRun<'_, '_>, ctx: &LayerCtx<'_, '_>) -> Result<(), 
 }
 
 /// Stage 5a, the flash attention: the launch plan's split, the flat-capped `part`.
-fn attn_flash(run: &ChunkRun<'_, '_>, ctx: &LayerCtx<'_, '_>) -> Result<(), EngError> {
+pub(super) fn attn_flash(run: &ChunkRun<'_, '_>, ctx: &LayerCtx<'_, '_>) -> Result<(), EngError> {
     if run.state.layout().kv.mode == KvMode::Int8G32 {
         if let Some(staging) = run.bufs.kv8_staging {
             if staging.plan.covers(run.rows.end()) {
@@ -2133,7 +2227,7 @@ fn attn_flash_fp16(
 }
 
 /// Stage 6a, `QuantAOut`.
-fn quant_a_out(run: &ChunkRun<'_, '_>, ctx: &LayerCtx<'_, '_>) -> Result<(), EngError> {
+pub(super) fn quant_a_out(run: &ChunkRun<'_, '_>, ctx: &LayerCtx<'_, '_>) -> Result<(), EngError> {
     let launch = ctx.launch;
     run.dense_input(
         launch,
@@ -2149,7 +2243,7 @@ fn quant_a_out(run: &ChunkRun<'_, '_>, ctx: &LayerCtx<'_, '_>) -> Result<(), Eng
 }
 
 /// Stage 7a, `AttnOut`.
-fn attn_out(run: &ChunkRun<'_, '_>, ctx: &LayerCtx<'_, '_>) -> Result<(), EngError> {
+pub(super) fn attn_out(run: &ChunkRun<'_, '_>, ctx: &LayerCtx<'_, '_>) -> Result<(), EngError> {
     let launch = ctx.launch;
     run.dense(
         launch,
@@ -2166,7 +2260,7 @@ fn attn_out(run: &ChunkRun<'_, '_>, ctx: &LayerCtx<'_, '_>) -> Result<(), EngErr
     )
 }
 /// Stage 8, `NormF`.
-fn norm_f(run: &ChunkRun<'_, '_>, ctx: &LayerCtx<'_, '_>) -> Result<(), EngError> {
+pub(super) fn norm_f(run: &ChunkRun<'_, '_>, ctx: &LayerCtx<'_, '_>) -> Result<(), EngError> {
     let launch = ctx.launch;
     let g = run.model.geometry;
     launch.ctx.add_norm_pack(
@@ -2259,7 +2353,7 @@ pub(super) fn run_chunk_moe(
 }
 
 /// Stages 10a-f, the shared expert. Diagnostic runs replace only its projections.
-fn run_chunk_shared(
+pub(super) fn run_chunk_shared(
     launch: &Launch<'_>,
     mw: &MoeLayerWeights<'_>,
     io: &MoeChunkIo<'_>,
@@ -2333,7 +2427,7 @@ fn run_chunk_shared(
 }
 
 /// Stages 11-16, the grouped routed projections and their existing nonlinear operation.
-fn run_chunk_routed(
+pub(super) fn run_chunk_routed(
     launch: &Launch<'_>,
     mw: &MoeLayerWeights<'_>,
     io: &MoeChunkIo<'_>,
@@ -2422,7 +2516,7 @@ fn run_chunk_routed(
 }
 
 /// Stage 17, unchanged for every diagnostic class.
-fn combine_chunk_moe(launch: &Launch<'_>, io: &MoeChunkIo<'_>) -> Result<(), EngError> {
+pub(super) fn combine_chunk_moe(launch: &Launch<'_>, io: &MoeChunkIo<'_>) -> Result<(), EngError> {
     let (dims, d) = (&io.dims, io.scratch);
     launch.ctx.moe_combine(
         launch.stream,
@@ -2479,7 +2573,7 @@ pub(super) fn run_chunk_route(launch: &Launch<'_>, io: &RouteIo<'_>) -> Result<(
 // ---- the layer walk and the body --------------------------------------------------------------
 
 /// Stage 9 inside the layer walk.
-fn chunk_route(run: &ChunkRun<'_, '_>, ctx: &LayerCtx<'_, '_>) -> Result<(), EngError> {
+pub(super) fn chunk_route(run: &ChunkRun<'_, '_>, ctx: &LayerCtx<'_, '_>) -> Result<(), EngError> {
     let launch = ctx.launch;
     let (router, router_shared) = ctx.moe.router();
     run_chunk_route(

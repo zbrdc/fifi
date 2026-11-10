@@ -746,6 +746,7 @@ fn check_apart(bufs: &BufferFacts) -> Result<(), EngError> {
 /// One expert stack of the block: the tiles of the Tiled load (the per-slot `matmul_expert`
 /// launches) or the file's own blocks of the Native load (the ONE merged `matvec_expert` launch;
 /// the depth rides `NativeWeight::experts`).
+#[derive(Clone, Copy)]
 pub(super) enum StackWeights<'w> {
     Tiled(ExpertStack<'w>),
     Native(&'w NativeWeight),
@@ -754,6 +755,7 @@ pub(super) enum StackWeights<'w> {
 /// The weights of the MoE block of one layer, resolved by the layer driver (the `(layer, role)`
 /// lookup of `LayerTable`): the raw F32 router matrices and the expert stacks and shared-expert
 /// projections of the session's layout (tiles or native blocks).
+#[derive(Clone, Copy)]
 pub(super) struct MoeLayerWeights<'w> {
     /// The raw F32 `[n_expert][hidden]` router matrix (`ffn_gate_inp`).
     pub(super) router: &'w DeviceBuffer,

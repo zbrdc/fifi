@@ -126,6 +126,21 @@ impl CardStack {
         Self::with_table(dims, options, devices, admission, &table)
     }
 
+    /// The ring's mailbox payload cap: the default covers the eager step's
+    /// exchanges (hidden*top_k for the fused MoE block); a chunked session
+    /// passes m*hidden so every layer sum of a chunk is one sequence.
+    pub(crate) fn with_payload(
+        dims: &StepDims,
+        options: &StepOptions,
+        devices: &[usize],
+        admission: &Admission,
+        table: &ShardTable,
+        payload: Option<usize>,
+    ) -> Result<(Self, Vec<ResidentState>), EngError> {
+        let ring_payload = payload.unwrap_or(dims.shape.hidden * dims.shape.moe.top_k.max(1));
+        Self::with_table_payload(dims, options, devices, admission, table, ring_payload)
+    }
+
     /// The stack over an explicit shard table: the placement planner's
     /// table, whose runs the loader must have used for the same cards.
     pub(crate) fn with_table(
@@ -134,6 +149,24 @@ impl CardStack {
         devices: &[usize],
         admission: &Admission,
         table: &ShardTable,
+    ) -> Result<(Self, Vec<ResidentState>), EngError> {
+        Self::with_table_payload(
+            dims,
+            options,
+            devices,
+            admission,
+            table,
+            dims.shape.hidden * dims.shape.moe.top_k.max(1),
+        )
+    }
+
+    pub(crate) fn with_table_payload(
+        dims: &StepDims,
+        options: &StepOptions,
+        devices: &[usize],
+        admission: &Admission,
+        table: &ShardTable,
+        ring_payload: usize,
     ) -> Result<(Self, Vec<ResidentState>), EngError> {
         if devices.is_empty() {
             return Err(EngError::BadRequest(
@@ -152,7 +185,7 @@ impl CardStack {
         // bare contexts before anything else borrows them. The payload cap
         // covers the MoE all-reduce, which exchanges every `expert_down`
         // pick row (`top_k` hidden rows) in one sequence.
-        let ring = PeerRing::new(&contexts, dims.shape.hidden * dims.shape.moe.top_k.max(1))?;
+        let ring = PeerRing::new(&contexts, ring_payload)?;
         let sync_broadcasts =
             std::env::var_os("Q36_P2P_SYNC_BROADCAST").is_some_and(|value| value == "1");
         let mut plans = Vec::with_capacity(devices.len());
@@ -291,6 +324,26 @@ impl CardStack {
         Ok(())
     }
 
+    /// A broadcast followed by a consumer barrier, regardless of the eager
+    /// path's optional synchronization setting. Use this when another
+    /// broadcast can reuse the same mailbox parity before a sum or gather.
+    pub(crate) fn broadcast_synchronized(
+        &self,
+        source_card: usize,
+        src: DeviceRange<'_>,
+        outs: &[DeviceRange<'_>],
+        statuses: &[DeviceRange<'_>],
+        count: usize,
+    ) -> Result<(), EngError> {
+        self.broadcast(source_card, src, outs, statuses, count)?;
+        if !self.sync_broadcasts {
+            for stream in &self.streams {
+                stream.synchronize()?;
+            }
+        }
+        Ok(())
+    }
+
     /// One all-gather of a row dealt across the cards: card `i` computed
     /// `ranges[i]` of the `total` row in `parts[i]`; afterwards every
     /// `outs[i]` holds the full row. The K/V gathers of the full-attention
@@ -347,7 +400,6 @@ mod device_tests {
         crate::kernels::cuda::peer::enable_peer_access(&devices).expect("enable peers");
         let (mut stack, _states) =
             CardStack::new(&dims(), &options(), &devices, &served_admission()).expect("stack");
-        stack.sync_broadcasts = true;
         let mut inputs = Vec::new();
         let mut outputs = [Vec::new(), Vec::new()];
         let mut expected = Vec::new();
@@ -369,43 +421,46 @@ mod device_tests {
             }
             expected.push(bytes);
         }
-        for _ in 0..32 {
-            for message in 0..3 {
-                let outs = [
-                    outputs[0][message].range(0, 16).unwrap(),
-                    outputs[1][message].range(0, 16).unwrap(),
-                ];
-                let statuses = [
-                    stack.shards()[0].ring_status().unwrap(),
-                    stack.shards()[1].ring_status().unwrap(),
-                ];
-                stack
-                    .broadcast(
-                        0,
-                        inputs[message].range(0, 16).unwrap(),
-                        &outs,
-                        &statuses,
-                        4,
-                    )
-                    .expect("broadcast");
-            }
-            for (card, card_outputs) in outputs.iter().enumerate() {
-                let mut status = [0; 4];
-                stack.shards()[card]
-                    .ring_word()
-                    .read_at(&stack.streams()[card], 0, &mut status)
-                    .unwrap();
-                assert_eq!(u32::from_le_bytes(status), 0, "card {card} ring status");
+        for sync_broadcasts in [false, true] {
+            stack.sync_broadcasts = sync_broadcasts;
+            for _ in 0..32 {
                 for message in 0..3 {
-                    let mut actual = [0; 16];
-                    card_outputs[message]
-                        .read_at(&stack.streams()[card], 0, &mut actual)
+                    let outs = [
+                        outputs[0][message].range(0, 16).unwrap(),
+                        outputs[1][message].range(0, 16).unwrap(),
+                    ];
+                    let statuses = [
+                        stack.shards()[0].ring_status().unwrap(),
+                        stack.shards()[1].ring_status().unwrap(),
+                    ];
+                    stack
+                        .broadcast_synchronized(
+                            0,
+                            inputs[message].range(0, 16).unwrap(),
+                            &outs,
+                            &statuses,
+                            4,
+                        )
+                        .expect("broadcast");
+                }
+                for (card, card_outputs) in outputs.iter().enumerate() {
+                    let mut status = [0; 4];
+                    stack.shards()[card]
+                        .ring_word()
+                        .read_at(&stack.streams()[card], 0, &mut status)
                         .unwrap();
-                    assert_eq!(
-                        actual.as_slice(),
-                        expected[message],
-                        "card {card}, message {message}"
-                    );
+                    assert_eq!(u32::from_le_bytes(status), 0, "card {card} ring status");
+                    for message in 0..3 {
+                        let mut actual = [0; 16];
+                        card_outputs[message]
+                            .read_at(&stack.streams()[card], 0, &mut actual)
+                            .unwrap();
+                        assert_eq!(
+                            actual.as_slice(),
+                            expected[message],
+                            "card {card}, message {message}"
+                        );
+                    }
                 }
             }
         }
