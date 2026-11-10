@@ -53,6 +53,39 @@ pub(crate) struct Exl3BankSpan<'a> {
 }
 
 impl<'a> Exl3BankSpan<'a> {
+    /// A span over caller-held, record-strided weights this module did not load: the bank
+    /// staging of a slot map or a ring copy. The arguments are the fields of the struct, in
+    /// order; the kernels validate every extent per call.
+    #[allow(clippy::too_many_arguments)] // a struct-literal of a private-fields type
+    pub(in crate::family) fn from_parts(
+        trellis: DeviceRange<'a>,
+        suh: DeviceRange<'a>,
+        svh: DeviceRange<'a>,
+        members: u32,
+        trellis_stride: usize,
+        scale_stride: usize,
+        shape: [usize; 2],
+        bits_twice: u8,
+        book: Codebook,
+    ) -> Self {
+        Self {
+            trellis,
+            suh,
+            svh,
+            members,
+            trellis_stride,
+            scale_stride,
+            shape,
+            bits_twice,
+            book,
+        }
+    }
+
+    /// The `[k, n]` every member projects with; the pairs of one launch share it.
+    pub(in crate::family) fn shape(&self) -> [usize; 2] {
+        self.shape
+    }
+
     /// The call that projects `io`'s row with the member `ids[slot]`; the ids are chosen on the
     /// device when the launch runs.
     pub(in crate::family) fn indexed_call(

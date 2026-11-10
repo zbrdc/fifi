@@ -34,7 +34,7 @@ use crate::{
         gguf_model::Role,
         project::cuda::{
             CudaWeight, CudaWeights,
-            exl3::{Exl3Bank, Exl3Io, Exl3Weight},
+            exl3::{Exl3Bank, Exl3BankSpan, Exl3Io, Exl3Weight},
         },
     },
     kernels::cuda::{
@@ -317,19 +317,19 @@ fn grouped_runs(
     grouped(launch, pairs, scratch)
 }
 
-/// One pair of an id-indexed launch: the bank, the pick slot whose id chooses the member, the row
-/// the pair reads and where its rows go.
-struct IndexedPair<'a> {
-    bank: &'a Exl3Bank,
-    slot: u32,
-    x: DeviceRange<'a>,
-    out: DeviceRange<'a>,
+/// One pair of an id-indexed launch: the bank span that holds every member, the pick slot
+/// whose id chooses the member, the row the pair reads and where its rows go.
+pub(in crate::family) struct IndexedPair<'a> {
+    pub(in crate::family) span: Exl3BankSpan<'a>,
+    pub(in crate::family) slot: u32,
+    pub(in crate::family) x: DeviceRange<'a>,
+    pub(in crate::family) out: DeviceRange<'a>,
 }
 
 /// Queues the id-indexed group `pairs`, all of one shape, as consecutive launches of at most
 /// `exl3_indexed_capacity` pairs in group order. Each launch starts again at row 0 of the
 /// scratch; the stream runs it after the previous launch has finished with those rows.
-fn grouped_indexed(
+pub(in crate::family) fn grouped_indexed(
     launch: &Launch<'_>,
     pairs: &[IndexedPair<'_>],
     ids: DeviceRange<'_>,
@@ -354,7 +354,7 @@ fn indexed_launch(
 ) -> Result<(), EngError> {
     let [k, n] = pairs
         .first()
-        .map(|pair| pair.bank.shape())
+        .map(|pair| pair.span.shape())
         .ok_or_else(|| refuse("an indexed launch without pairs".into()))?;
     let mut calls = Vec::with_capacity(pairs.len());
     for (index, pair) in pairs.iter().enumerate() {
@@ -367,7 +367,7 @@ fn indexed_launch(
             rows: 1,
             fused: false,
         };
-        calls.push(pair.bank.span()?.indexed_call(&io, ids, pair.slot));
+        calls.push(pair.span.indexed_call(&io, ids, pair.slot));
     }
     launch
         .ctx
@@ -498,7 +498,7 @@ pub(super) fn routed_on_device(
     for slot in 0..slots {
         for (half, bank) in [weights.gate, weights.up].into_iter().enumerate() {
             group.push(IndexedPair {
-                bank,
+                span: bank.span()?,
                 slot,
                 x: bufs.route.norm_row,
                 out: row(&bufs.expert_gu, i * F32, 2 * slot as usize + half)?,
@@ -510,7 +510,7 @@ pub(super) fn routed_on_device(
     let mut group = Vec::with_capacity(dims.top_k);
     for slot in 0..slots {
         group.push(IndexedPair {
-            bank: weights.down,
+            span: weights.down.span()?,
             slot,
             x: row(&bufs.expert_act, i * F32, slot as usize)?,
             out: row(&bufs.expert_down, h * F32, slot as usize)?,

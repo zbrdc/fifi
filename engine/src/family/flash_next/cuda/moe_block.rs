@@ -367,10 +367,11 @@ mod device {
         EngError,
         family::{
             flash_next::{cuda::bank::device::DeviceBank, moe::slot_bank::SlotBankLayout},
-            project::cuda::exl3::Exl3Weight,
+            project::cuda::exl3::{Exl3BankSpan, Exl3Weight},
             qwen36::cuda::{
                 exl3_moe::{
-                    Exl3MoeBufs, Scratch, SharedRowsIo, SharedWeights, shared_of, shared_rows,
+                    Exl3MoeBufs, IndexedPair, Scratch, SharedRowsIo, SharedWeights,
+                    grouped_indexed, shared_of, shared_rows,
                 },
                 moe::{Launch, MoeDims, RouteBufs},
             },
@@ -379,7 +380,6 @@ mod device {
             CudaContext, DeviceBuffer, DeviceRange,
             prefill::swiglu_rows::{SwigluRowsCall, SwigluRowsShape},
             resident::{
-                exl3::{Exl3IndexedCall, Exl3LinearCall},
                 moe_combine::{CombineCall, CombineOut, CombineShape, SharedTerm},
                 router::{RouterCall, RouterOut, RouterShape, RouterWeights},
                 tiered_classify::{ClassifyCall, ClassifyShape},
@@ -1384,57 +1384,41 @@ mod device {
             let ring_spans = ring
                 .map(|(_, members)| self.spans.for_slots(members as usize))
                 .transpose()?;
-            for chunk in items.chunks(launch.ctx.exl3_indexed_capacity()) {
-                let mut calls = Vec::with_capacity(chunk.len());
-                for (index, item) in chunk.iter().enumerate() {
-                    // The bank and the ring staging are both record-strided; the item's
-                    // source picks its weights, members and the spans over them.
-                    let (weights, members, spans) = if item.ring {
-                        let ((buffer, members), spans) = ring
-                            .zip(ring_spans.as_ref())
-                            .ok_or_else(|| refuse("a ring item without a ring".into()))?;
-                        (buffer, members, spans)
-                    } else {
-                        (bank.0, bank.1, &self.spans)
-                    };
-                    let span = &spans.parts[item.part];
-                    if span.shape != [k, n] {
-                        return Err(refuse("a launch group mixes matrix shapes".into()));
-                    }
-                    calls.push(Exl3IndexedCall {
-                        call: Exl3LinearCall {
-                            trellis: weights.range(span.trellis.start, span.trellis.len())?,
-                            suh: weights.range(span.suh.start, span.suh.len())?,
-                            svh: weights.range(span.svh.start, span.svh.len())?,
-                            bias: None,
-                            x: item.x,
-                            xh: row(&scratch.xh, k * F32, index)?,
-                            z: row(&scratch.z, n * F32, index)?,
-                            out: item.out,
-                            flag: scratch.flag,
-                            rows: 1,
-                            split_k: 2,
-                            k,
-                            n,
-                            bits_twice: span.bits_twice,
-                            book: self.book,
-                            fused: false,
-                        },
-                        ids,
-                        slot: item.pick,
-                        members,
-                        trellis_stride: self.spans.trellis_stride,
-                        scale_stride: self.spans.scale_stride,
-                        offsets: None,
-                    });
+            let mut pairs = Vec::with_capacity(items.len());
+            for item in items {
+                // The bank and the ring staging are both record-strided; the item's
+                // source picks its weights, members and the spans over them. The strides
+                // are the record layout's, shared by the bank and the ring.
+                let (weights, members, spans) = if item.ring {
+                    let ((buffer, members), spans) = ring
+                        .zip(ring_spans.as_ref())
+                        .ok_or_else(|| refuse("a ring item without a ring".into()))?;
+                    (buffer, members, spans)
+                } else {
+                    (bank.0, bank.1, &self.spans)
+                };
+                let span = &spans.parts[item.part];
+                if span.shape != [k, n] {
+                    return Err(refuse("a launch group mixes matrix shapes".into()));
                 }
-                launch.ctx.exl3_grouped_indexed(
-                    launch.stream,
-                    &calls,
-                    launch.ctx.exl3_indexed_cols(n)?,
-                )?;
+                pairs.push(IndexedPair {
+                    span: Exl3BankSpan::from_parts(
+                        weights.range(span.trellis.start, span.trellis.len())?,
+                        weights.range(span.suh.start, span.suh.len())?,
+                        weights.range(span.svh.start, span.svh.len())?,
+                        members,
+                        self.spans.trellis_stride,
+                        self.spans.scale_stride,
+                        span.shape,
+                        span.bits_twice,
+                        self.book,
+                    ),
+                    slot: item.pick,
+                    x: item.x,
+                    out: item.out,
+                });
             }
-            Ok(())
+            grouped_indexed(launch, &pairs, ids, scratch)
         }
 
         /// One id-indexed launch group over the bank buffer of `layer`, chunked at the launch
