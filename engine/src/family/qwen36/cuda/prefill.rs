@@ -2751,11 +2751,135 @@ pub(super) mod phase_timing {
                 Stage::AttnOut => attn_out(run, &ctx)?,
                 Stage::NormF => norm_f(run, &ctx)?,
                 Stage::Route => chunk_route(run, &ctx)?,
-                Stage::Moe => chunk_moe(run, &ctx)?,
+                Stage::Moe => {
+                    let LayerMoe::Native(weights) = &moe else {
+                        unreachable!("phase_timing: the EXL3 arm is refused above")
+                    };
+                    run_chunk_moe_timed(launch, weights, run, &ctx, marks)?
+                }
             }
             marks.mark(launch.stream, stage_name(stage))?;
         }
         Ok(())
+    }
+
+    /// [`chunk_moe`] with the sub-mark split: shared (10a-f), routed (11-16: prep, gate+up,
+    /// swiglu, gather+down) and combine (17). The `io` construction mirrors `chunk_moe`.
+    fn run_chunk_moe_timed(
+        launch: &Launch<'_>,
+        moe: &MoeLayerWeights<'_>,
+        run: &ChunkRun<'_, '_>,
+        ctx: &LayerCtx<'_, '_>,
+        marks: &mut PhaseMarks,
+    ) -> Result<(), EngError> {
+        let io = MoeChunkIo {
+            m: run.rows.m(),
+            dims: run.model.dims_at(run.rows.m()),
+            x2: run.v(ChunkSlot::X2)?,
+            ids: run.v(ChunkSlot::TopkId)?,
+            weights: run.v(ChunkSlot::TopkWeight)?,
+            shared_gate: run.v(ChunkSlot::SharedGate)?,
+            h: run.v(ChunkSlot::Hidden)?,
+            status: ctx.status,
+            scratch: &run.bufs.views,
+        };
+        run_chunk_shared(launch, moe, &io)?;
+        marks.mark(launch.stream, "moe_shared")?;
+        run_chunk_routed_timed(launch, moe, &io, marks)?;
+        marks.mark(launch.stream, "moe_routed")?;
+        combine_chunk_moe(launch, &io)?;
+        marks.mark(launch.stream, "moe_combine")
+    }
+
+    /// [`run_chunk_routed`] with marks after the ids build + scatter quant (prep), the gate+up
+    /// launches (gu), the swiglu, and the gather quant + down launch (down).
+    fn run_chunk_routed_timed(
+        launch: &Launch<'_>,
+        mw: &MoeLayerWeights<'_>,
+        io: &MoeChunkIo<'_>,
+        marks: &mut PhaseMarks,
+    ) -> Result<(), EngError> {
+        let (ctx, stream, m, dims, d) = (launch.ctx, launch.stream, io.m, &io.dims, io.scratch);
+        let ids = ctx.mmq_build_ids(
+            stream,
+            IdsGuardCall {
+                shape: chunk_mmid_shape(dims, m),
+                ids: io.ids,
+                ids_g: d.get(ChunkSlot::IdsG)?,
+                status: Some(io.status),
+            },
+            MmidIdsOut {
+                ids_src1: d.get(ChunkSlot::IdsSrc1)?,
+                ids_dst: d.get(ChunkSlot::IdsDst)?,
+                expert_bounds: d.get(ChunkSlot::ExpertBounds)?,
+            },
+        )?;
+        let gate = native_stack(&mw.gate)?;
+        ctx.mmq_quantize_scatter_ids(
+            stream,
+            &ids,
+            MmidQuantCall {
+                packing: crate::kernels::cuda::prefill::mmq_quant::MmqPacking::CpuReference,
+                quant: gate.quant(),
+                k: dims.hidden,
+                row_stride: dims.hidden,
+                x: io.x2,
+                y: d.get(ChunkSlot::Q8S)?,
+            },
+        )?;
+        marks.mark(stream, "moe_prep")?;
+        let gu = d.get(ChunkSlot::Gu)?;
+        let (up_off, up_len) = routed_up_view(gu.bytes(), dims)?;
+        let up_dst = gu.buffer().range(gu.offset() + up_off, up_len)?;
+        let launch_mmid =
+            |weight: &NativeWeight, y: DeviceRange<'_>, ld: usize, dst: DeviceRange<'_>| {
+                let n = weight.n_rows() / weight.experts().unwrap_or(1);
+                ctx.mmq_mmid_launch(
+                    stream,
+                    MmidLaunchCall {
+                        shape: ids.shape(),
+                        weight: routed_weight(weight, dims, weight.k(), n)?,
+                        ids: &ids,
+                        y,
+                        dst,
+                        ld,
+                        fixup: d.get(ChunkSlot::Fixup)?,
+                    },
+                )
+            };
+        let q8s = d.get(ChunkSlot::Q8S)?;
+        launch_mmid(gate, q8s, 2 * dims.inter, gu)?;
+        launch_mmid(native_stack(&mw.up)?, q8s, 2 * dims.inter, up_dst)?;
+        marks.mark(stream, "moe_gu")?;
+        ctx.swiglu_rows(
+            stream,
+            SwigluRowsCall {
+                shape: routed_swiglu(m, dims),
+                gu: d.get(ChunkSlot::Gu)?,
+                act: d.get(ChunkSlot::Act)?,
+            },
+        )?;
+        marks.mark(stream, "moe_swiglu")?;
+        let down = native_stack(&mw.down)?;
+        ctx.mmq_quantize_gather_ids(
+            stream,
+            &ids,
+            MmidQuantCall {
+                packing: crate::kernels::cuda::prefill::mmq_quant::MmqPacking::CpuReference,
+                quant: down.quant(),
+                k: dims.inter,
+                row_stride: dims.inter,
+                x: d.get(ChunkSlot::Act)?,
+                y: d.get(ChunkSlot::Q8Act)?,
+            },
+        )?;
+        launch_mmid(
+            down,
+            d.get(ChunkSlot::Q8Act)?,
+            dims.hidden,
+            d.get(ChunkSlot::Down)?,
+        )?;
+        marks.mark(stream, "moe_down")
     }
 
     /// [`run_chunk_body`] with marks: `start`, `embed`, then every stage of every layer.

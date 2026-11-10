@@ -2568,7 +2568,7 @@ fn phase_shares_row(name: &str, kv_mode: KvMode) {
     let mut stage_totals: Vec<(&str, f32)> = Vec::new();
     const RUNS: usize = 3;
     for _ in 0..RUNS {
-        let mut marks = PhaseMarks::new(&rig.ctx, 4 + RIG_LAYERS * 16).expect("marks");
+        let mut marks = PhaseMarks::new(&rig.ctx, 8 + RIG_LAYERS * 24).expect("marks");
         run_chunk_body_timed(&launch, &run, &mut marks).expect("timed body");
         rig.stream.synchronize().expect("run sync");
         let shares = marks.shares().expect("shares");
