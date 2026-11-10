@@ -649,80 +649,93 @@ __global__ void gdn_out_gate_k(ScanArgs a) {
 // and the written bytes are those of the sequential kernels, so the same driver call and
 // the same out-gate kernel (K2 above) serve it unchanged.
 //
-// Launch: grid (n_v_heads, 1, D / kHalf), block (kLanes, kChunkWarps) = 256 threads; one
-// block owns kHalf = 64 value columns of one head and walks the m rows in kC-token
-// sub-chunks. The D × 64 state slice lives in shared memory for the whole launch; each
-// sub-chunk stages the L2-normalized K̂ and Q̂ rows (row stride D + 1: the odd stride breaks
-// the 32-bank cycle of a 128-float row for every access pattern below), the block's 64 V
-// columns, the decay/beta gates with their prefix products, the strict-lower G matrix and
-// the masked A matrix, then solves U and emits the outputs in ONE warp-local loop (each of
-// the 8 warps owns 8 value columns; its 4 lanes per column split the 128-term dots and the
-// back-substitution sums with a xor 2,1 tree, so no barrier sits inside the token loop),
-// then applies the sub-chunk's single state update across all threads. The ratio B_t/B_s
-// is a running product, never a division: B_t itself underflows fp32 around 0.5^32 while
-// the ratios stay in range. No thread leaves before the barrier of the phase it reads.
+// Launch: grid (n_v_heads, 1, D / kCols), block (kLanes, kChunkWarps) = 512 threads; one
+// block owns kCols value columns of one head and walks the m rows in kC-token
+// sub-chunks. All hot reads are 128-bit: K̂/Q̂/S rows live with row stride D + 4 (a multiple
+// of four floats, so rows stay 16-byte aligned and the +4 varies the bank across the eight
+// lanes of an LDS.128 phase group), and every U/G/A/seen matrix is stored value-major with
+// row stride kC + 4 for the same reason. Per sub-chunk: stage K̂/Q̂/V and the gates (P),
+// the two kC×kC coefficient matrices (G), all kC state-seen dots as one parallel pass (M1:
+// seen = B_t·Sᵀk̂_t for every (t, c) pair), the forward substitution as a lean serial pass
+// (serial: one lane per value column, warps 0–1, each token one broadcast G read, one
+// per-lane seen read and a t-term in-lane back sum — no cross-lane traffic at all), the
+// outputs (M2: B_t·q̂ᵀS + the masked A·U sum, both operands float4 streams) and the single
+// decayed rank-kC state update across all threads (update). The ratio B_t/B_s is a running
+// product per Gram element, never a division: B_t itself underflows fp32 around 0.5^32
+// while the ratios stay in range. No thread leaves before the barrier of the phase it reads.
 //
 // The rounding of this form differs from the sequential kernels' (deeper dot trees inside
 // the solve against none in the token loop); both are pinned to the same f64 reference by
 // their tests, each with its own derived bound. No mutants yet: the mutation bank targets
 // the sequential kernels; adding the chunk instances is deferred until the kernel earns a
 // production default.
-constexpr int kC = 32;         // sub-chunk tokens (the solve's kC-step chain)
-constexpr int kChunkWarps = 8; // warps per block, one per 8 value columns
-constexpr int kHalf = 64;      // value columns per block (grid.z = D / kHalf)
-constexpr int kStride = D + 1; // K̂/Q̂ row stride: the odd stride varies the bank with the row
-// The shared floats of one launch: K̂, Q̂, V, decay, beta, prefix, G, A, U, the state slice.
+constexpr int kC = 32;          // sub-chunk tokens (the solve's kC-step chain)
+constexpr int kChunkWarps = 16; // warps per block (512 threads; the serial pass uses 2)
+constexpr int kCols = 64;       // value columns per block (grid.z = D / kCols = 2: 32 blocks)
+constexpr int kDpad = D + 4;    // row stride of the r-major rows (16-byte aligned, bank-varying)
+constexpr int kCpad = kC + 4;   // row stride of the value-major matrices
+// The shared floats of one launch: K̂, Q̂, U (value-major, staged V solved in place), G, A,
+// the state-seen rows (value-major) and the D × kCols state slice (value-major).
 constexpr int kChunkFloats =
-    2 * kC * kStride + kC * kHalf + 3 * kC + 2 * kC * kC + kC * kHalf + D * kHalf;
+    2 * kC * kDpad + kCols * kCpad + 2 * kC * kCpad + kCols * kCpad + kCols * kDpad + 3 * kC;
 constexpr size_t kChunkSmem = kChunkFloats * sizeof(float);
 static_assert(kChunkSmem < 96 * 1024, "sm_72 caps opt-in shared memory at 96KB per block");
 
-// Sum over the 4 lanes of one column quad (lane = 4·column + quad); the xor offsets 2 and 1
-// stay inside each consecutive-4 lane quad, so every lane of the quad holds the same bits.
-__device__ float quad_sum(float v) {
-#pragma unroll
-    for (int o = 2; o > 0; o >>= 1) v += __shfl_xor_sync(0xffffffffu, v, o);
-    return v;
+__device__ __forceinline__ float dot4(float4 x, float4 y) {
+    return x.x * y.x + x.y * y.y + x.z * y.z + x.w * y.w;
 }
 
 template <bool kGrouped, bool kAddEps>
 __global__ void __launch_bounds__(kLanes * kChunkWarps, 1) gdn_scan_chunk_k(ScanArgs a) {
-    extern __shared__ float sm[];  // the layout of kChunkFloats, in the order below
-    float *const kh_s = sm;                       // K̂  [kC][kStride]
-    float *const q_s = kh_s + kC * kStride;       // Q̂  [kC][kStride]
-    float *const v_s = q_s + kC * kStride;        // V  [kC][kHalf], this block's columns
-    float *const dec_s = v_s + kC * kHalf;        // the decay gates a_t
-    float *const b_s = dec_s + kC;                // the beta gates
-    float *const B_s = b_s + kC;                  // the prefix products B_t
-    float *const G_s = B_s + kC;                  // G[t][s] = b_t·(B_t/B_s)·(k_t·k_s), s < t
-    float *const A_s = G_s + kC * kC;             // A[t][s] = (B_t/B_s)·(q_t·k_s), s ≤ t
-    float *const U_s = A_s + kC * kC;             // the solved rank-one rows [kC][kHalf]
-    float *const S_s = U_s + kC * kHalf;          // the state slice [D][kHalf]
+    extern __shared__ __align__(16) float sm[];  // the layout of kChunkFloats, in the order below
+    float *const kh_s = sm;                        // K̂  [kC][kDpad]
+    float *const q_s = kh_s + kC * kDpad;          // Q̂  [kC][kDpad]
+    float *const U_s = q_s + kC * kDpad;           // U  [kCols][kCpad], value-major: staged V, solved in place
+    float *const G_s = U_s + kCols * kCpad;        // G[t][s] = b_t·(B_t/B_s)·(k_t·k_s), s < t
+    float *const A_s = G_s + kC * kCpad;           // A[t][s] = (B_t/B_s)·(q_t·k_s), s ≤ t (upper zeroed)
+    float *const seen_s = A_s + kC * kCpad;        // B_t·(Sᵀk̂_t) [kCols][kCpad], value-major
+    float *const S_s = seen_s + kCols * kCpad;     // the state slice [kCols][kDpad], value-major
+    float *const dec_s = S_s + kCols * kDpad;      // the decay gates a_t
+    float *const b_s = dec_s + kC;                 // the beta gates
+    float *const B_s = b_s + kC;                   // the prefix products B_t
     const int h = blockIdx.x, kh = key_head<kGrouped>(h, a);
     const int lane = threadIdx.x, w = threadIdx.y;
     const int tid = lane + kLanes * w;
-    const int col0 = blockIdx.z * kHalf;
+    const int col0 = blockIdx.z * kCols;
     float *const st = a.state + (size_t)h * D * D;
     if ((long long)a.p0 < 0 || (long long)a.p0 + a.m > a.ctx_tokens) {
         if (a.status && blockIdx.x == 0 && blockIdx.z == 0 && tid == 0) {
             atomicOr(a.status, INFERENCE_CUDA_PREFILL_STATUS_BOUND_VIOLATION);
         }
-        for (int i = tid; i < a.m * kHalf; i += kLanes * kChunkWarps) {
-            a.o_out[((size_t)(i / kHalf) * a.n_v_heads + h) * D + col0 + i % kHalf] =
+        for (int i = tid; i < a.m * kCols; i += kLanes * kChunkWarps) {
+            a.o_out[((size_t)(i / kCols) * a.n_v_heads + h) * D + col0 + i % kCols] =
                 __int_as_float(0x7fc00000);
         }
         return;
     }
     const float a_h = a.a[h], dt_h = a.dt_bias[h];
-    for (int i = tid; i < D * kHalf; i += kLanes * kChunkWarps) {
-        S_s[i] = st[(size_t)(i / kHalf) * D + col0 + i % kHalf];
+    // The state slice loads and stores run over consecutive value columns per thread, so the
+    // global traffic is coalesced; the shared layout is value-major because every hot phase
+    // walks r or s with the lane pinned to one value column.
+    for (int i = tid; i < D * kCols; i += kLanes * kChunkWarps) {
+        const int c = i % kCols, r = i / kCols;
+        S_s[c * kDpad + r] = st[(size_t)r * D + col0 + c];
     }
-    const int c = w * 8 + (lane >> 2), cq = lane & 3;  // solve: warp w owns column c
+    // A's strict upper triangle and its padding stay zero for the whole launch: M2 reads
+    // A rows in 128-bit steps past the diagonal, and the zeros swallow the unwritten U
+    // entries of a short tail. G's upper and padding stay zero for the same reason: the
+    // serial pass reads its rows in 128-bit steps past the diagonal.
+    for (int i = tid; i < 2 * kC * kCpad; i += kLanes * kChunkWarps) {
+        const int t = i / kCpad, s = i % kCpad;
+        if (s > t) (i < kC * kCpad ? A_s : G_s)[i % (kC * kCpad)] = 0.f;
+    }
+    __syncthreads();
     for (int t0 = 0; t0 < a.m; t0 += kC) {
         const int len = min(kC, a.m - t0);
         // P, the staging: warp w stages slots j = w + i·kChunkWarps — the normalized q/k rows
         // (the same expressions as the sequential kernels, run once per slot), this block's
-        // V columns, and (warp 0, one lane per slot) the gates with the prefix products.
+        // V columns into U (value-major), and (warp 0, one lane per slot) the gates with the
+        // prefix products.
         for (int i = 0; i < kC / kChunkWarps; ++i) {
             const int j = w + i * kChunkWarps;
             const int row = min(t0 + j, a.m - 1);  // the clamp keeps the loads coalesced
@@ -744,12 +757,16 @@ __global__ void __launch_bounds__(kLanes * kChunkWarps, 1) gdn_scan_chunk_k(Scan
             const float kmul = rsqrtf(l2_den<kAddEps>(warp_sum(ss), a.eps));
 #pragma unroll
             for (int r = 0; r < 4; ++r) {
-                q_s[j * kStride + r * kLanes + lane] = qv[r] * qmul;
-                kh_s[j * kStride + r * kLanes + lane] = kv[r] * kmul;
+                q_s[j * kDpad + r * kLanes + lane] = qv[r] * qmul;
+                kh_s[j * kDpad + r * kLanes + lane] = kv[r] * kmul;
             }
-            v_s[j * kHalf + lane] = rw[2 * a.n_k_heads * D + h * D + col0 + lane];
-            v_s[j * kHalf + kLanes + lane] =
-                rw[2 * a.n_k_heads * D + h * D + col0 + kLanes + lane];
+#pragma unroll
+            for (int cv = 0; cv < (kCols + kLanes - 1) / kLanes; ++cv) {
+                if (cv * kLanes + lane < kCols) {
+                    U_s[(cv * kLanes + lane) * kCpad + j] =
+                        rw[2 * a.n_k_heads * D + h * D + col0 + cv * kLanes + lane];
+                }
+            }
         }
         if (w == 0) {
             // One lane per slot reads its projection row; lanes beyond len carry the
@@ -770,71 +787,113 @@ __global__ void __launch_bounds__(kLanes * kChunkWarps, 1) gdn_scan_chunk_k(Scan
             }
             B_s[lane] = pre;
         }
-        __syncthreads();  // P's writes are visible to G and the solve
-        // G, the two kC×kC coefficient matrices: thread (t, j8) owns the s ≡ j8 (mod 8)
-        // entries of row t, walking s down from t so the ratio B_t/B_s is a running
-        // product (never a division: B_t underflows fp32 long before the ratio does).
-        // The diagonal A[t][t] (ratio 1) belongs to the one thread with j8 == t & 7.
+        __syncthreads();  // P's writes are visible to G, M1 and the serial pass
+        // G, the two kC×kC coefficient matrices, as an element list: thread e owns element
+        // e (e < kC is A's diagonal t = e; e ≥ kC is the strict-lower pair (t, s) numbered
+        // down from (kC−1, kC−2)). Each element takes its own running ratio product — never
+        // a division: B_t underflows fp32 long before the ratio does.
+        for (int e = tid; e < kC * (kC + 1) / 2; e += kLanes * kChunkWarps) {
+            int t, s;
+            if (e < kC) {
+                t = e;
+                s = t;
+            } else {
+                const int k = e - kC;
+                t = 1;
+                // the strict-lower pairs in row order: (1,0), (2,0), (2,1), (3,0)… — t is the
+                // smallest row whose cumulative count t(t+1)/2 exceeds k.
+                while (t * (t + 1) / 2 <= k) ++t;
+                s = k - t * (t - 1) / 2;
+            }
+            float ratio = 1.f;
+            for (int i = s + 1; i <= t; ++i) ratio *= dec_s[i];
+            const float4 *kt = reinterpret_cast<const float4 *>(kh_s + t * kDpad);
+            const float4 *qt = reinterpret_cast<const float4 *>(q_s + t * kDpad);
+            const float4 *ks = reinterpret_cast<const float4 *>(kh_s + s * kDpad);
+            float kk = 0.f, qk = 0.f;
+#pragma unroll 4
+            for (int r = 0; r < D / 4; ++r) {
+                kk += dot4(kt[r], ks[r]);
+                qk += dot4(qt[r], ks[r]);
+            }
+            if (s != t) {
+                G_s[t * kCpad + s] = b_s[t] * ratio * kk;
+                A_s[t * kCpad + s] = ratio * qk;
+            } else {
+                A_s[t * kCpad + t] = qk;
+            }
+        }
+        __syncthreads();  // G's writes are visible to the serial pass and M2
+        // M1, every state-seen term of the sub-chunk in one parallel pass: thread (t, c)
+        // walks r in 128-bit steps — K̂'s row is a warp-wide broadcast, the state row is the
+        // lane's own value column.
         {
-            const int t = tid >> 3, j8 = tid & 7;
-            if (t < len) {
-                if ((t & 7) == j8) {
-                    float qk = 0.f;
-#pragma unroll 8
-                    for (int r = 0; r < D; ++r) {
-                        qk += q_s[t * kStride + r] * kh_s[t * kStride + r];
-                    }
-                    A_s[t * kC + t] = qk;
-                }
-                float ratio = 1.f;
-                for (int s = t - 1; s >= 0; --s) {
-                    ratio *= dec_s[s + 1];
-                    if ((s & 7) != j8) continue;
-                    float kk = 0.f, qk = 0.f;
-#pragma unroll 8
-                    for (int r = 0; r < D; ++r) {
-                        kk += kh_s[t * kStride + r] * kh_s[s * kStride + r];
-                        qk += q_s[t * kStride + r] * kh_s[s * kStride + r];
-                    }
-                    G_s[t * kC + s] = b_s[t] * ratio * kk;
-                    A_s[t * kC + s] = ratio * qk;
-                }
+            const int c = tid % kCols, tg = tid / kCols;
+            const int tgs = kLanes * kChunkWarps / kCols;
+            for (int i = 0; i < kC / tgs; ++i) {
+                const int t = tg + tgs * i;
+                if (t >= len) break;
+                const float4 *kt = reinterpret_cast<const float4 *>(kh_s + t * kDpad);
+                const float4 *sc = reinterpret_cast<const float4 *>(S_s + c * kDpad);
+                float acc = 0.f;
+#pragma unroll 4
+                for (int r = 0; r < D / 4; ++r) acc += dot4(kt[r], sc[r]);
+                seen_s[c * kCpad + t] = B_s[t] * acc;
             }
         }
-        __syncthreads();  // G's writes are visible to the solve
-        // The solve and the outputs, one warp-local pass: for each token t, the state-seen
-        // dot w_t = B_t·(Sᵀk_t), the substituted row u_t, then the output o_t — every read
-        // of U_s[s] with s < t comes from an earlier iteration of the same warp, and the
-        // s == t read sits behind the __syncwarp of the u store, so no barrier is needed.
-        for (int t = 0; t < len; ++t) {
-            float wpart = 0.f;
-#pragma unroll 8
-            for (int i = 0; i < D / 4; ++i) {
-                const int r = 4 * i + cq;
-                wpart += kh_s[t * kStride + r] * S_s[r * kHalf + c];
-            }
-            const float seen = B_s[t] * quad_sum(wpart);
-            float back = 0.f;
-            for (int s = cq; s < t; s += 4) back += G_s[t * kC + s] * U_s[s * kHalf + c];
-            const float u = b_s[t] * (v_s[t * kHalf + c] - seen) - quad_sum(back);
-            if (cq == 0) U_s[t * kHalf + c] = u;
-            __syncwarp();
-            float opart = 0.f;
-#pragma unroll 8
-            for (int i = 0; i < D / 4; ++i) {
-                const int r = 4 * i + cq;
-                opart += q_s[t * kStride + r] * S_s[r * kHalf + c];
-            }
-            // The inter term is block-uniform, so it joins AFTER the quad sum of the
-            // masked intra sum (summing it across the quad would count it four times).
-            float intra = 0.f;
-            for (int s = cq; s <= t; s += 4) intra += A_s[t * kC + s] * U_s[s * kHalf + c];
-            const float o = B_s[t] * quad_sum(opart) + quad_sum(intra);
-            if (cq == 0) {
-                a.o_out[((size_t)(t0 + t) * a.n_v_heads + h) * D + col0 + c] = o;
+        __syncthreads();  // M1's writes are visible to the serial pass
+        // The forward substitution, one lane per value column (the first kCols/32 warps):
+        // every read is the lane's own U/seen entry or a broadcast G coefficient, so the
+        // kC-step chain carries no cross-lane traffic at all.
+        const int cl = w * kLanes + lane;
+        if (cl < kCols) {
+            const int c = cl;
+            for (int t = 0; t < len; ++t) {
+                const float4 *g = reinterpret_cast<const float4 *>(G_s + t * kCpad);
+                const float4 *uc = reinterpret_cast<const float4 *>(U_s + c * kCpad);
+                float4 back = make_float4(0.f, 0.f, 0.f, 0.f);
+#pragma unroll 2
+                for (int s = 0; s < t / 4; ++s) {
+                    const float4 gs = g[s], us = uc[s];
+                    back.x += gs.x * us.x;
+                    back.y += gs.y * us.y;
+                    back.z += gs.z * us.z;
+                    back.w += gs.w * us.w;
+                }
+                float tail = 0.f;
+                for (int s = 4 * (t / 4); s < t; ++s)
+                    tail += G_s[t * kCpad + s] * U_s[c * kCpad + s];
+                float b = back.x + back.y + back.z + back.w + tail;
+                const float u =
+                    b_s[t] * (U_s[c * kCpad + t] - seen_s[c * kCpad + t]) - b;
+                U_s[c * kCpad + t] = u;
             }
         }
-        __syncthreads();  // every warp's U rows and reads of S are done before the update
+        __syncthreads();  // the solved U rows are visible to M2 and the update
+        // M2, the outputs: thread (t, c) adds the inter term B_t·q̂ᵀS (an r walk like M1) and
+        // the masked intra sum A·U (an s walk; both operands are 128-bit streams, A's zeroed
+        // upper bounds the walk at the diagonal quad).
+        {
+            const int c = tid % kCols, tg = tid / kCols;
+            const int tgs = kLanes * kChunkWarps / kCols;
+            for (int i = 0; i < kC / tgs; ++i) {
+                const int t = tg + tgs * i;
+                if (t >= len) break;
+                const float4 *qt = reinterpret_cast<const float4 *>(q_s + t * kDpad);
+                const float4 *sc = reinterpret_cast<const float4 *>(S_s + c * kDpad);
+                float inter = 0.f;
+#pragma unroll 4
+                for (int r = 0; r < D / 4; ++r) inter += dot4(qt[r], sc[r]);
+                const float4 *at = reinterpret_cast<const float4 *>(A_s + t * kCpad);
+                const float4 *uc = reinterpret_cast<const float4 *>(U_s + c * kCpad);
+                float intra = 0.f;
+#pragma unroll 2
+                for (int s = 0; s <= t / 4; ++s) intra += dot4(at[s], uc[s]);
+                a.o_out[((size_t)(t0 + t) * a.n_v_heads + h) * D + col0 + c] =
+                    B_s[t] * inter + intra;
+            }
+        }
+        __syncthreads();  // M2's reads of S, A and U are done before the update writes S
         // The sub-chunk's single state update: S ← B_end·S + Σ_s (B_end/B_s)·k_s u_sᵀ, with
         // the tail ratios staged into B_s by thread 0 (B_s's prefix products are spent).
         if (tid == 0) {
@@ -846,18 +905,24 @@ __global__ void __launch_bounds__(kLanes * kChunkWarps, 1) gdn_scan_chunk_k(Scan
         }
         __syncthreads();
         const float b_end = B_s[0] * dec_s[0];
-        for (int i = tid; i < D * kHalf; i += kLanes * kChunkWarps) {
-            const int r = i / kHalf, cc = i % kHalf;
-            float acc = 0.f;
-            for (int s = 0; s < len; ++s) {
-                acc += B_s[s] * kh_s[s * kStride + r] * U_s[s * kHalf + cc];
+        {
+            // thread (c, r): U and B are warp broadcasts, K̂'s column is the lane's own r —
+            // one full-width shared read per term.
+            const int r = tid & (D - 1), cg = tid >> 7;
+            for (int i = 0; i < kCols / 4; ++i) {
+                const int c = cg + 4 * i;
+                float acc = 0.f;
+                for (int s = 0; s < len; ++s) {
+                    acc += B_s[s] * kh_s[s * kDpad + r] * U_s[c * kCpad + s];
+                }
+                S_s[c * kDpad + r] = S_s[c * kDpad + r] * b_end + acc;
             }
-            S_s[i] = S_s[i] * b_end + acc;
         }
-        __syncthreads();  // the update's writes are visible to the next sub-chunk's staging
+        __syncthreads();  // the update's writes are visible to the next sub-chunk's phases
     }
-    for (int i = tid; i < D * kHalf; i += kLanes * kChunkWarps) {
-        st[(size_t)(i / kHalf) * D + col0 + i % kHalf] = S_s[i];
+    for (int i = tid; i < D * kCols; i += kLanes * kChunkWarps) {
+        const int c = i % kCols, r = i / kCols;
+        st[(size_t)r * D + col0 + c] = S_s[c * kDpad + r];
     }
 }
 
@@ -936,7 +1001,7 @@ Failure launch_chunk_form(const ScanArgs &k, void *stream) {
     }();
     (void)opted_in;
     gdn_scan_chunk_k<kGrouped, kAddEps>
-        <<<dim3(k.n_v_heads, 1, D / kHalf), dim3(kLanes, kChunkWarps), kChunkSmem,
+        <<<dim3(k.n_v_heads, 1, D / kCols), dim3(kLanes, kChunkWarps), kChunkSmem,
            (cudaStream_t)stream>>>(k);
     failure.record(cudaGetLastError(), INFERENCE_CUDA_STAGE_LAUNCH);
     if (failure.err == cudaSuccess) {
