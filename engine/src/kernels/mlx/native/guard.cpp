@@ -4328,13 +4328,11 @@ static int compile_delta_layer_body(
   if (status == 0) status = inference_mlx_multiply(&weighted.value, eo.value, gates.value, s);
   if (status == 0) status = inference_mlx_sum_axis(&expert_rows.value, weighted.value, 1, false, s);
   {
-    const int* eo_shape = mlx_array_shape(eo.value);
-    if (status == 0 && (eo_shape == nullptr || mlx_array_ndim(eo.value) != 3)) {
-      status = 1;
-    } else if (status == 0) {
-      const int experts_shape[2] = {rows, eo_shape[2]};
+    // expert_rows is [T, 1, H] after the expert-axis sum (eo is 4-D like `stacked`); the
+    // layer sum needs [T, H], exactly the rows body's `out_shape` reshape.
+    const int experts_shape[2] = {rows, p->hidden};
+    if (status == 0)
       status = inference_mlx_reshape(&experts.value, expert_rows.value, experts_shape, 2, s);
-    }
   }
   // Shared expert: sigmoid(x . scalar) * down(silu(gate(x)) * up(x)), folded like the rows body.
   if (status == 0)

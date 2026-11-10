@@ -1217,7 +1217,7 @@ impl Context {
         inputs.push(args.in_norm.storage.native_array());
         inputs.push(args.post_norm.storage.native_array());
         inputs.push(args.router_t.storage.native_array());
-        for weight in args.shared.iter().chain(args.stacks.iter()) {
+        for weight in args.shared.iter() {
             inputs.push(weight.payload().storage.native_array());
             inputs.push(weight.scales().storage.native_array());
             inputs.push(
@@ -1228,6 +1228,16 @@ impl Context {
             );
         }
         inputs.push(args.shared_scalar_t.storage.native_array());
+        for weight in args.stacks.iter() {
+            inputs.push(weight.payload().storage.native_array());
+            inputs.push(weight.scales().storage.native_array());
+            inputs.push(
+                weight
+                    .biases()
+                    .map(|biases| biases.storage.native_array())
+                    .unwrap_or(ffi::NULL_ARRAY),
+            );
+        }
         debug_assert_eq!(inputs.len(), 44);
         for weight in packed_all.iter() {
             keep.push(weight.payload().share());

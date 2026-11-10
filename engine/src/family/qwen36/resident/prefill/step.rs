@@ -333,12 +333,15 @@ fn run(
             && !(mode == StepMode::Prompt && index == last)
             && decoder.routing == Routing::Device
             && compiled_layer_on()
+            // The fused `gdn_prep` kernel inside the closure carries the production head
+            // layout (the same gate as the eager fused prefill); other dims stay eager.
+            && shape.delta.key_heads == 16
+            && shape.delta.key_dim == 128
+            && shape.delta.value_heads == 32
+            && shape.delta.value_dim == 128
         {
-            if let (
-                RMixer::Delta(w),
-                LayerState::Delta { rec, ring },
-                RFeedForward::Moe(moe_w),
-            ) = (&layer.mixer, &old_layer, &layer.feed_forward)
+            if let (RMixer::Delta(w), LayerState::Delta { rec, ring }, RFeedForward::Moe(moe_w)) =
+                (&layer.mixer, &old_layer, &layer.feed_forward)
             {
                 let d = &shape.delta;
                 let s = ctx.kernels.compiled_delta_layer(&CompileDeltaLayerArgs {
@@ -793,6 +796,142 @@ mod tests {
                 &some(next.logits, &format!("{what} next logits")),
                 &after.logits,
                 &format!("{what} next logits"),
+            );
+        }
+    }
+
+    #[test]
+    fn the_compiled_layer_flag_keeps_non_fused_dims_on_the_eager_chunk() {
+        let _serial = crate::native_test_lock();
+        use super::super::super::executor::COMPILED_LAYER_TEST;
+        use std::sync::atomic::Ordering;
+        let ckpt = setup();
+        let (mut decoder, _) = decoder_and_oracle(&ckpt, 1024);
+        decoder.set_routing(Routing::Device);
+        // The tiny model's head layout is not the fused `gdn_prep` layout the closure bakes, so
+        // the forced flag must NOT route any layer: identical native-entry count and identical
+        // step result. (Byte parity of the routed closure itself is the ignored real-checkpoint
+        // test below - the production head layout only exists there.)
+        for rows in [2u32, 3, 8] {
+            let tokens: Vec<u32> = (0..rows).map(token).collect();
+            let mut a = decoder.zero_state().unwrap();
+            let eager = ok(decoder.prefill(&mut a, &tokens, StepMode::Window), "eager");
+            crate::kernels::mlx::reset_dispatch_count();
+            COMPILED_LAYER_TEST.store(true, Ordering::Relaxed);
+            let mut b = decoder.zero_state().unwrap();
+            let flagged =
+                ok(decoder.prefill(&mut b, &tokens, StepMode::Window), "flagged");
+            let ops = crate::kernels::mlx::dispatch_count();
+            COMPILED_LAYER_TEST.store(false, Ordering::Relaxed);
+            assert_eq!(eager, flagged, "rows {rows}: the flag changes nothing here");
+            let mut c = decoder.zero_state().unwrap();
+            crate::kernels::mlx::reset_dispatch_count();
+            ok(decoder.prefill(&mut c, &tokens, StepMode::Window), "count");
+            let plain_ops = crate::kernels::mlx::dispatch_count();
+            assert_eq!(
+                ops, plain_ops,
+                "rows {rows}: the forced flag made zero extra native entries (the gate held)"
+            );
+        }
+    }
+
+    /// The B1 acceptance oracle on the production checkpoint: the same device-routed Window
+    /// chunk runs eager and through the compiled whole-layer closure, and EVERY compared byte
+    /// must match - the step result, and each DeltaNet layer's recurrent state and ring. This
+    /// also decides the `moe::chunk_device`-versus-rows-sequence numerics question at batch T:
+    /// the closure replays the rows sequence, so byte equality proves the two agree exactly.
+    /// Ignored without the checkpoint: run on the Mac with `Q36_CKPT_DIR` set (the tokenizer
+    /// file is not needed - fixed token ids keep the comparison input-identical).
+    #[test]
+    #[ignore = "needs the real checkpoint: set Q36_CKPT_DIR"]
+    fn the_compiled_layer_chunk_is_byte_equal_on_the_real_checkpoint() {
+        let _serial = crate::native_test_lock();
+        use super::super::super::executor::COMPILED_LAYER_TEST;
+        use std::sync::atomic::Ordering;
+        let dir = super::super::super::real::env_path("Q36_CKPT_DIR");
+        let real = super::super::super::real::open(&dir);
+        let host = crate::family::qwen36::host_load::HostWeights::load(
+            &real.ckpt,
+            &crate::family::spec::QWEN3_6_35B_A3B,
+            &real.config,
+        )
+        .unwrap();
+        let mut decoder = crate::family::qwen36::resident::decoder::ResidentDecoder::
+            new_with_activation(
+            crate::kernels::MlxKernels::try_new().unwrap(),
+            &real.ckpt,
+            host,
+            512,
+            crate::family::qwen36::settings::Activation::Bf16,
+        )
+        .unwrap();
+        decoder.routing = Routing::Device;
+        let bits = |kernels: &mut crate::kernels::MlxKernels, t: &ExecutionTensor| -> Vec<u32> {
+            ok(values(kernels, t), "values")
+                .iter()
+                .map(|v| v.to_bits())
+                .collect()
+        };
+        let tokens: Vec<u32> = (11..19).collect();
+        for rows in [2usize, 3, 8] {
+            let toks = &tokens[..rows];
+            crate::kernels::mlx::reset_dispatch_count();
+            let mut eager_state = decoder.zero_state().unwrap();
+            let eager = ok(
+                decoder.prefill(&mut eager_state, toks, StepMode::Window),
+                "eager",
+            );
+            let eager_ops = crate::kernels::mlx::dispatch_count();
+            COMPILED_LAYER_TEST.store(true, Ordering::Relaxed);
+            crate::kernels::mlx::reset_dispatch_count();
+            let mut compiled_state = decoder.zero_state().unwrap();
+            let compiled = ok(
+                decoder.prefill(&mut compiled_state, toks, StepMode::Window),
+                "compiled",
+            );
+            let compiled_ops = crate::kernels::mlx::dispatch_count();
+            COMPILED_LAYER_TEST.store(false, Ordering::Relaxed);
+            assert_eq!(eager, compiled, "rows {rows}: the whole step result matches");
+            for (l, (a, b)) in eager_state
+                .layers()
+                .iter()
+                .zip(compiled_state.layers())
+                .enumerate()
+            {
+                match (a, b) {
+                    (
+                        LayerState::Delta {
+                            rec: a_rec,
+                            ring: a_ring,
+                        },
+                        LayerState::Delta {
+                            rec: b_rec,
+                            ring: b_ring,
+                        },
+                    ) => {
+                        assert_eq!(
+                            bits(&mut decoder.kernels, a_rec),
+                            bits(&mut decoder.kernels, b_rec),
+                            "rows {rows} layer {l}: the recurrent state is byte equal"
+                        );
+                        assert_eq!(
+                            bits(&mut decoder.kernels, a_ring),
+                            bits(&mut decoder.kernels, b_ring),
+                            "rows {rows} layer {l}: the ring is byte equal"
+                        );
+                    }
+                    (LayerState::Attn(a), LayerState::Attn(b)) => {
+                        assert_eq!(a.len, b.len, "rows {rows} layer {l}: cache length")
+                    }
+                    _ => panic!("rows {rows} layer {l}: state kind mismatch"),
+                }
+            }
+            println!(
+                "COMPILED_LAYER_PARITY rows={rows} eager_ops={eager_ops} compiled_ops={compiled_ops}"
+            );
+            assert!(
+                compiled_ops * 2 < eager_ops,
+                "rows {rows}: compiled {compiled_ops} entries must be under half of eager {eager_ops} (the residue is the still-eager attention layers and the head)"
             );
         }
     }
