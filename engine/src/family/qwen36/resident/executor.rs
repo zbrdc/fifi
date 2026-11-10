@@ -121,6 +121,7 @@ pub(crate) struct Q36Rules {
     /// member, default false. When true, the decoder warms both blocks once at load, so a trace
     /// failure fails the load instead of a request.
     pub(crate) compile: bool,
+    pub(crate) compile_program_limit: crate::kernels::compile_key::ProgramLimit,
     /// The admitted concurrent sessions. One preserves the legacy solo lifecycle.
     pub(crate) max_seqs: usize,
     /// The limits of this executor's prefix store: the start maps the `prefix_reuse` flag to two
@@ -524,12 +525,13 @@ impl Q36Executor {
     /// Builds the executor from loaded parts. The rules are checked again before the import, so a
     /// caller that skips `open` cannot skip them.
     pub(crate) fn from_parts(
-        kernels: MlxKernels,
+        mut kernels: MlxKernels,
         ckpt: &'static StreamedCheckpoint,
         host: HostWeights,
         rules: Q36Rules,
     ) -> Result<(Self, Q36Session)> {
         admit(host.shape(), &rules)?;
+        kernels.set_program_limit(rules.compile_program_limit)?;
         let fixed_state_bytes = if rules.max_seqs > 1 {
             fixed_session_bytes(host.shape())?
         } else {
@@ -1076,6 +1078,7 @@ mod tests {
             sampler_vocab,
             context_limit: LIMIT,
             session_cap: u64::from(LIMIT) * GROWTH,
+            compile_program_limit: Default::default(),
             max_seqs: 1,
             activation: Activation::F32,
             kv_dtype: KvDtype::F32,
@@ -1721,6 +1724,7 @@ mod tests {
             sampler_vocab: 248_077,
             context_limit: 32_768,
             session_cap: 40_960 * 32_768,
+            compile_program_limit: Default::default(),
             max_seqs: 1,
             activation: Activation::F32,
             kv_dtype: KvDtype::F32,
@@ -1960,6 +1964,7 @@ mod tests {
             sampler_vocab,
             context_limit,
             session_cap,
+            compile_program_limit: Default::default(),
             max_seqs: 1,
             activation: Activation::F32,
             kv_dtype: KvDtype::F32,
@@ -2039,6 +2044,7 @@ mod tests {
             sampler_vocab: VOCAB,
             context_limit: CHUNK_LIMIT,
             session_cap: u64::from(CHUNK_LIMIT) * GROWTH,
+            compile_program_limit: Default::default(),
             max_seqs: 1,
             activation: Activation::F32,
             kv_dtype: KvDtype::F32,
@@ -2963,6 +2969,7 @@ mod tests {
             activation: Activation::F32,
             kv_dtype: KvDtype::F32,
             compile: false,
+            compile_program_limit: Default::default(),
         };
         let (mut executor, mut session) = Q36Executor::open(&ckpt_dir, cache_limit, rules).unwrap();
         let mut job = GenerationState::new(IncrementalDecoder::new(&tokenizer)).with_max_tokens(32);
@@ -3068,6 +3075,7 @@ mod tests {
             sampler_vocab: 248_320,
             context_limit: 256,
             session_cap: 1 << 30,
+            compile_program_limit: Default::default(),
             max_seqs: 1,
             activation: activation_from_env(),
             kv_dtype: kv_dtype_from_env(),
@@ -3188,6 +3196,7 @@ mod tests {
             sampler_vocab: 248_320,
             context_limit: 4_096,
             session_cap: 4_096 * 40_960,
+            compile_program_limit: Default::default(),
             max_seqs: 1,
             activation: activation_from_env(),
             kv_dtype: kv_dtype_from_env(),
@@ -3310,6 +3319,7 @@ mod tests {
             sampler_vocab: VOCAB,
             context_limit: PREFIX_LIMIT,
             session_cap: 100_000,
+            compile_program_limit: Default::default(),
             max_seqs: 1,
             activation: Activation::F32,
             kv_dtype: KvDtype::F32,
@@ -3327,6 +3337,7 @@ mod tests {
             sampler_vocab: VOCAB,
             context_limit: PREFIX_LIMIT,
             session_cap: 25_000,
+            compile_program_limit: Default::default(),
             max_seqs: 1,
             activation: Activation::F32,
             kv_dtype: KvDtype::F32,

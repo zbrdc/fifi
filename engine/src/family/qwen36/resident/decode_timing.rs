@@ -1188,6 +1188,7 @@ fn speculative_decode_timing() {
         activation,
         kv_dtype: kv,
         compile,
+        compile_program_limit: Default::default(),
         max_seqs: 1,
         prefix_store: StoreLimits::default(),
     };

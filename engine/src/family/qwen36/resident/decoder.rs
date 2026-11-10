@@ -384,7 +384,7 @@ impl<'c> ResidentDecoder<'c> {
     /// Turns the compiled decode blocks on or off. Turning them on admits the WHOLE model first
     /// — every DeltaNet layer and every device-routed MoE layer's weight facts over the warm-up
     /// plan — and refuses the load with `EngError::Backend { operation: "compile_warm_up", .. }`
-    /// when the plan refuses (a packed weight without biases, more than four distinct programs),
+    /// when the plan refuses (a packed weight without biases, more programs than the adapter budget),
     /// so no compiled call can fail in the middle of a request. The warm-up then traces ONE
     /// layer per distinct cache key on zero tensors, evaluates the traced results, and records
     /// the per-block seconds in `compile_warmup`, so the first token of the first request
@@ -470,7 +470,14 @@ impl<'c> ResidentDecoder<'c> {
                 RFeedForward::Dense(_) => None,
             })
             .collect::<Result<_, EngError>>()?;
-        let plan = super::compile_plan::model_warmup(true, true, &delta_facts, &moe_facts, &[])?;
+        let plan = super::compile_plan::model_warmup(
+            self.kernels.program_limit(),
+            true,
+            true,
+            &delta_facts,
+            &moe_facts,
+            &[],
+        )?;
         if delta_facts.iter().any(|facts| facts.dims[5] <= 1) {
             return Err(EngError::BadRequest(
                 "compiled DeltaNet rows need more than one convolution tap".into(),
@@ -614,6 +621,7 @@ impl<'c> ResidentDecoder<'c> {
             })
             .collect::<Result<Vec<_>, EngError>>()?;
         let plan = super::compile_plan::model_warmup(
+            self.kernels.program_limit(),
             self.compile,
             self.routing == Routing::Device,
             &delta_facts,

@@ -117,9 +117,10 @@ fn refuse_biasless<const N: usize>(
 /// layer compiles on the device-routed path alone — a host-routed decoder runs its MoE through
 /// the uncompiled parity reference, so the plan skips the MoE weights entirely there. A packed
 /// weight without biases is refused for the blocks that compile, and the model may need at most
-/// `compile_key::PROGRAM_LIMIT` distinct programs: more is a model this adapter cannot serve
+/// the adapter's configured budget of distinct programs: more is a model it cannot serve
 /// compiled, refused HERE at load instead of at the first token that reaches a new layer.
 pub(super) fn model_warmup(
+    limit: compile_key::ProgramLimit,
     compile: bool,
     device_routing: bool,
     delta: &[DeltaLayerFacts],
@@ -218,14 +219,14 @@ pub(super) fn model_warmup(
     // closures); the post key's attention-core dtype is fixed per decoder (one cache form),
     // so it is one post program per set however the cache form is configured.
     let total = delta_plan.len() + moe_plan.len() + 2 * attn_plan.len();
-    if total > compile_key::PROGRAM_LIMIT {
+    if total > limit.get() {
         return Err(EngError::BadRequest(format!(
             "the model needs {total} distinct compiled programs ({} delta, {} moe, {} attn); at \
              most {} fit one adapter",
             delta_plan.len(),
             moe_plan.len(),
             2 * attn_plan.len(),
-            compile_key::PROGRAM_LIMIT
+            limit.get()
         )));
     }
     Ok(Warmup {
@@ -238,6 +239,76 @@ pub(super) fn model_warmup(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Portable source pin for the native-only wiring; execution still needs the Mac gate.
+    #[test]
+    fn program_budget_native_wiring_is_before_warmup_and_shared_with_plan() {
+        let start = include_str!("../start.rs");
+        assert!(start.contains("compile_program_limit: settings.compile_program_limit,"));
+        let executor = include_str!("executor.rs");
+        let configure = executor
+            .find("kernels.set_program_limit(rules.compile_program_limit)?;")
+            .unwrap();
+        let construct = executor
+            .find("let mut decoder = ResidentDecoder::new_with_kv(")
+            .unwrap();
+        let warmup = executor.find("decoder.set_compile(true)?;").unwrap();
+        assert!(configure < construct && construct < warmup);
+        let wrapper = include_str!("../../../kernels/mlx/mod.rs");
+        assert!(wrapper.contains("self.context.set_program_limit(limit)"));
+        assert!(wrapper.contains("self.context.program_limit()"));
+        let native: String = include_str!("../../../kernels/mlx/native.rs")
+            .split_whitespace()
+            .collect();
+        assert!(native.contains(".programs.set_limit(limit)"));
+        assert!(native.contains(".programs.limit()"));
+        let decoder = include_str!("decoder.rs");
+        assert_eq!(decoder.matches("self.kernels.program_limit(),").count(), 2);
+    }
+
+    fn model_warmup(
+        compile: bool,
+        device_routing: bool,
+        delta: &[DeltaLayerFacts],
+        moe: &[MoeLayerFacts],
+        attn: &[AttnLayerFacts],
+    ) -> Result<Warmup, EngError> {
+        super::model_warmup(
+            Default::default(),
+            compile,
+            device_routing,
+            delta,
+            moe,
+            attn,
+        )
+    }
+
+    #[test]
+    fn explicit_program_budget_admits_above_eight_and_refuses_above_budget() {
+        let delta: Vec<_> = (0..10)
+            .map(|layer| {
+                let mut facts = delta_layer(layer, 4);
+                facts.eps_bits = (1e-5_f32 + layer as f32 * 1e-6).to_bits();
+                facts
+            })
+            .collect();
+        let limit = compile_key::ProgramLimit::new(9).unwrap();
+        let plan = super::model_warmup(limit, true, true, &delta[..9], &[], &[]).unwrap();
+        assert_eq!(plan.delta.len(), 9);
+        // A duplicate at a full budget still needs no additional program.
+        let mut repeated = delta[..9].to_vec();
+        repeated.push(delta[0]);
+        assert_eq!(
+            super::model_warmup(limit, true, true, &repeated, &[], &[])
+                .unwrap()
+                .delta
+                .len(),
+            9
+        );
+        let error = super::model_warmup(limit, true, true, &delta, &[], &[]).unwrap_err();
+        assert!(format!("{error:?}").contains("at most 9"));
+        assert!(model_warmup(true, true, &delta[..9], &[], &[]).is_err());
+    }
     use crate::kernels::compile_key::dtype_key;
     use crate::tensor::Dtype;
 

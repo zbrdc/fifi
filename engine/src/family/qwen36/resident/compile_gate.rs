@@ -1219,6 +1219,7 @@ fn rules_with_compile_true_warm_the_decoder_at_open() {
         activation: Activation::F32,
         kv_dtype: super::super::settings::KvDtype::F32,
         compile,
+        compile_program_limit: Default::default(),
         max_seqs: 1,
     };
     let (off, session) =

@@ -284,16 +284,32 @@ pub(crate) fn moe_fun_id(baked: &MoeBaked) -> u64 {
     mix_fun_id(MOE_TAG, &parts)
 }
 
-/// The most baked keys that one adapter context may admit: DeltaNet, device-routed MoE, and
-/// the attention pre-RoPE and post-core closures of a uniform model need four keys, and a
-/// fifth covers one extra distinct constant set (for example a second quantization). The
-/// dense releases mix per-layer quantization overrides, so one attention layer set is no
-/// longer one constant set: the oQ6 pack needs 2 delta + 3 attention sets (2 programs each)
-/// = 8 keys. A ninth distinct key is an unapproved configuration change. This does not
-/// count MLX tapes: one MoE key permits B=1/2/4/8, so one adapter context can approve at
-/// most thirty-two key/batch pairs. Other contexts, cache clears and other threads are not
-/// bounded by this registry.
-pub(crate) const PROGRAM_LIMIT: usize = 8;
+/// Explicit per-adapter budget of distinct baked keys, not MLX tapes or bytes. One key can
+/// have several batch specializations. Raising the budget requires an operator opt-in.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct ProgramLimit(usize);
+
+impl Default for ProgramLimit {
+    fn default() -> Self {
+        Self(8)
+    }
+}
+
+impl ProgramLimit {
+    pub(crate) fn new(value: usize) -> Result<Self, EngError> {
+        // Vec<u64> must be addressable even if the registry eventually fills the budget.
+        if value == 0 || value > isize::MAX as usize / size_of::<u64>() {
+            return Err(EngError::BadRequest(
+                "compile_program_limit must be positive and fit the registry address space".into(),
+            ));
+        }
+        Ok(Self(value))
+    }
+
+    pub(crate) fn get(self) -> usize {
+        self.0
+    }
+}
 
 /// The compiled-program registry of ONE adapter context:
 /// the MLX compile cache is thread-local and dies with its thread, so the registry lives in the
@@ -302,17 +318,34 @@ pub(crate) const PROGRAM_LIMIT: usize = 8;
 #[derive(Debug, Default)]
 pub(crate) struct ProgramRegistry {
     seen: Vec<u64>,
+    limit: ProgramLimit,
 }
 
 impl ProgramRegistry {
+    /// Configuration is allowed only before any key is admitted; it never resets deduplication.
+    pub(crate) fn set_limit(&mut self, limit: ProgramLimit) -> Result<(), EngError> {
+        if !self.seen.is_empty() {
+            return Err(EngError::BadRequest(
+                "compile_program_limit must be configured before compiling any program".into(),
+            ));
+        }
+        self.limit = limit;
+        Ok(())
+    }
+
+    pub(crate) fn limit(&self) -> ProgramLimit {
+        self.limit
+    }
+
     pub(crate) fn admit(&mut self, id: u64) -> Result<bool, EngError> {
         if self.seen.contains(&id) {
             return Ok(false);
         }
-        if self.seen.len() >= PROGRAM_LIMIT {
+        if self.seen.len() >= self.limit.get() {
             return Err(EngError::BadRequest(format!(
-                "at most {PROGRAM_LIMIT} compiled programs per adapter; cache key {id:#x} is a \
-                 further distinct set of baked constants"
+                "at most {} compiled programs per adapter; cache key {id:#x} is a \
+                 further distinct set of baked constants",
+                self.limit.get()
             )));
         }
         self.seen.push(id);
@@ -998,18 +1031,39 @@ mod tests {
         refuse([1, 32, 2, 32, 127, 3], "must equal 2 * kw + vh * vd");
     }
 
-    /// The registry of one adapter context holds the limit rule as a plain function of the ids
-    /// seen: five distinct ids register, a repeat is a cache hit, and the SIXTH distinct id is
-    /// refused with `BadRequest` naming the limit — reaching the limit through the ids, not
-    /// through the constant.
+    /// Default adapters admit eight distinct ids and deduplicate repeats even when full.
+    #[test]
+    fn explicit_program_budget_is_bounded_and_deduplicates() {
+        let mut registry = ProgramRegistry::default();
+        registry.set_limit(ProgramLimit::new(12).unwrap()).unwrap();
+        assert_eq!(registry.limit().get(), 12);
+        for id in 0..12 {
+            assert_eq!(registry.admit(id), Ok(true));
+        }
+        assert_eq!(registry.admit(0), Ok(false));
+        assert!(registry.admit(12).is_err());
+        assert_eq!(registry.seen().len(), 12);
+        assert!(registry.set_limit(ProgramLimit::new(13).unwrap()).is_err());
+        assert_eq!(registry.limit().get(), 12);
+        assert_eq!(ProgramRegistry::default().limit().get(), 8);
+    }
+
+    #[test]
+    fn program_budget_rejects_zero_and_address_space_overflow() {
+        assert!(ProgramLimit::new(0).is_err());
+        assert!(ProgramLimit::new(usize::MAX).is_err());
+        assert!(ProgramLimit::new(isize::MAX as usize / size_of::<u64>() + 1).is_err());
+        assert_eq!(ProgramLimit::new(1).unwrap().get(), 1);
+    }
+
     #[test]
     fn a_local_registry_holds_the_same_rule() {
         let mut registry = ProgramRegistry::default();
         assert!(registry.seen().is_empty(), "a fresh adapter holds none");
-        for id in 7u64..7 + PROGRAM_LIMIT as u64 {
+        for id in 7u64..15 {
             assert_eq!(registry.admit(id), Ok(true));
         }
-        assert_eq!(registry.seen().len(), PROGRAM_LIMIT);
+        assert_eq!(registry.seen().len(), 8);
         // A repeat of a registered id is fine: it is a cache hit, not a new program.
         assert_eq!(registry.admit(8), Ok(false));
         let ninth = registry.admit(16);
@@ -1022,7 +1076,7 @@ mod tests {
         );
         // The refused id was not registered, so the registry still holds exactly the limit and
         // stays refused for a further distinct id.
-        assert_eq!(registry.seen().len(), PROGRAM_LIMIT);
+        assert_eq!(registry.seen().len(), 8);
         assert!(registry.admit(24).is_err(), "the limit stays refused");
     }
 }

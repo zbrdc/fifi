@@ -41,6 +41,7 @@ fn rules_of(settings: &Q36Settings, eos: Vec<u32>, sampler_vocab: usize) -> Q36R
         activation: settings.activation,
         kv_dtype: settings.kv,
         compile: settings.compile,
+        compile_program_limit: settings.compile_program_limit,
         max_seqs: settings.max_seqs,
         prefix_store: super::settings::prefix_store_limits_of(
             settings.prefix_reuse,
@@ -172,6 +173,27 @@ pub(super) fn plan_prefill(
 #[cfg(test)]
 mod tests {
     use super::rules_of;
+
+    #[test]
+    fn program_budget_is_forwarded_to_executor_rules() {
+        for value in [None, Some(12)] {
+            let options = Q36Options {
+                compile_program_limit: value,
+                cache_limit_bytes: Some(1024),
+                ..Default::default()
+            };
+            let settings = Q36Settings::new(
+                Path::new("model"),
+                Path::new("tokenizer"),
+                Some(&options),
+                &Q36Env::default(),
+                Backend::Mlx,
+            )
+            .unwrap();
+            let rules = rules_of(&settings, vec![], 8);
+            assert_eq!(rules.compile_program_limit.get(), value.unwrap_or(8));
+        }
+    }
     use crate::family::qwen36::settings::{Backend, Q36Env, Q36Options, Q36Settings};
     use crate::family::session::StoreLimits;
     use crate::family::{FamilySpec, QWEN3_6_35B_A3B, QWEN3_8_27B_DENSE};

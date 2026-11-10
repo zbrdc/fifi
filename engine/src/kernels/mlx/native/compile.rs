@@ -10,10 +10,10 @@
 //! uncompiled run issue the same MLX calls in the same order in both activation dtypes.
 //! Activation and packed-weight scale dtypes belong to the compile cache key
 //! (`kernels::compile_key`), keeping the F32 and BF16 decoders on distinct baked keys. One
-//! adapter context admits at most 5 keys before any native call; its `ProgramRegistry` dies
+//! adapter context admits its configured budget (default 8 keys) before any native call; its registry dies
 //! with it. B>1 MoE vectorizes its sequence. Staged B>1 DeltaNet batches
 //! five projections and keeps one recurrence/ring core per slot; taps<=1 stays B1-only.
-//! Each block key permits B=1/2/4/8 where supported: one context admits at most twenty key/batch
+//! Each block key permits B=1/2/4/8 where supported: the default budget permits up to 32 key/batch
 //! pairs. This is not a per-thread or global bound: other contexts can admit other keys, and
 //! cache clears or other threads can cause further closure-body entries.
 //!

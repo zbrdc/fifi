@@ -240,6 +240,26 @@ impl Context {
             <= self.state.as_ref().unwrap().max_threadgroup_memory)
     }
 
+    pub(super) fn program_limit(&self) -> crate::kernels::compile_key::ProgramLimit {
+        self.state
+            .as_ref()
+            .expect("live MLX adapter")
+            .programs
+            .limit()
+    }
+
+    pub(super) fn set_program_limit(
+        &mut self,
+        limit: crate::kernels::compile_key::ProgramLimit,
+    ) -> Result<(), EngError> {
+        self.check_ready()?;
+        self.state
+            .as_mut()
+            .expect("live MLX adapter")
+            .programs
+            .set_limit(limit)
+    }
+
     pub(super) fn try_new() -> Result<Self, EngError> {
         let _dispatch = DispatchGuard::enter();
         let lease = Lease::acquire()?;

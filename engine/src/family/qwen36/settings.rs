@@ -166,6 +166,9 @@ pub(crate) struct Q36Options {
     /// not bit-identical to the uncompiled path). The default is `false`; the shipped Mac config
     /// sets `true`. The MLX arm reads it; the CUDA arm records it as ignored.
     pub(crate) compile: Option<bool>,
+    /// MLX-only distinct compiled programs per adapter, positive and addressable. Default 8.
+    /// Raising this budget is opt-in and does not enable compilation.
+    pub(crate) compile_program_limit: Option<usize>,
     /// Concurrent MLX sessions, from 1 to 8. The default is 1; larger windows require compile.
     pub(crate) max_seqs: Option<usize>,
     /// The exact LRU entry count of the prefix store of a `prefix_reuse` engine, as the operator's
@@ -878,6 +881,7 @@ pub(crate) struct Q36Settings {
     /// The default is `false`; the MLX arm reads it, admits the model at load, and warms one
     /// program per distinct compiled block, and the CUDA arm records the key as ignored.
     pub(crate) compile: bool,
+    pub(crate) compile_program_limit: crate::kernels::compile_key::ProgramLimit,
     /// Maximum concurrent sessions. One preserves the original single-job worker.
     pub(crate) max_seqs: usize,
     /// The exact LRU entry count override of the prefix store, or `None` for the default cap of
@@ -1370,6 +1374,13 @@ impl Q36Settings {
         };
         let tiered = tiered_settings(options, backend)?;
         let expert_bank = expert_bank_settings(options, backend, weights)?;
+        let compile_program_limit = match options.compile_program_limit {
+            Some(_) if backend != Backend::Mlx => {
+                return Err(bad("compile_program_limit requires the MLX backend".into()));
+            }
+            Some(value) => crate::kernels::compile_key::ProgramLimit::new(value)?,
+            None => crate::kernels::compile_key::ProgramLimit::default(),
+        };
         let max_seqs = ranged("max_seqs", options.max_seqs, 1, 1, 8)?;
         // The override validates at boot through `ranged` (the same message shape as every
         // other member) so a typo cannot reach the store; the range keeps a fat finger from
@@ -1429,6 +1440,7 @@ impl Q36Settings {
                 Backend::Mlx => options.compile.unwrap_or(false),
                 Backend::Cuda => false,
             },
+            compile_program_limit,
             max_seqs,
             prefix_store_entries,
             backend,
@@ -1564,6 +1576,39 @@ mod tests {
     use crate::family::speculate::config::{SpecConfig, SpecOptions};
     use crate::tensor::Dtype;
     use std::path::{Path, PathBuf};
+
+    #[test]
+    fn compile_program_budget_defaults_validates_and_refuses_cuda() {
+        let options = |value| Q36Options {
+            compile_program_limit: value,
+            cache_limit_bytes: Some(1024),
+            ..Default::default()
+        };
+        for (value, expected) in [(None, 8), (Some(12), 12), (Some(1), 1)] {
+            let settings =
+                settings_for(Some(&options(value)), &Q36Env::default(), Backend::Mlx).unwrap();
+            assert_eq!(settings.compile_program_limit.get(), expected);
+            assert!(!settings.compile, "budget does not enable compilation");
+        }
+        for value in [0, usize::MAX] {
+            let error =
+                settings_for(Some(&options(Some(value))), &Q36Env::default(), Backend::Mlx)
+                    .unwrap_err();
+            assert!(format!("{error:?}").contains("compile_program_limit"));
+        }
+        for value in [8, 12] {
+            let error =
+                settings_for(Some(&options(Some(value))), &Q36Env::default(), Backend::Cuda)
+                    .unwrap_err();
+            assert!(format!("{error:?}").contains("compile_program_limit requires the MLX"));
+        }
+        for json in [
+            r#"{"compile_program_limit":-1}"#,
+            r#"{"compile_program_limit":18446744073709551616}"#,
+        ] {
+            assert!(serde_json::from_str::<Q36Options>(json).is_err());
+        }
+    }
 
     fn cuda_offload(body: &str) -> Result<Q36Settings, EngError> {
         let options: Q36Options = serde_json::from_str(body).unwrap();
@@ -2624,6 +2669,7 @@ mod tests {
                 kv_offload_host_bytes: None,
                 capture: false,
                 compile: false,
+                compile_program_limit: Default::default(),
                 max_seqs: 1,
                 prefix_store_entries: None,
                 backend: Backend::Mlx,

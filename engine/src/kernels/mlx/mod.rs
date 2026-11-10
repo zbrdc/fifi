@@ -723,6 +723,17 @@ impl MlxKernels {
         self.context.set_retire_cap(bytes)
     }
 
+    pub(crate) fn program_limit(&self) -> crate::kernels::compile_key::ProgramLimit {
+        self.context.program_limit()
+    }
+
+    pub(crate) fn set_program_limit(
+        &mut self,
+        limit: crate::kernels::compile_key::ProgramLimit,
+    ) -> Result<(), EngError> {
+        self.context.set_program_limit(limit)
+    }
+
     pub fn try_new() -> Result<Self, EngError> {
         Ok(Self {
             context: native::Context::try_new()?,
