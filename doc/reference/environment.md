@@ -12,7 +12,9 @@ Two kinds of values appear below:
 
 | Variable | Default | Meaning |
 | --- | --- | --- |
-| `INFERENCE_CUDA_ARCHS` | `86` (`72` on aarch64) | Comma-separated GPU architectures for the CUDA kernels, for example `89` for RTX 40-series cards or `86,89` for both. Read by `cargo build --features native-cuda`. |
+| `INFERENCE_CUDA_ARCHS` | `86` (`72` on aarch64) | Comma-separated native GPU architecture targets for CUDA kernels, read by `cargo build --features native-cuda`. For example, `75,86,89` targets RTX 20, 30 and 40 series with CUDA 12.4. The build also includes PTX for the highest listed target, which a suitable newer driver may compile for a newer GPU; PTX does not run on an older architecture. CUDA 12.8 or newer is needed to compile a native `120` target for RTX 50 series. These targets and PTX compatibility do not by themselves qualify the engine on a GPU. See [CUDA FP16 prefill attention](configuration.md#cuda-fp16-prefill-attention). |
+
+NVIDIA documents the [GPU compute capabilities](https://developer.nvidia.com/cuda/gpus), [PTX compatibility rules](https://docs.nvidia.com/cuda/archive/12.8.1/blackwell-compatibility-guide/index.html), and [CUDA 12.8 compiler support for SM 120](https://docs.nvidia.com/cuda/archive/12.8.2/cuda-features-archive/index.html).
 
 ## Server
 
@@ -37,6 +39,12 @@ Two kinds of values appear below:
 | `Q36_FUSED_DECODE` | off | Opt-in fused decode-middle kernel (conv, SiLU, the q/k/v split, head norms, decay/beta gates and ring-shift as one kernel). Read per call; default off until the parity gates pass. |
 | `Q36_PREFILL_QUERY_SLICE` | none | Opt-in query-block rows for sliced prefill attention, read once. Applies only where the composite attention runs, so it has no effect while the flash kernel serves the chunk. |
 | `Q36_NO_ACTMUL` (and siblings) | unset | Kill switches for the individual fused-prefill kernels while `Q36_FUSED_PREFILL` stays on: `Q36_NO_ACTMUL`, `Q36_NO_ATTNGATE`, `Q36_NO_EMBEDDED`, `Q36_NO_GDNPREP`, `Q36_NO_GDNPOST`, `Q36_NO_MOECOMBINE`. The variable's presence alone disables that one fusion. |
+
+## CUDA
+
+| Variable | Default | Accepted values | Meaning |
+| --- | --- | --- | --- |
+| `FIFI_CUDA_ATTN_PREFILL_ADAPT` | `0` | `0`, `1` | Experimental FP16 prefill attention selection for supported model geometries. `1` chooses a kernel using the current device's per-block shared-memory and thread limits; unset, `0` and unrecognized values retain the original launch path. Read once per process; restart to change it. The adaptive path is not yet qualified across RTX 20, 30, 40 and 50 series. See [CUDA FP16 prefill attention](configuration.md#cuda-fp16-prefill-attention). |
 
 ## Qwen3.6 on NVIDIA CUDA
 

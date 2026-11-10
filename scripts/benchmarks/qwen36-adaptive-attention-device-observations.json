@@ -1,0 +1,129 @@
+{
+  "scope": "Isolated attention correctness tests on two separate physical GPUs; no model-level or performance qualification.",
+  "tested_commit": "a552c9bf5df62387c0190c70b5d129dedfca0c52",
+  "draft_head_before_evidence": "57a6e68c14668656ba7b26327c9a83f3cb08bac3",
+  "source_comparison": "The four adaptive kernel/build files match the draft head. The tested candidate additionally includes tokenizer and health-test changes, so its full tree and binary differ from the draft.",
+  "tested_geometry": "The shared-rows oracle covers head dimensions 128 and 256 with groups 1 and 8.",
+  "limits": [
+    "Each GPU ran separately, not as a P2P pair.",
+    "Both segmented tests were explicitly selected despite being ignored by default.",
+    "The exact draft head, long contexts, a served A/B of adaptive dispatch, and RTX 40 and RTX 50 devices remain untested.",
+    "This correctness evidence does not establish a prefill or decode speedup.",
+    "Dispatch traces are observations of the tested candidate, not an exact-draft-tip performance measurement."
+  ],
+  "devices": [
+    {
+      "device": "RTX 2080 Ti",
+      "architecture": "sm75",
+      "compiled_images": [
+        "sm75"
+      ],
+      "test_binary_sha256": "3ff43fdbd090df72c571a3470a1398450d8bf40b277aea389c95ec3c614414a3",
+      "source_summary_sha256": "694c84e1f1a17e3048ea8f7f60dac799e7ac67ab8b351320094b0110acb1c7b1",
+      "service_restored": true,
+      "tests": [
+        {
+          "name": "kernels::cuda::prefill::attn_prefill::tests::attn_prefill_causal_mask_drops_future_keys",
+          "ran_with_ignored": false,
+          "log_sha256": "4e6d551a04919db98cbd1daee21f498d80036605ae9aac0ff7eabd2fd37067d3",
+          "output": "\nrunning 1 test\ntest kernels::cuda::prefill::attn_prefill::tests::attn_prefill_causal_mask_drops_future_keys ... CUDA devices visible: 1\nok\n\ntest result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 5899 filtered out; finished in 0.50s\n\n"
+        },
+        {
+          "name": "kernels::cuda::prefill::attn_prefill::tests::attn_prefill_matches_the_f64_host_reference",
+          "ran_with_ignored": false,
+          "log_sha256": "fe6df1e301c56bd15eab8aa5a487c447a25a185571f91e8917dee574873ba16f",
+          "output": "\nrunning 1 test\ntest kernels::cuda::prefill::attn_prefill::tests::attn_prefill_matches_the_f64_host_reference ... CUDA devices visible: 1\nT7 p0 0 m 64 late false: worst |\u0394out| 1.227e-4 of the derived bound 3.294e-3 at (1, 1, 200)\nT7 p0 100 m 40 late false: worst |\u0394out| 2.749e-5 of the derived bound 3.103e-3 at (0, 3, 82)\nT7 p0 0 m 64 late true: worst |\u0394out| 1.238e-4 of the derived bound 3.286e-3 at (2, 13, 53)\nT7 p0 3968 m 96 late true: worst |\u0394out| 5.243e-6 of the derived bound 3.763e-3 at (7, 5, 121)\nT7 p0 60 m 8 late false: worst |\u0394out| 3.394e-5 of the derived bound 3.660e-3 at (1, 9, 71)\nok\n\ntest result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 5899 filtered out; finished in 42.05s\n\n"
+        },
+        {
+          "name": "kernels::cuda::prefill::attn_prefill::tests::shared_rows::attn_prefill_shared_rows_match_the_portable_oracle",
+          "ran_with_ignored": false,
+          "log_sha256": "c0e0124b613236f104f4736b55632580c6e6fbff73b0706510b6c8912c7d6c89",
+          "output": "\nrunning 1 test\ntest kernels::cuda::prefill::attn_prefill::tests::shared_rows::attn_prefill_shared_rows_match_the_portable_oracle ... CUDA devices visible: 1\nok\n\ntest result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 5899 filtered out; finished in 1.68s\n\n"
+        },
+        {
+          "name": "kernels::cuda::prefill::attn_prefill::tests::segmented::attn_prefill_segmented_stage_matches_full_prefix_and_gates_once",
+          "ran_with_ignored": true,
+          "log_sha256": "bdbc3bb66692853166d5baaafb00d012aea67588a317d06e554f776f29eac99e",
+          "output": "\nrunning 1 test\ntest kernels::cuda::prefill::attn_prefill::tests::segmented::attn_prefill_segmented_stage_matches_full_prefix_and_gates_once ... CUDA devices visible: 1\nok\n\ntest result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 5899 filtered out; finished in 0.34s\n\n"
+        },
+        {
+          "name": "kernels::cuda::prefill::attn_prefill::tests::segmented::attn_prefill_segmented_rejects_window_and_ring_without_poisoning",
+          "ran_with_ignored": true,
+          "log_sha256": "0eff70272d40019522d9c6c546f82b54e3dff8ee617e9ac76ce8f61ee2abffb7",
+          "output": "\nrunning 1 test\ntest kernels::cuda::prefill::attn_prefill::tests::segmented::attn_prefill_segmented_rejects_window_and_ring_without_poisoning ... CUDA devices visible: 1\nok\n\ntest result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 5899 filtered out; finished in 0.24s\n\n"
+        }
+      ]
+    },
+    {
+      "device": "RTX 3080",
+      "architecture": "sm86",
+      "compiled_images": [
+        "sm86",
+        "sm89",
+        "compute89 PTX"
+      ],
+      "test_binary_sha256": "43e88cc42da3fc967cb627459a0ca3b5f8c2746ce45c7299a49a55828585f1a6",
+      "source_summary_sha256": "9eb4344a2ad33ec4775744be3604aaa5a88569f3755bb89b13a78f78cb4e8c4d",
+      "service_restored": true,
+      "tests": [
+        {
+          "name": "kernels::cuda::prefill::attn_prefill::tests::attn_prefill_causal_mask_drops_future_keys",
+          "ran_with_ignored": false,
+          "log_sha256": "c80a2b151691c0e243ad7ef2764ad27680d46dc479b41823167fb7afd525afe8",
+          "output": "\nrunning 1 test\ntest kernels::cuda::prefill::attn_prefill::tests::attn_prefill_causal_mask_drops_future_keys ... CUDA devices visible: 1\nok\n\ntest result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 5899 filtered out; finished in 0.63s\n\n"
+        },
+        {
+          "name": "kernels::cuda::prefill::attn_prefill::tests::attn_prefill_matches_the_f64_host_reference",
+          "ran_with_ignored": false,
+          "log_sha256": "9350f10ece434ec8cf60d54cb15b313230f3a86032e64d8bb0f65d72df03db3f",
+          "output": "\nrunning 1 test\ntest kernels::cuda::prefill::attn_prefill::tests::attn_prefill_matches_the_f64_host_reference ... CUDA devices visible: 1\nT7 p0 0 m 64 late false: worst |\u0394out| 1.292e-4 of the derived bound 3.294e-3 at (1, 5, 119)\nT7 p0 100 m 40 late false: worst |\u0394out| 2.923e-5 of the derived bound 3.103e-3 at (2, 3, 224)\nT7 p0 0 m 64 late true: worst |\u0394out| 1.361e-4 of the derived bound 3.286e-3 at (2, 5, 215)\nT7 p0 3968 m 96 late true: worst |\u0394out| 5.198e-6 of the derived bound 3.763e-3 at (20, 0, 109)\nT7 p0 60 m 8 late false: worst |\u0394out| 3.867e-5 of the derived bound 3.660e-3 at (1, 15, 158)\nok\n\ntest result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 5899 filtered out; finished in 42.00s\n\n"
+        },
+        {
+          "name": "kernels::cuda::prefill::attn_prefill::tests::shared_rows::attn_prefill_shared_rows_match_the_portable_oracle",
+          "ran_with_ignored": false,
+          "log_sha256": "dc3d163a625bc9862ab3f740d56cda5338d5d132e41937da50d1d5e933ad74ba",
+          "output": "\nrunning 1 test\ntest kernels::cuda::prefill::attn_prefill::tests::shared_rows::attn_prefill_shared_rows_match_the_portable_oracle ... CUDA devices visible: 1\nok\n\ntest result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 5899 filtered out; finished in 1.53s\n\n"
+        },
+        {
+          "name": "kernels::cuda::prefill::attn_prefill::tests::segmented::attn_prefill_segmented_stage_matches_full_prefix_and_gates_once",
+          "ran_with_ignored": true,
+          "log_sha256": "8c2413bef526cc944bc81e9f506d4ee6b0c7e8e6562f42ad1e9e7a83eddfd44e",
+          "output": "\nrunning 1 test\ntest kernels::cuda::prefill::attn_prefill::tests::segmented::attn_prefill_segmented_stage_matches_full_prefix_and_gates_once ... CUDA devices visible: 1\nok\n\ntest result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 5899 filtered out; finished in 0.28s\n\n"
+        },
+        {
+          "name": "kernels::cuda::prefill::attn_prefill::tests::segmented::attn_prefill_segmented_rejects_window_and_ring_without_poisoning",
+          "ran_with_ignored": true,
+          "log_sha256": "560bc185e5255de4fb5412e0cf691abfb6676eaf6b25a808cfcfff8a0829fa98",
+          "output": "\nrunning 1 test\ntest kernels::cuda::prefill::attn_prefill::tests::segmented::attn_prefill_segmented_rejects_window_and_ring_without_poisoning ... CUDA devices visible: 1\nok\n\ntest result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 5899 filtered out; finished in 0.23s\n\n"
+        }
+      ]
+    }
+  ],
+  "dispatch_observations": [
+    {
+      "device": "RTX 2080 Ti",
+      "case": "separate real EXL3 baseline profile",
+      "kernel": "attn_prefill_part_simt_k<256, 8>",
+      "instances": 10,
+      "kernel_csv_sha256": "dc50d1d35e84ce1f885566b846886176a8539573e217be53e02390c731e9ab8a",
+      "service_restored": true
+    },
+    {
+      "device": "RTX 3080 (inferred)",
+      "case": "single profiled causal-mask device test",
+      "kernel": "attn_prefill_part_dsplit_k<256, 8>",
+      "instances": 1,
+      "dynamic_shared_bytes": 98304,
+      "offline_audit_sha256": "ff18777c0b90875742d9d3ea5b651ad043f89a7d61329b4f3debe4675ca4f41f",
+      "profile_sha256": "a4ff90dc913eea7fd2495b4c6ae2aae575f878c12db7ef8b128e67599461bde5",
+      "kernel_csv_sha256": "94d641388ac44063f4594843f379f8c68ae43923d0b57a127908b70e78abd261",
+      "service_restored": true,
+      "attribution": "inferred from captured UUID-pinned launcher environment, single visible device and guard; not a direct SQLite physical-UUID join",
+      "original_validator": "failed due to device-ordinal mapping; offline audit used instead",
+      "limitations": [
+        "single profiled causal-mask case only; GPU attribution inferred from captured launcher visibility and sampled guard, not a direct trace UUID join; launcher scripts were not independently snapshotted at capture time",
+        "sampled during execution; not continuous proof of device idleness"
+      ]
+    }
+  ]
+}
