@@ -675,7 +675,12 @@ constexpr int kChunkWarps = 16; // warps per block (512 threads; the serial pass
 constexpr int kCols = 64;       // value columns per block (grid.z = D / kCols = 2: 32 blocks)
 constexpr int kDpad = D + 4;    // row stride of the r-major rows (16-byte aligned, bank-varying)
 constexpr int kCpad = kC + 4;   // row stride of the value-major matrices
-constexpr int kHpad = 136;      // halves per r-major row: D + 8 so 16B rows and a 272B bank-varying stride
+constexpr int kHpad = 128;      // halves per r-major row: exactly D, XOR-swizzled 16B chunks
+__device__ __forceinline__ int swr(int row, int r) {
+    // chunk j of row k lives at chunk j ^ (k & 7): ldmatrix's 8-row loads span all 32
+    // banks once each, with no pad column.
+    return row * kHpad + (((r >> 3) ^ (row & 7)) << 3) + (r & 7);
+}
 constexpr int kCHpad = 40;      // halves per value-major split row of U: kC + 8, 80B bank-varying 16B rows
 // The shared bytes of one launch: fp16 hi/lo split rows for K̂, Q̂ and the state slice S —
 // the tensor-core form (a split pair reconstructs to ~2^-22 relative, so every fp32 reader
@@ -687,6 +692,7 @@ constexpr size_t kChunkSmem =
     (kC * kCpad + 3 * kC) * sizeof(float);
 static_assert(kChunkSmem < 96 * 1024, "sm_72 caps opt-in shared memory at 96KB per block");
 static_assert(kHpad >= D, "r-major half rows must hold a full D row");
+static_assert(kHpad % 8 == 0, "swizzled r-major rows need 16B chunks");
 
 
 // Split a float into an fp16 hi/lo pair (joint residual ~2^-22 relative) and join it back.
@@ -722,6 +728,16 @@ __device__ __forceinline__ void ldm_a(const __half *m, int row, int col, unsigne
                  : "=r"(r[0]), "=r"(r[1]), "=r"(r[2]), "=r"(r[3])
                  : "r"(addr));
 }
+// The swizzled variants for the r-major split family (K-hat, Q-hat, S).
+template <int Stride>
+__device__ __forceinline__ void ldm_as(const __half *m, int row, int col, unsigned (&r)[4]) {
+    const int lr = row + (threadIdx.x & 7) + 8 * ((threadIdx.x >> 3) & 1);
+    const int lc = col + 8 * (threadIdx.x >> 4);
+    const unsigned addr = smem_addr(m + swr(lr, lc));
+    asm volatile("ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%0,%1,%2,%3}, [%4];\n"
+                 : "=r"(r[0]), "=r"(r[1]), "=r"(r[2]), "=r"(r[3])
+                 : "r"(addr));
+}
 // The B fragment (16x8 halves, from a row-major [n][k] source): the non-trans load already
 // lands lane l on {B[2(l%4)][n0+l/4], B[2(l%4)+1][n0+l/4]} — the trans form is for [k][n]
 // sources. Lanes 0-7 name source rows n0..n0+7 at k, lanes 8-15 the same rows at k+8.
@@ -730,6 +746,15 @@ __device__ __forceinline__ void ldm_b(const __half *m, int row, int col, unsigne
     const int lr = row + (threadIdx.x & 7);
     const int lc = col + 8 * ((threadIdx.x >> 3) & 1);
     const unsigned addr = smem_addr(m + (size_t)lr * Stride + lc);
+    asm volatile("ldmatrix.sync.aligned.m8n8.x2.shared.b16 {%0,%1}, [%2];\n"
+                 : "=r"(r[0]), "=r"(r[1])
+                 : "r"(addr));
+}
+template <int Stride>
+__device__ __forceinline__ void ldm_bs(const __half *m, int row, int col, unsigned (&r)[2]) {
+    const int lr = row + (threadIdx.x & 7);
+    const int lc = col + 8 * ((threadIdx.x >> 3) & 1);
+    const unsigned addr = smem_addr(m + swr(lr, lc));
     asm volatile("ldmatrix.sync.aligned.m8n8.x2.shared.b16 {%0,%1}, [%2];\n"
                  : "=r"(r[0]), "=r"(r[1])
                  : "r"(addr));
@@ -782,7 +807,7 @@ __global__ void __launch_bounds__(kLanes * kChunkWarps, 1) gdn_scan_chunk_k(Scan
     // walks r or s with the lane pinned to one value column.
     for (int i = tid; i < D * kCols; i += kLanes * kChunkWarps) {
         const int c = i % kCols, r = i / kCols;
-        f2s(st[(size_t)r * D + col0 + c], &S_h[c * kHpad + r], &S_l[c * kHpad + r]);
+        f2s(st[(size_t)r * D + col0 + c], &S_h[swr(c, r)], &S_l[swr(c, r)]);
     }
     // A's strict upper triangle and its padding stay zero for the whole launch: M2 reads
     // A rows in 128-bit steps past the diagonal, and the zeros swallow the unwritten U
@@ -831,10 +856,10 @@ __global__ void __launch_bounds__(kLanes * kChunkWarps, 1) gdn_scan_chunk_k(Scan
             const float kmul = rsqrtf(l2_den<kAddEps>(warp_sum(ss), a.eps));
 #pragma unroll
             for (int r = 0; r < 4; ++r) {
-                f2s(qv[r] * qmul, &q_h[j * kHpad + r * kLanes + lane],
-                    &q_l[j * kHpad + r * kLanes + lane]);
-                f2s(kv[r] * kmul, &kh_h[j * kHpad + r * kLanes + lane],
-                    &kh_l[j * kHpad + r * kLanes + lane]);
+                const int wq = swr(j, r * kLanes + lane);
+                f2s(qv[r] * qmul, &q_h[wq], &q_l[wq]);
+                const int wk = swr(j, r * kLanes + lane);
+                f2s(kv[r] * kmul, &kh_h[wk], &kh_l[wk]);
             }
 #pragma unroll
             for (int cv = 0; cv < (kCols + kLanes - 1) / kLanes; ++cv) {
@@ -878,10 +903,10 @@ __global__ void __launch_bounds__(kLanes * kChunkWarps, 1) gdn_scan_chunk_k(Scan
             const __half *ar_l = (w < 8) ? kh_l : q_l;
             for (int r0 = 0; r0 < D; r0 += 16) {
                 unsigned aH[4], aL[4], bH[2], bL[2];
-                ldm_a<kHpad>(ar_h, t0w, r0, aH);
-                ldm_a<kHpad>(ar_l, t0w, r0, aL);
-                ldm_b<kHpad>(kh_h, s0w, r0, bH);
-                ldm_b<kHpad>(kh_l, s0w, r0, bL);
+                ldm_as<kHpad>(ar_h, t0w, r0, aH);
+                ldm_as<kHpad>(ar_l, t0w, r0, aL);
+                ldm_bs<kHpad>(kh_h, s0w, r0, bH);
+                ldm_bs<kHpad>(kh_l, s0w, r0, bL);
                 mma_16816(d, aH, bH[0], bH[1]);
                 mma_16816(d, aH, bL[0], bL[1]);
                 mma_16816(d, aL, bH[0], bH[1]);
@@ -924,10 +949,10 @@ __global__ void __launch_bounds__(kLanes * kChunkWarps, 1) gdn_scan_chunk_k(Scan
             for (int i = s + 1; i <= t; ++i) ratio *= dec_s[i];
             float kk = 0.f, qk = 0.f;
             for (int r = 0; r < D; ++r) {
-                const float ktr = j2(kh_h, kh_l, t * kHpad + r);
-                const float ksr = j2(kh_h, kh_l, s * kHpad + r);
+                const float ktr = j2(kh_h, kh_l, swr(t, r));
+                const float ksr = j2(kh_h, kh_l, swr(s, r));
                 kk += ktr * ksr;
-                qk += j2(q_h, q_l, t * kHpad + r) * ksr;
+                qk += j2(q_h, q_l, swr(t, r)) * ksr;
             }
             if (s != t) {
                 G_s[t * kCpad + s] = b_s[t] * ratio * kk;
@@ -948,10 +973,10 @@ __global__ void __launch_bounds__(kLanes * kChunkWarps, 1) gdn_scan_chunk_k(Scan
             float d[4] = {0.f, 0.f, 0.f, 0.f};
             for (int r0 = 0; r0 < D; r0 += 16) {
                 unsigned aH[4], aL[4], bH[2], bL[2];
-                ldm_a<kHpad>(kh_h, t0w, r0, aH);
-                ldm_a<kHpad>(kh_l, t0w, r0, aL);
-                ldm_b<kHpad>(S_h, c0w, r0, bH);
-                ldm_b<kHpad>(S_l, c0w, r0, bL);
+                ldm_as<kHpad>(kh_h, t0w, r0, aH);
+                ldm_as<kHpad>(kh_l, t0w, r0, aL);
+                ldm_bs<kHpad>(S_h, c0w, r0, bH);
+                ldm_bs<kHpad>(S_l, c0w, r0, bL);
                 mma_16816(d, aH, bH[0], bH[1]);
                 mma_16816(d, aH, bL[0], bL[1]);
                 mma_16816(d, aL, bH[0], bH[1]);
@@ -976,7 +1001,7 @@ __global__ void __launch_bounds__(kLanes * kChunkWarps, 1) gdn_scan_chunk_k(Scan
                 if (t >= len) break;
                 float acc = 0.f;
                 for (int r = 0; r < D; ++r)
-                    acc += j2(kh_h, kh_l, t * kHpad + r) * j2(S_h, S_l, c * kHpad + r);
+                    acc += j2(kh_h, kh_l, swr(t, r)) * j2(S_h, S_l, swr(c, r));
                 f2s_at(j2(U_h, U_l, c * kCHpad + t) - B_s[t] * acc, U_h, U_l,
                        c * kCHpad + t);
             }
@@ -1020,10 +1045,10 @@ __global__ void __launch_bounds__(kLanes * kChunkWarps, 1) gdn_scan_chunk_k(Scan
             float di[4] = {0.f, 0.f, 0.f, 0.f}, da[4] = {0.f, 0.f, 0.f, 0.f};
             for (int r0 = 0; r0 < D; r0 += 16) {
                 unsigned aH[4], aL[4], bH[2], bL[2];
-                ldm_a<kHpad>(q_h, t0w, r0, aH);
-                ldm_a<kHpad>(q_l, t0w, r0, aL);
-                ldm_b<kHpad>(S_h, c0w, r0, bH);
-                ldm_b<kHpad>(S_l, c0w, r0, bL);
+                ldm_as<kHpad>(q_h, t0w, r0, aH);
+                ldm_as<kHpad>(q_l, t0w, r0, aL);
+                ldm_bs<kHpad>(S_h, c0w, r0, bH);
+                ldm_bs<kHpad>(S_l, c0w, r0, bL);
                 mma_16816(di, aH, bH[0], bH[1]);
                 mma_16816(di, aH, bL[0], bL[1]);
                 mma_16816(di, aL, bH[0], bH[1]);
@@ -1057,7 +1082,7 @@ __global__ void __launch_bounds__(kLanes * kChunkWarps, 1) gdn_scan_chunk_k(Scan
                 if (t >= len) break;
                 float inter = 0.f;
                 for (int r = 0; r < D; ++r)
-                    inter += j2(q_h, q_l, t * kHpad + r) * j2(S_h, S_l, c * kHpad + r);
+                    inter += j2(q_h, q_l, swr(t, r)) * j2(S_h, S_l, swr(c, r));
                 float intra = 0.f;
                 for (int s = 0; s <= t; ++s)
                     intra += j2(A_h, A_l, t * kCHpad + s) * j2(U_h, U_l, c * kCHpad + s);
@@ -1086,17 +1111,17 @@ __global__ void __launch_bounds__(kLanes * kChunkWarps, 1) gdn_scan_chunk_k(Scan
                 const int c = cg + 4 * i;
                 float acc = 0.f;
                 for (int s = 0; s < len; ++s) {
-                    acc += B_s[s] * j2(kh_h, kh_l, s * kHpad + r) * j2(U_h, U_l, c * kCHpad + s);
+                    acc += B_s[s] * j2(kh_h, kh_l, swr(s, r)) * j2(U_h, U_l, c * kCHpad + s);
                 }
-                f2s(j2(S_h, S_l, c * kHpad + r) * b_end + acc, &S_h[c * kHpad + r],
-                    &S_l[c * kHpad + r]);
+                f2s(j2(S_h, S_l, swr(c, r)) * b_end + acc, &S_h[swr(c, r)],
+                    &S_l[swr(c, r)]);
             }
         }
         __syncthreads();  // the update's writes are visible to the next sub-chunk's phases
     }
     for (int i = tid; i < D * kCols; i += kLanes * kChunkWarps) {
         const int c = i % kCols, r = i / kCols;
-        st[(size_t)r * D + col0 + c] = j2(S_h, S_l, c * kHpad + r);
+        st[(size_t)r * D + col0 + c] = j2(S_h, S_l, swr(c, r));
     }
 }
 
