@@ -101,6 +101,15 @@ unsafe extern "C" {
     ) -> c_int;
 }
 
+unsafe extern "C" {
+    #[link_name = "inference_cuda_gdn_scan_chunk_launch"]
+    fn gdn_scan_chunk_launch_raw(
+        args: *const GdnScanSeqArgsRaw,
+        stream: *mut c_void,
+        out_stage: *mut c_int,
+    ) -> c_int;
+}
+
 #[cfg(all(test, feature = "cuda-gdn-mutants"))]
 unsafe extern "C" {
     #[link_name = "inference_cuda_gdn_scan_seq_cols_bad_bounds_launch"]
@@ -328,6 +337,25 @@ pub(in crate::kernels::cuda) fn gdn_scan_seq_cols_launch(
     let status = unsafe {
         gdn_scan_seq_cols_launch_raw(&args, stream.as_ptr(), &mut stage, block_cols as c_int)
     };
+    checked(status, stage)
+}
+
+/// Queues the chunk-parallel WY scan (the state updated in place, the pre-norm rows
+/// written), then the same gated output RMSNorm in place on the same rows. Same checks and
+/// same written bytes as [`gdn_scan_seq_launch`]; the scan values differ from the
+/// sequential kernel's only by rounding.
+pub(in crate::kernels::cuda) fn gdn_scan_chunk_launch(
+    stream: &RawStream,
+    io: GdnScanSeqRaw<'_>,
+) -> Result<(), DeviceFailure> {
+    check_scan(&io)?;
+    let args = c_args(&io);
+    let mut stage = STAGE_NONE;
+    // SAFETY: as `gdn_scan_seq_launch`: `check_scan` proved every range inside its live
+    // allocation, large enough, 4-byte aligned, and `state` and `o_out` disjoint from every
+    // other range; the entry repeats the checks on the addresses. `args` lives across the
+    // call, `stage` is a live writable `c_int` and `stream` is live for the call.
+    let status = unsafe { gdn_scan_chunk_launch_raw(&args, stream.as_ptr(), &mut stage) };
     checked(status, stage)
 }
 

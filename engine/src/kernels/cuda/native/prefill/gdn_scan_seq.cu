@@ -634,6 +634,233 @@ __global__ void gdn_out_gate_k(ScanArgs a) {
     row[j] = o * rstd * a.norm_w[j] * out_gate<kSigmoid>(p[a.z_off + h * D + j]);
 }
 
+// ---- the chunk-parallel WY scan -----------------------------------------------------------
+//
+// The sequential kernels above evaluate the per-token recurrence in token order, so every
+// token pays a D×D decay, a D×D rank-one write and two D-dots before the next token can
+// start. gdn_scan_chunk_k evaluates the SAME recurrence (its scalar reference is
+// kernels/gdn_reference.rs chunk_step, pinned there against step at f64 exactness, both
+// directions of every form bit) one sub-chunk of kC tokens at a time: within a sub-chunk
+// the token loop becomes the WY form — forward substitution over kC rank-one coefficient
+// rows U (u_t = b_t·(v_t − B_t·Sᵀk_t) − Σ_{s<t} beta_t·(B_t/B_s)·(k_t·k_s)·u_s, with B the
+// prefix product of the decays), the masked output sum (o_t = B_t·(q_tᵀS) + Σ_{s≤t}
+// (B_t/B_s)·(q_t·k_s)·u_s against the sub-chunk's start state) and ONE decayed rank-kC
+// state update per sub-chunk. The gates, the q/k L2 norms, the p0 guard, the state layout
+// and the written bytes are those of the sequential kernels, so the same driver call and
+// the same out-gate kernel (K2 above) serve it unchanged.
+//
+// Launch: grid (n_v_heads, 1, D / kHalf), block (kLanes, kChunkWarps) = 256 threads; one
+// block owns kHalf = 64 value columns of one head and walks the m rows in kC-token
+// sub-chunks. The D × 64 state slice lives in shared memory for the whole launch; each
+// sub-chunk stages the L2-normalized K̂ and Q̂ rows (row stride D + 1: the odd stride breaks
+// the 32-bank cycle of a 128-float row for every access pattern below), the block's 64 V
+// columns, the decay/beta gates with their prefix products, the strict-lower G matrix and
+// the masked A matrix, then solves U and emits the outputs in ONE warp-local loop (each of
+// the 8 warps owns 8 value columns; its 4 lanes per column split the 128-term dots and the
+// back-substitution sums with a xor 2,1 tree, so no barrier sits inside the token loop),
+// then applies the sub-chunk's single state update across all threads. The ratio B_t/B_s
+// is a running product, never a division: B_t itself underflows fp32 around 0.5^32 while
+// the ratios stay in range. No thread leaves before the barrier of the phase it reads.
+//
+// The rounding of this form differs from the sequential kernels' (deeper dot trees inside
+// the solve against none in the token loop); both are pinned to the same f64 reference by
+// their tests, each with its own derived bound. No mutants yet: the mutation bank targets
+// the sequential kernels; adding the chunk instances is deferred until the kernel earns a
+// production default.
+constexpr int kC = 32;         // sub-chunk tokens (the solve's kC-step chain)
+constexpr int kChunkWarps = 8; // warps per block, one per 8 value columns
+constexpr int kHalf = 64;      // value columns per block (grid.z = D / kHalf)
+constexpr int kStride = D + 1; // K̂/Q̂ row stride: the odd stride varies the bank with the row
+// The shared floats of one launch: K̂, Q̂, V, decay, beta, prefix, G, A, U, the state slice.
+constexpr int kChunkFloats =
+    2 * kC * kStride + kC * kHalf + 3 * kC + 2 * kC * kC + kC * kHalf + D * kHalf;
+constexpr size_t kChunkSmem = kChunkFloats * sizeof(float);
+static_assert(kChunkSmem < 96 * 1024, "sm_72 caps opt-in shared memory at 96KB per block");
+
+// Sum over the 4 lanes of one column quad (lane = 4·column + quad); the xor offsets 2 and 1
+// stay inside each consecutive-4 lane quad, so every lane of the quad holds the same bits.
+__device__ float quad_sum(float v) {
+#pragma unroll
+    for (int o = 2; o > 0; o >>= 1) v += __shfl_xor_sync(0xffffffffu, v, o);
+    return v;
+}
+
+template <bool kGrouped, bool kAddEps>
+__global__ void __launch_bounds__(kLanes * kChunkWarps, 1) gdn_scan_chunk_k(ScanArgs a) {
+    extern __shared__ float sm[];  // the layout of kChunkFloats, in the order below
+    float *const kh_s = sm;                       // K̂  [kC][kStride]
+    float *const q_s = kh_s + kC * kStride;       // Q̂  [kC][kStride]
+    float *const v_s = q_s + kC * kStride;        // V  [kC][kHalf], this block's columns
+    float *const dec_s = v_s + kC * kHalf;        // the decay gates a_t
+    float *const b_s = dec_s + kC;                // the beta gates
+    float *const B_s = b_s + kC;                  // the prefix products B_t
+    float *const G_s = B_s + kC;                  // G[t][s] = b_t·(B_t/B_s)·(k_t·k_s), s < t
+    float *const A_s = G_s + kC * kC;             // A[t][s] = (B_t/B_s)·(q_t·k_s), s ≤ t
+    float *const U_s = A_s + kC * kC;             // the solved rank-one rows [kC][kHalf]
+    float *const S_s = U_s + kC * kHalf;          // the state slice [D][kHalf]
+    const int h = blockIdx.x, kh = key_head<kGrouped>(h, a);
+    const int lane = threadIdx.x, w = threadIdx.y;
+    const int tid = lane + kLanes * w;
+    const int col0 = blockIdx.z * kHalf;
+    float *const st = a.state + (size_t)h * D * D;
+    if ((long long)a.p0 < 0 || (long long)a.p0 + a.m > a.ctx_tokens) {
+        if (a.status && blockIdx.x == 0 && blockIdx.z == 0 && tid == 0) {
+            atomicOr(a.status, INFERENCE_CUDA_PREFILL_STATUS_BOUND_VIOLATION);
+        }
+        for (int i = tid; i < a.m * kHalf; i += kLanes * kChunkWarps) {
+            a.o_out[((size_t)(i / kHalf) * a.n_v_heads + h) * D + col0 + i % kHalf] =
+                __int_as_float(0x7fc00000);
+        }
+        return;
+    }
+    const float a_h = a.a[h], dt_h = a.dt_bias[h];
+    for (int i = tid; i < D * kHalf; i += kLanes * kChunkWarps) {
+        S_s[i] = st[(size_t)(i / kHalf) * D + col0 + i % kHalf];
+    }
+    const int c = w * 8 + (lane >> 2), cq = lane & 3;  // solve: warp w owns column c
+    for (int t0 = 0; t0 < a.m; t0 += kC) {
+        const int len = min(kC, a.m - t0);
+        // P, the staging: warp w stages slots j = w + i·kChunkWarps — the normalized q/k rows
+        // (the same expressions as the sequential kernels, run once per slot), this block's
+        // V columns, and (warp 0, one lane per slot) the gates with the prefix products.
+        for (int i = 0; i < kC / kChunkWarps; ++i) {
+            const int j = w + i * kChunkWarps;
+            const int row = min(t0 + j, a.m - 1);  // the clamp keeps the loads coalesced
+            const float *rw = a.conv + (size_t)row * a.conv_ld;
+            float qv[4], kv[4];
+#pragma unroll
+            for (int r = 0; r < 4; ++r) {
+                qv[r] = rw[kh * D + r * kLanes + lane];
+                kv[r] = rw[(a.n_k_heads + kh) * D + r * kLanes + lane];
+            }
+            float sq = 0.f, ss = 0.f;
+#pragma unroll
+            for (int r = 0; r < 4; ++r) {
+                sq += qv[r] * qv[r];
+                ss += kv[r] * kv[r];
+            }
+            const float qmul =
+                rsqrtf(l2_den<kAddEps>(warp_sum(sq), a.eps)) * rsqrtf((float)D);
+            const float kmul = rsqrtf(l2_den<kAddEps>(warp_sum(ss), a.eps));
+#pragma unroll
+            for (int r = 0; r < 4; ++r) {
+                q_s[j * kStride + r * kLanes + lane] = qv[r] * qmul;
+                kh_s[j * kStride + r * kLanes + lane] = kv[r] * kmul;
+            }
+            v_s[j * kHalf + lane] = rw[2 * a.n_k_heads * D + h * D + col0 + lane];
+            v_s[j * kHalf + kLanes + lane] =
+                rw[2 * a.n_k_heads * D + h * D + col0 + kLanes + lane];
+        }
+        if (w == 0) {
+            // One lane per slot reads its projection row; lanes beyond len carry the
+            // neutral 1 of the product scan, so every prefix below len is exact.
+            float d = 1.f, bb = 0.f;
+            if (lane < len) {
+                const float *p = a.proj + (size_t)(t0 + lane) * a.ld;
+                d = expf(softplus_e(p[a.alpha_off + h] + dt_h) * a_h);
+                bb = 1.f / (1.f + expf(-p[a.beta_off + h]));
+            }
+            dec_s[lane] = d;
+            b_s[lane] = bb;
+            float pre = d;
+#pragma unroll
+            for (int o = 1; o < kLanes; o <<= 1) {
+                const float up = __shfl_up_sync(0xffffffffu, pre, o);
+                if (lane >= o) pre *= up;
+            }
+            B_s[lane] = pre;
+        }
+        __syncthreads();  // P's writes are visible to G and the solve
+        // G, the two kC×kC coefficient matrices: thread (t, j8) owns the s ≡ j8 (mod 8)
+        // entries of row t, walking s down from t so the ratio B_t/B_s is a running
+        // product (never a division: B_t underflows fp32 long before the ratio does).
+        // The diagonal A[t][t] (ratio 1) belongs to the one thread with j8 == t & 7.
+        {
+            const int t = tid >> 3, j8 = tid & 7;
+            if (t < len) {
+                if ((t & 7) == j8) {
+                    float qk = 0.f;
+#pragma unroll 8
+                    for (int r = 0; r < D; ++r) {
+                        qk += q_s[t * kStride + r] * kh_s[t * kStride + r];
+                    }
+                    A_s[t * kC + t] = qk;
+                }
+                float ratio = 1.f;
+                for (int s = t - 1; s >= 0; --s) {
+                    ratio *= dec_s[s + 1];
+                    if ((s & 7) != j8) continue;
+                    float kk = 0.f, qk = 0.f;
+#pragma unroll 8
+                    for (int r = 0; r < D; ++r) {
+                        kk += kh_s[t * kStride + r] * kh_s[s * kStride + r];
+                        qk += q_s[t * kStride + r] * kh_s[s * kStride + r];
+                    }
+                    G_s[t * kC + s] = b_s[t] * ratio * kk;
+                    A_s[t * kC + s] = ratio * qk;
+                }
+            }
+        }
+        __syncthreads();  // G's writes are visible to the solve
+        // The solve and the outputs, one warp-local pass: for each token t, the state-seen
+        // dot w_t = B_t·(Sᵀk_t), the substituted row u_t, then the output o_t — every read
+        // of U_s[s] with s < t comes from an earlier iteration of the same warp, and the
+        // s == t read sits behind the __syncwarp of the u store, so no barrier is needed.
+        for (int t = 0; t < len; ++t) {
+            float wpart = 0.f;
+#pragma unroll 8
+            for (int i = 0; i < D / 4; ++i) {
+                const int r = 4 * i + cq;
+                wpart += kh_s[t * kStride + r] * S_s[r * kHalf + c];
+            }
+            const float seen = B_s[t] * quad_sum(wpart);
+            float back = 0.f;
+            for (int s = cq; s < t; s += 4) back += G_s[t * kC + s] * U_s[s * kHalf + c];
+            const float u = b_s[t] * (v_s[t * kHalf + c] - seen) - quad_sum(back);
+            if (cq == 0) U_s[t * kHalf + c] = u;
+            __syncwarp();
+            float opart = 0.f;
+#pragma unroll 8
+            for (int i = 0; i < D / 4; ++i) {
+                const int r = 4 * i + cq;
+                opart += q_s[t * kStride + r] * S_s[r * kHalf + c];
+            }
+            // The inter term is block-uniform, so it joins AFTER the quad sum of the
+            // masked intra sum (summing it across the quad would count it four times).
+            float intra = 0.f;
+            for (int s = cq; s <= t; s += 4) intra += A_s[t * kC + s] * U_s[s * kHalf + c];
+            const float o = B_s[t] * quad_sum(opart) + quad_sum(intra);
+            if (cq == 0) {
+                a.o_out[((size_t)(t0 + t) * a.n_v_heads + h) * D + col0 + c] = o;
+            }
+        }
+        __syncthreads();  // every warp's U rows and reads of S are done before the update
+        // The sub-chunk's single state update: S ← B_end·S + Σ_s (B_end/B_s)·k_s u_sᵀ, with
+        // the tail ratios staged into B_s by thread 0 (B_s's prefix products are spent).
+        if (tid == 0) {
+            float tail = 1.f;
+            for (int s = len - 1; s >= 0; --s) {
+                B_s[s] = tail;
+                tail *= dec_s[s];
+            }
+        }
+        __syncthreads();
+        const float b_end = B_s[0] * dec_s[0];
+        for (int i = tid; i < D * kHalf; i += kLanes * kChunkWarps) {
+            const int r = i / kHalf, cc = i % kHalf;
+            float acc = 0.f;
+            for (int s = 0; s < len; ++s) {
+                acc += B_s[s] * kh_s[s * kStride + r] * U_s[s * kHalf + cc];
+            }
+            S_s[i] = S_s[i] * b_end + acc;
+        }
+        __syncthreads();  // the update's writes are visible to the next sub-chunk's staging
+    }
+    for (int i = tid; i < D * kHalf; i += kLanes * kChunkWarps) {
+        st[(size_t)(i / kHalf) * D + col0 + i % kHalf] = S_s[i];
+    }
+}
+
 #ifdef INFERENCE_CUDA_GDN_MUTANTS
 bool host_mutant_nine(const ScanArgs &k) { return k.mutant == 9; }
 #else
@@ -696,7 +923,62 @@ Failure launch_scan(const ScanArgs &k, int form, int cols, void *stream) {
                : launch_l2<false>(k, form, cols, stream);
 }
 
+template <bool kGrouped, bool kAddEps, bool kSigmoid>
+Failure launch_chunk_form(const ScanArgs &k, void *stream) {
+    Failure failure;
+    // The opt-in of the block's dynamic shared memory, once per instantiation: sm_72 and
+    // later accept kChunkSmem (static_assert above); a failure surfaces as the launch
+    // error below, which the wrapper maps to a DeviceFailure.
+    static const bool opted_in = [] {
+        cudaFuncSetAttribute(gdn_scan_chunk_k<kGrouped, kAddEps>,
+                             cudaFuncAttributeMaxDynamicSharedMemorySize, (int)kChunkSmem);
+        return true;
+    }();
+    (void)opted_in;
+    gdn_scan_chunk_k<kGrouped, kAddEps>
+        <<<dim3(k.n_v_heads, 1, D / kHalf), dim3(kLanes, kChunkWarps), kChunkSmem,
+           (cudaStream_t)stream>>>(k);
+    failure.record(cudaGetLastError(), INFERENCE_CUDA_STAGE_LAUNCH);
+    if (failure.err == cudaSuccess) {
+        gdn_out_gate_k<kSigmoid><<<dim3(k.n_v_heads, k.m), D, 0, (cudaStream_t)stream>>>(k);
+        failure.record(cudaGetLastError(), INFERENCE_CUDA_STAGE_LAUNCH);
+    }
+    return failure;
+}
+
+template <bool kGrouped, bool kAddEps>
+Failure launch_chunk_gate(const ScanArgs &k, int form, void *stream) {
+    return (form & INFERENCE_CUDA_GDN_FORM_SIGMOID_GATE)
+               ? launch_chunk_form<kGrouped, kAddEps, true>(k, stream)
+               : launch_chunk_form<kGrouped, kAddEps, false>(k, stream);
+}
+
+template <bool kGrouped>
+Failure launch_chunk_l2(const ScanArgs &k, int form, void *stream) {
+    return (form & INFERENCE_CUDA_GDN_FORM_ADD_EPS_L2)
+               ? launch_chunk_gate<kGrouped, true>(k, form, stream)
+               : launch_chunk_gate<kGrouped, false>(k, form, stream);
+}
+
 }  // namespace
+
+extern "C" int inference_cuda_gdn_scan_chunk_launch(
+    const inference_cuda_gdn_scan_seq_args *args, void *stream, int *out_stage) {
+    try {
+        report_stage(out_stage, INFERENCE_CUDA_STAGE_NONE);
+        if (args == NULL || !valid(*args, stream)) {
+            return INFERENCE_CUDA_INVALID_ARGUMENT;
+        }
+        const ScanArgs k = to_args(args);
+        const Failure failure = (args->form & INFERENCE_CUDA_GDN_FORM_GROUPED_HEADS)
+                                    ? launch_chunk_l2<true>(k, args->form, stream)
+                                    : launch_chunk_l2<false>(k, args->form, stream);
+        report_stage(out_stage, failure.stage);
+        return (int)failure.err;
+    } catch (...) {
+        return INFERENCE_CUDA_NATIVE_EXCEPTION;
+    }
+}
 
 extern "C" int inference_cuda_gdn_scan_seq_launch(
     const inference_cuda_gdn_scan_seq_args *args, void *stream, int *out_stage) {

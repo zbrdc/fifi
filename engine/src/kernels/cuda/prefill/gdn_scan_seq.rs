@@ -41,7 +41,7 @@ use crate::kernels::cuda::context::{
 use crate::kernels::cuda::gdn_mutants::{SCAN_ACCEPTS_FOUR, SCAN_MIN_ONE, SCAN_NO_TRIM, mutated};
 use crate::kernels::cuda::native::prefill::gdn_scan_seq::{
     FORM_ADD_EPS_L2, FORM_GROUPED_HEADS, FORM_SIGMOID_GATE, GDN_SCAN_BLOCK_COLS, GdnScanSeqInts,
-    GdnScanSeqRaw, gdn_scan_seq_cols_launch, gdn_scan_seq_launch,
+    GdnScanSeqRaw, gdn_scan_chunk_launch, gdn_scan_seq_cols_launch, gdn_scan_seq_launch,
 };
 
 /// The kernel-side geometry of one chunk: the conv channel count
@@ -474,10 +474,39 @@ fn scan_cols_setting() -> Option<usize> {
     })
 }
 
+/// The value of `FIFI_GDN_SCAN_CHUNK`: `1` selects `gdn_scan_chunk_k` (the chunk-parallel
+/// WY scan) for launches of at least [`SCAN_MIN_ROWS`] rows; unset or any other value runs
+/// a sequential kernel. `1` (not `on`) so a misspelt value can never silently enable a
+/// numerics-different kernel.
+fn parse_scan_chunk(raw: Option<&OsStr>) -> Option<()> {
+    let text = raw?.to_str()?;
+    (text.trim() == "1").then_some(())
+}
+
+/// The chunk-scan setting of this process, read once: restart to change. The first read
+/// logs what was parsed ([`gdn_switch::note`], with `1` standing for "on"), so a misspelt
+/// value is visible in the server log.
+fn scan_chunk_setting() -> Option<()> {
+    static SETTING: OnceLock<Option<()>> = OnceLock::new();
+    *SETTING.get_or_init(|| {
+        let raw = std::env::var_os("FIFI_GDN_SCAN_CHUNK");
+        let parsed = parse_scan_chunk(raw.as_deref());
+        if parsed.is_some() {
+            crate::kernels::cuda::gdn_switch::note("FIFI_GDN_SCAN_CHUNK", raw.as_deref(), Some(1));
+        } else if raw.is_some() {
+            crate::kernels::cuda::gdn_switch::note("FIFI_GDN_SCAN_CHUNK", raw.as_deref(), None);
+        }
+        parsed
+    })
+}
+
 #[cfg(test)]
 thread_local! {
     /// Narrow-block scan launches this thread has queued: lets a test see which kernel a call chose.
     static COLS_CALLS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    /// Chunk-parallel scan launches this thread has queued: lets a test see which kernel a
+    /// call chose.
+    static CHUNK_CALLS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
 impl CudaContext {
@@ -506,13 +535,91 @@ impl CudaContext {
     /// `FIFI_GDN_SCAN_COLS` (see [`parse_scan_cols`]) selects the scan kernel with narrower
     /// blocks for launches of at least [`SCAN_MIN_ROWS`] rows; every other launch, and every launch
     /// by default, runs the original kernel. Both write the same bytes.
+    ///
+    /// `FIFI_GDN_SCAN_CHUNK` (see [`parse_scan_chunk`]) selects the chunk-parallel WY scan
+    /// kernel ([`Self::gdn_scan_chunk_form`]) for launches of at least [`SCAN_MIN_ROWS`]
+    /// rows, taking precedence over the cols switch; every launch by default, and every
+    /// launch below the row floor, runs a sequential kernel. The bytes written are the
+    /// same; the scan VALUES differ from the sequential kernel's by rounding only (both are
+    /// pinned to the same f64 reference by the tests, each with its own derived bound).
     pub(crate) fn gdn_scan_seq_form(
         &self,
         stream: &DeviceStream,
         call: GdnScanSeqCall<'_>,
         form: GdnForm,
     ) -> Result<(), EngError> {
-        self.gdn_scan_seq_with(stream, call, form, scan_cols_setting())
+        self.gdn_scan_seq_routed(
+            stream,
+            call,
+            form,
+            scan_chunk_setting(),
+            scan_cols_setting(),
+        )
+    }
+
+    /// [`Self::gdn_scan_seq_form`] under explicit switch values (the parsed
+    /// `FIFI_GDN_SCAN_CHUNK` and `FIFI_GDN_SCAN_COLS`): the seam the routing test drives.
+    /// The chunk switch takes precedence over the cols switch.
+    fn gdn_scan_seq_routed(
+        &self,
+        stream: &DeviceStream,
+        call: GdnScanSeqCall<'_>,
+        form: GdnForm,
+        chunk: Option<()>,
+        cols: Option<usize>,
+    ) -> Result<(), EngError> {
+        if chunk.is_some() && call.shape.m >= SCAN_MIN_ROWS {
+            #[cfg(test)]
+            CHUNK_CALLS.with(|calls| calls.set(calls.get() + 1));
+            return self.gdn_scan_chunk_form(stream, call, form);
+        }
+        self.gdn_scan_seq_with(stream, call, form, cols)
+    }
+
+    /// Queues the chunk-parallel WY scan of `call` on `stream` with the rules of `form`
+    /// (`gdn_scan_chunk_k`, the kC-token WY form of the same recurrence; its scalar
+    /// reference is `kernels::gdn_reference::chunk_step`), then the same gated output
+    /// RMSNorm in place on the same rows. The checks, the refusals, the ranges and the
+    /// bytes written are those of [`Self::gdn_scan_seq_form`]; the scan values differ from
+    /// the sequential kernel's by rounding only.
+    pub(crate) fn gdn_scan_chunk_form(
+        &self,
+        stream: &DeviceStream,
+        call: GdnScanSeqCall<'_>,
+        form: GdnForm,
+    ) -> Result<(), EngError> {
+        self.ensure_usable()?;
+        check_shape(&call.shape, call.eps)?;
+        let ints = scan_ints(&call.shape)?;
+        let need = scan_bytes(call.shape)?;
+        check_fit(&call, &need)?;
+        check_apart(&call, &need)?;
+        let conv = self.raw_range(&call.conv)?;
+        let proj = self.raw_range(&call.proj)?;
+        let a = self.raw_range(&call.weights.a)?;
+        let dt_bias = self.raw_range(&call.weights.dt_bias)?;
+        let norm_w = self.raw_range(&call.weights.norm_w)?;
+        let state = self.raw_range(&call.state)?;
+        let o_out = self.raw_range(&call.o_out)?;
+        let status = call
+            .status
+            .as_ref()
+            .map(|r| self.raw_range(r))
+            .transpose()?;
+        let io = GdnScanSeqRaw {
+            conv,
+            proj,
+            a,
+            dt_bias,
+            norm_w,
+            state,
+            o_out,
+            status,
+            ints,
+            eps: call.eps,
+            form: form.bits(),
+        };
+        self.launch_on(stream, move |raw| gdn_scan_chunk_launch(raw, io))
     }
 
     /// [`Self::gdn_scan_seq_form`] under an explicit switch value (the parsed `FIFI_GDN_SCAN_COLS`).

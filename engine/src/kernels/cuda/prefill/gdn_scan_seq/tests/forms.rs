@@ -16,7 +16,7 @@ pub(super) const FN_K: usize = 16;
 pub(super) const FN_V: usize = 48;
 
 /// The form with rule bits `bits` (1 grouped heads, 2 add-eps L2, 4 sigmoid gate; the C bits).
-fn form_of(bits: u8) -> GdnForm {
+pub(super) fn form_of(bits: u8) -> GdnForm {
     GdnForm {
         key_heads: if bits & 1 != 0 {
             GdnKeyHeads::Grouped
@@ -48,7 +48,7 @@ pub(super) fn opts_of(form: GdnForm) -> RefOpts {
 
 /// The largest gated-row error of `got` against the reference `opts`, each row relative to
 /// max(|ref|, 1) as in `judge_scan`. The rows must be finite first.
-fn rows_off(inp: &ScanInputs, got: &[f32], opts: RefOpts) -> f64 {
+pub(super) fn rows_off(inp: &ScanInputs, got: &[f32], opts: RefOpts) -> f64 {
     let want = scan_reference(inp, opts).out;
     let (want_rows, got_rows) = (want.as_chunks::<D>().0, got.as_chunks::<D>().0);
     want_rows
