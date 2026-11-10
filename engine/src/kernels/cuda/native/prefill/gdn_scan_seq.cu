@@ -700,6 +700,44 @@ __device__ __forceinline__ float j2(const __half *hi, const __half *lo, int i) {
     return __half2float(hi[i]) + __half2float(lo[i]);
 }
 
+#if __CUDA_ARCH__ >= 800
+// The tensor-core primitives of the chunk kernel's matmul phases, in the house style of
+// attn_prefill.cu (sm_80+; sm_72 builds never compile them and take the joined SIMT paths).
+__device__ __forceinline__ unsigned smem_addr(const void *p) {
+    return (unsigned)__cvta_generic_to_shared(p);
+}
+// The A fragment (16x16 halves, row-major source): lanes 0-7 name the rows of the
+// (rows 0-7, cols 0-7) block, lanes 8-15 rows 8-15, lanes 16-23 the col+8 halves of rows
+// 0-7, lanes 24-31 the same of rows 8-15.
+__device__ __forceinline__ void ldm_a(const __half *m, int row, int col, unsigned (&r)[4]) {
+    const int lr = row + (threadIdx.x & 7) + 8 * ((threadIdx.x >> 3) & 1);
+    const int lc = col + 8 * (threadIdx.x >> 4);
+    const unsigned addr = smem_addr(m + (size_t)lr * kHpad + lc);
+    asm volatile("ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%0,%1,%2,%3}, [%4];\n"
+                 : "=r"(r[0]), "=r"(r[1]), "=r"(r[2]), "=r"(r[3])
+                 : "r"(addr));
+}
+// The B fragment (16x8 halves, from a row-major [n][k] source): the non-trans load already
+// lands lane l on {B[2(l%4)][n0+l/4], B[2(l%4)+1][n0+l/4]} — the trans form is for [k][n]
+// sources. Lanes 0-7 name source rows n0..n0+7 at k, lanes 8-15 the same rows at k+8.
+__device__ __forceinline__ void ldm_b(const __half *m, int row, int col, unsigned (&r)[2]) {
+    const int lr = row + (threadIdx.x & 7);
+    const int lc = col + 8 * ((threadIdx.x >> 3) & 1);
+    const unsigned addr = smem_addr(m + (size_t)lr * kHpad + lc);
+    asm volatile("ldmatrix.sync.aligned.m8n8.x2.shared.b16 {%0,%1}, [%2];\n"
+                 : "=r"(r[0]), "=r"(r[1])
+                 : "r"(addr));
+}
+// D (16x8 f32) += A (16x16 f16, row) * B (16x8 f16, col).
+__device__ __forceinline__ void mma_16816(float *d, const unsigned *a, unsigned b0, unsigned b1) {
+    asm volatile(
+        "mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32 "
+        "{%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%0,%1,%2,%3};\n"
+        : "+f"(d[0]), "+f"(d[1]), "+f"(d[2]), "+f"(d[3])
+        : "r"(a[0]), "r"(a[1]), "r"(a[2]), "r"(a[3]), "r"(b0), "r"(b1));
+}
+#endif
+
 template <bool kGrouped, bool kAddEps>
 __global__ void __launch_bounds__(kLanes * kChunkWarps, 1) gdn_scan_chunk_k(ScanArgs a) {
     extern __shared__ __align__(16) unsigned char sm[];  // the layout of kChunkSmem, in order
@@ -842,9 +880,34 @@ __global__ void __launch_bounds__(kLanes * kChunkWarps, 1) gdn_scan_chunk_k(Scan
             }
         }
         __syncthreads();  // G's writes are visible to the serial pass and M2
-        // M1, every state-seen term of the sub-chunk in one parallel pass: thread (t, c)
-        // walks r in 128-bit steps — K̂'s row is a warp-wide broadcast, the state row is the
-        // lane's own value column.
+        // M1, every state-seen term of the sub-chunk in one pass. sm_80+: one tensor-core
+        // tile per warp — warp w owns the 16x8 (t, c) block t0 = 16·(w>>3), c0 = 8·(w&7);
+        // three mma products per 16-half k step cover the split (the lo·lo term sits below
+        // the residual the EC_S derivation already counts). sm_72 keeps the joined SIMT walk.
+#if __CUDA_ARCH__ >= 800
+        {
+            const int t0w = 16 * (w >> 3), c0w = 8 * (w & 7);
+            float d[4] = {0.f, 0.f, 0.f, 0.f};
+            for (int r0 = 0; r0 < D; r0 += 16) {
+                unsigned aH[4], aL[4], bH[2], bL[2];
+                ldm_a(kh_h, t0w, r0, aH);
+                ldm_a(kh_l, t0w, r0, aL);
+                ldm_b(S_h, c0w, r0, bH);
+                ldm_b(S_l, c0w, r0, bL);
+                mma_16816(d, aH, bH[0], bH[1]);
+                mma_16816(d, aH, bL[0], bL[1]);
+                mma_16816(d, aL, bH[0], bH[1]);
+            }
+            // D scatter: lane l owns rows l/4 and l/4+8, columns 2·(l%4) and +1.
+            const int r0 = lane >> 2, cc = 2 * (lane & 3);
+#pragma unroll
+            for (int e = 0; e < 4; ++e) {
+                const int t = t0w + r0 + 8 * (e >> 1);
+                const int c = c0w + cc + (e & 1);
+                if (t < len) seen_s[c * kCpad + t] = B_s[t] * d[e];
+            }
+        }
+#else
         {
             const int c = tid % kCols, tg = tid / kCols;
             const int tgs = kLanes * kChunkWarps / kCols;
@@ -857,6 +920,7 @@ __global__ void __launch_bounds__(kLanes * kChunkWarps, 1) gdn_scan_chunk_k(Scan
                 seen_s[c * kCpad + t] = B_s[t] * acc;
             }
         }
+#endif
         __syncthreads();  // M1's writes are visible to the serial pass
         // The forward substitution, one lane per value column (the first kCols/32 warps):
         // every read is the lane's own U/seen entry or a broadcast G coefficient, so the
