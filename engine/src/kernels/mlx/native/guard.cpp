@@ -2914,6 +2914,34 @@ static int compile_moe_lhs_load(
   return 0;
 }
 
+// The whole-layer closure's gather row-index pair, keyed by the ACTUAL row count (the chunk
+// window runs arbitrary T, not the decode slots): the same cache and builder, a direct key.
+static int compile_moe_lhs_for(
+    mlx_array* rows, mlx_array* flat, uintptr_t owner, int batch, int top_k,
+    mlx_stream s) noexcept {
+  const std::tuple<uintptr_t, int, int> key(owner, batch, top_k);
+  std::lock_guard<std::mutex> lock(compile_moe_lhs_mutex_);
+  const auto found = compile_moe_lhs_cache_.find(key);
+  if (found != compile_moe_lhs_cache_.end()) {
+    const int kept_rows = mlx_array_set(rows, found->second.first);
+    if (kept_rows != 0) return kept_rows;
+    return mlx_array_set(flat, found->second.second);
+  }
+  mlx_array built_rows = mlx_array_new();
+  mlx_array built_flat = mlx_array_new();
+  const int built = compile_moe_lhs_build(&built_rows, &built_flat, batch, top_k, s);
+  if (built != 0) return built;
+  const int kept_rows = mlx_array_set(rows, built_rows);
+  const int kept_flat = kept_rows == 0 ? mlx_array_set(flat, built_flat) : 1;
+  if (kept_rows != 0 || kept_flat != 0) {
+    mlx_array_free(built_rows);
+    mlx_array_free(built_flat);
+    return kept_rows != 0 ? kept_rows : kept_flat;
+  }
+  compile_moe_lhs_cache_.emplace(key, std::make_pair(built_rows, built_flat));
+  return 0;
+}
+
 // Vectorized B>1 MoE. The single-row body below stays on its original op sequence.
 // Row indices [B,1] broadcast against the once-clamped expert ids [B,k], so each gate/up
 // gather reads only that row's activation. The down input already has batch axes [B,k];
@@ -4090,8 +4118,9 @@ extern "C" int inference_mlx_compile_moe_block(
 //   28..36  payload, scales, biases of the shared gate, up, down packed weights (3 x 3)
 //   37 shared_scalar_t [H, 1] F32
 //   38..43  payload, scales, biases of the gate/up stack and the down stack (2 x 3)
-//   44 rows_lhs, 45 flat_lhs: the gathered-product row-index operands of shape [T*k] (Rust
-//      builds them per window, mirroring `compile_moe_lhs_load` at batch T)
+//   44 rows_lhs, 45 flat_lhs: the gathered-product row-index operands of shape [T*k]; the
+//      WRAPPER builds them per actual T (compile_moe_lhs_for) and extends the 44 caller
+//      inputs to the 46 the body traces, so the Rust seam stays shape-free.
 // Output order (4): out [T, H] activation dtype (both residual adds folded),
 //   rec_next [VH, VD, KD] F32, ring_next [CD, taps] F32, health [T] F32.
 struct CompileDeltaLayerPayload {
@@ -4365,12 +4394,33 @@ extern "C" int inference_mlx_compile_delta_layer(
     mlx_array* out, mlx_array* rec, mlx_array* ring, mlx_array* health,
     const mlx_array* inputs, size_t inputs_num, const int* dims, const int* quant, float eps,
     mlx_dtype activation, const char* prep_source, const char* delta_source,
-    const char* post_source, const char* router_source, uintptr_t fun_id,
+    const char* post_source, const char* router_source, uintptr_t owner, uintptr_t fun_id,
     mlx_stream stream) noexcept {
   return run_selected_operation(out, stream, [&]() noexcept {
-    if (inputs_num != 46 || dims == nullptr || quant == nullptr) {
+    if (inputs_num != 44 || dims == nullptr || quant == nullptr) {
       return 1;
     }
+    // The gather row-index pair of this window's row count: cached per (owner, T, top_k),
+    // appended after the 44 caller inputs so the body sees the 46-array contract.
+    mlx_array rows_lhs = mlx_array_new();
+    mlx_array flat_lhs = mlx_array_new();
+    const int* h_shape_in = mlx_array_shape(inputs[0]);
+    if (h_shape_in == nullptr || mlx_array_ndim(inputs[0]) != 2) {
+      return 1;
+    }
+    int lhs_status =
+        compile_moe_lhs_for(&rows_lhs, &flat_lhs, owner, h_shape_in[0], dims[10], stream);
+    if (lhs_status != 0) {
+      mlx_array_free(rows_lhs);
+      mlx_array_free(flat_lhs);
+      return lhs_status;
+    }
+    mlx_array closure_inputs[46];
+    for (size_t i = 0; i < 44; ++i) {
+      closure_inputs[i] = inputs[i];
+    }
+    closure_inputs[44] = rows_lhs;
+    closure_inputs[45] = flat_lhs;
     CompileDeltaLayerPayload* payload =
         static_cast<CompileDeltaLayerPayload*>(std::malloc(sizeof(CompileDeltaLayerPayload)));
     if (payload == nullptr) {
@@ -4406,8 +4456,8 @@ extern "C" int inference_mlx_compile_delta_layer(
     }
     mlx_array outputs[4] = {{nullptr}, {nullptr}, {nullptr}, {nullptr}};
     const int status = compile_apply_block(
-        outputs, 4, compile_delta_layer_body, payload, compile_delta_layer_payload_free, inputs,
-        inputs_num, fun_id);
+        outputs, 4, compile_delta_layer_body, payload, compile_delta_layer_payload_free,
+        closure_inputs, 46, fun_id);
     *out = outputs[0];
     *rec = outputs[1];
     *ring = outputs[2];

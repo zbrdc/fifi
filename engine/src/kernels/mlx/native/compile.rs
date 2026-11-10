@@ -35,8 +35,8 @@ use super::{
     guard::{DispatchGuard, clear_message, failure, mark_failed},
     handles::{Array, native_dtype},
     resident_ops::{
-        DELTA_MIDDLE_SOURCE, GATED_DELTA_SOURCE, check_f32_operand, check_operand,
-        native_output_valid, produce,
+        DELTA_MIDDLE_SOURCE, GATED_DELTA_SOURCE, GDN_POST_SOURCE, GDN_PREP_SOURCE,
+        MOE_ROUTER_SOURCE, check_f32_operand, check_operand, native_output_valid, produce,
     },
 };
 use crate::{
@@ -197,6 +197,58 @@ pub(crate) struct CompiledMoe {
     /// The gates `[B, k, 1, 1]` (F32); `[k, 1, 1]` for B=1.
     pub(crate) gates: ExecutionTensor,
     /// The sums of the whole probability rows `[B]` (F32).
+    pub(crate) health: ExecutionTensor,
+}
+
+/// The flat input list and baked constants of one compiled whole-layer DeltaNet chunk step
+/// (B1). Every tensor must belong to this adapter.
+pub(crate) struct CompileDeltaLayerArgs<'a> {
+    /// The raw residual stream `[T, H]`, `T >= 2`: the closure folds the input RMS norm, the
+    /// mixer residual, the post norm, the MoE rows sequence, and the output residual add.
+    pub(crate) x: &'a ExecutionTensor,
+    /// The window's recurrent state `[VH, VD, KD]` and convolution ring `[CD, taps]`.
+    pub(crate) rec: &'a ExecutionTensor,
+    pub(crate) ring: &'a ExecutionTensor,
+    /// `kh, kd, vh, vd, cd, taps`: widened by [`compile_key::checked_delta_dims`].
+    pub(crate) dims: [u32; 6],
+    /// qkv, z, b, a, out.
+    pub(crate) packed: [&'a ResidentPackedWeight; 5],
+    /// conv_taps, conv_last, neg_exp_a_log, dt_bias, norm.
+    pub(crate) plain: [&'a ExecutionTensor; 5],
+    /// The `qk_eps` and `sqrt_kd` scalars of the chunk path (`[1]` F32 each).
+    pub(crate) qk_eps: &'a ExecutionTensor,
+    pub(crate) sqrt_kd: &'a ExecutionTensor,
+    /// The input and post RMS norm weights `[H]`.
+    pub(crate) in_norm: &'a ExecutionTensor,
+    pub(crate) post_norm: &'a ExecutionTensor,
+    /// The transposed router weight `[H, E]`.
+    pub(crate) router_t: &'a ExecutionTensor,
+    /// The shared gate, up, down weights.
+    pub(crate) shared: [&'a ResidentPackedWeight; 3],
+    /// The transposed shared gate scalar `[H, 1]`.
+    pub(crate) shared_scalar_t: &'a ExecutionTensor,
+    /// The stacked gate/up expert operand and the down stack.
+    pub(crate) stacks: [&'a ResidentPackedWeight; 2],
+    pub(crate) hidden: u32,
+    pub(crate) experts: u32,
+    pub(crate) top_k: u32,
+    /// Whether the gates renormalize over the selection.
+    pub(crate) renorm: bool,
+    /// The RMS norm epsilon of the input and post norms.
+    pub(crate) eps: f32,
+    /// The activation dtype of the layer input and output, and part of the compile key.
+    pub(crate) act: Dtype,
+}
+
+/// The outputs of one compiled whole-layer chunk step, all lazy.
+pub(crate) struct CompiledDeltaLayer {
+    /// The layer output `[T, H]` in the activation dtype.
+    pub(crate) out: ExecutionTensor,
+    /// The window's next recurrent state `[VH, VD, KD]` (F32).
+    pub(crate) rec: ExecutionTensor,
+    /// The window's next convolution ring `[CD, taps]` (F32).
+    pub(crate) ring: ExecutionTensor,
+    /// The router health sums `[T]` (F32).
     pub(crate) health: ExecutionTensor,
 }
 
@@ -1029,6 +1081,216 @@ impl Context {
             ids: adapter.resident(ids_a, Dtype::U32, ids_shape, k_bytes),
             gates: adapter.resident(gates_a, Dtype::F32, gates_shape, k_bytes),
             health: adapter.resident(health_a, Dtype::F32, vec![batch], health_bytes),
+        })
+    }
+
+    /// Runs ONE whole DELTA-mixer layer of the chunk prefill through one `mlx_compile`d
+    /// closure (B1): the input RMS norm, the four projections, the fused `gdn_prep` kernel,
+    /// the gated-delta chunk recurrence, the fused `gdn_post` gate, the out projection, the
+    /// mixer residual, and the folded device-routed MoE rows sequence (post norm, router,
+    /// gathered experts, shared expert, output residual). The eager chunk spends ~395
+    /// uncompiled dispatches per layer; this closure is ONE native entry. `T` (the row count
+    /// of `x`) is an input shape the nonshapeless MLX cache specializes under the one key,
+    /// and the gather row-index operands are appended natively per window.
+    ///
+    /// Every tensor must belong to this adapter; `check_block_inputs`, the F32 rule on the
+    /// plain delta operands, and `check_norm_operand` on the three norm weights reject
+    /// anything else before the first native call. No fallback: after the caller turned the
+    /// flag on, a failure is a native failure.
+    pub(in crate::kernels::mlx) fn compiled_delta_layer(
+        &mut self,
+        args: &CompileDeltaLayerArgs<'_>,
+    ) -> Result<CompiledDeltaLayer, EngError> {
+        let label = "compiled delta layer";
+        let _dispatch = DispatchGuard::enter();
+        self.check_ready()?;
+        check_float(label, args.act)?;
+        let adapter = self.state.as_mut().unwrap();
+        let [kh, kd, vh, vd, cd, taps, kw, kw2] = compile_key::checked_delta_dims(args.dims)?;
+        let &[rows, hidden] = args.x.shape() else {
+            return Err(EngError::BadRequest(
+                "compiled delta layer input must be [T, H]".into(),
+            ));
+        };
+        if rows < 2 || hidden != args.hidden {
+            return Err(EngError::BadRequest(
+                "compiled delta layer needs T >= 2 rows of the hidden width".into(),
+            ));
+        }
+        if args.rec.shape() != [vh, vd, kd] || args.ring.shape() != [cd, taps] {
+            return Err(EngError::BadRequest(
+                "compiled delta layer state shapes disagree".into(),
+            ));
+        }
+        if args.router_t.shape()[0] != hidden
+            || args.router_t.shape().get(1) != Some(&args.experts)
+            || args.shared_scalar_t.shape() != [hidden, 1]
+        {
+            return Err(EngError::BadRequest(
+                "compiled delta layer router shapes disagree".into(),
+            ));
+        }
+        let mut packed_all: Vec<&ResidentPackedWeight> = Vec::with_capacity(10);
+        packed_all.extend(args.packed);
+        packed_all.extend(args.shared);
+        packed_all.extend(args.stacks);
+        let f32_operands: Vec<&ExecutionTensor> = args
+            .plain
+            .iter()
+            .chain(std::iter::once(args.qk_eps))
+            .chain(std::iter::once(args.sqrt_kd))
+            .chain(std::iter::once(args.router_t))
+            .chain(std::iter::once(args.shared_scalar_t))
+            .collect();
+        check_block_inputs(label, adapter, args.x, args.act, &f32_operands, &packed_all)?;
+        check_norm_operand(label, adapter, args.in_norm, hidden, args.act)?;
+        check_norm_operand(label, adapter, args.post_norm, hidden, args.act)?;
+        check_operand(label, adapter, args.rec)?;
+        check_operand(label, adapter, args.ring)?;
+        let triples: Vec<[i32; 3]> = packed_all.iter().map(|w| quant_triple(w)).collect::<Result<_, _>>()?;
+        let quant: Vec<i32> = triples.iter().flat_map(|t| t.iter().copied()).collect();
+        let fun_id = compile_key::delta_layer_fun_id(&compile_key::DeltaLayerBaked {
+            hidden: args.hidden,
+            dims: [kh, kd, vh, vd, cd, taps, kw, kw2],
+            experts: args.experts,
+            top_k: args.top_k,
+            renorm: u32::from(args.renorm),
+            eps_bits: args.eps.to_bits(),
+            act: compile_key::dtype_key(args.act),
+            scale_keys: packed_all
+                .iter()
+                .map(|weight| compile_key::dtype_key(weight.scales().dtype()))
+                .collect::<Vec<_>>()
+                .try_into()
+                .expect("ten packed weights"),
+            quant: triples
+                .try_into()
+                .expect("ten quantization triples"),
+        });
+        adapter.programs.admit(fun_id)?;
+        let dims: [i32; 12] = [
+            native_dim(label, hidden)?,
+            native_dim(label, kh)?,
+            native_dim(label, kd)?,
+            native_dim(label, vh)?,
+            native_dim(label, vd)?,
+            native_dim(label, cd)?,
+            native_dim(label, taps)?,
+            native_dim(label, kw)?,
+            native_dim(label, kw2)?,
+            native_dim(label, args.experts)?,
+            native_dim(label, args.top_k)?,
+            i32::from(args.renorm),
+        ];
+        let mut keep: Vec<_> = [args.x, args.rec, args.ring]
+            .into_iter()
+            .chain(std::iter::once(args.in_norm))
+            .chain(std::iter::once(args.post_norm))
+            .chain(std::iter::once(args.router_t))
+            .chain(std::iter::once(args.shared_scalar_t))
+            .chain(args.plain.iter().copied())
+            .chain(std::iter::once(args.qk_eps))
+            .chain(std::iter::once(args.sqrt_kd))
+            .map(|tensor| tensor.share())
+            .collect();
+        let mut inputs: Vec<ffi::mlx_array> = Vec::with_capacity(44);
+        inputs.push(args.x.storage.native_array());
+        inputs.push(args.rec.storage.native_array());
+        inputs.push(args.ring.storage.native_array());
+        for weight in args.packed {
+            inputs.push(weight.payload().storage.native_array());
+            inputs.push(weight.scales().storage.native_array());
+            inputs.push(
+                weight
+                    .biases()
+                    .map(|biases| biases.storage.native_array())
+                    .unwrap_or(ffi::NULL_ARRAY),
+            );
+        }
+        for tensor in args.plain.iter() {
+            inputs.push(tensor.storage.native_array());
+        }
+        inputs.push(args.qk_eps.storage.native_array());
+        inputs.push(args.sqrt_kd.storage.native_array());
+        inputs.push(args.in_norm.storage.native_array());
+        inputs.push(args.post_norm.storage.native_array());
+        inputs.push(args.router_t.storage.native_array());
+        for weight in args.shared.iter().chain(args.stacks.iter()) {
+            inputs.push(weight.payload().storage.native_array());
+            inputs.push(weight.scales().storage.native_array());
+            inputs.push(
+                weight
+                    .biases()
+                    .map(|biases| biases.storage.native_array())
+                    .unwrap_or(ffi::NULL_ARRAY),
+            );
+        }
+        inputs.push(args.shared_scalar_t.storage.native_array());
+        debug_assert_eq!(inputs.len(), 44);
+        for weight in packed_all.iter() {
+            keep.push(weight.payload().share());
+            keep.push(weight.scales().share());
+            if let Some(biases) = weight.biases() {
+                keep.push(biases.share());
+            }
+        }
+        clear_message();
+        let stream = adapter.stream.0;
+        let (mut out_a, mut rec_a, mut ring_a, mut health_a) =
+            (Array::null(), Array::null(), Array::null(), Array::null());
+        let started = std::time::Instant::now();
+        let built = produce(&mut out_a, label, |slot| unsafe {
+            ffi::mlx_compile_delta_layer(
+                slot,
+                &mut rec_a.0,
+                &mut ring_a.0,
+                &mut health_a.0,
+                inputs.as_ptr(),
+                inputs.len(),
+                dims.as_ptr(),
+                quant.as_ptr(),
+                args.eps,
+                native_dtype(args.act),
+                GDN_PREP_SOURCE.as_ptr().cast(),
+                GATED_DELTA_SOURCE.as_ptr().cast(),
+                GDN_POST_SOURCE.as_ptr().cast(),
+                MOE_ROUTER_SOURCE.as_ptr().cast(),
+                adapter.owner.0.get() as usize,
+                fun_id as usize,
+                stream,
+            )
+        });
+        super::super::compile_stats::record(
+            super::super::compile_stats::Kind::Delta,
+            fun_id,
+            started.elapsed().as_secs_f64(),
+        );
+        // The layer output carries the activation dtype; the state, ring, and health stay F32.
+        let hidden_bytes = u64::from(rows) * u64::from(hidden) * args.act.byte_width();
+        let state_bytes = u64::from(vh) * u64::from(vd) * u64::from(kd) * 4;
+        let ring_bytes = u64::from(cd) * u64::from(taps) * 4;
+        let health_bytes = u64::from(rows) * 4;
+        let checked = built.and_then(|()| {
+            if native_output_valid(out_a.0, &[rows, hidden], args.act, hidden_bytes)
+                && native_output_valid(rec_a.0, &[vh, vd, kd], Dtype::F32, state_bytes)
+                && native_output_valid(ring_a.0, &[cd, taps], Dtype::F32, ring_bytes)
+                && native_output_valid(health_a.0, &[rows], Dtype::F32, health_bytes)
+            {
+                Ok(())
+            } else {
+                Err(failure(label))
+            }
+        });
+        if checked.is_err() {
+            mark_failed();
+        }
+        checked?;
+        drop(keep);
+        Ok(CompiledDeltaLayer {
+            out: adapter.resident(out_a, args.act, vec![rows, hidden], hidden_bytes),
+            rec: adapter.resident(rec_a, Dtype::F32, vec![vh, vd, kd], state_bytes),
+            ring: adapter.resident(ring_a, Dtype::F32, vec![cd, taps], ring_bytes),
+            health: adapter.resident(health_a, Dtype::F32, vec![rows], health_bytes),
         })
     }
 

@@ -822,6 +822,34 @@ unsafe extern "C" {
         fun_id: usize,
         stream: mlx_stream,
     ) -> i32;
+    /// The whole-layer DeltaNet chunk closure (B1): one compiled entry for one DELTA-mixer
+    /// layer of the chunk prefill (input norm, projections, fused prep/recurrence/post,
+    /// mixer residual, and the folded device-routed MoE rows sequence). `dims` holds hidden,
+    /// kh, kd, vh, vd, cd, taps, kw, kw2, experts, top_k, renorm; `quant` holds mode, group,
+    /// bits per weight for the ten packed weights; `inputs` holds the 44 caller inputs (the
+    /// wrapper appends the two gather row-index operands itself, per the window's row count).
+    /// The four outputs (out [T,H], rec, ring, health [T]) are lazy. A non-zero status is a
+    /// native failure of the adapter.
+    #[link_name = "inference_mlx_compile_delta_layer"]
+    pub(super) fn mlx_compile_delta_layer(
+        out: *mut mlx_array,
+        rec: *mut mlx_array,
+        ring: *mut mlx_array,
+        health: *mut mlx_array,
+        inputs: *const mlx_array,
+        inputs_num: usize,
+        dims: *const i32,
+        quant: *const i32,
+        eps: f32,
+        activation: mlx_dtype,
+        prep_source: *const c_char,
+        delta_source: *const c_char,
+        post_source: *const c_char,
+        router_source: *const c_char,
+        owner: usize,
+        fun_id: usize,
+        stream: mlx_stream,
+    ) -> i32;
     #[cfg(test)]
     #[link_name = "inference_mlx_compile_flint_tail_body_entries"]
     pub(super) fn mlx_compile_flint_tail_body_entries() -> u64;

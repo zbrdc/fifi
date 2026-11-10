@@ -19,6 +19,7 @@ use crate::tensor::Dtype;
 pub(crate) const DELTA_TAG: u64 = 0x0036_5147_a5a0_0002;
 pub(crate) const MOE_TAG: u64 = 0x0036_5147_a5a0_0003;
 pub(crate) const FLINT_TAIL_TAG: u64 = 0x0036_5147_a5a0_0004;
+pub(crate) const DELTA_LAYER_TAG: u64 = 0x0036_5147_a5a0_0007;
 /// The cache-key tag of the attention pre-RoPE closure (projections, q/gate split, q/k norms).
 pub(crate) const ATTN_PRE_TAG: u64 = 0x0036_5147_a5a0_0005;
 pub(crate) const ATTN_POST_TAG: u64 = 0x0036_5147_a5a0_0006;
@@ -154,6 +155,47 @@ pub(crate) fn delta_fun_id(baked: &DeltaBaked) -> u64 {
         parts.extend(triple.iter().map(|&value| i64::from(value) as u64));
     }
     mix_fun_id(DELTA_TAG, &parts)
+}
+
+/// The baked constants of one compiled whole-layer DeltaNet chunk step (B1): the input
+/// norm, the four projections, the fused prep/recurrence/post kernels, the mixer residual,
+/// and the folded device-routed MoE rows sequence. T (the row count) is NOT baked: the
+/// nonshapeless MLX cache specializes it under the one key, like the B axis of the decode
+/// blocks.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct DeltaLayerBaked {
+    pub(crate) hidden: u32,
+    /// `kh, kd, vh, vd, cd, taps` (conv_kernel - 1), `kw` (kh * kd), `kw2` (2 * kw).
+    pub(crate) dims: [u32; 8],
+    pub(crate) experts: u32,
+    pub(crate) top_k: u32,
+    /// 1 when the gates renormalize over the selection, 0 otherwise.
+    pub(crate) renorm: u32,
+    /// `f32::to_bits(eps)`: the RMS norm epsilon of the input and post norms.
+    pub(crate) eps_bits: u32,
+    /// The activation dtype key of the layer input and output.
+    pub(crate) act: u64,
+    /// The scale dtype key of EACH packed weight, in the seam's weight order qkv, z, b, a,
+    /// out, shared gate, shared up, shared down, gate/up stack, down stack.
+    pub(crate) scale_keys: [u64; 10],
+    /// The quantization triple of EACH packed weight, in the same order.
+    pub(crate) quant: [[i32; 3]; 10],
+}
+
+pub(crate) fn delta_layer_fun_id(baked: &DeltaLayerBaked) -> u64 {
+    let mut parts = Vec::with_capacity(48);
+    parts.push(u64::from(baked.hidden));
+    parts.extend(baked.dims.iter().map(|&dim| u64::from(dim)));
+    parts.push(u64::from(baked.experts));
+    parts.push(u64::from(baked.top_k));
+    parts.push(u64::from(baked.renorm));
+    parts.push(u64::from(baked.eps_bits));
+    parts.push(baked.act);
+    parts.extend(baked.scale_keys);
+    for triple in &baked.quant {
+        parts.extend(triple.iter().map(|&value| i64::from(value) as u64));
+    }
+    mix_fun_id(DELTA_LAYER_TAG, &parts)
 }
 
 /// The baked constants of one compiled Flint decode tail: the
