@@ -2,7 +2,7 @@
 //! sequential kernels (the scalar form of its math is `kernels::gdn_reference::chunk_step`,
 //! pinned there against `step` at f64 exactness on the host). The kernel differs from the
 //! sequential ones by rounding only, so every test here judges it against the same
-//! reference with the chunk kernel's own derived bound `EC`; the sequential kernels' own
+//! reference with the chunk kernel's own derived bound `EC_S`; the sequential kernels' own
 //! tests (their bounds E3/E4) are untouched. The wrapper refusals are shared code and are
 //! exercised once here; the p0 device guard mirrors the sequential kernels' line for line
 //! and has no fault entry of its own (the fault-qualification entries target the
@@ -35,6 +35,14 @@ const KC: f64 = 32.0;
 /// lemma bounds cross-sub-chunk growth exactly as it bounded cross-token growth. The bound
 /// is `2·(C_DOTS + kC)·128·u`; the measured values print with each test for the lane report.
 const EC: f64 = 2.0 * (C_DOTS + KC) * 128.0 * U;
+/// The split-form bound: the chunk kernel stages K̂, Q̂ and S as fp16 hi/lo pairs, so every
+/// dot term carries an operand residual of at most 2·2⁻²² (both operands reconstruct to
+/// ~2⁻²² relative) on top of the fp32 accumulation rounding `u` the `EC` derivation counts.
+/// Replacing the per-term unit `U` with `U + 2⁻²¹` in that same expression bounds the split
+/// form; everything else (the decay lemma, the kC solve terms, the cross-sub-chunk growth)
+/// is unchanged. Measured ~7.0e-4 sits ~8× under it, the same worst-case profile the fp32
+/// form has under `EC`; dropping the lo half measured 7.1e-2 (the lo term is load-bearing).
+const EC_S: f64 = 2.0 * (C_DOTS + KC) * 128.0 * (U + 1.0 / 2_097_152.0);
 
 /// [`ScanRig::run_form`] for the chunk kernel: the same buffers, the chunk launch.
 fn run_chunk_form(
@@ -96,10 +104,10 @@ fn gdn_scan_chunk_matches_the_f64_reference() -> Result<(), EngError> {
         let (rows, state) = judged(&inp, &got, &label, RefOpts::default());
         measured.push(format!("{label}: rows {rows:.3e}, state {state:.3e}"));
         assert!(
-            rows <= EC,
-            "{label}: gated rows {rows:.3e} above EC {EC:.3e}"
+            rows <= EC_S,
+            "{label}: gated rows {rows:.3e} above EC_S {EC_S:.3e}"
         );
-        assert!(state <= EC, "{label}: state {state:.3e} above EC {EC:.3e}");
+        assert!(state <= EC_S, "{label}: state {state:.3e} above EC_S {EC_S:.3e}");
     }
     println!("REPORTED: {}", measured.join("; "));
     Ok(())
@@ -122,8 +130,8 @@ fn gdn_scan_chunk_m_edges() -> Result<(), EngError> {
         };
         let label = format!("chunk m {m}");
         let (rows, state) = judged(&inp, &got, &label, RefOpts::default());
-        assert!(rows <= EC, "{label}: rows {rows:.3e} above EC {EC:.3e}");
-        assert!(state <= EC, "{label}: state {state:.3e} above EC {EC:.3e}");
+        assert!(rows <= EC_S, "{label}: rows {rows:.3e} above EC_S {EC_S:.3e}");
+        assert!(state <= EC_S, "{label}: state {state:.3e} above EC_S {EC_S:.3e}");
     }
     Ok(())
 }
@@ -160,8 +168,8 @@ fn gdn_scan_chunk_every_form_matches_its_reference_and_no_neighbour() -> Result<
         let label = format!("chunk forms bits {b}");
         let opts = super::forms::opts_of(form);
         let (rows, st) = judge_scan_with(&inp, (out, state), &label, opts);
-        assert!(rows <= EC, "{label}: rows {rows:.3e} above EC {EC:.3e}");
-        assert!(st <= EC, "{label}: state {st:.3e} above EC {EC:.3e}");
+        assert!(rows <= EC_S, "{label}: rows {rows:.3e} above EC_S {EC_S:.3e}");
+        assert!(st <= EC_S, "{label}: state {st:.3e} above EC_S {EC_S:.3e}");
         for flip in [1u8, 2, 4] {
             let off = super::forms::rows_off(
                 &inp,
@@ -212,12 +220,12 @@ fn gdn_scan_chunk_splits_and_tokens_each_match_the_reference() -> Result<(), Eng
     for (label, got) in [("whole", &whole), ("split", &split), ("tokens", &tokens)] {
         let (rows, state) = judged(&inp, got, &format!("chunk {label}"), RefOpts::default());
         assert!(
-            rows <= EC,
-            "chunk {label}: rows {rows:.3e} above EC {EC:.3e}"
+            rows <= EC_S,
+            "chunk {label}: rows {rows:.3e} above EC_S {EC_S:.3e}"
         );
         assert!(
-            state <= EC,
-            "chunk {label}: state {state:.3e} above EC {EC:.3e}"
+            state <= EC_S,
+            "chunk {label}: state {state:.3e} above EC_S {EC_S:.3e}"
         );
     }
     let rel = |a: &[f32], b: &[f32]| {
@@ -230,8 +238,8 @@ fn gdn_scan_chunk_splits_and_tokens_each_match_the_reference() -> Result<(), Eng
             .fold(0.0_f64, f64::max)
     };
     let pair = rel(&whole.out, &split.out).max(rel(&whole.state, &split.state));
-    println!("REPORTED: chunk whole vs split max gap {pair:.3e} (EC {EC:.3e})");
-    assert!(pair <= 2.0 * EC, "whole vs split gap {pair:.3e} above 2*EC");
+    println!("REPORTED: chunk whole vs split max gap {pair:.3e} (EC_S {EC_S:.3e})");
+    assert!(pair <= 2.0 * EC_S, "whole vs split gap {pair:.3e} above 2*EC_S");
     Ok(())
 }
 
