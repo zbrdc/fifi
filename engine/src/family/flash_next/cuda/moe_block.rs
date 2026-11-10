@@ -874,8 +874,8 @@ mod device {
             dims: &MoeDims,
         ) -> Result<(), EngError> {
             let m = dims.rows;
-            if !(2..=16).contains(&m) {
-                return Err(refuse(format!("the block takes 2 to 16 rows, got {m}")));
+            if !(2..=32).contains(&m) {
+                return Err(refuse(format!("the block takes 2 to 32 rows, got {m}")));
             }
             let geometry = *self.bank.geometry();
             if dims.n_expert != geometry.experts

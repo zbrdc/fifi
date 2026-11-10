@@ -597,9 +597,9 @@ pub(in crate::family) fn shared_rows(
     io: &SharedRowsIo<'_>,
     (hidden, shared_inter, rows): (usize, usize, usize),
 ) -> Result<(), EngError> {
-    if !(2..=16).contains(&rows) {
+    if !(2..=32).contains(&rows) {
         return Err(refuse(format!(
-            "the K-row shared expert takes 2 to 16 rows, got {rows}"
+            "the K-row shared expert takes 2 to 32 rows, got {rows}"
         )));
     }
     let s = shared_inter;

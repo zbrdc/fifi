@@ -58,8 +58,8 @@ const I32: usize = size_of::<i32>();
 /// Most rows of one decode step. Qwen3.6 caps the merged expert launches at 8 rows and its
 /// verify window there; the Flash-Next chunk driver builds its plan at the prefill chunk width,
 /// whose shared expert splits its down groups at the kernel's 8-row bound, so the plan takes
-/// up to 16: twice the chunk width halves the per-layer-chunk drain count of a deep prefill.
-pub(super) const MAX_STEP_ROWS: usize = 16;
+/// wider chunks: every doubling halves the per-layer-chunk drain count of a deep prefill.
+pub(super) const MAX_STEP_ROWS: usize = 32;
 
 /// Splits of the QSA attention in a decode step unless the options say otherwise. The attended
 /// positions of a token are the selected blocks (2,048 at most) and the open tail; the part
