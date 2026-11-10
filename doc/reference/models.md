@@ -12,6 +12,8 @@
 
 "Pilot" means the model serves short contexts and its long-context quality is not measured.
 
+On CUDA, any single `.gguf` conversion of Qwen3.6-35B-A3B in `model_dir` serves with `Q36_ALLOW_UNPINNED_GGUF=1`; the strict open (architecture metadata and full tensor set) is the gate, and the pinned Q4_K_M file stays the qualified checkpoint and wins whenever it is present.
+
 ## Tokenizer files
 
 Each engine reads `tokenizer.json`, `tokenizer_config.json`, `chat_template.jinja` and `generation_config.json` from its `tokenizer_dir`.

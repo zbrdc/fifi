@@ -96,7 +96,7 @@ fn make_takes_the_step_layout_from_the_loaded_weights() {
     // its resolved KV form; paged mode charges the checked physical resource plan.
     let start = pinned(fn_section("fn start("));
     let planned = start
-        .find("StartupPlan::new(settings,verify,modes)?")
+        .find("StartupPlan::new(settings,verify,allow_unpinned,modes)?")
         .unwrap();
     let tokenizer = start.find("TokenizerBundle::load").unwrap();
     assert!(planned < tokenizer);
@@ -410,6 +410,47 @@ fn the_sha256_toggle_is_resolved_in_start_not_in_make() {
         .find("check_sha256(path,GGUF_SHA256)?;")
         .expect("the full-file hash");
     assert!(gate < hash, "gate {gate}, hash {hash}");
+}
+
+#[test]
+fn the_unpinned_admission_is_resolved_in_start_and_selects_in_open_only() {
+    // A bad Q36_ALLOW_UNPINNED_GGUF spelling must fail FAST, at startup — start() resolves the
+    // switch beside the SHA-256 toggle, before the bundle and the spawn — while the engine
+    // thread only selects the file: open_gguf selects through select_gguf and passes the
+    // resolved bools to the identity check, and an unpinned checkpoint passes that check
+    // through (no pinned size or digest; the strict model open is the gate).
+    let start = pinned(fn_section("fn start("));
+    let resolve = start
+        .find("allow_unpinned_wanted(std::env::var(ALLOW_UNPINNED_VAR).ok().as_deref())?")
+        .expect("start resolves the switch");
+    let load = start
+        .find("TokenizerBundle::load")
+        .expect("start loads the bundle");
+    assert!(resolve < load, "resolve {resolve}, bundle {load}");
+    let make = pinned(fn_section("fn make("));
+    assert!(
+        !make.contains("allow_unpinned_wanted("),
+        "make must not validate the switch on the engine thread"
+    );
+    let open = pinned(fn_section("fn open_gguf("));
+    let select = open
+        .find("select_gguf(")
+        .expect("open_gguf selects the file");
+    let identity = open
+        .find("check_gguf_identity(")
+        .expect("open_gguf checks the identity");
+    let model_open = open
+        .find("open_qwen3_6_35b_a3b(")
+        .expect("open_gguf opens the model");
+    assert!(
+        select < identity && identity < model_open,
+        "{select} {identity} {model_open}"
+    );
+    let identity = pinned(fn_section("fn check_gguf_identity("));
+    assert!(
+        identity.contains("if!pinned{"),
+        "the unpinned pass-through is explicit"
+    );
 }
 
 #[test]

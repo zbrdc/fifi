@@ -105,6 +105,7 @@ struct StartupPlan {
     paged: Option<PagedResourcesPlan>,
     device_first_native: Option<usize>,
     verify: bool,
+    allow_unpinned: bool,
     modes: RuntimeModes,
 }
 
@@ -113,10 +114,11 @@ impl StartupPlan {
     fn new_device_first(
         settings: &Q36Settings,
         verify: bool,
+        allow_unpinned: bool,
         modes: RuntimeModes,
     ) -> Result<Self, EngError> {
         let Some(limit) = settings.kv_offload_host_bytes else {
-            return Self::new(settings, verify, modes);
+            return Self::new(settings, verify, allow_unpinned, modes);
         };
         let kv_mode = serve_kv_mode(settings)?;
         if kv_mode != KvMode::Int8G32 || settings.tiered.is_some() {
@@ -153,6 +155,7 @@ impl StartupPlan {
             paged: None,
             device_first_native: Some(native),
             verify,
+            allow_unpinned,
             modes,
         })
     }
@@ -207,7 +210,12 @@ impl StartupPlan {
         Ok(self)
     }
 
-    fn new(settings: &Q36Settings, verify: bool, modes: RuntimeModes) -> Result<Self, EngError> {
+    fn new(
+        settings: &Q36Settings,
+        verify: bool,
+        allow_unpinned: bool,
+        modes: RuntimeModes,
+    ) -> Result<Self, EngError> {
         let kv_mode = serve_kv_mode(settings)?;
         let capacity = context_tokens(settings.context_limit, kv_mode)?;
         let paged = match settings.kv_offload_host_bytes {
@@ -237,6 +245,7 @@ impl StartupPlan {
             paged,
             device_first_native: None,
             verify,
+            allow_unpinned,
             modes,
         })
     }
@@ -255,6 +264,12 @@ const GGUF_SHA256: &str = "671e47e0ec53c665d048b98c3ecbfd5236b5ca9c3e02ed19fc8f8
 /// cannot silently skip the check. A value Rust cannot read as UTF-8 reads as unset (std's
 /// `env::var`), so it leaves the check off.
 const VERIFY_SHA256_VAR: &str = "Q36_VERIFY_GGUF_SHA256";
+/// The opt-in admission of a checkpoint other than the pinned file: `1` serves the directory's
+/// single `.gguf` when the pinned file is absent, and the strict model open — architecture
+/// metadata, full tensor set, types and dims — stays the gate, so only a Qwen3.6-35B-A3B
+/// conversion loads. Unset or `0` keeps the pinned-only behavior; every other spelling is a
+/// typed refusal raised at startup, exactly like `Q36_VERIFY_GGUF_SHA256`.
+pub(crate) const ALLOW_UNPINNED_VAR: &str = "Q36_ALLOW_UNPINNED_GGUF";
 const CHUNK_PREFILL_VAR: &str = "Q36_CUDA_CHUNK_PREFILL";
 const CHUNK_ROWS_VAR: &str = "Q36_CUDA_CHUNK_ROWS";
 const CONTEXT_STAGING_VAR: &str = "Q36_CUDA_KV8_STAGE_CONTEXT";
@@ -491,12 +506,78 @@ pub(super) fn pinned_gguf(artifact: &Path) -> PathBuf {
     artifact.join(GGUF_NAME)
 }
 
+/// The GGUF to serve and whether it is the pinned file. The pinned file wins whenever it is
+/// present; otherwise, with the unpinned admission on, the directory's single `.gguf` serves,
+/// and an empty or ambiguous directory is a typed refusal that names the candidates.
+pub(crate) fn select_gguf(
+    artifact: &Path,
+    allow_unpinned: bool,
+) -> Result<(PathBuf, bool), EngError> {
+    let pinned = pinned_gguf(artifact);
+    if pinned.is_file() {
+        return Ok((pinned, true));
+    }
+    if !allow_unpinned {
+        return Err(EngError::Checkpoint(format!(
+            "cuda checkpoint: {} is missing (pinned: {GGUF_NAME}, {GGUF_BYTES} bytes); set \
+             {ALLOW_UNPINNED_VAR}=1 to serve the directory's single .gguf of the family",
+            pinned.display()
+        )));
+    }
+    let read = |error: std::io::Error| {
+        EngError::Checkpoint(format!(
+            "cuda checkpoint: cannot read {}: {error}",
+            artifact.display()
+        ))
+    };
+    let mut found = Vec::new();
+    for entry in std::fs::read_dir(artifact).map_err(read)? {
+        let path = entry.map_err(read)?.path();
+        if path.extension().is_some_and(|ext| ext == "gguf") && path.is_file() {
+            found.push(path);
+        }
+    }
+    found.sort();
+    match found.len() {
+        0 => Err(EngError::Checkpoint(format!(
+            "cuda checkpoint: no .gguf file in {} ({ALLOW_UNPINNED_VAR}=1 is set)",
+            artifact.display()
+        ))),
+        1 => Ok((found.pop().expect("len is 1"), false)),
+        _ => {
+            let names = found
+                .iter()
+                .map(|path| format!("{}", path.display()))
+                .collect::<Vec<_>>()
+                .join(", ");
+            Err(EngError::Checkpoint(format!(
+                "cuda checkpoint: {ALLOW_UNPINNED_VAR}=1 serves exactly one .gguf, found \
+                 {}: {names}",
+                found.len()
+            )))
+        }
+    }
+}
+
 pub(super) fn sha256_wanted(raw: Option<&str>) -> Result<bool, EngError> {
     match raw {
         None | Some("0") => Ok(false),
         Some("1") => Ok(true),
         Some(other) => Err(EngError::BadRequest(format!(
             "{VERIFY_SHA256_VAR} must be 0 or 1, found {other:?}"
+        ))),
+    }
+}
+
+/// The `Q36_ALLOW_UNPINNED_GGUF` resolution, the same promise shape as `sha256_wanted`: only `1`
+/// admits an unpinned checkpoint, `0` and unset keep the pinned-only behavior, and every other
+/// spelling is a typed refusal.
+pub(crate) fn allow_unpinned_wanted(raw: Option<&str>) -> Result<bool, EngError> {
+    match raw {
+        None | Some("0") => Ok(false),
+        Some("1") => Ok(true),
+        Some(other) => Err(EngError::BadRequest(format!(
+            "{ALLOW_UNPINNED_VAR} must be 0 or 1, found {other:?}"
         ))),
     }
 }
@@ -540,11 +621,22 @@ pub(super) fn check_sha256(path: &Path, expected: &str) -> Result<(), EngError> 
     Ok(())
 }
 
-/// Checks the pinned identity of the GGUF: the NAME by construction (`pinned_gguf`), the exact
-/// SIZE always (the metadata alone), the full-file SHA-256 only when `verify` asks for it. The
+/// Checks the pinned identity of the GGUF: the NAME by construction (`select_gguf`), the exact
+/// SIZE always (the metadata alone), the full-file SHA-256 only when `verify` asks for it. A
+/// checkpoint admitted by `Q36_ALLOW_UNPINNED_GGUF` has no pinned size or digest (the EXL3
+/// precedent); its identity is the strict model open, so this check passes it through. The
 /// toggle value itself is resolved by the caller (`start()`), so a bad spelling is refused at
 /// startup, before any device work; unset stays OFF with no error.
-pub(crate) fn check_gguf_identity(path: &Path, verify: bool) -> Result<(), EngError> {
+pub(crate) fn check_gguf_identity(path: &Path, verify: bool, pinned: bool) -> Result<(), EngError> {
+    if !pinned {
+        if verify {
+            eprintln!(
+                "q36 cuda: {VERIFY_SHA256_VAR}=1 has no pinned digest for {}; skipping",
+                path.display()
+            );
+        }
+        return Ok(());
+    }
     let metadata = std::fs::metadata(path).map_err(|_| {
         EngError::Checkpoint(format!(
             "cuda checkpoint: {} is missing (pinned: {GGUF_NAME}, {GGUF_BYTES} bytes)",
@@ -689,9 +781,20 @@ pub(super) fn load_options(kv_cache: u64, fixed_admission: bool) -> LoadOptions<
     }
 }
 
-fn open_gguf(artifact: &Path, verify: bool) -> Result<(GgufModel, PathBuf), EngError> {
-    let gguf = pinned_gguf(artifact);
-    check_gguf_identity(&gguf, verify)?;
+pub(super) fn open_gguf(
+    artifact: &Path,
+    verify: bool,
+    allow_unpinned: bool,
+) -> Result<(GgufModel, PathBuf), EngError> {
+    let (gguf, pinned) = select_gguf(artifact, allow_unpinned)?;
+    if !pinned {
+        eprintln!(
+            "q36 cuda: serving unpinned checkpoint {} (admitted by {ALLOW_UNPINNED_VAR}=1; \
+             the model open validates it)",
+            gguf.display()
+        );
+    }
+    check_gguf_identity(&gguf, verify, pinned)?;
     let model = open_qwen3_6_35b_a3b(&gguf, None)?;
     Ok((model, gguf))
 }
@@ -708,6 +811,9 @@ pub(crate) fn start(
     // refused at startup, not on the engine thread after the projector exists; unset stays OFF
     // with no error (`sha256_wanted(None)` is `Ok(false)`, pinned in start_tests).
     let verify = sha256_wanted(std::env::var(VERIFY_SHA256_VAR).ok().as_deref())?;
+    // Likewise the unpinned admission: a bad `Q36_ALLOW_UNPINNED_GGUF` spelling stops the start
+    // before any weight is read; unset stays off.
+    let allow_unpinned = allow_unpinned_wanted(std::env::var(ALLOW_UNPINNED_VAR).ok().as_deref())?;
     // Likewise `FIFI_EXL3_SHARED_IN_ROUTED`: a bad value, or `1` on a GGUF checkpoint, stops the
     // start before any weight is read. Unset on a GGUF checkpoint is off and is not refused.
     resolve_switch(
@@ -776,9 +882,9 @@ pub(crate) fn start(
     };
     let device_first = device_first_wanted(std::env::var_os(DEVICE_FIRST_VAR).as_deref())?;
     let plan = if device_first {
-        StartupPlan::new_device_first(settings, verify, modes)?
+        StartupPlan::new_device_first(settings, verify, allow_unpinned, modes)?
     } else {
-        StartupPlan::new(settings, verify, modes)?
+        StartupPlan::new(settings, verify, allow_unpinned, modes)?
     };
     for key in &settings.ignored_mlx_keys {
         eprintln!("{}", ignored_mlx_line(key));
@@ -888,7 +994,7 @@ fn make_multi(
         "q36 cuda: devices {:?} probed: compute capability {}.{} on every device, peer access full",
         settings.cuda_devices, first.cc_major, first.cc_minor
     );
-    let (model, _gguf) = open_gguf(&settings.artifact, plan.verify)?;
+    let (model, _gguf) = open_gguf(&settings.artifact, plan.verify, plan.allow_unpinned)?;
     let inventory = Inventory::for_spec(&QWEN3_6_35B_A3B)?;
     let shape = HostShape::from_spec(&QWEN3_6_35B_A3B, ROTARY_DIM)?;
     let dims = StepDims::new(&shape, &inventory)?;
@@ -1091,13 +1197,14 @@ fn make(
 ) -> Result<(QwenResidentStep<'static>, DecodeSession), EngError> {
     let kv_cache = plan.reserve;
     let verify = plan.verify;
+    let allow_unpinned = plan.allow_unpinned;
     let fixed_admission = plan.modes.fixed_admission;
     stages.begin("initializing CUDA");
     let projector = CudaProjector::new()?;
     let before = projector.memory_info()?;
     stages.begin("loading weights");
     let gguf = match settings.weights {
-        WeightFormat::Gguf => Some(open_gguf(&settings.artifact, verify)?),
+        WeightFormat::Gguf => Some(open_gguf(&settings.artifact, verify, allow_unpinned)?),
         WeightFormat::Exl3 => None,
     };
     let tiered = tiered_plan_of(&settings);
@@ -1188,6 +1295,7 @@ fn make(
         paged,
         device_first_native,
         verify: _,
+        allow_unpinned: _,
         modes,
     } = plan;
     let device_first = device_first_native.is_some();
@@ -1771,7 +1879,7 @@ mod paged_start_tests {
     #[test]
     fn absent_offload_preserves_the_resident_loader_reserve() {
         let settings = settings("{}");
-        let plan = StartupPlan::new(&settings, false, modes(false)).unwrap();
+        let plan = StartupPlan::new(&settings, false, false, modes(false)).unwrap();
         assert!(plan.paged.is_none());
         assert_eq!(
             plan.reserve,
@@ -1788,7 +1896,7 @@ mod paged_start_tests {
         let settings = settings(
             r#"{"kv_dtype":"q8","context_limit":131072,"kv_offload_host_bytes":2000000000,"capture":false}"#,
         );
-        let plan = StartupPlan::new(&settings, false, modes(false)).unwrap();
+        let plan = StartupPlan::new(&settings, false, false, modes(false)).unwrap();
         assert_eq!(
             plan.reserve,
             u64::try_from(plan.paged.as_ref().unwrap().device_bytes().unwrap()).unwrap()
@@ -1801,7 +1909,7 @@ mod paged_start_tests {
         let configured = settings(
             r#"{"kv_dtype":"q8","context_limit":33280,"kv_offload_host_bytes":1,"capture":false}"#,
         );
-        let plan = StartupPlan::new_device_first(&configured, false, modes(false)).unwrap();
+        let plan = StartupPlan::new_device_first(&configured, false, false, modes(false)).unwrap();
         assert!(plan.paged.is_none());
         let inventory = Inventory::for_spec(&QWEN3_6_35B_A3B).unwrap();
         let shape = HostShape::from_spec(&QWEN3_6_35B_A3B, ROTARY_DIM).unwrap();
@@ -1821,10 +1929,10 @@ mod paged_start_tests {
         assert_eq!(plan.reserve, native as u64);
 
         let absent = settings("{}");
-        let plan = StartupPlan::new_device_first(&absent, false, modes(false)).unwrap();
+        let plan = StartupPlan::new_device_first(&absent, false, false, modes(false)).unwrap();
         assert_eq!(
             plan.reserve,
-            StartupPlan::new(&absent, false, modes(false))
+            StartupPlan::new(&absent, false, false, modes(false))
                 .unwrap()
                 .reserve
         );
@@ -1835,7 +1943,7 @@ mod paged_start_tests {
         let configured = settings(
             r#"{"kv_dtype":"q8","context_limit":2,"kv_offload_host_bytes":1,"capture":false}"#,
         );
-        let plan = StartupPlan::new_device_first(&configured, false, modes(false)).unwrap();
+        let plan = StartupPlan::new_device_first(&configured, false, false, modes(false)).unwrap();
         let native = plan.device_first_native.unwrap();
         assert!(plan.reserve as usize <= native);
         let plan = plan.after_load(&configured, floor() + native).unwrap();
@@ -1851,7 +1959,7 @@ mod paged_start_tests {
         let dims = super::super::common_tests::dims();
         let paging = super::super::paging_plan::PagingPlan::new(&dims, 1280).unwrap();
         let group = paging.group.total * paging.full_layers;
-        let plan = StartupPlan::new_device_first(&configured, false, modes(false)).unwrap();
+        let plan = StartupPlan::new_device_first(&configured, false, false, modes(false)).unwrap();
         let fixed = plan.reserve as usize;
         let plan = plan
             .after_load(&configured, floor() + fixed + 2 * group)
@@ -1862,14 +1970,15 @@ mod paged_start_tests {
         );
         assert_eq!(plan.reserve as usize, fixed + 2 * group);
 
-        let plan = StartupPlan::new_device_first(&configured, false, modes(false)).unwrap();
+        let plan = StartupPlan::new_device_first(&configured, false, false, modes(false)).unwrap();
         assert!(
             plan.after_load(&configured, floor() + fixed + group - 1)
                 .is_err()
         );
         let mut insufficient_host = configured;
         insufficient_host.kv_offload_host_bytes = Some(1);
-        let plan = StartupPlan::new_device_first(&insufficient_host, false, modes(false)).unwrap();
+        let plan =
+            StartupPlan::new_device_first(&insufficient_host, false, false, modes(false)).unwrap();
         assert!(
             plan.after_load(&insufficient_host, floor() + fixed + 2 * group)
                 .is_err()
@@ -1899,19 +2008,19 @@ mod paged_start_tests {
         let base = settings(
             r#"{"kv_dtype":"q8","context_limit":320,"kv_offload_host_bytes":1,"capture":false}"#,
         );
-        assert!(StartupPlan::new_device_first(&base, false, modes(true)).is_err());
+        assert!(StartupPlan::new_device_first(&base, false, false, modes(true)).is_err());
         let mut bad = base.clone();
         bad.capture = true;
-        assert!(StartupPlan::new_device_first(&bad, false, modes(false)).is_err());
+        assert!(StartupPlan::new_device_first(&bad, false, false, modes(false)).is_err());
         let mut bad = base.clone();
         bad.prefix_reuse = true;
-        assert!(StartupPlan::new_device_first(&bad, false, modes(false)).is_err());
+        assert!(StartupPlan::new_device_first(&bad, false, false, modes(false)).is_err());
         let mut bad = base.clone();
         bad.kv_offload_host_bytes = Some(0);
-        assert!(StartupPlan::new_device_first(&bad, false, modes(false)).is_err());
+        assert!(StartupPlan::new_device_first(&bad, false, false, modes(false)).is_err());
         let mut bad = base;
         bad.kv = KvDtype::F32;
-        assert!(StartupPlan::new_device_first(&bad, false, modes(false)).is_err());
+        assert!(StartupPlan::new_device_first(&bad, false, false, modes(false)).is_err());
     }
 
     #[test]
@@ -1919,16 +2028,16 @@ mod paged_start_tests {
         let settings = settings(
             r#"{"kv_dtype":"q8","context_limit":320,"kv_offload_host_bytes":8388608,"capture":false}"#,
         );
-        assert!(StartupPlan::new(&settings, false, modes(true)).is_err());
+        assert!(StartupPlan::new(&settings, false, false, modes(true)).is_err());
         let mut bad = settings.clone();
         bad.capture = true;
-        assert!(StartupPlan::new(&bad, false, modes(false)).is_err());
+        assert!(StartupPlan::new(&bad, false, false, modes(false)).is_err());
         let mut bad = settings.clone();
         bad.prefix_reuse = true;
-        assert!(StartupPlan::new(&bad, false, modes(false)).is_err());
+        assert!(StartupPlan::new(&bad, false, false, modes(false)).is_err());
         let mut bad = settings;
         bad.kv_offload_host_bytes = Some(1);
-        assert!(StartupPlan::new(&bad, false, modes(false)).is_err());
+        assert!(StartupPlan::new(&bad, false, false, modes(false)).is_err());
     }
 }
 

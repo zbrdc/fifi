@@ -1301,20 +1301,59 @@ fn largest_resident_context(
     largest
 }
 
-/// The pinned CUDA checkpoint check, through the loader's own gate
-/// (`check_gguf_identity`: pinned name + exact size; the full-file
-/// SHA-256 stays the loader's opt-in, since hashing 20 GB is not a
-/// preflight default). Only a CUDA build has the gate at all — and a
-/// CUDA backend implies that build — so the non-CUDA arm below is
-/// reachable only from tests that inject the backend.
+/// The CUDA checkpoint check, through the loader's own gates: the
+/// `Q36_ALLOW_UNPINNED_GGUF` switch decides the selection, then
+/// `check_gguf_identity` pins the curated file's exact size (the
+/// full-file SHA-256 stays the loader's opt-in, since hashing 20 GB
+/// is not a preflight default; an unpinned checkpoint has no pinned
+/// size or digest and is validated by the model open). Only a CUDA
+/// build has the gate at all — and a CUDA backend implies that
+/// build — so the non-CUDA arm below is reachable only from tests
+/// that inject the backend.
 #[cfg(all(feature = "native-cuda", target_os = "linux"))]
 fn pinned_gguf_check(model_dir: &Path, _inspection: &ModelInspection) -> Check {
-    use crate::family::qwen36::cuda::start::{GGUF_NAME, check_gguf_identity};
-    match check_gguf_identity(&model_dir.join(GGUF_NAME), false) {
+    use crate::family::qwen36::cuda::start::{
+        ALLOW_UNPINNED_VAR, GGUF_NAME, allow_unpinned_wanted, check_gguf_identity, select_gguf,
+    };
+    let allow_unpinned =
+        match allow_unpinned_wanted(std::env::var(ALLOW_UNPINNED_VAR).ok().as_deref()) {
+            Ok(wanted) => wanted,
+            Err(error) => {
+                return Check::new(
+                    "weight format",
+                    CheckStatus::Fail,
+                    format!(
+                        "the loader would refuse this start: {}",
+                        super::describe_error(&error)
+                    ),
+                );
+            }
+        };
+    let (gguf, pinned) = match select_gguf(model_dir, allow_unpinned) {
+        Ok(pair) => pair,
+        Err(error) => {
+            return Check::new(
+                "weight format",
+                CheckStatus::Fail,
+                format!(
+                    "the loader would refuse this checkpoint: {}",
+                    super::describe_error(&error)
+                ),
+            );
+        }
+    };
+    match check_gguf_identity(&gguf, false, pinned) {
         Ok(()) => Check::new(
             "weight format",
             CheckStatus::Pass,
-            format!("the pinned CUDA checkpoint {GGUF_NAME} is present at its pinned size"),
+            if pinned {
+                format!("the pinned CUDA checkpoint {GGUF_NAME} is present at its pinned size")
+            } else {
+                format!(
+                    "{} is admitted by {ALLOW_UNPINNED_VAR}=1; the model open validates it",
+                    gguf.display()
+                )
+            },
         ),
         Err(error) => Check::new(
             "weight format",

@@ -6,10 +6,10 @@
 use super::dims::{KvMode, StepDims};
 use super::pinned::ROTARY_DIM;
 use super::start::{
-    BuildGuard, CUDA_ENGINE_BUILT, GGUF_BYTES, GGUF_NAME, already_built, check_gguf_identity,
-    check_sha256, check_tiered_start, context_tokens, file_sha256, ignored_mlx_line,
-    kv_bytes_per_position, kv_cache_bytes, kv_mode_of, load_options, pinned_gguf, serve_kv_mode,
-    sha256_wanted, step_options, tiered_plan_of,
+    BuildGuard, CUDA_ENGINE_BUILT, GGUF_BYTES, GGUF_NAME, allow_unpinned_wanted, already_built,
+    check_gguf_identity, check_sha256, check_tiered_start, context_tokens, file_sha256,
+    ignored_mlx_line, kv_bytes_per_position, kv_cache_bytes, kv_mode_of, load_options, open_gguf,
+    pinned_gguf, select_gguf, serve_kv_mode, sha256_wanted, step_options, tiered_plan_of,
 };
 use super::state_layout::KvPool;
 use crate::EngError;
@@ -154,7 +154,7 @@ fn the_gguf_identity_is_checked_by_name_and_size() {
         Err(EngError::Checkpoint(message)) => message,
         other => panic!("expected Checkpoint, got {other:?}"),
     };
-    let missing = text(check_gguf_identity(&gguf, false));
+    let missing = text(check_gguf_identity(&gguf, false, true));
     assert!(
         missing.contains("is missing") && missing.contains(GGUF_NAME),
         "{missing}"
@@ -163,12 +163,12 @@ fn the_gguf_identity_is_checked_by_name_and_size() {
     // 20 GB written).
     let file = std::fs::File::create(&gguf).expect("create");
     file.set_len(GGUF_BYTES - 1).expect("truncate");
-    let wrong = text(check_gguf_identity(&gguf, false));
+    let wrong = text(check_gguf_identity(&gguf, false, true));
     assert!(wrong.contains(&format!("{}", GGUF_BYTES - 1)), "{wrong}");
     assert!(wrong.contains(&GGUF_BYTES.to_string()), "{wrong}");
     file.set_len(GGUF_BYTES).expect("sparse to the pinned size");
     assert!(
-        check_gguf_identity(&gguf, false).is_ok(),
+        check_gguf_identity(&gguf, false, true).is_ok(),
         "metadata admits the size"
     );
     for (raw, want) in [(None, false), (Some("0"), false), (Some("1"), true)] {
@@ -186,6 +186,70 @@ fn the_gguf_identity_is_checked_by_name_and_size() {
             "{text}"
         );
     }
+}
+
+#[test]
+fn the_unpinned_admission_selects_one_file_and_leaves_the_open_as_the_gate() {
+    // The switch: unset or `0` off, `1` on, every other spelling a typed refusal naming the
+    // variable — the same promise shape as the SHA-256 toggle.
+    for (raw, want) in [(None, false), (Some("0"), false), (Some("1"), true)] {
+        assert_eq!(allow_unpinned_wanted(raw), Ok(want));
+    }
+    for raw in ["yes", "true", ""] {
+        let text = match allow_unpinned_wanted(Some(raw)) {
+            Err(EngError::BadRequest(text)) => text,
+            other => panic!("raw {raw:?} was accepted: {other:?}"),
+        };
+        assert!(
+            text.contains("Q36_ALLOW_UNPINNED_GGUF must be 0 or 1"),
+            "{text}"
+        );
+    }
+    let dir = tempfile::tempdir().expect("temp dir");
+    let text = |result: Result<(std::path::PathBuf, bool), EngError>| match result {
+        Err(EngError::Checkpoint(message)) => message,
+        other => panic!("expected Checkpoint, got {other:?}"),
+    };
+    // Off, no pinned file: the refusal names the pinned identity and the switch.
+    let off = text(select_gguf(dir.path(), false));
+    assert!(
+        off.contains(GGUF_NAME) && off.contains("Q36_ALLOW_UNPINNED_GGUF"),
+        "{off}"
+    );
+    // On, empty directory: nothing to serve.
+    let empty = text(select_gguf(dir.path(), true));
+    assert!(empty.contains("no .gguf file"), "{empty}");
+    // On, one foreign file: admitted, and it is not the pinned identity.
+    let foreign = dir.path().join("Qwen3.6-35B-A3B-Q5_K_M.gguf");
+    std::fs::write(&foreign, b"").expect("write");
+    let (path, pinned) = select_gguf(dir.path(), true).expect("single file serves");
+    assert_eq!(path, foreign);
+    assert!(!pinned);
+    // The pinned file wins whenever it is present, switch or not.
+    let pinned_path = dir.path().join(GGUF_NAME);
+    std::fs::write(&pinned_path, b"").expect("write");
+    for allow in [false, true] {
+        let (path, pinned) = select_gguf(dir.path(), allow).expect("pinned file wins");
+        assert_eq!(path, pinned_path);
+        assert!(pinned);
+    }
+    // Two candidates: the admission refuses the ambiguity by naming both.
+    std::fs::remove_file(&pinned_path).expect("remove");
+    let second = dir.path().join("Qwen3.6-35B-A3B-Q8_0.gguf");
+    std::fs::write(&second, b"").expect("write");
+    let many = text(select_gguf(dir.path(), true));
+    assert!(many.contains("exactly one .gguf"), "{many}");
+    assert!(many.contains("Q8_0") && many.contains("Q5_K_M"), "{many}");
+    std::fs::remove_file(&second).expect("remove");
+    // An unpinned file has no pinned size or digest: the identity check passes it through, and
+    // the strict open is the gate — the admission ends at the GGUF parser (prefix `gguf:`),
+    // not at the pinned-identity refusal.
+    assert!(check_gguf_identity(&foreign, true, false).is_ok());
+    let text = match open_gguf(dir.path(), false, true) {
+        Err(EngError::Checkpoint(message)) => message,
+        other => panic!("expected the open to refuse, got {other:?}"),
+    };
+    assert!(text.starts_with("gguf"), "{text}");
 }
 
 #[test]
