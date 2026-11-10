@@ -417,9 +417,11 @@ fn tiered_json(sum: Option<&TokenReport>) -> Option<Value> {
         json!({
             "bank_hits": sum.bank_hits,
             "cpu_served": sum.cpu_served,
+            "cold_served": sum.cold_served,
             "swaps": sum.swaps,
             "routed_weight_ppm": sum.routed_weight_ppm,
             "cpu_weight_ppm": sum.cpu_weight_ppm,
+            "cold_weight_ppm": sum.cold_weight_ppm,
         })
     })
 }
@@ -1192,8 +1194,9 @@ mod tests {
         assert_eq!(
             tiered_json(Some(&sum)),
             Some(json!({
-                "bank_hits": 5, "cpu_served": 3, "swaps": 2,
-                "routed_weight_ppm": 700_000, "cpu_weight_ppm": 250_000
+                "bank_hits": 5, "cpu_served": 3, "cold_served": 0, "swaps": 2,
+                "routed_weight_ppm": 700_000, "cpu_weight_ppm": 250_000,
+                "cold_weight_ppm": 0
             }))
         );
     }

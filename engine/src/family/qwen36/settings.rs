@@ -574,6 +574,11 @@ pub(crate) struct TieredOptions {
     /// Fill every layer's bank with its lowest-numbered experts before the first token. The
     /// default is false: the banks start empty and policy P fills them.
     pub(crate) preload: Option<bool>,
+    /// Bank swaps per token, in thousandths, from 0 to 8000. The default 250 buys one
+    /// promotion per four tokens model-wide — sized for the blocking fill path. With
+    /// the async fill channel (Q36_TIERED_ASYNC_FILLS) the budget can rise: the
+    /// boundary's candidates are this token's actual misses, best score-ratio first.
+    pub(crate) swaps_milli: Option<u32>,
 }
 
 /// The `expert_bank` member of the `qwen36` object: how many routed experts per layer stay
@@ -620,6 +625,7 @@ pub(crate) struct TieredSettings {
     pub(crate) threads: usize,
     pub(crate) timeout_ms: u32,
     pub(crate) preload: bool,
+    pub(crate) swaps_milli: u32,
 }
 
 /// The environment fallbacks, read by the caller so that this file stays pure.
@@ -1147,6 +1153,7 @@ fn tiered_settings(
             .map_err(|_| bad("tiered.threads exceeds usize".into()))?,
         timeout_ms: ranged("tiered.timeout_ms", tiered.timeout_ms, 10_000, 1, 600_000)?,
         preload: tiered.preload.unwrap_or(false),
+        swaps_milli: ranged("tiered.swaps_milli", tiered.swaps_milli, 250, 0, 8_000)?,
     };
     // The member shapes are validated above so their errors keep precedence; the exclusion
     // reads the resolved flag, so an unset capture (the CUDA arm's default, on) is refused
@@ -3636,6 +3643,7 @@ mod tests {
         assert_eq!(
             got.tiered,
             Some(TieredSettings {
+                swaps_milli: 250,
                 slots: 40,
                 threads: 6,
                 timeout_ms: 10_000,
@@ -3649,6 +3657,7 @@ mod tests {
         assert_eq!(
             got.tiered,
             Some(TieredSettings {
+                swaps_milli: 250,
                 slots: 61,
                 threads: 4,
                 timeout_ms: 5000,

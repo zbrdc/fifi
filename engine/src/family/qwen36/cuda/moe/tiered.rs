@@ -29,6 +29,7 @@ use crate::EngError;
 use crate::family::project::cuda::WeightLayout;
 use crate::kernels::cuda::resident::moe_combine::{CombineCall, CombineOut, CombineShape};
 use crate::kernels::cuda::{DeviceBuffer, DeviceEvent, PinnedBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 
 const F32: usize = size_of::<f32>();
 const I32: usize = size_of::<i32>();
@@ -78,6 +79,16 @@ pub(in crate::family::qwen36::cuda) struct TieredScratch {
     event: DeviceEvent,
     hidden: usize,
     top_k: usize,
+    /// The last route readback's host wait, nanoseconds (Q36_TIERED_PROBE only) —
+    /// the TCAP sync-vs-drain probe's per-layer sample.
+    pub(in crate::family::qwen36::cuda) probe_route_ns: std::cell::Cell<u64>,
+}
+
+/// The decode probe flag (Q36_TIERED_PROBE=1): times the per-layer route wait and
+/// the token's device span so their split can decide the TCAP gate.
+pub(in crate::family::qwen36::cuda) fn tiered_probe() -> bool {
+    static PROBE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *PROBE.get_or_init(|| std::env::var_os("Q36_TIERED_PROBE").is_some_and(|v| v == "1"))
 }
 
 impl TieredScratch {
@@ -101,6 +112,7 @@ impl TieredScratch {
             event: ctx.event()?,
             hidden,
             top_k,
+            probe_route_ns: std::cell::Cell::new(0),
         })
     }
 }
@@ -216,7 +228,13 @@ fn route_to_host(
     ctx.copy_to_pinned(launch.stream, route.weights, &mut scratch.host, weights_at)?;
     ctx.copy_to_pinned(launch.stream, route.resid_in, &mut scratch.host, resid_at)?;
     launch.stream.record(&scratch.event)?;
+    let probe_t0 = std::time::Instant::now();
     scratch.host.wait(&scratch.event)?;
+    if tiered_probe() {
+        scratch
+            .probe_route_ns
+            .set(probe_t0.elapsed().as_nanos() as u64);
+    }
     let mut raw = vec![0u8; scratch.host.len()];
     scratch.host.read(0, &mut raw)?;
     let (id_words, _) = raw[ids_at..weights_at].as_chunks::<4>();

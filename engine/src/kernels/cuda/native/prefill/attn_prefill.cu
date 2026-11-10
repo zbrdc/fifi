@@ -27,11 +27,10 @@ constexpr int kMaxGridY = 65535;
 constexpr int kMaxRows = (1 << 30) - 1;
 constexpr int kMaxSplits = 128;
 constexpr int kMaxMinKeys = 1 << 20;
-/* Legacy D256 shared memory: 96 KB = 98,304 B, above the 48 KB default (the
- * entry opts in once per process, the vendored gemm.cuh pattern). The sm_72 SIMT kernel lays
- * out a Q tile (64 x 256 fp16 = 32 KB) and two K and V stages of 16 KB each, and uses the Q
- * tile and stage 0 of K (32-48 KB) and of V (64-80 KB), an 80 KB extent inside the request,
- * which sm_72's 96 KB per-block opt-in admits. */
+/* The dsplit (sm_80+) shared request: 96 KB = 98,304 B, above the 48 KB default (the
+ * entry opts in once per process, the vendored gemm.cuh pattern). The SIMT kernel below
+ * requests less — one K and one V stage per plane, no cp.async prefetch — because its loop
+ * consumes each tile in place; the dsplit arm alone carries the double-buffered stages. */
 constexpr int kSmemBytes = kRows * kHeadDim * 2 + 2 * (2 * kTile * kHeadDim * 2);
 /* The head_dim-quarter kernel: 16 warps, two cp.async stages of K and V (16 KB planes of 32
  * keys x 512 B) and a 2 KB exchange slot per warp, the same 98,304 B request. */
@@ -207,8 +206,8 @@ __global__ void __launch_bounds__(128) attn_prefill_part_simt_k(Args a) {
         return;  // no partial
     }
     extern __shared__ __half smem[];
-    __half *sq = smem;  // [64][256], then stage 0 of K at 32 KB and of V at 64 KB
-    __half *sk = smem + kRows * kHeadDim, *sv = smem + kRows * kHeadDim + 2 * kTile * kHeadDim;
+    __half *sq = smem;  // [64][256], then the one K stage at 32 KB and V at 48 KB (D256)
+    __half *sk = smem + kRows * kHeadDim, *sv = smem + kRows * kHeadDim + kTile * kHeadDim;
     const int s = blockIdx.x, kvh = blockIdx.y, tile = blockIdx.z;
     Block b;
     if (!block_of<kHeadDim, kGroup>(a, s, kvh, tile, b)) return;
@@ -885,10 +884,14 @@ struct PartArm {
 /* Selects by ptxVersion, the virtual arch the loaded code was compiled for (the __CUDA_ARCH__
  * its #if saw), not by the device's compute capability: a compute_72-only build JIT-compiled
  * on sm_86 still runs the SIMT kernel. Then opts the chosen kernel in to its dynamic shared
- * memory (the vendored gemm.cuh pattern). Both kernels request the same 98,304 B. */
+ * memory (the vendored gemm.cuh pattern). The SIMT kernel requests a single K and V stage
+ * (its loop consumes each tile in place): 64/32 KB at D256/D128 — exactly the sm_75
+ * per-block opt-in maximum at D256, which the old two-stage request (96/48 KB) exceeded,
+ * making every typed attention launch fail with cudaErrorInvalidValue on that card. The
+ * dsplit arm keeps the double-buffered 98,304 B request. */
 template <int kHeadDim, int kGroup>
 PartArm arm_part() {
-    constexpr int simt_bytes = kRows * kHeadDim * 2 + 4 * kTile * kHeadDim * 2;
+    constexpr int simt_bytes = (kRows + 2 * kTile) * kHeadDim * 2;
     PartArm arm = {0, attn_prefill_part_simt_k<kHeadDim, kGroup>, false, 128, simt_bytes,
                    cudaSuccess};
     cudaFuncAttributes attr = {};
@@ -967,9 +970,18 @@ __device__ inline Q8GroupScalars q8_group_scalars(
  * scores sit in registers, one tile max, one rescale, one expf per key — the per-key serial
  * chain of the scalar kernel is gone. Masking/poison rules, the (maximum, normalizer,
  * accumulator) contract, cell layout rr = (t - t0) * group + g and index order match
- * attn_prefill_part_q8_k; no atomics. */
+ * attn_prefill_part_q8_k; no atomics.
+ *
+ * Launch bounds carry the occupancy this kernel can reach, not an aspiration: the
+ * 64 KiB dynamic shared request of enqueue_q8_tiled is a whole Turing/Ampere SM's
+ * block budget, so at most ONE block is ever resident per SM. minBlocks 2 (ptxas's
+ * reading of a plain 256 bound) is unreachable, and on sm_75 ptxas pays for it —
+ * 128 registers plus a 36-byte spill, and the arm's zero-spill invariant
+ * (localSizeBytes == 0) then refuses the kernel with cudaErrorInvalidValue for the
+ * rest of the process. minBlocks 1 compiles spill-free (145 registers) with the
+ * same one-block residency the shared budget already forces. */
 template <int kHeadDim>
-__global__ void __launch_bounds__(256) attn_prefill_part_q8_tile_k(Args a,
+__global__ void __launch_bounds__(256, 1) attn_prefill_part_q8_tile_k(Args a,
                                                                   inference_cuda_attn_kv_pair views) {
     constexpr int kLanes = 32, kWarps = 8;
     constexpr int kDims = kHeadDim / kLanes;       // dims one lane owns
@@ -1171,11 +1183,15 @@ static Failure enqueue_q8_tiled(const Args &k, inference_cuda_attn_kv_pair views
         cudaFuncAttributes attr = {};
         const cudaError_t got =
             cudaFuncGetAttributes(&attr, attn_prefill_part_q8_tile_k<128>);
-        if (got != cudaSuccess) return got;  // propagate the real CUDA error
-        if (attr.maxThreadsPerBlock < 256 || attr.localSizeBytes != 0)
+        if (got != cudaSuccess) {
+            return got;  // propagate the real CUDA error
+        }
+        if (attr.maxThreadsPerBlock < 256 || attr.localSizeBytes != 0) {
             return cudaErrorInvalidValue;  // attribute-invariant refusal, not a CUDA error
-        return cudaFuncSetAttribute(attn_prefill_part_q8_tile_k<128>,
+        }
+        const cudaError_t set = cudaFuncSetAttribute(attn_prefill_part_q8_tile_k<128>,
                                     cudaFuncAttributeMaxDynamicSharedMemorySize, kTileBytes);
+        return set;
     }();
     if (arm_error != cudaSuccess) {
         failure.record(arm_error, INFERENCE_CUDA_STAGE_LAUNCH);

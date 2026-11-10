@@ -271,6 +271,28 @@ impl PinnedBuf {
         })
     }
 
+    /// Copies `out.len()` f32 words at byte `offset` (a multiple of 4) into `out` —
+    /// the f32 twin of [`PinnedBuf::read`], without the per-byte pass and the
+    /// per-value `from_le_bytes` round trip. Same refusals as `read`.
+    pub(crate) fn read_f32(&self, offset: usize, out: &mut [f32]) -> Result<(), EngError> {
+        ensure_usable(&TERMINAL)?;
+        if self.pending.is_some() {
+            return Err(refuse(
+                "the CUDA pinned buffer has a copy outstanding: wait for an event recorded behind it first",
+            ));
+        }
+        if out.is_empty() {
+            return Err(refuse("the CUDA pinned f32 read of an empty slice"));
+        }
+        resident::pinned_read_f32_into(self.raw()?, offset, out).map_err(|_| {
+            refuse(format!(
+                "the CUDA pinned f32 read of {} words at offset {offset} lies outside a pinned buffer of {} bytes",
+                out.len(),
+                self.bytes
+            ))
+        })
+    }
+
     /// The whole buffer as a read-only host slice, for a buffer the device only reads.
     ///
     /// Returns `BadRequest` once any device-to-host copy has targeted the buffer. Outstanding

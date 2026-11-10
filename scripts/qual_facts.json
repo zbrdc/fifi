@@ -16,7 +16,7 @@
   "targets": {
     "lib": {
       "path": "src/lib.rs",
-      "test_fns": 6651,
+      "test_fns": 6658,
       "ignored": 583,
       "env_gates": [
         "CUDA_MODULE_LOADING",
@@ -318,6 +318,8 @@
         "Q36_SPEED_8K",
         "Q36_SPEED_ROUTING",
         "Q36_THREADS",
+        "Q36_TIERED_PROBE",
+        "Q36_TIERED_TRACE",
         "Q36_WIDE_EQ_DUMP",
         "Q8_TILED_ENV_PROBE",
         "Q8_TILED_RUNTIME_STEP_PROBE",

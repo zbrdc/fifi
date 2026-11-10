@@ -129,6 +129,35 @@ pub struct ExpertJob {
     pub weight: f32,
 }
 
+/// One DISTINCT missed expert of one chunk layer: the same three Q4_K slices as
+/// [`ExpertJob`], serving the rows that routed to it. The row indices index the chunk's
+/// shared `[m][hidden]` activation block; `rows.len() == row_weights.len()`.
+pub struct GroupedExpertJob {
+    pub region: Arc<dyn MappedRegion>,
+    pub gate: Range<usize>,
+    pub up: Range<usize>,
+    pub down: Range<usize>,
+    pub rows: Vec<usize>,
+    pub row_weights: Vec<f32>,
+}
+
+/// The sparse outcome of one grouped job: for each row it serves, the expert's
+/// unscaled `hidden`-long forward of that row's activation.
+struct ChunkTaskItem(
+    usize,
+    GroupedExpertJob,
+    Arc<[f32]>,
+    usize,
+    Sender<ChunkJobOutcome>,
+);
+
+enum ChunkJobOutcome {
+    /// The rows this job served, each with its unscaled output.
+    Done(usize, Vec<(usize, Vec<f32>)>),
+    Failed(usize, ExpertCpuError),
+    Lost,
+}
+
 /// Typed failure of a pool run: every wait is bounded, so no call can hang and every
 /// failure of a run is one of these variants.
 #[derive(Debug, PartialEq)]
@@ -166,6 +195,7 @@ enum JobOutcome {
 #[derive(Default)]
 struct PoolQueue {
     jobs: VecDeque<TaskItem>,
+    chunk_jobs: VecDeque<ChunkTaskItem>,
     shutdown: bool,
 }
 
@@ -194,7 +224,10 @@ fn worker_loop(shared: Arc<PoolInner>, shape: ExpertShape, mut worker: Worker) {
             let mut queue = lock(&shared.queue);
             loop {
                 if let Some(item) = queue.jobs.pop_front() {
-                    break Some(item);
+                    break Some(WorkItem::PerToken(item));
+                }
+                if let Some(item) = queue.chunk_jobs.pop_front() {
+                    break Some(WorkItem::Chunk(item));
                 }
                 if queue.shutdown {
                     break None;
@@ -209,29 +242,76 @@ fn worker_loop(shared: Arc<PoolInner>, shape: ExpertShape, mut worker: Worker) {
         if let Some(gate) = &shared.gate {
             wait_gate(gate);
         }
-        let job = item.1;
-        let bytes = job.region.bytes();
-        let slices = ExpertSlices {
-            gate: &bytes[job.gate],
-            up: &bytes[job.up],
-            down: &bytes[job.down],
-        };
-        let mut out = vec![0.0f32; shape.hidden];
-        match catch_unwind(AssertUnwindSafe(|| {
-            worker.compute(shape, &slices, &item.2, &mut out)
-        })) {
-            Ok(Ok(())) => {
-                let _ = item.3.send(JobOutcome::Done(item.0, out));
+        match item {
+            WorkItem::PerToken(item) => {
+                let job = item.1;
+                let bytes = job.region.bytes();
+                let slices = ExpertSlices {
+                    gate: &bytes[job.gate],
+                    up: &bytes[job.up],
+                    down: &bytes[job.down],
+                };
+                let mut out = vec![0.0f32; shape.hidden];
+                match catch_unwind(AssertUnwindSafe(|| {
+                    worker.compute(shape, &slices, &item.2, &mut out)
+                })) {
+                    Ok(Ok(())) => {
+                        let _ = item.3.send(JobOutcome::Done(item.0, out));
+                    }
+                    Ok(Err(error)) => {
+                        let _ = item.3.send(JobOutcome::Failed(item.0, error));
+                    }
+                    Err(_panic) => {
+                        let _ = item.3.send(JobOutcome::Lost);
+                        return;
+                    }
+                }
             }
-            Ok(Err(error)) => {
-                let _ = item.3.send(JobOutcome::Failed(item.0, error));
-            }
-            Err(_panic) => {
-                let _ = item.3.send(JobOutcome::Lost);
-                return;
+            WorkItem::Chunk(item) => {
+                let (at, job, block, _m, sender) = (item.0, item.1, item.2, item.3, item.4);
+                let bytes = job.region.bytes();
+                let slices = ExpertSlices {
+                    gate: &bytes[job.gate],
+                    up: &bytes[job.up],
+                    down: &bytes[job.down],
+                };
+                let mut outs = Vec::with_capacity(job.rows.len());
+                let mut failure: Option<ExpertCpuError> = None;
+                for &row in job.rows.iter() {
+                    let input = &block[row * shape.hidden..(row + 1) * shape.hidden];
+                    let mut out = vec![0.0f32; shape.hidden];
+                    match catch_unwind(AssertUnwindSafe(|| {
+                        worker.compute(shape, &slices, input, &mut out)
+                    })) {
+                        Ok(Ok(())) => outs.push((row, out)),
+                        Ok(Err(error)) => {
+                            failure = Some(error);
+                            break;
+                        }
+                        Err(_panic) => {
+                            let _ = sender.send(ChunkJobOutcome::Lost);
+                            return;
+                        }
+                    }
+                }
+                match failure {
+                    None => {
+                        let _ = sender.send(ChunkJobOutcome::Done(at, outs));
+                    }
+                    Some(error) => {
+                        let _ = sender.send(ChunkJobOutcome::Failed(at, error));
+                    }
+                }
             }
         }
     }
+}
+
+/// One item of work for the merged worker loop: a per-token expert job (the
+/// decode path) or a grouped chunk job (the chunked prefill path).
+enum WorkItem {
+    PerToken(TaskItem),
+    Chunk(ChunkTaskItem),
 }
 
 /// A run allocates no kernel scratch: each worker owns the scratch of the
@@ -290,11 +370,11 @@ impl CpuPool {
             gate,
         });
         let mut handles = Vec::with_capacity(threads);
-        for _ in 0..threads {
+        for worker_at in 0..threads {
             let worker_shared = Arc::clone(&shared);
             let worker = Worker::new(kernel, shape);
             let spawned = std::thread::Builder::new()
-                .name(String::from("qwen36-cpu-pool"))
+                .name(format!("qwen36-cpu-pool-{worker_at}"))
                 .spawn(move || worker_loop(worker_shared, shape, worker));
             match spawned {
                 Ok(handle) => handles.push(handle),
@@ -315,6 +395,89 @@ impl CpuPool {
             shared,
             handles,
         })
+    }
+
+    /// The grouped twin of [`Self::start_layer`]: validates every job against the
+    /// shape and the shared activation block, queues one grouped job per DISTINCT
+    /// missed expert and returns at once with a [`PendingChunk`].
+    pub fn start_chunk_layer(
+        &self,
+        jobs: Vec<GroupedExpertJob>,
+        block: &[f32],
+        m: usize,
+    ) -> Result<Option<PendingChunk>, PoolError> {
+        if jobs.is_empty() {
+            return Ok(None);
+        }
+        if block.len() != m * self.shape.hidden {
+            return Err(PoolError::BadInput(format!(
+                "the activation block holds {} values, {} rows of {} want {}",
+                block.len(),
+                m,
+                self.shape.hidden,
+                m * self.shape.hidden
+            )));
+        }
+        let side =
+            self.shape.inter.saturating_mul(self.shape.hidden) / Q4K_BLOCK_VALUES * Q4K_BLOCK_BYTES;
+        let down =
+            self.shape.hidden.saturating_mul(self.shape.inter) / Q4K_BLOCK_VALUES * Q4K_BLOCK_BYTES;
+        for (j, job) in jobs.iter().enumerate() {
+            if job.rows.len() != job.row_weights.len() || job.rows.is_empty() {
+                return Err(PoolError::BadInput(format!(
+                    "grouped job {j} holds {} rows and {} weights",
+                    job.rows.len(),
+                    job.row_weights.len()
+                )));
+            }
+            if let Some(&row) = job.rows.iter().find(|&&r| r >= m) {
+                return Err(PoolError::BadInput(format!(
+                    "grouped job {j} names row {row} of {m}"
+                )));
+            }
+            for &w in &job.row_weights {
+                if !w.is_finite() {
+                    return Err(PoolError::BadInput(format!(
+                        "grouped job {j} holds the non-finite weight {w}"
+                    )));
+                }
+            }
+            let bytes = job.region.bytes();
+            for (name, range, want) in [
+                ("gate", &job.gate, side),
+                ("up", &job.up, side),
+                ("down", &job.down, down),
+            ] {
+                let (start, end) = (range.start, range.end);
+                if start > end || end > bytes.len() || end - start != want {
+                    return Err(PoolError::BadInput(format!(
+                        "grouped job {j}'s {name} slice is {start}..{end}, the shape wants {want} bytes"
+                    )));
+                }
+            }
+        }
+        let row_weights: Vec<Vec<f32>> = jobs.iter().map(|job| job.row_weights.clone()).collect();
+        let block_arc: Arc<[f32]> = Arc::from(block);
+        let (tx, rx) = channel();
+        {
+            let mut queue = lock(&self.shared.queue);
+            for (at, job) in jobs.into_iter().enumerate() {
+                queue.chunk_jobs.push_back(ChunkTaskItem(
+                    at,
+                    job,
+                    Arc::clone(&block_arc),
+                    m,
+                    tx.clone(),
+                ));
+            }
+        }
+        self.shared.ready.notify_all();
+        Ok(Some(PendingChunk {
+            rx,
+            row_weights,
+            m,
+            hidden: self.shape.hidden,
+        }))
     }
 
     /// Computes all jobs of ONE layer: the CPU half of its MoE output, or
@@ -415,6 +578,87 @@ pub struct PendingLayer {
     rx: Receiver<JobOutcome>,
     weights: Vec<f32>,
     hidden: usize,
+}
+
+/// The join half of a chunk layer: waits every grouped job and scatters the scaled
+/// outputs into the dense `[m][hidden]` partial, exactly the value the chunk arm's
+/// one M-row moe_combine adds to the block output.
+pub struct PendingChunk {
+    rx: Receiver<ChunkJobOutcome>,
+    /// Per job: the router weights of the rows it serves, for the finish-time scatter.
+    row_weights: Vec<Vec<f32>>,
+    m: usize,
+    hidden: usize,
+}
+
+impl PendingChunk {
+    /// Waits for every grouped job (at most `timeout` from this call) and returns the
+    /// dense `[m][hidden]` sum: row `r` accumulates `weight * output` of every expert
+    /// that served it, f32 from +0.0. A job's failure fails the chunk exactly as
+    /// `PendingLayer::finish` fails a layer.
+    pub fn finish(self, timeout: Duration) -> Result<Vec<f32>, PoolError> {
+        let PendingChunk {
+            rx,
+            row_weights,
+            m,
+            hidden,
+        } = self;
+        let mut out = vec![0.0f32; m * hidden];
+        let n = row_weights.len();
+        let mut answered = vec![false; n];
+        let mut first_err: Option<PoolError> = None;
+        let deadline = Instant::now() + timeout;
+        let mut got = 0usize;
+        while got < n {
+            let left = deadline.saturating_duration_since(Instant::now());
+            if left.is_zero() {
+                return Err(PoolError::Timeout {
+                    waited_ms: timeout.as_millis() as u64,
+                    pending: n - got,
+                });
+            }
+            match rx.recv_timeout(left) {
+                Ok(ChunkJobOutcome::Done(at, rows_out)) => {
+                    if answered.get(at).copied() != Some(true) {
+                        answered[at] = true;
+                        got += 1;
+                        let weights = &row_weights[at];
+                        for ((row, output), &weight) in rows_out.iter().zip(weights) {
+                            let slot = &mut out[row * hidden..(row + 1) * hidden];
+                            for (acc, value) in slot.iter_mut().zip(output) {
+                                *acc += weight * value;
+                            }
+                        }
+                    }
+                }
+                Ok(ChunkJobOutcome::Failed(at, error)) => {
+                    if answered.get(at).copied() != Some(true) {
+                        answered[at] = true;
+                        got += 1;
+                        if first_err.is_none() {
+                            first_err = Some(PoolError::Expert { job: at, error });
+                        }
+                    }
+                }
+                Ok(ChunkJobOutcome::Lost) => {
+                    return Err(PoolError::WorkerLost);
+                }
+                Err(RecvTimeoutError::Timeout) => {
+                    return Err(PoolError::Timeout {
+                        waited_ms: timeout.as_millis() as u64,
+                        pending: n - got,
+                    });
+                }
+                Err(RecvTimeoutError::Disconnected) => {
+                    return Err(PoolError::WorkerLost);
+                }
+            }
+        }
+        match first_err {
+            None => Ok(out),
+            Some(error) => Err(error),
+        }
+    }
 }
 
 impl PendingLayer {

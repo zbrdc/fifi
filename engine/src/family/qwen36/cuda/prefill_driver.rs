@@ -467,7 +467,11 @@ pub(super) fn needs_arena(
 ) -> bool {
     let supported_kv =
         kv_mode == KvMode::Fp16 || (kv_mode == KvMode::Int8G32 && kv8_chunked_prefill);
-    layout != WeightLayout::Tiled && supported_kv && !tiered && !mmq_q6k
+    let chunk_ok = !tiered
+        || super::prefill::tiered_chunk_enabled(
+            std::env::var_os(super::prefill::TIERED_CHUNK_VAR).as_deref(),
+        );
+    layout != WeightLayout::Tiled && supported_kv && chunk_ok && !mmq_q6k
 }
 
 /// The two session-build guards of `admit_prefill` as a pure seam (condition 8a): the

@@ -1,0 +1,26 @@
+{
+  "scope": "Source-tree provenance and earlier observation only; no exact-tip native-CUDA, GPU, performance, or long-context qualification.",
+  "upstream_base": "e669b9d4e17301feb741dbdb6c20b5d3fe2e7f18",
+  "source_snapshot_commit": "467980159bf1ce380f173a3e95c422fc333f76dd",
+  "source_snapshot_tree": "28f09e340ff92b8dd9e9df1ac91ce049cba02fb3",
+  "upstream_code_commit": "492a69f725c7b7044a26ba607a70fde93abddbe0",
+  "upstream_code_tree": "28f09e340ff92b8dd9e9df1ac91ce049cba02fb3",
+  "excluded_successor": "2bc98219d52e4ea763c20e5567d99dec8f6344a2 changes the existing tiered-decode upload path without an independent opt-in; it is excluded from this draft.",
+  "experimental_gate": "Q36_TIERED_CHUNK=1; unset remains off",
+  "other_behavior": "Includes sm75 typed-attention correctness fixes and the tiered.swaps_milli configuration from the source snapshot; these overlap other upstream drafts and are not claimed to be gate-only changes.",
+  "historical_observation_sha256": "ee622a0b3af9e27ad502be72964163d8d4bad3fbf9f4eec57652e56d34675a37",
+  "historical_observation_scope": "Two short server-log requests; source and binary not pinned, physical GPU not independently identified, no matched baseline.",
+  "host_checks": [
+    "cargo fmt --check",
+    "qualification inventory validate",
+    "document link checker",
+    "git diff --check",
+    "Ruff lint and Python syntax check for corpus helper"
+  ],
+  "pending": [
+    "exact-tip native-CUDA build and physical-device tests",
+    "matched repeated served A/B and output quality checks",
+    "128k/256k context and memory admission qualification"
+  ],
+  "soak_note": "A separate later 2080 soak overlapped a CPU compiler build approximately 21:15:27\u201321:25:05 UTC on 2026-11-10; affected performance samples require exclusion or qualification. The soak used a different successor source and does not validate this tip."
+}

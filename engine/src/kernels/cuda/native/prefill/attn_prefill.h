@@ -54,8 +54,9 @@
  * once per variant (the vendored gemm.cuh pattern), one block per SM. Code compiled for sm_72
  * (__CUDA_ARCH__ < 800; the entry selects by the loaded code's PTX arch) runs an fp32 SIMT part
  * kernel instead, attn_prefill_part_simt_k (grid (max_splits, n_kv_head, q_tiles), 128 threads),
- * requesting 96/48 KB for D256/D128; it computes the same result within the prefill-attention
- * tolerance, not bit for bit. It is compile-only (no board run).
+ * requesting 64/32 KB for D256/D128 (a single K/V stage per plane: the loop consumes each tile
+ * in place, and 64 KB is the whole sm_75 per-block opt-in budget); it computes the same result
+ * within the prefill-attention tolerance, not bit for bit. It is compile-only (no board run).
  *
  * Legacy F16 NaN isolation is per 64-row query tile, not per row: a NaN V cell inside a tile's key range
  * reaches every row of that tile (a row that does not see the key still multiplies p = 0 by

@@ -122,10 +122,11 @@ pub(crate) struct MmidIdsOut<'b> {
     pub(crate) expert_bounds: DeviceRange<'b>,
 }
 
-/// The ids of one grouped launch, made only by [`CudaContext::mmq_build_ids`] or the checked
-/// host constructor. Its values meet the id invariants: `ids_dst` is a permutation of
-/// `0..m * top_k`, `ids_src1` its inverse, the bounds rise from 0 to `m * top_k`, and no expert
-/// holds more than `m` columns.
+/// The ids of one grouped launch, made only by [`CudaContext::mmq_build_ids`], the checked
+/// host constructor, or the wrap constructor over one of their uploads. Its values meet the
+/// id invariants: `ids_dst` is a permutation of `0..m * top_k`, `ids_src1` its inverse, the
+/// bounds rise over their span of `0..m * top_k` (the whole domain for a built set, a
+/// `(base, end)` column span for a wrapped one), and no expert holds more than `m` columns.
 pub(crate) struct MmidIds<'b> {
     out: MmidIdsOut<'b>,
     shape: MmidShape,
@@ -162,6 +163,30 @@ impl<'b> MmidIds<'b> {
         write_ints(stream, &out.ids_dst, host.ids_dst)?;
         write_ints(stream, &out.ids_src1, &inverse)?;
         write_ints(stream, &out.expert_bounds, host.expert_bounds)?;
+        Ok(Self { out, shape })
+    }
+
+    /// The checked WRAP constructor: validates the same value invariants as
+    /// [`Self::from_host`] — `ids_dst` a full permutation of `0..m * top_k`, the bounds a
+    /// rising table of at most `m` columns per expert — but writes NOTHING: the `out`
+    /// ranges must already hold exactly these tables (one [`Self::from_host`] upload, or
+    /// an earlier wrap of it). `span` is the `(base, end)` column span the bounds table
+    /// covers; the dense whole-domain form is `(0, m * top_k)`.
+    ///
+    /// The tiered chunk arm wraps one upload per launch: the bank launch reads the first
+    /// `slots + 1` bounds entries, the cold launch the cold set's entries at byte offset
+    /// `slots * 4` — adjacent spans of one table, so the kernel's two grouped launches
+    /// over one full-width `y` and one `ids_dst` table partition the compact columns
+    /// without a second upload (see [`check_bounds_span`]).
+    pub(crate) fn wrap(
+        shape: MmidShape,
+        host: HostIds<'_>,
+        span: (usize, usize),
+        out: MmidIdsOut<'b>,
+    ) -> Result<Self, EngError> {
+        check_ids_shape(&shape)?;
+        check_host_ids_span(&shape, &host, span)?;
+        require_written_apart(&out_claims(&out, &shape)?, &[])?;
         Ok(Self { out, shape })
     }
 }
@@ -204,6 +229,42 @@ fn values(detail: &str) -> EngError {
     rule("ids values", detail)
 }
 
+/// The span form of [`check_host_ids`]: the same `ids_dst` permutation over the whole
+/// `0..m * top_k` domain (the wrapped sets SHARE the dense set's table, so its
+/// distinctness is what keeps the two launches' dst rows disjoint), with the bounds
+/// checked against `span` instead of the whole domain. No inverse is derived: a wrapped
+/// set is never uploaded, and the quantize entries read the table the dense upload
+/// already wrote.
+fn check_host_ids_span(
+    shape: &MmidShape,
+    host: &HostIds<'_>,
+    span: (usize, usize),
+) -> Result<(), EngError> {
+    let (ne, e) = (shape.ne_get_rows(), shape.n_experts);
+    let (n_dst, n_bounds) = (host.ids_dst.len(), host.expert_bounds.len());
+    if n_dst != ne || n_bounds != e + 1 {
+        return Err(values(&format!(
+            "ids_dst holds {n_dst} entries and expert_bounds {n_bounds}, not {ne} and {}",
+            e + 1
+        )));
+    }
+    check_bounds_span(shape, host.expert_bounds, span.0, span.1)?;
+    let mut seen = vec![false; ne];
+    for (c, &slot) in host.ids_dst.iter().enumerate() {
+        let index = usize::try_from(slot)
+            .ok()
+            .filter(|&index| index < ne)
+            .ok_or_else(|| values(&format!("ids_dst[{c}] is {slot}, outside 0..{ne}")))?;
+        if seen[index] {
+            return Err(values(&format!(
+                "ids_dst[{c}] repeats the token slot {slot}"
+            )));
+        }
+        seen[index] = true;
+    }
+    Ok(())
+}
+
 /// The value invariants of caller-built ids, checked on the host: `expert_bounds` holds
 /// `n_experts + 1` values rising from 0 to `m * top_k`, with at most `m` columns per expert (the
 /// grouped launch's grid computes `ceil(m / J)` tiles of each expert, so a column past them would
@@ -238,11 +299,27 @@ pub(crate) fn check_host_ids(shape: &MmidShape, host: &HostIds<'_>) -> Result<Ve
 /// The bounds half of [`check_host_ids`]: from 0 to `m * top_k`, never falling, at most `m`
 /// columns per expert.
 fn check_host_bounds(shape: &MmidShape, bounds: &[i32]) -> Result<(), EngError> {
-    let ne = shape.ne_get_rows();
+    check_bounds_span(shape, bounds, 0, shape.ne_get_rows())
+}
+
+/// The bounds rule over one span of the shared compact domain: `bounds[0] == base`,
+/// `bounds[n_experts] == end`, never falling, at most `m` columns per expert. The dense
+/// constructor takes the whole domain (`base 0`, `end m * top_k`); the tiered chunk's bank
+/// and cold launches take ADJACENT spans of one uploaded table — the vendored kernel reads
+/// each expert's pair as absolute column offsets into the full-width `y` and the full
+/// `ids_dst` table (`col_low = expert_bounds[zt]`, `ids_dst[col_low + jt*J + j]`,
+/// `mmq.cuh:962-990`), so a span's values address the same buffers the dense set uploaded
+/// and no second id upload can race the first launch's reads.
+fn check_bounds_span(
+    shape: &MmidShape,
+    bounds: &[i32],
+    base: usize,
+    end: usize,
+) -> Result<(), EngError> {
     let (first, last) = (bounds[0], bounds[shape.n_experts]);
-    if first != 0 || usize::try_from(last).ok() != Some(ne) {
+    if usize::try_from(first).ok() != Some(base) || usize::try_from(last).ok() != Some(end) {
         return Err(values(&format!(
-            "expert_bounds runs from {first} to {last}, not from 0 to {ne}"
+            "expert_bounds runs from {first} to {last}, not from {base} to {end}"
         )));
     }
     for (expert, pair) in bounds.windows(2).enumerate() {
@@ -800,3 +877,107 @@ impl CudaContext {
 
 #[cfg(all(test, feature = "native-cuda"))]
 pub(in crate::kernels::cuda) mod tests;
+
+/// The pure checker rules of the span form: the whole-domain check is the dense
+/// special case, adjacent spans accept the same tables a dense upload produced, and
+/// the value rules (permutation, ≤ m per expert, rising bounds) refuse everything the
+/// launch could mis-address.
+#[cfg(test)]
+mod span_tests {
+    use super::*;
+
+    fn shape(n_experts: usize) -> MmidShape {
+        MmidShape {
+            n_experts,
+            m: 4,
+            top_k: 2,
+        }
+    }
+
+    /// The combined layout of the tiered chunk arm: slots 4, cold 2, m*top_k 8 —
+    /// bounds `[0, 1, 3, 3, 4, 6, 8]`, ids_dst a permutation of `0..8`.
+    fn combined() -> (Vec<i32>, Vec<i32>) {
+        (vec![7, 0, 2, 5, 1, 4, 3, 6], vec![0, 1, 3, 3, 4, 6, 8])
+    }
+
+    #[test]
+    fn the_dense_check_accepts_the_whole_domain_and_refuses_a_short_one() {
+        let (ids_dst, bounds) = combined();
+        let host = HostIds {
+            ids_dst: &ids_dst,
+            expert_bounds: &bounds,
+        };
+        assert!(check_host_ids(&shape(6), &host).is_ok());
+        let bad = HostIds {
+            ids_dst: &ids_dst,
+            expert_bounds: &bounds[..6],
+        };
+        assert!(check_host_ids(&shape(6), &bad).is_err());
+    }
+
+    #[test]
+    fn adjacent_spans_of_one_table_both_wrap() {
+        let (ids_dst, bounds) = combined();
+        // The bank span: the head, 0 → 4.
+        let bank = HostIds {
+            ids_dst: &ids_dst,
+            expert_bounds: &bounds[..5],
+        };
+        assert!(check_host_ids_span(&shape(4), &bank, (0, 4)).is_ok());
+        // The cold span: the tail at base 4, 4 → 8.
+        let cold = HostIds {
+            ids_dst: &ids_dst,
+            expert_bounds: &bounds[4..],
+        };
+        assert!(check_host_ids_span(&shape(2), &cold, (4, 8)).is_ok());
+    }
+
+    #[test]
+    fn a_span_refuses_a_mismatched_base_end_or_repeat() {
+        let (ids_dst, bounds) = combined();
+        let bank = HostIds {
+            ids_dst: &ids_dst,
+            expert_bounds: &bounds[..5],
+        };
+        // The base must be the bounds' first value, not a caller's guess.
+        assert!(check_host_ids_span(&shape(4), &bank, (1, 4)).is_err());
+        assert!(check_host_ids_span(&shape(4), &bank, (0, 8)).is_err());
+        // A repeated dst row inside the shared table is a race the launch must refuse.
+        let mut repeated = ids_dst.clone();
+        repeated[0] = repeated[1];
+        let repeat = HostIds {
+            ids_dst: &repeated,
+            expert_bounds: &bounds,
+        };
+        assert!(
+            check_host_ids_span(&shape(6), &repeat, (0, 8)).is_err(),
+            "a repeated token slot must never pass"
+        );
+        // An id outside 0..m*top_k addresses past the dst buffer.
+        let mut outside = ids_dst.clone();
+        outside[2] = 8;
+        let out = HostIds {
+            ids_dst: &outside,
+            expert_bounds: &bounds,
+        };
+        assert!(check_host_ids_span(&shape(6), &out, (0, 8)).is_err());
+    }
+
+    #[test]
+    fn a_falling_bound_or_an_overfull_group_is_refused_whole_or_spanned() {
+        let (ids_dst, _) = combined();
+        // m = 4: a group of 5 columns never fits the tiles the grid computes.
+        let overfull = vec![0, 5, 5, 5, 5, 5, 8, 8];
+        let host = HostIds {
+            ids_dst: &ids_dst,
+            expert_bounds: &overfull,
+        };
+        assert!(check_host_ids_span(&shape(7), &host, (0, 8)).is_err());
+        let falling = vec![0, 3, 2, 3, 4, 6, 8];
+        let host = HostIds {
+            ids_dst: &ids_dst,
+            expert_bounds: &falling,
+        };
+        assert!(check_host_ids_span(&shape(6), &host, (0, 8)).is_err());
+    }
+}

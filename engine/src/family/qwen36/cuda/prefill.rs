@@ -289,7 +289,10 @@ impl<'a> ChunkViews<'a> {
 }
 
 /// The stages of one mixer layer of a chunk, in launch order; `NormA`, `QuantA`, `NormF`, `Route`
-/// and `Moe` are shared between the two kinds.
+/// and `Moe` are shared between the two kinds. The `Moe*` variants are timing-event
+/// labels recorded inside the tiered MoE arm, never stage-loop entries — the shared
+/// prefix groups them.
+#[allow(clippy::enum_variant_names)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum Stage {
     NormA,
@@ -306,7 +309,20 @@ pub(super) enum Stage {
     AttnOut,
     NormF,
     Route,
+    /// The whole MoE section in the stage loop's terms; the tiered arm records the
+    /// finer Moe* marks inside it.
     Moe,
+    MoeStart,
+    MoeShared,
+    MoeStage,
+    MoeScatter,
+    MoeBankUp,
+    MoeColdUp,
+    MoeSwiglu,
+    MoeGather,
+    MoeBankDown,
+    MoeColdDown,
+    MoeCombine,
 }
 
 /// The stages of the Resident MoE arm (10-17), in launch order; the order is binding.
@@ -404,6 +420,19 @@ pub(super) fn stage_phase(stage: Stage) -> Phase {
         Stage::NormF => Phase::NormF,
         Stage::Route => Phase::Route,
         Stage::Moe => Phase::Shared,
+        // Timing-event labels only (recorded inside the tiered MoE arm); they never
+        // drive a phase, they inherit the MoE section's.
+        Stage::MoeStart
+        | Stage::MoeShared
+        | Stage::MoeStage
+        | Stage::MoeScatter
+        | Stage::MoeBankUp
+        | Stage::MoeColdUp
+        | Stage::MoeSwiglu
+        | Stage::MoeGather
+        | Stage::MoeBankDown
+        | Stage::MoeColdDown
+        | Stage::MoeCombine => Phase::Shared,
     }
 }
 
@@ -467,6 +496,19 @@ pub(super) fn stage_slots(stage: Stage) -> (&'static [ChunkSlot], &'static [Chun
             ],
             &[ChunkSlot::Hidden],
         ),
+        // Timing-event labels only (recorded inside the tiered MoE arm); they never
+        // own arena slots of their own.
+        Stage::MoeStart
+        | Stage::MoeShared
+        | Stage::MoeStage
+        | Stage::MoeScatter
+        | Stage::MoeBankUp
+        | Stage::MoeColdUp
+        | Stage::MoeSwiglu
+        | Stage::MoeGather
+        | Stage::MoeBankDown
+        | Stage::MoeColdDown
+        | Stage::MoeCombine => (&[], &[]),
     }
 }
 
@@ -894,7 +936,7 @@ pub(super) fn check_model(f: &ModelFacts, expected_layers: usize) -> Result<(), 
             }
         }
         for stack in &facts.stacks {
-            if stack.experts != Some(f.experts) {
+            if stack.experts.is_some() && stack.experts != Some(f.experts) {
                 return Err(EngError::BadRequest(format!(
                     "prefill chunk: experts: layer {layer} stack {:?} holds {:?}, the model has {}",
                     stack.role, stack.experts, f.experts
@@ -991,30 +1033,78 @@ fn model_facts(
                 "prefill chunk: layout: the facts of a Native model need Native weights".to_owned(),
             ));
         };
-        let mw = &moe[layer];
-        let stacks = [
-            stack(Role::FfnGateExps, &mw.gate),
-            stack(Role::FfnUpExps, &mw.up),
-            stack(Role::FfnDownExps, &mw.down),
-        ];
-        let shared = |role, weight: &DenseWeight<'_>| {
-            let quant = match weight {
+        // The shared expert facts: (role, quant) pairs from the DenseWeight.
+        let shexp_quant = |weight: &DenseWeight<'_>| -> Option<QuantType> {
+            match weight {
                 DenseWeight::Native(native) => Some(native.quant()),
-                DenseWeight::Exl3(_) => None,
-                DenseWeight::Tiled(_) => None,
-            };
-            (role, quant)
+                _ => None,
+            }
         };
-        let shared = [
-            shared(Role::FfnGateShexp, &mw.shared_gate),
-            shared(Role::FfnUpShexp, &mw.shared_up),
-            shared(Role::FfnDownShexp, &mw.shared_down),
-        ];
+        // A tiered load keeps the routed stacks AND the shared expert projections
+        // in the runtime: the moe slice is empty, the chunk facts carry no MoE stack
+        // entries, and the shared facts carry no quant (the weights are not here).
+        let (stacks, shared_facts) = match moe.get(layer) {
+            Some(mw) => (
+                [
+                    stack(Role::FfnGateExps, &mw.gate),
+                    stack(Role::FfnUpExps, &mw.up),
+                    stack(Role::FfnDownExps, &mw.down),
+                ],
+                [
+                    (Role::FfnGateShexp, shexp_quant(&mw.shared_gate)),
+                    (Role::FfnUpShexp, shexp_quant(&mw.shared_up)),
+                    (Role::FfnDownShexp, shexp_quant(&mw.shared_down)),
+                ],
+            ),
+            None => {
+                // The tiered placeholders carry the model's full-depth geometry and
+                // its quant type (the banks hold the same Q4_K data as the file).
+                // TODO: read the quant from the banks at runtime when available.
+                let (e, i, h) = (
+                    dims.shape.moe.experts,
+                    dims.shape.moe.inter,
+                    dims.shape.hidden,
+                );
+                let q = Some(QuantType::Q4K);
+                (
+                    [
+                        StackFacts {
+                            role: Role::FfnGateExps,
+                            quant: q,
+                            experts: Some(e),
+                            n_rows: e * i,
+                            k: h,
+                        },
+                        StackFacts {
+                            role: Role::FfnUpExps,
+                            quant: q,
+                            experts: Some(e),
+                            n_rows: e * i,
+                            k: h,
+                        },
+                        StackFacts {
+                            role: Role::FfnDownExps,
+                            quant: q,
+                            experts: Some(e),
+                            n_rows: e * h,
+                            k: i,
+                        },
+                    ],
+                    // The shared expert is loaded for tiered (it's a non-expert
+                    // weight); its quant comes from the model's format.
+                    [
+                        (Role::FfnGateShexp, Some(QuantType::Q4K)),
+                        (Role::FfnUpShexp, Some(QuantType::Q4K)),
+                        (Role::FfnDownShexp, Some(QuantType::Q4K)),
+                    ],
+                )
+            }
+        };
         facts.push(LayerFacts {
             kind,
             dense,
             stacks,
-            shared,
+            shared: shared_facts,
         });
     }
     Ok(ModelFacts {
@@ -1247,6 +1337,9 @@ pub(super) struct ChunkRun<'r, 'w> {
     rows: ChunkRows,
     sparse: Option<ChunkSparse<'r>>,
     bank: Option<&'r std::cell::RefCell<super::exl3_bank::Exl3SlotResolver<'w>>>,
+    /// The tiered runtime, present when the session is tiered AND the chunk flag is
+    /// on: the chunk MoE stage routes through the bank stacks + CPU misses.
+    tiered: Option<&'r std::cell::RefCell<TieredRuntime<'w>>>,
     segmented_parts: std::cell::Cell<usize>,
     #[cfg(test)]
     kernel_class: ChunkKernelClass,
@@ -1295,6 +1388,7 @@ impl<'r, 'w> ChunkRun<'r, 'w> {
             rows,
             sparse: None,
             bank: None,
+            tiered: None,
             segmented_parts: std::cell::Cell::new(0),
             #[cfg(test)]
             kernel_class: ChunkKernelClass::ProductionMmq,
@@ -1303,6 +1397,16 @@ impl<'r, 'w> ChunkRun<'r, 'w> {
 
     pub(super) fn segmented_parts(&self) -> usize {
         self.segmented_parts.get()
+    }
+
+    /// Sets the tiered runtime: the chunk MoE stage routes through the bank stacks
+    /// + CPU misses when this is present.
+    pub(super) fn with_tiered(
+        mut self,
+        runtime: Option<&'r std::cell::RefCell<TieredRuntime<'w>>>,
+    ) -> Self {
+        self.tiered = runtime;
+        self
     }
 
     /// Attaches the session's sparse resources: every committed chunk row then also
@@ -1348,6 +1452,13 @@ struct LayerCtx<'a, 'w> {
 enum LayerMoe<'a, 'w> {
     Native(&'a MoeLayerWeights<'w>),
     Exl3(&'a Exl3MoeWeights<'w>),
+    /// A tiered chunk: the MoE stage routes through the runtime's banks, not
+    /// the loaded weights. The router stage reads these buffers (the same
+    /// device buffers the loaded model's MoE would carry).
+    Tiered {
+        router: &'a crate::kernels::cuda::DeviceBuffer,
+        router_shared: &'a crate::kernels::cuda::DeviceBuffer,
+    },
 }
 
 impl<'a, 'w> LayerMoe<'a, 'w> {
@@ -1356,6 +1467,10 @@ impl<'a, 'w> LayerMoe<'a, 'w> {
         match self {
             Self::Native(moe) => (moe.router, moe.router_shared),
             Self::Exl3(moe) => (moe.router, moe.router_shared),
+            Self::Tiered {
+                router,
+                router_shared,
+            } => (router, router_shared),
         }
     }
 }
@@ -1661,7 +1776,10 @@ fn attn_proj(run: &ChunkRun<'_, '_>, ctx: &LayerCtx<'_, '_>) -> Result<(), EngEr
 // Independent of StepParams. Every KV8 attention tile sets this word on the owning stream.
 const KV8_LENGTH_OFFSET: usize = CPF_ATTN_PART_CAP - size_of::<i32>();
 const KV8_ATTN_TILE_ROWS: usize = 16;
-const KV8_BULK_ROWS: usize = 1024;
+/// The bulk-row domain of the unstaged KV8 attention path. The scratch layout bound
+/// (`kv8_scratch_layout`: part_bytes + 2·(m·2048) B) must stay under KV8_LENGTH_OFFSET
+/// (≈ 8.4 MB of the 64 MiB cap at 2,048 rows).
+const KV8_BULK_ROWS: usize = 2048;
 
 /// A native attention tile keeps its absolute first query position, not the chunk end.
 /// Returns `(tile rows, first query's key count)` after checking the complete chunk end.
@@ -2224,6 +2342,13 @@ pub(super) struct MoeChunkIo<'b> {
 }
 
 /// The MoE dispatch: the Resident arm, and the Tiered arm that chunked prefill refuses.
+/// Whether tiered sessions may run chunked prefill (`Q36_TIERED_CHUNK=1`). Default
+/// off: the chunk arm is complete but the gate ships dark until device-qualified.
+pub(super) const TIERED_CHUNK_VAR: &str = "Q36_TIERED_CHUNK";
+pub(super) fn tiered_chunk_enabled(value: Option<&std::ffi::OsStr>) -> bool {
+    value == Some(std::ffi::OsStr::new("1"))
+}
+
 pub(super) enum ChunkMoe<'a, 'w> {
     Resident(&'a MoeLayerWeights<'w>),
     #[cfg_attr(
@@ -2244,18 +2369,578 @@ pub(super) fn run_chunk_moe(
     launch: &Launch<'_>,
     moe: ChunkMoe<'_, '_>,
     io: &MoeChunkIo<'_>,
+    marks: Option<&mut Vec<(usize, Stage, crate::kernels::cuda::TimingEvent)>>,
 ) -> Result<(), EngError> {
-    let mw = match moe {
-        ChunkMoe::Resident(mw) => mw,
-        ChunkMoe::Tiered { .. } => {
-            return Err(EngError::BadRequest(
-                "tiered chunk prefill: not supported".to_owned(),
-            ));
+    match moe {
+        ChunkMoe::Resident(mw) => {
+            run_chunk_shared(launch, mw, io)?;
+            run_chunk_routed(launch, mw, io)?;
+            combine_chunk_moe(launch, io)
         }
+        ChunkMoe::Tiered { runtime, layer } => run_chunk_tiered(launch, runtime, layer, io, marks),
+    }
+}
+
+/// Per-stage chunk trace prints, on only with Q36_TIERED_TRACE=1 (production logs stay
+/// quiet; the diagnostics earned their keep during bring-up).
+fn tiered_trace() -> bool {
+    static TRACE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *TRACE.get_or_init(|| std::env::var_os("Q36_TIERED_TRACE").is_some_and(|v| v == "1"))
+}
+
+/// The tiered chunk MoE: the shared expert unchanged, the routed stages against the
+/// BANK stacks and the COLD STAGING stacks with host-built grouped ids, and only the
+/// OVERFLOW misses (beyond the staging cut) served by the CPU pool.
+///
+/// The stages mirror `run_chunk_shared` + `run_chunk_routed` + `combine_chunk_moe`
+/// with four differences: (1) the route readback is HOST-side — M rows of ids and
+/// weights come back in one pinned batch, classified three ways by `begin_chunk_layer`
+/// (bank hit | cold staging channel with its REAL weight | overflow miss); (2) the
+/// grouped ids are ONE dense upload plus two SPAN wraps — the bank and cold launches
+/// read adjacent column spans of the same tables (the kernel addresses each expert's
+/// columns absolutely, so the two launches' gate/up/down write DISJOINT token-slot
+/// rows of the shared Gu/Down buffers); (3) the cold experts are staged first:
+/// stack-major pinned-ring DMAs into the staging bank, enqueue-only, stream-ordered
+/// before the cold launches; (4) the CPU partial joins via one extra M-row
+/// `moe_combine` (top_k 1, weights ones, in place) only when the staging cut left
+/// overflow picks.
+fn run_chunk_tiered(
+    launch: &Launch<'_>,
+    runtime: &mut TieredRuntime<'_>,
+    layer: usize,
+    io: &MoeChunkIo<'_>,
+    mut marks: Option<&mut Vec<(usize, Stage, crate::kernels::cuda::TimingEvent)>>,
+) -> Result<(), EngError> {
+    let (ctx, stream, m, dims) = (launch.ctx, launch.stream, io.m, &io.dims);
+    let top_k = dims.top_k;
+    let hidden = dims.hidden;
+    let slots = runtime.slots();
+    // One timing mark per MoE sub-stage: the stream interval between consecutive
+    // marks is that family's GPU time (same convention as the mixer gpu_marks).
+    let mut mark = |stage: Stage| -> Result<(), EngError> {
+        if let Some(v) = marks.as_deref_mut() {
+            let event = ctx.event_timing()?;
+            stream.record_timing(&event)?;
+            v.push((layer, stage, event));
+        }
+        Ok(())
     };
-    run_chunk_shared(launch, mw, io)?;
-    run_chunk_routed(launch, mw, io)?;
-    combine_chunk_moe(launch, io)
+    mark(Stage::MoeStart)?;
+
+    // Enqueue the batched route readback (M x top_k ids + weights + M x hidden normed
+    // rows, one pinned batch into the REUSED route buffer), run the shared expert
+    // while it flies, THEN wait: the shared expert's launches execute under the
+    // readback's host wait.
+    let t0 = std::time::Instant::now();
+    let ids_bytes = m * top_k * 4;
+    let weights_bytes = m * top_k * 4;
+    let hidden_bytes = m * hidden * 4;
+    let ids_range = io.ids.buffer().range(io.ids.offset(), ids_bytes)?;
+    let weights_range = io
+        .weights
+        .buffer()
+        .range(io.weights.offset(), weights_bytes)?;
+    let x2_range = io.x2.buffer().range(io.x2.offset(), hidden_bytes)?;
+    let layout = runtime.route_enqueue(
+        ctx,
+        stream,
+        ids_range,
+        weights_range,
+        x2_range,
+        m,
+        top_k,
+        hidden,
+    )?;
+    let weights = runtime.layer_weights(layer)?;
+    run_chunk_shared(launch, &weights, io)?;
+    let (route_ids, route_weights) = runtime.route_finish(layout)?;
+    mark(Stage::MoeShared)?;
+    let t_readback = t0.elapsed();
+
+    // The host classification (&mut runtime): validate every row, classify every pick.
+    // Only ids and weights flow per row — the CPU pool reads the hidden block
+    // zero-copy out of the pinned route buffer (`pool_dispatch`).
+    let rows: Vec<crate::family::qwen36::tiered::host::ChunkRouteRow> = (0..m)
+        .map(|r| crate::family::qwen36::tiered::host::ChunkRouteRow {
+            ids: route_ids[r * top_k..(r + 1) * top_k].to_vec(),
+            weights: route_weights[r * top_k..(r + 1) * top_k].to_vec(),
+        })
+        .collect();
+    let t1 = std::time::Instant::now();
+    let (plan, misses, cold) =
+        runtime
+            .begin_chunk(layer, &rows)
+            .map_err(|e| EngError::Backend {
+                operation: "tiered_chunk_host",
+                message: e.to_string(),
+            })?;
+    let t_classify = t1.elapsed();
+    if tiered_trace() {
+        eprintln!(
+            "tiered-chunk: layer {layer}: {} cold staged, {} overflow experts",
+            cold.len(),
+            misses.len()
+        );
+    }
+
+    // Start the grouped pool serving of the OVERFLOW BEFORE the GPU stages: the CPU
+    // work overlaps the GPU launches (the chunk's whole reason for existing).
+    let pending = runtime.pool_dispatch(layer, &misses, layout, m)?;
+
+    // Build and upload the host ids, patch the weights — BEFORE the cold fills: the
+    // table uploads are blocking writes, and queued behind the fill DMAs each would
+    // stall the host a fill's worth (measured 2.9 ms/layer); on a nearly drained
+    // stream they return in tens of microseconds.
+    let t3 = std::time::Instant::now();
+    let d = io.scratch;
+    let ids = build_tiered_host_ids(stream, &plan, m, top_k, slots, d)?;
+    patch_tiered_weights(stream, &plan, io)?;
+    let t_ids = t3.elapsed();
+
+    // Stage the cold experts (enqueue-only DMAs; the launches below read them in
+    // stream order). The staging list is channel-ordered and consecutive channels
+    // are contiguous in the staging stacks, so each ring slot carries a BATCH of
+    // slices as one wide DMA (a 590 KiB copy runs the PCIe link at a third of what
+    // a 2.4 MiB one reaches).
+    let t2 = std::time::Instant::now();
+    let region = runtime.cold_region();
+    runtime.stage_cold(ctx, stream, &cold, &region)?;
+    mark(Stage::MoeStage)?;
+    let t_stage = t2.elapsed();
+
+    // Stages 12-16 against the bank stacks and the cold staging stacks: scatter
+    // quantize, grouped MMQ (gate, up, down), swiglu. The launch code mirrors
+    // run_chunk_routed's stages 12-16 with the two span sets over the bank and
+    // staging stacks.
+    let weights = runtime.layer_weights(layer)?;
+    let cold_w = if ids.cold.is_some() {
+        Some(runtime.cold_weights()?)
+    } else {
+        None
+    };
+    let gate = native_stack(&weights.gate)?;
+    ctx.mmq_quantize_scatter_ids(
+        stream,
+        &ids.combined,
+        MmidQuantCall {
+            packing: crate::kernels::cuda::prefill::mmq_quant::MmqPacking::CpuReference,
+            quant: gate.quant(),
+            k: hidden,
+            row_stride: hidden,
+            x: io.x2,
+            y: d.get(ChunkSlot::Q8S)?,
+        },
+    )?;
+    mark(Stage::MoeScatter)?;
+    let gu = d.get(ChunkSlot::Gu)?;
+    let (up_off, up_len) = routed_up_view(gu.bytes(), dims)?;
+    let up_dst = gu.buffer().range(gu.offset() + up_off, up_len)?;
+    let launch_mmid = |weight: &NativeWeight,
+                       ids_set: &crate::kernels::cuda::prefill::mmq_mmid::MmidIds<'_>,
+                       y: DeviceRange<'_>,
+                       ld: usize,
+                       dst: DeviceRange<'_>|
+     -> Result<(), EngError> {
+        let n = weight.n_rows() / weight.experts().unwrap_or(1);
+        ctx.mmq_mmid_launch(
+            stream,
+            MmidLaunchCall {
+                shape: ids_set.shape(),
+                weight: routed_weight(weight, dims, weight.k(), n)?,
+                ids: ids_set,
+                y,
+                dst,
+                ld,
+                fixup: d.get(ChunkSlot::Fixup)?,
+            },
+        )
+    };
+    let q8s = d.get(ChunkSlot::Q8S)?;
+    launch_mmid(gate, &ids.bank, q8s, 2 * dims.inter, gu)?;
+    launch_mmid(
+        native_stack(&weights.up)?,
+        &ids.bank,
+        q8s,
+        2 * dims.inter,
+        up_dst,
+    )?;
+    mark(Stage::MoeBankUp)?;
+    if let (Some(cold_ids), Some((cold_gate, cold_up, _))) = (&ids.cold, &cold_w) {
+        launch_mmid(cold_gate, cold_ids, q8s, 2 * dims.inter, gu)?;
+        launch_mmid(cold_up, cold_ids, q8s, 2 * dims.inter, up_dst)?;
+    }
+    mark(Stage::MoeColdUp)?;
+    ctx.swiglu_rows(
+        stream,
+        SwigluRowsCall {
+            shape: routed_swiglu(m, dims),
+            gu: d.get(ChunkSlot::Gu)?,
+            act: d.get(ChunkSlot::Act)?,
+        },
+    )?;
+    mark(Stage::MoeSwiglu)?;
+    let down = native_stack(&weights.down)?;
+    let q8act = d.get(ChunkSlot::Q8Act)?;
+    if tiered_trace() {
+        eprintln!(
+            "tiered-chunk: gather: k={} ncols={}",
+            dims.inter,
+            ids.combined.shape().ne_get_rows()
+        );
+    }
+    ctx.mmq_quantize_gather_ids(
+        stream,
+        &ids.combined,
+        MmidQuantCall {
+            packing: crate::kernels::cuda::prefill::mmq_quant::MmqPacking::Vendor,
+            quant: down.quant(),
+            k: dims.inter,
+            row_stride: dims.inter,
+            x: d.get(ChunkSlot::Act)?,
+            y: d.get(ChunkSlot::Q8Act)?,
+        },
+    )?;
+    mark(Stage::MoeGather)?;
+    launch_mmid(down, &ids.bank, q8act, dims.hidden, d.get(ChunkSlot::Down)?)?;
+    mark(Stage::MoeBankDown)?;
+    if let (Some(cold_ids), Some((_, _, cold_down))) = (&ids.cold, &cold_w) {
+        launch_mmid(
+            cold_down,
+            cold_ids,
+            q8act,
+            dims.hidden,
+            d.get(ChunkSlot::Down)?,
+        )?;
+    }
+    mark(Stage::MoeColdDown)?;
+    if tiered_trace() {
+        eprintln!("tiered-chunk: down MMQ OK");
+    }
+
+    let t_launches = t3.elapsed();
+    // Stage 17, the combine with the patched weights.
+    if tiered_trace() {
+        eprintln!(
+            "tiered-chunk: combine: m={} hidden={} top_k={} down_bytes={} h_bytes={}",
+            io.m,
+            io.dims.hidden,
+            io.dims.top_k,
+            io.scratch.get(ChunkSlot::Down)?.bytes(),
+            io.h.bytes()
+        );
+    }
+    combine_chunk_moe(launch, io)?;
+    mark(Stage::MoeCombine)?;
+    if tiered_trace() {
+        eprintln!("tiered-chunk: combine OK");
+    }
+
+    // Join the CPU work and add the partial: one M-row moe_combine (top_k 1,
+    // weights ones, in place) adding `partial` to the block output.
+    if tiered_trace() {
+        eprintln!(
+            "tiered-chunk: layer {layer} ms: readback {:.1} classify {:.1} stage {:.1} ids {:.1} launches {:.1} overflow {}",
+            t_readback.as_secs_f64() * 1e3,
+            t_classify.as_secs_f64() * 1e3,
+            t_stage.as_secs_f64() * 1e3,
+            t_ids.as_secs_f64() * 1e3,
+            (t_launches - t_ids).as_secs_f64() * 1e3,
+            misses.len()
+        );
+    }
+    if let Some(pending) = pending {
+        let tj = std::time::Instant::now();
+        let partial = pending
+            .finish(std::time::Duration::from_secs(60))
+            .map_err(|e| EngError::Backend {
+                operation: "tiered_chunk_pool_join",
+                message: format!("{e:?}"),
+            })?;
+        if tiered_trace() {
+            eprintln!(
+                "tiered-chunk: layer {layer} pool join ms: {:.1}",
+                tj.elapsed().as_secs_f64() * 1e3
+            );
+        }
+        if partial.len() != m * hidden || partial.iter().any(|v| !v.is_finite()) {
+            return Err(EngError::Backend {
+                operation: "tiered_chunk_partial",
+                message: format!(
+                    "the partial holds {} values (want {} x {}) or a non-finite one",
+                    partial.len(),
+                    m,
+                    hidden
+                ),
+            });
+        }
+        // Upload the partial and add it: 1.0 * partial through a second M-row
+        // moe_combine (top_k 1, in place — the M-row twin of add_cpu_partial), via
+        // the REUSED pinned staging and device buffer instead of a fresh pageable
+        // upload per layer.
+        if tiered_trace() {
+            eprintln!(
+                "tiered-chunk: uploading the CPU partial ({} bytes)",
+                partial.len() * 4
+            );
+        }
+        runtime.add_pool_partial(ctx, stream, io.h, &partial, m, hidden)?;
+        if tiered_trace() {
+            eprintln!("tiered-chunk: partial add OK");
+        }
+    }
+    Ok(())
+}
+
+/// The grouped-ids layout of one chunk layer's picks over TWO weight stacks: the bank
+/// slots and the cold staging channels. `ids_dst` (the m*top_k flat pick indices)
+/// holds the bank columns first (slot order), then the cold columns (channel order) —
+/// still a permutation of the token slots; `expert_bounds` (slots + cold + 1 rising
+/// bounds) spans the whole domain, so the bank launch reads its head as its own table
+/// and the cold launch its tail (the kernel treats each expert's pair as ABSOLUTE
+/// column offsets into the one full-width q8_1 buffer and the one ids_dst table,
+/// mmq.cuh:962-990). Grouping is two passes: every pick with a slot of its own claims
+/// its group and marks the row's used slots (a cold pick claims its CHANNEL — distinct
+/// per row, since a row's picks are distinct experts); then the OVERFLOW misses (weight
+/// 0.0, the picks the CPU serves beyond the staging cut) spread round-robin over the
+/// slots, SKIPPING every slot their own row already holds a column in. One column per
+/// (row, slot) is what keeps every group at <= m entries and ids_dst a permutation —
+/// a plain round-robin broke both the moment a spread miss landed on a slot its token
+/// had already hit (a hot slot holding all m rows gained misses on top: "expert N
+/// holds m+k columns, above m", the check_host_ids refusal).
+#[derive(Debug)]
+pub(super) struct TieredChunkGroups {
+    pub(super) ids_dst: Vec<i32>,
+    pub(super) expert_bounds: Vec<i32>,
+    /// The cold channels with columns (the cold span is `bounds[slots]..bounds[slots+cold]`).
+    pub(super) cold_count: usize,
+}
+
+pub(super) fn group_tiered_picks(
+    slot_ids: &[i32],
+    weights: &[f32],
+    cold_ids: &[i32],
+    m: usize,
+    top_k: usize,
+    slots: usize,
+) -> Result<TieredChunkGroups, EngError> {
+    if slot_ids.len() != cold_ids.len() || weights.len() != slot_ids.len() {
+        return Err(EngError::BadRequest(format!(
+            "tiered chunk: {} slot ids, {} weights and {} cold ids",
+            slot_ids.len(),
+            weights.len(),
+            cold_ids.len()
+        )));
+    }
+    let mut groups: Vec<Vec<i32>> = vec![Vec::new(); slots];
+    let mut cold_groups: Vec<Vec<i32>> = Vec::new();
+    let words = slots.div_ceil(64);
+    let mut used = vec![0u64; m * words];
+    let mut spread_set: Vec<usize> = Vec::new();
+    for (flat, ((&slot_id, &weight), &cold)) in
+        slot_ids.iter().zip(weights).zip(cold_ids).enumerate()
+    {
+        let flat_i32 = i32::try_from(flat)
+            .map_err(|_| EngError::BadRequest(String::from("tiered chunk: column overflow")))?;
+        if cold >= 0 {
+            let channel = usize::try_from(cold).unwrap_or(usize::MAX);
+            // Grow-only: `resize(channel + 1)` alone would TRUNCATE the table when a
+            // lower channel follows a higher one (Vec::resize shrinks too), and
+            // `len().max(channel) + 1` ratchets past every real channel.
+            cold_groups.resize(cold_groups.len().max(channel + 1), Vec::new());
+            cold_groups[channel].push(flat_i32);
+            continue;
+        }
+        let target = if weight == 0.0 && slot_id <= 0 {
+            spread_set.push(flat);
+            continue;
+        } else if slot_id > 0 {
+            usize::try_from(slot_id).unwrap_or(0)
+        } else {
+            0
+        };
+        groups
+            .get_mut(target)
+            .map(|g| g.push(flat_i32))
+            .ok_or_else(|| {
+                EngError::BadRequest(format!("tiered chunk: slot {target} of {slots}"))
+            })?;
+        used[flat / top_k * words + target / 64] |= 1u64 << (target % 64);
+    }
+    let mut spread = 0usize;
+    for flat in spread_set {
+        let flat_i32 = i32::try_from(flat)
+            .map_err(|_| EngError::BadRequest(String::from("tiered chunk: column overflow")))?;
+        let row_words = &mut used[flat / top_k * words..flat / top_k * words + words];
+        // At most top_k slots of this row are marked, so this scan finds a free slot
+        // while slots > top_k; the counter turns the misconfigured remainder (every
+        // slot already used by one row) into a refusal instead of a spin.
+        let mut tries = 0;
+        while row_words[spread / 64] >> (spread % 64) & 1 == 1 {
+            spread = (spread + 1) % slots.max(1);
+            tries += 1;
+            if tries > slots {
+                return Err(EngError::BadRequest(format!(
+                    "tiered chunk: every one of the {slots} slots already holds a column of row {} \
+                     (top_k {top_k}) — no free slot for its miss",
+                    flat / top_k
+                )));
+            }
+        }
+        let target = spread;
+        row_words[target / 64] |= 1u64 << (target % 64);
+        groups
+            .get_mut(target)
+            .map(|g| g.push(flat_i32))
+            .ok_or_else(|| {
+                EngError::BadRequest(format!("tiered chunk: slot {target} of {slots}"))
+            })?;
+        spread = (spread + 1) % slots.max(1);
+    }
+    // Compact: the bank groups, then the cold groups; the bounds span the whole domain.
+    let mut ids_dst = Vec::with_capacity(m * top_k);
+    let mut expert_bounds = Vec::with_capacity(slots + cold_groups.len() + 1);
+    expert_bounds.push(0i32);
+    for group in groups.iter().chain(&cold_groups) {
+        ids_dst.extend_from_slice(group);
+        expert_bounds.push(i32::try_from(ids_dst.len()).unwrap_or(i32::MAX));
+    }
+    Ok(TieredChunkGroups {
+        ids_dst,
+        expert_bounds,
+        cold_count: cold_groups.len(),
+    })
+}
+
+/// The three id sets of one chunk layer over one table upload: the dense set (the
+/// scatter and the gather), the bank span and the cold span (the two grouped-launch
+/// families). The cold set is `None` when the layer stages no expert (a grouped launch
+/// refuses `n_experts < 1`).
+pub(super) struct TieredLaunchIds<'b> {
+    pub(super) combined: crate::kernels::cuda::prefill::mmq_mmid::MmidIds<'b>,
+    pub(super) bank: crate::kernels::cuda::prefill::mmq_mmid::MmidIds<'b>,
+    pub(super) cold: Option<crate::kernels::cuda::prefill::mmq_mmid::MmidIds<'b>>,
+}
+
+/// Builds, uploads and wraps the grouped ids from the chunk plan: one dense
+/// `MmidIds::from_host` writes the combined tables (the full permutation), then the
+/// bank and cold launches WRAP the same device tables over their column spans — the
+/// bank reads the bounds head, the cold the tail at byte offset `slots * 4`, so no
+/// second upload can race the launches' reads.
+fn build_tiered_host_ids<'b>(
+    stream: &crate::kernels::cuda::DeviceStream,
+    plan: &crate::family::qwen36::tiered::host::ChunkLayerPlanHost,
+    m: usize,
+    top_k: usize,
+    slots: usize,
+    d: &'b ChunkViews<'b>,
+) -> Result<TieredLaunchIds<'b>, EngError> {
+    use crate::kernels::cuda::prefill::mmq_mmid as mmid;
+    let groups = group_tiered_picks(
+        &plan.slot_ids,
+        &plan.device_weights,
+        &plan.cold_ids,
+        m,
+        top_k,
+        slots,
+    )?;
+    let (ne, cold_count) = (m * top_k, groups.cold_count);
+    // The cold span pads its channel count to the shape rule's minimum of top_k
+    // (zero-width experts — the kernel's tiles exit immediately on an empty channel),
+    // and the DENSE table must carry that same padding: from_host is the one upload,
+    // so the padded bounds entries [slots+cold_count+1, slots+channels+1) reach the
+    // device here — otherwise the cold launch reads stale scratch bytes as bounds
+    // whenever cold_count < top_k (a small or warm tail piece).
+    let channels = if cold_count > 0 {
+        cold_count.max(top_k)
+    } else {
+        0
+    };
+    let mut dense_bounds = groups.expert_bounds.clone();
+    dense_bounds.resize(slots + channels + 1, i32::try_from(ne).unwrap_or(i32::MAX));
+    let bank_columns = usize::try_from(dense_bounds[slots]).unwrap_or(0);
+    let table =
+        |bounds: crate::kernels::cuda::DeviceRange<'b>| -> Result<mmid::MmidIdsOut<'b>, EngError> {
+            Ok(mmid::MmidIdsOut {
+                ids_src1: d.get(ChunkSlot::IdsSrc1)?,
+                ids_dst: d.get(ChunkSlot::IdsDst)?,
+                expert_bounds: bounds,
+            })
+        };
+    // The dense set: every expert of both stacks in one table, a full permutation,
+    // padded to the cold span's channel count.
+    let combined = mmid::MmidIds::from_host(
+        stream,
+        mmid::MmidShape {
+            n_experts: slots + channels,
+            m,
+            top_k,
+        },
+        mmid::HostIds {
+            ids_dst: &groups.ids_dst,
+            expert_bounds: &dense_bounds,
+        },
+        table(d.get(ChunkSlot::ExpertBounds)?)?,
+    )?;
+    // The bank span: the bounds head, uploaded by the dense set above.
+    let bank = mmid::MmidIds::wrap(
+        mmid::MmidShape {
+            n_experts: slots,
+            m,
+            top_k,
+        },
+        mmid::HostIds {
+            ids_dst: &groups.ids_dst,
+            expert_bounds: &dense_bounds[..slots + 1],
+        },
+        (0, bank_columns),
+        table(d.get(ChunkSlot::ExpertBounds)?)?,
+    )?;
+    // The cold span: the bounds tail at byte offset `slots * 4`, already padded by
+    // the dense table above.
+    let cold = if cold_count > 0 {
+        let bounds = dense_bounds[slots..].to_vec();
+        let whole = d.get(ChunkSlot::ExpertBounds)?;
+        let tail = whole
+            .buffer()
+            .range(whole.offset() + slots * 4, (channels + 1) * 4)?;
+        Some(mmid::MmidIds::wrap(
+            mmid::MmidShape {
+                n_experts: channels,
+                m,
+                top_k,
+            },
+            mmid::HostIds {
+                ids_dst: &groups.ids_dst,
+                expert_bounds: &bounds,
+            },
+            (bank_columns, ne),
+            table(tail)?,
+        )?)
+    } else {
+        None
+    };
+    Ok(TieredLaunchIds {
+        combined,
+        bank,
+        cold,
+    })
+}
+
+/// Patches the device TopkWeight with the plan's weights (misses are 0.0, hits carry
+/// the router's weight — the same contract the decode plan's device_weights hold).
+fn patch_tiered_weights(
+    stream: &crate::kernels::cuda::DeviceStream,
+    plan: &crate::family::qwen36::tiered::host::ChunkLayerPlanHost,
+    io: &MoeChunkIo<'_>,
+) -> Result<(), EngError> {
+    let bytes: Vec<u8> = plan
+        .device_weights
+        .iter()
+        .flat_map(|w| w.to_le_bytes())
+        .collect();
+    io.weights
+        .buffer()
+        .write_at(stream, io.weights.offset(), &bytes)
 }
 
 /// Stages 10a-f, the shared expert. Diagnostic runs replace only its projections.
@@ -2297,6 +2982,9 @@ fn run_chunk_shared(
                 fixup: d.get(ChunkSlot::Fixup)?,
             },
         )?;
+    }
+    if tiered_trace() {
+        eprintln!("tiered-chunk: launching swiglu");
     }
     ctx.swiglu_rows(
         stream,
@@ -2392,6 +3080,9 @@ fn run_chunk_routed(
     launch_mmid(gate, q8s, 2 * dims.inter, gu)?;
     launch_mmid(native_stack(&mw.up)?, q8s, 2 * dims.inter, up_dst)?;
     // 14-16, the SwiGLU, the gather quantize and the down launch.
+    if tiered_trace() {
+        eprintln!("tiered-chunk: launching swiglu");
+    }
     ctx.swiglu_rows(
         stream,
         SwigluRowsCall {
@@ -2501,11 +3192,12 @@ fn chunk_route(run: &ChunkRun<'_, '_>, ctx: &LayerCtx<'_, '_>) -> Result<(), Eng
 
 /// The MoE dispatch inside the layer walk: v1 always the Resident arm (tiered sessions take
 /// the per-token path, `chunk_ready`).
-fn chunk_moe(run: &ChunkRun<'_, '_>, ctx: &LayerCtx<'_, '_>) -> Result<(), EngError> {
+fn chunk_moe(
+    run: &ChunkRun<'_, '_>,
+    ctx: &LayerCtx<'_, '_>,
+    marks: Option<&mut Vec<(usize, Stage, crate::kernels::cuda::TimingEvent)>>,
+) -> Result<(), EngError> {
     let launch = ctx.launch;
-    let LayerMoe::Native(moe) = ctx.moe else {
-        return exl3::moe_block(run, ctx);
-    };
     let io = MoeChunkIo {
         m: run.rows.m(),
         dims: run.model.dims_at(run.rows.m()),
@@ -2517,6 +3209,22 @@ fn chunk_moe(run: &ChunkRun<'_, '_>, ctx: &LayerCtx<'_, '_>) -> Result<(), EngEr
         status: ctx.status,
         scratch: &run.bufs.views,
     };
+    // The tiered arm: the chunk MoE runs against the bank stacks + CPU misses.
+    if let Some(cell) = run.tiered {
+        let mut runtime = cell.borrow_mut();
+        return run_chunk_moe(
+            launch,
+            ChunkMoe::Tiered {
+                runtime: &mut *runtime,
+                layer: ctx.layer,
+            },
+            &io,
+            marks,
+        );
+    }
+    let LayerMoe::Native(moe) = ctx.moe else {
+        return exl3::moe_block(run, ctx);
+    };
     #[cfg(test)]
     if run.kernel_class != ChunkKernelClass::ProductionMmq {
         diagnostic_shared(launch, moe, &io)?;
@@ -2527,7 +3235,7 @@ fn chunk_moe(run: &ChunkRun<'_, '_>, ctx: &LayerCtx<'_, '_>) -> Result<(), EngEr
         }
         return combine_chunk_moe(launch, &io);
     }
-    run_chunk_moe(launch, ChunkMoe::Resident(moe), &io)
+    run_chunk_moe(launch, ChunkMoe::Resident(moe), &io, None)
 }
 
 fn chunk_layer<T>(blocks: &[T], layer: usize) -> Result<&T, EngError> {
@@ -2537,18 +3245,30 @@ fn chunk_layer<T>(blocks: &[T], layer: usize) -> Result<&T, EngError> {
 }
 
 /// One layer of the chunk: the state ranges by the layer's `ordinal`, the weights by `layer`
-/// itself, every stage in `layer_stages` order.
+/// itself, every stage in `layer_stages` order. `gpu_marks`, when given, receives one
+/// timing event per stage launch (the piece's GPU-time profile under Q36_TIERED_TRACE).
 pub(super) fn run_chunk_layer(
     launch: &Launch<'_>,
     run: &ChunkRun<'_, '_>,
     status: DeviceRange<'_>,
     layer: usize,
     trace_piece: Option<u32>,
+    mut gpu_marks: Option<&mut Vec<(usize, Stage, crate::kernels::cuda::TimingEvent)>>,
 ) -> Result<(), EngError> {
     let slot = run.model.table.slot(layer)?;
-    let moe = match &run.model.weights {
-        ChunkWeights::Native { moe, .. } => LayerMoe::Native(chunk_layer(moe, layer)?),
-        ChunkWeights::Exl3 { moe, .. } => LayerMoe::Exl3(chunk_layer(moe, layer)?),
+    // A tiered chunk session routes through run.tiered: the moe slice is empty
+    // (the stacks live in the banks), so the layer dispatch skips it entirely.
+    let moe = if let Some(cell) = run.tiered {
+        let (router, router_shared) = cell.borrow().router_of(layer)?;
+        LayerMoe::Tiered {
+            router,
+            router_shared,
+        }
+    } else {
+        match &run.model.weights {
+            ChunkWeights::Native { moe, .. } => LayerMoe::Native(chunk_layer(moe, layer)?),
+            ChunkWeights::Exl3 { moe, .. } => LayerMoe::Exl3(chunk_layer(moe, layer)?),
+        }
     };
     let ctx = LayerCtx {
         launch,
@@ -2562,6 +3282,7 @@ pub(super) fn run_chunk_layer(
     // An EXL3 chunk reads the F32 rows in place: it has no quantize stages.
     let exl3 = run.model.weights.is_exl3();
     for stage in layer_stages(slot.kind)? {
+        let stage_t0 = std::time::Instant::now();
         match stage {
             Stage::NormA => norm_a(run, &ctx)?,
             Stage::QuantA | Stage::QuantDOut | Stage::QuantAOut if exl3 => {}
@@ -2597,8 +3318,36 @@ pub(super) fn run_chunk_layer(
                     )?;
                     crate::family::qwen36::trace::write_prefill_rows(piece, layer, &rows)?;
                 }
-                chunk_moe(run, &ctx)?
+                chunk_moe(run, &ctx, gpu_marks.as_deref_mut())?
             }
+            // The timing-event labels are recorded inside the tiered MoE arm; they
+            // are never yielded by `layer_stages` and cannot drive a launch here.
+            stage @ (Stage::MoeStart
+            | Stage::MoeShared
+            | Stage::MoeStage
+            | Stage::MoeScatter
+            | Stage::MoeBankUp
+            | Stage::MoeColdUp
+            | Stage::MoeSwiglu
+            | Stage::MoeGather
+            | Stage::MoeBankDown
+            | Stage::MoeColdDown
+            | Stage::MoeCombine) => {
+                return Err(EngError::BadRequest(format!(
+                    "prefill chunk: {stage:?} is a timing label, not a runnable stage"
+                )));
+            }
+        }
+        if tiered_trace() {
+            eprintln!(
+                "chunk-stage L{layer} {stage:?}: {:.2} ms",
+                stage_t0.elapsed().as_secs_f64() * 1e3
+            );
+        }
+        if let Some(marks) = gpu_marks.as_deref_mut() {
+            let event = launch.ctx.event_timing()?;
+            launch.stream.record_timing(&event)?;
+            marks.push((layer, stage, event));
         }
         exl3::split::mark_stage(launch.stream, stage);
     }
@@ -2607,7 +3356,7 @@ pub(super) fn run_chunk_layer(
 
 /// The chunk layer loop: every host guard before the first launch, then the embedding and every
 /// layer on the state's owning stream. Resolves the prefill word ONCE; every stage takes it as a
-/// range. KV8 accepts bulk M up to 1024. Unstaged attention uses tiles up to 16; each tile
+/// range. KV8 accepts bulk M up to 2048. Unstaged attention uses tiles up to 16; each tile
 /// initializes its independent part-tail carrier with a blocking write. FP16 and staged KV8
 /// attention are enqueue-only. Normal chunk publication is unchanged.
 pub(super) fn run_chunk_body(launch: &Launch<'_>, run: &ChunkRun<'_, '_>) -> Result<(), EngError> {
@@ -2632,13 +3381,97 @@ pub(super) fn run_chunk_body(launch: &Launch<'_>, run: &ChunkRun<'_, '_>) -> Res
     chunk_embed(launch, run, status)?;
     // One prefill-piece index for every layer of the piece (resident_trace's counter).
     let trace_piece = crate::family::qwen36::trace::begin_prefill();
+    // The GPU-time profile of the piece (Q36_TIERED_TRACE=1): one timing event per
+    // stage launch, drained and summed after the layer loop. Stream time between a
+    // stage's marks includes any stream idle while the host classifies or waits, so
+    // the split attributes wall to the stage that fences it on the stream.
+    let gpu_profile = tiered_trace();
+    let mut marks: Vec<(usize, Stage, crate::kernels::cuda::TimingEvent)> = Vec::new();
     for layer in 0..run.model.layers {
-        run_chunk_layer(launch, run, status, layer, trace_piece)?;
+        run_chunk_layer(
+            launch,
+            run,
+            status,
+            layer,
+            trace_piece,
+            gpu_profile.then_some(&mut marks),
+        )?;
     }
     if run.model.weights.is_exl3() {
         exl3::check_flag(launch, run)?;
     }
+    if gpu_profile {
+        launch.stream.synchronize()?;
+        let mut totals: std::collections::BTreeMap<(usize, &'static str), (f32, usize)> =
+            std::collections::BTreeMap::new();
+        for pair in marks.windows(2) {
+            let (l0, s0, e0) = (&pair[0].0, &pair[0].1, &pair[0].2);
+            let (l1, _s1, e1) = (&pair[1].0, &pair[1].1, &pair[1].2);
+            let ms = e0.elapsed_ms_since(e1)?;
+            let name = if l0 == l1 {
+                stage_name(*s0)
+            } else {
+                "layer-gap"
+            };
+            let slot = totals
+                .entry((if l0 == l1 { *l0 } else { usize::MAX }, name))
+                .or_default();
+            slot.0 += ms;
+            slot.1 += 1;
+        }
+        let mut by_stage: std::collections::BTreeMap<&'static str, (f32, usize)> =
+            std::collections::BTreeMap::new();
+        for ((_l, name), (ms, n)) in &totals {
+            let slot = by_stage.entry(name).or_default();
+            slot.0 += ms;
+            slot.1 += n;
+        }
+        let mut lines: Vec<(f32, &'static str, usize)> = by_stage
+            .into_iter()
+            .map(|(name, (ms, n))| (ms, name, n))
+            .collect();
+        lines.sort_by(|a, b| b.0.total_cmp(&a.0));
+        eprintln!(
+            "chunk gpu-time by stage (stream ms, layers {}):",
+            run.model.layers
+        );
+        for (ms, name, n) in &lines {
+            eprintln!("  {name}: {ms:.1} ms ({n} marks)");
+        }
+    }
     Ok(())
+}
+
+/// The name of a stage for the trace profile (a static label per variant).
+fn stage_name(stage: Stage) -> &'static str {
+    match stage {
+        Stage::NormA => "NormA",
+        Stage::QuantA => "QuantA",
+        Stage::DeltaProj => "DeltaProj",
+        Stage::Conv => "Conv",
+        Stage::Scan => "Scan",
+        Stage::QuantDOut => "QuantDOut",
+        Stage::SsmOut => "SsmOut",
+        Stage::AttnProj => "AttnProj",
+        Stage::Prep => "Prep",
+        Stage::Flash => "Flash",
+        Stage::QuantAOut => "QuantAOut",
+        Stage::AttnOut => "AttnOut",
+        Stage::NormF => "NormF",
+        Stage::Route => "Route",
+        Stage::Moe => "Moe",
+        Stage::MoeStart => "MoeStart",
+        Stage::MoeShared => "MoeShared",
+        Stage::MoeStage => "MoeStage",
+        Stage::MoeScatter => "MoeScatter",
+        Stage::MoeBankUp => "MoeBankUp",
+        Stage::MoeColdUp => "MoeColdUp",
+        Stage::MoeSwiglu => "MoeSwiglu",
+        Stage::MoeGather => "MoeGather",
+        Stage::MoeBankDown => "MoeBankDown",
+        Stage::MoeColdDown => "MoeColdDown",
+        Stage::MoeCombine => "MoeCombine",
+    }
 }
 
 /// Test-only native MMVQ projections over the existing chunk slots. These functions never

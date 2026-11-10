@@ -583,7 +583,11 @@ pub(super) fn chunk_verdict(facts: &ChunkFacts) -> ChunkVerdict {
     if facts.kv_mode == KvMode::Int8G32 && !facts.kv8_chunked_prefill {
         return ChunkVerdict::Kv8;
     }
-    if facts.tiered {
+    if facts.tiered
+        && !super::prefill::tiered_chunk_enabled(
+            std::env::var_os(super::prefill::TIERED_CHUNK_VAR).as_deref(),
+        )
+    {
         return ChunkVerdict::Tiered;
     }
     if facts.mmq_q6k {
@@ -1123,7 +1127,9 @@ impl<'a> QwenResidentStep<'a> {
     /// the no-cap default, and `chunk_ready` carries the cap only in its accept verdict.
     pub(crate) fn set_m_sess_cap(&mut self, m_sess_cap: u32) {
         self.m_sess_cap = if self.kv8_chunked_prefill {
-            m_sess_cap.min(1024)
+            // The KV8 chunk domain (KV8_BULK_ROWS in prefill.rs); raising the env's
+            // accepted rows past this needs that domain extended first.
+            m_sess_cap.min(2048)
         } else {
             m_sess_cap
         };
@@ -1392,13 +1398,15 @@ impl<'a> QwenResidentStep<'a> {
         Some(self.prefill.as_ref()?.kv8_staging().ok()??.plan)
     }
 
-    /// Builds the tiered runtime of a step made with `StepOptions.tiered`: one bank per layer
-    /// and the host. Refuses a plain step, a second attach and a bank count other than the layer
-    /// count. The scratch buffers are allocated here.
+    /// Builds the tiered runtime of a step made with `StepOptions.tiered`: one bank per layer,
+    /// the host and the optional cold staging bank of the chunked prefill. Refuses a plain
+    /// step, a second attach and a bank count other than the layer count. The scratch buffers
+    /// are allocated here.
     pub(crate) fn attach_tiered(
         &mut self,
         banks: Vec<ExpertBank>,
         host: TieredHost,
+        cold: Option<super::tiered_step::ColdStaging>,
     ) -> Result<(), EngError> {
         let parts = self.tiered_parts.take().ok_or_else(|| {
             EngError::BadRequest(
@@ -1409,7 +1417,7 @@ impl<'a> QwenResidentStep<'a> {
         let moe = &self.moe_dims;
         let scratch = TieredScratch::new(self.context, moe.hidden, moe.top_k)?;
         self.tiered = Some(std::cell::RefCell::new(TieredRuntime::new(
-            parts, banks, scratch, host,
+            parts, banks, scratch, host, cold,
         )?));
         Ok(())
     }
@@ -1572,6 +1580,14 @@ impl<'a> QwenResidentStep<'a> {
                     .as_ref()
                     .map(|sp| ChunkSparse::new(sp, &res.dims.shape.kinds)),
             );
+            // The tiered chunk arm: the runtime is present when the session is tiered
+            // AND the chunk flag is on (the gate ships dark until device-qualified).
+            let tiered_chunk = self.tiered.as_ref().filter(|_| {
+                super::prefill::tiered_chunk_enabled(
+                    std::env::var_os(super::prefill::TIERED_CHUNK_VAR).as_deref(),
+                )
+            });
+            let run = run.with_tiered(tiered_chunk);
             #[cfg(test)]
             let run = run.with_kernel_class(kernel_class);
             run_chunk_body(
@@ -1585,6 +1601,7 @@ impl<'a> QwenResidentStep<'a> {
         };
         let segmented_parts = body().inspect_err(|_| state.poison())?;
         prefill_report.note_segmented_parts(segmented_parts);
+        let t_status = std::time::Instant::now();
         let status = state
             .read_prefill_status(stream)
             .inspect_err(|_| state.poison())?;
@@ -1596,9 +1613,18 @@ impl<'a> QwenResidentStep<'a> {
             ns,
             status,
         });
+        let t_reval = std::time::Instant::now();
         state
             .revalidate(stream, p0 + m, status)
             .inspect_err(|_| state.poison())?;
+        if std::env::var_os("Q36_TIERED_TRACE").is_some_and(|v| v == "1") {
+            eprintln!(
+                "chunk-close p0={p0} m={m}: body {:.0} ms, status-read {:.0} ms, revalidate {:.0} ms",
+                t_status.duration_since(opened).as_secs_f64() * 1e3,
+                t_reval.duration_since(t_status).as_secs_f64() * 1e3,
+                t_reval.elapsed().as_secs_f64() * 1e3,
+            );
+        }
         // R3: the chunk committed [p0, p0 + m) and its sketch cells are queued; the
         // selection-eligible prefix grows with it, but only when this chunk continues
         // it exactly (interrupted or gapped prefill keeps the smaller prefix).

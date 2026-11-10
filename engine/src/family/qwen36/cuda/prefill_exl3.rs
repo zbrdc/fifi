@@ -415,6 +415,19 @@ pub(in crate::family::qwen36::cuda) mod split {
                 Stage::QuantA | Stage::QuantDOut | Stage::QuantAOut => "quantize",
                 Stage::Route => "router",
                 Stage::Moe => "moe tail",
+                // Timing labels recorded inside the tiered MoE arm; EXL3 never
+                // charges them (no EXL3 tiered chunk path).
+                Stage::MoeStart
+                | Stage::MoeShared
+                | Stage::MoeStage
+                | Stage::MoeScatter
+                | Stage::MoeBankUp
+                | Stage::MoeColdUp
+                | Stage::MoeSwiglu
+                | Stage::MoeGather
+                | Stage::MoeBankDown
+                | Stage::MoeColdDown
+                | Stage::MoeCombine => "tiered moe (labels)",
             },
         );
     }

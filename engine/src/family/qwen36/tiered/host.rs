@@ -114,6 +114,50 @@ fn weight_ppm(weight: f32) -> u64 {
     (f64::from(weight).max(0.0) * 1e6).round() as u64
 }
 
+/// One row of a chunk's route: the token-width inputs of `begin_layer`, one row of
+/// the M the chunk feeds at once. The CPU pool reads the chunk's shared normed rows
+/// separately (`start_chunk_pool`'s block), so no hidden slice rides per row.
+#[derive(Clone, Debug, PartialEq)]
+pub struct ChunkRouteRow {
+    pub ids: Vec<i32>,
+    pub weights: Vec<f32>,
+}
+
+/// The device plan of one chunk layer: `rows.len() * top_k` entries, row-major (row r's
+/// picks at `r * top_k..(r+1) * top_k`), the M-row twin of [`LayerPlanHost`].
+#[derive(Clone, Debug, PartialEq)]
+pub struct ChunkLayerPlanHost {
+    pub slot_ids: Vec<i32>,
+    pub device_weights: Vec<f32>,
+    /// The cold staging channel per pick: `-1` when the pick is not cold-served (a hit,
+    /// an overflow miss or a router fault), else its channel `0..cold.len()`. A cold
+    /// pick's `slot_ids` entry is unused (0) and its `device_weights` entry carries the
+    /// REAL router weight — the staging launch computes the pick on the device.
+    pub cold_ids: Vec<i32>,
+}
+
+/// The CPU work of one chunk layer, grouped by expert: one entry per DISTINCT missed
+/// expert, carrying the rows that routed to it with their per-row weights — the shape
+/// the grouped pool job (slice 4) consumes.
+#[derive(Clone, Debug, PartialEq)]
+pub struct ChunkMissGroup {
+    pub expert: u16,
+    pub rows: Vec<usize>,
+    pub row_weights: Vec<f32>,
+}
+
+/// One expert the cold staging bank serves for a chunk layer: its channel and the byte
+/// ranges of its three stacks in the checkpoint mapping (the fill gathers them
+/// stack-major into the pinned ring and DMAs them into the staging slots).
+#[derive(Clone, Debug, PartialEq)]
+pub struct ChunkColdStage {
+    pub expert: u16,
+    pub channel: u16,
+    pub gate: std::ops::Range<usize>,
+    pub up: std::ops::Range<usize>,
+    pub down: std::ops::Range<usize>,
+}
+
 /// The picks of every layer of one token as the device logged them: `(id, weight)` in rank order,
 /// exactly `top_k` per layer (`id == -1` is the router-fault value, any other negative id is
 /// refused). WHY: the classification moves onto the device, so the host learns a token's
@@ -357,6 +401,185 @@ impl TieredHost {
         self.report.routed_weight_ppm += routed_ppm;
         self.report.cpu_weight_ppm += cpu_ppm;
         Ok(plan)
+    }
+
+    /// Classifies the picks of `rows.len()` rows of `layer` at once and returns the device
+    /// plan, the cold staging list and the grouped OVERFLOW misses. The M-row twin of
+    /// [`Self::begin_layer`]: validate EVERY row first (the `account_token` pattern — a
+    /// refusal changes nothing), then classify all rows' picks against the table three
+    /// ways — a hit takes its bank slot, a miss of one of the `cold_cap` HOTTEST distinct
+    /// missed experts (by pick count, ties by expert id) takes a cold staging channel
+    /// with its REAL router weight, and every missed expert past `cold_cap` stays a CPU
+    /// pool group with the weight-0.0 dummy of today — then stash the routes per row for
+    /// the chunk boundary. `cold_cap` 0 keeps today's two-way plan exactly.
+    pub fn begin_chunk_layer(
+        &mut self,
+        layer: usize,
+        rows: &[ChunkRouteRow],
+        cold_cap: usize,
+    ) -> Result<(ChunkLayerPlanHost, Vec<ChunkMissGroup>, Vec<ChunkColdStage>), HostError> {
+        if let Some(open) = &self.in_flight {
+            return Err(HostError::Order(format!(
+                "begin_chunk_layer({layer}) while layer {} is in flight",
+                open.layer
+            )));
+        }
+        // Validate every row before classifying any: a bad row changes nothing.
+        for (row_at, row) in rows.iter().enumerate() {
+            match self.check_route(layer, &row.ids, &row.weights) {
+                Ok(()) => {}
+                Err(error) => {
+                    return Err(HostError::BadRoute(format!("row {row_at}: {error:?}")));
+                }
+            }
+        }
+        // Count the missed picks per distinct expert first: the hottest `cold_cap` take
+        // the staging channels (the cut that minimizes overflowed picks for a fixed cap).
+        let mut miss_picks: Vec<usize> = vec![0; self.cfg.experts];
+        for row in rows {
+            for &id in &row.ids {
+                if id >= 0 && self.table.lookup(layer, id as u16).is_none() {
+                    miss_picks[id as usize] += 1;
+                }
+            }
+        }
+        let mut hot: Vec<u16> = (0..self.cfg.experts)
+            .filter(|&e| miss_picks[e] > 0)
+            .map(|e| e as u16)
+            .collect();
+        hot.sort_by(|&a, &b| {
+            miss_picks[usize::from(b)]
+                .cmp(&miss_picks[usize::from(a)])
+                .then(a.cmp(&b))
+        });
+        hot.truncate(cold_cap);
+        let channel_of = |expert: u16| hot.iter().position(|&e| e == expert);
+        let mut plan = ChunkLayerPlanHost {
+            slot_ids: Vec::with_capacity(rows.len() * self.cfg.top_k),
+            device_weights: Vec::with_capacity(rows.len() * self.cfg.top_k),
+            cold_ids: vec![-1; rows.len() * self.cfg.top_k],
+        };
+        let mut misses: Vec<ChunkMissGroup> = Vec::new();
+        let mut row_routes: Vec<Vec<u16>> = Vec::with_capacity(rows.len());
+        for row in rows {
+            let mut route = Vec::with_capacity(row.ids.len());
+            for (&id, &weight) in row.ids.iter().zip(&row.weights) {
+                if id < 0 {
+                    plan.slot_ids.push(id);
+                    plan.device_weights.push(weight);
+                    continue;
+                }
+                let expert = id as u16;
+                let flat = plan.slot_ids.len();
+                // The same accounting the decode classify makes per pick, so a chunk
+                // piece's report separates bank hits, cold-staged serves and pool jobs
+                // (an all-zeros row means no traffic, not an unwired counter).
+                let ppm = weight_ppm(weight);
+                self.report.routed_weight_ppm += ppm;
+                if let Some((slot, _)) = self.table.lookup(layer, expert) {
+                    plan.slot_ids.push(slot as i32);
+                    plan.device_weights.push(weight);
+                    self.report.bank_hits += 1;
+                } else if let Some(channel) = channel_of(expert) {
+                    // Cold-served: the staging launch computes the pick on the device,
+                    // so the combine needs the REAL weight and no pool job exists. The
+                    // channel is below `cold_cap` (itself below the staging depth), so
+                    // the cast cannot wrap.
+                    plan.slot_ids.push(0);
+                    plan.device_weights.push(weight);
+                    plan.cold_ids[flat] = channel as i32;
+                    self.report.cold_served += 1;
+                    self.report.cold_weight_ppm += ppm;
+                } else {
+                    plan.slot_ids.push(0);
+                    plan.device_weights.push(0.0);
+                    self.report.cpu_served += 1;
+                    self.report.cpu_weight_ppm += ppm;
+                    let row_at = row_routes.len();
+                    match misses.iter_mut().find(|g| g.expert == expert) {
+                        Some(group) => {
+                            group.rows.push(row_at);
+                            group.row_weights.push(weight);
+                        }
+                        None => misses.push(ChunkMissGroup {
+                            expert,
+                            rows: vec![row_at],
+                            row_weights: vec![weight],
+                        }),
+                    }
+                }
+                route.push(expert);
+            }
+            row_routes.push(route);
+        }
+        self.routes[layer] = row_routes.into_iter().flatten().collect();
+        let cold = hot
+            .iter()
+            .enumerate()
+            .map(|(channel, &expert)| {
+                let ranges = self
+                    .locator
+                    .ranges(layer, usize::from(expert))
+                    .map_err(HostError::Locator)?;
+                Ok(ChunkColdStage {
+                    expert,
+                    channel: channel as u16,
+                    gate: ranges.gate,
+                    up: ranges.up,
+                    down: ranges.down,
+                })
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok((plan, misses, cold))
+    }
+
+    /// The checkpoint mapping the cold fill gathers its slices from (the same region the
+    /// CPU pool reads; an `Arc` clone, so the fill borrows nothing of the host).
+    pub fn cold_region(&self) -> Arc<dyn MappedRegion> {
+        Arc::clone(&self.region)
+    }
+
+    /// Joins the grouped CPU jobs of a chunk layer and returns the dense [m][hidden]
+    /// partial (the M-row twin of finish_layer's return).
+    pub fn finish_chunk_layer(&mut self, layer: usize) -> Result<Option<Vec<f32>>, HostError> {
+        self.finish_layer(layer)
+    }
+
+    /// Starts the grouped pool serving of a chunk layer's misses: one GroupedExpertJob
+    /// per DISTINCT missed expert (the locator names its byte ranges; the region, row
+    /// list and per-row weights come from the miss group). The caller runs the GPU
+    /// stages while the workers serve, then joins via `PendingChunk::finish`.
+    pub fn start_chunk_pool(
+        &mut self,
+        layer: usize,
+        misses: &[ChunkMissGroup],
+        block: &[f32],
+        m: usize,
+    ) -> Result<Option<super::cpu_pool::PendingChunk>, HostError> {
+        use super::cpu_pool::GroupedExpertJob;
+        if misses.is_empty() {
+            return Ok(None);
+        }
+        let jobs: Vec<GroupedExpertJob> = misses
+            .iter()
+            .map(|group| {
+                let ranges = self
+                    .locator
+                    .ranges(layer, usize::from(group.expert))
+                    .map_err(HostError::Locator)?;
+                Ok(GroupedExpertJob {
+                    region: Arc::clone(&self.region),
+                    gate: ranges.gate,
+                    up: ranges.up,
+                    down: ranges.down,
+                    rows: group.rows.clone(),
+                    row_weights: group.row_weights.clone(),
+                })
+            })
+            .collect::<Result<_, _>>()?;
+        self.pool
+            .start_chunk_layer(jobs, block, m)
+            .map_err(HostError::Pool)
     }
 
     /// Accounts for a whole token from the device's route log: the same counters and the same
@@ -911,6 +1134,85 @@ mod tests {
         // all-CPU layer 0.5 + 0.5, the faulted layer none.
         assert_eq!(f.host.report.routed_weight_ppm, 2_900_000);
         assert_eq!(f.host.report.cpu_weight_ppm, 1_300_000);
+    }
+
+    /// The three-way chunk classify: the hottest `cold_cap` distinct missed experts take
+    /// staging channels WITH their real router weights (no pool job), the rest stay
+    /// weight-0.0 overflow groups, and cold_cap 0 keeps today's two-way plan.
+    #[test]
+    fn chunk_classify_cuts_the_hottest_misses_into_cold_channels() {
+        let mut f = fixture();
+        let s2 = install(&mut f.host, 1, 2, 1);
+        let row = |ids: &[i32], weights: &[f32]| ChunkRouteRow {
+            ids: ids.to_vec(),
+            weights: weights.to_vec(),
+        };
+        let rows = [
+            row(&[2, 7, 3, 5], &[0.30, 0.20, 0.10, 0.02]),
+            row(&[3, 7, 2, 0], &[0.25, 0.15, 0.05, 0.01]),
+            row(&[3, 6, 2, 1], &[0.10, 0.05, 0.04, 0.01]),
+        ];
+        // Miss counts: expert 3 three picks, expert 7 two, experts 0/1/5/6 one each —
+        // the cap of 2 stages 3 and 7, everything else overflows to the pool.
+        let (plan, overflow, cold) = f.host.begin_chunk_layer(1, &rows, 2).unwrap();
+        assert_eq!(
+            plan.slot_ids,
+            vec![s2 as i32, 0, 0, 0, 0, 0, s2 as i32, 0, 0, 0, s2 as i32, 0]
+        );
+        // Cold picks keep their REAL weights (the combine multiplies them); the
+        // overflow picks keep the 0.0 dummy of the CPU path; hits keep theirs.
+        assert_eq!(
+            plan.device_weights,
+            vec![
+                0.30, 0.20, 0.10, 0.0, 0.25, 0.15, 0.05, 0.0, 0.10, 0.0, 0.04, 0.0
+            ]
+        );
+        assert_eq!(
+            plan.cold_ids,
+            vec![-1, 1, 0, -1, 0, 1, -1, -1, 0, -1, -1, -1]
+        );
+        // The overflow groups: one per distinct missed expert, its rows and weights.
+        let experts: Vec<u16> = {
+            let mut e: Vec<u16> = overflow.iter().map(|g| g.expert).collect();
+            e.sort();
+            e
+        };
+        assert_eq!(experts, vec![0, 1, 5, 6]);
+        let by_expert = |e: u16| overflow.iter().find(|g| g.expert == e).unwrap();
+        assert_eq!(by_expert(5).rows, vec![0]);
+        assert_eq!(by_expert(5).row_weights, vec![0.02]);
+        assert_eq!(by_expert(6).rows, vec![2]);
+        // The staged list: hottest first, channels in that order, and the ranges the
+        // locator names for each expert.
+        let expect = |expert: usize| f.reference.ranges(1, expert).unwrap();
+        assert_eq!(cold.len(), 2);
+        assert_eq!(cold[0].expert, 3);
+        assert_eq!(cold[0].channel, 0);
+        assert_eq!(cold[0].gate, expect(3).gate);
+        assert_eq!(cold[1].expert, 7);
+        assert_eq!(cold[1].channel, 1);
+        assert_eq!(cold[1].down, expect(7).down);
+
+        // The report separates the three outcomes — hits, staged serves, pool jobs —
+        // with the mass in millionths per pick, the decode classify's accounting, so a
+        // chunk piece's tiered summary can never read as an unwired counter.
+        assert_eq!(
+            (
+                f.host.report.bank_hits,
+                f.host.report.cold_served,
+                f.host.report.cpu_served
+            ),
+            (3, 5, 4)
+        );
+        assert_eq!(f.host.report.routed_weight_ppm, 1_280_000);
+        assert_eq!(f.host.report.cold_weight_ppm, 800_000);
+        assert_eq!(f.host.report.cpu_weight_ppm, 90_000);
+
+        // cold_cap 0: every miss overflows, the plan matches today's two-way form.
+        let (plan, overflow, cold) = f.host.begin_chunk_layer(1, &rows, 0).unwrap();
+        assert!(plan.cold_ids.iter().all(|&c| c == -1));
+        assert_eq!(overflow.len(), 6);
+        assert!(cold.is_empty());
     }
 
     #[test]

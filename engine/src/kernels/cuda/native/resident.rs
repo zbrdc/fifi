@@ -711,6 +711,32 @@ pub(in crate::kernels::cuda) fn pinned_read_into(
     Ok(())
 }
 
+/// Reads `out.len()` f32 words at byte `offset` (a multiple of 4) out of the pinned
+/// allocation, one volatile word read each — the f32 twin of [`pinned_read_into`] for
+/// blocks the device writes as little-endian f32 and the host consumes per layer (the
+/// chunk route's hidden rows; a per-byte read plus per-value `from_le_bytes` measured
+/// 10-15 ms/layer at m 1,922).
+pub(in crate::kernels::cuda) fn pinned_read_f32_into(
+    pinned: &RawPinned,
+    offset: usize,
+    out: &mut [f32],
+) -> Result<(), DeviceFailure> {
+    let bytes = out.len().checked_mul(4).ok_or_else(invalid_argument)?;
+    let end = offset.checked_add(bytes).ok_or_else(invalid_argument)?;
+    if end > pinned.bytes || offset % 4 != 0 {
+        return Err(invalid_argument());
+    }
+    let base = pinned.ptr.as_ptr().cast::<f32>().cast_const();
+    for (index, slot) in out.iter_mut().enumerate() {
+        // SAFETY: `offset + 4*index < end <= pinned.bytes`, and the allocation stays live
+        // and unfreed while `pinned` is borrowed. The volatile read keeps the compiler from
+        // caching bytes a device copy wrote; that no copy is writing them right now is the
+        // caller's proven precondition above.
+        *slot = unsafe { base.add(offset / 4 + index).read_volatile() };
+    }
+    Ok(())
+}
+
 /// The whole pinned allocation as a read-only slice.
 ///
 /// Precondition the caller must discharge: no device-to-host copy ever targets this allocation
