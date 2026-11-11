@@ -575,3 +575,104 @@ fn gdn_scan_chunk_fault_bad_bounds_reports_bit_8() -> Result<(), EngError> {
     );
     Ok(())
 }
+
+/// The mutation bank of `gdn_scan_chunk_k` (ids 24 to 31 of `kernels/cuda/gdn_mutants.rs`, plus
+/// the Rust-side threshold mutant 32): each branch must turn a reference-pinned or switch test
+/// red, and the unmutated control must pass the same tests. Needs the `cuda-gdn-mutants` build
+/// and a device; run with `--test-threads=1`.
+///
+/// Accepted survivors, by construction (no test can see them): the sm_72 SIMT fallback paths
+/// stay unmutated — the mutation bodies run on sm_80+ hosts, whose launches never take them —
+/// and the split (hi/lo) staging residuals below the fp16 normal floor are kept out of the
+/// tested input profile by the same constraint the `EC_S` derivation already documents. One
+/// MEASURED near-survivor recorded here: staging UB from U's hi half alone (the fp16 truncation)
+/// stays inside the 8× margin of `EC_S` at every oracle shape — U's lo split is not individually
+/// load-bearing for the state update, unlike the K̂/Q̂ splits whose lo-drop measures 7.1e-2 — so
+/// the bank's instance 30 is the blunt lo-only form that collapses the update term.
+#[cfg(feature = "cuda-gdn-mutants")]
+mod mutants {
+    use super::*;
+    use crate::kernels::cuda::gdn_mutants::select;
+
+    /// The mutant `id` must make `body` panic.
+    fn killed(id: u32, name: &str, body: fn()) {
+        let _selected = select(id);
+        let outcome = std::panic::catch_unwind(body);
+        assert!(
+            outcome.is_err(),
+            "mutant {name} (id {id}) survived its test"
+        );
+    }
+
+    #[test]
+    fn mutant_control_without_a_mutant_passes_the_chunk_tests() {
+        let _selected = select(0);
+        gdn_scan_chunk_matches_the_f64_reference().unwrap();
+        gdn_scan_chunk_m_edges().unwrap();
+        gdn_scan_chunk_splits_and_tokens_each_match_the_reference().unwrap();
+        the_chunk_switch_routes_only_long_scans().unwrap();
+    }
+
+    #[test]
+    fn mutant_chunk_gram_decay_ratios_dropped_is_killed() {
+        killed(24, "Gram decay ratios dropped", || {
+            gdn_scan_chunk_matches_the_f64_reference().unwrap()
+        });
+    }
+
+    #[test]
+    fn mutant_chunk_seen_term_unscaled_is_killed() {
+        killed(25, "seen term unscaled", || {
+            gdn_scan_chunk_matches_the_f64_reference().unwrap()
+        });
+    }
+
+    #[test]
+    fn mutant_chunk_solve_back_tail_shortened_is_killed() {
+        killed(26, "solve back tail shortened", || {
+            gdn_scan_chunk_matches_the_f64_reference().unwrap()
+        });
+    }
+
+    #[test]
+    fn mutant_chunk_intra_term_dropped_is_killed() {
+        killed(27, "intra term dropped", || {
+            gdn_scan_chunk_matches_the_f64_reference().unwrap()
+        });
+    }
+
+    #[test]
+    fn mutant_chunk_tail_product_off_by_one_is_killed() {
+        killed(28, "tail product off by one", || {
+            gdn_scan_chunk_splits_and_tokens_each_match_the_reference().unwrap()
+        });
+    }
+
+    #[test]
+    fn mutant_chunk_state_update_without_decay_is_killed() {
+        killed(29, "state update without decay", || {
+            gdn_scan_chunk_splits_and_tokens_each_match_the_reference().unwrap()
+        });
+    }
+
+    #[test]
+    fn mutant_chunk_ub_staged_lo_only_is_killed() {
+        killed(30, "UB staged from the lo half only", || {
+            gdn_scan_chunk_matches_the_f64_reference().unwrap()
+        });
+    }
+
+    #[test]
+    fn mutant_chunk_state_store_unswizzled_is_killed() {
+        killed(31, "state store unswizzled", || {
+            gdn_scan_chunk_splits_and_tokens_each_match_the_reference().unwrap()
+        });
+    }
+
+    #[test]
+    fn mutant_chunk_threshold_one_is_killed() {
+        killed(32, "chunk threshold one", || {
+            the_chunk_switch_routes_only_long_scans().unwrap()
+        });
+    }
+}

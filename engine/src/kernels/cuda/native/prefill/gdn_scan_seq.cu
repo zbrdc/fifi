@@ -808,6 +808,11 @@ __global__ void __launch_bounds__(kLanes * kChunkWarps, 1) gdn_scan_chunk_k(Scan
     const int tid = lane + kLanes * w;
     const int col0 = blockIdx.z * kCols;
     float *const st = a.state + (size_t)h * D * D;
+#ifdef INFERENCE_CUDA_GDN_MUTANTS
+    const int mutant = a.mutant;
+#else
+    constexpr int mutant = 0;  // a mutant branch is the constant false and compiles away
+#endif
     if ((long long)a.p0 < 0 || (long long)a.p0 + a.m > a.ctx_tokens) {
         if (a.status && blockIdx.x == 0 && blockIdx.z == 0 && tid == 0) {
             atomicOr(a.status, INFERENCE_CUDA_PREFILL_STATUS_BOUND_VIOLATION);
@@ -939,7 +944,7 @@ __global__ void __launch_bounds__(kLanes * kChunkWarps, 1) gdn_scan_chunk_k(Scan
                 for (int i = s + 1; i <= t; ++i) ratio *= dec_s[i];
                 if (s != t) {
                     if (is_kk) {
-                        G_s[t * kCpad + s] = b_s[t] * ratio * d[e];
+                        G_s[t * kCpad + s] = b_s[t] * (mutant == 24 ? 1.f : ratio) * d[e];
                     } else {
                         f2s_at(ratio * d[e], A_h, A_l, t * kCHpad + s);
                     }
@@ -1005,8 +1010,8 @@ __global__ void __launch_bounds__(kLanes * kChunkWarps, 1) gdn_scan_chunk_k(Scan
                 const int t = t0w + r0 + 8 * (e >> 1);
                 const int c = c0w + cc + (e & 1);
                 if (t < len)
-                    f2s_at(j2(U_h, U_l, c * kCHpad + t) - B_s[t] * d[e], U_h, U_l,
-                           c * kCHpad + t);
+                    f2s_at(j2(U_h, U_l, c * kCHpad + t) - (mutant == 25 ? 0.f : B_s[t]) * d[e],
+                           U_h, U_l, c * kCHpad + t);
             }
         }
 #else
@@ -1044,7 +1049,7 @@ __global__ void __launch_bounds__(kLanes * kChunkWarps, 1) gdn_scan_chunk_k(Scan
                     back.w += gs.w * j2(U_h, U_l, b4 + 3);
                 }
                 float tail = 0.f;
-                for (int s = 4 * (t / 4); s < t; ++s)
+                for (int s = 4 * (t / 4); s < t - (mutant == 26 ? 1 : 0); ++s)
                     tail += G_s[t * kCpad + s] * j2(U_h, U_l, c * kCHpad + s);
                 float b = back.x + back.y + back.z + back.w + tail;
                 const float u = b_s[t] * j2(U_h, U_l, c * kCHpad + t) - b;
@@ -1087,7 +1092,7 @@ __global__ void __launch_bounds__(kLanes * kChunkWarps, 1) gdn_scan_chunk_k(Scan
                 const int c = c0w + cc + (e & 1);
                 if (t < len)
                     a.o_out[((size_t)(t0 + t) * a.n_v_heads + h) * D + col0 + c] =
-                        B_s[t] * di[e] + da[e];
+                        B_s[t] * di[e] + (mutant == 27 ? 0.f : da[e]);
             }
         }
 #else
@@ -1114,7 +1119,7 @@ __global__ void __launch_bounds__(kLanes * kChunkWarps, 1) gdn_scan_chunk_k(Scan
         if (tid == 0) {
             float tail = 1.f;
             for (int s = len - 1; s >= 0; --s) {
-                B_s[s] = tail;
+                B_s[s] = mutant == 28 ? tail * dec_s[s] : tail;
                 tail *= dec_s[s];
             }
         }
@@ -1125,8 +1130,11 @@ __global__ void __launch_bounds__(kLanes * kChunkWarps, 1) gdn_scan_chunk_k(Scan
         // stale K-hat clones with exact zeros, so the full-window contraction is clean.
         for (int i = tid; i < kCols * kC; i += kLanes * kChunkWarps) {
             const int c = i / kC, s = i % kC;
-            f2s_at(s < len ? B_s[s] * j2(U_h, U_l, c * kCHpad + s) : 0.f, UB_h, UB_l,
-                   c * kCHpad + s);
+            f2s_at(s < len ? B_s[s]
+                           * (mutant == 30 ? __half2float(U_l[c * kCHpad + s])
+                                           : j2(U_h, U_l, c * kCHpad + s))
+                            : 0.f,
+                   UB_h, UB_l, c * kCHpad + s);
         }
         __syncthreads();
         {
@@ -1153,7 +1161,8 @@ __global__ void __launch_bounds__(kLanes * kChunkWarps, 1) gdn_scan_chunk_k(Scan
                 for (int e = 0; e < 4; ++e) {
                     const int c = c0w + r0 + 8 * (e >> 1);
                     const int r = r0w + cc + (e & 1);
-                    f2s_at(j2(S_h, S_l, swr(c, r)) * b_end + d[e], S_h, S_l, swr(c, r));
+                    f2s_at(j2(S_h, S_l, swr(c, r)) * (mutant == 29 ? 1.f : b_end) + d[e], S_h, S_l,
+                           swr(c, r));
                 }
             }
         }
@@ -1177,7 +1186,7 @@ __global__ void __launch_bounds__(kLanes * kChunkWarps, 1) gdn_scan_chunk_k(Scan
     }
     for (int i = tid; i < D * kCols; i += kLanes * kChunkWarps) {
         const int c = i % kCols, r = i / kCols;
-        st[(size_t)r * D + col0 + c] = j2(S_h, S_l, swr(c, r));
+        st[(size_t)r * D + col0 + c] = j2(S_h, S_l, mutant == 31 ? c * kHpad + r : swr(c, r));
     }
 }
 

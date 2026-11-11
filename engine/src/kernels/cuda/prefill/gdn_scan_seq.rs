@@ -38,7 +38,9 @@ use crate::EngError;
 use crate::kernels::cuda::context::{
     Claim, CudaContext, DeviceRange, DeviceStream, require_apart, require_fit,
 };
-use crate::kernels::cuda::gdn_mutants::{SCAN_ACCEPTS_FOUR, SCAN_MIN_ONE, SCAN_NO_TRIM, mutated};
+use crate::kernels::cuda::gdn_mutants::{
+    CHUNK_MIN_ONE, SCAN_ACCEPTS_FOUR, SCAN_MIN_ONE, SCAN_NO_TRIM, mutated,
+};
 use crate::kernels::cuda::native::prefill::gdn_scan_seq::{
     FORM_ADD_EPS_L2, FORM_GROUPED_HEADS, FORM_SIGMOID_GATE, GDN_SCAN_BLOCK_COLS, GdnScanSeqInts,
     GdnScanSeqRaw, gdn_scan_chunk_launch, gdn_scan_seq_cols_launch, gdn_scan_seq_launch,
@@ -572,7 +574,12 @@ impl CudaContext {
         chunk: Option<()>,
         cols: Option<usize>,
     ) -> Result<(), EngError> {
-        if chunk.is_some() && call.shape.m >= SCAN_MIN_ROWS && self.chunk_scan_hosted() {
+        let min = if mutated(CHUNK_MIN_ONE) {
+            1
+        } else {
+            SCAN_MIN_ROWS
+        };
+        if chunk.is_some() && call.shape.m >= min && self.chunk_scan_hosted() {
             #[cfg(test)]
             CHUNK_CALLS.with(|calls| calls.set(calls.get() + 1));
             return self.gdn_scan_chunk_form(stream, call, form);

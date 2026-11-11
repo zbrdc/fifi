@@ -231,7 +231,7 @@ extern "C" int inference_cuda_gdn_conv_rows_launch(const inference_cuda_gdn_conv
 std::atomic<int> g_gdn_mutant{0};
 
 extern "C" int inference_cuda_gdn_mutant_select(int id) {
-    if (id < 0 || id > 23) {
+    if (id < 0 || id > 31) {
         return INFERENCE_CUDA_INVALID_ARGUMENT;
     }
     g_gdn_mutant.store(id, std::memory_order_relaxed);
