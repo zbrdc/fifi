@@ -121,6 +121,7 @@ class CodingSessionTests(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stderr)
         data = json.loads(self.output.read_text())
         self.assertTrue(data["passed"])
+        self.assertEqual(data["reuse_mode"], "required")
         self.assertEqual([len(turn) for turn in self.server.turns], [1, 3])
         self.assertEqual(self.server.turns[1][0], self.server.turns[0][0])
         self.assertEqual(self.server.turns[1][1]["content"], data["turns"][0]["answer"])
@@ -128,6 +129,8 @@ class CodingSessionTests(unittest.TestCase):
         self.assertEqual(data["turns"][0]["reused_tokens"], 0)
         second = data["turns"][1]
         self.assertEqual(second["reused_tokens"], 2500)
+        self.assertTrue(second["reuse_passed"])
+        self.assertTrue(second["reuse_check_passed"])
         self.assertEqual(second["server_uncached_tokens_per_second"],
                          (second["prompt_tokens"] - 2500) / 2)
         self.assertEqual(second["client_uncached_tokens_per_second_estimate"],
@@ -136,7 +139,7 @@ class CodingSessionTests(unittest.TestCase):
         self.assertNotIn("server_prompt_tokens_per_second", second)
         self.assertFalse(self.output.with_name("coding.json.partial").exists())
 
-    def test_warm_reuse_is_required_by_default_and_can_be_relaxed(self):
+    def test_warm_reuse_is_required_by_default(self):
         self.server.second_reuse = 0
         result = self.cli()
         self.assertEqual(result.returncode, 2, result.stderr)
@@ -144,12 +147,28 @@ class CodingSessionTests(unittest.TestCase):
         self.output.unlink()
         self.server.turns.clear()
         result = self.cli("--min-reused-tokens", "0")
-        self.assertEqual(result.returncode, 0, result.stderr)
-        self.output.unlink()
+        self.assertEqual(result.returncode, 1, result.stderr)
+        self.assertFalse(self.output.exists())
         self.server.turns.clear()
         self.server.second_reuse = 2500
         result = self.cli("--min-reused-tokens", "2600")
         self.assertEqual(result.returncode, 2, result.stderr)
+
+    def test_disabled_mode_checks_zero_reuse_without_claiming_warm_reuse(self):
+        self.server.second_reuse = 0
+        result = self.cli("--reuse-mode", "disabled")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        data = json.loads(self.output.read_text())
+        self.assertEqual(data["reuse_mode"], "disabled")
+        self.assertIsNone(data["min_reused_tokens"])
+        self.assertIsNone(data["turns"][1]["reuse_passed"])
+        self.assertTrue(data["turns"][1]["reuse_check_passed"])
+        self.output.unlink()
+        self.server.turns.clear()
+        self.server.second_reuse = 2500
+        result = self.cli("--reuse-mode", "disabled")
+        self.assertEqual(result.returncode, 2, result.stderr)
+        self.assertFalse(json.loads(self.output.read_text())["turns"][1]["reuse_check_passed"])
 
     def test_wrong_or_truncated_second_edit_fails(self):
         for replacement, finish in (("return value.strip().lower()", "stop"),

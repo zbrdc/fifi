@@ -55,8 +55,10 @@ asks for a small code edit, and then asks for a revision in the same chat. It
 compares the returned statements as Python syntax trees and never executes the
 model's code. It counts both rendered prompts and verifies the first was cold.
 By default, the second turn must report at least one reused token; set a higher
-`--min-reused-tokens` threshold to require substantial reuse, or `0` to observe
-an engine with reuse disabled.
+`--min-reused-tokens` threshold to require substantial reuse. This is the
+`required` reuse mode. Use `--reuse-mode disabled` to check a path that must
+report zero reused tokens on both turns, such as the experimental P2P chunked
+path. A pass in disabled mode does not qualify warm prefix reuse.
 
 ```sh
 python3 scripts/bench_coding_session.py \
@@ -67,6 +69,11 @@ python3 scripts/bench_coding_session.py \
   --min-reused-tokens 100000 \
   --output "$TMPDIR/coding-session-128k.json"
 ```
+
+For the P2P chunked path, replace the reuse threshold with
+`--reuse-mode disabled` and use a separate output file. In this mode the result
+records `reuse_passed` as null and checks the expected absence of reuse through
+`reuse_check_passed`.
 
 For a 262,144-token total context, use a first-prompt target such as `257000`
 to leave space for both turns. The driver reserves two replies before starting

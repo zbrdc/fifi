@@ -134,7 +134,7 @@ def turn(client: common.Client, model: str, conversation: list[dict[str, str]],
 
 def run(args: argparse.Namespace) -> bool:
     if (args.prompt_tokens < 1 or args.max_tokens < 1 or args.tolerance < 0
-            or args.min_reused_tokens < 0 or not math.isfinite(args.timeout) or args.timeout <= 0):
+            or args.min_reused_tokens < 1 or not math.isfinite(args.timeout) or args.timeout <= 0):
         raise ValueError("invalid token count, reuse threshold, tolerance, or timeout")
     key = os.environ.get(args.api_key_env) if args.api_key_env else None
     if args.api_key_env and not key:
@@ -147,7 +147,9 @@ def run(args: argparse.Namespace) -> bool:
     output.parent.mkdir(parents=True, exist_ok=True)
     result = {"state": "started", "model": args.model, "target_prompt_tokens": args.prompt_tokens,
               "tolerance": args.tolerance, "max_completion_tokens": args.max_tokens,
-              "min_reused_tokens": args.min_reused_tokens, "turns": []}
+              "reuse_mode": args.reuse_mode,
+              "min_reused_tokens": args.min_reused_tokens if args.reuse_mode == "required" else None,
+              "turns": []}
     common.write_json(partial, result, create=True)
     try:
         limit = common.context_limit(client, args.model)
@@ -182,9 +184,12 @@ def run(args: argparse.Namespace) -> bool:
             second = turn(client, args.model, conversation, followup_count, args.max_tokens, cold=False)
             second["edit_passed"] = (second["finish_reason"] == "stop"
                                      and valid_replacement(second["answer"], "upper"))
-            second["reuse_passed"] = second["reused_tokens"] >= args.min_reused_tokens
+            second["reuse_passed"] = (second["reused_tokens"] >= args.min_reused_tokens
+                                      if args.reuse_mode == "required" else None)
+            second["reuse_check_passed"] = (second["reuse_passed"] if args.reuse_mode == "required"
+                                            else second["reused_tokens"] == 0)
             result["turns"].append(second)
-            passed = second["edit_passed"] and second["reuse_passed"]
+            passed = second["edit_passed"] and second["reuse_check_passed"]
         result.update({"state": "complete", "passed": passed,
                        "measurement_note": "Synthetic two-turn code edit; AST checked without execution. "
                        "Not general coding quality, device isolation, or build identity."})
@@ -205,6 +210,8 @@ def main() -> int:
     parser.add_argument("--prompt-tokens", type=int, required=True)
     parser.add_argument("--tolerance", type=int, default=128)
     parser.add_argument("--max-tokens", type=int, default=128)
+    parser.add_argument("--reuse-mode", choices=("required", "disabled"), default="required",
+                        help="require warm prefix reuse, or verify that reuse is disabled")
     parser.add_argument("--min-reused-tokens", type=int, default=1)
     parser.add_argument("--timeout", type=float, default=21600)
     parser.add_argument("--api-key-env")
