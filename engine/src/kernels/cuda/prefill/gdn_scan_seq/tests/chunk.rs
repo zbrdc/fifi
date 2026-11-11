@@ -9,9 +9,11 @@
 //! the sequential kernels' fault-qualification test.
 
 use super::{
-    D, RefOpts, Rig, ScanInputs, ScanLayout, ScanRig, assert_constraints, assert_scan_finite, f32s,
-    generate_scan, judge_scan_with, le_bytes, seed_of,
+    D, RefOpts, Rig, ScanInputs, ScanLayout, ScanRig, assert_constraints, assert_scan_finite,
+    generate_scan, judge_scan_with, seed_of,
 };
+#[cfg(feature = "cuda-fault-qualification")]
+use super::{f32s, le_bytes};
 use crate::EngError;
 #[cfg(feature = "cuda-fault-qualification")]
 use crate::kernels::cuda::PREFILL_STATUS_BOUND_VIOLATION;
@@ -20,8 +22,10 @@ use crate::kernels::cuda::native::prefill::gdn_scan_seq::{
     GdnScanSeqRaw, gdn_scan_chunk_fault_bad_bounds,
 };
 use crate::kernels::cuda::prefill::gdn_scan_seq::{
-    GDN_SCAN_EPS, GdnForm, GdnScanSeqCall, ScanShape, ScanWeights, scan_bytes, scan_ints,
+    GDN_SCAN_EPS, GdnForm, GdnScanSeqCall, ScanWeights, scan_bytes,
 };
+#[cfg(feature = "cuda-fault-qualification")]
+use crate::kernels::cuda::prefill::gdn_scan_seq::{ScanShape, scan_ints};
 use crate::kernels::cuda::testkit;
 
 /// The unit roundoff of f32.

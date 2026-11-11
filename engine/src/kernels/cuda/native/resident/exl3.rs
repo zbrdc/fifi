@@ -648,6 +648,8 @@ pub(in crate::kernels::cuda) fn indexed_table_records(
 /// parameter block's 20-pair cap. `pairs` points at `pairs_count` packed records (upload of
 /// [`indexed_table_records`]' bytes), `k_units`/`n_tiles`/`n_units` are the batch's widest
 /// shapes and `options` carries only the DP4A and pipeline bits.
+// One flat parameter record of the C entry it wraps; grouping the scalars would invent a
+// struct the FFI does not have.
 #[allow(clippy::too_many_arguments)]
 pub(in crate::kernels::cuda) fn indexed_table(
     stream: &RawStream,

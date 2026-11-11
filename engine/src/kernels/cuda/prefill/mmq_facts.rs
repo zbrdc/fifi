@@ -22,7 +22,7 @@ pub(crate) struct MmqFacts {
     pub(crate) cc: i32,
     /// Streaming multiprocessors.
     #[cfg_attr(
-        not(test),
+        not(any(test, feature = "native-cuda")),
         expect(
             dead_code,
             reason = "read by the GEMM fixup sizing when that wrapper lands"
@@ -31,7 +31,7 @@ pub(crate) struct MmqFacts {
     pub(crate) nsm: usize,
     /// Opt-in shared memory per block, in bytes.
     #[cfg_attr(
-        not(test),
+        not(any(test, feature = "native-cuda")),
         expect(
             dead_code,
             reason = "read by the GEMM fixup sizing when that wrapper lands"
