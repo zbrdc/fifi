@@ -23,6 +23,11 @@ establish a speedup or qualify this implementation.
 
 ## RTX 3060 + RTX 3080 observation
 
+Every measurement in this section ran on one experimental server build from the
+contributor's fork, which uses a 512-row chunked P2P prefill; each receipt
+records its source commit and binary hash. That chunked path is not part of
+this tree, so the rates describe that build, not a build of this tree.
+
 A guarded, same-binary comparison on Qwen3.6 35B A3B Q4_K_M with 512-row
 chunks measured the existing opt-in against the default. For a cold 4,274-token
 synthetic prompt, median server prefill rates were 474.09 versus 547.93 tokens/s
