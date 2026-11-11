@@ -501,7 +501,8 @@ fn the_shared_expert_of_k_rows_equals_k_one_row_blocks() {
     }
 }
 
-/// The K-row shared expert refuses one row and more than eight: the one-row block is `shared()`.
+/// The K-row shared expert refuses one row and more than thirty-two: the one-row block is
+/// `shared()`.
 #[test]
 fn the_k_row_shared_expert_takes_two_to_thirty_two_rows() {
     if !device_present("K-row shared expert row counts") {

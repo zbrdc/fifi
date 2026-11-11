@@ -122,8 +122,10 @@ pub(crate) const PIPE_VAR: &str = "FIFI_EXL3_PIPELINE";
 /// Opt-in switch of the pointer-table launch of the id-indexed kernels: unset or `0` keeps the
 /// parameter-block launches (up to 16 or 20 pairs), `1` moves the call records to a device
 /// table so one kernel per stage covers the whole batch (up to 65535 records, shapes may mix).
-/// Same bytes as the option launch of the same calls; the DP4A and pipeline options apply. A
-/// set value wins over the default a session registered. Process-wide, read once, strict.
+/// Same bytes as the option launch of the same calls; the DP4A and pipeline options apply. The
+/// record staging copy makes this form refuse graph capture (the option launch stays
+/// capturable). A set value wins over the default a session registered. Process-wide, read
+/// once, strict.
 pub(crate) const TABLE_VAR: &str = "FIFI_EXL3_TABLE";
 
 /// The opt-in options of the id-indexed launch, each selected on its own: the DP4A decode of
@@ -1485,6 +1487,7 @@ impl CudaContext {
             return Err(refuse("the calls must all use the same fused-publish arm"));
         }
         let mut raw = Vec::with_capacity(calls.len());
+        let mut outs: Vec<(&DeviceRange<'_>, usize)> = Vec::with_capacity(calls.len());
         let mut index = Vec::with_capacity(calls.len());
         for c in calls {
             let call = &c.call;
@@ -1526,6 +1529,16 @@ impl CudaContext {
                 return Err(refuse("the member strides leave the bank ranges"));
             }
             require_fit("EXL3 member ids", &c.ids, (c.slot as usize + 1) * 4, 4)?;
+            // One output span per record: two records writing one span would race. The C
+            // group check refuses it too; refusing here keeps that refusal off the native
+            // path, whose statuses latch the backend terminal.
+            for (prior, bytes) in outs.iter() {
+                require_apart(
+                    &Claim::of("EXL3 out", &call.out, needs[7]),
+                    &Claim::of("EXL3 out", prior, *bytes),
+                )?;
+            }
+            outs.push((&call.out, needs[7]));
             // The ids and every member of the bank are read-only inputs: apart from all writes.
             for (name, range, bytes) in [
                 ("EXL3 xh", &call.xh, needs[5]),
@@ -1582,10 +1595,11 @@ impl CudaContext {
     }
 
     /// The pointer-table form of the id-indexed launch ([`TABLE_VAR`]): the per-call records
-    /// ride a device table (packed host-side by the native layer, uploaded through the
-    /// allocation cache) and one kernel per stage covers the whole batch, so the parameter
-    /// block's pair cap lifts to the grid's. Only the DP4A and pipeline bits apply. Every byte
-    /// written equals the option launch of the same calls.
+    /// ride a device table (packed host-side by the native layer, staged through a
+    /// stream-ordered region copy) and one kernel per stage covers the whole batch, so the
+    /// parameter block's pair cap lifts to the grid's. Only the DP4A and pipeline bits apply.
+    /// Every byte written equals the option launch of the same calls. The staging copy makes
+    /// this form refuse graph capture (the option launch stays capturable).
     fn exl3_indexed_table(
         &self,
         stream: &DeviceStream,
@@ -1594,6 +1608,9 @@ impl CudaContext {
         options: &IndexedOptions,
     ) -> Result<(), EngError> {
         let records = ffi::indexed_table_records(raw, index).map_err(device_error)?;
+        // This module carries no unsafe, so the staging takes a byte copy of the packed records
+        // (2.5 KB at 20 records) instead of a raw view of the words.
+        let bytes: Vec<u8> = records.iter().flat_map(|word| word.to_le_bytes()).collect();
         // The grid covers the batch's widest shapes; narrower records exit their extra units
         // through the per-record k/n in the table.
         let k_units = raw
@@ -1607,7 +1624,7 @@ impl CudaContext {
         let native = u32::from(options.dp4a) | (u32::from(options.pipeline) << 2);
         let fused_publish = u32::from(raw[0].fused);
         let flag = raw[0].flag.address();
-        let table = self.stage_exl3_indexed_table(stream, &records)?;
+        let table = self.stage_exl3_indexed_table(stream, &bytes)?;
         let count = raw.len();
         self.launch_on(stream, |s| {
             ffi::indexed_table(

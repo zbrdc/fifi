@@ -1118,6 +1118,9 @@ impl CudaContext {
         let region = match regions.iter_mut().find(|(id, _)| *id == stream.id()) {
             Some((_, buffer)) => {
                 if buffer.bytes() < records.len() {
+                    // The free entry device-syncs before cudaFree, so readers of the replaced
+                    // region have completed; growth pays that sync (rare, only when a batch
+                    // outgrows the region).
                     *buffer = DeviceBuffer::allocate(
                         &self.lease,
                         records.len().max(buffer.bytes() * 2).max(4096),
@@ -1134,8 +1137,11 @@ impl CudaContext {
             }
         };
         let raw = self.owned(region)?;
-        let range = native::resident::RawRange::new(raw, 0, records.len())
-            .ok_or_else(|| EngError::BadRequest("EXL3 indexed table: empty records".into()))?;
+        // Unreachable in practice (`records.len()` was checked non-zero and the region grown to
+        // fit); a `None` would mean the byte math above disagrees with `RawRange::new`.
+        let range = native::resident::RawRange::new(raw, 0, records.len()).ok_or_else(|| {
+            EngError::BadRequest("EXL3 indexed table: the region does not fit the records".into())
+        })?;
         native::resident::copy_h2d_enqueue(range, records, stream_raw).map_err(device_error)?;
         Ok(range.address())
     }

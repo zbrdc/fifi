@@ -1738,7 +1738,8 @@ __global__ void table_input_rotate(const __grid_constant__ TableLaunch l) {
     GroupEntry a;
     if (!resolve_table<true>(l, p, a)) return;
     const size_t index = size_t(blockIdx.x) * 128 + threadIdx.x;
-    if (index >= size_t(p.k)) return;  // narrow records leave their tail threads idle
+    if (index >= size_t(p.k)) return;  // k is a multiple of 128, so a whole block retires here;
+                                       // no thread diverges across rotate128's barriers
     const float value = finite_or_flag(a.x[index] * a.suh[index % p.k], p.flag);
     a.xh[index] = finite_or_flag(rotate128(value, values), p.flag);
 }
@@ -2031,7 +2032,12 @@ static bool table_pack(const inference_cuda_exl3_linear_args *calls,
                 for (const auto &o : wj)
                     // The batch shares one completion flag: the only alias two records may
                     // write (the pack already refused records with different flag pointers).
-                    if (o.bytes && w.p != o.p && !apart(w.p, w.bytes, o.p, o.bytes)) return false;
+                    // Any other same-pointer pair stays refused, like the option launch.
+                    if (o.bytes
+                        && !(w.p == o.p && w.bytes == 4 && o.bytes == 4
+                             && w.p == (const void *)calls[0].flag)
+                        && !apart(w.p, w.bytes, o.p, o.bytes))
+                        return false;
                 for (const auto &r : rj)
                     if (r.bytes && !apart(w.p, w.bytes, r.p, r.bytes)) return false;
             }
@@ -2238,9 +2244,13 @@ extern "C" int inference_cuda_exl3_indexed_table(
 // uploads the buffer and computes the widest-shape grids from its own records.
 extern "C" int inference_cuda_exl3_indexed_table_pack(
     const inference_cuda_exl3_linear_args *calls, const inference_cuda_exl3_index_args *index,
-    size_t pairs_count, IndexedTablePair *out) {
+    size_t pairs_count, size_t out_bytes, IndexedTablePair *out) {
     try {
-        if (!out || !table_pack(calls, index, pairs_count, 2, out))
+        // The Rust side sizes its buffer from its own constant; this bound makes a grown
+        // record refuse here instead of writing past it.
+        if (!out || pairs_count > out_bytes / sizeof(IndexedTablePair))
+            return INFERENCE_CUDA_INVALID_ARGUMENT;
+        if (!table_pack(calls, index, pairs_count, 2, out))
             return INFERENCE_CUDA_INVALID_ARGUMENT;
         return INFERENCE_CUDA_OK;
     } catch (...) {

@@ -466,6 +466,7 @@ unsafe extern "C" {
         args: *const LinearArgs,
         index: *const IndexArgs,
         count: usize,
+        out_bytes: usize,
         out: *mut c_void,
     ) -> c_int;
     fn inference_cuda_exl3_indexed_table(
@@ -617,21 +618,25 @@ pub(in crate::kernels::cuda) const TABLE_PAIRS_MAX: usize = 65535;
 
 /// Packs the table records host-side ([`inference_cuda_exl3_indexed_table_pack`]): the same
 /// call and index records the option entry takes, validated per record with cross-record write
-/// isolation in C. Returns the packed bytes, one record per call.
+/// isolation in C (a count that does not fit the buffer is refused there, so a grown record
+/// cannot overrun a stale size constant). Returns the packed records as `u64` words (the
+/// packer writes an 8-aligned struct), `TABLE_PAIR_BYTES` per call.
 pub(in crate::kernels::cuda) fn indexed_table_records(
     calls: &[LinearRaw<'_>],
     index: &[IndexRaw<'_>],
-) -> Result<Vec<u8>, DeviceFailure> {
+) -> Result<Vec<u64>, DeviceFailure> {
     let (args, indexes) = indexed_records(calls, index, TABLE_PAIRS_MAX)?;
-    let mut out = vec![0u8; calls.len() * TABLE_PAIR_BYTES];
+    let mut out = vec![0u64; calls.len() * (TABLE_PAIR_BYTES / size_of::<u64>())];
     let mut stage = STAGE_NONE;
     // SAFETY: `args`/`indexes` are the arrays the option entry takes; `out` holds one record
-    // per call, the count the packer reads.
+    // per call at the alignment the packer's struct needs, and the C side refuses a count that
+    // does not fit `out_bytes`.
     let status = unsafe {
         inference_cuda_exl3_indexed_table_pack(
             args.as_ptr(),
             indexes.as_ptr(),
             args.len(),
+            out.len() * size_of::<u64>(),
             out.as_mut_ptr().cast(),
         )
     };

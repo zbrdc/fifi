@@ -22,7 +22,7 @@ use super::{
     indexed_from_env, indexed_pairs_from_env, merge_indexed, pipe_from_env, table_from_env,
 };
 use crate::kernels::cuda::native::resident::exl3::TABLE_PAIRS_MAX;
-use crate::kernels::cuda::{CudaContext, DeviceBuffer, DeviceStream, testkit};
+use crate::kernels::cuda::{CudaContext, DeviceBuffer, DeviceRange, DeviceStream, testkit};
 use crate::weights::exl3::Codebook;
 
 /// The multiplier of book 2's hash (`decode_state`).
@@ -432,8 +432,20 @@ type Written = (Vec<u8>, Vec<u8>, Vec<u8>, Vec<u8>);
 
 impl Bank {
     fn new(ctx: &CudaContext, rng: &mut testkit::Rng, kind: (Codebook, u8, usize)) -> Self {
+        Self::with_shape(ctx, rng, kind, (512, 384))
+    }
+
+    /// A bank of an explicit `(k, n)` (both multiples of 128, so whole blocks retire at the
+    /// per-record guards of the table launch): mixed-shape batches need two shapes of one
+    /// codebook.
+    fn with_shape(
+        ctx: &CudaContext,
+        rng: &mut testkit::Rng,
+        kind: (Codebook, u8, usize),
+        shape: (usize, usize),
+    ) -> Self {
         let (book, bits_twice, offset) = kind;
-        let (k, n, members) = (512usize, 384usize, 12usize);
+        let (k, n, members) = (shape.0, shape.1, 12usize);
         let stride = Self::stride(k, n, bits_twice);
         let mut bytes = vec![0xa5; offset];
         bytes.extend((0..members * stride).map(|_| rng.next_u64() as u8));
@@ -458,6 +470,55 @@ impl Bank {
 
     fn stride(k: usize, n: usize, bits_twice: u8) -> usize {
         k * n / 256 * usize::from(bits_twice) * 16
+    }
+
+    /// The call of pair `p` (member `ids[p]`, slot `p`) with caller-chosen rotated-input and
+    /// output ranges, so one launch can mix banks and shapes across records. The default
+    /// launch demands each pair's `xh` and `z` follow the previous pair's in one buffer; the
+    /// table launch takes them scattered, so the ranges are the caller's choice.
+    fn one_call<'a>(
+        &'a self,
+        p: usize,
+        xh: DeviceRange<'a>,
+        z: DeviceRange<'a>,
+        out: &'a DeviceBuffer,
+        flag: &'a DeviceBuffer,
+        ids: &'a DeviceBuffer,
+    ) -> Exl3IndexedCall<'a> {
+        let (k, n) = (self.k, self.n);
+        let stride = Self::stride(k, n, self.bits_twice);
+        Exl3IndexedCall {
+            call: Exl3LinearCall {
+                trellis: self
+                    .trellis
+                    .range(self.offset, self.members * stride)
+                    .unwrap(),
+                suh: self.scales.range(0, self.scales.bytes()).unwrap(),
+                svh: self
+                    .scales
+                    .range(k * 4, self.scales.bytes() - k * 4)
+                    .unwrap(),
+                bias: None,
+                x: self.x.range(p * k * 4, k * 4).unwrap(),
+                xh,
+                z,
+                out: out.range(0, n * 4).unwrap(),
+                flag: flag.range(0, 4).unwrap(),
+                rows: 1,
+                split_k: 2,
+                k,
+                n,
+                bits_twice: self.bits_twice,
+                book: self.book,
+                fused: false,
+            },
+            ids: ids.range(0, ids.bytes()).unwrap(),
+            slot: p as u32,
+            members: self.members as u32,
+            trellis_stride: stride,
+            scale_stride: k + n,
+            offsets: None,
+        }
     }
 
     /// The 20 calls of `ids` in launches of the context's capacity; what they wrote.
@@ -670,5 +731,157 @@ fn only_the_twenty_pair_option_takes_twenty_calls_in_one_launch() {
     assert_eq!(bank.run_in(&ctx, &stream, &ids, (16, 2)).unwrap(), want);
     ctx.set_indexed_options(Some(TABLE));
     assert!(bank.run_in(&ctx, &stream, &ids, (PAIRS, 2)).is_err());
+    ctx.set_indexed_options(None);
+}
+
+#[test]
+fn the_table_pack_refuses_two_records_writing_one_output() {
+    if !testkit::device_present("EXL3 table write isolation") {
+        return;
+    }
+    let ctx = CudaContext::new().expect("context");
+    let stream = ctx.stream().expect("stream");
+    let mut rng = testkit::Rng::new(0x5347_0022);
+    let bank = Bank::new(&ctx, &mut rng, (Codebook::Mul1, 6, 0));
+    let flag = testkit::upload_bytes(&ctx, &0u32.to_le_bytes());
+    let ids = testkit::upload_bytes(&ctx, &[3i32, 7].map(|id| id.to_le_bytes()).concat());
+    // Two calls whose outputs alias: the same span of one buffer, so the two records would race
+    // on it. The shared flag is the only alias a batch may write.
+    let xh0 = testkit::upload_filled(&ctx, 0xff, bank.k * 4);
+    let xh1 = testkit::upload_filled(&ctx, 0xff, bank.k * 4);
+    let z0 = testkit::upload_filled(&ctx, 0xff, bank.n * 4);
+    let z1 = testkit::upload_filled(&ctx, 0xff, bank.n * 4);
+    let shared_out = testkit::upload_filled(&ctx, 0xff, bank.n * 4);
+    let mut first = bank.one_call(
+        0,
+        xh0.range(0, bank.k * 4).unwrap(),
+        z0.range(0, bank.n * 4).unwrap(),
+        &shared_out,
+        &flag,
+        &ids,
+    );
+    let second = bank.one_call(
+        1,
+        xh1.range(0, bank.k * 4).unwrap(),
+        z1.range(0, bank.n * 4).unwrap(),
+        &shared_out,
+        &flag,
+        &ids,
+    );
+    first.slot = 0;
+    let calls = [first, second];
+    for options in [OFF, TABLE] {
+        ctx.set_indexed_options(Some(options));
+        let refused = ctx.exl3_grouped_indexed(&stream, &calls, 1);
+        let error = refused.expect_err("the aliased outputs were taken");
+        assert!(
+            matches!(error, crate::EngError::BadRequest(_)),
+            "{options:?}: {error:?}"
+        );
+    }
+    ctx.set_indexed_options(None);
+}
+
+#[test]
+fn the_table_launch_mixes_shapes_in_one_kernel() {
+    if !testkit::device_present("EXL3 table mixed shapes") {
+        return;
+    }
+    let ctx = CudaContext::new().expect("context");
+    let stream = ctx.stream().expect("stream");
+    let mut rng = testkit::Rng::new(0x5347_0023);
+    let kind = (Codebook::Mul1, 6u8, 0usize);
+    // The layer's two projections in one batch: the gate/up shape and the down shape swap k and
+    // n (both multiples of 128, the launch geometry's unit; whole blocks retire at the
+    // per-record guards).
+    let banks = [
+        Bank::with_shape(&ctx, &mut rng, kind, (768, 512)),
+        Bank::with_shape(&ctx, &mut rng, kind, (512, 768)),
+    ];
+    let flag = testkit::upload_bytes(&ctx, &0u32.to_le_bytes());
+    // Reference round: the default launch walks pair `p`'s `xh` and `z` at byte `p * k * 4`
+    // (and `p * n * 4`) of one contiguous buffer per bank, so each bank packs them; outputs
+    // stay separate allocations. Mixed round: per-pair buffers, which the table launch takes
+    // scattered — the equality across the two shapes proves the mixed records all ran.
+    struct Packed {
+        xh: DeviceBuffer,
+        z: DeviceBuffer,
+        outs: Vec<DeviceBuffer>,
+    }
+    let reference: Vec<Packed> = banks
+        .iter()
+        .map(|bank| Packed {
+            xh: testkit::upload_filled(&ctx, 0xff, 2 * bank.k * 4),
+            z: testkit::upload_filled(&ctx, 0xff, 2 * bank.n * 4),
+            outs: (0..2)
+                .map(|_| testkit::upload_filled(&ctx, 0xff, bank.n * 4))
+                .collect(),
+        })
+        .collect();
+    let mixed: Vec<Vec<[DeviceBuffer; 3]>> = banks
+        .iter()
+        .map(|bank| {
+            (0..2)
+                .map(|_| {
+                    [
+                        testkit::upload_filled(&ctx, 0xff, bank.k * 4),
+                        testkit::upload_filled(&ctx, 0xff, bank.n * 4),
+                        testkit::upload_filled(&ctx, 0xff, bank.n * 4),
+                    ]
+                })
+                .collect()
+        })
+        .collect();
+    // Reference: each bank's two calls launched alone under the default launch.
+    ctx.set_indexed_options(Some(OFF));
+    let mut want = Vec::new();
+    for (bank, packed) in banks.iter().zip(&reference) {
+        let ids = testkit::upload_bytes(&ctx, &[3i32, 7].map(|id| id.to_le_bytes()).concat());
+        let calls: Vec<Exl3IndexedCall<'_>> = (0..2)
+            .map(|p| {
+                bank.one_call(
+                    p,
+                    packed.xh.range(p * bank.k * 4, bank.k * 4).unwrap(),
+                    packed.z.range(p * bank.n * 4, bank.n * 4).unwrap(),
+                    &packed.outs[p],
+                    &flag,
+                    &ids,
+                )
+            })
+            .collect();
+        ctx.exl3_grouped_indexed(&stream, &calls, 1)
+            .expect("default");
+    }
+    stream.synchronize().expect("sync");
+    for packed in &reference {
+        for out in &packed.outs {
+            want.push(testkit::read_bytes(&ctx, out, out.bytes()));
+        }
+    }
+    // Mixed: all four calls of both shapes in one table launch; each record's bytes equal the
+    // default launch of its own calls.
+    ctx.set_indexed_options(Some(TABLE));
+    let ids = testkit::upload_bytes(&ctx, &[3i32, 7].map(|id| id.to_le_bytes()).concat());
+    let mut calls = Vec::new();
+    for (bank, pairs) in banks.iter().zip(&mixed) {
+        for (p, [xh, z, out]) in pairs.iter().enumerate() {
+            calls.push(bank.one_call(
+                p,
+                xh.range(0, bank.k * 4).unwrap(),
+                z.range(0, bank.n * 4).unwrap(),
+                out,
+                &flag,
+                &ids,
+            ));
+        }
+    }
+    ctx.exl3_grouped_indexed(&stream, &calls, 1)
+        .expect("the mixed-shape table launch");
+    stream.synchronize().expect("sync");
+    let flat = mixed.iter().flatten();
+    for (row, want) in flat.zip(&want) {
+        assert_eq!(&testkit::read_bytes(&ctx, &row[2], row[2].bytes()), want);
+    }
+    assert_eq!(testkit::read_bytes(&ctx, &flag, 4), [0; 4]);
     ctx.set_indexed_options(None);
 }

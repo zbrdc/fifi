@@ -172,12 +172,15 @@ int inference_cuda_exl3_indexed_table(const IndexedTablePair *pairs, size_t pair
                                       uint32_t *flag, uint32_t fused_publish, void *stream,
                                       int *out_stage, unsigned options);
 /* The host-side packer for the table launch: fills `out` (an array of `pairs_count`
- * IndexedTablePair the caller owns) from the same call and index records the option launch
- * takes, validating per record with per-record spans and cross-record write isolation.
- * Shapes may differ per record; k and n are written into each record. */
+ * IndexedTablePair the caller owns, `out_bytes` long) from the same call and index records
+ * the option launch takes, validating per record with per-record spans and cross-record write
+ * isolation. A count whose records do not fit `out_bytes` is refused, so a stale size constant
+ * on one side cannot overwrite the other's buffer. Shapes may differ per record; k and n are
+ * written into each record. */
 int inference_cuda_exl3_indexed_table_pack(const inference_cuda_exl3_linear_args *calls,
                                            const inference_cuda_exl3_index_args *index,
-                                           size_t pairs_count, IndexedTablePair *out);
+                                           size_t pairs_count, size_t out_bytes,
+                                           IndexedTablePair *out);
 /* Test probe of the DP4A decode: per word, the byte sum and the DP4A result (2 * count words);
  * per state 0..65535, the book-2 decode and its DP4A form (2 * 65536 halves). */
 int inference_cuda_exl3_book2_probe(const uint32_t *words, size_t count, uint32_t *sums,
