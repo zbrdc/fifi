@@ -1060,26 +1060,6 @@ mod tests {
                         // the eager middle shared, so the cache buffers themselves must be
                         // byte equal, not just the length. Both covered forms compare here:
                         // F32 (the control) and Q8 (the form the serve A/B measured).
-                        let q8_bits =
-                            |kernels: &mut crate::kernels::MlxKernels,
-                             a: &super::super::attn::Q8Tensor,
-                             b: &super::super::attn::Q8Tensor| {
-                                assert_eq!(
-                                    bits(kernels, &a.codes),
-                                    bits(kernels, &b.codes),
-                                    "rows {rows} layer {l}: the key/value codes are byte equal"
-                                );
-                                assert_eq!(
-                                    bits(kernels, &a.scales),
-                                    bits(kernels, &b.scales),
-                                    "rows {rows} layer {l}: the codes' scales are byte equal"
-                                );
-                                assert_eq!(
-                                    bits(kernels, &a.biases),
-                                    bits(kernels, &b.biases),
-                                    "rows {rows} layer {l}: the codes' biases are byte equal"
-                                );
-                            };
                         match (a.buffers.as_ref(), b.buffers.as_ref()) {
                             (
                                 Some(KvBuffers::F32 { k: ak, v: av }),
@@ -1096,12 +1076,42 @@ mod tests {
                                     "rows {rows} layer {l}: the value cache is byte equal"
                                 );
                             }
+                            // The Q8 arm (the form the serve A/B measured): the codes,
+                            // scales, and biases of each side compare as raw bits.
                             (
                                 Some(KvBuffers::Q8 { k: ak, v: av }),
                                 Some(KvBuffers::Q8 { k: bk, v: bv }),
                             ) => {
-                                q8_bits(&mut decoder.kernels, ak, bk);
-                                q8_bits(&mut decoder.kernels, av, bv);
+                                assert_eq!(
+                                    bits(&mut decoder.kernels, &ak.codes),
+                                    bits(&mut decoder.kernels, &bk.codes),
+                                    "rows {rows} layer {l}: the key codes are byte equal"
+                                );
+                                assert_eq!(
+                                    bits(&mut decoder.kernels, &ak.scales),
+                                    bits(&mut decoder.kernels, &bk.scales),
+                                    "rows {rows} layer {l}: the key scales are byte equal"
+                                );
+                                assert_eq!(
+                                    bits(&mut decoder.kernels, &ak.biases),
+                                    bits(&mut decoder.kernels, &bk.biases),
+                                    "rows {rows} layer {l}: the key biases are byte equal"
+                                );
+                                assert_eq!(
+                                    bits(&mut decoder.kernels, &av.codes),
+                                    bits(&mut decoder.kernels, &bv.codes),
+                                    "rows {rows} layer {l}: the value codes are byte equal"
+                                );
+                                assert_eq!(
+                                    bits(&mut decoder.kernels, &av.scales),
+                                    bits(&mut decoder.kernels, &bv.scales),
+                                    "rows {rows} layer {l}: the value scales are byte equal"
+                                );
+                                assert_eq!(
+                                    bits(&mut decoder.kernels, &av.biases),
+                                    bits(&mut decoder.kernels, &bv.biases),
+                                    "rows {rows} layer {l}: the value biases are byte equal"
+                                );
                             }
                             (None, None) => {}
                             _ => panic!("rows {rows} layer {l}: cache form mismatch"),
