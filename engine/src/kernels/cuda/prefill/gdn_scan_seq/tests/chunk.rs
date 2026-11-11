@@ -594,8 +594,13 @@ mod mutants {
     use super::*;
     use crate::kernels::cuda::gdn_mutants::select;
 
-    /// The mutant `id` must make `body` panic.
+    /// The mutant `id` must make `body` panic. The bank is a device gate: without a
+    /// device the bodies skip silently, which would read as survival, so refuse up front.
     fn killed(id: u32, name: &str, body: fn()) {
+        assert!(
+            testkit::device_present("the chunk mutation bank"),
+            "the chunk mutation bank needs a device"
+        );
         let _selected = select(id);
         let outcome = std::panic::catch_unwind(body);
         assert!(
@@ -621,8 +626,8 @@ mod mutants {
     }
 
     #[test]
-    fn mutant_chunk_seen_term_unscaled_is_killed() {
-        killed(25, "seen term unscaled", || {
+    fn mutant_chunk_seen_term_dropped_is_killed() {
+        killed(25, "seen term dropped", || {
             gdn_scan_chunk_matches_the_f64_reference().unwrap()
         });
     }

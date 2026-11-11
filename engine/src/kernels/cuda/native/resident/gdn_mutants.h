@@ -18,7 +18,7 @@
  *   More kernel mutants: 19 conv loads one row past the tile (same bytes; only memcheck sees it)
  *          20 scan: second barrier of a tile removed (a race; racecheck and synccheck see it)
  *          21 conv: channel guard c > n instead of c >= n   23 scan: the bound-violation guard disabled
- *   chunk scan (gdn_scan_chunk_k): 24 G drops its decay ratios   25 M1's seen term unscaled by B_t
+ *   chunk scan (gdn_scan_chunk_k): 24 G drops its decay ratios   25 M1's seen term dropped
  *          26 the solve drops its last back term   27 M2 drops the intra term   28 the tail product
  *          off by one   29 the state update drops b_end   30 UB staged from the lo split only
  *          31 the state store unswizzled. */
