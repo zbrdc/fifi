@@ -218,7 +218,8 @@ fn the_chunked_prefill_driver_matches_the_oracle() {
     };
     let prompt = ids("prompt_ids");
     let expected = ids("generated");
-    let context: u32 = 512;
+    let context: u32 =
+        var("FIFI_FLASH_NEXT_DRIVER_CONTEXT").map_or(512, |v| v.parse().expect("context"));
     assert!(
         prompt.len() + steps < context as usize,
         "the context is too small"
@@ -352,6 +353,10 @@ fn the_first_real_tokens_match_the_oracle() {
     let mut records = Vec::new();
     let mut first_row: Vec<f32> = Vec::new();
     let mut step_samples = Vec::new();
+    // The decode-phase timer: from the first step's start to the last step's end, so an A/B
+    // on decode work is not read off process wall (load + prefill dominate that).
+    let decode_started = std::time::Instant::now();
+    let mut decode_ended = decode_started;
     for step in 0..steps {
         let before = driver.bank_misses();
         let began = std::time::Instant::now();
@@ -359,6 +364,7 @@ fn the_first_real_tokens_match_the_oracle() {
             .logits(input)
             .unwrap_or_else(|e| panic!("step {step}: {e:?}"));
         let wall = began.elapsed();
+        decode_ended = std::time::Instant::now();
         let visible = &row[..actual_vocab];
         let picking = std::time::Instant::now();
         let pick = argmax(visible);
@@ -382,6 +388,12 @@ fn the_first_real_tokens_match_the_oracle() {
         generated.push(pick as u32);
         input = pick as u32;
     }
+    let decode_phase = decode_ended.duration_since(decode_started);
+    println!(
+        "decode phase: {steps} steps in {:.2} s ({:.1} ms/token)",
+        decode_phase.as_secs_f64(),
+        decode_phase.as_secs_f64() * 1000.0 / steps as f64
+    );
     table("prompt tokens (no head)", &prompt_samples);
     table("generated tokens", &step_samples);
     println!("generated {generated:?}");
@@ -456,6 +468,10 @@ fn the_first_real_tokens_match_the_oracle() {
             "agree_prefix": agree,
             "bank_slots": placement.0,
             "resident_sha256": placement.1,
+            "decode_phase": {
+                "steps": steps,
+                "secs": decode_phase.as_secs_f64(),
+            },
         });
         std::fs::write(
             out.join("engine.json"),
