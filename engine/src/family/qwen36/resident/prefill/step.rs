@@ -41,6 +41,7 @@
 
 use super::super::attn::KvBuffers;
 use super::super::chunk_plan::{PREFILL_RETIRE_CAP, delta_retire_per_token, delta_subchunk};
+use super::delta::fused_prefill_enabled;
 use super::super::decoder::{ResidentDecoder, StepMode, StepResult};
 use super::super::executor::compiled_layer_on;
 use super::super::kv_plan::{depth_ranges, prefill_score_bound};
@@ -333,10 +334,17 @@ fn run(
             && !(mode == StepMode::Prompt && index == last)
             && decoder.routing == Routing::Device
             && compiled_layer_on()
-            // 1-row chunks (a window replay tail) stay eager: the closure needs T >= 2.
-            && rows >= 2
-            // The fused `gdn_prep` kernel inside the closure carries the production head
-            // layout (the same gate as the eager fused prefill); other dims stay eager.
+            // The closure serves only the verify-window regime: it needs T >= 2 (a 1-row
+            // replay tail stays eager), stays under the T where the eager chunk switches to
+            // the WY `flash_delta` kernel (different numerics by design, and faster), and
+            // inside the native body's 1024-row bound - a 2048-row prompt chunk must keep
+            // the eager path rather than fail the adapter.
+            && (2..16).contains(&rows)
+            // The closure bakes the fused `gdn_prep`/`gdn_post` kernels and the production
+            // head layout, so it routes only when the eager fused prefill is on too; the
+            // kill switches stay effective.
+            && fused_prefill_enabled()
+            // (the same dims gate as the eager fused prefill); other dims stay eager.
             && shape.delta.key_heads == 16
             && shape.delta.key_dim == 128
             && shape.delta.value_heads == 32
@@ -870,16 +878,21 @@ mod tests {
                 .collect()
         };
         let tokens: Vec<u32> = (11..75).collect();
-        // Reproduce the serve order that broke the first run: a `Prompt` prefill (its chunks
-        // trace the closure at their row count, here 8) BEFORE the smaller verify windows -
-        // if the MLX cache wrongly reuses the first trace at a new T, the broadcast error
-        // appears here instead of in a serve run.
+        // Serve-order coverage, corrected by review: with the flag ON below, this 64-row
+        // `Prompt` chunk stays EAGER by the (2..16) window gate (the eager WY path serves
+        // large chunks) - so a misrouted large chunk cannot poison the adapter silently.
+        // The windows then trace at 2, 3 and 8 in rising order, which is the cross-T cache
+        // reuse that broke the first serve run.
         {
+            // Flag ON for the prompt: the 64-row chunk stays eager by the (2..16) gate, so a
+            // silent misroute would surface here as a native failure instead of in serve.
+            COMPILED_LAYER_TEST.store(true, Ordering::Relaxed);
             let mut pre = decoder.zero_state().unwrap();
             ok(
                 decoder.prefill(&mut pre, &tokens[..64], StepMode::Prompt),
                 "prompt",
             );
+            COMPILED_LAYER_TEST.store(false, Ordering::Relaxed);
         }
         for rows in [2usize, 3, 8] {
             let toks = &tokens[..rows];

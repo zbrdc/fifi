@@ -4103,10 +4103,13 @@ extern "C" int inference_mlx_compile_moe_block(
 // per layer; this closure replaces the whole layer with ONE native entry, so a window of
 // T rows costs ~40 entries plus the outer glue instead of ~1,100 per row.
 //
-// The op sequence replays `prefill/delta.rs` `chunk` (fused branch, production dims) and the
-// batched rows of `moe.rs` `chunk_device` through the same inference_mlx_* shims the eager
-// path calls, in the same order, so a compiled run and an eager run trace identical MLX
-// graphs. T (the row count of `h`) is an INPUT SHAPE, not a baked constant: the nonshapeless
+// The op sequence replays `prefill/delta.rs` `chunk` (fused branch, production dims) and
+// the DECODE ROWS body of `compile_moe_rows` (token-major gathers, no pair sort, no
+// `moe_combine` tail - the eager `chunk_device` differs there) through the same
+// inference_mlx_* shims. The recurrence half matches the eager path in the sub-16 regime
+// the wiring routes (both use the recurrent `gated_delta` kernel; the eager WY
+// `flash_delta` kernel takes over at T >= 16 and reassociates the math). T (the row count
+// of `h`) is an INPUT SHAPE, not a baked constant: the nonshapeless
 // MLX cache specializes it under the one fun_id, exactly like the B axis of the decode
 // blocks. The row-index operands of the two gathered products arrive as closure inputs
 // (indexes 44/45) because their shapes depend on T, which the payload must not bake.
@@ -4147,11 +4150,8 @@ static void compile_delta_layer_payload_free(void* raw) noexcept {
   }
 }
 
-static std::atomic<uint64_t> compile_delta_layer_body_entries_{0};
-
 static int compile_delta_layer_body(
     mlx_vector_array* res, const mlx_vector_array input, void* raw) noexcept {
-  compile_delta_layer_body_entries_.fetch_add(1, std::memory_order_relaxed);
   const CompileDeltaLayerPayload* p = static_cast<const CompileDeltaLayerPayload*>(raw);
   compile_touching("delta layer closure input vector");
   if (p == nullptr || res == nullptr || mlx_vector_array_size(input) != 46) {
