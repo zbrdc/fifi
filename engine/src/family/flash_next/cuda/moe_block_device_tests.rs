@@ -40,7 +40,7 @@ use crate::{
             load::{exl3_pack::inspect_flash_pack, model_shape, pack_files::FlashPackFiles},
             moe::exl3_cuda_tests::{
                 OUTPUT_BOUND, Reference, Router, floats, input, keys, reference, relative_l2,
-                upload,
+                relative_l2_f64, upload,
             },
         },
         gguf_model::Role,
@@ -61,15 +61,19 @@ const F32: usize = 4;
 const SLOTS: usize = 16;
 /// The two groupings of the sums differ only by association: a handful of float roundings.
 const SPLIT_BOUND: f64 = 1e-6;
-/// The ring branch computes every projection through the job-table tile kernels, which stage
-/// the F32 activation as F16 operands (documented operand error 2^-11, `exl3.cu`'s
-/// midrows_projection; the hi/lo opt-in cuts it to ~2^-22), while the all-resident and fp64
-/// references run the F32-operand flat launches. Measured 1.5e-4 to 2.1e-4 relative L2,
-/// identical whether every pick sits in the bank, in the ring, or split over both (the
-/// sources and their order change nothing; FIFI_FLASH_NEXT_RING_HELD arms those variants),
-/// and identical with the fused pair launch on and off. The bound keeps ~2x headroom over
-/// the measured spread; the resident comparison cannot tighten to SPLIT_BOUND because the
-/// difference is the launch family, not the sources.
+/// The ring branch's per-row output deviates from the all-resident block and from fp64 by
+/// 1.5e-4 to 2.9e-4 relative L2, measured on this pack at rows=49; the deviation is
+/// identical with the fused pair launch on and off and with all, none or some of row 0's
+/// picks held in the bank (FIFI_FLASH_NEXT_RING_HELD arms those variants; the knob moves
+/// row 0 only — the fixture's other rows keep the default split), so sum order and that
+/// source split are excluded. The cause is measured by the per-projection device test
+/// ([`each_projection_through_the_jobs_family_and_the_indexed_family_on_one_row`]): the
+/// job-table tile kernels stage the activations as F16 operands (`exl3.cu`'s
+/// jobs_input_rotate and JobsTile) while the flat indexed launches read F32, giving
+/// 1.9-3.9e-4 per projection against fp64 where the indexed family sits at 1.5-3.0e-7 —
+/// the block deviation is that launch-family arithmetic, not a defect of the ring branch.
+/// The bound covers the block-level combine (1.4x headroom over the 2.9e-4 maximum); the
+/// per-projection numbers are bounded separately at PROJECTION_BOUND.
 const RING_BOUND: f64 = 4e-4;
 
 fn pack_dir() -> PathBuf {
@@ -531,14 +535,42 @@ impl RigRows {
             .expect("read the outputs");
         bytes[r * self.hidden..][..self.hidden].to_vec()
     }
+
+    /// `expert_gu`, `expert_down` (whole chunk) and the routed ids, read back.
+    fn expert_bytes(&self, projector: &CudaProjector) -> (Vec<u8>, Vec<u8>, Vec<u8>) {
+        let stream = projector.context().stream().expect("stream");
+        let read = |i: usize| {
+            let mut bytes = vec![0u8; self.owned[i].bytes()];
+            self.owned[i]
+                .read_at(&stream, 0, &mut bytes)
+                .expect("read the expert buffers");
+            bytes
+        };
+        (read(8), read(10), read(4))
+    }
+
+    /// The scratch staging the two launch families hand their kernels: `xh` (the rotated
+    /// input rows) and `z` (the down windows), read back for a byte comparison between arms.
+    fn scratch_bytes(&self, projector: &CudaProjector) -> (Vec<u8>, Vec<u8>) {
+        let stream = projector.context().stream().expect("stream");
+        let read = |i: usize| {
+            let mut bytes = vec![0u8; self.owned[i].bytes()];
+            self.owned[i]
+                .read_at(&stream, 0, &mut bytes)
+                .expect("read the scratch buffers");
+            bytes
+        };
+        (read(14), read(15))
+    }
 }
 
 /// `run_rows` with the prefill ring funded: every pick reads its bank slot or its ring slot,
 /// the bank's miss counter stays flat (the ring path never steps or admits the bank), and
 /// every row matches the all-resident block and fp64 within RING_BOUND run after run (the
 /// ring re-arms per chunk like the driver cadence). RING_BOUND, not SPLIT_BOUND, because the
-/// ring branch's job-table tile kernels carry the F16 operand staging the flat-launch
-/// references do not — see the bound's doc for the measurements that isolated it.
+/// ring branch's job-table tile launches are not the flat indexed launches of the reference
+/// — see RING_BOUND's doc and the per-projection device test that separates the two
+/// families' arithmetic.
 #[test]
 #[ignore = "needs a GPU (about 3 GiB of ring and bank, about 2 GiB of pinned host memory per bank and FIFI_FLASH_NEXT_EXL3_PACK"]
 fn a_chunk_over_the_prefill_ring_matches_the_all_resident_block() {
@@ -628,9 +660,10 @@ fn a_chunk_over_the_prefill_ring_matches_the_all_resident_block() {
         });
     }
 
-    // The bank holds the first `held_of` of row 0's picks per layer, padded with other experts:
-    // the default 6 leaves row 0 mixed; the ring-tolerance measurements hold every pick
-    // (FIFI_FLASH_NEXT_RING_HELD=10, the all-bank arm) or none (0, the all-ring arm).
+    // The bank holds the first `held_of` of row 0's picks per layer, padded with other
+    // experts: the default 6 leaves row 0 mixed; the ring-tolerance measurements hold every
+    // pick of row 0 (FIFI_FLASH_NEXT_RING_HELD=10, the all-bank arm) or none (0, the
+    // all-ring arm). Rows 1.. keep the default split in every arm.
     let held_of: usize = std::env::var("FIFI_FLASH_NEXT_RING_HELD")
         .map_or(6, |v| v.parse().expect("a held-pick count"));
     let held: Vec<Vec<u16>> = arms
@@ -706,6 +739,181 @@ fn a_chunk_over_the_prefill_ring_matches_the_all_resident_block() {
                 );
             }
         }
+    }
+}
+
+/// The per-projection bound of the job-table launch family against fp64: the F16 activation
+/// operand class, 2^-11 = 4.88e-4, measured 1.9e-4 to 2.2e-4 (gate/up) and 2.9e-4 to 3.9e-4
+/// (down) on this pack.
+const PROJECTION_BOUND: f64 = 5e-4;
+
+/// The launch families the ring tolerance splits between, on one row and one expert each:
+/// the flat all-resident block runs the indexed launches (F32 operands), the funded ring runs
+/// the job-table tile kernels (F16-staged activations, `exl3.cu`'s jobs_input_rotate and
+/// JobsTile), and every projection of the same routed expert is compared across the two
+/// families and against fp64. Measured: indexed 1.5-3.0e-7 vs fp64, jobs 1.9-2.2e-4 (gate/up)
+/// and 2.9-3.9e-4 (down), and jobs-vs-indexed equals jobs-vs-fp64 because the indexed family
+/// sits at 1e-7 — the ring branch's whole block deviation is the job-table family's F16
+/// operand arithmetic, not a defect of the ring branch (the Qwen3.6 prefill test's 7.3e-6
+/// runs the indexed family, a different launch family, so the two numbers do not conflict).
+/// The staging byte comparison reports that the two arms' `xh`/`z` scratch differ — those
+/// buffers hold the families' own pair orders, so the bytes are an observation about
+/// staging, not a dtype probe; the per-projection numbers above are the discriminator.
+#[test]
+#[ignore = "needs a GPU (about 3 GiB of ring and bank, about 2 GiB of pinned host memory per bank and FIFI_FLASH_NEXT_EXL3_PACK"]
+fn each_projection_through_the_jobs_family_and_the_indexed_family_on_one_row() {
+    assert!(
+        device_present("Flash-Next split MoE block"),
+        "a GPU is required"
+    );
+    let first = moe_layer();
+    let layers = vec![first];
+    let files = FlashPackFiles::open(&pack_dir()).expect("open the pack");
+    let checkpoint = &files.checkpoint;
+    inspect_flash_pack(&checkpoint.source, &checkpoint.model_config)
+        .expect("the pack matches its config");
+    let (model, _) = model_shape(&checkpoint.model_config).expect("the model shape");
+    let shape = model.moe;
+    let one_row = MoeDims {
+        rows: 1,
+        hidden: model.hyper.hidden(),
+        n_expert: shape.experts(),
+        top_k: shape.top_k(),
+        inter: shape.inter(),
+        shared_inter: shape.shared_inter(),
+    };
+    // The split block takes 2 to 64 rows: the row is run twice, identically, and row 0 is
+    // compared (its row 1 twin is the same input, checked equal to it).
+    let two_rows = MoeDims { rows: 2, ..one_row };
+    let projector = CudaProjector::new().expect("projector");
+    let ctx = projector.context();
+    let stream = ctx.stream().expect("stream");
+    let launch = Launch {
+        ctx,
+        stream: &stream,
+    };
+    let source = PackRecordSource::new(checkpoint).expect("the record source");
+    let layout = source.layout().clone();
+
+    // The flat arm: the all-resident block, one row, indexed launches for every pick.
+    let router = Router::read(checkpoint, first, &one_row).expect("router");
+    let weights = upload(&projector, checkpoint, (first, &router), &one_row).expect("upload");
+    let keys = keys(first);
+    let row = input(one_row.hidden, 9);
+    let want = reference(checkpoint, (first, &router), &one_row, &row).expect("fp64 reference");
+    let block = Exl3MoeWeights::resolve_by(&weights, first, &one_row, |role| {
+        keys.iter()
+            .find(|(candidate, _)| *candidate == role)
+            .map(|(_, key)| key.as_str())
+            .ok_or_else(|| EngError::BadRequest(format!("no key for {role:?}")))
+    })
+    .expect("the all-resident block resolves");
+    let flat_rig = RigRows::new(&projector, &two_rows, &[row.clone(), row.clone()]).expect("rig");
+    // The flat qwen36 block is per-row: one call computes row 0's picks and fills the gu/down
+    // slots at offset 0 (`norm_row` is that row's h bytes).
+    run_exl3_moe(
+        &launch,
+        &block,
+        &flat_rig.bufs().expect("bufs"),
+        &one_row,
+        true,
+        None,
+        false,
+    )
+    .expect("the all-resident block");
+    launch.stream.synchronize().expect("sync");
+    let (flat_gu, flat_down, flat_ids) = flat_rig.expert_bytes(&projector);
+    let (flat_xh, flat_z) = flat_rig.scratch_bytes(&projector);
+
+    // The jobs arm: a bank with none of the row's picks resident, the ring funded, the same
+    // row through the job-table tile kernels.
+    let held = others(&want.ids, SLOTS);
+    let bank = build_bank(&projector, &source, &layers, &[held]);
+    let trunk = {
+        let key = |role: Role| {
+            keys.iter()
+                .find(|(candidate, _)| *candidate == role)
+                .map(|(_, key)| key.as_str())
+                .unwrap_or_else(|| panic!("no key for {role:?}"))
+        };
+        SplitMoeTrunk {
+            router: raw(&weights, key(Role::FfnGateInp)),
+            router_shared: raw(&weights, key(Role::FfnGateInpShexp)),
+            shared_gate: exl3(&weights, key(Role::FfnGateShexp)),
+            shared_up: exl3(&weights, key(Role::FfnUpShexp)),
+            shared_down: exl3(&weights, key(Role::FfnDownShexp)),
+        }
+    };
+    let mut split = SplitMoe::new(ctx, vec![trunk], bank, &layout, &two_rows).expect("split");
+    let streamed = shape.experts() - SLOTS;
+    let slots = split.plan_ring(ctx, streamed).expect("fund the ring");
+    assert!(slots >= streamed, "the ring holds one full streamed layer");
+    split.begin_prefill();
+    split.begin_chunk();
+    let jobs_rig = RigRows::new(&projector, &two_rows, &[row.clone(), row]).expect("rig");
+    split
+        .run_rows(&launch, 0, &jobs_rig.bufs().expect("bufs"), &two_rows)
+        .expect("the ring block");
+    stream.synchronize().expect("sync");
+    let (jobs_gu, jobs_down, jobs_ids) = jobs_rig.expert_bytes(&projector);
+    let (jobs_xh, jobs_z) = jobs_rig.scratch_bytes(&projector);
+
+    // The flat block writes the routed ids of row 0 only; both arms route the same logits
+    // through the same route kernel, so row 0's picks must agree.
+    let (k, i, h) = (one_row.top_k, one_row.inter, one_row.hidden);
+    assert_eq!(
+        &flat_ids[..k * 4],
+        &jobs_ids[..k * 4],
+        "both arms route to the same picks"
+    );
+    for (name, flat, jobs) in [("xh", &flat_xh, &jobs_xh), ("z", &flat_z, &jobs_z)] {
+        let first = flat.iter().zip(jobs).position(|(a, b)| a != b);
+        println!(
+            "staging {name}: bytes equal {}, first differing byte {:?}",
+            first.is_none(),
+            first
+        );
+        if let Some(at) = first {
+            let word = |bytes: &[u8], at: usize| {
+                f32::from_le_bytes(bytes[at..][..4].try_into().expect("a word"))
+            };
+            let (a, b) = (word(flat, at), word(jobs, at));
+            println!("staging {name} first differing element: flat {a:e}, jobs {b:e}");
+        }
+    }
+    let (flat_gu, flat_down) = (floats_f64(&flat_gu), floats_f64(&flat_down));
+    let (jobs_gu, jobs_down) = (floats_f64(&jobs_gu), floats_f64(&jobs_down));
+    // The jobs segment's pair order follows the ring's slot order, not the routing order, so
+    // each fp64 pick is matched by scanning the segment: its own projection sits within
+    // RING_BOUND while every other expert's is orders off — no ambiguity at these gaps.
+    // Both rows are the same input, so either twin row is the pick's projection.
+    let scan = |rows: &[f64], want: &[f64]| -> (usize, f64) {
+        rows.chunks(want.len())
+            .map(|got| relative_l2_f64(got, want))
+            .enumerate()
+            .min_by(|a, b| a.1.total_cmp(&b.1))
+            .expect("at least one row")
+    };
+    for p in 0..k {
+        let fg = &flat_gu[p * 2 * i..][..2 * i];
+        let wg = &want.gu[p * 2 * i..][..2 * i];
+        let fd = &flat_down[p * h..][..h];
+        let wd = &want.down[p * h..][..h];
+        let (gu_row, gu_error) = scan(&jobs_gu, wg);
+        let (down_row, down_error) = scan(&jobs_down, wd);
+        println!(
+            "pick {p} gate/up: indexed vs fp64 {:.3e}, jobs vs fp64 {:.3e} (segment row {gu_row}), jobs vs indexed {:.3e}; down: indexed vs fp64 {:.3e}, jobs vs fp64 {:.3e} (segment row {down_row}), jobs vs indexed {:.3e}",
+            relative_l2_f64(fg, wg),
+            gu_error,
+            scan(&jobs_gu, fg).1,
+            relative_l2_f64(fd, wd),
+            down_error,
+            scan(&jobs_down, fd).1,
+        );
+        assert!(
+            gu_error < PROJECTION_BOUND && down_error < PROJECTION_BOUND,
+            "pick {p}: the jobs family vs fp64"
+        );
     }
 }
 

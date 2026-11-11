@@ -216,9 +216,9 @@ pub(in crate::family::flash_next) struct Reference {
     /// The probability gap between the last pick and the best expert left out.
     margin: f64,
     /// `[top_k][gate | up]` in pick order, the layout of the block's `expert_gu`.
-    gu: Vec<f64>,
+    pub(in crate::family::flash_next) gu: Vec<f64>,
     /// `[top_k][hidden]`: each pick's down projection, unweighted, in pick order.
-    down: Vec<f64>,
+    pub(in crate::family::flash_next) down: Vec<f64>,
     pub(in crate::family::flash_next) out: Vec<f64>,
 }
 
@@ -399,6 +399,16 @@ pub(in crate::family::flash_next) fn relative_l2(actual: &[f32], expected: &[f64
     let (mut error, mut norm) = (0.0f64, 0.0f64);
     for (a, e) in actual.iter().zip(expected) {
         error += (f64::from(*a) - e).powi(2);
+        norm += e * e;
+    }
+    (error / norm).sqrt()
+}
+
+/// [`relative_l2`] with both sides already in f64 (device families against each other).
+pub(in crate::family::flash_next) fn relative_l2_f64(actual: &[f64], expected: &[f64]) -> f64 {
+    let (mut error, mut norm) = (0.0f64, 0.0f64);
+    for (a, e) in actual.iter().zip(expected) {
+        error += (a - e).powi(2);
         norm += e * e;
     }
     (error / norm).sqrt()
