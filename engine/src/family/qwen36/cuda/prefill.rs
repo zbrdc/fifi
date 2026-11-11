@@ -7,8 +7,10 @@
 //! owns the protocol around [`run_chunk_body`]. This module holds the slot views, the checked chunk
 //! rows, the pure call-shape builders, the stage lists, the constructor checks and the stage
 //! functions themselves. No function here allocates device memory, reads a device word or records
-//! an event. KV8 attention tiles update one device word with `write_at`, which waits for the owning
-//! stream. The body also calls [`super::state::ResidentState::check_chunk`].
+//! an event, with one exception: the serve-phase hook of [`phase_timing::serve`], which records
+//! timing events only when `FIFI_Q36_SERVE_PHASE` arms it. KV8 attention tiles update one device
+//! word with `write_at`, which waits for the owning stream. The body also calls
+//! [`super::state::ResidentState::check_chunk`].
 
 use super::{
     dims::{KvMode, StepDims},
@@ -2601,6 +2603,7 @@ pub(super) fn run_chunk_layer(
             }
         }
         exl3::split::mark_stage(launch.stream, stage);
+        phase_timing::serve::note_stage(launch.stream, stage, slot.kind)?;
     }
     Ok(())
 }
@@ -2629,7 +2632,10 @@ pub(super) fn run_chunk_body(launch: &Launch<'_>, run: &ChunkRun<'_, '_>) -> Res
         exl3::clear_flag(launch, run)?;
         exl3::write_dense_jobs(launch, &run.exl3_scratch()?, run.rows.m())?;
     }
+    phase_timing::serve::begin(launch.ctx, run.rows.p0(), run.rows.m(), run.model.layers)?;
+    phase_timing::serve::note(launch.stream, "start")?;
     chunk_embed(launch, run, status)?;
+    phase_timing::serve::note(launch.stream, "embed")?;
     // One prefill-piece index for every layer of the piece (resident_trace's counter).
     let trace_piece = crate::family::qwen36::trace::begin_prefill();
     for layer in 0..run.model.layers {
@@ -2641,10 +2647,12 @@ pub(super) fn run_chunk_body(launch: &Launch<'_>, run: &ChunkRun<'_, '_>) -> Res
     Ok(())
 }
 
-/// Test-only phase attribution of one chunk body: [`run_chunk_body`] with a timing event
-/// after every stage of every layer. Mirrors the production body arm-for-arm; the
-/// production loop is the source of truth — keep the two in sync when a stage changes.
-#[cfg(test)]
+/// Phase attribution of one chunk body: [`run_chunk_body`] with a timing event after
+/// every stage of every layer. The timed body mirrors the production body arm-for-arm;
+/// the production loop is the source of truth — keep the two in sync when a stage changes.
+///
+/// The module itself is compiled unconditionally: the production loop's `FIFI_Q36_SERVE_PHASE`
+/// hook (see [`serve`]) reuses `PhaseMarks` for serve-side attribution.
 pub(super) mod phase_timing {
     use super::*;
     use crate::kernels::cuda::{CudaContext, DeviceStream, TimingEvent};
@@ -2688,7 +2696,7 @@ pub(super) mod phase_timing {
         }
     }
 
-    fn stage_name(stage: Stage) -> &'static str {
+    pub(super) fn stage_name(stage: Stage) -> &'static str {
         match stage {
             Stage::NormA => "norma",
             Stage::QuantA => "quanta",
@@ -2910,8 +2918,362 @@ pub(super) mod phase_timing {
         marks.mark(launch.stream, "end")?;
         Ok(())
     }
-}
 
+    /// The serve-side attribution hook: `FIFI_Q36_SERVE_PHASE`, read once per process.
+    /// Armed, the production chunk loop records one event per stage (single-threaded per
+    /// engine, so a thread-local cell owns the marks) and every chunk prints its share
+    /// line after the status read that completes the stream. The switch follows the
+    /// strict rule of `FIFI_EXL3_SINGLE_GATHER`: unset and `0` stay off, `1` arms, any
+    /// other value (empty and non-UTF-8 included) fails the first chunk that would carry
+    /// marks with `BadRequest`, and the memoised refusal fails every later chunked
+    /// request until restart. Instrumentation failures of the armed path — event pool,
+    /// record, readback — close the backend's process-wide terminal latch: the chunk's
+    /// next device operation fails and the engine refuses all work until restart. The
+    /// marks are dropped and the failure noted on stderr, but the process does not
+    /// recover.
+    pub(in crate::family::qwen36::cuda) mod serve {
+        use super::*;
+        use std::cell::RefCell;
+        use std::ffi::OsStr;
+        use std::sync::OnceLock;
+
+        /// The switch rule of `doc/reference/environment.md`: unset and `0` stay off,
+        /// `1` arms, any other value is refused.
+        pub(crate) fn armed_from(raw: Option<&OsStr>) -> Option<bool> {
+            match raw {
+                None => Some(false),
+                Some(text) if text == OsStr::new("0") => Some(false),
+                Some(text) if text == OsStr::new("1") => Some(true),
+                Some(_) => None,
+            }
+        }
+
+        fn armed() -> Result<bool, EngError> {
+            static ARM: OnceLock<Option<bool>> = OnceLock::new();
+            let memoized = ARM.get_or_init(|| {
+                let raw = std::env::var_os("FIFI_Q36_SERVE_PHASE");
+                match armed_from(raw.as_deref()) {
+                    Some(on) => Some(on),
+                    None => {
+                        eprintln!("FIFI_Q36_SERVE_PHASE must be unset, \"0\" or \"1\"");
+                        None
+                    }
+                }
+            });
+            (*memoized).ok_or_else(|| {
+                EngError::BadRequest(
+                    "FIFI_Q36_SERVE_PHASE must be unset, \"0\" or \"1\"; unset it and restart"
+                        .into(),
+                )
+            })
+        }
+
+        thread_local! {
+            /// The marks of the chunk in flight: `None` between chunks.
+            static MARKS: RefCell<Option<(String, PhaseMarks)>> = const { RefCell::new(None) };
+        }
+
+        /// The ring capacity of one chunk: the production `layer_stages` tops at 10
+        /// stages per layer; 20 per layer leaves slack for a split stage without a
+        /// panic-prone exact count (the rig's sub-marked MoE layer tops at 16).
+        fn capacity(layers: usize) -> usize {
+            2 + layers.saturating_mul(20)
+        }
+
+        /// The share-line class of a stage recorded on a layer of `kind`: attention-
+        /// layer stages count as attention, delta-net stages as gdn, and the trailing
+        /// MoE stages (normf, route, moe) as moe on both kinds. Derived from the
+        /// recorded tag so there is one mapping; every_recorded_tag_is_pinned_by_table
+        /// pins each literal tag and its class for every stage of both kinds.
+        pub(crate) fn stage_class(stage: Stage, kind: AttentionKind) -> &'static str {
+            tag_class(stage_tag(stage, kind))
+        }
+
+        /// The recorded tag of one (stage, kind): `class:stage`, so the tag alone
+        /// carries the class the share line splits on. Literals, because the marks
+        /// store `&'static str` tags.
+        pub(crate) fn stage_tag(stage: Stage, kind: AttentionKind) -> &'static str {
+            match (stage, kind) {
+                (Stage::NormA, AttentionKind::Full) => "attn:norma",
+                (Stage::QuantA, AttentionKind::Full) => "attn:quanta",
+                (Stage::NormA, _) => "gdn:norma",
+                (Stage::QuantA, _) => "gdn:quanta",
+                (Stage::AttnProj, _) => "attn:attnproj",
+                (Stage::Prep, _) => "attn:prep",
+                (Stage::Flash, _) => "attn:flash",
+                (Stage::QuantAOut, _) => "attn:quantaout",
+                (Stage::AttnOut, _) => "attn:attnout",
+                (Stage::DeltaProj, _) => "gdn:deltaproj",
+                (Stage::Conv, _) => "gdn:conv",
+                (Stage::Scan, _) => "gdn:scan",
+                (Stage::QuantDOut, _) => "gdn:quantdout",
+                (Stage::SsmOut, _) => "gdn:ssmout",
+                (Stage::NormF, _) => "moe:normf",
+                (Stage::Route, _) => "moe:route",
+                (Stage::Moe, _) => "moe:moe",
+            }
+        }
+
+        /// Records one stage boundary of the chunk in flight, class-prefixed by the
+        /// layer kind. No-op unless armed.
+        pub(crate) fn note_stage(
+            stream: &DeviceStream,
+            stage: Stage,
+            kind: AttentionKind,
+        ) -> Result<(), EngError> {
+            note(stream, stage_tag(stage, kind))
+        }
+
+        /// Sums one span list per stage tag, largest first. Pure, so the share line's
+        /// aggregation is testable on any host.
+        pub(crate) fn aggregate(spans: &[(&'static str, f32)]) -> Vec<(&'static str, f32)> {
+            let mut stages: Vec<(&'static str, f32)> = Vec::new();
+            for &(tag, ms) in spans {
+                match stages.iter_mut().find(|(known, _)| *known == tag) {
+                    Some(slot) => slot.1 += ms,
+                    None => stages.push((tag, ms)),
+                }
+            }
+            stages.sort_by(|a, b| b.1.total_cmp(&a.1));
+            stages
+        }
+
+        /// The class a recorded tag splits on: the `class:` prefix of a layer-stage
+        /// tag, or the fixed class of a bare chunk-boundary tag (`embed` for the
+        /// embedding span, `moe` for the zero-length open/end marks).
+        pub(crate) fn tag_class(tag: &str) -> &'static str {
+            match tag.split_once(':') {
+                Some((class, _)) => match class {
+                    "attn" => "attn",
+                    "gdn" => "gdn",
+                    "moe" => "moe",
+                    _ => "embed",
+                },
+                None => match tag {
+                    "embed" => "embed",
+                    _ => "moe",
+                },
+            }
+        }
+
+        /// The share line of one chunk's spans: per-class and top-stage sums, each as a
+        /// percentage of the whole span time. Pure; a zero whole prints 0%, never NaN.
+        pub(crate) fn share_line(spans: &[(&'static str, f32)]) -> String {
+            let whole: f32 = spans.iter().map(|(_, ms)| ms).sum();
+            let pct = |ms: f32| if whole > 0.0 { 100.0 * ms / whole } else { 0.0 };
+            let stages = aggregate(spans);
+            let mut line = format!(" whole={whole:.2}ms |");
+            for class in ["gdn", "attn", "moe", "embed"] {
+                let ms: f32 = stages
+                    .iter()
+                    .filter(|(tag, _)| tag_class(tag) == class)
+                    .map(|(_, v)| v)
+                    .sum();
+                line.push_str(&format!(" {class}={ms:.2}ms({:.0}%)", pct(ms)));
+            }
+            for (tag, ms) in stages.iter().take(6) {
+                line.push_str(&format!(" {tag}={ms:.2}ms({:.0}%)", pct(*ms)));
+            }
+            line
+        }
+
+        /// Begins the marks of one chunk. No-op unless armed.
+        pub(crate) fn begin(
+            ctx: &CudaContext,
+            p0: usize,
+            m: usize,
+            layers: usize,
+        ) -> Result<(), EngError> {
+            if !armed()? {
+                return Ok(());
+            }
+            let marks = PhaseMarks::new(ctx, capacity(layers));
+            MARKS.with_borrow_mut(|cell| match (marks, cell.take()) {
+                (Ok(marks), _) => *cell = Some((format!("p0 {p0} m {m}"), marks)),
+                // An event-pool failure disarms this chunk (any earlier marks are
+                // dropped) — but the failed create has already closed the backend's
+                // terminal latch, so the chunk's next device operation fails and the
+                // engine refuses work until restart.
+                (Err(err), _) => eprintln!("phase-serve marks not started: {err:?}"),
+            });
+            Ok(())
+        }
+
+        /// Records one stage boundary of the chunk in flight. No-op unless armed.
+        pub(crate) fn note(stream: &DeviceStream, tag: &'static str) -> Result<(), EngError> {
+            if !armed()? {
+                return Ok(());
+            }
+            let recorded = MARKS.with_borrow_mut(|cell| match cell {
+                Some((_, marks)) => marks.mark(stream, tag),
+                None => Ok(()),
+            });
+            match recorded {
+                Ok(()) => Ok(()),
+                // A failed record poisons this chunk's marks: drop them and stay
+                // quiet rather than fail the request over a diagnostic.
+                Err(err) => {
+                    MARKS.with_borrow_mut(Option::take);
+                    eprintln!("phase-serve mark lost, chunk unattributed: {err:?}");
+                    Ok(())
+                }
+            }
+        }
+
+        /// Drops the marks of the chunk in flight without printing: the chunk failed.
+        pub(crate) fn discard() {
+            MARKS.with_borrow_mut(Option::take);
+        }
+
+        /// Ends the chunk: prints the share line, legal only after the caller's status
+        /// read completed the stream. Per-class and per-stage sums over every span of
+        /// the chunk, each as a share of the whole. No-op unless armed.
+        pub(crate) fn end() -> Result<(), EngError> {
+            if !armed()? {
+                return Ok(());
+            }
+            if let Some((what, marks)) = MARKS.with_borrow_mut(Option::take) {
+                match marks.shares() {
+                    Ok(spans) => {
+                        eprintln!("phase-serve {what}{}", share_line(&spans));
+                    }
+                    Err(err) => {
+                        eprintln!("phase-serve shares unreadable: {err:?}");
+                    }
+                }
+            }
+            Ok(())
+        }
+    }
+
+    /// Host tests of the serve-phase hook's pure parts: the strict switch rule and the
+    /// share-line aggregation.
+    #[cfg(test)]
+    mod serve_tests {
+        use super::super::{AttentionKind, Stage};
+        use super::serve::{aggregate, armed_from, share_line, stage_class, stage_tag, tag_class};
+        use super::stage_name;
+        use std::ffi::OsStr;
+
+        #[test]
+        fn switch_rule_is_unset_zero_one_nothing_else() {
+            assert_eq!(armed_from(None), Some(false));
+            assert_eq!(armed_from(Some(OsStr::new("0"))), Some(false));
+            assert_eq!(armed_from(Some(OsStr::new("1"))), Some(true));
+            for refused in ["", "on", "true", "2", " "] {
+                assert_eq!(armed_from(Some(OsStr::new(refused))), None, "{refused:?}");
+            }
+        }
+
+        #[cfg(unix)]
+        #[test]
+        fn non_utf8_value_is_refused() {
+            use std::os::unix::ffi::OsStrExt;
+            assert_eq!(armed_from(Some(OsStr::from_bytes(&[0xFF]))), None);
+        }
+
+        #[test]
+        fn aggregate_sums_by_tag_largest_first() {
+            let spans = [
+                ("flash", 10.0),
+                ("moe", 2.0),
+                ("flash", 30.0),
+                ("embed", 1.0),
+            ];
+            assert_eq!(
+                aggregate(&spans),
+                vec![("flash", 40.0), ("moe", 2.0), ("embed", 1.0)]
+            );
+        }
+
+        #[test]
+        fn every_stage_of_every_layer_kind_carries_its_class() {
+            let stages = [
+                Stage::NormA,
+                Stage::QuantA,
+                Stage::DeltaProj,
+                Stage::Conv,
+                Stage::Scan,
+                Stage::QuantDOut,
+                Stage::SsmOut,
+                Stage::AttnProj,
+                Stage::Prep,
+                Stage::Flash,
+                Stage::QuantAOut,
+                Stage::AttnOut,
+                Stage::NormF,
+                Stage::Route,
+                Stage::Moe,
+            ];
+            for kind in [AttentionKind::Full, AttentionKind::DeltaNet] {
+                for &stage in &stages {
+                    let class = stage_class(stage, kind);
+                    let tag = format!("{class}:{}", stage_name(stage));
+                    assert_eq!(tag_class(&tag), class, "{tag}");
+                }
+            }
+        }
+
+        #[test]
+        fn every_recorded_tag_is_pinned_by_table() {
+            // The expected literal for every stage of both layer kinds: a wrong
+            // class prefix or stage spelling in the stage_tag match fails here.
+            // (NormA and QuantA are the only kind-dependent arms; the trailing
+            // norm/route/moe stages are moe on both kinds.)
+            let full = [
+                (Stage::NormA, "attn:norma"),
+                (Stage::QuantA, "attn:quanta"),
+                (Stage::AttnProj, "attn:attnproj"),
+                (Stage::Prep, "attn:prep"),
+                (Stage::Flash, "attn:flash"),
+                (Stage::QuantAOut, "attn:quantaout"),
+                (Stage::AttnOut, "attn:attnout"),
+                (Stage::NormF, "moe:normf"),
+                (Stage::Route, "moe:route"),
+                (Stage::Moe, "moe:moe"),
+            ];
+            let delta = [
+                (Stage::NormA, "gdn:norma"),
+                (Stage::QuantA, "gdn:quanta"),
+                (Stage::DeltaProj, "gdn:deltaproj"),
+                (Stage::Conv, "gdn:conv"),
+                (Stage::Scan, "gdn:scan"),
+                (Stage::QuantDOut, "gdn:quantdout"),
+                (Stage::SsmOut, "gdn:ssmout"),
+                (Stage::NormF, "moe:normf"),
+                (Stage::Route, "moe:route"),
+                (Stage::Moe, "moe:moe"),
+            ];
+            let check = |kind: AttentionKind, expected: &[(Stage, &str)]| {
+                for &(stage, want) in expected {
+                    let tag = stage_tag(stage, kind);
+                    assert_eq!(tag, want, "{kind:?} {stage:?}");
+                    assert_eq!(tag_class(tag), stage_class(stage, kind), "{tag}");
+                }
+            };
+            check(AttentionKind::Full, &full);
+            check(AttentionKind::DeltaNet, &delta);
+        }
+
+        #[test]
+        fn share_line_splits_classes_and_survives_zero_whole() {
+            let spans = [
+                ("attn:flash", 30.0),
+                ("gdn:norma", 10.0),
+                ("moe:moe", 10.0),
+                ("embed", 0.0),
+            ];
+            let line = share_line(&spans);
+            assert!(line.contains("whole=50.00ms"), "{line}");
+            assert!(line.contains("attn=30.00ms(60%)"), "{line}");
+            assert!(line.contains("gdn=10.00ms(20%)"), "{line}");
+            assert!(line.contains("moe=10.00ms(20%)"), "{line}");
+            let zero = share_line(&[("attn:flash", 0.0)]);
+            assert!(zero.contains("(0%)"), "{zero}");
+            assert!(!zero.contains("NaN"), "{zero}");
+        }
+    }
+}
 /// Test-only native MMVQ projections over the existing chunk slots. These functions never
 /// interpret MMQ-packed bytes as native q8_1. They preserve chunk norms, SwiGLU and routing.
 #[cfg(test)]

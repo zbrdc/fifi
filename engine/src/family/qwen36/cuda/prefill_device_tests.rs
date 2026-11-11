@@ -2623,3 +2623,58 @@ fn chunk_phase_shares_kv8() {
     }
     phase_shares_row("kv8", KvMode::Int8G32);
 }
+
+/// The off-path identity of the serve-phase hook: with `FIFI_Q36_SERVE_PHASE` unset,
+/// one production chunk body leaves the context's live-event count unchanged — the
+/// hook records no timing event.
+#[test]
+#[ignore = "a CUDA device, held exclusively: the rig; run by name"]
+fn serve_phase_hook_creates_no_event_when_unset() {
+    if !device_present("serve_phase_hook_creates_no_event_when_unset") {
+        return;
+    }
+    if std::env::var_os("FIFI_Q36_SERVE_PHASE").is_some() {
+        eprintln!(
+            "serve_phase_hook_creates_no_event_when_unset: FIFI_Q36_SERVE_PHASE is set; skipping"
+        );
+        return;
+    }
+    let rig = build_rig().expect("rig");
+    let mut state = rig_state(&rig, KvMode::Fp16).expect("state");
+    let nsm = rig.ctx.mmq_device_facts().expect("facts").nsm;
+    let (tensors, arena, part) =
+        rig_session(&rig, RIG_CAP, nsm, CPF_ATTN_PART_CAP).expect("session");
+    let bufs = rig_bufs(&rig, &tensors, &arena, &part, RIG_CAP).expect("bufs");
+    let mixer = rig_mixer(&rig, false).expect("mixer");
+    let moe = rig_moe_slice(&rig, false).expect("moe");
+    let weights = ChunkWeights::new(&mixer, &moe, &rig.embed);
+    let model = ChunkModel::leading(&rig.table, &rig.geometry, &rig.dims, weights, RIG_LAYERS)
+        .expect("model");
+    open_chunk(&mut state, &rig.stream).expect("open");
+    let rows = ChunkRows::new(0, RIG_CAP, RIG_CAP, RIG_CAP).expect("rows");
+    let run = ChunkRun::new(&state, &model, &bufs, rows).expect("run");
+    let mut rng = Rng::new(0x5EED_0000_0000_0001);
+    let ids = clean_ids(RIG_CAP, &mut rng);
+    let view = slot_view(&arena, &tensors, ChunkSlot::IdsTok).expect("ids view");
+    view.buffer()
+        .write_at(
+            &rig.stream,
+            view.offset(),
+            &ids.iter()
+                .flat_map(|id| id.to_le_bytes())
+                .collect::<Vec<_>>(),
+        )
+        .expect("ids write");
+    let launch = Launch {
+        ctx: &rig.ctx,
+        stream: &rig.stream,
+    };
+    let before = rig.ctx.live_owners();
+    run_chunk_body(&launch, &run).expect("body");
+    rig.stream.synchronize().expect("sync");
+    let after = rig.ctx.live_owners();
+    assert_eq!(
+        before.events, after.events,
+        "serve-phase hook leaked a timing event"
+    );
+}

@@ -1618,12 +1618,20 @@ impl<'a> QwenResidentStep<'a> {
             )?;
             Ok(run.segmented_parts())
         };
-        let segmented_parts = body().inspect_err(|_| state.poison())?;
+        let segmented_parts = body().inspect_err(|_| {
+            state.poison();
+            super::prefill::phase_timing::serve::discard();
+        })?;
         prefill_report.note_segmented_parts(segmented_parts);
-        let status = state
-            .read_prefill_status(stream)
-            .inspect_err(|_| state.poison())?;
+        let status = state.read_prefill_status(stream).inspect_err(|_| {
+            state.poison();
+            super::prefill::phase_timing::serve::discard();
+        })?;
+        // The status read completed the stream, so the serve-phase marks (if armed) are
+        // readable now; nothing prints when the knob is off. The elapsed read comes
+        // first so the recorded step time excludes the share line's queries and print.
         let ns = u64::try_from(opened.elapsed().as_nanos()).unwrap_or(u64::MAX);
+        super::prefill::phase_timing::serve::end()?;
         prefill_report.push_step(StepRecord {
             p0,
             rows: m,

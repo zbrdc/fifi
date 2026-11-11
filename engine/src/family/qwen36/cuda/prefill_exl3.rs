@@ -349,7 +349,9 @@ pub(super) fn check_flag(launch: &Launch<'_>, run: &ChunkRun<'_, '_>) -> Result<
 /// Test-only section timer of the EXL3 chunk: once enabled, each mark waits for the stream and
 /// adds the time since the previous mark to its bucket, and the projections count their calls.
 /// A timed run is slower than an untimed one; the buckets locate time, they do not measure the
-/// untimed chunk. Production code carries no timer.
+/// untimed chunk. Production code carries no timer of its own here; the serve-phase hook of the
+/// parent module (`FIFI_Q36_SERVE_PHASE`) is the one production timer and marks stages around
+/// this loop when armed.
 #[cfg(test)]
 pub(in crate::family::qwen36::cuda) mod split {
     use super::super::Stage;
