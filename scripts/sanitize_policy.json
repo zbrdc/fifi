@@ -1,6 +1,6 @@
 {
  "schema_version": 1,
- "version": 3,
+ "version": 4,
  "description": "Authoritative public-vocabulary policy shared by the publisher sanitizer and the published_text gate. Every entry is classified; additions require a classification receipt.",
  "allowed_tags": [
   {
@@ -577,6 +577,11 @@
    "tag": "THREAD-LOCAL",
    "class": "technical-english",
    "origin": "legacy legacy-sanitizer"
+  },
+  {
+   "tag": "TIME-WAIT",
+   "class": "technical-english",
+   "origin": "receipt 2026-11-11, candidate-gate false positive (TCP socket state in a harness comment, reservation_harness.py.txt)"
   },
   {
    "tag": "VARIANTS-OK",
