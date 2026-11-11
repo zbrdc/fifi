@@ -3704,6 +3704,288 @@ extern "C" int inference_mlx_compile_attn_pre_layer_block(
   });
 }
 
+// ===== Attention post-core WINDOW closure (B1v2) =====
+// The whole tail of an attention layer of the verify window as one compiled closure: the
+// sigmoid output gate (the COMPOSITE chain - the fused attn_gate kernel is dense-only
+// heads==16/width==256 and the wiring dims gate excludes it), the cast to the activation
+// dtype, the output projection, the mixer residual, and then the folded device-routed MoE
+// rows sequence of the delta layer closure verbatim (post norm, router, gathered experts,
+// shared expert, final residual). The rope/append/attention core stay eager (offset and
+// prefix len must not bake); this body picks up at the eager core's `att` output.
+// 26 caller inputs (the wrapper appends the lhs pair as 24/25, tracing 26):
+//   0 att [1, heads, T, width] F32 or the activation dtype (the eager core output)
+//   1 gate [T, heads, width] activation dtype
+//   2 h [T, H] activation dtype (the RAW residual stream)
+//   3..5 payload, scales, biases of the packed output projection weight
+//   6 post norm [H] activation dtype, 7 router_t [H, E] F32
+//   8..16 payload, scales, biases of the shared gate, up, down packed weights (3 x 3)
+//   17 shared_scalar_t [H, 1] F32
+//   18..23 payload, scales, biases of the gate/up stack and the down stack (2 x 3)
+// Output (2): out [T, H] activation dtype (both residual adds folded), health [T] F32.
+struct CompileAttnPostLayerPayload {
+  int hidden, heads, width;
+  int experts, top_k, renorm;
+  float eps;
+  mlx_dtype act;
+  mlx_stream stream;
+  int mode[6], group[6], bits[6];  // o proj, shared g/u/d, gate/up stack, down stack
+};
+
+static void compile_attn_post_layer_payload_free(void* raw) noexcept {
+  CompileAttnPostLayerPayload* payload = static_cast<CompileAttnPostLayerPayload*>(raw);
+  if (payload != nullptr) {
+    mlx_stream_free(payload->stream);
+    std::free(payload);
+  }
+}
+
+static int compile_attn_post_layer_body(
+    mlx_vector_array* res, const mlx_vector_array input, void* raw) noexcept {
+  const CompileAttnPostLayerPayload* p = static_cast<const CompileAttnPostLayerPayload*>(raw);
+  compile_touching("attn post layer closure input vector");
+  if (p == nullptr || res == nullptr || mlx_vector_array_size(input) != 26) {
+    return 1;
+  }
+  compile_touching("attn post layer closure input element");
+  CompileScopeInputs in;
+  for (; in.count < 26; ++in.count) {
+    if (mlx_vector_array_get(&in.values[in.count], input, in.count) != 0) {
+      return 1;
+    }
+  }
+  const int* att_shape = mlx_array_shape(in.values[0]);
+  if (mlx_array_ndim(in.values[0]) != 4 || att_shape == nullptr || att_shape[0] != 1 ||
+      att_shape[1] != p->heads || att_shape[3] != p->width) {
+    return 1;
+  }
+  const int rows = att_shape[2];
+  if (rows < 2 || rows > 1024) {
+    return 1;
+  }
+  const int* gate_shape = mlx_array_shape(in.values[1]);
+  if (mlx_array_ndim(in.values[1]) != 3 || gate_shape == nullptr || gate_shape[0] != rows ||
+      gate_shape[1] != p->heads || gate_shape[2] != p->width) {
+    return 1;
+  }
+  const int* h_shape = mlx_array_shape(in.values[2]);
+  if (mlx_array_ndim(in.values[2]) != 2 || h_shape == nullptr || h_shape[0] != rows ||
+      h_shape[1] != p->hidden) {
+    return 1;
+  }
+  mlx_vector_array results = mlx_vector_array_new();
+  if (results.ctx == nullptr) return 1;
+  const mlx_stream s = p->stream;
+  const int swap_mid[4] = {0, 2, 1, 3};
+  const int rows_heads_width[3] = {rows, p->heads, p->width};
+  const int rows_qwidth[2] = {rows, p->heads * p->width};
+  CompileScopeArray att_t, att3, sig, gated, gated_act, row2, out, mid;
+  CompileScopeArray x_normed, logits, probs, health, negated, order, ids, clamped, top;
+  CompileScopeArray renorm_sum, gates0, gates, x3, stacked, hg, hu, silu_a, hprod;
+  CompileScopeArray sg, su, act2, sh, so, scalar_logit, factor, shared_out;
+  CompileScopeArray eo, weighted, expert_rows, experts, total, total_act, resid_out;
+  // The composite gate chain of prefill/attn.rs: transpose to [1,T,heads,width], back to
+  // rows, sigmoid gate, gated multiply, cast, flatten to [T, heads*width].
+  int status = inference_mlx_transpose_axes(&att_t.value, in.values[0], swap_mid, 4, s);
+  if (status == 0) status = inference_mlx_reshape(&att3.value, att_t.value, rows_heads_width, 3, s);
+  if (status == 0) status = inference_mlx_sigmoid(&sig.value, in.values[1], s);
+  if (status == 0) status = inference_mlx_multiply(&gated.value, att3.value, sig.value, s);
+  // The eager tail's to_act: an identity when the multiply already produced the dtype
+  // (the quantized-cache path), exactly the values the conditional cast leaves untouched.
+  if (status == 0) status = inference_mlx_astype(&gated_act.value, gated.value, p->act, s);
+  if (status == 0) status = inference_mlx_reshape(&row2.value, gated_act.value, rows_qwidth, 2, s);
+  if (status == 0)
+    status = inference_mlx_quantized_matmul(
+        &out.value, row2.value, in.values[3], in.values[4], in.values[5], true,
+        compile_quant_optional(p->group[0]), compile_quant_optional(p->bits[0]),
+        compile_quant_mode(p->mode[0]), s);
+  // Mixer residual: `mid` stays the activation dtype like the eager loop's checked add.
+  if (status == 0) status = inference_mlx_add(&mid.value, in.values[2], out.value, s);
+  // === the folded MoE rows sequence of the delta layer closure, indices remapped ===
+  if (status == 0)
+    status = inference_mlx_rms_norm(&x_normed.value, mid.value, in.values[6], p->eps, s);
+  if (status == 0)
+    status = inference_mlx_matmul(&logits.value, x_normed.value, in.values[7], s);
+  if (status == 0) status = inference_mlx_softmax(&probs.value, logits.value, true, s);
+  if (status == 0) status = inference_mlx_sum_axis(&health.value, probs.value, 1, false, s);
+  const int top_start[2] = {0, 0};
+  const int top_stop[2] = {rows, p->top_k};
+  const int top_strides[2] = {1, 1};
+  const uint32_t expert_upper = static_cast<uint32_t>(p->experts - 1);
+  if (status == 0) status = inference_mlx_negative(&negated.value, probs.value, s);
+  if (status == 0) status = inference_mlx_argsort_axis(&order.value, negated.value, 1, s);
+  if (status == 0)
+    status = inference_mlx_slice(&ids.value, order.value, top_start, top_stop, top_strides, 2, s);
+  if (status == 0)
+    status = inference_mlx_clamp_indices(&clamped.value, ids.value, expert_upper, s);
+  if (status == 0)
+    status = inference_mlx_resident_take_along_axis(&top.value, probs.value, clamped.value, 1, s);
+  if (status == 0 && p->renorm != 0) {
+    status = inference_mlx_sum_axis(&renorm_sum.value, top.value, 1, true, s);
+    if (status == 0) status = inference_mlx_divide(&gates0.value, top.value, renorm_sum.value, s);
+  }
+  const int gates_shape[4] = {rows, p->top_k, 1, 1};
+  if (status == 0)
+    status = inference_mlx_reshape(
+        &gates.value, p->renorm != 0 ? gates0.value : top.value, gates_shape, 4, s);
+  const int x3_shape[3] = {rows, 1, p->hidden};
+  if (status == 0) status = inference_mlx_reshape(&x3.value, x_normed.value, x3_shape, 3, s);
+  if (status == 0)
+    status = inference_mlx_resident_gather_qmm(
+        &stacked.value, x3.value, in.values[18], in.values[19], in.values[20], in.values[24],
+        clamped.value, true, compile_quant_optional(p->group[4]),
+        compile_quant_optional(p->bits[4]), compile_quant_mode(p->mode[4]), false, s);
+  if (status == 0 && stacked.value.ctx == nullptr) {
+    status = 1;  // Fail closed: a null stacked product must not reach the split.
+  }
+  if (status == 0) {
+    const int* stacked_shape = mlx_array_shape(stacked.value);
+    if (stacked_shape == nullptr || mlx_array_ndim(stacked.value) != 4 ||
+        stacked_shape[3] % 2 != 0) {
+      status = 1;
+    } else {
+      const int rows0 = stacked_shape[0];
+      const int rows1 = stacked_shape[1];
+      const int half = stacked_shape[3] / 2;
+      const int split_start[4] = {0, 0, 0, 0};
+      const int split_strides[4] = {1, 1, 1, 1};
+      const int gate_stop[4] = {rows0, rows1, 1, half};
+      const int up_start[4] = {0, 0, 0, half};
+      const int up_stop[4] = {rows0, rows1, 1, half * 2};
+      status = inference_mlx_slice(
+          &hg.value, stacked.value, split_start, gate_stop, split_strides, 4, s);
+      if (status == 0)
+        status = inference_mlx_slice(
+            &hu.value, stacked.value, up_start, up_stop, split_strides, 4, s);
+    }
+  }
+  if (status == 0) status = inference_mlx_silu(&silu_a.value, hg.value, s);
+  if (status == 0) status = inference_mlx_multiply(&hprod.value, silu_a.value, hu.value, s);
+  if (status == 0)
+    status = inference_mlx_resident_gather_qmm(
+        &eo.value, hprod.value, in.values[21], in.values[22], in.values[23], in.values[25],
+        clamped.value, true, compile_quant_optional(p->group[5]),
+        compile_quant_optional(p->bits[5]), compile_quant_mode(p->mode[5]), false, s);
+  if (status == 0) status = inference_mlx_multiply(&weighted.value, eo.value, gates.value, s);
+  if (status == 0) status = inference_mlx_sum_axis(&expert_rows.value, weighted.value, 1, false, s);
+  {
+    // expert_rows is [T, 1, H] after the expert-axis sum (eo is 4-D like `stacked`); the
+    // layer sum needs [T, H], exactly the rows body's `out_shape` reshape.
+    const int experts_shape[2] = {rows, p->hidden};
+    if (status == 0)
+      status = inference_mlx_reshape(&experts.value, expert_rows.value, experts_shape, 2, s);
+  }
+  // Shared expert: sigmoid(x . scalar) * down(silu(gate(x)) * up(x)), folded like the rows body.
+  if (status == 0)
+    status = inference_mlx_quantized_matmul(
+        &sg.value, x_normed.value, in.values[8], in.values[9], in.values[10], true,
+        compile_quant_optional(p->group[1]), compile_quant_optional(p->bits[1]),
+        compile_quant_mode(p->mode[1]), s);
+  if (status == 0)
+    status = inference_mlx_quantized_matmul(
+        &su.value, x_normed.value, in.values[11], in.values[12], in.values[13], true,
+        compile_quant_optional(p->group[2]), compile_quant_optional(p->bits[2]),
+        compile_quant_mode(p->mode[2]), s);
+  if (status == 0) status = inference_mlx_silu(&act2.value, sg.value, s);
+  if (status == 0) status = inference_mlx_multiply(&sh.value, act2.value, su.value, s);
+  if (status == 0)
+    status = inference_mlx_quantized_matmul(
+        &so.value, sh.value, in.values[14], in.values[15], in.values[16], true,
+        compile_quant_optional(p->group[3]), compile_quant_optional(p->bits[3]),
+        compile_quant_mode(p->mode[3]), s);
+  if (status == 0)
+    status = inference_mlx_matmul(&scalar_logit.value, x_normed.value, in.values[17], s);
+  if (status == 0) status = inference_mlx_sigmoid(&factor.value, scalar_logit.value, s);
+  if (status == 0) status = inference_mlx_multiply(&shared_out.value, factor.value, so.value, s);
+  if (status == 0) status = inference_mlx_add(&total.value, experts.value, shared_out.value, s);
+  if (status == 0) status = compile_cast_to(&total_act.value, total.value, p->act, s);
+  {
+    const mlx_array total_used = total_act.value.ctx != nullptr ? total_act.value : total.value;
+    if (status == 0)
+      status = inference_mlx_add(&resid_out.value, mid.value, total_used, s);
+  }
+  compile_touching("attn post layer closure output vector");
+  if (status == 0) status = mlx_vector_array_append_value(results, resid_out.value);
+  if (status == 0) status = mlx_vector_array_append_value(results, health.value);
+  compile_touching("attn post layer closure result vector");
+  if (status == 0) status = mlx_vector_array_set(res, results);
+  const int release = mlx_vector_array_free(results);
+  return status != 0 ? status : release;
+}
+
+// The window wrapper of the post body. `dims` holds hidden, heads, width, experts, top_k,
+// renorm; `quant` holds mode, group, bits per weight for the six packed weights (18
+// values). The wrapper builds the gather row-index pair per (owner, T, top_k) - the same
+// kind-1 raw-row cache the delta layer closure uses - and appends it after the 24 caller
+// inputs, so the Rust seam stays shape-free. Output slots arrive null.
+extern "C" int inference_mlx_compile_attn_post_layer(
+    mlx_array* out, mlx_array* health, const mlx_array* inputs, size_t inputs_num,
+    const int* dims, const int* quant, float eps, mlx_dtype activation, uintptr_t owner,
+    uintptr_t fun_id, mlx_stream stream) noexcept {
+  return run_selected_operation(out, stream, [&]() noexcept {
+    if (inputs_num != 24 || dims == nullptr || quant == nullptr) {
+      return 1;
+    }
+    // The window's row count rides on the residual operand h (input 2), like the delta
+    // wrapper reads it from its input 0.
+    const int* h_shape_in = mlx_array_shape(inputs[2]);
+    if (h_shape_in == nullptr || mlx_array_ndim(inputs[2]) != 2) {
+      return 1;
+    }
+    mlx_array rows_lhs = mlx_array_new();
+    mlx_array flat_lhs = mlx_array_new();
+    int lhs_status =
+        compile_moe_lhs_for(&rows_lhs, &flat_lhs, owner, h_shape_in[0], dims[4], stream);
+    if (lhs_status != 0) {
+      mlx_array_free(rows_lhs);
+      mlx_array_free(flat_lhs);
+      return lhs_status;
+    }
+    mlx_array closure_inputs[26];
+    for (size_t i = 0; i < 24; ++i) {
+      closure_inputs[i] = inputs[i];
+    }
+    closure_inputs[24] = rows_lhs;
+    closure_inputs[25] = flat_lhs;
+    CompileAttnPostLayerPayload* payload =
+        static_cast<CompileAttnPostLayerPayload*>(std::malloc(sizeof(CompileAttnPostLayerPayload)));
+    if (payload == nullptr) {
+      mlx_array_free(rows_lhs);
+      mlx_array_free(flat_lhs);
+      return 1;
+    }
+    payload->hidden = dims[0];
+    payload->heads = dims[1];
+    payload->width = dims[2];
+    payload->experts = dims[3];
+    payload->top_k = dims[4];
+    payload->renorm = dims[5];
+    payload->eps = eps;
+    payload->act = activation;
+    payload->stream = stream;
+    int stream_status = compile_copy_stream(&payload->stream, stream);
+    if (stream_status != 0) {
+      std::free(payload);
+      mlx_array_free(rows_lhs);
+      mlx_array_free(flat_lhs);
+      return stream_status;
+    }
+    for (int i = 0; i < 6; ++i) {
+      payload->mode[i] = quant[3 * i];
+      payload->group[i] = quant[3 * i + 1];
+      payload->bits[i] = quant[3 * i + 2];
+    }
+    mlx_array outputs[2] = {{nullptr}, {nullptr}};
+    const int status = compile_apply_block(
+        outputs, 2, compile_attn_post_layer_body, payload, compile_attn_post_layer_payload_free,
+        closure_inputs, 26, fun_id);
+    mlx_array_free(rows_lhs);
+    mlx_array_free(flat_lhs);
+    *out = outputs[0];
+    *health = outputs[1];
+    return status;
+  });
+}
+
 // ===== Attention post-core compile block =====
 // The attention post-core tail as one compiled closure (behind `qwen36.compile`): the
 // sigmoid output gate, the gated multiply, the cast to the activation dtype, and the output
