@@ -1250,7 +1250,17 @@ fn op_expert_gu(
     };
     let native = stack.native()?;
     let gate_native = if glu_gate {
-        Some(weights.gate.native()?)
+        let gate = weights.gate.native()?;
+        // The kernel decodes both stacks with the UP launch's quant type, so a mismatched
+        // gate stack (equal block bytes, e.g. Q4_0 vs Q4_K) would silently decode wrong.
+        if gate.quant() != native.quant() {
+            return Err(refuse(format!(
+                "the fused gate/up launch needs identical stack quant (gate {:?}, up {:?})",
+                gate.quant(),
+                native.quant()
+            )));
+        }
+        Some(gate)
     } else {
         None
     };

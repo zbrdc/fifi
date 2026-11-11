@@ -400,15 +400,23 @@ unsafe extern "C" {
 /// The base call against a nonzero q8_1 activation buffer: the zero-filled rig would make any
 /// bit comparison trivially pass, so this phase patterns `y` with a finite byte pattern (q8
 /// quanta 0x55, scale words also 0x55 - finite half2 denormals) before launching and returns
-/// the written `dst`.
-fn accept_phase_nonzero() -> Result<(c_int, Vec<u8>), EngError> {
+/// the written `dst`. `ncols_x` widens the k loop: the 256 base keeps one quant block per row
+/// (pipeline prologue only), 2048 runs the production-wide k loop that exercises the
+/// steady-state double-buffer swap (`h + 2 < total_h`).
+fn accept_phase_nonzero(ncols_x: i64) -> Result<(c_int, Vec<u8>), EngError> {
     let ctx = CudaContext::new()?;
     let stream = ctx.stream()?;
     let fx = Fx::new(&ctx)?;
     // Re-upload the y range with the pattern (Fx uploads zeros).
     let patterned = vec![0x55u8; ALLOC / 2];
     ctx.upload_at(&fx.bufs[Y], 0, &patterned)?;
-    let base = fx.args(|_| {});
+    let base = fx.args(|g| {
+        g.ncols_x = ncols_x;
+        // Packed wide-k strides: one k-block (256 values) per row stride, a full expert
+        // panel of n rows x k-blocks per channel (the same law BASE encodes at k=256).
+        g.stride_row_x = ncols_x / 256;
+        g.stride_channel_x = 128 * (ncols_x / 256);
+    });
     let rc = issue(&ctx, &stream, Some(&base))?;
     stream.synchronize()?;
     let mut bytes = vec![0u8; ALLOC / 2];
@@ -422,22 +430,30 @@ fn mmq_mmid_pipe_arm_is_bit_identical() {
     if !testkit::device_present(NAME) {
         return;
     }
-    let (rc0, out0) = accept_phase_nonzero().expect("unarmed accept phase");
-    assert_eq!(rc0, 0, "unarmed base call: expected success, got {rc0}");
-    assert!(
-        out0.as_chunks::<4>().0.iter().any(|c| *c != [0, 0, 0, 0]),
-        "nonzero rig produced an all-zero dst; the phase is not exercising the kernel"
-    );
-    inference_cuda_test_arm_mmq_pipe(1);
-    let (rc1, out1) = accept_phase_nonzero().expect("armed accept phase");
-    inference_cuda_test_arm_mmq_pipe(0);
-    assert_eq!(rc1, 0, "armed base call: expected success, got {rc1}");
-    assert_eq!(
-        out0, out1,
-        "pipe arm changed the mmid output bits (contract: bit-identical rescheduling)"
-    );
-    println!(
-        "{NAME}: armed and unarmed dst identical, {} bytes",
-        out0.len()
-    );
+    for ncols_x in [256, 2048] {
+        let (rc0, out0) = accept_phase_nonzero(ncols_x).expect("unarmed accept phase");
+        assert_eq!(
+            rc0, 0,
+            "unarmed k={ncols_x} call: expected success, got {rc0}"
+        );
+        assert!(
+            out0.as_chunks::<4>().0.iter().any(|c| *c != [0, 0, 0, 0]),
+            "nonzero rig produced an all-zero dst; the phase is not exercising the kernel"
+        );
+        inference_cuda_test_arm_mmq_pipe(1);
+        let (rc1, out1) = accept_phase_nonzero(ncols_x).expect("armed accept phase");
+        inference_cuda_test_arm_mmq_pipe(0);
+        assert_eq!(
+            rc1, 0,
+            "armed k={ncols_x} call: expected success, got {rc1}"
+        );
+        assert_eq!(
+            out0, out1,
+            "pipe arm changed the mmid output bits at k={ncols_x} (contract: bit-identical rescheduling)"
+        );
+        println!(
+            "{NAME}: k={ncols_x} armed and unarmed dst identical, {} bytes",
+            out0.len()
+        );
+    }
 }
