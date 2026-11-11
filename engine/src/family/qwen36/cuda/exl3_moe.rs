@@ -52,6 +52,9 @@ const F32: usize = size_of::<f32>();
 /// The most rows one down-projection group of the rows kernel takes (`grouped_max_rows`,
 /// exl3.cu `grouped_project_rows`); a wider window splits at this width.
 const GROUPED_MAX_ROWS: usize = 8;
+/// The most one-row pairs one grouped launch takes (`exl3.rs` `grouped_raw`); the shared
+/// expert's gate/up runs in row batches of `GROUPED_PAIRS / 2` rows.
+const GROUPED_PAIRS: usize = 48;
 const I32: usize = size_of::<i32>();
 
 pub(in crate::family) struct Exl3MoeWeights<'w> {
@@ -597,23 +600,29 @@ pub(in crate::family) fn shared_rows(
     io: &SharedRowsIo<'_>,
     (hidden, shared_inter, rows): (usize, usize, usize),
 ) -> Result<(), EngError> {
-    if !(2..=32).contains(&rows) {
+    if rows < 2 {
         return Err(refuse(format!(
-            "the K-row shared expert takes 2 to 32 rows, got {rows}"
+            "the K-row shared expert takes at least 2 rows, got {rows}"
         )));
     }
     let s = shared_inter;
-    let mut group = Vec::with_capacity(2 * rows);
-    for r in 0..rows {
-        for (half, weight) in [weights.gate, weights.up].into_iter().enumerate() {
-            group.push(Pair {
-                view: weight.view()?,
-                x: row(&io.norm_row, hidden * F32, r)?,
-                out: row(&io.gu, s * F32, 2 * r + half)?,
-            });
+    // The grouped launch takes at most 48 one-row pairs, so a chunk wider than 24 rows runs
+    // its gate/up in row batches; the pairs of a batch are row-disjoint in `gu`, and each
+    // batch reuses the xh/z scratch from row 0, so wider chunks need no extra scratch.
+    for b0 in (0..rows).step_by(GROUPED_PAIRS / 2) {
+        let width = (rows - b0).min(GROUPED_PAIRS / 2);
+        let mut group = Vec::with_capacity(2 * width);
+        for r in b0..b0 + width {
+            for (half, weight) in [weights.gate, weights.up].into_iter().enumerate() {
+                group.push(Pair {
+                    view: weight.view()?,
+                    x: row(&io.norm_row, hidden * F32, r)?,
+                    out: row(&io.gu, s * F32, 2 * r + half)?,
+                });
+            }
         }
+        grouped(launch, &group, &io.scratch)?;
     }
-    grouped(launch, &group, &io.scratch)?;
     swiglu(launch, io.gu, io.act, (rows, s))?;
     // The down projection's rows kernel takes one group of at most `GROUPED_MAX_ROWS` rows
     // (`grouped_project_rows`, exl3.cu). Gate and up above are one-row groups, so only the

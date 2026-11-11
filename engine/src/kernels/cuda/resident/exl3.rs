@@ -1768,9 +1768,13 @@ impl CudaContext {
                 .any(|call| !(1..=8).contains(&call.rows) || call.split_k != 2)
             || calls.iter().map(|call| call.rows).sum::<usize>() > 48
         {
-            return Err(EngError::BadRequest(
-                "EXL3 grouped needs 1..=48 pairs in local groups1..=8".into(),
-            ));
+            let rows: Vec<_> = calls.iter().map(|call| call.rows).collect();
+            return Err(EngError::BadRequest(format!(
+                "EXL3 grouped needs 1..=48 pairs in local groups of 1..=8 rows \
+                 (got {} calls, rows {rows:?}, sum {})",
+                calls.len(),
+                rows.iter().sum::<usize>(),
+            )));
         }
         // The native entry reads one fused-publish arm for the whole set and refuses a
         // mix; a native refusal would latch the backend, so refuse here first.

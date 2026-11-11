@@ -371,6 +371,7 @@ pub(in crate::family::flash_next) use device::{SplitMoe, SplitMoeTrunk};
 mod device {
     /// The router's picks per row: each row's expert ids and their weights.
     type RoutedPicks = Vec<(Vec<i32>, Vec<f32>)>;
+    use super::super::step_plan::MAX_STEP_ROWS;
     use super::{
         CTRL_BYTES, F32, I32, LOG_ENTRY, REQUEST_BYTES, ScratchLayout, SlotSpans, classify_picks,
         first_poisoned_filler, parse_log, pick_union, plan_second_pass, refuse,
@@ -955,8 +956,10 @@ mod device {
             dims: &MoeDims,
         ) -> Result<(), EngError> {
             let m = dims.rows;
-            if !(2..=32).contains(&m) {
-                return Err(refuse(format!("the block takes 2 to 32 rows, got {m}")));
+            if !(2..=MAX_STEP_ROWS).contains(&m) {
+                return Err(refuse(format!(
+                    "the block takes 2 to {MAX_STEP_ROWS} rows, got {m}"
+                )));
             }
             let geometry = *self.bank.geometry();
             if dims.n_expert != geometry.experts
@@ -1535,7 +1538,8 @@ mod device {
                     (h, dims.shared_inter, m),
                 )?;
             } else {
-                // The K-row kernel takes 2 to 32 rows; the sampling row runs the one-row
+                // The K-row shared expert takes at least 2 rows; the sampling row runs the
+                // one-row
                 // variant over its single-row buffers.
                 shared_of(launch, &shared_weights, bufs, dims)?;
             }
