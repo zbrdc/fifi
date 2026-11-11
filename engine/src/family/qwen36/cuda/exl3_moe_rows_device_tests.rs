@@ -503,7 +503,7 @@ fn the_shared_expert_of_k_rows_equals_k_one_row_blocks() {
 
 /// The K-row shared expert refuses one row and more than eight: the one-row block is `shared()`.
 #[test]
-fn the_k_row_shared_expert_takes_two_to_eight_rows() {
+fn the_k_row_shared_expert_takes_two_to_thirty_two_rows() {
     if !device_present("K-row shared expert row counts") {
         return;
     }
@@ -516,7 +516,7 @@ fn the_k_row_shared_expert_takes_two_to_eight_rows() {
     };
     let w = build_weights(&projector);
     let b = buffers(ctx, 9, &vec![0.0; 9 * HIDDEN], &vec![0.0; 9 * HIDDEN]);
-    for rows in [0usize, 1, 9] {
+    for rows in [0usize, 1, 33] {
         let result = shared_rows(
             &launch,
             &SharedWeights {
@@ -534,7 +534,7 @@ fn the_k_row_shared_expert_takes_two_to_eight_rows() {
             (HIDDEN, INTER, rows),
         );
         match result {
-            Err(EngError::BadRequest(message)) if message.contains("2 to 8 rows") => {}
+            Err(EngError::BadRequest(message)) if message.contains("2 to 32 rows") => {}
             other => panic!("rows {rows}: expected the row-count refusal, got {other:?}"),
         }
     }

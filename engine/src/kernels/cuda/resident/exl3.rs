@@ -6,10 +6,12 @@
 )]
 use crate::EngError;
 // The pure selection logic lives where the host build compiles and tests it.
+use crate::kernels::cuda::context::device_error;
 use crate::kernels::cuda::context::{
     Claim, CudaContext, DeviceRange, DeviceStream, require_apart, require_fit,
 };
 use crate::kernels::cuda::native::DeviceFailure;
+use crate::kernels::cuda::native::resident::RawRange;
 use crate::kernels::cuda::native::resident::RawStream;
 use crate::kernels::cuda::native::resident::exl3 as ffi;
 #[cfg(test)]
@@ -117,17 +119,29 @@ pub(crate) const INDEXED_PAIRS_VAR: &str = "FIFI_EXL3_INDEXED_PAIRS";
 /// latency overlaps the decode. Same bytes. A set value wins over the default a session
 /// registered. Process-wide, read once, strict: any other value is refused.
 pub(crate) const PIPE_VAR: &str = "FIFI_EXL3_PIPELINE";
+/// Opt-in switch of the pointer-table launch of the id-indexed kernels: unset or `0` keeps the
+/// parameter-block launches (up to 16 or 20 pairs), `1` moves the call records to a device
+/// table so one kernel per stage covers the whole batch (up to 65535 records, shapes may mix).
+/// Same bytes as the option launch of the same calls; the DP4A and pipeline options apply. A
+/// set value wins over the default a session registered. Process-wide, read once, strict.
+pub(crate) const TABLE_VAR: &str = "FIFI_EXL3_TABLE";
 
 /// The opt-in options of the id-indexed launch, each selected on its own: the DP4A decode of
 /// book 2 ([`DP4A_VAR`]), one launch of up to 20 pairs ([`INDEXED_PAIRS_VAR`]) and the pipelined
 /// tile loop ([`PIPE_VAR`]). All off is the default launch, which stays the fallback. Every byte
 /// an option writes equals the default launch of the same calls; every option runs one tile per
 /// block.
+///
+/// The pointer-table form ([`TABLE_VAR`]) is a fourth switch on the same launch: instead of a
+/// parameter block of up to 20 pairs, the call records ride a device table and one kernel per
+/// stage covers the whole batch, mixing shapes. It replaces the pair-count choice (`pairs20`
+/// is ignored under it) and inherits the DP4A and pipeline bits.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub(crate) struct IndexedOptions {
     pub(crate) dp4a: bool,
     pub(crate) pairs20: bool,
     pub(crate) pipeline: bool,
+    pub(crate) table: bool,
 }
 
 impl IndexedOptions {
@@ -135,42 +149,65 @@ impl IndexedOptions {
         dp4a: false,
         pairs20: false,
         pipeline: false,
+        table: false,
     };
     #[cfg(test)]
     pub(crate) const DP4A: Self = Self {
         dp4a: true,
         pairs20: false,
         pipeline: false,
+        table: false,
     };
     #[cfg(test)]
     pub(crate) const PAIRS20: Self = Self {
         dp4a: false,
         pairs20: true,
         pipeline: false,
+        table: false,
     };
     #[cfg(test)]
     pub(crate) const BOTH: Self = Self {
         dp4a: true,
         pairs20: true,
         pipeline: false,
+        table: false,
     };
     #[cfg(test)]
     pub(crate) const PIPE: Self = Self {
         dp4a: false,
         pairs20: false,
         pipeline: true,
+        table: false,
     };
     #[cfg(test)]
     pub(crate) const PAIRS20_PIPE: Self = Self {
         dp4a: false,
         pairs20: true,
         pipeline: true,
+        table: false,
     };
     #[cfg(test)]
     pub(crate) const BOTH_PIPE: Self = Self {
         dp4a: true,
         pairs20: true,
         pipeline: true,
+        table: false,
+    };
+    /// The pointer-table launch alone: one kernel per stage over the whole batch.
+    #[cfg(test)]
+    pub(crate) const TABLE: Self = Self {
+        dp4a: false,
+        pairs20: false,
+        pipeline: false,
+        table: true,
+    };
+    /// The pointer-table launch with the DP4A decode and the pipelined tile loop.
+    #[cfg(test)]
+    pub(crate) const TABLE_ALL: Self = Self {
+        dp4a: true,
+        pairs20: false,
+        pipeline: true,
+        table: true,
     };
     #[cfg(test)]
     pub(crate) const ALL: [Self; 8] = [
@@ -183,6 +220,7 @@ impl IndexedOptions {
             dp4a: true,
             pairs20: false,
             pipeline: true,
+            table: false,
         },
         Self::PAIRS20_PIPE,
         Self::BOTH_PIPE,
@@ -192,21 +230,28 @@ impl IndexedOptions {
     /// those joined by `+`.
     #[cfg(test)]
     pub(crate) fn name(self) -> &'static str {
-        match (self.dp4a, self.pairs20, self.pipeline) {
-            (false, false, false) => "off",
-            (true, false, false) => "dp4a",
-            (false, true, false) => "pairs20",
-            (true, true, false) => "both",
-            (false, false, true) => "pipe",
-            (true, false, true) => "dp4a+pipe",
-            (false, true, true) => "pairs20+pipe",
-            (true, true, true) => "all",
+        match (self.dp4a, self.pairs20, self.pipeline, self.table) {
+            (false, false, false, false) => "off",
+            (true, false, false, false) => "dp4a",
+            (false, true, false, false) => "pairs20",
+            (true, true, false, false) => "both",
+            (false, false, true, false) => "pipe",
+            (true, false, true, false) => "dp4a+pipe",
+            (false, true, true, false) => "pairs20+pipe",
+            (true, true, true, false) => "all",
+            (false, _, false, true) => "table",
+            (true, _, false, true) => "dp4a+table",
+            (false, _, true, true) => "table+pipe",
+            (true, _, true, true) => "dp4a+table+pipe",
         }
     }
 
-    /// The most pairs one launch takes under these options.
+    /// The most pairs one launch takes under these options. The pointer-table form reads its
+    /// records from a device table, so its cap is the grid's, not a parameter block's.
     fn capacity(self) -> usize {
-        if self.pairs20 {
+        if self.table {
+            ffi::TABLE_PAIRS_MAX
+        } else if self.pairs20 {
             INDEXED_OPTION_CAPACITY
         } else {
             INDEXED_CAPACITY
@@ -235,6 +280,9 @@ impl IndexedOptions {
         }
         if self.pipeline {
             suffix.push_str(" exl3_pipeline=on");
+        }
+        if self.table {
+            suffix.push_str(" exl3_table=on");
         }
         suffix
     }
@@ -280,8 +328,20 @@ pub(crate) fn pipe_from_env(value: Option<&std::ffi::OsStr>) -> Result<Option<bo
     }
 }
 
+/// Parses [`TABLE_VAR`]: `None` when unset, else whether the pointer-table launch is on.
+pub(crate) fn table_from_env(value: Option<&std::ffi::OsStr>) -> Result<Option<bool>, String> {
+    let Some(value) = value else {
+        return Ok(None);
+    };
+    match value.to_str().map(str::trim) {
+        Some("0") => Ok(Some(false)),
+        Some("1") => Ok(Some(true)),
+        _ => Err(format!("{TABLE_VAR} must be unset, \"0\" or \"1\"")),
+    }
+}
+
 /// What the environment says about each option (`None`: unset).
-type IndexedExplicit = (Option<bool>, Option<bool>, Option<bool>);
+type IndexedExplicit = (Option<bool>, Option<bool>, Option<bool>, Option<bool>);
 
 /// What the values of [`DP4A_VAR`], [`INDEXED_PAIRS_VAR`] and [`PIPE_VAR`] say about each option
 /// (`None`: unset), or the refusal of the first bad value. The environment read and the tests
@@ -290,11 +350,13 @@ fn indexed_from_env(
     dp4a: Option<&std::ffi::OsStr>,
     pairs: Option<&std::ffi::OsStr>,
     pipe: Option<&std::ffi::OsStr>,
+    table: Option<&std::ffi::OsStr>,
 ) -> Result<IndexedExplicit, String> {
     Ok((
         dp4a_from_env(dp4a)?,
         indexed_pairs_from_env(pairs)?,
         pipe_from_env(pipe)?,
+        table_from_env(table)?,
     ))
 }
 
@@ -309,6 +371,7 @@ fn indexed_explicit() -> Result<IndexedExplicit, EngError> {
                 std::env::var_os(DP4A_VAR).as_deref(),
                 std::env::var_os(INDEXED_PAIRS_VAR).as_deref(),
                 std::env::var_os(PIPE_VAR).as_deref(),
+                std::env::var_os(TABLE_VAR).as_deref(),
             )
         })
         .clone()
@@ -322,6 +385,7 @@ fn merge_indexed(default: IndexedOptions, explicit: IndexedExplicit) -> IndexedO
         dp4a: explicit.0.unwrap_or(default.dp4a),
         pairs20: explicit.1.unwrap_or(default.pairs20),
         pipeline: explicit.2.unwrap_or(default.pipeline),
+        table: explicit.3.unwrap_or(default.table),
     }
 }
 
@@ -335,6 +399,7 @@ fn check_indexed_with(kernel: SingleRow, options: IndexedOptions) -> Result<(), 
         (options.dp4a, format!("{DP4A_VAR}=1")),
         (options.pairs20, format!("{INDEXED_PAIRS_VAR}=20")),
         (options.pipeline, format!("{PIPE_VAR}=1")),
+        (options.table, format!("{TABLE_VAR}=1")),
     ]
     .into_iter()
     .filter_map(|(set, name)| set.then_some(name))
@@ -346,7 +411,7 @@ fn check_indexed_with(kernel: SingleRow, options: IndexedOptions) -> Result<(), 
     };
     Err(EngError::BadRequest(format!(
         "{} {verb} one tile per block: set {SINGLE_GATHER_VAR} to unset, \"off\", \"1\" or \
-         \"wide1\" with {them}, or turn {them} off ({DP4A_VAR}=0, {INDEXED_PAIRS_VAR}=16, {PIPE_VAR}=0)",
+         \"wide1\" with {them}, or turn {them} off ({DP4A_VAR}=0, {INDEXED_PAIRS_VAR}=16, {PIPE_VAR}=0, {TABLE_VAR}=0)",
         on.join(" and ")
     )))
 }
@@ -1497,6 +1562,12 @@ impl CudaContext {
                     .transpose()?,
             });
         }
+        if options.table {
+            if cols != 1 {
+                return Err(refuse("the pointer-table launch runs one tile per block"));
+            }
+            return self.exl3_indexed_table(stream, &raw, &index, &options);
+        }
         if let Some(native) = options.native(calls.len()) {
             if cols != 1 {
                 return Err(refuse(
@@ -1508,6 +1579,51 @@ impl CudaContext {
             });
         }
         self.launch_on(stream, |s| ffi::grouped_indexed(s, &raw, &index, cols))
+    }
+
+    /// The pointer-table form of the id-indexed launch ([`TABLE_VAR`]): the per-call records
+    /// ride a device table (packed host-side by the native layer, uploaded through the
+    /// allocation cache) and one kernel per stage covers the whole batch, so the parameter
+    /// block's pair cap lifts to the grid's. Only the DP4A and pipeline bits apply. Every byte
+    /// written equals the option launch of the same calls.
+    fn exl3_indexed_table(
+        &self,
+        stream: &DeviceStream,
+        raw: &[ffi::LinearRaw<'_>],
+        index: &[ffi::IndexRaw<'_>],
+        options: &IndexedOptions,
+    ) -> Result<(), EngError> {
+        let records = ffi::indexed_table_records(raw, index).map_err(device_error)?;
+        // The grid covers the batch's widest shapes; narrower records exit their extra units
+        // through the per-record k/n in the table.
+        let k_units = raw
+            .iter()
+            .map(|call| call.k.div_ceil(128))
+            .max()
+            .unwrap_or(1) as u32;
+        let n_max = raw.iter().map(|call| call.n).max().unwrap_or(16);
+        let n_tiles = (n_max / 16) as u32;
+        let n_units = n_max.div_ceil(128) as u32;
+        let native = u32::from(options.dp4a) | (u32::from(options.pipeline) << 2);
+        let fused_publish = u32::from(raw[0].fused);
+        let flag = raw[0].flag.address();
+        let table = self.upload(&records)?;
+        let pairs = RawRange::new(self.owned(&table)?, 0, records.len())
+            .ok_or_else(|| EngError::BadRequest("EXL3 indexed table: empty records".into()))?;
+        let count = raw.len();
+        self.launch_on(stream, |s| {
+            ffi::indexed_table(
+                s,
+                pairs.address(),
+                count,
+                k_units,
+                n_tiles,
+                n_units,
+                flag,
+                fused_publish,
+                native,
+            )
+        })
     }
 
     fn grouped_split_raw<'a>(

@@ -254,7 +254,8 @@ fn both_grouped_entries_choose_through_the_kernel_function() {
         "pub(crate) fn exl3_linear(",
     ] {
         let start = source.find(entry).expect(entry);
-        let body = &source[start..start + 900];
+        // 1200 chars: exl3_grouped_step grew past 900 when its fused-input arm landed.
+        let body = &source[start..start + 1200];
         assert!(body.contains("grouped_kernel_for("), "{entry}: {body}");
         assert!(body.contains("grouped_by("), "{entry}: {body}");
     }

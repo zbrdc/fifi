@@ -159,6 +159,25 @@ int inference_cuda_exl3_grouped_indexed_option(const inference_cuda_exl3_linear_
                                                const inference_cuda_exl3_index_args *index,
                                                size_t count, void *stream, int *out_stage,
                                                unsigned options);
+/* The pointer-table batched id-indexed launch: one kernel per stage over every record of a
+ * device-resident table (IndexedTablePair array), past the 4096-byte parameter block's 20-pair
+ * cap. `k_units`/`n_tiles`/`n_units` are the batch's widest shapes (ceil(k/128), n/16,
+ * ceil(n/128)); narrow records idle their tail blocks. Records carry their own k and n, so one
+ * batch may mix shapes. `options` bit 0 is DP4A, bit 2 the pipelined tile loop; bits 1 and 3 do
+ * not apply. Every byte written equals the option launch of the same calls one batch at a
+ * time. The caller fills and validates the table; this launches only. */
+struct IndexedTablePair;
+int inference_cuda_exl3_indexed_table(const IndexedTablePair *pairs, size_t pairs_count,
+                                      uint32_t k_units, uint32_t n_tiles, uint32_t n_units,
+                                      uint32_t *flag, uint32_t fused_publish, void *stream,
+                                      int *out_stage, unsigned options);
+/* The host-side packer for the table launch: fills `out` (an array of `pairs_count`
+ * IndexedTablePair the caller owns) from the same call and index records the option launch
+ * takes, validating per record with per-record spans and cross-record write isolation.
+ * Shapes may differ per record; k and n are written into each record. */
+int inference_cuda_exl3_indexed_table_pack(const inference_cuda_exl3_linear_args *calls,
+                                           const inference_cuda_exl3_index_args *index,
+                                           size_t pairs_count, IndexedTablePair *out);
 /* Test probe of the DP4A decode: per word, the byte sum and the DP4A result (2 * count words);
  * per state 0..65535, the book-2 decode and its DP4A form (2 * 65536 halves). */
 int inference_cuda_exl3_book2_probe(const uint32_t *words, size_t count, uint32_t *sums,

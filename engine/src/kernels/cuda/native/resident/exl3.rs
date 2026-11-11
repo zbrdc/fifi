@@ -462,6 +462,24 @@ unsafe extern "C" {
         stage: *mut c_int,
         options: u32,
     ) -> c_int;
+    fn inference_cuda_exl3_indexed_table_pack(
+        args: *const LinearArgs,
+        index: *const IndexArgs,
+        count: usize,
+        out: *mut c_void,
+    ) -> c_int;
+    fn inference_cuda_exl3_indexed_table(
+        pairs: *const c_void,
+        pairs_count: usize,
+        k_units: u32,
+        n_tiles: u32,
+        n_units: u32,
+        flag: *mut c_void,
+        fused_publish: u32,
+        stream: *mut c_void,
+        stage: *mut c_int,
+        options: u32,
+    ) -> c_int;
     #[cfg(test)]
     fn inference_cuda_exl3_book2_probe(
         words: *const c_void,
@@ -583,6 +601,71 @@ pub(in crate::kernels::cuda) fn grouped_indexed_option(
             args.as_ptr(),
             indexes.as_ptr(),
             args.len(),
+            stream.as_ptr(),
+            &mut stage,
+            options,
+        )
+    };
+    checked(status, stage)
+}
+
+/// The byte size of one `IndexedTablePair` record (the C side's static_asserts fix it:
+/// 80-byte `GroupEntry` + 40-byte `IndexInfo` + 8 bytes of k and n).
+pub(in crate::kernels::cuda) const TABLE_PAIR_BYTES: usize = 128;
+/// One table launch's record cap (the grid's y axis in the C entry).
+pub(in crate::kernels::cuda) const TABLE_PAIRS_MAX: usize = 65535;
+
+/// Packs the table records host-side ([`inference_cuda_exl3_indexed_table_pack`]): the same
+/// call and index records the option entry takes, validated per record with cross-record write
+/// isolation in C. Returns the packed bytes, one record per call.
+pub(in crate::kernels::cuda) fn indexed_table_records(
+    calls: &[LinearRaw<'_>],
+    index: &[IndexRaw<'_>],
+) -> Result<Vec<u8>, DeviceFailure> {
+    let (args, indexes) = indexed_records(calls, index, TABLE_PAIRS_MAX)?;
+    let mut out = vec![0u8; calls.len() * TABLE_PAIR_BYTES];
+    let mut stage = STAGE_NONE;
+    // SAFETY: `args`/`indexes` are the arrays the option entry takes; `out` holds one record
+    // per call, the count the packer reads.
+    let status = unsafe {
+        inference_cuda_exl3_indexed_table_pack(
+            args.as_ptr(),
+            indexes.as_ptr(),
+            args.len(),
+            out.as_mut_ptr().cast(),
+        )
+    };
+    checked(status, stage).map(|()| out)
+}
+
+/// [`grouped_indexed_option`] over a device-resident record table
+/// ([`inference_cuda_exl3_indexed_table`]): one kernel per stage for the whole batch, past the
+/// parameter block's 20-pair cap. `pairs` points at `pairs_count` packed records (upload of
+/// [`indexed_table_records`]' bytes), `k_units`/`n_tiles`/`n_units` are the batch's widest
+/// shapes and `options` carries only the DP4A and pipeline bits.
+pub(in crate::kernels::cuda) fn indexed_table(
+    stream: &RawStream,
+    pairs: *const c_void,
+    pairs_count: usize,
+    k_units: u32,
+    n_tiles: u32,
+    n_units: u32,
+    flag: *mut c_void,
+    fused_publish: u32,
+    options: u32,
+) -> Result<(), DeviceFailure> {
+    let mut stage = STAGE_NONE;
+    // SAFETY: as `grouped_indexed_option`; the records carry what the parameter block would,
+    // validated by the packer, and the scratch holds `pairs_count` of them.
+    let status = unsafe {
+        inference_cuda_exl3_indexed_table(
+            pairs.cast(),
+            pairs_count,
+            k_units,
+            n_tiles,
+            n_units,
+            flag.cast(),
+            fused_publish,
             stream.as_ptr(),
             &mut stage,
             options,

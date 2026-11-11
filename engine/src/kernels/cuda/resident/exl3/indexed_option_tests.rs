@@ -18,9 +18,10 @@ use std::ffi::OsStr;
 
 use super::{
     DP4A_VAR, Exl3IndexedCall, Exl3LinearCall, INDEXED_CAPACITY, INDEXED_PAIRS_VAR, IndexedOptions,
-    PIPE_VAR, SINGLE_GATHER_VAR, SingleRow, check_indexed_with, dp4a_from_env, indexed_from_env,
-    indexed_pairs_from_env, merge_indexed, pipe_from_env,
+    PIPE_VAR, SINGLE_GATHER_VAR, SingleRow, TABLE_VAR, check_indexed_with, dp4a_from_env,
+    indexed_from_env, indexed_pairs_from_env, merge_indexed, pipe_from_env, table_from_env,
 };
+use crate::kernels::cuda::native::resident::exl3::TABLE_PAIRS_MAX;
 use crate::kernels::cuda::{CudaContext, DeviceBuffer, DeviceStream, testkit};
 use crate::weights::exl3::Codebook;
 
@@ -34,6 +35,8 @@ const BOTH: IndexedOptions = IndexedOptions::BOTH;
 const PIPE: IndexedOptions = IndexedOptions::PIPE;
 const PAIRS20_PIPE: IndexedOptions = IndexedOptions::PAIRS20_PIPE;
 const BOTH_PIPE: IndexedOptions = IndexedOptions::BOTH_PIPE;
+const TABLE: IndexedOptions = IndexedOptions::TABLE;
+const TABLE_ALL: IndexedOptions = IndexedOptions::TABLE_ALL;
 
 #[test]
 fn the_switches_parse_strictly() {
@@ -42,6 +45,14 @@ fn the_switches_parse_strictly() {
     assert_eq!(dp4a_from_env(None), Ok(None));
     assert_eq!(indexed_pairs_from_env(None), Ok(None));
     assert_eq!(pipe_from_env(None), Ok(None));
+    assert_eq!(table_from_env(None), Ok(None));
+    for (value, on) in [("0", false), ("1", true), (" 1 ", true)] {
+        assert_eq!(parse(table_from_env, value), Ok(Some(on)), "{value:?}");
+    }
+    for bad in ["", "on", "2", "01", "table"] {
+        let error = parse(table_from_env, bad).expect_err(bad);
+        assert!(error.contains(TABLE_VAR), "{bad:?}: {error}");
+    }
     for (value, on) in [("0", false), ("1", true), (" 1 ", true)] {
         assert_eq!(parse(pipe_from_env, value), Ok(Some(on)), "{value:?}");
     }
@@ -73,19 +84,30 @@ fn the_switches_parse_strictly() {
 /// own option alone: `0` and `16` switch a registered default off, `1` and `20` switch one on.
 #[test]
 fn a_set_variable_wins_over_the_context_default_for_its_own_option() {
-    assert_eq!(merge_indexed(OFF, (None, None, None)), OFF);
-    assert_eq!(merge_indexed(BOTH, (None, None, None)), BOTH);
-    assert_eq!(merge_indexed(BOTH, (Some(false), None, None)), PAIRS20);
-    assert_eq!(merge_indexed(BOTH, (None, Some(false), None)), DP4A);
-    assert_eq!(merge_indexed(BOTH, (Some(false), Some(false), None)), OFF);
-    assert_eq!(merge_indexed(OFF, (Some(true), None, None)), DP4A);
-    assert_eq!(merge_indexed(DP4A, (None, Some(true), None)), BOTH);
-    assert_eq!(merge_indexed(OFF, (None, None, Some(true))), PIPE);
+    assert_eq!(merge_indexed(OFF, (None, None, None, None)), OFF);
+    assert_eq!(merge_indexed(BOTH, (None, None, None, None)), BOTH);
     assert_eq!(
-        merge_indexed(BOTH_PIPE, (Some(false), Some(false), None)),
+        merge_indexed(BOTH, (Some(false), None, None, None)),
+        PAIRS20
+    );
+    assert_eq!(merge_indexed(BOTH, (None, Some(false), None, None)), DP4A);
+    assert_eq!(
+        merge_indexed(BOTH, (Some(false), Some(false), None, None)),
+        OFF
+    );
+    assert_eq!(merge_indexed(OFF, (Some(true), None, None, None)), DP4A);
+    assert_eq!(merge_indexed(DP4A, (None, Some(true), None, None)), BOTH);
+    assert_eq!(merge_indexed(OFF, (None, None, Some(true), None)), PIPE);
+    assert_eq!(merge_indexed(OFF, (None, None, None, Some(true))), TABLE);
+    assert_eq!(
+        merge_indexed(TABLE_ALL, (Some(false), None, Some(false), Some(false))),
+        OFF
+    );
+    assert_eq!(
+        merge_indexed(BOTH_PIPE, (Some(false), Some(false), None, None)),
         PIPE
     );
-    assert_eq!(merge_indexed(BOTH, (None, None, Some(false))), BOTH);
+    assert_eq!(merge_indexed(BOTH, (None, None, Some(false), None)), BOTH);
 }
 
 /// The pair of switches the environment read goes through (the function the production read
@@ -94,26 +116,41 @@ fn a_set_variable_wins_over_the_context_default_for_its_own_option() {
 #[test]
 fn the_two_switches_select_their_options_independently() {
     let os = |v: &'static str| Some(OsStr::new(v));
-    let read = |dp4a, pairs, pipe| {
-        indexed_from_env(dp4a, pairs, pipe).map(|explicit| merge_indexed(OFF, explicit))
+    let read = |dp4a, pairs, pipe, table| {
+        indexed_from_env(dp4a, pairs, pipe, table).map(|explicit| merge_indexed(OFF, explicit))
     };
-    assert_eq!(read(None, None, None), Ok(OFF));
-    assert_eq!(read(os("1"), None, None), Ok(DP4A));
-    assert_eq!(read(None, os("20"), None), Ok(PAIRS20));
-    assert_eq!(read(os("1"), os("20"), None), Ok(BOTH));
-    assert_eq!(read(os("0"), os("16"), None), Ok(OFF));
-    assert_eq!(read(None, None, os("1")), Ok(PIPE));
-    assert_eq!(read(os("1"), os("20"), os("1")), Ok(BOTH_PIPE));
-    for (dp4a, pairs, pipe, var) in [
-        (os("on"), None, None, DP4A_VAR),
-        (os("1"), os("32"), None, INDEXED_PAIRS_VAR),
-        (None, os(""), None, INDEXED_PAIRS_VAR),
-        (os("2"), os("20"), None, DP4A_VAR),
-        (None, None, os("yes"), PIPE_VAR),
-        (os("1"), None, os("2"), PIPE_VAR),
+    assert_eq!(read(None, None, None, None), Ok(OFF));
+    assert_eq!(read(os("1"), None, None, None), Ok(DP4A));
+    assert_eq!(read(None, os("20"), None, None), Ok(PAIRS20));
+    assert_eq!(read(os("1"), os("20"), None, None), Ok(BOTH));
+    assert_eq!(read(os("0"), os("16"), None, None), Ok(OFF));
+    assert_eq!(read(None, None, os("1"), None), Ok(PIPE));
+    assert_eq!(read(os("1"), os("20"), os("1"), None), Ok(BOTH_PIPE));
+    assert_eq!(read(None, None, None, os("1")), Ok(TABLE));
+    // The pair count env still fills its own option under the table form (which ignores it).
+    assert_eq!(
+        read(os("1"), os("20"), os("1"), os("1")),
+        Ok(IndexedOptions {
+            dp4a: true,
+            pairs20: true,
+            pipeline: true,
+            table: true
+        })
+    );
+    for (dp4a, pairs, pipe, table, var) in [
+        (os("on"), None, None, None, DP4A_VAR),
+        (os("1"), os("32"), None, None, INDEXED_PAIRS_VAR),
+        (None, os(""), None, None, INDEXED_PAIRS_VAR),
+        (os("2"), os("20"), None, None, DP4A_VAR),
+        (None, None, os("yes"), None, PIPE_VAR),
+        (os("1"), None, os("2"), None, PIPE_VAR),
+        (None, None, None, os("table"), TABLE_VAR),
     ] {
-        let error = read(dp4a, pairs, pipe).expect_err("a bad value");
-        assert!(error.contains(var), "{dp4a:?} {pairs:?} {pipe:?}: {error}");
+        let error = read(dp4a, pairs, pipe, table).expect_err("a bad value");
+        assert!(
+            error.contains(var),
+            "{dp4a:?} {pairs:?} {pipe:?} {table:?}: {error}"
+        );
     }
 }
 
@@ -137,6 +174,8 @@ fn an_option_changes_only_the_launches_it_names() {
         (PIPE, 16, "pipe"),
         (PAIRS20_PIPE, 20, "pairs20+pipe"),
         (BOTH_PIPE, 20, "all"),
+        (TABLE, 65535, "table"),
+        (TABLE_ALL, 65535, "dp4a+table+pipe"),
     ] {
         assert_eq!(options.capacity(), capacity, "{options:?}");
         assert_eq!(options.name(), name);
@@ -157,7 +196,7 @@ fn an_option_refuses_a_wide_kernel_of_more_than_one_tile() {
     for kernel in [SingleRow::Wide(2), SingleRow::Wide(4)] {
         assert!(check_indexed_with(kernel, OFF).is_ok(), "{kernel:?}");
         // The refusal names the switches that are on, and the kernel switch to change.
-        for options in [DP4A, PAIRS20, BOTH, PIPE, BOTH_PIPE] {
+        for options in [DP4A, PAIRS20, BOTH, PIPE, BOTH_PIPE, TABLE, TABLE_ALL] {
             let error = check_indexed_with(kernel, options).expect_err("a wide kernel");
             let whole = format!("{error:?}");
             // The first part names the options that are on; the tail names both off values.
@@ -181,10 +220,16 @@ fn an_option_refuses_a_wide_kernel_of_more_than_one_tile() {
                 options.pipeline,
                 "{options:?}: {whole}"
             );
+            assert_eq!(
+                text.contains(TABLE_VAR),
+                options.table,
+                "{options:?}: {whole}"
+            );
             assert!(
                 tail.contains(&format!("{DP4A_VAR}=0"))
                     && tail.contains(&format!("{INDEXED_PAIRS_VAR}=16"))
-                    && tail.contains(&format!("{PIPE_VAR}=0")),
+                    && tail.contains(&format!("{PIPE_VAR}=0"))
+                    && tail.contains(&format!("{TABLE_VAR}=0")),
                 "{options:?}: {whole}"
             );
         }
@@ -201,6 +246,11 @@ fn the_load_line_names_exactly_the_options_that_are_on() {
     assert_eq!(
         BOTH_PIPE.suffix(),
         " exl3_dp4a=on exl3_indexed_pairs=20 exl3_pipeline=on"
+    );
+    assert_eq!(TABLE.suffix(), " exl3_table=on");
+    assert_eq!(
+        TABLE_ALL.suffix(),
+        " exl3_dp4a=on exl3_pipeline=on exl3_table=on"
     );
 }
 
@@ -531,7 +581,16 @@ fn indexed_options_write_the_bytes_of_the_default_launch() {
         let mut bad = ids;
         bad[17] = bank.members as i32;
         bad[19] = -1;
-        for options in [DP4A, PAIRS20, BOTH, PIPE, PAIRS20_PIPE, BOTH_PIPE] {
+        for options in [
+            DP4A,
+            PAIRS20,
+            BOTH,
+            PIPE,
+            PAIRS20_PIPE,
+            BOTH_PIPE,
+            TABLE,
+            TABLE_ALL,
+        ] {
             ctx.set_indexed_options(Some(options));
             let got = bank.run(&ctx, &stream, &ids);
             assert_eq!(got, want, "{kind:?} {options:?}");
@@ -584,9 +643,16 @@ fn only_the_twenty_pair_option_takes_twenty_calls_in_one_launch() {
             "{options:?} took 20 calls"
         );
     }
-    for options in [PAIRS20, BOTH, PAIRS20_PIPE, BOTH_PIPE] {
+    for options in [PAIRS20, BOTH, PAIRS20_PIPE, BOTH_PIPE, TABLE, TABLE_ALL] {
         ctx.set_indexed_options(Some(options));
-        assert_eq!(ctx.exl3_indexed_capacity(), PAIRS);
+        assert_eq!(
+            ctx.exl3_indexed_capacity(),
+            if options.table {
+                TABLE_PAIRS_MAX
+            } else {
+                PAIRS
+            }
+        );
         let got = bank.run_in(&ctx, &stream, &ids, (PAIRS, 1)).unwrap();
         assert_eq!(got, want, "{options:?}");
     }
@@ -602,5 +668,7 @@ fn only_the_twenty_pair_option_takes_twenty_calls_in_one_launch() {
     ctx.set_indexed_options(Some(PAIRS20));
     assert!(bank.run_in(&ctx, &stream, &ids, (PAIRS, 2)).is_err());
     assert_eq!(bank.run_in(&ctx, &stream, &ids, (16, 2)).unwrap(), want);
+    ctx.set_indexed_options(Some(TABLE));
+    assert!(bank.run_in(&ctx, &stream, &ids, (PAIRS, 2)).is_err());
     ctx.set_indexed_options(None);
 }

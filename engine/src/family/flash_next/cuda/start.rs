@@ -113,6 +113,7 @@ const SERVED_INDEXED: IndexedOptions = IndexedOptions {
     dp4a: true,
     pairs20: true,
     pipeline: true,
+    table: false,
 };
 
 /// Registers the kernels the Flash-Next decode runs on its context: the wide single-row kernel for

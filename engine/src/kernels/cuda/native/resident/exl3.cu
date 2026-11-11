@@ -1663,6 +1663,119 @@ __global__ void __launch_bounds__(256, wide_min_blocks<1>) option_project(
     indexed_project_body<1, Dp4a, Pipe>(p, partial, wtab);
 }
 
+// ---- Pointer-table batched launch (`inference_cuda_exl3_indexed_table`) ----
+// The parameter block caps one launch at 20 pairs; a routed prefill chunk wants hundreds.
+// The table launch moves the pair records to device memory: the host fills one scratch table
+// with a single copy and each stage is ONE kernel over the whole batch. The records are what
+// the option launch packs per pair, plus k and n per record because a batch may mix shapes
+// (gate/up k=hidden n=inter, down k=inter n=hidden). The grid keeps the option launch's axes -
+// x is the column unit, y the pair - so the shared bodies read their coordinates unchanged;
+// the kernel guards the units past a narrow record's shape. Bodies, arithmetic and bytes are
+// the option launch's. These three records are the C ABI of the header's table entries, so
+// they sit at global scope beside the parameter blocks the other C entries take.
+} // namespace
+struct IndexedTablePair {
+    GroupEntry entry;  // as the option launch packs it: first = the record grid row, rows = 1
+    IndexInfo info;
+    uint32_t k, n;
+};
+struct TableLaunch {
+    const IndexedTablePair *pairs;
+    uint32_t *flag;
+    uint32_t fused_publish;
+};
+static_assert(sizeof(IndexedTablePair) == 128 && sizeof(IndexedTablePair) % 8 == 0
+    && sizeof(TableLaunch) <= 32,
+    "table launch parameters: the Rust pack buffer sizes one record at 128 bytes");
+
+namespace {
+
+// The per-record view the shared bodies take where the option launch passes its parameter
+// block: shape, flag and the split-2 fold constant are the only fields the indexed bodies read.
+struct PairView {
+    uint32_t k, n;
+    uint32_t fused_publish;
+    uint32_t *flag;
+    static constexpr uint32_t split_k = 2;
+};
+
+// The resolve of the table launch: record y's entry with its bank id applied. A bad id raises
+// the flag from the block of unit 0 only, as the option launch does from x = 0, z = 0.
+template <bool Unit0Only>
+__device__ __forceinline__ bool resolve_table(const TableLaunch &l, PairView &p, GroupEntry &a) {
+    const IndexedTablePair &tp = l.pairs[blockIdx.y];
+    p = {tp.k, tp.n, l.fused_publish, l.flag};
+    a = tp.entry;
+    const IndexInfo &info = tp.info;
+    const int id = info.ids[info.slot];
+    const bool first_block = blockIdx.x == 0 && blockIdx.z == 0 && threadIdx.x == 0;
+    if (id < 0 || uint32_t(id) >= info.members) {
+        if (Unit0Only && first_block) atomicOr(l.flag, 1u);
+        return false;
+    }
+    if (info.offsets) {
+        const uint32_t offset = info.offsets[id];
+        if (offset == absent_member) {
+            if (Unit0Only && first_block) atomicOr(l.flag, 1u);
+            return false;
+        }
+        a.trellis = reinterpret_cast<const uint16_t *>(
+            reinterpret_cast<const char *>(a.trellis) + offset);
+        a.suh += offset / 4;
+        a.svh += offset / 4;
+        return true;
+    }
+    a.trellis = reinterpret_cast<const uint16_t *>(
+        reinterpret_cast<const char *>(a.trellis) + size_t(id) * info.trellis_stride);
+    a.suh += size_t(id) * info.scale_stride;
+    a.svh += size_t(id) * info.scale_stride;
+    return true;
+}
+
+__global__ void table_input_rotate(const __grid_constant__ TableLaunch l) {
+    __shared__ float values[128];
+    PairView p;
+    GroupEntry a;
+    if (!resolve_table<true>(l, p, a)) return;
+    const size_t index = size_t(blockIdx.x) * 128 + threadIdx.x;
+    if (index >= size_t(p.k)) return;  // narrow records leave their tail threads idle
+    const float value = finite_or_flag(a.x[index] * a.suh[index % p.k], p.flag);
+    a.xh[index] = finite_or_flag(rotate128(value, values), p.flag);
+}
+
+template <bool Dp4a, bool Pipe>
+__global__ void __launch_bounds__(256, wide_min_blocks<1>) table_project(
+    const __grid_constant__ TableLaunch l) {
+    __shared__ float partial[8][16];
+    __shared__ __align__(8) unsigned wtab[8][1][128];
+    PairView p;
+    GroupEntry a;
+    if (!resolve_table<false>(l, p, a)) return;
+    if (size_t(blockIdx.x) * 16 >= p.n) return;
+    switch (a.book) {
+        case 0: wide_by_rate<0, 1, true, PairView, Dp4a, Pipe>(p, a, wtab[threadIdx.x / 32], partial); break;
+        case 1: wide_by_rate<1, 1, true, PairView, Dp4a, Pipe>(p, a, wtab[threadIdx.x / 32], partial); break;
+        default: wide_by_rate<2, 1, true, PairView, Dp4a, Pipe>(p, a, wtab[threadIdx.x / 32], partial); break;
+    }
+}
+
+__global__ void table_output_rotate(const __grid_constant__ TableLaunch l) {
+    __shared__ float values[128];
+    PairView p;
+    GroupEntry a;
+    if (!resolve_table<true>(l, p, a)) return;
+    const size_t index = size_t(blockIdx.x) * 128 + threadIdx.x;
+    if (index >= size_t(p.n)) return;
+    const size_t col = index % p.n;
+    float z = a.z[index];
+    z = finite_or_flag(z + a.out[index], p.flag);
+    const float rotated = rotate128(z, values);
+    const float value = rotated * a.svh[col] + (a.bias ? a.bias[col] : 0.0f);
+    const float stored = p.fused_publish ?
+        __bfloat162float(__float2bfloat16_rn(value)) : value;
+    a.out[index] = finite_or_flag(stored, p.flag);
+}
+
 template <class P>
 __global__ void option_output_rotate(const __grid_constant__ P p) {
     __shared__ float values[128];
@@ -1858,6 +1971,80 @@ static int indexed_launch(const inference_cuda_exl3_linear_args *calls,
     } catch (...) { return INFERENCE_CUDA_NATIVE_EXCEPTION; }
 }
 
+// Packs the pointer-table records host-side and validates them for
+// inference_cuda_exl3_indexed_table: per record the option launch's geometry, view and id-index
+// checks, but shape may differ per record (k and n travel with the record) and the spans are
+// per record, so the option launch's shared-span contiguity gives way to cross-record checks:
+// every record's writes apart from every record's reads and writes, one flat flag and one
+// fused-publish arm for the batch.
+static bool table_pack(const inference_cuda_exl3_linear_args *calls,
+    const inference_cuda_exl3_index_args *index, size_t count, uint32_t split,
+    IndexedTablePair *out) {
+    if (!calls || !index || count < 1) return false;
+    struct View { const void *p; size_t bytes; };
+    for (size_t i = 0; i < count; ++i) {
+        const auto &a = calls[i];
+        if (!linear_geometry(a.rows, a.k, a.n, a.bits_twice, a.book, split, false) ||
+            a.rows != 1 || !linear_views(a, split)) return false;
+        const auto &x = index[i];
+        if (!x.ids || x.ids_bytes < (size_t(x.slot) + 1) * 4 || uintptr_t(x.ids) % 4 ||
+            !x.members ||
+            (x.offsets ? uintptr_t(x.offsets) % 4 != 0
+                       : (!x.trellis_stride || !x.scale_stride)))
+            return false;
+        if (a.flag != calls[0].flag || a.fused_publish != calls[0].fused_publish) return false;
+        out[i].entry = {a.trellis, a.suh, a.svh, a.bias, a.x, a.xh, a.z, a.out,
+            a.bits_twice, a.book, uint32_t(i), 1u};
+        out[i].info = {x.ids, x.slot, x.members, x.trellis_stride, x.scale_stride, x.offsets};
+        out[i].k = uint32_t(a.k);
+        out[i].n = uint32_t(a.n);
+    }
+    // Cross-record isolation: one record's writes never overlap another record's reads or
+    // writes. Reads may overlap reads (records of one bank share its trellis).
+    const auto writes_of = [&](size_t i, View (&w)[4]) {
+        const auto &a = calls[i];
+        w[0] = {a.xh, a.k * 4};
+        w[1] = {a.z, a.n * 4};  // split-2 folds one partial plane
+        w[2] = {a.out, a.n * 4};
+        w[3] = {a.flag, 4};
+    };
+    const auto reads_of = [&](size_t i, View (&r)[7]) {
+        const auto &a = calls[i];
+        r[0] = {a.trellis, a.k * a.n / 256 * size_t(a.bits_twice) * 16};
+        r[1] = {a.suh, a.k * 4};
+        r[2] = {a.svh, a.n * 4};
+        r[3] = {a.bias, a.bias ? a.n * 4 : 0};
+        r[4] = {a.x, a.k * 4};
+        r[5] = {index[i].ids, size_t(index[i].slot + 1) * 4};
+        r[6] = {index[i].offsets, index[i].offsets ? size_t(index[i].members) * 4 : 0};
+    };
+    View wi[4], wj[4], ri[7], rj[7];
+    for (size_t i = 0; i < count; ++i) {
+        writes_of(i, wi);
+        reads_of(i, ri);
+        for (size_t j = 0; j < count; ++j) {
+            if (i == j) continue;
+            writes_of(j, wj);
+            reads_of(j, rj);
+            for (const auto &w : wi) {
+                if (!w.bytes) continue;
+                for (const auto &o : wj)
+                    // The batch shares one completion flag: the only alias two records may
+                    // write (the pack already refused records with different flag pointers).
+                    if (o.bytes && w.p != o.p && !apart(w.p, w.bytes, o.p, o.bytes)) return false;
+                for (const auto &r : rj)
+                    if (r.bytes && !apart(w.p, w.bytes, r.p, r.bytes)) return false;
+            }
+            for (const auto &r : ri)
+                if (r.bytes) {
+                    for (const auto &o : wj)
+                        if (o.bytes && !apart(r.p, r.bytes, o.p, o.bytes)) return false;
+                }
+        }
+    }
+    return true;
+}
+
 // The id-indexed launch of an option on parameter block P, one tile per block.
 template <class P, bool Dp4a, bool Pipe = false>
 static int option_launch(const inference_cuda_exl3_linear_args *calls,
@@ -2001,6 +2188,63 @@ extern "C" int inference_cuda_exl3_grouped_indexed_option(
         case 7:
             return option_launch<IndexedOptionArgs, true, true>(calls, index, count, stream, out_stage);
         default: return INFERENCE_CUDA_INVALID_ARGUMENT;
+    }
+}
+
+// The pointer-table batched launch of the id-indexed kernels: one kernel per stage over every
+// record of the batch (`pairs_count` device records, filled and validated host-side). The
+// grids take the batch's widest shape; narrow records idle their tail blocks (per-thread for
+// the rotates, per-tile for the project). `k_units` is ceil(widest k / 128), `n_tiles` the
+// widest n / 16 and `n_units` ceil(widest n / 128). Options bit 0 is the DP4A decode, bit 2
+// the pipelined tile loop; the 20-pair and pong bits do not apply (no parameter block).
+extern "C" int inference_cuda_exl3_indexed_table(
+    const IndexedTablePair *pairs, size_t pairs_count, uint32_t k_units, uint32_t n_tiles,
+    uint32_t n_units, uint32_t *flag, uint32_t fused_publish, void *stream, int *out_stage,
+    unsigned options) {
+    try {
+        report_stage(out_stage, INFERENCE_CUDA_STAGE_NONE);
+        if (!stream || !pairs || !flag || pairs_count < 1 || pairs_count > 65535 ||
+            !k_units || !n_tiles || !n_units || options & ~5u)
+            return INFERENCE_CUDA_INVALID_ARGUMENT;
+        const TableLaunch l{pairs, flag, fused_publish};
+        Failure failure;
+        table_input_rotate<<<dim3(k_units, unsigned(pairs_count)), 128, 0,
+            (cudaStream_t)stream>>>(l);
+        failure.record(cudaGetLastError(), INFERENCE_CUDA_STAGE_LAUNCH);
+        if (failure.err == cudaSuccess) {
+            const dim3 grid(n_tiles, unsigned(pairs_count), 2);
+            if (options & 1u)
+                if (options & 4u) table_project<true, true><<<grid, 256, 0, (cudaStream_t)stream>>>(l);
+                else table_project<true, false><<<grid, 256, 0, (cudaStream_t)stream>>>(l);
+            else if (options & 4u) table_project<false, true><<<grid, 256, 0, (cudaStream_t)stream>>>(l);
+            else table_project<false, false><<<grid, 256, 0, (cudaStream_t)stream>>>(l);
+            failure.record(cudaGetLastError(), INFERENCE_CUDA_STAGE_LAUNCH);
+        }
+        if (failure.err == cudaSuccess) {
+            table_output_rotate<<<dim3(n_units, unsigned(pairs_count)), 128, 0,
+                (cudaStream_t)stream>>>(l);
+            failure.record(cudaGetLastError(), INFERENCE_CUDA_STAGE_LAUNCH);
+        }
+        if (failure.err != cudaSuccess) return INFERENCE_CUDA_NATIVE_EXCEPTION;
+        return INFERENCE_CUDA_OK;
+    } catch (...) {
+        return INFERENCE_CUDA_NATIVE_EXCEPTION;
+    }
+}
+
+// Packs `pairs_count` records into the caller's HOST buffer `out` for
+// inference_cuda_exl3_indexed_table: the option launch's per-call checks per record, shapes may
+// differ, spans per record, cross-record isolation enforced. Returns 0 on success; the caller
+// uploads the buffer and computes the widest-shape grids from its own records.
+extern "C" int inference_cuda_exl3_indexed_table_pack(
+    const inference_cuda_exl3_linear_args *calls, const inference_cuda_exl3_index_args *index,
+    size_t pairs_count, IndexedTablePair *out) {
+    try {
+        if (!out || !table_pack(calls, index, pairs_count, 2, out))
+            return INFERENCE_CUDA_INVALID_ARGUMENT;
+        return INFERENCE_CUDA_OK;
+    } catch (...) {
+        return INFERENCE_CUDA_NATIVE_EXCEPTION;
     }
 }
 

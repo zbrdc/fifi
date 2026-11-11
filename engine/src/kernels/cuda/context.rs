@@ -1368,7 +1368,7 @@ pub(crate) fn drop_page_cache(file: &std::fs::File, offset: u64, len: u64) -> Re
     })
 }
 
-fn device_error(failure: DeviceFailure) -> EngError {
+pub(crate) fn device_error(failure: DeviceFailure) -> EngError {
     native_error(&TERMINAL, graph::operation_of(&failure), failure.status)
 }
 
