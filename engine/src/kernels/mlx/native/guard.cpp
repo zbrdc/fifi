@@ -2878,7 +2878,11 @@ static int compile_moe_lhs_build(
 // corrupted later evaluations in the full test suite. The map therefore only grows - one
 // entry per (adapter stream, batch, top_k), which is four entries for a serving adapter.
 static std::mutex compile_moe_lhs_mutex_;
-static std::map<std::tuple<uintptr_t, int, int>, std::pair<mlx_array, mlx_array>>
+// Kind 0 = decode-slot key (compile_moe_lhs_load; the else-slot collapses every batch outside
+// {1,2,4} to 3), kind 1 = raw row count (compile_moe_lhs_for; arbitrary chunk T). Without the
+// kind field a slot-3 entry of batch 8 and a raw entry of T=3 share the key, and the window
+// closure traces an (8,8) gather index pair against (3,8) operands.
+static std::map<std::tuple<uintptr_t, int, int, int>, std::pair<mlx_array, mlx_array>>
     compile_moe_lhs_cache_;
 
 // Returns retained (rows, flat) operands for `batch` rows over `top_k` experts, building the
@@ -2891,7 +2895,7 @@ static int compile_moe_lhs_load(
   // was built and evaluated on. Entries are never freed - a compiled tape may hold the pair it
   // was traced with - and a retired adapter's entries are never read again.
   const int slot = compile_moe_lhs_index(batch);
-  const std::tuple<uintptr_t, int, int> key(owner, slot, top_k);
+  const std::tuple<uintptr_t, int, int, int> key(owner, slot, top_k, 0);
   std::lock_guard<std::mutex> lock(compile_moe_lhs_mutex_);
   const auto found = compile_moe_lhs_cache_.find(key);
   if (found != compile_moe_lhs_cache_.end()) {
@@ -2919,7 +2923,7 @@ static int compile_moe_lhs_load(
 static int compile_moe_lhs_for(
     mlx_array* rows, mlx_array* flat, uintptr_t owner, int batch, int top_k,
     mlx_stream s) noexcept {
-  const std::tuple<uintptr_t, int, int> key(owner, batch, top_k);
+  const std::tuple<uintptr_t, int, int, int> key(owner, batch, top_k, 1);
   std::lock_guard<std::mutex> lock(compile_moe_lhs_mutex_);
   const auto found = compile_moe_lhs_cache_.find(key);
   if (found != compile_moe_lhs_cache_.end()) {

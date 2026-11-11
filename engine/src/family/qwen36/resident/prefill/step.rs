@@ -333,6 +333,8 @@ fn run(
             && !(mode == StepMode::Prompt && index == last)
             && decoder.routing == Routing::Device
             && compiled_layer_on()
+            // 1-row chunks (a window replay tail) stay eager: the closure needs T >= 2.
+            && rows >= 2
             // The fused `gdn_prep` kernel inside the closure carries the production head
             // layout (the same gate as the eager fused prefill); other dims stay eager.
             && shape.delta.key_heads == 16
@@ -818,8 +820,10 @@ mod tests {
             let eager = ok(decoder.prefill(&mut a, &tokens, StepMode::Window), "eager");
             COMPILED_LAYER_TEST.store(true, Ordering::Relaxed);
             let mut b = decoder.zero_state().unwrap();
-            let flagged =
-                ok(decoder.prefill(&mut b, &tokens, StepMode::Window), "flagged");
+            let flagged = ok(
+                decoder.prefill(&mut b, &tokens, StepMode::Window),
+                "flagged",
+            );
             COMPILED_LAYER_TEST.store(false, Ordering::Relaxed);
             assert_eq!(eager, flagged, "rows {rows}: the flag changes nothing here");
             // Result equality alone proves the gate held: the closure's fused `gdn_prep`
@@ -849,15 +853,15 @@ mod tests {
             &real.config,
         )
         .unwrap();
-        let mut decoder = crate::family::qwen36::resident::decoder::ResidentDecoder::
-            new_with_activation(
-            crate::kernels::MlxKernels::try_new().unwrap(),
-            &real.ckpt,
-            host,
-            512,
-            crate::family::qwen36::settings::Activation::Bf16,
-        )
-        .unwrap();
+        let mut decoder =
+            crate::family::qwen36::resident::decoder::ResidentDecoder::new_with_activation(
+                crate::kernels::MlxKernels::try_new().unwrap(),
+                &real.ckpt,
+                host,
+                512,
+                crate::family::qwen36::settings::Activation::Bf16,
+            )
+            .unwrap();
         decoder.routing = Routing::Device;
         let bits = |kernels: &mut crate::kernels::MlxKernels, t: &ExecutionTensor| -> Vec<u32> {
             ok(values(kernels, t), "values")
@@ -865,7 +869,18 @@ mod tests {
                 .map(|v| v.to_bits())
                 .collect()
         };
-        let tokens: Vec<u32> = (11..19).collect();
+        let tokens: Vec<u32> = (11..75).collect();
+        // Reproduce the serve order that broke the first run: a `Prompt` prefill (its chunks
+        // trace the closure at their row count, here 8) BEFORE the smaller verify windows -
+        // if the MLX cache wrongly reuses the first trace at a new T, the broadcast error
+        // appears here instead of in a serve run.
+        {
+            let mut pre = decoder.zero_state().unwrap();
+            ok(
+                decoder.prefill(&mut pre, &tokens[..64], StepMode::Prompt),
+                "prompt",
+            );
+        }
         for rows in [2usize, 3, 8] {
             let toks = &tokens[..rows];
             crate::kernels::mlx::reset_dispatch_count();
@@ -884,7 +899,10 @@ mod tests {
             );
             let compiled_ops = crate::kernels::mlx::dispatch_count();
             COMPILED_LAYER_TEST.store(false, Ordering::Relaxed);
-            assert_eq!(eager, compiled, "rows {rows}: the whole step result matches");
+            assert_eq!(
+                eager, compiled,
+                "rows {rows}: the whole step result matches"
+            );
             for (l, (a, b)) in eager_state
                 .layers()
                 .iter()
