@@ -8,7 +8,8 @@
  *
  * Fill (`fill_dense_args` in the .cu, pinned field by field by the CPU test through
  * inference_cuda_mmq_dense_fill): ids_dst = expert_bounds = NULL (the kernel's dense branch
- * is exactly `ids_dst == NULL`, mmq.cuh:961/:1049), ncols_max = ncols_opt = m, one channel,
+ * is exactly `ids_dst == NULL`, mmq.cuh:961/:1049), ncols_max = m and ncols_opt = m unless a
+ * positive `cols_hint` steers the tile-width choice (the launch grid still uses ncols_max), one channel,
  * one sample, zero strides, `stride_row_x = k / qk` blocks, `nrows_dst = ld`, and
  * `dst = base + col_off` so a GEMM can write its slice of a fused [m][ld] destination.
  *

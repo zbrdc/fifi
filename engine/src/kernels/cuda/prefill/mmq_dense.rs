@@ -51,7 +51,9 @@ const GRID_LIMIT: usize = 1 << 30;
 /// The tile-width hint for dense launches: `INFERENCE_CUDA_MMQ_DENSE_COLS_HINT`, unset or
 /// `off`/`auto`/`0` keeps the stock first-J-with-fewest-tiles heuristic, a positive number
 /// steers `ncols_opt` (the same knob class as `INFERENCE_CUDA_MMID_COLS_HINT`, whose mmid
-/// fix measured +18% prefill on Xavier). Read once per process.
+/// fix measured +18% prefill on Xavier). A hint that changes J also changes the stream-k
+/// accumulation order, so armed output is not bitwise stock output on stream-k types.
+/// Read once per process.
 fn dense_cols_hint() -> Option<i64> {
     static HINT: std::sync::OnceLock<Option<String>> = std::sync::OnceLock::new();
     let raw = HINT.get_or_init(|| std::env::var("INFERENCE_CUDA_MMQ_DENSE_COLS_HINT").ok());

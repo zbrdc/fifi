@@ -175,8 +175,10 @@ size_t fixup_need(const inference_cuda_mmq_dense_args &a, const fifi_device_fact
         return 0;
     }
     const ggml_cuda_mmq_config config = ggml_cuda_mmq_get_config(type, best_j, fallback, dev.cc);
+    // The tile count mirrors the launch grid: ncols_max governs it (mmq.cuh:1506), only the
+    // J choice above reads ncols_opt (switch_J, mmq.cuh:1610). Under a hint < m these differ.
     const long long tiles =
-        (long long)ceil_div(ncols_opt_of(a), config.J) * ceil_div(a.n, config.I);
+        (long long)ceil_div(a.m, config.J) * ceil_div(a.n, config.I);
     const long long waves = ceil_div(tiles, dev.nsm);
     const bool tiling = GGML_CUDA_CC_IS_NVIDIA(dev.cc) && 100 * tiles / (dev.nsm * waves) >= 90;
     const long long blocks = tiling ? tiles : dev.nsm;
