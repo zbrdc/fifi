@@ -1051,9 +1051,12 @@ mod tests {
             println!(
                 "COMPILED_LAYER_PARITY rows={rows} eager_ops={eager_ops} compiled_ops={compiled_ops}"
             );
+            // The eager baseline is not a constant: when main wired compiled delta rows
+            // into the chunk path (the post-10cfc615e merges) eager dropped from ~8,100 to
+            // ~990 entries, so only strict improvement is claimed here, not a fixed ratio.
             assert!(
-                compiled_ops * 2 < eager_ops,
-                "rows {rows}: compiled {compiled_ops} entries must be under half of eager {eager_ops} (the residue is the eager window attention middle, the still-shared head, and the chunk edges)"
+                compiled_ops < eager_ops,
+                "rows {rows}: compiled {compiled_ops} entries must stay under eager {eager_ops} (the residue is the eager window attention middle, the still-shared head, and the chunk edges)"
             );
         }
     }
