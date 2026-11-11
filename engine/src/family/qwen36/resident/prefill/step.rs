@@ -407,15 +407,20 @@ fn run(
         // folded device-routed MoE rows sequence) - with the eager window attention middle
         // (`attn::chunk_core`: RoPE, the cache-form casts, the append, and the
         // position-dependent prefix attention) between them. The same regime gates as the
-        // delta closure; no dims gate, because these closures bake no fused kernel and no
-        // production layout (the POST body implements the composite gate chain, which the
-        // fused `attn_gate` kernel is the byte-equal replacement of). The query-slice block
-        // setting does not apply: the closure reads one attention call over the whole chunk.
+        // delta closure; the dims gate keeps the closures on the production attention layout
+        // of the 35B A3B (16 query heads, 2 KV heads, width 256 - also the fused attn_gate
+        // regime, whose kernel the POST body's composite chain replaces byte-equal, proven
+        // by the oracle), so the flag keeps changing nothing where the closure is
+        // unqualified. The query-slice block setting does not apply: the closure reads one
+        // attention call over the whole chunk.
         if mode != StepMode::Record
             && !(mode == StepMode::Prompt && index == last)
             && decoder.routing == Routing::Device
             && compiled_layer_on()
             && (2..16).contains(&rows)
+            && shape.attn.heads_q == 16
+            && shape.attn.heads_kv == 2
+            && shape.attn.head_dim == 256
         {
             if let (RMixer::Attn(w), LayerState::Attn(cache), RFeedForward::Moe(moe_w)) =
                 (&layer.mixer, &old_layer, &layer.feed_forward)
