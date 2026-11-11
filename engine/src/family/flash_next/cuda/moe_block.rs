@@ -1259,8 +1259,11 @@ mod device {
         /// through it.
         ///
         /// Accuracy: a streamed record's bits equal its banked bits (the same pinned-store
-        /// bytes), and the combine runs once over every pick, so the sum is the resident
-        /// reference's association exactly.
+        /// bytes), and the combine runs once over every pick, so the sum's association is the
+        /// resident reference's. The launch family differs, though: this branch's job-table
+        /// tile kernels stage the activation as F16 operands (2^-11 operand error), the flat
+        /// launches the resident reference runs do not — the ring device test bounds that
+        /// difference, which no source split or pick ordering can move.
         fn run_rows_ring(
             &mut self,
             launch: &Launch<'_>,

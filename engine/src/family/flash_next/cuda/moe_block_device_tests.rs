@@ -61,10 +61,15 @@ const F32: usize = 4;
 const SLOTS: usize = 16;
 /// The two groupings of the sums differ only by association: a handful of float roundings.
 const SPLIT_BOUND: f64 = 1e-6;
-/// The funded ring splits a row's picks over two sources, so its down passes sum the routed
-/// picks in a different order than the one-order references (all-resident and fp64) — the
-/// reassociation the job table introduced lane-wide; the driver oracle pins the end-to-end
-/// result at 64 rows. One order of magnitude over the per-pick rounding.
+/// The ring branch computes every projection through the job-table tile kernels, which stage
+/// the F32 activation as F16 operands (documented operand error 2^-11, `exl3.cu`'s
+/// midrows_projection; the hi/lo opt-in cuts it to ~2^-22), while the all-resident and fp64
+/// references run the F32-operand flat launches. Measured 1.5e-4 to 2.1e-4 relative L2,
+/// identical whether every pick sits in the bank, in the ring, or split over both (the
+/// sources and their order change nothing; FIFI_FLASH_NEXT_RING_HELD arms those variants),
+/// and identical with the fused pair launch on and off. The bound keeps ~2x headroom over
+/// the measured spread; the resident comparison cannot tighten to SPLIT_BOUND because the
+/// difference is the launch family, not the sources.
 const RING_BOUND: f64 = 4e-4;
 
 fn pack_dir() -> PathBuf {
@@ -530,8 +535,10 @@ impl RigRows {
 
 /// `run_rows` with the prefill ring funded: every pick reads its bank slot or its ring slot,
 /// the bank's miss counter stays flat (the ring path never steps or admits the bank), and
-/// every row matches the all-resident block within the split bound and fp64 within the output
-/// bound, run after run (the ring re-arms per chunk like the driver cadence).
+/// every row matches the all-resident block and fp64 within RING_BOUND run after run (the
+/// ring re-arms per chunk like the driver cadence). RING_BOUND, not SPLIT_BOUND, because the
+/// ring branch's job-table tile kernels carry the F16 operand staging the flat-launch
+/// references do not — see the bound's doc for the measurements that isolated it.
 #[test]
 #[ignore = "needs a GPU (about 3 GiB of ring and bank, about 2 GiB of pinned host memory per bank and FIFI_FLASH_NEXT_EXL3_PACK"]
 fn a_chunk_over_the_prefill_ring_matches_the_all_resident_block() {
