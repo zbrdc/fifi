@@ -106,6 +106,14 @@ even if the picker changes. Older clients that do not identify the model send
 trace lookups to the primary; refresh the GUI after upgrading. Retained traces
 include generated token pieces and are accessible through a keyless LAN GUI.
 
+The router lets Node keep backend sockets open between requests, so an
+established connection to an engine does not show that a request is running.
+Set `FIFI_ROUTER_CLOSE_BACKEND_CONNECTIONS=1` in the router's environment to
+stop pooling forwarded backend sockets and to request connection close on the
+model-list fetches. Active streams stay open until they finish, and a client
+disconnect still cancels its upstream stream. The variable is off by default
+and is read once when the router starts.
+
 ## GPU test coordination
 
 A permanently resident process on the spare GPU breaks any machine-wide
