@@ -67,6 +67,35 @@ impl CardDevice {
     }
 }
 
+/// The expert bank's placement state: slots per layer and a SHA-256 over every layer's
+/// `(place, expert)` residents, by place. The step-0 logits of a run follow this state (the
+/// bank size and the free VRAM at load pick the residents), so two run records compare only
+/// at the same digest.
+#[cfg(test)]
+fn bank_placement_digest(moe: &SplitMoeAt<'static>) -> (u32, String) {
+    use sha2::{Digest, Sha256};
+    let state = moe.bank().state();
+    let geometry = *state.geometry();
+    let mut hasher = Sha256::new();
+    for layer in 0..geometry.layers {
+        hasher.update((layer as u32).to_le_bytes());
+        for (place, expert) in state.places().occupied(layer) {
+            hasher.update(place.to_le_bytes());
+            hasher.update(expert.to_le_bytes());
+        }
+    }
+    (geometry.slots as u32, format!("{:x}", hasher.finalize()))
+}
+
+impl CardDevice {
+    /// The bank's placement digest (slots per layer, SHA-256 of the residents at load):
+    /// what a run record's step-0 logits hash compares at.
+    #[cfg(test)]
+    pub(super) fn placement_digest(&self) -> Option<(u32, String)> {
+        Some(bank_placement_digest(&self.moe))
+    }
+}
+
 impl StartSink for CardDevice {
     fn write_step_params(&mut self, token: i32, pos: i32) -> Result<(), EngError> {
         let params = StepParams::new(token, pos)?;
@@ -187,6 +216,13 @@ impl CardChunkDevice {
     /// The bank's statistics line, as 's.
     pub(super) fn bank_misses(&self) -> u64 {
         self.moe.bank().stats().misses
+    }
+
+    /// The bank's placement digest (slots per layer, SHA-256 of the residents at load):
+    /// what a run record's step-0 logits hash compares at.
+    #[cfg(test)]
+    pub(super) fn placement_digest(&self) -> Option<(u32, String)> {
+        Some(bank_placement_digest(&self.moe))
     }
 }
 

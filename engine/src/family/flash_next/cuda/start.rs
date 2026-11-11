@@ -859,6 +859,16 @@ impl StepDriver {
         }
     }
 
+    /// The bank's placement digest (slots per layer, SHA-256 of the resident set at load):
+    /// the state a run record's step-0 logits hash compares at, `None` without a bank.
+    #[cfg(test)]
+    pub(super) fn placement_digest(&self) -> Option<(u32, String)> {
+        match self {
+            Self::Token(driver) => driver.device().placement_digest(),
+            Self::Chunk(driver) => driver.device().placement_digest(),
+        }
+    }
+
     /// The last step's stage times, for the driver device tests. The chunk driver does not
     /// track stage times; the stage table runs on the token driver.
     pub(super) fn last_times(&self) -> TokenTimes {

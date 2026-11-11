@@ -17,6 +17,11 @@
 //! Reported: the generated ids against the oracle's, the stage table, and the step-0 relative L2,
 //! largest difference, argmax and top-20 overlap against the oracle's full row.
 //!
+//! The `engine.json` record carries `bank_slots` and `resident_sha256` — the load's placement
+//! state. The step-0 logits (and any digest of them) follow that state, not just the binary:
+//! the bank size and the free VRAM at load pick the residents, so two records compare only at
+//! the same digest.
+//!
 //! `teacher_forced_steps_follow_the_oracle_on_every_prompt`: every oracle prompt, fed the oracle's
 //! tokens, in one process.
 //! - `FIFI_FLASH_NEXT_EXL3_PACK`, `_DRIVER_ORACLE`, `_DRIVER_CONTEXT` (default: the largest prompt
@@ -321,6 +326,9 @@ fn the_first_real_tokens_match_the_oracle() {
     )
     .expect("build the driver");
     println!("load: {:.1} s", began.elapsed().as_secs_f64());
+    // The placement the run compares at: the load filled the residents this digest names, and
+    // the step-0 logits hash follows it (bank size and free VRAM at load pick them).
+    let placement = driver.placement_digest();
 
     let (last, head) = prompt.split_last().expect("a prompt");
     let fed = std::time::Instant::now();
@@ -443,6 +451,8 @@ fn the_first_real_tokens_match_the_oracle() {
             "schema": "fifi-flash-next-oracle/1", "role": "engine", "prompt": wanted_id,
             "prompt_ids": prompt, "generated": generated, "steps": records,
             "agree_prefix": agree,
+            "bank_slots": placement.as_ref().map(|p| p.0),
+            "resident_sha256": placement.as_ref().map(|p| p.1.clone()),
         });
         std::fs::write(
             out.join("engine.json"),
