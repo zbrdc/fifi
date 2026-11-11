@@ -16,7 +16,7 @@
   "targets": {
     "lib": {
       "path": "src/lib.rs",
-      "test_fns": 6714,
+      "test_fns": 6718,
       "ignored": 591,
       "env_gates": [
         "CUDA_MODULE_LOADING",
@@ -236,6 +236,7 @@
         "INFERENCE_CUDA_MEASURE_TRIM_DIR",
         "INFERENCE_CUDA_MEASURE_TRIM_ONLY",
         "INFERENCE_CUDA_MMID_COLS_HINT",
+        "INFERENCE_CUDA_MMQ_DENSE_COLS_HINT",
         "INFERENCE_CUDA_MOE_GLU_FUSE",
         "INFERENCE_CUDA_REQUIRE_DEVICE",
         "INFERENCE_CUDA_TILED_HEAD",
