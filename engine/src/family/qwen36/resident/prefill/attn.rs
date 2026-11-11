@@ -179,6 +179,7 @@ pub(super) fn chunk_core(
     let m = &mut *ctx.kernels;
     let q = m.rope_scaled(q, &rope)?;
     let k_new = m.rope_scaled(k_new, &rope)?;
+    let v_new = v_new.share();
     // The cache form (as the decode step of `attn.rs`): the F32 control keeps its cast to F32
     // whatever the activation dtype (the cast runs before the append so that a cache which starts
     // with this chunk is F32 too), and the Q8 form keeps the activation dtype, so the quantized

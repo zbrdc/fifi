@@ -2135,6 +2135,30 @@ impl MlxKernels {
         self.context.compiled_delta_layer(args)
     }
 
+    /// The PRE head of one attention layer of the chunk prefill (B1v2) through one
+    /// `mlx_compile`d closure: the input norm, the q/k/v projections, the q/k head norms, and
+    /// the gate slice, batched to `[1, heads, T, width]` for the eager window attention core.
+    /// See the `Context` method of the same name in `kernels/mlx/native/compile.rs`.
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub(crate) fn compiled_attn_pre_layer(
+        &mut self,
+        args: &native::compile::CompileAttnPreLayerArgs<'_>,
+    ) -> Result<native::compile::CompiledAttnPreLayer, EngError> {
+        self.context.compiled_attn_pre_layer(args)
+    }
+
+    /// The POST tail of one attention layer of the chunk prefill (B1v2) through one
+    /// `mlx_compile`d closure: the composite gate chain, the output projection, the mixer
+    /// residual, and the folded device-routed MoE rows sequence. See the `Context` method of
+    /// the same name in `kernels/mlx/native/compile.rs`.
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub(crate) fn compiled_attn_post_layer(
+        &mut self,
+        args: &native::compile::CompileAttnPostLayerArgs<'_>,
+    ) -> Result<native::compile::CompiledAttnPostLayer, EngError> {
+        self.context.compiled_attn_post_layer(args)
+    }
+
     /// Staged B2/4/8 DeltaNet seam. Slot zero is in `args`; other states follow row order.
     /// The resident decoder stays solo until its separate preparation and wiring gate.
     #[cfg_attr(not(test), allow(dead_code))]
