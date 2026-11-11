@@ -16,8 +16,8 @@
   "targets": {
     "lib": {
       "path": "src/lib.rs",
-      "test_fns": 6688,
-      "ignored": 587,
+      "test_fns": 6690,
+      "ignored": 588,
       "env_gates": [
         "CUDA_MODULE_LOADING",
         "DEFAULT_ON_CHILD",
@@ -278,6 +278,7 @@
         "Q36_CHUNKS",
         "Q36_COMPARE_A",
         "Q36_COMPARE_B",
+        "Q36_COMPILED_LAYER",
         "Q36_CUDA_BENCH_INPUT_DIR",
         "Q36_CUDA_BENCH_OUT",
         "Q36_CUDA_CHUNK_PREFILL",
@@ -320,10 +321,12 @@
         "Q36_SCALE_DTYPE",
         "Q36_SECTION_CORE_MARKS",
         "Q36_SOURCE_COMMIT",
+        "Q36_SPEC_STEP_WINDOW",
         "Q36_SPEED_8K",
         "Q36_SPEED_ROUTING",
         "Q36_THREADS",
         "Q36_WIDE_EQ_DUMP",
+        "Q36_WINDOW_TAPS",
         "Q8_TILED_ENV_PROBE",
         "Q8_TILED_RUNTIME_STEP_PROBE",
         "Q8_TILED_WRITER_ROUTE_PROBE",
