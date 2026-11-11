@@ -114,7 +114,7 @@ pub(super) fn chunk_sliced(
     let v_new = m.transpose(&vp, &[1, 0, 2])?;
     let v_new = m.reshape(&v_new, &[1, kv_heads, rows, width])?;
     // 5-6. RoPE, the cache-form casts, the capacity append, and the causal attention core
-    // over the valid prefix (the eager middle shared with the B1v2 compiled layer).
+    // over the valid prefix (the eager middle shared with the compiled attention layer).
     let (att, cache) = chunk_core(ctx, shape, cache, pos, rows, &q, &k_new, &v_new, slice)?;
     // 7. Back to rows, sigmoid output gate, and output projection. The attention output is F32
     // over the F32 cache and follows the query dtype over the Q8 cache; the projection takes the
@@ -139,7 +139,7 @@ pub(super) fn chunk_sliced(
     Ok(AttnStep { out, cache })
 }
 
-/// The eager middle of one attention chunk between the B1v2 compiled closures: RoPE on the
+/// The eager middle of one attention chunk between the compiled attention closures: RoPE on the
 /// normed queries and keys, the cache-form casts, the capacity append, and the causal
 /// attention core over the valid prefix. The projections, head norms, and gate slice (the
 /// PRE closure) and the gate chain plus output projection (the POST closure) stay outside.

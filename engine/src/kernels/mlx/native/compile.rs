@@ -253,7 +253,7 @@ pub(crate) struct CompiledDeltaLayer {
 }
 
 /// The flat input list and the baked constants of one compiled attention-layer PRE closure
-/// of the chunk prefill (B1v2). Every tensor must belong to this adapter.
+/// of the chunk prefill (window attention closure). Every tensor must belong to this adapter.
 pub(crate) struct CompileAttnPreLayerArgs<'a> {
     /// The raw residual stream `[T, H]` in the activation dtype (T in 2..=1024): the closure
     /// folds the input RMS norm at its head.
@@ -289,7 +289,7 @@ pub(crate) struct CompiledAttnPreLayer {
 }
 
 /// The flat input list and the baked constants of one compiled attention-layer POST closure
-/// of the chunk prefill (B1v2). Every tensor must belong to this adapter.
+/// of the chunk prefill (window attention closure). Every tensor must belong to this adapter.
 pub(crate) struct CompileAttnPostLayerArgs<'a> {
     /// The attention core output `[1, heads, T, width]`: F32 over the F32 cache, the
     /// activation dtype over the quantized cache. The dtype joins the compile cache key.
@@ -482,6 +482,40 @@ fn check_logical(
 
 fn native_dim(label: &'static str, value: u32) -> Result<i32, EngError> {
     i32::try_from(value).map_err(|_| EngError::BadRequest(format!("{label} dimension exceeds i32")))
+}
+
+/// The native attention post-layer body's fixed input order, one tag per caller input.
+/// The wrapper (`Context::compiled_attn_post_layer`) pushes its tensors in exactly this
+/// order; the pure test below pins every position so the Rust push order and the native
+/// index map cannot drift apart silently again (the first serve run caught a reordered
+/// triple only through the Mac oracle).
+pub(in crate::kernels::mlx) fn attn_post_layer_input_tags() -> [&'static str; 24] {
+    [
+        "att",
+        "gate",
+        "h",
+        "o_proj.payload",
+        "o_proj.scales",
+        "o_proj.biases",
+        "post_norm",
+        "router_t",
+        "shared_gate.payload",
+        "shared_gate.scales",
+        "shared_gate.biases",
+        "shared_up.payload",
+        "shared_up.scales",
+        "shared_up.biases",
+        "shared_down.payload",
+        "shared_down.scales",
+        "shared_down.biases",
+        "shared_scalar",
+        "stack_gate_up.payload",
+        "stack_gate_up.scales",
+        "stack_gate_up.biases",
+        "stack_down.payload",
+        "stack_down.scales",
+        "stack_down.biases",
+    ]
 }
 
 impl Context {
@@ -1386,7 +1420,7 @@ impl Context {
         })
     }
 
-    /// Runs the PRE head of one attention layer of the chunk prefill (B1v2) through one
+    /// Runs the PRE head of one attention layer of the chunk prefill (window attention closure) through one
     /// `mlx_compile`d closure: the input RMS norm, the q, k, v projections, the q/k head
     /// norms, and the gate slice. Returns the normed q and the new k/v, batched to
     /// `[1, heads, T, width]` for the eager window attention core (it reads the
@@ -1609,7 +1643,7 @@ impl Context {
         })
     }
 
-    /// Runs the POST tail of one attention layer of the chunk prefill (B1v2) through one
+    /// Runs the POST tail of one attention layer of the chunk prefill (window attention closure) through one
     /// `mlx_compile`d closure: the composite gate chain, the output projection, the mixer
     /// residual, and the folded device-routed MoE rows sequence (post norm, router, gathered
     /// experts, shared expert, output residual) — the same fold as
@@ -1752,7 +1786,7 @@ impl Context {
         for weight in args.stacks {
             push_triple(&mut inputs, weight);
         }
-        debug_assert_eq!(inputs.len(), 24);
+        debug_assert_eq!(inputs.len(), attn_post_layer_input_tags().len());
         for weight in std::iter::once(args.packed)
             .chain(args.shared.iter().copied())
             .chain(args.stacks.iter().copied())
@@ -2189,6 +2223,66 @@ pub(in crate::kernels::mlx) fn native_trace_counts() -> (u64, u64, u64) {
 /// Zeroes the native closure-body entry counts. Test builds only: `compile_stats::reset` calls
 /// this with its own reset, so a test that reads `traces` sees its own traces and not the body
 /// entries of the tests before it.
+
+#[cfg(test)]
+mod attn_post_layer_input_order {
+    /// The tag contract: the wrapper pushes exactly these 24 entries in this order, and the
+    /// native body reads them at exactly these indices (guard.cpp maps 0=att, 1=gate, 2=h,
+    /// 3..5 the o_proj triple, 6 post_norm, 7 router_t, 8..16 the three shared triples,
+    /// 16 the shared scalar, 17..23 the two stack triples, 24/25 the appended lhs pair).
+    #[test]
+    fn positions_match_the_native_body_index_map() {
+        let tags = super::attn_post_layer_input_tags();
+        assert_eq!(tags.len(), 24);
+        assert_eq!(tags[0], "att");
+        assert_eq!(tags[1], "gate");
+        assert_eq!(tags[2], "h");
+        assert_eq!(
+            &tags[3..6],
+            ["o_proj.payload", "o_proj.scales", "o_proj.biases"]
+        );
+        assert_eq!(tags[6], "post_norm");
+        assert_eq!(tags[7], "router_t");
+        assert_eq!(
+            &tags[8..11],
+            [
+                "shared_gate.payload",
+                "shared_gate.scales",
+                "shared_gate.biases"
+            ]
+        );
+        assert_eq!(
+            &tags[11..14],
+            ["shared_up.payload", "shared_up.scales", "shared_up.biases"]
+        );
+        assert_eq!(
+            &tags[14..17],
+            [
+                "shared_down.payload",
+                "shared_down.scales",
+                "shared_down.biases"
+            ]
+        );
+        assert_eq!(tags[17], "shared_scalar");
+        assert_eq!(
+            &tags[18..21],
+            [
+                "stack_gate_up.payload",
+                "stack_gate_up.scales",
+                "stack_gate_up.biases"
+            ]
+        );
+        assert_eq!(
+            &tags[21..24],
+            [
+                "stack_down.payload",
+                "stack_down.scales",
+                "stack_down.biases"
+            ]
+        );
+    }
+}
+
 #[cfg(test)]
 pub(in crate::kernels::mlx) fn native_trace_reset() {
     unsafe { ffi::mlx_compile_reset_trace_counts() };

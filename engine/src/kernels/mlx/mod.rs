@@ -2137,7 +2137,7 @@ impl MlxKernels {
         self.context.compiled_delta_layer(args)
     }
 
-    /// The PRE head of one attention layer of the chunk prefill (B1v2) through one
+    /// The PRE head of one attention layer of the chunk prefill (window attention closure) through one
     /// `mlx_compile`d closure: the input norm, the q/k/v projections, the q/k head norms, and
     /// the gate slice, batched to `[1, heads, T, width]` for the eager window attention core.
     /// See the `Context` method of the same name in `kernels/mlx/native/compile.rs`.
@@ -2149,7 +2149,7 @@ impl MlxKernels {
         self.context.compiled_attn_pre_layer(args)
     }
 
-    /// The POST tail of one attention layer of the chunk prefill (B1v2) through one
+    /// The POST tail of one attention layer of the chunk prefill (window attention closure) through one
     /// `mlx_compile`d closure: the composite gate chain, the output projection, the mixer
     /// residual, and the folded device-routed MoE rows sequence. See the `Context` method of
     /// the same name in `kernels/mlx/native/compile.rs`.

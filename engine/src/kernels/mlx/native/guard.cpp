@@ -3703,7 +3703,7 @@ extern "C" int inference_mlx_compile_attn_pre_layer_block(
   });
 }
 
-// ===== Attention post-core WINDOW closure (B1v2) =====
+// ===== Attention post-core WINDOW closure (window attention) =====
 // The whole tail of an attention layer of the verify window as one compiled closure: the
 // sigmoid output gate (the COMPOSITE chain - the fused attn_gate kernel is dense-only
 // heads==16/width==256 and the wiring dims gate excludes it), the cast to the activation
@@ -3711,7 +3711,7 @@ extern "C" int inference_mlx_compile_attn_pre_layer_block(
 // rows sequence of the delta layer closure verbatim (post norm, router, gathered experts,
 // shared expert, final residual). The rope/append/attention core stay eager (offset and
 // prefix len must not bake); this body picks up at the eager core's `att` output.
-// 26 caller inputs (the wrapper appends the lhs pair as 24/25, tracing 26):
+// 24 caller inputs (the wrapper appends the lhs pair as 24/25, so the body reads 26):
 //   0 att [1, heads, T, width] F32 or the activation dtype (the eager core output)
 //   1 gate [T, heads, width] activation dtype
 //   2 h [T, H] activation dtype (the RAW residual stream)

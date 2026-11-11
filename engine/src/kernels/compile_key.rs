@@ -235,7 +235,7 @@ pub(crate) fn flint_tail_fun_id(baked: &FlintTailBaked) -> u64 {
 }
 
 /// The baked constants of one compiled attention-layer PRE closure of the chunk prefill
-/// (B1v2): the input RMS norm, the q, k, v projections, the q and k head norms, and the
+/// (window attention closure): the input RMS norm, the q, k, v projections, the q and k head norms, and the
 /// gate slice. T is NOT baked: the nonshapeless MLX cache specializes it under the one
 /// key, like the whole-layer delta closure.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -273,7 +273,7 @@ pub(crate) fn attn_pre_layer_fun_id(baked: &AttnPreLayerBaked) -> u64 {
 }
 
 /// The baked constants of one compiled attention-layer POST closure of the chunk prefill
-/// (B1v2): the composite gate chain, the output projection, the mixer residual, and the
+/// (window attention closure): the composite gate chain, the output projection, the mixer residual, and the
 /// folded device-routed MoE rows sequence (post norm, router, gathered experts, shared
 /// expert, output residual) — the same fold as the whole-layer delta closure. T rides on
 /// the residual operand's shape and is NOT baked.

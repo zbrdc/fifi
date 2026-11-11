@@ -327,7 +327,7 @@ fn run(
     // `route_experts` and holds no node.
     let mut healths: Vec<ExecutionTensor> = Vec::new();
     for (index, (layer, old_layer)) in weights.layers.iter().zip(old).enumerate() {
-        // B1 (`Q36_COMPILED_LAYER=1`): one DELTA-mixer layer with a device-routed MoE runs as
+        // (`Q36_COMPILED_LAYER=1`): one DELTA-mixer layer with a device-routed MoE runs as
         // ONE compiled closure instead of ~395 eager native entries. The states the closure
         // does not cover keep the eager body below: `Record` (its recorded rows), the last
         // layer of a `Prompt` chunk (it skips its MoE), host routing, and any non-Delta or
@@ -398,28 +398,35 @@ fn run(
             });
             check_dtype("compiled layer output", &h, ctx.consts.act)?;
             continue;
-        } // B1v2 (`Q36_COMPILED_LAYER=1`): one ATTN-mixer layer runs as TWO compiled closures -
+        }
+        // (`Q36_COMPILED_LAYER=1`): one ATTN-mixer layer runs as TWO compiled closures -
         // PRE (the input norm, the q/k/v projections, the q/k head norms, the gate slice) and
         // POST (the composite gate chain, the output projection, the mixer residual, and the
         // folded device-routed MoE rows sequence) - with the eager window attention middle
         // (`attn::chunk_core`: RoPE, the cache-form casts, the append, and the
-        // position-dependent prefix attention) between them. The same regime gates as the
-        // delta closure; the dims gate keeps the closures on the production attention layout
-        // of the 35B A3B (16 query heads, 2 KV heads, width 256 - also the fused attn_gate
-        // regime, whose kernel the POST body's composite chain replaces byte-equal, proven
-        // by the oracle), so the flag keeps changing nothing where the closure is
-        // unqualified. The query-slice block setting does not apply: the closure reads one
-        // attention call over the whole chunk.
+        // position-dependent prefix attention) between them. The regime gates mirror the
+        // delta closure (fused prefill included, so the fused-prefill kill switch also
+        // disarms these closures); the dims gate keeps the closures on the production
+        // attention layout of the 35B A3B (16 query heads, 2 KV heads, width 256 - also
+        // the fused attn_gate regime, whose kernel the POST body's composite chain
+        // replaces byte-equal, proven by the oracle), so the flag keeps changing nothing
+        // where the closure is unqualified. The query-slice block setting does not apply:
+        // the closure reads one attention call over the whole chunk.
         if mode != StepMode::Record
             && !(mode == StepMode::Prompt && index == last)
             && decoder.routing == Routing::Device
             && compiled_layer_on()
+            && fused_prefill_enabled()
             && (2..16).contains(&rows)
             && shape.attn.heads_q == 16
             && shape.attn.heads_kv == 2
             && shape.attn.head_dim == 256
             && let (RMixer::Attn(w), LayerState::Attn(cache), RFeedForward::Moe(moe_w)) =
                 (&layer.mixer, &old_layer, &layer.feed_forward)
+            // The acceptance oracle proves byte parity for the F32 and Q8 cache forms; the
+            // BF16 cache stays eager until an oracle arm covers it (its casts live in the
+            // shared eager middle, but the form stays unproven, so it does not enter).
+            && !matches!(cache.kv, KvDtype::Bf16)
         {
             let a = &shape.attn;
             let pre = ctx
@@ -439,6 +446,12 @@ fn run(
             let (att, cache) = attn::chunk_core(
                 &mut ctx,
                 shape,
+                // Stated limit of the flag: this `share()` keeps `old_layer`'s KV buffers
+                // alive through the iteration, so `kv_append` inside `chunk_core` copies
+                // the whole cache capacity (no buffer donation) per attention layer -
+                // about 1 GiB transient at a 256K F32 cache. Acceptable for the
+                // verify-window regime (the caller already holds a snapshot share there);
+                // it must be fixed by taking the layer by value before any default flip.
                 cache.share(),
                 pos,
                 rows,
@@ -915,17 +928,27 @@ mod tests {
         }
     }
 
-    /// The B1 acceptance oracle on the production checkpoint: the same device-routed Window
-    /// chunk runs eager and through the compiled whole-layer closure, and EVERY compared byte
-    /// must match - the step result, and each DeltaNet layer's recurrent state and ring. This
-    /// also decides the `moe::chunk_device`-versus-rows-sequence numerics question at batch T:
-    /// the closure replays the rows sequence, so byte equality proves the two agree exactly.
-    /// Ignored without the checkpoint: run on the Mac with `Q36_CKPT_DIR` set (the tokenizer
-    /// file is not needed - fixed token ids keep the comparison input-identical).
+    /// The compiled-layer acceptance oracle on the production checkpoint, run once per
+    /// covered KV cache form (F32 and Q8 - the two forms the closures admit; BF16 stays
+    /// eager until an arm covers it): the same device-routed Window chunk runs eager and
+    /// through the compiled whole-layer closure, and EVERY compared byte must match - the
+    /// step result, each DeltaNet layer's recurrent state and ring, and each attention
+    /// layer's full KV capacity buffers. This also decides the
+    /// `moe::chunk_device`-versus-rows-sequence numerics question at batch T: the closure
+    /// replays the rows sequence, so byte equality proves the two agree exactly. Ignored
+    /// without the checkpoint: run on the Mac with `Q36_CKPT_DIR` set (the tokenizer file
+    /// is not needed - fixed token ids keep the comparison input-identical).
     #[test]
     #[ignore = "needs the real checkpoint: set Q36_CKPT_DIR"]
     fn the_compiled_layer_chunk_is_byte_equal_on_the_real_checkpoint() {
         let _serial = crate::native_test_lock();
+        compiled_layer_chunk_parity_on(KvDtype::F32);
+        compiled_layer_chunk_parity_on(KvDtype::Q8);
+    }
+
+    /// One KV-form arm of the acceptance oracle above: `kv` fixes the cache form the
+    /// decoder plans, and the byte comparison below covers that form's buffers.
+    fn compiled_layer_chunk_parity_on(kv: KvDtype) {
         use super::super::super::executor::COMPILED_LAYER_TEST;
         use std::sync::atomic::Ordering;
         let dir = super::super::super::real::env_path("Q36_CKPT_DIR");
@@ -936,15 +959,15 @@ mod tests {
             &real.config,
         )
         .unwrap();
-        let mut decoder =
-            crate::family::qwen36::resident::decoder::ResidentDecoder::new_with_activation(
-                crate::kernels::MlxKernels::try_new().unwrap(),
-                &real.ckpt,
-                host,
-                512,
-                crate::family::qwen36::settings::Activation::Bf16,
-            )
-            .unwrap();
+        let mut decoder = crate::family::qwen36::resident::decoder::ResidentDecoder::new_with_kv(
+            crate::kernels::MlxKernels::try_new().unwrap(),
+            &real.ckpt,
+            host,
+            512,
+            crate::family::qwen36::settings::Activation::Bf16,
+            kv,
+        )
+        .unwrap();
         decoder.routing = Routing::Device;
         let bits = |kernels: &mut crate::kernels::MlxKernels, t: &ExecutionTensor| -> Vec<u32> {
             ok(values(kernels, t), "values")
@@ -980,6 +1003,7 @@ mod tests {
             let eager_ops = crate::kernels::mlx::dispatch_count();
             COMPILED_LAYER_TEST.store(true, Ordering::Relaxed);
             crate::kernels::mlx::reset_dispatch_count();
+            let attn_calls_before = decoder.kernels.compile_counters().attn.calls;
             let mut compiled_state = decoder.zero_state().unwrap();
             let compiled = ok(
                 decoder.prefill(&mut compiled_state, toks, StepMode::Window),
@@ -987,16 +1011,27 @@ mod tests {
             );
             let compiled_ops = crate::kernels::mlx::dispatch_count();
             COMPILED_LAYER_TEST.store(false, Ordering::Relaxed);
+            // The attention closures must actually have run: each attention layer pays one
+            // PRE and one POST call per compiled chunk, so a silent gate failure leaves the
+            // count flat and fails here instead of passing vacuously on the eager fallback.
+            let attn_calls = {
+                let after = decoder.kernels.compile_counters().attn.calls;
+                after - attn_calls_before
+            };
             assert_eq!(
                 eager, compiled,
                 "rows {rows}: the whole step result matches"
             );
+            let mut attn_layers = 0usize;
             for (l, (a, b)) in eager_state
                 .layers()
                 .iter()
                 .zip(compiled_state.layers())
                 .enumerate()
             {
+                if matches!(a, LayerState::Attn(_)) {
+                    attn_layers += 1;
+                }
                 match (a, b) {
                     (
                         LayerState::Delta {
@@ -1021,10 +1056,30 @@ mod tests {
                     }
                     (LayerState::Attn(a), LayerState::Attn(b)) => {
                         assert_eq!(a.len, b.len, "rows {rows} layer {l}: cache length");
-                        // B1v2: the attention layers run through the PRE/POST closures with
+                        // the attention layers run through the PRE/POST closures with
                         // the eager middle shared, so the cache buffers themselves must be
-                        // byte equal, not just the length (the F32 form the decoder plans;
-                        // another form extends this arm).
+                        // byte equal, not just the length. Both covered forms compare here:
+                        // F32 (the control) and Q8 (the form the serve A/B measured).
+                        let q8_bits =
+                            |kernels: &mut crate::kernels::MlxKernels,
+                             a: &super::super::attn::Q8Tensor,
+                             b: &super::super::attn::Q8Tensor| {
+                                assert_eq!(
+                                    bits(kernels, &a.codes),
+                                    bits(kernels, &b.codes),
+                                    "rows {rows} layer {l}: the key/value codes are byte equal"
+                                );
+                                assert_eq!(
+                                    bits(kernels, &a.scales),
+                                    bits(kernels, &b.scales),
+                                    "rows {rows} layer {l}: the codes' scales are byte equal"
+                                );
+                                assert_eq!(
+                                    bits(kernels, &a.biases),
+                                    bits(kernels, &b.biases),
+                                    "rows {rows} layer {l}: the codes' biases are byte equal"
+                                );
+                            };
                         match (a.buffers.as_ref(), b.buffers.as_ref()) {
                             (
                                 Some(KvBuffers::F32 { k: ak, v: av }),
@@ -1041,6 +1096,13 @@ mod tests {
                                     "rows {rows} layer {l}: the value cache is byte equal"
                                 );
                             }
+                            (
+                                Some(KvBuffers::Q8 { k: ak, v: av }),
+                                Some(KvBuffers::Q8 { k: bk, v: bv }),
+                            ) => {
+                                q8_bits(&mut decoder.kernels, ak, bk);
+                                q8_bits(&mut decoder.kernels, av, bv);
+                            }
                             (None, None) => {}
                             _ => panic!("rows {rows} layer {l}: cache form mismatch"),
                         }
@@ -1049,11 +1111,22 @@ mod tests {
                 }
             }
             println!(
-                "COMPILED_LAYER_PARITY rows={rows} eager_ops={eager_ops} compiled_ops={compiled_ops}"
+                "COMPILED_LAYER_PARITY kv={kv:?} rows={rows} attn_layers={attn_layers} attn_calls={attn_calls} eager_ops={eager_ops} compiled_ops={compiled_ops}"
             );
-            // The eager baseline is not a constant: when main wired compiled delta rows
-            // into the chunk path (the post-10cfc615e merges) eager dropped from ~8,100 to
-            // ~990 entries, so only strict improvement is claimed here, not a fixed ratio.
+            assert!(
+                attn_calls >= 2 * attn_layers as u64,
+                "rows {rows}: the attention closures must run once per layer pair (calls {attn_calls} < 2 x {attn_layers})"
+            );
+            // The eager baseline is not a constant (main wiring compiled delta rows into the
+            // chunk path moved it), so the saving is pinned per attention layer instead of as
+            // a ratio: each closed attention layer removes the eager qkv/moe dispatch storm.
+            // The pin comes from the Mac receipt at the review tip (rows 2 saves 78, rows 3/8
+            // save 117 entries over the 32 attention layers of the 35B A3B).
+            assert!(
+                eager_ops - compiled_ops >= (attn_layers as u64) * 2,
+                "rows {rows}: the compiled chunk must save at least 2 entries per attention layer (saved {}, layers {attn_layers})",
+                eager_ops - compiled_ops
+            );
             assert!(
                 compiled_ops < eager_ops,
                 "rows {rows}: compiled {compiled_ops} entries must stay under eager {eager_ops} (the residue is the eager window attention middle, the still-shared head, and the chunk edges)"

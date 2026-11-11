@@ -955,9 +955,10 @@ unsafe extern "C" {
         fun_id: usize,
         stream: mlx_stream,
     ) -> i32;
-    /// The attention-layer PRE closure of the chunk prefill as one compiled closure (B1v2,
-    /// behind `qwen36.compile`): the input RMS norm, the q, k, v projections, the q and k
-    /// head norms, and the gate slice. `dims` holds hidden, heads, kv_heads, width; `quant`
+    /// The attention-layer PRE closure of the chunk prefill as one compiled closure (window
+    /// attention closure, behind the `Q36_COMPILED_LAYER` env var only): the input RMS norm,
+    /// the q, k, v projections, the q and k head norms, and the gate slice. `dims` holds
+    /// hidden, heads, kv_heads, width; `quant`
     /// holds mode, group, bits per weight for the q, k, v projections; `inputs` holds the 13
     /// closure inputs (the residual stream `[T, H]`, then the q, k, v packed triples, then
     /// q_norm, k_norm, then the folded input norm weight). The four outputs
@@ -978,9 +979,10 @@ unsafe extern "C" {
         fun_id: usize,
         stream: mlx_stream,
     ) -> i32;
-    /// The attention-layer POST closure of the chunk prefill as one compiled closure (B1v2,
-    /// behind `qwen36.compile`): the composite gate chain, the output projection, the mixer
-    /// residual, and the folded device-routed MoE rows sequence. `dims` holds hidden, heads,
+    /// The attention-layer POST closure of the chunk prefill as one compiled closure (window
+    /// attention closure, behind the `Q36_COMPILED_LAYER` env var only): the composite gate
+    /// chain, the output projection, the mixer residual, and the folded device-routed MoE
+    /// rows sequence. `dims` holds hidden, heads,
     /// width, experts, top_k, renorm; `quant` holds mode, group, bits per weight for the six
     /// packed weights (o_proj, shared gate, shared up, shared down, gate/up stack, down
     /// stack); `inputs` holds the 24 caller inputs (the attention core output
