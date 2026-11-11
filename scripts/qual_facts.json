@@ -16,8 +16,8 @@
   "targets": {
     "lib": {
       "path": "src/lib.rs",
-      "test_fns": 6700,
-      "ignored": 588,
+      "test_fns": 6708,
+      "ignored": 591,
       "env_gates": [
         "CUDA_MODULE_LOADING",
         "DEFAULT_ON_CHILD",
@@ -221,6 +221,8 @@
         "GEMMA4_TOKENIZER_DIR",
         "GEMMA4_TOKENIZER_JSON",
         "GEMMA4_VOCAB_SIZE",
+        "GLU_FUSE_ARM",
+        "GLU_SEQ_ARM",
         "HEAD_FIXTURE_DIR",
         "HOME",
         "INFERENCE_CUDA_FAULT_CHILD",
@@ -234,6 +236,7 @@
         "INFERENCE_CUDA_MEASURE_TRIM_DIR",
         "INFERENCE_CUDA_MEASURE_TRIM_ONLY",
         "INFERENCE_CUDA_MMID_COLS_HINT",
+        "INFERENCE_CUDA_MOE_GLU_FUSE",
         "INFERENCE_CUDA_REQUIRE_DEVICE",
         "INFERENCE_CUDA_TILED_HEAD",
         "INFERENCE_FLASH_NEXT_PLE_DEVICE",
