@@ -218,8 +218,9 @@ fn cuda_settings(options: &FlashOptions) -> Result<Option<CudaSettings>, EngErro
         return Err(bad("expert_stats must not be empty".into()));
     }
     // The step plan refuses widths above `MAX_STEP_ROWS` (`cuda/step_plan.rs`); refusing
-    // here names `prefill_rows` at parse time instead of a plan refusal at boot.
-    let prefill_rows = ranged("prefill_rows", options.prefill_rows, 1, 1, 32)?;
+    // here names `prefill_rows` at parse time instead of a plan refusal at boot. The high
+    // bound is the plan's `MAX_STEP_ROWS`; keep the two in step.
+    let prefill_rows = ranged("prefill_rows", options.prefill_rows, 1, 1, 64)?;
     Ok(Some(CudaSettings {
         context,
         kv_format,
