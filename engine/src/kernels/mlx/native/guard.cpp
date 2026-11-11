@@ -3461,7 +3461,6 @@ static int compile_attn_pre_layer_body(
   const mlx_stream s = p->stream;
   const int pair = p->width * 2;
   const int rows_heads_pair[3] = {rows, p->heads, pair};
-  const int rows_heads_width[3] = {rows, p->heads, p->width};
   const int rows_kv_width[3] = {rows, p->kv_heads, p->width};
   const int q4_shape[4] = {1, p->heads, rows, p->width};
   const int k4_shape[4] = {1, p->kv_heads, rows, p->width};
