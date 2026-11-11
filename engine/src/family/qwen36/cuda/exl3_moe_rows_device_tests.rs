@@ -27,8 +27,8 @@ use half::f16;
 
 use super::{
     exl3_moe::{
-        Exl3MoeBufs, Exl3MoeWeights, Scratch, SharedRowsIo, SharedWeights, run_exl3_moe,
-        run_exl3_moe_rows, shared, shared_rows,
+        Exl3MoeBufs, Exl3MoeWeights, GROUPED_PAIRS, Scratch, SharedRowsIo, SharedWeights,
+        run_exl3_moe, run_exl3_moe_rows, shared, shared_rows,
     },
     moe::{Launch, MoeDims, RouteBufs},
 };
@@ -269,10 +269,11 @@ fn buffers(ctx: &CudaContext, rows: usize, resid: &[f32], norm: &[f32]) -> Buffe
         shared_gu: zeros(ctx, rows * 2 * INTER * F32),
         shared_act: zeros(ctx, rows * INTER * F32),
         shared_out: zeros(ctx, rows * HIDDEN * F32),
-        // The projections' scratch is reused by every launch in stream order: 20 rows of the
-        // widest side covers 16 pairs of the indexed launch and the 2K pairs of the shared gate/up.
-        xh: zeros(ctx, 20 * HIDDEN * F32),
-        z: zeros(ctx, 20 * HIDDEN * F32),
+        // The projections' scratch is reused by every launch in stream order: the indexed
+        // launch's 16 pairs, the shared gate/up's pair batches (up to GROUPED_PAIRS rows), and
+        // the down windows (up to `rows` rows of xh and z).
+        xh: zeros(ctx, GROUPED_PAIRS.max(rows) * HIDDEN * F32),
+        z: zeros(ctx, GROUPED_PAIRS.max(rows) * HIDDEN * F32),
         flag: zeros(ctx, 4),
     }
 }

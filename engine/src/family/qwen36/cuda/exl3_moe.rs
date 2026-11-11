@@ -57,7 +57,7 @@ const F32: usize = size_of::<f32>();
 const GROUPED_MAX_ROWS: usize = 8;
 /// The most one-row pairs one grouped launch takes (`exl3.rs` `grouped_raw`); the shared
 /// expert's gate/up runs in row batches of `GROUPED_PAIRS / 2` rows.
-const GROUPED_PAIRS: usize = crate::kernels::cuda::resident::exl3::GROUPED_PAIRS_MAX;
+pub(crate) const GROUPED_PAIRS: usize = crate::kernels::cuda::resident::exl3::GROUPED_PAIRS_MAX;
 const I32: usize = size_of::<i32>();
 
 pub(in crate::family) struct Exl3MoeWeights<'w> {
