@@ -16,8 +16,8 @@
   "targets": {
     "lib": {
       "path": "src/lib.rs",
-      "test_fns": 6675,
-      "ignored": 586,
+      "test_fns": 6688,
+      "ignored": 587,
       "env_gates": [
         "CUDA_MODULE_LOADING",
         "DEFAULT_ON_CHILD",
@@ -122,6 +122,7 @@
         "FIFI_FLINT_TEACHER_IDS",
         "FIFI_FLINT_TOKEN_HEALTH",
         "FIFI_GDN_CONV_PREFILL",
+        "FIFI_GDN_SCAN_CHUNK",
         "FIFI_GDN_SCAN_COLS",
         "FIFI_GRAPH_BENCH_PHASES",
         "FIFI_KROW_BREAK",
