@@ -69,3 +69,31 @@ The example values are not a general recommendation: a different model,
 context, device order, or background GPU process can require more host-backed
 memory. Restore the prior settings and restart if the candidate does not fit
 or is slower.
+
+### Measured placement with a 256k context limit
+
+On one 12 GB RTX 3060 followed by one 10 GB RTX 3080, an experimental build
+using Q4_K_M weights, q8 KV, a configured 262,144-token limit, 256-row P2P
+chunks and Q8 staging was measured with these settings:
+
+```sh
+export Q36_P2P_HOST_EXPERT_BYTES_0=1395864370
+export Q36_P2P_HOST_EXPERT_BYTES=3470000000
+```
+
+Compared with `Q36_P2P_HOST_EXPERT_BYTES=3489660928`, this moved one
+75,497,472-byte expert slice from host memory onto the 3080. In one
+control-then-candidate run of three cold 4,274-token prompts per setting,
+median server job-start-to-first-token rate was 304.20 versus 307.80 tokens/s;
+median decode rate over three deterministic 128-token replies was 38.66
+versus 38.94 tokens/s. The first-token rate includes first-token generation.
+The candidate had 1,400 MiB free on the 3060 and 1,435 MiB free on the 3080
+after warmup. These small differences may include order or thermal effects.
+
+The run used a [separate integration commit and recorded the full samples,
+guard and restoration evidence](../scripts/benchmarks/qwen36-p2p-3080-placement-ab.json).
+Its longest prompt was 4,274 tokens; the configured context limit was not a
+128k or 256k prompt test. This setting is experimental and should be measured
+on the target system, with the prior values retained for rollback. A more
+aggressive setting that also moved two slices onto the 3060 was refused by
+that run's memory admission check.
