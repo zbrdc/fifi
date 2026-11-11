@@ -1,0 +1,42 @@
+{
+  "scope": "Offline overlap analysis of one previously captured CUDA software trace, not a new performance test.",
+  "trace_sha256": "8acde7211ac96e73f6024e200c517f6888a5e1760fe0612da51de3eed4ff5744",
+  "tested_source_commit": "76dec8a61d040efa97beefe273bed8dc9e68ff57",
+  "model": "Qwen3.6 35B A3B Q4_K_M; q8 KV",
+  "prompt_tokens": 4274,
+  "chunk_rows": 256,
+  "synchronization_calls": 9892,
+  "distinct_host_threads": 1,
+  "devices": {
+    "0": "RTX 3060 12 GB",
+    "1": "RTX 3080 10 GB"
+  },
+  "overlap": {
+    "sync_union_seconds": 12.649671,
+    "sync_with_q4_either_gpu_seconds": 10.450422,
+    "sync_with_recorded_activity_either_gpu_seconds": 12.641805,
+    "sync_without_recorded_activity_either_gpu_seconds": 0.007866,
+    "sync_with_3060_wait_and_3080_q4_seconds": 4.158698,
+    "sync_with_3080_wait_and_3060_q4_seconds": 2.555336,
+    "per_gpu": {
+      "0": {
+        "sync_with_q4_seconds": 6.15766,
+        "sync_with_wait_sum_seconds": 5.191659,
+        "sync_with_recorded_activity_seconds": 12.616495
+      },
+      "1": {
+        "sync_with_q4_seconds": 7.522486,
+        "sync_with_wait_sum_seconds": 3.866569,
+        "sync_with_recorded_activity_seconds": 12.609639
+      }
+    }
+  },
+  "limitations": [
+    "CUDA tracing perturbs timing; this is one old 256-row synthetic prompt, not the current 1024-row server.",
+    "Host synchronization duration is elapsed time, not CPU computation or CPU utilization.",
+    "GPU activity includes wait kernels; an active kernel does not establish useful compute saturation.",
+    "Overlapping categories are not additive and do not establish causality or possible speedup.",
+    "Mapped-host expert reads are not necessarily CUDA memcpy events; this trace does not identify weight placement or memory stalls.",
+    "No CPU samples or call stacks were collected; unrecorded activity may exist."
+  ]
+}
