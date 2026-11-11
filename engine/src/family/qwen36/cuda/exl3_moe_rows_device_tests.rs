@@ -448,7 +448,10 @@ fn the_shared_expert_of_k_rows_equals_k_one_row_blocks() {
     let w = build_weights(&projector);
     let weights = block(&w);
     let mut rng = Rng::new(0x4b52_0092);
-    for rows in 2..=8usize {
+    // 2..=8 pins the single-batch widths (one gate/up batch, one down group); 9 crosses the
+    // down-group bound; 25/33/49 cross the 24-row gate/up pair bound into two and three
+    // batches; 64 is the widest planned window (three batches).
+    for rows in [2usize, 3, 8, 9, 25, 33, 49, 64] {
         let norm = normal(&mut rng, rows * HIDDEN, 1.0);
         let batch = buffers(ctx, rows, &vec![0.0; rows * HIDDEN], &norm);
         shared_rows(
@@ -501,10 +504,10 @@ fn the_shared_expert_of_k_rows_equals_k_one_row_blocks() {
     }
 }
 
-/// The K-row shared expert refuses one row and more than thirty-two: the one-row block is
-/// `shared()`.
+/// The K-row shared expert refuses one row and windows over `MAX_EXL3_ROWS` (64): the one-row
+/// block is `shared()`, and both families' planners cap at the shared bound.
 #[test]
-fn the_k_row_shared_expert_takes_two_to_thirty_two_rows() {
+fn the_k_row_shared_expert_refuses_one_row_and_windows_over_sixty_four() {
     if !device_present("K-row shared expert row counts") {
         return;
     }
@@ -517,7 +520,11 @@ fn the_k_row_shared_expert_takes_two_to_thirty_two_rows() {
     };
     let w = build_weights(&projector);
     let b = buffers(ctx, 9, &vec![0.0; 9 * HIDDEN], &vec![0.0; 9 * HIDDEN]);
-    for rows in [0usize, 1, 33] {
+    for (rows, wanted) in [
+        (0usize, "at least 2 rows"),
+        (1, "at least 2 rows"),
+        (65, "at most 64 rows"),
+    ] {
         let result = shared_rows(
             &launch,
             &SharedWeights {
@@ -535,8 +542,8 @@ fn the_k_row_shared_expert_takes_two_to_thirty_two_rows() {
             (HIDDEN, INTER, rows),
         );
         match result {
-            Err(EngError::BadRequest(message)) if message.contains("2 to 32 rows") => {}
-            other => panic!("rows {rows}: expected the row-count refusal, got {other:?}"),
+            Err(EngError::BadRequest(message)) if message.contains(wanted) => {}
+            other => panic!("rows {rows}: expected the {wanted:?} refusal, got {other:?}"),
         }
     }
 }

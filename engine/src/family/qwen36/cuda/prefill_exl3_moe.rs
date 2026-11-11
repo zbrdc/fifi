@@ -6,7 +6,8 @@
 //! sorts its `m * top_k` pairs by expert, and uploads the two row lists and the table in one
 //! write. Gate, up and down then run each as ONE job-table launch over every expert of the
 //! chunk (three kernels, whatever the number of experts), and one SwiGLU runs over every pair.
-//! A job is at most [`TILE_ROWS`] rows of one expert; the expert's weights are read once per job,
+//! A job is at most [`EXL3_EXPERT_TILE_ROWS`](crate::family::project::exl3_jobs_plan::EXL3_EXPERT_TILE_ROWS)
+//! rows of one expert; the expert's weights are read once per job,
 //! which makes the routed pass layer-major: its weight traffic follows the experts a chunk picks,
 //! not its rows.
 //!

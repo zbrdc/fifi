@@ -46,7 +46,7 @@ pub(crate) struct FlashOptions {
     /// CUDA only: routed-expert slots per layer in video memory, from 11 to 512. Default: what the
     /// load plan leaves at the context.
     pub(crate) slots: Option<u32>,
-    /// CUDA only: rows of one device step during prefill, from 1 to 32. The default, 1, is the
+    /// CUDA only: rows of one device step during prefill, from 1 to 64. The default, 1, is the
     /// decode shape: one row per device call, exactly as before. A value above one runs the
     /// prompt as device chunks of that many rows (one PLE host roundtrip per chunk), with decode
     /// unchanged at one row.
@@ -536,6 +536,24 @@ mod tests {
             cuda_decode: Some(true),
             ..FlashOptions::default()
         }
+    }
+
+    /// `prefill_rows` takes the whole planned width (the shared `MAX_EXL3_ROWS`) and refuses
+    /// one row above it at parse time, naming the key.
+    #[test]
+    fn prefill_rows_is_bounded_at_the_planned_chunk_width() {
+        let env = FlashEnv::default();
+        let at = |rows: u32| {
+            let options = FlashOptions {
+                prefill_rows: Some(rows),
+                ..cuda_on()
+            };
+            settings(Some(&options), &env)
+        };
+        assert_eq!(at(64).unwrap().cuda.unwrap().prefill_rows, 64);
+        assert_eq!(at(1).unwrap().cuda.unwrap().prefill_rows, 1);
+        assert!(message(at(65)).contains("prefill_rows"));
+        assert!(message(at(0)).contains("prefill_rows"));
     }
 
     #[test]

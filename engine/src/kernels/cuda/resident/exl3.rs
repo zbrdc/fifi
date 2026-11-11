@@ -101,8 +101,11 @@ fn jobs_warp_rotate_setting() -> Result<bool, EngError> {
 
 /// The most pairs one default id-indexed launch takes.
 const INDEXED_CAPACITY: usize = 16;
-/// The most pairs one launch takes under the 20-pair option (Flash-Next's ten picks).
+/// The most pairs one 20-pair-option launch takes (Flash-Next's ten picks).
 const INDEXED_OPTION_CAPACITY: usize = 20;
+/// The most pairs one grouped launch takes, in local groups of 1..=8 rows
+/// (`grouped_raw`); the family-side shared expert batches its gate/up at half this width.
+pub(crate) const GROUPED_PAIRS_MAX: usize = 48;
 
 /// Opt-in switch of the DP4A decode of book 2 in the id-indexed launch: unset or `0` keeps the
 /// default decode, `1` decodes with one packed byte dot product. Same bytes. A set value wins over
@@ -1762,16 +1765,23 @@ impl CudaContext {
     ) -> Result<Vec<ffi::LinearRaw<'a>>, EngError> {
         self.ensure_usable()?;
         if calls.is_empty()
-            || calls.len() > 48
+            || calls.len() > GROUPED_PAIRS_MAX
             || calls
                 .iter()
                 .any(|call| !(1..=8).contains(&call.rows) || call.split_k != 2)
-            || calls.iter().map(|call| call.rows).sum::<usize>() > 48
+            || calls.iter().map(|call| call.rows).sum::<usize>() > GROUPED_PAIRS_MAX
         {
             let rows: Vec<_> = calls.iter().map(|call| call.rows).collect();
+            // A wide refused batch prints only the head of its rows vector.
+            let head: Vec<_> = rows.iter().take(8).collect();
+            let shown = if rows.len() > 8 {
+                format!("{} rows starting {head:?}", rows.len())
+            } else {
+                format!("{rows:?}")
+            };
             return Err(EngError::BadRequest(format!(
-                "EXL3 grouped needs 1..=48 pairs in local groups of 1..=8 rows \
-                 (got {} calls, rows {rows:?}, sum {})",
+                "EXL3 grouped needs 1..={GROUPED_PAIRS_MAX} pairs in local groups of 1..=8 rows \
+                 (got {} calls, rows {shown}, sum {})",
                 calls.len(),
                 rows.iter().sum::<usize>(),
             )));

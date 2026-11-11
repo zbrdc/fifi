@@ -41,8 +41,6 @@
 //! The pure parts (the classify oracle, the log parser, the spans of the bank buffer and the
 //! private scratch layout) are host code with host tests; the launches are native-cuda only.
 
-#![cfg_attr(not(test), allow(dead_code))]
-
 use std::ops::Range;
 
 use super::bank::miss_pass_inputs;
@@ -74,7 +72,8 @@ fn align_up(value: usize) -> usize {
 }
 
 /// The block's private device scratch: the slot row, the classify outputs and the second pass's
-/// inputs. One allocation, regions at aligned offsets. About 24 KiB at the real sizes.
+/// inputs. One allocation, regions at aligned offsets: about 25 KiB at the real sizes and one
+/// row, and the row-indexed regions grow with the planned chunk width.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) struct ScratchLayout {
     /// The chunk row count this layout is sized for; run_rows admits at most this many rows.
@@ -97,8 +96,9 @@ pub(super) struct ScratchLayout {
     pub(super) miss_weights: usize,
     /// f32 `[hidden]`: the resident pass's result while a miss pass is still to come.
     pub(super) partial: usize,
-    /// i32 `[2 * routed + EXL3_JOB_WORDS * exl3_max_jobs]`: the sort lists and the job table
-    /// of the chunk's routed job-table passes.
+    /// i32 `[(2 + EXL3_JOB_WORDS) * routed]`: the sort lists and the job tables of the chunk's
+    /// two routed job-table passes (2 list words plus one job record per pair; a source's
+    /// jobs are at most its pairs).
     pub(super) perm: usize,
     pub(super) total: usize,
 }
@@ -127,11 +127,13 @@ impl ScratchLayout {
             mul(rows.checked_mul(top_k), I32),
             mul(rows.checked_mul(top_k), F32),
             mul(rows.checked_mul(hidden), F32),
-            mul(Some(2 * routed), I32).and_then(|at| {
-                // Two sources (the bank's and the ring's slots) plan separately: their lists sum
-                // to `routed` pairs and their job tables to at most one job per pair each.
-                at.checked_add((2 + EXL3_JOB_WORDS) * routed * I32)
-            }),
+            // Two sources (the bank's and the ring's slots) plan separately: their lists sum
+            // to `routed` pairs and their job tables to at most one job per pair (an expert
+            // with rows owns at least one pair of its source), so 2 list words plus one
+            // 4-word job record per pair cover both sources' lists and tables.
+            (2 + EXL3_JOB_WORDS)
+                .checked_mul(routed)
+                .and_then(|words| words.checked_mul(I32)),
         ];
         let mut offsets = [0usize; 12];
         let mut at = 0usize;
@@ -276,44 +278,6 @@ impl SlotSpans {
                 .map_err(|_| refuse("three parts expected".into()))?,
         })
     }
-
-    /// The same record layout spanning `slots` slots instead of this one's — the prefill
-    /// ring's staging holds a different record count than the bank's slot row.
-    pub(super) fn for_slots(&self, slots: usize) -> Result<Self, EngError> {
-        let grow = slots
-            .checked_sub(self.slots)
-            .ok_or_else(|| refuse("fewer slots than the spans cover".into()))?;
-        let scale_grow = grow
-            .checked_mul(self.scale_stride * 4)
-            .ok_or_else(|| refuse("the span overflows".into()))?;
-        let trellis_grow = grow
-            .checked_mul(self.trellis_stride)
-            .ok_or_else(|| refuse("the span overflows".into()))?;
-        let mut parts = self.parts.clone();
-        for part in &mut parts {
-            part.trellis.end = part
-                .trellis
-                .end
-                .checked_add(trellis_grow)
-                .ok_or_else(|| refuse("the span overflows".into()))?;
-            part.suh.end = part
-                .suh
-                .end
-                .checked_add(scale_grow)
-                .ok_or_else(|| refuse("the span overflows".into()))?;
-            part.svh.end = part
-                .svh
-                .end
-                .checked_add(scale_grow)
-                .ok_or_else(|| refuse("the span overflows".into()))?;
-        }
-        Ok(Self {
-            slots,
-            trellis_stride: self.trellis_stride,
-            scale_stride: self.scale_stride,
-            parts,
-        })
-    }
 }
 
 /// The first pick whose weight is +0.0 (a filler pick) and whose down row holds an infinity or a NaN:
@@ -366,6 +330,13 @@ pub(super) fn plan_second_pass(
 #[cfg(all(feature = "native-cuda", target_os = "linux"))]
 #[allow(unused_imports, reason = "the decode step is the first caller")]
 pub(in crate::family::flash_next) use device::{SplitMoe, SplitMoeTrunk};
+
+#[cfg(all(feature = "native-cuda", target_os = "linux"))]
+#[allow(
+    unused_imports,
+    reason = "the host tests import these from the sibling test module"
+)]
+pub(super) use device::{source_offsets, source_plan};
 
 #[cfg(all(feature = "native-cuda", target_os = "linux"))]
 mod device {
@@ -425,7 +396,7 @@ mod device {
     /// The counting sort of one source's pairs: `sub` lists the chunk's pair positions of the
     /// source's picks in chunk order; the shared sort runs over their slot ids and the lists
     /// are translated back to the chunk's pair positions and rows.
-    fn source_plan(
+    pub(crate) fn source_plan(
         ids: &[i32],
         sub: &[usize],
         slots: usize,
@@ -440,6 +411,29 @@ mod device {
             *order = i32::try_from(pair / top_k).map_err(|_| overflow())?;
         }
         Ok(plan)
+    }
+
+    /// The perm-region byte offset of each source's lists and job table, and the offset of its
+    /// gate/up segment of the pair faces: source 0 (the bank) at the region's base, source 1
+    /// (the ring) after source 0's lists (2 words a pair) and its job table (a 4-word record
+    /// a job).
+    pub(crate) fn source_offsets(
+        perm: usize,
+        plans: [&PairPlan; 2],
+        sub: [&[usize]; 2],
+    ) -> ([usize; 2], [usize; 2]) {
+        let mut perm_at = perm;
+        let mut gu_at = 0usize;
+        let mut at_of = [0usize; 2];
+        let mut seg_of = [0usize; 2];
+        for source in 0..2 {
+            at_of[source] = perm_at;
+            seg_of[source] = gu_at;
+            let jobs = plan_jobs(&plans[source].counts).len();
+            perm_at += (2 * sub[source].len() + EXL3_JOB_WORDS * jobs) * I32;
+            gu_at += sub[source].len();
+        }
+        (at_of, seg_of)
     }
 
     /// The rotated-row and partial-sum ranges of a fused gate and up launch over `n` pairs,
@@ -485,6 +479,9 @@ mod device {
         trunks: Vec<SplitMoeTrunk<'w>>,
         bank: DeviceBank,
         spans: SlotSpans,
+        /// The record layout the bank spans were built from; the ring's spans are rebuilt
+        /// from it at the ring's own record count, which may be smaller than the bank's.
+        bank_layout: SlotBankLayout,
         layout: ScratchLayout,
         scratch: DeviceBuffer,
         book: Codebook,
@@ -515,8 +512,6 @@ mod device {
         pick: u32,
         x: DeviceRange<'a>,
         out: DeviceRange<'a>,
-        /// True when this pick's weights live in the prefill ring, not the bank.
-        ring: bool,
     }
 
     fn whole(buffer: &DeviceBuffer) -> Result<DeviceRange<'_>, EngError> {
@@ -542,7 +537,7 @@ mod device {
     impl<'w> SplitMoe<'w> {
         /// `trunks[layer]` is layer `layer`'s trunk; `bank` has one row per layer. `layout` is the
         /// bank's record layout, the one its records were packed with. Allocates the private
-        /// scratch (about 24 KiB), zeroed.
+        /// scratch (about 25 KiB at the decode shape, growing with the planned width), zeroed.
         pub(in crate::family::flash_next) fn new(
             ctx: &CudaContext,
             trunks: Vec<SplitMoeTrunk<'w>>,
@@ -595,6 +590,7 @@ mod device {
                 trunks,
                 bank,
                 spans,
+                bank_layout: layout.clone(),
                 layout: scratch_layout,
                 scratch,
                 book,
@@ -929,7 +925,7 @@ mod device {
             Ok(picks)
         }
 
-        /// The MoE block of a chunk of `dims.rows` rows (`2..=8`), the batched shape of
+        /// The MoE block of a chunk of `dims.rows` rows (`2..=MAX_STEP_ROWS`), the batched shape of
         /// [`Self::run`]: one router launch over every row, then — when the chunk's distinct
         /// picks fit the bank and any of them is missing — one `admit` of their union, so
         /// every row's picks ride the flat resident pass in grouped launches with the shared
@@ -959,6 +955,12 @@ mod device {
             if !(2..=MAX_STEP_ROWS).contains(&m) {
                 return Err(refuse(format!(
                     "the block takes 2 to {MAX_STEP_ROWS} rows, got {m}"
+                )));
+            }
+            if m > self.layout.rows {
+                return Err(refuse(format!(
+                    "the block plans {} rows, got {m}",
+                    self.layout.rows
                 )));
             }
             let geometry = *self.bank.geometry();
@@ -1065,7 +1067,6 @@ mod device {
                             pick: (r * k + pick) as u32,
                             x: row(&bufs.route.norm_row, h * F32, r)?,
                             out: row(&bufs.expert_gu, i * F32, 2 * (r * k + pick) + part)?,
-                            ring: false,
                         });
                     }
                     down.push(Item {
@@ -1073,7 +1074,6 @@ mod device {
                         pick: (r * k + pick) as u32,
                         x: row(&bufs.expert_act, i * F32, r * k + pick)?,
                         out: row(&bufs.expert_down, h * F32, r * k + pick)?,
-                        ring: false,
                     });
                 }
             }
@@ -1247,7 +1247,7 @@ mod device {
 
         /// The MoE block of a chunk over the prefill ring: every pick reads either its bank
         /// slot (the bank is frozen read-only for the whole prefill) or the ring slot the copy
-        /// stream filled, so there is no admit, no classify and no miss pass — one flat grouped
+        /// stream filled, so there is no admit, no classify and no miss pass — one job-table
         /// launch per source per part, the shared expert and one combine straight to the block
         /// output. At the start of layer `l`'s half the ring issues layer `l + 1`'s experts, so
         /// the copies run behind this half's compute and the next layer's attention.
@@ -1271,6 +1271,9 @@ mod device {
             let m = dims.rows;
             let (ctx, stream) = (launch.ctx, launch.stream);
             let sc = self.layout;
+            if m > sc.rows {
+                return Err(refuse(format!("the block plans {} rows, got {m}", sc.rows)));
+            }
             let (h, i, k) = (dims.hidden, dims.inter, dims.top_k);
             let geometry = *self.bank.geometry();
             let scratch = &self.scratch;
@@ -1357,22 +1360,13 @@ mod device {
                 .collect::<Result<Vec<_>, EngError>>()?;
             // Each source's lists and job table sit at their own offset of the perm region,
             // and its gate/up and SwiGLU rows form their own segment of the pair faces.
-            let mut perm_at = sc.perm;
-            let mut gu_at = 0usize;
-            let mut at_of = [0usize; 2];
-            let mut seg_of = [0usize; 2];
-            for source in 0..2 {
-                at_of[source] = perm_at;
-                seg_of[source] = gu_at;
-                let jobs = plan_jobs(&plans[source].counts).len();
-                perm_at += (2 * sub[source].len() + EXL3_JOB_WORDS * jobs) * I32;
-                gu_at += sub[source].len();
-            }
+            let (at_of, seg_of) =
+                source_offsets(sc.perm, [&plans[0], &plans[1]], [&sub[0], &sub[1]]);
             let ring_of = self
                 .ring
                 .as_ref()
                 .expect("the ring branch is taken only with a ring");
-            let ring_spans = self.spans.for_slots(ring_slots)?;
+            let ring_spans = SlotSpans::new(&self.bank_layout, ring_slots)?;
             let sources = [
                 (self.bank.slots(layer)?, &self.spans),
                 (ring_of.slots(), &ring_spans),
@@ -1539,8 +1533,7 @@ mod device {
                 )?;
             } else {
                 // The K-row shared expert takes at least 2 rows; the sampling row runs the
-                // one-row
-                // variant over its single-row buffers.
+                // one-row variant over its single-row buffers.
                 shared_of(launch, &shared_weights, bufs, dims)?;
             }
             ctx.moe_combine(
@@ -1572,15 +1565,13 @@ mod device {
             Ok(())
         }
 
-        /// One id-indexed launch group over `weights` (a bank layer or the ring, both laid out
-        /// as `members` records), chunked at the launch capacity; every chunk starts again at
-        /// row 0 of the scratch.
+        /// One id-indexed launch group over the bank buffer of `layer`, chunked at the launch
+        /// capacity; every chunk starts again at row 0 of the scratch.
         fn grouped_at<'a>(
             &'a self,
             launch: &Launch<'_>,
             items: &[Item<'a>],
             bank: (&DeviceBuffer, u32),
-            ring: Option<(&DeviceBuffer, u32)>,
             ids: DeviceRange<'_>,
             scratch: &Scratch<'a>,
         ) -> Result<(), EngError> {
@@ -1588,22 +1579,9 @@ mod device {
                 .first()
                 .ok_or_else(|| refuse("an indexed launch without pairs".into()))?;
             let [k, n] = self.spans.parts[first.part].shape;
-            let ring_spans = ring
-                .map(|(_, members)| self.spans.for_slots(members as usize))
-                .transpose()?;
             let mut pairs = Vec::with_capacity(items.len());
             for item in items {
-                // The bank and the ring staging are both record-strided; the item's
-                // source picks its weights, members and the spans over them. The strides
-                // are the record layout's, shared by the bank and the ring.
-                let (weights, members, spans) = if item.ring {
-                    let ((buffer, members), spans) = ring
-                        .zip(ring_spans.as_ref())
-                        .ok_or_else(|| refuse("a ring item without a ring".into()))?;
-                    (buffer, members, spans)
-                } else {
-                    (bank.0, bank.1, &self.spans)
-                };
+                let (weights, members, spans) = (bank.0, bank.1, &self.spans);
                 let span = &spans.parts[item.part];
                 if span.shape != [k, n] {
                     return Err(refuse("a launch group mixes matrix shapes".into()));
@@ -1643,7 +1621,6 @@ mod device {
                 launch,
                 items,
                 (self.bank.slots(layer)?, members),
-                None,
                 ids,
                 scratch,
             )
@@ -1696,7 +1673,6 @@ mod device {
                         pick: pick as u32,
                         x: bufs.route.norm_row,
                         out: row(&bufs.expert_gu, i * F32, 2 * pick + part)?,
-                        ring: false,
                     });
                 }
             }
@@ -1722,7 +1698,6 @@ mod device {
                     pick: pick as u32,
                     x: row(&bufs.expert_act, i * F32, pick)?,
                     out: row(&bufs.expert_down, h * F32, pick)?,
-                    ring: false,
                 });
             }
             self.grouped(launch, pass.layer, &items, (pass.ids, &bufs.scratch))?;

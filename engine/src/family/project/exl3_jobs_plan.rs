@@ -6,6 +6,13 @@
 /// dozen rows of a chunk, and a wider CTA would decode no fewer weights and run mostly idle warps.
 pub(crate) const EXL3_EXPERT_TILE_ROWS: usize = 64;
 
+/// The widest rows window the shared EXL3 expert machinery plans for: `shared_rows`
+/// (`qwen36::cuda::exl3_moe`) and the Flash-Next chunk plan (`MAX_STEP_ROWS`) refuse wider
+/// windows, and the chunk scratch is sized at this width. A kernel cap it is not — the dense
+/// job row cap is `jobs_row_cap` (256, exl3.cu) and the shared down groups split at 8 — this
+/// is the planning bound both families agreed on.
+pub(crate) const MAX_EXL3_ROWS: usize = 64;
+
 /// i32 words of one job of the device table.
 pub(crate) const EXL3_JOB_WORDS: usize = 4;
 

@@ -7,10 +7,16 @@ use super::{
     bank::{BankGeometry, ExpertBankState, HostMode, ReplaceOnMissLru},
     moe_block::{
         PassInputs, ScratchLayout, SlotSpans, classify_picks, first_poisoned_filler, parse_log,
-        pick_union, plan_second_pass,
+        pick_union, plan_second_pass, source_offsets, source_plan,
     },
 };
-use crate::{EngError, family::flash_next::moe::slot_bank::SlotBankLayout};
+use crate::{
+    EngError,
+    family::{
+        flash_next::moe::slot_bank::SlotBankLayout,
+        project::{cuda::exl3_jobs::PairPlan, exl3_jobs_plan::EXL3_JOB_WORDS},
+    },
+};
 
 const EXPERTS: usize = 512;
 const TOP_K: usize = 10;
@@ -151,9 +157,10 @@ fn the_private_scratch_is_aligned_disjoint_and_small() {
         (layout.miss_ids, 40),
         (layout.miss_weights, 40),
         (layout.partial, 2560 * 4),
-        // The job-table perm region: the two sources' lists (2·routed) plus their job tables
-        // ((2 + EXL3_JOB_WORDS)·routed), at routed = rows·top_k = 10.
-        (layout.perm, 320),
+        // The job-table perm region: the two sources' lists and job tables together —
+        // 2 list words plus one 4-word job record per pair (a source's jobs are at most its
+        // pairs) — at routed = rows·top_k = 10.
+        (layout.perm, 240),
     ];
     for (index, &(offset, bytes)) in regions.iter().enumerate() {
         assert_eq!(offset % 256, 0, "region {index}");
@@ -162,7 +169,89 @@ fn the_private_scratch_is_aligned_disjoint_and_small() {
             assert!(offset + bytes <= other || other + other_bytes <= offset);
         }
     }
-    assert_eq!(layout.total, 25_088, "24.5 KiB at the real sizes");
+    assert_eq!(layout.total, 24_832, "24.25 KiB at the real sizes");
+}
+
+/// The perm region is the last region and covers the widest split of the chunk's pairs over
+/// the two sources even when every pair is its own job; the allocation grows with the planned
+/// chunk width (the row-indexed regions scale with it).
+#[test]
+fn the_private_scratch_covers_the_widest_chunk_plan() {
+    let one = ScratchLayout::new(512, 10, 2560, 1).unwrap();
+    for (rows, routed) in [(32usize, 320usize), (64, 640)] {
+        let layout = ScratchLayout::new(512, 10, 2560, rows).unwrap();
+        assert_eq!(layout.rows, rows);
+        // The perm region is last; its size is 2 list words plus one job record (4 words) per
+        // pair — the worst case is every pair in one source with a job of its own, and the two
+        // sources sum to the same bound.
+        assert_eq!(
+            layout.total - layout.perm,
+            (2 + EXL3_JOB_WORDS) * routed * 4
+        );
+        assert!(layout.total > one.total);
+        // The row-indexed regions grow by more than the perm region alone.
+        assert!(layout.total - one.total > (routed - 10) * (2 + EXL3_JOB_WORDS) * 4);
+    }
+}
+
+/// One source's counting sort: sorted positions map back to the chunk's pair positions, and
+/// a slot id outside the source's slots refuses the chunk.
+#[test]
+fn source_plan_maps_sorted_positions_to_chunk_pairs() {
+    // A chunk of 2 rows, top_k 2: pair = row·2 + rank. Pairs 0, 2 and 3 pick bank slots
+    // (5, 5, 0); pair 1 picks the ring (slot 9).
+    let ids = [5i32, 9, 5, 0];
+    let bank = source_plan(&ids, &[0, 2, 3], 8, 2).unwrap();
+    assert_eq!(bank.counts, {
+        let mut counts = vec![0usize; 8];
+        counts[0] = 1;
+        counts[5] = 2;
+        counts
+    });
+    // Slot 0 owns pair 3 (row 1); slot 5 owns pairs 0 and 2 (rows 0 and 1), chunk order kept.
+    assert_eq!(bank.order, [1, 0, 1]);
+    assert_eq!(bank.scatter, [3, 0, 2]);
+    let ring = source_plan(&ids, &[1], 16, 2).unwrap();
+    assert_eq!(ring.counts, {
+        let mut counts = vec![0usize; 16];
+        counts[9] = 1;
+        counts
+    });
+    assert_eq!(ring.order, [0]);
+    assert_eq!(ring.scatter, [1]);
+    // A slot id outside the source's slots is a router fault, refused.
+    assert!(matches!(
+        source_plan(&ids, &[1], 8, 2),
+        Err(EngError::ModelOutput(_))
+    ));
+}
+
+/// The two sources' lists and job tables pack into the perm region back to back, and their
+/// gate/up segments tile the pair faces in source order.
+#[test]
+fn source_offsets_pack_the_perm_region() {
+    // Counts drive the job tables: one job per expert with rows (the 64-row tile never splits
+    // these small counts), so the bank (3 + 1 rows over two experts) takes two jobs.
+    let bank = PairPlan {
+        counts: vec![3, 1],
+        order: vec![],
+        scatter: vec![],
+    };
+    let ring = PairPlan {
+        counts: vec![2],
+        order: vec![],
+        scatter: vec![],
+    };
+    let (sub_bank, sub_ring) = ([0usize, 1, 2, 3], [4usize, 5]);
+    let (at_of, seg_of) = source_offsets(1_000, [&bank, &ring], [&sub_bank, &sub_ring]);
+    // Bank: 4 pairs and 2 jobs — (2·4 + 4·2)·4 bytes of lists and table.
+    assert_eq!(at_of, [1_000, 1_000 + (2 * 4 + 4 * 2) * 4]);
+    assert_eq!(seg_of, [0, 4]);
+    // Ring: 2 pairs and 1 job; the packing ends inside the perm formula's bound
+    // (2 words + one job record a pair over all 6 pairs, 3 jobs).
+    let end = at_of[1] + (2 * 2 + 4 * 1) * 4;
+    assert_eq!(end - 1_000, (2 * 6 + 4 * 3) * 4);
+    assert!(end - 1_000 <= (2 + EXL3_JOB_WORDS) * 6 * 4);
 }
 
 #[test]

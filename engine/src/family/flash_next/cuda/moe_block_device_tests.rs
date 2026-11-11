@@ -548,7 +548,9 @@ fn a_chunk_over_the_prefill_ring_matches_the_all_resident_block() {
         inter: shape.inter(),
         shared_inter: shape.shared_inter(),
     };
-    let m = 8;
+    // 49 rows: three gate/up pair batches (24 + 24 + 1) and a multi-group down window —
+    // wider than any single launch bound of the shared expert.
+    let m = 49;
     let chunk = MoeDims { rows: m, ..one_row };
     let projector = CudaProjector::new().expect("projector");
     let ctx = projector.context();

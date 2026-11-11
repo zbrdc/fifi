@@ -713,8 +713,8 @@ impl<'a> FlashStep<'a> {
     pub(super) fn begin_chunk(&self, m: usize) -> Result<(), EngError> {
         self.begin_token()?;
         self.check_rows(m)?;
-        // A chunk of at most MAX_STEP_ROWS (<= EXL3_EXPERT_TILE_ROWS) rows is one tile of
-        // member 0.
+        // A chunk of at most MAX_STEP_ROWS rows is one dense job of member 0: the kernel's
+        // job row cap (`jobs_row_cap`, 256, exl3.cu) is wider than any planned chunk.
         let job = Exl3Job {
             member: 0,
             row0: 0,

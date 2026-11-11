@@ -39,7 +39,7 @@
 use super::state::{FlashGeometry, StateBytes, StatePlan, overflow, product, sum};
 use crate::{
     EngError,
-    family::flash_next::moe::context_budget::KvFormat,
+    family::{flash_next::moe::context_budget::KvFormat, project::exl3_jobs_plan::MAX_EXL3_ROWS},
     kernels::cuda::{
         ArenaPlan, ArenaTensor, plan_arena,
         prefill::gdn_scan_seq::{cpf_dn_conv_out_bytes, cpf_dn_scan_out_bytes},
@@ -59,8 +59,10 @@ const I32: usize = size_of::<i32>();
 /// verify window there; the Flash-Next chunk driver builds its plan at the prefill chunk width,
 /// whose shared expert splits its down groups at the kernel's 8-row bound, so the plan takes
 /// wider chunks: every doubling halves the per-layer-chunk drain count of a deep prefill.
-/// `EXL3_EXPERT_TILE_ROWS` (64) is the one-tile dense bound of a chunk; see `begin_chunk`.
-pub(super) const MAX_STEP_ROWS: usize = 64;
+/// The bound is the shared `MAX_EXL3_ROWS`: `shared_rows` refuses wider windows whatever the
+/// caller. The kernel's dense job bound is wider still (`jobs_row_cap`, 256, exl3.cu), so
+/// raising this is a planning decision, not a kernel port; see `begin_chunk`.
+pub(super) const MAX_STEP_ROWS: usize = MAX_EXL3_ROWS;
 
 /// Splits of the QSA attention in a decode step unless the options say otherwise. The attended
 /// positions of a token are the selected blocks (2,048 at most) and the open tail; the part

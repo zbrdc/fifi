@@ -32,9 +32,12 @@ use crate::{
     EngError,
     family::{
         gguf_model::Role,
-        project::cuda::{
-            CudaWeight, CudaWeights,
-            exl3::{Exl3Bank, Exl3BankSpan, Exl3Io, Exl3Weight},
+        project::{
+            cuda::{
+                CudaWeight, CudaWeights,
+                exl3::{Exl3Bank, Exl3BankSpan, Exl3Io, Exl3Weight},
+            },
+            exl3_jobs_plan::MAX_EXL3_ROWS,
         },
     },
     kernels::cuda::{
@@ -54,7 +57,7 @@ const F32: usize = size_of::<f32>();
 const GROUPED_MAX_ROWS: usize = 8;
 /// The most one-row pairs one grouped launch takes (`exl3.rs` `grouped_raw`); the shared
 /// expert's gate/up runs in row batches of `GROUPED_PAIRS / 2` rows.
-const GROUPED_PAIRS: usize = 48;
+const GROUPED_PAIRS: usize = crate::kernels::cuda::resident::exl3::GROUPED_PAIRS_MAX;
 const I32: usize = size_of::<i32>();
 
 pub(in crate::family) struct Exl3MoeWeights<'w> {
@@ -341,7 +344,17 @@ pub(in crate::family) fn grouped_indexed(
     if pairs.is_empty() {
         return Err(refuse("an indexed launch without pairs".into()));
     }
-    for chunk in pairs.chunks(launch.ctx.exl3_indexed_capacity()) {
+    // Every pair of a chunk takes its own row of the scratch (`indexed_launch`), so a chunk is
+    // at most the rows the scratch holds. The launch capacity alone is not a bound: the
+    // pointer-table option reports a grid-size capacity (FIFI_EXL3_TABLE) that a chunk-sized
+    // scratch cannot span, and a 20-pair capacity needs a 20-row scratch.
+    let k = pairs
+        .first()
+        .map(|pair| pair.span.shape()[0])
+        .ok_or_else(|| refuse("an indexed launch without pairs".into()))?;
+    let rows = scratch.xh.bytes() / (k * F32).max(1);
+    let step = launch.ctx.exl3_indexed_capacity().min(rows).max(1);
+    for chunk in pairs.chunks(step) {
         indexed_launch(launch, chunk, ids, scratch)?;
     }
     Ok(())
@@ -593,6 +606,17 @@ pub(in crate::family) struct SharedRowsIo<'b> {
 /// groups of `rows` rows each (`[gate rows][up rows]`) would land as `[gate K rows][up K rows]`
 /// and need `up_off = K s` with `ld_in = s`, which `valid_shape` refuses.
 ///
+/// The gate/up row batches of a `rows`-wide shared-expert window: the grouped launch takes at
+/// most `GROUPED_PAIRS` one-row pairs, so a batch is at most `GROUPED_PAIRS / 2` rows wide. The
+/// pairs of a batch are row-disjoint in `gu`, and each batch reuses the xh/z scratch from
+/// row 0, so wider windows need no extra scratch.
+fn shared_row_batches(rows: usize) -> impl Iterator<Item = (usize, usize)> {
+    (0..rows).step_by(GROUPED_PAIRS / 2).map(move |b0| {
+        let width = (rows - b0).min(GROUPED_PAIRS / 2);
+        (b0, width)
+    })
+}
+
 /// The one-row block [`shared`] is untouched; the test compares this one to `rows` runs of it.
 pub(in crate::family) fn shared_rows(
     launch: &Launch<'_>,
@@ -605,12 +629,13 @@ pub(in crate::family) fn shared_rows(
             "the K-row shared expert takes at least 2 rows, got {rows}"
         )));
     }
+    if rows > MAX_EXL3_ROWS {
+        return Err(refuse(format!(
+            "the K-row shared expert takes at most {MAX_EXL3_ROWS} rows, got {rows}"
+        )));
+    }
     let s = shared_inter;
-    // The grouped launch takes at most 48 one-row pairs, so a chunk wider than 24 rows runs
-    // its gate/up in row batches; the pairs of a batch are row-disjoint in `gu`, and each
-    // batch reuses the xh/z scratch from row 0, so wider chunks need no extra scratch.
-    for b0 in (0..rows).step_by(GROUPED_PAIRS / 2) {
-        let width = (rows - b0).min(GROUPED_PAIRS / 2);
+    for (b0, width) in shared_row_batches(rows) {
         let mut group = Vec::with_capacity(2 * width);
         for r in b0..b0 + width {
             for (half, weight) in [weights.gate, weights.up].into_iter().enumerate() {
@@ -920,4 +945,30 @@ pub(in crate::family) fn run_exl3_moe_rows_banked(
         (dims.hidden, dims.shared_inter, rows),
     )?;
     combine(launch, bufs, dims)
+}
+
+#[cfg(test)]
+mod shared_rows_tests {
+    use super::*;
+
+    /// The gate/up batches split at the grouped launch's pair bound: 24 rows is one batch,
+    /// 25 splits 24+1, 49 splits 24+24+1, and the widest planned window (64) splits 24+24+16.
+    #[test]
+    fn gate_up_row_batches_split_at_the_pair_bound() {
+        let widths = |rows: usize| shared_row_batches(rows).map(|(_, w)| w).collect::<Vec<_>>();
+        assert_eq!(widths(2), [2]);
+        assert_eq!(widths(24), [24]);
+        assert_eq!(widths(25), [24, 1]);
+        assert_eq!(widths(48), [24, 24]);
+        assert_eq!(widths(49), [24, 24, 1]);
+        assert_eq!(widths(64), [24, 24, 16]);
+        for rows in 2..=MAX_EXL3_ROWS {
+            let batches = shared_row_batches(rows).collect::<Vec<_>>();
+            assert_eq!(batches.iter().map(|&(_, w)| w).sum::<usize>(), rows);
+            assert!(batches.iter().all(|&(_, w)| w <= GROUPED_PAIRS / 2));
+            for pair in batches.windows(2) {
+                assert!(pair[0].0 + pair[0].1 == pair[1].0);
+            }
+        }
+    }
 }
