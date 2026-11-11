@@ -10,6 +10,8 @@ use crate::EngError;
 #[cfg(all(feature = "native-cuda", target_os = "linux"))]
 pub(crate) mod cuda;
 
+pub(crate) mod exl3_jobs_plan;
+
 /// Executes the quantized projections of one forward step.
 ///
 /// All matrices use the checkpoint layout `[out, in]`, and every result is

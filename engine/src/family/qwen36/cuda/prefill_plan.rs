@@ -526,17 +526,7 @@ fn moe_rows(dims: &StepDims, m: usize) -> Result<Vec<Row>, EngError> {
 /// (256 rows decode each weight tile once for the whole job).
 pub(crate) const EXL3_TILE_ROWS: usize = 256;
 
-/// The most rows of one job of a routed expert: the narrowest CTA (64 rows). An expert holds a few
-/// dozen rows of a chunk, and a wider CTA would decode no fewer weights and run mostly idle warps.
-pub(crate) const EXL3_EXPERT_TILE_ROWS: usize = 64;
-
-pub(crate) const EXL3_JOB_WORDS: usize = 4;
-
-/// The most jobs of one routed pass over `routed` pairs and `experts` experts: one per expert
-/// with rows plus one per full tile beyond the first of an expert.
-pub(crate) fn exl3_max_jobs(experts: usize, routed: usize) -> usize {
-    experts + routed.div_ceil(EXL3_EXPERT_TILE_ROWS)
-}
+pub(crate) use crate::family::project::exl3_jobs_plan::{EXL3_JOB_WORDS, exl3_max_jobs};
 
 /// Every slot of an EXL3 chunk arena exactly once, in [`exl3_chunk_tensors`] order. An EXL3 chunk
 /// has no q8_1 copies, no MMQ id tables and no stream-k fixup range.

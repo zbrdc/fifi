@@ -1143,6 +1143,7 @@ fn matrix_shape(tensor: &GgufTensor) -> Result<(usize, usize), EngError> {
 
 pub(crate) mod exl3;
 pub(crate) use exl3::{Exl3JobsIo, Exl3MatrixView};
+pub(crate) mod exl3_jobs;
 mod load_policy;
 #[cfg(test)]
 mod model_tests;
