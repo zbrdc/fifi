@@ -117,12 +117,26 @@ A permanently resident process on the spare GPU breaks any machine-wide
   nvidia-smi vs CUDA children — do not scope on bare indices), falling back
   to the machine-wide check otherwise. This is never looser than the
   original guard.
-- **Fix the other lanes' gates the same way**: any script with a
-  machine-wide `--query-compute-apps` idle check must either scope to the
-  GPUs it actually uses or allowlist the second instance's `enginesrv`
-  path. Mark such edits and leave a note in each lane's coordination
-  ledger; measurement lanes that need a PCIe-quiet window stop the second
-  instance for the window (stop → lease → test → restore, as before).
+- **Coordinate service handoffs under the shared lease**: acquire the
+  existing shared `gpu.lock` before stopping or restarting either instance.
+  Use the runner's `--reserve` mode with a validated handoff command that
+  checks the inherited lease descriptor against the shared lock's device
+  and inode. Keep the lease held while that command verifies service and
+  device owners, stops the selected service, runs the test, and restores and
+  confirms the original service. A busy lease means no service action. Do not
+  release it before restoration is confirmed; if restoration fails, keep the holder
+  alive and escalate. Never unlink or replace the lock file: that can create
+  a different inode and allow simultaneous holders.
+- **Check the other lanes' gates**: scope idle checks to the physical GPUs
+  used without dropping any declared quiet conditions for other GPUs, CPU
+  or PCIe traffic. Verify the live service unit, process and GPU ownership
+  before treating another instance as expected. An executable path alone
+  does not establish ownership or request idleness. Record changes and
+  blocked work in the lane's coordination ledger.
+
+The lease is advisory. A direct `systemctl` action outside the reserved
+handoff can still interrupt a holder; all cooperating lanes must use the
+same lease and handoff procedure.
 
 Concurrent use can change the primary pair's performance. Measure any
 interference with matched workloads and retained telemetry rather than
