@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import os
 from pathlib import Path
+import select
 import shutil
 import socket
 import subprocess
@@ -20,6 +21,8 @@ SCRIPT = Path(__file__).resolve().parents[1] / "web-model-router.mjs"
 
 
 class Backend(BaseHTTPRequestHandler):
+    protocol_version = "HTTP/1.1"
+
     def log_message(self, *_):
         pass
 
@@ -54,10 +57,79 @@ class Backend(BaseHTTPRequestHandler):
 
     def do_POST(self):
         self.rfile.read(int(self.headers.get("content-length", "0")))
+        if self.server.hold_stream:
+            first, last = b"data: first\n\n", b"data: last\n\n"
+            self.send_response(200)
+            self.send_header("Content-Type", "text/event-stream")
+            if self.server.chunked_stream:
+                self.send_header("Transfer-Encoding", "chunked")
+            else:
+                self.send_header("Content-Length", str(len(first) + len(last)))
+            self.end_headers()
+            self.write_stream_piece(first)
+            self.wfile.flush()
+            self.server.stream_started.set()
+            deadline = time.monotonic() + 5
+            while (
+                not self.server.stream_release.is_set() and time.monotonic() < deadline
+            ):
+                readable, _, _ = select.select([self.connection], [], [], 0.05)
+                if readable:
+                    try:
+                        closed = not self.connection.recv(1, socket.MSG_PEEK)
+                    except OSError:
+                        closed = True
+                    if closed:
+                        self.server.stream_disconnected.set()
+                        return
+            if self.server.stream_release.is_set():
+                self.write_stream_piece(last)
+                if self.server.chunked_stream:
+                    self.wfile.write(b"0\r\n\r\n")
+                self.wfile.flush()
+            return
         self.reply()
 
+    def write_stream_piece(self, data):
+        if self.server.chunked_stream:
+            self.wfile.write(f"{len(data):x}\r\n".encode() + data + b"\r\n")
+        else:
+            self.wfile.write(data)
 
-class ModelRouterTests(unittest.TestCase):
+
+class TrackingHTTPServer(ThreadingHTTPServer):
+    """Track live backend sockets, including idle HTTP/1.1 connections."""
+
+    def __init__(self, *args, **kwargs):
+        self._connections = set()
+        self._connections_changed = threading.Condition()
+        super().__init__(*args, **kwargs)
+
+    def get_request(self):
+        connection, address = super().get_request()
+        with self._connections_changed:
+            self._connections.add(connection)
+            self._connections_changed.notify_all()
+        return connection, address
+
+    def close_request(self, request):
+        try:
+            super().close_request(request)
+        finally:
+            with self._connections_changed:
+                self._connections.discard(request)
+                self._connections_changed.notify_all()
+
+    def wait_for_no_connections(self, timeout=2):
+        with self._connections_changed:
+            return self._connections_changed.wait_for(
+                lambda: not self._connections, timeout=timeout
+            )
+
+
+class RouterFixture(unittest.TestCase):
+    close_backend_connections = False
+
     def setUp(self):
         node = shutil.which("node")
         if not node:
@@ -76,10 +148,15 @@ class ModelRouterTests(unittest.TestCase):
             ("fifi-q36", "primary-key"),
             ("fifi-q36-2080ti", "secondary-key"),
         ):
-            server = ThreadingHTTPServer(("127.0.0.1", 0), Backend)
+            server = TrackingHTTPServer(("127.0.0.1", 0), Backend)
             server.model = model
             server.key = key
             server.unavailable = False
+            server.hold_stream = False
+            server.chunked_stream = False
+            server.stream_started = threading.Event()
+            server.stream_release = threading.Event()
+            server.stream_disconnected = threading.Event()
             threading.Thread(target=server.serve_forever, daemon=True).start()
             self.addCleanup(server.server_close)
             self.addCleanup(server.shutdown)
@@ -102,6 +179,9 @@ class ModelRouterTests(unittest.TestCase):
             FIFI_SECONDARY_RUN=str(secondary),
             FIFI_MODEL_ROUTER_PORT=str(port),
         )
+        env.pop("FIFI_ROUTER_CLOSE_BACKEND_CONNECTIONS", None)
+        if self.close_backend_connections:
+            env["FIFI_ROUTER_CLOSE_BACKEND_CONNECTIONS"] = "1"
         self.proc = subprocess.Popen(
             [node, str(copy)],
             env=env,
@@ -114,7 +194,8 @@ class ModelRouterTests(unittest.TestCase):
             if self.proc.poll() is not None:
                 self.fail("model router exited before accepting requests")
             try:
-                self.get("/v1/models")
+                with socket.create_connection(("127.0.0.1", port), timeout=0.2):
+                    pass
                 break
             except OSError:
                 time.sleep(0.05)
@@ -140,6 +221,10 @@ class ModelRouterTests(unittest.TestCase):
         )
         with urllib.request.urlopen(request, timeout=4) as response:
             return json.load(response)
+
+
+class ModelRouterTests(RouterFixture):
+    close_backend_connections = True
 
     def test_primary_is_first_and_model_specific_routes_still_work(self):
         data = self.get("/v1/models")["data"]
@@ -184,6 +269,78 @@ class ModelRouterTests(unittest.TestCase):
         with self.assertRaises(urllib.error.HTTPError) as error:
             self.get("/v1/models")
         self.assertEqual(error.exception.code, 502)
+
+    def test_completed_model_list_releases_backend_connections(self):
+        self.assertEqual(len(self.get("/v1/models")["data"]), 2)
+        for backend in self.backends:
+            with self.subTest(model=backend.model):
+                self.assertTrue(
+                    backend.wait_for_no_connections(),
+                    f"{backend.model} retained a completed model-list connection",
+                )
+
+    def test_completed_forwarded_request_releases_backend_connection(self):
+        backend = self.backends[1]
+        self.assertEqual(self.post(backend.model)["backend"], backend.model)
+        self.assertTrue(
+            backend.wait_for_no_connections(),
+            "the 2080 backend retained a completed forwarded connection",
+        )
+
+    def open_held_stream(self, chunked):
+        backend = self.backends[1]
+        backend.hold_stream = True
+        backend.chunked_stream = chunked
+        self.addCleanup(backend.stream_release.set)
+        body = json.dumps({"model": backend.model, "stream": True}).encode()
+        request = urllib.request.Request(
+            self.base + "/v1/chat/completions",
+            data=body,
+            headers={"Content-Type": "application/json"},
+        )
+        response = urllib.request.urlopen(request, timeout=5)
+        self.addCleanup(response.close)
+        self.assertEqual(response.read(len(b"data: first\n\n")), b"data: first\n\n")
+        self.assertTrue(backend.stream_started.wait(timeout=2))
+        return backend, response
+
+    def assert_stream_lifetime(self, chunked):
+        backend, response = self.open_held_stream(chunked)
+        with response:
+            self.assertFalse(
+                backend.wait_for_no_connections(timeout=0.2),
+                "the active stream was disconnected before its response finished",
+            )
+            backend.stream_release.set()
+            self.assertEqual(response.read(), b"data: last\n\n")
+        self.assertTrue(
+            backend.wait_for_no_connections(),
+            "the completed stream retained its backend connection",
+        )
+
+    def test_stream_stays_connected_until_its_response_finishes(self):
+        self.assert_stream_lifetime(chunked=False)
+
+    def test_chunked_stream_stays_connected_until_its_response_finishes(self):
+        self.assert_stream_lifetime(chunked=True)
+
+    def test_client_disconnect_cancels_an_active_upstream_stream(self):
+        backend, response = self.open_held_stream(chunked=True)
+        response.close()
+        self.assertTrue(
+            backend.stream_disconnected.wait(timeout=2),
+            "the upstream connection remained open after the client disconnected",
+        )
+        self.assertTrue(backend.wait_for_no_connections())
+
+
+class DefaultConnectionPolicyTests(RouterFixture):
+    def test_default_preserves_model_list_connection_reuse(self):
+        self.assertEqual(len(self.get("/v1/models")["data"]), 2)
+        self.assertFalse(
+            self.backends[1].wait_for_no_connections(timeout=0.2),
+            "the default policy unexpectedly closed the model-list connection",
+        )
 
 
 if __name__ == "__main__":
