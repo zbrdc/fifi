@@ -20,6 +20,8 @@ pub(crate) const DELTA_TAG: u64 = 0x0036_5147_a5a0_0002;
 pub(crate) const MOE_TAG: u64 = 0x0036_5147_a5a0_0003;
 pub(crate) const FLINT_TAIL_TAG: u64 = 0x0036_5147_a5a0_0004;
 pub(crate) const DELTA_LAYER_TAG: u64 = 0x0036_5147_a5a0_0007;
+pub(crate) const ATTN_PRE_LAYER_TAG: u64 = 0x0036_5147_a5a0_0008;
+pub(crate) const ATTN_POST_LAYER_TAG: u64 = 0x0036_5147_a5a0_0009;
 /// The cache-key tag of the attention pre-RoPE closure (projections, q/gate split, q/k norms).
 pub(crate) const ATTN_PRE_TAG: u64 = 0x0036_5147_a5a0_0005;
 pub(crate) const ATTN_POST_TAG: u64 = 0x0036_5147_a5a0_0006;
@@ -230,6 +232,95 @@ pub(crate) fn flint_tail_fun_id(baked: &FlintTailBaked) -> u64 {
         parts.extend(triple.iter().map(|&value| i64::from(value) as u64));
     }
     mix_fun_id(FLINT_TAIL_TAG, &parts)
+}
+
+/// The baked constants of one compiled attention-layer PRE closure of the chunk prefill
+/// (B1v2): the input RMS norm, the q, k, v projections, the q and k head norms, and the
+/// gate slice. T is NOT baked: the nonshapeless MLX cache specializes it under the one
+/// key, like the whole-layer delta closure.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct AttnPreLayerBaked {
+    pub(crate) hidden: u32,
+    /// The query head count.
+    pub(crate) heads: u32,
+    /// The key/value head count (grouped-query attention).
+    pub(crate) kv_heads: u32,
+    /// The head width `D`.
+    pub(crate) width: u32,
+    /// `f32::to_bits(eps)`: the RMS norm epsilon of the input and head norms.
+    pub(crate) eps_bits: u32,
+    /// The activation dtype key of the layer input and outputs.
+    pub(crate) act: u64,
+    /// The scale dtype key of EACH packed weight, in the seam's weight order q, k, v.
+    pub(crate) scale_keys: [u64; 3],
+    /// The quantization triple of EACH packed weight, in the same order.
+    pub(crate) quant: [[i32; 3]; 3],
+}
+
+pub(crate) fn attn_pre_layer_fun_id(baked: &AttnPreLayerBaked) -> u64 {
+    let mut parts = Vec::with_capacity(16);
+    parts.push(u64::from(baked.hidden));
+    parts.push(u64::from(baked.heads));
+    parts.push(u64::from(baked.kv_heads));
+    parts.push(u64::from(baked.width));
+    parts.push(u64::from(baked.eps_bits));
+    parts.push(baked.act);
+    parts.extend(baked.scale_keys);
+    for triple in &baked.quant {
+        parts.extend(triple.iter().map(|&value| i64::from(value) as u64));
+    }
+    mix_fun_id(ATTN_PRE_LAYER_TAG, &parts)
+}
+
+/// The baked constants of one compiled attention-layer POST closure of the chunk prefill
+/// (B1v2): the composite gate chain, the output projection, the mixer residual, and the
+/// folded device-routed MoE rows sequence (post norm, router, gathered experts, shared
+/// expert, output residual) — the same fold as the whole-layer delta closure. T rides on
+/// the residual operand's shape and is NOT baked.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct AttnPostLayerBaked {
+    pub(crate) hidden: u32,
+    /// The query head count.
+    pub(crate) heads: u32,
+    /// The head width `D`.
+    pub(crate) width: u32,
+    /// The router expert count.
+    pub(crate) experts: u32,
+    /// The router selection width.
+    pub(crate) top_k: u32,
+    /// 1 when the gates renormalize over the selection, 0 otherwise.
+    pub(crate) renorm: u32,
+    /// `f32::to_bits(eps)`: the RMS norm epsilon of the post norm.
+    pub(crate) eps_bits: u32,
+    /// The activation dtype key of the layer input and output.
+    pub(crate) act: u64,
+    /// The dtype key of the attention core output operand: it is F32 over the F32 cache and
+    /// the activation dtype over the quantized cache, so it joins the key even though the
+    /// body relies on MLX's runtime promotion instead of branching on it.
+    pub(crate) att: u64,
+    /// The scale dtype key of EACH packed weight, in the seam's weight order o_proj,
+    /// shared gate, shared up, shared down, gate/up stack, down stack.
+    pub(crate) scale_keys: [u64; 6],
+    /// The quantization triple of EACH packed weight, in the same order.
+    pub(crate) quant: [[i32; 3]; 6],
+}
+
+pub(crate) fn attn_post_layer_fun_id(baked: &AttnPostLayerBaked) -> u64 {
+    let mut parts = Vec::with_capacity(30);
+    parts.push(u64::from(baked.hidden));
+    parts.push(u64::from(baked.heads));
+    parts.push(u64::from(baked.width));
+    parts.push(u64::from(baked.experts));
+    parts.push(u64::from(baked.top_k));
+    parts.push(u64::from(baked.renorm));
+    parts.push(u64::from(baked.eps_bits));
+    parts.push(baked.act);
+    parts.push(baked.att);
+    parts.extend(baked.scale_keys);
+    for triple in &baked.quant {
+        parts.extend(triple.iter().map(|&value| i64::from(value) as u64));
+    }
+    mix_fun_id(ATTN_POST_LAYER_TAG, &parts)
 }
 
 /// The baked constants of one compiled attention pre-RoPE step: the q/k/v projections, the

@@ -52,7 +52,9 @@ use super::super::weights::{RFeedForward, RMixer};
 use super::delta::fused_prefill_enabled;
 use super::{attn, delta, moe};
 use crate::family::qwen36::settings::KvDtype;
-use crate::kernels::mlx::native::compile::CompileDeltaLayerArgs;
+use crate::kernels::mlx::native::compile::{
+    CompileAttnPostLayerArgs, CompileAttnPreLayerArgs, CompileDeltaLayerArgs,
+};
 use crate::{
     EngError,
     family::flash_next::stored::{self, SlicedWeight},
@@ -396,6 +398,75 @@ fn run(
                     ring: s.ring,
                 });
                 check_dtype("compiled layer output", &h, ctx.consts.act)?;
+                continue;
+            }
+        }
+        // B1v2 (`Q36_COMPILED_LAYER=1`): one ATTN-mixer layer runs as TWO compiled closures -
+        // PRE (the input norm, the q/k/v projections, the q/k head norms, the gate slice) and
+        // POST (the composite gate chain, the output projection, the mixer residual, and the
+        // folded device-routed MoE rows sequence) - with the eager window attention middle
+        // (`attn::chunk_core`: RoPE, the cache-form casts, the append, and the
+        // position-dependent prefix attention) between them. The same regime gates as the
+        // delta closure; no dims gate, because these closures bake no fused kernel and no
+        // production layout (the POST body implements the composite gate chain, which the
+        // fused `attn_gate` kernel is the byte-equal replacement of). The query-slice block
+        // setting does not apply: the closure reads one attention call over the whole chunk.
+        if mode != StepMode::Record
+            && !(mode == StepMode::Prompt && index == last)
+            && decoder.routing == Routing::Device
+            && compiled_layer_on()
+            && (2..16).contains(&rows)
+        {
+            if let (RMixer::Attn(w), LayerState::Attn(cache), RFeedForward::Moe(moe_w)) =
+                (&layer.mixer, &old_layer, &layer.feed_forward)
+            {
+                let a = &shape.attn;
+                let pre = ctx.kernels.compiled_attn_pre_layer(&CompileAttnPreLayerArgs {
+                    x: &h,
+                    in_norm: &layer.input_norm,
+                    packed: [&w.q, &w.k, &w.v],
+                    norms: [&w.q_norm, &w.k_norm],
+                    hidden: shape.hidden as u32,
+                    heads: a.heads_q as u32,
+                    kv_heads: a.heads_kv as u32,
+                    width: a.head_dim as u32,
+                    eps: shape.eps,
+                    act: ctx.consts.act,
+                })?;
+                let (att, cache) = attn::chunk_core(
+                    &mut ctx,
+                    shape,
+                    cache.share(),
+                    pos,
+                    rows,
+                    &pre.q,
+                    &pre.k,
+                    &pre.v,
+                    None,
+                )?;
+                let post = ctx.kernels.compiled_attn_post_layer(&CompileAttnPostLayerArgs {
+                    att: &att,
+                    gate: &pre.gate,
+                    h: &h,
+                    packed: &w.o,
+                    post_norm: &layer.post_norm,
+                    router_t: &moe_w.router_t,
+                    shared: [&moe_w.shared_gate, &moe_w.shared_up, &moe_w.shared_down],
+                    shared_scalar_t: &moe_w.shared_scalar_t,
+                    stacks: [&moe_w.gate_up, &moe_w.down],
+                    hidden: shape.hidden as u32,
+                    heads: a.heads_q as u32,
+                    width: a.head_dim as u32,
+                    experts: shape.moe.experts as u32,
+                    top_k: shape.moe.top_k as u32,
+                    renorm: shape.moe.renorm,
+                    eps: shape.eps,
+                    act: ctx.consts.act,
+                })?;
+                h = post.out;
+                healths.push(post.health);
+                layers.push(LayerState::Attn(cache));
+                check_dtype("compiled attn layer output", &h, ctx.consts.act)?;
                 continue;
             }
         }
@@ -945,7 +1016,30 @@ mod tests {
                         );
                     }
                     (LayerState::Attn(a), LayerState::Attn(b)) => {
-                        assert_eq!(a.len, b.len, "rows {rows} layer {l}: cache length")
+                        assert_eq!(a.len, b.len, "rows {rows} layer {l}: cache length");
+                        // B1v2: the attention layers run through the PRE/POST closures with
+                        // the eager middle shared, so the cache buffers themselves must be
+                        // byte equal, not just the length (the F32 form the decoder plans;
+                        // another form extends this arm).
+                        match (a.buffers.as_ref(), b.buffers.as_ref()) {
+                            (
+                                Some(KvBuffers::F32 { k: ak, v: av }),
+                                Some(KvBuffers::F32 { k: bk, v: bv }),
+                            ) => {
+                                assert_eq!(
+                                    bits(&mut decoder.kernels, ak),
+                                    bits(&mut decoder.kernels, bk),
+                                    "rows {rows} layer {l}: the key cache is byte equal"
+                                );
+                                assert_eq!(
+                                    bits(&mut decoder.kernels, av),
+                                    bits(&mut decoder.kernels, bv),
+                                    "rows {rows} layer {l}: the value cache is byte equal"
+                                );
+                            }
+                            (None, None) => {}
+                            _ => panic!("rows {rows} layer {l}: cache form mismatch"),
+                        }
                     }
                     _ => panic!("rows {rows} layer {l}: state kind mismatch"),
                 }
@@ -955,7 +1049,7 @@ mod tests {
             );
             assert!(
                 compiled_ops * 2 < eager_ops,
-                "rows {rows}: compiled {compiled_ops} entries must be under half of eager {eager_ops} (the residue is the still-eager attention layers and the head)"
+                "rows {rows}: compiled {compiled_ops} entries must be under half of eager {eager_ops} (the residue is the eager window attention middle, the still-shared head, and the chunk edges)"
             );
         }
     }

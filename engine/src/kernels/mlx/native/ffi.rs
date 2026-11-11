@@ -955,6 +955,55 @@ unsafe extern "C" {
         fun_id: usize,
         stream: mlx_stream,
     ) -> i32;
+    /// The attention-layer PRE closure of the chunk prefill as one compiled closure (B1v2,
+    /// behind `qwen36.compile`): the input RMS norm, the q, k, v projections, the q and k
+    /// head norms, and the gate slice. `dims` holds hidden, heads, kv_heads, width; `quant`
+    /// holds mode, group, bits per weight for the q, k, v projections; `inputs` holds the 13
+    /// closure inputs (the residual stream `[T, H]`, then the q, k, v packed triples, then
+    /// q_norm, k_norm, then the folded input norm weight). The four outputs
+    /// (q `[1, heads, T, width]`, k and v `[1, kv_heads, T, width]`, gate `[T, heads, width]`)
+    /// are lazy. A non-zero status is a native failure of the adapter.
+    #[link_name = "inference_mlx_compile_attn_pre_layer_block"]
+    pub(super) fn mlx_compile_attn_pre_layer_block(
+        q: *mut mlx_array,
+        k: *mut mlx_array,
+        v: *mut mlx_array,
+        gate: *mut mlx_array,
+        inputs: *const mlx_array,
+        inputs_num: usize,
+        dims: *const i32,
+        quant: *const i32,
+        eps: f32,
+        activation: mlx_dtype,
+        fun_id: usize,
+        stream: mlx_stream,
+    ) -> i32;
+    /// The attention-layer POST closure of the chunk prefill as one compiled closure (B1v2,
+    /// behind `qwen36.compile`): the composite gate chain, the output projection, the mixer
+    /// residual, and the folded device-routed MoE rows sequence. `dims` holds hidden, heads,
+    /// width, experts, top_k, renorm; `quant` holds mode, group, bits per weight for the six
+    /// packed weights (o_proj, shared gate, shared up, shared down, gate/up stack, down
+    /// stack); `inputs` holds the 24 caller inputs (the attention core output
+    /// `[1, heads, T, width]`, the gate `[T, heads, width]`, the residual stream `[T, H]`, the
+    /// o_proj triple, the post norm, the transposed router, the three shared-expert triples,
+    /// the shared scalar head weight, the two stack triples); the wrapper appends the two
+    /// gather row-index operands itself, per the window's row count. The two outputs
+    /// (out `[T, H]`, health `[T]`) are lazy. A non-zero status is a native failure of the
+    /// adapter.
+    #[link_name = "inference_mlx_compile_attn_post_layer"]
+    pub(super) fn mlx_compile_attn_post_layer(
+        out: *mut mlx_array,
+        health: *mut mlx_array,
+        inputs: *const mlx_array,
+        inputs_num: usize,
+        dims: *const i32,
+        quant: *const i32,
+        eps: f32,
+        activation: mlx_dtype,
+        owner: usize,
+        fun_id: usize,
+        stream: mlx_stream,
+    ) -> i32;
     /// Clears the calling thread's MLX compile cache: the measurement harness between runs
     /// and the adapter teardown, after its pending work completed and before its stream and
     /// device are released. The cache is thread-local.

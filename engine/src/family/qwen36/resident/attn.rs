@@ -200,6 +200,41 @@ impl KvCache {
             .fold(0, u64::saturating_add)
     }
 
+    /// A handle-level copy for callers that run the eager cache middle while the layer state
+    /// still owns the original (the B1v2 compiled attention layer): every buffer is a shared
+    /// refcount, so both handles alias the same device memory.
+    pub(super) fn share(&self) -> Self {
+        let buffers = self.buffers.as_ref().map(|buffers| match buffers {
+            KvBuffers::F32 { k, v } => KvBuffers::F32 {
+                k: k.share(),
+                v: v.share(),
+            },
+            KvBuffers::Bf16 { k, v } => KvBuffers::Bf16 {
+                k: k.share(),
+                v: v.share(),
+            },
+            KvBuffers::Q8 { k, v } => KvBuffers::Q8 {
+                k: Q8Tensor {
+                    codes: k.codes.share(),
+                    scales: k.scales.share(),
+                    biases: k.biases.share(),
+                },
+                v: Q8Tensor {
+                    codes: v.codes.share(),
+                    scales: v.scales.share(),
+                    biases: v.biases.share(),
+                },
+            },
+        });
+        Self {
+            buffers,
+            kv: self.kv,
+            len: self.len,
+            cap: self.cap,
+            step: self.step,
+        }
+    }
+
     /// Validates the buffers against `kv_heads`, `width`, and the cache form `kv` with no native
     /// call: in the F32 form a pair of `[1, KVH, cap, D]` tensors; in the Q8 form six tensors -
     /// codes `[1, KVH, cap, D/4]`, scales and biases `[1, KVH, cap, D/64]` - all with

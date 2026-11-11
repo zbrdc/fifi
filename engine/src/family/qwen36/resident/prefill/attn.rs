@@ -92,6 +92,80 @@ pub(super) fn chunk_sliced(
     cache.check_buffers(kv_heads, width, cache.kv)?;
     let pair = width.checked_mul(2).ok_or_else(overflow)?;
     let q_width = heads.checked_mul(width).ok_or_else(overflow)?;
+    let m = &mut *ctx.kernels;
+    // 1. Query and gate, interleaved per head: head h is row[h * 2D..(h + 1) * 2D] of each row.
+    let qp = m.qmm(x, &w.q)?;
+    let qp = m.reshape(&qp, &[rows, heads, pair])?;
+    let q_raw = m.slice(&qp, &[0, 0, 0], &[rows, heads, width])?;
+    let gate = m.slice(&qp, &[0, 0, width], &[rows, heads, pair])?;
+    // 2. Query norm with the weight as stored, time on axis -2; RoPE runs in `chunk_core`.
+    let q = m.rms_norm(&q_raw, &w.q_norm, shape.eps)?;
+    let q = m.transpose(&q, &[1, 0, 2])?;
+    let q = m.reshape(&q, &[1, heads, rows, width])?;
+    // 3. New keys: norm per key-value head.
+    let kp = m.qmm(x, &w.k)?;
+    let kp = m.reshape(&kp, &[rows, kv_heads, width])?;
+    let k_new = m.rms_norm(&kp, &w.k_norm, shape.eps)?;
+    let k_new = m.transpose(&k_new, &[1, 0, 2])?;
+    let k_new = m.reshape(&k_new, &[1, kv_heads, rows, width])?;
+    // 4. New values.
+    let vp = m.qmm(x, &w.v)?;
+    let vp = m.reshape(&vp, &[rows, kv_heads, width])?;
+    let v_new = m.transpose(&vp, &[1, 0, 2])?;
+    let v_new = m.reshape(&v_new, &[1, kv_heads, rows, width])?;
+    // 5-6. RoPE, the cache-form casts, the capacity append, and the causal attention core
+    // over the valid prefix (the eager middle shared with the B1v2 compiled layer).
+    let (att, cache) = chunk_core(ctx, shape, cache, pos, rows, &q, &k_new, &v_new, slice)?;
+    // 7. Back to rows, sigmoid output gate, and output projection. The attention output is F32
+    // over the F32 cache and follows the query dtype over the Q8 cache; the projection takes the
+    // activation dtype.
+    // The attn_gate fused kernel (Q36_FUSED_PREFILL=1) replaces the transpose+sigmoid+mul
+    // chain in one kernel; the composite stays the default.
+    let o = if crate::family::qwen36::resident::prefill::delta::fused_prefill_enabled()
+        && std::env::var_os("Q36_NO_ATTNGATE").is_none()
+        && width == 256
+        && heads == 16
+    {
+        ctx.kernels.attn_gate(&att, &qp)?
+    } else {
+        let att = ctx.kernels.transpose(&att, &[0, 2, 1, 3])?;
+        let att = ctx.kernels.reshape(&att, &[rows, heads, width])?;
+        let gate = ctx.kernels.unary(UnaryOp::Sigmoid, &gate)?;
+        ctx.kernels.binary(BinaryOp::Mul, &att, &gate)?
+    };
+    let o = ctx.kernels.reshape(&o, &[rows, q_width])?;
+    let o = to_act(ctx, &o)?;
+    let out = ctx.kernels.qmm(&o, &w.o)?;
+    Ok(AttnStep { out, cache })
+}
+
+/// The eager middle of one attention chunk between the B1v2 compiled closures: RoPE on the
+/// normed queries and keys, the cache-form casts, the capacity append, and the causal
+/// attention core over the valid prefix. The projections, head norms, and gate slice (the
+/// PRE closure) and the gate chain plus output projection (the POST closure) stay outside.
+/// `q`, `k_new`, and `v_new` arrive normed and batched (`[1, heads, rows, width]` and
+/// `[1, kv_heads, rows, width]`), unroped; returns the attention core output
+/// `[1, heads, rows, width]` and the grown cache.
+pub(super) fn chunk_core(
+    ctx: &mut Ctx<'_>,
+    shape: &HostShape,
+    cache: KvCache,
+    pos: u32,
+    rows: u32,
+    q: &ExecutionTensor,
+    k_new: &ExecutionTensor,
+    v_new: &ExecutionTensor,
+    slice: Option<u32>,
+) -> Result<(ExecutionTensor, KvCache), EngError> {
+    let a = &shape.attn;
+    let (heads, kv_heads, width) = (dim(a.heads_q)?, dim(a.heads_kv)?, dim(a.head_dim)?);
+    if usize::try_from(pos).ok() != Some(cache.len) {
+        return Err(EngError::BadRequest(format!(
+            "attention cache holds {} positions, chunk is at {pos}",
+            cache.len
+        )));
+    }
+    cache.check_buffers(kv_heads, width, cache.kv)?;
     let next_len = usize::try_from(rows)
         .ok()
         .and_then(|rows| cache.len.checked_add(rows))
@@ -103,28 +177,8 @@ pub(super) fn chunk_sliced(
         offset: pos,
     };
     let m = &mut *ctx.kernels;
-    // 1. Query and gate, interleaved per head: head h is row[h * 2D..(h + 1) * 2D] of each row.
-    let qp = m.qmm(x, &w.q)?;
-    let qp = m.reshape(&qp, &[rows, heads, pair])?;
-    let q_raw = m.slice(&qp, &[0, 0, 0], &[rows, heads, width])?;
-    let gate = m.slice(&qp, &[0, 0, width], &[rows, heads, pair])?;
-    // 2. Query norm with the weight as stored, time on axis -2, then RoPE from position `pos`.
-    let q = m.rms_norm(&q_raw, &w.q_norm, shape.eps)?;
-    let q = m.transpose(&q, &[1, 0, 2])?;
-    let q = m.reshape(&q, &[1, heads, rows, width])?;
-    let q = m.rope_scaled(&q, &rope)?;
-    // 3. New keys: norm and RoPE per key-value head.
-    let kp = m.qmm(x, &w.k)?;
-    let kp = m.reshape(&kp, &[rows, kv_heads, width])?;
-    let k_new = m.rms_norm(&kp, &w.k_norm, shape.eps)?;
-    let k_new = m.transpose(&k_new, &[1, 0, 2])?;
-    let k_new = m.reshape(&k_new, &[1, kv_heads, rows, width])?;
-    let k_new = m.rope_scaled(&k_new, &rope)?;
-    // 4. New values.
-    let vp = m.qmm(x, &w.v)?;
-    let vp = m.reshape(&vp, &[rows, kv_heads, width])?;
-    let v_new = m.transpose(&vp, &[1, 0, 2])?;
-    let v_new = m.reshape(&v_new, &[1, kv_heads, rows, width])?;
+    let q = m.rope_scaled(q, &rope)?;
+    let k_new = m.rope_scaled(k_new, &rope)?;
     // The cache form (as the decode step of `attn.rs`): the F32 control keeps its cast to F32
     // whatever the activation dtype (the cast runs before the append so that a cache which starts
     // with this chunk is F32 too), and the Q8 form keeps the activation dtype, so the quantized
@@ -140,9 +194,9 @@ pub(super) fn chunk_sliced(
         ),
         KvDtype::Q8 => (k_new, v_new),
     };
-    // 5. Append the rows into the capacity buffers (a growth builds the larger buffers first).
+    // Append the rows into the capacity buffers (a growth builds the larger buffers first).
     let cache = append(ctx, kv_heads, width, cache, rows, &k_new, &v_new)?;
-    // 6. Causal attention over the valid prefix, as a copy-free view of the capacity buffers;
+    // Causal attention over the valid prefix, as a copy-free view of the capacity buffers;
     // head h reads KV head h / (QH / KVH). The Q8 form runs the mlx-lm quantized attention over
     // the codes, scales, and biases - causal for a chunk of more than one row, and a one-row
     // chunk is the decode case.
@@ -225,27 +279,7 @@ pub(super) fn chunk_sliced(
         }
         None => return Err(mismatch()),
     };
-    // 7. Back to rows, sigmoid output gate, and output projection. The attention output is F32
-    // over the F32 cache and follows the query dtype over the Q8 cache; the projection takes the
-    // activation dtype.
-    // The attn_gate fused kernel (Q36_FUSED_PREFILL=1) replaces the transpose+sigmoid+mul
-    // chain in one kernel; the composite stays the default.
-    let o = if crate::family::qwen36::resident::prefill::delta::fused_prefill_enabled()
-        && std::env::var_os("Q36_NO_ATTNGATE").is_none()
-        && width == 256
-        && heads == 16
-    {
-        ctx.kernels.attn_gate(&att, &qp)?
-    } else {
-        let att = ctx.kernels.transpose(&att, &[0, 2, 1, 3])?;
-        let att = ctx.kernels.reshape(&att, &[rows, heads, width])?;
-        let gate = ctx.kernels.unary(UnaryOp::Sigmoid, &gate)?;
-        ctx.kernels.binary(BinaryOp::Mul, &att, &gate)?
-    };
-    let o = ctx.kernels.reshape(&o, &[rows, q_width])?;
-    let o = to_act(ctx, &o)?;
-    let out = ctx.kernels.qmm(&o, &w.o)?;
-    Ok(AttnStep { out, cache })
+    Ok((att, cache))
 }
 
 /// Runs `attend(kernels, queries, len, block_rows)` once per query block of `blocks` and joins

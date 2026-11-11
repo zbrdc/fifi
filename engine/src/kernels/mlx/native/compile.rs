@@ -252,6 +252,86 @@ pub(crate) struct CompiledDeltaLayer {
     pub(crate) health: ExecutionTensor,
 }
 
+/// The flat input list and the baked constants of one compiled attention-layer PRE closure
+/// of the chunk prefill (B1v2). Every tensor must belong to this adapter.
+pub(crate) struct CompileAttnPreLayerArgs<'a> {
+    /// The raw residual stream `[T, H]` in the activation dtype (T in 2..=1024): the closure
+    /// folds the input RMS norm at its head.
+    pub(crate) x: &'a ExecutionTensor,
+    /// The input RMS norm weight `[H]` of the folded head norm.
+    pub(crate) in_norm: &'a ExecutionTensor,
+    /// The q (with interleaved gate), k, v packed weights.
+    pub(crate) packed: [&'a ResidentPackedWeight; 3],
+    /// The q and k norm weights `[D]`, in the activation dtype.
+    pub(crate) norms: [&'a ExecutionTensor; 2],
+    pub(crate) hidden: u32,
+    pub(crate) heads: u32,
+    pub(crate) kv_heads: u32,
+    pub(crate) width: u32,
+    pub(crate) eps: f32,
+    /// The activation dtype of the step and of all four outputs, and part of the compile
+    /// cache key.
+    pub(crate) act: Dtype,
+}
+
+/// The outputs of one compiled attention-layer pre closure, all lazy: the normed q and the
+/// new k/v, batched to `[1, heads, T, width]` for the eager window attention core that
+/// follows (it reads the position-dependent prefix length), plus the output gate.
+pub(crate) struct CompiledAttnPreLayer {
+    /// The normed queries `[1, heads, T, width]` in the activation dtype.
+    pub(crate) q: ExecutionTensor,
+    /// The normed new keys `[1, kv_heads, T, width]` in the activation dtype.
+    pub(crate) k: ExecutionTensor,
+    /// The new values `[1, kv_heads, T, width]` in the activation dtype.
+    pub(crate) v: ExecutionTensor,
+    /// The output gate `[T, heads, width]` in the activation dtype.
+    pub(crate) gate: ExecutionTensor,
+}
+
+/// The flat input list and the baked constants of one compiled attention-layer POST closure
+/// of the chunk prefill (B1v2). Every tensor must belong to this adapter.
+pub(crate) struct CompileAttnPostLayerArgs<'a> {
+    /// The attention core output `[1, heads, T, width]`: F32 over the F32 cache, the
+    /// activation dtype over the quantized cache. The dtype joins the compile cache key.
+    pub(crate) att: &'a ExecutionTensor,
+    /// The output gate `[T, heads, width]` in the activation dtype.
+    pub(crate) gate: &'a ExecutionTensor,
+    /// The raw residual stream `[T, H]`: the layer input, the base of the mixer residual, and
+    /// the T carrier.
+    pub(crate) h: &'a ExecutionTensor,
+    /// The packed output projection weight.
+    pub(crate) packed: &'a ResidentPackedWeight,
+    /// The post-attention RMS norm weight `[H]`.
+    pub(crate) post_norm: &'a ExecutionTensor,
+    /// The transposed router gate `[H, experts]` (F32).
+    pub(crate) router_t: &'a ExecutionTensor,
+    /// The shared gate, up, down weights.
+    pub(crate) shared: [&'a ResidentPackedWeight; 3],
+    /// The transposed shared gate scalar `[H, 1]`.
+    pub(crate) shared_scalar_t: &'a ExecutionTensor,
+    /// The stacked gate/up expert operand and the down stack.
+    pub(crate) stacks: [&'a ResidentPackedWeight; 2],
+    pub(crate) hidden: u32,
+    pub(crate) heads: u32,
+    pub(crate) width: u32,
+    pub(crate) experts: u32,
+    pub(crate) top_k: u32,
+    /// Whether the gates renormalize over the selection.
+    pub(crate) renorm: bool,
+    /// The RMS norm epsilon of the post norm.
+    pub(crate) eps: f32,
+    /// The activation dtype of the step and the output, and part of the compile key.
+    pub(crate) act: Dtype,
+}
+
+/// The outputs of one compiled attention-layer post closure, all lazy.
+pub(crate) struct CompiledAttnPostLayer {
+    /// The layer output `[T, H]` in the activation dtype.
+    pub(crate) out: ExecutionTensor,
+    /// The router health sums `[T]` (F32).
+    pub(crate) health: ExecutionTensor,
+}
+
 /// The flat input list and the baked constants of one compiled attention pre-RoPE decode
 /// step. Every tensor must belong to this adapter.
 pub(crate) struct CompileAttnPreArgs<'a> {
@@ -1302,6 +1382,388 @@ impl Context {
             out: adapter.resident(out_a, args.act, vec![rows, hidden], hidden_bytes),
             rec: adapter.resident(rec_a, Dtype::F32, vec![vh, vd, kd], state_bytes),
             ring: adapter.resident(ring_a, Dtype::F32, vec![cd, taps], ring_bytes),
+            health: adapter.resident(health_a, Dtype::F32, vec![rows], health_bytes),
+        })
+    }
+
+    /// Runs the PRE head of one attention layer of the chunk prefill (B1v2) through one
+    /// `mlx_compile`d closure: the input RMS norm, the q, k, v projections, the q/k head
+    /// norms, and the gate slice. Returns the normed q and the new k/v, batched to
+    /// `[1, heads, T, width]` for the eager window attention core (it reads the
+    /// position-dependent prefix length), plus the gate `[T, heads, width]`. T (the row count
+    /// of `x`) is an input shape the nonshapeless MLX cache specializes under the one key.
+    ///
+    /// Every tensor must belong to this adapter; `check_block_inputs`, `check_logical` on the
+    /// three projections, and `check_norm_operand` on the input norm reject anything else
+    /// before the first native call. No fallback: after the caller turned the flag on, a
+    /// failure is a native failure, with the same discipline as
+    /// [`Context::compiled_delta_layer`].
+    pub(in crate::kernels::mlx) fn compiled_attn_pre_layer(
+        &mut self,
+        args: &CompileAttnPreLayerArgs<'_>,
+    ) -> Result<CompiledAttnPreLayer, EngError> {
+        let label = "compiled attention pre layer";
+        let _dispatch = DispatchGuard::enter();
+        self.check_ready()?;
+        check_float(label, args.act)?;
+        let adapter = self.state.as_mut().unwrap();
+        if args.heads == 0 || args.kv_heads == 0 || args.width == 0 || args.kv_heads > args.heads {
+            return Err(EngError::BadRequest(
+                "compiled attention pre layer needs heads >= kv_heads >= 1 and width >= 1".into(),
+            ));
+        }
+        let pair = args
+            .width
+            .checked_mul(2)
+            .ok_or_else(|| EngError::BadRequest("compiled attention pre layer width overflows".into()))?;
+        let q_out = args
+            .heads
+            .checked_mul(pair)
+            .ok_or_else(|| EngError::BadRequest("compiled attention pre layer dims overflow".into()))?;
+        let kv_out = args
+            .kv_heads
+            .checked_mul(args.width)
+            .ok_or_else(|| EngError::BadRequest("compiled attention pre layer dims overflow".into()))?;
+        let &[rows, hidden] = args.x.shape() else {
+            return Err(EngError::BadRequest(
+                "compiled attention pre layer input must be [T, H]".into(),
+            ));
+        };
+        if rows < 2 || rows > 1024 || hidden != args.hidden {
+            return Err(EngError::BadRequest(
+                "compiled attention pre layer needs 2..=1024 rows of the hidden width".into(),
+            ));
+        }
+        for (what, weight, want) in [
+            ("q", &args.packed[0], [q_out, args.hidden]),
+            ("k", &args.packed[1], [kv_out, args.hidden]),
+            ("v", &args.packed[2], [kv_out, args.hidden]),
+        ] {
+            check_logical(label, what, weight, &want)?;
+        }
+        if args.norms[0].shape() != [args.width] || args.norms[1].shape() != [args.width] {
+            return Err(EngError::BadRequest(
+                "compiled attention pre layer inputs differ from the head norm shapes".into(),
+            ));
+        }
+        for norm in args.norms {
+            if norm.dtype() != args.act {
+                return Err(EngError::BadRequest(format!(
+                    "{label}: a head norm weight carries {:?}, the activation dtype is {:?}",
+                    norm.dtype(),
+                    args.act
+                )));
+            }
+        }
+        check_block_inputs(label, adapter, args.x, args.act, &[], args.packed.as_slice())?;
+        check_norm_operand(label, adapter, args.in_norm, hidden, args.act)?;
+        let triples: Vec<[i32; 3]> = args
+            .packed
+            .iter()
+            .map(|weight| quant_triple(weight))
+            .collect::<Result<_, _>>()?;
+        let quant: Vec<i32> = triples.iter().flat_map(|t| t.iter().copied()).collect();
+        let dims: [i32; 4] = [
+            native_dim(label, hidden)?,
+            native_dim(label, args.heads)?,
+            native_dim(label, args.kv_heads)?,
+            native_dim(label, args.width)?,
+        ];
+        let fun_id = compile_key::attn_pre_layer_fun_id(&compile_key::AttnPreLayerBaked {
+            hidden: args.hidden,
+            heads: args.heads,
+            kv_heads: args.kv_heads,
+            width: args.width,
+            eps_bits: args.eps.to_bits(),
+            act: compile_key::dtype_key(args.act),
+            scale_keys: args
+                .packed
+                .each_ref()
+                .map(|weight| compile_key::dtype_key(weight.scales().dtype())),
+            quant: triples.try_into().expect("three quantization triples"),
+        });
+        adapter.programs.admit(fun_id)?;
+        let mut keep: Vec<_> = [args.x, args.in_norm]
+            .into_iter()
+            .chain(args.norms.iter().copied())
+            .map(|tensor| tensor.share())
+            .collect();
+        let mut inputs: Vec<ffi::mlx_array> = Vec::with_capacity(13);
+        inputs.push(args.x.storage.native_array());
+        for weight in args.packed {
+            inputs.push(weight.payload().storage.native_array());
+            inputs.push(weight.scales().storage.native_array());
+            inputs.push(
+                weight
+                    .biases()
+                    .map(|biases| biases.storage.native_array())
+                    .unwrap_or(ffi::NULL_ARRAY),
+            );
+        }
+        inputs.push(args.norms[0].storage.native_array());
+        inputs.push(args.norms[1].storage.native_array());
+        inputs.push(args.in_norm.storage.native_array());
+        debug_assert_eq!(inputs.len(), 13);
+        for weight in args.packed {
+            keep.push(weight.payload().share());
+            keep.push(weight.scales().share());
+            if let Some(biases) = weight.biases() {
+                keep.push(biases.share());
+            }
+        }
+        clear_message();
+        let stream = adapter.stream.0;
+        let (mut q_a, mut k_a, mut v_a, mut gate_a) =
+            (Array::null(), Array::null(), Array::null(), Array::null());
+        let started = std::time::Instant::now();
+        let built = produce(&mut q_a, label, |slot| unsafe {
+            ffi::mlx_compile_attn_pre_layer_block(
+                slot,
+                &mut k_a.0,
+                &mut v_a.0,
+                &mut gate_a.0,
+                inputs.as_ptr(),
+                inputs.len(),
+                dims.as_ptr(),
+                quant.as_ptr(),
+                args.eps,
+                native_dtype(args.act),
+                fun_id as usize,
+                stream,
+            )
+        });
+        super::super::compile_stats::record(
+            super::super::compile_stats::Kind::Attn,
+            fun_id,
+            started.elapsed().as_secs_f64(),
+        );
+        // All four outputs carry the activation dtype.
+        let q_bytes =
+            u64::from(args.heads) * u64::from(rows) * u64::from(args.width) * args.act.byte_width();
+        let kv_bytes = u64::from(args.kv_heads) * u64::from(rows) * u64::from(args.width)
+            * args.act.byte_width();
+        let gate_bytes =
+            u64::from(rows) * u64::from(args.heads) * u64::from(args.width) * args.act.byte_width();
+        let checked = built.and_then(|()| {
+            if native_output_valid(q_a.0, &[1, args.heads, rows, args.width], args.act, q_bytes)
+                && native_output_valid(
+                    k_a.0,
+                    &[1, args.kv_heads, rows, args.width],
+                    args.act,
+                    kv_bytes,
+                )
+                && native_output_valid(
+                    v_a.0,
+                    &[1, args.kv_heads, rows, args.width],
+                    args.act,
+                    kv_bytes,
+                )
+                && native_output_valid(gate_a.0, &[rows, args.heads, args.width], args.act, gate_bytes)
+            {
+                Ok(())
+            } else {
+                Err(failure(label))
+            }
+        });
+        if checked.is_err() {
+            mark_failed();
+        }
+        checked?;
+        drop(keep);
+        Ok(CompiledAttnPreLayer {
+            q: adapter.resident(q_a, args.act, vec![1, args.heads, rows, args.width], q_bytes),
+            k: adapter.resident(k_a, args.act, vec![1, args.kv_heads, rows, args.width], kv_bytes),
+            v: adapter.resident(v_a, args.act, vec![1, args.kv_heads, rows, args.width], kv_bytes),
+            gate: adapter.resident(gate_a, args.act, vec![rows, args.heads, args.width], gate_bytes),
+        })
+    }
+
+    /// Runs the POST tail of one attention layer of the chunk prefill (B1v2) through one
+    /// `mlx_compile`d closure: the composite gate chain, the output projection, the mixer
+    /// residual, and the folded device-routed MoE rows sequence (post norm, router, gathered
+    /// experts, shared expert, output residual) — the same fold as
+    /// [`Context::compiled_delta_layer`]. Inputs are the eager window attention core's
+    /// output `[1, heads, T, width]`, the pre closure's gate, and the layer's residual
+    /// stream; the row count rides on the residual operand's shape, and the wrapper builds
+    /// the gather row-index operands natively per window. Outputs: the layer output `[T, H]`
+    /// and the router health `[T]`.
+    ///
+    /// Every tensor must belong to this adapter; `check_block_inputs`, `check_logical` on the
+    /// output projection, and `check_norm_operand` on the post norm reject anything else
+    /// before the first native call. No fallback: after the caller turned the flag on, a
+    /// failure is a native failure, with the same discipline as
+    /// [`Context::compiled_delta_layer`].
+    pub(in crate::kernels::mlx) fn compiled_attn_post_layer(
+        &mut self,
+        args: &CompileAttnPostLayerArgs<'_>,
+    ) -> Result<CompiledAttnPostLayer, EngError> {
+        let label = "compiled attention post layer";
+        let _dispatch = DispatchGuard::enter();
+        self.check_ready()?;
+        check_float(label, args.act)?;
+        let adapter = self.state.as_mut().unwrap();
+        if args.heads == 0 || args.width == 0 || args.experts == 0 || args.top_k == 0 {
+            return Err(EngError::BadRequest(
+                "compiled attention post layer needs heads, width, experts, top_k >= 1".into(),
+            ));
+        }
+        let o_out = args
+            .heads
+            .checked_mul(args.width)
+            .ok_or_else(|| EngError::BadRequest("compiled attention post layer dims overflow".into()))?;
+        let rows = match args.att.shape() {
+            &[1, heads, r, width] if heads == args.heads && width == args.width => r,
+            _ => {
+                return Err(EngError::BadRequest(
+                    "compiled attention post layer core output must be [1, heads, T, width]".into(),
+                ));
+            }
+        };
+        if rows < 2 || rows > 1024 {
+            return Err(EngError::BadRequest(
+                "compiled attention post layer needs 2..=1024 rows".into(),
+            ));
+        }
+        if args.gate.shape() != [rows, args.heads, args.width] {
+            return Err(EngError::BadRequest(
+                "compiled attention post layer gate must be [T, heads, width]".into(),
+            ));
+        }
+        let &[h_rows, hidden] = args.h.shape() else {
+            return Err(EngError::BadRequest(
+                "compiled attention post layer residual must be [T, H]".into(),
+            ));
+        };
+        if h_rows != rows || hidden != args.hidden {
+            return Err(EngError::BadRequest(
+                "compiled attention post layer residual disagrees with the core output rows".into(),
+            ));
+        }
+        check_logical(label, "o_proj", args.packed, &[hidden, o_out])?;
+        if args.router_t.shape()[0] != hidden
+            || args.router_t.shape().get(1) != Some(&args.experts)
+            || args.shared_scalar_t.shape() != [hidden, 1]
+        {
+            return Err(EngError::BadRequest(
+                "compiled attention post layer router shapes disagree".into(),
+            ));
+        }
+        let mut packed_all: Vec<&ResidentPackedWeight> = Vec::with_capacity(6);
+        packed_all.push(args.packed);
+        packed_all.extend(args.shared);
+        packed_all.extend(args.stacks);
+        let f32_operands = [args.router_t, args.shared_scalar_t];
+        check_block_inputs(label, adapter, args.h, args.act, &f32_operands, &packed_all)?;
+        check_operand(label, adapter, args.att)?;
+        check_operand(label, adapter, args.gate)?;
+        check_norm_operand(label, adapter, args.post_norm, hidden, args.act)?;
+        let triples: Vec<[i32; 3]> = packed_all
+            .iter()
+            .map(|weight| quant_triple(weight))
+            .collect::<Result<_, _>>()?;
+        let quant: Vec<i32> = triples.iter().flat_map(|t| t.iter().copied()).collect();
+        let fun_id = compile_key::attn_post_layer_fun_id(&compile_key::AttnPostLayerBaked {
+            hidden: args.hidden,
+            heads: args.heads,
+            width: args.width,
+            experts: args.experts,
+            top_k: args.top_k,
+            renorm: u32::from(args.renorm),
+            eps_bits: args.eps.to_bits(),
+            act: compile_key::dtype_key(args.act),
+            att: compile_key::dtype_key(args.att.dtype()),
+            scale_keys: packed_all
+                .iter()
+                .map(|weight| compile_key::dtype_key(weight.scales().dtype()))
+                .collect::<Vec<_>>()
+                .try_into()
+                .expect("six packed weights"),
+            quant: triples.try_into().expect("six quantization triples"),
+        });
+        adapter.programs.admit(fun_id)?;
+        let dims: [i32; 6] = [
+            native_dim(label, hidden)?,
+            native_dim(label, args.heads)?,
+            native_dim(label, args.width)?,
+            native_dim(label, args.experts)?,
+            native_dim(label, args.top_k)?,
+            i32::from(args.renorm),
+        ];
+        let mut keep: Vec<_> = [args.att, args.gate, args.h, args.post_norm]
+            .into_iter()
+            .chain(std::iter::once(args.router_t))
+            .chain(std::iter::once(args.shared_scalar_t))
+            .map(|tensor| tensor.share())
+            .collect();
+        let mut inputs: Vec<ffi::mlx_array> = Vec::with_capacity(24);
+        inputs.push(args.att.storage.native_array());
+        inputs.push(args.gate.storage.native_array());
+        inputs.push(args.h.storage.native_array());
+        for weight in std::iter::once(args.packed)
+            .chain(args.shared.iter().copied())
+            .chain(args.stacks.iter().copied())
+        {
+            inputs.push(weight.payload().storage.native_array());
+            inputs.push(weight.scales().storage.native_array());
+            inputs.push(
+                weight
+                    .biases()
+                    .map(|biases| biases.storage.native_array())
+                    .unwrap_or(ffi::NULL_ARRAY),
+            );
+            keep.push(weight.payload().share());
+            keep.push(weight.scales().share());
+            if let Some(biases) = weight.biases() {
+                keep.push(biases.share());
+            }
+        }
+        inputs.push(args.post_norm.storage.native_array());
+        inputs.push(args.router_t.storage.native_array());
+        inputs.push(args.shared_scalar_t.storage.native_array());
+        debug_assert_eq!(inputs.len(), 24);
+        clear_message();
+        let stream = adapter.stream.0;
+        let (mut out_a, mut health_a) = (Array::null(), Array::null());
+        let started = std::time::Instant::now();
+        let built = produce(&mut out_a, label, |slot| unsafe {
+            ffi::mlx_compile_attn_post_layer(
+                slot,
+                &mut health_a.0,
+                inputs.as_ptr(),
+                inputs.len(),
+                dims.as_ptr(),
+                quant.as_ptr(),
+                args.eps,
+                native_dtype(args.act),
+                adapter.owner.0.get() as usize,
+                fun_id as usize,
+                stream,
+            )
+        });
+        super::super::compile_stats::record(
+            super::super::compile_stats::Kind::Attn,
+            fun_id,
+            started.elapsed().as_secs_f64(),
+        );
+        // The layer output carries the activation dtype; the health stays F32.
+        let hidden_bytes = u64::from(rows) * u64::from(hidden) * args.act.byte_width();
+        let health_bytes = u64::from(rows) * 4;
+        let checked = built.and_then(|()| {
+            if native_output_valid(out_a.0, &[rows, hidden], args.act, hidden_bytes)
+                && native_output_valid(health_a.0, &[rows], Dtype::F32, health_bytes)
+            {
+                Ok(())
+            } else {
+                Err(failure(label))
+            }
+        });
+        if checked.is_err() {
+            mark_failed();
+        }
+        checked?;
+        drop(keep);
+        Ok(CompiledAttnPostLayer {
+            out: adapter.resident(out_a, args.act, vec![rows, hidden], hidden_bytes),
             health: adapter.resident(health_a, Dtype::F32, vec![rows], health_bytes),
         })
     }
