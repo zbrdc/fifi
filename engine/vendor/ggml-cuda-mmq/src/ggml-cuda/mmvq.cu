@@ -955,6 +955,12 @@ static cudaError_t mul_mat_vec_q_wpr_launch(
 static int g_mvq_wpr_test_arm = 0;
 extern "C" void inference_cuda_test_arm_mvq_wpr(const int on) { g_mvq_wpr_test_arm = on; }
 
+// FIFI-MMQ-PIPE: test arm for the pipelined mul_mat_q k-loop (mmq.cuh reads this at launch
+// time next to INFERENCE_CUDA_MMQ_PIPE; defined here because mmq.cuh is included by several
+// template-instance TUs and needs exactly one definition).
+int g_mmq_pipe_test_arm = 0;
+extern "C" void inference_cuda_test_arm_mmq_pipe(const int on) { g_mmq_pipe_test_arm = on; }
+
 // V-MV1 (b): returns cudaError_t; the fusion assert is a returned cudaErrorInvalidValue and the
 // ggml_cuda_kernel_launch result is returned, never swallowed.
 template<ggml_type type, int c_ncols_dst, bool small_k = false, bool halve_iters = false>

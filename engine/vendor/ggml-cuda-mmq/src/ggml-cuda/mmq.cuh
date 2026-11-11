@@ -895,6 +895,102 @@ static __device__ __forceinline__ void mul_mat_q_process_tile(
     }
 }
 
+// FIFI-MMQ-PIPE: two-stage software pipeline for the dp4a k-loop, cc 7.2 (Xavier) + Q4_K +
+// non-stream-K only, armed by INFERENCE_CUDA_MMQ_PIPE (or the test arm). The stock loop is
+// fully serialized: load x, load y-half, __syncthreads, vec_dot, __syncthreads, load y-half,
+// __syncthreads, vec_dot, __syncthreads - four block-wide barriers per 256-element k-slab and
+// no load/compute overlap at any point. This variant keeps the identical load_tiles and
+// vec_dot calls (same arguments, same arithmetic order, bit-identical results) but stages
+// x and y into double buffers and issues the NEXT stage's loads before the current stage's
+// vec_dot: loads and compute touch disjoint shared memory, so no barrier is needed between
+// them. One barrier per 128-element half (two per iteration, vs four) guards buffer reuse.
+// Shared memory grows from ~24 KB to ~47 KB per block, which still fits the 48 KB static
+// limit and keeps two blocks per SM at the 96 KB carve-out.
+template <ggml_type type, int J, bool fallback>
+static __device__ __forceinline__ void mul_mat_q_process_tile_pipe(
+        const char * __restrict__ x, const int offset_x, const int * __restrict__ y,
+        const int * __restrict__ ids_dst, float * __restrict__ dst, float * __restrict__ tmp_fixup,
+        const float * __restrict__ y_scale,
+        const int stride_row_x, const int ncols_y, const int stride_col_dst,
+        const int tile_x_max_i, const int tile_y_max_j, const int kb0_start, const int kb0_stop) {
+
+    static_assert(type == GGML_TYPE_Q4_K, "pipelined mmq is Q4_K-only");
+    constexpr int warp_size  = ggml_cuda_get_physical_warp_size();
+    constexpr int nwarps     = ggml_cuda_mmq_get_nthreads(type, J, fallback) / warp_size;
+    constexpr int qk         = ggml_cuda_type_traits<type>::qk;
+    constexpr int I          = ggml_cuda_mmq_get_I(type, J, fallback);
+    constexpr ggml_cuda_mmq_load_tiles_t load_tiles = ggml_cuda_mmq_get_load_tiles<type, J, fallback>();
+    constexpr ggml_cuda_mmq_vec_dot_t    vec_dot    = ggml_cuda_mmq_get_vec_dot<type, J, fallback>();
+    constexpr ggml_cuda_mmq_write_back_t write_back = ggml_cuda_mmq_get_write_back<type, J, fallback>();
+
+    constexpr int ITER_K = ggml_cuda_mmq_get_K_vram(type, J, fallback);
+    static_assert(ITER_K == qk, "pipeline assumes one quant block per iteration");
+    GGML_UNUSED(tmp_fixup); // non-stream-K only: never the fixup path
+
+    // Layout mirrors mmq_get_nbytes_shared_pipe: ids | x0 | x1 | y0 | y1, where each y buffer
+    // holds one 128-element half (the stock loop reuses one buffer for both halves). The y
+    // stride is GGML_PAD(J*MMQ_TILE_Y_K, nthreads) ints, matching the stock tile_y stride so
+    // the host-side size formula stays a pure doubling.
+    extern __shared__ int data_mul_mat_q[];
+    constexpr tile_x_sizes txs = mmq_get_dp4a_tile_x_sizes(type, I);
+    constexpr int nbx = txs.qs + txs.dm + txs.sc;
+    const int nby = GGML_PAD(J*MMQ_TILE_Y_K, nwarps*warp_size);
+    int * tile_xb[2] = {data_mul_mat_q + J, data_mul_mat_q + J + nbx};
+    int * tile_yh[2] = {tile_xb[1] + nbx, tile_xb[1] + nbx + nby};
+
+    float sum[J*I / (nwarps*warp_size)] = {0.0f};
+
+    constexpr int sz       = sizeof(block_q8_1_mmq) / sizeof(int);
+    constexpr int ne_block = QK8_1_MMQ;
+    const int total_h = 2*(kb0_stop - kb0_start); // two 128-element y halves per iteration
+
+    // Prologue: stage iteration kb0_start (x tile + both y halves), then one barrier.
+    load_tiles(x, tile_xb[0], offset_x + kb0_start, tile_x_max_i, stride_row_x);
+    {
+        const int * by0 = y + ncols_y * (kb0_start * qk / ne_block) * sz;
+#pragma unroll
+        for (int l0 = 0; l0 < J * MMQ_TILE_Y_K; l0 += nwarps * warp_size) {
+            const int l = l0 + threadIdx.y*warp_size + threadIdx.x;
+            tile_yh[0][l] = by0[l];
+        }
+        by0 = y + ncols_y * ((kb0_start * qk / ne_block) * sz + sz);
+#pragma unroll
+        for (int l0 = 0; l0 < J * MMQ_TILE_Y_K; l0 += nwarps * warp_size) {
+            const int l = l0 + threadIdx.y*warp_size + threadIdx.x;
+            tile_yh[1][l] = by0[l];
+        }
+    }
+    __syncthreads();
+
+#pragma unroll 2
+    for (int h = 0; h < total_h; ++h) {
+        const int kb = kb0_start + (h >> 1); // base quant block of this half's iteration
+
+        // Prefetch the next half's y and, on half boundaries, the next iteration's x. Both
+        // write buffers the current vec_dot does not read: no barrier needed between these
+        // loads and the compute below. Global half g's source is y word-block 2*kb0_start + g
+        // (half 0 of iteration k is block 2k, half 1 is block 2k+1).
+        if (h + 1 < total_h) {
+            const int g = h + 1;
+            const int * by0 = y + ncols_y * (2*kb0_start + g) * sz;
+#pragma unroll
+            for (int l0 = 0; l0 < J * MMQ_TILE_Y_K; l0 += nwarps * warp_size) {
+                const int l = l0 + threadIdx.y*warp_size + threadIdx.x;
+                tile_yh[(h+1)&1][l] = by0[l];
+            }
+        }
+        if ((h&1) == 0 && h + 2 < total_h) {
+            load_tiles(x, tile_xb[((h >> 1) + 1) & 1], offset_x + kb + 1, tile_x_max_i, stride_row_x);
+        }
+
+        vec_dot(tile_xb[(h >> 1)&1], tile_yh[h&1], sum, (h&1)*MMQ_TILE_NE_K);
+
+        __syncthreads(); // guards tile_yh[h&1] (reuse by the h+2 load) and the x buffer swap
+    }
+
+    write_back(sum, ids_dst, dst, y_scale, stride_col_dst, tile_x_max_i, tile_y_max_j);
+}
+
 
 // The mul_mat_q kernel implements "stream-k" work partitioning as described in https://arxiv.org/abs/2301.03598
 
@@ -907,7 +1003,7 @@ static __global__ void mul_mat_q(
         const uint3 blocks_per_ne00, const int nrows_x, const int ncols_dst, const int stride_row_x, const int ncols_y, const int stride_col_dst,
         const uint3 channel_ratio, const uint3 nchannels_y, const int stride_channel_x, const int stride_channel_y, const int stride_channel_dst,
         const uint3 sample_ratio, const uint3 nsamples_y, const int stride_sample_x, const int stride_sample_y, const int stride_sample_dst,
-        const uint3 ntx) {
+        const uint3 ntx, const bool pipe) {
 
     // Skip unused template specializations for faster compilation:
     if (ggml_cuda_mmq_get_config(type, J, fallback).type == GGML_TYPE_COUNT) {
@@ -1001,6 +1097,17 @@ static __global__ void mul_mat_q(
         const int offset_x = fastdiv(wt, sample_ratio)*stride_sample_x + fastdiv(zt, channel_ratio)*stride_channel_x + it*I*stride_row_x;
 
         constexpr bool fixup = false;
+        // FIFI-MMQ-PIPE: Q4_K non-fallback rows only, so every other specialization compiles
+        // exactly as before; the runtime flag picks the pipelined loop on the production row.
+        if constexpr (type == GGML_TYPE_Q4_K && !fallback) {
+            if (pipe) {
+                mul_mat_q_process_tile_pipe<type, J, fallback>
+                    (x, offset_x, y + offset_y, ids_dst_shared, dst + offset_dst, nullptr, y_scale_tile,
+                     stride_row_x, ncols_y, stride_col_dst,
+                     tile_x_max_i, tile_y_max_j, 0, blocks_per_ne00.z);
+                return;
+            }
+        }
         mul_mat_q_process_tile<type, J, fallback, fixup>
             (x, offset_x, y + offset_y, ids_dst_shared, dst + offset_dst, tmp_fixup, y_scale_tile,
              stride_row_x, ncols_y, stride_col_dst,
@@ -1346,6 +1453,16 @@ static size_t mmq_get_nbytes_shared(const ggml_cuda_mmq_config & config, const i
     return nbs_ids + nbs_x + GGML_PAD(nbs_y, config.nthreads*sizeof(int));
 }
 
+// FIFI-MMQ-PIPE: shared budget of the pipelined loop - ids plus two x tiles and two y halves.
+// Pure doubling of the x and y terms, so the device-side layout in
+// mul_mat_q_process_tile_pipe stays a mirror of this formula.
+static size_t mmq_get_nbytes_shared_pipe(const ggml_cuda_mmq_config & config, const int cc) {
+    const size_t nbs_ids = config.J*sizeof(int);
+    const size_t nbs_x = ggml_cuda_mmq_get_nbytes_shared_x(config, cc);
+    const size_t nbs_y = config.J * (sizeof(block_q8_1_mmq));
+    return nbs_ids + 2*nbs_x + 2*GGML_PAD(nbs_y, config.nthreads*sizeof(int));
+}
+
 template <ggml_type type, int J, bool fallback>
 static cudaError_t launch_mul_mat_q(const mmq_args & args, cudaStream_t stream) {
     const int cc = args.dev.cc;
@@ -1355,12 +1472,34 @@ static cudaError_t launch_mul_mat_q(const mmq_args & args, cudaStream_t stream) 
     const ggml_cuda_mmq_config config = ggml_cuda_mmq_get_config(type, J, fallback, cc);
     FIFI_REQUIRE(config.nthreads % warp_size == 0);
     const int nwarps = config.nthreads / warp_size;
-    const int nbytes_shared = mmq_get_nbytes_shared(config, cc);
+
+    // FIFI-MMQ-PIPE: read per call (no static cache) so a test process can arm the flag
+    // around individual launches; one getenv is noise against a 100 microsecond launch.
+    bool mmq_pipe = false;
+    if constexpr (type == GGML_TYPE_Q4_K && !fallback) {
+        extern int g_mmq_pipe_test_arm; // defined next to the vendored entry points
+        mmq_pipe = cc == 720 && (g_mmq_pipe_test_arm != 0 || std::getenv("INFERENCE_CUDA_MMQ_PIPE") != nullptr);
+    }
+
+    const int nbytes_shared = mmq_pipe ? mmq_get_nbytes_shared_pipe(config, cc) : mmq_get_nbytes_shared(config, cc);
 
     const dim3 block_dims(warp_size, nwarps, 1);
 
     CUDA_SET_SHARED_MEMORY_LIMIT((mul_mat_q<type, J, false>), nbytes_shared, args.dev.device);
     CUDA_SET_SHARED_MEMORY_LIMIT((mul_mat_q<type, J,  true>), nbytes_shared, args.dev.device);
+
+    // FIFI-MMQ-PIPE: the doubled buffers only pay off if two blocks still fit per SM. The
+    // carve-out is a separate knob (INFERENCE_CUDA_MMQ_CARVEOUT) because it is useful on the
+    // stock loop too: 4 stock blocks/SM at the 96 KB carve-out vs 2 at the default split.
+    // Measured on Xavier 2026-11-10: the pipelined loop alone is ~25% slower (the staged
+    // loads are ld.global->st.shared chains, so the "prefetch" still stalls the issuing warp
+    // on DRAM; the pipeline buys barriers but loses resident warps).
+    if (mmq_pipe || (cc == 720 && std::getenv("INFERENCE_CUDA_MMQ_CARVEOUT") != nullptr)) {
+        FIFI_TRY(cudaFuncSetAttribute((mul_mat_q<type, J, false>), cudaFuncAttributePreferredSharedMemoryCarveout,
+                                      cudaSharedmemCarveoutMaxShared));
+        FIFI_TRY(cudaFuncSetAttribute((mul_mat_q<type, J,  true>), cudaFuncAttributePreferredSharedMemoryCarveout,
+                                      cudaSharedmemCarveoutMaxShared));
+    }
 
     const int nty  = (args.nrows_x   + config.I - 1) / config.I;
     const int ntx  = (args.ncols_max + config.J - 1) / config.J;
@@ -1388,7 +1527,7 @@ static cudaError_t launch_mul_mat_q(const mmq_args & args, cudaStream_t stream) 
              blocks_per_ne00_fd, args.nrows_x, args.ncols_dst, args.stride_row_x, args.ncols_y, args.nrows_dst,
              channel_ratio_fd, nchannels_y_fd, args.stride_channel_x, args.stride_channel_y, args.stride_channel_dst,
              sample_ratio_fd, nsamples_y_fd, args.stride_sample_x, args.stride_sample_y, args.stride_sample_dst,
-             ntx_fd);
+             ntx_fd, mmq_pipe);
         return cudaGetLastError();
     }
 
@@ -1419,7 +1558,7 @@ static cudaError_t launch_mul_mat_q(const mmq_args & args, cudaStream_t stream) 
          blocks_per_ne00_fd, args.nrows_x, args.ncols_dst, args.stride_row_x, args.ncols_y, args.nrows_dst,
          channel_ratio_fd, nchannels_y_fd, args.stride_channel_x, args.stride_channel_y, args.stride_channel_dst,
          sample_ratio_fd, nsamples_y_fd, args.stride_sample_x, args.stride_sample_y, args.stride_sample_dst,
-         ntx_fd);
+         ntx_fd, false);
 
     if (!fixup_needed) {
         return cudaGetLastError();

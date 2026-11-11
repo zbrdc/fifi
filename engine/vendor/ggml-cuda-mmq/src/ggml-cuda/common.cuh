@@ -198,15 +198,17 @@ static int ggml_cuda_highest_compiled_arch(const int arch) {
 
 // V-3b: shared_memory_limit_raised is process-global. It is written only by the thread that owns the device context
 // (decision 0047 thread confinement), so it takes no lock; the attribute it guards is idempotent, so a repeated set is harmless.
+// FIFI-MMQ-PIPE: the attribute is re-raised when a later launch asks for more - the pipelined mmq arm doubles the
+// shared budget at runtime, so a process that first ran the stock loop must not stay capped at the smaller size.
 #if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
 #    define CUDA_SET_SHARED_MEMORY_LIMIT(kernel, nbytes, device)                                              \
         do {                                                                                                   \
-            static bool shared_memory_limit_raised[GGML_CUDA_MAX_DEVICES] = { false };                         \
+            static size_t shared_memory_raised_to[GGML_CUDA_MAX_DEVICES] = { 0 };                             \
             const int   id                                                = (device);                          \
             FIFI_REQUIRE(id >= 0 && id < GGML_CUDA_MAX_DEVICES);                                               \
-            if (!shared_memory_limit_raised[id]) {                                                             \
+            if ((nbytes) > shared_memory_raised_to[id]) {                                                      \
                 FIFI_TRY(cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, nbytes));   \
-                shared_memory_limit_raised[id] = true;                                                         \
+                shared_memory_raised_to[id] = (nbytes);                                                        \
             }                                                                                                  \
         } while (0)
 #else
