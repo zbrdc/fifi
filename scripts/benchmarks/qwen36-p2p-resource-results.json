@@ -1,0 +1,974 @@
+{
+  "scope": "Guarded observer overhead and sampled resource use; no causal bottleneck or production qualification claim.",
+  "observer_source_commit": "dc5a2e670da765467c905b384e4cdcb2e01f755b",
+  "observer_sha256": "7b62cd2da0b7077cb7924f7362f01a52a976f67a314c466f57f071471690e87e",
+  "server_tested_commit": "cc635bbdf4f9adb7f261d0721b63200ea7293341",
+  "server_source_tree_head": "c273f2a7eac3236577edbfe79b6a34dc09b48028",
+  "server_binary_sha256": "0f276c5f071a0249b7b82e714de09e94722768e3fee22a1fd529b68784640f5e",
+  "build_receipt_sha256": "775379a254d70815e190b283a68200dfddf9ada2afd113ddf77940a3d0cb94a1",
+  "model": "Qwen3.6 35B A3B Q4_K_M",
+  "model_sha256": "671e47e0ec53c665d048b98c3ecbfd5236b5ca9c3e02ed19fc8f81f7b85140c7",
+  "devices": [
+    "RTX 3060 12 GB",
+    "RTX 3080 10 GB"
+  ],
+  "configured_context_tokens": 262144,
+  "kv_cache": "q8",
+  "prefix_reuse": false,
+  "chunk_rows": 512,
+  "common_flags": {
+    "Q36_P2P_ASYNC_BROADCAST": "0",
+    "Q36_P2P_SYNC_BROADCAST": "1"
+  },
+  "arm_difference": {
+    "control": "observer off",
+    "candidate": "observer on, 2-second interval"
+  },
+  "samples_per_arm_per_order": 3,
+  "served_smoke": {
+    "guard": {
+      "samples": 85,
+      "minimum_free_mib": 1368,
+      "sha256": "102f2b4b323b44c1c16b1b7101d6708c998da7a458a14f8550efa71de8e3fc81"
+    },
+    "restoration": {
+      "reason": "original pair service ready",
+      "complete_sha256": "b04bf9539c44c53d3c4cedb8355c630aad2cf21fa74f59e00eb8b64d91cbf79c",
+      "restore_sha256": "ec8531c48de7e4b199aa41197040a5fa2ca12bb1cfe82410d3117e7642e3194d"
+    },
+    "summary_sha256": "6e2ccb960a4f9cdce24f3d0545decdccf7e6a061e67d01324d619666b22a8875"
+  },
+  "runs": [
+    {
+      "order": "control-first",
+      "comparisons": {
+        "short": {
+          "payload_sha256": "30d2e3484b1f4583f6e329fe9f8f9263e51894aa7898aa11fe107829277ee8ab",
+          "control": {
+            "samples": [
+              {
+                "request_id": "chatcmpl-0000000000000002",
+                "prompt_tokens": 524,
+                "completion_tokens": 2,
+                "reused_tokens": 0,
+                "prefill_ms": 1252.2,
+                "started_to_first_token_prompt_tokens_per_second": 418.4635042325507,
+                "complete_reply_prompt_tokens_per_second": 409.51609109075866,
+                "decode_tokens_per_second": 38.45
+              },
+              {
+                "request_id": "chatcmpl-0000000000000003",
+                "prompt_tokens": 524,
+                "completion_tokens": 2,
+                "reused_tokens": 0,
+                "prefill_ms": 1251.1,
+                "started_to_first_token_prompt_tokens_per_second": 418.8314283430581,
+                "complete_reply_prompt_tokens_per_second": 409.9332137434022,
+                "decode_tokens_per_second": 38.72
+              },
+              {
+                "request_id": "chatcmpl-0000000000000004",
+                "prompt_tokens": 524,
+                "completion_tokens": 2,
+                "reused_tokens": 0,
+                "prefill_ms": 1249.7,
+                "started_to_first_token_prompt_tokens_per_second": 419.3006321517164,
+                "complete_reply_prompt_tokens_per_second": 410.28082312981627,
+                "decode_tokens_per_second": 38.48
+              }
+            ],
+            "median_started_to_first_token_prompt_tokens_per_second": 418.8314283430581,
+            "median_complete_reply_prompt_tokens_per_second": 409.9332137434022
+          },
+          "candidate": {
+            "samples": [
+              {
+                "request_id": "chatcmpl-0000000000000002",
+                "prompt_tokens": 524,
+                "completion_tokens": 2,
+                "reused_tokens": 0,
+                "prefill_ms": 1251.6,
+                "started_to_first_token_prompt_tokens_per_second": 418.66410993927775,
+                "complete_reply_prompt_tokens_per_second": 409.6720122088514,
+                "decode_tokens_per_second": 38.66
+              },
+              {
+                "request_id": "chatcmpl-0000000000000003",
+                "prompt_tokens": 524,
+                "completion_tokens": 2,
+                "reused_tokens": 0,
+                "prefill_ms": 1249.5,
+                "started_to_first_token_prompt_tokens_per_second": 419.3677470988395,
+                "complete_reply_prompt_tokens_per_second": 410.41546733711635,
+                "decode_tokens_per_second": 38.6
+              },
+              {
+                "request_id": "chatcmpl-0000000000000004",
+                "prompt_tokens": 524,
+                "completion_tokens": 2,
+                "reused_tokens": 0,
+                "prefill_ms": 1249.1,
+                "started_to_first_token_prompt_tokens_per_second": 419.50204146985834,
+                "complete_reply_prompt_tokens_per_second": 410.4890930541172,
+                "decode_tokens_per_second": 38.6
+              }
+            ],
+            "median_started_to_first_token_prompt_tokens_per_second": 419.3677470988395,
+            "median_complete_reply_prompt_tokens_per_second": 410.41546733711635
+          },
+          "started_to_first_token_speedup": 1.0012805122048818,
+          "timing_note": "Server timing runs from job start to first emitted batch and includes first-token generation; client timing runs to the complete reply."
+        },
+        "long": {
+          "payload_sha256": "83bc090b8c20bbf350317d552c592dd83fd0f8a0e9505c1ed895b914be94e890",
+          "control": {
+            "samples": [
+              {
+                "request_id": "chatcmpl-0000000000000005",
+                "prompt_tokens": 4274,
+                "completion_tokens": 2,
+                "reused_tokens": 0,
+                "prefill_ms": 9031.4,
+                "started_to_first_token_prompt_tokens_per_second": 473.237814735257,
+                "complete_reply_prompt_tokens_per_second": 471.57403778594556,
+                "decode_tokens_per_second": 38.59
+              },
+              {
+                "request_id": "chatcmpl-0000000000000006",
+                "prompt_tokens": 4274,
+                "completion_tokens": 2,
+                "reused_tokens": 0,
+                "prefill_ms": 9038.7,
+                "started_to_first_token_prompt_tokens_per_second": 472.85560976689123,
+                "complete_reply_prompt_tokens_per_second": 471.25711971485526,
+                "decode_tokens_per_second": 38.51
+              },
+              {
+                "request_id": "chatcmpl-0000000000000007",
+                "prompt_tokens": 4274,
+                "completion_tokens": 2,
+                "reused_tokens": 0,
+                "prefill_ms": 9036.2,
+                "started_to_first_token_prompt_tokens_per_second": 472.98643234988157,
+                "complete_reply_prompt_tokens_per_second": 471.3520724272051,
+                "decode_tokens_per_second": 38.45
+              }
+            ],
+            "median_started_to_first_token_prompt_tokens_per_second": 472.98643234988157,
+            "median_complete_reply_prompt_tokens_per_second": 471.3520724272051
+          },
+          "candidate": {
+            "samples": [
+              {
+                "request_id": "chatcmpl-0000000000000005",
+                "prompt_tokens": 4274,
+                "completion_tokens": 2,
+                "reused_tokens": 0,
+                "prefill_ms": 9043.5,
+                "started_to_first_token_prompt_tokens_per_second": 472.6046331619395,
+                "complete_reply_prompt_tokens_per_second": 470.67208537907936,
+                "decode_tokens_per_second": 38.71
+              },
+              {
+                "request_id": "chatcmpl-0000000000000006",
+                "prompt_tokens": 4274,
+                "completion_tokens": 2,
+                "reused_tokens": 0,
+                "prefill_ms": 9046.1,
+                "started_to_first_token_prompt_tokens_per_second": 472.46879870883583,
+                "complete_reply_prompt_tokens_per_second": 470.8556440763187,
+                "decode_tokens_per_second": 38.48
+              },
+              {
+                "request_id": "chatcmpl-0000000000000007",
+                "prompt_tokens": 4274,
+                "completion_tokens": 2,
+                "reused_tokens": 0,
+                "prefill_ms": 9047.0,
+                "started_to_first_token_prompt_tokens_per_second": 472.4217972808666,
+                "complete_reply_prompt_tokens_per_second": 470.8360887820162,
+                "decode_tokens_per_second": 38.53
+              }
+            ],
+            "median_started_to_first_token_prompt_tokens_per_second": 472.46879870883583,
+            "median_complete_reply_prompt_tokens_per_second": 470.8360887820162
+          },
+          "started_to_first_token_speedup": 0.9989056057306464,
+          "timing_note": "Server timing runs from job start to first emitted batch and includes first-token generation; client timing runs to the complete reply."
+        },
+        "decode": {
+          "control_median_tokens_per_second": 38.76,
+          "candidate_median_tokens_per_second": 38.61,
+          "speedup": 0.9961300309597524,
+          "payload_sha256": "bacd82b581ce7dd5cb38dde1bb3004787b2327dab7ae6d4d6b3d25a6df747f3e",
+          "samples": {
+            "control": [
+              {
+                "request_id": "chatcmpl-0000000000000008",
+                "prompt_tokens": 31,
+                "completion_tokens": 128,
+                "finish_reason": "length",
+                "answer_sha256": "ef5d7dd6bee907301e7cdb774195e953c37a82af6e8bde4afacc7b1ed065113b",
+                "time_to_first_token_ms": 271.0,
+                "decode_tokens_per_second": 38.76,
+                "total_seconds": 3.54814
+              },
+              {
+                "request_id": "chatcmpl-0000000000000009",
+                "prompt_tokens": 31,
+                "completion_tokens": 128,
+                "finish_reason": "length",
+                "answer_sha256": "ef5d7dd6bee907301e7cdb774195e953c37a82af6e8bde4afacc7b1ed065113b",
+                "time_to_first_token_ms": 271.6,
+                "decode_tokens_per_second": 38.77,
+                "total_seconds": 3.54794
+              },
+              {
+                "request_id": "chatcmpl-000000000000000a",
+                "prompt_tokens": 31,
+                "completion_tokens": 128,
+                "finish_reason": "length",
+                "answer_sha256": "ef5d7dd6bee907301e7cdb774195e953c37a82af6e8bde4afacc7b1ed065113b",
+                "time_to_first_token_ms": 270.4,
+                "decode_tokens_per_second": 38.76,
+                "total_seconds": 3.547511
+              }
+            ],
+            "candidate": [
+              {
+                "request_id": "chatcmpl-0000000000000008",
+                "prompt_tokens": 31,
+                "completion_tokens": 128,
+                "finish_reason": "length",
+                "answer_sha256": "ef5d7dd6bee907301e7cdb774195e953c37a82af6e8bde4afacc7b1ed065113b",
+                "time_to_first_token_ms": 272.2,
+                "decode_tokens_per_second": 38.61,
+                "total_seconds": 3.562735
+              },
+              {
+                "request_id": "chatcmpl-0000000000000009",
+                "prompt_tokens": 31,
+                "completion_tokens": 128,
+                "finish_reason": "length",
+                "answer_sha256": "ef5d7dd6bee907301e7cdb774195e953c37a82af6e8bde4afacc7b1ed065113b",
+                "time_to_first_token_ms": 272.4,
+                "decode_tokens_per_second": 38.64,
+                "total_seconds": 3.560421
+              },
+              {
+                "request_id": "chatcmpl-000000000000000a",
+                "prompt_tokens": 31,
+                "completion_tokens": 128,
+                "finish_reason": "length",
+                "answer_sha256": "ef5d7dd6bee907301e7cdb774195e953c37a82af6e8bde4afacc7b1ed065113b",
+                "time_to_first_token_ms": 271.4,
+                "decode_tokens_per_second": 38.58,
+                "total_seconds": 3.564629
+              }
+            ]
+          }
+        }
+      },
+      "long_batch": {
+        "batch_start_monotonic_ns": 219253610064850,
+        "batch_end_monotonic_ns": 219280964092093,
+        "fully_contained_cpu_intervals": 12,
+        "cpu": {
+          "process_total_cores": {
+            "count": 12,
+            "median": 1.0000001797504152,
+            "min": 0.99500000796,
+            "max": 1.0050015080047627
+          },
+          "process_user_cores": {
+            "count": 12,
+            "median": 1.0000001797504152,
+            "min": 0.99500000796,
+            "max": 1.0000045005202545
+          },
+          "process_system_cores": {
+            "count": 12,
+            "median": 0.0,
+            "min": 0.0,
+            "max": 0.005000007502511257
+          },
+          "busiest_thread_cores": {
+            "count": 12,
+            "median": 0.9999987792521015,
+            "min": 0.995001676577825,
+            "max": 1.0000045005202545
+          },
+          "system_busy_fraction": {
+            "count": 12,
+            "median": 0.05387672619412972,
+            "min": 0.049604001667361404,
+            "max": 0.06010016694490818
+          },
+          "busiest_thread_names": [
+            "engine"
+          ]
+        },
+        "gpus": [
+          {
+            "uuid": "GPU-704fef60-5280-9b88-fa3d-d11135caf576",
+            "gpu_busy_percent_samples": [
+              100,
+              100,
+              100,
+              72,
+              100,
+              100,
+              100,
+              100,
+              100,
+              100,
+              100,
+              100
+            ],
+            "pcie_generation_samples": [
+              4
+            ],
+            "pcie_width_samples": [
+              4
+            ],
+            "pcie_rx_kb_per_s_samples": [
+              1130664,
+              1137500,
+              5542382,
+              1137890,
+              1011230,
+              2603076,
+              6620117,
+              6707812,
+              1137109,
+              3369824,
+              6871533,
+              6870117
+            ],
+            "pcie_tx_kb_per_s_samples": [
+              1008593,
+              1131396,
+              1527685,
+              1032617,
+              917626,
+              619628,
+              1574511,
+              1569873,
+              1131103,
+              1577685,
+              1535546,
+              1369775
+            ]
+          },
+          {
+            "uuid": "GPU-282e266a-24ac-6fa8-a16d-4281e52b4c0a",
+            "gpu_busy_percent_samples": [
+              100,
+              100,
+              100,
+              100,
+              100,
+              100,
+              100,
+              100,
+              100,
+              100,
+              100,
+              100
+            ],
+            "pcie_generation_samples": [
+              4
+            ],
+            "pcie_width_samples": [
+              8
+            ],
+            "pcie_rx_kb_per_s_samples": [
+              922802,
+              1134326,
+              1764306,
+              13272851,
+              957177,
+              1019189,
+              2789013,
+              4962841,
+              1092578,
+              1133984,
+              5847119,
+              10902880
+            ],
+            "pcie_tx_kb_per_s_samples": [
+              1125634,
+              905712,
+              1310400,
+              1123583,
+              1125341,
+              1114306,
+              488,
+              226367,
+              1080908,
+              1237255,
+              2637353,
+              537
+            ]
+          }
+        ],
+        "observer_wall_ms": {
+          "count": 12,
+          "median": 88.9748925,
+          "min": 83.971717,
+          "max": 106.90723
+        },
+        "observer_cpu_ms": {
+          "count": 12,
+          "median": 8.755779,
+          "min": 3.766253,
+          "max": 17.700485
+        }
+      },
+      "observer": {
+        "sha256": "e552542978db883eeb26524a8b101755ac04608b40c78c6de36e089f1cb6dea8",
+        "samples": 22,
+        "interval_seconds": 2.0
+      },
+      "artifact_sha256": {
+        "resource_jsonl": "e552542978db883eeb26524a8b101755ac04608b40c78c6de36e089f1cb6dea8",
+        "control-short.json": "0b1b57585c22dedefa1958999062ea22c33887dc2baa1a97e9f92b1aa14033fe",
+        "candidate-short.json": "2da83f6e463c15a0e4775ee88086cd0cde20b072c7669b194dd5ba0ae3a5bdcf",
+        "control-long.json": "6df4462da58fda64b3b26714db85e6a24b6c4616b8eff268e4331563ddc4dd8a",
+        "candidate-long.json": "d85ab8b8f0a2e516282dc5ee18704280605659433a28795f546c669e46af9d89",
+        "control-decode.json": "628f14e0343b55178224aeb8031eb8488493973b67278a8220d442ff6aa679ab",
+        "control-engine.log": "c3971a59ccb837a0cc6d7fa920dcaa241d292cb57bbceb3740f796bb071dc54f",
+        "candidate-decode.json": "282314ee2b5af14a1e869854488d278c5bb519717a15f8b45a1ed644260e6386",
+        "candidate-engine.log": "1c873e561eadc5601a464fcc3928bf0339b091bac8e8e95e0ad6fde08f9430f2"
+      },
+      "guard": {
+        "samples": 236,
+        "minimum_free_mib": 1368,
+        "sha256": "2972c417aa88eff1e3c61151b921db6fbd8828695d6e3a491820d7c61e7ab586"
+      },
+      "restoration": {
+        "reason": "original pair service ready",
+        "complete_sha256": "4504254b08166ddf68afcb00f829c8d99d8cef0f9e49114b7ec37a4cd5d25b24",
+        "restore_sha256": "ec8531c48de7e4b199aa41197040a5fa2ca12bb1cfe82410d3117e7642e3194d"
+      },
+      "summary_sha256": "e39a6697a4a71729b0c22b827373ccda26f63c28089148269861e665c239a4fa"
+    },
+    {
+      "order": "candidate-first",
+      "comparisons": {
+        "short": {
+          "payload_sha256": "30d2e3484b1f4583f6e329fe9f8f9263e51894aa7898aa11fe107829277ee8ab",
+          "control": {
+            "samples": [
+              {
+                "request_id": "chatcmpl-0000000000000002",
+                "prompt_tokens": 524,
+                "completion_tokens": 2,
+                "reused_tokens": 0,
+                "prefill_ms": 1252.8,
+                "started_to_first_token_prompt_tokens_per_second": 418.2630906768838,
+                "complete_reply_prompt_tokens_per_second": 409.1985331325866,
+                "decode_tokens_per_second": 38.19
+              },
+              {
+                "request_id": "chatcmpl-0000000000000003",
+                "prompt_tokens": 524,
+                "completion_tokens": 2,
+                "reused_tokens": 0,
+                "prefill_ms": 1252.0,
+                "started_to_first_token_prompt_tokens_per_second": 418.53035143769966,
+                "complete_reply_prompt_tokens_per_second": 409.53657497684634,
+                "decode_tokens_per_second": 38.26
+              },
+              {
+                "request_id": "chatcmpl-0000000000000004",
+                "prompt_tokens": 524,
+                "completion_tokens": 2,
+                "reused_tokens": 0,
+                "prefill_ms": 1250.6,
+                "started_to_first_token_prompt_tokens_per_second": 418.99888053734213,
+                "complete_reply_prompt_tokens_per_second": 410.08271305714317,
+                "decode_tokens_per_second": 38.66
+              }
+            ],
+            "median_started_to_first_token_prompt_tokens_per_second": 418.53035143769966,
+            "median_complete_reply_prompt_tokens_per_second": 409.53657497684634
+          },
+          "candidate": {
+            "samples": [
+              {
+                "request_id": "chatcmpl-0000000000000002",
+                "prompt_tokens": 524,
+                "completion_tokens": 2,
+                "reused_tokens": 0,
+                "prefill_ms": 1253.2,
+                "started_to_first_token_prompt_tokens_per_second": 418.1295882540696,
+                "complete_reply_prompt_tokens_per_second": 409.1490091020038,
+                "decode_tokens_per_second": 38.53
+              },
+              {
+                "request_id": "chatcmpl-0000000000000003",
+                "prompt_tokens": 524,
+                "completion_tokens": 2,
+                "reused_tokens": 0,
+                "prefill_ms": 1253.7,
+                "started_to_first_token_prompt_tokens_per_second": 417.9628300231315,
+                "complete_reply_prompt_tokens_per_second": 409.07394714202513,
+                "decode_tokens_per_second": 38.53
+              },
+              {
+                "request_id": "chatcmpl-0000000000000004",
+                "prompt_tokens": 524,
+                "completion_tokens": 2,
+                "reused_tokens": 0,
+                "prefill_ms": 1253.6,
+                "started_to_first_token_prompt_tokens_per_second": 417.996171027441,
+                "complete_reply_prompt_tokens_per_second": 409.1116343853644,
+                "decode_tokens_per_second": 38.54
+              }
+            ],
+            "median_started_to_first_token_prompt_tokens_per_second": 417.996171027441,
+            "median_complete_reply_prompt_tokens_per_second": 409.1116343853644
+          },
+          "started_to_first_token_speedup": 0.9987236758136567,
+          "timing_note": "Server timing runs from job start to first emitted batch and includes first-token generation; client timing runs to the complete reply."
+        },
+        "long": {
+          "payload_sha256": "83bc090b8c20bbf350317d552c592dd83fd0f8a0e9505c1ed895b914be94e890",
+          "control": {
+            "samples": [
+              {
+                "request_id": "chatcmpl-0000000000000005",
+                "prompt_tokens": 4274,
+                "completion_tokens": 2,
+                "reused_tokens": 0,
+                "prefill_ms": 9049.6,
+                "started_to_first_token_prompt_tokens_per_second": 472.2860678925035,
+                "complete_reply_prompt_tokens_per_second": 470.63596088193697,
+                "decode_tokens_per_second": 38.47
+              },
+              {
+                "request_id": "chatcmpl-0000000000000006",
+                "prompt_tokens": 4274,
+                "completion_tokens": 2,
+                "reused_tokens": 0,
+                "prefill_ms": 9047.1,
+                "started_to_first_token_prompt_tokens_per_second": 472.41657547722474,
+                "complete_reply_prompt_tokens_per_second": 470.7787290406258,
+                "decode_tokens_per_second": 38.54
+              },
+              {
+                "request_id": "chatcmpl-0000000000000007",
+                "prompt_tokens": 4274,
+                "completion_tokens": 2,
+                "reused_tokens": 0,
+                "prefill_ms": 9050.4,
+                "started_to_first_token_prompt_tokens_per_second": 472.24432069300804,
+                "complete_reply_prompt_tokens_per_second": 470.6693901032125,
+                "decode_tokens_per_second": 38.52
+              }
+            ],
+            "median_started_to_first_token_prompt_tokens_per_second": 472.2860678925035,
+            "median_complete_reply_prompt_tokens_per_second": 470.6693901032125
+          },
+          "candidate": {
+            "samples": [
+              {
+                "request_id": "chatcmpl-0000000000000005",
+                "prompt_tokens": 4274,
+                "completion_tokens": 2,
+                "reused_tokens": 0,
+                "prefill_ms": 9044.4,
+                "started_to_first_token_prompt_tokens_per_second": 472.55760470567424,
+                "complete_reply_prompt_tokens_per_second": 470.8883781905745,
+                "decode_tokens_per_second": 37.8
+              },
+              {
+                "request_id": "chatcmpl-0000000000000006",
+                "prompt_tokens": 4274,
+                "completion_tokens": 2,
+                "reused_tokens": 0,
+                "prefill_ms": 9043.4,
+                "started_to_first_token_prompt_tokens_per_second": 472.6098591237809,
+                "complete_reply_prompt_tokens_per_second": 470.96164439442697,
+                "decode_tokens_per_second": 38.61
+              },
+              {
+                "request_id": "chatcmpl-0000000000000007",
+                "prompt_tokens": 4274,
+                "completion_tokens": 2,
+                "reused_tokens": 0,
+                "prefill_ms": 9038.1,
+                "started_to_first_token_prompt_tokens_per_second": 472.88700058640643,
+                "complete_reply_prompt_tokens_per_second": 471.2939632690643,
+                "decode_tokens_per_second": 38.66
+              }
+            ],
+            "median_started_to_first_token_prompt_tokens_per_second": 472.6098591237809,
+            "median_complete_reply_prompt_tokens_per_second": 470.96164439442697
+          },
+          "started_to_first_token_speedup": 1.0006855828560055,
+          "timing_note": "Server timing runs from job start to first emitted batch and includes first-token generation; client timing runs to the complete reply."
+        },
+        "decode": {
+          "control_median_tokens_per_second": 38.52,
+          "candidate_median_tokens_per_second": 38.73,
+          "speedup": 1.0054517133956384,
+          "payload_sha256": "bacd82b581ce7dd5cb38dde1bb3004787b2327dab7ae6d4d6b3d25a6df747f3e",
+          "samples": {
+            "control": [
+              {
+                "request_id": "chatcmpl-0000000000000008",
+                "prompt_tokens": 31,
+                "completion_tokens": 128,
+                "finish_reason": "length",
+                "answer_sha256": "ef5d7dd6bee907301e7cdb774195e953c37a82af6e8bde4afacc7b1ed065113b",
+                "time_to_first_token_ms": 271.8,
+                "decode_tokens_per_second": 38.48,
+                "total_seconds": 3.572674
+              },
+              {
+                "request_id": "chatcmpl-0000000000000009",
+                "prompt_tokens": 31,
+                "completion_tokens": 128,
+                "finish_reason": "length",
+                "answer_sha256": "ef5d7dd6bee907301e7cdb774195e953c37a82af6e8bde4afacc7b1ed065113b",
+                "time_to_first_token_ms": 272.6,
+                "decode_tokens_per_second": 38.52,
+                "total_seconds": 3.570404
+              },
+              {
+                "request_id": "chatcmpl-000000000000000a",
+                "prompt_tokens": 31,
+                "completion_tokens": 128,
+                "finish_reason": "length",
+                "answer_sha256": "ef5d7dd6bee907301e7cdb774195e953c37a82af6e8bde4afacc7b1ed065113b",
+                "time_to_first_token_ms": 270.9,
+                "decode_tokens_per_second": 38.64,
+                "total_seconds": 3.558767
+              }
+            ],
+            "candidate": [
+              {
+                "request_id": "chatcmpl-0000000000000008",
+                "prompt_tokens": 31,
+                "completion_tokens": 128,
+                "finish_reason": "length",
+                "answer_sha256": "ef5d7dd6bee907301e7cdb774195e953c37a82af6e8bde4afacc7b1ed065113b",
+                "time_to_first_token_ms": 271.2,
+                "decode_tokens_per_second": 38.73,
+                "total_seconds": 3.550743
+              },
+              {
+                "request_id": "chatcmpl-0000000000000009",
+                "prompt_tokens": 31,
+                "completion_tokens": 128,
+                "finish_reason": "length",
+                "answer_sha256": "ef5d7dd6bee907301e7cdb774195e953c37a82af6e8bde4afacc7b1ed065113b",
+                "time_to_first_token_ms": 270.5,
+                "decode_tokens_per_second": 38.72,
+                "total_seconds": 3.551237
+              },
+              {
+                "request_id": "chatcmpl-000000000000000a",
+                "prompt_tokens": 31,
+                "completion_tokens": 128,
+                "finish_reason": "length",
+                "answer_sha256": "ef5d7dd6bee907301e7cdb774195e953c37a82af6e8bde4afacc7b1ed065113b",
+                "time_to_first_token_ms": 272.0,
+                "decode_tokens_per_second": 38.74,
+                "total_seconds": 3.550966
+              }
+            ]
+          }
+        }
+      },
+      "long_batch": {
+        "batch_start_monotonic_ns": 219664233733299,
+        "batch_end_monotonic_ns": 219691559341024,
+        "fully_contained_cpu_intervals": 12,
+        "cpu": {
+          "process_total_cores": {
+            "count": 12,
+            "median": 0.99999935175046,
+            "min": 0.9950029641138302,
+            "max": 1.0050003778801422
+          },
+          "process_user_cores": {
+            "count": 12,
+            "median": 0.99999935175046,
+            "min": 0.9950029641138302,
+            "max": 1.000006206538521
+          },
+          "process_system_cores": {
+            "count": 12,
+            "median": 0.0,
+            "min": 0.0,
+            "max": 0.005000001880000706
+          },
+          "busiest_thread_cores": {
+            "count": 12,
+            "median": 0.9999974637566862,
+            "min": 0.9950011173862549,
+            "max": 1.000001209501463
+          },
+          "system_busy_fraction": {
+            "count": 12,
+            "median": 0.05504009056257882,
+            "min": 0.04836356055868251,
+            "max": 0.05982905982905983
+          },
+          "busiest_thread_names": [
+            "engine"
+          ]
+        },
+        "gpus": [
+          {
+            "uuid": "GPU-704fef60-5280-9b88-fa3d-d11135caf576",
+            "gpu_busy_percent_samples": [
+              100,
+              100,
+              100,
+              69,
+              100,
+              100,
+              100,
+              100,
+              100,
+              100,
+              100,
+              100
+            ],
+            "pcie_generation_samples": [
+              4
+            ],
+            "pcie_width_samples": [
+              4
+            ],
+            "pcie_rx_kb_per_s_samples": [
+              1067822,
+              913427,
+              4184082,
+              1135791,
+              1139013,
+              1827050,
+              6781250,
+              6093701,
+              1087939,
+              1222949,
+              4904345,
+              6801562
+            ],
+            "pcie_tx_kb_per_s_samples": [
+              1099218,
+              914794,
+              1535351,
+              1129248,
+              1131103,
+              459375,
+              1537060,
+              1542675,
+              1057958,
+              1599658,
+              1573828,
+              1480175
+            ]
+          },
+          {
+            "uuid": "GPU-282e266a-24ac-6fa8-a16d-4281e52b4c0a",
+            "gpu_busy_percent_samples": [
+              100,
+              100,
+              100,
+              100,
+              100,
+              100,
+              100,
+              100,
+              100,
+              100,
+              100,
+              100
+            ],
+            "pcie_generation_samples": [
+              4
+            ],
+            "pcie_width_samples": [
+              8
+            ],
+            "pcie_rx_kb_per_s_samples": [
+              949755,
+              1100390,
+              981835,
+              11278027,
+              1084472,
+              1076855,
+              4914794,
+              225830,
+              1092773,
+              913720,
+              390,
+              9588330
+            ],
+            "pcie_tx_kb_per_s_samples": [
+              1125781,
+              1125341,
+              1397900,
+              1577636,
+              1125439,
+              1125292,
+              488,
+              1302197,
+              1125341,
+              941210,
+              2819580,
+              1784423
+            ]
+          }
+        ],
+        "observer_wall_ms": {
+          "count": 12,
+          "median": 89.0592365,
+          "min": 84.109131,
+          "max": 95.983523
+        },
+        "observer_cpu_ms": {
+          "count": 12,
+          "median": 8.733386,
+          "min": 3.889363,
+          "max": 15.49611
+        }
+      },
+      "observer": {
+        "sha256": "d0dd97b37fcb483ba0671fbf6c63a83e622b0b2b739baf458e28aee862faf5f9",
+        "samples": 22,
+        "interval_seconds": 2.0
+      },
+      "artifact_sha256": {
+        "resource_jsonl": "d0dd97b37fcb483ba0671fbf6c63a83e622b0b2b739baf458e28aee862faf5f9",
+        "control-short.json": "8c9541bd4a29b67580d922694abeeaafec50961b2cfc127df2734d7378f14de7",
+        "candidate-short.json": "184ac8bf2b0e86e1495e7714e8b5e0ce5f7c061b91aec4ba6211cfc42028bdcd",
+        "control-long.json": "c3d32d8b0307e578e12b51c9dfeb6fc2008b6f2ccac74a9b26061f9c933b03b0",
+        "candidate-long.json": "33ce81714071da6f8db7b44f3db24d07323ba32f391e914878e031bf37c54657",
+        "control-decode.json": "0d42b12d6958a0e567657fc2f91f00d897e763979035e8034c91a69ba64c56fc",
+        "control-engine.log": "940c95ad197148970e84c421855368688d54efbeb4c209a685befea29cf4cd6a",
+        "candidate-decode.json": "dad9d3037249407f5b989541a720b7739078fe43cc1345ee9872631cce4b878d",
+        "candidate-engine.log": "c9914f380e3d715034ab2af08e75f4a7373c9b5f7bef140c92158118e375ad6e"
+      },
+      "guard": {
+        "samples": 234,
+        "minimum_free_mib": 1368,
+        "sha256": "6929e5cb0e636cb89bf52e0ccfd45550776e562a2d34be5f3c499ed7668df8e9"
+      },
+      "restoration": {
+        "reason": "original pair service ready",
+        "complete_sha256": "4504254b08166ddf68afcb00f829c8d99d8cef0f9e49114b7ec37a4cd5d25b24",
+        "restore_sha256": "ec8531c48de7e4b199aa41197040a5fa2ca12bb1cfe82410d3117e7642e3194d"
+      },
+      "summary_sha256": "9d7f30844297d647a768a1bf118dcba7c53fbc71168e36ba93115ceb3795400c"
+    }
+  ],
+  "secondary_service_unchanged": {
+    "ready": true,
+    "fingerprint_sha256": {
+      "executable": "7ecc29185c3ff4b0cf29df8d6e39f1be5446f93bbf8128f8d8049377fcef1490",
+      "start": "67fce39d8ed2ec714da6f252e9bd0fd0e1dbc30dc6e0b83bf101b49f10c8000f",
+      "config": "821a91e6d0a763a31f4676d6bab5c8bfd5f2739737e05c612deece673cbd430f"
+    }
+  },
+  "measurement_driver_sha256": {
+    "scripts/bench_p2p_prefill.py": "90ae74c68eaa3f0c92aa212965818f3dbe6f4cd89c9c0843f6d40e93880b9c1b",
+    "scripts/bench_p2p_decode.py": "be5013449dc88b24e6fbc67dbfe323518ba6a30e281dfbd9d0a3638d58f11ee7",
+    "scripts/bench_host_gpu_resources.py": "7b62cd2da0b7077cb7924f7362f01a52a976f67a314c466f57f071471690e87e",
+    "compare_prefill.py": "60c46fbd0bf5441ba0858c250cebcdb412d1ec31f8b74ce4e3ac202e2efd1218"
+  },
+  "post_measurement_topology": {
+    "scope": "Read-only post-benchmark PCIe width/topology observation; link speed dynamically downclocks at idle and is omitted.",
+    "board_vendor": "Gigabyte Technology Co., Ltd.",
+    "board_name": "X570 AORUS ULTRA",
+    "board_revision": "Default string",
+    "cpu": "AMD Ryzen 9 3900X",
+    "gpus": {
+      "RTX 3080": "0000:0b:00.0",
+      "RTX 3060": "0000:0c:00.0",
+      "RTX 2080 Ti": "0000:05:00.0"
+    },
+    "links": {
+      "0000:00:03.1": {
+        "sysfs_device_path": "/sys/devices/pci0000:00/0000:00:03.1",
+        "negotiated_width": 8,
+        "maximum_width": 8,
+        "maximum_speed": "16.0 GT/s PCIe"
+      },
+      "0000:00:03.2": {
+        "sysfs_device_path": "/sys/devices/pci0000:00/0000:00:03.2",
+        "negotiated_width": 4,
+        "maximum_width": 8,
+        "maximum_speed": "16.0 GT/s PCIe"
+      },
+      "0000:0b:00.0": {
+        "sysfs_device_path": "/sys/devices/pci0000:00/0000:00:03.1/0000:0b:00.0",
+        "negotiated_width": 8,
+        "maximum_width": 16,
+        "maximum_speed": "16.0 GT/s PCIe"
+      },
+      "0000:0c:00.0": {
+        "sysfs_device_path": "/sys/devices/pci0000:00/0000:00:03.2/0000:0c:00.0",
+        "negotiated_width": 4,
+        "maximum_width": 16,
+        "maximum_speed": "16.0 GT/s PCIe"
+      },
+      "0000:03:02.0": {
+        "sysfs_device_path": "/sys/devices/pci0000:00/0000:00:01.2/0000:02:00.0/0000:03:02.0",
+        "negotiated_width": 4,
+        "maximum_width": 4,
+        "maximum_speed": "16.0 GT/s PCIe"
+      },
+      "0000:05:00.0": {
+        "sysfs_device_path": "/sys/devices/pci0000:00/0000:00:01.2/0000:02:00.0/0000:03:02.0/0000:05:00.0",
+        "negotiated_width": 4,
+        "maximum_width": 16,
+        "maximum_speed": "8.0 GT/s PCIe"
+      }
+    },
+    "vendor_specification": "https://www.gigabyte.com/Motherboard/X570-AORUS-ULTRA-rev-10/sp",
+    "limitations": [
+      "DMI did not report a usable board revision; the cited specification is the rev 1.0 page.",
+      "An x4 negotiated width versus an x8 root-port maximum does not by itself identify why width is reduced or establish a performance bottleneck.",
+      "No hardware or firmware was modified; identify physical slots, risers and active-lane constraints before considering a change."
+    ]
+  },
+  "cpu_driver_tests": {
+    "observer_harness": {
+      "tests_passed": 39,
+      "log_sha256": "905b031720ec8ad2bd108338dd46caa985018ecec9a9c6d2a4f64296f40f58aa"
+    },
+    "resource_observer": {
+      "tests_passed": 8,
+      "log_sha256": "005b17fd5b5bcbc2752cb949e49f9383dde187534f15a09791a17a4bfca77527"
+    },
+    "prefill_comparator": {
+      "tests_passed": 5,
+      "log_sha256": "6273232de4d3ef7acd4ecafa5c86beeeb974f56586b21089a2990b3f72facbe6"
+    }
+  },
+  "proof_snapshot_sha256": {
+    "control-first-resource.jsonl": "e552542978db883eeb26524a8b101755ac04608b40c78c6de36e089f1cb6dea8",
+    "candidate-first-resource.jsonl": "d0dd97b37fcb483ba0671fbf6c63a83e622b0b2b739baf458e28aee862faf5f9",
+    "observer_harness.py.txt": "d0760bd745739343df5bb5eb761ee853cc677d0ac1eebfd1403de8078b651988",
+    "compare_prefill.py": "60c46fbd0bf5441ba0858c250cebcdb412d1ec31f8b74ce4e3ac202e2efd1218",
+    "bench_p2p_decode.py": "be5013449dc88b24e6fbc67dbfe323518ba6a30e281dfbd9d0a3638d58f11ee7",
+    "topology-observation.json": "f634061251ba9452ae0e18516da6d5f51096c5c26c5c76842d2c9a9d36f01965"
+  },
+  "limitations": [
+    "One synthetic workload and three samples per arm/order do not characterize general workloads.",
+    "Long-batch windows cover three 4,274-token requests and their transitions, not only individual prefill kernels.",
+    "Engine CPU rates are average cores over fully contained sample intervals; they do not distinguish useful work from driver polling or prove a CPU bottleneck.",
+    "GPU busy percentages do not show compute efficiency and can include waiting kernels.",
+    "PCIe RX/TX values are independent 20 ms NVML sampling windows in KB/s, not a continuous traffic total; they cannot distinguish host from peer traffic.",
+    "The observer does not measure host DRAM bandwidth and excludes child processes from the sampled engine CPU total.",
+    "The observer controller snapshot was not independently hashed at run time; measurement drivers were hash-checked by the harness.",
+    "Configured 262144 context was not filled; no long-coding-session or 128k/256k qualification is established.",
+    "The local main base has separate unresolved broad-test history; these measurements do not qualify that base."
+  ]
+}
