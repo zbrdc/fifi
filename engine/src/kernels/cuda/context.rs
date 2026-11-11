@@ -146,6 +146,9 @@ pub(crate) struct CudaContext {
     pub(in crate::kernels::cuda) mmq_facts: MmqFactsCache,
     // Device region of one argmax reduction, allocated on first use.
     argmax_scratch: RefCell<Option<DeviceBuffer>>,
+    /// The device regions of the pointer-table EXL3 launch, one per stream id: written by a
+    /// stream-ordered host copy that never waits on the device, grown when a batch outgrows one.
+    exl3_table_regions: RefCell<Vec<(u64, DeviceBuffer)>>,
     /// Workspace allocations made, the first one included; tests compare it.
     #[cfg(test)]
     workspace_allocations: std::cell::Cell<usize>,
@@ -381,6 +384,7 @@ impl CudaContext {
             growth,
             mmq_facts: MmqFactsCache::default(),
             argmax_scratch: RefCell::new(None),
+            exl3_table_regions: RefCell::new(Vec::new()),
             pinned_stage: RefCell::new(None),
             #[cfg(test)]
             workspace_allocations: std::cell::Cell::new(1),
@@ -1086,6 +1090,54 @@ impl CudaContext {
         self.successful_allocations
             .set(self.successful_allocations.get().saturating_add(1));
         Ok(buffer)
+    }
+
+    /// Stages the record table of a pointer-table EXL3 launch on `stream` and returns the device
+    /// address of the records. One region per stream, written by a stream-ordered host copy: the
+    /// copy lands behind the kernel that read the previous table, so the launch path never waits
+    /// on the device the way a cached upload would (its reuse settles, a full sync). Grown when a
+    /// batch outgrows the region; the replaced region frees only after its readers ran.
+    pub(in crate::kernels::cuda) fn stage_exl3_indexed_table(
+        &self,
+        stream: &DeviceStream,
+        records: &[u8],
+    ) -> Result<*mut std::ffi::c_void, EngError> {
+        self.ensure_usable()?;
+        graph::ensure_closed("an upload")?;
+        if records.is_empty() {
+            return Err(EngError::BadRequest(
+                "EXL3 indexed table: empty records".into(),
+            ));
+        }
+        let stream_raw = stream.raw()?;
+        let _dispatch = self.enter()?;
+        let mut regions = self
+            .exl3_table_regions
+            .try_borrow_mut()
+            .map_err(|_| workspace_in_use())?;
+        let region = match regions.iter_mut().find(|(id, _)| *id == stream.id()) {
+            Some((_, buffer)) => {
+                if buffer.bytes() < records.len() {
+                    *buffer = DeviceBuffer::allocate(
+                        &self.lease,
+                        records.len().max(buffer.bytes() * 2).max(4096),
+                    )?;
+                }
+                buffer
+            }
+            None => {
+                regions.push((
+                    stream.id(),
+                    DeviceBuffer::allocate(&self.lease, records.len().max(4096))?,
+                ));
+                &mut regions.last_mut().expect("just pushed").1
+            }
+        };
+        let raw = self.owned(region)?;
+        let range = native::resident::RawRange::new(raw, 0, records.len())
+            .ok_or_else(|| EngError::BadRequest("EXL3 indexed table: empty records".into()))?;
+        native::resident::copy_h2d_enqueue(range, records, stream_raw).map_err(device_error)?;
+        Ok(range.address())
     }
 
     /// The tiles are group-major, so each chunk lands at the byte offset of

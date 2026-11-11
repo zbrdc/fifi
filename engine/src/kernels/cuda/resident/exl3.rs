@@ -1607,14 +1607,12 @@ impl CudaContext {
         let native = u32::from(options.dp4a) | (u32::from(options.pipeline) << 2);
         let fused_publish = u32::from(raw[0].fused);
         let flag = raw[0].flag.address();
-        let table = self.upload(&records)?;
-        let pairs = RawRange::new(self.owned(&table)?, 0, records.len())
-            .ok_or_else(|| EngError::BadRequest("EXL3 indexed table: empty records".into()))?;
+        let table = self.stage_exl3_indexed_table(stream, &records)?;
         let count = raw.len();
         self.launch_on(stream, |s| {
             ffi::indexed_table(
                 s,
-                pairs.address(),
+                table,
                 count,
                 k_units,
                 n_tiles,

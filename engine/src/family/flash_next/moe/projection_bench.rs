@@ -116,7 +116,8 @@ macro_rules! decode {
 const SPLIT: Launches = &[(0, 16), (16, 4)];
 const SINGLE: Launches = &[(0, 20)];
 /// The 20 gate and up pairs: the default launch and DP4A as 16 + 4 launches, then one 20-pair launch
-/// without and with DP4A.
+/// without and with DP4A, the pipelined tile loop, and the pointer-table forms of the same calls
+/// (one kernel per stage over the record table; the DP4A and pipeline bits stack on it).
 const GATEUP_20: &[Variant] = &[
     ("base", IndexedOptions::OFF, SPLIT),
     ("dp4a", IndexedOptions::DP4A, SPLIT),
@@ -124,9 +125,45 @@ const GATEUP_20: &[Variant] = &[
     ("both", IndexedOptions::BOTH, SINGLE),
     ("pipe", IndexedOptions::PIPE, SPLIT),
     ("both_pipe", IndexedOptions::BOTH_PIPE, SINGLE),
+    (
+        "table",
+        IndexedOptions {
+            table: true,
+            ..IndexedOptions::OFF
+        },
+        SINGLE,
+    ),
+    (
+        "dp4a_table",
+        IndexedOptions {
+            dp4a: true,
+            table: true,
+            ..IndexedOptions::OFF
+        },
+        SINGLE,
+    ),
+    (
+        "table_pipe",
+        IndexedOptions {
+            pipeline: true,
+            table: true,
+            ..IndexedOptions::OFF
+        },
+        SINGLE,
+    ),
+    (
+        "dp4a_table_pipe",
+        IndexedOptions {
+            dp4a: true,
+            pipeline: true,
+            table: true,
+            ..IndexedOptions::OFF
+        },
+        SINGLE,
+    ),
 ];
 
-const CASES: [Case; 15] = [
+const CASES: [Case; 18] = [
     case("gateup_p2", Shape::GateUp, decode!(&[(0, 2)]), false),
     case("gateup_p4", Shape::GateUp, decode!(&[(0, 4)]), false),
     case("gateup_p8", Shape::GateUp, decode!(&[(0, 8)]), false),
@@ -134,6 +171,63 @@ const CASES: [Case; 15] = [
     case("gateup_p16", Shape::GateUp, decode!(&[(0, 16)]), false),
     case("gateup_tail_p4", Shape::GateUp, decode!(&[(16, 4)]), false),
     case("gateup_20", Shape::GateUp, GATEUP_20, false),
+    case(
+        "gateup_p4_table",
+        Shape::GateUp,
+        &[
+            ("base", IndexedOptions::OFF, &[(0, 4)]),
+            (
+                "table",
+                IndexedOptions {
+                    table: true,
+                    ..IndexedOptions::OFF
+                },
+                &[(0, 4)],
+            ),
+        ],
+        false,
+    ),
+    case(
+        "gateup_p16_table",
+        Shape::GateUp,
+        &[
+            ("base", IndexedOptions::OFF, &[(0, 16)]),
+            (
+                "table",
+                IndexedOptions {
+                    table: true,
+                    ..IndexedOptions::OFF
+                },
+                &[(0, 16)],
+            ),
+        ],
+        false,
+    ),
+    case(
+        "down_p10_table",
+        Shape::Down,
+        &[
+            ("base", IndexedOptions::OFF, &[(0, 10)]),
+            (
+                "table",
+                IndexedOptions {
+                    table: true,
+                    ..IndexedOptions::OFF
+                },
+                &[(0, 10)],
+            ),
+            (
+                "dp4a_table",
+                IndexedOptions {
+                    dp4a: true,
+                    table: true,
+                    ..IndexedOptions::OFF
+                },
+                &[(0, 10)],
+            ),
+        ],
+        false,
+    ),
     case("down_p2", Shape::Down, decode!(&[(0, 2)]), false),
     case("down_p4", Shape::Down, decode!(&[(0, 4)]), false),
     case("down_p8", Shape::Down, decode!(&[(0, 8)]), false),
