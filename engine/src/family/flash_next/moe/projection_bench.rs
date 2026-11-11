@@ -67,8 +67,6 @@ const PICKS: usize = 10;
 const SETS: usize = 51;
 const LAUNCHES: usize = 48;
 const TRIALS: usize = 4;
-/// The most pairs one case covers: the block's 20 gate and up pairs.
-const MAX_PAIRS: usize = 20;
 /// Bytes of the gate's device copy: about 2.5 ms at the 3090's copy rate, longer than the host
 /// takes to queue the largest case.
 const GATE_BYTES: usize = 1 << 30;
@@ -81,12 +79,12 @@ enum Shape {
 
 /// Launches of consecutive pairs: (first pair, pair count), in pick order.
 type Launches = &'static [(usize, usize)];
-
 /// One variant of a case: its name, the options it runs and its launches.
 type Variant = (&'static str, IndexedOptions, Launches);
 
 /// One timed case on one shape. Its first variant is the default launch, the reference of the
 /// check.
+#[derive(Clone)]
 struct Case {
     name: &'static str,
     shape: Shape,
@@ -115,6 +113,74 @@ macro_rules! decode {
 
 const SPLIT: Launches = &[(0, 16), (16, 4)];
 const SINGLE: Launches = &[(0, 20)];
+
+/// The rows points of the sweep cases: pairs one launch form covers. Past 20 pairs the
+/// parameter-block form runs as 20-pair launches (`chunks20` below), the table form as one
+/// launch; below it both run one launch and the sweep measures the small-batch end.
+const SWEEP_ROWS: [usize; 5] = [16, 64, 256, 1024, 2048];
+/// The widest sweep point; bounds the chunk tables and the rig's per-row buffers.
+const SWEEP_ROWS_MAX: usize = SWEEP_ROWS[SWEEP_ROWS.len() - 1];
+
+/// `rows` pairs as `N` consecutive 20-pair launches, the widest parameter block; the tail
+/// launch carries the remainder. `N` is `rows` rounded up to twenties.
+const fn chunks20<const N: usize>(rows: usize) -> [(usize, usize); N] {
+    assert!(
+        N == rows.div_ceil(20),
+        "N must be rows rounded up to twenties"
+    );
+    let mut table = [(0, 0); N];
+    let mut i = 0;
+    while i < N {
+        let first = i * 20;
+        table[i] = (first, if first + 20 <= rows { 20 } else { rows - first });
+        i += 1;
+    }
+    table
+}
+
+const CHUNKS_16: &[(usize, usize)] = &chunks20::<1>(16);
+const CHUNKS_64: &[(usize, usize)] = &chunks20::<4>(64);
+const CHUNKS_256: &[(usize, usize)] = &chunks20::<13>(256);
+const CHUNKS_1024: &[(usize, usize)] = &chunks20::<52>(1024);
+const CHUNKS_2048: &[(usize, usize)] = &chunks20::<103>(2048);
+
+/// Each rows point's launch forms, in check order: the chunked parameter-block launches are
+/// the reference, then the table launch of the same pairs, then its DP4A form. A macro, not a
+/// const fn: the table variants borrow literal launch lists, which only a static initializer
+/// can hold.
+macro_rules! sweep_variants {
+    ($launch:expr, $rows:literal) => {
+        [
+            ("chunk20", IndexedOptions::PAIRS20, $launch),
+            (
+                "table",
+                IndexedOptions {
+                    table: true,
+                    ..IndexedOptions::OFF
+                },
+                &[(0usize, $rows)],
+            ),
+            (
+                "dp4a_table",
+                IndexedOptions {
+                    dp4a: true,
+                    table: true,
+                    ..IndexedOptions::OFF
+                },
+                &[(0usize, $rows)],
+            ),
+        ]
+    };
+}
+
+/// A static, not a const: the sweep cases borrow its rows by address.
+static SWEEP_VARIANTS: [[Variant; 3]; 5] = [
+    sweep_variants!(CHUNKS_16, 16),
+    sweep_variants!(CHUNKS_64, 64),
+    sweep_variants!(CHUNKS_256, 256),
+    sweep_variants!(CHUNKS_1024, 1024),
+    sweep_variants!(CHUNKS_2048, 2048),
+];
 /// The 20 gate and up pairs: the default launch and DP4A as 16 + 4 launches, then one 20-pair launch
 /// without and with DP4A, the pipelined tile loop, and the pointer-table forms of the same calls
 /// (one kernel per stage over the record table; the DP4A and pipeline bits stack on it).
@@ -287,17 +353,28 @@ impl Rig<'_> {
 
     /// Queues one id-indexed launch of the pairs `pairs` of `shape` with the id set `set`, under
     /// the context's options. Pair `p` writes output row `p` and, as call `p - pairs.start` of
-    /// the launch, that row of the rotated inputs and partials.
+    /// the launch, that row of the rotated inputs and partials. Past one id set the picks cycle
+    /// the cold sets again: at the sweep widths the batch holds more picks than the bank has
+    /// distinct experts, and repeated experts are the production regime there.
     fn launch(&self, shape: Shape, pairs: &Range<usize>, set: usize) -> Res<()> {
         let (k, n, x) = self.dims_of(shape);
-        let ids = self.ids.range(set * PICKS * 4, PICKS * 4)?;
         let flag = self.flag.range(0, F32)?;
         let mut calls = Vec::with_capacity(pairs.len());
         for (row, pair) in pairs.clone().enumerate() {
-            let (bank, slot) = match shape {
-                Shape::GateUp => ([self.parts.gate, self.parts.up][pair % 2], pair / 2),
-                Shape::Down => (self.parts.down, pair),
+            let (bank, slot, sets_past) = match shape {
+                Shape::GateUp => (
+                    [self.parts.gate, self.parts.up][pair % 2],
+                    (pair / 2) % PICKS,
+                    (pair / 2) / PICKS,
+                ),
+                Shape::Down => (self.parts.down, pair % PICKS, pair / PICKS),
             };
+            let set = if sets_past == 0 {
+                set
+            } else {
+                (set + sets_past) % SETS
+            };
+            let ids = self.ids.range(set * PICKS * 4, PICKS * 4)?;
             let io = Exl3Io {
                 x: x.range(0, k * F32)?,
                 xh: self.xh.range(row * k * F32, k * F32)?,
@@ -327,7 +404,7 @@ impl Rig<'_> {
     /// row, rotated input and split-K partial is NaN beforehand, so a skipped write of any of
     /// them reaches the output.
     fn outputs(&self, shape: Shape, variant: &Variant, set: usize) -> Res<Vec<u8>> {
-        let (k, n, _) = self.dims_of(shape);
+        let (_, n, _) = self.dims_of(shape);
         let launches = variant.2;
         let first = launches.iter().map(|&(first, _)| first).min();
         let end = launches.iter().map(|&(first, count)| first + count).max();
@@ -335,9 +412,14 @@ impl Rig<'_> {
             return Err(fail("a variant without launches"));
         };
         let nan = |values: usize| f32::NAN.to_le_bytes().repeat(values);
-        self.out.write_at(&self.stream, 0, &nan(MAX_PAIRS * n))?;
-        self.z.write_at(&self.stream, 0, &nan(MAX_PAIRS * n))?;
-        self.xh.write_at(&self.stream, 0, &nan(MAX_PAIRS * k))?;
+        // The whole row buffers, not only this variant's rows: any skipped write anywhere
+        // reaches the compared rows through the buffer's stale bytes.
+        self.out
+            .write_at(&self.stream, 0, &nan(self.out.bytes() / F32))?;
+        self.z
+            .write_at(&self.stream, 0, &nan(self.z.bytes() / F32))?;
+        self.xh
+            .write_at(&self.stream, 0, &nan(self.xh.bytes() / F32))?;
         self.run(shape, variant, set)?;
         self.stream.synchronize()?;
         let mut got = vec![0u8; (end - first) * n * F32];
@@ -405,9 +487,9 @@ impl Rig<'_> {
 
 /// `Err` unless every variant of every case writes the bytes its default variant writes, with
 /// the first and last cold id sets and the warm set.
-fn check(rig: &Rig<'_>) -> Res<usize> {
+fn check(rig: &Rig<'_>, cases: &[Case]) -> Res<usize> {
     let mut compared = 0;
-    for (case, set) in CASES
+    for (case, set) in cases
         .iter()
         .flat_map(|case| [0, SETS - 1, SETS].map(|set| (case, set)))
     {
@@ -453,14 +535,14 @@ struct Pooled {
     queue_us: Vec<f64>,
 }
 
-fn timing(rig: &Rig<'_>) -> Res<()> {
-    let mut pooled: Vec<Vec<Pooled>> = CASES
+fn timing(rig: &Rig<'_>, cases: &[Case]) -> Res<()> {
+    let mut pooled: Vec<Vec<Pooled>> = cases
         .iter()
         .map(|case| vec![Pooled::default(); case.variants.len()])
         .collect();
     for trial in 0..=TRIALS {
         clock_mark(&format!("projection_trial{trial}"));
-        for (case, into) in CASES.iter().zip(&mut pooled) {
+        for (case, into) in cases.iter().zip(&mut pooled) {
             let count = case.variants.len();
             for turn in 0..count {
                 let v = (turn + trial) % count;
@@ -475,7 +557,7 @@ fn timing(rig: &Rig<'_>) -> Res<()> {
         }
     }
     rig.ctx.set_indexed_options(None);
-    for (case, got) in CASES.iter().zip(&pooled) {
+    for (case, got) in cases.iter().zip(&pooled) {
         for (variant, all) in case.variants.iter().zip(got) {
             let pairs: usize = variant.2.iter().map(|&(_, count)| count).sum();
             let queue = all.queue_us.iter().sum::<f64>() / all.queue_us.len() as f64;
@@ -526,7 +608,36 @@ fn flash_next_exl3_projection_variants_microbench() {
     run().expect("the EXL3 projection variant microbenchmark");
 }
 
+/// The Item 1 rows-sweep cases: every rows point on both shapes, the chunked 20-pair
+/// parameter-block launches against one pointer-table launch of the same pairs. Run only when
+/// `FIFI_EXL3_SWEEP=1` — the extra points are for the exclusive measurement window, not the
+/// ordinary variant bench.
+fn sweep_cases() -> Vec<Case> {
+    let mut cases = Vec::with_capacity(SWEEP_ROWS.len() * 2);
+    for (i, rows) in SWEEP_ROWS.iter().enumerate() {
+        let variants: &'static [Variant] = &SWEEP_VARIANTS[i];
+        for shape in [Shape::GateUp, Shape::Down] {
+            let name = match shape {
+                Shape::GateUp => "gateup",
+                Shape::Down => "down",
+            };
+            cases.push(Case {
+                name: Box::leak(format!("{name}_r{rows}").into_boxed_str()),
+                shape,
+                variants,
+                warm: false,
+            });
+        }
+    }
+    cases
+}
+
 fn run() -> Res<()> {
+    let mut cases = CASES.to_vec();
+    let sweep = std::env::var("FIFI_EXL3_SWEEP").ok().as_deref() == Some("1");
+    if sweep {
+        cases.extend(sweep_cases());
+    }
     let (checkpoint, layer, moe) = open_layer("Flash-Next EXL3 projection variant microbenchmark")?;
     if moe.top_k != PICKS {
         return Err(fail("the cases assume ten picks"));
@@ -547,15 +658,18 @@ fn run() -> Res<()> {
         |values: Vec<f32>| -> Vec<u8> { values.iter().flat_map(|v| v.to_le_bytes()).collect() };
     let zeros = |bytes: usize| ctx.upload(&vec![0u8; bytes]);
     let wide = moe.hidden.max(moe.inter);
+    // Without the sweep the rig stays as small as its cases have always been; the sweep's
+    // row buffers are its own cost.
+    let row_capacity = if sweep { SWEEP_ROWS_MAX } else { 20 };
     let rig = Rig {
         ctx,
         parts: Parts::resolve(&weights, layer, &moe)?,
         dims: moe,
         x_up: ctx.upload(&floats(input(moe.hidden, 0)))?,
         x_down: ctx.upload(&floats(input(moe.inter, 1)))?,
-        xh: zeros(MAX_PAIRS * wide * F32)?,
-        z: zeros(MAX_PAIRS * wide * F32)?,
-        out: zeros(MAX_PAIRS * wide * F32)?,
+        xh: zeros(row_capacity * wide * F32)?,
+        z: zeros(row_capacity * wide * F32)?,
+        out: zeros(row_capacity * wide * F32)?,
         flag: zeros(F32)?,
         ids: ctx.upload(&id_sets(moe.n_expert)?)?,
         marks: (0..=LAUNCHES)
@@ -566,9 +680,9 @@ fn run() -> Res<()> {
         gate_mark: ctx.event_timing()?,
         stream: ctx.stream()?,
     };
-    let compared = check(&rig)?;
+    let compared = check(&rig, &cases)?;
     println!(
-        "RESBENCH {{\"phase\":\"projection_check\",\"case\":\"variants_equal_base\",\"compared\":{compared}}}"
+        "RESBENCH {{\"phase\":\"projection_check\",\"case\":\"variants_equal_base\",\"compared\":{compared},\"sweep\":{sweep}}}",
     );
-    timing(&rig)
+    timing(&rig, &cases)
 }
