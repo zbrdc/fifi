@@ -610,7 +610,7 @@ fn teacher_forced_steps_follow_the_oracle_on_every_prompt() {
         kv_format: KvFormatName::F16,
         slots: var("FIFI_FLASH_NEXT_DRIVER_SLOTS").map(|v| v.parse().expect("slots")),
         expert_stats: None,
-        prefill_rows: 1,
+        prefill_rows: var("FIFI_FLASH_NEXT_DRIVER_ROWS").map_or(1, |v| v.parse().expect("rows")),
     };
     let mut driver = build_driver(
         &|stage| println!("stage: {stage}"),
