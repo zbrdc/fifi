@@ -4,9 +4,11 @@
 #include <cuda_bf16.h>
 #include <mma.h>
 #include <atomic>
+#include <algorithm>
 #include <cstdlib>
 #include <stddef.h>
 #include <stdint.h>
+#include <vector>
 #include "../abi.h"
 #include "../device.h"
 #include "exl3.h"
@@ -2001,51 +2003,55 @@ static bool table_pack(const inference_cuda_exl3_linear_args *calls,
         out[i].n = uint32_t(a.n);
     }
     // Cross-record isolation: one record's writes never overlap another record's reads or
-    // writes. Reads may overlap reads (records of one bank share its trellis).
-    const auto writes_of = [&](size_t i, View (&w)[4]) {
-        const auto &a = calls[i];
-        w[0] = {a.xh, a.k * 4};
-        w[1] = {a.z, a.n * 4};  // split-2 folds one partial plane
-        w[2] = {a.out, a.n * 4};
-        w[3] = {a.flag, 4};
-    };
-    const auto reads_of = [&](size_t i, View (&r)[7]) {
-        const auto &a = calls[i];
-        r[0] = {a.trellis, a.k * a.n / 256 * size_t(a.bits_twice) * 16};
-        r[1] = {a.suh, a.k * 4};
-        r[2] = {a.svh, a.n * 4};
-        r[3] = {a.bias, a.bias ? a.n * 4 : 0};
-        r[4] = {a.x, a.k * 4};
-        r[5] = {index[i].ids, size_t(index[i].slot + 1) * 4};
-        r[6] = {index[i].offsets, index[i].offsets ? size_t(index[i].members) * 4 : 0};
-    };
-    View wi[4], wj[4], ri[7], rj[7];
+    // writes. Reads may overlap reads (records of one bank share its trellis). One sorted
+    // sweep over the write spans, then each read against them: the record count is the
+    // grid's, so the pairwise loops an earlier packer used were quadratic in it.
+    struct SpanView { const void *p; size_t bytes; uint32_t record; bool flag; };
+    std::vector<SpanView> writes;
+    writes.reserve(4 * count);
+    const void *const flag0 = (const void *)calls[0].flag;
     for (size_t i = 0; i < count; ++i) {
-        writes_of(i, wi);
-        reads_of(i, ri);
-        for (size_t j = 0; j < count; ++j) {
-            if (i == j) continue;
-            writes_of(j, wj);
-            reads_of(j, rj);
-            for (const auto &w : wi) {
-                if (!w.bytes) continue;
-                for (const auto &o : wj)
-                    // The batch shares one completion flag: the only alias two records may
-                    // write (the pack already refused records with different flag pointers).
-                    // Any other same-pointer pair stays refused, like the option launch.
-                    if (o.bytes
-                        && !(w.p == o.p && w.bytes == 4 && o.bytes == 4
-                             && w.p == (const void *)calls[0].flag)
-                        && !apart(w.p, w.bytes, o.p, o.bytes))
-                        return false;
-                for (const auto &r : rj)
-                    if (r.bytes && !apart(w.p, w.bytes, r.p, r.bytes)) return false;
+        const auto &a = calls[i];
+        writes.push_back({a.xh, a.k * 4, uint32_t(i), false});
+        writes.push_back({a.z, a.n * 4, uint32_t(i), false});
+        writes.push_back({a.out, a.n * 4, uint32_t(i), false});
+        writes.push_back({a.flag, 4, uint32_t(i), true});
+    }
+    std::sort(writes.begin(), writes.end(), [](const SpanView &x, const SpanView &y) {
+        return uintptr_t(x.p) < uintptr_t(y.p) || (x.p == y.p && x.bytes < y.bytes);
+    });
+    for (size_t i = 1; i < writes.size(); ++i) {
+        const SpanView &a = writes[i - 1], &b = writes[i];
+        if (uintptr_t(b.p) >= uintptr_t(a.p) + a.bytes) continue;
+        // The batch shares one completion flag: the only alias two records may write (the
+        // pack already refused records with a different flag pointer); any other
+        // same-pointer pair stays refused, like the option launch.
+        if (a.flag && b.flag && a.bytes == 4 && b.bytes == 4 && a.p == b.p && a.p == flag0)
+            continue;
+        return false;
+    }
+    for (size_t i = 0; i < count; ++i) {
+        const auto &a = calls[i];
+        const auto &x = index[i];
+        const struct { const void *p; size_t bytes; } reads[] = {
+            {a.trellis, a.k * a.n / 256 * size_t(a.bits_twice) * 16},
+            {a.suh, a.k * 4},
+            {a.svh, a.n * 4},
+            {a.bias, a.bias ? a.n * 4 : 0},
+            {a.x, a.k * 4},
+            {x.ids, size_t(x.slot + 1) * 4},
+            {x.offsets, x.offsets ? size_t(x.members) * 4 : 0}};
+        for (const auto &r : reads) {
+            if (!r.bytes) continue;
+            size_t at = size_t(std::lower_bound(writes.begin(), writes.end(), r.p,
+                [](const SpanView &w, const void *p) { return w.p < p; })
+                - writes.begin());
+            if (at) --at;  // the write starting before r may still cover it
+            for (; at < writes.size() && uintptr_t(writes[at].p) < uintptr_t(r.p) + r.bytes;
+                 ++at) {
+                if (writes[at].record == i) continue;
+                if (uintptr_t(r.p) < uintptr_t(writes[at].p) + writes[at].bytes) return false;
             }
-            for (const auto &r : ri)
-                if (r.bytes) {
-                    for (const auto &o : wj)
-                        if (o.bytes && !apart(r.p, r.bytes, o.p, o.bytes)) return false;
-                }
         }
     }
     return true;

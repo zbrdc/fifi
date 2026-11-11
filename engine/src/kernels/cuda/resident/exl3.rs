@@ -11,7 +11,6 @@ use crate::kernels::cuda::context::{
     Claim, CudaContext, DeviceRange, DeviceStream, require_apart, require_fit,
 };
 use crate::kernels::cuda::native::DeviceFailure;
-use crate::kernels::cuda::native::resident::RawRange;
 use crate::kernels::cuda::native::resident::RawStream;
 use crate::kernels::cuda::native::resident::exl3 as ffi;
 #[cfg(test)]
@@ -124,8 +123,11 @@ pub(crate) const PIPE_VAR: &str = "FIFI_EXL3_PIPELINE";
 /// table so one kernel per stage covers the whole batch (up to 65535 records, shapes may mix).
 /// Same bytes as the option launch of the same calls; the DP4A and pipeline options apply. The
 /// record staging copy makes this form refuse graph capture (the option launch stays
-/// capturable). A set value wins over the default a session registered. Process-wide, read
-/// once, strict.
+/// capturable). The capacity is the launch's own cap: the serve-side chunkers that call
+/// `exl3_indexed_capacity` still carve their working scratch for 16 or 20 rows, so a served
+/// batch above that returns `BadRequest` until their scratch grows with the batch — the flag
+/// is for the direct launch paths (tests, benches). A set value wins over the default a session
+/// registered. Process-wide, read once, strict.
 pub(crate) const TABLE_VAR: &str = "FIFI_EXL3_TABLE";
 
 /// The opt-in options of the id-indexed launch, each selected on its own: the DP4A decode of
@@ -490,7 +492,10 @@ fn single_gather_explicit() -> Result<Option<SingleRow>, EngError> {
 
 impl CudaContext {
     /// The most pairs one id-indexed launch on this context takes: 16, or 20 under the 20-pair
-    /// option. A bad switch value gives 16 here; the launch itself refuses it.
+    /// option, or the table launch's record cap under its flag. A bad switch value gives 16
+    /// here; the launch itself refuses it. The table cap is the launch's own limit — callers
+    /// that carve a fixed working scratch per pair must still bound their batches by that
+    /// scratch, not by this number, or the range checks refuse the oversized rows.
     pub(crate) fn exl3_indexed_capacity(&self) -> usize {
         self.exl3_indexed_options()
             .map_or(INDEXED_CAPACITY, IndexedOptions::capacity)
@@ -1452,6 +1457,109 @@ impl CudaContext {
         self.grouped_indexed_by(stream, calls, cols, true)
     }
 
+    /// Cross-record isolation of the id-indexed launches, as one sorted sweep: a record's
+    /// writes — its rotated input, its split-K partial, its output and the 4-byte completion
+    /// flag — never overlap another record's reads or writes. Reads may overlap reads,
+    /// because the records of one bank share its trellis, scales and id table. The native
+    /// checks keep the same rule; refusing here keeps every deliberate refusal off the
+    /// native path, whose statuses latch the backend terminal for the rest of the process.
+    /// The sweep is O(records · log records): the table launch admits the grid's record
+    /// count, and the pairwise loop an earlier form of this check used was quadratic in it.
+    fn refuse_cross_record_overlap(
+        raw: &[ffi::LinearRaw<'_>],
+        index: &[ffi::IndexRaw<'_>],
+    ) -> Result<(), EngError> {
+        let refuse = |what: String| EngError::BadRequest(format!("EXL3 indexed launch: {what}"));
+        struct Write {
+            addr: usize,
+            bytes: usize,
+            record: usize,
+            name: &'static str,
+        }
+        let flag0 = raw[0].flag.address() as usize;
+        let mut writes: Vec<Write> = Vec::with_capacity(raw.len() * 4);
+        for (i, a) in raw.iter().enumerate() {
+            if a.flag.address() as usize != flag0 {
+                return Err(refuse("the calls must share one flag span".into()));
+            }
+            for (name, r, bytes) in [
+                ("xh", &a.xh, a.k * 4),
+                ("z", &a.z, a.n * 4),
+                ("out", &a.out, a.n * 4),
+                ("flag", &a.flag, 4),
+            ] {
+                writes.push(Write {
+                    addr: r.address() as usize,
+                    bytes,
+                    record: i,
+                    name,
+                });
+            }
+        }
+        writes.sort_unstable_by_key(|w| (w.addr, w.bytes));
+        for pair in writes.windows(2) {
+            let (a, b) = (&pair[0], &pair[1]);
+            if b.addr >= a.addr + a.bytes {
+                continue;
+            }
+            // The batch's one shared 4-byte flag is the only write two records may share
+            // (uniformity was proved above); any other same-pointer pair stays refused.
+            if a.name == "flag" && b.name == "flag" && a.bytes == 4 && b.bytes == 4 {
+                continue;
+            }
+            return Err(refuse(format!(
+                "record {}'s {} overlaps record {}'s {}",
+                a.record, a.name, b.record, b.name
+            )));
+        }
+        for (i, a) in raw.iter().enumerate() {
+            let x = &index[i];
+            let none = std::ptr::null_mut();
+            let reads: [(&str, *mut std::ffi::c_void, usize); 7] = [
+                (
+                    "trellis",
+                    a.trellis.address(),
+                    a.k * a.n / 256 * usize::from(a.bits_twice) * 16,
+                ),
+                ("suh", a.suh.address(), a.k * 4),
+                ("svh", a.svh.address(), a.n * 4),
+                (
+                    "bias",
+                    a.bias.as_ref().map_or(none, |b| b.address()),
+                    a.bias.map_or(0, |_| a.n * 4),
+                ),
+                ("x", a.x.address(), a.k * 4),
+                ("member ids", x.ids.address(), (x.slot as usize + 1) * 4),
+                (
+                    "member offsets",
+                    x.offsets.as_ref().map_or(none, |t| t.address()),
+                    x.offsets.map_or(0, |_| x.members as usize * 4),
+                ),
+            ];
+            for (name, p, bytes) in reads {
+                if bytes == 0 {
+                    continue;
+                }
+                let addr = p as usize;
+                // The write starting before `addr` may still cover it; walk while the
+                // writes start inside the read span.
+                let mut at = writes.partition_point(|w| w.addr < addr);
+                at = at.saturating_sub(1);
+                while at < writes.len() && writes[at].addr < addr + bytes {
+                    let w = &writes[at];
+                    if w.record != i && addr < w.addr + w.bytes {
+                        return Err(refuse(format!(
+                            "record {i}'s {name} overlaps record {}'s {}",
+                            w.record, w.name
+                        )));
+                    }
+                    at += 1;
+                }
+            }
+        }
+        Ok(())
+    }
+
     /// The id-indexed launch; `widen` adds the 20-pair option to the environment's options.
     fn grouped_indexed_by(
         &self,
@@ -1487,7 +1595,6 @@ impl CudaContext {
             return Err(refuse("the calls must all use the same fused-publish arm"));
         }
         let mut raw = Vec::with_capacity(calls.len());
-        let mut outs: Vec<(&DeviceRange<'_>, usize)> = Vec::with_capacity(calls.len());
         let mut index = Vec::with_capacity(calls.len());
         for c in calls {
             let call = &c.call;
@@ -1529,16 +1636,6 @@ impl CudaContext {
                 return Err(refuse("the member strides leave the bank ranges"));
             }
             require_fit("EXL3 member ids", &c.ids, (c.slot as usize + 1) * 4, 4)?;
-            // One output span per record: two records writing one span would race. The C
-            // group check refuses it too; refusing here keeps that refusal off the native
-            // path, whose statuses latch the backend terminal.
-            for (prior, bytes) in outs.iter() {
-                require_apart(
-                    &Claim::of("EXL3 out", &call.out, needs[7]),
-                    &Claim::of("EXL3 out", prior, *bytes),
-                )?;
-            }
-            outs.push((&call.out, needs[7]));
             // The ids and every member of the bank are read-only inputs: apart from all writes.
             for (name, range, bytes) in [
                 ("EXL3 xh", &call.xh, needs[5]),
@@ -1575,6 +1672,7 @@ impl CudaContext {
                     .transpose()?,
             });
         }
+        Self::refuse_cross_record_overlap(&raw, &index)?;
         if options.table {
             if cols != 1 {
                 return Err(refuse("the pointer-table launch runs one tile per block"));

@@ -627,7 +627,7 @@ pub(in crate::kernels::cuda) fn indexed_table_records(
 ) -> Result<Vec<u64>, DeviceFailure> {
     let (args, indexes) = indexed_records(calls, index, TABLE_PAIRS_MAX)?;
     let mut out = vec![0u64; calls.len() * (TABLE_PAIR_BYTES / size_of::<u64>())];
-    let mut stage = STAGE_NONE;
+    let stage = STAGE_NONE;
     // SAFETY: `args`/`indexes` are the arrays the option entry takes; `out` holds one record
     // per call at the alignment the packer's struct needs, and the C side refuses a count that
     // does not fit `out_bytes`.
@@ -648,6 +648,7 @@ pub(in crate::kernels::cuda) fn indexed_table_records(
 /// parameter block's 20-pair cap. `pairs` points at `pairs_count` packed records (upload of
 /// [`indexed_table_records`]' bytes), `k_units`/`n_tiles`/`n_units` are the batch's widest
 /// shapes and `options` carries only the DP4A and pipeline bits.
+#[allow(clippy::too_many_arguments)]
 pub(in crate::kernels::cuda) fn indexed_table(
     stream: &RawStream,
     pairs: *const c_void,

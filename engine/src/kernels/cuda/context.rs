@@ -1104,6 +1104,9 @@ impl CudaContext {
     ) -> Result<*mut std::ffi::c_void, EngError> {
         self.ensure_usable()?;
         graph::ensure_closed("an upload")?;
+        // Before the copy takes the stream's raw handle: a stream of another adapter must be
+        // refused before it receives any work (launch_on checks only after its launches).
+        stream::same_adapter(&self.lease, stream.lease(), "stream")?;
         if records.is_empty() {
             return Err(EngError::BadRequest(
                 "EXL3 indexed table: empty records".into(),

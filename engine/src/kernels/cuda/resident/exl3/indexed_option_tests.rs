@@ -432,17 +432,19 @@ type Written = (Vec<u8>, Vec<u8>, Vec<u8>, Vec<u8>);
 
 impl Bank {
     fn new(ctx: &CudaContext, rng: &mut testkit::Rng, kind: (Codebook, u8, usize)) -> Self {
-        Self::with_shape(ctx, rng, kind, (512, 384))
+        Self::with_shape(ctx, rng, kind, (512, 384), PAIRS)
     }
 
     /// A bank of an explicit `(k, n)` (both multiples of 128, so whole blocks retire at the
-    /// per-record guards of the table launch): mixed-shape batches need two shapes of one
-    /// codebook.
+    /// per-record guards of the table launch) holding `rows` input rows: mixed-shape batches
+    /// need two shapes of one codebook, and a batch past the parameter block's pair cap needs
+    /// more rows than it.
     fn with_shape(
         ctx: &CudaContext,
         rng: &mut testkit::Rng,
         kind: (Codebook, u8, usize),
         shape: (usize, usize),
+        rows: usize,
     ) -> Self {
         let (book, bits_twice, offset) = kind;
         let (k, n, members) = (shape.0, shape.1, 12usize);
@@ -452,7 +454,7 @@ impl Bank {
         let scale_values: Vec<f32> = (0..members * (k + n))
             .map(|i| 0.4 + (i % 11) as f32 / 16.0)
             .collect();
-        let x_values: Vec<f32> = (0..PAIRS * k)
+        let x_values: Vec<f32> = (0..rows * k)
             .map(|_| (rng.unit() as f32 - 0.5) * 8.0)
             .collect();
         Self {
@@ -735,8 +737,8 @@ fn only_the_twenty_pair_option_takes_twenty_calls_in_one_launch() {
 }
 
 #[test]
-fn the_table_pack_refuses_two_records_writing_one_output() {
-    if !testkit::device_present("EXL3 table write isolation") {
+fn the_launch_refuses_overlapping_records_before_any_native_call() {
+    if !testkit::device_present("EXL3 cross-record isolation") {
         return;
     }
     let ctx = CudaContext::new().expect("context");
@@ -752,7 +754,7 @@ fn the_table_pack_refuses_two_records_writing_one_output() {
     let z0 = testkit::upload_filled(&ctx, 0xff, bank.n * 4);
     let z1 = testkit::upload_filled(&ctx, 0xff, bank.n * 4);
     let shared_out = testkit::upload_filled(&ctx, 0xff, bank.n * 4);
-    let mut first = bank.one_call(
+    let mut aliased_out = bank.one_call(
         0,
         xh0.range(0, bank.k * 4).unwrap(),
         z0.range(0, bank.n * 4).unwrap(),
@@ -768,18 +770,78 @@ fn the_table_pack_refuses_two_records_writing_one_output() {
         &flag,
         &ids,
     );
-    first.slot = 0;
-    let calls = [first, second];
+    aliased_out.slot = 0;
+    let aliased_outputs = [aliased_out, second];
+    // Overlapping rotated-input spans: two ranges of one buffer that share bytes, a
+    // write-write alias the records would race on.
+    let shared_xh = testkit::upload_filled(&ctx, 0xff, bank.k * 4 * 3 / 2);
+    let overlapping_xh = [
+        bank.one_call(
+            0,
+            shared_xh.range(0, bank.k * 4).unwrap(),
+            z0.range(0, bank.n * 4).unwrap(),
+            &xh0,
+            &flag,
+            &ids,
+        ),
+        bank.one_call(
+            1,
+            shared_xh.range(bank.k * 4 / 2, bank.k * 4).unwrap(),
+            z1.range(0, bank.n * 4).unwrap(),
+            &xh1,
+            &flag,
+            &ids,
+        ),
+    ];
+    // Both classes are refused by the shared host prologue (a native refusal would latch
+    // the backend terminal for the rest of the process), and the context still serves a
+    // good launch afterwards — the proof the refusal never reached the device layer.
     for options in [OFF, TABLE] {
         ctx.set_indexed_options(Some(options));
-        let refused = ctx.exl3_grouped_indexed(&stream, &calls, 1);
-        let error = refused.expect_err("the aliased outputs were taken");
-        assert!(
-            matches!(error, crate::EngError::BadRequest(_)),
-            "{options:?}: {error:?}"
-        );
+        for (what, calls) in [
+            ("aliased outputs", aliased_outputs.as_slice()),
+            ("overlapping xh", overlapping_xh.as_slice()),
+        ] {
+            let refused = ctx.exl3_grouped_indexed(&stream, calls, 1);
+            let error = refused.expect_err("the overlapping records were taken");
+            assert!(
+                matches!(error, crate::EngError::BadRequest(_)),
+                "{what} under {options:?}: {error:?}"
+            );
+        }
+        a_good_launch_follows(&ctx, &stream, &bank, &flag, &ids);
     }
     ctx.set_indexed_options(None);
+}
+
+/// The proof a refusal stayed host-side: the same context still runs a launch. A native
+/// refusal would have latched the backend terminal, and this would fail instead.
+fn a_good_launch_follows(
+    ctx: &CudaContext,
+    stream: &DeviceStream,
+    bank: &Bank,
+    flag: &DeviceBuffer,
+    ids: &DeviceBuffer,
+) {
+    let xh = testkit::upload_filled(ctx, 0xff, 2 * bank.k * 4);
+    let z = testkit::upload_filled(ctx, 0xff, 2 * bank.n * 4);
+    let outs: Vec<_> = (0..2)
+        .map(|_| testkit::upload_filled(ctx, 0xff, bank.n * 4))
+        .collect();
+    let calls: Vec<_> = (0..2)
+        .map(|p| {
+            bank.one_call(
+                p,
+                xh.range(p * bank.k * 4, bank.k * 4).unwrap(),
+                z.range(p * bank.n * 4, bank.n * 4).unwrap(),
+                &outs[p],
+                flag,
+                ids,
+            )
+        })
+        .collect();
+    ctx.exl3_grouped_indexed(stream, &calls, 1)
+        .expect("the context still serves a good launch");
 }
 
 #[test]
@@ -795,8 +857,8 @@ fn the_table_launch_mixes_shapes_in_one_kernel() {
     // n (both multiples of 128, the launch geometry's unit; whole blocks retire at the
     // per-record guards).
     let banks = [
-        Bank::with_shape(&ctx, &mut rng, kind, (768, 512)),
-        Bank::with_shape(&ctx, &mut rng, kind, (512, 768)),
+        Bank::with_shape(&ctx, &mut rng, kind, (768, 512), 2),
+        Bank::with_shape(&ctx, &mut rng, kind, (512, 768), 2),
     ];
     let flag = testkit::upload_bytes(&ctx, &0u32.to_le_bytes());
     // Reference round: the default launch walks pair `p`'s `xh` and `z` at byte `p * k * 4`
@@ -884,4 +946,178 @@ fn the_table_launch_mixes_shapes_in_one_kernel() {
     }
     assert_eq!(testkit::read_bytes(&ctx, &flag, 4), [0; 4]);
     ctx.set_indexed_options(None);
+}
+
+/// One table launch per batch of `per_bank` records from each bank (two shapes), checked
+/// against the same records run as chunked 20-pair option launches. Returns each record's
+/// output bytes in bank-then-pair order — the order the reference chunks wrote them.
+fn batch_matches_wide_chunks(
+    ctx: &CudaContext,
+    stream: &DeviceStream,
+    banks: &[Bank],
+    flag: &DeviceBuffer,
+    per_bank: usize,
+) -> Vec<Vec<u8>> {
+    let ids: Vec<u8> = (0..per_bank)
+        .flat_map(|i| ((3 + i % 5) as i32).to_le_bytes())
+        .collect();
+    let ids = testkit::upload_bytes(ctx, &ids);
+    // Reference: each bank's records in chunks of 20 (the widest parameter block), their
+    // `xh` and `z` packed per chunk as the option launch requires.
+    ctx.set_indexed_options(Some(OFF));
+    let mut want = Vec::new();
+    for bank in banks {
+        for chunk in (0..per_bank).collect::<Vec<_>>().chunks(20) {
+            let rows = chunk.len();
+            let xh = testkit::upload_filled(ctx, 0xff, rows * bank.k * 4);
+            let z = testkit::upload_filled(ctx, 0xff, rows * bank.n * 4);
+            let outs: Vec<_> = (0..rows)
+                .map(|_| testkit::upload_filled(ctx, 0xff, bank.n * 4))
+                .collect();
+            let calls: Vec<_> = chunk
+                .iter()
+                .enumerate()
+                .map(|(at, &p)| {
+                    bank.one_call(
+                        p,
+                        xh.range(at * bank.k * 4, bank.k * 4).unwrap(),
+                        z.range(at * bank.n * 4, bank.n * 4).unwrap(),
+                        &outs[at],
+                        flag,
+                        &ids,
+                    )
+                })
+                .collect();
+            ctx.exl3_grouped_indexed_wide(stream, &calls, 1)
+                .expect("the reference chunk");
+            for out in &outs {
+                want.push(testkit::read_bytes(ctx, out, out.bytes()));
+            }
+        }
+    }
+    stream.synchronize().expect("sync");
+    // The batch: every record of every bank in one table launch, their buffers scattered.
+    ctx.set_indexed_options(Some(TABLE));
+    // The buffers must be owned outside the loop that borrows them into the calls (the
+    // calls outlive each iteration).
+    let mut staged = Vec::with_capacity(banks.len() * per_bank);
+    for (bank_idx, bank) in banks.iter().enumerate() {
+        for p in 0..per_bank {
+            staged.push((
+                bank_idx,
+                p,
+                testkit::upload_filled(ctx, 0xff, bank.k * 4),
+                testkit::upload_filled(ctx, 0xff, bank.n * 4),
+                testkit::upload_filled(ctx, 0xff, bank.n * 4),
+            ));
+        }
+    }
+    let mut calls = Vec::with_capacity(staged.len());
+    let mut outs = Vec::with_capacity(staged.len());
+    for (bank_idx, p, xh, z, out) in &staged {
+        let bank = &banks[*bank_idx];
+        calls.push(bank.one_call(
+            *p,
+            xh.range(0, bank.k * 4).unwrap(),
+            z.range(0, bank.n * 4).unwrap(),
+            out,
+            flag,
+            &ids,
+        ));
+        outs.push(out);
+    }
+    ctx.exl3_grouped_indexed(stream, &calls, 1)
+        .expect("the batched table launch");
+    stream.synchronize().expect("sync");
+    for (out, want) in outs.iter().zip(&want) {
+        assert_eq!(&testkit::read_bytes(ctx, out, out.bytes()), want);
+    }
+    ctx.set_indexed_options(None);
+    want
+}
+
+#[test]
+fn the_table_launch_batches_past_the_pair_cap_and_grows_its_region() {
+    if !testkit::device_present("EXL3 table past the pair cap") {
+        return;
+    }
+    let ctx = CudaContext::new().expect("context");
+    let stream = ctx.stream().expect("stream");
+    let mut rng = testkit::Rng::new(0x5347_0024);
+    let kind = (Codebook::Mul1, 6u8, 0usize);
+    // Two shapes, thirty rows each: the first batch (60 records, 7680 bytes of records)
+    // crosses the staging region's 4096-byte start and grows it, the eight-record batch
+    // reuses the grown region, and the ninety-six-record batch grows it again — every batch
+    // byte-equal to its chunked 20-pair reference.
+    let banks = [
+        Bank::with_shape(&ctx, &mut rng, kind, (768, 512), 48),
+        Bank::with_shape(&ctx, &mut rng, kind, (512, 768), 48),
+    ];
+    let flag = testkit::upload_bytes(&ctx, &0u32.to_le_bytes());
+    batch_matches_wide_chunks(&ctx, &stream, &banks, &flag, 30);
+    batch_matches_wide_chunks(&ctx, &stream, &banks, &flag, 4);
+    batch_matches_wide_chunks(&ctx, &stream, &banks, &flag, 48);
+    assert_eq!(testkit::read_bytes(&ctx, &flag, 4), [0; 4]);
+}
+
+#[test]
+fn the_table_launch_keeps_one_region_per_stream() {
+    if !testkit::device_present("EXL3 table region per stream") {
+        return;
+    }
+    let ctx = CudaContext::new().expect("context");
+    let first = ctx.stream().expect("stream");
+    let second = ctx.stream().expect("stream");
+    let mut rng = testkit::Rng::new(0x5347_0025);
+    let kind = (Codebook::Mul1, 6u8, 0usize);
+    let bank = Bank::with_shape(&ctx, &mut rng, kind, (512, 384), 6);
+    let flag = testkit::upload_bytes(&ctx, &0u32.to_le_bytes());
+    // The reference bytes of the six records, once per stream (the same records, so the
+    // same bytes).
+    let want = batch_matches_wide_chunks(&ctx, &first, std::slice::from_ref(&bank), &flag, 6);
+    batch_matches_wide_chunks(&ctx, &second, std::slice::from_ref(&bank), &flag, 6);
+    // Two interleaved batches on two streams: each stages its records into its own
+    // stream's region, so the second launch's copy must not overwrite the first's before
+    // its kernel read them. Both synchronize only after both launches are queued.
+    ctx.set_indexed_options(Some(TABLE));
+    let ids: Vec<u8> = (0..6i32).flat_map(|i| (3 + i % 5).to_le_bytes()).collect();
+    let ids = testkit::upload_bytes(&ctx, &ids);
+    let mut launches = Vec::new();
+    for stream in [&first, &second] {
+        // Buffers owned per stream, then borrowed into the calls (the staged tuple moves
+        // with its borrows into `launches`).
+        let mut staged = Vec::with_capacity(6);
+        for _ in 0..6 {
+            staged.push((
+                testkit::upload_filled(&ctx, 0xff, bank.k * 4),
+                testkit::upload_filled(&ctx, 0xff, bank.n * 4),
+                testkit::upload_filled(&ctx, 0xff, bank.n * 4),
+            ));
+        }
+        let mut calls = Vec::with_capacity(6);
+        for (p, (xh, z, out)) in staged.iter().enumerate() {
+            calls.push(bank.one_call(
+                p,
+                xh.range(0, bank.k * 4).unwrap(),
+                z.range(0, bank.n * 4).unwrap(),
+                out,
+                &flag,
+                &ids,
+            ));
+        }
+        ctx.exl3_grouped_indexed(stream, &calls, 1)
+            .expect("the batched table launch");
+        launches.push(staged);
+    }
+    first.synchronize().expect("sync");
+    second.synchronize().expect("sync");
+    ctx.set_indexed_options(None);
+    // Each stream's bytes equal the reference of the same records.
+    for staged in &launches {
+        // Each staged row is (xh, z, out) in record order: the out is the third element.
+        for ((_, _, out), want) in staged.iter().zip(&want) {
+            assert_eq!(&testkit::read_bytes(&ctx, out, out.bytes()), want);
+        }
+    }
+    assert_eq!(testkit::read_bytes(&ctx, &flag, 4), [0; 4]);
 }
