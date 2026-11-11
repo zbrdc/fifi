@@ -50,6 +50,7 @@ use crate::{
     EngError,
     family::{
         flash_next::moe::slot_bank::{PARTS, SlotBankLayout},
+        project::exl3_jobs_plan::EXL3_JOB_WORDS,
         qwen36::tiered::classify::{Classified, ROUTE_INVALID, classify_reference},
     },
 };
@@ -96,6 +97,9 @@ pub(super) struct ScratchLayout {
     pub(super) miss_weights: usize,
     /// f32 `[hidden]`: the resident pass's result while a miss pass is still to come.
     pub(super) partial: usize,
+    /// i32 `[2 * routed + EXL3_JOB_WORDS * exl3_max_jobs]`: the sort lists and the job table
+    /// of the chunk's routed job-table passes.
+    pub(super) perm: usize,
     pub(super) total: usize,
 }
 
@@ -110,6 +114,7 @@ impl ScratchLayout {
     ) -> Result<Self, EngError> {
         let overflow = || refuse("the scratch size overflows".into());
         let mul = |a: Option<usize>, b: usize| a.and_then(|at| at.checked_mul(b));
+        let routed = rows.checked_mul(top_k).ok_or_else(overflow)?;
         let regions = [
             n_expert.checked_mul(I32),
             mul(rows.checked_mul(top_k), I32),
@@ -122,8 +127,13 @@ impl ScratchLayout {
             mul(rows.checked_mul(top_k), I32),
             mul(rows.checked_mul(top_k), F32),
             mul(rows.checked_mul(hidden), F32),
+            mul(Some(2 * routed), I32).and_then(|at| {
+                // Two sources (the bank's and the ring's slots) plan separately: their lists sum
+                // to `routed` pairs and their job tables to at most one job per pair each.
+                at.checked_add((2 + EXL3_JOB_WORDS) * routed * I32)
+            }),
         ];
-        let mut offsets = [0usize; 11];
+        let mut offsets = [0usize; 12];
         let mut at = 0usize;
         for (offset, size) in offsets.iter_mut().zip(regions) {
             *offset = at;
@@ -145,6 +155,7 @@ impl ScratchLayout {
             miss_ids,
             miss_weights,
             partial,
+            perm,
         ] = offsets;
         Ok(Self {
             rows,
@@ -159,6 +170,7 @@ impl ScratchLayout {
             miss_ids,
             miss_weights,
             partial,
+            perm,
             total: at,
         })
     }
@@ -367,7 +379,16 @@ mod device {
         EngError,
         family::{
             flash_next::{cuda::bank::device::DeviceBank, moe::slot_bank::SlotBankLayout},
-            project::cuda::exl3::{Exl3BankSpan, Exl3Weight},
+            project::{
+                cuda::{
+                    exl3::{Exl3BankSpan, Exl3Members, Exl3Weight},
+                    exl3_jobs::{
+                        Lists, PairPlan, Scratch as JobScratch, Table, jobs_call, pair_layout,
+                        plan_jobs, plan_pairs, project_jobs, write_lists,
+                    },
+                },
+                exl3_jobs_plan::EXL3_JOB_WORDS,
+            },
             qwen36::cuda::{
                 exl3_moe::{
                     Exl3MoeBufs, IndexedPair, Scratch, SharedRowsIo, SharedWeights,
@@ -387,6 +408,64 @@ mod device {
         },
         weights::exl3::Codebook,
     };
+
+    /// The `rows` rows of `range` at row `index` of `row_bytes` each.
+    fn rows_of<'b>(
+        range: &DeviceRange<'b>,
+        row_bytes: usize,
+        index: usize,
+        rows: usize,
+    ) -> Result<DeviceRange<'b>, EngError> {
+        range
+            .buffer()
+            .range(range.offset() + index * row_bytes, rows * row_bytes)
+    }
+
+    /// The counting sort of one source's pairs: `sub` lists the chunk's pair positions of the
+    /// source's picks in chunk order; the shared sort runs over their slot ids and the lists
+    /// are translated back to the chunk's pair positions and rows.
+    fn source_plan(
+        ids: &[i32],
+        sub: &[usize],
+        slots: usize,
+        top_k: usize,
+    ) -> Result<PairPlan, EngError> {
+        let picks: Vec<i32> = sub.iter().map(|&at| ids[at]).collect();
+        let mut plan = plan_pairs(&picks, slots, top_k)?;
+        let overflow = || refuse("the chunk's pair count exceeds i32".into());
+        for (order, scatter) in plan.order.iter_mut().zip(&mut plan.scatter) {
+            let pair = sub[*scatter as usize];
+            *scatter = i32::try_from(pair).map_err(|_| overflow())?;
+            *order = i32::try_from(pair / top_k).map_err(|_| overflow())?;
+        }
+        Ok(plan)
+    }
+
+    /// The rotated-row and partial-sum ranges of a fused gate and up launch over `n` pairs,
+    /// when the second rotation fits behind the partial sums of the scratch's `z` range;
+    /// `None` otherwise, and the caller runs the two projections separately.
+    fn pair_scratch_of<'b>(
+        scratch: &Scratch<'b>,
+        n: usize,
+        inter: usize,
+        hidden: usize,
+    ) -> Result<Option<(JobScratch<'b>, JobScratch<'b>)>, EngError> {
+        let Some(layout) = pair_layout((n, inter, hidden), scratch.z.bytes()) else {
+            return Ok(None);
+        };
+        let z = scratch
+            .z
+            .buffer()
+            .range(scratch.z.offset(), layout.z_bytes)?;
+        let second_xh = scratch
+            .z
+            .buffer()
+            .range(scratch.z.offset() + layout.tail, layout.xh_bytes)?;
+        Ok(Some((
+            JobScratch { xh: scratch.xh, z },
+            JobScratch { xh: second_xh, z },
+        )))
+    }
 
     /// The trunk weights of one layer's MoE block: the router, the shared expert's gate row, and
     /// the shared expert's three matrices. The caller borrows them from the loaded weights.
@@ -1250,66 +1329,190 @@ mod device {
                     }
                 }
             }
-            scratch.write_at(stream, sc.slot_ids, &le_i32(&ids))?;
             scratch.write_at(stream, sc.weights, &le_f32(&weights))?;
-            let ids_range = scratch.range(sc.slot_ids, m * k * I32)?;
             tick(24);
 
-            // The flat launches of both passes: every pick rides the list in `r * k + p`
-            // order (the indexed launch requires contiguous out rows), each item carrying
-            // its source.
-            let mut gu = Vec::with_capacity(2 * m * k);
-            let mut down = Vec::with_capacity(m * k);
-            for r in 0..m {
-                for pick in 0..k {
-                    let at = r * k + pick;
-                    for part in 0..2usize {
-                        gu.push(Item {
-                            part,
-                            pick: at as u32,
-                            x: row(&bufs.route.norm_row, h * F32, r)?,
-                            out: row(&bufs.expert_gu, i * F32, 2 * at + part)?,
-                            ring: is_ring[at],
-                        });
-                    }
-                    down.push(Item {
-                        part: 2,
-                        pick: at as u32,
-                        x: row(&bufs.expert_act, i * F32, at)?,
-                        out: row(&bufs.expert_down, h * F32, at)?,
-                        ring: is_ring[at],
-                    });
-                }
-            }
-
-            // The compute waits this layer's copies before any grouped read of a ring slot.
+            // The compute waits this layer's copies before any job reads a ring slot.
             self.ring
                 .as_ref()
                 .expect("the ring branch is taken only with a ring")
                 .wait_layer(stream, layer)?;
-            let members = u32::try_from(geometry.slots)
-                .map_err(|_| refuse("the bank has too many slots".into()))?;
-            let ring_members =
-                u32::try_from(ring_slots).map_err(|_| refuse("the ring is too large".into()))?;
-            let bank = (self.bank.slots(layer)?, members);
-            let ring = self.ring.as_ref().map(|ring| (ring.slots(), ring_members));
-            self.grouped_at(launch, &gu, bank, ring, ids_range, &bufs.scratch)?;
-            tick(25);
-            ctx.swiglu_rows(
-                stream,
-                SwigluRowsCall {
-                    shape: SwigluRowsShape {
-                        rows: m * k,
-                        n_ff: i,
-                        up_off: i,
-                        ld_in: 2 * i,
-                        ld_out: i,
+            // The routed job table of both passes: the chunk's pairs are sorted per source —
+            // the bank's slots and the ring's slots are two member banks. Gate and up read
+            // the chunk rows through the first list and write disjoint segments of the
+            // gate/up face, the SwiGLU covers each segment, down writes each pair row to
+            // its place through the second list. Every part is one launch per source
+            // whatever the number of experts, in place of one indexed launch per sixteen
+            // picks.
+            let mut sub = [Vec::new(), Vec::new()];
+            for (at, &to_ring) in is_ring.iter().enumerate() {
+                sub[usize::from(to_ring)].push(at);
+            }
+            let slots_of = [geometry.slots, ring_slots];
+            let plans: Vec<_> = (0..2)
+                .map(|source| source_plan(&ids, &sub[source], slots_of[source], k))
+                .collect::<Result<Vec<_>, EngError>>()?;
+            // Each source's lists and job table sit at their own offset of the perm region,
+            // and its gate/up and SwiGLU rows form their own segment of the pair faces.
+            let mut perm_at = sc.perm;
+            let mut gu_at = 0usize;
+            let mut at_of = [0usize; 2];
+            let mut seg_of = [0usize; 2];
+            for source in 0..2 {
+                at_of[source] = perm_at;
+                seg_of[source] = gu_at;
+                let jobs = plan_jobs(&plans[source].counts).len();
+                perm_at += (2 * sub[source].len() + EXL3_JOB_WORDS * jobs) * I32;
+                gu_at += sub[source].len();
+            }
+            let ring_of = self
+                .ring
+                .as_ref()
+                .expect("the ring branch is taken only with a ring");
+            let ring_spans = self.spans.for_slots(ring_slots)?;
+            let sources = [
+                (self.bank.slots(layer)?, &self.spans),
+                (ring_of.slots(), &ring_spans),
+            ];
+            let pair = ctx.exl3_jobs_pair_enabled()?;
+            // Gate and up of every source, each followed by the SwiGLU of its segment.
+            for (source, (buffer, spans)) in sources.iter().enumerate() {
+                let n = sub[source].len();
+                if n == 0 {
+                    continue;
+                }
+                let plan = &plans[source];
+                let jobs = plan_jobs(&plan.counts);
+                let perm =
+                    scratch.range(at_of[source], (2 * n + EXL3_JOB_WORDS * jobs.len()) * I32)?;
+                write_lists(launch, perm, (plan, &jobs))?;
+                let listed = Lists {
+                    input: Some(scratch.range(perm.offset(), n * I32)?),
+                    output: None,
+                    x_rows: m,
+                    out_rows: n,
+                };
+                let table = Table {
+                    jobs: &jobs,
+                    range: scratch.range(perm.offset() + 2 * n * I32, jobs.len() * 16)?,
+                    rows: n,
+                };
+                let seg = rows_of(&bufs.expert_gu, 2 * i * F32, seg_of[source], n)?;
+                let act = rows_of(&bufs.expert_act, i * F32, seg_of[source], n)?;
+                let rotated = JobScratch {
+                    xh: rows_of(&bufs.scratch.xh, h * F32, 0, n)?,
+                    z: rows_of(&bufs.scratch.z, i * F32, 0, n)?,
+                };
+                let members = [
+                    self.members_of(buffer, spans, 0)?,
+                    self.members_of(buffer, spans, 1)?,
+                ];
+                let fused = if pair {
+                    pair_scratch_of(&bufs.scratch, n, i, h)?
+                } else {
+                    None
+                };
+                match fused {
+                    Some((first, second)) => {
+                        let calls = (
+                            jobs_call(
+                                bufs.scratch.flag,
+                                first,
+                                table,
+                                &members[0],
+                                bufs.route.norm_row,
+                                (seg, 2 * i, 0),
+                                listed,
+                            )?,
+                            jobs_call(
+                                bufs.scratch.flag,
+                                second,
+                                table,
+                                &members[1],
+                                bufs.route.norm_row,
+                                (seg, 2 * i, i),
+                                listed,
+                            )?,
+                        );
+                        ctx.exl3_jobs_pair_mode(stream, calls, (true, None))?;
+                    }
+                    None => {
+                        project_jobs(
+                            launch,
+                            bufs.scratch.flag,
+                            rotated,
+                            table,
+                            &members[0],
+                            bufs.route.norm_row,
+                            (seg, 2 * i, 0),
+                            listed,
+                        )?;
+                        project_jobs(
+                            launch,
+                            bufs.scratch.flag,
+                            rotated,
+                            table,
+                            &members[1],
+                            bufs.route.norm_row,
+                            (seg, 2 * i, i),
+                            listed,
+                        )?;
+                    }
+                }
+                ctx.swiglu_rows(
+                    stream,
+                    SwigluRowsCall {
+                        shape: SwigluRowsShape {
+                            rows: n,
+                            n_ff: i,
+                            up_off: i,
+                            ld_in: 2 * i,
+                            ld_out: i,
+                        },
+                        gu: seg,
+                        act,
                     },
-                    gu: bufs.expert_gu,
-                    act: bufs.expert_act,
-                },
-            )?;
-            self.grouped_at(launch, &down, bank, ring, ids_range, &bufs.scratch)?;
+                )?;
+            }
+            tick(25);
+            // Down of every source, each pair row written to its place through the scatter
+            // list the combine then reads in pick order.
+            for (source, (buffer, spans)) in sources.iter().enumerate() {
+                let n = sub[source].len();
+                if n == 0 {
+                    continue;
+                }
+                let plan = &plans[source];
+                let jobs = plan_jobs(&plan.counts);
+                let perm =
+                    scratch.range(at_of[source], (2 * n + EXL3_JOB_WORDS * jobs.len()) * I32)?;
+                let scatter = scratch.range(perm.offset() + n * I32, n * I32)?;
+                let table = Table {
+                    jobs: &jobs,
+                    range: scratch.range(perm.offset() + 2 * n * I32, jobs.len() * 16)?,
+                    rows: n,
+                };
+                let act = rows_of(&bufs.expert_act, i * F32, seg_of[source], n)?;
+                let listed = Lists {
+                    input: None,
+                    output: Some(scatter),
+                    x_rows: n,
+                    out_rows: m * k,
+                };
+                project_jobs(
+                    launch,
+                    bufs.scratch.flag,
+                    JobScratch {
+                        xh: rows_of(&bufs.scratch.xh, h * F32, 0, n)?,
+                        z: rows_of(&bufs.scratch.z, h * F32, 0, n)?,
+                    },
+                    table,
+                    &self.members_of(buffer, spans, 2)?,
+                    act,
+                    (bufs.expert_down, h, 0),
+                    listed,
+                )?;
+            }
             tick(26);
 
             // The shared expert of every row, then the one combine over every pick.
@@ -1440,6 +1643,35 @@ mod device {
                 ids,
                 scratch,
             )
+        }
+
+        /// The members of part `part` over one source of expert records — the bank's layer
+        /// buffer or the ring's staging — as the job table addresses them: member `i`'s part
+        /// matrices sit at the part's offsets of the record plus `i` record strides. The
+        /// strides of the shared struct count u16 elements (trellis) and f32 values (scales).
+        fn members_of<'b>(
+            &self,
+            buffer: &'b DeviceBuffer,
+            spans: &SlotSpans,
+            part: usize,
+        ) -> Result<Exl3Members<'b>, EngError> {
+            let span = &spans.parts[part];
+            if !spans.trellis_stride.is_multiple_of(2) {
+                return Err(refuse(
+                    "the bank's record stride is not a whole u16 count".into(),
+                ));
+            }
+            Ok(Exl3Members {
+                trellis: buffer.range(span.trellis.start, span.trellis.len())?,
+                suh: buffer.range(span.suh.start, span.suh.len())?,
+                svh: buffer.range(span.svh.start, span.svh.len())?,
+                trellis_stride: spans.trellis_stride / 2,
+                scale_stride: spans.scale_stride,
+                members: spans.slots,
+                shape: span.shape,
+                bits_twice: span.bits_twice,
+                book: self.book,
+            })
         }
 
         /// One pass over the bank of `pass.layer`: gate and up of the picks, SwiGLU, down, the

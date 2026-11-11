@@ -308,12 +308,25 @@ fn exl3_scratch(geometry: &FlashGeometry, rows: usize) -> Result<(usize, usize),
         &geometry.qsa,
     );
     let (top_k, inter, shared_inter) = moe;
+    // The routed experts: one row runs the grouped launch of both projections (2 * top_k member
+    // rows); a chunk runs them as one job-table launch over its routed pairs, and the pair
+    // layout rotates the second projection's input from the partial tail, so the rotation
+    // face holds one routed face, not two.
+    let (routed_in, routed_out) = if rows == 1 {
+        (2 * top_k, top_k)
+    } else {
+        let routed = rows.checked_mul(top_k).ok_or_else(|| {
+            EngError::BadRequest("the chunk's routed pair count overflows".into())
+        })?;
+        (routed, routed)
+    };
     let mut launches = vec![
         // lm_head
         (rows, h, geometry.vocab),
-        // routed gate and up of every pick in one group, then the down group
-        (2 * top_k, h, inter),
-        (top_k, inter, h),
+        // the routed job table of the chunked prefill: one launch covers every pair of the
+        // chunk, so the rotation and the partials hold the whole chunk's pairs
+        (routed_in, h, inter),
+        (routed_out, inter, h),
         // shared gate and up as 2 * rows groups, then its down
         (2 * rows, h, shared_inter),
         (rows, shared_inter, h),

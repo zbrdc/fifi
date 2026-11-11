@@ -151,6 +151,9 @@ fn the_private_scratch_is_aligned_disjoint_and_small() {
         (layout.miss_ids, 40),
         (layout.miss_weights, 40),
         (layout.partial, 2560 * 4),
+        // The job-table perm region: the two sources' lists (2·routed) plus their job tables
+        // ((2 + EXL3_JOB_WORDS)·routed), at routed = rows·top_k = 10.
+        (layout.perm, 320),
     ];
     for (index, &(offset, bytes)) in regions.iter().enumerate() {
         assert_eq!(offset % 256, 0, "region {index}");
@@ -159,7 +162,7 @@ fn the_private_scratch_is_aligned_disjoint_and_small() {
             assert!(offset + bytes <= other || other + other_bytes <= offset);
         }
     }
-    assert_eq!(layout.total, 24_576, "24 KiB at the real sizes");
+    assert_eq!(layout.total, 25_088, "24.5 KiB at the real sizes");
 }
 
 #[test]
