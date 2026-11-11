@@ -41,7 +41,6 @@
 
 use super::super::attn::KvBuffers;
 use super::super::chunk_plan::{PREFILL_RETIRE_CAP, delta_retire_per_token, delta_subchunk};
-use super::delta::fused_prefill_enabled;
 use super::super::decoder::{ResidentDecoder, StepMode, StepResult};
 use super::super::executor::compiled_layer_on;
 use super::super::kv_plan::{depth_ranges, prefill_score_bound};
@@ -50,6 +49,7 @@ use super::super::ops::{Ctx, cast_to, dim, linear, linear_rows, short_import, to
 use super::super::state::{LayerState, ResidentState, chunk_growth_bytes};
 use super::super::step::{check_dtype, read_token, split_rows};
 use super::super::weights::{RFeedForward, RMixer};
+use super::delta::fused_prefill_enabled;
 use super::{attn, delta, moe};
 use crate::family::qwen36::settings::KvDtype;
 use crate::kernels::mlx::native::compile::CompileDeltaLayerArgs;
