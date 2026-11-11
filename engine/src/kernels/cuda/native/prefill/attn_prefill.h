@@ -58,7 +58,9 @@
  * (grid (max_splits, n_kv_head, q_tiles), 128 threads), requesting 64/32 KB for D256/D128.
  * It reports an error if neither arm fits; CUDA query and opt-in errors propagate. Successful
  * selections are cached per device and model geometry. SIMT computes within the prefill-attention
- * tolerance, not bit for bit; pre-sm80 SIMT has been compile-only (no board run).
+ * tolerance, not bit for bit. The legacy pre-sm80 SIMT layout has been compile-only (no board run);
+ * RTX 2080 Ti runs of the single-buffer arm are recorded in
+ * scripts/benchmarks/qwen36-adaptive-attention-device-observations.json.
  *
  * Legacy F16 NaN isolation is per 64-row query tile, not per row: a NaN V cell inside a tile's key range
  * reaches every row of that tile (a row that does not see the key still multiplies p = 0 by

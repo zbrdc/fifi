@@ -257,11 +257,13 @@ __global__ void __launch_bounds__(128) attn_prefill_part_simt_legacy_k(Args a) {
 }
 
 
-/* The fp32 SIMT kernel (sm_72 has been compile-only), the same block and partial cell as
+/* The fp32 SIMT kernel, the same block and partial cell as
  * attn_prefill_part_dsplit_k: 128 threads, two per row (each owning one half of the row's 256
  * dims), the same loaders, masking and part layout; the score halves join with one shuffle, so both
  * halves of a row see the same statistics in the same order. Compiled for all architectures so
- * an sm_80+ device whose actual opt-in limit cannot fit dsplit can also choose this arm. */
+ * an sm_80+ device whose actual opt-in limit cannot fit dsplit can also choose this arm. It is
+ * compile-only on sm_72; RTX 2080 Ti runs are recorded in
+ * scripts/benchmarks/qwen36-adaptive-attention-device-observations.json. */
 template <int kHeadDim, int kGroup>
 __global__ void __launch_bounds__(128) attn_prefill_part_simt_k(Args a) {
     if (!bounds_ok(a)) {
