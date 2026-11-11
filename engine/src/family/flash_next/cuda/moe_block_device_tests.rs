@@ -623,12 +623,21 @@ fn a_chunk_over_the_prefill_ring_matches_the_all_resident_block() {
         });
     }
 
-    // The bank holds six of row 0's picks per layer: row 0 is mixed, every later row misses.
+    // The bank holds the first `held_of` of row 0's picks per layer, padded with other experts:
+    // the default 6 leaves row 0 mixed; the ring-tolerance measurements hold every pick
+    // (FIFI_FLASH_NEXT_RING_HELD=10, the all-bank arm) or none (0, the all-ring arm).
+    let held_of: usize = std::env::var("FIFI_FLASH_NEXT_RING_HELD")
+        .map_or(6, |v| v.parse().expect("a held-pick count"));
     let held: Vec<Vec<u16>> = arms
         .iter()
         .map(|arm| {
-            let mut held: Vec<u16> = arm.wants[0].ids.iter().take(6).map(|&e| e as u16).collect();
-            held.extend(others(&arm.wants[0].ids, SLOTS - 6));
+            let mut held: Vec<u16> = arm.wants[0]
+                .ids
+                .iter()
+                .take(held_of)
+                .map(|&e| e as u16)
+                .collect();
+            held.extend(others(&arm.wants[0].ids, SLOTS - held.len()));
             held
         })
         .collect();
