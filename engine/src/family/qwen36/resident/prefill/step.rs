@@ -975,6 +975,12 @@ mod tests {
                 .map(|v| v.to_bits())
                 .collect()
         };
+        // Raw storage bytes of one readback: dtype-agnostic, so the U32 codes and the
+        // BF16 scales/biases of the Q8 arm compare without a typed reader.
+        let raw = |kernels: &mut crate::kernels::MlxKernels, t: &ExecutionTensor| -> Vec<u8> {
+            let host = ok(kernels.readback(t), "readback");
+            some(host.host_bytes(), "host bytes").to_vec()
+        };
         let tokens: Vec<u32> = (11..75).collect();
         // Serve-order coverage, corrected by review: with the flag ON below, this 64-row
         // `Prompt` chunk stays EAGER by the (2..16) window gate (the eager WY path serves
@@ -1083,33 +1089,33 @@ mod tests {
                                 Some(KvBuffers::Q8 { k: bk, v: bv }),
                             ) => {
                                 assert_eq!(
-                                    bits(&mut decoder.kernels, &ak.codes),
-                                    bits(&mut decoder.kernels, &bk.codes),
+                                    raw(&mut decoder.kernels, &ak.codes),
+                                    raw(&mut decoder.kernels, &bk.codes),
                                     "rows {rows} layer {l}: the key codes are byte equal"
                                 );
                                 assert_eq!(
-                                    bits(&mut decoder.kernels, &ak.scales),
-                                    bits(&mut decoder.kernels, &bk.scales),
+                                    raw(&mut decoder.kernels, &ak.scales),
+                                    raw(&mut decoder.kernels, &bk.scales),
                                     "rows {rows} layer {l}: the key scales are byte equal"
                                 );
                                 assert_eq!(
-                                    bits(&mut decoder.kernels, &ak.biases),
-                                    bits(&mut decoder.kernels, &bk.biases),
+                                    raw(&mut decoder.kernels, &ak.biases),
+                                    raw(&mut decoder.kernels, &bk.biases),
                                     "rows {rows} layer {l}: the key biases are byte equal"
                                 );
                                 assert_eq!(
-                                    bits(&mut decoder.kernels, &av.codes),
-                                    bits(&mut decoder.kernels, &bv.codes),
+                                    raw(&mut decoder.kernels, &av.codes),
+                                    raw(&mut decoder.kernels, &bv.codes),
                                     "rows {rows} layer {l}: the value codes are byte equal"
                                 );
                                 assert_eq!(
-                                    bits(&mut decoder.kernels, &av.scales),
-                                    bits(&mut decoder.kernels, &bv.scales),
+                                    raw(&mut decoder.kernels, &av.scales),
+                                    raw(&mut decoder.kernels, &bv.scales),
                                     "rows {rows} layer {l}: the value scales are byte equal"
                                 );
                                 assert_eq!(
-                                    bits(&mut decoder.kernels, &av.biases),
-                                    bits(&mut decoder.kernels, &bv.biases),
+                                    raw(&mut decoder.kernels, &av.biases),
+                                    raw(&mut decoder.kernels, &bv.biases),
                                     "rows {rows} layer {l}: the value biases are byte equal"
                                 );
                             }
@@ -1130,8 +1136,9 @@ mod tests {
             // The eager baseline is not a constant (main wiring compiled delta rows into the
             // chunk path moved it), so the saving is pinned per attention layer instead of as
             // a ratio: each closed attention layer removes the eager qkv/moe dispatch storm.
-            // The pin comes from the Mac receipt at the review tip (rows 2 saves 78, rows 3/8
-            // save 117 entries over the 32 attention layers of the 35B A3B).
+            // The pin comes from the Mac receipt at the review tip: rows 2 saves 78 and rows
+            // 3/8 save 117 entries over the 10 attention layers of the 35B A3B (7.8 to 11.7
+            // per layer), so 2 per layer is a conservative floor.
             assert!(
                 eager_ops - compiled_ops >= (attn_layers as u64) * 2,
                 "rows {rows}: the compiled chunk must save at least 2 entries per attention layer (saved {}, layers {attn_layers})",
