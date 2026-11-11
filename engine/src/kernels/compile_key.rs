@@ -19,8 +19,21 @@ use crate::tensor::Dtype;
 pub(crate) const DELTA_TAG: u64 = 0x0036_5147_a5a0_0002;
 pub(crate) const MOE_TAG: u64 = 0x0036_5147_a5a0_0003;
 pub(crate) const FLINT_TAIL_TAG: u64 = 0x0036_5147_a5a0_0004;
+/// read by the MLX layer-closure compile path (host builds compile this module without it).
+#[cfg_attr(
+    not(feature = "native-mlx"),
+    expect(dead_code, reason = "read by the MLX layer-closure compile path")
+)]
 pub(crate) const DELTA_LAYER_TAG: u64 = 0x0036_5147_a5a0_0007;
+#[cfg_attr(
+    not(feature = "native-mlx"),
+    expect(dead_code, reason = "read by the MLX layer-closure compile path")
+)]
 pub(crate) const ATTN_PRE_LAYER_TAG: u64 = 0x0036_5147_a5a0_0008;
+#[cfg_attr(
+    not(feature = "native-mlx"),
+    expect(dead_code, reason = "read by the MLX layer-closure compile path")
+)]
 pub(crate) const ATTN_POST_LAYER_TAG: u64 = 0x0036_5147_a5a0_0009;
 /// The cache-key tag of the attention pre-RoPE closure (projections, q/gate split, q/k norms).
 pub(crate) const ATTN_PRE_TAG: u64 = 0x0036_5147_a5a0_0005;
@@ -165,6 +178,10 @@ pub(crate) fn delta_fun_id(baked: &DeltaBaked) -> u64 {
 /// nonshapeless MLX cache specializes it under the one key, like the B axis of the decode
 /// blocks.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[cfg_attr(
+    not(feature = "native-mlx"),
+    expect(dead_code, reason = "read by the MLX layer-closure compile path")
+)]
 pub(crate) struct DeltaLayerBaked {
     pub(crate) hidden: u32,
     /// `kh, kd, vh, vd, cd, taps` (conv_kernel - 1), `kw` (kh * kd), `kw2` (2 * kw).
@@ -184,6 +201,10 @@ pub(crate) struct DeltaLayerBaked {
     pub(crate) quant: [[i32; 3]; 10],
 }
 
+#[cfg_attr(
+    not(feature = "native-mlx"),
+    expect(dead_code, reason = "read by the MLX layer-closure compile path")
+)]
 pub(crate) fn delta_layer_fun_id(baked: &DeltaLayerBaked) -> u64 {
     let mut parts = Vec::with_capacity(48);
     parts.push(u64::from(baked.hidden));
@@ -239,6 +260,10 @@ pub(crate) fn flint_tail_fun_id(baked: &FlintTailBaked) -> u64 {
 /// gate slice. T is NOT baked: the nonshapeless MLX cache specializes it under the one
 /// key, like the whole-layer delta closure.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[cfg_attr(
+    not(feature = "native-mlx"),
+    expect(dead_code, reason = "read by the MLX layer-closure compile path")
+)]
 pub(crate) struct AttnPreLayerBaked {
     pub(crate) hidden: u32,
     /// The query head count.
@@ -257,6 +282,10 @@ pub(crate) struct AttnPreLayerBaked {
     pub(crate) quant: [[i32; 3]; 3],
 }
 
+#[cfg_attr(
+    not(feature = "native-mlx"),
+    expect(dead_code, reason = "read by the MLX layer-closure compile path")
+)]
 pub(crate) fn attn_pre_layer_fun_id(baked: &AttnPreLayerBaked) -> u64 {
     let mut parts = Vec::with_capacity(16);
     parts.push(u64::from(baked.hidden));
@@ -278,6 +307,10 @@ pub(crate) fn attn_pre_layer_fun_id(baked: &AttnPreLayerBaked) -> u64 {
 /// expert, output residual) — the same fold as the whole-layer delta closure. T rides on
 /// the residual operand's shape and is NOT baked.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[cfg_attr(
+    not(feature = "native-mlx"),
+    expect(dead_code, reason = "read by the MLX layer-closure compile path")
+)]
 pub(crate) struct AttnPostLayerBaked {
     pub(crate) hidden: u32,
     /// The query head count.
@@ -305,6 +338,10 @@ pub(crate) struct AttnPostLayerBaked {
     pub(crate) quant: [[i32; 3]; 6],
 }
 
+#[cfg_attr(
+    not(feature = "native-mlx"),
+    expect(dead_code, reason = "read by the MLX layer-closure compile path")
+)]
 pub(crate) fn attn_post_layer_fun_id(baked: &AttnPostLayerBaked) -> u64 {
     let mut parts = Vec::with_capacity(30);
     parts.push(u64::from(baked.hidden));
