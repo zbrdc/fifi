@@ -37,7 +37,8 @@ pub(crate) fn dispatch_count() -> u64 {
     guard::dispatch_count()
 }
 
-/// Zeroes the calling thread's native-dispatch count (the `Q36_WINDOW_TAPS` probe).
+/// Zeroes the calling thread's native-dispatch count (the parity oracle's op-count asserts).
+#[cfg(test)]
 pub(crate) fn reset_dispatch_count() {
     guard::reset_dispatch_count()
 }

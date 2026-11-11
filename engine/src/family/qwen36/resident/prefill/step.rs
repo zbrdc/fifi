@@ -351,57 +351,54 @@ fn run(
             && shape.delta.key_dim == 128
             && shape.delta.value_heads == 32
             && shape.delta.value_dim == 128
-        {
-            if let (RMixer::Delta(w), LayerState::Delta { rec, ring }, RFeedForward::Moe(moe_w)) =
+            && let (RMixer::Delta(w), LayerState::Delta { rec, ring }, RFeedForward::Moe(moe_w)) =
                 (&layer.mixer, &old_layer, &layer.feed_forward)
-            {
-                let d = &shape.delta;
-                let s = ctx.kernels.compiled_delta_layer(&CompileDeltaLayerArgs {
-                    x: &h,
-                    rec,
-                    ring,
-                    dims: [
-                        d.key_heads as u32,
-                        d.key_dim as u32,
-                        d.value_heads as u32,
-                        d.value_dim as u32,
-                        d.conv_dim() as u32,
-                        (d.conv_kernel - 1) as u32,
-                    ],
-                    packed: [&w.qkv, &w.z, &w.b, &w.a, &w.out],
-                    plain: [
-                        &w.conv_taps,
-                        &w.conv_last,
-                        &w.neg_exp_a_log,
-                        &w.dt_bias,
-                        &w.norm,
-                    ],
-                    qk_eps: &ctx.consts.qk_eps,
-                    sqrt_kd: &ctx.consts.sqrt_kd,
-                    in_norm: &layer.input_norm,
-                    post_norm: &layer.post_norm,
-                    router_t: &moe_w.router_t,
-                    shared: [&moe_w.shared_gate, &moe_w.shared_up, &moe_w.shared_down],
-                    shared_scalar_t: &moe_w.shared_scalar_t,
-                    stacks: [&moe_w.gate_up, &moe_w.down],
-                    hidden: shape.hidden as u32,
-                    experts: shape.moe.experts as u32,
-                    top_k: shape.moe.top_k as u32,
-                    renorm: shape.moe.renorm,
-                    eps: shape.eps,
-                    act: ctx.consts.act,
-                })?;
-                h = s.out;
-                healths.push(s.health);
-                layers.push(LayerState::Delta {
-                    rec: s.rec,
-                    ring: s.ring,
-                });
-                check_dtype("compiled layer output", &h, ctx.consts.act)?;
-                continue;
-            }
-        }
-        // B1v2 (`Q36_COMPILED_LAYER=1`): one ATTN-mixer layer runs as TWO compiled closures -
+        {
+            let d = &shape.delta;
+            let s = ctx.kernels.compiled_delta_layer(&CompileDeltaLayerArgs {
+                x: &h,
+                rec,
+                ring,
+                dims: [
+                    d.key_heads as u32,
+                    d.key_dim as u32,
+                    d.value_heads as u32,
+                    d.value_dim as u32,
+                    d.conv_dim() as u32,
+                    (d.conv_kernel - 1) as u32,
+                ],
+                packed: [&w.qkv, &w.z, &w.b, &w.a, &w.out],
+                plain: [
+                    &w.conv_taps,
+                    &w.conv_last,
+                    &w.neg_exp_a_log,
+                    &w.dt_bias,
+                    &w.norm,
+                ],
+                qk_eps: &ctx.consts.qk_eps,
+                sqrt_kd: &ctx.consts.sqrt_kd,
+                in_norm: &layer.input_norm,
+                post_norm: &layer.post_norm,
+                router_t: &moe_w.router_t,
+                shared: [&moe_w.shared_gate, &moe_w.shared_up, &moe_w.shared_down],
+                shared_scalar_t: &moe_w.shared_scalar_t,
+                stacks: [&moe_w.gate_up, &moe_w.down],
+                hidden: shape.hidden as u32,
+                experts: shape.moe.experts as u32,
+                top_k: shape.moe.top_k as u32,
+                renorm: shape.moe.renorm,
+                eps: shape.eps,
+                act: ctx.consts.act,
+            })?;
+            h = s.out;
+            healths.push(s.health);
+            layers.push(LayerState::Delta {
+                rec: s.rec,
+                ring: s.ring,
+            });
+            check_dtype("compiled layer output", &h, ctx.consts.act)?;
+            continue;
+        } // B1v2 (`Q36_COMPILED_LAYER=1`): one ATTN-mixer layer runs as TWO compiled closures -
         // PRE (the input norm, the q/k/v projections, the q/k head norms, the gate slice) and
         // POST (the composite gate chain, the output projection, the mixer residual, and the
         // folded device-routed MoE rows sequence) - with the eager window attention middle
@@ -421,12 +418,13 @@ fn run(
             && shape.attn.heads_q == 16
             && shape.attn.heads_kv == 2
             && shape.attn.head_dim == 256
-        {
-            if let (RMixer::Attn(w), LayerState::Attn(cache), RFeedForward::Moe(moe_w)) =
+            && let (RMixer::Attn(w), LayerState::Attn(cache), RFeedForward::Moe(moe_w)) =
                 (&layer.mixer, &old_layer, &layer.feed_forward)
-            {
-                let a = &shape.attn;
-                let pre = ctx.kernels.compiled_attn_pre_layer(&CompileAttnPreLayerArgs {
+        {
+            let a = &shape.attn;
+            let pre = ctx
+                .kernels
+                .compiled_attn_pre_layer(&CompileAttnPreLayerArgs {
                     x: &h,
                     in_norm: &layer.input_norm,
                     packed: [&w.q, &w.k, &w.v],
@@ -438,18 +436,20 @@ fn run(
                     eps: shape.eps,
                     act: ctx.consts.act,
                 })?;
-                let (att, cache) = attn::chunk_core(
-                    &mut ctx,
-                    shape,
-                    cache.share(),
-                    pos,
-                    rows,
-                    &pre.q,
-                    &pre.k,
-                    &pre.v,
-                    None,
-                )?;
-                let post = ctx.kernels.compiled_attn_post_layer(&CompileAttnPostLayerArgs {
+            let (att, cache) = attn::chunk_core(
+                &mut ctx,
+                shape,
+                cache.share(),
+                pos,
+                rows,
+                &pre.q,
+                &pre.k,
+                &pre.v,
+                None,
+            )?;
+            let post = ctx
+                .kernels
+                .compiled_attn_post_layer(&CompileAttnPostLayerArgs {
                     att: &att,
                     gate: &pre.gate,
                     h: &h,
@@ -468,12 +468,11 @@ fn run(
                     eps: shape.eps,
                     act: ctx.consts.act,
                 })?;
-                h = post.out;
-                healths.push(post.health);
-                layers.push(LayerState::Attn(cache));
-                check_dtype("compiled attn layer output", &h, ctx.consts.act)?;
-                continue;
-            }
+            h = post.out;
+            healths.push(post.health);
+            layers.push(LayerState::Attn(cache));
+            check_dtype("compiled attn layer output", &h, ctx.consts.act)?;
+            continue;
         }
         let normed = ctx.kernels.rms_norm(&h, &layer.input_norm, shape.eps)?;
         // The same dtype guard as the decode step. MLX promotes mixed operands,

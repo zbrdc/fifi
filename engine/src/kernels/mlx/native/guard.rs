@@ -46,7 +46,8 @@ pub(crate) fn dispatch_count() -> u64 {
     DISPATCHES.with(Cell::get)
 }
 
-/// Zeroes the thread's native-call count (the window-tap probe).
+/// Zeroes the thread's native-call count (the parity oracle's op-count asserts).
+#[cfg(test)]
 pub(crate) fn reset_dispatch_count() {
     DISPATCHES.with(|count| count.set(0));
 }

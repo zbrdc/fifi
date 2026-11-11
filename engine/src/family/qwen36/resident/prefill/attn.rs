@@ -146,6 +146,7 @@ pub(super) fn chunk_sliced(
 /// `q`, `k_new`, and `v_new` arrive normed and batched (`[1, heads, rows, width]` and
 /// `[1, kv_heads, rows, width]`), unroped; returns the attention core output
 /// `[1, heads, rows, width]` and the grown cache.
+#[allow(clippy::too_many_arguments)] // the seam mirrors attn::chunk's parameter set; a struct would obscure the eager/compiled symmetry
 pub(super) fn chunk_core(
     ctx: &mut Ctx<'_>,
     shape: &HostShape,

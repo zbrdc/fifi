@@ -1412,24 +1412,21 @@ impl Context {
                 "compiled attention pre layer needs heads >= kv_heads >= 1 and width >= 1".into(),
             ));
         }
-        let pair = args
-            .width
-            .checked_mul(2)
-            .ok_or_else(|| EngError::BadRequest("compiled attention pre layer width overflows".into()))?;
-        let q_out = args
-            .heads
-            .checked_mul(pair)
-            .ok_or_else(|| EngError::BadRequest("compiled attention pre layer dims overflow".into()))?;
-        let kv_out = args
-            .kv_heads
-            .checked_mul(args.width)
-            .ok_or_else(|| EngError::BadRequest("compiled attention pre layer dims overflow".into()))?;
+        let pair = args.width.checked_mul(2).ok_or_else(|| {
+            EngError::BadRequest("compiled attention pre layer width overflows".into())
+        })?;
+        let q_out = args.heads.checked_mul(pair).ok_or_else(|| {
+            EngError::BadRequest("compiled attention pre layer dims overflow".into())
+        })?;
+        let kv_out = args.kv_heads.checked_mul(args.width).ok_or_else(|| {
+            EngError::BadRequest("compiled attention pre layer dims overflow".into())
+        })?;
         let &[rows, hidden] = args.x.shape() else {
             return Err(EngError::BadRequest(
                 "compiled attention pre layer input must be [T, H]".into(),
             ));
         };
-        if rows < 2 || rows > 1024 || hidden != args.hidden {
+        if !(2..=1024).contains(&rows) || hidden != args.hidden {
             return Err(EngError::BadRequest(
                 "compiled attention pre layer needs 2..=1024 rows of the hidden width".into(),
             ));
@@ -1455,7 +1452,14 @@ impl Context {
                 )));
             }
         }
-        check_block_inputs(label, adapter, args.x, args.act, &[], args.packed.as_slice())?;
+        check_block_inputs(
+            label,
+            adapter,
+            args.x,
+            args.act,
+            &[],
+            args.packed.as_slice(),
+        )?;
         check_norm_operand(label, adapter, args.in_norm, hidden, args.act)?;
         let triples: Vec<[i32; 3]> = args
             .packed
@@ -1540,7 +1544,9 @@ impl Context {
         // All four outputs carry the activation dtype.
         let q_bytes =
             u64::from(args.heads) * u64::from(rows) * u64::from(args.width) * args.act.byte_width();
-        let kv_bytes = u64::from(args.kv_heads) * u64::from(rows) * u64::from(args.width)
+        let kv_bytes = u64::from(args.kv_heads)
+            * u64::from(rows)
+            * u64::from(args.width)
             * args.act.byte_width();
         let gate_bytes =
             u64::from(rows) * u64::from(args.heads) * u64::from(args.width) * args.act.byte_width();
@@ -1558,7 +1564,12 @@ impl Context {
                     args.act,
                     kv_bytes,
                 )
-                && native_output_valid(gate_a.0, &[rows, args.heads, args.width], args.act, gate_bytes)
+                && native_output_valid(
+                    gate_a.0,
+                    &[rows, args.heads, args.width],
+                    args.act,
+                    gate_bytes,
+                )
             {
                 Ok(())
             } else {
@@ -1571,10 +1582,30 @@ impl Context {
         checked?;
         drop(keep);
         Ok(CompiledAttnPreLayer {
-            q: adapter.resident(q_a, args.act, vec![1, args.heads, rows, args.width], q_bytes),
-            k: adapter.resident(k_a, args.act, vec![1, args.kv_heads, rows, args.width], kv_bytes),
-            v: adapter.resident(v_a, args.act, vec![1, args.kv_heads, rows, args.width], kv_bytes),
-            gate: adapter.resident(gate_a, args.act, vec![rows, args.heads, args.width], gate_bytes),
+            q: adapter.resident(
+                q_a,
+                args.act,
+                vec![1, args.heads, rows, args.width],
+                q_bytes,
+            ),
+            k: adapter.resident(
+                k_a,
+                args.act,
+                vec![1, args.kv_heads, rows, args.width],
+                kv_bytes,
+            ),
+            v: adapter.resident(
+                v_a,
+                args.act,
+                vec![1, args.kv_heads, rows, args.width],
+                kv_bytes,
+            ),
+            gate: adapter.resident(
+                gate_a,
+                args.act,
+                vec![rows, args.heads, args.width],
+                gate_bytes,
+            ),
         })
     }
 
@@ -1607,10 +1638,9 @@ impl Context {
                 "compiled attention post layer needs heads, width, experts, top_k >= 1".into(),
             ));
         }
-        let o_out = args
-            .heads
-            .checked_mul(args.width)
-            .ok_or_else(|| EngError::BadRequest("compiled attention post layer dims overflow".into()))?;
+        let o_out = args.heads.checked_mul(args.width).ok_or_else(|| {
+            EngError::BadRequest("compiled attention post layer dims overflow".into())
+        })?;
         let rows = match args.att.shape() {
             &[1, heads, r, width] if heads == args.heads && width == args.width => r,
             _ => {
@@ -1619,7 +1649,7 @@ impl Context {
                 ));
             }
         };
-        if rows < 2 || rows > 1024 {
+        if !(2..=1024).contains(&rows) {
             return Err(EngError::BadRequest(
                 "compiled attention post layer needs 2..=1024 rows".into(),
             ));
@@ -1696,7 +1726,7 @@ impl Context {
             .map(|tensor| tensor.share())
             .collect();
         let mut inputs: Vec<ffi::mlx_array> = Vec::with_capacity(24);
-        let mut push_triple = |inputs: &mut Vec<ffi::mlx_array>, weight: &ResidentPackedWeight| {
+        let push_triple = |inputs: &mut Vec<ffi::mlx_array>, weight: &ResidentPackedWeight| {
             inputs.push(weight.payload().storage.native_array());
             inputs.push(weight.scales().storage.native_array());
             inputs.push(
