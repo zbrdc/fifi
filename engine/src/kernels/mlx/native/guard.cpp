@@ -3406,6 +3406,117 @@ static int compile_attn_pre_body(
   return status != 0 ? status : release;
 }
 
+// The window (T >= 2) variant of the attention pre block above: the same folded input
+// norm, projections, and q/k norms, at `T` rows read from x's shape (one fun_id, the
+// nonshapeless cache specializes T). Two deliberate differences from the T=1 body, both
+// mirroring `prefill/attn.rs` `chunk_sliced` exactly: the q/k/v tensors take the
+// `[T, heads, width] -> transpose -> [1, heads, T, width]` route (at T=1 the transpose is
+// identity, which is why the decode body omits it), and the gate slice stays 3-D
+// `[T, heads, width]`. Rope, the cache-dtype casts, the append, and the attention core stay
+// OUTSIDE (rope's offset and the core's len are host ints that must not bake into the
+// trace); the post block below picks up after them.
+// 13 inputs, the same order as the decode pre; 4 outputs: q [1,heads,T,width],
+// k [1,kv_heads,T,width], v [1,kv_heads,T,width] (all pre-rope, activation dtype),
+// gate [T,heads,width].
+struct CompileAttnPreLayerPayload {
+  int hidden;
+  int heads, kv_heads, width;
+  float eps;
+  mlx_stream stream;
+  int mode[3];   // q, k, v projections
+  int group[3];
+  int bits[3];
+};
+
+static void compile_attn_pre_layer_payload_free(void* raw) noexcept {
+  CompileAttnPreLayerPayload* payload = static_cast<CompileAttnPreLayerPayload*>(raw);
+  if (payload != nullptr) {
+    mlx_stream_free(payload->stream);
+    std::free(payload);
+  }
+}
+
+static int compile_attn_pre_layer_body(
+    mlx_vector_array* res, const mlx_vector_array input, void* raw) noexcept {
+  const CompileAttnPreLayerPayload* p = static_cast<const CompileAttnPreLayerPayload*>(raw);
+  compile_touching("attn pre layer closure input vector");
+  if (p == nullptr || res == nullptr || mlx_vector_array_size(input) != 13) {
+    return 1;
+  }
+  compile_touching("attn pre layer closure input element");
+  CompileScopeInputs in;
+  for (; in.count < 13; ++in.count) {
+    if (mlx_vector_array_get(&in.values[in.count], input, in.count) != 0) {
+      return 1;
+    }
+  }
+  const int* x_shape = mlx_array_shape(in.values[0]);
+  if (mlx_array_ndim(in.values[0]) != 2 || x_shape == nullptr || x_shape[0] < 2 ||
+      x_shape[0] > 1024 || x_shape[1] != p->hidden) {
+    return 1;
+  }
+  const int rows = x_shape[0];
+  mlx_vector_array results = mlx_vector_array_new();
+  if (results.ctx == nullptr) return 1;
+  const mlx_stream s = p->stream;
+  const int pair = p->width * 2;
+  const int rows_heads_pair[3] = {rows, p->heads, pair};
+  const int rows_heads_width[3] = {rows, p->heads, p->width};
+  const int rows_kv_width[3] = {rows, p->kv_heads, p->width};
+  const int q4_shape[4] = {1, p->heads, rows, p->width};
+  const int k4_shape[4] = {1, p->kv_heads, rows, p->width};
+  const int q_start[3] = {0, 0, 0};
+  const int q_stop[3] = {rows, p->heads, p->width};
+  const int gate_start[3] = {0, 0, p->width};
+  const int gate_stop[3] = {rows, p->heads, pair};
+  const int strides3[3] = {1, 1, 1};
+  const int swap_heads[3] = {1, 0, 2};
+  CompileScopeArray x_normed, q_full, k_full, v_full, qp, q_raw, gate, q_normed, kp, k_normed;
+  CompileScopeArray q4, k4, v4, transposed, v3;
+  int status = inference_mlx_rms_norm(&x_normed.value, in.values[0], in.values[12], p->eps, s);
+  // x_normed is already [T, hidden]; the projections read it exactly as the eager chunk
+  // reads the normed tensor (no flatten needed).
+  if (status == 0)
+    status = inference_mlx_quantized_matmul(
+        &q_full.value, x_normed.value, in.values[1], in.values[2], in.values[3], true,
+        compile_quant_optional(p->group[0]), compile_quant_optional(p->bits[0]),
+        compile_quant_mode(p->mode[0]), s);
+  if (status == 0)
+    status = inference_mlx_quantized_matmul(
+        &k_full.value, x_normed.value, in.values[4], in.values[5], in.values[6], true,
+        compile_quant_optional(p->group[1]), compile_quant_optional(p->bits[1]),
+        compile_quant_mode(p->mode[1]), s);
+  if (status == 0)
+    status = inference_mlx_quantized_matmul(
+        &v_full.value, x_normed.value, in.values[7], in.values[8], in.values[9], true,
+        compile_quant_optional(p->group[2]), compile_quant_optional(p->bits[2]),
+        compile_quant_mode(p->mode[2]), s);
+  if (status == 0) status = inference_mlx_reshape(&qp.value, q_full.value, rows_heads_pair, 3, s);
+  if (status == 0)
+    status = inference_mlx_slice(&q_raw.value, qp.value, q_start, q_stop, strides3, 3, s);
+  if (status == 0)
+    status = inference_mlx_slice(&gate.value, qp.value, gate_start, gate_stop, strides3, 3, s);
+  if (status == 0) status = inference_mlx_rms_norm(&q_normed.value, q_raw.value, in.values[10], p->eps, s);
+  if (status == 0) status = inference_mlx_reshape(&kp.value, k_full.value, rows_kv_width, 3, s);
+  if (status == 0) status = inference_mlx_rms_norm(&k_normed.value, kp.value, in.values[11], p->eps, s);
+  if (status == 0) status = inference_mlx_transpose_axes(&transposed.value, q_normed.value, swap_heads, 3, s);
+  if (status == 0) status = inference_mlx_reshape(&q4.value, transposed.value, q4_shape, 4, s);
+  if (status == 0) status = inference_mlx_transpose_axes(&transposed.value, k_normed.value, swap_heads, 3, s);
+  if (status == 0) status = inference_mlx_reshape(&k4.value, transposed.value, k4_shape, 4, s);
+  if (status == 0) status = inference_mlx_reshape(&v3.value, v_full.value, rows_kv_width, 3, s);
+  if (status == 0) status = inference_mlx_transpose_axes(&transposed.value, v3.value, swap_heads, 3, s);
+  if (status == 0) status = inference_mlx_reshape(&v4.value, transposed.value, k4_shape, 4, s);
+  compile_touching("attn pre layer body output vector");
+  if (status == 0) status = mlx_vector_array_append_value(results, q4.value);
+  if (status == 0) status = mlx_vector_array_append_value(results, k4.value);
+  if (status == 0) status = mlx_vector_array_append_value(results, v4.value);
+  if (status == 0) status = mlx_vector_array_append_value(results, gate.value);
+  compile_touching("attn pre layer closure result vector");
+  if (status == 0) status = mlx_vector_array_set(res, results);
+  const int release = mlx_vector_array_free(results);
+  return status != 0 ? status : release;
+}
+
 // Builds a payload closure, compiles it under the fixed cache key `fun_id` (shapeless false),
 // applies it to `inputs`, checks the output count, extracts the outputs, and frees every handle
 // on every path. `outputs` holds the extracted arrays when the status is zero.
@@ -3543,6 +3654,48 @@ extern "C" int inference_mlx_compile_attn_pre_block(
     const int status = compile_apply_block(
         outputs, 4, compile_attn_pre_body, payload, compile_attn_pre_payload_free, inputs,
         inputs_num, fun_id);
+    *q = outputs[0];
+    *k = outputs[1];
+    *v = outputs[2];
+    *gate = outputs[3];
+    return status;
+  });
+}
+
+// The window wrapper of the pre body above: the same 13-input contract and dims/quant
+// layout as the decode block, but the body accepts any T in [2,1024] from x's shape.
+extern "C" int inference_mlx_compile_attn_pre_layer_block(
+    mlx_array* q, mlx_array* k, mlx_array* v, mlx_array* gate, const mlx_array* inputs,
+    size_t inputs_num, const int* dims, const int* quant, float eps, mlx_dtype activation,
+    uintptr_t fun_id, mlx_stream stream) noexcept {
+  return run_selected_operation(q, stream, [&]() noexcept {
+    (void)activation;
+    if (inputs_num != 13) return 1;
+    CompileAttnPreLayerPayload* payload =
+        static_cast<CompileAttnPreLayerPayload*>(std::malloc(sizeof(CompileAttnPreLayerPayload)));
+    if (payload == nullptr) {
+      return 1;
+    }
+    payload->hidden = dims[0];
+    payload->heads = dims[1];
+    payload->kv_heads = dims[2];
+    payload->width = dims[3];
+    payload->eps = eps;
+    payload->stream = stream;
+    int stream_status = compile_copy_stream(&payload->stream, stream);
+    if (stream_status != 0) {
+      std::free(payload);
+      return stream_status;
+    }
+    for (int i = 0; i < 3; ++i) {
+      payload->mode[i] = quant[3 * i];
+      payload->group[i] = quant[3 * i + 1];
+      payload->bits[i] = quant[3 * i + 2];
+    }
+    mlx_array outputs[4] = {{nullptr}, {nullptr}, {nullptr}, {nullptr}};
+    const int status = compile_apply_block(
+        outputs, 4, compile_attn_pre_layer_body, payload, compile_attn_pre_layer_payload_free,
+        inputs, inputs_num, fun_id);
     *q = outputs[0];
     *k = outputs[1];
     *v = outputs[2];
