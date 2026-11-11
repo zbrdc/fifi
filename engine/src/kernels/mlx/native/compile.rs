@@ -487,10 +487,10 @@ fn native_dim(label: &'static str, value: u32) -> Result<i32, EngError> {
 /// The native attention post-layer body's fixed input order, one tag per caller input.
 /// The wrapper (`Context::compiled_attn_post_layer`) builds its inputs as (tag, array)
 /// pairs and asserts the pushed tag sequence against this list before the native call,
-/// and the pure test below pins every position against the native index map, so the
-/// Rust push order and that map cannot drift apart: a swapped push fails the assert at
-/// every call. The test compiles wherever this module does (macOS aarch64 with
-/// native-mlx), not on other hosts.
+/// which catches a reordered or missing push (it does not check that a tag labels the
+/// right array). The pure test below pins this list against the native index map, so a
+/// hand-edit of either side is caught there. The test compiles wherever this module
+/// does (macOS aarch64 with native-mlx), not on other hosts.
 pub(in crate::kernels::mlx) fn attn_post_layer_input_tags() -> [&'static str; 24] {
     [
         "att",
@@ -1763,19 +1763,19 @@ impl Context {
             .collect();
         // The native body reads its caller inputs at fixed indices (the index map of
         // guard.cpp). The wrapper builds its inputs as (tag, array) pairs and splits them
-        // only after asserting the tag sequence against [`attn_post_layer_input_tags`],
-        // so a swapped push fails HERE - at every call, debug or release - instead of
-        // feeding the native body reordered operands. The pure test pins the contract
-        // list itself against the index map.
+        // only after asserting the tag sequence against [`attn_post_layer_input_tags`]:
+        // the assert catches a reordered or missing push at every call; it does not check
+        // that a tag labels the right array. The pure test pins the contract list itself
+        // against the native index map.
         let mut inputs: Vec<(&'static str, ffi::mlx_array)> = Vec::with_capacity(24);
-        let mut push = |inputs: &mut Vec<(&'static str, ffi::mlx_array)>,
-                        tag: &'static str,
-                        array: ffi::mlx_array| {
+        let push = |inputs: &mut Vec<(&'static str, ffi::mlx_array)>,
+                    tag: &'static str,
+                    array: ffi::mlx_array| {
             inputs.push((tag, array));
         };
-        let mut push_triple = |inputs: &mut Vec<(&'static str, ffi::mlx_array)>,
-                               weight: &ResidentPackedWeight,
-                               tags: [&'static str; 3]| {
+        let push_triple = |inputs: &mut Vec<(&'static str, ffi::mlx_array)>,
+                           weight: &ResidentPackedWeight,
+                           tags: [&'static str; 3]| {
             push(inputs, tags[0], weight.payload().storage.native_array());
             push(inputs, tags[1], weight.scales().storage.native_array());
             let biases = weight
@@ -2602,7 +2602,7 @@ impl Context {
 mod attn_post_layer_input_order {
     /// The tag contract: the wrapper pushes exactly these 24 entries in this order, and the
     /// native body reads them at exactly these indices (guard.cpp maps 0=att, 1=gate, 2=h,
-    /// 3..5 the o_proj triple, 6 post_norm, 7 router_t, 8..17 the three shared triples,
+    /// 3..6 the o_proj triple, 6 post_norm, 7 router_t, 8..17 the three shared triples,
     /// 17 the shared scalar, 18..24 the two stack triples, 24/25 the appended lhs pair).
     #[test]
     fn positions_match_the_native_body_index_map() {

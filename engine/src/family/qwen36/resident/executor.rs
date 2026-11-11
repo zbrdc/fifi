@@ -302,27 +302,29 @@ fn window_taps_on() -> bool {
     std::env::var_os("Q36_WINDOW_TAPS").is_some_and(|v| v == "1")
 }
 
-/// Arms the compiled whole-layer chunk closures (`Q36_COMPILED_LAYER=1`): a chunk window
-/// of the device-routed prefill runs each DELTA-mixer layer AND each window-attention
-/// layer as ONE `mlx_compile`d closure instead of the eager entry storm. The delta
-/// closure covers the input norm, mixer, both residual adds and the folded MoE rows
-/// sequence (~395 eager native entries replaced); the attention closures cover a PRE
-/// body (projections, q/k norms, gate slice) and a POST body (o_proj, mixer residual,
-/// the same folded MoE rows sequence). The attention closures additionally require
-/// `fused_prefill_enabled`, so the fused-prefill kill switch disarms them. Inside a
-/// closure the per-block eager health evaluation is skipped: one end-of-closure health
-/// vector covers the whole layer. Default off; the eager chunk stays the reference and
-/// the parity oracle. Known limit while off (it blocks a default flip, not the flag):
-/// the window-attention path pays one extra `cache.share` KV copy per layer for the
-/// eager middle, and the BF16 cache form is excluded from the closures' coverage.
-///
 /// The test override exists because edition 2024 makes `set_var` unsafe and the crate denies
 /// `unsafe_code`: the parity test flips the AtomicBool instead of the environment, inside the
-/// native test lock, and a production build reads the variable alone.
+/// native test lock, and a production build reads the variable alone. See [`compiled_layer_on`]
+/// for what the flag arms.
 #[cfg(test)]
 pub(super) static COMPILED_LAYER_TEST: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(false);
 
+/// Arms the compiled whole-layer chunk closures (`Q36_COMPILED_LAYER=1`): the eligible
+/// layers of a device-routed chunk window with 2 to 15 rows (outside that row window,
+/// `Record` mode, host routing, and the last layer of a `Prompt` chunk stay eager) run
+/// as ONE `mlx_compile`d closure instead of the eager entry storm. A DELTA-mixer layer
+/// with a device-routed MoE becomes one closure (input norm, mixer, both residual adds
+/// and the folded MoE rows sequence); an attention layer becomes a PRE body (input norm,
+/// projections, q/k norms, gate slice) and a POST body (o_proj, mixer residual, the same
+/// folded MoE rows sequence). Both families require `fused_prefill_enabled`, so the
+/// fused-prefill kill switch disarms them together; production dims gate each body.
+/// A closure layer takes no per-layer output `evaluate` (the `EVAL_CADENCE` cadence of
+/// the eager chunk); its one health vector per closure joins the chunk-end stack like
+/// an eager layer's. Default off; the eager chunk stays the reference and the parity
+/// oracle. Known limit while off (it blocks a default flip, not the flag): the
+/// window-attention path pays one extra `cache.share` KV copy per layer for the eager
+/// middle, and the BF16 cache form is excluded from the attention closures' coverage.
 pub(super) fn compiled_layer_on() -> bool {
     #[cfg(test)]
     if COMPILED_LAYER_TEST.load(std::sync::atomic::Ordering::Relaxed) {
