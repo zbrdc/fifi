@@ -497,7 +497,7 @@ pub(in crate::kernels::cuda) fn copy_h2d_pageable(
             &mut stage,
         )
     };
-    complete_pageable_copy(host, stream, checked(status, stage))
+    complete_pageable_copy(host, stream, checked(status, stage), true)
 }
 
 /// Enqueues a pageable-host slice into a device range behind earlier work on `stream` and
@@ -602,20 +602,28 @@ pub(in crate::kernels::cuda) fn copy_d2h_pageable(
             &mut stage,
         )
     };
-    complete_pageable_copy(host, stream, checked(status, stage))
+    complete_pageable_copy(host, stream, checked(status, stage), false)
 }
 
 fn complete_pageable_copy(
     host: Vec<u8>,
     stream: &RawStream,
     copy: Result<(), DeviceFailure>,
+    upload: bool,
 ) -> Result<Vec<u8>, DeviceFailure> {
-    match stream_synchronize(stream) {
+    // The wait is the host block this function exists to prove; its cost is charged to the
+    // page-io counters so the phase profile can split upload waits from readback waits.
+    let wait = std::time::Instant::now();
+    let done = stream_synchronize(stream);
+    let blocked_ns = wait.elapsed().as_nanos() as u64;
+    match done {
         Ok(()) => {
+            crate::kernels::page_io_block::note(upload, blocked_ns);
             copy?;
             Ok(host)
         }
         Err(completion) => {
+            crate::kernels::page_io_block::note(upload, blocked_ns);
             #[cfg(all(test, feature = "cuda-fault-qualification"))]
             RETAINED_PAGEABLE_BYTES.fetch_add(host.capacity(), std::sync::atomic::Ordering::AcqRel);
             // Unknown completion cannot release host storage, even when copy failed first.

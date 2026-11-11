@@ -44,8 +44,10 @@ pub(in crate::family::flash_next) mod prof {
 
     /// The phases of `queue` plus the inside of one layer, in call order. Slots 22-27 walk the
     /// interior of the ring rows-block, which the one-row block's taps (slots 11-13) never
-    /// reach: the ring issues no admit and no miss pass.
-    pub(super) const NAMES: [&str; 34] = [
+    /// reach: the ring issues no admit and no miss pass. Slots 34-42 are the host time blocked
+    /// inside the page-io waits of the routing path (`write_at`/`read_at` sync), per site —
+    /// the split the upload-form decision needs.
+    pub(super) const NAMES: [&str; 43] = [
         "begin(host feeds)",
         "start writes",
         "layers<PLE",
@@ -80,17 +82,45 @@ pub(in crate::family::flash_next) mod prof {
         "  rows shared+combine",
         "  rows dirty sync+step",
         "  rows miss+clean tails",
+        "blk step slot_row up",
+        "blk step log readback",
+        "blk step miss uploads",
+        "blk route picks readback",
+        "blk rows admit slot_row up",
+        "blk rows tail uploads",
+        "blk ring weights up",
+        "blk ring wait_layer",
+        "blk filler readback",
     ];
-    pub(super) static NS: [AtomicU64; 34] = [const { AtomicU64::new(0) }; 34];
+    pub(super) static NS: [AtomicU64; 43] = [const { AtomicU64::new(0) }; 43];
     pub(super) static ROWS: AtomicU64 = AtomicU64::new(0);
     static ON: OnceLock<bool> = OnceLock::new();
 
     pub(in crate::family::flash_next) fn on() -> bool {
-        *ON.get_or_init(|| std::env::var("INFERENCE_FLASH_NEXT_PROFILE").is_ok_and(|v| v != "0"))
+        *ON.get_or_init(|| {
+            let on = std::env::var("INFERENCE_FLASH_NEXT_PROFILE").is_ok_and(|v| v != "0");
+            crate::kernels::page_io_block::arm();
+            on
+        })
     }
 
     pub(in crate::family::flash_next) fn add(slot: usize, spent: std::time::Duration) {
         NS[slot].fetch_add(spent.as_nanos() as u64, AtomicOrdering::Relaxed);
+    }
+
+    /// Runs `f`, charging its wall time to `slot` when the profile is on: the page-io
+    /// sites time a call whose internals block on the stream, so the charge is the block.
+    pub(in crate::family::flash_next) fn blocked<R>(
+        slot: usize,
+        on: bool,
+        f: impl FnOnce() -> Result<R>,
+    ) -> Result<R> {
+        let started = on.then(std::time::Instant::now);
+        let spent = f();
+        if let Some(started) = started {
+            add(slot, started.elapsed());
+        }
+        spent
     }
 
     /// Prints one line per phase and resets; call once per prompt, after its sampling row.
@@ -112,6 +142,13 @@ pub(in crate::family::flash_next) mod prof {
             "flash-next chunk profile: {total_rows} rows, phases sum {:.1} s",
             sum as f64 / 1e9
         );
+        if let Some((up, down)) = crate::kernels::page_io_block::take() {
+            eprintln!(
+                "flash-next chunk profile: page-io blocked: uploads {:.0} ms, readbacks {:.0} ms",
+                up as f64 / 1e6,
+                down as f64 / 1e6
+            );
+        }
         for n in &NS {
             n.store(0, AtomicOrdering::Relaxed);
         }

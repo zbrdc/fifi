@@ -44,6 +44,8 @@
 use std::ops::Range;
 
 use super::bank::miss_pass_inputs;
+#[cfg(all(feature = "native-cuda", target_os = "linux"))]
+use crate::family::flash_next::cuda::driver::chunk::prof;
 use crate::{
     EngError,
     family::{
@@ -346,7 +348,7 @@ mod device {
     use super::super::step_plan::MAX_STEP_ROWS;
     use super::{
         CTRL_BYTES, F32, I32, LOG_ENTRY, REQUEST_BYTES, ScratchLayout, SlotSpans, classify_picks,
-        first_poisoned_filler, parse_log, pick_union, plan_second_pass, refuse,
+        first_poisoned_filler, parse_log, pick_union, plan_second_pass, prof, refuse,
     };
     use crate::{
         EngError,
@@ -715,13 +717,16 @@ mod device {
             let (ctx, stream) = (launch.ctx, launch.stream);
             let sc = self.layout;
             let (h, k) = (dims.hidden, dims.top_k);
+            let profile = crate::family::flash_next::cuda::driver::chunk::prof::on();
             let slot_row_before: Vec<i32> = self.bank.slot_row(layer)?.to_vec();
             let scratch = &self.scratch;
             let slot_ids = scratch.range(sc.slot_ids, k * I32)?;
             let slot_weights = scratch.range(sc.weights, k * F32)?;
             let partial = scratch.range(sc.partial, h * F32)?;
 
-            scratch.write_at(stream, sc.slot_row, &le_i32(&slot_row_before))?;
+            prof::blocked(34, profile, || {
+                scratch.write_at(stream, sc.slot_row, &le_i32(&slot_row_before))
+            })?;
             let trunk = &self.trunks[layer];
             ctx.router(
                 stream,
@@ -770,7 +775,7 @@ mod device {
                 },
             )?;
             let mut raw = vec![0u8; k * LOG_ENTRY];
-            scratch.read_at(stream, sc.log, &mut raw)?;
+            prof::blocked(35, profile, || scratch.read_at(stream, sc.log, &mut raw))?;
             let (ids, weights) = parse_log(&raw, k)?;
             let classified = classify_picks(&slot_row_before, geometry.slots, &ids, &weights)?;
 
@@ -804,8 +809,10 @@ mod device {
             let second = plan_second_pass(&ids, &weights, &classified, &slot_row_after)?;
             if let Some((miss_slots, miss_weights)) = second.miss {
                 let scratch = &self.scratch;
-                scratch.write_at(stream, sc.miss_ids, &le_i32(&miss_slots))?;
-                scratch.write_at(stream, sc.miss_weights, &le_f32(&miss_weights))?;
+                prof::blocked(36, profile, || {
+                    scratch.write_at(stream, sc.miss_ids, &le_i32(&miss_slots))?;
+                    scratch.write_at(stream, sc.miss_weights, &le_f32(&miss_weights))
+                })?;
                 self.pass(
                     launch,
                     bufs,
@@ -892,16 +899,20 @@ mod device {
                 },
             )?;
             let mut raw_ids = vec![0u8; m * k * I32];
-            bufs.route
-                .ids
-                .buffer()
-                .read_at(stream, bufs.route.ids.offset(), &mut raw_ids)?;
-            let mut raw_weights = vec![0u8; m * k * F32];
-            bufs.route.weights.buffer().read_at(
-                stream,
-                bufs.route.weights.offset(),
-                &mut raw_weights,
-            )?;
+            let profile = crate::family::flash_next::cuda::driver::chunk::prof::on();
+            let raw_weights = prof::blocked(37, profile, || {
+                bufs.route
+                    .ids
+                    .buffer()
+                    .read_at(stream, bufs.route.ids.offset(), &mut raw_ids)?;
+                let mut raw_weights = vec![0u8; m * k * F32];
+                bufs.route.weights.buffer().read_at(
+                    stream,
+                    bufs.route.weights.offset(),
+                    &mut raw_weights,
+                )?;
+                Ok::<_, EngError>(raw_weights)
+            })?;
             let mut picks: Vec<(Vec<i32>, Vec<f32>)> = Vec::with_capacity(m);
             for r in 0..m {
                 let ids: Vec<i32> = raw_ids[r * k * I32..][..k * I32]
@@ -1023,7 +1034,9 @@ mod device {
             // row of the chunk missed still rides this row's own second pass.
             let slot_row: Vec<i32> = self.bank.slot_row(layer)?.to_vec();
 
-            scratch.write_at(stream, sc.slot_row, &le_i32(&slot_row))?;
+            prof::blocked(38, profile, || {
+                scratch.write_at(stream, sc.slot_row, &le_i32(&slot_row))
+            })?;
             let mut classified = Vec::with_capacity(m);
             for (r, pick) in picks.iter().enumerate() {
                 ctx.tiered_classify(
@@ -1156,11 +1169,13 @@ mod device {
                     break;
                 }
                 if classified[r].misses.is_empty() {
-                    scratch.write_at(
-                        stream,
-                        sc.miss_weights + r * k * F32,
-                        &le_f32(&vec![0.0; k]),
-                    )?;
+                    prof::blocked(39, profile, || {
+                        scratch.write_at(
+                            stream,
+                            sc.miss_weights + r * k * F32,
+                            &le_f32(&vec![0.0; k]),
+                        )
+                    })?;
                     ctx.moe_combine(
                         stream,
                         CombineCall {
@@ -1190,12 +1205,18 @@ mod device {
                     plan_second_pass(&picks[r].0, &picks[r].1, &classified[r], &slot_row_after)?;
                 tick(32);
                 if let Some((miss_slots, miss_weights)) = second.miss {
-                    scratch.write_at(stream, sc.miss_ids + r * k * I32, &le_i32(&miss_slots))?;
-                    scratch.write_at(
-                        stream,
-                        sc.miss_weights + r * k * F32,
-                        &le_f32(&miss_weights),
-                    )?;
+                    prof::blocked(39, profile, || {
+                        scratch.write_at(
+                            stream,
+                            sc.miss_ids + r * k * I32,
+                            &le_i32(&miss_slots),
+                        )?;
+                        scratch.write_at(
+                            stream,
+                            sc.miss_weights + r * k * F32,
+                            &le_f32(&miss_weights),
+                        )
+                    })?;
                     let row_bufs = Self::row_of(bufs, dims, r)?;
                     self.pass(
                         launch,
@@ -1231,12 +1252,15 @@ mod device {
             weights: &[f32],
         ) -> Result<(), EngError> {
             let (h, k) = (dims.hidden, dims.top_k);
+            let profile = crate::family::flash_next::cuda::driver::chunk::prof::on();
             let mut raw = vec![0u8; k * h * F32];
-            bufs.expert_down.buffer().read_at(
-                launch.stream,
-                bufs.expert_down.offset() + r * k * h * F32,
-                &mut raw,
-            )?;
+            prof::blocked(42, profile, || {
+                bufs.expert_down.buffer().read_at(
+                    launch.stream,
+                    bufs.expert_down.offset() + r * k * h * F32,
+                    &mut raw,
+                )
+            })?;
             match first_poisoned_filler(&raw, h, weights) {
                 Some(pick) => Err(refuse(format!(
                     "the filler expert (slot 0) gave a non-finite output on pick {pick}; \
@@ -1339,14 +1363,18 @@ mod device {
                     }
                 }
             }
-            scratch.write_at(stream, sc.weights, &le_f32(&weights))?;
+            prof::blocked(40, profile, || {
+                scratch.write_at(stream, sc.weights, &le_f32(&weights))
+            })?;
             tick(24);
 
             // The compute waits this layer's copies before any job reads a ring slot.
-            self.ring
-                .as_ref()
-                .expect("the ring branch is taken only with a ring")
-                .wait_layer(stream, layer)?;
+            prof::blocked(41, profile, || {
+                self.ring
+                    .as_ref()
+                    .expect("the ring branch is taken only with a ring")
+                    .wait_layer(stream, layer)
+            })?;
             // The routed job table of both passes: the chunk's pairs are sorted per source —
             // the bank's slots and the ring's slots are two member banks. Gate and up read
             // the chunk rows through the first list and write disjoint segments of the
