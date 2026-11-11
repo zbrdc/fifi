@@ -2225,65 +2225,6 @@ pub(in crate::kernels::mlx) fn native_trace_counts() -> (u64, u64, u64) {
 /// entries of the tests before it.
 
 #[cfg(test)]
-mod attn_post_layer_input_order {
-    /// The tag contract: the wrapper pushes exactly these 24 entries in this order, and the
-    /// native body reads them at exactly these indices (guard.cpp maps 0=att, 1=gate, 2=h,
-    /// 3..5 the o_proj triple, 6 post_norm, 7 router_t, 8..16 the three shared triples,
-    /// 16 the shared scalar, 17..23 the two stack triples, 24/25 the appended lhs pair).
-    #[test]
-    fn positions_match_the_native_body_index_map() {
-        let tags = super::attn_post_layer_input_tags();
-        assert_eq!(tags.len(), 24);
-        assert_eq!(tags[0], "att");
-        assert_eq!(tags[1], "gate");
-        assert_eq!(tags[2], "h");
-        assert_eq!(
-            &tags[3..6],
-            ["o_proj.payload", "o_proj.scales", "o_proj.biases"]
-        );
-        assert_eq!(tags[6], "post_norm");
-        assert_eq!(tags[7], "router_t");
-        assert_eq!(
-            &tags[8..11],
-            [
-                "shared_gate.payload",
-                "shared_gate.scales",
-                "shared_gate.biases"
-            ]
-        );
-        assert_eq!(
-            &tags[11..14],
-            ["shared_up.payload", "shared_up.scales", "shared_up.biases"]
-        );
-        assert_eq!(
-            &tags[14..17],
-            [
-                "shared_down.payload",
-                "shared_down.scales",
-                "shared_down.biases"
-            ]
-        );
-        assert_eq!(tags[17], "shared_scalar");
-        assert_eq!(
-            &tags[18..21],
-            [
-                "stack_gate_up.payload",
-                "stack_gate_up.scales",
-                "stack_gate_up.biases"
-            ]
-        );
-        assert_eq!(
-            &tags[21..24],
-            [
-                "stack_down.payload",
-                "stack_down.scales",
-                "stack_down.biases"
-            ]
-        );
-    }
-}
-
-#[cfg(test)]
 pub(in crate::kernels::mlx) fn native_trace_reset() {
     unsafe { ffi::mlx_compile_reset_trace_counts() };
 }
@@ -2593,5 +2534,64 @@ impl Context {
             return Err(failure(label));
         }
         Ok(state.resident(out, act, shape, byte_len))
+    }
+}
+
+#[cfg(test)]
+mod attn_post_layer_input_order {
+    /// The tag contract: the wrapper pushes exactly these 24 entries in this order, and the
+    /// native body reads them at exactly these indices (guard.cpp maps 0=att, 1=gate, 2=h,
+    /// 3..5 the o_proj triple, 6 post_norm, 7 router_t, 8..16 the three shared triples,
+    /// 16 the shared scalar, 17..23 the two stack triples, 24/25 the appended lhs pair).
+    #[test]
+    fn positions_match_the_native_body_index_map() {
+        let tags = super::attn_post_layer_input_tags();
+        assert_eq!(tags.len(), 24);
+        assert_eq!(tags[0], "att");
+        assert_eq!(tags[1], "gate");
+        assert_eq!(tags[2], "h");
+        assert_eq!(
+            &tags[3..6],
+            ["o_proj.payload", "o_proj.scales", "o_proj.biases"]
+        );
+        assert_eq!(tags[6], "post_norm");
+        assert_eq!(tags[7], "router_t");
+        assert_eq!(
+            &tags[8..11],
+            [
+                "shared_gate.payload",
+                "shared_gate.scales",
+                "shared_gate.biases"
+            ]
+        );
+        assert_eq!(
+            &tags[11..14],
+            ["shared_up.payload", "shared_up.scales", "shared_up.biases"]
+        );
+        assert_eq!(
+            &tags[14..17],
+            [
+                "shared_down.payload",
+                "shared_down.scales",
+                "shared_down.biases"
+            ]
+        );
+        assert_eq!(tags[17], "shared_scalar");
+        assert_eq!(
+            &tags[18..21],
+            [
+                "stack_gate_up.payload",
+                "stack_gate_up.scales",
+                "stack_gate_up.biases"
+            ]
+        );
+        assert_eq!(
+            &tags[21..24],
+            [
+                "stack_down.payload",
+                "stack_down.scales",
+                "stack_down.biases"
+            ]
+        );
     }
 }
