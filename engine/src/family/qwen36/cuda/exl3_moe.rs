@@ -970,18 +970,19 @@ mod indexed_step_tests {
     /// a short scratch clamps every chunk, and a degenerate k cannot collapse the step.
     #[test]
     fn the_chunk_step_is_the_capacity_clamped_to_the_scratch_rows() {
-        let row = |n: usize| n * F32;
+        // An `xh` row holds k f32s: `rows` of a k-wide scratch is `rows * k` floats.
+        let rows = |n: usize| n * 2560 * F32;
         // A scratch that holds more rows than every capacity: the capacity rules.
-        assert_eq!(indexed_step(16, row(64), 2560), 16);
-        assert_eq!(indexed_step(20, row(64), 2560), 20);
-        assert_eq!(indexed_step(256, row(64), 2560), 64);
+        assert_eq!(indexed_step(16, rows(64), 2560), 16);
+        assert_eq!(indexed_step(20, rows(64), 2560), 20);
+        assert_eq!(indexed_step(256, rows(64), 2560), 64);
         // A scratch shorter than the capacity: the scratch's row count rules, down to one.
-        assert_eq!(indexed_step(16, row(6), 2560), 6);
-        assert_eq!(indexed_step(20, row(1), 2560), 1);
-        assert_eq!(indexed_step(256, row(0), 2560), 1);
+        assert_eq!(indexed_step(16, rows(6), 2560), 6);
+        assert_eq!(indexed_step(20, rows(1), 2560), 1);
+        assert_eq!(indexed_step(256, rows(0), 2560), 1);
         // A k of zero would divide by zero; the max(1) in the divisor keeps one row per byte
         // budget the scratch allows.
-        assert_eq!(indexed_step(16, row(64), 0), 16);
+        assert_eq!(indexed_step(16, rows(64), 0), 16);
     }
 }
 
