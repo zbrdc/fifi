@@ -1781,8 +1781,7 @@ impl CudaContext {
             };
             return Err(EngError::BadRequest(format!(
                 "EXL3 grouped needs 1..={GROUPED_PAIRS_MAX} pairs in local groups of 1..=8 rows \
-                 (got {} calls, rows {shown}, sum {})",
-                calls.len(),
+                 (rows {shown}, sum {})",
                 rows.iter().sum::<usize>(),
             )));
         }

@@ -523,19 +523,44 @@ fn pick_union_keeps_each_distinct_id_first_use_first() {
 #[test]
 fn slot_spans_fit_a_ring_smaller_than_the_bank_slot_row() {
     let layout = layout();
-    // The bank's own spans and a ring's spans over the SAME layout with FEWER slots: the
-    // per-part ranges must end inside the smaller slot row (start unchanged, end grown by
-    // the last slot's offset), and one slot keeps exactly the one-record base range.
+    let record = layout.record_bytes();
+    // A ring's spans over the SAME layout with FEWER slots, checked against the layout's own
+    // arithmetic - not against `bank_ranges`, which is what `SlotSpans::new` calls: each
+    // part's band starts at its record-0 offset and ends at that offset plus the part's own
+    // bytes plus one record stride per extra slot, so the whole band fits the ring's
+    // `slots * record_bytes` buffer, and a one-slot ring keeps exactly the base record ranges.
     for slots in [1usize, 2, 7, 16] {
         let spans = SlotSpans::new(&layout, slots).unwrap();
         for part in 0..3 {
-            let [trellis, suh, svh] = layout.bank_ranges(part, slots).unwrap();
-            assert_eq!(
-                spans.parts[part].trellis, trellis,
-                "part {part} trellis at {slots}"
-            );
-            assert_eq!(spans.parts[part].suh, suh, "part {part} suh at {slots}");
-            assert_eq!(spans.parts[part].svh, svh, "part {part} svh at {slots}");
+            let base = layout.part(part);
+            let bands = [&base.trellis, &base.suh, &base.svh];
+            let got = [
+                &spans.parts[part].trellis,
+                &spans.parts[part].suh,
+                &spans.parts[part].svh,
+            ];
+            for (band, got) in bands.iter().zip(got) {
+                let (band, got) = (
+                    band as &std::ops::Range<usize>,
+                    got as &std::ops::Range<usize>,
+                );
+                assert_eq!(
+                    got.start, band.start,
+                    "part {part} band start at {slots} slots"
+                );
+                assert_eq!(
+                    got.end,
+                    band.end + (slots - 1) * record,
+                    "part {part} band end at {slots} slots"
+                );
+                assert!(
+                    got.end <= record * slots,
+                    "part {part} band at {slots} slots leaves the ring buffer"
+                );
+                if slots == 1 {
+                    assert_eq!(got, band, "part {part} one-slot ring keeps the base range");
+                }
+            }
         }
     }
     // Zero slots is a refusal, the same one the layout's bank_ranges gives.

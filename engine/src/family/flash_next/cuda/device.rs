@@ -65,6 +65,13 @@ impl CardDevice {
     pub(super) fn bank_misses(&self) -> u64 {
         self.moe.bank().stats().misses
     }
+
+    /// The bank's placement digest ([`bank_placement_digest`]): what a run record's step-0
+    /// logits hash compares at.
+    #[cfg(test)]
+    pub(super) fn placement_digest(&self) -> (u32, String) {
+        bank_placement_digest(&self.moe)
+    }
 }
 
 /// The expert bank's placement state: slots per layer and a SHA-256 over every layer's
@@ -85,15 +92,6 @@ fn bank_placement_digest(moe: &SplitMoeAt<'static>) -> (u32, String) {
         }
     }
     (geometry.slots as u32, format!("{:x}", hasher.finalize()))
-}
-
-impl CardDevice {
-    /// The bank's placement digest (slots per layer, SHA-256 of the residents at load):
-    /// what a run record's step-0 logits hash compares at.
-    #[cfg(test)]
-    pub(super) fn placement_digest(&self) -> Option<(u32, String)> {
-        Some(bank_placement_digest(&self.moe))
-    }
 }
 
 impl StartSink for CardDevice {
@@ -221,8 +219,8 @@ impl CardChunkDevice {
     /// The bank's placement digest (slots per layer, SHA-256 of the residents at load):
     /// what a run record's step-0 logits hash compares at.
     #[cfg(test)]
-    pub(super) fn placement_digest(&self) -> Option<(u32, String)> {
-        Some(bank_placement_digest(&self.moe))
+    pub(super) fn placement_digest(&self) -> (u32, String) {
+        bank_placement_digest(&self.moe)
     }
 }
 

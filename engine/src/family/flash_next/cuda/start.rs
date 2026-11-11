@@ -860,9 +860,9 @@ impl StepDriver {
     }
 
     /// The bank's placement digest (slots per layer, SHA-256 of the resident set at load):
-    /// the state a run record's step-0 logits hash compares at, `None` without a bank.
+    /// the state a run record's step-0 logits hash compares at.
     #[cfg(test)]
-    pub(super) fn placement_digest(&self) -> Option<(u32, String)> {
+    pub(super) fn placement_digest(&self) -> (u32, String) {
         match self {
             Self::Token(driver) => driver.device().placement_digest(),
             Self::Chunk(driver) => driver.device().placement_digest(),

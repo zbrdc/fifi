@@ -22,6 +22,13 @@
 //! Checked: a layer without a miss writes the bytes of the all-resident block; a layer with misses
 //! is within a relative L2 of 1e-6 of it (the sums are associated in two groups, every product is
 //! the same); both are within the block's bound of fp64; the bank holds every pick afterwards.
+//!
+//! The prefill ring has its own tests: `a_chunk_over_the_prefill_ring_matches_the_all_resident_block`
+//! (49 rows over a funded ring, RING_BOUND against the all-resident block and fp64) and
+//! [`each_projection_through_the_jobs_family_and_the_indexed_family_on_one_row`] (the launch-family
+//! A/B behind that bound). `FIFI_FLASH_NEXT_RING_HELD` (test-only, read by the ring test) picks how
+//! many of ROW 0's picks the bank holds — 0 the all-ring arm, 10 the all-bank arm, 6 the default
+//! mix — rows 1.. keep the default split in every arm.
 
 use std::path::PathBuf;
 

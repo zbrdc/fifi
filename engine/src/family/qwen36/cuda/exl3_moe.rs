@@ -332,23 +332,20 @@ pub(in crate::family) struct IndexedPair<'a> {
     pub(in crate::family) out: DeviceRange<'a>,
 }
 
-/// Queues the id-indexed group `pairs`, all of one shape, as consecutive launches of at most
-/// `exl3_indexed_capacity` pairs in group order. Each launch starts again at row 0 of the
-/// scratch; the stream runs it after the previous launch has finished with those rows.
-/// One indexed chunk is at most the launch capacity and at most the rows the scratch's
-/// rotated-input face holds (`k` f32 a row), at least one pair: the caller refuses an empty
-/// pair list before this. The capacity alone is not the bound - the pointer-table option
-/// reports a grid-size capacity that a chunk-sized scratch cannot span, and a 20-pair
-/// capacity needs a 20-row scratch. The clamp reads `xh` only: in every plan of this tree
-/// `z` holds at least as many rows (the step plan sizes it from the same launch list), and
-/// the `m <= layout.rows` guards of the block bind the private scratch, not these faces.
+/// The number of pairs one indexed chunk may hold: the launch capacity clamped to the rows
+/// the scratch's rotated-input face carries, at least one pair (the caller refuses an empty
+/// pair list before this).
 fn indexed_step(capacity: usize, xh_bytes: usize, k: usize) -> usize {
     capacity.min(xh_bytes / (k * F32).max(1)).max(1)
 }
 
 /// Every EXL3 pair of a routed block in indexed launches of at most the capacity: each pair
 /// runs its own row of the scratch (`indexed_launch`), so a chunk is clamped to the rows the
-/// scratch holds ([`indexed_step`]).
+/// scratch holds ([`indexed_step`]). The capacity alone is not the bound - the pointer-table
+/// option reports a grid-size capacity that a chunk-sized scratch cannot span, and a 20-pair
+/// capacity needs a 20-row scratch. The clamp reads `xh` only: in every plan of this tree
+/// `z` holds at least as many rows (the step plan sizes it from the same launch list), and
+/// the `m <= layout.rows` guards of the block bind the private scratch, not these faces.
 pub(in crate::family) fn grouped_indexed(
     launch: &Launch<'_>,
     pairs: &[IndexedPair<'_>],
@@ -358,10 +355,6 @@ pub(in crate::family) fn grouped_indexed(
     if pairs.is_empty() {
         return Err(refuse("an indexed launch without pairs".into()));
     }
-    // Every pair of a chunk takes its own row of the scratch (`indexed_launch`), so a chunk is
-    // at most the rows the scratch holds. The launch capacity alone is not a bound: the
-    // pointer-table option reports a grid-size capacity (FIFI_EXL3_TABLE) that a chunk-sized
-    // scratch cannot span, and a 20-pair capacity needs a 20-row scratch.
     let k = pairs
         .first()
         .map(|pair| pair.span.shape()[0])
@@ -627,7 +620,9 @@ fn shared_row_batches(rows: usize) -> impl Iterator<Item = (usize, usize)> {
 /// `2 r + 1`), so each row's `[gate | up]` is contiguous and ONE `swiglu_rows` over `rows` rows
 /// reads it with `ld_in = 2 s`, `up_off = s`, the layout of the one-row block: no relaxation of the
 /// SwiGLU's validation. Every pair is exactly the one-row computation (a group of one row, the
-/// one-tile wide body). The down projection is one group of `rows` rows, the rows kernel. Two
+/// one-tile wide body). The down projection runs in row-disjoint groups of at most
+/// `GROUPED_MAX_ROWS` rows (the rows kernel's group bound - `ceil(rows / 8)` groups for a
+/// 64-row window, one call at 8 rows or fewer). Two
 /// groups of `rows` rows each (`[gate rows][up rows]`) would land as `[gate K rows][up K rows]`
 /// and need `up_off = K s` with `ld_in = s`, which `valid_shape` refuses.
 ///
@@ -980,8 +975,9 @@ mod indexed_step_tests {
         assert_eq!(indexed_step(16, rows(6), 2560), 6);
         assert_eq!(indexed_step(20, rows(1), 2560), 1);
         assert_eq!(indexed_step(256, rows(0), 2560), 1);
-        // A k of zero would divide by zero; the max(1) in the divisor keeps one row per byte
-        // budget the scratch allows.
+        // A k of zero cannot come from a real span (every part's k is a nonzero multiple of
+        // 128); the max(1) in the divisor still guards the division, and the byte budget
+        // alone decides the step.
         assert_eq!(indexed_step(16, rows(64), 0), 16);
     }
 }

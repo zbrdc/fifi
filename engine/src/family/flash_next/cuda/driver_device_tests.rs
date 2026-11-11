@@ -20,7 +20,10 @@
 //! The `engine.json` record carries `bank_slots` and `resident_sha256` — the load's placement
 //! state. The step-0 logits (and any digest of them) follow that state, not just the binary:
 //! the bank size and the free VRAM at load pick the residents, so two records compare only at
-//! the same digest.
+//! the same digest. The dependence is measured, not assumed: this run is `prefill_rows: 1`
+//! (the token driver, never a chunk driver), and at rows=1 forced placements of 206 and 150
+//! slots produced step-0 hashes 185d3542 and 4fc4e49f on the same binary — placement moves
+//! the logits, which is why the digest travels with every record.
 //!
 //! `teacher_forced_steps_follow_the_oracle_on_every_prompt`: every oracle prompt, fed the oracle's
 //! tokens, in one process.
@@ -451,8 +454,8 @@ fn the_first_real_tokens_match_the_oracle() {
             "schema": "fifi-flash-next-oracle/1", "role": "engine", "prompt": wanted_id,
             "prompt_ids": prompt, "generated": generated, "steps": records,
             "agree_prefix": agree,
-            "bank_slots": placement.as_ref().map(|p| p.0),
-            "resident_sha256": placement.as_ref().map(|p| p.1.clone()),
+            "bank_slots": placement.0,
+            "resident_sha256": placement.1,
         });
         std::fs::write(
             out.join("engine.json"),
@@ -884,6 +887,10 @@ fn write_follow_reports(
 /// Environment: `FIFI_FLASH_NEXT_EXL3_PACK`, `FIFI_FLASH_NEXT_DRIVER_ORACLE`, `_PROMPT` (default
 /// `chat-short`), `_STEPS` (default 64), `_CONTEXT` (default 512), `_OUT`, `_CONFIG` (a label) and
 /// `_ROUND`.
+///
+/// The record also carries the run's bank placement (`bank_slots`, `resident_sha256`) - the
+/// load's residents, named before the run feeds experts - so runs compare hashes only at the
+/// same placement.
 #[test]
 #[ignore = "needs a GPU (about 21 GiB) and the full pack; run by the kernel receipt script"]
 fn single_row_kernel_receipt_run() {
@@ -944,6 +951,10 @@ fn single_row_kernel_receipt_run() {
     };
     let mut driver = build_driver(&|_| {}, &pack, &wanted, actual_vocab, None).expect("driver");
     let kernel = driver.single_row_kernel_name().expect("kernel name");
+    // The placement the run's logits hashes compare at. Read now: the usage profile moves
+    // residents as the run feeds experts, and the driver's drop writes the usage dump after
+    // this; the digest names only the load's placement.
+    let placement = driver.placement_digest();
     let env = |name: &str| std::env::var(name).ok();
     println!(
         "config {config} round {round}: single-row kernel {kernel}; SINGLE_GATHER {:?} DP4A {:?} INDEXED_PAIRS {:?}",
@@ -1028,6 +1039,8 @@ fn single_row_kernel_receipt_run() {
         &path,
         serde_json::to_vec_pretty(&serde_json::json!({
             "config": config, "round": round, "kernel": kernel, "prompt": wanted_id,
+            "bank_slots": placement.0,
+            "resident_sha256": placement.1,
             "env": {"FIFI_EXL3_SINGLE_GATHER": env("FIFI_EXL3_SINGLE_GATHER"),
                     "FIFI_EXL3_DP4A": env("FIFI_EXL3_DP4A"),
                     "FIFI_EXL3_INDEXED_PAIRS": env("FIFI_EXL3_INDEXED_PAIRS")},
