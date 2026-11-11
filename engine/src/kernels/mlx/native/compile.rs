@@ -1696,13 +1696,7 @@ impl Context {
             .map(|tensor| tensor.share())
             .collect();
         let mut inputs: Vec<ffi::mlx_array> = Vec::with_capacity(24);
-        inputs.push(args.att.storage.native_array());
-        inputs.push(args.gate.storage.native_array());
-        inputs.push(args.h.storage.native_array());
-        for weight in std::iter::once(args.packed)
-            .chain(args.shared.iter().copied())
-            .chain(args.stacks.iter().copied())
-        {
+        let mut push_triple = |inputs: &mut Vec<ffi::mlx_array>, weight: &ResidentPackedWeight| {
             inputs.push(weight.payload().storage.native_array());
             inputs.push(weight.scales().storage.native_array());
             inputs.push(
@@ -1711,16 +1705,34 @@ impl Context {
                     .map(|biases| biases.storage.native_array())
                     .unwrap_or(ffi::NULL_ARRAY),
             );
+        };
+        // The native body's fixed input order: att, gate, h, the o_proj triple, the post norm,
+        // the transposed router, the three shared-expert triples, the shared scalar head
+        // weight, then the gate/up stack and down stack triples.
+        inputs.push(args.att.storage.native_array());
+        inputs.push(args.gate.storage.native_array());
+        inputs.push(args.h.storage.native_array());
+        push_triple(&mut inputs, args.packed);
+        inputs.push(args.post_norm.storage.native_array());
+        inputs.push(args.router_t.storage.native_array());
+        for weight in args.shared {
+            push_triple(&mut inputs, weight);
+        }
+        inputs.push(args.shared_scalar_t.storage.native_array());
+        for weight in args.stacks {
+            push_triple(&mut inputs, weight);
+        }
+        debug_assert_eq!(inputs.len(), 24);
+        for weight in std::iter::once(args.packed)
+            .chain(args.shared.iter().copied())
+            .chain(args.stacks.iter().copied())
+        {
             keep.push(weight.payload().share());
             keep.push(weight.scales().share());
             if let Some(biases) = weight.biases() {
                 keep.push(biases.share());
             }
         }
-        inputs.push(args.post_norm.storage.native_array());
-        inputs.push(args.router_t.storage.native_array());
-        inputs.push(args.shared_scalar_t.storage.native_array());
-        debug_assert_eq!(inputs.len(), 24);
         clear_message();
         let stream = adapter.stream.0;
         let (mut out_a, mut health_a) = (Array::null(), Array::null());
