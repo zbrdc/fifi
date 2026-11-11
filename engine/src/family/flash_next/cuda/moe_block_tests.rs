@@ -7,15 +7,19 @@ use super::{
     bank::{BankGeometry, ExpertBankState, HostMode, ReplaceOnMissLru},
     moe_block::{
         PassInputs, ScratchLayout, SlotSpans, classify_picks, first_poisoned_filler, parse_log,
-        pick_union, plan_second_pass, source_offsets, source_plan,
+        pick_union, plan_second_pass,
     },
 };
 use crate::{
     EngError,
-    family::{
-        flash_next::moe::slot_bank::SlotBankLayout,
-        project::{cuda::exl3_jobs::PairPlan, exl3_jobs_plan::EXL3_JOB_WORDS},
-    },
+    family::{flash_next::moe::slot_bank::SlotBankLayout, project::exl3_jobs_plan::EXL3_JOB_WORDS},
+};
+// The planning items sit in the native-cuda device module; the scratch-size tests above run on
+// every host, so only these imports carry the gate.
+#[cfg(all(feature = "native-cuda", target_os = "linux"))]
+use {
+    super::moe_block::{source_offsets, source_plan},
+    crate::family::project::cuda::exl3_jobs::PairPlan,
 };
 
 const EXPERTS: usize = 512;
@@ -196,6 +200,7 @@ fn the_private_scratch_covers_the_widest_chunk_plan() {
 
 /// One source's counting sort: sorted positions map back to the chunk's pair positions, and
 /// a slot id outside the source's slots refuses the chunk.
+#[cfg(all(feature = "native-cuda", target_os = "linux"))]
 #[test]
 fn source_plan_maps_sorted_positions_to_chunk_pairs() {
     // A chunk of 2 rows, top_k 2: pair = row·2 + rank. Pairs 0, 2 and 3 pick bank slots
@@ -228,6 +233,7 @@ fn source_plan_maps_sorted_positions_to_chunk_pairs() {
 
 /// The two sources' lists and job tables pack into the perm region back to back, and their
 /// gate/up segments tile the pair faces in source order.
+#[cfg(all(feature = "native-cuda", target_os = "linux"))]
 #[test]
 fn source_offsets_pack_the_perm_region() {
     // Counts drive the job tables: one job per expert with rows (the 64-row tile never splits
@@ -245,12 +251,12 @@ fn source_offsets_pack_the_perm_region() {
     let (sub_bank, sub_ring) = ([0usize, 1, 2, 3], [4usize, 5]);
     let (at_of, seg_of) = source_offsets(1_000, [&bank, &ring], [&sub_bank, &sub_ring]);
     // Bank: 4 pairs and 2 jobs — (2·4 + 4·2)·4 bytes of lists and table.
-    assert_eq!(at_of, [1_000, 1_000 + (2 * 4 + 4 * 2) * 4]);
+    assert_eq!(at_of, [1_000, 1_000 + (2 * 4 + EXL3_JOB_WORDS * 2) * 4]);
     assert_eq!(seg_of, [0, 4]);
     // Ring: 2 pairs and 1 job; the packing ends inside the perm formula's bound
     // (2 words + one job record a pair over all 6 pairs, 3 jobs).
-    let end = at_of[1] + (2 * 2 + 4 * 1) * 4;
-    assert_eq!(end - 1_000, (2 * 6 + 4 * 3) * 4);
+    let end = at_of[1] + (2 * 2 + EXL3_JOB_WORDS) * 4;
+    assert_eq!(end - 1_000, (2 * 6 + EXL3_JOB_WORDS * 3) * 4);
     assert!(end - 1_000 <= (2 + EXL3_JOB_WORDS) * 6 * 4);
 }
 
