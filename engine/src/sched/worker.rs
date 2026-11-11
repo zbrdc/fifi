@@ -147,7 +147,8 @@ struct Shared {
     running: Mutex<Option<Arc<AtomicBool>>>,
     /// Opt-in window jobs only. The legacy single-slot path never registers here.
     active: Mutex<Vec<ActiveJob>>,
-    /// Jobs submitted but not yet dequeued by the engine thread.
+    /// Jobs being submitted or waiting to be dequeued. In-progress submissions
+    /// are included conservatively, even if the channel later refuses them.
     queued: AtomicUsize,
 }
 
@@ -214,14 +215,38 @@ pub(crate) enum SubmitError {
     Unavailable,
 }
 
+/// One reservation exists from before publication until dequeue or drop.
+/// This also accounts for refused sends and messages dropped with the receiver.
+struct QueueTicket(Arc<Shared>);
+
+impl QueueTicket {
+    fn reserve(shared: &Arc<Shared>) -> Self {
+        shared.queued.fetch_add(1, Ordering::SeqCst);
+        Self(Arc::clone(shared))
+    }
+}
+
+impl Drop for QueueTicket {
+    fn drop(&mut self) {
+        self.0.queued.fetch_sub(1, Ordering::SeqCst);
+    }
+}
+
 // The sampler's capture handle grew Job past the large-variant floor; the
-// queue stays flat (one Arc worth of growth) rather than boxing every job.
+// queue stays flat rather than boxing every job.
 #[allow(clippy::large_enum_variant)]
 enum Message {
-    Job(Job),
+    Job(Job, QueueTicket),
     /// Ends the loop after the jobs ahead of it. `shutdown` sends it so that the thread stops
     /// while other handles are still alive.
     Stop,
+}
+
+fn publish_job(queue: &SyncSender<Message>, message: Message) -> Result<(), SubmitError> {
+    queue.try_send(message).map_err(|error| match error {
+        TrySendError::Full(_) => SubmitError::QueueFull,
+        TrySendError::Disconnected(_) => SubmitError::Unavailable,
+    })
 }
 
 /// The portable, shareable front of one engine thread.
@@ -259,6 +284,14 @@ impl EngineHandle {
     /// A job that a concurrent failure or stop catches in the queue can also end with a closed
     /// channel and no event. The owner then treats the closed channel as a `Backend` failure.
     pub(crate) fn try_submit(&self, job: Job) -> Result<(), SubmitError> {
+        self.try_submit_with(job, publish_job)
+    }
+
+    fn try_submit_with(
+        &self,
+        job: Job,
+        publish: impl FnOnce(&SyncSender<Message>, Message) -> Result<(), SubmitError>,
+    ) -> Result<(), SubmitError> {
         if self.shared.stop.load(Ordering::SeqCst) {
             return Err(SubmitError::Unavailable);
         }
@@ -268,17 +301,12 @@ impl EngineHandle {
             EngineState::Stopped => return Err(SubmitError::Unavailable),
             EngineState::Loading | EngineState::Ready | EngineState::Busy => {}
         }
-        self.queue
-            .try_send(Message::Job(job))
-            .map_err(|error| match error {
-                TrySendError::Full(_) => SubmitError::QueueFull,
-                TrySendError::Disconnected(_) => SubmitError::Unavailable,
-            })?;
-        self.shared.queued.fetch_add(1, Ordering::SeqCst);
-        Ok(())
+        let ticket = QueueTicket::reserve(&self.shared);
+        publish(&self.queue, Message::Job(job, ticket))
     }
 
-    /// Jobs waiting for the engine thread to dequeue them.
+    /// Jobs waiting to be dequeued or currently attempting submission.
+    /// This is a conservative observation, not an atomic idle fence.
     pub(crate) fn queued(&self) -> usize {
         self.shared.queued.load(Ordering::SeqCst)
     }
@@ -461,10 +489,8 @@ fn cancel_unstarted(job: Job) {
 
 fn drain(jobs: &Receiver<Message>, finish: fn(Job)) {
     while let Ok(message) = jobs.try_recv() {
-        if let Message::Job(job) = message {
-            // No shared counter here: drain runs on shutdown paths where
-            // the count is discarded with the engine. The live paths
-            // decrement at their own dequeue points.
+        if let Message::Job(job, ticket) = message {
+            drop(ticket);
             finish(job);
         }
     }
@@ -592,8 +618,8 @@ fn work<E, F>(
         );
         return;
     }
-    while let Ok(Message::Job(job)) = jobs.recv() {
-        shared.queued.fetch_sub(1, Ordering::SeqCst);
+    while let Ok(Message::Job(job, ticket)) = jobs.recv() {
+        drop(ticket);
         if shared.state() == EngineState::NativeFailed {
             reject(job);
             continue;
@@ -1679,6 +1705,79 @@ mod tests {
         drop(engine);
     }
 
+    fn queue_for_test(capacity: usize) -> (EngineHandle, mpsc::Receiver<super::Message>) {
+        let (queue, receiver) = mpsc::sync_channel(capacity);
+        let shared = Arc::new(super::Shared::new());
+        (EngineHandle { queue, shared }, receiver)
+    }
+
+    #[test]
+    fn queue_ticket_survives_dequeue_before_submit_returns() {
+        let (handle, receiver) = queue_for_test(1);
+        let (job, _events) = job(&[1]);
+        handle
+            .try_submit_with(job, |queue, message| {
+                assert_eq!(handle.queued(), 1, "reserve before publication");
+                super::publish_job(queue, message)?;
+                let super::Message::Job(_job, ticket) = receiver.try_recv().expect("job") else {
+                    panic!("expected job");
+                };
+                drop(ticket);
+                assert_eq!(handle.queued(), 0, "worker finished before publish returns");
+                Ok(())
+            })
+            .expect("submit");
+        assert_eq!(handle.queued(), 0);
+    }
+
+    #[test]
+    fn queue_ticket_rolls_back_full_and_disconnected_sends() {
+        let (handle, receiver) = queue_for_test(1);
+        let (first, _first_events) = job(&[1]);
+        handle.try_submit(first).expect("first job");
+        assert_eq!(handle.queued(), 1);
+        let (full, _full_events) = job(&[2]);
+        assert_eq!(handle.try_submit(full), Err(SubmitError::QueueFull));
+        assert_eq!(handle.queued(), 1, "failed reservation is released");
+        drop(receiver);
+        assert_eq!(handle.queued(), 0, "receiver drop releases queued jobs");
+        let (disconnected, _disconnected_events) = job(&[3]);
+        assert_eq!(
+            handle.try_submit(disconnected),
+            Err(SubmitError::Unavailable)
+        );
+        assert_eq!(handle.queued(), 0);
+    }
+
+    #[test]
+    fn queue_ticket_releases_jobs_drained_after_stop() {
+        let (handle, receiver) = queue_for_test(2);
+        handle.queue.send(super::Message::Stop).expect("stop");
+        let (late, _events) = job(&[1]);
+        handle.try_submit(late).expect("job behind stop");
+        assert_eq!(handle.queued(), 1);
+        super::drain(&receiver, super::cancel_unstarted);
+        assert_eq!(handle.queued(), 0);
+    }
+
+    #[test]
+    fn queue_ticket_releases_late_job_when_receiver_drops_after_final_drain() {
+        let (handle, receiver) = queue_for_test(1);
+        let (late, _events) = job(&[1]);
+        handle
+            .try_submit_with(late, |queue, message| {
+                // The submit already passed its state check. The worker can
+                // fail and finish draining before this publication succeeds.
+                handle.shared.set_state(EngineState::Error);
+                super::drain(&receiver, super::reject);
+                super::publish_job(queue, message)
+            })
+            .expect("late publish");
+        assert_eq!(handle.queued(), 1);
+        drop(receiver);
+        assert_eq!(handle.queued(), 0);
+    }
+
     /// The events of a job that stops at once, uses no extra tokens, and reports a store that
     /// holds nothing and restored nothing.
     fn stop_events(prompt: u32, reused: u32) -> Vec<JobEvent> {
@@ -2062,6 +2161,7 @@ mod tests {
             })]
         );
         assert_eq!(collect(queued_events), vec![unavailable_event()]);
+        assert_eq!(handle.queued(), 0, "terminal drain releases queue tickets");
         assert_eq!(handle.state(), EngineState::NativeFailed);
         let (late, _late_events) = job(&[2]);
         assert_eq!(handle.try_submit(late), Err(SubmitError::NativeFailed));
@@ -2125,6 +2225,11 @@ mod tests {
         handle.try_submit(queued).expect("submit while loading");
         release_tx.send(()).expect("release the load");
         assert_eq!(collect(queued_events), vec![unavailable_event()]);
+        assert_eq!(
+            handle.queued(),
+            0,
+            "failed-load drain releases queue tickets"
+        );
         assert_eq!(handle.state(), EngineState::Error);
         let cause = handle.failure().expect("a failed load keeps its cause");
         assert!(cause.contains("no weights"), "cause: {cause}");
@@ -2150,6 +2255,7 @@ mod tests {
         handle.try_submit(queued).expect("submit while loading");
         release_tx.send(()).expect("release the load");
         assert_eq!(collect(queued_events), vec![unavailable_event()]);
+        assert_eq!(handle.queued(), 0, "panic drain releases queue tickets");
         wait_until("the Error state", || handle.state() != EngineState::Loading);
         assert_eq!(handle.state(), EngineState::Error);
         let cause = handle.failure().expect("a panic keeps its cause");
@@ -2186,6 +2292,7 @@ mod tests {
             })]
         );
         assert_eq!(collect(queued_events), vec![unavailable_event()]);
+        assert_eq!(handle.queued(), 0, "panic drain releases queue tickets");
         assert_eq!(handle.state(), EngineState::NativeFailed);
         let (late, _late_events) = job(&[2]);
         assert_eq!(handle.try_submit(late), Err(SubmitError::NativeFailed));
@@ -2601,7 +2708,10 @@ mod tests {
         handle.queue.send(super::Message::Stop).expect("send stop");
         handle
             .queue
-            .send(super::Message::Job(late))
+            .send(super::Message::Job(
+                late,
+                super::QueueTicket::reserve(&handle.shared),
+            ))
             .unwrap_or_else(|_| panic!("the queue refused the job"));
         release_tx.send(()).expect("release the load");
         assert_eq!(
@@ -2613,6 +2723,7 @@ mod tests {
             ]
         );
         assert_eq!(handle.state(), EngineState::Stopped);
+        assert_eq!(handle.queued(), 0, "stop drain releases queue tickets");
         assert!(calls(&log).is_empty(), "the executor ran a stopped job");
         drop(handle);
         assert_eq!(engine.shutdown().state, EngineState::Stopped);

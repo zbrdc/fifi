@@ -354,11 +354,11 @@ pub(super) fn work<E: ExecutorOps>(
                 }
                 break;
             };
-            let Message::Job(job) = message else {
+            let Message::Job(job, ticket) = message else {
                 shared.stop.store(true, Ordering::SeqCst);
                 break;
             };
-            shared.queued.fetch_sub(1, Ordering::SeqCst);
+            drop(ticket);
             if shared.stop.load(Ordering::SeqCst) || job.generation.cancel.load(Ordering::SeqCst) {
                 cancel_unstarted(job);
                 continue;
