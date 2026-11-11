@@ -2223,7 +2223,6 @@ pub(in crate::kernels::mlx) fn native_trace_counts() -> (u64, u64, u64) {
 /// Zeroes the native closure-body entry counts. Test builds only: `compile_stats::reset` calls
 /// this with its own reset, so a test that reads `traces` sees its own traces and not the body
 /// entries of the tests before it.
-
 #[cfg(test)]
 pub(in crate::kernels::mlx) fn native_trace_reset() {
     unsafe { ffi::mlx_compile_reset_trace_counts() };
