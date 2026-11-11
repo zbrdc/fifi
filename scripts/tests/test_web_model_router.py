@@ -223,8 +223,8 @@ class RouterFixture(unittest.TestCase):
             return json.load(response)
 
 
-class ModelRouterTests(RouterFixture):
-    close_backend_connections = True
+class RoutingBehavior:
+    """Routing, trace and error handling must not depend on the connection policy."""
 
     def test_primary_is_first_and_model_specific_routes_still_work(self):
         data = self.get("/v1/models")["data"]
@@ -269,6 +269,10 @@ class ModelRouterTests(RouterFixture):
         with self.assertRaises(urllib.error.HTTPError) as error:
             self.get("/v1/models")
         self.assertEqual(error.exception.code, 502)
+
+
+class ModelRouterTests(RoutingBehavior, RouterFixture):
+    close_backend_connections = True
 
     def test_completed_model_list_releases_backend_connections(self):
         self.assertEqual(len(self.get("/v1/models")["data"]), 2)
@@ -334,12 +338,20 @@ class ModelRouterTests(RouterFixture):
         self.assertTrue(backend.wait_for_no_connections())
 
 
-class DefaultConnectionPolicyTests(RouterFixture):
+class DefaultConnectionPolicyTests(RoutingBehavior, RouterFixture):
     def test_default_preserves_model_list_connection_reuse(self):
         self.assertEqual(len(self.get("/v1/models")["data"]), 2)
         self.assertFalse(
             self.backends[1].wait_for_no_connections(timeout=0.2),
             "the default policy unexpectedly closed the model-list connection",
+        )
+
+    def test_default_preserves_forwarded_connection_reuse(self):
+        backend = self.backends[1]
+        self.assertEqual(self.post(backend.model)["backend"], backend.model)
+        self.assertFalse(
+            backend.wait_for_no_connections(timeout=0.2),
+            "the default policy unexpectedly closed the forwarded connection",
         )
 
 
