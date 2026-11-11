@@ -104,6 +104,14 @@ pub(in crate::family::flash_next) mod prof {
         })
     }
 
+    /// The host-stage measurement switch (`INFERENCE_FLASH_NEXT_DRAIN_TICK`): with the
+    /// profile on, every phase boundary also drains the device queues, so each phase's
+    /// recorded time is the host's own cost with an empty queue at its start.
+    pub(in crate::family::flash_next) fn drain_tick() -> bool {
+        static ON: OnceLock<bool> = OnceLock::new();
+        *ON.get_or_init(|| std::env::var("INFERENCE_FLASH_NEXT_DRAIN_TICK").is_ok_and(|v| v != "0"))
+    }
+
     pub(in crate::family::flash_next) fn add(slot: usize, spent: std::time::Duration) {
         NS[slot].fetch_add(spent.as_nanos() as u64, AtomicOrdering::Relaxed);
     }
@@ -200,6 +208,12 @@ pub(in crate::family::flash_next::cuda) trait ChunkDevice {
     fn read_logits(&mut self) -> Result<Vec<f32>>;
     /// Reads the status word and the arithmetic flag; refuses a chunk that set either.
     fn check_health(&mut self) -> Result<()>;
+    /// Empties every device queue this device feeds. The host-stage measurement mode
+    /// (`INFERENCE_FLASH_NEXT_DRAIN_TICK` with the profile on) calls it between phases so
+    /// each phase's recorded time starts with an empty queue; the default does nothing.
+    fn drain(&mut self) -> Result<()> {
+        Ok(())
+    }
     /// Zeroes the persistent state: a new sequence.
     fn reset(&mut self) -> Result<()>;
     /// The bank's miss count for the per-job report, if the device has a bank.
@@ -332,12 +346,17 @@ impl<D: ChunkDevice, F: TokenFeeds> ChunkDriver<D, F> {
         let shape = self.shape;
 
         let profile = prof::on();
+        let drain_on = profile && prof::drain_tick();
         let mut t = Instant::now();
-        let mut tick = |slot: usize| {
+        let mut tick = |dev: &mut D, slot: usize| -> Result<()> {
             if profile {
                 prof::add(slot, t.elapsed());
                 t = Instant::now();
             }
+            if drain_on {
+                dev.drain()?;
+            }
+            Ok(())
         };
         self.device
             .write_chunk_params(tokens[0] as i32, pos as i32, m as i32)?;
@@ -350,11 +369,11 @@ impl<D: ChunkDevice, F: TokenFeeds> ChunkDriver<D, F> {
         self.device.write_chunk_stream(&stream_rows)?;
         self.device.write_chunk_ple(&ple_rows)?;
         self.device.begin_chunk()?;
-        tick(1);
+        tick(&mut self.device, 1)?;
         self.device.layers(0..shape.ple_layer, pos, m)?;
-        tick(2);
+        tick(&mut self.device, 2)?;
         let mut rows = self.device.read_stream()?;
-        tick(3);
+        tick(&mut self.device, 3)?;
         let width = shape.start.stream;
         if rows.len() != m * width {
             return Err(EngError::Backend {
@@ -390,15 +409,15 @@ impl<D: ChunkDevice, F: TokenFeeds> ChunkDriver<D, F> {
                 *value += delta;
             }
         }
-        tick(4);
+        tick(&mut self.device, 4)?;
         self.device.write_stream_back(&rows)?;
-        tick(5);
+        tick(&mut self.device, 5)?;
         self.device.layers(shape.ple_layer..shape.layers, pos, m)?;
-        tick(6);
+        tick(&mut self.device, 6)?;
         let logits = if want_logits {
             self.device.head()?;
             let row = self.device.read_logits()?;
-            tick(7);
+            tick(&mut self.device, 7)?;
             Some(row)
         } else {
             None

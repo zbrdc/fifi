@@ -225,6 +225,10 @@ impl CardChunkDevice {
 }
 
 impl super::driver::chunk::ChunkDevice for CardChunkDevice {
+    fn drain(&mut self) -> Result<(), EngError> {
+        self.step.stream.synchronize()
+    }
+
     fn write_chunk_params(&mut self, token0: i32, pos: i32, m: i32) -> Result<(), EngError> {
         self.m = usize::try_from(m).map_err(|_| {
             EngError::BadRequest(format!("Flash-Next chunk driver: a negative row count {m}"))
