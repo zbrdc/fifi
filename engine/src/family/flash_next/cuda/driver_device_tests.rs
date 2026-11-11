@@ -692,11 +692,13 @@ fn teacher_forced_steps_follow_the_oracle_on_every_prompt() {
         );
         driver.reset().expect("reset");
         let began = std::time::Instant::now();
+        let misses_before = driver.bank_misses();
         let (last, head) = prompt.split_last().expect("a prompt");
         for &token in head {
             driver.feed(token).expect("feed a prompt token");
         }
         feed_ms = began.elapsed().as_secs_f64() * 1e3 / head.len().max(1) as f64;
+        let prompt_misses = driver.bank_misses().saturating_sub(misses_before);
         let began = std::time::Instant::now();
         let mut steps: Vec<FollowStep> = Vec::with_capacity(count);
         let mut engine_steps = Vec::with_capacity(count);
@@ -778,13 +780,18 @@ fn teacher_forced_steps_follow_the_oracle_on_every_prompt() {
         let full: Vec<f64> = steps.iter().filter_map(|s| s.kl_full).collect();
         let (klf_mean, klf_max) = mean_max(&full);
         let overlap = steps.iter().map(|s| s.overlap).sum::<usize>() as f64 / count as f64;
+        let step_misses = driver
+            .bank_misses()
+            .saturating_sub(misses_before + prompt_misses);
         println!(
             "{id}: {count} steps, top-1 {agree}/{count} ({:.4}), KL top-20 mean {kl20_mean:.3e} max {kl20_max:.3e}, \
              KL full-vocab ({} rows) mean {klf_mean:.3e} max {klf_max:.3e}, top-20 overlap mean {overlap:.2}/20, \
-             prompt {:.1} ms/token, steps {step_ms:.1} ms/token",
+             prompt {:.1} ms/token, steps {step_ms:.1} ms/token, misses prompt {prompt_misses} ({:.2}/tok) steps {step_misses} ({:.2}/tok)",
             agree as f64 / count as f64,
             full.len(),
-            feed_ms
+            feed_ms,
+            prompt_misses as f64 / head.len().max(1) as f64,
+            step_misses as f64 / count as f64
         );
         let mut flips = Vec::new();
         for (i, s) in steps.iter().enumerate() {
