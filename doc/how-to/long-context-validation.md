@@ -56,9 +56,9 @@ compares the returned statements as Python syntax trees and never executes the
 model's code. It counts both rendered prompts and verifies the first was cold.
 By default, the second turn must report at least one reused token; set a higher
 `--min-reused-tokens` threshold to require substantial reuse. This is the
-`required` reuse mode. Use `--reuse-mode disabled` to check a path that must
-report zero reused tokens on both turns, such as the experimental P2P chunked
-path. A pass in disabled mode does not qualify warm prefix reuse.
+`required` reuse mode. Use `--reuse-mode disabled` to check a server or path
+that does not support prefix reuse and must report zero reused tokens on both
+turns. A pass in disabled mode does not qualify warm prefix reuse.
 
 ```sh
 python3 scripts/bench_coding_session.py \
@@ -70,7 +70,7 @@ python3 scripts/bench_coding_session.py \
   --output "$TMPDIR/coding-session-128k.json"
 ```
 
-For the P2P chunked path, replace the reuse threshold with
+For a path without prefix reuse, replace the reuse threshold with
 `--reuse-mode disabled` and use a separate output file. In this mode the result
 records `reuse_passed` as null and checks the expected absence of reuse through
 `reuse_check_passed`.

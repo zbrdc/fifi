@@ -6,7 +6,8 @@ The traced server was commit `76dec8a61d040efa97beefe273bed8dc9e68ff57`,
 using q8 KV, 256-row P2P chunks and disabled prefix reuse. It was not the
 current serving process or the later 1,024-row experiment. The
 [earlier profile](https://github.com/BColsey/fifi/blob/8b2034aea9bd409e16c3c562fcffa1cc20dccce0/scripts/benchmarks/qwen36-p2p-staging-profile.json)
-records the capture, model and binary identities.
+records the capture, model and binary identities. It lives in the
+contributor's fork and is not part of this repository.
 
 The trace contains 9,892 `cudaStreamSynchronize` calls on one host thread.
 Their union is 12.650 seconds. During 12.642 seconds of that interval, at
@@ -37,5 +38,4 @@ python3 scripts/benchmarks/qwen36-p2p-sync-overlap.py \
 A next experiment should identify resident versus host-mapped expert inputs
 in the current server's trace, measure both cards and host activity, and compare
 placements using the same binary, workload and memory-admission limits in both
-orders. Host CPU profiling support must be checked before reserving GPU time;
-this host currently denies a basic unprivileged `perf` counter probe.
+orders. Host CPU profiling support must be checked before reserving GPU time.
