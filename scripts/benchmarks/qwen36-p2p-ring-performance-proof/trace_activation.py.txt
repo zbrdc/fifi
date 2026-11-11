@@ -1,0 +1,58 @@
+#!/usr/bin/env python3
+"""Validate the captured P2P ring launch grid and physical GPU mapping."""
+import hashlib
+import json
+import os
+from pathlib import Path
+import sqlite3
+import subprocess
+import tempfile
+
+NSYS = Path('/home/ben/fifi-scratch/7f9c3ee80929/p2p-event-fences/tools/nsight/opt/nvidia/nsight-systems-cli/2026.6.1/target-linux-x64/nsys')
+NSYS_SHA = '8bdff6f409c35cda3032c84f187b6ebf861d1aa7cd0049bf8846ff31e6005fff'
+DEVICES = {0:'704fef60-5280-9b88-fa3d-d11135caf576', 1:'282e266a-24ac-6fa8-a16d-4281e52b4c0a'}
+KERNELS = ('publish_f32_kernel', 'wait_sum_kernel')
+ROOT = Path(__file__).resolve().parent
+
+def sha(path):
+    with Path(path).open('rb') as f: return hashlib.file_digest(f, 'sha256').hexdigest()
+
+def inspect_database(db):
+    con = sqlite3.connect('file:'+str(db)+'?mode=ro', uri=True)
+    try:
+        devices = con.execute('select cudaId,uuid from TARGET_INFO_CUDA_DEVICE').fetchall()
+        if len(devices) != 2 or dict(devices) != DEVICES:
+            raise ValueError('CUDA logical-to-physical GPU mapping differs')
+        rows = con.execute('''select k.deviceId,s.value,k.gridX,count(*)
+          from CUPTI_ACTIVITY_KIND_KERNEL k join StringIds s on s.id=k.shortName
+          where s.value in (?,?) group by k.deviceId,s.value,k.gridX''', KERNELS).fetchall()
+    finally:
+        con.close()
+    found = {(device,name) for device,name,grid,count in rows if grid > 1 and count > 0}
+    if found != {(device,name) for device in DEVICES for name in KERNELS}:
+        raise ValueError('both multiblock kernel types were not observed on both GPUs')
+    return [{'device':device,'name':name,'grid_x':grid,'count':count}
+            for device,name,grid,count in sorted(rows)]
+
+def validate(campaign):
+    campaign=Path(campaign)
+    summary=json.loads((campaign/'attention/summary.json').read_text())
+    items=[x for x in summary.get('outcomes',[]) if x.get('case')=='chunk-exchange']
+    if len(items)!=1 or items[0].get('passed') is not True:
+        raise ValueError('chunk-exchange evidence is absent or failed')
+    trace=campaign/'attention/ring-activation.nsys-rep'
+    if trace.is_symlink() or not trace.is_file() or sha(trace)!=items[0].get('activation_trace_sha256'):
+        raise ValueError('ring activation trace missing or modified')
+    if NSYS.is_symlink() or not NSYS.is_file() or sha(NSYS)!=NSYS_SHA or items[0].get('tracer_sha256')!=NSYS_SHA:
+        raise ValueError('pinned trace exporter missing or changed')
+    with tempfile.TemporaryDirectory(dir=ROOT) as temp:
+        db=Path(temp)/'activation.sqlite'
+        env=os.environ.copy()
+        env.update({'TMPDIR':temp,'TMP':temp,'TEMP':temp})
+        subprocess.run([str(NSYS),'export','--type=sqlite','--quiet=true','--force-overwrite=false',
+                        '--output='+str(db),str(trace)],env=env,stdout=subprocess.PIPE,
+                       stderr=subprocess.STDOUT,text=True,timeout=120,check=True)
+        if not db.is_file(): raise ValueError('trace exporter produced no database')
+        observed=inspect_database(db)
+    return {'trace_sha256':sha(trace), 'tracer_sha256':NSYS_SHA, 'devices':{str(k): v for k,v in DEVICES.items()},
+            'multiblock_launches':observed}

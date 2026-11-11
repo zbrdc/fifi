@@ -1,0 +1,152 @@
+{
+  "scope": "One guarded synthetic two-turn coding session; no warm-cache or general quality qualification.",
+  "model": "Qwen3.6 35B A3B Q4_K_M",
+  "model_sha256": "671e47e0ec53c665d048b98c3ecbfd5236b5ca9c3e02ed19fc8f81f7b85140c7",
+  "devices": [
+    "RTX 3060 12 GB",
+    "RTX 3080 10 GB"
+  ],
+  "context_limit": 262144,
+  "max_completion_tokens_per_turn": 128,
+  "kv_cache": "q8",
+  "prefix_reuse": false,
+  "chunk_rows": 512,
+  "settings": {
+    "INFERENCE_CUDA_P2P_RING_MULTIBLOCK": "1",
+    "Q36_P2P_ASYNC_BROADCAST": "0"
+  },
+  "tested_source_commit": "cc635bbdf4f9adb7f261d0721b63200ea7293341",
+  "server_binary_sha256": "0f276c5f071a0249b7b82e714de09e94722768e3fee22a1fd529b68784640f5e",
+  "driver_source": {
+    "commit": "90f1de648b4b18cb76e1e2f43218be9b6890a8d8",
+    "files": {
+      "bench_coding_session.py": "fdb0e9e246e79dfe52fb08f43308d2ab777455af1d3ce59b5917975aceb3561e",
+      "bench_long_context.py": "67adb062bb6e2b73d6830cf69625f3f7657d959aa7426025bb4bbf3f9d5c6803",
+      "bench_engines.py": "09f42c1f164c2c6479bc5a200dd3c127d0c36082e02f35e865b4ce2d109904a2"
+    }
+  },
+  "runner_sources": {
+    "attention_device.py": "bd82ab52977a9b6d143d35fc32f10282234eb805b1cd2ffbc752a3a335034f8e",
+    "benchmark_device.py": "2eacb6ae874d8f65c2e435d7d6b300787366dea206e9b6cac97704f8e4ac732d",
+    "reserve_pair_attention.py": "3515b16aa5aa817ce4ebdcdc545173a15a5cf26578b10bafd946c503cb3f5a18",
+    "scope_guard.py": "14d7aec72002f2d4b067609e98bf397f7e080ea7fdb9ab5337f836325f9b8cb2",
+    "trace_activation.py": "d994ad337051dfb16b79b70531aeacbc8e8d93622e4647e711680c1b7c11d1ea",
+    "shared_guard_sha256": "e7022df0efde4a270e50836697403cb147d7526443512050bfe13ed770fa3ef3"
+  },
+  "peer_proof": {
+    "summary_sha256": "a3bb3bd0b87da9f1605797ab8f754e1323b6c59e63e3df9b939d68fa8d0d9b3d",
+    "guard_sha256": "7e5f891a2ce9c67885fde0689e9fea7c95334e4fa1ff0e722f3208c97ff21325",
+    "guard_samples": 14,
+    "activation": {
+      "trace_sha256": "6a2a3851cb53b172c4556a223e43c641e0ff28f06720e0ef07cee027c5aaad95",
+      "tracer_sha256": "8bdff6f409c35cda3032c84f187b6ebf861d1aa7cd0049bf8846ff31e6005fff",
+      "devices": {
+        "0": "704fef60-5280-9b88-fa3d-d11135caf576",
+        "1": "282e266a-24ac-6fa8-a16d-4281e52b4c0a"
+      },
+      "multiblock_launches": [
+        {
+          "device": 0,
+          "name": "publish_f32_kernel",
+          "grid_x": 64,
+          "count": 41
+        },
+        {
+          "device": 0,
+          "name": "wait_sum_kernel",
+          "grid_x": 64,
+          "count": 41
+        },
+        {
+          "device": 1,
+          "name": "publish_f32_kernel",
+          "grid_x": 64,
+          "count": 41
+        },
+        {
+          "device": 1,
+          "name": "wait_sum_kernel",
+          "grid_x": 64,
+          "count": 41
+        }
+      ]
+    }
+  },
+  "results": [
+    {
+      "target": 261600,
+      "passed": true,
+      "turns": [
+        {
+          "turn": 1,
+          "prompt_tokens": 261696,
+          "completion_tokens": 11,
+          "reused_tokens": 0,
+          "request_id": "chatcmpl-0000000000000004",
+          "finish_reason": "stop",
+          "answer_sha256": "6200cf9fa016ecbe96aa58960e0b77ae2e5afdf46f0b365c0ee3b104086377e0",
+          "edit_passed": true,
+          "server_prefill_ms": 632826.2,
+          "server_first_batch_tokens_per_second": 413.535343511378,
+          "first_visible_seconds": 633.0845088919741
+        },
+        {
+          "turn": 2,
+          "prompt_tokens": 261740,
+          "completion_tokens": 11,
+          "reused_tokens": 0,
+          "request_id": "chatcmpl-0000000000000006",
+          "finish_reason": "stop",
+          "answer_sha256": "7614d2970c884bdd545bfece237054faa8ff5669bd9e634ea617fbd5f4056004",
+          "edit_passed": true,
+          "server_prefill_ms": 632960.4,
+          "server_first_batch_tokens_per_second": 413.5171805376766,
+          "first_visible_seconds": 633.2126261849771
+        }
+      ],
+      "raw_result_sha256": "86c9165e4d881a8e1d8eee5588d8041fe62d98cdbae6a3ff35c0f6015b028429"
+    }
+  ],
+  "smoke": {
+    "receipt_sha256": "4e368f80c8a9bd68ce8a811a2c7fe2d887665f61294221ca72c25c192382c807",
+    "guard": {
+      "samples": 90,
+      "minimum_free_mib": 1368,
+      "sha256": "9242bcbd89b5a0e57aad02b571e491e1faada064224d9b11ff4df5f8386c3bb8"
+    },
+    "restoration": {
+      "reason": "original pair service ready",
+      "complete_sha256": "b04bf9539c44c53d3c4cedb8355c630aad2cf21fa74f59e00eb8b64d91cbf79c",
+      "restore_sha256": "ec8531c48de7e4b199aa41197040a5fa2ca12bb1cfe82410d3117e7642e3194d"
+    }
+  },
+  "full": {
+    "guard": {
+      "samples": 1023,
+      "minimum_free_mib": 1368,
+      "sha256": "fbe797d797216b84633af706e08dc45ee59b2769828b58fd6875f6b523e54887"
+    },
+    "restoration": {
+      "reason": "original pair service ready",
+      "complete_sha256": "4504254b08166ddf68afcb00f829c8d99d8cef0f9e49114b7ec37a4cd5d25b24",
+      "restore_sha256": "ec8531c48de7e4b199aa41197040a5fa2ca12bb1cfe82410d3117e7642e3194d"
+    },
+    "summary_sha256": "c4f98eae3bddffdb8c830fe225c5b06c421869cc6fb83b20b34eda220b9a4502",
+    "server_log_sha256": "bcf5fa5f75c8a24d10fc4f00ef971ac1eef7549ec0a4200c3688de089909a436"
+  },
+  "secondary_service_unchanged": {
+    "ready": true,
+    "fingerprint_sha256": {
+      "executable": "7ecc29185c3ff4b0cf29df8d6e39f1be5446f93bbf8128f8d8049377fcef1490",
+      "start": "67fce39d8ed2ec714da6f252e9bd0fd0e1dbc30dc6e0b83bf101b49f10c8000f",
+      "config": "821a91e6d0a763a31f4676d6bab5c8bfd5f2739737e05c612deece673cbd430f"
+    }
+  },
+  "limitations": [
+    "One synthetic two-turn Python edit does not establish general coding quality.",
+    "Prefix reuse was disabled and both turns were processed cold.",
+    "The two prompts and responses remain below, but do not fill every position of, the configured context.",
+    "Server prefill timing includes first emitted-batch work.",
+    "This result does not qualify the experimental ring or the main base for default use."
+  ]
+}

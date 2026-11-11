@@ -1,0 +1,221 @@
+#!/usr/bin/env python3
+"""Run an isolated server-counted two-turn coding check under the GPU guard."""
+import fcntl
+import hashlib
+import json
+import os
+from pathlib import Path
+import re
+import secrets
+import subprocess
+import sys
+
+import benchmark_device as bench
+
+ROOT = Path(__file__).resolve().parent
+SOURCE = Path('/home/ben/fifi-scratch/773ed216d349/long-context-cache-mode/wt')
+SOURCE_COMMIT = '90f1de648b4b18cb76e1e2f43218be9b6890a8d8'
+DEVICE, PAIR_VISIBLE, LOCK = bench.DEVICE, bench.PAIR_VISIBLE, bench.LOCK
+sha = bench.sha
+TARGETS = {'smoke': (512,), 'full': (131072,)}
+RUNNER_FILES = ('attention_device.py', 'benchmark_device.py', 'reserve_pair_attention.py', 'scope_guard.py', 'trace_activation.py')
+LOADED_RUNNER_HASHES = {name: sha(ROOT / name) for name in RUNNER_FILES}
+GUARD_SOURCE = Path('/home/ben/fifi-scratch/e4ecf0370956/publish-prefix-evidence/guard-peer.py')
+LOADED_GUARD_HASH = sha(GUARD_SOURCE)
+
+
+def runner_sources():
+    hashes = {name: sha(ROOT / name) for name in RUNNER_FILES}
+    if hashes != LOADED_RUNNER_HASHES:
+        raise ValueError('guarded campaign source changed after import')
+    if sha(GUARD_SOURCE) != LOADED_GUARD_HASH:
+        raise ValueError('shared peer guard changed after import')
+    hashes['shared_guard_sha256'] = LOADED_GUARD_HASH
+    return hashes
+
+
+def long_source():
+    def git(*args):
+        return subprocess.check_output(['git', '-C', str(SOURCE), *args], text=True, timeout=10).strip()
+    if git('rev-parse', 'HEAD') != SOURCE_COMMIT or git('status', '--porcelain', '--untracked-files=all'):
+        raise ValueError('long-context source differs from its clean pinned commit')
+    files = {}
+    for name in ('bench_coding_session.py', 'bench_long_context.py', 'bench_engines.py'):
+        path = SOURCE / 'scripts' / name
+        if path.is_symlink() or not path.is_file():
+            raise ValueError('long-context driver is missing or unsafe')
+        files[name] = sha(path)
+    return {'commit': SOURCE_COMMIT, 'files': files}
+
+
+def preflight():
+    return {**bench.preflight(), 'long_source': long_source(), 'runner_sources': runner_sources(),
+            'recall_targets': {key: list(value) for key, value in TARGETS.items()},
+            'scope': 'Isolated synthetic two-turn coding check; prefix reuse disabled.'}
+
+
+def validate_result(data, log_text, target):
+    # Reuse the pinned driver's AST validation without executing model output.
+    import importlib.util
+    spec = importlib.util.spec_from_file_location('coding_driver', SOURCE / 'scripts/bench_coding_session.py')
+    sys.path.insert(0, str(SOURCE / 'scripts'))
+    coding = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(coding)
+    turns = data.get('turns')
+    if (data.get('state') != 'complete' or data.get('target_prompt_tokens') != target
+            or data.get('context_limit') != 262144 or data.get('max_completion_tokens') != 128
+            or data.get('reuse_mode') != 'disabled' or not isinstance(turns, list)
+            or len(turns) not in (1, 2) or type(data.get('passed')) is not bool):
+        raise ValueError('coding-session result is incomplete or inconsistent')
+    records = bench.compare.records(log_text)
+    checked, requests = [], set()
+    for i, turn in enumerate(turns):
+        request, prompt, completion = turn.get('request_id'), turn.get('prompt_tokens'), turn.get('completion_tokens')
+        answer, reused = turn.get('answer'), turn.get('reused_tokens')
+        row = records.get(request)
+        if (not isinstance(request, str) or not request or request in requests
+                or type(prompt) is not int or prompt < 1 or prompt + 128 > 262144
+                or type(completion) is not int or not 1 <= completion <= 128
+                or type(reused) is not int or reused != 0 or not isinstance(answer, str)
+                or not isinstance(row, dict) or row.get('status') != 200 or row.get('outcome') != 'ok'
+                or row.get('prompt_tokens') != prompt or row.get('completion_tokens') != completion
+                or row.get('reused_tokens') != 0 or not bench.compare.positive_number(row.get('prefill_ms'))
+                or (turn.get('server_prefill_ms') is not None and turn['server_prefill_ms'] != row['prefill_ms'])
+                or not bench.compare.positive_number(turn.get('first_visible_seconds'))):
+            raise ValueError('coding turn lacks matching cold server telemetry')
+        requests.add(request)
+        passed = turn.get('finish_reason') == 'stop' and coding.valid_replacement(answer, 'lower' if i == 0 else 'upper')
+        if turn.get('edit_passed') is not passed:
+            raise ValueError('coding edit result disagrees with its answer')
+        if i and turn.get('reuse_check_passed') is not True:
+            raise ValueError('follow-up did not confirm reuse was disabled')
+        checked.append({'turn': i + 1, 'prompt_tokens': prompt, 'completion_tokens': completion,
+                        'reused_tokens': reused, 'request_id': request, 'finish_reason': turn.get('finish_reason'),
+                        'answer_sha256': hashlib.sha256(answer.encode()).hexdigest(), 'edit_passed': passed,
+                        'server_prefill_ms': row['prefill_ms'],
+                        'server_first_batch_tokens_per_second': 1000 * prompt / row['prefill_ms'],
+                        'first_visible_seconds': turn['first_visible_seconds']})
+    if (not target <= checked[0]['prompt_tokens'] <= target + 128
+            or checked[0]['prompt_tokens'] + 2 * 128 > 262144):
+        raise ValueError('first coding prompt is outside target tolerance or response budget')
+    expected_pass = len(checked) == 2 and all(t['edit_passed'] for t in checked)
+    if data['passed'] is not expected_pass or (len(checked) == 1 and checked[0]['edit_passed']):
+        raise ValueError('coding-session outcome is inconsistent')
+    return {'target': target, 'passed': expected_pass, 'turns': checked}
+
+
+def validate_smoke_receipt(path, info):
+    campaign = Path(path)
+    if (not campaign.is_absolute() or campaign.is_symlink() or campaign.parent.resolve() != ROOT.resolve()
+            or not re.fullmatch(r'pair-reserved-[a-z0-9_]+', campaign.name)):
+        raise ValueError('invalid long-context smoke campaign')
+    files = [campaign / name for name in ('complete.json', 'restore.json', 'attention/summary.json',
+             'attention/candidate-engine.log', 'attention/coding-512.json', 'guard.jsonl')]
+    if any(p.is_symlink() or not p.is_file() or not p.resolve().is_relative_to(campaign.resolve()) for p in files):
+        raise ValueError('missing long-context smoke artifact')
+    complete, restore, summary = (json.loads(p.read_text()) for p in files[:3])
+    if (complete.get('restored') is not True or complete.get('result_type') != 'p2p_correctness_tests'
+            or restore.get('restored') is not True or summary.get('mode') != 'smoke'
+            or summary.get('inputs') != info or summary.get('candidate_warmup') is not True
+            or summary.get('server_log_sha256') != sha(files[3])
+            or summary.get('coding_sha256', {}).get('512') != sha(files[4])):
+        raise ValueError('long-context smoke inputs or restoration do not match')
+    bench.check_path(files[3].read_text(), 'candidate')
+    if not validate_result(json.loads(files[4].read_text()), files[3].read_text(), 512)['passed']:
+        raise ValueError('coding-session smoke did not pass both edits')
+    samples = [json.loads(line) for line in files[5].read_text().splitlines()]
+    if (not samples or any(s['builders'] or s['other_jobs'] or s['unexpected'] or not s['states_ok']
+            or s['clients'] or s['listeners'] or any(s['non_target_utilization'].values())
+            or set(s['pair_free_mib']) != set(PAIR_VISIBLE.split(','))
+            or any(v < 1024 for v in s['pair_free_mib'].values()) for s in samples)):
+        raise ValueError('long-context smoke guard or VRAM floor was not clear')
+    hashes = {str(p.relative_to(campaign)): sha(p) for p in files}
+    return hashlib.sha256(json.dumps(hashes, sort_keys=True).encode()).hexdigest()
+
+
+def run_coding(target, out, env, server_log):
+    result, log = out / f'coding-{target}.json', out / f'coding-{target}.log'
+    cmd = [sys.executable, str(SOURCE / 'scripts/bench_coding_session.py'), '--url', bench.URL,
+           '--model', 'fifi-q36', '--prompt-tokens', str(target), '--max-tokens', '128',
+           '--reuse-mode', 'disabled', '--timeout', '5400', '--api-key-env', bench.KEY_ENV, '--output', str(result)]
+    with log.open('x') as stream:
+        proc = subprocess.run(cmd, cwd=SOURCE, env=env, stdout=stream, stderr=subprocess.STDOUT,
+                              timeout=7200, check=False)
+    if proc.returncode not in (0, 2) or not result.is_file():
+        raise RuntimeError(f'coding driver did not complete for {target}; inspect {log}')
+    summary = validate_result(json.loads(result.read_text()), server_log.read_text(), target)
+    if (proc.returncode == 0) != summary['passed']:
+        raise ValueError('coding exit status disagrees with its result')
+    return summary
+
+
+def run(out, mode):
+    actual, expected = os.fstat(9), LOCK.stat()
+    if (actual.st_dev, actual.st_ino) != (expected.st_dev, expected.st_ino):
+        raise RuntimeError('shared lease identity mismatch')
+    fcntl.flock(9, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    if os.environ.get('CUDA_VISIBLE_DEVICES') != PAIR_VISIBLE or os.environ.get('INFERENCE_CUDA_REQUIRE_DEVICE') != '1':
+        raise RuntimeError('device pair or required-device setting mismatch')
+    if mode not in TARGETS:
+        raise ValueError('unknown recall mode')
+    info = preflight()
+    out.mkdir(parents=True, exist_ok=False)
+    config = out / 'private-config.json'
+    config.write_bytes(bench.config_bytes())
+    config.chmod(0o600)
+    if sha(config) != info['private_config_sha256']:
+        raise RuntimeError('private configuration changed')
+    key = secrets.token_urlsafe(32)
+    env = bench.env_for(key, 'candidate')
+    env['PYTHONDONTWRITEBYTECODE'] = '1'
+    item = info['server']
+    binary = item['server_binary']
+    if sha(binary) != item['server_binary_sha256']:
+        raise RuntimeError('server binary changed')
+    logpath = out / 'candidate-engine.log'
+    results = []
+    with logpath.open('x') as log:
+        process = subprocess.Popen([binary, '--config', str(config)], cwd=Path(item['source']) / 'engine',
+                                   env=env, stdout=log, stderr=subprocess.STDOUT)
+        try:
+            free = bench.wait_ready(process, key, binary)
+            environ = Path(f'/proc/{process.pid}/environ').read_bytes().split(b'\0')
+            if environ.count(b'INFERENCE_CUDA_P2P_RING_MULTIBLOCK=1') != 1:
+                raise RuntimeError('server multi-block ring setting differs from requested candidate')
+            warm = out / 'candidate-warmup.json'
+            bench.driver('bench_p2p_prefill.py', ['--repeat', '8', '--samples', '1', '--output', str(warm)],
+                         out / 'candidate-warmup.log', env)
+            bench.check_path(logpath.read_text(), 'candidate')
+            bench.compare.summarize(json.loads(warm.read_text()), logpath.read_text(), min_samples=1)
+            for target in TARGETS[mode]:
+                print(f'PROGRESS starting two-turn coding target={target}', flush=True)
+                results.append(run_coding(target, out, env, logpath))
+                (out / 'progress.json').write_text(json.dumps({'state': 'running', 'results': results}, indent=2) + '\n')
+                print(f"PROGRESS completed target={target} prompt={results[-1]['turns'][0]['prompt_tokens']} "
+                      f"passed={results[-1]['passed']}", flush=True)
+                if not results[-1]['passed']:
+                    break
+            free_after = bench.memory_free()
+        finally:
+            bench.stop_server(process)
+    if (bench.verify_drivers() != info['drivers'] or bench.model_fingerprint() != info['model']
+            or hashlib.sha256(bench.config_bytes()).hexdigest() != info['private_config_sha256']
+            or long_source() != info['long_source'] or runner_sources() != info['runner_sources']
+            or sha(binary) != item['server_binary_sha256']):
+        raise RuntimeError('measurement inputs changed during the run')
+    summary = {'inputs': info, 'mode': mode, 'candidate_warmup': True, 'results': results,
+               'all_targets_completed': len(results) == len(TARGETS[mode]),
+               'all_session_passed': len(results) == len(TARGETS[mode]) and all(x['passed'] for x in results),
+               'server_log_sha256': sha(logpath), 'free_mib_after_load': free,
+               'free_mib_after_requests': free_after,
+               'coding_sha256': {str(item['target']): sha(out / f"coding-{item['target']}.json") for item in results},
+               'limitations': ['Synthetic two-turn code edit with prefix reuse disabled.',
+                               'One sample per length does not establish general coding quality.',
+                               'Server prefill timing includes first-batch work.']}
+    (out / 'summary.json').write_text(json.dumps(summary, indent=2, allow_nan=False) + '\n')
+
+
+if __name__ == '__main__':
+    if len(sys.argv) != 3 or sys.argv[1] not in TARGETS:
+        raise SystemExit('usage: attention_device.py smoke|full OUTPUT')
+    run(Path(sys.argv[2]), sys.argv[1])

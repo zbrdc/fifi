@@ -1,0 +1,672 @@
+#!/usr/bin/env python3
+"""Guarded P2P card tests while restoring the serving GPU pair."""
+import argparse
+import fcntl
+import hashlib
+import shlex
+import importlib.util
+import json
+import os
+import re
+from pathlib import Path
+import shutil
+import signal
+import socket
+import subprocess
+import sys
+import tempfile
+import time
+import urllib.request
+
+import attention_device as attention
+import scope_guard
+
+ROOT = Path(__file__).resolve().parent
+PRIMARY = 'fifi-qwen36-engine.service'
+SECONDARY = 'fifi-qwen36-2080ti.service'
+START = Path('/home/ben/fifi-qwen36/start.sh')
+CONFIG = Path('/home/ben/fifi-qwen36/qwen36-p2p-256k.json')
+BUILD_ENV = Path('/home/ben/fifi-scratch/a81ebdf26a2a/qwen36-local/build-env.sh')
+API_KEY = Path('/home/ben/fifi-qwen36/api-key')
+LOCK = Path('/home/ben/fifi-qwen36/gpu.lock')
+RUNNER = Path('/home/ben/fifi-qwen36/gpu-run-local')
+ROUTER_UNIT = 'fifi-web-model-router.service'
+ROUTER_EXE = Path('/home/ben/.nvm/versions/node/v22.17.0/bin/node')
+ROUTER_SCRIPT = Path('/home/ben/fifi-scratch/a81ebdf26a2a/qwen36-local/web-model-router.mjs')
+PAIR = {'GPU-704fef60-5280-9b88-fa3d-d11135caf576', 'GPU-282e266a-24ac-6fa8-a16d-4281e52b4c0a'}
+TARGET = attention.DEVICE
+PAIR_VISIBLE = 'GPU-704fef60-5280-9b88-fa3d-d11135caf576,GPU-282e266a-24ac-6fa8-a16d-4281e52b4c0a'
+OTHER = 'GPU-699004f8-e2f0-747e-5c02-30141e9d4b7c'
+
+spec = importlib.util.spec_from_file_location('peer_guard', '/home/ben/fifi-scratch/e4ecf0370956/publish-prefix-evidence/guard-peer.py')
+guard = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(guard)
+guard_original_assistant_children = guard.assistant_children
+
+
+def current_assistant_owners(proc_root=Path('/proc')):
+    """Discover every current Claude owner, including sessions started later."""
+    owners = {}
+    for path in proc_root.iterdir():
+        if not path.name.isdigit():
+            continue
+        try:
+            if (path / 'comm').read_text().strip() == 'claude':
+                fields = (path / 'stat').read_text().rsplit(')', 1)[1].split()
+                owners[int(path.name)] = int(fields[19])
+        except (FileNotFoundError, PermissionError, ProcessLookupError):
+            continue
+    return owners
+
+
+def current_assistant_children():
+    for pid, start in current_assistant_owners().items():
+        if pid in guard.OTHER_ASSISTANTS and guard.OTHER_ASSISTANTS[pid] != start:
+            raise RuntimeError(f'assistant {pid} identity changed')
+        guard.OTHER_ASSISTANTS[pid] = start
+    return guard_original_assistant_children()
+
+
+guard.assistant_children = current_assistant_children
+
+
+
+
+def state(unit):
+    data = subprocess.check_output(['systemctl', '--user', 'show', unit, '-p', 'ActiveState',
+                                    '-p', 'MainPID', '-p', 'Job'], text=True, timeout=5)
+    return dict(line.split('=', 1) for line in data.splitlines())
+
+
+def unit_fingerprint():
+    # Never persist the unit's environment values: hash loaded manager properties
+    # plus the on-disk fragment/drop-ins and manager environment.
+    properties = ('FragmentPath', 'DropInPaths', 'NeedDaemonReload', 'ExecStart', 'ExecStartPre',
+                  'ExecStartPost', 'ExecCondition', 'ExecStop', 'ExecStopPost', 'Environment',
+                  'EnvironmentFiles', 'PassEnvironment', 'UnsetEnvironment', 'WorkingDirectory',
+                  'RootDirectory', 'User', 'Group', 'Slice', 'Delegate', 'Restart',
+                  'TimeoutStopUSec', 'TimeoutStartUSec')
+    command = ['systemctl', '--user', 'show', PRIMARY]
+    for name in properties:
+        command.extend(['-p', name])
+    raw = subprocess.check_output(command, text=True, timeout=5)
+    fields = dict(line.split('=', 1) for line in raw.splitlines())
+    if fields.get('NeedDaemonReload') != 'no' or not fields.get('FragmentPath'):
+        raise RuntimeError('unit needs daemon reload or has no fragment')
+    if fields.get('EnvironmentFiles'):
+        raise RuntimeError('environment files require independent input provenance')
+    start = fields.get('ExecStart', '')
+    if start.count(' ; start_time=') != 1:
+        raise RuntimeError('cannot normalize loaded ExecStart')
+    fields['ExecStart'] = start.split(' ; start_time=', 1)[0]
+    match = re.fullmatch(r'\{ path=(.+?) ; argv\[\]=(.+?) ; ignore_errors=no', fields['ExecStart'])
+    if (not match or shlex.split(match.group(2)) != [match.group(1)]
+            or Path(match.group(1)).resolve(strict=True) != START.resolve(strict=True)):
+        raise RuntimeError('loaded ExecStart does not match the expected launcher')
+    # Other executable hooks would also require normalizing dynamic runtime data.
+    if any(fields.get(name) for name in ('ExecStartPre', 'ExecStartPost', 'ExecCondition', 'ExecStop', 'ExecStopPost')):
+        raise RuntimeError('unit hooks require independent input provenance')
+    paths = [fields['FragmentPath'], *shlex.split(fields.get('DropInPaths', ''))]
+    resolved = {}
+    for item in paths:
+        path = Path(item)
+        if not path.is_absolute() or not path.is_file():
+            raise RuntimeError('invalid unit fragment or drop-in')
+        resolved[item] = {'resolved':str(path.resolve(strict=True)), 'sha256':attention.sha(path)}
+    manager_env = subprocess.check_output(['systemctl', '--user', 'show-environment'], timeout=5)
+    encoded = json.dumps(fields, sort_keys=True, separators=(',', ':')).encode()
+    return {'unit_properties_sha256':hashlib.sha256(encoded).hexdigest(),
+            'manager_environment_sha256':hashlib.sha256(manager_env).hexdigest(), 'files':resolved}
+
+
+def ready():
+    with urllib.request.urlopen('http://127.0.0.1:18792/v1/system', timeout=5) as response:
+        data = json.load(response)
+    models = [x for x in data['engines'] if x.get('model') == 'fifi-q36']
+    return len(models) == 1 and models[0].get('state') == 'ready' and models[0].get('context_limit') == 262144
+
+
+def clients():
+    # Refuse every non-listening TCP socket, including TIME-WAIT. Restoration
+    # waits at least 120 seconds for transient closing states to drain.
+    output = subprocess.check_output(['ss', '-Htan', '( sport = :18791 )'], text=True, timeout=5)
+    found = []
+    for line in output.splitlines():
+        fields = line.split()
+        if len(fields) < 5:
+            raise RuntimeError('malformed ss socket row')
+        if fields[0] != 'LISTEN':
+            found.append(line)
+    return '\n'.join(found)
+
+
+def listeners():
+    return subprocess.check_output(['ss', '-Hltn', '( sport = :18791 )'], text=True, timeout=5).strip()
+
+
+def port_open():
+    with socket.socket() as sock:
+        sock.settimeout(1)
+        return sock.connect_ex(('127.0.0.1', 18791)) == 0
+
+
+def gpu_values(query, selected):
+    out = subprocess.check_output(['nvidia-smi', '-i', ','.join(sorted(selected)),
+        '--query-gpu=uuid,' + query, '--format=csv,noheader,nounits'], text=True, timeout=5)
+    result = {}
+    for line in out.splitlines():
+        uuid, value = line.split(',')
+        uuid = uuid.strip()
+        if uuid in result:
+            raise ValueError('duplicate GPU reading')
+        result[uuid] = int(value.strip())
+    if set(result) != set(selected):
+        raise ValueError('GPU readings do not match requested UUIDs')
+    return result
+
+
+def pair_free_ok(values):
+    return set(values) == PAIR and all(type(v) is int and v >= 1024 for v in values.values())
+
+
+
+def tcp_rows():
+    """Stable local TCP table snapshot for both ends of the service's port."""
+    result = []
+    for version in ('tcp', 'tcp6'):
+        for line in Path('/proc/net/' + version).read_text().splitlines()[1:]:
+            fields = line.split()
+            if len(fields) < 10:
+                raise RuntimeError('malformed TCP table')
+            local, remote, status, inode = fields[1], fields[2], fields[3], fields[9]
+            try:
+                laddr, lport = local.rsplit(':', 1)
+                raddr, rport = remote.rsplit(':', 1)
+                lp, rp = int(lport, 16), int(rport, 16)
+            except (ValueError, IndexError) as err:
+                raise RuntimeError('invalid TCP endpoint') from err
+            if status == '01' and (lp == 18791 or rp == 18791):
+                if version != 'tcp' or laddr != '0100007F' or raddr != '0100007F':
+                    raise RuntimeError('unexpected non-loopback or IPv6 service peer')
+                result.append((lp, rp, inode))
+    return sorted(result)
+
+
+def ss_peer_ports(text):
+    peers = []
+    for line in text.splitlines():
+        fields = line.split()
+        if len(fields) < 5:
+            raise RuntimeError('malformed ss output')
+        if fields[0] != 'ESTAB':
+            raise RuntimeError('non-established client cannot use router-poll exception')
+        local, remote = fields[3], fields[4]
+        if not local.startswith('127.0.0.1:') or not remote.startswith('127.0.0.1:'):
+            raise RuntimeError('unexpected ss address')
+        try:
+            lport, rport = int(local.rsplit(':', 1)[1]), int(remote.rsplit(':', 1)[1])
+        except ValueError as err:
+            raise RuntimeError('invalid ss port') from err
+        if lport != 18791:
+            raise RuntimeError('ss returned an unexpected service port')
+        peers.append(rport)
+    return sorted(peers)
+
+
+def fd_sockets(pid):
+    result = set()
+    for entry in (Path('/proc') / str(pid) / 'fd').iterdir():
+        try:
+            value = os.readlink(entry)
+        except FileNotFoundError:
+            # Descriptors may close while scanned; a second TCP snapshot catches it.
+            continue
+        if value.startswith('socket:[') and value.endswith(']'):
+            result.add(value[8:-1])
+    return result
+
+
+def process_identity(pid):
+    path = Path('/proc') / str(pid)
+    fields = (path / 'stat').read_text().rsplit(')', 1)[1].split()
+    return int(fields[19]), (path / 'exe').resolve(strict=True), (path / 'cmdline').read_bytes().split(b'\0')
+
+
+class TransientSnapshotRace(RuntimeError):
+    """A socket snapshot changed; retry a complete verification inside idle's bound."""
+
+
+def confirmed_router_clients(server_pid):
+    router = state(ROUTER_UNIT)
+    if router.get('ActiveState') != 'active':
+        raise RuntimeError('router unit is not active')
+    router_pid = int(router.get('MainPID', '0'))
+    if router_pid <= 0 or server_pid <= 0:
+        raise RuntimeError('invalid router or server PID')
+    first_router = process_identity(router_pid)
+    first_server = process_identity(server_pid)
+    if first_router[1] != ROUTER_EXE.resolve(strict=True) or len(first_router[2]) < 2 or os.fsdecode(first_router[2][1]) != str(ROUTER_SCRIPT):
+        raise RuntimeError('router executable or script does not match the expected service')
+    execs = [shlex.split(line) for line in START.read_text().splitlines() if line.startswith('exec ')]
+    if len(execs) != 1 or len(execs[0]) < 2 or first_server[1] != Path(execs[0][1]).resolve(strict=True):
+        raise RuntimeError('engine executable does not match its expected service launcher')
+    rows = tcp_rows()
+    router_fds, server_fds = fd_sockets(router_pid), fd_sockets(server_pid)
+    incoming = [row for row in rows if row[0] == 18791]
+    outgoing = [row for row in rows if row[1] == 18791]
+    if len(incoming) != len(outgoing):
+        raise RuntimeError('unpaired or unexpected TCP endpoints')
+    checked = []
+    for local, peer, server_inode in incoming:
+        opposite = [row for row in outgoing if row[0] == peer and row[1] == local]
+        if len(opposite) != 1 or server_inode not in server_fds or opposite[0][2] not in router_fds:
+            raise RuntimeError('client socket is not owned by the expected router and engine')
+        checked.append({'router_pid': router_pid, 'router_starttime': first_router[0],
+                        'server_pid': server_pid, 'server_starttime': first_server[0],
+                        'client_port': peer, 'router_inode': opposite[0][2], 'server_inode': server_inode})
+    # Refuse races rather than assuming a changing set is the same idle connection.
+    rows_after = tcp_rows()
+    if first_router != process_identity(router_pid) or first_server != process_identity(server_pid):
+        raise RuntimeError('process identity changed during verification')
+    if rows != rows_after:
+        raise TransientSnapshotRace('socket set changed during verification')
+    router_after = state(ROUTER_UNIT)
+    server_after = state(PRIMARY)
+    if (router_after.get('ActiveState') != 'active' or int(router_after.get('MainPID', '0')) != router_pid
+            or server_after.get('ActiveState') != 'active' or int(server_after.get('MainPID', '0')) != server_pid):
+        raise RuntimeError('service PID changed during socket verification')
+    if sorted(row[1] for row in incoming) != ss_peer_ports(clients()):
+        raise TransientSnapshotRace('TCP snapshot and ss endpoints disagree')
+    return checked
+
+
+def checked_clients(allow_confirmed_router, server_pid):
+    sockets = clients()
+    if not sockets:
+        return []
+    if not allow_confirmed_router:
+        return None
+    checked = confirmed_router_clients(server_pid)
+    if not checked:
+        raise TransientSnapshotRace('established connection disappeared during verification')
+    return checked
+
+
+def final_checked_clients(allow_confirmed_router, server_pid, observations=None):
+    """Retry only changing socket snapshots; every other refusal remains immediate."""
+    for _ in range(3):
+        try:
+            return checked_clients(allow_confirmed_router, server_pid)
+        except TransientSnapshotRace as error:
+            if observations is not None:
+                observations.append({'time':time.time(), 'event':'final_socket_snapshot_retry',
+                                     'reason':str(error)})
+            time.sleep(1)
+    return None
+
+
+def pair_idle(observations=None, *, allow_confirmed_router=False, server_pid=None):
+    quiet = 0
+    for _ in range(18):
+        utilization = gpu_values('utilization.gpu', PAIR)
+        try:
+            checked = checked_clients(allow_confirmed_router, server_pid)
+        except TransientSnapshotRace as error:
+            quiet = 0
+            if observations is not None:
+                observations.append({'time':time.time(), 'event':'socket_snapshot_retry', 'reason':str(error)})
+            time.sleep(1)
+            continue
+        ready_now = ready()
+        if observations is not None:
+            observations.append({'time':time.time(), 'router_peers':checked,
+                                 'utilization':utilization, 'ready':ready_now})
+        if checked is not None and not any(utilization.values()) and ready_now:
+            quiet += 1
+            if quiet == 3:
+                return True
+        else:
+            quiet = 0
+        time.sleep(1)
+    return False
+
+
+def lock_check():
+    actual, expected = os.fstat(9), LOCK.stat()
+    if (actual.st_dev, actual.st_ino) != (expected.st_dev, expected.st_ino):
+        raise RuntimeError('shared lease descriptor does not match lock')
+    fcntl.flock(9, fcntl.LOCK_EX | fcntl.LOCK_NB)
+
+
+def preflight(mode='smoke'):
+    if mode not in ('smoke', 'full'):
+        raise ValueError('unknown attention mode')
+    if guard.PAIR != PAIR or guard.OTHER != OTHER or TARGET not in PAIR:
+        raise ValueError('shared GPU guard does not match pinned physical devices')
+    scope_guard.check_manager()
+    info = attention.preflight()
+    if not os.access(RUNNER, os.X_OK):
+        raise ValueError('shared runner unavailable')
+    if any(not path.is_file() for path in (START, CONFIG, BUILD_ENV, API_KEY)):
+        raise ValueError('service startup or config missing')
+    if mode in ('full', 'profile'):
+        receipt = os.environ.get('FIFI_PAIR_SMOKE_RECEIPT')
+        if not receipt:
+            raise ValueError('full suite requires completed same-input pair smoke')
+        info = {**info, 'smoke_receipt_sha256': attention.validate_smoke_receipt(receipt, info)}
+    if mode == 'profile':
+        import profile_report
+        nsys = shutil.which('nsys')
+        if not nsys or not os.access(nsys, os.X_OK) or not os.access(profile_report.IMPORTER, os.X_OK):
+            raise ValueError('Nsight or importer missing')
+        info = {**info, 'nsys':nsys, 'nsys_sha256':attention.sha(nsys),
+                'importer_sha256':attention.sha(profile_report.IMPORTER)}
+    return info
+
+
+def unchanged(hashes):
+    return all(attention.sha(path) == expected for path, expected in hashes.items())
+
+
+def pair_owner(pid):
+    records = [(gpu, p) for gpu, p in guard.processes() if gpu in PAIR]
+    return len(records) == 2 and set(records) == {(gpu, pid) for gpu in PAIR}
+
+
+def other_owner(pid):
+    return [(gpu, p) for gpu, p in guard.processes() if gpu == OTHER] == [(OTHER, pid)]
+
+
+def in_pair_scope(gpu, pid, active_scope):
+    if gpu not in PAIR or active_scope is None:
+        return False
+    try:
+        return active_scope.contains(pid)
+    except ProcessLookupError:
+        return False
+
+
+def restore(hashes, unit_before, original_pid):
+    deadline = time.monotonic() + 90
+    stable = 0
+    while time.monotonic() < deadline:
+        try:
+            current = state(PRIMARY); status, job = current.get('ActiveState'), current.get('Job')
+            if job is None:
+                return False, 'systemd job state unavailable; restoration unconfirmed'
+            if job or status in ('deactivating', 'activating', 'reloading'):
+                stable = 0; time.sleep(1); continue
+            if status in ('inactive', 'failed'):
+                break
+            if status == 'active':
+                original = next((p for p in hashes if p not in (START, CONFIG, BUILD_ENV, API_KEY)), None)
+                ok = (int(current.get('MainPID', '0')) == original_pid and original is not None
+                      and unchanged(hashes) and unit_fingerprint() == unit_before
+                      and os.path.samefile(original, f'/proc/{original_pid}/exe')
+                      and pair_owner(original_pid) and ready())
+                stable = stable + 1 if ok else 0
+                if stable >= 3:
+                    return True, 'original pair service remained active and ready'
+                time.sleep(1); continue
+            return False, f'unexpected service state {status}'
+        except (OSError, ValueError, RuntimeError, subprocess.SubprocessError) as error:
+            return False, 'cannot check stop settlement: ' + repr(error)
+    else:
+        return False, 'stop did not settle within 90 seconds'
+    deadline = time.monotonic() + 120
+    while True:
+        try:
+            if not unchanged(hashes) or unit_fingerprint() != unit_before:
+                return False, 'restore deferred: original service or unit inputs changed'
+            busy = any(gpu in PAIR for gpu, _ in guard.processes())
+            occupied = port_open() or bool(listeners()) or bool(clients())
+        except (OSError, ValueError, RuntimeError, subprocess.SubprocessError) as error:
+            return False, 'cannot check restore conditions: ' + repr(error)
+        if not busy and not occupied:
+            break
+        if time.monotonic() >= deadline:
+            return False, 'restore deferred: pair or port still occupied'
+        time.sleep(1)
+    subprocess.run(['systemctl', '--user', 'start', '--no-block', PRIMARY], check=True, timeout=10)
+    deadline = time.monotonic() + 240
+    while time.monotonic() < deadline:
+        try:
+            current = state(PRIMARY)
+            new_pid = int(current.get('MainPID', '0'))
+            original = next((p for p in hashes if p not in (START, CONFIG, BUILD_ENV, API_KEY)), None)
+            if (current.get('ActiveState') == 'active' and current.get('Job') == '' and new_pid > 0
+                    and original is not None and unchanged(hashes) and unit_fingerprint() == unit_before
+                    and os.path.samefile(original, f'/proc/{new_pid}/exe') and pair_owner(new_pid) and ready()):
+                return True, 'original pair service ready'
+        except (OSError, ValueError, subprocess.SubprocessError):
+            pass
+        time.sleep(2)
+    return False, 'start issued but readiness was not confirmed'
+
+
+def validate_profile_guard(samples, evidence):
+    try:
+        if (not samples or any(s['other_jobs'] or s['builders'] or s['unexpected'] or not s['states_ok']
+                or s['clients'] or s['listeners'] or set(s['non_target_utilization']) != {OTHER}
+                or any(s['non_target_utilization'].values()) for s in samples)
+                or min(s['time'] for s in samples)*1e9 > evidence['event_start_utc_ns']
+                or max(s['time'] for s in samples)*1e9 < evidence['event_end_utc_ns']):
+            raise ValueError('sampled guard evidence does not bracket clean traced events')
+    except (KeyError, TypeError) as error:
+        raise ValueError('incomplete sampled guard or trace evidence') from error
+
+
+def interrupted(signum, _frame):
+    raise SystemExit(128 + signum)
+
+
+def relay_progress(path, offset):
+    """Forward only complete, explicitly marked progress lines from the child."""
+    with path.open() as stream:
+        stream.seek(offset)
+        while True:
+            position = stream.tell()
+            line = stream.readline()
+            if not line or not line.endswith('\n'):
+                return position
+            if line.startswith('PROGRESS ') and len(line) < 256:
+                print(line.rstrip(), flush=True)
+
+
+def execute(mode='smoke', allow_confirmed_router=False):
+    lock_check()
+    info = preflight(mode)
+    children = guard.assistant_children()
+    if guard.assistant_activity(children, children) or guard.builders():
+        raise RuntimeError('other assistant work or builder is active')
+    primary, secondary = state(PRIMARY), state(SECONDARY)
+    if primary.get('ActiveState') != 'active' or secondary.get('ActiveState') != 'active':
+        raise RuntimeError('expected services not active')
+    primary_pid, secondary_pid = int(primary['MainPID']), int(secondary['MainPID'])
+    observations = []
+    if allow_confirmed_router:
+        print('User-confirmed idle primary router-poll exception enabled; socket ownership does not prove request idleness.', flush=True)
+    if (not pair_owner(primary_pid) or not other_owner(secondary_pid)
+            or not pair_idle(observations, allow_confirmed_router=allow_confirmed_router, server_pid=primary_pid)):
+        raise RuntimeError('pair not uniquely owned or not client-free and idle')
+    if gpu_values('utilization.gpu', {OTHER})[OTHER]:
+        raise RuntimeError('2080 service is busy')
+    original = Path(os.readlink(f'/proc/{primary_pid}/exe'))
+    if not original.is_file() or not os.path.samefile(original, f'/proc/{primary_pid}/exe'):
+        raise RuntimeError('original primary executable cannot be verified')
+    hashes = {p: attention.sha(p) for p in (START, CONFIG, BUILD_ENV, API_KEY, original)}
+    unit_before = unit_fingerprint()
+    used = gpu_values('memory.used', PAIR)
+    campaign = Path(tempfile.mkdtemp(prefix='pair-reserved-', dir=ROOT))
+    temp = campaign / 'tmp'; temp.mkdir()
+    (campaign / 'inputs.json').write_text(json.dumps({'probe':info, 'primary_pid':primary_pid,
+        'secondary_pid':secondary_pid, 'used_mib':used, 'initial_observations':observations,
+        'router_poll_exception':{'enabled':allow_confirmed_router,
+            'basis':'user explicitly confirmed all sessions idle',
+            'limitation':'socket ownership does not prove request idleness; cross-user FD sharing cannot be excluded'},
+        'original_files':{str(p):h for p,h in hashes.items() if p != API_KEY},
+        'unit_fingerprint':unit_before}, indent=2) + '\n')
+    scope = scope_guard.Scope(); child = None; stop_requested = False
+    restored = None; reason = 'no handoff'
+    try:
+        before = []
+        if (guard.assistant_activity(children, guard.assistant_children()) or guard.builders()
+                or not pair_idle(before, allow_confirmed_router=allow_confirmed_router, server_pid=primary_pid)
+                or not pair_owner(primary_pid) or not other_owner(secondary_pid)
+                or gpu_values('utilization.gpu', {OTHER})[OTHER]):
+            raise RuntimeError('work, clients or ownership changed before handoff')
+        checked = final_checked_clients(allow_confirmed_router, primary_pid, before)
+        current = state(PRIMARY)
+        secondary_now = state(SECONDARY)
+        if (current.get('ActiveState') != 'active' or int(current.get('MainPID','0')) != primary_pid
+                or secondary_now.get('ActiveState') != 'active' or int(secondary_now.get('MainPID','0')) != secondary_pid
+                or checked is None
+                or any(gpu_values('utilization.gpu', PAIR).values()) or not ready()
+                or not unchanged(hashes) or unit_fingerprint() != unit_before
+                or not os.path.samefile(original, f'/proc/{primary_pid}/exe')):
+            raise RuntimeError('service identity or inputs changed before handoff')
+        (campaign / 'before-stop.json').write_text(json.dumps(before, indent=2) + '\n')
+        stop_requested = True
+        subprocess.run(['systemctl', '--user', 'stop', PRIMARY], check=True, timeout=45)
+        deadline = time.monotonic() + 120
+        while time.monotonic() < deadline:
+            if not any(gpu in PAIR for gpu, _ in guard.processes()) and not port_open() and not listeners() and not clients():
+                break
+            time.sleep(1)
+        else:
+            raise RuntimeError('primary service did not release both GPUs and sockets')
+        secondary_now = state(SECONDARY)
+        if (guard.assistant_activity(children, guard.assistant_children()) or guard.builders()
+                or secondary_now.get('ActiveState') != 'active' or int(secondary_now.get('MainPID','0')) != secondary_pid
+                or not other_owner(secondary_pid) or gpu_values('utilization.gpu', {OTHER})[OTHER]):
+            raise RuntimeError('competing work or 2080 state changed after handoff')
+        free = gpu_values('memory.free', PAIR)
+        required = {gpu:max(8192, used[gpu]+256) for gpu in PAIR}
+        if any(free[gpu] < required[gpu] for gpu in PAIR):
+            raise RuntimeError(f'pair free memory below test/restoration admission: {free}, need {required}')
+        (campaign/'memory-admission.json').write_text(json.dumps({
+            'free_mib':free, 'required_mib':required, 'service_used_before_mib':used,
+            'note':'8192 MiB minimum per card and at least prior service usage plus 256 MiB; a guard, not a measured rig footprint'
+        }, indent=2)+'\n')
+        if preflight(mode) != info:
+            raise RuntimeError('candidate or receipt changed after handoff')
+        env = {k:v for k,v in os.environ.items() if not k.startswith(('FIFI_', 'Q36_', 'INFERENCE_'))}
+        env['FIFI_P2P_BUILD_RECEIPT'] = os.environ['FIFI_P2P_BUILD_RECEIPT']
+        env['FIFI_PEER_PROOF'] = os.environ['FIFI_PEER_PROOF']
+        env['FIFI_EVENT_AB_ORDER'] = os.environ.get('FIFI_EVENT_AB_ORDER', 'control-first')
+        env['LD_LIBRARY_PATH'] = '/home/ben/fifi-qwen36/libcuda-trial' + ((':' + env['LD_LIBRARY_PATH']) if env.get('LD_LIBRARY_PATH') else '')
+        if mode in ('full', 'profile'):
+            env['FIFI_PAIR_SMOKE_RECEIPT'] = os.environ['FIFI_PAIR_SMOKE_RECEIPT']
+        if mode == 'profile':
+            env.update({'FIFI_PAIR_NSYS':info['nsys'], 'FIFI_PAIR_NSYS_SHA256':info['nsys_sha256'],
+                        'FIFI_PAIR_IMPORTER_SHA256':info['importer_sha256']})
+        env.update({'TMPDIR':str(temp), 'TMP':str(temp), 'TEMP':str(temp),
+                    'CUDA_VISIBLE_DEVICES':PAIR_VISIBLE, 'CUDA_CACHE_PATH':str(temp/'cuda-cache'),
+                    'INFERENCE_CUDA_REQUIRE_DEVICE':'1', 'CUDA_MODULE_LOADING':'LAZY'})
+        cmd = [sys.executable, str(ROOT/'attention_device.py'), mode, str(campaign/'attention')]
+        with (campaign/'runner.log').open('w') as out, (campaign/'guard.jsonl').open('w') as watch:
+            def sample_guard(active_scope):
+                other_jobs = guard.assistant_activity(children, guard.assistant_children())
+                builders = guard.builders(); unexpected = []
+                for gpu, pid in guard.processes():
+                    if gpu == OTHER and pid != secondary_pid:
+                        unexpected.append((gpu,pid))
+                    elif gpu in PAIR:
+                        if not in_pair_scope(gpu, pid, active_scope):
+                            unexpected.append((gpu,pid))
+                non_target = {OTHER}
+                utilization = gpu_values('utilization.gpu', non_target)
+                pair_free = gpu_values('memory.free', PAIR)
+                primary_now, secondary_now = state(PRIMARY), state(SECONDARY)
+                states_ok = (primary_now.get('ActiveState') in ('inactive', 'failed') and primary_now.get('Job') == ''
+                             and secondary_now.get('ActiveState') == 'active'
+                             and int(secondary_now.get('MainPID', '0')) == secondary_pid and other_owner(secondary_pid))
+                occupied_clients, occupied_listeners = bool(clients()), bool(listeners())
+                sample = {'time':time.time(),'other_jobs':other_jobs,'builders':builders,
+                          'unexpected':unexpected,'non_target_utilization':utilization,'states_ok':states_ok,
+                          'pair_free_mib':pair_free,'clients':occupied_clients,'listeners':occupied_listeners}
+                watch.write(json.dumps(sample)+'\n'); watch.flush()
+                if (other_jobs or builders or unexpected or not states_ok or any(utilization.values())
+                        or occupied_clients or occupied_listeners or not pair_free_ok(pair_free)):
+                    raise RuntimeError('competing work or listener appeared during test')
+            # The first profile observation precedes process launch, allowing
+            # the recorded samples to bracket the actual traced event interval.
+            if mode == 'profile':
+                sample_guard(None)
+            child = subprocess.Popen(scope.command(cmd), stdout=out, stderr=subprocess.STDOUT,
+                                     env=env, start_new_session=True, pass_fds=(9,))
+            scope.wait_started(child)
+            (campaign/'scope.json').write_text(json.dumps({'unit':scope.unit, 'cgroup':scope.cgroup,
+                'invocation':scope.invocation}, indent=2)+'\n')
+            deadline = time.monotonic() + (7200 if mode == 'full' else 600)
+            progress_offset = 0
+            while child.poll() is None:
+                if time.monotonic() >= deadline:
+                    raise TimeoutError('attention campaign exceeded deadline')
+                sample_guard(scope)
+                progress_offset = relay_progress(campaign/'runner.log', progress_offset)
+                time.sleep(1)
+            relay_progress(campaign/'runner.log', progress_offset)
+            if child.wait() != 0:
+                raise RuntimeError('attention test failed; inspect runner.log')
+            if mode == 'profile':
+                sample_guard(scope)
+        summary = campaign/'attention/summary.json'
+        if not summary.is_file() or not json.loads(summary.read_text()):
+            raise RuntimeError('missing attention summary')
+        if mode == 'profile':
+            evidence = json.loads(summary.read_text()).get('profile_evidence', {})
+            samples = [json.loads(line) for line in (campaign/'guard.jsonl').read_text().splitlines()]
+            validate_profile_guard(samples, evidence)
+        (campaign/'summary.json').write_text(summary.read_text())
+    finally:
+        signal.signal(signal.SIGTERM, signal.SIG_IGN); signal.signal(signal.SIGINT, signal.SIG_IGN)
+        failed = sys.exc_info()[0] is not None
+        if child is not None:
+            scope.cleanup(child)
+        if stop_requested:
+            try: restored, reason = restore(hashes, unit_before, primary_pid)
+            except (OSError, ValueError, RuntimeError, subprocess.SubprocessError) as error:
+                restored, reason = False, repr(error)
+        (campaign/'restore.json').write_text(json.dumps({'restored':restored,'reason':reason},indent=2)+'\n')
+        shutil.rmtree(temp)
+        if stop_requested and not restored:
+            raise RuntimeError(f'pair restoration unconfirmed: {reason}; artifacts {campaign}')
+        if not failed and restored and (campaign/'summary.json').is_file():
+            (campaign/'complete.json').write_text(json.dumps({'restored':True,'summary':'summary.json',
+                'result_type':('p2p_correctness_tests' if mode == 'smoke' else 'p2p_diagnostic_matrix')}, indent=2)+'\n')
+    print('Recorded diagnostic results:', campaign, flush=True)
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    modes = parser.add_mutually_exclusive_group(required=True)
+    modes.add_argument('--preflight', action='store_true')
+    modes.add_argument('--run-after-coordination', action='store_true')
+    modes.add_argument('--reserved-smoke', action='store_true', help=argparse.SUPPRESS)
+    modes.add_argument('--reserved-full', action='store_true', help=argparse.SUPPRESS)
+    modes.add_argument('--reserved-profile', action='store_true', help=argparse.SUPPRESS)
+    action = parser.add_mutually_exclusive_group()
+    action.add_argument('--full', action='store_true')
+    action.add_argument('--profile', action='store_true')
+    parser.add_argument('--smoke-receipt')
+    parser.add_argument('--allow-confirmed-pair-router-polls', action='store_true',
+                        help='apply user-confirmed idle primary router-socket exception')
+    args = parser.parse_args()
+    mode = 'profile' if args.profile or args.reserved_profile else 'full' if args.full or args.reserved_full else 'smoke'
+    if args.smoke_receipt: os.environ['FIFI_PAIR_SMOKE_RECEIPT'] = args.smoke_receipt
+    if args.preflight:
+        print(json.dumps(preflight(mode), indent=2))
+    elif args.run_after_coordination:
+        preflight(mode)
+        env = os.environ.copy(); env['FIFI_SCRATCH_ROOT'] = str(LOCK.parent); env['CUDA_VISIBLE_DEVICES'] = PAIR_VISIBLE
+        command = [str(RUNNER), '--reserve', '--', sys.executable, __file__,
+                   '--reserved-profile' if args.profile else '--reserved-full' if args.full else '--reserved-smoke']
+        if args.allow_confirmed_pair_router_polls:
+            command.append('--allow-confirmed-pair-router-polls')
+        os.execve(str(RUNNER), command, env)
+    else:
+        signal.signal(signal.SIGINT, interrupted); signal.signal(signal.SIGTERM, interrupted)
+        execute(mode, allow_confirmed_router=args.allow_confirmed_pair_router_polls)
+
+if __name__ == '__main__': main()

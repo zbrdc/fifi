@@ -1,0 +1,222 @@
+{
+  "scope": "One guarded synthetic cold recall request per length; no coding or warm-cache qualification.",
+  "model": "Qwen3.6 35B A3B Q4_K_M",
+  "model_sha256": "671e47e0ec53c665d048b98c3ecbfd5236b5ca9c3e02ed19fc8f81f7b85140c7",
+  "devices": [
+    "RTX 3060 12 GB",
+    "RTX 3080 10 GB"
+  ],
+  "context_limit": 262144,
+  "kv_cache": "q8",
+  "prefix_reuse": false,
+  "chunk_rows": 512,
+  "settings": {
+    "INFERENCE_CUDA_P2P_RING_MULTIBLOCK": "1",
+    "Q36_P2P_ASYNC_BROADCAST": "0"
+  },
+  "tested_source_commit": "cc635bbdf4f9adb7f261d0721b63200ea7293341",
+  "server_binary_sha256": "0f276c5f071a0249b7b82e714de09e94722768e3fee22a1fd529b68784640f5e",
+  "driver_source": {
+    "commit": "90f1de648b4b18cb76e1e2f43218be9b6890a8d8",
+    "files": {
+      "bench_long_context.py": "67adb062bb6e2b73d6830cf69625f3f7657d959aa7426025bb4bbf3f9d5c6803",
+      "bench_engines.py": "09f42c1f164c2c6479bc5a200dd3c127d0c36082e02f35e865b4ce2d109904a2"
+    }
+  },
+  "runner_sources": {
+    "attention_device.py": "a07b67066fc8eb60985957f678ba9b0a0f7e68673de7189a04e047ecaa3a4b20",
+    "benchmark_device.py": "2eacb6ae874d8f65c2e435d7d6b300787366dea206e9b6cac97704f8e4ac732d",
+    "reserve_pair_attention.py": "3515b16aa5aa817ce4ebdcdc545173a15a5cf26578b10bafd946c503cb3f5a18",
+    "scope_guard.py": "14d7aec72002f2d4b067609e98bf397f7e080ea7fdb9ab5337f836325f9b8cb2",
+    "trace_activation.py": "d994ad337051dfb16b79b70531aeacbc8e8d93622e4647e711680c1b7c11d1ea",
+    "shared_guard_sha256": "e7022df0efde4a270e50836697403cb147d7526443512050bfe13ed770fa3ef3"
+  },
+  "peer_proof": {
+    "summary_sha256": "a3bb3bd0b87da9f1605797ab8f754e1323b6c59e63e3df9b939d68fa8d0d9b3d",
+    "guard_sha256": "7e5f891a2ce9c67885fde0689e9fea7c95334e4fa1ff0e722f3208c97ff21325",
+    "guard_samples": 14,
+    "activation": {
+      "trace_sha256": "6a2a3851cb53b172c4556a223e43c641e0ff28f06720e0ef07cee027c5aaad95",
+      "tracer_sha256": "8bdff6f409c35cda3032c84f187b6ebf861d1aa7cd0049bf8846ff31e6005fff",
+      "devices": {
+        "0": "704fef60-5280-9b88-fa3d-d11135caf576",
+        "1": "282e266a-24ac-6fa8-a16d-4281e52b4c0a"
+      },
+      "multiblock_launches": [
+        {
+          "device": 0,
+          "name": "publish_f32_kernel",
+          "grid_x": 64,
+          "count": 41
+        },
+        {
+          "device": 0,
+          "name": "wait_sum_kernel",
+          "grid_x": 64,
+          "count": 41
+        },
+        {
+          "device": 1,
+          "name": "publish_f32_kernel",
+          "grid_x": 64,
+          "count": 41
+        },
+        {
+          "device": 1,
+          "name": "wait_sum_kernel",
+          "grid_x": 64,
+          "count": 41
+        }
+      ]
+    }
+  },
+  "results": [
+    {
+      "target": 8192,
+      "prompt_tokens": 8312,
+      "completion_tokens": 21,
+      "request_id": "chatcmpl-0000000000000005",
+      "recall_passed": true,
+      "marker_checks": [
+        {
+          "name": "MAPLE",
+          "approx_depth_fraction": 0.1,
+          "expected": "750489",
+          "reported": "750489",
+          "correct": true
+        },
+        {
+          "name": "COBALT",
+          "approx_depth_fraction": 0.5,
+          "expected": "133515",
+          "reported": "133515",
+          "correct": true
+        },
+        {
+          "name": "FJORD",
+          "approx_depth_fraction": 0.9,
+          "expected": "299897",
+          "reported": "299897",
+          "correct": true
+        }
+      ],
+      "server_prefill_ms": 15516.5,
+      "server_first_batch_tokens_per_second": 535.6878161956627,
+      "first_visible_seconds": 15.525522607989842,
+      "decode_tokens_per_second": 38.36,
+      "raw_result_sha256": "8afb8ccaa03bc778ebd07f1f4405d8ba17845eb722c798d03687ae77b406d391"
+    },
+    {
+      "target": 32768,
+      "prompt_tokens": 32882,
+      "completion_tokens": 21,
+      "request_id": "chatcmpl-0000000000000009",
+      "recall_passed": true,
+      "marker_checks": [
+        {
+          "name": "MAPLE",
+          "approx_depth_fraction": 0.1,
+          "expected": "271425",
+          "reported": "271425",
+          "correct": true
+        },
+        {
+          "name": "COBALT",
+          "approx_depth_fraction": 0.5,
+          "expected": "581676",
+          "reported": "581676",
+          "correct": true
+        },
+        {
+          "name": "FJORD",
+          "approx_depth_fraction": 0.9,
+          "expected": "237926",
+          "reported": "237926",
+          "correct": true
+        }
+      ],
+      "server_prefill_ms": 61233.5,
+      "server_first_batch_tokens_per_second": 536.9936391027787,
+      "first_visible_seconds": 61.271656025986886,
+      "decode_tokens_per_second": 35.93,
+      "raw_result_sha256": "57b3f681b67018ba49ef1d2f924b3869acef97e1abb06468899b06346016bd82"
+    },
+    {
+      "target": 131072,
+      "prompt_tokens": 131194,
+      "completion_tokens": 21,
+      "request_id": "chatcmpl-000000000000000d",
+      "recall_passed": true,
+      "marker_checks": [
+        {
+          "name": "MAPLE",
+          "approx_depth_fraction": 0.1,
+          "expected": "935393",
+          "reported": "935393",
+          "correct": true
+        },
+        {
+          "name": "COBALT",
+          "approx_depth_fraction": 0.5,
+          "expected": "858893",
+          "reported": "858893",
+          "correct": true
+        },
+        {
+          "name": "FJORD",
+          "approx_depth_fraction": 0.9,
+          "expected": "156661",
+          "reported": "156661",
+          "correct": true
+        }
+      ],
+      "server_prefill_ms": 265967.4,
+      "server_first_batch_tokens_per_second": 493.2709798268509,
+      "first_visible_seconds": 266.12206821498694,
+      "decode_tokens_per_second": 29.86,
+      "raw_result_sha256": "d9fbb180b8a9789260d7ee95ed7cc397f7baf415ec6a0576a08006d1e92327ed"
+    }
+  ],
+  "smoke": {
+    "receipt_sha256": "52492434e9b753f7c7bd849e32b6ecdf778191ee50b002327957700ed1550e85",
+    "guard": {
+      "samples": 86,
+      "minimum_free_mib": 1368,
+      "sha256": "c1770a59e3e84ed1a9837d75a1c1da118920226c6c22a000f57ee7ba8b84f144"
+    },
+    "restoration": {
+      "reason": "original pair service ready",
+      "complete_sha256": "b04bf9539c44c53d3c4cedb8355c630aad2cf21fa74f59e00eb8b64d91cbf79c",
+      "restore_sha256": "ec8531c48de7e4b199aa41197040a5fa2ca12bb1cfe82410d3117e7642e3194d"
+    }
+  },
+  "full": {
+    "guard": {
+      "samples": 338,
+      "minimum_free_mib": 1368,
+      "sha256": "fc4c7d316e4bc0a3476797b2630f7249c26760e09232d115f9c1b3ef02ee07e4"
+    },
+    "restoration": {
+      "reason": "original pair service ready",
+      "complete_sha256": "4504254b08166ddf68afcb00f829c8d99d8cef0f9e49114b7ec37a4cd5d25b24",
+      "restore_sha256": "ec8531c48de7e4b199aa41197040a5fa2ca12bb1cfe82410d3117e7642e3194d"
+    },
+    "summary_sha256": "f50501b7f8d1bb688b09225da0c2bb56964a92191e69165326ce78ec29ce5123",
+    "server_log_sha256": "5d403dd106a42f72845a16665a13ac76a596f9f336dc7cdf899e2bfc38b5e3a1"
+  },
+  "secondary_service_unchanged": {
+    "ready": true,
+    "fingerprint_sha256": {
+      "executable": "7ecc29185c3ff4b0cf29df8d6e39f1be5446f93bbf8128f8d8049377fcef1490",
+      "start": "67fce39d8ed2ec714da6f252e9bd0fd0e1dbc30dc6e0b83bf101b49f10c8000f",
+      "config": "821a91e6d0a763a31f4676d6bab5c8bfd5f2739737e05c612deece673cbd430f"
+    }
+  },
+  "limitations": [
+    "Each length is one cold synthetic prompt with three markers, not a coding-quality benchmark.",
+    "No prefix reuse or multi-turn session behavior was tested.",
+    "The configured 262144-token context was not filled in this campaign.",
+    "Server prefill timing includes first emitted-batch work.",
+    "This result does not qualify the experimental ring or the main base for default use."
+  ]
+}

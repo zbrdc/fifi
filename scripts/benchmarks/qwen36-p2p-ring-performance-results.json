@@ -1,0 +1,753 @@
+{
+  "scope": "Guarded synthetic Qwen3.6 multiblock peer-ring comparison; no production qualification.",
+  "source_commit": "cc635bbdf4f9adb7f261d0721b63200ea7293341",
+  "model": "Qwen3.6 35B A3B Q4_K_M",
+  "model_sha256": "671e47e0ec53c665d048b98c3ecbfd5236b5ca9c3e02ed19fc8f81f7b85140c7",
+  "devices": [
+    "RTX 3060 12 GB",
+    "RTX 3080 10 GB"
+  ],
+  "kv_cache": "q8",
+  "configured_context_tokens": 262144,
+  "prefix_reuse": false,
+  "chunk_rows": 512,
+  "samples_per_arm_per_order": 3,
+  "arm_difference": {
+    "control": {
+      "INFERENCE_CUDA_P2P_RING_MULTIBLOCK": "0"
+    },
+    "candidate": {
+      "INFERENCE_CUDA_P2P_RING_MULTIBLOCK": "1"
+    }
+  },
+  "common_sync_broadcast": "1",
+  "common_async_broadcast": "0",
+  "host_expert_bytes_requested": [
+    1395864370,
+    3489660928
+  ],
+  "host_expert_bytes_selected": [
+    1434451968,
+    3548381184
+  ],
+  "build": {
+    "target": "native-cuda linux sm86 release",
+    "test_binary_sha256": "aa97c8500dbfaf5ac27a6560da4809e0852d8ac6eb3ba1bd49a80c15d33574be",
+    "server_binary_sha256": "0f276c5f071a0249b7b82e714de09e94722768e3fee22a1fd529b68784640f5e",
+    "receipt_sha256": "775379a254d70815e190b283a68200dfddf9ada2afd113ddf77940a3d0cb94a1",
+    "test_build_log_sha256": "b34b568cbc379bbeff9694732e47c472b88acee4db2175b9d50ecd6e238a07f3",
+    "server_build_log_sha256": "d1cc4be2e33cdadc2d4f2a98c8e98e75a9fb74073b7dff273aa3514985aae40e",
+    "selected_host_tests": [
+      {
+        "name": "family::qwen36::cuda::card_prefill::config_tests::chunk_setting_is_explicit_and_bounded",
+        "log_sha256": "45bf73c97c017a8c524c271a1260d25bcf83695fa13a8ddd9a22e75feb298dca",
+        "output": "\nrunning 1 test\ntest family::qwen36::cuda::card_prefill::config_tests::chunk_setting_is_explicit_and_bounded ... ok\n\ntest result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 5924 filtered out; finished in 0.00s\n\n"
+      },
+      {
+        "name": "family::qwen36::cuda::card_prefill::config_tests::mailbox_covers_both_chunk_sums_and_eager_decode",
+        "log_sha256": "06043a27e4e8ac9a7cc7ad4e0493e0df56ba5f54c618007475d4b231c53a270a",
+        "output": "\nrunning 1 test\ntest family::qwen36::cuda::card_prefill::config_tests::mailbox_covers_both_chunk_sums_and_eager_decode ... ok\n\ntest result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 5924 filtered out; finished in 0.00s\n\n"
+      },
+      {
+        "name": "family::qwen36::cuda::card_prefill::config_tests::chunk_admission_preserves_the_free_vram_floor",
+        "log_sha256": "5628256ef6339c192775767d13ed7722e91387639b9d435005a6bc9956abc365",
+        "output": "\nrunning 1 test\ntest family::qwen36::cuda::card_prefill::config_tests::chunk_admission_preserves_the_free_vram_floor ... ok\n\ntest result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 5924 filtered out; finished in 0.00s\n\n"
+      },
+      {
+        "name": "family::qwen36::cuda::card_prefill::config_tests::card_staging_respects_shard_geometry_and_live_floor",
+        "log_sha256": "8235944d6e42124cfd800fdd8482d2c3d36ad971d70461d3d2f19937a6864e21",
+        "output": "\nrunning 1 test\ntest family::qwen36::cuda::card_prefill::config_tests::card_staging_respects_shard_geometry_and_live_floor ... ok\n\ntest result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 5924 filtered out; finished in 0.00s\n\n"
+      },
+      {
+        "name": "family::qwen36::cuda::prefill_plan::card_tests::card_chunk_arenas_are_narrower_and_complete",
+        "log_sha256": "c63f249bbc4db20b8d4f1a181fcf945d19d482142e72f8680585f819cfa4c0d8",
+        "output": "\nrunning 1 test\ntest family::qwen36::cuda::prefill_plan::card_tests::card_chunk_arenas_are_narrower_and_complete ... ok\n\ntest result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 5924 filtered out; finished in 0.00s\n\n"
+      },
+      {
+        "name": "family::qwen36::cuda::prefill_plan::card_tests::card_combine_output_is_disjoint_from_its_inputs",
+        "log_sha256": "cc1650930b7510a965b5d8d78289930336f5bfec6aff352ce11a8ed9d10d1ccf",
+        "output": "\nrunning 1 test\ntest family::qwen36::cuda::prefill_plan::card_tests::card_combine_output_is_disjoint_from_its_inputs ... ok\n\ntest result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 5924 filtered out; finished in 0.00s\n\n"
+      },
+      {
+        "name": "family::qwen36::cuda::prefill_tests::zero_row_is_optional_only_for_native_card_views",
+        "log_sha256": "224c148a07899a68848fec830079fe105c749f4739691ac4e5ccb4749f4016cf",
+        "output": "\nrunning 1 test\ntest family::qwen36::cuda::prefill_tests::zero_row_is_optional_only_for_native_card_views ... ok\n\ntest result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 5924 filtered out; finished in 0.00s\n\n"
+      },
+      {
+        "name": "family::qwen36::settings::tests::the_pin_holds_the_digest_of_each_tokenizer_file",
+        "log_sha256": "dcc7a0a49ae51702c9948cb66ababdbb66fcfcc3fdbdee12b98653cb13326534",
+        "output": "\nrunning 1 test\ntest family::qwen36::settings::tests::the_pin_holds_the_digest_of_each_tokenizer_file ... ok\n\ntest result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 5924 filtered out; finished in 0.00s\n\n"
+      },
+      {
+        "name": "family::qwen36::settings::tests::tokenizer_pin_selection_keeps_dense_and_moe_bundles_separate",
+        "log_sha256": "9f456b5efdef1a75557e2da91879450aee152aac9e4c5245104722b8da1e7c50",
+        "output": "\nrunning 1 test\ntest family::qwen36::settings::tests::tokenizer_pin_selection_keeps_dense_and_moe_bundles_separate ... ok\n\ntest result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 5924 filtered out; finished in 0.00s\n\n"
+      }
+    ]
+  },
+  "peer_correctness": {
+    "cases": [
+      {
+        "case": "chunk-exchange",
+        "test": "kernels::cuda::peer_ring::device_tests::chunk_sized_exchange_sums_on_a_physical_pair",
+        "log_sha256": "2b5c8ec3c550fa619b20cd5ee7bf9c215d150f3a12dd90c7bd2259580e80971c",
+        "output": "\nrunning 1 test\ntest kernels::cuda::peer_ring::device_tests::chunk_sized_exchange_sums_on_a_physical_pair ... CUDA devices visible: 2\nchunk_sized_exchange_sums_on_a_physical_pair: 256x2048 f32 (2.10 MB payload) exchange_sum: 0.0005114668*1e3 = 0.511 ms              per exchange; a 40-layer chunk pays 80 sums = 40.9 ms\nok\n\ntest result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 5924 filtered out; finished in 0.72s\n\nCollecting data...\nGenerating '/home/ben/fifi-scratch/0cae2ae995db/p2p-async-chunk/ring-check/pair-reserved-jls9qb5_/tmp/nsys-ben/nsys-report-91ca.qdstrm'\n\n[1/1] [0%                          ] ring-activation.nsys-rep\n[1/1] [0%                          ] ring-activation.nsys-rep\n[1/1] [1%                          ] ring-activation.nsys-rep\n[1/1] [3%                          ] ring-activation.nsys-rep\n[1/1] [======35%                   ] ring-activation.nsys-rep\n[1/1] [====================85%     ] ring-activation.nsys-rep\n[1/1] [========================98% ] ring-activation.nsys-rep\n[1/1] [========================99% ] ring-activation.nsys-rep\n[1/1] [========================100%] ring-activation.nsys-rep\n[1/1] [========================100%] ring-activation.nsys-rep\nGenerated:\n\t/home/ben/fifi-scratch/0cae2ae995db/p2p-async-chunk/ring-check/pair-reserved-jls9qb5_/attention/ring-activation.nsys-rep\n"
+      },
+      {
+        "case": "chain-reuse",
+        "test": "kernels::cuda::peer_ring::device_tests::physical_pair_chains_large_exchanges_without_host_synchronization",
+        "log_sha256": "5df18d529ae0fbbaa157359212e26676265b976cbb31784cec2159aa55831a71",
+        "output": "\nrunning 1 test\ntest kernels::cuda::peer_ring::device_tests::physical_pair_chains_large_exchanges_without_host_synchronization ... CUDA devices visible: 2\nok\n\ntest result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 5924 filtered out; finished in 0.46s\n\n"
+      },
+      {
+        "case": "overflow-reuse",
+        "test": "kernels::cuda::peer_ring::device_tests::physical_pair_clears_fp16_overflow_when_a_large_f32_slot_is_reused",
+        "log_sha256": "0e48cae3fc81d27770fb03e8123a940a1abc66b460f2e121cd187f4ab764c3a8",
+        "output": "\nrunning 1 test\ntest kernels::cuda::peer_ring::device_tests::physical_pair_clears_fp16_overflow_when_a_large_f32_slot_is_reused ... CUDA devices visible: 2\nok\n\ntest result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 5924 filtered out; finished in 0.37s\n\n"
+      },
+      {
+        "case": "timeout",
+        "test": "kernels::cuda::peer_ring::device_tests::large_waits_with_no_publisher_report_timeout_and_leave_output_unchanged",
+        "log_sha256": "c613bf13bc3839c57ae5e3ffd53b856aac03520e7d041889c67d8201599f7fe2",
+        "output": "\nrunning 1 test\ntest kernels::cuda::peer_ring::device_tests::large_waits_with_no_publisher_report_timeout_and_leave_output_unchanged ... CUDA devices visible: 2\nok\n\ntest result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 5924 filtered out; finished in 0.25s\n\n"
+      },
+      {
+        "case": "large-chunk-logits",
+        "test": "family::qwen36::cuda::card_chunk_device_tests::large_card_chunk_matches_the_per_token_path_on_physical_peers",
+        "log_sha256": "55f23266370f738689a307a4bcbc3ff5d61b758f1583990063fcffc91caeaa14",
+        "output": "\nrunning 1 test\ntest family::qwen36::cuda::card_chunk_device_tests::large_card_chunk_matches_the_per_token_path_on_physical_peers ... CUDA devices visible: 2\nq36 cuda: card 0 KV8 staging: 256 rows, 262144 bytes\nq36 cuda: card 1 KV8 staging: 256 rows, 262144 bytes\ngdn_delta qualification partitioned=false\ncard_chunk_matches_the_per_token_path: 96 rows, winner 3256, chunk margin 37.4642/34.8854\nok\n\ntest result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 5924 filtered out; finished in 11.15s\n\n"
+      }
+    ],
+    "guard": {
+      "samples": 14,
+      "sha256": "7e5f891a2ce9c67885fde0689e9fea7c95334e4fa1ff0e722f3208c97ff21325",
+      "minimum_free_mib": null
+    },
+    "restoration": {
+      "reason": "original pair service ready",
+      "complete_sha256": "4504254b08166ddf68afcb00f829c8d99d8cef0f9e49114b7ec37a4cd5d25b24",
+      "restore_sha256": "ec8531c48de7e4b199aa41197040a5fa2ca12bb1cfe82410d3117e7642e3194d"
+    },
+    "summary_sha256": "a3bb3bd0b87da9f1605797ab8f754e1323b6c59e63e3df9b939d68fa8d0d9b3d",
+    "activation": {
+      "trace_sha256": "6a2a3851cb53b172c4556a223e43c641e0ff28f06720e0ef07cee027c5aaad95",
+      "tracer_sha256": "8bdff6f409c35cda3032c84f187b6ebf861d1aa7cd0049bf8846ff31e6005fff",
+      "devices": {
+        "0": "704fef60-5280-9b88-fa3d-d11135caf576",
+        "1": "282e266a-24ac-6fa8-a16d-4281e52b4c0a"
+      },
+      "multiblock_launches": [
+        {
+          "device": 0,
+          "name": "publish_f32_kernel",
+          "grid_x": 64,
+          "count": 41
+        },
+        {
+          "device": 0,
+          "name": "wait_sum_kernel",
+          "grid_x": 64,
+          "count": 41
+        },
+        {
+          "device": 1,
+          "name": "publish_f32_kernel",
+          "grid_x": 64,
+          "count": 41
+        },
+        {
+          "device": 1,
+          "name": "wait_sum_kernel",
+          "grid_x": 64,
+          "count": 41
+        }
+      ]
+    },
+    "preceding_smoke": {
+      "receipt_sha256": "34f7b8ee93984f2b9662ab4906cfebc435542eddbf559d45f771bb892005dd84",
+      "guard": {
+        "samples": 10,
+        "sha256": "9d1f3e36d6c306d884518bd07a7f1f0a724924569241f779762038b92166853e",
+        "minimum_free_mib": null
+      },
+      "restoration": {
+        "reason": "original pair service ready",
+        "complete_sha256": "b04bf9539c44c53d3c4cedb8355c630aad2cf21fa74f59e00eb8b64d91cbf79c",
+        "restore_sha256": "ec8531c48de7e4b199aa41197040a5fa2ca12bb1cfe82410d3117e7642e3194d"
+      }
+    }
+  },
+  "served_smoke": {
+    "guard": {
+      "samples": 87,
+      "sha256": "54f2c824607471a0e1160d843eaaba8a5ff4821877303bacb0705334cfa15455",
+      "minimum_free_mib": 1370
+    },
+    "restoration": {
+      "reason": "original pair service ready",
+      "complete_sha256": "b04bf9539c44c53d3c4cedb8355c630aad2cf21fa74f59e00eb8b64d91cbf79c",
+      "restore_sha256": "ec8531c48de7e4b199aa41197040a5fa2ca12bb1cfe82410d3117e7642e3194d"
+    },
+    "summary_sha256": "48c3fc6c7702af8e2cd948b6fa26b767758d52b1a5816b3f4fda411f0a49f7e4"
+  },
+  "runs": [
+    {
+      "order": "control-first",
+      "comparisons": {
+        "short": {
+          "payload_sha256": "30d2e3484b1f4583f6e329fe9f8f9263e51894aa7898aa11fe107829277ee8ab",
+          "control": {
+            "samples": [
+              {
+                "request_id": "chatcmpl-0000000000000002",
+                "prompt_tokens": 524,
+                "completion_tokens": 2,
+                "reused_tokens": 0,
+                "prefill_ms": 1245.6,
+                "started_to_first_token_prompt_tokens_per_second": 420.6807964033398,
+                "complete_reply_prompt_tokens_per_second": 411.52424969469456,
+                "decode_tokens_per_second": 38.53
+              },
+              {
+                "request_id": "chatcmpl-0000000000000003",
+                "prompt_tokens": 524,
+                "completion_tokens": 2,
+                "reused_tokens": 0,
+                "prefill_ms": 1242.4,
+                "started_to_first_token_prompt_tokens_per_second": 421.7643271088216,
+                "complete_reply_prompt_tokens_per_second": 412.7024132064773,
+                "decode_tokens_per_second": 38.6
+              },
+              {
+                "request_id": "chatcmpl-0000000000000004",
+                "prompt_tokens": 524,
+                "completion_tokens": 2,
+                "reused_tokens": 0,
+                "prefill_ms": 1246.1,
+                "started_to_first_token_prompt_tokens_per_second": 420.5119974319878,
+                "complete_reply_prompt_tokens_per_second": 411.4977497198439,
+                "decode_tokens_per_second": 38.7
+              }
+            ],
+            "median_started_to_first_token_prompt_tokens_per_second": 420.6807964033398,
+            "median_complete_reply_prompt_tokens_per_second": 411.52424969469456
+          },
+          "candidate": {
+            "samples": [
+              {
+                "request_id": "chatcmpl-0000000000000002",
+                "prompt_tokens": 524,
+                "completion_tokens": 2,
+                "reused_tokens": 0,
+                "prefill_ms": 1097.5,
+                "started_to_first_token_prompt_tokens_per_second": 477.4487471526196,
+                "complete_reply_prompt_tokens_per_second": 465.9049180531932,
+                "decode_tokens_per_second": 38.94
+              },
+              {
+                "request_id": "chatcmpl-0000000000000003",
+                "prompt_tokens": 524,
+                "completion_tokens": 2,
+                "reused_tokens": 0,
+                "prefill_ms": 1096.3,
+                "started_to_first_token_prompt_tokens_per_second": 477.97135820487097,
+                "complete_reply_prompt_tokens_per_second": 466.46441339429424,
+                "decode_tokens_per_second": 38.9
+              },
+              {
+                "request_id": "chatcmpl-0000000000000004",
+                "prompt_tokens": 524,
+                "completion_tokens": 2,
+                "reused_tokens": 0,
+                "prefill_ms": 1096.1,
+                "started_to_first_token_prompt_tokens_per_second": 478.05857129823926,
+                "complete_reply_prompt_tokens_per_second": 466.5254625858153,
+                "decode_tokens_per_second": 38.91
+              }
+            ],
+            "median_started_to_first_token_prompt_tokens_per_second": 477.97135820487097,
+            "median_complete_reply_prompt_tokens_per_second": 466.46441339429424
+          },
+          "started_to_first_token_speedup": 1.1361853507251665,
+          "timing_note": "Server timing runs from job start to first emitted batch and includes first-token generation; client timing runs to the complete reply.",
+          "answer_sha256": "4b227777d4dd1fc61c6f884f48641d02b4d121d3fd328cb08b5531fcacdabf8a"
+        },
+        "long": {
+          "payload_sha256": "83bc090b8c20bbf350317d552c592dd83fd0f8a0e9505c1ed895b914be94e890",
+          "control": {
+            "samples": [
+              {
+                "request_id": "chatcmpl-0000000000000005",
+                "prompt_tokens": 4274,
+                "completion_tokens": 2,
+                "reused_tokens": 0,
+                "prefill_ms": 9004.4,
+                "started_to_first_token_prompt_tokens_per_second": 474.6568344364977,
+                "complete_reply_prompt_tokens_per_second": 472.99376055493207,
+                "decode_tokens_per_second": 38.59
+              },
+              {
+                "request_id": "chatcmpl-0000000000000006",
+                "prompt_tokens": 4274,
+                "completion_tokens": 2,
+                "reused_tokens": 0,
+                "prefill_ms": 9015.2,
+                "started_to_first_token_prompt_tokens_per_second": 474.0882065844351,
+                "complete_reply_prompt_tokens_per_second": 472.45485397618734,
+                "decode_tokens_per_second": 38.35
+              },
+              {
+                "request_id": "chatcmpl-0000000000000007",
+                "prompt_tokens": 4274,
+                "completion_tokens": 2,
+                "reused_tokens": 0,
+                "prefill_ms": 9022.9,
+                "started_to_first_token_prompt_tokens_per_second": 473.6836272151969,
+                "complete_reply_prompt_tokens_per_second": 472.07578926068453,
+                "decode_tokens_per_second": 38.51
+              }
+            ],
+            "median_started_to_first_token_prompt_tokens_per_second": 474.0882065844351,
+            "median_complete_reply_prompt_tokens_per_second": 472.45485397618734
+          },
+          "candidate": {
+            "samples": [
+              {
+                "request_id": "chatcmpl-0000000000000005",
+                "prompt_tokens": 4274,
+                "completion_tokens": 2,
+                "reused_tokens": 0,
+                "prefill_ms": 7800.2,
+                "started_to_first_token_prompt_tokens_per_second": 547.9346683418374,
+                "complete_reply_prompt_tokens_per_second": 545.7223805293813,
+                "decode_tokens_per_second": 38.68
+              },
+              {
+                "request_id": "chatcmpl-0000000000000006",
+                "prompt_tokens": 4274,
+                "completion_tokens": 2,
+                "reused_tokens": 0,
+                "prefill_ms": 7791.0,
+                "started_to_first_token_prompt_tokens_per_second": 548.5816968296753,
+                "complete_reply_prompt_tokens_per_second": 546.4155320085207,
+                "decode_tokens_per_second": 38.73
+              },
+              {
+                "request_id": "chatcmpl-0000000000000007",
+                "prompt_tokens": 4274,
+                "completion_tokens": 2,
+                "reused_tokens": 0,
+                "prefill_ms": 7807.7,
+                "started_to_first_token_prompt_tokens_per_second": 547.4083276765244,
+                "complete_reply_prompt_tokens_per_second": 545.221144324017,
+                "decode_tokens_per_second": 37.74
+              }
+            ],
+            "median_started_to_first_token_prompt_tokens_per_second": 547.9346683418374,
+            "median_complete_reply_prompt_tokens_per_second": 545.7223805293813
+          },
+          "started_to_first_token_speedup": 1.1557652367888005,
+          "timing_note": "Server timing runs from job start to first emitted batch and includes first-token generation; client timing runs to the complete reply.",
+          "answer_sha256": "4b227777d4dd1fc61c6f884f48641d02b4d121d3fd328cb08b5531fcacdabf8a"
+        },
+        "decode": {
+          "control_median_tokens_per_second": 38.54,
+          "candidate_median_tokens_per_second": 38.84,
+          "speedup": 1.0077841203943956,
+          "payload_sha256": "bacd82b581ce7dd5cb38dde1bb3004787b2327dab7ae6d4d6b3d25a6df747f3e",
+          "samples": {
+            "control": [
+              {
+                "request_id": "chatcmpl-0000000000000008",
+                "prompt_tokens": 31,
+                "completion_tokens": 128,
+                "finish_reason": "length",
+                "answer_sha256": "ef5d7dd6bee907301e7cdb774195e953c37a82af6e8bde4afacc7b1ed065113b",
+                "time_to_first_token_ms": 271.8,
+                "decode_tokens_per_second": 38.47,
+                "total_seconds": 3.574446
+              },
+              {
+                "request_id": "chatcmpl-0000000000000009",
+                "prompt_tokens": 31,
+                "completion_tokens": 128,
+                "finish_reason": "length",
+                "answer_sha256": "ef5d7dd6bee907301e7cdb774195e953c37a82af6e8bde4afacc7b1ed065113b",
+                "time_to_first_token_ms": 272.4,
+                "decode_tokens_per_second": 38.55,
+                "total_seconds": 3.567772
+              },
+              {
+                "request_id": "chatcmpl-000000000000000a",
+                "prompt_tokens": 31,
+                "completion_tokens": 128,
+                "finish_reason": "length",
+                "answer_sha256": "ef5d7dd6bee907301e7cdb774195e953c37a82af6e8bde4afacc7b1ed065113b",
+                "time_to_first_token_ms": 270.8,
+                "decode_tokens_per_second": 38.54,
+                "total_seconds": 3.56717
+              }
+            ],
+            "candidate": [
+              {
+                "request_id": "chatcmpl-0000000000000008",
+                "prompt_tokens": 31,
+                "completion_tokens": 128,
+                "finish_reason": "length",
+                "answer_sha256": "ef5d7dd6bee907301e7cdb774195e953c37a82af6e8bde4afacc7b1ed065113b",
+                "time_to_first_token_ms": 265.7,
+                "decode_tokens_per_second": 38.97,
+                "total_seconds": 3.525839
+              },
+              {
+                "request_id": "chatcmpl-0000000000000009",
+                "prompt_tokens": 31,
+                "completion_tokens": 128,
+                "finish_reason": "length",
+                "answer_sha256": "ef5d7dd6bee907301e7cdb774195e953c37a82af6e8bde4afacc7b1ed065113b",
+                "time_to_first_token_ms": 266.7,
+                "decode_tokens_per_second": 38.84,
+                "total_seconds": 3.537561
+              },
+              {
+                "request_id": "chatcmpl-000000000000000a",
+                "prompt_tokens": 31,
+                "completion_tokens": 128,
+                "finish_reason": "length",
+                "answer_sha256": "ef5d7dd6bee907301e7cdb774195e953c37a82af6e8bde4afacc7b1ed065113b",
+                "time_to_first_token_ms": 265.9,
+                "decode_tokens_per_second": 38.83,
+                "total_seconds": 3.537343
+              }
+            ]
+          }
+        }
+      },
+      "artifact_sha256": {
+        "control-short.json": "66a5e121fd6672a23d6ab804c8357bfad0d64b0415d579e6d831422912813356",
+        "candidate-short.json": "fe3ba2e2e3762f51ddb5d87ee1ebba0c3dc7cc9c813c3a4f129aacc12b891045",
+        "control-long.json": "191188971bf154f6c6a31d6caaca9b4a45fe2ad20252e53792c6680cca0c54ef",
+        "candidate-long.json": "8ccd0b99da0ea21b6f12947b6b99b8b82500cac96f092fc742e3fe68be40bd0f",
+        "control-decode.json": "e258d95e741935c6a01c774641121ff8e8ec09b46ad0dbe68656cbd57a51a97f",
+        "control-engine.log": "d5adaa30e75d200645b6140eb203e8cbdaf15a0bb9e91347a7eec0d0d0d577f6",
+        "candidate-decode.json": "ae249e8d3291dc3ece6d83a7fb17782d5661d098059f92ce5866eb98459942be",
+        "candidate-engine.log": "3737cd0b748c4bfd7b2eb6da7854659ce307d66b70247fc5e59535eafcd3fce0"
+      },
+      "free_mib_after_warmup": {
+        "control": {
+          "GPU-282e266a-24ac-6fa8-a16d-4281e52b4c0a": 1475,
+          "GPU-704fef60-5280-9b88-fa3d-d11135caf576": 1368
+        },
+        "candidate": {
+          "GPU-282e266a-24ac-6fa8-a16d-4281e52b4c0a": 1475,
+          "GPU-704fef60-5280-9b88-fa3d-d11135caf576": 1368
+        }
+      },
+      "guard": {
+        "samples": 230,
+        "sha256": "30451d4c17083706d5f2233e8ca247781bb436472198a4bac8696548aee35b3a",
+        "minimum_free_mib": 1368
+      },
+      "restoration": {
+        "reason": "original pair service ready",
+        "complete_sha256": "4504254b08166ddf68afcb00f829c8d99d8cef0f9e49114b7ec37a4cd5d25b24",
+        "restore_sha256": "ec8531c48de7e4b199aa41197040a5fa2ca12bb1cfe82410d3117e7642e3194d"
+      },
+      "summary_sha256": "020beab36b05a8d2322d7fba9a0ff1c8c69e668e8e6c4c197c5d02cfb81d6df8"
+    },
+    {
+      "order": "candidate-first",
+      "comparisons": {
+        "short": {
+          "payload_sha256": "30d2e3484b1f4583f6e329fe9f8f9263e51894aa7898aa11fe107829277ee8ab",
+          "control": {
+            "samples": [
+              {
+                "request_id": "chatcmpl-0000000000000002",
+                "prompt_tokens": 524,
+                "completion_tokens": 2,
+                "reused_tokens": 0,
+                "prefill_ms": 1252.1,
+                "started_to_first_token_prompt_tokens_per_second": 418.4969251657216,
+                "complete_reply_prompt_tokens_per_second": 409.47064978459815,
+                "decode_tokens_per_second": 38.44
+              },
+              {
+                "request_id": "chatcmpl-0000000000000003",
+                "prompt_tokens": 524,
+                "completion_tokens": 2,
+                "reused_tokens": 0,
+                "prefill_ms": 1252.9,
+                "started_to_first_token_prompt_tokens_per_second": 418.22970707957535,
+                "complete_reply_prompt_tokens_per_second": 409.2659689879493,
+                "decode_tokens_per_second": 38.46
+              },
+              {
+                "request_id": "chatcmpl-0000000000000004",
+                "prompt_tokens": 524,
+                "completion_tokens": 2,
+                "reused_tokens": 0,
+                "prefill_ms": 1252.5,
+                "started_to_first_token_prompt_tokens_per_second": 418.3632734530938,
+                "complete_reply_prompt_tokens_per_second": 409.26053494413276,
+                "decode_tokens_per_second": 37.86
+              }
+            ],
+            "median_started_to_first_token_prompt_tokens_per_second": 418.3632734530938,
+            "median_complete_reply_prompt_tokens_per_second": 409.2659689879493
+          },
+          "candidate": {
+            "samples": [
+              {
+                "request_id": "chatcmpl-0000000000000002",
+                "prompt_tokens": 524,
+                "completion_tokens": 2,
+                "reused_tokens": 0,
+                "prefill_ms": 1102.6,
+                "started_to_first_token_prompt_tokens_per_second": 475.2403410121531,
+                "complete_reply_prompt_tokens_per_second": 463.8847157953631,
+                "decode_tokens_per_second": 39.1
+              },
+              {
+                "request_id": "chatcmpl-0000000000000003",
+                "prompt_tokens": 524,
+                "completion_tokens": 2,
+                "reused_tokens": 0,
+                "prefill_ms": 1099.0,
+                "started_to_first_token_prompt_tokens_per_second": 476.79708826205643,
+                "complete_reply_prompt_tokens_per_second": 465.3637074922669,
+                "decode_tokens_per_second": 39.09
+              },
+              {
+                "request_id": "chatcmpl-0000000000000004",
+                "prompt_tokens": 524,
+                "completion_tokens": 2,
+                "reused_tokens": 0,
+                "prefill_ms": 1099.1,
+                "started_to_first_token_prompt_tokens_per_second": 476.75370757892824,
+                "complete_reply_prompt_tokens_per_second": 465.31866336325936,
+                "decode_tokens_per_second": 39.09
+              }
+            ],
+            "median_started_to_first_token_prompt_tokens_per_second": 476.75370757892824,
+            "median_complete_reply_prompt_tokens_per_second": 465.31866336325936
+          },
+          "started_to_first_token_speedup": 1.1395687380584114,
+          "timing_note": "Server timing runs from job start to first emitted batch and includes first-token generation; client timing runs to the complete reply.",
+          "answer_sha256": "4b227777d4dd1fc61c6f884f48641d02b4d121d3fd328cb08b5531fcacdabf8a"
+        },
+        "long": {
+          "payload_sha256": "83bc090b8c20bbf350317d552c592dd83fd0f8a0e9505c1ed895b914be94e890",
+          "control": {
+            "samples": [
+              {
+                "request_id": "chatcmpl-0000000000000005",
+                "prompt_tokens": 4274,
+                "completion_tokens": 2,
+                "reused_tokens": 0,
+                "prefill_ms": 9049.7,
+                "started_to_first_token_prompt_tokens_per_second": 472.28084908892004,
+                "complete_reply_prompt_tokens_per_second": 470.6195848879801,
+                "decode_tokens_per_second": 38.09
+              },
+              {
+                "request_id": "chatcmpl-0000000000000006",
+                "prompt_tokens": 4274,
+                "completion_tokens": 2,
+                "reused_tokens": 0,
+                "prefill_ms": 9049.6,
+                "started_to_first_token_prompt_tokens_per_second": 472.2860678925035,
+                "complete_reply_prompt_tokens_per_second": 470.64072879058216,
+                "decode_tokens_per_second": 38.55
+              },
+              {
+                "request_id": "chatcmpl-0000000000000007",
+                "prompt_tokens": 4274,
+                "completion_tokens": 2,
+                "reused_tokens": 0,
+                "prefill_ms": 9050.2,
+                "started_to_first_token_prompt_tokens_per_second": 472.2547568009546,
+                "complete_reply_prompt_tokens_per_second": 470.6552404113355,
+                "decode_tokens_per_second": 38.52
+              }
+            ],
+            "median_started_to_first_token_prompt_tokens_per_second": 472.28084908892004,
+            "median_complete_reply_prompt_tokens_per_second": 470.64072879058216
+          },
+          "candidate": {
+            "samples": [
+              {
+                "request_id": "chatcmpl-0000000000000005",
+                "prompt_tokens": 4274,
+                "completion_tokens": 2,
+                "reused_tokens": 0,
+                "prefill_ms": 7809.6,
+                "started_to_first_token_prompt_tokens_per_second": 547.2751485351362,
+                "complete_reply_prompt_tokens_per_second": 545.0442609351577,
+                "decode_tokens_per_second": 38.94
+              },
+              {
+                "request_id": "chatcmpl-0000000000000006",
+                "prompt_tokens": 4274,
+                "completion_tokens": 2,
+                "reused_tokens": 0,
+                "prefill_ms": 7803.8,
+                "started_to_first_token_prompt_tokens_per_second": 547.6818985622389,
+                "complete_reply_prompt_tokens_per_second": 545.4978241988399,
+                "decode_tokens_per_second": 38.74
+              },
+              {
+                "request_id": "chatcmpl-0000000000000007",
+                "prompt_tokens": 4274,
+                "completion_tokens": 2,
+                "reused_tokens": 0,
+                "prefill_ms": 7800.9,
+                "started_to_first_token_prompt_tokens_per_second": 547.8855003909806,
+                "complete_reply_prompt_tokens_per_second": 545.7388952222182,
+                "decode_tokens_per_second": 38.53
+              }
+            ],
+            "median_started_to_first_token_prompt_tokens_per_second": 547.6818985622389,
+            "median_complete_reply_prompt_tokens_per_second": 545.4978241988399
+          },
+          "started_to_first_token_speedup": 1.1596529895691843,
+          "timing_note": "Server timing runs from job start to first emitted batch and includes first-token generation; client timing runs to the complete reply.",
+          "answer_sha256": "4b227777d4dd1fc61c6f884f48641d02b4d121d3fd328cb08b5531fcacdabf8a"
+        },
+        "decode": {
+          "control_median_tokens_per_second": 38.69,
+          "candidate_median_tokens_per_second": 38.9,
+          "speedup": 1.0054277591108813,
+          "payload_sha256": "bacd82b581ce7dd5cb38dde1bb3004787b2327dab7ae6d4d6b3d25a6df747f3e",
+          "samples": {
+            "control": [
+              {
+                "request_id": "chatcmpl-0000000000000008",
+                "prompt_tokens": 31,
+                "completion_tokens": 128,
+                "finish_reason": "length",
+                "answer_sha256": "ef5d7dd6bee907301e7cdb774195e953c37a82af6e8bde4afacc7b1ed065113b",
+                "time_to_first_token_ms": 271.9,
+                "decode_tokens_per_second": 38.69,
+                "total_seconds": 3.555258
+              },
+              {
+                "request_id": "chatcmpl-0000000000000009",
+                "prompt_tokens": 31,
+                "completion_tokens": 128,
+                "finish_reason": "length",
+                "answer_sha256": "ef5d7dd6bee907301e7cdb774195e953c37a82af6e8bde4afacc7b1ed065113b",
+                "time_to_first_token_ms": 273.0,
+                "decode_tokens_per_second": 38.73,
+                "total_seconds": 3.55289
+              },
+              {
+                "request_id": "chatcmpl-000000000000000a",
+                "prompt_tokens": 31,
+                "completion_tokens": 128,
+                "finish_reason": "length",
+                "answer_sha256": "ef5d7dd6bee907301e7cdb774195e953c37a82af6e8bde4afacc7b1ed065113b",
+                "time_to_first_token_ms": 272.5,
+                "decode_tokens_per_second": 38.68,
+                "total_seconds": 3.556752
+              }
+            ],
+            "candidate": [
+              {
+                "request_id": "chatcmpl-0000000000000008",
+                "prompt_tokens": 31,
+                "completion_tokens": 128,
+                "finish_reason": "length",
+                "answer_sha256": "ef5d7dd6bee907301e7cdb774195e953c37a82af6e8bde4afacc7b1ed065113b",
+                "time_to_first_token_ms": 266.2,
+                "decode_tokens_per_second": 38.9,
+                "total_seconds": 3.532019
+              },
+              {
+                "request_id": "chatcmpl-0000000000000009",
+                "prompt_tokens": 31,
+                "completion_tokens": 128,
+                "finish_reason": "length",
+                "answer_sha256": "ef5d7dd6bee907301e7cdb774195e953c37a82af6e8bde4afacc7b1ed065113b",
+                "time_to_first_token_ms": 266.0,
+                "decode_tokens_per_second": 39.03,
+                "total_seconds": 3.52068
+              },
+              {
+                "request_id": "chatcmpl-000000000000000a",
+                "prompt_tokens": 31,
+                "completion_tokens": 128,
+                "finish_reason": "length",
+                "answer_sha256": "ef5d7dd6bee907301e7cdb774195e953c37a82af6e8bde4afacc7b1ed065113b",
+                "time_to_first_token_ms": 265.9,
+                "decode_tokens_per_second": 38.9,
+                "total_seconds": 3.531327
+              }
+            ]
+          }
+        }
+      },
+      "artifact_sha256": {
+        "control-short.json": "87a8863eae0f2730b6bd66b54622098b6dbf23822f981e75fc888bf587e93f08",
+        "candidate-short.json": "6573857ee8f4f608fa8a71686466dcde67a8102bbbd3b660aaa32827675dea71",
+        "control-long.json": "421e6c390cd3b89371b7f004b8a5abb48c913f6b7625f1923869f368a24ecccd",
+        "candidate-long.json": "354211b012b1dbc924243f0d0934d79272029364343eecc4946294255b5da61f",
+        "control-decode.json": "c1fb69d2509cdc206581469d5e8e9052bb305b0f3538b61902350ab9fb092e59",
+        "control-engine.log": "8ac04f4d0ff9437efdb90cf338d4d184cdb880faf1a72d8757accd3fbd671d8e",
+        "candidate-decode.json": "5080a9b65745ef59da36fdbd4f1197499be744e515f5382439c41c673ada9d46",
+        "candidate-engine.log": "1302af04319958d71a6880130026ef1ac43a92d3b81c9290dbc2713c13f11c8f"
+      },
+      "free_mib_after_warmup": {
+        "candidate": {
+          "GPU-282e266a-24ac-6fa8-a16d-4281e52b4c0a": 1475,
+          "GPU-704fef60-5280-9b88-fa3d-d11135caf576": 1368
+        },
+        "control": {
+          "GPU-282e266a-24ac-6fa8-a16d-4281e52b4c0a": 1475,
+          "GPU-704fef60-5280-9b88-fa3d-d11135caf576": 1368
+        }
+      },
+      "guard": {
+        "samples": 230,
+        "sha256": "b784fbc1a3ef4ee84cc88e97339edccabd57d46b3d7f30e21d2ab8f169a9664a",
+        "minimum_free_mib": 1368
+      },
+      "restoration": {
+        "reason": "original pair service ready",
+        "complete_sha256": "4504254b08166ddf68afcb00f829c8d99d8cef0f9e49114b7ec37a4cd5d25b24",
+        "restore_sha256": "ec8531c48de7e4b199aa41197040a5fa2ca12bb1cfe82410d3117e7642e3194d"
+      },
+      "summary_sha256": "f3e93bc603ee1e5cd6a64e29c477da9e87060b8cb8a654aad234e3729067f770"
+    }
+  ],
+  "secondary_service_unchanged": {
+    "ready": true,
+    "fingerprint_sha256": {
+      "executable": "7ecc29185c3ff4b0cf29df8d6e39f1be5446f93bbf8128f8d8049377fcef1490",
+      "start": "67fce39d8ed2ec714da6f252e9bd0fd0e1dbc30dc6e0b83bf101b49f10c8000f",
+      "config": "821a91e6d0a763a31f4676d6bab5c8bfd5f2739737e05c612deece673cbd430f"
+    }
+  },
+  "measurement_driver_sha256": {
+    "scripts/bench_p2p_prefill.py": "90ae74c68eaa3f0c92aa212965818f3dbe6f4cd89c9c0843f6d40e93880b9c1b",
+    "scripts/bench_p2p_decode.py": "be5013449dc88b24e6fbc67dbfe323518ba6a30e281dfbd9d0a3638d58f11ee7",
+    "compare_prefill.py": "60c46fbd0bf5441ba0858c250cebcdb412d1ec31f8b74ce4e3ac202e2efd1218"
+  },
+  "proof_snapshot_sha256": {
+    "benchmark_harness.py.txt": "2eacb6ae874d8f65c2e435d7d6b300787366dea206e9b6cac97704f8e4ac732d",
+    "compare_prefill.py": "60c46fbd0bf5441ba0858c250cebcdb412d1ec31f8b74ce4e3ac202e2efd1218",
+    "bench_p2p_decode.py": "be5013449dc88b24e6fbc67dbfe323518ba6a30e281dfbd9d0a3638d58f11ee7",
+    "trace_activation.py.txt": "d994ad337051dfb16b79b70531aeacbc8e8d93622e4647e711680c1b7c11d1ea",
+    "peer_harness.py.txt": "feb3864a9aa131f297430c9bc13386f64df5359fdef2731d5cf7b8176553708a"
+  },
+  "limitations": [
+    "Synthetic single prompts; three samples per arm and order do not characterize general workloads.",
+    "Server prefill timing runs from job start through the first emitted batch, including first-token generation.",
+    "The decode sample is a deterministic 31-token prompt with 128 completion tokens; matching hashes cover only this output.",
+    "Configured 262144 context was not filled. No 128k/256k recall, coding-session quality, or production qualification is established.",
+    "The peer smoke preceded the addition of trace capture to the correctness harness; the source binary, test and switch were unchanged. The matched A/B harness hashes were recorded during the candidate smoke and verified after each order.",
+    "The launch grid is confirmed by an instrumented synthetic peer test, not a trace of the served benchmark. The profiler timing is not used as a throughput result.",
+    "The snapshot is host-specific and depends on local guarded-runner infrastructure and scratch artifacts; it is not a portable standalone benchmark.",
+    "The tiered-upload main base has separate unresolved broad-test history; these P2P checks do not qualify that base."
+  ]
+}
