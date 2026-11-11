@@ -120,6 +120,14 @@ pub(crate) fn q36_effective(
             present(&options.weight_format),
         ),
         row(
+            "gguf_sha256",
+            settings
+                .gguf_sha256
+                .clone()
+                .unwrap_or_else(|| "off".to_string()),
+            present(&options.gguf_sha256),
+        ),
+        row(
             "context_limit",
             settings.context_limit.to_string(),
             present(&options.context_limit),
@@ -426,6 +434,35 @@ mod tests {
             origin(&rows, "compile_program_limit"),
             Origin::IgnoredOnThisBackend
         );
+    }
+
+    #[test]
+    fn q36_content_pin_reports_the_normalized_value_and_its_origin() {
+        for pin in [None, Some("A".repeat(64))] {
+            let options = Q36Options {
+                gguf_sha256: pin.clone(),
+                ..Q36Options::default()
+            };
+            let settings = resolve(&options, Backend::Cuda);
+            let rows = q36_effective(&options, None, Backend::Cuda, &settings);
+            let row = rows.iter().find(|row| row.key == "gguf_sha256").unwrap();
+            assert_eq!(
+                row.value,
+                if pin.is_some() {
+                    "a".repeat(64)
+                } else {
+                    "off".to_string()
+                }
+            );
+            assert_eq!(
+                row.origin,
+                if pin.is_some() {
+                    Origin::ConfigFile
+                } else {
+                    Origin::Default
+                }
+            );
+        }
     }
 
     #[test]

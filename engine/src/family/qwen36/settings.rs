@@ -120,6 +120,8 @@ pub(crate) fn prefix_store_limits_of(
 #[derive(Clone, Debug, Default, Deserialize, PartialEq)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct Q36Options {
+    /// Optional content pin for the selected CUDA GGUF file: exactly 64 hex digits.
+    pub(crate) gguf_sha256: Option<String>,
     /// The MLX allocator cache limit in bytes. Fallback: `Q36_CACHE_LIMIT`. There is no default.
     pub(crate) cache_limit_bytes: Option<u64>,
     /// The first position that the engine refuses, from 2. The default is 262,144 on the MLX arm
@@ -901,6 +903,8 @@ pub(crate) struct Q36Settings {
     pub(crate) expert_bank: Option<ExpertBankSettings>,
     /// The checkpoint format `artifact` holds. The default is the pinned GGUF file.
     pub(crate) weights: WeightFormat,
+    /// Checked lowercase content pin for CUDA GGUF; absent preserves legacy verification.
+    pub(crate) gguf_sha256: Option<String>,
     /// Speculative decoding. Disabled unless `draft_mode` says otherwise.
     pub(crate) speculation: SpecConfig,
     /// How a verify window is rolled back. `Host` unless `draft_rollback` says `device`.
@@ -1254,6 +1258,19 @@ impl Q36Settings {
         let options = options.unwrap_or(&default);
         let weights = weight_format_of(options.weight_format.as_deref())?;
         check_weight_format(weights, options, backend)?;
+        let gguf_sha256 = options
+            .gguf_sha256
+            .as_deref()
+            .map(|digest| {
+                if backend != Backend::Cuda || weights != WeightFormat::Gguf {
+                    return Err(bad("gguf_sha256 requires CUDA GGUF weights".into()));
+                }
+                if digest.len() != 64 || !digest.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+                    return Err(bad("gguf_sha256 must contain exactly 64 hex digits".into()));
+                }
+                Ok(digest.to_ascii_lowercase())
+            })
+            .transpose()?;
         let cuda_devices = cuda_devices_of(options, backend, weights)?;
         let speculation = speculation_of(options, backend, weights)?;
         let kv_offload_host_bytes = kv_offload_of(options, backend)?;
@@ -1448,6 +1465,7 @@ impl Q36Settings {
             tiered,
             expert_bank,
             weights,
+            gguf_sha256,
             speculation,
             draft_rollback,
             draft_verify,
@@ -1619,6 +1637,50 @@ mod tests {
     fn cuda_offload(body: &str) -> Result<Q36Settings, EngError> {
         let options: Q36Options = serde_json::from_str(body).unwrap();
         settings_for(Some(&options), &Q36Env::default(), Backend::Cuda)
+    }
+
+    #[test]
+    fn gguf_content_pin_is_optional_checked_and_cuda_only() {
+        assert!(cuda_offload("{}").unwrap().gguf_sha256.is_none());
+        let digest = "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad";
+        let object = serde_json::json!({"gguf_sha256": digest.to_uppercase()}).to_string();
+        let pinned = cuda_offload(&object).unwrap();
+        assert_eq!(pinned.gguf_sha256.as_deref(), Some(digest));
+        assert_eq!(pinned.cache_limit, 0);
+        for invalid in [
+            "".to_string(),
+            "a".repeat(63),
+            "a".repeat(65),
+            "g".repeat(64),
+        ] {
+            let object = serde_json::json!({"gguf_sha256": invalid}).to_string();
+            let error = message(cuda_offload(&object));
+            assert!(
+                error.contains("gguf_sha256") && error.contains("64 hex"),
+                "{error}"
+            );
+        }
+        let options = Q36Options {
+            gguf_sha256: Some(digest.to_string()),
+            cache_limit_bytes: Some(1024),
+            ..Q36Options::default()
+        };
+        let error = message(settings_for(
+            Some(&options),
+            &Q36Env::default(),
+            Backend::Mlx,
+        ));
+        assert!(
+            error.contains("gguf_sha256") && error.contains("CUDA GGUF"),
+            "{error}"
+        );
+        let object =
+            serde_json::json!({"gguf_sha256": digest, "weight_format": "exl3"}).to_string();
+        let error = message(cuda_offload(&object));
+        assert!(
+            error.contains("gguf_sha256") && error.contains("CUDA GGUF"),
+            "{error}"
+        );
     }
 
     #[test]
@@ -2683,6 +2745,7 @@ mod tests {
                 tiered: None,
                 expert_bank: None,
                 weights: super::WeightFormat::Gguf,
+                gguf_sha256: None,
                 speculation: SpecConfig::default(),
                 draft_rollback: RollbackMode::Host,
                 draft_verify: VerifyMode::Eager,

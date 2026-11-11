@@ -245,11 +245,47 @@ fn the_unpinned_admission_selects_one_file_and_leaves_the_open_as_the_gate() {
     // the strict open is the gate — the admission ends at the GGUF parser (prefix `gguf:`),
     // not at the pinned-identity refusal.
     assert!(check_gguf_identity(&foreign, true, false).is_ok());
-    let text = match open_gguf(dir.path(), false, true) {
+    let text = match open_gguf(dir.path(), false, true, None) {
         Err(EngError::Checkpoint(message)) => message,
         other => panic!("expected the open to refuse, got {other:?}"),
     };
     assert!(text.starts_with("gguf"), "{text}");
+}
+
+#[test]
+fn an_explicit_content_pin_checks_unpinned_files_before_model_open() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let path = dir.path().join("alternate.gguf");
+    let digest = "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad";
+    std::fs::write(&path, b"abc").unwrap();
+    let checkpoint = |result: Result<_, EngError>| match result {
+        Err(EngError::Checkpoint(message)) => message,
+        other => panic!("expected Checkpoint, got {other:?}"),
+    };
+    for verify in [false, true] {
+        let matched = checkpoint(open_gguf(dir.path(), verify, true, Some(digest)));
+        assert!(
+            matched.starts_with("gguf"),
+            "a matching pin reaches the parser: {matched}"
+        );
+    }
+    std::fs::write(&path, b"abd").unwrap();
+    for verify in [false, true] {
+        let changed = checkpoint(open_gguf(dir.path(), verify, true, Some(digest)));
+        assert!(
+            changed.contains("sha256") && changed.contains(digest),
+            "{changed}"
+        );
+        assert!(changed.contains("does not match"), "{changed}");
+    }
+    let admission = checkpoint(open_gguf(dir.path(), false, false, Some(digest)));
+    assert!(admission.contains("Q36_ALLOW_UNPINNED_GGUF"), "{admission}");
+    std::fs::write(dir.path().join(GGUF_NAME), b"abc").unwrap();
+    let size = checkpoint(open_gguf(dir.path(), false, true, Some(digest)));
+    assert!(
+        size.contains("has 3 bytes"),
+        "a content pin preserves the size gate: {size}"
+    );
 }
 
 #[test]

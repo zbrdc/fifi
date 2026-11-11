@@ -785,6 +785,7 @@ pub(super) fn open_gguf(
     artifact: &Path,
     verify: bool,
     allow_unpinned: bool,
+    expected_sha256: Option<&str>,
 ) -> Result<(GgufModel, PathBuf), EngError> {
     let (gguf, pinned) = select_gguf(artifact, allow_unpinned)?;
     if !pinned {
@@ -794,7 +795,11 @@ pub(super) fn open_gguf(
             gguf.display()
         );
     }
-    check_gguf_identity(&gguf, verify, pinned)?;
+    // An explicit content pin replaces the built-in digest, but not filename/size admission.
+    check_gguf_identity(&gguf, verify && expected_sha256.is_none(), pinned)?;
+    if let Some(expected) = expected_sha256 {
+        check_sha256(&gguf, expected)?;
+    }
     let model = open_qwen3_6_35b_a3b(&gguf, None)?;
     Ok((model, gguf))
 }
@@ -994,7 +999,12 @@ fn make_multi(
         "q36 cuda: devices {:?} probed: compute capability {}.{} on every device, peer access full",
         settings.cuda_devices, first.cc_major, first.cc_minor
     );
-    let (model, _gguf) = open_gguf(&settings.artifact, plan.verify, plan.allow_unpinned)?;
+    let (model, _gguf) = open_gguf(
+        &settings.artifact,
+        plan.verify,
+        plan.allow_unpinned,
+        settings.gguf_sha256.as_deref(),
+    )?;
     let inventory = Inventory::for_spec(&QWEN3_6_35B_A3B)?;
     let shape = HostShape::from_spec(&QWEN3_6_35B_A3B, ROTARY_DIM)?;
     let dims = StepDims::new(&shape, &inventory)?;
@@ -1204,7 +1214,12 @@ fn make(
     let before = projector.memory_info()?;
     stages.begin("loading weights");
     let gguf = match settings.weights {
-        WeightFormat::Gguf => Some(open_gguf(&settings.artifact, verify, allow_unpinned)?),
+        WeightFormat::Gguf => Some(open_gguf(
+            &settings.artifact,
+            verify,
+            allow_unpinned,
+            settings.gguf_sha256.as_deref(),
+        )?),
         WeightFormat::Exl3 => None,
     };
     let tiered = tiered_plan_of(&settings);

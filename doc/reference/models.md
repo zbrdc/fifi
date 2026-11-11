@@ -14,6 +14,10 @@
 
 On CUDA, any single `.gguf` conversion of Qwen3.6-35B-A3B in `model_dir` serves with `Q36_ALLOW_UNPINNED_GGUF=1`; the strict open (architecture metadata and full tensor set) is the gate, and the pinned Q4_K_M file stays the qualified checkpoint and wins whenever it is present.
 
+For CUDA GGUF, `qwen36.gguf_sha256` binds startup to an expected full-file digest, including an alternate checkpoint admitted by that switch.
+See [content pinning](configuration.md#gguf-content-pinning-cuda).
+A content pin does not qualify another quantization or checkpoint for quality.
+
 ## Tokenizer files
 
 Each engine reads `tokenizer.json`, `tokenizer_config.json`, `chat_template.jinja` and `generation_config.json` from its `tokenizer_dir`.

@@ -413,6 +413,26 @@ fn the_sha256_toggle_is_resolved_in_start_not_in_make() {
 }
 
 #[test]
+fn the_explicit_gguf_pin_reaches_both_loaders_and_precedes_model_open() {
+    for name in ["fn make(", "fn make_multi("] {
+        let make = pinned(fn_section(name));
+        assert!(make.contains("settings.gguf_sha256.as_deref()"), "{name}");
+    }
+    let open = pinned(fn_section("fn open_gguf("));
+    let hash = open
+        .find("check_sha256(&gguf,expected)?")
+        .expect("explicit pin check");
+    let parse = open
+        .find("open_qwen3_6_35b_a3b(")
+        .expect("strict model open");
+    assert!(hash < parse);
+    assert!(
+        open.contains("verify&&expected_sha256.is_none()"),
+        "hash once per file"
+    );
+}
+
+#[test]
 fn the_unpinned_admission_is_resolved_in_start_and_selects_in_open_only() {
     // A bad Q36_ALLOW_UNPINNED_GGUF spelling must fail FAST, at startup — start() resolves the
     // switch beside the SHA-256 toggle, before the bundle and the spawn — while the engine

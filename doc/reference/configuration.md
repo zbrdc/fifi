@@ -57,6 +57,7 @@ Options for `qwen3_6_35b_a3b`. "MLX" means Apple Silicon.
 | `max_seqs` | MLX | 1 | Sequences decoded at once, 1 to 8. Above 1 it needs `compile: true`, a `prefill_chunk` of at least 4, and a `prefill_budget_bytes` larger than both `prefill_session_reserve_bytes` and `session_cap_bytes`. |
 | `prefix_store_entries` | MLX | 6 | Saved prefixes kept with `prefix_reuse` on, 1 to 4,096. |
 | `weight_format` | CUDA | `gguf` | The format of the checkpoint in `model_dir`: `gguf` (the pinned Q4_K_M file; with `Q36_ALLOW_UNPINNED_GGUF=1`, the directory's single `.gguf` of the family, validated at open) or `exl3` (an EXL3 pack directory with `config.json` and the safetensors shards). Any other value, including a different case, is refused. See [below](#exl3-pack-cuda). The MLX arm refuses `exl3`. |
+| `gguf_sha256` | CUDA GGUF | off | Expected SHA-256 of the selected GGUF file, exactly 64 hex digits. Startup always verifies this pin before opening the model. MLX and EXL3 refuse the key. See [content pinning](#gguf-content-pinning-cuda). |
 | `capture` | CUDA | `true` for `exl3`, `false` for `gguf` | Run each decode step as a CUDA graph. |
 | `cuda_devices` | CUDA | `[0]` | The CUDA devices this engine spans, as device numbers in strictly ascending order, at most four. The MLX arm refuses the key. A list other than `[0]` is probed at startup (the devices must exist, share one compute capability, and directly access each other's memory) and serves the whole model across the cards, GGUF checkpoints only, with `tiered`, `kv_offload_host_bytes`, `capture` and speculation off. |
 | `kv_offload_host_bytes` | CUDA | off | Keep the KV cache in host memory, up to this many bytes. See [below](#host-memory-kv-cache-cuda). |
@@ -77,6 +78,20 @@ It ignores `cache_limit_bytes`, `session_cap_bytes`, `prefill_chunk`, `compile` 
 MLX ignores `capture` with a log line, and refuses `tiered`.
 The `draft_*`, `num_draft_tokens`, `hybrid_draft_tokens`, `ngram_match_min` and `mtp_model_dir` keys are checked at start. A `draft_mode` other than `disabled` is refused on MLX and with GGUF weights, because nothing there can run a window. (EXL3 weights already refuse `kv_offload_host_bytes`, the one KV cache a window cannot export.) `mtp` is refused with EXL3 weights because its draft step does not exist. `ngram` works with EXL3 weights, and the output is the same as with `disabled` for any sampler. A window feeds its rows one at a time and first copies the whole committed session state to the host, so each window costs time proportional to the context and `ngram` is slower than `disabled`: use it to check output, not to serve long contexts.
 `prefix_store_entries` is ignored with a log line when `prefix_reuse` is off.
+
+### GGUF content pinning (CUDA)
+
+Set `qwen36.gguf_sha256` to a trusted full-file SHA-256 to bind startup to specific checkpoint bytes.
+The value accepts uppercase or lowercase hex digits.
+A mismatch refuses startup before model parsing or weight upload.
+This explicit pin takes precedence over `Q36_VERIFY_GGUF_SHA256`, so startup hashes the file once.
+Without the key, the existing filename, size and optional built-in hash checks remain unchanged.
+
+The key also works with `Q36_ALLOW_UNPINNED_GGUF=1` for an alternate checkpoint filename.
+It does not enable unpinned admission or change which file startup selects.
+The pinned filename still wins when present, and its size check still applies.
+A matching digest establishes content identity, not model quality or source authenticity.
+Keep the checkpoint files unchanged while the engine serves them.
 
 ### EXL3 pack (CUDA)
 

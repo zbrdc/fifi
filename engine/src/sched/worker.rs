@@ -1177,6 +1177,7 @@ mod tests {
         log: Log,
         hold: Option<(mpsc::Sender<()>, mpsc::Receiver<()>)>,
         hold_after_emit: Option<(mpsc::Sender<()>, mpsc::Receiver<()>)>,
+        emit_ack: Option<mpsc::Receiver<()>>,
         fail_first_decode: Option<EngError>,
         fail_after_emit: Option<EngError>,
         cancel_after_prefill: Option<Arc<AtomicBool>>,
@@ -1214,6 +1215,7 @@ mod tests {
                 log: Arc::clone(log),
                 hold: None,
                 hold_after_emit: None,
+                emit_ack: None,
                 fail_first_decode: None,
                 fail_after_emit: None,
                 cancel_after_prefill: None,
@@ -1347,6 +1349,10 @@ mod tests {
             if let Some((entered, release)) = self.hold_after_emit.take() {
                 let _ = entered.send(());
                 let _ = release.recv();
+            }
+            if let Some(ack) = &self.emit_ack {
+                ack.recv_timeout(Duration::from_secs(10))
+                    .expect("the consumer drains each batch");
             }
             if let Some(error) = self.fail_after_emit.take() {
                 return Err(error);
@@ -2428,6 +2434,53 @@ mod tests {
             [batch(&[EOS], "", Some(DecodeFinish::Stop)), finished(1, 1)]
         );
         engine.shutdown();
+    }
+
+    #[test]
+    fn an_actively_drained_job_can_outlive_its_event_channel_capacity() {
+        const TOKENS: usize = 2_100;
+        const { assert!(TOKENS > 2 * crate::sched::job::EVENT_CAPACITY) };
+        let log = new_log();
+        let mut script = vec![vec![0]; TOKENS];
+        script.push(vec![EOS]);
+        let mut spy = Spy::new(script, &log);
+        let (ack, received) = mpsc::channel();
+        spy.emit_ack = Some(received);
+        let engine = start_spy(8, spy);
+        let engine_handle = engine.handle();
+        let (job, mut handle) = job(&[2]);
+        engine_handle.try_submit(job).expect("submit");
+        let mut batches = 0;
+        loop {
+            match handle.events.blocking_recv().expect("terminal event") {
+                JobEvent::Started => {}
+                JobEvent::Batch(value) => {
+                    let last = batches == TOKENS;
+                    assert_eq!(value.tokens, if last { vec![EOS] } else { vec![0] });
+                    assert_eq!(
+                        value.finish,
+                        if last { Some(DecodeFinish::Stop) } else { None }
+                    );
+                    batches += 1;
+                    ack.send(())
+                        .expect("allow the next batch only after this one is drained");
+                }
+                JobEvent::Finished(usage) => {
+                    assert_eq!(usage.prompt_tokens, 1);
+                    assert_eq!(usage.completion_tokens, (TOKENS + 1) as u32);
+                    break;
+                }
+                JobEvent::Error(error) => panic!("generation failed: {error:?}"),
+            }
+        }
+        assert_eq!(batches, TOKENS + 1);
+        assert!(
+            !handle.is_cancelled(),
+            "a drained stream is not a slow client"
+        );
+        assert!(handle.events.blocking_recv().is_none());
+        drop(engine_handle);
+        assert_eq!(engine.shutdown().state, EngineState::Stopped);
     }
 
     #[test]
