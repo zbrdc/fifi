@@ -161,8 +161,8 @@ pub(super) enum Slot {
     Exl3Xh,
     Exl3Z,
     Exl3Flag,
-    /// The device job table of a chunk's job-table projections: one entry (a chunk of at most
-    /// `MAX_STEP_ROWS` rows is one tile), 16 bytes.
+    /// The device job table of a chunk's job-table projections: one entry (a whole chunk,
+    /// whatever its row count within `MAX_STEP_ROWS`), 16 bytes.
     Exl3Jobs,
     /// f32 `[rows][vocab]`.
     Logits,

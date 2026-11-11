@@ -68,6 +68,22 @@ fn the_sizes_of_one_row_follow_the_geometry() {
 }
 
 #[test]
+fn the_exl3_scratch_spans_the_chunk_at_every_width() {
+    let (_, g) = real();
+    // Independent of exl3_scratch's loop: at every width the rotated-input face is the routed
+    // job table's one launch over rows * 10 pairs (its input width is hidden = 2560), and the
+    // partial face is lm_head's (rows, 248_320) partial - every other launch (the shared
+    // expert's 2 * rows groups, DeltaNet's conv/value, QSA's projections, PLE's keys) stays
+    // under both at these widths. Rows 1 keeps the 20 gate/up pairs of the grouped launch.
+    for (rows, pairs) in [(1usize, 20usize), (32, 320), (64, 640)] {
+        let plan = plan_at(&g, rows, 32_768);
+        let bytes = |s| slot(&plan, s).bytes;
+        assert_eq!(bytes(Slot::Exl3Xh), pairs * 2560 * 4, "xh at rows {rows}");
+        assert_eq!(bytes(Slot::Exl3Z), rows * 248_320 * 4, "z at rows {rows}");
+    }
+}
+
+#[test]
 fn sizes_grow_with_rows_and_the_context_only_where_they_should() {
     let (_, g) = real();
     let one = plan_at(&g, 1, 32_768);

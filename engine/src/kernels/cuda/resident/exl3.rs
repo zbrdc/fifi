@@ -1775,7 +1775,7 @@ impl CudaContext {
             // A wide refused batch prints only the head of its rows vector.
             let head: Vec<_> = rows.iter().take(8).collect();
             let shown = if rows.len() > 8 {
-                format!("{} rows starting {head:?}", rows.len())
+                format!("{} calls starting {head:?}", rows.len())
             } else {
                 format!("{rows:?}")
             };

@@ -335,6 +335,20 @@ pub(in crate::family) struct IndexedPair<'a> {
 /// Queues the id-indexed group `pairs`, all of one shape, as consecutive launches of at most
 /// `exl3_indexed_capacity` pairs in group order. Each launch starts again at row 0 of the
 /// scratch; the stream runs it after the previous launch has finished with those rows.
+/// One indexed chunk is at most the launch capacity and at most the rows the scratch's
+/// rotated-input face holds (`k` f32 a row), at least one pair: the caller refuses an empty
+/// pair list before this. The capacity alone is not the bound - the pointer-table option
+/// reports a grid-size capacity that a chunk-sized scratch cannot span, and a 20-pair
+/// capacity needs a 20-row scratch. The clamp reads `xh` only: in every plan of this tree
+/// `z` holds at least as many rows (the step plan sizes it from the same launch list), and
+/// the `m <= layout.rows` guards of the block bind the private scratch, not these faces.
+fn indexed_step(capacity: usize, xh_bytes: usize, k: usize) -> usize {
+    capacity.min(xh_bytes / (k * F32).max(1)).max(1)
+}
+
+/// Every EXL3 pair of a routed block in indexed launches of at most the capacity: each pair
+/// runs its own row of the scratch (`indexed_launch`), so a chunk is clamped to the rows the
+/// scratch holds ([`indexed_step`]).
 pub(in crate::family) fn grouped_indexed(
     launch: &Launch<'_>,
     pairs: &[IndexedPair<'_>],
@@ -352,8 +366,7 @@ pub(in crate::family) fn grouped_indexed(
         .first()
         .map(|pair| pair.span.shape()[0])
         .ok_or_else(|| refuse("an indexed launch without pairs".into()))?;
-    let rows = scratch.xh.bytes() / (k * F32).max(1);
-    let step = launch.ctx.exl3_indexed_capacity().min(rows).max(1);
+    let step = indexed_step(launch.ctx.exl3_indexed_capacity(), scratch.xh.bytes(), k);
     for chunk in pairs.chunks(step) {
         indexed_launch(launch, chunk, ids, scratch)?;
     }
@@ -595,17 +608,6 @@ pub(in crate::family) struct SharedRowsIo<'b> {
     pub(in crate::family) scratch: Scratch<'b>,
 }
 
-/// The shared expert of a K-row verify window, `rows` in 2 to 8.
-///
-/// Gate and up are `2 * rows` one-row groups in ONE grouped launch, ordered
-/// `[gate_0, up_0, gate_1, up_1, ...]` like the routed block (row `r` owns the pairs `2 r` and
-/// `2 r + 1`), so each row's `[gate | up]` is contiguous and ONE `swiglu_rows` over `rows` rows
-/// reads it with `ld_in = 2 s`, `up_off = s`, the layout of the one-row block: no relaxation of the
-/// SwiGLU's validation. Every pair is exactly the one-row computation (a group of one row, the
-/// one-tile wide body). The down projection is one group of `rows` rows, the rows kernel. Two
-/// groups of `rows` rows each (`[gate rows][up rows]`) would land as `[gate K rows][up K rows]`
-/// and need `up_off = K s` with `ld_in = s`, which `valid_shape` refuses.
-///
 /// The gate/up row batches of a `rows`-wide shared-expert window: the grouped launch takes at
 /// most `GROUPED_PAIRS` one-row pairs, so a batch is at most `GROUPED_PAIRS / 2` rows wide. The
 /// pairs of a batch are row-disjoint in `gu`, and each batch reuses the xh/z scratch from
@@ -617,6 +619,18 @@ fn shared_row_batches(rows: usize) -> impl Iterator<Item = (usize, usize)> {
     })
 }
 
+/// The shared expert of a K-row verify window, `rows` in 2 to [`MAX_EXL3_ROWS`].
+///
+/// Gate and up are `2 * rows` one-row pairs in grouped launches of at most `GROUPED_PAIRS`
+/// pairs (batches of `GROUPED_PAIRS / 2` rows, [`shared_row_batches`]), ordered
+/// `[gate_0, up_0, gate_1, up_1, ...]` like the routed block (row `r` owns the pairs `2 r` and
+/// `2 r + 1`), so each row's `[gate | up]` is contiguous and ONE `swiglu_rows` over `rows` rows
+/// reads it with `ld_in = 2 s`, `up_off = s`, the layout of the one-row block: no relaxation of the
+/// SwiGLU's validation. Every pair is exactly the one-row computation (a group of one row, the
+/// one-tile wide body). The down projection is one group of `rows` rows, the rows kernel. Two
+/// groups of `rows` rows each (`[gate rows][up rows]`) would land as `[gate K rows][up K rows]`
+/// and need `up_off = K s` with `ld_in = s`, which `valid_shape` refuses.
+///
 /// The one-row block [`shared`] is untouched; the test compares this one to `rows` runs of it.
 pub(in crate::family) fn shared_rows(
     launch: &Launch<'_>,
@@ -945,6 +959,30 @@ pub(in crate::family) fn run_exl3_moe_rows_banked(
         (dims.hidden, dims.shared_inter, rows),
     )?;
     combine(launch, bufs, dims)
+}
+
+#[cfg(test)]
+mod indexed_step_tests {
+    use super::*;
+
+    /// The chunk a launch takes is the smaller of the capacity and the scratch's rows, never
+    /// zero: the launch capacity (16, 20, or the pointer table's grid cap) is only a ceiling,
+    /// a short scratch clamps every chunk, and a degenerate k cannot collapse the step.
+    #[test]
+    fn the_chunk_step_is_the_capacity_clamped_to_the_scratch_rows() {
+        let row = |n: usize| n * F32;
+        // A scratch that holds more rows than every capacity: the capacity rules.
+        assert_eq!(indexed_step(16, row(64), 2560), 16);
+        assert_eq!(indexed_step(20, row(64), 2560), 20);
+        assert_eq!(indexed_step(256, row(64), 2560), 64);
+        // A scratch shorter than the capacity: the scratch's row count rules, down to one.
+        assert_eq!(indexed_step(16, row(6), 2560), 6);
+        assert_eq!(indexed_step(20, row(1), 2560), 1);
+        assert_eq!(indexed_step(256, row(0), 2560), 1);
+        // A k of zero would divide by zero; the max(1) in the divisor keeps one row per byte
+        // budget the scratch allows.
+        assert_eq!(indexed_step(16, row(64), 0), 16);
+    }
 }
 
 #[cfg(test)]

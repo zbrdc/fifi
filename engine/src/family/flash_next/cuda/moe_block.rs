@@ -72,8 +72,9 @@ fn align_up(value: usize) -> usize {
 }
 
 /// The block's private device scratch: the slot row, the classify outputs and the second pass's
-/// inputs. One allocation, regions at aligned offsets: about 25 KiB at the real sizes and one
-/// row, and the row-indexed regions grow with the planned chunk width.
+/// inputs. One allocation, regions at aligned offsets: 24,832 bytes at the real sizes and one
+/// row (pinned by the host tests), and the row-indexed regions grow with the planned chunk
+/// width.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) struct ScratchLayout {
     /// The chunk row count this layout is sized for; run_rows admits at most this many rows.
@@ -537,7 +538,7 @@ mod device {
     impl<'w> SplitMoe<'w> {
         /// `trunks[layer]` is layer `layer`'s trunk; `bank` has one row per layer. `layout` is the
         /// bank's record layout, the one its records were packed with. Allocates the private
-        /// scratch (about 25 KiB at the decode shape, growing with the planned width), zeroed.
+        /// scratch (24,832 bytes at the decode shape, growing with the planned width), zeroed.
         pub(in crate::family::flash_next) fn new(
             ctx: &CudaContext,
             trunks: Vec<SplitMoeTrunk<'w>>,

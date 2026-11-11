@@ -519,3 +519,25 @@ fn pick_union_keeps_each_distinct_id_first_use_first() {
     // Duplicates inside one row and across rows collapse to the first use.
     assert_eq!(pick_union(&[&[5, 0, 5], &[0, 5]], 8), vec![5, 0]);
 }
+
+#[test]
+fn slot_spans_fit_a_ring_smaller_than_the_bank_slot_row() {
+    let layout = layout();
+    // The bank's own spans and a ring's spans over the SAME layout with FEWER slots: the
+    // per-part ranges must end inside the smaller slot row (start unchanged, end grown by
+    // the last slot's offset), and one slot keeps exactly the one-record base range.
+    for slots in [1usize, 2, 7, 16] {
+        let spans = SlotSpans::new(&layout, slots).unwrap();
+        for part in 0..3 {
+            let [trellis, suh, svh] = layout.bank_ranges(part, slots).unwrap();
+            assert_eq!(
+                spans.parts[part].trellis, trellis,
+                "part {part} trellis at {slots}"
+            );
+            assert_eq!(spans.parts[part].suh, suh, "part {part} suh at {slots}");
+            assert_eq!(spans.parts[part].svh, svh, "part {part} svh at {slots}");
+        }
+    }
+    // Zero slots is a refusal, the same one the layout's bank_ranges gives.
+    assert!(SlotSpans::new(&layout, 0).is_err());
+}
