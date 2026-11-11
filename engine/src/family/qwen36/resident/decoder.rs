@@ -707,7 +707,7 @@ impl<'c> ResidentDecoder<'c> {
                 let norm_in = &layer_ref.input_norm;
                 let started = std::time::Instant::now();
                 let got =
-                    super::compiled::delta_step(&mut ctx, &shape, w, &rec, &ring, &x, &norm_in)?;
+                    super::compiled::delta_step(&mut ctx, &shape, w, &rec, &ring, &x, norm_in)?;
                 ctx.kernels.evaluate(&[&got.out, &got.rec, &got.ring])?;
                 delta_seconds.push(started.elapsed().as_secs_f64());
             }
@@ -720,8 +720,7 @@ impl<'c> ResidentDecoder<'c> {
                 RFeedForward::Moe(w) => {
                     let norm_post = &layer.post_norm;
                     let started = std::time::Instant::now();
-                    let got =
-                        super::compiled::moe_step_device(&mut ctx, &shape, w, &x, &norm_post)?;
+                    let got = super::compiled::moe_step_device(&mut ctx, &shape, w, &x, norm_post)?;
                     ctx.kernels.evaluate(&[
                         &got.0,
                         got.1.ids.ids(),

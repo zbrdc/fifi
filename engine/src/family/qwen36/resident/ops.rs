@@ -149,8 +149,8 @@ impl Consts {
             f32_tensor(Vec::new(), &[0.0])?,
             f32_tensor(Vec::new(), &[kd * 1e-6])?,
             f32_tensor(Vec::new(), &[kd.sqrt()])?,
-            f32_tensor(vec![key_dim as u32], &vec![q_fill; key_dim as usize])?,
-            f32_tensor(vec![key_dim as u32], &vec![k_fill; key_dim as usize])?,
+            f32_tensor(vec![key_dim as u32], &vec![q_fill; key_dim])?,
+            f32_tensor(vec![key_dim as u32], &vec![k_fill; key_dim])?,
         ];
         let refs: Vec<&Tensor> = sources.iter().collect();
         let mut got = kernels.import_many(&refs)?.into_iter();

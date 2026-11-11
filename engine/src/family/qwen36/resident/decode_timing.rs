@@ -1240,7 +1240,7 @@ fn speculative_decode_timing() {
             let mut tokens = 0usize;
             let mut multi = 0usize;
             for _ in 0..calls {
-                let batch = one_serving_call(&mut executor, &mut **session, &mut jobs[slot]);
+                let batch = one_serving_call(&mut executor, session, &mut jobs[slot]);
                 let count = batch.tokens.len();
                 tokens += count;
                 multi += usize::from(count > 1);

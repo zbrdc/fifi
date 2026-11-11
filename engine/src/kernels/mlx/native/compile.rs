@@ -488,9 +488,10 @@ fn native_dim(label: &'static str, value: u32) -> Result<i32, EngError> {
 /// The wrapper (`Context::compiled_attn_post_layer`) builds its inputs as (tag, array)
 /// pairs and asserts the pushed tag sequence against this list before the native call,
 /// which catches a reordered or missing push (it does not check that a tag labels the
-/// right array). The pure test below pins this list against the native index map, so a
-/// hand-edit of either side is caught there. The test compiles wherever this module
-/// does (macOS aarch64 with native-mlx), not on other hosts.
+/// right array). The pure test below pins THIS list against its own hand-checked copy of
+/// the native index map - it never reads guard.cpp, so the correspondence to the native
+/// indices is a reviewed fact, not a machine-checked one. The test compiles wherever this
+/// module does (macOS aarch64 with native-mlx), not on other hosts.
 pub(in crate::kernels::mlx) fn attn_post_layer_input_tags() -> [&'static str; 24] {
     [
         "att",
@@ -2072,8 +2073,8 @@ impl Context {
         // All four outputs carry the activation dtype; the widths are u32 products that fit u64.
         // The q and gate outputs hold heads*width elements each; k and v hold kv_heads*width.
         let width = args.act.byte_width();
-        let q_bytes = u64::from(args.heads) * u64::from(args.width) * u64::from(width);
-        let kv_bytes = u64::from(kv_out) * u64::from(width);
+        let q_bytes = u64::from(args.heads) * u64::from(args.width) * width;
+        let kv_bytes = u64::from(kv_out) * width;
         let q_shape = vec![1, args.heads, 1, args.width];
         let kv_shape = vec![1, args.kv_heads, 1, args.width];
         let gate_shape = vec![args.heads, args.width];
@@ -2189,19 +2190,18 @@ impl Context {
             quant: triple,
         });
         adapter.programs.admit(fun_id)?;
-        let mut inputs: Vec<ffi::mlx_array> = Vec::with_capacity(6);
-        inputs.push(args.att.storage.native_array());
-        inputs.push(args.gate.storage.native_array());
-        inputs.push(args.packed.payload().storage.native_array());
-        inputs.push(args.packed.scales().storage.native_array());
-        inputs.push(
+        let inputs: Vec<ffi::mlx_array> = vec![
+            args.att.storage.native_array(),
+            args.gate.storage.native_array(),
+            args.packed.payload().storage.native_array(),
+            args.packed.scales().storage.native_array(),
             args.packed
                 .biases()
                 .map(|biases| biases.storage.native_array())
                 .unwrap_or(ffi::NULL_ARRAY),
-        );
-        // The raw residual stream closes the 6-operand input list of the folded residual add.
-        inputs.push(args.res.storage.native_array());
+            // The raw residual stream closes the 6-operand input list of the folded residual add.
+            args.res.storage.native_array(),
+        ];
         let mut keep: Vec<_> = [args.att, args.gate, args.res]
             .into_iter()
             .map(|tensor| tensor.share())
@@ -2233,7 +2233,7 @@ impl Context {
             started.elapsed().as_secs_f64(),
         );
         let out_shape = vec![1, args.hidden];
-        let out_bytes = u64::from(args.hidden) * u64::from(args.act.byte_width());
+        let out_bytes = u64::from(args.hidden) * args.act.byte_width();
         let checked = built.and_then(|()| {
             if native_output_valid(out_a.0, &out_shape, args.act, out_bytes) {
                 Ok(())

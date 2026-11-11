@@ -1,9 +1,9 @@
 //! The guard names every file of a pack, and the n-gram table's layout comes from the config.
 
 use super::super::tests::CONFIG;
-use super::{
-    Dims, FlashPackFiles, NGRAM_FILE, SIDE_FILES, guard_side_files, ngram_key, ngram_layout,
-};
+#[cfg(target_os = "linux")]
+use super::FlashPackFiles;
+use super::{Dims, NGRAM_FILE, SIDE_FILES, guard_side_files, ngram_key, ngram_layout};
 use crate::weights::exl3::ngram::NgramLayout;
 
 #[test]

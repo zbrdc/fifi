@@ -677,6 +677,10 @@ pub(super) fn step_projected(
 /// key `[1, KVH, 1, D]`, the new value `[1, KVH, 1, D]`, and the output gate `[heads, D]`;
 /// returns the gated attention output `[1, heads * width]` in the activation dtype, BEFORE
 /// `w.o` (so the batched path can stack all rows and project once).
+#[expect(
+    clippy::too_many_arguments,
+    reason = "the four attention operands (q, k_new, v_new, gate) ride with the context, shape, cache and position; a parameter object would hide the dataflow of one private helper"
+)]
 fn step_tail(
     ctx: &mut Ctx<'_>,
     shape: &HostShape,
@@ -746,13 +750,13 @@ fn step_tail_to_att(
     let att = match cache.buffers.as_ref() {
         Some(KvBuffers::F32 { k, v }) => {
             ctx.kernels
-                .grouped_attention_prefix(&q, k, v, dim(next_len)?, scale, false)?
+                .grouped_attention_prefix(q, k, v, dim(next_len)?, scale, false)?
         }
         // The BF16 form reads natively: the same prefix attention over BF16 buffers
         // (the adapter's `allow_bf16` covers them), no dequant in the scan.
         Some(KvBuffers::Bf16 { k, v }) => {
             ctx.kernels
-                .grouped_attention_prefix(&q, k, v, dim(next_len)?, scale, false)?
+                .grouped_attention_prefix(q, k, v, dim(next_len)?, scale, false)?
         }
         Some(KvBuffers::Q8 { k, v }) => {
             let keys = QuantizedKv {
@@ -774,13 +778,13 @@ fn step_tail_to_att(
             if next_len >= fused_min_len()
                 && ctx
                     .kernels
-                    .supports_quantized_attention_decode(&q, &keys, &values, len, Q8_GROUP, Q8_BITS)
+                    .supports_quantized_attention_decode(q, &keys, &values, len, Q8_GROUP, Q8_BITS)
             {
                 ctx.kernels
-                    .quantized_attention_decode(&q, &keys, &values, len, scale, Q8_GROUP, Q8_BITS)?
+                    .quantized_attention_decode(q, &keys, &values, len, scale, Q8_GROUP, Q8_BITS)?
             } else {
                 ctx.kernels.quantized_attention_prefix(
-                    &q, &keys, &values, len, scale, false, Q8_GROUP, Q8_BITS,
+                    q, &keys, &values, len, scale, false, Q8_GROUP, Q8_BITS,
                 )?
             }
         }

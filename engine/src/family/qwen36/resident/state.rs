@@ -517,9 +517,9 @@ impl ResidentState {
     /// bounded page-table allowance of its alias): the admission probe of the checkpoint
     /// window (`Q36_SPEC_STEP_WINDOW=2`). It makes no charge and no native call.
     pub(super) fn snapshot_bytes(&self) -> Result<u64, EngError> {
-        Ok(fixed_bytes(&self.layers)?
+        fixed_bytes(&self.layers)?
             .checked_add(allowance_bytes(self.pos))
-            .ok_or_else(|| EngError::MemoryPlan("snapshot bytes overflow u64".into()))?)
+            .ok_or_else(|| EngError::MemoryPlan("snapshot bytes overflow u64".into()))
     }
 
     /// Shares the committed state as a snapshot. It makes no native call and copies no array. One

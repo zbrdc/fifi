@@ -302,10 +302,10 @@ fn window_taps_on() -> bool {
     std::env::var_os("Q36_WINDOW_TAPS").is_some_and(|v| v == "1")
 }
 
-/// The test override exists because edition 2024 makes `set_var` unsafe and the crate denies
-/// `unsafe_code`: the parity test flips the AtomicBool instead of the environment, inside the
-/// native test lock, and a production build reads the variable alone. See [`compiled_layer_on`]
-/// for what the flag arms.
+/// The parity test overrides the flag through this AtomicBool instead of the
+/// environment, because edition 2024 makes `set_var` unsafe and the crate denies
+/// `unsafe_code`: the test flips it inside the native test lock, and a production build
+/// reads the variable alone. See [`compiled_layer_on`] for what the flag arms.
 #[cfg(test)]
 pub(super) static COMPILED_LAYER_TEST: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(false);
@@ -320,11 +320,13 @@ pub(super) static COMPILED_LAYER_TEST: std::sync::atomic::AtomicBool =
 /// folded MoE rows sequence). Both families require `fused_prefill_enabled`, so the
 /// fused-prefill kill switch disarms them together; production dims gate each body.
 /// A closure layer takes no per-layer output `evaluate` (the `EVAL_CADENCE` cadence of
-/// the eager chunk); its one health vector per closure joins the chunk-end stack like
-/// an eager layer's. Default off; the eager chunk stays the reference and the parity
-/// oracle. Known limit while off (it blocks a default flip, not the flag): the
-/// window-attention path pays one extra `cache.share` KV copy per layer for the eager
-/// middle, and the BF16 cache form is excluded from the attention closures' coverage.
+/// the eager chunk); the delta closure and the attention POST closure each return one
+/// health vector (the attention PRE closure returns none), which joins the chunk-end
+/// stack like an eager layer's. Default off; the eager chunk stays the reference and
+/// the parity oracle. Known limit while off (it blocks a default flip, not the flag):
+/// the window-attention path pays one extra `cache.share` KV copy per layer for the
+/// eager middle, and the BF16 cache form is excluded from the attention closures'
+/// coverage.
 pub(super) fn compiled_layer_on() -> bool {
     #[cfg(test)]
     if COMPILED_LAYER_TEST.load(std::sync::atomic::Ordering::Relaxed) {

@@ -1552,10 +1552,6 @@ mod tests {
             scales: &vs,
             biases: &vb,
         };
-        let qd: Vec<f32> = (0..h * rows * d)
-            .map(|i| (((i * 29) % 389) as f32 - 194.0) / 300.0)
-            .collect();
-        let q = upload(&mut kernels, vec![1, h, rows, d], &qd);
         let scale = 1.0 / (d as f32).sqrt();
 
         // MLX caches lazy graphs by inputs: identical iterations are free. Each timed

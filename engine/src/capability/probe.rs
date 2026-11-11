@@ -178,6 +178,7 @@ fn read_meminfo() -> Result<(u64, u64), String> {
 /// strictness as the admission-time parsers: exactly one value per field,
 /// a `kB` unit, and available never above total — anything else is not a
 /// memory reading this report may print.
+#[cfg(any(target_os = "linux", test))]
 pub(crate) fn parse_meminfo(contents: &str) -> Option<(u64, u64)> {
     let mut total = None;
     let mut available = None;

@@ -2351,7 +2351,7 @@ impl Context {
             ));
         }
         if experts == 0
-            || experts % 32 != 0
+            || !experts.is_multiple_of(32)
             || experts > 1024
             || top_k == 0
             || top_k > experts
