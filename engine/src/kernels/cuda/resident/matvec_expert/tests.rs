@@ -1100,7 +1100,7 @@ fn the_expert_matvec_bandwidth_bench() {
             ctx.bench_destroy(start).expect("destroy");
             ctx.bench_destroy(end).expect("destroy");
         }
-        cold.sort_by(|a, b| a.total_cmp(&b));
+        cold.sort_by(|a, b| a.total_cmp(b));
         let cold_us = cold[cold.len() / 2];
         let read_bytes =
             N_USED as f64 * rows as f64 * QuantType::Q4K.weight_bytes(1, k).expect("size") as f64;
@@ -1166,7 +1166,7 @@ fn the_expert_matvec_bandwidth_bench() {
             ctx.bench_destroy(start).expect("destroy");
             ctx.bench_destroy(end).expect("destroy");
         }
-        cold.sort_by(|a, b| a.total_cmp(&b));
+        cold.sort_by(|a, b| a.total_cmp(b));
         let cold_us = cold[cold.len() / 2];
         let read_bytes = w_bytes as f64;
         println!(
@@ -1232,9 +1232,14 @@ fn matvec_expert_wpr_mode_matches_dense_within_reassociation() {
                 let got_f = &got[slot * stride * 4 + y_off..slot * stride * 4 + y_off + rows * 4];
                 let mut worst = 0.0f32;
                 let mut worst_ulps = 0u32;
-                for (g, w) in got_f.chunks_exact(4).zip(want.chunks_exact(4)) {
-                    let g = f32::from_le_bytes(g.try_into().expect("f32"));
-                    let w = f32::from_le_bytes(w.try_into().expect("f32"));
+                for (g, w) in got_f
+                    .as_chunks::<4>()
+                    .0
+                    .iter()
+                    .zip(want.as_chunks::<4>().0.iter())
+                {
+                    let g = f32::from_le_bytes(*g);
+                    let w = f32::from_le_bytes(*w);
                     assert!(
                         g.is_finite() && w.is_finite(),
                         "{NAME}: non-finite at {shape:?} slot {slot}"
