@@ -485,10 +485,12 @@ fn native_dim(label: &'static str, value: u32) -> Result<i32, EngError> {
 }
 
 /// The native attention post-layer body's fixed input order, one tag per caller input.
-/// The wrapper (`Context::compiled_attn_post_layer`) pushes its tensors in exactly this
-/// order; the pure test below pins every position so the Rust push order and the native
-/// index map cannot drift apart silently again (the first serve run caught a reordered
-/// triple only through the Mac oracle).
+/// The wrapper (`Context::compiled_attn_post_layer`) builds its inputs as (tag, array)
+/// pairs and asserts the pushed tag sequence against this list before the native call,
+/// and the pure test below pins every position against the native index map, so the
+/// Rust push order and that map cannot drift apart: a swapped push fails the assert at
+/// every call. The test compiles wherever this module does (macOS aarch64 with
+/// native-mlx), not on other hosts.
 pub(in crate::kernels::mlx) fn attn_post_layer_input_tags() -> [&'static str; 24] {
     [
         "att",
@@ -1759,34 +1761,94 @@ impl Context {
             .chain(std::iter::once(args.shared_scalar_t))
             .map(|tensor| tensor.share())
             .collect();
-        let mut inputs: Vec<ffi::mlx_array> = Vec::with_capacity(24);
-        let push_triple = |inputs: &mut Vec<ffi::mlx_array>, weight: &ResidentPackedWeight| {
-            inputs.push(weight.payload().storage.native_array());
-            inputs.push(weight.scales().storage.native_array());
-            inputs.push(
-                weight
-                    .biases()
-                    .map(|biases| biases.storage.native_array())
-                    .unwrap_or(ffi::NULL_ARRAY),
-            );
+        // The native body reads its caller inputs at fixed indices (the index map of
+        // guard.cpp). The wrapper builds its inputs as (tag, array) pairs and splits them
+        // only after asserting the tag sequence against [`attn_post_layer_input_tags`],
+        // so a swapped push fails HERE - at every call, debug or release - instead of
+        // feeding the native body reordered operands. The pure test pins the contract
+        // list itself against the index map.
+        let mut inputs: Vec<(&'static str, ffi::mlx_array)> = Vec::with_capacity(24);
+        let mut push = |inputs: &mut Vec<(&'static str, ffi::mlx_array)>,
+                        tag: &'static str,
+                        array: ffi::mlx_array| {
+            inputs.push((tag, array));
+        };
+        let mut push_triple = |inputs: &mut Vec<(&'static str, ffi::mlx_array)>,
+                               weight: &ResidentPackedWeight,
+                               tags: [&'static str; 3]| {
+            push(inputs, tags[0], weight.payload().storage.native_array());
+            push(inputs, tags[1], weight.scales().storage.native_array());
+            let biases = weight
+                .biases()
+                .map(|biases| biases.storage.native_array())
+                .unwrap_or(ffi::NULL_ARRAY);
+            push(inputs, tags[2], biases);
         };
         // The native body's fixed input order: att, gate, h, the o_proj triple, the post norm,
         // the transposed router, the three shared-expert triples, the shared scalar head
         // weight, then the gate/up stack and down stack triples.
-        inputs.push(args.att.storage.native_array());
-        inputs.push(args.gate.storage.native_array());
-        inputs.push(args.h.storage.native_array());
-        push_triple(&mut inputs, args.packed);
-        inputs.push(args.post_norm.storage.native_array());
-        inputs.push(args.router_t.storage.native_array());
-        for weight in args.shared {
-            push_triple(&mut inputs, weight);
+        push(&mut inputs, "att", args.att.storage.native_array());
+        push(&mut inputs, "gate", args.gate.storage.native_array());
+        push(&mut inputs, "h", args.h.storage.native_array());
+        push_triple(
+            &mut inputs,
+            args.packed,
+            ["o_proj.payload", "o_proj.scales", "o_proj.biases"],
+        );
+        push(
+            &mut inputs,
+            "post_norm",
+            args.post_norm.storage.native_array(),
+        );
+        push(
+            &mut inputs,
+            "router_t",
+            args.router_t.storage.native_array(),
+        );
+        for (weight, triple_tags) in args.shared.iter().zip([
+            [
+                "shared_gate.payload",
+                "shared_gate.scales",
+                "shared_gate.biases",
+            ],
+            ["shared_up.payload", "shared_up.scales", "shared_up.biases"],
+            [
+                "shared_down.payload",
+                "shared_down.scales",
+                "shared_down.biases",
+            ],
+        ]) {
+            push_triple(&mut inputs, weight, triple_tags);
         }
-        inputs.push(args.shared_scalar_t.storage.native_array());
-        for weight in args.stacks {
-            push_triple(&mut inputs, weight);
+        push(
+            &mut inputs,
+            "shared_scalar",
+            args.shared_scalar_t.storage.native_array(),
+        );
+        for (weight, triple_tags) in args.stacks.iter().zip([
+            [
+                "stack_gate_up.payload",
+                "stack_gate_up.scales",
+                "stack_gate_up.biases",
+            ],
+            [
+                "stack_down.payload",
+                "stack_down.scales",
+                "stack_down.biases",
+            ],
+        ]) {
+            push_triple(&mut inputs, weight, triple_tags);
         }
-        debug_assert_eq!(inputs.len(), attn_post_layer_input_tags().len());
+        let inputs: Vec<ffi::mlx_array> = {
+            let (pushed_tags, arrays): (Vec<&'static str>, Vec<ffi::mlx_array>) =
+                inputs.into_iter().unzip();
+            assert_eq!(
+                pushed_tags.as_slice(),
+                attn_post_layer_input_tags(),
+                "the push order left the native input contract"
+            );
+            arrays
+        };
         for weight in std::iter::once(args.packed)
             .chain(args.shared.iter().copied())
             .chain(args.stacks.iter().copied())
@@ -2540,8 +2602,8 @@ impl Context {
 mod attn_post_layer_input_order {
     /// The tag contract: the wrapper pushes exactly these 24 entries in this order, and the
     /// native body reads them at exactly these indices (guard.cpp maps 0=att, 1=gate, 2=h,
-    /// 3..5 the o_proj triple, 6 post_norm, 7 router_t, 8..16 the three shared triples,
-    /// 16 the shared scalar, 17..23 the two stack triples, 24/25 the appended lhs pair).
+    /// 3..5 the o_proj triple, 6 post_norm, 7 router_t, 8..17 the three shared triples,
+    /// 17 the shared scalar, 18..24 the two stack triples, 24/25 the appended lhs pair).
     #[test]
     fn positions_match_the_native_body_index_map() {
         let tags = super::attn_post_layer_input_tags();

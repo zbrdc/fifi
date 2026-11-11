@@ -302,10 +302,19 @@ fn window_taps_on() -> bool {
     std::env::var_os("Q36_WINDOW_TAPS").is_some_and(|v| v == "1")
 }
 
-/// Arms the compiled whole-layer chunk closure (`Q36_COMPILED_LAYER=1`, B1): a DELTA-mixer
-/// layer of a device-routed chunk window runs as ONE `mlx_compile`d closure (input norm,
-/// mixer, both residual adds, and the folded MoE rows sequence) instead of ~395 eager native
-/// entries. Default off; the eager chunk stays the reference and the parity oracle.
+/// Arms the compiled whole-layer chunk closures (`Q36_COMPILED_LAYER=1`): a chunk window
+/// of the device-routed prefill runs each DELTA-mixer layer AND each window-attention
+/// layer as ONE `mlx_compile`d closure instead of the eager entry storm. The delta
+/// closure covers the input norm, mixer, both residual adds and the folded MoE rows
+/// sequence (~395 eager native entries replaced); the attention closures cover a PRE
+/// body (projections, q/k norms, gate slice) and a POST body (o_proj, mixer residual,
+/// the same folded MoE rows sequence). The attention closures additionally require
+/// `fused_prefill_enabled`, so the fused-prefill kill switch disarms them. Inside a
+/// closure the per-block eager health evaluation is skipped: one end-of-closure health
+/// vector covers the whole layer. Default off; the eager chunk stays the reference and
+/// the parity oracle. Known limit while off (it blocks a default flip, not the flag):
+/// the window-attention path pays one extra `cache.share` KV copy per layer for the
+/// eager middle, and the BF16 cache form is excluded from the closures' coverage.
 ///
 /// The test override exists because edition 2024 makes `set_var` unsafe and the crate denies
 /// `unsafe_code`: the parity test flips the AtomicBool instead of the environment, inside the

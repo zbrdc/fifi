@@ -985,8 +985,9 @@ mod tests {
         // Serve-order coverage, corrected by review: with the flag ON below, this 64-row
         // `Prompt` chunk stays EAGER by the (2..16) window gate (the eager WY path serves
         // large chunks) - so a misrouted large chunk cannot poison the adapter silently.
-        // The windows then trace at 2, 3 and 8 in rising order, which is the cross-T cache
-        // reuse that broke the first serve run.
+        // The windows then trace at 2, 3 and 8 in rising order: successive compiles under
+        // one adapter must reuse the cache across T, never alias it, so the rising order
+        // exercises the cross-T cache-reuse contract of the closures.
         {
             // Flag ON for the prompt: the 64-row chunk stays eager by the (2..16) gate, so a
             // silent misroute would surface here as a native failure instead of in serve.
@@ -1064,8 +1065,8 @@ mod tests {
                         assert_eq!(a.len, b.len, "rows {rows} layer {l}: cache length");
                         // the attention layers run through the PRE/POST closures with
                         // the eager middle shared, so the cache buffers themselves must be
-                        // byte equal, not just the length. Both covered forms compare here:
-                        // F32 (the control) and Q8 (the form the serve A/B measured).
+                        // byte equal, not just the length. Both covered cache forms compare
+                        // here: F32 (the control) and Q8 (the serve-quantized form).
                         match (a.buffers.as_ref(), b.buffers.as_ref()) {
                             (
                                 Some(KvBuffers::F32 { k: ak, v: av }),
@@ -1082,7 +1083,7 @@ mod tests {
                                     "rows {rows} layer {l}: the value cache is byte equal"
                                 );
                             }
-                            // The Q8 arm (the form the serve A/B measured): the codes,
+                            // The Q8 arm (the serve-quantized form): the codes,
                             // scales, and biases of each side compare as raw bits.
                             (
                                 Some(KvBuffers::Q8 { k: ak, v: av }),
@@ -1129,6 +1130,12 @@ mod tests {
             println!(
                 "COMPILED_LAYER_PARITY kv={kv:?} rows={rows} attn_layers={attn_layers} attn_calls={attn_calls} eager_ops={eager_ops} compiled_ops={compiled_ops}"
             );
+            // The layer-kind count comes from the eager state: a zero would let the call and
+            // saving checks below pass vacuously, so pin it first.
+            assert!(
+                attn_layers > 0,
+                "rows {rows}: the parity state must hold attention layers (found {attn_layers})"
+            );
             assert!(
                 attn_calls >= 2 * attn_layers as u64,
                 "rows {rows}: the attention closures must run once per layer pair (calls {attn_calls} < 2 x {attn_layers})"
@@ -1136,17 +1143,16 @@ mod tests {
             // The eager baseline is not a constant (main wiring compiled delta rows into the
             // chunk path moved it), so the saving is pinned per attention layer instead of as
             // a ratio: each closed attention layer removes the eager qkv/moe dispatch storm.
-            // The pin comes from the Mac receipt at the review tip: rows 2 saves 78 and rows
-            // 3/8 save 117 entries over the 10 attention layers of the 35B A3B (7.8 to 11.7
-            // per layer), so 2 per layer is a conservative floor.
+            // Measured savings run 7.8 to 11.7 entries per attention layer on the 35B A3B
+            // family shape (10 attention layers), so 2 per layer is a conservative floor.
+            assert!(
+                compiled_ops < eager_ops,
+                "rows {rows}: compiled {compiled_ops} entries must stay under eager {eager_ops} (the residue is the eager window attention middle, the still-shared head, and the chunk edges)"
+            );
             assert!(
                 eager_ops - compiled_ops >= (attn_layers as u64) * 2,
                 "rows {rows}: the compiled chunk must save at least 2 entries per attention layer (saved {}, layers {attn_layers})",
                 eager_ops - compiled_ops
-            );
-            assert!(
-                compiled_ops < eager_ops,
-                "rows {rows}: compiled {compiled_ops} entries must stay under eager {eager_ops} (the residue is the eager window attention middle, the still-shared head, and the chunk edges)"
             );
         }
     }
