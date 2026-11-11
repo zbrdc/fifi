@@ -76,6 +76,7 @@ fn base() -> MmqDenseArgsRaw {
         m: 64,
         ld: 512,
         col_off: 0,
+        cols_hint: 0,
     }
 }
 
@@ -127,6 +128,22 @@ fn the_dense_fill_pins_every_mmq_args_field() {
         ]
     );
     assert_eq!((v.type_x, v.reserved), (8, 0));
+
+    // The tile-width hint reaches ncols_opt (the J-selection input) and nothing else: a
+    // positive hint below m replaces it, a hint at or above m keeps the stock value.
+    let qkv_shape = |cols_hint: c_int| MmqDenseArgsRaw {
+        n: 8192,
+        m: 49,
+        ld: 8192,
+        cols_hint,
+        ..base()
+    };
+    let hinted = fill(&qkv_shape(17)).expect("the hinted fill");
+    assert_eq!(hinted.ints[16..], [49, 17]);
+    let clamped = fill(&qkv_shape(80)).expect("the over-wide hint fill");
+    assert_eq!(clamped.ints[16..], [49, 49]);
+    assert_eq!(hinted.ints[..16], v.ints[..16]);
+    assert_eq!(clamped.ints[..16], v.ints[..16]);
 
     // A Q4_K slice of a fused destination: ld wider than n, a column offset (floats), the
     // stride in 256-value blocks.

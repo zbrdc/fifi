@@ -21,6 +21,7 @@ fn base() -> Nvfp4Args {
             m: 5,
             ld: 6144,
             col_off: 0,
+            cols_hint: 0,
         },
         y_scale: at(0x5000_0000).cast(),
     }

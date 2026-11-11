@@ -1,4 +1,4 @@
-/* Dense NVFP4-only addition: the legacy 64-byte dense ABI stays unchanged.
+/* Dense NVFP4-only addition: the dense ABI carries cols_hint at byte 64.
  * matrix is type40, contiguous dst [M][N], original GGUF blocks [N][K/64].
  * y_scale requires M+127 immutable, finite positive FP32 projection factors:
  * stream-k temporary writes include whole J<=128 tiles past M. The owning Rust
@@ -25,10 +25,10 @@ int inference_cuda_mmq_nvfp4_dense_fill(const inference_cuda_mmq_nvfp4_args *a,
                                        inference_cuda_mmq_args_view *out);
 #ifdef __cplusplus
 }
-static_assert(sizeof(inference_cuda_mmq_nvfp4_args) == 72 &&
-              offsetof(inference_cuda_mmq_nvfp4_args, y_scale) == 64,
+static_assert(sizeof(inference_cuda_mmq_nvfp4_args) == 80 &&
+              offsetof(inference_cuda_mmq_nvfp4_args, y_scale) == 72,
               "NVFP4 dense args layout");
 #else
-_Static_assert(sizeof(inference_cuda_mmq_nvfp4_args) == 72, "NVFP4 dense args layout");
+_Static_assert(sizeof(inference_cuda_mmq_nvfp4_args) == 80, "NVFP4 dense args layout");
 #endif
 #endif

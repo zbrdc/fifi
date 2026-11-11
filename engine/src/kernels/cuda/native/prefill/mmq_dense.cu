@@ -110,6 +110,13 @@ bool valid_dense(const inference_cuda_mmq_dense_args *a) {
     return a != NULL && valid_dense(a, block_shape(a->type));
 }
 
+/* The tile-width selection input: the stock heuristic uses every activation column; a
+ * positive hint clamps to the column count (the launch's own ncols_max), 0 or negative
+ * keeps the stock behavior. */
+static int ncols_opt_of(const inference_cuda_mmq_dense_args &a) {
+    return a.cols_hint > 0 && a.cols_hint < a.m ? a.cols_hint : a.m;
+}
+
 /* The dense fill, one pure function of the call (no device facts). */
 mmq_args fill_dense_args(const inference_cuda_mmq_dense_args &a, BlockShape shape) {
     mmq_args args{};
@@ -129,7 +136,7 @@ mmq_args fill_dense_args(const inference_cuda_mmq_dense_args &a, BlockShape shap
     args.nchannels_x = args.nchannels_y = 1;
     args.nsamples_x = args.nsamples_y = 1;
     args.ncols_max = a.m;
-    args.ncols_opt = a.m;
+    args.ncols_opt = ncols_opt_of(a);
     args.fixup = (float *)a.fixup;
     args.fixup_bytes = a.fixup_bytes;
     return args;
@@ -158,7 +165,7 @@ size_t fixup_need(const inference_cuda_mmq_dense_args &a, const fifi_device_fact
         if (config.type == GGML_TYPE_COUNT || mmq_get_nbytes_shared(config, dev.cc) > dev.smpbo) {
             continue;
         }
-        const int tiles = (a.m + config.J - 1) / config.J;
+        const int tiles = (ncols_opt_of(a) + config.J - 1) / config.J;
         if (tiles < best_tiles) {
             best_j = j;
             best_tiles = tiles;
@@ -168,7 +175,8 @@ size_t fixup_need(const inference_cuda_mmq_dense_args &a, const fifi_device_fact
         return 0;
     }
     const ggml_cuda_mmq_config config = ggml_cuda_mmq_get_config(type, best_j, fallback, dev.cc);
-    const long long tiles = (long long)ceil_div(a.m, config.J) * ceil_div(a.n, config.I);
+    const long long tiles =
+        (long long)ceil_div(ncols_opt_of(a), config.J) * ceil_div(a.n, config.I);
     const long long waves = ceil_div(tiles, dev.nsm);
     const bool tiling = GGML_CUDA_CC_IS_NVIDIA(dev.cc) && 100 * tiles / (dev.nsm * waves) >= 90;
     const long long blocks = tiling ? tiles : dev.nsm;

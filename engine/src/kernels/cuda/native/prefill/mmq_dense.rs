@@ -36,10 +36,11 @@ struct MmqDenseArgsRaw {
     m: c_int,
     ld: c_int,
     col_off: c_int,
+    cols_hint: c_int,
 }
 
 const _: () = assert!(
-    size_of::<MmqDenseArgsRaw>() == 64
+    size_of::<MmqDenseArgsRaw>() == 72
         && offset_of!(MmqDenseArgsRaw, y) == 8
         && offset_of!(MmqDenseArgsRaw, dst) == 16
         && offset_of!(MmqDenseArgsRaw, fixup) == 24
@@ -50,6 +51,7 @@ const _: () = assert!(
         && offset_of!(MmqDenseArgsRaw, m) == 52
         && offset_of!(MmqDenseArgsRaw, ld) == 56
         && offset_of!(MmqDenseArgsRaw, col_off) == 60
+        && offset_of!(MmqDenseArgsRaw, cols_hint) == 64
 );
 
 unsafe extern "C" {
@@ -134,6 +136,7 @@ fn c_dense(io: &MmqDenseRaw<'_>) -> MmqDenseArgsRaw {
         m: io.ints.m,
         ld: io.ints.ld,
         col_off: io.ints.col_off,
+        cols_hint: io.ints.cols_hint,
     }
 }
 

@@ -14,7 +14,7 @@ struct Nvfp4Args {
     y_scale: *const f32,
 }
 
-const _: () = assert!(size_of::<Nvfp4Args>() == 72 && offset_of!(Nvfp4Args, y_scale) == 64);
+const _: () = assert!(size_of::<Nvfp4Args>() == 80 && offset_of!(Nvfp4Args, y_scale) == 72);
 
 unsafe extern "C" {
     fn inference_cuda_mmq_nvfp4_dense(

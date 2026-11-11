@@ -48,6 +48,24 @@ const TILE_I: usize = 128;
 /// The vendored `variable kbc must not overflow` bound on `ntiles_dst * blocks_per_ne00`.
 const GRID_LIMIT: usize = 1 << 30;
 
+/// The tile-width hint for dense launches: `INFERENCE_CUDA_MMQ_DENSE_COLS_HINT`, unset or
+/// `off`/`auto`/`0` keeps the stock first-J-with-fewest-tiles heuristic, a positive number
+/// steers `ncols_opt` (the same knob class as `INFERENCE_CUDA_MMID_COLS_HINT`, whose mmid
+/// fix measured +18% prefill on Xavier). Read once per process.
+fn dense_cols_hint() -> Option<i64> {
+    static HINT: std::sync::OnceLock<Option<String>> = std::sync::OnceLock::new();
+    let raw = HINT.get_or_init(|| std::env::var("INFERENCE_CUDA_MMQ_DENSE_COLS_HINT").ok());
+    parse_cols_hint(raw.as_deref().unwrap_or(""))
+}
+
+fn parse_cols_hint(text: &str) -> Option<i64> {
+    let text = text.trim();
+    if text.is_empty() || text == "auto" || text == "off" {
+        return None;
+    }
+    text.parse::<i64>().ok().filter(|n| *n > 0)
+}
+
 /// The converted integers of one dense call, `c_int` for the FFI mirror; the rule checks
 /// build them, so no conversion can fail inside a launch closure.
 #[derive(Debug, Clone, Copy)]
@@ -58,6 +76,8 @@ pub(crate) struct DenseInts {
     pub(crate) m: c_int,
     pub(crate) ld: c_int,
     pub(crate) col_off: c_int,
+    /// The tile-width hint: 0 keeps the stock heuristic, a positive value clamps to `m`.
+    pub(crate) cols_hint: c_int,
 }
 
 /// The bytes of the three ranges a dense call uses: the weight blocks, the q8_1 columns
@@ -135,13 +155,20 @@ pub(super) fn check_dense_mmq_rules(
         MmqType::Nvfp4 => 64,
     };
     check_grid(qk, k, n, m)?;
+    let m_int = to_int("m", m)?;
+    let cols_hint = match dense_cols_hint() {
+        // The C side clamps the same way; keep the mirror in step so checks and launch agree.
+        Some(hint) => hint.clamp(1, i64::from(m_int)) as c_int,
+        None => 0,
+    };
     let ints = DenseInts {
         ty: super::mmq_quant::ggml_of(ty),
         k: to_int("k", k)?,
         n: to_int("n", n)?,
-        m: to_int("m", m)?,
+        m: m_int,
         ld: to_int("ld", ld)?,
         col_off: to_int("col_off", col_off)?,
+        cols_hint,
     };
     check_dst_reach(n, m, ld)?;
     Ok(ints)
@@ -359,3 +386,20 @@ impl CudaContext {
 
 #[cfg(all(test, feature = "native-cuda"))]
 mod tests;
+
+#[cfg(test)]
+mod cols_hint_tests {
+    use super::parse_cols_hint;
+
+    #[test]
+    fn parse_cols_hint_takes_positive_integers_only() {
+        assert_eq!(parse_cols_hint(""), None);
+        assert_eq!(parse_cols_hint("auto"), None);
+        assert_eq!(parse_cols_hint(" off "), None);
+        assert_eq!(parse_cols_hint("0"), None);
+        assert_eq!(parse_cols_hint("-8"), None);
+        assert_eq!(parse_cols_hint("junk"), None);
+        assert_eq!(parse_cols_hint("24"), Some(24));
+        assert_eq!(parse_cols_hint(" 128 "), Some(128));
+    }
+}
