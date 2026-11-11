@@ -183,6 +183,7 @@ const CUDA_HEADERS: &[&str] = &[
     "src/kernels/cuda/native/peer_ring_policy.h",
     "src/kernels/cuda/native/prefill/attn_prep_chunk.h",
     "src/kernels/cuda/native/prefill/attn_prefill.h",
+    "src/kernels/cuda/native/prefill/attn_prefill_plan.h",
     "src/kernels/cuda/native/prefill/gdn_scan_seq.h",
     "src/kernels/cuda/native/prefill/ggml_shim/ggml-cuda.h",
     "src/kernels/cuda/native/prefill/ggml_shim/ggml-impl.h",
