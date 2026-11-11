@@ -488,10 +488,10 @@ fn native_dim(label: &'static str, value: u32) -> Result<i32, EngError> {
 /// The wrapper (`Context::compiled_attn_post_layer`) builds its inputs as (tag, array)
 /// pairs and asserts the pushed tag sequence against this list before the native call,
 /// which catches a reordered or missing push (it does not check that a tag labels the
-/// right array). The pure test below pins THIS list against its own hand-checked copy of
-/// the native index map - it never reads guard.cpp, so the correspondence to the native
-/// indices is a reviewed fact, not a machine-checked one. The test compiles wherever this
-/// module does (macOS aarch64 with native-mlx), not on other hosts.
+/// right array). The pure test below pins THIS list against a hand-checked copy of
+/// the native index map - it never reads guard.cpp, so it catches edits to this
+/// list, not edits to the native map. The test compiles wherever this module does
+/// (macOS aarch64 with native-mlx), not on other hosts.
 pub(in crate::kernels::mlx) fn attn_post_layer_input_tags() -> [&'static str; 24] {
     [
         "att",
@@ -2600,12 +2600,14 @@ impl Context {
 
 #[cfg(test)]
 mod attn_post_layer_input_order {
-    /// The tag contract: the wrapper pushes exactly these 24 entries in this order, and the
-    /// native body reads them at exactly these indices (guard.cpp maps 0=att, 1=gate, 2=h,
-    /// 3..6 the o_proj triple, 6 post_norm, 7 router_t, 8..17 the three shared triples,
-    /// 17 the shared scalar, 18..24 the two stack triples, 24/25 the appended lhs pair).
+    /// The tag contract, as a hand-checked copy of the native body's index map
+    /// (guard.cpp reads 0=att, 1=gate, 2=h, 3..6 the o_proj triple, 6 post_norm,
+    /// 7 router_t, 8..17 the three shared triples, 17 the shared scalar, 18..24 the
+    /// two stack triples, 24/25 the appended lhs pair). The test below pins
+    /// attn_post_layer_input_tags against THIS copy - it does not read guard.cpp,
+    /// so it catches edits to the tags list, not edits to the native map.
     #[test]
-    fn positions_match_the_native_body_index_map() {
+    fn positions_match_the_pinned_index_copy() {
         let tags = super::attn_post_layer_input_tags();
         assert_eq!(tags.len(), 24);
         assert_eq!(tags[0], "att");
