@@ -61,6 +61,7 @@
         "FIFI_EXL3_SINGLE_GATHER",
         "FIFI_EXL3_SLOTS",
         "FIFI_EXL3_STICKY",
+        "FIFI_EXL3_SWEEP",
         "FIFI_EXL3_SWEEP_LAYERS",
         "FIFI_EXL3_TOKENS",
         "FIFI_EXL3_TRACE",
