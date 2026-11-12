@@ -93,9 +93,12 @@ impl ResidentDecoder<'_> {
                 "token is outside the embedding table".into(),
             ));
         }
-        let growth = super::state::kv_growth_bytes(&self.weights)?;
-        (0..states.len())
-            .map(|_| self.budget.acquire_growth(growth))
+        states
+            .iter()
+            .map(|state| {
+                let growth = super::state::advance_charge(state, &self.weights, 1)?;
+                self.budget.acquire_growth(growth)
+            })
             .collect()
     }
 

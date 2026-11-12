@@ -14,7 +14,8 @@
 //! ACTIVATION dtype (BF16 in the serving default, so the per-position cost is 1,088 B; F32
 //! activation mode widens the scales and costs 1,152 B). A decode step appends one position at
 //! `[0, 0, len, 0]`; a chunk appends its rows the same way. When `len + rows` passes `cap`, the
-//! layer builds a larger buffer of `round_up(len + rows, KV_STEP)` positions - the valid prefix
+//! layer builds a larger buffer of `round_up(len + rows, KV_STEP)` positions under the quantum
+//! law, or double the capacity clamped to the context limit under `Q36_KV_GEOMETRIC=1` - the valid prefix
 //! `[0, len)` of ALL the buffers copied once (a copy is acceptable once per growth), zero slack -
 //! and appends into that. Attention runs over the copy-free prefix view of the buffers
 //! (`grouped_attention_prefix` in the F32 form, `quantized_attention_prefix` in the Q8 form, the
@@ -22,14 +23,20 @@
 //! copies the whole cache per token as the `concatenate` formulation did (about 671 MB per token at
 //! depth 8,192 on the real model in the F32 form). A snapshot shares the buffers; the next in-place
 //! append on a shared buffer copies it once (the operation falls back when the handle is not
-//! unique), so the snapshot keeps its own rows. The admission charge of the session budget stays
-//! LOGICAL, `len` positions of growth bytes per layer (`settings::kv_growth_per_position`, the one
-//! byte authority); the capacity slack of a whole session stays below one `KV_STEP` of growth bytes
+//! unique), so the snapshot keeps its own rows. With `Q36_KV_GEOMETRIC` unset the admission
+//! charge of the session budget is LOGICAL, `len` positions of growth bytes per layer
+//! (`settings::kv_growth_per_position`, the one byte authority), and the capacity slack of a
+//! whole session stays below one `KV_STEP` of growth bytes
 //! per attention layer (256 * 4,096 * 10 = 10,485,760 bytes on the real model in the F32 form;
-//! 256 * 1,088 * 10 = 2,785,280 at Q8 with BF16 scales). That slack bound EXCLUDES the growth
-//! transient - the old buffer, its slice copy, and the new buffer alive together at a growth, about
-//! 100 MB per layer at depth 8,192 in the F32 form - which the session reserve margin and the
-//! retire cap cover. The step builds a lazy graph only.
+//! 256 * 1,088 * 10 = 2,785,280 at Q8 with BF16 scales). Under `Q36_KV_GEOMETRIC=1` (read once per process; restart to change) the capacity doubles instead, to the context limit; admission and the reserve then charge the ALLOCATED capacity (each layer's `cap`), so the charge never understates the buffers, and the per-layer slack can reach half that capacity. That slack bound EXCLUDES the growth
+//! transient: at a growth the old buffer and the new buffer are alive together (the copy is
+//! `slice(old)` concatenated with a zero block, so which pieces the graph materialises depends
+//! on MLX; per layer, computed from buffer sizes and not measured: under the quantum
+//! law about 68 MB at depth 8,192 in the F32 form (33.5 MB old + 34.6 MB new); under
+//! `Q36_KV_GEOMETRIC=1` about 101 MB at the 8,192-to-16,384 doubling (33.5 MB old +
+//! 67.1 MB new) and about 1.6 GB at the 128K-to-256K doubling (0.54 GB old + 1.07 GB
+//! new). The new buffer is inside the geometric charge; the old one is the part beyond it.
+//! The session reserve margin and the retire cap cover it. The step builds a lazy graph only.
 
 use super::kv_plan;
 use super::ops::{Ctx, cast_to, dim, linear, to_act};
@@ -124,6 +131,9 @@ pub(super) struct KvCache {
     /// The growth quantum in positions. The default is `KV_STEP`; tests use a small step so a run
     /// crosses a growth boundary within a few tokens.
     pub(super) step: usize,
+    /// The geometric-growth ceiling in positions, from the decoder's `context_limit`. Zero (the
+    /// default, and whenever `Q36_KV_GEOMETRIC` is off) keeps the pure `step`-quantum growth.
+    pub(super) ceiling: usize,
 }
 
 impl KvCache {
@@ -147,7 +157,16 @@ impl KvCache {
             len: 0,
             cap: 0,
             step,
+            ceiling: 0,
         }
+    }
+
+    /// The same empty cache under geometric growth: on a boundary the capacity doubles, clamped
+    /// to `ceiling`, instead of advancing one quantum. `ResidentState::zero_with` sets it from
+    /// the decoder's `context_limit` when `Q36_KV_GEOMETRIC` is on.
+    pub(super) fn with_ceiling(mut self, ceiling: usize) -> Self {
+        self.ceiling = ceiling;
+        self
     }
 
     /// A cache that shares every buffer with `self`, of the same form, length, capacity, and
@@ -175,6 +194,7 @@ impl KvCache {
             len: self.len,
             cap: self.cap,
             step: self.step,
+            ceiling: self.ceiling,
         }
     }
 
@@ -192,7 +212,8 @@ impl KvCache {
     }
 
     /// Stored bytes of the keys and values, from the tensors' own sizes: the capacity slack is
-    /// included. Reports and tests read this; the admission charge is logical (`state::kv_bytes`).
+    /// included. Reports and tests read this; the admission charge is the valid length with
+    /// `Q36_KV_GEOMETRIC` unset and the allocated capacity under it (`state::kv_bytes`).
     pub(super) fn byte_len(&self) -> u64 {
         self.tensors()
             .into_iter()
@@ -274,9 +295,15 @@ fn share_q8(side: &Q8Tensor) -> Q8Tensor {
 /// LOGICAL admission charge of one position: the capacity buffers hold up to one `KV_STEP` of slack
 /// per layer on top of it, so the slack of a whole session stays below `KV_STEP * growth_bytes`
 /// summed over the attention layers - 10,485,760 bytes on the real model in the F32 form, 2,785,280
-/// at Q8 with BF16 scales - and `state::kv_bytes` charges only this formula, never the stored
-/// bytes. The bound excludes the growth transient (the old buffer, its slice copy, and the new
-/// buffer alive at a growth), which the session reserve margin and the retire cap cover.
+/// at Q8 with BF16 scales - and `state::kv_bytes` charges exactly this formula with
+/// `Q36_KV_GEOMETRIC` unset and the allocated capacity under it, never the stored bytes
+/// directly. The bound excludes the growth transient (the old buffer and the new buffer
+/// alive at a growth; per layer, computed from buffer sizes and not measured: under the
+/// quantum law about 68 MB at depth 8,192 in the F32 form (33.5 MB old + 34.6 MB new);
+/// under `Q36_KV_GEOMETRIC=1` about 101 MB at the 8,192-to-16,384 doubling (33.5 MB old
+/// + 67.1 MB new) and about 1.6 GB at the 128K-to-256K doubling (0.54 GB old + 1.07 GB
+/// new)), which the
+/// session reserve margin and the retire cap cover.
 pub(super) fn growth_bytes(
     shape: &HostShape,
     kv: KvDtype,
@@ -405,7 +432,8 @@ fn append_q8_side(
 /// Appends `rows` new positions - `k_new` and `v_new`, each `[1, KVH, rows, D]` F32 in the F32 form
 /// or of the ACTIVATION dtype in the Q8 form - to the validated `cache` and returns the next cache.
 /// When `len + rows` passes `cap`, the buffers grow to
-/// `kv_plan::next_capacity(len, rows, cap, step)` positions: the valid prefix of ALL the buffers
+/// `kv_plan::next_capacity(len, rows, cap, step, ceiling)` positions - one `step` quantum, or a
+/// doubling clamped to the ceiling under geometric growth: the valid prefix of ALL the buffers
 /// copied once and zero slack, for keys and for values. The append itself is the consuming
 /// `kv_append` at `[0, 0, len, 0]`: a unique buffer is written in place (MLX donates it), a buffer
 /// shared with a snapshot is copied once. In the Q8 form the new rows arrive as the activation
@@ -425,7 +453,7 @@ pub(super) fn append(
 ) -> Result<KvCache, EngError> {
     let rows = usize::try_from(rows).map_err(|_| overflow())?;
     let next_len = cache.len.checked_add(rows).ok_or_else(overflow)?;
-    let cap = kv_plan::next_capacity(cache.len, rows, cache.cap, cache.step)?;
+    let cap = kv_plan::next_capacity(cache.len, rows, cache.cap, cache.step, cache.ceiling)?;
     let len = dim(cache.len)?;
     let buffers = match (cache.kv, cache.buffers) {
         // The F32 form, byte for byte the same as without the Q8 form: the new rows are F32 (the
@@ -539,6 +567,7 @@ pub(super) fn append(
         len: next_len,
         cap,
         step: cache.step,
+        ceiling: cache.ceiling,
     })
 }
 
@@ -1267,6 +1296,7 @@ mod tests {
             len: 1,
             cap: 1,
             step: 3,
+            ceiling: 0,
         };
         let wrong_shape = step(&mut ctx, &shape, rw, bad, 1, &xr, &w.layers[1].input_norm);
         assert!(
@@ -1291,6 +1321,7 @@ mod tests {
             len: 2,
             cap: 1,
             step: 3,
+            ceiling: 0,
         };
         let wrong_cap = step(&mut ctx, &shape, rw, bad, 2, &xr, &w.layers[1].input_norm);
         assert!(
@@ -1849,6 +1880,61 @@ mod tests {
             );
         }
         assert_eq!((cache.len, cache.cap), (7, 8), "one growth at position 4");
+    }
+
+    /// S6: under the geometric law a doubling CLAMPS to the ceiling, and the ceiling
+    /// itself rounds up to a step multiple (10 -> 12). Both cache forms, step 4: rows
+    /// 1-4 hold the first quantum (4), row 5 doubles to 8, and row 9 would double to 16
+    /// but clamps to 12, where the remaining rows stay.
+    #[test]
+    fn a_geometric_cache_clamps_to_the_ceiling_in_both_forms() {
+        let _serial = crate::native_test_lock();
+        for (label, kv, setup) in [
+            (
+                "f32",
+                KvDtype::F32,
+                setup as fn() -> (StreamedCheckpoint, HostWeights, ResidentWeights, MlxKernels),
+            ),
+            (
+                "q8",
+                KvDtype::Q8,
+                setup_kv8 as fn() -> (StreamedCheckpoint, HostWeights, ResidentWeights, MlxKernels),
+            ),
+        ] {
+            let (_, oracle, w, mut kernels) = setup();
+            let shape = oracle.shape().clone();
+            let RMixer::Attn(rw) = &w.layers[1].mixer else {
+                panic!("resident layer 1 is attention");
+            };
+            let growth = growth_bytes(&shape, kv, Activation::F32).unwrap();
+            let mut cache = KvCache::with_form(kv, 4).with_ceiling(10);
+            for n in 0..12u32 {
+                let xr = upload(&mut kernels, &input(n));
+                let mut ctx = Ctx {
+                    kernels: &mut kernels,
+                    consts: &w.consts,
+                    compile: false,
+                };
+                cache = step(&mut ctx, &shape, rw, cache, n, &xr, &w.layers[1].input_norm)
+                    .unwrap()
+                    .cache;
+                let expected = match n {
+                    0..=3 => 4,
+                    4..=7 => 8,
+                    _ => 12,
+                };
+                assert_eq!(
+                    (cache.len, cache.cap),
+                    (n as usize + 1, expected),
+                    "{label} step {n}"
+                );
+            }
+            assert_eq!(
+                cache.byte_len(),
+                12 * growth,
+                "{label}: the clamped 12, not the doubled 16, is stored"
+            );
+        }
     }
 
     /// A cache whose declared form does not match its buffers, or whose Q8 buffers hold the wrong

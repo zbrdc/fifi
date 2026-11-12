@@ -375,6 +375,8 @@ fn run_config_effective(path: &std::path::Path, json: bool) -> Result<(), String
         use crate::family::qwen36::settings::{Q36Env, Q36Settings};
         let env = Q36Env {
             cache_limit: std::env::var("Q36_CACHE_LIMIT").ok(),
+            kv_geometric: std::env::var("Q36_KV_GEOMETRIC").ok(),
+            spec_step_window: std::env::var("Q36_SPEC_STEP_WINDOW").ok(),
         };
         let backend = backend_of_build();
         let spec = if engine.family == crate::family::qwen36::factory::DENSE_FAMILY {

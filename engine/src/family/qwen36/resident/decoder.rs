@@ -803,8 +803,15 @@ impl<'c> ResidentDecoder<'c> {
         Ok(())
     }
 
-    /// Imports a zero state with one synchronization.
+    /// Imports a zero state with one synchronization. Under `Q36_KV_GEOMETRIC` the attention
+    /// caches grow geometrically with this decoder's `context_limit` as the ceiling.
     pub(super) fn zero_state(&mut self) -> Result<ResidentState, EngError> {
+        if super::state::geometric_growth()? {
+            let ceiling = usize::try_from(self.context_limit).map_err(|_| {
+                EngError::MemoryPlan("q36 kv plan: the context limit overflows usize".into())
+            })?;
+            return ResidentState::zero_geometric(&mut self.kernels, &self.weights, ceiling);
+        }
         ResidentState::zero(&mut self.kernels, &self.weights)
     }
 

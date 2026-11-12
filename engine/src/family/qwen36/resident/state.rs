@@ -5,18 +5,23 @@
 //! the F32 control `[1, KVH, cap, D]` per key and value tensor, in the Q8 form the codes
 //! `[1, KVH, cap, D/4]` beside scales and biases `[1, KVH, cap, D/64]` of the activation dtype,
 //! `len` valid positions, growth in `KV_STEP` quanta. The growth charge covers the cache only, as
-//! in the Flash-Next decoder, and stays LOGICAL — `len` positions of growth bytes per layer, from
-//! the cache form and the activation dtype — so the capacity slack, bounded by one `KV_STEP` of
+//! in the Flash-Next decoder: under the quantum law it is LOGICAL — `len` positions of growth
+//! bytes per layer, from the cache form and the activation dtype — so the capacity slack,
+//! bounded by one `KV_STEP` of
 //! growth bytes per attention layer (256 * 4,096 * 10 = 10,485,760 bytes on the real model in the
-//! F32 form; 256 * 1,088 * 10 = 2,785,280 at Q8 with BF16 scales), never enters a permit;
-//! `kv_storage_bytes` reports the stored bytes. The slack bound excludes the growth TRANSIENT — the
-//! old buffer, its slice copy, and the new buffer alive together at a growth, about 100 MB per
-//! layer at depth 8,192 in the F32 form — which the session reserve margin and the retire cap
-//! cover. The fixed DeltaNet state of 65,863,680 bytes is not charged by the steps; a snapshot
+//! F32 form; 256 * 1,088 * 10 = 2,785,280 at Q8 with BF16 scales), never enters a permit; Under `Q36_KV_GEOMETRIC=1` (read once per process; restart to change) the capacity doubles instead, to the context limit; admission and the reserve then charge the ALLOCATED capacity (each layer's `cap`), so the charge never understates the buffers, and the per-layer slack can reach half that capacity.
+//! `kv_storage_bytes` reports the stored bytes. The slack bound excludes the growth TRANSIENT:
+//! at a growth the old buffer and the new buffer are alive together (per layer, computed
+//! from buffer sizes and not measured: under the quantum law about 68 MB at depth 8,192
+//! in the F32 form (33.5 MB old + 34.6 MB new); under `Q36_KV_GEOMETRIC=1` about 101 MB
+//! at the 8,192-to-16,384 doubling (33.5 MB old + 67.1 MB new) and about 1.6 GB at
+//! the 128K-to-256K doubling (0.54 GB old + 1.07 GB new), of which the old buffer is the
+//! part beyond the geometric
+//! charge). The session reserve margin and the retire cap cover it. The fixed DeltaNet state of 65,863,680 bytes is not charged by the steps; a snapshot
 //! charges it once with its entry.
 
 use super::attn::{KvCache, growth_bytes};
-use super::kv_plan::{KV_STEP, session_bytes};
+use super::kv_plan::{KV_STEP, next_capacity, session_bytes};
 use super::ops::{Bytes, dim, short_import, zeros};
 use super::prefix_pages::{Page, allowance_bytes, allowance_pages};
 use super::weights::{RMixer, ResidentWeights};
@@ -86,34 +91,91 @@ pub(super) fn kv_growth_per_layer_bytes(weights: &ResidentWeights) -> Result<u64
 }
 
 /// Bytes that a chunk of `rows` tokens adds to the stored caches: `rows` positions of
-/// `kv_growth_bytes`. It makes no native call.
+/// `kv_growth_bytes`, every attention layer summed. It makes no native call. The test
+/// budget sizers use it; the serving paths charge `advance_charge`.
 pub(super) fn chunk_growth_bytes(weights: &ResidentWeights, rows: u32) -> Result<u64, EngError> {
     kv_growth_bytes(weights)?
         .checked_mul(u64::from(rows))
         .ok_or_else(|| EngError::MemoryPlan("kv chunk growth bytes overflow u64".into()))
 }
 
-/// The LOGICAL bytes of the attention caches in `layers`: one
+/// The growth charge of advancing `rows` rows. Under the quantum law it is the per-row
+/// bytes of every attention layer — the valid length is the charge, the capacity slack never
+/// enters a permit, unchanged behaviour. Under the geometric law (`Q36_KV_GEOMETRIC=1`, read
+/// once per process; restart to change) admission and the reserve charge the ALLOCATED
+/// capacity: the charge of an advance is the capacity it adds (zero while the rows fit the
+/// current capacity, the doubling when they do not), so the cumulative charge of a state is
+/// exactly its layers' allocated bytes — `check_commit_rows` enforces the equality.
+pub(super) fn advance_charge(
+    state: &ResidentState,
+    weights: &ResidentWeights,
+    rows: u32,
+) -> Result<u64, EngError> {
+    // The quantum law: the charge is the valid length - every attention layer summed,
+    // the capacity slack never enters a permit. Unchanged behaviour.
+    if state.kv_ceiling == 0 {
+        return chunk_growth_bytes(weights, rows);
+    }
+    // The geometric law: the ALLOCATED capacity the advance adds, per layer (the
+    // all-layer `kv_growth_bytes` sum must not be multiplied by the layer count again).
+    let per_layer = kv_growth_per_layer_bytes(weights)?;
+    let overflow = || EngError::MemoryPlan("kv advance charge overflow u64".into());
+    let mut total = 0u64;
+    for layer in &state.layers {
+        let LayerState::Attn(cache) = layer else {
+            continue;
+        };
+        let after = next_capacity(
+            cache.len,
+            rows as usize,
+            cache.cap,
+            state.kv_step,
+            state.kv_ceiling,
+        )?;
+        let charge = per_layer
+            .checked_mul(u64::try_from(after.saturating_sub(cache.cap)).map_err(|_| overflow())?)
+            .ok_or_else(overflow)?;
+        total = total.checked_add(charge).ok_or_else(overflow)?;
+    }
+    Ok(total)
+}
+
+/// The bytes of the attention caches in `layers`: one
 /// `kv_plan::session_bytes` charge — the attention layer count, the valid length they hold, and
 /// the PER-LAYER growth — because every attention layer of a committed, snapshotted, or restored
 /// state holds the same valid length, the position (`check_step` before a step,
-/// `check_saved_layer` before a restore). The charge of a state at `pos` is therefore exactly
-/// `pos * kv_growth_bytes(weights)`, the formula the step and chunk permits hold; the capacity
-/// slack of the buffers never enters it, and the slack of a whole session stays below one
-/// `KV_STEP` of growth bytes per attention layer (256 * 4,096 * 10 = 10,485,760 bytes on the
-/// real model). Attention layers of UNEQUAL valid length give `u64::MAX`, so a state whose layers
-/// disagree fails the permit equality check instead of passing on the last layer's length. Use
-/// `kv_storage_bytes` for the stored bytes.
-fn kv_bytes(layers: &[LayerState], per_layer: u64) -> u64 {
-    kv_bytes_at_len(layers, None, per_layer)
+/// `check_saved_layer` before a restore). Under the quantum law (`allocated == false`) the
+/// charge of a state at `pos` is therefore exactly `pos * kv_growth_bytes(weights)`, the
+/// formula the step and chunk permits hold; the capacity slack never enters it, and the slack
+/// of a whole session stays below one `KV_STEP` of growth bytes per attention layer
+/// (256 * 4,096 * 10 = 10,485,760 bytes on the real model). Under `Q36_KV_GEOMETRIC=1`
+/// (`allocated == true`, read once per process; restart to change) admission and the reserve
+/// charge the ALLOCATED capacity — each layer's `cap` positions, summed per layer because a
+/// mid-doubling session staggers them — so a doubling is charged when it happens and the
+/// reserve never understates the buffers. A NON-ZERO rewind keeps the capacity, so the
+/// rewound permit re-charges the same bytes; a rewind to ZERO adopts the snapshot's
+/// pristine capacity-zero caches and charges nothing. Attention layers of UNEQUAL valid length give `u64::MAX`, so a
+/// state whose layers disagree fails the permit equality check instead of passing on the last
+/// layer's length. Use `kv_storage_bytes` for the stored bytes.
+fn kv_bytes(layers: &[LayerState], per_layer: u64, allocated: bool) -> u64 {
+    kv_bytes_at_len(layers, None, per_layer, allocated)
 }
 
 /// The admission charge with an optional valid-length override: the rewind path acquires
 /// for the REWOUND extent before any mutation, so it passes the snapshot position while the
-/// caches still hold the longer valid length.
-fn kv_bytes_at_len(layers: &[LayerState], len_override: Option<usize>, per_layer: u64) -> u64 {
+/// caches still hold the longer valid length. Under `allocated` the override only feeds the
+/// equal-length invariant check — the charge itself is each layer's capacity, which a
+/// non-zero rewind does not change; a rewind to zero restores pristine capacity-zero caches,
+/// so the allocated charge of the rewound extent is 0.
+fn kv_bytes_at_len(
+    layers: &[LayerState],
+    len_override: Option<usize>,
+    per_layer: u64,
+    allocated: bool,
+) -> u64 {
     let mut attn_layers = 0;
     let mut len: Option<usize> = None;
+    let mut allocated_total: u64 = 0;
     for layer in layers {
         if let LayerState::Attn(cache) = layer {
             attn_layers += 1;
@@ -125,7 +187,19 @@ fn kv_bytes_at_len(layers: &[LayerState], len_override: Option<usize>, per_layer
                 Some(first) if first != valid => return u64::MAX,
                 Some(_) => {}
             }
+            allocated_total =
+                allocated_total.saturating_add((cache.cap as u64).saturating_mul(per_layer));
         }
+    }
+    if allocated {
+        // A rewind to ZERO swaps the attention caches for pristine, capacity-zero
+        // buffers (see `restore`), so the rewound extent's allocated charge is 0 -
+        // charging the old caps would leave a stale permit that fails the next
+        // `check_commit_rows` equality.
+        if len.unwrap_or(0) == 0 {
+            return 0;
+        }
+        return allocated_total;
     }
     session_bytes(attn_layers, len.unwrap_or(0), per_layer).unwrap_or(u64::MAX)
 }
@@ -280,7 +354,8 @@ pub(super) struct ResidentState {
     /// rewritten positions stops restoring. A commit at or above it extends new ground and
     /// keeps the generation.
     high_water: u32,
-    /// One growth permit per committed step. Together they hold the logical cache bytes.
+    /// One growth permit per committed step. Together they hold the cache bytes: the valid
+    /// length with `Q36_KV_GEOMETRIC` unset, the allocated capacity under it.
     /// `reset` and drop release them. A failed step keeps the earlier permits until `reset`.
     permits: Vec<GrowthPermit>,
     /// The LOGICAL growth bytes of ONE position of ONE attention layer
@@ -291,6 +366,28 @@ pub(super) struct ResidentState {
     /// The growth quantum of the attention caches, in positions: `KV_STEP` for `zero` and the
     /// test step for `zero_with_step`. `reset` keeps it.
     kv_step: usize,
+    /// The geometric-growth ceiling of the attention caches, in positions: the decoder's
+    /// `context_limit` when `Q36_KV_GEOMETRIC` is on, zero (pure quantum growth) otherwise.
+    /// `reset` keeps it.
+    kv_ceiling: usize,
+}
+
+/// Whether the attention caches grow geometrically (a boundary doubles the capacity, clamped to
+/// the context limit) instead of in `KV_STEP` quanta. Default off: the quantum growth stays the
+/// reference until the geometric arm is measured (the boundary wall harness, the segment
+/// rates, the peak-memory probe and the byte-parity digest across growth boundaries).
+/// Read once per process (restart to change). Accepted values are `0` (default) and `1`;
+/// anything else is a `BadRequest` configuration error raised at the first `zero_state`,
+/// inside engine open - not a panic.
+pub(super) fn geometric_growth() -> Result<bool, EngError> {
+    use std::sync::OnceLock;
+    static VALUE: OnceLock<Result<bool, String>> = OnceLock::new();
+    VALUE
+        .get_or_init(|| {
+            super::super::settings::parse_kv_geometric(std::env::var("Q36_KV_GEOMETRIC"))
+        })
+        .clone()
+        .map_err(EngError::BadRequest)
 }
 
 impl ResidentState {
@@ -300,7 +397,18 @@ impl ResidentState {
         kernels: &mut MlxKernels,
         weights: &ResidentWeights,
     ) -> Result<Self, EngError> {
-        Self::zero_with(kernels, weights, KV_STEP)
+        Self::zero_with(kernels, weights, KV_STEP, 0)
+    }
+
+    /// Imports a zero state whose attention caches grow geometrically - a boundary doubles the
+    /// capacity, clamped to `kv_ceiling`. The decoder's `zero_state` calls this with its
+    /// `context_limit` when `Q36_KV_GEOMETRIC` is on.
+    pub(super) fn zero_geometric(
+        kernels: &mut MlxKernels,
+        weights: &ResidentWeights,
+        kv_ceiling: usize,
+    ) -> Result<Self, EngError> {
+        Self::zero_with(kernels, weights, KV_STEP, kv_ceiling)
     }
 
     /// Imports a zero state whose attention caches grow in `kv_step`-position quanta. Tests use
@@ -311,7 +419,7 @@ impl ResidentState {
         weights: &ResidentWeights,
         kv_step: usize,
     ) -> Result<Self, EngError> {
-        Self::zero_with(kernels, weights, kv_step)
+        Self::zero_with(kernels, weights, kv_step, 0)
     }
 
     /// The one constructor body of `zero` and `zero_with_step`.
@@ -319,6 +427,7 @@ impl ResidentState {
         kernels: &mut MlxKernels,
         weights: &ResidentWeights,
         kv_step: usize,
+        kv_ceiling: usize,
     ) -> Result<Self, EngError> {
         let d = &weights.shape.delta;
         let rec = vec![dim(d.value_heads)?, dim(d.value_dim)?, dim(d.key_dim)?];
@@ -344,7 +453,9 @@ impl ResidentState {
                     rec: next()?,
                     ring: next()?,
                 },
-                RMixer::Attn(_) => LayerState::Attn(KvCache::with_form(weights.kv, kv_step)),
+                RMixer::Attn(_) => LayerState::Attn(
+                    KvCache::with_form(weights.kv, kv_step).with_ceiling(kv_ceiling),
+                ),
             });
         }
         Ok(Self {
@@ -356,6 +467,7 @@ impl ResidentState {
             permits: Vec::new(),
             kv_growth_per_layer: kv_growth_per_layer_bytes(weights)?,
             kv_step,
+            kv_ceiling,
         })
     }
 
@@ -487,8 +599,9 @@ impl ResidentState {
     }
 
     /// Publishes a step of `rows` tokens after its `evaluate` and readbacks succeeded. It keeps
-    /// `permit` only if the total charge equals the LOGICAL cache bytes (`len` positions of
-    /// growth per layer). Otherwise it returns `MemoryPlan`, drops
+    /// `permit` only if the total charge equals the cache bytes — with `Q36_KV_GEOMETRIC`
+    /// unset the LOGICAL bytes (`len` positions of growth per layer), under it the ALLOCATED
+    /// capacity per layer. Otherwise it returns `MemoryPlan`, drops
     /// `permit`, and changes nothing.
     pub(super) fn commit_rows(
         &mut self,
@@ -525,10 +638,18 @@ impl ResidentState {
             .charged_bytes()?
             .checked_add(permit.retained_bytes())
             .ok_or_else(|| EngError::MemoryPlan("session charge overflows u64".into()))?;
-        let logical = kv_bytes(layers, self.kv_growth_per_layer);
+        let allocated = self.kv_ceiling > 0;
+        let logical = kv_bytes(layers, self.kv_growth_per_layer, allocated);
         if logical != charged {
+            // The default path keeps its historical text; only the geometric law names the
+            // allocated-capacity charge.
+            let what = if allocated {
+                "the cache bytes"
+            } else {
+                "the logical cache bytes"
+            };
             return Err(EngError::MemoryPlan(format!(
-                "session charge {charged} bytes differs from the logical cache bytes {logical}"
+                "session charge {charged} bytes differs from {what} {logical}"
             )));
         }
         Ok(pos)
@@ -583,7 +704,9 @@ impl ResidentState {
     /// appends), the DeltaNet tensors swap to the snapshot's shared handles (a step on a
     /// Delta state always builds new arrays, so the shared ones are immutable), and the
     /// position rewinds. The permits stay: the capacity buffers and their charge are
-    /// unchanged. The snapshot keeps its own permit. A snapshot of another generation, of a
+    /// unchanged — EXCEPT a rewind to position ZERO, which swaps the attention caches for
+    /// pristine capacity-zero buffers and re-charges nothing (the rewound permit is 0). The
+    /// snapshot keeps its own permit. A snapshot of another generation, of a
     /// position the live state no longer extends, or of another Delta layout returns
     /// `BadRequest`. On error the state is unchanged.
     pub(super) fn restore(
@@ -612,7 +735,11 @@ impl ResidentState {
             let adopted_layers: Vec<LayerState> =
                 snapshot.layers.iter().map(LayerState::share).collect();
             let adopted_pos = snapshot.pos;
-            let adopted_bytes = kv_bytes(&adopted_layers, self.kv_growth_per_layer);
+            let adopted_bytes = kv_bytes(
+                &adopted_layers,
+                self.kv_growth_per_layer,
+                self.kv_ceiling > 0,
+            );
             let new_permit = budget.acquire_growth(adopted_bytes)?;
             // Success: replace the state (the old permits drop, releasing their charge).
             self.layers = adopted_layers;
@@ -673,7 +800,12 @@ impl ResidentState {
         // as they were.
         let rewind_len = usize::try_from(snapshot.pos)
             .map_err(|_| EngError::BadRequest("the rewind position overflows usize".into()))?;
-        let rewound = kv_bytes_at_len(&self.layers, Some(rewind_len), self.kv_growth_per_layer);
+        let rewound = kv_bytes_at_len(
+            &self.layers,
+            Some(rewind_len),
+            self.kv_growth_per_layer,
+            self.kv_ceiling > 0,
+        );
         let new_permit = budget.acquire_growth(rewound)?;
         let mut next_saved = snapshot.delta();
         for layer in &mut self.layers {
@@ -695,7 +827,8 @@ impl ResidentState {
         for layer in &mut self.layers {
             if let LayerState::Attn(cache) = layer {
                 if rewind_len == 0 {
-                    *cache = KvCache::with_form(weights.kv, self.kv_step);
+                    *cache =
+                        KvCache::with_form(weights.kv, self.kv_step).with_ceiling(self.kv_ceiling);
                 } else {
                     cache.len = rewind_len;
                 }
@@ -709,6 +842,68 @@ impl ResidentState {
         Ok(())
     }
 
+    /// Whether this state grows geometrically (`Q36_KV_GEOMETRIC=1`): admission and the
+    /// reserve charge the ALLOCATED capacity.
+    pub(super) fn geometric_law(&self) -> bool {
+        self.kv_ceiling > 0
+    }
+
+    /// The ALLOCATED KV bytes of the attention layers - the charge `kv_bytes` computes under
+    /// the geometric law, and what a NON-ZERO rewind re-acquires (it keeps the capacity; a
+    /// rewind to zero charges 0).
+    pub(super) fn allocated_kv_bytes(&self) -> u64 {
+        kv_bytes(&self.layers, self.kv_growth_per_layer, true)
+    }
+
+    /// The allocated capacity of the first attention layer's KV buffers - the value
+    /// the growth law leaves after a fill. Test support only.
+    #[cfg(test)]
+    pub(super) fn attn_cap(&self) -> usize {
+        for layer in &self.layers {
+            if let LayerState::Attn(cache) = layer {
+                return cache.cap;
+            }
+        }
+        0
+    }
+
+    /// Reads every attention layer's VALID F32 key and value rows back as host values, in
+    /// model order (keys then values per layer), for the growth-parity digest of the Mac
+    /// gates: only the first `len` positions of each buffer, so two growth laws that hold
+    /// the same rows at different capacities digest identically. One synchronization per
+    /// buffer. Test support only.
+    #[cfg(test)]
+    pub(super) fn attn_kv_values(
+        &mut self,
+        kernels: &mut MlxKernels,
+        kv_heads: u32,
+        width: u32,
+    ) -> Result<Vec<Vec<f32>>, EngError> {
+        let mut all = Vec::new();
+        for layer in &mut self.layers {
+            if let LayerState::Attn(cache) = layer {
+                let (k, v, len) = match &cache.buffers {
+                    Some(super::attn::KvBuffers::F32 { k, v }) => (k, v, cache.len),
+                    // A digest over nothing would "match" any law; a non-F32 form is an
+                    // error, not a skip.
+                    _ => {
+                        return Err(EngError::BadRequest(
+                            "attn_kv_values reads only the F32 form".into(),
+                        ));
+                    }
+                };
+                let len = u32::try_from(len)
+                    .map_err(|_| EngError::BadRequest("resident length exceeds u32".into()))?;
+                let end = [1, kv_heads, len, width];
+                let k = kernels.slice(k, &[0, 0, 0, 0], &end)?;
+                let v = kernels.slice(v, &[0, 0, 0, 0], &end)?;
+                all.push(super::ops::values(kernels, &k)?);
+                all.push(super::ops::values(kernels, &v)?);
+            }
+        }
+        Ok(all)
+    }
+
     /// Replaces this state with a fresh zero state. On error the state is unchanged. The state
     /// keeps its growth quantum: a state made with `zero_with_step` resets to the same step, not to
     /// `KV_STEP`. A reset REWRITES the attention buffers (a fresh zero holds new arrays), so it
@@ -719,9 +914,11 @@ impl ResidentState {
         weights: &ResidentWeights,
     ) -> Result<(), EngError> {
         let kv_step = self.kv_step;
+        let kv_ceiling = self.kv_ceiling;
         // A reset builds fresh zero buffers, and `zero_with` draws a fresh unique generation,
-        // so every snapshot of the old buffers stops restoring.
-        *self = Self::zero_with(kernels, weights, kv_step)?;
+        // so every snapshot of the old buffers stops restoring. The growth law (quantum step
+        // and geometric ceiling) survives the reset, like the step already did.
+        *self = Self::zero_with(kernels, weights, kv_step, kv_ceiling)?;
         Ok(())
     }
 
@@ -1824,6 +2021,47 @@ mod snapshot_tests {
         assert_eq!(live.pos(), 1, "position after one step");
     }
 
+    /// M1 regression: under the geometric law a REWIND to position 0 (same generation)
+    /// swaps the attention caches for pristine capacity-zero buffers, so the rewound
+    /// permit's charge must be 0 - a stale charge from the caps the layers held would
+    /// fail the next `check_commit_rows` equality with MemoryPlan.
+    #[test]
+    fn a_geometric_restore_to_zero_releases_the_charge_and_the_next_step_commits() {
+        let _serial = crate::native_test_lock();
+        let (ckpt, host) = load();
+        let mut decoder = decoder_with_cap(&ckpt, host, 100_000);
+        // The budget comes first, sized for the snapshot's PIN (the fixed DeltaNet bytes,
+        // measured without taking one) beside the prompt's and the fresh state's first
+        // quanta - two charges of 256 rows each under the geometric law.
+        let mut live =
+            ResidentState::zero_geometric(&mut decoder.kernels, &decoder.weights, 100_000).unwrap();
+        let pinned = decoder.snapshot_bytes(&live).unwrap();
+        decoder.set_session_budget(SessionBudget::new(pinned + 512 * KV_PER_TOKEN));
+        let snapshot = decoder.snapshot(&live).unwrap();
+        prefill(&mut decoder, &mut live, &[4, 5, 6]);
+        assert!(
+            live.charged_bytes().unwrap() > 0,
+            "the prompt holds a charge"
+        );
+        decoder.restore(&mut live, &snapshot).unwrap();
+        assert_eq!(live.pos(), 0, "the rewind returns to position 0");
+        assert_eq!(
+            live.charged_bytes().unwrap(),
+            0,
+            "the rewound extent holds no stale charge"
+        );
+        // The next step acquires from scratch and commits; before the fix the stale charge
+        // of the caps the layers held at snapshot time failed this with MemoryPlan.
+        let step = decoder.step(&mut live, 3, StepMode::Record).unwrap();
+        let mut fresh =
+            ResidentState::zero_geometric(&mut decoder.kernels, &decoder.weights, 100_000).unwrap();
+        let zero_step = decoder.step(&mut fresh, 3, StepMode::Record).unwrap();
+        assert_eq!(
+            step, zero_step,
+            "the rewound step matches a fresh zero state"
+        );
+    }
+
     /// The A/B/A isolation gate: decode away from a snapshot, rewind, decode differently, rewind
     /// again - the Delta values return to the saved set after every cycle. These tests pass
     /// deterministically on the Mac (three runs).
@@ -1992,7 +2230,8 @@ mod snapshot_tests {
         // The rewind acquire charges the extent at the snapshot position: the same
         // single-formula count the restore itself uses (this test module is a child of
         // state.rs, so the private items are in reach).
-        let rewound_extent = super::kv_bytes_at_len(p.layers(), Some(2), p.kv_growth_per_layer);
+        let rewound_extent =
+            super::kv_bytes_at_len(p.layers(), Some(2), p.kv_growth_per_layer, false);
         drop(snap);
         drop(p);
         drop(probe);

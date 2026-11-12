@@ -628,6 +628,7 @@ mod tests {
         };
         let env = Q36Env {
             cache_limit: Some("2048".to_string()),
+            ..Q36Env::default()
         };
         let settings = Q36Settings::new(
             Path::new("m"),

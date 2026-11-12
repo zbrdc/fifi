@@ -998,6 +998,7 @@ mod tests {
             len: 1,
             cap: 1,
             step: 4,
+            ceiling: 0,
         };
         let mut ctx = Ctx {
             kernels: &mut kernels,

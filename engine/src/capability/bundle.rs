@@ -390,6 +390,8 @@ fn engine_input(
             .map_err(|error| super::describe_error(&error));
     let env = crate::family::qwen36::settings::Q36Env {
         cache_limit: std::env::var("Q36_CACHE_LIMIT").ok(),
+        kv_geometric: std::env::var("Q36_KV_GEOMETRIC").ok(),
+        spec_step_window: std::env::var("Q36_SPEC_STEP_WINDOW").ok(),
     };
     let effective = effective_rows(engine, &env);
     EngineInput {
@@ -923,6 +925,7 @@ mod tests {
         // process environment: tests must not depend on Q36_CACHE_LIMIT.
         let env = crate::family::qwen36::settings::Q36Env {
             cache_limit: Some("8589934592".to_string()),
+            ..crate::family::qwen36::settings::Q36Env::default()
         };
         // Deliberately NOT asserting row count or keys: the resolver owns
         // the surface; the bundle only carries it with origins attached.

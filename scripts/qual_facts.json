@@ -16,8 +16,8 @@
   "targets": {
     "lib": {
       "path": "src/lib.rs",
-      "test_fns": 6738,
-      "ignored": 594,
+      "test_fns": 6753,
+      "ignored": 601,
       "env_gates": [
         "CUDA_MODULE_LOADING",
         "DEFAULT_ON_CHILD",
@@ -311,6 +311,7 @@
         "Q36_HOST_REF",
         "Q36_KV8_FUSED_MIN_LEN",
         "Q36_KV_DTYPE",
+        "Q36_KV_GEOMETRIC",
         "Q36_NO_ACTMUL",
         "Q36_NO_ATTNGATE",
         "Q36_NO_EMBEDDED",

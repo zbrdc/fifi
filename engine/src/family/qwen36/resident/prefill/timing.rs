@@ -79,7 +79,9 @@
 //!
 //! The session budget covers the deepest requested depth: the shipped cap of 4 GiB charges only
 //! 104,857 positions of the F32 cache (a 131,072-position F32 run charges about 5.4 GB; a Q8 run
-//! about 1.4 GB), the charge is the same function the serving path uses, and the report records
+//! about 1.4 GB), the charge is the same LOGICAL function the serving admission uses with
+//! `Q36_KV_GEOMETRIC` unset (under the geometric law the first row charges a whole quantum),
+//! and the report records
 //! the cap the run used.
 //!
 //! Output: `prefill_stage_breakdown.json` in `Q36_OUT_DIR` — per depth the chunk count, one row
@@ -291,7 +293,7 @@ fn timed_chunk(
         .ok_or_else(|| bad("a prefill needs between one and u32::MAX tokens"))?;
     state.check_chunk(&decoder.weights, decoder.context_limit, rows)?;
     let started = Instant::now();
-    let growth = chunk_growth_bytes(&decoder.weights, rows)?;
+    let growth = super::super::state::advance_charge(state, &decoder.weights, rows)?;
     let permit = decoder.budget.acquire_growth(growth)?;
     let old = state.begin();
     match decoder.kernels.set_retire_cap(PREFILL_RETIRE_CAP) {
@@ -559,8 +561,9 @@ fn prefill_stage_breakdown() {
         ResidentDecoder::new_with_kv(kernels, &real.ckpt, host, CONTEXT_LIMIT, activation, kv)
             .unwrap();
     // The session cap of the shipped config, raised only when the deepest requested depth
-    // charges more than it (the charge is `chunk_growth_bytes`, the function the serving path
-    // uses); the report records both caps.
+    // charges more than it (the charge is `chunk_growth_bytes`, the quantum-law logical
+    // charge the serving admission uses; this probe runs with `Q36_KV_GEOMETRIC` unset);
+    // the report records both caps.
     let deepest = u32::try_from(*depths.iter().max().unwrap()).unwrap();
     let cap = SESSION_CAP.max(chunk_growth_bytes(&decoder.weights, deepest).unwrap());
     decoder.budget = SessionBudget::new(cap);

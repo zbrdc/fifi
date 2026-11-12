@@ -1930,6 +1930,7 @@ mod tests {
                 };
                 let env = Q36Env {
                     cache_limit: Some("8589934592".to_string()),
+                    ..Q36Env::default()
                 };
                 let backend = q36_factory::backend_of_build();
                 let render = |settings: &Q36Settings| {

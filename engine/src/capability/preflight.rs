@@ -546,6 +546,8 @@ fn q36_preflight(
     };
     let env = Q36Env {
         cache_limit: std::env::var("Q36_CACHE_LIMIT").ok(),
+        kv_geometric: std::env::var("Q36_KV_GEOMETRIC").ok(),
+        spec_step_window: std::env::var("Q36_SPEC_STEP_WINDOW").ok(),
     };
     let settings = match Q36Settings::new(model_dir, tokenizer_dir, Some(&options), &env, backend) {
         Ok(settings) => {

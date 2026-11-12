@@ -42,7 +42,8 @@
 //!
 //! A depth must fit the ids source and the context limit (262,144).
 //!
-//! The session budget covers the whole depth through `chunk_growth_bytes`, the same product the
+//! The session budget covers the whole depth through `chunk_growth_bytes`, the quantum-law
+//! logical product the serving admission uses (`Q36_KV_GEOMETRIC` unset), the same one the
 //! per-token charges sum to, raised over the shipped cap when the depth needs more, exactly as
 //! `prefill/timing.rs` raises it; the report records the cap the run used.
 //!

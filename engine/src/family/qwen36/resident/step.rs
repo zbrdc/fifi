@@ -27,7 +27,7 @@ use super::attn::KvBuffers;
 use super::decoder::{ResidentDecoder, StepMode, StepResult};
 use super::moe::{self, Routing};
 use super::ops::{Ctx, cast_to, linear, short_import, to_act, values};
-use super::state::{LayerState, ResidentState, kv_growth_bytes};
+use super::state::{LayerState, ResidentState};
 use super::weights::{RFeedForward, RMixer};
 use super::{attn, delta};
 use crate::family::qwen36::settings::KvDtype;
@@ -49,7 +49,7 @@ pub(super) fn step(
     mode: StepMode,
 ) -> Result<StepResult, EngError> {
     state.check_step(&decoder.weights, decoder.context_limit)?;
-    let growth = kv_growth_bytes(&decoder.weights)?;
+    let growth = super::state::advance_charge(state, &decoder.weights, 1)?;
     let permit = decoder.budget.acquire_growth(growth)?;
     let old = state.begin();
     run(decoder, state, old, permit, token, mode)

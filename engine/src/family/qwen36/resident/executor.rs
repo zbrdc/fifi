@@ -67,7 +67,7 @@
 use super::attn::growth_bytes;
 use super::chunk_plan::{ChunkCost, PREFILL_CANDIDATES, PrefillPlan, PrefillTerms, admitted_chunk};
 use super::decoder::{MAX_CHUNK_ROWS, ResidentDecoder, StepMode};
-use super::state::{ResidentSnapshot, ResidentState, chunk_growth_bytes};
+use super::state::{ResidentSnapshot, ResidentState, advance_charge};
 use crate::{
     EngError,
     family::{
@@ -495,16 +495,41 @@ impl Q36WindowStep<'_> {
             // budget exactly as the chunk path expects it; a mid-window fallback cannot,
             // because restored rows keep their growth permits.
             let per_snapshot = decoder.snapshot_bytes(state)?;
-            let per_row = chunk_growth_bytes(&decoder.weights, 1)?;
+            let per_row = advance_charge(state, &decoder.weights, 1)?;
             let rows = u64::try_from(inputs.len())
                 .map_err(|_| EngError::BadRequest("the verify window exceeds u64 rows".into()))?;
-            let rewind = u64::from(state.pos())
-                .saturating_add(rows)
-                .saturating_sub(1)
-                .saturating_mul(per_row);
-            let need = rows
-                .saturating_mul(per_snapshot.saturating_add(per_row))
-                .saturating_add(rewind);
+            // Upfront admission under the FULL set of held charges. Quantum law: the T
+            // one-row acquires plus the rewind extent at the last position. Geometric law:
+            // the T one-row acquires sum to whatever capacity the window's rows ADD (zero
+            // while they fit, the doubling they cross - `advance_charge(T)` from today's
+            // caps), and the rewind re-acquires that same capacity ON TOP of today's
+            // allocated bytes, so both terms carry it.
+            //
+            // This reserve bounds only the WINDOW's own charges: the checkpoint-window
+            // commit is deferred to the next driver cycle, and interleaved plain rows can
+            // grow the shared caches past the window's extent before it fires, so the
+            // commit's adopt-path restore acquires the checkpoint's frozen capacities -
+            // an extent no reserve taken at the window can bound. That combination is
+            // therefore REFUSED AT ENGINE OPEN (`Q36_KV_GEOMETRIC=1` together with
+            // `Q36_SPEC_STEP_WINDOW=2`, in the settings validation); this branch cannot
+            // run in a served engine while the geometric law is armed.
+            let need = if state.geometric_law() {
+                let window_rows = u32::try_from(inputs.len()).map_err(|_| {
+                    EngError::BadRequest("the verify window exceeds u32 rows".into())
+                })?;
+                let grown = advance_charge(state, &decoder.weights, window_rows)?;
+                rows.saturating_mul(per_snapshot)
+                    .saturating_add(grown)
+                    .saturating_add(grown)
+                    .saturating_add(state.allocated_kv_bytes())
+            } else {
+                let rewind = u64::from(state.pos())
+                    .saturating_add(rows)
+                    .saturating_sub(1)
+                    .saturating_mul(per_row);
+                rows.saturating_mul(per_snapshot.saturating_add(per_row))
+                    .saturating_add(rewind)
+            };
             if decoder.budget.free() < need {
                 return Ok(None);
             }
@@ -835,8 +860,21 @@ fn admit(shape: &HostShape, rules: &Q36Rules) -> Result<()> {
             rules.context_limit
         )));
     }
+    // Under the geometric law the LAST capacity clamp rounds the context limit up to a
+    // KV_STEP multiple (and the first row already charges one whole step), so admission
+    // must size the cap for that rounded need - the quantum law keeps the exact product.
+    let geometric = super::state::geometric_growth()?;
+    let limit = if geometric {
+        u64::try_from(super::kv_plan::round_up(
+            rules.context_limit as usize,
+            super::kv_plan::KV_STEP,
+        )?)
+        .map_err(|_| EngError::BadRequest("context limit rounds past u64".into()))?
+    } else {
+        u64::from(rules.context_limit)
+    };
     let needed = growth_per_position(shape, rules.kv_dtype, rules.activation)?
-        .checked_mul(u64::from(rules.context_limit))
+        .checked_mul(limit)
         .ok_or_else(|| EngError::MemoryPlan("cache bytes at the limit overflow u64".to_string()))?;
     if needed > rules.session_cap {
         return Err(EngError::MemoryPlan(format!(
@@ -1158,13 +1196,14 @@ impl ExecutorOps for Q36Executor {
             let (mut step, _) = self.split(state);
             match core.prepare_decode(&mut step, generation)? {
                 DecodePreparation::Finished(batch) => results[slot] = Some(Ok(batch)),
-                DecodePreparation::Token(_) => active.push(slot),
+                DecodePreparation::Token(_) => {
+                    active.push((slot, advance_charge(state, &self.decoder.weights, 1)?))
+                }
             }
         }
-        let growth = super::state::kv_growth_bytes(&self.decoder.weights)?;
         let mut permits = Vec::new();
         let mut admitted = Vec::new();
-        for slot in active {
+        for (slot, growth) in active {
             match self.decoder.budget.acquire_growth(growth) {
                 Ok(permit) => {
                     permits.push(permit);
@@ -1407,16 +1446,27 @@ impl ExecutorOps for Q36Executor {
 
     /// The pool-derived prompt ceiling: the free budget plus the session's own permits - which its
     /// next reset releases - over the per-position KV growth, minus the one position the first
-    /// sampled token needs.
+    /// sampled token needs. Under the geometric law the divisor is TWICE the per-position
+    /// growth: a boundary doubling can charge a whole capacity at once, so positions are
+    /// counted at their worst-case amortised cost - conservative, never under.
     ///
     /// shortcut: permits that a still-stored snapshot shares with the session (a pinned
     /// root this session saved) are counted as releasable, so the ceiling can overstate by
     /// that root's bytes; upgrade when a client compacting to exactly the ceiling still
     /// fails in practice, by tracking per-session shared charges.
     fn pool_prompt_ceiling(&self, st: &Q36Session) -> Option<u64> {
-        let growth = super::state::kv_growth_bytes(&self.decoder.weights).ok()?;
         let session = st.state.charged_bytes().ok()?;
-        Some((self.decoder.budget.free() + session).saturating_sub(growth) / growth.max(1))
+        let growth = super::state::kv_growth_bytes(&self.decoder.weights).ok()?;
+        // The next position's charge: one row under the quantum law, the pending doubling
+        // (if any) under the geometric law; the divisor doubles under the geometric law
+        // because a boundary can charge a whole capacity at once.
+        let next = advance_charge(&st.state, &self.decoder.weights, 1).ok()?;
+        let per_position = if st.state.geometric_law() {
+            growth.saturating_mul(2)
+        } else {
+            growth
+        };
+        Some((self.decoder.budget.free() + session).saturating_sub(next) / per_position.max(1))
     }
 }
 
@@ -1676,6 +1726,139 @@ mod tests {
         drop(replacement);
         drop(first);
         assert_eq!(executor.decoder.session_used(), 0);
+    }
+
+    /// M2 regression, geometric law + `Q36_SPEC_STEP_WINDOW=2`: a checkpoint window of
+    /// T rows whose span crosses the 256 boundary mid-window doubles the capacity to
+    /// 512. The prompt is 254 tokens (253 rows published, the last token pending), the
+    /// windows are T = 2 (max_drafts 1), and the SECOND window feeds rows 256 and 257 -
+    /// the crossing one. The budget sits exactly AT the pre-fix reserve's need for that
+    /// window (`2 x snapshot + allocated + one doubling`). The landed reserve carries
+    /// one more doubling, so it declines the crossing window up front and the chunk
+    /// window finishes the job. Every draft in this test is accepted, so the commit does
+    /// not restore; in that case the pre-fix reserve also admitted and completed the
+    /// window (measured on the Mac), and this test is a lock on the window path's
+    /// completion and charges, not a discriminator of the two formulas. The extra
+    /// doubling is the peak of a window whose draft is rejected; that case is refused
+    /// at engine open together with the geometric law (see
+    /// `geometric_checkpoint_window` in settings.rs). `windows > 0`
+    /// proves the window path ran (observe fires only after run_window and
+    /// commit_window). Ignored: it needs its own process with `Q36_KV_GEOMETRIC=1
+    /// Q36_SPEC_STEP_WINDOW=2` (both read once per process).
+    #[test]
+    #[ignore = "run in its own process: Q36_KV_GEOMETRIC=1 Q36_SPEC_STEP_WINDOW=2"]
+    fn a_geometric_checkpoint_window_crossing_a_doubling_completes_with_the_full_reserve() {
+        let geometric = crate::family::qwen36::resident::state::geometric_growth().unwrap_or(false);
+        if !checkpoint_window() || !geometric {
+            return;
+        }
+        let _serial = crate::native_test_lock();
+        let prompt: Vec<u32> = (0..254u32).map(|i| i % VOCAB as u32).collect();
+        // The prompt's first quantum: 256 rows of both layers' bytes.
+        let first_quantum = 256 * GROWTH;
+        // One doubling (256 new rows) and the per-snapshot bytes, measured off a probe
+        // session.
+        let (probe_executor, probe_session) = build(Q36Rules {
+            context_limit: 600,
+            session_cap: first_quantum * 4,
+            ..rules(vec![], VOCAB)
+        });
+        let per_snapshot = probe_executor
+            .decoder
+            .snapshot_bytes(&probe_session.state)
+            .unwrap();
+        drop(probe_session);
+        drop(probe_executor);
+        let mut big = rules(vec![], VOCAB);
+        big.context_limit = 600;
+        // The SEPARATING budget: free == the pre-fix reserve's need at the crossing
+        // window (2 snapshots + allocated + one doubling; allocated and the doubling
+        // are both one first quantum on the tiny model), so the landed reserve - one
+        // doubling higher - declines that window upfront.
+        big.session_cap = 2 * per_snapshot + 3 * first_quantum;
+        let want = oracle(&prompt, 8, &mut seeded_sampler(), VOCAB);
+        let (mut executor, mut session) = build(big);
+        executor.prefill(&mut session, &prompt).unwrap();
+        // The prompt's last token stays pending for the generation: 253 rows published,
+        // the whole prompt inside the first quantum.
+        assert_eq!(session.state.pos(), 253);
+        assert_eq!(session.state.charged_bytes().unwrap(), first_quantum);
+        let mut job = seeded_generation(8);
+        let mut speculator = Speculator::new(
+            Scripted {
+                want: want.clone(),
+                wrong: false,
+                skip: prompt.len(),
+                windows: 0,
+            },
+            1,
+        );
+        let mut batches = Vec::new();
+        for _ in 0..100 {
+            let batch = spec_decode(&mut speculator, &mut executor, &mut session, &mut job);
+            let done = batch.finish.is_some();
+            batches.push(batch);
+            if done {
+                break;
+            }
+        }
+        assert_eq!(tokens_of(&batches), want, "every window completed");
+        assert!(
+            speculator.drafter.windows > 0,
+            "the window path must run, not the plain stand-down"
+        );
+        assert_eq!(
+            session.state.pos(),
+            261,
+            "the windows advanced past the doubling"
+        );
+        assert_eq!(
+            session.state.charged_bytes().unwrap(),
+            512 * GROWTH,
+            "the charge lands on the doubled allocation"
+        );
+    }
+
+    /// S3: under the geometric law `admit` sizes the cap for the ROUNDED context limit
+    /// (round_up(300, KV_STEP) = 512 positions), so a cap that exactly fits the
+    /// quantum-law product (300 positions of growth) is refused AT OPEN instead of
+    /// opening and failing MemoryPlan at the row-257 doubling; the rounded cap opens.
+    /// Ignored: it needs its own process with `Q36_KV_GEOMETRIC=1` (read once).
+    #[test]
+    #[ignore = "run in its own process: Q36_KV_GEOMETRIC=1"]
+    fn a_geometric_admit_sizes_the_cap_to_the_rounded_law() {
+        let geometric = crate::family::qwen36::resident::state::geometric_growth().unwrap_or(false);
+        if !geometric {
+            return;
+        }
+        // `make_host` keeps the helper callable twice: a plain `host` binding would
+        // shadow the function after the first use.
+        let make_host = host as fn(&StreamedCheckpoint) -> HostWeights;
+        let ckpt: &'static StreamedCheckpoint = Box::leak(Box::new(tiny::checkpoint(&TINY_GQA)));
+        let mut narrow = rules(vec![], VOCAB);
+        narrow.context_limit = 300;
+        narrow.session_cap = 300 * GROWTH;
+        let error = Q36Executor::from_parts(
+            MlxKernels::try_new().unwrap(),
+            ckpt,
+            make_host(ckpt),
+            narrow,
+        )
+        .err()
+        .expect("the quantum-sized cap must be refused at open, not at the doubling");
+        assert!(matches!(error, EngError::MemoryPlan(_)), "{error:?}");
+        let mut rounded = rules(vec![], VOCAB);
+        rounded.context_limit = 300;
+        rounded.session_cap = 512 * GROWTH;
+        drop(
+            Q36Executor::from_parts(
+                MlxKernels::try_new().unwrap(),
+                ckpt,
+                make_host(ckpt),
+                rounded,
+            )
+            .expect("the rounded cap opens"),
+        );
     }
 
     #[test]
@@ -1960,10 +2143,14 @@ mod tests {
     }
 
     /// Proposes the oracle chain (`wrong`: every draft off by one, so no draft is ever accepted
-    /// and every window rolls back).
+    /// and every window rolls back). `skip` counts the PROMPT tokens the history carries in
+    /// front of the chain; `windows` counts the observe() calls, which fire only after a real
+    /// window ran and committed - the proof a test actually exercised the window path.
     struct Scripted {
         want: Vec<u32>,
         wrong: bool,
+        skip: usize,
+        windows: usize,
     }
 
     impl Drafter for Scripted {
@@ -1972,7 +2159,7 @@ mod tests {
             history: &[u32],
             room: usize,
         ) -> std::result::Result<Proposal, crate::EngError> {
-            let start = history.len().min(self.want.len());
+            let start = history.len().saturating_sub(self.skip).min(self.want.len());
             let take = room.min(self.want.len() - start);
             let tokens = self.want[start..start + take]
                 .iter()
@@ -1995,6 +2182,7 @@ mod tests {
             _window: &crate::family::speculate::window::Window,
             _accepted: &crate::family::speculate::accept::Accepted,
         ) -> std::result::Result<(), crate::EngError> {
+            self.windows += 1;
             Ok(())
         }
     }
@@ -2014,6 +2202,8 @@ mod tests {
                 Scripted {
                     want: want.clone(),
                     wrong,
+                    skip: PROMPT.len(),
+                    windows: 0,
                 },
                 2,
             );

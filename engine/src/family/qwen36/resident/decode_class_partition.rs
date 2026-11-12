@@ -41,7 +41,7 @@ use super::delta;
 use super::moe;
 use super::moe::Routing;
 use super::ops::{Ctx, linear, short_import, to_act};
-use super::state::{LayerState, ResidentState, kv_growth_bytes};
+use super::state::{LayerState, ResidentState};
 use super::step::read_head;
 use super::weights::{RFeedForward, RMixer};
 use crate::EngError;
@@ -171,7 +171,7 @@ pub(super) fn one_marked_token(
     part: &mut Partitioner,
 ) -> Result<u32, EngError> {
     state.check_step(&decoder.weights, decoder.context_limit)?;
-    let growth = kv_growth_bytes(&decoder.weights)?;
+    let growth = super::state::advance_charge(state, &decoder.weights, 1)?;
     let permit = decoder.budget.acquire_growth(growth)?;
     let old = state.begin();
     run_marked(decoder, state, old, permit, token, part)

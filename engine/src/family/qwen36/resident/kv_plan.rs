@@ -13,17 +13,23 @@
 //! (KVH 2, D 256; 40,960 over its 10 attention layers), and in the Q8 form 1,088 bytes at BF16
 //! scales (10,880 over the 10 layers) or 1,152 at F32 scales (11,520). The session slack stays
 //! below one `KV_STEP` of the charge per attention layer: 10,485,760 bytes in the F32 form,
-//! 2,785,280 at Q8/BF16, 2,949,120 at Q8/F32 scales.
+//! 2,785,280 at Q8/BF16, 2,949,120 at Q8/F32 scales. Under `Q36_KV_GEOMETRIC=1` (read once per process; restart to change) the capacity doubles instead, to the context limit; admission and the reserve then charge the ALLOCATED capacity (each layer's `cap`), so the charge never understates the buffers, and the per-layer slack can reach half that capacity.
 //!
-//! The growth TRANSIENT at a capacity growth — the old buffer, its slice copy, and the new
-//! buffer alive together, about 100 MB per layer at depth 8,192 in the F32 form — is NOT part
-//! of the slack bound below: the session reserve margin and the retire cap cover it.
+//! The growth TRANSIENT at a capacity growth — the old buffer and the new buffer alive
+//! together; per layer, computed from buffer sizes and not measured: under the quantum
+//! law about 68 MB at depth 8,192 in the F32 form (33.5 MB old + 34.6 MB new); under
+//! `Q36_KV_GEOMETRIC=1` about 101 MB at the 8,192-to-16,384 doubling (33.5 MB old +
+//! 67.1 MB new) and about 1.6 GB at the 128K-to-256K
+//! doubling (0.54 GB old + 1.07 GB new; the new buffer is inside the geometric charge, the old one is the extra) —
+//! is NOT part of the slack bound below: the session reserve margin and the retire cap
+//! cover it.
 
 use crate::EngError;
 
-/// The growth quantum of the capacity buffers, in positions: a buffer
-/// grows to a multiple of this many positions, so the slack of one layer stays below one quantum
-/// of its growth bytes and the slack of a whole session below one quantum per attention layer
+/// The growth quantum of the capacity buffers, in positions: with `Q36_KV_GEOMETRIC` unset a
+/// buffer grows to a multiple of this many positions, so the slack of one layer stays below one
+/// quantum of its growth bytes and the slack of a whole session below one quantum per attention
+/// layer; under the geometric law the slack can instead reach half the ALLOCATED capacity
 /// (in the F32 form 256 * 4,096 * 10 = 10,485,760 bytes on the real model; at Q8 with BF16
 /// scales 256 * 1,088 * 10 = 2,785,280).
 pub(super) const KV_STEP: usize = 256;
@@ -261,13 +267,18 @@ pub(super) fn round_up(positions: usize, step: usize) -> Result<usize, EngError>
 }
 
 /// The capacity after appending `rows` positions to a buffer of `len` valid positions and `cap`
-/// allocated positions: `cap` when the rows fit, else `round_up(len + rows, step)`. An empty
-/// cache (`len == 0`, `cap == 0`) allocates `round_up(rows, step)` positions for its first rows.
+/// allocated positions: `cap` when the rows fit, else `round_up(len + rows, step)` with
+/// `ceiling == 0`. A positive `ceiling` (the geometric law, `Q36_KV_GEOMETRIC=1`) doubles the
+/// capacity instead - `min(max(2 * cap, quantum), max(round_up(ceiling, step), quantum))` - so
+/// one layer's growth transient is an old+new overlap while total copy work over a fill stays
+/// linear. An empty cache (`len == 0`, `cap == 0`) allocates `round_up(rows, step)` positions
+/// for its first rows under either law.
 pub(super) fn next_capacity(
     len: usize,
     rows: usize,
     cap: usize,
     step: usize,
+    ceiling: usize,
 ) -> Result<usize, EngError> {
     let needed = len
         .checked_add(rows)
@@ -275,7 +286,18 @@ pub(super) fn next_capacity(
     if needed <= cap {
         return Ok(cap);
     }
-    round_up(needed, step)
+    let quantum = round_up(needed, step)?;
+    if ceiling == 0 {
+        return Ok(quantum);
+    }
+    // Geometric growth (`Q36_KV_GEOMETRIC`): a boundary doubles the capacity, clamped to the
+    // declared ceiling (the context limit, rounded up to a step multiple so every capacity stays
+    // one). The clamp never lands below the quantum need - a step that passes the declared
+    // ceiling keeps the pure-quantum behaviour for that one growth - and an empty cache still
+    // starts at one quantum.
+    let ceiling = round_up(ceiling, step)?;
+    let doubled = cap.saturating_mul(2).max(quantum);
+    Ok(doubled.min(ceiling.max(quantum)))
 }
 
 /// The LOGICAL byte count of `len` positions at `per_position` bytes each: the admission charge
@@ -324,6 +346,81 @@ mod tests {
     }
 
     #[test]
+    fn next_capacity_doubles_under_geometric_growth_and_clamps_at_the_ceiling() {
+        // Every boundary doubles the capacity instead of advancing one quantum.
+        assert_eq!(next_capacity(4, 1, 4, 4, 64).unwrap(), 8);
+        assert_eq!(next_capacity(8, 1, 8, 4, 64).unwrap(), 16);
+        assert_eq!(next_capacity(16, 1, 16, 4, 64).unwrap(), 32);
+        // The doubling from half the ceiling lands exactly on it, and a buffer that
+        // fits never grows.
+        assert_eq!(next_capacity(32, 1, 32, 4, 64).unwrap(), 64);
+        assert_eq!(next_capacity(33, 1, 64, 4, 64).unwrap(), 64);
+        // The ceiling rounds up to a step multiple itself, so capacities stay multiples.
+        assert_eq!(next_capacity(4, 1, 4, 4, 33).unwrap(), 8);
+        assert_eq!(next_capacity(32, 1, 32, 4, 33).unwrap(), 36);
+        // An empty cache starts at one quantum, never at the doubled zero.
+        assert_eq!(next_capacity(0, 1, 0, 256, 65_536).unwrap(), 256);
+        // A step that already passes the declared ceiling keeps the quantum need: the
+        // clamp never lands below what the append requires.
+        assert_eq!(next_capacity(60, 8, 64, 4, 33).unwrap(), 68);
+        // One append above twice the capacity, inside the ceiling: the QUANTUM need
+        // wins, not a doubling, and the capacity is not a power of two.
+        assert_eq!(next_capacity(4, 100, 4, 4, 1_024).unwrap(), 104);
+        // A ceiling that is not a power-of-two multiple of the step: the clamp lands
+        // on the rounded ceiling, above the declared limit.
+        assert_eq!(
+            next_capacity(65_536, 256, 65_536, 256, 100_000).unwrap(),
+            100_096
+        );
+        // A ceiling below the current capacity still serves the append: the quantum
+        // need is the floor (the `max(quantum)` guard).
+        assert_eq!(next_capacity(1_024, 1, 1_024, 256, 1_000).unwrap(), 1_280);
+    }
+
+    #[test]
+    fn a_full_geometric_walk_doubles_with_half_slack_and_lands_on_the_ceiling() {
+        let step = 256;
+        let ceiling = 262_144;
+        let mut len = 0usize;
+        let mut cap = 0usize;
+        let mut first_cap = 0;
+        let mut caps: Vec<usize> = Vec::new();
+        while len < ceiling {
+            let next = next_capacity(len, step, cap, step, ceiling).unwrap();
+            if next > cap {
+                if first_cap == 0 {
+                    first_cap = next;
+                } else {
+                    assert!(
+                        next <= cap.saturating_mul(2),
+                        "a growth at len {len} more than doubles: {cap} -> {next}"
+                    );
+                    // Slack at most half the capacity, from the first doubling on.
+                    let slack = next - len - step;
+                    assert!(
+                        slack * 2 <= next,
+                        "slack {slack} exceeds half of {next} at len {len}"
+                    );
+                }
+                caps.push(next);
+                cap = next;
+            }
+            len += step;
+        }
+        assert_eq!(cap, ceiling, "the walk lands exactly on the ceiling");
+        assert_eq!(first_cap, step, "the first allocation is one quantum");
+        // The whole capacity sequence: the law cannot silently revert to the quantum law
+        // (that walk grows at every step and ends far below the ceiling at this count).
+        assert_eq!(
+            caps,
+            [
+                256, 512, 1_024, 2_048, 4_096, 8_192, 16_384, 32_768, 65_536, 131_072, 262_144
+            ],
+            "eleven allocations, each doubling to the ceiling"
+        );
+    }
+
+    #[test]
     fn round_up_rejects_a_zero_step_and_an_overflow() {
         assert!(round_up(5, 0).is_err(), "a zero step has no multiple");
         assert!(
@@ -335,28 +432,28 @@ mod tests {
     #[test]
     fn next_capacity_keeps_a_fitting_buffer_and_grows_in_steps() {
         // The first rows of an empty cache allocate a whole quantum.
-        assert_eq!(next_capacity(0, 1, 0, 256).unwrap(), 256);
-        assert_eq!(next_capacity(0, 5, 0, 4).unwrap(), 8);
+        assert_eq!(next_capacity(0, 1, 0, 256, 0).unwrap(), 256);
+        assert_eq!(next_capacity(0, 5, 0, 4, 0).unwrap(), 8);
         // Rows that fit keep the capacity: 2 valid of 3, one more row fits exactly.
-        assert_eq!(next_capacity(2, 1, 3, 3).unwrap(), 3);
+        assert_eq!(next_capacity(2, 1, 3, 3, 0).unwrap(), 3);
         assert_eq!(
-            next_capacity(3, 1, 4, 3).unwrap(),
+            next_capacity(3, 1, 4, 3, 0).unwrap(),
             4,
             "an exact fit does not grow"
         );
         // One row past the capacity grows to the next multiple of the step.
-        assert_eq!(next_capacity(3, 1, 3, 3).unwrap(), 6);
-        assert_eq!(next_capacity(5, 1, 4, 3).unwrap(), 6);
+        assert_eq!(next_capacity(3, 1, 3, 3, 0).unwrap(), 6);
+        assert_eq!(next_capacity(5, 1, 4, 3, 0).unwrap(), 6);
         // A chunk wider than the free space: 2 valid of 4, five rows need 7, so 8.
-        assert_eq!(next_capacity(2, 5, 4, 4).unwrap(), 8);
+        assert_eq!(next_capacity(2, 5, 4, 4, 0).unwrap(), 8);
         // A chunk wider than a whole step crosses several quanta at once.
-        assert_eq!(next_capacity(10, 512, 16, 256).unwrap(), 512 + 256);
+        assert_eq!(next_capacity(10, 512, 16, 256, 0).unwrap(), 512 + 256);
     }
 
     #[test]
     fn next_capacity_rejects_a_length_overflow() {
         assert!(
-            next_capacity(usize::MAX, 1, 0, 256).is_err(),
+            next_capacity(usize::MAX, 1, 0, 256, 0).is_err(),
             "one more position past usize::MAX overflows"
         );
     }

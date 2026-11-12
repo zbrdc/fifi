@@ -46,7 +46,7 @@ use super::super::executor::compiled_layer_on;
 use super::super::kv_plan::{depth_ranges, prefill_score_bound};
 use super::super::moe::Routing;
 use super::super::ops::{Ctx, cast_to, dim, linear, linear_rows, short_import, to_act, values};
-use super::super::state::{LayerState, ResidentState, chunk_growth_bytes};
+use super::super::state::{LayerState, ResidentState, advance_charge};
 use super::super::step::{check_dtype, read_token, split_rows};
 use super::super::weights::{RFeedForward, RMixer};
 use super::delta::fused_prefill_enabled;
@@ -174,7 +174,7 @@ pub(in super::super) fn chunk_with_cap(
 ) -> Result<StepResult, EngError> {
     let rows = row_count(tokens)?;
     state.check_chunk(&decoder.weights, decoder.context_limit, rows)?;
-    let growth = chunk_growth_bytes(&decoder.weights, rows)?;
+    let growth = advance_charge(state, &decoder.weights, rows)?;
     let permit = decoder.budget.acquire_growth(growth)?;
     let old = state.begin();
     match decoder.kernels.set_retire_cap(cap) {
@@ -1241,16 +1241,16 @@ mod tests {
         // cache for 8 more rows, at 65,520 (cap 65,792) it does not.
         let step = super::super::super::kv_plan::KV_STEP;
         let cap_at =
-            |len: usize| super::super::super::kv_plan::next_capacity(len, 0, 0, step).unwrap();
+            |len: usize| super::super::super::kv_plan::next_capacity(len, 0, 0, step, 0).unwrap();
         let cap_65536 = cap_at(65_536);
         let cap_65520 = cap_at(65_520);
         assert!(
-            super::super::super::kv_plan::next_capacity(65_536, 8, cap_65536, step).unwrap()
+            super::super::super::kv_plan::next_capacity(65_536, 8, cap_65536, step, 0).unwrap()
                 > cap_65536,
             "the 65,536 fill must cross a growth boundary for 8 rows"
         );
         assert_eq!(
-            super::super::super::kv_plan::next_capacity(65_520, 8, cap_65520, step).unwrap(),
+            super::super::super::kv_plan::next_capacity(65_520, 8, cap_65520, step, 0).unwrap(),
             cap_65520,
             "the 65,520 fill must fit its 8 rows in spare capacity"
         );
@@ -1292,6 +1292,411 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// Wall probe of the capacity-growth rebuild: successive 8-row Window steps through
+    /// two KV_STEP=256 boundaries at a 64K fill, each step timed around the whole
+    /// synchronous prefill call. A step that starts at a 256 multiple crosses a boundary
+    /// and rebuilds every attention layer's buffers (one `grown` copy per side); the
+    /// others append in place. Prints the mean wall of the crossing and non-crossing
+    /// steps; the difference is the per-crossing rebuild cost of all attention layers.
+    /// Ignored without the checkpoint (Mac, `Q36_CKPT_DIR`).
+    #[test]
+    #[ignore = "needs the real checkpoint on the Mac; run with --ignored"]
+    #[cfg(all(feature = "native-mlx", target_os = "macos", target_arch = "aarch64",))]
+    /// NOTE: valid only with `Q36_KV_GEOMETRIC` unset. The bucket labels below are the
+    /// quantum law's crossings (`from` 65,280 and 65,536 grow to 65,536 and 65,792);
+    /// the probe compares against a plain append and pins nothing about the geometric
+    /// law's capacities or crossing positions.
+    fn window_step_wall_at_capacity_boundaries() {
+        let _serial = crate::native_test_lock();
+        let dir = super::super::super::real::env_path("Q36_CKPT_DIR");
+        let real = super::super::super::real::open(&dir);
+        let host = crate::family::qwen36::host_load::HostWeights::load(
+            &real.ckpt,
+            &crate::family::spec::QWEN3_6_35B_A3B,
+            &real.config,
+        )
+        .unwrap();
+        let kv = match std::env::var("Q36_KV_DTYPE").as_deref() {
+            Ok("q8") => KvDtype::Q8,
+            _ => KvDtype::F32,
+        };
+        let mut decoder = crate::family::qwen36::resident::decoder::ResidentDecoder::new_with_kv(
+            crate::kernels::MlxKernels::try_new().unwrap(),
+            &real.ckpt,
+            host,
+            262_144,
+            crate::family::qwen36::settings::Activation::Bf16,
+            kv,
+        )
+        .unwrap();
+        decoder.routing = Routing::Device;
+        // Start just below the 65_536 boundary and step 8 rows at a time through two
+        // boundaries (65_536 and 65_792): 40 steps, the two at multiples of 256 cross.
+        let start = 65_280usize;
+        let tokens: Vec<u32> = (0..start + 8 * 40).map(|i| token(i as u32)).collect();
+        let mut state = decoder.zero_state().unwrap();
+        ok(
+            decoder.prefill(&mut state, &tokens[..start], StepMode::Prompt),
+            "prompt",
+        );
+        let mut crossing = Vec::new();
+        let mut steady = Vec::new();
+        for step in 0..40u32 {
+            let from = start + (step as usize) * 8;
+            let t0 = std::time::Instant::now();
+            ok(
+                decoder.prefill(&mut state, &tokens[from..from + 8], StepMode::Window),
+                "window",
+            );
+            let wall = t0.elapsed().as_secs_f64() * 1e3;
+            if from.is_multiple_of(256) {
+                crossing.push(wall);
+            } else {
+                steady.push(wall);
+            }
+        }
+        let mean = |v: &[f64]| v.iter().sum::<f64>() / v.len() as f64;
+        println!(
+            "BOUNDARY_WALL kv={kv:?} crossing_ms={} n={} steady_ms={} n={}",
+            mean(&crossing),
+            crossing.len(),
+            mean(&steady),
+            steady.len(),
+        );
+    }
+
+    /// Byte parity of the KV caches across growth boundaries, asserted in-process: one
+    /// prompt of 1,300 tokens fed in 256-row chunks crosses five quantum boundaries
+    /// (capacities 256..1,536) or three geometric doublings (256, 512, 1,024, 2,048);
+    /// after the two shared growths, every later capacity differs between the laws. The
+    /// cache VALUES must be identical under either law, so the test prefills a quantum
+    /// state and a geometric state from the same decoder and asserts the value vectors
+    /// equal while the capacities differ. A per-law digest is still printed for the
+    /// external runs. Ignored without the checkpoint (Mac, `Q36_CKPT_DIR`).
+    #[test]
+    #[ignore = "needs the real checkpoint on the Mac; run with --ignored"]
+    #[cfg(all(feature = "native-mlx", target_os = "macos", target_arch = "aarch64",))]
+    fn kv_values_match_across_growth_boundaries() {
+        use std::collections::hash_map::DefaultHasher;
+        use std::hash::{Hash, Hasher};
+        let _serial = crate::native_test_lock();
+        let dir = super::super::super::real::env_path("Q36_CKPT_DIR");
+        let real = super::super::super::real::open(&dir);
+        let host = crate::family::qwen36::host_load::HostWeights::load(
+            &real.ckpt,
+            &crate::family::spec::QWEN3_6_35B_A3B,
+            &real.config,
+        )
+        .unwrap();
+        let mut decoder = crate::family::qwen36::resident::decoder::ResidentDecoder::new_with_kv(
+            crate::kernels::MlxKernels::try_new().unwrap(),
+            &real.ckpt,
+            host,
+            262_144,
+            crate::family::qwen36::settings::Activation::Bf16,
+            KvDtype::F32,
+        )
+        .unwrap();
+        decoder.routing = Routing::Device;
+        // 256-row chunks make every 256-token quantum a growth event; the decoder's
+        // default 512 would merge the boundaries in pairs.
+        decoder.set_chunk_rows(256).unwrap();
+        let tokens: Vec<u32> = (0..1_300u32).map(token).collect();
+        let a = &decoder.weights.shape.attn;
+        let (kv_heads, width) = (a.heads_kv as u32, a.head_dim as u32);
+
+        // A fn, not a closure: a closure would hold its borrow of `decoder.kernels`
+        // across the `decoder.prefill` calls below.
+        fn digest(
+            state: &mut super::super::super::state::ResidentState,
+            kernels: &mut crate::kernels::MlxKernels,
+            kv_heads: u32,
+            width: u32,
+            geometric: bool,
+        ) -> (Vec<Vec<f32>>, u64, usize) {
+            let values = state.attn_kv_values(kernels, kv_heads, width).unwrap();
+            let mut hasher = DefaultHasher::new();
+            for side in &values {
+                side.len().hash(&mut hasher);
+                for word in side {
+                    word.to_bits().hash(&mut hasher);
+                }
+            }
+            let cap = state.attn_cap();
+            println!(
+                "KV_GROWTH_DIGEST geometric={geometric} cap={cap} sides={} values={} digest={:016x}",
+                values.len(),
+                values.iter().map(Vec::len).sum::<usize>(),
+                hasher.finish(),
+            );
+            (values, hasher.finish(), cap)
+        }
+
+        // Both laws in one process: the quantum state from `zero`, the geometric state
+        // from `zero_geometric`, regardless of the ambient Q36_KV_GEOMETRIC.
+        let mut quantum =
+            super::super::super::state::ResidentState::zero(&mut decoder.kernels, &decoder.weights)
+                .unwrap();
+        ok(
+            decoder.prefill(&mut quantum, &tokens, StepMode::Prompt),
+            "quantum prompt",
+        );
+        let (quantum_values, quantum_digest, quantum_cap) =
+            digest(&mut quantum, &mut decoder.kernels, kv_heads, width, false);
+
+        let mut geometric = super::super::super::state::ResidentState::zero_geometric(
+            &mut decoder.kernels,
+            &decoder.weights,
+            262_144,
+        )
+        .unwrap();
+        ok(
+            decoder.prefill(&mut geometric, &tokens, StepMode::Prompt),
+            "geometric prompt",
+        );
+        let (geometric_values, geometric_digest, geometric_cap) =
+            digest(&mut geometric, &mut decoder.kernels, kv_heads, width, true);
+
+        assert_eq!(
+            quantum_values, geometric_values,
+            "the KV values must be identical under either growth law"
+        );
+        assert_eq!(quantum_digest, geometric_digest);
+        // 1,300 tokens at step 256. Capacity sequences: quantum 256, 512, 768, 1,024,
+        // 1,280, 1,536 (six allocations); geometric 256, 512, 1,024, 2,048 (four). The
+        // first two allocations coincide, and every capacity from the third differs.
+        assert_eq!(quantum_cap, 1_536, "the quantum capacity");
+        assert_eq!(geometric_cap, 2_048, "the geometric capacity");
+    }
+
+    /// Under the geometric law admission charges the ALLOCATED capacity, not the valid
+    /// length: sessions ending just past a doubling charge the doubled capacity, several
+    /// sessions sum, and a session that cannot afford its next capacity is refused by the
+    /// budget. The quantum control first proves the same fill charges its length only.
+    #[test]
+    fn geometric_admission_charges_the_allocated_capacity() {
+        let _serial = crate::native_test_lock();
+        let ckpt = setup();
+        let (mut decoder, _) = decoder_and_oracle(&ckpt, 1_024);
+        // 256-row chunks: the first chunk allocates 256 (a quantum from empty), the SECOND
+        // chunk's 4 rows cross the 256 boundary and double to 512 - a session ends just
+        // past a true doubling, not a first allocation.
+        decoder.set_chunk_rows(256).unwrap();
+        let tokens: Vec<u32> = (0..260).map(token).collect();
+
+        // Quantum control: the charge is the valid length. Built with `zero`, so the
+        // ambient Q36_KV_GEOMETRIC cannot flip the control's law.
+        decoder.set_session_budget(SessionBudget::new(260 * GROWTH));
+        let mut quantum =
+            super::super::super::state::ResidentState::zero(&mut decoder.kernels, &decoder.weights)
+                .unwrap();
+        ok(
+            decoder.prefill(&mut quantum, &tokens, StepMode::Prompt),
+            "quantum prompt",
+        );
+        assert_eq!(decoder.session_used(), 260 * GROWTH);
+
+        // Geometric: one session charges the ALLOCATED capacity (512 rows), two fit the
+        // cap, the third is refused before it allocates anything.
+        let one = 512 * GROWTH;
+        decoder.set_session_budget(SessionBudget::new(2 * one));
+        let mut first = super::super::super::state::ResidentState::zero_geometric(
+            &mut decoder.kernels,
+            &decoder.weights,
+            1_024,
+        )
+        .unwrap();
+        ok(
+            decoder.prefill(&mut first, &tokens, StepMode::Prompt),
+            "first geometric prompt",
+        );
+        assert_eq!(
+            first.attn_cap(),
+            512,
+            "260 tokens cross 256, so the cache doubles"
+        );
+        assert_eq!(
+            decoder.session_used(),
+            one,
+            "the charge is the allocated capacity, not the valid length"
+        );
+        let mut second = super::super::super::state::ResidentState::zero_geometric(
+            &mut decoder.kernels,
+            &decoder.weights,
+            1_024,
+        )
+        .unwrap();
+        ok(
+            decoder.prefill(&mut second, &tokens, StepMode::Prompt),
+            "second geometric prompt",
+        );
+        assert_eq!(decoder.session_used(), 2 * one);
+        let mut third = super::super::super::state::ResidentState::zero_geometric(
+            &mut decoder.kernels,
+            &decoder.weights,
+            1_024,
+        )
+        .unwrap();
+        let refused = decoder.prefill(&mut third, &tokens, StepMode::Prompt);
+        assert!(
+            matches!(refused, Err(EngError::MemoryPlan(_))),
+            "{refused:?}"
+        );
+        assert_eq!(third.pos(), 0, "no chunk ran");
+        assert!(!third.is_poisoned(), "a denial does not poison");
+        assert_eq!(
+            decoder.session_used(),
+            2 * one,
+            "the denial charges nothing"
+        );
+    }
+
+    /// The geometric law holds at the Q8 form too: the same fill doubles the capacity
+    /// through the Q8 append path. Ignored without the checkpoint (Mac, `Q36_CKPT_DIR`).
+    #[test]
+    #[ignore = "needs the real checkpoint on the Mac; run with --ignored"]
+    #[cfg(all(feature = "native-mlx", target_os = "macos", target_arch = "aarch64",))]
+    fn geometric_growth_holds_at_the_q8_form() {
+        let _serial = crate::native_test_lock();
+        let dir = super::super::super::real::env_path("Q36_CKPT_DIR");
+        let real = super::super::super::real::open(&dir);
+        let host = crate::family::qwen36::host_load::HostWeights::load(
+            &real.ckpt,
+            &crate::family::spec::QWEN3_6_35B_A3B,
+            &real.config,
+        )
+        .unwrap();
+        let mut decoder = crate::family::qwen36::resident::decoder::ResidentDecoder::new_with_kv(
+            crate::kernels::MlxKernels::try_new().unwrap(),
+            &real.ckpt,
+            host,
+            262_144,
+            crate::family::qwen36::settings::Activation::Bf16,
+            KvDtype::Q8,
+        )
+        .unwrap();
+        decoder.routing = Routing::Device;
+        decoder.set_chunk_rows(256).unwrap();
+        let tokens: Vec<u32> = (0..600u32).map(token).collect();
+        let mut state = super::super::super::state::ResidentState::zero_geometric(
+            &mut decoder.kernels,
+            &decoder.weights,
+            262_144,
+        )
+        .unwrap();
+        ok(
+            decoder.prefill(&mut state, &tokens, StepMode::Prompt),
+            "q8 prompt",
+        );
+        assert_eq!(
+            state.attn_cap(),
+            1_024,
+            "600 tokens double 512 to 1,024 at Q8"
+        );
+    }
+
+    /// A reset keeps the geometric law (`Q36_KV_GEOMETRIC` semantics, built directly):
+    /// after a reset the caches grow by doubling again, not by one `KV_STEP`. Ignored
+    /// without the checkpoint (Mac, `Q36_CKPT_DIR`).
+    #[test]
+    #[ignore = "needs the real checkpoint on the Mac; run with --ignored"]
+    #[cfg(all(feature = "native-mlx", target_os = "macos", target_arch = "aarch64",))]
+    fn a_reset_keeps_the_geometric_law() {
+        let _serial = crate::native_test_lock();
+        let dir = super::super::super::real::env_path("Q36_CKPT_DIR");
+        let real = super::super::super::real::open(&dir);
+        let host = crate::family::qwen36::host_load::HostWeights::load(
+            &real.ckpt,
+            &crate::family::spec::QWEN3_6_35B_A3B,
+            &real.config,
+        )
+        .unwrap();
+        let mut decoder = crate::family::qwen36::resident::decoder::ResidentDecoder::new_with_kv(
+            crate::kernels::MlxKernels::try_new().unwrap(),
+            &real.ckpt,
+            host,
+            262_144,
+            crate::family::qwen36::settings::Activation::Bf16,
+            KvDtype::F32,
+        )
+        .unwrap();
+        decoder.routing = Routing::Device;
+        decoder.set_chunk_rows(256).unwrap();
+        let tokens: Vec<u32> = (0..600u32).map(token).collect();
+        let mut state = super::super::super::state::ResidentState::zero_geometric(
+            &mut decoder.kernels,
+            &decoder.weights,
+            262_144,
+        )
+        .unwrap();
+        ok(
+            decoder.prefill(&mut state, &tokens, StepMode::Prompt),
+            "first prompt",
+        );
+        assert_eq!(state.attn_cap(), 1_024, "600 tokens double 512 to 1,024");
+        decoder.reset(&mut state).unwrap();
+        assert_eq!(state.attn_cap(), 0, "the reset state has no capacity");
+        ok(
+            decoder.prefill(&mut state, &tokens, StepMode::Prompt),
+            "second prompt",
+        );
+        assert_eq!(
+            state.attn_cap(),
+            1_024,
+            "after the reset the caches double again, not one KV_STEP (would be 768)"
+        );
+    }
+
+    /// A prompt ending just past a doubling: 1,030 tokens cross 1,024, so the geometric
+    /// law allocates 2,048 while the quantum law stays at 1,280. The charge EQUALS the
+    /// allocated storage. Ignored without the checkpoint (Mac, `Q36_CKPT_DIR`).
+    #[test]
+    #[ignore = "needs the real checkpoint on the Mac; run with --ignored"]
+    #[cfg(all(feature = "native-mlx", target_os = "macos", target_arch = "aarch64",))]
+    fn a_prompt_just_past_a_doubling_charges_the_allocated_storage() {
+        let _serial = crate::native_test_lock();
+        let dir = super::super::super::real::env_path("Q36_CKPT_DIR");
+        let real = super::super::super::real::open(&dir);
+        let host = crate::family::qwen36::host_load::HostWeights::load(
+            &real.ckpt,
+            &crate::family::spec::QWEN3_6_35B_A3B,
+            &real.config,
+        )
+        .unwrap();
+        let mut decoder = crate::family::qwen36::resident::decoder::ResidentDecoder::new_with_kv(
+            crate::kernels::MlxKernels::try_new().unwrap(),
+            &real.ckpt,
+            host,
+            262_144,
+            crate::family::qwen36::settings::Activation::Bf16,
+            KvDtype::F32,
+        )
+        .unwrap();
+        decoder.routing = Routing::Device;
+        decoder.set_chunk_rows(256).unwrap();
+        let tokens: Vec<u32> = (0..1_030u32).map(token).collect();
+        let mut state = super::super::super::state::ResidentState::zero_geometric(
+            &mut decoder.kernels,
+            &decoder.weights,
+            262_144,
+        )
+        .unwrap();
+        ok(
+            decoder.prefill(&mut state, &tokens, StepMode::Prompt),
+            "prompt",
+        );
+        let cap = state.attn_cap();
+        assert_eq!(cap, 2_048, "1,030 crosses 1,024, so the cache doubles");
+        // The charge is the ALLOCATED capacity: the stored bytes and the session charge
+        // are equal, with no logical-vs-allocated gap to bound.
+        let charged = state.charged_bytes().unwrap();
+        let stored = super::super::super::state::kv_storage_bytes(state.layers());
+        assert_eq!(
+            stored, charged,
+            "the geometric charge must equal the allocated storage"
+        );
     }
 
     #[test]
@@ -1867,7 +2272,7 @@ mod tests {
         );
         let tokens: Vec<u32> = (0..8).map(token).collect();
         let rows = row_count(&tokens).unwrap();
-        let growth = chunk_growth_bytes(&decoder.weights, rows).unwrap();
+        let growth = advance_charge(&state, &decoder.weights, rows).unwrap();
         let permit = decoder.budget.acquire_growth(growth).unwrap();
         let refused = run(
             &mut decoder,

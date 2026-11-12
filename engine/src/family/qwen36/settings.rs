@@ -632,6 +632,31 @@ pub(crate) struct TieredSettings {
 pub(crate) struct Q36Env {
     /// `Q36_CACHE_LIMIT`, a byte count.
     pub(crate) cache_limit: Option<String>,
+    /// `Q36_KV_GEOMETRIC`, `1` arming the geometric KV capacity law (the raw value;
+    /// `resident::state::geometric_growth` remains the parse authority).
+    pub(crate) kv_geometric: Option<String>,
+    /// `Q36_SPEC_STEP_WINDOW`, `2` arming the checkpoint-window verify path (the raw
+    /// value; `resident::executor`'s one-shot readers remain the parse authority).
+    pub(crate) spec_step_window: Option<String>,
+}
+
+/// The checkpoint-window verify path (`Q36_SPEC_STEP_WINDOW=2`) commits at the NEXT
+/// driver cycle, and under the geometric KV law (`Q36_KV_GEOMETRIC=1`) the interleaved
+/// plain rows grow the shared caches before the commit fires, so the deferred commit's
+/// restore adopts the checkpoint's frozen capacities - an extent no reserve taken at the
+/// window can bound (measured on the Mac: a commit at live position 257 adopted 524,288
+/// bytes with 281,616 available). Engine open refuses the combination until the
+/// deferred commit is fixed; each variable alone still opens. The armed conditions
+/// mirror the one-shot readers in the resident modules (`Some("1")`, `Some("2")`).
+fn geometric_checkpoint_window(env: &Q36Env) -> Result<(), EngError> {
+    if env.kv_geometric.as_deref() == Some("1") && env.spec_step_window.as_deref() == Some("2") {
+        return Err(bad(
+            "Q36_KV_GEOMETRIC=1 with Q36_SPEC_STEP_WINDOW=2 is not supported: \
+             the checkpoint-window commit is not yet supported under the geometric law"
+                .into(),
+        ));
+    }
+    Ok(())
 }
 
 /// The dtype of the Q36 decode activations: the hidden state between blocks, the inputs of the
@@ -683,6 +708,25 @@ pub(crate) const Q8_GROUP: u32 = 64;
 /// charge of `kv_growth_per_position` (one byte per code), so a change of this constant needs those
 /// places and the portable check of `quantize_rows`.
 pub(crate) const Q8_BITS: u32 = 8;
+
+/// Parses the `Q36_KV_GEOMETRIC` value: absent or `0` is the quantum law (false), `1`
+/// is the geometric law (true), anything else is an error naming the value. Pure, so a
+/// host test pins every arm; `state::geometric_growth` applies it once per process.
+#[cfg(any(
+    test,
+    all(feature = "native-mlx", target_os = "macos", target_arch = "aarch64")
+))]
+pub(crate) fn parse_kv_geometric(
+    value: Result<String, std::env::VarError>,
+) -> Result<bool, String> {
+    match value {
+        Err(std::env::VarError::NotPresent) => Ok(false),
+        Ok(text) if text == "0" => Ok(false),
+        Ok(text) if text == "1" => Ok(true),
+        Ok(text) => Err(format!("Q36_KV_GEOMETRIC must be 0 or 1, got {text:?}")),
+        Err(error) => Err(format!("Q36_KV_GEOMETRIC is not valid text: {error}")),
+    }
+}
 
 /// The LOGICAL bytes that one more position adds to the cache of ONE attention layer, from the
 /// cache form and the activation dtype — the one byte authority: `attn::growth_bytes` (which
@@ -1254,6 +1298,7 @@ impl Q36Settings {
                 spec.name
             )));
         }
+        geometric_checkpoint_window(env)?;
         let default = Q36Options::default();
         let options = options.unwrap_or(&default);
         let weights = weight_format_of(options.weight_format.as_deref())?;
@@ -1595,6 +1640,29 @@ mod tests {
     use crate::tensor::Dtype;
     use std::path::{Path, PathBuf};
 
+    /// S4: every arm of the `Q36_KV_GEOMETRIC` parse - absent, `0`, `1`, junk, and the
+    /// not-valid-text error - pinned on the host, because the caller lives in the
+    /// Mac-gated resident module.
+    #[test]
+    fn the_kv_geometric_parse_covers_every_arm() {
+        use super::parse_kv_geometric;
+        use std::env::VarError;
+        assert_eq!(parse_kv_geometric(Err(VarError::NotPresent)), Ok(false));
+        assert_eq!(parse_kv_geometric(Ok("0".into())), Ok(false));
+        assert_eq!(parse_kv_geometric(Ok("1".into())), Ok(true));
+        assert_eq!(
+            parse_kv_geometric(Ok("2".into())),
+            Err("Q36_KV_GEOMETRIC must be 0 or 1, got \"2\"".to_string())
+        );
+        assert_eq!(
+            parse_kv_geometric(Err(VarError::NotUnicode(std::ffi::OsString::new()))),
+            Err(
+                "Q36_KV_GEOMETRIC is not valid text: environment variable was not valid unicode: \"\""
+                    .to_string()
+            )
+        );
+    }
+
     #[test]
     fn compile_program_budget_defaults_validates_and_refuses_cuda() {
         let options = |value| Q36Options {
@@ -1733,6 +1801,7 @@ mod tests {
         let options: Q36Options = serde_json::from_str(r#"{"expert_bank":{}}"#).unwrap();
         let mlx = Q36Env {
             cache_limit: Some("1024".to_string()),
+            ..Q36Env::default()
         };
         assert!(
             message(settings_for(Some(&options), &mlx, Backend::Mlx))
@@ -3001,12 +3070,59 @@ mod tests {
     fn the_environment_fills_the_cache_limit_and_the_object_wins() {
         let env = Q36Env {
             cache_limit: Some("77".to_string()),
+            ..Q36Env::default()
         };
         assert_eq!(settings(None, &env).unwrap().cache_limit, 77);
         assert_eq!(
             settings(Some(&with_limit()), &env).unwrap().cache_limit,
             1024,
             "the object wins"
+        );
+    }
+
+    #[test]
+    fn the_geometric_checkpoint_window_combination_is_refused_at_open() {
+        let both = Q36Env {
+            kv_geometric: Some("1".to_string()),
+            spec_step_window: Some("2".to_string()),
+            ..Q36Env::default()
+        };
+        assert_eq!(
+            message(settings(None, &both)),
+            "engine config: Q36_KV_GEOMETRIC=1 with Q36_SPEC_STEP_WINDOW=2 is not supported: \
+             the checkpoint-window commit is not yet supported under the geometric law"
+        );
+    }
+
+    #[test]
+    fn each_window_or_geometric_variable_alone_still_opens() {
+        // Each alone must reach the LATER per-arm validation (here: the MLX cache-limit
+        // refusal), proving the combination guard refused nothing by itself.
+        let geometric_alone = Q36Env {
+            kv_geometric: Some("1".to_string()),
+            ..Q36Env::default()
+        };
+        assert_eq!(
+            message(settings(None, &geometric_alone)),
+            "engine config: cache_limit_bytes is missing and Q36_CACHE_LIMIT is not set"
+        );
+        let window_alone = Q36Env {
+            spec_step_window: Some("2".to_string()),
+            ..Q36Env::default()
+        };
+        assert_eq!(
+            message(settings(None, &window_alone)),
+            "engine config: cache_limit_bytes is missing and Q36_CACHE_LIMIT is not set"
+        );
+        let window_step_alone = Q36Env {
+            spec_step_window: Some("1".to_string()),
+            kv_geometric: Some("1".to_string()),
+            ..Q36Env::default()
+        };
+        assert_eq!(
+            message(settings(None, &window_step_alone)),
+            "engine config: cache_limit_bytes is missing and Q36_CACHE_LIMIT is not set",
+            "the =1 step window is not the checkpoint window and stays allowed"
         );
     }
 
@@ -3018,6 +3134,7 @@ mod tests {
         );
         let empty = Q36Env {
             cache_limit: Some(String::new()),
+            ..Q36Env::default()
         };
         assert_eq!(
             message(settings(None, &empty)),
@@ -3025,6 +3142,7 @@ mod tests {
         );
         let env = Q36Env {
             cache_limit: Some("many".to_string()),
+            ..Q36Env::default()
         };
         assert_eq!(
             message(settings(None, &env)),
