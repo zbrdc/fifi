@@ -16,8 +16,8 @@
   "targets": {
     "lib": {
       "path": "src/lib.rs",
-      "test_fns": 6727,
-      "ignored": 593,
+      "test_fns": 6736,
+      "ignored": 594,
       "env_gates": [
         "CUDA_MODULE_LOADING",
         "DEFAULT_ON_CHILD",
@@ -73,6 +73,7 @@
         "FIFI_FLASH_NEXT_EXPERT_USAGE_OUT",
         "FIFI_FLASH_NEXT_FUSED_IN",
         "FIFI_FLASH_NEXT_MISS_TRACES",
+        "FIFI_FLASH_NEXT_RING_HELD",
         "FIFI_FLASH_NEXT_ROUTE_TRACE",
         "FIFI_FLASH_NEXT_STEP_HEAD",
         "FIFI_FLASH_NEXT_STEP_LAYERS",
