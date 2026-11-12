@@ -349,12 +349,14 @@ impl<D: ChunkDevice, F: TokenFeeds> ChunkDriver<D, F> {
         let drain_on = profile && prof::drain_tick();
         let mut t = Instant::now();
         let mut tick = |dev: &mut D, slot: usize| -> Result<()> {
+            // Drain before closing the slot: the drain completes the previous phase's tail, so
+            // its host wait belongs in that slot's total, not in the phase that follows.
+            if drain_on {
+                dev.drain()?;
+            }
             if profile {
                 prof::add(slot, t.elapsed());
                 t = Instant::now();
-            }
-            if drain_on {
-                dev.drain()?;
             }
             Ok(())
         };

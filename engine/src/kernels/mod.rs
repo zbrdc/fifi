@@ -84,6 +84,14 @@ pub(crate) mod page_io_block {
             .get_or_init(|| std::env::var("INFERENCE_FLASH_NEXT_PROFILE").is_ok_and(|v| v != "0"))
     }
 
+    /// Whether any copy is being recorded; reading this never arms the switch. The
+    /// pageable-copy path checks it BEFORE taking any clock read, per the shared-path rule.
+    #[cfg(all(feature = "native-cuda", target_os = "linux"))]
+    #[inline]
+    pub(crate) fn armed() -> bool {
+        ENABLED.get().copied().unwrap_or(false)
+    }
+
     /// Records `ns` spent blocked; the disarmed path is one load and no store. Only the
     /// native page-io wrappers call this, so it exists where they do.
     #[cfg(all(feature = "native-cuda", target_os = "linux"))]

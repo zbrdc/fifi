@@ -612,18 +612,27 @@ fn complete_pageable_copy(
     upload: bool,
 ) -> Result<Vec<u8>, DeviceFailure> {
     // The wait is the host block this function exists to prove; its cost is charged to the
-    // page-io counters so the phase profile can split upload waits from readback waits.
-    let wait = std::time::Instant::now();
+    // page-io counters so the phase profile can split upload waits from readback waits. The
+    // shared-path rule: no clock read at all until the counters say they are armed.
+    let wait = if crate::kernels::page_io_block::armed() {
+        Some(std::time::Instant::now())
+    } else {
+        None
+    };
     let done = stream_synchronize(stream);
-    let blocked_ns = wait.elapsed().as_nanos() as u64;
+    let blocked_ns = wait.map(|w| w.elapsed().as_nanos() as u64);
     match done {
         Ok(()) => {
-            crate::kernels::page_io_block::note(upload, blocked_ns);
+            if let Some(ns) = blocked_ns {
+                crate::kernels::page_io_block::note(upload, ns);
+            }
             copy?;
             Ok(host)
         }
         Err(completion) => {
-            crate::kernels::page_io_block::note(upload, blocked_ns);
+            if let Some(ns) = blocked_ns {
+                crate::kernels::page_io_block::note(upload, ns);
+            }
             #[cfg(all(test, feature = "cuda-fault-qualification"))]
             RETAINED_PAGEABLE_BYTES.fetch_add(host.capacity(), std::sync::atomic::Ordering::AcqRel);
             // Unknown completion cannot release host storage, even when copy failed first.

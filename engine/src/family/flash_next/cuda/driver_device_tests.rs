@@ -353,10 +353,9 @@ fn the_first_real_tokens_match_the_oracle() {
     let mut records = Vec::new();
     let mut first_row: Vec<f32> = Vec::new();
     let mut step_samples = Vec::new();
-    // The decode-phase timer: from the first step's start to the last step's end, so an A/B
-    // on decode work is not read off process wall (load + prefill dominate that).
-    let decode_started = std::time::Instant::now();
-    let mut decode_ended = decode_started;
+    // The decode-phase figure sums each step's logits wall only: the harness work between
+    // steps (argmax, the top-20 sort, the json record) stays out, so a decode A/B reads the
+    // driver, not the harness. Per-step `wall` below is that same logits-only clock.
     for step in 0..steps {
         let before = driver.bank_misses();
         let began = std::time::Instant::now();
@@ -364,7 +363,6 @@ fn the_first_real_tokens_match_the_oracle() {
             .logits(input)
             .unwrap_or_else(|e| panic!("step {step}: {e:?}"));
         let wall = began.elapsed();
-        decode_ended = std::time::Instant::now();
         let visible = &row[..actual_vocab];
         let picking = std::time::Instant::now();
         let pick = argmax(visible);
@@ -388,7 +386,7 @@ fn the_first_real_tokens_match_the_oracle() {
         generated.push(pick as u32);
         input = pick as u32;
     }
-    let decode_phase = decode_ended.duration_since(decode_started);
+    let decode_phase = step_samples.iter().map(|s| s.wall).sum::<Duration>();
     println!(
         "decode phase: {steps} steps in {:.2} s ({:.1} ms/token)",
         decode_phase.as_secs_f64(),
