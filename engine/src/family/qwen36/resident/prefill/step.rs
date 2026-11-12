@@ -443,15 +443,19 @@ fn run(
                     eps: shape.eps,
                     act: ctx.consts.act,
                 })?;
+            // The state is borrowed, so `chunk_core` receives a share and the old
+            // binding stays alive through the iteration. Measured on the two-fill
+            // probe (`compiled_layer_window_peak_at_large_cache`, 8-row Window steps
+            // on 65,536- and 65,520-token F32 fills, MLX on the 36 GB Mac Studio):
+            // cold - the first window after the flag flip - the closure arm peaked
+            // 0.25-0.48 GiB above the eager arm, but with a warm-up window absorbing
+            // the one-off compile work the steady transient is about 0.05 GiB at both
+            // fills, growth boundary or not. The by-value variant measured MORE cold
+            // (about 0.81 GiB at a plain append), so the borrow stays; what the
+            // remaining ~0.05 GiB is made of is not settled.
             let (att, cache) = attn::chunk_core(
                 &mut ctx,
                 shape,
-                // Stated limit of the flag: this `share()` keeps `old_layer`'s KV buffers
-                // alive through the iteration, so `kv_append` inside `chunk_core` copies
-                // the whole cache capacity (no buffer donation) per attention layer -
-                // about 1 GiB transient at a 256K F32 cache. Acceptable for the
-                // verify-window regime (the caller already holds a snapshot share there);
-                // it must be fixed by taking the layer by value before any default flip.
                 cache.share(),
                 pos,
                 rows,
@@ -988,35 +992,74 @@ mod tests {
         // The windows then trace at 2, 3 and 8 in rising order: successive compiles under
         // one adapter must reuse the cache across T, never alias it, so the rising order
         // exercises the cross-T cache-reuse contract of the closures.
-        {
-            // Flag ON for the prompt: the 64-row chunk stays eager by the (2..16) gate, so a
-            // silent misroute would surface here as a native failure instead of in serve.
-            COMPILED_LAYER_TEST.store(true, Ordering::Relaxed);
-            let mut pre = decoder.zero_state().unwrap();
-            ok(
-                decoder.prefill(&mut pre, &tokens[..64], StepMode::Prompt),
-                "prompt",
-            );
-            COMPILED_LAYER_TEST.store(false, Ordering::Relaxed);
-        }
+        // Each arm seeds its own state with the same eager prompt, so every compared
+        // window appends onto a POPULATED cache - the path the ownership change touches -
+        // and the third arm holds a decoder snapshot across the compiled window: the
+        // verify regime, where a share of the KV buffers stays alive by design.
         for rows in [2usize, 3, 8] {
             let toks = &tokens[..rows];
-            crate::kernels::mlx::reset_dispatch_count();
             let mut eager_state = decoder.zero_state().unwrap();
+            ok(
+                decoder.prefill(&mut eager_state, &tokens[..64], StepMode::Prompt),
+                "eager prompt",
+            );
+            crate::kernels::mlx::reset_dispatch_count();
             let eager = ok(
                 decoder.prefill(&mut eager_state, toks, StepMode::Window),
                 "eager",
             );
             let eager_ops = crate::kernels::mlx::dispatch_count();
             COMPILED_LAYER_TEST.store(true, Ordering::Relaxed);
+            let mut compiled_state = decoder.zero_state().unwrap();
+            ok(
+                decoder.prefill(&mut compiled_state, &tokens[..64], StepMode::Prompt),
+                "compiled-arm prompt",
+            );
             crate::kernels::mlx::reset_dispatch_count();
             let attn_calls_before = decoder.kernels.compile_counters().attn.calls;
-            let mut compiled_state = decoder.zero_state().unwrap();
             let compiled = ok(
                 decoder.prefill(&mut compiled_state, toks, StepMode::Window),
                 "compiled",
             );
             let compiled_ops = crate::kernels::mlx::dispatch_count();
+            // The verify regime: the same compiled window with a held snapshot share of
+            // the KV buffers. Its step result must equal the eager arm byte for byte.
+            let mut shared_state = decoder.zero_state().unwrap();
+            ok(
+                decoder.prefill(&mut shared_state, &tokens[..64], StepMode::Prompt),
+                "shared-arm prompt",
+            );
+            let held_snapshot = decoder.snapshot(&shared_state).expect("snapshot");
+            // The snapshot's own bytes, read before and after the window: the append
+            // through the share must leave the held prefix untouched (a shared buffer
+            // is copied on write, never moved). F32 only - the Q8 form has no
+            // non-F32 readback in the test support.
+            let snapshot_f32 =
+                |snap: &super::super::super::state::ResidentSnapshot,
+                 kernels: &mut crate::kernels::MlxKernels| {
+                    snap.attn_f32_values(kernels).unwrap()
+                };
+            let snapshot_before = if kv == KvDtype::F32 {
+                Some(snapshot_f32(&held_snapshot, &mut decoder.kernels))
+            } else {
+                None
+            };
+            let shared = ok(
+                decoder.prefill(&mut shared_state, toks, StepMode::Window),
+                "compiled with a held snapshot",
+            );
+            assert_eq!(
+                eager, shared,
+                "rows {rows}: the held-snapshot compiled window matches the eager step"
+            );
+            if let Some(before) = snapshot_before {
+                assert_eq!(
+                    before,
+                    snapshot_f32(&held_snapshot, &mut decoder.kernels),
+                    "rows {rows}: the held snapshot's KV bytes are unchanged by the window"
+                );
+            }
+            drop(held_snapshot);
             COMPILED_LAYER_TEST.store(false, Ordering::Relaxed);
             // The attention closures must actually have run: each attention layer pays one
             // PRE and one POST call per compiled chunk, so a silent gate failure leaves the
@@ -1154,6 +1197,100 @@ mod tests {
                 "rows {rows}: the compiled chunk must save at least 2 entries per attention layer (saved {}, layers {attn_layers})",
                 eager_ops - compiled_ops
             );
+        }
+    }
+
+    /// Peak-memory probe of a compiled 2..15-row Window chunk that CROSSES a capacity
+    /// growth step at a large fill (the regime the KV-copy limit was stated for: the
+    /// cache grows in KV_STEP=256 steps, so a window whose rows cross a 256 boundary
+    /// rebuilds every buffer). Each arm starts from a fresh state and the same
+    /// 65,536-token prompt (len == cap exactly), resets the process-wide peak counter
+    /// right before the 8-row window step, and prints the peak after it. The peaks are
+    /// the measurement, so nothing asserts on them. Ignored without the checkpoint
+    /// (Mac, `Q36_CKPT_DIR`).
+    #[test]
+    #[ignore = "needs the real checkpoint on the Mac; run with --ignored"]
+    #[cfg(all(feature = "native-mlx", target_os = "macos", target_arch = "aarch64",))]
+    fn compiled_layer_window_peak_at_large_cache() {
+        let _serial = crate::native_test_lock();
+        use super::super::super::executor::COMPILED_LAYER_TEST;
+        use std::sync::atomic::Ordering;
+        let dir = super::super::super::real::env_path("Q36_CKPT_DIR");
+        let real = super::super::super::real::open(&dir);
+        let host = crate::family::qwen36::host_load::HostWeights::load(
+            &real.ckpt,
+            &crate::family::spec::QWEN3_6_35B_A3B,
+            &real.config,
+        )
+        .unwrap();
+        let mut decoder = crate::family::qwen36::resident::decoder::ResidentDecoder::new_with_kv(
+            crate::kernels::MlxKernels::try_new().unwrap(),
+            &real.ckpt,
+            host,
+            262_144,
+            crate::family::qwen36::settings::Activation::Bf16,
+            KvDtype::F32,
+        )
+        .unwrap();
+        decoder.routing = Routing::Device;
+        let tokens: Vec<u32> = (0..65_544).map(|i| token(i as u32)).collect();
+        // Two fills: 65,536 (len == cap, the 8-row window crosses a KV_STEP growth) and
+        // 65,520 (8 rows fit the spare capacity, no growth) - the second separates the
+        // plain append from the rebuild. The premise itself is asserted from the
+        // capacity rule, not from the fill comments: at 65,536 the rule grows the
+        // cache for 8 more rows, at 65,520 (cap 65,792) it does not.
+        let step = super::super::super::kv_plan::KV_STEP;
+        let cap_at =
+            |len: usize| super::super::super::kv_plan::next_capacity(len, 0, 0, step).unwrap();
+        let cap_65536 = cap_at(65_536);
+        let cap_65520 = cap_at(65_520);
+        assert!(
+            super::super::super::kv_plan::next_capacity(65_536, 8, cap_65536, step).unwrap()
+                > cap_65536,
+            "the 65,536 fill must cross a growth boundary for 8 rows"
+        );
+        assert_eq!(
+            super::super::super::kv_plan::next_capacity(65_520, 8, cap_65520, step).unwrap(),
+            cap_65520,
+            "the 65,520 fill must fit its 8 rows in spare capacity"
+        );
+        for fill in [65_536usize, 65_520] {
+            for (label, on) in [("eager", false), ("compiled", true)] {
+                let mut state = decoder.zero_state().unwrap();
+                ok(
+                    decoder.prefill(&mut state, &tokens[..fill], StepMode::Prompt),
+                    "prompt",
+                );
+                // A warm-up window under the same flag, dropped from the peak: the
+                // first compiled window pays the closures' one-off compile work and
+                // the flag flip's first allocation, none of which is the window's
+                // steady transient under measurement.
+                COMPILED_LAYER_TEST.store(on, Ordering::Relaxed);
+                ok(
+                    decoder.prefill(&mut state, &tokens[..8], StepMode::Record),
+                    "warm-up",
+                );
+                COMPILED_LAYER_TEST.store(false, Ordering::Relaxed);
+                decoder.kernels.reset_peak_memory().unwrap();
+                let calls_before = decoder.kernels.compile_counters().attn.calls;
+                COMPILED_LAYER_TEST.store(on, Ordering::Relaxed);
+                ok(
+                    decoder.prefill(&mut state, &tokens[65_536..65_544], StepMode::Window),
+                    "window",
+                );
+                COMPILED_LAYER_TEST.store(false, Ordering::Relaxed);
+                // The measured arm must have run the attention closures: a silent
+                // gate failure would leave the counter flat and the peak vacuous.
+                let calls = decoder.kernels.compile_counters().attn.calls - calls_before;
+                assert!(
+                    !on || calls > 0,
+                    "the compiled window must call the attention closures (calls {calls})"
+                );
+                let peak = decoder.kernels.memory_stats().unwrap().peak;
+                println!(
+                    "COMPILED_LAYER_PEAK fill={fill} {label} peak_bytes={peak} attn_calls={calls}"
+                );
+            }
         }
     }
 

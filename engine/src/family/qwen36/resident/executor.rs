@@ -323,10 +323,14 @@ pub(super) static COMPILED_LAYER_TEST: std::sync::atomic::AtomicBool =
 /// the eager chunk); the delta closure and the attention POST closure each return one
 /// health vector (the attention PRE closure returns none), which joins the chunk-end
 /// stack like an eager layer's. Default off; the eager chunk stays the reference and
-/// the parity oracle. Known limit while off (it blocks a default flip, not the flag):
-/// the window-attention path pays one extra `cache.share` KV copy per layer for the
-/// eager middle, and the BF16 cache form is excluded from the attention closures'
-/// coverage.
+/// the parity oracle. Known limits while off (they block a default flip, not the
+/// flag): the BF16 cache form is excluded from the attention closures' coverage, and
+/// the closure arm borrows the layer state, so `chunk_core` appends through a share -
+/// measured cold at 0.25-0.48 GiB of peak above the eager arm and warm (after a
+/// warm-up window absorbs the one-off compile work) at about 0.05 GiB (8-row Window
+/// steps at 64K F32 fills, MLX on the 36 GB Mac Studio), while the by-value variant
+/// measured worse cold (about 0.81 GiB at a plain append). The source of the
+/// remaining transient is not settled.
 pub(super) fn compiled_layer_on() -> bool {
     #[cfg(test)]
     if COMPILED_LAYER_TEST.load(std::sync::atomic::Ordering::Relaxed) {

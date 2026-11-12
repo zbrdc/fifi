@@ -222,6 +222,27 @@ pub(super) struct ResidentSnapshot {
 }
 
 impl ResidentSnapshot {
+    /// Reads every attention layer's F32 key and value buffer back, whole, for the
+    /// parity oracle's held-snapshot immutability check (the bytes before and after a
+    /// window step must be equal). Layers in another cache form read nothing here. One
+    /// synchronization per buffer. Test support only.
+    #[cfg(test)]
+    pub(super) fn attn_f32_values(
+        &self,
+        kernels: &mut MlxKernels,
+    ) -> Result<Vec<Vec<f32>>, EngError> {
+        let mut all = Vec::new();
+        for layer in &self.layers {
+            if let LayerState::Attn(cache) = layer
+                && let Some(super::attn::KvBuffers::F32 { k, v }) = &cache.buffers
+            {
+                all.push(super::ops::values(kernels, k)?);
+                all.push(super::ops::values(kernels, v)?);
+            }
+        }
+        Ok(all)
+    }
+
     pub(super) fn pos(&self) -> u32 {
         self.pos
     }
