@@ -45,6 +45,7 @@
 //! equals `FlashLoadPlan::delta_state_bytes`. The fixed state that the budget does not charge yet is
 //! [`StateBytes::other_fixed_bytes`].
 
+pub(super) use super::driver::StateSlot;
 use crate::{
     EngError,
     family::{
@@ -370,25 +371,6 @@ impl FlashGeometry {
     }
 }
 
-/// One persistent tensor. The layer index is the model layer, not an ordinal among its kind.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(super) enum StateSlot {
-    /// Recurrent state of a DeltaNet layer.
-    DeltaRec(usize),
-    /// Conv ring of a DeltaNet layer.
-    DeltaConv(usize),
-    /// fp16 K cache of a QSA layer.
-    QsaK(usize),
-    /// fp16 V cache of a QSA layer.
-    QsaV(usize),
-    /// Pooled indexer keys of a QSA layer.
-    QsaIndexKeys(usize),
-    /// Raw-key ring of the open indexer block of a QSA layer.
-    QsaRawRing(usize),
-    PleRing,
-    Words,
-}
-
 /// The fixed and the context-dependent bytes of a state plan, in the names the context budget uses.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) struct StateBytes {
@@ -517,6 +499,19 @@ impl StatePlan {
     /// The tensor index of `slot` in the arena (`DeviceArena::tensor`).
     pub(super) fn index(&self, slot: StateSlot) -> Option<usize> {
         self.slots.iter().position(|&(found, _)| found == slot)
+    }
+
+    /// Whether `slot` is position state a resume leaves in place under the valid length (the
+    /// QSA K/V planes and the indexer keys): no kernel reads a position at or past the valid
+    /// length, so a fresh sequence never observes them. The raw-key ring is NOT position state:
+    /// slot `p % ratio` accumulates the open block's raw keys, so the saving job's own
+    /// continuation overwrites the slots a mid-block boundary needs — the ring is copied with
+    /// the fixed state (saved, restored and zeroed on reset).
+    pub(super) fn is_position_state(slot: StateSlot) -> bool {
+        matches!(
+            slot,
+            StateSlot::QsaK(_) | StateSlot::QsaV(_) | StateSlot::QsaIndexKeys(_)
+        )
     }
 
     /// `(offset, bytes)` of `slot` in the arena.

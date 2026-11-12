@@ -38,6 +38,27 @@ use crate::{EngError, family::session::TokenStepper};
 
 type Result<T> = std::result::Result<T, EngError>;
 
+/// One persistent tensor of the state arena. The layer index is the model layer, not an ordinal
+/// among its kind. Defined here (not in `state`) so the resume seam below can name it in every
+/// cfg the driver builds under; `state` imports it for its plan.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(in crate::family::flash_next) enum StateSlot {
+    /// Recurrent state of a DeltaNet layer.
+    DeltaRec(usize),
+    /// Conv ring of a DeltaNet layer.
+    DeltaConv(usize),
+    /// fp16 K cache of a QSA layer.
+    QsaK(usize),
+    /// fp16 V cache of a QSA layer.
+    QsaV(usize),
+    /// Pooled indexer keys of a QSA layer.
+    QsaIndexKeys(usize),
+    /// Raw-key ring of the open indexer block of a QSA layer.
+    QsaRawRing(usize),
+    PleRing,
+    Words,
+}
+
 /// The sizes the driver checks and splits the layers by.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) struct DriverShape {
@@ -108,6 +129,57 @@ pub(super) trait TokenFeeds {
     }
     /// Forgets the history and the ring: a new sequence.
     fn reset(&mut self);
+    /// The host half of a resume snapshot (token history, host ring mirror), or `None` for a
+    /// feed with no PLE state. The default is `None`.
+    fn ple_state(&self) -> Option<(&[u32], &[f32])> {
+        None
+    }
+    /// Installs a saved host half, as a prefix restore brings the feed back to a boundary.
+    /// The default refuses: only a feed with PLE state resumes.
+    fn ple_resume(&mut self, _history: &[u32], _ring: &[f32]) -> Result<()> {
+        Err(EngError::BadRequest(
+            "this feed has no PLE state to resume".to_string(),
+        ))
+    }
+}
+
+/// The fixed device state a resume saves: one raw byte image per copied slot (the GDN recurrent
+/// states, their conv rings, the PLE device ring AND the QSA raw-key ring — its slots hold the
+/// open block's accumulated raw keys, which the saving job's own continuation overwrites), the
+/// position the model had consumed, and the PLE feed's host half. The QSA K/V planes and the
+/// indexer keys are not here: they stay in place on the card and a restore rewinds the valid
+/// length onto them.
+#[derive(Clone)]
+pub(in crate::family::flash_next) struct ResumeSnapshot {
+    /// `(slot, bytes)` for every copied slot (the GDN recurrent states, their conv rings, the
+    /// PLE device ring, the QSA raw-key ring).
+    pub(in crate::family::flash_next) parts: Vec<(StateSlot, Vec<u8>)>,
+    /// Tokens the model had consumed when the boundary was saved (the pending token excluded).
+    pub(in crate::family::flash_next) pos: usize,
+    /// The PLE feed's token history at the boundary.
+    pub(in crate::family::flash_next) ple_history: Vec<u32>,
+    /// The PLE feed's host ring mirror at the boundary.
+    pub(in crate::family::flash_next) ple_ring: Vec<f32>,
+}
+
+/// Fixed-state device IO for a driver's device: the seam a [`ResumesState`] driver reads and
+/// installs its snapshot through.
+pub(super) trait StateIo {
+    /// Reads every copied slot, behind the queued work.
+    fn read_fixed_state(&self) -> Result<Vec<(StateSlot, Vec<u8>)>>;
+    /// Installs every copied slot, ordered before the next launch.
+    fn write_fixed_state(&mut self, parts: &[(StateSlot, Vec<u8>)]) -> Result<()>;
+}
+
+/// The resume seam of the drivers: what the executor's prefix store saves and restores. The
+/// position count comes from [`TokenStepper::fed`].
+pub(crate) trait ResumesState: StepperPositions {
+    fn save_resume(&self) -> Result<ResumeSnapshot>;
+    fn restore_resume(&mut self, snapshot: &ResumeSnapshot) -> Result<()>;
+    /// The arena generation the driver is in: one advance per fresh sequence. The executor
+    /// stamps it into the prefix store's path, so a restore at any other generation never
+    /// matches the entry — the rows it left in place may have been overwritten meanwhile.
+    fn resume_generation(&self) -> u64;
 }
 
 /// The device side of a token. It is the sink of the token start.
@@ -143,6 +215,11 @@ pub(super) struct TokenDriver<D: TokenDevice, F: TokenFeeds> {
     /// Tokens the state has consumed: the next position.
     pos: usize,
     poisoned: bool,
+    /// Advances once per fresh sequence (at the ATTEMPT of its first row, so a failed or
+    /// partial first write also advances it; the row never needs to commit): the
+    /// in-place rows a resume leaves on the card belong to the generation that wrote them, so a
+    /// snapshot saved at another generation is structurally unusable and never matches.
+    generation: u64,
     times: TokenTimes,
 }
 
@@ -160,6 +237,7 @@ impl<D: TokenDevice, F: TokenFeeds> TokenDriver<D, F> {
             feeds,
             shape,
             pos: 0,
+            generation: 0,
             poisoned: false,
             times: TokenTimes::default(),
         })
@@ -180,8 +258,15 @@ impl<D: TokenDevice, F: TokenFeeds> TokenDriver<D, F> {
         self.shape.positions
     }
 
+    /// The device, shared with the routing-diagnostics reads; tests also poke it directly.
     pub(in crate::family::flash_next::cuda) fn device(&self) -> &D {
         &self.device
+    }
+
+    /// The device mutably, for the executor tests' failure injection and fixture writes.
+    #[cfg(test)]
+    pub(in crate::family::flash_next::cuda) fn device_mut(&mut self) -> &mut D {
+        &mut self.device
     }
 
     #[cfg(test)]
@@ -213,6 +298,12 @@ impl<D: TokenDevice, F: TokenFeeds> TokenDriver<D, F> {
         // Host reads only: a failure here leaves the state as it was.
         let opened = Instant::now();
         let start = self.feeds.begin(token)?;
+        // The generation advances at the ATTEMPT of a fresh sequence's first row, not only on
+        // success: a first chunk that fails after queueing device work may still have written
+        // the rows, and a stale snapshot must never survive that.
+        if self.pos == 0 {
+            self.generation += 1;
+        }
         self.times = TokenTimes {
             rows: opened.elapsed(),
             ..TokenTimes::default()
@@ -324,6 +415,34 @@ impl<D: TokenDevice, F: TokenFeeds> TokenStepper for TokenDriver<D, F> {
         self.device.reset()?;
         self.feeds.reset();
         self.pos = 0;
+        self.poisoned = false;
+        Ok(())
+    }
+}
+
+impl<D: TokenDevice + StateIo, F: TokenFeeds> ResumesState for TokenDriver<D, F> {
+    fn resume_generation(&self) -> u64 {
+        self.generation
+    }
+
+    fn save_resume(&self) -> Result<ResumeSnapshot> {
+        let parts = self.device.read_fixed_state()?;
+        let (ple_history, ple_ring) = self.feeds.ple_state().unwrap_or((&[], &[]));
+        Ok(ResumeSnapshot {
+            parts,
+            pos: self.pos,
+            ple_history: ple_history.to_vec(),
+            ple_ring: ple_ring.to_vec(),
+        })
+    }
+
+    fn restore_resume(&mut self, snapshot: &ResumeSnapshot) -> Result<()> {
+        self.device.write_fixed_state(&snapshot.parts)?;
+        if !snapshot.ple_ring.is_empty() {
+            self.feeds
+                .ple_resume(&snapshot.ple_history, &snapshot.ple_ring)?;
+        }
+        self.pos = snapshot.pos;
         self.poisoned = false;
         Ok(())
     }

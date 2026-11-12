@@ -30,7 +30,7 @@ use std::sync::OnceLock;
 use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
 use std::time::Instant;
 
-use super::{DriverShape, TokenFeeds};
+use super::{DriverShape, ResumeSnapshot, TokenFeeds};
 use crate::EngError;
 use crate::family::flash_next::cuda::ple_feed::PleKeyValue;
 use crate::family::session::TokenStepper;
@@ -114,7 +114,9 @@ pub(in crate::family::flash_next) mod prof {
     /// unset, `0`, `false` or `off` leave them off, and anything else is refused at driver
     /// build by `check_switch_spelling`. The fast paths call the same parser, so the value
     /// that would be refused is never the value that arms.
-    pub(super) fn parse_switch(raw: Option<&str>) -> std::result::Result<bool, String> {
+    pub(in crate::family::flash_next) fn parse_switch(
+        raw: Option<&str>,
+    ) -> std::result::Result<bool, String> {
         match raw {
             None | Some("0") | Some("false") | Some("off") => Ok(false),
             Some("1") | Some("true") | Some("on") => Ok(true),
@@ -122,12 +124,13 @@ pub(in crate::family::flash_next) mod prof {
         }
     }
 
-    /// Refuses an unknown spelling of either diagnostic switch at driver build, before any
+    /// Refuses an unknown spelling of the Flash-Next switches at driver build, before any
     /// chunk runs; a driver is never constructed with a value the fast paths would misread.
     pub(in crate::family::flash_next) fn check_switch_spelling() -> Result<()> {
         for name in [
             "INFERENCE_FLASH_NEXT_PROFILE",
             "INFERENCE_FLASH_NEXT_DRAIN_TICK",
+            "INFERENCE_FLASH_NEXT_PREFIX_RESUME",
         ] {
             let refused = |seen: &str| {
                 EngError::BadRequest(format!(
@@ -313,6 +316,11 @@ pub(in crate::family::flash_next::cuda) struct ChunkDriver<D: ChunkDevice, F: To
     /// Tokens the state has consumed: the next position.
     pos: usize,
     poisoned: bool,
+    /// Advances once per fresh sequence (at the ATTEMPT of its first row, so a failed or
+    /// partial first write also advances it; the row never needs to commit): the
+    /// in-place rows a resume leaves on the card belong to the generation that wrote them, so a
+    /// snapshot saved at another generation is structurally unusable and never matches.
+    generation: u64,
     /// The most rows one device chunk runs; the caller sets it from the memory plan.
     pub(in crate::family::flash_next::cuda) chunk_cap: usize,
     /// Whether the PLE projections run on the device (`ChunkDevice::ple_project_chunk`).
@@ -338,6 +346,7 @@ impl<D: ChunkDevice, F: TokenFeeds> ChunkDriver<D, F> {
             shape,
             pos: 0,
             poisoned: false,
+            generation: 0,
             chunk_cap: 1,
             ple_device: false,
         })
@@ -402,6 +411,12 @@ impl<D: ChunkDevice, F: TokenFeeds> ChunkDriver<D, F> {
         if profile {
             prof::add(0, t0.elapsed());
             prof::ROWS.fetch_add(m as u64, AtomicOrdering::Relaxed);
+        }
+        // The generation advances at the ATTEMPT of a fresh sequence's first chunk, not only
+        // on success: a failed chunk that queued device work may still have written the rows,
+        // and a stale snapshot must never survive that.
+        if self.pos == 0 {
+            self.generation += 1;
         }
         let outcome = self.queue(tokens, &starts, want_logits);
         match outcome {
@@ -557,6 +572,34 @@ impl<D: ChunkDevice, F: TokenFeeds> TokenStepper for ChunkDriver<D, F> {
         self.device.reset()?;
         self.feeds.reset();
         self.pos = 0;
+        self.poisoned = false;
+        Ok(())
+    }
+}
+
+impl<D: ChunkDevice + super::StateIo, F: TokenFeeds> super::ResumesState for ChunkDriver<D, F> {
+    fn resume_generation(&self) -> u64 {
+        self.generation
+    }
+
+    fn save_resume(&self) -> Result<ResumeSnapshot> {
+        let parts = self.device.read_fixed_state()?;
+        let (ple_history, ple_ring) = self.feeds.ple_state().unwrap_or((&[], &[]));
+        Ok(ResumeSnapshot {
+            parts,
+            pos: self.pos,
+            ple_history: ple_history.to_vec(),
+            ple_ring: ple_ring.to_vec(),
+        })
+    }
+
+    fn restore_resume(&mut self, snapshot: &ResumeSnapshot) -> Result<()> {
+        self.device.write_fixed_state(&snapshot.parts)?;
+        if !snapshot.ple_ring.is_empty() {
+            self.feeds
+                .ple_resume(&snapshot.ple_history, &snapshot.ple_ring)?;
+        }
+        self.pos = snapshot.pos;
         self.poisoned = false;
         Ok(())
     }

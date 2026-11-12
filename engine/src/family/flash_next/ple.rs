@@ -120,6 +120,27 @@ impl PleState {
         self.history.len() * 4 + self.ring.len() * 4
     }
 
+    /// Installs a saved `(history, ring)` pair, as a prefix restore brings the feed back to a
+    /// boundary. Refuses a ring of the wrong length; the history is whatever the boundary held.
+    pub(crate) fn resume(&mut self, history: &[u32], ring: &[f32]) -> Result<(), EngError> {
+        if ring.len() != self.ring.len() {
+            return Err(EngError::BadRequest(format!(
+                "the PLE ring holds {} values, not {}",
+                self.ring.len(),
+                ring.len()
+            )));
+        }
+        self.history.clear();
+        self.history.extend_from_slice(history);
+        self.ring.copy_from_slice(ring);
+        Ok(())
+    }
+
+    /// The ring values in host layout: the resume snapshot's host half.
+    pub(crate) fn ring_values(&self) -> &[f32] {
+        &self.ring
+    }
+
     /// The convolution ring, row `c` at `c * (conv_kernel - 1) * ngram` (test observation only).
     #[cfg(test)]
     pub(crate) fn ring(&self) -> &[f32] {
@@ -613,6 +634,33 @@ mod tests {
             plan_chunk_rows(&shape, &w, &[1], &[]),
             Err(EngError::BadRequest(_))
         ));
+    }
+
+    #[test]
+    fn resume_installs_the_saved_half_and_refuses_a_wrong_ring() {
+        let shape = PleShape::new(dims()).unwrap();
+        let mut state = PleState::new(&shape);
+        state.history.extend_from_slice(&[7, 8, 9]);
+        for (i, v) in state.ring.iter_mut().enumerate() {
+            *v = i as f32 + 0.5;
+        }
+        let (history, ring) = (state.history.clone(), state.ring.clone());
+        // A ring of the wrong length is refused and changes nothing.
+        let mut short = ring.clone();
+        short.pop();
+        assert!(state.resume(&[1], &short).is_err());
+        assert_eq!(state.history, history, "a refused resume changes nothing");
+        // A later sequence's history REPLACES the boundary's, never appends.
+        state.history.clear();
+        state.history.push(42);
+        state.resume(&history, &ring).unwrap();
+        assert_eq!(state.history, history);
+        assert_eq!(state.ring, ring);
+        assert_eq!(
+            state.ring_values(),
+            &ring[..],
+            "the snapshot reads the same values back"
+        );
     }
 
     #[test]

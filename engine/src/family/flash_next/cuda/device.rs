@@ -16,6 +16,7 @@ use super::{
     driver::TokenDevice,
     feeds::StartSink,
     ple_feed::PleKeyValue,
+    state::StateSlot,
     step::{FlashStep, SplitMoeAt},
     step_plan::Slot,
 };
@@ -158,6 +159,16 @@ impl TokenDevice for CardDevice {
 
     fn bank_misses(&self) -> Option<u64> {
         Some(CardDevice::bank_misses(self))
+    }
+}
+
+impl super::driver::StateIo for CardDevice {
+    fn read_fixed_state(&self) -> Result<Vec<(StateSlot, Vec<u8>)>, EngError> {
+        self.step.read_fixed_state()
+    }
+
+    fn write_fixed_state(&mut self, parts: &[(StateSlot, Vec<u8>)]) -> Result<(), EngError> {
+        self.step.write_fixed_state(parts)
     }
 }
 
@@ -339,5 +350,15 @@ impl super::driver::chunk::ChunkDevice for CardChunkDevice {
 
     fn bank_misses(&self) -> Option<u64> {
         Some(self.moe.bank().stats().misses)
+    }
+}
+
+impl super::driver::StateIo for CardChunkDevice {
+    fn read_fixed_state(&self) -> Result<Vec<(StateSlot, Vec<u8>)>, EngError> {
+        self.step.read_fixed_state()
+    }
+
+    fn write_fixed_state(&mut self, parts: &[(StateSlot, Vec<u8>)]) -> Result<(), EngError> {
+        self.step.write_fixed_state(parts)
     }
 }

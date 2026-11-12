@@ -593,6 +593,20 @@ impl PleFeed {
     pub(in crate::family) fn reset(&mut self) {
         self.state = PleState::new(&self.shape);
     }
+
+    /// The host half of a resume snapshot: the token history and the host ring mirror.
+    pub(in crate::family) fn state_parts(&self) -> (&[u32], &[f32]) {
+        (self.state.history(), self.state.ring_values())
+    }
+
+    /// Installs a saved host half, as a prefix restore brings the feed back to a boundary.
+    pub(in crate::family) fn resume(
+        &mut self,
+        history: &[u32],
+        ring: &[f32],
+    ) -> Result<(), EngError> {
+        self.state.resume(history, ring)
+    }
 }
 
 #[cfg(test)]

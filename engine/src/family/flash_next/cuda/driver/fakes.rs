@@ -6,6 +6,7 @@
 
 use std::ops::Range;
 
+use super::super::driver::StateSlot;
 use super::{DriverShape, StartVectors, TokenDevice, TokenFeeds, chunk::ChunkDevice};
 use crate::family::flash_next::cuda::ple_feed::PleKeyValue;
 use crate::{
@@ -41,6 +42,8 @@ pub(in crate::family::flash_next::cuda) struct FakeDevice {
     /// Every call, in order.
     pub(in crate::family::flash_next::cuda) log: Vec<String>,
     pub(in crate::family::flash_next::cuda) stream: Vec<f32>,
+    /// The fixed-state image a resume reads and installs (one blob; the fake has no slots).
+    pub(in crate::family::flash_next::cuda) fixed: Vec<u8>,
     /// The call that fails (its log name), once.
     pub(in crate::family::flash_next::cuda) fail: Option<&'static str>,
     pub(in crate::family::flash_next::cuda) resets: usize,
@@ -120,6 +123,21 @@ impl TokenDevice for FakeDevice {
     }
 }
 
+impl super::StateIo for FakeDevice {
+    fn read_fixed_state(&self) -> Result<Vec<(StateSlot, Vec<u8>)>, EngError> {
+        Ok(vec![(StateSlot::PleRing, self.fixed.clone())])
+    }
+
+    fn write_fixed_state(&mut self, parts: &[(StateSlot, Vec<u8>)]) -> Result<(), EngError> {
+        let Some((_, bytes)) = parts.first() else {
+            return Ok(());
+        };
+        self.fixed = bytes.clone();
+        self.log.push("state_write".to_string());
+        Ok(())
+    }
+}
+
 /// The chunk fake: `m` rows of the stream; layer `l` at position `p` adds `l + 1 + p + row` to
 /// every value of row `row`, so a row carries its own index and the PLE roundtrip is checkable
 /// per row. The logits row follows the LAST row, as the head does.
@@ -133,6 +151,8 @@ pub(in crate::family::flash_next::cuda) struct FakeChunkDevice {
     /// The call that fails (its log name), once.
     pub(in crate::family::flash_next::cuda) fail: Option<&'static str>,
     pub(in crate::family::flash_next::cuda) resets: usize,
+    /// The last state the resume seam wrote back, as read.
+    pub(in crate::family::flash_next::cuda) state: Vec<(StateSlot, Vec<u8>)>,
 }
 
 impl FakeChunkDevice {
@@ -146,6 +166,19 @@ impl FakeChunkDevice {
                 message: format!("{name} failed"),
             });
         }
+        Ok(())
+    }
+}
+
+impl super::StateIo for FakeChunkDevice {
+    fn read_fixed_state(&self) -> Result<Vec<(StateSlot, Vec<u8>)>, EngError> {
+        // read takes &self, so no log step here — the log is only for the mutable calls.
+        Ok(self.state.clone())
+    }
+
+    fn write_fixed_state(&mut self, parts: &[(StateSlot, Vec<u8>)]) -> Result<(), EngError> {
+        self.step("write_fixed_state", String::new())?;
+        self.state = parts.to_vec();
         Ok(())
     }
 }

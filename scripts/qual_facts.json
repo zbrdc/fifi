@@ -16,8 +16,8 @@
   "targets": {
     "lib": {
       "path": "src/lib.rs",
-      "test_fns": 6753,
-      "ignored": 601,
+      "test_fns": 6761,
+      "ignored": 603,
       "env_gates": [
         "CUDA_MODULE_LOADING",
         "DEFAULT_ON_CHILD",
@@ -246,6 +246,7 @@
         "INFERENCE_FLASH_NEXT_DRAIN_TICK",
         "INFERENCE_FLASH_NEXT_PLE_DEVICE",
         "INFERENCE_FLASH_NEXT_PLE_THREADS",
+        "INFERENCE_FLASH_NEXT_PREFIX_RESUME",
         "INFERENCE_FLASH_NEXT_PROFILE",
         "INFERENCE_FLASH_NEXT_RING_BUDGET",
         "INFERENCE_GEMMA_MATVEC_FIXTURES",

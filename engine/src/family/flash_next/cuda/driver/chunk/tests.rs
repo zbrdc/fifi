@@ -134,6 +134,32 @@ fn an_empty_chunk_and_an_out_of_range_token_change_nothing() {
 }
 
 #[test]
+fn the_generation_advances_at_the_attempt_of_a_fresh_sequence() {
+    // The serve driver is the chunk driver, so the generation guard is proven here too:
+    // the bump lands BEFORE the queue call, so a FAILED first chunk (device work may still
+    // have written rows) already invalidates older snapshots, and every fresh sequence
+    // after a reset bumps again — the generation survives resets by design.
+    use crate::family::flash_next::cuda::driver::ResumesState;
+
+    let device = FakeChunkDevice {
+        fail: Some("layers"),
+        ..FakeChunkDevice::default()
+    };
+    let mut driver = ChunkDriver::new(device, FakeFeeds::default(), shape()).unwrap();
+    assert_eq!(driver.resume_generation(), 0);
+    assert!(driver.run_chunk(&[3, 4], false).is_err());
+    // The attempt itself advanced the generation although the chunk never landed.
+    assert_eq!(driver.resume_generation(), 1);
+    assert_eq!(driver.fed(), 0);
+
+    driver.reset().unwrap();
+    driver.run_chunk(&[2, 3], false).unwrap();
+    // A fresh sequence after the reset advanced it again.
+    assert_eq!(driver.resume_generation(), 2);
+    assert_eq!(driver.fed(), 2);
+}
+
+#[test]
 fn a_failure_after_the_first_write_poisons_until_reset() {
     let device = FakeChunkDevice {
         fail: Some("layers"),

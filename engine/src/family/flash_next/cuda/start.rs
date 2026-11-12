@@ -37,7 +37,9 @@ use super::{
     bank_source::PackRecordSource,
     device::{CardChunkDevice, CardDevice},
     driver::chunk::ChunkDriver,
-    driver::{DriverShape, StepperPositions, TokenDriver, TokenTimes},
+    driver::{
+        DriverShape, ResumeSnapshot, ResumesState, StepperPositions, TokenDriver, TokenTimes,
+    },
     executor::{CudaRules, FlashCudaExecutor},
     feeds::StartShape,
     feeds::device::{DevicePle, PleUpload},
@@ -828,6 +830,29 @@ impl StepperPositions for StepDriver {
         match self {
             Self::Token(driver) => driver.positions(),
             Self::Chunk(driver) => driver.positions(),
+        }
+    }
+}
+
+impl ResumesState for StepDriver {
+    fn resume_generation(&self) -> u64 {
+        match self {
+            Self::Token(driver) => driver.resume_generation(),
+            Self::Chunk(driver) => driver.resume_generation(),
+        }
+    }
+
+    fn save_resume(&self) -> Result<ResumeSnapshot, EngError> {
+        match self {
+            Self::Token(driver) => driver.save_resume(),
+            Self::Chunk(driver) => driver.save_resume(),
+        }
+    }
+
+    fn restore_resume(&mut self, snapshot: &ResumeSnapshot) -> Result<(), EngError> {
+        match self {
+            Self::Token(driver) => driver.restore_resume(snapshot),
+            Self::Chunk(driver) => driver.restore_resume(snapshot),
         }
     }
 }

@@ -162,19 +162,74 @@ impl<'a> FlashStep<'a> {
     /// Zeroes the persistent state (the recurrent states, the rings, the caches) and clears the
     /// poison: a new sequence. The device has no memset wrapper yet, so the zeros go over in chunks
     /// of 16 MiB; a state of 6 GiB (a 262,144-position context) takes about half a second.
+    ///
+    /// With the prefix-resume switch armed, only the fixed state is zeroed (the recurrent
+    /// states, the conv rings, the PLE ring, the words and the raw-key ring): the QSA planes and
+    /// the indexer keys stay in place for a restore to rewind the valid length onto (see
+    /// [`StatePlan::is_position_state`] for why a fresh sequence never observes them).
     pub(super) fn reset(&self) -> Result<(), EngError> {
         let zeros = vec![0u8; 1 << 24];
-        let mut at = 0usize;
-        let total = self.state.bytes();
-        while at < total {
-            let len = zeros.len().min(total - at);
-            self.state
-                .buffer()
-                .write_at(self.stream, at, &zeros[..len])?;
-            at += len;
+        let ranges: Vec<(usize, usize)> = if crate::family::flash_next::cuda::resume::on() {
+            self.state_plan
+                .slots()
+                .iter()
+                .filter(|&&(slot, _)| !StatePlan::is_position_state(slot))
+                .filter_map(|&(slot, _)| self.state_plan.placement(slot))
+                .collect()
+        } else {
+            vec![(0, self.state.bytes())]
+        };
+        for (start, bytes) in ranges {
+            let mut at = start;
+            let end = start
+                .checked_add(bytes)
+                .ok_or_else(|| refuse("state arena offset overflows".into()))?;
+            while at < end {
+                let len = zeros.len().min(end - at);
+                self.state
+                    .buffer()
+                    .write_at(self.stream, at, &zeros[..len])?;
+                at += len;
+            }
         }
         self.poisoned.set(false);
         Ok(())
+    }
+
+    /// Reads `slot` of the persistent state back as raw little-endian bytes, behind the queued
+    /// work. The prefix-resume snapshot is built from these.
+    pub(super) fn read_state_bytes(&self, slot: StateSlot) -> Result<Vec<u8>, EngError> {
+        let range = self.state_slot(slot)?;
+        let (_, bytes) = self
+            .state_plan
+            .placement(slot)
+            .ok_or_else(|| refuse(format!("the state has no slot {slot:?}")))?;
+        let mut out = vec![0u8; bytes];
+        range
+            .buffer()
+            .read_at(self.stream, range.offset(), &mut out)?;
+        Ok(out)
+    }
+
+    /// Writes `slot` of the persistent state from raw bytes, ordered before the next launch.
+    /// A prefix restore installs its snapshot through these.
+    pub(super) fn write_state_bytes(
+        &mut self,
+        slot: StateSlot,
+        bytes: &[u8],
+    ) -> Result<(), EngError> {
+        let range = self.state_slot(slot)?;
+        let (_, want) = self
+            .state_plan
+            .placement(slot)
+            .ok_or_else(|| refuse(format!("the state has no slot {slot:?}")))?;
+        if bytes.len() != want {
+            return Err(refuse(format!(
+                "the state slot {slot:?} holds {want} bytes, not {}",
+                bytes.len()
+            )));
+        }
+        range.buffer().write_at(self.stream, range.offset(), bytes)
     }
 
     /// Refuses while the step is poisoned.
@@ -250,6 +305,28 @@ impl<'a> FlashStep<'a> {
     /// The offset of `slot` in the step arena buffer.
     pub(super) fn slot_offset(&self, slot: Slot) -> Result<usize, EngError> {
         Ok(self.slot(slot)?.offset())
+    }
+
+    /// Reads every copied slot of the persistent state (see [`StatePlan::is_position_state"])
+    /// as raw bytes, behind the queued work: the prefix-resume snapshot.
+    pub(super) fn read_fixed_state(&self) -> Result<Vec<(StateSlot, Vec<u8>)>, EngError> {
+        self.state_plan
+            .slots()
+            .iter()
+            .filter(|&&(slot, _)| !StatePlan::is_position_state(slot))
+            .map(|&(slot, _)| Ok((slot, self.read_state_bytes(slot)?)))
+            .collect()
+    }
+
+    /// Installs a snapshot's copied slots, ordered before the next launch.
+    pub(super) fn write_fixed_state(
+        &mut self,
+        parts: &[(StateSlot, Vec<u8>)],
+    ) -> Result<(), EngError> {
+        for (slot, bytes) in parts {
+            self.write_state_bytes(*slot, bytes)?;
+        }
+        Ok(())
     }
 
     // ------------------------------------------------------------------ weights

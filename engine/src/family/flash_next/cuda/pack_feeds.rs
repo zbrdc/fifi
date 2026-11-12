@@ -103,6 +103,15 @@ impl TokenFeeds for PackFeeds {
         self.pending.clear();
         self.ple.reset();
     }
+
+    fn ple_state(&self) -> Option<(&[u32], &[f32])> {
+        Some(self.ple.state_parts())
+    }
+
+    fn ple_resume(&mut self, history: &[u32], ring: &[f32]) -> Result<(), EngError> {
+        self.pending.clear();
+        self.ple.resume(history, ring)
+    }
 }
 
 #[cfg(test)]
