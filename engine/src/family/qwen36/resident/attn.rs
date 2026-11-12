@@ -302,8 +302,8 @@ fn share_q8(side: &Q8Tensor) -> Q8Tensor {
 /// quantum law about 68 MB at depth 8,192 in the F32 form (33.5 MB old + 34.6 MB new);
 /// under `Q36_KV_GEOMETRIC=1` about 101 MB at the 8,192-to-16,384 doubling (33.5 MB old
 /// + 67.1 MB new) and about 1.6 GB at the 128K-to-256K doubling (0.54 GB old + 1.07 GB
-/// new)), which the
-/// session reserve margin and the retire cap cover.
+///   new)), which the
+///   session reserve margin and the retire cap cover.
 pub(super) fn growth_bytes(
     shape: &HostShape,
     kv: KvDtype,
