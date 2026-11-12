@@ -33,6 +33,7 @@ pub mod quantization;
     reason = "the Q36 host reference serves later work; until it lands, only tests and the Mac reference run call it"
 )]
 pub mod qwen36;
+pub mod raon1;
 pub mod recurrent;
 pub mod route;
 #[allow(

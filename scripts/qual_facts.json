@@ -16,7 +16,7 @@
   "targets": {
     "lib": {
       "path": "src/lib.rs",
-      "test_fns": 6779,
+      "test_fns": 6799,
       "ignored": 604,
       "env_gates": [
         "CUDA_MODULE_LOADING",
@@ -343,6 +343,7 @@
         "Q8_TILED_WRITER_ROUTE_PROBE",
         "QWEN36_G2A_COMPILE",
         "QWEN36_ORACLE_DIR",
+        "RAON_Q4_KM",
         "RD4A_FIXTURES",
         "RD7A_FIXTURES",
         "TCAP_STRESS_DEADLINE_SECS",
