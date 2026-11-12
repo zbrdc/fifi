@@ -13,6 +13,10 @@ fn chunk_driver() -> ChunkDriver<FakeChunkDevice, FakeFeeds> {
     ChunkDriver::new(FakeChunkDevice::default(), FakeFeeds::default(), shape()).unwrap()
 }
 
+/// The route counters are process globals: every test that reads them serialises here, so an
+/// interleaved `run_chunk` of another test cannot add to a read.
+static ROUTE_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 #[test]
 fn a_fed_chunk_runs_the_start_the_layers_around_one_ple_roundtrip_and_no_head() {
     let mut driver = chunk_driver();
@@ -298,4 +302,70 @@ fn a_boundary_drains_before_it_charges_the_slot_and_only_under_both_switches() {
     .unwrap_err();
     assert!(matches!(error, EngError::Backend { .. }));
     assert!(none.is_empty());
+}
+
+#[test]
+fn the_host_batch_route_projects_the_chunk_and_hands_each_row_its_pair() {
+    use crate::family::flash_next::cuda::ple_feed::{HostMatrix, HostProjection};
+
+    // Key matrix value i is i % PLE_EMBED, so row 0 holds 0,1,2 and its dot with the fake's
+    // [t; PLE_EMBED] embedding is 3t: token 3 projects 9, token 4 projects 12. The value matrix
+    // is constant 0.25 and never reaches `pairs` (only the first key is recorded).
+    let key = (0..6 * fakes::PLE_EMBED)
+        .map(|i| (i % fakes::PLE_EMBED) as f32)
+        .collect::<Vec<_>>();
+    let value = vec![0.25; 3 * fakes::PLE_EMBED];
+    let projection = HostProjection::new(
+        HostMatrix::new(6, fakes::PLE_EMBED, key).unwrap(),
+        HostMatrix::new(3, fakes::PLE_EMBED, value).unwrap(),
+        2,
+    );
+    let mut driver = chunk_driver();
+    driver.ple_host_batch = Some(Box::new(projection));
+    let _guard = ROUTE_LOCK.lock().unwrap();
+    super::prof::reset_route_counters();
+    driver.run_chunk(&[3, 4], false).unwrap();
+    // The fake's `begin` embeds each token as [token; PLE_EMBED]: key row 0 holds 0..3
+    // (sum 3), so token t's first key is 3t — the pairs were projected and set in order.
+    assert_eq!(driver.feeds().pairs, [9.0, 12.0]);
+    // A two-row chunk on a two-thread projection takes the product route.
+    assert_eq!(super::prof::route_counters(), (1, 0));
+    // Everything else ran exactly as the per-row route: same log, same updates.
+    let mut plain = chunk_driver();
+    plain.run_chunk(&[3, 4], false).unwrap();
+    assert_eq!(driver.device().log, plain.device().log);
+    assert_eq!(driver.feeds().updates, plain.feeds().updates);
+}
+
+#[test]
+fn a_one_row_chunk_takes_the_per_row_projections_not_the_product() {
+    use crate::family::flash_next::cuda::ple_feed::{HostMatrix, HostProjection};
+
+    let _guard = ROUTE_LOCK.lock().unwrap();
+
+    let key = (0..6 * fakes::PLE_EMBED)
+        .map(|i| (i % fakes::PLE_EMBED) as f32)
+        .collect::<Vec<_>>();
+    let value = vec![0.25; 3 * fakes::PLE_EMBED];
+    // Two projection threads: a one-row chunk is narrower than them, so it must keep the
+    // per-row projections — a one-row product would sweep the weights on a single thread.
+    let projection = HostProjection::new(
+        HostMatrix::new(6, fakes::PLE_EMBED, key).unwrap(),
+        HostMatrix::new(3, fakes::PLE_EMBED, value).unwrap(),
+        2,
+    );
+    let mut driver = chunk_driver();
+    driver.ple_host_batch = Some(Box::new(projection));
+    super::prof::reset_route_counters();
+    driver.run_chunk(&[3], false).unwrap();
+    assert_eq!(
+        super::prof::route_counters(),
+        (0, 1),
+        "a one-row chunk must not run the chunk product"
+    );
+    // The narrow chunk still gets its projected pair, same as the product route would give.
+    assert_eq!(driver.feeds().pairs, [9.0]);
+    // The wide chunk on the same driver flips to the product: one product, no extra rows.
+    driver.run_chunk(&[3, 4], false).unwrap();
+    assert_eq!(super::prof::route_counters(), (1, 1));
 }

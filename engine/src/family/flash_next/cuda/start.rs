@@ -105,6 +105,22 @@ fn ple_device() -> Result<bool, EngError> {
     }
 }
 
+/// Whether chunked prefill batches its two PLE host projections into one blocked product per
+/// chunk (`INFERENCE_FLASH_NEXT_PLE_BATCH=1` opts in): the chunk's embeddings project at once —
+/// the 131 MB of weight matrices stream once per token block instead of once per token — and
+/// each row's pair then feeds the unchanged host step through the fixed projection, so the
+/// numbers stay bit-identical to the per-token path. Strict: any set value other than `1` is
+/// refused.
+fn ple_batch() -> Result<bool, EngError> {
+    match std::env::var("INFERENCE_FLASH_NEXT_PLE_BATCH") {
+        Ok(text) if text == "1" => Ok(true),
+        Ok(_) => Err(EngError::BadRequest(
+            "INFERENCE_FLASH_NEXT_PLE_BATCH must be unset or \"1\"".into(),
+        )),
+        Err(_) => Ok(false),
+    }
+}
+
 /// The id-indexed options Flash-Next serves its routed experts with: the DP4A decode of codebook 2
 /// (the codebook of this pack), one launch for the 20 gate and up pairs of ten picks, and the
 /// pipelined tile loop on: it writes the bytes of the default launches and the serve A/B
@@ -687,6 +703,9 @@ pub(super) fn build_driver(
     let model_layers: Vec<usize> = (0..layers).collect();
     let moe = SplitMoeAt::new(block, &model_layers)?;
 
+    // The batch flag is read before the 131 MB of projection weights, so a refused value
+    // fails fast instead of after the upload-scale read.
+    let batch_switch = ple_batch()?;
     stage("opening the n-gram table");
     let (vectors, projection) = PleVectors::read(
         &checkpoint.source,
@@ -724,15 +743,49 @@ pub(super) fn build_driver(
         }
         None => None,
     };
-    let ple = if device_ple.is_some() {
-        PleFeed::with_fixed(
-            model.ple,
-            ngram_rows,
-            vectors,
-            Rc::new(FixedProjection::new()),
+    // The batch host route (chunked prefill only, no device route): the feed takes precomputed
+    // pairs from one blocked product per chunk; the projection runs that product.
+    let batch_ple = match batch_switch.then_some(rows > 1) {
+        Some(true) if device_ple.is_none() => true,
+        Some(_) => {
+            if device_ple.is_none() {
+                eprintln!(
+                    "flash-next cuda: INFERENCE_FLASH_NEXT_PLE_BATCH ignored (prefill rows = 1)"
+                );
+            } else {
+                eprintln!(
+                    "flash-next cuda: INFERENCE_FLASH_NEXT_PLE_BATCH ignored (PLE_DEVICE route)"
+                );
+            }
+            false
+        }
+        None => false,
+    };
+    let (ple, ple_host_batch) = if device_ple.is_some() {
+        (
+            PleFeed::with_fixed(
+                model.ple,
+                ngram_rows,
+                vectors,
+                Rc::new(FixedProjection::new()),
+            ),
+            None,
+        )
+    } else if batch_ple {
+        (
+            PleFeed::with_fixed(
+                model.ple,
+                ngram_rows,
+                vectors,
+                Rc::new(FixedProjection::new()),
+            ),
+            Some(Box::new(projection)),
         )
     } else {
-        PleFeed::new(model.ple, ngram_rows, vectors, Box::new(projection))
+        (
+            PleFeed::new(model.ple, ngram_rows, vectors, Box::new(projection)),
+            None,
+        )
     };
     let hidden = model.hyper.hidden();
     let branches = model.hyper.branches();
@@ -758,14 +811,17 @@ pub(super) fn build_driver(
         )?;
         chunked.chunk_cap = rows;
         chunked.ple_device = ple_on_card;
+        let route_note = if ple_on_card {
+            ", PLE projections on the card"
+        } else if ple_host_batch.is_some() {
+            ", PLE projections batched on the host"
+        } else {
+            ""
+        };
+        chunked.ple_host_batch = ple_host_batch;
         eprintln!(
-            "flash-next cuda: ready in {:.1} s, prefill chunks of {rows} rows{}",
+            "flash-next cuda: ready in {:.1} s, prefill chunks of {rows} rows{route_note}",
             began.elapsed().as_secs_f64(),
-            if ple_on_card {
-                ", PLE projections on the card"
-            } else {
-                ""
-            }
         );
         StepDriver::Chunk(chunked)
     } else {

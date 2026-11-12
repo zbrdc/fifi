@@ -32,7 +32,7 @@ use std::time::Instant;
 
 use super::{DriverShape, ResumeSnapshot, TokenFeeds};
 use crate::EngError;
-use crate::family::flash_next::cuda::ple_feed::PleKeyValue;
+use crate::family::flash_next::cuda::ple_feed::{HostProjection, PleKeyValue, PleProjection};
 use crate::family::session::TokenStepper;
 
 type Result<T> = std::result::Result<T, EngError>;
@@ -95,7 +95,27 @@ pub(in crate::family::flash_next) mod prof {
     ];
     pub(super) static NS: [AtomicU64; 43] = [const { AtomicU64::new(0) }; 43];
     pub(super) static ROWS: AtomicU64 = AtomicU64::new(0);
+    /// Chunk products the batch host route ran (m >= threads), and the rows it routed to the
+    /// per-row projections instead (m < threads, decode's one-row chunks included). Counted
+    /// unconditionally — a run proves its route only from a printed counter — but only printed
+    /// under the profile switch.
+    pub(super) static PRODUCTS: AtomicU64 = AtomicU64::new(0);
+    pub(super) static FALLBACK_ROWS: AtomicU64 = AtomicU64::new(0);
     static ON: OnceLock<bool> = OnceLock::new();
+
+    /// The route counters of this process so far, for the chunk-driver tests.
+    pub(in crate::family::flash_next) fn route_counters() -> (u64, u64) {
+        (
+            PRODUCTS.load(AtomicOrdering::Relaxed),
+            FALLBACK_ROWS.load(AtomicOrdering::Relaxed),
+        )
+    }
+
+    /// Zeroes the route counters; tests call this so their reads are deltas.
+    pub(in crate::family::flash_next) fn reset_route_counters() {
+        PRODUCTS.store(0, AtomicOrdering::Relaxed);
+        FALLBACK_ROWS.store(0, AtomicOrdering::Relaxed);
+    }
 
     pub(in crate::family::flash_next) fn on() -> bool {
         *ON.get_or_init(|| {
@@ -209,6 +229,13 @@ pub(in crate::family::flash_next) mod prof {
             "flash-next chunk profile: {total_rows} rows, phases sum {:.1} s (the sum counts the interior slots 8-33 and the nested page-io slots 34-42 twice)",
             sum as f64 / 1e9
         );
+        let products = PRODUCTS.load(AtomicOrdering::Relaxed);
+        let fallback = FALLBACK_ROWS.load(AtomicOrdering::Relaxed);
+        if products + fallback > 0 {
+            eprintln!(
+                "flash-next chunk profile: {products} chunk products, {fallback} per-row projection rows (chunks narrower than the projection threads)"
+            );
+        }
         if let Some((up, down)) = crate::kernels::page_io_block::take() {
             eprintln!(
                 "flash-next chunk profile: page-io blocked: uploads {:.0} ms, readbacks {:.0} ms",
@@ -220,6 +247,8 @@ pub(in crate::family::flash_next) mod prof {
             n.store(0, AtomicOrdering::Relaxed);
         }
         ROWS.store(0, AtomicOrdering::Relaxed);
+        PRODUCTS.store(0, AtomicOrdering::Relaxed);
+        FALLBACK_ROWS.store(0, AtomicOrdering::Relaxed);
     }
 }
 
@@ -325,6 +354,11 @@ pub(in crate::family::flash_next::cuda) struct ChunkDriver<D: ChunkDevice, F: To
     pub(in crate::family::flash_next::cuda) chunk_cap: usize,
     /// Whether the PLE projections run on the device (`ChunkDevice::ple_project_chunk`).
     pub(in crate::family::flash_next::cuda) ple_device: bool,
+    /// The batch host route: the projections of the whole chunk in one blocked product
+    /// (`HostProjection::project_chunk`), each row's pair then feeding the unchanged host
+    /// step through the fixed projection. `None` keeps the per-row projections of
+    /// [`TokenFeeds::ple_update`].
+    pub(in crate::family::flash_next::cuda) ple_host_batch: Option<Box<HostProjection>>,
 }
 
 impl<D: ChunkDevice, F: TokenFeeds> ChunkDriver<D, F> {
@@ -349,6 +383,7 @@ impl<D: ChunkDevice, F: TokenFeeds> ChunkDriver<D, F> {
             generation: 0,
             chunk_cap: 1,
             ple_device: false,
+            ple_host_batch: None,
         })
     }
 
@@ -462,6 +497,27 @@ impl<D: ChunkDevice, F: TokenFeeds> ChunkDriver<D, F> {
         tick(&mut self.device, 1)?;
         self.device.layers(0..shape.ple_layer, pos, m)?;
         tick(&mut self.device, 2)?;
+        // The batch host route projects the chunk's embeddings after the pre-PLE layers are
+        // queued, so the product runs while the card works (its input is the chunk's start
+        // vectors, not device output). Chunks narrower than the projection threads keep the
+        // per-row projections: a one-row product would sweep the 131 MB of weights on a single
+        // thread, while `matvec` splits the rows across all of them.
+        let host_pairs = match self.ple_host_batch.as_deref_mut() {
+            Some(host) if m >= host.threads() => {
+                prof::PRODUCTS.fetch_add(1, AtomicOrdering::Relaxed);
+                Some(host.project_chunk(&ple_rows, m)?)
+            }
+            Some(host) => {
+                let embed = shape.start.ple_embed;
+                let rows = ple_rows
+                    .chunks(embed)
+                    .map(|embedding| host.project(embedding))
+                    .collect::<Result<Vec<_>>>()?;
+                prof::FALLBACK_ROWS.fetch_add(rows.len() as u64, AtomicOrdering::Relaxed);
+                Some(rows)
+            }
+            None => None,
+        };
         let mut rows = self.device.read_stream()?;
         tick(&mut self.device, 3)?;
         let width = shape.start.stream;
@@ -477,25 +533,24 @@ impl<D: ChunkDevice, F: TokenFeeds> ChunkDriver<D, F> {
         // The device route projects the chunk's embeddings on the card (one m-row launch pair)
         // and hands each row's keys/value to the host step, which then runs unchanged; the host
         // route runs its own projections inside `ple_update`.
-        let pairs = if self.ple_device {
+        let mut pairs = (if self.ple_device {
             Some(self.device.ple_project_chunk()?)
         } else {
-            None
-        };
-        for (i, token) in tokens.iter().enumerate() {
-            if let Some(pair) = pairs.as_ref().and_then(|p| p.get(i)) {
-                self.feeds.set_ple_pair(pair.clone())?;
+            host_pairs
+        })
+        .map(IntoIterator::into_iter);
+        for (token, row) in tokens.iter().zip(rows.chunks_mut(width)) {
+            if let Some(pair) = pairs.as_mut().and_then(std::iter::Iterator::next) {
+                self.feeds.set_ple_pair(pair)?;
             }
-            let update = self
-                .feeds
-                .ple_update(*token, &rows[i * width..(i + 1) * width])?;
+            let update = self.feeds.ple_update(*token, row)?;
             if update.len() != width {
                 return Err(EngError::BadRequest(format!(
                     "Flash-Next chunk driver: the PLE update has {} values for a stream of {width}",
                     update.len()
                 )));
             }
-            for (value, delta) in rows[i * width..(i + 1) * width].iter_mut().zip(&update) {
+            for (value, delta) in row.iter_mut().zip(&update) {
                 *value += delta;
             }
         }

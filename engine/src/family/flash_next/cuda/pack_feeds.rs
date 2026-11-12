@@ -71,15 +71,7 @@ impl TokenFeeds for PackFeeds {
         let mut pending = Vec::with_capacity(tokens.len());
         for (i, &token) in tokens.iter().enumerate() {
             let stream = stream_row(self.source, token, self.hidden, self.branches)?;
-            let plan = self.ple.plan_after(&tokens[..i], token)?;
-            let rows = self.ple.gather(&plan)?;
-            let mut ple_embedding = Vec::new();
-            for &(_, local) in &plan.rows {
-                let values = rows.get(u64::from(local)).ok_or_else(|| {
-                    EngError::BadRequest(format!("n-gram row {local} was not gathered"))
-                })?;
-                ple_embedding.extend_from_slice(values);
-            }
+            let (ple_embedding, rows) = self.ple.chunk_embedding(&tokens[..i], token)?;
             starts.push(StartVectors {
                 stream,
                 ple_embedding,

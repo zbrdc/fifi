@@ -40,6 +40,10 @@ use crate::{
 /// The scale of the n-gram rows in the step. The EXL3 table has none (see the module doc).
 const WEIGHT_SCALE: f32 = 1.0;
 
+// The batch route projects the packed start embeddings unscaled; `ple::step` scales its own
+// rows by `WEIGHT_SCALE`. They agree only while the constant is one.
+const _: () = assert!(WEIGHT_SCALE == 1.0);
+
 fn le_i64(bytes: &[u8], what: &str) -> Result<Vec<i64>, EngError> {
     let (words, rest) = bytes.as_chunks::<8>();
     if !rest.is_empty() {
@@ -212,6 +216,123 @@ impl HostProjection {
             value,
             threads,
         }
+    }
+
+    /// The thread count the chunk driver thresholds its small-chunk fallback against.
+    pub(in crate::family) fn threads(&self) -> usize {
+        self.threads
+    }
+
+    /// One weight row dotted against four embeddings with the four folds interleaved. Each
+    /// sum still adds its products in index order starting from `-0.0` — the identity `Sum for
+    /// f32` folds from, which [`HostMatrix::matvec`]'s `.sum()` therefore uses — so the values
+    /// are bit-identical, an all-`-0.0` row included; only the interleaving differs, and the
+    /// fold order cannot see it. Interleaving breaks the dependent-add chain that otherwise
+    /// pins one dot to one add per weight load.
+    fn row_dots(weights: &[f32], quad: [&[f32]; 4], embed: usize) -> [f32; 4] {
+        let mut sums = [-0.0f32; 4];
+        for column in 0..embed {
+            let weight = weights[column];
+            sums[0] += weight * quad[0][column];
+            sums[1] += weight * quad[1][column];
+            sums[2] += weight * quad[2][column];
+            sums[3] += weight * quad[3][column];
+        }
+        sums
+    }
+
+    /// Tokens a blocked product computes against one weight row before the next weight row
+    /// streams in. A block's embeddings stay in cache while the 131 MB of weights sweep once
+    /// per block; bigger blocks mean fewer sweeps and more residency.
+    const BLOCK: usize = 32;
+
+    /// Tokens one [`Self::row_dots`] call interleaves. Four independent folds give the
+    /// scheduler four adds per weight load instead of one dependent chain.
+    const UNROLL: usize = 4;
+
+    /// The projections of a whole chunk in one product: `rows` embeddings of `key.cols`
+    /// values each, flattened. The token runs split over the projection threads (whole rows
+    /// per thread, so no two threads share an output element); inside a run the tokens go
+    /// [`Self::BLOCK`] at a time and each weight row serves the whole block while hot, so the
+    /// weights stream once per block instead of once per token. Every output element folds its
+    /// dot exactly as [`HostMatrix::matvec`] does — the same sequential `sum` over the same
+    /// products — so the pairs are bit-identical to per-token [`PleProjection::project`] calls.
+    pub(in crate::family) fn project_chunk(
+        &self,
+        embeddings: &[f32],
+        rows: usize,
+    ) -> Result<Vec<PleKeyValue>, EngError> {
+        let embed = self.key.cols;
+        if self.value.cols != embed {
+            return Err(EngError::Checkpoint(format!(
+                "PLE projections disagree on the embedding: key {embed} values, value {}",
+                self.value.cols
+            )));
+        }
+        if embeddings.len() != rows * embed {
+            return Err(EngError::BadRequest(format!(
+                "PLE chunk projection input has {} values, expected {rows} rows of {embed}",
+                embeddings.len()
+            )));
+        }
+        let mut out: Vec<PleKeyValue> = (0..rows)
+            .map(|_| PleKeyValue {
+                keys: vec![0.0; self.key.rows],
+                value: vec![0.0; self.value.rows],
+            })
+            .collect();
+        let run = rows.div_ceil(self.threads.max(1)).max(1);
+        std::thread::scope(|scope| {
+            for (index, part) in out.chunks_mut(run).enumerate() {
+                let (key, value) = (&self.key, &self.value);
+                let first = index * run;
+                scope.spawn(move || {
+                    let embedding = |token: usize| &embeddings[token * embed..(token + 1) * embed];
+                    let last = rows - 1;
+                    let quad_at = |base: usize| {
+                        [
+                            embedding(base.min(last)),
+                            embedding((base + 1).min(last)),
+                            embedding((base + 2).min(last)),
+                            embedding((base + 3).min(last)),
+                        ]
+                    };
+                    let mut start = 0;
+                    while start < part.len() {
+                        let end = (start + Self::BLOCK).min(part.len());
+                        let block = &mut part[start..end];
+                        for row in 0..key.rows {
+                            let weights = &key.data[row * embed..(row + 1) * embed];
+                            for (group, slots) in block.chunks_mut(Self::UNROLL).enumerate() {
+                                let sums = Self::row_dots(
+                                    weights,
+                                    quad_at(first + start + group * Self::UNROLL),
+                                    embed,
+                                );
+                                for (sum, pair) in sums.iter().zip(slots.iter_mut()) {
+                                    pair.keys[row] = *sum;
+                                }
+                            }
+                        }
+                        for row in 0..value.rows {
+                            let weights = &value.data[row * embed..(row + 1) * embed];
+                            for (group, slots) in block.chunks_mut(Self::UNROLL).enumerate() {
+                                let sums = Self::row_dots(
+                                    weights,
+                                    quad_at(first + start + group * Self::UNROLL),
+                                    embed,
+                                );
+                                for (sum, pair) in sums.iter().zip(slots.iter_mut()) {
+                                    pair.value[row] = *sum;
+                                }
+                            }
+                        }
+                        start = end;
+                    }
+                });
+            }
+        });
+        Ok(out)
     }
 }
 
@@ -548,6 +669,30 @@ impl PleFeed {
     /// Reads and decodes the rows of `plan` (see [`NgramRows::gather`]).
     pub(in crate::family) fn gather(&self, plan: &RowPlan) -> Result<Gathered, EngError> {
         self.rows.gather(plan)
+    }
+
+    /// The PLE embedding of `token` as the chunk feeds assemble it: planned against the
+    /// history it will have when its turn comes (the `prefix` tokens before it in the
+    /// chunk), gathered, and the gathered rows concatenated in plan order. Returns the
+    /// gathered rows too — `pack_feeds::begin_chunk` keeps them pending for the update
+    /// pass. The per-token step projects the same values (its own `plan` + `gather`, the
+    /// rows unscaled while `WEIGHT_SCALE` is one); the chunk-embeddings test pins the two
+    /// assemblies together bit for bit.
+    pub(in crate::family) fn chunk_embedding(
+        &self,
+        prefix: &[u32],
+        token: u32,
+    ) -> Result<(Vec<f32>, Gathered), EngError> {
+        let plan = self.plan_after(prefix, token)?;
+        let rows = self.gather(&plan)?;
+        let mut embedding = Vec::new();
+        for &(_, local) in &plan.rows {
+            let row = rows.get(u64::from(local)).ok_or_else(|| {
+                EngError::BadRequest(format!("n-gram row {local} was not gathered"))
+            })?;
+            embedding.extend_from_slice(row);
+        }
+        Ok((embedding, rows))
     }
 
     /// The residual update of `token`: `stream` is the residual stream (`branches * hidden`) at the

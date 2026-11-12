@@ -11,10 +11,12 @@
 //!   from the 30 GiB table, and the real PLE projections of layer 1 run through the feed.
 
 use std::path::Path;
+use std::rc::Rc;
+use std::sync::{Arc, Mutex};
 
 use super::{
-    Gathered, HostMatrix, HostProjection, NgramRows, PleFeed, PleKeyValue, PleProjection,
-    PleVectors,
+    FixedProjection, Gathered, HostMatrix, HostProjection, NgramRows, PleFeed, PleKeyValue,
+    PleProjection, PleVectors,
 };
 use crate::{
     EngError,
@@ -403,4 +405,221 @@ fn the_projection_route_is_called_once_per_update_and_its_failure_is_not_applied
     let gathered = failing.gather(&plan).unwrap();
     assert!(failing.update(PROMPT[0], &gathered, &stream).is_err());
     assert!(failing.state.history().is_empty());
+}
+
+/// A route that records each embedding the step projects, then delegates.
+struct Capturing {
+    inner: HostProjection,
+    seen: Arc<Mutex<Vec<Vec<f32>>>>,
+}
+
+impl PleProjection for Capturing {
+    fn project(&mut self, embedding: &[f32]) -> Result<PleKeyValue, EngError> {
+        self.seen.lock().unwrap().push(embedding.to_vec());
+        self.inner.project(embedding)
+    }
+}
+
+#[test]
+fn the_chunk_product_is_bit_identical_to_the_per_token_projections() {
+    let shape = PleShape::new(dims(8)).unwrap();
+    let embed = shape.embed();
+    let (hidden, width) = (8, BRANCHES * 8);
+    for (threads, rows) in [(1, 1), (1, 37), (1, 40), (3, 70), (8, 129)] {
+        let build = || {
+            HostProjection::new(
+                HostMatrix::new(width, embed, values(width * embed, 1, 0.05)).unwrap(),
+                HostMatrix::new(hidden, embed, values(hidden * embed, 2, 0.05)).unwrap(),
+                threads,
+            )
+        };
+        let projection = build();
+        let mut per_token = build();
+        let embeddings = values(rows * embed, 7, 1.0);
+        let chunk = projection.project_chunk(&embeddings, rows).unwrap();
+        assert_eq!(chunk.len(), rows);
+        for (token, pair) in chunk.iter().enumerate() {
+            let want = per_token
+                .project(&embeddings[token * embed..(token + 1) * embed])
+                .unwrap();
+            assert!(
+                pair.keys
+                    .iter()
+                    .zip(&want.keys)
+                    .all(|(a, b)| a.to_bits() == b.to_bits()),
+                "threads {threads}, row {token}: keys"
+            );
+            assert!(
+                pair.value
+                    .iter()
+                    .zip(&want.value)
+                    .all(|(a, b)| a.to_bits() == b.to_bits()),
+                "threads {threads}, row {token}: value"
+            );
+        }
+    }
+    // A short input is refused without running.
+    let shape_embed = PleShape::new(dims(8)).unwrap().embed();
+    let projection = HostProjection::new(
+        HostMatrix::new(
+            BRANCHES * 8,
+            shape_embed,
+            values(BRANCHES * 8 * shape_embed, 1, 0.05),
+        )
+        .unwrap(),
+        HostMatrix::new(8, shape_embed, values(8 * shape_embed, 2, 0.05)).unwrap(),
+        3,
+    );
+    let short = values(2 * shape_embed - 1, 7, 1.0);
+    assert!(matches!(
+        projection.project_chunk(&short, 2),
+        Err(EngError::BadRequest(_))
+    ));
+}
+
+#[test]
+fn the_batched_chunk_equals_the_per_token_steps_on_the_recorded_rows() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("ngram_embedding.safetensors");
+    write_table(&path);
+    let open = || NgramFile::open(&path, &LocalGuard::new().unwrap(), KEY, LAYOUT).unwrap();
+    let shape = PleShape::new(dims(8)).unwrap();
+
+    // The reference: the live per-token route, capturing each embedding the step projects.
+    let seen = Arc::new(Mutex::new(Vec::new()));
+    let (vectors, inner) = host(&shape);
+    let route = Capturing {
+        inner,
+        seen: Arc::clone(&seen),
+    };
+    let mut reference = PleFeed::new(
+        shape,
+        NgramRows::new(open()).unwrap(),
+        vectors,
+        Box::new(route),
+    );
+    let mut per_token = Vec::new();
+    for (index, &token) in PROMPT.iter().enumerate() {
+        let plan = reference.plan(token).unwrap();
+        let gathered = reference.gather(&plan).unwrap();
+        let stream = values(BRANCHES * 8, 50 + index, 1.0);
+        per_token.push(reference.update(token, &gathered, &stream).unwrap());
+    }
+    let embeddings: Vec<f32> = seen.lock().unwrap().iter().flatten().copied().collect();
+
+    // The batch route: one product over the chunk, each row's pair set before its step.
+    let (vectors, projection) = host(&shape);
+    let fixed = Rc::new(FixedProjection::new());
+    let mut batched = PleFeed::with_fixed(
+        shape,
+        NgramRows::new(open()).unwrap(),
+        vectors,
+        Rc::clone(&fixed),
+    );
+    let pairs = projection.project_chunk(&embeddings, PROMPT.len()).unwrap();
+    for (index, (&token, pair)) in PROMPT.iter().zip(pairs).enumerate() {
+        let plan = batched.plan(token).unwrap();
+        let gathered = batched.gather(&plan).unwrap();
+        let stream = values(BRANCHES * 8, 50 + index, 1.0);
+        batched.set_fixed(pair).unwrap();
+        let update = batched.update(token, &gathered, &stream).unwrap();
+        assert!(
+            update
+                .iter()
+                .zip(&per_token[index])
+                .all(|(a, b)| a.to_bits() == b.to_bits()),
+            "row {index}: the batched update differs from the per-token step"
+        );
+    }
+}
+
+#[test]
+fn an_all_negative_zero_row_keeps_its_sign_in_the_chunk_product() {
+    // `Sum for f32` folds from -0.0, so `matvec` returns -0.0 for a row of +1 weights against
+    // an all-(-0.0) embedding; the chunk lanes must fold from the same identity, or a zeroed
+    // embedding would project to +0.0 on one path and -0.0 on the other.
+    let shape = PleShape::new(dims(8)).unwrap();
+    let embed = shape.embed();
+    let (hidden, width) = (8, BRANCHES * 8);
+    let build = || {
+        HostProjection::new(
+            HostMatrix::new(width, embed, vec![1.0f32; width * embed]).unwrap(),
+            HostMatrix::new(hidden, embed, vec![1.0f32; hidden * embed]).unwrap(),
+            3,
+        )
+    };
+    let projection = build();
+    let mut per_token = build();
+    let embeddings = vec![-0.0f32; 2 * embed];
+    let chunk = projection.project_chunk(&embeddings, 2).unwrap();
+    for row in 0..2 {
+        let want = per_token
+            .project(&embeddings[row * embed..(row + 1) * embed])
+            .unwrap();
+        assert!(
+            chunk[row]
+                .keys
+                .iter()
+                .zip(&want.keys)
+                .chain(chunk[row].value.iter().zip(&want.value))
+                .all(|(a, b)| a.to_bits() == b.to_bits()),
+            "row {row}: the chunk product lost the sign of a zero fold"
+        );
+    }
+}
+
+#[test]
+fn the_packed_chunk_embeddings_match_the_per_token_step_embeddings() {
+    // `PleFeed::chunk_embedding` is the assembly `pack_feeds::begin_chunk` builds its start
+    // vectors from (plan_after + gather + concat, unscaled); the per-token step builds its
+    // own from `plan` + `gather`. Pin the two together bit for bit — they agree because
+    // `WEIGHT_SCALE` is one and both concatenate the same gathered rows in the same order.
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("ngram_embedding.safetensors");
+    write_table(&path);
+    let open = || NgramFile::open(&path, &LocalGuard::new().unwrap(), KEY, LAYOUT).unwrap();
+    let shape = PleShape::new(dims(8)).unwrap();
+
+    let seen = Arc::new(Mutex::new(Vec::new()));
+    let (vectors, inner) = host(&shape);
+    let mut reference = PleFeed::new(
+        shape,
+        NgramRows::new(open()).unwrap(),
+        vectors,
+        Box::new(Capturing {
+            inner,
+            seen: Arc::clone(&seen),
+        }),
+    );
+    for (index, &token) in PROMPT.iter().enumerate() {
+        let plan = reference.plan(token).unwrap();
+        let gathered = reference.gather(&plan).unwrap();
+        let stream = values(BRANCHES * 8, 50 + index, 1.0);
+        reference.update(token, &gathered, &stream).unwrap();
+    }
+    let step_embeddings: Vec<Vec<f32>> = seen.lock().unwrap().clone();
+
+    let (vectors, _projection) = host(&shape);
+    let packed = PleFeed::with_fixed(
+        shape,
+        NgramRows::new(open()).unwrap(),
+        vectors,
+        Rc::new(FixedProjection::new()),
+    );
+    for (index, &token) in PROMPT.iter().enumerate() {
+        // Row i plans against the tokens before it in the chunk, as begin_chunk feeds it.
+        let (ple_embedding, _rows) = packed.chunk_embedding(&PROMPT[..index], token).unwrap();
+        assert_eq!(
+            ple_embedding.len(),
+            step_embeddings[index].len(),
+            "row {index}"
+        );
+        assert!(
+            ple_embedding
+                .iter()
+                .zip(&step_embeddings[index])
+                .all(|(a, b)| a.to_bits() == b.to_bits()),
+            "row {index}: the packed embedding differs from the one the step projects"
+        );
+    }
 }
