@@ -637,6 +637,13 @@ impl<D: ChunkDevice + super::StateIo, F: TokenFeeds> super::ResumesState for Chu
         self.generation
     }
 
+    fn resume_host_bytes(&self) -> u64 {
+        let (ple_history, ple_ring) = self.feeds.ple_state().unwrap_or((&[], &[]));
+        let history = (ple_history.len() as u64) * std::mem::size_of::<u32>() as u64;
+        let ring = (ple_ring.len() as u64) * std::mem::size_of::<f32>() as u64;
+        self.device.fixed_state_bytes() + history + ring
+    }
+
     fn save_resume(&self) -> Result<ResumeSnapshot> {
         let parts = self.device.read_fixed_state()?;
         let (ple_history, ple_ring) = self.feeds.ple_state().unwrap_or((&[], &[]));

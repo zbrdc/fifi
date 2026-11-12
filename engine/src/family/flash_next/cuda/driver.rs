@@ -162,11 +162,25 @@ pub(in crate::family::flash_next) struct ResumeSnapshot {
     pub(in crate::family::flash_next) ple_ring: Vec<f32>,
 }
 
+impl ResumeSnapshot {
+    /// The host bytes this snapshot holds: its fixed parts, the PLE token history and the
+    /// PLE ring mirror.
+    pub(in crate::family::flash_next) fn host_bytes(&self) -> u64 {
+        let parts: u64 = self.parts.iter().map(|(_, bytes)| bytes.len() as u64).sum();
+        let history = (self.ple_history.len() as u64) * std::mem::size_of::<u32>() as u64;
+        let ring = (self.ple_ring.len() as u64) * std::mem::size_of::<f32>() as u64;
+        parts + history + ring
+    }
+}
+
 /// Fixed-state device IO for a driver's device: the seam a [`ResumesState`] driver reads and
 /// installs its snapshot through.
 pub(super) trait StateIo {
     /// Reads every copied slot, behind the queued work.
     fn read_fixed_state(&self) -> Result<Vec<(StateSlot, Vec<u8>)>>;
+    /// The bytes [`Self::read_fixed_state`] will produce, without reading them: the host
+    /// charge of one snapshot's fixed part.
+    fn fixed_state_bytes(&self) -> u64;
     /// Installs every copied slot, ordered before the next launch.
     fn write_fixed_state(&mut self, parts: &[(StateSlot, Vec<u8>)]) -> Result<()>;
 }
@@ -180,6 +194,9 @@ pub(crate) trait ResumesState: StepperPositions {
     /// stamps it into the prefix store's path, so a restore at any other generation never
     /// matches the entry — the rows it left in place may have been overwritten meanwhile.
     fn resume_generation(&self) -> u64;
+    /// The host bytes [`Self::save_resume`] would produce now, without reading any device
+    /// state: the budget charge of one more entry.
+    fn resume_host_bytes(&self) -> u64;
 }
 
 /// The device side of a token. It is the sink of the token start.
@@ -445,6 +462,13 @@ impl<D: TokenDevice + StateIo, F: TokenFeeds> ResumesState for TokenDriver<D, F>
         self.pos = snapshot.pos;
         self.poisoned = false;
         Ok(())
+    }
+
+    fn resume_host_bytes(&self) -> u64 {
+        let (ple_history, ple_ring) = self.feeds.ple_state().unwrap_or((&[], &[]));
+        let history = (ple_history.len() as u64) * std::mem::size_of::<u32>() as u64;
+        let ring = (ple_ring.len() as u64) * std::mem::size_of::<f32>() as u64;
+        self.device.fixed_state_bytes() + history + ring
     }
 }
 

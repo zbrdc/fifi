@@ -413,6 +413,41 @@ impl DecodeSession {
         result
     }
 
+    /// `save_prefix` with a host-bytes charge: the store makes room, then hands the survivors'
+    /// bytes (measured by `size`) to `charge` before taking the snapshot; `false` refuses the
+    /// save. The charge sees what stays after the save, never the entries the room step is
+    /// about to retire.
+    ///
+    /// The Flash executor compiles only under `test` or `native-cuda` on Linux
+    /// (`flash_next/cuda/mod.rs`), so a plain non-test build has no caller.
+    #[cfg_attr(not(feature = "native-cuda"), allow(dead_code))]
+    #[allow(clippy::too_many_arguments)] // the store's save seam: key/path/fed/kind plus the budget pair
+    pub(crate) fn save_prefix_budgeted<S, P: PartialEq>(
+        &self,
+        store: &mut PrefixStore<S, P>,
+        key: &[u32],
+        path: P,
+        fed: usize,
+        kind: SaveKind,
+        size: &dyn Fn(&S) -> u64,
+        charge: &mut dyn FnMut(u64) -> bool,
+        mut snapshot: impl FnMut() -> Result<S>,
+    ) -> Result<bool> {
+        let pending = self.prefix_save_pending(key, fed)?;
+        let observed = std::mem::replace(&mut store.restored, self.restored_prefix);
+        let result = store.save_charged(
+            key,
+            pending,
+            path,
+            kind,
+            Some(size),
+            Some(charge),
+            &mut snapshot,
+        );
+        store.restored = observed;
+        result
+    }
+
     /// Freezes the validated token-side save point while device state is staged separately.
     pub(crate) fn prepare_prefix_save(&self, key: &[u32], fed: usize) -> Result<Self> {
         self.prefix_save_pending(key, fed)?;
@@ -987,6 +1022,25 @@ impl<S, P: PartialEq> PrefixStore<S, P> {
         kind: SaveKind,
         snapshot: &mut dyn FnMut() -> Result<S>,
     ) -> Result<bool> {
+        self.save_charged(key, pending, path, kind, None, None, snapshot)
+    }
+
+    /// `save` with a host-bytes charge: after the room step and before the snapshot, the
+    /// store sums the survivors' bytes with `size` and hands the total to `charge`; a `false`
+    /// return refuses the save. Charging after room is the point — the pre-room held bytes
+    /// count entries this save is about to evict, so a pre-room line denies every save of a
+    /// full store from turn 2 on, wedging reuse where the unbudgeted store rolls forward.
+    #[allow(clippy::too_many_arguments)] // mirrors the save seam: the budget pair rides the same call
+    fn save_charged(
+        &mut self,
+        key: &[u32],
+        pending: u32,
+        path: P,
+        kind: SaveKind,
+        size: Option<&dyn Fn(&S) -> u64>,
+        charge: Option<&mut dyn FnMut(u64) -> bool>,
+        snapshot: &mut dyn FnMut() -> Result<S>,
+    ) -> Result<bool> {
         // (a) A stored entry with the same key and the same path is a use, not a new snapshot.
         // A repeated tip that extends the restored entry still replaces that entry (rule 4).
         if let Some(done) = self.use_duplicate(key, &path, kind) {
@@ -1073,6 +1127,22 @@ impl<S, P: PartialEq> PrefixStore<S, P> {
                         }
                     }
                 }
+            }
+        }
+        // (c2) The budgeted charge, after room: the bytes the surviving entries hold must fit
+        // the line with the would-be entry. A refusal here never calls the snapshot (the
+        // read-back is the cost) and counts as a save-side refusal; the store may sit one
+        // entry lighter for it, which is the price of charging what really stays.
+        if let (Some(size), Some(charge)) = (size, charge) {
+            let held: u64 = self
+                .roots
+                .iter()
+                .chain(&self.lru)
+                .map(|stored| size(&stored.saved.state))
+                .sum();
+            if !charge(held) {
+                self.save_refusals += 1;
+                return Ok(false);
             }
         }
         // (d) The snapshot, with one eviction before each retry of a denied permit. The victim is
@@ -1331,6 +1401,31 @@ impl<S, P: PartialEq> PrefixStore<S, P> {
         }
         found.sort_by_key(|&(_, _, len)| Reverse(len));
         found
+    }
+
+    /// Drops every entry whose key is longer than `boundary`, of every path. The executor
+    /// whose restore continues from `boundary` calls this before any continuation row is
+    /// written: the continuation overwrites the rows those entries describe, and a restore
+    /// does not start a fresh sequence, so a counter-based validity rule never retires them.
+    /// The restored entry itself (`key.len() == boundary`) and every deeper entry stay.
+    /// The Flash executor compiles only under `test` or `native-cuda` on Linux
+    /// (`cuda/mod.rs`), so a plain non-test build has no caller.
+    #[cfg_attr(not(feature = "native-cuda"), allow(dead_code))]
+    pub(crate) fn drop_above(&mut self, boundary: usize) {
+        self.roots
+            .retain(|stored| stored.saved.key.len() <= boundary);
+        self.lru.retain(|stored| stored.saved.key.len() <= boundary);
+    }
+
+    /// Drops every entry whose `path` differs from `path`. A store keyed by an arena
+    /// generation never candidates those entries again (the restore walk matches the path
+    /// exactly), so a budgeted executor reclaims their host bytes before a save charges the
+    /// line — stale generations cannot wedge the budget. Same compile visibility as
+    /// `drop_above`.
+    #[cfg_attr(not(feature = "native-cuda"), allow(dead_code))]
+    pub(crate) fn retain_path(&mut self, path: &P) {
+        self.roots.retain(|stored| stored.saved.path == *path);
+        self.lru.retain(|stored| stored.saved.path == *path);
     }
 
     /// The first candidate a `restore_prefix` for `prompt` under `path` would try: an
@@ -2630,6 +2725,153 @@ mod tests {
         let mut session = DecodeSession::default();
         session.prefill(&mut step, tokens, LIMIT).unwrap();
         (step, session)
+    }
+
+    #[test]
+    fn retain_path_keeps_one_generation_and_drops_the_rest() {
+        let tokens: Vec<u32> = (0..9_000).collect();
+        let mut slot = store(1, 3);
+        // Path 1: a root and a tip. Path 2: a tip of the same lineage shape.
+        let (step, session) = held(&tokens[..4_000]);
+        assert_eq!(
+            save_as(
+                &session,
+                &mut slot,
+                &step,
+                &tokens[..4_000],
+                1,
+                SaveKind::Root
+            ),
+            Ok(true)
+        );
+        let (step, session) = held(&tokens[..5_000]);
+        assert_eq!(
+            save_as(
+                &session,
+                &mut slot,
+                &step,
+                &tokens[..5_000],
+                1,
+                SaveKind::Tip
+            ),
+            Ok(true)
+        );
+        let (step, session) = held(&tokens[..6_000]);
+        assert_eq!(
+            save_as(
+                &session,
+                &mut slot,
+                &step,
+                &tokens[..6_000],
+                2,
+                SaveKind::Tip
+            ),
+            Ok(true)
+        );
+
+        slot.retain_path(&1);
+
+        // Path 1 still restores (both its entries), path 2 is gone: its prompt now falls
+        // through to path 1's shorter cut.
+        let (mut step, mut session) = held(&tokens[..7_000]);
+        session.reset(&mut step).unwrap();
+        assert_eq!(
+            restore(&mut session, &mut slot, &mut step, &tokens[..7_000], 1),
+            Ok(5_000)
+        );
+        let (mut step, mut session) = held(&tokens[..7_000]);
+        session.reset(&mut step).unwrap();
+        // Path 2 is gone entirely: the restore walk matches the path exactly, so a
+        // foreign path never adopts another path's cut.
+        assert_eq!(
+            restore(&mut session, &mut slot, &mut step, &tokens[..7_000], 2),
+            Ok(0)
+        );
+    }
+
+    #[test]
+    fn drop_above_keeps_the_boundary_entry_and_drops_only_longer_keys() {
+        let tokens: Vec<u32> = (0..9_000).collect();
+        let mut slot = store(0, 3);
+        for (len, kind) in [
+            (3_000, SaveKind::Block),
+            (5_000, SaveKind::Tip),
+            (7_000, SaveKind::Tip),
+        ] {
+            let (step, session) = held(&tokens[..len]);
+            assert_eq!(
+                save_as(&session, &mut slot, &step, &tokens[..len], 1, kind),
+                Ok(true)
+            );
+        }
+
+        slot.drop_above(5_000);
+
+        // A prompt that once restored the 7_000 cut now falls to exactly the 5_000 boundary
+        // entry (kept: its key equals the boundary), and the 3_000 cut below it also stays.
+        let (mut step, mut session) = held(&tokens[..8_000]);
+        session.reset(&mut step).unwrap();
+        assert_eq!(
+            restore(&mut session, &mut slot, &mut step, &tokens[..8_000], 1),
+            Ok(5_000)
+        );
+        slot.drop_above(3_000);
+        let (mut step, mut session) = held(&tokens[..8_000]);
+        session.reset(&mut step).unwrap();
+        assert_eq!(
+            restore(&mut session, &mut slot, &mut step, &tokens[..8_000], 1),
+            Ok(3_000)
+        );
+    }
+
+    #[test]
+    fn a_refusing_charge_takes_no_snapshot_and_keeps_the_room_removals() {
+        let tokens: Vec<u32> = (0..9_000).collect();
+        let mut slot = store(0, 2);
+        for len in [3_000, 5_000] {
+            let (step, session) = held(&tokens[..len]);
+            assert_eq!(
+                save(&session, &mut slot, &step, &tokens[..len], 1),
+                Ok(true)
+            );
+        }
+        let (step, session) = held(&tokens[..7_000]);
+        let mut took_snapshot = false;
+        let refused = session
+            .save_prefix_budgeted(
+                &mut slot,
+                &tokens[..7_000],
+                1,
+                step.fed(),
+                SaveKind::Tip,
+                &|fed: &Vec<u32>| fed.len() as u64,
+                &mut |_| false,
+                || {
+                    took_snapshot = true;
+                    Ok(step.fed.clone())
+                },
+            )
+            .unwrap();
+        assert!(!refused, "the refusing charge answers false");
+        assert!(!took_snapshot, "no snapshot was taken");
+        assert_eq!(
+            slot.save_side_totals().save_refusals,
+            1,
+            "one refusal counted"
+        );
+        assert_eq!(
+            slot.save_side_totals().room_removals,
+            1,
+            "the room step's removal stays in place (the 3_000 cut was retired to admit \
+             the refused save)"
+        );
+        // And the room victim is really gone: the longest restorable cut is now 5_000.
+        let (mut step, mut session) = held(&tokens[..8_000]);
+        session.reset(&mut step).unwrap();
+        assert_eq!(
+            restore(&mut session, &mut slot, &mut step, &tokens[..8_000], 1),
+            Ok(5_000)
+        );
     }
 
     #[test]

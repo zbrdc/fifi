@@ -167,6 +167,10 @@ impl super::driver::StateIo for CardDevice {
         self.step.read_fixed_state()
     }
 
+    fn fixed_state_bytes(&self) -> u64 {
+        self.step.fixed_state_bytes()
+    }
+
     fn write_fixed_state(&mut self, parts: &[(StateSlot, Vec<u8>)]) -> Result<(), EngError> {
         self.step.write_fixed_state(parts)
     }
@@ -356,6 +360,10 @@ impl super::driver::chunk::ChunkDevice for CardChunkDevice {
 impl super::driver::StateIo for CardChunkDevice {
     fn read_fixed_state(&self) -> Result<Vec<(StateSlot, Vec<u8>)>, EngError> {
         self.step.read_fixed_state()
+    }
+
+    fn fixed_state_bytes(&self) -> u64 {
+        self.step.fixed_state_bytes()
     }
 
     fn write_fixed_state(&mut self, parts: &[(StateSlot, Vec<u8>)]) -> Result<(), EngError> {

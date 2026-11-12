@@ -318,6 +318,17 @@ impl<'a> FlashStep<'a> {
             .collect()
     }
 
+    /// The bytes [`Self::read_fixed_state`] will produce, without reading them: the host charge
+    /// of one snapshot's fixed part.
+    pub(super) fn fixed_state_bytes(&self) -> u64 {
+        self.state_plan
+            .slots()
+            .iter()
+            .filter(|&&(slot, _)| !StatePlan::is_position_state(slot))
+            .map(|&(_, bytes)| bytes as u64)
+            .sum()
+    }
+
     /// Installs a snapshot's copied slots, ordered before the next launch.
     pub(super) fn write_fixed_state(
         &mut self,

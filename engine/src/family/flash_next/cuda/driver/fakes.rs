@@ -128,6 +128,10 @@ impl super::StateIo for FakeDevice {
         Ok(vec![(StateSlot::PleRing, self.fixed.clone())])
     }
 
+    fn fixed_state_bytes(&self) -> u64 {
+        self.fixed.len() as u64
+    }
+
     fn write_fixed_state(&mut self, parts: &[(StateSlot, Vec<u8>)]) -> Result<(), EngError> {
         let Some((_, bytes)) = parts.first() else {
             return Ok(());
@@ -174,6 +178,10 @@ impl super::StateIo for FakeChunkDevice {
     fn read_fixed_state(&self) -> Result<Vec<(StateSlot, Vec<u8>)>, EngError> {
         // read takes &self, so no log step here — the log is only for the mutable calls.
         Ok(self.state.clone())
+    }
+
+    fn fixed_state_bytes(&self) -> u64 {
+        self.state.iter().map(|(_, bytes)| bytes.len() as u64).sum()
     }
 
     fn write_fixed_state(&mut self, parts: &[(StateSlot, Vec<u8>)]) -> Result<(), EngError> {

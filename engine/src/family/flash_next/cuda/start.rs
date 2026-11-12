@@ -898,6 +898,13 @@ impl ResumesState for StepDriver {
         }
     }
 
+    fn resume_host_bytes(&self) -> u64 {
+        match self {
+            Self::Token(driver) => driver.resume_host_bytes(),
+            Self::Chunk(driver) => driver.resume_host_bytes(),
+        }
+    }
+
     fn save_resume(&self) -> Result<ResumeSnapshot, EngError> {
         match self {
             Self::Token(driver) => driver.save_resume(),

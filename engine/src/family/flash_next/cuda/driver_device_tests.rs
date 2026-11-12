@@ -436,6 +436,134 @@ fn the_prefix_resume_matches_a_fresh_prefill() {
     );
 }
 
+/// The mid-turn suffix case of the two-entry store: the re-rendered tail diverges inside the
+/// tip key (two tokens above the block boundary), so the tip is refused and the rolling block
+/// below it serves; the block-resumed turn draws the fresh greedy tokens within the family's
+/// stream bound. The block cut here is synthetic (`tip - 8` on the chat-short prompt): the
+/// 64-lattice position is the worker's planning choice (pinned in `sched`), while this test
+/// pins the numerics of a restore from a below-tip entry.
+#[test]
+#[ignore = "needs a GPU (about 21 GiB), the full pack in FIFI_FLASH_NEXT_EXL3_PACK and the oracle run JSON"]
+fn the_suffix_turn_resumed_from_the_block_matches_a_fresh_prefill() {
+    use crate::family::executor::ExecutorOps;
+
+    assert!(
+        device_present("Flash-Next suffix resume"),
+        "this test needs a CUDA card"
+    );
+    resume::arm_for_tests();
+    let pack = PathBuf::from(var("FIFI_FLASH_NEXT_EXL3_PACK").expect("FIFI_FLASH_NEXT_EXL3_PACK"));
+    let oracle_path =
+        PathBuf::from(var("FIFI_FLASH_NEXT_DRIVER_ORACLE").expect("FIFI_FLASH_NEXT_DRIVER_ORACLE"));
+    let oracle: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&oracle_path).expect("oracle json")).expect("json");
+    let actual_vocab = oracle["vocab"]["actual_vocab"].as_u64().expect("vocab") as usize;
+    let steps: usize =
+        var("FIFI_FLASH_NEXT_DRIVER_STEPS").map_or(64, |v| v.parse().expect("steps"));
+    let record = oracle["prompts"]
+        .as_array()
+        .expect("prompts")
+        .iter()
+        .find(|p| p["id"] == "chat-short")
+        .expect("the chat-short prompt");
+    let prompt: Vec<u32> = record["prompt_ids"]
+        .as_array()
+        .expect("prompt_ids")
+        .iter()
+        .map(|v| v.as_u64().expect("an id") as u32)
+        .collect();
+    // The worker's two-entry shape at a synthetic block: the tip is all but the last 8
+    // tokens (the boundary of the 4-arm test), the block 8 below it, and the suffix prompt
+    // re-renders the two tokens above the block — the seam the template's tail merge makes.
+    let cut = prompt.len().saturating_sub(8).max(9);
+    let (a, b) = prompt.split_at(cut);
+    let block = cut - 8;
+    let mut c = a[..block].to_vec();
+    let seam = [
+        (a[block] + 1) % actual_vocab as u32,
+        (a[block + 1] + 2) % actual_vocab as u32,
+    ];
+    assert_ne!(seam[0], a[block]);
+    assert_ne!(seam[1], a[block + 1]);
+    c.extend_from_slice(&seam);
+    c.extend_from_slice(&a[block + 2..]);
+    c.extend_from_slice(b);
+    assert_eq!(c.len(), prompt.len());
+    assert_eq!(
+        &c[..block],
+        &a[..block],
+        "the suffix prefixes the block key"
+    );
+    assert_ne!(
+        &c[block..block + 2],
+        &a[block..block + 2],
+        "the seam is inside the tip key"
+    );
+    assert!(prompt.len() + steps < 512, "raise the context");
+    let wanted = CudaSettings {
+        context: 512,
+        kv_format: KvFormatName::F16,
+        slots: None,
+        expert_stats: None,
+        prefill_rows: var("FIFI_FLASH_NEXT_DRIVER_ROWS").map_or(4, |v| v.parse().expect("rows")),
+    };
+    let driver = build_driver(&|_| {}, &pack, &wanted, actual_vocab, None).expect("driver");
+    let (mut executor, mut session) = FlashCudaExecutor::new(
+        driver,
+        CudaRules {
+            eos: Arc::from(vec![]),
+            sampler_vocab: actual_vocab,
+        },
+    )
+    .expect("executor");
+
+    // The fresh reference of the suffix prompt.
+    executor.reset(&mut session).unwrap();
+    executor.prefill(&mut session, &c).unwrap();
+    let (fresh_ids, fresh_rows) = greedy(&mut executor, &c, steps, actual_vocab);
+
+    // Turn 1: prefill A, saving the block at its boundary and the tip at A's end.
+    executor.reset(&mut session).unwrap();
+    executor.prefill(&mut session, &a[..block]).unwrap();
+    assert!(
+        executor
+            .save_prefix(&session, &a[..block], SaveKind::Block)
+            .unwrap(),
+        "the armed switch saves the block"
+    );
+    executor.prefill(&mut session, &a[block..]).unwrap();
+    assert!(executor.save_prefix(&session, a, SaveKind::Tip).unwrap());
+    for _ in 0..8 {
+        executor
+            .stepper()
+            .logits(*a.last().expect("a boundary token"))
+            .expect("decode past the boundary");
+    }
+    // The suffix turn: the tip is refused at the seam, the block restores, the tail feeds.
+    executor.reset(&mut session).unwrap();
+    let reused = executor.restore_prefix(&mut session, &c).unwrap();
+    assert_eq!(reused, block, "the block serves the re-rendered tail");
+    executor.prefill(&mut session, &c[block..]).unwrap();
+    let (resumed_ids, resumed_rows) = greedy(&mut executor, &c, steps, actual_vocab);
+    assert_eq!(
+        resumed_ids, fresh_ids,
+        "the block-resumed turn draws the fresh greedy tokens"
+    );
+    // The family's cross-path ladder (step_tests): stream 2e-4 — the same bound the tip
+    // restore holds; a wrong (stale) row read lands orders of magnitude above it.
+    let bound = 2e-4f64;
+    let worst = resumed_rows
+        .iter()
+        .zip(&fresh_rows)
+        .map(|(got, want)| relative_l2(got, want))
+        .fold(0.0f64, f64::max);
+    println!("block-resume rel-L2: max {worst:.3e} over {steps} rows, bound {bound:.0e}");
+    assert!(
+        worst <= bound,
+        "block-resumed logits drift {worst:.3e} above {bound:.0e}"
+    );
+}
+
 /// The mid-block boundary case of the raw-key ring: a boundary whose open block is partially
 /// filled (`(boundary - 1) % ratio != 0`), a continuation longer than the block's remainder, and
 /// a prompt whose completed blocks exceed the indexer budget (the real pack: ratio 4, budget

@@ -18,7 +18,10 @@
 //! restore after any intervening fresh prefill never matches the entry and falls back to a full
 //! prefill: request A saves, request C prefills from 0 and overwrites the rows, request D with
 //! A's prefix refuses the entry (generation mismatch) and full-prefills — correct output, no
-//! stale-row read, no error.
+//! stale-row read, no error. A restore at boundary b additionally drops every stored entry
+//! with a LONGER key before any row is written (`drop_above`): the restoring job's own
+//! continuation overwrites the rows those entries describe, and a restore does not start a
+//! fresh sequence, so the generation alone never retires them.
 
 use std::sync::OnceLock;
 
@@ -58,6 +61,21 @@ pub(in crate::family::flash_next) fn on() -> bool {
 }
 
 #[cfg(test)]
-pub(in crate::family::flash_next) fn arm_for_tests() {
-    TEST_ON.store(true, Ordering::Relaxed);
+pub(in crate::family::flash_next) fn set_for_tests(on: bool) {
+    TEST_ON.store(on, Ordering::Relaxed);
 }
+
+#[cfg(test)]
+pub(in crate::family::flash_next) fn arm_for_tests() {
+    set_for_tests(true);
+}
+
+/// The host bytes the resume store may hold across its entries: the budget a save charges
+/// on the survivors after the store makes room, plus the would-be entry
+/// (`survivors + one more snapshot <= budget`). The snapshots are pageable host RAM — about
+/// 110.8 MiB of fixed state each on this pack plus the PLE history term — so the line, not
+/// the entry count, is the machine's ceiling: a rolling two-entry store always fits (one
+/// survivor plus the new entry), and any future store shape that would cross it degrades to
+/// fewer entries instead of growing host RAM. A denied save is skipped; correctness never
+/// depends on it.
+pub(in crate::family::flash_next) const HOST_BUDGET_BYTES: u64 = 256 * 1024 * 1024;
