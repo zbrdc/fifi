@@ -73,14 +73,16 @@ const SPLIT_BOUND: f64 = 1e-6;
 /// identical with the fused pair launch on and off and with all, none or some of row 0's
 /// picks held in the bank (FIFI_FLASH_NEXT_RING_HELD arms those variants; the knob moves
 /// row 0 only — the fixture's other rows keep the default split), so sum order and that
-/// source split are excluded. The cause is measured by the per-projection device test
-/// ([`each_projection_through_the_jobs_family_and_the_indexed_family_on_one_row`]): the
-/// job-table tile kernels stage the activations as F16 operands (`exl3.cu`'s
-/// jobs_input_rotate and JobsTile) while the flat indexed launches read F32, giving
-/// 1.9-3.9e-4 per projection against fp64 where the indexed family sits at 1.5-3.0e-7 —
-/// the block deviation is that launch-family arithmetic, not a defect of the ring branch.
+/// source split are excluded. The per-projection device test
+/// ([`each_projection_through_the_jobs_family_and_the_indexed_family_on_one_row`])
+/// separates the families' arithmetic: the job-table tile kernels stage the activations as
+/// F16 operands (`exl3.cu`'s
+/// jobs_input_rotate rounds to F16 where it writes the rotated rows; JobsTile multiplies
+/// F16 halves) while the flat indexed launches read their F32 staging — giving 1.9-3.9e-4
+/// per projection against fp64 where the indexed family sits at 1.5-3.0e-7 — the block
+/// deviation is that launch-family arithmetic, not a defect of the ring branch.
 /// The bound covers the block-level combine (1.4x headroom over the 2.9e-4 maximum); the
-/// per-projection numbers are bounded separately at PROJECTION_BOUND.
+/// per-projection figures are bounded separately at `GATE_UP_BOUND`/`DOWN_BOUND`.
 const RING_BOUND: f64 = 4e-4;
 
 fn pack_dir() -> PathBuf {
@@ -456,9 +458,10 @@ fn floats_f64(bytes: &[u8]) -> Vec<f64> {
     floats(bytes).into_iter().map(f64::from).collect()
 }
 
-/// The buffers of one `run_rows` call, zeroed, with `rows` as the normalized inputs. The
-/// grouped launches chunk at the same capacity as one row's, restarting at scratch row 0, so
-/// the EXL3 scratch keeps its one-row sizing.
+/// The buffers of one `run_rows` call, zeroed, with `rows` as the normalized inputs. A
+/// source's gate/up launch stages one `xh` row per pair and the whole chunk can be one
+/// source's, so the scratch staging is sized `m·k` rows (the F32 byte sizing also covers
+/// the F16 staging the job-table family writes into the same ranges).
 struct RigRows {
     owned: Vec<DeviceBuffer>,
     hidden: usize,
@@ -554,20 +557,6 @@ impl RigRows {
             bytes
         };
         (read(8), read(10), read(4))
-    }
-
-    /// The scratch staging the two launch families hand their kernels: `xh` (the rotated
-    /// input rows) and `z` (the down windows), read back for a byte comparison between arms.
-    fn scratch_bytes(&self, projector: &CudaProjector) -> (Vec<u8>, Vec<u8>) {
-        let stream = projector.context().stream().expect("stream");
-        let read = |i: usize| {
-            let mut bytes = vec![0u8; self.owned[i].bytes()];
-            self.owned[i]
-                .read_at(&stream, 0, &mut bytes)
-                .expect("read the scratch buffers");
-            bytes
-        };
-        (read(14), read(15))
     }
 }
 
@@ -749,23 +738,35 @@ fn a_chunk_over_the_prefill_ring_matches_the_all_resident_block() {
     }
 }
 
-/// The per-projection bound of the job-table launch family against fp64: the F16 activation
-/// operand class, 2^-11 = 4.88e-4, measured 1.9e-4 to 2.2e-4 (gate/up) and 2.9e-4 to 3.9e-4
-/// (down) on this pack.
-const PROJECTION_BOUND: f64 = 5e-4;
+/// The job-table family's per-projection bounds against fp64, split by projection and
+/// measured on this pack (Qwen3.8-Flash-Next exl3 3.05bpw h5 ng5, pack layer 3 — the
+/// `FIFI_FLASH_NEXT_EXL3_MOE_LAYER` default — its ten picks of one deterministic row, seed 9;
+/// 3090): gate/up 1.9-2.2e-4 and down 2.9-3.9e-4, the F16 activation operand class
+/// (2^-11 = 4.88e-4; the down bound keeps 1.3x headroom over its 3.9e-4 maximum).
+const GATE_UP_BOUND: f64 = 3e-4;
+const DOWN_BOUND: f64 = 5e-4;
+/// The flat indexed family reads F32 operands: 1.5-3.0e-7 against fp64 on the same row
+/// (same provenance), three orders under the jobs family, so the two cannot be confused.
+const INDEXED_BOUND: f64 = 1e-6;
 
 /// The launch families the ring tolerance splits between, on one row and one expert each:
 /// the flat all-resident block runs the indexed launches (F32 operands), the funded ring runs
 /// the job-table tile kernels (F16-staged activations, `exl3.cu`'s jobs_input_rotate and
-/// JobsTile), and every projection of the same routed expert is compared across the two
-/// families and against fp64. Measured: indexed 1.5-3.0e-7 vs fp64, jobs 1.9-2.2e-4 (gate/up)
-/// and 2.9-3.9e-4 (down), and jobs-vs-indexed equals jobs-vs-fp64 because the indexed family
-/// sits at 1e-7 — the ring branch's whole block deviation is the job-table family's F16
-/// operand arithmetic, not a defect of the ring branch (the Qwen3.6 prefill test's 7.3e-6
-/// runs the indexed family, a different launch family, so the two numbers do not conflict).
-/// The staging byte comparison reports that the two arms' `xh`/`z` scratch differ — those
-/// buffers hold the families' own pair orders, so the bytes are an observation about
-/// staging, not a dtype probe; the per-projection numbers above are the discriminator.
+/// JobsTile), and every projection of the same routed expert is asserted across the two
+/// families and against fp64, both twin rows each. Measured on the provenance above:
+/// indexed 1.5-3.0e-7 vs fp64, jobs 1.9-2.2e-4 (gate/up) and 2.9-3.9e-4 (down), and
+/// jobs-vs-indexed equals jobs-vs-fp64 because the indexed family sits at 1e-7 — the ring
+/// branch's whole-block deviation is the job-table family's F16 operand arithmetic, not a
+/// defect of the ring branch. The dtype statement rests on the kernel source (the staging
+/// write at `exl3.cu`'s jobs_input_rotate rounds to F16; the indexed launches read F32) and
+/// on those asserted error classes; no byte-level staging comparison is made. The Qwen3.6
+/// chunk prefill test runs these same job-table kernels; its measured print (layer 3, 1024
+/// rows, the Qwen3.6 4.00 bpw pack, the host's RTX 3090) is `whole row 8.183e-6; moe term
+/// vs residual norm 2.450e-2; delta only 3.341e-4` — the MoE term is 2.45% of the residual
+/// stream's norm, and the delta-only figure sits in the 1.9-3.9e-4 job-table class above:
+/// the whole-row figure is consistent with that F16-operand error diluted by the residual
+/// stream. Margins: down 1.28x over 3.9e-4, gate/up 1.36x over 2.2e-4, indexed 3.4x over
+/// 2.9e-7.
 #[test]
 #[ignore = "needs a GPU (about 3 GiB of ring and bank, about 2 GiB of pinned host memory per bank and FIFI_FLASH_NEXT_EXL3_PACK"]
 fn each_projection_through_the_jobs_family_and_the_indexed_family_on_one_row() {
@@ -789,8 +790,9 @@ fn each_projection_through_the_jobs_family_and_the_indexed_family_on_one_row() {
         inter: shape.inter(),
         shared_inter: shape.shared_inter(),
     };
-    // The split block takes 2 to 64 rows: the row is run twice, identically, and row 0 is
-    // compared (its row 1 twin is the same input, checked equal to it).
+    // The split block takes 2 to 64 rows: the row is run twice, identically, so every
+    // pick's projection appears once per twin row in the jobs segment; the scan below
+    // asserts both twins, so a defect in one twin alone fails.
     let two_rows = MoeDims { rows: 2, ..one_row };
     let projector = CudaProjector::new().expect("projector");
     let ctx = projector.context();
@@ -830,7 +832,6 @@ fn each_projection_through_the_jobs_family_and_the_indexed_family_on_one_row() {
     .expect("the all-resident block");
     launch.stream.synchronize().expect("sync");
     let (flat_gu, flat_down, flat_ids) = flat_rig.expert_bytes(&projector);
-    let (flat_xh, flat_z) = flat_rig.scratch_bytes(&projector);
 
     // The jobs arm: a bank with none of the row's picks resident, the ring funded, the same
     // row through the job-table tile kernels.
@@ -863,7 +864,6 @@ fn each_projection_through_the_jobs_family_and_the_indexed_family_on_one_row() {
         .expect("the ring block");
     stream.synchronize().expect("sync");
     let (jobs_gu, jobs_down, jobs_ids) = jobs_rig.expert_bytes(&projector);
-    let (jobs_xh, jobs_z) = jobs_rig.scratch_bytes(&projector);
 
     // The flat block writes the routed ids of row 0 only; both arms route the same logits
     // through the same route kernel, so row 0's picks must agree.
@@ -873,53 +873,76 @@ fn each_projection_through_the_jobs_family_and_the_indexed_family_on_one_row() {
         &jobs_ids[..k * 4],
         "both arms route to the same picks"
     );
-    for (name, flat, jobs) in [("xh", &flat_xh, &jobs_xh), ("z", &flat_z, &jobs_z)] {
-        let first = flat.iter().zip(jobs).position(|(a, b)| a != b);
-        println!(
-            "staging {name}: bytes equal {}, first differing byte {:?}",
-            first.is_none(),
-            first
-        );
-        if let Some(at) = first {
-            let word = |bytes: &[u8], at: usize| {
-                f32::from_le_bytes(bytes[at..][..4].try_into().expect("a word"))
-            };
-            let (a, b) = (word(flat, at), word(jobs, at));
-            println!("staging {name} first differing element: flat {a:e}, jobs {b:e}");
-        }
-    }
+    // No byte-level staging comparison between the arms is made; the families' difference
+    // is established by the asserted error classes below. The dtype statement rests on the
+    // kernel source (jobs_input_rotate rounds its operands to F16 where it stores the
+    // rotated rows; the indexed launches
+    // read the F32 staging) and on the per-projection error classes asserted below: the
+    // indexed family reproduces fp64 at 1e-7 while the jobs family sits at 1e-4.
     let (flat_gu, flat_down) = (floats_f64(&flat_gu), floats_f64(&flat_down));
     let (jobs_gu, jobs_down) = (floats_f64(&jobs_gu), floats_f64(&jobs_down));
     // The jobs segment's pair order follows the ring's slot order, not the routing order, so
-    // each fp64 pick is matched by scanning the segment: its own projection sits within
-    // RING_BOUND while every other expert's is orders off — no ambiguity at these gaps.
-    // Both rows are the same input, so either twin row is the pick's projection.
-    let scan = |rows: &[f64], want: &[f64]| -> (usize, f64) {
+    // each fp64 pick is matched by scanning the segment: every segment row within the
+    // family bound IS this pick (every other expert's projection is orders off — no
+    // ambiguity at these gaps), and the row is run twice, identically, so the pick appears
+    // once per twin row: exactly two rows must match, and a defect in one twin alone fails.
+    let twins = |rows: &[f64], want: &[f64], bound: f64| -> Vec<f64> {
         rows.chunks(want.len())
             .map(|got| relative_l2_f64(got, want))
-            .enumerate()
-            .min_by(|a, b| a.1.total_cmp(&b.1))
-            .expect("at least one row")
+            .filter(|error| *error < bound)
+            .collect()
     };
+    let max_of = |v: &[f64]| v.iter().copied().fold(f64::MIN, f64::max);
     for p in 0..k {
         let fg = &flat_gu[p * 2 * i..][..2 * i];
         let wg = &want.gu[p * 2 * i..][..2 * i];
         let fd = &flat_down[p * h..][..h];
         let wd = &want.down[p * h..][..h];
-        let (gu_row, gu_error) = scan(&jobs_gu, wg);
-        let (down_row, down_error) = scan(&jobs_down, wd);
-        println!(
-            "pick {p} gate/up: indexed vs fp64 {:.3e}, jobs vs fp64 {:.3e} (segment row {gu_row}), jobs vs indexed {:.3e}; down: indexed vs fp64 {:.3e}, jobs vs fp64 {:.3e} (segment row {down_row}), jobs vs indexed {:.3e}",
-            relative_l2_f64(fg, wg),
-            gu_error,
-            scan(&jobs_gu, fg).1,
-            relative_l2_f64(fd, wd),
-            down_error,
-            scan(&jobs_down, fd).1,
+        // The indexed family against fp64, asserted at its own F32 class.
+        let (gu_indexed, down_indexed) = (relative_l2_f64(fg, wg), relative_l2_f64(fd, wd));
+        assert!(
+            gu_indexed < INDEXED_BOUND,
+            "pick {p}: indexed gate/up vs fp64 {gu_indexed:.3e}"
         );
         assert!(
-            gu_error < PROJECTION_BOUND && down_error < PROJECTION_BOUND,
-            "pick {p}: the jobs family vs fp64"
+            down_indexed < INDEXED_BOUND,
+            "pick {p}: indexed down vs fp64 {down_indexed:.3e}"
+        );
+        // The jobs family against fp64 and against the indexed row, both twins asserted.
+        let gu_twins = twins(&jobs_gu, wg, GATE_UP_BOUND);
+        let down_twins = twins(&jobs_down, wd, DOWN_BOUND);
+        assert_eq!(
+            gu_twins.len(),
+            2,
+            "pick {p}: both gate/up twin rows match fp64 (errors {:?})",
+            gu_twins
+        );
+        assert_eq!(
+            down_twins.len(),
+            2,
+            "pick {p}: both down twin rows match fp64 (errors {:?})",
+            down_twins
+        );
+        let jg = twins(&jobs_gu, fg, GATE_UP_BOUND);
+        let jd = twins(&jobs_down, fd, DOWN_BOUND);
+        assert_eq!(
+            jg.len(),
+            2,
+            "pick {p}: both gate/up twin rows match the indexed row (errors {:?})",
+            jg
+        );
+        assert_eq!(
+            jd.len(),
+            2,
+            "pick {p}: both down twin rows match the indexed row (errors {:?})",
+            jd
+        );
+        println!(
+            "pick {p} gate/up: indexed vs fp64 {gu_indexed:.3e}; jobs vs fp64 {:.3e} (both twins); jobs vs indexed {:.3e}; down: indexed vs fp64 {down_indexed:.3e}; jobs vs fp64 {:.3e}; jobs vs indexed {:.3e}",
+            max_of(&gu_twins),
+            max_of(&jg),
+            max_of(&down_twins),
+            max_of(&jd),
         );
     }
 }
