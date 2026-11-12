@@ -99,6 +99,8 @@ The Flash-Next family serves only with `flash_next.cuda_decode: true` in the con
 | `FIFI_FLASH_NEXT_EXPERT_STATS` | unset | Path of a popularity-profile JSON (`expert_stats` format). The engine's own `expert_stats` key wins over the variable; a set value must read and parse — a malformed file refuses the start. |
 | `FIFI_FLASH_NEXT_EXPERT_USAGE_OUT` | unset | Where the expert-usage dump is written at shutdown (the engine's `expert_stats` key first, this variable as fallback), so the next start of the same entry serves warm. |
 | `FIFI_FLASH_NEXT_FUSED_IN` | off (strict) | Fused-input launch of the dense projections: the input rotation runs inside the projection kernel. Bit-identical bytes, but the measured full-step decode regressed, so it stays off for re-measuring after the launch floor changes. Only `1` opts in; any other non-empty value is refused. Read once per process. |
+| `INFERENCE_FLASH_NEXT_PROFILE` | unset | Chunk phase profile of the Flash-Next CUDA driver: every phase's host time is summed per prompt and printed after its sampling row, and the page-io waits of the routing path (`write_at`/`read_at` sync) are split into upload and readback totals. Any value other than `0` arms it. Counting is passive; walls under the profile are not comparable to unprofiled runs. |
+| `INFERENCE_FLASH_NEXT_DRAIN_TICK` | unset | Host-stage timing companion to `INFERENCE_FLASH_NEXT_PROFILE`: with both set, every phase boundary drains the device queues, so each phase's recorded time starts with an empty queue (the host's own cost). Without the profile set this variable does nothing. Any value other than `0` arms it. |
 
 ## Flint
 
