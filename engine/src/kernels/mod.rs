@@ -77,22 +77,24 @@ pub(crate) mod page_io_block {
     pub(crate) static UPLOAD_NS: AtomicU64 = AtomicU64::new(0);
     pub(crate) static READBACK_NS: AtomicU64 = AtomicU64::new(0);
 
-    /// Arms the counters; the chunk profile's own switch calls this, so every copy after the
-    /// first step is recorded.
-    pub(crate) fn arm() -> bool {
-        *ENABLED
-            .get_or_init(|| std::env::var("INFERENCE_FLASH_NEXT_PROFILE").is_ok_and(|v| v != "0"))
+    /// Arms or disarms the counters; the chunk profile's own switch passes the parsed
+    /// value, so this module names no variable of any family. Returns the value set.
+    pub(crate) fn arm(on: bool) -> bool {
+        let _ = ENABLED.set(on);
+        on
     }
 
     /// Whether any copy is being recorded; reading this never arms the switch. The
-    /// pageable-copy path checks it BEFORE taking any clock read, per the shared-path rule.
+    /// pageable-copy path reads it before taking any clock read, so the Qwen3.6 and Flint
+    /// copies that share that path pay one load and a branch while disarmed.
     #[cfg(all(feature = "native-cuda", target_os = "linux"))]
     #[inline]
     pub(crate) fn armed() -> bool {
         ENABLED.get().copied().unwrap_or(false)
     }
 
-    /// Records `ns` spent blocked; the disarmed path is one load and no store. Only the
+    /// Records `ns` spent blocked. The pageable-copy path calls this only after `armed()`
+    /// said yes; the guard here keeps the counter off for any other caller. Only the
     /// native page-io wrappers call this, so it exists where they do.
     #[cfg(all(feature = "native-cuda", target_os = "linux"))]
     #[inline]

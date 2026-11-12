@@ -30,6 +30,9 @@
 //! - `FIFI_FLASH_NEXT_EXL3_PACK`, `_DRIVER_ORACLE`, `_DRIVER_CONTEXT` (default: the largest prompt
 //!   plus its steps plus 8, rounded up to 4) and `_DRIVER_SLOTS` as above.
 //! - `FIFI_FLASH_NEXT_DRIVER_PROMPTS`: a comma-separated list of prompt ids (default: all).
+//! - `FIFI_FLASH_NEXT_DRIVER_ROWS` (follow harness, default 1): the driver's row plan
+//!   (scratch width, ring, driver class). The harness itself feeds one row per call at any
+//!   setting; a chunk-size comparison needs the direct driver test.
 //! - `FIFI_FLASH_NEXT_DRIVER_BUDGET_SEC`: wall seconds after which a prompt that would not finish
 //!   is skipped and named (default 700).
 //! - `FIFI_FLASH_NEXT_DRIVER_OUT`: a directory for `follow.json` (summaries), `engine-follow.json`
@@ -610,6 +613,10 @@ fn teacher_forced_steps_follow_the_oracle_on_every_prompt() {
         expert_stats: None,
         prefill_rows: var("FIFI_FLASH_NEXT_DRIVER_ROWS").map_or(1, |v| v.parse().expect("rows")),
     };
+    // `prefill_rows` picks the driver's row plan (scratch width, ring, driver class), not
+    // the chunk size this harness runs: it feeds the prompt one row per `feed` call and
+    // decodes one row per `logits` call whatever the plan says. A chunk-size comparison
+    // needs the direct chunk driver test, not this harness.
     let mut driver = build_driver(
         &|stage| println!("stage: {stage}"),
         &pack,
@@ -778,13 +785,15 @@ fn teacher_forced_steps_follow_the_oracle_on_every_prompt() {
         let full: Vec<f64> = steps.iter().filter_map(|s| s.kl_full).collect();
         let (klf_mean, klf_max) = mean_max(&full);
         let overlap = steps.iter().map(|s| s.overlap).sum::<usize>() as f64 / count as f64;
+        let rows_plan = wanted.prefill_rows;
         let step_misses = driver
             .bank_misses()
             .saturating_sub(misses_before + prompt_misses);
         println!(
             "{id}: {count} steps, top-1 {agree}/{count} ({:.4}), KL top-20 mean {kl20_mean:.3e} max {kl20_max:.3e}, \
              KL full-vocab ({} rows) mean {klf_mean:.3e} max {klf_max:.3e}, top-20 overlap mean {overlap:.2}/20, \
-             prompt {:.1} ms/token, steps {step_ms:.1} ms/token, misses prompt {prompt_misses} ({:.2}/tok) steps {step_misses} ({:.2}/tok)",
+             prompt {:.1} ms/token, steps {step_ms:.1} ms/token, misses prompt {prompt_misses} ({:.2}/tok) steps {step_misses} ({:.2}/tok), \
+             rows plan {rows_plan} (the follow harness feeds one row per call)",
             agree as f64 / count as f64,
             full.len(),
             feed_ms,

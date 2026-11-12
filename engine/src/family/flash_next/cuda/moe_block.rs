@@ -717,7 +717,7 @@ mod device {
             let (ctx, stream) = (launch.ctx, launch.stream);
             let sc = self.layout;
             let (h, k) = (dims.hidden, dims.top_k);
-            let profile = crate::family::flash_next::cuda::driver::chunk::prof::on();
+            let profile = prof::on();
             let slot_row_before: Vec<i32> = self.bank.slot_row(layer)?.to_vec();
             let scratch = &self.scratch;
             let slot_ids = scratch.range(sc.slot_ids, k * I32)?;
@@ -899,7 +899,7 @@ mod device {
                 },
             )?;
             let mut raw_ids = vec![0u8; m * k * I32];
-            let profile = crate::family::flash_next::cuda::driver::chunk::prof::on();
+            let profile = prof::on();
             let raw_weights = prof::blocked(37, profile, || {
                 bufs.route
                     .ids
@@ -998,11 +998,11 @@ mod device {
             let partial = scratch.range(sc.partial, m * h * F32)?;
 
             // One router over every row; its picks drive the host bank, so they come back once.
-            let profile = crate::family::flash_next::cuda::driver::chunk::prof::on();
+            let profile = prof::on();
             let mut t = std::time::Instant::now();
             let mut tick = |slot: usize| {
                 if profile {
-                    crate::family::flash_next::cuda::driver::chunk::prof::add(slot, t.elapsed());
+                    prof::add(slot, t.elapsed());
                     t = std::time::Instant::now();
                 }
             };
@@ -1252,7 +1252,7 @@ mod device {
             weights: &[f32],
         ) -> Result<(), EngError> {
             let (h, k) = (dims.hidden, dims.top_k);
-            let profile = crate::family::flash_next::cuda::driver::chunk::prof::on();
+            let profile = prof::on();
             let mut raw = vec![0u8; k * h * F32];
             prof::blocked(42, profile, || {
                 bufs.expert_down.buffer().read_at(
@@ -1308,11 +1308,11 @@ mod device {
 
             // The profiler's ring taps walk this body in call order; the route read-back is
             // the one drain of the layer, so it also absorbs the prior layer's queued compute.
-            let profile = crate::family::flash_next::cuda::driver::chunk::prof::on();
+            let profile = prof::on();
             let mut t = std::time::Instant::now();
             let mut tick = |slot: usize| {
                 if profile {
-                    crate::family::flash_next::cuda::driver::chunk::prof::add(slot, t.elapsed());
+                    prof::add(slot, t.elapsed());
                     t = std::time::Instant::now();
                 }
             };

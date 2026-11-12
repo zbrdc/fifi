@@ -216,6 +216,12 @@ impl ChunkDevice for FakeChunkDevice {
         self.step("health", String::new())
     }
 
+    /// Logs like every other call, so the boundary-order test can see the drain between the
+    /// phases; the `fail` mechanism covers a failing drain by name.
+    fn drain(&mut self) -> Result<(), EngError> {
+        self.step("drain", String::new())
+    }
+
     fn reset(&mut self) -> Result<(), EngError> {
         self.resets += 1;
         self.stream.clear();

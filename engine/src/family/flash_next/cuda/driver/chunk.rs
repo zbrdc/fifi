@@ -45,8 +45,9 @@ pub(in crate::family::flash_next) mod prof {
     /// The phases of `queue` plus the inside of one layer, in call order. Slots 22-27 walk the
     /// interior of the ring rows-block, which the one-row block's taps (slots 11-13) never
     /// reach: the ring issues no admit and no miss pass. Slots 34-42 are the host time blocked
-    /// inside the page-io waits of the routing path (`write_at`/`read_at` sync), per site —
-    /// the split the upload-form decision needs.
+    /// inside the page-io waits — the `stream_synchronize` of a pageable copy — per site,
+    /// upload and readback separately. They are nested inside the phases above them, so the
+    /// phases sum counts them twice.
     pub(super) const NAMES: [&str; 43] = [
         "begin(host feeds)",
         "start writes",
@@ -98,18 +99,73 @@ pub(in crate::family::flash_next) mod prof {
 
     pub(in crate::family::flash_next) fn on() -> bool {
         *ON.get_or_init(|| {
-            let on = std::env::var("INFERENCE_FLASH_NEXT_PROFILE").is_ok_and(|v| v != "0");
-            crate::kernels::page_io_block::arm();
+            let on = parse_switch(
+                std::env::var("INFERENCE_FLASH_NEXT_PROFILE")
+                    .ok()
+                    .as_deref(),
+            )
+            .unwrap_or(false);
+            crate::kernels::page_io_block::arm(on);
             on
         })
     }
 
+    /// The strict spelling the two diagnostic switches share: `1`, `true` or `on` arm them,
+    /// unset, `0`, `false` or `off` leave them off, and anything else is refused at driver
+    /// build by `check_switch_spelling`. The fast paths call the same parser, so the value
+    /// that would be refused is never the value that arms.
+    pub(super) fn parse_switch(raw: Option<&str>) -> std::result::Result<bool, String> {
+        match raw {
+            None | Some("0") | Some("false") | Some("off") => Ok(false),
+            Some("1") | Some("true") | Some("on") => Ok(true),
+            Some(other) => Err(other.to_string()),
+        }
+    }
+
+    /// Refuses an unknown spelling of either diagnostic switch at driver build, before any
+    /// chunk runs; a driver is never constructed with a value the fast paths would misread.
+    pub(in crate::family::flash_next) fn check_switch_spelling() -> Result<()> {
+        for name in [
+            "INFERENCE_FLASH_NEXT_PROFILE",
+            "INFERENCE_FLASH_NEXT_DRAIN_TICK",
+        ] {
+            let refused = |seen: &str| {
+                EngError::BadRequest(format!(
+                    "Flash-Next driver: {name} must be 1, true, on, 0, false or off, not {seen}"
+                ))
+            };
+            match std::env::var(name) {
+                Err(std::env::VarError::NotPresent) => {}
+                Err(std::env::VarError::NotUnicode(_)) => {
+                    return Err(refused("a non-unicode value"));
+                }
+                Ok(value) => {
+                    if let Err(bad) = parse_switch(Some(&value)) {
+                        return Err(refused(&bad));
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
     /// The host-stage measurement switch (`INFERENCE_FLASH_NEXT_DRAIN_TICK`): with the
-    /// profile on, every phase boundary also drains the device queues, so each phase's
-    /// recorded time is the host's own cost with an empty queue at its start.
+    /// profile on, every phase boundary first synchronises the step stream and then closes
+    /// the phase's slot, so a slot carries the wait that finishes its own queued work (the
+    /// queue is empty at its start; the host-only part is the slot minus that wait). Only
+    /// the step stream is drained — the prefill ring's copy stream and the expert bank's
+    /// stream keep running. The mode serialises host and device, so walls under it are
+    /// longer than without it and comparable only to each other.
     pub(in crate::family::flash_next) fn drain_tick() -> bool {
         static ON: OnceLock<bool> = OnceLock::new();
-        *ON.get_or_init(|| std::env::var("INFERENCE_FLASH_NEXT_DRAIN_TICK").is_ok_and(|v| v != "0"))
+        *ON.get_or_init(|| {
+            parse_switch(
+                std::env::var("INFERENCE_FLASH_NEXT_DRAIN_TICK")
+                    .ok()
+                    .as_deref(),
+            )
+            .unwrap_or(false)
+        })
     }
 
     pub(in crate::family::flash_next) fn add(slot: usize, spent: std::time::Duration) {
@@ -147,7 +203,7 @@ pub(in crate::family::flash_next) mod prof {
             );
         }
         eprintln!(
-            "flash-next chunk profile: {total_rows} rows, phases sum {:.1} s",
+            "flash-next chunk profile: {total_rows} rows, phases sum {:.1} s (the sum counts the interior slots 8-33 and the nested page-io slots 34-42 twice)",
             sum as f64 / 1e9
         );
         if let Some((up, down)) = crate::kernels::page_io_block::take() {
@@ -162,6 +218,29 @@ pub(in crate::family::flash_next) mod prof {
         }
         ROWS.store(0, AtomicOrdering::Relaxed);
     }
+}
+
+/// One phase boundary under the profile: drain first, then charge the elapsed time to
+/// the slot being closed. The drain synchronises the stream the phase just queued, so
+/// its wait belongs inside that phase's slot; draining after the reset would push it
+/// into the next phase. A free function (not the closure) so a host test can pin the
+/// order against a fake device.
+fn advance_boundary<D: ChunkDevice>(
+    dev: &mut D,
+    slot: usize,
+    t: &mut Instant,
+    profile: bool,
+    drain_on: bool,
+    add: impl FnOnce(usize, std::time::Duration),
+) -> Result<()> {
+    if drain_on {
+        dev.drain()?;
+    }
+    if profile {
+        add(slot, t.elapsed());
+        *t = Instant::now();
+    }
+    Ok(())
 }
 
 /// The device side of a chunk. The start writes are the sink of the host feeds at chunk
@@ -208,9 +287,11 @@ pub(in crate::family::flash_next::cuda) trait ChunkDevice {
     fn read_logits(&mut self) -> Result<Vec<f32>>;
     /// Reads the status word and the arithmetic flag; refuses a chunk that set either.
     fn check_health(&mut self) -> Result<()>;
-    /// Empties every device queue this device feeds. The host-stage measurement mode
-    /// (`INFERENCE_FLASH_NEXT_DRAIN_TICK` with the profile on) calls it between phases so
-    /// each phase's recorded time starts with an empty queue; the default does nothing.
+    /// Synchronises the step stream of this device — the only stream the host-stage
+    /// measurement mode (`INFERENCE_FLASH_NEXT_DRAIN_TICK` with the profile on) drains;
+    /// the prefill ring's copy stream and the expert bank's stream keep running. It runs
+    /// at a phase boundary before the phase's slot closes, so the slot carries the wait
+    /// that finishes its own queued work; the default does nothing.
     fn drain(&mut self) -> Result<()> {
         Ok(())
     }
@@ -244,6 +325,7 @@ impl<D: ChunkDevice, F: TokenFeeds> ChunkDriver<D, F> {
         feeds: F,
         shape: DriverShape,
     ) -> Result<Self> {
+        prof::check_switch_spelling()?;
         if shape.layers <= shape.ple_layer {
             return Err(EngError::BadRequest(format!(
                 "Flash-Next chunk driver: the PLE layer {} must sit inside the {} layers",
@@ -349,16 +431,7 @@ impl<D: ChunkDevice, F: TokenFeeds> ChunkDriver<D, F> {
         let drain_on = profile && prof::drain_tick();
         let mut t = Instant::now();
         let mut tick = |dev: &mut D, slot: usize| -> Result<()> {
-            // Drain before closing the slot: the drain completes the previous phase's tail, so
-            // its host wait belongs in that slot's total, not in the phase that follows.
-            if drain_on {
-                dev.drain()?;
-            }
-            if profile {
-                prof::add(slot, t.elapsed());
-                t = Instant::now();
-            }
-            Ok(())
+            advance_boundary(dev, slot, &mut t, profile, drain_on, prof::add)
         };
         self.device
             .write_chunk_params(tokens[0] as i32, pos as i32, m as i32)?;

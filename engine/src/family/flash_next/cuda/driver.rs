@@ -148,6 +148,7 @@ pub(super) struct TokenDriver<D: TokenDevice, F: TokenFeeds> {
 
 impl<D: TokenDevice, F: TokenFeeds> TokenDriver<D, F> {
     pub(super) fn new(device: D, feeds: F, shape: DriverShape) -> Result<Self> {
+        super::driver::chunk::prof::check_switch_spelling()?;
         if shape.layers == 0 || shape.ple_layer >= shape.layers || shape.positions == 0 {
             return Err(EngError::BadRequest(format!(
                 "Flash-Next driver: {} layers with the PLE layer at {} and {} positions",

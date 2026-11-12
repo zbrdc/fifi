@@ -217,3 +217,59 @@ fn feed_rows_with_the_default_cap_feeds_one_token_at_a_time() {
         ["chunk_params 1 0 1", "chunk_params 2 1 1"].map(String::from)
     );
 }
+
+#[test]
+fn the_switch_spelling_is_strict() {
+    use super::prof::parse_switch;
+    assert_eq!(parse_switch(None), Ok(false));
+    for off in ["0", "false", "off"] {
+        assert_eq!(parse_switch(Some(off)), Ok(false), "off spelling {off:?}");
+    }
+    for on in ["1", "true", "on"] {
+        assert_eq!(parse_switch(Some(on)), Ok(true), "on spelling {on:?}");
+    }
+    for bad in ["", "2", "yes", "TRUE", "On", " off"] {
+        assert!(parse_switch(Some(bad)).is_err(), "refuse spelling {bad:?}");
+    }
+}
+
+#[test]
+fn a_boundary_drains_before_it_charges_the_slot_and_only_under_both_switches() {
+    // The order the drain mode pins: the drain synchronises the stream the phase just
+    // queued, so its wait lands inside the slot being closed, and neither half runs
+    // without the profile. The OnceLock arming itself cannot be re-set within a process,
+    // so this holds the boundary given the two flags, which is where the order lives.
+    let mut dev = FakeChunkDevice::default();
+    let mut t = std::time::Instant::now();
+    let mut charged: Vec<usize> = Vec::new();
+    super::advance_boundary(&mut dev, 34, &mut t, true, true, |slot, _| {
+        charged.push(slot)
+    })
+    .unwrap();
+    assert_eq!(dev.log.last().map(String::as_str), Some("drain"));
+    assert_eq!(charged, [34]);
+
+    // Profile off: no drain and no charge.
+    let mut quiet = FakeChunkDevice::default();
+    let mut t = std::time::Instant::now();
+    let mut none: Vec<usize> = Vec::new();
+    super::advance_boundary(&mut quiet, 1, &mut t, false, false, |slot, _| {
+        none.push(slot)
+    })
+    .unwrap();
+    assert!(quiet.log.is_empty());
+    assert!(none.is_empty());
+
+    // A failing drain surfaces the error and charges nothing.
+    let mut failing = FakeChunkDevice {
+        fail: Some("drain"),
+        ..Default::default()
+    };
+    let mut t = std::time::Instant::now();
+    let error = super::advance_boundary(&mut failing, 2, &mut t, true, true, |slot, _| {
+        none.push(slot)
+    })
+    .unwrap_err();
+    assert!(matches!(error, EngError::Backend { .. }));
+    assert!(none.is_empty());
+}

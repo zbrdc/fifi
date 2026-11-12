@@ -612,8 +612,9 @@ fn complete_pageable_copy(
     upload: bool,
 ) -> Result<Vec<u8>, DeviceFailure> {
     // The wait is the host block this function exists to prove; its cost is charged to the
-    // page-io counters so the phase profile can split upload waits from readback waits. The
-    // shared-path rule: no clock read at all until the counters say they are armed.
+    // page-io counters so the phase profile can split upload waits from readback waits. No
+    // clock read until the counters say they are armed: the Qwen3.6 and Flint copies that
+    // share this path pay one load and a branch while disarmed, nothing else.
     let wait = if crate::kernels::page_io_block::armed() {
         Some(std::time::Instant::now())
     } else {
