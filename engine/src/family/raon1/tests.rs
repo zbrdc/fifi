@@ -492,10 +492,9 @@ fn read_f32_dequantizes_every_quantized_type_of_the_file() {
     }
 }
 
-#[test]
 /// Dims of the roles whose fields alias on the real model, written as literals
-/// from the field table — NOT from spec.inventory(). These are the roles S6 was
-/// about: a generator that reads the wrong field (ssm_norm on time_step_rank
+/// from the field table — NOT from spec.inventory(). These are the roles at
+/// stake: a generator that reads the wrong field (ssm_norm on time_step_rank
 /// instead of head_dim) still opens its own generated file, and only these
 /// hand-written rows catch it. RDA roles on layer 1, MLA roles on layer 2.
 #[test]
