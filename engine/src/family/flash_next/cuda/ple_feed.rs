@@ -250,13 +250,68 @@ impl HostProjection {
     /// scheduler four adds per weight load instead of one dependent chain.
     const UNROLL: usize = 4;
 
+    /// Chunk rows up to which [`Self::project_chunk`] takes the slab route. A judgement
+    /// call, not a measured crossover: the slab route streams each matrix's weights once per
+    /// chunk (split into per-thread slabs) for any row count, while the token route streams
+    /// them once per [`Self::BLOCK`]-token block per thread — fewer full sweeps once each
+    /// thread's run fits one block, which serving reaches around this width (serve chunks of
+    /// 16 rows: one sweep against eight).
+    const SLAB_ROWS: usize = 128;
+
+    /// Which `project_chunk` route `rows` takes: the slab route at or below [`Self::SLAB_ROWS`],
+    /// the token-block route above. Pure, so tests pin the threshold on it.
+    pub(in crate::family) fn uses_slab(rows: usize) -> bool {
+        rows <= Self::SLAB_ROWS
+    }
+
+    /// One thread's slab of one matrix: `run` weight rows folded against every token, results
+    /// laid out `sums[slab_row * tokens + token]`. Each weight row streams once and serves all
+    /// its tokens while hot; every element still folds its dot exactly as
+    /// [`HostMatrix::matvec`] does — the same sequential sum over the same products, only the
+    /// interleave across tokens differs, which the fold order cannot see.
+    fn project_slab(
+        matrix: &[f32],
+        matrix_rows: usize,
+        embeddings: &[f32],
+        tokens: usize,
+        run: usize,
+        first_row: usize,
+        embed: usize,
+    ) -> Vec<f32> {
+        let last = tokens - 1;
+        let quad_at = |base: usize| {
+            [
+                &embeddings[base.min(last) * embed..(base.min(last) + 1) * embed],
+                &embeddings[(base + 1).min(last) * embed..((base + 1).min(last) + 1) * embed],
+                &embeddings[(base + 2).min(last) * embed..((base + 2).min(last) + 1) * embed],
+                &embeddings[(base + 3).min(last) * embed..((base + 3).min(last) + 1) * embed],
+            ]
+        };
+        let mut sums = vec![0.0f32; run * tokens];
+        for row in first_row..(first_row + run).min(matrix_rows) {
+            let weights = &matrix[row * embed..(row + 1) * embed];
+            for quad in (0..tokens).step_by(Self::UNROLL) {
+                let dots = Self::row_dots(weights, quad_at(quad), embed);
+                for (lane, dot) in dots.iter().enumerate() {
+                    let token = quad + lane;
+                    if token < tokens {
+                        sums[(row - first_row) * tokens + token] = *dot;
+                    }
+                }
+            }
+        }
+        sums
+    }
+
     /// The projections of a whole chunk in one product: `rows` embeddings of `key.cols`
-    /// values each, flattened. The token runs split over the projection threads (whole rows
-    /// per thread, so no two threads share an output element); inside a run the tokens go
-    /// [`Self::BLOCK`] at a time and each weight row serves the whole block while hot, so the
-    /// weights stream once per block instead of once per token. Every output element folds its
-    /// dot exactly as [`HostMatrix::matvec`] does — the same sequential `sum` over the same
-    /// products — so the pairs are bit-identical to per-token [`PleProjection::project`] calls.
+    /// values each, flattened. At or below [`Self::SLAB_ROWS`] each matrix's weights stream
+    /// ONCE per chunk, split into per-thread row slabs ([`Self::project_slab`]); above it the
+    /// token runs split over the projection threads (whole rows per thread, so no two threads
+    /// share an output element) and the tokens go [`Self::BLOCK`] at a time inside a run, each
+    /// weight row serving the whole block while hot. Every output element folds its dot
+    /// exactly as [`HostMatrix::matvec`] does — the same sequential `sum` over the same
+    /// products — so the pairs are bit-identical to per-token [`PleProjection::project`] calls
+    /// on both routes.
     pub(in crate::family) fn project_chunk(
         &self,
         embeddings: &[f32],
@@ -275,12 +330,75 @@ impl HostProjection {
                 embeddings.len()
             )));
         }
+        if rows == 0 {
+            return Ok(Vec::new());
+        }
         let mut out: Vec<PleKeyValue> = (0..rows)
             .map(|_| PleKeyValue {
                 keys: vec![0.0; self.key.rows],
                 value: vec![0.0; self.value.rows],
             })
             .collect();
+        if Self::uses_slab(rows) {
+            // Slab route: each matrix streams once per chunk, split into per-thread row slabs.
+            let (key, value) = (&self.key, &self.value);
+            let threads = self.threads.max(1);
+            let key_run = key.rows.div_ceil(threads);
+            let value_run = value.rows.div_ceil(threads);
+            let mut sums: Vec<(usize, Vec<f32>, usize, Vec<f32>)> = Vec::new();
+            std::thread::scope(|scope| {
+                let mut handles = Vec::new();
+                for thread in 0..threads {
+                    let k_first = thread * key_run;
+                    let v_first = thread * value_run;
+                    if k_first >= key.rows && v_first >= value.rows {
+                        continue;
+                    }
+                    handles.push(scope.spawn(move || {
+                        (
+                            k_first,
+                            Self::project_slab(
+                                &key.data, key.rows, embeddings, rows, key_run, k_first, embed,
+                            ),
+                            v_first,
+                            Self::project_slab(
+                                &value.data,
+                                value.rows,
+                                embeddings,
+                                rows,
+                                value_run,
+                                v_first,
+                                embed,
+                            ),
+                        )
+                    }));
+                }
+                for handle in handles {
+                    sums.push(handle.join().expect("a slab projection thread panicked"));
+                }
+            });
+            for (k_first, keys_sums, v_first, value_sums) in &sums {
+                for slab_row in 0..key_run {
+                    let row = k_first + slab_row;
+                    if row >= key.rows {
+                        break;
+                    }
+                    for (token, pair) in out.iter_mut().enumerate() {
+                        pair.keys[row] = keys_sums[slab_row * rows + token];
+                    }
+                }
+                for slab_row in 0..value_run {
+                    let row = v_first + slab_row;
+                    if row >= value.rows {
+                        break;
+                    }
+                    for (token, pair) in out.iter_mut().enumerate() {
+                        pair.value[row] = value_sums[slab_row * rows + token];
+                    }
+                }
+            }
+            return Ok(out);
+        }
         let run = rows.div_ceil(self.threads.max(1)).max(1);
         std::thread::scope(|scope| {
             for (index, part) in out.chunks_mut(run).enumerate() {

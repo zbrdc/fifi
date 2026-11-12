@@ -421,11 +421,43 @@ impl PleProjection for Capturing {
 }
 
 #[test]
+fn the_chunk_product_route_threshold_is_pinned() {
+    // Both routes are bit-identical, so the identity tests cannot tell them apart; this pins
+    // the boundary. Mutation: change `rows <= Self::SLAB_ROWS` to `<` (or SLAB_ROWS by one) and
+    // exactly one of these fails.
+    assert!(HostProjection::uses_slab(128));
+    assert!(!HostProjection::uses_slab(129));
+}
+
+#[test]
+fn the_chunk_product_accepts_an_empty_chunk() {
+    let build = || {
+        HostProjection::new(
+            HostMatrix::new(8, 256, values(8 * 256, 1, 0.05)).unwrap(),
+            HostMatrix::new(8, 256, values(8 * 256, 2, 0.05)).unwrap(),
+            2,
+        )
+    };
+    let pairs = build().project_chunk(&[], 0).unwrap();
+    assert!(pairs.is_empty());
+}
+
+#[test]
 fn the_chunk_product_is_bit_identical_to_the_per_token_projections() {
     let shape = PleShape::new(dims(8)).unwrap();
     let embed = shape.embed();
     let (hidden, width) = (8, BRANCHES * 8);
-    for (threads, rows) in [(1, 1), (1, 37), (1, 40), (3, 70), (8, 129)] {
+    for (threads, rows) in [
+        (1, 1),
+        (1, 37),
+        (1, 40),
+        (3, 70),
+        (5, 16),
+        (8, 16),
+        (8, 128),
+        (8, 129),
+        (2, 300),
+    ] {
         let build = || {
             HostProjection::new(
                 HostMatrix::new(width, embed, values(width * embed, 1, 0.05)).unwrap(),
