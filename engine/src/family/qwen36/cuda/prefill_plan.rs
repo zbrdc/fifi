@@ -90,14 +90,10 @@ pub(crate) fn m_pos(p0: usize) -> usize {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum PrefillStep {
-    /// `rows >= 2` rows from position `p0` through the chunk layer loop.
-    Chunk { p0: usize, rows: usize },
-    /// A run of exactly one row at `p0` goes through `feed`, not a chunk (the Flash-Next
-    /// precedent), so a 1-row tail never needs a chunk plan.
-    Feed { p0: usize },
-}
+// The admission types moved to the shared prefill core (`family::prefill`); these re-exports
+// keep the old paths alive for the driver, the step and the plan tests.
+pub(crate) use crate::family::prefill::admission::{Admission, ChunkCost, Extra};
+pub(crate) use crate::family::prefill::arena::PrefillStep;
 
 /// The steps that feed `n_rows` rows from position `p0` (`feed_rows` gets tokens `0..n-1`; the
 /// last prompt token goes through decode). Each chunk has `min(M_pos(p0), m_sess, rows left)`
@@ -152,141 +148,6 @@ pub(crate) fn chunk_list_with_depth_tier(
         at += rows;
     }
     Ok(steps)
-}
-
-/// What chunk size `m` costs the device beyond KV.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) struct ChunkCost {
-    pub(crate) m: usize,
-    /// The `plan_arena` total of the chunk's tensor list.
-    pub(crate) arena: usize,
-    /// Bytes of the attention `part` buffer of the `M_sess` split plan, reported for a decision on
-    /// the flat charge. The driver allocates the buffer at [`PART_CHARGE`] (= `CPF_ATTN_PART_CAP`),
-    /// never at this figure: a smaller chunk launched with its own split plan can need more than
-    /// the `M_sess` plan (209 rows in a 256-row session: 14,266,368 B against 12,681,216; 641 rows
-    /// in a 1,024-row session: 21,399,552 against 16,908,288), and the flat cap covers both.
-    pub(crate) part: usize,
-}
-
-/// One extra tensor of the admission sum: `fixed + bytes_per_token * M` bytes, such as the tiered
-/// `partial [M][2048]` f32 (8,192 B per token) or the expert bank.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) struct Extra {
-    pub(crate) name: &'static str,
-    pub(crate) fixed: usize,
-    pub(crate) bytes_per_token: usize,
-}
-
-fn extras_bytes(extras: &[Extra], m: usize) -> Result<usize, EngError> {
-    let mut total = 0usize;
-    for extra in extras {
-        total = extra
-            .bytes_per_token
-            .checked_mul(m)
-            .and_then(|bytes| bytes.checked_add(extra.fixed))
-            .and_then(|bytes| bytes.checked_add(total))
-            .ok_or_else(|| {
-                EngError::MemoryPlan(format!("prefill plan: extra {} overflows", extra.name))
-            })?;
-    }
-    Ok(total)
-}
-
-/// The admission inputs that do not depend on the chunk size or the window.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct Admission {
-    /// Device bytes for the resident state ([`state_bytes`]), the decode arena, the prefill arena
-    /// and `part`: free VRAM measured ONCE by the caller right after the weight load and BEFORE the
-    /// resident state (the DeltaNet pool, the KV and the words, which `ResidentState::allocate`
-    /// takes together) and the decode-arena allocations, less the headroom (never a literal here);
-    /// the state and the decode arena are then charged as their own inputs (a figure from before
-    /// the KV is from before the pool too). The snapshot must follow the loading of every kernel
-    /// module: until the start sets CUDA_MODULE_LOADING=EAGER (or makes one warm-up launch per
-    /// entry), a lazily loaded module can take VRAM after the snapshot, and the headroom has to
-    /// cover it. The step's small session resources — the stream, the event, the pinned word and
-    /// the kernel scratch (`step.rs`) — also stay inside that headroom; the decode arena keeps its
-    /// own separate charge (real memory, not headroom).
-    pub(crate) device_budget: usize,
-    /// `DeviceArena::bytes()` of the decode plan, read at run time.
-    pub(crate) decode_arena: usize,
-    /// The flat `part` charge, [`PART_CHARGE`] in every row.
-    pub(crate) part_charge: usize,
-    /// Fallback buffers when one is active; 0 for Qwen3.6 Native.
-    pub(crate) fallback: usize,
-    pub(crate) device_extras: Vec<Extra>,
-    /// Pinned host bytes available, a separate budget: host extras never enter the device sum.
-    pub(crate) host_budget: usize,
-    pub(crate) host_extras: Vec<Extra>,
-}
-
-impl Admission {
-    /// The rule with the flat `part` charge and no decode arena, fallback or extras.
-    pub(crate) fn new(device_budget: usize) -> Self {
-        Self {
-            device_budget,
-            decode_arena: 0,
-            part_charge: PART_CHARGE,
-            fallback: 0,
-            device_extras: Vec::new(),
-            host_budget: 0,
-            host_extras: Vec::new(),
-        }
-    }
-
-    /// Whether chunk size `cost.m` is admitted with `state` bytes of resident state
-    /// ([`state_bytes`]): the device sum (the decode arena, the state, the arena, the larger
-    /// of the flat and the real `part`, the fallback and the device extras) leaves at least
-    /// [`SPARE_MIN`] spare and the pinned host rows fit the host budget.
-    pub(crate) fn passes(&self, state: usize, cost: &ChunkCost) -> Result<bool, EngError> {
-        // The part term is the larger of the flat charge and the chunk's real part: the flat charge
-        // is the floor, so a later lowering of `part_charge` cannot undercharge a chunk whose own
-        // split plan needs more.
-        let part = self.part_charge.max(cost.part);
-        let parts = [
-            self.decode_arena,
-            state,
-            cost.arena,
-            part,
-            self.fallback,
-            extras_bytes(&self.device_extras, cost.m)?,
-        ];
-        let charged = parts
-            .iter()
-            .try_fold(0usize, |sum, &part| sum.checked_add(part));
-        let spare = self
-            .device_budget
-            .checked_sub(charged.ok_or_else(overflow)?);
-        let host = extras_bytes(&self.host_extras, cost.m)?;
-        Ok(spare.is_some_and(|spare| spare >= SPARE_MIN) && host <= self.host_budget)
-    }
-
-    /// `M_sess`: the largest of `costs` that is admitted and at most `cap` (the
-    /// `qwen36.prefill_chunk` member; `None` is no cap, 2,048). `None` means no size passes and the
-    /// session keeps the per-token path. The budget is the caller's snapshot of free VRAM after the
-    /// weight load and before the resident state and the decode-arena allocations, less the
-    /// headroom (`device_budget`), and that snapshot must follow the loading of every kernel
-    /// module: until the start loads modules eagerly, a lazily loaded module can take VRAM after it
-    /// and the headroom has to cover that too.
-    pub(crate) fn admit(
-        &self,
-        state: usize,
-        costs: &[ChunkCost],
-        cap: Option<usize>,
-    ) -> Result<Option<usize>, EngError> {
-        let cap = cap.unwrap_or(M_LADDER[0]);
-        if !M_LADDER.contains(&cap) {
-            return Err(EngError::BadRequest(format!(
-                "prefill plan: prefill_chunk {cap} is not one of {M_LADDER:?}"
-            )));
-        }
-        let mut best = None;
-        for cost in costs.iter().filter(|cost| cost.m <= cap) {
-            if self.passes(state, cost)? {
-                best = best.max(Some(cost.m));
-            }
-        }
-        Ok(best)
-    }
 }
 
 /// KV bytes of a session of `window` positions: the pool's exact bytes per position, without

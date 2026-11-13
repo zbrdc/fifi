@@ -375,7 +375,10 @@ fn the_rule_reproduces_0049s_window_ends_from_its_pb_rows() {
     // state term (an explicit zero DeltaNet pool and words), so the design figures reproduce
     // exactly; production charges state_bytes (pool + KV + words), which moves the real window ends
     // down.
-    let (costs, admission) = (pb_costs(), Admission::new(BASIS));
+    let (costs, admission) = (
+        pb_costs(),
+        Admission::new(BASIS, PART_CHARGE, SPARE_MIN, &M_LADDER),
+    );
     let (fp16, kv8) = (per_position(KvMode::Fp16), per_position(KvMode::Int8G32));
     // The design: "FP16 prefill ends at 119.6K tokens (103.5K at M = 2,048)", to 0.1K.
     assert_eq!(
@@ -392,14 +395,17 @@ fn the_rule_reproduces_0049s_window_ends_from_its_pb_rows() {
     assert!((194_500..=195_500).contains(&last_window(&admission, &at_2048, kv8)));
     let fallback = Admission {
         fallback: 432 * MIB,
-        ..Admission::new(BASIS)
+        ..Admission::new(BASIS, PART_CHARGE, SPARE_MIN, &M_LADDER)
     };
     assert!((152_500..=153_500).contains(&last_window(&fallback, &at_2048, kv8)));
 }
 
 #[test]
 fn admit_picks_the_largest_size_that_passes_at_every_window_end() {
-    let (costs, admission) = (pb_costs(), Admission::new(BASIS));
+    let (costs, admission) = (
+        pb_costs(),
+        Admission::new(BASIS, PART_CHARGE, SPARE_MIN, &M_LADDER),
+    );
     let fp16 = per_position(KvMode::Fp16);
     let mut ends: Vec<(usize, usize)> = M_LADDER
         .iter()
@@ -424,7 +430,10 @@ fn admit_picks_the_largest_size_that_passes_at_every_window_end() {
 
 #[test]
 fn finding_13_dropping_the_part_row_flips_exactly_256_at_120k_fp16() {
-    let (costs, admission) = (pb_costs(), Admission::new(BASIS));
+    let (costs, admission) = (
+        pb_costs(),
+        Admission::new(BASIS, PART_CHARGE, SPARE_MIN, &M_LADDER),
+    );
     let kv = 120_000 * per_position(KvMode::Fp16);
     // 146 MiB are left after the KV (2,490 - 2,343.75 = 146.25).
     assert_eq!((BASIS - kv) / MIB, 146);
@@ -444,7 +453,7 @@ fn finding_13_dropping_the_part_row_flips_exactly_256_at_120k_fp16() {
         .collect();
     let dropped = Admission {
         part_charge: 0,
-        ..Admission::new(BASIS)
+        ..Admission::new(BASIS, PART_CHARGE, SPARE_MIN, &M_LADDER)
     };
     assert_eq!(dropped.admit(kv, &dropped_costs, None).unwrap(), Some(256));
     let passing: Vec<usize> = M_LADDER
@@ -466,7 +475,11 @@ fn at_least_64_mib_must_stay_spare_not_just_one_byte() {
     };
     let kv = 1000 * MIB;
     let need = kv + cost.arena + PART_CHARGE + SPARE_MIN;
-    let passes = |budget: usize| Admission::new(budget).passes(kv, &cost).unwrap();
+    let passes = |budget: usize| {
+        Admission::new(budget, PART_CHARGE, SPARE_MIN, &M_LADDER)
+            .passes(kv, &cost)
+            .unwrap()
+    };
     assert!(passes(need) && passes(need + 1));
     assert!(!passes(need - 1), "64 MiB - 1 spare");
     assert!(!passes(need - SPARE_MIN + 1), "1 byte spare");
@@ -487,7 +500,11 @@ fn exact_boundary(
     };
     let kv = 1000 * MIB;
     let need = kv + cost.arena + PART_CHARGE + SPARE_MIN + charge;
-    let at = |budget: usize| configure(Admission::new(budget)).passes(kv, &cost).unwrap();
+    let at = |budget: usize| {
+        configure(Admission::new(budget, PART_CHARGE, SPARE_MIN, &M_LADDER))
+            .passes(kv, &cost)
+            .unwrap()
+    };
     [at(need), at(need - 1)]
 }
 
@@ -508,7 +525,7 @@ fn every_device_charge_enters_the_sum_once_and_at_full_size() {
             "decode arena",
             Admission {
                 decode_arena: decode,
-                ..Admission::new(0)
+                ..Admission::new(0, PART_CHARGE, SPARE_MIN, &M_LADDER)
             },
             decode,
         ),
@@ -516,7 +533,7 @@ fn every_device_charge_enters_the_sum_once_and_at_full_size() {
             "fallback",
             Admission {
                 fallback: 432 * MIB,
-                ..Admission::new(0)
+                ..Admission::new(0, PART_CHARGE, SPARE_MIN, &M_LADDER)
             },
             432 * MIB,
         ),
@@ -524,7 +541,7 @@ fn every_device_charge_enters_the_sum_once_and_at_full_size() {
             "fixed extra",
             Admission {
                 device_extras: vec![extra(12_345, 0)],
-                ..Admission::new(0)
+                ..Admission::new(0, PART_CHARGE, SPARE_MIN, &M_LADDER)
             },
             12_345,
         ),
@@ -532,7 +549,7 @@ fn every_device_charge_enters_the_sum_once_and_at_full_size() {
             "per-token extra",
             Admission {
                 device_extras: vec![extra(0, 8192)],
-                ..Admission::new(0)
+                ..Admission::new(0, PART_CHARGE, SPARE_MIN, &M_LADDER)
             },
             8192 * 1024,
         ),
@@ -540,7 +557,7 @@ fn every_device_charge_enters_the_sum_once_and_at_full_size() {
             "two extras",
             Admission {
                 device_extras: vec![extra(7, 3), extra(11, 5)],
-                ..Admission::new(0)
+                ..Admission::new(0, PART_CHARGE, SPARE_MIN, &M_LADDER)
             },
             7 + 11 + 8 * 1024,
         ),
@@ -548,7 +565,7 @@ fn every_device_charge_enters_the_sum_once_and_at_full_size() {
             "part",
             Admission {
                 part_charge: 3 * PART_CHARGE,
-                ..Admission::new(0)
+                ..Admission::new(0, PART_CHARGE, SPARE_MIN, &M_LADDER)
             },
             2 * PART_CHARGE,
         ),
@@ -596,7 +613,7 @@ fn a_lowered_flat_part_charge_still_pays_the_real_part_when_it_is_larger() {
     let lowered = |budget: usize| Admission {
         device_budget: budget,
         part_charge: MIB,
-        ..Admission::new(0)
+        ..Admission::new(0, PART_CHARGE, SPARE_MIN, &M_LADDER)
     };
     let need = kv + cost.arena + 3 * MIB + SPARE_MIN;
     assert!(lowered(need).passes(kv, &cost).unwrap());
@@ -628,14 +645,22 @@ fn pinned_host_rows_have_their_own_budget_and_never_enter_the_device_sum() {
         arena: MIB,
         part: 0,
     };
-    let tight = with_host(8192 * 2048 - 1)(Admission::new(100 * MIB * 1024));
+    let tight = with_host(8192 * 2048 - 1)(Admission::new(
+        100 * MIB * 1024,
+        PART_CHARGE,
+        SPARE_MIN,
+        &M_LADDER,
+    ));
     assert!(!tight.passes(0, &cost).unwrap());
     assert!(tight.passes(0, &ChunkCost { m: 1024, ..cost }).unwrap());
 }
 
 #[test]
 fn a_cap_limits_m_sess_and_absent_means_2048() {
-    let (costs, rich) = (pb_costs(), Admission::new(100 * 1024 * MIB));
+    let (costs, rich) = (
+        pb_costs(),
+        Admission::new(100 * 1024 * MIB, PART_CHARGE, SPARE_MIN, &M_LADDER),
+    );
     assert_eq!(rich.admit(0, &costs, None).unwrap(), Some(2048));
     for cap in M_LADDER {
         assert_eq!(
@@ -656,7 +681,10 @@ fn a_cap_limits_m_sess_and_absent_means_2048() {
 #[test]
 fn admission_wins_over_a_larger_cap_and_the_cap_over_a_larger_admission() {
     // 114,688 FP16 positions leave 250 MiB: 512 passes (250 - 88.6 - 64 >= 64), 1,024 does not.
-    let (costs, admission) = (pb_costs(), Admission::new(BASIS));
+    let (costs, admission) = (
+        pb_costs(),
+        Admission::new(BASIS, PART_CHARGE, SPARE_MIN, &M_LADDER),
+    );
     let kv = 114_688 * per_position(KvMode::Fp16);
     assert_eq!(admission.admit(kv, &costs, None).unwrap(), Some(512));
     assert_eq!(admission.admit(kv, &costs, Some(2048)).unwrap(), Some(512));
@@ -665,7 +693,10 @@ fn admission_wins_over_a_larger_cap_and_the_cap_over_a_larger_admission() {
 
 #[test]
 fn eight_bit_kv_admits_what_fp16_refuses() {
-    let (costs, admission) = (pb_costs(), Admission::new(BASIS));
+    let (costs, admission) = (
+        pb_costs(),
+        Admission::new(BASIS, PART_CHARGE, SPARE_MIN, &M_LADDER),
+    );
     let d = dims();
     let kv = |mode| kv_bytes(&d, mode, 150_000).unwrap();
     assert_eq!(
@@ -691,7 +722,9 @@ fn sums_are_checked_not_wrapped_or_saturated() {
         part: 0,
     };
     assert!(
-        Admission::new(usize::MAX).passes(1, &cost).is_err(),
+        Admission::new(usize::MAX, PART_CHARGE, SPARE_MIN, &M_LADDER)
+            .passes(1, &cost)
+            .is_err(),
         "kv + arena wraps to 0"
     );
     let small = ChunkCost {
@@ -711,7 +744,7 @@ fn sums_are_checked_not_wrapped_or_saturated() {
     ] {
         let admission = Admission {
             device_extras: extras.clone(),
-            ..Admission::new(usize::MAX)
+            ..Admission::new(usize::MAX, PART_CHARGE, SPARE_MIN, &M_LADDER)
         };
         let error = admission
             .passes(0, &small)
@@ -719,7 +752,7 @@ fn sums_are_checked_not_wrapped_or_saturated() {
         assert!(error_text(error).contains("huge"), "{extras:?}");
         let host = Admission {
             host_extras: extras,
-            ..Admission::new(usize::MAX)
+            ..Admission::new(usize::MAX, PART_CHARGE, SPARE_MIN, &M_LADDER)
         };
         assert!(host.passes(0, &small).is_err());
     }
@@ -1031,7 +1064,7 @@ fn chunk_costs_are_the_ladder_in_order_and_feed_admission() {
     // With the computed totals and the whole resident state charged (the pool and the words
     // move every FP16 window end down by about 3.2K positions against the KV-only figure),
     // 100K FP16 positions admit the 2,048 arena and 120K admit none.
-    let admission = Admission::new(BASIS);
+    let admission = Admission::new(BASIS, PART_CHARGE, SPARE_MIN, &M_LADDER);
     let state = |window: usize| state_bytes(&d, KvMode::Fp16, window, 1).expect("state");
     assert_eq!(
         admission.admit(state(100_000), &costs, None).unwrap(),
@@ -1064,9 +1097,11 @@ fn fp16_kv_is_capped_near_80k_positions_at_the_2048_row_arena_ceiling() {
     };
     let d = dims();
     let end = |basis_mib: usize| {
-        last_window_with(&Admission::new(basis_mib * MIB), &cost, |window| {
-            state_bytes(&d, KvMode::Fp16, window, 1).expect("state")
-        })
+        last_window_with(
+            &Admission::new(basis_mib * MIB, PART_CHARGE, SPARE_MIN, &M_LADDER),
+            &cost,
+            |window| state_bytes(&d, KvMode::Fp16, window, 1).expect("state"),
+        )
     };
     assert_eq!(end(2490), 79_767);
     assert_eq!(end(2532), 81_918);
@@ -1098,7 +1133,7 @@ fn v1_totals_and_admission_tables_are_reported_beside_0049s_rows() {
         );
     }
     let pb = pb_costs();
-    let admission = Admission::new(BASIS);
+    let admission = Admission::new(BASIS, PART_CHARGE, SPARE_MIN, &M_LADDER);
     let modes = [("FP16", KvMode::Fp16), ("KV8", KvMode::Int8G32)];
     println!("last window each M passes (positions), design rows | v1 plan (whole state)");
     for m in M_LADDER.iter().rev() {

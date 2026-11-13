@@ -42,6 +42,10 @@ pub mod nemotron35;
     reason = "no engine path calls the store yet; only its tests do"
 )]
 pub(crate) mod parking;
+/// The shared prefill core promoted from the first chunked family: the admission arithmetic
+/// (device-free) and the CUDA arena-fill and chunk-driver primitives. Family plans stay with
+/// their families; nothing here names one.
+pub(in crate::family) mod prefill;
 #[allow(
     dead_code,
     reason = "the Qwen3.6 host and CUDA loads, the Flash-Next MoE/PLE blocks and the Nemotron host projector run the seam; the allow covers the adapters only tests still reach"
