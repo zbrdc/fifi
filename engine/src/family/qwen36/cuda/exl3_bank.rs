@@ -678,22 +678,23 @@ impl LayerResolver<'_, '_> {
             None
         };
         let refill = copy.map_or(stream, |(copy, _)| copy);
-        for &slot in &misses {
-            let expert = table.expert_of(slot);
-            for (part, target) in parts.iter().enumerate() {
-                let record = store[part].member(expert);
-                // On the launch stream (no split): the copy races the launches queued
-                // after it instead of a device-wide sync per miss, and the next layer's
-                // readback (already a stream wait) covers its completion. On the copy
-                // stream (split): the event below gates the launches that read the slot;
-                // both streams were quiescent at the readback that produced the picks.
-                // The store is pinned, so the record must stay untouched until the
-                // streams drain; the store is immutable post-load and
-                // process-long-lived, which is that invariant.
-                target
-                    .bank
-                    .write_at_enqueue(refill, slot * target.record, record)?;
-            }
+        for op in refill_plan(
+            table,
+            &misses,
+            [parts[0].record, parts[1].record, parts[2].record],
+        ) {
+            let record = store[op.part].member(op.expert);
+            // On the launch stream (no split): the copy races the launches queued
+            // after it instead of a device-wide sync per miss, and the next layer's
+            // readback (already a stream wait) covers its completion. On the copy
+            // stream (split): the event below gates the launches that read the slot;
+            // both streams were quiescent at the readback that produced the picks.
+            // The store is pinned, so the record must stay untouched until the
+            // streams drain; the store is immutable post-load and
+            // process-long-lived, which is that invariant.
+            parts[op.part]
+                .bank
+                .write_at_enqueue(refill, op.slot * op.record, record)?;
         }
         let event = match (copy, miss_count > 0) {
             (Some((_, event)), true) => {
@@ -712,6 +713,37 @@ impl LayerResolver<'_, '_> {
         probe::resolve(began.elapsed());
         Ok((slots, misses, event))
     }
+}
+
+/// One record copy of a layer refill: the slot that refills, the expert now in it, the
+/// part's buffer index, and the record stride of that part (the write offset is the slot
+/// times the stride).
+struct RefillOp {
+    slot: usize,
+    expert: usize,
+    part: usize,
+    record: usize,
+}
+
+/// The refill plan of one layer's misses — in miss order, then part order — as the exact
+/// copies [`LayerResolver::resolve_mapped`] issues, parameterized by the three parts'
+/// record strides. Pure host data over the table: the pick-replay harness records this
+/// instead of recomputing the refill semantics, so a change in the engine's refill order
+/// fails the golden compare.
+fn refill_plan(table: &LayerSlots, misses: &[usize], strides: [usize; 3]) -> Vec<RefillOp> {
+    let mut ops = Vec::with_capacity(misses.len() * 3);
+    for &slot in misses {
+        let expert = table.expert_of(slot);
+        for part in 0..3 {
+            ops.push(RefillOp {
+                slot,
+                expert,
+                part,
+                record: strides[part],
+            });
+        }
+    }
+    ops
 }
 
 /// Test-only pick-trace capture: the admission-policy study replays real routing through
