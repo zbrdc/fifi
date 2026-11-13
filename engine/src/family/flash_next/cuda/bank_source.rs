@@ -50,11 +50,11 @@ pub(super) struct PackRecordSource<'a> {
 impl<'a> PackRecordSource<'a> {
     /// Takes the layer and expert counts from `config.json` and the record layout from the first
     /// expert of the first layer, then checks the layout against the header walk's routed-expert
-    /// total (`files.report.pack.expert_bytes`), so every expert has the layout's size or the pack was
+    /// total (`files.report.expert_bytes`), so every expert has the layout's size or the pack was
     /// refused at open.
     pub(super) fn from_files(files: &'a FlashPackFiles) -> Result<Self, EngError> {
         let source = Self::new(&files.checkpoint)?;
-        source.check_expert_bytes(files.report.pack.expert_bytes)?;
+        source.check_expert_bytes(files.report.expert_bytes)?;
         Ok(source)
     }
 

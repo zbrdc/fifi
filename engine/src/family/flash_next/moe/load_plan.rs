@@ -1,7 +1,7 @@
 //! The memory plan of a full Flash-Next load: what the pack's own header walk and config say about
 //! the sizes, joined to the context-aware expert budget.
 //!
-//! WHAT: [`FlashLoadPlan::new`] takes the header-walk report (`FlashPackReport`), the model config
+//! WHAT: [`FlashLoadPlan::new`] takes the header-walk report (`PackReport`), the model config
 //! and the n-gram table length, and derives every number the load needs without reading a payload:
 //! the routed-expert shape, the trunk bytes on the device (everything but the experts and the
 //! embedding, which the host gathers), the DeltaNet state, the K/V geometry of the attention layers
@@ -25,10 +25,8 @@ use super::{
 };
 use crate::{
     EngError,
-    family::flash_next::{
-        deltanet::DeltaState,
-        load::{exl3_pack::FlashPackReport, model_shape},
-    },
+    family::exl3_pack::PackReport,
+    family::flash_next::{deltanet::DeltaState, load::model_shape},
     family::qwen36::tiered::budget::KvPlan,
 };
 
@@ -59,28 +57,22 @@ impl FlashLoadPlan {
     /// the cost-model fixture); its `shape`,
     /// `vram.non_expert` and `kv` fields are replaced by what the pack says.
     pub(in crate::family::flash_next) fn new(
-        report: &FlashPackReport,
+        report: &PackReport,
         model_config: &[u8],
         ngram_bytes: u64,
         card: TierInputs,
     ) -> Result<Self, EngError> {
         let (model, kinds) = model_shape(model_config)?;
         let moe = model.moe;
-        let shape = TierShape::from_pack(
-            kinds.len(),
-            moe.experts,
-            moe.top_k,
-            report.pack.expert_bytes,
-        )?;
+        let shape = TierShape::from_pack(kinds.len(), moe.experts, moe.top_k, report.expert_bytes)?;
         // Two bytes an element: the real pack stores the embedding in BF16. The walk accepts any half
         // dtype or F32; an F32 table would make this figure, and so the trunk's, too small by half.
         let embedding_bytes = (model.vocab as u64)
             .checked_mul(moe.hidden as u64 * 2)
             .ok_or_else(|| refuse("the embedding size overflows".into()))?;
         let trunk_bytes = report
-            .pack
             .device_bytes
-            .checked_sub(report.pack.expert_bytes)
+            .checked_sub(report.expert_bytes)
             .and_then(|rest| rest.checked_sub(embedding_bytes))
             .ok_or_else(|| {
                 refuse("the experts and the embedding exceed the pack's device bytes".into())

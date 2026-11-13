@@ -14,17 +14,15 @@ const CONFIG: &[u8] =
 const GIB_U: u64 = 1 << 30;
 const EXPERT_BYTES: u64 = 1_881_600;
 
-fn report(trunk: u64) -> FlashPackReport {
+fn report(trunk: u64) -> PackReport {
     let experts = 24_576 * EXPERT_BYTES;
     let embedding = 248_320u64 * 2560 * 2;
-    FlashPackReport {
-        pack: PackReport {
-            device_bytes: experts + embedding + trunk,
-            expert_bytes: experts,
-            matrices: 74_041,
-            rates: BTreeMap::new(),
-            codebook: Marker::Mul1,
-        },
+    PackReport {
+        device_bytes: experts + embedding + trunk,
+        expert_bytes: experts,
+        matrices: 74_041,
+        rates: BTreeMap::new(),
+        codebook: Marker::Mul1,
     }
 }
 
@@ -128,7 +126,7 @@ fn a_context_that_keeps_too_few_slots_is_refused_with_the_longest_that_works() {
 #[test]
 fn a_report_smaller_than_its_experts_and_embedding_is_refused() {
     let mut small = report(0);
-    small.pack.device_bytes = small.pack.expert_bytes;
+    small.device_bytes = small.expert_bytes;
     let text = FlashLoadPlan::new(&small, CONFIG, 0, card())
         .unwrap_err()
         .describe();

@@ -7,7 +7,6 @@
 
 use super::*;
 use crate::family::exl3_pack::{Marker, PackReport};
-use crate::family::flash_next::load::exl3_pack::FlashPackReport;
 use crate::family::flash_next::moe::load_plan::FlashLoadPlan;
 use crate::family::flash_next::moe::tier_plan::TierShape;
 use std::collections::BTreeMap;
@@ -16,17 +15,15 @@ use std::fmt::Write as _;
 const CONFIG: &[u8] =
     include_bytes!("../../../../../tests/fixtures/qwen3_8_flash_next_config.json");
 
-fn pack_report(trunk: u64) -> FlashPackReport {
+fn pack_report(trunk: u64) -> PackReport {
     let experts = 24_576 * EXPERT_BYTES;
     let embedding = 248_320u64 * 2560 * 2;
-    FlashPackReport {
-        pack: PackReport {
-            device_bytes: experts + embedding + trunk,
-            expert_bytes: experts,
-            matrices: 74_041,
-            rates: BTreeMap::new(),
-            codebook: Marker::Mul1,
-        },
+    PackReport {
+        device_bytes: experts + embedding + trunk,
+        expert_bytes: experts,
+        matrices: 74_041,
+        rates: BTreeMap::new(),
+        codebook: Marker::Mul1,
     }
 }
 

@@ -137,9 +137,9 @@ fn banked_load_holds_dense_plus_slots_and_stores_every_expert() {
     let slots = 8usize;
     let checkpoint = Checkpoint::open(dir).expect("open the pack");
     let shape = HostShape::from_spec(&QWEN3_6_35B_A3B, ROTARY_DIM).expect("host shape");
-    let split = inspect_pack_split(&checkpoint.source, &shape).expect("header walk");
-    let routed = split.routed_bytes;
-    let dense = split.report.device_bytes - routed;
+    let report = inspect_pack_split(&checkpoint.source, &shape).expect("header walk");
+    let routed = report.expert_bytes;
+    let dense = report.device_bytes - routed;
     let layers = shape.kinds.len();
     let experts = shape.moe.experts;
     let per_member = routed / layers as u64 / experts as u64;

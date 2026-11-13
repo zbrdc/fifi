@@ -228,18 +228,14 @@ fn a_pack_of_the_model_shape_is_counted_from_its_headers() {
     assert_eq!(report.matrices, 1 + 3 + 4 + 2 * 3 * 4);
 }
 
-/// The walk now totals the routed experts' device bytes twice: the report's `expert_bytes`
-/// (saturating, accumulated per moe_block) and the split's `routed_bytes` (plain addition over
-/// the banks). One quantity computed two ways must agree on a synthetic pack.
+/// The walk's report carries the routed experts' device bytes in `expert_bytes` (the field a
+/// banked load's dense/routed split reads); a synthetic pack with experts must produce a
+/// positive total there.
 #[test]
-fn the_two_routed_expert_sums_of_the_split_agree() {
+fn the_walk_totals_routed_expert_bytes() {
     let entries = pack(&shape());
-    let split = inspect_pack_split(&fixtures::checkpoint(entries), &shape()).unwrap();
-    assert!(
-        split.report.expert_bytes > 0,
-        "the synthetic pack has experts"
-    );
-    assert_eq!(split.report.expert_bytes, split.routed_bytes);
+    let report = inspect_pack_split(&fixtures::checkpoint(entries), &shape()).unwrap();
+    assert!(report.expert_bytes > 0, "the synthetic pack has experts");
 }
 
 #[test]

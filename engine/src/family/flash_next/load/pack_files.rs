@@ -14,12 +14,10 @@
 
 use std::path::Path;
 
-use super::{
-    Dims,
-    exl3_pack::{FlashPackReport, inspect_flash_pack},
-};
+use super::{Dims, exl3_pack::inspect_flash_pack};
 use crate::{
     EngError,
+    family::exl3_pack::PackReport,
     family::exl3_pack::Root,
     storage_guard::LocalGuard,
     weights::exl3::{Checkpoint, ngram::NgramLayout, ngram_file::NgramFile},
@@ -40,7 +38,7 @@ pub(in crate::family) const SIDE_FILES: [&str; 3] = [
 pub(in crate::family) struct FlashPackFiles {
     pub(in crate::family) checkpoint: Checkpoint,
     pub(in crate::family) ngram: NgramFile,
-    pub(in crate::family) report: FlashPackReport,
+    pub(in crate::family) report: PackReport,
 }
 
 /// The tensor-name prefix of the n-gram table: the layer with the PLE block.

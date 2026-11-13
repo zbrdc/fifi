@@ -133,24 +133,15 @@ pub(in crate::family) fn codebook_name(marker: Marker) -> &'static str {
     }
 }
 
-/// A family's header walk over a pack directory: exactly the rules its serving load applies.
-pub(in crate::family) trait PackWalk {
-    fn walk(&self, dir: &std::path::Path) -> Result<PackReport, EngError>;
-}
-
-/// Runs `walk` over `dir` and copies the report into the family-neutral plan.
-pub(in crate::family) fn plan_pack(
-    dir: &std::path::Path,
-    walk: &dyn PackWalk,
-) -> Result<PackPlan, EngError> {
-    let report = walk.walk(dir)?;
-    Ok(PackPlan {
+/// Copies a walk report into the family-neutral plan.
+pub(in crate::family) fn plan_from_report(report: PackReport) -> PackPlan {
+    PackPlan {
         device_bytes: report.device_bytes,
         expert_bytes: report.expert_bytes,
         matrices: report.matrices,
         rates: report.rates,
         codebook: codebook_name(report.codebook),
-    })
+    }
 }
 
 /// What kind of tensor a walk visited.

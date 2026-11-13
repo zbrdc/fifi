@@ -7,7 +7,7 @@ pub(crate) mod executor;
 #[cfg(all(feature = "native-cuda", target_os = "linux"))]
 pub(in crate::family) mod exl3;
 #[cfg(any(test, all(feature = "native-cuda", target_os = "linux")))]
-mod exl3_pack;
+pub(crate) mod exl3_pack;
 #[allow(
     dead_code,
     reason = "the factory wires the MLX and the opt-in CUDA executors (`cuda_decode`); the allow covers the pieces still reached only by tests until the family is qualified"

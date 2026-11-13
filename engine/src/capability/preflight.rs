@@ -1645,7 +1645,7 @@ fn estimate_q36(
 /// rows only retell it, so the record and the estimate cannot disagree.
 #[cfg(any(test, all(feature = "native-cuda", target_os = "linux")))]
 fn q36_exl3_decisions(
-    plan: &crate::family::qwen36::Exl3PackPlan,
+    plan: &crate::family::exl3_pack::PackPlan,
     estimate: &Estimate,
     disk_bytes: u64,
     kv: crate::family::qwen36::settings::KvDtype,
@@ -2047,11 +2047,11 @@ mod tests {
 
     #[test]
     fn q36_exl3_decisions_retell_the_pack_walk_and_the_context_proposal() {
-        use crate::family::qwen36::Exl3PackPlan;
+        use crate::family::exl3_pack::PackPlan;
         use crate::family::qwen36::settings::KvDtype;
         use std::collections::BTreeMap;
 
-        let plan = Exl3PackPlan {
+        let plan = PackPlan {
             device_bytes: 21_000_000_000,
             expert_bytes: 20_000_000_000,
             matrices: 1_976,

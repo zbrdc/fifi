@@ -54,21 +54,16 @@ pub(super) fn inspect_pack(
     source: &StreamedCheckpoint,
     shape: &HostShape,
 ) -> Result<PackReport, EngError> {
-    inspect_pack_split(source, shape).map(|split| split.report)
+    inspect_pack_split(source, shape)
 }
 
-/// The pack walk plus its expert/dense split: `routed_bytes` is the device bytes of the routed
-/// experts alone (the banks a banked load replaces with `slots` members per projection), so
-/// `report.device_bytes - routed_bytes` is what a banked load still uploads.
-pub(super) struct PackSplit {
-    pub(super) report: PackReport,
-    pub(super) routed_bytes: u64,
-}
-
+/// The routed experts' device bytes are the report's `expert_bytes` (the banks a banked load
+/// replaces with `slots` members per projection); `device_bytes - expert_bytes` is what a
+/// banked load still uploads.
 pub(super) fn inspect_pack_split(
     source: &StreamedCheckpoint,
     shape: &HostShape,
-) -> Result<PackSplit, EngError> {
+) -> Result<PackReport, EngError> {
     let mut walk = Inspector::new(source, Root::Layers);
     let dim = |value: usize| u32::try_from(value).unwrap_or(u32::MAX);
     let h = shape.hidden;
@@ -82,7 +77,6 @@ pub(super) fn inspect_pack_split(
     }
     walk.plain(NORM_NAME, &[dim(h)], false)?;
     walk.matrix(HEAD_PREFIX, h, shape.vocab)?;
-    let mut routed_total = 0u64;
     for (layer, kind) in shape.kinds.iter().enumerate() {
         walk.plain(
             &walk.root().name(layer, "input_layernorm.weight"),
@@ -99,13 +93,9 @@ pub(super) fn inspect_pack_split(
             AttentionKind::DeltaNet => walk.delta(layer, shape)?,
             other => return Err(refuse(format!("layer {layer} is {other:?}"))),
         }
-        routed_total = routed_total.saturating_add(walk.moe(layer, shape)?);
+        walk.moe(layer, shape)?;
     }
-    let report = walk.report()?;
-    Ok(PackSplit {
-        report,
-        routed_bytes: routed_total,
-    })
+    walk.report()
 }
 
 impl Inspector<'_> {
@@ -180,10 +170,6 @@ impl Inspector<'_> {
     }
 }
 
-/// The planning summary of one pack directory: the family-neutral
-/// [`PackPlan`](crate::family::exl3_pack::PackPlan) under its historical name.
-pub(crate) type Exl3PackPlan = crate::family::exl3_pack::PackPlan;
-
 /// Walks the pack of `dir` the way the serving load does (`load_exl3_dir`: pinned model,
 /// pinned rotary dimension, no MTP head) and returns its planning facts. A pack of another
 /// size, rate, codebook or layout is refused here, exactly as the load would refuse it
@@ -192,11 +178,8 @@ pub(crate) type Exl3PackPlan = crate::family::exl3_pack::PackPlan;
 /// dimension, no MTP head).
 struct Q36Walk;
 
-impl crate::family::exl3_pack::PackWalk for Q36Walk {
-    fn walk(
-        &self,
-        dir: &std::path::Path,
-    ) -> Result<crate::family::exl3_pack::PackReport, EngError> {
+impl Q36Walk {
+    fn walk(&self, dir: &std::path::Path) -> Result<PackReport, EngError> {
         let checkpoint = crate::weights::exl3::Checkpoint::open(dir)?;
         let shape = HostShape::from_spec(
             &crate::family::spec::QWEN3_6_35B_A3B,
@@ -208,6 +191,10 @@ impl crate::family::exl3_pack::PackWalk for Q36Walk {
 
 /// The device-free estimate of one pack directory for this family's serving load:
 /// the header walk's totals, produced through the family-neutral plan.
-pub(crate) fn exl3_plan(dir: &std::path::Path) -> Result<Exl3PackPlan, EngError> {
-    crate::family::exl3_pack::plan_pack(dir, &Q36Walk)
+pub(crate) fn exl3_plan(
+    dir: &std::path::Path,
+) -> Result<crate::family::exl3_pack::PackPlan, EngError> {
+    Q36Walk
+        .walk(dir)
+        .map(crate::family::exl3_pack::plan_from_report)
 }

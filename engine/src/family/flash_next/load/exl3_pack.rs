@@ -32,12 +32,6 @@ use crate::{
 /// The hyper-connection mixer that feeds `lm_head`: a read without an inject projection.
 const MIXER: &str = "model.language_model.hyper_connection_mixer";
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub(in crate::family) struct FlashPackReport {
-    /// The shared walk report; its `expert_bytes` field is the part that expert tiers place.
-    pub(in crate::family) pack: PackReport,
-}
-
 fn refuse(detail: String) -> EngError {
     EngError::Checkpoint(format!("EXL3 pack: {detail}"))
 }
@@ -47,7 +41,7 @@ fn refuse(detail: String) -> EngError {
 pub(in crate::family) fn inspect_flash_pack(
     source: &StreamedCheckpoint,
     config: &[u8],
-) -> Result<FlashPackReport, EngError> {
+) -> Result<PackReport, EngError> {
     walk_flash_pack(source, config, false).map(|(report, _)| report)
 }
 
@@ -56,7 +50,7 @@ pub(in crate::family) fn inspect_flash_pack(
 pub(in crate::family) fn inspect_flash_pack_listing(
     source: &StreamedCheckpoint,
     config: &[u8],
-) -> Result<(FlashPackReport, Vec<Visit>), EngError> {
+) -> Result<(PackReport, Vec<Visit>), EngError> {
     walk_flash_pack(source, config, true)
 }
 
@@ -64,7 +58,7 @@ fn walk_flash_pack(
     source: &StreamedCheckpoint,
     config: &[u8],
     record: bool,
-) -> Result<(FlashPackReport, Vec<Visit>), EngError> {
+) -> Result<(PackReport, Vec<Visit>), EngError> {
     let dims = Dims::read(config)?;
     let mut walk = Inspector::new(source, Root::Layers);
     if record {
@@ -95,7 +89,7 @@ fn walk_flash_pack(
         walk.moe_block(layer, block)?;
     }
     let (pack, visits) = walk.report_with_visits()?;
-    Ok((FlashPackReport { pack }, visits))
+    Ok((pack, visits))
 }
 
 /// One hyper-connection site under `prefix`: every weight in one half dtype, which the kernel

@@ -478,7 +478,7 @@ pub(super) fn build_driver(
         layers,
         model.moe.experts(),
         model.moe.top_k(),
-        report.pack.expert_bytes,
+        report.expert_bytes,
     )?;
     let (mem_total, mem_available) = read_meminfo()?;
     // The prefill ring's budget, carved out before the load plan so the bank sizes itself

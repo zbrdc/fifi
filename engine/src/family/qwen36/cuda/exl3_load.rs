@@ -84,8 +84,8 @@ pub(super) fn load_exl3_banked_dir(
         inventory: &inventory,
     };
     let reader = PackReader::new(projector, &checkpoint, reserve);
-    let split = inspect_pack_split(&checkpoint.source, &shape)?;
-    let dense = split.report.device_bytes.saturating_sub(split.routed_bytes);
+    let report = inspect_pack_split(&checkpoint.source, &shape)?;
+    let dense = report.device_bytes.saturating_sub(report.expert_bytes);
     reader.admit(dense)?;
     let layers = LayerTable::new(&dims, &inventory)?.len();
     let mut store = ExpertStore::with_layers(layers);
@@ -101,7 +101,7 @@ pub(super) fn load_exl3_banked_dir(
         store,
         slots,
         experts: shape.moe.experts,
-        routed_bytes: split.routed_bytes,
+        routed_bytes: report.expert_bytes,
         dense_bytes: dense,
     })
 }
@@ -129,7 +129,7 @@ pub(super) fn load_exl3_dir_decided(
     };
     let checkpoint = Checkpoint::open(dir)?;
     let shape = HostShape::from_spec(&QWEN3_6_35B_A3B, ROTARY_DIM)?;
-    let split = inspect_pack_split(&checkpoint.source, &shape)?;
+    let report = inspect_pack_split(&checkpoint.source, &shape)?;
     let host_facts = probe_host();
     let host = (
         host_facts.mem_total_bytes.clone(),
@@ -143,14 +143,14 @@ pub(super) fn load_exl3_dir_decided(
         _ => None,
     };
     let free = u64::try_from(projector.memory_info()?.free).unwrap_or(u64::MAX);
-    let dense = split.report.device_bytes.saturating_sub(split.routed_bytes);
+    let dense = report.device_bytes.saturating_sub(report.expert_bytes);
     let layers = shape.kinds.len();
     let experts = shape.moe.experts;
     let decision = super::exl3_bank::decide(
         bank.slots,
         bank.mode,
         dense,
-        split.routed_bytes,
+        report.expert_bytes,
         layers,
         experts,
         free,

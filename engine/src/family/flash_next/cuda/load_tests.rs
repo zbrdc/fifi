@@ -259,12 +259,12 @@ fn the_list_bytes_are_the_walks_trunk_bytes() {
     // The plan's rule (FlashLoadPlan): device bytes less the experts and the embedding.
     assert_eq!(
         list.bytes(),
-        report.pack.device_bytes - report.pack.expert_bytes - embedding
+        report.device_bytes - report.expert_bytes - embedding
     );
     assert_eq!(embedding, 248_320 * 2560 * 2);
     let matrices = list.all().filter(|t| t.form == Form::Matrix).count();
     // 301 matrices at 5 bpw and the 12 indexers at 3 bpw are trunk; the rest are experts.
-    assert_eq!(report.pack.matrices - matrices, 48 * 512 * 3);
+    assert_eq!(report.matrices - matrices, 48 * 512 * 3);
     eprintln!(
         "trunk {} tensors, {} bytes",
         list.all().count(),

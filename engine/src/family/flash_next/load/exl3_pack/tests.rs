@@ -260,19 +260,19 @@ fn a_stock_pack_matches_the_config_and_an_independent_byte_sum() {
         .filter(|(name, ..)| name.contains(".mlp.experts."))
         .map(|(name, dtype, shape)| device_bytes(name, dtype, shape))
         .sum::<u64>();
-    assert_eq!(report.pack.device_bytes, total);
-    assert_eq!(report.pack.expert_bytes, experts);
+    assert_eq!(report.device_bytes, total);
+    assert_eq!(report.expert_bytes, experts);
     // lm_head, 3 DeltaNet layers of 3 and a QSA layer of 5, 4 layers of 9 experts and 3 shared.
-    assert_eq!(report.pack.matrices, 1 + 3 * 3 + 5 + 4 * 12);
+    assert_eq!(report.matrices, 1 + 3 * 3 + 5 + 4 * 12);
     let low = 1 + 4 * 9;
     assert_eq!(
-        report.pack.rates.into_iter().collect::<Vec<_>>(),
+        report.rates.into_iter().collect::<Vec<_>>(),
         [
             ((LOW / 8) as u8, low),
             ((HIGH / 8) as u8, 1 + 9 + 4 + 4 * 3)
         ]
     );
-    assert_eq!(report.pack.codebook, Marker::Mul1);
+    assert_eq!(report.codebook, Marker::Mul1);
 }
 
 /// The recording walk returns the report of the plain walk, and its list is the pack: every
@@ -287,13 +287,13 @@ fn the_listing_is_the_pack_and_adds_up_to_the_report() {
     assert_eq!(report, plain_report);
     assert_eq!(
         visits.iter().map(|v| v.bytes).sum::<u64>(),
-        report.pack.device_bytes
+        report.device_bytes
     );
     let matrices = visits
         .iter()
         .filter(|v| matches!(v.kind, VisitKind::Matrix { .. }))
         .count();
-    assert_eq!(matrices, report.pack.matrices);
+    assert_eq!(matrices, report.matrices);
     let visited: std::collections::BTreeSet<&str> =
         visits.iter().map(|v| v.name.as_str()).collect();
     assert_eq!(visited.len(), visits.len(), "a tensor visited twice");
@@ -437,12 +437,12 @@ fn the_real_pack_matches_the_config_and_its_independent_byte_sum() {
     println!("REPORTED: {report:?}");
     let expected = |name: &str| var(name).parse::<u64>().unwrap();
     assert_eq!(
-        report.pack.device_bytes,
+        report.device_bytes,
         expected("FIFI_FLASH_NEXT_EXL3_EXPECT_BYTES")
     );
     assert_eq!(
-        report.pack.expert_bytes,
+        report.expert_bytes,
         expected("FIFI_FLASH_NEXT_EXL3_EXPECT_EXPERT_BYTES")
     );
-    assert_eq!(report.pack.codebook, Marker::Mul1);
+    assert_eq!(report.codebook, Marker::Mul1);
 }

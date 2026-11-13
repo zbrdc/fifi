@@ -38,7 +38,7 @@ fn the_whole_trunk_uploads_and_the_device_holds_the_plans_trunk_bytes() {
         kinds.len(),
         shape.moe.experts(),
         shape.moe.top_k(),
-        report.pack.expert_bytes,
+        report.expert_bytes,
     )
     .expect("tier shape");
     let card = TierInputs::cost_model_3090(
