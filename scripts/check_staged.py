@@ -12,6 +12,7 @@ import re
 import shutil
 import subprocess
 import sys
+import tempfile
 
 
 COMMIT_SUBJECT = re.compile(
@@ -574,29 +575,62 @@ def run_publisher_integration(root: Path) -> None:
             "qualification evaluates exactly the integrated tree; commit or "
             "stash first"
         )
-    for label, relative, argv in PUBLISHER_INTEGRATION_CHECKS:
-        if shutil.which(argv[0]) is None:
+    # The mlx unit suite's Scratch requires a task TMPDIR (deliberate); a
+    # caller without one fails six tests on the missing variable rather than
+    # on integration. Provide one for the checks' lifetime, under a
+    # task-owned parent — TMP, then TEMP, then a scratch directory under
+    # CARGO_TARGET_DIR — and remove it afterwards. Never /tmp: the host rule
+    # forbids agent scratch there. A caller that set its own TMPDIR is
+    # untouched.
+    created_tmpdir = None
+    if not os.environ.get("TMPDIR"):
+        parent = None
+        for key in ("TMP", "TEMP"):
+            candidate = os.environ.get(key)
+            if candidate and candidate != "/tmp":
+                parent = candidate
+                break
+        if parent is None:
+            cargo_target = os.environ.get("CARGO_TARGET_DIR")
+            if cargo_target:
+                parent = os.path.join(cargo_target, "fifi-gate-scratch")
+                os.makedirs(parent, exist_ok=True)
+        if parent is None:
             raise CheckError(
-                f"publisher integration check \"{label}\" cannot run: "
-                f"{argv[0]} was not found on PATH"
+                "publisher integration gate needs a task scratch directory: "
+                "set TMPDIR (or TMP, TEMP or CARGO_TARGET_DIR) to a non-/tmp "
+                "directory"
             )
-        try:
-            result = subprocess.run(
-                argv,
-                cwd=str(root / relative),
-                stdout=subprocess.PIPE,
-                stderr=subprocess.STDOUT,
-                check=False,
-            )
-        except OSError as error:
-            raise CheckError(f"publisher integration check \"{label}\" failed to start: {error}") from error
-        if result.returncode != 0:
-            tail = result.stdout.decode("utf-8", errors="backslashreplace").strip()[-800:]
-            raise CheckError(
-                f"publisher integration check \"{label}\" failed with exit status "
-                f"{result.returncode}" + (f":\n{tail}" if tail else "")
-            )
-        print(f"publisher integration check passed: {label}")
+        created_tmpdir = tempfile.mkdtemp(prefix="publisher-gate-tmp.", dir=parent)
+        os.environ["TMPDIR"] = created_tmpdir
+    try:
+        for label, relative, argv in PUBLISHER_INTEGRATION_CHECKS:
+            if shutil.which(argv[0]) is None:
+                raise CheckError(
+                    f"publisher integration check \"{label}\" cannot run: "
+                    f"{argv[0]} was not found on PATH"
+                )
+            try:
+                result = subprocess.run(
+                    argv,
+                    cwd=str(root / relative),
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.STDOUT,
+                    check=False,
+                )
+            except OSError as error:
+                raise CheckError(f"publisher integration check \"{label}\" failed to start: {error}") from error
+            if result.returncode != 0:
+                tail = result.stdout.decode("utf-8", errors="backslashreplace").strip()[-800:]
+                raise CheckError(
+                    f"publisher integration check \"{label}\" failed with exit status "
+                    f"{result.returncode}" + (f":\n{tail}" if tail else "")
+                )
+            print(f"publisher integration check passed: {label}")
+    finally:
+        if created_tmpdir is not None:
+            del os.environ["TMPDIR"]
+            shutil.rmtree(created_tmpdir, ignore_errors=True)
     print(
         "Publisher integration qualification PASSED (clean tree, all mandated "
         "suites green). The pre-commit published-text gate alone does not "

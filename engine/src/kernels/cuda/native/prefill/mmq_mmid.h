@@ -27,7 +27,7 @@
  * before any launch.
  *
  * inference_cuda_mmq_mmid_launch: one grouped GEMM over a weight stack through the vendored
- * mul_mat_q_case (mmq.cuh:1500-1510) with the ids of an MmidIds. The geometry fields are the
+ * mul_mat_q_case (mmq.cuh:1639-1649) with the ids of an MmidIds. The geometry fields are the
  * vendored mmq_args (mmq.cuh:1326-1340) as the Rust fill_mmid_args fills them (the pin's
  * mmq.cu:255-261), and the entry refuses anything but this grouped form:
  *   type_x                     Q4_K (12) or Q6_K (14); a grouped Q8_0 or Q5_0 has no arm here

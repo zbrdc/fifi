@@ -654,11 +654,12 @@ mod tests {
         assert!(printed.contains("ENGINESRV_API_KEY"), "{printed}");
     }
 
-    /// This build compiles no GPU backend, so preflight's backend check
-    /// is the refusal a user of this binary sees — quoted verbatim, with
-    /// preflight's own next-step line. The green zero-config path is the
-    /// CUDA build's, exercised by the hardware lane; the settings the
-    /// CPU build WOULD resolve are covered by the discovery tests above
+    /// The refusal a user of this binary sees, quoted verbatim, with
+    /// preflight's own next-step line. Each build picks its own arm below:
+    /// the CPU build's backend check, the device builds' settings and
+    /// tokenizer-pin refusals. The green zero-config path is the CUDA
+    /// build's, exercised by the hardware lane; the settings the CPU
+    /// build WOULD resolve are covered by the discovery tests above
     /// and the parity test of `run`.
     #[test]
     fn build_config_refusals_quote_preflight_verbatim() {
@@ -674,24 +675,39 @@ mod tests {
                 "{}",
                 error.0
             );
+        } else if cfg!(all(feature = "native-cuda", target_os = "linux")) {
+            // A Linux native-cuda build picks the CUDA backend and reaches the
+            // preflight validators: the fixture's tokenizer is not the pinned one,
+            // so this arm pins that verbatim refusal instead of the CPU build's
+            // "no GPU backend". (native-cuda is a no-op off Linux, engine/build.rs.)
+            assert!(error.0.contains("tokenizer pin"), "{}", error.0);
         } else {
             assert!(error.0.contains("no GPU backend"), "{}", error.0);
         }
         assert!(error.0.contains("next:"), "{}", error.0);
 
-        // The same refusal carries EXL3-only directories on this build
-        // (detection itself is covered above); a CUDA build takes them
-        // through the experimental acknowledgement instead.
+        // The same refusal carries EXL3-only directories on every build
+        // (detection itself is covered above): even a CUDA build refuses
+        // them here, because the fixture's tokenizer fails the preflight
+        // pin before the experimental verdict can speak.
         let exl3 = model_dir(Some("qwen3_5_moe"), false, true);
         let error = super::build_config(&args_for(exl3.path())).unwrap_err();
-        if cfg!(feature = "native-mlx") {
-            assert!(
-                error.0.contains("cache_limit_bytes is missing"),
-                "{}",
-                error.0
-            );
+        if cfg!(all(feature = "native-cuda", target_os = "linux")) {
+            // The EXL3-only directory's experimental qualification never
+            // gets to speak here: its fixture tokenizer fails the same
+            // preflight check first, and a failed check outranks the
+            // experimental verdict, so this build refuses it too.
+            assert!(error.0.contains("tokenizer pin"), "{}", error.0);
         } else {
-            assert!(error.0.contains("no GPU backend"), "{}", error.0);
+            if cfg!(feature = "native-mlx") {
+                assert!(
+                    error.0.contains("cache_limit_bytes is missing"),
+                    "{}",
+                    error.0
+                );
+            } else {
+                assert!(error.0.contains("no GPU backend"), "{}", error.0);
+            }
         }
     }
 }

@@ -1222,6 +1222,7 @@ fn the_split_moe_block_matches_the_resident_block_and_the_host_across_tokens() {
 }
 
 #[test]
+#[ignore = "needs a GPU, --test-threads=1 and the pack in FIFI_FLASH_NEXT_EXL3_PACK (layers in FIFI_FLASH_NEXT_STEP_LAYERS)"]
 fn a_chunk_of_rows_matches_the_same_rows_one_at_a_time() {
     // The chunked prefill contract at the step level: M rows through one rows=M step equal M
     // launches of a rows=1 step, stream rows and DeltaNet states alike. The tolerance covers the

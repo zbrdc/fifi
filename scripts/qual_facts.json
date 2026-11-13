@@ -17,7 +17,7 @@
     "lib": {
       "path": "src/lib.rs",
       "test_fns": 6798,
-      "ignored": 604,
+      "ignored": 605,
       "env_gates": [
         "CUDA_MODULE_LOADING",
         "DEFAULT_ON_CHILD",

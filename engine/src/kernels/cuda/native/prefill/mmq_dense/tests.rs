@@ -391,7 +391,7 @@ fn c_fixup_need_hinted(ty: c_int, n: usize, m: usize, hint: c_int, facts: &Facts
 }
 
 /// The Rust side of the cross-pin: the tile width from the Rust replica `j_best`, then the
-/// vendored launch's tile count, tiling-mode test and block count (mmq.cuh:1395-1408), then
+/// vendored launch's tile count, tiling-mode test and block count (mmq.cuh:1534-1547), then
 /// `fixup_floats_exact`. Every kept config row has I = 128 and stream-k on.
 fn rust_fixup_need(ty: MmqType, n: usize, m: usize, ncols_opt: usize, facts: &FactsRaw) -> usize {
     let nsm = usize::try_from(facts.nsm).expect("nsm");
@@ -402,7 +402,7 @@ fn rust_fixup_need(ty: MmqType, n: usize, m: usize, ncols_opt: usize, facts: &Fa
     if !MmqConfig::select(facts.cc).stream_k(ty, j) {
         return 0;
     }
-    // The grid tiles come from ncols_max (the real m, mmq.cuh:1506); only J reads the hint.
+    // The grid tiles come from ncols_max (the real m, mmq.cuh:1645); only J reads the hint.
     let tiles = m.div_ceil(j) * n.div_ceil(128);
     let waves = tiles.div_ceil(nsm);
     let blocks = if 100 * tiles / (nsm * waves) >= 90 {
@@ -497,7 +497,7 @@ fn the_c_fixup_need_agrees_with_the_rust_sizing_everywhere() {
 #[test]
 fn the_c_fixup_need_agrees_with_the_rust_sizing_under_a_hint() {
     // The hint changes the J choice (ncols_opt) but never the launch grid (ncols_max,
-    // mmq.cuh:1506) or the tile count the fixup need reads. Pinned on the sm_72 set — the
+    // mmq.cuh:1645) or the tile count the fixup need reads. Pinned on the sm_72 set — the
     // board this knob exists for — over hints that straddle every J breakpoint, including
     // over-wide hints (>= m keep stock) and the armed J = 16 pin.
     let facts = FactsRaw {

@@ -518,7 +518,7 @@ ggml_cuda_mmq_get_config_{suffix}(ggml_type type, int J, bool fallback) {{"
     }
 }
 
-/// The vendored J-selection loop (mmq.cuh:1444-1461) hash-pinned: the replica `j_best`
+/// The vendored J-selection loop (mmq.cuh:1583-1600) hash-pinned: the replica `j_best`
 /// models this exact loop, so a vendor change to it must fail CI. The first line is
 /// asserted first, so a line-number drift fails by text before the hash can mismatch.
 #[test]
@@ -528,12 +528,12 @@ fn vendored_j_selection_loop_is_pinned() {
         "/vendor/ggml-cuda-mmq/src/ggml-cuda/mmq.cuh"
     ));
     let lines: Vec<&str> = mmq.lines().collect();
-    let first = lines[1443];
+    let first = lines[1582];
     assert!(
         first.trim_start().starts_with("for (int J = 8; J <= 128"),
-        "mmq.cuh:1444 is no longer the J loop: {first}"
+        "mmq.cuh:1583 is no longer the J loop: {first}"
     );
-    let text: String = lines[1443..=1460]
+    let text: String = lines[1582..=1599]
         .iter()
         .fold(String::new(), |acc, line| acc + line + "\n");
     use sha2::Digest;
@@ -566,34 +566,34 @@ fn vendored_mmq_range_hash(first: usize, last: usize, head: &str) -> String {
     format!("{:x}", sha2::Sha256::digest(text.as_bytes()))
 }
 
-/// The vendored stream-k launch rule (mmq.cuh:1395-1412): the 90 % tiling test, the `2^30`
+/// The vendored stream-k launch rule (mmq.cuh:1534-1551): the 90 % tiling test, the `2^30`
 /// limit, the fixup test and the fixup byte need. The dense C entry's `fixup_need` and the
 /// Rust mirrors of the 2^30 limit re-express exactly this passage, so a vendor change to it
 /// must fail CI.
 #[test]
 fn vendored_stream_k_launch_rule_is_pinned() {
     assert_eq!(
-        vendored_mmq_range_hash(1395, 1412, "// For the stream-k kernel it is possible"),
+        vendored_mmq_range_hash(1534, 1551, "// For the stream-k kernel it is possible"),
         "38ebc22e187c1deecd6a4afb30c0171e8dfecf988cadbf9da22ee59f07477db8",
         "the vendored stream-k rule changed; re-derive fixup_need and the grid-limit mirror"
     );
 }
 
-/// The vendored launch's grid setup and stream-k branch test (mmq.cuh:1365-1367 and :1385):
+/// The vendored launch's grid setup and stream-k branch test (mmq.cuh:1504-1506 and :1524):
 /// the row and column tile counts and the channel-sample count, and the test that picks the
 /// stream-k kernel. `fixup_need` re-expresses both (tiles = ntx * nty with ntzw = 1; the
 /// replica returns 0 for a type or J without a stream-k row), so a vendor change must fail CI.
 #[test]
 fn vendored_launch_grid_and_stream_k_branch_are_pinned() {
     assert_eq!(
-        vendored_mmq_range_hash(1365, 1367, "const int nty"),
+        vendored_mmq_range_hash(1504, 1506, "const int nty"),
         "92188104c7dbffb6eb6d136a8367c88af3a1901f2e4849412f61a87324cc1a60",
         "the vendored tile-count setup changed; re-derive fixup_need"
     );
     assert_eq!(
         vendored_mmq_range_hash(
-            1385,
-            1385,
+            1524,
+            1524,
             "if (!ggml_cuda_mmq_get_stream_k(type, J, fallback, cc))"
         ),
         "880850ab75e67f60c46b55e0b0ef3374612189071d731723f9b24a00dea9ed0d",
@@ -601,13 +601,13 @@ fn vendored_launch_grid_and_stream_k_branch_are_pinned() {
     );
 }
 
-/// The vendored case function (mmq.cuh:1500-1510): the device check and the fallback rule,
+/// The vendored case function (mmq.cuh:1639-1649): the device check and the fallback rule,
 /// `nrows_x % 128 != 0`, that picks the J set. Every sizing row names the fallback axis from
 /// it, so a vendor change to it must fail CI.
 #[test]
 fn vendored_mmq_case_fallback_rule_is_pinned() {
     assert_eq!(
-        vendored_mmq_range_hash(1500, 1510, "template <ggml_type type>"),
+        vendored_mmq_range_hash(1639, 1649, "template <ggml_type type>"),
         "3160816f078b9a79c9ff6a131ac94bbb0b407e1acdd3f12c734bd10272481b79",
         "the vendored mul_mat_q_case changed; re-derive the fallback axis of the sizing"
     );

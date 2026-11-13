@@ -1,4 +1,5 @@
-//! NVFP4-only extension of the unchanged dense C argument layout.
+//! NVFP4-only extension of the dense C argument layout: it embeds the
+//! dense args struct and adds the y_scale field after it.
 
 use super::{
     DeviceFailure, MmqDenseArgsRaw, MmqDenseRaw, RawRange, RawStream, STAGE_NONE, Span, c_dense,

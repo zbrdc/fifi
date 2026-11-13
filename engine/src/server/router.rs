@@ -471,9 +471,11 @@ mod tests {
         );
         assert_eq!(body["version"], env!("CARGO_PKG_VERSION"));
         // The compiled-in backends this build carries: none on the plain CPU test build,
-        // "mlx" on a native-mlx build.
+        // "mlx" on a native-mlx build, "cuda" on a native-cuda build.
         if cfg!(feature = "native-mlx") {
             assert_eq!(body["backends_compiled"], serde_json::json!(["mlx"]));
+        } else if cfg!(all(feature = "native-cuda", target_os = "linux")) {
+            assert_eq!(body["backends_compiled"], serde_json::json!(["cuda"]));
         } else {
             assert_eq!(body["backends_compiled"], serde_json::json!([]));
         }
