@@ -310,7 +310,7 @@ impl ExpertStore {
 ///
 /// One slot index addresses member `i` of all three parts' device banks and of the store's
 /// part stores alike, so the table is one array per layer, not per part.
-struct LayerSlots {
+pub(crate) struct LayerSlots {
     experts: usize,
     slots: usize,
     /// How many of the layer's hottest experts (by decayed use count) stay pinned: a miss
@@ -318,8 +318,8 @@ struct LayerSlots {
     /// plain LRU. Clamped to `slots - 1`; ties at the threshold can still mark more experts
     /// hot than that, and the victim's fallback — not the clamp — guarantees progress.
     sticky: usize,
-    /// Expert -> slot, [`EMPTY`] when absent.
-    slot_of: Vec<u16>,
+    /// Expert -> slot, [`NO_SLOT`] when absent.
+    slot_of: Vec<i32>,
     /// Slot -> expert, [`EMPTY`] when the slot never filled.
     expert_of: Vec<u16>,
     last_used: Vec<u64>,
@@ -337,8 +337,11 @@ struct LayerSlots {
 /// intervals only lag a drifting workload, shorter ones thrash the hot set.
 const DECAY_CALLS: u64 = 64;
 
-/// The absent marker of both directions of the slot table.
+/// The absent marker of the slot -> expert direction.
 const EMPTY: u16 = u16::MAX;
+/// The absent marker of the expert -> slot direction: the slot row the shared seam
+/// publishes (`SlotTable::slot_row`) is exactly this array.
+const NO_SLOT: i32 = -1;
 
 impl LayerSlots {
     fn new(experts: usize, slots: usize, sticky: usize) -> Self {
@@ -350,7 +353,7 @@ impl LayerSlots {
             experts,
             slots,
             sticky,
-            slot_of: vec![EMPTY; experts],
+            slot_of: vec![NO_SLOT; experts],
             expert_of: vec![EMPTY; slots],
             last_used: vec![0; slots],
             counts: vec![0; experts],
@@ -399,22 +402,22 @@ impl LayerSlots {
             if self.sticky > 0 {
                 self.counts[expert] = self.counts[expert].saturating_add(1);
             }
-            let slot = match usize::from(self.slot_of[expert]) {
-                s if s < self.slots => s,
+            let slot = match self.slot_of[expert] {
+                s if (0..self.slots as i32).contains(&s) => s as usize,
                 _ => self.victim(&slots)?,
             };
-            let miss = self.slot_of[expert] == EMPTY;
+            let miss = self.slot_of[expert] == NO_SLOT;
             if miss {
                 let evicted = self.expert_of[slot];
                 if evicted != EMPTY {
-                    self.slot_of[usize::from(evicted)] = EMPTY;
+                    self.slot_of[usize::from(evicted)] = NO_SLOT;
                 }
                 self.expert_of[slot] = u16::try_from(expert).map_err(|_| {
                     EngError::BadRequest(format!(
                         "EXL3 expert bank: expert {expert} does not fit the slot table"
                     ))
                 })?;
-                self.slot_of[expert] = u16::try_from(slot).expect("slots fit u16 (max 256)");
+                self.slot_of[expert] = i32::try_from(slot).expect("slots fit i32");
                 misses.push(slot);
             }
             slots.push(slot);
@@ -452,6 +455,24 @@ impl LayerSlots {
     /// The expert a slot holds (for the store read of a miss copy).
     fn expert_of(&self, slot: usize) -> usize {
         usize::from(self.expert_of[slot])
+    }
+}
+
+/// The Q36 tables behind the shared seam's table half
+/// ([`SlotTable`](crate::family::expert_bank::SlotTable)): one `LayerSlots` per layer, its
+/// live `slot_of` row the tiered classifier reads. Only the table surface is shared — the
+/// pass protocol stays Q36's own (`assign` and the refill loop are not routed through
+/// `SlotPolicy`; the c2 note's requirement).
+pub(super) struct LayerTables(pub(crate) Vec<LayerSlots>);
+
+impl crate::family::expert_bank::SlotTable for LayerTables {
+    fn slot_row(&self, layer: usize) -> &[i32] {
+        &self.0[layer].slot_of
+    }
+
+    fn expert_in_slot(&self, layer: usize, slot: usize) -> Option<u16> {
+        let expert = self.0[layer].expert_of.get(slot).copied()?;
+        (expert != EMPTY).then_some(expert)
     }
 }
 

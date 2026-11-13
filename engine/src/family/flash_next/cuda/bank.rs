@@ -61,7 +61,7 @@ use crate::{
 #[allow(unused_imports)]
 pub(super) use crate::family::expert_bank::{
     BankGeometry, BankStats, CopyOp, Demote, ExpertBankState, HostMode, HostPlaces, NO_PLACE,
-    PassCopies, PassPlan, SlotMove, SlotPolicy, bank_error, plan_error,
+    PassCopies, PassPlan, SlotMove, SlotPolicy, SlotTable, bank_error, plan_error,
 };
 
 impl BankGeometry {
@@ -546,6 +546,16 @@ impl Drop for ReplaceOnMissLru {
     }
 }
 
+impl SlotTable for ReplaceOnMissLru {
+    fn slot_row(&self, layer: usize) -> &[i32] {
+        self.layers.get(layer).map_or(&[], |lru| &lru.slot_of)
+    }
+
+    fn expert_in_slot(&self, layer: usize, slot: usize) -> Option<u16> {
+        self.layers.get(layer)?.resident.get(slot).copied()
+    }
+}
+
 impl SlotPolicy for ReplaceOnMissLru {
     fn plan_pass(&mut self, layer: usize, picks: &[i32]) -> Result<PassPlan, EngError> {
         let current = self.layer(layer)?;
@@ -607,14 +617,6 @@ impl SlotPolicy for ReplaceOnMissLru {
         let plan = next.apply(&newest_first, &demanded)?;
         self.layers[layer] = next;
         Ok(plan)
-    }
-
-    fn slot_row(&self, layer: usize) -> &[i32] {
-        self.layers.get(layer).map_or(&[], |lru| &lru.slot_of)
-    }
-
-    fn expert_in_slot(&self, layer: usize, slot: usize) -> Option<u16> {
-        self.layers.get(layer)?.resident.get(slot).copied()
     }
 }
 

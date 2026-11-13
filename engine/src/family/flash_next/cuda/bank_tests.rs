@@ -685,18 +685,20 @@ fn a_policy_row_must_hold_exactly_the_slots() {
     assert!(fill(row(6)).is_err(), "a slot past the bank");
     // A policy that reports a short row after its own checks is caught by `with_policy`.
     struct Short(Vec<i32>);
+    impl SlotTable for Short {
+        fn slot_row(&self, _: usize) -> &[i32] {
+            &self.0
+        }
+        fn expert_in_slot(&self, _: usize, _: usize) -> Option<u16> {
+            None
+        }
+    }
     impl SlotPolicy for Short {
         fn plan_pass(&mut self, _: usize, _: &[i32]) -> Result<PassPlan, EngError> {
             Ok(PassPlan::default())
         }
         fn admit(&mut self, _: usize, _: &[u16]) -> Result<PassPlan, EngError> {
             Ok(PassPlan::default())
-        }
-        fn slot_row(&self, _: usize) -> &[i32] {
-            &self.0
-        }
-        fn expert_in_slot(&self, _: usize, _: usize) -> Option<u16> {
-            None
         }
     }
     let error = message(

@@ -127,8 +127,20 @@ pub(crate) struct PassPlan {
     pub(crate) moves: Vec<SlotMove>,
 }
 
+/// The classifier-facing table half of the seam: the slot row a tiered classifier reads and
+/// the slot -> expert inverse. A family whose pass protocol differs from Flash-Next's
+/// pass copies implements just this half (Q36's `LayerTables` does) without adopting
+/// `SlotPolicy`'s copy planning.
+pub(crate) trait SlotTable {
+    /// The classifier's table of `layer`: the slot of every expert, or -1.
+    fn slot_row(&self, layer: usize) -> &[i32];
+
+    /// The expert in `slot` of `layer`.
+    fn expert_in_slot(&self, layer: usize, slot: usize) -> Option<u16>;
+}
+
 /// The seam a shared policy fills in. Every method keeps the rules in the module doc.
-pub(crate) trait SlotPolicy {
+pub(crate) trait SlotPolicy: SlotTable {
     /// Plans the copies of one layer for the router's picks. `picks` holds every pick of the token
     /// in this layer, hits included (`-1`, the router fault, is skipped; any other id outside the
     /// layer is refused; repeats count once). Atomic: an `Err` changes nothing.
@@ -137,12 +149,6 @@ pub(crate) trait SlotPolicy {
     /// Admits experts without a router pass, oldest use first (a prefill chunk's experts after the
     /// chunk). The last `slots` distinct experts are kept; the rest are dropped.
     fn admit(&mut self, layer: usize, experts_by_use: &[u16]) -> Result<PassPlan, EngError>;
-
-    /// The classifier's table of `layer`: the slot of every expert, or -1.
-    fn slot_row(&self, layer: usize) -> &[i32];
-
-    /// The expert in `slot` of `layer`.
-    fn expert_in_slot(&self, layer: usize, slot: usize) -> Option<u16>;
 }
 
 // ---------------------------------------------------------------------------------------------

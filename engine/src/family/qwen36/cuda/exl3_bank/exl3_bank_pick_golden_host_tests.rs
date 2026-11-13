@@ -16,7 +16,8 @@
 //! checkout cannot pass a compare it should fail. The Flash-Next pick golden
 //! (`flash_next/cuda/bank_pick_golden_host_tests.rs`) owns its own file, same format.
 
-use super::{DECAY_CALLS, EMPTY, LayerSlots, refill_plan};
+use super::{DECAY_CALLS, LayerSlots, LayerTables, refill_plan};
+use crate::family::expert_bank::SlotTable;
 use sha2::{Digest, Sha256};
 use std::fmt::Write as _;
 
@@ -88,17 +89,26 @@ fn arm_text(slots: usize, sticky: usize, seed: u64) -> String {
                 );
             }
         }
-        let row: Vec<i32> = table
-            .slot_of
-            .iter()
-            .map(|&slot| if slot == EMPTY { -1 } else { i32::from(slot) })
-            .collect();
+        // The row is already the seam's shape (`NO_SLOT = -1`): the golden and the
+        // shared `SlotTable::slot_row` read the same array.
+        let row: Vec<i32> = table.slot_of.clone();
         let _ = writeln!(text, "table {call} tick={} row={row:?}", table.tick);
+    }
+    let decays = table.tick / DECAY_CALLS;
+    // The shared-table view of the final state agrees with the golden's own reading.
+    let row = table.slot_of.clone();
+    let seam_tables = LayerTables(vec![table]);
+    assert_eq!(seam_tables.slot_row(0), row.as_slice());
+    for slot in 0..seam_tables.slot_row(0).len().min(SLOTS) {
+        let expert = seam_tables.expert_in_slot(0, slot);
+        assert_eq!(
+            expert.is_some(),
+            seam_tables.slot_row(0).contains(&(slot as i32))
+        );
     }
     let _ = writeln!(
         text,
-        "counters calls={CALLS} hits={hits} misses={misses} decays={}",
-        table.tick / DECAY_CALLS
+        "counters calls={CALLS} hits={hits} misses={misses} decays={decays}"
     );
     text
 }
@@ -137,11 +147,7 @@ fn error_text(seed: u64) -> String {
         follow.1,
         follow.1.is_empty()
     );
-    let row: Vec<i32> = table
-        .slot_of
-        .iter()
-        .map(|&slot| if slot == EMPTY { -1 } else { i32::from(slot) })
-        .collect();
+    let row: Vec<i32> = table.slot_of.clone();
     let _ = writeln!(text, "table 5 tick={} row={row:?}", table.tick);
     text
 }

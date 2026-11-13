@@ -3,7 +3,7 @@
 //! repeats, which is the mapping the golden's admit arm pins. Cardless: everything here runs on
 //! the policy and the slot row, the parts of the contract that live on the host.
 
-use super::bank::{BankGeometry, ReplaceOnMissLru, SlotPolicy};
+use super::bank::{BankGeometry, ReplaceOnMissLru, SlotPolicy, SlotTable};
 use super::prefill_adapter::AdmitPlan;
 
 const LAYERS: usize = 2;
