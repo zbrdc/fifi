@@ -73,8 +73,9 @@ miss resolver at the existing `read_picks` site.**
   the fact that the merged/captured EXL3 step reads picks on the device.
 - **Prefill**: v1 routes prefill pieces through the same miss resolver,
   which must also remap the **prefill job-table members** — the job table
-  addresses experts directly (`member: expert as u32`,
-  `prefill_exl3_moe.rs:167`) after a 256-bin host sort (`read_plan`), so the
+  addresses experts directly (`member: member as u32`,
+  `project/cuda/exl3_jobs.rs:111`) after a 256-bin host sort (the
+  `read_plan` of `family/exl3/prefill_moe.rs`), so the
   remap happens there, host-side (reviewer finding 3). A piece that touches
   all 256 experts of a layer streams them through the slots once per piece.
   Measured cost on the 4050 (PCIe gen4 x8) decides whether we need flint's

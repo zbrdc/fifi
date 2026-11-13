@@ -14,7 +14,7 @@
 
 use std::path::Path;
 
-use super::{Exl3Scratch, F32, Output, Projector, write_dense_jobs};
+use super::{Exl3Scratch, F32, Output, Projector, TILE_ROWS, write_dense_jobs};
 use crate::{
     family::{
         AttentionKind,
@@ -124,6 +124,7 @@ impl Scratch {
             launch,
             scratch: self.view(),
             rows,
+            tile_rows: TILE_ROWS,
         };
         write_dense_jobs(launch, &projector.scratch, rows).unwrap();
         projector
