@@ -25,7 +25,7 @@ pub(in crate::family) mod exl3_merge_plan;
 #[cfg(test)]
 mod exl3_merge_plan_tests;
 #[cfg(any(test, all(feature = "native-cuda", target_os = "linux")))]
-mod exl3_pack;
+pub(in crate::family) mod exl3_pack;
 #[cfg(any(test, all(feature = "native-cuda", target_os = "linux")))]
 pub(crate) use exl3_pack::{Exl3PackPlan, exl3_plan};
 #[cfg(test)]

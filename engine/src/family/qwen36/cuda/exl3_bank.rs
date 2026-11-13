@@ -180,7 +180,7 @@ fn admit_host(routed: u64, host: Option<(u64, u64)>) -> Result<(), EngError> {
 /// Every routed expert of one projection of one layer, one record per member in the exact
 /// device-bank layout: member `i`'s `[trellis, scales]` bytes at `i * record`, so a slot
 /// fill or miss copy is a single contiguous write.
-pub(super) struct PartStore {
+pub(in crate::family) struct PartStore {
     records: Vec<u8>,
     record: usize,
     trellis: usize,
@@ -189,7 +189,7 @@ pub(super) struct PartStore {
 }
 
 impl PartStore {
-    pub(super) fn new(shape: [usize; 2], bits_twice: u8, members: usize) -> Self {
+    pub(in crate::family) fn new(shape: [usize; 2], bits_twice: u8, members: usize) -> Self {
         let (trellis, scale_stride) = exl3_member_layout(shape, bits_twice);
         let record = trellis + scale_stride;
         Self {
@@ -204,7 +204,7 @@ impl PartStore {
     /// Writes member `member`'s staged bytes as its record. The length checks are the
     /// store's own rate guard: a member whose staged bytes disagree with the first member's
     /// strides is refused, not mis-laid.
-    pub(super) fn put(
+    pub(in crate::family) fn put(
         &mut self,
         member: usize,
         staged: &Exl3MemberStaging,
@@ -274,7 +274,7 @@ impl ExpertStore {
     }
 
     /// Appends one layer's three part stores; the load fills them layer by layer.
-    pub(super) fn push_layer(&mut self, parts: [PartStore; 3]) {
+    pub(in crate::family) fn push_layer(&mut self, parts: [PartStore; 3]) {
         self.layers.push(parts);
     }
 

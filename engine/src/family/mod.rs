@@ -4,6 +4,8 @@ mod config;
     reason = "the worker and the server jobs run the seam and every family executor implements it; the allow covers the members only tests still reach"
 )]
 pub(crate) mod executor;
+#[cfg(all(feature = "native-cuda", target_os = "linux"))]
+pub(in crate::family) mod exl3;
 #[cfg(any(test, all(feature = "native-cuda", target_os = "linux")))]
 mod exl3_pack;
 #[allow(

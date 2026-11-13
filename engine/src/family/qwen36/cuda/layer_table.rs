@@ -23,7 +23,7 @@ struct LayerEntry {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(super) struct LayerTable {
+pub(in crate::family) struct LayerTable {
     layers: Vec<LayerEntry>,
 }
 
@@ -120,7 +120,7 @@ impl LayerTable {
         })
     }
 
-    pub(super) fn name(&self, layer: usize, role: Role) -> Result<&str, EngError> {
+    pub(in crate::family) fn name(&self, layer: usize, role: Role) -> Result<&str, EngError> {
         self.entry(layer)?
             .names
             .iter()

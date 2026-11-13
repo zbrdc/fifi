@@ -231,8 +231,8 @@ fn pair_ranges<'b>(
 
 /// The matrix of one id-indexed pair of the merged block.
 enum MergedMember<'a> {
-    /// Pick `slot` of a routed bank.
-    Routed(&'a Exl3Bank, u32),
+    /// A pick of a routed bank; the pick's slot rides in the pair's `word`.
+    Routed(&'a Exl3Bank),
     /// The shared matrix, a bank of one member.
     Shared(&'a Exl3Weight),
 }
@@ -240,7 +240,7 @@ enum MergedMember<'a> {
 impl MergedMember<'_> {
     fn shape(&self) -> [usize; 2] {
         match self {
-            Self::Routed(bank, _) => bank.shape(),
+            Self::Routed(bank) => bank.shape(),
             Self::Shared(weight) => weight.shape,
         }
     }
@@ -283,7 +283,7 @@ fn indexed_group(
             IdWord::Zero => zero,
         };
         calls.push(match &pair.member {
-            MergedMember::Routed(bank, _) => bank.span()?.indexed_call(&io, ids, slot),
+            MergedMember::Routed(bank) => bank.span()?.indexed_call(&io, ids, slot),
             MergedMember::Shared(weight) => weight.view()?.indexed_call(&io, ids, slot),
         });
     }
@@ -310,7 +310,7 @@ fn merged_on_device(
             .map(|pair| {
                 let (x, out) = pair_ranges(pair, bufs.route.norm_row, r, dims)?;
                 let member = match pair.member {
-                    Member::Routed(slot) => MergedMember::Routed(bank_of(weights, pair.proj), slot),
+                    Member::Routed(_) => MergedMember::Routed(bank_of(weights, pair.proj)),
                     Member::Shared => MergedMember::Shared(single_of(weights, pair.proj)),
                 };
                 Ok(MergedPair {
@@ -390,7 +390,7 @@ pub(in crate::family) fn run_exl3_moe_merged(
     (weights, bufs, merge): (&Exl3MoeWeights<'_>, &Exl3MoeBufs<'_>, &SharedMerge),
     dims: &MoeDims,
     device_ids: bool,
-    mut bank: Option<&mut super::super::exl3_bank::LayerResolver<'_, '_>>,
+    mut bank: Option<&mut crate::family::qwen36::cuda::exl3_bank::LayerResolver<'_, '_>>,
     overlap: bool,
 ) -> Result<(), EngError> {
     check_dims(&plan_dims(dims)).map_err(refuse)?;

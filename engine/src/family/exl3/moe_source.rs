@@ -7,15 +7,15 @@
 //! block and the upload: the router and the gate as F32 vectors, the routed experts of each
 //! projection as one bank, the shared expert as three single matrices.
 
-use super::{
-    super::exl3_pack::{
-        ExpertPart, expert_name_in, router_name_in, shared_gate_name_in, shared_name_in,
+use crate::family::{
+    exl3_pack::{ExpertPart, expert_name_in, router_name_in, shared_gate_name_in, shared_name_in},
+    qwen36::cuda::{
+        exl3_bank::{ExpertStore, PartStore},
+        exl3_source::PackReader,
+        layer_table::LayerTable,
+        mixer_geometry::DenseSpec,
+        moe::MoeDims,
     },
-    exl3_bank::{ExpertStore, PartStore},
-    exl3_source::PackReader,
-    layer_table::LayerTable,
-    mixer_geometry::DenseSpec,
-    moe::MoeDims,
 };
 use crate::{
     EngError,
@@ -77,7 +77,7 @@ pub(super) struct ExpertPlan {
 
 /// `model_config` is the checkpoint's config.json bytes; the MoE fields live
 /// under `text_config`, matching the attention source's contract.
-pub(super) fn check_moe_source_geometry(
+pub(in crate::family) fn check_moe_source_geometry(
     model_config: &[u8],
     moe: &MoeDims,
 ) -> Result<(), EngError> {
@@ -126,7 +126,7 @@ pub(super) fn stored_shape(rows: usize, k: usize) -> (usize, usize) {
     (rows, k)
 }
 
-pub(super) fn moe_weights(
+pub(in crate::family) fn moe_weights(
     reader: &PackReader<'_>,
     table: &LayerTable,
     layer: usize,
@@ -138,7 +138,7 @@ pub(super) fn moe_weights(
 /// The banked arm: `slots` members per routed bank on the device, and every expert of every
 /// projection staged into the host `store`'s entry for this layer (gate, up, down order), in
 /// the device-bank byte layout a later miss copy moves unchanged.
-pub(super) fn moe_weights_banked(
+pub(in crate::family) fn moe_weights_banked(
     reader: &PackReader<'_>,
     table: &LayerTable,
     layer: usize,

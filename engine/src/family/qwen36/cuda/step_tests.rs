@@ -189,7 +189,7 @@ fn only_an_exl3_step_refuses_a_pair_with_the_arithmetic_mask() {
 /// the wide kernel serves them when the switch names it.
 #[test]
 fn the_exl3_moe_block_launches_its_groups_through_the_step_entry() {
-    let source = include_str!("exl3_moe.rs");
+    let source = include_str!("../../exl3/moe.rs");
     let start = source.find("fn grouped(").expect("the grouped helper");
     let body = &source[start..start + 1200];
     assert!(body.contains("exl3_grouped_step("), "{body}");
@@ -757,7 +757,7 @@ fn a_captured_exl3_step_refuses_more_than_eight_picks() {
 /// The block's device-pick path makes no host read and no wait: a captured body cannot.
 #[test]
 fn the_device_pick_path_of_the_exl3_moe_block_never_waits_for_the_host() {
-    let source = include_str!("exl3_moe.rs");
+    let source = include_str!("../../exl3/moe.rs");
     for name in [
         "fn routed_on_device(",
         "fn grouped_indexed(",

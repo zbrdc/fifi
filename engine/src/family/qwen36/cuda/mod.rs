@@ -45,7 +45,7 @@ mod eager_window_device_tests;
 mod executor;
 #[cfg(test)]
 mod executor_tests;
-mod exl3_bank;
+pub(in crate::family) mod exl3_bank;
 #[cfg(test)]
 mod exl3_bank_krow_device_tests;
 #[cfg(test)]
@@ -57,14 +57,14 @@ mod exl3_device_tests;
 mod exl3_load;
 #[cfg(test)]
 mod exl3_load_device_tests;
-pub(in crate::family) mod exl3_moe;
+pub(in crate::family) use crate::family::exl3::moe as exl3_moe;
 #[cfg(test)]
 mod exl3_moe_device_tests;
 #[cfg(test)]
 mod exl3_moe_merge_device_tests;
 #[cfg(test)]
 mod exl3_moe_rows_device_tests;
-mod exl3_moe_source;
+use crate::family::exl3::moe_source as exl3_moe_source;
 pub(in crate::family) mod exl3_source;
 #[cfg(test)]
 mod exl3_step_device_tests;
@@ -84,14 +84,14 @@ mod krow_ops;
 mod krow_step_device_tests;
 #[cfg(test)]
 mod kv8_step_device_tests;
-mod layer_table;
+pub(in crate::family) mod layer_table;
 #[cfg(test)]
 mod layer_tests;
 #[cfg(all(test, feature = "native-cuda"))]
 #[path = "m3_run.rs"]
 mod m3_run;
 mod mixer;
-mod mixer_geometry;
+pub(in crate::family) mod mixer_geometry;
 mod mixer_ops;
 mod mixer_shapes;
 #[cfg(test)]

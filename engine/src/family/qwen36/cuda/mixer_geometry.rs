@@ -75,10 +75,10 @@ const PLAIN_ROLES: [Role; 2] = [Role::SsmBeta, Role::SsmAlpha];
 /// A dense (tiled) mixer weight: its role, output rows and input length.
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(super) struct DenseSpec {
-    pub(super) role: Role,
-    pub(super) rows: usize,
-    pub(super) k: usize,
+pub(in crate::family) struct DenseSpec {
+    pub(in crate::family) role: Role,
+    pub(in crate::family) rows: usize,
+    pub(in crate::family) k: usize,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

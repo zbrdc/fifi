@@ -111,7 +111,7 @@ impl<'a> PackReader<'a> {
         selected.tensor(name).ok_or_else(missing)
     }
 
-    pub(super) fn exl3(
+    pub(in crate::family) fn exl3(
         &self,
         name: String,
         prefix: &str,
@@ -139,7 +139,7 @@ impl<'a> PackReader<'a> {
         Ok(CudaWeight::Exl3 { name, weight })
     }
 
-    pub(super) fn bank(
+    pub(in crate::family) fn bank(
         &self,
         name: String,
         count: usize,

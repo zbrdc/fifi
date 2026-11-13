@@ -14,14 +14,17 @@ use crate::{
     weights::StreamedCheckpoint,
 };
 
-pub(super) use crate::family::exl3_pack::{
-    EMBED_NAME, ExpertPart, HEAD_PREFIX, Inspector, Marker, MoeBlock, NORM_NAME, PackReport, Root,
-    expert_name_in, layer_name, router_name_in, shared_gate_name_in, shared_name_in,
+pub(in crate::family) use crate::family::exl3_pack::{
+    EMBED_NAME, HEAD_PREFIX, Inspector, Marker, MoeBlock, NORM_NAME, PackReport, Root, layer_name,
+};
+#[cfg(test)]
+pub(in crate::family) use crate::family::exl3_pack::{
+    ExpertPart, expert_name_in, router_name_in, shared_gate_name_in, shared_name_in,
 };
 
 /// The router weight of a layer of the model.
 #[cfg(test)]
-pub(super) fn router_name(layer: usize) -> String {
+pub(in crate::family) fn router_name(layer: usize) -> String {
     router_name_in(Root::Layers, layer)
 }
 
@@ -33,13 +36,13 @@ pub(super) fn shared_gate_name(layer: usize) -> String {
 
 /// One projection of one routed expert of a layer of the model.
 #[cfg(test)]
-pub(super) fn expert_name(layer: usize, expert: usize, part: ExpertPart) -> String {
+pub(in crate::family) fn expert_name(layer: usize, expert: usize, part: ExpertPart) -> String {
     expert_name_in(Root::Layers, layer, expert, part)
 }
 
 /// One projection of the shared expert of a layer of the model.
 #[cfg(test)]
-pub(super) fn shared_name(layer: usize, part: ExpertPart) -> String {
+pub(in crate::family) fn shared_name(layer: usize, part: ExpertPart) -> String {
     shared_name_in(Root::Layers, layer, part)
 }
 

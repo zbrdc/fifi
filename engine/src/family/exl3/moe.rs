@@ -24,7 +24,7 @@
 
 pub(in crate::family) mod merge;
 
-use super::{
+use crate::family::qwen36::cuda::{
     layer_table::LayerTable,
     moe::{Launch, MoeDims, RouteBufs},
 };
@@ -62,19 +62,19 @@ const I32: usize = size_of::<i32>();
 
 pub(in crate::family) struct Exl3MoeWeights<'w> {
     /// The raw F32 `[n_expert][hidden]` router matrix.
-    pub(super) router: &'w DeviceBuffer,
+    pub(in crate::family) router: &'w DeviceBuffer,
     /// The raw F32 `[hidden]` shared-gate vector.
-    pub(super) router_shared: &'w DeviceBuffer,
-    pub(super) gate: &'w Exl3Bank,
-    pub(super) up: &'w Exl3Bank,
-    pub(super) down: &'w Exl3Bank,
-    pub(super) shared_gate: &'w Exl3Weight,
-    pub(super) shared_up: &'w Exl3Weight,
-    pub(super) shared_down: &'w Exl3Weight,
+    pub(in crate::family) router_shared: &'w DeviceBuffer,
+    pub(in crate::family) gate: &'w Exl3Bank,
+    pub(in crate::family) up: &'w Exl3Bank,
+    pub(in crate::family) down: &'w Exl3Bank,
+    pub(in crate::family) shared_gate: &'w Exl3Weight,
+    pub(in crate::family) shared_up: &'w Exl3Weight,
+    pub(in crate::family) shared_down: &'w Exl3Weight,
 }
 
 impl<'w> Exl3MoeWeights<'w> {
-    pub(super) fn resolve(
+    pub(in crate::family) fn resolve(
         weights: &'w CudaWeights,
         table: &LayerTable,
         layer: usize,
@@ -85,7 +85,7 @@ impl<'w> Exl3MoeWeights<'w> {
 
     /// The block of `layer` of a banked load: the routed banks hold `members` slots, not the
     /// full expert count, and the host miss resolver feeds the launches slot indices.
-    pub(super) fn resolve_banked(
+    pub(in crate::family) fn resolve_banked(
         weights: &'w CudaWeights,
         table: &LayerTable,
         layer: usize,
@@ -207,11 +207,6 @@ fn span<'b>(
         .range(range.offset() + r0 * row_bytes, width * row_bytes)
 }
 
-/// The first `bytes` bytes of `range`.
-fn leading<'b>(range: &DeviceRange<'b>, bytes: usize) -> Result<DeviceRange<'b>, EngError> {
-    range.buffer().range(range.offset(), bytes)
-}
-
 fn whole(buffer: &DeviceBuffer) -> Result<DeviceRange<'_>, EngError> {
     buffer.range(0, buffer.bytes())
 }
@@ -263,11 +258,11 @@ static GROUP_SPLIT_OVERRIDE: std::sync::atomic::AtomicU32 = std::sync::atomic::A
 
 /// Test-only override of [`group_split`] (the env is process-wide and OnceLock-cached).
 #[cfg(test)]
-pub(super) fn set_group_split_override(split: u32) {
+pub(in crate::family) fn set_group_split_override(split: u32) {
     GROUP_SPLIT_OVERRIDE.store(split, std::sync::atomic::Ordering::Relaxed);
 }
 
-pub(super) fn group_split() -> u32 {
+pub(in crate::family) fn group_split() -> u32 {
     let set = GROUP_SPLIT_OVERRIDE.load(std::sync::atomic::Ordering::Relaxed);
     if matches!(set, 2 | 4 | 8) {
         return set;
@@ -507,7 +502,7 @@ fn routed(
 /// The routed experts with the picks read on the device: the same groups and the same arithmetic
 /// as [`routed`], but the member of every pair comes from the router's id array when the kernels
 /// run, so the block waits for nothing and can be captured in a graph.
-pub(super) fn routed_on_device(
+pub(in crate::family) fn routed_on_device(
     launch: &Launch<'_>,
     weights: &Exl3MoeWeights<'_>,
     bufs: &Exl3MoeBufs<'_>,
@@ -542,7 +537,7 @@ pub(super) fn routed_on_device(
 }
 
 /// The shared expert: gate and up in one group, the SwiGLU, the down projection.
-pub(super) fn shared(
+pub(in crate::family) fn shared(
     launch: &Launch<'_>,
     weights: &Exl3MoeWeights<'_>,
     bufs: &Exl3MoeBufs<'_>,
@@ -730,7 +725,7 @@ pub(in crate::family) fn run_exl3_moe(
     bufs: &Exl3MoeBufs<'_>,
     dims: &MoeDims,
     device_ids: bool,
-    mut bank: Option<&mut super::exl3_bank::LayerResolver<'_, '_>>,
+    mut bank: Option<&mut crate::family::qwen36::cuda::exl3_bank::LayerResolver<'_, '_>>,
     overlap: bool,
 ) -> Result<(), EngError> {
     if dims.rows != 1 {
@@ -911,7 +906,7 @@ pub(in crate::family) fn run_exl3_moe_rows_banked(
     weights: &Exl3MoeWeights<'_>,
     bufs: &Exl3MoeBufs<'_>,
     dims: &MoeDims,
-    bank: &mut super::exl3_bank::LayerResolver<'_, '_>,
+    bank: &mut crate::family::qwen36::cuda::exl3_bank::LayerResolver<'_, '_>,
 ) -> Result<(), EngError> {
     let rows = dims.rows;
     if !(2..=8).contains(&rows) {
