@@ -259,7 +259,7 @@ fn the_list_bytes_are_the_walks_trunk_bytes() {
     // The plan's rule (FlashLoadPlan): device bytes less the experts and the embedding.
     assert_eq!(
         list.bytes(),
-        report.pack.device_bytes - report.expert_bytes - embedding
+        report.pack.device_bytes - report.pack.expert_bytes - embedding
     );
     assert_eq!(embedding, 248_320 * 2560 * 2);
     let matrices = list.all().filter(|t| t.form == Form::Matrix).count();

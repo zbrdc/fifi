@@ -119,12 +119,17 @@ pub(super) fn pack_sizes(checkpoint: &Checkpoint) -> (TierShape, u64, usize) {
     let report = inspect_flash_pack(&checkpoint.source, &checkpoint.model_config).expect("walk");
     let (shape, kinds) = model_shape(&checkpoint.model_config).expect("the model shape");
     let moe = shape.moe;
-    let tier = TierShape::from_pack(kinds.len(), moe.experts, moe.top_k, report.expert_bytes)
-        .expect("the pack's experts share one size");
+    let tier = TierShape::from_pack(
+        kinds.len(),
+        moe.experts,
+        moe.top_k,
+        report.pack.expert_bytes,
+    )
+    .expect("the pack's experts share one size");
     let embedding = shape.vocab as u64 * moe.hidden as u64 * 2;
     (
         tier,
-        report.pack.device_bytes - report.expert_bytes - embedding,
+        report.pack.device_bytes - report.pack.expert_bytes - embedding,
         moe.hidden,
     )
 }
@@ -137,15 +142,20 @@ fn the_real_router_picks_ten_and_the_tier_classifies_routes_outside_its_profile(
     let (shape, kinds) = model_shape(&checkpoint.model_config).expect("the model shape");
     let moe = shape.moe;
     assert_eq!((moe.experts, moe.top_k, moe.renorm), (512, 10, true));
-    let tier = TierShape::from_pack(kinds.len(), moe.experts, moe.top_k, report.expert_bytes)
-        .expect("the pack's experts share one size");
+    let tier = TierShape::from_pack(
+        kinds.len(),
+        moe.experts,
+        moe.top_k,
+        report.pack.expert_bytes,
+    )
+    .expect("the pack's experts share one size");
     assert_eq!(tier.expert_bytes, 1_881_600);
 
     // The trunk the plan assumes: everything on the device but the experts and the embedding
     // (which the host gathers) and the tensors a host feed reads, against the exact figure of the
     // plan doc (3.61 GiB).
     let embedding = shape.vocab as u64 * moe.hidden as u64 * 2;
-    let trunk = report.pack.device_bytes - report.expert_bytes - embedding;
+    let trunk = report.pack.device_bytes - report.pack.expert_bytes - embedding;
     eprintln!("trunk bytes {trunk} ({:.3} GiB)", trunk as f64 / GIB as f64);
     assert_eq!(
         trunk, 3_872_376_320,

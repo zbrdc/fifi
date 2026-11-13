@@ -34,9 +34,8 @@ const MIXER: &str = "model.language_model.hyper_connection_mixer";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(in crate::family) struct FlashPackReport {
+    /// The shared walk report; its `expert_bytes` field is the part that expert tiers place.
     pub(in crate::family) pack: PackReport,
-    /// Device bytes of the routed experts alone, the part that expert tiers place.
-    pub(in crate::family) expert_bytes: u64,
 }
 
 fn refuse(detail: String) -> EngError {
@@ -81,7 +80,6 @@ fn walk_flash_pack(
         inter: dims.moe_inter as usize,
         shared_inter: dims.shared_inter as usize,
     };
-    let mut expert_bytes = 0;
     for (layer, &qsa_layer) in dims.kinds.iter().enumerate() {
         let at = |suffix: &str| Root::Layers.name(layer, suffix);
         hyper(&mut walk, &at("attn_hyper_connection"), &dims, true)?;
@@ -94,10 +92,10 @@ fn walk_flash_pack(
             ple(&mut walk, &at("ple"), &dims)?;
         }
         hyper(&mut walk, &at("mlp_hyper_connection"), &dims, true)?;
-        expert_bytes += walk.moe_block(layer, block)?;
+        walk.moe_block(layer, block)?;
     }
     let (pack, visits) = walk.report_with_visits()?;
-    Ok((FlashPackReport { pack, expert_bytes }, visits))
+    Ok((FlashPackReport { pack }, visits))
 }
 
 /// One hyper-connection site under `prefix`: every weight in one half dtype, which the kernel

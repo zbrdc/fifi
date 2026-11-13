@@ -58,7 +58,7 @@ pub(in crate::family::flash_next) struct TierShape {
 
 impl TierShape {
     /// The shape from the header walk: every routed expert has the same size because every bank
-    /// has one rate and the shapes are fixed (`FlashPackReport::expert_bytes` is their sum).
+    /// has one rate and the shapes are fixed (`PackReport::expert_bytes` is their sum).
     pub(in crate::family::flash_next) fn from_pack(
         layers: usize,
         experts: usize,

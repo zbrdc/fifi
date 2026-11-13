@@ -20,11 +20,11 @@ fn report(trunk: u64) -> FlashPackReport {
     FlashPackReport {
         pack: PackReport {
             device_bytes: experts + embedding + trunk,
+            expert_bytes: experts,
             matrices: 74_041,
             rates: BTreeMap::new(),
             codebook: Marker::Mul1,
         },
-        expert_bytes: experts,
     }
 }
 
@@ -128,7 +128,7 @@ fn a_context_that_keeps_too_few_slots_is_refused_with_the_longest_that_works() {
 #[test]
 fn a_report_smaller_than_its_experts_and_embedding_is_refused() {
     let mut small = report(0);
-    small.pack.device_bytes = small.expert_bytes;
+    small.pack.device_bytes = small.pack.expert_bytes;
     let text = FlashLoadPlan::new(&small, CONFIG, 0, card())
         .unwrap_err()
         .describe();

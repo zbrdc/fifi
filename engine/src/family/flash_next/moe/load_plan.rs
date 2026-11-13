@@ -66,7 +66,12 @@ impl FlashLoadPlan {
     ) -> Result<Self, EngError> {
         let (model, kinds) = model_shape(model_config)?;
         let moe = model.moe;
-        let shape = TierShape::from_pack(kinds.len(), moe.experts, moe.top_k, report.expert_bytes)?;
+        let shape = TierShape::from_pack(
+            kinds.len(),
+            moe.experts,
+            moe.top_k,
+            report.pack.expert_bytes,
+        )?;
         // Two bytes an element: the real pack stores the embedding in BF16. The walk accepts any half
         // dtype or F32; an F32 table would make this figure, and so the trunk's, too small by half.
         let embedding_bytes = (model.vocab as u64)
@@ -75,7 +80,7 @@ impl FlashLoadPlan {
         let trunk_bytes = report
             .pack
             .device_bytes
-            .checked_sub(report.expert_bytes)
+            .checked_sub(report.pack.expert_bytes)
             .and_then(|rest| rest.checked_sub(embedding_bytes))
             .ok_or_else(|| {
                 refuse("the experts and the embedding exceed the pack's device bytes".into())

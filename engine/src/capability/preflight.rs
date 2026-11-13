@@ -2053,6 +2053,7 @@ mod tests {
 
         let plan = Exl3PackPlan {
             device_bytes: 21_000_000_000,
+            expert_bytes: 20_000_000_000,
             matrices: 1_976,
             rates: BTreeMap::from([(10u8, 976), (12u8, 1_000)]),
             codebook: "Mcg",

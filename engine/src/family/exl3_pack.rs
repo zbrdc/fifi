@@ -100,11 +100,57 @@ pub(in crate::family) struct PackReport {
     /// Device bytes the load holds: trellises as stored, scales and plain vectors widened to
     /// F32, the embedding as stored.
     pub(in crate::family) device_bytes: u64,
+    /// Device bytes of the routed experts alone, the part that expert tiers place.
+    pub(in crate::family) expert_bytes: u64,
     /// Quantized matrices (a routed expert counts one per projection).
     pub(in crate::family) matrices: usize,
     /// Matrices per rate, keyed by twice the bits per weight.
     pub(in crate::family) rates: BTreeMap<u8, usize>,
     pub(in crate::family) codebook: Marker,
+}
+
+/// The family-neutral planning summary of one pack directory: exactly the
+/// loader's own header walk, with its totals copied out for callers outside `family`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct PackPlan {
+    /// Device bytes the load will hold ([`PackReport::device_bytes`]).
+    pub(crate) device_bytes: u64,
+    /// Device bytes of the routed experts alone ([`PackReport::expert_bytes`]).
+    pub(crate) expert_bytes: u64,
+    /// Quantized matrices (a routed expert counts one per projection).
+    pub(crate) matrices: usize,
+    /// Matrices per rate, keyed by twice the bits per weight.
+    pub(crate) rates: BTreeMap<u8, usize>,
+    /// The codebook marker tensor every matrix of the pack carries, by name.
+    pub(crate) codebook: &'static str,
+}
+
+/// The name of the codebook marker a matrix carries, for rows that retell the walk.
+pub(in crate::family) fn codebook_name(marker: Marker) -> &'static str {
+    match marker {
+        Marker::Mul1 => "Mul1",
+        Marker::Mcg => "Mcg",
+    }
+}
+
+/// A family's header walk over a pack directory: exactly the rules its serving load applies.
+pub(in crate::family) trait PackWalk {
+    fn walk(&self, dir: &std::path::Path) -> Result<PackReport, EngError>;
+}
+
+/// Runs `walk` over `dir` and copies the report into the family-neutral plan.
+pub(in crate::family) fn plan_pack(
+    dir: &std::path::Path,
+    walk: &dyn PackWalk,
+) -> Result<PackPlan, EngError> {
+    let report = walk.walk(dir)?;
+    Ok(PackPlan {
+        device_bytes: report.device_bytes,
+        expert_bytes: report.expert_bytes,
+        matrices: report.matrices,
+        rates: report.rates,
+        codebook: codebook_name(report.codebook),
+    })
 }
 
 /// What kind of tensor a walk visited.
@@ -149,6 +195,7 @@ pub(in crate::family) struct Inspector<'a> {
     source: &'a StreamedCheckpoint,
     root: Root,
     bytes: u64,
+    expert_bytes: u64,
     matrices: usize,
     rates: BTreeMap<u8, usize>,
     marker: Option<Marker>,
@@ -162,6 +209,7 @@ impl<'a> Inspector<'a> {
             source,
             root,
             bytes: 0,
+            expert_bytes: 0,
             matrices: 0,
             rates: BTreeMap::new(),
             marker: None,
@@ -195,6 +243,7 @@ impl<'a> Inspector<'a> {
     pub(in crate::family) fn report(self) -> Result<PackReport, EngError> {
         Ok(PackReport {
             device_bytes: self.bytes,
+            expert_bytes: self.expert_bytes,
             matrices: self.matrices,
             rates: self.rates,
             codebook: self
@@ -393,6 +442,7 @@ impl<'a> Inspector<'a> {
                 }
             }
             routed += self.bytes - before;
+            self.expert_bytes += self.bytes - before;
             let (k, n) = match part {
                 ExpertPart::Down => (shared_inter, h),
                 _ => (h, shared_inter),

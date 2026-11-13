@@ -261,7 +261,7 @@ fn a_stock_pack_matches_the_config_and_an_independent_byte_sum() {
         .map(|(name, dtype, shape)| device_bytes(name, dtype, shape))
         .sum::<u64>();
     assert_eq!(report.pack.device_bytes, total);
-    assert_eq!(report.expert_bytes, experts);
+    assert_eq!(report.pack.expert_bytes, experts);
     // lm_head, 3 DeltaNet layers of 3 and a QSA layer of 5, 4 layers of 9 experts and 3 shared.
     assert_eq!(report.pack.matrices, 1 + 3 * 3 + 5 + 4 * 12);
     let low = 1 + 4 * 9;
@@ -441,7 +441,7 @@ fn the_real_pack_matches_the_config_and_its_independent_byte_sum() {
         expected("FIFI_FLASH_NEXT_EXL3_EXPECT_BYTES")
     );
     assert_eq!(
-        report.expert_bytes,
+        report.pack.expert_bytes,
         expected("FIFI_FLASH_NEXT_EXL3_EXPECT_EXPERT_BYTES")
     );
     assert_eq!(report.pack.codebook, Marker::Mul1);

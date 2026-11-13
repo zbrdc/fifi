@@ -6,10 +6,11 @@
 use std::path::Path;
 
 use super::{
-    exl3_pack::{ExpertPart, Marker, expert_name, inspect_pack, layer_name},
+    exl3_pack::{ExpertPart, expert_name, inspect_pack, inspect_pack_split, layer_name},
     fixtures::{self, Entry},
     host::{AttnDims, DeltaDims, HostShape, MoeDims},
 };
+use crate::family::exl3_pack::{Marker, codebook_name};
 use crate::{
     EngError,
     family::{AttentionKind, QWEN3_6_35B_A3B},
@@ -227,6 +228,20 @@ fn a_pack_of_the_model_shape_is_counted_from_its_headers() {
     assert_eq!(report.matrices, 1 + 3 + 4 + 2 * 3 * 4);
 }
 
+/// The walk now totals the routed experts' device bytes twice: the report's `expert_bytes`
+/// (saturating, accumulated per moe_block) and the split's `routed_bytes` (plain addition over
+/// the banks). One quantity computed two ways must agree on a synthetic pack.
+#[test]
+fn the_two_routed_expert_sums_of_the_split_agree() {
+    let entries = pack(&shape());
+    let split = inspect_pack_split(&fixtures::checkpoint(entries), &shape()).unwrap();
+    assert!(
+        split.report.expert_bytes > 0,
+        "the synthetic pack has experts"
+    );
+    assert_eq!(split.report.expert_bytes, split.routed_bytes);
+}
+
 #[test]
 fn each_header_change_is_a_named_refusal() {
     let base = pack(&shape());
@@ -346,7 +361,6 @@ fn exl3_plan_refuses_a_directory_without_pack_metadata() {
 /// real pack's codebook in the decision rows, so the mapping is pinned, not println'd.
 #[test]
 fn codebook_names_are_the_markers_own() {
-    use super::exl3_pack::codebook_name;
     assert_eq!(codebook_name(Marker::Mul1), "Mul1");
     assert_eq!(codebook_name(Marker::Mcg), "Mcg");
 }

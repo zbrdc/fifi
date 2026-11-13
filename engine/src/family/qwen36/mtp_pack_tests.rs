@@ -4,11 +4,12 @@
 use std::path::Path;
 
 use super::{
-    exl3_pack::{ExpertPart, Marker, PackReport},
+    exl3_pack::{ExpertPart, PackReport},
     fixtures::{self, Entry},
     host::{AttnDims, DeltaDims, HostShape, MoeDims},
     mtp_pack::{FC_PREFIX, NORM_NAME, PRE_FC_NORM_EMBEDDING, PRE_FC_NORM_HIDDEN, inspect_mtp_pack},
 };
+use crate::family::exl3_pack::Marker;
 use crate::{
     EngError,
     family::{AttentionKind, QWEN3_6_35B_A3B},
