@@ -168,12 +168,71 @@ fn error_text(seed: u64) -> String {
     text
 }
 
+/// Renders one state arm: the same pick stream and admit as the fill arm, driven through
+/// `ExpertBankState` (the host owner a `DeviceBank` wraps) in one host mode, recording the
+/// copy operations the device would run — the demote write-back places included, which the
+/// policy-level arms cannot see.
+fn state_text(mode: HostMode, seed: u64) -> String {
+    let geometry =
+        BankGeometry::new(LAYERS, EXPERTS, TOP_K, SLOTS, RECORD).expect("a legal geometry");
+    let mut state =
+        ExpertBankState::with_policy(geometry, mode, policy(seed)).expect("a filled bank");
+    let mut text = String::new();
+    for call in 0..CALLS {
+        let picks = call_picks(seed, call);
+        let copies = state
+            .begin_pass(0, &picks)
+            .expect("in-range picks and faults");
+        let _ = writeln!(
+            text,
+            "call {call} picks={picks:?} distinct={} hits={}",
+            copies.distinct, copies.hits
+        );
+        for (i, op) in copies.ops.iter().enumerate() {
+            let _ = writeln!(
+                text,
+                "op {call} {i} slot={} in={} src={} demote={:?}",
+                op.slot, op.incoming, op.src_place, op.demote
+            );
+        }
+    }
+    let admit: Vec<u16> = (0..60u16).map(|i| (i % 50) * 5 + 1).collect();
+    let copies = state.admit(0, &admit).expect("the admit contract");
+    let _ = writeln!(
+        text,
+        "admit distinct={} hits={}",
+        copies.distinct, copies.hits
+    );
+    for (i, op) in copies.ops.iter().enumerate() {
+        let _ = writeln!(
+            text,
+            "aop {i} slot={} in={} src={} demote={:?}",
+            op.slot, op.incoming, op.src_place, op.demote
+        );
+    }
+    let stats = state.stats();
+    let _ = writeln!(
+        text,
+        "counters passes={} picks={} hits={} misses={} demotions={}",
+        stats.passes, stats.picks, stats.hits, stats.misses, stats.demotions
+    );
+    text
+}
+
 /// The digests of this family's arms.
 pub(super) fn sections() -> serde_json::Map<String, serde_json::Value> {
     let mut map = serde_json::Map::new();
     for (name, text) in [
         ("fill", arm_text(0xfeed_0001)),
         ("error", error_text(0xfeed_0002)),
+        (
+            "state-exclusive",
+            state_text(HostMode::Exclusive, 0xfeed_0003),
+        ),
+        (
+            "state-inclusive",
+            state_text(HostMode::Inclusive, 0xfeed_0004),
+        ),
     ] {
         map.insert(name.into(), digest(&text).into());
     }

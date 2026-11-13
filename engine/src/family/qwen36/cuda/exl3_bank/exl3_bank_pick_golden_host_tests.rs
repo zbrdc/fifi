@@ -16,7 +16,7 @@
 //! checkout cannot pass a compare it should fail. The file is shared with the Flash-Next pick
 //! golden (`flash_next/cuda/bank_pick_golden_host_tests.rs`); each test owns its own subtree.
 
-use super::{DECAY_CALLS, EMPTY, LayerSlots};
+use super::{DECAY_CALLS, EMPTY, LayerSlots, refill_plan};
 use sha2::{Digest, Sha256};
 use std::fmt::Write as _;
 
@@ -49,9 +49,12 @@ fn digest(text: &str) -> String {
     format!("{:x}", hasher.finalize())
 }
 
-/// Renders one arm: the replay of `CALLS` calls through a fresh table.
-fn arm_text(sticky: usize, seed: u64) -> String {
-    let mut table = LayerSlots::new(EXPERTS, SLOTS, sticky);
+/// Renders one arm: the replay of `CALLS` calls through a fresh table. The refill lines
+/// render the engine's own plan (`refill_plan`, the function `resolve_mapped` issues its
+/// copies from), not a reimplementation: the format matches what an earlier version of
+/// this harness recomputed, so a plan that agrees leaves the pinned digests untouched.
+fn arm_text(slots: usize, sticky: usize, seed: u64) -> String {
+    let mut table = LayerSlots::new(EXPERTS, slots, sticky);
     let mut text = String::new();
     let (mut hits, mut misses) = (0usize, 0usize);
     for call in 0..CALLS {
@@ -68,12 +71,17 @@ fn arm_text(sticky: usize, seed: u64) -> String {
              gated={gated:?} event={}",
             !miss_slots.is_empty()
         );
-        for (i, &slot) in miss_slots.iter().enumerate() {
-            for (part, &len) in PART_LEN.iter().enumerate() {
+        for (i, ops) in refill_plan(&table, &miss_slots, PART_LEN)
+            .chunks(3)
+            .enumerate()
+        {
+            for op in ops {
                 let _ = writeln!(
                     text,
-                    "refill {call} {i} part={part} off={} len={len}",
-                    slot * len
+                    "refill {call} {i} part={} off={} len={}",
+                    op.part,
+                    op.slot * op.record,
+                    op.record
                 );
             }
         }
@@ -135,13 +143,54 @@ fn error_text(seed: u64) -> String {
     text
 }
 
+/// Renders the duplicates-and-capacity arm: a stream with picks repeated inside one call,
+/// then a call with more distinct experts than the table holds slots, recording whatever
+/// the policy answers — repeats are pinned as they land, and the over-capacity refusal as
+/// the engine states it.
+fn dupes_text(slots: usize, seed: u64) -> String {
+    let mut table = LayerSlots::new(EXPERTS, slots, 8);
+    let mut text = String::new();
+    for call in 0..8 {
+        let base = call_picks(seed, call);
+        let mut picks = base.clone();
+        picks.extend_from_slice(&base[..4]);
+        match table.assign(&picks) {
+            Ok((assigned, miss_slots)) => {
+                let _ = writeln!(
+                    text,
+                    "call {call} picks={picks:?} slots={assigned:?} misses={miss_slots:?}"
+                );
+            }
+            Err(error) => {
+                let _ = writeln!(text, "call {call} picks={picks:?} error={error:?}");
+            }
+        }
+    }
+    let over: Vec<usize> = (0..slots + 1).collect();
+    match table.assign(&over) {
+        Ok((assigned, miss_slots)) => {
+            let _ = writeln!(
+                text,
+                "over picks={over:?} slots={assigned:?} misses={miss_slots:?}"
+            );
+        }
+        Err(error) => {
+            let _ = writeln!(text, "over picks={} distinct error={error:?}", over.len());
+        }
+    }
+    text
+}
+
 /// The digests of this family's arms.
 pub(super) fn sections() -> serde_json::Map<String, serde_json::Value> {
     let mut map = serde_json::Map::new();
     for (name, text) in [
-        ("lru", arm_text(0, 0x5eed_0001)),
-        ("sticky", arm_text(8, 0x5eed_0002)),
+        ("lru", arm_text(SLOTS, 0, 0x5eed_0001)),
+        ("sticky", arm_text(SLOTS, 8, 0x5eed_0002)),
         ("error", error_text(0x5eed_0003)),
+        ("lru32", arm_text(32, 0, 0x5eed_0004)),
+        ("sticky3", arm_text(SLOTS, 3, 0x5eed_0005)),
+        ("dupes", dupes_text(SLOTS, 0x5eed_0006)),
     ] {
         map.insert(name.into(), digest(&text).into());
     }

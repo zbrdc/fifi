@@ -2,11 +2,16 @@
   "harness": "pick-replay-1",
   "fn": {
     "fill": "e0699f9487b279bb5630b91cb94bea181e374f8a4b050fceda2bfe3078c1b18d",
-    "error": "68b21870337710b5862317fae56dca1ba0bd9277b4ca9627f2b41a3dfd3f4862"
+    "error": "68b21870337710b5862317fae56dca1ba0bd9277b4ca9627f2b41a3dfd3f4862",
+    "state-exclusive": "93aeae99d41550ab983bcf905195531806c0ad3af9d63fdcc75b00f9b42e3350",
+    "state-inclusive": "145a069ba0078a78fe80d17aabcbf92b6579cf615f5b84bbd79a88f14016e648"
   },
   "q36": {
     "lru": "9f8f24127387e6269f918f52b5177808892207615335fc67f9ddf1b53fdcb0e5",
     "sticky": "b201365cb8c669edb569cb351b60ae7bfd017a40dbf0c5859df5dc274af313e0",
-    "error": "dea8d8a08f540eeaea968e43be982e891427d50adf8cc57f85596b80776cc6a3"
+    "error": "dea8d8a08f540eeaea968e43be982e891427d50adf8cc57f85596b80776cc6a3",
+    "lru32": "42acd0b1c9f25e68a1d3dc9fae23a2c5f3529ec2ed0e93096a6382eca6bce8f8",
+    "sticky3": "d94ff2b2ab5cc4a9296fbe4dddf82fcb855a1d97c204656f5356ec9167acfe3a",
+    "dupes": "d6540d689ddc754fb48c359c4a3f302e0866bc3b8ee7613ba5c65b8d2a28e54d"
   }
 }
