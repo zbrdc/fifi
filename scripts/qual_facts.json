@@ -16,8 +16,8 @@
   "targets": {
     "lib": {
       "path": "src/lib.rs",
-      "test_fns": 6800,
-      "ignored": 605,
+      "test_fns": 6805,
+      "ignored": 609,
       "env_gates": [
         "CUDA_MODULE_LOADING",
         "DEFAULT_ON_CHILD",
@@ -126,6 +126,13 @@
         "FIFI_GDN_CONV_PREFILL",
         "FIFI_GDN_SCAN_CHUNK",
         "FIFI_GDN_SCAN_COLS",
+        "FIFI_GOLDEN_CAP",
+        "FIFI_GOLDEN_COMMIT",
+        "FIFI_GOLDEN_GPU_JSON",
+        "FIFI_GOLDEN_OUT",
+        "FIFI_GOLDEN_PACK_SHA256",
+        "FIFI_GOLDEN_REPLACE",
+        "FIFI_GOLDEN_SCRIBBLE",
         "FIFI_GOLDEN_UPDATE",
         "FIFI_GRAPH_BENCH_PHASES",
         "FIFI_KROW_BREAK",
@@ -415,7 +422,7 @@
         },
         "Q36_CUDA_MODEL_DIR": {
           "or_skip": 0,
-          "required": 11
+          "required": 12
         }
       }
     },
