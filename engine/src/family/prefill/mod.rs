@@ -25,3 +25,6 @@ pub(crate) mod steps;
 
 #[cfg(all(feature = "native-cuda", target_os = "linux"))]
 pub(in crate::family) mod arena;
+
+#[cfg(all(feature = "native-cuda", target_os = "linux"))]
+pub(in crate::family) mod chunk_family;

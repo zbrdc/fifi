@@ -125,7 +125,7 @@ pub(super) const ALL_SLOTS: [ChunkSlot; 35] = [
 /// The rows of one chunk: `m` rows at the positions `p0..p0 + m` of a session whose arena was
 /// planned for `m_sess` rows. Constructed against the caller's `cap` and `m_sess`; the body
 /// re-checks the state's own cap (a chunk built against a larger cap than the state's).
-#[derive(Debug)]
+#[derive(Debug, Clone, Copy)]
 pub(super) struct ChunkRows {
     p0: usize,
     m: usize,

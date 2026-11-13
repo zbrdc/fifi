@@ -1514,11 +1514,11 @@ impl<'a> QwenResidentStep<'a> {
     pub(super) fn run_chunk(&mut self, p0: usize, rows: &[u32]) -> Result<(), EngError> {
         use super::moe::Launch;
         use super::prefill::{
-            ChunkBufs, ChunkModel, ChunkRows, ChunkRun, ChunkSparse, ChunkViews, ChunkWeights,
-            run_chunk_body,
+            ChunkBufs, ChunkModel, ChunkRows, ChunkSparse, ChunkViews, ChunkWeights,
         };
-        use super::prefill_driver::{check_chunk_start, chunk_ids};
+        use super::prefill_driver::{Q36ChunkCtx, Q36ChunkFamily, check_chunk_start, chunk_ids};
         use super::prefill_plan::ChunkSlot;
+        use crate::family::prefill::chunk_family::ChunkFamily;
 
         // A chunk advances the live state: refused through a gated state or an awaiting window.
         self.state_usable()?;
@@ -1577,39 +1577,54 @@ impl<'a> QwenResidentStep<'a> {
         // 3. From here every error poisons.
         *started = true;
         let opened = std::time::Instant::now();
-        let body = || -> Result<usize, EngError> {
-            state.begin_prefill()?;
-            state.clear_prefill_status(stream)?;
-            let bytes: Vec<u8> = ids.iter().flat_map(|id| id.to_le_bytes()).collect();
-            ids_range
-                .buffer()
-                .write_at(stream, ids_range.offset(), &bytes)?;
-            let run = ChunkRun::new(&*state, &model, &bufs, chunk_rows)?;
-            let run = run.with_bank(self.exl3_bank).with_sparse(
-                res.sparse
-                    .as_ref()
-                    .map(|sp| ChunkSparse::new(sp, &res.dims.shape.kinds)),
-            );
+        // The sparse projection is a preflight product too (built from `res` before the window).
+        let sparse = res
+            .sparse
+            .as_ref()
+            .map(|sp| ChunkSparse::new(sp, &res.dims.shape.kinds));
+        let mut fam = Q36ChunkFamily::new(
+            self.exl3_bank,
             #[cfg(test)]
-            let run = run.with_kernel_class(kernel_class);
-            run_chunk_body(
-                &Launch {
-                    ctx: context,
-                    stream,
-                },
-                &run,
-            )?;
-            Ok(run.segmented_parts())
+            kernel_class,
+        );
+        let mut ctx = Q36ChunkCtx {
+            state,
+            launch: Launch {
+                ctx: context,
+                stream,
+            },
+            ids: &ids,
+            ids_range,
+            model: &model,
+            bufs: &bufs,
+            chunk_rows,
+            sparse,
         };
-        let segmented_parts = body().inspect_err(|_| {
-            state.poison();
+        // The window opens, the status clears, the ids stage and the layers run: today's body,
+        // unchanged, one instruction order. Each call takes its own dyn borrow of `fam`, so the
+        // step's report reads `fam.segmented_parts` between them.
+        fn open_and_run<'a, 'w>(
+            family: &mut dyn ChunkFamily<Ctx = Q36ChunkCtx<'a, 'w>>,
+            ctx: &mut Q36ChunkCtx<'a, 'w>,
+            p0: usize,
+            m: usize,
+        ) -> Result<(), EngError> {
+            family.begin_window(ctx)?;
+            family.clear_chunk_status(ctx)?;
+            family.write_chunk_inputs(ctx, p0, m)?;
+            family.run_layers(ctx, p0, m)
+        }
+        open_and_run(&mut fam, &mut ctx, p0, m).inspect_err(|_| {
+            ctx.state.poison();
             super::prefill::phase_timing::serve::discard();
         })?;
-        prefill_report.note_segmented_parts(segmented_parts);
-        let status = state.read_prefill_status(stream).inspect_err(|_| {
-            state.poison();
-            super::prefill::phase_timing::serve::discard();
-        })?;
+        prefill_report.note_segmented_parts(fam.segmented_parts);
+        let status = (&mut fam as &mut dyn ChunkFamily<Ctx = Q36ChunkCtx>)
+            .read_health(&mut ctx)
+            .inspect_err(|_| {
+                ctx.state.poison();
+                super::prefill::phase_timing::serve::discard();
+            })?;
         // The status read completed the stream, so the serve-phase marks (if armed) are
         // readable now; nothing prints when the knob is off. The elapsed read comes
         // first so the recorded step time excludes the share line's queries and print.
@@ -1622,9 +1637,9 @@ impl<'a> QwenResidentStep<'a> {
             ns,
             status,
         });
-        state
-            .revalidate(stream, p0 + m, status)
-            .inspect_err(|_| state.poison())?;
+        (&mut fam as &mut dyn ChunkFamily<Ctx = Q36ChunkCtx>)
+            .commit_chunk(&mut ctx, p0, m, status)
+            .inspect_err(|_| ctx.state.poison())?;
         // R3: the chunk committed [p0, p0 + m) and its sketch cells are queued; the
         // selection-eligible prefix grows with it, but only when this chunk continues
         // it exactly (interrupted or gapped prefill keeps the smaller prefix).

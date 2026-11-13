@@ -671,3 +671,106 @@ pub(super) fn chunk_ids(rows: &[u32], sampler_width: usize) -> Result<Vec<i32>, 
         })
         .collect()
 }
+
+// ---- the shared chunk-family surface ---------------------------------------------------------
+
+use super::moe::Launch;
+use super::prefill::{ChunkBufs, ChunkModel, ChunkRows, ChunkSparse};
+use super::state::ResidentState;
+use crate::family::prefill::chunk_family::ChunkFamily;
+
+/// What the chunk body captures today, handed to the trait opaquely: the state, the launch, the
+/// host-checked ids with their arena range, the prebuilt model, buffers, rows and sparse
+/// projection. The ids are a PREFLIGHT product (`chunk_ids` runs before the window opens), so a
+/// refused token id changes nothing on the device.
+pub(super) struct Q36ChunkCtx<'a, 'w> {
+    pub(super) state: &'a mut ResidentState,
+    pub(super) launch: Launch<'a>,
+    pub(super) ids: &'a [i32],
+    pub(super) ids_range: DeviceRange<'a>,
+    pub(super) model: &'a ChunkModel<'a, 'w>,
+    pub(super) bufs: &'a ChunkBufs<'a>,
+    pub(super) chunk_rows: ChunkRows,
+    pub(super) sparse: Option<ChunkSparse<'a>>,
+}
+
+/// The Qwen3.6 [`ChunkFamily`]: every method calls the site it replaced verbatim; the
+/// instruction order inside a chunk is unchanged. `run_layers` stores the run's part count in
+/// `segmented_parts` for the step's report (a Qwen3.6-only figure, so it stays here and not in
+/// the trait).
+pub(super) struct Q36ChunkFamily<'a, 'w> {
+    bank: Option<&'a std::cell::RefCell<super::exl3_bank::Exl3SlotResolver<'w>>>,
+    #[cfg(test)]
+    kernel_class: super::prefill::ChunkKernelClass,
+    pub(super) segmented_parts: usize,
+}
+
+impl<'a, 'w> Q36ChunkFamily<'a, 'w> {
+    pub(super) fn new(
+        bank: Option<&'a std::cell::RefCell<super::exl3_bank::Exl3SlotResolver<'w>>>,
+        #[cfg(test)] kernel_class: super::prefill::ChunkKernelClass,
+    ) -> Self {
+        Self {
+            bank,
+            #[cfg(test)]
+            kernel_class,
+            segmented_parts: 0,
+        }
+    }
+}
+
+impl<'a, 'w> ChunkFamily for Q36ChunkFamily<'a, 'w> {
+    type Ctx = Q36ChunkCtx<'a, 'w>;
+
+    fn begin_window(&mut self, ctx: &mut Self::Ctx) -> Result<(), EngError> {
+        ctx.state.begin_prefill()
+    }
+
+    fn clear_chunk_status(&mut self, ctx: &mut Self::Ctx) -> Result<(), EngError> {
+        ctx.state.clear_prefill_status(ctx.launch.stream)
+    }
+
+    fn write_chunk_inputs(
+        &mut self,
+        ctx: &mut Self::Ctx,
+        _p0: usize,
+        _m: usize,
+    ) -> Result<(), EngError> {
+        let bytes: Vec<u8> = ctx.ids.iter().flat_map(|id| id.to_le_bytes()).collect();
+        ctx.ids_range
+            .buffer()
+            .write_at(ctx.launch.stream, ctx.ids_range.offset(), &bytes)
+    }
+
+    fn run_layers(&mut self, ctx: &mut Self::Ctx, _p0: usize, _m: usize) -> Result<(), EngError> {
+        let run = super::prefill::ChunkRun::new(&*ctx.state, ctx.model, ctx.bufs, ctx.chunk_rows)?;
+        let run = run.with_bank(self.bank).with_sparse(ctx.sparse.take());
+        #[cfg(test)]
+        let run = run.with_kernel_class(self.kernel_class);
+        super::prefill::run_chunk_body(&ctx.launch, &run)?;
+        self.segmented_parts = run.segmented_parts();
+        Ok(())
+    }
+
+    fn read_health(&mut self, ctx: &mut Self::Ctx) -> Result<i32, EngError> {
+        ctx.state.read_prefill_status(ctx.launch.stream)
+    }
+
+    fn commit_chunk(
+        &mut self,
+        ctx: &mut Self::Ctx,
+        p0: usize,
+        m: usize,
+        status: i32,
+    ) -> Result<(), EngError> {
+        ctx.state.revalidate(ctx.launch.stream, p0 + m, status)
+    }
+
+    fn reset(&mut self, ctx: &mut Self::Ctx) -> Result<(), EngError> {
+        ctx.state.reset(ctx.launch.stream)
+    }
+
+    fn bank_misses(&self) -> Option<u64> {
+        self.bank.as_ref().map(|bank| bank.borrow().stats().1)
+    }
+}
