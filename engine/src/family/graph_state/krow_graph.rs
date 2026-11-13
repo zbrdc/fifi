@@ -1,13 +1,14 @@
-//! One CUDA graph per window length of the K-row body (`qwen36.draft_verify = krow`).
+//! One CUDA graph per window length of the K-row body (`draft_verify = krow`).
 //!
-//! The graph of `K` rows records the whole launch list of [`super::krow_step`] for exactly `K`
+//! The graph of `K` rows records the whole launch list of the family's K-row step for exactly `K`
 //! rows: the launch list is fixed by `K` (grids, row-offset ranges, the snapshot strides), and
 //! everything that changes from window to window is a device word the kernels read (`pos`,
 //! `kv_len`, the window ids, the router's picks). So a graph serves every window of its length and
 //! no other length: [`GraphTable`] keeps one slot per `K` and a lookup for `K` can only return the
 //! graph captured for `K` rows.
 //!
-//! The warm rule is the one-row step's (`step::next_mode`), applied per `K`. The first window of a
+//! The warm rule is the one-row step's (`next_mode` of this module), applied per `K`. The first
+//! window of a
 //! length runs the body eagerly: it loads the modules of the kernels it launches, which a capture
 //! forbids, and warms the views. The next window of that length captures and launches the graph in
 //! the same window (a capture records and does not run). Every later window of that length replays.
@@ -32,9 +33,12 @@
 //! (the small buffer), `state` and `rollback`, so every graph drops before the buffers it covers;
 //! `krow_graph_tests` pins that order on the source.
 
-use super::next_mode;
-use crate::family::qwen36::cuda::step::Mode;
-use crate::{EngError, family::qwen36::rollback::MAX_ROWS};
+use super::{Mode, next_mode};
+use crate::EngError;
+
+/// The longest window the K-row body serves; the table is sized to it. The
+/// family's window cap (Qwen3.6's `QWEN36_MAX_WINDOW_ROWS`) aliases this.
+pub(in crate::family) const MAX_ROWS: usize = 8;
 
 /// The shortest window the K-row body serves (one row is the single-row step and its own graph).
 pub(in crate::family) const MIN_ROWS: usize = 2;

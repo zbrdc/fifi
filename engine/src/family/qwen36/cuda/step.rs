@@ -11,7 +11,8 @@
 //!    records (its doc states the contract);
 //! 3. the read-back, the event and ONE blocking wait (`read_back`).
 //!
-//! The body of a token runs in one of three modes (the pure `next_mode` rule below): eager (the
+//! The body of a token runs in one of three modes (the pure `next_mode` rule of
+//! `family::graph_state`): eager (the
 //! warm-up token, every fallback and every plain session), captured (one capture, then
 //! replays), or eager-after-refusal. A refused capture is STICKY for the whole step
 //! construction: later tokens stay eager and keep reporting `RefusedFellBackToEager`, across
@@ -268,13 +269,7 @@ impl SectionMarks {
     }
 }
 
-pub(in crate::family) enum Mode {
-    Replay,
-    Capture,
-    Eager,
-}
-
-pub(super) use crate::family::graph_state::next_mode;
+pub(in crate::family) use crate::family::graph_state::{Mode, next_mode};
 
 /// The pure part of `capture_once`: what to do with the result of the capture attempt.
 /// `Ok(Some(graph))`: the capture succeeded, the caller stores and replays the graph. `Ok(None)`:
@@ -282,7 +277,7 @@ pub(super) use crate::family::graph_state::next_mode;
 /// the failure rule must judge the rerun alone), the sticky refusal is set (`refused`) and the
 /// caller reruns the body eagerly. `Err`: any other error comes back unchanged, with `entered`
 /// and `refused` untouched, for the caller to fail on.
-pub(in crate::family) fn fold_capture<G>(
+pub(super) fn fold_capture<G>(
     attempt: Result<(G, ()), EngError>,
     is_refusal: fn(&EngError) -> bool,
     entered: &mut usize,
@@ -357,9 +352,7 @@ pub(super) fn exl3_device_pick_refusal(
     Ok(())
 }
 
-pub(in crate::family) fn exl3_flag_error() -> EngError {
-    EngError::ModelOutput("EXL3 projection flagged invalid arithmetic".to_owned())
-}
+use crate::family::graph_state::book::exl3_flag_error;
 
 /// The refusal of a result pair whose status carries the EXL3 arithmetic verdict (mask 16). It is
 /// taken before `decide` sees the pair, so a flagged EXL3 token never commits, whatever other
@@ -552,7 +545,7 @@ pub(crate) struct QwenResidentStep<'a> {
 /// The typed verdict of the chunk gate: whether `feed_rows` may run the chunk path for this
 /// session. Every refusal keeps the per-token prompt path; the run report records the reason.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(in crate::family) enum ChunkVerdict {
+pub(super) enum ChunkVerdict {
     /// The session may use the chunk path. `m_sess` is the ADMITTED `M_sess`, one of
     /// `M_LADDER` (`PrefillArena::m_sess`), never the raw cap: the arena admission narrows the
     /// cap of `set_m_sess_cap` to the largest ladder size whose device sum fits the budget.

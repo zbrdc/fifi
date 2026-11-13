@@ -7,6 +7,9 @@ use super::run_report::CaptureOutcome;
 use super::state::StepField;
 use super::state_layout::Word;
 use super::step::{HowRan, Mode, fold_capture, next_mode, reported_outcome};
+use super::verdict::{FailureAction, action_for};
+use crate::EngError;
+use crate::family::graph_state::krow_graph::{ENTERED_BY_GRAPH, Facts, GraphTable, MAX_ROWS};
 use crate::kernels::cuda::resident::step_params::{
     OFFSET_KV_LEN, OFFSET_POS, OFFSET_STATUS, OFFSET_TOKEN_ID, STEP_PARAMS_BYTES,
 };
@@ -806,4 +809,92 @@ fn tiered_step_refuses_capture_with_a_typed_error() {
         }
         other => panic!("tiered with capture must be refused: {other:?}"),
     }
+}
+
+fn table_mode(table: &GraphTable<usize>, rows: usize, capture_on: bool) -> &'static str {
+    match table.mode(rows, capture_on).expect("a served length") {
+        Mode::Replay => "replay",
+        Mode::Capture => "capture",
+        Mode::Eager => "eager",
+    }
+}
+
+#[test]
+fn a_refused_capture_is_sticky_for_every_length_and_leaves_captured_graphs_alone() {
+    let facts = |nodes: usize, vram_bytes: u64| Facts { nodes, vram_bytes };
+    let mut table = GraphTable::<usize>::default();
+    for rows in [2, 3, 4] {
+        table.note_eager(rows);
+    }
+    table.store(3, 3, facts(0, 0)).expect("store");
+    // The capture of 4 rows is refused by the device: the shared fold sets the flag and reports
+    // that the body must run again, eagerly.
+    let mut entered = 17;
+    let kept = fold_capture::<usize>(
+        Err(EngError::BadRequest("cuda capture: refused".to_owned())),
+        crate::kernels::cuda::is_capture_refusal,
+        &mut entered,
+        table.refused_mut(),
+    )
+    .expect("a refusal is not an error");
+    assert!(kept.is_none());
+    assert_eq!(entered, 0, "the attempt's op count is discarded");
+    assert_eq!(
+        table_mode(&table, 3, true),
+        "replay",
+        "the captured graph still serves its length"
+    );
+    assert_eq!(
+        table_mode(&table, 2, true),
+        "eager",
+        "warm but refused: no capture of 2"
+    );
+    assert_eq!(table_mode(&table, 4, true), "eager");
+    assert_eq!(table_mode(&table, MAX_ROWS, true), "eager");
+}
+
+#[test]
+fn a_failed_launch_of_a_graph_is_judged_after_the_launch() {
+    // The graph is the whole body, so the count the failure rule sees must be one that poisons the
+    // state; a count of 0 or 1 would take the step back as if the first op had refused to launch.
+    assert_eq!(action_for(ENTERED_BY_GRAPH), FailureAction::Poison);
+    assert_eq!(
+        action_for(0),
+        FailureAction::Cancel,
+        "the rule itself is unchanged"
+    );
+    assert_eq!(action_for(1), FailureAction::Cancel);
+}
+
+/// The field order of `QwenResidentStep` is its drop order: the K-row graphs bake in the addresses
+/// of the K-row buffer, the state and the rollback slots, so they must be declared before all
+/// three. Fields are found by name, not by line.
+#[test]
+fn the_k_row_graphs_are_declared_before_the_buffers_they_bake_in() {
+    let source = include_str!("step.rs");
+    let start = source
+        .find("pub(crate) struct QwenResidentStep<'a> {")
+        .expect("the step struct");
+    let end = start
+        + source[start..]
+            .find("\n}\n")
+            .expect("the end of the struct");
+    let fields = &source[start..end];
+    let declared = |name: &str| -> usize {
+        let needle = format!("\n    {name}: ");
+        fields
+            .find(&needle)
+            .unwrap_or_else(|| panic!("the field {name:?} is not declared in the step struct"))
+    };
+    let graphs = declared("krow_graphs");
+    for later in ["krow", "state", "rollback", "context", "stream"] {
+        assert!(
+            graphs < declared(later),
+            "krow_graphs must be declared before {later}: it drops first"
+        );
+    }
+    assert!(
+        declared("graph") < graphs,
+        "the K-row graphs sit next to the one-row graph, after it"
+    );
 }

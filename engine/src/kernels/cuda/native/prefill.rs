@@ -26,7 +26,7 @@ use super::{DeviceFailure, STAGE_NONE, checked, invalid_argument};
 
 /// The kernels' mirror of `INFERENCE_CUDA_PREFILL_STATUS_BOUND_VIOLATION` in `prefill/status.h`:
 /// mask 8 (0x8) of the prefill status word, a prefill chunk fault — the mask
-/// `family/qwen36/cuda/book.rs` `status_error` maps to Backend `"prefill_chunk"`. One const here;
+/// `family/graph_state/book.rs` `status_error` maps to Backend `"prefill_chunk"`. One const here;
 /// every user imports this one.
 #[cfg_attr(
     not(test),

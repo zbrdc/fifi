@@ -98,9 +98,15 @@ pub(crate) fn status_error(status: i32) -> EngError {
         };
     }
     if status & STATUS_EXL3_ARITHMETIC != 0 {
-        return crate::family::qwen36::cuda::step::exl3_flag_error();
+        return exl3_flag_error();
     }
     report.error().unwrap_or_else(|| unknown_bits(status))
+}
+
+/// The EXL3 arithmetic flag's error: an EXL3 step's projection reported invalid
+/// arithmetic, so the step fails closed whatever other bits the status word holds.
+pub(in crate::family) fn exl3_flag_error() -> EngError {
+    EngError::ModelOutput("EXL3 projection flagged invalid arithmetic".to_owned())
 }
 
 fn unknown_bits(status: i32) -> EngError {

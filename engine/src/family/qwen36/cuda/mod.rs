@@ -147,7 +147,7 @@ mod placement_tests;
 mod prefill;
 #[cfg(test)]
 mod prefill_device_tests;
-pub(in crate::family) mod prefill_driver;
+mod prefill_driver;
 #[cfg(test)]
 mod prefill_driver_tests;
 #[cfg(test)]
@@ -163,7 +163,7 @@ mod prefill_plan_tests;
 mod prefill_step_device_tests;
 #[cfg(test)]
 mod prefill_tests;
-pub(in crate::family) mod prefix;
+mod prefix;
 #[cfg(test)]
 mod prefix_device_tests;
 #[cfg(test)]
@@ -173,7 +173,7 @@ mod r5_fmt;
 mod readback;
 #[cfg(test)]
 mod readback_tests;
-pub(in crate::family) mod resources;
+mod resources;
 #[cfg(test)]
 mod resources_tests;
 #[cfg(test)]
@@ -209,7 +209,7 @@ mod start_pins;
 mod start_tests;
 mod state;
 pub(in crate::family) mod state_layout;
-pub(in crate::family) mod step;
+mod step;
 mod step_ops;
 #[cfg(test)]
 mod step_ops_tests;
@@ -221,7 +221,7 @@ mod tests;
 mod tiered_load;
 mod tiered_step;
 mod trace;
-pub(in crate::family) mod verdict;
+mod verdict;
 #[cfg(test)]
 mod verdict_tests;
 #[cfg(test)]

@@ -16,7 +16,9 @@
 use crate::EngError;
 
 /// The most rows of one window (`QWEN36_MAX_WINDOW_ROWS`, `settings.rs`).
-pub(crate) const MAX_ROWS: usize = super::settings::QWEN36_MAX_WINDOW_ROWS;
+// The rollback window cap: the K-row table capacity in graph_state::krow_graph (the
+// table lives behind the CUDA gate, this file does not); krow_graph_tests pins equality.
+pub(crate) const MAX_ROWS: usize = 8;
 
 fn refuse(what: &str, why: &str) -> EngError {
     EngError::BadRequest(format!("device rollback: {what}: {why}"))
