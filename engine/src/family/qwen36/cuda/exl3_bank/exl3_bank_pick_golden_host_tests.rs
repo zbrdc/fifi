@@ -1,0 +1,222 @@
+//! The pick-replay golden of the Q36 bank policy: `LayerSlots` (LRU, and LRU with the sticky
+//! decayed-hot set) replayed over deterministic pick streams, recording per call the picks,
+//! the returned slots, the miss list, the gated pick set (the picks whose expert refilled this
+//! call), the event flag a `resolve_split` would raise, the refill plan (three parts, part
+//! offset and length per miss, in miss order), the whole slot table after every call, and the
+//! counters. The error arm pins the RECORDED DEFECT: `assign` is not atomic (a mid-stream
+//! `Err` leaves `tick` advanced and earlier assignments standing), and a failed refill write in
+//! `resolve_mapped` leaves the table ahead of the device bytes — the fix is a later change
+//! of its own, and this golden is what proves it unchanged until then and moved after.
+//!
+//! Host-only, modelless, GPUless, but compiled under `--features native-cuda` in the
+//! container (the qwen36 cuda module is native-cuda-gated): name this test in every
+//! native-cuda test battery. `FIFI_GOLDEN_UPDATE=1` rewrites this family's section of
+//! `testdata/pick-goldens.json` atomically (same mechanism and switch as the prefill golden
+//! harness); without it the compile-time pin is compared, so a drifted
+//! checkout cannot pass a compare it should fail. The file is shared with the Flash-Next pick
+//! golden (`flash_next/cuda/bank_pick_golden_host_tests.rs`); each test owns its own subtree.
+
+use super::{DECAY_CALLS, EMPTY, LayerSlots};
+use sha2::{Digest, Sha256};
+use std::fmt::Write as _;
+
+const EXPERTS: usize = 512;
+const SLOTS: usize = 48;
+/// The three part lengths of the 3.05 pack's record (gate/up/down), 1,881,600 bytes together.
+const PART_LEN: [usize; 3] = [626_864, 626_864, 626_872];
+const CALLS: usize = 200;
+const PICKS: usize = 8;
+
+/// An xorshift stream: `CALLS` calls of `PICKS` distinct experts each, deterministic per seed.
+fn call_picks(seed: u64, call: usize) -> Vec<usize> {
+    let mut state = seed ^ (call as u64).wrapping_mul(0x9e37_79b9_7f4a_7c15);
+    let mut picks = Vec::with_capacity(PICKS);
+    while picks.len() < PICKS {
+        state ^= state << 13;
+        state ^= state >> 7;
+        state ^= state << 17;
+        let expert = (state >> 33) as usize % EXPERTS;
+        if !picks.contains(&expert) {
+            picks.push(expert);
+        }
+    }
+    picks
+}
+
+fn digest(text: &str) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(text.as_bytes());
+    format!("{:x}", hasher.finalize())
+}
+
+/// Renders one arm: the replay of `CALLS` calls through a fresh table.
+fn arm_text(sticky: usize, seed: u64) -> String {
+    let mut table = LayerSlots::new(EXPERTS, SLOTS, sticky);
+    let mut text = String::new();
+    let (mut hits, mut misses) = (0usize, 0usize);
+    for call in 0..CALLS {
+        let picks = call_picks(seed, call);
+        let (slots, miss_slots) = table.assign(&picks).expect("in-range distinct picks");
+        let gated: Vec<usize> = (0..picks.len())
+            .filter(|&p| miss_slots.contains(&slots[p]))
+            .collect();
+        hits += slots.len() - gated.len();
+        misses += miss_slots.len();
+        let _ = writeln!(
+            text,
+            "call {call} picks={picks:?} slots={slots:?} misses={miss_slots:?} \
+             gated={gated:?} event={}",
+            !miss_slots.is_empty()
+        );
+        for (i, &slot) in miss_slots.iter().enumerate() {
+            for (part, &len) in PART_LEN.iter().enumerate() {
+                let _ = writeln!(
+                    text,
+                    "refill {call} {i} part={part} off={} len={len}",
+                    slot * len
+                );
+            }
+        }
+        let row: Vec<i32> = table
+            .slot_of
+            .iter()
+            .map(|&slot| if slot == EMPTY { -1 } else { i32::from(slot) })
+            .collect();
+        let _ = writeln!(text, "table {call} tick={} row={row:?}", table.tick);
+    }
+    let _ = writeln!(
+        text,
+        "counters calls={CALLS} hits={hits} misses={misses} decays={}",
+        table.tick / DECAY_CALLS
+    );
+    text
+}
+
+/// Renders the error arm: a mid-stream out-of-range pick, the table state the failed call
+/// leaves behind (tick advanced: the non-atomicity this golden pins), and the follow-up call
+/// that makes it visible: the first pick of the failed call was already assigned, so
+/// re-assigning it alone is a hit with no miss. What is pinned of the defect is the
+/// refused-pick half; the refill order, the gated set, the event flag and the counters are
+/// recomputed here from the policy's returns, not read from the engine.
+fn error_text(seed: u64) -> String {
+    let mut table = LayerSlots::new(EXPERTS, SLOTS, 8);
+    let mut text = String::new();
+    let mut resident: Vec<usize> = Vec::new();
+    for call in 0..4 {
+        let picks = call_picks(seed, call);
+        resident.extend_from_slice(&picks);
+        let (slots, _) = table.assign(&picks).expect("valid calls first");
+        let _ = writeln!(text, "call {call} picks={picks:?} slots={slots:?}");
+    }
+    let bad_expert = (0..EXPERTS)
+        .find(|&e| !resident.contains(&e))
+        .expect("512 experts against at most 32 assigned leaves an absent one");
+    let bad = vec![bad_expert, EXPERTS, bad_expert];
+    let error = table
+        .assign(&bad)
+        .expect_err("an out-of-range pick exceeds the layer");
+    let _ = writeln!(text, "call 4 picks={bad:?} error={error:?}");
+    let follow = table
+        .assign(&[bad_expert])
+        .expect("the first pick of the failed call stands");
+    let _ = writeln!(
+        text,
+        "call 5 picks=[{bad_expert}] slots={:?} misses={:?} defect={}",
+        follow.0,
+        follow.1,
+        follow.1.is_empty()
+    );
+    let row: Vec<i32> = table
+        .slot_of
+        .iter()
+        .map(|&slot| if slot == EMPTY { -1 } else { i32::from(slot) })
+        .collect();
+    let _ = writeln!(text, "table 5 tick={} row={row:?}", table.tick);
+    text
+}
+
+/// The digests of this family's arms.
+pub(super) fn sections() -> serde_json::Map<String, serde_json::Value> {
+    let mut map = serde_json::Map::new();
+    for (name, text) in [
+        ("lru", arm_text(0, 0x5eed_0001)),
+        ("sticky", arm_text(8, 0x5eed_0002)),
+        ("error", error_text(0x5eed_0003)),
+    ] {
+        map.insert(name.into(), digest(&text).into());
+    }
+    map
+}
+
+/// Serializes `FIFI_GOLDEN_UPDATE` captures: the two pick-golden tests of this crate update
+/// the same file from parallel libtest threads, so the read-merge-write must be serialized or
+/// one subtree can be lost to the interleaving. The lock is a `create_new` file beside the
+/// golden (atomic everywhere we run); a capture crashed mid-update leaves it behind, and the
+/// next capture panics after a minute instead of racing — delete the stale file then. Other
+/// harnesses' golden files are separate paths and are never touched by this code.
+fn with_golden_lock<R>(path: &std::path::Path, update: impl FnOnce() -> R) -> R {
+    let lock = path.with_extension("lock");
+    let began = std::time::Instant::now();
+    while std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&lock)
+        .is_err()
+    {
+        if began.elapsed() > std::time::Duration::from_secs(60) {
+            panic!(
+                "the pick-goldens update lock {} is held or stale; delete it if no capture runs",
+                lock.display()
+            );
+        }
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+    let result = update();
+    let _ = std::fs::remove_file(&lock);
+    result
+}
+
+#[test]
+fn the_pick_replay_holds_its_golden_digests() {
+    const GOLDENS_TEXT: &str = include_str!("../testdata/pick-goldens.json");
+    let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("src/family/qwen36/cuda/testdata/pick-goldens.json");
+    let sections = sections();
+    if std::env::var_os("FIFI_GOLDEN_UPDATE").is_some_and(|value| !value.is_empty()) {
+        with_golden_lock(&path, || {
+            let text = std::fs::read_to_string(&path)
+                .unwrap_or_else(|error| panic!("{}: {error}", path.display()));
+            let mut goldens: serde_json::Value =
+                serde_json::from_str(&text).expect("the committed pick goldens on disk");
+            goldens["q36"] = serde_json::Value::Object(sections);
+            let tmp = path.with_extension("json.tmp");
+            std::fs::write(
+                &tmp,
+                serde_json::to_string_pretty(&goldens).expect("serialize"),
+            )
+            .expect("write the update beside the golden");
+            std::fs::rename(&tmp, &path).expect("the atomic replace");
+        });
+        println!("UPDATED q36 pick goldens in {}", path.display());
+        return;
+    }
+    let pinned: serde_json::Value =
+        serde_json::from_str(GOLDENS_TEXT).expect("the committed pick goldens");
+    assert!(
+        !pinned["q36"].is_null(),
+        "no q36 pick goldens; capture with FIFI_GOLDEN_UPDATE=1"
+    );
+    let mut drifted: Vec<String> = Vec::new();
+    for (name, sha) in &sections {
+        let pinned_sha = pinned["q36"][name].as_str().unwrap_or("");
+        if pinned_sha != sha.as_str().unwrap_or("") {
+            drifted.push(format!("{name}: pinned {pinned_sha:?}, computed {sha}"));
+        }
+    }
+    assert!(
+        drifted.is_empty(),
+        "the Q36 bank policy moved; sections:\n{}",
+        drifted.join("\n")
+    );
+    println!("GOLDEN MATCH q36 picks");
+}

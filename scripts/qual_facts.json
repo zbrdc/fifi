@@ -16,7 +16,7 @@
   "targets": {
     "lib": {
       "path": "src/lib.rs",
-      "test_fns": 6798,
+      "test_fns": 6800,
       "ignored": 605,
       "env_gates": [
         "CUDA_MODULE_LOADING",
@@ -126,6 +126,7 @@
         "FIFI_GDN_CONV_PREFILL",
         "FIFI_GDN_SCAN_CHUNK",
         "FIFI_GDN_SCAN_COLS",
+        "FIFI_GOLDEN_UPDATE",
         "FIFI_GRAPH_BENCH_PHASES",
         "FIFI_KROW_BREAK",
         "FIFI_KROW_COMMIT",

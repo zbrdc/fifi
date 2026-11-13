@@ -16,6 +16,8 @@ mod bank;
 pub(in crate::family::flash_next) mod resume;
 
 // The pack reader exists where the pack files do (`load::pack_files`): tests and native-cuda Linux.
+#[cfg(test)]
+mod bank_pick_golden_host_tests;
 #[cfg(any(test, all(feature = "native-cuda", target_os = "linux")))]
 mod bank_source;
 #[cfg(test)]

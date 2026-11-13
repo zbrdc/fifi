@@ -1112,3 +1112,6 @@ pub(crate) mod probe {
         )
     }
 }
+
+#[cfg(test)]
+mod exl3_bank_pick_golden_host_tests;
