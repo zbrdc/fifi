@@ -22,13 +22,6 @@ fn mode(table: &GraphTable<usize>, rows: usize, capture_on: bool) -> &'static st
     mode_name(table.mode(rows, capture_on).expect("a served length"))
 }
 
-/// The rollback window cap is the table capacity: two names, one number, pinned here.
-#[test]
-fn the_rollback_cap_is_the_table_capacity() {
-    use crate::family::qwen36::rollback;
-    assert_eq!(rollback::MAX_ROWS, MAX_ROWS);
-}
-
 #[test]
 fn only_windows_of_two_to_the_cap_have_a_slot() {
     assert_eq!(SLOTS, MAX_ROWS + 1);

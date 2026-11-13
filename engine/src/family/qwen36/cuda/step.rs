@@ -2811,6 +2811,11 @@ mod prefix_runtime;
 
 use crate::family::graph_state::krow_graph;
 
+// The K-row table's capacity must equal the family's window cap: three literals
+// exist (settings, this table, rollback's alias of settings); this ties them at compile time.
+const _: () =
+    assert!(krow_graph::MAX_ROWS == crate::family::qwen36::settings::QWEN36_MAX_WINDOW_ROWS);
+
 #[path = "krow_step.rs"]
 mod krow_step;
 

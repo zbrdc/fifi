@@ -36,8 +36,9 @@
 use super::{Mode, next_mode};
 use crate::EngError;
 
-/// The longest window the K-row body serves; the table is sized to it. The
-/// family's window cap (Qwen3.6's `QWEN36_MAX_WINDOW_ROWS`) aliases this.
+/// The longest window the K-row body serves; the table is sized to it.
+/// `QWEN36_MAX_WINDOW_ROWS` and rollback's `MAX_ROWS` hold the same value;
+/// `qwen36/cuda/step.rs` pins the tie with a const assert.
 pub(in crate::family) const MAX_ROWS: usize = 8;
 
 /// The shortest window the K-row body serves (one row is the single-row step and its own graph).
