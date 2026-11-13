@@ -379,7 +379,7 @@ pub(crate) struct PlacementPlan {
 
 /// One full-attention layer's KV stride, `[K | K scales | V | V scales]`,
 /// mirroring `state_layout`'s KvPool math for the Int8G32 layout.
-fn kv_layer_stride_bytes(shape: &HostShape) -> Result<u64, EngError> {
+pub(super) fn kv_layer_stride_bytes(shape: &HostShape) -> Result<u64, EngError> {
     let attn = &shape.attn;
     if !attn.head_dim.is_multiple_of(32) {
         return Err(refuse(format!(
@@ -392,7 +392,11 @@ fn kv_layer_stride_bytes(shape: &HostShape) -> Result<u64, EngError> {
     Ok(align_up(rows + scales + rows + scales))
 }
 
-fn kv_cache_bytes(shape: &HostShape, layers: usize, capacity: usize) -> Result<u64, EngError> {
+pub(super) fn kv_cache_bytes(
+    shape: &HostShape,
+    layers: usize,
+    capacity: usize,
+) -> Result<u64, EngError> {
     let stride = kv_layer_stride_bytes(shape)?;
     stride
         .checked_mul(layers as u64)

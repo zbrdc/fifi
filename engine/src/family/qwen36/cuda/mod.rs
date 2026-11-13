@@ -55,6 +55,8 @@ mod exl3_device_tests;
 mod exl3_load;
 #[cfg(test)]
 mod exl3_load_device_tests;
+#[cfg(test)]
+mod kv_bytes_golden_host_tests;
 use crate::family::exl3::moe as exl3_moe;
 #[cfg(test)]
 mod exl3_moe_device_tests;

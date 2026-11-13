@@ -1,0 +1,8 @@
+{
+  "family": "qwen36-host",
+  "arms": {
+    "dtype": "139d9be8976d3df06cd5c0e6b22208c071952ada82ebde759eb161137655fd61",
+    "growth": "7aa743454af4badf212d27b0a6412e5be08ce4c2bed84b26788e4992102ce334",
+    "staging": "5cb4f29b049bdcbe19687dc6b0e2fc0335b5583d2f4bb08c7fdb807054187123"
+  }
+}

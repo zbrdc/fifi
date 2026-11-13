@@ -1620,6 +1620,9 @@ pub(crate) fn tokenizer_pin_for_spec(spec: &FamilySpec) -> Result<TokenizerPin, 
 }
 
 #[cfg(test)]
+mod kv_bytes_golden_tests;
+
+#[cfg(test)]
 mod tests {
     use super::{
         BF16_DEFAULT_PREFILL_CHUNK, Backend, BankMode, DEFAULT_CONTEXT_LIMIT,

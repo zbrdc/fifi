@@ -228,4 +228,6 @@ impl ContextBudget {
 }
 
 #[cfg(test)]
+mod kv_bytes_golden_tests;
+#[cfg(test)]
 mod tests;

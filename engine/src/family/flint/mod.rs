@@ -45,6 +45,8 @@ pub(crate) mod settings;
 #[cfg_attr(not(test), allow(dead_code))]
 mod gguf_weights;
 #[cfg(test)]
+mod kv_bytes_golden_tests;
+#[cfg(test)]
 mod kv_plan_tests;
 #[cfg(test)]
 mod mlx_qualification;
