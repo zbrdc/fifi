@@ -122,20 +122,21 @@ impl Admission {
     }
 
     /// `M_sess`: the largest of `costs` that is admitted and at most `cap` (the caller's
-    /// chunk-cap setting; `None` is no cap, the ladder's first rung). `None` means no
-    /// size passes and the session keeps the per-token path. The budget is the caller's snapshot
-    /// of free VRAM after the weight load and before the resident state and the decode-arena
-    /// allocations, less the headroom.
+    /// chunk-cap setting `setting_label`; `None` is no cap, the ladder's first rung). `None`
+    /// means no size passes and the session keeps the per-token path. The budget is the caller's
+    /// snapshot of free VRAM after the weight load and before the resident state and the
+    /// decode-arena allocations, less the headroom.
     pub(crate) fn admit(
         &self,
         state: usize,
         costs: &[ChunkCost],
         cap: Option<usize>,
+        setting_label: &str,
     ) -> Result<Option<usize>, EngError> {
         let cap = cap.unwrap_or(self.ladder[0]);
         if !self.ladder.contains(&cap) {
             return Err(EngError::BadRequest(format!(
-                "prefill plan: prefill_chunk {cap} is not one of {:?}",
+                "prefill plan: {setting_label} {cap} is not one of {:?}",
                 self.ladder
             )));
         }
@@ -180,6 +181,7 @@ pub(crate) fn admit_m_sess(
     part_charge: usize,
     spare_min: usize,
     ladder: &'static [usize],
+    setting_label: &str,
 ) -> Result<Option<usize>, EngError> {
     if facts.state_planned != facts.state_allocated {
         return Err(EngError::Checkpoint(format!(
@@ -192,7 +194,7 @@ pub(crate) fn admit_m_sess(
         device_extras: extras.to_vec(),
         ..Admission::new(facts.budget, part_charge, spare_min, ladder)
     };
-    admission.admit(facts.state_planned, costs, Some(facts.cap))
+    admission.admit(facts.state_planned, costs, Some(facts.cap), setting_label)
 }
 
 fn overflow() -> EngError {

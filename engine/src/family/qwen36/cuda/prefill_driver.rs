@@ -63,10 +63,6 @@ pub(super) mod io {
     pub(in super::super) static ALLOCS: AtomicUsize = AtomicUsize::new(0);
     /// Zero-fill span writes of the arena build (27-93 for the ladder's arenas).
     pub(in super::super) static SPAN_WRITES: AtomicUsize = AtomicUsize::new(0);
-    /// Prefill-status reads, exactly one per chunk at chunk close.
-    pub(super) static STATUS_READS: AtomicUsize = AtomicUsize::new(0);
-    /// Device-to-host reads of intermediate buffers, which the I/O rule bans per chunk.
-    pub(super) static D2H_READS: AtomicUsize = AtomicUsize::new(0);
     /// Scribble writes of the golden capture arm (0 without `FIFI_GOLDEN_SCRIBBLE`): the whole
     /// fresh arena in [`ZERO_CHUNK`] pieces, so the arm can assert the scribble ran at all.
     pub(in super::super) static SCRIBBLES: AtomicUsize = AtomicUsize::new(0);
@@ -106,6 +102,7 @@ pub(super) fn admit_m_sess(
         PART_CHARGE,
         SPARE_MIN,
         &M_LADDER,
+        "prefill_chunk",
     )
 }
 
@@ -436,7 +433,7 @@ pub(super) fn require_fixed_room(
             fixed: staging.bytes,
             bytes_per_token: 0,
         }],
-        ..Admission::new(budget, PART_CHARGE, SPARE_MIN, &M_LADDER)
+        ..Admission::qwen36(budget)
     };
     if !admission.passes(0, cost)? {
         return Err(EngError::MemoryPlan(format!(

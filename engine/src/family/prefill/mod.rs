@@ -9,8 +9,19 @@
 
 // Host (non-CUDA) builds have no production consumer yet: the promoting family's CUDA driver
 // re-exports these under native-cuda, and the second consumer imports them ungated later.
-#[allow(dead_code)]
+#[allow(
+    dead_code,
+    reason = "the promoting family's CUDA driver consumes this under native-cuda; the second family's ungated planner lands in the shared-pass series"
+)]
 pub(crate) mod admission;
+
+// Same host-build situation as `admission`: the CUDA-gated arena consumes this, and the second
+// family's ungated planner arrives with the shared-pass series.
+#[allow(
+    dead_code,
+    reason = "the gated arena module is its only current consumer; the second family's ungated planner lands in the shared-pass series"
+)]
+pub(crate) mod steps;
 
 #[cfg(all(feature = "native-cuda", target_os = "linux"))]
 pub(in crate::family) mod arena;

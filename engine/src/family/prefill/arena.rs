@@ -93,14 +93,9 @@ pub(crate) fn check_chunk_start(p0: usize, committed: usize) -> Result<(), EngEr
     Ok(())
 }
 
-/// One step of the family's chunk list: `rows >= 2` rows from position `p0` through the chunk
-/// path, or a run of exactly one row at `p0` through the per-token path, so a 1-row tail never
-/// needs a chunk plan.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum PrefillStep {
-    Chunk { p0: usize, rows: usize },
-    Feed { p0: usize },
-}
+// `PrefillStep` itself is ungated (`steps.rs`), so a pure-host family planner can build the
+// list without the CUDA gate; the re-export keeps this module's old path alive.
+pub(crate) use super::steps::PrefillStep;
 
 /// Drives `steps` over the prompt rows of one feed_rows call: each step gets its own rows, a feed
 /// step exactly one. The list is the family's own; this walk only slices `tokens` at each step

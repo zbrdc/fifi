@@ -95,6 +95,15 @@ pub(crate) fn m_pos(p0: usize) -> usize {
 pub(crate) use crate::family::prefill::admission::{Admission, ChunkCost, Extra};
 pub(crate) use crate::family::prefill::arena::PrefillStep;
 
+impl Admission {
+    /// The Qwen3.6 rule: the ladder, the flat part charge and the spare minimum bind here, so
+    /// every Qwen3.6 call site (and the plan tests' literals) stays a one-argument
+    /// constructor.
+    pub(crate) fn qwen36(device_budget: usize) -> Self {
+        Self::new(device_budget, PART_CHARGE, SPARE_MIN, &M_LADDER)
+    }
+}
+
 /// The steps that feed `n_rows` rows from position `p0` (`feed_rows` gets tokens `0..n-1`; the
 /// last prompt token goes through decode). Each chunk has `min(M_pos(p0), m_sess, rows left)`
 /// rows, `m_sess` being the session's arena size (already capped by `qwen36.prefill_chunk`).
