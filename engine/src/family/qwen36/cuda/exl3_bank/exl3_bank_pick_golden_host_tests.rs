@@ -10,11 +10,11 @@
 //!
 //! Host-only, modelless, GPUless, but compiled under `--features native-cuda` in the
 //! container (the qwen36 cuda module is native-cuda-gated): name this test in every
-//! native-cuda test battery. `FIFI_GOLDEN_UPDATE=1` rewrites this family's section of
-//! `testdata/pick-goldens.json` atomically (same mechanism and switch as the prefill golden
-//! harness); without it the compile-time pin is compared, so a drifted
-//! checkout cannot pass a compare it should fail. The file is shared with the Flash-Next pick
-//! golden (`flash_next/cuda/bank_pick_golden_host_tests.rs`); each test owns its own subtree.
+//! native-cuda test battery. `FIFI_GOLDEN_UPDATE=1` rewrites this family's golden file
+//! `testdata/pick-goldens.json` atomically with sorted keys (same mechanism and switch as
+//! the prefill golden harness); without it the compile-time pin is compared, so a drifted
+//! checkout cannot pass a compare it should fail. The Flash-Next pick golden
+//! (`flash_next/cuda/bank_pick_golden_host_tests.rs`) owns its own file, same format.
 
 use super::{DECAY_CALLS, EMPTY, LayerSlots, refill_plan};
 use sha2::{Digest, Sha256};
@@ -197,12 +197,12 @@ pub(super) fn sections() -> serde_json::Map<String, serde_json::Value> {
     map
 }
 
-/// Serializes `FIFI_GOLDEN_UPDATE` captures: the two pick-golden tests of this crate update
-/// the same file from parallel libtest threads, so the read-merge-write must be serialized or
-/// one subtree can be lost to the interleaving. The lock is a `create_new` file beside the
-/// golden (atomic everywhere we run); a capture crashed mid-update leaves it behind, and the
-/// next capture panics after a minute instead of racing — delete the stale file then. Other
-/// harnesses' golden files are separate paths and are never touched by this code.
+/// Serializes `FIFI_GOLDEN_UPDATE` captures: the arms are written as a sorted-key map so the
+/// file is byte-stable whatever crate features order `serde_json`, and the read-merge-write
+/// of a capture runs under a `create_new` guard beside the golden (atomic everywhere we
+/// run). A capture crashed mid-update leaves the guard behind, and the next capture panics
+/// after a minute instead of racing — delete the stale file then. This family's golden file
+/// is ours alone; the Flash-Next family writes its own file.
 fn with_golden_lock<R>(path: &std::path::Path, update: impl FnOnce() -> R) -> R {
     let lock = path.with_extension("lock");
     let began = std::time::Instant::now();
@@ -237,7 +237,14 @@ fn the_pick_replay_holds_its_golden_digests() {
                 .unwrap_or_else(|error| panic!("{}: {error}", path.display()));
             let mut goldens: serde_json::Value =
                 serde_json::from_str(&text).expect("the committed pick goldens on disk");
-            goldens["q36"] = serde_json::Value::Object(sections);
+            let mut arms: std::collections::BTreeMap<&str, serde_json::Value> =
+                std::collections::BTreeMap::new();
+            for (name, sha) in &sections {
+                arms.insert(name.as_str(), sha.clone());
+            }
+            goldens["arms"] = serde_json::Value::Object(
+                arms.into_iter().map(|(k, v)| (k.to_string(), v)).collect(),
+            );
             let tmp = path.with_extension("json.tmp");
             std::fs::write(
                 &tmp,
@@ -251,13 +258,12 @@ fn the_pick_replay_holds_its_golden_digests() {
     }
     let pinned: serde_json::Value =
         serde_json::from_str(GOLDENS_TEXT).expect("the committed pick goldens");
-    assert!(
-        !pinned["q36"].is_null(),
-        "no q36 pick goldens; capture with FIFI_GOLDEN_UPDATE=1"
-    );
+    let pinned_arms = pinned["arms"]
+        .as_object()
+        .unwrap_or_else(|| panic!("no q36 pick arms; capture with FIFI_GOLDEN_UPDATE=1"));
     let mut drifted: Vec<String> = Vec::new();
     for (name, sha) in &sections {
-        let pinned_sha = pinned["q36"][name].as_str().unwrap_or("");
+        let pinned_sha = pinned_arms.get(name).and_then(|v| v.as_str()).unwrap_or("");
         if pinned_sha != sha.as_str().unwrap_or("") {
             drifted.push(format!("{name}: pinned {pinned_sha:?}, computed {sha}"));
         }

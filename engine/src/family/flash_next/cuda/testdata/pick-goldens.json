@@ -1,0 +1,10 @@
+{
+  "harness": "pick-replay-1",
+  "family": "fn",
+  "arms": {
+    "error": "68b21870337710b5862317fae56dca1ba0bd9277b4ca9627f2b41a3dfd3f4862",
+    "fill": "e0699f9487b279bb5630b91cb94bea181e374f8a4b050fceda2bfe3078c1b18d",
+    "state-exclusive": "93aeae99d41550ab983bcf905195531806c0ad3af9d63fdcc75b00f9b42e3350",
+    "state-inclusive": "145a069ba0078a78fe80d17aabcbf92b6579cf615f5b84bbd79a88f14016e648"
+  }
+}

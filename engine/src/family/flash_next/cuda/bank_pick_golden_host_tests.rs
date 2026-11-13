@@ -7,11 +7,11 @@
 //! a prefill chunk uses). The error arm pins `plan_pass`'s atomicity ("an Err changes
 //! nothing"): the row after a refused call is byte-identical.
 //!
-//! Host-only, modelless, GPUless. `FIFI_GOLDEN_UPDATE=1` rewrites this family's section of
-//! `testdata/pick-goldens.json` (the file the Q36 pick golden in
-//! `qwen36/cuda/exl3_bank_pick_golden_host_tests.rs` also owns a subtree of; one golden
-//! mechanism, same switch as the prefill golden harness) atomically; without it the compile-time
-//! pin is compared.
+//! Host-only, modelless, GPUless. `FIFI_GOLDEN_UPDATE=1` rewrites this family's golden
+//! file `testdata/pick-goldens.json` atomically with sorted keys (the Q36 pick golden in
+//! `qwen36/cuda/exl3_bank_pick_golden_host_tests.rs` owns its own file, same format;
+//! one golden mechanism, same switch as the prefill golden harness); without it the
+//! compile-time pin is compared.
 
 use super::bank::*;
 use sha2::{Digest, Sha256};
@@ -239,9 +239,13 @@ pub(super) fn sections() -> serde_json::Map<String, serde_json::Value> {
     map
 }
 
-/// Serializes `FIFI_GOLDEN_UPDATE` captures with the Q36 pick-golden test (same file, parallel
-/// libtest threads — see its copy of this helper). Duplicated until the shared policy seam
-/// gives both policies one home.
+/// Serializes `FIFI_GOLDEN_UPDATE` captures: the arms are written as a sorted-key map so the
+/// file is byte-stable whatever crate features order `serde_json`, and the read-merge-write
+/// of a capture runs under a `create_new` guard beside the golden. A capture crashed
+/// mid-update leaves the guard behind, and the next capture panics after a minute instead of
+/// racing — delete the stale file then. This family's golden file is ours alone; the Q36
+/// family writes its own file. Duplicated until the shared policy seam gives both policies
+/// one home.
 fn with_golden_lock<R>(path: &std::path::Path, update: impl FnOnce() -> R) -> R {
     let lock = path.with_extension("lock");
     let began = std::time::Instant::now();
@@ -266,9 +270,9 @@ fn with_golden_lock<R>(path: &std::path::Path, update: impl FnOnce() -> R) -> R 
 
 #[test]
 fn the_pick_replay_holds_its_golden_digests() {
-    const GOLDENS_TEXT: &str = include_str!("../../qwen36/cuda/testdata/pick-goldens.json");
+    const GOLDENS_TEXT: &str = include_str!("testdata/pick-goldens.json");
     let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-        .join("src/family/qwen36/cuda/testdata/pick-goldens.json");
+        .join("src/family/flash_next/cuda/testdata/pick-goldens.json");
     let sections = sections();
     if std::env::var_os("FIFI_GOLDEN_UPDATE").is_some_and(|value| !value.is_empty()) {
         with_golden_lock(&path, || {
@@ -276,7 +280,14 @@ fn the_pick_replay_holds_its_golden_digests() {
                 .unwrap_or_else(|error| panic!("{}: {error}", path.display()));
             let mut goldens: serde_json::Value =
                 serde_json::from_str(&text).expect("the committed pick goldens on disk");
-            goldens["fn"] = serde_json::Value::Object(sections);
+            let mut arms: std::collections::BTreeMap<&str, serde_json::Value> =
+                std::collections::BTreeMap::new();
+            for (name, sha) in &sections {
+                arms.insert(name.as_str(), sha.clone());
+            }
+            goldens["arms"] = serde_json::Value::Object(
+                arms.into_iter().map(|(k, v)| (k.to_string(), v)).collect(),
+            );
             let tmp = path.with_extension("json.tmp");
             std::fs::write(
                 &tmp,
@@ -290,13 +301,12 @@ fn the_pick_replay_holds_its_golden_digests() {
     }
     let pinned: serde_json::Value =
         serde_json::from_str(GOLDENS_TEXT).expect("the committed pick goldens");
-    assert!(
-        !pinned["fn"].is_null(),
-        "no fn pick goldens; capture with FIFI_GOLDEN_UPDATE=1"
-    );
+    let pinned_arms = pinned["arms"]
+        .as_object()
+        .unwrap_or_else(|| panic!("no fn pick arms; capture with FIFI_GOLDEN_UPDATE=1"));
     let mut drifted: Vec<String> = Vec::new();
     for (name, sha) in &sections {
-        let pinned_sha = pinned["fn"][name].as_str().unwrap_or("");
+        let pinned_sha = pinned_arms.get(name).and_then(|v| v.as_str()).unwrap_or("");
         if pinned_sha != sha.as_str().unwrap_or("") {
             drifted.push(format!("{name}: pinned {pinned_sha:?}, computed {sha}"));
         }
