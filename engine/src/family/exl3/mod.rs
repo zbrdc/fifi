@@ -4,5 +4,6 @@
 //! merged-pass host path, and the weight source that lays experts out as a
 //! bank. The old `qwen36::cuda` paths re-export from here.
 
+pub(in crate::family) mod bank;
 pub(in crate::family) mod moe;
 pub(in crate::family) mod moe_source;
