@@ -1660,6 +1660,13 @@ impl<'a> QwenResidentStep<'a> {
         &self.prefill_report
     }
 
+    /// The session's admitted prefill arena (test-only): the golden arms read `m_sess` and the
+    /// built table through it, so the verdict and the real arena are asserted to agree.
+    #[cfg(test)]
+    pub(super) fn test_prefill_arena(&self) -> Option<&PrefillArena> {
+        self.prefill.as_ref()
+    }
+
     pub(super) fn note_feed_rows(&mut self, verdict: &ChunkVerdict, rows: usize) {
         self.prefill_report.note_feed_rows(verdict, rows);
     }

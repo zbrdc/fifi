@@ -57,6 +57,9 @@ pub(super) mod io {
     pub(super) static STATUS_READS: AtomicUsize = AtomicUsize::new(0);
     /// Device-to-host reads of intermediate buffers, which the I/O rule bans per chunk.
     pub(super) static D2H_READS: AtomicUsize = AtomicUsize::new(0);
+    /// Scribble writes of the golden capture arm (0 without `FIFI_GOLDEN_SCRIBBLE`): the whole
+    /// fresh arena in [`ZERO_CHUNK`] pieces, so the arm can assert the scribble ran at all.
+    pub(in super::super) static SCRIBBLES: AtomicUsize = AtomicUsize::new(0);
 
     pub(in super::super) fn reset() {
         ALLOCS.store(0, Ordering::Relaxed);
@@ -69,6 +72,10 @@ pub(super) mod io {
 
     pub(super) fn bump_span_write() {
         SPAN_WRITES.fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub(super) fn bump_scribble() {
+        SCRIBBLES.fetch_add(1, Ordering::Relaxed);
     }
 }
 
@@ -576,6 +583,19 @@ impl PrefillArena {
         let arena = ctx.arena(&tensors)?;
         #[cfg(test)]
         io::bump_alloc();
+        // Test-only (the golden scribble arm): a 0xA5 pattern over the WHOLE fresh allocation
+        // before the zero fill, so a span `zero_spans` misses cannot hide behind the allocator.
+        #[cfg(test)]
+        if std::env::var_os("FIFI_GOLDEN_SCRIBBLE").is_some() {
+            let pattern = vec![0xA5u8; ZERO_CHUNK.min(arena.bytes())];
+            let mut at = 0;
+            while at < arena.bytes() {
+                let len = ZERO_CHUNK.min(arena.bytes() - at);
+                arena.buffer().write_at(stream, at, &pattern[..len])?;
+                io::bump_scribble();
+                at += len;
+            }
+        }
         let zeros = vec![0u8; ZERO_CHUNK.min(arena.bytes())];
         for (at, len) in zero_spans(arena.bytes(), ZERO_CHUNK)? {
             arena.buffer().write_at(stream, at, &zeros[..len])?;

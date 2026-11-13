@@ -154,6 +154,10 @@ mod prefill_driver;
 mod prefill_driver_tests;
 #[cfg(test)]
 mod prefill_exl3_step_device_tests;
+#[cfg(test)]
+mod prefill_golden_device_tests;
+#[cfg(test)]
+mod prefill_golden_host_tests;
 mod prefill_plan;
 #[cfg(test)]
 mod prefill_plan_tests;

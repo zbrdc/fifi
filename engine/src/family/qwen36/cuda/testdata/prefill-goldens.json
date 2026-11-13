@@ -1,0 +1,16 @@
+{
+  "arms": {},
+  "host": {
+    "admission_grid": "460f4012a03f1718e978b34e2df6bfb7846eadc1be5b3507198f2b331b77290d",
+    "arena_built_exl3": "648c65893d82184337755c42f10ab9fec9a5567253c1b34f073b7a1aa342cef4",
+    "arena_built_family": "73f32fa9d5933bd90a22239e5f6d979e9b1ea3cbe7dbbb3192641077f1f42118",
+    "dense_jobs": "7b06499b34326dd7aa436a21f19442eeec41af1e3d401a8f19d32bf77e9fdd23",
+    "exl3_tables": "cbd2f7abc7205e284a3e40ead7fa4eecd6c6fb5cd8ef722d58660128ba6be640",
+    "family_tables": "b13b4d173716d875e5dc22fa3b5f8672aecfd827764c993659c49b67448ba0bb",
+    "fed_rows": 5377,
+    "partition": "d57046f692d4c9d351a43da688698e93f8696e4e06e854dc9e6f94e7a6c9d1fd",
+    "prompt_sha256": "b6b3989689d7014994c3e95b9da778930bb6bd06ac373bcb2be50981548aa7bc",
+    "whole": "34731838fc0e614fadfaa3bb7ff89e0b5ab1420748c361cf533c8172e892f8d5",
+    "zero_spans": "dc87a88bb4dfe0d19cb7f3e5d1eacd025ba6c98d6780ebd7d33bff96245e4944"
+  }
+}

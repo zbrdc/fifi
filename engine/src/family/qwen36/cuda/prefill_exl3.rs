@@ -85,7 +85,8 @@ fn window<'b>(
 }
 
 /// The jobs of a dense projection of `rows` rows: member 0, tiles of at most [`TILE_ROWS`] rows.
-pub(super) fn dense_jobs(rows: usize) -> Vec<Exl3Job> {
+/// `pub(in ...::cuda)` so the golden host test can digest the table.
+pub(in crate::family::qwen36::cuda) fn dense_jobs(rows: usize) -> Vec<Exl3Job> {
     (0..rows)
         .step_by(TILE_ROWS)
         .map(|first| Exl3Job {
