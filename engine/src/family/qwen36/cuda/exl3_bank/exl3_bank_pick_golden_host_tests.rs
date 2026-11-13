@@ -22,7 +22,9 @@ use std::fmt::Write as _;
 
 const EXPERTS: usize = 512;
 const SLOTS: usize = 48;
-/// The three part lengths of the 3.05 pack's record (gate/up/down), 1,881,600 bytes together.
+/// The three part lengths of the 3.05 pack's record (gate/up/down), 1,881,600 bytes
+/// together. Mirrors `parts_strides` (the derivation `resolve_mapped` feeds `refill_plan`)
+/// for that pack; the refill lines below pin the strides, offsets and experts against it.
 const PART_LEN: [usize; 3] = [626_864, 626_864, 626_872];
 const CALLS: usize = 200;
 const PICKS: usize = 8;
@@ -78,9 +80,10 @@ fn arm_text(slots: usize, sticky: usize, seed: u64) -> String {
             for op in ops {
                 let _ = writeln!(
                     text,
-                    "refill {call} {i} part={} off={} len={}",
+                    "refill {call} {i} part={} expert={} off={} len={}",
                     op.part,
-                    op.slot * op.record,
+                    op.expert,
+                    op.offset(),
                     op.record
                 );
             }
@@ -246,11 +249,9 @@ fn the_pick_replay_holds_its_golden_digests() {
                 arms.into_iter().map(|(k, v)| (k.to_string(), v)).collect(),
             );
             let tmp = path.with_extension("json.tmp");
-            std::fs::write(
-                &tmp,
-                serde_json::to_string_pretty(&goldens).expect("serialize"),
-            )
-            .expect("write the update beside the golden");
+            let mut text = serde_json::to_string_pretty(&goldens).expect("serialize");
+            text.push('\n');
+            std::fs::write(&tmp, text).expect("write the update beside the golden");
             std::fs::rename(&tmp, &path).expect("the atomic replace");
         });
         println!("UPDATED q36 pick goldens in {}", path.display());
@@ -266,6 +267,11 @@ fn the_pick_replay_holds_its_golden_digests() {
         let pinned_sha = pinned_arms.get(name).and_then(|v| v.as_str()).unwrap_or("");
         if pinned_sha != sha.as_str().unwrap_or("") {
             drifted.push(format!("{name}: pinned {pinned_sha:?}, computed {sha}"));
+        }
+    }
+    for name in pinned_arms.keys() {
+        if !sections.contains_key(name) {
+            drifted.push(format!("{name}: pinned but no longer computed — stale arm"));
         }
     }
     assert!(

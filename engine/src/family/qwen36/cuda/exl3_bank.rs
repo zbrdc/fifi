@@ -678,11 +678,7 @@ impl LayerResolver<'_, '_> {
             None
         };
         let refill = copy.map_or(stream, |(copy, _)| copy);
-        for op in refill_plan(
-            table,
-            &misses,
-            [parts[0].record, parts[1].record, parts[2].record],
-        ) {
+        for op in refill_plan(table, &misses, parts_strides(&parts)) {
             let record = store[op.part].member(op.expert);
             // On the launch stream (no split): the copy races the launches queued
             // after it instead of a device-wide sync per miss, and the next layer's
@@ -694,7 +690,7 @@ impl LayerResolver<'_, '_> {
             // process-long-lived, which is that invariant.
             parts[op.part]
                 .bank
-                .write_at_enqueue(refill, op.slot * op.record, record)?;
+                .write_at_enqueue(refill, op.offset(), record)?;
         }
         let event = match (copy, miss_count > 0) {
             (Some((_, event)), true) => {
@@ -716,13 +712,26 @@ impl LayerResolver<'_, '_> {
 }
 
 /// One record copy of a layer refill: the slot that refills, the expert now in it, the
-/// part's buffer index, and the record stride of that part (the write offset is the slot
-/// times the stride).
+/// part's buffer index, and the record stride of that part; the write offset is the slot
+/// times the stride ([`RefillOp::offset`]).
 struct RefillOp {
     slot: usize,
     expert: usize,
     part: usize,
     record: usize,
+}
+
+impl RefillOp {
+    fn offset(&self) -> usize {
+        self.slot * self.record
+    }
+}
+
+/// The record strides of the three parts — the one place the plan's stride inputs are
+/// derived. `resolve_mapped` passes exactly this to [`refill_plan`]; the pick-replay
+/// harness mirrors the values (`PART_LEN`) against this derivation.
+fn parts_strides(parts: &[BankTarget<'_>; 3]) -> [usize; 3] {
+    [parts[0].record, parts[1].record, parts[2].record]
 }
 
 /// The refill plan of one layer's misses — in miss order, then part order — as the exact

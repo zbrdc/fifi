@@ -9,9 +9,9 @@
 //!
 //! Host-only, modelless, GPUless. `FIFI_GOLDEN_UPDATE=1` rewrites this family's golden
 //! file `testdata/pick-goldens.json` atomically with sorted keys (the Q36 pick golden in
-//! `qwen36/cuda/exl3_bank_pick_golden_host_tests.rs` owns its own file, same format;
-//! one golden mechanism, same switch as the prefill golden harness); without it the
-//! compile-time pin is compared.
+//! `qwen36/cuda/exl3_bank/exl3_bank_pick_golden_host_tests.rs` owns its own file, same
+//! format; one golden mechanism, same switch as the prefill golden harness); without it
+//! the compile-time pin is compared.
 
 use super::bank::*;
 use sha2::{Digest, Sha256};
@@ -191,10 +191,20 @@ fn state_text(mode: HostMode, seed: u64) -> String {
         for (i, op) in copies.ops.iter().enumerate() {
             let _ = writeln!(
                 text,
-                "op {call} {i} slot={} in={} src={} demote={:?}",
-                op.slot, op.incoming, op.src_place, op.demote
+                "op {call} {i} slot={} in={} src={} off={} demote={:?}",
+                op.slot,
+                op.incoming,
+                op.src_place,
+                usize::from(op.slot) * RECORD,
+                op.demote
             );
         }
+        let _ = writeln!(
+            text,
+            "row {call} {:?} occ={:?}",
+            state.slot_row(0),
+            state.places().occupied(0)
+        );
     }
     let admit: Vec<u16> = (0..60u16).map(|i| (i % 50) * 5 + 1).collect();
     let copies = state.admit(0, &admit).expect("the admit contract");
@@ -213,8 +223,14 @@ fn state_text(mode: HostMode, seed: u64) -> String {
     let stats = state.stats();
     let _ = writeln!(
         text,
-        "counters passes={} picks={} hits={} misses={} demotions={}",
-        stats.passes, stats.picks, stats.hits, stats.misses, stats.demotions
+        "counters passes={} picks={} hits={} misses={} demotions={} three={} hist={:?}",
+        stats.passes,
+        stats.picks,
+        stats.hits,
+        stats.misses,
+        stats.demotions,
+        stats.layers_with_3_plus_misses,
+        stats.miss_histogram
     );
     text
 }
@@ -289,11 +305,9 @@ fn the_pick_replay_holds_its_golden_digests() {
                 arms.into_iter().map(|(k, v)| (k.to_string(), v)).collect(),
             );
             let tmp = path.with_extension("json.tmp");
-            std::fs::write(
-                &tmp,
-                serde_json::to_string_pretty(&goldens).expect("serialize"),
-            )
-            .expect("write the update beside the golden");
+            let mut text = serde_json::to_string_pretty(&goldens).expect("serialize");
+            text.push('\n');
+            std::fs::write(&tmp, text).expect("write the update beside the golden");
             std::fs::rename(&tmp, &path).expect("the atomic replace");
         });
         println!("UPDATED fn pick goldens in {}", path.display());
@@ -309,6 +323,11 @@ fn the_pick_replay_holds_its_golden_digests() {
         let pinned_sha = pinned_arms.get(name).and_then(|v| v.as_str()).unwrap_or("");
         if pinned_sha != sha.as_str().unwrap_or("") {
             drifted.push(format!("{name}: pinned {pinned_sha:?}, computed {sha}"));
+        }
+    }
+    for name in pinned_arms.keys() {
+        if !sections.contains_key(name) {
+            drifted.push(format!("{name}: pinned but no longer computed — stale arm"));
         }
     }
     assert!(
