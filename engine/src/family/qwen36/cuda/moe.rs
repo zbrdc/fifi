@@ -30,6 +30,8 @@ use super::mixer_weights::DenseWeight;
 use super::shard::ShardTable;
 use super::step_plan::{Phase, Slot};
 use crate::EngError;
+
+pub(in crate::family) use crate::family::exl3::launch::{Launch, MoeDims, RouteBufs};
 use crate::family::project::cuda::WeightLayout;
 use crate::kernels::cuda::resident::matmul_expert::{ExpertCall, ExpertSelect, ExpertStack};
 use crate::kernels::cuda::resident::matvec_expert::ExpertMatvecCall;
@@ -43,29 +45,14 @@ use crate::kernels::cuda::resident::router::{
 use crate::kernels::cuda::resident::swiglu_pack::SwigluPackCall;
 use crate::kernels::cuda::resident::swiglu_q8::SwigluQ8Call;
 use crate::kernels::cuda::{
-    CudaContext, DeviceBuffer, DeviceRange, DeviceStream, MatmulIo, NativeWeight, Projection,
-    TiledWeight, resident::quantize_q8_1::q8_1_bytes, xf_bytes,
+    DeviceBuffer, DeviceRange, MatmulIo, NativeWeight, Projection, TiledWeight,
+    resident::quantize_q8_1::q8_1_bytes, xf_bytes,
 };
 
 const F32: usize = size_of::<f32>();
 const I32: usize = size_of::<i32>();
 /// The width quantum of `swiglu_pack` (`k_pad`, the pack kernel's `WIDTH_QUANTUM`).
 const PACK_WIDTH: usize = 256;
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(in crate::family) struct MoeDims {
-    /// Token rows; stage 1 runs this block at one row (verify windows need their own sizing).
-    pub(in crate::family) rows: usize,
-    /// Hidden size: the router and shared-projection width, the residual width.
-    pub(in crate::family) hidden: usize,
-    pub(in crate::family) n_expert: usize,
-    /// Experts picked per row.
-    pub(in crate::family) top_k: usize,
-    /// Rows of one expert's gate and up projections.
-    pub(in crate::family) inter: usize,
-    /// Rows of the shared expert's gate and up projections.
-    pub(in crate::family) shared_inter: usize,
-}
 
 impl MoeDims {
     pub(super) fn new(dims: &StepDims, rows: usize) -> Self {
@@ -792,26 +779,6 @@ pub(super) struct MoeLayerWeights<'w> {
     pub(super) shared_down: DenseWeight<'w>,
 }
 
-/// The routing and residual ranges of the block: views of the step arena and the status word.
-pub(in crate::family) struct RouteBufs<'b> {
-    /// f32 `[hidden]`: the residual after the mixer add, the block input.
-    pub(in crate::family) resid_in: DeviceRange<'b>,
-    /// f32 `[hidden]`: the other residual buffer, the block output.
-    pub(in crate::family) resid_out: DeviceRange<'b>,
-    /// f32 `[hidden]`: the normalized row, the router input.
-    pub(in crate::family) norm_row: DeviceRange<'b>,
-    /// The router's logits scratch (`RouterLogits`).
-    pub(in crate::family) logits: DeviceRange<'b>,
-    /// i32 `[top_k]`: the pick ids, read on the device only.
-    pub(in crate::family) ids: DeviceRange<'b>,
-    /// f32 `[top_k]`: the renormalized pick weights.
-    pub(in crate::family) weights: DeviceRange<'b>,
-    /// f32: the shared gate, sigmoid-ed by the router.
-    pub(in crate::family) shared_gate: DeviceRange<'b>,
-    /// The status word the router ORs its fault bit into.
-    pub(in crate::family) status: DeviceRange<'b>,
-}
-
 /// The expert and shared-expert ranges of the block: views of the step arena, the input packs
 /// grouped in [`Packs`].
 pub(super) struct ExpertBufs<'b> {
@@ -953,15 +920,6 @@ impl MoeBuffers<'_> {
             },
         }
     }
-}
-
-/// The context and the one owned stream the block queues on. Grouping them keeps every function
-/// of this file at four arguments or fewer (the project rules).
-pub(in crate::family) struct Launch<'a> {
-    /// The adapter that owns every buffer of the block.
-    pub(in crate::family) ctx: &'a CudaContext,
-    /// The one owned stream: every op queues on it, and none of them makes the host wait.
-    pub(in crate::family) stream: &'a DeviceStream,
 }
 
 /// The block dims back from the facts [`check_block`] pins exactly, so that the launcher carries

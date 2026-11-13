@@ -28,6 +28,9 @@ use super::{
     state_layout::{Plane, Word},
     tiered_step::TieredRuntime,
 };
+pub(in crate::family) use crate::family::exl3::shapes::{
+    chunk_combine_shape, routed_swiglu, shared_swiglu,
+};
 use crate::family::project::cuda::WeightLayout;
 use crate::family::spec::AttentionKind;
 use crate::{
@@ -52,7 +55,7 @@ use crate::{
                 mmq_type_of,
             },
             mmq_size::{NCOLS_LIMIT, fixup_floats_max},
-            swiglu_rows::{SwigluRowsCall, SwigluRowsShape},
+            swiglu_rows::SwigluRowsCall,
         },
         resident::{
             add_norm_pack::AddNormCall,
@@ -64,7 +67,7 @@ use crate::{
             gdn_conv::{ConvCall, ConvShape},
             kv8_append::Kv8Data,
             matvec_q::QuantType,
-            moe_combine::{CombineCall, CombineOut, CombineShape, SharedTerm},
+            moe_combine::{CombineCall, CombineOut, SharedTerm},
             router::{RouterCall, RouterOut, RouterShape, RouterWeights},
             sparse_sketch::{SparseSketchData, SparseSketchShape},
         },
@@ -535,18 +538,6 @@ pub(super) fn check_q8_layouts(groups: &[(ChunkSlot, &[QuantType])]) -> Result<(
     Ok(())
 }
 
-/// The SwiGLU shape of the routed stacks (stage 14): `m * top_k` rows, the up half at column
-/// `inter` of a `2 * inter` row.
-pub(super) fn routed_swiglu(m: usize, dims: &MoeDims) -> SwigluRowsShape {
-    SwigluRowsShape {
-        rows: m * dims.top_k,
-        n_ff: dims.inter,
-        up_off: dims.inter,
-        ld_in: 2 * dims.inter,
-        ld_out: dims.inter,
-    }
-}
-
 /// The `(offset, length)` of the up half's sub-view of a `Gu` slot of `gu_bytes` bytes
 /// (stage 13b): the grouped launch has no column offset, so the up launch writes the tail
 /// that starts at column `dims.inter` — the same constant that sets [`routed_swiglu`]'s
@@ -663,16 +654,6 @@ pub(super) fn chunk_router_shape(dims: &MoeDims, m: usize) -> RouterShape {
     }
 }
 
-/// The combine shape (stage 17).
-pub(super) fn chunk_combine_shape(dims: &MoeDims, m: usize) -> CombineShape {
-    CombineShape {
-        m,
-        n: dims.hidden,
-        top_k: dims.top_k,
-        ld_down: dims.hidden,
-    }
-}
-
 /// The grouped-launch shape of the MoE block (stage 11).
 pub(super) fn chunk_mmid_shape(dims: &MoeDims, m: usize) -> MmidShape {
     MmidShape {
@@ -688,17 +669,6 @@ pub(super) fn shared_cols(dims: &MoeDims) -> [(usize, usize); 2] {
         (2 * dims.shared_inter, 0),
         (2 * dims.shared_inter, dims.shared_inter),
     ]
-}
-
-/// The shared expert's SwiGLU shape (stage 10d).
-pub(super) fn shared_swiglu(m: usize, dims: &MoeDims) -> SwigluRowsShape {
-    SwigluRowsShape {
-        rows: m,
-        n_ff: dims.shared_inter,
-        up_off: dims.shared_inter,
-        ld_in: 2 * dims.shared_inter,
-        ld_out: dims.shared_inter,
-    }
 }
 
 /// The `MmidWeight` of one routed stack (stages 13a, 13b, 16): the whole stack buffer, its
