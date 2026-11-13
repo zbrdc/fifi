@@ -372,9 +372,15 @@ fn assert_admitted(out_root: &Path, arm: &str, verdict: &ChunkVerdict, kv8: bool
 }
 
 /// Loads the arm's weights, runs the chunked prefill of the golden prompt at the explicit cap,
-/// asserting the admission, the built arena and the stage rows along the way.
-fn capture(arm: &str, kv8: bool, layout: WeightLayout) -> Result<Captured, EngError> {
-    let scribble = std::env::var_os("FIFI_GOLDEN_SCRIBBLE").is_some();
+/// asserting the admission, the built arena and the stage rows along the way. `scribble` is the
+/// arm's identity, not an environment read: the plain arms pass `false` so a leaked
+/// `FIFI_GOLDEN_SCRIBBLE` cannot scribble or gate anything.
+fn capture(
+    arm: &str,
+    kv8: bool,
+    layout: WeightLayout,
+    scribble: bool,
+) -> Result<Captured, EngError> {
     guard_env(scribble);
     validate_inputs();
     // Read FIFI_GOLDEN_OUT before the pack loads: a missing value must fail here, not after.
@@ -608,8 +614,8 @@ pub(super) fn store_goldens(path: &Path, goldens: serde_json::Value) {
 
 /// Runs one arm end to end: capture, artifacts, digest, golden compare or update. A scribble arm
 /// must equal the plain arm's pinned golden, proving the zero fill covers what the kernels read.
-fn run_arm(arm: &str, plain_twin: Option<&str>, kv8: bool, layout: WeightLayout) {
-    let captured = capture(arm, kv8, layout).expect("capture");
+fn run_arm(arm: &str, plain_twin: Option<&str>, kv8: bool, layout: WeightLayout, scribble: bool) {
+    let captured = capture(arm, kv8, layout, scribble).expect("capture");
     let Captured {
         logits,
         export,
@@ -765,6 +771,7 @@ fn golden_capture_exl3_fp16_arm() {
         None,
         false,
         WeightLayout::Exl3,
+        false,
     );
 }
 
@@ -776,6 +783,7 @@ fn golden_capture_exl3_kv8_arm() {
         None,
         true,
         WeightLayout::Exl3,
+        false,
     );
 }
 
@@ -787,6 +795,7 @@ fn golden_capture_gguf_fp16_arm() {
         None,
         false,
         WeightLayout::Native,
+        false,
     );
 }
 
@@ -803,5 +812,6 @@ fn golden_capture_exl3_fp16_scribble_arm() {
         Some("exl3-fp16-1024"),
         false,
         WeightLayout::Exl3,
+        true,
     );
 }
