@@ -734,12 +734,12 @@ fn refill_plan(table: &LayerSlots, misses: &[usize], strides: [usize; 3]) -> Vec
     let mut ops = Vec::with_capacity(misses.len() * 3);
     for &slot in misses {
         let expert = table.expert_of(slot);
-        for part in 0..3 {
+        for (part, &record) in strides.iter().enumerate() {
             ops.push(RefillOp {
                 slot,
                 expert,
                 part,
-                record: strides[part],
+                record,
             });
         }
     }
