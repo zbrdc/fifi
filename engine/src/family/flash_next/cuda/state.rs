@@ -54,7 +54,8 @@ use crate::{
             moe::context_budget::{KvFormat, KvGeometry},
             step::ModelShape,
         },
-        qwen36::cuda::{book::StateBook, state_layout::Word},
+        graph_state::book::StateBook,
+        qwen36::cuda::state_layout::Word,
     },
     kernels::{
         ARENA_ALIGN,
