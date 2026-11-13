@@ -461,17 +461,19 @@ impl LayerSlots {
 /// The Q36 tables behind the shared seam's table half
 /// ([`SlotTable`](crate::family::expert_bank::SlotTable)): one `LayerSlots` per layer, its
 /// live `slot_of` row the tiered classifier reads. Only the table surface is shared — the
-/// pass protocol stays Q36's own (`assign` and the refill loop are not routed through
-/// `SlotPolicy`; the c2 note's requirement).
+/// pass protocol stays Q36's own: `assign` and the refill loop are not routed through
+/// `SlotPolicy`.
 pub(super) struct LayerTables(pub(crate) Vec<LayerSlots>);
 
 impl crate::family::expert_bank::SlotTable for LayerTables {
     fn slot_row(&self, layer: usize) -> &[i32] {
-        &self.0[layer].slot_of
+        self.0
+            .get(layer)
+            .map_or(&[], |tables| tables.slot_of.as_slice())
     }
 
     fn expert_in_slot(&self, layer: usize, slot: usize) -> Option<u16> {
-        let expert = self.0[layer].expert_of.get(slot).copied()?;
+        let expert = self.0.get(layer)?.expert_of.get(slot).copied()?;
         (expert != EMPTY).then_some(expert)
     }
 }

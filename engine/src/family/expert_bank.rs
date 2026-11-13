@@ -129,8 +129,7 @@ pub(crate) struct PassPlan {
 
 /// The classifier-facing table half of the seam: the slot row a tiered classifier reads and
 /// the slot -> expert inverse. A family whose pass protocol differs from Flash-Next's
-/// pass copies implements just this half (Q36's `LayerTables` does) without adopting
-/// `SlotPolicy`'s copy planning.
+/// copy planning implements just this half without adopting `SlotPolicy`.
 pub(crate) trait SlotTable {
     /// The classifier's table of `layer`: the slot of every expert, or -1.
     fn slot_row(&self, layer: usize) -> &[i32];

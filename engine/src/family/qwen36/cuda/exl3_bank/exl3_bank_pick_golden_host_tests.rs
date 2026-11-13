@@ -95,16 +95,22 @@ fn arm_text(slots: usize, sticky: usize, seed: u64) -> String {
         let _ = writeln!(text, "table {call} tick={} row={row:?}", table.tick);
     }
     let decays = table.tick / DECAY_CALLS;
-    // The shared-table view of the final state agrees with the golden's own reading.
-    let row = table.slot_of.clone();
+    // The seam's two directions agree after the replay: a slot holds an expert exactly
+    // when the row points back at that slot, and the id is the one the row names.
     let seam_tables = LayerTables(vec![table]);
-    assert_eq!(seam_tables.slot_row(0), row.as_slice());
-    for slot in 0..seam_tables.slot_row(0).len().min(SLOTS) {
-        let expert = seam_tables.expert_in_slot(0, slot);
-        assert_eq!(
-            expert.is_some(),
-            seam_tables.slot_row(0).contains(&(slot as i32))
-        );
+    let row = seam_tables.slot_row(0);
+    for slot in 0..SLOTS {
+        match seam_tables.expert_in_slot(0, slot) {
+            Some(expert) => assert_eq!(
+                row[usize::from(expert)],
+                slot as i32,
+                "slot {slot} holds {expert} but the row disagrees"
+            ),
+            None => assert!(
+                !row.contains(&(slot as i32)),
+                "slot {slot} holds no expert but the row points to it"
+            ),
+        }
     }
     let _ = writeln!(
         text,
