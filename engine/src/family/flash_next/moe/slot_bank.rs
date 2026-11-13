@@ -15,7 +15,7 @@
 //! part's offset in record 0 and extended over all slots ([`SlotBankLayout::bank_ranges`]).
 //!
 //! Nothing here allocates device memory or changes how any model loads: Qwen3.6's EXL3 bank
-//! (`upload_exl3_bank`, separate trellis and scale buffers) is untouched, and only the Flash-Next
+//! (`upload_exl3_bank`, one record buffer per part) is untouched, and only the Flash-Next
 //! step will build a slot bank.
 //!
 //! Pure host code.
