@@ -13,6 +13,15 @@ mod exl3_pack;
     reason = "the factory wires the MLX and the opt-in CUDA executors (`cuda_decode`); the allow covers the pieces still reached only by tests until the family is qualified"
 )]
 pub(crate) mod flash_next;
+
+/// The shared host half of the expert-bank seam: the slot-policy contract, the host places,
+/// the copy plan of a pass, the counters. Ungated on purpose so plain host gates compile and
+/// run the seam's tests without the card feature.
+#[allow(
+    dead_code,
+    reason = "compiled on every platform; only the Flash-Next bank and the tests call it until the shared pass lands"
+)]
+pub(crate) mod expert_bank;
 pub mod flint;
 pub mod gemma4;
 pub mod gguf_model;
