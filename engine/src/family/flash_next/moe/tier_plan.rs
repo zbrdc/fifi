@@ -88,10 +88,6 @@ impl TierShape {
     }
 }
 
-/// K/V and indexer-key bytes of one context position: per QSA layer a K row and a V row of
-/// `heads_kv * head_dim` values of `kv_elem_bytes`, and one f32 indexer key of `idx_dim` per `ratio`
-/// positions. Int8 K/V (`kv_elem_bytes` 1) counts no scale bytes here; `KvGeometry::position_bytes`
-/// (`context_budget.rs`) adds the f32 row scales and is what the step's budget uses.
 /// The indexer key bytes one position carries. Refused unless the key of `idx_dim` f32
 /// values divides evenly over `ratio` positions.
 pub(in crate::family::flash_next) fn indexer_key_bytes(
@@ -106,6 +102,10 @@ pub(in crate::family::flash_next) fn indexer_key_bytes(
     Ok(idx_dim * 4 / ratio)
 }
 
+/// K/V and indexer-key bytes of one context position: per QSA layer a K row and a V row of
+/// `heads_kv * head_dim` values of `kv_elem_bytes`, and one f32 indexer key of `idx_dim` per `ratio`
+/// positions. Int8 K/V (`kv_elem_bytes` 1) counts no scale bytes here; `KvGeometry::position_bytes`
+/// (`context_budget.rs`) adds the f32 row scales and is what the step's budget uses.
 /// Bytes one context position costs in the raw element size `kv_elem_bytes`. The per-layer
 /// K/V payload is the shared arithmetic, mapped by element size; the indexer key and the
 /// layer multiply are this family's geometry.

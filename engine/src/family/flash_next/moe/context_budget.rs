@@ -117,12 +117,13 @@ fn shared_kv_format(
     format: KvFormat,
     head_dim: u64,
 ) -> Result<crate::family::kv_format::KvFormat, EngError> {
-    let group = u32::try_from(head_dim)
-        .map_err(|_| refuse("the K/V head dimension does not fit the shared format".into()))?;
     Ok(match format {
+        // F16 carries no group, so it keeps no head_dim limit of its own.
         KvFormat::F16 => crate::family::kv_format::KvFormat::F16,
         KvFormat::Int8 => crate::family::kv_format::KvFormat::Int8 {
-            group,
+            group: u32::try_from(head_dim).map_err(|_| {
+                refuse("the K/V head dimension does not fit the shared format".into())
+            })?,
             scale_bytes: 4,
         },
     })
