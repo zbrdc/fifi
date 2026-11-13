@@ -3,10 +3,10 @@
 //! is generic over the graph type, so a plain integer stands for a graph here and the real
 //! `GraphExec` is exercised on the device (`d1_window_device_tests`).
 
-use super::super::super::verdict::{FailureAction, action_for};
-use super::super::{Mode, fold_capture};
 use super::{ENTERED_BY_GRAPH, Facts, GraphTable, MIN_ROWS, SLOTS, slot_of};
 use crate::EngError;
+use crate::family::qwen36::cuda::step::{Mode, fold_capture};
+use crate::family::qwen36::cuda::verdict::{FailureAction, action_for};
 use crate::family::qwen36::rollback::MAX_ROWS;
 
 fn facts(nodes: usize, vram_bytes: u64) -> Facts {
@@ -216,7 +216,7 @@ fn switching_the_graphs_off_runs_the_eager_body_and_back_on_replays_the_stored_g
 /// three. Fields are found by name, not by line.
 #[test]
 fn the_k_row_graphs_are_declared_before_the_buffers_they_bake_in() {
-    let source = include_str!("step.rs");
+    let source = include_str!("../qwen36/cuda/step.rs");
     let start = source
         .find("pub(crate) struct QwenResidentStep<'a> {")
         .expect("the step struct");

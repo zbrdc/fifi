@@ -268,23 +268,13 @@ impl SectionMarks {
     }
 }
 
-pub(super) enum Mode {
+pub(in crate::family) enum Mode {
     Replay,
     Capture,
     Eager,
 }
 
-/// The dispatch rule: replay once a graph exists; attempt the capture only on a warmed step
-/// that asked for it and has not already refused one; otherwise run eagerly.
-pub(super) fn next_mode(graph_ready: bool, warmed: bool, capture_on: bool, refused: bool) -> Mode {
-    if graph_ready {
-        Mode::Replay
-    } else if warmed && capture_on && !refused {
-        Mode::Capture
-    } else {
-        Mode::Eager
-    }
-}
+pub(super) use crate::family::graph_state::next_mode;
 
 /// The pure part of `capture_once`: what to do with the result of the capture attempt.
 /// `Ok(Some(graph))`: the capture succeeded, the caller stores and replays the graph. `Ok(None)`:
@@ -292,7 +282,7 @@ pub(super) fn next_mode(graph_ready: bool, warmed: bool, capture_on: bool, refus
 /// the failure rule must judge the rerun alone), the sticky refusal is set (`refused`) and the
 /// caller reruns the body eagerly. `Err`: any other error comes back unchanged, with `entered`
 /// and `refused` untouched, for the caller to fail on.
-pub(super) fn fold_capture<G>(
+pub(in crate::family) fn fold_capture<G>(
     attempt: Result<(G, ()), EngError>,
     is_refusal: fn(&EngError) -> bool,
     entered: &mut usize,
@@ -367,7 +357,7 @@ pub(super) fn exl3_device_pick_refusal(
     Ok(())
 }
 
-pub(super) fn exl3_flag_error() -> EngError {
+pub(in crate::family) fn exl3_flag_error() -> EngError {
     EngError::ModelOutput("EXL3 projection flagged invalid arithmetic".to_owned())
 }
 
@@ -562,7 +552,7 @@ pub(crate) struct QwenResidentStep<'a> {
 /// The typed verdict of the chunk gate: whether `feed_rows` may run the chunk path for this
 /// session. Every refusal keeps the per-token prompt path; the run report records the reason.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(super) enum ChunkVerdict {
+pub(in crate::family) enum ChunkVerdict {
     /// The session may use the chunk path. `m_sess` is the ADMITTED `M_sess`, one of
     /// `M_LADDER` (`PrefillArena::m_sess`), never the raw cap: the arena admission narrows the
     /// cap of `set_m_sess_cap` to the largest ladder size whose device sum fits the budget.
@@ -2826,8 +2816,7 @@ mod shortlist_bench;
 #[path = "prefix_runtime.rs"]
 mod prefix_runtime;
 
-#[path = "krow_graph.rs"]
-mod krow_graph;
+use crate::family::graph_state::krow_graph;
 
 #[path = "krow_step.rs"]
 mod krow_step;

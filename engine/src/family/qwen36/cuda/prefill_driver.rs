@@ -33,7 +33,7 @@ use crate::{
 /// Free VRAM after the weight load and before state/decode allocation, less the selected
 /// headroom. Extras include caller-owned allocations such as the device prefix tip.
 /// Fixed admission also checks fresh free VRAM before allocating its remaining buffers.
-pub(super) struct PrefillBudget {
+pub(in crate::family) struct PrefillBudget {
     pub(super) device_free: usize,
     pub(super) extras: Vec<Extra>,
 }

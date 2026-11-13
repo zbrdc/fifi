@@ -395,7 +395,7 @@ pub(super) struct KrowResources {
 }
 
 /// Everything a session builds once and the step borrows.
-pub(super) struct StepResources {
+pub(in crate::family) struct StepResources {
     pub(super) dims: StepDims,
     pub(super) plan: StepPlan,
     pub(super) arena: DeviceArena,

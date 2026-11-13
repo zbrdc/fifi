@@ -98,7 +98,7 @@ pub(crate) fn status_error(status: i32) -> EngError {
         };
     }
     if status & STATUS_EXL3_ARITHMETIC != 0 {
-        return super::step::exl3_flag_error();
+        return crate::family::qwen36::cuda::step::exl3_flag_error();
     }
     report.error().unwrap_or_else(|| unknown_bits(status))
 }
@@ -191,6 +191,14 @@ fn refuse(what: &str, why: &str) -> EngError {
 }
 
 impl StateBook {
+    #[cfg_attr(
+        not(test),
+        expect(dead_code, reason = "only the book's tests read it today")
+    )]
+    pub(in crate::family) fn needs_start(&self) -> bool {
+        self.needs_start
+    }
+
     /// A book for a state of `capacity` KV rows owned by stream `owner`. It starts `Poisoned`:
     /// the buffers are uninitialized until the first reset finishes.
     pub(in crate::family) fn new(capacity: usize, owner: u64) -> Self {
@@ -219,10 +227,6 @@ impl StateBook {
 
     pub(in crate::family) fn pending_rows(&self) -> usize {
         self.pending.advances.iter().sum()
-    }
-
-    pub(in crate::family) fn needs_start(&self) -> bool {
-        self.needs_start
     }
 
     /// `BadRequest` unless `stream_id` is the owning stream (rule 5).

@@ -32,19 +32,20 @@
 //! (the small buffer), `state` and `rollback`, so every graph drops before the buffers it covers;
 //! `krow_graph_tests` pins that order on the source.
 
-use super::{Mode, next_mode};
+use super::next_mode;
+use crate::family::qwen36::cuda::step::Mode;
 use crate::{EngError, family::qwen36::rollback::MAX_ROWS};
 
 /// The shortest window the K-row body serves (one row is the single-row step and its own graph).
-pub(super) const MIN_ROWS: usize = 2;
+pub(in crate::family) const MIN_ROWS: usize = 2;
 
 /// Slots of the table: indexed by the window length, so slots 0 and 1 stay empty.
-pub(super) const SLOTS: usize = MAX_ROWS + 1;
+pub(in crate::family) const SLOTS: usize = MAX_ROWS + 1;
 
 /// Ops counted for a window whose graph launch failed. The graph is the whole body, so a failure
 /// of the launch is judged as a failure after the launch (the state is poisoned and the window
 /// fails closed), never as a refusal of the first op that takes the step back.
-pub(super) const ENTERED_BY_GRAPH: usize = 2;
+pub(in crate::family) const ENTERED_BY_GRAPH: usize = 2;
 
 /// What the table counts, per window length (test builds).
 #[cfg(test)]
@@ -80,16 +81,16 @@ impl GraphStats {
 
 /// What a capture reports about its graph (kept in test builds only).
 #[derive(Clone, Copy, Debug, Default)]
-pub(super) struct Facts {
+pub(in crate::family) struct Facts {
     #[cfg(test)]
-    pub(super) nodes: usize,
+    pub(in crate::family) nodes: usize,
     #[cfg(test)]
-    pub(super) vram_bytes: u64,
+    pub(in crate::family) vram_bytes: u64,
 }
 
 /// One graph per window length, with the warm flags and the sticky refusal. Generic over the graph
 /// type so the host tests run the rules on a fake.
-pub(super) struct GraphTable<G> {
+pub(in crate::family) struct GraphTable<G> {
     graphs: [Option<G>; SLOTS],
     warmed: [bool; SLOTS],
     refused: bool,
@@ -116,7 +117,7 @@ impl<G> Default for GraphTable<G> {
 }
 
 /// The slot of a window length, or the refusal of a length the K-row body does not serve.
-pub(super) fn slot_of(rows: usize) -> Result<usize, EngError> {
+pub(in crate::family) fn slot_of(rows: usize) -> Result<usize, EngError> {
     if (MIN_ROWS..=MAX_ROWS).contains(&rows) {
         Ok(rows)
     } else {
@@ -128,12 +129,12 @@ pub(super) fn slot_of(rows: usize) -> Result<usize, EngError> {
 
 impl<G> GraphTable<G> {
     /// The graph captured for exactly `rows` rows, if any.
-    pub(super) fn graph(&self, rows: usize) -> Result<Option<&G>, EngError> {
+    pub(in crate::family) fn graph(&self, rows: usize) -> Result<Option<&G>, EngError> {
         Ok(self.graphs[slot_of(rows)?].as_ref())
     }
 
     /// How the next window of `rows` rows runs. `capture_on` is the step's capture setting.
-    pub(super) fn mode(&self, rows: usize, capture_on: bool) -> Result<Mode, EngError> {
+    pub(in crate::family) fn mode(&self, rows: usize, capture_on: bool) -> Result<Mode, EngError> {
         let at = slot_of(rows)?;
         // Switched off (test builds): the eager body, also for a length that has its graph.
         #[cfg(test)]
@@ -150,7 +151,12 @@ impl<G> GraphTable<G> {
 
     /// Stores the graph just captured for `rows` rows. A second graph for a length is refused: a
     /// length is captured once.
-    pub(super) fn store(&mut self, rows: usize, graph: G, _facts: Facts) -> Result<(), EngError> {
+    pub(in crate::family) fn store(
+        &mut self,
+        rows: usize,
+        graph: G,
+        _facts: Facts,
+    ) -> Result<(), EngError> {
         let at = slot_of(rows)?;
         if self.graphs[at].is_some() {
             return Err(EngError::BadRequest(format!(
@@ -168,7 +174,7 @@ impl<G> GraphTable<G> {
     }
 
     /// A window of `rows` rows enqueued the eager body whole: the length is warm.
-    pub(super) fn note_eager(&mut self, rows: usize) {
+    pub(in crate::family) fn note_eager(&mut self, rows: usize) {
         if let Ok(at) = slot_of(rows) {
             self.warmed[at] = true;
             #[cfg(test)]
@@ -179,7 +185,7 @@ impl<G> GraphTable<G> {
     }
 
     /// A window of `rows` rows launched its graph (replay, or the launch after the capture).
-    pub(super) fn note_replay(&mut self, rows: usize) {
+    pub(in crate::family) fn note_replay(&mut self, rows: usize) {
         #[cfg(test)]
         if let Ok(at) = slot_of(rows) {
             self.stats.replays[at] += 1;
@@ -189,7 +195,7 @@ impl<G> GraphTable<G> {
     }
 
     /// The sticky refusal flag, for `fold_capture`.
-    pub(super) fn refused_mut(&mut self) -> &mut bool {
+    pub(in crate::family) fn refused_mut(&mut self) -> &mut bool {
         &mut self.refused
     }
 

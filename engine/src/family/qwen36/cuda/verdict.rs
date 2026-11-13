@@ -51,7 +51,7 @@ pub(super) fn bad_token_error(token: i32) -> EngError {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(super) enum FailureAction {
+pub(in crate::family) enum FailureAction {
     /// Nothing was queued: take the admitted step back (`cancel_enqueue`).
     Cancel,
     /// Work may be queued: poison the state.
@@ -61,7 +61,7 @@ pub(super) enum FailureAction {
 /// `entered` counts the ops of the body that were entered, the failing one included. Op 1 is
 /// `step_begin`, a single wrapper that queues nothing when it refuses; any later op may have
 /// queued work (a block is entered whole), so any `run_block` error poisons.
-pub(super) fn action_for(entered: usize) -> FailureAction {
+pub(in crate::family) fn action_for(entered: usize) -> FailureAction {
     if entered <= 1 {
         FailureAction::Cancel
     } else {

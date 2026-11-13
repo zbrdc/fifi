@@ -10,9 +10,7 @@
 
 #[cfg(all(test, feature = "research-activation"))]
 mod activation_device_tests;
-pub(in crate::family) mod book;
-#[cfg(test)]
-mod book_tests;
+pub(in crate::family) use crate::family::graph_state::book;
 mod card_attn;
 #[cfg(test)]
 mod card_attn_device_tests;
@@ -149,7 +147,7 @@ mod placement_tests;
 mod prefill;
 #[cfg(test)]
 mod prefill_device_tests;
-mod prefill_driver;
+pub(in crate::family) mod prefill_driver;
 #[cfg(test)]
 mod prefill_driver_tests;
 #[cfg(test)]
@@ -165,7 +163,7 @@ mod prefill_plan_tests;
 mod prefill_step_device_tests;
 #[cfg(test)]
 mod prefill_tests;
-mod prefix;
+pub(in crate::family) mod prefix;
 #[cfg(test)]
 mod prefix_device_tests;
 #[cfg(test)]
@@ -175,7 +173,7 @@ mod r5_fmt;
 mod readback;
 #[cfg(test)]
 mod readback_tests;
-mod resources;
+pub(in crate::family) mod resources;
 #[cfg(test)]
 mod resources_tests;
 #[cfg(test)]
@@ -211,7 +209,7 @@ mod start_pins;
 mod start_tests;
 mod state;
 pub(in crate::family) mod state_layout;
-mod step;
+pub(in crate::family) mod step;
 mod step_ops;
 #[cfg(test)]
 mod step_ops_tests;
@@ -223,7 +221,7 @@ mod tests;
 mod tiered_load;
 mod tiered_step;
 mod trace;
-mod verdict;
+pub(in crate::family) mod verdict;
 #[cfg(test)]
 mod verdict_tests;
 #[cfg(test)]

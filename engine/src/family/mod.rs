@@ -25,6 +25,8 @@ pub(crate) mod expert_bank;
 pub mod flint;
 pub mod gemma4;
 pub mod gguf_model;
+#[cfg(all(feature = "native-cuda", target_os = "linux"))]
+pub(in crate::family) mod graph_state;
 pub mod keys;
 pub mod layer_weights;
 pub mod nemotron35;
