@@ -678,7 +678,7 @@ impl LayerResolver<'_, '_> {
             None
         };
         let refill = copy.map_or(stream, |(copy, _)| copy);
-        for op in refill_plan(table, &misses, parts_strides(&parts)) {
+        for op in refill_plan(table, &misses, parts_strides(parts)) {
             let record = store[op.part].member(op.expert);
             // On the launch stream (no split): the copy races the launches queued
             // after it instead of a device-wide sync per miss, and the next layer's
