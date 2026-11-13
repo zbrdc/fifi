@@ -18,7 +18,7 @@
 //! `Select`, `AttnCore`, then `MixerOut` (the out-projection of either mixer), `HyperApplyA`,
 //! `HyperReadM`, `Route`, `GateUp`, `Swiglu`, `Down`, `Combine`, `HyperApplyM`; after the last
 //! layer `FinalMix`, `LmHead`, `Argmax`, `Advance`. The EXL3 MoE block runs the routed and shared
-//! experts as one op in stream order (`qwen36/cuda/exl3_moe.rs`), so the tensors it touches are live
+//! experts as one op in stream order (`family/exl3/moe.rs`), so the tensors it touches are live
 //! from `GateUp` to `Combine`.
 //!
 //! # Rows

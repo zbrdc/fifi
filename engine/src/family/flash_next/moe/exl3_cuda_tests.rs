@@ -1,4 +1,4 @@
-//! The EXL3 MoE block of the CUDA step (`qwen36::cuda::exl3_moe`, shared with Flash-Next) on one
+//! The EXL3 MoE block of the CUDA step (`family::exl3::moe`, shared with Flash-Next) on one
 //! real layer of the Qwen3.8 Flash-Next EXL3 pack, against an fp64 evaluation of the same stored
 //! matrices and against this module's host `route`.
 //!
@@ -41,6 +41,7 @@ use super::route;
 use crate::{
     EngError,
     family::{
+        exl3::moe::{Exl3MoeBufs, Exl3MoeWeights, Scratch, run_exl3_moe},
         exl3_pack::{
             ExpertPart, Root, expert_name_in, router_name_in, shared_gate_name_in, shared_name_in,
         },
@@ -50,10 +51,7 @@ use crate::{
         },
         gguf_model::Role,
         project::cuda::{CudaProjector, CudaWeight, CudaWeights, Reserve},
-        qwen36::cuda::{
-            exl3_moe::{Exl3MoeBufs, Exl3MoeWeights, Scratch, run_exl3_moe},
-            moe::{Launch, MoeDims, RouteBufs},
-        },
+        qwen36::cuda::moe::{Launch, MoeDims, RouteBufs},
     },
     kernels::cuda::{
         DeviceBuffer, device_present,

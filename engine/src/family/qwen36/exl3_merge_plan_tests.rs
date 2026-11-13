@@ -351,7 +351,7 @@ fn only_the_merged_block_asks_for_the_wide_indexed_launch() {
     let merge = include_str!("../exl3/moe/merge.rs");
     assert_eq!(merge.matches("exl3_grouped_indexed_wide(").count(), 1);
     for (file, source) in [
-        ("exl3_moe.rs", include_str!("../exl3/moe.rs")),
+        ("exl3/moe.rs", include_str!("../exl3/moe.rs")),
         ("step.rs", include_str!("cuda/step.rs")),
         ("mixer.rs", include_str!("cuda/mixer.rs")),
         ("mixer_ops.rs", include_str!("cuda/mixer_ops.rs")),

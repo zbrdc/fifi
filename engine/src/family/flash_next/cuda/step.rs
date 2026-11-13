@@ -46,6 +46,7 @@ use std::cell::Cell;
 use crate::{
     EngError,
     family::{
+        exl3::moe::{Exl3MoeBufs, Exl3MoeWeights, Scratch, run_exl3_moe},
         exl3_pack::layer_name,
         flash_next::{
             cuda::{
@@ -62,10 +63,7 @@ use crate::{
             CudaWeight, CudaWeights,
             exl3::{Exl3Io, Exl3JobsIo, Exl3Weight},
         },
-        qwen36::cuda::{
-            exl3_moe::{Exl3MoeBufs, Exl3MoeWeights, Scratch, run_exl3_moe},
-            moe::{Launch, MoeDims, RouteBufs},
-        },
+        qwen36::cuda::moe::{Launch, MoeDims, RouteBufs},
     },
     kernels::cuda::{
         CudaContext, DeviceArena, DeviceBuffer, DeviceRange, DeviceStream,

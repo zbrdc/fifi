@@ -1,5 +1,5 @@
 //! The split MoE block on two real layers of the full pack, against the all-resident block
-//! (`qwen36::cuda::exl3_moe::run_exl3_moe` over a bank of every expert) and against an fp64
+//! (`family::exl3::moe::run_exl3_moe` over a bank of every expert) and against an fp64
 //! evaluation of the stored matrices.
 //!
 //! `FIFI_FLASH_NEXT_EXL3_PACK` names the local pack directory (the full 3.05 bpw pack, or a copy
@@ -43,6 +43,7 @@ use super::{
 use crate::{
     EngError,
     family::{
+        exl3::moe::{Exl3MoeBufs, Exl3MoeWeights, Scratch, run_exl3_moe},
         flash_next::{
             load::{exl3_pack::inspect_flash_pack, model_shape, pack_files::FlashPackFiles},
             moe::exl3_cuda_tests::{
@@ -52,10 +53,7 @@ use crate::{
         },
         gguf_model::Role,
         project::cuda::{CudaProjector, CudaWeight, CudaWeights},
-        qwen36::cuda::{
-            exl3_moe::{Exl3MoeBufs, Exl3MoeWeights, Scratch, run_exl3_moe},
-            moe::{Launch, MoeDims, RouteBufs},
-        },
+        qwen36::cuda::moe::{Launch, MoeDims, RouteBufs},
     },
     kernels::cuda::{
         DeviceBuffer, device_present,

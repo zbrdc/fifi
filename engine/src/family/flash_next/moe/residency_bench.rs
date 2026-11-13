@@ -52,13 +52,11 @@ use super::exl3_cuda_tests::{Router, input, keys, matrix, upload};
 use crate::{
     EngError,
     family::{
+        exl3::moe::{Exl3MoeBufs, Exl3MoeWeights, Scratch, run_exl3_moe},
         exl3_pack::{ExpertPart, Root, expert_name_in},
         flash_next::load::{exl3_pack::inspect_flash_pack, model_shape},
         project::cuda::{CudaProjector, CudaWeights},
-        qwen36::cuda::{
-            exl3_moe::{Exl3MoeBufs, Exl3MoeWeights, Scratch, run_exl3_moe},
-            moe::{Launch, MoeDims, RouteBufs},
-        },
+        qwen36::cuda::moe::{Launch, MoeDims, RouteBufs},
     },
     kernels::{
         cuda::{

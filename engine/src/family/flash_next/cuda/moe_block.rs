@@ -353,6 +353,10 @@ mod device {
     use crate::{
         EngError,
         family::{
+            exl3::moe::{
+                Exl3MoeBufs, IndexedPair, Scratch, SharedRowsIo, SharedWeights, grouped_indexed,
+                shared_of, shared_rows,
+            },
             flash_next::{cuda::bank::device::DeviceBank, moe::slot_bank::SlotBankLayout},
             project::{
                 cuda::{
@@ -364,13 +368,7 @@ mod device {
                 },
                 exl3_jobs_plan::EXL3_JOB_WORDS,
             },
-            qwen36::cuda::{
-                exl3_moe::{
-                    Exl3MoeBufs, IndexedPair, Scratch, SharedRowsIo, SharedWeights,
-                    grouped_indexed, shared_of, shared_rows,
-                },
-                moe::{Launch, MoeDims, RouteBufs},
-            },
+            qwen36::cuda::moe::{Launch, MoeDims, RouteBufs},
         },
         kernels::cuda::{
             CudaContext, DeviceBuffer, DeviceRange,

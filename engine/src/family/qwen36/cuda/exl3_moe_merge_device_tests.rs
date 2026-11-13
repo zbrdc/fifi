@@ -1,4 +1,4 @@
-//! Device tests of the shared expert inside the routed launches (`exl3_moe/merge.rs`). All are
+//! Device tests of the shared expert inside the routed launches (`family/exl3/moe/merge.rs`). All are
 //! `#[ignore]`: they need the 3090 held exclusively and the pinned 4.00 pack in
 //! `FIFI_EXL3_CHECKPOINT`, and run in a window with its own authorization.
 //!

@@ -57,7 +57,7 @@ mod exl3_device_tests;
 mod exl3_load;
 #[cfg(test)]
 mod exl3_load_device_tests;
-pub(in crate::family) use crate::family::exl3::moe as exl3_moe;
+use crate::family::exl3::moe as exl3_moe;
 #[cfg(test)]
 mod exl3_moe_device_tests;
 #[cfg(test)]

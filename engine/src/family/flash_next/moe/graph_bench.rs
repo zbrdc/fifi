@@ -101,15 +101,13 @@ use super::{
 };
 use crate::{
     family::{
+        exl3::moe::Exl3MoeBufs,
         gguf_model::Role,
         project::cuda::{
             CudaProjector, CudaWeight, CudaWeights,
             exl3::{Exl3Bank, Exl3Io, Exl3Weight},
         },
-        qwen36::cuda::{
-            exl3_moe::Exl3MoeBufs,
-            moe::{Launch, MoeDims},
-        },
+        qwen36::cuda::moe::{Launch, MoeDims},
     },
     kernels::cuda::{
         CapturePlan, CudaContext, DeviceBuffer, DeviceEvent, DeviceRange, DeviceStream, GraphExec,
