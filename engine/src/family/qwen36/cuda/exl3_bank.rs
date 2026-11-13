@@ -753,7 +753,13 @@ impl LayerResolver<'_, '_> {
         }
         let event = match (copy, miss_count > 0) {
             (Some((_, event)), true) => {
-                refill.record(event)?;
+                if let Err(err) = refill.record(event) {
+                    // The writes were enqueued, but the gate the launches wait on was
+                    // not: treat the misses as torn, as above, so correctness does not
+                    // depend on the caller's fence succeeding.
+                    table.invalidate(&misses);
+                    return Err(err);
+                }
                 Some(event)
             }
             _ => None,

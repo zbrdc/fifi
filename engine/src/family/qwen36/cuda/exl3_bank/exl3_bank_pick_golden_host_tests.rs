@@ -16,7 +16,7 @@
 //! checkout cannot pass a compare it should fail. The Flash-Next pick golden
 //! (`flash_next/cuda/bank_pick_golden_host_tests.rs`) owns its own file, same format.
 
-use super::{DECAY_CALLS, LayerSlots, LayerTables, refill_plan};
+use super::{DECAY_CALLS, EMPTY, LayerSlots, LayerTables, NO_SLOT, refill_plan};
 use crate::family::expert_bank::SlotTable;
 use sha2::{Digest, Sha256};
 use std::fmt::Write as _;
@@ -150,10 +150,10 @@ fn error_text(seed: u64) -> String {
         .expect("the table still serves after a refusal");
     let _ = writeln!(
         text,
-        "call 5 picks=[{bad_expert}] slots={:?} misses={:?} atomic={}",
+        "call 5 picks=[{bad_expert}] slots={:?} misses={:?} refilled={}",
         follow.0,
         follow.1,
-        follow.1.is_empty()
+        !follow.1.is_empty()
     );
     let row: Vec<i32> = table.slot_of.clone();
     let _ = writeln!(text, "table 5 tick={} row={row:?}", table.tick);
@@ -163,7 +163,7 @@ fn error_text(seed: u64) -> String {
 /// Renders the torn-refill response arm. The failing device write itself needs the device
 /// bank and is not host-drivable, so this drives the response alone: a call whose misses
 /// would have refilled, then [`LayerSlots::invalidate`] over exactly those missed slots,
-/// then the same picks again — every invalidated slot re-misses, and the refill plan of
+/// then the same picks again — every pick that had missed re-misses, and the refill of
 /// that second call names the same experts the torn one would have. What is pinned is the
 /// invalidation function and its round trip, not the write failure's trigger.
 fn invalidate_text(seed: u64) -> String {
@@ -175,17 +175,26 @@ fn invalidate_text(seed: u64) -> String {
         let _ = writeln!(text, "call {call} picks={picks:?} slots={slots:?}");
     }
     let picks = call_picks(seed, 4);
-    let before = table.clone();
     let (_, misses) = table.assign(&picks).expect("a miss-heavy call");
     let _ = writeln!(text, "call 4 picks={picks:?} misses={misses:?}");
+    // The incoming expert of each missed slot, before invalidate drops it.
+    let incoming: Vec<usize> = misses.iter().map(|&slot| table.expert_of(slot)).collect();
     table.invalidate(&misses);
-    assert_ne!(
-        table, before,
-        "invalidate drops the incoming experts of the missed slots"
-    );
+    for (&slot, &expert) in misses.iter().zip(&incoming) {
+        assert_eq!(table.expert_of[slot], EMPTY, "slot {slot} reads absent");
+        assert_eq!(
+            table.slot_of[expert], NO_SLOT,
+            "expert {expert} reads absent"
+        );
+    }
     let row: Vec<i32> = table.slot_of.clone();
     let _ = writeln!(text, "invalidated tick={} row={row:?}", table.tick);
     let (_, again) = table.assign(&picks).expect("the same picks serve again");
+    assert_eq!(
+        again.len(),
+        misses.len(),
+        "every pick that had missed re-misses"
+    );
     let _ = writeln!(
         text,
         "call 5 picks={picks:?} misses={again:?} refill_again={}",
