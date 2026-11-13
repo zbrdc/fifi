@@ -235,6 +235,12 @@ impl KvPool {
         Ok(layout)
     }
 
+    /// The aligned per-layer stride the pool reserves (K/V and scale planes, alignment
+    /// rounded); the golden pins this and `total` together.
+    pub(super) fn layer_stride(&self) -> usize {
+        self.layer_stride
+    }
+
     /// KV bytes for one position over all attention layers (exact, not rounded to the alignment).
     pub(crate) fn bytes_per_token(dims: &StepDims, mode: KvMode) -> Result<usize, EngError> {
         let a = &dims.shape.attn;

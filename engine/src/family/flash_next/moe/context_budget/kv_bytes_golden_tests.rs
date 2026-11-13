@@ -6,8 +6,29 @@
 //! module.
 
 use super::*;
+use crate::family::exl3_pack::{Marker, PackReport};
+use crate::family::flash_next::load::exl3_pack::FlashPackReport;
+use crate::family::flash_next::moe::load_plan::FlashLoadPlan;
 use crate::family::flash_next::moe::tier_plan::TierShape;
+use std::collections::BTreeMap;
 use std::fmt::Write as _;
+
+const CONFIG: &[u8] =
+    include_bytes!("../../../../../tests/fixtures/qwen3_8_flash_next_config.json");
+
+fn pack_report(trunk: u64) -> FlashPackReport {
+    let experts = 24_576 * EXPERT_BYTES;
+    let embedding = 248_320u64 * 2560 * 2;
+    FlashPackReport {
+        pack: PackReport {
+            device_bytes: experts + embedding + trunk,
+            expert_bytes: experts,
+            matrices: 74_041,
+            rates: BTreeMap::new(),
+            codebook: Marker::Mul1,
+        },
+    }
+}
 
 const MIB: u64 = 1 << 20;
 const EXPERT_BYTES: u64 = 1_881_600;
@@ -53,8 +74,8 @@ fn position_text() -> String {
         FLASH_NEXT.idx_dim,
         FLASH_NEXT.ratio
     );
-    // Local labels, not {format:?}: the P5 ladder replaces this enum, and the golden
-    // must move on bytes, not on a Debug name.
+    // Local labels, not {format:?}: the golden must move on bytes, not on a
+    // Debug name.
     for (label, format) in [("f16", KvFormat::F16), ("int8", KvFormat::Int8)] {
         let total = FLASH_NEXT.position_bytes(format).unwrap();
         let scales = FLASH_NEXT
@@ -89,19 +110,37 @@ fn tier_text() -> String {
     text
 }
 
-/// Renders the slot counts a real context yields per format: the load plan's K/V shape term.
+/// Renders the slot counts a real context yields per format, through the load plan's
+/// own geometry (the plan the loader computes, not the budget helper alone).
 fn slots_text() -> String {
     let mut text = String::new();
+    let shape = TierShape::from_pack(48, 512, 10, 24_576 * EXPERT_BYTES).unwrap();
+    let card = TierInputs::cost_model_3090(
+        shape,
+        (0, 0),
+        KvPlan {
+            positions: 1,
+            bytes_per_position: 1,
+        },
+    );
+    let load =
+        FlashLoadPlan::new(&pack_report(3_854_000_000), CONFIG, 32_640_183_408, card).unwrap();
     for positions in [262_144u64, 131_072, 32_768] {
-        for (label, format) in [("f16", KvFormat::F16), ("int8", KvFormat::Int8)] {
-            let plan = budget().plan_at(positions, format).unwrap();
-            let _ = writeln!(
-                text,
-                "positions {positions} {label} slots_per_layer={}",
-                plan.slots_per_layer()
-            );
-        }
+        let plan = load.at_context(positions, KvFormat::F16, 100).unwrap();
+        let _ = writeln!(
+            text,
+            "positions {positions} f16 slots_per_layer={} kv_bytes={}",
+            plan.context.plan.slots_per_layer(),
+            plan.kv_bytes
+        );
     }
+    // The load plan refuses Int8 until the attention kernel exists; the refusal text
+    // is real behavior and pins with the numbers.
+    let refused = load
+        .at_context(262_144, KvFormat::Int8, 100)
+        .unwrap_err()
+        .describe();
+    let _ = writeln!(text, "int8 refused: {refused}");
     text
 }
 
@@ -168,11 +207,14 @@ fn the_kv_bytes_hold_their_golden_digests() {
             goldens["arms"] = serde_json::Value::Object(
                 arms.into_iter().map(|(k, v)| (k.to_string(), v)).collect(),
             );
-            std::fs::write(
-                &path,
-                serde_json::to_string_pretty(&goldens).unwrap() + "\n",
-            )
-            .unwrap();
+            // Atomic: a capture that dies mid-write never leaves a half-written
+            // golden; the rename is the commit point.
+            let rendered = serde_json::to_string_pretty(&goldens).unwrap()
+                + "
+";
+            let temp = path.with_extension("json.tmp");
+            std::fs::write(&temp, rendered).unwrap();
+            std::fs::rename(&temp, &path).unwrap();
             println!("GOLDEN UPDATED flash-next kv bytes");
         });
         return;
@@ -182,15 +224,27 @@ fn the_kv_bytes_hold_their_golden_digests() {
     let pinned_arms = pinned["arms"]
         .as_object()
         .unwrap_or_else(|| panic!("no flash-next kv arms; capture with FIFI_GOLDEN_UPDATE=1"));
+    // Report every drift in one assert, not just the first failure.
+    let mut drifted: Vec<String> = Vec::new();
     for (name, sha) in &sections {
         let pinned_sha = pinned_arms.get(name).and_then(|v| v.as_str()).unwrap_or("");
-        assert_eq!(pinned_sha, sha, "arm {name} moved; capture deliberately");
+        if pinned_sha != sha {
+            drifted.push(format!("arm {name}: pinned {pinned_sha}, rendered {sha}"));
+        }
     }
     for name in pinned_arms.keys() {
-        assert!(
-            sections.contains_key(name),
-            "pinned arm {name} no longer renders"
-        );
+        if !sections.contains_key(name) {
+            drifted.push(format!("arm {name}: pinned but no longer renders"));
+        }
     }
+    assert!(
+        drifted.is_empty(),
+        "kv bytes goldens moved (capture deliberately and name the move in the commit):
+{}",
+        drifted.join(
+            "
+"
+        )
+    );
     println!("GOLDEN MATCH flash-next kv bytes");
 }

@@ -37,13 +37,31 @@ fn pool_text() -> String {
         "heads_kv={} head_dim={}",
         dims.shape.attn.heads_kv, dims.shape.attn.head_dim
     );
-    // Local labels, not {mode:?}: the P5 ladder replaces this enum, and the golden
-    // must move on bytes, not on a Debug name. The dtype arm below is the one
-    // deliberate exception: it pins the Debug text itself.
+    // Local labels, not {mode:?}: the golden must move on bytes, not on a Debug
+    // name. The dtype arm below is the one deliberate exception: it pins the
+    // Debug text itself.
     for (label, mode) in [("fp16", KvMode::Fp16), ("int8g32", KvMode::Int8G32)] {
         let bytes = KvPool::bytes_per_token(&dims, mode).unwrap();
         let _ = writeln!(text, "{label} bytes_per_token={bytes}");
     }
+    // The pool the decoder actually reserves: aligned per-layer stride and whole-pool
+    // bytes at a real capacity, both modes, full heads.
+    for (label, mode) in [("fp16", KvMode::Fp16), ("int8g32", KvMode::Int8G32)] {
+        let pool = KvPool::new(&dims, mode, 16_384).unwrap();
+        let _ = writeln!(
+            text,
+            "{label} capacity 16384 aligned_layer_stride={} total={}",
+            pool.layer_stride(),
+            pool.total
+        );
+    }
+    let staging = KvPool::q8_staging_layer(&dims, 16_384).unwrap();
+    let _ = writeln!(
+        text,
+        "int8g32 staging_layer_stride={} staging_total={}",
+        staging.layer_stride(),
+        staging.total
+    );
     text
 }
 
@@ -149,11 +167,14 @@ fn the_kv_bytes_hold_their_golden_digests() {
             goldens["arms"] = serde_json::Value::Object(
                 arms.into_iter().map(|(k, v)| (k.to_string(), v)).collect(),
             );
-            std::fs::write(
-                &path,
-                serde_json::to_string_pretty(&goldens).unwrap() + "\n",
-            )
-            .unwrap();
+            // Atomic: a capture that dies mid-write never leaves a half-written
+            // golden; the rename is the commit point.
+            let rendered = serde_json::to_string_pretty(&goldens).unwrap()
+                + "
+";
+            let temp = path.with_extension("json.tmp");
+            std::fs::write(&temp, rendered).unwrap();
+            std::fs::rename(&temp, &path).unwrap();
             println!("GOLDEN UPDATED qwen36-cuda kv bytes");
         });
         return;
@@ -163,15 +184,27 @@ fn the_kv_bytes_hold_their_golden_digests() {
     let pinned_arms = pinned["arms"]
         .as_object()
         .unwrap_or_else(|| panic!("no qwen36-cuda kv arms; capture with FIFI_GOLDEN_UPDATE=1"));
+    // Report every drift in one assert, not just the first failure.
+    let mut drifted: Vec<String> = Vec::new();
     for (name, sha) in &sections {
         let pinned_sha = pinned_arms.get(name).and_then(|v| v.as_str()).unwrap_or("");
-        assert_eq!(pinned_sha, sha, "arm {name} moved; capture deliberately");
+        if pinned_sha != sha {
+            drifted.push(format!("arm {name}: pinned {pinned_sha}, rendered {sha}"));
+        }
     }
     for name in pinned_arms.keys() {
-        assert!(
-            sections.contains_key(name),
-            "pinned arm {name} no longer renders"
-        );
+        if !sections.contains_key(name) {
+            drifted.push(format!("arm {name}: pinned but no longer renders"));
+        }
     }
+    assert!(
+        drifted.is_empty(),
+        "kv bytes goldens moved (capture deliberately and name the move in the commit):
+{}",
+        drifted.join(
+            "
+"
+        )
+    );
     println!("GOLDEN MATCH qwen36-cuda kv bytes");
 }
