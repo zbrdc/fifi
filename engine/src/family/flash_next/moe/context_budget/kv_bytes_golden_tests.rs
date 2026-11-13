@@ -144,6 +144,51 @@ fn slots_text() -> String {
     text
 }
 
+/// The settings member the user actually writes: the f16 default resolves and the
+/// int8 refusal text stays verbatim. Pinned before any step touches the parse or
+/// the planning arithmetic.
+fn settings_text() -> String {
+    let mut text = String::new();
+    let base = crate::family::flash_next::settings::FlashOptions {
+        manifest: Some(std::path::PathBuf::from("/art/download-manifest.json")),
+        // cache_limit_bytes stays unset: it is an MLX key and refuses to combine
+        // with cuda_decode, which is the arm this pin drives.
+        cuda_decode: Some(true),
+        ..crate::family::flash_next::settings::FlashOptions::default()
+    };
+    let resolved = crate::family::flash_next::settings::FlashSettings::new(
+        std::path::Path::new("/art"),
+        std::path::Path::new("/tok"),
+        Some(&base),
+        &crate::family::flash_next::settings::FlashEnv::default(),
+    );
+    let _ = writeln!(text, "default kv_format resolves={}", resolved.is_ok());
+    let int8 = crate::family::flash_next::settings::FlashOptions {
+        kv_format: Some(crate::family::flash_next::settings::KvFormatName::Int8),
+        ..base
+    };
+    let refused = crate::family::flash_next::settings::FlashSettings::new(
+        std::path::Path::new("/art"),
+        std::path::Path::new("/tok"),
+        Some(&int8),
+        &crate::family::flash_next::settings::FlashEnv::default(),
+    )
+    .unwrap_err()
+    .describe();
+    // The arm is self-checking: the rendered lines must actually be the resolution
+    // and the refusal, not some other error path.
+    assert!(
+        resolved.is_ok(),
+        "the f16 default must resolve: {resolved:?}"
+    );
+    assert!(
+        refused.contains("no attention kernel"),
+        "the refusal text changed: {refused}"
+    );
+    let _ = writeln!(text, "int8 refused: {refused}");
+    text
+}
+
 /// The digests of this family's arms.
 fn sections() -> serde_json::Map<String, serde_json::Value> {
     let mut map = serde_json::Map::new();
@@ -151,6 +196,7 @@ fn sections() -> serde_json::Map<String, serde_json::Value> {
         ("position", position_text()),
         ("tier", tier_text()),
         ("slots", slots_text()),
+        ("settings", settings_text()),
     ] {
         map.insert(name.into(), digest(&text).into());
     }
