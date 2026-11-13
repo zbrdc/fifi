@@ -29,6 +29,9 @@ mod moe_block;
 mod moe_block_device_tests;
 #[cfg(test)]
 mod moe_block_tests;
+mod prefill_adapter;
+#[cfg(test)]
+mod prefill_adapter_host_tests;
 mod prefill_ring;
 #[cfg(all(test, feature = "native-cuda", target_os = "linux"))]
 mod prefill_ring_device_tests;
