@@ -69,8 +69,10 @@ fn the_admit_plan_decides_from_the_slot_row() {
 
 /// The union-admit identity: admitting the chunk's union (first-seen order, repeats gone) and
 /// admitting the raw pick list with repeats produce the same plan — distinct, hits and every
-/// move — because the policy counts an expert once either way. This is what makes the
-/// adapter's admit equal to the golden's direct admit arm.
+/// move — because the policy counts an expert once either way; the slot rows agree
+/// afterwards. A second admit of the same list on both banks must then also agree: it
+/// exercises the recency order the first admit left, where a policy that counted repeats
+/// differently would diverge.
 #[test]
 fn admitting_the_union_moves_the_same_slots_as_admitting_the_raw_list() {
     let mut by_union = policy();
@@ -103,5 +105,13 @@ fn admitting_the_union_moves_the_same_slots_as_admitting_the_raw_list() {
     assert_eq!(through_union.hits, direct.hits);
     assert_eq!(through_union.moves, direct.moves);
     // And the tables agree afterwards, not just the plans.
+    assert_eq!(by_union.slot_row(0), by_raw.slot_row(0));
+
+    // The second admit rides the recency order the first one left.
+    let again_union = by_union
+        .admit(0, &plan_of.union)
+        .expect("the union still fits the slots");
+    let again_raw = by_raw.admit(0, &flat).expect("the raw list still fits");
+    assert_eq!(again_union.moves, again_raw.moves);
     assert_eq!(by_union.slot_row(0), by_raw.slot_row(0));
 }

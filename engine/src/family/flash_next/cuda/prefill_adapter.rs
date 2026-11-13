@@ -1,8 +1,8 @@
 //! The chunk-facing contract over the bank: what a prefill chunk does to the expert bank,
 //! formalized as one type so the chunked prefill paths of both families code against the same
-//! shape. The served path of Flash-Next (`moe_block::run_rows`) already implements this
-//! sequence inline; the adapter gives it a name and keeps the ordering rules in one place
-//! without changing what runs today.
+//! shape. The served path of Flash-Next (`moe_block::run_rows`) still carries its own inline
+//! copy of this sequence; the two can drift until the shared prefill pass routes `run_rows`
+//! through the adapter. The adapter changes nothing that runs today.
 //!
 //! The sequence of one chunk, per `run_rows`:
 //!
@@ -12,7 +12,9 @@
 //!    union fits the bank's slots, and how many of the union are not resident.
 //! 3. If the union fits and anything is missing, the caller drains its own stream, then
 //!    [`PrefillAdapter::admit_union`] admits the union in one pass. An admit that does not
-//!    run returns `None`; the per-row step tail is the caller's fallback.
+//!    run returns `None`; the per-row step tail is the caller's fallback, also for an
+//!    over-capacity union (the shared pass keeps that rule until it needs the policy's
+//!    keep-last-slots admit, which `DeviceBank::admit` already accepts).
 //! 4. Whenever the returned copies have ops, the caller uploads the bank's slot row again
 //!    before the next classify.
 //!
@@ -23,9 +25,13 @@
 use super::moe_block::pick_union;
 
 /// The chunk-admit decision of one layer: the union of the chunk's pick rows in first-seen
-/// order (faults skipped by `pick_union`'s caller contract; ids outside the layer are refused
-/// by the bank long before an admit runs), whether that union fits the bank's slots, and how
-/// many of the union are not resident. An admit runs only when `fits && missing > 0`.
+/// order, whether that union fits the bank's slots, and how many of the union are not
+/// resident. An admit runs only when `fits && missing > 0`.
+///
+/// Ids must be inside `0..experts`: `pick_union` indexes its seen table by the id and panics
+/// otherwise, and `slot_row` is indexed the same way. The served caller refuses faults (-1)
+/// and out-of-range ids before this (`route_rows`), and [`PrefillAdapter::admit_plan`] refuses
+/// them itself.
 ///
 /// Pure host data: it is computed from a slot row, so the host tests pin it without a card.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -70,7 +76,7 @@ impl AdmitPlan {
 /// constructs today; a caller that wants the contract constructs this over it.
 #[cfg(all(feature = "native-cuda", target_os = "linux"))]
 pub(in crate::family::flash_next) mod device {
-    use super::super::bank::{PassCopies, device::DeviceBank};
+    use super::super::bank::{BankGeometry, BankStats, PassCopies, device::DeviceBank};
     use super::AdmitPlan;
     use crate::{
         EngError,
@@ -86,13 +92,26 @@ pub(in crate::family::flash_next) mod device {
             Self { bank }
         }
 
-        /// The chunk-admit decision of `layer` for the chunk's pick rows.
+        /// The chunk-admit decision of `layer` for the chunk's pick rows. Faults (-1) and ids
+        /// outside the layer are refused here, so a caller that cannot guarantee its router
+        /// output still cannot panic the union.
         pub(in crate::family::flash_next) fn admit_plan(
             &self,
             layer: usize,
             picks_rows: &[&[i32]],
         ) -> Result<AdmitPlan, EngError> {
             let geometry = self.bank.geometry();
+            for row in picks_rows {
+                if let Some(&id) = row
+                    .iter()
+                    .find(|&&id| id < 0 || id >= geometry.experts as i32)
+                {
+                    return Err(EngError::BadRequest(format!(
+                        "the chunk admit takes picks inside 0..{}, got {id}",
+                        geometry.experts
+                    )));
+                }
+            }
             Ok(AdmitPlan::of(
                 picks_rows,
                 geometry.experts,
@@ -101,12 +120,30 @@ pub(in crate::family::flash_next) mod device {
             ))
         }
 
+        /// Runs a plan `admit_plan` already computed, so a caller that drains its stream only
+        /// when an admit will run does not pay the union twice. `None` when the plan does not
+        /// admit. Same contract as [`Self::admit_union`]: copies on the bank's own stream, the
+        /// caller drained first, re-upload [`Self::slot_row`] when ops are returned.
+        pub(in crate::family::flash_next) fn admit_planned(
+            &mut self,
+            ctx: &CudaContext,
+            layer: usize,
+            plan: &AdmitPlan,
+        ) -> Result<Option<PassCopies>, EngError> {
+            if !plan.admits() {
+                return Ok(None);
+            }
+            Ok(Some(self.bank.admit(ctx, layer, &plan.union)?))
+        }
+
         /// Admits the chunk's union in one pass when the plan admits; `None` when it does not
         /// (the union does not fit, or everything is already resident) — the caller's fallback
-        /// is the per-row [`Self::step`] tail. The copies run on the bank's own stream and the
-        /// call returns when they have finished; the caller must drain its own stream first,
-        /// exactly as `DeviceBank::step` requires. When the returned copies have ops, upload
-        /// [`Self::slot_row`] again before the next classify.
+        /// is the per-row [`Self::step`] tail. A caller that wants to drain its own stream only
+        /// when an admit will run computes [`Self::admit_plan`] first and uses
+        /// [`Self::admit_planned`] instead, so the union is not computed twice. The copies run
+        /// on the bank's own stream and the call returns when they have finished; the caller
+        /// must drain its own stream first, exactly as `DeviceBank::step` requires. When the
+        /// returned copies have ops, upload [`Self::slot_row`] again before the next classify.
         pub(in crate::family::flash_next) fn admit_union(
             &mut self,
             ctx: &CudaContext,
@@ -114,10 +151,7 @@ pub(in crate::family::flash_next) mod device {
             picks_rows: &[&[i32]],
         ) -> Result<Option<PassCopies>, EngError> {
             let plan = self.admit_plan(layer, picks_rows)?;
-            if !plan.admits() {
-                return Ok(None);
-            }
-            Ok(Some(self.bank.admit(ctx, layer, &plan.union)?))
+            self.admit_planned(ctx, layer, &plan)
         }
 
         /// The per-row fallback: one decode-shaped pass for the rows the union admit did not
@@ -186,8 +220,21 @@ pub(in crate::family::flash_next) mod device {
             self.bank.stream()
         }
 
-        /// Whether a failed copy left the device out of step with the host model; every method
-        /// above is refused while this holds.
+        /// The counters of the passes so far (hits, misses, write-backs, miss histogram).
+        pub(in crate::family::flash_next) fn stats(&self) -> &BankStats {
+            self.bank.stats()
+        }
+
+        /// The sizes of the bank: layers, experts, top-k, slots per layer and the record size.
+        pub(in crate::family::flash_next) fn geometry(&self) -> &BankGeometry {
+            self.bank.geometry()
+        }
+
+        /// Whether a failed copy left the device out of step with the host model. While this
+        /// holds, `admit_plan`, `admit_union`, `admit_planned`, `step`, `slot_row`, `slots` and
+        /// `stream_place` are refused; `place_of`, `synchronize_store`, `stream`, `stats`,
+        /// `geometry` and this method still answer (the ring must be able to hand its stores
+        /// back and the counters to be read out while a rebuild is decided).
         pub(in crate::family::flash_next) fn is_poisoned(&self) -> bool {
             self.bank.is_poisoned()
         }
