@@ -310,6 +310,7 @@ impl ExpertStore {
 ///
 /// One slot index addresses member `i` of all three parts' device banks and of the store's
 /// part stores alike, so the table is one array per layer, not per part.
+#[derive(Clone, Debug, PartialEq)]
 pub(crate) struct LayerSlots {
     experts: usize,
     slots: usize,
@@ -386,6 +387,17 @@ impl LayerSlots {
     /// Returns the slots in pick order and, for each miss, the slot whose device bytes the
     /// caller must refill from the store.
     fn assign(&mut self, picks: &[usize]) -> Result<(Vec<usize>, Vec<usize>), EngError> {
+        // Atomic, the seam's rule: an Err changes nothing. The pass runs on a scratch
+        // clone (the table is KiBs — noise next to the three record copies one miss
+        // issues) and only lands on Ok, so a mid-stream refusal leaves the live table
+        // exactly as the call found it.
+        let mut scratch = self.clone();
+        let outcome = scratch.assign_steps(picks)?;
+        *self = scratch;
+        Ok(outcome)
+    }
+
+    fn assign_steps(&mut self, picks: &[usize]) -> Result<(Vec<usize>, Vec<usize>), EngError> {
         self.tick += 1;
         if self.tick.is_multiple_of(DECAY_CALLS) {
             self.decay();
@@ -455,6 +467,21 @@ impl LayerSlots {
     /// The expert a slot holds (for the store read of a miss copy).
     fn expert_of(&self, slot: usize) -> usize {
         usize::from(self.expert_of[slot])
+    }
+
+    /// The torn-refill response: drop `slots` from both directions of the table so the
+    /// next call treats them as misses and refills. A failed record write leaves a
+    /// slot's bytes untrustworthy while the table still names its incoming expert, and
+    /// restoring the pre-call table would be wrong — an evicted expert's bytes may be
+    /// half overwritten — so the slot simply reads absent in both directions.
+    fn invalidate(&mut self, slots: &[usize]) {
+        for &slot in slots {
+            let expert = self.expert_of[slot];
+            if expert != EMPTY {
+                self.slot_of[usize::from(expert)] = NO_SLOT;
+            }
+            self.expert_of[slot] = EMPTY;
+        }
     }
 }
 
@@ -711,9 +738,18 @@ impl LayerResolver<'_, '_> {
             // The store is pinned, so the record must stay untouched until the
             // streams drain; the store is immutable post-load and
             // process-long-lived, which is that invariant.
-            parts[op.part]
+            if let Err(err) = parts[op.part]
                 .bank
-                .write_at_enqueue(refill, op.offset(), record)?;
+                .write_at_enqueue(refill, op.offset(), record)
+            {
+                // The write failed mid-plan: the enqueued copies of this call's misses
+                // cannot be trusted to be complete, and the table still names their
+                // incoming experts. Both directions of every missed slot read absent
+                // again, so the next call re-misses them and refills over whatever
+                // bytes landed.
+                table.invalidate(&misses);
+                return Err(err);
+            }
         }
         let event = match (copy, miss_count > 0) {
             (Some((_, event)), true) => {

@@ -119,12 +119,12 @@ fn arm_text(slots: usize, sticky: usize, seed: u64) -> String {
     text
 }
 
-/// Renders the error arm: a mid-stream out-of-range pick, the table state the failed call
-/// leaves behind (tick advanced: the non-atomicity this golden pins), and the follow-up call
-/// that makes it visible: the first pick of the failed call was already assigned, so
-/// re-assigning it alone is a hit with no miss. What is pinned of the defect is the
-/// refused-pick half; the refill order, the gated set, the event flag and the counters are
-/// recomputed here from the policy's returns, not read from the engine.
+/// Renders the error arm: a mid-stream out-of-range pick, and the atomicity the fix pins —
+/// the failed call leaves the table untouched (tick and row as the last good call left
+/// them, asserted against a snapshot), so the follow-up re-assignment of the pick the
+/// failed call would have taken is a fresh miss, not a hit on a half-applied table. The
+/// refill order, the gated set, the event flag and the counters are recomputed here from
+/// the policy's returns, not read from the engine.
 fn error_text(seed: u64) -> String {
     let mut table = LayerSlots::new(EXPERTS, SLOTS, 8);
     let mut text = String::new();
@@ -139,22 +139,58 @@ fn error_text(seed: u64) -> String {
         .find(|&e| !resident.contains(&e))
         .expect("512 experts against at most 32 assigned leaves an absent one");
     let bad = vec![bad_expert, EXPERTS, bad_expert];
+    let before = table.clone();
     let error = table
         .assign(&bad)
         .expect_err("an out-of-range pick exceeds the layer");
-    let _ = writeln!(text, "call 4 picks={bad:?} error={error:?}");
+    assert_eq!(table, before, "the refused call changes nothing");
+    let _ = writeln!(text, "call 4 picks={bad:?} error={error:?}",);
     let follow = table
         .assign(&[bad_expert])
-        .expect("the first pick of the failed call stands");
+        .expect("the table still serves after a refusal");
     let _ = writeln!(
         text,
-        "call 5 picks=[{bad_expert}] slots={:?} misses={:?} defect={}",
+        "call 5 picks=[{bad_expert}] slots={:?} misses={:?} atomic={}",
         follow.0,
         follow.1,
         follow.1.is_empty()
     );
     let row: Vec<i32> = table.slot_of.clone();
     let _ = writeln!(text, "table 5 tick={} row={row:?}", table.tick);
+    text
+}
+
+/// Renders the torn-refill response arm. The failing device write itself needs the device
+/// bank and is not host-drivable, so this drives the response alone: a call whose misses
+/// would have refilled, then [`LayerSlots::invalidate`] over exactly those missed slots,
+/// then the same picks again — every invalidated slot re-misses, and the refill plan of
+/// that second call names the same experts the torn one would have. What is pinned is the
+/// invalidation function and its round trip, not the write failure's trigger.
+fn invalidate_text(seed: u64) -> String {
+    let mut table = LayerSlots::new(EXPERTS, SLOTS, 8);
+    let mut text = String::new();
+    for call in 0..4 {
+        let picks = call_picks(seed, call);
+        let (slots, _) = table.assign(&picks).expect("valid calls first");
+        let _ = writeln!(text, "call {call} picks={picks:?} slots={slots:?}");
+    }
+    let picks = call_picks(seed, 4);
+    let before = table.clone();
+    let (_, misses) = table.assign(&picks).expect("a miss-heavy call");
+    let _ = writeln!(text, "call 4 picks={picks:?} misses={misses:?}");
+    table.invalidate(&misses);
+    assert_ne!(
+        table, before,
+        "invalidate drops the incoming experts of the missed slots"
+    );
+    let row: Vec<i32> = table.slot_of.clone();
+    let _ = writeln!(text, "invalidated tick={} row={row:?}", table.tick);
+    let (_, again) = table.assign(&picks).expect("the same picks serve again");
+    let _ = writeln!(
+        text,
+        "call 5 picks={picks:?} misses={again:?} refill_again={}",
+        again.len()
+    );
     text
 }
 
@@ -206,6 +242,7 @@ pub(super) fn sections() -> serde_json::Map<String, serde_json::Value> {
         ("lru32", arm_text(32, 0, 0x5eed_0004)),
         ("sticky3", arm_text(SLOTS, 3, 0x5eed_0005)),
         ("dupes", dupes_text(SLOTS, 0x5eed_0006)),
+        ("invalidate", invalidate_text(0x5eed_0007)),
     ] {
         map.insert(name.into(), digest(&text).into());
     }
