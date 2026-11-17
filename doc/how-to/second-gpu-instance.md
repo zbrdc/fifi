@@ -146,6 +146,10 @@ The lease is advisory. A direct `systemctl` action outside the reserved
 handoff can still interrupt a holder; all cooperating lanes must use the
 same lease and handoff procedure.
 
+The [guarded 2080 Ti handoff](guarded-2080-handoff.md) describes the
+host-specific cooperative supervisor, its owner-adoption prerequisites, and
+its limits. It is not automatically installed or enabled.
+
 Concurrent use can change the primary pair's performance. Measure any
 interference with matched workloads and retained telemetry rather than
 assuming a fixed penalty.
