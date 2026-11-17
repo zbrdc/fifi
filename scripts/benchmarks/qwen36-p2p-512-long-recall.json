@@ -1,0 +1,110 @@
+{
+  "description": "Guarded real-model cold synthetic recall with experimental 512-row P2P chunks; 128k interrupted.",
+  "server_source_commit": "76dec8a61d040efa97beefe273bed8dc9e68ff57",
+  "server_binary_sha256": "efac9000d75f7fddddfa5c50882837f60915dbcfdfa6afa51433fe56da9fd69d",
+  "driver_source_commit": "74f2b561e3cb3bf1eb36c62908f08515e2c94cb2",
+  "model": "Qwen3.6-35B-A3B-Q4_K_M",
+  "model_sha256": "671e47e0ec53c665d048b98c3ecbfd5236b5ca9c3e02ed19fc8f81f7b85140c7",
+  "kv_mode": "q8",
+  "configured_context_tokens": 262144,
+  "prefix_reuse": false,
+  "chunk_rows": 512,
+  "devices": [
+    "NVIDIA GeForce RTX 3060 12 GB",
+    "NVIDIA GeForce RTX 3080 10 GB"
+  ],
+  "completed_results": [
+    {
+      "target_tokens": 8192,
+      "server_counted_prompt_tokens": 8311,
+      "completion_tokens": 21,
+      "reused_tokens": 0,
+      "recall_passed": true,
+      "markers": [
+        {
+          "name": "MAPLE",
+          "approx_depth_fraction": 0.1,
+          "correct": true
+        },
+        {
+          "name": "COBALT",
+          "approx_depth_fraction": 0.5,
+          "correct": true
+        },
+        {
+          "name": "FJORD",
+          "approx_depth_fraction": 0.9,
+          "correct": true
+        }
+      ],
+      "prefill_ms": 17867.1,
+      "server_first_batch_tokens_per_second": 465.1566286638571,
+      "first_visible_seconds": 17.87617763201706,
+      "decode_tokens_per_second": 38.25,
+      "prompt_sha256": "f7b55602dcc34d017bc64f62acdfa8c5a103791a08d3bcd20479e1bf68501e6c",
+      "result_sha256": "d044bb11b6324f7c2aa7a8003c8edeb2e40ec428b5f22f208de9dca30f1defa5"
+    },
+    {
+      "target_tokens": 32768,
+      "server_counted_prompt_tokens": 32884,
+      "completion_tokens": 21,
+      "reused_tokens": 0,
+      "recall_passed": true,
+      "markers": [
+        {
+          "name": "MAPLE",
+          "approx_depth_fraction": 0.1,
+          "correct": true
+        },
+        {
+          "name": "COBALT",
+          "approx_depth_fraction": 0.5,
+          "correct": true
+        },
+        {
+          "name": "FJORD",
+          "approx_depth_fraction": 0.9,
+          "correct": true
+        }
+      ],
+      "prefill_ms": 70684.8,
+      "server_first_batch_tokens_per_second": 465.2202453709991,
+      "first_visible_seconds": 70.72507382099866,
+      "decode_tokens_per_second": 35.49,
+      "prompt_sha256": "e3ae1f560c32c96598cdb56a60960034ec6ffa56d85a26dc95a405e87c9d6d41",
+      "result_sha256": "8cc507443606ee0b78d46b24f0b1f07ca85d44672d3945b1afc064deb2e761cf"
+    }
+  ],
+  "interrupted_target": {
+    "target_tokens": 131072,
+    "server_counted_prompt_tokens": 131195,
+    "state": "counted; interrupted before completed reply",
+    "recall_passed": null,
+    "reason": "guard detected another assistant build"
+  },
+  "guard": {
+    "clear_samples_before_interruption": 349,
+    "final_sample": "foreign build detected; campaign stopped",
+    "free_vram_mib_min_before_interruption": {
+      "GPU-282e266a-24ac-6fa8-a16d-4281e52b4c0a": 1475,
+      "GPU-704fef60-5280-9b88-fa3d-d11135caf576": 1368
+    },
+    "original_engine_restored": true,
+    "log_sha256": "75fdf84740871869f50941ddc4e34775a0195498ef7bc82024e8f43f50abaa43",
+    "restore_sha256": "ec8531c48de7e4b199aa41197040a5fa2ca12bb1cfe82410d3117e7642e3194d"
+  },
+  "smoke": {
+    "server_counted_prompt_tokens": 636,
+    "recall_passed": true,
+    "receipt_digest_sha256": "1f48a02e0d56cf8a71cc13ada71b8cedca2c3a073e6a3bc554017cade928f005"
+  },
+  "server_log_sha256": "04f6c4e1fa4d6fde30c22f4f0702a33edc4d0b16aab009061d998b1aa8e4457d",
+  "runner_source": "https://github.com/BColsey/fifi/tree/08ac03f871866cfff3245ebfd152fbe4b7b8ca3b/scripts/benchmarks/qwen36-p2p-long-recall-proof",
+  "limitations": [
+    "One synthetic cold recall per completed length; this is not an A/B or a general coding quality test.",
+    "No completed 128k or 256k request in this campaign.",
+    "Prefix reuse was disabled.",
+    "Server prefill timing includes first-batch work; client first-visible timing includes request overhead.",
+    "The campaign ended on guard contention after both recorded results; it is not a wholly clear run."
+  ]
+}

@@ -168,39 +168,52 @@ class RouterFixture(unittest.TestCase):
         ):
             self.assertEqual(source.count(original), 1)
             source = source.replace(original, f"http://127.0.0.1:{server.server_port}")
+        # Keep the selected port reserved until Node has inherited the listener.
+        # Binding and closing a probe socket left a race with concurrent processes.
+        listen = ").listen(PORT, HOST,"
+        self.assertEqual(source.count(listen), 1)
+        source = source.replace(
+            listen, ").listen({ fd: Number(process.env.FIFI_TEST_LISTEN_FD) },"
+        )
         copy = root / "router.mjs"
         copy.write_text(source)
-        with socket.socket() as sock:
-            sock.bind(("127.0.0.1", 0))
-            port = sock.getsockname()[1]
-        env = dict(
-            os.environ,
-            FIFI_PRIMARY_RUN=str(primary),
-            FIFI_SECONDARY_RUN=str(secondary),
-            FIFI_MODEL_ROUTER_PORT=str(port),
-        )
-        env.pop("FIFI_ROUTER_CLOSE_BACKEND_CONNECTIONS", None)
-        if self.close_backend_connections:
-            env["FIFI_ROUTER_CLOSE_BACKEND_CONNECTIONS"] = "1"
-        self.proc = subprocess.Popen(
-            [node, str(copy)],
-            env=env,
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
-        )
-        self.addCleanup(self.stop_router)
-        self.base = f"http://127.0.0.1:{port}"
-        for _ in range(60):
-            if self.proc.poll() is not None:
-                self.fail("model router exited before accepting requests")
-            try:
-                with socket.create_connection(("127.0.0.1", port), timeout=0.2):
-                    pass
-                break
-            except OSError:
+        log_path = root / "router.log"
+        with socket.socket() as listener, log_path.open("wb") as log:
+            listener.bind(("127.0.0.1", 0))
+            listener.listen()
+            port = listener.getsockname()[1]
+            env = dict(
+                os.environ,
+                FIFI_PRIMARY_RUN=str(primary),
+                FIFI_SECONDARY_RUN=str(secondary),
+                FIFI_MODEL_ROUTER_PORT=str(port),
+                FIFI_TEST_LISTEN_FD=str(listener.fileno()),
+            )
+            env.pop("FIFI_ROUTER_CLOSE_BACKEND_CONNECTIONS", None)
+            if self.close_backend_connections:
+                env["FIFI_ROUTER_CLOSE_BACKEND_CONNECTIONS"] = "1"
+            self.proc = subprocess.Popen(
+                [node, str(copy)],
+                env=env,
+                pass_fds=(listener.fileno(),),
+                stdout=log,
+                stderr=subprocess.STDOUT,
+            )
+            self.addCleanup(self.stop_router)
+            self.base = f"http://127.0.0.1:{port}"
+            # The listen callback proves that Node owns the socket and is ready.
+            # A TCP probe alone can succeed against the inherited listener early.
+            ready = f"model router on 127.0.0.1:{port} ->"
+            deadline = time.monotonic() + 10
+            while time.monotonic() < deadline:
+                output = log_path.read_text(errors="replace")
+                if ready in output:
+                    break
+                if self.proc.poll() is not None:
+                    self.fail(f"model router exited during startup: {output}")
                 time.sleep(0.05)
-        else:
-            self.fail("model router did not start")
+            else:
+                self.fail(f"model router did not become ready: {output}")
 
     def stop_router(self):
         if self.proc.poll() is None:
