@@ -40,9 +40,13 @@ use super::native;
 use crate::EngError;
 use crate::kernels::cuda::DeviceRange;
 
+/// The transport's payload ceiling, in f32 values: the largest single
+/// exchange the ring accepts (and the chunk driver's row cap basis).
+pub(crate) const MAX_VALUES: usize = native::peer_ring::MAX_VALUES;
+
 /// Bytes of slot header before the payload. Matches `kHeaderBytes` in
 /// `native/peer_ring.cu`.
-pub(crate) const HEADER_BYTES: usize = 128;
+const HEADER_BYTES: usize = 128;
 /// Payloads are allocated at the f32 stride so the fp32 diagnostic mode
 /// needs no second mailbox.
 const VALUE_BYTES: usize = 4;
@@ -120,6 +124,25 @@ impl RingMode {
     fn f32_payload(self) -> bool {
         matches!(self, RingMode::F32)
     }
+}
+
+fn check_exchange_count(
+    layout: MailboxLayout,
+    count: usize,
+    mode: RingMode,
+) -> Result<(), EngError> {
+    if count == 0 || count > layout.max_values {
+        return Err(bad(format!(
+            "an exchange of {count} values exceeds the mailbox payload of {}",
+            layout.max_values
+        )));
+    }
+    // Refuse before any device has published: FP16 still uses the
+    // single-block publisher and keeps its previous payload limit.
+    if mode == RingMode::F16 && count > native::peer_ring::MAX_F16_VALUES {
+        return Err(bad("an fp16 exchange exceeds its payload limit".into()));
+    }
+    Ok(())
 }
 
 /// The mailboxes and sequence state of one device set. Not `Send`: the
@@ -240,12 +263,7 @@ impl PeerRing {
                 "partials, outs and statuses are one range per device".into()
             ));
         }
-        if count == 0 || count > self.layout.max_values {
-            return Err(bad(format!(
-                "an exchange of {count} values exceeds the mailbox payload of {}",
-                self.layout.max_values
-            )));
-        }
+        check_exchange_count(self.layout, count, mode)?;
         let (seq, next) = self.take_seq()?;
         let bytes = count * VALUE_BYTES;
         if (partials
@@ -451,6 +469,21 @@ impl PeerRing {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn wide_f32_exchange_does_not_extend_the_fp16_bound() {
+        let layout = MailboxLayout::new(2, MAX_VALUES).expect("wide layout");
+        assert!(check_exchange_count(layout, MAX_VALUES, RingMode::F32).is_ok());
+        assert!(
+            check_exchange_count(layout, native::peer_ring::MAX_F16_VALUES, RingMode::F16).is_ok()
+        );
+        assert!(
+            check_exchange_count(layout, native::peer_ring::MAX_F16_VALUES + 1, RingMode::F16)
+                .is_err()
+        );
+        assert!(check_exchange_count(layout, MAX_VALUES + 1, RingMode::F32).is_err());
+        assert!(check_exchange_count(layout, 0, RingMode::F32).is_err());
+    }
 
     #[test]
     fn the_layout_tiles_slots_by_source_then_parity() {
@@ -702,6 +735,78 @@ mod device_tests {
             per * 1e3,
             per * 1e3 * 80.0,
         );
+    }
+
+    /// Exercise the widened f32 limit and both parity slots on physical peers.
+    /// Different values per round expose a stale-slot read; the outputs are
+    /// checked in full on both cards after all exchanges have been queued.
+    #[test]
+    #[ignore = "requires two physical peer-enabled CUDA devices"]
+    fn wide_f32_exchanges_reuse_slots_on_physical_peers() {
+        const NAME: &str = "wide_f32_exchanges_reuse_slots_on_physical_peers";
+        const N: usize = MAX_VALUES;
+        const ROUNDS: usize = 3;
+        assert!(device_present(NAME), "{NAME}: CUDA devices are required");
+        let admission = served_admission();
+        let contexts = [
+            CudaContext::with_admission_on(0, &admission).expect("context 0"),
+            CudaContext::with_admission_on(1, &admission).expect("context 1"),
+        ];
+        crate::kernels::cuda::peer::enable_peer_access(&[0, 1]).expect("peer access");
+        let streams = [
+            contexts[0].stream().expect("stream 0"),
+            contexts[1].stream().expect("stream 1"),
+        ];
+        let ring = PeerRing::new(&contexts, N).expect("wide ring");
+        let statuses = [
+            upload_f32(&contexts[0], &streams[0], &[0.0]).expect("status 0"),
+            upload_f32(&contexts[1], &streams[1], &[0.0]).expect("status 1"),
+        ];
+        let inputs: Vec<[DeviceBuffer; 2]> = (0..ROUNDS)
+            .map(|round| {
+                let value = (round + 1) as f32;
+                [
+                    upload_f32(&contexts[0], &streams[0], &vec![value; N]).expect("input 0"),
+                    upload_f32(&contexts[1], &streams[1], &vec![value * 10.0; N]).expect("input 1"),
+                ]
+            })
+            .collect();
+        let outputs: Vec<[DeviceBuffer; 2]> = (0..ROUNDS)
+            .map(|_| {
+                [
+                    contexts[0].allocate(N * 4).expect("output 0"),
+                    contexts[1].allocate(N * 4).expect("output 1"),
+                ]
+            })
+            .collect();
+        for round in 0..ROUNDS {
+            ring.exchange_sum(
+                &contexts,
+                &streams,
+                &[whole(&inputs[round][0]), whole(&inputs[round][1])],
+                &[whole(&outputs[round][0]), whole(&outputs[round][1])],
+                &[whole(&statuses[0]), whole(&statuses[1])],
+                N,
+                RingMode::F32,
+            )
+            .expect("queue wide exchange");
+        }
+        for round in 0..ROUNDS {
+            for card in 0..2 {
+                let got = download_f32(&outputs[round][card], &streams[card], N).expect("output");
+                let expected = (round + 1) as f32 * 11.0;
+                assert!(
+                    got.iter().all(|&value| value == expected),
+                    "round {round}, card {card}: stale or incorrect output"
+                );
+            }
+        }
+        for card in 0..2 {
+            assert_eq!(
+                status_of(&statuses[card], &streams[card]).expect("status"),
+                0
+            );
+        }
     }
 
     #[test]
