@@ -1,0 +1,94 @@
+{
+  "description": "Test-only Qwen 3.6 P2P chunk prefix snapshot diagnostic; this does not enable production reuse.",
+  "source_commit": "bfd5bee3d7793c43e5fd60f111056c19c52dce8a",
+  "integration_base": "76dec8a61d040efa97beefe273bed8dc9e68ff57",
+  "test_binary_sha256": "bfe13a23a793d887a9a35328477b68a06263f19392c3d90530bce434b3b52d52",
+  "build_receipt_sha256": "941df4e100f040a6f62e46572d575c08d9975d4366f1c12056d651fae8d09ddd",
+  "target": "Linux release, native-cuda, sm86",
+  "cuda_driver": "615.78.08",
+  "devices": [
+    "NVIDIA GeForce RTX 3060 12 GB",
+    "NVIDIA GeForce RTX 3080 10 GB"
+  ],
+  "build_and_host_checks": {
+    "host_tests_passed": 10,
+    "guard_runner_cpu_tests_passed": 33
+  },
+  "fixture": {
+    "layers": 2,
+    "layers_attention": [
+      "DeltaNet",
+      "Full"
+    ],
+    "vocabulary": 4096,
+    "context_tokens": 256,
+    "chunk_rows": 32,
+    "prompt_tokens": 100,
+    "kv_mode": "int8-g32",
+    "weight_fixture": "deterministically generated Q4_K GGUF",
+    "cache_construction": "test-only prefix store attached before chunk; test-only path identity"
+  },
+  "checks": [
+    "wrong prefill path and wrong chunk size miss",
+    "matching path restores the intended cut",
+    "same split: logits, both card KV bytes and DeltaNet state equal bit for bit",
+    "natural split: record differing logits and greedy winners"
+  ],
+  "results": [
+    {
+      "cut": 31,
+      "aligned_state_and_logits_bitwise_equal": true,
+      "natural_changed_logits": 0,
+      "natural_max_abs_printed": 0.0,
+      "restored_winner": 3256,
+      "natural_winner": 3256
+    },
+    {
+      "cut": 32,
+      "aligned_state_and_logits_bitwise_equal": true,
+      "natural_changed_logits": 0,
+      "natural_max_abs_printed": 0.0,
+      "restored_winner": 3256,
+      "natural_winner": 3256
+    },
+    {
+      "cut": 33,
+      "aligned_state_and_logits_bitwise_equal": true,
+      "natural_changed_logits": 0,
+      "natural_max_abs_printed": 0.0,
+      "restored_winner": 3256,
+      "natural_winner": 3256
+    },
+    {
+      "cut": 59,
+      "aligned_state_and_logits_bitwise_equal": true,
+      "natural_changed_logits": 0,
+      "natural_max_abs_printed": 0.0,
+      "restored_winner": 3256,
+      "natural_winner": 3256
+    }
+  ],
+  "runs": {
+    "smoke": {
+      "test": "family::qwen36::cuda::card_chunk_device_tests::card_chunk_matches_the_per_token_path_on_physical_peers",
+      "test_log_sha256": "4cd76467e609e7bac1ab32093414e5c4d74139ae5f95f47ef6a760ee830e9087",
+      "guard_samples": 10,
+      "guard_samples_clear": true,
+      "original_engine_restored": true
+    },
+    "diagnostic": {
+      "test": "family::qwen36::cuda::card_chunk_device_tests::chunk_prefix_turn_chain_diagnostic_on_physical_peers",
+      "test_log_sha256": "9562cf29e0827deba4f1d3b10a6425e6d8f2f86400a1b7a4e3112a49639a7e72",
+      "guard_samples": 10,
+      "guard_samples_clear": true,
+      "original_engine_restored": true
+    }
+  },
+  "limitations": [
+    "No full-model weights, served requests, real long context, coding-quality, or throughput were tested.",
+    "The synthetic test lacks an explicit negative control proving its logits are sensitive to a changed context.",
+    "The natural-split finding applies only to this single deterministic fixture.",
+    "The production P2P chunk path still disables prefix reuse."
+  ],
+  "reproduce": "Build the native-cuda release library test executable with sm86; expose exactly two peer-enabled GPUs, then run the named ignored tests individually with --exact --ignored --test-threads=1 --nocapture under a device lease."
+}

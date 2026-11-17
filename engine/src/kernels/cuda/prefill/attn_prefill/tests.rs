@@ -635,6 +635,17 @@ impl Fx {
         data: &Data,
     ) -> Result<Self, EngError> {
         let ctx = CudaContext::new()?;
+        Self::with_context_and_data(ctx, shape, split, with_gate, with_status, data)
+    }
+
+    fn with_context_and_data(
+        ctx: CudaContext,
+        shape: AttnPrefillShape,
+        split: CpfAttnSplit,
+        with_gate: bool,
+        with_status: bool,
+        data: &Data,
+    ) -> Result<Self, EngError> {
         let stream = ctx.stream()?;
         let q_len = shape.m * shape.n_head * shape.head_dim * 4;
         let cache = shape.cache_rows * shape.n_kv_head * shape.head_dim * 2;
@@ -1590,6 +1601,62 @@ fn attn_prefill_matches_the_f64_host_reference() {
             "T7 p0 {p0} m {m} late {late}: worst |Δout| {worst:.3e} of the derived bound \
              {bound:.3e} at {worst_at:?}"
         );
+    }
+}
+
+/// A typed part launch must arm the current device even after the same
+/// geometry has already been used on another device in this process.
+#[test]
+#[ignore = "requires two physical CUDA devices"]
+fn attn_prefill_arms_each_physical_device_before_launch() {
+    const NAME: &str = "attn_prefill_arms_each_physical_device_before_launch";
+    assert!(
+        testkit::device_present(NAME),
+        "{NAME}: two CUDA devices are required"
+    );
+    let shape = qwen(8, 8, 0);
+    let split = CpfAttnSplit {
+        max_splits: 1,
+        min_keys: 32,
+    };
+    let input = data(shape.m, shape.cache_rows, 0x7_0036, 0.2, 0.4);
+    let admission = crate::family::project::cuda::served_admission();
+    let outputs: Vec<Vec<f32>> = [0, 1, 0]
+        .into_iter()
+        .map(|device| {
+            let ctx = CudaContext::with_admission_on(device, &admission)
+                .unwrap_or_else(|error| panic!("{NAME}: device {device}: {error:?}"));
+            let fx = Fx::with_context_and_data(ctx, shape, split, false, false, &input)
+                .unwrap_or_else(|error| panic!("{NAME}: fixture on device {device}: {error:?}"));
+            fx.run()
+                .unwrap_or_else(|error| panic!("{NAME}: launch on device {device}: {error:?}"));
+            println!("{NAME}: completed device {device}");
+            fx.out_values()
+        })
+        .collect();
+    let bound = 2f64.powi(-9) * v_scale(&input.v);
+    for t in 0..shape.m {
+        for h in 0..shape.n_head {
+            let reference = ref_row(
+                &input.q[(t * shape.n_head + h) * D..][..D],
+                &input.k,
+                &input.v,
+                h / GROUP,
+                t + 1,
+                f64::from(SCALE),
+            );
+            for d in 0..D {
+                for (run, output) in outputs.iter().enumerate() {
+                    let value = f64::from(output[(t * shape.n_head + h) * D + d]);
+                    assert!(
+                        value.is_finite() && (value - reference[d]).abs() <= bound,
+                        "{NAME}: run {run}, t {t}, head {h}, dim {d}, value {value}, \
+                         reference {}, bound {bound}",
+                        reference[d]
+                    );
+                }
+            }
+        }
     }
 }
 

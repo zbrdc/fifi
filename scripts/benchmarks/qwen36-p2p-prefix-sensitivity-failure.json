@@ -1,0 +1,26 @@
+{
+  "description": "Failed context-sensitivity negative control for the synthetic P2P prefix rig; no production changes.",
+  "source_commit": "64ecc9e5c86e71faf86c74055e27da84b8edfdff",
+  "test_binary_sha256": "9d6107bb6c3c5f7b63245e83b39954b9deb372f49f76a7796ab7961da27e58dc",
+  "build_receipt_sha256": "6828d73216268c5de984a3f3f22624add4d7bb9960c662034f07c77ce050cbc8",
+  "fixture": "Deterministic two-layer Q4_K GGUF; 100 prompt tokens; 32-row chunks; 256-token context; int8-g32 KV.",
+  "devices": [
+    "NVIDIA GeForce RTX 3060 12 GB",
+    "NVIDIA GeForce RTX 3080 10 GB"
+  ],
+  "changed_context": "Changed first 59 tokens, retaining length and final token; altered cache key missed.",
+  "result": {
+    "changed_logits": 0,
+    "max_abs_printed": 0.0,
+    "sensitivity_assertion": "FAILED",
+    "same_boundary_restore_checks_before_failure": "passed at cuts 31, 32, 33, 59",
+    "natural_boundary_changed_logits_at_each_cut": 0
+  },
+  "guard_samples": 10,
+  "guard_samples_clear": true,
+  "original_engine_restored": true,
+  "test_log_sha256": "378c30a74a64c28fdeb076f73a2232c2a18a11020fbe965ef9a8f2391d5bf318",
+  "runner_log_sha256": "de1404370fc91ed8b9837ca62413e6df487cfe3792a67c8f82d25aa1179db04a",
+  "interpretation": "The fixture failed to demonstrate sensitivity to its earlier context. Its zero natural-boundary drift does not establish correctness of P2P chunk prefix reuse. This finding alone does not establish a defect in real-model inference.",
+  "production_chunk_prefix_reuse_enabled": false
+}

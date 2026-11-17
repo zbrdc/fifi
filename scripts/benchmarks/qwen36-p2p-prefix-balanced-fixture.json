@@ -1,0 +1,103 @@
+{
+  "description": "Context-sensitive, test-only Qwen 3.6 P2P chunk prefix snapshot diagnostic; production reuse remains disabled.",
+  "source_commit": "a8ae6014bd22781843c4f13a231fb04c1dc3cb78",
+  "integration_base": "76dec8a61d040efa97beefe273bed8dc9e68ff57",
+  "test_binary_sha256": "95b6a0ca5e9a7c4126189fce3cd6865e8c7f6c92e45508d54a15efe93e390033",
+  "build_receipt_sha256": "0fa69932b57e1256fd828920a9d88d8fa19f8d0c0cf03778c2f9c53eb532d784",
+  "target": "Linux release, native-cuda, sm86",
+  "cuda_driver": "615.78.08",
+  "devices": [
+    "NVIDIA GeForce RTX 3060 12 GB",
+    "NVIDIA GeForce RTX 3080 10 GB"
+  ],
+  "build_and_host_checks": {
+    "host_tests_passed": 11,
+    "guard_runner_cpu_tests_passed": 33
+  },
+  "fixture": {
+    "layers": 2,
+    "layers_attention": [
+      "DeltaNet",
+      "Full"
+    ],
+    "vocabulary": 4096,
+    "context_tokens": 256,
+    "chunk_rows": 32,
+    "prompt_tokens": 100,
+    "kv_mode": "int8-g32",
+    "weights": "deterministic Q4_K GGUF with balanced signed values",
+    "cache_construction": "test-only prefix store attached before chunk; test-only path identity"
+  },
+  "checks": [
+    "wrong prefill path, wrong chunk size and altered cache key miss",
+    "matching path restores the intended cut",
+    "same split: logits, both card KV bytes and DeltaNet state equal bit for bit",
+    "natural split: report differing logits and greedy winners",
+    "changed-context negative control changes logits"
+  ],
+  "results": [
+    {
+      "cut": 31,
+      "aligned_state_and_logits_bitwise_equal": true,
+      "natural_changed_logits": 4096,
+      "natural_max_abs_printed": 0.002999067,
+      "restored_winner": 3632,
+      "natural_winner": 3632
+    },
+    {
+      "cut": 32,
+      "aligned_state_and_logits_bitwise_equal": true,
+      "natural_changed_logits": 0,
+      "natural_max_abs_printed": 0.0,
+      "restored_winner": 3632,
+      "natural_winner": 3632
+    },
+    {
+      "cut": 33,
+      "aligned_state_and_logits_bitwise_equal": true,
+      "natural_changed_logits": 4096,
+      "natural_max_abs_printed": 0.003262401,
+      "restored_winner": 3632,
+      "natural_winner": 3632
+    },
+    {
+      "cut": 59,
+      "aligned_state_and_logits_bitwise_equal": true,
+      "natural_changed_logits": 4096,
+      "natural_max_abs_printed": 0.003364086,
+      "restored_winner": 3632,
+      "natural_winner": 3632
+    }
+  ],
+  "negative_control": {
+    "changed_earlier_tokens": 59,
+    "same_length_and_final_token": true,
+    "changed_logits": 4096,
+    "max_abs_printed": 0.004877329,
+    "passed": true
+  },
+  "runs": {
+    "smoke": {
+      "test": "family::qwen36::cuda::card_chunk_device_tests::card_chunk_matches_the_per_token_path_on_physical_peers",
+      "test_log_sha256": "d0aaaaed62fe7047e5b050512ada97f75ddfc04ce4be6bdcff33267fd9790421",
+      "guard_samples": 10,
+      "guard_samples_clear": true,
+      "original_engine_restored": true
+    },
+    "diagnostic": {
+      "test": "family::qwen36::cuda::card_chunk_device_tests::chunk_prefix_turn_chain_diagnostic_on_physical_peers",
+      "test_log_sha256": "f657dbdbb9681ad9a20521a21b7282a08609e78eb03cd648b624df44ed42debf",
+      "guard_samples": 10,
+      "guard_samples_clear": true,
+      "original_engine_restored": true
+    }
+  },
+  "limitations": [
+    "No full-model weights, served requests, real long context, coding-quality, or throughput were tested.",
+    "Natural-boundary logit comparison does not compare full states and represents one synthetic fixture.",
+    "Matching greedy winners do not establish equivalent generation or output quality.",
+    "The production P2P chunk path still disables prefix reuse."
+  ],
+  "prior_negative_control_failure": "qwen36-p2p-prefix-sensitivity-failure.json",
+  "reproduce": "Build the native-cuda release library test executable with sm86; expose exactly two peer-enabled GPUs, then run the named ignored tests individually with --exact --ignored --test-threads=1 --nocapture under a device lease."
+}

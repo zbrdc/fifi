@@ -40,9 +40,13 @@ use super::native;
 use crate::EngError;
 use crate::kernels::cuda::DeviceRange;
 
+/// The transport's payload ceiling, in f32 values: the largest single
+/// exchange the ring accepts (and the chunk driver's row cap basis).
+pub(crate) const MAX_VALUES: usize = native::peer_ring::MAX_VALUES;
+
 /// Bytes of slot header before the payload. Matches `kHeaderBytes` in
 /// `native/peer_ring.cu`.
-pub(crate) const HEADER_BYTES: usize = 128;
+const HEADER_BYTES: usize = 128;
 /// Payloads are allocated at the f32 stride so the fp32 diagnostic mode
 /// needs no second mailbox.
 const VALUE_BYTES: usize = 4;
