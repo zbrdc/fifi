@@ -1,0 +1,1103 @@
+{
+  "schema_version": 1,
+  "generated_at": "2026-11-17T04:41:17.575354+00:00",
+  "purpose": "Publication inventory for all pending local commits and source WIP. Preservation, integration, measurement, qualification and default enablement are separate states.",
+  "upstream_main": "3f4bd6ae71d78b4ce37a37564e6c53d71a4d49a0",
+  "local_main": "48b9a62f726c8d0d4d4ab7cd02974f95e73e4544",
+  "coverage": {
+    "previously_unpublished_commits": 213,
+    "preservation_heads": 49,
+    "original_commits_unpreserved": [],
+    "unpublished_local_commits_before_manifest": [],
+    "original_source_worktrees_unchanged": true
+  },
+  "preserved_commits": [
+    "039181cf24f2256adb5004d0e88959241bb32f9e",
+    "044188e2baed4d5ffdb8ecf76d436322643220a9",
+    "0474c0d04ea9ab3c8972a47ea77e3aaf08536349",
+    "06d5f82f348371243641c4309f0cebe3da944143",
+    "07dda740c23e5e3aa8379d2d6deccbbd25fd6f57",
+    "08aa8242a60aca91bc828cddef13aef2c4654280",
+    "0d2284d385433c272ede1c9ef86f27c79dc68194",
+    "0d8a065bccfbc408a02710c3a26a6c72c79731c3",
+    "0da3ea18be9abc286f5d0721badd71ae75b2d1bd",
+    "0e15f8fb1db74a31c285355f5e8b15ec268e36e5",
+    "0e6d4e30c148eb1764afa50514a8d647e23ffe9f",
+    "0f9b29588c3b2c5299ef64b7f005a092e281729e",
+    "0ff36db3d1b03f5d57d7d3a3082ce5e2038ceb2a",
+    "112b853391560fc9d6e9abcf486570cc27df86de",
+    "13f082865020552ea4678609e8affd00329f0154",
+    "16b28915717e7f5511e25a9d80595483b9e38282",
+    "1714c174659b5ff47786ebfe292da321e50ffeb5",
+    "1743ebf6609adcf4aaffb28241c449c540c85c3f",
+    "19076308d48a150e6423e9984cc9423e1622d11d",
+    "190a252895b8f97fe30db442da3f7a385b7c94c8",
+    "1a73ab8582686e2310c36b55f78515f864527e25",
+    "1abd0d3b0cff7bdfb47d61403985370b103f4adf",
+    "1b44231bb477121d9f12dddf0d52248d22da0d65",
+    "1f2f4dcd54cf1c9aadddca525424e8b2b30daea3",
+    "21942d3722987d70f316cafe75dc1434347f3af0",
+    "238bbaf342be2f0d245f6a23fc94b6b801ced0c1",
+    "25aa9d07e961d97e215367a7b65359455e2b6f8b",
+    "25cabcd86f00f0049e16cab5627458531c896e72",
+    "279a52a1966fb173923397f21d19ebf18cd16f3a",
+    "29fadcd6e6e735875fe84ee8e1c7a60ab9991c76",
+    "2c198dc45e8bd52db1b04923f65a4314e452bd14",
+    "2c831d844596c485f8340b1c41abd1e721d3c918",
+    "2d6fa429e58c7c1998381455aba5207f7c353b4d",
+    "30aeb19cd60aa2b0fd626f8e14ed3ef06c8093c0",
+    "34190eed334f3f1dece092cf980fdfec05eee543",
+    "36a5568bb6b43767806dc6124707b94f975f4e24",
+    "37062f45402b364ad2394ffa0bc509a7967e6839",
+    "3741af627528be2b2bafa3d16147a7817e27e20c",
+    "38745ebcb3d5d5e204532b6a068b85c2fdc297da",
+    "38fffa0185f5718d7829455d7ccdbd08135c8c08",
+    "3ab367cbd13967a694997855df6d726f6c648fbb",
+    "3ae54ce2b41f172ef8c2a0ae1990c2c558d50b52",
+    "3b6e52f00744819e9f4fb39a37c54bd591d52e9f",
+    "3c9c3d8c3d16d88f6877a57fd65dedee7d4423a5",
+    "3ca1e50d3cc349acce139d2a562a2ea8ccd39acf",
+    "3d5a98ded58f04596a47a721822e4efe6bfc4003",
+    "3e74551a5dc8de26ec4884d78f3788bb31b1b511",
+    "413d3639e1ce15665fe7eb8eba5718c16ac571da",
+    "4245b64240cc3a4c1c4379105ecd31ab68bdb4c5",
+    "42b092f7f2f0a5a04ffa907832aa0f3ee41c5c1c",
+    "42c5197a88ccf4e4a10315ff8e81c00ef3a7b489",
+    "4358c6821464b29e9e7d6e0e8667dbad0c897b4e",
+    "43d54675187cb31d338cc33e541f2d6bd4e5a657",
+    "4647942670a1a45810faad6eaf933e717023bbea",
+    "4769585c91c79fd948b1cda7b006ed9293e88aae",
+    "47aa030195de41e38e480a0849b3a55d26dc5f0c",
+    "481bbfdbf4c4f86b9c1c9203f43de46fd997df4e",
+    "48a29c250aa0f03b2c9c8b6a51918149bf96ebcd",
+    "48b9a62f726c8d0d4d4ab7cd02974f95e73e4544",
+    "4a466aa79f6d9f41fe9c5e204958eefaed346c39",
+    "4bd29b6a8addec57fc0b6cd407fd18b8c03f6e86",
+    "4d57c80d96e7e197ce48c10637418002624bf33f",
+    "50ba0cce07b5b119817dc7753f67a84581c106ee",
+    "521e0882461d5fab4078d477b46ff074c40fcef0",
+    "52a85f4a0dd9141e0076dc544491486b3ba99752",
+    "52b4d46def8f7fb510db7fa2fe8a8365a9d656e4",
+    "536f7bdc1f0eae3ada9029745000016c5180957c",
+    "53a730a3633ed127760f8458f0e25c2b0db030a3",
+    "5459a6b2a290cab665583c4182787409f0902981",
+    "55b2fb29d8ad916c2a5f6d681e5cc18f298f9516",
+    "55badf0391f243e93bc532b7ece30820ff81a7fd",
+    "5760afc6c4103963f8602fbf1177738dc570e27d",
+    "57ab15bb8bc637b184c82477a5dc54045c5f49a0",
+    "580d054d4968f924ede50a99c4d69703357c5810",
+    "5823f1614443b34854678313635c69eaa3467f92",
+    "5a742c4f318aaf1b13de00824a95e4cbe69c9ca8",
+    "5b282e3de081a3347871715a9e546849e2627aed",
+    "5b89efc27faa92ac51ddec351d6b0587d86de344",
+    "5de50f30e980ac164a260f89aaec6987a9f66aa8",
+    "5fa05f091486a38733a3cc777599479518cc86da",
+    "5fa18d43407d6b0a10b13f0b6b1f8fbb4b29a058",
+    "5fd21c9cd441cae40abcb4759c57afb1908aeaf6",
+    "62273b250340de3b81d9901ddde7ab0b13ac67f9",
+    "633936dd753ab0a3110dc36ea5902a07a5c4cced",
+    "6424390644e17283f034635a4dd932fd18eaab33",
+    "6463caff443fb1a31708d70f0a8244a0eec174a5",
+    "66633a16abfd7c1e16c0afc4a22582dbc1d871e5",
+    "674253794c7462d6df48272e4148a1d9704c772b",
+    "677b6d0ef9b416b2dae49a23f96e89d609bdd004",
+    "67ec883490e0a087d2f03adf2bdda3a0355e9f42",
+    "6936798f5963eb65e168b85d6763de79e40fad1d",
+    "696c49a76a11f9545d8b943c46ebf61aa432285c",
+    "69b1a8692d7272407a603599d96e82a749d288fd",
+    "6c67c515badce1fd8f00cac6048b560f4174aa30",
+    "6d4f6eaddd34816893e9f583e2ba9836dd1bf7ad",
+    "6d8c3c49b73e5ca6aab15b17cb6f2b6f4e562ebb",
+    "6e4cd38f13d175e04126e580663ba72820d19b11",
+    "6e75fe0999225c8e7e9360b639a3384fb1c54b84",
+    "6ebfe7900c7dbf0932b3d8ec54cb09db79a4d621",
+    "6ed6112e7a29af4f4619ac993eb795f9896ef0fc",
+    "70e843a09289c9689d307d1b4d973e1e7f46856c",
+    "70f8153926767529e53210f914aedbac6db27c5e",
+    "723c1494b01823fc2cd5860b37814600e8d95daa",
+    "72fef0ced45725b49ce539a40728f6d8420bb9d2",
+    "74655ef1f2f0ca53c0551703102ab8f24a49ec69",
+    "751886a451e2ef01eb9cb368d12a1a46232c3da3",
+    "78d77a1d10d3567cabf087b99f343c6750de22b9",
+    "7ef5c19b3d69e0aa58578a56796bac1215b64ea6",
+    "7fe38630416f646f7bf594d47e9e0dce3d239a61",
+    "8154063ef0c84bda55d8ab4c2d14f3f184cbcf08",
+    "8180cd68172385652fc47a829561541ac1436353",
+    "83763d05ec084feaf23f0079dea021b8eb49a14b",
+    "85011851479233a9e1611c6f7b468ce39307bc21",
+    "86175ff5eb81f0d7859adab91c9792eb6b0a9c12",
+    "88ac044d2b1b14ced3cb9c033da9dd85e71dd0ae",
+    "88d8a3e3831dd6194fa8d554f1797302c099d3b2",
+    "8bc24e2ef6d8d05476ab01a35d91b9b9825bbaa3",
+    "8e31edd5ccfc94ae32a0b01376e03e43b2ff9a01",
+    "8f2822653ae669e6ea049b92c2fff3372c3a3c09",
+    "8f52cdafa1570c50215a368a82faaa8bf27c39db",
+    "925886e246f2ed19d9cb70d8fe5c401d2936daff",
+    "96bcd3c05de98f39d73151e151c3200c9567733c",
+    "99cb6990c855a0c8af54e3d2c3c8076408e90947",
+    "9a39cf44df8c8f93cd99f45358731ea2b1a6cfdd",
+    "9ae8611f37cd77f383ab3f9fe4e2691633758f74",
+    "9ee3c8dcef94a8dd79403816a5ca3b3d962781f3",
+    "9f66b6850c48b50e19ff08ba0a7a6318a7cf23e3",
+    "a122520494ce964dd0f139aa1671895a8eddb5f4",
+    "a1c2f2af99748952b5234b5ce08c4fffb090f7a9",
+    "a24413e240e288a8c44b6f226db589c5a71fb061",
+    "a24b364bfa88d542b30bd7f351849f27cdabc9bc",
+    "a29fd59247b59262966bdf0eaff30f7440d8bf41",
+    "a36c3e9616adef91270456bb481ead75c016ba8d",
+    "a3c59e9285838f9e3db7f14c2452bfa38ba03a41",
+    "a5316981cac8a7d490d0cfa7f14e3d52dc40bd5c",
+    "a552c9bf5df62387c0190c70b5d129dedfca0c52",
+    "a55d8cfee15e6c91301a428cb320de25b4e36776",
+    "a69304c95f93c2f475472ea27280b7455a5e3da3",
+    "a79de8bda5f7577d4616b676059e37b4f002dec9",
+    "a8b90af1b0ff5d7124d5cea04e5a6ba050ffb383",
+    "aa073b4523f01b796227b69db6bc32bf496161fd",
+    "aae3e5bfec7c1a21be520aa43e3b5acb5eec30d2",
+    "ad97242f7bdec268ff869a0a8bd9461dd4dc7047",
+    "affbc42b923897f9f78d83748c0ce2da957a57b5",
+    "b037e02289d46a8a484cd2da80953ccdd030fcd9",
+    "b0880cbcd42ba1f71d54912643e48077242b522e",
+    "b2c9ea6b47271917723f32e7610ae60e2af1a828",
+    "b313233f0dae1656b05c353b7ef57c1efae3b0cd",
+    "b3614c2a37cc43576e2cd948b7ecf8671b326378",
+    "b3c8cbdf7265a565ed382e52305761ab75df70fb",
+    "b69036723a3b28c311490f80fc7aeefb9533d30a",
+    "b72ff2e7a40696d85533c19a15f1280db71b9750",
+    "b7bfacf1e9128757f6d0bad23b1a8394ed4c2bf7",
+    "b7c2d607ff0c3fc83cea4bd461431c25c26e42f5",
+    "ba76882cb0e59d4b76cd2178a53773015184a6d9",
+    "bbbfcd019c4a1842475771b226e0534ee6934a71",
+    "bd28f6ba08469d0df79068cf5e3dc23e984bc4d9",
+    "be9eb5536e60fe647bd59f65c07c5a4b573a2958",
+    "bfca57aee5ed09aa5f7919c92ce03c0153613956",
+    "c146ecbf7bdbfe0e851d69c588c067d4f2dea562",
+    "c27dea7bc6ae88c70d14620af1d2816619822632",
+    "c5e88a700831d1b5f0c7ac188125899232c0dbc3",
+    "c90438954e5e5c8b55161d56275ab0d21b3878f9",
+    "c995ff1008efdc9c2072bd8432d6f6cc8e0a7b74",
+    "cad6088b0af573b18526f93d220ad70e294159f2",
+    "cc08006096e4a8b3849815ca3f84ce2178837535",
+    "cc0c91640dcc0f24736fb74faf877e09aa98ba84",
+    "cc24f23e63b444bdfa6770d033d971352ca1cbe5",
+    "cd0e87df28543b4c889bc1aef6bb35261a598562",
+    "cd32921e3ec31202a0177fb5895e749a522e93a3",
+    "ce00cd00ef8c34faf18ef6f80c7f8d3b8d95d4cf",
+    "cec7a685ec1c5628a4c82b7f5354cfe2759f292e",
+    "d0b4b1e210b2a2e91b5ca12b5613bbdd29404ecd",
+    "d1a1c53fcc8a126e1972e59e3e8d00f50c253770",
+    "d1deb58ff5ea5a64d5b9bfc4bd0c7cf4182788d5",
+    "d20106dad0af2abae98583e884a5a6919404e01c",
+    "d387f30c724c35600fbe44097f2ed2e7ad00ecb3",
+    "d9d98d678615d96455dd5a8becdf4d73c140a91c",
+    "dcd66ed8b6041787b980b6d5a8e4af8daee29d95",
+    "e23c0a5d35f6a0f0cf2c7b3d52ab6b6d2003d876",
+    "e27691b36c7cc1ce024b1eb11ffbf5c8813c54b7",
+    "e3aea00a98b969a4da96023771702b15dba9495f",
+    "e53557d9e37a2df58ce3ed87c9095e535b77f954",
+    "e59f19babcadd6c8aaa530dc1aa0836cd5b55214",
+    "e801f5a59414dd4df3465e9794c6a209e52a44ab",
+    "e808824b13003ecbaf49b877305c24a83f0049d8",
+    "e8217e4d637f9ad9189069eeb76052651e04dee7",
+    "e863e57802e17362db6806957a5148cb9545af70",
+    "ea36ce91bf15b78a665d42f2d10a513508ea442c",
+    "ead0445ad2a4fb1b6c10c296768e01fc7a54422d",
+    "eb4fe9e8da4a4aa16886b87f622cf38d206d26b2",
+    "eb80ef0ee7f5c816e97848a52c3cac894ef586b2",
+    "ec44a5f0bc2faa9e725cfff8ec172840be1e5284",
+    "ef5115c50521787123b57374cbd860cd80278a32",
+    "ef52de618a234cabf7283a751888fba631da0f04",
+    "efce748d5ca2d5ed1a48bed5842fda18ba5b3e77",
+    "f0b782cb311e0189411599c5d2708e14ec0b7f12",
+    "f1a22759f19b2e975a5ff7d2c1e9e2c953fe6fa5",
+    "f24d59bfd47b0186f0e390d2bb54f6ec4c0bf58e",
+    "f2fbb0305ff48bef7f0d6d3bf659e94cc54d88d1",
+    "f3bb0c42f1e217b2da34f25ccc6daac5799c0a69",
+    "f5f1d588a0c78c54c74ca979a85da18b86b228ee",
+    "f7eced37fb0d7d33e5fff84fae654e517d1e1d44",
+    "fa49adbaa14a007698e0540f7525195567c81af0",
+    "fc3ffe63c7cebf8df0111ce3b1d6abee3e664cb6",
+    "fc6cf900d6ff47c11417824e364eb92814a8e476",
+    "fcbbc15e4053ce9917b9d7870ad2d317b4c7c283",
+    "fcd6ba980bef63558d302df946f1805fcfd56b75",
+    "fd22007be316bfbefe62b19adcee4e723ad6e4df",
+    "fe317fa7a493022abab7da7ebc0c33204e3f6faf",
+    "ff1bee2b0c2e563e353b99bef60d62bf8a782584",
+    "ff92124e2489d9e85871465749a82945f33a2fdc",
+    "ffb4606df9b29f88d39d26a886096e253e1afd95"
+  ],
+  "preservation_branches": [
+    {
+      "local_branch": "task/joint-supervisor-21942d3",
+      "sha": "ea36ce91bf15b78a665d42f2d10a513508ea442c",
+      "remote_branch": "wip/preserve-20261117/joint-supervisor-21942d3",
+      "url": "https://github.com/BColsey/fifi/tree/wip/preserve-20261117/joint-supervisor-21942d3"
+    },
+    {
+      "local_branch": "task/qwen36-ring-fuse-moe",
+      "sha": "dcd66ed8b6041787b980b6d5a8e4af8daee29d95",
+      "remote_branch": "wip/preserve-20261117/qwen36-ring-fuse-moe",
+      "url": "https://github.com/BColsey/fifi/tree/wip/preserve-20261117/qwen36-ring-fuse-moe"
+    },
+    {
+      "local_branch": "task/p2p-chunk-default-off-6199015",
+      "sha": "0f9b29588c3b2c5299ef64b7f005a092e281729e",
+      "remote_branch": "wip/preserve-20261117/p2p-chunk-default-off-6199015",
+      "url": "https://github.com/BColsey/fifi/tree/wip/preserve-20261117/p2p-chunk-default-off-6199015"
+    },
+    {
+      "local_branch": "task/p2p-chunk-default-off-dd3d9af",
+      "sha": "c995ff1008efdc9c2072bd8432d6f6cc8e0a7b74",
+      "remote_branch": "wip/preserve-20261117/p2p-chunk-default-off-dd3d9af",
+      "url": "https://github.com/BColsey/fifi/tree/wip/preserve-20261117/p2p-chunk-default-off-dd3d9af"
+    },
+    {
+      "local_branch": "task/p2p-chunk-default-off-667",
+      "sha": "d20106dad0af2abae98583e884a5a6919404e01c",
+      "remote_branch": "wip/preserve-20261117/p2p-chunk-default-off-667",
+      "url": "https://github.com/BColsey/fifi/tree/wip/preserve-20261117/p2p-chunk-default-off-667"
+    },
+    {
+      "local_branch": "task/p2p-chunk-port-667",
+      "sha": "69b1a8692d7272407a603599d96e82a749d288fd",
+      "remote_branch": "wip/preserve-20261117/p2p-chunk-port-667",
+      "url": "https://github.com/BColsey/fifi/tree/wip/preserve-20261117/p2p-chunk-port-667"
+    },
+    {
+      "local_branch": "main",
+      "sha": "48b9a62f726c8d0d4d4ab7cd02974f95e73e4544",
+      "remote_branch": "wip/preserve-20261117/main",
+      "url": "https://github.com/BColsey/fifi/tree/wip/preserve-20261117/main"
+    },
+    {
+      "local_branch": "task/2080-latest-integrated",
+      "sha": "5fa05f091486a38733a3cc777599479518cc86da",
+      "remote_branch": "wip/preserve-20261117/2080-latest-integrated",
+      "url": "https://github.com/BColsey/fifi/tree/wip/preserve-20261117/2080-latest-integrated"
+    },
+    {
+      "local_branch": "task/p2p-expert-timing-2c831d8",
+      "sha": "674253794c7462d6df48272e4148a1d9704c772b",
+      "remote_branch": "wip/preserve-20261117/p2p-expert-timing-2c831d8",
+      "url": "https://github.com/BColsey/fifi/tree/wip/preserve-20261117/p2p-expert-timing-2c831d8"
+    },
+    {
+      "local_branch": "task/qwen36-p2p-chunk-prefill",
+      "sha": "fcbbc15e4053ce9917b9d7870ad2d317b4c7c283",
+      "remote_branch": "wip/preserve-20261117/qwen36-p2p-chunk-prefill",
+      "url": "https://github.com/BColsey/fifi/tree/wip/preserve-20261117/qwen36-p2p-chunk-prefill"
+    },
+    {
+      "local_branch": "task/attention-adaptive-doc-a552",
+      "sha": "6463caff443fb1a31708d70f0a8244a0eec174a5",
+      "remote_branch": "wip/preserve-20261117/attention-adaptive-doc-a552",
+      "url": "https://github.com/BColsey/fifi/tree/wip/preserve-20261117/attention-adaptive-doc-a552"
+    },
+    {
+      "local_branch": "task/p2p-chunk-default-off-ca071c1",
+      "sha": "19076308d48a150e6423e9984cc9423e1622d11d",
+      "remote_branch": "wip/preserve-20261117/p2p-chunk-default-off-ca071c1",
+      "url": "https://github.com/BColsey/fifi/tree/wip/preserve-20261117/p2p-chunk-default-off-ca071c1"
+    },
+    {
+      "local_branch": "task/p2p-long-context-drivers",
+      "sha": "413d3639e1ce15665fe7eb8eba5718c16ac571da",
+      "remote_branch": "wip/preserve-20261117/p2p-long-context-drivers",
+      "url": "https://github.com/BColsey/fifi/tree/wip/preserve-20261117/p2p-long-context-drivers"
+    },
+    {
+      "local_branch": "task/attention-adaptive-doc",
+      "sha": "b7c2d607ff0c3fc83cea4bd461431c25c26e42f5",
+      "remote_branch": "wip/preserve-20261117/attention-adaptive-doc",
+      "url": "https://github.com/BColsey/fifi/tree/wip/preserve-20261117/attention-adaptive-doc"
+    },
+    {
+      "local_branch": "task/long-context-evidence-6199015",
+      "sha": "536f7bdc1f0eae3ada9029745000016c5180957c",
+      "remote_branch": "wip/preserve-20261117/long-context-evidence-6199015",
+      "url": "https://github.com/BColsey/fifi/tree/wip/preserve-20261117/long-context-evidence-6199015"
+    },
+    {
+      "local_branch": "task/long-context-evidence-dd3d9af",
+      "sha": "cc0c91640dcc0f24736fb74faf877e09aa98ba84",
+      "remote_branch": "wip/preserve-20261117/long-context-evidence-dd3d9af",
+      "url": "https://github.com/BColsey/fifi/tree/wip/preserve-20261117/long-context-evidence-dd3d9af"
+    },
+    {
+      "local_branch": "task/p2p-chunk-default-off-2057207",
+      "sha": "925886e246f2ed19d9cb70d8fe5c401d2936daff",
+      "remote_branch": "wip/preserve-20261117/p2p-chunk-default-off-2057207",
+      "url": "https://github.com/BColsey/fifi/tree/wip/preserve-20261117/p2p-chunk-default-off-2057207"
+    },
+    {
+      "local_branch": "task/p2p-host-snapshot-21942d3",
+      "sha": "5a742c4f318aaf1b13de00824a95e4cbe69c9ca8",
+      "remote_branch": "wip/preserve-20261117/p2p-host-snapshot-21942d3",
+      "url": "https://github.com/BColsey/fifi/tree/wip/preserve-20261117/p2p-host-snapshot-21942d3"
+    },
+    {
+      "local_branch": "task/qualification-facts-6199015",
+      "sha": "cd0e87df28543b4c889bc1aef6bb35261a598562",
+      "remote_branch": "wip/preserve-20261117/qualification-facts-6199015",
+      "url": "https://github.com/BColsey/fifi/tree/wip/preserve-20261117/qualification-facts-6199015"
+    },
+    {
+      "local_branch": "task/qualification-facts-667",
+      "sha": "5459a6b2a290cab665583c4182787409f0902981",
+      "remote_branch": "wip/preserve-20261117/qualification-facts-667",
+      "url": "https://github.com/BColsey/fifi/tree/wip/preserve-20261117/qualification-facts-667"
+    },
+    {
+      "local_branch": "task/qualification-facts-dd3d9af",
+      "sha": "481bbfdbf4c4f86b9c1c9203f43de46fd997df4e",
+      "remote_branch": "wip/preserve-20261117/qualification-facts-dd3d9af",
+      "url": "https://github.com/BColsey/fifi/tree/wip/preserve-20261117/qualification-facts-dd3d9af"
+    },
+    {
+      "local_branch": "task/qwen36-p2p-local-kv-gather",
+      "sha": "b313233f0dae1656b05c353b7ef57c1efae3b0cd",
+      "remote_branch": "wip/preserve-20261117/qwen36-p2p-local-kv-gather",
+      "url": "https://github.com/BColsey/fifi/tree/wip/preserve-20261117/qwen36-p2p-local-kv-gather"
+    },
+    {
+      "local_branch": "task/tiered-chunk-prefill",
+      "sha": "c90438954e5e5c8b55161d56275ab0d21b3878f9",
+      "remote_branch": "wip/preserve-20261117/tiered-chunk-prefill",
+      "url": "https://github.com/BColsey/fifi/tree/wip/preserve-20261117/tiered-chunk-prefill"
+    },
+    {
+      "local_branch": "task/attention-adaptive-doc-8f282",
+      "sha": "9ee3c8dcef94a8dd79403816a5ca3b3d962781f3",
+      "remote_branch": "wip/preserve-20261117/attention-adaptive-doc-8f282",
+      "url": "https://github.com/BColsey/fifi/tree/wip/preserve-20261117/attention-adaptive-doc-8f282"
+    },
+    {
+      "local_branch": "task/attn-q8-tile-launchbounds",
+      "sha": "1b44231bb477121d9f12dddf0d52248d22da0d65",
+      "remote_branch": "wip/preserve-20261117/attn-q8-tile-launchbounds",
+      "url": "https://github.com/BColsey/fifi/tree/wip/preserve-20261117/attn-q8-tile-launchbounds"
+    },
+    {
+      "local_branch": "task/p2p-concurrent-guard-07dda",
+      "sha": "0d2284d385433c272ede1c9ef86f27c79dc68194",
+      "remote_branch": "wip/preserve-20261117/p2p-concurrent-guard-07dda",
+      "url": "https://github.com/BColsey/fifi/tree/wip/preserve-20261117/p2p-concurrent-guard-07dda"
+    },
+    {
+      "local_branch": "task/p2p1024-latest-main-f1a",
+      "sha": "e8217e4d637f9ad9189069eeb76052651e04dee7",
+      "remote_branch": "wip/preserve-20261117/p2p1024-latest-main-f1a",
+      "url": "https://github.com/BColsey/fifi/tree/wip/preserve-20261117/p2p1024-latest-main-f1a"
+    },
+    {
+      "local_branch": "task/preserve-local-main-cad6088",
+      "sha": "cad6088b0af573b18526f93d220ad70e294159f2",
+      "remote_branch": "wip/preserve-20261117/preserve-local-main-cad6088",
+      "url": "https://github.com/BColsey/fifi/tree/wip/preserve-20261117/preserve-local-main-cad6088"
+    },
+    {
+      "local_branch": "task/router-connection-lifecycle-6199015",
+      "sha": "a79de8bda5f7577d4616b676059e37b4f002dec9",
+      "remote_branch": "wip/preserve-20261117/router-connection-lifecycle-6199015",
+      "url": "https://github.com/BColsey/fifi/tree/wip/preserve-20261117/router-connection-lifecycle-6199015"
+    },
+    {
+      "local_branch": "task/adaptive-attention-reconcile-2656630",
+      "sha": "6ed6112e7a29af4f4619ac993eb795f9896ef0fc",
+      "remote_branch": "wip/preserve-20261117/adaptive-attention-reconcile-2656630",
+      "url": "https://github.com/BColsey/fifi/tree/wip/preserve-20261117/adaptive-attention-reconcile-2656630"
+    },
+    {
+      "local_branch": "task/attention-adaptive-doc-06d5",
+      "sha": "521e0882461d5fab4078d477b46ff074c40fcef0",
+      "remote_branch": "wip/preserve-20261117/attention-adaptive-doc-06d5",
+      "url": "https://github.com/BColsey/fifi/tree/wip/preserve-20261117/attention-adaptive-doc-06d5"
+    },
+    {
+      "local_branch": "task/attention-health-fix-8f28226",
+      "sha": "70e843a09289c9689d307d1b4d973e1e7f46856c",
+      "remote_branch": "wip/preserve-20261117/attention-health-fix-8f28226",
+      "url": "https://github.com/BColsey/fifi/tree/wip/preserve-20261117/attention-health-fix-8f28226"
+    },
+    {
+      "local_branch": "task/browser-cleanup-6199015",
+      "sha": "580d054d4968f924ede50a99c4d69703357c5810",
+      "remote_branch": "wip/preserve-20261117/browser-cleanup-6199015",
+      "url": "https://github.com/BColsey/fifi/tree/wip/preserve-20261117/browser-cleanup-6199015"
+    },
+    {
+      "local_branch": "task/cuda-health-started-2057207",
+      "sha": "0d8a065bccfbc408a02710c3a26a6c72c79731c3",
+      "remote_branch": "wip/preserve-20261117/cuda-health-started-2057207",
+      "url": "https://github.com/BColsey/fifi/tree/wip/preserve-20261117/cuda-health-started-2057207"
+    },
+    {
+      "local_branch": "task/gpu-handoff-6202b011",
+      "sha": "d9d98d678615d96455dd5a8becdf4d73c140a91c",
+      "remote_branch": "wip/preserve-20261117/gpu-handoff-6202b011",
+      "url": "https://github.com/BColsey/fifi/tree/wip/preserve-20261117/gpu-handoff-6202b011"
+    },
+    {
+      "local_branch": "task/kv-quality-doc",
+      "sha": "0da3ea18be9abc286f5d0721badd71ae75b2d1bd",
+      "remote_branch": "wip/preserve-20261117/kv-quality-doc",
+      "url": "https://github.com/BColsey/fifi/tree/wip/preserve-20261117/kv-quality-doc"
+    },
+    {
+      "local_branch": "task/long-context-cache-mode-76a",
+      "sha": "48a29c250aa0f03b2c9c8b6a51918149bf96ebcd",
+      "remote_branch": "wip/preserve-20261117/long-context-cache-mode-76a",
+      "url": "https://github.com/BColsey/fifi/tree/wip/preserve-20261117/long-context-cache-mode-76a"
+    },
+    {
+      "local_branch": "task/long-context-evidence-667",
+      "sha": "eb80ef0ee7f5c816e97848a52c3cac894ef586b2",
+      "remote_branch": "wip/preserve-20261117/long-context-evidence-667",
+      "url": "https://github.com/BColsey/fifi/tree/wip/preserve-20261117/long-context-evidence-667"
+    },
+    {
+      "local_branch": "task/mr-async-decode-6bb",
+      "sha": "1f2f4dcd54cf1c9aadddca525424e8b2b30daea3",
+      "remote_branch": "wip/preserve-20261117/mr-async-decode-6bb",
+      "url": "https://github.com/BColsey/fifi/tree/wip/preserve-20261117/mr-async-decode-6bb"
+    },
+    {
+      "local_branch": "task/p2p-sync-overlap-6202",
+      "sha": "6ebfe7900c7dbf0932b3d8ec54cb09db79a4d621",
+      "remote_branch": "wip/preserve-20261117/p2p-sync-overlap-6202",
+      "url": "https://github.com/BColsey/fifi/tree/wip/preserve-20261117/p2p-sync-overlap-6202"
+    },
+    {
+      "local_branch": "task/p2p-unstaged-control-c01bfb6",
+      "sha": "67ec883490e0a087d2f03adf2bdda3a0355e9f42",
+      "remote_branch": "wip/preserve-20261117/p2p-unstaged-control-c01bfb6",
+      "url": "https://github.com/BColsey/fifi/tree/wip/preserve-20261117/p2p-unstaged-control-c01bfb6"
+    },
+    {
+      "local_branch": "task/pair-boot-memset",
+      "sha": "aa073b4523f01b796227b69db6bc32bf496161fd",
+      "remote_branch": "wip/preserve-20261117/pair-boot-memset",
+      "url": "https://github.com/BColsey/fifi/tree/wip/preserve-20261117/pair-boot-memset"
+    },
+    {
+      "local_branch": "task/pair-router-first-fault",
+      "sha": "4d57c80d96e7e197ce48c10637418002624bf33f",
+      "remote_branch": "wip/preserve-20261117/pair-router-first-fault",
+      "url": "https://github.com/BColsey/fifi/tree/wip/preserve-20261117/pair-router-first-fault"
+    },
+    {
+      "local_branch": "task/prefill-proof-accounting-2057207",
+      "sha": "4769585c91c79fd948b1cda7b006ed9293e88aae",
+      "remote_branch": "wip/preserve-20261117/prefill-proof-accounting-2057207",
+      "url": "https://github.com/BColsey/fifi/tree/wip/preserve-20261117/prefill-proof-accounting-2057207"
+    },
+    {
+      "local_branch": "task/prefill-proof-accounting-2b5902c",
+      "sha": "62273b250340de3b81d9901ddde7ab0b13ac67f9",
+      "remote_branch": "wip/preserve-20261117/prefill-proof-accounting-2b5902c",
+      "url": "https://github.com/BColsey/fifi/tree/wip/preserve-20261117/prefill-proof-accounting-2b5902c"
+    },
+    {
+      "local_branch": "task/prefill-proof-accounting-ca071c1",
+      "sha": "cd32921e3ec31202a0177fb5895e749a522e93a3",
+      "remote_branch": "wip/preserve-20261117/prefill-proof-accounting-ca071c1",
+      "url": "https://github.com/BColsey/fifi/tree/wip/preserve-20261117/prefill-proof-accounting-ca071c1"
+    },
+    {
+      "local_branch": "task/qwen36-p2p-async-broadcast",
+      "sha": "ef5115c50521787123b57374cbd860cd80278a32",
+      "remote_branch": "wip/preserve-20261117/qwen36-p2p-async-broadcast",
+      "url": "https://github.com/BColsey/fifi/tree/wip/preserve-20261117/qwen36-p2p-async-broadcast"
+    },
+    {
+      "local_branch": "task/qwen36-sliced-async-events",
+      "sha": "ce00cd00ef8c34faf18ef6f80c7f8d3b8d95d4cf",
+      "remote_branch": "wip/preserve-20261117/qwen36-sliced-async-events",
+      "url": "https://github.com/BColsey/fifi/tree/wip/preserve-20261117/qwen36-sliced-async-events"
+    },
+    {
+      "local_branch": "task/sched-queue-ticket-21942d3",
+      "sha": "cc24f23e63b444bdfa6770d033d971352ca1cbe5",
+      "remote_branch": "wip/preserve-20261117/sched-queue-ticket-21942d3",
+      "url": "https://github.com/BColsey/fifi/tree/wip/preserve-20261117/sched-queue-ticket-21942d3"
+    }
+  ],
+  "source_snapshots": [
+    {
+      "name": "concurrent-client",
+      "sha": "5fb25408dc004a00f03ed5a53ca182f6b4c69ae7",
+      "branch": "wip/pending-concurrent-client-20261117",
+      "base": "0d2284d385433c272ede1c9ef86f27c79dc68194",
+      "file_sha256": {
+        "scripts/p2p_concurrent_guard/client.py": "50f8b7fe887c9dfd18fcc1c5b711f6cb7b2da12379756e19ab6144dee72a1b69"
+      },
+      "original_preserved": true
+    },
+    {
+      "name": "fused-expert-sums",
+      "sha": "1b67608ce75c6b5c9f7ca1e36dcc24d819797ccb",
+      "branch": "wip/pending-fused-expert-sums-20261117",
+      "base": "5dfbc21a684751b776bea4afd40c5eaa1edfda21",
+      "file_sha256": {
+        "doc/reference/environment.md": "8127fb7cb9c7b6a757c68a8a8ad62eb5a8e855957b9ff446529fc14b8b1de08c",
+        "engine/src/family/qwen36/cuda/card_block.rs": "2c214bf7ca676e221172b62a4937853bb8cfd7d025984788d757c0fe8bda9390",
+        "engine/src/family/qwen36/cuda/card_moe_device_tests.rs": "7e501214cfa05ba1e183c396b25aed714c3d46690f54e911aa88fdda233cdf8c",
+        "engine/src/family/qwen36/cuda/card_session_device_tests.rs": "edac0ca02efd6251820817c4e17aa94ecf906035cb9efa4841aeefd022753440",
+        "engine/src/family/qwen36/cuda/card_step.rs": "032758480a6487ad1d06a486998e76df2a29bf10f42d7cec9474a9ede6389c95",
+        "engine/src/kernels/cuda/peer_ring.rs": "0baecb7b87333ff88c00ac9a9cd74bd4c11f489b7ec4147a61a0f66c404d5772",
+        "doc/qwen36-p2p-fused-expert-sum.md": "68fe3a99b1f565b3e25aaba32cda1a1f02ab7e3adcf459390ff5766b39518f25"
+      },
+      "original_preserved": true
+    },
+    {
+      "name": "ring-prefill",
+      "sha": "339cb4254d5957fd0c1911366fc3c67abde727eb",
+      "branch": "wip/pending-ring-prefill-20261117",
+      "base": "dcd66ed8b6041787b980b6d5a8e4af8daee29d95",
+      "file_sha256": {
+        "engine/src/family/qwen36/cuda/card_prefill.rs": "695b33aa67d65679378730b3fcb6d53a4131d5018eb540f1addd5544824e3b54",
+        "engine/src/family/qwen36/cuda/card_session.rs": "197c24da0177445ce4aff216cc7db8220285266938f0ffbbaca03bb8be40445e",
+        "engine/src/family/qwen36/cuda/prefill.rs": "6385114707386b5e505022319250f577ea0b9e390984e8906f035e0150d490a4"
+      },
+      "original_preserved": true
+    }
+  ],
+  "refreshed_existing_drafts": [
+    {
+      "number": 51,
+      "title": "Draft: cooperative lease-first 2080 handoff guard",
+      "url": "https://github.com/zbrdc/fifi/pull/51",
+      "head": "61fff64942a2d3bf2b209fbadfb50c1f09c746b3",
+      "state": "open",
+      "contains_upstream_main": true,
+      "qualified_by_publication": false
+    },
+    {
+      "number": 48,
+      "title": "WIP: arm CUDA prefill attention per device",
+      "url": "https://github.com/zbrdc/fifi/pull/48",
+      "head": "24d42b229ed79dab9f9bde52c4fbf7364b0b3b29",
+      "state": "open",
+      "contains_upstream_main": true,
+      "qualified_by_publication": false
+    },
+    {
+      "number": 47,
+      "title": "WIP: event barriers for P2P chunk broadcasts",
+      "url": "https://github.com/zbrdc/fifi/pull/47",
+      "head": "726f6b374f0a5d99a4322fddf2787218c9b275a2",
+      "state": "open",
+      "contains_upstream_main": true,
+      "qualified_by_publication": false
+    },
+    {
+      "number": 46,
+      "title": "WIP: diagnose P2P chunk prefix restore",
+      "url": "https://github.com/zbrdc/fifi/pull/46",
+      "head": "20f24ddbe63bb3d695438a948300a9e0b8398cf1",
+      "state": "open",
+      "contains_upstream_main": true,
+      "qualified_by_publication": false
+    },
+    {
+      "number": 44,
+      "title": "WIP: probe 2,048-row P2P prefill chunks",
+      "url": "https://github.com/zbrdc/fifi/pull/44",
+      "head": "a15f2c7b5f66b9b145de90a81b612186e43c931f",
+      "state": "open",
+      "contains_upstream_main": true,
+      "qualified_by_publication": false
+    },
+    {
+      "number": 43,
+      "title": "WIP: widen opt-in P2P prefill chunks to 1,024 rows",
+      "url": "https://github.com/zbrdc/fifi/pull/43",
+      "head": "9350300648c5d06fe66ba8264aa4f45e1cb42216",
+      "state": "open",
+      "contains_upstream_main": true,
+      "qualified_by_publication": false
+    },
+    {
+      "number": 42,
+      "title": "WIP: staged P2P chunked prefill with 512-row evidence",
+      "url": "https://github.com/zbrdc/fifi/pull/42",
+      "head": "5842ffb40971665061195f008bcd00d8ee5720ad",
+      "state": "open",
+      "contains_upstream_main": true,
+      "qualified_by_publication": false
+    },
+    {
+      "number": 36,
+      "title": "WIP: select CUDA prefill attention within device limits",
+      "url": "https://github.com/zbrdc/fifi/pull/36",
+      "head": "87dddd737461a8ccdde9259d3d1c5a47cb7c4fde",
+      "state": "closed",
+      "contains_upstream_main": true,
+      "qualified_by_publication": false
+    },
+    {
+      "number": 34,
+      "title": "WIP: allow the router to release completed backend connections",
+      "url": "https://github.com/zbrdc/fifi/pull/34",
+      "head": "663d152ebce1814eb7f6e8e4f6be767dc9f65c81",
+      "state": "closed",
+      "contains_upstream_main": true,
+      "qualified_by_publication": false
+    },
+    {
+      "number": 29,
+      "title": "WIP: optimize 2080 tiered prefill, cold staging and decode",
+      "url": "https://github.com/zbrdc/fifi/pull/29",
+      "head": "93787ceb4e61c7adf5d8f9bc25d396d69c6b6fac",
+      "state": "open",
+      "contains_upstream_main": true,
+      "qualified_by_publication": false
+    }
+  ],
+  "new_drafts": [
+    {
+      "name": "joint-supervisor",
+      "number": 53,
+      "title": "WIP: supervise P2P request scopes and host observations",
+      "url": "https://github.com/zbrdc/fifi/pull/53",
+      "head": "wip/review-joint-supervisor-20261117",
+      "sha": "f6237ef905b9d72fb42c26233505f21e34bd003e",
+      "draft": true
+    },
+    {
+      "name": "expert-timing",
+      "number": 54,
+      "title": "WIP: measure P2P routed-expert stages",
+      "url": "https://github.com/zbrdc/fifi/pull/54",
+      "head": "wip/pending-expert-timing-20261117",
+      "sha": "674253794c7462d6df48272e4148a1d9704c772b",
+      "draft": true
+    },
+    {
+      "name": "stream-memset",
+      "number": 55,
+      "title": "WIP: initialize resident CUDA state on its owning stream",
+      "url": "https://github.com/zbrdc/fifi/pull/55",
+      "head": "wip/review-stream-memset-20261117",
+      "sha": "90b3bc470d912fb1301151f347a843de8930bb42",
+      "draft": true
+    },
+    {
+      "name": "router-first-fault",
+      "number": 56,
+      "title": "WIP: report the first P2P router fault",
+      "url": "https://github.com/zbrdc/fifi/pull/56",
+      "head": "wip/review-router-first-fault-20261117",
+      "sha": "a0dfea2abfe8fd8d69d98282504a27fa62775b55",
+      "draft": true
+    },
+    {
+      "name": "concurrent-client",
+      "number": 57,
+      "title": "WIP: add bounded client for concurrent P2P guard",
+      "url": "https://github.com/zbrdc/fifi/pull/57",
+      "head": "wip/review-concurrent-client-20261117",
+      "sha": "d89f7f174b68e523ede108d00da053ec9951d96c",
+      "draft": true
+    },
+    {
+      "name": "fused-expert-sums",
+      "number": 58,
+      "title": "WIP: fuse P2P expert-sum exchanges",
+      "url": "https://github.com/zbrdc/fifi/pull/58",
+      "head": "wip/pending-fused-expert-sums-20261117",
+      "sha": "1b67608ce75c6b5c9f7ca1e36dcc24d819797ccb",
+      "draft": true
+    },
+    {
+      "name": "ring-prefill",
+      "number": 59,
+      "title": "WIP: capture pending ring-prefill changes",
+      "url": "https://github.com/zbrdc/fifi/pull/59",
+      "head": "wip/pending-ring-prefill-20261117",
+      "sha": "339cb4254d5957fd0c1911366fc3c67abde727eb",
+      "draft": true
+    }
+  ],
+  "prior_fork_drafts": [
+    {
+      "number": 13,
+      "title": "Split tiered Q8_G expert jobs across CPU workers",
+      "url": "https://github.com/BColsey/fifi/pull/13",
+      "head": "codex/tiered-split-jobs-c713779",
+      "sha": "c7137795c1bd7002a4d079d08cda91107420e5af",
+      "base": "task/tiered-chunk-prefill",
+      "status": "existing historical or stacked draft; source commits already remote; see current upstream drafts for refreshed integration work"
+    },
+    {
+      "number": 12,
+      "title": "Document lease-first GPU service handoffs",
+      "url": "https://github.com/BColsey/fifi/pull/12",
+      "head": "task/gpu-lease-doc-2bc",
+      "sha": "6202b011051975a63183d9fb02583b046e4740b2",
+      "base": "task/main-snapshot-2bc9821",
+      "status": "existing historical or stacked draft; source commits already remote; see current upstream drafts for refreshed integration work"
+    },
+    {
+      "number": 11,
+      "title": "Probe 2,048-row P2P prefill chunks",
+      "url": "https://github.com/BColsey/fifi/pull/11",
+      "head": "task/p2p-chunk2048-481",
+      "sha": "9201018e8313728d86b0ef06e62305c4e25182df",
+      "base": "task/p2p-chunk1024-725",
+      "status": "existing historical or stacked draft; source commits already remote; see current upstream drafts for refreshed integration work"
+    },
+    {
+      "number": 10,
+      "title": "Widen opt-in P2P chunks to 1,024 rows",
+      "url": "https://github.com/BColsey/fifi/pull/10",
+      "head": "task/p2p-chunk1024-725",
+      "sha": "dca00fd814da5af09a633b8168849a8c2e22f11a",
+      "base": "task/p2p-chunk512-validation",
+      "status": "existing historical or stacked draft; source commits already remote; see current upstream drafts for refreshed integration work"
+    },
+    {
+      "number": 9,
+      "title": "Measure opt-in multi-block P2P ring prefill on the 3060 + 3080",
+      "url": "https://github.com/BColsey/fifi/pull/9",
+      "head": "task/p2p-ring-measure-2bc",
+      "sha": "9732166b6552e95360d747988f62ba647eb1b392",
+      "base": "task/main-snapshot-2bc9821",
+      "status": "existing historical or stacked draft; source commits already remote; see current upstream drafts for refreshed integration work"
+    },
+    {
+      "number": 8,
+      "title": "Experiment with event barriers for chunked P2P broadcasts",
+      "url": "https://github.com/BColsey/fifi/pull/8",
+      "head": "task/p2p-async-chunk-0ca",
+      "sha": "c273f2a7eac3236577edbfe79b6a34dc09b48028",
+      "base": "task/p2p-integration-773",
+      "status": "existing historical or stacked draft; source commits already remote; see current upstream drafts for refreshed integration work"
+    },
+    {
+      "number": 7,
+      "title": "Add CPU and GPU resource observer for inference benchmarks",
+      "url": "https://github.com/BColsey/fifi/pull/7",
+      "head": "task/p2p-resource-sampler-773",
+      "sha": "64cdaad3b24f69e84c781a72126cf620710abed3",
+      "base": "task/main-snapshot-2bc9821",
+      "status": "existing historical or stacked draft; source commits already remote; see current upstream drafts for refreshed integration work"
+    },
+    {
+      "number": 6,
+      "title": "Investigate P2P chunk prefix restore across two GPUs",
+      "url": "https://github.com/BColsey/fifi/pull/6",
+      "head": "task/p2p-chunk-prefix-diagnostic",
+      "sha": "6c7dc4718951385cdfc8d66eb7e3c23e3a653e29",
+      "base": "task/p2p-integration-773",
+      "status": "existing historical or stacked draft; source commits already remote; see current upstream drafts for refreshed integration work"
+    },
+    {
+      "number": 5,
+      "title": "Distinguish disabled and required reuse in coding checks",
+      "url": "https://github.com/BColsey/fifi/pull/5",
+      "head": "task/long-context-validation-main",
+      "sha": "90f1de648b4b18cb76e1e2f43218be9b6890a8d8",
+      "base": "task/main-snapshot-2bc9821",
+      "status": "existing historical or stacked draft; source commits already remote; see current upstream drafts for refreshed integration work"
+    },
+    {
+      "number": 4,
+      "title": "WIP: validate and measure 512-row P2P prefill",
+      "url": "https://github.com/BColsey/fifi/pull/4",
+      "head": "task/p2p-chunk512-validation",
+      "sha": "725f186d712247bfce15c245861848c828d80292",
+      "base": "task/p2p-integration-773",
+      "status": "existing historical or stacked draft; source commits already remote; see current upstream drafts for refreshed integration work"
+    },
+    {
+      "number": 3,
+      "title": "WIP: document measured 3080 expert placement",
+      "url": "https://github.com/BColsey/fifi/pull/3",
+      "head": "task/p2p-placement-tuning-proof",
+      "sha": "c22e165956fa3a7f7d6a87761c6ff4386db86e82",
+      "base": "task/p2p-integration-773",
+      "status": "existing historical or stacked draft; source commits already remote; see current upstream drafts for refreshed integration work"
+    },
+    {
+      "number": 2,
+      "title": "WIP: arm typed prefill attention on each CUDA device",
+      "url": "https://github.com/BColsey/fifi/pull/2",
+      "head": "task/attention-legacy-device-fix",
+      "sha": "85dcd29a1bb4bad8d48c76e5ba32827929004353",
+      "base": "task/attention-adaptive-base-773",
+      "status": "existing historical or stacked draft; source commits already remote; see current upstream drafts for refreshed integration work"
+    },
+    {
+      "number": 1,
+      "title": "WIP: stage Q8 attention per P2P card",
+      "url": "https://github.com/BColsey/fifi/pull/1",
+      "head": "task/p2p-kv8-staging",
+      "sha": "4e6f9f1343017cea7d213a800532b2d7de9efc4b",
+      "base": "task/p2p-chunk-base-773",
+      "status": "existing historical or stacked draft; source commits already remote; see current upstream drafts for refreshed integration work"
+    }
+  ],
+  "checks": {
+    "integration": {
+      "sha": "93787ceb4e61c7adf5d8f9bc25d396d69c6b6fac",
+      "rust_fmt": true,
+      "release_clippy_warnings_denied": true,
+      "release_lib_build": true,
+      "cpu_lib_passed": 3457,
+      "cpu_lib_failed": 0,
+      "cpu_lib_ignored": 60,
+      "qualification_inventory": true,
+      "doc_links": true,
+      "local_isolated_scripts": {
+        "discovered": 274,
+        "passed": 273,
+        "skipped": 1,
+        "isolated_python": true
+      }
+    },
+    "handoff": {
+      "sha": "61fff64942a2d3bf2b209fbadfb50c1f09c746b3",
+      "discovered": 92,
+      "passed": 91,
+      "skipped": 1
+    },
+    "supervisor": {
+      "sha": "f6237ef905b9d72fb42c26233505f21e34bd003e",
+      "discovered": 104,
+      "passed": 90,
+      "skipped": 14,
+      "local_isolated_full_suite": {
+        "discovered": 374,
+        "passed": 359,
+        "skipped": 15,
+        "isolated_python": true
+      },
+      "github_scripts_ci": "passed on f6237ef905b9d72fb42c26233505f21e34bd003e; Rust job pending at this snapshot"
+    },
+    "router_report": {
+      "sha": "a0dfea2abfe8fd8d69d98282504a27fa62775b55",
+      "discovered": 3,
+      "passed": 3,
+      "github_portable_ci": "rust and scripts passed"
+    },
+    "router_upstream": {
+      "sha": "663d152ebce1814eb7f6e8e4f6be767dc9f65c81",
+      "passed": 15
+    }
+  },
+  "incorporated": {
+    "upstream_drafts": [
+      34,
+      36
+    ],
+    "scheduler_ticket": "cc24f23e63b444bdfa6770d033d971352ca1cbe5 has no remaining delta when ported onto current main; upstream publish_job policy retained"
+  },
+  "remaining_work": [
+    {
+      "draft": 54,
+      "owner": "P2P expert-timing lane",
+      "next_action": "Port timing delta onto current chunk/tiered execution and shared EXL3 launch ownership.",
+      "wake_condition": "Architecture port reviewed; then native build and admitted device run."
+    },
+    {
+      "draft": 58,
+      "owner": "P2P fused-expert-sum lane",
+      "next_action": "Port preserved source snapshot onto current card-session and peer-ring architecture.",
+      "wake_condition": "Architecture port reviewed; then native build and admitted device run."
+    },
+    {
+      "draft": 59,
+      "owner": "P2P ring-prefill lane",
+      "next_action": "Port preserved source snapshot onto current launch ownership, per-device facts and attention policy.",
+      "wake_condition": "Architecture port reviewed; then native build and admitted device run."
+    },
+    {
+      "draft": 29,
+      "owner": "2080 optimization lane",
+      "next_action": "Complete exact-refreshed-tip native/device validation and adaptive staging A/B after CUDA host recovery.",
+      "wake_condition": "Host recovery and normal GPU runner admission succeed."
+    },
+    {
+      "drafts": [
+        29,
+        48,
+        55
+      ],
+      "owner": "portable CI / router test fixture",
+      "next_action": "Diagnose the inherited model-router startup failures and obtain green scripts CI. Integration scripts pass locally; do not label these heads CI-green.",
+      "wake_condition": "Maintainer can rerun Actions or a reviewed fixture fix is pushed. The connected app returned 403 for Actions rerun."
+    }
+  ],
+  "publication_status": {
+    "new_merges_into_main": false,
+    "new_gpu_measurements": false,
+    "new_gpu_qualification": false,
+    "production_default_flips": false,
+    "fork_pr_creation": "Connected GitHub app denied fork PR creation; all new drafts were created upstream from pushed fork heads."
+  },
+  "portable_ci": [
+    {
+      "number": 51,
+      "sha": "61fff64942a2d3bf2b209fbadfb50c1f09c746b3",
+      "checks": [
+        {
+          "name": "scripts",
+          "status": "completed",
+          "conclusion": "success",
+          "id": 133817963529,
+          "url": "https://github.com/zbrdc/fifi/actions/runs/44017231689/job/133817963529"
+        },
+        {
+          "name": "rust",
+          "status": "completed",
+          "conclusion": "success",
+          "id": 133817963138,
+          "url": "https://github.com/zbrdc/fifi/actions/runs/44017231689/job/133817963138"
+        }
+      ]
+    },
+    {
+      "number": 48,
+      "sha": "24d42b229ed79dab9f9bde52c4fbf7364b0b3b29",
+      "checks": [
+        {
+          "name": "rust",
+          "status": "completed",
+          "conclusion": "success",
+          "id": 133817964624,
+          "url": "https://github.com/zbrdc/fifi/actions/runs/44017232071/job/133817964624"
+        },
+        {
+          "name": "scripts",
+          "status": "completed",
+          "conclusion": "failure",
+          "id": 133817964414,
+          "url": "https://github.com/zbrdc/fifi/actions/runs/44017232071/job/133817964414"
+        }
+      ]
+    },
+    {
+      "number": 47,
+      "sha": "726f6b374f0a5d99a4322fddf2787218c9b275a2",
+      "checks": [
+        {
+          "name": "rust",
+          "status": "completed",
+          "conclusion": "success",
+          "id": 133817961537,
+          "url": "https://github.com/zbrdc/fifi/actions/runs/44017230401/job/133817961537"
+        },
+        {
+          "name": "scripts",
+          "status": "completed",
+          "conclusion": "success",
+          "id": 133817961117,
+          "url": "https://github.com/zbrdc/fifi/actions/runs/44017230401/job/133817961117"
+        }
+      ]
+    },
+    {
+      "number": 46,
+      "sha": "20f24ddbe63bb3d695438a948300a9e0b8398cf1",
+      "checks": [
+        {
+          "name": "rust",
+          "status": "completed",
+          "conclusion": "success",
+          "id": 133817963693,
+          "url": "https://github.com/zbrdc/fifi/actions/runs/44017231902/job/133817963693"
+        },
+        {
+          "name": "scripts",
+          "status": "completed",
+          "conclusion": "success",
+          "id": 133817963326,
+          "url": "https://github.com/zbrdc/fifi/actions/runs/44017231902/job/133817963326"
+        }
+      ]
+    },
+    {
+      "number": 44,
+      "sha": "a15f2c7b5f66b9b145de90a81b612186e43c931f",
+      "checks": [
+        {
+          "name": "scripts",
+          "status": "completed",
+          "conclusion": "success",
+          "id": 133817962822,
+          "url": "https://github.com/zbrdc/fifi/actions/runs/44017231535/job/133817962822"
+        },
+        {
+          "name": "rust",
+          "status": "completed",
+          "conclusion": "success",
+          "id": 133817962492,
+          "url": "https://github.com/zbrdc/fifi/actions/runs/44017231535/job/133817962492"
+        }
+      ]
+    },
+    {
+      "number": 43,
+      "sha": "9350300648c5d06fe66ba8264aa4f45e1cb42216",
+      "checks": [
+        {
+          "name": "scripts",
+          "status": "completed",
+          "conclusion": "success",
+          "id": 133817959641,
+          "url": "https://github.com/zbrdc/fifi/actions/runs/44017230433/job/133817959641"
+        },
+        {
+          "name": "rust",
+          "status": "completed",
+          "conclusion": "success",
+          "id": 133817959031,
+          "url": "https://github.com/zbrdc/fifi/actions/runs/44017230433/job/133817959031"
+        }
+      ]
+    },
+    {
+      "number": 42,
+      "sha": "5842ffb40971665061195f008bcd00d8ee5720ad",
+      "checks": [
+        {
+          "name": "rust",
+          "status": "completed",
+          "conclusion": "success",
+          "id": 133817966139,
+          "url": "https://github.com/zbrdc/fifi/actions/runs/44017232587/job/133817966139"
+        },
+        {
+          "name": "scripts",
+          "status": "completed",
+          "conclusion": "success",
+          "id": 133817965782,
+          "url": "https://github.com/zbrdc/fifi/actions/runs/44017232587/job/133817965782"
+        }
+      ]
+    },
+    {
+      "number": 29,
+      "sha": "93787ceb4e61c7adf5d8f9bc25d396d69c6b6fac",
+      "checks": [
+        {
+          "name": "rust",
+          "status": "completed",
+          "conclusion": "success",
+          "id": 133817963652,
+          "url": "https://github.com/zbrdc/fifi/actions/runs/44017231661/job/133817963652"
+        },
+        {
+          "name": "scripts",
+          "status": "completed",
+          "conclusion": "failure",
+          "id": 133817963317,
+          "url": "https://github.com/zbrdc/fifi/actions/runs/44017231661/job/133817963317"
+        }
+      ]
+    }
+  ],
+  "record_scope": "Historical publication snapshot before the merge-readiness repairs. Earlier remaining_work and CI fields are retained as history, not current blockers.",
+  "superseded_by": "merge-readiness-20261117.json"
+}

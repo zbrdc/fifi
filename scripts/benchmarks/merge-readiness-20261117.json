@@ -1,0 +1,450 @@
+{
+  "schema_version": 1,
+  "generated_at": "2026-11-17T05:23:14.604022+00:00",
+  "purpose": "Current review commits and local validation after resolving publication blockers; use the linked exact-commit check runs for current portable CI status. This record separates integration from GPU measurement and qualification.",
+  "upstream_main": "3f4bd6ae71d78b4ce37a37564e6c53d71a4d49a0",
+  "active_code_and_tooling_prs": [
+    {
+      "pr": 29,
+      "url": "https://github.com/zbrdc/fifi/pull/29",
+      "commit": "8ee2cde39628b75eebf7051614f8d37c24cc179a",
+      "ci": {
+        "required_jobs": [
+          "rust",
+          "scripts"
+        ],
+        "exact_commit_checks": "https://github.com/zbrdc/fifi/commit/8ee2cde39628b75eebf7051614f8d37c24cc179a/checks",
+        "status_source": "Live GitHub check runs on this exact commit; required before marking the PR ready."
+      },
+      "merged": false,
+      "new_gpu_measurements": false,
+      "new_device_qualification": false,
+      "experimental_default_enabled_by_readiness_work": false,
+      "native_check": {
+        "status": "passed",
+        "architectures": [
+          "sm75",
+          "sm86"
+        ],
+        "command": "cargo check --locked --offline --release --features native-cuda --lib --tests",
+        "log": "/home/ben/fifi-scratch/3f4bd6ae71d7/merge-readiness/evidence/native-29-check.log",
+        "sha256": "ac63cd3573b4854442b4f89d128ac96fa266c4cdf21efe0f091047cd4fd64498"
+      }
+    },
+    {
+      "pr": 42,
+      "url": "https://github.com/zbrdc/fifi/pull/42",
+      "commit": "f4e26ffaed12452f034f10efba94037a18550051",
+      "ci": {
+        "required_jobs": [
+          "rust",
+          "scripts"
+        ],
+        "exact_commit_checks": "https://github.com/zbrdc/fifi/commit/f4e26ffaed12452f034f10efba94037a18550051/checks",
+        "status_source": "Live GitHub check runs on this exact commit; required before marking the PR ready."
+      },
+      "merged": false,
+      "new_gpu_measurements": false,
+      "new_device_qualification": false,
+      "experimental_default_enabled_by_readiness_work": false,
+      "native_check": {
+        "status": "passed",
+        "architectures": [
+          "sm75",
+          "sm86"
+        ],
+        "command": "cargo check --locked --offline --release --features native-cuda --lib --tests",
+        "log": "/home/ben/fifi-scratch/3f4bd6ae71d7/merge-readiness/evidence/native-42-check.log",
+        "sha256": "3419bf2638c54da02f6bae258fac300b5e82dc9acc3dc429db37fd7013c80787"
+      }
+    },
+    {
+      "pr": 43,
+      "url": "https://github.com/zbrdc/fifi/pull/43",
+      "commit": "050a28fe996361ec9bfb5ceadd380e4c5d151a81",
+      "ci": {
+        "required_jobs": [
+          "rust",
+          "scripts"
+        ],
+        "exact_commit_checks": "https://github.com/zbrdc/fifi/commit/050a28fe996361ec9bfb5ceadd380e4c5d151a81/checks",
+        "status_source": "Live GitHub check runs on this exact commit; required before marking the PR ready."
+      },
+      "merged": false,
+      "new_gpu_measurements": false,
+      "new_device_qualification": false,
+      "experimental_default_enabled_by_readiness_work": false,
+      "native_check": {
+        "status": "passed",
+        "architectures": [
+          "sm75",
+          "sm86"
+        ],
+        "command": "cargo check --locked --offline --release --features native-cuda --lib --tests",
+        "log": "/home/ben/fifi-scratch/3f4bd6ae71d7/merge-readiness/evidence/native-43-check.log",
+        "sha256": "2efb3869a1848e6d8882026c47521de8dd167ced63905cc41135320839178cfd"
+      }
+    },
+    {
+      "pr": 44,
+      "url": "https://github.com/zbrdc/fifi/pull/44",
+      "commit": "65b9d5b4b7773717dbfbb35a1aaeac07348f229d",
+      "ci": {
+        "required_jobs": [
+          "rust",
+          "scripts"
+        ],
+        "exact_commit_checks": "https://github.com/zbrdc/fifi/commit/65b9d5b4b7773717dbfbb35a1aaeac07348f229d/checks",
+        "status_source": "Live GitHub check runs on this exact commit; required before marking the PR ready."
+      },
+      "merged": false,
+      "new_gpu_measurements": false,
+      "new_device_qualification": false,
+      "experimental_default_enabled_by_readiness_work": false,
+      "native_check": {
+        "status": "passed",
+        "architectures": [
+          "sm75",
+          "sm86"
+        ],
+        "command": "cargo check --locked --offline --release --features native-cuda --lib --tests",
+        "log": "/home/ben/fifi-scratch/3f4bd6ae71d7/merge-readiness/evidence/native-44-check.log",
+        "sha256": "686ee145ee5589bc842325b40323cfa61f0b728d1460e13d8fa3d49d4c8805ff"
+      }
+    },
+    {
+      "pr": 46,
+      "url": "https://github.com/zbrdc/fifi/pull/46",
+      "commit": "3ac6343889275001bd92c2647653256d97bf660b",
+      "ci": {
+        "required_jobs": [
+          "rust",
+          "scripts"
+        ],
+        "exact_commit_checks": "https://github.com/zbrdc/fifi/commit/3ac6343889275001bd92c2647653256d97bf660b/checks",
+        "status_source": "Live GitHub check runs on this exact commit; required before marking the PR ready."
+      },
+      "merged": false,
+      "new_gpu_measurements": false,
+      "new_device_qualification": false,
+      "experimental_default_enabled_by_readiness_work": false,
+      "native_check": {
+        "status": "passed",
+        "architectures": [
+          "sm75",
+          "sm86"
+        ],
+        "command": "cargo check --locked --offline --release --features native-cuda --lib --tests",
+        "log": "/home/ben/fifi-scratch/3f4bd6ae71d7/merge-readiness/evidence/native-46-check.log",
+        "sha256": "9eb76c52b685c58b909c98f0ca63fc10b65176f19f62ffb5646352af1b68f06d"
+      }
+    },
+    {
+      "pr": 47,
+      "url": "https://github.com/zbrdc/fifi/pull/47",
+      "commit": "c666b9b168ad9a1f028aafc5a670a0f967ac3b07",
+      "ci": {
+        "required_jobs": [
+          "rust",
+          "scripts"
+        ],
+        "exact_commit_checks": "https://github.com/zbrdc/fifi/commit/c666b9b168ad9a1f028aafc5a670a0f967ac3b07/checks",
+        "status_source": "Live GitHub check runs on this exact commit; required before marking the PR ready."
+      },
+      "merged": false,
+      "new_gpu_measurements": false,
+      "new_device_qualification": false,
+      "experimental_default_enabled_by_readiness_work": false,
+      "native_check": {
+        "status": "passed",
+        "architectures": [
+          "sm75",
+          "sm86"
+        ],
+        "command": "cargo check --locked --offline --release --features native-cuda --lib --tests",
+        "log": "/home/ben/fifi-scratch/3f4bd6ae71d7/merge-readiness/evidence/native-47-check.log",
+        "sha256": "ea937ac9bdeb22974de4a078e56b9b411e1fb63edce9316f4c9efb024f71ae13"
+      }
+    },
+    {
+      "pr": 48,
+      "url": "https://github.com/zbrdc/fifi/pull/48",
+      "commit": "1dc6b9092fa7b7548ca882d99d4c0953fb685ff1",
+      "ci": {
+        "required_jobs": [
+          "rust",
+          "scripts"
+        ],
+        "exact_commit_checks": "https://github.com/zbrdc/fifi/commit/1dc6b9092fa7b7548ca882d99d4c0953fb685ff1/checks",
+        "status_source": "Live GitHub check runs on this exact commit; required before marking the PR ready."
+      },
+      "merged": false,
+      "new_gpu_measurements": false,
+      "new_device_qualification": false,
+      "experimental_default_enabled_by_readiness_work": false,
+      "native_check": {
+        "status": "passed",
+        "architectures": [
+          "sm75",
+          "sm86"
+        ],
+        "command": "cargo check --locked --offline --release --features native-cuda --lib --tests",
+        "log": "/home/ben/fifi-scratch/3f4bd6ae71d7/merge-readiness/evidence/native-48-check.log",
+        "sha256": "603adb2537ba404015fb9e89bd472e7587fd54449b99b70161f4335fd66a0ecb"
+      }
+    },
+    {
+      "pr": 51,
+      "url": "https://github.com/zbrdc/fifi/pull/51",
+      "commit": "5f0776b8946b9697c9baecc497f11c6be071f68e",
+      "ci": {
+        "required_jobs": [
+          "rust",
+          "scripts"
+        ],
+        "exact_commit_checks": "https://github.com/zbrdc/fifi/commit/5f0776b8946b9697c9baecc497f11c6be071f68e/checks",
+        "status_source": "Live GitHub check runs on this exact commit; required before marking the PR ready."
+      },
+      "merged": false,
+      "new_gpu_measurements": false,
+      "new_device_qualification": false,
+      "experimental_default_enabled_by_readiness_work": false
+    },
+    {
+      "pr": 53,
+      "url": "https://github.com/zbrdc/fifi/pull/53",
+      "commit": "fb39b90c3970d6d3747803838e4761a91400385e",
+      "ci": {
+        "required_jobs": [
+          "rust",
+          "scripts"
+        ],
+        "exact_commit_checks": "https://github.com/zbrdc/fifi/commit/fb39b90c3970d6d3747803838e4761a91400385e/checks",
+        "status_source": "Live GitHub check runs on this exact commit; required before marking the PR ready."
+      },
+      "merged": false,
+      "new_gpu_measurements": false,
+      "new_device_qualification": false,
+      "experimental_default_enabled_by_readiness_work": false
+    },
+    {
+      "pr": 54,
+      "url": "https://github.com/zbrdc/fifi/pull/54",
+      "commit": "d800018ea36c7abe61ea63a74bfd9dc9f52be149",
+      "ci": {
+        "required_jobs": [
+          "rust",
+          "scripts"
+        ],
+        "exact_commit_checks": "https://github.com/zbrdc/fifi/commit/d800018ea36c7abe61ea63a74bfd9dc9f52be149/checks",
+        "status_source": "Live GitHub check runs on this exact commit; required before marking the PR ready."
+      },
+      "merged": false,
+      "new_gpu_measurements": false,
+      "new_device_qualification": false,
+      "experimental_default_enabled_by_readiness_work": false,
+      "native_check": {
+        "status": "passed",
+        "architectures": [
+          "sm75",
+          "sm86"
+        ],
+        "command": "cargo check --locked --offline --release --features native-cuda --lib --tests",
+        "log": "/home/ben/fifi-scratch/3f4bd6ae71d7/merge-readiness/evidence/native-54-check.log",
+        "sha256": "3be05b3356cb17ccb45da532002171a45d8cbb4384ab91931e67ec83eb2d2d4b"
+      },
+      "native_module_cpu_tests": {
+        "status": "passed",
+        "counts": 9,
+        "logs": [
+          "/home/ben/fifi-scratch/3f4bd6ae71d7/merge-readiness/evidence/native-54-backing_label_tests-tests.log",
+          "/home/ben/fifi-scratch/3f4bd6ae71d7/merge-readiness/evidence/native-54-card_expert_timing__tests-tests.log",
+          "/home/ben/fifi-scratch/3f4bd6ae71d7/merge-readiness/evidence/native-54-card_prefill__-tests.log"
+        ]
+      }
+    },
+    {
+      "pr": 55,
+      "url": "https://github.com/zbrdc/fifi/pull/55",
+      "commit": "4440f9f67c5e0081c94e11b28238601db18c7cbf",
+      "ci": {
+        "required_jobs": [
+          "rust",
+          "scripts"
+        ],
+        "exact_commit_checks": "https://github.com/zbrdc/fifi/commit/4440f9f67c5e0081c94e11b28238601db18c7cbf/checks",
+        "status_source": "Live GitHub check runs on this exact commit; required before marking the PR ready."
+      },
+      "merged": false,
+      "new_gpu_measurements": false,
+      "new_device_qualification": false,
+      "experimental_default_enabled_by_readiness_work": false,
+      "native_check": {
+        "status": "passed",
+        "architectures": [
+          "sm75",
+          "sm86"
+        ],
+        "command": "cargo check --locked --offline --release --features native-cuda --lib --tests",
+        "log": "/home/ben/fifi-scratch/3f4bd6ae71d7/merge-readiness/evidence/native-55-check.log",
+        "sha256": "7b149c962ac65d2ce532f3527e57441c76ad1e0cd88d1140b1300d9e40766b36"
+      }
+    },
+    {
+      "pr": 56,
+      "url": "https://github.com/zbrdc/fifi/pull/56",
+      "commit": "2c548cc2843652ed2b329dc758e58a13748e43cd",
+      "ci": {
+        "required_jobs": [
+          "rust",
+          "scripts"
+        ],
+        "exact_commit_checks": "https://github.com/zbrdc/fifi/commit/2c548cc2843652ed2b329dc758e58a13748e43cd/checks",
+        "status_source": "Live GitHub check runs on this exact commit; required before marking the PR ready."
+      },
+      "merged": false,
+      "new_gpu_measurements": false,
+      "new_device_qualification": false,
+      "experimental_default_enabled_by_readiness_work": false,
+      "native_check": {
+        "status": "passed",
+        "architectures": [
+          "sm75",
+          "sm86"
+        ],
+        "command": "cargo check --locked --offline --release --features native-cuda --lib --tests",
+        "log": "/home/ben/fifi-scratch/3f4bd6ae71d7/merge-readiness/evidence/native-56-check.log",
+        "sha256": "c9784481a0afa7c4f4a98eb682e4513fea17b14df07a221970c0be8daecb2ae4"
+      }
+    },
+    {
+      "pr": 57,
+      "url": "https://github.com/zbrdc/fifi/pull/57",
+      "commit": "fa4688b0763132063497bb74025e85aa50cf51e7",
+      "ci": {
+        "required_jobs": [
+          "rust",
+          "scripts"
+        ],
+        "exact_commit_checks": "https://github.com/zbrdc/fifi/commit/fa4688b0763132063497bb74025e85aa50cf51e7/checks",
+        "status_source": "Live GitHub check runs on this exact commit; required before marking the PR ready."
+      },
+      "merged": false,
+      "new_gpu_measurements": false,
+      "new_device_qualification": false,
+      "experimental_default_enabled_by_readiness_work": false,
+      "focused_cpu_tests": {
+        "passed": 6,
+        "suite": "scripts/tests/test_p2p_client.py"
+      }
+    },
+    {
+      "pr": 59,
+      "url": "https://github.com/zbrdc/fifi/pull/59",
+      "commit": "3ded83415c4e1c7d3782a53312a3fb94f9264fdd",
+      "ci": {
+        "required_jobs": [
+          "rust",
+          "scripts"
+        ],
+        "exact_commit_checks": "https://github.com/zbrdc/fifi/commit/3ded83415c4e1c7d3782a53312a3fb94f9264fdd/checks",
+        "status_source": "Live GitHub check runs on this exact commit; required before marking the PR ready."
+      },
+      "merged": false,
+      "new_gpu_measurements": false,
+      "new_device_qualification": false,
+      "experimental_default_enabled_by_readiness_work": false,
+      "native_check": {
+        "status": "passed",
+        "architectures": [
+          "sm75",
+          "sm86"
+        ],
+        "command": "cargo check --locked --offline --release --features native-cuda --lib --tests",
+        "log": "/home/ben/fifi-scratch/3f4bd6ae71d7/merge-readiness/evidence/native-59-check.log",
+        "sha256": "3edb1035fd162c14cb8af99d3808dbc60c8d9c81ce22960e7a702e0cc6fad39f"
+      },
+      "native_module_cpu_tests": {
+        "status": "passed",
+        "counts": 7,
+        "logs": [
+          "/home/ben/fifi-scratch/3f4bd6ae71d7/merge-readiness/evidence/native-59-card_prefill__-tests.log"
+        ]
+      }
+    }
+  ],
+  "inventory_pr": 60,
+  "resolved": [
+    {
+      "pr": 54,
+      "resolution": "Expert timing ported to shared launch and chunk architecture; native build and nine focused CPU tests passed."
+    },
+    {
+      "pr": 59,
+      "resolution": "Pending delta is incremental per-layer KV staging. Ported with full memory admission accounting, shared-staging fallback, rewind safety and invalidation; native build and seven focused CPU tests passed."
+    },
+    {
+      "pr": 58,
+      "resolution": "Closed as superseded: current main already fuses contiguous expert-sum rows. Original snapshot/history preserved; older test code is not represented as merged."
+    },
+    {
+      "prs": [
+        29,
+        42,
+        43,
+        44,
+        46,
+        47,
+        48,
+        51,
+        53,
+        54,
+        55,
+        56,
+        57,
+        59
+      ],
+      "resolution": "Router startup fixture keeps an inherited listening socket and waits for explicit child readiness; original modified worktrees were preserved."
+    }
+  ],
+  "remaining_work": [
+    {
+      "owner": "GPU qualification coordinator",
+      "next_action": "Recover the CUDA driver/UVM host, then use normal runner admission for exact-commit correctness checks and matched 2080/P2P measurements.",
+      "wake_condition": "CUDA host recovery and GPU admission succeed.",
+      "blocks_integration": false
+    },
+    {
+      "owner": "Merge coordinator",
+      "next_action": "Review the listed commits and integrate in dependency order, rechecking later heads whenever main advances.",
+      "wake_condition": "Review accepted and required exact-commit CI green.",
+      "blocks_default_enablement": "Experiment qualification or an explicit owner decision is still required."
+    }
+  ],
+  "suggested_review_order": [
+    [
+      29,
+      42,
+      48,
+      51,
+      53,
+      57
+    ],
+    [
+      43,
+      46,
+      47,
+      54,
+      56,
+      59
+    ],
+    [
+      44,
+      55
+    ],
+    [
+      60
+    ]
+  ],
+  "publication_history": "pending-publication-20261117.json"
+}
