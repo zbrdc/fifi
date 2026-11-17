@@ -14,7 +14,8 @@
 //! For sums and gathers, each device's own wait supplies a two-exchange
 //! dependency chain. Consecutive broadcasts have only one publisher, so
 //! they also need a consumer barrier before a slot can be reused. The
-//! Qwen card stack offers an opt-in host synchronization for this case.
+//! Qwen card stack offers opt-in host or cross-device event synchronization
+//! for this case.
 //!
 //! [`PeerRing::reset`] re-zeroes every mailbox and restarts the sequence;
 //! it is the session boundary. It also serves the (practically unreachable)
@@ -40,9 +41,13 @@ use super::native;
 use crate::EngError;
 use crate::kernels::cuda::DeviceRange;
 
+/// The transport's payload ceiling, in f32 values: the largest single
+/// exchange the ring accepts (and the chunk driver's row cap basis).
+pub(crate) const MAX_VALUES: usize = native::peer_ring::MAX_VALUES;
+
 /// Bytes of slot header before the payload. Matches `kHeaderBytes` in
 /// `native/peer_ring.cu`.
-pub(crate) const HEADER_BYTES: usize = 128;
+const HEADER_BYTES: usize = 128;
 /// Payloads are allocated at the f32 stride so the fp32 diagnostic mode
 /// needs no second mailbox.
 const VALUE_BYTES: usize = 4;

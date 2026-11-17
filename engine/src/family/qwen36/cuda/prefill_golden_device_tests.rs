@@ -123,6 +123,7 @@ pub(super) fn table_text(list: &[(ChunkSlot, ArenaTensor)], total: usize, m: usi
 /// The explicit name of a chunk slot, so table digests never hash `Debug` text.
 fn slot_name(slot: &ChunkSlot) -> &'static str {
     match slot {
+        ChunkSlot::Zero => "zero",
         ChunkSlot::Hidden => "hidden",
         ChunkSlot::IdsTok => "ids_tok",
         ChunkSlot::X => "x",

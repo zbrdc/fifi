@@ -6,9 +6,10 @@
 //! - Both are `!Send` and `!Sync` (`PhantomData<*const ()>`), so the creating
 //!   thread is the only one that calls them.
 //! - Every method reports a terminal backend first, then checks its arguments
-//!   (an owner of another adapter is a `BadRequest`), then enters the dispatch
-//!   guard and makes the one native call. The raw calls stay in
-//!   `native::resident`; this module has none.
+//!   (an owner of another adapter is a `BadRequest`, except for the explicit
+//!   cross-device event wait), then enters the dispatch guard and makes the
+//!   one native call. The raw calls stay in `native::resident`; this module
+//!   has none.
 //! - Drop goes through [`release`]: after a terminal failure it makes
 //!   no native call and leaves the owner counted; a failed destroy latches the
 //!   backend. The native destroy of a stream synchronizes it first. Drop never
@@ -130,6 +131,19 @@ impl DeviceStream {
     pub(crate) fn wait(&self, event: &DeviceEvent) -> Result<(), EngError> {
         ensure_usable(&TERMINAL)?;
         same_adapter(&self.lease, &event.lease, "event")?;
+        self.wait_recorded(event)
+    }
+
+    /// Makes this stream wait on a recorded event from another CUDA context.
+    /// CUDA permits cross-device stream waits, but not cross-device event
+    /// records. This path is explicitly unavailable during graph capture.
+    pub(crate) fn wait_peer_event(&self, event: &DeviceEvent) -> Result<(), EngError> {
+        ensure_usable(&TERMINAL)?;
+        ensure_closed("a cross-device event wait")?;
+        self.wait_recorded(event)
+    }
+
+    fn wait_recorded(&self, event: &DeviceEvent) -> Result<(), EngError> {
         // CUDA treats a wait on an event that was never recorded as a silent no-op,
         // so a fork and join built on it would lose its ordering without a sign.
         if event.mark().is_none() {
