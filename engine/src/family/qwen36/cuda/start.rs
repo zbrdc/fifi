@@ -17,7 +17,7 @@ use super::super::settings::{
     WeightFormat, tokenizer_pin, weight_format_name,
 };
 use super::{
-    card_load::card_loads,
+    card_load::{ModelWeights, checkpoint_card_loads},
     card_session::{CardSession, Q36CudaStep},
     card_step::CardStack,
     card_weights::{load_card_weights, load_card_weights_mapped},
@@ -44,7 +44,7 @@ use crate::{
     family::{
         QWEN3_6_35B_A3B,
         exl3::bank::{Exl3SlotResolver, ExpertStore},
-        gguf_model::{GgufModel, Inventory, Role, open_qwen3_6_35b_a3b},
+        gguf_model::{GgufModel, Inventory, open_qwen3_6_35b_a3b},
         project::cuda::{
             BorrowedLoader, CudaProjector, CudaWeights, LoadOptions, Reserve, WeightLayout,
             served_admission,
@@ -739,29 +739,12 @@ pub(super) fn context_tokens(context_limit: u32, kv_mode: KvMode) -> Result<usiz
     Ok(context_tokens)
 }
 
-/// The KV bytes of ONE position under `kv_mode`, straight from the pool's own layout
-/// arithmetic (`KvPool::bytes_per_token`, 20,480 under Fp16 and 10,880 under Int8G32, pinned
-/// by the start tests), never a constant: the admission must follow the KV mode the config
-/// picked.
-pub(super) fn kv_bytes_per_position(kv_mode: KvMode) -> Result<u64, EngError> {
+/// Bytes the resident KV pool will allocate, including each plane's alignment.
+pub(super) fn kv_cache_bytes(context_tokens: usize, kv_mode: KvMode) -> Result<u64, EngError> {
     let inventory = Inventory::for_spec(&QWEN3_6_35B_A3B)?;
     let shape = HostShape::from_spec(&QWEN3_6_35B_A3B, ROTARY_DIM)?;
     let dims = StepDims::new(&shape, &inventory)?;
-    u64::try_from(KvPool::bytes_per_token(&dims, kv_mode)?).map_err(|_| {
-        EngError::MemoryPlan("cuda admission: the KV bytes per position exceed u64".into())
-    })
-}
-
-/// The KV cache bytes of `context_tokens` positions of `kv_mode`, in checked arithmetic: the
-/// number is the loader's admission term, so an impossible product is refused at planning
-/// time. A u32 limit cannot overflow u64; the largest limits are refused by the admission
-/// itself.
-pub(super) fn kv_cache_bytes(context_tokens: usize, kv_mode: KvMode) -> Result<u64, EngError> {
-    let positions = u64::try_from(context_tokens)
-        .map_err(|_| EngError::MemoryPlan("cuda admission: KV positions exceed u64".into()))?;
-    kv_bytes_per_position(kv_mode)?
-        .checked_mul(positions)
-        .ok_or_else(|| EngError::MemoryPlan("cuda admission: the KV bytes overflow u64".into()))
+    Ok(KvPool::new(&dims, kv_mode, context_tokens)?.total as u64)
 }
 
 /// The load options of the engine: THE ONE PLACE the reserve terms and the load layout live
@@ -1011,18 +994,8 @@ fn make_multi(
     let kv_mode = kv_mode_of(settings.kv, WeightLayout::Native)?;
     let options = step_options(settings.context_limit, WeightLayout::Native, kv_mode)?;
     stages.begin("planning shards");
-    // The shard plans size each card's upload from the file's expert quant; layer 0's
-    // expert gate names the tensor that carries it.
     let layers = LayerTable::new(&dims, &inventory)?;
-    let gate = layers.name(0, Role::FfnGateExps)?;
-    let quant = model
-        .weights
-        .header()
-        .tensor(gate)
-        .ok_or_else(|| {
-            EngError::Checkpoint(format!("gguf model: tensor {gate} is not in the file"))
-        })?
-        .ggml_type();
+    let weights = ModelWeights::from_checkpoint(&inventory, model.weights.header())?;
     // Experimental and default off: the bandwidth-waterfill placement
     // planner redistributes the sliceable roles instead of the even deal.
     // The planner budgets every sliced weight as card-resident, so each
@@ -1049,11 +1022,9 @@ fn make_multi(
         }
         let policy = PlacementPolicy::default();
         let request = PlacementRequest {
-            shape: &shape,
-            inventory: &inventory,
-            quant,
-            kv_capacity_rows: settings.context_limit as usize,
-            delta_slots: options.delta_slots,
+            dims: &dims,
+            options: &options,
+            weights: &weights,
             profiles: &profiles,
             policy: &policy,
         };
@@ -1065,33 +1036,10 @@ fn make_multi(
         planned = Some(plan);
         &planned.as_ref().expect("just set").table
     } else {
-        even_table = ShardTable::new(&shape, settings.cuda_devices.len(), 256)?;
+        even_table = ShardTable::new(&shape, settings.cuda_devices.len(), weights.column_block)?;
         &even_table
     };
-    let loads = card_loads(table, &inventory, quant)?;
-    let fixed_admission = plan.modes.fixed_admission;
-    // The load reserve keeps the single-device figure except its state
-    // term: the card caches are SLICED (each card stores only its own K/V
-    // head groups), so the largest card's sliced state replaces the full
-    // replica's. Over-reserving only refuses a tight fit earlier, never
-    // corrupts it, and the post-load floor check still guards every card.
-    let reserve = {
-        let head_dim = dims.shape.attn.head_dim;
-        let full_state = u64::try_from(StateLayout::new(&dims, &options)?.bytes()?)
-            .map_err(|_| EngError::MemoryPlan("card state layout overflows u64".into()))?;
-        let mut max_card_state: u64 = 0;
-        for card in 0..settings.cuda_devices.len() {
-            let heads = table.kv_rows(card)?.len() / head_dim;
-            let bytes =
-                u64::try_from(StateLayout::new_with_kv_heads(&dims, &options, heads)?.bytes()?)
-                    .map_err(|_| EngError::MemoryPlan("card state layout overflows u64".into()))?;
-            max_card_state = max_card_state.max(bytes);
-        }
-        plan.reserve
-            .saturating_sub(full_state)
-            .saturating_add(max_card_state)
-    };
-    let load = load_options(reserve, fixed_admission);
+    let loads = checkpoint_card_loads(table, &weights)?;
     // Experimental and default off. The original variable controls card 1;
     // the new card-0 variable leaves that existing setting compatible.
     let first_var = "Q36_P2P_HOST_EXPERT_BYTES_0";
@@ -1111,6 +1059,9 @@ fn make_multi(
         None => CardStack::new(&dims, &options, &settings.cuda_devices, &served_admission())?,
     };
     stages.begin("loading weights");
+    // CardStack already allocated the state pools and arenas on these contexts.
+    // The borrowed loaders query free VRAM again, so only upload headroom is outstanding.
+    let load = load_options(0, plan.modes.fixed_admission);
     let mut loaded = Vec::with_capacity(loads.len());
     for (card, set) in loads.iter().enumerate() {
         let loader = BorrowedLoader::new(&stack.contexts()[card])?;

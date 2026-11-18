@@ -2,7 +2,11 @@
 //! 10 GB RTX 3080 and 12 GB RTX 3060 pair), overcommitment refusal, and
 //! conservative tie-breaks. No GPU needed: profiles are injected.
 
+use super::card_load::ModelWeights;
+use super::dims::{KvMode, StepDims};
+use super::start::step_options;
 use crate::EngError;
+use crate::family::project::cuda::WeightLayout;
 use crate::family::qwen36::cuda::placement::{
     DeviceProfile, PlacementPlan, PlacementPolicy, PlacementRequest, plan_placement,
 };
@@ -66,15 +70,28 @@ fn plan_for(
     profiles: &[DeviceProfile],
     quant: GgufType,
 ) -> Result<PlacementPlan, EngError> {
+    plan_at(spec, profiles, quant, 4096, KvMode::Int8G32, 4)
+}
+
+fn plan_at(
+    spec: &FamilySpec,
+    profiles: &[DeviceProfile],
+    quant: GgufType,
+    context: u32,
+    mode: KvMode,
+    slots: usize,
+) -> Result<PlacementPlan, EngError> {
     let shape = HostShape::from_spec(spec, 64)?;
     let inventory = Inventory::for_spec(spec)?;
     let policy = PlacementPolicy::default();
+    let dims = StepDims::new(&shape, &inventory)?;
+    let mut options = step_options(context, WeightLayout::Native, mode)?;
+    options.delta_slots = slots;
+    let weights = ModelWeights::uniform(&inventory, quant)?;
     let request = PlacementRequest {
-        shape: &shape,
-        inventory: &inventory,
-        quant,
-        kv_capacity_rows: 4096,
-        delta_slots: 4,
+        dims: &dims,
+        options: &options,
+        weights: &weights,
         profiles,
         policy: &policy,
     };
@@ -427,24 +444,21 @@ fn unequal_bandwidth_reports_geometry_cap() {
 fn the_real_shape_deals_rows_the_native_matvec_accepts() {
     use crate::family::qwen36::cuda::pinned::ROTARY_DIM;
     let shape = HostShape::from_spec(&QWEN3_6_35B_A3B, ROTARY_DIM).expect("shape");
-    let inventory = Inventory::for_spec(&QWEN3_6_35B_A3B).expect("inventory");
     // The deployed pair with tonight's host-expert relief folded in.
     let mut p0 = rtx_3060_12g(11_292 * MIB);
     p0.free_bytes += 1_342_177_280;
     let mut p1 = rtx_3080_10g(9_060 * MIB);
     p1.free_bytes += 3_489_660_928;
     let profiles = [p0, p1];
-    let policy = PlacementPolicy::default();
-    let req = PlacementRequest {
-        shape: &shape,
-        inventory: &inventory,
-        quant: GgufType::Q4K,
-        kv_capacity_rows: 131072,
-        delta_slots: 1,
-        profiles: &profiles,
-        policy: &policy,
-    };
-    let PlacementPlan { runs, table, .. } = plan_placement(&req).expect("a feasible plan");
+    let PlacementPlan { runs, table, .. } = plan_at(
+        &QWEN3_6_35B_A3B,
+        &profiles,
+        GgufType::Q4K,
+        131072,
+        KvMode::Int8G32,
+        1,
+    )
+    .expect("a feasible plan");
     // Every dealt dimension covers its whole total exactly, and the two
     // dimensions whose rows resolve through the native matvec move in
     // multiples of four rows on every card.
@@ -475,5 +489,148 @@ fn the_real_shape_deals_rows_the_native_matvec_accepts() {
     for card in 0..2 {
         let vh = table.value_heads(card).expect("value heads").len();
         assert_eq!(vh % 4, 0, "card {card} beta/alpha rows {vh}");
+    }
+}
+
+#[test]
+fn long_context_admission_matches_local_heads_format_and_replicated_delta() {
+    let mut spec = FamilySpec {
+        heads_q: 32,
+        heads_kv: 4,
+        ..scaled_spec()
+    };
+    // Four 8-head DeltaNet groups give every card a legal nonempty shard.
+    spec.linear.as_mut().unwrap().key_heads = 8;
+    let shape = HostShape::from_spec(&spec, 64).unwrap();
+    let inventory = Inventory::for_spec(&spec).unwrap();
+    let dims = StepDims::new(&shape, &inventory).unwrap();
+    for n in 1..=4 {
+        let profiles: Vec<_> = (0..n)
+            .map(|device| DeviceProfile {
+                device,
+                free_bytes: 32 * GIB,
+                total_bytes: 32 * GIB,
+                can_access: vec![true; n],
+                ..rtx_3080_10g(32 * GIB)
+            })
+            .collect();
+        for context in [
+            2048, 4096, 8192, 16_384, 16_385, 32_768, 65_536, 131_072, 262_144,
+        ] {
+            for mode in [KvMode::Int8G32, KvMode::Fp16] {
+                let mut options = step_options(context, WeightLayout::Native, mode).unwrap();
+                options.delta_slots = 2;
+                let plan = plan_at(&spec, &profiles, GgufType::Q80, context, mode, 2).unwrap();
+                assert_no_overcommit(&plan);
+                for (i, card) in plan.receipt.cards.iter().enumerate() {
+                    let heads = plan.table.query_heads(i).unwrap().len() / 8;
+                    let layout =
+                        super::state_layout::StateLayout::new_with_kv_heads(&dims, &options, heads)
+                            .unwrap();
+                    assert_eq!(card.kv_cache_bytes, layout.kv.total as u64);
+                    assert_eq!(card.delta_state_bytes, layout.delta.total as u64);
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn admission_honors_an_exact_two_card_cache_budget_and_refuses_a_larger_format() {
+    let spec = scaled_spec();
+    let mut profiles = [rtx_3080_10g(10 * GIB), rtx_3080_10g(10 * GIB)];
+    let plan = plan_at(&spec, &profiles, GgufType::Q80, 262144, KvMode::Int8G32, 1).unwrap();
+    for (profile, card) in profiles.iter_mut().zip(plan.receipt.cards) {
+        profile.free_bytes = card.planned_bytes + card.safety_reserve_bytes;
+    }
+    let fit = plan_at(&spec, &profiles, GgufType::Q80, 262144, KvMode::Int8G32, 1).unwrap();
+    assert_no_overcommit(&fit);
+    assert!(plan_at(&spec, &profiles, GgufType::Q80, 262144, KvMode::Fp16, 1).is_err());
+}
+
+#[test]
+fn mixed_tensor_types_determine_cut_alignment_and_match_the_upload_manifest() {
+    let spec = scaled_spec();
+    let inventory = Inventory::for_spec(&spec).unwrap();
+    let shape = HostShape::from_spec(&spec, 64).unwrap();
+    let dims = StepDims::new(&shape, &inventory).unwrap();
+    let weights = ModelWeights::from_types(&inventory, |name, allowed| {
+        let ty = if name.ends_with("ffn_down_exps.weight") {
+            GgufType::Q6K
+        } else {
+            GgufType::Q80
+        };
+        Ok(if allowed.contains(&ty) {
+            ty
+        } else {
+            allowed[0]
+        })
+    })
+    .unwrap();
+    assert_eq!(
+        weights.get("blk.0.ffn_gate_exps.weight").unwrap().ty,
+        GgufType::Q80
+    );
+    assert_eq!(
+        weights.get("blk.0.ffn_down_exps.weight").unwrap().ty,
+        GgufType::Q6K
+    );
+    assert_eq!(weights.column_block, 256);
+    let plan = plan_placement(&PlacementRequest {
+        dims: &dims,
+        options: &step_options(2048, WeightLayout::Native, KvMode::Int8G32).unwrap(),
+        weights: &weights,
+        profiles: &[rtx_3080_10g(10 * GIB), rtx_3060_12g(12 * GIB)],
+        policy: &PlacementPolicy::default(),
+    })
+    .unwrap();
+    let uploads = super::card_load::checkpoint_card_loads(&plan.table, &weights).unwrap();
+    for (card, manifest) in plan.receipt.cards.iter().zip(uploads) {
+        assert_eq!(card.sliced_weights_bytes, manifest.sliced_bytes);
+        assert_eq!(card.replicated_weights_bytes, manifest.whole_bytes);
+        assert_eq!(card.embedding_bytes, manifest.solo_bytes);
+    }
+}
+
+#[test]
+#[ignore = "requires the Qwen3.6 35B GGUF checkpoint on disk; CPU only"]
+fn checkpoint_placement_matches_the_two_card_manifest_at_256k() {
+    let dir = std::env::var_os("FIFI_QWEN36_MODEL_DIR").expect("set the model directory");
+    let (model, _) =
+        super::start::open_gguf(std::path::Path::new(&dir), false, false, None).unwrap();
+    let inventory = Inventory::for_spec(&QWEN3_6_35B_A3B).unwrap();
+    let shape = HostShape::from_spec(&QWEN3_6_35B_A3B, 64).unwrap();
+    let dims = StepDims::new(&shape, &inventory).unwrap();
+    let weights = ModelWeights::from_checkpoint(&inventory, model.weights.header()).unwrap();
+    let profiles = [
+        DeviceProfile {
+            total_bytes: 24 * GIB,
+            ..rtx_3080_10g(22 * GIB)
+        },
+        DeviceProfile {
+            total_bytes: 24 * GIB,
+            ..rtx_3060_12g(22 * GIB)
+        },
+    ];
+    let options = step_options(262_144, WeightLayout::Native, KvMode::Int8G32).unwrap();
+    let plan = plan_placement(&PlacementRequest {
+        dims: &dims,
+        options: &options,
+        weights: &weights,
+        profiles: &profiles,
+        policy: &PlacementPolicy::default(),
+    })
+    .unwrap();
+    let manifests = super::card_load::checkpoint_card_loads(&plan.table, &weights).unwrap();
+    for (i, (card, manifest)) in plan.receipt.cards.iter().zip(manifests).enumerate() {
+        assert_eq!(card.kv_cache_bytes, 1_426_063_360);
+        assert_eq!(card.sliced_weights_bytes, manifest.sliced_bytes);
+        assert_eq!(card.replicated_weights_bytes, manifest.whole_bytes);
+        assert_eq!(card.embedding_bytes, manifest.solo_bytes);
+        println!(
+            "card {i} checkpoint upload {} bytes, KV {} bytes",
+            manifest.upload_bytes(),
+            card.kv_cache_bytes
+        );
     }
 }

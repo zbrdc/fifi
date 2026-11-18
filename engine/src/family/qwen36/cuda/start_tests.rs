@@ -8,8 +8,8 @@ use super::pinned::ROTARY_DIM;
 use super::start::{
     BuildGuard, CUDA_ENGINE_BUILT, GGUF_BYTES, GGUF_NAME, allow_unpinned_wanted, already_built,
     check_gguf_identity, check_sha256, check_tiered_start, context_tokens, file_sha256,
-    ignored_mlx_line, kv_bytes_per_position, kv_cache_bytes, kv_mode_of, load_options, open_gguf,
-    pinned_gguf, select_gguf, serve_kv_mode, sha256_wanted, step_options, tiered_plan_of,
+    ignored_mlx_line, kv_cache_bytes, kv_mode_of, load_options, open_gguf, pinned_gguf,
+    select_gguf, serve_kv_mode, sha256_wanted, step_options, tiered_plan_of,
 };
 use super::state_layout::KvPool;
 use crate::EngError;
@@ -359,29 +359,26 @@ fn the_step_options_follow_the_context_limit_and_the_given_layout_and_mode() {
 }
 
 #[test]
-fn the_kv_bytes_per_position_is_the_pool_figure_of_the_pinned_shape_in_both_modes() {
-    // In both KV modes the admission's per-position term is the SAME figure the state layout
-    // computes for the pinned shape — 20,480 B under Fp16 and 10,880 B under Int8G32 — never
-    // an independent constant: the layout is the source, the two literals are the pin.
+fn admission_budgets_the_aligned_resident_kv_planes() {
     let dims = StepDims::new(
-        &HostShape::from_spec(&QWEN3_6_35B_A3B, ROTARY_DIM).expect("shape"),
-        &Inventory::for_spec(&QWEN3_6_35B_A3B).expect("inventory"),
+        &HostShape::from_spec(&QWEN3_6_35B_A3B, ROTARY_DIM).unwrap(),
+        &Inventory::for_spec(&QWEN3_6_35B_A3B).unwrap(),
     )
-    .expect("dims");
-    for (mode, want) in [(KvMode::Fp16, 20_480u64), (KvMode::Int8G32, 10_880u64)] {
-        let per_token = KvPool::bytes_per_token(&dims, mode).expect("bytes per token");
-        assert_eq!(u64::try_from(per_token).expect("u64"), want, "{mode:?}");
-        assert_eq!(
-            kv_bytes_per_position(mode).expect("per position"),
-            want,
-            "{mode:?}"
-        );
-        assert_eq!(
-            kv_cache_bytes(1, mode).expect("one position"),
-            want,
-            "{mode:?}"
-        );
+    .unwrap();
+    for mode in [KvMode::Fp16, KvMode::Int8G32] {
+        for context in [1, 2048, 2049, 32_768, 262_144] {
+            let bytes = kv_cache_bytes(context, mode).unwrap();
+            assert_eq!(
+                bytes,
+                KvPool::new(&dims, mode, context).unwrap().total as u64
+            );
+        }
     }
+    // At 2049 rows each Q8 scale plane needs another 224 bytes (two per layer).
+    assert_eq!(
+        kv_cache_bytes(2049, KvMode::Int8G32).unwrap(),
+        2049 * 10_880 + 4480
+    );
 }
 
 #[test]

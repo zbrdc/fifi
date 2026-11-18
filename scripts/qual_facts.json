@@ -16,8 +16,8 @@
   "targets": {
     "lib": {
       "path": "src/lib.rs",
-      "test_fns": 6906,
-      "ignored": 619,
+      "test_fns": 6911,
+      "ignored": 620,
       "env_gates": [
         "CUDA_MODULE_LOADING",
         "DEFAULT_ON_CHILD",
@@ -155,6 +155,7 @@
         "FIFI_PF_SPLIT",
         "FIFI_PF_TIMING_ONLY",
         "FIFI_Q36_SERVE_PHASE",
+        "FIFI_QWEN36_MODEL_DIR",
         "FIFI_RING_ORACLE_ROWS",
         "FIFI_RING_REF_TIMING",
         "FIFI_SCRATCH_ROOT",

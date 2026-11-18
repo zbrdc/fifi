@@ -6,6 +6,28 @@
 //! match.
 
 #[test]
+fn peer_weight_upload_only_reserves_headroom_after_card_states_are_allocated() {
+    let body = pinned(fn_section("fn make_multi("));
+    let create = body.find("let(stack,states)=").unwrap();
+    let options = body
+        .find("letload=load_options(0,plan.modes.fixed_admission);")
+        .unwrap();
+    let upload = body
+        .find("letloader=BorrowedLoader::new(&stack.contexts()[card])?;")
+        .unwrap();
+    assert!(create < options && options < upload);
+    for fixed in [false, true] {
+        let reserve = super::start::load_options(0, fixed).reserve;
+        assert_eq!(reserve.kv_cache, 0);
+        assert_eq!(
+            reserve.headroom as usize,
+            super::start::prefill_headroom(fixed)
+        );
+        assert!(reserve.headroom > 0);
+    }
+}
+
+#[test]
 fn serve_hands_the_capture_setting_to_the_step() {
     // The step cannot run on the CPU, so the wiring is pinned on start.rs's own text (the style of
     // the gate's build_step pin): comments stripped, whitespace collapsed, so only the real call

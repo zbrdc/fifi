@@ -1,6 +1,6 @@
 //! The K/V bytes golden of the device-side planning arithmetic: the pool's per-token figure for
 //! both modes, the prefill window bytes, the loader's admission term at real contexts, the
-//! placement stride and cache figures, and the `KvMode::name()` text the activation fingerprint
+//! placement cache figures, and the `KvMode::name()` text the activation fingerprint
 //! embeds (`step_activation.rs`). A change that moves any of these numbers must re-capture
 //! deliberately and name the move in the commit message. `FIFI_GOLDEN_UPDATE=1` rewrites this
 //! family's golden file beside the module.
@@ -75,7 +75,7 @@ fn admission_text() -> String {
             let _ = writeln!(text, "window {window} {label} kv_bytes={bytes}");
         }
     }
-    for context in [4_096usize, 32_768, 262_144] {
+    for context in [2_049usize, 4_096, 32_768, 262_144] {
         for (label, mode) in [("fp16", KvMode::Fp16), ("int8g32", KvMode::Int8G32)] {
             let bytes = start::kv_cache_bytes(context, mode).unwrap();
             let _ = writeln!(text, "context {context} {label} kv_cache_bytes={bytes}");
@@ -84,15 +84,25 @@ fn admission_text() -> String {
     text
 }
 
-/// The placement stride and whole-cache figures the placement plan charges.
+/// What the planner charges for a whole device or one half of the peer pair.
 fn placement_text() -> String {
+    use super::shard::ShardTable;
+    use crate::family::project::cuda::WeightLayout;
     let mut text = String::new();
-    let shape = HostShape::from_spec(&QWEN3_6_35B_A3B, 64).expect("real shape");
-    let stride = placement::kv_layer_stride_bytes(&shape).unwrap();
-    let _ = writeln!(text, "stride_bytes={stride}");
-    for capacity in [16_384usize, 45_056] {
-        let bytes = placement::kv_cache_bytes(&shape, 40, capacity).unwrap();
-        let _ = writeln!(text, "layers 40 capacity {capacity} kv_cache_bytes={bytes}");
+    let dims = dims();
+    for n in [1, 2] {
+        let table = ShardTable::new(&dims.shape, n, 256).unwrap();
+        for capacity in [2048, 16_385, 262_144] {
+            for mode in [KvMode::Fp16, KvMode::Int8G32] {
+                let opts = start::step_options(capacity, WeightLayout::Native, mode).unwrap();
+                let bytes = placement::card_kv_bytes(&dims, &opts, &table, 0).unwrap();
+                let _ = writeln!(
+                    text,
+                    "{n} cards capacity {capacity} {} card0_kv_bytes={bytes}",
+                    mode.name()
+                );
+            }
+        }
     }
     text
 }

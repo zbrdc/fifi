@@ -1,9 +1,9 @@
 {
   "family": "qwen36-cuda",
   "arms": {
-    "admission": "74976ea7c4260a076a27313ae8ee92fda9083187ae1bb5585e4f6a3d8f45a939",
+    "admission": "37de851cc90d40bcbe30f7d003065dc9c2895b4fa86a96b8070a58634f7796ef",
     "dtype": "c389e10e489bb1b2f8d76ba5ca05536e1eecb00f49f7a80ac6127745cb83198b",
-    "placement": "40175464011268b4c53d8167343d54c99dd72f0c6202862aad85dbc771bc8c49",
+    "placement": "4874145062c814adeb344fabce092ae6e3545a4d3bc5171b697968bd4b5777be",
     "pool": "4f06bbd82976d0791d08f647625a54c865bb330753e4d9e3a77db2c65cb5a717"
   }
 }
