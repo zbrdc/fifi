@@ -1,6 +1,6 @@
 #pragma once
 
-// Host-only launch policy; callers validate that count is 1..=1<<20.
+// Host-only launch policy; callers validate their payload-specific bounds.
 namespace fifi_ring {
 
 constexpr int kValuesPerBlock = 256 * 8;

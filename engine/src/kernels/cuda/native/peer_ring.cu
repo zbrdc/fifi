@@ -9,7 +9,8 @@
 
 namespace {
 
-constexpr int kMaxValues = 1 << 20;
+constexpr int kMaxValues = 1 << 21;
+constexpr int kMaxF16Values = 1 << 20;
 constexpr int kMaxPeers = 3;
 constexpr unsigned kStatusTimeout = 1u;
 constexpr unsigned kStatusOverflow = 2u;
@@ -261,7 +262,7 @@ extern "C" int inference_cuda_ring_publish_f16(void *stream,
                                                void *dst_slot, int count,
                                                unsigned seq) {
     try {
-        if (!publish_args_ok(src, dst_slot, count, seq)) {
+        if (!publish_args_ok(src, dst_slot, count, seq) || count > kMaxF16Values) {
             return INFERENCE_CUDA_INVALID_ARGUMENT;
         }
         (void)cudaGetLastError();
@@ -308,7 +309,7 @@ extern "C" int inference_cuda_ring_wait_sum_f16(
     unsigned *status) {
     try {
         if (!wait_args_ok(out, own, peer_slot0, peer_slot1, peer_slot2,
-                          peer_count, count, seq, status)) {
+                          peer_count, count, seq, status) || count > kMaxF16Values) {
             return INFERENCE_CUDA_INVALID_ARGUMENT;
         }
         (void)cudaGetLastError();

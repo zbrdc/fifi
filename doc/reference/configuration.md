@@ -40,9 +40,9 @@ Model weights must be on local storage; network storage is not a tier or a fallb
 
 ### CUDA FP16 prefill attention
 
-FP16 prefill attention retains the original PTX-based launch path by default. Set [`FIFI_CUDA_ATTN_PREFILL_ADAPT=1`](environment.md#cuda) before engine startup to opt into selection for the current CUDA device and model geometry. The adaptive path uses the loaded kernel's PTX version, the device's per-block shared-memory limit and the device and kernel thread limits. It selects the tensor-core arm when it fits and its loaded code supports it, otherwise the compact SIMT arm when that fits. If neither fits, or a device query or shared-memory opt-in fails, the launch returns an error. Successful adaptive selections are cached per device and geometry.
+FP16 prefill attention retains the existing PTX-based launch path by default. Set [`FIFI_CUDA_ATTN_PREFILL_ADAPT=1`](environment.md#cuda) before engine startup to opt into selection for the current CUDA device and model geometry. The adaptive path uses the loaded kernel's PTX version, the device's per-block shared-memory limit and the device and kernel thread limits. It selects the tensor-core arm when it fits and its loaded code supports it, otherwise the compact SIMT arm when that fits. If neither fits, or a device query or shared-memory opt-in fails, the launch returns an error. Successful adaptive selections are cached per device and geometry.
 
-This selection applies to the FP16 attention part kernel, not every model kernel or the q8 attention path. It does not establish correctness or performance for every GPU and model. Device qualification of the selection across RTX 20, 30, 40 and 50 series remains open. The build must also contain compatible device code; see [`INFERENCE_CUDA_ARCHS`](environment.md#build).
+This selection applies to the FP16 attention part kernel, not every model kernel or the q8 attention path. It does not establish correctness or performance for every GPU and model. Device qualification of the selection across RTX 20, 30, 40 and 50 series remains open; see the [evidence and its limits](../explanation/adaptive-attention-evidence.md). The build must also contain compatible device code; see [`INFERENCE_CUDA_ARCHS`](environment.md#build).
 
 ## `qwen36`
 

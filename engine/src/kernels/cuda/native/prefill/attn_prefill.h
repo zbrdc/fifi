@@ -49,18 +49,12 @@
  * writes NaN to out, and each ORs mask 8 (INFERENCE_CUDA_PREFILL_STATUS_BOUND_VIOLATION) into
  * *status when status != NULL. A valid launch touches neither.
  *
- * The D256 MMA part uses 96 KB of dynamic shared memory; D128 uses 64 KB (two cp.async K/V stages
- * and a 32 KB score exchange). By default the entry retains the original PTX-selected kernel and
- * original shared-memory layout and launch request. With FIFI_CUDA_ATTN_PREFILL_ADAPT=1, it queries
- * the current CUDA device's per-block opt-in limit
- * and each kernel's static shared allocation, then prefers MMA when the loaded PTX supports it and
- * the request fits. Otherwise it selects an fp32 SIMT part kernel
- * (grid (max_splits, n_kv_head, q_tiles), 128 threads), requesting 64/32 KB for D256/D128.
- * It reports an error if neither arm fits; CUDA query and opt-in errors propagate. Successful
- * selections are cached per device and model geometry. SIMT computes within the prefill-attention
- * tolerance, not bit for bit. The legacy pre-sm80 SIMT layout has been compile-only (no board run);
- * RTX 2080 Ti runs of the single-buffer arm are recorded in
- * scripts/benchmarks/qwen36-adaptive-attention-device-observations.json.
+ * The default selects by loaded PTX and preserves the existing launch path. The D256 MMA part
+ * uses 96 KiB of dynamic shared memory; D128 uses 64 KiB. The SIMT arm uses a single K/V stage
+ * and requests 64/32 KiB for D256/D128. SIMT computes within the prefill-attention tolerance,
+ * not bit for bit. With FIFI_CUDA_ATTN_PREFILL_ADAPT=1, the launch also checks the current
+ * device's per-block shared-memory and thread limits and the compiled kernels' attributes;
+ * successful choices are cached per device and model geometry. Query or opt-in failures propagate.
  *
  * Legacy F16 NaN isolation is per 64-row query tile, not per row: a NaN V cell inside a tile's key range
  * reaches every row of that tile (a row that does not see the key still multiplies p = 0 by
