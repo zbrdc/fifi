@@ -18,7 +18,7 @@
 //! those ranges first.
 //!
 //! Argued, not tested: the `shared memory` rule of the builder cannot fire on a real device
-//! (4 * 2,048 bytes against the 48 KiB every built device has, FIFI_MIN_SMPBO); it exists so
+//! (4 * 4,096 bytes against the 48 KiB every built device has, FIFI_MIN_SMPBO); it exists so
 //! that a raised chunk cap fails typed (mmid.cu:147).
 
 use super::{
@@ -641,7 +641,7 @@ fn mmq_mmid_refuses_id_shapes_out_of_range() {
         ("n_experts", MmidShape { n_experts: 0, m: 1, top_k: 1 }),
         ("n_experts", MmidShape { n_experts: 65_536, m: 1, top_k: 1 }),
         ("m", MmidShape { n_experts: 256, m: 0, top_k: 8 }),
-        ("m", MmidShape { n_experts: 256, m: 2049, top_k: 8 }),
+        ("m", MmidShape { n_experts: 256, m: 4097, top_k: 8 }),
         ("top_k", MmidShape { n_experts: 256, m: 1, top_k: 0 }),
         ("top_k", MmidShape { n_experts: 256, m: 1, top_k: 33 }),
         ("top_k", MmidShape { n_experts: 4, m: 1, top_k: 5 }),
@@ -1351,4 +1351,108 @@ fn the_tile_hint_reaches_q4_k_only() {
     set_hint_override(None);
     assert_eq!(q4k.ncols_opt, 8, "Q4_K follows the hint");
     assert_eq!(q6k.ncols_opt, 128, "Q6_K keeps the whole-chunk tile");
+}
+
+/// Exercise the enlarged token and gathered-row bounds against two legacy-sized launches.
+/// Every output and pad is checked; sampled rows also have an independent f64 reference.
+#[test]
+fn extended_rows_match_split_launches_and_sampled_reference() {
+    use rig::{LaunchSpec, dequantized, expert_blocks, gate_dst, launch_once, normal_rows};
+    if !testkit::device_present("extended_rows_match_split_launches_and_sampled_reference") {
+        return;
+    }
+    for quant in [QuantType::Q4K, QuantType::Q6K] {
+        for m in [4095, 4096] {
+            for gather in [false, true] {
+                let shape = MmidShape {
+                    n_experts: 8,
+                    m,
+                    top_k: 8,
+                };
+                let (k, n, ld) = (256, 32, 40);
+                let rows: Vec<_> = (0..m)
+                    .flat_map(|t| (0..8).map(move |slot| ((slot + t) % 8) as i32))
+                    .collect();
+                let x = normal_rows(if gather { m * 8 } else { m }, k, 0x4096);
+                let weights = expert_blocks(quant, 8, n, k, 0x4097);
+                let spec = LaunchSpec {
+                    shape,
+                    quant,
+                    k,
+                    n,
+                    ld,
+                    rows: &rows,
+                    x: &x,
+                    gather,
+                };
+                let (whole, split) = (|| -> Result<_, EngError> {
+                    let ctx = CudaContext::new()?;
+                    let stream = ctx.stream()?;
+                    let w = ctx.upload(&weights)?;
+                    let whole = launch_once(&ctx, &stream, &w, &spec)?;
+                    let mut split = Vec::new();
+                    for (start, count) in [(0, 2048), (2048, m - 2048)] {
+                        let stride = k * if gather { 8 } else { 1 };
+                        let part = LaunchSpec {
+                            shape: MmidShape { m: count, ..shape },
+                            rows: &rows[start * 8..(start + count) * 8],
+                            x: &x[start * stride..(start + count) * stride],
+                            ..spec
+                        };
+                        split.push(launch_once(&ctx, &stream, &w, &part)?);
+                    }
+                    Ok((whole, split))
+                })()
+                .expect("extended grouped device phase");
+                assert_eq!(whole.status, 0);
+                gate_dst(&whole.dst, (m * 8, n, ld), "whole");
+                let mut offset = 0;
+                let (mut error, mut energy) = (0.0f64, 0.0f64);
+                for (part, count) in split.iter().zip([2048, m - 2048]) {
+                    assert_eq!(part.status, 0);
+                    gate_dst(&part.dst, (count * 8, n, ld), "split");
+                    for row in 0..count * 8 {
+                        for col in 0..n {
+                            let a = f64::from(whole.dst[(offset + row) * ld + col]);
+                            let b = f64::from(part.dst[row * ld + col]);
+                            error += (a - b) * (a - b);
+                            energy += b * b;
+                        }
+                    }
+                    offset += count * 8;
+                }
+                assert_eq!(offset, m * 8);
+                assert!(
+                    energy > 0.0 && error / energy <= 1e-10,
+                    "split NMSE {}",
+                    error / energy
+                );
+                let deq = dequantized(quant, &weights);
+                let (mut error, mut energy) = (0.0f64, 0.0f64);
+                for token in [0, 2047, 2048, m - 2, m - 1] {
+                    for slot in 0..8 {
+                        let row = token * 8 + slot;
+                        let expert = rows[row] as usize;
+                        let xr = if gather { row } else { token };
+                        for col in 0..n {
+                            let want: f64 = (0..k)
+                                .map(|c| {
+                                    f64::from(deq[(expert * n + col) * k + c])
+                                        * f64::from(x[xr * k + c])
+                                })
+                                .sum();
+                            let delta = f64::from(whole.dst[row * ld + col]) - want;
+                            error += delta * delta;
+                            energy += want * want;
+                        }
+                    }
+                }
+                println!(
+                    "extended grouped {quant:?} M{m} gather={gather}: sampled NMSE {:.3e}",
+                    error / energy
+                );
+                assert!(energy > 0.0 && error / energy <= 1e-3);
+            }
+        }
+    }
 }

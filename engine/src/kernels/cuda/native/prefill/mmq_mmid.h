@@ -56,7 +56,7 @@
  * y, ids_dst or expert_bounds.
  * One more int index of the vendored kernels, bounded only by the shape caps: the y-tile copies
  * compute ncols_y * (kb0 * qk / 128) * 36 in int (mmq.cuh:859, :875), at most
- * 65,536 * 256 * 36 = 603,979,776 under m <= 2048, top_k <= 32 and K <= 32768. Raising a cap
+ * 131,072 * 256 * 36 = 1,207,959,552 under m <= 4096, top_k <= 32 and K <= 32768. Raising a cap
  * reopens it, so it is recorded here rather than left implicit in the caps.
  * Output: dst[ids_dst[j] * ld + i] for compact column j and row i < N (mmq.cuh:470), so row
  * t * top_k + r holds pick r of token t. The ids must carry the values of an MmidIds (ids_dst a
@@ -64,7 +64,7 @@
  * expert); this entry checks their capacities, the Rust type proves the values.
  *
  * Shape rules every entry shares: 1 <= n_experts <= 65535 (the z extent of the MMQ tiling grid),
- * 1 <= m <= 2048 (the chunk cap), 1 <= top_k <= min(n_experts, 32). Pointers are
+ * 1 <= m <= 4096 (the chunk cap), 1 <= top_k <= min(n_experts, 32). Pointers are
  * 4-byte aligned, and every written range shares no byte with any other range of the call. A
  * violated rule is INFERENCE_CUDA_INVALID_ARGUMENT before any CUDA call. The launches are
  * asynchronous on stream and never synchronize.
@@ -80,7 +80,7 @@ extern "C" {
 #endif
 
 #define INFERENCE_CUDA_MMQ_MMID_MAX_EXPERTS 65535
-#define INFERENCE_CUDA_MMQ_MMID_MAX_TOKENS 2048
+#define INFERENCE_CUDA_MMQ_MMID_MAX_TOKENS 4096
 #define INFERENCE_CUDA_MMQ_MMID_MAX_TOP_K 32
 /* Mask 1 of the prefill status word: a router fault row (every slot -1), route_experts. */
 #define INFERENCE_CUDA_MMQ_IDS_ROUTER_FAULT 0x1

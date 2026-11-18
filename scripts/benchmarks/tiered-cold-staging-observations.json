@@ -1,0 +1,57 @@
+{
+  "scope": "Two single-request server-log observations from an experimental tiered chunk run, not an exact-tip or matched A/B qualification.",
+  "source": {
+    "artifact": "cold-qual-engine.log",
+    "sha256": "48b14b82f53a9b847575ec46ad196694ccce5acd38695fa85835865b820d6a81",
+    "source_commit": null,
+    "binary_sha256": null,
+    "device_identity_independently_verified": false
+  },
+  "log_configuration": {
+    "engine_id": "q36-2080ti",
+    "context_limit": 65536,
+    "kv_cache": "int8g32",
+    "prefill_chunk_rows": 1024,
+    "tiered_slots_per_layer": 78,
+    "cpu_threads": 8
+  },
+  "limitations": [
+    "The run predates commit 40135e87d164d430a1a8b12915ea0bf7c93b0f41; the exact source tree and binary were not recorded in this log.",
+    "Engine name suggests an RTX 2080 Ti but the log does not independently identify the physical device.",
+    "These records alone do not establish a speedup: they contain no matched, repeated baseline or output-quality comparison.",
+    "These short requests do not qualify 128k or 256k context.",
+    "Server-reported prefill_ms is used; the rate is not a kernel-only measurement."
+  ],
+  "cold_requests": [
+    {
+      "request_id": "chatcmpl-0000000000000001",
+      "started_at_ms": 1794270855758,
+      "model": "fifi-q36-2080ti",
+      "engine": "q36-2080ti",
+      "status": 200,
+      "finish_reason": "length",
+      "prompt_tokens": 2147,
+      "completion_tokens": 1,
+      "reused_tokens": 0,
+      "queue_wait_ms": 0.0,
+      "prefill_ms": 8015.5,
+      "time_to_first_token_ms": 8015.5,
+      "prompt_tokens_per_second_from_prefill_ms": 267.86
+    },
+    {
+      "request_id": "chatcmpl-0000000000000003",
+      "started_at_ms": 1794270865173,
+      "model": "fifi-q36-2080ti",
+      "engine": "q36-2080ti",
+      "status": 200,
+      "finish_reason": "length",
+      "prompt_tokens": 3687,
+      "completion_tokens": 1,
+      "reused_tokens": 0,
+      "queue_wait_ms": 0.0,
+      "prefill_ms": 12270.9,
+      "time_to_first_token_ms": 12271.0,
+      "prompt_tokens_per_second_from_prefill_ms": 300.47
+    }
+  ]
+}

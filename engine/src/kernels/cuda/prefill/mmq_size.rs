@@ -42,12 +42,38 @@ pub(crate) const SRC1_LOAD_CHUNK: usize = 2048;
 /// column reaches it whatever J the launch picked, so no `ncols_opt` function is safe
 /// (worst-row margin 144 B).
 pub(crate) const Q8_1_PAD: usize = 128 * Q8_1_BLOCK_BYTES;
-/// The chunk-column domain of every sizing function (chunks are capped at 2,048 rows);
+/// The chunk-column domain of every sizing function (chunks are capped at 4,096 rows);
 /// wrappers refuse more through [`check_ncols_domain`].
-pub(crate) const NCOLS_LIMIT: usize = 2048;
-/// The architectures the engine compiles (the vendored trim, mmq.cuh:221-222): both at least
-/// Volta.
-const COMPILED_ARCHS: [i32; 2] = [720, 860];
+pub(crate) const NCOLS_LIMIT: usize = 4096;
+// Read the same generated list as the native chooser, at compile time. A fixed
+// [720, 860] list selects Volta shared-memory sizing for an sm_75 build.
+const ARCH_HEADER: &[u8] =
+    include_str!(concat!(env!("OUT_DIR"), "/fifi_cuda_arch_list.h")).as_bytes();
+const fn arch_count(header: &[u8]) -> usize {
+    let (mut count, mut i) = (1, 0);
+    while i < header.len() {
+        if header[i] == b',' {
+            count += 1;
+        }
+        i += 1;
+    }
+    count
+}
+const fn parse_archs<const N: usize>(header: &[u8]) -> [i32; N] {
+    let mut archs = [0; N];
+    let (mut at, mut i) = (0, 0);
+    while i < header.len() {
+        let byte = header[i];
+        if byte.is_ascii_digit() {
+            archs[at] = archs[at] * 10 + (byte - b'0') as i32;
+        } else if byte == b',' {
+            at += 1;
+        }
+        i += 1;
+    }
+    archs
+}
+const COMPILED_ARCHS: [i32; arch_count(ARCH_HEADER)] = parse_archs(ARCH_HEADER);
 const CC_VOLTA: i32 = 700;
 const CC_TURING: i32 = 750;
 pub(super) const J_MAX: usize = 128;
@@ -260,7 +286,7 @@ pub(crate) fn legacy_j_max(fallback: bool, cc: i32, ncols: usize) -> usize {
 
 /// The `ncols_opt` where a q8_1 buffer sized by the old rule (`pad = legacy_j_max * 144`,
 /// the pin's mmq.cu:136-137 and :206) under-pads the launch's need (`y_tile_span - r*144`),
-/// recomputed over the whole domain 1..=2048, never taken from a sweep.
+/// recomputed over the whole domain 1..=4096, never taken from a sweep.
 pub(crate) fn overread_window(
     mmq_type: MmqType,
     fallback: bool,
@@ -358,7 +384,7 @@ pub(crate) fn fixup_floats_exact(
         .ok_or_else(|| rule("size overflow", "the exact fixup bound overflows"))
 }
 
-/// The ncols domain guard: every rule above holds for `ncols` in `1..=2048`, and a caller
+/// The ncols domain guard: every rule above holds for `ncols` in `1..=4096`, and a caller
 /// that raises the chunk cap must extend this domain first.
 pub(crate) fn check_ncols_domain(ncols: usize) -> Result<(), EngError> {
     if ncols == 0 || ncols > NCOLS_LIMIT {

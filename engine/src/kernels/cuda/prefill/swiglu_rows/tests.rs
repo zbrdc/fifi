@@ -1,6 +1,6 @@
 //! Tests of the swiglu_rows wrapper: (1) the f64 reference under SW0, with the finiteness clause to
 //! |g| = 88 and the flush-to-zero cases reported; (2) the layout rows with canaries in the gaps;
-//! (3) shapes of 1, 7 and 16,384 rows; (4) bit equality of two runs; (5) canaries around `act`
+//! (3) shapes of 1, 7 and 32,768 rows; (4) bit equality of two runs; (5) canaries around `act`
 //! (every value test checks every byte of the act buffer); (6) the refusal tables, each guard
 //! reached and asserted by its own text; plus the numerics row against the decode path's
 //! `swiglu_q8` and the NaN/inf pass-through row.
@@ -294,7 +294,7 @@ fn report(what: &str, worst: &Worst) {
     );
 }
 
-/// Test (1) and the 16,384-row shape of (3): the Qwen MoE shape at the 8M = 16,384-row cap, gates
+/// Test (1) and the 32,768-row shape of (3): the Qwen MoE shape at the 8M = 32,768-row cap, gates
 /// uniform over SW0's whole domain [-12, 12), up values +-2^[-4, 4). Every value is graded.
 #[test]
 fn swiglu_rows_matches_the_f64_reference_within_sw0() {
@@ -313,9 +313,9 @@ fn swiglu_rows_matches_the_f64_reference_within_sw0() {
         .flat_map(|row| &row[..512]);
     let (low, high) = gates.fold((0f32, 0f32), |(lo, hi), &g| (lo.min(g), hi.max(g)));
     assert!(low < -11.988 && high > 11.988, "gates span [{low}, {high}]");
-    let worst = assert_act(&shape, &values, &act, "qwen 16,384 rows");
+    let worst = assert_act(&shape, &values, &act, "qwen 32,768 rows");
     assert_eq!(worst.graded, MAX_ROWS * 512, "every value is graded");
-    report("test 1, qwen 16,384 rows, |g| < 12", &worst);
+    report("test 1, qwen 32,768 rows, |g| < 12", &worst);
 }
 
 /// Normal inputs where flush-to-zero or the approximate division's large-denominator rule can
@@ -547,10 +547,10 @@ fn swiglu_rows_refuses_shapes_the_kernel_refuses() {
     const BIG: usize = 1 << 31;
     let tag = |rule: &str, detail: &str| format!("swiglu_rows: {rule}: {detail}");
     let cases = vec![
-        case("rows 0", &tag("rows", "rows is 0, not 1 to 16384"), |r| {
+        case("rows 0", &tag("rows", "rows is 0, not 1 to 32768"), |r| {
             r.shape.rows = 0
         }),
-        case("rows 16385", &tag("rows", "rows is 16385, not 1 to"), |r| {
+        case("rows 32769", &tag("rows", "rows is 32769, not 1 to"), |r| {
             r.shape.rows = MAX_ROWS + 1
         }),
         case("n_ff 0", &tag("n_ff", "n_ff is 0, not 4 to 32768"), |r| {
@@ -971,12 +971,12 @@ fn swiglu_rows_passes_nan_and_inf_through() {
 
 #[test]
 fn swiglu_rows_needs_are_exact() {
-    // The Qwen MoE shape at the 16,384-row cap: the whole [rows][1,024] gu and [rows][512] act.
+    // The Qwen MoE shape at the 32,768-row cap: the whole [rows][1,024] gu and [rows][512] act.
     assert_eq!(
         swiglu_rows_needs(&qwen(MAX_ROWS)),
         Some(SwigluRowsNeeds {
-            gu: 67_108_864,
-            act: 33_554_432
+            gu: 134_217_728,
+            act: 67_108_864
         })
     );
     // The layout shape of test 2: the last row ends at its up half (6 * 88 + 80 floats) and at

@@ -28,7 +28,7 @@
  * every rule so the native entry cannot latch the backend): a weight type with no dense case
  * (anything but Q8_0, Q4_K, Q6_K), k off the 256-value K grid or above 32768 (the k loop reads
  * 256 values per iteration with no k clamp, mmq.cuh:856; checked before the qk rule, which it
- * implies), m outside 1..=2048 (the chunk cap), n below 1, ld below col_off + n, a destination
+ * implies), m outside 1..=4096 (the chunk cap), n below 1, ld below col_off + n, a destination
  * reach `(m-1)*ld + n` above INT_MAX (the kernels index dst in 32-bit int), a tile grid
  * of 2^30 or more (`ceil(m/8)*ceil(n/128)*k/qk`, bounded with the smallest J, mmq.cuh:1402),
  * a NULL or misaligned pointer, and a written range (dst, fixup) that overlaps another range.
@@ -54,7 +54,7 @@ typedef struct inference_cuda_mmq_dense_args {
     int type;           /* ggml_type of the weight: Q8_0 = 8, Q4_K = 12, Q6_K = 14 */
     int k;              /* values per weight row: 256, 512, ..., 32768 */
     int n;              /* weight rows = output values per column */
-    int m;              /* activation columns: 1..=2048 */
+    int m;              /* activation columns: 1..=4096 */
     int ld;             /* floats between two dst columns: >= col_off + n */
     int col_off;        /* floats before this GEMM's slice inside a dst column */
     int cols_hint;      /* tile-width hint for ncols_opt: 0 = stock heuristic, else clamped to m */
@@ -87,7 +87,7 @@ int inference_cuda_mmq_dense(const inference_cuda_mmq_dense_args *a, void *strea
 /* The bytes of stream-k fixup range the vendored launch demands for `a` on a device with
  * `facts`: the tile width it picks, the tiling-mode test, then `blocks * J * I` floats, 0
  * when the launch tiles, when no tile width fits the shared memory, for a NULL pointer, a
- * type with no dense case, m outside 1..=2048, n below 1 or an SM count of 0. Every other
+ * type with no dense case, m outside 1..=4096, n below 1 or an SM count of 0. Every other
  * argument is computed, not validated: the entry's own rules refuse them before the
  * launching entry calls this with the facts it queried. Pure: no CUDA call, and only the two
  * structs are read (no pointer inside `a` is followed), so a host test can sweep it against

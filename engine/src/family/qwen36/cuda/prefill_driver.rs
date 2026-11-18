@@ -103,9 +103,47 @@ pub(super) fn admit_m_sess(
         costs,
         PART_CHARGE,
         SPARE_MIN,
-        &M_LADDER,
+        if facts.cap == 4096 {
+            &super::prefill_plan::LARGE_M_LADDER
+        } else {
+            &M_LADDER
+        },
         "prefill_chunk",
     )
+}
+
+/// The large experiment uses bounded KV8 attention tiles, not an all-M FP16
+/// partial allocation. Charge the whole reused part buffer, including its K/V scratch.
+pub(super) fn tiered_large_cost(dims: &StepDims, nsm: usize) -> Result<ChunkCost, EngError> {
+    let m = 4096;
+    super::prefill::kv8_scratch_layout(m, CPF_ATTN_PART_CAP)?;
+    let geometry = super::mixer_geometry::MixerGeometry::new(dims)?;
+    super::prefill::kv8_segment_query_rows(super::prefill::chunk_attn_geometry(&geometry, m), 1)?;
+    let tensors: Vec<_> = chunk_tensors(dims, m, nsm)?
+        .into_iter()
+        .map(|(_, tensor)| tensor)
+        .collect();
+    Ok(ChunkCost {
+        m,
+        arena: crate::kernels::cuda::plan_arena(&tensors)?.total,
+        part: CPF_ATTN_PART_CAP,
+    })
+}
+
+pub(super) fn tiered_large_cap(
+    value: Option<&std::ffi::OsStr>,
+    eligible: bool,
+    cap: usize,
+) -> Result<usize, EngError> {
+    match value {
+        None => Ok(cap),
+        Some(v) if v == "0" => Ok(cap),
+        Some(v) if v == "1" && eligible && cap == 2048 => Ok(4096),
+        Some(v) if v == "1" => Err(EngError::BadRequest(
+            "Q36_TIERED_PREFILL_4096 requires native tiered KV8, non-fixed admission and a 2048-row cap".into(),
+        )),
+        Some(_) => Err(EngError::BadRequest("Q36_TIERED_PREFILL_4096 must be 0 or 1".into())),
+    }
 }
 
 /// One reusable layer's K/V half planes, bounded independently of stored KV capacity.
@@ -459,7 +497,11 @@ pub(super) fn needs_arena(
 ) -> bool {
     let supported_kv =
         kv_mode == KvMode::Fp16 || (kv_mode == KvMode::Int8G32 && kv8_chunked_prefill);
-    layout != WeightLayout::Tiled && supported_kv && !tiered && !mmq_q6k
+    let chunk_ok = !tiered
+        || super::prefill::tiered_chunk_enabled(
+            std::env::var_os(super::prefill::TIERED_CHUNK_VAR).as_deref(),
+        );
+    layout != WeightLayout::Tiled && supported_kv && chunk_ok && !mmq_q6k
 }
 
 /// The two session-build guards of `admit_prefill` as a pure seam (condition 8a): the
@@ -615,6 +657,14 @@ impl PrefillArena {
             .transpose()
     }
 
+    /// Highest exclusive key position covered by a contiguous FP16 staging allocation.
+    pub(super) fn contiguous_staging_rows(&self) -> usize {
+        match &self.kv8_staging {
+            Some((plan, _, false)) => plan.capacity,
+            _ => 0,
+        }
+    }
+
     pub(super) fn segmented(&self) -> bool {
         self.kv8_staging.as_ref().is_some_and(|(_, _, mode)| *mode)
     }
@@ -662,6 +712,62 @@ pub(super) fn drive_chunks(
     drive_steps(start, tokens, steps, run)
 }
 
+/// Merge adjacent steps within this feed. Beyond the original 8K range, a
+/// merged chunk must fit the contiguous K/V stage and the 2,048-row staged
+/// attention path. Larger chunks use query subtiles and may restage the keys.
+pub(super) fn coalesce_tiered_deep(
+    steps: Vec<PrefillStep>,
+    m_sess: usize,
+    staged_end: usize,
+) -> Vec<PrefillStep> {
+    let first_deep = if m_sess == 4096 { 0 } else { 3_072 };
+    const ORIGINAL_END: usize = 8_192;
+    const KV8_MAX_ROWS: usize = 4_096;
+    let limit = m_sess.min(KV8_MAX_ROWS);
+    let mut out = Vec::with_capacity(steps.len());
+    for step in steps {
+        let mut merged = false;
+        if let Some(PrefillStep::Chunk { p0, rows }) = out.last_mut()
+            && let PrefillStep::Chunk {
+                p0: next,
+                rows: more,
+            } = step
+            && *p0 >= first_deep
+            && p0.checked_add(*rows) == Some(next)
+            && let Some(total) = rows.checked_add(more)
+            && total <= limit
+            && let Some(end) = p0.checked_add(total)
+            && (end <= ORIGINAL_END || (end <= staged_end && total <= 2_048))
+        {
+            *rows = total;
+            merged = true;
+        }
+        if !merged {
+            out.push(step);
+        }
+    }
+    out
+}
+
+/// Coalesce eligible tiered chunks within the stage and the current scheduler piece.
+pub(super) fn drive_tiered_wide_chunks(
+    start: usize,
+    tokens: &[u32],
+    m_sess: usize,
+    fixed_depth: bool,
+    staged_end: usize,
+    run: impl FnMut(PrefillStep, &[u32]) -> Result<(), EngError>,
+) -> Result<Vec<PrefillStep>, EngError> {
+    let steps = chunk_list_with_depth_tier(start, tokens.len(), m_sess, fixed_depth)?;
+    let original = steps.len();
+    let widened = coalesce_tiered_deep(steps, m_sess, staged_end);
+    eprintln!(
+        "tiered-wide-prefill: planned {original} steps as {}",
+        widened.len()
+    );
+    drive_steps(start, tokens, widened, run)
+}
+
 /// Preserves the per-token vocabulary refusal before checking the signed kernel index.
 pub(super) fn chunk_ids(rows: &[u32], sampler_width: usize) -> Result<Vec<i32>, EngError> {
     rows.iter()
@@ -678,6 +784,7 @@ pub(super) fn chunk_ids(rows: &[u32], sampler_width: usize) -> Result<Vec<i32>, 
 
 use super::prefill::{ChunkBufs, ChunkModel, ChunkRows, ChunkSparse};
 use super::state::ResidentState;
+use super::tiered_step::TieredRuntime;
 use crate::family::prefill::chunk_family::ChunkFamily;
 
 /// What the chunk body captures today, handed to the trait opaquely: the state, the launch, the
@@ -702,6 +809,7 @@ pub(super) struct Q36ChunkCtx<'a, 'w> {
 /// the trait).
 pub(super) struct Q36ChunkFamily<'a, 'w> {
     bank: Option<&'a std::cell::RefCell<crate::family::exl3::bank::Exl3SlotResolver<'w>>>,
+    tiered: Option<&'a std::cell::RefCell<TieredRuntime<'w>>>,
     #[cfg(test)]
     kernel_class: super::prefill::ChunkKernelClass,
     pub(super) segmented_parts: usize,
@@ -710,10 +818,12 @@ pub(super) struct Q36ChunkFamily<'a, 'w> {
 impl<'a, 'w> Q36ChunkFamily<'a, 'w> {
     pub(super) fn new(
         bank: Option<&'a std::cell::RefCell<crate::family::exl3::bank::Exl3SlotResolver<'w>>>,
+        tiered: Option<&'a std::cell::RefCell<TieredRuntime<'w>>>,
         #[cfg(test)] kernel_class: super::prefill::ChunkKernelClass,
     ) -> Self {
         Self {
             bank,
+            tiered,
             #[cfg(test)]
             kernel_class,
             segmented_parts: 0,
@@ -746,7 +856,10 @@ impl<'a, 'w> ChunkFamily for Q36ChunkFamily<'a, 'w> {
 
     fn run_layers(&mut self, ctx: &mut Self::Ctx, _p0: usize, _m: usize) -> Result<(), EngError> {
         let run = super::prefill::ChunkRun::new(&*ctx.state, ctx.model, ctx.bufs, ctx.chunk_rows)?;
-        let run = run.with_bank(self.bank).with_sparse(ctx.sparse.take());
+        let run = run
+            .with_bank(self.bank)
+            .with_tiered(self.tiered)
+            .with_sparse(ctx.sparse.take());
         #[cfg(test)]
         let run = run.with_kernel_class(self.kernel_class);
         super::prefill::run_chunk_body(&ctx.launch, &run)?;

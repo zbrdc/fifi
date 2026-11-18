@@ -76,8 +76,35 @@ pub(in crate::family::qwen36::cuda) struct TieredScratch {
     ones: DeviceBuffer,
     host: PinnedBuf,
     event: DeviceEvent,
+    /// The pinned staging of the per-layer plan (ids at 0, weights at `top_k * F32`) and of
+    /// the CPU partial: the decode uploads flow through them with `copy_from_pinned` + one
+    /// event instead of `write_at`, which drains the stream per upload (the round-4 panel's
+    /// async-write port; the chunk path runs the same pattern in `RouteScratch`).
+    plan_host: PinnedBuf,
+    plan_event: Option<DeviceEvent>,
+    partial_host: PinnedBuf,
+    partial_event: Option<DeviceEvent>,
     hidden: usize,
     top_k: usize,
+    /// The last route readback's host wait, nanoseconds (Q36_TIERED_PROBE only) —
+    /// the TCAP sync-vs-drain probe's per-layer sample.
+    pub(in crate::family::qwen36::cuda) probe_route_ns: std::cell::Cell<u64>,
+    /// Per-layer host-phase timings of the decode block, nanoseconds (probe only):
+    /// parse (route bytes -> RouteRead), begin_layer (classify + pool dispatch),
+    /// plan upload, the expert launch loop, finish_layer (+ partial). The idle of
+    /// the 52%-util decode lives in these host-paced phases.
+    pub(in crate::family::qwen36::cuda) probe_parse_ns: std::cell::Cell<u64>,
+    pub(in crate::family::qwen36::cuda) probe_begin_ns: std::cell::Cell<u64>,
+    pub(in crate::family::qwen36::cuda) probe_plan_ns: std::cell::Cell<u64>,
+    pub(in crate::family::qwen36::cuda) probe_launch_ns: std::cell::Cell<u64>,
+    pub(in crate::family::qwen36::cuda) probe_finish_ns: std::cell::Cell<u64>,
+}
+
+/// The decode probe flag (Q36_TIERED_PROBE=1): times the per-layer route wait and
+/// the token's device span so their split can decide the TCAP gate.
+pub(in crate::family::qwen36::cuda) fn tiered_probe() -> bool {
+    static PROBE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *PROBE.get_or_init(|| std::env::var_os("Q36_TIERED_PROBE").is_some_and(|v| v == "1"))
 }
 
 impl TieredScratch {
@@ -99,8 +126,18 @@ impl TieredScratch {
             ones: ctx.upload(&1.0f32.to_le_bytes())?,
             host: ctx.pinned_buf((2 * hidden + 2 * top_k) * F32)?,
             event: ctx.event()?,
+            plan_host: ctx.pinned_buf(2 * top_k * F32)?,
+            plan_event: None,
+            partial_host: ctx.pinned_buf(hidden * F32)?,
+            partial_event: None,
             hidden,
             top_k,
+            probe_route_ns: std::cell::Cell::new(0),
+            probe_parse_ns: std::cell::Cell::new(0),
+            probe_begin_ns: std::cell::Cell::new(0),
+            probe_plan_ns: std::cell::Cell::new(0),
+            probe_launch_ns: std::cell::Cell::new(0),
+            probe_finish_ns: std::cell::Cell::new(0),
         })
     }
 }
@@ -207,28 +244,51 @@ fn route_to_host(
     dims: &MoeDims,
 ) -> Result<RouteRead, EngError> {
     op_router(launch, weights, bufs, *dims)?;
-    let (ids_at, weights_at) = (scratch.hidden * F32, (scratch.hidden + scratch.top_k) * F32);
+    let ids_at = scratch.hidden * F32;
     let resid_at = (scratch.hidden + 2 * scratch.top_k) * F32;
     let route = &bufs.route;
     let ctx = launch.ctx;
     ctx.copy_to_pinned(launch.stream, route.norm_row, &mut scratch.host, 0)?;
     ctx.copy_to_pinned(launch.stream, route.ids, &mut scratch.host, ids_at)?;
-    ctx.copy_to_pinned(launch.stream, route.weights, &mut scratch.host, weights_at)?;
+    ctx.copy_to_pinned(
+        launch.stream,
+        route.weights,
+        &mut scratch.host,
+        (scratch.hidden + scratch.top_k) * F32,
+    )?;
     ctx.copy_to_pinned(launch.stream, route.resid_in, &mut scratch.host, resid_at)?;
     launch.stream.record(&scratch.event)?;
+    let probe_t0 = std::time::Instant::now();
     scratch.host.wait(&scratch.event)?;
-    let mut raw = vec![0u8; scratch.host.len()];
-    scratch.host.read(0, &mut raw)?;
-    let (id_words, _) = raw[ids_at..weights_at].as_chunks::<4>();
+    if tiered_probe() {
+        scratch
+            .probe_route_ns
+            .set(probe_t0.elapsed().as_nanos() as u64);
+    }
+    let mut small = vec![0u8; 2 * scratch.top_k * F32];
+    let parse_t0 = std::time::Instant::now();
+    scratch.host.read(ids_at, &mut small)?;
+    let (id_words, _) = small[..scratch.top_k * F32].as_chunks::<4>();
     let ids = id_words
         .iter()
         .map(|word| i32::from_le_bytes(*word))
         .collect();
+    // The hidden and resid blocks go through the word-wide read instead of the full-buffer
+    // per-byte read (the round-4 port; `read_f32` is the same primitive the chunk path uses).
+    let mut hidden_vals = vec![0f32; scratch.hidden];
+    scratch.host.read_f32(0, &mut hidden_vals)?;
+    let mut resid_vals = vec![0f32; scratch.hidden];
+    scratch.host.read_f32(resid_at, &mut resid_vals)?;
+    if tiered_probe() {
+        scratch
+            .probe_parse_ns
+            .set(parse_t0.elapsed().as_nanos() as u64);
+    }
     Ok(RouteRead {
         ids,
-        weights: floats(&raw[weights_at..resid_at]),
-        hidden: floats(&raw[..ids_at]),
-        resid: floats(&raw[resid_at..]),
+        weights: floats(&small[scratch.top_k * F32..]),
+        hidden: hidden_vals,
+        resid: resid_vals,
     })
 }
 
@@ -283,10 +343,30 @@ fn add_cpu_partial(
             partial.len()
         )));
     }
-    let scratch = &block.scratch;
-    scratch
-        .cpu_partial
-        .write_at(launch.stream, 0, &to_bytes(partial, f32::to_le_bytes))?;
+    // Async partial upload through the pinned staging (the round-4 port; same wait-write-
+    // copy-record steady state as the plan upload above).
+    {
+        let scratch = &mut *block.scratch;
+        let bytes = to_bytes(partial, f32::to_le_bytes);
+        if let Some(event) = scratch.partial_event.as_ref() {
+            scratch.partial_host.wait(event)?;
+        }
+        scratch.partial_host.write(0, &bytes)?;
+        let dst = scratch.cpu_partial.range(0, hidden * F32)?;
+        let partial_host = &mut scratch.partial_host;
+        launch
+            .ctx
+            .copy_from_pinned(launch.stream, partial_host, 0, dst)?;
+        let event = match scratch.partial_event.as_ref() {
+            Some(event) => event,
+            None => {
+                scratch.partial_event = Some(launch.ctx.event()?);
+                scratch.partial_event.as_ref().expect("just created")
+            }
+        };
+        launch.stream.record(event)?;
+    }
+    let scratch = &*block.scratch;
     launch.ctx.moe_combine(
         launch.stream,
         CombineCall {
@@ -310,8 +390,8 @@ fn add_cpu_partial(
 /// The caller keeps the block eager (it syncs with the host); a capture window refuses it. An
 /// error from the host or from a device call is returned as it is: the step then poisons the
 /// token, so nothing here undoes the launches already queued. On success it returns the host
-/// waits it made: the route event wait, the two blocking plan writes, and the blocking write of
-/// the CPU partial when a pick was served on the CPU.
+/// waits it made: the route event wait, the plan uploads (pinned-staged, one event per layer),
+/// and the CPU partial upload when a pick was served on the CPU.
 pub(in crate::family::qwen36::cuda) fn run_moe_block_tiered(
     launch: &Launch<'_>,
     host: &mut dyn TieredLayerHost,
@@ -331,31 +411,84 @@ pub(in crate::family::qwen36::cuda) fn run_moe_block_tiered(
         waits: 1,
         writes: 0,
     };
+    let begin_t0 = std::time::Instant::now();
     let plan = host.begin_layer(layer, &route)?;
+    if tiered_probe() {
+        block
+            .scratch
+            .probe_begin_ns
+            .set(begin_t0.elapsed().as_nanos() as u64);
+    }
     check_plan(&plan, dims.top_k, slots)?;
+    let plan_t0 = std::time::Instant::now();
+    {
+        // Async plan upload: pinned staging + copy_from_pinned + one event (the blocking
+        // `write_at` drained the stream per upload). Steady state: the previous layer's
+        // copies completed long before, so the wait is a device no-op that clears the
+        // write refusal; the first layer holds no event yet.
+        let scratch = &mut *block.scratch;
+        let plan_ids = to_bytes(&plan.slot_ids, i32::to_le_bytes);
+        let plan_weights = to_bytes(&plan.device_weights, f32::to_le_bytes);
+        if let Some(event) = scratch.plan_event.as_ref() {
+            scratch.plan_host.wait(event)?;
+        }
+        scratch.plan_host.write(0, &plan_ids)?;
+        scratch
+            .plan_host
+            .write(scratch.top_k * F32, &plan_weights)?;
+        let ids_range = scratch.slot_ids.range(0, scratch.top_k * I32)?;
+        let weights_range = scratch.slot_weights.range(0, scratch.top_k * F32)?;
+        let plan_host = &mut scratch.plan_host;
+        launch
+            .ctx
+            .copy_from_pinned(launch.stream, plan_host, 0, ids_range)?;
+        launch.ctx.copy_from_pinned(
+            launch.stream,
+            plan_host,
+            scratch.top_k * F32,
+            weights_range,
+        )?;
+        let event = match scratch.plan_event.as_ref() {
+            Some(event) => event,
+            None => {
+                scratch.plan_event = Some(launch.ctx.event()?);
+                scratch.plan_event.as_ref().expect("just created")
+            }
+        };
+        launch.stream.record(event)?;
+    }
+    if tiered_probe() {
+        block
+            .scratch
+            .probe_plan_ns
+            .set(plan_t0.elapsed().as_nanos() as u64);
+    }
+    syncs.writes += 2;
     let scratch = &*block.scratch;
-    scratch.slot_ids.write_at(
-        launch.stream,
-        0,
-        &to_bytes(&plan.slot_ids, i32::to_le_bytes),
-    )?;
-    syncs.writes += 1;
-    scratch.slot_weights.write_at(
-        launch.stream,
-        0,
-        &to_bytes(&plan.device_weights, f32::to_le_bytes),
-    )?;
-    syncs.writes += 1;
     let tiered = tiered_bufs(block.bufs, scratch)?;
+    let launch_t0 = std::time::Instant::now();
     for op in moe_sequence(dims.top_k, WeightLayout::Native)
         .into_iter()
         .skip(1)
     {
         launch_op(launch, weights, &tiered, op)?;
     }
+    if tiered_probe() {
+        block
+            .scratch
+            .probe_launch_ns
+            .set(launch_t0.elapsed().as_nanos() as u64);
+    }
+    let finish_t0 = std::time::Instant::now();
     if let Some(partial) = host.finish_layer(layer)? {
         add_cpu_partial(launch, block, &partial)?;
         syncs.writes += 1;
+    }
+    if tiered_probe() {
+        block
+            .scratch
+            .probe_finish_ns
+            .set(finish_t0.elapsed().as_nanos() as u64);
     }
     Ok(syncs)
 }

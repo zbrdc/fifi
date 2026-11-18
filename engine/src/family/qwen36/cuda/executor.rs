@@ -74,7 +74,16 @@ pub(super) fn chunk_path_of(verdict: &ChunkVerdict) -> ChunkPath {
 /// Keep the admitted arena, but cap every worker piece by its current depth.
 pub(super) fn piece_of(verdict: &ChunkVerdict, p0: usize) -> Option<usize> {
     match verdict {
-        ChunkVerdict::Ready { m_sess } => Some(super::prefill_plan::fixed_depth_rows(p0, *m_sess)),
+        ChunkVerdict::Ready { m_sess } => {
+            // The experimental arena is larger, but only its initial 8K may use
+            // larger worker pieces. Preserve later cancellation/depth boundaries.
+            let rows = if *m_sess == 4096 {
+                if p0 < 8192 { 4096.min(8192 - p0) } else { 2048 }
+            } else {
+                *m_sess
+            };
+            Some(super::prefill_plan::fixed_depth_rows(p0, rows))
+        }
         _ => None,
     }
 }

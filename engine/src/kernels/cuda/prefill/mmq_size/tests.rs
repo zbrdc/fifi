@@ -281,7 +281,7 @@ fn qwen_widths_and_ids_pins() {
 }
 
 /// The exhaustive dense assertion: `S(J_best(n)) - r*144 <= Q8_1_PAD` for every n in
-/// 1..=2048, both fallbacks, both build archs, with the minimum margin witnessed.
+/// 1..=4096, both fallbacks, both build archs, with the minimum margin witnessed.
 #[test]
 fn exhaustive_dense_pad_rule() {
     for cc in [720, 860] {
@@ -304,7 +304,7 @@ fn exhaustive_dense_pad_rule() {
 }
 
 /// The exhaustive grouped assertion: the last tile can hold a single-column top expert, so
-/// `S(J_best(M)) - 144 <= Q8_1_PAD` for every M in 1..=2048. The witness: M = 49..56 at
+/// `S(J_best(M)) - 144 <= Q8_1_PAD` for every M in 1..=4096. The witness: M = 49..56 at
 /// fallback = false picks J = 64, needs 9,072 B, and the earlier pad covered only 8,192 B.
 #[test]
 fn exhaustive_grouped_pad_rule() {
@@ -405,13 +405,13 @@ fn overread_windows_recomputed() {
     assert!(legacy_j_max(false, 860, 14) >= 8); // 14 is safe: the old pad covers the need
 }
 
-/// The domain guard: 1..=2048 passes, 0 and 2049 are typed refusals that a wrapper refusal test
+/// The domain guard: 1..=4096 passes, 0 and 4097 are typed refusals that a wrapper refusal test
 /// can pin.
 #[test]
 fn ncols_domain_guard() {
     assert!(check_ncols_domain(1).is_ok());
-    assert!(check_ncols_domain(2048).is_ok());
-    for ncols in [0, 2049] {
+    assert!(check_ncols_domain(4096).is_ok());
+    for ncols in [0, 4097] {
         let err = check_ncols_domain(ncols).unwrap_err();
         assert!(
             matches!(err, EngError::BadRequest(ref m) if m.contains("mmq_size: chunk cap")),
@@ -613,11 +613,7 @@ fn vendored_mmq_case_fallback_rule_is_pinned() {
     );
 }
 
-/// `COMPILED_ARCHS` is pinned to the build: every architecture THIS build compiled — the list
-/// build.rs wrote into its generated `__CUDA_ARCH_LIST__` header — must appear in the constant,
-/// so a build whose arch set grows past it fails here instead of silently taking the wrong
-/// config table. (Deriving the constant from `INFERENCE_CUDA_ARCHS` at run time is not
-/// possible: the test exes run outside the build environment, where the variable is absent.)
+/// The compile-time list must exactly match an independent parse of the native header.
 #[test]
 fn compiled_archs_cover_the_build() {
     // Embedded at build time, not read at run time: a test exe copied away from its target
@@ -636,6 +632,7 @@ fn compiled_archs_cover_the_build() {
         })
         .collect();
     assert!(!built.is_empty(), "no compiled architecture");
+    assert_eq!(COMPILED_ARCHS.as_slice(), built);
     for cc in built {
         assert!(
             COMPILED_ARCHS.contains(&cc),

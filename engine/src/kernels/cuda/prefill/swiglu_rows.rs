@@ -26,8 +26,8 @@ use crate::kernels::cuda::native::prefill::swiglu_rows::{
     SwigluRowsInts, SwigluRowsRaw, swiglu_rows_launch,
 };
 
-/// The most rows of one call: 8 slot rows per token at the 2,048-row chunk cap.
-pub(crate) const MAX_ROWS: usize = 16_384;
+/// The most rows of one call: 8 slot rows per token at the 4,096-row chunk cap.
+pub(crate) const MAX_ROWS: usize = 32_768;
 pub(crate) const MAX_FF: usize = 32_768;
 /// `n_ff`, `up_off`, `ld_in` and `ld_out` are multiples of this: the kernel moves `float4`.
 pub(crate) const QUAD: usize = 4;

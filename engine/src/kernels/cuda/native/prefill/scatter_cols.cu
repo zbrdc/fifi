@@ -12,7 +12,7 @@
 namespace {
 
 constexpr int kThreads = 128;  // float4 columns per block
-constexpr int kMaxRows = 16384;
+constexpr int kMaxRows = 32768;
 constexpr int kMaxWidth = 65536;
 
 bool aligned16(const void *p) { return ((uintptr_t)p & 15) == 0; }

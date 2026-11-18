@@ -10,6 +10,9 @@
 pub struct TokenReport {
     pub bank_hits: u32,
     pub cpu_served: u32,
+    /// Chunk-prefill picks served by the cold staging bank on the device (GPU-served
+    /// misses: not bank hits, not CPU pool jobs). Zero on the per-token path.
+    pub cold_served: u32,
     /// CPU serves whose expert bytes were not in the OS page cache (SSD loads).
     pub ssd_misses: u32,
     /// Bank changes executed at the token boundary: warm-up fills plus swaps.
@@ -19,6 +22,8 @@ pub struct TokenReport {
     /// outputs are built from. WHY: the CPU share of PICKS says little when the popular experts are the missed ones.
     pub routed_weight_ppm: u64,
     pub cpu_weight_ppm: u64,
+    /// Router weight of the cold-staged picks, in millionths (the staging share of mass).
+    pub cold_weight_ppm: u64,
     /// Router-guess prefetch fills issued (advice promotions that reached the fill path).
     pub guess_fills: u32,
     /// Prefetch promotions that evicted a resident expert (the thrash-bound counter).
@@ -36,11 +41,13 @@ impl TokenReport {
         let TokenReport {
             bank_hits,
             cpu_served,
+            cold_served,
             ssd_misses,
             swaps,
             ssd_bytes,
             routed_weight_ppm,
             cpu_weight_ppm,
+            cold_weight_ppm,
             guess_fills,
             guess_evicts,
             guess_samples,
@@ -48,11 +55,13 @@ impl TokenReport {
         } = *other;
         self.bank_hits += bank_hits;
         self.cpu_served += cpu_served;
+        self.cold_served += cold_served;
         self.ssd_misses += ssd_misses;
         self.swaps += swaps;
         self.ssd_bytes += ssd_bytes;
         self.routed_weight_ppm += routed_weight_ppm;
         self.cpu_weight_ppm += cpu_weight_ppm;
+        self.cold_weight_ppm += cold_weight_ppm;
         self.guess_fills += guess_fills;
         self.guess_evicts += guess_evicts;
         self.guess_samples += guess_samples;
@@ -67,6 +76,8 @@ mod tests {
     #[test]
     fn token_report_merge_adds_every_counter() {
         let mut left = TokenReport {
+            cold_served: 1,
+            cold_weight_ppm: 11,
             bank_hits: 3,
             cpu_served: 5,
             ssd_misses: 2,
@@ -80,6 +91,8 @@ mod tests {
             guess_hits: 4,
         };
         left.merge(&TokenReport {
+            cold_served: 2,
+            cold_weight_ppm: 22,
             bank_hits: 4,
             cpu_served: 7,
             ssd_misses: 9,
@@ -95,6 +108,8 @@ mod tests {
         assert_eq!(
             left,
             TokenReport {
+                cold_served: 3,
+                cold_weight_ppm: 33,
                 bank_hits: 7,
                 cpu_served: 12,
                 ssd_misses: 11,

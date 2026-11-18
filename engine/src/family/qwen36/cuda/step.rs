@@ -596,7 +596,11 @@ pub(super) fn chunk_verdict(facts: &ChunkFacts) -> ChunkVerdict {
     if facts.kv_mode == KvMode::Int8G32 && !facts.kv8_chunked_prefill {
         return ChunkVerdict::Kv8;
     }
-    if facts.tiered {
+    if facts.tiered
+        && !super::prefill::tiered_chunk_enabled(
+            std::env::var_os(super::prefill::TIERED_CHUNK_VAR).as_deref(),
+        )
+    {
         return ChunkVerdict::Tiered;
     }
     if facts.mmq_q6k {
@@ -1143,7 +1147,9 @@ impl<'a> QwenResidentStep<'a> {
     /// the no-cap default, and `chunk_ready` carries the cap only in its accept verdict.
     pub(crate) fn set_m_sess_cap(&mut self, m_sess_cap: u32) {
         self.m_sess_cap = if self.kv8_chunked_prefill {
-            m_sess_cap.min(1024)
+            // The KV8 chunk domain (KV8_BULK_ROWS in prefill.rs); raising the env's
+            // accepted rows past this needs that domain extended first.
+            m_sess_cap.min(2048)
         } else {
             m_sess_cap
         };
@@ -1220,15 +1226,26 @@ impl<'a> QwenResidentStep<'a> {
                 self.m_sess_cap as usize
             },
         };
+        admit.cap = super::prefill_driver::tiered_large_cap(
+            std::env::var_os("Q36_TIERED_PREFILL_4096").as_deref(),
+            self.tiered_mode && self.layout == WeightLayout::Native && kv8 && !fixed,
+            admit.cap,
+        )?;
         if fixed {
             admit.cap = fixed_chunk_rows(layout.kv.capacity, admit.cap);
         }
         let facts = self.context.mmq_device_facts()?;
-        let costs = if self.layout == WeightLayout::Exl3 {
+        let mut costs = if self.layout == WeightLayout::Exl3 {
             exl3_chunk_costs(&self.res.dims, facts.nsm)?
         } else {
             chunk_costs(&self.res.dims, facts.nsm)?
         };
+        if admit.cap == 4096 {
+            costs.insert(
+                0,
+                super::prefill_driver::tiered_large_cost(&self.res.dims, facts.nsm)?,
+            );
+        }
         let staging = if kv8 {
             let a = &self.res.geometry.attn;
             Some(if fixed {
@@ -1332,6 +1349,12 @@ impl<'a> QwenResidentStep<'a> {
         } else {
             admit_with_staging(&admit, &budget.extras, &costs, staging)?
         };
+        if admit.cap == 4096 {
+            eprintln!(
+                "tiered-prefill-4096: admitted {} rows",
+                admitted.unwrap_or(0)
+            );
+        }
         let Some(m) = admitted else {
             if kv8 {
                 eprintln!("q36 cuda: KV8 per-token prefill (no chunk arena admitted)");
@@ -1412,13 +1435,15 @@ impl<'a> QwenResidentStep<'a> {
         Some(self.prefill.as_ref()?.kv8_staging().ok()??.plan)
     }
 
-    /// Builds the tiered runtime of a step made with `StepOptions.tiered`: one bank per layer
-    /// and the host. Refuses a plain step, a second attach and a bank count other than the layer
-    /// count. The scratch buffers are allocated here.
+    /// Builds the tiered runtime of a step made with `StepOptions.tiered`: one bank per layer,
+    /// the host and the optional cold staging bank of the chunked prefill. Refuses a plain
+    /// step, a second attach and a bank count other than the layer count. The scratch buffers
+    /// are allocated here.
     pub(crate) fn attach_tiered(
         &mut self,
         banks: Vec<ExpertBank>,
         host: TieredHost,
+        cold: Option<super::tiered_step::ColdStaging>,
     ) -> Result<(), EngError> {
         let parts = self.tiered_parts.take().ok_or_else(|| {
             EngError::BadRequest(
@@ -1429,7 +1454,7 @@ impl<'a> QwenResidentStep<'a> {
         let moe = &self.moe_dims;
         let scratch = TieredScratch::new(self.context, moe.hidden, moe.top_k)?;
         self.tiered = Some(std::cell::RefCell::new(TieredRuntime::new(
-            parts, banks, scratch, host,
+            parts, banks, scratch, host, cold,
         )?));
         Ok(())
     }
@@ -1465,35 +1490,51 @@ impl<'a> QwenResidentStep<'a> {
         tokens: &[u32],
         m_sess: usize,
     ) -> Result<(), EngError> {
-        use super::prefill_driver::drive_chunks;
+        use super::prefill_driver::{drive_chunks, drive_tiered_wide_chunks};
         use crate::family::prefill::arena::PrefillStep;
         use crate::family::session::TokenStepper;
 
         let start = self.tokens();
         let fixed_depth = self.fixed_prefill_depth();
         self.prefill_report.note_chunked_epoch_start(start);
-        drive_chunks(
-            start,
-            tokens,
-            m_sess,
-            fixed_depth,
-            |step, rows| match step {
-                PrefillStep::Chunk { p0, .. } => self.run_chunk(p0, rows),
-                PrefillStep::Feed { p0 } => {
-                    let [token] = rows else {
-                        return Err(EngError::BadRequest(
-                            "prefill chunk: a feed step needs exactly one row".to_owned(),
-                        ));
-                    };
-                    let opened = std::time::Instant::now();
-                    TokenStepper::feed(self, *token)?;
-                    let ns = u64::try_from(opened.elapsed().as_nanos()).unwrap_or(u64::MAX);
-                    self.record_feed(p0, ns);
-                    Ok(())
-                }
-            },
-        )
-        .map(|_| ())
+        let wide_tiered = self.tiered_mode
+            && self.kv8_chunked_prefill
+            && self.state.layout().kv.mode == KvMode::Int8G32
+            && super::prefill::tiered_chunk_enabled(
+                std::env::var_os(super::prefill::TIERED_CHUNK_VAR).as_deref(),
+            )
+            && (m_sess == 4096
+                || std::env::var_os("Q36_TIERED_WIDE_PREFILL").is_some_and(|v| v == "1"));
+        let staged_end = if wide_tiered
+            && std::env::var_os("Q36_TIERED_WIDE_STAGED").is_some_and(|v| v == "1")
+        {
+            self.prefill
+                .as_ref()
+                .map_or(0, PrefillArena::contiguous_staging_rows)
+        } else {
+            0
+        };
+        let run = |step, rows: &[u32]| match step {
+            PrefillStep::Chunk { p0, .. } => self.run_chunk(p0, rows),
+            PrefillStep::Feed { p0 } => {
+                let [token] = rows else {
+                    return Err(EngError::BadRequest(
+                        "prefill chunk: a feed step needs exactly one row".to_owned(),
+                    ));
+                };
+                let opened = std::time::Instant::now();
+                TokenStepper::feed(self, *token)?;
+                let ns = u64::try_from(opened.elapsed().as_nanos()).unwrap_or(u64::MAX);
+                self.record_feed(p0, ns);
+                Ok(())
+            }
+        };
+        let result = if wide_tiered {
+            drive_tiered_wide_chunks(start, tokens, m_sess, fixed_depth, staged_end, run)
+        } else {
+            drive_chunks(start, tokens, m_sess, fixed_depth, run)
+        };
+        result.map(|_| ())
     }
 
     pub(super) fn fixed_prefill_depth(&self) -> bool {
@@ -1583,8 +1624,15 @@ impl<'a> QwenResidentStep<'a> {
             .sparse
             .as_ref()
             .map(|sp| ChunkSparse::new(sp, &res.dims.shape.kinds));
+        // The tiered chunk path stays behind its existing, default-off gate.
+        let tiered_chunk = self.tiered.as_ref().filter(|_| {
+            super::prefill::tiered_chunk_enabled(
+                std::env::var_os(super::prefill::TIERED_CHUNK_VAR).as_deref(),
+            )
+        });
         let mut fam = Q36ChunkFamily::new(
             self.exl3_bank,
+            tiered_chunk,
             #[cfg(test)]
             kernel_class,
         );
@@ -1620,6 +1668,7 @@ impl<'a> QwenResidentStep<'a> {
             super::prefill::phase_timing::serve::discard();
         })?;
         prefill_report.note_segmented_parts(fam.segmented_parts);
+        let t_status = std::time::Instant::now();
         let status = (&mut fam as &mut dyn ChunkFamily<Ctx = Q36ChunkCtx>)
             .read_health(&mut ctx)
             .inspect_err(|_| {
@@ -1638,9 +1687,18 @@ impl<'a> QwenResidentStep<'a> {
             ns,
             status,
         });
+        let t_reval = std::time::Instant::now();
         (&mut fam as &mut dyn ChunkFamily<Ctx = Q36ChunkCtx>)
             .commit_chunk(&mut ctx, p0, m, status)
             .inspect_err(|_| ctx.state.poison())?;
+        if std::env::var_os("Q36_TIERED_TRACE").is_some_and(|v| v == "1") {
+            eprintln!(
+                "chunk-close p0={p0} m={m}: body {:.0} ms, status-read {:.0} ms, revalidate {:.0} ms",
+                t_status.duration_since(opened).as_secs_f64() * 1e3,
+                t_reval.duration_since(t_status).as_secs_f64() * 1e3,
+                t_reval.elapsed().as_secs_f64() * 1e3,
+            );
+        }
         // R3: the chunk committed [p0, p0 + m) and its sketch cells are queued; the
         // selection-eligible prefix grows with it, but only when this chunk continues
         // it exactly (interrupted or gapped prefill keeps the smaller prefix).

@@ -150,14 +150,26 @@ __device__ inline bool block_of(const Args &a, int s, int kvh, int tile, Block &
     return true;
 }
 
-#if __CUDA_ARCH__ >= 800
+#if __CUDA_ARCH__ >= 750
 /* D (16x8 f32) += A (16x16 f16, row) * B (16x8 f16, col), the sm_80 tensor-core path. */
 __device__ inline void mma_16816(float *d, const unsigned *a, unsigned b0, unsigned b1) {
+#if __CUDA_ARCH__ >= 800
     asm volatile(
         "mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32 "
         "{%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%0,%1,%2,%3};\n"
         : "+f"(d[0]), "+f"(d[1]), "+f"(d[2]), "+f"(d[3])
-        : "r"(a[0]), "r"(a[1]), "r"(a[2]), "r"(a[3]), "r"(b0), "r"(b1));
+         : "r"(a[0]), "r"(a[1]), "r"(a[2]), "r"(a[3]), "r"(b0), "r"(b1));
+#else
+    // PTX m16n8k8 stores the first eight columns in A[0:2], B[0],
+    // and the next eight in A[2:4], B[1]; C/D has the same four f32 lanes.
+    asm volatile(
+        "mma.sync.aligned.m16n8k8.row.col.f32.f16.f16.f32 "
+        "{%0,%1,%2,%3}, {%4,%5}, {%6}, {%0,%1,%2,%3};\n"
+        "mma.sync.aligned.m16n8k8.row.col.f32.f16.f16.f32 "
+        "{%0,%1,%2,%3}, {%7,%8}, {%9}, {%0,%1,%2,%3};\n"
+        : "+f"(d[0]), "+f"(d[1]), "+f"(d[2]), "+f"(d[3])
+        : "r"(a[0]), "r"(a[1]), "r"(b0), "r"(a[2]), "r"(a[3]), "r"(b1));
+#endif
 }
 #endif
 /* The Q tile in shared memory, rounded to fp16 once (128 threads): rows past the chunk's end
@@ -204,8 +216,8 @@ __global__ void __launch_bounds__(128) attn_prefill_part_simt_legacy_k(Args a) {
         return;  // no partial
     }
     extern __shared__ __half smem[];
-    __half *sq = smem;  // [64][256], then stage 0 of K at 32 KB and of V at 64 KB
-    __half *sk = smem + kRows * kHeadDim, *sv = smem + kRows * kHeadDim + 2 * kTile * kHeadDim;
+    __half *sq = smem;  // [64][256], then the one K stage at 32 KB and V at 48 KB (D256)
+    __half *sk = smem + kRows * kHeadDim, *sv = smem + kRows * kHeadDim + kTile * kHeadDim;
     const int s = blockIdx.x, kvh = blockIdx.y, tile = blockIdx.z;
     Block b;
     if (!block_of<kHeadDim, kGroup>(a, s, kvh, tile, b)) return;
@@ -322,7 +334,7 @@ __global__ void __launch_bounds__(128) attn_prefill_part_simt_k(Args a) {
         b.accs[(size_t)out_row * kHeadDim + half * (kHeadDim / 2) + e] = o_acc[e];
 }
 
-#if __CUDA_ARCH__ >= 800
+#if __CUDA_ARCH__ >= 750
 constexpr float kLog2e = 1.4426950408889634f;
 
 __device__ inline float exp_score_delta(float delta) {
@@ -344,14 +356,27 @@ __device__ inline unsigned smem_addr(const void *p) {
 
 /* 16 bytes global -> shared, bypassing L1; src_bytes 0 reads nothing and writes zeros. */
 __device__ inline void cp_async16(unsigned dst, const void *src, int src_bytes) {
+#if __CUDA_ARCH__ >= 800
     asm volatile("cp.async.cg.shared.global [%0], [%1], 16, %2;\n" ::"r"(dst), "l"(src),
                  "r"(src_bytes));
+#else
+    // Turing uses the single-stage path: the surrounding block barriers protect
+    // reuse and publish these synchronous, aligned vector copies.
+    auto *out = reinterpret_cast<uint4 *>(__cvta_shared_to_generic(dst));
+    *out = src_bytes ? *reinterpret_cast<const uint4 *>(src) : make_uint4(0, 0, 0, 0);
+#endif
 }
 
-__device__ inline void cp_async_commit() { asm volatile("cp.async.commit_group;\n" ::); }
+__device__ inline void cp_async_commit() {
+#if __CUDA_ARCH__ >= 800
+    asm volatile("cp.async.commit_group;\n" ::);
+#endif
+}
 
 __device__ inline void cp_async_wait_all() {
+#if __CUDA_ARCH__ >= 800
     asm volatile("cp.async.wait_group 0;\n" ::: "memory");
+#endif
 }
 
 /* Four 8x8 b16 matrices; lanes 8i..8i+7 give the row addresses of matrix i. */
@@ -429,9 +454,15 @@ __device__ inline void load_q_frags(const Args &a, const Block &b, int kvh, int 
  * group hold identical statistics and P̂. K and V arrive by cp.async into two swizzled stages (one
  * block barrier per tile) and reach the MMAs by ldmatrix. Grid (q_tiles, n_kv_head, max_splits),
  * the heaviest causal tiles first; an sm_72 build traps here. */
-template <int kHeadDim, int kGroup>
+template <int kHeadDim, int kGroup, bool SingleStage = false>
 __global__ void __launch_bounds__(kThreadsD, 1) attn_prefill_part_dsplit_k(Args a) {
-#if __CUDA_ARCH__ >= 800
+#if __CUDA_ARCH__ >= 750
+#if __CUDA_ARCH__ < 800
+    if constexpr (!SingleStage) {
+        __trap();
+        return;
+    }
+#endif
     constexpr int kPlaneBytes = kTile * kHeadDim * 2;
     constexpr int kStageBytes = 2 * kPlaneBytes;
     if (!bounds_ok(a)) {
@@ -444,8 +475,10 @@ __global__ void __launch_bounds__(kThreadsD, 1) attn_prefill_part_dsplit_k(Args 
     Block b;
     if (!block_of<kHeadDim, kGroup>(a, s, kvh, tile, b)) return;
     const unsigned stages = smem_addr(dsmem);
-    float4 *const xch = reinterpret_cast<float4 *>(dsmem + 2 * kStageBytes);
-    if (b.k_begin < b.k_end) issue_kv_tile<kHeadDim>(a, b, kvh, b.k_begin, stages);
+    float4 *const xch = reinterpret_cast<float4 *>(dsmem + (SingleStage ? 1 : 2) * kStageBytes);
+    if constexpr (!SingleStage) {
+        if (b.k_begin < b.k_end) issue_kv_tile<kHeadDim>(a, b, kvh, b.k_begin, stages);
+    }
 
     const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
     const int rg = warp >> 2, dq = warp & 3;
@@ -472,12 +505,19 @@ __global__ void __launch_bounds__(kThreadsD, 1) attn_prefill_part_dsplit_k(Args 
 
     int n = 0;
     for (int base = b.k_begin; base < b.k_end && b.first + base <= b.max_p; base += kTile, ++n) {
-        cp_async_wait_all();
-        __syncthreads();  // tile n visible; stage (n + 1) & 1 and the exchange free
-        const int next = base + kTile;
-        if (next < b.k_end && b.first + next <= b.max_p)
-            issue_kv_tile<kHeadDim>(a, b, kvh, next, stages + ((n + 1) & 1) * kStageBytes);
-        const unsigned kst = stages + (n & 1) * kStageBytes, vst = kst + kPlaneBytes;
+        if constexpr (SingleStage) {
+            __syncthreads();  // every row group finished reading the previous K/V tile
+            issue_kv_tile<kHeadDim>(a, b, kvh, base, stages);
+            __syncthreads();  // synchronous Turing copies are visible to every warp
+        } else {
+            cp_async_wait_all();
+            __syncthreads();
+            const int next = base + kTile;
+            if (next < b.k_end && b.first + next <= b.max_p)
+                issue_kv_tile<kHeadDim>(a, b, kvh, next, stages + ((n + 1) & 1) * kStageBytes);
+        }
+        const unsigned kst = stages + (SingleStage ? 0 : (n & 1) * kStageBytes);
+        const unsigned vst = kst + kPlaneBytes;
 
         /* This quarter's S: 4 k16 steps x 4 n8 key blocks. */
         float sq[4][4];
@@ -957,7 +997,7 @@ bool adaptive_attention_enabled() {
  * the experimental adaptive path is off. */
 template <int kHeadDim, int kGroup>
 PartArm arm_part_legacy() {
-    constexpr int simt_bytes = kRows * kHeadDim * 2 + 4 * kTile * kHeadDim * 2;
+    constexpr int simt_bytes = (kRows + 2 * kTile) * kHeadDim * 2;
     PartArm arm = {0, attn_prefill_part_simt_legacy_k<kHeadDim, kGroup>, false, 128,
                    simt_bytes, cudaSuccess};
     cudaFuncAttributes attr = {};
@@ -1015,6 +1055,37 @@ PartArm arm_part(int device) {
     return arm;
 }
 
+/* Turing pilot, opt-in and limited to the measured Qwen geometry. The single
+ * stage fits 64 KiB: 32 KiB K/V plus 32 KiB exchange. Other devices and models
+ * retain their existing selection. Read once per process; unset is rollback. */
+bool turing_attention_enabled() {
+    static const bool enabled = attn_prefill_plan::adaptive_enabled(
+        std::getenv("FIFI_CUDA_ATTN_PREFILL_TURING"));
+    return enabled;
+}
+
+template <int kHeadDim, int kGroup>
+PartArm arm_part_turing() {
+    constexpr int bytes = 2 * kTile * kHeadDim * 2 + (kThreadsD / 32) * 2048;
+    PartArm arm = {0, attn_prefill_part_dsplit_k<kHeadDim, kGroup, true>, true,
+                   kThreadsD, bytes, cudaSuccess};
+    int device = 0, limit = 0, threads = 0;
+    arm.err = cudaGetDevice(&device);
+    if (arm.err == cudaSuccess) arm.err = cudaDeviceGetAttribute(&limit, cudaDevAttrMaxSharedMemoryPerBlockOptin, device);
+    if (arm.err == cudaSuccess) arm.err = cudaDeviceGetAttribute(&threads, cudaDevAttrMaxThreadsPerBlock, device);
+    cudaFuncAttributes attr = {};
+    if (arm.err == cudaSuccess) arm.err = cudaFuncGetAttributes(&attr, arm.kernel);
+    if (arm.err != cudaSuccess) return arm;
+    arm.ptx = attr.ptxVersion;
+    if (arm.ptx != 75 || !attn_prefill_plan::fits(limit, attr.sharedSizeBytes, bytes) ||
+        !attn_prefill_plan::fits_threads(threads, attr.maxThreadsPerBlock, kThreadsD)) {
+        arm.err = cudaErrorInvalidConfiguration;
+        return arm;
+    }
+    arm.err = cudaFuncSetAttribute(arm.kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, bytes);
+    return arm;
+}
+
 /* The legacy path retains its process-wide arm; adaptive successes are cached
  * by CUDA device and instantiated model geometry. Adaptive failures propagate
  * and are not cached. */
@@ -1023,7 +1094,17 @@ Failure enqueue_typed(const Args &k, void *stream) {
     Failure failure;
     if (k.mode != 2) {
         PartArm arm;
-        if (adaptive_attention_enabled()) {
+        int major = 0, minor = 0;
+        if (turing_attention_enabled()) {
+            int current = 0;
+            failure.record(cudaGetDevice(&current), INFERENCE_CUDA_STAGE_LAUNCH);
+            if (failure.ok()) failure.record(cudaDeviceGetAttribute(&major, cudaDevAttrComputeCapabilityMajor, current), INFERENCE_CUDA_STAGE_LAUNCH);
+            if (failure.ok()) failure.record(cudaDeviceGetAttribute(&minor, cudaDevAttrComputeCapabilityMinor, current), INFERENCE_CUDA_STAGE_LAUNCH);
+            if (!failure.ok()) return failure;
+        }
+        if (turing_attention_enabled() && major == 7 && minor == 5 && kHeadDim == 256 && kGroup == 8) {
+            arm = arm_part_turing<kHeadDim, kGroup>();
+        } else if (adaptive_attention_enabled()) {
             int device = -1;
             failure.record(cudaGetDevice(&device), INFERENCE_CUDA_STAGE_LAUNCH);
             if (!failure.ok()) return failure;
@@ -1096,9 +1177,18 @@ __device__ inline Q8GroupScalars q8_group_scalars(
  * scores sit in registers, one tile max, one rescale, one expf per key — the per-key serial
  * chain of the scalar kernel is gone. Masking/poison rules, the (maximum, normalizer,
  * accumulator) contract, cell layout rr = (t - t0) * group + g and index order match
- * attn_prefill_part_q8_k; no atomics. */
+ * attn_prefill_part_q8_k; no atomics.
+ *
+ * Launch bounds carry the occupancy this kernel can reach, not an aspiration: the
+ * 64 KiB dynamic shared request of enqueue_q8_tiled is a whole Turing/Ampere SM's
+ * block budget, so at most ONE block is ever resident per SM. minBlocks 2 (ptxas's
+ * reading of a plain 256 bound) is unreachable, and on sm_75 ptxas pays for it —
+ * 128 registers plus a 36-byte spill, and the arm's zero-spill invariant
+ * (localSizeBytes == 0) then refuses the kernel with cudaErrorInvalidValue for the
+ * rest of the process. minBlocks 1 compiles spill-free (145 registers) with the
+ * same one-block residency the shared budget already forces. */
 template <int kHeadDim>
-__global__ void __launch_bounds__(256) attn_prefill_part_q8_tile_k(Args a,
+__global__ void __launch_bounds__(256, 1) attn_prefill_part_q8_tile_k(Args a,
                                                                   inference_cuda_attn_kv_pair views) {
     constexpr int kLanes = 32, kWarps = 8;
     constexpr int kDims = kHeadDim / kLanes;       // dims one lane owns
@@ -1300,11 +1390,15 @@ static Failure enqueue_q8_tiled(const Args &k, inference_cuda_attn_kv_pair views
         cudaFuncAttributes attr = {};
         const cudaError_t got =
             cudaFuncGetAttributes(&attr, attn_prefill_part_q8_tile_k<128>);
-        if (got != cudaSuccess) return got;  // propagate the real CUDA error
-        if (attr.maxThreadsPerBlock < 256 || attr.localSizeBytes != 0)
+        if (got != cudaSuccess) {
+            return got;  // propagate the real CUDA error
+        }
+        if (attr.maxThreadsPerBlock < 256 || attr.localSizeBytes != 0) {
             return cudaErrorInvalidValue;  // attribute-invariant refusal, not a CUDA error
-        return cudaFuncSetAttribute(attn_prefill_part_q8_tile_k<128>,
+        }
+        const cudaError_t set = cudaFuncSetAttribute(attn_prefill_part_q8_tile_k<128>,
                                     cudaFuncAttributeMaxDynamicSharedMemorySize, kTileBytes);
+        return set;
     }();
     if (arm_error != cudaSuccess) {
         failure.record(arm_error, INFERENCE_CUDA_STAGE_LAUNCH);

@@ -28,8 +28,13 @@
 //! in the fixed tree order of `tree8` with two `hadd_ps` and one lane add, so the result
 //! is bitwise the scalar one.
 //!
-//! Residual obligations: at most 5 unsafe blocks (a wrapper call per dot, the intrinsics block
-//! of each dot and the one of the sub-block helper), each with a SAFETY proof comment
+//! The opt-in `FIFI_CPU_Q8G_F16C=1` path converts the two weight scales together with F16C.
+//! It requires both AVX2 and F16C; the default AVX2 path and non-AVX2 scalar fallback remain.
+//! Both paths inline the same integer dot and fixed float reduction. Binary16 conversion is
+//! exact, including signed zero, subnormals and quieted NaN payloads (exhaustively tested).
+//!
+//! Residual obligations: at most 8 unsafe blocks (the original five, two feature-specific
+//! entries into the shared dot and the exhaustive F16C test), each with a SAFETY proof comment
 //! naming the runtime feature check, the caller's length validation and the in-bounds
 //! unaligned loads; on non-x86_64 targets this module compiles to an empty,
 //! documented stub, where `DotBackend::detect` never reports `Avx2` and the
@@ -135,7 +140,39 @@ mod imp {
         // SAFETY: target-feature function may run on this CPU; slice lengths were
         // SAFETY: validated by the dispatching matvec before this call, and every
         // SAFETY: load inside is an unaligned `loadu` within those validated bounds.
-        unsafe { q4k_q8g_row_dot_avx2(row, xq) }
+        // SAFETY: `f16c_enabled` additionally checks F16C before selecting that entry.
+        unsafe {
+            if f16c_enabled() {
+                q4k_q8g_row_dot_f16c(row, xq)
+            } else {
+                q4k_q8g_row_dot_avx2(row, xq)
+            }
+        }
+    }
+
+    fn f16c_enabled() -> bool {
+        static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        *ENABLED.get_or_init(|| {
+            let enabled = std::env::var("FIFI_CPU_Q8G_F16C").as_deref() == Ok("1")
+                && std::is_x86_feature_detected!("f16c");
+            if enabled {
+                eprintln!("cpu-q8g: F16C scale conversion enabled");
+            }
+            enabled
+        })
+    }
+
+    #[inline]
+    #[target_feature(enable = "f16c")]
+    unsafe fn block_scales_f16c(blk: &[u8; Q4K_BLOCK_BYTES]) -> (f32, f32) {
+        // The caller requires F16C. The four bytes are read safely from a whole block;
+        // these register-only intrinsics do not dereference pointers.
+        let halves = _mm_cvtsi32_si128(i32::from_le_bytes([blk[0], blk[1], blk[2], blk[3]]));
+        let scales = _mm_cvtph_ps(halves);
+        (
+            _mm_cvtss_f32(scales),
+            _mm_cvtss_f32(_mm_shuffle_ps(scales, scales, 1)),
+        )
     }
 
     /// The `isum_j` of the eight sub-blocks of one block as eight exact i32 lanes: per sub-block
@@ -143,7 +180,7 @@ mod imp {
     /// so the lane order of the horizontal sums cannot change a bit.
     #[target_feature(enable = "avx2")]
     unsafe fn sub_block_sums(blk: &[u8], q8: &[i8]) -> __m256i {
-        // SAFETY: called only from `q4k_q8g_row_dot_avx2` after the runtime AVX2 check; `blk`
+        // SAFETY: called only from the shared row dot after the runtime AVX2 check; `blk`
         // SAFETY: is a whole 144-byte block and `q8` a whole 256-value block, so every 32-byte
         // SAFETY: unaligned load below stays inside them.
         unsafe {
@@ -176,10 +213,24 @@ mod imp {
     /// `q4k_q8g_row_dot_scalar` (exact integers, the same f32 products, the `tree8` order).
     #[target_feature(enable = "avx2")]
     unsafe fn q4k_q8g_row_dot_avx2(row: &[u8], xq: &Q8gRow) -> f32 {
+        // SAFETY: the safe wrapper checked AVX2. This specialization never calls F16C;
+        // SAFETY: the matvec caller validated all row lengths before reaching the wrapper.
+        unsafe { q4k_q8g_row_dot_inner::<false>(row, xq) }
+    }
+
+    #[target_feature(enable = "avx2,f16c")]
+    unsafe fn q4k_q8g_row_dot_f16c(row: &[u8], xq: &Q8gRow) -> f32 {
+        // SAFETY: the safe wrapper checked AVX2 and `f16c_enabled` checked F16C;
+        // SAFETY: the matvec caller validated all row lengths before reaching the wrapper.
+        unsafe { q4k_q8g_row_dot_inner::<true>(row, xq) }
+    }
+
+    /// Inlined into the feature-specific entry so F16C introduces no per-block call.
+    /// Requires AVX2, plus F16C when HARDWARE_SCALES is true, and validated row lengths.
+    #[inline(always)]
+    unsafe fn q4k_q8g_row_dot_inner<const HARDWARE_SCALES: bool>(row: &[u8], xq: &Q8gRow) -> f32 {
         let mut acc = 0.0f32;
         for (b, blk) in row.as_chunks::<Q4K_BLOCK_BYTES>().0.iter().enumerate() {
-            let d_w = f16_bits_to_f32(u16::from_le_bytes([blk[0], blk[1]]));
-            let dmin_w = f16_bits_to_f32(u16::from_le_bytes([blk[2], blk[3]]));
             let q8 = &xq.q[Q4K_BLOCK_VALUES * b..][..Q4K_BLOCK_VALUES];
             let dx = &xq.d[GROUPS_PER_BLOCK * b..][..GROUPS_PER_BLOCK];
             let sums = &xq.s[GROUPS_PER_BLOCK * b..][..GROUPS_PER_BLOCK];
@@ -188,11 +239,20 @@ mod imp {
                 let (s, m) = scale_min(j, blk);
                 (sc[j], mn[j]) = (i32::from(s), i32::from(m));
             }
-            // SAFETY: the safe wrapper checked the runtime AVX2 feature bit before entry;
+            // SAFETY: the entries above require runtime AVX2; the true specialization
+            // SAFETY: additionally requires F16C before it calls `block_scales_f16c`.
             // SAFETY: `dx` and `sums` are exactly 8 elements (32 bytes), so the two unaligned
             // SAFETY: 32-byte loads read inside them; the other calls take values or the
             // SAFETY: bounds-checked slices of `sub_block_sums`.
-            let (t1, t2) = unsafe {
+            let (d_w, dmin_w, t1, t2) = unsafe {
+                let (d_w, dmin_w) = if HARDWARE_SCALES {
+                    block_scales_f16c(blk)
+                } else {
+                    (
+                        f16_bits_to_f32(u16::from_le_bytes([blk[0], blk[1]])),
+                        f16_bits_to_f32(u16::from_le_bytes([blk[2], blk[3]])),
+                    )
+                };
                 let isum = sub_block_sums(blk, q8);
                 let sc_v =
                     _mm256_setr_epi32(sc[0], sc[1], sc[2], sc[3], sc[4], sc[5], sc[6], sc[7]);
@@ -208,10 +268,41 @@ mod imp {
                 let h = _mm256_hadd_ps(p1, p2);
                 let h2 = _mm256_hadd_ps(h, h);
                 let t = _mm_add_ps(_mm256_castps256_ps128(h2), _mm256_extractf128_ps(h2, 1));
-                (_mm_cvtss_f32(t), _mm_cvtss_f32(_mm_shuffle_ps(t, t, 1)))
+                (
+                    d_w,
+                    dmin_w,
+                    _mm_cvtss_f32(t),
+                    _mm_cvtss_f32(_mm_shuffle_ps(t, t, 1)),
+                )
             };
             acc += q8g_block_value(d_w, dmin_w, t1, t2);
         }
         acc
+    }
+
+    #[test]
+    fn f16c_scales_match_all_binary16_patterns() {
+        if !std::is_x86_feature_detected!("f16c") {
+            eprintln!("f16c_scales_match_all_binary16_patterns: F16C unavailable, skipped");
+            return;
+        }
+        let mut blk = [0u8; Q4K_BLOCK_BYTES];
+        for bits in 0..=u16::MAX {
+            let other = bits.reverse_bits();
+            blk[..2].copy_from_slice(&bits.to_le_bytes());
+            blk[2..4].copy_from_slice(&other.to_le_bytes());
+            // SAFETY: F16C was detected above, and `blk` is one complete Q4_K block.
+            let (d, dmin) = unsafe { block_scales_f16c(&blk) };
+            assert_eq!(
+                d.to_bits(),
+                f16_bits_to_f32(bits).to_bits(),
+                "d {bits:#06x}"
+            );
+            assert_eq!(
+                dmin.to_bits(),
+                f16_bits_to_f32(other).to_bits(),
+                "dmin {other:#06x}"
+            );
+        }
     }
 }

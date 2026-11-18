@@ -21,7 +21,7 @@ use crate::kernels::cuda::native::prefill::scatter_cols::{
     ScatterColsInts, ScatterColsRaw, scatter_cols_launch,
 };
 
-pub(crate) const MAX_ROWS: usize = 16_384;
+pub(crate) const MAX_ROWS: usize = 32_768;
 pub(crate) const MAX_WIDTH: usize = 65_536;
 /// `n`, `col_off` and `ld` are multiples of this: the kernel moves `float4`.
 pub(crate) const QUAD: usize = 4;

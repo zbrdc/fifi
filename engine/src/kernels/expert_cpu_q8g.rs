@@ -332,5 +332,155 @@ pub fn expert_forward_q8g(
     Ok(())
 }
 
+/// One half of the split side pass: the gate and up rows in `rows` (of `inter`),
+/// swiglu'd — exactly the values `expert_forward_q8g` leaves in `act[rows]`. Gate and
+/// up rows are independent integer dots over the same quantized input, so a half is
+/// BIT-IDENTICAL to the whole forward's rows; the down pass (`expert_down_q8g`) runs
+/// on the joining thread. `s.down` is checked too so one `ExpertSlices` serves both
+/// halves and the tail.
+pub fn expert_act_half_q8g(
+    backend: DotBackend,
+    shape: ExpertShape,
+    s: &ExpertSlices<'_>,
+    x: &[f32],
+    rows: std::ops::Range<usize>,
+) -> Result<Vec<f32>, ExpertCpuError> {
+    let ExpertShape { hidden, inter } = shape;
+    if hidden == 0
+        || inter == 0
+        || !hidden.is_multiple_of(Q4K_BLOCK_VALUES)
+        || !inter.is_multiple_of(Q4K_BLOCK_VALUES)
+    {
+        return Err(ExpertCpuError::BadShape(format!(
+            "expert shape {hidden}x{inter}: extents must be positive multiples of \
+             {Q4K_BLOCK_VALUES}"
+        )));
+    }
+    if rows.start >= rows.end || rows.end > inter {
+        return Err(ExpertCpuError::BadShape(format!(
+            "side rows {}..{} of {inter} inter rows",
+            rows.start, rows.end
+        )));
+    }
+    let side = inter * (hidden / Q4K_BLOCK_VALUES) * Q4K_BLOCK_BYTES;
+    // No `down` check: the half never touches it — the tail (`expert_down_q8g`)
+    // owns and validates the down slice.
+    for (what, got, want) in [
+        ("x", x.len(), hidden),
+        ("gate", s.gate.len(), side),
+        ("up", s.up.len(), side),
+    ] {
+        if got != want {
+            return Err(ExpertCpuError::BadLength { what, got, want });
+        }
+    }
+    let row_bytes = hidden / Q4K_BLOCK_VALUES * Q4K_BLOCK_BYTES;
+    let mut qx = Q8gRow::zeros(hidden)?;
+    quantize_q8g(x, &mut qx)?;
+    let mut out = vec![0.0f32; rows.len()];
+    let half = |w: &[u8], o: &mut [f32]| {
+        for (o, row) in o
+            .iter_mut()
+            .zip(w.chunks_exact(row_bytes).skip(rows.start).take(rows.len()))
+        {
+            *o = row_dot(backend, row, &qx);
+        }
+    };
+    let mut up = vec![0.0f32; rows.len()];
+    half(s.gate, &mut out);
+    half(s.up, &mut up);
+    // The whole forward's swiglu on exactly these rows.
+    for i in 0..rows.len() {
+        let g = out[i];
+        out[i] = g / (1.0 + (-g).exp()) * up[i];
+    }
+    Ok(out)
+}
+
+/// The tail of the split expert on the calling thread: quantize the assembled `act`
+/// and run every down row — `expert_forward_q8g`'s last two steps, unmodified.
+pub fn expert_down_q8g(
+    backend: DotBackend,
+    shape: ExpertShape,
+    s: &ExpertSlices<'_>,
+    act: &[f32],
+    qh: &mut Q8gRow,
+    out: &mut [f32],
+) -> Result<(), ExpertCpuError> {
+    let ExpertShape { hidden, inter } = shape;
+    if hidden == 0
+        || inter == 0
+        || !hidden.is_multiple_of(Q4K_BLOCK_VALUES)
+        || !inter.is_multiple_of(Q4K_BLOCK_VALUES)
+    {
+        return Err(ExpertCpuError::BadShape(format!(
+            "expert shape {hidden}x{inter}: extents must be positive multiples of \
+             {Q4K_BLOCK_VALUES}"
+        )));
+    }
+    let down = hidden * (inter / Q4K_BLOCK_VALUES) * Q4K_BLOCK_BYTES;
+    for (what, got, want) in [
+        ("act", act.len(), inter),
+        ("out", out.len(), hidden),
+        ("down", s.down.len(), down),
+    ] {
+        if got != want {
+            return Err(ExpertCpuError::BadLength { what, got, want });
+        }
+    }
+    quantize_q8g(act, qh)?;
+    matvec_rows(backend, s.down, inter, qh, out);
+    Ok(())
+}
+
+/// The down pass as a WORKER half-job (the second split round): quantize the
+/// assembled `act` (duplicated per half, ~µs) and compute the down rows in `rows`
+/// (of `hidden`) — disjoint outputs, the same integer arithmetic as the whole
+/// forward's down rows, so a half is bit-identical to its rows of `out`.
+pub fn expert_down_half_q8g(
+    backend: DotBackend,
+    shape: ExpertShape,
+    s: &ExpertSlices<'_>,
+    act: &[f32],
+    rows: std::ops::Range<usize>,
+) -> Result<Vec<f32>, ExpertCpuError> {
+    let ExpertShape { hidden, inter } = shape;
+    if hidden == 0
+        || inter == 0
+        || !hidden.is_multiple_of(Q4K_BLOCK_VALUES)
+        || !inter.is_multiple_of(Q4K_BLOCK_VALUES)
+    {
+        return Err(ExpertCpuError::BadShape(format!(
+            "expert shape {hidden}x{inter}: extents must be positive multiples of \
+             {Q4K_BLOCK_VALUES}"
+        )));
+    }
+    if rows.start >= rows.end || rows.end > hidden {
+        return Err(ExpertCpuError::BadShape(format!(
+            "down rows {}..{} of {hidden} hidden rows",
+            rows.start, rows.end
+        )));
+    }
+    let down = hidden * (inter / Q4K_BLOCK_VALUES) * Q4K_BLOCK_BYTES;
+    for (what, got, want) in [("act", act.len(), inter), ("down", s.down.len(), down)] {
+        if got != want {
+            return Err(ExpertCpuError::BadLength { what, got, want });
+        }
+    }
+    let mut qh = Q8gRow::zeros(inter)?;
+    quantize_q8g(act, &mut qh)?;
+    let row_bytes = inter / Q4K_BLOCK_VALUES * Q4K_BLOCK_BYTES;
+    let mut out = vec![0.0f32; rows.len()];
+    for (o, row) in out.iter_mut().zip(
+        s.down
+            .chunks_exact(row_bytes)
+            .skip(rows.start)
+            .take(rows.len()),
+    ) {
+        *o = row_dot(backend, row, &qh);
+    }
+    Ok(out)
+}
+
 #[cfg(test)]
 mod tests;

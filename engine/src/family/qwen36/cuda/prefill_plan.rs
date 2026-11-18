@@ -44,6 +44,8 @@ use crate::{
 /// The chunk sizes a session arena may be built for, largest first. The largest is also the default
 /// of the `qwen36.prefill_chunk` cap: absent means no cap.
 pub(crate) const M_LADDER: [usize; 5] = [2048, 1024, 512, 256, 128];
+/// Only offered by the default-off tiered experiment; the normal ladder stays unchanged.
+pub(super) const LARGE_M_LADDER: [usize; 6] = [4096, 2048, 1024, 512, 256, 128];
 /// Keep 1,024-row chunks through the warm 32K–64K range; partials remain capped at 64 MiB.
 const TIER_1024_FROM: usize = 3 * 1024;
 const TIER_512_FROM: usize = 64 * 1024;
@@ -135,9 +137,9 @@ pub(crate) fn chunk_list_with_depth_tier(
     m_sess: usize,
     fixed_depth: bool,
 ) -> Result<Vec<PrefillStep>, EngError> {
-    if m_sess != 16 && !M_LADDER.contains(&m_sess) {
+    if m_sess != 16 && !LARGE_M_LADDER.contains(&m_sess) {
         return Err(EngError::BadRequest(format!(
-            "prefill plan: chunk size {m_sess} is not one of {M_LADDER:?} or 16"
+            "prefill plan: chunk size {m_sess} is not one of {LARGE_M_LADDER:?} or 16"
         )));
     }
     let end = p0.checked_add(n_rows).ok_or_else(overflow)?;
@@ -573,7 +575,7 @@ fn exl3_scratch_rows(dims: &StepDims, g: &MixerGeometry, m: usize) -> Result<Vec
     ])
 }
 
-/// The tensors of an EXL3 chunk of `m` rows in `1..=2048`, in the order of [`EXL3_SLOTS`]. The
+/// The tensors of an EXL3 chunk of `m` rows in `1..=4096`, in the order of [`EXL3_SLOTS`]. The
 /// arena is zero-filled once at session build, which clears the flag; the chunk driver clears it
 /// again before each chunk. Smaller chunks of a session use prefixes of
 /// the slots planned for its `M_sess`, as for the GGUF list.
@@ -628,7 +630,7 @@ pub(crate) fn exl3_chunk_costs(dims: &StepDims, nsm: usize) -> Result<Vec<ChunkC
 
 /// The tensors of a chunk of `m` rows, in the order of the plan table, for a device with `nsm`
 /// SMs (the runtime device fact that sizes the fixup range; never a literal here). `m` is in
-/// `1..=2048` (the chunk cap of `mmq_size`). Smaller chunks of a session use prefixes of the
+/// `1..=4096` (the chunk cap of `mmq_size`). Smaller chunks of a session use prefixes of the
 /// tensors planned for its `M_sess`: every slot grows with `m` except the `xf` sinks, whose
 /// planned size carries the 1-row fragment floor because `xf_bytes` is not monotone in `m`.
 pub(crate) fn chunk_tensors(

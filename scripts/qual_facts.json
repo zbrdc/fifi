@@ -16,7 +16,7 @@
   "targets": {
     "lib": {
       "path": "src/lib.rs",
-      "test_fns": 6906,
+      "test_fns": 6931,
       "ignored": 619,
       "env_gates": [
         "CUDA_MODULE_LOADING",
@@ -34,6 +34,7 @@
         "FIFI_ACTIVATION_GPU_AUTH",
         "FIFI_ACTIVATION_MANIFEST",
         "FIFI_ADD_CHAIN_M",
+        "FIFI_CPU_Q8G_F16C",
         "FIFI_D1_CAPTURE",
         "FIFI_D1_CONTEXT",
         "FIFI_D1_KROW_GRAPH",
@@ -347,6 +348,16 @@
         "Q36_SPEED_8K",
         "Q36_SPEED_ROUTING",
         "Q36_THREADS",
+        "Q36_TIERED_COLD_LIMIT",
+        "Q36_TIERED_COLD_MIN_ROWS",
+        "Q36_TIERED_COLD_SHORT_LIMIT",
+        "Q36_TIERED_PREFILL_4096",
+        "Q36_TIERED_PROBE",
+        "Q36_TIERED_SPLIT_JOBS",
+        "Q36_TIERED_SPLIT_MAX_JOBS",
+        "Q36_TIERED_TRACE",
+        "Q36_TIERED_WIDE_PREFILL",
+        "Q36_TIERED_WIDE_STAGED",
         "Q36_WIDE_EQ_DUMP",
         "Q36_WINDOW_TAPS",
         "Q8_TILED_ENV_PROBE",

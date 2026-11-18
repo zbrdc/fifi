@@ -25,8 +25,8 @@
  * every rule so the native entry cannot latch the backend): k off the 256-value K grid or
  * above 32768 (MMQ_ITER_K: the GEMM reads 256-value k strides with no k clamp, so a buffer it
  * cannot read safely is never built), row_stride not a multiple of 4 or below k or above 2^30
- * (float4 row alignment), ncols/m/top_k outside the domain (1..=2048 columns plain and
- * tokens, `m*top_k` in 1..=16384 gathered and scattered, top_k in 1..=32), a weight type with
+ * (float4 row alignment), ncols/m/top_k outside the domain (1..=4096 columns plain and
+ * tokens, `m*top_k` in 1..=32768 gathered and scattered, top_k in 1..=32), a weight type with
  * no q8_1 ds layout (MMQ_Q8_1_DS_LAYOUT_INVALID), a NULL or misaligned pointer, and an output
  * range that overlaps an input range.
  */
@@ -49,7 +49,7 @@ typedef struct inference_cuda_mmq_quantize_args {
     int type;        /* ggml_type discriminant of the consuming GEMM's weight */
     int k;           /* values per row quantized: 256, 512, ..., 32768 */
     int row_stride;  /* floats per source row: multiple of 4, k..=2^30 */
-    int ncols;       /* output columns: 1..=2048 (ids == NULL), 1..=16384 (ids != NULL) */
+    int ncols;       /* output columns: 1..=4096 (ids == NULL), 1..=32768 (ids != NULL) */
     int packing;     /* 0: vendor, 1: CPU-reference Q8_0/Q4_K packing */
 } inference_cuda_mmq_quantize_args;
 
@@ -61,8 +61,8 @@ typedef struct inference_cuda_mmq_quantize_scatter_args {
     int type;                   /* ggml_type discriminant of the consuming GEMM's weight */
     int k;                      /* values per row quantized: 256, 512, ..., 32768 */
     int row_stride;             /* floats per source row: multiple of 4, k..=2^30 */
-    int m;                      /* source rows (tokens): 1..=2048 */
-    int top_k;                  /* compact rows per token: 1..=32, m*top_k <= 16384 */
+    int m;                      /* source rows (tokens): 1..=4096 */
+    int top_k;                  /* compact rows per token: 1..=32, m*top_k <= 32768 */
     int packing;                /* 0: vendor, 1: CPU-reference Q8_0/Q4_K packing */
 } inference_cuda_mmq_quantize_scatter_args;
 

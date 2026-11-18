@@ -23,11 +23,6 @@
 //! - Each stream counts the operations enqueued through the context. An event
 //!   remembers the count at its last record, which lets [`super::pinned`]
 //!   refuse to read memory before the event that follows its copy.
-#![cfg_attr(
-    not(test),
-    expect(dead_code, reason = "staged for the resident decode step")
-)]
-
 use std::{
     cell::Cell,
     marker::PhantomData,
