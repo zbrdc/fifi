@@ -12,6 +12,8 @@ mod tests;
 /// registry row exists but its starter refuses while the family is
 /// staged; see `start_gemma4` in the server factory.
 pub(crate) const FAMILY: &str = "gemma4";
+pub(crate) const STAGED_REASON: &str = "gemma4 is staged in this build: the server factory does not construct \
+         the Gemma engine yet";
 
 pub use config::check_humanizer_config;
 pub use gguf::open_humanizer_q8;

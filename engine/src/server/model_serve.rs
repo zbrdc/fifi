@@ -26,15 +26,9 @@ use crate::server::config::{Config, EngineConfig, StartupError};
 /// The families `--model` can identify and start. One row per
 /// detectable family; extending to Flint is a row here plus its
 /// loader's own checks staying the authority.
-const DETECTABLE_FAMILIES: &[(&str, &[&str])] = &[
-    (
-        crate::family::qwen36::factory::FAMILY,
-        crate::family::QWEN3_6_35B_A3B.model_types,
-    ),
-    (
-        crate::family::qwen36::factory::DENSE_FAMILY,
-        crate::family::QWEN3_8_27B_DENSE.model_types,
-    ),
+const DETECTABLE_FAMILIES: &[&str] = &[
+    crate::family::qwen36::factory::FAMILY,
+    crate::family::qwen36::factory::DENSE_FAMILY,
 ];
 
 /// The listen address of a simplified startup, matching the shipped
@@ -295,7 +289,7 @@ fn select_family(
     inspection: &inspect::ModelInspection,
 ) -> Result<String, StartupError> {
     if let Some(family) = &args.family {
-        if DETECTABLE_FAMILIES.iter().any(|(name, _)| name == family) {
+        if DETECTABLE_FAMILIES.contains(&family.as_str()) {
             return Ok(family.clone());
         }
         return Err(StartupError(format!(
@@ -303,17 +297,8 @@ fn select_family(
             detectable_names()
         )));
     }
-    let mut matches: Vec<&str> = DETECTABLE_FAMILIES
-        .iter()
-        .filter(|(_, types)| {
-            types
-                .iter()
-                .any(|t| inspection.config_model_types.iter().any(|seen| seen == t))
-        })
-        .map(|(name, _)| *name)
-        .collect();
-    match matches.pop() {
-        Some(name) if matches.is_empty() => Ok(name.to_string()),
+    match inspection.detected_family() {
+        Some(name) if DETECTABLE_FAMILIES.contains(&name) => Ok(name.to_string()),
         _ => Err(StartupError(format!(
             "serve --model: cannot identify the family from config.json (model_type {:?}); pass --family. Detectable families: {}",
             inspection.config_model_types,
@@ -336,11 +321,7 @@ fn select_weight_format(has_gguf: bool, has_safetensors: bool) -> &'static str {
 }
 
 fn detectable_names() -> String {
-    DETECTABLE_FAMILIES
-        .iter()
-        .map(|(name, _)| *name)
-        .collect::<Vec<_>>()
-        .join(", ")
+    DETECTABLE_FAMILIES.join(", ")
 }
 
 fn backend_name(backend: crate::family::qwen36::settings::Backend) -> &'static str {

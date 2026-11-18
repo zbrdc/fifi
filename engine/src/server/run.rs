@@ -517,11 +517,10 @@ fn start_gemma4(
     _prefix_reuse: bool,
     _ready_note: ReadyNote,
 ) -> Result<StartedEngine, EngError> {
-    Err(EngError::BadRequest(
-        "gemma4 is staged in this build: the server factory does not construct \
-         the Gemma engine yet; nothing was read from the model directory"
-            .into(),
-    ))
+    Err(EngError::BadRequest(format!(
+        "{}; nothing was read from the model directory",
+        gemma4::STAGED_REASON
+    )))
 }
 
 /// The closed registry of families this build starts. Staged backends

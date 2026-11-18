@@ -352,24 +352,13 @@ fn identify_family(
         ));
         return None;
     }
-    // Inference, deliberately narrow: only a `config.json` model_type that
-    // a family's spec itself accepts. Anything else asks the user to name
-    // the family rather than guessing at GB-scale consequences.
-    let spec = crate::family::spec::QWEN3_6_35B_A3B;
-    if inspection
-        .config_model_types
-        .iter()
-        .any(|t| spec.model_types.contains(&t.as_str()))
-    {
+    if let Some(family) = inspection.detected_family() {
         checks.push(Check::new(
             "family",
             CheckStatus::Pass,
-            format!(
-                "config.json model_type matches {}",
-                crate::family::qwen36::factory::FAMILY
-            ),
+            format!("config.json model_type matches {family}"),
         ));
-        return Some(crate::family::qwen36::factory::FAMILY.to_string());
+        return Some(family.to_string());
     }
     checks.push(Check::new(
         "family",
@@ -429,6 +418,13 @@ fn shallow_preflight(
     family: Option<String>,
     mut checks: Vec<Check>,
 ) -> PreflightReport {
+    if family.as_deref() == Some(crate::family::gemma4::FAMILY) {
+        checks.push(Check::new(
+            "server factory",
+            CheckStatus::Fail,
+            crate::family::gemma4::STAGED_REASON.to_string(),
+        ));
+    }
     let (verdict, next_step) = if any_failed(&checks) || family.is_none() {
         (
             Verdict::Unsupported,
@@ -1918,6 +1914,59 @@ mod tests {
             .iter()
             .find(|c| c.name == name)
             .unwrap_or_else(|| panic!("no check named {name} in {:?}", report.checks))
+    }
+
+    #[test]
+    fn preflight_identifies_each_real_registered_family_without_claiming_device_fit() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        for name in crate::capability::inspect::TOKENIZER_FILES {
+            std::fs::write(root.join(name), "{}").unwrap();
+        }
+        std::fs::write(root.join("model.safetensors"), b"fixture").unwrap();
+        for (kind, family) in [
+            ("flint", "flint"),
+            ("nemotron_h_omni", "nemotron35"),
+            ("qwen3_5_text", "qwen3_8_27b_dense"),
+            ("qwen3_5_moe", "qwen3_6_35b_a3b"),
+            ("qwen4_exp", "qwen3_8_flash_next"),
+            ("gemma4_unified", "gemma4"),
+        ] {
+            std::fs::write(
+                root.join("config.json"),
+                serde_json::json!({"model_type":kind}).to_string(),
+            )
+            .unwrap();
+            let report = super::preflight(
+                root,
+                root,
+                &super::Candidate::default(),
+                &cuda_facts(1 << 30),
+            )
+            .unwrap();
+            assert_eq!(report.family.as_deref(), Some(family));
+            if family == "gemma4" {
+                assert_eq!(report.verdict, Verdict::Unsupported);
+                assert_eq!(
+                    check_named(&report, "server factory").status,
+                    CheckStatus::Fail
+                );
+            }
+        }
+        std::fs::write(
+            root.join("config.json"),
+            r#"{"model_type":"qwen3_5_moe","text_config":{"model_type":"qwen4_exp"}}"#,
+        )
+        .unwrap();
+        let report = super::preflight(
+            root,
+            root,
+            &super::Candidate::default(),
+            &cuda_facts(1 << 30),
+        )
+        .unwrap();
+        assert!(report.family.is_none());
+        assert_eq!(report.verdict, Verdict::Unsupported);
     }
 
     #[test]

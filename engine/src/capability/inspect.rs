@@ -63,6 +63,33 @@ pub struct ModelInspection {
 }
 
 impl ModelInspection {
+    /// A type identifies a candidate loader. Only that loader can establish compatibility
+    /// or memory fit. Conflicting family evidence must never choose a planner by row order.
+    pub(crate) fn detected_family(&self) -> Option<&'static str> {
+        use crate::family::{QWEN3_6_35B_A3B, QWEN3_8_27B_DENSE, QWEN3_8_FLASH_NEXT};
+        let families: &[(&str, &[&str])] = &[
+            (QWEN3_6_35B_A3B.name, QWEN3_6_35B_A3B.model_types),
+            (QWEN3_8_27B_DENSE.name, QWEN3_8_27B_DENSE.model_types),
+            (QWEN3_8_FLASH_NEXT.name, QWEN3_8_FLASH_NEXT.model_types),
+            (crate::family::flint::FAMILY, &["flint"]),
+            (
+                crate::family::nemotron35::factory::FAMILY,
+                &["nemotron_h_omni"],
+            ),
+            (
+                crate::family::gemma4::FAMILY,
+                &["gemma4_unified", "gemma4_unified_text"],
+            ),
+        ];
+        let mut matches = families.iter().filter(|(_, types)| {
+            self.config_model_types
+                .iter()
+                .any(|seen| types.contains(&seen.as_str()))
+        });
+        let (family, _) = matches.next()?;
+        matches.next().is_none().then_some(*family)
+    }
+
     /// Total checkpoint bytes on disk: GGUF payloads plus safetensors
     /// shards. This is the preflight's weight figure: what the loader
     /// uploads or maps, before any residency policy.
