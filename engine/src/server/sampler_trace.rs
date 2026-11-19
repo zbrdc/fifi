@@ -612,8 +612,17 @@ mod tests {
             assert_eq!(packet["raw_byte_len"], content.len());
             assert_eq!(packet["trailer"], "");
         }
-        // The armed reply must be identical to the plain one — the e2e leg
-        // of semantics preservation (the per-row proof is in sampler tests).
+        // The requests can cross a wall-clock second. Each must carry a timestamp.
+        for reply in &mut replies {
+            let created = reply
+                .as_object_mut()
+                .expect("reply object")
+                .remove("created");
+            assert!(
+                created.and_then(|value| value.as_u64()).is_some(),
+                "missing or invalid creation timestamp"
+            );
+        }
         assert_eq!(replies[0], replies[1], "arming capture changed the reply");
     }
 
