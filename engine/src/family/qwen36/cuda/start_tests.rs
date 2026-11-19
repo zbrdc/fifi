@@ -503,6 +503,34 @@ fn cuda_settings(object: &str) -> Q36Settings {
 }
 
 #[test]
+fn auto_tiered_start_uses_the_space_left_by_the_requested_context() {
+    use super::tiered_load::{admit_banks, geometry_of};
+    let settings = cuda_settings(r#"{"capture":false,"tiered":{"slots":"auto"}}"#);
+    let request = tiered_plan_of(&settings).unwrap().slots;
+    let shape = HostShape::from_spec(&QWEN3_6_35B_A3B, ROTARY_DIM).unwrap();
+    let inventory = Inventory::for_spec(&QWEN3_6_35B_A3B).unwrap();
+    let dims = StepDims::new(&shape, &inventory).unwrap();
+    let geometry = geometry_of(&dims);
+    let layers = dims.shape.kinds.len();
+    let reserve = 1 << 30;
+    let after_fixed = 10_u64 << 30;
+    let slot_bytes = crate::kernels::cuda::ExpertBank::bytes_for(geometry, geometry.top_k).unwrap()
+        / geometry.top_k as u64
+        * layers as u64;
+    let mut depths = Vec::new();
+    for rows in [2048, 4096, 8192, 16384, 32768, 65536, 131072, 262144] {
+        let free = after_fixed - KvPool::new(&dims, KvMode::Fp16, rows).unwrap().total as u64;
+        let slots =
+            admit_banks(free, geometry, layers, request, shape.moe.experts, reserve).unwrap();
+        assert!(slots as u64 * slot_bytes + reserve <= free);
+        assert!((slots as u64 + 1) * slot_bytes + reserve > free);
+        depths.push(slots);
+    }
+    assert!(depths.windows(2).all(|pair| pair[1] <= pair[0]));
+    assert!(depths.last() < depths.first());
+}
+
+#[test]
 fn start_without_the_tiered_key_builds_no_bank() {
     let plain = cuda_settings("{}");
     assert_eq!(
@@ -516,8 +544,12 @@ fn start_without_the_tiered_key_builds_no_bank() {
     );
     let plan = tiered_plan_of(&tiered).expect("the member asks for a plan");
     assert_eq!(
-        (plan.slots_per_layer, plan.threads, plan.timeout_ms),
-        (40, 4, 2500)
+        (plan.slots, plan.threads, plan.timeout_ms),
+        (
+            crate::family::qwen36::settings::SlotRequest::Exactly(40),
+            4,
+            2500
+        )
     );
     assert_eq!(
         (plan.swaps_milli, plan.decay_milli),

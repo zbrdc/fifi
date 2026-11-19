@@ -441,8 +441,12 @@ mod tests {
             .unwrap();
         let plan = tiered.tiered.expect("the member sets the plan");
         assert_eq!(
-            (plan.slots_per_layer, plan.threads, plan.timeout_ms),
-            (61, 6, 5000)
+            (plan.slots, plan.threads, plan.timeout_ms),
+            (
+                crate::family::qwen36::settings::SlotRequest::Exactly(61),
+                6,
+                5000
+            )
         );
         assert!(!plan.preload, "the banks start empty unless asked");
         let preloaded: GateSettings = with_member(r#"{"slots": 256, "preload": true}"#)

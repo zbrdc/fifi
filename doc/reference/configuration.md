@@ -22,6 +22,7 @@ Example files are in [`engine/config`](../../engine/config/README.md).
 | --- | --- | --- |
 | `id` | yes | Engine name. Clients can select the engine with it (`x-engine`). |
 | `family` | yes | The model family; see [Models](models.md). |
+| `resource_policy` | no | Set `"auto"` to size unspecified resources with the selected family’s load-time planner. Exact counts and explicit device lists take precedence. |
 | `model_dir` | yes | Directory of the checkpoint. It must be on local storage; see [Local storage](#local-storage). |
 | `tokenizer_dir` | yes | Directory with `tokenizer.json`, `tokenizer_config.json`, `chat_template.jinja` and `generation_config.json`. For Qwen3.6, Flint and Nemotron, startup checks each file against the hashes of the tested release. |
 | `model` | no | The name clients send in the `model` field. Defaults to the family name. |
@@ -33,6 +34,12 @@ Example files are in [`engine/config`](../../engine/config/README.md).
 | `flash_next` | no | Options of `qwen3_8_flash_next`, which is not validated end to end. |
 | `think_replay` | no | `false` drops the reasoning that clients resend with earlier assistant turns from the prompt, for this engine only. `true` is refused; leave the key out for the default. |
 | `notice_toolwrap` | no | `false` renders system messages that follow an assistant turn as plain system text, for this engine only. `true` is refused. See `ENGINESRV_NOTICE_TOOLWRAP`. |
+
+### Automatic resource planning
+
+Set `"resource_policy": "auto"` on an individual engine entry. The loader keeps the chosen context, backend and weight format. In standalone Qwen CUDA tiered mode, `"qwen36": {"tiered": {}}` selects a bank that fits after existing device reservations. An explicit slot count remains exact. Dense and multi-device configurations use their existing state and placement admission. Flash-Next and Flint already choose expert residency from their native memory plans when their supported automatic modes are selected.
+
+Nemotron CPU and CUDA entries can omit `nemotron.cache_entries` with this policy. The loader sizes the host cache from available RAM, decoded expert tensor sizes and cacheable tensor count after its serving reservations. The CUDA path accounts for transfer staging, then fits the optional device weight cache to the selected card’s measured free memory. On integrated hardware it also charges shared host backing. Startup logs the resolved entry count. An explicit positive count retains its existing admission checks. Unsupported model/backend combinations continue to report the loader’s refusal.
 
 ### Local storage
 
@@ -125,7 +132,7 @@ Do not modify or replace the model file while the server is running.
 
 | Key | Default | Meaning |
 | --- | --- | --- |
-| `slots` | required | Expert slots per layer on the GPU, 8 to 256. |
+| `slots` | `"auto"` with engine `resource_policy` set to `"auto"`, otherwise required | An integer from 8 to 256 requests an exact count. `"auto"` selects the largest whole number that fits every layer after weights, KV cache and step allocations, leaving 1 GiB of free VRAM. Startup reports the selected count and refuses a load that cannot hold one token’s routed experts. |
 | `threads` | 6 | CPU worker threads, 1 to 8. |
 | `timeout_ms` | 10,000 | Longest wait for one layer's CPU experts, 1 to 600,000. |
 | `preload` | `false` | `true` fills each layer's slots with its lowest-numbered experts before the first token. By default the slots start empty and fill as experts are used. |
@@ -150,13 +157,13 @@ CPU experts trade decode speed for GPU memory and for PCIe traffic. On an RTX 30
 
 ## `nemotron`
 
-Required for `nemotron35`. All four keys are required.
+Required for `nemotron35`. Supply `backend`, `context_limit` and `prefill_chunk`. Supply `cache_entries` unless the engine uses the [automatic resource policy](#automatic-resource-planning).
 
 | Key | Values | Meaning |
 | --- | --- | --- |
 | `backend` | `"cuda"`, `"cpu_reference"` | `cuda` needs a Linux build with `--features native-cuda` and accepts greedy decoding only. `cpu_reference` runs on the CPU and is slow. |
 | `context_limit` | 1 or more | Context limit in tokens. |
-| `cache_entries` | 1 or more | Expert weight tensors kept decoded in host memory. |
+| `cache_entries` | 1 or more | Exact number of expert weight tensors kept decoded in host memory. With the automatic resource policy, omit this key to let the loader size the cache. |
 | `prefill_chunk` | 1 to `context_limit` | Prompt tokens per step. |
 
 ## `fake`

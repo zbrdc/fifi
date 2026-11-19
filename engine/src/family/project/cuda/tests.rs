@@ -73,6 +73,16 @@ fn mapped_expert_selection_is_opt_in_bounded_and_refuses_impossible_requests() {
     assert!(select_host_experts(&choices, 91).is_err());
     assert!(select_host_experts(&[(true, u64::MAX), (true, 1)], u64::MAX).is_err());
 }
+
+#[test]
+fn mapped_expert_placement_preserves_headroom_in_the_effective_host_budget() {
+    let remaining = 6u64 << 30;
+    let payload = 5u64 << 30;
+    assert!(admit_mapped_experts(payload, remaining).is_ok());
+    assert!(admit_mapped_experts(payload, remaining - 1).is_err());
+    assert!(admit_mapped_experts(u64::MAX, u64::MAX).is_err());
+}
+
 /// The measured file is named by the operator, so the reader does not second-guess
 /// its tensor sizes.
 const MEASURE_LIMITS: GgufLimits = GgufLimits {

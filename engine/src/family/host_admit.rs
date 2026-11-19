@@ -5,19 +5,19 @@
 //! limit. Every refusal names the caller that refused; the frozen
 //! families' exact texts are pinned by the full-text tests in this module.
 
-use crate::EngError;
+use crate::{EngError, memory::HostMemory};
 
 pub(crate) struct HostAdmission {
     mem_available: u64,
     // None means a confirmed unlimited cgroup, never a failed limit read.
     cgroup_remaining: Option<u64>,
-    os_floor: u64,
+    mem_total: u64,
 }
 
 impl HostAdmission {
     #[allow(
         dead_code,
-        reason = "the callers live on the CUDA executor paths; host tests exercise probe_in"
+        reason = "non-Linux host tests exercise probe_in instead of live procfs"
     )]
     pub(crate) fn probe(label: &'static str, root_label: &'static str) -> Result<Self, EngError> {
         Self::probe_in(
@@ -59,11 +59,28 @@ impl HostAdmission {
         Ok(Self {
             mem_available: available,
             cgroup_remaining,
-            os_floor: total.div_ceil(10).max(8u64 << 30),
+            mem_total: total,
         })
     }
 
-    /// [`admit_for`] with the caller's label as the refusing name.
+    pub(crate) fn memory(&self) -> HostMemory {
+        HostMemory {
+            total: self.mem_total,
+            available: self
+                .cgroup_remaining
+                .map_or(self.mem_available, |remaining| {
+                    remaining.min(self.mem_available)
+                }),
+        }
+    }
+
+    pub(crate) fn available_bytes(&self) -> u64 {
+        self.memory().available
+    }
+}
+
+#[cfg(any(test, all(feature = "native-cuda", target_os = "linux")))]
+impl HostAdmission {
     pub(crate) fn admit(&self, label: &'static str, required: u64) -> Result<(), EngError> {
         self.admit_for(required, label)
     }
@@ -72,18 +89,15 @@ impl HostAdmission {
     /// snapshot refusal does not masquerade as another caller's
     /// (the refusal names the caller).
     pub(crate) fn admit_for(&self, required: u64, what: &str) -> Result<(), EngError> {
-        let available = self
-            .cgroup_remaining
-            .map_or(self.mem_available, |remaining| {
-                remaining.min(self.mem_available)
-            });
+        let memory = self.memory();
+        let available = memory.available;
+        let os_floor = memory.os_floor();
         if required
-            .checked_add(self.os_floor)
+            .checked_add(os_floor)
             .is_none_or(|needed| needed > available)
         {
             return Err(EngError::MemoryPlan(format!(
-                "{what} needs {required} bytes plus {} bytes for the OS floor. Available host/cgroup budget: {available} bytes.",
-                self.os_floor
+                "{what} needs {required} bytes plus {os_floor} bytes for the OS floor. Available host/cgroup budget: {available} bytes."
             )));
         }
         Ok(())
@@ -265,17 +279,32 @@ fn cgroup_from_proc(
             "{label} cannot map its process inside a complete unified cgroup tree."
         ))
     };
-    let mut lines = membership.lines();
-    let path = std::path::Path::new(
-        lines
-            .next()
-            .and_then(|line| line.strip_prefix("0::"))
-            .ok_or_else(invalid)?,
-    );
+    // Legacy hierarchies such as net_cls can coexist with v2 memory accounting.
+    let mut unified_path = None;
+    for line in membership.lines() {
+        let mut fields = line.splitn(3, ':');
+        let id = fields.next().ok_or_else(invalid)?;
+        let controllers = fields.next().ok_or_else(invalid)?;
+        let path = std::path::Path::new(fields.next().ok_or_else(invalid)?);
+        if !path.is_absolute() {
+            return Err(invalid());
+        }
+        if id == "0" {
+            if !controllers.is_empty() || unified_path.replace(path).is_some() {
+                return Err(invalid());
+            }
+        } else if !id.bytes().all(|b| b.is_ascii_digit())
+            || id.parse::<u32>().ok().is_none_or(|id| id == 0)
+            || controllers
+                .split(',')
+                .any(|c| c.is_empty() || c == "memory" || c.contains(char::is_whitespace))
+        {
+            return Err(invalid());
+        }
+    }
+    let path = unified_path.ok_or_else(invalid)?;
     if pid == 0
-        || lines.next().is_some()
         || !root.is_absolute()
-        || !path.is_absolute()
         || root
             .components()
             .chain(path.components())
@@ -678,14 +707,15 @@ mod tests {
         let (root, proc) = namespace_root("8589934592\n", "memory\n");
         let budget =
             HostAdmission::probe_in(LABEL, ROOT_LABEL, proc.path(), root.path(), 42).unwrap();
-        assert_eq!(budget.cgroup_remaining, Some(6u64 << 30));
-        assert_eq!(budget.os_floor, 8u64 << 30);
+        assert_eq!(budget.available_bytes(), 6u64 << 30);
+        assert_eq!(budget.memory().os_floor(), 8u64 << 30);
         // 6 GiB left in the cgroup, 8 GiB floor: nothing is admitted.
         assert!(budget.admit(LABEL, 1).is_err());
         let (root, proc) = namespace_root("max\n", "memory\n");
         let budget =
             HostAdmission::probe_in(LABEL, ROOT_LABEL, proc.path(), root.path(), 42).unwrap();
         assert_eq!(budget.cgroup_remaining, None);
+        assert_eq!(budget.available_bytes(), 24u64 << 30);
         // MemAvailable is 24 GiB; the floor is max(8 GiB, 10% of 32 GiB) = 8 GiB.
         assert!(budget.admit(LABEL, 16u64 << 30).is_ok());
         assert!(budget.admit(LABEL, (16u64 << 30) + 1).is_err());
@@ -724,12 +754,30 @@ mod tests {
     }
 
     #[test]
+    fn hybrid_membership_uses_the_unified_memory_budget_in_either_order() {
+        let (root, proc) = namespace_root("8589934592\n", "memory\n");
+        for membership in ["1:net_cls:/\n0::/\n", "0::/\n2:cpu,cpuacct:/work:bench\n"] {
+            std::fs::write(proc.path().join("self/cgroup"), membership).unwrap();
+            let budget =
+                HostAdmission::probe_in(LABEL, ROOT_LABEL, proc.path(), root.path(), 42).unwrap();
+            // Machine-wide MemAvailable is 24 GiB, but only 6 GiB remain in this group.
+            assert_eq!(budget.available_bytes(), 6u64 << 30);
+        }
+    }
+
+    #[test]
     fn cgroup_discovery_rejects_bad_process_mapping() {
         for (membership, pid, owners, kind) in [
             ("0::/../work\n", 42, "41\n42\n", "domain"),
             ("0::work\n", 42, "41\n42\n", "domain"),
             ("0::/work\n0::/work\n", 42, "41\n42\n", "domain"),
             ("1:memory:/work\n", 42, "41\n42\n", "domain"),
+            ("0::/work\n1:cpu,memory:/\n", 42, "42\n", "domain"),
+            ("0::/work\n0:net_cls:/\n", 42, "42\n", "domain"),
+            ("0::/work\n1::/\n", 42, "42\n", "domain"),
+            ("0::/work\n1:cpu,:/\n", 42, "42\n", "domain"),
+            ("0::/work\nx:cpu:/\n", 42, "42\n", "domain"),
+            ("0::/work\n1:net_cls:relative\n", 42, "42\n", "domain"),
             ("0::/work\n", 0, "41\n42\n", "domain"),
             ("0::/work\n", 42, "41\n", "domain"),
             ("0::/work\n", 42, "41\n42\n", "threaded"),
@@ -872,7 +920,7 @@ mod tests {
         );
         let budget = result.unwrap();
         assert_eq!(budget.mem_available, 48u64 << 30);
-        assert_eq!(budget.os_floor, 27_487_790_695);
+        assert_eq!(budget.memory().os_floor(), 27_487_790_695);
         assert_eq!(budget.cgroup_remaining, None);
         assert!(budget.admit(LABEL, 256 * 47 * 1_603_584u64).is_ok());
     }
@@ -882,7 +930,7 @@ mod tests {
         let text = "MemAvailable: 25165824 kB\nMemFree: 0 kB\nMemTotal: 33554432 kB\n";
         let floor = 8u64 << 30;
         let budget = HostAdmission::from_meminfo(LABEL, text, Some(floor + 1)).unwrap();
-        assert_eq!(budget.os_floor, floor);
+        assert_eq!(budget.memory().os_floor(), floor);
         assert_eq!(budget.cgroup_remaining, Some(floor + 1));
         assert!(budget.admit(LABEL, 1).is_ok());
         assert!(budget.admit(LABEL, 2).is_err());
@@ -929,10 +977,14 @@ mod tests {
         let budget = HostAdmission {
             mem_available: u64::MAX,
             cgroup_remaining: None,
-            os_floor: 1,
+            mem_total: u64::MAX,
         };
         assert!(budget.admit(LABEL, u64::MAX).is_err());
-        assert!(budget.admit(LABEL, u64::MAX - 1).is_ok());
+        assert!(
+            budget
+                .admit(LABEL, u64::MAX - budget.memory().os_floor())
+                .is_ok()
+        );
     }
 
     #[test]
@@ -942,7 +994,7 @@ mod tests {
         let exact = HostAdmission {
             mem_available: required + floor,
             cgroup_remaining: Some(required + floor),
-            os_floor: floor,
+            mem_total: 64 << 30,
         };
         assert!(
             exact.admit(LABEL, required).is_ok(),

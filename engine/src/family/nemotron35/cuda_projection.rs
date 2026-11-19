@@ -721,11 +721,11 @@ impl CudaProjector {
         let limits = admission.transfer_limits();
         let max_payload = admission.max_payload();
         let workspace = admission.workspace().clone();
-        let cache_budget = admission.device_weight_cache_bytes();
+        let mut cache_budget = 0;
         let stream_plan = admission.stream_plan();
         let context =
-            CudaContext::with_pinned_stage(&workspace, max_payload, move |memory, integrated| {
-                admission.into_cleanup(memory, integrated)
+            CudaContext::with_pinned_stage(&workspace, max_payload, |memory, integrated| {
+                admission.into_cleanup_with_cache(memory, integrated, &mut cache_budget)
             })?;
         Ok(Self {
             context,

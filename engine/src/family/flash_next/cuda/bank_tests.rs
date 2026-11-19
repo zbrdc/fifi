@@ -138,32 +138,63 @@ fn the_geometry_takes_the_plan_and_refuses_another_record_size() {
 // The host budget.
 // ---------------------------------------------------------------------------------------------
 
+#[cfg(target_os = "linux")]
 #[test]
-fn meminfo_gives_the_machine_and_the_os_floor() {
-    let text = "MemTotal:       65467544 kB\nMemFree:  1 kB\nMemAvailable:   50000000 kB\n";
-    let memory = HostMemory::from_meminfo(text).unwrap();
-    assert_eq!(memory.total, HOST_TOTAL);
-    assert_eq!(memory.available, 50_000_000 * 1024);
-    assert_eq!(
-        memory.os_floor(),
-        8 * GIB,
-        "a tenth of 62 GiB is under the 8 GiB floor"
+#[ignore = "requires a Linux process with a 512 MiB memory cgroup"]
+fn process_memory_limit_512_mib() {
+    let memory = HostPinPlan::probe_host().unwrap();
+    assert!((1..=512 << 20).contains(&memory.available), "{memory:?}");
+    let geometry = geometry_of(&plan_with_slots(143));
+    let err = HostPinPlan::for_load(&geometry, None, &memory, 0).unwrap_err();
+    assert!(err.describe().contains("are available"), "{err:?}");
+    eprintln!("Flash-Next {memory:?}: inclusive and exclusive expert storage refused");
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+#[ignore = "requires a 20 GiB memory cgroup on a host with an 8 GiB OS floor"]
+fn process_memory_limit_20_gib_selects_exclusive() {
+    let memory = HostPinPlan::probe_host().unwrap();
+    assert!(
+        (19 * GIB..=20 * GIB).contains(&memory.available),
+        "{memory:?}"
     );
-    let big = HostMemory {
-        total: 200 * GIB,
-        available: 100 * GIB,
-    };
-    assert_eq!(big.os_floor(), 20 * GIB);
-    for bad in [
-        "MemTotal: 10 kB\n",
-        "MemAvailable: 10 kB\n",
-        "MemTotal: 10 MB\nMemAvailable: 1 kB\n",
-        "MemTotal: 10 kB\nMemAvailable: 11 kB\n",
-        "MemTotal: 0 kB\nMemAvailable: 0 kB\n",
-        "MemTotal: x kB\nMemAvailable: 1 kB\n",
-    ] {
-        assert!(HostMemory::from_meminfo(bad).is_err(), "{bad:?}");
-    }
+    assert_eq!(memory.os_floor(), 8 * GIB);
+    let geometry = BankGeometry::new(4, 8, 2, 6, 256 << 20).unwrap();
+    let ple = GIB;
+    assert!(HostPinPlan::for_load(&geometry, Some("inclusive"), &memory, ple).is_err());
+    let plan = HostPinPlan::for_load(&geometry, None, &memory, ple).unwrap();
+    assert_eq!(plan.mode, HostMode::Exclusive);
+    let forced = HostPinPlan::for_load(&geometry, Some("exclusive"), &memory, ple).unwrap();
+    assert_eq!(plan.process_bytes, forced.process_bytes);
+    eprintln!(
+        "Flash-Next {memory:?}: auto chose exclusive, process plan {} bytes",
+        plan.process_bytes
+    );
+}
+
+#[test]
+fn auto_store_falls_back_after_charging_ple_and_preserves_forced_modes() {
+    let geometry = geometry_of(&plan_with_slots(143));
+    let memory = host(HOST_TOTAL);
+    let inclusive = HostPinPlan::for_load(&geometry, Some("inclusive"), &memory, 0).unwrap();
+    let memory = host(inclusive.process_bytes + inclusive.os_floor);
+    let ple = GIB;
+    assert_eq!(
+        HostPinPlan::for_load(&geometry, None, &memory, 0)
+            .unwrap()
+            .mode,
+        HostMode::Inclusive
+    );
+    assert!(HostPinPlan::for_load(&geometry, Some("inclusive"), &memory, ple).is_err());
+    let auto = HostPinPlan::for_load(&geometry, Some("auto"), &memory, ple).unwrap();
+    let forced = HostPinPlan::for_load(&geometry, Some("exclusive"), &memory, 0).unwrap();
+    assert_eq!(auto.mode, HostMode::Exclusive);
+    assert_eq!(auto.process_bytes, forced.process_bytes + ple);
+    let exact = auto.process_bytes + auto.os_floor;
+    assert!(HostPinPlan::for_load(&geometry, None, &host(exact), ple).is_ok());
+    assert!(HostPinPlan::for_load(&geometry, None, &host(exact - 1), ple).is_err());
+    assert!(HostPinPlan::for_load(&geometry, None, &memory, u64::MAX).is_err());
 }
 
 #[test]

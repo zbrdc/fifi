@@ -150,8 +150,8 @@ pub(in crate::family::flash_next) struct TierInputs {
 impl TierInputs {
     /// The inputs of a load, from what the machine reports: `free_vram` is the device's free memory
     /// measured after the context exists and before any weight is resident (the desktop and other
-    /// processes are already excluded), `(mem_total, mem_available)` is `/proc/meminfo`
-    /// (`capability::probe`). The device reserves are the fixed admission ledger of Qwen3.6's
+    /// processes are already excluded), `(mem_total, mem_available)` carries physical RAM and process-available bytes
+    /// after enclosing memory limits. The device reserves are the fixed admission ledger of Qwen3.6's
     /// `enginesrv check` (`qwen36::admission_sketch`): the measured runtime overhead floor for the
     /// kernel arena and the CUDA context, and the admission margin, the minimum spare and the
     /// uncertainty band as the margin (`desktop_reserve` of `VramBudget`, whose error text still says

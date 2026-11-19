@@ -28,18 +28,6 @@ fn byte_limit(name: &str, value: Option<&std::ffi::OsStr>) -> Result<Option<usiz
     Ok(Some(bytes))
 }
 
-fn mem_available(contents: &str) -> Option<usize> {
-    let value = contents
-        .lines()
-        .find_map(|line| line.strip_prefix("MemAvailable:"))?;
-    let mut fields = value.split_whitespace();
-    let kib = fields.next()?.parse::<usize>().ok()?;
-    if fields.next()? != "kB" || fields.next().is_some() {
-        return None;
-    }
-    kib.checked_mul(1024)
-}
-
 fn default_pin_bytes(checkpoint: usize) -> usize {
     checkpoint.saturating_mul(3).min(DEFAULT_PIN_BYTES_MAX)
 }
@@ -84,13 +72,17 @@ impl QwenResidentStep<'_> {
         let checkpoint = PrefixPinPool::checkpoint_bytes(self.state.layout())?;
         let limit = byte_limit(PIN_BYTES_ENV, std::env::var_os(PIN_BYTES_ENV).as_deref())?
             .unwrap_or_else(|| default_pin_bytes(checkpoint));
-        let available = std::fs::read_to_string("/proc/meminfo")
-            .ok()
-            .and_then(|contents| mem_available(&contents));
+        let available = crate::family::host_admit::HostAdmission::probe(
+            "q36 pinned prefix",
+            "q36 pinned prefix",
+        )
+        .inspect_err(|error| eprintln!("q36 cuda: pinned prefix host budget: {}", error.describe()))
+        .ok()
+        .and_then(|budget| usize::try_from(budget.available_bytes()).ok());
         let entries = planned_entries(checkpoint, limit, available);
         if entries == 0 {
             eprintln!(
-                "q36 cuda: pinned prefix refused, checkpoint {checkpoint} B, cap {limit} B, host headroom {PIN_MEMORY_HEADROOM} B, MemAvailable {available:?}; retained entries 0, bytes 0"
+                "q36 cuda: pinned prefix refused, checkpoint {checkpoint} B, cap {limit} B, host headroom {PIN_MEMORY_HEADROOM} B, available host/cgroup bytes {available:?}; retained entries 0, bytes 0"
             );
             return Ok(());
         }
@@ -401,26 +393,5 @@ mod tests {
             use std::os::unix::ffi::OsStrExt;
             assert!(byte_limit(PIN_BYTES_ENV, Some(OsStr::from_bytes(&[0xff]))).is_err());
         }
-    }
-
-    #[test]
-    fn unavailable_or_malformed_host_memory_refuses_retention() {
-        assert_eq!(
-            mem_available("MemTotal: 99 kB\nMemAvailable: 3072 kB\n"),
-            Some(3 << 20)
-        );
-        for info in [
-            "",
-            "MemAvailable: -1 kB",
-            "MemAvailable: 1 MB",
-            "MemAvailable: 1 kB extra",
-            "MemAvailable: nope kB",
-        ] {
-            assert_eq!(mem_available(info), None);
-        }
-        assert_eq!(
-            mem_available(&format!("MemAvailable: {} kB", usize::MAX)),
-            None
-        );
     }
 }

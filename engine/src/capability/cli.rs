@@ -435,6 +435,15 @@ fn run_config_effective(path: &std::path::Path, json: bool) -> Result<(), String
             "id": engine.id, "family": engine.family, "settings": rows,
         }));
     }
+    for (engine, row) in config.engines.iter().zip(&mut json_engines) {
+        if engine.resource_policy.is_some() {
+            row["resource_policy"] = "auto".into();
+            rendered.push_str(&format!(
+                "engine {} resource_policy: auto (family load-time admission)\n",
+                engine.id
+            ));
+        }
+    }
     if json {
         println!(
             "{}",

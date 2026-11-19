@@ -90,49 +90,7 @@ const MIB: u64 = 1 << 20;
 // Host memory budget.
 // ---------------------------------------------------------------------------------------------
 
-/// `MemTotal` and `MemAvailable` of the machine, in bytes. `available` is the caller's minimum of
-/// the host figure and every cgroup ancestor's remaining bytes (`family::host_admit::HostAdmission`
-/// reads that on the CUDA path; see [`HostPinPlan::new`]).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(super) struct HostMemory {
-    pub(super) total: u64,
-    pub(super) available: u64,
-}
-
-impl HostMemory {
-    /// Parses the text of `/proc/meminfo`. Refuses a missing field, a unit other than kB and an
-    /// available figure above the total.
-    pub(super) fn from_meminfo(text: &str) -> Result<Self, EngError> {
-        let field = |name: &str| -> Result<u64, EngError> {
-            let invalid = || plan_error(format!("/proc/meminfo has no valid {name} in kB"));
-            let line = text
-                .lines()
-                .find_map(|line| line.strip_prefix(name))
-                .and_then(|rest| rest.strip_prefix(':'))
-                .ok_or_else(invalid)?;
-            let mut words = line.split_whitespace();
-            let kib: u64 = words
-                .next()
-                .and_then(|value| value.parse().ok())
-                .ok_or_else(invalid)?;
-            if words.next() != Some("kB") || words.next().is_some() {
-                return Err(invalid());
-            }
-            kib.checked_mul(1024).ok_or_else(invalid)
-        };
-        let (total, available) = (field("MemTotal")?, field("MemAvailable")?);
-        if total == 0 || available > total {
-            return Err(plan_error("/proc/meminfo totals are inconsistent".into()));
-        }
-        Ok(Self { total, available })
-    }
-
-    /// The OS floor: a tenth of the RAM, at least 8 GiB. The same rule as the
-    /// host guard's `from_meminfo`, which keeps it private.
-    pub(super) fn os_floor(&self) -> u64 {
-        self.total.div_ceil(10).max(8 * GIB)
-    }
-}
+pub(super) use crate::memory::HostMemory;
 
 /// The host terms besides the pinned store.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -204,13 +162,46 @@ pub(super) struct HostPinPlan {
 }
 
 impl HostPinPlan {
+    #[cfg(all(target_os = "linux", any(test, feature = "native-cuda")))]
+    pub(super) fn probe_host() -> Result<HostMemory, EngError> {
+        crate::family::host_admit::HostAdmission::probe("Flash-Next expert bank", "Flash-Next")
+            .map(|budget| budget.memory())
+    }
+
+    /// Account for the host PLE matrices before choosing between inclusive and exclusive storage.
+    pub(super) fn for_load(
+        geometry: &BankGeometry,
+        mode: Option<&str>,
+        memory: &HostMemory,
+        ple_bytes: u64,
+    ) -> Result<Self, EngError> {
+        let mut terms = HostTerms::DEFAULT;
+        terms.engine_heap = terms
+            .engine_heap
+            .checked_add(ple_bytes)
+            .ok_or_else(|| plan_error("host heap and PLE projections overflow".into()))?;
+        let plan = |mode| Self::new(geometry, mode, memory, &terms);
+        match mode {
+            None | Some("" | "auto") => plan(HostMode::Inclusive).or_else(|inclusive| {
+                eprintln!(
+                    "flash-next cuda: inclusive store refused ({inclusive:?}); exclusive store"
+                );
+                plan(HostMode::Exclusive)
+            }),
+            Some("inclusive") => plan(HostMode::Inclusive),
+            Some("exclusive") => plan(HostMode::Exclusive),
+            Some(other) => Err(EngError::BadRequest(format!(
+                "FIFI_FLASH_NEXT_BANK_MODE={other}: only auto, inclusive and exclusive are valid"
+            ))),
+        }
+    }
+
     /// Sizes the pinned store from the machine and refuses (it never shrinks the store, and never
     /// changes the context) when
     /// - the process and the OS floor exceed `available`, or
     /// - the page cache left (`available` minus the need) is below `ngram_cache_min`.
     ///
-    /// On the CUDA path the caller also runs the host guard's `probe()?.admit_for(process_bytes, ..)`,
-    /// which applies the cgroup ancestors (and refuses a cgroup-namespace root, so run on the host).
+    /// The loader rechecks the final charge immediately before allocating.
     pub(super) fn new(
         geometry: &BankGeometry,
         mode: HostMode,

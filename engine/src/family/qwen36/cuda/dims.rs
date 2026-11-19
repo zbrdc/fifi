@@ -4,7 +4,7 @@
 //! the widths of the fused projection outputs come from the output rows of the tensor roles in the
 //! inventory, checked against the geometry. No model number is written here.
 
-use super::super::host::HostShape;
+use super::super::{host::HostShape, settings::SlotRequest};
 use crate::{
     EngError,
     family::{
@@ -100,8 +100,8 @@ pub(crate) struct StepOptions {
 /// (fractions are milli-units).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct TieredPlan {
-    /// Bank slots per layer; at least the picks per token, at most the experts of a layer.
-    pub(crate) slots_per_layer: usize,
+    /// Resolved against the model and the remaining VRAM at bank allocation.
+    pub(crate) slots: SlotRequest,
     /// CPU worker threads, 1 to [`TieredPlan::MAX_THREADS`].
     pub(crate) threads: usize,
     /// The longest the host waits for one layer's CPU experts.
@@ -123,8 +123,12 @@ impl TieredPlan {
     /// The defaults of the measurements: the caller chooses the slots and the thread count (6 in
     /// the measurements); timeout 10 s, 0.25 swaps per token, decay 0.999, no preload.
     pub(crate) fn new(slots_per_layer: usize, threads: usize) -> Self {
+        Self::from_slots(SlotRequest::Exactly(slots_per_layer), threads)
+    }
+
+    pub(crate) fn from_slots(slots: SlotRequest, threads: usize) -> Self {
         Self {
-            slots_per_layer,
+            slots,
             threads,
             timeout_ms: 10_000,
             swaps_milli: 250,
@@ -135,7 +139,7 @@ impl TieredPlan {
 
     pub(crate) fn check(&self) -> Result<(), EngError> {
         let bad = |what: String| Err(EngError::BadRequest(format!("tiered plan: {what}")));
-        if self.slots_per_layer == 0 {
+        if self.slots == SlotRequest::Exactly(0) {
             return bad(String::from("slots_per_layer must be above zero"));
         }
         if !(1..=Self::MAX_THREADS).contains(&self.threads) {

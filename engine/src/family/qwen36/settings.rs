@@ -569,9 +569,8 @@ fn speculation_of(
 #[derive(Clone, Copy, Debug, Default, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct TieredOptions {
-    /// Expert bank slots per layer, from 8 (the picks per token) to 256. Required: the number
-    /// depends on the card, the context and the desktop, so no default covers it.
-    pub(crate) slots: Option<u32>,
+    /// An exact count of resident experts or "auto" for the largest count that fits.
+    pub(crate) slots: Option<SlotRequest>,
     /// CPU worker threads, from 1 to 8. The default is 6.
     pub(crate) threads: Option<u32>,
     /// The longest wait for one layer's CPU experts, in milliseconds, from 1 to 600,000. The
@@ -604,6 +603,26 @@ pub(crate) enum SlotRequest {
     Exactly(usize),
 }
 
+impl<'de> Deserialize<'de> for SlotRequest {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        #[derive(Deserialize)]
+        #[serde(untagged)]
+        enum Input {
+            Count(u32),
+            Name(String),
+        }
+        match Input::deserialize(deserializer)? {
+            Input::Count(count) => usize::try_from(count)
+                .map(Self::Exactly)
+                .map_err(serde::de::Error::custom),
+            Input::Name(name) if name == "auto" => Ok(Self::Fit),
+            Input::Name(_) => Err(serde::de::Error::custom(
+                "tiered.slots expects an integer or \"auto\"",
+            )),
+        }
+    }
+}
+
 /// Whether the banked load runs only when the resident load does not fit (`Auto`) or always
 /// (`On`).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -622,7 +641,7 @@ pub(crate) struct ExpertBankSettings {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct TieredSettings {
-    pub(crate) slots: usize,
+    pub(crate) slots: SlotRequest,
     pub(crate) threads: usize,
     pub(crate) timeout_ms: u32,
     pub(crate) preload: bool,
@@ -1190,10 +1209,16 @@ fn tiered_settings(
     }
     let slots = tiered
         .slots
-        .ok_or_else(|| bad("tiered needs slots (bank slots per layer, 8 to 256)".into()))?;
+        .ok_or_else(|| bad("tiered needs slots (8 to 256 or auto)".into()))?;
+    if let SlotRequest::Exactly(count) = slots
+        && !(8..=256).contains(&count)
+    {
+        return Err(bad(format!(
+            "tiered.slots must be 8 to 256 or auto, found {count}"
+        )));
+    }
     let built = TieredSettings {
-        slots: usize::try_from(ranged("tiered.slots", Some(slots), 8, 8, 256)?)
-            .map_err(|_| bad("tiered.slots exceeds usize".into()))?,
+        slots,
         threads: usize::try_from(ranged("tiered.threads", tiered.threads, 6, 1, 8)?)
             .map_err(|_| bad("tiered.threads exceeds usize".into()))?,
         timeout_ms: ranged("tiered.timeout_ms", tiered.timeout_ms, 10_000, 1, 600_000)?,
@@ -2529,7 +2554,7 @@ mod tests {
         );
         let tiered = exl3_options(|o| {
             o.tiered = Some(super::TieredOptions {
-                slots: Some(8),
+                slots: Some(SlotRequest::Exactly(8)),
                 ..super::TieredOptions::default()
             })
         });
@@ -3871,7 +3896,7 @@ mod tests {
         assert_eq!(
             got.tiered,
             Some(TieredSettings {
-                slots: 40,
+                slots: SlotRequest::Exactly(40),
                 threads: 6,
                 timeout_ms: 10_000,
                 preload: false
@@ -3884,12 +3909,29 @@ mod tests {
         assert_eq!(
             got.tiered,
             Some(TieredSettings {
-                slots: 61,
+                slots: SlotRequest::Exactly(61),
                 threads: 4,
                 timeout_ms: 5000,
                 preload: true
             })
         );
+    }
+
+    #[test]
+    fn auto_tiered_slots_are_explicit_and_preserve_the_cuda_mode_checks() {
+        let options = tiered(r#""capture":false,"tiered":{"slots":"auto"}"#);
+        let got = settings_for(Some(&options), &Q36Env::default(), Backend::Cuda).unwrap();
+        assert_eq!(got.tiered.unwrap().slots, SlotRequest::Fit);
+        for value in [r#""AUTO""#, r#""16""#, "true", "16.5", "-1"] {
+            assert!(
+                serde_json::from_str::<Q36Options>(&format!(r#"{{"tiered":{{"slots":{value}}}}}"#))
+                    .is_err(),
+                "{value}"
+            );
+        }
+        assert!(settings_for(Some(&options), &Q36Env::default(), Backend::Mlx).is_err());
+        let capture = tiered(r#""capture":true,"tiered":{"slots":"auto"}"#);
+        assert!(settings_for(Some(&capture), &Q36Env::default(), Backend::Cuda).is_err());
     }
 
     #[test]

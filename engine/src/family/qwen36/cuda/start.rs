@@ -660,7 +660,7 @@ pub(super) fn tiered_plan_of(settings: &Q36Settings) -> Option<TieredPlan> {
     settings.tiered.map(|tiered| TieredPlan {
         timeout_ms: tiered.timeout_ms,
         preload: tiered.preload,
-        ..TieredPlan::new(tiered.slots, tiered.threads)
+        ..TieredPlan::from_slots(tiered.slots, tiered.threads)
     })
 }
 
@@ -1521,7 +1521,7 @@ fn make(
         let (model, gguf) = gguf.as_ref().ok_or_else(|| {
             EngError::BadRequest("engine config: tiered experts read the GGUF file".into())
         })?;
-        attach_tiered_parts(
+        let slots = attach_tiered_parts(
             &mut step,
             projector.context(),
             ((model.weights.header(), gguf), &res.dims),
@@ -1529,7 +1529,7 @@ fn make(
         )?;
         eprintln!(
             "q36 cuda: tiered, {} slots per layer, {} cpu threads, timeout {} ms",
-            plan.slots_per_layer, plan.threads, plan.timeout_ms
+            slots, plan.threads, plan.timeout_ms
         );
     }
     eprintln!(

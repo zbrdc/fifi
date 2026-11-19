@@ -240,6 +240,7 @@ fn config_from(discovered: &Discovered, args: &ModelServeArgs) -> Config {
         sample_trace: false,
         web_dir: None,
         engines: vec![EngineConfig {
+            resource_policy: None,
             id: "q36".to_string(),
             model_dir: args.model_dir.clone(),
             tokenizer_dir: discovered.tokenizer_dir.clone(),

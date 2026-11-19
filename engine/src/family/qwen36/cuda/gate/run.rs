@@ -176,7 +176,10 @@ fn identities_of(s: &GateSettings, total: usize, before: usize, after: usize) ->
     if let Some(plan) = s.tiered {
         // Only a tiered call carries the member: a plain call's identities stay byte for byte.
         identities["tiered"] = json!({
-            "slots": plan.slots_per_layer,
+            "slots": match plan.slots {
+                crate::family::qwen36::settings::SlotRequest::Fit => json!("auto"),
+                crate::family::qwen36::settings::SlotRequest::Exactly(n) => json!(n),
+            },
             "threads": plan.threads,
             "timeout_ms": plan.timeout_ms,
             "preload": plan.preload,
@@ -1154,8 +1157,8 @@ mod tests {
                 .unwrap()
                 .tiered
                 .unwrap()
-                .slots_per_layer,
-            40
+                .slots,
+            crate::family::qwen36::settings::SlotRequest::Exactly(40)
         );
         assert_eq!(
             session_options(&plain, WeightLayout::Native)

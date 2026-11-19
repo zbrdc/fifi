@@ -185,6 +185,7 @@ mod tests {
 
     fn config(options: Option<FakeOptions>) -> EngineConfig {
         EngineConfig {
+            resource_policy: None,
             id: "e1".to_string(),
             model_dir: std::env::temp_dir().join("fake-model-dir"),
             tokenizer_dir: tokenizer_dir(),

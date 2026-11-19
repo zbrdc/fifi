@@ -92,10 +92,12 @@ pub struct NemotronLoader {
 }
 
 impl NemotronLoader {
+    pub(super) const CACHE_INDEX_ENTRY_BYTES: usize = std::mem::size_of::<(ExpertKey, Tensor)>();
+
     /// Reads config and index only. A nonzero cache entry capacity is required.
     pub fn open(directory: impl AsRef<Path>, cache_entries: usize) -> Result<Self, EngError> {
         let cache_bytes = cache_entries
-            .checked_mul(std::mem::size_of::<(ExpertKey, Tensor)>())
+            .checked_mul(Self::CACHE_INDEX_ENTRY_BYTES)
             .filter(|&bytes| bytes <= isize::MAX as usize)
             .ok_or_else(|| bad("cache entry capacity exceeds host limits"))?;
         if cache_bytes == 0 {

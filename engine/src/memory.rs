@@ -5,6 +5,19 @@
 
 use crate::EngError;
 
+/// Physical RAM and the bytes currently available to the process, before model-specific reserves.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct HostMemory {
+    pub(crate) total: u64,
+    pub(crate) available: u64,
+}
+
+impl HostMemory {
+    pub(crate) fn os_floor(self) -> u64 {
+        self.total.div_ceil(10).max(8 << 30)
+    }
+}
+
 /// 850 permille leaves the 15 percent that device and driver allocations need
 /// beyond the engine's own accounting.
 pub const DEFAULT_SHARE_PERMILLE: u16 = 850;

@@ -185,22 +185,19 @@ class RouterFixture(unittest.TestCase):
         self.proc = subprocess.Popen(
             [node, str(copy)],
             env=env,
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
         )
+        self.addCleanup(self.proc.stdout.close)
         self.addCleanup(self.stop_router)
         self.base = f"http://127.0.0.1:{port}"
-        for _ in range(60):
-            if self.proc.poll() is not None:
-                self.fail("model router exited before accepting requests")
-            try:
-                with socket.create_connection(("127.0.0.1", port), timeout=0.2):
-                    pass
-                break
-            except OSError:
-                time.sleep(0.05)
-        else:
-            self.fail("model router did not start")
+        # Node prints this line from its listen callback. On a cold runner,
+        # interpreter startup can take longer than the requests themselves.
+        ready, _, _ = select.select([self.proc.stdout], [], [], 30)
+        self.assertTrue(ready, "model router produced no startup output within 30s")
+        line = self.proc.stdout.readline().rstrip()
+        self.assertIn(f"model router on 127.0.0.1:{port} ->", line, f"router startup: {line!r}")
 
     def stop_router(self):
         if self.proc.poll() is None:

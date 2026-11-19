@@ -51,7 +51,7 @@ pub(super) fn admit_checkpoint(
     let cache_entries = u64::try_from(cache_entries)
         .map_err(|_| memory_error("expert cache entry count exceeds u64"))?;
     let expert_cache_bytes = cache_entries
-        .checked_mul(largest_expert_entry_bytes)
+        .checked_mul(payloads.cache_entry_bytes()?)
         .ok_or_else(|| memory_error("expert cache bytes overflow u64"))?;
     // A cache miss peaks at one extra worst-entry payload: the loader documents a 2x-entry
     // decode peak. The fixed 256 MiB covers logits (~512 KiB at vocab 131072), attention
@@ -75,6 +75,7 @@ pub(super) fn admit_checkpoint(
 /// Decoded payload sizes the admission checks share, taken from one header scan.
 #[derive(Debug, Clone, Copy)]
 struct Payloads {
+    expert_entries: usize,
     dense_payload_bytes: u64,
     largest_dense_tensor_bytes: u64,
     largest_routed_entry_bytes: u64,
@@ -82,6 +83,14 @@ struct Payloads {
     largest_expert_entry_bytes: u64,
     #[cfg(all(feature = "native-cuda", target_os = "linux"))]
     cuda: CudaPayloads,
+}
+
+impl Payloads {
+    fn cache_entry_bytes(&self) -> Result<u64, EngError> {
+        self.largest_expert_entry_bytes
+            .checked_add(super::loader::NemotronLoader::CACHE_INDEX_ENTRY_BYTES as u64)
+            .ok_or_else(|| memory_error("expert cache payload and index bytes overflow u64"))
+    }
 }
 
 #[cfg(all(feature = "native-cuda", target_os = "linux"))]
@@ -130,6 +139,7 @@ fn checkpoint_payloads(
     }
 
     let mut payloads = Payloads {
+        expert_entries: 0,
         dense_payload_bytes: 0,
         largest_dense_tensor_bytes: 0,
         largest_routed_entry_bytes: 0,
@@ -154,6 +164,7 @@ fn checkpoint_payloads(
                 if plan.part != NemotronTensorPart::Weight {
                     continue;
                 }
+                payloads.expert_entries += 1;
                 let entry = expert_entry_payload_bytes(name, metadata.dtype(), metadata.shape())?;
                 #[cfg(all(feature = "native-cuda", target_os = "linux"))]
                 {
@@ -356,12 +367,43 @@ pub(super) fn admit_serving(
     descriptor: &NemotronTextSpec,
     spec: &NemotronExecSpec,
     capacity: u32,
-    cache_entries: usize,
+    cache_entries: Option<usize>,
     policy: MemoryPolicy,
-    available_bytes: u64,
-) -> Result<(), EngError> {
-    let (components, _) = serving_plan(directory, descriptor, spec, capacity, cache_entries)?;
-    check_serving_memory(components, policy, available_bytes).map(|_| ())
+    available: u64,
+) -> Result<usize, EngError> {
+    let (components, payloads) = serving_plan(
+        directory,
+        descriptor,
+        spec,
+        capacity,
+        cache_entries.unwrap_or(0),
+    )?;
+    let fixed = check_serving_memory(components, policy, available)?;
+    match cache_entries {
+        Some(entries) => Ok(entries),
+        None => fit_cache_entries(
+            &payloads,
+            admission_ceiling(policy, available).saturating_sub(fixed),
+        ),
+    }
+}
+
+/// All decoded entries fit within the largest entry charged by the existing admission ledger.
+fn fit_cache_entries(payloads: &Payloads, bytes: u64) -> Result<usize, EngError> {
+    let entry_bytes = payloads.cache_entry_bytes()?;
+    let count = bytes
+        .checked_div(entry_bytes)
+        .ok_or_else(|| memory_error("automatic expert cache needs a nonempty expert"))?;
+    let entries = payloads
+        .expert_entries
+        .min(usize::try_from(count).unwrap_or(usize::MAX));
+    if entries == 0 {
+        return Err(memory_error(format!(
+            "automatic expert cache needs {} bytes for one entry, {bytes} available",
+            entry_bytes
+        )));
+    }
+    Ok(entries)
 }
 
 /// One header scan supplies both the retained serving plan and its tensor maxima.
@@ -390,7 +432,7 @@ fn serving_plan(
         .checked_mul(3)
         .ok_or_else(|| memory_error("three state payloads overflow u64"))?;
     let expert_cache = cache_entries
-        .checked_mul(payloads.largest_expert_entry_bytes)
+        .checked_mul(payloads.cache_entry_bytes()?)
         .ok_or_else(|| memory_error("expert cache bytes overflow u64"))?;
     let retained = retained_selected_bytes(
         routed_pairs,
@@ -422,25 +464,16 @@ fn serving_plan(
     ))
 }
 
-pub(super) fn host_available_bytes() -> Option<u64> {
+pub(super) fn host_available_bytes() -> Result<u64, EngError> {
     #[cfg(target_os = "linux")]
     {
-        fs::read_to_string("/proc/meminfo")
-            .ok()
-            .and_then(|contents| parse_mem_available(&contents))
+        crate::family::host_admit::HostAdmission::probe("Nemotron admission", "Nemotron admission")
+            .map(|budget| budget.available_bytes())
     }
     #[cfg(not(target_os = "linux"))]
-    None
-}
-
-#[cfg(target_os = "linux")]
-fn parse_mem_available(contents: &str) -> Option<u64> {
-    let line = contents
-        .lines()
-        .find(|line| line.starts_with("MemAvailable:"))?;
-    let mut fields = line.strip_prefix("MemAvailable:")?.split_whitespace();
-    let kib = fields.next()?.parse::<u64>().ok()?;
-    (fields.next()? == "kB").then_some(kib.checked_mul(1024)?)
+    Err(memory_error(
+        "host availability probe requires Linux; use generate_with_admission with an explicit available-byte budget",
+    ))
 }
 
 fn memory_error(message: impl Into<String>) -> EngError {
@@ -650,7 +683,10 @@ mod tests {
         ) -> u64 {
             let payloads = checkpoint_payloads(dir, descriptor).unwrap();
             let state = NemotronState::planned_bytes(spec, 16).unwrap();
-            let cache = 4u64 * payloads.largest_expert_entry_bytes;
+            let cache = 4u64
+                * (payloads.largest_expert_entry_bytes
+                    + crate::family::nemotron35::loader::NemotronLoader::CACHE_INDEX_ENTRY_BYTES
+                        as u64);
             let transient = payloads.largest_expert_entry_bytes + ACTIVATION_WORKSPACE_BYTES;
             payloads.dense_payload_bytes + state + cache + transient
         }
@@ -722,6 +758,74 @@ mod tests {
             assert!(matches!(error, EngError::MemoryPlan(_)), "{error:?}");
         }
 
+        #[cfg(target_os = "linux")]
+        #[test]
+        #[ignore = "requires a Linux process with a 512 MiB memory cgroup"]
+        fn process_memory_limit_512_mib() {
+            let (dir, descriptor, spec) = fixture();
+            let available = super::super::host_available_bytes().unwrap();
+            assert!((1..=512 << 20).contains(&available), "{available}");
+            let policy = MemoryPolicy::default_share();
+            let payload = checkpoint_payloads(dir.path(), &descriptor).unwrap();
+            let entries =
+                usize::try_from((512u64 << 20) / payload.largest_expert_entry_bytes + 1).unwrap();
+            let (components, _) =
+                serving_plan(dir.path(), &descriptor, &spec, 16, entries).unwrap();
+            let required =
+                super::super::check_serving_memory(components, policy, 20 << 30).unwrap();
+            let admit = |limit| {
+                admit_serving(
+                    dir.path(),
+                    &descriptor,
+                    &spec,
+                    16,
+                    Some(entries),
+                    policy,
+                    limit,
+                )
+            };
+            assert_eq!(admit(required).unwrap(), entries);
+            assert!(admit(required - 1).is_err());
+            let error = admit(available).unwrap_err();
+            assert!(error.describe().contains("ceiling"), "{error:?}");
+            assert!(
+                admit_serving(dir.path(), &descriptor, &spec, 16, None, policy, available).is_err()
+            );
+            eprintln!("Nemotron serving needs {required} bytes, process has {available}: refused");
+        }
+
+        #[cfg(target_os = "linux")]
+        #[test]
+        #[ignore = "requires a Linux process with a 2 GiB memory cgroup"]
+        fn process_memory_limit_2_gib_auto_cache() {
+            let (dir, descriptor, spec) = fixture();
+            let available = super::super::host_available_bytes().unwrap();
+            assert!((1 << 30..=2 << 30).contains(&available), "{available}");
+            let policy = MemoryPolicy::default_share();
+            let payload = checkpoint_payloads(dir.path(), &descriptor).unwrap();
+            let admit = |entries| {
+                admit_serving(
+                    dir.path(),
+                    &descriptor,
+                    &spec,
+                    16,
+                    entries,
+                    policy,
+                    available,
+                )
+            };
+            let automatic = admit(None).unwrap();
+            assert!(automatic > 0);
+            assert_eq!(automatic, payload.expert_entries);
+            assert_eq!(admit(Some(1)).unwrap(), 1);
+            let oversized =
+                usize::try_from(available / payload.cache_entry_bytes().unwrap() + 1).unwrap();
+            assert!(admit(Some(oversized)).is_err());
+            eprintln!(
+                "Nemotron auto admitted {automatic} checkpoint entries at {available} available bytes; explicit one-entry cache admitted"
+            );
+        }
+
         #[test]
         fn admit_serving_accepts_the_exact_total_and_refuses_one_byte_less() {
             let (dir, descriptor, spec) = fixture();
@@ -740,17 +844,58 @@ mod tests {
                 &descriptor,
                 &spec,
                 16,
-                4,
+                Some(4),
                 MemoryPolicy::default_share(),
                 total,
             )
             .expect("the exact serving total fits the measured ceiling");
+            let stride = components.expert_cache_bytes / 4;
+            let one_entry = total - 3 * stride;
+            assert_eq!(
+                admit_serving(
+                    dir.path(),
+                    &descriptor,
+                    &spec,
+                    16,
+                    None,
+                    MemoryPolicy::default_share(),
+                    one_entry
+                )
+                .unwrap(),
+                1
+            );
+            assert!(
+                admit_serving(
+                    dir.path(),
+                    &descriptor,
+                    &spec,
+                    16,
+                    None,
+                    MemoryPolicy::default_share(),
+                    one_entry - 1
+                )
+                .is_err()
+            );
+            let (_, payloads) = serving_plan(dir.path(), &descriptor, &spec, 16, 0).unwrap();
+            assert_eq!(
+                admit_serving(
+                    dir.path(),
+                    &descriptor,
+                    &spec,
+                    16,
+                    None,
+                    MemoryPolicy::default_share(),
+                    u64::MAX
+                )
+                .unwrap(),
+                payloads.expert_entries
+            );
             let error = admit_serving(
                 dir.path(),
                 &descriptor,
                 &spec,
                 16,
-                4,
+                Some(4),
                 MemoryPolicy::default_share(),
                 total - 1,
             )
@@ -929,6 +1074,7 @@ pub(super) mod cuda {
         plan: CudaPlan,
         policy: MemoryPolicy,
         available_host: u64,
+        resize_device_cache: bool,
         charged_device: u64,
         shared_device_host: u64,
         stream_plan: Option<super::ChunkStreamPlan>,
@@ -961,6 +1107,7 @@ pub(super) mod cuda {
             plan,
             policy,
             available_host,
+            resize_device_cache: false,
             charged_device: 0,
             shared_device_host: 0,
             stream_plan: None,
@@ -978,6 +1125,10 @@ pub(super) mod cuda {
 
         pub(crate) fn transfer_limits(&self) -> CudaTransferLimits {
             self.plan.transfers
+        }
+
+        pub(in crate::family::nemotron35) fn enable_auto_cache(&mut self) {
+            self.resize_device_cache = true;
         }
 
         pub(crate) fn device_weight_cache_bytes(&self) -> u64 {
@@ -1035,17 +1186,26 @@ pub(super) mod cuda {
         }
 
         /// The backend calls this under dispatch, before any staged allocation.
-        pub(crate) fn into_cleanup(
+        #[cfg(test)]
+        fn into_cleanup(
+            self,
+            memory: MemoryInfo,
+            integrated: bool,
+        ) -> Result<Box<dyn FnOnce()>, EngError> {
+            self.into_cleanup_with_cache(memory, integrated, &mut 0)
+        }
+
+        pub(crate) fn into_cleanup_with_cache(
             mut self,
             memory: MemoryInfo,
             integrated: bool,
+            cache_budget: &mut u64,
         ) -> Result<Box<dyn FnOnce()>, EngError> {
             if memory.free > memory.total {
                 return Err(memory_error("CUDA free memory exceeds reported total"));
             }
             let free = u64::try_from(memory.free)
                 .map_err(|_| memory_error("CUDA free memory exceeds u64"))?;
-            let shared = if integrated { self.plan.device_peak } else { 0 };
             {
                 let mut held = HELD
                     .lock()
@@ -1053,16 +1213,38 @@ pub(super) mod cuda {
                 if held.failed {
                     return Err(memory_error("CUDA reservation ledger is unavailable"));
                 }
+                let trim = if self.resize_device_cache {
+                    let host_total = u128::from(held.host)
+                        + if integrated {
+                            u128::from(self.plan.device_peak)
+                        } else {
+                            0
+                        };
+                    let host_excess = host_total.saturating_sub(u128::from(admission_ceiling(
+                        self.policy,
+                        self.available_host,
+                    )));
+                    // Each trimmed byte also frees its device backing on unified-memory hardware.
+                    let host_trim = host_excess.div_ceil(if integrated { 2 } else { 1 });
+                    let device_total = u128::from(held.device) + u128::from(self.plan.device_peak);
+                    let device_trim =
+                        device_total.saturating_sub(u128::from(self.policy.limit(free)));
+                    host_trim
+                        .max(device_trim)
+                        .min(u128::from(self.plan.weight_cache)) as u64
+                } else {
+                    0
+                };
+                let peak = self.plan.device_peak - trim;
+                let shared = if integrated { peak } else { 0 };
                 let host = held
                     .host
-                    .checked_add(shared)
+                    .checked_sub(trim)
+                    .and_then(|h| h.checked_add(shared))
                     .ok_or_else(|| memory_error("shared CUDA host reservation overflows u64"))?;
-                let device = held
-                    .device
-                    .checked_add(self.plan.device_peak)
-                    .ok_or_else(|| {
-                        memory_error("aggregate CUDA device reservation overflows u64")
-                    })?;
+                let device = held.device.checked_add(peak).ok_or_else(|| {
+                    memory_error("aggregate CUDA device reservation overflows u64")
+                })?;
                 if host > admission_ceiling(self.policy, self.available_host) {
                     return Err(memory_error(
                         "shared CUDA device reservation exceeds host ceiling",
@@ -1076,8 +1258,18 @@ pub(super) mod cuda {
                 }
                 held.host = host;
                 held.device = device;
-                self.charged_device = self.plan.device_peak;
+                self.plan.weight_cache -= trim;
+                self.plan.host_total -= trim;
+                self.plan.device_peak = peak;
+                self.charged_device = peak;
                 self.shared_device_host = shared;
+            }
+            *cache_budget = self.device_weight_cache_bytes();
+            if self.resize_device_cache {
+                eprintln!(
+                    "nemotron35: admitted {} bytes of CUDA weight cache with {free} free device bytes",
+                    *cache_budget
+                );
             }
             Ok(Box::new(move || self.release_native_after_cleanup()))
         }
@@ -1113,31 +1305,74 @@ pub(super) mod cuda {
         descriptor: &NemotronTextSpec,
         spec: &NemotronExecSpec,
         capacity: u32,
-        cache_entries: usize,
+        cache_entries: Option<usize>,
         policy: MemoryPolicy,
         available_host: u64,
-    ) -> Result<CudaAdmission, EngError> {
-        let (components, payloads) =
-            serving_plan(directory, descriptor, spec, capacity, cache_entries)?;
+    ) -> Result<(CudaAdmission, usize), EngError> {
+        let (components, payloads) = serving_plan(
+            directory,
+            descriptor,
+            spec,
+            capacity,
+            cache_entries.unwrap_or(0),
+        )?;
         let host_base_bytes = check_serving_memory(components, policy, available_host)?;
         let packed_pair_bytes = payloads
             .cuda
             .largest_packed_bytes
             .checked_add(payloads.cuda.largest_scale_bytes)
             .ok_or_else(|| memory_error("packed weight/scale peak overflows u64"))?;
-        admit_cuda_plan(
+        let mut input = CudaPlanInput {
+            host_base_bytes,
+            largest_tensor_bytes: payloads
+                .largest_dense_tensor_bytes
+                .max(payloads.largest_expert_entry_bytes),
+            packed_pair_bytes,
+            max_shape: payloads.cuda.max_shape,
+            device_weight_cache_bytes: DEVICE_WEIGHT_CACHE_REQUEST_BYTES,
+        };
+        let entries = if let Some(entries) = cache_entries {
+            entries
+        } else {
+            let held = HELD
+                .lock()
+                .map_err(|_| memory_error("CUDA reservation ledger is poisoned"))?
+                .host;
+            let ceiling = admission_ceiling(policy, available_host).saturating_sub(held);
+            fit_loader_cache(&mut input, &payloads, ceiling)?
+        };
+        Ok((admit_cuda_plan(input, policy, available_host)?, entries))
+    }
+
+    fn fit_loader_cache(
+        input: &mut CudaPlanInput,
+        payloads: &super::Payloads,
+        ceiling: u64,
+    ) -> Result<usize, EngError> {
+        let mandatory = CudaPlan::new(
             CudaPlanInput {
-                host_base_bytes,
-                largest_tensor_bytes: payloads
-                    .largest_dense_tensor_bytes
-                    .max(payloads.largest_expert_entry_bytes),
-                packed_pair_bytes,
-                max_shape: payloads.cuda.max_shape,
-                device_weight_cache_bytes: DEVICE_WEIGHT_CACHE_REQUEST_BYTES,
+                device_weight_cache_bytes: 0,
+                ..*input
             },
-            policy,
-            available_host,
-        )
+            ceiling,
+        )?
+        .host_total;
+        let entry_bytes = payloads.cache_entry_bytes()?;
+        let available = ceiling.saturating_sub(mandatory);
+        // Reserve room for at least one loader entry before funding the optional device weight cache.
+        input.device_weight_cache_bytes = input
+            .device_weight_cache_bytes
+            .min(available.saturating_sub(entry_bytes));
+        let entries =
+            super::fit_cache_entries(payloads, available - input.device_weight_cache_bytes)?;
+        let bytes = (entries as u64)
+            .checked_mul(entry_bytes)
+            .ok_or_else(|| memory_error("automatic cache bytes overflow"))?;
+        input.host_base_bytes = input
+            .host_base_bytes
+            .checked_add(bytes)
+            .ok_or_else(|| memory_error("automatic CUDA host plan overflows"))?;
+        Ok(entries)
     }
 
     #[cfg(test)]
@@ -1200,6 +1435,80 @@ pub(super) mod cuda {
         fn reservation_snapshot(ticket: &CudaAdmission) -> (String, (u64, u64, bool)) {
             let held = HELD.lock().unwrap_or_else(|error| error.into_inner());
             (format!("{ticket:?}"), (held.host, held.device, held.failed))
+        }
+
+        #[test]
+        fn automatic_loader_cache_protects_staging_and_one_entry_before_device_caching() {
+            let payloads = super::super::Payloads {
+                dense_payload_bytes: 100,
+                largest_dense_tensor_bytes: 10,
+                largest_routed_entry_bytes: 20,
+                largest_shared_entry_bytes: 12,
+                largest_expert_entry_bytes: 20,
+                expert_entries: 5,
+                cuda: Default::default(),
+            };
+            let mut initial = small(100);
+            initial.device_weight_cache_bytes = 50;
+            let fixed = CudaPlan::new(small(100), u64::MAX).unwrap().host_total;
+            let entry = payloads.cache_entry_bytes().unwrap();
+            assert!(fit_loader_cache(&mut initial, &payloads, fixed + entry - 1).is_err());
+            let mut one = small(100);
+            one.device_weight_cache_bytes = 50;
+            assert_eq!(
+                fit_loader_cache(&mut one, &payloads, fixed + entry).unwrap(),
+                1
+            );
+            assert_eq!(one.device_weight_cache_bytes, 0);
+            assert_eq!(one.host_base_bytes, 100 + entry);
+            let mut many = small(100);
+            many.device_weight_cache_bytes = 50;
+            assert_eq!(
+                fit_loader_cache(&mut many, &payloads, fixed + 5 * entry + 50).unwrap(),
+                5
+            );
+            assert_eq!(many.device_weight_cache_bytes, 50);
+            assert_eq!(many.host_base_bytes, 100 + 5 * entry);
+        }
+
+        fn auto_device_cache_uses_the_measured_card_budget() {
+            let mut input = small(100);
+            input.device_weight_cache_bytes = 1000;
+            let mut ticket = admit_cuda_plan(input, MemoryPolicy::default_share(), 10_000).unwrap();
+            let required = ticket.plan.device_peak - ticket.plan.weight_cache;
+            ticket.enable_auto_cache();
+            let free = (required + 50) * 1000 / 850 + 1;
+            let expected = MemoryPolicy::default_share().limit(free) - required;
+            let before = held();
+            let mut budget = 0;
+            let cleanup = ticket
+                .into_cleanup_with_cache(memory(free), false, &mut budget)
+                .unwrap();
+            assert_eq!(budget, expected);
+            assert_eq!(held(), (before.0 - (1000 - expected), required + expected));
+            cleanup();
+        }
+
+        fn auto_cache_counts_both_copies_on_integrated_hardware() {
+            let bare = CudaPlan::new(small(100), u64::MAX).unwrap();
+            let wanted = 17;
+            let mut input = small(100);
+            input.device_weight_cache_bytes = 64;
+            // This fixture stages small tensors when uncached. With caching enabled it
+            // also needs one pageable upload before the host and device cache copies.
+            let fixed_device = bare.device_peak + input.largest_tensor_bytes;
+            let ceiling = bare.host_total + fixed_device + 2 * wanted + 1;
+            let mut ticket =
+                admit_cuda_plan(input, MemoryPolicy::default_share(), ceiling).unwrap();
+            ticket.enable_auto_cache();
+            let mut budget = 0;
+            let device_free = ticket.plan.device_peak * 2;
+            let cleanup = ticket
+                .into_cleanup_with_cache(memory(device_free), true, &mut budget)
+                .unwrap();
+            assert_eq!(budget, wanted);
+            assert_eq!(held(), (ceiling - 1, fixed_device + wanted));
+            cleanup();
         }
 
         fn host_boundaries() {
@@ -1677,7 +1986,15 @@ pub(super) mod cuda {
 
         #[test]
         fn owned_reservation_contract() {
-            let cases: [(&str, fn()); 16] = [
+            let cases: [(&str, fn()); 18] = [
+                (
+                    "auto-cache-integrated",
+                    auto_cache_counts_both_copies_on_integrated_hardware,
+                ),
+                (
+                    "auto-cache",
+                    auto_device_cache_uses_the_measured_card_budget,
+                ),
                 ("host", host_boundaries),
                 ("cleanup", cleanup_and_reload),
                 ("discard", discarded_obligation),

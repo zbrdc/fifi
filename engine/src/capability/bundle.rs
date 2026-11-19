@@ -912,6 +912,7 @@ mod tests {
     fn effective_rows_come_from_the_real_resolver_with_origins() {
         let model = q36_dir();
         let engine = crate::server::config::EngineConfig {
+            resource_policy: None,
             id: "q36".to_string(),
             model_dir: model.path().to_path_buf(),
             tokenizer_dir: model.path().to_path_buf(),

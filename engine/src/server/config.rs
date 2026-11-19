@@ -73,9 +73,16 @@ pub(crate) struct Config {
     pub(crate) engines: Vec<EngineConfig>,
 }
 
+#[derive(Clone, Copy, Debug, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum ResourcePolicy {
+    Auto,
+}
+
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct EngineConfig {
+    pub(crate) resource_policy: Option<ResourcePolicy>,
     pub(crate) id: String,
     pub(crate) model_dir: PathBuf,
     pub(crate) tokenizer_dir: PathBuf,
@@ -113,6 +120,32 @@ pub(crate) struct FakeOptions {
 }
 
 impl EngineConfig {
+    fn resolve_resource_policy(&mut self) -> Result<(), StartupError> {
+        let auto = self.resource_policy == Some(ResourcePolicy::Auto);
+        if self.family == NEMOTRON_FAMILY
+            && let Some(options) = &self.nemotron
+        {
+            options.check_cache_policy(auto).map_err(|why| {
+                StartupError(format!(
+                    "engine {}: {}",
+                    self.id,
+                    crate::capability::describe_error(&why)
+                ))
+            })?;
+        }
+        if auto
+            && self.family == Q36_FAMILY
+            && let Some(tier) = self
+                .qwen36
+                .as_mut()
+                .and_then(|options| options.tiered.as_mut())
+        {
+            tier.slots
+                .get_or_insert(crate::family::qwen36::settings::SlotRequest::Fit);
+        }
+        Ok(())
+    }
+
     pub(crate) fn model_name(&self) -> String {
         self.model.clone().unwrap_or_else(|| self.family.clone())
     }
@@ -122,8 +155,11 @@ impl Config {
     pub(crate) fn from_file(path: &Path) -> Result<Config, StartupError> {
         let text = std::fs::read_to_string(path)
             .map_err(|error| StartupError(format!("cannot read {}: {error}", path.display())))?;
-        let config: Config = serde_json::from_str(&text)
+        let mut config: Config = serde_json::from_str(&text)
             .map_err(|error| StartupError(format!("cannot parse {}: {error}", path.display())))?;
+        for engine in &mut config.engines {
+            engine.resolve_resource_policy()?;
+        }
         config.check()?;
         Ok(config)
     }
@@ -783,6 +819,62 @@ mod tests {
     }
 
     const NEMOTRON: &str = r#""family": "nemotron35""#;
+
+    #[test]
+    fn engine_resource_policy_defers_to_the_selected_loader_and_preserves_pins() {
+        use crate::family::qwen36::settings::SlotRequest;
+        let mut value: serde_json::Value = serde_json::from_str(VALID).unwrap();
+        value["engines"][0]["resource_policy"] = "auto".into();
+        for family in super::FAMILIES {
+            value["engines"][0]["family"] = family.into();
+            if family == super::NEMOTRON_FAMILY {
+                value["engines"][0]["nemotron"] = serde_json::json!({"backend":"cpu_reference","context_limit":64,"prefill_chunk":2});
+            }
+            load(&value.to_string()).unwrap_or_else(|e| panic!("{family}: {e}"));
+            value["engines"][0]
+                .as_object_mut()
+                .unwrap()
+                .remove("nemotron");
+        }
+        value["engines"][0]["family"] = super::Q36_FAMILY.into();
+        value["engines"][0]["qwen36"] = serde_json::json!({"tiered": {}});
+        let config = load(&value.to_string()).unwrap();
+        assert_eq!(
+            config.engines[0]
+                .qwen36
+                .as_ref()
+                .unwrap()
+                .tiered
+                .unwrap()
+                .slots,
+            Some(SlotRequest::Fit)
+        );
+        value["engines"][0]["qwen36"]["tiered"]["slots"] = 12.into();
+        let config = load(&value.to_string()).unwrap();
+        assert_eq!(
+            config.engines[0]
+                .qwen36
+                .as_ref()
+                .unwrap()
+                .tiered
+                .unwrap()
+                .slots,
+            Some(SlotRequest::Exactly(12))
+        );
+        let engine = &mut value["engines"][0];
+        engine.as_object_mut().unwrap().remove("qwen36");
+        engine["family"] = super::NEMOTRON_FAMILY.into();
+        engine["nemotron"] =
+            serde_json::json!({"backend":"cpu_reference","context_limit":64,"prefill_chunk":2});
+        assert!(load(&value.to_string()).is_ok());
+        value["engines"][0]
+            .as_object_mut()
+            .unwrap()
+            .remove("resource_policy");
+        assert!(message(load(&value.to_string())).contains("cache_entries"));
+        value["engines"][0]["resource_policy"] = "other".into();
+        assert!(message(load(&value.to_string())).contains("unknown variant"));
+    }
 
     #[test]
     fn a_nemotron_entry_reads_its_options_object() {

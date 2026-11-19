@@ -30,7 +30,7 @@ use std::{
 };
 
 use super::{
-    bank::{HostMemory, HostPinPlan, HostTerms, RecordSource, device::DeviceBank},
+    bank::{HostPinPlan, RecordSource, device::DeviceBank},
     bank_source::PackRecordSource,
     device::{CardChunkDevice, CardDevice},
     driver::chunk::ChunkDriver,
@@ -256,13 +256,6 @@ fn moe_trunks(
         .collect()
 }
 
-fn read_meminfo() -> Result<(u64, u64), EngError> {
-    let text = std::fs::read_to_string("/proc/meminfo")
-        .map_err(|error| EngError::MemoryPlan(format!("/proc/meminfo: {error}")))?;
-    let memory = HostMemory::from_meminfo(&text)?;
-    Ok((memory.total, memory.available))
-}
-
 /// A record source that adds up the time spent reading and packing records from the pack, so the
 /// load log can split the bank fill into the pack read and the pin and upload.
 struct TimedSource<'a> {
@@ -461,7 +454,7 @@ pub(super) fn build_driver(
         model.moe.top_k(),
         report.expert_bytes,
     )?;
-    let (mem_total, mem_available) = read_meminfo()?;
+    let memory = HostPinPlan::probe_host()?;
     let rows = wanted.prefill_rows as usize;
     let prefill_arena_bytes = if shared_prefill {
         StepPlan::prefill_bytes(
@@ -498,7 +491,7 @@ pub(super) fn build_driver(
             bytes_per_position: 1,
         },
         free_vram.saturating_sub(ring_budget),
-        (mem_total, mem_available),
+        (memory.total, memory.available),
     )
     .with_prefill_arena(prefill_arena_bytes)?;
     let load_plan = FlashLoadPlan::new(&report, &checkpoint.model_config, ngram_bytes, card)?;
@@ -541,33 +534,18 @@ pub(super) fn build_driver(
     // of host RAM (43.07 GiB on this pack), so `auto` takes it only when the plan admits it and
     // falls back to the exclusive store of spare places. `FIFI_FLASH_NEXT_BANK_MODE` forces a
     // mode (`inclusive` or `exclusive`); anything else is refused, never a silent fallback.
-    let memory = HostMemory {
-        total: mem_total,
-        available: mem_available,
-    };
-    let host_plan = match std::env::var("FIFI_FLASH_NEXT_BANK_MODE").as_deref() {
-        Err(_) | Ok("") | Ok("auto") => {
-            HostPinPlan::new(&geometry, HostMode::Inclusive, &memory, &HostTerms::DEFAULT).or_else(
-                |inclusive| {
-                    eprintln!(
-                        "flash-next cuda: inclusive store refused ({inclusive:?}); exclusive store"
-                    );
-                    HostPinPlan::new(&geometry, HostMode::Exclusive, &memory, &HostTerms::DEFAULT)
-                },
-            )?
-        }
-        Ok("inclusive") => {
-            HostPinPlan::new(&geometry, HostMode::Inclusive, &memory, &HostTerms::DEFAULT)?
-        }
-        Ok("exclusive") => {
-            HostPinPlan::new(&geometry, HostMode::Exclusive, &memory, &HostTerms::DEFAULT)?
-        }
-        Ok(other) => {
-            return Err(EngError::BadRequest(format!(
-                "FIFI_FLASH_NEXT_BANK_MODE={other}: only auto, inclusive and exclusive are valid"
-            )));
-        }
-    };
+    let ple_bytes = (model.hyper.branches() as u64)
+        .checked_add(1)
+        .and_then(|branches| branches.checked_mul(model.hyper.hidden() as u64))
+        .and_then(|width| width.checked_mul(model.ple.embed() as u64))
+        .and_then(|elements| elements.checked_mul(4))
+        .ok_or_else(|| EngError::MemoryPlan("Flash-Next PLE projection bytes overflow".into()))?;
+    let host_plan = HostPinPlan::for_load(
+        &geometry,
+        std::env::var("FIFI_FLASH_NEXT_BANK_MODE").ok().as_deref(),
+        &memory,
+        ple_bytes,
+    )?;
     eprintln!(
         "flash-next cuda: {} store, {} pinned host bytes",
         match host_plan.mode {
@@ -576,10 +554,8 @@ pub(super) fn build_driver(
         },
         host_plan.store_bytes
     );
-    let ple_width = (model.hyper.hidden() * model.hyper.branches() + model.hyper.hidden()) as u64;
-    let ple_bytes = ple_width * model.ple.embed() as u64 * 4;
     HostAdmission::probe("Flash-Next expert bank", "Flash-Next")?.admit_for(
-        host_plan.process_bytes + ple_bytes,
+        host_plan.process_bytes,
         "Flash-Next expert bank and PLE projections",
     )?;
 

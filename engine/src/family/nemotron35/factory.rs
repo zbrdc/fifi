@@ -31,12 +31,21 @@ pub(crate) const FAMILY: &str = "nemotron35";
 pub(crate) struct NemotronOptions {
     backend: String,
     context_limit: u32,
-    cache_entries: usize,
+    cache_entries: Option<usize>,
     prefill_chunk: u32,
 }
 
 impl NemotronOptions {
     /// Rejects every unsupported setting before a file or a device is touched.
+    pub(crate) fn check_cache_policy(&self, automatic: bool) -> Result<(), EngError> {
+        if self.cache_entries.is_none() && !automatic {
+            return Err(config_error(
+                "cache_entries is required unless resource_policy is auto",
+            ));
+        }
+        Ok(())
+    }
+
     fn check(&self) -> Result<(), EngError> {
         match self.backend.as_str() {
             "cpu_reference" => {}
@@ -55,7 +64,7 @@ impl NemotronOptions {
         if self.context_limit == 0 {
             return Err(config_error("context_limit must be positive"));
         }
-        if self.cache_entries == 0 {
+        if self.cache_entries == Some(0) {
             return Err(config_error("cache_entries must be positive"));
         }
         if self.prefill_chunk == 0 || self.prefill_chunk > self.context_limit {
@@ -81,9 +90,11 @@ pub(crate) fn start_engine(
     model_dir: &Path,
     tokenizer_dir: &Path,
     options: Option<&NemotronOptions>,
+    automatic: bool,
     ready_note: ReadyNote,
 ) -> Result<StartedEngine, EngError> {
     let options = options.ok_or_else(|| config_error("this entry needs options"))?;
+    options.check_cache_policy(automatic)?;
     options.check()?;
     let bundle = crate::tokenizer::nemotron::load(tokenizer_dir)?;
     let eos = bundle.eos_token_ids().to_vec();
@@ -103,24 +114,11 @@ pub(crate) fn start_engine(
             ));
         }
         let spec = NemotronExecSpec::from_descriptor(&descriptor)?;
-        let available = admission::host_available_bytes().ok_or_else(|| {
-            EngError::MemoryPlan(
-                "nemotron35 admission: available host memory is unavailable".to_string(),
-            )
-        })?;
-        let admitted = match owned.backend.as_str() {
+        let available = admission::host_available_bytes()?;
+        let (admitted, entries) = match owned.backend.as_str() {
             #[cfg(all(feature = "native-cuda", target_os = "linux"))]
-            "cuda" => StackAdmission::Cuda(admission::cuda::admit_cuda_serving(
-                &model,
-                &descriptor,
-                &spec,
-                owned.context_limit,
-                owned.cache_entries,
-                MemoryPolicy::default_share(),
-                available,
-            )?),
-            _ => {
-                admission::admit_serving(
+            "cuda" => {
+                let (mut ticket, entries) = admission::cuda::admit_cuda_serving(
                     &model,
                     &descriptor,
                     &spec,
@@ -129,11 +127,32 @@ pub(crate) fn start_engine(
                     MemoryPolicy::default_share(),
                     available,
                 )?;
-                StackAdmission::Cpu
+                if automatic {
+                    ticket.enable_auto_cache();
+                }
+                (StackAdmission::Cuda(ticket), entries)
+            }
+            _ => {
+                let entries = admission::admit_serving(
+                    &model,
+                    &descriptor,
+                    &spec,
+                    owned.context_limit,
+                    owned.cache_entries,
+                    MemoryPolicy::default_share(),
+                    available,
+                )?;
+                (StackAdmission::Cpu, entries)
             }
         };
         let state = NemotronState::new(&spec, owned.context_limit)?;
-        let source = LoaderWeightSource::open(&model, owned.cache_entries)?;
+        if automatic {
+            eprintln!(
+                "nemotron35: admitted {entries} host expert cache entries at context {}",
+                owned.context_limit
+            );
+        }
+        let source = LoaderWeightSource::open(&model, entries)?;
         let stack = build_stack(admitted, spec, source, state)?;
         NemotronExecutor::new(stack, eos)
     })?;
@@ -244,7 +263,7 @@ mod tests {
     fn missing_options_and_bad_options_stop_before_any_file_read() {
         let absent = Path::new("/nonexistent/model");
         let tokenizer = Path::new("/nonexistent/tokenizer");
-        let error = match start_engine(absent, tokenizer, None, None) {
+        let error = match start_engine(absent, tokenizer, None, false, None) {
             Err(error) => error,
             Ok(_) => panic!("options are required"),
         };
@@ -252,7 +271,7 @@ mod tests {
         let json =
             r#"{"backend":"cpu_reference","context_limit":0,"cache_entries":1,"prefill_chunk":1}"#;
         let parsed = options(json);
-        let error = match start_engine(absent, tokenizer, Some(&parsed), None) {
+        let error = match start_engine(absent, tokenizer, Some(&parsed), false, None) {
             Err(error) => error,
             Ok(_) => panic!("bounds are checked first"),
         };

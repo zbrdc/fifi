@@ -1148,6 +1148,18 @@ mod load_policy;
 #[cfg(test)]
 mod model_tests;
 
+fn admit_mapped_experts(host_bytes: u64, available: u64) -> Result<(), EngError> {
+    let needed = host_bytes.checked_add(1 << 30).ok_or_else(|| {
+        EngError::MemoryPlan("cuda mapped experts: host memory demand overflows".into())
+    })?;
+    if needed > available {
+        return Err(EngError::MemoryPlan(format!(
+            "cuda mapped experts: need {needed} host bytes including 1 GiB free, have {available}"
+        )));
+    }
+    Ok(())
+}
+
 /// Select whole eligible slices from the end of the load until the requested
 /// minimum is met. The only possible overshoot is one complete expert slice.
 fn select_host_experts(
@@ -1301,25 +1313,14 @@ fn load_inner(
         tensor.mapped = mapped;
     }
     if host_bytes != 0 {
-        let available = crate::capability::probe::probe_host()
-            .mem_available_bytes
-            .as_ref()
-            .copied()
-            .ok_or_else(|| {
-                EngError::MemoryPlan(
-                    "cuda mapped experts: host memory availability is unknown".into(),
-                )
-            })?;
-        let needed = host_bytes.checked_add(1 << 30).ok_or_else(|| {
-            EngError::MemoryPlan("cuda mapped experts: host memory demand overflows".into())
-        })?;
-        if needed > available {
-            return Err(EngError::MemoryPlan(format!(
-                "cuda mapped experts: need {needed} host bytes including 1 GiB free, have {available}"
-            )));
-        }
+        let available = crate::family::host_admit::HostAdmission::probe(
+            "cuda mapped experts",
+            "cuda mapped experts",
+        )?
+        .available_bytes();
+        admit_mapped_experts(host_bytes, available)?;
         eprintln!(
-            "cuda mapped experts: placing {host_bytes} bytes in host memory (host available {available} bytes)"
+            "cuda mapped experts: placing {host_bytes} bytes in host memory (available host/cgroup bytes {available})"
         );
     }
     let total = tensors

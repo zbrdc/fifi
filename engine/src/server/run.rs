@@ -246,6 +246,12 @@ fn start_engines(file: &Config) -> Result<(Vec<Engine>, Vec<EngineEntry>), Start
         // The registry lookup sits next to the staged check and before any
         // file read: an unstartable family fails fast without touching the
         // model directory.
+        if config.resource_policy.is_some() {
+            eprintln!(
+                "engine {}: resource_policy=auto, using {} load-time admission",
+                config.id, config.family
+            );
+        }
         let starter = family_starter(&config.family).ok_or_else(|| {
             StartupError(format!(
                 "engine {} failed to start: family {} has no starter in this build",
@@ -483,6 +489,7 @@ fn start_nemotron(
         &config.model_dir,
         &config.tokenizer_dir,
         config.nemotron.as_ref(),
+        config.resource_policy.is_some(),
         ready_note,
     )?;
     Ok(StartedEngine {
@@ -778,6 +785,7 @@ mod tests {
 
     fn engine_config(id: &str, options: Option<FakeOptions>) -> EngineConfig {
         EngineConfig {
+            resource_policy: None,
             id: id.to_string(),
             model_dir: std::env::temp_dir().join("fake-model-dir"),
             tokenizer_dir: PathBuf::from(env!("CARGO_MANIFEST_DIR"))
@@ -821,6 +829,7 @@ mod tests {
     /// (family, qwen36) vary; everything else is inert.
     fn engine_of(family: &str, qwen36: Option<Q36Options>) -> EngineConfig {
         EngineConfig {
+            resource_policy: None,
             id: "resolver-test".to_string(),
             model_dir: std::env::temp_dir().join("resolver-test"),
             tokenizer_dir: std::env::temp_dir().join("resolver-test"),

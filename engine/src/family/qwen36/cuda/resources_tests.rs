@@ -346,7 +346,7 @@ fn tiered_plan_is_copy_eq_and_validates_its_numbers() {
     };
     refused(
         TieredPlan {
-            slots_per_layer: 0,
+            slots: crate::family::qwen36::settings::SlotRequest::Exactly(0),
             ..plan
         },
         "slots_per_layer",
