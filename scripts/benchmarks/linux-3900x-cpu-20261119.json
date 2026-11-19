@@ -1,0 +1,165 @@
+{
+  "started_utc": "2026-11-19T22:26:01.744769+00:00",
+  "source_commit": "e2657475b5869a839f3b4e107963f0fd164e887c",
+  "rust": "rustc 1.98.1 (48a229cea 2026-09-01)",
+  "executables": {
+    "unittests src/lib.rs": "88e662de6ecee85475bfdd742fd85391f4aea276cb6d41a50779773361c9b21e",
+    "tests/decision_head.rs": "5882b375d31f57e5c80a3ea51ac79bf4c4b2640ac441a15a710491bc5f2dcdbe"
+  },
+  "timings": {
+    "sampler-1": {
+      "test": "family::sampler::tests::sample_timing_at_the_vocabulary_size",
+      "cpu_affinity": "10",
+      "env": {
+        "FIFI_CPU_GREEDY_BLOCKS": "0"
+      },
+      "measurements": [
+        "test family::sampler::tests::sample_timing_at_the_vocabulary_size ... vocab 248077, temperature 0, top_p 1, top_k 0: 0.20 ms per draw",
+        "vocab 248077, temperature 0.2, top_p 0.95, top_k 20: 0.40 ms per draw",
+        "vocab 248077, temperature 0.2, top_p 0.95, top_k 0: 9.24 ms per draw",
+        "vocab 248077, temperature 0.2, top_p 1, top_k 0: 9.28 ms per draw",
+        "vocab 248077, temperature 1, top_p 0.95, top_k 0: 10.49 ms per draw"
+      ]
+    },
+    "sampler-2": {
+      "test": "family::sampler::tests::sample_timing_at_the_vocabulary_size",
+      "cpu_affinity": "10",
+      "env": {
+        "FIFI_CPU_GREEDY_BLOCKS": "1"
+      },
+      "measurements": [
+        "test family::sampler::tests::sample_timing_at_the_vocabulary_size ... vocab 248077, temperature 0, top_p 1, top_k 0: 0.03 ms per draw",
+        "vocab 248077, temperature 0.2, top_p 0.95, top_k 20: 0.42 ms per draw",
+        "vocab 248077, temperature 0.2, top_p 0.95, top_k 0: 9.24 ms per draw",
+        "vocab 248077, temperature 0.2, top_p 1, top_k 0: 9.29 ms per draw",
+        "vocab 248077, temperature 1, top_p 0.95, top_k 0: 10.44 ms per draw"
+      ]
+    },
+    "sampler-3": {
+      "test": "family::sampler::tests::sample_timing_at_the_vocabulary_size",
+      "cpu_affinity": "10",
+      "env": {
+        "FIFI_CPU_GREEDY_BLOCKS": "1"
+      },
+      "measurements": [
+        "test family::sampler::tests::sample_timing_at_the_vocabulary_size ... vocab 248077, temperature 0, top_p 1, top_k 0: 0.03 ms per draw",
+        "vocab 248077, temperature 0.2, top_p 0.95, top_k 20: 0.39 ms per draw",
+        "vocab 248077, temperature 0.2, top_p 0.95, top_k 0: 9.05 ms per draw",
+        "vocab 248077, temperature 0.2, top_p 1, top_k 0: 9.06 ms per draw",
+        "vocab 248077, temperature 1, top_p 0.95, top_k 0: 10.23 ms per draw"
+      ]
+    },
+    "sampler-4": {
+      "test": "family::sampler::tests::sample_timing_at_the_vocabulary_size",
+      "cpu_affinity": "10",
+      "env": {
+        "FIFI_CPU_GREEDY_BLOCKS": "0"
+      },
+      "measurements": [
+        "test family::sampler::tests::sample_timing_at_the_vocabulary_size ... vocab 248077, temperature 0, top_p 1, top_k 0: 0.19 ms per draw",
+        "vocab 248077, temperature 0.2, top_p 0.95, top_k 20: 0.39 ms per draw",
+        "vocab 248077, temperature 0.2, top_p 0.95, top_k 0: 9.02 ms per draw",
+        "vocab 248077, temperature 0.2, top_p 1, top_k 0: 9.08 ms per draw",
+        "vocab 248077, temperature 1, top_p 0.95, top_k 0: 10.24 ms per draw"
+      ]
+    },
+    "sampler-reference": {
+      "test": "family::sampler::tests::timing_248077_row_reference_against_partial_selection",
+      "cpu_affinity": "10",
+      "env": {},
+      "measurements": [
+        "test family::sampler::tests::timing_248077_row_reference_against_partial_selection ... vocab 248077, temperature 0.7, top_p 0.95, top_k 0, 64 draws each: reference 25492.5 \u00b5s/sample, sampler 10265.0 \u00b5s/sample",
+        "vocab 248077, temperature 1, top_p 0.95, top_k 20, 64 draws each: reference 23935.6 \u00b5s/sample, sampler 391.2 \u00b5s/sample",
+        "vocab 248077, temperature 0.7, top_p 1, top_k 0, 64 draws each: reference 25603.2 \u00b5s/sample, sampler 10287.4 \u00b5s/sample",
+        "vocab 248077, temperature 0.7, top_p 0.95, top_k 20, 64 draws each: reference 23916.5 \u00b5s/sample, sampler 390.1 \u00b5s/sample"
+      ]
+    },
+    "q4k-expert": {
+      "test": "kernels::expert_cpu::tests::expert_cpu_rate_is_recorded",
+      "cpu_affinity": "10",
+      "env": {},
+      "measurements": [
+        "test kernels::expert_cpu::tests::expert_cpu_rate_is_recorded ... expert_cpu_rate_is_recorded: 2000 experts in 1.69873393s: 2.08 GB/s of Q4_K weight bytes"
+      ]
+    },
+    "flint-shape-1": {
+      "test": "kernels::exl3_cpu::tests::flint_shape_rate_latency",
+      "cpu_affinity": "6-11",
+      "env": {
+        "FIFI_EXL3_SWEEP_LAYERS": "1"
+      },
+      "measurements": [
+        "test kernels::exl3_cpu::tests::flint_shape_rate_latency ... Avx2 words= 16 threads= 1: median   3497.7 us/layer,   583.0 us/expert",
+        "Avx2 words= 16 threads= 6: median    667.1 us/layer,   111.2 us/expert",
+        "Avx2 words= 24 threads= 1: median   3471.9 us/layer,   578.6 us/expert",
+        "Avx2 words= 24 threads= 6: median    657.1 us/layer,   109.5 us/expert",
+        "Avx2 words= 32 threads= 1: median   3550.6 us/layer,   591.8 us/expert",
+        "Avx2 words= 32 threads= 6: median    726.2 us/layer,   121.0 us/expert",
+        "Avx2 words= 40 threads= 1: median   3520.1 us/layer,   586.7 us/expert",
+        "Avx2 words= 40 threads= 6: median    725.8 us/layer,   121.0 us/expert",
+        "Avx2 words= 48 threads= 1: median   3626.1 us/layer,   604.4 us/expert",
+        "Avx2 words= 48 threads= 6: median    761.4 us/layer,   126.9 us/expert",
+        "Avx2 words= 56 threads= 1: median   3567.5 us/layer,   594.6 us/expert",
+        "Avx2 words= 56 threads= 6: median    750.1 us/layer,   125.0 us/expert",
+        "Avx2 words= 64 threads= 1: median   3795.1 us/layer,   632.5 us/expert",
+        "Avx2 words= 64 threads= 6: median    767.6 us/layer,   127.9 us/expert",
+        "Avx2 words= 80 threads= 1: median   3981.1 us/layer,   663.5 us/expert",
+        "Avx2 words= 80 threads= 6: median    854.2 us/layer,   142.4 us/expert",
+        "Avx2 words= 96 threads= 1: median   5432.8 us/layer,   905.5 us/expert",
+        "Avx2 words= 96 threads= 6: median    897.4 us/layer,   149.6 us/expert",
+        "Avx2 words=112 threads= 1: median   5506.5 us/layer,   917.7 us/expert",
+        "Avx2 words=112 threads= 6: median   1048.0 us/layer,   174.7 us/expert",
+        "Avx2 words=128 threads= 1: median   7894.1 us/layer,  1315.7 us/expert",
+        "Avx2 words=128 threads= 6: median   1186.2 us/layer,   197.7 us/expert"
+      ]
+    },
+    "flint-shape-12": {
+      "test": "kernels::exl3_cpu::tests::flint_shape_rate_latency",
+      "cpu_affinity": "6-11",
+      "env": {
+        "FIFI_EXL3_SWEEP_LAYERS": "12"
+      },
+      "measurements": [
+        "test kernels::exl3_cpu::tests::flint_shape_rate_latency ... Avx2 words= 16 threads= 1: median   3558.8 us/layer,   593.1 us/expert",
+        "Avx2 words= 16 threads= 6: median    874.9 us/layer,   145.8 us/expert",
+        "Avx2 words= 24 threads= 1: median   3587.8 us/layer,   598.0 us/expert",
+        "Avx2 words= 24 threads= 6: median    785.7 us/layer,   131.0 us/expert",
+        "Avx2 words= 32 threads= 1: median   4168.3 us/layer,   694.7 us/expert",
+        "Avx2 words= 32 threads= 6: median   1176.4 us/layer,   196.1 us/expert",
+        "Avx2 words= 40 threads= 1: median   6226.7 us/layer,  1037.8 us/expert",
+        "Avx2 words= 40 threads= 6: median   1335.7 us/layer,   222.6 us/expert",
+        "Avx2 words= 48 threads= 1: median   5612.8 us/layer,   935.5 us/expert",
+        "Avx2 words= 48 threads= 6: median   1418.1 us/layer,   236.3 us/expert",
+        "Avx2 words= 56 threads= 1: median   5433.5 us/layer,   905.6 us/expert",
+        "Avx2 words= 56 threads= 6: median   1349.2 us/layer,   224.9 us/expert",
+        "Avx2 words= 64 threads= 1: median   8020.9 us/layer,  1336.8 us/expert",
+        "Avx2 words= 64 threads= 6: median   1540.0 us/layer,   256.7 us/expert",
+        "Avx2 words= 80 threads= 1: median   7957.9 us/layer,  1326.3 us/expert",
+        "Avx2 words= 80 threads= 6: median   1799.0 us/layer,   299.8 us/expert",
+        "Avx2 words= 96 threads= 1: median  10647.7 us/layer,  1774.6 us/expert",
+        "Avx2 words= 96 threads= 6: median   1974.6 us/layer,   329.1 us/expert",
+        "Avx2 words=112 threads= 1: median   7439.4 us/layer,  1239.9 us/expert",
+        "Avx2 words=112 threads= 6: median   2337.2 us/layer,   389.5 us/expert",
+        "Avx2 words=128 threads= 1: median  10024.8 us/layer,  1670.8 us/expert",
+        "Avx2 words=128 threads= 6: median   2298.2 us/layer,   383.0 us/expert"
+      ]
+    },
+    "decision-head": {
+      "test": "cpu_head_decision_tier_latency",
+      "cpu_affinity": "10",
+      "env": {},
+      "measurements": [
+        "test cpu_head_decision_tier_latency ... CPU decision head 4096/512/260: p50=1593.9us p90=1633.1us p99=1981.3us"
+      ]
+    }
+  },
+  "end_utc": "2026-11-19T22:27:12.370557+00:00",
+  "engine_base": "906e162ff66331c1d8ce7550180f5ce46f42b84d",
+  "engine_tree": "f47123e87c28b3fafee8a282464b8bcfc795063a",
+  "cpu": "AMD Ryzen 9 3900X",
+  "notes": [
+    "Synthetic host release probes. CPU affinity is recorded per probe.",
+    "The host also built native CUDA code during these timings.",
+    "The source commit changes benchmark scripts and docs only. The engine source tree matches the engine base."
+  ]
+}

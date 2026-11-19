@@ -34,6 +34,10 @@ Against MLX-LM 0.32.2 (mlx 0.32.4, `--prompt-cache`), the same 12 turns:
 The MLX-LM run with its default cache failed on the twelfth turn, so its sum covers 11 turns.
 About half of fifi's decode gap to MLX-LM comes from the 8-bit KV cache; the rest is kernel time per step.
 
+## Qwen3.6 on a standalone RTX 2080 Ti (11 GB)
+
+With Qwen3.6-35B-A3B Q4_K_M, Q8 KV and one saved conversation, a 65,351-token prompt took 834.27 seconds to first token. An immediate repeat reused 65,344 tokens and took 0.87 seconds. After a different conversation displaced the checkpoint, the original prompt took 836.37 seconds. Each figure is one observation. Separate 128-token counting continuations decoded at 80.19 tokens/s near 2K and 66.77 tokens/s near 64K. [Workload and measurements](https://github.com/zbrdc/fifi/pull/89)
+
 ## Qwen3.6 on an RTX 3090 (24 GB)
 
 Against llama.cpp (8-bit KV cache, `-ub 1024`), same GGUF file, 131,072-token context:
@@ -61,3 +65,21 @@ Prompt processing runs at about 1,000 tokens/s.
 
 Compared with the publisher's own runtime, fifi's next-token distributions have a mean KL divergence of 0.062 and 94.0% top-1 agreement.
 The publisher runtime's two modes differ from each other by 0.074 and 92.4%.
+
+## CPU sampling and expert probes on a Ryzen 9 3900X
+
+Release timings at engine revision `906e162f`, using Rust 1.98.1:
+
+| Workload | Measured result |
+| --- | --- |
+| Greedy selection over 248,077 logits, with block selection off | 0.19–0.20 ms per draw |
+| Greedy selection over the same logits, with block selection on | 0.03 ms per draw |
+| Q4_K expert forward pass, 2,048 hidden units and 512 intermediate units | 2.08 GB/s of weight bytes |
+| CPU decision head, 4,096 inputs, 512 hidden units and 260 outputs | 1.59 ms p50, 1.98 ms p99 |
+
+The greedy run used 30 timed draws per arm in off/on/on/off order on one
+logical CPU. Other host tasks built native CUDA code during the run. These
+results measure isolated CPU operations used by inference. The full record
+includes the sampler reference comparison and AVX2 EXL3 expert probes with
+one and twelve layers of synthetic weights.
+[Raw timings and test names](../../scripts/benchmarks/linux-3900x-cpu-20261119.json)
