@@ -28,7 +28,6 @@ use crate::family::exl3::source::PackReader;
 use crate::family::exl3_pack::{EMBED_NAME, HEAD_PREFIX, NORM_NAME, Root};
 use crate::{
     EngError,
-    capability::probe::probe_host,
     family::{
         AttentionKind, FamilySpec, QWEN3_6_35B_A3B,
         exl3::bank::ExpertStore,
@@ -136,18 +135,6 @@ pub(super) fn load_exl3_dir_decided(
     let checkpoint = Checkpoint::open(dir)?;
     let shape = HostShape::from_spec(&QWEN3_6_35B_A3B, ROTARY_DIM)?;
     let report = inspect_pack_split(&checkpoint.source, &shape)?;
-    let host_facts = probe_host();
-    let host = (
-        host_facts.mem_total_bytes.clone(),
-        host_facts.mem_available_bytes.clone(),
-    );
-    let host = match host {
-        (
-            crate::capability::Probe::Measured(total),
-            crate::capability::Probe::Measured(available),
-        ) => Some((total, available)),
-        _ => None,
-    };
     let free = u64::try_from(projector.memory_info()?.free).unwrap_or(u64::MAX);
     let dense = report.device_bytes.saturating_sub(report.expert_bytes);
     let layers = shape.kinds.len();
@@ -161,7 +148,7 @@ pub(super) fn load_exl3_dir_decided(
         experts,
         free,
         reserve,
-        host,
+        super::exl3_bank::probe_host_store,
     )?;
     // A bank smaller than one token's picks cannot hold them together: the resolver would
     // refuse every decode token and every prefill sub-block after a successful boot. Refuse

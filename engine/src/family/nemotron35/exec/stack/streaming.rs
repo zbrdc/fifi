@@ -736,8 +736,7 @@ mod cuda_tests {
                 device_weight_cache_bytes: 4096,
             },
             MemoryPolicy::default_share(),
-            admission::host_available_bytes()
-                .ok_or_else(|| EngError::MemoryPlan("host availability unavailable".into()))?,
+            admission::host_available_bytes()?,
         )?;
         CudaProjector::new(admission)
     }

@@ -103,11 +103,7 @@ pub(crate) fn start_engine(
             ));
         }
         let spec = NemotronExecSpec::from_descriptor(&descriptor)?;
-        let available = admission::host_available_bytes().ok_or_else(|| {
-            EngError::MemoryPlan(
-                "nemotron35 admission: available host memory is unavailable".to_string(),
-            )
-        })?;
+        let available = admission::host_available_bytes()?;
         let admitted = match owned.backend.as_str() {
             #[cfg(all(feature = "native-cuda", target_os = "linux"))]
             "cuda" => StackAdmission::Cuda(admission::cuda::admit_cuda_serving(

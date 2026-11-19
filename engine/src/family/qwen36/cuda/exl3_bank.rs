@@ -10,6 +10,7 @@ use crate::{
         project::cuda::Reserve,
         qwen36::settings::{BankMode, SlotRequest},
     },
+    memory::HostMemory,
 };
 
 /// The refusal helper of this module: every admission error names its numbers.
@@ -19,6 +20,11 @@ fn refuse(detail: String) -> EngError {
 
 fn gib(bytes: u64) -> String {
     format!("{:.2} GiB", bytes as f64 / (1 << 30) as f64)
+}
+
+pub(super) fn probe_host_store() -> Result<HostMemory, EngError> {
+    crate::family::host_admit::HostAdmission::probe("EXL3 expert bank", "EXL3 expert bank")
+        .map(|budget| budget.memory())
 }
 
 /// The resolved banked load: the slot count and the figures the start line reports.
@@ -50,7 +56,7 @@ pub(super) fn decide(
     n_expert: usize,
     free: u64,
     reserve: Reserve,
-    host: Option<(u64, u64)>,
+    host: impl FnOnce() -> Result<HostMemory, EngError>,
 ) -> Result<Option<BankAdmission>, EngError> {
     let hold = reserve
         .kv_cache
@@ -63,7 +69,7 @@ pub(super) fn decide(
     if mode == BankMode::Auto && resident.saturating_add(hold) <= free {
         return Ok(None);
     }
-    admit_host(routed, host)?;
+    admit_host(routed, host()?)?;
     // The load also leaves the resident flow's post-load floor free: the CUDA context and
     // workspaces eat bytes the figures above do not count, and the per-tensor admits after
     // the banks re-subtract the full hold (the embed table's admit is the last one).
@@ -126,19 +132,9 @@ pub(super) fn decide(
     }))
 }
 
-/// The routed-expert bytes of one expert of one layer (the three projections summed). The
-/// walk guarantees one rate per projection, so the division is exact; a remainder means a
-/// pack the walk did not see, and is refused rather than mis-banked.
-/// The host store's admission: the routed bytes must fit the available RAM under an OS
-/// margin of the larger of 2 GiB and 20% of the total. The figures come from
-/// `/proc/meminfo` (`probe_host`); a host without them does not get a banked load.
-fn admit_host(routed: u64, host: Option<(u64, u64)>) -> Result<(), EngError> {
-    let Some((total, available)) = host else {
-        return Err(refuse(
-            "the host memory figures are unavailable, so the expert store cannot be admitted"
-                .into(),
-        ));
-    };
+/// The pageable routed-expert store keeps the larger of 2 GiB and 20% of physical RAM free.
+fn admit_host(routed: u64, host: HostMemory) -> Result<(), EngError> {
+    let HostMemory { total, available } = host;
     let margin = (2 << 30).max(total / 5);
     let budget = available.saturating_sub(margin);
     if routed > budget {
@@ -183,8 +179,11 @@ mod tests {
     }
 
     /// A 16 GiB host with ~14 GiB available: the store fits under the 3.2 GiB margin.
-    fn host() -> Option<(u64, u64)> {
-        Some((16 << 30, 14 << 30))
+    fn host() -> Result<HostMemory, EngError> {
+        Ok(HostMemory {
+            total: 16 << 30,
+            available: 14 << 30,
+        })
     }
 
     fn reserve(hold: u64) -> Reserve {
@@ -199,7 +198,7 @@ mod tests {
         dense_routed: (u64, u64),
         free: u64,
         request: SlotRequest,
-        host: Option<(u64, u64)>,
+        host: impl FnOnce() -> Result<HostMemory, EngError>,
     ) -> Result<Option<BankAdmission>, EngError> {
         let (dense, routed) = dense_routed;
         decide(
@@ -220,7 +219,10 @@ mod tests {
         let (dense, routed) = figures();
         let free = dense + routed + (1 << 30) + (1 << 20);
         assert_eq!(
-            decide_auto((dense, routed), free, SlotRequest::Fit, host()).unwrap(),
+            decide_auto((dense, routed), free, SlotRequest::Fit, || panic!(
+                "resident load queried host store budget"
+            ))
+            .unwrap(),
             None
         );
     }
@@ -231,7 +233,7 @@ mod tests {
         // Free for 1 GiB of dense + hold + the post-load floor, plus 64 slots per layer.
         let per_member = routed / 47 / 256;
         let free = dense + (1 << 30) + (1 << 30) + per_member * 64 * 47;
-        let got = decide_auto((dense, routed), free, SlotRequest::Fit, host())
+        let got = decide_auto((dense, routed), free, SlotRequest::Fit, host)
             .unwrap()
             .expect("banks");
         assert_eq!(got.slots, 64);
@@ -252,7 +254,7 @@ mod tests {
             256,
             free,
             reserve(1 << 30),
-            host(),
+            host,
         )
         .unwrap()
         .expect("banks");
@@ -270,10 +272,38 @@ mod tests {
         let free = dense + (1 << 30) + (routed / 47 / 256) * 16;
         let error = format!(
             "{:?}",
-            decide_auto((dense, routed), free, SlotRequest::Exactly(200), host()).unwrap_err()
+            decide_auto((dense, routed), free, SlotRequest::Exactly(200), host).unwrap_err()
         );
         assert!(error.contains("200 slots"), "{error}");
         assert!(error.contains("budget"), "{error}");
+    }
+
+    #[test]
+    #[ignore = "requires a Linux process with a 512 MiB memory cgroup"]
+    fn process_memory_limit_512_mib() {
+        let memory = probe_host_store().unwrap();
+        assert!((1..=512 << 20).contains(&memory.available), "{memory:?}");
+        let (dense, routed) = figures();
+        let resident_free = dense + routed + (1 << 30);
+        assert!(
+            decide_auto(
+                (dense, routed),
+                resident_free,
+                SlotRequest::Fit,
+                probe_host_store
+            )
+            .unwrap()
+            .is_none()
+        );
+        let err = decide_auto(
+            (dense, routed),
+            resident_free - 1,
+            SlotRequest::Fit,
+            probe_host_store,
+        )
+        .unwrap_err();
+        assert!(err.describe().contains("expert store needs"), "{err:?}");
+        eprintln!("Qwen EXL3 {memory:?}: resident admitted, pageable expert store refused");
     }
 
     #[test]
@@ -292,7 +322,10 @@ mod tests {
                 256,
                 1 << 40,
                 reserve(1 << 30),
-                Some((16 << 30, 8 << 30)),
+                || Ok(HostMemory {
+                    total: 16 << 30,
+                    available: 8 << 30
+                }),
             )
             .unwrap_err()
         );
@@ -309,7 +342,7 @@ mod tests {
                 256,
                 1 << 40,
                 reserve(1 << 30),
-                None,
+                || Err(refuse("host figures unavailable".into())),
             )
             .unwrap_err()
         );
@@ -322,7 +355,7 @@ mod tests {
         // Barely past the dense figure + hold + the post-load floor: one slot fits.
         let per_member = routed / 47 / 256;
         let free = dense + (1 << 30) + (1 << 30) + per_member * 47;
-        let got = decide_auto((dense, routed), free, SlotRequest::Fit, host())
+        let got = decide_auto((dense, routed), free, SlotRequest::Fit, host)
             .unwrap()
             .expect("banks");
         assert_eq!(got.slots, 1);
@@ -337,7 +370,7 @@ mod tests {
             256,
             1 << 44,
             reserve(1 << 30),
-            host(),
+            host,
         )
         .unwrap()
         .expect("banks");
