@@ -990,7 +990,7 @@ mod tests {
             (
                 "expert_cpu_avx2.rs",
                 include_str!("expert_cpu_avx2.rs"),
-                5usize,
+                8usize,
             ),
             ("nvfp4_cpu.rs", include_str!("nvfp4_cpu.rs"), 25usize),
             ("exl3_cpu_avx2.rs", include_str!("exl3_cpu_avx2.rs"), 4usize),

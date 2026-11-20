@@ -70,6 +70,8 @@ fn the_block_lands_in_its_columns_and_nothing_else_moves() {
         shape(144, 8_192, 12_352, 0),
         shape(33, 4_096, 12_352, 8_192),
         shape(2_048, 32, 12_352, 12_320),
+        shape(4_096, 32, 12_352, 12_320),
+        shape(32_768, 32, 64, 32),
     ];
     for case in cases {
         let src: Vec<f32> = (0..case.rows * case.n)

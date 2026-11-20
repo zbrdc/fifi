@@ -105,7 +105,7 @@ constexpr int kKMax = 32768;
 constexpr long long kStrideMax = 1LL << 30;
 /* The chunk cap (`mmq_size::NCOLS_LIMIT` on the Rust side) and its gathered form
  * (`m * top_k` at top_k 8). */
-constexpr int kRowLimit = 2048;
+constexpr int kRowLimit = 4096;
 constexpr long long kRowsMax = 32768;
 constexpr int kTopKMax = 32;
 

@@ -34,7 +34,7 @@ constexpr int kKMax = 32768;
 /* The chunk cap (`mmq_size::NCOLS_LIMIT` on the Rust side), the smallest tile width the
  * launch can pick and the I tile of every kept row; the `2^30` bound is the vendored
  * `variable kbc` guard. */
-constexpr int kColsMax = 2048;
+constexpr int kColsMax = 4096;
 constexpr int kTileJMin = 8;
 constexpr int kTileI = 128;
 constexpr long long kGridLimit = 1LL << 30;

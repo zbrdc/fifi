@@ -315,8 +315,9 @@ fn chunk_prefill_rows(value: Option<&std::ffi::OsStr>) -> Result<u32, EngError> 
         Some(value) if value == "128" => Ok(128),
         Some(value) if value == "512" => Ok(512),
         Some(value) if value == "1024" => Ok(1024),
+        Some(value) if value == "2048" => Ok(2048),
         Some(_) => Err(EngError::BadRequest(format!(
-            "{CHUNK_ROWS_VAR} must be 16, 128, 512 or 1024"
+            "{CHUNK_ROWS_VAR} must be 16, 128, 512, 1024 or 2048"
         ))),
     }
 }
@@ -653,6 +654,7 @@ pub(super) fn tiered_plan_of(settings: &Q36Settings) -> Option<TieredPlan> {
     settings.tiered.map(|tiered| TieredPlan {
         timeout_ms: tiered.timeout_ms,
         preload: tiered.preload,
+        swaps_milli: tiered.swaps_milli,
         ..TieredPlan::from_slots(tiered.slots, tiered.threads)
     })
 }
@@ -2002,13 +2004,13 @@ mod chunk_prefill_flag_tests {
     #[test]
     fn requested_bulk_sizes_are_explicit_and_default_to_1024() {
         assert_eq!(chunk_prefill_rows(None).unwrap(), 1024);
-        for rows in ["16", "128", "512", "1024"] {
+        for rows in ["16", "128", "512", "1024", "2048"] {
             assert_eq!(
                 chunk_prefill_rows(Some(OsStr::new(rows))).unwrap(),
                 rows.parse::<u32>().unwrap()
             );
         }
-        for bad in ["", "0", "1", "64", "1025", "2048", " 512"] {
+        for bad in ["", "0", "1", "64", "1025", "4096", " 512"] {
             assert!(chunk_prefill_rows(Some(OsStr::new(bad))).is_err());
         }
     }

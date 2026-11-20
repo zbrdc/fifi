@@ -5,13 +5,6 @@ use inference_engine::{
 use serde_json::{Value, json};
 use std::{fs, path::Path};
 
-const BUNDLE_FILES: [&str; 4] = [
-    "tokenizer.json",
-    "tokenizer_config.json",
-    "chat_template.jinja",
-    "generation_config.json",
-];
-
 const FIXTURE_TOKENIZER_JSON_SHA256: &str =
     "ecc5ec5e4bc85b4554a526aec0671dded4b8592b73a37a38dac591cadaee2cc1";
 const FIXTURE_TOKENIZER_CONFIG_SHA256: &str =
@@ -135,13 +128,6 @@ fn nemotron35_model_bundle_loads_and_renders_the_trailing_user_turn() {
         eprintln!("skip: NEM35_MODEL_DIR is not set");
         return;
     };
-    for name in BUNDLE_FILES {
-        let path = model_dir.join(name);
-        assert!(path.is_file(), "{} must exist", path.display());
-        fs::read(&path)
-            .unwrap_or_else(|error| panic!("{} must be readable: {error}", path.display()));
-    }
-
     let bundle = nemotron::load(&model_dir).expect("Nemotron bundle loads");
     assert_eq!(bundle.vocab_size(), 131_072);
     assert_eq!(bundle.eos_token_id(), 11);

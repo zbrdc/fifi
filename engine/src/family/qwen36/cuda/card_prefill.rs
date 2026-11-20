@@ -788,6 +788,19 @@ fn run_card_chunk_layer(
                         Stage::QuantAOut => quant_a_out(&runs[card], &ctx)?,
                         Stage::AttnOut => attn_out(&runs[card], &ctx)?,
                         Stage::NormF | Stage::Route | Stage::Moe => unreachable!("handled above"),
+                        Stage::MoeStart
+                        | Stage::MoeShared
+                        | Stage::MoeStage
+                        | Stage::MoeScatter
+                        | Stage::MoeBankUp
+                        | Stage::MoeColdUp
+                        | Stage::MoeSwiglu
+                        | Stage::MoeGather
+                        | Stage::MoeBankDown
+                        | Stage::MoeColdDown
+                        | Stage::MoeCombine => {
+                            unreachable!("tiered timing labels are not launch stages")
+                        }
                     }
                 }
             }

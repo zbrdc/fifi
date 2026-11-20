@@ -290,6 +290,42 @@ impl ExpertPolicy {
         swaps
     }
 
+    /// Seed scores from the recent picks of a validated prefill chunk. The
+    /// initial bank can hold up to four new experts per layer from these picks.
+    #[cfg(any(feature = "native-cuda", test))]
+    pub(super) fn prefill_warm_swaps(&mut self, routes: &[Vec<u16>]) -> Vec<Swap> {
+        const TAIL_ROWS: usize = 32;
+        const SWAPS_PER_LAYER: usize = 4;
+        let mut swaps = Vec::new();
+        for (layer, ids) in routes.iter().enumerate() {
+            let mut seen = vec![false; self.cfg.experts];
+            for &expert in ids.iter().rev().take(TAIL_ROWS * self.cfg.top_k) {
+                let expert = usize::from(expert);
+                self.scores[layer][expert] += self.scale;
+                seen[expert] = true;
+            }
+            let scores = &self.scores[layer];
+            let mut misses: Vec<u16> = seen
+                .iter()
+                .zip(&self.resident[layer])
+                .enumerate()
+                .filter(|&(_, (&seen, &resident))| seen && !resident)
+                .map(|(expert, _)| expert as u16)
+                .collect();
+            misses.sort_unstable_by(|&a, &b| {
+                scores[usize::from(b)]
+                    .total_cmp(&scores[usize::from(a)])
+                    .then(a.cmp(&b))
+            });
+            for expert in misses.into_iter().take(SWAPS_PER_LAYER) {
+                if let Some(swap) = self.advise(layer, expert) {
+                    swaps.push(swap);
+                }
+            }
+        }
+        swaps
+    }
+
     /// Decides the promotion of ONE candidate outside the token boundary: a router guess
     /// offers `expert` for `layer` before the layer's route is known. Free bank: the
     /// promotion is free, exactly a warm-up fill of `boundary`. Full bank: the victim is

@@ -177,7 +177,7 @@ fn rows(fx: &Fx) -> Vec<Row> {
         geo(fx, "g1 ncols_opt == m", |g| g.ncols_opt = 5),
         geo(fx, "g2 m >= 1", |g| (g.ncols_max, g.ncols_opt) = (-1, -1)),
         geo(fx, "g3 m <= MAX_TOKENS", |g| {
-            (g.ncols_max, g.ncols_opt, g.ncols_dst, g.ncols_y) = (2049, 2049, 4098, 4098);
+            (g.ncols_max, g.ncols_opt, g.ncols_dst, g.ncols_y) = (4097, 4097, 8194, 8194);
         }),
         geo(fx, "g4 ncols_y == ncols_dst", |g| g.ncols_y = 9),
         geo(fx, "g5 ne >= m", |g| (g.ncols_dst, g.ncols_y) = (0, 0)),

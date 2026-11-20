@@ -198,12 +198,12 @@ fn mmq_quant_refuses_bad_row_strides_by_tag() {
 
 #[test]
 fn mmq_quant_refuses_domain_violations_by_tag() {
-    // Plain: the 2,048 chunk cap. Gathered: the 32,768 ne_get_rows bound. Scatter: the
+    // Plain: the 4,096 chunk cap. Gathered: the 32,768 ne_get_rows bound. Scatter: the
     // m/top_k/ne_get_rows domain, the product checked before the bound (checked multiply).
     let plain = |ncols| check_quantize_rules(MmqType::Q80, 2048, 2048, ncols, false);
-    let err = format!("{:?}", plain(2049).expect_err("over the chunk cap"));
+    let err = format!("{:?}", plain(4097).expect_err("over the chunk cap"));
     assert!(err.contains("mmq_quant: ncols"), "{err}");
-    plain(2048).expect("the cap itself");
+    plain(4096).expect("the cap itself");
     let gathered = |ncols| check_quantize_rules(MmqType::Q4K, 512, 512, ncols, true);
     let err = format!("{:?}", gathered(32_769).expect_err("over the gather bound"));
     assert!(err.contains("mmq_quant: ncols"), "{err}");
@@ -211,9 +211,10 @@ fn mmq_quant_refuses_domain_violations_by_tag() {
     let scatter = |m, top_k| check_scatter_rules(MmqType::Q4K, 2048, 2048, m, top_k);
     for (m, top_k, tag) in [
         (0usize, 8usize, "mmq_quant: M"),
-        (2049, 8, "mmq_quant: M"),
+        (4097, 8, "mmq_quant: M"),
         (8, 0, "mmq_quant: top_k"),
         (8, 33, "mmq_quant: top_k"),
+        (4096, 9, "mmq_quant: ne_get_rows"),
         (2048, 17, "mmq_quant: ne_get_rows"),
     ] {
         let err = format!("{:?}", scatter(m, top_k).expect_err("domain violation"));
@@ -221,7 +222,8 @@ fn mmq_quant_refuses_domain_violations_by_tag() {
     }
     scatter(2048, 8).expect("the full resident shape");
     scatter(2048, 10).expect("the flash-next shape the lift is for (20,480 rows)");
-    scatter(2048, 16).expect("the new bound itself (32,768 rows)");
+    scatter(2048, 16).expect("the bound itself (32,768 rows)");
+    scatter(4096, 8).expect("the full resident shape");
 }
 
 #[test]

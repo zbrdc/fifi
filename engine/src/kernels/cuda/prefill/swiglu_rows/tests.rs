@@ -1,6 +1,6 @@
 //! Tests of the swiglu_rows wrapper: (1) the f64 reference under SW0, with the finiteness clause to
 //! |g| = 88 and the flush-to-zero cases reported; (2) the layout rows with canaries in the gaps;
-//! (3) shapes of 1, 7 and 16,384 rows; (4) bit equality of two runs; (5) canaries around `act`
+//! (3) shapes of 1, 7 and 32,768 rows; (4) bit equality of two runs; (5) canaries around `act`
 //! (every value test checks every byte of the act buffer); (6) the refusal tables, each guard
 //! reached and asserted by its own text; plus the numerics row against the decode path's
 //! `swiglu_q8` and the NaN/inf pass-through row.
@@ -294,7 +294,7 @@ fn report(what: &str, worst: &Worst) {
     );
 }
 
-/// Test (1) and the 16,384-row shape of (3): the Qwen MoE shape at the 8M = 16,384-row cap, gates
+/// Test (1) and the 32,768-row shape of (3): the Qwen MoE shape at the 8M = 32,768-row cap, gates
 /// uniform over SW0's whole domain [-12, 12), up values +-2^[-4, 4). Every value is graded.
 #[test]
 fn swiglu_rows_matches_the_f64_reference_within_sw0() {
@@ -313,9 +313,9 @@ fn swiglu_rows_matches_the_f64_reference_within_sw0() {
         .flat_map(|row| &row[..512]);
     let (low, high) = gates.fold((0f32, 0f32), |(lo, hi), &g| (lo.min(g), hi.max(g)));
     assert!(low < -11.988 && high > 11.988, "gates span [{low}, {high}]");
-    let worst = assert_act(&shape, &values, &act, "qwen 16,384 rows");
+    let worst = assert_act(&shape, &values, &act, "qwen 32,768 rows");
     assert_eq!(worst.graded, MAX_ROWS * 512, "every value is graded");
-    report("test 1, qwen 16,384 rows, |g| < 12", &worst);
+    report("test 1, qwen 32,768 rows, |g| < 12", &worst);
 }
 
 /// Normal inputs where flush-to-zero or the approximate division's large-denominator rule can

@@ -50,7 +50,7 @@ pub(crate) const K_GRID: usize = 256;
 pub(crate) const K_MAX: usize = 32_768;
 /// The row-stride bound: `(ncols - 1) * row_stride + k` floats must stay well inside usize.
 const ROW_STRIDE_MAX: usize = 1 << 30;
-/// The gathered/scattered column bound: `ne_get_rows = M * top_k` at top_k 8 and the 2,048
+/// The gathered/scattered column bound: `ne_get_rows = M * top_k` at top_k 8 and the 4,096
 /// chunk cap.
 const ROWS_LIMIT: usize = 32_768;
 /// The top_k bound (the ids guard's own rule).

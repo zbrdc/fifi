@@ -81,12 +81,12 @@ fn mmq_dense_refuses_the_k_extent_by_tag() {
 fn mmq_dense_pins_the_chunk_cap() {
     // The sizing domain of `mmq_size` is 1..=2,048 columns; raising the chunk cap without
     // extending it must fail here.
-    assert_eq!(NCOLS_LIMIT, 2048);
-    for m in [0usize, 2049, 4096] {
+    assert_eq!(NCOLS_LIMIT, 4096);
+    for m in [0usize, 4097, 8192] {
         let text = refusal(check_dense_rules(QuantType::Q80, 2048, 512, m, 512, 0));
         assert!(text.contains("mmq_dense: M"), "{m}: {text}");
     }
-    for m in [1usize, 2048] {
+    for m in [1usize, 2048, 4095, 4096] {
         check_dense_rules(QuantType::Q80, 2048, 512, m, 512, 0).expect("inside the cap");
     }
 }
@@ -2267,5 +2267,29 @@ fn mmq_prefill_ceiling_probe() {
                  projected whole-model prefill {projected:8.0} tok/s (card-limited)"
             );
         }
+    }
+}
+
+#[test]
+fn mmq_dense_extended_rows_match_the_reference() {
+    if !testkit::device_present("mmq_dense_extended_rows_match_the_reference") {
+        return;
+    }
+    let inputs: Vec<_> = [QuantType::Q80, QuantType::Q4K, QuantType::Q6K]
+        .into_iter()
+        .flat_map(|ty| {
+            [4095, 4096].map(|m| input(dense("extended rows", ty, (256, 32, m)), 0x4096))
+        })
+        .collect();
+    let runs = run_cases(&inputs).expect("extended rows device phase");
+    for (input, run) in inputs.iter().zip(&runs) {
+        let c = &input.case;
+        let dev = gated_slice(run, c);
+        let stat = nmse(&dev, &reference(c, &input.w, &input.x), c.n, c.m);
+        println!(
+            "extended dense {:?} M{} NMSE {:.3e}",
+            c.ty, c.m, stat.global
+        );
+        assert!(stat.global <= 1e-3);
     }
 }

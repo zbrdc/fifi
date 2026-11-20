@@ -22,7 +22,7 @@
 namespace {
 
 constexpr int kThreads = 128;   // float4 columns per block
-constexpr int kMaxRows = 32768; // 16 x the 2,048-row chunk cap at top_k 10; below the grid's y limit (65,535)
+constexpr int kMaxRows = 32768; // 8 x the 4,096-row chunk cap; also below the grid's y limit
 constexpr int kMaxWidth = 32768;
 
 bool aligned16(const void *p) { return ((uintptr_t)p & 15) == 0; }

@@ -1185,3 +1185,54 @@ fn identity_default_quantizer_and_matvec_equal_the_scalar_reference() {
         }
     }
 }
+
+/// The split shape is BIT-IDENTICAL to the whole forward: halves + the down pass
+/// on the joining thread reproduce `expert_forward_q8g`'s output exactly (gate and
+/// up rows are independent integer dots; the down pass is the same arithmetic on
+/// the same assembled act). The split-job lever's correctness floor.
+#[test]
+fn split_halves_plus_down_match_the_whole_forward_bitwise() {
+    let mut rng = Lcg(0x5B17);
+    for _ in 0..4 {
+        let (g, u, d) = expert_bytes(&mut rng);
+        let slices = ExpertSlices {
+            gate: &g,
+            up: &u,
+            down: &d,
+        };
+        let x = random_x(&mut rng, SHAPE.hidden);
+        let mut whole = vec![0.0f32; SHAPE.hidden];
+        let mut scratch = ExpertScratchQ8g::new(SHAPE);
+        expert_forward_q8g(
+            DotBackend::scalar(),
+            SHAPE,
+            &slices,
+            &x,
+            &mut scratch,
+            &mut whole,
+        )
+        .unwrap();
+
+        let mid = SHAPE.inter / 2;
+        let low = expert_act_half_q8g(DotBackend::scalar(), SHAPE, &slices, &x, 0..mid).unwrap();
+        let high = expert_act_half_q8g(DotBackend::scalar(), SHAPE, &slices, &x, mid..SHAPE.inter)
+            .unwrap();
+        let mut act = low;
+        act.extend_from_slice(&high);
+        let mut qh = Q8gRow::zeros(SHAPE.inter).unwrap();
+        let mut split = vec![0.0f32; SHAPE.hidden];
+        expert_down_q8g(
+            DotBackend::scalar(),
+            SHAPE,
+            &slices,
+            &act,
+            &mut qh,
+            &mut split,
+        )
+        .unwrap();
+        assert_eq!(
+            whole.iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
+            split.iter().map(|v| v.to_bits()).collect::<Vec<_>>()
+        );
+    }
+}

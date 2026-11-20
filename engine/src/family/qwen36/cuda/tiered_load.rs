@@ -13,6 +13,7 @@ use std::time::Duration;
 
 use super::dims::{StepDims, TieredPlan};
 use super::step::QwenResidentStep;
+use super::tiered_step::ColdStaging;
 use crate::EngError;
 use crate::family::device_budget::KvPlan;
 use crate::family::mapped_file::MappedFile;
@@ -74,7 +75,8 @@ pub(super) fn bank_slot_bytes(geometry: ExpertBankGeometry) -> Result<u64, EngEr
 
 /// Refuses a plan whose banks do not fit `free` device bytes (after the weights, the KV cache
 /// and the step state are resident), through `plan_vram`: the minimum bank is the plan's own
-/// slots per layer, the desktop reserve is the loader's headroom. The message names the numbers.
+/// slots per layer and the desktop reserve is the loader's headroom. The caller deducts
+/// any cold staging allocation from the available bytes before admission.
 pub(super) fn admit_banks(
     free: u64,
     geometry: ExpertBankGeometry,
@@ -121,13 +123,52 @@ pub(super) fn admit_banks(
     })
 }
 
+/// When staged prefill can run, fund its shared cold bank before assigning surplus
+/// to all layers' resident banks. Explicit counts keep their existing staging policy.
+fn tiered_bank_depths(
+    free: u64,
+    geometry: ExpertBankGeometry,
+    layers: usize,
+    request: SlotRequest,
+    experts: usize,
+    chunk_ready: bool,
+) -> Result<(usize, usize), EngError> {
+    const COLD_TARGET: usize = 78;
+    let hot_minimum = match request {
+        SlotRequest::Fit => geometry.top_k,
+        SlotRequest::Exactly(count) => count,
+    };
+    let minimum_bytes = ExpertBank::bytes_for(geometry, hot_minimum)?;
+    let slot_bytes = minimum_bytes / hot_minimum as u64;
+    let banks = minimum_bytes
+        .checked_mul(layers as u64)
+        .ok_or_else(|| EngError::MemoryPlan("tiered: resident banks overflow u64".into()))?;
+    let spare = free.saturating_sub(ADMISSION_RESERVE).saturating_sub(banks);
+    let cold = if request == SlotRequest::Fit && !chunk_ready {
+        0
+    } else {
+        (spare / slot_bytes).min(COLD_TARGET.min(experts) as u64) as usize
+    };
+    let cold = if cold >= geometry.top_k { cold } else { 0 };
+    let hot = admit_banks(
+        free - cold as u64 * slot_bytes,
+        geometry,
+        layers,
+        request,
+        experts,
+        ADMISSION_RESERVE,
+    )?;
+    Ok((hot, cold))
+}
+
 pub(super) fn build_tiered(
     ctx: &CudaContext,
     (header, gguf): (&GgufHeader, &Path),
     dims: &StepDims,
     plan: &TieredPlan,
     slots: usize,
-) -> Result<(Vec<ExpertBank>, TieredHost), EngError> {
+    cold_cap: usize,
+) -> Result<(Vec<ExpertBank>, TieredHost, Option<ColdStaging>), EngError> {
     let moe = &dims.shape.moe;
     let layers = dims.shape.kinds.len();
     let shape = ExpertShape {
@@ -176,7 +217,14 @@ pub(super) fn build_tiered(
     let banks = (0..layers)
         .map(|_| ExpertBank::new(ctx, geometry, slots))
         .collect::<Result<Vec<_>, _>>()?;
-    Ok((banks, host))
+    // The staging bank follows the banks: same free pool, one shared bank for every
+    // layer. A cap below top_k cannot even build a bank geometry, so it stays None.
+    let cold = if cold_cap >= geometry.top_k {
+        Some(ColdStaging::new(ctx, geometry, cold_cap)?)
+    } else {
+        None
+    };
+    Ok((banks, host, cold))
 }
 
 /// Admits the banks against the free device memory (the weights, the KV cache and the step state
@@ -189,16 +237,16 @@ pub(super) fn attach_tiered_parts(
     plan: &TieredPlan,
 ) -> Result<usize, EngError> {
     let free = u64::try_from(ctx.memory_info()?.free).unwrap_or(u64::MAX);
-    let slots = admit_banks(
+    let (slots, cold_cap) = tiered_bank_depths(
         free,
         geometry_of(dims),
         dims.shape.kinds.len(),
         plan.slots,
         dims.shape.moe.experts,
-        ADMISSION_RESERVE,
+        matches!(step.chunk_ready(), super::step::ChunkVerdict::Ready { .. }),
     )?;
-    let (banks, host) = build_tiered(ctx, source, dims, plan, slots)?;
-    step.attach_tiered(banks, host)?;
+    let (banks, host, cold) = build_tiered(ctx, source, dims, plan, slots, cold_cap)?;
+    step.attach_tiered(banks, host, cold)?;
     if plan.preload {
         step.preload_tiered()?;
     }

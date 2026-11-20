@@ -579,6 +579,10 @@ pub(crate) struct TieredOptions {
     /// Fill every layer's bank with its lowest-numbered experts before the first token. The
     /// default is false: the banks start empty and policy P fills them.
     pub(crate) preload: Option<bool>,
+    /// Bank swaps per token, in thousandths, from 0 to 8000. The default 250 buys one
+    /// promotion per four tokens model-wide. The boundary considers this token's misses
+    /// in descending score-ratio order.
+    pub(crate) swaps_milli: Option<u32>,
 }
 
 /// The `expert_bank` member of the `qwen36` object: how many routed experts per layer stay
@@ -645,12 +649,15 @@ pub(crate) struct TieredSettings {
     pub(crate) threads: usize,
     pub(crate) timeout_ms: u32,
     pub(crate) preload: bool,
+    pub(crate) swaps_milli: u32,
 }
 
 /// The default CPU worker threads of the tiered member.
 const TIERED_DEFAULT_THREADS: u32 = 6;
 /// The default wait for one layer's CPU experts, in milliseconds.
 const TIERED_DEFAULT_TIMEOUT_MS: u32 = 10_000;
+/// The default expert-bank swap credit per thousand tokens.
+const TIERED_DEFAULT_SWAPS_MILLI: u32 = 250;
 
 impl TieredSettings {
     /// The member a config that names `"tiered": {"slots": "auto"}` and nothing else
@@ -664,6 +671,7 @@ impl TieredSettings {
         threads: TIERED_DEFAULT_THREADS as usize,
         timeout_ms: TIERED_DEFAULT_TIMEOUT_MS,
         preload: false,
+        swaps_milli: TIERED_DEFAULT_SWAPS_MILLI,
     };
 }
 
@@ -1296,6 +1304,13 @@ fn tiered_settings(
             600_000,
         )?,
         preload: tiered.preload.unwrap_or(false),
+        swaps_milli: ranged(
+            "tiered.swaps_milli",
+            tiered.swaps_milli,
+            TIERED_DEFAULT_SWAPS_MILLI,
+            0,
+            8_000,
+        )?,
     };
     // The member shapes are validated above so their errors keep precedence; the exclusion
     // reads the resolved flag, so an unset capture (the CUDA arm's default, on) is refused
@@ -4097,6 +4112,7 @@ mod tests {
         assert_eq!(
             got.tiered,
             Some(TieredSettings {
+                swaps_milli: 250,
                 slots: SlotRequest::Exactly(40),
                 threads: 6,
                 timeout_ms: 10_000,
@@ -4110,6 +4126,7 @@ mod tests {
         assert_eq!(
             got.tiered,
             Some(TieredSettings {
+                swaps_milli: 250,
                 slots: SlotRequest::Exactly(61),
                 threads: 4,
                 timeout_ms: 5000,

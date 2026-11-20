@@ -253,7 +253,7 @@ fn the_dense_entry_refuses_each_bad_argument_at_its_own_guard() {
         ("M zero", MmqDenseArgsRaw { m: 0, ..base() }),
         (
             "M above the chunk cap",
-            MmqDenseArgsRaw { m: 2049, ..base() },
+            MmqDenseArgsRaw { m: 4097, ..base() },
         ),
         ("N zero", MmqDenseArgsRaw { n: 0, ..base() }),
         ("ld below n", MmqDenseArgsRaw { ld: 511, ..base() }),
@@ -437,14 +437,15 @@ pub(crate) fn compiled_archs() -> Vec<i32> {
 fn the_c_fixup_need_agrees_with_the_rust_sizing_everywhere() {
     // The cross-pin of the two J-loop replicas: the C function that sizes the fixup refusal
     // and the Rust replica must give the same bytes, including the "0 when the launch tiles"
-    // and "no tile width fits" cases, for every M in 1..=2048, the Qwen dense row counts
+    // and "no tile width fits" cases, for every M in 1..=4096, the Qwen dense row counts
     // (fallback off) and the partial-tile ones (fallback on), all three weight types, and
     // device facts of the sm_86, sm_89 and sm_72 classes plus a one-SM device and a device
     // whose shared memory fits no tile width.
-    let sets: [(&str, i32, i32, usize); 7] = [
+    let sets: [(&str, i32, i32, usize); 8] = [
         ("sm_86, 82 SMs", 860, 82, 101_376),
         ("sm_89 class, 20 SMs", 890, 20, 102_400),
         ("sm_72, 8 SMs", 720, 8, 98_304),
+        ("sm_75, 68 SMs", 750, 68, 65_536),
         ("sm_86 class, 1 SM", 860, 1, 101_376),
         ("sm_86 class, shared memory skips J >= 120", 860, 82, 56_000),
         ("sm_89 class, shared memory skips J >= 120", 890, 20, 56_000),
@@ -454,7 +455,12 @@ fn the_c_fixup_need_agrees_with_the_rust_sizing_everywhere() {
     // build, so their cc follows the first compiled fleet arch instead of a literal. A
     // single-arch build still sweeps its own class at 20 and 1 SMs and under a tight
     // shared-memory cap.
-    let fleet_smpbo = [(860, 101_376usize), (890, 102_400), (720, 98_304)];
+    let fleet_smpbo = [
+        (860, 101_376usize),
+        (890, 102_400),
+        (720, 98_304),
+        (750, 65_536),
+    ];
     let built = compiled_archs();
     let Some((base_cc, base_smpbo)) = fleet_smpbo
         .iter()
@@ -509,7 +515,7 @@ fn the_c_fixup_need_agrees_with_the_rust_sizing_everywhere() {
         };
         for (ggml, ty) in types {
             for n in rows {
-                for m in 1..=2048usize {
+                for m in 1..=4096usize {
                     let (c, r) = (
                         c_fixup_need(ggml, n, m, &facts),
                         rust_fixup_need(ty, n, m, m, &facts),
@@ -645,5 +651,37 @@ fn the_c_fixup_need_is_zero_for_arguments_the_entry_refuses() {
     assert_eq!(c_fixup_need(8, 32, 24, &no_sms), 0);
     assert_eq!(c_fixup_need(6, 32, 24, &good), 0, "Q5_0 has no dense case");
     assert_eq!(c_fixup_need(8, 32, 0, &good), 0, "no columns");
-    assert_eq!(c_fixup_need(8, 32, 2049, &good), 0, "above the chunk cap");
+    assert_eq!(c_fixup_need(8, 32, 4097, &good), 0, "above the chunk cap");
+}
+
+#[test]
+fn extended_domain_c_fixup_stays_within_the_allocated_maximum() {
+    let built = compiled_archs();
+    let mut cases = 0;
+    for cc in built.into_iter().filter(|cc| [720, 750, 860].contains(cc)) {
+        let facts = FactsRaw {
+            device: 0,
+            cc,
+            nsm: 68,
+            reserved: 0,
+            smpbo: if cc == 750 { 65_536 } else { 101_376 },
+        };
+        for ty in [8, 12, 14] {
+            for n in [32, 512, 2048, 8192] {
+                for m in 2049..=4096 {
+                    let need = c_fixup_need(ty, n, m, &facts);
+                    assert!(
+                        need <= 68 * 128 * 128 * 4,
+                        "{cc} type {ty} M {m} N {n} needs {need}"
+                    );
+                    cases += 1;
+                }
+            }
+        }
+    }
+    assert!(
+        cases >= 24_576,
+        "no supported compiled architecture exercised"
+    );
+    println!("extended native fixup bound: {cases} shapes");
 }

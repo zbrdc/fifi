@@ -16,7 +16,7 @@ use crate::EngError;
 use crate::kernels::cuda::resident::matvec_q::QuantType;
 use crate::weights::GgufType;
 
-use super::{CudaContext, DeviceStream, NativeWeight, QuantTensor};
+use super::{CudaContext, DeviceRange, DeviceStream, NativeWeight, QuantTensor};
 
 /// Source bytes the zero upload materialises at once.
 const ZERO_CHUNK_BYTES: usize = 8 << 20;
@@ -191,14 +191,29 @@ impl ExpertBank {
         up: &[u8],
         down: &[u8],
     ) -> Result<(), EngError> {
+        let [gate_dst, up_dst, down_dst] =
+            self.fill_ranges(slot, [gate.len(), up.len(), down.len()])?;
+        gate_dst
+            .buffer()
+            .write_at(stream, gate_dst.offset(), gate)?;
+        up_dst.buffer().write_at(stream, up_dst.offset(), up)?;
+        down_dst.buffer().write_at(stream, down_dst.offset(), down)
+    }
+
+    /// Validates all three slice sizes and returns the slot ranges in gate/up/down order.
+    pub(crate) fn fill_ranges(
+        &self,
+        slot: usize,
+        [gate, up, down]: [usize; 3],
+    ) -> Result<[DeviceRange<'_>; 3], EngError> {
         let (gate_up_bytes, down_bytes) = self.slice_bytes()?;
         if slot >= self.slots {
             return Err(refuse(format!("slot {slot} is outside 0..{}", self.slots)));
         }
         for (what, got, want) in [
-            ("gate", gate.len(), gate_up_bytes),
-            ("up", up.len(), gate_up_bytes),
-            ("down", down.len(), down_bytes),
+            ("gate", gate, gate_up_bytes),
+            ("up", up, gate_up_bytes),
+            ("down", down, down_bytes),
         ] {
             if got != want {
                 return Err(refuse(format!(
@@ -206,13 +221,15 @@ impl ExpertBank {
                 )));
             }
         }
-        self.gate
-            .buffer()
-            .write_at(stream, slot * gate_up_bytes, gate)?;
-        self.up
-            .buffer()
-            .write_at(stream, slot * gate_up_bytes, up)?;
-        self.down.buffer().write_at(stream, slot * down_bytes, down)
+        Ok([
+            self.gate
+                .buffer()
+                .range(slot * gate_up_bytes, gate_up_bytes)?,
+            self.up
+                .buffer()
+                .range(slot * gate_up_bytes, gate_up_bytes)?,
+            self.down.buffer().range(slot * down_bytes, down_bytes)?,
+        ])
     }
 }
 
