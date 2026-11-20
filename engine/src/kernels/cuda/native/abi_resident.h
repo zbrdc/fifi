@@ -66,6 +66,13 @@ int inference_cuda_copy_h2d_async(void *device, const void *host, size_t bytes, 
 /* Stream-ordered copy between disjoint device ranges. No allocation or wait. */
 int inference_cuda_copy_d2d_async(void *device_dst, const void *device_src, size_t bytes,
                                  void *stream, int *out_stage);
+/* Stream-ordered device-side fill of `bytes` bytes at `device_dst` with the low
+ * byte of `value` (the state clears use 0), on stream, behind the work queued on
+ * stream. No host staging and no wait: the fill has not finished when the call
+ * returns; a fault in it surfaces at the next synchronize exactly as any
+ * queued launch would. stream must not be NULL; bytes must not be 0. */
+int inference_cuda_memset_async(void *device_dst, size_t bytes, int value, void *stream,
+                                int *out_stage);
 
 /* xf = fp16 pack of x [m][k] (kern::pack_f32), on stream. stream must not be
  * NULL: the entry never falls back to the default stream. x_dev and xf_dev are

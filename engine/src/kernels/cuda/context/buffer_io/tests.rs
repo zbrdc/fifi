@@ -21,13 +21,20 @@ fn request_counters_keep_size_direction_and_lease_separate_without_a_device() {
     super::record_allocation(first, 1_048_592);
     super::record_allocation(other, 5_457_920);
     super::record_ranged_h2d(first, 2_097_152);
+    super::record_memset(first, 1_491_927_808);
+    super::record_memset(first, 1_491_927_808);
     super::BUFFER_REQUESTS.with_borrow_mut(|counts| {
         let first = counts.remove(&first).unwrap();
         let other = counts.remove(&other).unwrap();
         assert_eq!(first.allocations, [(1_048_592, 2)].into());
         assert_eq!(first.ranged_h2d, [(2_097_152, 1)].into());
-        assert_eq!(other.allocations, [(5_457_920, 1)].into());
-        assert!(other.ranged_h2d.is_empty());
+        assert_eq!(
+            first.memsets,
+            [(1_491_927_808, 2)].into(),
+            "device-side fills count by size, separately from pageable H2D"
+        );
+        assert!(other.memsets.is_empty());
+        assert!(first.ranged_d2h.is_empty());
         assert_eq!(
             first
                 .allocations

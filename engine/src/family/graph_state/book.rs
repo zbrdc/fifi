@@ -314,6 +314,17 @@ impl StateBook {
         stream_id: u64,
         rewrites_words: bool,
     ) -> Result<(), EngError> {
+        self.check_import(stream_id, rewrites_words)?;
+        self.health = Health::Poisoned;
+        Ok(())
+    }
+
+    /// A group of states can check every import before mutating the first state.
+    pub(in crate::family) fn check_import(
+        &self,
+        stream_id: u64,
+        rewrites_words: bool,
+    ) -> Result<(), EngError> {
         self.check_owner(stream_id, "import_state")?;
         if self.health == Health::Poisoned && !rewrites_words {
             return Err(refuse(
@@ -321,7 +332,6 @@ impl StateBook {
                 "a poisoned state is imported only together with reset's work on the words; reset first",
             ));
         }
-        self.health = Health::Poisoned;
         Ok(())
     }
 

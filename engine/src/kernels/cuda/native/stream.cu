@@ -410,3 +410,22 @@ extern "C" int inference_cuda_copy_h2d_async(void *device, const void *host, siz
         return INFERENCE_CUDA_NATIVE_EXCEPTION;
     }
 }
+
+/* Device-side fill (see abi_resident.h): the state clears ride this instead of
+ * pageable host chunks, so no cuStreamSynchronize storm sits between the
+ * enqueued fills. */
+extern "C" int inference_cuda_memset_async(void *device_dst, size_t bytes, int value,
+                                           void *stream, int *out_stage) {
+    try {
+        report_stage(out_stage, INFERENCE_CUDA_STAGE_NONE);
+        if (device_dst == NULL || stream == NULL || bytes == 0) {
+            return INFERENCE_CUDA_INVALID_ARGUMENT;
+        }
+        Failure failure;
+        failure.record(cudaMemsetAsync(device_dst, value, bytes, (cudaStream_t)stream),
+                       INFERENCE_CUDA_STAGE_COPY);
+        return finish(failure, out_stage);
+    } catch (...) {
+        return INFERENCE_CUDA_NATIVE_EXCEPTION;
+    }
+}

@@ -1015,33 +1015,28 @@ PartArm arm_part(int device) {
     return arm;
 }
 
-/* The legacy path retains its process-wide arm; adaptive successes are cached
- * by CUDA device and instantiated model geometry. Adaptive failures propagate
- * and are not cached. */
+/* Both attention paths arm each device and geometry before the first launch.
+ * Cache successful arms so a failure cannot poison another device's selection. */
 template <int kHeadDim, int kGroup>
 Failure enqueue_typed(const Args &k, void *stream) {
     Failure failure;
     if (k.mode != 2) {
+        int device = -1;
+        failure.record(cudaGetDevice(&device), INFERENCE_CUDA_STAGE_LAUNCH);
+        if (!failure.ok()) return failure;
+        static std::mutex arms_mutex;
+        static std::map<int, PartArm> arms;
         PartArm arm;
-        if (adaptive_attention_enabled()) {
-            int device = -1;
-            failure.record(cudaGetDevice(&device), INFERENCE_CUDA_STAGE_LAUNCH);
-            if (!failure.ok()) return failure;
-            static std::mutex arms_mutex;
-            static std::map<int, PartArm> arms;
-            {
-                std::lock_guard<std::mutex> lock(arms_mutex);
-                const auto it = arms.find(device);
-                if (it != arms.end()) {
-                    arm = it->second;
-                } else {
-                    arm = arm_part<kHeadDim, kGroup>(device);
-                    if (arm.err == cudaSuccess) arms.emplace(device, arm);
-                }
+        {
+            std::lock_guard<std::mutex> lock(arms_mutex);
+            const auto it = arms.find(device);
+            if (it != arms.end()) {
+                arm = it->second;
+            } else {
+                arm = adaptive_attention_enabled() ? arm_part<kHeadDim, kGroup>(device)
+                                                   : arm_part_legacy<kHeadDim, kGroup>();
+                if (arm.err == cudaSuccess) arms.emplace(device, arm);
             }
-        } else {
-            static const PartArm legacy = arm_part_legacy<kHeadDim, kGroup>();
-            arm = legacy;
         }
         failure.record(arm.err, INFERENCE_CUDA_STAGE_LAUNCH);
         if (!failure.ok() && cudaPeekAtLastError() == arm.err)

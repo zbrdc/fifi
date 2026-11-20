@@ -1614,16 +1614,6 @@ fn attn_prefill_arms_each_physical_device_before_launch() {
         testkit::device_present(NAME),
         "{NAME}: two CUDA devices are required"
     );
-    // The per-device arming lives on the adaptive path; the gate is read once
-    // per process, so this pin only proves something when the whole binary
-    // runs with the switch set (the card runner exports it for this leg).
-    assert!(
-        std::env::var("FIFI_CUDA_ATTN_PREFILL_ADAPT")
-            .ok()
-            .as_deref()
-            == Some("1"),
-        "{NAME}: set FIFI_CUDA_ATTN_PREFILL_ADAPT=1 for the whole test process"
-    );
     let shape = qwen(8, 8, 0);
     let split = CpfAttnSplit {
         max_splits: 1,

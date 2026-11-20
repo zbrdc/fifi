@@ -14,7 +14,7 @@ use crate::family::graph_state::book::Health;
 
 use super::super::super::host::HostShape;
 use super::super::dims::{KvMode, StepDims, StepOptions};
-use super::super::state_layout::{KvPool, Plane, StateLayout};
+use super::super::state_layout::{DeltaPool, KvPool, Plane, StateLayout};
 use super::ResidentState;
 use crate::EngError;
 use crate::family::project::cuda::WeightLayout;
@@ -147,6 +147,178 @@ fn int8g32_allocates_the_four_planes_zeroed_and_sized_by_the_layout() {
             plane.ordinal, plane.plane
         );
     }
+}
+
+/// The clear ranges must be exactly the blocks the pageable clears wrote - disjoint, in
+/// bounds, one rec and one conv block per layer per cleared slot, together the exact
+/// byte count of those blocks (the alignment padding between blocks stays stale, as
+/// before: nothing reads it). Pure host arithmetic: no device needed.
+fn assert_delta_ranges(pool: &DeltaPool, first_slot: usize) {
+    let ranges = super::delta_clear_ranges(pool, first_slot).expect("the clear ranges");
+    let cleared_slots = pool.slots - first_slot;
+    assert_eq!(
+        ranges.len(),
+        cleared_slots * pool.layers * 2,
+        "one rec and one conv range per layer per cleared slot"
+    );
+    let block = (pool.rec_values + pool.conv_values) * 4;
+    assert_eq!(
+        ranges.iter().map(|&(_, bytes)| bytes).sum::<usize>(),
+        cleared_slots * pool.layers * block,
+        "the cleared bytes are exactly the record and conv values of the cleared slots"
+    );
+    let mut sorted: Vec<(usize, usize)> = ranges.clone();
+    sorted.sort();
+    for pair in sorted.windows(2) {
+        let (end, next) = (pair[0].0 + pair[0].1, pair[1].0);
+        assert!(end <= next, "the clear ranges overlap around byte {next}");
+    }
+    for &(offset, bytes) in &ranges {
+        assert!(
+            offset + bytes <= pool.total,
+            "a clear range runs past the pool: {offset}+{bytes} > {}",
+            pool.total
+        );
+    }
+}
+
+#[test]
+fn the_delta_clear_ranges_match_the_pageable_blocks_on_the_host() {
+    let d = dims().expect("the checked dims of the step");
+    let layout = StateLayout::new(&d, &options(KvMode::Int8G32, 8)).expect("the Int8G32 layout");
+    assert_delta_ranges(&layout.delta, 0);
+    // The import path clears everything but slot 0 (the freshly written slot).
+    if layout.delta.slots > 1 {
+        assert_delta_ranges(&layout.delta, 1);
+    }
+    assert!(
+        layout.kv.total > 0 && layout.words.total > 0,
+        "the kv and words clears are one whole-buffer fill each"
+    );
+}
+
+/// The transport pin of the boot fix: allocating and resetting a state must reach the
+/// device as stream-ordered fills (`memsets`) and never as pageable ranged H2D writes -
+/// the per-chunk `cuStreamSynchronize` storm the host copies caused could wedge the
+/// patched libcuda at deep contexts. `zeroed_phase` above keeps the semantic pin (the
+/// planes end zeroed); this keeps the transport pin.
+struct TransportProbe {
+    kv_total: usize,
+    words_total: usize,
+    rec_bytes: usize,
+    conv_bytes: usize,
+    layers: usize,
+    allocate_memsets: std::collections::BTreeMap<usize, usize>,
+    allocate_h2d: std::collections::BTreeMap<usize, usize>,
+    reset_added_memsets: std::collections::BTreeMap<usize, usize>,
+    reset_added_h2d: std::collections::BTreeMap<usize, usize>,
+    kv_zeroed: bool,
+    delta_zeroed: bool,
+    words_zeroed: bool,
+}
+
+/// `after` minus `before`, by size: the requests one phase added.
+fn added(
+    before: &std::collections::BTreeMap<usize, usize>,
+    after: &std::collections::BTreeMap<usize, usize>,
+) -> std::collections::BTreeMap<usize, usize> {
+    after
+        .iter()
+        .filter_map(|(bytes, count)| {
+            let added = count - before.get(bytes).copied().unwrap_or(0);
+            (added > 0).then_some((*bytes, added))
+        })
+        .collect()
+}
+
+fn transport_phase() -> Result<TransportProbe, EngError> {
+    let rig = Rig::new()?;
+    let d = dims()?;
+    let capacity = 8;
+    let layout = StateLayout::new(&d, &options(KvMode::Int8G32, capacity))?;
+    // Prime the allocator with dirty blocks, so a missing zeroing leaves 0xFF bytes.
+    for bytes in [layout.kv.total, layout.delta.total, layout.words.total] {
+        let dirty = rig.ctx.allocate(bytes)?;
+        dirty.write_at(&rig.stream, 0, &vec![0xFF; bytes])?;
+        drop(dirty);
+    }
+    let primed = rig.ctx.buffer_requests();
+    let mut state = ResidentState::allocate(
+        &rig.ctx,
+        &rig.stream,
+        &d,
+        &options(KvMode::Int8G32, capacity),
+    )?;
+    let allocated = rig.ctx.buffer_requests();
+    let (allocate_memsets, allocate_h2d) = (
+        added(&primed.memsets, &allocated.memsets),
+        added(&primed.ranged_h2d, &allocated.ranged_h2d),
+    );
+    state.reset(&rig.stream)?;
+    let after_reset = rig.ctx.buffer_requests();
+    let (reset_added_memsets, reset_added_h2d) = (
+        added(&allocated.memsets, &after_reset.memsets),
+        added(&allocated.ranged_h2d, &after_reset.ranged_h2d),
+    );
+    let kv = state.kv_plane(0, Plane::K)?;
+    let mut kv_bytes = vec![0u8; 64.min(kv.bytes())];
+    kv.buffer()
+        .read_at(&rig.stream, kv.offset(), &mut kv_bytes)?;
+    let pool = &state.layout().delta;
+    let rec = state.delta_rec(0, 0)?;
+    let mut rec_bytes_out = vec![0u8; rec.bytes()];
+    rec.buffer()
+        .read_at(&rig.stream, rec.offset(), &mut rec_bytes_out)?;
+    let words = state.step_field(super::StepField::Status)?;
+    let mut word_out = [0u8; 4];
+    words
+        .buffer()
+        .read_at(&rig.stream, words.offset(), &mut word_out)?;
+    Ok(TransportProbe {
+        kv_total: layout.kv.total,
+        words_total: layout.words.total,
+        rec_bytes: pool.rec_values * 4,
+        conv_bytes: pool.conv_values * 4,
+        layers: pool.layers,
+        allocate_memsets,
+        allocate_h2d,
+        reset_added_memsets,
+        reset_added_h2d,
+        kv_zeroed: kv_bytes.iter().all(|&byte| byte == 0),
+        delta_zeroed: rec_bytes_out.iter().all(|&byte| byte == 0),
+        words_zeroed: word_out == [0; 4],
+    })
+}
+
+#[test]
+fn allocate_and_reset_clear_through_device_fills_never_pageable_copies() {
+    if !device_present("allocate_and_reset_clear_through_device_fills_never_pageable_copies") {
+        return;
+    }
+    let probe = transport_phase().expect("the device phase of the transport pin");
+    assert!(
+        probe.allocate_h2d.is_empty(),
+        "the clears must not page host bytes: ranged H2D by size {:?}",
+        probe.allocate_h2d
+    );
+    let mut expected = std::collections::BTreeMap::new();
+    expected.insert(probe.kv_total, 1);
+    expected.insert(probe.words_total, 1);
+    expected.insert(probe.rec_bytes, probe.layers);
+    expected.insert(probe.conv_bytes, probe.layers);
+    assert_eq!(probe.allocate_memsets, expected);
+    assert!(
+        probe.reset_added_h2d.is_empty(),
+        "a reset must not page host bytes: ranged H2D by size {:?}",
+        probe.reset_added_h2d
+    );
+    let mut reset_expected = std::collections::BTreeMap::new();
+    reset_expected.insert(probe.words_total, 1);
+    reset_expected.insert(probe.rec_bytes, probe.layers);
+    reset_expected.insert(probe.conv_bytes, probe.layers);
+    assert_eq!(probe.reset_added_memsets, reset_expected);
+    assert!(probe.kv_zeroed && probe.delta_zeroed && probe.words_zeroed);
+    println!("STATE_CLEAR_TRANSPORT_MEMSET_PASS");
 }
 
 struct Fp16Probe {

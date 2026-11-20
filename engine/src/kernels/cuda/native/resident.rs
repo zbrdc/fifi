@@ -254,6 +254,14 @@ unsafe extern "C" {
         stream: *mut c_void,
         out_stage: *mut c_int,
     ) -> c_int;
+    #[link_name = "inference_cuda_memset_async"]
+    fn memset_async_raw(
+        destination: *mut c_void,
+        bytes: usize,
+        value: c_int,
+        stream: *mut c_void,
+        out_stage: *mut c_int,
+    ) -> c_int;
     #[link_name = "inference_cuda_pack_launch"]
     fn pack_launch_raw(
         x: *const f32,
@@ -593,6 +601,30 @@ pub(in crate::kernels::cuda) fn copy_d2d_async(
             destination.address(),
             source.address().cast_const(),
             source.bytes,
+            stream.0.as_ptr(),
+            &mut stage,
+        )
+    };
+    checked(status, stage)
+}
+
+/// Enqueues a device-side fill of `value` (one byte) over `dst`, behind the work queued
+/// earlier on `stream`, and returns without waiting: the next work on the stream sees the
+/// fill. Launch-only; a fault in the fill surfaces at the next synchronize.
+pub(in crate::kernels::cuda) fn memset_async(
+    dst: RawRange<'_>,
+    value: u8,
+    stream: &RawStream,
+) -> Result<(), DeviceFailure> {
+    let mut stage = STAGE_NONE;
+    // SAFETY: `RawRange::new` proved the range inside a live allocation, which stays valid
+    // until queued work finishes (`inference_cuda_free` synchronizes before free). No host
+    // memory is involved, so nothing must outlive the call.
+    let status = unsafe {
+        memset_async_raw(
+            dst.address(),
+            dst.bytes,
+            value as c_int,
             stream.0.as_ptr(),
             &mut stage,
         )

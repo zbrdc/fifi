@@ -22,6 +22,9 @@
 //!   `native::resident` checks it again.
 //! - Pageable copies use owned chunks of at most 64 MiB. A failed fence retains
 //!   that storage until process exit; a failed D2H chunk never reaches the caller.
+//! - [`DeviceBuffer::zero_at`] is the fill counterpart of `write_at` for known-zero
+//!   bytes: one stream-ordered device-side memset, no host staging and no wait. It
+//!   exists so the state clears never need pageable copies (or their syncs) at all.
 
 use super::graph::ensure_closed;
 use super::stream::{DeviceStream, same_adapter};
@@ -39,6 +42,9 @@ pub(crate) struct BufferRequests {
     pub(crate) allocations: std::collections::BTreeMap<usize, usize>,
     pub(crate) ranged_h2d: std::collections::BTreeMap<usize, usize>,
     pub(crate) ranged_d2h: std::collections::BTreeMap<usize, usize>,
+    /// Stream-ordered device-side fills ([`DeviceBuffer::zero_at`]), by size: the state
+    /// clears must land here and leave `ranged_h2d` empty.
+    pub(crate) memsets: std::collections::BTreeMap<usize, usize>,
 }
 
 #[cfg(test)]
@@ -70,6 +76,18 @@ fn record_ranged_h2d(lease: usize, bytes: usize) {
             .entry(lease)
             .or_default()
             .ranged_h2d
+            .entry(bytes)
+            .or_default() += 1;
+    });
+}
+
+#[cfg(test)]
+fn record_memset(lease: usize, bytes: usize) {
+    BUFFER_REQUESTS.with_borrow_mut(|counts| {
+        *counts
+            .entry(lease)
+            .or_default()
+            .memsets
             .entry(bytes)
             .or_default() += 1;
     });
@@ -325,6 +343,29 @@ impl DeviceBuffer {
         stream.note_enqueue();
         #[cfg(test)]
         record_ranged_h2d(std::rc::Rc::as_ptr(&self.lease) as usize, bytes.len());
+        Ok(())
+    }
+
+    /// Enqueues a device-side zero fill of `bytes` at byte `offset`, behind the work queued
+    /// on `stream`, and returns without waiting: the next work on the stream sees the zeros
+    /// (the state clears of `family::qwen36` ride this, so a boot or reset never pages host
+    /// zeros through `copy_h2d_pageable` and its blocking per-chunk sync).
+    ///
+    /// Returns `BadRequest` for the conditions of [`Self::read_at`]; a rejected enqueue from
+    /// the adapter is terminal like every native failure.
+    pub(crate) fn zero_at(
+        &self,
+        stream: &DeviceStream,
+        offset: usize,
+        bytes: usize,
+    ) -> Result<(), EngError> {
+        let range = self.io_range(stream, "write", offset, bytes)?;
+        let raw = stream.raw()?;
+        let _dispatch = enter_on(stream.lease().device())?;
+        resident::memset_async(range, 0, raw).map_err(device_error)?;
+        stream.note_enqueue();
+        #[cfg(test)]
+        record_memset(std::rc::Rc::as_ptr(&self.lease) as usize, bytes);
         Ok(())
     }
 

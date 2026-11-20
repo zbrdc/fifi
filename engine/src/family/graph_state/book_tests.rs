@@ -461,6 +461,23 @@ fn a_poisoned_state_is_not_imported_without_the_words_rewrite() {
 }
 
 #[test]
+fn validating_imports_across_owners_preserves_each_book_until_apply() {
+    let mut first = valid_book(64);
+    first.enqueue(2).expect("two pending rows");
+    let mut other = StateBook::new(64, OWNER + 1);
+    other.poison();
+    let original = [first.clone(), other.clone()];
+
+    first.check_import(OWNER, true).expect("first owner");
+    assert!(other.check_import(OWNER, true).is_err());
+    assert!(other.check_import(OWNER + 1, false).is_err());
+    other
+        .check_import(OWNER + 1, true)
+        .expect("complete recovery");
+    assert_eq!([first, other], original);
+}
+
+#[test]
 fn an_import_that_fails_after_the_check_leaves_the_state_poisoned() {
     let mut book = valid_book(64);
     book.enqueue(1).expect("step");

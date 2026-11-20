@@ -559,7 +559,7 @@ impl ResidentState {
     }
 
     /// Zeroes every DeltaNet slot and the words in place, ordered on `stream`, and forgets the KV
-    /// positions and the pending steps (the copies run behind all work queued on the stream).
+    /// positions and the pending steps (the fills run behind all work queued on the stream).
     ///
     /// Reset invariant under Int8G32: a reset leaves the STALE codes and scales in every cell >=
     /// the new kv_len — nothing rewrites or clears them. That is correct only because
@@ -592,57 +592,45 @@ impl ResidentState {
         Ok(())
     }
 
+    /// Zeroes every DeltaNet slot from `first_slot` on, ordered on `stream`: one
+    /// stream-ordered device-side fill per record/conv block (the fills run behind all work
+    /// queued on the stream; the host never pages zeros in and never syncs per chunk - the
+    /// pageable storm this replaced could wedge a `cuStreamSynchronize` on the patched
+    /// libcuda at deep contexts).
     fn clear_delta(&self, stream: &DeviceStream, first_slot: usize) -> Result<(), EngError> {
-        let pool = self.layout.delta;
-        if matches!(&self.kv, KvStorage::Paged { .. } | KvStorage::Cached { .. }) {
-            // Fixed read-only staging keeps reset/import independent of retained prefix size.
-            const ZEROS: [u8; 8192] = [0; 8192];
-            for slot in first_slot..pool.slots {
-                for ordinal in 0..pool.layers {
-                    for (offset, bytes) in [
-                        (pool.rec_offset(slot, ordinal)?, pool.rec_values * F32),
-                        (pool.conv_offset(slot, ordinal)?, pool.conv_values * F32),
-                    ] {
-                        for at in (0..bytes).step_by(ZEROS.len()) {
-                            let len = ZEROS.len().min(bytes - at);
-                            self.delta.write_at(stream, offset + at, &ZEROS[..len])?;
-                        }
-                    }
-                }
-            }
-            return Ok(());
-        }
-        let zeros = vec![0u8; pool.rec_values.max(pool.conv_values) * F32];
-        for slot in first_slot..pool.slots {
-            for ordinal in 0..pool.layers {
-                let rec = pool.rec_offset(slot, ordinal)?;
-                self.delta
-                    .write_at(stream, rec, &zeros[..pool.rec_values * F32])?;
-                let conv = pool.conv_offset(slot, ordinal)?;
-                self.delta
-                    .write_at(stream, conv, &zeros[..pool.conv_values * F32])?;
-            }
+        for (offset, bytes) in delta_clear_ranges(&self.layout.delta, first_slot)? {
+            self.delta.zero_at(stream, offset, bytes)?;
         }
         Ok(())
     }
 
-    /// Zeroes the whole KV pool in place, ordered on `stream` (the copies run behind all work
-    /// queued on the stream), in bounded host chunks: the Int8G32 codes and scales start at 0.
+    /// Zeroes the whole KV pool in place, ordered on `stream` (the fill runs behind all work
+    /// queued on the stream), as ONE device-side fill: the Int8G32 codes and scales start
+    /// at 0.
     fn clear_kv(&self, stream: &DeviceStream) -> Result<(), EngError> {
-        const CHUNK: usize = 1 << 24; // 16 MiB of staging per copy
-        let zeros = vec![0u8; CHUNK.min(self.layout.kv.total)];
-        for at in (0..self.layout.kv.total).step_by(zeros.len()) {
-            let end = (at + zeros.len()).min(self.layout.kv.total);
-            self.resident_kv()?
-                .write_at(stream, at, &zeros[..end - at])?;
-        }
-        Ok(())
+        self.resident_kv()?.zero_at(stream, 0, self.layout.kv.total)
     }
 
     fn clear_words(&self, stream: &DeviceStream) -> Result<(), EngError> {
-        self.words
-            .write_at(stream, 0, &vec![0u8; self.layout.words.total])
+        self.words.zero_at(stream, 0, self.layout.words.total)
     }
+}
+
+/// The byte ranges [`ResidentState::clear_delta`] zeroes for slots `first_slot..`:
+/// pure layout arithmetic (host-computable, no device), so the cover is pinned by the
+/// host tests - the device half is one `zero_at` per range.
+fn delta_clear_ranges(
+    pool: &super::state_layout::DeltaPool,
+    first_slot: usize,
+) -> Result<Vec<(usize, usize)>, EngError> {
+    let mut ranges = Vec::with_capacity((pool.slots - first_slot) * pool.layers * 2);
+    for slot in first_slot..pool.slots {
+        for ordinal in 0..pool.layers {
+            ranges.push((pool.rec_offset(slot, ordinal)?, pool.rec_values * F32));
+            ranges.push((pool.conv_offset(slot, ordinal)?, pool.conv_values * F32));
+        }
+    }
+    Ok(ranges)
 }
 
 /// Orders work queued on branch streams before whatever the owning stream queues next: each
