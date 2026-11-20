@@ -38,10 +38,7 @@ const EXTENSIONS: &[&str] = &[
 
 /// Hyphenated uppercase words that are ordinary public vocabulary. Loaded from
 /// the shared policy file so the sanitizer and this gate read one authority
-/// and cannot drift. When the repository has no development tooling
-/// directory (the file lives there), this gate skips with one printed line;
-/// where the directory is present the file must exist and parse, or the
-/// gate fails closed.
+/// and cannot drift.
 fn allowed_tags() -> &'static [String] {
     static ALLOWED: std::sync::OnceLock<Vec<String>> = std::sync::OnceLock::new();
     ALLOWED.get_or_init(|| read_policy_tags(&shared_policy_path()))
@@ -49,6 +46,31 @@ fn allowed_tags() -> &'static [String] {
 
 fn shared_policy_path() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR")).join("../scripts/sanitize_policy.json")
+}
+
+/// The public checkout can carry benchmark scripts without publication tooling.
+fn publication_policy_available(root: &Path) -> bool {
+    let missing = matches!(
+        shared_policy_path().symlink_metadata(),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound
+    );
+    if missing {
+        assert!(
+            std::env::var("FIFI_TEST_REQUIRE_DATA").as_deref() != Ok("1"),
+            "FIFI_TEST_REQUIRE_DATA=1 but the shared publication policy is absent"
+        );
+        let publisher_hook = root.join(".githooks/publisher-integration");
+        if !publisher_hook
+            .try_exists()
+            .expect("checking for the publisher integration hook")
+        {
+            eprintln!("skipping: no shared publication policy in the public checkout");
+            return false;
+        }
+    }
+    // Validate even if no scanned word needs the allowlist.
+    allowed_tags();
+    true
 }
 
 /// Fails closed: a missing or malformed policy panics this gate, never skips.
@@ -110,16 +132,7 @@ const HOST_WORDS: &[&str] = &[concat!("pi", "nu")];
 #[test]
 fn published_files_carry_no_internal_plan_labels() {
     let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("..");
-    // The allowlist lives in the development tooling directory, which the
-    // public source does not carry. Without it every hyphenated word would
-    // flag, so the whole gate skips there - unless FIFI_TEST_REQUIRE_DATA=1
-    // demands the real run.
-    if !root.join("scripts").is_dir() {
-        assert!(
-            std::env::var("FIFI_TEST_REQUIRE_DATA").as_deref() != Ok("1"),
-            "FIFI_TEST_REQUIRE_DATA=1 but the tooling directory is absent: the published-text gate cannot run"
-        );
-        eprintln!("skipping: no development tooling directory");
+    if !publication_policy_available(&root) {
         return;
     }
     let files = published_files(&root);
@@ -372,16 +385,8 @@ fn starts_with_digit(text: &str) -> bool {
 
 #[test]
 fn the_label_rules_match_codes_and_skip_ordinary_words() {
-    // The rules are read against the shared policy, which the public
-    // source does not carry; skip there, fail closed under
-    // FIFI_TEST_REQUIRE_DATA=1.
     let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("..");
-    if !root.join("scripts").is_dir() {
-        assert!(
-            std::env::var("FIFI_TEST_REQUIRE_DATA").as_deref() != Ok("1"),
-            "FIFI_TEST_REQUIRE_DATA=1 but the tooling directory is absent: the label rules cannot run"
-        );
-        eprintln!("skipping: no development tooling directory");
+    if !publication_policy_available(&root) {
         return;
     }
     assert_eq!(

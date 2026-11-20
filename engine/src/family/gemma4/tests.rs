@@ -1012,24 +1012,31 @@ fn rejects_bolt_kv_heads_on_a_shared_layer() {
 }
 
 /// Runs the converter's in-tree self-check so the battery exercises the
-/// Python layout code too. Skips (printed) when the repository has no
-/// development tooling directory, or when no python3 or no numpy is
-/// present;
-/// otherwise the self-check's exit code is the test's verdict.
+/// Python layout code too. Skips if the self-check is absent in a public
+/// checkout, or if Python or NumPy is unavailable.
 #[test]
 fn the_bolt_converter_selfcheck_runs() {
     let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("..");
-    // The script lives in the development tooling directory, which the
-    // public source does not carry.
-    // Checked BEFORE the numpy probe so a renamed script in our tree cannot
-    // hide behind a printed SKIPPED line. FIFI_TEST_REQUIRE_DATA=1 demands
-    // the real run and turns this skip into a failure.
-    if !root.join("scripts").is_dir() {
+    let selfcheck = "scripts/convert_bolt_gguf_selfcheck.py";
+    // Check for the script before probing NumPy so missing development
+    // tooling cannot be hidden by a dependency skip.
+    if !root
+        .join(selfcheck)
+        .try_exists()
+        .expect("checking for the Bolt converter self-check")
+    {
         assert!(
             std::env::var("FIFI_TEST_REQUIRE_DATA").as_deref() != Ok("1"),
-            "FIFI_TEST_REQUIRE_DATA=1 but the tooling directory is absent: the self-check cannot run"
+            "FIFI_TEST_REQUIRE_DATA=1 but the Bolt converter self-check is absent"
         );
-        eprintln!("skipping: no development tooling directory");
+        let publisher_hook = root.join(".githooks/publisher-integration");
+        assert!(
+            !publisher_hook
+                .try_exists()
+                .expect("checking for the publisher integration hook"),
+            "the Bolt converter self-check is absent in the development checkout"
+        );
+        eprintln!("skipping: no Bolt converter self-check in the public checkout");
         return;
     }
     // numpy is the self-check's only third-party need; probe it so a host
@@ -1050,7 +1057,7 @@ fn the_bolt_converter_selfcheck_runs() {
         Err(error) => panic!("python3 failed to start: {error}"),
     }
     let output = std::process::Command::new("python3")
-        .arg("scripts/convert_bolt_gguf_selfcheck.py")
+        .arg(selfcheck)
         .current_dir(&root)
         .output();
     match output {

@@ -123,9 +123,12 @@ fn every_type_matches_oracle_bit_for_bit() {
     }
 }
 
-const ALL: [GgufType; 15] = [
+const ALL: [GgufType; 19] = [
     GgufType::Q20,
+    GgufType::Q40,
+    GgufType::Q3K,
     GgufType::Q4K,
+    GgufType::Q50,
     GgufType::Q5K,
     GgufType::Q6K,
     GgufType::Q80,
@@ -136,6 +139,7 @@ const ALL: [GgufType; 15] = [
     GgufType::Iq3S,
     GgufType::Iq4Nl,
     GgufType::Iq4Xs,
+    GgufType::Nvfp4,
     GgufType::F32,
     GgufType::F16,
     GgufType::Bf16,
@@ -213,15 +217,20 @@ fn empty_input_gives_empty_output() {
 
 #[test]
 fn unsupported_type_is_an_error() {
-    let mut dst = vec![0f32; 32];
-    // Q4_0 left this list when the dequant plan wired it (scalar decode
-    // and the CUDA projector); only types plan() still refuses belong here.
-    for ty in [GgufType::Q2K, GgufType::Iq1S] {
+    for ty in [GgufType::Q41, GgufType::Q2K, GgufType::Iq1S] {
         let src = vec![0u8; ty.block_bytes() as usize];
-        assert!(matches!(
-            dequantize_into(ty, &src, &mut dst),
-            Err(EngError::Checkpoint(_))
-        ));
+        let mut dst = vec![0f32; ty.block_elems() as usize];
+        assert!(
+            matches!(
+                dequantize_into(ty, &src, &mut dst),
+                Err(EngError::Checkpoint(_))
+            ),
+            "{ty:?}"
+        );
+        assert!(
+            matches!(dequantize(ty, &src), Err(EngError::Checkpoint(_))),
+            "{ty:?}"
+        );
     }
 }
 

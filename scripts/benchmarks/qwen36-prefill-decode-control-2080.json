@@ -1,0 +1,182 @@
+{
+  "hardware": "RTX 2080 Ti, standalone CUDA",
+  "model": "Qwen3.6-35B-A3B Q4_K_M",
+  "binary_sha256": "9cd061a3320e450cd39855b776d8a220bf006287585aabef81d04ac633697638",
+  "driver_revision": "e93b65107054a9ac736b23045567a4114ff411ec",
+  "input_driver_sha256": "d3731cc856b668987fcbbc301a0c4ef59de23e86567ff355fe170c960d12010d",
+  "fixed_output_tokens": 128,
+  "context_limit": 65536,
+  "notes": [
+    "Older deployment, two repeats per depth and mode. Exact same token IDs from cold to warm.",
+    "The server prefill interval ends with the first generated batch. Warm prefill includes a checkpoint restore.",
+    "Usage and timing matched all eight journal entries. No other chat request arrived within the interval."
+  ],
+  "medians": {
+    "2048": {
+      "cold": {
+        "server_prefill_ms": 3572.85,
+        "server_time_to_first_token_ms": 3572.9,
+        "server_decode_tokens_per_second": 92.725,
+        "fresh_prefill_tokens_per_second": 503.023
+      },
+      "warm": {
+        "server_prefill_ms": 348.8,
+        "server_time_to_first_token_ms": 348.8,
+        "server_decode_tokens_per_second": 92.925,
+        "fresh_prefill_tokens_per_second": 20.073
+      }
+    },
+    "8192": {
+      "cold": {
+        "server_prefill_ms": 24443.4,
+        "server_time_to_first_token_ms": 24443.4,
+        "server_decode_tokens_per_second": 91.835,
+        "fresh_prefill_tokens_per_second": 325.119
+      },
+      "warm": {
+        "server_prefill_ms": 369.7,
+        "server_time_to_first_token_ms": 369.7,
+        "server_decode_tokens_per_second": 91.945,
+        "fresh_prefill_tokens_per_second": 18.934
+      }
+    }
+  },
+  "measurements": [
+    {
+      "depth": 2048,
+      "seed": "paired-count-906e162f-2048-0",
+      "turn": "cold",
+      "id": "chatcmpl-000000000000027d",
+      "prompt_sha256": "204034341ec8ba749ca9fa482a2d8089934f63e16e74f50624503e2b3dea2c07",
+      "reply_sha256": "ef5d7dd6bee907301e7cdb774195e953c37a82af6e8bde4afacc7b1ed065113b",
+      "prompt_tokens": 1797,
+      "reused_tokens": 0,
+      "fresh_tokens": 1797,
+      "completion_tokens": 128,
+      "server_queue_wait_ms": 0.0,
+      "server_prefill_ms": 3612.8,
+      "server_time_to_first_token_ms": 3612.8,
+      "server_decode_tokens_per_second": 92.91,
+      "fresh_prefill_tokens_per_second": 497.3981399468556
+    },
+    {
+      "depth": 2048,
+      "seed": "paired-count-906e162f-2048-0",
+      "turn": "warm",
+      "id": "chatcmpl-000000000000027e",
+      "prompt_sha256": "204034341ec8ba749ca9fa482a2d8089934f63e16e74f50624503e2b3dea2c07",
+      "reply_sha256": "ef5d7dd6bee907301e7cdb774195e953c37a82af6e8bde4afacc7b1ed065113b",
+      "prompt_tokens": 1797,
+      "reused_tokens": 1790,
+      "fresh_tokens": 7,
+      "completion_tokens": 128,
+      "server_queue_wait_ms": 0.0,
+      "server_prefill_ms": 353.9,
+      "server_time_to_first_token_ms": 353.9,
+      "server_decode_tokens_per_second": 93.08,
+      "fresh_prefill_tokens_per_second": 19.779598756710936
+    },
+    {
+      "depth": 2048,
+      "seed": "paired-count-906e162f-2048-1",
+      "turn": "cold",
+      "id": "chatcmpl-0000000000000284",
+      "prompt_sha256": "bdf865de00bcf50cede5f624fd5c3c224e70c5620ec000c82bd61aa6f55430de",
+      "reply_sha256": "ef5d7dd6bee907301e7cdb774195e953c37a82af6e8bde4afacc7b1ed065113b",
+      "prompt_tokens": 1797,
+      "reused_tokens": 0,
+      "fresh_tokens": 1797,
+      "completion_tokens": 128,
+      "server_queue_wait_ms": 0.1,
+      "server_prefill_ms": 3532.9,
+      "server_time_to_first_token_ms": 3533.0,
+      "server_decode_tokens_per_second": 92.54,
+      "fresh_prefill_tokens_per_second": 508.6472869314161
+    },
+    {
+      "depth": 2048,
+      "seed": "paired-count-906e162f-2048-1",
+      "turn": "warm",
+      "id": "chatcmpl-0000000000000285",
+      "prompt_sha256": "bdf865de00bcf50cede5f624fd5c3c224e70c5620ec000c82bd61aa6f55430de",
+      "reply_sha256": "ef5d7dd6bee907301e7cdb774195e953c37a82af6e8bde4afacc7b1ed065113b",
+      "prompt_tokens": 1797,
+      "reused_tokens": 1790,
+      "fresh_tokens": 7,
+      "completion_tokens": 128,
+      "server_queue_wait_ms": 0.0,
+      "server_prefill_ms": 343.7,
+      "server_time_to_first_token_ms": 343.7,
+      "server_decode_tokens_per_second": 92.77,
+      "fresh_prefill_tokens_per_second": 20.366598778004075
+    },
+    {
+      "depth": 8192,
+      "seed": "paired-count-906e162f-8192-0",
+      "turn": "cold",
+      "id": "chatcmpl-000000000000028b",
+      "prompt_sha256": "bb55ab90075178f749a52724fb4d6b25a7898fe00f7004a66f8bf90e6aad71c0",
+      "reply_sha256": "ef5d7dd6bee907301e7cdb774195e953c37a82af6e8bde4afacc7b1ed065113b",
+      "prompt_tokens": 7947,
+      "reused_tokens": 0,
+      "fresh_tokens": 7947,
+      "completion_tokens": 128,
+      "server_queue_wait_ms": 0.0,
+      "server_prefill_ms": 24417.4,
+      "server_time_to_first_token_ms": 24417.4,
+      "server_decode_tokens_per_second": 93.83,
+      "fresh_prefill_tokens_per_second": 325.4646276835371
+    },
+    {
+      "depth": 8192,
+      "seed": "paired-count-906e162f-8192-0",
+      "turn": "warm",
+      "id": "chatcmpl-000000000000028c",
+      "prompt_sha256": "bb55ab90075178f749a52724fb4d6b25a7898fe00f7004a66f8bf90e6aad71c0",
+      "reply_sha256": "ef5d7dd6bee907301e7cdb774195e953c37a82af6e8bde4afacc7b1ed065113b",
+      "prompt_tokens": 7947,
+      "reused_tokens": 7940,
+      "fresh_tokens": 7,
+      "completion_tokens": 128,
+      "server_queue_wait_ms": 0.0,
+      "server_prefill_ms": 368.7,
+      "server_time_to_first_token_ms": 368.7,
+      "server_decode_tokens_per_second": 91.62,
+      "fresh_prefill_tokens_per_second": 18.98562516951451
+    },
+    {
+      "depth": 8192,
+      "seed": "paired-count-906e162f-8192-1",
+      "turn": "cold",
+      "id": "chatcmpl-0000000000000292",
+      "prompt_sha256": "7ff1221aeedf42f72e43955499b81e306cd3476601525a5d4552c7b987d8be5d",
+      "reply_sha256": "ef5d7dd6bee907301e7cdb774195e953c37a82af6e8bde4afacc7b1ed065113b",
+      "prompt_tokens": 7947,
+      "reused_tokens": 0,
+      "fresh_tokens": 7947,
+      "completion_tokens": 128,
+      "server_queue_wait_ms": 0.1,
+      "server_prefill_ms": 24469.4,
+      "server_time_to_first_token_ms": 24469.4,
+      "server_decode_tokens_per_second": 89.84,
+      "fresh_prefill_tokens_per_second": 324.77298176497993
+    },
+    {
+      "depth": 8192,
+      "seed": "paired-count-906e162f-8192-1",
+      "turn": "warm",
+      "id": "chatcmpl-0000000000000293",
+      "prompt_sha256": "7ff1221aeedf42f72e43955499b81e306cd3476601525a5d4552c7b987d8be5d",
+      "reply_sha256": "ef5d7dd6bee907301e7cdb774195e953c37a82af6e8bde4afacc7b1ed065113b",
+      "prompt_tokens": 7947,
+      "reused_tokens": 7940,
+      "fresh_tokens": 7,
+      "completion_tokens": 128,
+      "server_queue_wait_ms": 0.0,
+      "server_prefill_ms": 370.7,
+      "server_time_to_first_token_ms": 370.7,
+      "server_decode_tokens_per_second": 92.27,
+      "fresh_prefill_tokens_per_second": 18.883193957377934
+    }
+  ]
+}
