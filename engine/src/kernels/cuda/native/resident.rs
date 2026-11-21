@@ -150,6 +150,10 @@ impl<'a> RawRange<'a> {
 }
 
 impl RawRange<'_> {
+    pub(super) fn uses(&self, device: &RawDevice) -> bool {
+        self.device.ptr == device.ptr
+    }
+
     /// The byte offset of the range inside its allocation. Read-only: `address` relies on
     /// `RawRange::new`'s bound proof, so the fields stay private.
     pub(in crate::kernels::cuda) fn offset(&self) -> usize {

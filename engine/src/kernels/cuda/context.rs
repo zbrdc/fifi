@@ -707,9 +707,26 @@ impl CudaContext {
         shape: [usize; 2],
         x: &[f32],
     ) -> Result<Vec<f32>, EngError> {
+        self.nvfp4_matvec_range(
+            packed.range(0, packed.bytes())?,
+            scale.range(0, scale.bytes())?,
+            weight_scale_2,
+            shape,
+            x,
+        )
+    }
+
+    pub(crate) fn nvfp4_matvec_range(
+        &self,
+        packed: DeviceRange<'_>,
+        scale: DeviceRange<'_>,
+        weight_scale_2: f32,
+        shape: [usize; 2],
+        x: &[f32],
+    ) -> Result<Vec<f32>, EngError> {
         self.ensure_usable()?;
-        let packed_raw = self.owned(packed)?;
-        let scale_raw = self.owned(scale)?;
+        let packed_raw = self.raw_range(&packed)?;
+        let scale_raw = self.raw_range(&scale)?;
         let (packed_bytes, scale_bytes, need) =
             native::nvfp4_matvec_bytes(shape).ok_or_else(|| {
                 EngError::BadRequest(
@@ -738,6 +755,10 @@ impl CudaContext {
                 "cuda NVFP4 matvec: weight_scale_2 must be finite and positive".to_owned(),
             ));
         }
+        launch::require_apart(
+            &launch::Claim::of("weight codes", &packed, packed.bytes()),
+            &launch::Claim::of("weight scales", &scale, scale.bytes()),
+        )?;
         let mut y = host_floats(shape[0])?;
         let _dispatch = self.enter()?;
         let mut workspace = self
@@ -1042,6 +1063,63 @@ impl CudaContext {
         .map_err(|failure| {
             if failure.status == native::STATUS_INVALID_ARGUMENT {
                 EngError::BadRequest("cuda F8 matvec: a decoded weight was not finite".to_owned())
+            } else {
+                device_error(failure)
+            }
+        })?;
+        Ok(y)
+    }
+
+    /// Projects through E4M3FN codes with an E8M0 exponent for each block of 32.
+    pub(crate) fn mxfp8_matvec(
+        &self,
+        codes: DeviceRange<'_>,
+        scales: DeviceRange<'_>,
+        shape: [usize; 2],
+        x: &[f32],
+    ) -> Result<Vec<f32>, EngError> {
+        self.ensure_usable()?;
+        let codes_raw = self.raw_range(&codes)?;
+        let scales_raw = self.raw_range(&scales)?;
+        let invalid = || {
+            EngError::BadRequest(
+                "cuda MXFP8 matvec: expected packed codes, block scales, and finite activations"
+                    .into(),
+            )
+        };
+        let (codes_bytes, need) = native::f8_matvec_bytes(shape).ok_or_else(invalid)?;
+        if !shape[1].is_multiple_of(32)
+            || codes.bytes() != codes_bytes
+            || scales.bytes() != codes_bytes / 32
+            || x.len() != shape[1]
+            || !x.iter().all(|value| value.is_finite())
+        {
+            return Err(invalid());
+        }
+        launch::require_apart(
+            &launch::Claim::of("weight codes", &codes, codes.bytes()),
+            &launch::Claim::of("weight scales", &scales, scales.bytes()),
+        )?;
+        let mut y = host_floats(shape[0])?;
+        let _dispatch = self.enter()?;
+        let mut workspace = self
+            .workspace
+            .try_borrow_mut()
+            .map_err(|_| workspace_in_use())?;
+        self.reserve_workspace(&mut workspace, need)?;
+        self.ensure_usable()?;
+        let device = self.owned(&workspace.buffer)?;
+        native::mxfp8_gemv(
+            codes_raw,
+            scales_raw,
+            shape,
+            workspace.work(device),
+            x,
+            &mut y,
+        )
+        .map_err(|failure| {
+            if failure.status == native::STATUS_INVALID_ARGUMENT {
+                invalid()
             } else {
                 device_error(failure)
             }

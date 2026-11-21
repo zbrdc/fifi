@@ -68,6 +68,7 @@ pub enum GgufType {
     Q50,
     Q51,
     Q80,
+    Mxfp4,
     Nvfp4,
     Q20,
     Q2K,
@@ -116,6 +117,7 @@ impl GgufType {
             28 => Self::F64,
             29 => Self::Iq1M,
             30 => Self::Bf16,
+            39 => Self::Mxfp4,
             40 => Self::Nvfp4,
             42 => Self::Q20,
             _ => return bad(format!("unknown or unsupported tensor type id {id}")),
@@ -151,6 +153,7 @@ impl GgufType {
             Self::F64 => 28,
             Self::Iq1M => 29,
             Self::Bf16 => 30,
+            Self::Mxfp4 => 39,
             Self::Nvfp4 => 40,
             Self::Q20 => 42,
         }
@@ -171,6 +174,7 @@ impl GgufType {
             Self::Q50 => "Q5_0",
             Self::Q51 => "Q5_1",
             Self::Q80 => "Q8_0",
+            Self::Mxfp4 => "MXFP4",
             Self::Nvfp4 => "NVFP4",
             Self::Q20 => "Q2_0",
             Self::Q2K => "Q2_K",
@@ -201,7 +205,13 @@ impl GgufType {
             | Self::I16
             | Self::I32
             | Self::I64 => 1,
-            Self::Q40 | Self::Q41 | Self::Q50 | Self::Q51 | Self::Q80 | Self::Iq4Nl => 32,
+            Self::Q40
+            | Self::Q41
+            | Self::Q50
+            | Self::Q51
+            | Self::Q80
+            | Self::Iq4Nl
+            | Self::Mxfp4 => 32,
             Self::Q20 | Self::Nvfp4 => 64,
             Self::Q2K
             | Self::Q3K
@@ -231,6 +241,7 @@ impl GgufType {
             Self::Q50 => 22,
             Self::Q51 => 24,
             Self::Q80 => 34,
+            Self::Mxfp4 => 17,
             Self::Nvfp4 => 36,
             Self::Q2K => 84,
             Self::Q3K | Self::Iq3S => 110,

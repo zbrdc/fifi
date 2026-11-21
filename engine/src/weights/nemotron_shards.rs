@@ -108,6 +108,25 @@ impl NemotronShardReader {
         self.tensors.get(name)
     }
 
+    #[cfg(all(
+        feature = "native-cuda",
+        target_os = "linux",
+        target_pointer_width = "64"
+    ))]
+    pub(crate) fn tensors(&self) -> impl Iterator<Item = (&str, &NemotronShardTensor)> {
+        self.tensors
+            .iter()
+            .map(|(name, tensor)| (name.as_str(), tensor))
+    }
+
+    pub(crate) fn tensor_count(&self) -> usize {
+        self.tensors.len()
+    }
+
+    pub(crate) fn payload_len(&self) -> u64 {
+        self.file_len - self.data_start
+    }
+
     /// Length of the shard file; `open` proved the header-declared data section ends exactly here.
     pub fn file_len(&self) -> u64 {
         self.file_len

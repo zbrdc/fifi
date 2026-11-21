@@ -376,6 +376,14 @@ impl TokenizerBundle {
     /// executors compare the vocabulary with the model's own head size and refuse a larger one.
     /// `tokenizer.json` and `tokenizer_config.json` are required.
     pub fn load(dir: &Path, pin: &TokenizerPin) -> Result<Self, EngError> {
+        Self::load_with_template(dir, pin, ChatTemplate::from_str)
+    }
+
+    pub(crate) fn load_with_template(
+        dir: &Path,
+        pin: &TokenizerPin,
+        parse_template: impl FnOnce(&str) -> Result<ChatTemplate, EngError>,
+    ) -> Result<Self, EngError> {
         let mut notes = Vec::new();
         let tokenizer_bytes = require(
             "tokenizer.json",
@@ -444,7 +452,9 @@ impl TokenizerBundle {
             ));
         }
         let eos_token_ids = eos_lookup(&config, &generation, &tokenizer)?;
-        let template = parse_template(&template_bytes)?;
+        let template_text = std::str::from_utf8(&template_bytes)
+            .map_err(|_| EngError::Checkpoint("chat_template.jinja is not UTF-8".to_string()))?;
+        let template = parse_template(template_text)?;
         for note in &notes {
             eprintln!("{note}");
         }
@@ -1383,12 +1393,6 @@ fn generation_eos_ids(
             Ok(id)
         })
         .collect()
-}
-
-fn parse_template(bytes: &[u8]) -> Result<ChatTemplate, EngError> {
-    let source = std::str::from_utf8(bytes)
-        .map_err(|_| EngError::Checkpoint("chat_template.jinja is not UTF-8".to_string()))?;
-    ChatTemplate::from_str(source)
 }
 
 #[cfg(test)]

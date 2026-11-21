@@ -123,8 +123,11 @@ fn every_type_matches_oracle_bit_for_bit() {
     }
 }
 
-const ALL: [GgufType; 15] = [
+const ALL: [GgufType; 18] = [
     GgufType::Q20,
+    GgufType::Mxfp4,
+    GgufType::Q2K,
+    GgufType::Iq1M,
     GgufType::Q4K,
     GgufType::Q5K,
     GgufType::Q6K,
@@ -216,7 +219,7 @@ fn unsupported_type_is_an_error() {
     let mut dst = vec![0f32; 32];
     // Q4_0 left this list when the dequant plan wired it (scalar decode
     // and the CUDA projector); only types plan() still refuses belong here.
-    for ty in [GgufType::Q2K, GgufType::Iq1S] {
+    for ty in [GgufType::Q41, GgufType::Q51] {
         let src = vec![0u8; ty.block_bytes() as usize];
         assert!(matches!(
             dequantize_into(ty, &src, &mut dst),
@@ -257,4 +260,63 @@ fn q5_0_all_zero_block_decodes_to_negative_zero_bits() {
     let v = dequantize(GgufType::Q50, &[0u8; 22]).unwrap();
     assert_eq!(v.len(), 32);
     assert!(v.iter().all(|x| x.to_bits() == 0x8000_0000), "{v:?}");
+}
+
+#[test]
+fn q2k_and_iq1m_match_ggml_block_decoders() {
+    // Golden output from the pinned Unsloth b12588 libggml-base, including
+    // independent scale/min terms, both IQ1 shifts, and a subnormal FP16 scale.
+    for (ty, want) in [
+        (
+            GgufType::Q2K,
+            "3f7d265440bda8d035690400c8a7b79f09bb23bca0ae0d5a595427f13ccd780a",
+        ),
+        (
+            GgufType::Iq1M,
+            "ef430b551389bd1d23f178a8eb21b7605d4bcaf36a9c4a52b4a6bdff3883c27c",
+        ),
+    ] {
+        let len = ty.block_bytes() as usize;
+        let mut input = Vec::with_capacity(len * 3);
+        for (n, bits) in [0x3400u16, 0xb600, 0x0001].into_iter().enumerate() {
+            let mut block = (0..len)
+                .map(|i| (53 * i + 41 * n + 17) as u8)
+                .collect::<Vec<_>>();
+            if ty == GgufType::Q2K {
+                let min = [0x2c00u16, 0x3800, 0x0002][n];
+                block[80..82].copy_from_slice(&bits.to_le_bytes());
+                block[82..84].copy_from_slice(&min.to_le_bytes());
+            } else {
+                for k in 0..4 {
+                    let byte = &mut block[49 + 2 * k];
+                    *byte = (*byte & 15) | (((bits >> (4 * k)) as u8 & 15) << 4);
+                }
+            }
+            input.extend(block);
+        }
+        let decoded = dequantize(ty, &input).unwrap();
+        let output = decoded
+            .into_iter()
+            .flat_map(f32::to_le_bytes)
+            .collect::<Vec<_>>();
+        assert_eq!(sha(&output), want, "{ty:?}");
+    }
+}
+
+#[test]
+fn mxfp4_matches_ggml_for_every_e8m0_exponent() {
+    let mut input = Vec::new();
+    for exponent in 0..=u8::MAX {
+        input.push(exponent);
+        input.extend((0..16).map(|i| exponent.wrapping_add(13 * i)));
+    }
+    let output = dequantize(GgufType::Mxfp4, &input).unwrap();
+    let bytes = output
+        .into_iter()
+        .flat_map(f32::to_le_bytes)
+        .collect::<Vec<_>>();
+    assert_eq!(
+        sha(&bytes),
+        "d901377e435d2a9867f6112d287fd88cbe4ab9af85c9ff52790a8e4591a1c849"
+    );
 }

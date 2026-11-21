@@ -13,6 +13,7 @@
 namespace {
 
 constexpr unsigned kMatvecThreads = 128;
+constexpr size_t kMxBlock = 32;
 
 /* E4M3FN of one code byte, identical to the table construction of
  * kernels/f8.rs and kernels/nvfp4.rs: bias 7, subnormal fraction * 2^-9, NaN
@@ -56,6 +57,39 @@ __global__ void f8_gemv_rows(const unsigned char *codes, float weight_scale,
             accumulate_step(e4m3_value(row_codes[column]), weight_scale,
                             x[column], sum, bad);
         if (bad)
+            atomicOr(nonfinite, 1u);
+        else
+            y[row] = sum;
+    }
+}
+
+// Each row keeps the host block and column order, including E8M0 zero (2^-127).
+__global__ void mxfp8_gemv_rows(const unsigned char *codes, const unsigned char *scales,
+                                const float *x, float *y, unsigned int *nonfinite,
+                                size_t rows, size_t columns) {
+    const size_t blocks = columns / kMxBlock;
+    const size_t stride = blockDim.x * gridDim.x;
+    for (size_t row = blockIdx.x * blockDim.x + threadIdx.x; row < rows; row += stride) {
+        const unsigned char *row_codes = codes + row * columns;
+        const unsigned char *row_scales = scales + row * blocks;
+        float sum = 0.0f;
+        bool bad = false;
+        for (size_t block = 0; block < blocks; ++block) {
+            const unsigned code = row_scales[block];
+            if (code == 255u) {
+                bad = true;
+                break;
+            }
+            const float scale = __uint_as_float(code == 0 ? 1u << 22 : code << 23);
+            float dot = 0.0f;
+#pragma unroll
+            for (size_t offset = 0; offset < kMxBlock; ++offset) {
+                const size_t column = block * kMxBlock + offset;
+                dot = __fadd_rn(dot, __fmul_rn(e4m3_value(row_codes[column]), x[column]));
+            }
+            sum = __fadd_rn(sum, __fmul_rn(scale, dot));
+        }
+        if (bad || !isfinite(sum))
             atomicOr(nonfinite, 1u);
         else
             y[row] = sum;
@@ -108,10 +142,20 @@ bool f8_regions_usable(const void *codes, size_t codes_bytes,
            apart(ws.y, need.y, ws.xf, need.flag);
 }
 
-}  // namespace
+bool mx_scales_usable(const void *scales, size_t scales_bytes,
+                      const void *codes, const Needs &need,
+                      const inference_cuda_workspace &ws, size_t columns) {
+    return columns % kMxBlock == 0 && scales_bytes == need.codes / kMxBlock &&
+           usable(scales, scales_bytes, scales_bytes, alignof(unsigned char)) &&
+           apart(scales, scales_bytes, codes, need.codes) &&
+           apart(scales, scales_bytes, ws.x, need.x) &&
+           apart(scales, scales_bytes, ws.y, need.y) &&
+           apart(scales, scales_bytes, ws.xf, need.flag);
+}
 
-extern "C" int inference_cuda_f8_gemv_ws(
+int f8_gemv_ws(
     const void *codes, size_t codes_bytes, float weight_scale,
+    const void *scales, size_t scales_bytes, bool mx,
     size_t rows, size_t columns,
     const float *x, size_t x_bytes, float *y, size_t y_bytes,
     const inference_cuda_workspace *workspace, int *out_stage) {
@@ -124,7 +168,8 @@ extern "C" int inference_cuda_f8_gemv_ws(
             weight_scale <= 0.0f || !checked_needs(rows, columns, need) ||
             !f8_regions_usable(codes, codes_bytes, *workspace, need) ||
             !usable(x, x_bytes, need.x, alignof(float)) ||
-            !usable(y, y_bytes, need.y, alignof(float)))
+            !usable(y, y_bytes, need.y, alignof(float)) ||
+            (mx && !mx_scales_usable(scales, scales_bytes, codes, need, *workspace, columns)))
             return INFERENCE_CUDA_INVALID_ARGUMENT;
         for (size_t column = 0; column < columns; ++column)
             if (!std::isfinite(x[column])) return INFERENCE_CUDA_INVALID_ARGUMENT;
@@ -142,11 +187,20 @@ extern "C" int inference_cuda_f8_gemv_ws(
             const size_t blocks_needed = (rows - 1) / kMatvecThreads + 1;
             const unsigned blocks = static_cast<unsigned>(blocks_needed < 65535
                                                              ? blocks_needed : 65535);
-            f8_gemv_rows<<<blocks, kMatvecThreads>>>(
-                static_cast<const unsigned char *>(codes), weight_scale,
-                static_cast<const float *>(workspace->x),
-                static_cast<float *>(workspace->y),
-                static_cast<unsigned int *>(workspace->xf), rows, columns);
+            if (mx) {
+                mxfp8_gemv_rows<<<blocks, kMatvecThreads>>>(
+                    static_cast<const unsigned char *>(codes),
+                    static_cast<const unsigned char *>(scales),
+                    static_cast<const float *>(workspace->x),
+                    static_cast<float *>(workspace->y),
+                    static_cast<unsigned int *>(workspace->xf), rows, columns);
+            } else {
+                f8_gemv_rows<<<blocks, kMatvecThreads>>>(
+                    static_cast<const unsigned char *>(codes), weight_scale,
+                    static_cast<const float *>(workspace->x),
+                    static_cast<float *>(workspace->y),
+                    static_cast<unsigned int *>(workspace->xf), rows, columns);
+            }
             failure.record(cudaGetLastError(), INFERENCE_CUDA_STAGE_LAUNCH);
         }
         failure.record(cudaDeviceSynchronize(), INFERENCE_CUDA_STAGE_SYNCHRONIZE);
@@ -172,6 +226,26 @@ extern "C" int inference_cuda_f8_gemv_ws(
         report_stage(out_stage, failure.stage);
         return failure.ok() ? INFERENCE_CUDA_NATIVE_EXCEPTION : static_cast<int>(failure.err);
     }
+}
+
+}  // namespace
+
+extern "C" int inference_cuda_f8_gemv_ws(
+    const void *codes, size_t codes_bytes, float weight_scale,
+    size_t rows, size_t columns,
+    const float *x, size_t x_bytes, float *y, size_t y_bytes,
+    const inference_cuda_workspace *workspace, int *out_stage) {
+    return f8_gemv_ws(codes, codes_bytes, weight_scale, nullptr, 0, false,
+                      rows, columns, x, x_bytes, y, y_bytes, workspace, out_stage);
+}
+
+extern "C" int inference_cuda_mxfp8_gemv_ws(
+    const void *codes, size_t codes_bytes, const void *scales, size_t scales_bytes,
+    size_t rows, size_t columns,
+    const float *x, size_t x_bytes, float *y, size_t y_bytes,
+    const inference_cuda_workspace *workspace, int *out_stage) {
+    return f8_gemv_ws(codes, codes_bytes, 1.0f, scales, scales_bytes, true,
+                      rows, columns, x, x_bytes, y, y_bytes, workspace, out_stage);
 }
 
 extern "C" int inference_cuda_f8_gemv_launch(

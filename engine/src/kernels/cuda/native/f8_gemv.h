@@ -46,6 +46,16 @@ int inference_cuda_f8_gemv_ws(
     const float *x, size_t x_bytes, float *y, size_t y_bytes,
     const inference_cuda_workspace *workspace, int *out_stage);
 
+/* MXFP8 stores one unsigned E8M0 scale per group of 32 E4M3FN values.
+ * The block dot is accumulated before multiplying by the block scale.
+ * scales has exactly rows * columns / 32 bytes and must be disjoint from
+ * the codes and workspace. The remaining _ws contracts are shared. */
+int inference_cuda_mxfp8_gemv_ws(
+    const void *codes, size_t codes_bytes, const void *scales, size_t scales_bytes,
+    size_t rows, size_t columns,
+    const float *x, size_t x_bytes, float *y, size_t y_bytes,
+    const inference_cuda_workspace *workspace, int *out_stage);
+
 /* Launch-only variant for the device chain (NEM35_DEVICE_CHAIN): x is a
  * borrowed DEVICE address of at least columns floats (the caller's
  * persistent activation buffer); the result is written to workspace->y on

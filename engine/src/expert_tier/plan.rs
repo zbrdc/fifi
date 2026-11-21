@@ -32,6 +32,23 @@ pub fn auto_fit_gpu_layers(
     usize::try_from(spare / layer_bytes).map_or(max_layers, |fit| fit.min(max_layers))
 }
 
+/// Carve out an adaptive cache quota from an existing expert byte budget.
+/// Whole-model fit takes priority, and the quota is bounded by admitted bytes.
+#[cfg(any(test, all(feature = "native-cuda", target_os = "linux")))]
+pub(crate) fn expert_cache_reserve(
+    total_weights: u64,
+    capacity: u64,
+    requested: Option<u64>,
+) -> u64 {
+    if total_weights <= capacity {
+        0
+    } else {
+        requested
+            .unwrap_or_else(|| capacity - capacity / 4)
+            .min(capacity)
+    }
+}
+
 /// One part of one routed expert as the checkpoint stores it: its quantized data, the group
 /// scales that go with it (empty for formats without them) and one per-tensor scale.
 #[derive(Clone, Debug, PartialEq)]
@@ -187,6 +204,18 @@ pub fn place_gpu_layers<G: GpuExpertStore, S: ExpertPayloadSource>(
 mod tests {
     use super::*;
     use crate::expert_tier::{Coverage, StreamBankPlan};
+
+    #[test]
+    fn cache_reservation_preserves_whole_model_fit_and_device_floor() {
+        assert_eq!(expert_cache_reserve(9, 10, Some(3)), 0);
+        assert_eq!(expert_cache_reserve(10, 10, Some(3)), 0);
+        assert_eq!(expert_cache_reserve(11, 10, Some(3)), 3);
+        assert_eq!(expert_cache_reserve(11, 10, Some(12)), 10);
+        assert_eq!(expert_cache_reserve(11, 0, Some(12)), 0);
+        assert_eq!(expert_cache_reserve(21, 20, None), 15);
+        assert_eq!(expert_cache_reserve(20, 20, None), 0);
+        assert_eq!(expert_cache_reserve(21, 20, Some(0)), 0);
+    }
 
     const GIB: u64 = 1 << 30;
     const EXPERTS: u32 = 4;

@@ -35,6 +35,11 @@ impl HostAdmission {
         )
     }
 
+    #[cfg(all(feature = "native-cuda", target_os = "linux"))]
+    pub(crate) fn cache_capacity(&self) -> u64 {
+        self.available_budget().saturating_sub(self.os_floor)
+    }
+
     /// The admission pair for facts paths that must not go dark inside a container: when the
     /// cgroup probe refuses (a namespace root, for example), the pair falls back to the bare
     /// `/proc/meminfo` figures and logs the refusal — those callers worked on the bare figure

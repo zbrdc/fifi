@@ -4,6 +4,8 @@ mod bundle;
 mod decode;
 mod encode;
 pub mod gemma;
+#[cfg(target_pointer_width = "64")]
+pub(crate) mod inkling2;
 pub mod nemotron;
 mod output;
 mod pyjson;

@@ -13,6 +13,8 @@ use std::ffi::{CStr, c_char, c_int, c_void};
 use std::ptr::NonNull;
 use std::sync::OnceLock;
 
+use resident::RawRange;
+
 #[cfg(test)]
 mod constant_bank_guard;
 
@@ -541,6 +543,22 @@ unsafe extern "C" {
         codes: *const c_void,
         codes_bytes: usize,
         weight_scale: f32,
+        rows: usize,
+        columns: usize,
+        x: *const f32,
+        x_bytes: usize,
+        y: *mut f32,
+        y_bytes: usize,
+        workspace: *const WorkspaceRaw,
+        out_stage: *mut c_int,
+    ) -> c_int;
+    #[link_name = "inference_cuda_mxfp8_gemv_ws"]
+    #[allow(clippy::too_many_arguments, reason = "mirrors native/f8_gemv.h")]
+    fn mxfp8_gemv_ws_raw(
+        codes: *const c_void,
+        codes_bytes: usize,
+        scales: *const c_void,
+        scales_bytes: usize,
         rows: usize,
         columns: usize,
         x: *const f32,
@@ -1339,8 +1357,8 @@ pub(super) fn f8_matvec_bytes([rows, columns]: [usize; 2]) -> Option<(usize, Act
 /// expands the matrix. Checks every extent and input the native side relies
 /// on; the workspace `xf` region carries the kernel's non-finite flag.
 pub(super) fn nvfp4_gemv(
-    packed: &RawDevice,
-    scale: &RawDevice,
+    packed: RawRange<'_>,
+    scale: RawRange<'_>,
     weight_scale_2: f32,
     shape: [usize; 2],
     work: Work<'_>,
@@ -1349,15 +1367,15 @@ pub(super) fn nvfp4_gemv(
 ) -> Result<(), DeviceFailure> {
     let (packed_bytes, scale_bytes, need) =
         nvfp4_matvec_bytes(shape).ok_or_else(invalid_argument)?;
-    if packed.bytes != packed_bytes
-        || scale.bytes != scale_bytes
+    if packed.bytes() != packed_bytes
+        || scale.bytes() != scale_bytes
         || x.len() != shape[1]
         || y.len() != shape[0]
         || !weight_scale_2.is_finite()
         || weight_scale_2 <= 0.0
         || !x.iter().all(|v| v.is_finite())
-        || packed.ptr == work.device.ptr
-        || scale.ptr == work.device.ptr
+        || packed.uses(work.device)
+        || scale.uses(work.device)
     {
         return Err(invalid_argument());
     }
@@ -1370,10 +1388,10 @@ pub(super) fn nvfp4_gemv(
     // outlives this synchronous call, which retains none of them.
     let status = unsafe {
         nvfp4_gemv_ws_raw(
-            packed.ptr.as_ptr(),
-            packed.bytes,
-            scale.ptr.as_ptr(),
-            scale.bytes,
+            packed.address(),
+            packed.bytes(),
+            scale.address(),
+            scale.bytes(),
             weight_scale_2,
             shape[0],
             shape[1],
@@ -1540,6 +1558,52 @@ pub(super) fn f8_gemv(
             codes.ptr.as_ptr(),
             codes.bytes,
             weight_scale,
+            shape[0],
+            shape[1],
+            x.as_ptr(),
+            need.x,
+            y.as_mut_ptr(),
+            need.y,
+            &workspace,
+            &mut stage,
+        )
+    };
+    checked(status, stage)
+}
+
+/// MXFP8 uses the same workspace as E4M3 F8 and one E8M0 byte per 32 columns.
+pub(super) fn mxfp8_gemv(
+    codes: RawRange<'_>,
+    scales: RawRange<'_>,
+    shape: [usize; 2],
+    work: Work<'_>,
+    x: &[f32],
+    y: &mut [f32],
+) -> Result<(), DeviceFailure> {
+    let (codes_bytes, need) = f8_matvec_bytes(shape).ok_or_else(invalid_argument)?;
+    if codes.bytes() != codes_bytes
+        || !shape[1].is_multiple_of(32)
+        || scales.bytes() != codes_bytes / 32
+        || x.len() != shape[1]
+        || y.len() != shape[0]
+        || !x.iter().all(|value| value.is_finite())
+        || codes.uses(work.device)
+        || scales.uses(work.device)
+    {
+        return Err(invalid_argument());
+    }
+
+    let workspace = workspace_raw(&work, need).ok_or_else(invalid_argument)?;
+    let mut stage = STAGE_NONE;
+    // SAFETY: the checked extents bound both read-only weight regions.
+    // workspace_raw validates the aligned, disjoint scratch regions. The
+    // synchronous call borrows x and y for exactly their checked extents.
+    let status = unsafe {
+        mxfp8_gemv_ws_raw(
+            codes.address(),
+            codes.bytes(),
+            scales.address(),
+            scales.bytes(),
             shape[0],
             shape[1],
             x.as_ptr(),

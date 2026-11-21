@@ -1,10 +1,5 @@
-//! The dense half-precision matvec of the Flash-Next step on the device. Its one user is the PLE
-//! block: the key projection `[10240, 2560]` and the value projection `[2560, 2560]`, stored F16 in
-//! the EXL3 pack, once per token in the layer that has the block. The host matvec of the same
-//! projections measures 2.6 to 3.4 ms a token (p99 7 to 14 ms; the S2 feeds bench) against about 0.07 ms on the device. The
-//! DeltaNet `b` and `a` gates do not use it: they take the router's strided F32 dot, widened at
-//! upload, as Qwen3.6's gates do. BF16 weights (the official checkpoint) are accepted. The formula
-//! and the layouts are in `native/resident/dense_gemv.h`.
+//! Shared matrix-vector projection for F16, BF16 and original packed GGUF weights.
+//! Activations and results stay in device buffers between launches.
 //!
 //! [`CudaContext::dense_gemv`] queues one kernel on a [`DeviceStream`] and returns. It allocates
 //! nothing, copies nothing and never synchronizes; a fault in the queued work surfaces at the next
@@ -13,17 +8,13 @@
 //! Every refusal is a `BadRequest` and happens before any native call, because a status from the
 //! native layer other than an allocation failure latches the backend terminal. A refused call
 //! changes nothing.
-#![cfg_attr(
-    not(test),
-    expect(dead_code, reason = "staged for the Flash-Next CUDA step")
-)]
 
 use crate::EngError;
 use crate::kernels::cuda::context::{Claim, require_apart, require_fit};
 pub(crate) use crate::kernels::cuda::native::resident::dense_gemv::{DenseDtype, DenseGemvBytes};
 use crate::kernels::cuda::native::resident::dense_gemv::{
     DenseGemvRaw, GEMV_MAX_COLS, GEMV_MAX_LD, GEMV_MAX_M, GEMV_MAX_ROWS, GemvDims,
-    dense_gemv_launch, gemv_need,
+    dense_gemv_launch, gemv_need, typed_gemv_need,
 };
 use crate::kernels::cuda::{CudaContext, DeviceRange, DeviceStream};
 
@@ -71,15 +62,17 @@ pub(crate) struct DenseGemvCall<'b> {
     pub(crate) y: DeviceRange<'b>,
 }
 
-/// The bytes each range of a launch of `shape` must hold.
+/// Buffer sizes for a dense F16 or BF16 matrix of this shape.
 pub(crate) fn dense_gemv_bytes(shape: DenseGemvShape) -> Result<DenseGemvBytes, EngError> {
-    gemv_need(shape.dims()).ok_or_else(|| {
-        EngError::BadRequest(format!(
-            "the CUDA dense matvec takes 1 to {GEMV_MAX_M} rows of activations, 1 to \
+    gemv_need(shape.dims()).ok_or_else(|| invalid_shape(shape))
+}
+
+fn invalid_shape(shape: DenseGemvShape) -> EngError {
+    EngError::BadRequest(format!(
+        "the CUDA dense matvec takes 1 to {GEMV_MAX_M} rows of activations, 1 to \
              {GEMV_MAX_ROWS} weight rows, 1 to {GEMV_MAX_COLS} columns and strides from the row \
              width to {GEMV_MAX_LD}, got {shape:?}"
-        ))
-    })
+    ))
 }
 
 impl CudaContext {
@@ -99,7 +92,8 @@ impl CudaContext {
     }
 
     fn plan_dense_gemv<'b>(&self, call: &DenseGemvCall<'b>) -> Result<DenseGemvRaw<'b>, EngError> {
-        let need = dense_gemv_bytes(call.shape)?;
+        let need = typed_gemv_need(call.shape.dims(), call.dtype)
+            .ok_or_else(|| invalid_shape(call.shape))?;
         require_fit("w", &call.w, need.w, 2)?;
         require_fit("x", &call.x, need.x, 4)?;
         require_fit("y", &call.y, need.y, 4)?;
@@ -115,6 +109,9 @@ impl CudaContext {
         })
     }
 }
+
+mod moe;
+pub(crate) use moe::{GgufMoeCall, GgufMoePick, GgufMoeShape};
 
 #[cfg(all(test, feature = "native-cuda"))]
 mod tests;

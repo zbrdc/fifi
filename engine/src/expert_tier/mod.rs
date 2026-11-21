@@ -41,6 +41,8 @@ mod stream_nvfp4;
 
 pub use cpu::{CpuExpertKernel, CpuTier, ExpertPick, map_read_only};
 pub use overlap::{Overlap, run_overlapped};
+#[cfg(all(feature = "native-cuda", target_os = "linux"))]
+pub(crate) use plan::expert_cache_reserve;
 pub use plan::{
     ExpertPayload, ExpertPayloadSource, ExpertPayloadView, GpuExpertStore, GpuLayerPlan,
     VRAM_HEADROOM_BYTES, auto_fit_gpu_layers, place_gpu_layers,
@@ -49,7 +51,7 @@ pub use report::{TierReport, TokenSplit};
 pub use residency::{Coverage, Placement, Residency};
 pub use stream::StreamBankPlan;
 #[cfg(all(feature = "native-cuda", target_os = "linux"))]
-pub(crate) use stream_cuda::CudaStreamBanks;
+pub(crate) use stream_cuda::{CudaBankLease, CudaStreamBanks};
 #[cfg(all(feature = "native-cuda", target_os = "linux"))]
 pub(crate) use stream_nvfp4::launch_device_input as project_nvfp4_batch_device;
 #[cfg(all(feature = "native-cuda", target_os = "linux"))]

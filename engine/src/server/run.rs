@@ -585,6 +585,43 @@ fn start_gemma4(
     )))
 }
 
+fn start_inkling2(
+    config: &EngineConfig,
+    prefix_reuse: bool,
+    ready_note: ReadyNote,
+) -> Result<StartedEngine, EngError> {
+    use crate::family::inkling2;
+    let backend = inkling2::TextBackend::from_env()?
+        .ok_or_else(|| EngError::BadRequest(inkling2::enable_text_backend()))?;
+    #[cfg(target_pointer_width = "64")]
+    {
+        let context_limit = inkling2::text_context()?;
+        let (engine, bundle) = inkling2::start_engine(
+            backend,
+            &config.model_dir,
+            &config.tokenizer_dir,
+            inkling2::TextSettings {
+                context: context_limit,
+                prefix_reuse,
+            },
+            ready_note,
+        )?;
+        Ok(StartedEngine {
+            engine,
+            bundle: Arc::new(bundle),
+            context_limit,
+            effective: Vec::new(),
+        })
+    }
+    #[cfg(not(target_pointer_width = "64"))]
+    {
+        let _ = (backend, config, ready_note, prefix_reuse);
+        Err(EngError::BadRequest(
+            "Inkling text serving requires a 64-bit build".into(),
+        ))
+    }
+}
+
 /// The closed registry of families this build starts. Staged backends
 /// refuse inside their starter before model or tokenizer reads; the
 /// config gate owns the unknown-family rejection text.
@@ -598,6 +635,7 @@ const FAMILY_STARTERS: &[(&str, Starter, bool)] = &[
     (q36_factory::DENSE_FAMILY, start_q36, true),
     (nemotron_factory::FAMILY, start_nemotron, false),
     (gemma4::FAMILY, start_gemma4, false),
+    (crate::family::inkling2::FAMILY, start_inkling2, false),
     (fake::FAMILY, start_fake, false),
 ];
 

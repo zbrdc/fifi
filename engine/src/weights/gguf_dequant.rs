@@ -19,8 +19,8 @@
 
 use super::gguf::GgufType;
 use super::gguf_tables::{
-    IQ2S_GRID, IQ2XS_GRID, IQ2XXS_GRID, IQ3S_GRID, IQ3XXS_GRID, KMASK_IQ2XS, KSIGNS_IQ2XS,
-    KVALUES_IQ4NL,
+    IQ1S_GRID, IQ2S_GRID, IQ2XS_GRID, IQ2XXS_GRID, IQ3S_GRID, IQ3XXS_GRID, KMASK_IQ2XS,
+    KSIGNS_IQ2XS, KVALUES_IQ4NL,
 };
 use crate::EngError;
 
@@ -131,6 +131,22 @@ fn scale_min_k4(j: usize, q: &[u8]) -> (u8, u8) {
     }
 }
 
+fn q2_k(b: &[u8], y: &mut [f32]) {
+    let d = rd_f16(b, 80);
+    let dmin = rd_f16(b, 82);
+    for (group, out) in y.as_chunks_mut::<16>().0.iter_mut().enumerate() {
+        let scale = b[group];
+        let step = d * f32::from(scale & 15);
+        let min = dmin * f32::from(scale >> 4);
+        // Two groups share a shift in each 32-byte packed half-block.
+        let offset = 16 + 32 * (group / 8) + 16 * (group % 2);
+        let shift = 2 * ((group % 8) / 2);
+        for (dst, &packed) in out.iter_mut().zip(&b[offset..][..16]) {
+            *dst = step * f32::from((packed >> shift) & 3) - min;
+        }
+    }
+}
+
 /// Q3_K, decoded per value index from the published block layout; no ggml
 /// loop nest or register shuffle is transcribed. The 110-byte block is 32
 /// `hmask` bytes at +0, 64 `qs` bytes at +32, 12 packed 6-bit sub-scale
@@ -230,6 +246,47 @@ fn q6_k(b: &[u8], y: &mut [f32]) {
             out[l + 32] = d * f32::from(sc[is + 2] as i8) * q2 as f32;
             out[l + 64] = d * f32::from(sc[is + 4] as i8) * q3 as f32;
             out[l + 96] = d * f32::from(sc[is + 6] as i8) * q4 as f32;
+        }
+    }
+}
+
+fn iq1_grid(index: usize, delta: f32, scale: f32, values: &mut [f32; 8]) {
+    let grid = IQ1S_GRID[index];
+    for (lane, value) in values.iter_mut().enumerate() {
+        let code = (grid >> (2 * lane)) & 3;
+        *value = scale * (f32::from(code) - 1.0 + delta);
+    }
+}
+
+fn iq1_s(b: &[u8], y: &mut [f32]) {
+    let scale = rd_f16(b, 0);
+    for (group, row) in y.as_chunks_mut::<32>().0.iter_mut().enumerate() {
+        let high = rd_u16(b, 34 + 2 * group);
+        let d = scale * f32::from(2 * ((high >> 12) & 7) + 1);
+        let delta = if high & 0x8000 == 0 { 0.125 } else { -0.125 };
+        for (segment, values) in row.as_chunks_mut::<8>().0.iter_mut().enumerate() {
+            let low = usize::from(b[2 + 4 * group + segment]);
+            let index = low | (usize::from((high >> (3 * segment)) & 7) << 8);
+            iq1_grid(index, delta, d, values);
+        }
+    }
+}
+
+fn iq1_m(b: &[u8], y: &mut [f32]) {
+    let scales = [rd_u16(b, 48), rd_u16(b, 50), rd_u16(b, 52), rd_u16(b, 54)];
+    // The high nibble of each scale word contributes to the block's FP16 scale.
+    let bits = scales.iter().enumerate().fold(0, |bits, (word, &packed)| {
+        bits | ((packed >> 12) << (4 * word))
+    });
+    let scale = f16_to_f32(bits);
+    for (group, row) in y.as_chunks_mut::<32>().0.iter_mut().enumerate() {
+        let packed_scales = scales[group / 2] >> (6 * (group % 2));
+        for (segment, values) in row.as_chunks_mut::<8>().0.iter_mut().enumerate() {
+            let high = b[32 + 2 * group + segment / 2] >> (4 * (segment % 2));
+            let index = usize::from(b[4 * group + segment]) | (usize::from(high & 7) << 8);
+            let delta = if high & 8 == 0 { 0.125 } else { -0.125 };
+            let multiplier = (packed_scales >> (3 * (segment / 2))) & 7;
+            iq1_grid(index, delta, scale * f32::from(2 * multiplier + 1), values);
         }
     }
 }
@@ -360,6 +417,22 @@ fn iq4_xs(b: &[u8], y: &mut [f32]) {
     }
 }
 
+fn mxfp4(b: &[u8], y: &mut [f32]) {
+    // The GGML E2M1 table uses doubled integer values, so halve the E8M0 scale.
+    const VALUES: [i8; 16] = [0, 1, 2, 3, 4, 6, 8, 12, 0, -1, -2, -3, -4, -6, -8, -12];
+    let exponent = u32::from(b[0]);
+    let scale = f32::from_bits(if exponent < 2 {
+        0x0020_0000 << exponent
+    } else {
+        (exponent - 1) << 23
+    });
+    let (low, high) = y.split_at_mut(16);
+    for ((lo, hi), &packed) in low.iter_mut().zip(high).zip(&b[1..]) {
+        *lo = f32::from(VALUES[usize::from(packed & 15)]) * scale;
+        *hi = f32::from(VALUES[usize::from(packed >> 4)]) * scale;
+    }
+}
+
 fn nvfp4(b: &[u8], y: &mut [f32]) {
     // The GGUF integer-value convention makes code 8 positive zero.
     const VALUES: [f32; 16] = [
@@ -388,13 +461,17 @@ fn plan(ty: GgufType, src_len: usize) -> Result<(Decoder, usize, usize, usize), 
     let decode: Decoder = match ty {
         GgufType::Q20 => q2_0,
         GgufType::Q40 => q4_0,
+        GgufType::Q2K => q2_k,
         GgufType::Q3K => q3_k,
         GgufType::Q4K => q4_k,
         GgufType::Q50 => q5_0,
         GgufType::Q5K => q5_k,
         GgufType::Q6K => q6_k,
         GgufType::Q80 => q8_0,
+        GgufType::Mxfp4 => mxfp4,
         GgufType::Nvfp4 => nvfp4,
+        GgufType::Iq1S => iq1_s,
+        GgufType::Iq1M => iq1_m,
         GgufType::Iq2Xxs => iq2_xxs,
         GgufType::Iq2Xs => iq2_xs,
         GgufType::Iq2S => iq2_s,
@@ -444,6 +521,30 @@ pub fn dequantize_into(ty: GgufType, src: &[u8], dst: &mut [f32]) -> Result<(), 
         decode(b, y);
     }
     Ok(())
+}
+
+/// Project the first `rows` of a little-endian F32 GGUF matrix. The ordered
+/// products are accumulated directly from the mapped row without a decoded copy.
+pub(crate) fn project_f32_rows(src: &[u8], x: &[f32], rows: usize) -> Result<Vec<f32>, EngError> {
+    let row_bytes = x
+        .len()
+        .checked_mul(size_of::<f32>())
+        .ok_or_else(|| bad("F32 row size"))?;
+    if row_bytes == 0 || !src.len().is_multiple_of(row_bytes) || rows > src.len() / row_bytes {
+        return Err(bad("invalid F32 matrix extent"));
+    }
+    Ok(src
+        .chunks_exact(row_bytes)
+        .take(rows)
+        .map(|row| {
+            row.as_chunks::<4>()
+                .0
+                .iter()
+                .zip(x)
+                .map(|(w, &value)| f32::from_le_bytes(*w) * value)
+                .sum()
+        })
+        .collect())
 }
 
 /// Decodes one NVFP4 expert and applies its little-endian F32 tensor scale.
@@ -541,6 +642,53 @@ pub fn dequantize(ty: GgufType, src: &[u8]) -> Result<Vec<f32>, EngError> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn mapped_f32_projection_matches_the_decoded_rows_bit_for_bit() {
+        use super::*;
+        let x: Vec<_> = (0..23).map(|i| (3.25 - i as f32) / 13.0).collect();
+        let bytes: Vec<_> = (0..5 * x.len())
+            .flat_map(|i| ((i % 19) as f32 / 7.0 - 1.125).to_le_bytes())
+            .collect();
+        let want: Vec<_> = bytes
+            .chunks_exact(x.len() * 4)
+            .take(3)
+            .map(|row| {
+                let decoded = dequantize(GgufType::F32, row).unwrap();
+                x.iter()
+                    .zip(decoded)
+                    .map(|(&a, b)| a * b)
+                    .sum::<f32>()
+                    .to_bits()
+            })
+            .collect();
+        let got = project_f32_rows(&bytes, &x, 3).unwrap();
+        assert_eq!(got.into_iter().map(f32::to_bits).collect::<Vec<_>>(), want);
+        assert!(project_f32_rows(&bytes[..bytes.len() - 1], &x, 3).is_err());
+        assert!(project_f32_rows(&bytes, &x, 6).is_err());
+    }
+
+    #[test]
+    fn iq1_s_matches_the_reference_grid_scales_and_signs() {
+        let mut block = std::array::from_fn::<_, 50, _>(|i| (i * 37 + 11) as u8);
+        block[..2].copy_from_slice(&0x3c00u16.to_le_bytes());
+        let mut weights = [0.0; 256];
+        super::dequantize_into(super::GgufType::Iq1S, &block, &mut weights).unwrap();
+        assert_eq!(
+            weights[..8],
+            [-2.625, 0.375, 3.375, 3.375, 3.375, 0.375, 3.375, 0.375]
+        );
+        assert_eq!(
+            weights[112..120],
+            [
+                -1.875, -1.875, -16.875, -16.875, -16.875, -16.875, -1.875, -1.875
+            ]
+        );
+        assert_eq!(
+            weights[248..],
+            [-4.375, 5.625, 0.625, 0.625, -4.375, -4.375, 0.625, -4.375]
+        );
+    }
+
     use super::*;
 
     #[test]

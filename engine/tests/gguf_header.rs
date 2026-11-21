@@ -40,6 +40,7 @@ const TYPES: &[(u32, &str, u64, u64)] = &[
     (28, "F64", 1, 8),
     (29, "IQ1_M", 256, 56),
     (30, "BF16", 1, 2),
+    (39, "MXFP4", 32, 17),
     (40, "NVFP4", 64, 36),
     (42, "Q2_0", 64, 18),
 ];
@@ -164,23 +165,7 @@ fn type_table_matches_the_pinned_reference() {
 
 #[test]
 fn unknown_or_unsupported_type_ids_are_errors() {
-    for id in [
-        4,
-        5,
-        9,
-        15,
-        31,
-        32,
-        33,
-        34,
-        35,
-        36,
-        39,
-        41,
-        43,
-        1000,
-        u32::MAX,
-    ] {
+    for id in [4, 5, 9, 15, 31, 32, 33, 34, 35, 36, 41, 43, 1000, u32::MAX] {
         match GgufType::from_id(id) {
             Err(EngError::Checkpoint(m)) => assert!(
                 m.contains(&format!("unknown or unsupported tensor type id {id}")),

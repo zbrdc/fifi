@@ -5,6 +5,7 @@
 use crate::family::flash_next::{factory::FAMILY as FLASH_FAMILY, settings::FlashOptions};
 use crate::family::flint::{FAMILY as FLINT_FAMILY, settings::FlintOptions};
 use crate::family::gemma4::FAMILY as GEMMA4_FAMILY;
+use crate::family::inkling2::FAMILY as INKLING2_FAMILY;
 use crate::family::{
     nemotron35::factory::{FAMILY as NEMOTRON_FAMILY, NemotronOptions},
     qwen36::{
@@ -29,7 +30,7 @@ impl std::fmt::Display for StartupError {
 impl std::error::Error for StartupError {}
 
 /// The family names that this build recognizes, including staged backends.
-pub(crate) const FAMILIES: [&str; 7] = [
+pub(crate) const FAMILIES: [&str; 8] = [
     FAKE_FAMILY,
     FLASH_FAMILY,
     Q36_FAMILY,
@@ -37,6 +38,7 @@ pub(crate) const FAMILIES: [&str; 7] = [
     FLINT_FAMILY,
     NEMOTRON_FAMILY,
     GEMMA4_FAMILY,
+    INKLING2_FAMILY,
 ];
 
 const FAKE_FAMILY: &str = super::fake::FAMILY;
