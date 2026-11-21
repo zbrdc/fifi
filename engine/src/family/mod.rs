@@ -49,6 +49,7 @@ pub(in crate::family) mod graph_state;
 // build (the admission fits need the cgroup-aware probe) and the test build.
 #[cfg(any(test, target_os = "linux"))]
 pub(crate) mod host_admit;
+pub mod inkling2_mini;
 pub mod keys;
 pub(crate) mod kv_format;
 #[cfg(any(

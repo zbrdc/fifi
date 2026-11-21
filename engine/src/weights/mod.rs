@@ -44,6 +44,7 @@ pub use gguf_dequant::{
 };
 pub(crate) use gguf_weights::{GgufLimits, GgufWeights};
 pub use indexed::IndexedWeights;
+pub(crate) use shard::read_stored_header;
 pub use shard::{HeaderEntry, ShardHeader};
 pub use tiered::{LoadLimits, ShardIo, TieredWeights};
 

@@ -41,15 +41,17 @@ pub struct GgufFact {
     /// `general.architecture` from the header, when it is a string.
     pub architecture: Option<String>,
     pub tensor_count: usize,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub inkling2_loop:
+        Option<Result<crate::family::inkling2_mini::gguf_metadata::Geometry, String>>,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize)]
 pub struct ModelInspection {
     pub model_dir: PathBuf,
     pub files: Vec<FileFact>,
-    /// Every `.gguf` file, parsed header-first. `None` inside the vector
-    /// is impossible: an unparseable GGUF lands in `gguf_errors` instead,
-    /// with the parser's own message.
+    /// Parsed `.gguf` files and Inkling mainline `.gguf_file` artifacts. Files
+    /// that fail to parse appear in `gguf_errors` with the parser's message.
     pub gguf_files: Vec<GgufFact>,
     pub gguf_errors: Vec<String>,
     pub safetensors_files: usize,
@@ -109,7 +111,7 @@ pub fn inspect(model_dir: &Path, tokenizer_dir: &Path) -> Result<ModelInspection
     let mut safetensors_files = 0usize;
     let mut safetensors_bytes = 0u64;
     for file in &files {
-        if file.name.ends_with(".gguf") {
+        if file.name.ends_with(".gguf") || file.name.ends_with(".gguf_file") {
             match gguf_fact(&model_dir.join(&file.name), file.bytes) {
                 Ok(mut fact) => {
                     fact.file.clone_from(&file.name);
@@ -167,11 +169,25 @@ fn gguf_fact(path: &Path, file_bytes: u64) -> Result<GgufFact, EngError> {
         Some(MetaValue::String(value)) => Some(value.clone()),
         _ => None,
     };
+    let inkling2_loop = (architecture.as_deref() == Some("inkling2_loop")).then(|| {
+        crate::family::inkling2_mini::gguf_metadata::inspect(&header, &mut reader)
+            .map_err(|error| super::describe_error(&error))
+    });
+    if path
+        .extension()
+        .is_some_and(|extension| extension == "gguf_file")
+        && inkling2_loop.is_none()
+    {
+        return Err(checkpoint(
+            ".gguf_file requires the inkling2_loop architecture".into(),
+        ));
+    }
     Ok(GgufFact {
         file: String::new(),
         file_bytes,
         architecture,
         tensor_count: header.tensors().len(),
+        inkling2_loop,
     })
 }
 

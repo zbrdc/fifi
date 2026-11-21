@@ -168,6 +168,9 @@ pub enum QuantizationMode {
     Affine,
     Mxfp4,
     Mxfp8,
+    /// E2M1 payload and E4M3 group scales. A checkpoint's outer expert multipliers
+    /// are separate from this packed representation.
+    Nvfp4,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -182,7 +185,7 @@ impl QuantizationSpec {
     pub(crate) fn validate(&self) -> Result<(), EngError> {
         let bits_ok = match self.mode {
             QuantizationMode::Affine => matches!(self.bits, 2..=6 | 8),
-            QuantizationMode::Mxfp4 => self.bits == 4,
+            QuantizationMode::Mxfp4 | QuantizationMode::Nvfp4 => self.bits == 4,
             QuantizationMode::Mxfp8 => self.bits == 8,
         };
         if !bits_ok {
@@ -194,6 +197,7 @@ impl QuantizationSpec {
         let group_ok = match self.mode {
             QuantizationMode::Affine => matches!(self.group_size, 32 | 64 | 128),
             QuantizationMode::Mxfp4 | QuantizationMode::Mxfp8 => self.group_size == 32,
+            QuantizationMode::Nvfp4 => self.group_size == 16,
         };
         if !group_ok {
             return Err(EngError::Checkpoint(format!(
@@ -260,22 +264,25 @@ mod tests {
         }
         spec(QuantizationMode::Mxfp4, 4, 32).validate().unwrap();
         spec(QuantizationMode::Mxfp8, 8, 32).validate().unwrap();
+        spec(QuantizationMode::Nvfp4, 4, 16).validate().unwrap();
     }
 
     #[test]
     fn validate_names_the_rejected_field() {
-        use QuantizationMode::{Affine, Mxfp4, Mxfp8};
+        use QuantizationMode::{Affine, Mxfp4, Mxfp8, Nvfp4};
         for (candidate, field) in [
             (spec(Affine, 0, 64), "bits"),
             (spec(Affine, 7, 64), "bits"),
             (spec(Affine, u32::MAX, 64), "bits"),
             (spec(Mxfp4, 8, 32), "bits"),
             (spec(Mxfp8, 4, 32), "bits"),
+            (spec(Nvfp4, 8, 16), "bits"),
             (spec(Affine, 4, 0), "group_size"),
             (spec(Affine, 4, 16), "group_size"),
             (spec(Affine, 4, 256), "group_size"),
             (spec(Mxfp4, 4, 64), "group_size"),
             (spec(Mxfp8, 8, 128), "group_size"),
+            (spec(Nvfp4, 4, 32), "group_size"),
         ] {
             let Err(EngError::Checkpoint(message)) = candidate.validate() else {
                 panic!("{candidate:?} must fail");

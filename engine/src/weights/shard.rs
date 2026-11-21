@@ -38,34 +38,18 @@ impl ShardHeader {
         byte_len: u64,
         max_header_bytes: u64,
     ) -> Result<Self, EngError> {
-        if byte_len < 8 {
-            return Err(EngError::Checkpoint(
-                "shard is shorter than the safetensors prefix".into(),
-            ));
-        }
-        let header_len = read_prefix(reader)?;
-        if header_len > max_header_bytes {
-            return Err(EngError::MemoryPlan(format!(
-                "shard header length {header_len} exceeds the header budget {max_header_bytes}"
-            )));
-        }
-        let header_len = usize::try_from(header_len).map_err(|_| {
-            EngError::MemoryPlan(format!(
-                "shard header length {header_len} does not fit the platform word size"
-            ))
-        })?;
-        let data_start = (8u64)
-            .checked_add(header_len as u64)
-            .ok_or_else(|| EngError::Checkpoint("shard header length overflows".into()))?;
-        if data_start > byte_len {
-            return Err(EngError::Checkpoint(format!(
-                "shard header length {header_len} exceeds the shard byte length {byte_len}"
-            )));
-        }
-        let json = read_header(reader, header_len)?;
-        let value = parse_header_json(&json, "shard header")?;
-        let entries = parse_entries(&value)?;
-        from_entries(entries, data_start, byte_len)
+        let (data_start, entries) = read_stored_header(reader, byte_len, max_header_bytes)?;
+        let entries = entries
+            .into_iter()
+            .map(|(name, info)| {
+                let converted = convert_entry(&name, &info)?;
+                Ok((name, converted))
+            })
+            .collect::<Result<BTreeMap<_, _>, EngError>>()?;
+        Ok(Self {
+            data_start,
+            entries,
+        })
     }
 
     pub fn data_start(&self) -> u64 {
@@ -81,6 +65,43 @@ impl ShardHeader {
             .iter()
             .map(|(key, entry)| (key.as_str(), entry))
     }
+}
+
+/// Safetensors storage metadata, preserving float8 encodings for format-specific loaders.
+pub(crate) fn read_stored_header<R: Read + ?Sized>(
+    reader: &mut R,
+    byte_len: u64,
+    max_header_bytes: u64,
+) -> Result<(u64, Vec<(String, TensorInfo)>), EngError> {
+    if byte_len < 8 {
+        return Err(EngError::Checkpoint(
+            "shard is shorter than the safetensors prefix".into(),
+        ));
+    }
+    let header_len = read_prefix(reader)?;
+    if header_len > max_header_bytes {
+        return Err(EngError::MemoryPlan(format!(
+            "shard header length {header_len} exceeds the header budget {max_header_bytes}"
+        )));
+    }
+    let header_len = usize::try_from(header_len).map_err(|_| {
+        EngError::MemoryPlan(format!(
+            "shard header length {header_len} does not fit the platform word size"
+        ))
+    })?;
+    let data_start = (8u64)
+        .checked_add(header_len as u64)
+        .ok_or_else(|| EngError::Checkpoint("shard header length overflows".into()))?;
+    if data_start > byte_len {
+        return Err(EngError::Checkpoint(format!(
+            "shard header length {header_len} exceeds the shard byte length {byte_len}"
+        )));
+    }
+    let json = read_header(reader, header_len)?;
+    let value = parse_header_json(&json, "shard header")?;
+    let entries = parse_entries(&value)?;
+    validate_extent(&entries, data_start, byte_len)?;
+    Ok((data_start, entries))
 }
 
 fn read_prefix<R: Read + ?Sized>(reader: &mut R) -> Result<u64, EngError> {
@@ -116,12 +137,12 @@ fn parse_entries(value: &serde_json::Value) -> Result<Vec<(String, TensorInfo)>,
     Ok(entries)
 }
 
-fn from_entries(
-    entries: Vec<(String, TensorInfo)>,
+fn validate_extent(
+    entries: &[(String, TensorInfo)],
     data_start: u64,
     byte_len: u64,
-) -> Result<ShardHeader, EngError> {
-    let metadata = Metadata::new(None, entries.clone())
+) -> Result<(), EngError> {
+    let metadata = Metadata::new(None, entries.to_vec())
         .map_err(|e| EngError::Checkpoint(format!("shard header validation failed: {e}")))?;
     let data_len = u64::try_from(metadata.data_len())
         .map_err(|_| EngError::MemoryPlan("shard data length does not fit u64".into()))?;
@@ -133,15 +154,7 @@ fn from_entries(
             "shard byte length {byte_len} does not match the data section end {data_end}"
         )));
     }
-    let mut map = BTreeMap::new();
-    for (name, info) in &entries {
-        let converted = convert_entry(name, info)?;
-        map.insert(name.clone(), converted);
-    }
-    Ok(ShardHeader {
-        data_start,
-        entries: map,
-    })
+    Ok(())
 }
 
 fn convert_entry(name: &str, info: &TensorInfo) -> Result<HeaderEntry, EngError> {

@@ -605,6 +605,10 @@ pub struct MlxKernels {
 }
 
 impl MlxKernels {
+    pub(crate) fn check_ready(&self) -> Result<(), EngError> {
+        self.context.check_ready()
+    }
+
     pub fn owner_key(&self) -> crate::tensor::OwnerKey {
         self.context.owner_key()
     }
@@ -1141,6 +1145,35 @@ impl MlxKernels {
     ) -> Result<ExecutionTensor, EngError> {
         self.context
             .gather_qmm_bounded(x, stack, indices.ids(), indices.bound())
+    }
+
+    /// Applies packed NVFP4 expert weights and the selected experts' F32 outer
+    /// multipliers. Scaling stays on the device and uses the same bound as the
+    /// gather. F32 activations keep the unscaled accumulation in F32.
+    pub(crate) fn gather_nvfp4(
+        &mut self,
+        x: &ExecutionTensor,
+        stack: &ResidentPackedWeight,
+        indices: &BoundedIndices,
+        outer_multipliers: &ExecutionTensor,
+    ) -> Result<ExecutionTensor, EngError> {
+        let [experts, _, _] = stack.logical_shape() else {
+            return Err(bad_request("NVFP4 expert stack must be rank three"));
+        };
+        if stack.quantization().mode != QuantizationMode::Nvfp4
+            || x.dtype() != Dtype::F32
+            || outer_multipliers.dtype() != Dtype::F32
+            || outer_multipliers.shape() != [*experts]
+            || outer_multipliers.owner_key() != self.owner_key()
+        {
+            return Err(bad_request(
+                "scaled expert gather requires NVFP4 weights, F32 activations and one F32 multiplier per expert",
+            ));
+        }
+        let result = self.gather_qmm_bounded(x, stack, indices)?;
+        let multipliers = self.take_bounded(outer_multipliers, indices, 0)?;
+        let multipliers = self.reshape(&multipliers, &[indices.ids().shape()[0], 1, 1])?;
+        self.binary(BinaryOp::Mul, &result, &multipliers)
     }
 
     /// `gather_qmm_bounded` with MLX's `sorted_indices` flag set: the checks, the sortedness
@@ -2121,6 +2154,33 @@ impl MlxKernels {
         self.context.act_mul(g_in, u_in)
     }
 
+    pub(crate) fn inkling_activation(
+        &mut self,
+        gate_up: &ExecutionTensor,
+        weights: &ExecutionTensor,
+        quantization: Option<QuantizationMode>,
+    ) -> Result<ExecutionTensor, EngError> {
+        self.context
+            .inkling_activation(gate_up, weights, quantization)
+    }
+
+    pub(crate) fn inkling_quantized_rows(
+        &mut self,
+        input: &ExecutionTensor,
+        mode: QuantizationMode,
+    ) -> Result<ExecutionTensor, EngError> {
+        self.context.inkling_quantized_rows(input, mode)
+    }
+
+    pub(crate) fn inkling_merge(
+        &mut self,
+        down: &ExecutionTensor,
+        rows: u32,
+        picks: u32,
+    ) -> Result<ExecutionTensor, EngError> {
+        self.context.inkling_merge(down, rows, picks)
+    }
+
     /// The moe_combine fused kernel: the un-sort, gate, choice sum, shared fold, cast.
     #[allow(clippy::too_many_arguments)]
     pub fn moe_combine(
@@ -2405,6 +2465,7 @@ impl Prepared {
             ),
             QuantizationMode::Mxfp4 => (c"mxfp4", None, None, ScaleStorage::Uint8),
             QuantizationMode::Mxfp8 => (c"mxfp8", None, None, ScaleStorage::Uint8),
+            QuantizationMode::Nvfp4 => (c"nvfp4", None, None, ScaleStorage::Uint8),
         };
         if activation.dtype() != Dtype::F32 {
             return Err(bad_request("activation dtype must be F32"));
@@ -2427,7 +2488,7 @@ impl Prepared {
                     bad_request("affine weights require additive biases")
                 })?)?)
             }
-            QuantizationMode::Mxfp4 | QuantizationMode::Mxfp8 => None,
+            QuantizationMode::Mxfp4 | QuantizationMode::Mxfp8 | QuantizationMode::Nvfp4 => None,
         };
         let scales = match scales_storage {
             ScaleStorage::Float32 => StagedBytes::from_f32(&float_values(weight.scales())?)?,
@@ -2655,6 +2716,7 @@ fn quant_args(spec: QuantizationSpec) -> Result<QuantArgs, EngError> {
         QuantizationMode::Affine => (c"affine", Some(spec.group_size), Some(spec.bits)),
         QuantizationMode::Mxfp4 => (c"mxfp4", None, None),
         QuantizationMode::Mxfp8 => (c"mxfp8", None, None),
+        QuantizationMode::Nvfp4 => (c"nvfp4", None, None),
     };
     Ok(QuantArgs {
         group_size: group_size
@@ -2680,7 +2742,9 @@ fn packed_stages(
                 bad_request("affine weights require additive biases")
             })?)?),
         ),
-        QuantizationMode::Mxfp4 | QuantizationMode::Mxfp8 => (stage_raw(weight.scales())?, None),
+        QuantizationMode::Mxfp4 | QuantizationMode::Mxfp8 | QuantizationMode::Nvfp4 => {
+            (stage_raw(weight.scales())?, None)
+        }
     };
     Ok((payload, scales, biases))
 }

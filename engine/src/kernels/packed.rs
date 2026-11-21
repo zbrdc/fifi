@@ -69,7 +69,9 @@ impl PackedWeight {
             ));
         }
         if quantization.mode != QuantizationMode::Affine && scales.dtype() != Dtype::U8 {
-            return Err(EngError::Checkpoint("MXFP scales dtype must be U8".into()));
+            return Err(EngError::Checkpoint(
+                "packed floating-point scales dtype must be U8".into(),
+            ));
         }
         if quantization.mode == QuantizationMode::Affine {
             let biases = biases.as_ref().ok_or_else(|| {
@@ -83,7 +85,7 @@ impl PackedWeight {
         }
         if quantization.mode != QuantizationMode::Affine && biases.is_some() {
             return Err(EngError::Checkpoint(
-                "MXFP weights must not contain additive biases".into(),
+                "packed floating-point weights must not contain additive biases".into(),
             ));
         }
         expected_shape[last] = width / quantization.group_size;

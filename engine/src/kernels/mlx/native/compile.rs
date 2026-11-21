@@ -82,6 +82,11 @@ pub(crate) fn quant_triple(weight: &ResidentPackedWeight) -> Result<[i32; 3], En
             0,
             0,
         ),
+        QuantizationMode::Nvfp4 => {
+            return Err(EngError::BadRequest(
+                "compiled routing does not support NVFP4 expert multipliers".into(),
+            ));
+        }
     };
     let native = |name: &'static str, value: u32| {
         i32::try_from(value)

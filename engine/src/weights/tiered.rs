@@ -249,11 +249,11 @@ fn check_dtype(
     } else {
         match spec.mode {
             QuantizationMode::Affine => matches!(dtype, Dtype::F16 | Dtype::Bf16 | Dtype::F32),
-            // MXFP scales are U8 and the module has no biases (see `PackedWeight::try_new`).
-            QuantizationMode::Mxfp4 | QuantizationMode::Mxfp8 => {
+            // Packed floating-point group scales are U8 and these modules have no biases.
+            QuantizationMode::Mxfp4 | QuantizationMode::Mxfp8 | QuantizationMode::Nvfp4 => {
                 if key.ends_with(".biases") {
                     return Err(EngError::Checkpoint(format!(
-                        "shard {shard:?}: tensor {key:?}: MXFP modules have no biases"
+                        "shard {shard:?}: tensor {key:?}: packed floating-point modules have no biases"
                     )));
                 }
                 dtype == Dtype::U8 && key.ends_with(".scales")

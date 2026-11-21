@@ -612,6 +612,16 @@ unsafe extern "C" {
         source: *const c_char,
         stream: mlx_stream,
     ) -> i32;
+    #[link_name = "inference_mlx_inkling_expert_kernel"]
+    pub(super) fn mlx_inkling_expert_kernel(
+        output: *mut mlx_array,
+        projected: mlx_array,
+        route_weights: mlx_array,
+        dims: *const i32,
+        source: *const c_char,
+        header: *const c_char,
+        stream: mlx_stream,
+    ) -> i32;
     /// The router_topk fused kernel (Q36 decode MoE): the stable top-k selection and
     /// renormalized gates of one router probability row in ONE launch. `dims` holds
     /// [rows, experts, top_k, k_max, renorm]; `ids_shape`/`gates_shape` set the output ranks

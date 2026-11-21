@@ -229,6 +229,66 @@ fn evaluate(
     let mut checks = Vec::new();
     inventory_checks(inspection, &mut checks);
 
+    use crate::family::inkling2_mini;
+    if candidate
+        .family
+        .as_deref()
+        .is_none_or(|family| family == inkling2_mini::FAMILY)
+        && inspection
+            .gguf_files
+            .iter()
+            .any(|file| file.inkling2_loop.is_some())
+    {
+        for file in &inspection.gguf_files {
+            let Some(geometry) = &file.inkling2_loop else {
+                continue;
+            };
+            let (status, detail) = match geometry {
+                Ok(g) => (
+                    CheckStatus::Pass,
+                    format!(
+                        "single-file checkpoint, {} physical layers, {} layer visits ({} global, {} sliding-window), loop {}..{} x{}, hidden {}, {} of {} experts, context {}, window {}",
+                        g.physical_layers,
+                        g.logical_layers,
+                        g.global_layers,
+                        g.local_layers,
+                        g.core_start,
+                        g.core_end,
+                        g.passes,
+                        g.hidden_size,
+                        g.experts_per_token,
+                        g.experts,
+                        g.context_length,
+                        g.sliding_window,
+                    ),
+                ),
+                Err(error) => (CheckStatus::Fail, error.clone()),
+            };
+            checks.push(Check::new(
+                "Inkling 2 Mini GGUF layout",
+                status,
+                format!("{}: {detail}", file.file),
+            ));
+        }
+        return inkling2_mini_report(
+            model_dir,
+            tokenizer_dir,
+            checks,
+            Vec::new(),
+            "Inkling 2 Mini GGUF serving is unsupported",
+            "Use the GGUF header inventory to validate the checkpoint layout.",
+        );
+    }
+    if candidate.family.as_deref() == Some(inkling2_mini::FAMILY)
+        || (candidate.family.is_none()
+            && inspection
+                .config_model_types
+                .iter()
+                .any(|kind| kind == inkling2_mini::MODEL_TYPE))
+    {
+        return inkling2_mini_preflight(model_dir, tokenizer_dir, candidate, checks);
+    }
+
     let family = identify_family(inspection, candidate, &mut checks);
     let family_name = family.as_deref();
     if family_name == Some(crate::family::qwen36::factory::FAMILY) {
@@ -572,6 +632,80 @@ fn any_failed(checks: &[Check]) -> bool {
 
 fn any_warned(checks: &[Check]) -> bool {
     checks.iter().any(|c| c.status == CheckStatus::Warn)
+}
+
+/// Inkling's header plan is available before a serving backend is wired up.
+fn inkling2_mini_preflight(
+    model_dir: &Path,
+    tokenizer_dir: &Path,
+    candidate: &Candidate,
+    mut checks: Vec<Check>,
+) -> PreflightReport {
+    use crate::family::inkling2_mini;
+    let plan = if candidate.kv_dtype.as_deref().is_some_and(|kv| kv != "bf16") {
+        Err(crate::EngError::BadRequest(
+            "Inkling 2 Mini currently prices BF16 KV".into(),
+        ))
+    } else {
+        inkling2_mini::inspect(model_dir, candidate.context_limit)
+    };
+    let decisions = match plan {
+        Ok(rows) => {
+            checks.push(Check::new(
+                "Inkling 2 Mini expert layout",
+                CheckStatus::Pass,
+                "fixed-loop config, shard inventory and mixed expert layout verified from headers"
+                    .into(),
+            ));
+            rows
+        }
+        Err(error) => {
+            checks.push(Check::new(
+                "Inkling 2 Mini expert layout",
+                CheckStatus::Fail,
+                super::describe_error(&error),
+            ));
+            Vec::new()
+        }
+    };
+    inkling2_mini_report(
+        model_dir,
+        tokenizer_dir,
+        checks,
+        decisions,
+        "Inkling 2 Mini text execution is pending",
+        "Use the header plan to size the text executor and qualify it against the reference model.",
+    )
+}
+
+fn inkling2_mini_report(
+    model_dir: &Path,
+    tokenizer_dir: &Path,
+    mut checks: Vec<Check>,
+    decisions: Vec<PlanDecision>,
+    execution_detail: &str,
+    next_step: &str,
+) -> PreflightReport {
+    checks.push(Check::new(
+        "text execution",
+        CheckStatus::Fail,
+        execution_detail.into(),
+    ));
+    PreflightReport {
+        model_dir: model_dir.to_path_buf(),
+        tokenizer_dir: tokenizer_dir.to_path_buf(),
+        family: Some(crate::family::inkling2_mini::FAMILY.into()),
+        verdict: Verdict::Unsupported,
+        dimensions: Dimensions {
+            compatibility: Compatibility::Unsupported,
+            qualification: Qualification::Unverified,
+            resource_fit: ResourceFit::Unknown,
+        },
+        checks,
+        decisions,
+        estimate: None,
+        next_step: next_step.into(),
+    }
 }
 
 fn shallow_preflight(
@@ -2330,6 +2464,120 @@ mod tests {
             .iter()
             .find(|c| c.name == name)
             .unwrap_or_else(|| panic!("no check named {name} in {:?}", report.checks))
+    }
+
+    #[test]
+    fn inkling_mainline_gguf_reports_fixed_loop_without_safetensors() {
+        fn key(bytes: &mut Vec<u8>, name: &str, kind: u32) {
+            bytes.extend((name.len() as u64).to_le_bytes());
+            bytes.extend(name.as_bytes());
+            bytes.extend(kind.to_le_bytes());
+        }
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("Inkling-2-Mini-UD-Q4_K_M.gguf_file");
+        let numbers = [
+            ("block_count", 24u32),
+            ("loop.start", 6),
+            ("loop.end", 18),
+            ("loop.count", 3),
+            ("loop.gate_rank", 64),
+            ("embedding_length", 2304),
+            ("context_length", 1_048_576),
+            ("expert_feed_forward_length", 1152),
+            ("expert_count", 128),
+            ("expert_used_count", 8),
+            ("attention.key_length", 128),
+            ("attention.value_length", 128),
+            ("attention.key_length_swa", 128),
+            ("attention.value_length_swa", 128),
+            ("attention.sliding_window", 1024),
+        ];
+        let mut header = b"GGUF".to_vec();
+        header.extend(3u32.to_le_bytes());
+        header.extend(1u64.to_le_bytes());
+        header.extend((numbers.len() as u64 + 4).to_le_bytes());
+        key(&mut header, "general.architecture", 8);
+        let architecture = b"inkling2_loop";
+        header.extend((architecture.len() as u64).to_le_bytes());
+        header.extend(architecture);
+
+        for (name, value) in numbers {
+            key(&mut header, &format!("inkling2_loop.{name}"), 4);
+            header.extend(value.to_le_bytes());
+        }
+        for (name, count) in [("head_count", 24i32), ("head_count_kv", 8i32)] {
+            key(&mut header, &format!("inkling2_loop.attention.{name}"), 9);
+            header.extend(5u32.to_le_bytes());
+            header.extend(24u64.to_le_bytes());
+            for _ in 0..24 {
+                header.extend(count.to_le_bytes());
+            }
+        }
+        key(
+            &mut header,
+            "inkling2_loop.attention.sliding_window_pattern",
+            9,
+        );
+        header.extend(7u32.to_le_bytes());
+        header.extend(24u64.to_le_bytes());
+        let pattern_start = header.len();
+        header.extend((0..24).map(|layer| u8::from(layer % 6 != 5)));
+
+        // A single F32 tensor suffices to exercise inventory and range validation.
+        let tensor = b"output_norm.weight";
+        header.extend((tensor.len() as u64).to_le_bytes());
+        header.extend(tensor);
+        header.extend(1u32.to_le_bytes());
+        header.extend(1u64.to_le_bytes());
+        header.extend(0u32.to_le_bytes());
+        header.extend(0u64.to_le_bytes());
+        header.resize(header.len().next_multiple_of(32) + 4, 0);
+        std::fs::write(&path, &header).unwrap();
+
+        let run = || {
+            super::preflight(
+                dir.path(),
+                dir.path(),
+                &super::Candidate::default(),
+                &cuda_facts(24u64 << 30),
+            )
+            .unwrap()
+        };
+        let report = run();
+        assert_eq!(report.family.as_deref(), Some("inkling2_mini"));
+        assert_eq!(report.verdict, Verdict::Unsupported);
+        let inventory = check_named(&report, "gguf header");
+        assert_eq!(inventory.status, CheckStatus::Pass);
+        assert!(
+            inventory
+                .detail
+                .contains("1 tensors, architecture inkling2_loop")
+        );
+        let layout = check_named(&report, "Inkling 2 Mini GGUF layout");
+        assert_eq!(layout.status, CheckStatus::Pass);
+        assert!(
+            layout
+                .detail
+                .contains("24 physical layers, 48 layer visits (8 global, 40 sliding-window)")
+        );
+        assert_eq!(
+            check_named(&report, "text execution").detail,
+            "Inkling 2 Mini GGUF serving is unsupported"
+        );
+        assert!(
+            !report
+                .checks
+                .iter()
+                .any(|check| check.name == "Inkling 2 Mini expert layout")
+        );
+
+        header[pattern_start] = 0;
+        std::fs::write(&path, &header).unwrap();
+        let invalid = run();
+        let layout = check_named(&invalid, "Inkling 2 Mini GGUF layout");
+        assert_eq!(layout.status, CheckStatus::Fail);
+        assert!(layout.detail.contains("sliding_window_pattern[0]"));
     }
 
     #[test]
