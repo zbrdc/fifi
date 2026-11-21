@@ -26,17 +26,20 @@
 
 use super::super::chunk_plan::{PairPlan, pair_plan, require_sorted_experts};
 use super::super::ops::{Ctx, dim, f32_tensor, short_import, to_act, u32_tensor, values};
+use super::super::stream_timing::ForwardTiming;
 use super::super::weights::RMoe;
 use crate::{
     EngError,
     family::{
         math::expect_len,
+        prefill::mlx::{overlap_expert_reads, submit_shared_expert},
         qwen36::host::HostShape,
         route::{Routed, route_experts},
         spec::Router,
     },
     kernels::{BinaryOp, ReduceOp, UnaryOp},
     tensor::{ExecutionTensor, Tensor},
+    weights::StreamedCheckpoint,
 };
 
 /// The shared expert in kernel-ready parts: the down projection `so` `[T, H]` and the scalar
@@ -68,10 +71,14 @@ fn shared_rows(
 /// Imports the four index tensors of a plan with one synchronization: the sorted experts `[P]`,
 /// the token of each sorted pair `[P]`, the inverse permutation `[P]` (all U32), and the sorted
 /// gates `[P, 1, 1]` (F32). It returns them in that order.
-fn import_plan(ctx: &mut Ctx<'_>, plan: &PairPlan) -> Result<[ExecutionTensor; 4], EngError> {
+fn import_plan(
+    ctx: &mut Ctx<'_>,
+    plan: &PairPlan,
+    experts: &[u32],
+) -> Result<[ExecutionTensor; 4], EngError> {
     let pairs = dim(plan.experts.len())?;
     let sources: [Tensor; 4] = [
-        u32_tensor(vec![pairs], &plan.experts)?,
+        u32_tensor(vec![pairs], experts)?,
         u32_tensor(vec![pairs], &plan.tokens)?,
         u32_tensor(vec![pairs], &plan.inverse)?,
         f32_tensor(vec![pairs, 1, 1], &plan.gates)?,
@@ -92,11 +99,23 @@ fn import_plan(ctx: &mut Ctx<'_>, plan: &PairPlan) -> Result<[ExecutionTensor; 4
 /// `gather_qmm_sorted` requires that order and cannot read the device indices.
 /// A router row that holds a NaN, an infinite value, or a negative value returns `Backend` from
 /// `route_experts`. That error ends one job and does not make the adapter terminal.
+#[cfg(test)]
 pub(super) fn chunk(
     ctx: &mut Ctx<'_>,
     shape: &HostShape,
     w: &RMoe,
     x: &ExecutionTensor,
+) -> Result<(ExecutionTensor, Vec<Routed>), EngError> {
+    chunk_with_checkpoint(ctx, shape, w, x, None, &mut None)
+}
+
+pub(super) fn chunk_with_checkpoint(
+    ctx: &mut Ctx<'_>,
+    shape: &HostShape,
+    w: &RMoe,
+    x: &ExecutionTensor,
+    ckpt: Option<&StreamedCheckpoint>,
+    timing: &mut Option<ForwardTiming>,
 ) -> Result<(ExecutionTensor, Vec<Routed>), EngError> {
     let m = &shape.moe;
     let hidden = dim(shape.hidden)?;
@@ -114,29 +133,52 @@ pub(super) fn chunk(
     let logits = ctx.kernels.mm(x, &w.router_t)?;
     let probs = ctx.kernels.softmax(&logits)?;
     let host = values(ctx.kernels, &probs)?;
-    expect_len(
-        &host,
-        m.experts
-            .checked_mul(usize::try_from(rows).unwrap_or(usize::MAX))
-            .ok_or_else(|| EngError::BadRequest("moe chunk size overflows".into()))?,
-        "moe chunk router",
-    )?;
-    let top_k = u32::try_from(m.top_k)
-        .map_err(|_| EngError::BadRequest("resident moe top-k exceeds u32".into()))?;
-    let router = Router::SoftmaxTopK { renorm: m.renorm };
-    let routed = host
-        .chunks_exact(m.experts)
-        .map(|row| route_experts(row, &router, top_k))
-        .collect::<Result<Vec<_>, _>>()?;
-    let plan = pair_plan(&routed, m.top_k, m.experts)?;
-    require_sorted_experts(&plan.experts)?;
+    let (routed, plan, top_k) = ForwardTiming::host_route(timing.as_mut(), || {
+        expect_len(
+            &host,
+            m.experts
+                .checked_mul(usize::try_from(rows).unwrap_or(usize::MAX))
+                .ok_or_else(|| EngError::BadRequest("moe chunk size overflows".into()))?,
+            "moe chunk router",
+        )?;
+        let top_k = u32::try_from(m.top_k)
+            .map_err(|_| EngError::BadRequest("resident moe top-k exceeds u32".into()))?;
+        let router = Router::SoftmaxTopK { renorm: m.renorm };
+        let routed = host
+            .chunks_exact(m.experts)
+            .map(|row| route_experts(row, &router, top_k))
+            .collect::<Result<Vec<_>, _>>()?;
+        let plan = pair_plan(&routed, m.top_k, m.experts)?;
+        require_sorted_experts(&plan.experts)?;
+        Ok::<_, EngError>((routed, plan, top_k))
+    })?;
     let pairs = dim(plan.experts.len())?;
-    let [ids, tokens, inverse, gates] = import_plan(ctx, &plan)?;
+    let queued_shared = if w.streams_experts() && overlap_expert_reads() {
+        let output = shared_rows(ctx, w, x)?;
+        Some(submit_shared_expert(ctx.kernels, output)?)
+    } else {
+        None
+    };
+    let stage_started = timing.as_ref().map(|_| std::time::Instant::now());
+    let staged = w.stage_selection(ctx.kernels, ckpt, &plan.experts, rows, timing.as_mut())?;
+    ForwardTiming::stage_ready(
+        timing.as_mut(),
+        stage_started,
+        staged.as_ref().map(|(pages, _)| pages),
+    )?;
+    let (pages, local) = if let Some((pages, local)) = &staged {
+        (pages, local)
+    } else {
+        (w.expert_pages()?, &plan.experts)
+    };
+    let [ids, tokens, inverse, gates] = import_plan(ctx, &plan, local)?;
     // One clamp for the expert ids of the whole chunk: the three sorted
     // gathered products share it, and the clamp of the already in-range plan ids is the identity.
     // The `tokens` and `inverse` takes keep their own clamps: each is consumed once, so a shared
     // clamp would save no node.
-    let bounded = ctx.kernels.bound_indices(&ids, dim(m.experts)?)?;
+    let bounded = ctx
+        .kernels
+        .bound_indices(&ids, pages.down.logical_shape()[0])?;
     // Selected experts: gate and up on the input row of each pair, SwiGLU, then down per pair.
     let picked = ctx.kernels.take(x, &tokens, 0)?;
     let x_pairs = ctx.kernels.reshape(&picked, &[pairs, 1, hidden])?;
@@ -144,7 +186,7 @@ pub(super) fn chunk(
     // and the up half [I, 2I) of every pair row.
     let stacked = ctx
         .kernels
-        .gather_qmm_sorted_bounded(&x_pairs, &w.gate_up, &bounded)?;
+        .gather_qmm_sorted_bounded(&x_pairs, &pages.gate_up, &bounded)?;
     let (taken, half) = (stacked.shape()[0], stacked.shape()[2] / 2);
     let hg = ctx.kernels.slice(&stacked, &[0, 0, 0], &[taken, 1, half])?;
     let hu = ctx
@@ -154,18 +196,25 @@ pub(super) fn chunk(
     let h = ctx.kernels.binary(BinaryOp::Mul, &act, &hu)?;
     let eo = ctx
         .kernels
-        .gather_qmm_sorted_bounded(&h, &w.down, &bounded)?;
+        .gather_qmm_sorted_bounded(&h, &pages.down, &bounded)?;
     let weighted = ctx.kernels.binary(BinaryOp::Mul, &eo, &gates)?;
     // Back to token-major order, then the sum over the choices of each token.
     let flat = ctx.kernels.reshape(&weighted, &[pairs, hidden])?;
     let ordered = ctx.kernels.take(&flat, &inverse, 0)?;
     let ordered = ctx.kernels.reshape(&ordered, &[rows, top_k, hidden])?;
     let experts = ctx.kernels.reduce(ReduceOp::Sum, &ordered, 1, false)?;
-    let shared_out = shared_rows(ctx, w, x)?;
+    let shared_out = match queued_shared {
+        Some(output) => output,
+        None => shared_rows(ctx, w, x)?,
+    };
     let out = ctx.kernels.binary(BinaryOp::Add, &experts, &shared_out)?;
     // As in the decode combine of `moe.rs`, the gates are F32, so the weighted expert sum and the
     // shared expert product are F32. The residual add takes the activation dtype.
     let out = to_act(ctx, &out)?;
+    if staged.is_some() {
+        ctx.kernels.evaluate(&[&out])?;
+    }
+    ForwardTiming::stage_end(timing.as_mut(), stage_started);
     Ok((out, routed))
 }
 
@@ -289,9 +338,11 @@ pub(super) fn chunk_device(
     // d. Selected experts in the sorted order, SwiGLU, down per pair, then the un-sort back to
     // token-major order and the sum over the choices of each token. The gate product is the same
     // elementwise product as in the host path; only its place moves (token-major, not sorted).
-    let stacked = ctx
-        .kernels
-        .gather_qmm_sorted_bounded(&x_pairs, &w.gate_up, &sorted_bounded)?;
+    let stacked = ctx.kernels.gather_qmm_sorted_bounded(
+        &x_pairs,
+        &w.expert_pages()?.gate_up,
+        &sorted_bounded,
+    )?;
     let (taken, half) = (stacked.shape()[0], stacked.shape()[2] / 2);
     let hg = ctx.kernels.slice(&stacked, &[0, 0, 0], &[taken, 1, half])?;
     let hu = ctx
@@ -301,7 +352,7 @@ pub(super) fn chunk_device(
     let h = ctx.kernels.binary(BinaryOp::Mul, &act, &hu)?;
     let eo = ctx
         .kernels
-        .gather_qmm_sorted_bounded(&h, &w.down, &sorted_bounded)?;
+        .gather_qmm_sorted_bounded(&h, &w.expert_pages()?.down, &sorted_bounded)?;
     let order_p_f = ctx.kernels.u32_to_f32(&order_p)?;
     let inverse = ctx.kernels.argsort(&order_p_f, 0)?;
     let eo_flat = ctx.kernels.reshape(&eo, &[pairs, hidden])?;
@@ -429,9 +480,11 @@ pub(super) fn chunk_device_phased(
     let x_rep = ctx.kernels.repeat(x, top_k, 0)?;
     let x_sorted = ctx.kernels.take(&x_rep, &order_p, 0)?;
     let x_pairs = ctx.kernels.reshape(&x_sorted, &[pairs, 1, hidden])?;
-    let stacked = ctx
-        .kernels
-        .gather_qmm_sorted_bounded(&x_pairs, &w.gate_up, &sorted_bounded)?;
+    let stacked = ctx.kernels.gather_qmm_sorted_bounded(
+        &x_pairs,
+        &w.expert_pages()?.gate_up,
+        &sorted_bounded,
+    )?;
     let (taken, half) = (stacked.shape()[0], stacked.shape()[2] / 2);
     let hg = ctx.kernels.slice(&stacked, &[0, 0, 0], &[taken, 1, half])?;
     let hu = ctx
@@ -441,7 +494,7 @@ pub(super) fn chunk_device_phased(
     let h = ctx.kernels.binary(BinaryOp::Mul, &act, &hu)?;
     let eo = ctx
         .kernels
-        .gather_qmm_sorted_bounded(&h, &w.down, &sorted_bounded)?;
+        .gather_qmm_sorted_bounded(&h, &w.expert_pages()?.down, &sorted_bounded)?;
     ctx.kernels.evaluate(&[&eo])?;
     let gemm_s = clock.elapsed().as_secs_f64();
     // Tail phase: the un-sort, the gated choice sum, the shared expert, and the cast, fused

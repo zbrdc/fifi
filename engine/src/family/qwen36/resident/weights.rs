@@ -8,21 +8,25 @@
 //! engine. The embedding table stays in the checkpoint; the token start reads one row per token.
 
 use super::super::settings::{Activation, scale_pairing_error};
+use super::dense_stage::DenseStage;
 use super::layout::{
     neg_exp, router_transposed, scalar_gate, split_conv, widen_layout, widen_stack_scales,
     with_f32_scales,
 };
 use super::ops::{Bytes, Consts, dim, f32_tensor, short_import};
+use super::stream_timing::ForwardTiming;
 use crate::{
     EngError,
     family::{
+        mlx_budget::DeviceBudget,
+        prefill::mlx::{local_expert_ids, prefill_expert_read_runs, sorted_expert_ids},
         qwen36::{
             host::{DeltaW, DenseW, FeedForwardW, HostShape, LayerW, MixerW, MoeW},
             host_load::HostWeights,
         },
         stored::{
             RoleRange, SlicedWeight, StackLayout, StackedLayouts, StoredWeight, read_stack_into,
-            read_stacked_into, stacked_layout,
+            read_stack_runs_into, read_stacked_into, read_stacked_runs_into, stacked_layout,
         },
     },
     kernels::{HostPages, MlxKernels, PackedPages, PackedWeight, PageRange, ResidentPackedWeight},
@@ -266,7 +270,14 @@ impl RDense {
 
 pub(super) enum RFeedForward {
     Dense(Box<RDense>),
+    StagedDense(Box<DenseStage>),
     Moe(Box<RMoe>),
+}
+
+impl RFeedForward {
+    pub(super) fn is_dense(&self) -> bool {
+        matches!(self, Self::Dense(_) | Self::StagedDense(_))
+    }
 }
 
 struct MoeFront {
@@ -285,12 +296,39 @@ pub(super) struct RMoe {
     pub(super) shared_up: ResidentPackedWeight,
     pub(super) shared_down: ResidentPackedWeight,
     pub(super) shared_scalar_t: ExecutionTensor,
-    /// The gate and up projections of all experts stacked along the output axis: ONE operand of
-    /// one `gather_qmm` per step instead of two.
+    experts: Experts,
+}
+
+enum Experts {
+    Resident(Box<ExpertPages>),
+    Disk(Box<ExpertSlices>),
+}
+
+pub(super) struct ExpertPages {
     pub(super) gate_up: ResidentPackedWeight,
     pub(super) down: ResidentPackedWeight,
-    /// The pages under the two stacks. Field order is drop order: the pages outlive the stacks.
+    // The page owner outlives both wrapped operands.
     pages: HostPages,
+}
+
+pub(super) struct ExpertSlices {
+    stacks: [SlicedWeight; 3],
+    f32_scales: bool,
+}
+
+impl ExpertPages {
+    pub(super) fn page_bytes(&self) -> Result<u64, EngError> {
+        u64::try_from(self.pages.len())
+            .map_err(|_| EngError::MemoryPlan("expert page bytes exceed u64".into()))
+    }
+}
+
+struct ExpertLayout {
+    gate: StackLayout,
+    up: StackLayout,
+    gate_up: StackLayout,
+    down: StackLayout,
+    down_read: Option<StackLayout>,
 }
 
 impl MoeFront {
@@ -331,60 +369,94 @@ fn page_range(range: &RoleRange) -> PageRange {
     }
 }
 
-impl RMoe {
-    /// Reads all experts of one layer into new pages - the gate and up projections stacked into
-    /// one operand, then `down` - and wraps the two stacks without a copy.
-    fn import_experts(
-        kernels: &mut MlxKernels,
-        ckpt: &StreamedCheckpoint,
-        front: MoeFront,
-        stacks: &(SlicedWeight, SlicedWeight, SlicedWeight),
-        experts: u32,
-        f32_scales: bool,
-    ) -> Result<Self, EngError> {
-        let (gate, up, down) = (&stacks.0, &stacks.1, &stacks.2);
+impl ExpertSlices {
+    pub(super) fn new(stacks: [SlicedWeight; 3], f32_scales: bool) -> Self {
+        Self { stacks, f32_scales }
+    }
+
+    fn layout(&self, ckpt: &StreamedCheckpoint, count: u32) -> Result<ExpertLayout, EngError> {
+        let [gate, up, down] = &self.stacks;
         let page = HostPages::page_size();
         // The narrow gate/up layouts carry the stored slice sizes of the two projections. The
         // stacked layout joins every expert slice of every role - gate bytes then up bytes - so
         // the pages wrap ONE operand `[experts, 2 * rows, cols]` for both projections, with no
         // second copy on the device. `down` follows the stacked block.
-        let gate_narrow = StackLayout::new(ckpt, gate, experts, 0, page)?;
-        let up_narrow = StackLayout::new(ckpt, up, experts, 0, page)?;
+        let gate_narrow = StackLayout::new(ckpt, gate, count, 0, page)?;
+        let up_narrow = StackLayout::new(ckpt, up, count, 0, page)?;
         let stacked_narrow = stacked_layout(&gate_narrow, &up_narrow, 0, page)?;
         // With F32 scales (the default) the scales and biases slots hold F32 values that
         // `read_stacked_into` widens per slot; `down` widens through the plain machinery.
-        let (stacked, down_layout, down_read) = if f32_scales {
+        let (stacked, down_layout, down_read) = if self.f32_scales {
             let (stacked, _whole_role_read) = widen_layout(&stacked_narrow, page)?;
-            let down_narrow = StackLayout::new(ckpt, down, experts, stacked.end, page)?;
+            let down_narrow = StackLayout::new(ckpt, down, count, stacked.end, page)?;
             let (down, read) = widen_layout(&down_narrow, page)?;
             (stacked, down, Some(read))
         } else {
-            let down = StackLayout::new(ckpt, down, experts, stacked_narrow.end, page)?;
+            let down = StackLayout::new(ckpt, down, count, stacked_narrow.end, page)?;
             (stacked_narrow, down, None)
         };
+        Ok(ExpertLayout {
+            gate: gate_narrow,
+            up: up_narrow,
+            gate_up: stacked,
+            down: down_layout,
+            down_read,
+        })
+    }
+
+    pub(super) fn bytes(&self, ckpt: &StreamedCheckpoint, count: u32) -> Result<u64, EngError> {
+        u64::try_from(self.layout(ckpt, count)?.down.end)
+            .map_err(|_| EngError::MemoryPlan("expert page bytes exceed u64".into()))
+    }
+
+    /// Read only the selected experts, using their supplied order as local IDs.
+    pub(super) fn stage(
+        &self,
+        kernels: &mut MlxKernels,
+        ckpt: &StreamedCheckpoint,
+        ids: &[u32],
+        coalesce: bool,
+    ) -> Result<ExpertPages, EngError> {
+        let ExpertLayout {
+            gate: gate_narrow,
+            up: up_narrow,
+            gate_up: stacked,
+            down: down_layout,
+            down_read,
+        } = self.layout(ckpt, dim(ids.len())?)?;
+        let [gate, up, down] = &self.stacks;
         let mut pages = HostPages::try_new(down_layout.end)?;
-        let ids: Vec<u32> = (0..experts).collect();
         {
             let bytes = pages.try_write().ok_or_else(|| EngError::Backend {
                 operation: "expert_pages",
                 message: "new expert pages are not writable".into(),
             })?;
-            read_stacked_into(
+            let read_stacked = if coalesce {
+                read_stacked_runs_into
+            } else {
+                read_stacked_into
+            };
+            read_stacked(
                 ckpt,
                 gate,
                 up,
-                &ids,
+                ids,
                 bytes,
                 &StackedLayouts {
                     gate: &gate_narrow,
                     up: &up_narrow,
                     stacked: &stacked,
                 },
-                f32_scales,
+                self.f32_scales,
             )?;
             let down_target = down_read.as_ref().unwrap_or(&down_layout);
-            read_stack_into(ckpt, down, &ids, bytes, down_target)?;
-            if f32_scales {
+            let read_stack = if coalesce {
+                read_stack_runs_into
+            } else {
+                read_stack_into
+            };
+            read_stack(ckpt, down, ids, bytes, down_target)?;
+            if self.f32_scales {
                 widen_stack_scales(bytes, &down_layout)?;
             }
         }
@@ -398,42 +470,98 @@ impl RMoe {
                 quantization: stack.spec,
             })
             .collect();
+        #[cfg(feature = "native-fault-qualification")]
+        let started = std::time::Instant::now();
         let (imported, plain) = kernels.import_packed_pages(&pages, &wrapped, &[])?;
+        #[cfg(feature = "native-fault-qualification")]
+        crate::family::stored::record_page_import(started.elapsed());
         if !plain.is_empty() {
             return Err(short_import());
         }
         let [gate_up, down]: [ResidentPackedWeight; 2] =
             imported.try_into().map_err(|_| short_import())?;
-        Ok(Self {
-            router_t: front.router_t,
-            shared_gate: front.shared_gate,
-            shared_up: front.shared_up,
-            shared_down: front.shared_down,
-            shared_scalar_t: front.shared_scalar_t,
+        Ok(ExpertPages {
             gate_up,
             down,
             pages,
         })
     }
+}
+
+impl RMoe {
+    fn new(front: MoeFront, stacks: [SlicedWeight; 3], f32_scales: bool) -> Self {
+        Self {
+            router_t: front.router_t,
+            shared_gate: front.shared_gate,
+            shared_up: front.shared_up,
+            shared_down: front.shared_down,
+            shared_scalar_t: front.shared_scalar_t,
+            experts: Experts::Disk(Box::new(ExpertSlices::new(stacks, f32_scales))),
+        }
+    }
+
+    fn disk(&self) -> Option<&ExpertSlices> {
+        match &self.experts {
+            Experts::Disk(slices) => Some(slices),
+            Experts::Resident(_) => None,
+        }
+    }
+
+    pub(super) fn streams_experts(&self) -> bool {
+        self.disk().is_some()
+    }
+
+    pub(super) fn stage_selection(
+        &self,
+        kernels: &mut MlxKernels,
+        ckpt: Option<&StreamedCheckpoint>,
+        selected: &[u32],
+        rows: u32,
+        timing: Option<&mut ForwardTiming>,
+    ) -> Result<Option<(ExpertPages, Vec<u32>)>, EngError> {
+        let Some(slices) = self.disk() else {
+            return Ok(None);
+        };
+        let ckpt =
+            ckpt.ok_or_else(|| EngError::Checkpoint("missing Qwen expert checkpoint".into()))?;
+        let experts = sorted_expert_ids(selected);
+        let local = local_expert_ids(selected, &experts)?;
+        let coalesce = rows > 1 && prefill_expert_read_runs();
+        Ok(Some((
+            ForwardTiming::load_stage(timing, &experts, coalesce, || {
+                slices.stage(kernels, ckpt, &experts, coalesce)
+            })?,
+            local,
+        )))
+    }
+
+    pub(super) fn expert_pages(&self) -> Result<&ExpertPages, EngError> {
+        match &self.experts {
+            Experts::Resident(pages) => Ok(pages),
+            Experts::Disk(_) => Err(EngError::BadRequest(
+                "this Qwen MoE path requires resident experts".into(),
+            )),
+        }
+    }
 
     fn bytes(&self, total: &mut Bytes) -> Result<(), EngError> {
         total.tensor(&self.router_t)?;
         total.tensor(&self.shared_scalar_t)?;
-        for w in [
-            &self.shared_gate,
-            &self.shared_up,
-            &self.shared_down,
-            &self.gate_up,
-            &self.down,
-        ] {
+        for w in [&self.shared_gate, &self.shared_up, &self.shared_down] {
             total.packed(w)?;
+        }
+        if let Experts::Resident(pages) = &self.experts {
+            total.packed(&pages.gate_up)?;
+            total.packed(&pages.down)?;
         }
         Ok(())
     }
 
     fn page_bytes(&self) -> Result<u64, EngError> {
-        u64::try_from(self.pages.len())
-            .map_err(|_| EngError::MemoryPlan("expert page bytes exceed u64".into()))
+        let Experts::Resident(pages) = &self.experts else {
+            return Ok(0);
+        };
+        pages.page_bytes()
     }
 }
 
@@ -449,8 +577,8 @@ impl RLayer {
     pub(super) fn as_moe(&self) -> Result<&RMoe, EngError> {
         match &self.feed_forward {
             RFeedForward::Moe(moe) => Ok(moe),
-            RFeedForward::Dense(_) => Err(EngError::BadRequest(
-                "dense execution is not implemented yet".into(),
+            RFeedForward::Dense(_) | RFeedForward::StagedDense(_) => Err(EngError::BadRequest(
+                "a dense layer has no routed experts".into(),
             )),
         }
     }
@@ -459,9 +587,10 @@ impl RLayer {
 /// Only MoE layers retain sliced stacks for phase 2.
 enum FeedForwardFront {
     Dense(Box<RDense>),
+    StagedDense(Box<DenseStage>),
     Moe {
         front: Box<MoeFront>,
-        stacks: Box<(SlicedWeight, SlicedWeight, SlicedWeight)>,
+        stacks: Box<[SlicedWeight; 3]>,
     },
 }
 
@@ -506,7 +635,7 @@ impl ResidentWeights {
         ckpt: &StreamedCheckpoint,
         host: HostWeights,
     ) -> Result<Self, EngError> {
-        Self::import_with(kernels, ckpt, host, true)
+        Self::import_with(kernels, ckpt, host, true, None)
     }
 
     /// Like `import`, with the scales and biases kept as stored (BF16). The BF16 half of the one
@@ -517,14 +646,15 @@ impl ResidentWeights {
         ckpt: &StreamedCheckpoint,
         host: HostWeights,
     ) -> Result<Self, EngError> {
-        Self::import_with(kernels, ckpt, host, false)
+        Self::import_with(kernels, ckpt, host, false, None)
     }
 
-    fn import_with(
+    pub(super) fn import_with(
         kernels: &mut MlxKernels,
         ckpt: &StreamedCheckpoint,
         host: HostWeights,
         f32_scales: bool,
+        device_plan: Option<ExpertDevicePlan>,
     ) -> Result<Self, EngError> {
         let shape = host.shape().clone();
         let view = host.view();
@@ -536,26 +666,17 @@ impl ResidentWeights {
         let final_norm = got.plain()?;
         got.finish()?;
         let embed = sliced_of(view.embed)?;
-        let mut fronts = Vec::with_capacity(view.layers.len());
-        for layer in &view.layers {
-            fronts.push(import_layer_front(kernels, layer, &shape, f32_scales)?);
-        }
         drop(view);
-        drop(host);
+        let fronts = host
+            .import_layers(|layer| import_layer_front(kernels, ckpt, layer, &shape, f32_scales))?;
         let consts = Consts::import(kernels, &shape)?;
         let mut layers = Vec::with_capacity(fronts.len());
         for front in fronts {
             let feed_forward = match front.feed_forward {
                 FeedForwardFront::Dense(dense) => RFeedForward::Dense(dense),
+                FeedForwardFront::StagedDense(dense) => RFeedForward::StagedDense(dense),
                 FeedForwardFront::Moe { front, stacks } => {
-                    RFeedForward::Moe(Box::new(RMoe::import_experts(
-                        kernels,
-                        ckpt,
-                        *front,
-                        &stacks,
-                        dim(shape.moe.experts)?,
-                        f32_scales,
-                    )?))
+                    RFeedForward::Moe(Box::new(RMoe::new(*front, *stacks, f32_scales)))
                 }
             };
             layers.push(RLayer {
@@ -565,7 +686,7 @@ impl ResidentWeights {
                 feed_forward,
             });
         }
-        Ok(Self {
+        let mut weights = Self {
             shape,
             embed,
             lm_head,
@@ -573,7 +694,128 @@ impl ResidentWeights {
             layers,
             consts,
             kv: crate::family::qwen36::settings::KvDtype::F32,
-        })
+        };
+        if weights.choose_expert_placement(ckpt, device_plan)? {
+            let count = dim(weights.shape.moe.experts)?;
+            let ids: Vec<u32> = (0..count).collect();
+            for layer in &mut weights.layers {
+                if let RFeedForward::Moe(moe) = &mut layer.feed_forward
+                    && let Some(slices) = moe.disk()
+                {
+                    moe.experts =
+                        Experts::Resident(Box::new(slices.stage(kernels, ckpt, &ids, false)?));
+                }
+            }
+        }
+        Ok(weights)
+    }
+
+    fn choose_expert_placement(
+        &self,
+        ckpt: &StreamedCheckpoint,
+        device_plan: Option<ExpertDevicePlan>,
+    ) -> Result<bool, EngError> {
+        let Some(plan) = device_plan else {
+            return Ok(true);
+        };
+        let base = self.byte_len()?;
+        let available = plan.device.remaining(
+            "Qwen MLX",
+            &[
+                ("base_weights_bytes", base),
+                ("session_reserve_bytes", plan.reserve),
+            ],
+        )?;
+        let expert_count = dim(self.shape.moe.experts)?;
+        let mut all_experts = Bytes::default();
+        for slices in self.disk_layers() {
+            let layout = slices.layout(ckpt, expert_count)?;
+            let expected = if slices.f32_scales {
+                Dtype::F32
+            } else {
+                Dtype::Bf16
+            };
+            for stack in [&layout.gate_up, &layout.down] {
+                if stack.scales.dtype != expected
+                    || stack
+                        .biases
+                        .as_ref()
+                        .is_some_and(|biases| biases.dtype != expected)
+                {
+                    return Err(EngError::BadRequest(format!(
+                        "Qwen MLX expert scales and biases must use {expected:?}"
+                    )));
+                }
+            }
+            all_experts.add(
+                u64::try_from(layout.down.end)
+                    .map_err(|_| EngError::MemoryPlan("expert page bytes exceed u64".into()))?,
+            )?;
+        }
+        let resident = all_experts.total() <= available;
+        let decode_stage = if resident {
+            0
+        } else {
+            self.expert_stage_bytes(ckpt, 1)?
+        };
+        if decode_stage > available {
+            return Err(EngError::MemoryPlan(format!(
+                "Qwen MLX needs {decode_stage} bytes to stage one token's experts, with {available} bytes left after base weights and session reserves"
+            )));
+        }
+        if !resident && plan.max_seqs > 1 {
+            return Err(EngError::MemoryPlan(
+                "Qwen MLX disk-backed experts require max_seqs=1".into(),
+            ));
+        }
+        eprintln!(
+            "qwen: MLX weight placement={} base_weights_bytes={base} full_expert_page_bytes={} decode_expert_stage_bytes={decode_stage} expert_budget_bytes={available}",
+            if resident { "resident" } else { "disk-experts" },
+            all_experts.total(),
+        );
+        Ok(resident)
+    }
+
+    fn disk_layers(&self) -> impl Iterator<Item = &ExpertSlices> {
+        self.layers
+            .iter()
+            .filter_map(|layer| match &layer.feed_forward {
+                RFeedForward::Moe(moe) => moe.disk(),
+                RFeedForward::Dense(_) | RFeedForward::StagedDense(_) => None,
+            })
+    }
+
+    pub(super) fn streams_experts(&self) -> bool {
+        self.disk_layers().next().is_some()
+    }
+
+    pub(super) fn stages_dense(&self) -> bool {
+        self.layers
+            .iter()
+            .any(|layer| matches!(layer.feed_forward, RFeedForward::StagedDense(_)))
+    }
+
+    pub(super) fn dense_stage_bytes(&self) -> Result<u64, EngError> {
+        self.layers
+            .iter()
+            .try_fold(0u64, |peak, layer| match &layer.feed_forward {
+                RFeedForward::StagedDense(stage) => Ok(peak.max(stage.charge()?)),
+                _ => Ok(peak),
+            })
+    }
+
+    /// Upper bound for one layer's distinct selected experts. The other
+    /// layers stage after the current graph has been evaluated.
+    pub(super) fn expert_stage_bytes(
+        &self,
+        ckpt: &StreamedCheckpoint,
+        rows: u32,
+    ) -> Result<u64, EngError> {
+        let count = rows
+            .saturating_mul(dim(self.shape.moe.top_k)?)
+            .min(dim(self.shape.moe.experts)?);
+        self.disk_layers()
+            .try_fold(0, |peak, slices| Ok(peak.max(slices.bytes(ckpt, count)?)))
     }
 
     /// Converts the layer norms to `dtype` and evaluates them once: the input
@@ -641,6 +883,7 @@ impl ResidentWeights {
             }
             match &layer.feed_forward {
                 RFeedForward::Dense(dense) => dense.bytes(&mut total)?,
+                RFeedForward::StagedDense(_) => {}
                 RFeedForward::Moe(moe) => moe.bytes(&mut total)?,
             }
         }
@@ -686,19 +929,28 @@ impl ResidentWeights {
                 RFeedForward::Dense(dense) => [&dense.gate, &dense.up, &dense.down]
                     .into_iter()
                     .for_each(&mut visit),
-                RFeedForward::Moe(moe) => [
-                    &moe.shared_gate,
-                    &moe.shared_up,
-                    &moe.shared_down,
-                    &moe.gate_up,
-                    &moe.down,
-                ]
-                .into_iter()
-                .for_each(&mut visit),
+                RFeedForward::StagedDense(_) => {}
+                RFeedForward::Moe(moe) => {
+                    [&moe.shared_gate, &moe.shared_up, &moe.shared_down]
+                        .into_iter()
+                        .for_each(&mut visit);
+                    if let Experts::Resident(pages) = &moe.experts {
+                        [&pages.gate_up, &pages.down]
+                            .into_iter()
+                            .for_each(&mut visit);
+                    }
+                }
             }
         }
         census
     }
+}
+
+#[derive(Clone, Copy)]
+pub(super) struct ExpertDevicePlan {
+    pub(super) device: DeviceBudget,
+    pub(super) reserve: u64,
+    pub(super) max_seqs: usize,
 }
 
 /// The packed weights of a model and the dtypes of their scale and bias tensors.
@@ -714,6 +966,7 @@ pub(super) struct ScaleCensus {
 /// Imports the non-expert tensors of one layer with one synchronization.
 fn import_layer_front(
     kernels: &mut MlxKernels,
+    ckpt: &StreamedCheckpoint,
     layer: &LayerW<'_, StoredWeight>,
     shape: &HostShape,
     f32_scales: bool,
@@ -725,7 +978,22 @@ fn import_layer_front(
         MixerW::Delta(w) => RDelta::queue(&mut batch, w, shape)?,
         MixerW::Attn(w) => RAttn::queue(&mut batch, w)?,
     }
+    let staged = match &layer.feed_forward {
+        FeedForwardW::Dense(dense) if matches!(dense.gate, StoredWeight::Sliced(_)) => {
+            Some(DenseStage::new(
+                ckpt,
+                [
+                    sliced_of(dense.gate)?,
+                    sliced_of(dense.up)?,
+                    sliced_of(dense.down)?,
+                ],
+                f32_scales,
+            )?)
+        }
+        _ => None,
+    };
     match &layer.feed_forward {
+        FeedForwardW::Dense(_) if staged.is_some() => {}
         FeedForwardW::Dense(dense) => RDense::queue(&mut batch, dense)?,
         FeedForwardW::Moe(moe) => MoeFront::queue(&mut batch, moe, shape)?,
     }
@@ -736,15 +1004,18 @@ fn import_layer_front(
         MixerW::Delta(_) => RMixer::Delta(RDelta::take(&mut got)?),
         MixerW::Attn(_) => RMixer::Attn(RAttn::take(&mut got)?),
     };
-    let feed_forward = match &layer.feed_forward {
-        FeedForwardW::Dense(_) => FeedForwardFront::Dense(Box::new(RDense::take(&mut got)?)),
-        FeedForwardW::Moe(moe) => FeedForwardFront::Moe {
+    let feed_forward = match (&layer.feed_forward, staged) {
+        (FeedForwardW::Dense(_), Some(stage)) => FeedForwardFront::StagedDense(Box::new(stage)),
+        (FeedForwardW::Dense(_), None) => {
+            FeedForwardFront::Dense(Box::new(RDense::take(&mut got)?))
+        }
+        (FeedForwardW::Moe(moe), _) => FeedForwardFront::Moe {
             front: Box::new(MoeFront::take(&mut got)?),
-            stacks: Box::new((
+            stacks: Box::new([
                 sliced_of(moe.gate)?,
                 sliced_of(moe.up)?,
                 sliced_of(moe.down)?,
-            )),
+            ]),
         },
     };
     got.finish()?;
@@ -785,7 +1056,8 @@ mod tests {
             let (ckpt, host) = load(spec);
             let oracle = HostWeights::load(&ckpt, spec, &tiny::config(spec)).unwrap();
             let mut kernels = MlxKernels::try_new().unwrap();
-            let w = ResidentWeights::import_with(&mut kernels, &ckpt, host, f32_scales).unwrap();
+            let w =
+                ResidentWeights::import_with(&mut kernels, &ckpt, host, f32_scales, None).unwrap();
             let view = oracle.view();
             let mut cpu = CpuProjector::new(&ckpt, 1);
             for (index, layer) in w.layers.iter().enumerate() {
@@ -864,8 +1136,8 @@ mod tests {
         assert_eq!(moe.router_t.shape(), [64, 4]);
         assert_eq!(moe.shared_scalar_t.shape(), [64, 1]);
         assert_eq!(shape_of(&moe.shared_gate), [64, 64]);
-        assert_eq!(shape_of(&moe.gate_up), [4, 128, 64]);
-        assert_eq!(shape_of(&moe.down), [4, 64, 64]);
+        assert_eq!(shape_of(&moe.expert_pages().unwrap().gate_up), [4, 128, 64]);
+        assert_eq!(shape_of(&moe.expert_pages().unwrap().down), [4, 64, 64]);
     }
 
     /// The bytes that the import must make resident, summed from the stored tensor list by rule:
@@ -1115,7 +1387,16 @@ mod tests {
                 .import_tensor(&u32_tensor(vec![1], &[e]).unwrap())
                 .unwrap();
             let got = kernels
-                .gather_qmm(&x3, &w.layers[0].as_moe().unwrap().gate_up, &ids)
+                .gather_qmm(
+                    &x3,
+                    &w.layers[0]
+                        .as_moe()
+                        .unwrap()
+                        .expert_pages()
+                        .unwrap()
+                        .gate_up,
+                    &ids,
+                )
                 .unwrap();
             let got = values(&mut kernels, &got).unwrap();
             let gate = cpu.expert_linear(moe0.gate, e, &x).unwrap();
@@ -1130,7 +1411,7 @@ mod tests {
         }
         for (name, stack, host_stack) in [(
             "down",
-            &w.layers[1].as_moe().unwrap().down,
+            &w.layers[1].as_moe().unwrap().expert_pages().unwrap().down,
             view.layers[1].as_moe().unwrap().down,
         )] {
             for e in 0..4u32 {
@@ -1229,7 +1510,10 @@ mod tests {
                 let role = format!("layer {index} {role}");
                 assert_role(&mut kernels, &mut cpu, resident, stored, &role);
             }
-            for stack in [&moe.gate_up, &moe.down] {
+            for stack in [
+                &moe.expert_pages().unwrap().gate_up,
+                &moe.expert_pages().unwrap().down,
+            ] {
                 let spec = stack.quantization();
                 assert_eq!(
                     (spec.mode, spec.bits, spec.group_size),

@@ -97,27 +97,32 @@ impl CacheStep {
     /// limit is a SESSION parameter (131,072 by default), set only after the
     /// factory/budget gates; `new` keeps the 8,192 default unchanged. The hard
     /// ceiling is the model's 262,144.
+    #[cfg(test)]
     pub(super) fn with_limit(layer: usize, pos: u32, limit: u32) -> Result<Self, EngError> {
         if limit < WINDOW {
             return Err(EngError::BadRequest(format!(
                 "Flint context limit {limit} is below the SWA window {WINDOW}"
             )));
         }
-        if limit > CONTEXT_CEILING {
+        Self::with_capacity(layer, pos, limit)
+    }
+
+    fn with_capacity(layer: usize, pos: u32, full_capacity: u32) -> Result<Self, EngError> {
+        if full_capacity > CONTEXT_CEILING {
             return Err(EngError::BadRequest(format!(
-                "Flint context limit {limit} exceeds the model ceiling {CONTEXT_CEILING}"
+                "Flint context limit {full_capacity} exceeds the model ceiling {CONTEXT_CEILING}"
             )));
         }
         if layer >= 49 {
             return Err(EngError::BadRequest("Flint layer is outside 0..49".into()));
         }
-        if pos >= limit {
+        if pos >= full_capacity {
             return Err(EngError::ContextLimit(format!(
-                "Flint context exceeds {limit} positions"
+                "Flint context exceeds {full_capacity} positions"
             )));
         }
         let full = FULL_LAYERS.contains(&(layer as u64));
-        let capacity = if full { limit } else { WINDOW };
+        let capacity = if full { full_capacity } else { WINDOW };
         #[cfg(test)]
         let (slot, first, second) = {
             let range = ChunkWindow::new(capacity as usize, pos as usize, 1)?.live_range();
@@ -162,9 +167,14 @@ pub(super) struct ChunkCachePlan {
 
 impl ChunkCachePlan {
     /// Validates the serving bounds (1..=1024 rows, the whole chunk inside the
-    /// limit) and derives the last row's step. The driver builds one plan per
+    /// full-attention capacity) and derives the last row's step. The driver builds one plan per
     /// (layer, chunk) and hands it to `Plane::prepare_chunk`.
-    pub(super) fn new(layer: usize, p0: u32, rows: u32, limit: u32) -> Result<Self, EngError> {
+    pub(super) fn new(
+        layer: usize,
+        p0: u32,
+        rows: u32,
+        full_capacity: u32,
+    ) -> Result<Self, EngError> {
         if rows == 0 || rows > 1024 {
             return Err(EngError::BadRequest(format!(
                 "Flint chunk carries 1..=1024 rows, not {rows}"
@@ -174,7 +184,7 @@ impl ChunkCachePlan {
             .checked_add(rows - 1)
             .ok_or_else(|| EngError::ContextLimit("Flint chunk overflows the limit".into()))?;
         Ok(Self {
-            step: CacheStep::with_limit(layer, last, limit)?,
+            step: CacheStep::with_capacity(layer, last, full_capacity)?,
             p0,
             rows,
         })
@@ -200,9 +210,8 @@ mod native {
         pub(in crate::family::flint) planes: Vec<Option<Plane>>,
         pub(in crate::family::flint) pos: u32,
         pub(in crate::family::flint) valid: bool,
-        /// Grown full-attention capacity: full planes start at the rounded-up
-        /// prompt need, not the context limit, and double as chunks cross it.
-        /// Ring planes stay at WINDOW and never grow.
+        /// Full-attention capacity used to allocate the first planes and track
+        /// subsequent growth. Ring planes stay at WINDOW and never grow.
         pub(in crate::family::flint) full_capacity: u32,
     }
 
@@ -217,10 +226,8 @@ mod native {
         }
 
         /// Grows the full-attention planes so `need_end` rows fit, keeping
-        /// short prompts at a short-prompt allocation. The capacity rounds up
-        /// to 4096 rows, doubles on later crossings, and never passes the
-        /// context limit; a need beyond the limit is the usual context error
-        /// and grows nothing.
+        /// short prompts at a short-prompt allocation. Both growth policies
+        /// stay within the context limit and keep the sliding window fixed.
         pub(in crate::family::flint) fn ensure_full_capacity(
             &mut self,
             k: &mut MlxKernels,
@@ -236,7 +243,11 @@ mod native {
                     need_end, limit
                 )));
             }
-            let target = super::capacity_target(need_end, self.full_capacity, limit);
+            let target = if super::compact_kv_flagged() {
+                crate::family::mlx_kv::compact_capacity(need_end, limit)
+            } else {
+                super::capacity_target(need_end, self.full_capacity, limit)
+            };
             for (layer, slot) in self.planes.iter_mut().enumerate() {
                 if FULL_LAYERS.contains(&(layer as u64))
                     && let Some(plane) = slot.take()
@@ -706,6 +717,42 @@ mod native {
 pub(in crate::family::flint) fn capacity_target(need_end: u32, current: u32, limit: u32) -> u32 {
     let rounded = need_end.div_ceil(4096) * 4096;
     rounded.max(current.max(1) * 2).min(limit)
+}
+
+/// Capacity for a fresh request with a known output limit. The final token is
+/// pending, so it never enters the KV planes unless a later request feeds it.
+pub(super) fn initial_request_capacity(
+    prompt_tokens: usize,
+    completion_limit: Option<u32>,
+    context_limit: u32,
+) -> u32 {
+    let Some(completion_limit) = completion_limit else {
+        return 0;
+    };
+    let prompt_tokens = u32::try_from(prompt_tokens).unwrap_or(u32::MAX);
+    let rows = prompt_tokens
+        .saturating_add(completion_limit)
+        .saturating_sub(1);
+    crate::family::mlx_kv::compact_capacity(rows, context_limit)
+}
+
+#[test]
+fn request_capacity_covers_fed_rows_within_context() {
+    assert_eq!(initial_request_capacity(1, Some(0), 32768), 0);
+    assert_eq!(initial_request_capacity(256, None, 32768), 0);
+    assert_eq!(initial_request_capacity(257, Some(0), 32768), 256);
+    assert_eq!(initial_request_capacity(1017, Some(8), 32768), 1024);
+    assert_eq!(initial_request_capacity(1017, Some(9), 32768), 2048);
+    assert_eq!(initial_request_capacity(1017, Some(24), 32768), 2048);
+    assert_eq!(initial_request_capacity(1017, Some(u32::MAX), 8192), 8192);
+}
+
+#[cfg(all(feature = "native-mlx", target_os = "macos", target_arch = "aarch64"))]
+pub(super) fn compact_kv_flagged() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        std::env::var_os("FIFI_FLINT_MLX_COMPACT_KV").is_some_and(|value| value == "1")
+    })
 }
 
 /// The prefix-slice row count vendor decode reads instead of the whole

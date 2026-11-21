@@ -1,7 +1,7 @@
 //! The host-derived MLX defaults, through the settings resolver.
 
 use super::host_plan::HostFacts;
-use super::settings::{Backend, Q36Env, Q36Options, Q36Settings};
+use super::settings::{Backend, MlxPlacement, Q36Env, Q36Options, Q36Settings};
 use crate::EngError;
 use std::path::Path;
 
@@ -228,6 +228,52 @@ fn dense(options: Option<&Q36Options>, env: &Q36Env) -> Result<Q36Settings, EngE
         Backend::Mlx,
         crate::family::spec::QWEN3_8_27B_DENSE,
     )
+}
+
+#[test]
+fn an_explicit_context_defers_the_expert_shortfall_to_the_mlx_planner() {
+    let options = Q36Options {
+        context_limit: Some(4096),
+        ..Q36Options::default()
+    };
+    let mut host = env(16);
+
+    // The dense flag cannot bypass the routed expert check.
+    host.mlx_disk_dense_ffn = true;
+    assert!(refusal(resolve(Some(&options), &host)).contains("the model needs 19.0 GiB"));
+
+    host.mlx_disk_experts = true;
+    let got = resolve(Some(&options), &host).expect("defer to expert placement");
+    assert_eq!(got.context_limit, 4096);
+    assert_eq!(got.prefill_budget, Some(12 * GIB));
+    assert_eq!(got.mlx_placement, MlxPlacement::ExpertFallback);
+    assert_eq!(got.mlx_host_placement_cap, Some(12 * GIB));
+    assert!(refusal(resolve(None, &host)).contains("context 262144"));
+}
+
+#[test]
+fn an_explicit_context_defers_the_dense_shortfall_to_the_mlx_planner() {
+    let mut options = Q36Options {
+        context_limit: Some(2048),
+        ..Q36Options::default()
+    };
+    let mut host = dense_env(16, DENSE_6BIT_BYTES);
+
+    host.mlx_disk_experts = true;
+    assert!(refusal(dense(Some(&options), &host)).contains("the model needs 21.7 GiB"));
+
+    host.mlx_disk_dense_ffn = true;
+    let got = dense(Some(&options), &host).expect("defer to dense staging");
+    assert_eq!(got.context_limit, 2048);
+    assert_eq!(got.prefill_budget, Some(12 * GIB));
+    assert_eq!(got.mlx_placement, MlxPlacement::DenseFfnStaging);
+    assert_eq!(got.mlx_host_placement_cap, Some(12 * GIB));
+    assert!(refusal(dense(None, &host)).contains("context 262144"));
+
+    options.prefill_budget_bytes = Some(10 * GIB);
+    let explicit = dense(Some(&options), &host).unwrap();
+    assert_eq!(explicit.prefill_budget, Some(10 * GIB));
+    assert_eq!(explicit.mlx_host_placement_cap, None);
 }
 
 #[test]

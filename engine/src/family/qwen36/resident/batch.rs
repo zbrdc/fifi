@@ -279,6 +279,11 @@ impl ResidentDecoder<'_> {
                 (RFeedForward::Dense(w), _) => {
                     moe::dense_rows(&mut ctx, shape, w, &mid, &layer.post_norm)?
                 }
+                (RFeedForward::StagedDense(_), _) => {
+                    return Err(EngError::BadRequest(
+                        "dense FFN staging requires a single session".into(),
+                    ));
+                }
                 (RFeedForward::Moe(w), true) => {
                     let (out, route) = super::compiled::moe_step_device(
                         &mut ctx,

@@ -1,8 +1,8 @@
 //! Chunk step assembly.
 //!
 //! `prefill` runs `T` prompt tokens. Up to the dense QSA limit it runs them as one chunk through
-//! `chunk_with_cap`, layer by layer. Tokens past the limit run as one-token `Prompt` steps on the
-//! sparse decode path, and the last one runs in the requested mode. A chunk makes the
+//! `chunk_with_cap`, layer by layer. After the dense limit, the sparse path runs bounded batches
+//! when admitted and one-token steps otherwise. The last row runs in the requested mode. A chunk makes the
 //! synchronizations of one token: the token-start import, one router readback per layer, and one
 //! `evaluate`. `Generate` and `Record` add the readbacks of the one-token step, for the last row
 //! of the chunk only. Two groups add planned synchronizations on top, and the qualification build
@@ -32,12 +32,12 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 use super::super::ops::{Ctx, dim, linear, values};
 use super::super::qsa::MAX_POSITIONS;
-use super::super::state::{LayerState, ResidentState, chunk_growth_bytes};
+use super::super::state::{LayerState, ResidentState, qsa_append_growth};
 use super::super::step::{read_token, split_rows};
 use super::super::weights::{RAttn, RDelta};
 use super::super::{ResidentDecoder, StepMode, StepResult, hyper as decode_hyper};
 use super::pool::PrefillPool;
-use super::qsa::dense_rows;
+use super::qsa::{QsaBatch, dense_rows, sparse_rows};
 use super::{deltanet, hyper, moe, ple, qsa, start};
 use crate::family::flash_next::deltanet::DeltaShape;
 use crate::family::flash_next::prefill_plan::{
@@ -97,7 +97,18 @@ pub(in super::super) fn open(
 /// last chunk of a prompt.
 pub(in super::super) fn close(decoder: &mut ResidentDecoder<'_>) {
     if let Some(open) = decoder.prefill_pages.take() {
+        #[cfg(feature = "native-fault-qualification")]
+        let memory = super::super::stream_timing::prefill_memory(&decoder.kernels)
+            .map(|before| (open.pool.byte_len(), before));
         open.pool.finish();
+        #[cfg(feature = "native-fault-qualification")]
+        if let Some((mapped_bytes, before)) = memory {
+            super::super::stream_timing::record_prefill_release(
+                &decoder.kernels,
+                mapped_bytes,
+                before,
+            );
+        }
     }
 }
 
@@ -123,9 +134,9 @@ fn check_open(decoder: &ResidentDecoder<'_>, rows: u32) -> Result<(), EngError> 
 ///
 /// The checks that need no native call come first: a closed or too small set of pages, a poisoned
 /// state, and a prompt that passes `qsa::MAX_POSITIONS` return an error and change nothing. The
-/// tokens that fit the dense QSA limit run as one chunk. The rest run as one-token steps, and the
-/// last token of the call runs in `mode`. An error in the one-token part leaves the earlier tokens
-/// published.
+/// tokens that fit the dense QSA limit run as one chunk. The sparse suffix uses the workspace
+/// allowance to bound each batch. The last token runs in `mode`. A failure leaves the earlier
+/// committed chunks published.
 pub(in super::super) fn prefill(
     decoder: &mut ResidentDecoder<'_>,
     state: &mut ResidentState,
@@ -154,20 +165,45 @@ pub(in super::super) fn prefill(
     } else {
         StepMode::Prompt
     };
-    let head = if chunked.is_empty() {
+    let mut output = if chunked.is_empty() {
         None
     } else {
         Some(chunk_with_cap(decoder, state, chunked, chunk_mode, prefill_cap())?.0)
     };
-    match steps.split_last() {
-        None => head.ok_or_else(|| bad("a prefill chunk needs at least one token")),
-        Some((&last, before)) => {
-            for &token in before {
-                decoder.step(state, token, StepMode::Prompt)?;
-            }
-            decoder.step(state, last, mode)
-        }
+    let mut suffix = steps;
+    while !suffix.is_empty() {
+        let rows = if decoder.sparse_prefill_bytes == 0 {
+            1
+        } else {
+            sparse_rows(
+                &decoder.weights.shape.qsa,
+                state.pos(),
+                row_count(suffix)?,
+                decoder.sparse_prefill_bytes,
+            )? as usize
+        };
+        let (piece, rest) = suffix.split_at(rows);
+        let piece_mode = if rest.is_empty() {
+            mode
+        } else {
+            StepMode::Prompt
+        };
+        output = Some(if let &[token] = piece {
+            decoder.step(state, token, piece_mode)?
+        } else {
+            chunk_with_qsa(
+                decoder,
+                state,
+                piece,
+                piece_mode,
+                prefill_cap(),
+                QsaBatch::Sparse,
+            )?
+            .0
+        });
+        suffix = rest;
     }
+    output.ok_or_else(|| bad("a prefill chunk needs at least one token"))
 }
 
 /// Qualification builds only: the retire cap that `PrefillCapOverride` sets, in bytes. Zero means
@@ -243,15 +279,28 @@ pub(in super::super) fn chunk_with_cap(
     mode: StepMode,
     cap: u64,
 ) -> Result<(StepResult, ChunkStats), EngError> {
+    chunk_with_qsa(decoder, state, tokens, mode, cap, QsaBatch::Dense)
+}
+
+fn chunk_with_qsa(
+    decoder: &mut ResidentDecoder<'_>,
+    state: &mut ResidentState,
+    tokens: &[u32],
+    mode: StepMode,
+    cap: u64,
+    batch: QsaBatch,
+) -> Result<(StepResult, ChunkStats), EngError> {
     let rows = row_count(tokens)?;
     check_open(decoder, rows)?;
-    state.check_chunk(&decoder.weights, rows)?;
-    let growth = chunk_growth_bytes(&decoder.weights, rows)?;
+    state.check_chunk(&decoder.weights, rows, batch)?;
+    let growth = qsa_append_growth(&decoder.weights, state.pos(), rows)?;
     let permit = decoder.budget.acquire_growth(growth)?;
+    #[cfg(feature = "native-fault-qualification")]
+    let timing = super::super::stream_timing::begin(&decoder.kernels, state.pos());
     let old = state.begin();
     let result = match decoder.kernels.set_retire_cap(cap) {
         Ok(previous) => {
-            let result = run(decoder, state, old, permit, tokens, mode, cap);
+            let result = run(decoder, state, old, permit, tokens, mode, cap, batch);
             let restored = decoder.kernels.set_retire_cap(previous);
             result.and_then(|out| restored.map(|_| out))
         }
@@ -259,6 +308,10 @@ pub(in super::super) fn chunk_with_cap(
     };
     if let Some(open) = decoder.prefill_pages.as_mut() {
         open.pool.release_lent();
+    }
+    #[cfg(feature = "native-fault-qualification")]
+    if let (Ok(_), Some(timing)) = (&result, timing) {
+        timing.finish(&decoder.kernels, rows, mode, "chunk");
     }
     result
 }
@@ -329,6 +382,10 @@ fn delta_layer(
     Ok(DeltaLayer { out, rec, ring })
 }
 
+#[allow(
+    clippy::too_many_arguments,
+    reason = "one prefill batch and its checked state"
+)]
 fn run(
     decoder: &mut ResidentDecoder<'_>,
     state: &mut ResidentState,
@@ -337,6 +394,7 @@ fn run(
     tokens: &[u32],
     mode: StepMode,
     cap: u64,
+    batch: QsaBatch,
 ) -> Result<(StepResult, ChunkStats), EngError> {
     let rows = row_count(tokens)?;
     let ckpt = decoder.ckpt;
@@ -365,6 +423,10 @@ fn run(
     let mut layers = Vec::with_capacity(old.len());
     let mut records = Vec::new();
     let mut stats = ChunkStats::default();
+    #[cfg(feature = "native-fault-qualification")]
+    let mut dense_unions = (batch == QsaBatch::Dense
+        && super::super::stream_timing::capture_dense_unions())
+    .then(|| Vec::with_capacity(weights.layers.len()));
     for (index, (layer, old_layer)) in weights.layers.iter().zip(old).enumerate() {
         if index == shape.ple_layer {
             let out = ple::block_rows(
@@ -394,7 +456,7 @@ fn run(
                 )
             }
             (RAttn::Qsa(w), cache @ LayerState::Qsa { .. }) => {
-                let s = qsa::chunk(&mut ctx, &shape.qsa, w, &cache, pos, &read.mixed)?;
+                let s = qsa::chunk(&mut ctx, &shape.qsa, w, cache, pos, &read.mixed, batch)?;
                 (s.out, s.state)
             }
             _ => return Err(bad("layer state kind does not match its weights")),
@@ -414,6 +476,10 @@ fn run(
             .waves_extra
             .checked_add(u64::from(waves.saturating_sub(1)))
             .ok_or_else(|| bad("prefill wave count overflows u64"))?;
+        #[cfg(feature = "native-fault-qualification")]
+        if let Some(unions) = &mut dense_unions {
+            unions.push(route.distinct);
+        }
         h = hyper::apply_rows(&mut ctx, &shape.hyper, &h, &gate, &out)?;
         if mode == StepMode::Record {
             records.push(last_row(&mut ctx, &h, rows, branches, hidden)?);
@@ -483,6 +549,10 @@ fn run(
         None => None,
     };
     state.commit_rows(rows, layers, ple_ring, begun.history, permit)?;
+    #[cfg(feature = "native-fault-qualification")]
+    if let Some(unions) = dense_unions {
+        super::super::stream_timing::record_dense_unions(pos, rows, pool.set_experts(), &unions);
+    }
     Ok((
         StepResult {
             token: token_out,
@@ -924,6 +994,34 @@ mod tests {
             .unwrap();
         let used = decoder.kernels.qualification_sync_count() - before;
         assert_eq!(used, 4 + 5 * 4 + 5, "one chunk of 9 and six steps");
+    }
+
+    #[cfg(feature = "native-fault-qualification")]
+    #[test]
+    fn admitted_sparse_prefill_preserves_state_and_reduces_waits() {
+        let _serial = crate::native_test_lock();
+        let (ckpt, flash) = load();
+        let mut decoder = decoder(&ckpt, &flash);
+        let mut control = decoder.zero_state().unwrap();
+        let mut candidate = decoder.zero_state().unwrap();
+        for state in [&mut control, &mut candidate] {
+            steps(&mut decoder, state, &prompt(0, 16));
+        }
+        let tokens = prompt(16, 13);
+        let before = decoder.kernels.qualification_sync_count();
+        let want = decoder
+            .prefill(&mut control, &tokens, StepMode::Generate)
+            .unwrap();
+        let baseline = decoder.kernels.qualification_sync_count() - before;
+        decoder.sparse_prefill_bytes = prefill_cap();
+        let before = decoder.kernels.qualification_sync_count();
+        let got = decoder
+            .prefill(&mut candidate, &tokens, StepMode::Generate)
+            .unwrap();
+        let batched = decoder.kernels.qualification_sync_count() - before;
+        assert_eq!(want.token, got.token);
+        assert!(batched < baseline, "batched {batched}, baseline {baseline}");
+        assert_same_state(&mut decoder, &candidate, &control, "dense 3, sparse 8 + 2");
     }
 
     /// Chunk parity with expert waves. With a wave cap of 1 every layer runs one wave per distinct

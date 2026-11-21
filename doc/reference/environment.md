@@ -39,6 +39,17 @@ NVIDIA documents the [GPU compute capabilities](https://developer.nvidia.com/cud
 | `FIFI_MLX_AUTO_BUDGET` | off | Set to `1` to size Qwen3.6, Qwen3.8 dense, Flash-Next or Flint prefill from Metal's recommended working set at startup. Applies to one MLX model per server and respects configured chunk ceilings. Flint streams selected routed experts from its local checkpoint when its full resident weights exceed the budget. |
 | `FIFI_MLX_WORKING_SET_MIB` | unset | A positive integer ceiling for the planned Metal working set, in MiB. Setting it activates automatic sizing and retains Metal's recommendation as an upper bound. Applies to one MLX model per server. |
 | `FIFI_MLX_REUSE_IDENTITY_RESHAPE` | off | Set to `1` to share a validated native resident tensor when the requested reshape matches its current dimensions. |
+| `FIFI_FLASH_NEXT_MLX_SPARSE_PREFILL` | off | Set to `1` to batch sparse Flash-Next MLX prompt rows when chunked prefill has workspace left over. Each batch has up to eight rows. It shrinks as the prefix grows and takes one-token steps when fewer than two rows fit. |
+| `FIFI_FLASH_NEXT_MLX_CAPACITY_KV` | off | Set to `1` to append QSA keys, values and index keys to geometrically grown Metal buffers. The session budget charges spare rows. Attention and sparse indexing see only the filled prefix. |
+| `FIFI_FLASH_NEXT_MLX_STREAM_TIMING` | off | Set to `1` in an Apple Silicon qualification build to log the existing logical expert-read, page-import and native MLX wait counters per successful Flash-Next forward. |
+| `FIFI_Q36_MLX_DISK_EXPERTS` | off | Set to `1` with MLX device sizing enabled to let Qwen3.6 stage routed experts from local shards when the full expert banks exceed the working set. The streamed path uses one session and charges one layer of expert pages to the prefill plan. |
+| `FIFI_Q36_MLX_DISK_DENSE_FFN` | off | Set to `1` with MLX device sizing enabled to stage the Qwen3.8 dense gate, up and down matrices one layer at a time. Decode and prefill charge the largest layer stage alongside resident weights and session memory. |
+| `FIFI_Q36_MLX_FUSE_FINAL_PREFILL` | off | Set to `1` to include the pending prompt token in the last Qwen3.8 dense prefill batch and reuse its logits at the first decode step. Applies to single-sequence disk-staged FFNs when the enlarged batch fits in one forward. |
+| `FIFI_Q36_MLX_STREAM_TIMING` | off | Set to `1` in an Apple Silicon qualification build to log one timing record per streamed forward. Qwen3.6 MoE reports host routing, logical reads, page staging and native MLX wait times. Qwen3.8 dense reports logical FFN bytes and slice reads. |
+| `FIFI_Q36_MLX_EXPERT_TRACE` | off | Set to `1` in an Apple Silicon qualification build to log the sorted checkpoint expert IDs and logical reads for each staged layer of a Qwen3.6 MoE forward. |
+| `FIFI_MLX_EXPERT_READ_RUNS` | off | Set to `prefill` to group adjacent expert slice reads on the multi-row disk-backed paths in Flint, Flash-Next and Qwen3.6 MoE. Each run covers exactly the selected experts. Flint's legacy read policy and pipeline switches take precedence when set. |
+| `FIFI_MLX_OVERLAP_EXPERT_READS` | off | Set to `1` to submit the independent shared expert to Metal before the same layer's exact routed weights are read on the CPU. This applies to disk-backed Flint, Flash-Next and Qwen3.6 MoE. Flint's legacy pipeline switch takes precedence when set. |
+| `FIFI_MLX_POSITIONED_READS` | off | Set to `1` to read local safetensors shard ranges at explicit offsets in Flint, Flash-Next and Qwen. Contiguous and vectored reads fill the existing buffers for the same validated ranges. |
 
 ## Qwen3.6 on Apple Silicon
 
@@ -50,7 +61,7 @@ NVIDIA documents the [GPU compute capabilities](https://developer.nvidia.com/cud
 | `Q36_FLASH_PREFILL` | on | Fused flash-prefill kernel replaces the composite prefix attention; on since its default-flip gate passed (cohort 2,046 positions: dNLL -0.000080, top-1 98.045%). `0` is the kill switch. Validated at D >= 128 with the Q8 cache and REP 8. |
 | `Q36_FLASH_DELTA` | on | Flash-delta gated rule replaces the recurrent kernel in prefill: the chunked WY-form kernel (4.1x) runs for chunks of 16 rows or more, the recurrent kernel serves decode. `0` is the kill switch. |
 | `Q36_FUSED_DECODE` | off | Opt-in fused decode-middle kernel (conv, SiLU, the q/k/v split, head norms, decay/beta gates and ring-shift as one kernel). Read per call; default off until the parity gates pass. |
-| `Q36_PREFILL_QUERY_SLICE` | none | Opt-in query-block rows for sliced prefill attention, read once. Applies only where the composite attention runs, so it has no effect while the flash kernel serves the chunk. |
+| `Q36_PREFILL_QUERY_SLICE` | none | Opt-in query-block rows for F32, BF16 and Q8 composite prefill attention, read once. Fused flash prefill uses the full eligible chunk. |
 | `Q36_KV_GEOMETRIC` | `0` | Opt-in geometric KV capacity growth: attention caches double to the context limit instead of growing in `KV_STEP` quanta, cutting quadratic copy work over a fill. Read once per process; any value but `0` or `1` fails engine open with `BadRequest`. Under this flag admission and the session reserve charge the ALLOCATED capacity (each layer's `cap`), not the valid length, so the charge tracks the buffers exactly; a growth transient holds one layer's old and new buffers together (about 1.6 GB per layer at the 128K to 256K F32 doubling, computed from buffer sizes, not measured: 0.54 GB old + 1.07 GB new; the new buffer is inside the charge, the old one is the part beyond it). Budget sizing: the FIRST row charges a whole 256-position quantum (262,144 B on the tiny F32 model), so a session cap that admitted the quantum law can deny the first row - size caps for `round_up(context_limit, KV_STEP)` growth bytes over the attention layers. Setting `1` together with `Q36_SPEC_STEP_WINDOW=2` is refused at engine open: the checkpoint-window commit is not yet supported under the geometric law. |
 | `Q36_NO_ACTMUL` (and siblings) | unset | Kill switches for the individual fused-prefill kernels while `Q36_FUSED_PREFILL` stays on: `Q36_NO_ACTMUL`, `Q36_NO_ATTNGATE`, `Q36_NO_EMBEDDED`, `Q36_NO_GDNPREP`, `Q36_NO_GDNPOST`, `Q36_NO_MOECOMBINE`. The variable's presence alone disables that one fusion. |
 
@@ -139,6 +150,11 @@ On Apple Silicon:
 | --- | --- | --- | --- |
 | `FIFI_FLINT_MLX_CONTEXT_LIMIT` | `32768` | `32768`, `8192` | Context limit. Any other value selects 8,192. |
 | `FIFI_FLINT_MLX_BATCH_PREFILL` | `1024` | `1024`, `512`, `0` | Prompt chunk size. `0` processes one token at a time, 50 to 70 times slower. Any other value selects 512. |
+| `FIFI_FLINT_MLX_REQUEST_PREFILL` | off | `1` | Price prefill attention workspace from the admitted prompt span for a fresh request. Requires the Metal budget. Prefix-marked requests and chained prefill keep the startup width. |
+| `FIFI_FLINT_MLX_PREFILL_PAIR` | off | `1`, `auto`, `waves64` | Share expert reads across a fresh two-piece Flint prompt. `1` requires a single shared stage. `auto` tries a single stage and then 64-expert waves. `waves64` requests waves directly. Requires request-aware prefill, disk-backed experts, and the shared-page pipeline. |
+| `FIFI_FLINT_MLX_CANCEL_PREFILL_PAIR` | off | `1` | Stop an admitted Flint pair between layers when the client cancels. The worker discards the partial session before serving the next request. |
+| `FIFI_FLINT_MLX_COMPACT_KV` | off | `1` | Start Flint's full-attention KV planes at 256 rows or the capacity of the first prefill piece, whichever is larger after rounding to a power of two. Double capacity as needed up to the context limit. Sliding-window planes keep their 513 rows. |
+| `FIFI_FLINT_MLX_REQUEST_KV` | off | `1` | Size the initial full-attention KV allocation from the admitted prompt and generation limit. Requires compact KV and an active Metal working-set budget. Requests with prefix boundaries or without a generation limit keep geometric growth. |
 | `FIFI_FLINT_MLX_CACHE_LIMIT` | `67108864` | `67108864`, `0` | MLX freed-buffer cache in bytes. `0` restores the no-cache behavior (a driver round-trip per freed buffer). Any other value selects `0`. |
 | `FIFI_FLINT_MLX_ASYNC_CHAIN` | on | switch | Evaluate decode work in chains of 4 layers instead of synchronizing after every layer. |
 | `FIFI_FLINT_MLX_COALESCE_RESIDUAL` | on | switch | Merge the residual updates of a decode step. |
@@ -150,6 +166,9 @@ On Apple Silicon:
 | `FIFI_FLINT_PREFIX_REUSE` | off | switch | Experimental: keep prefix snapshots between turns. Also needs `"prefix_reuse": true`. |
 | `FIFI_FLINT_PREFIX_BUDGET_BYTES` | physical memory minus weights and a system reserve | positive byte count | Memory cap for prefix snapshots. `0` or an unreadable value refuses startup. |
 | `FIFI_FLINT_MLX_COMPILE_LAYER` | off | switch | Run the layer tail through one compiled MLX closure (graph cache). Fail-safe polarity: absent, non-UTF-8 or any value other than the explicit enable words keeps the eager tail. Read once per process. |
+| `FIFI_FLINT_EXPERT_RECORDS` | off | local file or directory path | In a `native-fault-qualification` build, stage single-row experts from a local sidecar file or from a directory with up to four `.records` files. Each file adds 432 MiB and binds to one routed layer of the current checkpoint. Requires disk-backed experts, shared-page staging and the expert cache off. |
+| `FIFI_FLINT_EXPERT_RECORDS_CONTROL` | off | `1` | In a qualification run with sidecars configured, validate the same files and time the same layers while serving all expert reads from the original shards. |
+| `FIFI_FLINT_MLX_EXPERT_CACHE_MIB` | off | positive MiB, `0` | Reserve per-layer unified-memory slots for packed experts in one-row Flint forwards with automatic device sizing and disk-backed weights. The configured MiB caps the allocation, which is also limited by the remaining Metal budget. |
 | `FIFI_FLINT_MLX_PREFILL_CHAIN` | off | switch | Chained multi-row prefill groups (graph-ordered, fence-free). Default off until an A/B proves at least +10% pp4096 tok/s; any non-enable value is the rollback. |
 
 On NVIDIA CUDA:
@@ -182,6 +201,12 @@ On NVIDIA CUDA:
 | `FIFI_FLINT_CPU_MOE_OVERLAP` | off | With the `cpu_moe_*` keys configured, overlap the CPU expert work with the device step. Resolved once, like the kernel switches above. |
 
 The startup line reports `alloc_cache=`, `late_health=`, `token_health=`, `packed_pointwise=`, `grouped_gather=`, `q8_tiled=`, `kv_device_f16=` and `fused_publish=` (the q8-tile route resolves off on f16 engines). When armed it also ends with `alloc_return=lazy`.
+
+## Nemotron 3.5 on Apple Silicon
+
+| Variable | Default | Meaning |
+| --- | --- | --- |
+| `FIFI_NEM35_CPU_NEON` | off | Set to `1` to use the Arm NEON NVFP4 dot product in the mapped CPU expert pool on Apple Silicon. The pool reads it at construction. [Mapped expert profiling](../how-to/nemotron.md#profile-mapped-experts-on-apple-silicon) |
 
 ## Nemotron 3.5 on NVIDIA CUDA
 

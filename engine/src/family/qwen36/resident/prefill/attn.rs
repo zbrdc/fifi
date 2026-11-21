@@ -205,15 +205,10 @@ pub(super) fn chunk_core(
     let scale = 1.0 / (width as f32).sqrt();
     let blocks = query_block_ranges(rows, slice);
     let att = match cache.buffers.as_ref() {
-        Some(KvBuffers::F32 { k, v }) => {
+        Some(KvBuffers::F32 { k, v } | KvBuffers::Bf16 { k, v }) => {
             attend_blocks(ctx.kernels, &q, pos, &blocks, |kernels, q_block, len, _| {
                 kernels.grouped_attention_prefix(q_block, k, v, len, scale, true)
             })?
-        }
-        // The BF16 form: the same causal prefix attention over the BF16 buffers.
-        Some(KvBuffers::Bf16 { k, v }) => {
-            ctx.kernels
-                .grouped_attention_prefix(&q, k, v, dim(next_len)?, scale, true)?
         }
         Some(KvBuffers::Q8 { k, v }) => {
             let keys = QuantizedKv {
@@ -339,7 +334,7 @@ fn unpad_rep6_output(
     kernels.concatenate(&views, 1)
 }
 
-/// Causal attention over the valid prefix in the 256-row blocks of `Q36_PREFILL_QUERY_SLICE`,
+/// Causal attention over the valid prefix in the blocks of `Q36_PREFILL_QUERY_SLICE`,
 /// concatenating the outputs on the query axis. A block `[start, stop)` of a chunk at position `pos` attends
 /// the first `len = pos + stop` positions with `block_rows = stop - start` queries, and the
 /// causal mask aligned to the last key makes its first query the row `pos + start`: the rows
@@ -1120,15 +1115,16 @@ mod tests {
         values(kernels, &next.out).unwrap()
     }
 
-    /// An F32 cache that holds the decode-step positions `0..warm`.
-    fn f32_warm_cache(
+    /// A float cache that holds the decode-step positions `0..warm`.
+    fn float_warm_cache(
         kernels: &mut MlxKernels,
         w: &ResidentWeights,
         shape: &HostShape,
         rw: &RAttn,
         warm: u32,
+        kv: KvDtype,
     ) -> KvCache {
-        let mut cache = KvCache::with_step(4);
+        let mut cache = KvCache::with_form(kv, 4);
         for n in 0..warm {
             let xr = upload(kernels, vec![1, 64], &input(n));
             let mut ctx = Ctx {
@@ -1167,9 +1163,14 @@ mod tests {
     /// `[start, stop)` attends `pos + stop` positions and its first query is the row
     /// `pos + start`. Blocks of 1, 2 and 3 rows give the output of the whole-chunk call to
     /// float noise, and a block that covers the chunk is that call, bit for bit.
-    fn sliced_blocks_match_the_whole_chunk(q8: bool) {
+    fn sliced_blocks_match_the_whole_chunk(kv: KvDtype) {
         let _serial = crate::native_test_lock();
-        let (_ckpt, oracle, w, mut kernels) = if q8 { setup_kv8() } else { setup() };
+        let (_ckpt, oracle, w, mut kernels) = if kv == KvDtype::Q8 {
+            setup_kv8()
+        } else {
+            setup()
+        };
+        kernels.allow_bf16(kv == KvDtype::Bf16);
         let shape = oracle.shape().clone();
         let RMixer::Attn(rw) = &w.layers[1].mixer else {
             panic!("resident layer 1 is attention");
@@ -1177,21 +1178,28 @@ mod tests {
         let (warm, count) = (3u32, 7u32);
         let data: Vec<f32> = (warm..warm + count).flat_map(input).collect();
         let mut run = |slice: Option<u32>| {
-            let cache = if q8 {
+            let cache = if kv == KvDtype::Q8 {
                 q8_warm_cache(&mut kernels, &w, &shape, rw, warm, None)
             } else {
-                f32_warm_cache(&mut kernels, &w, &shape, rw, warm)
+                float_warm_cache(&mut kernels, &w, &shape, rw, warm, kv)
             };
-            chunk_output(&mut kernels, &w, &shape, rw, cache, warm, &data, slice)
+            let before = crate::kernels::mlx::dispatch_count();
+            let output = chunk_output(&mut kernels, &w, &shape, rw, cache, warm, &data, slice);
+            (output, crate::kernels::mlx::dispatch_count() - before)
         };
-        let whole = run(None);
+        let (whole, whole_dispatches) = run(None);
         assert!(whole.iter().all(|value| value.is_finite()));
         let mut worst = 0f32;
         for slice in SLICES {
-            let sliced = run(Some(slice));
+            let (sliced, dispatches) = run(Some(slice));
             let gap = max_gap(&sliced, &whole);
-            println!("q8 {q8}, slice {slice}: gap {gap}");
-            if slice >= count {
+            println!("{kv:?}, slice {slice}: gap {gap}");
+            if slice < count {
+                assert!(
+                    dispatches > whole_dispatches,
+                    "the query blocks must dispatch"
+                );
+            } else {
                 assert_eq!(
                     sliced, whole,
                     "a block covering the chunk is the whole call"
@@ -1204,12 +1212,17 @@ mod tests {
 
     #[test]
     fn sliced_q8_query_blocks_match_the_whole_chunk_call() {
-        sliced_blocks_match_the_whole_chunk(true);
+        sliced_blocks_match_the_whole_chunk(KvDtype::Q8);
     }
 
     #[test]
     fn sliced_f32_query_blocks_match_the_whole_chunk_call() {
-        sliced_blocks_match_the_whole_chunk(false);
+        sliced_blocks_match_the_whole_chunk(KvDtype::F32);
+    }
+
+    #[test]
+    fn sliced_bf16_query_blocks_match_the_whole_chunk_call() {
+        sliced_blocks_match_the_whole_chunk(KvDtype::Bf16);
     }
 
     /// The causality test of `a_q8_chunk_row_never_reads_a_later_row` with the queries in blocks

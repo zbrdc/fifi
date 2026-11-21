@@ -29,7 +29,7 @@ use super::moe::{self, Routing};
 use super::ops::{Ctx, cast_to, linear, short_import, to_act, values};
 use super::state::{LayerState, ResidentState};
 use super::weights::{RFeedForward, RMixer};
-use super::{attn, delta};
+use super::{attn, delta, stream_timing::ForwardTiming};
 use crate::family::qwen36::settings::KvDtype;
 use crate::{
     EngError,
@@ -90,6 +90,7 @@ pub(super) fn run(
     let weights = &decoder.weights;
     let shape = &weights.shape;
     let pos = state.pos();
+    let mut timing = ForwardTiming::begin(&decoder.kernels, weights, pos);
     let last = weights.layers.len().saturating_sub(1);
     // The test-only graph probe leaves the decoder before `ctx` borrows its
     // kernels. `None` in every run that sets no probe, so the step is what it was without this.
@@ -160,9 +161,19 @@ pub(super) fn run(
             (RFeedForward::Dense(w), _) => {
                 moe::dense_rows(&mut ctx, shape, w, &mid, &layer.post_norm)?
             }
+            (RFeedForward::StagedDense(stage), _) => {
+                stage.evaluate(&mut ctx, ckpt, shape, &mid, &layer.post_norm)?
+            }
             (RFeedForward::Moe(w), Routing::Host) => {
-                let (out, (selection, probs)) =
-                    moe::step(&mut ctx, shape, w, &mid, &layer.post_norm)?;
+                let (out, (selection, probs)) = moe::step_with_checkpoint(
+                    &mut ctx,
+                    shape,
+                    w,
+                    &mid,
+                    &layer.post_norm,
+                    Some(ckpt),
+                    &mut timing,
+                )?;
                 if mode == StepMode::Record {
                     host_routes.push(selection.iter().map(|pick| pick.0).collect());
                     host_probs.push(probs);
@@ -195,7 +206,7 @@ pub(super) fn run(
     let head_routing = if weights
         .layers
         .iter()
-        .all(|layer| matches!(&layer.feed_forward, RFeedForward::Dense(_)))
+        .all(|layer| layer.feed_forward.is_dense())
     {
         Routing::Host
     } else {
@@ -312,6 +323,9 @@ pub(super) fn run(
         _ => None,
     };
     state.commit(layers, permit)?;
+    if let Some(timing) = timing {
+        timing.finish(ctx.kernels, 1, mode);
+    }
     Ok(StepResult {
         window_logits: None,
         token: token_out,

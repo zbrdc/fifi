@@ -36,28 +36,25 @@ pub(crate) fn start_engine(
     prefix_reuse: bool,
     ready_note: ReadyNote,
 ) -> Result<StartedEngine, EngError> {
-    let env = FlashEnv {
-        manifest: std::env::var("FLASH_NEXT_ARTIFACT_MANIFEST").ok(),
-        cache_limit: std::env::var("FLASH_NEXT_CACHE_LIMIT").ok(),
-    };
-    start_engine_with(
+    start_engine_resolved(
         model_dir,
         tokenizer_dir,
         options,
-        &env,
+        &FlashEnv::capture(),
         prefix_reuse,
         ready_note,
     )
+    .map(|(engine, _)| engine)
 }
 
-fn start_engine_with(
+pub(crate) fn start_engine_resolved(
     model_dir: &Path,
     tokenizer_dir: &Path,
     options: Option<&FlashOptions>,
     env: &FlashEnv,
     prefix_reuse: bool,
     ready_note: ReadyNote,
-) -> Result<StartedEngine, EngError> {
+) -> Result<(StartedEngine, FlashSettings), EngError> {
     let settings = FlashSettings::new(model_dir, tokenizer_dir, options, env)?;
     if settings.manifest_found_in_pack {
         eprintln!(
@@ -68,11 +65,24 @@ fn start_engine_with(
     // The CUDA decoder serves the positions its caches hold (the memory plan's choice when the
     // config sets none); the MLX one a fixed limit.
     let (engine, bundle, context_limit) = launch(&settings, prefix_reuse, ready_note)?;
-    Ok(StartedEngine {
-        engine,
-        bundle,
-        context_limit,
-    })
+    Ok((
+        StartedEngine {
+            engine,
+            bundle,
+            context_limit,
+        },
+        settings,
+    ))
+}
+
+pub(crate) fn check_mlx_settings(settings: &FlashSettings) -> Result<(), EngError> {
+    if settings.cuda.is_some() {
+        return Err(EngError::BadRequest(
+            "engine config: cuda_decode needs a build with --features native-cuda on Linux; this build serves Flash-Next on MLX"
+                .to_string(),
+        ));
+    }
+    Ok(())
 }
 
 #[cfg(all(feature = "native-mlx", target_os = "macos", target_arch = "aarch64"))]
@@ -81,12 +91,7 @@ fn launch(
     prefix_reuse: bool,
     ready_note: ReadyNote,
 ) -> Result<(Engine, TokenizerBundle, u32), EngError> {
-    if settings.cuda.is_some() {
-        return Err(EngError::BadRequest(
-            "engine config: cuda_decode needs a build with --features native-cuda on Linux; this build serves Flash-Next on MLX"
-                .to_string(),
-        ));
-    }
+    check_mlx_settings(settings)?;
     let (engine, bundle) = super::start::start(settings, prefix_reuse, ready_note)?;
     Ok((engine, bundle, CONTEXT_LIMIT))
 }
@@ -129,7 +134,7 @@ fn launch(
 
 #[cfg(test)]
 mod tests {
-    use super::{CONTEXT_LIMIT, FAMILY, FlashEnv, start_engine_with};
+    use super::{CONTEXT_LIMIT, FAMILY, FlashEnv, start_engine_resolved};
     use crate::{EngError, family::flash_next::settings::FlashOptions};
     use std::path::Path;
 
@@ -142,7 +147,8 @@ mod tests {
     }
 
     fn start(options: Option<&FlashOptions>, env: &FlashEnv) -> Result<(), EngError> {
-        start_engine_with(Path::new("/a"), Path::new("/a"), options, env, false, None).map(|_| ())
+        start_engine_resolved(Path::new("/a"), Path::new("/a"), options, env, false, None)
+            .map(|_| ())
     }
 
     #[test]

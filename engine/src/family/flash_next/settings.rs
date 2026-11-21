@@ -211,6 +211,15 @@ pub(crate) struct FlashEnv {
     pub(crate) cache_limit: Option<String>,
 }
 
+impl FlashEnv {
+    pub(crate) fn capture() -> Self {
+        Self {
+            manifest: std::env::var("FLASH_NEXT_ARTIFACT_MANIFEST").ok(),
+            cache_limit: std::env::var("FLASH_NEXT_CACHE_LIMIT").ok(),
+        }
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct FlashSettings {
     /// The artifact directory with the safetensors shards and `config.json`.

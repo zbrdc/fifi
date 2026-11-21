@@ -10,7 +10,7 @@ use crate::{
     kernels::{PackedWeight, QuantizationMode, QuantizationSpec},
     tensor::{Dtype, Tensor},
     weights::{
-        AcquireRequest, CancelHandle, Completion, Priority, Selection, ShardHeader, ShardIo,
+        AcquireRequest, CancelHandle, Completion, Priority, Selection, ShardHeader,
         StreamedCheckpoint,
     },
 };
@@ -18,6 +18,13 @@ use crate::{
 #[path = "weights_profile.rs"]
 mod profile;
 use profile::Profile;
+#[cfg(all(
+    feature = "native-fault-qualification",
+    target_os = "macos",
+    target_arch = "aarch64"
+))]
+#[path = "weights_records.rs"]
+pub(super) mod records;
 
 const HEADER_LIMIT: u64 = 16 * 1024 * 1024;
 const EMBEDDING: &str = "model.embed_tokens";
@@ -25,6 +32,22 @@ const EMBEDDING: &str = "model.embed_tokens";
 pub(super) struct FlintCheckpoint {
     weights: StreamedCheckpoint,
     profile: Profile,
+    #[cfg(all(
+        feature = "native-fault-qualification",
+        target_os = "macos",
+        target_arch = "aarch64"
+    ))]
+    records: Option<records::RecordSet>,
+}
+
+#[cfg(all(feature = "native-mlx", target_os = "macos", target_arch = "aarch64"))]
+pub(super) struct ExpertPageLayout {
+    stacks: Vec<(
+        crate::family::stored::SlicedWeight,
+        crate::family::stored::StackLayout,
+    )>,
+    pub(super) packed: Vec<crate::kernels::PackedPages>,
+    pub(super) index_offset: usize,
 }
 
 impl FlintCheckpoint {
@@ -48,12 +71,33 @@ impl FlintCheckpoint {
                 "requires exactly the five published safetensors shards",
             ));
         }
-        let mut shards: Vec<(String, Box<dyn ShardIo + Send>, u64)> = Vec::new();
+        let mut shards = Vec::new();
         let mut routes = BTreeMap::new();
+        #[cfg(all(
+            feature = "native-fault-qualification",
+            target_os = "macos",
+            target_arch = "aarch64"
+        ))]
+        let records = std::env::var_os("FIFI_FLINT_EXPERT_RECORDS");
+        #[cfg(all(
+            feature = "native-fault-qualification",
+            target_os = "macos",
+            target_arch = "aarch64"
+        ))]
+        let mut stamps = Vec::new();
         for path in paths {
             guard.check(&path, "model weights")?;
             let mut file = File::open(&path).map_err(checkpoint_io)?;
-            let len = file.metadata().map_err(checkpoint_io)?.len();
+            let meta = file.metadata().map_err(checkpoint_io)?;
+            let len = meta.len();
+            #[cfg(all(
+                feature = "native-fault-qualification",
+                target_os = "macos",
+                target_arch = "aarch64"
+            ))]
+            if records.is_some() {
+                stamps.push(records::ShardStamp::from(&meta));
+            }
             let header = ShardHeader::read(&mut file, len, HEADER_LIMIT)?;
             let name = path
                 .file_name()
@@ -65,13 +109,13 @@ impl FlintCheckpoint {
                     return Err(invalid(&format!("duplicate tensor {key}")));
                 }
             }
-            shards.push((name, Box::new(file), len));
+            shards.push((name, file, len));
         }
         // The publisher has no index. Derive only routing, then let the common
         // indexed reader check the same file handles and all header membership.
         let index = serde_json::to_vec(&serde_json::json!({"weight_map": routes}))
             .map_err(|error| invalid(&format!("derived index: {error}")))?;
-        let weights = StreamedCheckpoint::open(&index, shards, HEADER_LIMIT)?;
+        let weights = StreamedCheckpoint::open_files(&index, shards, HEADER_LIMIT)?;
         let profile = Profile::pinned();
         if routes.len() != profile.tensors.len() {
             return Err(invalid(
@@ -85,7 +129,38 @@ impl FlintCheckpoint {
                 )));
             }
         }
-        Ok(Self { weights, profile })
+        #[cfg(all(
+            feature = "native-fault-qualification",
+            target_os = "macos",
+            target_arch = "aarch64"
+        ))]
+        let records = records
+            .as_deref()
+            .map(|path| {
+                let control = std::env::var_os("FIFI_FLINT_EXPERT_RECORDS_CONTROL")
+                    .is_some_and(|value| value == "1");
+                records::RecordSet::open(Path::new(path), &stamps, !control)
+            })
+            .transpose()?;
+        Ok(Self {
+            weights,
+            profile,
+            #[cfg(all(
+                feature = "native-fault-qualification",
+                target_os = "macos",
+                target_arch = "aarch64"
+            ))]
+            records,
+        })
+    }
+
+    #[cfg(all(
+        feature = "native-fault-qualification",
+        target_os = "macos",
+        target_arch = "aarch64"
+    ))]
+    pub(super) fn expert_record_description(&self) -> Option<String> {
+        self.records.as_ref().map(records::RecordSet::describe)
     }
 
     pub(super) fn tensor(&self, name: &str) -> Result<Tensor, EngError> {
@@ -153,26 +228,14 @@ impl FlintCheckpoint {
     /// extents, so this reader stays separate from `weights::expert_store`
     /// until the store's vocabulary grows per-extent addressing.
     #[cfg(all(feature = "native-mlx", target_os = "macos", target_arch = "aarch64"))]
-    pub(super) fn expert_pages(
+    pub(super) fn expert_page_layout(
         &self,
         stem: &str,
-        ids: &[u32],
-        remapped: &Tensor,
-        coalesce_reads: bool,
-    ) -> Result<
-        (
-            crate::kernels::HostPages,
-            Vec<crate::kernels::PackedPages>,
-            crate::kernels::PageRange,
-        ),
-        EngError,
-    > {
-        use crate::family::stored::{
-            RoleRange, StackLayout, read_stack_into, read_stack_runs_into,
-        };
+        count: u32,
+    ) -> Result<ExpertPageLayout, EngError> {
+        use crate::family::stored::{RoleRange, StackLayout};
         use crate::kernels::{HostPages, PackedPages, PageRange};
 
-        let count = u32::try_from(ids.len()).map_err(|_| invalid("too many Flint expert IDs"))?;
         let page = HostPages::page_size();
         let mut end = 0;
         let mut stacks = Vec::with_capacity(3);
@@ -195,6 +258,62 @@ impl FlintCheckpoint {
             end = layout.end;
             stacks.push((weight, layout));
         }
+        let range = |role: &RoleRange| PageRange {
+            offset: role.offset,
+            dtype: role.dtype,
+            shape: role.shape.clone(),
+        };
+        let packed = stacks
+            .iter()
+            .map(|(_, layout)| PackedPages {
+                payload: range(&layout.payload),
+                scales: range(&layout.scales),
+                biases: layout.biases.as_ref().map(range),
+                logical_shape: layout.logical_shape.clone(),
+                quantization: layout.spec,
+            })
+            .collect();
+        Ok(ExpertPageLayout {
+            stacks,
+            packed,
+            index_offset: end,
+        })
+    }
+
+    #[cfg(all(feature = "native-mlx", target_os = "macos", target_arch = "aarch64"))]
+    pub(super) fn read_expert_slots(
+        &self,
+        layout: &ExpertPageLayout,
+        slots: &[(u32, usize)],
+        dst: &mut [u8],
+    ) -> Result<(), EngError> {
+        for (weight, stack) in &layout.stacks {
+            crate::family::stored::read_stack_slots_into(&self.weights, weight, slots, dst, stack)?;
+        }
+        Ok(())
+    }
+
+    #[cfg(all(feature = "native-mlx", target_os = "macos", target_arch = "aarch64"))]
+    pub(super) fn expert_pages(
+        &self,
+        stem: &str,
+        ids: &[u32],
+        remapped: &Tensor,
+        coalesce_reads: bool,
+    ) -> Result<
+        (
+            crate::kernels::HostPages,
+            Vec<crate::kernels::PackedPages>,
+            crate::kernels::PageRange,
+        ),
+        EngError,
+    > {
+        use crate::family::stored::{read_stack_into, read_stack_runs_into};
+        use crate::kernels::{HostPages, PageRange};
+
+        let count = u32::try_from(ids.len()).map_err(|_| invalid("too many Flint expert IDs"))?;
+        let layout = self.expert_page_layout(stem, count)?;
+        let end = layout.index_offset;
         let local_bytes = remapped
             .host_bytes()
             .ok_or_else(|| invalid("expert IDs need host bytes"))?;
@@ -206,36 +325,45 @@ impl FlintCheckpoint {
             operation: "Flint expert staging",
             message: "fresh expert pages are not writable".into(),
         })?;
-        for (weight, layout) in &stacks {
-            let read_stack = if coalesce_reads {
-                read_stack_runs_into
-            } else {
-                read_stack_into
-            };
-            read_stack(&self.weights, weight, ids, dst, layout)?;
+        let read_stack = if coalesce_reads {
+            read_stack_runs_into
+        } else {
+            read_stack_into
+        };
+        #[cfg(feature = "native-fault-qualification")]
+        let probe = self
+            .records
+            .as_ref()
+            .filter(|_| remapped.shape() == [6])
+            .and_then(|records| records.for_stem(stem));
+        #[cfg(feature = "native-fault-qualification")]
+        let started =
+            (probe.is_some() && super::mlx_expert_timing::enabled()).then(std::time::Instant::now);
+        #[cfg(feature = "native-fault-qualification")]
+        let records_used = if let Some((record, true)) = probe {
+            record.read(&layout, ids, dst)?;
+            true
+        } else {
+            false
+        };
+        #[cfg(not(feature = "native-fault-qualification"))]
+        let records_used = false;
+        if !records_used {
+            for (weight, layout) in &layout.stacks {
+                read_stack(&self.weights, weight, ids, dst, layout)?;
+            }
+        }
+        #[cfg(feature = "native-fault-qualification")]
+        if let Some(started) = started {
+            records::record_layer_read(started.elapsed(), records_used);
         }
         dst[end..id_end].copy_from_slice(local_bytes);
-        let range = |role: &RoleRange| PageRange {
-            offset: role.offset,
-            dtype: role.dtype,
-            shape: role.shape.clone(),
-        };
-        let packed = stacks
-            .into_iter()
-            .map(|(_, layout)| PackedPages {
-                payload: range(&layout.payload),
-                scales: range(&layout.scales),
-                biases: layout.biases.as_ref().map(range),
-                logical_shape: layout.logical_shape,
-                quantization: layout.spec,
-            })
-            .collect();
         let local = PageRange {
             offset: end,
             dtype: remapped.dtype(),
             shape: remapped.shape().to_vec(),
         };
-        Ok((pages, packed, local))
+        Ok((pages, layout.packed, local))
     }
 
     pub(super) fn embedding_rows(&self, ids: &[u32]) -> Result<PackedWeight, EngError> {
@@ -428,3 +556,12 @@ fn invalid(message: &str) -> EngError {
 #[cfg(test)]
 #[path = "weights_tests.rs"]
 mod tests;
+
+#[cfg(all(
+    test,
+    feature = "native-fault-qualification",
+    target_os = "macos",
+    target_arch = "aarch64"
+))]
+#[path = "weights_cache_bench.rs"]
+mod cache_bench;

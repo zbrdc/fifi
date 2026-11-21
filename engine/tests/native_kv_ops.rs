@@ -384,6 +384,109 @@ fn kv_append_donates_the_buffer_over_200_appends() {
     kernels.set_retire_cap(previous_cap).unwrap();
 }
 
+/// Operator comparison at representative serving geometries, with and without
+/// a pinned prefix snapshot. Imports and parity readbacks are outside timing.
+#[test]
+#[ignore = "synchronized Apple Silicon KV copy and allocation measurements"]
+fn mlx_kv_append_storage_matrix() {
+    let _serial = GPU_TEST.lock().unwrap();
+    let samples = std::env::var("FIFI_MLX_KV_APPEND_SAMPLES")
+        .map_or(5, |value| value.parse::<u32>().unwrap());
+    assert!((1..=32).contains(&samples));
+    let mut kernels = MlxKernels::try_new().unwrap();
+    kernels.allow_bf16(true);
+    kernels.set_cache_limit(16 << 20).unwrap();
+    let filled = |dtype: Dtype, shape: [u32; 4], byte| {
+        let elements = shape.iter().map(|&n| n as usize).product::<usize>();
+        let width = if dtype == Dtype::Bf16 { 2 } else { 4 };
+        Tensor::try_from_host(dtype, shape.to_vec(), vec![byte; elements * width]).unwrap()
+    };
+    for (family, dtype, heads, width) in [
+        ("flash-next-f32", Dtype::F32, 2, 256),
+        ("qwen36-q8-codes", Dtype::U32, 2, 64),
+        ("qwen38-dense-bf16", Dtype::Bf16, 4, 256),
+        ("flint-bf16", Dtype::Bf16, 4, 128),
+    ] {
+        let row = import(&mut kernels, &filled(dtype, [1, heads, 1, width], 0x40));
+        let modes: &[&str] = if dtype == Dtype::U32 {
+            &["unique", "snapshot"]
+        } else {
+            &["concatenate", "unique", "snapshot"]
+        };
+        for pos in [8_191, 32_767] {
+            for sample in 0..=samples {
+                let first = sample as usize % modes.len();
+                for &mode in modes.iter().cycle().skip(first).take(modes.len()) {
+                    let capacity = if mode == "concatenate" { pos } else { pos + 1 };
+                    let target = import(
+                        &mut kernels,
+                        &filled(dtype, [1, heads, capacity, width], 0x20),
+                    );
+                    let old = (mode == "snapshot").then(|| target.share());
+                    kernels.reset_peak_memory().unwrap();
+                    let start = kernels.memory_stats().unwrap().active;
+                    let began = Instant::now();
+                    let out = if mode == "concatenate" {
+                        let out = kernels.concatenate(&[&target, &row], 2).unwrap();
+                        drop(target);
+                        out
+                    } else {
+                        kernels.kv_append(target, &row, &[0, 0, pos, 0]).unwrap()
+                    };
+                    kernels.evaluate(&[&out]).unwrap();
+                    let elapsed = began.elapsed().as_nanos();
+                    let extra = kernels.memory_stats().unwrap().peak.saturating_sub(start);
+                    assert_eq!(out.shape(), [1, heads, pos + 1, width]);
+                    if sample == 0 {
+                        let prev = kernels
+                            .slice(&out, &[0, 0, pos - 1, 0], &[1, heads, pos, width])
+                            .unwrap();
+                        let last = kernels
+                            .slice(&out, &[0, 0, pos, 0], &[1, heads, pos + 1, width])
+                            .unwrap();
+                        assert!(
+                            kernels
+                                .readback(&prev)
+                                .unwrap()
+                                .host_bytes()
+                                .unwrap()
+                                .iter()
+                                .all(|&b| b == 0x20)
+                        );
+                        assert!(
+                            kernels
+                                .readback(&last)
+                                .unwrap()
+                                .host_bytes()
+                                .unwrap()
+                                .iter()
+                                .all(|&b| b == 0x40)
+                        );
+                        if let Some(old) = &old {
+                            let saved = kernels
+                                .slice(old, &[0, 0, pos, 0], &[1, heads, pos + 1, width])
+                                .unwrap();
+                            assert!(
+                                kernels
+                                    .readback(&saved)
+                                    .unwrap()
+                                    .host_bytes()
+                                    .unwrap()
+                                    .iter()
+                                    .all(|&b| b == 0x20)
+                            );
+                        }
+                    } else {
+                        println!(
+                            "kv_append_sample,{family},{pos},{sample},{mode},{elapsed},{extra}"
+                        );
+                    }
+                }
+            }
+        }
+    }
+}
+
 /// Queries, keys, and values of one attention configuration with exact small-integer patterns.
 fn attention_parts(queries: u32, capacity: u32, width: u32) -> (Tensor, Tensor, Tensor) {
     let q = f32_pattern(&[1, 16, queries, width], |index| {

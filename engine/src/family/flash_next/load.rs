@@ -33,6 +33,66 @@ pub(crate) fn model_shape(config: &[u8]) -> Result<(ModelShape, Vec<bool>), EngE
     Ok((shape, dims.kinds))
 }
 
+/// Packed payloads that the resident MLX importer always loads.
+#[cfg(all(feature = "native-mlx", target_os = "macos", target_arch = "aarch64"))]
+pub(super) fn resident_packed_payload(key: &str, kinds: &[bool], ple_layer: usize) -> bool {
+    if key == "language_model.lm_head.weight" {
+        return true;
+    }
+    let Some(module) = key
+        .strip_prefix(MODEL)
+        .and_then(|name| name.strip_suffix(".weight"))
+    else {
+        return false;
+    };
+    if matches!(
+        module,
+        "hyper_connection_mixer.input_mix_weight_down"
+            | "hyper_connection_mixer.input_mix_weight_up"
+    ) {
+        return true;
+    }
+    let Some((layer, role)) = module
+        .strip_prefix("layers.")
+        .and_then(|name| name.split_once('.'))
+    else {
+        return false;
+    };
+    let Ok(index) = layer.parse::<usize>() else {
+        return false;
+    };
+    let Some(&qsa) = kinds.get(index).filter(|_| layer == index.to_string()) else {
+        return false;
+    };
+    if let Some(projection) = role
+        .strip_prefix("attn_hyper_connection.")
+        .or_else(|| role.strip_prefix("mlp_hyper_connection."))
+    {
+        return matches!(
+            projection,
+            "input_mix_weight_down" | "input_mix_weight_up" | "block_inject_weight"
+        );
+    }
+    match role {
+        "self_attn.q_proj"
+        | "self_attn.k_proj"
+        | "self_attn.v_proj"
+        | "self_attn.o_proj"
+        | "self_attn.indexer.index_qk_proj" => qsa,
+        "linear_attn.in_proj_qkv"
+        | "linear_attn.in_proj_z"
+        | "linear_attn.in_proj_b"
+        | "linear_attn.in_proj_a"
+        | "linear_attn.out_proj" => !qsa,
+        "mlp.shared_expert.gate_proj"
+        | "mlp.shared_expert.up_proj"
+        | "mlp.shared_expert.down_proj"
+        | "mlp.shared_expert_gate" => true,
+        "ple.key_proj" | "ple.value_proj" => index == ple_layer,
+        _ => false,
+    }
+}
+
 struct Dims {
     hidden: u32,
     eps: f32,

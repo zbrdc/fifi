@@ -272,6 +272,24 @@ pub(crate) fn sliced(
     })
 }
 
+/// Describe a rank-two packed matrix as contiguous single-row slices.
+pub(crate) fn sliced_matrix(
+    ckpt: &StreamedCheckpoint,
+    stem: &str,
+    spec: QuantizationSpec,
+    rows: u32,
+    cols: u32,
+) -> Result<SlicedWeight, EngError> {
+    let weight = sliced(ckpt, stem, spec, 1, cols)?;
+    if weight.slices != rows {
+        return Err(EngError::Checkpoint(format!(
+            "tensor {stem}.weight has {} rows, expected {rows}",
+            weight.slices
+        )));
+    }
+    Ok(weight)
+}
+
 /// Reads one role of slice `index`, keeping a single row as rank 2.
 fn read_role(
     ckpt: &StreamedCheckpoint,
@@ -394,6 +412,21 @@ pub(crate) struct StackLayout {
 }
 
 impl StackLayout {
+    #[cfg(all(feature = "native-mlx", target_os = "macos", target_arch = "aarch64"))]
+    pub(crate) fn matrix(
+        ckpt: &StreamedCheckpoint,
+        weight: &SlicedWeight,
+        base: usize,
+        page: usize,
+    ) -> Result<Self, EngError> {
+        if weight.slice_rows != 1 {
+            return Err(EngError::Checkpoint(
+                "dense staging needs a packed matrix".into(),
+            ));
+        }
+        Self::new(ckpt, weight, weight.slices, base, page)
+    }
+
     /// The publisher stores expert payloads as U8. A page import can view the
     /// same byte ranges as U32 words without a repacking copy.
     #[cfg(all(feature = "native-mlx", target_os = "macos", target_arch = "aarch64"))]
@@ -505,11 +538,43 @@ impl StackLayout {
         })
     }
 
-    fn roles(&self) -> impl Iterator<Item = (&'static str, &RoleRange)> {
+    pub(crate) fn roles(&self) -> impl Iterator<Item = (&'static str, &RoleRange)> {
         [("weight", &self.payload), ("scales", &self.scales)]
             .into_iter()
             .chain(self.biases.as_ref().map(|range| ("biases", range)))
     }
+}
+
+/// Fill selected positions of a persistent page bank with exact checkpoint slices.
+/// Callers own the mappings and publish a slot only after all of its roles have loaded.
+#[cfg(all(feature = "native-mlx", target_os = "macos", target_arch = "aarch64"))]
+pub(crate) fn read_stack_slots_into(
+    ckpt: &StreamedCheckpoint,
+    weight: &SlicedWeight,
+    slots: &[(u32, usize)],
+    dst: &mut [u8],
+    layout: &StackLayout,
+) -> Result<(), EngError> {
+    if layout.end > dst.len()
+        || slots
+            .iter()
+            .any(|&(id, rank)| id >= weight.slices || rank >= layout.count as usize)
+    {
+        return Err(EngError::BadRequest(
+            "expert cache slot outside its checked layout".into(),
+        ));
+    }
+    for (role, range) in layout.roles() {
+        let key = format!("{}.{role}", weight.stem);
+        for &(id, rank) in slots {
+            let start = range.offset + rank * range.slice_len;
+            let end = start + range.slice_len;
+            counted_read(range.slice_len, || {
+                ckpt.read_slice_into(&key, id, &mut dst[start..end])
+            })?;
+        }
+    }
+    Ok(())
 }
 
 /// Expert slice reads and page imports since the last reset (qualification builds only).
@@ -537,7 +602,7 @@ mod expert_counters {
 
 /// Runs one slice read of `bytes` bytes and, in qualification builds, counts it with its wall time.
 #[cfg(feature = "native-fault-qualification")]
-fn counted_read<T>(bytes: usize, read: impl FnOnce() -> T) -> T {
+pub(crate) fn counted_read<T>(bytes: usize, read: impl FnOnce() -> T) -> T {
     use expert_counters::{READ_BYTES, READ_NS, SLICE_READS, add, ns};
     let started = std::time::Instant::now();
     let out = read();
@@ -635,6 +700,40 @@ pub(crate) fn read_stack_runs_into(
     read_stack_to_pages::<true>(ckpt, weight, indices, dst, layout)
 }
 
+/// Read each role of a whole packed matrix once into its aligned destination.
+#[cfg(all(feature = "native-mlx", target_os = "macos", target_arch = "aarch64"))]
+pub(crate) fn read_matrix_into(
+    ckpt: &StreamedCheckpoint,
+    weight: &SlicedWeight,
+    dst: &mut [u8],
+    layout: &StackLayout,
+) -> Result<(), EngError> {
+    if weight.slice_rows != 1 || layout.count != weight.slices || layout.end > dst.len() {
+        return Err(EngError::BadRequest(format!(
+            "invalid matrix staging for {}",
+            weight.stem
+        )));
+    }
+    for (role, range) in layout.roles() {
+        let target = range
+            .slice_len
+            .checked_mul(layout.count as usize)
+            .and_then(|len| range.offset.checked_add(len))
+            .and_then(|end| dst.get_mut(range.offset..end))
+            .ok_or_else(|| {
+                EngError::BadRequest(format!(
+                    "matrix staging range for {}.{role} overflows",
+                    weight.stem
+                ))
+            })?;
+        let key = format!("{}.{role}", weight.stem);
+        counted_read(target.len(), || {
+            ckpt.read_slice_run_into(&key, 0, layout.count, target)
+        })?;
+    }
+    Ok(())
+}
+
 fn read_stack_to_pages<const COALESCE: bool>(
     ckpt: &StreamedCheckpoint,
     weight: &SlicedWeight,
@@ -670,10 +769,7 @@ fn read_stack_to_pages<const COALESCE: bool>(
         while rank < indices.len() {
             let index = indices[rank];
             let count = if COALESCE {
-                1 + indices[rank..]
-                    .windows(2)
-                    .take_while(|pair| pair[0].checked_add(1) == Some(pair[1]))
-                    .count()
+                consecutive_count(&indices[rank..])
             } else {
                 1
             };
@@ -705,6 +801,13 @@ fn read_stack_to_pages<const COALESCE: bool>(
         }
     }
     Ok(())
+}
+
+fn consecutive_count(indices: &[u32]) -> usize {
+    1 + indices
+        .windows(2)
+        .take_while(|pair| pair[0].checked_add(1) == Some(pair[1]))
+        .count()
 }
 
 /// Expands BF16 values to F32 inside one buffer, with no second buffer.
@@ -851,6 +954,34 @@ pub(crate) fn read_stacked_into(
     layouts: &StackedLayouts<'_>,
     f32_scales: bool,
 ) -> Result<(), EngError> {
+    read_stacked::<false>(ckpt, gate, up, indices, dst, layouts, f32_scales)
+}
+
+#[cfg(any(
+    test,
+    all(feature = "native-mlx", target_os = "macos", target_arch = "aarch64")
+))]
+pub(crate) fn read_stacked_runs_into(
+    ckpt: &StreamedCheckpoint,
+    gate: &SlicedWeight,
+    up: &SlicedWeight,
+    indices: &[u32],
+    dst: &mut [u8],
+    layouts: &StackedLayouts<'_>,
+    f32_scales: bool,
+) -> Result<(), EngError> {
+    read_stacked::<true>(ckpt, gate, up, indices, dst, layouts, f32_scales)
+}
+
+fn read_stacked<const COALESCE: bool>(
+    ckpt: &StreamedCheckpoint,
+    gate: &SlicedWeight,
+    up: &SlicedWeight,
+    indices: &[u32],
+    dst: &mut [u8],
+    layouts: &StackedLayouts<'_>,
+    f32_scales: bool,
+) -> Result<(), EngError> {
     let (gate_narrow, up_narrow, wide) = (layouts.gate, layouts.up, layouts.stacked);
     if indices.is_empty() || u32::try_from(indices.len()).ok() != Some(wide.count) {
         return Err(EngError::BadRequest(format!(
@@ -886,6 +1017,22 @@ pub(crate) fn read_stacked_into(
             .slice_len
             .checked_add(u.slice_len)
             .ok_or_else(|| EngError::BadRequest(format!("stacked {role} pair overflows")))?;
+        #[cfg(any(
+            test,
+            all(feature = "native-mlx", target_os = "macos", target_arch = "aarch64")
+        ))]
+        if COALESCE {
+            return read_stacked_role_runs(
+                ckpt,
+                role,
+                [(gate, g.slice_len), (up, u.slice_len)],
+                indices,
+                dst,
+                wide_role,
+                pair,
+                widen,
+            );
+        }
         for (rank, &index) in indices.iter().enumerate() {
             let offset_error = || EngError::BadRequest(format!("stacked {role} offset overflows"));
             let slot = wide_role
@@ -952,6 +1099,73 @@ pub(crate) fn read_stacked_into(
         wide.biases.as_ref(),
     ) {
         read_role("biases", g, u, w, f32_scales)?;
+    }
+    Ok(())
+}
+
+#[cfg(any(
+    test,
+    all(feature = "native-mlx", target_os = "macos", target_arch = "aarch64")
+))]
+#[allow(
+    clippy::too_many_arguments,
+    reason = "two source roles and one shared destination stride"
+)]
+fn read_stacked_role_runs(
+    ckpt: &StreamedCheckpoint,
+    role: &str,
+    weights: [(&SlicedWeight, usize); 2],
+    indices: &[u32],
+    dst: &mut [u8],
+    layout: &RoleRange,
+    pair: usize,
+    widen: bool,
+) -> Result<(), EngError> {
+    use std::io::IoSliceMut;
+    const MAX_VECTORS: usize = 64;
+    let invalid = || EngError::BadRequest(format!("invalid stacked {role} staging range"));
+    let at = if widen { pair } else { 0 };
+    let used = at
+        .checked_add(pair)
+        .filter(|&end| end <= layout.slice_len)
+        .ok_or_else(invalid)?;
+    let end = indices
+        .len()
+        .checked_mul(layout.slice_len)
+        .and_then(|size| layout.offset.checked_add(size))
+        .ok_or_else(invalid)?;
+    let slots = dst.get_mut(layout.offset..end).ok_or_else(invalid)?;
+    let keys = weights.map(|(weight, _)| format!("{}.{role}", weight.stem));
+    let mut rank = 0;
+    while rank < indices.len() {
+        let count = consecutive_count(&indices[rank..][..(indices.len() - rank).min(MAX_VECTORS)]);
+        let group = &mut slots[rank * layout.slice_len..(rank + count) * layout.slice_len];
+        let mut offset = at;
+        for ((_, size), key) in weights.iter().zip(&keys) {
+            let end = offset + size;
+            if count == 1 {
+                counted_read(*size, || {
+                    ckpt.read_slice_into(key, indices[rank], &mut group[offset..end])
+                })?;
+            } else {
+                // The source role is contiguous. The destination has one
+                // disjoint range per expert in the fused gate/up stack.
+                let mut iov: Vec<_> = group
+                    .chunks_exact_mut(layout.slice_len)
+                    .map(|slot| IoSliceMut::new(&mut slot[offset..end]))
+                    .collect();
+                counted_read(count * size, || {
+                    ckpt.read_slice_run_scattered(key, indices[rank], &mut iov)
+                })?;
+            }
+            offset = end;
+        }
+        if widen {
+            for slot in group.chunks_exact_mut(layout.slice_len) {
+                widen_bf16_in_place(&mut slot[..used])?;
+            }
+        }
+        rank += count;
     }
     Ok(())
 }
@@ -1267,6 +1481,25 @@ mod tests {
             true,
         )
         .unwrap();
+        let mut grouped = vec![0xAB_u8; wide.end + page];
+        read_stacked_runs_into(
+            &ckpt,
+            &gate,
+            &up,
+            &indices,
+            &mut grouped,
+            &StackedLayouts {
+                gate: &gate_narrow,
+                up: &up_narrow,
+                stacked: &wide,
+            },
+            true,
+        )
+        .unwrap();
+        assert_eq!(
+            grouped, dst,
+            "vectored reads preserve wide scales and slot padding"
+        );
         let f32_of = |bytes: &[u8]| -> Vec<u8> {
             let mut wide = Vec::with_capacity(bytes.len() * 2);
             for i in (0..bytes.len()).step_by(2) {

@@ -35,7 +35,7 @@
 //! positions, where one layer step retires about 14 MB.
 
 use super::super::qsa::{QsaDims, QsaShape};
-use super::ops::{Ctx, dim, linear};
+use super::ops::{Ctx, linear};
 use super::state::LayerState;
 use super::weights::RQsa;
 use crate::{
@@ -48,6 +48,17 @@ use crate::{
 /// covers. A step at this position or beyond returns `ContextLimit`. The load-time block constants
 /// cover exactly this many positions.
 pub(super) const MAX_POSITIONS: u32 = 32_768;
+
+pub(super) fn capacity(visible: u32) -> u32 {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    if *ENABLED.get_or_init(|| {
+        std::env::var_os("FIFI_FLASH_NEXT_MLX_CAPACITY_KV").is_some_and(|value| value == "1")
+    }) {
+        crate::family::mlx_kv::compact_capacity(visible, MAX_POSITIONS)
+    } else {
+        visible
+    }
+}
 
 /// The additive attention mask of a dropped block. `exp` of it underflows to 0 in F32.
 pub(super) const MASK_OFF: f32 = -1.0e30;
@@ -117,11 +128,140 @@ pub(super) fn check_cache(len: usize, pos: u32) -> Result<(), EngError> {
     Ok(())
 }
 
+pub(super) struct CacheAppend {
+    pos: u32,
+    planes: [Option<ExecutionTensor>; 3],
+}
+
+impl CacheAppend {
+    pub(super) fn new(state: LayerState, d: &QsaDims, pos: u32) -> Result<Self, EngError> {
+        let LayerState::Qsa { k, v, ik, len } = state else {
+            return Err(mismatch());
+        };
+        check_cache(len, pos)?;
+        let allocated = capacity(pos);
+        match (&k, &v, &ik) {
+            (None, None, None) if pos == 0 => {}
+            (Some(k), Some(v), Some(ik))
+                if pos > 0
+                    && k.shape() == [1, d.heads_kv, allocated, d.head_dim]
+                    && v.shape() == k.shape()
+                    && ik.shape() == [allocated, d.idx_dim] => {}
+            _ => return Err(mismatch()),
+        }
+        Ok(Self {
+            pos,
+            planes: [k, v, ik],
+        })
+    }
+
+    /// Returns the three visible planes for attention and the owned capacity
+    /// buffers for the next step. Only writes to uniquely owned buffers can
+    /// donate storage, so a retained prefix still observes its original rows.
+    pub(super) fn append(
+        self,
+        ctx: &mut Ctx<'_>,
+        update: [ExecutionTensor; 3],
+    ) -> Result<([ExecutionTensor; 3], LayerState), EngError> {
+        let pos = self.pos;
+        let end = pos.checked_add(update[0].shape()[2]).ok_or_else(overflow)?;
+        let target = capacity(end);
+        let [old_k, old_v, old_ik] = self.planes;
+        let [new_k, new_v, new_ik] = update;
+        let k = append_plane(ctx, old_k, new_k, 2, pos, end, target)?;
+        let v = append_plane(ctx, old_v, new_v, 2, pos, end, target)?;
+        let ik = append_plane(ctx, old_ik, new_ik, 0, pos, end, target)?;
+        let visible = [
+            prefix(ctx, &k, 2, end)?,
+            prefix(ctx, &v, 2, end)?,
+            prefix(ctx, &ik, 0, end)?,
+        ];
+        Ok((
+            visible,
+            LayerState::Qsa {
+                k: Some(k),
+                v: Some(v),
+                ik: Some(ik),
+                len: end as usize,
+            },
+        ))
+    }
+}
+
+fn prefix(
+    ctx: &mut Ctx<'_>,
+    plane: &ExecutionTensor,
+    axis: usize,
+    end: u32,
+) -> Result<ExecutionTensor, EngError> {
+    if plane.shape()[axis] == end {
+        return Ok(plane.share());
+    }
+    let rank = plane.shape().len();
+    let mut stop = [0; 4];
+    stop[..rank].copy_from_slice(plane.shape());
+    stop[axis] = end;
+    ctx.kernels.slice(plane, &[0; 4][..rank], &stop[..rank])
+}
+
+fn append_plane(
+    ctx: &mut Ctx<'_>,
+    old: Option<ExecutionTensor>,
+    update: ExecutionTensor,
+    axis: usize,
+    pos: u32,
+    end: u32,
+    target: u32,
+) -> Result<ExecutionTensor, EngError> {
+    if let Some(old) = old {
+        if old.shape()[axis] == target {
+            let rank = old.shape().len();
+            let mut at = [0; 4];
+            at[axis] = pos;
+            return ctx.kernels.kv_append(old, &update, &at[..rank]);
+        }
+        let live = prefix(ctx, &old, axis, pos)?;
+        if target == end {
+            return ctx.kernels.concatenate(&[&live, &update], axis as u32);
+        }
+        let zeros = padding(ctx, update.shape(), axis, target - end)?;
+        return ctx
+            .kernels
+            .concatenate(&[&live, &update, &zeros], axis as u32);
+    }
+    if target == end {
+        return Ok(update);
+    }
+    let zeros = padding(ctx, update.shape(), axis, target - end)?;
+    ctx.kernels.concatenate(&[&update, &zeros], axis as u32)
+}
+
+fn padding(
+    ctx: &mut Ctx<'_>,
+    shape: &[u32],
+    axis: usize,
+    rows: u32,
+) -> Result<ExecutionTensor, EngError> {
+    let mut extent = shape.to_vec();
+    extent[axis] = rows;
+    let mut zeros = ctx
+        .kernels
+        .reshape(&ctx.consts.zero, &vec![1; extent.len()])?;
+    for (axis, count) in extent
+        .into_iter()
+        .enumerate()
+        .filter(|&(_, count)| count > 1)
+    {
+        zeros = ctx.kernels.repeat(&zeros, count, axis as u32)?;
+    }
+    Ok(zeros)
+}
+
 /// The grown caches of one layer: keys and values `[1, KVH, T, D]`, raw indexer keys `[T, ID]`.
-struct Kv<'a> {
-    k: &'a ExecutionTensor,
-    v: &'a ExecutionTensor,
-    ik: &'a ExecutionTensor,
+pub(super) struct Kv<'a> {
+    pub(super) k: &'a ExecutionTensor,
+    pub(super) v: &'a ExecutionTensor,
+    pub(super) ik: &'a ExecutionTensor,
 }
 
 /// What block selection needs besides the caches: the plan, the position, and the indexer
@@ -256,45 +396,69 @@ fn attend_sparse(
     ctx.kernels.batched_mm(&probs, kv.v)
 }
 
+/// Reuse decode selection for each query against its own causal prefix of a batched append.
+pub(super) fn attend_sparse_rows(
+    ctx: &mut Ctx<'_>,
+    shape: &QsaShape,
+    w: &RQsa,
+    pos: u32,
+    q: &ExecutionTensor,
+    ip: &ExecutionTensor,
+    kv: Kv<'_>,
+) -> Result<ExecutionTensor, EngError> {
+    let &[1, heads, rows, width] = q.shape() else {
+        return Err(mismatch());
+    };
+    let &[ip_rows, ip_width] = ip.shape() else {
+        return Err(mismatch());
+    };
+    if ip_rows != rows {
+        return Err(mismatch());
+    }
+    let d = shape.dims();
+    let mut outputs = Vec::with_capacity(rows as usize);
+    for row in 0..rows {
+        let pos = pos.checked_add(row).ok_or_else(overflow)?;
+        let plan = Plan::new(&d, pos)?;
+        let q = ctx
+            .kernels
+            .slice(q, &[0, 0, row, 0], &[1, heads, row + 1, width])?;
+        let ip = ctx.kernels.slice(ip, &[row, 0], &[row + 1, ip_width])?;
+        let prefix = |kernels: &mut crate::kernels::MlxKernels, x| {
+            kernels.slice(x, &[0, 0, 0, 0], &[1, d.heads_kv, plan.visible, width])
+        };
+        let k = prefix(ctx.kernels, kv.k)?;
+        let v = prefix(ctx.kernels, kv.v)?;
+        let view = Kv {
+            k: &k,
+            v: &v,
+            ik: kv.ik,
+        };
+        let selection = Selection { plan, pos, ip: &ip };
+        let att = attend_sparse(ctx, shape, w, &selection, &q, &view)?;
+        outputs.push(ctx.kernels.reshape(&att, &[1, heads, 1, width])?);
+    }
+    ctx.kernels
+        .concatenate(&outputs.iter().collect::<Vec<_>>(), 2)
+}
+
 /// Runs one QSA decode step at `pos` on `x` (`H` values, any shape). It builds a lazy graph
-/// only: no readback and no evaluate. `state` is never changed; on error nothing is returned.
+/// only: no readback and no evaluate. The old cache is consumed.
 pub(super) fn step(
     ctx: &mut Ctx<'_>,
     shape: &QsaShape,
     w: &RQsa,
-    state: &LayerState,
+    state: LayerState,
     pos: u32,
     x: &ExecutionTensor,
 ) -> Result<QsaStep, EngError> {
-    let LayerState::Qsa { k, v, ik, len } = state else {
-        return Err(EngError::BadRequest(
-            "qsa step needs a QSA layer state".into(),
-        ));
-    };
-    check_cache(*len, pos)?;
     let d = shape.dims();
+    let cache = CacheAppend::new(state, &d, pos)?;
     let plan = Plan::new(&d, pos)?;
     let (heads, kv_heads, width) = (d.heads_q, d.heads_kv, d.head_dim);
-    let t = dim(*len)?;
-    let cache = match (k, v, ik) {
-        (None, None, None) if *len == 0 => None,
-        (Some(k), Some(v), Some(ik)) if *len > 0 => {
-            let kv_shape = [1, kv_heads, t, width];
-            let ik_shape = [t, d.idx_dim];
-            if k.shape() != kv_shape.as_slice()
-                || v.shape() != kv_shape.as_slice()
-                || ik.shape() != ik_shape.as_slice()
-            {
-                return Err(mismatch());
-            }
-            Some((k, v, ik))
-        }
-        _ => return Err(mismatch()),
-    };
     let pair = width.checked_mul(2).ok_or_else(overflow)?;
     let idx_start = d.idx_heads.checked_mul(d.idx_dim).ok_or_else(overflow)?;
     let idx_stop = idx_start.checked_add(d.idx_dim).ok_or_else(overflow)?;
-    let next_len = len.checked_add(1).ok_or_else(overflow)?;
     let rope = RopeSpec {
         dims: d.rotary_dim,
         base: d.theta,
@@ -323,14 +487,7 @@ pub(super) fn step(
     let ip = linear(ctx, &w.idx, x)?;
     let ik_new = ctx.kernels.slice(&ip, &[0, idx_start], &[1, idx_stop])?;
     // 5. Append on the time axis, or start the cache (qsa.rs:238-242).
-    let (k_all, v_all, ik_all) = match cache {
-        None => (k_new, v_new, ik_new),
-        Some((k, v, ik)) => (
-            ctx.kernels.concatenate(&[k, &k_new], 2)?,
-            ctx.kernels.concatenate(&[v, &v_new], 2)?,
-            ctx.kernels.concatenate(&[ik, &ik_new], 0)?,
-        ),
-    };
+    let ([k_all, v_all, ik_all], state) = cache.append(ctx, [k_new, v_new, ik_new])?;
     // 6. Attention (qsa.rs:316-343). Head h reads KV head h / (QH / KVH), the same grouping as SDPA.
     // Dense: every position attends. Sparse: the top blocks and the tail attend.
     let att = if plan.sparse() {
@@ -351,15 +508,7 @@ pub(super) fn step(
     let gate = ctx.kernels.unary(UnaryOp::Sigmoid, &gate)?;
     let o = ctx.kernels.binary(BinaryOp::Mul, &att, &gate)?;
     let out = linear(ctx, &w.o, &o)?;
-    Ok(QsaStep {
-        out,
-        state: LayerState::Qsa {
-            k: Some(k_all),
-            v: Some(v_all),
-            ik: Some(ik_all),
-            len: next_len,
-        },
-    })
+    Ok(QsaStep { out, state })
 }
 
 #[cfg(test)]
@@ -380,6 +529,17 @@ mod tests {
     use crate::family::project::Projector;
     use crate::kernels::MlxKernels;
     use crate::tensor::Dtype;
+
+    fn step(
+        ctx: &mut Ctx<'_>,
+        shape: &QsaShape,
+        weights: &RQsa,
+        state: &LayerState,
+        pos: u32,
+        input: &ExecutionTensor,
+    ) -> Result<QsaStep, EngError> {
+        super::step(ctx, shape, weights, state.share(), pos, input)
+    }
 
     /// Input of step `pos`: `x[i] = ((i + 5 pos) % 11 - 5) / 16`, exact in f32.
     fn input(pos: u32) -> Vec<f32> {

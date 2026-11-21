@@ -123,7 +123,7 @@ pub(crate) fn q36_effective(
         Origin::Default
     };
 
-    vec![
+    let mut rows = vec![
         row(
             "weight_format",
             weight_format_name(settings.weights).to_string(),
@@ -216,7 +216,209 @@ pub(crate) fn q36_effective(
             settings.capture.to_string(),
             present(&options.capture),
         ),
-    ]
+    ];
+    if backend == Backend::Mlx && super::probe::CompiledBackends::of_this_build().mlx {
+        rows.push(row("backend", "mlx".into(), Origin::Derived));
+        append_mlx_inputs(&mut rows);
+        if !dense {
+            rows.push(mlx_switch("mlx_disk_experts", "FIFI_Q36_MLX_DISK_EXPERTS"));
+        } else {
+            rows.push(mlx_switch(
+                "mlx_disk_dense_ffn",
+                "FIFI_Q36_MLX_DISK_DENSE_FFN",
+            ));
+        }
+    }
+    rows
+}
+
+fn mlx_switch(key: &'static str, name: &str) -> EffectiveSetting {
+    let value = std::env::var_os(name);
+    row(
+        key,
+        value.as_deref().is_some_and(|flag| flag == "1").to_string(),
+        env_origin(&value),
+    )
+}
+
+fn env_origin<T>(value: &Option<T>) -> Origin {
+    if value.is_some() {
+        Origin::Environment
+    } else {
+        Origin::Default
+    }
+}
+
+fn append_mlx_inputs(rows: &mut Vec<EffectiveSetting>) {
+    rows.push(mlx_switch("mlx_auto_budget", "FIFI_MLX_AUTO_BUDGET"));
+    rows.push(mlx_switch(
+        "mlx_positioned_reads",
+        "FIFI_MLX_POSITIONED_READS",
+    ));
+    let read_runs = std::env::var_os("FIFI_MLX_EXPERT_READ_RUNS");
+    rows.push(row(
+        "mlx_expert_read_runs",
+        if read_runs.as_deref().is_some_and(|value| value == "prefill") {
+            "prefill"
+        } else {
+            "off"
+        }
+        .into(),
+        env_origin(&read_runs),
+    ));
+    rows.push(mlx_switch(
+        "mlx_overlap_expert_reads",
+        "FIFI_MLX_OVERLAP_EXPERT_READS",
+    ));
+    #[cfg(all(feature = "native-mlx", target_os = "macos", target_arch = "aarch64"))]
+    {
+        use crate::family::mlx_budget;
+        let (value, origin) = match mlx_budget::configured_ceiling() {
+            Ok(None) => ("off".into(), Origin::Default),
+            Ok(Some(bytes)) => (bytes.to_string(), Origin::Environment),
+            Err(_) => ("invalid".into(), Origin::Environment),
+        };
+        rows.push(row("mlx_device_ceiling_bytes", value, origin));
+        rows.push(row(
+            "mlx_device_sizing",
+            mlx_budget::enabled().to_string(),
+            Origin::Derived,
+        ));
+    }
+}
+
+pub(crate) fn flash_mlx_effective(
+    options: &crate::family::flash_next::settings::FlashOptions,
+    env: &crate::family::flash_next::settings::FlashEnv,
+    settings: &crate::family::flash_next::settings::FlashSettings,
+) -> Vec<EffectiveSetting> {
+    use crate::family::flash_next::factory::CONTEXT_LIMIT;
+    let cache_origin = if options.cache_limit_bytes.is_some() {
+        Origin::ConfigFile
+    } else {
+        env_origin(&env.cache_limit)
+    };
+    let mut rows = vec![
+        row("backend", "mlx".into(), Origin::Derived),
+        row("context_limit", CONTEXT_LIMIT.to_string(), Origin::Default),
+        row("kv_dtype", "f32".into(), Origin::Default),
+        row(
+            "cache_limit_bytes",
+            settings.cache_limit.to_string(),
+            cache_origin,
+        ),
+        row(
+            "prefill_budget_bytes",
+            settings
+                .prefill_budget
+                .map_or_else(|| "off".into(), |bytes| bytes.to_string()),
+            present(&options.prefill_budget_bytes),
+        ),
+        row(
+            "prefill_chunk",
+            settings.prefill_chunk.to_string(),
+            present(&options.prefill_chunk),
+        ),
+        mlx_switch("mlx_sparse_prefill", "FIFI_FLASH_NEXT_MLX_SPARSE_PREFILL"),
+        mlx_switch("mlx_capacity_kv", "FIFI_FLASH_NEXT_MLX_CAPACITY_KV"),
+    ];
+    append_mlx_inputs(&mut rows);
+    rows
+}
+
+pub(crate) fn flash_mlx_config_effective(
+    model_dir: &std::path::Path,
+    tokenizer_dir: &std::path::Path,
+    options: Option<&crate::family::flash_next::settings::FlashOptions>,
+) -> Result<Vec<EffectiveSetting>, crate::EngError> {
+    use crate::family::flash_next::{
+        factory::check_mlx_settings,
+        settings::{FlashEnv, FlashOptions, FlashSettings},
+    };
+    let env = FlashEnv::capture();
+    let settings = FlashSettings::new(model_dir, tokenizer_dir, options, &env)?;
+    check_mlx_settings(&settings)?;
+    let default = FlashOptions::default();
+    Ok(flash_mlx_effective(
+        options.unwrap_or(&default),
+        &env,
+        &settings,
+    ))
+}
+
+pub(crate) fn flint_effective_for_build(
+    options: Option<&crate::family::flint::settings::FlintOptions>,
+    served: Option<&crate::family::flint::prefill_order::PrefillOrder>,
+) -> Result<Vec<EffectiveSetting>, crate::EngError> {
+    #[cfg(all(feature = "native-mlx", target_os = "macos", target_arch = "aarch64"))]
+    {
+        use crate::family::flint::factory;
+        factory::check_mlx_options(options)?;
+        let context = std::env::var_os("FIFI_FLINT_MLX_CONTEXT_LIMIT");
+        let rows = std::env::var_os("FIFI_FLINT_MLX_BATCH_PREFILL");
+        let cache = std::env::var_os("FIFI_FLINT_MLX_CACHE_LIMIT");
+        let request_kv = std::env::var_os("FIFI_FLINT_MLX_REQUEST_KV");
+        let request_prefill = std::env::var_os("FIFI_FLINT_MLX_REQUEST_PREFILL");
+        let prefill_pair = std::env::var_os("FIFI_FLINT_MLX_PREFILL_PAIR");
+        let pair_policy = factory::prefill_pair_policy(prefill_pair.as_deref());
+        let mut result = vec![
+            row("backend", "mlx".into(), Origin::Derived),
+            row(
+                "context_limit",
+                factory::context_limit().to_string(),
+                env_origin(&context),
+            ),
+            row("kv_dtype", "bf16".into(), Origin::Default),
+            row(
+                "prefill_chunk",
+                factory::prefill_chunk_rows(factory::os_setting(rows.as_deref())).to_string(),
+                env_origin(&rows),
+            ),
+            row(
+                "cache_limit_bytes",
+                factory::cache_limit_with(factory::os_setting(cache.as_deref())).to_string(),
+                env_origin(&cache),
+            ),
+            row(
+                "mlx_request_prefill",
+                factory::request_prefill_enabled(request_prefill.as_deref()).to_string(),
+                env_origin(&request_prefill),
+            ),
+            row(
+                "mlx_prefill_pair",
+                (pair_policy != factory::PrefillPairPolicy::Off).to_string(),
+                env_origin(&prefill_pair),
+            ),
+            row(
+                "mlx_prefill_pair_policy",
+                pair_policy.label().into(),
+                env_origin(&prefill_pair),
+            ),
+            mlx_switch(
+                "mlx_cancel_prefill_pair",
+                "FIFI_FLINT_MLX_CANCEL_PREFILL_PAIR",
+            ),
+            mlx_switch("mlx_compact_kv", "FIFI_FLINT_MLX_COMPACT_KV"),
+            row(
+                "mlx_request_kv",
+                factory::request_sized_kv_enabled(request_kv.as_deref()).to_string(),
+                env_origin(&request_kv),
+            ),
+        ];
+        append_mlx_inputs(&mut result);
+        let _ = served;
+        Ok(result)
+    }
+    #[cfg(not(all(feature = "native-mlx", target_os = "macos", target_arch = "aarch64")))]
+    {
+        use crate::family::flint::{budget::FlintEnv, settings::FlintOptions};
+        let default = FlintOptions::cuda_default();
+        Ok(flint_effective(
+            options.unwrap_or(&default),
+            &FlintEnv::capture(),
+            served,
+        ))
+    }
 }
 
 /// The principal Flint settings with origins, in the same three-part
@@ -226,6 +428,10 @@ pub(crate) fn q36_effective(
 /// inject rather than capture), and the resolved values the switches
 /// produce. Flint's MLX path ignores the `flint` object; these rows are
 /// the CUDA view.
+#[cfg(any(
+    test,
+    not(all(feature = "native-mlx", target_os = "macos", target_arch = "aarch64"))
+))]
 pub(crate) fn flint_effective(
     options: &crate::family::flint::settings::FlintOptions,
     env: &crate::family::flint::budget::FlintEnv,

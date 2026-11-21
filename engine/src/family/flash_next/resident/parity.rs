@@ -319,7 +319,7 @@ fn block_attention(
             ))
         }
         (RAttn::Qsa(w), cache @ LayerState::Qsa { .. }) => {
-            let s = qsa::step(ctx, &shape.qsa, w, &cache, pos, &x)?;
+            let s = qsa::step(ctx, &shape.qsa, w, cache, pos, &x)?;
             let out = values(ctx.kernels, &s.out)?;
             Ok((out, s.state))
         }
@@ -342,7 +342,7 @@ fn block_moe(
     x: &[f32],
 ) -> Result<Vec<f32>, EngError> {
     let x = import(ctx, vec![1, dim(x.len())?], x)?;
-    let result = moe::step_paged(ctx, ckpt, shape, w, slots, &x)
+    let result = moe::step_paged(ctx, ckpt, shape, w, slots, None, &x)
         .and_then(|(out, _)| values(ctx.kernels, &out));
     slots.release_lent();
     result

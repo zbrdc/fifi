@@ -5,6 +5,8 @@
 //! checkpoint.
 
 #[cfg(all(feature = "native-mlx", target_os = "macos", target_arch = "aarch64"))]
+mod decode_cache;
+#[cfg(all(feature = "native-mlx", target_os = "macos", target_arch = "aarch64"))]
 mod deltanet;
 #[cfg(all(feature = "native-mlx", target_os = "macos", target_arch = "aarch64"))]
 pub(super) mod executor;
@@ -36,6 +38,12 @@ mod slots;
 mod state;
 #[cfg(all(feature = "native-mlx", target_os = "macos", target_arch = "aarch64"))]
 mod step;
+#[cfg(all(
+    feature = "native-fault-qualification",
+    target_os = "macos",
+    target_arch = "aarch64"
+))]
+mod stream_timing;
 #[cfg(test)]
 mod trace;
 #[cfg(all(feature = "native-mlx", target_os = "macos", target_arch = "aarch64"))]
@@ -92,11 +100,14 @@ struct ResidentDecoder<'c> {
     weights: ResidentWeights,
     /// The fixed expert page pool: `POOL_SETS` sets sized for the largest layer.
     slots: ExpertSlots,
+    decode_cache: Option<decode_cache::DecodeCache>,
     /// Default-off, record-only expert hints. Never changes the demand path.
     expert_prefetch: prefetch::Prefetch,
     /// The prefill page sets, open from `open_prefill` to `close_prefill`. They drop after the
     /// adapter like the decode pool.
     prefill_pages: Option<prefill::step::Open>,
+    /// Spare planner bytes allowed for one sparse QSA batch in a layer.
+    sparse_prefill_bytes: u64,
     /// The engine's session budget. Each step charges its QSA growth here. The cap is `u64::MAX`
     /// until the executor sets the admitted value.
     budget: SessionBudget,
@@ -147,8 +158,10 @@ impl<'c> ResidentDecoder<'c> {
             ckpt,
             weights,
             slots,
+            decode_cache: None,
             expert_prefetch: prefetch::Prefetch::default(),
             prefill_pages: None,
+            sparse_prefill_bytes: 0,
             budget: SessionBudget::new(u64::MAX),
             #[cfg(test)]
             route_trace: None,
@@ -185,7 +198,14 @@ impl<'c> ResidentDecoder<'c> {
 
     /// Replaces `state` with a zero state. On error `state` is unchanged.
     fn reset(&mut self, state: &mut ResidentState) -> Result<(), EngError> {
+        self.release_decode_cache();
         state.reset(&mut self.kernels, &self.weights)
+    }
+
+    fn release_decode_cache(&mut self) {
+        if let Some(cache) = &mut self.decode_cache {
+            cache.release();
+        }
     }
 
     /// Saves `state` as a snapshot that shares its arrays and charges the session budget. See
@@ -228,8 +248,8 @@ impl<'c> ResidentDecoder<'c> {
     }
 
     /// Runs `tokens` as a prefill and publishes the state after them. Up to the dense QSA limit
-    /// the tokens run as one chunk, and the rest run as one-token `Prompt` steps on the sparse
-    /// path. The last token runs in `mode`: `Prompt` runs no head, `Generate` also returns the
+    /// the tokens run as one chunk. The sparse suffix uses bounded batches when admitted, and
+    /// one-token steps otherwise. The last token runs in `mode`: `Prompt` runs no head, `Generate` also returns the
     /// greedy token, and `Record` adds the logits and the post-MoE residual of every layer, all
     /// for the last row only. See `prefill::step::prefill`.
     fn prefill(

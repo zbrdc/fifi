@@ -440,16 +440,11 @@ fn start_flint(
         config.flint.as_ref(),
         ready_note,
     )?;
-    // The same resolution the engine started with: the options (the
-    // factory's CUDA default when the config has no flint object) and
-    // the environment switches read once, here, exactly as at load.
-    let default_options = flint::settings::FlintOptions::cuda_default();
-    let effective = crate::capability::effective::flint_effective(
-        config.flint.as_ref().unwrap_or(&default_options),
-        &flint::budget::FlintEnv::capture(),
+    let effective = crate::capability::effective::flint_effective_for_build(
+        config.flint.as_ref(),
         // The order the open actually served, so a retried load reports the token-major walk.
         flint::prefill_order::served().as_ref(),
-    );
+    )?;
     Ok(StartedEngine {
         engine: started.engine,
         bundle: Arc::new(started.bundle),
@@ -463,18 +458,34 @@ fn start_flash(
     prefix_reuse: bool,
     ready_note: ReadyNote,
 ) -> Result<StartedEngine, EngError> {
-    let started = factory::start_engine(
+    use crate::family::flash_next::settings::{FlashEnv, FlashOptions};
+
+    let env = FlashEnv::capture();
+    let (started, settings) = factory::start_engine_resolved(
         &config.model_dir,
         &config.tokenizer_dir,
         config.flash_next.as_ref(),
+        &env,
         prefix_reuse,
         ready_note,
     )?;
+    let effective = if settings.cuda.is_none() {
+        crate::capability::effective::flash_mlx_effective(
+            config
+                .flash_next
+                .as_ref()
+                .unwrap_or(&FlashOptions::default()),
+            &env,
+            &settings,
+        )
+    } else {
+        Vec::new()
+    };
     Ok(StartedEngine {
         engine: started.engine,
         bundle: Arc::new(started.bundle),
         context_limit: started.context_limit,
-        effective: Vec::new(),
+        effective,
     })
 }
 

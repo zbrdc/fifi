@@ -98,8 +98,11 @@ pub(crate) fn start(
     let engine = spawn_engine_noted(fallback, ready_note, move |stages| {
         let device = DeviceBudget::detect()?;
         stages.begin("opening the model");
-        let (mut executor, session) =
-            Q36Executor::open_for_family(&owned.artifact, owned.cache_limit, rules, &owned.spec)?;
+        let (mut executor, session) = if let Some(device) = device {
+            Q36Executor::open_for_device(&owned, rules, device)?
+        } else {
+            Q36Executor::open_for_family(&owned.artifact, owned.cache_limit, rules, &owned.spec)?
+        };
         if owned.speculation.enabled() {
             executor.set_speculation(&owned.speculation)?;
             eprintln!(
@@ -151,6 +154,7 @@ pub(super) fn plan_prefill(
                 "concurrent serving requires a prefill budget".into(),
             ));
         }
+        executor.record_mlx_plan(settings.prefill_chunk, None, None)?;
         return Ok(None);
     };
     let max_rows = settings.prefill_chunk;
@@ -184,6 +188,7 @@ pub(super) fn plan_prefill(
             "concurrent serving requires an admitted prefill chunk above one token".into(),
         ));
     }
+    executor.record_mlx_plan(max_rows, Some(plan), device)?;
     let terms = plan.terms.to_string().lines().collect::<Vec<_>>().join(" ");
     let terms = if let Some(device) = device {
         format!("{device} {terms}")

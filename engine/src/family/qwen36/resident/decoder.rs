@@ -9,7 +9,7 @@ use super::ops::{Ctx, cast_to, f32_tensor, short_import};
 use super::prefill;
 use super::state::{ResidentSnapshot, ResidentState};
 use super::step;
-use super::weights::{RFeedForward, RMixer, ResidentWeights};
+use super::weights::{ExpertDevicePlan, RFeedForward, RMixer, ResidentWeights};
 #[cfg(test)]
 use crate::tensor::ExecutionTensor;
 use crate::{
@@ -236,6 +236,7 @@ impl<'c> ResidentDecoder<'c> {
             activation,
             activation == Activation::F32,
             KvDtype::F32,
+            None,
         )
     }
 
@@ -246,6 +247,7 @@ impl<'c> ResidentDecoder<'c> {
     /// bytes per layer and position on the real model) and F32 activations give F32 scales (1,152).
     /// A Q8 engine whose `head_dim` is not a multiple of the group (64) is refused at load with
     /// `BadRequest` naming the setting, before any weight imports.
+    #[cfg(test)]
     pub(super) fn new_with_kv(
         kernels: MlxKernels,
         ckpt: &'c StreamedCheckpoint,
@@ -253,6 +255,18 @@ impl<'c> ResidentDecoder<'c> {
         context_limit: u32,
         activation: Activation,
         kv: KvDtype,
+    ) -> Result<Self, EngError> {
+        Self::new_with_placement(kernels, ckpt, host, context_limit, activation, kv, None)
+    }
+
+    pub(super) fn new_with_placement(
+        kernels: MlxKernels,
+        ckpt: &'c StreamedCheckpoint,
+        host: HostWeights,
+        context_limit: u32,
+        activation: Activation,
+        kv: KvDtype,
+        device_plan: Option<ExpertDevicePlan>,
     ) -> Result<Self, EngError> {
         Self::new_paired(
             kernels,
@@ -262,6 +276,7 @@ impl<'c> ResidentDecoder<'c> {
             activation,
             activation == Activation::F32,
             kv,
+            device_plan,
         )
     }
 
@@ -284,6 +299,7 @@ impl<'c> ResidentDecoder<'c> {
             activation,
             super::scale_knob::scales_f32_requested(),
             KvDtype::F32,
+            None,
         )
     }
 
@@ -291,6 +307,10 @@ impl<'c> ResidentDecoder<'c> {
     /// pair that does not match `activation` before anything else changes. The cache form `kv`
     /// is checked against the head dimension BEFORE any import (a Q8 cache needs a multiple of
     /// the group of 64) and lands on the weights, where `zero_with` reads it for every cache.
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "test-only scale override and startup placement"
+    )]
     fn new_paired(
         mut kernels: MlxKernels,
         ckpt: &'c StreamedCheckpoint,
@@ -299,6 +319,7 @@ impl<'c> ResidentDecoder<'c> {
         activation: Activation,
         f32_scales: bool,
         kv: KvDtype,
+        device_plan: Option<ExpertDevicePlan>,
     ) -> Result<Self, EngError> {
         let act = activation.dtype();
         if kv == KvDtype::Q8
@@ -315,7 +336,9 @@ impl<'c> ResidentDecoder<'c> {
         }
         kernels.set_retire_cap(DECODE_RETIRE_CAP)?;
         let warm_shape = host.shape().clone();
-        let mut weights = if f32_scales {
+        let mut weights = if device_plan.is_some() {
+            ResidentWeights::import_with(&mut kernels, ckpt, host, f32_scales, device_plan)?
+        } else if f32_scales {
             ResidentWeights::import(&mut kernels, ckpt, host)?
         } else {
             ResidentWeights::import_bf16_scales(&mut kernels, ckpt, host)?
@@ -340,7 +363,12 @@ impl<'c> ResidentDecoder<'c> {
                 kv,
             )?;
         }
-        Ok(Self::with_weights(kernels, ckpt, weights, context_limit))
+        let streams_experts = weights.streams_experts();
+        let mut decoder = Self::with_weights(kernels, ckpt, weights, context_limit);
+        if streams_experts {
+            decoder.routing = Routing::Host;
+        }
+        Ok(decoder)
     }
 
     fn with_weights(
@@ -467,7 +495,7 @@ impl<'c> ResidentDecoder<'c> {
             .enumerate()
             .filter_map(|(layer, current)| match &current.feed_forward {
                 RFeedForward::Moe(w) => Some(super::compiled::moe_facts(layer, &shape, w, act)),
-                RFeedForward::Dense(_) => None,
+                RFeedForward::Dense(_) | RFeedForward::StagedDense(_) => None,
             })
             .collect::<Result<_, EngError>>()?;
         let plan = super::compile_plan::model_warmup(
@@ -600,14 +628,16 @@ impl<'c> ResidentDecoder<'c> {
                 RMixer::Attn(_) => None,
             })
             .collect::<Result<Vec<_>, EngError>>()?;
+        let resident_experts = !self.weights.streams_experts();
         let moe_facts: Vec<super::compile_plan::MoeLayerFacts> = self
             .weights
             .layers
             .iter()
             .enumerate()
+            .filter(|_| resident_experts)
             .filter_map(|(layer, current)| match &current.feed_forward {
                 RFeedForward::Moe(w) => Some(super::compiled::moe_facts(layer, &shape, w, act)),
-                RFeedForward::Dense(_) => None,
+                RFeedForward::Dense(_) | RFeedForward::StagedDense(_) => None,
             })
             .collect::<Result<Vec<_>, EngError>>()?;
         let attn_facts: Vec<super::compile_plan::AttnLayerFacts> = self
@@ -729,7 +759,7 @@ impl<'c> ResidentDecoder<'c> {
                     ])?;
                     moe_seconds.push(started.elapsed().as_secs_f64());
                 }
-                RFeedForward::Dense(_) => {}
+                RFeedForward::Dense(_) | RFeedForward::StagedDense(_) => {}
             }
         }
         for (layer, _id) in &plan.attn {

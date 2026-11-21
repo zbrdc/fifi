@@ -294,6 +294,11 @@ fn run_marked(
                 part.mark(&mut ctx, "moe_block", &[&out])?;
                 out
             }
+            RFeedForward::StagedDense(_) => {
+                return Err(EngError::BadRequest(
+                    "decode graph partition requires resident dense FFN weights".into(),
+                ));
+            }
             RFeedForward::Moe(w) => {
                 let (out, route) = moe::step_device(&mut ctx, shape, w, &mid, &layer.post_norm)?;
                 health = Some(match health.take() {

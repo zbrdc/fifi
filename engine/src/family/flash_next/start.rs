@@ -41,8 +41,13 @@ pub(crate) fn start(
     };
     let engine = spawn_engine_noted(prefill_chunk, ready_note, move |_| {
         let device = crate::family::mlx_budget::DeviceBudget::detect()?;
-        let (mut executor, session) =
-            FlashExecutor::open(&settings.artifact, settings.cache_limit, rules)?;
+        let (mut executor, session) = FlashExecutor::open_with_admission(
+            &settings.artifact,
+            settings.cache_limit,
+            rules,
+            device,
+            prefix_reuse,
+        )?;
         if usize::try_from(CONTEXT_LIMIT).ok() != Some(executor.context_limit()) {
             return Err(EngError::Checkpoint(format!(
                 "the executor accepts {} positions, but the server reports {CONTEXT_LIMIT}",

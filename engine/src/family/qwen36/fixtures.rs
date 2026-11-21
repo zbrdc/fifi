@@ -73,6 +73,18 @@ pub(super) fn dense(out: &mut Vec<Entry>, key: &str, shape: Vec<u32>, values: &[
 
 /// One shard that holds `entries`, opened through the same reader as a real checkpoint.
 pub(super) fn checkpoint(entries: Vec<Entry>) -> StreamedCheckpoint {
+    let (index, file) = checkpoint_files(entries);
+    let len = file.len() as u64;
+    let reader: Box<dyn ShardIo + Send> = Box::new(Cursor::new(file));
+    StreamedCheckpoint::open(
+        &index,
+        vec![("m.safetensors".to_string(), reader, len)],
+        1 << 20,
+    )
+    .unwrap()
+}
+
+pub(super) fn checkpoint_files(entries: Vec<Entry>) -> (Vec<u8>, Vec<u8>) {
     let mut header = serde_json::Map::new();
     let mut payload = Vec::new();
     let mut index = serde_json::Map::new();
@@ -90,12 +102,5 @@ pub(super) fn checkpoint(entries: Vec<Entry>) -> StreamedCheckpoint {
     file.extend_from_slice(&header);
     file.extend_from_slice(&payload);
     let index = serde_json::to_vec(&serde_json::json!({"weight_map": index})).unwrap();
-    let len = file.len() as u64;
-    let reader: Box<dyn ShardIo + Send> = Box::new(Cursor::new(file));
-    StreamedCheckpoint::open(
-        &index,
-        vec![("m.safetensors".to_string(), reader, len)],
-        1 << 20,
-    )
-    .unwrap()
+    (index, file)
 }

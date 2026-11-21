@@ -85,13 +85,7 @@ pub(crate) fn backend_of_build() -> Backend {
     }
 }
 
-/// The settings of an entry with the process-wide `prefix_reuse` flag applied:
-/// `Q36Settings::new` builds the checked settings and leaves the flag false, because no config
-/// member or environment key carries the process-wide flag, so the flag travels in the settings
-/// from here — the MLX `start` reads it into the `prefix_store` limits of the rules. The
-/// builder is pure: the factory and its test share it, and the server's
-/// effective-configuration parity test resolves through it so the retained
-/// rows cannot drift from what a start resolves.
+/// Resolve the serving settings with the same prefix policy used by the worker.
 pub(crate) fn settings_with_prefix_reuse(
     model_dir: &Path,
     tokenizer_dir: &Path,
@@ -101,10 +95,15 @@ pub(crate) fn settings_with_prefix_reuse(
     prefix_reuse: bool,
     spec: FamilySpec,
 ) -> Result<Q36Settings, EngError> {
-    let mut settings =
-        Q36Settings::new_for_family(model_dir, tokenizer_dir, options, env, backend, spec)?;
-    settings.prefix_reuse = prefix_reuse;
-    Ok(settings)
+    Q36Settings::resolve(
+        model_dir,
+        tokenizer_dir,
+        options,
+        env,
+        backend,
+        spec,
+        Some(prefix_reuse),
+    )
 }
 
 /// The Linux tests reach `settings_with_prefix_reuse` and the rules; the call from this

@@ -13,8 +13,8 @@ use crate::{
     EngError,
     expert_tier::{CpuExpertKernel, CpuTier, ExpertPick, map_read_only},
     kernels::nvfp4_cpu::{
-        ExpertPick as KernelPick, ExpertPool, ExpertView, LayerExperts, Nvfp4CpuError, Nvfp4Matrix,
-        PoolConfig, WaitPolicy,
+        ExpertPick as KernelPick, ExpertPool, ExpertView, Isa, LayerExperts, Nvfp4CpuError,
+        Nvfp4Matrix, PoolConfig, WaitPolicy,
     },
 };
 
@@ -29,7 +29,11 @@ pub(crate) struct Nvfp4Kernel {
 
 impl Nvfp4Kernel {
     pub(crate) fn new(threads: usize) -> Result<Self, EngError> {
+        let isa = (cfg!(all(target_os = "macos", target_arch = "aarch64"))
+            && std::env::var_os("FIFI_NEM35_CPU_NEON").is_some_and(|value| value == "1"))
+        .then_some(Isa::Neon);
         let pool = ExpertPool::new(PoolConfig {
+            isa,
             threads,
             wait: WaitPolicy::SpinThenPark(SPIN_WINDOW),
             ..PoolConfig::default()
@@ -153,6 +157,7 @@ pub(crate) fn layer_experts_from_mapping(
 #[derive(Clone, Debug, PartialEq)]
 pub struct CpuLayerTiming {
     pub layer: u32,
+    pub isa: Isa,
     /// The first call, which pays the page faults of a cold layer.
     pub first: Duration,
     /// The remaining calls in milliseconds, sorted ascending.
@@ -194,7 +199,9 @@ pub fn time_cpu_experts(
         moe.routed_experts,
         moe.experts_per_token as usize,
     );
-    let mut cpu = new_cpu_experts(threads)?;
+    let kernel = Nvfp4Kernel::new(threads)?;
+    let isa = kernel.pool.isa();
+    let mut cpu = CpuTier::new(kernel);
     let mut state = 0x9e37_79b9_7f4a_7c15_u64;
     let mut next = move || {
         // xorshift64*: enough randomness to pick experts and activations.
@@ -236,6 +243,7 @@ pub fn time_cpu_experts(
         warm_ms.sort_by(f64::total_cmp);
         timings.push(CpuLayerTiming {
             layer,
+            isa,
             first,
             warm_ms,
         });
@@ -416,6 +424,7 @@ mod tests {
     fn layer_timing_reports_median_and_tail_of_the_warm_calls() {
         let timing = CpuLayerTiming {
             layer: 3,
+            isa: Isa::Scalar,
             first: Duration::from_millis(100),
             warm_ms: (1..=10).map(f64::from).collect(),
         };
@@ -423,6 +432,7 @@ mod tests {
         assert_eq!(timing.p90_ms(), 10.0);
         let empty = CpuLayerTiming {
             layer: 0,
+            isa: Isa::Scalar,
             first: Duration::ZERO,
             warm_ms: Vec::new(),
         };

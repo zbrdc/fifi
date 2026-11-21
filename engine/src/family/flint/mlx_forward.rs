@@ -2,6 +2,7 @@
 
 use super::{
     factory::context_limit,
+    mlx_expert_cache::LayerExpertCache,
     mlx_model::{Ffn, Layer, Model, Routed, SwiGlu, expert_pipeline_flagged, expert_read_runs},
     mlx_route,
     mlx_state::{ChunkCachePlan, Plane, State, WINDOW},
@@ -30,6 +31,10 @@ use super::{
 };
 
 type Result<T> = std::result::Result<T, EngError>;
+
+#[path = "mlx_prefill_pair.rs"]
+mod prefill_pair;
+pub(super) use prefill_pair::{PairPlan, PairStaging};
 
 /// pp attribution probe (test builds): under FLINT_QUAL_STAGE_SYNC, fence
 /// `tensor` (evaluate + synchronize) so the enclosing span's elapsed time
@@ -238,7 +243,7 @@ impl Model {
             state.valid = true;
             #[cfg(feature = "native-fault-qualification")]
             if let Some(timing) = timing {
-                timing.finish(&self.kernels, rows);
+                timing.finish(&self.kernels, rows, state.full_capacity);
             }
         }
         result
@@ -683,7 +688,11 @@ fn ffn(
             let span = Span::begin("ffn_experts", 0, None, Some((x.dtype(), x.shape())));
             let (rows, shared_in_flight) = match routed {
                 Routed::Resident(weights) => (grouped_experts(k, weights, x, &route.ids)?, None),
-                Routed::Disk { source, stem } => stage_disk_experts(
+                Routed::Disk {
+                    source,
+                    stem,
+                    cache,
+                } => stage_disk_experts(
                     k,
                     source,
                     stem,
@@ -691,6 +700,7 @@ fn ffn(
                     &route.ids,
                     Some(shared),
                     expert_pipeline_flagged(),
+                    cache.as_deref(),
                 )?,
             };
             #[cfg(test)]
@@ -720,7 +730,7 @@ pub(super) fn disk_experts(
     ids: &BoundedIndices,
     pipeline: bool,
 ) -> Result<ExecutionTensor> {
-    stage_disk_experts(k, source, stem, x, ids, None, pipeline).map(|(rows, _)| rows)
+    stage_disk_experts(k, source, stem, x, ids, None, pipeline, None).map(|(rows, _)| rows)
 }
 
 fn stage_disk_experts(
@@ -731,38 +741,35 @@ fn stage_disk_experts(
     ids: &BoundedIndices,
     shared: Option<&SwiGlu>,
     pipeline: bool,
+    cache: Option<&std::cell::RefCell<LayerExpertCache>>,
 ) -> Result<(ExecutionTensor, Option<ExecutionTensor>)> {
+    let cache = cache.filter(|_| x.shape()[0] == 1);
     let host = k.readback(ids.ids())?;
     // The router results are available now. The shared expert only needs
     // the same input and can run while the host stages the routed experts.
     let shared = shared
-        .filter(|_| pipeline)
+        .filter(|_| pipeline || cache.is_some())
         .map(|shared| {
             let output = shared.apply(k, x)?;
-            k.evaluate_async(&[&output])?;
-            Ok::<_, EngError>(output)
+            crate::family::prefill::mlx::submit_shared_expert(k, output)
         })
         .transpose()?;
-    let bytes = host
-        .host_bytes()
-        .ok_or_else(|| EngError::Checkpoint("Flint expert IDs have no host bytes".into()))?;
-    let selected: Vec<u32> = bytes
-        .as_chunks::<4>()
-        .0
-        .iter()
-        .map(|&bytes| u32::from_le_bytes(bytes))
-        .collect();
+    let selected = host_expert_ids(&host)?;
     // Preserve the group order while remapping the expert IDs into the compact stack.
-    let mut experts = selected.clone();
-    experts.sort_unstable();
-    experts.dedup();
-    let mut remapped = Vec::with_capacity(bytes.len());
-    for id in selected {
-        let slot = experts
-            .binary_search(&id)
-            .map_err(|_| EngError::Checkpoint("Flint expert remap lost a selected ID".into()))?;
-        remapped.extend_from_slice(&(slot as u32).to_le_bytes());
+    use crate::family::prefill::mlx::{local_expert_ids, sorted_expert_ids};
+    let experts = sorted_expert_ids(&selected);
+    if let Some(cache) = cache.filter(|_| experts.len() == 6)
+        && let Ok(route) = <&[u32; 6]>::try_from(selected.as_slice())
+    {
+        let rows = cache.borrow_mut().evaluate(k, source, x, route)?;
+        #[cfg(feature = "native-fault-qualification")]
+        trace_expert_accesses(stem, 1, &experts);
+        return Ok((rows, shared));
     }
+    let remapped = local_expert_ids(&selected, &experts)?
+        .into_iter()
+        .flat_map(u32::to_le_bytes)
+        .collect();
     let local = Tensor::try_from_host(Dtype::U32, host.shape().to_vec(), remapped)?;
     let (stack, local, _pages) = if pipeline {
         let coalesce_reads = expert_read_runs().coalesce(x.shape()[0]);
@@ -777,7 +784,36 @@ fn stage_disk_experts(
     let rows = grouped_experts(k, &stack, x, &local)?;
     // Retire this layer's staged arrays before opening the next disk bank.
     k.evaluate(&[&rows])?;
+    #[cfg(feature = "native-fault-qualification")]
+    trace_expert_accesses(stem, x.shape()[0], &experts);
     Ok((rows, shared))
+}
+
+fn host_expert_ids(host: &Tensor) -> Result<Vec<u32>> {
+    let bytes = host
+        .host_bytes()
+        .ok_or_else(|| EngError::Checkpoint("Flint expert IDs have no host bytes".into()))?;
+    Ok(bytes
+        .as_chunks::<4>()
+        .0
+        .iter()
+        .map(|&bytes| u32::from_le_bytes(bytes))
+        .collect())
+}
+
+/// The disk path already has the sorted, distinct checkpoint IDs on the host.
+/// Recording a completed stage adds no GPU readback and exposes no prompt text.
+#[cfg(feature = "native-fault-qualification")]
+fn trace_expert_accesses(stem: &str, rows: u32, experts: &[u32]) {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    if *ENABLED.get_or_init(|| {
+        std::env::var_os("FIFI_FLINT_EXPERT_TRACE").is_some_and(|value| value == "1")
+    }) {
+        eprintln!(
+            "flint_expert_access {}",
+            serde_json::json!({"stem": stem, "rows": rows, "experts": experts})
+        );
+    }
 }
 
 pub(super) fn grouped_experts(
@@ -806,22 +842,38 @@ pub(super) fn grouped_experts(
     let repeated = k.repeat(x, 6, 0)?;
     let sorted_x = k.take(&repeated, &order, 0)?;
     let sorted_x = k.reshape(&sorted_x, &[pairs, 1, hidden])?;
-    let gate = k.gather_qmm_sorted_bounded(&sorted_x, &w.gate, &sorted_ids)?;
-    let up = k.gather_qmm_sorted_bounded(&sorted_x, &w.up, &sorted_ids)?;
-    let gate = k.silu(&gate)?;
-    let product = k.binary(BinaryOp::Mul, &gate, &up)?;
-    #[cfg(test)]
-    stage_fence(k, "ffn_gate_up", &product)?;
-    let output = k.gather_qmm_sorted_bounded(&product, &w.down, &sorted_ids)?;
-    let output = k.reshape(&output, &[pairs, hidden])?;
-    #[cfg(test)]
-    stage_fence(k, "ffn_down", &output)?;
+    let output = sorted_expert_pairs(k, w, &sorted_x, &sorted_ids)?;
     // Restore token/rank order before BF16 weighted reduction, not after it.
     let order = k.u32_to_f32(&order)?;
     let inverse = k.argsort(&order, 0)?;
     let ordered = k.take(&output, &inverse, 0)?;
     k.reshape(&ordered, &[tokens, 6, hidden])
 }
+
+fn sorted_expert_pairs(
+    k: &mut MlxKernels,
+    w: &SwiGlu,
+    sorted_x: &ExecutionTensor,
+    sorted_ids: &BoundedIndices,
+) -> Result<ExecutionTensor> {
+    let pairs = sorted_x.shape()[0];
+    let hidden = sorted_x.shape()[2];
+    let gate = k.gather_qmm_sorted_bounded(sorted_x, &w.gate, sorted_ids)?;
+    let up = k.gather_qmm_sorted_bounded(sorted_x, &w.up, sorted_ids)?;
+    let gate = k.silu(&gate)?;
+    let product = k.binary(BinaryOp::Mul, &gate, &up)?;
+    #[cfg(test)]
+    stage_fence(k, "ffn_gate_up", &product)?;
+    let output = k.gather_qmm_sorted_bounded(&product, &w.down, sorted_ids)?;
+    let output = k.reshape(&output, &[pairs, hidden])?;
+    #[cfg(test)]
+    stage_fence(k, "ffn_down", &output)?;
+    Ok(output)
+}
+
+#[cfg(all(test, feature = "native-fault-qualification"))]
+#[path = "mlx_prefill_reuse_fixture.rs"]
+mod prefill_reuse_fixture;
 
 #[cfg(test)]
 pub(super) fn import_f32(

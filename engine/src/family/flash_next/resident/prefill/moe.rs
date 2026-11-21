@@ -20,6 +20,9 @@ use super::super::{
     weights::RMoe,
 };
 use super::pool::{PrefillPool, WavePages};
+use crate::family::prefill::mlx::{
+    overlap_expert_reads, prefill_expert_read_runs, submit_shared_expert,
+};
 use crate::{
     EngError,
     kernels::{BinaryOp, ReduceOp, UnaryOp},
@@ -115,10 +118,11 @@ fn routed_rows(
     };
     let mut parts: Vec<ExecutionTensor> = Vec::with_capacity(plan.waves.len());
     let mut inverse: Option<ExecutionTensor> = None;
+    let coalesce = tokens > 1 && prefill_expert_read_runs();
     for (index, wave) in plan.waves.iter().enumerate() {
         let last = index + 1 == plan.waves.len();
         let wanted = last.then_some(plan.inverse.as_slice());
-        let pages = pool.import_wave(ctx.kernels, ckpt, w, wave, wanted)?;
+        let pages = pool.import_wave(ctx.kernels, ckpt, w, wave, wanted, coalesce)?;
         let rows = wave_rows(ctx, &pages, x)?;
         if last {
             inverse = pages.inverse;
@@ -176,8 +180,17 @@ pub(super) fn step_chunk(
     let route = chunk_route(ctx, shape, w, x)?;
     pool.release_lent(); // the router readback evaluated every earlier layer
     let plan = split_waves(&route, pool.set_experts())?;
+    let queued_shared = if overlap_expert_reads() {
+        let output = shared_rows(ctx, w, x)?;
+        Some(submit_shared_expert(ctx.kernels, output)?)
+    } else {
+        None
+    };
     let experts = routed_rows(ctx, ckpt, w, pool, &plan, x, route.top_k)?;
-    let shared = shared_rows(ctx, w, x)?;
+    let shared = match queued_shared {
+        Some(output) => output,
+        None => shared_rows(ctx, w, x)?,
+    };
     let out = ctx.kernels.binary(BinaryOp::Add, &experts, &shared)?;
     Ok((out, route))
 }
@@ -345,7 +358,8 @@ mod tests {
             consts: &weights.consts,
         };
         let moe_w = &weights.layers[0].moe;
-        let (out, _) = step_paged(&mut ctx, ckpt, &weights.shape.moe, moe_w, slots, &x).unwrap();
+        let (out, _) =
+            step_paged(&mut ctx, ckpt, &weights.shape.moe, moe_w, slots, None, &x).unwrap();
         values(kernels, &out).unwrap()
     }
 

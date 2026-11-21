@@ -1,8 +1,9 @@
 //! Resident Flash-Next session state, with the step's check, poison, and commit.
 
+use super::super::step::ModelShape;
 use super::ops::{Bytes, dim, short_import, zeros};
-use super::prefill::qsa::check_chunk_dense;
-use super::qsa::check_cache;
+use super::prefill::qsa::{QsaBatch, check_batch};
+use super::qsa::{capacity, check_cache};
 use super::weights::{RAttn, ResidentWeights};
 use crate::{
     EngError,
@@ -19,12 +20,16 @@ const F32_BYTES: u64 = 4;
 /// cache and appends the same rows at every position, so the growth does not depend on the
 /// position. It makes no native call. `commit` checks the charge against the stored bytes.
 pub(super) fn qsa_growth_bytes(weights: &ResidentWeights) -> Result<u64, EngError> {
-    let d = weights.shape.qsa.dims();
     let layers = weights
         .layers
         .iter()
         .filter(|layer| matches!(layer.attn, RAttn::Qsa(_)))
         .count();
+    qsa_bytes_per_position(&weights.shape, layers)
+}
+
+fn qsa_bytes_per_position(shape: &ModelShape, layers: usize) -> Result<u64, EngError> {
+    let d = shape.qsa.dims();
     use crate::family::kv_format::{KvFormat, KvRowShape};
     let overflow = || EngError::MemoryPlan("qsa growth bytes overflow u64".into());
     let kv = KvFormat::F32
@@ -39,6 +44,55 @@ pub(super) fn qsa_growth_bytes(weights: &ResidentWeights) -> Result<u64, EngErro
         .ok_or_else(overflow)
 }
 
+struct FixedStateShapes {
+    rec: [u32; 3],
+    ring: [u32; 2],
+    ple: [u32; 2],
+}
+
+impl FixedStateShapes {
+    fn new(shape: &ModelShape) -> Result<Self, EngError> {
+        let d = &shape.delta;
+        let ple = shape.ple.dims();
+        let cols = (ple.conv_kernel - 1)
+            .checked_mul(ple.ngram)
+            .ok_or_else(|| EngError::MemoryPlan("ple ring width overflows".into()))?;
+        Ok(Self {
+            rec: [
+                dim(d.value_heads())?,
+                dim(d.key_dim())?,
+                dim(d.value_dim())?,
+            ],
+            ring: [dim(d.conv_dim())?, dim(d.conv_kernel() - 1)?],
+            ple: [dim(shape.hyper.width())?, cols],
+        })
+    }
+}
+
+/// Prices the zero state and all context rows from model geometry alone.
+pub(super) fn state_bytes_at_context(
+    shape: &ModelShape,
+    kinds: &[bool],
+    positions: u32,
+) -> Result<u64, EngError> {
+    let fixed = FixedStateShapes::new(shape)?;
+    let qsa_layers = kinds.iter().filter(|&&qsa| qsa).count();
+    let delta_layers = kinds.len() - qsa_layers;
+    let bytes = |dims: &[u32]| {
+        dims.iter()
+            .try_fold(F32_BYTES, |n, &dim| n.checked_mul(u64::from(dim)))
+    };
+    let context = qsa_bytes_per_position(shape, qsa_layers)?.checked_mul(u64::from(positions));
+    let total = || {
+        bytes(&fixed.rec)?
+            .checked_add(bytes(&fixed.ring)?)?
+            .checked_mul(u64::try_from(delta_layers).ok()?)?
+            .checked_add(bytes(&fixed.ple)?)?
+            .checked_add(context?)
+    };
+    total().ok_or_else(|| EngError::MemoryPlan("Flash-Next session bytes overflow".into()))
+}
+
 /// Bytes that a chunk of `rows` tokens adds to the stored QSA caches: `rows` positions of
 /// `qsa_growth_bytes`. The growth per position is constant while the QSA path keeps its whole
 /// cache. It makes no native call.
@@ -46,6 +100,18 @@ pub(super) fn chunk_growth_bytes(weights: &ResidentWeights, rows: u32) -> Result
     qsa_growth_bytes(weights)?
         .checked_mul(u64::from(rows))
         .ok_or_else(|| EngError::MemoryPlan("qsa chunk growth bytes overflow u64".into()))
+}
+
+/// Charge newly allocated rows, including spare capacity, before taking state.
+pub(super) fn qsa_append_growth(
+    weights: &ResidentWeights,
+    pos: u32,
+    rows: u32,
+) -> Result<u64, EngError> {
+    let end = pos
+        .checked_add(rows)
+        .ok_or_else(|| EngError::ContextLimit("position overflows u32".into()))?;
+    chunk_growth_bytes(weights, capacity(end) - capacity(pos))
 }
 
 /// Bytes of the QSA tensors in `layers`, summed from the tensors' own sizes.
@@ -68,7 +134,8 @@ pub(super) enum LayerState {
         rec: ExecutionTensor,
         ring: ExecutionTensor,
     },
-    /// QSA keys `[1, KVH, T, D]`, values, and raw indexer keys `[T, ID]`. `None` while `len` is 0.
+    /// QSA keys `[1, KVH, cap, D]`, values, and raw indexer keys `[cap, ID]`.
+    /// Only rows below `len` are visible. The planes are absent at length zero.
     Qsa {
         k: Option<ExecutionTensor>,
         v: Option<ExecutionTensor>,
@@ -79,7 +146,7 @@ pub(super) enum LayerState {
 
 impl LayerState {
     /// Returns a layer state that shares every array with `self`. It copies no array.
-    fn share(&self) -> Self {
+    pub(super) fn share(&self) -> Self {
         match self {
             Self::Delta { rec, ring } => Self::Delta {
                 rec: rec.share(),
@@ -108,8 +175,8 @@ fn fixed_bytes(layers: &[LayerState], ple_ring: &ExecutionTensor) -> Result<u64,
     Ok(total.total())
 }
 
-/// A committed `ResidentState` held by shared handles. Its arrays are immutable: a step builds new
-/// arrays and never writes into an existing one. One growth permit charges all its bytes to the
+/// A committed `ResidentState` held by shared handles. Its arrays are immutable while shared.
+/// One growth permit charges all allocated bytes to the
 /// session budget and releases them when the snapshot drops.
 pub(super) struct ResidentSnapshot {
     layers: Vec<LayerState>,
@@ -148,25 +215,15 @@ impl ResidentState {
         kernels: &mut MlxKernels,
         weights: &ResidentWeights,
     ) -> Result<Self, EngError> {
-        let d = &weights.shape.delta;
-        let rec = vec![
-            dim(d.value_heads())?,
-            dim(d.key_dim())?,
-            dim(d.value_dim())?,
-        ];
-        let ring = vec![dim(d.conv_dim())?, dim(d.conv_kernel() - 1)?];
-        let ple = weights.shape.ple.dims();
-        let cols = (ple.conv_kernel - 1)
-            .checked_mul(ple.ngram)
-            .ok_or_else(|| EngError::MemoryPlan("ple ring width overflows".into()))?;
+        let fixed = FixedStateShapes::new(&weights.shape)?;
         let mut sources: Vec<Tensor> = Vec::new();
         for layer in &weights.layers {
             if matches!(layer.attn, RAttn::Delta(_)) {
-                sources.push(zeros(rec.clone())?);
-                sources.push(zeros(ring.clone())?);
+                sources.push(zeros(fixed.rec.to_vec())?);
+                sources.push(zeros(fixed.ring.to_vec())?);
             }
         }
-        sources.push(zeros(vec![dim(weights.shape.hyper.width())?, cols])?);
+        sources.push(zeros(fixed.ple.to_vec())?);
         let refs: Vec<&Tensor> = sources.iter().collect();
         let mut got = kernels.import_many(&refs)?.into_iter();
         let mut next = || got.next().ok_or_else(short_import);
@@ -256,9 +313,13 @@ impl ResidentState {
     }
 
     /// Host checks before a chunk of `rows` tokens. They make no native call. On error the state is
-    /// unchanged and not poisoned. A chunk whose last row passes the dense QSA limit returns
-    /// `ContextLimit`, also when the one-token path allows that position.
-    pub(super) fn check_chunk(&self, weights: &ResidentWeights, rows: u32) -> Result<(), EngError> {
+    /// unchanged and not poisoned. The QSA mode must cover the whole chunk.
+    pub(super) fn check_chunk(
+        &self,
+        weights: &ResidentWeights,
+        rows: u32,
+        batch: QsaBatch,
+    ) -> Result<(), EngError> {
         self.check_step(weights)?;
         if rows == 0 {
             return Err(EngError::BadRequest(
@@ -270,7 +331,7 @@ impl ResidentState {
         }
         for state in &self.layers {
             if let LayerState::Qsa { len, .. } = state {
-                check_chunk_dense(&weights.shape.qsa, *len, self.pos, rows)?;
+                check_batch(&weights.shape.qsa, *len, self.pos, rows, batch)?;
             }
         }
         Ok(())
@@ -328,7 +389,9 @@ impl ResidentState {
                 "session charge {charged} bytes differs from stored QSA bytes {stored}"
             )));
         }
-        self.permits.push(permit);
+        if permit.retained_bytes() > 0 {
+            self.permits.push(permit);
+        }
         self.layers = layers;
         self.ple_ring = ple_ring;
         self.history = history;
@@ -337,22 +400,25 @@ impl ResidentState {
         Ok(())
     }
 
-    /// Shares the committed state as a snapshot. It makes no native call and copies no array. One
-    /// permit charges the QSA bytes and the fixed bytes to `budget`. A poisoned state returns
-    /// `BadRequest`. A denied permit returns `MemoryPlan`. On error the state and the budget are unchanged.
-    pub(super) fn snapshot(
-        &self,
-        budget: &mut SessionBudget,
-    ) -> Result<ResidentSnapshot, EngError> {
+    /// Computes the same charge as a snapshot without changing the state or budget.
+    pub(super) fn snapshot_bytes(&self) -> Result<u64, EngError> {
         if self.is_poisoned() {
             return Err(EngError::BadRequest(
                 "a poisoned resident state cannot be saved".into(),
             ));
         }
-        let bytes = qsa_bytes(&self.layers)?
+        qsa_bytes(&self.layers)?
             .checked_add(fixed_bytes(&self.layers, &self.ple_ring)?)
-            .ok_or_else(|| EngError::MemoryPlan("snapshot bytes overflow u64".into()))?;
-        let charge = budget.acquire_growth(bytes)?;
+            .ok_or_else(|| EngError::MemoryPlan("snapshot bytes overflow u64".into()))
+    }
+
+    /// Shares the committed state as a snapshot. It makes no native call and copies no array.
+    /// One permit charges its allocated bytes to the session budget.
+    pub(super) fn snapshot(
+        &self,
+        budget: &mut SessionBudget,
+    ) -> Result<ResidentSnapshot, EngError> {
+        let charge = budget.acquire_growth(self.snapshot_bytes()?)?;
         Ok(ResidentSnapshot {
             layers: self.layers.iter().map(LayerState::share).collect(),
             ple_ring: self.ple_ring.share(),
@@ -756,6 +822,65 @@ mod snapshot_tests {
     /// Bytes of the fixture state that do not grow: DeltaNet `rec` 2 * 32 * 32 * 4 = 8,192,
     /// the convolution ring 128 * 3 * 4 = 1,536, and the PLE ring 128 * 9 * 4 = 4,608.
     const FIXED_BYTES: u64 = 14_336;
+
+    #[test]
+    #[ignore = "run with FIFI_FLASH_NEXT_MLX_CAPACITY_KV=1 on an admitted Mac GPU"]
+    fn capacity_qsa_charges_growth_and_protects_restored_prefixes() {
+        let _serial = crate::native_test_lock();
+        assert_eq!(super::capacity(1), 256, "the capacity-backed arm must run");
+        let (ckpt, flash) = load();
+        let initial = 256 * QSA_PER_TOKEN;
+        let mut decoder = decoder_with_cap(&ckpt, &flash, 2 * initial + FIXED_BYTES);
+        decoder.open_prefill(128).unwrap();
+        decoder.sparse_prefill_bytes = 8 << 20;
+        let mut state = decoder.zero_state().unwrap();
+        let ids: Vec<u32> = (0..261).map(|pos| pos % 7 + 1).collect();
+        for piece in ids[..252].chunks(128) {
+            decoder
+                .prefill(&mut state, piece, StepMode::Prompt)
+                .unwrap();
+        }
+        assert_eq!(decoder.session_used(), initial);
+        let snapshot = decoder.snapshot(&state).unwrap();
+        let snapshot_values = read(&mut decoder, arrays(&snapshot.layers, &snapshot.ple_ring));
+        assert_eq!(snapshot.charged_bytes(), initial + FIXED_BYTES);
+        decoder.reset(&mut state).unwrap();
+        decoder.restore(&mut state, &snapshot).unwrap();
+        decoder
+            .step(&mut state, ids[252], StepMode::Prompt)
+            .unwrap();
+        assert_eq!(state.pos(), 253);
+        assert_eq!(decoder.session_used(), 2 * initial + FIXED_BYTES);
+        assert_eq!(
+            read(&mut decoder, arrays(&snapshot.layers, &snapshot.ple_ring)),
+            snapshot_values
+        );
+
+        let resumed = &ids[253..];
+        let denied = decoder.prefill(&mut state, resumed, StepMode::Record);
+        assert!(matches!(denied, Err(EngError::MemoryPlan(_))));
+        assert_eq!(state.pos(), 253);
+        assert!(!state.is_poisoned());
+        assert_eq!(decoder.session_used(), 2 * initial + FIXED_BYTES);
+        drop(snapshot);
+        let grown = decoder
+            .prefill(&mut state, resumed, StepMode::Record)
+            .unwrap();
+        assert_eq!(state.pos(), 261);
+        assert_eq!(decoder.session_used(), 2 * initial);
+        decoder.reset(&mut state).unwrap();
+        assert_eq!(decoder.session_used(), 0);
+        prefill(&mut decoder, &mut state, &ids[..260]);
+        let stepped = decoder
+            .step(&mut state, ids[260], StepMode::Record)
+            .unwrap();
+        assert_eq!(stepped.token, grown.token);
+        super::super::prefill::assert_parity(
+            &grown.logits.unwrap(),
+            &stepped.logits.unwrap(),
+            "QSA growth after restoring",
+        );
+    }
 
     fn load() -> (StreamedCheckpoint, FlashWeights) {
         let ckpt = fixtures::checkpoint();

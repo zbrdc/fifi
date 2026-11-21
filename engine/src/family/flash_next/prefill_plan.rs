@@ -372,6 +372,8 @@ pub(crate) struct PrefillPlan {
     /// The chunk size, or `None` when no size above one token fits.
     pub(crate) chunk: Option<u32>,
     pub(crate) terms: PrefillTerms,
+    /// Workspace charged for the selected chunk, or zero when stepping token by token.
+    pub(crate) workspace_bytes: u64,
 }
 
 /// A chunk of one token is the one-token path, so a result of 1 is `None`.

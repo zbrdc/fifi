@@ -24,18 +24,18 @@ fn floats(dtype: Dtype, shape: Vec<u32>, values: impl Iterator<Item = f32>) -> T
     Tensor::try_from_host(dtype, shape, bytes).unwrap()
 }
 
-fn weight(format: QuantizationSpec, dtype: Dtype) -> PackedWeight {
-    let payload_width = WIDTH * format.bits / 32;
-    let scale_width = WIDTH / format.group_size;
+fn weight(format: QuantizationSpec, dtype: Dtype, width: u32) -> PackedWeight {
+    let payload_width = width * format.bits / 32;
+    let scale_width = width / format.group_size;
     // Finite, nonzero payload in both the affine and MX floating-point encodings.
     let payload = Tensor::try_from_host(
         Dtype::U32,
-        vec![WIDTH, payload_width],
-        vec![0x35; (WIDTH * payload_width * 4) as usize],
+        vec![width, payload_width],
+        vec![0x35; (width * payload_width * 4) as usize],
     )
     .unwrap();
-    let aux = vec![WIDTH, scale_width];
-    let count = (WIDTH * scale_width) as usize;
+    let aux = vec![width, scale_width];
+    let count = (width * scale_width) as usize;
     let (scales, biases) = if format.mode == QuantizationMode::Affine {
         (
             floats(dtype, aux.clone(), std::iter::repeat_n(0.015625, count)),
@@ -47,7 +47,7 @@ fn weight(format: QuantizationSpec, dtype: Dtype) -> PackedWeight {
             None,
         )
     };
-    PackedWeight::try_new(payload, scales, biases, vec![WIDTH, WIDTH], format).unwrap()
+    PackedWeight::try_new(payload, scales, biases, vec![width, width], format).unwrap()
 }
 
 fn formats() -> impl Iterator<Item = (&'static str, QuantizationSpec)> {
@@ -133,14 +133,24 @@ fn packed_projection_matrix() {
     let mut k = MlxKernels::try_new().unwrap();
     k.allow_bf16(true);
     k.set_cache_limit(64 << 20).unwrap();
-    for (mode, spec) in formats() {
+    let large = std::env::var_os("FIFI_MLX_PROJECTION_LARGE").is_some_and(|value| value == "1");
+    let (width, batches) = if large {
+        (4096, [128, 256])
+    } else {
+        (WIDTH, BATCHES)
+    };
+    for (mode, spec) in formats().filter(|(mode, spec)| {
+        !large
+            || *mode != "affine"
+            || ([4, 8].contains(&spec.bits) && [32, 64].contains(&spec.group_size))
+    }) {
         for (dtype, name) in [(Dtype::F32, "f32"), (Dtype::Bf16, "bf16")] {
-            let packed = k.import_packed(&weight(spec, dtype)).unwrap();
-            for rows in BATCHES {
+            let packed = k.import_packed(&weight(spec, dtype, width)).unwrap();
+            for rows in batches {
                 let input = floats(
                     dtype,
-                    vec![rows, WIDTH],
-                    (0..rows * WIDTH).map(|index| (1 + index % 17) as f32 / 512.0),
+                    vec![rows, width],
+                    (0..rows * width).map(|index| (1 + index % 17) as f32 / 512.0),
                 );
                 let input = k.import_tensor(&input).unwrap();
                 let view = k.reshape(&input, input.shape()).unwrap();
@@ -155,7 +165,7 @@ fn packed_projection_matrix() {
                     "{mode} {spec:?} {name} {rows}"
                 );
                 assert!(bytes.iter().any(|byte| *byte != 0));
-                assert_eq!(actual.shape(), &[rows, WIDTH]);
+                assert_eq!(actual.shape(), &[rows, width]);
                 let digest = format!("{:x}", Sha256::digest(bytes));
 
                 let mut submission = Vec::with_capacity(samples);
@@ -172,7 +182,7 @@ fn packed_projection_matrix() {
                     "mlx_projection {}",
                     serde_json::json!({
                         "quant": mode, "bits": spec.bits, "group": spec.group_size,
-                        "dtype": name, "rows": rows, "width": WIDTH, "output_sha256": digest,
+                        "dtype": name, "rows": rows, "width": width, "output_sha256": digest,
                         "submit_ns": submission, "elapsed_ns": elapsed,
                     })
                 );

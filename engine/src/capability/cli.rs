@@ -332,13 +332,26 @@ fn run_config_effective(path: &std::path::Path, json: bool) -> Result<(), String
     for engine in &config.engines {
         let is_q36_family = engine.family == crate::family::qwen36::factory::FAMILY
             || engine.family == crate::family::qwen36::factory::DENSE_FAMILY;
-        if engine.family == crate::family::flint::FAMILY {
-            let default_options = crate::family::flint::settings::FlintOptions::cuda_default();
-            let rows = super::effective::flint_effective(
-                engine.flint.as_ref().unwrap_or(&default_options),
-                &crate::family::flint::budget::FlintEnv::capture(),
-                None,
-            );
+        let is_flint = engine.family == crate::family::flint::FAMILY;
+        let is_flash_mlx = engine.family == crate::family::flash_next::factory::FAMILY
+            && super::probe::CompiledBackends::of_this_build().mlx;
+        if is_flint || is_flash_mlx {
+            let rows = if is_flint {
+                super::effective::flint_effective_for_build(engine.flint.as_ref(), None)
+            } else {
+                super::effective::flash_mlx_config_effective(
+                    &engine.model_dir,
+                    &engine.tokenizer_dir,
+                    engine.flash_next.as_ref(),
+                )
+            }
+            .map_err(|error| {
+                format!(
+                    "engine {} would not start: {}",
+                    engine.id,
+                    super::describe_error(&error)
+                )
+            })?;
             rendered.push_str(&format!(
                 "engine {} ({}, model {}):\n",
                 engine.id,
@@ -353,12 +366,21 @@ fn run_config_effective(path: &std::path::Path, json: bool) -> Result<(), String
                     row.origin.name()
                 ));
             }
+            let settings = if is_flint && !super::probe::CompiledBackends::of_this_build().mlx {
+                serde_json::json!(
+                    rows.iter()
+                        .map(|row| serde_json::json!({
+                            "key": row.key, "value": row.value, "origin": row.origin.name()
+                        }))
+                        .collect::<Vec<_>>()
+                )
+            } else {
+                serde_json::json!(rows)
+            };
             json_engines.push(serde_json::json!({
                 "id": engine.id,
                 "family": engine.family,
-                "settings": rows.iter().map(|row| serde_json::json!({
-                    "key": row.key, "value": row.value, "origin": row.origin.name()
-                })).collect::<Vec<_>>(),
+                "settings": settings,
             }));
             continue;
         }
@@ -402,7 +424,7 @@ fn run_config_effective(path: &std::path::Path, json: bool) -> Result<(), String
         }
         if !is_q36_family {
             rendered.push_str(&format!(
-                "engine {} ({}): per-key origins are composed for the Qwen3.6 families only so far; model_dir {}\n",
+                "engine {} ({}): per-key origins are unavailable on this backend; model_dir {}\n",
                 engine.id,
                 engine.family,
                 engine.model_dir.display()
@@ -412,8 +434,8 @@ fn run_config_effective(path: &std::path::Path, json: bool) -> Result<(), String
             }));
             continue;
         }
-        use crate::family::qwen36::factory::backend_of_build;
-        use crate::family::qwen36::settings::{Q36Env, Q36Settings};
+        use crate::family::qwen36::factory::{backend_of_build, settings_with_prefix_reuse};
+        use crate::family::qwen36::settings::Q36Env;
         let env = Q36Env::from_process(&engine.model_dir);
         let backend = backend_of_build();
         let spec = if engine.family == crate::family::qwen36::factory::DENSE_FAMILY {
@@ -421,12 +443,16 @@ fn run_config_effective(path: &std::path::Path, json: bool) -> Result<(), String
         } else {
             crate::family::spec::QWEN3_6_35B_A3B
         };
-        let settings = Q36Settings::new_for_family(
+        let prefix_reuse = config
+            .prefix_reuse
+            .unwrap_or_else(|| crate::server::run::default_prefix_reuse(engine));
+        let settings = settings_with_prefix_reuse(
             &engine.model_dir,
             &engine.tokenizer_dir,
             engine.qwen36.as_ref(),
             &env,
             backend,
+            prefix_reuse,
             spec,
         )
         .map_err(|error| {
@@ -436,9 +462,6 @@ fn run_config_effective(path: &std::path::Path, json: bool) -> Result<(), String
                 super::describe_error(&error)
             )
         })?;
-        let prefix_reuse = config
-            .prefix_reuse
-            .unwrap_or_else(|| crate::server::run::default_prefix_reuse(engine));
         if prefix_reuse {
             settings
                 .check_prefix_reuse_cap(true)

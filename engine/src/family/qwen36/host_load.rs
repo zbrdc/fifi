@@ -79,6 +79,53 @@ struct OwnedLayer {
     feed_forward: OwnedFeedForward,
 }
 
+impl OwnedLayer {
+    fn view(&self) -> LayerW<'_, StoredWeight> {
+        LayerW {
+            input_norm: &self.input_norm,
+            post_norm: &self.post_norm,
+            mixer: match &self.mixer {
+                OwnedMixer::Delta(d) => MixerW::Delta(DeltaW {
+                    qkv: &d.qkv,
+                    z: &d.z,
+                    b: &d.b,
+                    a: &d.a,
+                    out: &d.out,
+                    conv: &d.conv,
+                    a_log: &d.a_log,
+                    dt_bias: &d.dt_bias,
+                    norm: &d.norm,
+                }),
+                OwnedMixer::Attn(a) => MixerW::Attn(AttnW {
+                    q: &a.q,
+                    k: &a.k,
+                    v: &a.v,
+                    o: &a.o,
+                    q_norm: &a.q_norm,
+                    k_norm: &a.k_norm,
+                }),
+            },
+            feed_forward: match &self.feed_forward {
+                OwnedFeedForward::Dense(dense) => FeedForwardW::Dense(DenseW {
+                    gate: &dense.gate,
+                    up: &dense.up,
+                    down: &dense.down,
+                }),
+                OwnedFeedForward::Moe(moe) => FeedForwardW::Moe(MoeW {
+                    router: &moe.router,
+                    gate: &moe.gate,
+                    up: &moe.up,
+                    down: &moe.down,
+                    shared_gate: &moe.shared_gate,
+                    shared_up: &moe.shared_up,
+                    shared_down: &moe.shared_down,
+                    shared_scalar: &moe.shared_scalar,
+                }),
+            },
+        }
+    }
+}
+
 pub(crate) struct HostWeights {
     shape: HostShape,
     embed: StoredWeight,
@@ -149,6 +196,7 @@ struct Loader<'a> {
     ckpt: &'a StreamedCheckpoint,
     quant: QuantizationMap,
     keys: BTreeSet<String>,
+    stage_dense_ffn: bool,
 }
 
 impl Loader<'_> {
@@ -177,6 +225,21 @@ impl Loader<'_> {
         Ok(StoredWeight::Packed(Box::new(weight)))
     }
 
+    fn dense_ffn(
+        &mut self,
+        stem: &str,
+        out: usize,
+        input: usize,
+    ) -> Result<StoredWeight, EngError> {
+        if !self.stage_dense_ffn {
+            return self.packed(stem, out, input);
+        }
+        let spec = self.spec(stem)?;
+        let weight = stored::sliced_matrix(self.ckpt, stem, spec, dim(out)?, dim(input)?)?;
+        self.record(stem, spec);
+        Ok(StoredWeight::Sliced(weight))
+    }
+
     /// A packed stack `[slices, rows, cols]` or table `[slices, cols]`, described and not read.
     fn sliced(&mut self, stem: &str, rows: usize, cols: usize) -> Result<StoredWeight, EngError> {
         let spec = self.spec(stem)?;
@@ -202,12 +265,22 @@ impl HostWeights {
         spec: &FamilySpec,
         config: &[u8],
     ) -> Result<Self, EngError> {
+        Self::load_with_dense_staging(ckpt, spec, config, false)
+    }
+
+    pub(crate) fn load_with_dense_staging(
+        ckpt: &StreamedCheckpoint,
+        spec: &FamilySpec,
+        config: &[u8],
+        stage_dense_ffn: bool,
+    ) -> Result<Self, EngError> {
         spec.check_config(config)?;
         let shape = HostShape::from_spec(spec, rotary_dim(config, spec.head_dim)?)?;
         let mut loader = Loader {
             ckpt,
             quant: QuantizationMap::from_json(config)?,
             keys: BTreeSet::new(),
+            stage_dense_ffn,
         };
         let hidden = shape.hidden;
         let embed = loader.sliced(&format!("{MODEL}embed_tokens"), 1, hidden)?;
@@ -268,56 +341,25 @@ impl HostWeights {
         &self.keys
     }
 
+    /// Consume host payloads immediately after each layer imports.
+    #[cfg(all(feature = "native-mlx", target_os = "macos", target_arch = "aarch64"))]
+    pub(crate) fn import_layers<T>(
+        mut self,
+        mut import: impl FnMut(&LayerW<'_, StoredWeight>) -> Result<T, EngError>,
+    ) -> Result<Vec<T>, EngError> {
+        let layers = std::mem::take(&mut self.layers);
+        drop(self);
+        layers
+            .into_iter()
+            .map(|layer| import(&layer.view()))
+            .collect()
+    }
+
     /// Borrowed weights for [`super::host::step`].
     pub(crate) fn view(&self) -> ModelW<'_, StoredWeight> {
         ModelW {
             embed: &self.embed,
-            layers: self
-                .layers
-                .iter()
-                .map(|layer| LayerW {
-                    input_norm: &layer.input_norm,
-                    post_norm: &layer.post_norm,
-                    mixer: match &layer.mixer {
-                        OwnedMixer::Delta(d) => MixerW::Delta(DeltaW {
-                            qkv: &d.qkv,
-                            z: &d.z,
-                            b: &d.b,
-                            a: &d.a,
-                            out: &d.out,
-                            conv: &d.conv,
-                            a_log: &d.a_log,
-                            dt_bias: &d.dt_bias,
-                            norm: &d.norm,
-                        }),
-                        OwnedMixer::Attn(a) => MixerW::Attn(AttnW {
-                            q: &a.q,
-                            k: &a.k,
-                            v: &a.v,
-                            o: &a.o,
-                            q_norm: &a.q_norm,
-                            k_norm: &a.k_norm,
-                        }),
-                    },
-                    feed_forward: match &layer.feed_forward {
-                        OwnedFeedForward::Dense(dense) => FeedForwardW::Dense(DenseW {
-                            gate: &dense.gate,
-                            up: &dense.up,
-                            down: &dense.down,
-                        }),
-                        OwnedFeedForward::Moe(moe) => FeedForwardW::Moe(MoeW {
-                            router: &moe.router,
-                            gate: &moe.gate,
-                            up: &moe.up,
-                            down: &moe.down,
-                            shared_gate: &moe.shared_gate,
-                            shared_up: &moe.shared_up,
-                            shared_down: &moe.shared_down,
-                            shared_scalar: &moe.shared_scalar,
-                        }),
-                    },
-                })
-                .collect(),
+            layers: self.layers.iter().map(OwnedLayer::view).collect(),
             final_norm: &self.final_norm,
             lm_head: &self.lm_head,
         }
@@ -369,9 +411,9 @@ fn load_dense(
     prefix: &str,
 ) -> Result<OwnedDense, EngError> {
     Ok(OwnedDense {
-        gate: loader.packed(&format!("{prefix}mlp.gate_proj"), inter, hidden)?,
-        up: loader.packed(&format!("{prefix}mlp.up_proj"), inter, hidden)?,
-        down: loader.packed(&format!("{prefix}mlp.down_proj"), hidden, inter)?,
+        gate: loader.dense_ffn(&format!("{prefix}mlp.gate_proj"), inter, hidden)?,
+        up: loader.dense_ffn(&format!("{prefix}mlp.up_proj"), inter, hidden)?,
+        down: loader.dense_ffn(&format!("{prefix}mlp.down_proj"), hidden, inter)?,
     })
 }
 

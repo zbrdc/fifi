@@ -198,7 +198,7 @@ async fn ready(State(state): State<Arc<AppState>>) -> Response {
 /// latch the serving backend terminal on failure, and a detected
 /// device says nothing about what the loaded executors use. So this
 /// reports compiled-in backends, host memory and threads, and the
-/// engines with their resolved context limits — never a device list.
+/// engines' settings and previously recorded startup decisions.
 async fn system(State(state): State<Arc<AppState>>) -> Json<serde_json::Value> {
     use crate::capability::Probe;
     let host = crate::capability::probe::probe_host();
@@ -218,16 +218,23 @@ async fn system(State(state): State<Arc<AppState>>) -> Json<serde_json::Value> {
         .entries()
         .iter()
         .map(|entry| {
-            serde_json::json!({
+            let status = entry.handle.state();
+            let mut engine = serde_json::json!({
                 "id": entry.id,
                 "model": entry.model,
-                "state": state_name(entry.handle.state()),
+                "state": state_name(status),
                 "queued": entry.handle.queued(),
                 "context_limit": entry.context_limit,
                 // The retained rows the engine started with (empty where a
                 // family composes no per-key origins) — not a re-resolution.
                 "settings": entry.effective,
-            })
+            });
+            if status != crate::sched::worker::EngineState::Loading
+                && let Some(plan) = entry.handle.mlx_execution()
+            {
+                engine["execution"] = json!(plan);
+            }
+            engine
         })
         .collect();
     Json(serde_json::json!({
@@ -516,6 +523,77 @@ mod tests {
         assert_eq!(rows[0]["key"], "context_limit");
         assert_eq!(rows[0]["value"], "32768");
         assert_eq!(rows[0]["origin"], "config_file");
+    }
+
+    #[tokio::test]
+    async fn system_route_publishes_the_loaded_mlx_execution_plan() {
+        use crate::{
+            exec_fake::FakeExecutor,
+            family::mlx_report::{
+                MlxDeviceCeiling, MlxExecutionPlan, MlxPrefillMemory, PrefillReason,
+            },
+            sched::worker::spawn_engine,
+        };
+        let (gate, wait) = std::sync::mpsc::channel::<()>();
+        let engine = spawn_engine(16, move |_| {
+            wait.recv().unwrap();
+            let mut fake = FakeExecutor::new(Vec::new(), &[testkit::EOS], 32);
+            fake.with_mlx_plan(MlxExecutionPlan::new(
+                "disk_experts",
+                "file-backed fixture",
+                16,
+                1,
+                PrefillReason::Workspace,
+                Some(MlxPrefillMemory {
+                    prefill_budget_bytes: 2 << 30,
+                    remaining_bytes: 128 << 20,
+                    device: Some(MlxDeviceCeiling {
+                        metal_working_set_bytes: 4 << 30,
+                        effective_device_budget_bytes: 2 << 30,
+                        configured_device_ceiling_bytes: Some(2 << 30),
+                    }),
+                    base_charges: [("session_reserve_bytes", 1920 << 20)].into(),
+                    workspace: [("expert_staging_bytes", 8 << 20)].into(),
+                }),
+            ));
+            Ok((fake, Default::default()))
+        })
+        .unwrap();
+        let entry = testkit::entry("e1", "model-a", &engine, 4096);
+        let app = router(Arc::new(AppState::new(testkit::API_KEY, vec![entry])));
+        let query = || testkit::get("/v1/system", Some(testkit::API_KEY));
+        let (status, _, bytes) = testkit::send(&app, query()).await;
+        assert_eq!(status, StatusCode::OK);
+        let loading = testkit::json_of(&bytes);
+        assert_eq!(loading["engines"][0]["state"], "loading");
+        assert!(loading["engines"][0].get("execution").is_none());
+        gate.send(()).unwrap();
+        testkit::wait_for_state(&engine.handle(), EngineState::Ready);
+        let (status, _, bytes) = testkit::send(&app, query()).await;
+        assert_eq!(status, StatusCode::OK);
+        let ready = testkit::json_of(&bytes);
+        assert_pointer(
+            "/paths/~1v1~1system/get/responses/200/content/application~1json/schema",
+            &ready,
+        );
+        let report = &ready["engines"][0]["execution"];
+        assert_eq!(report["backend"], "mlx");
+        assert_eq!(report["prefill_rows"], 1);
+        assert_eq!(report["worker_piece_rows"], 16);
+        assert_eq!(report["decisions"][0]["chosen"], "disk_experts");
+        assert_eq!(
+            report["decisions"][1]["alternatives"][0]["reason"],
+            "no supported chunk fits the workspace budget"
+        );
+        assert_eq!(
+            report["memory"]["device"]["effective_device_budget_bytes"],
+            2u64 << 30
+        );
+        assert_eq!(
+            report["memory"]["workspace"]["expert_staging_bytes"],
+            8 << 20
+        );
+        assert!(engine.shutdown().failure.is_none());
     }
 
     #[tokio::test]

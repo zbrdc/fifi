@@ -7,10 +7,14 @@
 //! route recorder needs no extra readback.
 
 use super::super::moe::{MoeShape, select};
+use super::decode_cache::DecodeCache;
 use super::ops::{Ctx, dim, linear, short_import, values};
 use super::slots::{ExpertSlots, SetLayout};
 use super::weights::RMoe;
-use crate::family::stored::read_stack_into;
+use crate::family::{
+    prefill::mlx::{overlap_expert_reads, submit_shared_expert},
+    stored::read_stack_into,
+};
 use crate::{
     EngError,
     kernels::{BinaryOp, HostPages, ReduceOp, ResidentPackedWeight, UnaryOp},
@@ -53,6 +57,7 @@ fn routed(
     ckpt: &StreamedCheckpoint,
     w: &RMoe,
     slots: &mut ExpertSlots,
+    decode_cache: Option<(&mut DecodeCache, usize)>,
     routes: &[(u32, f32)],
     x: &ExecutionTensor,
 ) -> Result<ExecutionTensor, EngError> {
@@ -70,7 +75,7 @@ fn routed(
     };
     let ids: Vec<u32> = routes.iter().map(|&(e, _)| e).collect();
     let gate_values: Vec<f32> = routes.iter().map(|&(_, g)| g).collect();
-    let (stacks, plain) = import_in_pages(ctx, ckpt, w, slots, &ids, &gate_values)?;
+    let (stacks, plain) = import_in_pages(ctx, ckpt, w, slots, decode_cache, &ids, &gate_values)?;
     let [g, u, d]: [ResidentPackedWeight; 3] = stacks.try_into().map_err(|_| short_import())?;
     let [gates]: [ExecutionTensor; 1] = plain.try_into().map_err(|_| short_import())?;
     let x3 = ctx.kernels.reshape(x, &[1, 1, hidden])?;
@@ -91,6 +96,7 @@ fn import_in_pages(
     ckpt: &StreamedCheckpoint,
     w: &RMoe,
     slots: &mut ExpertSlots,
+    decode_cache: Option<(&mut DecodeCache, usize)>,
     ids: &[u32],
     gate_values: &[f32],
 ) -> Result<(Vec<ResidentPackedWeight>, Vec<ExecutionTensor>), EngError> {
@@ -104,8 +110,12 @@ fn import_in_pages(
                 "the expert stacks do not fit one page set".into(),
             ));
         }
-        for (stored, stack) in [&w.gate, &w.up, &w.down].into_iter().zip(&layout.stacks) {
-            read_stack_into(ckpt, stored, ids, bytes, stack)?;
+        if let Some((cache, layer)) = decode_cache {
+            cache.stage(layer, ckpt, w, ids, bytes, &layout)?;
+        } else {
+            for (stored, stack) in [&w.gate, &w.up, &w.down].into_iter().zip(&layout.stacks) {
+                read_stack_into(ckpt, stored, ids, bytes, stack)?;
+            }
         }
         let gates_at = layout.gates.offset;
         for (word, value) in bytes[gates_at..]
@@ -117,11 +127,15 @@ fn import_in_pages(
             *word = value.to_le_bytes();
         }
     }
+    #[cfg(feature = "native-fault-qualification")]
+    let import_started = std::time::Instant::now();
     let imported = ctx.kernels.import_packed_pages(
         slots.pages(set)?,
         &layout.packed(),
         std::slice::from_ref(&layout.gates),
     )?;
+    #[cfg(feature = "native-fault-qualification")]
+    crate::family::stored::record_page_import(import_started.elapsed());
     slots.lend(set);
     Ok(imported)
 }
@@ -151,12 +165,22 @@ pub(super) fn step_paged(
     shape: &MoeShape,
     w: &RMoe,
     slots: &mut ExpertSlots,
+    decode_cache: Option<(&mut DecodeCache, usize)>,
     x: &ExecutionTensor,
 ) -> Result<(ExecutionTensor, Selection), EngError> {
     let (routes, probs) = route(ctx, shape, w, x)?;
     slots.release_lent();
-    let experts = routed(ctx, ckpt, w, slots, &routes, x)?;
-    let shared_out = shared(ctx, w, x)?;
+    let queued_shared = if overlap_expert_reads() {
+        let output = shared(ctx, w, x)?;
+        Some(submit_shared_expert(ctx.kernels, output)?)
+    } else {
+        None
+    };
+    let experts = routed(ctx, ckpt, w, slots, decode_cache, &routes, x)?;
+    let shared_out = match queued_shared {
+        Some(output) => output,
+        None => shared(ctx, w, x)?,
+    };
     let out = ctx.kernels.binary(BinaryOp::Add, &experts, &shared_out)?;
     Ok((out, (routes, probs)))
 }
@@ -293,6 +317,7 @@ pub(super) mod tests {
             &weights.shape.moe,
             &weights.layers[0].moe,
             &mut slots,
+            None,
             &input,
         )?;
         let host = values(kernels, &out);
@@ -418,7 +443,7 @@ pub(super) mod tests {
             };
             let moe_w = &weights.layers[layer].moe;
             let (out, (routes, probs)) =
-                step_paged(&mut ctx, &ckpt, &shape, moe_w, &mut slots, &input).unwrap();
+                step_paged(&mut ctx, &ckpt, &shape, moe_w, &mut slots, None, &input).unwrap();
             let host = values(&mut kernels, &out).unwrap();
             drop(out);
             slots.release_lent();
@@ -513,7 +538,7 @@ pub(super) mod tests {
                 kernels: &mut kernels,
                 consts: &weights.consts,
             };
-            let result = step_paged(&mut ctx, &ckpt, &shape, moe_w, &mut slots, &input);
+            let result = step_paged(&mut ctx, &ckpt, &shape, moe_w, &mut slots, None, &input);
             assert!(result.is_ok(), "call {call}: {:?}", result.err());
             let Ok((out, _)) = result else {
                 return;
@@ -544,8 +569,16 @@ pub(super) mod tests {
             kernels: &mut kernels,
             consts: &weights.consts,
         };
-        let (first, _) =
-            step_paged(&mut ctx, &ckpt, &weights.shape.moe, moe_w, &mut slots, &a).unwrap();
+        let (first, _) = step_paged(
+            &mut ctx,
+            &ckpt,
+            &weights.shape.moe,
+            moe_w,
+            &mut slots,
+            None,
+            &a,
+        )
+        .unwrap();
         assert_eq!(
             ctx.kernels.qualification_sync_count(),
             before + 1,
@@ -554,8 +587,16 @@ pub(super) mod tests {
         // The second call releases the first call's set, so its output is evaluated first.
         let first_host = values(ctx.kernels, &first).unwrap();
         let after_read = ctx.kernels.qualification_sync_count();
-        let (second, _) =
-            step_paged(&mut ctx, &ckpt, &weights.shape.moe, moe_w, &mut slots, &b).unwrap();
+        let (second, _) = step_paged(
+            &mut ctx,
+            &ckpt,
+            &weights.shape.moe,
+            moe_w,
+            &mut slots,
+            None,
+            &b,
+        )
+        .unwrap();
         assert_eq!(
             ctx.kernels.qualification_sync_count(),
             after_read + 1,

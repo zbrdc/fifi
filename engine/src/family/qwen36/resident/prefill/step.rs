@@ -48,6 +48,7 @@ use super::super::moe::Routing;
 use super::super::ops::{Ctx, cast_to, dim, linear, linear_rows, short_import, to_act, values};
 use super::super::state::{LayerState, ResidentState, advance_charge};
 use super::super::step::{check_dtype, read_token, split_rows};
+use super::super::stream_timing::ForwardTiming;
 use super::super::weights::{RFeedForward, RMixer};
 use super::delta::fused_prefill_enabled;
 use super::{attn, delta, moe};
@@ -120,26 +121,7 @@ pub(in super::super) fn prefill(
 ) -> Result<StepResult, EngError> {
     let rows = row_count(tokens)?;
     state.check_chunk(&decoder.weights, decoder.context_limit, rows)?; // the whole prompt
-    // The depth-aware split: a deterministic function of the
-    // prompt length, the start position, and the chunk setting, so snapshots and prefix reuse
-    // see the same boundaries on a recompute. It applies to both KV forms.
-    // The flash-prefill kernel materializes no score matrix, so under its whole
-    // eligibility the budget split is moot and an unbounded budget keeps full chunks. Without
-    // it, `Q36_PREFILL_QUERY_SLICE` (opt-in) moves the budget from the chunk to the query
-    // block that `attn::chunk` runs.
-    let score_bound = prefill_score_bound(
-        decoder.weights.shape.attn.heads_q as u32,
-        decoder.weights.shape.attn.heads_kv as u32,
-        decoder.weights.shape.attn.head_dim as u32,
-        decoder.weights.kv,
-    )?;
-    let parts = depth_ranges(
-        state.pos(),
-        rows,
-        decoder.chunk_rows,
-        repeat_count(&decoder.weights.shape)?,
-        score_bound,
-    )?;
+    let parts = chunk_ranges(decoder, state.pos(), rows)?;
     let mut result = None;
     for (index, &(start, stop)) in parts.iter().enumerate() {
         let part = usize::try_from(start)
@@ -161,6 +143,33 @@ pub(in super::super) fn prefill(
         )?);
     }
     result.ok_or_else(|| bad("a prefill needs at least one token"))
+}
+
+pub(in super::super) fn chunk_ranges(
+    decoder: &ResidentDecoder<'_>,
+    pos: u32,
+    rows: u32,
+) -> Result<Vec<(u32, u32)>, EngError> {
+    // The depth-aware split: a deterministic function of the
+    // prompt length, the start position, and the chunk setting, so snapshots and prefix reuse
+    // see the same boundaries on a recompute. It applies to both KV forms.
+    // The flash-prefill kernel materializes no score matrix, so under its whole
+    // eligibility the budget split is moot and an unbounded budget keeps full chunks. Without
+    // it, `Q36_PREFILL_QUERY_SLICE` (opt-in) moves the budget from the chunk to the query
+    // block that `attn::chunk` runs.
+    let score_bound = prefill_score_bound(
+        decoder.weights.shape.attn.heads_q as u32,
+        decoder.weights.shape.attn.heads_kv as u32,
+        decoder.weights.shape.attn.head_dim as u32,
+        decoder.weights.kv,
+    )?;
+    depth_ranges(
+        pos,
+        rows,
+        decoder.chunk_rows,
+        repeat_count(&decoder.weights.shape)?,
+        score_bound,
+    )
 }
 
 /// Runs `tokens` as one chunk with the retire cap `cap`. Tests use it to set a small cap. The gated
@@ -307,6 +316,7 @@ fn run(
     let weights = &decoder.weights;
     let shape = &weights.shape;
     let pos = state.pos();
+    let mut timing = ForwardTiming::begin(&decoder.kernels, weights, pos);
     let hidden = dim(shape.hidden)?;
     let per_token = delta_retire_per_token(
         dim(shape.delta.value_heads)?,
@@ -383,7 +393,7 @@ fn run(
                 router_t: &moe_w.router_t,
                 shared: [&moe_w.shared_gate, &moe_w.shared_up, &moe_w.shared_down],
                 shared_scalar_t: &moe_w.shared_scalar_t,
-                stacks: [&moe_w.gate_up, &moe_w.down],
+                stacks: [&moe_w.expert_pages()?.gate_up, &moe_w.expert_pages()?.down],
                 hidden: shape.hidden as u32,
                 experts: shape.moe.experts as u32,
                 top_k: shape.moe.top_k as u32,
@@ -476,7 +486,7 @@ fn run(
                     router_t: &moe_w.router_t,
                     shared: [&moe_w.shared_gate, &moe_w.shared_up, &moe_w.shared_down],
                     shared_scalar_t: &moe_w.shared_scalar_t,
-                    stacks: [&moe_w.gate_up, &moe_w.down],
+                    stacks: [&moe_w.expert_pages()?.gate_up, &moe_w.expert_pages()?.down],
                     hidden: shape.hidden as u32,
                     heads: a.heads_q as u32,
                     width: a.head_dim as u32,
@@ -537,7 +547,13 @@ fn run(
                 skip_add = true;
                 super::super::moe::dense_rows(&mut ctx, shape, w, &mid, &layer.post_norm)?
             }
-            (RFeedForward::Moe(w), Routing::Host) => moe::chunk(&mut ctx, shape, w, &normed)?.0,
+            (RFeedForward::StagedDense(stage), _) => {
+                skip_add = true;
+                stage.evaluate(&mut ctx, ckpt, shape, &mid, &layer.post_norm)?
+            }
+            (RFeedForward::Moe(w), Routing::Host) => {
+                moe::chunk_with_checkpoint(&mut ctx, shape, w, &normed, Some(ckpt), &mut timing)?.0
+            }
             (RFeedForward::Moe(w), Routing::Device) => {
                 let device = moe::chunk_device(&mut ctx, shape, w, &normed)?;
                 healths.push(device.health);
@@ -685,6 +701,9 @@ fn run(
         None => None,
     };
     state.commit_rows(rows, layers, permit)?;
+    if let Some(timing) = timing {
+        timing.finish(ctx.kernels, rows, mode);
+    }
     Ok(StepResult {
         window_logits,
         token: token_out,

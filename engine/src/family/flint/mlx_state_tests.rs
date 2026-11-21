@@ -6,6 +6,100 @@ use crate::{
 };
 
 #[test]
+#[ignore = "run with FIFI_FLINT_MLX_COMPACT_KV=1 on an admitted Mac GPU"]
+fn compact_kv_grows_full_planes_and_preserves_saved_rows() {
+    let _serial = crate::native_test_lock();
+    assert!(compact_kv_flagged(), "the compact growth arm must run");
+    let mut kernels = MlxKernels::try_new().unwrap();
+    kernels.allow_bf16(true);
+    let mut state = State::new();
+    let mut saved = None;
+    for (rows, capacity, marker) in [(256, 256, 1.0_f32), (1, 512, 2.0), (256, 1024, 3.0)] {
+        let pos = state.pos;
+        state
+            .ensure_full_capacity(&mut kernels, pos + rows)
+            .unwrap();
+        assert_eq!(state.full_capacity, capacity);
+        let host = Tensor::try_from_host(
+            Dtype::F32,
+            vec![4, rows, 128],
+            marker.to_le_bytes().repeat(4 * rows as usize * 128),
+        )
+        .unwrap();
+        let block = kernels.import_tensor(&host).unwrap();
+        for layer in [0, 2] {
+            let plan = ChunkCachePlan::new(layer, pos, rows, capacity).unwrap();
+            let (keys, _, guard) = Plane::prepare_chunk(
+                &mut kernels,
+                &mut state.planes[layer],
+                &plan,
+                &block,
+                &block,
+                false,
+            )
+            .unwrap();
+            Plane::commit_chunk(&mut kernels, &mut state.planes[layer], guard, &keys).unwrap();
+        }
+        state.pos += rows;
+        if capacity == 256 {
+            saved = Some(state.snapshot_prefix());
+        }
+    }
+    let read = |kernels: &mut MlxKernels, state: &State| {
+        let (keys, values) = state.planes[0].as_ref().unwrap().snapshot(kernels).unwrap();
+        assert_eq!(keys.host_bytes().unwrap(), values.host_bytes().unwrap());
+        keys
+    };
+    let grown = read(&mut kernels, &state);
+    let markers: Vec<u16> = grown
+        .host_bytes()
+        .unwrap()
+        .as_chunks::<2>()
+        .0
+        .iter()
+        .map(|bytes| u16::from_le_bytes(*bytes))
+        .collect();
+    for head in 0..4 {
+        for (row, want) in [
+            (0, 0x3f80),
+            (255, 0x3f80),
+            (256, 0x4000),
+            (512, 0x4040),
+            (513, 0),
+        ] {
+            assert!(
+                markers[(head * 1024 + row) * 128..][..128]
+                    .iter()
+                    .all(|&got| got == want)
+            );
+        }
+    }
+    state.restore_prefix(&saved.unwrap());
+    let restored = read(&mut kernels, &state);
+    assert_eq!(restored.shape(), [4, 256, 128]);
+    assert_eq!(state.pos, 256);
+    assert!(
+        restored
+            .host_bytes()
+            .unwrap()
+            .as_chunks::<2>()
+            .0
+            .iter()
+            .all(|bytes| *bytes == [0x80, 0x3f])
+    );
+    assert_eq!(
+        state.planes[2]
+            .as_ref()
+            .unwrap()
+            .snapshot(&mut kernels)
+            .unwrap()
+            .0
+            .shape(),
+        [4, WINDOW, 128]
+    );
+}
+
+#[test]
 #[ignore = "requires an explicit Mac GPU allocation; no model weights"]
 fn bf16_cache_window_and_reset_preserve_chronological_rows() {
     let _serial = crate::native_test_lock();

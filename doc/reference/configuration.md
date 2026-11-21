@@ -48,11 +48,19 @@ This selection applies to the FP16 attention part kernel, not every model kernel
 
 An optional positive integer, `flash_next.prefill_budget_bytes`, gives the engine a total byte budget for batched prompt processing. Omit the key to serve one token at a time. With a budget, startup selects the largest fitting chunk up to `flash_next.prefill_chunk` (default 16, range 1–2,048). A worker piece below four rows or insufficient room for a four-row chunk selects the one-token path. The budget applies to chunk admission after model load. This setting is specific to MLX.
 
-The startup line gives the selected path and the bytes charged. The planner reserves resident weights, the decode pool, the QSA cache at the full 32,768-position limit, fixed recurrent state, the configured MLX allocator cache and a 1 GiB pressure margin. With prefix reuse enabled, it also reserves full-sized snapshots for the prefix store's slots. Local shard reads have a zero S3 cache charge. The remaining bytes determine which chunk workspace fits.
+The startup line gives the selected path and the bytes charged. The planner reserves resident weights, the decode pool, the QSA cache at the full 32,768-position limit, fixed recurrent state, the configured MLX allocator cache and a 1 GiB pressure margin. With prefix reuse enabled, it also reserves full-sized snapshots for the prefix store's slots by default. Local shard reads have a zero S3 cache charge. The remaining bytes determine which chunk workspace fits.
+
+`FIFI_FLASH_NEXT_MLX_PREFILL_WAVE_CAP` bounds how many routed experts each MLX prefill wave can hold. It accepts an integer from 1 to 512 at startup and defaults to 512. The same cap determines both the workspace charge and the staging pool size. A lower cap can admit a wider chunk within the device budget. Layers whose selected experts exceed the cap run multiple waves and preserve the router's original pair order. Startup logs the wave cap and the selected chunk's workspace charge in bytes.
+
+With prefix reuse enabled, set `FIFI_FLASH_NEXT_MLX_PREFIX_BUDGET_BYTES` to a positive byte count to bound the retained snapshot store. For example, `268435456` sets a 256 MiB cap. Startup charges the smaller of this cap and the default snapshot reservation. A snapshot that exceeds the cap is skipped and previously retained snapshots remain available. The planner continues to charge live state, restore overlap and the allocator cache separately.
+
+`FIFI_FLASH_NEXT_MLX_DECODE_CACHE_SLOTS` sets the number of retained expert records per layer during sampled decode. It defaults to zero and accepts up to four slots, bounded by the model's experts selected per token. A positive setting requires automatic MLX sizing or an explicit `FIFI_MLX_WORKING_SET_MIB` ceiling. Startup checks the page-rounded cache mapping and its metadata against the device budget. The mapping is released at the decode boundary before the next prefill. Only demand reads populate it, after an expert is selected twice in a row. Cached slices are copied into the existing rank-ordered staging set.
 
 ## `qwen36`
 
 Options for `qwen3_6_35b_a3b`. "MLX" means Apple Silicon.
+
+For Qwen3.6 MoE or Qwen3.8 dense on Apple Silicon, the matching [disk-staging switch](environment.md#apple-silicon-device-sizing) and an active Metal working-set limit allow an explicit `context_limit` with a host-derived `prefill_budget_bytes`. If the entire checkpoint exceeds the host budget, startup checks resident weights, staging and session memory against that budget and the Metal limit. With an omitted context on a single-sequence start that would exceed the resident host budget, the planner reads the checkpoint headers and sizes context from the resident weights, staging, and session reserve. It preserves the largest prefill width that fits at 4,096 tokens, then grows context within the host and Metal limits in 1,024-token steps. An explicit context or session cap keeps its configured value.
 
 | Key | Backend | Default | Meaning |
 | --- | --- | --- | --- |

@@ -667,6 +667,15 @@ impl TieredSettings {
     };
 }
 
+/// The opted-in MLX placement policy. The expert fallback can still choose residency.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) enum MlxPlacement {
+    #[default]
+    Resident,
+    ExpertFallback,
+    DenseFfnStaging,
+}
+
 /// The environment fallbacks, read by the caller so that this file stays pure.
 #[derive(Debug, Default)]
 pub(crate) struct Q36Env {
@@ -681,19 +690,28 @@ pub(crate) struct Q36Env {
     /// The host memory and the model's shard bytes, for the MLX values that no member and no
     /// variable sets (`host_plan`). `None` keeps every such value required, as before.
     pub(crate) host: Option<HostFacts>,
+    /// Disk weights are available only when MLX working-set planning is active.
+    pub(crate) mlx_disk_experts: bool,
+    pub(crate) mlx_disk_dense_ffn: bool,
 }
 
 impl Q36Env {
-    /// The environment of this process and the host it runs on: the three allowlisted variables
-    /// and, for the model under `model_dir`, the facts the host-derived defaults read. The one
-    /// constructor every start, preflight and effective-configuration view calls, so they resolve
-    /// the same settings.
+    /// Read the process inputs shared by startup, preflight and effective configuration.
     pub(crate) fn from_process(model_dir: &Path) -> Self {
+        #[cfg(all(feature = "native-mlx", target_os = "macos", target_arch = "aarch64"))]
+        let device_budget = crate::family::mlx_budget::enabled();
+        #[cfg(not(all(feature = "native-mlx", target_os = "macos", target_arch = "aarch64")))]
+        let device_budget = false;
         Self {
             cache_limit: std::env::var("Q36_CACHE_LIMIT").ok(),
             kv_geometric: std::env::var("Q36_KV_GEOMETRIC").ok(),
             spec_step_window: std::env::var("Q36_SPEC_STEP_WINDOW").ok(),
             host: HostFacts::probe(model_dir),
+            mlx_disk_experts: device_budget
+                && std::env::var_os("FIFI_Q36_MLX_DISK_EXPERTS").is_some_and(|value| value == "1"),
+            mlx_disk_dense_ffn: device_budget
+                && std::env::var_os("FIFI_Q36_MLX_DISK_DENSE_FFN")
+                    .is_some_and(|value| value == "1"),
         }
     }
 }
@@ -970,6 +988,10 @@ pub(crate) struct Q36Settings {
     pub(crate) prefill_budget: Option<u64>,
     /// The bytes that the planner keeps free. It is used only when `prefill_budget` is set.
     pub(crate) prefill_reserve: u64,
+    pub(crate) mlx_placement: MlxPlacement,
+    /// When resident host admission defers to disk staging, startup must still enforce the host
+    /// budget alongside the Metal ceiling.
+    pub(crate) mlx_host_placement_cap: Option<u64>,
     /// The dtype of the decode activations, which also picks the scale storage. The default is
     /// `bf16`.
     pub(crate) activation: Activation,
@@ -1389,6 +1411,20 @@ impl Q36Settings {
         backend: Backend,
         spec: FamilySpec,
     ) -> Result<Self, EngError> {
+        Self::resolve(model_dir, tokenizer_dir, options, env, backend, spec, None)
+    }
+
+    /// Resolve a serving configuration. Native startup may inspect staged checkpoint headers
+    /// when host-derived admission would otherwise refuse an omitted context.
+    pub(super) fn resolve(
+        model_dir: &Path,
+        tokenizer_dir: &Path,
+        options: Option<&Q36Options>,
+        env: &Q36Env,
+        backend: Backend,
+        spec: FamilySpec,
+        prefix_reuse: Option<bool>,
+    ) -> Result<Self, EngError> {
         if spec.feed_forward.is_some() && backend == Backend::Cuda {
             return Err(bad(format!(
                 "{} requires the native-mlx backend on Apple Silicon; the CUDA Q36 loader does not support the dense family",
@@ -1497,6 +1533,66 @@ impl Q36Settings {
                 }
             }
         }
+        let reserve_at = |context| match reserve {
+            ReservePlan::Explicit(reserve) => Ok(reserve),
+            ReservePlan::Off => Ok(0),
+            ReservePlan::Derive => derived_reserve(&spec, kv, activation, context, cache_limit),
+        };
+        let mut prefill_reserve = reserve_at(context_limit)?;
+        let mlx_placement = match (backend, spec.feed_forward.is_some()) {
+            (Backend::Mlx, false) if env.mlx_disk_experts => MlxPlacement::ExpertFallback,
+            (Backend::Mlx, true) if env.mlx_disk_dense_ffn => MlxPlacement::DenseFfnStaging,
+            _ => MlxPlacement::Resident,
+        };
+        let host_shortfall = budget_from_host.zip(env.host).and_then(|(budget, host)| {
+            host_plan::shortfall_text(host, budget, prefill_reserve, context_limit)
+        });
+        let mlx_prefill_chunk = || {
+            ranged(
+                "prefill_chunk",
+                options.prefill_chunk,
+                if activation == Activation::Bf16 {
+                    BF16_DEFAULT_PREFILL_CHUNK
+                } else {
+                    DEFAULT_PREFILL_CHUNK
+                },
+                1,
+                MAX_PREFILL_CHUNK,
+            )
+        };
+        #[cfg(all(feature = "native-mlx", target_os = "macos", target_arch = "aarch64"))]
+        let staged_context = if mlx_placement != MlxPlacement::Resident
+            && host_shortfall.is_some()
+            && options.context_limit.is_none()
+            && options.max_seqs.unwrap_or(1) == 1
+            && let (Some(budget), Some(reuse)) = (budget_from_host, prefix_reuse)
+        {
+            use super::resident::context_plan::{ContextRequest, derive};
+            let plan = derive(ContextRequest {
+                artifact: model_dir,
+                spec: &spec,
+                placement: mlx_placement,
+                activation,
+                kv,
+                host_budget: budget,
+                reserve_override: options.prefill_session_reserve_bytes.unwrap_or(0),
+                cache_limit,
+                max_context: context_limit,
+                max_rows: mlx_prefill_chunk()?,
+                session_cap: at_least_one("session_cap_bytes", options.session_cap_bytes)?,
+                prefix_reuse: reuse,
+            })?;
+            Some((plan.context, plan.session_cap))
+        } else {
+            None
+        };
+        #[cfg(not(all(feature = "native-mlx", target_os = "macos", target_arch = "aarch64")))]
+        let staged_context: Option<(u32, u64)> = None;
+        if let Some((context, _)) = staged_context {
+            context_limit = context;
+            prefill_reserve = reserve_at(context)?;
+            context_from_host = true;
+        }
         // The dense spec's session floor: one full session of cache
         // growth plus the fixed state. An absent cap derives exactly
         // this (the MoE default would not admit the dense session);
@@ -1521,39 +1617,30 @@ impl Q36Settings {
         } else {
             None
         };
-        let prefill_reserve = match reserve {
-            ReservePlan::Explicit(reserve) => reserve,
-            ReservePlan::Off => 0,
-            ReservePlan::Derive => {
-                derived_reserve(&spec, kv, activation, context_limit, cache_limit)?
+        let mlx_host_placement_cap = if let Some(text) = host_shortfall {
+            // An explicit context or a header-derived context can use the staged weight plan.
+            if mlx_placement == MlxPlacement::Resident
+                || (options.context_limit.is_none() && staged_context.is_none())
+            {
+                return Err(bad(text));
             }
+            budget_from_host
+        } else {
+            None
         };
-        if let (Some(budget), Some(host)) = (budget_from_host, env.host)
-            && let Some(text) =
-                host_plan::shortfall_text(host, budget, prefill_reserve, context_limit)
-        {
-            return Err(bad(text));
-        }
         let (session_cap, prefill_chunk) = match backend {
             Backend::Mlx => (
                 ranged(
                     "session_cap_bytes",
                     options.session_cap_bytes,
-                    dense_required.unwrap_or(DEFAULT_SESSION_CAP),
+                    staged_context
+                        .map(|(_, cap)| cap)
+                        .or(dense_required)
+                        .unwrap_or(DEFAULT_SESSION_CAP),
                     1,
                     u64::MAX,
                 )?,
-                ranged(
-                    "prefill_chunk",
-                    options.prefill_chunk,
-                    if activation == Activation::Bf16 {
-                        BF16_DEFAULT_PREFILL_CHUNK
-                    } else {
-                        DEFAULT_PREFILL_CHUNK
-                    },
-                    1,
-                    MAX_PREFILL_CHUNK,
-                )?,
+                mlx_prefill_chunk()?,
             ),
             // Inert: the CUDA arm reads none of them (the KV is sized by `context_limit`, the
             // worker piece is `NO_BUDGET_PIECE`, `prefill_chunk` is ignored with its start line
@@ -1675,7 +1762,11 @@ impl Q36Settings {
                     source: source(
                         "context_limit",
                         options.context_limit.is_some(),
-                        "derived: largest that fits the budget".into(),
+                        if staged_context.is_some() {
+                            "derived: staged weights, session and prefill workspace"
+                        } else {
+                            "derived: largest that fits the budget"
+                        }.into(),
                     ),
                 },
                 NoteValue {
@@ -1709,6 +1800,8 @@ impl Q36Settings {
             prefill_chunk,
             prefill_budget,
             prefill_reserve,
+            mlx_placement,
+            mlx_host_placement_cap,
             activation,
             kv,
             kv_offload_host_bytes,
@@ -1726,7 +1819,7 @@ impl Q36Settings {
             max_seqs,
             prefix_store_entries,
             backend,
-            prefix_reuse: false,
+            prefix_reuse: prefix_reuse.unwrap_or(false),
             tiered,
             expert_bank,
             weights,
@@ -3027,6 +3120,8 @@ mod tests {
                 prefill_chunk: 256,
                 prefill_budget: None,
                 prefill_reserve: 0,
+                mlx_placement: super::MlxPlacement::Resident,
+                mlx_host_placement_cap: None,
                 activation: super::Activation::Bf16,
                 kv: super::KvDtype::Q8,
                 kv_offload_host_bytes: None,

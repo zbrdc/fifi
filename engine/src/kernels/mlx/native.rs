@@ -356,6 +356,15 @@ impl Drop for Context {
     }
 }
 
+/// Process-attributed disk read bytes and physical footprint on this host.
+#[cfg(feature = "native-fault-qualification")]
+pub(crate) fn qualification_process_usage() -> Option<(u64, u64)> {
+    let mut read_bytes = 0;
+    let mut footprint_bytes = 0;
+    let status = unsafe { ffi::mlx_process_usage(&mut read_bytes, &mut footprint_bytes) };
+    (status == 0).then_some((read_bytes, footprint_bytes))
+}
+
 #[cfg(test)]
 pub(crate) fn process_rss_bytes() -> Result<u64, EngError> {
     let mut bytes = 0;

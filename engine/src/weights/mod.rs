@@ -1,4 +1,10 @@
 mod acquire;
+#[cfg(all(
+    feature = "native-fault-qualification",
+    target_os = "macos",
+    target_arch = "aarch64"
+))]
+pub(crate) use acquire::read_all_vectored_at;
 pub mod exl3;
 
 // No caller yet; kept compiling and tested standalone.

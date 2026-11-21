@@ -108,6 +108,9 @@ unsafe extern "C" {
     #[cfg(test)]
     #[link_name = "inference_mlx_process_rss_bytes"]
     pub(super) fn mlx_process_rss_bytes(bytes: *mut u64) -> i32;
+    #[cfg(feature = "native-fault-qualification")]
+    #[link_name = "inference_mlx_process_usage"]
+    pub(super) fn mlx_process_usage(read_bytes: *mut u64, footprint_bytes: *mut u64) -> i32;
     #[link_name = "inference_mlx_array_free"]
     pub(super) fn mlx_array_free(array: mlx_array) -> i32;
     #[link_name = "inference_mlx_vector_array_new"]

@@ -35,11 +35,9 @@
 //! experts) claimed from one atomic counter, so a slow or descheduled thread only delays the
 //! chunk it holds. Idle workers wait per [`WaitPolicy`]: spin, park, or spin for a window then park.
 //!
-//! Unsafe scope: this file holds the x86-64 intrinsics (runtime-detected AVX-512 and AVX2 paths,
-//! a portable scalar fallback), the raw-pointer hand-off of one job to the workers, and the aligned
-//! scratch buffers. Each `unsafe` block carries its own SAFETY argument. The repo's third scoped
-//! unsafe module, confined to this file by the `unsafe_is_confined_to_the_avx2_module` test.
-//! It is not a general policy for unsafe code.
+//! Unsafe scope: runtime-detected AVX-512 and AVX2, opt-in Arm NEON, the raw-pointer worker
+//! hand-off, and aligned scratch buffers. Each block carries a SAFETY argument. The
+//! `unsafe_is_confined_to_the_avx2_module` test records the sites in this file and the NEON module.
 //! Weight views borrow read-only `MappedFile` data. This module maps no files.
 
 use std::ops::Range;
@@ -330,6 +328,8 @@ pub enum Isa {
     Avx2,
     /// 512-bit AVX-512 (F, BW, VL) with F16C.
     Avx512,
+    /// Arm Advanced SIMD with an E2M1 nibble lookup.
+    Neon,
 }
 
 impl Isa {
@@ -343,6 +343,8 @@ impl Isa {
     pub fn is_supported(self) -> bool {
         match self {
             Self::Scalar => true,
+            #[cfg(target_arch = "aarch64")]
+            Self::Neon => std::arch::is_aarch64_feature_detected!("neon"),
             #[cfg(target_arch = "x86_64")]
             Self::Avx2 => {
                 std::is_x86_feature_detected!("avx2")
@@ -356,7 +358,6 @@ impl Isa {
                     && std::is_x86_feature_detected!("avx512vl")
                     && std::is_x86_feature_detected!("f16c")
             }
-            #[cfg(not(target_arch = "x86_64"))]
             _ => false,
         }
     }
@@ -463,6 +464,11 @@ fn dot_rows<const NX: usize>(
             // SAFETY: Avx2 only reaches here after `Isa::is_supported` held at pool construction.
             unsafe { avx2::dot_rows(m, rows, xs, res, max_code) }
         }
+        #[cfg(target_arch = "aarch64")]
+        Isa::Neon => {
+            // SAFETY: pool construction checked the NEON support of this device.
+            unsafe { neon::dot_rows(m, rows, xs, res, max_code) }
+        }
         _ => scalar::dot_rows(m, rows, xs, res, max_code),
     }
 }
@@ -484,6 +490,10 @@ fn dot_rows_n(
         _ => unreachable!("pass of {} activation rows", xs.len()),
     }
 }
+
+#[cfg(target_arch = "aarch64")]
+#[path = "nvfp4_cpu/neon.rs"]
+mod neon;
 
 mod scalar {
     use super::*;
@@ -1564,7 +1574,7 @@ mod tests {
     }
 
     fn supported_isas() -> Vec<Isa> {
-        [Isa::Scalar, Isa::Avx2, Isa::Avx512]
+        [Isa::Scalar, Isa::Avx2, Isa::Avx512, Isa::Neon]
             .into_iter()
             .filter(|isa| isa.is_supported())
             .collect()
@@ -1854,8 +1864,8 @@ mod tests {
             let x = random_x(&mut rng, latent);
             let picks = picks_for(&mut rng, 9, 5);
             let truth = owned.reference_f64(&x, &picks);
-            let mut first: Option<Vec<f32>> = None;
             for isa in supported_isas() {
+                let mut first: Option<Vec<f32>> = None;
                 for threads in [1usize, 2, 5] {
                     let p = pool(threads, WaitPolicy::Park, isa);
                     let mut out = vec![0.0f32; latent];
@@ -1865,10 +1875,10 @@ mod tests {
                         &truth,
                         &format!("{isa:?} t{threads} {latent}x{inter}"),
                     );
-                    if isa == Isa::detect() {
-                        match &first {
-                            None => first = Some(out),
-                            Some(f) => assert_eq!(f, &out, "result depends on the thread count"),
+                    match &first {
+                        None => first = Some(out),
+                        Some(f) => {
+                            assert_eq!(f, &out, "{isa:?} result depends on the thread count")
                         }
                     }
                 }

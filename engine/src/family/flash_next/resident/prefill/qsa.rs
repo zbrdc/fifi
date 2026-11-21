@@ -6,10 +6,11 @@
 //! more keys than queries; the test `grouped_attention_aligns_the_causal_mask_to_the_last_key` in
 //! `tests/native_fast.rs` decides, and the chunk tests here repeat the check through the layer.
 //!
-//! The dense limit stays. A chunk whose last row passes it returns `ContextLimit` before any native
-//! call. There is no sparse chunk yet.
+//! Dense batches stop at the dense limit. Sparse batches use the decode selector on each row's
+//! causal prefix while sharing the layer's projections and cache append.
 
-use super::super::ops::{Ctx, dim};
+use super::super::ops::Ctx;
+use super::super::qsa::{CacheAppend, Kv, MAX_POSITIONS, attend_sparse_rows, check_cache};
 use super::super::state::LayerState;
 use super::super::weights::RQsa;
 use crate::family::flash_next::qsa::QsaShape;
@@ -18,6 +19,63 @@ use crate::{
     kernels::{BinaryOp, RopeSpec, UnaryOp},
     tensor::ExecutionTensor,
 };
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(in super::super) enum QsaBatch {
+    Dense,
+    Sparse,
+}
+
+pub(in super::super) fn check_batch(
+    shape: &QsaShape,
+    len: usize,
+    pos: u32,
+    rows: u32,
+    batch: QsaBatch,
+) -> Result<(), EngError> {
+    if batch == QsaBatch::Dense {
+        return check_chunk_dense(shape, len, pos, rows);
+    }
+    check_cache(len, pos)?;
+    if pos.checked_add(rows).is_none_or(|end| end > MAX_POSITIONS) || dense_rows(shape, pos)? != 0 {
+        return Err(EngError::ContextLimit(
+            "a sparse QSA batch must lie between the dense limit and the context limit".into(),
+        ));
+    }
+    Ok(())
+}
+
+/// Keep sparse graphs small while they share the layer's single router wait.
+const MAX_SPARSE_ROWS: u32 = 8;
+
+pub(super) fn sparse_rows(
+    shape: &QsaShape,
+    pos: u32,
+    requested: u32,
+    allowance: u64,
+) -> Result<u32, EngError> {
+    let rows = requested.min(MAX_SPARSE_ROWS);
+    if rows < 2 {
+        return Ok(rows);
+    }
+    let end = pos.checked_add(rows).ok_or_else(overflow)?;
+    let bytes_per_row = sparse_row_workspace(shape, end)?;
+    let fit = u32::try_from(allowance / bytes_per_row).unwrap_or(u32::MAX);
+    Ok(rows.min(fit).max(1))
+}
+
+fn sparse_row_workspace(shape: &QsaShape, visible: u32) -> Result<u64, EngError> {
+    let d = shape.dims();
+    // Charge the prefix views at their full size. The remaining terms bound
+    // raw and pooled indexer keys, scoring and sort tensors, attention logits
+    // and their intermediates. Price every position as a whole indexer block.
+    let words = 2 * u128::from(d.heads_kv) * u128::from(d.head_dim)
+        + 8 * u128::from(d.idx_dim)
+        + 4 * u128::from(d.idx_heads)
+        + 8 * u128::from(d.heads_q)
+        + 16;
+    u64::try_from(words * u128::from(visible) * 4).map_err(|_| overflow())
+}
 
 pub(super) struct QsaChunk {
     /// Layer output `[T, H]`.
@@ -28,10 +86,6 @@ pub(super) struct QsaChunk {
 
 fn overflow() -> EngError {
     EngError::BadRequest("resident qsa dimension overflows".into())
-}
-
-fn mismatch() -> EngError {
-    EngError::BadRequest("resident qsa cache does not match its shape".into())
 }
 
 /// Checks, before any native call, that the cache holds `pos` positions and that the last row of a
@@ -58,7 +112,7 @@ pub(in super::super) fn check_chunk_dense(
     match (blocks, limit) {
         (Some(blocks), Some(limit)) if blocks <= limit => Ok(()),
         _ => Err(EngError::ContextLimit(
-            "resident QSA chunk passes the dense limit; there is no sparse chunk".into(),
+            "resident QSA dense chunk passes the dense limit".into(),
         )),
     }
 }
@@ -81,17 +135,18 @@ pub(in super::super) fn dense_rows(shape: &QsaShape, pos: u32) -> Result<u32, En
     u32::try_from(room).map_err(|_| overflow())
 }
 
-/// Runs one dense QSA chunk of `x` `[T, H]` at position `pos`. It builds a lazy graph only: no
-/// readback and no evaluate. `state` is never changed; on error nothing is returned.
+/// Runs one QSA batch of `x` `[T, H]` at position `pos`. It builds a lazy graph only: no
+/// readback and no evaluate. The old cache is consumed.
 pub(super) fn chunk(
     ctx: &mut Ctx<'_>,
     shape: &QsaShape,
     w: &RQsa,
-    state: &LayerState,
+    state: LayerState,
     pos: u32,
     x: &ExecutionTensor,
+    batch: QsaBatch,
 ) -> Result<QsaChunk, EngError> {
-    let LayerState::Qsa { k, v, ik, len } = state else {
+    let LayerState::Qsa { len, .. } = state else {
         return Err(EngError::BadRequest(
             "qsa chunk needs a QSA layer state".into(),
         ));
@@ -104,33 +159,14 @@ pub(super) fn chunk(
     if rows == 0 {
         return Err(EngError::BadRequest("qsa chunk needs a row".into()));
     }
-    check_chunk_dense(shape, *len, pos, rows)?;
+    check_batch(shape, len, pos, rows, batch)?;
     let d = shape.dims();
+    let cache = CacheAppend::new(state, &d, pos)?;
     let (heads, kv_heads, width) = (d.heads_q, d.heads_kv, d.head_dim);
-    let cached = dim(*len)?;
-    let cache = match (k, v, ik) {
-        (None, None, None) if *len == 0 => None,
-        (Some(k), Some(v), Some(ik)) if *len > 0 => {
-            let kv_shape = [1, kv_heads, cached, width];
-            let ik_shape = [cached, d.idx_dim];
-            if k.shape() != kv_shape.as_slice()
-                || v.shape() != kv_shape.as_slice()
-                || ik.shape() != ik_shape.as_slice()
-            {
-                return Err(mismatch());
-            }
-            Some((k, v, ik))
-        }
-        _ => return Err(mismatch()),
-    };
     let pair = width.checked_mul(2).ok_or_else(overflow)?;
     let idx_start = d.idx_heads.checked_mul(d.idx_dim).ok_or_else(overflow)?;
     let idx_stop = idx_start.checked_add(d.idx_dim).ok_or_else(overflow)?;
     let q_width = heads.checked_mul(width).ok_or_else(overflow)?;
-    let next_len = usize::try_from(rows)
-        .ok()
-        .and_then(|rows| len.checked_add(rows))
-        .ok_or_else(overflow)?;
     let rope = RopeSpec {
         dims: d.rotary_dim,
         base: d.theta,
@@ -165,19 +201,23 @@ pub(super) fn chunk(
     let ip = ctx.kernels.qmm(x, &w.idx)?;
     let ik_new = ctx.kernels.slice(&ip, &[0, idx_start], &[rows, idx_stop])?;
     // 5. Append on the time axis, or start the cache.
-    let (k_all, v_all, ik_all) = match cache {
-        None => (k_new, v_new, ik_new),
-        Some((k, v, ik)) => (
-            ctx.kernels.concatenate(&[k, &k_new], 2)?,
-            ctx.kernels.concatenate(&[v, &v_new], 2)?,
-            ctx.kernels.concatenate(&[ik, &ik_new], 0)?,
-        ),
+    let ([k_all, v_all, ik_all], state) = cache.append(ctx, [k_new, v_new, ik_new])?;
+    // 6. Each row attends to its own prefix in the grown cache.
+    let att = match batch {
+        QsaBatch::Dense => {
+            let scale = 1.0 / (width as f32).sqrt();
+            ctx.kernels
+                .grouped_attention(&q, &k_all, &v_all, scale, true)?
+        }
+        QsaBatch::Sparse => {
+            let kv = Kv {
+                k: &k_all,
+                v: &v_all,
+                ik: &ik_all,
+            };
+            attend_sparse_rows(ctx, shape, w, pos, &q, &ip, kv)?
+        }
     };
-    // 6. Causal attention over all positions; head h reads KV head h / (QH / KVH).
-    let scale = 1.0 / (width as f32).sqrt();
-    let att = ctx
-        .kernels
-        .grouped_attention(&q, &k_all, &v_all, scale, true)?;
     // 7. Back to rows, sigmoid output gate, and output projection.
     let att = ctx.kernels.transpose(&att, &[0, 2, 1, 3])?;
     let att = ctx.kernels.reshape(&att, &[rows, heads, width])?;
@@ -185,15 +225,7 @@ pub(super) fn chunk(
     let o = ctx.kernels.binary(BinaryOp::Mul, &att, &gate)?;
     let o = ctx.kernels.reshape(&o, &[rows, q_width])?;
     let out = ctx.kernels.qmm(&o, &w.o)?;
-    Ok(QsaChunk {
-        out,
-        state: LayerState::Qsa {
-            k: Some(k_all),
-            v: Some(v_all),
-            ik: Some(ik_all),
-            len: next_len,
-        },
-    })
+    Ok(QsaChunk { out, state })
 }
 
 #[cfg(test)]
@@ -262,18 +294,35 @@ mod tests {
             &mut ctx,
             &rig.shape,
             qsa_weights(&rig.weights),
-            state,
+            state.share(),
             pos,
             &x,
         )
         .unwrap()
     }
 
-    fn chunk_one(rig: &mut Rig, state: &LayerState, pos: u32, rows: u32) -> QsaChunk {
+    fn chunk_one(
+        rig: &mut Rig,
+        state: &LayerState,
+        pos: u32,
+        rows: u32,
+        batch: QsaBatch,
+    ) -> QsaChunk {
         let flat: Vec<f32> = (pos..pos + rows).flat_map(input).collect();
+        chunk_input(rig, state, pos, batch, &flat)
+    }
+
+    fn chunk_input(
+        rig: &mut Rig,
+        state: &LayerState,
+        pos: u32,
+        batch: QsaBatch,
+        flat: &[f32],
+    ) -> QsaChunk {
+        let rows = u32::try_from(flat.len() / 64).unwrap();
         let x = rig
             .kernels
-            .import_tensor(&f32_tensor(vec![rows, 64], &flat).unwrap())
+            .import_tensor(&f32_tensor(vec![rows, 64], flat).unwrap())
             .unwrap();
         let mut ctx = Ctx {
             kernels: &mut rig.kernels,
@@ -283,9 +332,10 @@ mod tests {
             &mut ctx,
             &rig.shape,
             qsa_weights(&rig.weights),
-            state,
+            state.share(),
             pos,
             &x,
+            batch,
         )
         .unwrap()
     }
@@ -305,7 +355,7 @@ mod tests {
     }
 
     /// A chunk of `rows` rows after `pos` cached positions equals `rows` decode steps.
-    fn assert_chunk_matches_steps(pos: u32, rows: u32) {
+    fn assert_chunk_matches_steps(pos: u32, rows: u32, batch: QsaBatch) {
         let mut rig = rig();
         let mut reference = empty();
         let mut base = empty();
@@ -320,7 +370,7 @@ mod tests {
                 base = decode_one(&mut rig, &base, at).state;
             }
         }
-        let got = chunk_one(&mut rig, &base, pos, rows);
+        let got = chunk_one(&mut rig, &base, pos, rows, batch);
         let label = format!("P {pos} T {rows}");
         assert_parity(
             &values(&mut rig.kernels, &got.out).unwrap(),
@@ -342,7 +392,7 @@ mod tests {
     fn chunks_from_an_empty_cache_match_the_decode_steps() {
         let _serial = crate::native_test_lock();
         for rows in [1, 2, 3, 4, 7] {
-            assert_chunk_matches_steps(0, rows);
+            assert_chunk_matches_steps(0, rows, QsaBatch::Dense);
         }
     }
 
@@ -352,8 +402,49 @@ mod tests {
     fn chunks_after_five_cached_positions_match_the_decode_steps() {
         let _serial = crate::native_test_lock();
         for rows in [1, 2, 3, 4, 7] {
-            assert_chunk_matches_steps(5, rows);
+            assert_chunk_matches_steps(5, rows, QsaBatch::Dense);
         }
+    }
+
+    #[test]
+    fn sparse_batches_match_decode_across_index_blocks() {
+        let _serial = crate::native_test_lock();
+        for (pos, rows) in [(19, 2), (19, 8), (22, 5), (31, 8)] {
+            assert_chunk_matches_steps(pos, rows, QsaBatch::Sparse);
+        }
+    }
+
+    #[test]
+    fn sparse_batches_hide_future_keys_and_values_from_earlier_rows() {
+        let _serial = crate::native_test_lock();
+        let mut rig = rig();
+        let mut state = empty();
+        for pos in 0..19 {
+            state = decode_one(&mut rig, &state, pos).state;
+        }
+        let reference = chunk_one(&mut rig, &state, 19, 5, QsaBatch::Sparse);
+        let mut flat: Vec<f32> = (19..24).flat_map(input).collect();
+        for value in &mut flat[3 * 64..] {
+            *value *= -4.0;
+        }
+        let changed = chunk_input(&mut rig, &state, 19, QsaBatch::Sparse, &flat);
+        let want = values(&mut rig.kernels, &reference.out).unwrap();
+        let got = values(&mut rig.kernels, &changed.out).unwrap();
+        assert_eq!(&got[..3 * 64], &want[..3 * 64]);
+        assert_ne!(&got[3 * 64..], &want[3 * 64..]);
+    }
+
+    #[test]
+    fn sparse_batch_width_shrinks_at_longer_prefixes() {
+        let ckpt = fixtures::checkpoint();
+        let flash = FlashWeights::load(&ckpt, &fixtures::config()).unwrap();
+        let shape = flash.shape().qsa;
+        let allowance = sparse_row_workspace(&shape, 27).unwrap() * 2;
+        assert_eq!(sparse_rows(&shape, 19, 8, allowance).unwrap(), 2);
+        assert_eq!(sparse_rows(&shape, 19, 8, allowance - 1).unwrap(), 1);
+        assert_eq!(sparse_rows(&shape, 25, 8, allowance).unwrap(), 1);
+        assert_eq!(sparse_rows(&shape, 19, 32, allowance * 4).unwrap(), 8);
+        assert_eq!(sparse_rows(&shape, 19, 3, allowance * 4).unwrap(), 3);
     }
 
     /// The room is `19 - pos` visible positions of the fixture, never negative, and it agrees with

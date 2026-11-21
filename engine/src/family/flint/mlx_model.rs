@@ -1,20 +1,25 @@
 //! Bounded Flint weight import. Only resident packed matrices survive each import.
 
 use super::{
+    mlx_expert_cache::{self, LayerExpertCache},
     mlx_math::{self, Projection, SwiGluWeights},
     weights::FlintCheckpoint,
 };
 use crate::{
     EngError,
-    kernels::{MlxKernels, ResidentPackedWeight},
+    family::prefill::mlx::{overlap_expert_reads, prefill_expert_read_runs},
+    kernels::{HostPages, MlxKernels, PackedPages, PageRange, ResidentPackedWeight},
     tensor::{Dtype, ExecutionTensor, Tensor},
 };
-use std::{path::Path, rc::Rc, sync::OnceLock};
+use std::{cell::RefCell, path::Path, rc::Rc, sync::OnceLock};
 
 pub(super) fn expert_pipeline_flagged() -> bool {
     static ENABLED: OnceLock<bool> = OnceLock::new();
     *ENABLED.get_or_init(|| {
-        std::env::var_os("FIFI_FLINT_MLX_EXPERT_PIPELINE").is_some_and(|value| value == "1")
+        std::env::var_os("FIFI_FLINT_MLX_EXPERT_PIPELINE").map_or_else(
+            || overlap_expert_reads() || prefill_expert_read_runs(),
+            |value| value == "1",
+        )
     })
 }
 
@@ -49,12 +54,12 @@ impl ExpertReadRuns {
 
 pub(super) fn expert_read_runs() -> ExpertReadRuns {
     static MODE: OnceLock<ExpertReadRuns> = OnceLock::new();
-    *MODE.get_or_init(|| {
-        ExpertReadRuns::from_env(
-            std::env::var("FIFI_FLINT_MLX_EXPERT_READ_RUNS")
-                .ok()
-                .as_deref(),
-        )
+    *MODE.get_or_init(|| match std::env::var("FIFI_FLINT_MLX_EXPERT_READ_RUNS") {
+        Ok(value) => ExpertReadRuns::from_env(Some(&value)),
+        Err(std::env::VarError::NotPresent) if prefill_expert_read_runs() => {
+            ExpertReadRuns::Prefill
+        }
+        Err(_) => ExpertReadRuns::Off,
     })
 }
 
@@ -134,7 +139,7 @@ impl SwiGlu {
         experts: &[u32],
         remapped: &Tensor,
         coalesce_reads: bool,
-    ) -> Result<(Self, ExecutionTensor, crate::kernels::HostPages)> {
+    ) -> Result<(Self, ExecutionTensor, HostPages)> {
         let (pages, packed, local) =
             source.expert_pages(stem, experts, remapped, coalesce_reads)?;
         let (weights, ids) = Self::import_expert_pages(k, &pages, &packed, local)?;
@@ -143,9 +148,9 @@ impl SwiGlu {
 
     pub(super) fn import_expert_pages(
         k: &mut MlxKernels,
-        pages: &crate::kernels::HostPages,
-        packed: &[crate::kernels::PackedPages],
-        local: crate::kernels::PageRange,
+        pages: &HostPages,
+        packed: &[PackedPages],
+        local: PageRange,
     ) -> Result<(Self, ExecutionTensor)> {
         #[cfg(feature = "native-fault-qualification")]
         let started = super::mlx_expert_timing::enabled().then(std::time::Instant::now);
@@ -188,6 +193,7 @@ pub(super) enum Routed {
     Disk {
         source: Rc<FlintCheckpoint>,
         stem: String,
+        cache: Option<Box<RefCell<LayerExpertCache>>>,
     },
 }
 
@@ -214,11 +220,12 @@ pub(super) struct Layer {
 }
 
 impl Layer {
-    fn load(
+    pub(super) fn load(
         k: &mut MlxKernels,
         source: &Rc<FlintCheckpoint>,
         index: usize,
         disk: bool,
+        cache: Option<LayerExpertCache>,
     ) -> Result<Self> {
         let stem = format!("model.layers.{index}");
         let ffn = if index < 2 {
@@ -233,6 +240,7 @@ impl Layer {
                     Routed::Disk {
                         source: Rc::clone(source),
                         stem: format!("{stem}.mlp.switch_mlp"),
+                        cache: cache.map(|cache| Box::new(RefCell::new(cache))),
                     }
                 } else {
                     Routed::Resident(SwiGlu::load(k, source, &format!("{stem}.mlp.switch_mlp"))?)
@@ -297,6 +305,7 @@ pub(super) struct Model {
     pub(super) head: ResidentPackedWeight,
     pub(super) source: Rc<FlintCheckpoint>,
     pub(super) streamed_expert_bytes: u64,
+    pub(super) cached_expert_bytes: u64,
     pub(super) kernels: MlxKernels,
 }
 
@@ -346,6 +355,23 @@ impl Model {
             None => 0,
         };
         let disk = streamed_expert_bytes != 0;
+        let (caches, cached_expert_bytes) = if let Some(budget) = available.filter(|_| disk) {
+            let cache_budget = budget
+                .saturating_sub(source.mlx_weight_bytes(true))
+                .saturating_sub(expert_staging_bytes(streamed_expert_bytes, 1));
+            mlx_expert_cache::plan(&source, cache_budget)?
+        } else {
+            ((0..super::config::LAYERS).map(|_| None).collect(), 0)
+        };
+        #[cfg(feature = "native-fault-qualification")]
+        if let Some(description) = source.expert_record_description() {
+            if !disk || !expert_pipeline_flagged() || cached_expert_bytes != 0 {
+                return Err(EngError::BadRequest(
+                    "Flint expert records need disk-backed experts, the shared-page pipeline and expert caching off".into(),
+                ));
+            }
+            eprintln!("flint: MLX expert records {description}");
+        }
         if disk {
             let pipeline = expert_pipeline_flagged();
             eprintln!(
@@ -372,8 +398,8 @@ impl Model {
         // measured decode churn envelope.
         kernels.set_cache_limit(cache_limit_bytes())?;
         let mut layers = Vec::with_capacity(super::config::LAYERS);
-        for index in 0..super::config::LAYERS {
-            layers.push(Layer::load(&mut kernels, &source, index, disk)?);
+        for (index, cache) in caches.into_iter().enumerate() {
+            layers.push(Layer::load(&mut kernels, &source, index, disk, cache)?);
         }
         let norm = plain(&mut kernels, &source, "model.norm.weight")?;
         let head = packed(&mut kernels, &source, "lm_head")?;
@@ -383,6 +409,7 @@ impl Model {
             head,
             source,
             streamed_expert_bytes,
+            cached_expert_bytes,
             kernels,
         })
     }

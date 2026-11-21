@@ -1,7 +1,8 @@
 //! Worker adapter. Shared DecodeSession owns EOS, sampling, cancellation and token publication.
 
 use super::{
-    factory::context_limit,
+    factory::{PrefillPairPolicy, context_limit, prefill_pair_policy},
+    mlx_forward::{PairPlan, PairStaging},
     mlx_model::{Model, expert_staging_bytes},
     mlx_state::PrefixSnapshot,
     mlx_state::State,
@@ -10,14 +11,19 @@ use crate::sched::job::{PrefixHit, PrefixReport};
 use crate::{
     EngError,
     family::{
-        executor::{ExecutorOps, GenerationState},
+        executor::{ExecutorOps, GenerationState, PrefillPairOutcome},
+        mlx_report::{MlxExecutionPlan, MlxPrefillMemory, PrefillReason},
         session::{
             DecodeSession, Limits, PrefixStore, SaveKind, StoreLimits, TokenStepper, check_prompt,
         },
     },
     tokenizer::DecodeBatch,
 };
-use std::path::{Path, PathBuf};
+use std::{
+    num::NonZeroUsize,
+    path::{Path, PathBuf},
+    sync::atomic::AtomicBool,
+};
 
 type Result<T> = std::result::Result<T, EngError>;
 
@@ -35,6 +41,12 @@ pub(super) struct FlintExecutor {
     prefix: PrefixStore<PrefixSnapshot, FlintPath>,
     model: Model,
     prefill_piece: usize,
+    mlx_plan: MlxExecutionPlan,
+    request_sized_kv: bool,
+    request_prefill: bool,
+    flash_prefill: bool,
+    prefill_pair: PrefillPairPolicy,
+    cancel_prefill_pair: bool,
     eos: Vec<u32>,
     pub(super) vocab: usize,
     root: PathBuf,
@@ -60,6 +72,8 @@ pub(super) struct FlintExecutor {
 pub(super) struct FlintSession {
     state: State,
     core: DecodeSession,
+    request_prefill_piece: Option<NonZeroUsize>,
+    prefill_pair: bool,
 }
 
 impl FlintSession {
@@ -82,6 +96,12 @@ impl FlintSession {
 pub(super) struct Step<'a> {
     model: &'a mut Model,
     state: &'a mut State,
+}
+
+impl<'a> Step<'a> {
+    fn new(model: &'a mut Model, state: &'a mut State) -> Self {
+        Self { model, state }
+    }
 }
 
 impl TokenStepper for Step<'_> {
@@ -121,10 +141,7 @@ impl FlintExecutor {
     /// state, for identity gates that must feed rows and read logits back.
     #[cfg(test)]
     pub(super) fn stepper<'a>(&'a mut self, st: &'a mut FlintSession) -> Step<'a> {
-        Step {
-            model: &mut self.model,
-            state: &mut st.state,
-        }
+        Step::new(&mut self.model, &mut st.state)
     }
 
     pub(super) fn open(
@@ -170,15 +187,62 @@ impl FlintExecutor {
         let max_rows = super::factory::prefill_chunk_rows(super::factory::os_setting(
             std::env::var_os("FIFI_FLINT_MLX_BATCH_PREFILL").as_deref(),
         ));
-        let prefill_piece = if let Some((device, charges, _)) = reserve {
-            device_prefill_piece(device, &model, max_rows, &charges)?
+        let (prefill_piece, memory, flash_prefill) = if let Some((device, charges, _)) = reserve {
+            let (piece, memory, flash_prefill) =
+                device_prefill_piece(device, &model, max_rows, &charges)?;
+            (piece, Some(memory), flash_prefill)
         } else {
-            max_rows
+            (max_rows, None, false)
         };
+        let (placement, placement_reason) = if model.streamed_expert_bytes != 0 {
+            ("disk_experts", "full expert banks exceed the device budget")
+        } else {
+            ("resident", "routed expert banks are imported at startup")
+        };
+        let reason = if max_rows == 1 {
+            PrefillReason::RowCeiling
+        } else if memory.is_none() {
+            PrefillReason::Configured
+        } else if prefill_piece == 1 {
+            PrefillReason::Workspace
+        } else {
+            PrefillReason::Admitted
+        };
+        let request_sized_kv = memory.is_some()
+            && super::factory::request_sized_kv_enabled(
+                std::env::var_os("FIFI_FLINT_MLX_REQUEST_KV").as_deref(),
+            );
+        let request_prefill = memory.is_some()
+            && super::factory::request_prefill_enabled(
+                std::env::var_os("FIFI_FLINT_MLX_REQUEST_PREFILL").as_deref(),
+            );
+        let prefill_pair = if request_prefill
+            && model.streamed_expert_bytes != 0
+            && super::mlx_model::expert_pipeline_flagged()
+        {
+            prefill_pair_policy(std::env::var_os("FIFI_FLINT_MLX_PREFILL_PAIR").as_deref())
+        } else {
+            PrefillPairPolicy::Off
+        };
+        let mlx_plan = MlxExecutionPlan::new(
+            placement,
+            placement_reason,
+            max_rows,
+            prefill_piece,
+            reason,
+            memory,
+        );
         Ok((
             Self {
                 model,
                 prefill_piece,
+                mlx_plan,
+                request_sized_kv,
+                request_prefill,
+                flash_prefill,
+                prefill_pair,
+                cancel_prefill_pair: std::env::var_os("FIFI_FLINT_MLX_CANCEL_PREFILL_PAIR")
+                    .is_some_and(|value| value == "1"),
                 eos,
                 vocab,
                 root: root.to_path_buf(),
@@ -193,6 +257,8 @@ impl FlintExecutor {
             FlintSession {
                 state: State::new(),
                 core: DecodeSession::default(),
+                request_prefill_piece: None,
+                prefill_pair: false,
             },
         ))
     }
@@ -280,6 +346,94 @@ fn fitting_prefill_piece(
     Ok(rows.unwrap_or(1) as usize)
 }
 
+fn pair_workspace(first: u32, second: u32, per_expert: u64, staging: PairStaging) -> u64 {
+    let (first, second) = (u64::from(first), u64::from(second));
+    let total = first + second;
+    // Price both attention workspaces, one maximally populated stage, and
+    // the hidden, projection and routed-pair buffers across both pieces.
+    let scores = 3 * 32 * 4 * (first * first + second * total);
+    let stage = 2 * per_expert * staging.slots() as u64;
+    // Waves keep projected pairs while concatenating outputs and restoring rank order.
+    let restore = match staging {
+        PairStaging::Shared => 0,
+        PairStaging::Waves64 => 12 * total * 2048 * 2 + (256 << 10),
+    };
+    scores + stage + 32 * total * 2048 * 2 + restore
+}
+
+fn admitted_pair_plan(
+    prompt_rows: usize,
+    first_piece: usize,
+    remaining_bytes: u64,
+    per_expert: u64,
+    policy: PrefillPairPolicy,
+) -> Option<PairPlan> {
+    let second = prompt_rows.checked_sub(first_piece)?;
+    if !(3..=1024).contains(&first_piece) || !(2..=first_piece).contains(&second) {
+        return None;
+    }
+    let split = first_piece - 1;
+    let candidates: &[PairStaging] = match policy {
+        PrefillPairPolicy::Off => &[],
+        PrefillPairPolicy::Shared => &[PairStaging::Shared],
+        PrefillPairPolicy::Auto => &[PairStaging::Shared, PairStaging::Waves64],
+        PrefillPairPolicy::Waves64 => &[PairStaging::Waves64],
+    };
+    candidates
+        .iter()
+        .copied()
+        .find(|&staging| {
+            pair_workspace(split as u32, second as u32, per_expert, staging) <= remaining_bytes
+        })
+        .map(|staging| PairPlan { split, staging })
+}
+
+#[test]
+fn prefill_pair_admission_accounts_for_both_pieces_before_mutation() {
+    let expert = 1_769_472;
+    let shared = pair_workspace(1023, 1017, expert, PairStaging::Shared);
+    let waves = pair_workspace(1023, 1017, expert, PairStaging::Waves64);
+    let plan = |budget, policy| admitted_pair_plan(2041, 1024, budget, expert, policy);
+    assert_eq!(
+        plan(shared, PrefillPairPolicy::Auto),
+        Some(PairPlan {
+            split: 1023,
+            staging: PairStaging::Shared
+        }),
+    );
+    assert_eq!(
+        plan(waves, PrefillPairPolicy::Auto),
+        Some(PairPlan {
+            split: 1023,
+            staging: PairStaging::Waves64
+        }),
+    );
+    assert_eq!(plan(waves - 1, PrefillPairPolicy::Auto), None);
+    assert_eq!(plan(shared - 1, PrefillPairPolicy::Shared), None);
+    assert_eq!(
+        plan(u64::MAX, PrefillPairPolicy::Waves64).unwrap().staging,
+        PairStaging::Waves64
+    );
+    assert_eq!(plan(u64::MAX, PrefillPairPolicy::Off), None);
+    for first in [512, 1024] {
+        let plan =
+            |rows| admitted_pair_plan(rows, first, u64::MAX, expert, PrefillPairPolicy::Auto);
+        for rows in [first - 1, first, first + 1, 2 * first + 1, 3 * first] {
+            assert_eq!(plan(rows), None, "first piece {first}, prompt {rows}");
+        }
+        for rows in [first + 2, 2 * first] {
+            assert_eq!(
+                plan(rows),
+                Some(PairPlan {
+                    split: first - 1,
+                    staging: PairStaging::Shared,
+                }),
+                "first piece {first}, prompt {rows}",
+            );
+        }
+    }
+}
+
 fn device_session_charges(retention_cap: u64) -> Result<[(&'static str, u64); 5]> {
     use crate::family::{
         kv_format::{KvFormat, KvRowShape},
@@ -311,7 +465,7 @@ fn device_prefill_piece(
     model: &Model,
     max_rows: usize,
     session: &[(&'static str, u64)],
-) -> Result<usize> {
+) -> Result<(usize, MlxPrefillMemory, bool)> {
     // Model::open_for_budget has imported its resident arrays. The allocator
     // count includes those arrays; the prefill reserve separately prices the
     // whole session including the fixed-size rings.
@@ -319,6 +473,9 @@ fn device_prefill_piece(
     let per_expert = model.streamed_expert_bytes;
     let mut charges = session.to_vec();
     charges.push(("resident_active_bytes", weights));
+    if model.cached_expert_bytes != 0 {
+        charges.push(("resident_expert_cache_bytes", model.cached_expert_bytes));
+    }
     charges.push((
         "decode_expert_staging_bytes",
         expert_staging_bytes(per_expert, 1),
@@ -345,11 +502,22 @@ fn device_prefill_piece(
         .map(|(name, bytes)| format!("{name}={bytes}"))
         .collect::<Vec<_>>()
         .join(" ");
+    let staging = expert_staging_bytes(per_expert, rows as u32);
     eprintln!(
         "flint: MLX device budget selects {rows} prefill rows (ceiling {max_rows}); {device} {terms} expert_staging_bytes={} remaining_bytes={remaining}",
-        expert_staging_bytes(per_expert, rows as u32),
+        staging,
     );
-    Ok(rows)
+    Ok((
+        rows,
+        MlxPrefillMemory {
+            prefill_budget_bytes: device.bytes(),
+            remaining_bytes: remaining,
+            device: Some(device.ceiling_report()),
+            base_charges: charges.into_iter().collect(),
+            workspace: [("expert_staging_bytes", staging)].into(),
+        },
+        flash_prefill,
+    ))
 }
 
 #[cfg(test)]
@@ -476,6 +644,34 @@ fn device_prefill_does_not_cliff_on_the_measured_working_set() {
     assert_eq!(selected, 1024);
 }
 
+#[test]
+fn request_span_admits_a_wider_piece_at_the_same_budget() {
+    let expert = 1_769_472;
+    let remaining = 5_453_957_568;
+    assert_eq!(
+        fitting_prefill_piece(1024, 32768, remaining, expert, false).unwrap(),
+        256
+    );
+    assert_eq!(
+        fitting_prefill_piece(1024, 2041, remaining, expert, false).unwrap(),
+        1024
+    );
+    let just_fits = 3 * 32 * 4 * 2041 * 1024 + expert_staging_bytes(expert, 1024);
+    assert_eq!(
+        fitting_prefill_piece(1024, 2041, just_fits, expert, false).unwrap(),
+        1024
+    );
+    assert_eq!(
+        fitting_prefill_piece(1024, 2041, just_fits - 1, expert, false).unwrap(),
+        512
+    );
+    assert_eq!(
+        fitting_prefill_piece(1024, 2041, remaining, expert, true).unwrap(),
+        fitting_prefill_piece(1024, 32768, remaining, expert, true).unwrap(),
+        "flash workspace is independent of prompt span"
+    );
+}
+
 impl ExecutorOps for FlintExecutor {
     type Session = FlintSession;
 
@@ -492,21 +688,93 @@ impl ExecutorOps for FlintExecutor {
         // a restore never reports the job before it.
         self.prefix_hit = PrefixHit::Miss;
         self.prefix_uncached_shared = 0;
-        st.core.reset(&mut Step {
-            model: &mut self.model,
-            state: &mut st.state,
-        })
+        st.request_prefill_piece = None;
+        st.prefill_pair = false;
+        st.core
+            .reset(&mut Step::new(&mut self.model, &mut st.state))
+    }
+
+    fn reset_for_request(
+        &mut self,
+        st: &mut FlintSession,
+        prompt_tokens: usize,
+        completion_limit: Option<u32>,
+        has_prefix_boundary: bool,
+    ) -> Result<()> {
+        self.reset(st)?;
+        st.prefill_pair = self.prefill_pair != PrefillPairPolicy::Off && !has_prefix_boundary;
+        if self.request_prefill {
+            let mut rows = self.prefill_piece;
+            // Prefix snapshots keep their established chunk tiling.
+            if !has_prefix_boundary && let Some(memory) = &self.mlx_plan.memory {
+                let prompt_rows = prompt_tokens.min(context_limit() as usize);
+                rows = rows.max(fitting_prefill_piece(
+                    self.mlx_plan.configured_prefill_rows.min(prompt_rows),
+                    prompt_rows as u32,
+                    memory.remaining_bytes,
+                    self.model.streamed_expert_bytes,
+                    self.flash_prefill,
+                )?);
+            }
+            st.request_prefill_piece = NonZeroUsize::new(rows);
+        }
+        // Prefix jobs keep geometric growth and its existing snapshot charges.
+        if self.request_sized_kv && !has_prefix_boundary {
+            st.state.full_capacity = super::mlx_state::initial_request_capacity(
+                prompt_tokens,
+                completion_limit,
+                context_limit(),
+            );
+        }
+        Ok(())
     }
 
     fn prefill(&mut self, st: &mut FlintSession, tokens: &[u32]) -> Result<()> {
         st.core.prefill(
-            &mut Step {
-                model: &mut self.model,
-                state: &mut st.state,
-            },
+            &mut Step::new(&mut self.model, &mut st.state),
             tokens,
             context_limit() as usize,
         )
+    }
+
+    fn try_prefill_pair(
+        &mut self,
+        st: &mut FlintSession,
+        tokens: &[u32],
+        first_piece: usize,
+        cancel: &AtomicBool,
+    ) -> Result<PrefillPairOutcome> {
+        if !st.prefill_pair || !st.core.history().is_empty() || st.state.pos != 0 {
+            return Ok(PrefillPairOutcome::Declined);
+        }
+        let (Some(piece), Some(memory)) = (st.request_prefill_piece, &self.mlx_plan.memory) else {
+            return Ok(PrefillPairOutcome::Declined);
+        };
+        if first_piece != piece.get() {
+            return Ok(PrefillPairOutcome::Declined);
+        }
+        let Some(plan) = admitted_pair_plan(
+            tokens.len(),
+            first_piece,
+            memory.remaining_bytes,
+            self.model.streamed_expert_bytes,
+            self.prefill_pair,
+        ) else {
+            return Ok(PrefillPairOutcome::Declined);
+        };
+        // DecodeSession leaves the last token pending. The split preserves
+        // the boundary just before the first piece's former pending token.
+        let cancel = self.cancel_prefill_pair.then_some(cancel);
+        let forward = st
+            .core
+            .prefill_with(tokens, context_limit() as usize, |rows| {
+                self.model.prefill_pair(&mut st.state, rows, plan, cancel)
+            })?;
+        if forward.is_break() {
+            Ok(PrefillPairOutcome::Cancelled)
+        } else {
+            Ok(PrefillPairOutcome::Completed)
+        }
     }
 
     fn decode(
@@ -520,10 +788,7 @@ impl ExecutorOps for FlintExecutor {
             context_limit: context_limit() as usize,
         };
         st.core.decode(
-            &mut Step {
-                model: &mut self.model,
-                state: &mut st.state,
-            },
+            &mut Step::new(&mut self.model, &mut st.state),
             generation,
             &limits,
         )
@@ -532,7 +797,19 @@ impl ExecutorOps for FlintExecutor {
     fn boundary(&mut self, _st: &mut FlintSession) {}
 
     fn prefill_piece(&self) -> Option<usize> {
-        Some(self.prefill_piece)
+        if self.request_prefill {
+            Some(self.mlx_plan.configured_prefill_rows)
+        } else {
+            Some(self.prefill_piece)
+        }
+    }
+
+    fn request_prefill_piece(&self, st: &FlintSession) -> Option<NonZeroUsize> {
+        st.request_prefill_piece
+    }
+
+    fn mlx_execution_plan(&self) -> Option<&MlxExecutionPlan> {
+        Some(&self.mlx_plan)
     }
 
     fn prefix_limits(&self) -> StoreLimits {
@@ -701,6 +978,7 @@ pub(super) struct FlintEnv {
     pub(super) t1_flash: bool,
     pub(super) async_chain: bool,
     pub(super) coalesce_residual: bool,
+    pub(super) compact_kv: bool,
 }
 
 /// The numeric-path fingerprint a stored Flint prefix binds: the context
@@ -732,6 +1010,7 @@ impl FlintPath {
                 t1_flash: mlx::t1_flash_flagged(),
                 async_chain: super::mlx_forward::async_chain_flagged(),
                 coalesce_residual: super::mlx_forward::coalesce_residual_flagged(),
+                compact_kv: super::mlx_state::compact_kv_flagged(),
             },
         )
     }

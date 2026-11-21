@@ -20,7 +20,7 @@
 
 use super::ops::{Ctx, linear, values};
 use super::prefetch::TokenIdentity;
-use super::state::{LayerState, ResidentState, qsa_growth_bytes};
+use super::state::{LayerState, ResidentState, qsa_append_growth};
 use super::weights::RAttn;
 use super::{ResidentDecoder, StepMode, StepResult, deltanet, hyper, moe, ple, qsa};
 use crate::{
@@ -40,11 +40,26 @@ pub(super) fn step(
     mode: StepMode,
 ) -> Result<StepResult, EngError> {
     state.check_step(&decoder.weights)?;
-    let growth = qsa_growth_bytes(&decoder.weights)?;
+    let growth = qsa_append_growth(&decoder.weights, state.pos(), 1)?;
     let permit = decoder.budget.acquire_growth(growth)?;
+    #[cfg(feature = "native-fault-qualification")]
+    let timing = super::stream_timing::begin(&decoder.kernels, state.pos());
+    #[cfg(feature = "native-fault-qualification")]
+    let position = state.pos();
+    #[cfg(feature = "native-fault-qualification")]
+    if let Some(cache) = decoder.decode_cache.as_mut().filter(|cache| cache.active()) {
+        cache.stats = super::decode_cache::CopyStats::default();
+    }
     let old = state.begin();
     let result = run(decoder, state, old, permit, token, mode);
     decoder.slots.release_lent();
+    #[cfg(feature = "native-fault-qualification")]
+    if let (Ok(_), Some(timing)) = (&result, timing) {
+        timing.finish(&decoder.kernels, 1, mode, "step");
+        if let Some(cache) = decoder.decode_cache.as_ref().filter(|cache| cache.active()) {
+            super::stream_timing::record_decode_cache(position, cache.stats);
+        }
+    }
     result
 }
 
@@ -72,6 +87,9 @@ fn run(
     let mut ple_ring = None;
     let mut layers = Vec::with_capacity(old.len());
     let mut records = Vec::new();
+    #[cfg(feature = "native-fault-qualification")]
+    let mut routes = (mode == StepMode::Logits && super::stream_timing::capture_decode_routes())
+        .then(|| Vec::<Vec<u32>>::with_capacity(weights.layers.len()));
     for (index, (layer, old_layer)) in weights.layers.iter().zip(old).enumerate() {
         if index == shape.ple_layer {
             let out = ple::block(
@@ -103,7 +121,7 @@ fn run(
                 )
             }
             (RAttn::Qsa(w), cache @ LayerState::Qsa { .. }) => {
-                let s = qsa::step(&mut ctx, &shape.qsa, w, &cache, pos, &read.mixed)?;
+                let s = qsa::step(&mut ctx, &shape.qsa, w, cache, pos, &read.mixed)?;
                 (s.out, s.state)
             }
             _ => {
@@ -125,8 +143,17 @@ fn run(
             &shape.moe,
             &layer.moe,
             &mut decoder.slots,
+            decoder
+                .decode_cache
+                .as_mut()
+                .filter(|cache| mode == StepMode::Logits && cache.active())
+                .map(|cache| (cache, index)),
             &read.mixed,
         )?;
+        #[cfg(feature = "native-fault-qualification")]
+        if let Some(routes) = &mut routes {
+            routes.push(selection.0.iter().map(|&(expert, _)| expert).collect());
+        }
         // Tests only: the S3 route recorder keeps the host selection of each layer.
         #[cfg(test)]
         if let Some(trace) = decoder.route_trace.as_mut() {
@@ -216,6 +243,10 @@ fn run(
         None => None,
     };
     state.commit(layers, ple_ring, start.history, permit)?;
+    #[cfg(feature = "native-fault-qualification")]
+    if let Some(routes) = routes {
+        super::stream_timing::record_decode_routes(pos, &routes);
+    }
     Ok(StepResult {
         token: token_out,
         logits: logits_out,

@@ -21,9 +21,9 @@ use super::super::{
     slots::{ExpertSlots, SetLayout},
     weights::RMoe,
 };
-use crate::family::stored::read_stack_into;
 #[cfg(feature = "native-fault-qualification")]
 use crate::family::stored::record_page_import;
+use crate::family::stored::{read_stack_into, read_stack_runs_into};
 use crate::{
     EngError,
     kernels::{HostPages, MlxKernels, PageRange, ResidentPackedWeight},
@@ -201,6 +201,7 @@ impl PrefillPool {
         w: &RMoe,
         wave: &Wave,
         inverse: Option<&[u32]>,
+        coalesce: bool,
     ) -> Result<WavePages, EngError> {
         let count = |len: usize| u32::try_from(len).map_err(|_| bad("prefill count exceeds u32"));
         let experts = count(wave.experts.len())?;
@@ -232,11 +233,16 @@ impl PrefillPool {
             if layout.end > bytes.len() {
                 return Err(bad("the expert stacks do not fit one page set"));
             }
+            let read_stack = if coalesce {
+                read_stack_runs_into
+            } else {
+                read_stack_into
+            };
             for (stored, stack) in [&w.gate, &w.up, &w.down]
                 .into_iter()
                 .zip(&layout.set.stacks)
             {
-                read_stack_into(ckpt, stored, &wave.experts, bytes, stack)?;
+                read_stack(ckpt, stored, &wave.experts, bytes, stack)?;
             }
             put_words(bytes, layout.ranks.offset, le_words(&wave.local_ranks))?;
             put_words(bytes, layout.tokens.offset, le_words(&wave.tokens))?;
@@ -393,6 +399,7 @@ mod tests {
                 &weights.layers[0].moe,
                 &plan.waves[0],
                 Some(&inverse),
+                true,
             )
             .unwrap();
         let inverse_tensor = pages.inverse.as_ref().unwrap();
@@ -442,13 +449,13 @@ mod tests {
         assert_eq!(plan.waves.len(), 2, "two waves");
         let moe_w = &weights.layers[0].moe;
         let first = pool
-            .import_wave(&mut kernels, &ckpt, moe_w, &plan.waves[0], None)
+            .import_wave(&mut kernels, &ckpt, moe_w, &plan.waves[0], None, false)
             .unwrap();
         assert_eq!(first.ranks.shape(), [7], "first wave pairs");
         assert!(first.inverse.is_none(), "no inverse requested");
         drop(first);
         let second = pool
-            .import_wave(&mut kernels, &ckpt, moe_w, &plan.waves[1], None)
+            .import_wave(&mut kernels, &ckpt, moe_w, &plan.waves[1], None, false)
             .unwrap();
         assert_eq!(second.ranks.shape(), [1], "second wave pairs");
         assert_eq!(second.stacks[0].logical_shape(), [1, 32, 64], "one expert");
@@ -470,7 +477,7 @@ mod tests {
         let mut pool = PrefillPool::new(&ckpt, layers, 2, 8).unwrap();
         let wave = split_waves(&route(), 4).unwrap().waves.remove(0);
         let mut bad_request = |wave: &Wave, inverse: Option<&[u32]>| {
-            let result = pool.import_wave(&mut kernels, &ckpt, moe_w, wave, inverse);
+            let result = pool.import_wave(&mut kernels, &ckpt, moe_w, wave, inverse, false);
             matches!(result, Err(EngError::BadRequest(_)))
         };
         assert!(bad_request(&wave, None), "three experts in a set of two");
@@ -514,14 +521,28 @@ mod tests {
             "the plan hands over sorted ranks"
         );
         wave.local_ranks.reverse();
-        let rejected = pool.import_wave(&mut kernels, &ckpt, &weights.layers[0].moe, &wave, None);
+        let rejected = pool.import_wave(
+            &mut kernels,
+            &ckpt,
+            &weights.layers[0].moe,
+            &wave,
+            None,
+            false,
+        );
         let failure = rejected.err();
         assert!(
             matches!(&failure, Some(EngError::BadRequest(m)) if m.starts_with("flash-next prefill:")),
             "one inversion is a bad request that names the flash-next prefill: {failure:?}"
         );
         let sorted = split_waves(&route(), 4).unwrap().waves.remove(0);
-        let imported = pool.import_wave(&mut kernels, &ckpt, &weights.layers[0].moe, &sorted, None);
+        let imported = pool.import_wave(
+            &mut kernels,
+            &ckpt,
+            &weights.layers[0].moe,
+            &sorted,
+            None,
+            false,
+        );
         let failure = imported.err();
         assert!(
             failure.is_none(),

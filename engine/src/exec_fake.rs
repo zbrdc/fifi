@@ -183,6 +183,7 @@ pub(crate) struct FakeExecutor {
     max_seqs: usize,
     window_calls: Arc<std::sync::atomic::AtomicUsize>,
     deny_restore_once: bool,
+    mlx_plan: Option<crate::family::mlx_report::MlxExecutionPlan>,
 }
 
 impl FakeExecutor {
@@ -211,7 +212,12 @@ impl FakeExecutor {
             max_seqs: 1,
             window_calls: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             deny_restore_once: false,
+            mlx_plan: None,
         }
+    }
+
+    pub(crate) fn with_mlx_plan(&mut self, plan: crate::family::mlx_report::MlxExecutionPlan) {
+        self.mlx_plan = Some(plan);
     }
 
     /// Runs the engine on the BATCH worker path with this fake's real store: any value above one
@@ -310,6 +316,9 @@ impl FakeExecutor {
 }
 
 impl ExecutorOps for FakeExecutor {
+    fn mlx_execution_plan(&self) -> Option<&crate::family::mlx_report::MlxExecutionPlan> {
+        self.mlx_plan.as_ref()
+    }
     type Session = FakeSession;
 
     fn max_seqs(&self) -> usize {

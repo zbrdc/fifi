@@ -135,8 +135,8 @@ pub(super) fn moe_facts(
             weight_facts(&w.shared_gate)?,
             weight_facts(&w.shared_up)?,
             weight_facts(&w.shared_down)?,
-            weight_facts(&w.gate_up)?,
-            weight_facts(&w.down)?,
+            weight_facts(&w.expert_pages()?.gate_up)?,
+            weight_facts(&w.expert_pages()?.down)?,
         ],
     })
 }
@@ -371,7 +371,7 @@ pub(super) fn moe_step_device(
         post_norm,
         shared: [&w.shared_gate, &w.shared_up, &w.shared_down],
         shared_scalar_t: &w.shared_scalar_t,
-        stacks: [&w.gate_up, &w.down],
+        stacks: [&w.expert_pages()?.gate_up, &w.expert_pages()?.down],
         hidden,
         experts,
         top_k: dim(m.top_k)?,

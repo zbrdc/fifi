@@ -5,7 +5,9 @@ If you have not built fifi before, do the [tutorial](../getting-started.md) firs
 
 ## On a Mac
 
-You need Apple Silicon with at least 36 GB of memory, and:
+The resident profile below uses Apple Silicon with at least 36 GB of memory. The experimental disk-backed profile served the same checkpoint on a 16 GB M4 mini with a 4,096-token context.
+
+The Mac build also needs the following.
 
 - Xcode (from the App Store), then `xcode-select --install` for the command-line tools.
 - CMake: `brew install cmake`.

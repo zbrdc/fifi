@@ -19,6 +19,9 @@
 #include <mutex>
 #include <unistd.h>
 #include <mach/mach.h>
+#ifdef INFERENCE_NATIVE_FAULT_QUALIFICATION
+#include <libproc.h>
+#endif
 
 #ifdef INFERENCE_NATIVE_FAULT_QUALIFICATION
 #include <atomic>
@@ -383,6 +386,19 @@ extern "C" int inference_mlx_process_rss_bytes(std::uint64_t* bytes) noexcept {
   *bytes = static_cast<std::uint64_t>(info.resident_size);
   return KERN_SUCCESS;
 }
+
+#ifdef INFERENCE_NATIVE_FAULT_QUALIFICATION
+extern "C" int inference_mlx_process_usage(std::uint64_t* read_bytes,
+                                            std::uint64_t* footprint_bytes) noexcept {
+  rusage_info_v4 info{};
+  const int status = proc_pid_rusage(getpid(), RUSAGE_INFO_V4,
+                                    reinterpret_cast<rusage_info_t*>(&info));
+  if (status != 0) return status;
+  *read_bytes = info.ri_diskio_bytesread;
+  *footprint_bytes = info.ri_phys_footprint;
+  return 0;
+}
+#endif
 
 extern "C" int inference_mlx_array_free(mlx_array array) noexcept {
 #ifdef INFERENCE_NATIVE_FAULT_QUALIFICATION

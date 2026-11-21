@@ -315,6 +315,89 @@ components:
                   families whose per-key origins are not composed.
                 items:
                   $ref: "#/components/schemas/EffectiveSetting"
+              execution:
+                $ref: "#/components/schemas/MlxExecution"
+    MlxExecution:
+      type: object
+      description: Startup plan reported by the loaded MLX worker. Absent during loading or if the worker did not publish a plan.
+      required: [backend, configured_prefill_rows, prefill_rows, worker_piece_rows, decisions]
+      properties:
+        backend:
+          const: mlx
+        configured_prefill_rows:
+          type: integer
+          minimum: 1
+        prefill_rows:
+          type: integer
+          minimum: 1
+          description: Admitted prefill row ceiling. A value of one selects one-token steps.
+        worker_piece_rows:
+          type: integer
+          minimum: 1
+          description: Maximum prompt rows passed to the executor at once. A piece can contain multiple one-token steps.
+        decisions:
+          type: array
+          items:
+            $ref: "#/components/schemas/ExecutionDecision"
+        memory:
+          $ref: "#/components/schemas/MlxPrefillMemory"
+    ExecutionDecision:
+      type: object
+      required: [name, chosen, alternatives, fixed_at]
+      properties:
+        name:
+          type: string
+        chosen:
+          type: string
+        fixed_at:
+          enum: [start, load]
+        alternatives:
+          type: array
+          items:
+            type: object
+            required: [option, verdict, reason]
+            properties:
+              option:
+                type: string
+              verdict:
+                type: string
+              reason:
+                type: string
+    MlxPrefillMemory:
+      type: object
+      required: [prefill_budget_bytes, remaining_bytes, base_charges]
+      properties:
+        prefill_budget_bytes:
+          type: integer
+          minimum: 0
+        remaining_bytes:
+          type: integer
+          minimum: 0
+          description: Workspace available after base charges.
+        base_charges:
+          type: object
+          additionalProperties:
+            type: integer
+            minimum: 0
+        workspace:
+          type: object
+          description: Staging charges and allowances within the remaining budget. These can include a one-token decode stage priced against the device budget.
+          additionalProperties:
+            type: integer
+            minimum: 0
+        device:
+          type: object
+          required: [metal_working_set_bytes, effective_device_budget_bytes]
+          properties:
+            metal_working_set_bytes:
+              type: integer
+              minimum: 1
+            effective_device_budget_bytes:
+              type: integer
+              minimum: 1
+            configured_device_ceiling_bytes:
+              type: integer
+              minimum: 1
     EffectiveSetting:
       type: object
       required: [key, value, origin]
@@ -1784,11 +1867,10 @@ paths:
         Server extension, not part of the OpenAI API. What this build
         and process are: the crate version, the native backends
         compiled in, host memory and CPU threads, and the engines
-        with their states and resolved context limits. The serving
-        process deliberately does not probe devices (a failed device
-        query can latch the backend); for device facts use the
-        short-lived `enginesrv doctor` command. Nothing here implies a
-        detected device or feature is used by a loaded executor.
+        with their states, resolved settings, and reported startup plans.
+        The route does not probe devices. It reads the execution plan
+        already published by the worker. For independent device facts
+        use the short-lived `enginesrv doctor` command.
       responses:
         "401":
           $ref: "#/components/responses/Unauthorized"

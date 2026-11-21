@@ -286,3 +286,30 @@ fn ane_predict_matches_cpu_within_fp16_tolerance() {
     );
     assert_eq!(argmax(&actual.class_logits), argmax(&expected.class_logits));
 }
+
+#[test]
+#[ignore = "measure the idle decision head on a Mac with the experimental ANE bridge"]
+fn ane_idle_decision_latency() {
+    let _serial = ANE_TEST.lock().unwrap();
+    let input = features();
+    let cpu = DecisionHead::cpu(weights()).unwrap();
+    let ane = DecisionHead::ane(weights()).unwrap();
+    for (name, head) in [("cpu_reference", &cpu), ("ane", &ane)] {
+        for _ in 0..16 {
+            std::hint::black_box(head.predict(&input).unwrap());
+        }
+        let mut samples = Vec::with_capacity(500);
+        for _ in 0..500 {
+            let start = std::time::Instant::now();
+            std::hint::black_box(head.predict(std::hint::black_box(&input)).unwrap());
+            samples.push(start.elapsed().as_nanos());
+        }
+        samples.sort_unstable();
+        println!(
+            "ane_idle {name} n={} p50_us={:.2} p99_us={:.2}",
+            samples.len(),
+            samples[249] as f64 / 1000.0,
+            samples[494] as f64 / 1000.0,
+        );
+    }
+}

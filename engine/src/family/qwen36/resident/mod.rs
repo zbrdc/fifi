@@ -5,6 +5,8 @@
 //! per token. The portable parts (`layout`, `tiny`) run on Linux. The graph builders need the Mac GPU.
 
 mod chunk_plan;
+#[cfg(all(feature = "native-mlx", target_os = "macos", target_arch = "aarch64"))]
+pub(in crate::family::qwen36) mod context_plan;
 mod kv_plan;
 mod layout;
 
@@ -92,6 +94,8 @@ mod decoder;
 #[cfg(all(feature = "native-mlx", target_os = "macos", target_arch = "aarch64"))]
 mod delta;
 #[cfg(all(feature = "native-mlx", target_os = "macos", target_arch = "aarch64"))]
+mod dense_stage;
+#[cfg(all(feature = "native-mlx", target_os = "macos", target_arch = "aarch64"))]
 pub(super) mod executor;
 /// The primitive-histogram diagnostic. `cfg(test)` like `route_parity`:
 /// the pure parts (the `mlx_print_graph` parser and the id and activation readers) carry Linux
@@ -174,6 +178,8 @@ mod scale_knob;
 mod state;
 #[cfg(all(feature = "native-mlx", target_os = "macos", target_arch = "aarch64"))]
 mod step;
+#[cfg(all(feature = "native-mlx", target_os = "macos", target_arch = "aarch64"))]
+mod stream_timing;
 #[cfg(all(
     test,
     feature = "native-mlx",

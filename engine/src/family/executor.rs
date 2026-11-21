@@ -52,6 +52,12 @@ impl GenerationState {
     }
 }
 
+pub(crate) enum PrefillPairOutcome {
+    Declined,
+    Completed,
+    Cancelled,
+}
+
 /// The calls the engine worker makes on an executor, in the worker's call order. `check_prompt`
 /// comes first: the worker asks it at the start of every job, before it resets a session or
 /// feeds a token, so a prompt that cannot fit is refused before any engine work.
@@ -87,8 +93,35 @@ pub(crate) trait ExecutorOps {
     /// The committed tokens of the session.
     fn history<'s>(&self, st: &'s Self::Session) -> &'s [u32];
     fn reset(&mut self, st: &mut Self::Session) -> Result<()>;
+    /// Resets a session for an admitted request before any prefix restore or prefill.
+    /// A fresh request with a known generation limit may size its initial buffers here.
+    fn reset_for_request(
+        &mut self,
+        st: &mut Self::Session,
+        _prompt_tokens: usize,
+        _completion_limit: Option<u32>,
+        _has_prefix_boundary: bool,
+    ) -> Result<()> {
+        self.reset(st)
+    }
     /// Consumes one non-empty prompt chunk.
     fn prefill(&mut self, st: &mut Self::Session, toks: &[u32]) -> Result<()>;
+    /// Consumes the final piece for a request that will decode next. The worker has finished
+    /// saving prefixes and will call only decode or reset on this session.
+    fn prefill_for_decode(&mut self, st: &mut Self::Session, toks: &[u32]) -> Result<()> {
+        self.prefill(st, toks)
+    }
+    /// Tries to consume a fresh prompt as two pieces in one call. A declined
+    /// pair leaves the session untouched. A cancelled pair requires a reset.
+    fn try_prefill_pair(
+        &mut self,
+        _st: &mut Self::Session,
+        _tokens: &[u32],
+        _first_piece: usize,
+        _cancel: &AtomicBool,
+    ) -> Result<PrefillPairOutcome> {
+        Ok(PrefillPairOutcome::Declined)
+    }
     /// Commits one batch of tokens, or reports `Cancelled`.
     fn decode(
         &mut self,
@@ -105,6 +138,15 @@ pub(crate) trait ExecutorOps {
     /// chunks. The worker refreshes this hint between pieces. `None` means the caller's
     /// fallback; `Some(0)` is invalid and is checked at startup and between pieces.
     fn prefill_piece(&self) -> Option<usize> {
+        None
+    }
+    /// A request's prefill width after reset. The worker bounds it by the startup ceiling
+    /// and applies it to save points and every prefill piece of this session.
+    fn request_prefill_piece(&self, _st: &Self::Session) -> Option<std::num::NonZeroUsize> {
+        None
+    }
+    /// An optional report from startup after the executor has applied its plan.
+    fn mlx_execution_plan(&self) -> Option<&super::mlx_report::MlxExecutionPlan> {
         None
     }
     /// The limits of this executor's prefix store: how many pinned roots and how many LRU entries

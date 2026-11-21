@@ -20,12 +20,20 @@
 //! node, and the values stay bit for bit the values of the per-operation clamps.
 
 use super::ops::{Ctx, dim, f32_tensor, short_import, to_act, u32_tensor, values};
-use super::weights::{RDense, RMoe};
+use super::stream_timing::ForwardTiming;
+use super::weights::{ExpertPages, RDense, RMoe};
 use crate::{
     EngError,
-    family::{math::expect_len, qwen36::host::HostShape, route::route_experts, spec::Router},
+    family::{
+        math::expect_len,
+        prefill::mlx::{overlap_expert_reads, submit_shared_expert},
+        qwen36::host::HostShape,
+        route::route_experts,
+        spec::Router,
+    },
     kernels::{BinaryOp, BoundedIndices, ReduceOp, UnaryOp},
     tensor::{Dtype, ExecutionTensor, Tensor},
+    weights::StreamedCheckpoint,
 };
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -96,6 +104,7 @@ pub(super) fn shared(
 /// A router output with a count other than the expert count returns `BadRequest` before routing.
 /// A router row that holds a NaN, an infinite value, or a negative value returns `Backend` from
 /// `route_experts`. That error ends one job and does not make the adapter terminal.
+#[cfg(test)]
 pub(super) fn step(
     ctx: &mut Ctx<'_>,
     shape: &HostShape,
@@ -103,14 +112,58 @@ pub(super) fn step(
     x: &ExecutionTensor,
     post_norm: &ExecutionTensor,
 ) -> Result<(ExecutionTensor, Selection), EngError> {
+    step_with_checkpoint(ctx, shape, w, x, post_norm, None, &mut None)
+}
+
+pub(super) fn step_with_checkpoint(
+    ctx: &mut Ctx<'_>,
+    shape: &HostShape,
+    w: &RMoe,
+    x: &ExecutionTensor,
+    post_norm: &ExecutionTensor,
+    ckpt: Option<&StreamedCheckpoint>,
+    timing: &mut Option<ForwardTiming>,
+) -> Result<(ExecutionTensor, Selection), EngError> {
     // The folded post-attention norm: the same op the step loop used to run, relocated inside
     // the block so the eager and compiled paths share one contract over the raw residual stream.
     let normed = ctx.kernels.rms_norm(x, post_norm, shape.eps)?;
-    let ((bounded, gates), tail) = route_row(ctx, shape, w, &normed)?;
-    let out = combine(ctx, shape, w, &normed, &bounded, &gates)?;
+    let (routed, host) = route_row(ctx, shape, w, &normed, timing.as_mut())?;
+    let queued_shared = if w.streams_experts() && overlap_expert_reads() {
+        let output = shared(ctx, w, &normed)?;
+        Some(submit_shared_expert(ctx.kernels, output)?)
+    } else {
+        None
+    };
+    let stage_started = timing.as_ref().map(|_| std::time::Instant::now());
+    let staged = w.stage_selection(ctx.kernels, ckpt, &routed.indices, 1, timing.as_mut())?;
+    ForwardTiming::stage_ready(
+        timing.as_mut(),
+        stage_started,
+        staged.as_ref().map(|(pages, _)| pages),
+    )?;
+    let (pages, indices) = if let Some((pages, local)) = &staged {
+        (pages, local)
+    } else {
+        (w.expert_pages()?, &routed.indices)
+    };
+    let [ids, gates] = import_selection(ctx, indices, &routed.weights)?;
+    let bounded = ctx
+        .kernels
+        .bound_indices(&ids, pages.down.logical_shape()[0])?;
+    let experts = combine_core(ctx, shape, pages, &normed, &bounded, &gates)?;
+    let shared_out = match queued_shared {
+        Some(output) => output,
+        None => shared(ctx, w, &normed)?,
+    };
+    let out = combine_sums(ctx, &experts, &shared_out)?;
+    if staged.is_some() {
+        ctx.kernels.evaluate(&[&out])?;
+    }
     // The folded output residual: the same `binary(Add, x, out)` the step loop used to run.
     let out = ctx.kernels.binary(BinaryOp::Add, x, &out)?;
-    Ok((out, tail))
+    let selection = routed.indices.into_iter().zip(routed.weights).collect();
+    ForwardTiming::stage_end(timing.as_mut(), stage_started);
+    Ok((out, (selection, host)))
 }
 
 /// The routing of one row `x` `[1, H]`: the router probabilities read back
@@ -122,29 +175,35 @@ fn route_row(
     shape: &HostShape,
     w: &RMoe,
     x: &ExecutionTensor,
-) -> Result<((BoundedIndices, ExecutionTensor), Selection), EngError> {
+    timing: Option<&mut ForwardTiming>,
+) -> Result<(crate::family::route::Routed, Vec<f32>), EngError> {
     let m = &shape.moe;
     // Router probabilities softmax(x · router_t) `[1, E]`, read back once.
     let logits = ctx.kernels.mm(x, &w.router_t)?;
     let probs = ctx.kernels.softmax(&logits)?;
     let host = values(ctx.kernels, &probs)?;
-    expect_len(&host, m.experts, "moe router")?;
-    let top_k = u32::try_from(m.top_k)
-        .map_err(|_| EngError::BadRequest("resident moe top-k exceeds u32".into()))?;
-    let routed = route_experts(&host, &Router::SoftmaxTopK { renorm: m.renorm }, top_k)?;
-    let k = dim(routed.indices.len())?;
+    let routed = ForwardTiming::host_route(timing, || {
+        expect_len(&host, m.experts, "moe router")?;
+        let top_k = u32::try_from(m.top_k)
+            .map_err(|_| EngError::BadRequest("resident moe top-k exceeds u32".into()))?;
+        route_experts(&host, &Router::SoftmaxTopK { renorm: m.renorm }, top_k)
+    })?;
+    Ok((routed, host))
+}
+
+fn import_selection(
+    ctx: &mut Ctx<'_>,
+    indices: &[u32],
+    weights: &[f32],
+) -> Result<[ExecutionTensor; 2], EngError> {
+    let k = dim(indices.len())?;
     // Indices `[k]` (U32) and gates `[k, 1, 1]` (F32) in one import.
-    let ids: Tensor = u32_tensor(vec![k], &routed.indices)?;
-    let gates: Tensor = f32_tensor(vec![k, 1, 1], &routed.weights)?;
-    let mut imported = ctx.kernels.import_many(&[&ids, &gates])?.into_iter();
-    let ids = imported.next().ok_or_else(short_import)?;
-    let gates = imported.next().ok_or_else(short_import)?;
-    // One clamp for the whole layer: the host selection is inside the expert
-    // count already, and the clamp of an already clamped tensor is the identity, so the three
-    // gathered products below keep their values bit for bit.
-    let bounded = ctx.kernels.bound_indices(&ids, dim(m.experts)?)?;
-    let selection = routed.indices.iter().copied().zip(routed.weights).collect();
-    Ok(((bounded, gates), (selection, host)))
+    let ids: Tensor = u32_tensor(vec![k], indices)?;
+    let gates: Tensor = f32_tensor(vec![k, 1, 1], weights)?;
+    ctx.kernels
+        .import_many(&[&ids, &gates])?
+        .try_into()
+        .map_err(|_| short_import())
 }
 
 /// The selected experts and the shared expert on `x` `[1, H]`: gate and up on the shared input,
@@ -156,15 +215,24 @@ fn combine(
     ctx: &mut Ctx<'_>,
     shape: &HostShape,
     w: &RMoe,
+    pages: &ExpertPages,
     x: &ExecutionTensor,
     ids: &BoundedIndices,
     gates: &ExecutionTensor,
 ) -> Result<ExecutionTensor, EngError> {
-    let experts = combine_core(ctx, shape, w, x, ids, gates)?;
+    let experts = combine_core(ctx, shape, pages, x, ids, gates)?;
     let shared_out = shared(ctx, w, x)?;
+    combine_sums(ctx, &experts, &shared_out)
+}
+
+fn combine_sums(
+    ctx: &mut Ctx<'_>,
+    experts: &ExecutionTensor,
+    shared: &ExecutionTensor,
+) -> Result<ExecutionTensor, EngError> {
     // The gates are F32, so the weighted sum and the shared expert product are F32. The
     // residual add takes the activation dtype.
-    let total = ctx.kernels.binary(BinaryOp::Add, &experts, &shared_out)?;
+    let total = ctx.kernels.binary(BinaryOp::Add, experts, shared)?;
     to_act(ctx, &total)
 }
 
@@ -173,7 +241,7 @@ fn combine(
 fn combine_core(
     ctx: &mut Ctx<'_>,
     shape: &HostShape,
-    w: &RMoe,
+    pages: &ExpertPages,
     x: &ExecutionTensor,
     ids: &BoundedIndices,
     gates: &ExecutionTensor,
@@ -183,7 +251,7 @@ fn combine_core(
     // One gathered product of the stacked gate/up operand: rows [0, I) carry the gate
     // projection and rows [I, 2I) the up projection of every selected expert, so the two
     // bandwidth-bound gathers of the layer become one.
-    let stacked = ctx.kernels.gather_qmm_bounded(&x3, &w.gate_up, ids)?;
+    let stacked = ctx.kernels.gather_qmm_bounded(&x3, &pages.gate_up, ids)?;
     let (rows, half) = (stacked.shape()[0], stacked.shape()[2] / 2);
     let hg = ctx.kernels.slice(&stacked, &[0, 0, 0], &[rows, 1, half])?;
     let hu = ctx
@@ -206,7 +274,7 @@ fn combine_core(
         let act = ctx.kernels.silu(&hg)?;
         ctx.kernels.binary(BinaryOp::Mul, &act, &hu)?
     };
-    let eo = ctx.kernels.gather_qmm_bounded(&h, &w.down, ids)?;
+    let eo = ctx.kernels.gather_qmm_bounded(&h, &pages.down, ids)?;
     let weighted = ctx.kernels.binary(BinaryOp::Mul, &eo, gates)?;
     ctx.kernels.reduce(ReduceOp::Sum, &weighted, 0, false)
 }
@@ -280,6 +348,7 @@ pub(super) fn combine_rows(
     gates: &ExecutionTensor,
     top_k: u32,
 ) -> Result<ExecutionTensor, EngError> {
+    let pages = w.expert_pages()?;
     let hidden = dim(shape.hidden)?;
     let rows = x.shape()[0];
     // The pair input: each slot's row repeated k times, slot-major.
@@ -291,7 +360,7 @@ pub(super) fn combine_rows(
     let x3 = ctx.kernels.reshape(&x3, &[pairs, 1, hidden])?;
     // The stacked gate/up operand: one gathered product for the whole window, split into the
     // gate half [0, I) and the up half [I, 2I) of every selected pair row.
-    let stacked = ctx.kernels.gather_qmm_bounded(&x3, &w.gate_up, ids)?;
+    let stacked = ctx.kernels.gather_qmm_bounded(&x3, &pages.gate_up, ids)?;
     let (taken, half) = (stacked.shape()[0], stacked.shape()[2] / 2);
     let hg = ctx.kernels.slice(&stacked, &[0, 0, 0], &[taken, 1, half])?;
     let hu = ctx
@@ -311,7 +380,7 @@ pub(super) fn combine_rows(
         let act = ctx.kernels.silu(&hg)?;
         ctx.kernels.binary(BinaryOp::Mul, &act, &hu)?
     };
-    let eo = ctx.kernels.gather_qmm_bounded(&h, &w.down, ids)?;
+    let eo = ctx.kernels.gather_qmm_bounded(&h, &pages.down, ids)?;
     let weighted = ctx.kernels.binary(BinaryOp::Mul, &eo, gates)?;
     let weighted = ctx.kernels.reshape(&weighted, &[rows, top_k, hidden])?;
     ctx.kernels.reduce(ReduceOp::Sum, &weighted, 1, false)
@@ -430,7 +499,15 @@ pub(super) fn step_device(
         )));
     }
     let route = route_device(ctx, &probs, m.top_k, m.renorm)?;
-    let out = combine(ctx, shape, w, &normed, &route.ids, &route.gates)?;
+    let out = combine(
+        ctx,
+        shape,
+        w,
+        w.expert_pages()?,
+        &normed,
+        &route.ids,
+        &route.gates,
+    )?;
     // The folded output residual: the same `binary(Add, x, out)` the step loop used to run.
     let out = ctx.kernels.binary(BinaryOp::Add, x, &out)?;
     Ok((out, route))

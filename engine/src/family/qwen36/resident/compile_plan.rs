@@ -250,7 +250,7 @@ mod tests {
             .find("kernels.set_program_limit(rules.compile_program_limit)?;")
             .unwrap();
         let construct = executor
-            .find("let mut decoder = ResidentDecoder::new_with_kv(")
+            .find("let mut decoder = ResidentDecoder::new_with_placement(")
             .unwrap();
         let warmup = executor.find("decoder.set_compile(true)?;").unwrap();
         assert!(configure < construct && construct < warmup);

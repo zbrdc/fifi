@@ -47,6 +47,7 @@ fn a_path_binds_every_flag_it_reads() {
         t1_flash,
         async_chain,
         coalesce_residual,
+        compact_kv: false,
     };
     let bare = || env(1024, true, false, false, false, false, false, false);
     let base = FlintPath::from_env_values(root, 32_768, bare());
@@ -115,6 +116,17 @@ fn a_path_binds_every_flag_it_reads() {
                 root,
                 32_768,
                 env(1024, true, false, false, false, false, false, true),
+            ),
+        ),
+        (
+            "compact_kv",
+            FlintPath::from_env_values(
+                root,
+                32_768,
+                FlintEnv {
+                    compact_kv: true,
+                    ..bare()
+                },
             ),
         ),
         ("limit", FlintPath::from_env_values(root, 16_384, bare())),
