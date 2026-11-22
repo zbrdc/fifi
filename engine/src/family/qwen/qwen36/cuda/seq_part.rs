@@ -165,6 +165,13 @@ impl crate::family::pooled_sessions::PartHost for QwenResidentStep<'static> {
     }
 
     fn finish_save(&mut self) -> Result<(), EngError> {
+        if self.pending_prefix.is_none() {
+            return Ok(());
+        }
         self.complete_prefix_save()
+    }
+
+    fn discard_save(&mut self) {
+        self.drop_pending_prefix();
     }
 }

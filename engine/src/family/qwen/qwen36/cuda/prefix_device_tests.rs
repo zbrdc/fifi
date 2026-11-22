@@ -1261,3 +1261,108 @@ fn the_served_wrapper_publishes_a_deferred_save_after_the_first_emit() {
     assert_eq!((before, after, pending), (0, 1, 0));
     println!("SERVED_WRAPPER_AFTER_EMIT_PASS");
 }
+
+#[derive(Debug)]
+struct PooledPrefixObs {
+    accepted: [bool; 2],
+    ready: [Option<u32>; 4],
+    dropped_coverage: usize,
+    peer_coverage: usize,
+    peer_history: Vec<u32>,
+    peer_key: Vec<u32>,
+    emitted: usize,
+}
+
+fn pooled_prefix_phase() -> Result<PooledPrefixObs, EngError> {
+    use crate::family::{
+        cell_pool::INITIAL_CELLS,
+        pooled_sessions::{PooledSessions, Sizing},
+    };
+
+    let gguf = gguf_path()?;
+    let bundle = TokenizerBundle::load(gguf.parent().unwrap_or(Path::new(".")), &tokenizer_pin()?)?;
+    let ids = bundle.tokenizer().encode(
+        "one two three four five six seven eight nine ten eleven twelve thirteen fourteen",
+    )?;
+    let dropped_prompt = head(&ids, 6)?;
+    let peer_prompt = range_of(&ids, 6..13)?;
+    let dropped_key = head(dropped_prompt, 5)?;
+    let peer_key = head(peer_prompt, 6)?;
+    let model = open_qwen3_6_35b_a3b(&gguf, None)?;
+    // PartHost is implemented for the served ('static) step. Like the served-wrapper test,
+    // run alone in a process: the projector, resources and weights live until process exit.
+    let projector: &'static CudaProjector = Box::leak(Box::new(CudaProjector::new()?));
+    let device = Box::leak(Box::new(
+        projector.load_model(&model, load_options())?.device,
+    ));
+    let opts = options(KvMode::Fp16, 2 * INITIAL_CELLS, None);
+    let res = Box::leak(Box::new(StepResources::new(
+        projector.context(),
+        dims()?,
+        &Inventory::for_spec(&QWEN3_6_35B_A3B)?,
+        &opts,
+    )?));
+    let mut step =
+        QwenResidentStep::new(projector.context(), res, device, &opts, rules_for(&bundle)?)?;
+    let layout = step.state_layout();
+    let checkpoint = layout.delta.total / layout.delta.slots + layout.kv.total;
+    step.enable_pinned_prefix_with(Some(2 * checkpoint))?;
+    if !step.pinned_prefix_enabled() {
+        return Err(EngError::MemoryPlan(
+            "the pooled prefix regression needs one retained pin and one staging pin".into(),
+        ));
+    }
+    let (mut pooled, mut first) =
+        PooledSessions::new(step, DecodeSession::default(), 2, Sizing::WholePool)?;
+    let entries = |pooled: &PooledSessions<_>| pooled.prefix_report().map(|report| report.entries);
+    pooled.reset_for_request(&mut first, dropped_prompt.len(), Some(1), true)?;
+    pooled.boundary(&mut first);
+    pooled.prefill(&mut first, dropped_key)?;
+    let staged_first = pooled.save_prefix(&first, dropped_key, SaveKind::Tip)?;
+    let before_drop = entries(&pooled);
+    drop(first); // No emit: the save still belongs to the now orphaned full-context part.
+
+    // Admission reclaims the old part; the peer then grows from INITIAL_CELLS to the full
+    // pool. Activating it must not try to finish a save from the old state instance.
+    let mut peer = pooled.new_session()?;
+    pooled.reset_for_request(&mut peer, peer_prompt.len(), Some(1), true)?;
+    let after_reclaim = entries(&pooled);
+    let dropped_coverage = pooled.restore_prefix(&mut peer, dropped_prompt)?;
+    pooled.boundary(&mut peer);
+    pooled.prefill(&mut peer, peer_key)?;
+    let staged_peer = pooled.save_prefix(&peer, peer_key, SaveKind::Tip)?;
+    let before_emit = entries(&pooled);
+    pooled.prefill(
+        &mut peer,
+        range_of(peer_prompt, peer_key.len()..peer_prompt.len())?,
+    )?;
+    let mut generation =
+        GenerationState::new(IncrementalDecoder::new(bundle.tokenizer())).with_max_tokens(1);
+    let emitted = pooled.decode(&mut peer, &mut generation)?.tokens.len();
+    pooled.after_emit()?;
+    let after_emit = entries(&pooled);
+    pooled.reset_for_request(&mut peer, peer_prompt.len(), Some(1), true)?;
+    let peer_coverage = pooled.restore_prefix(&mut peer, peer_prompt)?;
+    Ok(PooledPrefixObs {
+        accepted: [staged_first, staged_peer],
+        ready: [before_drop, after_reclaim, before_emit, after_emit],
+        dropped_coverage,
+        peer_coverage,
+        peer_history: pooled.history(&peer).to_vec(),
+        peer_key: peer_key.to_vec(),
+        emitted,
+    })
+}
+
+#[test]
+#[ignore = "exclusive CUDA GPU, pinned Q36 GGUF and tokenizer; run alone in a process"]
+fn pooled_prefix_drops_unemitted_save_before_peer_activation() {
+    let obs =
+        pooled_prefix_phase().expect("the peer progresses after reclaiming the dropped owner");
+    assert_eq!(obs.accepted, [true, true], "both saves were staged");
+    assert_eq!(obs.ready, [Some(0), Some(0), Some(0), Some(1)]);
+    assert_eq!(obs.dropped_coverage, 0, "the dropped save never published");
+    assert_eq!(obs.emitted, 1, "the peer decoded a token");
+    assert_eq!(obs.peer_coverage, obs.peer_key.len());
+    assert_eq!(obs.peer_history, obs.peer_key);
+}

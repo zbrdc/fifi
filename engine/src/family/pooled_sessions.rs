@@ -71,6 +71,8 @@ pub(crate) trait PartHost: ExecutorOps<Session = DecodeSession> {
     fn free_device_bytes(&self) -> Option<u64>;
     /// Finishes a save staged for the part that is about to leave.
     fn finish_save(&mut self) -> Result<()>;
+    /// Discards a staged save without publishing it when its owner's part is retired.
+    fn discard_save(&mut self);
 }
 
 /// How a session's cells are sized until a session can grow.
@@ -227,6 +229,7 @@ impl<E: PartHost> PooledSessions<E> {
         let Some(left) = self.resident.take() else {
             return;
         };
+        self.step.discard_save();
         let mut idle = self.idle.take().expect("the idle part is present");
         self.step.swap_part(&mut idle);
         left.inner.borrow_mut().part = Some(idle);
@@ -246,6 +249,10 @@ impl<E: PartHost> PooledSessions<E> {
         };
         if session.slot.inner.borrow().lease.cells() == cells && held == Some(cells) {
             return Ok(());
+        }
+        // Resizing a different slot must not discard the live owner's save.
+        if !resident && self.resident.is_some() {
+            self.step.finish_save()?;
         }
         self.deactivate();
         let small = INITIAL_CELLS.min(self.ceiling);
@@ -498,6 +505,8 @@ mod tests {
     /// A host with no device: a part is its cell count, and the step runs one part.
     struct Fake {
         running: usize,
+        pending_owner: Option<usize>,
+        saved: bool,
     }
 
     impl ExecutorOps for Fake {
@@ -559,7 +568,17 @@ mod tests {
         }
 
         fn finish_save(&mut self) -> Result<()> {
+            if let Some(owner) = self.pending_owner.take() {
+                assert_eq!(self.running, owner, "save finished on a different part");
+                self.saved = true;
+            }
             Ok(())
+        }
+
+        fn discard_save(&mut self) {
+            if let Some(owner) = self.pending_owner.take() {
+                assert_eq!(self.running, owner, "save discarded on a different part");
+            }
         }
     }
 
@@ -567,7 +586,11 @@ mod tests {
 
     fn engine(max_seqs: usize, sizing: Sizing) -> (PooledSessions<Fake>, PooledSession<usize>) {
         PooledSessions::new(
-            Fake { running: POOL },
+            Fake {
+                running: POOL,
+                pending_owner: None,
+                saved: false,
+            },
             DecodeSession::default(),
             max_seqs,
             sizing,
@@ -595,6 +618,41 @@ mod tests {
             .reset_for_request(&mut second, 100, None, false)
             .expect("and takes the whole pool");
         assert_eq!(sessions.step.context_cells(), POOL);
+    }
+
+    #[test]
+    fn reclaim_does_not_carry_a_cancelled_owners_save_to_the_idle_part() {
+        let (mut sessions, first) = engine(2, Sizing::WholePool);
+        sessions.step.pending_owner = Some(POOL);
+        drop(first);
+        let mut peer = sessions.new_session().expect("admit peer after reclaim");
+        sessions.reset(&mut peer).expect("activate peer");
+        sessions.prefill(&mut peer, &[1]).expect("peer progresses");
+        assert!(sessions.step.pending_owner.is_none());
+        assert!(!sessions.step.saved);
+    }
+
+    #[test]
+    fn resize_does_not_carry_a_deferred_save_to_replacement_planes() {
+        let (mut sessions, mut first) = engine(2, Sizing::WholePool);
+        sessions.step.pending_owner = Some(POOL);
+        sessions.resize(&mut first, POOL / 2).expect("resize");
+        sessions.reset(&mut first).expect("activate replacement");
+        assert!(sessions.step.pending_owner.is_none());
+        assert!(!sessions.step.saved);
+    }
+
+    #[test]
+    fn resizing_a_peer_finishes_the_live_owners_save_before_switching() {
+        let (mut sessions, mut first) = engine(2, Sizing::EvenShare);
+        let mut peer = sessions.new_session().expect("admit peer");
+        sessions.resize(&mut first, POOL / 2).expect("size owner");
+        sessions.reset(&mut first).expect("activate owner");
+        sessions.step.pending_owner = Some(POOL / 2);
+        sessions.resize(&mut peer, POOL / 4).expect("resize peer");
+        sessions.reset(&mut peer).expect("activate peer");
+        assert!(sessions.step.pending_owner.is_none());
+        assert!(sessions.step.saved);
     }
 
     #[test]
