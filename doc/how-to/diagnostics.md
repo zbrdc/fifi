@@ -5,7 +5,7 @@ None loads model weights, starts a server, or touches the network.
 
 ```text
 enginesrv doctor [--config <path>] [--json] [--bundle <file>]
-enginesrv check <model_dir> [--tokenizer-dir <dir>] [--family <name>]
+enginesrv check <model_dir-or-gguf> [--tokenizer-dir <dir>] [--family <name>]
                  [--context <tokens>] [--kv <f32|bf16|q8>] [--json]
 enginesrv config effective <path> [--json]
 ```
@@ -13,8 +13,11 @@ enginesrv config effective <path> [--json]
 - `doctor` — what this build can serve on this machine: compiled backends,
   CUDA device and free VRAM, host RAM and threads. With `--config`, also
   validates that file.
-- `check` — one model directory preflighted: compatibility verdict, the
-  checks behind it, and a memory estimate. Exit 0 when servable.
+- `check` — a model directory or one `.gguf` file: compatibility verdict,
+  the checks behind it, and a memory estimate where supported. An explicit
+  file excludes other weight files in the directory and defaults tokenizer
+  side files to its parent. For Qwen3.6 CUDA, the weight check names the
+  selected GGUF and the estimate uses its byte count. Exit 0 when servable.
 - `config effective` — the resolved configuration with the origin of every
   value (config file, environment, family default, or compiled default).
 

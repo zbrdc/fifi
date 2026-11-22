@@ -232,15 +232,18 @@ async fn system(State(state): State<Arc<AppState>>) -> Json<serde_json::Value> {
         .iter()
         .map(|entry| {
             let status = entry.handle.state();
+            let settings = if status == crate::sched::worker::EngineState::Loading {
+                &entry.effective
+            } else {
+                entry.handle.loaded_effective().unwrap_or(&entry.effective)
+            };
             let mut engine = serde_json::json!({
                 "id": entry.id,
                 "model": entry.model,
                 "state": state_name(status),
                 "queued": entry.handle.queued(),
                 "context_limit": entry.context_limit,
-                // The retained rows the engine started with (empty where a
-                // family composes no per-key origins) — not a re-resolution.
-                "settings": entry.effective,
+                "settings": settings,
             });
             if status != crate::sched::worker::EngineState::Loading
                 && let Some(plan) = entry.handle.mlx_execution()
@@ -539,6 +542,96 @@ mod tests {
         assert_eq!(rows[0]["key"], "context_limit");
         assert_eq!(rows[0]["value"], "32768");
         assert_eq!(rows[0]["origin"], "config_file");
+    }
+
+    #[tokio::test]
+    async fn system_route_reports_worker_resolved_flint_settings() {
+        use crate::{
+            capability::effective::flint_effective,
+            exec_fake::FakeExecutor,
+            family::flint::{
+                budget::{CpuMoeConfig, FlintEnv, LayerMajor},
+                prefill_order::{OrderInputs, resolve_prefill_order},
+                settings::FlintOptions,
+            },
+            sched::worker::spawn_engine,
+        };
+        let start = |mode, fails| {
+            let (gate, wait) = std::sync::mpsc::channel::<()>();
+            let (staged, ready) = std::sync::mpsc::channel();
+            let engine = spawn_engine(16, move |stages| {
+                let options = FlintOptions::cuda_default();
+                let cpu_moe = CpuMoeConfig::default();
+                let inputs = OrderInputs::for_options(&options, &cpu_moe, true, true);
+                let order = resolve_prefill_order(None, None, &inputs)
+                    .unwrap()
+                    .with_mode(mode);
+                stages.publish_effective(flint_effective(
+                    &options,
+                    &FlintEnv::default(),
+                    Some(&order),
+                ));
+                staged.send(()).unwrap();
+                wait.recv().unwrap();
+                if fails {
+                    return Err(crate::EngError::Checkpoint("fixture load failure".into()));
+                }
+                Ok((
+                    FakeExecutor::new(Vec::new(), &[testkit::EOS], 32),
+                    Default::default(),
+                ))
+            })
+            .unwrap();
+            ready
+                .recv_timeout(std::time::Duration::from_secs(5))
+                .unwrap();
+            assert!(engine.handle().loaded_effective().is_none());
+            (engine, gate)
+        };
+        let (fallback, release_fallback) = start(LayerMajor::Off, false);
+        let (jobs, release_jobs) = start(LayerMajor::Jobs, false);
+        let (failed, release_failed) = start(LayerMajor::Jobs, true);
+        let entries = vec![
+            testkit::entry("fallback", "model-a", &fallback, 4096),
+            testkit::entry("jobs", "model-b", &jobs, 4096),
+            testkit::entry("failed", "model-c", &failed, 4096),
+        ];
+        let app = router(Arc::new(AppState::new(testkit::API_KEY, entries)));
+        let query = || async {
+            let (status, _, bytes) =
+                testkit::send(&app, testkit::get("/v1/system", Some(testkit::API_KEY))).await;
+            assert_eq!(status, StatusCode::OK);
+            testkit::json_of(&bytes)
+        };
+        let loading = query().await;
+        for engine in loading["engines"].as_array().unwrap() {
+            assert_eq!(engine["state"], "loading");
+            assert_eq!(engine["settings"], serde_json::json!([]));
+        }
+        release_jobs.send(()).unwrap();
+        release_failed.send(()).unwrap();
+        release_fallback.send(()).unwrap();
+        testkit::wait_for_state(&jobs.handle(), EngineState::Ready);
+        testkit::wait_for_state(&failed.handle(), EngineState::Error);
+        testkit::wait_for_state(&fallback.handle(), EngineState::Ready);
+        let settled = query().await;
+        let setting = |index: usize, key| {
+            settled["engines"][index]["settings"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|row| row["key"] == key)
+                .unwrap()["value"]
+                .as_str()
+                .unwrap()
+        };
+        assert!(setting(0, "layer_major").starts_with("off (token-major) (default-fallback"));
+        assert_eq!(setting(0, "tall_hilo"), "off");
+        assert_eq!(setting(1, "tall_hilo"), "on");
+        assert_eq!(settled["engines"][2]["settings"], serde_json::json!([]));
+        fallback.shutdown();
+        jobs.shutdown();
+        failed.shutdown();
     }
 
     #[tokio::test]

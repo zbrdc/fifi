@@ -247,7 +247,8 @@ fn launch(
     options: Option<&FlintOptions>,
     ready_note: ReadyNote,
 ) -> Result<StartedEngine, EngError> {
-    use crate::sched::worker::spawn_engine_noted;
+    use super::budget::FlintEnv;
+    use crate::{capability::effective::flint_effective, sched::worker::spawn_engine_noted};
 
     let options_absent = options.is_none();
     let options = effective_options(options);
@@ -264,8 +265,15 @@ fn launch(
     let vocab = bundle.vocab_size() as usize;
     let root = model_dir.to_owned();
     let template_sha = pinned_template_sha();
-    let engine = spawn_engine_noted(1, ready_note, move |_| {
-        super::cuda_executor::FlintExecutor::open(&root, &options, eos, vocab, template_sha)
+    let engine = spawn_engine_noted(1, ready_note, move |stages| {
+        let (executor, session) =
+            super::cuda_executor::FlintExecutor::open(&root, &options, eos, vocab, template_sha)?;
+        stages.publish_effective(flint_effective(
+            &options,
+            &FlintEnv::capture(),
+            Some(executor.served_order()),
+        ));
+        Ok((executor, session))
     })?;
     Ok(StartedEngine {
         engine,

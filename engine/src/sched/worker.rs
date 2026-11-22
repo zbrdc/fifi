@@ -146,6 +146,7 @@ struct Shared {
     /// percentages, no invented sequence.
     load_stage: Mutex<Option<&'static str>>,
     mlx_execution: OnceLock<LoadedMlxExecution>,
+    effective: OnceLock<Vec<crate::capability::effective::EffectiveSetting>>,
     /// Set by `shutdown`. The worker cancels every job that it has not finished.
     stop: AtomicBool,
     /// The cancel flag of the running job, so `shutdown` can cancel it.
@@ -174,6 +175,7 @@ impl Shared {
             failure: Mutex::new(None),
             load_stage: Mutex::new(None),
             mlx_execution: OnceLock::new(),
+            effective: OnceLock::new(),
             stop: AtomicBool::new(false),
             running: Mutex::new(None),
             active: Mutex::new(Vec::new()),
@@ -292,6 +294,12 @@ impl EngineHandle {
 
     pub(crate) fn failure(&self) -> Option<String> {
         self.shared.failure()
+    }
+
+    pub(crate) fn loaded_effective(
+        &self,
+    ) -> Option<&[crate::capability::effective::EffectiveSetting]> {
+        self.shared.effective.get().map(Vec::as_slice)
     }
 
     pub(crate) fn mlx_execution(&self) -> Option<&LoadedMlxExecution> {
@@ -430,6 +438,7 @@ pub(crate) type ReadyNote = Option<Box<dyn FnOnce(EngineNote) + Send>>;
 /// reporting simply never calls [`Stages::begin`].
 pub(crate) struct Stages<'a> {
     shared: &'a Shared,
+    pending_effective: OnceLock<Vec<crate::capability::effective::EffectiveSetting>>,
 }
 
 impl Stages<'_> {
@@ -437,6 +446,18 @@ impl Stages<'_> {
     /// construction: a mutex write per phase, a handful per engine.
     pub(crate) fn begin(&self, stage: &'static str) {
         *lock(&self.shared.load_stage) = Some(stage);
+    }
+
+    /// Stages the loaded settings for this worker. Failed startup discards them.
+    #[cfg(any(test, all(feature = "native-cuda", target_os = "linux")))]
+    pub(crate) fn publish_effective(
+        &self,
+        rows: Vec<crate::capability::effective::EffectiveSetting>,
+    ) {
+        assert!(
+            self.pending_effective.set(rows).is_ok(),
+            "settings staged twice"
+        );
     }
 }
 
@@ -592,7 +613,10 @@ fn work<E, F>(
     E: ExecutorOps,
     F: FnOnce(&Stages<'_>) -> Result<(E, E::Session), EngError>,
 {
-    let stages = Stages { shared };
+    let stages = Stages {
+        shared,
+        pending_effective: OnceLock::new(),
+    };
     let (mut executor, mut session) = match make(&stages) {
         Ok(pair) => pair,
         Err(error) => {
@@ -629,6 +653,9 @@ fn work<E, F>(
             plan: plan.clone(),
             worker_piece_rows: prefill_chunk,
         });
+    }
+    if let Some(rows) = stages.pending_effective.into_inner() {
+        let _ = shared.effective.set(rows);
     }
     shared.set_state(EngineState::Ready);
     shared.clear_load_stage();

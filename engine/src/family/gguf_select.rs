@@ -40,7 +40,7 @@ impl GgufFile {
     }
 }
 
-fn is_gguf(path: &Path) -> bool {
+pub(crate) fn is_gguf(path: &Path) -> bool {
     path.extension()
         .is_some_and(|ext| ext.eq_ignore_ascii_case("gguf"))
 }
@@ -142,7 +142,6 @@ pub(crate) fn candidates(model: &Path) -> Result<(PathBuf, Vec<GgufFile>), EngEr
 /// Whether the weights file of `model` (the first of its candidates) states `architecture` and
 /// every integer key of `keys` with the given value, and `softcap` as a float: the identity a
 /// directory with no `config.json` is checked by. The error names the key that differs.
-#[cfg(any(feature = "native-cuda", test))]
 pub(crate) fn check_header_identity(
     model: &Path,
     architecture: &str,

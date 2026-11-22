@@ -1,4 +1,4 @@
-//! What is in a model directory, read without loading any weights.
+//! Checkpoint inventory for a directory or an explicit GGUF file, without loading weights.
 //!
 //! GGUF facts come from the shared `GgufHeader` parse, which stops at the end of
 //! the tensor table and never reads payloads; safetensors directories are
@@ -11,6 +11,7 @@ use serde::Serialize;
 use std::path::{Path, PathBuf};
 
 use crate::EngError;
+use crate::family::gguf_select::{directory_of, is_gguf};
 use crate::weights::MetaValue;
 
 /// Header cap for a scanned GGUF file. The real Qwen3.6 header (metadata
@@ -63,9 +64,7 @@ pub struct ModelInspection {
 }
 
 impl ModelInspection {
-    /// Total checkpoint bytes on disk: GGUF payloads plus safetensors
-    /// shards. This is the preflight's weight figure: what the loader
-    /// uploads or maps, before any residency policy.
+    /// Total inventoried checkpoint bytes on disk, before selection or residency policy.
     pub fn weight_bytes(&self) -> u64 {
         let gguf: u64 = self.gguf_files.iter().map(|fact| fact.file_bytes).sum();
         gguf + self.safetensors_bytes
@@ -76,10 +75,82 @@ fn checkpoint(message: String) -> EngError {
     EngError::Checkpoint(format!("model inspection: {message}"))
 }
 
-/// Inspect `model_dir`; tokenizer presence is read from `tokenizer_dir`
-/// (pass the same path twice for the usual one-directory layout).
+/// Inspect a directory or one explicit GGUF. Side files are relative to their directory,
+/// including when the caller supplies the same GGUF path for both arguments.
 pub fn inspect(model_dir: &Path, tokenizer_dir: &Path) -> Result<ModelInspection, EngError> {
     crate::storage_guard::require_local(model_dir, "model weights")?;
+    let side_dir = directory_of(model_dir);
+    let tokenizer_dir = directory_of(tokenizer_dir);
+    let explicit = model_dir.is_file() && is_gguf(model_dir);
+    let files = if explicit {
+        let metadata = std::fs::metadata(model_dir)
+            .map_err(|error| checkpoint(format!("cannot stat {}: {error}", model_dir.display())))?;
+        vec![FileFact {
+            name: model_dir
+                .file_name()
+                .unwrap_or_default()
+                .to_string_lossy()
+                .into_owned(),
+            bytes: metadata.len(),
+        }]
+    } else {
+        directory_files(model_dir)?
+    };
+
+    let mut gguf_files = Vec::new();
+    let mut gguf_errors = Vec::new();
+    let mut safetensors_files = 0usize;
+    let mut safetensors_bytes = 0u64;
+    for file in &files {
+        let path = if explicit {
+            model_dir.to_path_buf()
+        } else {
+            side_dir.join(&file.name)
+        };
+        if is_gguf(&path) {
+            match gguf_fact(&path, file.bytes) {
+                Ok(mut fact) => {
+                    fact.file.clone_from(&file.name);
+                    gguf_files.push(fact);
+                }
+                Err(error) => {
+                    gguf_errors.push(format!("{}: {}", file.name, super::describe_error(&error)))
+                }
+            }
+        } else if file.name.ends_with(".safetensors") {
+            safetensors_files += 1;
+            safetensors_bytes += file.bytes;
+        }
+    }
+
+    let config_path = side_dir.join("config.json");
+    let has_config_json = config_path.is_file();
+    let config_model_types = if has_config_json {
+        read_model_types(&config_path).unwrap_or_default()
+    } else {
+        Vec::new()
+    };
+
+    let (tokenizer_present, tokenizer_missing) = TOKENIZER_FILES
+        .map(str::to_string)
+        .into_iter()
+        .partition(|name| tokenizer_dir.join(name).is_file());
+
+    Ok(ModelInspection {
+        model_dir: model_dir.to_path_buf(),
+        files,
+        gguf_files,
+        gguf_errors,
+        safetensors_files,
+        safetensors_bytes,
+        has_config_json,
+        config_model_types,
+        tokenizer_present,
+        tokenizer_missing,
+    })
+}
+
+fn directory_files(model_dir: &Path) -> Result<Vec<FileFact>, EngError> {
     if !model_dir.is_dir() {
         return Err(checkpoint(format!(
             "{} is not a directory",
@@ -115,58 +186,7 @@ pub fn inspect(model_dir: &Path, tokenizer_dir: &Path) -> Result<ModelInspection
         }
     }
     files.sort_by(|a, b| a.name.cmp(&b.name));
-
-    let mut gguf_files = Vec::new();
-    let mut gguf_errors = Vec::new();
-    let mut safetensors_files = 0usize;
-    let mut safetensors_bytes = 0u64;
-    for file in &files {
-        if file.name.ends_with(".gguf") {
-            match gguf_fact(&model_dir.join(&file.name), file.bytes) {
-                Ok(mut fact) => {
-                    fact.file.clone_from(&file.name);
-                    gguf_files.push(fact);
-                }
-                Err(error) => {
-                    gguf_errors.push(format!("{}: {}", file.name, super::describe_error(&error)))
-                }
-            }
-        } else if file.name.ends_with(".safetensors") {
-            safetensors_files += 1;
-            safetensors_bytes += file.bytes;
-        }
-    }
-
-    let config_path = model_dir.join("config.json");
-    let has_config_json = config_path.is_file();
-    let config_model_types = if has_config_json {
-        read_model_types(&config_path).unwrap_or_default()
-    } else {
-        Vec::new()
-    };
-
-    let mut tokenizer_present = Vec::new();
-    let mut tokenizer_missing = Vec::new();
-    for name in TOKENIZER_FILES {
-        if tokenizer_dir.join(name).is_file() {
-            tokenizer_present.push(name.to_string());
-        } else {
-            tokenizer_missing.push(name.to_string());
-        }
-    }
-
-    Ok(ModelInspection {
-        model_dir: model_dir.to_path_buf(),
-        files,
-        gguf_files,
-        gguf_errors,
-        safetensors_files,
-        safetensors_bytes,
-        has_config_json,
-        config_model_types,
-        tokenizer_present,
-        tokenizer_missing,
-    })
+    Ok(files)
 }
 
 fn gguf_fact(path: &Path, file_bytes: u64) -> Result<GgufFact, EngError> {
@@ -252,6 +272,27 @@ mod tests {
         let dir = PathBuf::from("/nonexistent/fifi-model-dir");
         let error = crate::capability::describe_error(&inspect(&dir, &dir).unwrap_err());
         assert!(error.contains("not a directory"), "{error}");
+    }
+
+    #[test]
+    fn inspecting_an_explicit_gguf_reads_only_that_checkpoint_and_its_side_files() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let selected = dir.path().join("selected.GGUF");
+        let header = crate::tokenizer::gguf::tests::tiny_gguf("gemma4", "gpt2", "raon");
+        std::fs::write(&selected, &header).expect("write selected checkpoint");
+        std::fs::write(dir.path().join("broken.gguf"), "not a GGUF").expect("write sibling");
+        std::fs::write(dir.path().join("config.json"), r#"{"model_type":"gemma4"}"#)
+            .expect("write config");
+        std::fs::write(dir.path().join("tokenizer.json"), "{}").expect("write tokenizer");
+
+        let report = inspect(&selected, &selected).expect("inspect selected checkpoint");
+        assert_eq!(report.model_dir, selected);
+        assert_eq!(report.files.len(), 1);
+        assert_eq!(report.gguf_files[0].file, "selected.GGUF");
+        assert_eq!(report.weight_bytes(), header.len() as u64);
+        assert!(report.gguf_errors.is_empty());
+        assert_eq!(report.config_model_types, ["gemma4"]);
+        assert_eq!(report.tokenizer_present, ["tokenizer.json"]);
     }
 
     #[test]

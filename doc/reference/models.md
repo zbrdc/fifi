@@ -7,10 +7,12 @@
 | `nemotron35` | Nemotron 3.5 Super, 120B total, 12B active | no | yes, greedy only | `nvidia/NVIDIA-Nemotron-3.5-Super-VL-120B-A12B-NVFP4` at revision `8a115b9d`. |
 | `qwen3_8_flash_next` | Qwen3.8-Flash-Next | in the source tree | opt-in | Not validated end to end; A `native-cuda` Linux build serves it on the card unless `flash_next.cuda_decode` is false. |
 | `qwen3_8_27b_dense` | Qwen3.8-27B | in the source tree | no | Not validated end to end. |
-| `gemma4` | Gemma4 | staged | staged | Registered name only: a config naming it starts no engine ("gemma4 is staged in this build"). |
+| `gemma4` | Nemotron Bolt E4B | no | Bolt E4B only | A compatible Bolt E4B GGUF. Other Gemma4 checkpoints are not served. |
 | `fake` | none | yes | yes | Test engine; replies with fixed text. |
 
 "Pilot" means the model serves short contexts and its long-context quality is not measured.
+
+See the [shared architecture TODO](../architecture-todo.md) for follow-up work on startup, diagnostics, and execution.
 
 On CUDA, any `.gguf` conversion of Qwen3.6-35B-A3B in `model_dir` serves (the largest when there are several; `Q36_ALLOW_UNPINNED_GGUF=0` serves only the pinned file); the strict open (architecture metadata and full tensor set) is the gate, and the pinned Q4_K_M file stays the qualified checkpoint and wins whenever it is present.
 

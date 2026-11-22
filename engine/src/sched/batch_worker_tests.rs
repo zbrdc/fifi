@@ -1109,23 +1109,29 @@ fn a_prompt_that_finishes_prefill_joins_after_one_adoption_tick() {
 }
 
 #[test]
-fn cancelling_the_last_prefill_piece_keeps_the_row_out_of_decode() {
-    let log = Log::default();
-    let (hold, entered, unblock) = gate();
-    let mut fake = WindowFake::new(&log);
-    fake.hold_prefill = Some(hold);
-    let (engine, release) = start_with_budget(fake, 4);
-    let (request, events) = job(&[1; 3], 2);
-    engine.handle().try_submit(request).unwrap();
-    release.send(()).unwrap();
-    entered.recv_timeout(WAIT).unwrap();
-    events.cancel();
-    unblock.send(()).unwrap();
-    let result = collect(events);
-    assert_eq!(finish(&result), DecodeFinish::Cancelled);
-    assert_eq!(usage(&result).completion_tokens, 0);
-    engine.shutdown();
-    assert!(lock(&log).windows.is_empty());
+fn cancelling_the_last_prefill_piece_publishes_no_tokens_in_either_worker() {
+    for max_seqs in [1, 2] {
+        let log = Log::default();
+        let (hold, entered, unblock) = gate();
+        let mut fake = WindowFake::new(&log);
+        fake.max = max_seqs;
+        fake.hold_prefill = Some(hold);
+        let (engine, release) = start_with_budget(fake, 4);
+        let (request, events) = job(&[1; 3], 2);
+        engine.handle().try_submit(request).unwrap();
+        release.send(()).unwrap();
+        entered.recv_timeout(WAIT).unwrap();
+        events.cancel();
+        unblock.send(()).unwrap();
+        let result = collect(events);
+        assert_eq!(finish(&result), DecodeFinish::Cancelled);
+        assert_eq!(usage(&result).completion_tokens, 0);
+        assert!(output(&result).is_empty());
+        assert_eq!(engine.shutdown().state, EngineState::Stopped);
+        // The single worker can call decode to finish cancellation; the batch worker
+        // must not submit a cancelled row to its native window.
+        assert!(lock(&log).windows.is_empty());
+    }
 }
 
 #[test]
@@ -1717,30 +1723,18 @@ fn a_cancelled_growth_denial_returns_its_permits_and_keeps_an_independent_checkp
 }
 
 #[test]
-fn a_denial_restart_restores_the_denied_jobs_own_tip_through_a_real_batch_store() {
-    // The batch pre-pass against a REAL store (FakeExecutor + prefix limits + session
-    // budget with `max_seqs` 8, so spawn_engine selects the BATCH worker - not the
-    // WindowFake evict counter, and not the single-worker path the same fake defaults
-    // to). The denied conversation's second turn restores its own tip, the growth
-    // cannot fit, the pre-pass protects the restored anchor, and the rebuild
-    // re-restores it (reused > 0) - the integration pin that the protect id from a real
-    // restored session survives the batch restart path. A mutant that deletes the batch
-    // restart fails this fixture outright (the turn errors instead of finishing). This
-    // fixture does NOT discriminate a no-protect mutant - the restore moves the denied
-    // conversation's entry to MRU, so the oldest OTHER tip spends with or without
-    // protection (same for the worker twin in worker.rs,
-    // `a_denial_keeps_the_denied_jobs_own_restored_anchor_and_spends_a_dead_tip`). The
-    // arms that CAN be discriminated are pinned elsewhere: the tier order by
-    // hand-built-store mutants in family/session.rs
-    // (`an_interior_anchor_spends_before_an_older_covering_root` and the two-path
-    // fixture). The adoption-denial knob test below exercises the STORE's own protect
-    // at the engine level - the worker's protect WIRING itself is not discriminated by
-    // any engine fixture (store-level tests pin the semantics); its candidate is the
-    // OLDEST entry, so a drop-first or no-protect mutant spends it and reused_tokens
-    // flips 100 -> 0.
+fn a_denial_restart_restores_the_jobs_own_tip_in_both_workers() {
+    for max_seqs in [1, 8] {
+        assert_denial_restart_restores_tip(max_seqs);
+    }
+}
+
+fn assert_denial_restart_restores_tip(max_seqs: usize) {
+    // Use a real store and pool so the second turn must evict and re-restore its own
+    // tip. This does not discriminate a missing protect ID: restore also makes the tip MRU.
     let (release, held) = mpsc::channel();
     let mut fake = FakeExecutor::new(vec![vec![EOS]; 6], &[EOS], 10_000);
-    fake.with_max_seqs(8);
+    fake.with_max_seqs(max_seqs);
     fake.with_prefix_limits(2, 6);
     fake.with_session_budget(10_000_000, 1_024, 3_000_000);
     // Clone the window counter BEFORE the fake moves into the factory: a positive
@@ -1781,13 +1775,12 @@ fn a_denial_restart_restores_the_denied_jobs_own_tip_through_a_real_batch_store(
     let denied = denied.with_prefix_boundary(3_499).expect("boundary");
     handle.try_submit(denied).expect("submit");
     let events = collect(denied_events);
-    assert!(
-        matches!(events.last(), Some(JobEvent::Finished(usage)) if usage.reused_tokens > 0),
-        "the rebuild re-restored the denied job's own tip: {events:?}"
-    );
-    assert!(
+    assert_eq!(usage(&events).reused_tokens, 100, "max_seqs={max_seqs}");
+    assert_eq!(finish(&events), DecodeFinish::Stop, "max_seqs={max_seqs}");
+    assert_eq!(
         windows.load(Ordering::SeqCst) > 0,
-        "the batch branch ran: the engine advanced decode windows"
+        max_seqs > 1,
+        "only the batch branch advances decode windows"
     );
     drop(handle);
     engine.shutdown();

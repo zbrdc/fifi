@@ -10,17 +10,54 @@
 //! after the prefix write no cache cells and feed nothing but the final norm);
 //! the pending token's decode runs the head.
 
-#[cfg(any(feature = "native-cuda", test))]
-use std::{fs, path::Path};
+use super::config;
+use crate::{EngError, capability::probe::CompiledBackends, family::gguf_select};
+use std::fs;
+use std::path::Path;
 
-#[cfg(any(feature = "native-cuda", test))]
-use {super::config, crate::EngError};
+/// Build eligibility only. A CUDA build still has to pass the Bolt checkpoint checks at load.
+pub(crate) fn check_backend(model: &Path, backends: &CompiledBackends) -> Result<(), EngError> {
+    if backends.cuda {
+        Ok(())
+    } else {
+        Err(cuda_required(model))
+    }
+}
 
-/// Reads and validates the model directory's `config.json` against the Bolt
-/// descriptor; the server starter uses this to dispatch inside the gemma4
-/// family. A directory that is not a Bolt checkpoint fails the check.
-#[cfg(any(feature = "native-cuda", test))]
-pub(crate) fn bolt_configured(model_dir: &Path) -> Result<(), EngError> {
+pub(crate) fn cuda_required(model: &Path) -> EngError {
+    EngError::BadRequest(format!(
+        "gemma4 serves only the Nemotron Bolt E4B on the native-cuda build; \
+         this build has no CUDA engine (model directory {})",
+        model.display()
+    ))
+}
+
+/// Shared Bolt identity gate, not a tensor or memory check. A supplied config is
+/// authoritative; only a missing config lets the selected GGUF header stand in for it.
+pub(crate) fn check_checkpoint(model: &Path) -> Result<(), EngError> {
+    let directory = gguf_select::directory_of(model);
+    let result = bolt_configured(&directory).or_else(|error| {
+        if directory.join("config.json").exists() {
+            return Err(error);
+        }
+        gguf_select::check_header_identity(
+            model,
+            "gemma4",
+            crate::family::spec::NEMOTRON_BOLT_E4B_GGUF_KEYS,
+            Some(crate::family::spec::NEMOTRON_BOLT_E4B_GGUF_SOFTCAP),
+        )
+    });
+    result.map_err(|cause| {
+        EngError::BadRequest(format!(
+            "gemma4 serves only the Nemotron Bolt E4B on the native-cuda build; \
+             the model directory {} failed the Bolt configuration check: {}",
+            directory.display(),
+            cause.describe()
+        ))
+    })
+}
+
+fn bolt_configured(model_dir: &Path) -> Result<(), EngError> {
     let json = fs::read(model_dir.join("config.json"))
         .map_err(|error| EngError::Checkpoint(format!("gemma4 config.json: {error}")))?;
     config::check_bolt_config(&json)
@@ -69,6 +106,32 @@ mod tests {
         assert_eq!(files.len(), 1);
         bolt_configured(&found).expect("the Bolt config gate passes beside the file");
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_bare_bolt_header_passes_but_cannot_override_an_invalid_config() {
+        use crate::family::spec::{NEMOTRON_BOLT_E4B_GGUF_KEYS, NEMOTRON_BOLT_E4B_GGUF_SOFTCAP};
+        use crate::tokenizer::gguf::tests::{
+            gguf_file, kv_f32_for_tests, kv_string_for_tests, kv_u32_for_tests,
+        };
+        let dir = tempfile::tempdir().expect("tempdir");
+        let file = dir.path().join("bolt.gguf");
+        let mut metadata = vec![kv_string_for_tests("general.architecture", "gemma4")];
+        metadata.extend(
+            NEMOTRON_BOLT_E4B_GGUF_KEYS
+                .iter()
+                .map(|(key, value)| kv_u32_for_tests(key, *value)),
+        );
+        let (softcap, value) = NEMOTRON_BOLT_E4B_GGUF_SOFTCAP;
+        metadata.push(kv_f32_for_tests(softcap, value));
+        std::fs::write(&file, gguf_file(&metadata)).expect("write Bolt header");
+        for model in [dir.path(), &file] {
+            super::check_checkpoint(model).expect("accept the Bolt header");
+        }
+
+        std::fs::write(dir.path().join("config.json"), "{").expect("write invalid config");
+        let error = super::check_checkpoint(&file).expect_err("do not fall back to the header");
+        assert!(error.describe().contains("configuration JSON"), "{error:?}");
     }
 
     #[test]

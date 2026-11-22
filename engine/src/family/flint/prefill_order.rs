@@ -254,25 +254,6 @@ pub(crate) fn open_with_default_fallback<T>(
     }
 }
 
-/// The order the last Flint open actually served (after a fallback, the token-major walk), kept for
-/// the effective settings the running server reports. One Flint engine per process.
-static SERVED: std::sync::Mutex<Option<PrefillOrder>> = std::sync::Mutex::new(None);
-
-/// Records the order a successful open served.
-pub(crate) fn record_served(order: &PrefillOrder) {
-    *SERVED
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(order.clone());
-}
-
-/// The order the last successful Flint open served, if one has opened in this process.
-pub(crate) fn served() -> Option<PrefillOrder> {
-    SERVED
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner)
-        .clone()
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -550,19 +531,8 @@ mod tests {
         assert_eq!(fell.load_suffix(), " prefill_order_source=default-fallback");
     }
 
-    /// The served order is what the running server reports: a recorded fallback reads back as the token-major walk.
-    #[test]
-    fn the_served_order_reads_back_what_the_open_recorded() {
-        let jobs = resolve_prefill_order(None, None, &inputs("f16", &none())).unwrap();
-        record_served(&jobs.with_mode(LayerMajor::Off));
-        let served = served().expect("recorded");
-        assert_eq!(served.mode, LayerMajor::Off);
-        assert!(served.fell_back && !served.hilo);
-    }
-
-    /// The one line that links the resolved hi/lo state to the kernels: `open_resolved` hands `hilo` to
-    /// `set_tall_hilo` before it touches the device, un-negated and not as a literal, and the open records
-    /// the order it served. Deleting or inverting either fails here on the host.
+    /// `open_resolved` hands the successful attempt's hi/lo state to the kernels before any device
+    /// work and retains that same attempt's order on the executor for runtime settings.
     #[test]
     fn the_open_hands_the_resolved_hilo_state_to_the_kernels() {
         let source = include_str!("cuda_executor.rs");
@@ -578,8 +548,8 @@ mod tests {
             .expect("open_resolved opens the context");
         assert!(set < device, "the state is set before any device work");
         assert!(
-            body.contains("            hilo,\n"),
-            "hilo comes from the resolved state"
+            body.contains("let PrefillOrder { mode, hilo, .. } = order;"),
+            "hilo comes from the resolved order"
         );
         for wrong in [
             "set_tall_hilo(!hilo)",
@@ -589,10 +559,13 @@ mod tests {
             assert!(!source.contains(wrong), "{wrong}");
         }
         let open = source.find("    fn open_with(").expect("open_with exists");
-        let open_body = &source[open..start];
         assert!(
-            open_body.contains("record_served(&order.with_mode("),
-            "the open records the order it served"
+            source[open..start].contains("order.with_mode(mode),"),
+            "each open attempt receives its own order"
+        );
+        assert!(
+            source[start..].contains("served_order: order,"),
+            "the successful executor retains its own order"
         );
     }
 

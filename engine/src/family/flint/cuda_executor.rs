@@ -1,7 +1,8 @@
 //! Single-session CUDA adapter. The shared session owns generation and publication.
 
 use super::prefill_order::{
-    OrderInputs, open_with_default_fallback, prefill_order_name, resolve_prefill_order,
+    OrderInputs, PrefillOrder, open_with_default_fallback, prefill_order_name,
+    resolve_prefill_order,
 };
 use super::{
     budget::{
@@ -134,6 +135,7 @@ pub(super) struct FlintExecutor {
     layer_mode: LayerMajor,
     /// The tall projections of the jobs pass split their activations (hi/lo), as resolved at open.
     tall_hilo: bool,
+    served_order: PrefillOrder,
     bank_tally: BankTally,
     root: std::path::PathBuf,
     options: FlintOptions,
@@ -517,16 +519,6 @@ fn open_switches(
     super::settings::layer_major_from_env(layer_major)
 }
 
-/// What an open runs with once the prefill order is resolved: the layer-major mode, the CPU expert
-/// configuration, whether the tall projections split their activations, and the load-line tokens
-/// that name the order and its source.
-struct Resolved {
-    mode: LayerMajor,
-    cpu_moe: CpuMoeConfig,
-    hilo: bool,
-    suffix: String,
-}
-
 impl FlintExecutor {
     pub(super) fn open(
         root: &Path,
@@ -609,30 +601,26 @@ impl FlintExecutor {
         // jobs pass reserves more memory and the early check sees only the static ceiling, so a
         // defaulted jobs open that fails for want of memory is retried once on the token-major
         // walk (an explicit value is never retried).
-        let ran = std::cell::Cell::new(order.mode);
-        let opened = open_with_default_fallback(
+        open_with_default_fallback(
             &order,
             |mode| {
-                ran.set(mode);
                 Self::open_resolved(
                     root,
                     options,
                     eos.clone(),
                     vocab,
                     template_sha,
-                    Resolved {
-                        mode,
-                        cpu_moe,
-                        hilo: mode == LayerMajor::Jobs && order.hilo,
-                        suffix: order.with_mode(mode).load_suffix(),
-                    },
+                    cpu_moe,
+                    order.with_mode(mode),
                 )
             },
             |line| eprintln!("{line}"),
-        )?;
-        // What the running server reports as its effective settings is what actually opened.
-        super::prefill_order::record_served(&order.with_mode(ran.get()));
-        Ok(opened)
+        )
+    }
+
+    /// The prefill order this executor successfully opened with, including any fallback.
+    pub(super) fn served_order(&self) -> &PrefillOrder {
+        &self.served_order
     }
 
     /// The open for a resolved prefill order: plans the memory, loads the weights and arms the
@@ -643,14 +631,10 @@ impl FlintExecutor {
         eos: Vec<u32>,
         vocab: usize,
         template_sha: [u8; 32],
-        resolved: Resolved,
+        cpu_moe: CpuMoeConfig,
+        order: PrefillOrder,
     ) -> Result<(Self, FlintSession)> {
-        let Resolved {
-            mode,
-            cpu_moe,
-            hilo,
-            suffix: order_suffix,
-        } = resolved;
+        let PrefillOrder { mode, hilo, .. } = order;
         // The tall projections of this process read the resolved hi/lo state, not the raw variable.
         super::settings::set_tall_hilo(hilo);
         let context_rows = options.context_limit as usize;
@@ -783,7 +767,7 @@ impl FlintExecutor {
                 format!(" layer_major={rows}{jobs}")
             }),
             // The resolved order and where it came from (default or explicit), and the hi/lo state.
-            order_suffix,
+            order.load_suffix(),
             ctx.single_gather_suffix(),
             model
                 .banked_experts()
@@ -824,6 +808,7 @@ impl FlintExecutor {
                 layer_major: layer_major_rows,
                 layer_mode: mode,
                 tall_hilo: hilo,
+                served_order: order,
                 bank_tally: BankTally::default(),
                 root: root.to_path_buf(),
                 template_sha,
@@ -1459,9 +1444,7 @@ mod open_switch_tests {
             "alloc_cache_selected(),",
             "jobs_default_admitted(options),",
             "open_with_default_fallback(",
-            "record_served(",
-            "hilo: mode == LayerMajor::Jobs && order.hilo,",
-            "order.with_mode(mode).load_suffix()",
+            "order.with_mode(mode)",
             "tall_hilo_from_env(",
         ] {
             assert!(body.contains(needle), "open_with lost `{needle}`");

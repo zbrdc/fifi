@@ -139,13 +139,13 @@ pub(crate) struct Discovered {
     pub(crate) tokenizer_dir: PathBuf,
 }
 
-/// Inspect the directory and choose family, format, and options.
+/// Inspect the model path and choose family, format, and options.
 /// Pure filesystem evidence; no preflight, no probing.
 fn discover(args: &ModelServeArgs) -> Result<Discovered, StartupError> {
     let tokenizer_dir = args
         .tokenizer_dir
         .clone()
-        .unwrap_or_else(|| args.model_dir.clone());
+        .unwrap_or_else(|| crate::family::gguf_select::directory_of(&args.model_dir));
     let inspection = inspect::inspect(&args.model_dir, &tokenizer_dir)
         .map_err(|error| StartupError(describe_error(&error)))?;
 
@@ -392,10 +392,8 @@ pub(crate) fn servable_family(model_dir: &Path) -> Result<String, String> {
     select_family(&ModelServeArgs::default(), &inspection).map_err(|error| error.0)
 }
 
-/// The memory one engine of a downloaded snapshot needs, from the
-/// capability preflight's own estimate (the planner's closed-form cache
-/// and admission terms) with the weight term narrowed to the one
-/// quantization a serve loads.
+/// The memory one engine of a downloaded snapshot needs, including the
+/// preflight's closed-form cache and admission terms.
 pub(crate) struct TierEstimate {
     pub(crate) vram_bytes: u64,
     pub(crate) ram_bytes: u64,
@@ -415,12 +413,17 @@ pub(crate) fn estimate_tiers(model_dir: &Path, family: &str) -> Option<TierEstim
     };
     let report = preflight::preflight(model_dir, model_dir, &candidate, &facts).ok()?;
     let estimate = report.estimate?;
-    let (weights, picked) = match crate::family::gguf_select::candidates(model_dir) {
-        Ok((_, candidates)) if !candidates.is_empty() => {
-            (candidates[0].bytes, "the largest GGUF quantization on disk")
-        }
-        _ => (estimate.weight_bytes, "the checkpoint files on disk"),
-    };
+    let (weights, picked) =
+        if family == crate::family::qwen::qwen36::factory::FAMILY && facts.backends.cuda {
+            (estimate.weight_bytes, "the GGUF selected by preflight")
+        } else {
+            match crate::family::gguf_select::candidates(model_dir) {
+                Ok((_, candidates)) if !candidates.is_empty() => {
+                    (candidates[0].bytes, "the largest GGUF quantization on disk")
+                }
+                _ => (estimate.weight_bytes, "the checkpoint files on disk"),
+            }
+        };
     let other = estimate.total_bytes.saturating_sub(estimate.weight_bytes);
     Some(TierEstimate {
         vram_bytes: weights + other + estimate.admission_charges_bytes,
@@ -936,6 +939,27 @@ mod tests {
             assert_eq!(discovered.family, *family, "{architecture}");
             assert_eq!(discovered.weight_format, "gguf");
         }
+    }
+
+    #[test]
+    fn an_explicit_gguf_discovers_its_own_family_and_defaults_side_files_to_the_parent() {
+        let dir = directory_of_architecture("qwen35moe");
+        let file = dir.path().join("model.gguf");
+        std::fs::write(
+            dir.path().join("bolt.gguf"),
+            crate::tokenizer::gguf::tests::tiny_gguf("gemma4", "gpt2", "raon"),
+        )
+        .expect("write another architecture");
+        let args = args_for(&file);
+        let discovered = discover(&args).expect("discover explicit checkpoint");
+        assert_eq!(
+            discovered.family,
+            crate::family::qwen::qwen36::factory::FAMILY
+        );
+        assert_eq!(discovered.tokenizer_dir, dir.path());
+        let config = super::config_from(&discovered, &args);
+        assert_eq!(config.engines[0].model_dir, file);
+        assert_eq!(config.engines[0].tokenizer_dir, dir.path());
     }
 
     #[test]

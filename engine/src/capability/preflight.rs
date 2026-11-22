@@ -15,6 +15,7 @@ use serde::Serialize;
 use std::path::{Path, PathBuf};
 
 use super::{Probe, inspect::ModelInspection, probe::HardwareFacts};
+use crate::family::qwen::qwen36::settings::{Backend as Q36Backend, Q36Options};
 use crate::memory::MemoryPolicy;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
@@ -209,13 +210,26 @@ pub fn preflight(
     candidate: &Candidate,
     facts: &HardwareFacts,
 ) -> Result<PreflightReport, crate::EngError> {
-    let inspection = super::inspect::inspect(model_dir, tokenizer_dir)?;
+    preflight_with_q36_options(model_dir, tokenizer_dir, candidate, facts, None)
+}
+
+/// Configured Qwen GGUF entries carry the actual options; a standalone check has only overrides.
+pub(crate) fn preflight_with_q36_options(
+    model_dir: &Path,
+    tokenizer_dir: &Path,
+    candidate: &Candidate,
+    facts: &HardwareFacts,
+    q36_options: Option<&Q36Options>,
+) -> Result<PreflightReport, crate::EngError> {
+    let tokenizer_dir = crate::family::gguf_select::directory_of(tokenizer_dir);
+    let inspection = super::inspect::inspect(model_dir, &tokenizer_dir)?;
     Ok(evaluate(
         model_dir,
-        tokenizer_dir,
+        &tokenizer_dir,
         &inspection,
         candidate,
         facts,
+        q36_options,
     ))
 }
 
@@ -225,6 +239,7 @@ fn evaluate(
     inspection: &ModelInspection,
     candidate: &Candidate,
     facts: &HardwareFacts,
+    q36_options: Option<&Q36Options>,
 ) -> PreflightReport {
     let mut checks = Vec::new();
     inventory_checks(inspection, &mut checks);
@@ -234,18 +249,43 @@ fn evaluate(
 
     let family = identify_family(inspection, candidate, &mut checks);
     let family_name = family.as_deref();
+    if family_name == Some(crate::family::gemma::gemma4::FAMILY)
+        && let Err(error) =
+            crate::family::gemma::gemma4::serve::check_backend(model_dir, &facts.backends)
+    {
+        checks.push(Check::new("backend", CheckStatus::Fail, error.describe()));
+        return shallow_preflight(model_dir, tokenizer_dir, inspection, family, checks);
+    }
     // A GGUF directory with no tokenizer files starts from the vocabulary in the weights.
     gguf_tokenizer_check(inspection, &mut checks);
+    if family_name == Some(crate::family::gemma::gemma4::FAMILY) {
+        checks.push(
+            match crate::family::gemma::gemma4::serve::check_checkpoint(model_dir) {
+                Ok(()) => Check::new(
+                    "Bolt checkpoint",
+                    CheckStatus::Pass,
+                    "matches Bolt identity; tensor validation and memory admission run at load"
+                        .to_string(),
+                ),
+                Err(error) => Check::new("Bolt checkpoint", CheckStatus::Fail, error.describe()),
+            },
+        );
+        return shallow_preflight(model_dir, tokenizer_dir, inspection, family, checks);
+    }
     if family_name == Some(crate::family::qwen::qwen36::factory::FAMILY) {
-        // `None` when this binary has no GPU backend at all;
-        // `backend_of_build`'s fallback arm must not masquerade as one.
-        let backend =
-            (!facts.backends.none()).then(crate::family::qwen::qwen36::factory::backend_of_build);
+        let backend = if facts.backends.mlx {
+            Some(Q36Backend::Mlx)
+        } else {
+            facts.backends.cuda.then_some(Q36Backend::Cuda)
+        };
         return q36_preflight(
             model_dir,
             tokenizer_dir,
             inspection,
-            candidate,
+            Q36Inputs {
+                candidate,
+                configured: q36_options,
+            },
             facts,
             backend,
             checks,
@@ -511,9 +551,8 @@ fn inventory_checks(inspection: &ModelInspection, checks: &mut Vec<Check>) {
     }
 }
 
-/// The servable families this build recognizes, from the one list the
-/// server config validates against.
-fn servable_families() -> &'static [&'static str] {
+/// The family names the server config accepts, whether or not the build can serve them.
+fn recognized_families() -> &'static [&'static str] {
     &crate::server::config::FAMILIES
 }
 
@@ -523,7 +562,7 @@ fn identify_family(
     checks: &mut Vec<Check>,
 ) -> Option<String> {
     if let Some(family) = &candidate.family {
-        if servable_families().contains(&family.as_str()) {
+        if recognized_families().contains(&family.as_str()) {
             checks.push(Check::new(
                 "family",
                 CheckStatus::Pass,
@@ -536,7 +575,7 @@ fn identify_family(
             CheckStatus::Fail,
             format!(
                 "family {family} is not recognized by this build (supported: {})",
-                servable_families().join(", ")
+                recognized_families().join(", ")
             ),
         ));
         return None;
@@ -582,21 +621,25 @@ fn identify_family(
         CheckStatus::Fail,
         format!(
             "the family cannot be identified from this directory; pass --family (supported: {})",
-            servable_families().join(", ")
+            recognized_families().join(", ")
         ),
     ));
     None
 }
 
-/// A directory with GGUF weights and no tokenizer files starts from the vocabulary in the GGUF
-/// header: the check that asked for the four files is replaced by one that builds the tokenizer
-/// from the file's own header. A directory that has the files keeps the file check.
+/// Check embedded tokenizer metadata when side files are missing. An explicit GGUF supplies
+/// its own metadata; a directory uses the vocabulary-bearing file that the loader would find.
 fn gguf_tokenizer_check(inspection: &ModelInspection, checks: &mut Vec<Check>) {
     if inspection.tokenizer_missing.is_empty() {
         return;
     }
-    let Ok(Some(path)) = crate::tokenizer::gguf::vocabulary_gguf(&inspection.model_dir) else {
-        return;
+    let path = if inspection.model_dir.is_file() && !inspection.gguf_files.is_empty() {
+        inspection.model_dir.clone()
+    } else {
+        let Ok(Some(path)) = crate::tokenizer::gguf::vocabulary_gguf(&inspection.model_dir) else {
+            return;
+        };
+        path
     };
     checks.retain(|check| check.name != "tokenizer files");
     let built = crate::tokenizer::gguf::GgufTokenizer::read(&path)
@@ -668,16 +711,21 @@ fn shallow_preflight(
     }
 }
 
+struct Q36Inputs<'a> {
+    candidate: &'a Candidate,
+    configured: Option<&'a Q36Options>,
+}
+
 fn q36_preflight(
     model_dir: &Path,
     tokenizer_dir: &Path,
     inspection: &ModelInspection,
-    candidate: &Candidate,
+    inputs: Q36Inputs<'_>,
     facts: &HardwareFacts,
-    backend: Option<crate::family::qwen::qwen36::settings::Backend>,
+    backend: Option<Q36Backend>,
     mut checks: Vec<Check>,
 ) -> PreflightReport {
-    use crate::family::qwen::qwen36::settings::{Backend, Q36Env, Q36Options, Q36Settings};
+    use crate::family::qwen::qwen36::settings::{Backend, Q36Env, Q36Settings};
 
     let family = Some(crate::family::qwen::qwen36::factory::FAMILY.to_string());
     let finish = |checks: Vec<Check>,
@@ -731,15 +779,21 @@ fn q36_preflight(
         return finish(checks, None, Vec::new(), Qualification::Unverified);
     }
 
-    // The factory's own settings resolution: identical validation of the
-    // candidate options, including every range and combination rule.
-    let options = Q36Options {
-        context_limit: candidate.context_limit,
-        kv_dtype: candidate.kv_dtype.clone(),
-        ..Q36Options::default()
+    // The factory's own settings resolution applies the same range and combination rules.
+    let candidate = inputs.candidate;
+    let standalone;
+    let options = if let Some(configured) = inputs.configured {
+        configured
+    } else {
+        standalone = Q36Options {
+            context_limit: candidate.context_limit,
+            kv_dtype: candidate.kv_dtype.clone(),
+            ..Q36Options::default()
+        };
+        &standalone
     };
     let env = Q36Env::from_process(model_dir);
-    let settings = match Q36Settings::new(model_dir, tokenizer_dir, Some(&options), &env, backend) {
+    let settings = match Q36Settings::new(model_dir, tokenizer_dir, Some(options), &env, backend) {
         Ok(settings) => {
             checks.push(Check::new(
                 "settings",
@@ -802,9 +856,12 @@ fn q36_preflight(
     // Format vs. directory shape: the resolved weight format must have
     // its files here. Exact checkpoint identity stays the loader's check.
     use crate::family::qwen::qwen36::settings::WeightFormat;
+    let mut selected_gguf_bytes = None;
     match settings.weights {
         WeightFormat::Gguf if backend == Backend::Cuda => {
-            checks.push(pinned_gguf_check(model_dir, inspection));
+            let (check, bytes) = cuda_gguf_check(model_dir, inspection);
+            checks.push(check);
+            selected_gguf_bytes = bytes;
         }
         // The MLX arm reads an MLX safetensors pack; `gguf` is only the unset default of
         // `weight_format`, which the MLX arm does not use.
@@ -847,14 +904,7 @@ fn q36_preflight(
     }
 
     let spec = settings.spec;
-    // The CUDA GGUF loader reads exactly the pinned file, so only its
-    // bytes are the planning figure; other layouts use the whole
-    // inventory of weight files found.
-    let disk_bytes = if backend == Backend::Cuda && settings.weights == WeightFormat::Gguf {
-        pinned_gguf_bytes(inspection).unwrap_or_else(|| inspection.weight_bytes())
-    } else {
-        inspection.weight_bytes()
-    };
+    let disk_bytes = selected_gguf_bytes.unwrap_or_else(|| inspection.weight_bytes());
     // The EXL3 planning figure is the loader's own header walk, not the
     // bytes on disk: the walk counts the widening to F32 the load
     // performs, and refuses a pack of another size, rate, codebook or
@@ -1535,83 +1585,57 @@ fn largest_resident_context(
     })
 }
 
-/// The CUDA checkpoint check, through the loader's own gates: the
-/// `Q36_ALLOW_UNPINNED_GGUF` switch decides the selection, then
-/// `check_gguf_identity` pins the curated file's exact size (the
-/// full-file SHA-256 stays the loader's opt-in, since hashing 20 GB
-/// is not a preflight default; an unpinned checkpoint has no pinned
-/// size or digest and is validated by the model open). Only a CUDA
-/// build has the gate at all — and a CUDA backend implies that
-/// build — so the non-CUDA arm below is reachable only from tests
-/// that inject the backend.
+/// Use the loader's own selection and lightweight identity check. Full content
+/// verification and tensor validation still belong to model open.
 #[cfg(all(feature = "native-cuda", target_os = "linux"))]
-fn pinned_gguf_check(model_dir: &Path, _inspection: &ModelInspection) -> Check {
+fn cuda_gguf_check(model_dir: &Path, _inspection: &ModelInspection) -> (Check, Option<u64>) {
     use crate::family::qwen::qwen36::cuda::start::ALLOW_UNPINNED_VAR;
     gguf_admission_check(model_dir, std::env::var(ALLOW_UNPINNED_VAR).ok().as_deref())
 }
 
-/// The pure core of [`pinned_gguf_check`]: the raw switch value arrives resolved by the
-/// caller, so the branches (a bad spelling, a refused selection, the pinned and the admitted
-/// checkpoint) test without touching process-global state.
 #[cfg(all(feature = "native-cuda", target_os = "linux"))]
-fn gguf_admission_check(model_dir: &Path, raw: Option<&str>) -> Check {
+fn gguf_admission_check(model_dir: &Path, raw: Option<&str>) -> (Check, Option<u64>) {
     use crate::family::qwen::qwen36::cuda::start::{
-        ALLOW_UNPINNED_VAR, GGUF_NAME, allow_unpinned_wanted, check_gguf_identity, select_gguf,
+        ALLOW_UNPINNED_VAR, allow_unpinned_wanted, check_gguf_identity, select_gguf,
     };
-    let allow_unpinned = match allow_unpinned_wanted(raw) {
-        Ok(wanted) => wanted,
-        Err(error) => {
-            return Check::new(
-                "weight format",
-                CheckStatus::Fail,
-                format!(
-                    "the loader would refuse this start: {}",
-                    super::describe_error(&error)
-                ),
-            );
-        }
-    };
-    let (gguf, pinned) = match select_gguf(model_dir, allow_unpinned) {
-        Ok(pair) => pair,
-        Err(error) => {
-            return Check::new(
-                "weight format",
-                CheckStatus::Fail,
-                format!(
-                    "the loader would refuse this checkpoint: {}",
-                    super::describe_error(&error)
-                ),
-            );
-        }
-    };
-    match check_gguf_identity(&gguf, false, pinned) {
-        Ok(()) => Check::new(
-            "weight format",
-            CheckStatus::Pass,
-            if pinned {
-                format!("the pinned CUDA checkpoint {GGUF_NAME} is present at its pinned size")
+    let selection = (|| {
+        let (path, pinned) = select_gguf(model_dir, allow_unpinned_wanted(raw)?)?;
+        check_gguf_identity(&path, false, pinned)?;
+        let (_, files) = crate::family::gguf_select::candidates(&path)?;
+        Ok::<_, crate::EngError>((path, pinned, files[0].bytes))
+    })();
+    let (status, detail, bytes) = match selection {
+        Ok((path, pinned, bytes)) => {
+            let basis = if pinned {
+                "preferred checkpoint name".to_string()
             } else {
+                format!("unpinned checkpoint; {ALLOW_UNPINNED_VAR}=0 requires the preferred name")
+            };
+            (
+                CheckStatus::Pass,
                 format!(
-                    "{} is not the pinned file; it is served unless {ALLOW_UNPINNED_VAR}=0, and the \
-                     model open validates it",
-                    gguf.display()
-                )
-            },
-        ),
-        Err(error) => Check::new(
-            "weight format",
+                    "selected {} ({bytes} bytes; {basis}); model open validates it",
+                    path.display()
+                ),
+                Some(bytes),
+            )
+        }
+        Err(error) => (
             CheckStatus::Fail,
             format!(
                 "the loader would refuse this checkpoint: {}",
                 super::describe_error(&error)
             ),
+            None,
         ),
-    }
+    };
+    (Check::new("weight format", status, detail), bytes)
 }
 
+/// Only tests can inject CUDA facts in a build without the native selector.
 #[cfg(not(all(feature = "native-cuda", target_os = "linux")))]
-fn pinned_gguf_check(_model_dir: &Path, inspection: &ModelInspection) -> Check {
-    if inspection.gguf_files.is_empty() {
+fn cuda_gguf_check(_model_dir: &Path, inspection: &ModelInspection) -> (Check, Option<u64>) {
+    let check = if inspection.gguf_files.is_empty() {
         Check::new(
             "weight format",
             CheckStatus::Fail,
@@ -1624,24 +1648,8 @@ fn pinned_gguf_check(_model_dir: &Path, inspection: &ModelInspection) -> Check {
             "the pinned-file identity check lives in the CUDA build; this binary cannot run it"
                 .to_string(),
         )
-    }
-}
-
-/// The pinned file's bytes from the inventory, when this build knows
-/// the pinned name (same gate as `pinned_gguf_check`).
-#[cfg(all(feature = "native-cuda", target_os = "linux"))]
-fn pinned_gguf_bytes(inspection: &ModelInspection) -> Option<u64> {
-    use crate::family::qwen::qwen36::cuda::start::GGUF_NAME;
-    inspection
-        .gguf_files
-        .iter()
-        .find(|fact| fact.file == GGUF_NAME)
-        .map(|fact| fact.file_bytes)
-}
-
-#[cfg(not(all(feature = "native-cuda", target_os = "linux")))]
-fn pinned_gguf_bytes(_inspection: &ModelInspection) -> Option<u64> {
-    None
+    };
+    (check, None)
 }
 
 fn q36_dimensions(
@@ -2247,6 +2255,91 @@ mod tests {
         assert!(check.detail.contains("model.gguf"), "{}", check.detail);
     }
 
+    #[test]
+    fn an_explicit_gguf_reports_its_own_embedded_tokenizer() {
+        let dir = gguf_only_directory();
+        let selected = dir.path().join("model.gguf");
+        std::fs::write(dir.path().join("a-other.gguf"), b"not a GGUF").expect("write sibling");
+        let report = super::preflight(
+            &selected,
+            &selected,
+            &Candidate::default(),
+            &cuda_facts(22 << 30),
+        )
+        .expect("report");
+        assert_eq!(report.model_dir, selected);
+        assert_eq!(report.tokenizer_dir, dir.path());
+        assert_eq!(
+            report.family.as_deref(),
+            Some(crate::family::qwen::qwen36::factory::FAMILY)
+        );
+        let tokenizer = check_named(&report, "tokenizer files");
+        assert_eq!(tokenizer.status, CheckStatus::Pass, "{}", tokenizer.detail);
+        assert!(tokenizer.detail.contains("model.gguf"));
+        assert!(
+            report
+                .checks
+                .iter()
+                .all(|check| !check.detail.contains("a-other.gguf"))
+        );
+    }
+
+    #[test]
+    fn gemma4_preflight_requires_cuda_and_bolt_identity() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        std::fs::write(
+            dir.path().join("model.gguf"),
+            crate::tokenizer::gguf::tests::tiny_gguf("gemma4", "gpt2", "raon"),
+        )
+        .expect("write the weights file");
+
+        let cuda = cuda_facts(22 << 30);
+        let mut without_cuda = cuda.clone();
+        without_cuda.backends.cuda = false;
+        for family in [Some(crate::family::gemma::gemma4::FAMILY.to_owned()), None] {
+            let candidate = Candidate {
+                family,
+                ..Candidate::default()
+            };
+            let check = |facts| {
+                super::preflight(dir.path(), dir.path(), &candidate, facts).expect("report")
+            };
+            let refused = check(&without_cuda);
+            assert_eq!(
+                refused.family.as_deref(),
+                Some(crate::family::gemma::gemma4::FAMILY)
+            );
+            assert_eq!(refused.verdict, Verdict::Unsupported);
+            assert!(!refused.verdict.servable());
+            let backend = check_named(&refused, "backend");
+            assert_eq!(backend.status, CheckStatus::Fail);
+            assert!(backend.detail.contains("this build has no CUDA engine"));
+
+            let other_gemma = check(&cuda);
+            assert_eq!(other_gemma.verdict, Verdict::Unsupported);
+            let identity = check_named(&other_gemma, "Bolt checkpoint");
+            assert_eq!(identity.status, CheckStatus::Fail);
+            assert!(identity.detail.contains("gemma4.block_count"));
+        }
+
+        std::fs::write(
+            dir.path().join("config.json"),
+            include_bytes!("../../testdata/gemma4/bolt-config.json"),
+        )
+        .expect("write Bolt configuration");
+        let candidate = Candidate {
+            family: Some(crate::family::gemma::gemma4::FAMILY.to_owned()),
+            ..Candidate::default()
+        };
+        let bolt = super::preflight(dir.path(), dir.path(), &candidate, &cuda).expect("report");
+        assert_eq!(
+            check_named(&bolt, "Bolt checkpoint").status,
+            CheckStatus::Pass
+        );
+        assert_eq!(bolt.verdict, Verdict::Experimental);
+        assert_eq!(bolt.dimensions.qualification, Qualification::Unverified);
+    }
+
     fn cuda_facts(free_vram: u64) -> super::super::probe::HardwareFacts {
         use crate::capability::Probe;
         use crate::capability::probe::{CompiledBackends, CudaFacts, HardwareFacts, HostFacts};
@@ -2437,7 +2530,10 @@ mod tests {
             &dir,
             &dir,
             &inspection,
-            &super::Candidate::default(),
+            super::Q36Inputs {
+                candidate: &Candidate::default(),
+                configured: None,
+            },
             &cuda_facts(24u64 << 30),
             Some(Backend::Cuda),
             Vec::new(),
@@ -2455,9 +2551,9 @@ mod tests {
     #[test]
     fn an_mlx_pack_passes_the_weight_format_check_without_a_gguf_file() {
         use crate::family::qwen::qwen36::settings::Backend;
-        let candidate = super::Candidate {
+        let candidate = Candidate {
             context_limit: Some(4096),
-            ..super::Candidate::default()
+            ..Candidate::default()
         };
         let report_for = |with_shard: bool| {
             let dir = tempfile::tempdir().unwrap().keep();
@@ -2472,7 +2568,10 @@ mod tests {
                 &dir,
                 &dir,
                 &inspection,
-                &candidate,
+                super::Q36Inputs {
+                    candidate: &candidate,
+                    configured: None,
+                },
                 &cuda_facts(24u64 << 30),
                 Some(Backend::Mlx),
                 Vec::new(),
@@ -2497,15 +2596,18 @@ mod tests {
         use crate::family::qwen::qwen36::settings::Backend;
         let dir = tempfile::tempdir().unwrap().keep();
         let inspection = crate::capability::inspect::inspect(&dir, &dir).unwrap();
-        let candidate = super::Candidate {
+        let candidate = Candidate {
             kv_dtype: Some("q4".to_string()),
-            ..super::Candidate::default()
+            ..Candidate::default()
         };
         let report = super::q36_preflight(
             &dir,
             &dir,
             &inspection,
-            &candidate,
+            super::Q36Inputs {
+                candidate: &candidate,
+                configured: None,
+            },
             &cuda_facts(24u64 << 30),
             Some(Backend::Cuda),
             Vec::new(),
@@ -2678,7 +2780,10 @@ mod tests {
             &dir,
             &dir,
             &inspection,
-            &super::Candidate::default(),
+            super::Q36Inputs {
+                candidate: &Candidate::default(),
+                configured: None,
+            },
             &cuda_facts(0),
             None,
             Vec::new(),
@@ -2852,9 +2957,10 @@ mod tests {
         use super::gguf_admission_check;
         let dir = tempfile::tempdir().expect("temp dir");
         let foreign = dir.path().join("Qwen3.6-35B-A3B-Q5_K_M.gguf");
-        std::fs::write(&foreign, b"").expect("write");
+        std::fs::write(&foreign, b"small").expect("write");
         // Switch off, pinned file absent: Fail naming the pinned identity and the switch.
-        let off = gguf_admission_check(dir.path(), Some("0"));
+        let (off, bytes) = gguf_admission_check(dir.path(), Some("0"));
+        assert_eq!(bytes, None);
         assert_eq!(off.name, "weight format");
         assert_eq!(off.status, super::CheckStatus::Fail);
         assert!(
@@ -2865,7 +2971,8 @@ mod tests {
         );
         // Switch unset or on, one foreign file: Pass with the admitted-checkpoint note.
         for raw in [None, Some("1")] {
-            let on = gguf_admission_check(dir.path(), raw);
+            let (on, bytes) = gguf_admission_check(dir.path(), raw);
+            assert_eq!(bytes, Some(5));
             assert_eq!(on.status, super::CheckStatus::Pass);
             assert!(
                 on.detail.contains("Q5_K_M") && on.detail.contains("Q36_ALLOW_UNPINNED_GGUF=0"),
@@ -2874,13 +2981,36 @@ mod tests {
             );
         }
         // A bad spelling: Fail before any selection, naming the refusal.
-        let bad = gguf_admission_check(dir.path(), Some("yes"));
+        let (bad, bytes) = gguf_admission_check(dir.path(), Some("yes"));
+        assert_eq!(bytes, None);
         assert_eq!(bad.status, super::CheckStatus::Fail);
         assert!(bad.detail.contains("must be 0 or 1"), "{}", bad.detail);
         // Two candidates: the larger file is the one the loader serves.
         std::fs::write(dir.path().join("Qwen3.6-35B-A3B-Q8_0.gguf"), b"larger").expect("write");
-        let many = gguf_admission_check(dir.path(), Some("1"));
+        let (many, bytes) = gguf_admission_check(dir.path(), Some("1"));
         assert_eq!(many.status, super::CheckStatus::Pass);
+        assert_eq!(bytes, Some(6));
         assert!(many.detail.contains("Q8_0"), "{}", many.detail);
+
+        let preferred = dir
+            .path()
+            .join(crate::family::qwen::qwen36::cuda::start::GGUF_NAME);
+        std::fs::write(preferred, b"p").expect("write preferred file");
+        assert_eq!(gguf_admission_check(dir.path(), Some("1")).1, Some(1));
+        assert_eq!(gguf_admission_check(&foreign, Some("1")).1, Some(5));
+    }
+
+    #[cfg(all(feature = "native-cuda", target_os = "linux"))]
+    #[test]
+    fn a_selected_split_gguf_counts_only_its_shards() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let first = dir.path().join("model-00001-of-00002.gguf");
+        std::fs::write(&first, b"abc").expect("first shard");
+        std::fs::write(dir.path().join("model-00002-of-00002.gguf"), b"defg")
+            .expect("second shard");
+        std::fs::write(dir.path().join("other.gguf"), b"unrelated").expect("unrelated checkpoint");
+        let (check, bytes) = super::gguf_admission_check(&first, None);
+        assert_eq!(check.status, CheckStatus::Pass);
+        assert_eq!(bytes, Some(7));
     }
 }

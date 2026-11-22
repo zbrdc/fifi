@@ -411,9 +411,19 @@ fn engine_input(
             .as_ref()
             .and_then(|options| options.prefill_rows),
     };
-    let preflight =
-        preflight::preflight(&engine.model_dir, &engine.tokenizer_dir, &candidate, facts)
-            .map_err(|error| super::describe_error(&error));
+    let qwen_gguf = engine.qwen36.as_ref().filter(|options| {
+        facts.backends.cuda
+            && engine.family == crate::family::qwen::qwen36::factory::FAMILY
+            && matches!(options.weight_format.as_deref(), None | Some("gguf"))
+    });
+    let preflight = preflight::preflight_with_q36_options(
+        &engine.model_dir,
+        &engine.tokenizer_dir,
+        &candidate,
+        facts,
+        qwen_gguf,
+    )
+    .map_err(|error| super::describe_error(&error));
     let env = crate::family::qwen::qwen36::settings::Q36Env::from_process(&engine.model_dir);
     let effective = effective_rows(engine, &env);
     EngineInput {
@@ -581,7 +591,7 @@ mod tests {
         write_bundle,
     };
     use crate::capability::Probe;
-    use crate::capability::preflight::{self, Candidate};
+    use crate::capability::preflight::{self, Candidate, CheckStatus};
     use crate::capability::probe::{CompiledBackends, CudaFacts, HardwareFacts, HostFacts};
     use serde_json::{Value, json};
     use std::os::unix::fs::symlink;
@@ -1066,6 +1076,52 @@ mod tests {
                 .detail
                 .contains("the device's free memory could not be probed")
         }));
+    }
+
+    #[test]
+    fn bundle_preflight_resolves_the_configured_qwen_gguf_options() {
+        let model = q36_dir();
+        let config_path = model.path().join("engine.json");
+        let config = json!({
+            "listen": "127.0.0.1:18080",
+            "api_key_env": "UNUSED_BUNDLE_TEST_KEY",
+            "engines": [{
+                "id": "q36", "family": "qwen3_6_35b_a3b",
+                "model_dir": model.path(), "tokenizer_dir": model.path(),
+                "qwen36": {"weight_format": "gguf", "context_limit": 8192, "kv_dtype": "q8",
+                           "gguf_sha256": "not-a-content-pin"}
+            }]
+        });
+        std::fs::write(&config_path, config.to_string()).expect("write config");
+        let mut config = crate::server::config::Config::from_file(&config_path).expect("config");
+        let engine = &mut config.engines[0];
+        let mut facts = synthetic_facts();
+        facts.backends.cuda = true;
+        let settings_check = |engine: &crate::server::config::EngineConfig| {
+            super::engine_input(engine, &facts)
+                .preflight
+                .expect("report")
+                .checks
+                .into_iter()
+                .find(|check| check.name == "settings")
+                .expect("settings check")
+        };
+        let invalid = settings_check(&*engine);
+        assert_eq!(invalid.status, CheckStatus::Fail);
+        assert!(
+            invalid
+                .detail
+                .contains("gguf_sha256 must contain exactly 64 hex digits")
+        );
+
+        engine.qwen36.as_mut().expect("options").gguf_sha256 = Some("ab".repeat(32));
+        let valid = settings_check(&*engine);
+        assert_eq!(valid.status, CheckStatus::Pass, "{}", valid.detail);
+        assert!(
+            valid.detail.contains("context 8192, kv_dtype q8"),
+            "{}",
+            valid.detail
+        );
     }
 
     #[test]
