@@ -329,7 +329,7 @@ fn launch_needs(g: &MmidGeometry, nsm: c_int) -> Option<[usize; 6]> {
         int(g.ncols_max)?,
     );
     // The last row's last k tile reads to `k_read(k)`, past the stack's last row.
-    let last_row = k_read(int(g.ncols_x)?) / quant.block_size();
+    let last_row = k_read(int(g.ncols_x)?)? / quant.block_size();
     let blocks = (e.checked_sub(1)?.checked_mul(int(g.stride_channel_x)?)?)
         .checked_add(n.checked_sub(1)?.checked_mul(int(g.stride_row_x)?)?)?
         .checked_add(last_row)?;

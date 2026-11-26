@@ -800,7 +800,9 @@ fn mmq_weight(
         return None;
     };
     let quant = QuantType::from_gguf(kind).filter(|&quant| MmqType::of(quant).is_some())?;
-    if !k.is_multiple_of(quant.block_size()) || weight_tail(quant, k) > WEIGHT_TAIL_BYTES {
+    if !k.is_multiple_of(quant.block_size())
+        || weight_tail(quant, k).is_none_or(|tail| tail > WEIGHT_TAIL_BYTES)
+    {
         return None;
     }
     let stride_bytes = quant.weight_bytes(n, k)?;

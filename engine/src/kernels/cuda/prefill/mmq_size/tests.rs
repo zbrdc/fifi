@@ -721,15 +721,14 @@ fn the_weight_tail_holds_every_last_k_tile() {
         let worst = (K_GRID / qk - 1) * quant.block_bytes();
         assert!(worst <= WEIGHT_TAIL_BYTES, "{ty:?}: {worst}");
         for k in (qk..=4 * K_GRID).step_by(qk) {
-            assert!(weight_tail(quant, k) <= worst, "{ty:?} {k}");
-            assert_eq!(
-                weight_tail(quant, k) == 0,
-                k.is_multiple_of(K_GRID),
-                "{ty:?} {k}"
-            );
-            assert_eq!(k_read(k), k.next_multiple_of(K_GRID));
+            let tail = weight_tail(quant, k).unwrap();
+            assert!(tail <= worst, "{ty:?} {k}");
+            assert_eq!(tail == 0, k.is_multiple_of(K_GRID), "{ty:?} {k}");
+            assert_eq!(k_read(k), Some(k.next_multiple_of(K_GRID)));
         }
     }
     // Inkling's expert down rows: 1,152 IQ4_NL values read to 1,280, four blocks of 18 bytes.
-    assert_eq!(weight_tail(QuantType::Iq4Nl, 1_152), 72);
+    assert_eq!(weight_tail(QuantType::Iq4Nl, 1_152), Some(72));
+    assert_eq!(k_read(usize::MAX), None);
+    assert_eq!(weight_tail(QuantType::Iq4Nl, usize::MAX), None);
 }

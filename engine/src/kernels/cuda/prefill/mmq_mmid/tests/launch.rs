@@ -304,7 +304,7 @@ fn mmq_mmid_expert_down_rows_off_the_k_tile_stay_within_the_frozen_bound() {
             gather: true,
         };
         let weights = expert_blocks(quant, shape.n_experts, n, k, 0x1154);
-        let tail = weight_tail(quant, k);
+        let tail = weight_tail(quant, k).unwrap();
         assert!(tail > 0 && tail <= WEIGHT_TAIL_BYTES, "{quant:?}: {tail}");
         let mut with_tail = weights.clone();
         with_tail.resize(weights.len() + WEIGHT_TAIL_BYTES, 0);

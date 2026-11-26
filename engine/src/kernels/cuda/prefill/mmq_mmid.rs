@@ -484,7 +484,7 @@ impl MmidLaunchShape {
     fn weight_blocks(&self) -> usize {
         (self.ids.n_experts - 1) * self.stride_blocks()
             + (self.n - 1) * self.row_blocks()
-            + k_read(self.k) / self.quant.block_size()
+            + k_read(self.k).expect("check_launch_shape bounds K") / self.quant.block_size()
     }
 
     /// The dst floats the launch writes, after [`check_launch_shape`].

@@ -45,15 +45,16 @@ pub(crate) const K_GRID: usize = 256;
 pub(crate) const WEIGHT_TAIL_BYTES: usize = 256;
 
 /// The k values the GEMM reads of each row and the q8_1 buffer holds of each column: `k` up to
-/// the next multiple of [`K_GRID`]; the quantize writes zeros past `k`.
-pub(crate) fn k_read(k: usize) -> usize {
-    k.next_multiple_of(K_GRID)
+/// the next multiple of [`K_GRID`]; the quantize writes zeros past `k`. `None` when the rounding
+/// overflows.
+pub(crate) fn k_read(k: usize) -> Option<usize> {
+    k.checked_next_multiple_of(K_GRID)
 }
 
 /// The weight bytes past `k` that the last k tile of a row of `quant` reads (0 when `k` is on
-/// the k grid).
-pub(crate) fn weight_tail(quant: QuantType, k: usize) -> usize {
-    (k_read(k) - k) / quant.block_size() * quant.block_bytes()
+/// the k grid); `None` when [`k_read`] overflows.
+pub(crate) fn weight_tail(quant: QuantType, k: usize) -> Option<usize> {
+    Some((k_read(k)? - k) / quant.block_size() * quant.block_bytes())
 }
 pub(crate) const Q8_1_BLOCK_BYTES: usize = 144;
 /// The PAD's rounding granularity, a deliberate over-bound: the y-tile copies' own loop steps
@@ -551,8 +552,9 @@ pub(crate) fn q8_1_bytes(k: usize, ncols: usize) -> Result<usize, EngError> {
     if k == 0 || ncols == 0 {
         return Err(rule("zero extent", "K and ncols must be at least 1"));
     }
-    (k_read(k) / QK8_1_MMQ)
-        .checked_mul(ncols)
+    k_read(k)
+        .map(|k| k / QK8_1_MMQ)
+        .and_then(|blocks| blocks.checked_mul(ncols))
         .and_then(|blocks| blocks.checked_mul(Q8_1_BLOCK_BYTES))
         .and_then(|bytes| bytes.checked_add(Q8_1_PAD))
         .ok_or_else(|| rule("size overflow", "the q8_1 scratch size overflows"))
