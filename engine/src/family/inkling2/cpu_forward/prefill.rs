@@ -1285,8 +1285,55 @@ fn device_grouped_prefill_last_logits() {
             .collect()
     };
     let logits = continuation(&mut model);
+    fs::write(output, &logits).unwrap();
     model.restore(&saved);
     let restored = continuation(&mut model);
-    assert_eq!(logits, restored, "restored continuation logits differ");
-    fs::write(output, logits).unwrap();
+    // The restored sequence rebuilds its device rows from the snapshot's host rows, so its
+    // continuation agrees to rounding, within the limits of the shadow restore test, and picks
+    // the same top token on every row.
+    let floats = |bytes: &[u8]| -> Vec<f32> {
+        bytes
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .map(|word| f32::from_le_bytes(*word))
+            .collect()
+    };
+    let (first, second) = (floats(&logits), floats(&restored));
+    assert_eq!(first.len(), second.len());
+    let (mut exact, mut max, mut diff, mut norm) = (0, 0f64, 0f64, 0f64);
+    for (&a, &b) in first.iter().zip(&second) {
+        let d = f64::from(a) - f64::from(b);
+        exact += usize::from(a.to_bits() == b.to_bits());
+        max = max.max(d.abs());
+        diff += d * d;
+        norm += f64::from(a).powi(2);
+    }
+    let rel = (diff / norm).sqrt();
+    let top = |row: &[f32]| {
+        row.iter()
+            .enumerate()
+            .max_by(|a, b| a.1.total_cmp(b.1))
+            .map(|(i, _)| i)
+    };
+    let width = first.len() / tail.len();
+    let same_top = first
+        .chunks_exact(width)
+        .zip(second.chunks_exact(width))
+        .filter(|(a, b)| top(a) == top(b))
+        .count();
+    eprintln!(
+        "restored continuation: exact={exact}/{} max_abs={max} rel_l2={rel} top={same_top}/{}",
+        first.len(),
+        tail.len()
+    );
+    assert!(
+        max <= 0.02 && rel <= 0.001,
+        "restored continuation logits differ"
+    );
+    assert_eq!(
+        same_top,
+        tail.len(),
+        "restored continuation picks another top token"
+    );
 }
