@@ -443,6 +443,8 @@ impl CpuForward {
             }
         }
         let bytes: Vec<u8> = words.iter().flat_map(|w| w.to_ne_bytes()).collect();
-        prompt.constants.write_at(&prompt.stream, 0, &bytes)
+        // Queued behind the previous visit's reads on the prompt stream; the controllers on
+        // their own stream read the constants only after the prompt stream's next synchronize.
+        prompt.constants.write_at_enqueue(&prompt.stream, 0, &bytes)
     }
 }

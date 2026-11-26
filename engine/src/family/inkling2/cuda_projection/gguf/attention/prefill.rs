@@ -570,10 +570,12 @@ impl ResidentAttention {
         for row in prior.iter().rev() {
             extend_words(&mut upload, row);
         }
-        raw.write_at(&self.stream, 0, &upload)?;
+        // Queued: only kernels on this stream read the history and the weights, and a pageable
+        // source is consumed before the call returns.
+        raw.write_at_enqueue(&self.stream, 0, &upload)?;
         upload.clear();
         extend_words(&mut upload, weights);
-        kernel.write_at(&self.stream, 0, &upload)?;
+        kernel.write_at_enqueue(&self.stream, 0, &upload)?;
         Ok(Some(PrefillConv {
             raw,
             convolved,
@@ -626,7 +628,7 @@ impl ResidentAttention {
         }
         status
             .buffer()
-            .write_at(&self.stream, status.offset(), &health)?;
+            .zero_at(&self.stream, status.offset(), health.len())?;
         context.inkling_output_conv(
             &self.stream,
             [destination.raw, past, weight, output, status],
