@@ -24,11 +24,14 @@ use crate::{
             dense_gemv::DenseDtype,
             inkling_conv::ConvCall,
             inkling_local_prep::PrepMath,
-            inkling_stream::{AddCall, MAX_BLOCKS, MixCall, MixShape, SealCall, StreamShape},
+            inkling_stream::{
+                MAX_BLOCKS, MixCall, MixJob, MixNorm, MixShape, SealCall, StreamShape,
+            },
         },
     },
 };
 
+mod baseline;
 #[cfg(test)]
 mod pair;
 mod token;
@@ -121,6 +124,8 @@ struct Layout {
     attention_out: Region,
     mlp_input: Region,
     mlp_conv: Region,
+    /// The plain visits' MLP input: the norm the depth mix writes itself.
+    mlp_normed: Region,
     bytes: usize,
 }
 
@@ -159,6 +164,16 @@ impl Layout {
             attention_out: take(h),
             mlp_input: take(h),
             mlp_conv: take(h),
+            mlp_normed: if Switch::DecodeGlue.on() {
+                // Fused norm feeds the same vector-load GEMV as messages above.
+                let span = take(h + 3);
+                Region {
+                    start: span.start.next_multiple_of(16),
+                    bytes: h * WORD,
+                }
+            } else {
+                take(0)
+            },
             bytes: end,
         }
     }
@@ -634,9 +649,15 @@ impl Execution<'_> {
     }
 
     fn enqueue(&self, cuda: &GgufCuda, position: usize) -> Result<(), EngError> {
+        if !self.context.dense_group_policy().decode_glue {
+            return self.enqueue_baseline(cuda, position);
+        }
         let l = self.layout;
         let shape = self.plan.shape;
-        let (depth, bank) = ((l.depth, 0), (l.bank, shape.bank_first));
+        let width = shape.widths.hidden;
+        // The bank queries and the attention query read different stream states (the bank and
+        // the depth), so one launch holds a block per mix and they run in parallel.
+        let mut jobs = Vec::with_capacity(5);
         for (query, out) in self
             .weights
             .bank_queries
@@ -644,20 +665,84 @@ impl Execution<'_> {
             .flatten()
             .zip(l.messages)
         {
-            self.mix(bank, shape.bank_blocks, query, out)?;
+            jobs.push(MixJob {
+                state: self.row(l.bank.row((shape.bank_blocks + 1) * width))?,
+                query: self.weights.row(query)?,
+                out: self.row(out)?,
+                health: self.row(l.glue_health)?,
+                addend: None,
+                norm: None,
+                first_block: shape.bank_first,
+                blocks: shape.bank_blocks,
+            });
         }
         let input = match self.weights.attention_query {
             Some(query) => {
-                self.mix(depth, shape.blocks, query, l.attention_input)?;
+                jobs.push(MixJob {
+                    state: self.row(l.depth.row((shape.blocks + 1) * width))?,
+                    query: self.weights.row(query)?,
+                    out: self.row(l.attention_input)?,
+                    health: self.row(l.glue_health)?,
+                    addend: None,
+                    norm: None,
+                    first_block: 0,
+                    blocks: shape.blocks,
+                });
                 l.attention_input
             }
-            None => l.depth.row(shape.widths.hidden),
+            None => l.depth.row(width),
         };
+        if !jobs.is_empty() {
+            self.context
+                .inkling_stream_mix_jobs(self.stream, &jobs, (width, MIX_EPS))?;
+        }
         self.attention(cuda, position, input)?;
-        let blocks = self.advance_depth()?;
-        self.mix(depth, blocks, self.weights.mlp_query, l.mlp_input)?;
-        self.mlp(cuda)?;
-        self.add(l.mlp_conv)
+        let plain = self.weights.attention_query.is_none();
+        let (blocks, addend) = self.advance_depth()?;
+        let addend = match addend {
+            Some(region) => Some(self.row(region)?),
+            None => None,
+        };
+        if plain {
+            // The depth mix adds the attention output itself (the host's add) and writes the
+            // weighted norm of its output, so the plain MLP reads that row without a norm launch.
+            self.context.inkling_stream_mix_jobs(
+                self.stream,
+                &[MixJob {
+                    state: self.row(l.depth.row((blocks + 1) * width))?,
+                    query: self.weights.row(self.weights.mlp_query)?,
+                    out: self.row(l.mlp_input)?,
+                    health: self.row(l.glue_health)?,
+                    addend,
+                    norm: Some(MixNorm {
+                        gamma: self.weights.row(self.weights.mlp[0])?,
+                        normed: self.row(l.mlp_normed)?,
+                        eps: self.plan.math.eps,
+                    }),
+                    first_block: 0,
+                    blocks,
+                }],
+                (width, MIX_EPS),
+            )?;
+            return self.mlp(cuda, l.mlp_normed);
+        }
+        // A controlled visit without a seal: its depth mix takes the attention output as the
+        // addend too.
+        self.context.inkling_stream_mix_jobs(
+            self.stream,
+            &[MixJob {
+                state: self.row(l.depth.row((blocks + 1) * width))?,
+                query: self.weights.row(self.weights.mlp_query)?,
+                out: self.row(l.mlp_input)?,
+                health: self.row(l.glue_health)?,
+                addend,
+                norm: None,
+                first_block: 0,
+                blocks,
+            }],
+            (width, MIX_EPS),
+        )?;
+        self.mlp(cuda, l.mlp_input)
     }
 
     fn mix(
@@ -757,12 +842,13 @@ impl Execution<'_> {
         cuda.enqueue_local_decode(self.stream, request)
     }
 
-    fn advance_depth(&self) -> Result<usize, EngError> {
+    /// Seal or leave the depth stream alone after the attention; a visit without a seal gets
+    /// the attention output back as the addend of its depth mix instead of an add launch.
+    fn advance_depth(&self) -> Result<(usize, Option<Region>), EngError> {
         let shape = self.plan.shape;
         let l = self.layout;
         if !shape.seal {
-            self.add(l.attention_out)?;
-            return Ok(shape.blocks);
+            return Ok((shape.blocks, Some(l.attention_out)));
         }
         self.context.inkling_stream_seal(
             self.stream,
@@ -777,27 +863,15 @@ impl Execution<'_> {
                 eps: MIX_EPS,
             },
         )?;
-        Ok(shape.blocks + 1)
+        Ok((shape.blocks + 1, None))
     }
 
-    fn add(&self, addend: Region) -> Result<(), EngError> {
-        let width = self.plan.shape.widths.hidden;
-        self.context.inkling_stream_add(
-            self.stream,
-            AddCall {
-                state: self.row(self.layout.depth.row(width))?,
-                row: self.row(addend)?,
-                health: self.row(self.layout.glue_health)?,
-            },
-            width,
-        )
-    }
-
-    fn mlp(&self, cuda: &GgufCuda) -> Result<(), EngError> {
+    fn mlp(&self, cuda: &GgufCuda, normed: Region) -> Result<(), EngError> {
         let l = self.layout;
         let [gamma, bias, conv] = self.weights.mlp;
+        let plain = self.weights.attention_query.is_none();
         let controls = &self.plan.controls;
-        let request = ResidentMlpRequest {
+        let mut request = ResidentMlpRequest {
             layer: self.plan.visit.weight_layer as u32,
             caps: controls.caps,
             scale: controls.scale,
@@ -813,20 +887,27 @@ impl Execution<'_> {
             health: self.row(l.mlp_health)?,
             gate_health: self.row(l.glue_health)?,
             status: self.row(l.mlp_status)?,
+            pre_normed: None,
         };
         if self.plan.shape.banked {
             cuda.enqueue_controlled_mlp(self.stream, request)?;
+        } else if plain {
+            let normed = self.row(normed)?;
+            request.pre_normed = Some(normed);
+            cuda.enqueue_plain_mlp(self.stream, request)?;
         } else {
             cuda.enqueue_plain_mlp(self.stream, request)?;
         }
         let shape = self.plan.shape.widths;
         self.context.inkling_conv(
             self.stream,
+            // The convolution adds its row into the depth stream's current row itself.
             ConvCall {
                 input: self.row(l.mlp_raw)?,
                 kernel: self.weights.row(conv)?,
                 history: self.row(l.histories[3])?,
                 out: self.row(l.mlp_conv)?,
+                state: Some(self.row(l.depth.row(shape.hidden))?),
                 health: self.row(l.glue_health)?,
             },
             (shape.hidden, shape.taps),

@@ -10,9 +10,12 @@ constexpr int kWidth = 128, kTaps = 4;
 // Largest row the Rust wrappers pass to inkling_weighted_norm.
 constexpr int kMaxNormWidth = 4096;
 
+// The weight rows and the K/V conv histories are the caller's ranges: nothing is staged. The
+// kernel shifts `past_k` / `past_v` in place.
 struct Args {
     float *q, *relative, *raw_k, *raw_v, *k, *v, *sinks, *gates;
-    float *aux;
+    const float *q_scale, *rel_scale, *kernel_k, *kernel_v;
+    float *past_k, *past_v;
     uint32_t *status;
     int queries, kv, dims, history;
     float qk_limit, rel_limit, eps;
@@ -24,12 +27,9 @@ __global__ void inkling_local_prep(Args a) {
     __shared__ float squares[kWidth], scale;
     const int d = threadIdx.x;
     int head = blockIdx.x;
-    const int q_words = a.queries * kWidth;
-    const int rel_words = a.queries * a.dims;
     const int kv_words = a.kv * kWidth;
-    const float *q_scale = a.aux + 1; // first word is the attention position
-    const float *rel_scale = q_scale + q_words;
-    const float *kernels = rel_scale + rel_words;
+    const float *q_scale = a.q_scale;
+    const float *rel_scale = a.rel_scale;
     float *output;
     float x = 0.f;
     bool valid = true;
@@ -54,8 +54,8 @@ __global__ void inkling_local_prep(Args a) {
         const int at = (head - plane * a.kv) * kWidth + d;
         output = (rms ? a.v : a.k) + at;
         const float raw = (rms ? a.raw_v : a.raw_k)[at];
-        const float *w = kernels + (plane * kv_words + at) * kTaps;
-        float *past = a.aux + 1 + q_words + rel_words + (2 * kTaps + plane * (kTaps - 1)) * kv_words;
+        const float *w = (plane ? a.kernel_v : a.kernel_k) + at * kTaps;
+        float *past = plane ? a.past_v : a.past_k;
         float conv = __fmul_rn(w[kTaps - 1], raw);
         for (int lag = 1; lag <= a.history; ++lag) {
             conv = __fadd_rn(conv, __fmul_rn(w[kTaps - 1 - lag], past[(lag - 1) * kv_words + at]));
@@ -199,6 +199,80 @@ __global__ void inkling_weighted_norm(const float *input, const float *gamma,
     if (lane == 0) status[row] = failed ? 1.f : 0.f;
 }
 
+// Parallel form for the launch-only chain (`inference_cuda_inkling_weighted_norm_reduced`).
+// Each thread adds every kNormThreads-th square in row order, a warp adds its lanes in tree
+// order and thread-ordered warp partials are then added in warp order. The sum is therefore
+// not the host's ordered sum: the scale agrees with the host within floating-point error, like
+// the depth stream kernels. Four loads are in flight per thread so the row's latency is paid
+// once per pass, not once per add.
+constexpr int kNormThreads = 256;
+constexpr int kNormWarps = kNormThreads / 32;
+
+__device__ __forceinline__ float square_sum(const float *x, int width, int &invalid) {
+    float squares = 0.f;
+    int i = threadIdx.x;
+    for (; i + 3 * kNormThreads < width; i += 4 * kNormThreads) {
+        float value[4];
+        #pragma unroll
+        for (int u = 0; u < 4; ++u) value[u] = x[i + u * kNormThreads];
+        #pragma unroll
+        for (int u = 0; u < 4; ++u) {
+            invalid |= !isfinite(value[u]);
+            squares = __fadd_rn(squares, __fmul_rn(value[u], value[u]));
+        }
+    }
+    for (; i < width; i += kNormThreads) {
+        const float value = x[i];
+        invalid |= !isfinite(value);
+        squares = __fadd_rn(squares, __fmul_rn(value, value));
+    }
+    return squares;
+}
+
+__global__ void inkling_weighted_norm_reduced(const float *input, const float *gamma,
+    float *output, float *status, int width, float eps) {
+    __shared__ float partials[kNormWarps];
+    const int row = blockIdx.x;
+    const int lane = threadIdx.x;
+    const float *x = input + row * width;
+    int invalid = 0;
+    float squares = square_sum(x, width, invalid);
+    #pragma unroll
+    for (int offset = 16; offset > 0; offset >>= 1) {
+        squares = __fadd_rn(squares, __shfl_xor_sync(0xffffffffu, squares, offset));
+    }
+    if ((lane & 31) == 0) partials[lane >> 5] = squares;
+    __syncthreads();
+    // The same tree for every thread: the scale is one value for the whole block.
+    float total = 0.f;
+    for (int w = 0; w < kNormWarps; ++w) total = __fadd_rn(total, partials[w]);
+    const float root = __fsqrt_rn(__fadd_rn(__fdiv_rn(total, float(width)), eps));
+    invalid |= !isfinite(total) || !isfinite(root);
+    const float scale = isfinite(root) ? __frcp_rn(root) : __int_as_float(0x7fc00000);
+    int i = lane;
+    for (; i + 3 * kNormThreads < width; i += 4 * kNormThreads) {
+        float value[4], weight[4];
+        #pragma unroll
+        for (int u = 0; u < 4; ++u) {
+            value[u] = x[i + u * kNormThreads];
+            weight[u] = gamma[i + u * kNormThreads];
+        }
+        #pragma unroll
+        for (int u = 0; u < 4; ++u) {
+            const float result = __fmul_rn(__fmul_rn(value[u], scale), weight[u]);
+            output[row * width + i + u * kNormThreads] = result;
+            invalid |= !isfinite(result);
+        }
+    }
+    for (; i < width; i += kNormThreads) {
+        const float result = __fmul_rn(__fmul_rn(x[i], scale), gamma[i]);
+        output[row * width + i] = result;
+        invalid |= !isfinite(result);
+    }
+    const int failed = __syncthreads_or(invalid);
+    if (lane == 0) status[row] = failed ? 1.f : 0.f;
+}
+
 // One CTA per token, with ordered accumulation matching Rust's depth RMSNorm.
 // The raw result feeds the residual stream; the normalized plane feeds depth.
 __global__ void inkling_depth_current(const float *prior, const float *attention,
@@ -252,6 +326,17 @@ __global__ void inkling_depth_mix(const float *planes, const float *weights,
 extern "C" int inference_cuda_inkling_weighted_norm(void *const *p, int rows, int width,
     float eps, void *stream, int *out_stage) {
     inkling_weighted_norm<<<rows, 128, 0, (cudaStream_t)stream>>>(
+        static_cast<const float *>(p[0]), static_cast<const float *>(p[1]),
+        static_cast<float *>(p[2]), static_cast<float *>(p[3]), width, eps);
+    Failure failure;
+    failure.record(cudaGetLastError(), INFERENCE_CUDA_STAGE_LAUNCH);
+    report_stage(out_stage, failure.stage);
+    return (int)failure.err;
+}
+
+extern "C" int inference_cuda_inkling_weighted_norm_reduced(void *const *p, int rows, int width,
+    float eps, void *stream, int *out_stage) {
+    inkling_weighted_norm_reduced<<<rows, kNormThreads, 0, (cudaStream_t)stream>>>(
         static_cast<const float *>(p[0]), static_cast<const float *>(p[1]),
         static_cast<float *>(p[2]), static_cast<float *>(p[3]), width, eps);
     Failure failure;
@@ -328,7 +413,10 @@ extern "C" int inference_cuda_inkling_local_prep(void *const *p, int queries, in
               static_cast<float *>(p[2]), static_cast<float *>(p[3]),
               static_cast<float *>(p[4]), static_cast<float *>(p[5]),
               static_cast<float *>(p[6]), static_cast<float *>(p[7]),
-              static_cast<float *>(p[8]), static_cast<uint32_t *>(p[9]),
+              static_cast<const float *>(p[8]), static_cast<const float *>(p[9]),
+              static_cast<const float *>(p[10]), static_cast<const float *>(p[11]),
+              static_cast<float *>(p[12]), static_cast<float *>(p[13]),
+              static_cast<uint32_t *>(p[14]),
               queries, kv, dims, history, qk_limit, rel_limit, eps};
     inkling_local_prep<<<2 * (queries + kv), kWidth, 0, (cudaStream_t)stream>>>(args);
     Failure failure;

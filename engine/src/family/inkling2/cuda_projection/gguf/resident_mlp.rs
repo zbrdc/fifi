@@ -46,6 +46,9 @@ pub(in crate::family::inkling2) struct ResidentMlpRequest<'a> {
     pub health: DeviceRange<'a>,
     pub gate_health: DeviceRange<'a>,
     pub status: DeviceRange<'a>,
+    /// The plain MLP only: the weighted norm of `input`, already on the device, so the MLP
+    /// skips its own norm launch and reads this row instead.
+    pub pre_normed: Option<DeviceRange<'a>>,
 }
 
 /// What `routed_expert_group` resolves for the router and the experts of one layer.
@@ -67,6 +70,33 @@ fn require_packed(dtypes: [DenseDtype; 2]) -> Result<(), EngError> {
 }
 
 impl GgufCuda {
+    pub(in crate::family::inkling2) fn enqueue_device_routed_prefill(
+        &self,
+        stream: &DeviceStream,
+        layer: u32,
+        rows: crate::kernels::cuda::resident::dense_gemv::routed_prefill::DeviceRoutedPrefill<'_>,
+        dtypes: [DenseDtype; 2],
+        caps: [f32; 2],
+    ) -> Result<Option<()>, EngError> {
+        let r = self.routed(layer)?;
+        if (r.moe.experts, r.moe.hidden, r.moe.middle, r.shape.top_k) != (128, 2304, 1152, 8) {
+            return Ok(None);
+        }
+        let [Some(g), Some(d)] = dtypes.map(|t| match t {
+            DenseDtype::PackedGguf(k) => Some(k.id()),
+            DenseDtype::GgufNvfp4 => Some(40),
+            _ => None,
+        }) else {
+            return Ok(None);
+        };
+        if !matches!(g, 16 | 17 | 19 | 22) || !matches!(d, 40 | 42) {
+            return Ok(None);
+        }
+        self.context
+            .routed_prefill(stream, rows, r.stacks, r.scales, [g, d], caps)?;
+        Ok(Some(()))
+    }
+
     fn routed(&self, layer: u32) -> Result<Routed<'_>, EngError> {
         let name = format!("model.llm.layers.{layer}.mlp.gate.weight");
         let Some((router, DenseDtype::F32)) = self.dense.get(&name) else {
@@ -145,6 +175,7 @@ impl GgufCuda {
             health,
             gate_health,
             status,
+            pre_normed: _,
         } = request;
         require_packed(dtypes)?;
         let routed = self.routed(layer)?;
@@ -202,17 +233,23 @@ impl GgufCuda {
     ) -> Result<(), EngError> {
         require_packed(r.dtypes)?;
         let routed = self.routed(r.layer)?;
-        self.context.enqueue_row_weighted_norm(
-            stream,
-            [r.input, r.gamma, r.message, r.health],
-            routed.shape.hidden,
-            r.eps,
-        )?;
+        let x = match r.pre_normed {
+            Some(normed) => normed,
+            None => {
+                self.context.enqueue_row_weighted_norm(
+                    stream,
+                    [r.input, r.gamma, r.message, r.health],
+                    routed.shape.hidden,
+                    r.eps,
+                )?;
+                r.message
+            }
+        };
         self.enqueue_routed(
             stream,
             &routed,
             (r.dtypes, (r.caps, r.scale)),
-            [r.message, r.bias, r.status, r.out],
+            [x, r.bias, r.status, r.out],
         )
     }
 

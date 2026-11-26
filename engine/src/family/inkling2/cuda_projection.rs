@@ -28,7 +28,7 @@ use crate::{
 
 mod dense;
 pub(super) mod gguf;
-mod q8_row_reuse;
+pub(in crate::family::inkling2) mod q8_row_reuse;
 
 use dense::{DensePlan, DenseStep};
 
@@ -118,7 +118,9 @@ fn expert_stacks(weights: &Weights, layer: usize) -> Result<[ExpertStack<'_>; 2]
 pub(super) fn dense_group_policy() -> crate::kernels::cuda::resident::dense_gemv::DenseGroupPolicy {
     crate::kernels::cuda::resident::dense_gemv::DenseGroupPolicy {
         decode_split: Switch::DecodeSplit.on(),
+        decode_glue: Switch::DecodeGlue.on(),
         weight_visit: Switch::PrefillQ8Visit.on(),
+        prefill_tensor_gemm: Switch::PrefillTensorGemm.on(),
     }
 }
 
@@ -264,9 +266,9 @@ fn stages(spec: &TextSpec) -> Result<Vec<Stage>, EngError> {
         .collect()
 }
 
-struct Resident {
-    codes: DeviceBuffer,
-    shape: [usize; 2],
+pub(in crate::family::inkling2) struct Resident {
+    pub(in crate::family::inkling2) codes: DeviceBuffer,
+    pub(in crate::family::inkling2) shape: [usize; 2],
 }
 
 struct PackedBuffers {

@@ -20,6 +20,14 @@ unsafe extern "C" {
         stream: *mut c_void,
         stage: *mut c_int,
     ) -> c_int;
+    fn inference_cuda_inkling_weighted_norm_reduced(
+        ranges: *const *mut c_void,
+        rows: c_int,
+        width: c_int,
+        eps: f32,
+        stream: *mut c_void,
+        stage: *mut c_int,
+    ) -> c_int;
     fn inference_cuda_inkling_depth_current(
         ranges: *const *mut c_void,
         rows: c_int,
@@ -69,7 +77,17 @@ unsafe extern "C" {
     ) -> c_int;
 }
 
-pub(in crate::kernels::cuda) fn weighted_norm(
+type NormEntry = unsafe extern "C" fn(
+    ranges: *const *mut c_void,
+    rows: c_int,
+    width: c_int,
+    eps: f32,
+    stream: *mut c_void,
+    stage: *mut c_int,
+) -> c_int;
+
+fn weighted_norm_on(
+    entry: NormEntry,
     stream: &RawStream,
     ranges: [RawRange<'_>; 4],
     [rows, width]: [usize; 2],
@@ -90,7 +108,7 @@ pub(in crate::kernels::cuda) fn weighted_norm(
     let mut stage = STAGE_NONE;
     // SAFETY: validated bounding geometry and disjoint, aligned regions.
     let status = unsafe {
-        inference_cuda_inkling_weighted_norm(
+        entry(
             pointers.as_ptr(),
             rows as c_int,
             width as c_int,
@@ -100,6 +118,38 @@ pub(in crate::kernels::cuda) fn weighted_norm(
         )
     };
     checked(status, stage)
+}
+
+/// The host's ordered sum: bit-identical to the host row for row.
+pub(in crate::kernels::cuda) fn weighted_norm(
+    stream: &RawStream,
+    ranges: [RawRange<'_>; 4],
+    [rows, width]: [usize; 2],
+    eps: f32,
+) -> Result<(), DeviceFailure> {
+    weighted_norm_on(
+        inference_cuda_inkling_weighted_norm,
+        stream,
+        ranges,
+        [rows, width],
+        eps,
+    )
+}
+
+/// The parallel reduction: within floating-point error of the host row.
+pub(in crate::kernels::cuda) fn weighted_norm_reduced(
+    stream: &RawStream,
+    ranges: [RawRange<'_>; 4],
+    [rows, width]: [usize; 2],
+    eps: f32,
+) -> Result<(), DeviceFailure> {
+    weighted_norm_on(
+        inference_cuda_inkling_weighted_norm_reduced,
+        stream,
+        ranges,
+        [rows, width],
+        eps,
+    )
 }
 
 pub(in crate::kernels::cuda) fn depth_current(
@@ -257,7 +307,7 @@ pub(in crate::kernels::cuda) fn effective_taps(
 
 pub(in crate::kernels::cuda) fn launch(
     stream: &RawStream,
-    ranges: [RawRange<'_>; 10],
+    ranges: [RawRange<'_>; 15],
     shape: PrepShape,
     history: usize,
     math: PrepMath,
@@ -272,7 +322,7 @@ pub(in crate::kernels::cuda) fn launch(
     {
         return Err(invalid_argument());
     }
-    validate_f32_ranges(&ranges, shape.words())?;
+    validate_f32_ranges(&ranges, shape.direct_words())?;
     let pointers = ranges.map(|r| r.address());
     let mut stage = STAGE_NONE;
     // SAFETY: the host pointer array lives for the call, and the CUDA spans are

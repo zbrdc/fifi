@@ -108,10 +108,16 @@ struct DenseGemvArgsRaw {
 
 /// `INFERENCE_CUDA_DENSE_GEMV_DECODE_SPLIT` in dense_gemv.h.
 const DECODE_SPLIT: c_int = 1;
+const PREFILL_TENSOR_GEMM: c_int = 2;
 
 /// The native flag bits of a call.
 fn flags(call: &DenseGemvRaw<'_>) -> c_int {
-    if call.decode_split { DECODE_SPLIT } else { 0 }
+    (if call.decode_split { DECODE_SPLIT } else { 0 })
+        | (if call.prefill_tensor_gemm {
+            PREFILL_TENSOR_GEMM
+        } else {
+            0
+        })
 }
 
 const _: () = assert!(
@@ -229,6 +235,7 @@ pub(in crate::kernels::cuda) struct DenseGemvRaw<'a> {
     pub(in crate::kernels::cuda) y: RawRange<'a>,
     /// The context's weight-visit choice (`DenseGroupPolicy::weight_visit`).
     pub(in crate::kernels::cuda) weight_visit: bool,
+    pub(in crate::kernels::cuda) prefill_tensor_gemm: bool,
     /// The context's split-kernel choice (`DenseGroupPolicy::decode_split`).
     pub(in crate::kernels::cuda) decode_split: bool,
 }

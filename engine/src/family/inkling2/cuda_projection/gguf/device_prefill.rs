@@ -13,7 +13,7 @@ use crate::{
     EngError,
     expert_tier::{ExpertId, ExpertPayloadSource},
     kernels::cuda::{
-        CudaContext, DeviceBuffer, DeviceRange, DeviceStream, PinnedBuf,
+        CudaContext, DeviceBuffer, DeviceEvent, DeviceRange, DeviceStream, PinnedBuf,
         prefill::{
             mmq_mmid::{GroupedDqRows, MmidWeight, SparseDqCall, grouped_dq_serves},
             row_ops::{ClippedExpertCall, IndexedRankSumCall, RowGatherCall, RowShape},
@@ -147,6 +147,9 @@ struct Scratch {
     buffer: DeviceBuffer,
     stream: DeviceStream,
     host: PinnedBuf,
+    /// Recorded on the caller's stream right behind the last unfenced upload of `host`; the next
+    /// window waits for it before writing `host` again (nothing else is synchronized).
+    uploaded: Option<DeviceEvent>,
     rows: usize,
     geometry: Geometry,
 }
@@ -195,6 +198,13 @@ impl Workspace {
         self.scratch = Some(scratch);
         Ok(self.scratch.as_mut())
     }
+}
+
+/// Where an unfenced window stages its metadata and publishes its flag word.
+struct Unfenced<'a> {
+    stream: &'a DeviceStream,
+    flag_out: DeviceRange<'a>,
+    destination: DeviceRange<'a>,
 }
 
 struct Projections<'a> {
@@ -345,6 +355,62 @@ impl GgufCuda {
         caps: [f32; 2],
         weight: impl Fn(usize, usize) -> f32,
     ) -> Result<Option<Vec<Vec<f32>>>, EngError> {
+        self.prefill_device_experts_impl(
+            source,
+            layer,
+            (batch, destination),
+            dtypes,
+            caps,
+            weight,
+            None,
+        )
+    }
+
+    /// The one call site of the routed-expert stage for the device-resident prefill pass
+    /// (`FIFI_INKLING_CUDA_RESIDENT_PREFILL_PASS`): the same kernels as
+    /// [`Self::prefill_device_experts`], enqueued on `stream` behind the caller's work, with
+    /// the window metadata staged through `host` and the window's flag word copied into
+    /// `flag_out` for the caller's fence. One window, a device destination, nothing read.
+    pub(in crate::family::inkling2) fn prefill_device_experts_unfenced<'a>(
+        &self,
+        source: &mut impl ExpertPayloadSource,
+        layer: u32,
+        (batch, destination): (ExpertPrefillRows<'_>, Option<DeviceRange<'_>>),
+        (dtypes, caps): ([DenseDtype; 2], [f32; 2]),
+        weight: impl Fn(usize, usize) -> f32,
+        (stream, flag_out): (&'a DeviceStream, DeviceRange<'a>),
+    ) -> Result<Option<()>, EngError> {
+        let (batch, Some(destination)) = (batch, destination) else {
+            return Ok(None);
+        };
+        let unfenced = Unfenced {
+            stream,
+            flag_out,
+            destination,
+        };
+        self.prefill_device_experts_impl(
+            source,
+            layer,
+            (batch, None),
+            dtypes,
+            caps,
+            weight,
+            Some(unfenced),
+        )
+        .map(|option| option.map(|_| ()))
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn prefill_device_experts_impl(
+        &self,
+        source: &mut impl ExpertPayloadSource,
+        layer: u32,
+        (batch, destination): (ExpertPrefillRows<'_>, Option<DeviceRange<'_>>),
+        dtypes: [DenseDtype; 2],
+        caps: [f32; 2],
+        weight: impl Fn(usize, usize) -> f32,
+        unfenced: Option<Unfenced<'_>>,
+    ) -> Result<Option<Vec<Vec<f32>>>, EngError> {
         let Some(workspace) = &self.device_prefill else {
             return Ok(None);
         };
@@ -352,6 +418,14 @@ impl GgufCuda {
             return Ok(None);
         };
         if let Some(out) = destination
+            && (!admits_router_input(routes.len(), hidden, out.bytes())
+                || !out.offset().is_multiple_of(4))
+        {
+            return Err(bad(
+                "incorrect CUDA expert output destination extent or alignment",
+            ));
+        }
+        if let Some(out) = unfenced.as_ref().map(|u| u.destination)
             && (!admits_router_input(routes.len(), hidden, out.bytes())
                 || !out.offset().is_multiple_of(4))
         {
@@ -378,6 +452,13 @@ impl GgufCuda {
         };
         let cuda = &self.context;
         let mut workspace = workspace.borrow_mut();
+        if unfenced.is_some()
+            && workspace
+                .cached(projections.geometry)
+                .is_none_or(|scratch| scratch.rows < routes.len())
+        {
+            return Ok(None);
+        }
         let Some(scratch) = workspace.fit(cuda, routes.len(), projections.geometry)? else {
             return Ok(None);
         };
@@ -402,9 +483,23 @@ impl GgufCuda {
                 |row, id| weight(first + row, id),
             )?;
             let target = destination
+                .or(unfenced.as_ref().map(|u| u.destination))
                 .map(|out| out.slice(first * hidden * 4, routes.len() * hidden * 4))
                 .transpose()?;
-            let (rows, launches) = scratch.execute(cuda, &projections, &plan, (input, target))?;
+            let (rows, launches) = match &unfenced {
+                Some(u) => (
+                    Vec::new(),
+                    scratch.enqueue_unfenced(
+                        cuda,
+                        u.stream,
+                        u.flag_out,
+                        &projections,
+                        &plan,
+                        (input, target),
+                    )?,
+                ),
+                None => scratch.execute(cuda, &projections, &plan, (input, target))?,
+            };
             output.extend(rows);
             for (total, count) in counts.iter_mut().zip(launches) {
                 total.wmma += count.wmma;
@@ -668,6 +763,7 @@ impl Scratch {
                 buffer,
                 stream: cuda.stream()?,
                 host: cuda.pinned_buf(layout.output.end)?,
+                uploaded: None,
                 rows,
                 geometry,
             }))
@@ -690,7 +786,7 @@ impl Scratch {
         self.host.write(0, plan.upload.as_flattened())?;
         cuda.copy_from_pinned(&self.stream, &mut self.host, 0, upload)?;
         let result = self
-            .enqueue(cuda, projections, plan, operands)
+            .enqueue(cuda, &self.stream, projections, plan, operands)
             .and_then(|counts| {
                 // With a device destination, only status crosses the host boundary.
                 let end = if operands.1.is_some() {
@@ -704,6 +800,7 @@ impl Scratch {
             });
         // A launch can be refused after the upload has been queued.
         let waited = self.host.synchronize(&self.stream);
+        self.uploaded = None;
         let counts = result?;
         waited?;
         let mut flag = [0; 4];
@@ -725,9 +822,43 @@ impl Scratch {
         Ok((rows, counts))
     }
 
+    /// The launch-only form for a device-resident caller: the window's metadata goes through
+    /// `host` (it stays unread until the caller's fence) on `stream`, the kernels follow on the
+    /// same stream, and the window's flag word is copied into `flag_out` for that fence. One
+    /// window only; nothing is synchronized or read.
+    fn enqueue_unfenced(
+        &mut self,
+        cuda: &CudaContext,
+        stream: &DeviceStream,
+        flag_out: DeviceRange<'_>,
+        projections: &Projections<'_>,
+        plan: &RoutedWindow,
+        operands: (Option<DeviceRange<'_>>, Option<DeviceRange<'_>>),
+    ) -> Result<[DenseGemvGroupCounts; 2], EngError> {
+        let l = &plan.layout;
+        if plan.rows > self.rows || flag_out.bytes() < 4 {
+            return Err(bad("the unfenced expert window does not fit its admission"));
+        }
+        let upload = self.buffer.range(0, l.flag.end)?;
+        // The pinned page of the previous window is released by the event recorded behind its
+        // upload: a tiny copy long finished by the time the next visit reaches its experts.
+        if let Some(event) = self.uploaded.take() {
+            self.host.wait(&event)?;
+        }
+        self.host.write(0, plan.upload.as_flattened())?;
+        cuda.copy_from_pinned(stream, &mut self.host, 0, upload)?;
+        let event = cuda.event()?;
+        stream.record(&event)?;
+        self.uploaded = Some(event);
+        let counts = self.enqueue(cuda, stream, projections, plan, operands)?;
+        cuda.copy_device(stream, self.buffer.range(l.flag.start, 4)?, flag_out)?;
+        Ok(counts)
+    }
+
     fn enqueue(
         &self,
         cuda: &CudaContext,
+        stream: &DeviceStream,
         projections: &Projections<'_>,
         plan: &RoutedWindow,
         (retained, output): (Option<DeviceRange<'_>>, Option<DeviceRange<'_>>),
@@ -738,7 +869,7 @@ impl Scratch {
         let range = |span: &Range<usize>| self.buffer.range(span.start, span.len());
         let flag = range(&l.flag)?;
         cuda.row_gather(
-            &self.stream,
+            stream,
             RowGatherCall {
                 x: match retained {
                     Some(input) => input,
@@ -754,9 +885,9 @@ impl Scratch {
                 source_rows: plan.rows,
             },
         )?;
-        let gate = self.project(cuda, projections, plan, 0)?;
+        let gate = self.project(cuda, projections, plan, stream, 0)?;
         cuda.row_clipped_expert(
-            &self.stream,
+            stream,
             ClippedExpertCall {
                 x: range(&l.gate)?,
                 scales: range(&l.gate_scales)?,
@@ -769,9 +900,9 @@ impl Scratch {
                 caps: projections.caps,
             },
         )?;
-        let down = self.project(cuda, projections, plan, 1)?;
+        let down = self.project(cuda, projections, plan, stream, 1)?;
         cuda.row_indexed_rank_sum(
-            &self.stream,
+            stream,
             IndexedRankSumCall {
                 x: range(&l.down)?,
                 inverse_ids: range(&l.inverse_ids)?,
@@ -797,6 +928,7 @@ impl Scratch {
         cuda: &CudaContext,
         projections: &Projections<'_>,
         plan: &RoutedWindow,
+        stream: &DeviceStream,
         stage: usize,
     ) -> Result<DenseGemvGroupCounts, EngError> {
         let l = &plan.layout;
@@ -807,7 +939,7 @@ impl Scratch {
         if let (Some(selection), Some(weight)) = (selection, projections.grouped_weights[stage]) {
             let range = |span: &Range<usize>| self.buffer.range(span.start, span.len());
             cuda.gemm_dq_sparse_rows(
-                &self.stream,
+                stream,
                 SparseDqCall {
                     weight,
                     plan: selection,
@@ -841,13 +973,13 @@ impl Scratch {
             .collect::<Result<Vec<_>, EngError>>()?;
         if Switch::PrefillWeightPanels.on() {
             // Down is unwritten during gate; gate is dead after row_clipped_expert.
-            // Both stages and all users of these spans are ordered on self.stream.
+            // Both stages and all users of these spans are ordered on `stream`.
             let dead = if stage == 0 { &l.down } else { &l.gate };
             let pad = (16 - dead.start % 16) % 16;
             if dead.len() > pad {
                 let tmp = self.buffer.range(dead.start + pad, dead.len() - pad)?;
                 return cuda.dense_gemv_group_with_panels(
-                    &self.stream,
+                    stream,
                     &calls,
                     minimum,
                     projections.exact_tile,
@@ -855,7 +987,7 @@ impl Scratch {
                 );
             }
         }
-        cuda.dense_gemv_group_with_tiles(&self.stream, &calls, minimum, projections.exact_tile)
+        cuda.dense_gemv_group_with_tiles(stream, &calls, minimum, projections.exact_tile)
     }
 }
 

@@ -84,13 +84,13 @@ impl DensePlan {
 }
 
 #[derive(Clone, Copy)]
-pub(super) struct ResidentProjection<'a> {
-    pub(super) weight: &'a Resident,
-    pub(super) dtype: DenseDtype,
-    pub(super) input: usize,
+pub(in crate::family::inkling2) struct ResidentProjection<'a> {
+    pub(in crate::family::inkling2) weight: &'a Resident,
+    pub(in crate::family::inkling2) dtype: DenseDtype,
+    pub(in crate::family::inkling2) input: usize,
 }
 
-pub(super) type ControllerWeights<'a> = [(&'a Resident, DenseDtype); 3];
+pub(in crate::family::inkling2) type ControllerWeights<'a> = [(&'a Resident, DenseDtype); 3];
 
 pub(super) struct ControllerRow<'a> {
     pub(super) weights: ControllerWeights<'a>,

@@ -98,6 +98,7 @@ pub(crate) mod hyper;
 pub(crate) mod inkling_controller;
 pub(crate) mod inkling_conv;
 pub(crate) mod inkling_local_prep;
+pub(crate) mod inkling_pass;
 pub(crate) mod inkling_stream;
 pub(crate) mod kv8_append;
 pub(crate) mod kv_f16_append;

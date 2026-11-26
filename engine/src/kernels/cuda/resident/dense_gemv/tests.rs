@@ -20,6 +20,8 @@ use crate::kernels::cuda::{CudaContext, DeviceBuffer, DeviceRange, DeviceStream}
 mod decode_attention_tests;
 #[path = "decode_control_tests.rs"]
 mod decode_control_tests;
+#[path = "routed_prefill_tests.rs"]
+mod routed_prefill_tests;
 
 /// Unit roundoff of f32.
 const U: f64 = 1.0 / 16_777_216.0;

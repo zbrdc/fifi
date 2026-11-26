@@ -170,3 +170,86 @@ fn cpu_parity_controller_norm_reports_invalid_roles() {
     let (out, health) = run(&ctx, [1, 1], &packed, f32::MAX, Arithmetic::CpuParity);
     assert!(out[0].is_finite() && health[0].is_nan());
 }
+
+/// The rows entry (the caller's `[input, message, gamma, gain, forget, out]` per role) is the
+/// packed launch bit for bit, with the same health; an output row that shares a byte with a row
+/// of another role is refused before any launch.
+#[test]
+fn rows_controller_norm_equals_the_packed_launch_bit_for_bit() {
+    use crate::EngError;
+
+    if !device_present("Inkling controller norm rows") {
+        return;
+    }
+    let ctx = CudaContext::new().unwrap();
+    let stream = ctx.stream().unwrap();
+    let width = 2304;
+    for roles in [1usize, 3] {
+        let packed = pack(roles, width, None);
+        let (expected, expected_health) =
+            run(&ctx, [width, roles], &packed, EPS, Arithmetic::Generic);
+        let words = packed.len();
+        let workspace = ctx.allocate(words * 4).unwrap();
+        let outs = ctx.allocate(roles * width * 4).unwrap();
+        let health = ctx.allocate(roles * 4).unwrap();
+        let bytes: Vec<_> = packed.iter().flat_map(|v| v.to_ne_bytes()).collect();
+        workspace.write_at(&stream, 0, &bytes).unwrap();
+        health.write_at(&stream, 0, &vec![0u8; roles * 4]).unwrap();
+        fn row<'a>(
+            buffer: &'a crate::kernels::cuda::DeviceBuffer,
+            at: usize,
+            width: usize,
+        ) -> crate::kernels::cuda::DeviceRange<'a> {
+            buffer.range(at * width * 4, width * 4).unwrap()
+        }
+        let rows: Vec<_> = (0..roles)
+            .map(|role| {
+                [
+                    row(&workspace, role * 3, width),
+                    row(&workspace, role * 3 + 1, width),
+                    row(&workspace, role * 3 + 2, width),
+                    row(&workspace, 3 * roles + role * 2, width),
+                    row(&workspace, 3 * roles + role * 2 + 1, width),
+                    row(&outs, role, width),
+                ]
+            })
+            .collect();
+        let mut clash = rows.clone();
+        if roles > 1 {
+            clash[1][5] = row(&workspace, 0, width);
+            let error = ctx.inkling_controller_norm_rows(
+                &stream,
+                &clash,
+                health.range(0, roles * 4).unwrap(),
+                (width, EPS),
+            );
+            assert!(matches!(error, Err(EngError::BadRequest(_))), "{error:?}");
+        }
+        ctx.inkling_controller_norm_rows(
+            &stream,
+            &rows,
+            health.range(0, roles * 4).unwrap(),
+            (width, EPS),
+        )
+        .unwrap();
+        let mut output = vec![0u8; roles * width * 4];
+        outs.read_at(&stream, 0, &mut output).unwrap();
+        let mut status = vec![0u8; roles * 4];
+        health.read_at(&stream, 0, &mut status).unwrap();
+        let floats = |bytes: &[u8]| {
+            bytes
+                .as_chunks::<4>()
+                .0
+                .iter()
+                .copied()
+                .map(f32::from_ne_bytes)
+                .collect::<Vec<_>>()
+        };
+        let (output, status) = (floats(&output), floats(&status));
+        for (a, b) in output.iter().zip(&expected) {
+            assert_eq!(a.to_bits(), b.to_bits(), "roles {roles}");
+        }
+        assert_eq!(status, expected_health);
+        let _ = stream;
+    }
+}

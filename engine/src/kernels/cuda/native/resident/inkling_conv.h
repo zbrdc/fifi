@@ -17,6 +17,10 @@
  * `health` is one float: left alone, or quiet NaN when an input, a kernel value, a history
  * value or an output is not finite.
  *
+ * `state` is null, or the current row of a depth stream: then `state[c] += out[c]` (the host's
+ * add_current, one rounded add) follows, and a non-finite sum is reported the same way. `state`
+ * shares no byte with any other range.
+ *
  * Every entry takes the stream explicitly, returns INFERENCE_CUDA_INVALID_ARGUMENT for a bad
  * argument before any CUDA call, never falls back to the default stream and does not
  * synchronize. `out` is either exactly `input` or shares no byte with it; `history`, `kernel`
@@ -30,8 +34,8 @@ extern "C" {
 #endif
 
 int inference_cuda_inkling_conv(const float *input, const float *kernel, float *history,
-                                float *out, float *health, int width, int taps, void *stream,
-                                int *out_stage);
+                                float *out, float *state, float *health, int width, int taps,
+                                void *stream, int *out_stage);
 
 #ifdef __cplusplus
 }

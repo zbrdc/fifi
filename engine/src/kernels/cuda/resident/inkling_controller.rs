@@ -3,11 +3,18 @@
 #[cfg(test)]
 mod tests;
 
-use crate::EngError;
-use crate::kernels::cuda::{CudaContext, DeviceRange, DeviceStream};
+use std::mem::{align_of, size_of};
 
-pub(crate) use super::super::native::resident::inkling_controller::Arithmetic;
-use super::super::native::resident::inkling_controller::{launch, prepare, rebuild_gates};
+use crate::EngError;
+use crate::kernels::cuda::{
+    CudaContext, DeviceRange, DeviceStream,
+    context::{Claim, require_apart, require_fit},
+};
+
+pub(crate) use super::super::native::resident::inkling_controller::{Arithmetic, MAX_ROW_ROLES};
+use super::super::native::resident::inkling_controller::{
+    launch, launch_rows, prepare, rebuild_gates,
+};
 
 impl CudaContext {
     /// Rebuild gates from the host's exact RMS scales. The workspace is packed
@@ -49,6 +56,84 @@ impl CudaContext {
         (width, eps): (usize, f32),
     ) -> Result<(), EngError> {
         self.inkling_controller_norm_roles(stream, workspace, health, ([width, 3], eps))
+    }
+
+    /// Up to 16 independent controller roles over the caller's rows: per role
+    /// `[input, message, gamma, gain, forget, out]`, `width` floats each, so nothing is packed
+    /// into a workspace. Every output row shares no byte with any other row; `health` (one
+    /// float per role) with none of them.
+    pub(crate) fn inkling_controller_norm_rows(
+        &self,
+        stream: &DeviceStream,
+        rows: &[[DeviceRange<'_>; 6]],
+        health: DeviceRange<'_>,
+        (width, eps): (usize, f32),
+    ) -> Result<(), EngError> {
+        let roles = rows.len();
+        if !(1..=4096).contains(&width)
+            || !(1..=MAX_ROW_ROLES).contains(&roles)
+            || !eps.is_finite()
+            || eps <= 0.0
+        {
+            return Err(EngError::BadRequest(format!(
+                "the CUDA Inkling controller norm takes 1 to {MAX_ROW_ROLES} roles of 1 to 4096 columns and a finite positive eps, got roles {roles}, width {width}, eps {eps}"
+            )));
+        }
+        let word = size_of::<f32>();
+        let row = width * word;
+        let names = [
+            "Inkling controller input",
+            "Inkling controller message",
+            "Inkling controller gamma",
+            "Inkling controller gain",
+            "Inkling controller forget",
+            "Inkling controller output",
+        ];
+        let mut claims = Vec::with_capacity(6 * roles);
+        for role in rows {
+            for (name, range) in names.iter().zip(role) {
+                require_fit(name, range, row, align_of::<f32>())?;
+                if range.bytes() != row {
+                    return Err(EngError::BadRequest(format!(
+                        "the CUDA {name} range holds {} bytes but the call needs exactly {row}",
+                        range.bytes()
+                    )));
+                }
+                claims.push(Claim::of(name, range, row));
+            }
+        }
+        let status_words = roles * word;
+        require_fit(
+            "Inkling controller health",
+            &health,
+            status_words,
+            align_of::<f32>(),
+        )?;
+        if health.bytes() != status_words {
+            return Err(EngError::BadRequest(format!(
+                "the CUDA Inkling controller health range holds {} bytes but the call needs exactly {status_words}",
+                health.bytes()
+            )));
+        }
+        let status = Claim::of("Inkling controller health", &health, status_words);
+        for (i, claim) in claims.iter().enumerate() {
+            for (j, other) in claims.iter().enumerate() {
+                if i != j && (i % 6 == 5 || j % 6 == 5) {
+                    require_apart(claim, other)?;
+                }
+            }
+            require_apart(&status, claim)?;
+        }
+        self.ensure_usable()?;
+        let raw = rows
+            .iter()
+            .flatten()
+            .map(|range| self.raw_range(range))
+            .collect::<Result<Vec<_>, _>>()?;
+        let health = self.raw_range(&health)?;
+        self.launch_on(stream, |stream| {
+            launch_rows(stream, &raw, roles, health, (width, eps))
+        })
     }
 
     /// Packs 1..=1536 independent roles: triples, pairs, then outputs.

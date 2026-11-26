@@ -28,6 +28,9 @@ pub(crate) struct ConvCall<'a> {
     pub(crate) kernel: DeviceRange<'a>,
     pub(crate) history: DeviceRange<'a>,
     pub(crate) out: DeviceRange<'a>,
+    /// The current row of a depth stream, which takes `state[c] += out[c]` (the host's
+    /// add_current of the convolved row) instead of a following add launch; or absent.
+    pub(crate) state: Option<DeviceRange<'a>>,
     pub(crate) health: DeviceRange<'a>,
 }
 
@@ -77,6 +80,9 @@ impl CudaContext {
         check_exact("Inkling conv history", &call.history, history)?;
         check_exact("Inkling conv output", &call.out, row)?;
         check_exact("Inkling conv health", &call.health, health)?;
+        if let Some(state) = &call.state {
+            check_exact("Inkling conv state", state, row)?;
+        }
         let input = Claim::of("Inkling conv input", &call.input, row);
         let out = Claim::of("Inkling conv output", &call.out, row);
         let kernel = Claim::of("Inkling conv kernel", &call.kernel, kernel);
@@ -97,12 +103,24 @@ impl CudaContext {
         require_apart(&kernel, &history)?;
         require_apart(&kernel, &health)?;
         require_apart(&history, &health)?;
+        // `state` shares no byte with any other range.
+        if let Some(state) = &call.state {
+            let state = Claim::of("Inkling conv state", state, row);
+            for other in [&input, &out, &kernel, &history, &health] {
+                require_apart(&state, other)?;
+            }
+        }
         self.ensure_usable()?;
         let native_call = ConvRaw {
             input: self.raw_range(&call.input)?,
             kernel: self.raw_range(&call.kernel)?,
             history: self.raw_range(&call.history)?,
             out: self.raw_range(&call.out)?,
+            state: call
+                .state
+                .as_ref()
+                .map(|state| self.raw_range(state))
+                .transpose()?,
             health: self.raw_range(&call.health)?,
         };
         self.launch_on(stream, |raw| {

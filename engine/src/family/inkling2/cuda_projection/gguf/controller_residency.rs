@@ -9,6 +9,9 @@ use crate::family::inkling2::switches::Switch;
 use crate::family::mem::DEVICE;
 
 const MAX_CHARGE: u64 = 64 << 20;
+/// The resident prefill pass launches every controller of every visit from one plan, so it needs
+/// the complete triples of all visits on the device; with the pass flag the charge may cover them.
+const PASS_CHARGE: u64 = 640 << 20;
 
 pub(super) fn enabled() -> bool {
     Switch::ResidentControllers.on()
@@ -21,7 +24,7 @@ pub(super) fn admit(
     [original_floor, expert_workspace]: [u64; 2],
 ) -> Result<(), EngError> {
     let before = context.memory_info()?.free as u64;
-    let Some(floor) = minimum_free(before, original_floor, expert_workspace) else {
+    let Some(floor) = floor(before, original_floor, expert_workspace, charge()) else {
         return Ok(());
     };
     let mut admitted = Vec::new();
@@ -82,12 +85,25 @@ pub(super) fn workspace_floor(expert_workspace: u64) -> Option<u64> {
         .checked_add(DEVICE_HEADROOM + DEVICE.inkling_controller_margin)
 }
 
-fn minimum_free(before: u64, original_floor: u64, expert_workspace: u64) -> Option<u64> {
+fn charge() -> u64 {
+    if crate::family::inkling2::switches::Switch::ResidentPrefillPass.on() {
+        PASS_CHARGE
+    } else {
+        MAX_CHARGE
+    }
+}
+
+fn floor(before: u64, original_floor: u64, expert_workspace: u64, charge: u64) -> Option<u64> {
     Some(
         workspace_floor(expert_workspace)?
-            .max(original_floor.saturating_sub(MAX_CHARGE))
-            .max(before.saturating_sub(MAX_CHARGE)),
+            .max(original_floor.saturating_sub(charge))
+            .max(before.saturating_sub(charge)),
     )
+}
+
+#[cfg(test)]
+fn minimum_free(before: u64, original_floor: u64, expert_workspace: u64) -> Option<u64> {
+    floor(before, original_floor, expert_workspace, MAX_CHARGE)
 }
 
 pub(super) fn expert_workspace(

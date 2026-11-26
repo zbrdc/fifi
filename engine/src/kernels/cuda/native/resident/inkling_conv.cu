@@ -39,7 +39,7 @@ __device__ void report(float *health, int invalid) {
 // Channel c of the host's `CausalConv::apply`, in its summation order: the accumulator starts
 // at 0 and each lag adds its rounded product, then the input is added and the norm applied.
 __device__ void convolve(const float *input, const float *kernel, float *history, float *out,
-                         int c, int width, int taps, float norm, int &invalid) {
+                         float *state, int c, int width, int taps, float norm, int &invalid) {
     // `out` may be `input`: x is read before out[c] is written.
     const float x = input[c];
     const float *k = kernel + static_cast<size_t>(c) * taps;
@@ -60,10 +60,16 @@ __device__ void convolve(const float *input, const float *kernel, float *history
     const float value = __fmul_rn(__fadd_rn(acc, x), norm);
     out[c] = value;
     invalid |= !isfinite(value);
+    // `state`: the host's add_current of the convolved row, one rounded add.
+    if (state) {
+        const float sum = __fadd_rn(state[c], value);
+        state[c] = sum;
+        invalid |= !isfinite(sum);
+    }
 }
 
 __global__ void inkling_conv_kernel(const float *input, const float *kernel, float *history,
-                                    float *out, float *health, int width, int taps) {
+                                    float *out, float *state, float *health, int width, int taps) {
     // The host norm, (taps + 1) as f32 then sqrt then recip, each step rounded to nearest even.
     const float norm = __frcp_rn(__fsqrt_rn(__fadd_rn(static_cast<float>(taps), 1.0f)));
     int invalid = 0;
@@ -71,15 +77,16 @@ __global__ void inkling_conv_kernel(const float *input, const float *kernel, flo
     const int first = blockIdx.x * blockDim.x;
     const int stride = blockDim.x * gridDim.x;
     for (int c = first + threadIdx.x; c < width; c += stride) {
-        convolve(input, kernel, history, out, c, width, taps, norm, invalid);
+        convolve(input, kernel, history, out, state, c, width, taps, norm, invalid);
     }
     report(health, invalid);
 }
 }  // namespace
 
 extern "C" int inference_cuda_inkling_conv(const float *input, const float *kernel,
-                                           float *history, float *out, float *health,
-                                           int width, int taps, void *stream, int *out_stage) {
+                                           float *history, float *out, float *state,
+                                           float *health, int width, int taps, void *stream,
+                                           int *out_stage) {
     report_stage(out_stage, INFERENCE_CUDA_STAGE_NONE);
     if (!input || !kernel || !history || !out || !health || !stream || !aligned(input) ||
         !aligned(kernel) || !aligned(history) || !aligned(out) || !aligned(health) ||
@@ -104,12 +111,20 @@ extern "C" int inference_cuda_inkling_conv(const float *input, const float *kern
         overlaps(health, health_bytes, input, row)) {
         return INFERENCE_CUDA_INVALID_ARGUMENT;
     }
+    // `state` is null or the current row of a stream: apart from every other range.
+    if (state &&
+        (!aligned(state) || overlaps(state, row, input, row) || overlaps(state, row, out, row) ||
+         overlaps(state, row, history, history_bytes) ||
+         overlaps(state, row, kernel, kernel_bytes) ||
+         overlaps(state, row, health, health_bytes))) {
+        return INFERENCE_CUDA_INVALID_ARGUMENT;
+    }
     // One channel per thread: with one block a thread walked up to nine channels and every
     // walk serialized its loads. A channel's accumulation order does not depend on the block
     // that owns it. Every block that saw a non-finite value writes the same NaN.
     const int blocks = (width + threads - 1) / threads;
     inkling_conv_kernel<<<blocks, threads, 0, static_cast<cudaStream_t>(stream)>>>(
-        input, kernel, history, out, health, width, taps);
+        input, kernel, history, out, state, health, width, taps);
     Failure failure;
     failure.record(cudaGetLastError(), INFERENCE_CUDA_STAGE_LAUNCH);
     report_stage(out_stage, failure.stage);

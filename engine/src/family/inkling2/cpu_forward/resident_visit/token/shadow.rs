@@ -78,6 +78,7 @@ impl CpuForward {
         if !self.state.iter().any(VisitState::is_resident) {
             return Ok(());
         }
+        self.pass_tails_stale();
         let Weights::Gguf(w) = &self.weights else {
             return Err(bad("resident rows without GGUF weights"));
         };

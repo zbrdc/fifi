@@ -7,10 +7,10 @@ use super::shadow_tests::Error;
 use super::*;
 use crate::family::inkling2::cpu_forward::PrefixState;
 
-struct Fixture {
-    name: &'static str,
-    prompt: Vec<u32>,
-    limit: usize,
+pub(super) struct Fixture {
+    pub(super) name: &'static str,
+    pub(super) prompt: Vec<u32>,
+    pub(super) limit: usize,
 }
 
 fn fixtures() -> Vec<Fixture> {
@@ -31,7 +31,7 @@ fn fixtures() -> Vec<Fixture> {
         .collect()
 }
 
-fn argmax(logits: &[f32]) -> u32 {
+pub(super) fn argmax(logits: &[f32]) -> u32 {
     logits
         .iter()
         .enumerate()
@@ -41,17 +41,22 @@ fn argmax(logits: &[f32]) -> u32 {
 }
 
 #[derive(Default)]
-struct Run {
+pub(super) struct Run {
     logits: Vec<Vec<f32>>,
     /// Greedy continuation, one token per logits row.
-    tokens: Vec<u32>,
+    pub(super) tokens: Vec<u32>,
     /// Host state after every token (rows are shared with the forward's storage).
     snapshots: Vec<PrefixState>,
 }
 
 /// Feeds a fixture the way serving does: grouped prefill of every prompt row but the last, then
 /// the last prompt token as the first decode step.
-fn generate(f: &mut CpuForward, fixture: &Fixture, forced: Option<&[u32]>, every: usize) -> Run {
+pub(super) fn generate(
+    f: &mut CpuForward,
+    fixture: &Fixture,
+    forced: Option<&[u32]>,
+    every: usize,
+) -> Run {
     let chain = forced.is_some();
     if fixture.prompt.len() > 1 {
         f.prefill_grouped(&fixture.prompt[..fixture.prompt.len() - 1])
@@ -97,7 +102,7 @@ fn generate(f: &mut CpuForward, fixture: &Fixture, forced: Option<&[u32]>, every
     run
 }
 
-fn compare(fixture: &Fixture, every: usize, oracle: &Run, chain: &Run) {
+pub(super) fn compare(fixture: &Fixture, every: usize, oracle: &Run, chain: &Run) {
     let name = fixture.name;
     // Rows first: a wrong readback explains wrong logits, the reverse does not hold.
     let known: Vec<&PrefixState> = oracle

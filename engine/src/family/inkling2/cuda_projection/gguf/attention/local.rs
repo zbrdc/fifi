@@ -105,6 +105,8 @@ pub(in crate::family::inkling2) struct LocalResult {
     pub rows: [Vec<f32>; 4],
 }
 
+mod baseline;
+
 fn decode_split_enabled() -> bool {
     Switch::DecodeSplit.on()
 }
@@ -609,7 +611,9 @@ impl ResidentAttention {
         self.enqueue_resident_output(context, stream, request, (shape, projection), rows)
     }
 
-    /// Aux staging, the dense closure, the prep launch and the shifted histories back.
+    /// The dense closure, then the prep launch over the caller's own weight rows and K/V
+    /// histories: nothing is staged into the aux scratch, which only holds the effective taps
+    /// of a global visit. The kernel shifts the caller's histories in place.
     fn enqueue_resident_prep<'a>(
         &'a self,
         context: &CudaContext,
@@ -619,11 +623,20 @@ impl ResidentAttention {
         (shape, hidden, status): (LocalShape, usize, LocalStatus),
         dense: impl FnOnce([DeviceRange<'_>; 4], ResidentStatus<'_>) -> Result<(), EngError>,
     ) -> Result<PrepRows<'a>, EngError> {
+        if !context.dense_group_policy().decode_glue {
+            return self.enqueue_prep_baseline(
+                context,
+                stream,
+                store,
+                request,
+                (shape, hidden, status),
+                dense,
+            );
+        }
         let aux = store.aux.range(0, store.aux.bytes())?;
-        Self::stage_resident_aux(context, stream, request, (shape, aux))?;
         let scratch = ScratchLayout::new(shape, hidden);
         let at = scratch.at;
-        let row = |index: usize, words| words_range(&store.scratch, at[index], words);
+        let row = |index: usize, words: usize| words_range(&store.scratch, at[index], words);
         let q = shape.query_channels();
         let [qr, relative, sinks, gates] = [
             row(0, q)?,
@@ -632,13 +645,12 @@ impl ResidentAttention {
             row(3, q)?,
         ];
         let health = Health::split(request.status, status)?;
+        let layout = AuxLayout::new(shape);
+        let effective = [layout.range(2, aux)?, layout.range(3, aux)?];
         dense(
             [qr, relative, sinks, gates],
             ResidentStatus {
-                effective: [
-                    AuxLayout::new(shape).range(2, aux)?,
-                    AuxLayout::new(shape).range(3, aux)?,
-                ],
+                effective,
                 controller_health: health.controller,
                 gate_health: health.gates,
                 zeros: store
@@ -657,7 +669,14 @@ impl ResidentAttention {
             kv: shape.kv_heads,
             dims: shape.relative_dims,
         };
-        context.inkling_local_prep(
+        // A global visit's dense closure wrote the effective taps; a local one convolves with
+        // the static kernels.
+        let [kernel_k, kernel_v] = if request.visit.attention == Attention::Global {
+            effective
+        } else {
+            [request.weights.key_kernel, request.weights.value_kernel]
+        };
+        context.inkling_local_prep_direct(
             stream,
             [
                 qr,
@@ -668,14 +687,18 @@ impl ResidentAttention {
                 v,
                 sinks,
                 gates,
-                aux,
+                request.weights.query_scale,
+                request.weights.relative_scale,
+                kernel_k,
+                kernel_v,
+                request.raw_history[0],
+                request.raw_history[1],
                 health.prep,
             ],
             prep,
             PrepShape::TAPS - 1,
             request.math,
         )?;
-        self.unstage_resident_aux(context, stream, request, (shape, aux))?;
         Ok(PrepRows {
             q: qr,
             relative,
@@ -687,42 +710,6 @@ impl ResidentAttention {
             attention_out: row(4, q)?,
             projected: row(5, hidden)?,
         })
-    }
-
-    fn stage_resident_aux(
-        context: &CudaContext,
-        stream: &DeviceStream,
-        request: &ResidentLocalDecode<'_>,
-        (shape, aux): (LocalShape, DeviceRange<'_>),
-    ) -> Result<(), EngError> {
-        let layout = AuxLayout::new(shape);
-        let sources = [
-            request.weights.query_scale,
-            request.weights.relative_scale,
-            request.weights.key_kernel,
-            request.weights.value_kernel,
-            request.raw_history[0],
-            request.raw_history[1],
-        ];
-        for (index, source) in sources.into_iter().enumerate() {
-            context.copy_device(stream, source, layout.range(index, aux)?)?;
-        }
-        Ok(())
-    }
-
-    /// The prep kernel shifted the aux histories in place; hand them back.
-    fn unstage_resident_aux(
-        &self,
-        context: &CudaContext,
-        stream: &DeviceStream,
-        request: &ResidentLocalDecode<'_>,
-        (shape, aux): (LocalShape, DeviceRange<'_>),
-    ) -> Result<(), EngError> {
-        let layout = AuxLayout::new(shape);
-        for (plane, history) in request.raw_history.iter().enumerate() {
-            context.copy_device(stream, layout.range(4 + plane, aux)?, *history)?;
-        }
-        Ok(())
     }
 
     /// Attention over the resident ring, then the output projection and the `attn_sconv`
@@ -785,6 +772,7 @@ impl ResidentAttention {
                 kernel: request.attn_conv.kernel,
                 history: request.attn_conv.history,
                 out: request.out,
+                state: None,
                 health: health.conv,
             },
             (request.out.bytes() / WORD, PrepShape::TAPS),

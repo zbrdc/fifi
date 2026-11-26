@@ -264,36 +264,41 @@ impl DenseStep {
         (rows, work, eps): (&RoutedRows<'_>, &Workspace<'_>, f32),
         enqueue: impl FnOnce(&DeviceStream, [DeviceRange<'_>; 4]) -> Result<(), EngError>,
     ) -> Result<(), EngError> {
+        if !context.dense_group_policy().decode_glue {
+            return self.launch_controlled_baseline(context, stream, (rows, work, eps), enqueue);
+        }
         let row = rows.input.bytes();
-        // The gate halves: the normalized input, then the normalized message.
-        for (src, dst) in [
-            (rows.input, work.gate.slice(0, row)?),
-            (rows.message, work.gate.slice(row, row)?),
-        ] {
-            context.inkling_stream_norm(
-                stream,
-                NormCall {
-                    src,
-                    dst,
-                    health: rows.gate_health,
-                },
-                (work.width, MIX_EPS),
-            )?;
-        }
-        for (src, at) in [(rows.input, 0), (rows.message, row), (rows.gamma, 2 * row)] {
-            context.copy_device(stream, src, work.norm.slice(at, row)?)?;
-        }
+        // The gate halves: the normalized input, then the normalized message, in one launch.
+        let gates = [
+            NormCall {
+                src: rows.input,
+                dst: work.gate.slice(0, row)?,
+                health: rows.gate_health,
+            },
+            NormCall {
+                src: rows.message,
+                dst: work.gate.slice(row, row)?,
+                health: rows.gate_health,
+            },
+        ];
+        context.inkling_stream_norm_rows(stream, &gates, (work.width, MIX_EPS))?;
+        // The controller GEMVs write the gain and forget rows into the work block; the norm
+        // reads them next to the caller's input, message and gamma rows where they live.
+        let [gain, forget] = [3, 4].map(|i| work.norm.slice(i * row, row));
+        let [gain, forget] = [gain?, forget?];
         context.copy_device(stream, rows.bias, work.bias)?;
         context.dense_gemv_group(stream, &work.calls)?;
-        context.inkling_controller_norm_roles(
+        context.inkling_controller_norm_rows(
             stream,
-            work.norm,
+            &[[rows.input, rows.message, rows.gamma, gain, forget, work.x]],
             rows.health,
-            ([work.width, 1], eps),
+            (work.width, eps),
         )?;
         enqueue(stream, [work.x, work.bias, rows.status, rows.out])
     }
 }
+
+mod baseline;
 
 #[cfg(test)]
 mod tests {

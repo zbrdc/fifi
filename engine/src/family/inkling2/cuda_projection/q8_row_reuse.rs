@@ -22,7 +22,7 @@ fn flags() -> (bool, bool) {
     })
 }
 
-pub(super) fn project_group(
+pub(in crate::family::inkling2) fn project_group(
     context: &CudaContext,
     stream: &DeviceStream,
     calls: &[DenseGemvCall<'_>],
@@ -56,7 +56,7 @@ pub(super) fn project_group(
     Ok(())
 }
 
-pub(super) fn project_output(
+pub(in crate::family::inkling2) fn project_output(
     context: &CudaContext,
     stream: &DeviceStream,
     call: DenseGemvCall<'_>,

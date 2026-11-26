@@ -574,6 +574,8 @@ impl CpuForward {
 
     #[cfg(all(feature = "native-cuda", target_os = "linux"))]
     pub(super) fn invalidate_device_attention(&self) {
+        #[cfg(all(feature = "native-cuda", target_os = "linux"))]
+        self.pass_tails_stale();
         if let Weights::Gguf(weights) = &self.weights
             && let Some((_, attention)) = weights.resident_attention()
         {
@@ -835,6 +837,48 @@ impl VisitState {
         self.resident = false;
     }
 
+    /// Adopts what a device-resident prefill pass read back (`INVARIANTS.md` of the pass lane,
+    /// section 1): `keys` and `values` newest first, as the ring yields them reversed; the four
+    /// raw convolution histories oldest first with three rows each, of which the last `valid`
+    /// exist; and the cursor `position`.
+    #[cfg(all(feature = "native-cuda", target_os = "linux"))]
+    pub(super) fn publish_pass(
+        &mut self,
+        (keys, values): (Vec<Vec<f32>>, Vec<Vec<f32>>),
+        [k, v, attn, mlp]: [Vec<Vec<f32>>; 4],
+        (valid, capacity, position): (usize, usize, usize),
+    ) {
+        self.keys = keys.into_iter().rev().map(Arc::new).collect();
+        self.values = values.into_iter().rev().map(Arc::new).collect();
+        self.keys.truncate(capacity);
+        self.values.truncate(capacity);
+        for (history, rows) in [
+            &mut self.conv.k.0,
+            &mut self.conv.v.0,
+            &mut self.conv.attn.0,
+            &mut self.conv.mlp.0,
+        ]
+        .into_iter()
+        .zip([k, v, attn, mlp])
+        {
+            *history = rows.into_iter().rev().take(valid).collect();
+            history.truncate(past_rows());
+        }
+        self.position = position;
+        self.resident = false;
+    }
+
+    /// The four raw convolution histories, newest first, as the host keeps them.
+    #[cfg(all(feature = "native-cuda", target_os = "linux"))]
+    pub(super) fn histories(&self) -> [Vec<Vec<f32>>; 4] {
+        [
+            self.conv.k.0.iter().cloned().collect(),
+            self.conv.v.0.iter().cloned().collect(),
+            self.conv.attn.0.iter().cloned().collect(),
+            self.conv.mlp.0.iter().cloned().collect(),
+        ]
+    }
+
     #[cfg(all(test, feature = "native-cuda", target_os = "linux"))]
     pub(super) fn resident_history_identity(&self) -> Option<std::sync::Weak<Vec<f32>>> {
         self.keys.front().map(Arc::downgrade)
@@ -899,6 +943,80 @@ impl VisitState {
             conv(&self.conv.attn.0),
             conv(&self.conv.mlp.0),
         ]
+    }
+
+    /// Per-part fingerprints (`keys, values, k, v, attn, mlp`) and the full first and last K/V
+    /// rows and history rows of the visit, for a parity run that must name the differing part.
+    #[cfg(all(test, feature = "native-cuda", target_os = "linux"))]
+    pub(super) fn parity_parts(&self) -> (Vec<(&'static str, usize, u64)>, serde_json::Value) {
+        fn plane<'a>(rows: impl IntoIterator<Item = &'a Vec<f32>>) -> (usize, u64) {
+            use std::hash::{DefaultHasher, Hash, Hasher};
+            let mut hash = DefaultHasher::new();
+            let mut len = 0;
+            for row in rows {
+                len += 1;
+                for &value in row {
+                    value.to_bits().hash(&mut hash);
+                }
+            }
+            (len, hash.finish())
+        }
+        let keys: Vec<_> = self.keys.iter().map(Arc::as_ref).collect();
+        let values: Vec<_> = self.values.iter().map(Arc::as_ref).collect();
+        let parts = vec![
+            ("keys", plane(keys.iter().copied())),
+            ("values", plane(values.iter().copied())),
+            ("k", plane(self.conv.k.0.iter())),
+            ("v", plane(self.conv.v.0.iter())),
+            ("attn", plane(self.conv.attn.0.iter())),
+            ("mlp", plane(self.conv.mlp.0.iter())),
+        ]
+        .into_iter()
+        .map(|(name, (len, hash))| (name, len, hash))
+        .collect();
+        fn bits<'a>(rows: impl IntoIterator<Item = &'a Vec<f32>>) -> serde_json::Value {
+            serde_json::json!(
+                rows.into_iter()
+                    .map(|row| row.iter().map(|x| x.to_bits()).collect::<Vec<_>>())
+                    .collect::<Vec<_>>()
+            )
+        }
+        fn firsts<'a>(rows: &[&'a Vec<f32>]) -> Vec<&'a Vec<f32>> {
+            match rows {
+                [] => Vec::new(),
+                rows => vec![rows[0], rows[rows.len() - 1]],
+            }
+        }
+        let detail = serde_json::json!({
+            "position": self.position,
+            "keys": bits(firsts(&keys).into_iter()),
+            "values": bits(firsts(&values).into_iter()),
+            "k": bits(self.conv.k.0.iter()),
+            "v": bits(self.conv.v.0.iter()),
+            "attn": bits(self.conv.attn.0.iter()),
+            "mlp": bits(self.conv.mlp.0.iter()),
+        });
+        (parts, detail)
+    }
+
+    /// Every K/V row and history row of the visit, as bits (for a per-row parity comparison).
+    #[cfg(all(test, feature = "native-cuda", target_os = "linux"))]
+    pub(super) fn parity_rows(&self) -> serde_json::Value {
+        fn bits<'a>(rows: impl IntoIterator<Item = &'a Vec<f32>>) -> serde_json::Value {
+            serde_json::json!(
+                rows.into_iter()
+                    .map(|row| row.iter().map(|x| x.to_bits()).collect::<Vec<_>>())
+                    .collect::<Vec<_>>()
+            )
+        }
+        serde_json::json!({
+            "keys": bits(self.keys.iter().map(Arc::as_ref)),
+            "values": bits(self.values.iter().map(Arc::as_ref)),
+            "k": bits(self.conv.k.0.iter()),
+            "v": bits(self.conv.v.0.iter()),
+            "attn": bits(self.conv.attn.0.iter()),
+            "mlp": bits(self.conv.mlp.0.iter()),
+        })
     }
 
     #[cfg(all(test, feature = "native-cuda", target_os = "linux"))]
@@ -1291,6 +1409,12 @@ pub(super) fn note_resident_queries(chained: bool) {
             "Inkling CUDA kept {path} prefill attention Q, relative, sinks and gates resident"
         )
     });
+}
+
+/// Rows a convolution history keeps between groups (`taps - 1` of the four-tap kernels).
+#[cfg(all(feature = "native-cuda", target_os = "linux"))]
+pub(super) fn past_rows() -> usize {
+    3
 }
 
 pub(super) fn clip_rows(rows: &mut [f32], width: usize, limit: f32) {

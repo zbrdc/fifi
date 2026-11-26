@@ -44,7 +44,7 @@ typedef struct inference_cuda_dense_gemv_args {
 } inference_cuda_dense_gemv_args;
 
 /* The single-row split kernels: one CTA per output with K across four warps. */
-enum { INFERENCE_CUDA_DENSE_GEMV_DECODE_SPLIT = 1 };
+enum { INFERENCE_CUDA_DENSE_GEMV_DECODE_SPLIT = 1, INFERENCE_CUDA_DENSE_GEMV_PREFILL_TENSOR_GEMM = 2 };
 
 int inference_cuda_dense_gemv_launch(const inference_cuda_dense_gemv_args *args, void *stream,
                                      int *out_stage);

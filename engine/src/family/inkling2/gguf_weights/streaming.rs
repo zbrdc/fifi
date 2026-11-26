@@ -214,6 +214,38 @@ impl GgufTextWeights {
         cuda.prefill_device_experts(&mut source, layer, operands, dtypes, caps, route_weight)
     }
 
+    /// Launch-only form of [`Self::prefill_device_experts`] for the device-resident prefill
+    /// pass; see `GgufCuda::prefill_device_experts_unfenced`.
+    #[allow(clippy::too_many_arguments)]
+    pub(in crate::family::inkling2) fn prefill_device_experts_unfenced<'a>(
+        &self,
+        names: [&str; 2],
+        layer: u32,
+        (rows, destination): (ExpertPrefillRows<'_>, Option<DeviceRange<'a>>),
+        caps: [f32; 2],
+        route_weight: impl Fn(usize, usize) -> f32,
+        (stream, flag_out): (&'a crate::kernels::cuda::DeviceStream, DeviceRange<'a>),
+    ) -> Result<Option<()>, EngError> {
+        let Some(cuda) = self
+            .cuda
+            .as_ref()
+            .filter(|cuda| cuda.prefills_device_layer(layer))
+        else {
+            return Ok(None);
+        };
+        let Some((mut source, dtypes)) = self.stream_source(names, layer)? else {
+            return Ok(None);
+        };
+        cuda.prefill_device_experts_unfenced(
+            &mut source,
+            layer,
+            (rows, destination),
+            (dtypes, caps),
+            route_weight,
+            (stream, flag_out),
+        )
+    }
+
     pub(in crate::family::inkling2) fn prefill_bank_report(
         &self,
     ) -> Option<crate::sched::job::PrefillBankReport> {

@@ -268,6 +268,45 @@ pub(in crate::kernels::cuda) fn launch_gguf_moe(
     Ok(GgufMoeSchedule::from_bits(bits))
 }
 
+unsafe extern "C" {
+    fn inference_inkling_routed(
+        p: *const *mut c_void,
+        rows: c_int,
+        gate: c_int,
+        down: c_int,
+        gc: f32,
+        uc: f32,
+        stream: *mut c_void,
+        stage: *mut c_int,
+    ) -> c_int;
+}
+
+pub(in crate::kernels::cuda) fn launch_routed_prefill(
+    stream: &RawStream,
+    ranges: [RawRange<'_>; 10],
+    rows: usize,
+    kinds: [u32; 2],
+    caps: [f32; 2],
+) -> Result<(), DeviceFailure> {
+    let pointers = ranges.map(|r| r.address());
+    let mut stage = STAGE_NONE;
+    // SAFETY: routed_prefill validates all ten extents, alignments, shapes and write aliases;
+    // the C launcher copies the pointer arguments during this call.
+    let status = unsafe {
+        inference_inkling_routed(
+            pointers.as_ptr(),
+            rows as c_int,
+            kinds[0] as c_int,
+            kinds[1] as c_int,
+            caps[0],
+            caps[1],
+            stream.0.as_ptr(),
+            &mut stage,
+        )
+    };
+    checked(status, stage)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

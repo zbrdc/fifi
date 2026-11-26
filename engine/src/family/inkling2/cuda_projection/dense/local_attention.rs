@@ -163,6 +163,8 @@ pub(in crate::family::inkling2::cuda_projection) struct ResidentLocalTargets<'a,
 
 // Row offsets in the idle logits slot, in hidden-word rows.
 const RAW_AT: usize = 6;
+/// Where the controller GEMVs write the `[gain, forget]` pair of each of the three roles.
+const PAIRS_AT: usize = RAW_AT + 3 * 3;
 const NORMED_AT: usize = 21;
 const PLAIN_NORMED_AT: usize = 5;
 const CONTROLLER_ROWS: usize = 6;
@@ -175,6 +177,8 @@ struct ResidentLayout {
     roles: usize,
     normed_at: usize,
 }
+
+mod baseline;
 
 impl ResidentLayout {
     fn new(hidden: usize, bank: bool) -> Self {
@@ -245,6 +249,9 @@ impl DenseStep {
         targets: ResidentLocalTargets<'a, N>,
         role_inputs: Option<[DeviceRange<'a>; 3]>,
     ) -> Result<(), EngError> {
+        if !context.dense_group_policy().decode_glue {
+            return self.enqueue_roles_baseline(context, stream, local, targets, role_inputs);
+        }
         let ResidentLocal {
             inputs,
             controllers,
@@ -270,7 +277,10 @@ impl DenseStep {
                 return Err(bad("CUDA resident local attention projection rows differ"));
             }
         }
-        match &inputs {
+        // The rows of every controller role: the caller's triples, the gain and forget rows
+        // the GEMVs wrote (or the caller's zero rows), and the normed output rows.
+
+        let controller_rows: Vec<[DeviceRange<'_>; 6]> = match &inputs {
             ResidentLocalInputs::Plain {
                 input,
                 gamma,
@@ -278,17 +288,17 @@ impl DenseStep {
             } => {
                 require_rows("gamma", &[gamma], hidden)?;
                 require_rows("zero", &[zeros], 2 * hidden)?;
-                self.copy_rows(
-                    context,
-                    stream,
-                    &[(input, 0), (input, 1), (gamma, 2)],
-                    hidden,
-                )?;
-                context.copy_device(
-                    stream,
-                    *zeros,
-                    self.range(Slot::Output, 3 * hidden, 2 * hidden)?,
-                )?;
+                // One role with identity control: the caller's zero rows are the gain and
+                // forget rows, so nothing is copied into the workspace.
+                let out = self.range(Slot::Output, layout.normed_at * hidden, hidden)?;
+                vec![[
+                    *input,
+                    *input,
+                    *gamma,
+                    zeros.slice(0, hidden * size_of::<f32>())?,
+                    zeros.slice(hidden * size_of::<f32>(), hidden * size_of::<f32>())?,
+                    out,
+                ]]
             }
             ResidentLocalInputs::Controlled {
                 input,
@@ -305,35 +315,26 @@ impl DenseStep {
                 let roles = role_inputs.unwrap_or([*input; 3]);
                 require_rows("role input", &roles.each_ref(), hidden)?;
                 self.norm_gates(context, stream, (&roles, messages, gate_health), hidden)?;
-                for role in 0..3 {
-                    let at = RAW_AT + 3 * role;
-                    self.copy_rows(
-                        context,
-                        stream,
-                        &[
-                            (&roles[role], at),
-                            (&messages[role], at + 1),
-                            (&gammas[role], at + 2),
-                        ],
-                        hidden,
-                    )?;
-                }
+                // The controller GEMVs write the gain and forget rows into the work slot; the
+                // norm reads them next to the caller's input, message and gamma rows.
                 let calls =
                     self.controlled_attention_calls(hidden, controllers.expect("bank checked"))?;
                 context.dense_gemv_group(stream, &calls)?;
+                let mut rows = Vec::with_capacity(3);
+                for role in 0..3 {
+                    rows.push([
+                        roles[role],
+                        messages[role],
+                        gammas[role],
+                        self.range(Slot::Output, (PAIRS_AT + 2 * role) * hidden, hidden)?,
+                        self.range(Slot::Output, (PAIRS_AT + 1 + 2 * role) * hidden, hidden)?,
+                        self.range(Slot::Output, (layout.normed_at + role) * hidden, hidden)?,
+                    ]);
+                }
+                rows
             }
-        }
-        let workspace = self.range(
-            Slot::Output,
-            layout.workspace_at,
-            CONTROLLER_ROWS * layout.roles * hidden,
-        )?;
-        context.inkling_controller_norm_roles(
-            stream,
-            workspace,
-            *health,
-            ([hidden, layout.roles], eps),
-        )?;
+        };
+        context.inkling_controller_norm_rows(stream, &controller_rows, *health, (hidden, eps))?;
         let calls = weights
             .into_iter()
             .zip(targets.projections)
@@ -346,26 +347,9 @@ impl DenseStep {
         context.dense_gemv_group(stream, &calls)
     }
 
-    /// Copy whole rows into the logits slot from `(source, destination row)` pairs.
-    fn copy_rows(
-        &self,
-        context: &CudaContext,
-        stream: &DeviceStream,
-        rows: &[(&DeviceRange<'_>, usize)],
-        hidden: usize,
-    ) -> Result<(), EngError> {
-        for (source, row) in rows {
-            context.copy_device(
-                stream,
-                **source,
-                self.range(Slot::Output, row * hidden, hidden)?,
-            )?;
-        }
-        Ok(())
-    }
-
-    /// The six gate halves: `inkling_stream_norm` of the shared input and of each message
-    /// into `[input | message]` rows with eps `MIX_EPS`; health into `gate_health`.
+    /// The six gate halves: one `inkling_stream_norm_rows` launch that norms the shared input
+    /// and each message into `[input | message]` rows with eps `MIX_EPS`; health into
+    /// `gate_health`.
     fn norm_gates(
         &self,
         context: &CudaContext,
@@ -377,23 +361,23 @@ impl DenseStep {
         ),
         hidden: usize,
     ) -> Result<(), EngError> {
-        for role in 0..3 {
-            for (half, src) in [&inputs[role], &messages[role]].into_iter().enumerate() {
+        // One launch: the six norms are independent rows of one width.
+        let rows = (0..3)
+            .flat_map(|role| {
+                [&inputs[role], &messages[role]]
+                    .into_iter()
+                    .enumerate()
+                    .map(move |(half, src)| (role, half, src))
+            })
+            .map(|(role, half, src)| {
                 let at = (2 * role + half) * hidden;
-                let dst = self.range(Slot::Output, at, hidden)?;
-                let health =
-                    health.slice((2 * role + half) * size_of::<f32>(), size_of::<f32>())?;
-                context.inkling_stream_norm(
-                    stream,
-                    NormCall {
-                        src: *src,
-                        dst,
-                        health,
-                    },
-                    (hidden, MIX_EPS),
-                )?;
-            }
-        }
-        Ok(())
+                Ok(NormCall {
+                    src: *src,
+                    dst: self.range(Slot::Output, at, hidden)?,
+                    health: health.slice((2 * role + half) * size_of::<f32>(), size_of::<f32>())?,
+                })
+            })
+            .collect::<Result<Vec<_>, EngError>>()?;
+        context.inkling_stream_norm_rows(stream, &rows, (hidden, MIX_EPS))
     }
 }

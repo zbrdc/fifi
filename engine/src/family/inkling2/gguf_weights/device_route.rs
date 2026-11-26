@@ -37,6 +37,28 @@ impl GgufTextWeights {
 }
 
 impl GgufTextWeights {
+    /// Additional launch-only grouped stage for the prefill pass. No host route weights or ids.
+    #[allow(dead_code, reason = "call site staged on the resident-pass branch")]
+    pub(in crate::family::inkling2) fn prefill_device_routed_experts(
+        &self,
+        layer: u32,
+        stream: &crate::kernels::cuda::DeviceStream,
+        rows: crate::kernels::cuda::resident::dense_gemv::routed_prefill::DeviceRoutedPrefill<'_>,
+        caps: [f32; 2],
+    ) -> Result<Option<()>, EngError> {
+        if !crate::family::inkling2::switches::Switch::PrefillTensorGemm.on() {
+            return Ok(None);
+        }
+        let Some(cuda) = self.cuda.as_ref().filter(|c| c.has_resident_route(layer)) else {
+            return Ok(None);
+        };
+        let prefix = format!("model.llm.layers.{layer}.mlp");
+        let Some(dtypes) = self.resident_expert_dtypes(&prefix)? else {
+            return Ok(None);
+        };
+        cuda.enqueue_device_routed_prefill(stream, layer, rows, dtypes, caps)
+    }
+
     pub(in crate::family::inkling2) fn device_routed_experts(
         &self,
         prefix: &str,

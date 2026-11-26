@@ -176,6 +176,7 @@ impl Sequence {
                     .unwrap(),
                 history: self.history(),
                 out: out_range,
+                state: None,
                 health: self.health_range(),
             },
             (self.width, self.taps),
@@ -417,6 +418,7 @@ fn wrapper_rejects_bad_shapes_and_shared_bytes_by_error_text() {
                 kernel: kernel_range,
                 history,
                 out,
+                state: None,
                 health,
             },
             shape,
@@ -528,4 +530,113 @@ fn wrapper_rejects_bad_shapes_and_shared_bytes_by_error_text() {
     // `out` exactly `input` is accepted, and the context still launches afterwards.
     call(good_input, good_history, good_input, (width, taps)).unwrap();
     call(good_input, good_history, good_out, (width, taps)).unwrap();
+}
+
+/// A `state` row takes `state += out` as the add launch would (bit-exact, one rounded add) while
+/// the output is the plain convolution's; a `state` that overlaps the output or the history is
+/// refused before any launch.
+#[test]
+fn a_state_row_takes_the_convolved_row_as_the_add_launch_would() {
+    use crate::kernels::cuda::resident::inkling_stream::AddCall;
+
+    if !device_present("Inkling conv state add") {
+        return;
+    }
+    let ctx = CudaContext::new().unwrap();
+    let stream = ctx.stream().unwrap();
+    let (width, taps) = (2304usize, 4usize);
+    let row = row_bytes(width);
+    let word = size_of::<f32>();
+    let kernel = normal_row(&mut Rng::new(0x57a7_eadd), width * taps);
+    let sequence = Sequence::new(&ctx, &stream, 8, width, taps, &kernel);
+    let mut host_history = Vec::new();
+    for step in 0..6usize {
+        let input = normal_row(&mut Rng::new(100 + step as u64), width);
+        let history_before = download(
+            &sequence.rows,
+            &stream,
+            sequence.row(sequence.steps),
+            width * (taps - 1),
+        );
+        let plain = sequence
+            .conv(&ctx, &stream, step, &input, Output::Disjoint)
+            .unwrap();
+        let current = normal_row(&mut Rng::new(500 + step as u64), width);
+        let expected = host::apply(&input, &kernel, taps, &mut host_history);
+        assert_within_relative(&plain, &expected, "plain output");
+        // The state row: the plain output added into it by the add launch ...
+        let state = ctx.allocate(row * 2).unwrap();
+        upload(&state, &stream, 0, &current);
+        upload(
+            &state,
+            &stream,
+            row,
+            &normal_row(&mut Rng::new(900 + step as u64), width),
+        );
+        upload(&sequence.health, &stream, 0, &[0.0]);
+        ctx.inkling_stream_add(
+            &stream,
+            AddCall {
+                state: state.range(0, row).unwrap(),
+                row: sequence.out.range(0, row).unwrap(),
+                health: sequence.health_range(),
+            },
+            width,
+        )
+        .unwrap();
+        let added = download(&state, &stream, 0, width);
+        assert_eq!(sequence.health(&stream).to_bits(), 0);
+        let host_added: Vec<f32> = current.iter().zip(&plain).map(|(a, b)| a + b).collect();
+        assert_eq!(added, host_added, "step {step}: the add launch");
+        // ... equals the fused launch: `state[c] += out[c]` inside the convolution.
+        upload(&state, &stream, 0, &current);
+        upload(&state, &stream, row, &input);
+        // The same history the plain convolution saw.
+        upload(
+            &sequence.rows,
+            &stream,
+            sequence.row(sequence.steps),
+            &history_before,
+        );
+        upload(&sequence.health, &stream, 0, &[0.0]);
+        ctx.inkling_conv(
+            &stream,
+            ConvCall {
+                input: state.range(row, row).unwrap(),
+                kernel: sequence.kernel.range(0, row * taps).unwrap(),
+                history: sequence.history(),
+                out: sequence.out.range(0, row).unwrap(),
+                state: Some(state.range(0, row).unwrap()),
+                health: sequence.health_range(),
+            },
+            (width, taps),
+        )
+        .unwrap();
+        let fused = download(&sequence.out, &stream, 0, width);
+        let fused_state = download(&state, &stream, 0, width);
+        assert_within_relative(&fused, &expected, "fused output");
+        assert_eq!(fused_state, added, "step {step}: the state add");
+        assert_eq!(sequence.health(&stream).to_bits(), 0);
+    }
+    // A `state` sharing bytes with the output is refused by error text, before any launch.
+    let input = normal_row(&mut Rng::new(7), width);
+    upload(&sequence.rows, &stream, 0, &input);
+    let error = ctx
+        .inkling_conv(
+            &stream,
+            ConvCall {
+                input: sequence.input(0),
+                kernel: sequence.kernel.range(0, row * taps).unwrap(),
+                history: sequence.history(),
+                out: sequence.out.range(0, row).unwrap(),
+                state: Some(sequence.out.range(word, row - word).unwrap()),
+                health: sequence.health_range(),
+            },
+            (width, taps),
+        )
+        .unwrap_err();
+    assert!(
+        format!("{error:?}").contains("Inkling conv state"),
+        "{error:?}"
+    );
 }

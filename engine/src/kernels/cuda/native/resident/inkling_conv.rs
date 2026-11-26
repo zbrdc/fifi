@@ -30,6 +30,7 @@ unsafe extern "C" {
         kernel: *const c_void,
         history: *mut c_void,
         out: *mut c_void,
+        state: *mut c_void,
         health: *mut c_void,
         width: c_int,
         taps: c_int,
@@ -44,6 +45,8 @@ pub(in crate::kernels::cuda) struct ConvRaw<'a> {
     pub(in crate::kernels::cuda) kernel: RawRange<'a>,
     pub(in crate::kernels::cuda) history: RawRange<'a>,
     pub(in crate::kernels::cuda) out: RawRange<'a>,
+    /// The current row of a depth stream, which takes `state[c] += out[c]`, or absent.
+    pub(in crate::kernels::cuda) state: Option<RawRange<'a>>,
     pub(in crate::kernels::cuda) health: RawRange<'a>,
 }
 
@@ -62,7 +65,8 @@ fn out_is_input_or_apart(out: &Span<'_>, input: &Span<'_>) -> bool {
 }
 
 /// `out[c] = (acc + input[c]) * (1 / sqrt(taps + 1))` with `acc` the host's ordered tap sum of
-/// `input[c]` and the `taps - 1` history rows (`CausalConv::apply`).
+/// `input[c]` and the `taps - 1` history rows (`CausalConv::apply`); with a `state`, then
+/// `state[c] += out[c]`.
 pub(in crate::kernels::cuda) fn launch(
     stream: &RawStream,
     call: &ConvRaw<'_>,
@@ -78,6 +82,7 @@ pub(in crate::kernels::cuda) fn launch(
         || !sized(&call.history, history)
         || !sized(&call.out, row)
         || !sized(&call.health, health)
+        || call.state.is_some_and(|state| !sized(&state, row))
     {
         return Err(invalid_argument());
     }
@@ -98,6 +103,17 @@ pub(in crate::kernels::cuda) fn launch(
         && kernel.apart(&history)
         && kernel.apart(&health)
         && history.apart(&health);
+    if let Some(state) = &call.state {
+        let state = Span::of(state, row);
+        if !input.apart(&state)
+            || !out.apart(&state)
+            || !kernel.apart(&state)
+            || !history.apart(&state)
+            || !health.apart(&state)
+        {
+            return Err(invalid_argument());
+        }
+    }
     if !apart {
         return Err(invalid_argument());
     }
@@ -110,6 +126,8 @@ pub(in crate::kernels::cuda) fn launch(
             call.kernel.address() as *const c_void,
             call.history.address(),
             call.out.address(),
+            call.state
+                .map_or(std::ptr::null_mut(), |state| state.address()),
             call.health.address(),
             width as c_int,
             taps as c_int,

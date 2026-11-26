@@ -148,7 +148,9 @@ const CUDA_SOURCES: &[&str] = &[
     "src/kernels/cuda/native/resident/draft_attention_bf16.cu",
     "src/kernels/cuda/native/resident/correct_draft_logits_bf16.cu",
     "src/kernels/cuda/native/resident/inkling_stream.cu",
+    "src/kernels/cuda/native/resident/inkling_stream_baseline.cu",
     "src/kernels/cuda/native/resident/inkling_conv.cu",
+    "src/kernels/cuda/native/resident/inkling_pass.cu",
 ];
 
 /// The vendored llama.cpp MMQ sources that compile to objects. Their build group:
@@ -305,6 +307,7 @@ const CUDA_HEADERS: &[&str] = &[
     "src/kernels/cuda/native/resident/inkling_exact_visit_tile.cuh",
     "src/kernels/cuda/native/resident/inkling_split_visit_tile.cuh",
     "src/kernels/cuda/native/resident/inkling_iq2_visit_tile.cuh",
+    "src/kernels/cuda/native/resident/inkling_tensor_gemm.cuh",
     "src/kernels/cuda/native/resident/inkling_controller_pair.cuh",
     "src/kernels/cuda/native/resident/inkling_stream_visit.cuh",
     "src/kernels/cuda/native/resident/inkling_splitn_visit.cuh",
@@ -328,9 +331,11 @@ const CUDA_HEADERS: &[&str] = &[
     "src/kernels/cuda/native/resident/inkling_f32_visit.cuh",
     "src/kernels/cuda/native/resident/inkling_q6_imma.cuh",
     "src/kernels/cuda/native/resident/inkling_panel_wide.cuh",
+    "src/kernels/cuda/native/resident/inkling_routed_prefill.cuh",
     "src/kernels/cuda/native/resident/inkling_weight_panel.cuh",
     "src/kernels/cuda/native/resident/gguf_gemv.cuh",
     "src/kernels/cuda/native/resident/inkling_conv.h",
+    "src/kernels/cuda/native/resident/inkling_pass.h",
     "src/kernels/cuda/native/resident/inkling_decode_experts.cuh",
     "src/kernels/cuda/native/resident/inkling_decode_control_pair.cuh",
     "src/kernels/cuda/native/resident/inkling_decode_attention_group.cuh",

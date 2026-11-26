@@ -87,10 +87,17 @@ pub(in crate::family::inkling2) struct Row<'a> {
     pub gates: &'a [f32],
 }
 
+pub(in crate::family::inkling2) struct TileParts<'a> {
+    pub shape: RelativeAttentionShape,
+    pub table: DeviceRange<'a>,
+    pub k_cache: DeviceRange<'a>,
+    pub v_cache: DeviceRange<'a>,
+}
+
 pub(in crate::family::inkling2) struct OutputProjection<'a> {
-    pub(super) weight: DeviceRange<'a>,
-    pub(super) dtype: DenseDtype,
-    pub(super) rows: usize,
+    pub(in crate::family::inkling2) weight: DeviceRange<'a>,
+    pub(in crate::family::inkling2) dtype: DenseDtype,
+    pub(in crate::family::inkling2) rows: usize,
 }
 
 pub(in crate::family::inkling2) struct History<'a> {
@@ -341,6 +348,29 @@ impl ResidentAttention {
 
     pub(super) fn projected_rows(&self) -> Option<usize> {
         self.projected_rows
+    }
+
+    /// The read-only parts of one visit's relative-attention tile for a device-resident
+    /// caller: the shape, the bias table and the two rings.
+    pub(in crate::family::inkling2) fn tile_parts(&self, slot: usize) -> Option<TileParts<'_>> {
+        let visit = self.visits.get(slot)?;
+        Some(TileParts {
+            shape: visit.shape,
+            table: self.arena.range(visit.table_at, visit.table_bytes).ok()?,
+            k_cache: self.arena.range(visit.cache_at, visit.cache_bytes).ok()?,
+            v_cache: self
+                .arena
+                .range(visit.cache_at + visit.cache_bytes, visit.cache_bytes)
+                .ok()?,
+        })
+    }
+
+    /// The device ring of `slot` holds every row below `position` and no row above it.
+    /// Only a caller that fenced the launch of those rows may certify the cursor.
+    pub(in crate::family::inkling2) fn certify(&self, slot: usize, position: usize) {
+        if let Some(cursor) = self.state.borrow_mut().next_position.get_mut(slot) {
+            *cursor = Some(position);
+        }
     }
 
     pub(in crate::family::inkling2) fn invalidate(&self) {

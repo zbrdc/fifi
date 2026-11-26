@@ -283,6 +283,7 @@ impl Rows {
             health: self.range(4, 1),
             gate_health: self.range(4, 2).slice(4, 4).unwrap(),
             status: self.words.range(EXPERTS * 4, 4).unwrap(),
+            pre_normed: None,
         }
     }
 

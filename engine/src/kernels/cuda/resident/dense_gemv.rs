@@ -153,8 +153,11 @@ pub(crate) struct DenseGroupPolicy {
     /// One launch for the six or eight attention matvecs of a decode step, and one per
     /// controller pair.
     pub(crate) decode_split: bool,
+    pub(crate) decode_glue: bool,
     /// The weight-visit kernels: measured shapes read their weights once for all rows.
     pub(crate) weight_visit: bool,
+    /// Wider SM75 tile for measured expert prefill shapes.
+    pub(crate) prefill_tensor_gemm: bool,
 }
 
 fn invalid_shape(shape: DenseGemvShape) -> EngError {
@@ -423,12 +426,14 @@ impl CudaContext {
             x: self.raw_range(&call.x)?,
             y: self.raw_range(&call.y)?,
             weight_visit: self.dense_group_policy().weight_visit,
+            prefill_tensor_gemm: self.dense_group_policy().prefill_tensor_gemm,
             decode_split: self.dense_group_policy().decode_split,
         })
     }
 }
 
 mod moe;
+pub(crate) mod routed_prefill;
 pub(crate) use crate::kernels::cuda::native::resident::dense_gemv::moe::{
     GgufGate, GgufMoeSchedule,
 };
