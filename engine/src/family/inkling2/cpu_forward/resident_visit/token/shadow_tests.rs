@@ -1,5 +1,23 @@
 use super::*;
 
+/// Whether the device products are the exact f32 ones, the decode experts and the prompt's
+/// projections and experts. The chain and the host token path agree to rounding only then: the
+/// q8_1 products quantize each visit's inputs, so state rows drift apart by a few percent over a
+/// long run. The comparisons print why they skip; the test chains run them with the three
+/// switches below off.
+pub(super) fn exact_products(test: &str) -> bool {
+    use crate::family::inkling2::switches::Switch;
+    let exact = !Switch::DecodeQ8Experts.on()
+        && !Switch::PrefillTensorCoreProjections.on()
+        && !Switch::PrefillTensorCoreExperts.on();
+    if !exact {
+        eprintln!(
+            "{test}: skipped, it compares to the f32 products; set FIFI_INKLING_CUDA_DECODE_Q8_EXPERTS=0, FIFI_INKLING_CUDA_PREFILL_TENSOR_CORE_PROJECTIONS=0 and FIFI_INKLING_CUDA_PREFILL_TENSOR_CORE_EXPERTS=0"
+        );
+    }
+    exact
+}
+
 #[derive(Default)]
 pub(super) struct Error {
     n: usize,
@@ -37,6 +55,9 @@ impl Error {
 #[test]
 #[ignore = "requires a leased CUDA device and real packed Inkling GGUF"]
 fn shadow_snapshot_restore_and_resume() {
+    if !exact_products("shadow_snapshot_restore_and_resume") {
+        return;
+    }
     let path = std::env::var_os("FIFI_INKLING_MODEL_DIR").unwrap();
     let run = |oracle: bool| {
         let mut f = CpuForward::open(std::path::Path::new(&path), 768).unwrap();

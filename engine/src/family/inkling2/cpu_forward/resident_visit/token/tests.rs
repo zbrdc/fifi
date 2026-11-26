@@ -3,6 +3,9 @@ use super::*;
 #[test]
 #[ignore = "requires leased CUDA and fully resident Inkling Mini GGUF"]
 fn whole_token_logits_agree_after_warm_host_row() {
+    if !super::shadow_tests::exact_products("whole_token_logits_agree_after_warm_host_row") {
+        return;
+    }
     let path = std::env::var_os("FIFI_INKLING_MODEL_DIR").unwrap();
     let load = || {
         let mut f = CpuForward::open(std::path::Path::new(&path), 768).unwrap();

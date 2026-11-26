@@ -165,6 +165,9 @@ fn compare(fixture: &Fixture, every: usize, oracle: &Run, chain: &Run) {
 #[test]
 #[ignore = "requires a leased CUDA device, the Inkling GGUF and FIFI_INKLING_FIXTURES"]
 fn snapshots_after_chain_tokens_match_the_host_path() {
+    if !super::shadow_tests::exact_products("snapshots_after_chain_tokens_match_the_host_path") {
+        return;
+    }
     let path = std::path::PathBuf::from(std::env::var_os("FIFI_INKLING_MODEL_DIR").unwrap());
     for fixture in fixtures() {
         let oracle = {
