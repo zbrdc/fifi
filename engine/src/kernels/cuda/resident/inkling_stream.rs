@@ -18,7 +18,7 @@ use crate::kernels::cuda::{
 
 use super::super::native::resident::inkling_stream::{self as native};
 pub(crate) use super::super::native::resident::inkling_stream::{
-    MAX_BLOCKS, MAX_MIX_JOBS, MAX_NORM_ROWS, MAX_ORDERED_WIDTH, MAX_STATES, States,
+    MAX_BLOCKS, MAX_MIX_JOBS, MAX_NORM_ROWS, MAX_STATES, States,
 };
 
 const MAX_WIDTH: usize = 8192;
@@ -72,9 +72,9 @@ pub(crate) struct AddCall<'a> {
     pub(crate) health: DeviceRange<'a>,
 }
 
-/// The ranges of a host-ordered mix. Without `query` the output is the raw current row; with
-/// `gamma` it is `norm(mix) * gamma` (`CpuForward::norm`).
-pub(crate) struct OrderedMixCall<'a> {
+/// The ranges of a mix of several states. Without `query` the output is the raw current row;
+/// with `gamma` it is `norm(mix) * gamma` (`CpuForward::norm`).
+pub(crate) struct MixStatesCall<'a> {
     pub(crate) state: DeviceRange<'a>,
     pub(crate) query: Option<DeviceRange<'a>>,
     pub(crate) gamma: Option<DeviceRange<'a>>,
@@ -82,9 +82,9 @@ pub(crate) struct OrderedMixCall<'a> {
     pub(crate) health: DeviceRange<'a>,
 }
 
-/// The shape of a host-ordered mix; output rows are `out_stride` floats apart.
+/// The shape of a mix of several states; output rows are `out_stride` floats apart.
 #[derive(Clone, Copy, Debug, PartialEq)]
-pub(crate) struct OrderedMixShape {
+pub(crate) struct MixStatesShape {
     pub(crate) first_block: usize,
     pub(crate) blocks: usize,
     pub(crate) width: usize,
@@ -167,7 +167,25 @@ impl CudaContext {
         call: MixCall<'_>,
         shape: MixShape,
     ) -> Result<(), EngError> {
-        self.inkling_stream_mix_states(stream, call, shape, States::one(shape.blocks + 1))
+        self.inkling_stream_mix_states(
+            stream,
+            MixStatesCall {
+                state: call.state,
+                query: Some(call.query),
+                gamma: None,
+                out: call.out,
+                health: call.health,
+            },
+            MixStatesShape {
+                first_block: shape.first_block,
+                blocks: shape.blocks,
+                width: shape.width,
+                out_stride: shape.width,
+                mix_eps: shape.eps,
+                norm_eps: 1.0,
+            },
+            States::one(shape.blocks + 1),
+        )
     }
 
     /// [`Self::inkling_stream_mix`] of independent jobs in one launch, a block per job: each
@@ -227,59 +245,6 @@ impl CudaContext {
         self.launch_on(stream, |s| native::mix_jobs(s, &raw, health, (width, eps)))
     }
 
-    /// [`Self::inkling_stream_mix`] of each of `states`, the outputs packed one row apart.
-    pub(crate) fn inkling_stream_mix_states(
-        &self,
-        stream: &DeviceStream,
-        call: MixCall<'_>,
-        shape: MixShape,
-        states: States,
-    ) -> Result<(), EngError> {
-        check_shape(
-            "mix",
-            shape.first_block,
-            shape.blocks,
-            shape.width,
-            shape.eps,
-        )?;
-        let row = shape.width * size_of::<f32>();
-        let state = state_bytes(states, shape.blocks + 1, shape.width)?;
-        let out = states.rows * row;
-        let health = size_of::<f32>();
-        check_row("Inkling stream state", &call.state, state)?;
-        check_row("Inkling stream query", &call.query, row)?;
-        check_row("Inkling stream mix output", &call.out, out)?;
-        check_row("Inkling stream health", &call.health, health)?;
-        writes_apart(
-            [
-                Claim::of("Inkling stream mix output", &call.out, out),
-                Claim::of("Inkling stream health", &call.health, health),
-            ],
-            [
-                Claim::of("Inkling stream state", &call.state, state),
-                Claim::of("Inkling stream query", &call.query, row),
-            ],
-        )?;
-        self.ensure_usable()?;
-        let (state, query, out, health) = (
-            self.raw_range(&call.state)?,
-            self.raw_range(&call.query)?,
-            self.raw_range(&call.out)?,
-            self.raw_range(&call.health)?,
-        );
-        self.launch_on(stream, |raw| {
-            native::mix(
-                raw,
-                state,
-                query,
-                out,
-                health,
-                [shape.first_block, shape.blocks, shape.width],
-                (shape.eps, states),
-            )
-        })
-    }
-
     /// `Stream::seal(next)` of the host: the current row is RMS-normalized into the new sealed
     /// row, then replaced by `next`. The sealed row agrees with the host within rounding.
     pub(crate) fn inkling_stream_seal(
@@ -294,111 +259,6 @@ impl CudaContext {
     /// [`Self::inkling_stream_seal`] of each of `states`, the next rows packed one row apart.
     pub(crate) fn inkling_stream_seal_states(
         &self,
-        stream: &DeviceStream,
-        call: SealCall<'_>,
-        shape: StreamShape,
-        states: States,
-    ) -> Result<(), EngError> {
-        self.seal_states_with(false, stream, call, shape, states)
-    }
-
-    /// [`Self::inkling_stream_seal_states`] with the scale summed in the host's element order:
-    /// the sealed rows are the host's bits.
-    pub(crate) fn inkling_stream_seal_ordered(
-        &self,
-        stream: &DeviceStream,
-        call: SealCall<'_>,
-        shape: StreamShape,
-        states: States,
-    ) -> Result<(), EngError> {
-        if shape.width > MAX_ORDERED_WIDTH {
-            return Err(EngError::BadRequest(format!(
-                "the ordered CUDA Inkling stream seal takes at most {MAX_ORDERED_WIDTH} columns"
-            )));
-        }
-        self.seal_states_with(true, stream, call, shape, states)
-    }
-
-    /// `Stream::mix` of the host for each of `states`, summed in the host's element order on one
-    /// lane, so the output is the host's bits; see [`OrderedMixCall`] for the optional operands.
-    pub(crate) fn inkling_stream_mix_ordered(
-        &self,
-        stream: &DeviceStream,
-        call: OrderedMixCall<'_>,
-        shape: OrderedMixShape,
-        states: States,
-    ) -> Result<(), EngError> {
-        let eps = |set: bool, eps: f32| if set { eps } else { 1.0 };
-        check_shape(
-            "ordered mix",
-            shape.first_block,
-            shape.blocks,
-            shape.width,
-            eps(call.query.is_some(), shape.mix_eps),
-        )?;
-        check_shape(
-            "ordered mix norm",
-            0,
-            0,
-            shape.width,
-            eps(call.gamma.is_some(), shape.norm_eps),
-        )?;
-        if shape.width > MAX_ORDERED_WIDTH || shape.out_stride < shape.width {
-            return Err(EngError::BadRequest(format!(
-                "the ordered CUDA Inkling stream mix takes at most {MAX_ORDERED_WIDTH} columns and \
-                 an output stride of at least the width, got {} and {}",
-                shape.width, shape.out_stride
-            )));
-        }
-        let row = shape.width * size_of::<f32>();
-        let state = state_bytes(states, shape.blocks + 1, shape.width)?;
-        let out = ((states.rows - 1) * shape.out_stride + shape.width) * size_of::<f32>();
-        let health = size_of::<f32>();
-        check_row("Inkling stream state", &call.state, state)?;
-        for (name, range) in [("query", &call.query), ("gamma", &call.gamma)] {
-            if let Some(range) = range {
-                check_row(name, range, row)?;
-            }
-        }
-        check_row("Inkling ordered mix output", &call.out, out)?;
-        check_row("Inkling stream health", &call.health, health)?;
-        let mut reads = vec![Claim::of("Inkling stream state", &call.state, state)];
-        reads.extend(call.query.iter().map(|q| Claim::of("query", q, row)));
-        reads.extend(call.gamma.iter().map(|g| Claim::of("gamma", g, row)));
-        writes_apart(
-            [
-                Claim::of("Inkling ordered mix output", &call.out, out),
-                Claim::of("Inkling stream health", &call.health, health),
-            ],
-            reads,
-        )?;
-        self.ensure_usable()?;
-        let raw = native::OrderedMixRaw {
-            state: self.raw_range(&call.state)?,
-            query: call.query.as_ref().map(|q| self.raw_range(q)).transpose()?,
-            gamma: call.gamma.as_ref().map(|g| self.raw_range(g)).transpose()?,
-            out: self.raw_range(&call.out)?,
-            health: self.raw_range(&call.health)?,
-        };
-        self.launch_on(stream, |stream| {
-            native::mix_ordered(
-                stream,
-                raw,
-                [
-                    shape.first_block,
-                    shape.blocks,
-                    shape.width,
-                    shape.out_stride,
-                ],
-                [shape.mix_eps, shape.norm_eps],
-                states,
-            )
-        })
-    }
-
-    fn seal_states_with(
-        &self,
-        ordered: bool,
         stream: &DeviceStream,
         call: SealCall<'_>,
         shape: StreamShape,
@@ -426,25 +286,93 @@ impl CudaContext {
             self.raw_range(&call.health)?,
         );
         self.launch_on(stream, |raw| {
-            if ordered {
-                native::seal_ordered(
-                    raw,
-                    [state, next, health],
-                    [shape.blocks, shape.width],
-                    shape.eps,
-                    states,
-                )
-            } else {
-                native::seal(
-                    raw,
-                    state,
-                    next,
-                    health,
-                    [shape.blocks, shape.width],
-                    shape.eps,
-                    states,
-                )
+            native::seal(
+                raw,
+                state,
+                next,
+                health,
+                [shape.blocks, shape.width],
+                shape.eps,
+                states,
+            )
+        })
+    }
+
+    /// [`Self::inkling_stream_mix`] of each of `states`, with the optional operands of
+    /// [`MixStatesCall`]. Each output row has the bits of the same state mixed on its own, and a
+    /// norm fused by `gamma` those of `enqueue_row_weighted_norm` on the mix.
+    pub(crate) fn inkling_stream_mix_states(
+        &self,
+        stream: &DeviceStream,
+        call: MixStatesCall<'_>,
+        shape: MixStatesShape,
+        states: States,
+    ) -> Result<(), EngError> {
+        let eps = |set: bool, eps: f32| if set { eps } else { 1.0 };
+        check_shape(
+            "mix",
+            shape.first_block,
+            shape.blocks,
+            shape.width,
+            eps(call.query.is_some(), shape.mix_eps),
+        )?;
+        check_shape(
+            "mix norm",
+            0,
+            0,
+            shape.width,
+            eps(call.gamma.is_some(), shape.norm_eps),
+        )?;
+        if shape.out_stride < shape.width {
+            return Err(EngError::BadRequest(format!(
+                "the CUDA Inkling stream mix takes an output stride of at least the width, got {} \
+                 for {} columns",
+                shape.out_stride, shape.width
+            )));
+        }
+        let row = shape.width * size_of::<f32>();
+        let state = state_bytes(states, shape.blocks + 1, shape.width)?;
+        let out = ((states.rows - 1) * shape.out_stride + shape.width) * size_of::<f32>();
+        let health = size_of::<f32>();
+        check_row("Inkling stream state", &call.state, state)?;
+        for (name, range) in [("query", &call.query), ("gamma", &call.gamma)] {
+            if let Some(range) = range {
+                check_row(name, range, row)?;
             }
+        }
+        check_row("Inkling stream mix output", &call.out, out)?;
+        check_row("Inkling stream health", &call.health, health)?;
+        let mut reads = vec![Claim::of("Inkling stream state", &call.state, state)];
+        reads.extend(call.query.iter().map(|q| Claim::of("query", q, row)));
+        reads.extend(call.gamma.iter().map(|g| Claim::of("gamma", g, row)));
+        writes_apart(
+            [
+                Claim::of("Inkling stream mix output", &call.out, out),
+                Claim::of("Inkling stream health", &call.health, health),
+            ],
+            reads,
+        )?;
+        self.ensure_usable()?;
+        let raw = native::MixRaw {
+            state: self.raw_range(&call.state)?,
+            query: call.query.as_ref().map(|q| self.raw_range(q)).transpose()?,
+            gamma: call.gamma.as_ref().map(|g| self.raw_range(g)).transpose()?,
+            out: self.raw_range(&call.out)?,
+            health: self.raw_range(&call.health)?,
+        };
+        self.launch_on(stream, |stream| {
+            native::mix(
+                stream,
+                raw,
+                [
+                    shape.first_block,
+                    shape.blocks,
+                    shape.width,
+                    shape.out_stride,
+                ],
+                [shape.mix_eps, shape.norm_eps],
+                states,
+            )
         })
     }
 

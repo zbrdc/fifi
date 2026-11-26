@@ -1,10 +1,12 @@
 use std::mem::size_of;
 
-use crate::kernels::cuda::{CudaContext, DeviceBuffer, DeviceStream, device_present, testkit::Rng};
+use crate::kernels::cuda::{
+    CudaContext, DeviceBuffer, DeviceStream, device_present, lane_mix, lane_norm, testkit::Rng,
+};
 
 use super::{
-    AddCall, MAX_BLOCKS, MAX_MIX_JOBS, MAX_NORM_ROWS, MixCall, MixJob, MixShape, NormCall,
-    SealCall, States, StreamShape,
+    AddCall, MAX_BLOCKS, MAX_MIX_JOBS, MAX_NORM_ROWS, MixCall, MixJob, MixShape, MixStatesCall,
+    MixStatesShape, NormCall, SealCall, States, StreamShape,
 };
 
 const EPS: f32 = 1e-5;
@@ -176,8 +178,10 @@ fn max_error(out: &[f32], expected: &[f32]) -> f32 {
         .fold(0.0f32, f32::max)
 }
 
+/// Within rounding of the host's `Stream::mix`, and bit for bit the lane-order model of the
+/// device mix ([`lane_mix`]).
 #[test]
-fn mix_matches_the_host_algorithm_within_rounding() {
+fn mix_matches_the_host_algorithm_within_rounding_and_the_lane_order_bit_for_bit() {
     if !device_present("Inkling stream mix") {
         return;
     }
@@ -203,6 +207,14 @@ fn mix_matches_the_host_algorithm_within_rounding() {
                 assert!(
                     error <= 1e-4,
                     "width {width} blocks {blocks} first_block {first_block}: max error {error}"
+                );
+                let rows: Vec<&[f32]> = sealed.iter().map(Vec::as_slice).collect();
+                let lane = lane_mix(&current, &rows, first_block, &query, EPS);
+                assert!(
+                    out.iter()
+                        .map(|v| v.to_bits())
+                        .eq(lane.iter().map(|v| v.to_bits())),
+                    "width {width} blocks {blocks} first_block {first_block}: lane order bits"
                 );
                 let health = buffers.health(&stream);
                 assert_eq!(health.to_bits(), 0, "width {width} blocks {blocks}");
@@ -507,7 +519,7 @@ fn wrapper_rejects_bad_shapes_and_shared_bytes_before_launching() {
 }
 
 #[test]
-fn norm_matches_the_host_scale_and_refuses_to_normalize_in_place() {
+fn norm_is_the_lane_order_scale_and_refuses_to_normalize_in_place() {
     if !device_present("Inkling stream norm") {
         return;
     }
@@ -530,13 +542,14 @@ fn norm_matches_the_host_scale_and_refuses_to_normalize_in_place() {
         (width, EPS),
     )
     .unwrap();
-    let expected = host::norm(&src, EPS);
-    for (a, b) in download(&buffers.out, &stream, 0, width)
-        .iter()
-        .zip(&expected)
-    {
-        assert!((a - b).abs() <= 1e-6 * (1.0 + b.abs()), "{a} vs {b}");
-    }
+    let expected = lane_norm(&src, None, EPS);
+    let actual = download(&buffers.out, &stream, 0, width);
+    assert!(
+        actual
+            .iter()
+            .map(|v| v.to_bits())
+            .eq(expected.iter().map(|v| v.to_bits()))
+    );
     assert_eq!(buffers.health(&stream).to_bits(), 0);
 
     let error = ctx
@@ -601,13 +614,21 @@ fn states_in_one_launch_match_one_launch_each_bit_for_bit() {
     };
     ctx.inkling_stream_mix_states(
         &stream,
-        MixCall {
+        MixStatesCall {
             state: state.range(0, span(blocks + 1)).unwrap(),
-            query: q.range(0, row).unwrap(),
+            query: Some(q.range(0, row).unwrap()),
+            gamma: None,
             out: out.range(0, rows * row).unwrap(),
             health: health.range(0, 4).unwrap(),
         },
-        mix,
+        MixStatesShape {
+            first_block: mix.first_block,
+            blocks,
+            width,
+            out_stride: width,
+            mix_eps: EPS,
+            norm_eps: 1.0,
+        },
         many,
     )
     .unwrap();

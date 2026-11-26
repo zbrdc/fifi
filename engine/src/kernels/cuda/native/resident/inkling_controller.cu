@@ -4,10 +4,11 @@
 
 #include "abi.h"
 #include "device.h"
-#include "resident/ordered_sum.cuh"
+#include "resident/lane_sum.cuh"
 
 namespace {
 constexpr int threads = 256;
+static_assert(threads == kLaneThreads, "the controller gate norm reduces in the lane order");
 
 // Packed [gate outputs | raw triples | scale pairs], all in role order.
 __global__ void inkling_rebuild_gates(float *workspace, int width, int roles) {
@@ -21,11 +22,10 @@ __global__ void inkling_rebuild_gates(float *workspace, int width, int roles) {
 
 // One CTA per gate half. Keep the original pair for applying gain/forget;
 // broadcasting gamma here avoids uploading the same weight for every row. The gate is the
-// host's `control_input_from` half, bit for bit: the half is staged in shared memory and one
-// lane sums its squares in element order from -0.0, as `rms_norm_with_scale` does. The other
-// lanes wait for that sum; the exact order is the point. Unlike the host, a half whose squares
-// or variance overflow (the host then scales by zero) fails the health word, so the visit
-// stops with an error instead of carrying a degenerate gate.
+// host's `control_input_from` half with the squares in the lane order (`lane_sum.cuh`), the order
+// of every resident Inkling row norm. Unlike the host, a half whose squares or variance overflow
+// (the host then scales by zero) fails the health word, so the visit stops with an error instead
+// of carrying a degenerate gate.
 __global__ void inkling_prepare_controller(const float *pairs, const float *gamma,
                                            float *triples, float *gates, float *health,
                                            int width, float eps) {
@@ -37,31 +37,16 @@ __global__ void inkling_prepare_controller(const float *pairs, const float *gamm
     float *gate = gates + half * width;
     float *raw_gamma = triples + (3 * role + 2) * width;
     const int lane = threadIdx.x;
-    extern __shared__ float staged[];
-    __shared__ float shared_scale;
-    __shared__ int shared_invalid;
-    bool invalid = false;
+    __shared__ float scratch[kLaneWarps];
+    int invalid = 0;
     for (int i = lane; i < width; i += threads) {
         const float x = src[i];
         raw[i] = x;
-        staged[i] = x;
         if (side == 0) raw_gamma[i] = gamma[i];
-        invalid |= !isfinite(x);
     }
-    __syncthreads();
-    if (lane == 0) {
-        const float squares = ordered_dot(staged, staged, width);
-        const float variance = __fadd_rn(__fdiv_rn(squares, static_cast<float>(width)), eps);
-        const float scale = ordered_rms_scale(squares, width, eps);
-        shared_scale = scale;
-        // A square or the sum can overflow while the gate stays finite.
-        shared_invalid = !isfinite(squares) || !isfinite(variance) || !isfinite(scale);
-    }
-    __syncthreads();
-    const float scale = shared_scale;
-    invalid |= shared_invalid != 0;
+    const float scale = lane_rms_scale(src, width, eps, scratch, invalid);
     for (int i = lane; i < width; i += threads) {
-        const float x = __fmul_rn(staged[i], scale);
+        const float x = __fmul_rn(src[i], scale);
         gate[i] = x;
         invalid |= !isfinite(x);
     }
@@ -204,7 +189,7 @@ extern "C" int inference_cuda_inkling_prepare_controller(
         width < 1 || width > 4096 || roles < 1 || roles > 1536 ||
         !isfinite(eps) || eps <= 0.0f)
         return INFERENCE_CUDA_INVALID_ARGUMENT;
-    inkling_prepare_controller<<<2 * roles, threads, width * sizeof(float), (cudaStream_t)stream>>>(
+    inkling_prepare_controller<<<2 * roles, threads, 0, (cudaStream_t)stream>>>(
         pairs, gamma, triples, gates, health, width, eps);
     Failure failure;
     failure.record(cudaGetLastError(), INFERENCE_CUDA_STAGE_LAUNCH);

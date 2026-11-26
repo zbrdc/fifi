@@ -10,7 +10,9 @@
  *   Rows in this order: sealed[blocks - 1], sealed[blocks - 2], ..., sealed[first_block], then
  *   the normalized current row. Each row scores dot(row, query) / sqrt(width). The weights are the
  *   softmax of the scores (the peak is subtracted first) and `out` is their weighted mean. This is
- *   `Stream::mix(first_block, query)` of the host.
+ *   `Stream::mix(first_block, query)` of the host. Without a query (null) the output is the raw
+ *   current row; with a `gamma` it is `norm(mix) * gamma` with `norm_eps`, as `CpuForward::norm`.
+ *   Output rows are `out_stride` floats apart.
  *
  * inference_cuda_inkling_stream_mix_jobs
  *   Up to 8 independent mixes in one launch, a block per job, each with its own state, query,
@@ -27,8 +29,9 @@
  *   gate halves of the cross-pass controllers (`rms_norm_with_scale` of the host).
  *
  * RMS scale: (dot(x, x) / width + eps).sqrt().recip(), every operation rounded to nearest even.
- * Reductions are reordered against the host's ordered sums, so results agree with the host
- * within floating-point error and are not bit-identical.
+ * Every row reduction is in the lane order of `lane_sum.cuh`, so results agree with the host's
+ * ordered sums within floating-point error and are not bit-identical, while a row gives the same
+ * bits whichever of these kernels, or of the other resident Inkling row norms, reduces it.
  * `health` is one float: left alone, or quiet NaN when an input or an output is not finite.
  *
  * Every entry takes the stream explicitly, returns INFERENCE_CUDA_INVALID_ARGUMENT for a bad
@@ -43,12 +46,12 @@ extern "C" {
 #endif
 
 /* Each of mix, seal and add runs on `rows` states, `stride` rows of `width` floats apart, one
- * block per state; their other row operands (mix output, seal next, add addend) are packed
- * `width` apart. `health` is one float for the whole launch. */
-int inference_cuda_inkling_stream_mix(const float *state, const float *query, float *out,
-                                      float *health, int first_block, int blocks, int width,
-                                      float eps, int rows, int stride, void *stream,
-                                      int *out_stage);
+ * block per state; their other row operands (seal next, add addend) are packed `width` apart,
+ * and mix outputs `out_stride` apart. `health` is one float for the whole launch. */
+int inference_cuda_inkling_stream_mix(const float *state, const float *query, const float *gamma,
+                                      float *out, float *health, int first_block, int blocks,
+                                      int width, float mix_eps, float norm_eps, int rows,
+                                      int stride, int out_stride, void *stream, int *out_stage);
 
 /* `rows` holds `state, query, out` of each of the `count` jobs and `extents` their `first_block,
  * blocks`. Every output and `health` share no byte with any row a job reads or with each other;
@@ -69,21 +72,6 @@ int inference_cuda_inkling_stream_add(float *state, const float *row, float *hea
  * share one health word. */
 int inference_cuda_inkling_stream_norm_rows(const void *const *ranges, int count, int width,
                                             float eps, void *stream, int *out_stage);
-
-/* Host-ordered mix and seal: the same layouts, with every reduction in the host's element order on
- * one lane, so the results are the host's bits (`Stream::mix`, `Stream::seal`). The mix may take
- * no query (the output is the raw current row) and a `gamma`: the output is then
- * `norm(mix) * gamma` with `norm_eps`, as `CpuForward::norm`. Mix output rows are `out_stride`
- * floats apart. Width at most 4096. */
-int inference_cuda_inkling_stream_mix_ordered(const float *state, const float *query,
-                                              const float *gamma, float *out, float *health,
-                                              int first_block, int blocks, int width,
-                                              float mix_eps, float norm_eps, int rows, int stride,
-                                              int out_stride, void *stream, int *out_stage);
-
-int inference_cuda_inkling_stream_seal_ordered(float *state, const float *next, float *health,
-                                               int blocks, int width, float eps, int rows,
-                                               int stride, void *stream, int *out_stage);
 
 #ifdef __cplusplus
 }

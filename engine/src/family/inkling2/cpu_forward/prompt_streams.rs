@@ -2,9 +2,9 @@
 //!
 //! Each row's state is its current row and then its sealed rows (each stored RMS-normalized, as
 //! the host [`Stream`] stores them), `1 + capacity` rows apart. Every row of a prompt crosses the
-//! same visits, so all rows hold the same number of sealed rows. The mix and the seal run in the
-//! host's element order and the add is one rounded sum per element, so the device states keep the
-//! host's bits and [`PromptStreams::download`] rebuilds the host streams exactly.
+//! same visits, so all rows hold the same number of sealed rows. The mix and the seal are the
+//! decode token's kernels, a block per row, so a prompt row's states and mixes have the bits a
+//! decode token's would of the same inputs; both agree with the host's within rounding.
 
 use super::{MIX_EPS, Stream, bad};
 use crate::{
@@ -12,8 +12,7 @@ use crate::{
     kernels::cuda::{
         CudaContext, DeviceBuffer, DeviceRange, DeviceStream,
         resident::inkling_stream::{
-            AddCall, MAX_BLOCKS, MAX_ORDERED_WIDTH, OrderedMixCall, OrderedMixShape, SealCall,
-            States, StreamShape,
+            AddCall, MAX_BLOCKS, MixStatesCall, MixStatesShape, SealCall, States, StreamShape,
         },
     },
 };
@@ -57,7 +56,7 @@ impl PromptStreams {
         let (width, blocks) = (first.current().len(), first.block_count());
         if capacity > MAX_BLOCKS
             || blocks > capacity
-            || !(1..=MAX_ORDERED_WIDTH).contains(&width)
+            || width == 0
             || streams
                 .iter()
                 .any(|s| s.block_count() != blocks || s.current().len() != width)
@@ -153,16 +152,16 @@ impl PromptStreams {
         target: MixTarget<'_>,
     ) -> Result<(), EngError> {
         let (gamma, norm_eps) = target.norm.unzip();
-        context.inkling_stream_mix_ordered(
+        context.inkling_stream_mix_states(
             stream,
-            OrderedMixCall {
+            MixStatesCall {
                 state: self.used(self.blocks + 1)?,
                 query: target.query,
                 gamma,
                 out: target.out,
                 health: self.health()?,
             },
-            OrderedMixShape {
+            MixStatesShape {
                 first_block: target.first_block,
                 blocks: self.blocks,
                 width: self.width,
@@ -186,7 +185,7 @@ impl PromptStreams {
                 "the device prompt streams have no room for another block",
             ));
         }
-        context.inkling_stream_seal_ordered(
+        context.inkling_stream_seal_states(
             stream,
             SealCall {
                 state: self.used(self.blocks + 2)?,
@@ -263,8 +262,7 @@ impl PromptStreams {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::family::inkling2::cpu_forward::rms_norm;
-    use crate::kernels::cuda::device_present;
+    use crate::kernels::cuda::{device_present, lane_mix, lane_norm};
 
     struct Lcg(u64);
 
@@ -304,20 +302,32 @@ mod tests {
             .collect()
     }
 
-    fn same_streams(device: &[Stream], host: &[Stream]) {
-        assert_eq!(device.len(), host.len());
-        for (d, h) in device.iter().zip(host) {
-            assert_eq!(bits(d.current()), bits(h.current()));
-            assert_eq!(d.block_count(), h.block_count());
-            for first in 0..=h.block_count() {
-                let q = vec![0.25; h.current().len()];
-                assert_eq!(bits(&d.mix(first, &q)), bits(&h.mix(first, &q)));
-            }
-        }
+    /// A host stream's state, current row first, as the device lays it out.
+    fn state_floats(stream: &Stream) -> Vec<f32> {
+        let mut bytes = vec![0; stream.device_state_bytes()];
+        stream.write_device_state(&mut bytes);
+        bytes
+            .as_chunks::<WORD>()
+            .0
+            .iter()
+            .map(|w| f32::from_ne_bytes(*w))
+            .collect()
+    }
+
+    fn state_bits(stream: &Stream) -> Vec<u32> {
+        bits(&state_floats(stream))
+    }
+
+    fn max_error(device: &[f32], host: &[f32]) -> f32 {
+        device
+            .iter()
+            .zip(host)
+            .map(|(d, h)| (d - h).abs())
+            .fold(0.0, f32::max)
     }
 
     #[test]
-    fn device_prompt_streams_mix_seal_and_add_with_the_host_bits() {
+    fn device_prompt_streams_mix_seal_and_add_in_the_lane_order() {
         if !device_present("Inkling device prompt streams") {
             return;
         }
@@ -325,9 +335,8 @@ mod tests {
         let stream = context.stream().unwrap();
         let mut rng = Lcg(7);
         let (rows, eps) = (256, 1e-5);
-        // Widths with a partial last chunk of products, a whole number of chunks (960) and less
-        // than one (100); enough sealed rows that their ordered sums span two warps; and the
-        // widest mix of the most rows (4096 values, 63 sealed rows and the current one).
+        // Widths below, at and above one load of every lane (2304 is nine), and the widest mix
+        // of the most rows (4096 values, 63 sealed rows and the current one).
         for (width, sealed) in [
             (2304, 0),
             (2304, 1),
@@ -338,7 +347,7 @@ mod tests {
             (100, 3),
             (4096, MAX_BLOCKS),
         ] {
-            let mut host: Vec<Stream> = (0..rows)
+            let host: Vec<Stream> = (0..rows)
                 .map(|_| {
                     let mut s = Stream::new(rng.row(width));
                     for _ in 0..sealed {
@@ -356,7 +365,8 @@ mod tests {
                 upload_floats(&context, &stream, &query),
                 upload_floats(&context, &stream, &gamma),
             );
-            // Mixes from every first block, with and without the norm, into a strided output.
+            // Mixes from every first block into a strided output: within rounding of the host's
+            // mix, and the fused norm the lane-order norm of that mix, bit for bit.
             let stride = width + 5;
             let out = context.allocate(rows * stride * WORD).unwrap();
             let firsts: Vec<usize> = if sealed > 8 {
@@ -365,6 +375,7 @@ mod tests {
                 (0..=sealed).collect()
             };
             for first in firsts {
+                let mut mixed: Vec<Vec<f32>> = Vec::new();
                 for norm in [false, true] {
                     device
                         .mix(
@@ -381,50 +392,65 @@ mod tests {
                         .unwrap();
                     let values = read_floats(&out, &stream);
                     for (r, h) in host.iter().enumerate() {
-                        let mut expected = h.mix(first, &query);
-                        if norm {
-                            rms_norm(&mut expected, eps);
-                            for (x, w) in expected.iter_mut().zip(&gamma) {
-                                *x *= w;
-                            }
-                        }
                         let actual = &values[r * stride..][..width];
-                        assert_eq!(
-                            bits(actual),
-                            bits(&expected),
-                            "sealed {sealed} first {first} norm {norm} row {r}"
-                        );
+                        if norm {
+                            let expected = lane_norm(&mixed[r], Some(&gamma), eps);
+                            assert_eq!(
+                                bits(actual),
+                                bits(&expected),
+                                "sealed {sealed} first {first} norm row {r}"
+                            );
+                        } else {
+                            let error = max_error(actual, &h.mix(first, &query));
+                            assert!(
+                                error <= 1e-4,
+                                "sealed {sealed} first {first} row {r}: max error {error}"
+                            );
+                            let state = state_floats(h);
+                            let (current, rows) = state.split_at(width);
+                            let rows: Vec<&[f32]> = rows.chunks(width).collect();
+                            let lane = lane_mix(current, &rows, first, &query, MIX_EPS);
+                            assert_eq!(
+                                bits(actual),
+                                bits(&lane),
+                                "sealed {sealed} first {first} lane order row {r}"
+                            );
+                            mixed.push(actual.to_vec());
+                        }
                     }
                 }
             }
-            // Without a query: the raw current row, normalized and scaled.
-            device
-                .mix(
-                    &context,
-                    &stream,
-                    MixTarget {
-                        query: None,
-                        norm: Some((g.range(0, g.bytes()).unwrap(), eps)),
-                        first_block: 0,
-                        out: out.range(0, rows * width * WORD).unwrap(),
-                        stride: width,
-                    },
-                )
-                .unwrap();
-            let values = read_floats(&out, &stream);
-            for (r, h) in host.iter().enumerate() {
-                let mut expected = h.current().to_vec();
-                rms_norm(&mut expected, eps);
-                for (x, w) in expected.iter_mut().zip(&gamma) {
-                    *x *= w;
+            // Without a query: the raw current row, alone or normalized and scaled.
+            for norm in [false, true] {
+                device
+                    .mix(
+                        &context,
+                        &stream,
+                        MixTarget {
+                            query: None,
+                            norm: norm.then(|| (g.range(0, g.bytes()).unwrap(), eps)),
+                            first_block: 0,
+                            out: out.range(0, rows * width * WORD).unwrap(),
+                            stride: width,
+                        },
+                    )
+                    .unwrap();
+                let values = read_floats(&out, &stream);
+                for (r, h) in host.iter().enumerate() {
+                    let expected = if norm {
+                        lane_norm(h.current(), Some(&gamma), eps)
+                    } else {
+                        h.current().to_vec()
+                    };
+                    assert_eq!(
+                        bits(&values[r * width..][..width]),
+                        bits(&expected),
+                        "current row {r} norm {norm}"
+                    );
                 }
-                assert_eq!(
-                    bits(&values[r * width..][..width]),
-                    bits(&expected),
-                    "current row {r}"
-                );
             }
-            // Seal, then add, against the host, while a block is free.
+            // Seal, then add, while a block is free: the sealed row is the lane-order norm of the
+            // old current row and the add one rounded sum per element.
             if sealed == capacity {
                 continue;
             }
@@ -446,11 +472,20 @@ mod tests {
                     add_buffer.range(0, add_buffer.bytes()).unwrap(),
                 )
                 .unwrap();
-            for ((h, n), a) in host.iter_mut().zip(next).zip(&addend) {
-                h.seal(n);
-                h.add_current(a);
+            let downloaded = device.download(&stream).unwrap();
+            for (r, ((h, n), a)) in host.iter().zip(next).zip(&addend).enumerate() {
+                let mut expected = state_bits(h);
+                let row = expected.split_off(width);
+                let current: Vec<f32> = n.iter().zip(a).map(|(x, y)| x + y).collect();
+                let mut expected_state = bits(&current);
+                expected_state.extend(row);
+                expected_state.extend(bits(&lane_norm(h.current(), None, MIX_EPS)));
+                assert_eq!(
+                    state_bits(&downloaded[r]),
+                    expected_state,
+                    "state of row {r}"
+                );
             }
-            same_streams(&device.download(&stream).unwrap(), &host);
         }
     }
 }

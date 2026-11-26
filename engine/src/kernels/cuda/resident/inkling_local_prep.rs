@@ -365,7 +365,7 @@ impl CudaContext {
 mod tests {
     use super::*;
     use crate::kernels::cuda::{
-        device_present,
+        device_present, lane_norm,
         testkit::{read_bytes, upload_bytes},
     };
 
@@ -373,18 +373,8 @@ mod tests {
         values.iter().map(|x| x.to_ne_bytes()).collect()
     }
 
-    /// `ordered_rms_scale` and the scaled output, op for op in scalar order.
-    fn ordered_norm(x: &[f32], gamma: &[f32], eps: f32) -> Vec<u32> {
-        let squares = x.iter().fold(-0.0f32, |sum, v| sum + v * v);
-        let scale = 1.0 / (squares / x.len() as f32 + eps).sqrt();
-        x.iter()
-            .zip(gamma)
-            .map(|(v, g)| ((v * scale) * g).to_bits())
-            .collect()
-    }
-
     #[test]
-    fn weighted_norm_matches_the_scalar_order_bit_for_bit() {
+    fn weighted_norm_matches_the_lane_order_bit_for_bit() {
         if !device_present("Inkling CUDA weighted norm") {
             return;
         }
@@ -427,7 +417,11 @@ mod tests {
                 .0
                 .iter()
                 .map(|v| u32::from_ne_bytes(*v));
-            assert!(row.eq(ordered_norm(&input, &gamma, eps)), "width {width}");
+            let expected = lane_norm(&input, Some(&gamma), eps);
+            assert!(
+                row.eq(expected.iter().map(|v| v.to_bits())),
+                "width {width}"
+            );
         }
     }
 

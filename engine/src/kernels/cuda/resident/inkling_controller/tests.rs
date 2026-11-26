@@ -1,7 +1,7 @@
 mod host;
 
 use super::Arithmetic;
-use crate::kernels::cuda::{CudaContext, device_present};
+use crate::kernels::cuda::{CudaContext, device_present, lane_norm};
 
 const EPS: f32 = 1e-5;
 
@@ -175,15 +175,8 @@ fn all(buffer: &crate::kernels::cuda::DeviceBuffer) -> crate::kernels::cuda::Dev
     buffer.range(0, buffer.bytes()).unwrap()
 }
 
-/// The host's `rms_norm_with_scale` of one gate half: squares summed in element order.
-fn host_gate(half: &[f32], eps: f32) -> Vec<f32> {
-    let squares: f32 = half.iter().map(|x| x * x).sum();
-    let scale = (squares / half.len() as f32 + eps).sqrt().recip();
-    half.iter().map(|x| x * scale).collect()
-}
-
 #[test]
-fn prepare_controller_gates_are_the_host_rms_norm_bits() {
+fn prepare_controller_gates_are_the_lane_order_rms_norm_bits() {
     if !device_present("Inkling controller gate preparation") {
         return;
     }
@@ -240,7 +233,7 @@ fn prepare_controller_gates_are_the_host_rms_norm_bits() {
             assert_eq!(health[half].is_nan(), failed, "width={width} half={half}");
             if !failed {
                 assert_eq!(health[half].to_bits(), 0, "width={width} half={half}");
-                let expected = host_gate(source, EPS);
+                let expected = lane_norm(source, None, EPS);
                 for (i, (device, host)) in gates[half * width..][..width]
                     .iter()
                     .zip(expected)

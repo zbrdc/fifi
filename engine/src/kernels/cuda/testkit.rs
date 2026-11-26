@@ -563,6 +563,93 @@ pub(super) fn unpack_xf(xf: &[u8], m: usize, k: usize) -> Vec<u16> {
     out
 }
 
+/// The squares of `x` summed in the lane order of `native/resident/lane_sum.cuh`: 256 lanes each
+/// add every 256th element in order from +0.0, each warp of 32 lanes folds by halving shuffles,
+/// and the eight warp sums add in warp order. The resident Inkling row norms give these bits.
+pub(crate) fn lane_squares(x: &[f32]) -> f32 {
+    let mut lanes = [0.0f32; 256];
+    for (i, v) in x.iter().enumerate() {
+        lanes[i % 256] += v * v;
+    }
+    let warps: Vec<f32> = lanes.chunks_mut(32).map(warp_fold).collect();
+    warps[1..].iter().fold(warps[0], |total, w| total + w)
+}
+
+/// A warp's sum by halving shuffles: lane 0's value after `lane_warp_sum`.
+fn warp_fold(warp: &mut [f32]) -> f32 {
+    for offset in [16, 8, 4, 2, 1] {
+        for lane in 0..offset {
+            warp[lane] += warp[lane + offset];
+        }
+    }
+    warp[0]
+}
+
+/// `Stream::mix(first_block, query)` in the order of the device mix (`inkling_stream.cu`):
+/// the current row's scale in the lane order, each row scored by 32 lanes that add every 32nd
+/// product `(value * scale) * query` in order from -0.0 and fold by halving, the softmax on one
+/// lane, and each column's weighted sum over the rows in mix order. `sealed` is as stored, oldest
+/// first; the device mix gives these bits.
+pub(crate) fn lane_mix(
+    current: &[f32],
+    sealed: &[&[f32]],
+    first_block: usize,
+    query: &[f32],
+    eps: f32,
+) -> Vec<f32> {
+    let width = current.len();
+    let current_scale = (lane_squares(current) / width as f32 + eps).sqrt().recip();
+    let rows: Vec<(&[f32], f32)> = sealed[first_block..]
+        .iter()
+        .rev()
+        .map(|row| (*row, 1.0))
+        .chain([(current, current_scale)])
+        .collect();
+    let norm = (width as f32).sqrt().recip();
+    let scores: Vec<f32> = rows
+        .iter()
+        .map(|(row, scale)| {
+            let mut lanes = [-0.0f32; 32];
+            for (i, (v, q)) in row.iter().zip(query).enumerate() {
+                lanes[i % 32] += (v * scale) * q;
+            }
+            warp_fold(&mut lanes) * norm
+        })
+        .collect();
+    let peak = scores.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+    let weights: Vec<f32> = scores
+        .iter()
+        .map(|s| crate::kernels::portable_exp::portable_exp(s - peak))
+        .collect();
+    let mass = weights.iter().fold(0.0f32, |m, w| m + w);
+    (0..width)
+        .map(|c| {
+            let sum = rows
+                .iter()
+                .zip(&weights)
+                .fold(0.0f32, |sum, ((row, scale), w)| {
+                    let x = if *scale == 1.0 {
+                        row[c]
+                    } else {
+                        row[c] * scale
+                    };
+                    sum + w * x
+                });
+            sum / mass
+        })
+        .collect()
+}
+
+/// `x * rms_scale(x)`, then times `gamma` when given, with the squares in the lane order
+/// ([`lane_squares`]): the bits of the resident Inkling row norms.
+pub(crate) fn lane_norm(x: &[f32], gamma: Option<&[f32]>, eps: f32) -> Vec<f32> {
+    let scale = (lane_squares(x) / x.len() as f32 + eps).sqrt().recip();
+    match gamma {
+        Some(gamma) => x.iter().zip(gamma).map(|(v, g)| (v * scale) * g).collect(),
+        None => x.iter().map(|v| v * scale).collect(),
+    }
+}
+
 pub(super) fn upload_bytes(ctx: &CudaContext, bytes: &[u8]) -> DeviceBuffer {
     ctx.upload(bytes).expect("upload of the test bytes")
 }

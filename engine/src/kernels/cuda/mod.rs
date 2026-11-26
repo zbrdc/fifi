@@ -118,6 +118,8 @@ pub(crate) use native::prefill::PREFILL_STATUS_BOUND_VIOLATION;
 /// `testkit` module being private to `kernels::cuda`.
 #[cfg(test)]
 pub(crate) use testkit::device_present;
+#[cfg(test)]
+pub(crate) use testkit::{lane_mix, lane_norm};
 
 use std::ffi::c_int;
 use std::sync::atomic::{AtomicBool, AtomicI32, Ordering};
