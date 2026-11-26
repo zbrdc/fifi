@@ -769,17 +769,29 @@ impl ResidentAttention {
             dest.validate(work, layout, count)?;
         }
         work.encoded.clear();
+        let kv = side.as_ref().and_then(|s| s.kv);
+        // With device K/V preparation and resident queries the rows hold no host bytes: the
+        // preparation writes their K/V and positions, and the upload starts at the scales.
         let mut offsets = Vec::with_capacity(count);
-        for (i, row) in rows.iter().enumerate() {
-            offsets.push(row.append_inputs(
-                visit.shape,
-                (position + i) as i32,
-                &mut work.encoded,
-                (
-                    layout.side_slots(),
-                    side.as_ref().is_some_and(|s| s.kv.is_some()),
-                ),
-            )?);
+        if kv.is_some() {
+            for (i, row) in rows.iter().enumerate() {
+                match row.device_offsets(visit.shape, i * layout.input, layout.side_slots())? {
+                    Some(row) => offsets.push(row),
+                    None => break,
+                }
+            }
+        }
+        let device_rows = offsets.len() == count;
+        if !device_rows {
+            offsets.clear();
+            for (i, row) in rows.iter().enumerate() {
+                offsets.push(row.append_inputs(
+                    visit.shape,
+                    (position + i) as i32,
+                    &mut work.encoded,
+                    (layout.side_slots(), kv.is_some()),
+                )?);
+            }
         }
         if let Some(query) = side.as_ref().and_then(|s| s.query) {
             for (scale, i) in query.scales.into_iter().zip([0, 3]) {
@@ -789,7 +801,6 @@ impl ResidentAttention {
                 extend_words(&mut work.encoded, scale);
             }
         }
-        let kv = side.as_ref().and_then(|s| s.kv);
         let kv_history = match kv {
             Some(kv) => Some(encode_kv_prep(&mut work.encoded, kv, layout, count)?),
             None => None,
@@ -812,7 +823,12 @@ impl ResidentAttention {
             visit,
             layout,
             work,
-            (&offsets, side, kv.zip(kv_history)),
+            (
+                &offsets,
+                side,
+                kv.zip(kv_history),
+                device_rows.then_some(position),
+            ),
             (projection, tile, destination),
         )?;
         // The ring is independent of the projection output. Publish its cursor
@@ -834,10 +850,11 @@ impl ResidentAttention {
         visit: Visit,
         layout: Layout,
         work: &mut Workspace,
-        (offsets, side, kv): (
+        (offsets, side, kv, first): (
             &[[usize; 8]],
             Option<Sidecar<'_>>,
             Option<(&KvPrep<'_>, usize)>,
+            Option<usize>,
         ),
         (projection, tile, destination): (
             Option<&OutputProjection<'_>>,
@@ -861,8 +878,10 @@ impl ResidentAttention {
         let status_at = prep_at + 4 * prep_words;
         let out_at = status_at + 4 * count;
         let attention_at = layout.attention_at(out_at, count);
-        debug_assert_eq!(work.encoded.len(), status_at);
-        work.encoded.resize(out_at, 0);
+        // `first` when the device writes the rows: the host image starts at the scales.
+        let uploaded = if first.is_some() { scales_at } else { 0 };
+        debug_assert_eq!(uploaded + work.encoded.len(), status_at);
+        work.encoded.resize(out_at - uploaded, 0);
         work.transfer.write(0, &work.encoded)?;
         let device = &work.device;
         let call = |i: usize, bytes: [usize; 12]| {
@@ -895,7 +914,7 @@ impl ResidentAttention {
                 &self.stream,
                 &mut work.transfer,
                 0,
-                device.range(0, out_at)?,
+                device.range(uploaded, out_at - uploaded)?,
             )?;
             if let Some(side) = &side
                 && let Some(query) = side.query
@@ -917,9 +936,10 @@ impl ResidentAttention {
                     .as_ref()
                     .ok_or_else(|| bad("K/V preparation lacks side rows"))?;
                 let kv_bytes = layout.resident[1];
-                let [k_at, v_at] = [offsets[0][1], offsets[0][2]];
+                let [k_at, v_at, position_at] = [offsets[0][1], offsets[0][2], offsets[0][6]];
                 if offsets.iter().enumerate().any(|(i, row)| {
-                    [row[1], row[2]] != [k_at, v_at].map(|at| at + i * layout.input)
+                    [row[1], row[2], row[6]]
+                        != [k_at, v_at, position_at].map(|at| at + i * layout.input)
                 }) {
                     return Err(bad("CUDA K/V preparation rows are not evenly spaced"));
                 }
@@ -942,6 +962,7 @@ impl ResidentAttention {
                         raw: [layout.resident[0] / 4, (layout.resident[0] + kv_bytes) / 4],
                         out_stride: layout.input / 4,
                         out: [k_at / 4, v_at / 4],
+                        positions: first.map(|first| (position_at / 4, first)),
                         limit: kv.limit,
                         eps: kv.eps,
                     },

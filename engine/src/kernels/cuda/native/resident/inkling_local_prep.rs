@@ -135,7 +135,8 @@ pub(in crate::kernels::cuda) fn kv_prep_rows(
     let words = shape.words().ok_or_else(invalid_argument)?;
     validate_f32_ranges(&ranges, words)?;
     let pointers = ranges.map(|range| range.address());
-    let geometry = shape.geometry().map(|n| n as c_int);
+    // words() bounds every count below i32::MAX; only the missing position word maps to -1.
+    let geometry = shape.geometry().map(|n| c_int::try_from(n).unwrap_or(-1));
     let mut stage = STAGE_NONE;
     // SAFETY: words() bounds every index the kernel forms for this geometry, and the five
     // spans are exact, aligned and distinct; both arrays outlive the call.

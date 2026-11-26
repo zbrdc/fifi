@@ -131,6 +131,9 @@ pub(crate) struct KvPrepShape {
     pub raw: [usize; 2],
     pub out_stride: usize,
     pub out: [usize; 2],
+    /// The word of each output row that takes its position, and the first row's position:
+    /// rows whose positions the device writes beside their K/V.
+    pub positions: Option<(usize, usize)>,
     pub limit: f32,
     pub eps: f32,
 }
@@ -154,6 +157,16 @@ impl KvPrepShape {
             || self.history >= taps
             || !fits(self.raw_stride, self.raw)
             || !fits(self.out_stride, self.out)
+            || self.positions.is_some_and(|(at, first)| {
+                at >= self.out_stride
+                    || self
+                        .out
+                        .iter()
+                        .any(|&start| (start..start + kv).contains(&at))
+                    || first
+                        .checked_add(self.rows - 1)
+                        .is_none_or(|last| last > i32::MAX as usize)
+            })
             || !(self.limit.is_finite() && self.limit > 0.0)
             || !(self.eps.is_finite() && self.eps > 0.0)
         {
@@ -173,8 +186,10 @@ impl KvPrepShape {
         ])
     }
 
-    /// The integer arguments of the launch, in the kernel's order.
-    pub(crate) fn geometry(self) -> [usize; 10] {
+    /// The integer arguments of the launch, in the kernel's order; a missing position word is
+    /// `usize::MAX`, which the launch passes as -1.
+    pub(crate) fn geometry(self) -> [usize; 12] {
+        let (position, first) = self.positions.unwrap_or((usize::MAX, 0));
         [
             self.rows,
             self.kv_heads * PrepShape::WIDTH,
@@ -186,6 +201,8 @@ impl KvPrepShape {
             self.out_stride,
             self.out[0],
             self.out[1],
+            position,
+            first,
         ]
     }
 }
@@ -484,6 +501,8 @@ mod tests {
                     raw,
                     out_stride,
                     out,
+                    // Every other history count also has the device write row positions.
+                    positions: (history % 2 == 1).then_some((kv + 1, 17)),
                     limit,
                     eps,
                 };
@@ -558,6 +577,15 @@ mod tests {
                                 .map(|v| v.to_bits())
                                 .eq(x.iter().map(|v| v.to_bits())),
                             "plane {plane} row {row} history {history} dynamic {dynamic}"
+                        );
+                    }
+                }
+                if let Some((at, first)) = shape.positions {
+                    for row in 0..rows {
+                        assert_eq!(
+                            got[row * out_stride + at].to_bits(),
+                            (first + row) as u32,
+                            "position of row {row}"
                         );
                     }
                 }

@@ -594,15 +594,13 @@ impl Row<'_> {
         Ok(offsets)
     }
 
-    /// Appends the row's host inputs. Slots marked `resident` take no bytes; with `device_kv`
-    /// an empty K or V row is a zero slot the device's K/V preparation fills.
-    fn append_inputs(
+    /// The bytes of the row's six input slots: none for a slot marked `resident`. With
+    /// `device_kv` an empty K or V row is a zero slot the device's K/V preparation fills.
+    fn input_sizes(
         &self,
         shape: RelativeAttentionShape,
-        position: i32,
-        bytes: &mut Vec<u8>,
         (resident, device_kv): ([bool; 6], bool),
-    ) -> Result<[usize; 8], EngError> {
+    ) -> Result<InputSlots<'_>, EngError> {
         let slices = [
             self.query,
             self.key,
@@ -626,17 +624,30 @@ impl Row<'_> {
                 *size = 0;
             }
         }
-        let filled = |i: usize| device_kv && (i == 1 || i == 2) && slices[i].is_empty();
-        if (0..6).any(|i| slices[i].len() != sizes[i] && !filled(i)) {
+        let filled =
+            std::array::from_fn(|i| device_kv && (i == 1 || i == 2) && slices[i].is_empty());
+        if (0..6).any(|i| slices[i].len() != sizes[i] && !filled[i]) {
             return Err(bad("incorrect CUDA relative attention input shape"));
         }
+        Ok((slices, sizes.map(|words| words * size_of::<f32>()), filled))
+    }
+
+    /// Appends the row's host inputs (see [`Self::input_sizes`]) and its position.
+    fn append_inputs(
+        &self,
+        shape: RelativeAttentionShape,
+        position: i32,
+        bytes: &mut Vec<u8>,
+        slots: ([bool; 6], bool),
+    ) -> Result<[usize; 8], EngError> {
+        let (slices, sizes, filled) = self.input_sizes(shape, slots)?;
         let mut offsets = [0; 8];
-        for (i, (offset, slice)) in offsets.iter_mut().zip(slices).enumerate() {
-            *offset = bytes.len();
-            if filled(i) {
-                bytes.resize(bytes.len() + sizes[i] * size_of::<f32>(), 0);
+        for i in 0..6 {
+            offsets[i] = bytes.len();
+            if filled[i] {
+                bytes.resize(bytes.len() + sizes[i], 0);
             } else {
-                extend_words(bytes, slice);
+                extend_words(bytes, slices[i]);
             }
         }
         offsets[6] = bytes.len();
@@ -644,7 +655,35 @@ impl Row<'_> {
         offsets[7] = bytes.len();
         Ok(offsets)
     }
+
+    /// The offsets [`Self::append_inputs`] would give a row at byte `at`, for a row the
+    /// device fills whole: every slot is resident or a K/V slot its preparation writes, and the
+    /// preparation writes the position too. `None` when the row has host bytes.
+    fn device_offsets(
+        &self,
+        shape: RelativeAttentionShape,
+        at: usize,
+        resident: [bool; 6],
+    ) -> Result<Option<[usize; 8]>, EngError> {
+        let (_, sizes, filled) = self.input_sizes(shape, (resident, true))?;
+        if (0..6).any(|i| sizes[i] != 0 && !filled[i]) {
+            return Ok(None);
+        }
+        let mut offsets = [0; 8];
+        let mut end = at;
+        for (offset, size) in offsets.iter_mut().zip(sizes) {
+            *offset = end;
+            end += size;
+        }
+        offsets[6] = end;
+        offsets[7] = end + size_of::<i32>();
+        Ok(Some(offsets))
+    }
 }
+
+/// A row's six input slots ([`Row::input_sizes`]): the host values, the bytes each takes in the
+/// upload, and whether the device's K/V preparation fills it.
+type InputSlots<'a> = ([&'a [f32]; 6], [usize; 6], [bool; 6]);
 
 fn ring_splits(first_slot: usize, rows: usize, capacity: usize) -> [(usize, usize); 2] {
     let until_wrap = rows.min(capacity - first_slot);

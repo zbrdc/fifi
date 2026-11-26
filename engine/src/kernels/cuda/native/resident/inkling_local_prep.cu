@@ -119,6 +119,8 @@ struct KvRowsArgs {
     uint32_t *status;
     int rows, kv, history, dynamic;
     int raw_stride, raw_k, raw_v, out_stride, out_k, out_v;
+    // The word of each output row that takes its position, `first` plus the row, or -1.
+    int out_position, first;
     float limit, eps;
 };
 
@@ -163,6 +165,10 @@ __global__ void inkling_kv_prep_rows(KvRowsArgs a) {
     __syncthreads();
     const float result = __fmul_rn(x, scale);
     a.out[(size_t)row * a.out_stride + (plane ? a.out_v : a.out_k) + at] = result;
+    if (a.out_position >= 0 && blockIdx.x == 0 && d == 0) {
+        reinterpret_cast<int *>(a.out)[(size_t)row * a.out_stride + a.out_position] =
+            a.first + row;
+    }
     const int invalid = __syncthreads_or(!valid || !isfinite(x) || !isfinite(result));
     if (d == 0 && invalid) atomicOr(a.status + row, 1u);
 }
@@ -235,7 +241,7 @@ extern "C" int inference_cuda_inkling_kv_prep_rows(void *const *p, const int *sh
                     taps, taps + 2 * kTaps * shape[1],
                     static_cast<float *>(p[3]), static_cast<uint32_t *>(p[4]),
                     shape[0], shape[1], shape[2], shape[3], shape[4], shape[5], shape[6],
-                    shape[7], shape[8], shape[9], limit, eps};
+                    shape[7], shape[8], shape[9], shape[10], shape[11], limit, eps};
     inkling_kv_prep_rows<<<dim3(2 * (args.kv / kWidth), args.rows), kWidth, 0,
                            (cudaStream_t)stream>>>(args);
     Failure failure;
