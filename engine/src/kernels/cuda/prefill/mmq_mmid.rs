@@ -630,7 +630,8 @@ pub(in crate::kernels::cuda) fn fill_mmid_args(s: &MmidLaunchShape) -> MmidGeome
         wide(s.ids.m),
     );
     MmidGeometry {
-        type_x: i64::from(s.quant.ggml()),
+        // `check_launch_shape` refuses a type without a vendored case first; -1 has no arm.
+        type_x: MmqType::of(s.quant).map_or(-1, |ty| i64::from(ty.ggml())),
         ncols_x: wide(s.k),
         nrows_x: wide(s.n),
         ncols_dst: ne,

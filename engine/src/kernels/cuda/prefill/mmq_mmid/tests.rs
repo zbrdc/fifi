@@ -1121,6 +1121,34 @@ fn fill_mmid_args_pins_every_field_of_the_grouped_form() {
         ..grouped(14, 512, 2048, 2048)
     };
     assert_eq!(fill_mmid_args(&down), want);
+    // Inkling's expert down over IQ4_NL rows of 1,152 values: the type id is the GGUF one of the
+    // MMQ case (20); the decode matvec's mapping has none for the codebook types.
+    let inkling = MmidLaunchShape {
+        ids: MmidShape {
+            n_experts: 128,
+            m: 64,
+            top_k: 8,
+        },
+        quant: QuantType::Iq4Nl,
+        k: 1_152,
+        n: 2304,
+        stride_bytes: 2304 * 36 * 18,
+        ld: 2304,
+    };
+    check_launch_shape(&inkling).expect("the Inkling down shape");
+    assert_eq!(fill_mmid_args(&inkling).type_x, 20);
+    // Every type with a case fills its own id.
+    for ty in MmqType::ALL {
+        let Some(quant) = ty.quant() else {
+            continue;
+        };
+        let shape = MmidLaunchShape { quant, ..inkling };
+        assert_eq!(
+            fill_mmid_args(&shape).type_x,
+            i64::from(ty.ggml()),
+            "{ty:?}"
+        );
+    }
 }
 
 #[test]
