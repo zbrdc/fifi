@@ -17,9 +17,11 @@ use crate::{
         CudaContext, DeviceBuffer, DeviceRange, DeviceStream, PinnedBuf,
         prefill::{
             mmq_mmid::{
-                GroupedDqRows, IdsGuardCall, MmidIdsOut, MmidShape, MmidWeight, SparseDqCall,
-                grouped_dq_serves,
+                GroupedDqRows, HostIds, IdsGuardCall, MmidIds, MmidIdsOut, MmidLaunchCall,
+                MmidQuantCall, MmidShape, MmidWeight, SparseDqCall, grouped_dq_serves,
             },
+            mmq_quant::{K_GRID, MmqPacking},
+            mmq_size::{MmqType, fixup_floats_max, ids_dst_ints, q8_1_bytes},
             row_ops::{ClippedExpertCall, IndexedRankSumCall, RowGatherCall, RowShape},
         },
         resident::{
@@ -46,6 +48,8 @@ struct Geometry {
     grouped_experts: usize,
     /// The router's experts when the rows route on the device, else 0.
     routed_experts: usize,
+    /// The stack's experts when a stage runs on the vendored grouped MMQ, else 0.
+    mmq_experts: usize,
 }
 
 impl Geometry {
@@ -57,6 +61,7 @@ impl Geometry {
             && self.rank == shape.rank
             && self.grouped_experts >= shape.grouped_experts
             && self.routed_experts >= shape.routed_experts
+            && self.mmq_experts >= shape.mmq_experts
     }
 }
 
@@ -72,11 +77,20 @@ struct Layout {
     inverse_ids: Range<usize>,
     weights: Range<usize>,
     route: Option<RouteSpans>,
+    mmid: Option<MmidSpans>,
     output: Range<usize>,
     gathered: Range<usize>,
     gate: Range<usize>,
     middle: Range<usize>,
     down: Range<usize>,
+}
+
+/// The ids of a grouped MMQ stage, which reads and writes the slots in their compact order: the
+/// identity maps (`ids_dst` with the stream-k fixup gather pad) and the expert bounds.
+struct MmidSpans {
+    ids_dst: Range<usize>,
+    ids_src1: Range<usize>,
+    bounds: Range<usize>,
 }
 
 /// Device routing scratch: the bias and the status word are uploaded together, and the status,
@@ -114,6 +128,15 @@ impl Layout {
         } else {
             [0..0, 0..0]
         };
+        let mmid = if shape.mmq_experts > 0 {
+            Some(MmidSpans {
+                ids_dst: span(ids_dst_ints(slots, rows).ok()?, 1)?,
+                ids_src1: span(slots, 1)?,
+                bounds: span(shape.mmq_experts.checked_add(1)?, 1)?,
+            })
+        } else {
+            None
+        };
         let flag = span(1, 1)?;
         let inverse_ids = span(slots, 1)?;
         let weights = span(slots, 1)?;
@@ -147,6 +170,7 @@ impl Layout {
             inverse_ids,
             weights,
             route,
+            mmid,
             output: span(rows, shape.hidden)?,
             gathered: span(slots, shape.hidden)?,
             gate: span(slots, shape.middle.checked_mul(2)?)?,
@@ -178,6 +202,11 @@ pub(super) fn device_workspace_bytes(spec: &super::super::TextSpec, context: usi
         rank: usize::try_from(spec.num_experts_per_tok).ok()?,
         grouped_experts: 0,
         routed_experts: usize::try_from(spec.n_routed_experts).ok()?,
+        mmq_experts: if Switch::PrefillTensorCoreExperts.on() {
+            usize::try_from(spec.n_routed_experts).ok()?
+        } else {
+            0
+        },
     };
     let rows = context.min(DenseGemvShape::MAX_ACTIVATION_ROWS.checked_div(shape.rank)?);
     u64::try_from(Layout::new(rows, shape)?.down.end).ok()
@@ -190,10 +219,34 @@ pub(super) struct Workspace {
 
 struct Scratch {
     buffer: DeviceBuffer,
+    /// The q8_1 columns and the stream-k fixup of a grouped MMQ stage, when the geometry has one.
+    mmq: Option<MmqScratch>,
     stream: DeviceStream,
     host: PinnedBuf,
     rows: usize,
     geometry: Geometry,
+}
+
+struct MmqScratch {
+    buffer: DeviceBuffer,
+    fixup_at: usize,
+    fixup_bytes: usize,
+}
+
+impl MmqScratch {
+    /// The q8_1 columns of `slots` slots of the widest stage input and the fixup of the device.
+    fn allocate(cuda: &CudaContext, slots: usize, k: usize) -> Result<Self, EngError> {
+        let fixup_at = q8_1_bytes(k, slots)?.next_multiple_of(256);
+        let fixup_bytes = fixup_floats_max(cuda.mmq_device_facts()?.nsm)? * size_of::<f32>();
+        let bytes = fixup_at
+            .checked_add(fixup_bytes)
+            .ok_or_else(|| bad("expert prefill MMQ scratch overflows"))?;
+        Ok(Self {
+            buffer: cuda.allocate(bytes)?,
+            fixup_at,
+            fixup_bytes,
+        })
+    }
 }
 
 impl Workspace {
@@ -249,6 +302,8 @@ struct Projections<'a> {
     min_wmma_rows: [Option<usize>; 2],
     exact_tile: bool,
     grouped_weights: [Option<MmidWeight<'a>>; 2],
+    /// The stacks of the stages that run on the vendored grouped MMQ, over every slot.
+    mmq_weights: [Option<MmidWeight<'a>>; 2],
     matrices: BTreeMap<ExpertId, [Matrix<'a>; 2]>,
 }
 
@@ -658,20 +713,28 @@ impl GgufCuda {
             return Ok(None);
         }
         let shapes = [[2 * middle, hidden], [hidden, middle]];
-        let (grouped_weights, grouped_experts) =
+        let (grouped_weights, grouped_experts, mmq_weights, mmq_experts) =
             if self.device_prefill_grouped_dq && self.device_prefill_wmma {
                 let stacks = self.resident.original_layer(layer)?;
                 let weights = std::array::from_fn(|stage| {
                     grouped_weight(dtypes[stage], shapes[stage], stacks[stage])
                 });
-                let experts = weights
-                    .iter()
-                    .flatten()
-                    .next()
-                    .map_or(0, |w| w.base.bytes() / w.stride_bytes);
-                (weights, experts)
+                let mmq = std::array::from_fn(|stage| {
+                    Switch::PrefillTensorCoreExperts
+                        .on()
+                        .then(|| mmq_weight(dtypes[stage], shapes[stage], stacks[stage]))
+                        .flatten()
+                });
+                let experts = |weights: &[Option<MmidWeight<'_>>; 2]| {
+                    weights
+                        .iter()
+                        .flatten()
+                        .next()
+                        .map_or(0, |w| w.base.bytes() / w.stride_bytes)
+                };
+                (weights, experts(&weights), mmq, experts(&mmq))
             } else {
-                ([None, None], 0)
+                ([None, None], 0, [None, None], 0)
             };
         Ok(Some(Projections {
             geometry: Geometry {
@@ -680,11 +743,13 @@ impl GgufCuda {
                 rank,
                 grouped_experts,
                 routed_experts: 0,
+                mmq_experts,
             },
             dtypes,
             min_wmma_rows: WMMA_MIN_ROWS.map(|rows| self.device_prefill_wmma.then_some(rows)),
             exact_tile: self.device_prefill_exact_tile,
             grouped_weights,
+            mmq_weights,
             caps,
             matrices,
         }))
@@ -719,6 +784,33 @@ fn grouped_weight(
     })
 }
 
+/// The stack of one stage on the vendored grouped MMQ: a type with a case, a row length on its
+/// K grid, and whole expert matrices.
+fn mmq_weight(
+    dtype: DenseDtype,
+    [n, k]: [usize; 2],
+    base: DeviceRange<'_>,
+) -> Option<MmidWeight<'_>> {
+    let DenseDtype::PackedGguf(kind) = dtype else {
+        return None;
+    };
+    let quant = QuantType::from_gguf(kind).filter(|&quant| MmqType::of(quant).is_some())?;
+    if !k.is_multiple_of(K_GRID) {
+        return None;
+    }
+    let stride_bytes = quant.weight_bytes(n, k)?;
+    if stride_bytes == 0 || !base.bytes().is_multiple_of(stride_bytes) {
+        return None;
+    }
+    Some(MmidWeight {
+        base,
+        quant,
+        k,
+        n,
+        stride_bytes,
+    })
+}
+
 // The expert workspace is independent of the dense step arena. Consume only an
 // exact whole-batch range after the producer's synchronous logits readback.
 fn admits_router_input(rows: usize, hidden: usize, bytes: usize) -> bool {
@@ -737,8 +829,16 @@ struct RoutedWindow {
     upload: Vec<[u8; 4]>,
     groups: ExpertGroups,
     grouped: [Option<GroupedDqRows>; 2],
+    /// The host copy of the grouped MMQ ids the upload carries, when a stage runs there.
+    mmid: Option<MmidHost>,
     layout: Layout,
     rows: usize,
+}
+
+/// The compact slots map to themselves; `bounds[e]` is the first slot of expert `e`.
+struct MmidHost {
+    ids_dst: Vec<i32>,
+    bounds: Vec<i32>,
 }
 
 impl RoutedWindow {
@@ -777,10 +877,17 @@ impl RoutedWindow {
             weight,
         )?;
         let grouped = pack_grouped_rows(projections, &layout, &groups, &mut upload);
+        let mmid = pack_mmid(
+            projections.geometry.mmq_experts,
+            &layout,
+            &groups,
+            &mut upload,
+        )?;
         Ok(Self {
             upload,
             groups,
             grouped,
+            mmid,
             layout,
             rows: routes.len(),
         })
@@ -794,6 +901,9 @@ fn pack_grouped_rows(
     upload: &mut [[u8; 4]],
 ) -> [Option<GroupedDqRows>; 2] {
     std::array::from_fn(|stage| {
+        if projections.mmq_weights[stage].is_some() {
+            return None;
+        }
         projections.grouped_weights[stage]?;
         let minimum = projections.min_wmma_rows[stage]?;
         let experts = projections.geometry.grouped_experts;
@@ -814,6 +924,52 @@ fn pack_grouped_rows(
         }
         Some(plan)
     })
+}
+
+/// Writes the grouped MMQ ids of `groups` into `upload`: every slot is its own compact column, so
+/// the stage reads its input rows and writes its output rows in the order the other stages use.
+fn pack_mmid(
+    experts: usize,
+    layout: &Layout,
+    groups: &[(ExpertId, Range<usize>)],
+    upload: &mut [[u8; 4]],
+) -> Result<Option<MmidHost>, EngError> {
+    let Some(spans) = &layout.mmid else {
+        return Ok(None);
+    };
+    let slots = spans.ids_src1.len() / 4;
+    let mut bounds = vec![0i32; experts + 1];
+    for (id, span) in groups {
+        let expert = id.expert as usize;
+        if expert >= experts {
+            return Err(bad(
+                "CUDA expert prefill routed an expert outside the MMQ stack",
+            ));
+        }
+        bounds[expert + 1] = i32::try_from(span.len())
+            .map_err(|_| bad("CUDA expert prefill slot count overflows"))?;
+    }
+    for e in 0..experts {
+        bounds[e + 1] += bounds[e];
+    }
+    if usize::try_from(bounds[experts]).ok() != Some(slots) {
+        return Err(bad("CUDA expert prefill groups do not cover every slot"));
+    }
+    let ids_dst: Vec<i32> = (0..slots)
+        .map(|slot| {
+            i32::try_from(slot).map_err(|_| bad("CUDA expert prefill slot count overflows"))
+        })
+        .collect::<Result<_, _>>()?;
+    for (span, values) in [
+        (&spans.ids_dst, &ids_dst),
+        (&spans.ids_src1, &ids_dst),
+        (&spans.bounds, &bounds),
+    ] {
+        for (dst, value) in upload[span.start / 4..].iter_mut().zip(values.iter()) {
+            *dst = value.to_ne_bytes();
+        }
+    }
+    Ok(Some(MmidHost { ids_dst, bounds }))
 }
 
 fn pack_routes(
@@ -903,12 +1059,19 @@ impl Scratch {
     ) -> Result<Option<Self>, EngError> {
         let allocate = || -> Result<_, EngError> {
             let buffer = cuda.allocate(layout.down.end)?;
+            let mmq = if geometry.mmq_experts > 0 {
+                let k = geometry.hidden.max(geometry.middle);
+                Some(MmqScratch::allocate(cuda, rows * geometry.rank, k)?)
+            } else {
+                None
+            };
             if (cuda.memory_info()?.free as u64) < DEVICE_HEADROOM {
                 // Driver allocation granularity can exceed the logical extent.
                 return Ok(None);
             }
             Ok(Some(Self {
                 buffer,
+                mmq,
                 stream: cuda.stream()?,
                 host: cuda.pinned_buf(layout.output.end)?,
                 rows,
@@ -988,11 +1151,18 @@ impl Scratch {
             },
         )?;
         let grouped = pack_grouped_rows(projections, &layout, &groups, &mut upload);
+        let mmid = pack_mmid(
+            projections.geometry.mmq_experts,
+            &layout,
+            &groups,
+            &mut upload,
+        )?;
         Ok((
             RoutedWindow {
                 upload,
                 groups,
                 grouped,
+                mmid,
                 layout,
                 rows,
             },
@@ -1184,6 +1354,73 @@ impl Scratch {
         Ok([gate, down])
     }
 
+    /// One stage over every slot on the vendored grouped MMQ: the compact input rows are quantized
+    /// to q8_1 columns at the layout of the stack, then each expert's columns run through its
+    /// matrix into the compact output rows.
+    fn project_mmq(
+        &self,
+        cuda: &CudaContext,
+        projections: &Projections<'_>,
+        plan: &RoutedWindow,
+        weight: MmidWeight<'_>,
+        (x_span, y_span): (&Range<usize>, &Range<usize>),
+    ) -> Result<(), EngError> {
+        let missing = || bad("CUDA expert prefill MMQ stage has no ids or scratch");
+        let (host, spans, scratch) = (
+            plan.mmid.as_ref().ok_or_else(missing)?,
+            plan.layout.mmid.as_ref().ok_or_else(missing)?,
+            self.mmq.as_ref().ok_or_else(missing)?,
+        );
+        let range = |span: &Range<usize>| self.buffer.range(span.start, span.len());
+        let shape = MmidShape {
+            n_experts: projections.geometry.mmq_experts,
+            m: plan.rows,
+            top_k: projections.geometry.rank,
+        };
+        let ids = MmidIds::wrap(
+            shape,
+            HostIds {
+                ids_dst: &host.ids_dst,
+                expert_bounds: &host.bounds,
+            },
+            (0, shape.ne_get_rows()),
+            MmidIdsOut {
+                ids_src1: range(&spans.ids_src1)?,
+                ids_dst: range(&spans.ids_dst)?,
+                expert_bounds: range(&spans.bounds)?,
+            },
+        )?;
+        let q8 = scratch
+            .buffer
+            .range(0, q8_1_bytes(weight.k, shape.ne_get_rows())?)?;
+        cuda.mmq_quantize_gather_ids(
+            &self.stream,
+            &ids,
+            MmidQuantCall {
+                packing: MmqPacking::Vendor,
+                quant: weight.quant,
+                k: weight.k,
+                row_stride: weight.k,
+                x: range(x_span)?,
+                y: q8,
+            },
+        )?;
+        cuda.mmq_mmid_launch(
+            &self.stream,
+            MmidLaunchCall {
+                shape,
+                weight,
+                ids: &ids,
+                y: q8,
+                dst: range(y_span)?,
+                ld: weight.n,
+                fixup: scratch
+                    .buffer
+                    .range(scratch.fixup_at, scratch.fixup_bytes)?,
+            },
+        )
+    }
+
     fn project(
         &self,
         cuda: &CudaContext,
@@ -1194,6 +1431,10 @@ impl Scratch {
         let l = &plan.layout;
         let pair = [(&l.gathered, &l.gate), (&l.middle, &l.down)][stage];
         let (x_span, y_span) = pair;
+        if let Some(weight) = projections.mmq_weights[stage] {
+            self.project_mmq(cuda, projections, plan, weight, pair)?;
+            return Ok(DenseGemvGroupCounts::default());
+        }
         let minimum = projections.min_wmma_rows[stage];
         let selection = plan.grouped[stage].as_ref();
         if let (Some(selection), Some(weight)) = (selection, projections.grouped_weights[stage]) {
@@ -1256,6 +1497,57 @@ mod tests {
     use super::*;
 
     #[test]
+    fn grouped_mmq_ids_map_every_compact_slot_to_itself_within_expert_bounds() {
+        let shape = Geometry {
+            hidden: 256,
+            middle: 128,
+            rank: 2,
+            grouped_experts: 4,
+            routed_experts: 0,
+            mmq_experts: 4,
+        };
+        let layout = Layout::new(3, shape).unwrap();
+        let spans = layout.mmid.as_ref().unwrap();
+        assert_eq!(spans.ids_dst.len() / 4, 6 + 3 + 127);
+        assert!(spans.bounds.end <= layout.flag.start);
+        let id = |expert| ExpertId { layer: 7, expert };
+        let groups = [(id(0), 0..2), (id(2), 2..5), (id(3), 5..6)];
+        let mut upload = vec![[0xff; 4]; layout.flag.end / 4];
+        let host = pack_mmid(4, &layout, &groups, &mut upload)
+            .unwrap()
+            .unwrap();
+        assert_eq!(host.bounds, [0, 2, 2, 5, 6]);
+        assert_eq!(host.ids_dst, [0, 1, 2, 3, 4, 5]);
+        let words = |span: &Range<usize>, n: usize| -> Vec<i32> {
+            upload[span.start / 4..span.start / 4 + n]
+                .iter()
+                .map(|w| i32::from_ne_bytes(*w))
+                .collect()
+        };
+        assert_eq!(words(&spans.ids_dst, 6), host.ids_dst);
+        assert_eq!(words(&spans.ids_src1, 6), host.ids_dst);
+        assert_eq!(words(&spans.bounds, 5), host.bounds);
+        let short = [(id(0), 0..2), (id(2), 2..5)];
+        assert!(pack_mmid(4, &layout, &short, &mut upload).is_err());
+        let outside = [(id(0), 0..2), (id(4), 2..6)];
+        assert!(pack_mmid(4, &layout, &outside, &mut upload).is_err());
+        let plain = Layout::new(
+            3,
+            Geometry {
+                mmq_experts: 0,
+                ..shape
+            },
+        )
+        .unwrap();
+        assert!(plain.mmid.is_none());
+        assert!(
+            pack_mmid(0, &plain, &groups, &mut upload)
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[test]
     fn retained_router_rows_remove_only_input_from_expert_upload() {
         let shape = Geometry {
             hidden: 2304,
@@ -1263,6 +1555,7 @@ mod tests {
             rank: 8,
             grouped_experts: 0,
             routed_experts: 0,
+            mmq_experts: 0,
         };
         for rows in [2, 8, 31, 512] {
             let original = Layout::new(rows, shape).unwrap();
@@ -1286,6 +1579,7 @@ mod tests {
             rank: 8,
             grouped_experts: 0,
             routed_experts: 0,
+            mmq_experts: 0,
         };
         let single = Layout::new(1, shape).unwrap();
         let plan = Layout::new(512, shape).unwrap();
@@ -1309,6 +1603,7 @@ mod tests {
             rank: 8,
             grouped_experts: 128,
             routed_experts: 0,
+            mmq_experts: 0,
         };
         let plain = Geometry {
             grouped_experts: 0,
@@ -1349,6 +1644,7 @@ mod tests {
             rank: 8,
             grouped_experts: 128,
             routed_experts: 0,
+            mmq_experts: 0,
         };
         for rows in [2, 31, 511, 512] {
             let full = Layout::new(rows, shape).unwrap();
@@ -1374,6 +1670,7 @@ mod tests {
             rank: 2,
             grouped_experts: 0,
             routed_experts: 0,
+            mmq_experts: 0,
         };
         let input = [0.0; 2];
         let routes = [
@@ -1436,6 +1733,7 @@ mod tests {
             rank,
             grouped_experts: 0,
             routed_experts: experts,
+            mmq_experts: 0,
         };
         let mut seed = 12345u64;
         let mut next = |bound: usize| {

@@ -39,6 +39,7 @@ crate::family::switch_table::switch_table! {
         PackedGguf = "FIFI_INKLING_CUDA_PACKED_GGUF", true;
         PrefillAttentionSide = "FIFI_INKLING_CUDA_PREFILL_ATTENTION_SIDE", true;
         PrefillTensorCoreProjections = "FIFI_INKLING_CUDA_PREFILL_TENSOR_CORE_PROJECTIONS", false;
+        PrefillTensorCoreExperts = "FIFI_INKLING_CUDA_PREFILL_TENSOR_CORE_EXPERTS", false;
         PrefillControllerWorkspace = "FIFI_INKLING_CUDA_PREFILL_CONTROLLER_WORKSPACE", true;
         PrefillOutputConv = "FIFI_INKLING_CUDA_PREFILL_OUTPUT_CONV", true;
         PrefillQ6RowReuse = "FIFI_INKLING_CUDA_PREFILL_Q6_ROW_REUSE", true;
