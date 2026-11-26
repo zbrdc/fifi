@@ -21,7 +21,7 @@ crate::family::switch_table::switch_table! {
         ChainLocalDecode = "FIFI_INKLING_CUDA_CHAIN_LOCAL_DECODE", true;
         ChainMlpExperts = "FIFI_INKLING_CUDA_CHAIN_MLP_EXPERTS", true;
         DecodeExactQ2Down = "FIFI_INKLING_CUDA_DECODE_EXACT_Q2_DOWN", false;
-        DecodeQ8Experts = "FIFI_INKLING_CUDA_DECODE_Q8_EXPERTS", false;
+        DecodeQ8Experts = "FIFI_INKLING_CUDA_DECODE_Q8_EXPERTS", true;
         DecodeSplit = "FIFI_INKLING_CUDA_DECODE_SPLIT", true;
         DenseStream = "FIFI_INKLING_CUDA_DENSE_STREAM", true;
         DeviceExpertPrefill = "FIFI_INKLING_CUDA_DEVICE_EXPERT_PREFILL", true;
@@ -39,8 +39,8 @@ crate::family::switch_table::switch_table! {
         MultirowControllers = "FIFI_INKLING_CUDA_MULTIROW_CONTROLLERS", true;
         PackedGguf = "FIFI_INKLING_CUDA_PACKED_GGUF", true;
         PrefillAttentionSide = "FIFI_INKLING_CUDA_PREFILL_ATTENTION_SIDE", true;
-        PrefillTensorCoreProjections = "FIFI_INKLING_CUDA_PREFILL_TENSOR_CORE_PROJECTIONS", false;
-        PrefillTensorCoreExperts = "FIFI_INKLING_CUDA_PREFILL_TENSOR_CORE_EXPERTS", false;
+        PrefillTensorCoreProjections = "FIFI_INKLING_CUDA_PREFILL_TENSOR_CORE_PROJECTIONS", true;
+        PrefillTensorCoreExperts = "FIFI_INKLING_CUDA_PREFILL_TENSOR_CORE_EXPERTS", true;
         PrefillControllerWorkspace = "FIFI_INKLING_CUDA_PREFILL_CONTROLLER_WORKSPACE", true;
         PrefillOutputConv = "FIFI_INKLING_CUDA_PREFILL_OUTPUT_CONV", true;
         PrefillQ6RowReuse = "FIFI_INKLING_CUDA_PREFILL_Q6_ROW_REUSE", true;
