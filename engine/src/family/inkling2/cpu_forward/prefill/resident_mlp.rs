@@ -1,6 +1,7 @@
-//! Keep a banked prefill MLP's normalized rows on device until expert dispatch. Route
-//! selection stays on the host. `Visit::execute` mixes the messages on the host and uploads
-//! the pairs; `Visit::execute_device` reads pairs the device prompt streams wrote.
+//! Keep a banked prefill MLP's normalized rows on device until expert dispatch. The rows route
+//! on the device when it routes prompt rows, else on the host from their logits.
+//! `Visit::execute` mixes the messages on the host and uploads the pairs;
+//! `Visit::execute_device` reads pairs the device prompt streams wrote.
 
 use crate::family::inkling2::switches::Switch;
 use std::{borrow::Cow, sync::Once};
@@ -10,7 +11,9 @@ use crate::{
     EngError,
     family::inkling2::{
         cpu_forward::MIX_EPS,
-        cuda_projection::gguf::{ExpertPrefillRows, ResidentController, ResidentMlpController},
+        cuda_projection::gguf::{
+            DeviceRoute, ExpertPrefillRows, ResidentController, ResidentMlpController,
+        },
         phase_profile::Work,
     },
 };
@@ -231,19 +234,61 @@ impl Visit<'_> {
 }
 
 /// What routing and expert dispatch read of an admitted visit.
-struct Route<'a> {
-    physical: u32,
-    weights: &'a GgufTextWeights,
-    router: &'a str,
-    bias: &'a [f32],
-    experts: &'a [String; 2],
-    caps: [f32; 2],
+pub(super) struct Route<'a> {
+    pub(super) physical: u32,
+    pub(super) weights: &'a GgufTextWeights,
+    pub(super) router: &'a str,
+    pub(super) bias: &'a [f32],
+    pub(super) experts: &'a [String; 2],
+    pub(super) caps: [f32; 2],
 }
 
 impl Route<'_> {
     /// Routes the normalized `activations` and runs their experts; the outputs come back unless
     /// they go to `destination`.
-    fn dispatch(
+    pub(super) fn dispatch(
+        &self,
+        forward: &CpuForward,
+        rows: usize,
+        activations: DeviceRange<'_>,
+        destination: Option<DeviceRange<'_>>,
+    ) -> Result<Vec<Vec<f32>>, EngError> {
+        let rank = forward.spec.num_experts_per_tok as usize;
+        let routed = {
+            let _span = forward.phase_span(Work::Experts);
+            self.weights.route_device_experts(
+                self.experts.each_ref().map(String::as_str),
+                self.physical,
+                (
+                    DeviceRoute {
+                        router: self.router,
+                        bias: self.bias,
+                        scale: forward.math.route_scale,
+                        rank,
+                        hidden: forward.hidden(),
+                        activations,
+                    },
+                    destination,
+                ),
+                self.caps,
+            )?
+        };
+        let outputs = match routed {
+            Some(routed) => {
+                forward
+                    .record_prefill_routes(self.physical as usize, routed.picks.chunks_exact(rank));
+                routed.outputs
+            }
+            None => self.dispatch_host_routes(forward, rows, activations, destination)?,
+        };
+        if outputs.len() != if destination.is_some() { 0 } else { rows } {
+            return Err(bad("incorrect Inkling resident MLP output rows"));
+        }
+        Ok(outputs)
+    }
+
+    /// Routes the rows on the host from their logits, then runs their experts on the device.
+    fn dispatch_host_routes(
         &self,
         forward: &CpuForward,
         rows: usize,
@@ -280,9 +325,6 @@ impl Route<'_> {
                 )?
                 .ok_or_else(|| bad("previously admitted Inkling resident MLP experts declined"))?
         };
-        if outputs.len() != if destination.is_some() { 0 } else { rows } {
-            return Err(bad("incorrect Inkling resident MLP output rows"));
-        }
         Ok(outputs)
     }
 }

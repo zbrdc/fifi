@@ -43,7 +43,9 @@ pub(in crate::family::inkling2) use resident_local::{
     ConvRows, LocalDecodeWidths, PrepWeights, ResidentLocalDecode,
 };
 
-pub(in crate::family::inkling2) use device_prefill::ExpertPrefillRows;
+pub(in crate::family::inkling2) use device_prefill::{
+    DeviceRoute, DeviceRouted, ExpertPrefillRows,
+};
 pub(in crate::family::inkling2) use residency::{ExpertLayer, ExpertStack};
 use residency::{PackedBudget, ResidentExperts};
 
@@ -70,6 +72,8 @@ pub(in crate::family::inkling2) struct GgufCuda {
     device_prefill_wmma: bool,
     device_prefill_grouped_dq: bool,
     device_prefill_exact_tile: bool,
+    /// Prompt rows route on the device and only their expert grouping comes back.
+    device_prompt_routing: bool,
     cold_controller: Option<cold_controller::Staging>,
     resident: ResidentExperts,
     cache: RefCell<BTreeMap<u32, cache::LayerCache>>,
@@ -882,6 +886,7 @@ impl GgufCuda {
                 && context
                     .device_attributes()
                     .is_ok_and(|attrs| attrs.compute_capability >= (7, 5)),
+            device_prompt_routing: device_prefill && Switch::DeviceRouting.on(),
             device_prefill_exact_tile: device_prefill
                 && Switch::DeviceExpertPrefillExactTile.on()
                 // The kernels use SM75 tensor-core instructions. A refused diagnostic keeps

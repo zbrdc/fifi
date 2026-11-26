@@ -838,17 +838,26 @@ impl CpuForward {
         })
         .into_iter()
         .collect::<Result<Vec<_>, _>>()?;
-        for route in &routes {
-            self.observe_route(layer, route);
+        self.record_prefill_routes(layer, routes.iter().map(|route| route.selected.as_slice()));
+        Ok(routes)
+    }
+
+    /// Records the experts of prompt rows in row order, wherever the rows routed.
+    fn record_prefill_routes<'r>(
+        &self,
+        layer: usize,
+        routes: impl Iterator<Item = &'r [usize]> + Clone,
+    ) {
+        for selected in routes.clone() {
+            self.observe_route(layer, selected);
         }
         if std::env::var("FIFI_INKLING_DEBUG_PREFILL_ROUTES").as_deref() == Ok("1") {
-            let routes: Vec<_> = routes.iter().map(|route| &route.selected).collect();
+            let routes: Vec<_> = routes.collect();
             eprintln!(
                 "Inkling grouped route diagnostic {}",
                 serde_json::json!({"layer":layer,"routes":routes})
             );
         }
-        Ok(routes)
     }
 
     fn diagnose_chained_projections(

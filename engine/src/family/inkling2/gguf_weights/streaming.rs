@@ -5,7 +5,7 @@ use crate::{
     EngError,
     expert_tier::{ExpertId, ExpertPayload, ExpertPayloadSource, ExpertPayloadView},
     family::inkling2::cuda_projection::gguf::{
-        ExpertPrefillRows,
+        DeviceRoute, DeviceRouted, ExpertPrefillRows,
         streaming::{ExpertGroup, ExpertRows, PrefillRoute, ResidentRoute, RoutedExperts},
     },
     kernels::cuda::resident::dense_gemv::{DenseDtype, GgufMoePick},
@@ -212,6 +212,28 @@ impl GgufTextWeights {
             return Ok(None);
         };
         cuda.prefill_device_experts(&mut source, layer, operands, dtypes, caps, route_weight)
+    }
+
+    /// Routes prompt rows on the device and runs their experts; `None` when the device does
+    /// not route this layer, before any device work.
+    pub(in crate::family::inkling2) fn route_device_experts(
+        &self,
+        names: [&str; 2],
+        layer: u32,
+        operands: (DeviceRoute<'_>, Option<DeviceRange<'_>>),
+        caps: [f32; 2],
+    ) -> Result<Option<DeviceRouted>, EngError> {
+        let Some(cuda) = self
+            .cuda
+            .as_ref()
+            .filter(|cuda| cuda.prefills_device_layer(layer))
+        else {
+            return Ok(None);
+        };
+        let Some((mut source, dtypes)) = self.stream_source(names, layer)? else {
+            return Ok(None);
+        };
+        cuda.route_device_experts(&mut source, layer, operands, dtypes, caps)
     }
 
     pub(in crate::family::inkling2) fn prefill_bank_report(

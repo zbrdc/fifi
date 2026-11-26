@@ -12,10 +12,14 @@ use super::{
 use crate::{
     EngError,
     expert_tier::{ExpertId, ExpertPayloadSource},
+    family::inkling2::cpu_forward::ROUTE_NORMALIZATION_FLOOR,
     kernels::cuda::{
         CudaContext, DeviceBuffer, DeviceRange, DeviceStream, PinnedBuf,
         prefill::{
-            mmq_mmid::{GroupedDqRows, MmidWeight, SparseDqCall, grouped_dq_serves},
+            mmq_mmid::{
+                GroupedDqRows, IdsGuardCall, MmidIdsOut, MmidShape, MmidWeight, SparseDqCall,
+                grouped_dq_serves,
+            },
             row_ops::{ClippedExpertCall, IndexedRankSumCall, RowGatherCall, RowShape},
         },
         resident::{
@@ -23,6 +27,10 @@ use crate::{
                 DenseDtype, DenseGemvCall, DenseGemvGroupCounts, DenseGemvShape, dense_gemv_bytes,
             },
             matvec_q::QuantType,
+            router::{
+                MAX_ROWS as ROUTER_MAX_ROWS, RouterLogitsCall, RouterShape, RouterSigmoidBias,
+                RouterSigmoidCall, router_packed_logits_bytes,
+            },
         },
     },
 };
@@ -36,6 +44,8 @@ struct Geometry {
     middle: usize,
     rank: usize,
     grouped_experts: usize,
+    /// The router's experts when the rows route on the device, else 0.
+    routed_experts: usize,
 }
 
 impl Geometry {
@@ -46,23 +56,39 @@ impl Geometry {
             && self.middle == shape.middle
             && self.rank == shape.rank
             && self.grouped_experts >= shape.grouped_experts
+            && self.routed_experts >= shape.routed_experts
     }
 }
 
+/// The host plan fills everything before `flag` and zeroes `flag`; on the host route it also
+/// writes the inverse ids and weights, which a device route writes itself.
 struct Layout {
     input: Range<usize>,
     row_ids: Range<usize>,
-    inverse_ids: Range<usize>,
     gate_scales: Range<usize>,
     down_scales: Range<usize>,
-    weights: Range<usize>,
     grouped: [Range<usize>; 2],
     flag: Range<usize>,
+    inverse_ids: Range<usize>,
+    weights: Range<usize>,
+    route: Option<RouteSpans>,
     output: Range<usize>,
     gathered: Range<usize>,
     gate: Range<usize>,
     middle: Range<usize>,
     down: Range<usize>,
+}
+
+/// Device routing scratch: the bias and the status word are uploaded together, and the status,
+/// the expert bounds and the compact slot map come back together.
+struct RouteSpans {
+    bias: Range<usize>,
+    status: Range<usize>,
+    bounds: Range<usize>,
+    ids_dst: Range<usize>,
+    picks: Range<usize>,
+    guarded: Range<usize>,
+    logits: Range<usize>,
 }
 
 impl Layout {
@@ -80,29 +106,47 @@ impl Layout {
         };
         let input = span(if retained { 0 } else { rows }, shape.hidden)?;
         let row_ids = span(slots, 1)?;
-        let inverse_ids = span(slots, 1)?;
         let gate_scales = span(slots, 1)?;
         let down_scales = span(slots, 1)?;
-        let weights = span(slots, 1)?;
         let grouped = if shape.grouped_experts > 0 {
             let words = slots.checked_add(shape.grouped_experts)?.checked_add(1)?;
-            let spans = [span(words, 1)?, span(words, 1)?];
-            // F32 vector loads in GEMM require packed operands at 16-byte alignment.
-            let align_words = (3 - (spans[1].end / 4 % 4)) % 4;
-            span(align_words, 1)?;
-            spans
+            [span(words, 1)?, span(words, 1)?]
         } else {
             [0..0, 0..0]
         };
+        let flag = span(1, 1)?;
+        let inverse_ids = span(slots, 1)?;
+        let weights = span(slots, 1)?;
+        let experts = shape.routed_experts;
+        let route = if experts > 0 {
+            Some(RouteSpans {
+                bias: span(experts, 1)?,
+                status: span(1, 1)?,
+                bounds: span(experts.checked_add(1)?, 1)?,
+                // The grouped launch's fixup gather reads up to `rows + 127` past the slots.
+                ids_dst: span(slots.checked_add(rows)?.checked_add(127)?, 1)?,
+                picks: span(slots, 1)?,
+                guarded: span(slots, 1)?,
+                logits: span(rows, experts)?,
+            })
+        } else {
+            None
+        };
+        if shape.grouped_experts > 0 {
+            // F32 vector loads in GEMM require packed operands at 16-byte alignment.
+            let end = route.as_ref().map_or(weights.end, |spans| spans.logits.end);
+            span((4 - end / 4 % 4) % 4, 1)?;
+        }
         Some(Self {
             input,
             row_ids,
-            inverse_ids,
             gate_scales,
             down_scales,
-            weights,
             grouped,
-            flag: span(1, 1)?,
+            flag,
+            inverse_ids,
+            weights,
+            route,
             output: span(rows, shape.hidden)?,
             gathered: span(slots, shape.hidden)?,
             gate: span(slots, shape.middle.checked_mul(2)?)?,
@@ -133,6 +177,7 @@ pub(super) fn device_workspace_bytes(spec: &super::super::TextSpec, context: usi
         middle: usize::try_from(spec.intermediate_size).ok()?,
         rank: usize::try_from(spec.num_experts_per_tok).ok()?,
         grouped_experts: 0,
+        routed_experts: usize::try_from(spec.n_routed_experts).ok()?,
     };
     let rows = context.min(DenseGemvShape::MAX_ACTIVATION_ROWS.checked_div(shape.rank)?);
     u64::try_from(Layout::new(rows, shape)?.down.end).ok()
@@ -215,6 +260,30 @@ pub(in crate::family::inkling2) enum ExpertPrefillRows<'a> {
         hidden: usize,
         activations: DeviceRange<'a>,
     },
+}
+
+/// Prompt rows that route on the device: `activations` holds the normalized rows, `router`
+/// names the layer's F32 router, and `bias` and `scale` are its expert bias and route scale.
+pub(in crate::family::inkling2) struct DeviceRoute<'a> {
+    pub(in crate::family::inkling2) router: &'a str,
+    pub(in crate::family::inkling2) bias: &'a [f32],
+    pub(in crate::family::inkling2) scale: f32,
+    pub(in crate::family::inkling2) rank: usize,
+    pub(in crate::family::inkling2) hidden: usize,
+    pub(in crate::family::inkling2) activations: DeviceRange<'a>,
+}
+
+struct Router<'a> {
+    w: DeviceRange<'a>,
+    bias: &'a [f32],
+    scale: f32,
+}
+
+/// The routed experts of a device route: the outputs, unless they went to a destination, and
+/// each row's experts in rank order, `rank` per row.
+pub(in crate::family::inkling2) struct DeviceRouted {
+    pub(in crate::family::inkling2) outputs: Vec<Vec<f32>>,
+    pub(in crate::family::inkling2) picks: Vec<usize>,
 }
 
 #[derive(Clone, Copy)]
@@ -414,20 +483,143 @@ impl GgufCuda {
                 *total += selection.as_ref().map_or(0, GroupedDqRows::selected);
             }
         }
-        if self.prefill_report.is_some() {
-            eprintln!(
-                "Inkling CUDA device expert prefill {}",
-                serde_json::json!({"layer": layer, "rows": routes.len(),
-                    "windows": routes.len().div_ceil(scratch.rows),
-                    "router_input_h2d_bytes_saved": retained.map_or(0, |input| input.bytes()),
-                    "expert_output_d2h_bytes_avoided": destination.map_or(0, |out| out.bytes()),
-                    "wmma_gate_calls": counts[0].wmma, "wmma_down_calls": counts[1].wmma,
-                    "grouped_dq_gate_slots": grouped_slots[0], "grouped_dq_down_slots": grouped_slots[1],
-                    "exact_tile_gate_calls": counts[0].exact_tiles,
-                    "exact_tile_down_calls": counts[1].exact_tiles})
-            );
-        }
+        self.report_expert_prefill(
+            layer,
+            [routes.len(), scratch.rows],
+            [retained, destination],
+            (counts, grouped_slots),
+        );
         Ok(Some(output))
+    }
+
+    /// Routes the prompt rows of `route` on the device and runs their experts. The router
+    /// logits stay on the device; only the status, the expert bounds and the compact slot map
+    /// come back, and the host plans the expert launches from them. Returns `None`, before any
+    /// device work, when the device does not route these rows.
+    pub(in crate::family::inkling2) fn route_device_experts(
+        &self,
+        source: &mut impl ExpertPayloadSource,
+        layer: u32,
+        (route, destination): (DeviceRoute<'_>, Option<DeviceRange<'_>>),
+        dtypes: [DenseDtype; 2],
+        caps: [f32; 2],
+    ) -> Result<Option<DeviceRouted>, EngError> {
+        let Some(workspace) = self
+            .device_prefill
+            .as_ref()
+            .filter(|_| self.device_prompt_routing)
+        else {
+            return Ok(None);
+        };
+        let Some((weight, DenseDtype::F32)) = self.dense.get(route.router) else {
+            return Ok(None);
+        };
+        let DeviceRoute {
+            bias,
+            scale,
+            rank,
+            hidden,
+            activations,
+            ..
+        } = route;
+        let [experts, width] = weight.shape;
+        let stride = hidden * size_of::<f32>();
+        let rows = activations.bytes().checked_div(stride).unwrap_or(0);
+        // Windows never exceed the router's row limit, which the grouped ids share.
+        let shape = RouterShape {
+            m: rows.clamp(1, ROUTER_MAX_ROWS),
+            hidden,
+            n_expert: experts,
+            top_k: rank,
+        };
+        if width != hidden
+            || bias.len() != experts
+            || !scale.is_finite()
+            || !admits_router_input(rows, hidden, activations.bytes())
+            || !self.valid_device_prefill(rows, rank, dtypes, caps)
+            || router_packed_logits_bytes(shape).is_err()
+        {
+            return Ok(None);
+        }
+        if let Some(out) = destination
+            && (!admits_router_input(rows, hidden, out.bytes()) || !out.offset().is_multiple_of(4))
+        {
+            return Err(bad(
+                "incorrect CUDA expert output destination extent or alignment",
+            ));
+        }
+        let Some(mut projections) =
+            self.prepare_device_experts(source, layer, 0..experts, [rank, hidden], dtypes, caps)?
+        else {
+            return Ok(None);
+        };
+        projections.geometry.routed_experts = experts;
+        let cuda = &self.context;
+        let mut workspace = workspace.borrow_mut();
+        let Some(scratch) = workspace.fit(cuda, rows, projections.geometry)? else {
+            return Ok(None);
+        };
+        let router = Router {
+            w: weight.codes.range(0, weight.codes.bytes())?,
+            bias,
+            scale,
+        };
+        let mut routed = DeviceRouted {
+            outputs: Vec::with_capacity(if destination.is_some() { 0 } else { rows }),
+            picks: Vec::with_capacity(rows * rank),
+        };
+        let mut counts = [DenseGemvGroupCounts::default(); 2];
+        let mut grouped_slots = [0; 2];
+        let window = scratch.rows.min(ROUTER_MAX_ROWS);
+        for first in (0..rows).step_by(window) {
+            let count = (rows - first).min(window);
+            let input = activations.slice(first * stride, count * stride)?;
+            let target = destination
+                .map(|out| out.slice(first * stride, count * stride))
+                .transpose()?;
+            let (plan, picks) = scratch.route(cuda, &projections, layer, &router, input)?;
+            let (rows, launches) =
+                scratch.execute(cuda, &projections, &plan, (Some(input), target))?;
+            routed.outputs.extend(rows);
+            routed.picks.extend(picks);
+            for (total, count) in counts.iter_mut().zip(launches) {
+                total.wmma += count.wmma;
+                total.exact_tiles += count.exact_tiles;
+            }
+            for (total, selection) in grouped_slots.iter_mut().zip(&plan.grouped) {
+                *total += selection.as_ref().map_or(0, GroupedDqRows::selected);
+            }
+        }
+        self.report_expert_prefill(
+            layer,
+            [rows, window],
+            [Some(activations), destination],
+            (counts, grouped_slots),
+        );
+        Ok(Some(routed))
+    }
+
+    fn report_expert_prefill(
+        &self,
+        layer: u32,
+        [rows, window]: [usize; 2],
+        [retained, destination]: [Option<DeviceRange<'_>>; 2],
+        (counts, grouped_slots): ([DenseGemvGroupCounts; 2], [usize; 2]),
+    ) {
+        if self.prefill_report.is_none() {
+            return;
+        }
+        eprintln!(
+            "Inkling CUDA device expert prefill {}",
+            serde_json::json!({"layer": layer, "rows": rows,
+                "windows": rows.div_ceil(window),
+                "router_input_h2d_bytes_saved": retained.map_or(0, |input| input.bytes()),
+                "expert_output_d2h_bytes_avoided": destination.map_or(0, |out| out.bytes()),
+                "wmma_gate_calls": counts[0].wmma, "wmma_down_calls": counts[1].wmma,
+                "grouped_dq_gate_slots": grouped_slots[0], "grouped_dq_down_slots": grouped_slots[1],
+                "exact_tile_gate_calls": counts[0].exact_tiles,
+                "exact_tile_down_calls": counts[1].exact_tiles})
+        );
     }
 
     fn prepare_device_experts<'a>(
@@ -487,6 +679,7 @@ impl GgufCuda {
                 middle,
                 rank,
                 grouped_experts,
+                routed_experts: 0,
             },
             dtypes,
             min_wmma_rows: WMMA_MIN_ROWS.map(|rows| self.device_prefill_wmma.then_some(rows)),
@@ -537,9 +730,12 @@ fn admits_router_input(rows: usize, hidden: usize, bytes: usize) -> bool {
             == Some(bytes)
 }
 
+/// Each expert's slots in the expert-major order, experts ascending.
+type ExpertGroups = Vec<(ExpertId, Range<usize>)>;
+
 struct RoutedWindow {
     upload: Vec<[u8; 4]>,
-    groups: Vec<(ExpertId, Range<usize>)>,
+    groups: ExpertGroups,
     grouped: [Option<GroupedDqRows>; 2],
     layout: Layout,
     rows: usize,
@@ -556,7 +752,7 @@ impl RoutedWindow {
         let shape = projections.geometry;
         let layout = Layout::for_input(routes.len(), shape, retained)
             .ok_or_else(|| bad("expert prefill arena overflows"))?;
-        let mut upload = vec![[0; 4]; layout.flag.end / 4];
+        let mut upload = vec![[0; 4]; layout.weights.end / 4];
         if !retained {
             let RowRoutes::Host(host) = routes else {
                 return Err(bad("missing resident expert prefill input"));
@@ -651,6 +847,53 @@ fn pack_routes(
     Ok(batches)
 }
 
+/// The host part of a device-grouped plan. `bounds` and `columns` are the device's expert
+/// bounds and compact slot map (column to slot `row * rank + lane`), in expert order and row
+/// order within an expert, as [`pack_routes`] groups them. Fills each column's row and expert
+/// scales and returns the expert groups and each slot's expert.
+fn pack_device_grouping(
+    upload: &mut [[u8; 4]],
+    layout: &Layout,
+    (layer, rank): (u32, usize),
+    (bounds, columns): (&[i32], &[i32]),
+    scales: impl Fn(ExpertId) -> Option<[f32; 2]>,
+) -> Result<(ExpertGroups, Vec<usize>), EngError> {
+    let invalid = || bad("CUDA prompt routing returned an invalid expert grouping");
+    let slots = columns.len();
+    if bounds.first() != Some(&0) || bounds.last().copied() != i32::try_from(slots).ok() {
+        return Err(invalid());
+    }
+    let mut groups = Vec::new();
+    let mut picks = vec![0; slots];
+    for (expert, pair) in bounds.windows(2).enumerate() {
+        if pair[0] > pair[1] {
+            return Err(invalid());
+        }
+        // The first bound is zero and the bounds rise to `slots`.
+        let [start, end] = [pair[0], pair[1]].map(|bound| bound as usize);
+        if start == end {
+            continue;
+        }
+        let id = ExpertId {
+            layer,
+            expert: expert as u32,
+        };
+        let [gate, down] = scales(id).ok_or_else(invalid)?.map(f32::to_ne_bytes);
+        for (column, &slot) in columns.iter().enumerate().take(end).skip(start) {
+            let slot = usize::try_from(slot)
+                .ok()
+                .filter(|&slot| slot < slots)
+                .ok_or_else(invalid)?;
+            upload[layout.row_ids.start / 4 + column] = ((slot / rank) as i32).to_ne_bytes();
+            upload[layout.gate_scales.start / 4 + column] = gate;
+            upload[layout.down_scales.start / 4 + column] = down;
+            picks[slot] = expert;
+        }
+        groups.push((id, start..end));
+    }
+    Ok((groups, picks))
+}
+
 impl Scratch {
     fn allocate(
         cuda: &CudaContext,
@@ -678,6 +921,156 @@ impl Scratch {
         }
     }
 
+    /// Routes the rows of `input` on the device and groups their slots by expert there, then
+    /// plans the window from the status, expert bounds and compact slot map that come back.
+    /// The device holds the inverse ids and the route weights; the plan uploads the rest.
+    /// Returns the plan and each row's experts in rank order.
+    fn route(
+        &mut self,
+        cuda: &CudaContext,
+        projections: &Projections<'_>,
+        layer: u32,
+        router: &Router<'_>,
+        input: DeviceRange<'_>,
+    ) -> Result<(RoutedWindow, Vec<usize>), EngError> {
+        let shape = projections.geometry;
+        let rows = input.bytes() / (shape.hidden * size_of::<f32>());
+        let layout = Layout::for_input(rows, shape, true)
+            .ok_or_else(|| bad("expert prefill arena overflows"))?;
+        let spans = layout
+            .route
+            .as_ref()
+            .ok_or_else(|| bad("expert prefill arena has no routing scratch"))?;
+        let (experts, rank) = (shape.routed_experts, shape.rank);
+        let slots = rows * rank;
+        let mut sent: Vec<[u8; 4]> = router.bias.iter().map(|b| b.to_ne_bytes()).collect();
+        sent.push([0; 4]);
+        self.host.write(spans.bias.start, sent.as_flattened())?;
+        let queued = self.enqueue_route(
+            cuda,
+            (&layout, spans),
+            router,
+            input,
+            [rows, shape.hidden, rank],
+        );
+        // A launch can be refused after the bias upload has been queued.
+        let waited = self.host.synchronize(&self.stream);
+        queued?;
+        waited?;
+        let read_ints = |span: Range<usize>| -> Result<Vec<i32>, EngError> {
+            let mut words = vec![[0; 4]; span.len() / 4];
+            self.host.read(span.start, words.as_flattened_mut())?;
+            Ok(words.into_iter().map(i32::from_ne_bytes).collect())
+        };
+        if read_ints(spans.status.clone())?[0] != 0 {
+            return Err(bad(
+                "CUDA prompt routing met a nonfinite router logit or an invalid expert",
+            ));
+        }
+        let bounds = read_ints(spans.bounds.clone())?;
+        let columns = read_ints(spans.ids_dst.start..spans.ids_dst.start + slots * 4)?;
+        if bounds.len() != experts + 1 {
+            return Err(bad(
+                "CUDA prompt routing returned an invalid expert grouping",
+            ));
+        }
+        let mut upload = vec![[0; 4]; layout.flag.end / 4];
+        let (groups, picks) = pack_device_grouping(
+            &mut upload,
+            &layout,
+            (layer, rank),
+            (&bounds, &columns),
+            |id| {
+                projections
+                    .matrices
+                    .get(&id)
+                    .map(|pair| pair.each_ref().map(|matrix| matrix.scale))
+            },
+        )?;
+        let grouped = pack_grouped_rows(projections, &layout, &groups, &mut upload);
+        Ok((
+            RoutedWindow {
+                upload,
+                groups,
+                grouped,
+                layout,
+                rows,
+            },
+            picks,
+        ))
+    }
+
+    /// Queues the bias upload, the router logits and selection, the grouped ids and the
+    /// readback of the status, bounds and compact slot map.
+    fn enqueue_route(
+        &mut self,
+        cuda: &CudaContext,
+        (layout, spans): (&Layout, &RouteSpans),
+        router: &Router<'_>,
+        x: DeviceRange<'_>,
+        [rows, hidden, rank]: [usize; 3],
+    ) -> Result<(), EngError> {
+        let experts = router.bias.len();
+        let sent = self
+            .buffer
+            .range(spans.bias.start, spans.status.end - spans.bias.start)?;
+        cuda.copy_from_pinned(&self.stream, &mut self.host, spans.bias.start, sent)?;
+        let range = |span: &Range<usize>| self.buffer.range(span.start, span.len());
+        let shape = RouterShape {
+            m: rows,
+            hidden,
+            n_expert: experts,
+            top_k: rank,
+        };
+        let logits = range(&spans.logits)?;
+        let status = range(&spans.status)?;
+        cuda.router_logits_rows(
+            &self.stream,
+            RouterLogitsCall {
+                shape,
+                x,
+                w: router.w,
+                logits,
+            },
+        )?;
+        cuda.router_sigmoid_select_rows(
+            &self.stream,
+            RouterSigmoidCall {
+                shape,
+                bias: Some(RouterSigmoidBias::HostRounded {
+                    values: range(&spans.bias)?,
+                    floor: ROUTE_NORMALIZATION_FLOOR,
+                    scale: router.scale,
+                }),
+                logits,
+                ids: range(&spans.picks)?,
+                weights: range(&layout.weights)?,
+                status,
+            },
+        )?;
+        cuda.mmq_build_ids(
+            &self.stream,
+            IdsGuardCall {
+                shape: MmidShape {
+                    n_experts: experts,
+                    m: rows,
+                    top_k: rank,
+                },
+                ids: range(&spans.picks)?,
+                ids_g: range(&spans.guarded)?,
+                status: Some(status),
+            },
+            MmidIdsOut {
+                ids_src1: range(&layout.inverse_ids)?,
+                ids_dst: range(&spans.ids_dst)?,
+                expert_bounds: range(&spans.bounds)?,
+            },
+        )?;
+        let back = spans.status.start..spans.ids_dst.start + rows * rank * 4;
+        let returned = self.buffer.range(back.start, back.len())?;
+        cuda.copy_to_pinned(&self.stream, returned, &mut self.host, back.start)
+    }
+
     fn execute(
         &mut self,
         cuda: &CudaContext,
@@ -686,20 +1079,19 @@ impl Scratch {
         operands: (Option<DeviceRange<'_>>, Option<DeviceRange<'_>>),
     ) -> Result<(Vec<Vec<f32>>, [DenseGemvGroupCounts; 2]), EngError> {
         let l = &plan.layout;
-        let upload = self.buffer.range(0, l.flag.end)?;
+        let upload = self.buffer.range(0, size_of_val(plan.upload.as_slice()))?;
         self.host.write(0, plan.upload.as_flattened())?;
         cuda.copy_from_pinned(&self.stream, &mut self.host, 0, upload)?;
         let result = self
             .enqueue(cuda, projections, plan, operands)
             .and_then(|counts| {
                 // With a device destination, only status crosses the host boundary.
-                let end = if operands.1.is_some() {
-                    l.flag.end
-                } else {
-                    l.output.end
-                };
-                let readback = self.buffer.range(l.flag.start, end - l.flag.start)?;
-                cuda.copy_to_pinned(&self.stream, readback, &mut self.host, l.flag.start)?;
+                let flag = self.buffer.range(l.flag.start, l.flag.len())?;
+                cuda.copy_to_pinned(&self.stream, flag, &mut self.host, l.flag.start)?;
+                if operands.1.is_none() {
+                    let output = self.buffer.range(l.output.start, l.output.len())?;
+                    cuda.copy_to_pinned(&self.stream, output, &mut self.host, l.output.start)?;
+                }
                 Ok(counts)
             });
         // A launch can be refused after the upload has been queued.
@@ -870,6 +1262,7 @@ mod tests {
             middle: 512,
             rank: 8,
             grouped_experts: 0,
+            routed_experts: 0,
         };
         for rows in [2, 8, 31, 512] {
             let original = Layout::new(rows, shape).unwrap();
@@ -892,6 +1285,7 @@ mod tests {
             middle: 512,
             rank: 8,
             grouped_experts: 0,
+            routed_experts: 0,
         };
         let single = Layout::new(1, shape).unwrap();
         let plan = Layout::new(512, shape).unwrap();
@@ -914,6 +1308,7 @@ mod tests {
             middle: 1152,
             rank: 8,
             grouped_experts: 128,
+            routed_experts: 0,
         };
         let plain = Geometry {
             grouped_experts: 0,
@@ -953,12 +1348,13 @@ mod tests {
             middle: 1152,
             rank: 8,
             grouped_experts: 128,
+            routed_experts: 0,
         };
         for rows in [2, 31, 511, 512] {
             let full = Layout::new(rows, shape).unwrap();
             let retained = Layout::for_input(rows, shape, true).unwrap();
             for l in [&full, &retained] {
-                assert_eq!(l.grouped[0].start, l.weights.end);
+                assert_eq!(l.grouped[0].start, l.down_scales.end);
                 assert_eq!(l.grouped[0].end, l.grouped[1].start);
                 assert!(l.grouped[1].end <= l.flag.start);
                 assert_eq!(l.grouped[1].len(), (rows * 8 + 129) * 4);
@@ -977,6 +1373,7 @@ mod tests {
             middle: 2,
             rank: 2,
             grouped_experts: 0,
+            routed_experts: 0,
         };
         let input = [0.0; 2];
         let routes = [
@@ -995,7 +1392,7 @@ mod tests {
         let resident = RowRoutes::Resident(&ids);
         assert_eq!(group_route_ids(5, resident.ids()), groups);
         assert_eq!(resident.window(1..2).ids().next(), Some(ids[1]));
-        let mut upload = vec![[0; 4]; layout.flag.end / 4];
+        let mut upload = vec![[0; 4]; layout.weights.end / 4];
         let batches = pack_routes(
             &mut upload,
             &layout,
@@ -1027,5 +1424,103 @@ mod tests {
         assert_eq!(floats(&layout.gate_scales), [2.0, 3.0, 4.0, 4.0]);
         assert_eq!(floats(&layout.down_scales), [3.0, 4.0, 5.0, 5.0]);
         assert_eq!(floats(&layout.weights), [12.0, 10.0, 21.0, 22.0]);
+    }
+
+    #[test]
+    fn device_grouping_plans_the_rows_and_scales_of_the_host_route() {
+        let rank = 3;
+        let experts = 7;
+        let shape = Geometry {
+            hidden: 4,
+            middle: 4,
+            rank,
+            grouped_experts: 0,
+            routed_experts: experts,
+        };
+        let mut seed = 12345u64;
+        let mut next = |bound: usize| {
+            seed = seed
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            (seed >> 33) as usize % bound
+        };
+        for rows in [2, 5, 17] {
+            // Distinct experts per row, as the router picks them.
+            let picks: Vec<Vec<usize>> = (0..rows)
+                .map(|_| {
+                    let mut row = Vec::new();
+                    while row.len() < rank {
+                        let expert = next(experts);
+                        if !row.contains(&expert) {
+                            row.push(expert);
+                        }
+                    }
+                    row
+                })
+                .collect();
+            let scales = |id: ExpertId| {
+                let expert = id.expert as f32;
+                Some([expert + 0.5, expert + 1.5])
+            };
+            let layout = Layout::for_input(rows, shape, true).unwrap();
+            let mut host = vec![[0; 4]; layout.weights.end / 4];
+            let ids: Vec<&[usize]> = picks.iter().map(Vec::as_slice).collect();
+            let host_groups = pack_routes(
+                &mut host,
+                &layout,
+                rank,
+                group_route_ids(5, RowRoutes::Resident(&ids).ids()),
+                |id| scales(id).unwrap(),
+                |_, _| 1.0,
+            )
+            .unwrap();
+            // The device's grouping: experts in order, rows in order within an expert.
+            let mut bounds = vec![0];
+            let mut columns = Vec::new();
+            for expert in 0..experts {
+                for (row, picked) in picks.iter().enumerate() {
+                    if let Some(lane) = picked.iter().position(|&e| e == expert) {
+                        columns.push((row * rank + lane) as i32);
+                    }
+                }
+                bounds.push(columns.len() as i32);
+            }
+            let mut device = vec![[0; 4]; layout.flag.end / 4];
+            let (groups, slots) =
+                pack_device_grouping(&mut device, &layout, (5, rank), (&bounds, &columns), scales)
+                    .unwrap();
+            assert_eq!(groups, host_groups);
+            assert_eq!(slots, picks.concat());
+            for span in [&layout.row_ids, &layout.gate_scales, &layout.down_scales] {
+                assert_eq!(
+                    device[span.start / 4..span.end / 4],
+                    host[span.start / 4..span.end / 4]
+                );
+            }
+            // The device's inverse map is the host's inverse ids.
+            let mut inverse = vec![0; rows * rank];
+            for (column, &slot) in columns.iter().enumerate() {
+                inverse[slot as usize] = column as i32;
+            }
+            let span = &layout.inverse_ids;
+            let host_inverse: Vec<i32> = host[span.start / 4..span.end / 4]
+                .iter()
+                .map(|word| i32::from_ne_bytes(*word))
+                .collect();
+            assert_eq!(inverse, host_inverse);
+        }
+        let layout = Layout::for_input(2, shape, true).unwrap();
+        let mut upload = vec![[0; 4]; layout.flag.end / 4];
+        let scales = |_| Some([1.0, 1.0]);
+        for (bounds, columns) in [
+            (vec![0, 3, 2, 6, 6, 6, 6, 6], vec![0, 1, 2, 3, 4, 5]),
+            (vec![0, 3, 3, 3, 3, 3, 3, 5], vec![0, 1, 2, 3, 4, 5]),
+            (vec![0, 3, 3, 3, 3, 3, 3, 6], vec![0, 1, 2, 3, 4, 6]),
+        ] {
+            assert!(
+                pack_device_grouping(&mut upload, &layout, (5, rank), (&bounds, &columns), scales)
+                    .is_err()
+            );
+        }
     }
 }

@@ -911,18 +911,18 @@ impl CpuForward {
         bias: &[f32],
     ) -> Result<MoeRoute, EngError> {
         let route = route_scores(scores, bias, self.spec.num_experts_per_tok as usize)?;
-        self.observe_route(layer, &route);
+        self.observe_route(layer, &route.selected);
         Ok(route)
     }
 
     /// Records a route's experts for the streamed expert cache.
-    fn observe_route(&self, layer: usize, route: &MoeRoute) {
+    fn observe_route(&self, layer: usize, selected: &[usize]) {
         #[cfg(all(feature = "native-cuda", target_os = "linux"))]
         if let Weights::Gguf(weights) = &self.weights {
-            weights.observe_experts(layer, &route.selected);
+            weights.observe_experts(layer, selected);
         }
         #[cfg(not(all(feature = "native-cuda", target_os = "linux")))]
-        let _ = (layer, route);
+        let _ = (layer, selected);
     }
 
     fn moe(

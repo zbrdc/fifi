@@ -1,12 +1,13 @@
 //! Prompt visits run on the device prompt streams. The depth mixes, norms, attention, residual,
-//! MLP input, experts and both output convolutions stay on the device; the host reads the
-//! router logits to route, and the K/V rows it mirrors. The core passes' prelude and message
-//! bank stay on the device too (`banked` runs the visits that read the bank).
+//! MLP input, routing, experts and both output convolutions stay on the device; the host reads
+//! back each visit's statuses and expert grouping, and the last raw rows its convolution
+//! histories keep. The core passes' prelude and message bank stay on the device too (`banked`
+//! runs the visits that read the bank).
 
 use super::super::prompt_streams::{MixTarget, PromptStreams};
 use super::{
-    Attention, CpuForward, EngError, ExpertPrefillRows, GgufTextWeights, LayerVisit, MessageBank,
-    PromptRow, Role, VisitState, attention_norm_name, bad,
+    Attention, CpuForward, EngError, GgufTextWeights, LayerVisit, MessageBank, PromptRow, Role,
+    VisitState, attention_norm_name, bad, resident_mlp::Route,
 };
 use crate::family::inkling2::{cuda_projection::gguf::attention::prefill, switches::Switch};
 use crate::kernels::cuda::{
@@ -248,11 +249,11 @@ impl CpuForward {
         let physical = visit.weight_layer;
         let experts = self.spec.n_routed_experts as usize;
         let router = format!("{prefix}.gate.weight");
-        let names = [
+        let expert_names = [
             format!("{prefix}.experts.w13_weight"),
             format!("{prefix}.experts.w2_weight"),
         ];
-        let names = names.each_ref().map(String::as_str);
+        let names = expert_names.each_ref().map(String::as_str);
         let caps = [self.math.mlp_gate_softcap, self.math.mlp_up_softcap];
         let seal = physical.is_multiple_of(self.spec.n_layers_per_attn_res_block);
         if (seal && !prompt.streams.has_room())
@@ -353,34 +354,20 @@ impl CpuForward {
         // The attention plane is free once the residual has read it.
         prompt.stream.synchronize()?;
         bridge.publish_conv_tail(state, conv)?;
-        let routes = {
-            let _span = self.phase_span(super::super::Work::Router);
-            let logits = weights.resident_prefill_router_logits(&router, activations)?;
-            self.route_prefill_logits(physical, &logits, &bias, rows)?
+        let route = Route {
+            physical: physical as u32,
+            weights,
+            router: &router,
+            bias: &bias,
+            experts: &expert_names,
+            caps,
         };
-        let ids: Vec<_> = routes
-            .iter()
-            .map(|route| route.selected.as_slice())
-            .collect();
-        {
-            let _span = self.phase_span(super::super::Work::Experts);
-            weights
-                .prefill_device_experts(
-                    names,
-                    physical as u32,
-                    (
-                        ExpertPrefillRows::Resident {
-                            ids: &ids,
-                            hidden: width,
-                            activations,
-                        },
-                        Some(mlp_conv.expert_destination()?),
-                    ),
-                    caps,
-                    |row, id| routes[row].weight(id, self.math.route_scale),
-                )?
-                .ok_or_else(|| bad("admitted Inkling device experts declined a prompt visit"))?;
-        }
+        route.dispatch(
+            self,
+            rows,
+            activations,
+            Some(mlp_conv.expert_destination()?),
+        )?;
         attention.finish_prefill_expert_conv(context, &mut mlp_conv)?;
         prompt
             .streams
