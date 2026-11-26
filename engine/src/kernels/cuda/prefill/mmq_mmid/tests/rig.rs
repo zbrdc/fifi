@@ -15,7 +15,7 @@ use crate::kernels::cuda::prefill::mmq_size::{
 use crate::kernels::cuda::resident::matvec_q::QuantType;
 use crate::kernels::cuda::testkit::Rng;
 use crate::kernels::cuda::{CudaContext, DeviceBuffer, DeviceStream};
-use crate::weights::{GgufType, dequantize};
+use crate::weights::dequantize;
 
 /// The poison of an unwritten q8_1 byte: as a scale word it is NaN (f32 `0xFFFF_FFFF`, half
 /// `0xFFFF`), so the finiteness gate catches a skipped store before any comparison.
@@ -136,30 +136,6 @@ impl IdBufs {
     }
 }
 
-/// The ggml type of the host dequantizer for a glued weight type.
-fn gguf_of(quant: QuantType) -> GgufType {
-    match quant {
-        QuantType::Q4K => GgufType::Q4K,
-        QuantType::Q6K => GgufType::Q6K,
-        QuantType::Q80 => GgufType::Q80,
-        QuantType::Q50 => GgufType::Q50,
-        QuantType::Q5K => GgufType::Q5K,
-        QuantType::Q40 => GgufType::Q40,
-        QuantType::Q3K => GgufType::Q3K,
-        QuantType::Iq4Xs => GgufType::Iq4Xs,
-        QuantType::Iq4Nl => GgufType::Iq4Nl,
-        QuantType::Iq2S => GgufType::Iq2S,
-        QuantType::Iq3Xxs => GgufType::Iq3Xxs,
-        QuantType::Iq2Xxs => GgufType::Iq2Xxs,
-        QuantType::Q20 => GgufType::Q20,
-        QuantType::Iq2Xs => GgufType::Iq2Xs,
-        QuantType::Iq3S => GgufType::Iq3S,
-        QuantType::Q2K => GgufType::Q2K,
-        QuantType::Iq1S => GgufType::Iq1S,
-        QuantType::Iq1M => GgufType::Iq1M,
-    }
-}
-
 /// Native GGUF blocks of `experts` matrices of `n` rows by `k` values, back to back: seeded
 /// random bytes with the fp16 scale fields set, so every dequantized value is finite and of
 /// order one (Q4_K: d 2^-6, dmin 2^-7; Q6_K: d 2^-7, its scale bytes random i8).
@@ -189,7 +165,7 @@ pub(super) fn expert_blocks(
 
 /// The weights of `blocks` as f32, by the host dequantizer of the checkpoint loader.
 pub(super) fn dequantized(quant: QuantType, blocks: &[u8]) -> Vec<f32> {
-    dequantize(gguf_of(quant), blocks).expect("the test weights are whole blocks")
+    dequantize(quant.gguf(), blocks).expect("the test weights are whole blocks")
 }
 
 /// One grouped GEMM of a test: the router rows, the activations, and the numbers of the launch.

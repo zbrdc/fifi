@@ -19,8 +19,13 @@
 #include "mmvq.cuh"
 #pragma GCC diagnostic pop
 
+#include "prefill/mmq_types.h"
 #include "resident/matvec_expert.h"
 #include "resident/mmvq_arch.h"
+
+/* The weight types of the vendored MMVQ cases, as X(ggml type, block struct): the MMQ
+ * list and IQ1_M, which has an MMVQ case and no MMQ one. */
+#define INFERENCE_CUDA_MMVQ_TYPES(X) INFERENCE_CUDA_MMQ_TYPES(X) X(GGML_TYPE_IQ1_M, block_iq1_m)
 
 namespace {
 
@@ -39,9 +44,22 @@ bool apart(const void *a, size_t a_bytes, const void *b, size_t b_bytes) {
     return (uintptr_t)a + a_bytes <= (uintptr_t)b || (uintptr_t)b + b_bytes <= (uintptr_t)a;
 }
 
-bool mmvq_type(int type) {
-    return type == INFERENCE_CUDA_TYPE_Q4_K || type == INFERENCE_CUDA_TYPE_Q5_0 ||
-           type == INFERENCE_CUDA_TYPE_Q6_K || type == INFERENCE_CUDA_TYPE_Q8_0;
+/* The values and bytes per weight block of a listed type; {0, 0} for every other int. */
+struct BlockShape {
+    int values;
+    size_t bytes;
+};
+
+BlockShape mmvq_block_shape(int type) {
+    switch (type) {
+#define INFERENCE_CUDA_MMVQ_SHAPE(T, B) \
+    case T:                             \
+        return {(int)ggml_cuda_type_traits<T>::qk, sizeof(B)};
+        INFERENCE_CUDA_MMVQ_TYPES(INFERENCE_CUDA_MMVQ_SHAPE)
+#undef INFERENCE_CUDA_MMVQ_SHAPE
+        default:
+            return {0, 0};
+    }
 }
 
 /* The fifi_device_facts the vendored host entry reads, queried the device_info.cu way. */
@@ -87,8 +105,9 @@ extern "C" int inference_cuda_matvec_expert_launch(const inference_cuda_matvec_e
         const int n_expert = args->n_expert;
         const int n_used = args->n_used;
         const int per_slot = args->x_per_slot;
+        const BlockShape shape = mmvq_block_shape(args->type);
         if (args->w_stack == NULL || args->ids == NULL || args->x_q8 == NULL || args->y == NULL ||
-            !mmvq_type(args->type) || k <= 0 || rows < 1 || rows % kRowsGroup != 0 ||
+            shape.values == 0 || k <= 0 || rows < 1 || rows % kRowsGroup != 0 ||
             n_expert < 1 || n_used < 1 || n_used > 8 || n_used > n_expert ||
             (per_slot != 0 && per_slot != 1) ||
             args->y_slot_stride < rows || !aligned(args->w_stack, 4) ||
@@ -96,11 +115,8 @@ extern "C" int inference_cuda_matvec_expert_launch(const inference_cuda_matvec_e
             return INFERENCE_CUDA_INVALID_ARGUMENT;
         }
         const ggml_type type = (ggml_type)args->type;
-        const int qk = type == GGML_TYPE_Q4_K || type == GGML_TYPE_Q6_K ? 256 : 32;
-        const size_t block_bytes = type == GGML_TYPE_Q4_K   ? 144
-                                   : type == GGML_TYPE_Q6_K ? 210
-                                   : type == GGML_TYPE_Q8_0 ? 34
-                                                            : 22;
+        const int qk = shape.values;
+        const size_t block_bytes = shape.bytes;
         if (k % qk != 0) {
             return INFERENCE_CUDA_INVALID_ARGUMENT;
         }

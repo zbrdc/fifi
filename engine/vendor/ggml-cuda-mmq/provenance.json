@@ -4,7 +4,7 @@
   "commit": "acecd56032ddc34bada14a2d978f110d9c987095",
   "license": "MIT",
   "copyright": "Copyright (c) 2023-2026 The ggml authors",
-  "note": "CPF-V1 pure import: the include closure of the mmq instances q4_k, q5_0, q6_k, q8_0, quantize.cu and mmid.cu, byte identical to the pin; vendored_sha256 equals upstream_sha256 for every file and there is no patch. Shims are our glue (CPF-V2); sha256 null means not written yet. CPF-V2 patch V-2 (patches/V-2-errors.patch) follows the import, so the sentence above on the absence of a patch describes the CPF-V1 state; patched_sha256 is the file after the last patch of its chain. Patch V-3a (patches/V-3a-backend-machinery.patch) deletes the unused ggml backend machinery. Patch V-3b (patches/V-3b-stream-fixup-device-guard.patch) makes the fixup range and the device facts arguments and adds the typed host refusal fifi_check_device. Patch V-3c (patches/V-3c-pdl-off.patch) sets PDL off with one line. The three shims are written; their sha256 is recorded. Patch V-4 (patches/V-4-trim.patch) edits three files; ten whole files are removed and listed under trim with their upstream hashes (the pin holds their bytes). MATVEC-PAR S1 c1: the MMVQ import (mmvq.cu, mmvq.cuh, byte identical to the pin) with a new unary.cuh shim (the four scalar GLU device helpers) and enum ggml_glu_op added to the ggml.h shim, so the untrimmed include of unary.cuh resolves. MATVEC-PAR S1 c2: patch V-MV1 (patches/V-MV1-mmvq.patch) trims the import to the device-only, error-returning form; final hashes in files.patched_sha256. V-PACK1 adds an opt-in Q8_0 reference policy. The original vendor entries retain their signatures and behavior. Q4_K reference packing remains in our native glue. Patch V-5 (patches/V-5-q4k-tiling-configs.patch) makes the Q4_K rows for J 8..64 tiling configs, so a narrow grouped tile does not switch the kernel to stream-k. The MMQ instances q4_0, q2_0, q2_k, q3_k, q5_k, iq1_s, iq2_xxs, iq2_xs, iq2_s, iq3_xxs, iq3_s, iq4_nl and iq4_xs are imported byte identical to the pin; the kept headers already held their cases, so no other file changes.",
+  "note": "CPF-V1 pure import: the include closure of the mmq instances q4_k, q5_0, q6_k, q8_0, quantize.cu and mmid.cu, byte identical to the pin; vendored_sha256 equals upstream_sha256 for every file and there is no patch. Shims are our glue (CPF-V2); sha256 null means not written yet. CPF-V2 patch V-2 (patches/V-2-errors.patch) follows the import, so the sentence above on the absence of a patch describes the CPF-V1 state; patched_sha256 is the file after the last patch of its chain. Patch V-3a (patches/V-3a-backend-machinery.patch) deletes the unused ggml backend machinery. Patch V-3b (patches/V-3b-stream-fixup-device-guard.patch) makes the fixup range and the device facts arguments and adds the typed host refusal fifi_check_device. Patch V-3c (patches/V-3c-pdl-off.patch) sets PDL off with one line. The three shims are written; their sha256 is recorded. Patch V-4 (patches/V-4-trim.patch) edits three files; ten whole files are removed and listed under trim with their upstream hashes (the pin holds their bytes). MATVEC-PAR S1 c1: the MMVQ import (mmvq.cu, mmvq.cuh, byte identical to the pin) with a new unary.cuh shim (the four scalar GLU device helpers) and enum ggml_glu_op added to the ggml.h shim, so the untrimmed include of unary.cuh resolves. MATVEC-PAR S1 c2: patch V-MV1 (patches/V-MV1-mmvq.patch) trims the import to the device-only, error-returning form; final hashes in files.patched_sha256. V-PACK1 adds an opt-in Q8_0 reference policy. The original vendor entries retain their signatures and behavior. Q4_K reference packing remains in our native glue. Patch V-5 (patches/V-5-q4k-tiling-configs.patch) makes the Q4_K rows for J 8..64 tiling configs, so a narrow grouped tile does not switch the kernel to stream-k. The MMQ instances q4_0, q2_0, q2_k, q3_k, q5_k, iq1_s, iq2_xxs, iq2_xs, iq2_s, iq3_xxs, iq3_s, iq4_nl and iq4_xs are imported byte identical to the pin; the kept headers already held their cases, so no other file changes. Patch V-MV2 (patches/V-MV2-mmvq-every-type.patch) gives the trimmed MMVQ the upstream cases of every type with a wrapped entry.",
   "include_roots": [
     "src/ggml-cuda",
     "src"
@@ -74,13 +74,13 @@
       "upstream_path": "ggml/src/ggml-cuda/mmvq.cu",
       "upstream_sha256": "d4c70f68ab79d463fd6fd52cac66a62e915858397ba4b2b7f658a7fbf13121f3",
       "vendored_sha256": "d4c70f68ab79d463fd6fd52cac66a62e915858397ba4b2b7f658a7fbf13121f3",
-      "patched_sha256": "8ffa0a71dd8e9a0ca1931f455d007d1e0a0f9190d9ba6a9c649598e4d6a82d9d"
+      "patched_sha256": "490a679d632fdbbcec86ff4ce55d24b1bb8801592830a3269b24447f4426e1ad"
     },
     "src/ggml-cuda/mmvq.cuh": {
       "upstream_path": "ggml/src/ggml-cuda/mmvq.cuh",
       "upstream_sha256": "b37f8359f519ba90ddecd9cb3ca5f8c2ae05685bfae6813d435d75763c2bb006",
       "vendored_sha256": "b37f8359f519ba90ddecd9cb3ca5f8c2ae05685bfae6813d435d75763c2bb006",
-      "patched_sha256": "d10e0201283eff3bbbe6e2d9f3cfc813a7af507547f55f79ad6359520e49d317"
+      "patched_sha256": "4072c593f785094be21dc6bbcdcaec07864f22bb24e99f6c9e5993f36dba1b14"
     },
     "src/ggml-cuda/quantize.cu": {
       "upstream_path": "ggml/src/ggml-cuda/quantize.cu",
@@ -325,6 +325,21 @@
         "src/ggml-cuda/mmq-config-ampere.cuh": {
           "before_sha256": "6de9336a6c2f65c0ad83cbe9303dcd03e8cbb6185d15346133a31421000f6408",
           "after_sha256": "fcbf07e96134045950a3108a04179de385104f2f5065a1cc00a0feb857eac08d"
+        }
+      }
+    },
+    {
+      "id": "V-MV2",
+      "description": "Give the trimmed MMVQ every type with a wrapped entry: get_vec_dot_q_cuda and get_vdr_mmvq take back their upstream cases for Q4_0, Q5_0, Q8_0, Q2_0, Q2_K, Q3_K, Q4_K, Q5_K, Q6_K, IQ1_S, IQ1_M, IQ2_XXS, IQ2_XS, IQ2_S, IQ3_XXS, IQ3_S, IQ4_NL and IQ4_XS (the lines are upstream's), mul_mat_vec_q_switch_type gains a case per type in the V-MV1 error-returning form, and fifi_mmvq_launch checks the type against the same list (fifi_mmvq_has_case). Q1_0, Q4_1, Q5_1, MXFP4 and NVFP4 stay out. The before hashes are the tree's files, which later in-place edits (the cc 7.2 warp-per-row arms) moved past the V-MV1 after hashes.",
+      "diff": "patches/V-MV2-mmvq-every-type.patch",
+      "files": {
+        "src/ggml-cuda/mmvq.cu": {
+          "before_sha256": "bdd3cc402f685dd9552603e0f8f3b1de6d83eb873e941f2d5f6f980177c4d879",
+          "after_sha256": "490a679d632fdbbcec86ff4ce55d24b1bb8801592830a3269b24447f4426e1ad"
+        },
+        "src/ggml-cuda/mmvq.cuh": {
+          "before_sha256": "c354b957b6b1138f9f292b36883d1f6d18fef7c3d33b70ae448e988de31adcb6",
+          "after_sha256": "4072c593f785094be21dc6bbcdcaec07864f22bb24e99f6c9e5993f36dba1b14"
         }
       }
     }

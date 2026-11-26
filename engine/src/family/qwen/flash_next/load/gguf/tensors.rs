@@ -896,31 +896,6 @@ mod cuda_tests {
     use super::*;
     use crate::kernels::cuda::resident::matvec_q::QuantType;
 
-    /// The GGUF type each matvec kernel format reads. The match has no wildcard: a kernel
-    /// format added to `QuantType` stops this test compiling until the table is updated.
-    fn gguf_type(quant: QuantType) -> GgufType {
-        match quant {
-            QuantType::Q4K => GgufType::Q4K,
-            QuantType::Q50 => GgufType::Q50,
-            QuantType::Q6K => GgufType::Q6K,
-            QuantType::Q80 => GgufType::Q80,
-            QuantType::Q5K => GgufType::Q5K,
-            QuantType::Q40 => GgufType::Q40,
-            QuantType::Q3K => GgufType::Q3K,
-            QuantType::Iq4Xs => GgufType::Iq4Xs,
-            QuantType::Iq4Nl => GgufType::Iq4Nl,
-            QuantType::Iq2S => GgufType::Iq2S,
-            QuantType::Iq3Xxs => GgufType::Iq3Xxs,
-            QuantType::Iq2Xxs => GgufType::Iq2Xxs,
-            QuantType::Q20 => GgufType::Q20,
-            QuantType::Iq2Xs => GgufType::Iq2Xs,
-            QuantType::Iq3S => GgufType::Iq3S,
-            QuantType::Q2K => GgufType::Q2K,
-            QuantType::Iq1S => GgufType::Iq1S,
-            QuantType::Iq1M => GgufType::Iq1M,
-        }
-    }
-
     /// Every matvec kernel format.
     const ALL_KERNELS: [QuantType; 18] = [
         QuantType::Q4K,
@@ -947,13 +922,13 @@ mod cuda_tests {
     /// formats are one set with one geometry.
     #[test]
     fn the_native_type_list_is_the_kernel_formats() {
-        let mut from_kernels: Vec<u32> = ALL_KERNELS.map(|q| gguf_type(q).id()).to_vec();
+        let mut from_kernels: Vec<u32> = ALL_KERNELS.map(|q| q.gguf().id()).to_vec();
         let mut listed: Vec<u32> = GgufType::native_types().iter().map(|ty| ty.id()).collect();
         from_kernels.sort_unstable();
         listed.sort_unstable();
         assert_eq!(listed, from_kernels);
         for quant in ALL_KERNELS {
-            let ty = gguf_type(quant);
+            let ty = quant.gguf();
             assert_eq!(ty.block_elems() as usize, quant.block_size(), "{ty:?}");
             assert_eq!(ty.block_bytes() as usize, quant.block_bytes(), "{ty:?}");
             assert!(has_decode_kernel(Place::Experts, ty), "{ty:?}");

@@ -20,11 +20,12 @@
 //! every range holds the bytes the call uses and is 4-byte aligned; `y` overlaps none of
 //! `w_stack`, `x_q8`, `ids`. A refused call changes nothing.
 //!
-//! Every type without a vendored arm ([`QuantType::expert_uses_window`]: the IQ types, Q2_0, Q2_K,
-//! Q3_K, Q4_0 and Q5_K) runs the in-house window
-//! kernel (`native/resident/matvec_gguf.cu`) instead of the vendored one: same layout and ids
-//! contract, but `rows` is any positive count and `n_used` is in `1..=32` (Flash-Next routes
-//! ten experts per token).
+//! The vendored MMVQ has a case for every [`QuantType`]. [`ExpertKernel::of`] routes a type: the
+//! four it served first (Q4_K, Q5_0, Q6_K, Q8_0) run there, and every other type runs the
+//! in-house window kernel (`native/resident/matvec_gguf.cu`) until a measurement moves it: same
+//! layout and ids contract, but `rows` is any positive count and `n_used` is in `1..=32`
+//! (Flash-Next routes ten experts per token). `FIFI_CUDA_EXPERT_MATVEC=vendored` sends every type
+//! to the vendored kernel, for the comparison.
 
 use crate::EngError;
 use crate::kernels::cuda::context::{
@@ -41,6 +42,31 @@ use crate::kernels::cuda::resident::quantize_q8_1::q8_1_bytes;
 
 /// Per-launch limit of the vendored expert kernel, matching its native guard.
 const VENDORED_MAX_USED: usize = 8;
+
+/// The kernel a routed-expert matvec runs on.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum ExpertKernel {
+    /// The vendored MMVQ: `rows` a multiple of 4, up to 8 used slots per launch.
+    Vendored,
+    /// The in-house window kernel: any row count, up to 32 used slots per launch.
+    Window,
+}
+
+impl ExpertKernel {
+    /// The route of `ty`: [`QuantType::expert_uses_window`], or the vendored kernel for every type
+    /// when `FIFI_CUDA_EXPERT_MATVEC=vendored`.
+    pub(crate) fn of(ty: QuantType) -> Self {
+        static ALL_VENDORED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        let all_vendored = *ALL_VENDORED.get_or_init(|| {
+            std::env::var("FIFI_CUDA_EXPERT_MATVEC").is_ok_and(|v| v.trim() == "vendored")
+        });
+        if all_vendored || !ty.expert_uses_window() {
+            Self::Vendored
+        } else {
+            Self::Window
+        }
+    }
+}
 
 pub(crate) struct ExpertMatvecCall<'b> {
     pub(crate) ty: QuantType,
@@ -114,8 +140,19 @@ impl CudaContext {
         stream: &DeviceStream,
         call: ExpertMatvecCall<'_>,
     ) -> Result<(), EngError> {
+        let kernel = ExpertKernel::of(call.ty);
+        self.matvec_expert_on(stream, call, kernel)
+    }
+
+    /// [`Self::matvec_expert`] on a named kernel instead of the type's route.
+    pub(crate) fn matvec_expert_on(
+        &self,
+        stream: &DeviceStream,
+        call: ExpertMatvecCall<'_>,
+        kernel: ExpertKernel,
+    ) -> Result<(), EngError> {
         self.ensure_usable()?;
-        if call.ty.expert_uses_window() {
+        if kernel == ExpertKernel::Window {
             let raw = self.plan_matvec_expert_codebook(&call)?;
             let row_bytes = q8_1_bytes(call.k, 1).expect("checked in plan");
             return self.launch_on(stream, |stream_raw| {
@@ -128,7 +165,7 @@ impl CudaContext {
 
     /// Whether [`Self::matvec_expert`] takes `call`: the checks it makes before queuing.
     pub(crate) fn matvec_expert_takes(&self, call: &ExpertMatvecCall<'_>) -> bool {
-        if call.ty.expert_uses_window() {
+        if ExpertKernel::of(call.ty) == ExpertKernel::Window {
             self.plan_matvec_expert_codebook(call).is_ok()
         } else {
             self.plan_matvec_expert(call).is_ok()
@@ -176,7 +213,7 @@ impl CudaContext {
         }
         let qrow = q8_1_bytes(call.k, 1)
             .ok_or_else(|| EngError::BadRequest("the CUDA expert size overflows".into()))?;
-        let window = call.ty.expert_uses_window();
+        let window = ExpertKernel::of(call.ty) == ExpertKernel::Window;
         let max = if window { MAX_USED } else { VENDORED_MAX_USED };
         let mut plans = Vec::new();
         for first in (0..call.n_used).step_by(max) {
@@ -314,15 +351,6 @@ impl CudaContext {
                 "the CUDA expert matvec needs k as a multiple of {}, got {}",
                 call.ty.block_size(),
                 call.k
-            )));
-        }
-        // This plan serves the vendored MMVQ only; every other type is planned by
-        // `plan_matvec_expert_codebook`, so one reaching here is refused rather than reaching
-        // the discriminant.
-        if call.ty.expert_uses_window() {
-            return Err(EngError::BadRequest(format!(
-                "the CUDA expert matvec does not take {:?} yet",
-                call.ty
             )));
         }
         if call.rows == 0 || call.n_expert == 0 {

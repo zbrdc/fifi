@@ -31,15 +31,13 @@ use crate::kernels::cuda::resident::quantize_q8_1::q8_1_bytes;
 #[cfg(test)]
 use crate::kernels::cuda::{ADAPTER_OPERATION, TERMINAL, native_error};
 
-/// The weight formats the matvec serves. The four `Vendored` discriminants name the trimmed
-/// vendored MMVQ instantiations (Qwen3.6 and Mellum) and are the `ggml_type` values of the shim
-/// `ggml.h` (`GGML_TYPE_Q4_K = 12`, `Q5_0 = 6`, `Q6_K = 14`, `Q8_0 = 8`), not numbers from
-/// memory. `Q5K`/`Q3K` are the in-house Q5_K/Q3_K kernels
-/// (`native/resident/matvec_q5k.cu`, `native/resident/matvec_q3k.cu`): they never enter the
-/// vendored switch and carry no `ggml_type`. `Iq4Xs`, `Iq4Nl`, `Iq2S`, `Iq3Xxs`, `Iq2Xxs`,
-/// `Q20`, `Iq2Xs`, `Iq3S`, `Q2K`, `Iq1S` and `Iq1M` are served by the in-house codebook
-/// matvec (`native/resident/matvec_gguf.cu`), dense and expert, and by the codebook arms of
-/// the dequantizing GEMM.
+/// The weight formats the matvec serves; [`QuantType::ggml`] is each one's `ggml_type`, the GGUF
+/// tensor type id. The dense matvec runs Q4_K, Q5_0, Q6_K and Q8_0 on the vendored MMVQ (Qwen3.6
+/// and Mellum), Q5_K and Q3_K on the in-house kernels (`native/resident/matvec_q5k.cu`,
+/// `native/resident/matvec_q3k.cu`), and `Iq4Xs`, `Iq4Nl`, `Iq2S`, `Iq3Xxs`, `Iq2Xxs`, `Q20`,
+/// `Iq2Xs`, `Iq3S`, `Q2K`, `Iq1S` and `Iq1M` on the in-house codebook matvec
+/// (`native/resident/matvec_gguf.cu`), which also has the codebook arms of the dequantizing
+/// GEMM. The routed-expert matvec has a vendored case for every format (`matvec_expert`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum QuantType {
     Q4K,
@@ -63,33 +61,34 @@ pub(crate) enum QuantType {
 }
 
 impl QuantType {
-    /// The `ggml_type` value the vendored code switches on. `Q5K`, `Q3K` and `Iq4Xs` have
-    /// none and never enter the vendored switch: the dense matvec routes them to the
-    /// in-house kernels first, and every other vendored entry refuses them before this is
-    /// asked.
-    pub(crate) fn ggml(self) -> i32 {
+    /// The GGUF tensor type of the blocks this type reads.
+    pub(crate) fn gguf(self) -> GgufType {
         match self {
-            Self::Q4K => 12,
-            Self::Q50 => 6,
-            Self::Q6K => 14,
-            Self::Q80 => 8,
-            Self::Q5K
-            | Self::Q40
-            | Self::Q3K
-            | Self::Iq4Xs
-            | Self::Iq4Nl
-            | Self::Iq2S
-            | Self::Iq3Xxs
-            | Self::Iq2Xxs
-            | Self::Q20
-            | Self::Iq2Xs
-            | Self::Iq3S
-            | Self::Q2K
-            | Self::Iq1S
-            | Self::Iq1M => {
-                unreachable!("the in-house kernels never enter the vendored switch")
-            }
+            Self::Q4K => GgufType::Q4K,
+            Self::Q50 => GgufType::Q50,
+            Self::Q6K => GgufType::Q6K,
+            Self::Q80 => GgufType::Q80,
+            Self::Q5K => GgufType::Q5K,
+            Self::Q40 => GgufType::Q40,
+            Self::Q3K => GgufType::Q3K,
+            Self::Iq4Xs => GgufType::Iq4Xs,
+            Self::Iq4Nl => GgufType::Iq4Nl,
+            Self::Iq2S => GgufType::Iq2S,
+            Self::Iq3Xxs => GgufType::Iq3Xxs,
+            Self::Iq2Xxs => GgufType::Iq2Xxs,
+            Self::Q20 => GgufType::Q20,
+            Self::Iq2Xs => GgufType::Iq2Xs,
+            Self::Iq3S => GgufType::Iq3S,
+            Self::Q2K => GgufType::Q2K,
+            Self::Iq1S => GgufType::Iq1S,
+            Self::Iq1M => GgufType::Iq1M,
         }
+    }
+
+    /// The `ggml_type` value the vendored code switches on: the GGUF tensor type id, which the
+    /// vendored ggml.h shim's enum values are. A native entry refuses a type it has no case for.
+    pub(crate) fn ggml(self) -> i32 {
+        i32::try_from(self.gguf().id()).expect("GGUF type ids are small")
     }
 
     /// True for the types the in-house codebook kernels (`matvec_gguf.cu` and the codebook arms
@@ -118,8 +117,11 @@ impl QuantType {
         matches!(self, Self::Q5K | Self::Q40 | Self::Q3K) || self.is_codebook()
     }
 
-    /// True for the types whose routed-expert matvec is the in-house window kernel
-    /// (`matvec_gguf.cu`): every type without a vendored MMVQ arm.
+    /// True for the types whose routed-expert matvec runs the in-house window kernel
+    /// (`matvec_gguf.cu`) by default: every type but the four the vendored MMVQ served first.
+    /// The vendored MMVQ has a case for every type; [`ExpertKernel::of`] applies the route.
+    ///
+    /// [`ExpertKernel::of`]: crate::kernels::cuda::resident::matvec_expert::ExpertKernel::of
     pub(crate) fn expert_uses_window(self) -> bool {
         !matches!(self, Self::Q4K | Self::Q50 | Self::Q6K | Self::Q80)
     }

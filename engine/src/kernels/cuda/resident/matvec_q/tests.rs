@@ -478,8 +478,11 @@ fn quant_sizes_are_pure_and_exact() {
     assert_eq!(QuantType::Q5K.block_size(), 256);
     assert_eq!(QuantType::Q5K.block_bytes(), 176);
     assert_eq!(QuantType::Q5K.weight_bytes(64, 2048), Some(64 * 8 * 176));
-    // No ggml_type: Q5_K is served by the in-house kernel, never the vendored switch.
-    assert_eq!(QuantType::Q5K.block_bytes(), 176);
+    // The ggml_type of every format is its GGUF tensor type id.
+    assert_eq!(QuantType::Q5K.ggml(), 13);
+    assert_eq!(QuantType::Iq4Nl.ggml(), 20);
+    assert_eq!(QuantType::Iq1M.ggml(), 29);
+    assert_eq!(QuantType::Q20.ggml(), 42);
     assert_eq!(QuantType::Q3K.block_size(), 256);
     assert_eq!(QuantType::Q3K.block_bytes(), 110);
     assert_eq!(QuantType::Q3K.weight_bytes(64, 2048), Some(64 * 8 * 110));

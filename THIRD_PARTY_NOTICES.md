@@ -85,6 +85,7 @@ SOFTWARE.
   - `V-4-trim.patch`: trim to the tile configurations for sm_72 and sm_86. Ten whole files (other tile configurations and the HIP and MUSA vendor headers) are removed.
   - `V-5-q4k-tiling-configs.patch`: make the Q4_K configurations for J 8 to 64 tiling configurations instead of stream-k.
   - `V-MV1-mmvq.patch`: trim MMVQ to a device-only form that returns errors.
+  - `V-MV2-mmvq-every-type.patch`: restore the upstream MMVQ cases of Q4_0, Q5_0, Q8_0, Q2_0, the K-quants and the IQ types, so the expert matvec takes every type the engine reads.
   - `V-PACK1-reference-packing.patch`: add an opt-in Q8_0 packing policy that matches the CPU reference. The default behavior of the vendor entry points does not change.
 - `engine/vendor/ggml-cuda-mmq/provenance.json` records, for every imported file, the upstream SHA-256 and the SHA-256 after the last patch. It also records the patch chain and the hashes of the removed files.
 - Written for this tree: `src/ggml-cuda/template-instances/mmq-instance-nvfp4.cu`. It is a two-line file in the form of the upstream instance files that instantiates the vendored MMQ template for `GGML_TYPE_NVFP4`. `engine/build.rs` compiles it. It is not an upstream file and `provenance.json` does not list it.

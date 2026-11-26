@@ -5,7 +5,7 @@ use crate::weights::{GgufType, dequantize};
 /// The kernel type and the host type of each block layout the native dispatcher serves: the
 /// seven layouts of the pinned Flash-Next checkpoint's matrices (Q6_K, Q8_0, IQ2_S, IQ3_XXS,
 /// IQ4_NL, IQ4_XS and Q2_0) and every other type a checkpoint may carry into these kernels.
-const CASES: [(QuantType, GgufType); 18] = [
+pub(in crate::kernels::cuda) const CASES: [(QuantType, GgufType); 18] = [
     (QuantType::Q6K, GgufType::Q6K),
     (QuantType::Q80, GgufType::Q80),
     (QuantType::Iq2S, GgufType::Iq2S),
@@ -120,7 +120,13 @@ const SCALES: [u16; 6] = [0x0400, 0x2c00, 0xac00, 0x3c00, 0xbc00, 0x4c00];
 
 /// `rows` rows of `k` values of `ty` as random, valid blocks with finite scales, and
 /// `ncols` deterministic activation rows of `k` values.
-fn fixture(ty: QuantType, rows: usize, k: usize, ncols: usize, seed: u32) -> (Vec<u8>, Vec<f32>) {
+pub(in crate::kernels::cuda) fn fixture(
+    ty: QuantType,
+    rows: usize,
+    k: usize,
+    ncols: usize,
+    seed: u32,
+) -> (Vec<u8>, Vec<f32>) {
     let block = ty.block_size();
     let bytes = ty.block_bytes();
     let mut state = seed;

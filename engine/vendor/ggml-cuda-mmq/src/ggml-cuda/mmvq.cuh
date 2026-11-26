@@ -25,7 +25,7 @@ struct ggml_cuda_mm_fusion_args_device {
 // shared activation vector (gate/up) and n_used for one per used slot (down); dev replaces the
 // deleted ggml_cuda_info() reads (V-3b pattern: mmq_args.dev).
 struct fifi_mmvq_args {
-    ggml_type type;              // one of Q4_K, Q5_0, Q6_K, Q8_0 (V-MV1 c)
+    ggml_type type;              // a type of mul_mat_vec_q_switch_type (V-MV2)
     const void * vx;             // weight blocks, native GGUF row-major layout
     const void * vy_q8_1;        // activation, block_q8_1, MATRIX_ROW_PADDING-padded rows
     const int32_t * ids;         // per-slot expert ids read on the device, or null (dense path)

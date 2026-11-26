@@ -281,4 +281,4 @@ impl CudaContext {
 }
 
 #[cfg(test)]
-mod tests;
+pub(in crate::kernels::cuda) mod tests;

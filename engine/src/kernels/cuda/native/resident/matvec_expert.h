@@ -15,7 +15,7 @@ extern "C" {
 #endif
 
 typedef struct inference_cuda_matvec_expert_args {
-    int type;         /* INFERENCE_CUDA_TYPE_Q4_K, Q5_0, Q6_K or Q8_0 */
+    int type;         /* the ggml_type of a vendored MMVQ case (matvec_expert.cu) */
     const void *w_stack; /* native blocks [n_expert][rows][k / qk] */
     const void *ids;  /* device i32 [n_used], read when the kernel runs */
     const void *x_q8; /* block_q8_1: one shared padded row (x_per_slot 0) or n_used rows */

@@ -5,7 +5,7 @@
 //! cannot drift: the dense per-slot oracle of test 5 is `matvec_q` itself on the selected
 //! expert's weights.
 
-use super::{ExpertMatvecCall, ExpertShape, expert_needs};
+use super::{ExpertKernel, ExpertMatvecCall, ExpertShape, expert_needs};
 use crate::EngError;
 use crate::kernels::cuda::resident::matvec_q::tests::{
     Owner, assert_bad_request, bench, nan_filled, reference,
@@ -532,6 +532,107 @@ fn matvec_expert_equals_the_dense_launch_per_slot() {
                     want.as_slice(),
                     "{ty:?} {shape:?} slot {slot} (up, per-slot x)"
                 );
+            }
+        }
+    }
+}
+
+/// The vendored MMVQ takes every type: for each of the 18 kernel formats, the expert products of
+/// the shared-x (gate/up) view match the f64 product of the host-dequantized weights with the
+/// q8_1 activations, and for the types the window kernel serves by default the two kernels agree
+/// within the same bound. Only the float sums' order separates them from the reference.
+#[test]
+fn the_vendored_expert_matvec_takes_every_type() {
+    use crate::kernels::cuda::resident::matvec_gguf_f32::tests::{CASES, fixture};
+    if !testkit::device_present("the_vendored_expert_matvec_takes_every_type") {
+        return;
+    }
+    let ctx = CudaContext::new().expect("context");
+    let stream = ctx.stream().expect("stream");
+    let (k, rows) = (512_usize, 64_usize);
+    for (seed, (ty, gguf)) in CASES.into_iter().enumerate() {
+        let (blocks, _) = fixture(ty, rows * N_EXPERT, k, 0, 0x5eed + seed as u32);
+        let x: Vec<f32> = (0..k)
+            .map(|i| ((i * 7 % 29) as f32 - 14.0) / 11.0)
+            .collect();
+        let stack = testkit::upload_bytes(&ctx, &blocks);
+        let ids = ids_buffer(&ctx, &IDS);
+        let x_dev = testkit::upload_f32(&ctx, &x);
+        let x_bytes = q8_1_bytes(k, 1).expect("size");
+        let x_q8 = testkit::upload_filled(&ctx, 0xAA, x_bytes);
+        ctx.quantize_q8_1(
+            &stream,
+            QuantizeCall {
+                x: x_dev.range(0, k * 4).expect("x"),
+                y: x_q8.range(0, x_bytes).expect("x_q8"),
+                k,
+                ncols: 1,
+            },
+        )
+        .expect("quantize");
+        let y_bytes = N_USED * rows * 4;
+        let run = |kernel| {
+            let y = testkit::upload_filled(&ctx, 0xAA, y_bytes);
+            ctx.matvec_expert_on(
+                &stream,
+                ExpertMatvecCall {
+                    ty,
+                    w_stack: stack.range(0, blocks.len()).expect("stack"),
+                    ids: ids.range(0, N_USED * 4).expect("ids"),
+                    x_q8: x_q8.range(0, x_bytes).expect("x_q8"),
+                    x_per_slot: false,
+                    y: y.range(0, y_bytes).expect("y"),
+                    y_slot_stride: rows,
+                    k,
+                    rows,
+                    n_expert: N_EXPERT,
+                    n_used: N_USED,
+                    glu_gate: None,
+                },
+                kernel,
+            )
+            .unwrap_or_else(|err| panic!("{ty:?} {kernel:?}: {err:?}"));
+            stream.synchronize().expect("drain");
+            testkit::read_bytes(&ctx, &y, y_bytes)
+                .as_chunks::<4>()
+                .0
+                .iter()
+                .map(|b| f32::from_le_bytes(*b))
+                .collect::<Vec<f32>>()
+        };
+        // The activations as the kernels read them: each 32-value q8_1 block is an f16 scale
+        // (then the f16 sum) and 32 int8 values.
+        let q8 = testkit::read_bytes(&ctx, &x_q8, x_bytes);
+        let xq: Vec<f64> = (0..k)
+            .map(|i| {
+                let block = &q8[(i / 32) * 36..];
+                let d = testkit::f16_to_f32(u16::from_le_bytes([block[0], block[1]]));
+                f64::from(d) * f64::from(block[4 + i % 32] as i8)
+            })
+            .collect();
+        let weights = crate::weights::dequantize(gguf, &blocks).expect("dequantize");
+        let vendored = run(ExpertKernel::Vendored);
+        let window =
+            (ExpertKernel::of(ty) == ExpertKernel::Window).then(|| run(ExpertKernel::Window));
+        for (slot, &id) in IDS.iter().enumerate() {
+            for row in 0..rows {
+                let w = &weights[(id as usize * rows + row) * k..][..k];
+                let (sum, abs) = w.iter().zip(&xq).fold((0.0, 0.0), |(s, a), (&w, &x)| {
+                    (s + f64::from(w) * x, a + (f64::from(w) * x).abs())
+                });
+                let bound = 1e-4 * abs + 1e-6;
+                let got = f64::from(vendored[slot * rows + row]);
+                assert!(
+                    (got - sum).abs() <= bound,
+                    "{ty:?} slot {slot} row {row}: vendored {got} vs {sum} (bound {bound})"
+                );
+                if let Some(window) = &window {
+                    let other = f64::from(window[slot * rows + row]);
+                    assert!(
+                        (got - other).abs() <= bound,
+                        "{ty:?} slot {slot} row {row}: vendored {got} vs window {other}"
+                    );
+                }
             }
         }
     }
@@ -1527,7 +1628,7 @@ fn inkling_iq4nl_expert_paths_bench() {
     let gu = testkit::upload_filled(&ctx, 0, used * 2 * middle * 4);
     let mid = testkit::upload_f32(&ctx, &vec![0.01_f32; used * middle]);
     let dn = testkit::upload_filled(&ctx, 0, used * hidden * 4);
-    let q8 = || {
+    let q8 = |kernel| {
         ctx.quantize_q8_1(
             &stream,
             QuantizeCall {
@@ -1538,7 +1639,7 @@ fn inkling_iq4nl_expert_paths_bench() {
             },
         )
         .expect("quantize x");
-        ctx.matvec_expert(
+        ctx.matvec_expert_on(
             &stream,
             ExpertMatvecCall {
                 ty,
@@ -1554,6 +1655,7 @@ fn inkling_iq4nl_expert_paths_bench() {
                 n_used: used,
                 glu_gate: None,
             },
+            kernel,
         )
         .expect("gate up");
         ctx.quantize_q8_1(
@@ -1566,7 +1668,7 @@ fn inkling_iq4nl_expert_paths_bench() {
             },
         )
         .expect("quantize middle");
-        ctx.matvec_expert(
+        ctx.matvec_expert_on(
             &stream,
             ExpertMatvecCall {
                 ty,
@@ -1582,10 +1684,16 @@ fn inkling_iq4nl_expert_paths_bench() {
                 n_used: used,
                 glu_gate: None,
             },
+            kernel,
         )
         .expect("down");
     };
-    report("q8_1 window: quantize + gu + down", &q8);
+    report("q8_1 window: quantize + gu + down", &|| {
+        q8(ExpertKernel::Window)
+    });
+    report("q8_1 vendored MMVQ: quantize + gu + down", &|| {
+        q8(ExpertKernel::Vendored);
+    });
 
     let exact = || {
         ctx.matvec_gguf_f32_expert(

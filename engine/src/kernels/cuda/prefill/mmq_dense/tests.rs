@@ -297,29 +297,6 @@ fn mmq_fixup_bytes_follow_the_device_sm_count() {
 /// finiteness gate catches a skipped store before any bound check.
 const POISON: u8 = 0xff;
 
-fn gguf_of(ty: QuantType) -> GgufType {
-    match ty {
-        QuantType::Q80 => GgufType::Q80,
-        QuantType::Q50 => GgufType::Q50,
-        QuantType::Q4K => GgufType::Q4K,
-        QuantType::Q6K => GgufType::Q6K,
-        QuantType::Q5K => GgufType::Q5K,
-        QuantType::Q40 => GgufType::Q40,
-        QuantType::Q3K => GgufType::Q3K,
-        QuantType::Iq4Xs => GgufType::Iq4Xs,
-        QuantType::Iq4Nl => GgufType::Iq4Nl,
-        QuantType::Iq2S => GgufType::Iq2S,
-        QuantType::Iq3Xxs => GgufType::Iq3Xxs,
-        QuantType::Iq2Xxs => GgufType::Iq2Xxs,
-        QuantType::Q20 => GgufType::Q20,
-        QuantType::Iq2Xs => GgufType::Iq2Xs,
-        QuantType::Iq3S => GgufType::Iq3S,
-        QuantType::Q2K => GgufType::Q2K,
-        QuantType::Iq1S => GgufType::Iq1S,
-        QuantType::Iq1M => GgufType::Iq1M,
-    }
-}
-
 /// Host-built Q8_0 blocks of an `n` x `k` weight: Gaussian rows quantized per 32 values the
 /// way ggml does (scale `amax / 127` rounded to f16, round-to-nearest codes), so the blocks
 /// carry a real weight's code distribution.
@@ -360,7 +337,7 @@ fn upload_weight(
 ) -> Result<NativeWeight, EngError> {
     let tensor = QuantTensor {
         name: "mmq dense test weight",
-        ty: gguf_of(ty),
+        ty: ty.gguf(),
         n_rows: shape.0,
         k: shape.1,
         source_len: bytes.len(),
@@ -514,7 +491,7 @@ fn mmq_type_of(ty: QuantType) -> MmqType {
 fn weight_bytes(ty: QuantType, n: usize, k: usize, seed: u64) -> Vec<u8> {
     match ty {
         QuantType::Q80 => q8_0_weight(n, k, seed),
-        other => testkit::weight_source(gguf_of(other), n, k),
+        other => testkit::weight_source(other.gguf(), n, k),
     }
 }
 
@@ -686,7 +663,7 @@ fn q4k_chunk_gemm_runs_on_both_physical_devices_in_one_process() {
         // scaled by the input maximum and each weight row's L1 norm. A fixed
         // absolute tolerance near zero is unsuitable for different partitions.
         const HOP_FACTOR: f64 = (0.5 + 127.0 / 2048.0) / 127.0 + 1.0 / 1024.0 + 1.0 / 262_144.0;
-        let weights = dequantize(gguf_of(input.case.ty), &input.w).expect("dequantize weights");
+        let weights = dequantize(input.case.ty.gguf(), &input.w).expect("dequantize weights");
         let row_l1: Vec<f64> = weights
             .chunks_exact(input.case.k)
             .map(|row| row.iter().map(|value| f64::from(value.abs())).sum())
@@ -799,7 +776,7 @@ fn gated_slice(run: &Run, case: &Case) -> Vec<f64> {
 /// The f64 reference `[column][row]`: the dequantized weights (the library's own host
 /// dequantizer) against the unquantized f32 activations, rows split over threads.
 fn reference(case: &Case, w: &[u8], x: &[f32]) -> Vec<f64> {
-    let weights = dequantize(gguf_of(case.ty), w).expect("the host dequantizer");
+    let weights = dequantize(case.ty.gguf(), w).expect("the host dequantizer");
     let xs: Vec<f64> = x.iter().map(|v| f64::from(*v)).collect();
     let (n, k, m) = (case.n, case.k, case.m);
     let threads = std::thread::available_parallelism().map_or(4, |t| t.get().min(16));
