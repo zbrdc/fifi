@@ -11,7 +11,7 @@ use std::mem::{offset_of, size_of};
 
 use super::{DeviceFailure, RawRange, RawStream, STAGE_NONE, Span, checked, invalid_argument};
 use crate::kernels::cuda::prefill::mmq_dense::DenseInts;
-use crate::kernels::cuda::prefill::mmq_size::q8_1_bytes;
+use crate::kernels::cuda::prefill::mmq_size::{MmqType, q8_1_bytes};
 use crate::kernels::cuda::resident::matvec_q::QuantType;
 
 /// Mirror of `inference_cuda_mmq_dense_args`, field for field.
@@ -67,10 +67,13 @@ fn size(n: c_int) -> Result<usize, DeviceFailure> {
     usize::try_from(n).map_err(|_| invalid_argument())
 }
 
+/// The native weight type of a dense call's `ggml_type` discriminant: every [`MmqType`] with a
+/// native weight. NVFP4 has its own entry, so it is refused here.
 fn quant_of(ggml: c_int) -> Result<QuantType, DeviceFailure> {
-    [QuantType::Q80, QuantType::Q4K, QuantType::Q6K]
+    MmqType::ALL
         .into_iter()
-        .find(|quant| quant.ggml() == ggml)
+        .find(|ty| ty.ggml() == ggml)
+        .and_then(MmqType::quant)
         .ok_or_else(invalid_argument)
 }
 

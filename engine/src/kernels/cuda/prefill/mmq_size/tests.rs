@@ -84,8 +84,19 @@ fn smpbo_of(cc: i32) -> usize {
 /// The layout string the vendored CASE rows name per type (both headers agree).
 fn layout_of(mmq_type: MmqType) -> &'static str {
     match mmq_type {
-        MmqType::Q80 | MmqType::Q50 => "GGML_CUDA_MMQ_SRAM_LAYOUT_Q8_0",
-        MmqType::Q4K => "GGML_CUDA_MMQ_SRAM_LAYOUT_Q8_1",
+        MmqType::Q40
+        | MmqType::Q50
+        | MmqType::Q80
+        | MmqType::Q20
+        | MmqType::Iq1S
+        | MmqType::Iq2Xxs
+        | MmqType::Iq3Xxs
+        | MmqType::Iq3S
+        | MmqType::Iq4Nl
+        | MmqType::Iq4Xs => "GGML_CUDA_MMQ_SRAM_LAYOUT_Q8_0",
+        MmqType::Q4K | MmqType::Q5K => "GGML_CUDA_MMQ_SRAM_LAYOUT_Q8_1",
+        MmqType::Q2K => "GGML_CUDA_MMQ_SRAM_LAYOUT_Q2_K",
+        MmqType::Q3K | MmqType::Iq2Xs | MmqType::Iq2S => "GGML_CUDA_MMQ_SRAM_LAYOUT_Q3_K",
         MmqType::Q6K => "GGML_CUDA_MMQ_SRAM_LAYOUT_Q6_K",
         MmqType::Nvfp4 => "GGML_CUDA_MMQ_SRAM_LAYOUT_NVFP4",
     }
@@ -93,10 +104,23 @@ fn layout_of(mmq_type: MmqType) -> &'static str {
 
 fn type_name(mmq_type: MmqType) -> &'static str {
     match mmq_type {
-        MmqType::Q80 => "GGML_TYPE_Q8_0",
+        MmqType::Q40 => "GGML_TYPE_Q4_0",
         MmqType::Q50 => "GGML_TYPE_Q5_0",
+        MmqType::Q80 => "GGML_TYPE_Q8_0",
+        MmqType::Q20 => "GGML_TYPE_Q2_0",
+        MmqType::Q2K => "GGML_TYPE_Q2_K",
+        MmqType::Q3K => "GGML_TYPE_Q3_K",
         MmqType::Q4K => "GGML_TYPE_Q4_K",
+        MmqType::Q5K => "GGML_TYPE_Q5_K",
         MmqType::Q6K => "GGML_TYPE_Q6_K",
+        MmqType::Iq1S => "GGML_TYPE_IQ1_S",
+        MmqType::Iq2Xxs => "GGML_TYPE_IQ2_XXS",
+        MmqType::Iq2Xs => "GGML_TYPE_IQ2_XS",
+        MmqType::Iq2S => "GGML_TYPE_IQ2_S",
+        MmqType::Iq3Xxs => "GGML_TYPE_IQ3_XXS",
+        MmqType::Iq3S => "GGML_TYPE_IQ3_S",
+        MmqType::Iq4Nl => "GGML_TYPE_IQ4_NL",
+        MmqType::Iq4Xs => "GGML_TYPE_IQ4_XS",
         MmqType::Nvfp4 => "GGML_TYPE_NVFP4",
     }
 }
@@ -122,13 +146,7 @@ fn config_tables_match_vendored_headers() {
             )),
         ),
     ];
-    for mmq_type in [
-        MmqType::Q80,
-        MmqType::Q50,
-        MmqType::Q4K,
-        MmqType::Q6K,
-        MmqType::Nvfp4,
-    ] {
+    for mmq_type in MmqType::ALL {
         for (table, text) in headers {
             let cfg = table.config();
             for (fallback, j_set) in cfg.j_sets.iter().enumerate() {
@@ -176,19 +194,13 @@ fn built_ccs() -> Vec<i32> {
 /// and the 3090 99 KiB opt-in per block.
 #[test]
 fn shared_bytes_fit_both_build_architectures() {
-    let rows: Vec<(i32, usize, usize)> = [(720, 98_304, 60_672), (860, 101_376, 61_952)]
+    let rows: Vec<(i32, usize, usize)> = [(720, 98_304, 69_120), (860, 101_376, 70_144)]
         .into_iter()
         .filter(|(cc, _, _)| super::arch_compiled(*cc))
         .collect();
     for (cc, smpbo, largest) in rows {
         let mut max = 0;
-        for mmq_type in [
-            MmqType::Q80,
-            MmqType::Q50,
-            MmqType::Q4K,
-            MmqType::Q6K,
-            MmqType::Nvfp4,
-        ] {
+        for mmq_type in MmqType::ALL {
             for fallback in [false, true] {
                 for j in (8..=128).step_by(8) {
                     if let Some(nbytes) =
@@ -655,4 +667,43 @@ fn compiled_archs_cover_the_build() {
             COMPILED_ARCHS
         );
     }
+}
+
+/// The Rust type list is the native one: `mmq_types.h` names the same types in the same order
+/// (NVFP4 aside), each `ggml` value is the GGUF tensor type id of the same name, the block size
+/// is the weight type's, and `of` and `quant` invert each other; IQ1_M has no case.
+#[test]
+fn mmq_types_match_the_native_list_and_the_gguf_ids() {
+    let header = include_str!(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/src/kernels/cuda/native/prefill/mmq_types.h"
+    ));
+    let listed: Vec<&str> = header
+        .lines()
+        .filter_map(|line| line.trim().strip_prefix("X("))
+        .filter_map(|rest| rest.split(',').next())
+        .collect();
+    let ours: Vec<&str> = MmqType::ALL
+        .into_iter()
+        .filter(|&ty| ty != MmqType::Nvfp4)
+        .map(type_name)
+        .collect();
+    assert_eq!(listed, ours);
+    for ty in MmqType::ALL {
+        let id = u32::try_from(ty.ggml()).expect("a non-negative id");
+        let gguf = crate::weights::GgufType::from_id(id).expect("a GGUF type id");
+        assert_eq!(
+            type_name(ty).strip_prefix("GGML_TYPE_"),
+            Some(gguf.name()),
+            "{ty:?}"
+        );
+        match ty.quant() {
+            Some(quant) => {
+                assert_eq!(MmqType::of(quant), Some(ty));
+                assert_eq!(ty.block_values(), quant.block_size(), "{ty:?}");
+            }
+            None => assert_eq!((ty, ty.block_values()), (MmqType::Nvfp4, 64)),
+        }
+    }
+    assert_eq!(MmqType::of(QuantType::Iq1M), None);
 }

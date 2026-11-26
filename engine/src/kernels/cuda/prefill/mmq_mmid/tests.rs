@@ -1176,8 +1176,7 @@ fn check_launch_shape_refuses_every_number_rule() {
     let int_max = 0x7fff_ffff_usize;
     let rows: Vec<(&str, MmidLaunchShape)> = vec![
         ("m", with(&|s| s.ids.m = 0)),
-        ("type", with(&|s| s.quant = QuantType::Q80)),
-        ("type", with(&|s| s.quant = QuantType::Q50)),
+        ("type", with(&|s| s.quant = QuantType::Iq1M)),
         ("K-grid", with(&|s| s.k = 384)),
         ("K-grid", with(&|s| (s.quant, s.k) = (QuantType::Q6K, 384))),
         ("K", with(&|s| s.k = 0)),

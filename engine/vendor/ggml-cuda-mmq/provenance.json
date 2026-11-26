@@ -4,7 +4,7 @@
   "commit": "acecd56032ddc34bada14a2d978f110d9c987095",
   "license": "MIT",
   "copyright": "Copyright (c) 2023-2026 The ggml authors",
-  "note": "CPF-V1 pure import: the include closure of the mmq instances q4_k, q5_0, q6_k, q8_0, quantize.cu and mmid.cu, byte identical to the pin; vendored_sha256 equals upstream_sha256 for every file and there is no patch. Shims are our glue (CPF-V2); sha256 null means not written yet. CPF-V2 patch V-2 (patches/V-2-errors.patch) follows the import, so the sentence above on the absence of a patch describes the CPF-V1 state; patched_sha256 is the file after the last patch of its chain. Patch V-3a (patches/V-3a-backend-machinery.patch) deletes the unused ggml backend machinery. Patch V-3b (patches/V-3b-stream-fixup-device-guard.patch) makes the fixup range and the device facts arguments and adds the typed host refusal fifi_check_device. Patch V-3c (patches/V-3c-pdl-off.patch) sets PDL off with one line. The three shims are written; their sha256 is recorded. Patch V-4 (patches/V-4-trim.patch) edits three files; ten whole files are removed and listed under trim with their upstream hashes (the pin holds their bytes). MATVEC-PAR S1 c1: the MMVQ import (mmvq.cu, mmvq.cuh, byte identical to the pin) with a new unary.cuh shim (the four scalar GLU device helpers) and enum ggml_glu_op added to the ggml.h shim, so the untrimmed include of unary.cuh resolves. MATVEC-PAR S1 c2: patch V-MV1 (patches/V-MV1-mmvq.patch) trims the import to the device-only, error-returning form; final hashes in files.patched_sha256. V-PACK1 adds an opt-in Q8_0 reference policy. The original vendor entries retain their signatures and behavior. Q4_K reference packing remains in our native glue. Patch V-5 (patches/V-5-q4k-tiling-configs.patch) makes the Q4_K rows for J 8..64 tiling configs, so a narrow grouped tile does not switch the kernel to stream-k.",
+  "note": "CPF-V1 pure import: the include closure of the mmq instances q4_k, q5_0, q6_k, q8_0, quantize.cu and mmid.cu, byte identical to the pin; vendored_sha256 equals upstream_sha256 for every file and there is no patch. Shims are our glue (CPF-V2); sha256 null means not written yet. CPF-V2 patch V-2 (patches/V-2-errors.patch) follows the import, so the sentence above on the absence of a patch describes the CPF-V1 state; patched_sha256 is the file after the last patch of its chain. Patch V-3a (patches/V-3a-backend-machinery.patch) deletes the unused ggml backend machinery. Patch V-3b (patches/V-3b-stream-fixup-device-guard.patch) makes the fixup range and the device facts arguments and adds the typed host refusal fifi_check_device. Patch V-3c (patches/V-3c-pdl-off.patch) sets PDL off with one line. The three shims are written; their sha256 is recorded. Patch V-4 (patches/V-4-trim.patch) edits three files; ten whole files are removed and listed under trim with their upstream hashes (the pin holds their bytes). MATVEC-PAR S1 c1: the MMVQ import (mmvq.cu, mmvq.cuh, byte identical to the pin) with a new unary.cuh shim (the four scalar GLU device helpers) and enum ggml_glu_op added to the ggml.h shim, so the untrimmed include of unary.cuh resolves. MATVEC-PAR S1 c2: patch V-MV1 (patches/V-MV1-mmvq.patch) trims the import to the device-only, error-returning form; final hashes in files.patched_sha256. V-PACK1 adds an opt-in Q8_0 reference policy. The original vendor entries retain their signatures and behavior. Q4_K reference packing remains in our native glue. Patch V-5 (patches/V-5-q4k-tiling-configs.patch) makes the Q4_K rows for J 8..64 tiling configs, so a narrow grouped tile does not switch the kernel to stream-k. The MMQ instances q4_0, q2_0, q2_k, q3_k, q5_k, iq1_s, iq2_xxs, iq2_xs, iq2_s, iq3_xxs, iq3_s, iq4_nl and iq4_xs are imported byte identical to the pin; the kept headers already held their cases, so no other file changes.",
   "include_roots": [
     "src/ggml-cuda",
     "src"
@@ -30,18 +30,6 @@
       "upstream_path": "ggml/src/ggml-cuda/mma.cuh",
       "upstream_sha256": "c7e0f3332da182e203b4b953f9fa8535ffca3767d2b7d4d7dbf7ce486262d1af",
       "vendored_sha256": "c7e0f3332da182e203b4b953f9fa8535ffca3767d2b7d4d7dbf7ce486262d1af"
-    },
-    "src/ggml-cuda/mmvq.cu": {
-      "upstream_path": "ggml/src/ggml-cuda/mmvq.cu",
-      "upstream_sha256": "d4c70f68ab79d463fd6fd52cac66a62e915858397ba4b2b7f658a7fbf13121f3",
-      "vendored_sha256": "d4c70f68ab79d463fd6fd52cac66a62e915858397ba4b2b7f658a7fbf13121f3",
-      "patched_sha256": "8ffa0a71dd8e9a0ca1931f455d007d1e0a0f9190d9ba6a9c649598e4d6a82d9d"
-    },
-    "src/ggml-cuda/mmvq.cuh": {
-      "upstream_path": "ggml/src/ggml-cuda/mmvq.cuh",
-      "upstream_sha256": "b37f8359f519ba90ddecd9cb3ca5f8c2ae05685bfae6813d435d75763c2bb006",
-      "vendored_sha256": "b37f8359f519ba90ddecd9cb3ca5f8c2ae05685bfae6813d435d75763c2bb006",
-      "patched_sha256": "d10e0201283eff3bbbe6e2d9f3cfc813a7af507547f55f79ad6359520e49d317"
     },
     "src/ggml-cuda/mmid.cu": {
       "upstream_path": "ggml/src/ggml-cuda/mmid.cu",
@@ -82,6 +70,18 @@
       "vendored_sha256": "50db23f5055af6e28c142fcb4c7fb16c51f7137184ebf8c0ca113ed88906851b",
       "patched_sha256": "b66116c5ac0ef41e316f399731d44e3381a8c14971525caf64548652ae9e9d9e"
     },
+    "src/ggml-cuda/mmvq.cu": {
+      "upstream_path": "ggml/src/ggml-cuda/mmvq.cu",
+      "upstream_sha256": "d4c70f68ab79d463fd6fd52cac66a62e915858397ba4b2b7f658a7fbf13121f3",
+      "vendored_sha256": "d4c70f68ab79d463fd6fd52cac66a62e915858397ba4b2b7f658a7fbf13121f3",
+      "patched_sha256": "8ffa0a71dd8e9a0ca1931f455d007d1e0a0f9190d9ba6a9c649598e4d6a82d9d"
+    },
+    "src/ggml-cuda/mmvq.cuh": {
+      "upstream_path": "ggml/src/ggml-cuda/mmvq.cuh",
+      "upstream_sha256": "b37f8359f519ba90ddecd9cb3ca5f8c2ae05685bfae6813d435d75763c2bb006",
+      "vendored_sha256": "b37f8359f519ba90ddecd9cb3ca5f8c2ae05685bfae6813d435d75763c2bb006",
+      "patched_sha256": "d10e0201283eff3bbbe6e2d9f3cfc813a7af507547f55f79ad6359520e49d317"
+    },
     "src/ggml-cuda/quantize.cu": {
       "upstream_path": "ggml/src/ggml-cuda/quantize.cu",
       "upstream_sha256": "71cd7baab62ee1f457d23ae648c381d18b9b1327ec34832f31463b14b81895b3",
@@ -94,6 +94,66 @@
       "vendored_sha256": "112e190a096e1fa68d4c72ca2a450cb202586e3f2919c884f3e3316a8d5c57cd",
       "patched_sha256": "3cad550cb483a4142651b5fe0c4ea3c4cd24abf3ef17f1f8c915ed94fbccff04"
     },
+    "src/ggml-cuda/template-instances/mmq-instance-iq1_s.cu": {
+      "upstream_path": "ggml/src/ggml-cuda/template-instances/mmq-instance-iq1_s.cu",
+      "upstream_sha256": "3e54437db9b0cdda4ddb629982f1f083458de06771a04e5d25ab3e65dbca9e95",
+      "vendored_sha256": "3e54437db9b0cdda4ddb629982f1f083458de06771a04e5d25ab3e65dbca9e95"
+    },
+    "src/ggml-cuda/template-instances/mmq-instance-iq2_s.cu": {
+      "upstream_path": "ggml/src/ggml-cuda/template-instances/mmq-instance-iq2_s.cu",
+      "upstream_sha256": "8a841418b1b818a13f739759ea0d36ed778e1b6343aee85fdc58d341b169bd55",
+      "vendored_sha256": "8a841418b1b818a13f739759ea0d36ed778e1b6343aee85fdc58d341b169bd55"
+    },
+    "src/ggml-cuda/template-instances/mmq-instance-iq2_xs.cu": {
+      "upstream_path": "ggml/src/ggml-cuda/template-instances/mmq-instance-iq2_xs.cu",
+      "upstream_sha256": "549d0c56b4b7ffccf262a611e28d257ce8e7ee94ce7ac814259c427eaeb10fe8",
+      "vendored_sha256": "549d0c56b4b7ffccf262a611e28d257ce8e7ee94ce7ac814259c427eaeb10fe8"
+    },
+    "src/ggml-cuda/template-instances/mmq-instance-iq2_xxs.cu": {
+      "upstream_path": "ggml/src/ggml-cuda/template-instances/mmq-instance-iq2_xxs.cu",
+      "upstream_sha256": "7fa1a4a0aaec59e2e27eb40a13078be685952e446c5c9fb0840a47d0e28a17bf",
+      "vendored_sha256": "7fa1a4a0aaec59e2e27eb40a13078be685952e446c5c9fb0840a47d0e28a17bf"
+    },
+    "src/ggml-cuda/template-instances/mmq-instance-iq3_s.cu": {
+      "upstream_path": "ggml/src/ggml-cuda/template-instances/mmq-instance-iq3_s.cu",
+      "upstream_sha256": "8167508364494a8f51f736186c5294585a26302cb034e051b8b80acf1db18850",
+      "vendored_sha256": "8167508364494a8f51f736186c5294585a26302cb034e051b8b80acf1db18850"
+    },
+    "src/ggml-cuda/template-instances/mmq-instance-iq3_xxs.cu": {
+      "upstream_path": "ggml/src/ggml-cuda/template-instances/mmq-instance-iq3_xxs.cu",
+      "upstream_sha256": "13af5ff17c13dbbe712a6f400b83b69da77792969162c6f345491392d36c1d51",
+      "vendored_sha256": "13af5ff17c13dbbe712a6f400b83b69da77792969162c6f345491392d36c1d51"
+    },
+    "src/ggml-cuda/template-instances/mmq-instance-iq4_nl.cu": {
+      "upstream_path": "ggml/src/ggml-cuda/template-instances/mmq-instance-iq4_nl.cu",
+      "upstream_sha256": "a03418c7c0607a3ce3707129dd7e0fcd18d36f241c55289a274fac66f1548f93",
+      "vendored_sha256": "a03418c7c0607a3ce3707129dd7e0fcd18d36f241c55289a274fac66f1548f93"
+    },
+    "src/ggml-cuda/template-instances/mmq-instance-iq4_xs.cu": {
+      "upstream_path": "ggml/src/ggml-cuda/template-instances/mmq-instance-iq4_xs.cu",
+      "upstream_sha256": "c4f568105a3ff273287b04c58879ea455efd5fa05aa72da9ef0efeb7ab9de520",
+      "vendored_sha256": "c4f568105a3ff273287b04c58879ea455efd5fa05aa72da9ef0efeb7ab9de520"
+    },
+    "src/ggml-cuda/template-instances/mmq-instance-q2_0.cu": {
+      "upstream_path": "ggml/src/ggml-cuda/template-instances/mmq-instance-q2_0.cu",
+      "upstream_sha256": "41253e37b9d032e78135d8bcee4544de82e07002530f7045eccf782727c8a784",
+      "vendored_sha256": "41253e37b9d032e78135d8bcee4544de82e07002530f7045eccf782727c8a784"
+    },
+    "src/ggml-cuda/template-instances/mmq-instance-q2_k.cu": {
+      "upstream_path": "ggml/src/ggml-cuda/template-instances/mmq-instance-q2_k.cu",
+      "upstream_sha256": "e378922ee4aaabe395e7e3f620a38ae26e36e27b46036b8b7fea71292bf8cc2b",
+      "vendored_sha256": "e378922ee4aaabe395e7e3f620a38ae26e36e27b46036b8b7fea71292bf8cc2b"
+    },
+    "src/ggml-cuda/template-instances/mmq-instance-q3_k.cu": {
+      "upstream_path": "ggml/src/ggml-cuda/template-instances/mmq-instance-q3_k.cu",
+      "upstream_sha256": "3847ca2cefb02dd316033e05db5451b24440cf6ab4cb2d23b4f54a388b492edc",
+      "vendored_sha256": "3847ca2cefb02dd316033e05db5451b24440cf6ab4cb2d23b4f54a388b492edc"
+    },
+    "src/ggml-cuda/template-instances/mmq-instance-q4_0.cu": {
+      "upstream_path": "ggml/src/ggml-cuda/template-instances/mmq-instance-q4_0.cu",
+      "upstream_sha256": "b0f6646afd4a8cc45aaf390a004700057baeae6d87d672dcd67c21a0a81eb74f",
+      "vendored_sha256": "b0f6646afd4a8cc45aaf390a004700057baeae6d87d672dcd67c21a0a81eb74f"
+    },
     "src/ggml-cuda/template-instances/mmq-instance-q4_k.cu": {
       "upstream_path": "ggml/src/ggml-cuda/template-instances/mmq-instance-q4_k.cu",
       "upstream_sha256": "2ab47361d40a9ece25406c20693424a466c93bcb5cdb5c06cee8f9d03a806beb",
@@ -103,6 +163,11 @@
       "upstream_path": "ggml/src/ggml-cuda/template-instances/mmq-instance-q5_0.cu",
       "upstream_sha256": "34a443ed0e68b1ad614eb251758d0f43f003ce8d10e7833f9f58a46677d336db",
       "vendored_sha256": "34a443ed0e68b1ad614eb251758d0f43f003ce8d10e7833f9f58a46677d336db"
+    },
+    "src/ggml-cuda/template-instances/mmq-instance-q5_k.cu": {
+      "upstream_path": "ggml/src/ggml-cuda/template-instances/mmq-instance-q5_k.cu",
+      "upstream_sha256": "c98bbe1dd91e03362f4136357c6f4e4e2c5328902fdc6fd857d0f608386ffb2e",
+      "vendored_sha256": "c98bbe1dd91e03362f4136357c6f4e4e2c5328902fdc6fd857d0f608386ffb2e"
     },
     "src/ggml-cuda/template-instances/mmq-instance-q6_k.cu": {
       "upstream_path": "ggml/src/ggml-cuda/template-instances/mmq-instance-q6_k.cu",
@@ -306,7 +371,7 @@
       ]
     }
   ],
-  "import_file_count": 31,
+  "import_file_count": 44,
   "trim": {
     "removed_files": {
       "src/ggml-cuda/mmq-config-blackwell.cuh": {

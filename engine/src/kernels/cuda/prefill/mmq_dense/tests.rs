@@ -48,7 +48,7 @@ fn mmq_dense_rule_pins_convert_the_integers() {
 
 #[test]
 fn mmq_dense_refuses_a_type_without_a_case_by_tag() {
-    let text = refusal(check_dense_rules(QuantType::Q50, 2048, 512, 8, 512, 0));
+    let text = refusal(check_dense_rules(QuantType::Iq1M, 2048, 512, 8, 512, 0));
     assert!(text.contains("mmq_dense: type"), "{text}");
 }
 
@@ -506,28 +506,7 @@ fn mmq_dense_wrapper_refuses_bad_ranges_by_tag_and_changes_nothing() {
 }
 
 fn mmq_type_of(ty: QuantType) -> MmqType {
-    match ty {
-        QuantType::Q80 => MmqType::Q80,
-        QuantType::Q50 => MmqType::Q50,
-        QuantType::Q4K => MmqType::Q4K,
-        QuantType::Q6K => MmqType::Q6K,
-        // Q5_K, Q4_0, Q3_K and IQ4_XS never reach the mmq path: the dense GEMM rows below
-        // take the four mmq types only, and this mapping exists for those rows.
-        QuantType::Q5K => unreachable!("Q5_K has no mmq type"),
-        QuantType::Q40 => unreachable!("Q4_0 has no mmq type"),
-        QuantType::Q3K => unreachable!("Q3_K has no mmq type"),
-        QuantType::Iq4Xs => unreachable!("IQ4_XS has no mmq type"),
-        QuantType::Iq4Nl
-        | QuantType::Iq2S
-        | QuantType::Iq3Xxs
-        | QuantType::Iq2Xxs
-        | QuantType::Q20
-        | QuantType::Iq2Xs
-        | QuantType::Iq3S
-        | QuantType::Q2K
-        | QuantType::Iq1S
-        | QuantType::Iq1M => unreachable!("the codebook types have no mmq type"),
-    }
+    MmqType::of(ty).expect("a type with an mmq case")
 }
 
 /// Native blocks of `ty`: realistic Q8_0 codes, the testkit's finite random blocks for the
@@ -630,7 +609,8 @@ fn run_case(rig: &Rig, case: &Case, weight: &NativeWeight, x: &[f32]) -> Result<
             x: xb.range(0, xb.bytes())?,
             y: y.range(0, need.y)?,
         },
-    )?;
+    )
+    .inspect_err(|error| eprintln!("{:?}: the q8_1 quantize refused: {error:?}", case.ty))?;
     let total = case.m * case.ld * 4;
     let dst = testkit::upload_filled(ctx, POISON, total + CANARY);
     ctx.mmq_dense(
@@ -645,7 +625,8 @@ fn run_case(rig: &Rig, case: &Case, weight: &NativeWeight, x: &[f32]) -> Result<
             col_off: case.col_off,
             fixup: fixup.range(0, *fixup_bytes)?,
         },
-    )?;
+    )
+    .inspect_err(|error| eprintln!("{:?}: the GEMM refused: {error:?}", case.ty))?;
     stream.synchronize()?;
     Ok(Run {
         dst: testkit::read_bytes(ctx, &dst, total + CANARY),
@@ -1525,11 +1506,11 @@ fn mmq_dense_c_entry_refuses_a_fixup_range_short_of_the_launch_need() {
     );
 }
 
-/// The two input paths' bytes for one weight, and the refusal text for a Q5_0 weight.
+/// The two input paths' bytes for one weight, and the refusal text for an IQ1_M weight.
 struct InputPaths {
     via_input: Vec<Vec<u8>>,
     direct: Vec<Vec<u8>>,
-    q50: Result<(), EngError>,
+    iq1m: Result<(), EngError>,
 }
 
 #[test]
@@ -1537,7 +1518,7 @@ fn mmq_dense_input_quantizes_in_the_layout_of_the_weight() {
     // The family-facing input path derives the q8_1 scale layout (D4 for Q8_0 and Q6_K, DS4 for
     // Q4_K) from the consuming weight: its bytes equal a direct `mmq_quantize` with that
     // weight's type, the layouts share their codes and differ in their scale words, Q6_K gives
-    // Q8_0's bytes, and a Q5_0 weight, which has no dense case, is refused by the dense tag.
+    // Q8_0's bytes, and an IQ1_M weight, which has no dense case, is refused by the dense tag.
     const NAME: &str = "mmq_dense_input_quantizes_in_the_layout_of_the_weight";
     if !testkit::device_present(NAME) {
         return;
@@ -1552,7 +1533,7 @@ fn mmq_dense_input_quantizes_in_the_layout_of_the_weight() {
         let mut paths = InputPaths {
             via_input: Vec::new(),
             direct: Vec::new(),
-            q50: Ok(()),
+            iq1m: Ok(()),
         };
         for (ty, mmq) in [
             (QuantType::Q80, MmqType::Q80),
@@ -1596,13 +1577,18 @@ fn mmq_dense_input_quantizes_in_the_layout_of_the_weight() {
                 .direct
                 .push(testkit::read_bytes(&ctx, &direct, need.y));
         }
-        let q50 = upload_weight(&ctx, QuantType::Q50, (n, k), &vec![0u8; n * (k / 32) * 22])?;
+        let iq1m = upload_weight(
+            &ctx,
+            QuantType::Iq1M,
+            (n, k),
+            &vec![0u8; n * (k / 256) * 56],
+        )?;
         let y = testkit::upload_filled(&ctx, POISON, need.y);
-        paths.q50 = ctx.mmq_dense_input(
+        paths.iq1m = ctx.mmq_dense_input(
             &stream,
             MmqDenseInputCall {
                 packing: crate::kernels::cuda::prefill::mmq_quant::MmqPacking::Vendor,
-                weight: &q50,
+                weight: &iq1m,
                 m,
                 row_stride: k,
                 x: xb.range(0, xb.bytes())?,
@@ -1649,7 +1635,7 @@ fn mmq_dense_input_quantizes_in_the_layout_of_the_weight() {
     );
     let text = format!(
         "{:?}",
-        out.q50.expect_err("a Q5_0 weight has no dense input")
+        out.iq1m.expect_err("an IQ1_M weight has no dense input")
     );
     assert!(text.contains("mmq_dense: type"), "{text}");
 }
@@ -2312,4 +2298,84 @@ fn mmq_dense_extended_rows_match_the_reference() {
         );
         assert!(stat.global <= 1e-3);
     }
+}
+
+/// Native blocks of any MMQ weight type: xorshift bytes with the f16 block scale at 1.0 and the
+/// K-quant minimum scale at 0.5, so every dequantized value is finite. The other bytes are codes,
+/// sub-block scales and codebook indices, valid at every value.
+fn any_weight(ty: QuantType, n: usize, k: usize, seed: u64) -> Vec<u8> {
+    let block = ty.block_bytes();
+    let (d_at, dmin_at) = match ty {
+        QuantType::Q2K => (80, Some(82)),
+        QuantType::Q3K => (108, None),
+        QuantType::Q6K => (208, None),
+        QuantType::Q4K | QuantType::Q5K => (0, Some(2)),
+        _ => (0, None),
+    };
+    let mut rng = Rng::new(seed);
+    let mut bytes: Vec<u8> = (0..n * (k / ty.block_size()) * block)
+        .map(|_| (rng.next_u64() >> 32) as u8)
+        .collect();
+    for chunk in bytes.chunks_exact_mut(block) {
+        chunk[d_at..d_at + 2].copy_from_slice(&0x3c00u16.to_le_bytes());
+        if let Some(at) = dmin_at {
+            chunk[at..at + 2].copy_from_slice(&0x3800u16.to_le_bytes());
+        }
+    }
+    bytes
+}
+
+#[test]
+fn mmq_dense_every_type_matches_the_f64_reference() {
+    // Every weight type of the vendored instances against the host dequantizer's weights and the
+    // unquantized activations: one stream-k shape with a column tail (m 130) and one of 64
+    // columns. The error is the q8_1 rounding of the activations.
+    const NAME: &str = "mmq_dense_every_type_matches_the_f64_reference";
+    if !testkit::device_present(NAME) {
+        return;
+    }
+    let inputs: Vec<CaseInput> = MmqType::ALL
+        .into_iter()
+        .filter_map(MmqType::quant)
+        .zip(0u64..)
+        .flat_map(|(ty, i)| {
+            [(2304, 256, 130), (1024, 128, 64)].map(|shape| {
+                let case = dense("every type", ty, shape);
+                let seed = 0x6453_0000 + i * 2 + u64::from(shape.2 == 64);
+                let w = any_weight(ty, case.n, case.k, seed);
+                let x = activations(case.m, case.k, seed ^ 0x5555);
+                CaseInput { case, w, x }
+            })
+        })
+        .collect();
+    let mut refused = Vec::new();
+    for input in &inputs {
+        let c = &input.case;
+        let run = match run_cases(std::slice::from_ref(input)) {
+            Ok(run) => run,
+            Err(error) => {
+                refused.push(format!("{:?} K{} N{} M{}: {error:?}", c.ty, c.k, c.n, c.m));
+                continue;
+            }
+        };
+        let dev = gated_slice(&run[0], c);
+        let stat = nmse(&dev, &reference(c, &input.w, &input.x), c.n, c.m);
+        println!(
+            "{NAME}: {:?} K{} N{} M{}: NMSE {:.3e}, per-column max {:.3e}",
+            c.ty, c.k, c.n, c.m, stat.global, stat.max
+        );
+        if stat.global > 1e-3 {
+            refused.push(format!(
+                "{:?} K{} N{} M{}: NMSE {:.3e}",
+                c.ty, c.k, c.n, c.m, stat.global
+            ));
+        }
+    }
+    assert!(
+        refused.is_empty(),
+        "{} of {} cases failed:\n{}",
+        refused.len(),
+        inputs.len(),
+        refused.join("\n")
+    );
 }

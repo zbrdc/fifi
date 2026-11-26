@@ -433,8 +433,9 @@ fn a_shared_q8_buffer_is_requantized_when_the_layout_changes() {
         3,
         "a buffer noted as Ds4 is not quantized again"
     );
-    // A type the mmq pair does not read has no layout: the buffer is untouched and the call errs.
-    assert!(cursor.ensure(QuantType::Q5K, || Ok(())).is_err());
+    // A type the mmq pair does not read (IQ1_M, the one native type with no vendored case) has no
+    // layout: the buffer is untouched and the call errs.
+    assert!(cursor.ensure(QuantType::Iq1M, || Ok(())).is_err());
 }
 
 /// A routed stack on the dequantizing GEMM reads the f32 rows, so the stage declares them: `Act`

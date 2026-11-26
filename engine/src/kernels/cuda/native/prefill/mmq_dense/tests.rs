@@ -238,7 +238,7 @@ fn the_dense_entry_refuses_each_bad_argument_at_its_own_guard() {
                 ..base()
             },
         ),
-        ("Q5_0 has no case", MmqDenseArgsRaw { ty: 6, ..base() }),
+        ("IQ1_M has no case", MmqDenseArgsRaw { ty: 29, ..base() }),
         ("F32 has no case", MmqDenseArgsRaw { ty: 0, ..base() }),
         ("K off the k grid", MmqDenseArgsRaw { k: 384, ..base() }),
         ("K zero", MmqDenseArgsRaw { k: 0, ..base() }),
@@ -644,7 +644,11 @@ fn the_c_fixup_need_is_zero_for_arguments_the_entry_refuses() {
     );
     let no_sms = FactsRaw { nsm: 0, ..good };
     assert_eq!(c_fixup_need(8, 32, 24, &no_sms), 0);
-    assert_eq!(c_fixup_need(6, 32, 24, &good), 0, "Q5_0 has no dense case");
+    assert_eq!(
+        c_fixup_need(29, 32, 24, &good),
+        0,
+        "IQ1_M has no dense case"
+    );
     assert_eq!(c_fixup_need(8, 32, 0, &good), 0, "no columns");
     assert_eq!(c_fixup_need(8, 32, 4097, &good), 0, "above the chunk cap");
 }
@@ -679,4 +683,17 @@ fn extended_domain_c_fixup_stays_within_the_allocated_maximum() {
         "no supported compiled architecture exercised"
     );
     println!("extended native fixup bound: {cases} shapes");
+}
+
+#[test]
+fn the_launch_checks_take_every_mmq_type_with_a_native_weight() {
+    // The Rust check before the C entry must know every type the C side serves, or a served
+    // type is refused with an invalid argument that stops the backend.
+    for ty in MmqType::ALL {
+        match ty.quant() {
+            Some(quant) => assert_eq!(super::quant_of(ty.ggml()).ok(), Some(quant), "{ty:?}"),
+            None => assert!(super::quant_of(ty.ggml()).is_err(), "{ty:?}"),
+        }
+    }
+    assert!(super::quant_of(-1).is_err());
 }

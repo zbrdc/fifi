@@ -26,6 +26,7 @@
 )]
 
 use crate::EngError;
+use crate::kernels::cuda::resident::matvec_q::QuantType;
 
 /// Values per `block_q8_1_mmq` (`QK8_1_MMQ`, mmq.cuh:25) and its bytes (:28-47, :57-58).
 const QK8_1_MMQ: usize = 128;
@@ -87,6 +88,7 @@ pub(super) const J_MAX: usize = 128;
 /// `MMQ_TILE_NE_K` and the quantization widths of the sram strides (mmq.cuh:116, :126-140).
 const TILE_K: usize = 32;
 const QI8_0: usize = 8;
+const QI8_1: usize = 8;
 const QI6_K: usize = 32;
 
 /// A `BadRequest` that names the sizing rule that fired (the `mmq_size` tag).
@@ -98,34 +100,229 @@ fn pad_up(n: usize, m: usize) -> usize {
     n.div_ceil(m) * m
 }
 
-/// The MMQ weight type tags: per-tensor dispatch, never role.
 /// The widest Q4_K tile the vendored table implements as a tiling config (the vendored Q4_K
 /// tiling patch). Above this width the Q4_K rows are stream-k configs.
 pub(crate) const Q4K_TILING_MAX_J: usize = 64;
 
+/// The MMQ weight types: per-tensor dispatch, never role. One per vendored instance
+/// (`native/prefill/mmq_types.h`, the same list), plus NVFP4, which has its own dense entry.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum MmqType {
-    Q80,
+    Q40,
     Q50,
+    Q80,
+    Q20,
+    Q2K,
+    Q3K,
     Q4K,
+    Q5K,
     Q6K,
+    Iq1S,
+    Iq2Xxs,
+    Iq2Xs,
+    Iq2S,
+    Iq3Xxs,
+    Iq3S,
+    Iq4Nl,
+    Iq4Xs,
     Nvfp4,
 }
 
-/// The q8_1 scale layout a weight of an [`MmqType`] reads (mmq.cuh:61-101): the D4 scale
-/// form for Q8_0, Q5_0, Q6_K and NVFP4, the DS4 form for Q4_K. One q8_1 buffer is quantized once
-/// and read by every GEMM of its group, so the layout is a property of the weight type.
+/// The q8_1 scale layout a weight of an [`MmqType`] reads (mmq.cuh:61-101): D4 (one scale per
+/// 32 values), DS4 (a scale and a sum per 32 values) or D2S6 (Q2_K's scales and sums of 64 and 16
+/// values). One q8_1 buffer is quantized once and read by every GEMM of its group, so the layout
+/// is a property of the weight type.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Q8_1Layout {
     D4,
     Ds4,
+    D2s6,
+}
+
+/// The shared-memory x-tile layout of a type on the MMA path (`ggml_cuda_mmq_sram_layout`,
+/// mmq.cuh:116-124, the CASE rows of mmq-config-ampere.cuh).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SramLayout {
+    Q80,
+    Q81,
+    Q2K,
+    Q3K,
+    Q6K,
+    Nvfp4,
+}
+
+/// The dp4a x-tile sizes of a type (`MMQ_DP4A_TXS_*`, mmq.cuh:330-372).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Dp4aTile {
+    Q40,
+    Q80,
+    Q80x16,
+    Q2K,
+    Q3K,
+    Q4K,
+    Q5K,
+    Q6K,
 }
 
 impl MmqType {
+    /// Every type, in the order of `mmq_types.h`, NVFP4 last.
+    pub(crate) const ALL: [Self; 18] = [
+        Self::Q40,
+        Self::Q50,
+        Self::Q80,
+        Self::Q20,
+        Self::Q2K,
+        Self::Q3K,
+        Self::Q4K,
+        Self::Q5K,
+        Self::Q6K,
+        Self::Iq1S,
+        Self::Iq2Xxs,
+        Self::Iq2Xs,
+        Self::Iq2S,
+        Self::Iq3Xxs,
+        Self::Iq3S,
+        Self::Iq4Nl,
+        Self::Iq4Xs,
+        Self::Nvfp4,
+    ];
+
+    /// The MMQ type of a native weight type; `None` for IQ1_M, which has no vendored case.
+    pub(crate) fn of(quant: QuantType) -> Option<Self> {
+        Some(match quant {
+            QuantType::Q40 => Self::Q40,
+            QuantType::Q50 => Self::Q50,
+            QuantType::Q80 => Self::Q80,
+            QuantType::Q20 => Self::Q20,
+            QuantType::Q2K => Self::Q2K,
+            QuantType::Q3K => Self::Q3K,
+            QuantType::Q4K => Self::Q4K,
+            QuantType::Q5K => Self::Q5K,
+            QuantType::Q6K => Self::Q6K,
+            QuantType::Iq1S => Self::Iq1S,
+            QuantType::Iq2Xxs => Self::Iq2Xxs,
+            QuantType::Iq2Xs => Self::Iq2Xs,
+            QuantType::Iq2S => Self::Iq2S,
+            QuantType::Iq3Xxs => Self::Iq3Xxs,
+            QuantType::Iq3S => Self::Iq3S,
+            QuantType::Iq4Nl => Self::Iq4Nl,
+            QuantType::Iq4Xs => Self::Iq4Xs,
+            QuantType::Iq1M => return None,
+        })
+    }
+
+    /// The native weight type, `None` for NVFP4 (its weights are not a [`QuantType`]).
+    pub(crate) fn quant(self) -> Option<QuantType> {
+        Some(match self {
+            Self::Q40 => QuantType::Q40,
+            Self::Q50 => QuantType::Q50,
+            Self::Q80 => QuantType::Q80,
+            Self::Q20 => QuantType::Q20,
+            Self::Q2K => QuantType::Q2K,
+            Self::Q3K => QuantType::Q3K,
+            Self::Q4K => QuantType::Q4K,
+            Self::Q5K => QuantType::Q5K,
+            Self::Q6K => QuantType::Q6K,
+            Self::Iq1S => QuantType::Iq1S,
+            Self::Iq2Xxs => QuantType::Iq2Xxs,
+            Self::Iq2Xs => QuantType::Iq2Xs,
+            Self::Iq2S => QuantType::Iq2S,
+            Self::Iq3Xxs => QuantType::Iq3Xxs,
+            Self::Iq3S => QuantType::Iq3S,
+            Self::Iq4Nl => QuantType::Iq4Nl,
+            Self::Iq4Xs => QuantType::Iq4Xs,
+            Self::Nvfp4 => return None,
+        })
+    }
+
+    /// The `ggml_type` discriminant the native entries switch on: the GGUF tensor type id
+    /// (`GgufType::id`, the vendored ggml.h shim's values; pinned by test).
+    pub(crate) fn ggml(self) -> i32 {
+        match self {
+            Self::Q40 => 2,
+            Self::Q50 => 6,
+            Self::Q80 => 8,
+            Self::Q2K => 10,
+            Self::Q3K => 11,
+            Self::Q4K => 12,
+            Self::Q5K => 13,
+            Self::Q6K => 14,
+            Self::Iq2Xxs => 16,
+            Self::Iq2Xs => 17,
+            Self::Iq3Xxs => 18,
+            Self::Iq1S => 19,
+            Self::Iq4Nl => 20,
+            Self::Iq3S => 21,
+            Self::Iq2S => 22,
+            Self::Iq4Xs => 23,
+            Self::Nvfp4 => 40,
+            Self::Q20 => 42,
+        }
+    }
+
+    /// Values per weight block (`ggml_cuda_type_traits<T>::qk`).
+    pub(crate) fn block_values(self) -> usize {
+        self.quant().map_or(64, QuantType::block_size)
+    }
+
     pub(crate) fn q8_1_layout(self) -> Q8_1Layout {
         match self {
-            Self::Q80 | Self::Q50 | Self::Q6K | Self::Nvfp4 => Q8_1Layout::D4,
-            Self::Q4K => Q8_1Layout::Ds4,
+            Self::Q40 | Self::Q4K | Self::Q5K | Self::Iq1S => Q8_1Layout::Ds4,
+            Self::Q2K => Q8_1Layout::D2s6,
+            Self::Q50
+            | Self::Q80
+            | Self::Q20
+            | Self::Q3K
+            | Self::Q6K
+            | Self::Iq2Xxs
+            | Self::Iq2Xs
+            | Self::Iq2S
+            | Self::Iq3Xxs
+            | Self::Iq3S
+            | Self::Iq4Nl
+            | Self::Iq4Xs
+            | Self::Nvfp4 => Q8_1Layout::D4,
+        }
+    }
+
+    fn sram_layout(self) -> SramLayout {
+        match self {
+            Self::Q4K | Self::Q5K => SramLayout::Q81,
+            Self::Q2K => SramLayout::Q2K,
+            Self::Q3K | Self::Iq2Xs | Self::Iq2S => SramLayout::Q3K,
+            Self::Q6K => SramLayout::Q6K,
+            Self::Nvfp4 => SramLayout::Nvfp4,
+            Self::Q40
+            | Self::Q50
+            | Self::Q80
+            | Self::Q20
+            | Self::Iq1S
+            | Self::Iq2Xxs
+            | Self::Iq3Xxs
+            | Self::Iq3S
+            | Self::Iq4Nl
+            | Self::Iq4Xs => SramLayout::Q80,
+        }
+    }
+
+    fn dp4a_tile(self) -> Dp4aTile {
+        match self {
+            Self::Q40 => Dp4aTile::Q40,
+            Self::Nvfp4 | Self::Iq2Xs | Self::Iq2S => Dp4aTile::Q80x16,
+            Self::Q2K => Dp4aTile::Q2K,
+            Self::Q3K => Dp4aTile::Q3K,
+            Self::Q4K => Dp4aTile::Q4K,
+            Self::Q5K => Dp4aTile::Q5K,
+            Self::Q6K => Dp4aTile::Q6K,
+            Self::Q50
+            | Self::Q80
+            | Self::Q20
+            | Self::Iq1S
+            | Self::Iq2Xxs
+            | Self::Iq3Xxs
+            | Self::Iq3S
+            | Self::Iq4Nl
+            | Self::Iq4Xs => Dp4aTile::Q80,
         }
     }
 }
@@ -187,14 +384,15 @@ impl MmqConfig {
         }
     }
 
-    /// `ggml_cuda_mmq_get_sram_stride` (mmq.cuh:126-140) for the layout our types use: the
-    /// Q8_0 layout for Q8_0/Q5_0, Q8_1 for Q4_K, Q6_K for Q6_K, NVFP4 for NVFP4.
+    /// `ggml_cuda_mmq_get_sram_stride` (mmq.cuh:126-140) of the type's layout, in ints.
     fn sram_stride(self, mmq_type: MmqType) -> usize {
-        match mmq_type {
-            MmqType::Q80 | MmqType::Q50 => 2 * TILE_K + 2 * TILE_K / QI8_0 + 4,
-            MmqType::Q4K => 2 * TILE_K + 2 * TILE_K / 8 + 4,
-            MmqType::Q6K => 2 * TILE_K + TILE_K / QI6_K + TILE_K / 8 + 7,
-            MmqType::Nvfp4 => 2 * TILE_K + TILE_K / 2 + 4,
+        match mmq_type.sram_layout() {
+            SramLayout::Q80 => 2 * TILE_K + 2 * TILE_K / QI8_0 + 4,
+            SramLayout::Q81 => 2 * TILE_K + 2 * TILE_K / QI8_1 + 4,
+            SramLayout::Q2K => 2 * TILE_K + TILE_K + 4,
+            SramLayout::Q3K => 2 * TILE_K + TILE_K / 2 + 4,
+            SramLayout::Q6K => 2 * TILE_K + TILE_K / QI6_K + TILE_K / 8 + 7,
+            SramLayout::Nvfp4 => 2 * TILE_K + TILE_K / 2 + 4,
         }
     }
 
@@ -218,11 +416,14 @@ impl MmqConfig {
             return i * self.sram_stride(mmq_type) * 4;
         }
         // [qs, dm, sc] of MMQ_DP4A_TXS_* (mmq.cuh:330-352) at tile width i, TILE_K = 32.
-        let dims = match mmq_type {
-            MmqType::Q80 | MmqType::Q50 => [i * 64 + i, i * 8 + i / 4, 0],
-            MmqType::Q4K => [i * 32 + i, i, i * 4 + i / 8],
-            MmqType::Q6K => [i * 64 + i, i + i / 32, i * 4 + i / 8],
-            MmqType::Nvfp4 => [i * 64 + i, i * 16 + i / 2, 0],
+        let dims = match mmq_type.dp4a_tile() {
+            Dp4aTile::Q40 => [i * 32 + i, i * 8 + i / 4, 0],
+            Dp4aTile::Q80 => [i * 64 + i, i * 8 + i / 4, 0],
+            Dp4aTile::Q80x16 => [i * 64 + i, i * 16 + i / 2, 0],
+            Dp4aTile::Q2K => [i * 64 + i, i * 32 + i, 0],
+            Dp4aTile::Q3K => [i * 64 + i, i, i * 4 + i / 8],
+            Dp4aTile::Q4K => [i * 32 + i, i, i * 4 + i / 8],
+            Dp4aTile::Q5K | Dp4aTile::Q6K => [i * 64 + i, i + i / 32, i * 4 + i / 8],
         };
         (dims[0] + dims[1] + dims[2]) * 4
     }

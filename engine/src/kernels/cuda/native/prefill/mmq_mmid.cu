@@ -22,6 +22,7 @@
 #include "mmq.cuh"
 #pragma GCC diagnostic pop
 
+#include "prefill/mmq_cases.cuh"
 #include "prefill/mmq_facts.h"
 
 namespace {
@@ -134,13 +135,8 @@ bool valid_build(const inference_cuda_mmq_build_ids_args *a) {
     return true;
 }
 
-/* Bytes of one block of a grouped weight type, 0 for a type with no arm. Both take qk = 256. */
-int64_t grouped_block_bytes(int64_t type) {
-    if (type == INFERENCE_CUDA_TYPE_Q4_K) {
-        return 144;
-    }
-    return type == INFERENCE_CUDA_TYPE_Q6_K ? 210 : 0;
-}
+/* Values per weight block of a grouped weight type, 0 for a type with no case. */
+int64_t block_values(int64_t type) { return mmq_block_shape((int)type).values; }
 
 /* The grouped mmq_args form of mmq_mmid.h, before any product is formed. */
 bool valid_grouped(const inference_cuda_mmq_mmid_args *a) {
@@ -150,9 +146,9 @@ bool valid_grouped(const inference_cuda_mmq_mmid_args *a) {
     const bool experts = a->nchannels_y == e && e >= 1 && e <= INFERENCE_CUDA_MMQ_MMID_MAX_EXPERTS;
     const bool picks = tokens && experts && ne / m <= INFERENCE_CUDA_MMQ_MMID_MAX_TOP_K &&
                        ne / m <= e;
-    const bool weight = grouped_block_bytes(a->type_x) != 0 && k % 256 == 0 && k >= 256 &&
-                        k <= kMaxK && a->stride_row_x == k / 256 && a->nrows_x >= 1 &&
-                        a->nrows_x <= INT_MAX;
+    const int64_t qk = block_values(a->type_x);
+    const bool weight = qk != 0 && k % 256 == 0 && k >= 256 && k <= kMaxK &&
+                        a->stride_row_x == k / qk && a->nrows_x >= 1 && a->nrows_x <= INT_MAX;
     const bool flat = a->nsamples_x == 1 && a->nsamples_y == 1 && a->stride_sample_x == 0 &&
                       a->stride_sample_y == 0 && a->stride_sample_dst == 0 &&
                       a->stride_channel_y == 0 && a->stride_channel_dst == 0;
@@ -161,7 +157,7 @@ bool valid_grouped(const inference_cuda_mmq_mmid_args *a) {
 
 /* The int limits of the vendored kernels; every product is bounded by valid_grouped first. */
 bool valid_limits(const inference_cuda_mmq_mmid_args *a) {
-    const int64_t kb = a->ncols_x / 256, n = a->nrows_x, e = a->nchannels_x;
+    const int64_t kb = a->ncols_x / block_values(a->type_x), n = a->nrows_x, e = a->nchannels_x;
     const int64_t tiles = (a->ncols_max + 7) / 8 * ((n + 127) / 128) * e;
     const int64_t stride = a->stride_channel_x;
     if (tiles > kTilesLimit || tiles * kb >= kGridLimit || stride < n * kb || stride > INT_MAX) {
@@ -182,10 +178,11 @@ struct Extent {
 /* Capacities, alignment and disjointness, after valid_limits. Extents: x, y, ids_dst,
  * expert_bounds, dst, fixup; dst is apart from all others, fixup from the first four. */
 bool valid_ranges(const inference_cuda_mmq_mmid_args *a, int nsm) {
-    const int64_t kb = a->ncols_x / 256, ne = a->ncols_dst;
+    const MmqBlockShape shape = mmq_block_shape((int)a->type_x);
+    const int64_t kb = a->ncols_x / shape.values, ne = a->ncols_dst;
     const int64_t blocks = (a->nchannels_x - 1) * a->stride_channel_x + a->nrows_x * kb;
     const Extent r[6] = {
-        {a->x, (size_t)(blocks * grouped_block_bytes(a->type_x)), a->x_bytes, 16},
+        {a->x, (size_t)(blocks * shape.bytes), a->x_bytes, 16},
         {a->y, (size_t)(a->ncols_x / 128 * ne * kQ81Block + kQ81Pad), a->y_bytes, 16},
         {a->ids_dst, (size_t)(ne + a->ncols_max + 127) * sizeof(int), a->ids_dst_bytes, 4},
         {a->expert_bounds, (size_t)(a->nchannels_x + 1) * sizeof(int), a->expert_bounds_bytes, 4},
@@ -310,10 +307,7 @@ extern "C" int inference_cuda_mmq_mmid_launch(const inference_cuda_mmq_mmid_args
         const mmq_args args = to_mmq_args(a, facts);
         const cudaStream_t s = (cudaStream_t)stream;
         Failure failure;
-        failure.record(a->type_x == INFERENCE_CUDA_TYPE_Q4_K
-                           ? mul_mat_q_case<GGML_TYPE_Q4_K>(args, s)
-                           : mul_mat_q_case<GGML_TYPE_Q6_K>(args, s),
-                       INFERENCE_CUDA_STAGE_LAUNCH);
+        failure.record(mmq_launch_case(args, s), INFERENCE_CUDA_STAGE_LAUNCH);
         report_stage(out_stage, failure.stage);
         return (int)failure.err;
     } catch (...) {

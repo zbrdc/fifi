@@ -21,6 +21,7 @@
 #include "mmq.cuh"
 #pragma GCC diagnostic pop
 
+#include "prefill/mmq_cases.cuh"
 #include "prefill/mmq_dense.h"
 #include "prefill/mmq_facts.h"
 #include "prefill/mmq_nvfp4.h"
@@ -42,24 +43,9 @@ constexpr long long kGridLimit = 1LL << 30;
 constexpr long long kQ8BlockBytes = 144;
 constexpr long long kQ8Pad = 128 * kQ8BlockBytes;
 
-/* The values and bytes per weight block of the three dense cases; 0 for every other type. */
-struct BlockShape {
-    int values;
-    int bytes;
-};
+using BlockShape = MmqBlockShape;
 
-BlockShape block_shape(int type) {
-    switch (type) {
-        case GGML_TYPE_Q8_0:
-            return {(int)ggml_cuda_type_traits<GGML_TYPE_Q8_0>::qk, (int)sizeof(block_q8_0)};
-        case GGML_TYPE_Q4_K:
-            return {(int)ggml_cuda_type_traits<GGML_TYPE_Q4_K>::qk, (int)sizeof(block_q4_K)};
-        case GGML_TYPE_Q6_K:
-            return {(int)ggml_cuda_type_traits<GGML_TYPE_Q6_K>::qk, (int)sizeof(block_q6_K)};
-        default:
-            return {0, 0};
-    }
-}
+BlockShape block_shape(int type) { return mmq_block_shape(type); }
 
 bool aligned_to(const void *p, uintptr_t a) { return ((uintptr_t)p & (a - 1)) == 0; }
 
@@ -186,16 +172,7 @@ size_t fixup_need(const inference_cuda_mmq_dense_args &a, const fifi_device_fact
 }
 
 cudaError_t launch_dense(const mmq_args &args, cudaStream_t stream) {
-    switch (args.type_x) {
-        case GGML_TYPE_Q8_0:
-            return mul_mat_q_case<GGML_TYPE_Q8_0>(args, stream);
-        case GGML_TYPE_Q4_K:
-            return mul_mat_q_case<GGML_TYPE_Q4_K>(args, stream);
-        case GGML_TYPE_Q6_K:
-            return mul_mat_q_case<GGML_TYPE_Q6_K>(args, stream);
-        default:  // unreachable behind valid_dense
-            return cudaErrorInvalidValue;
-    }
+    return mmq_launch_case(args, stream);
 }
 
 inference_cuda_mmq_args_view view_of(const mmq_args &m) {

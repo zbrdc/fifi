@@ -51,7 +51,7 @@ use crate::kernels::cuda::prefill::attn_prefill::{
     WideAttention, WideCall, WideGeometry, WideLoad,
 };
 use crate::kernels::cuda::prefill::dense_chunk_gemm::DenseChunkGemm;
-use crate::kernels::cuda::prefill::mmq_dense::has_dense_case;
+use crate::kernels::cuda::prefill::mmq_dense::takes;
 use crate::kernels::cuda::resident::add_rmsnorm_q8::AddNormQ8Call;
 use crate::kernels::cuda::resident::attn_decode_gemma::{
     AttnDecodeGemmaCall, AttnDecodeGemmaSplit,
@@ -99,13 +99,13 @@ const MMQ_MIN_ROWS: usize = 16;
 const MMQ_K_MAX: usize = FFN;
 
 /// Whether a group of projections over one activation runs on the tensor cores: the chunk is wide
-/// enough and every weight of the group rests in one type that has a dense case, since one
-/// quantized activation serves one layout.
+/// enough and every weight of the group rests in one type the dense product takes by default, since
+/// one quantized activation serves one layout.
 fn on_tensor_cores(mut types: impl Iterator<Item = QuantType>, m: usize) -> bool {
     let Some(first) = types.next() else {
         return false;
     };
-    m >= MMQ_MIN_ROWS && has_dense_case(first) && types.all(|ty| ty == first)
+    m >= MMQ_MIN_ROWS && takes(first) && types.all(|ty| ty == first)
 }
 /// The model's maximum positions: the ceiling of the planned KV cells per physical layer.
 pub(crate) const MAX_CELLS: usize = match NEMOTRON_BOLT_E4B.feed_forward {

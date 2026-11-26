@@ -76,7 +76,7 @@ SOFTWARE.
 ## ggml-cuda-mmq (llama.cpp CUDA MMQ and MMVQ kernels)
 
 - Source: https://github.com/ggml-org/llama.cpp, commit `acecd56032ddc34bada14a2d978f110d9c987095`.
-- Location: `engine/vendor/ggml-cuda-mmq/`. It holds the include closure of the MMQ instances `q4_k`, `q5_0`, `q6_k`, and `q8_0`, of `quantize.cu`, `mmid.cu`, and the MMVQ files `mmvq.cu` and `mmvq.cuh`. These files were imported byte for byte from the commit above and then patched.
+- Location: `engine/vendor/ggml-cuda-mmq/`. It holds the include closure of the MMQ instances `q4_k`, `q5_0`, `q6_k`, and `q8_0`, of `quantize.cu`, `mmid.cu`, and the MMVQ files `mmvq.cu` and `mmvq.cuh`. These files were imported byte for byte from the commit above and then patched. The MMQ instances `q4_0`, `q2_0`, `q2_k`, `q3_k`, `q5_k`, `iq1_s`, `iq2_xxs`, `iq2_xs`, `iq2_s`, `iq3_xxs`, `iq3_s`, `iq4_nl`, and `iq4_xs` were imported later from the same commit, byte for byte and unpatched; the headers already held their cases.
 - Changes: the eight patches in `engine/vendor/ggml-cuda-mmq/patches/` change the imported files:
   - `V-2-errors.patch`: return errors instead of ending the process.
   - `V-3a-backend-machinery.patch`: remove the ggml backend machinery that no kept source uses.

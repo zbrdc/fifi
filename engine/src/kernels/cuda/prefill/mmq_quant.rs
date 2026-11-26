@@ -54,16 +54,9 @@ fn rule(tag: &str, detail: &str) -> EngError {
     EngError::BadRequest(format!("mmq_quant: {tag}: {detail}"))
 }
 
-/// The `ggml_type` discriminant of `ty` (the shim values, `QuantType::ggml`'s; pinned by
-/// test against the decode side).
+/// The `ggml_type` discriminant of `ty` ([`MmqType::ggml`]).
 pub(super) fn ggml_of(ty: MmqType) -> i32 {
-    match ty {
-        MmqType::Q80 => 8,
-        MmqType::Q50 => 6,
-        MmqType::Q4K => 12,
-        MmqType::Q6K => 14,
-        MmqType::Nvfp4 => 40,
-    }
+    ty.ggml()
 }
 
 fn to_int(tag: &str, value: usize) -> Result<c_int, EngError> {

@@ -199,30 +199,10 @@ impl MmidIds<'_> {
 
 /// The `MmqType` of the `mmq_quant` entries for a weight `QuantType` (the one mapping between
 /// the launch-side weight type and the quantize-side type; the typed scatter and gather
-/// wrappers call the quantize entries through it). The four glued types map one for one, so
-/// the D4/DS4 scale layout of every q8_1 buffer follows its weight (mmq.cuh:61-101).
+/// wrappers call the quantize entries through it), so the scale layout of every q8_1 buffer
+/// follows its weight (mmq.cuh:61-101). IQ1_M has no case.
 pub(crate) fn mmq_type_of(quant: QuantType) -> Result<MmqType, EngError> {
-    match quant {
-        QuantType::Q80 => Ok(MmqType::Q80),
-        QuantType::Q50 => Ok(MmqType::Q50),
-        QuantType::Q4K => Ok(MmqType::Q4K),
-        QuantType::Q6K => Ok(MmqType::Q6K),
-        // Q5_K, Q4_0, Q3_K and IQ4_XS ride the dequantizing GEMM, never the mmq pair.
-        QuantType::Q5K => Err(rule("type", "Q5_K has no mmq case")),
-        QuantType::Q40 => Err(rule("type", "Q4_0 has no mmq case")),
-        QuantType::Q3K => Err(rule("type", "Q3_K has no mmq case")),
-        QuantType::Iq4Xs => Err(rule("type", "IQ4_XS has no mmq case")),
-        QuantType::Iq4Nl
-        | QuantType::Iq2S
-        | QuantType::Iq3Xxs
-        | QuantType::Iq2Xxs
-        | QuantType::Q20
-        | QuantType::Iq2Xs
-        | QuantType::Iq3S
-        | QuantType::Q2K
-        | QuantType::Iq1S
-        | QuantType::Iq1M => Err(rule("type", "the codebook types have no mmq case")),
-    }
+    MmqType::of(quant).ok_or_else(|| rule("type", &format!("{quant:?} has no mmq case")))
 }
 
 /// The activations of one typed quantize call. `x` holds f32 rows of `row_stride >= k` floats
@@ -484,7 +464,7 @@ pub(crate) struct MmidLaunchShape {
 }
 
 impl MmidLaunchShape {
-    /// The weight blocks of one row, `k / 256` for both glued types.
+    /// The weight blocks of one row.
     fn row_blocks(&self) -> usize {
         self.k / self.quant.block_size()
     }
@@ -506,14 +486,15 @@ impl MmidLaunchShape {
 }
 
 /// Checks every number rule of a grouped launch (`mmq_mmid.h`) in this order: the id shape, the
-/// type (Q4_K and Q6_K; a grouped Q8_0 or Q5_0 has no arm), the K grid (before any per-type rule),
+/// type (every [`MmqType`] but NVFP4, whose grouped launch is its own), the K grid (before any
+/// per-type rule),
 /// K's range, N, ld, the stream-k grid limit bounded with J = 8, the stride (whole blocks, at least
 /// one matrix, an `int`), and the `int` weight and dst indexes. Each bound keeps every product
 /// below 2^56, so the sums cannot overflow.
 pub(crate) fn check_launch_shape(s: &MmidLaunchShape) -> Result<(), EngError> {
     check_ids_shape(&s.ids)?;
-    if !matches!(s.quant, QuantType::Q4K | QuantType::Q6K) {
-        let detail = format!("a grouped {:?} launch has no glued arm", s.quant);
+    if MmqType::of(s.quant).is_none() {
+        let detail = format!("a grouped {:?} launch has no vendored case", s.quant);
         return Err(rule("type", &detail));
     }
     if !s.k.is_multiple_of(K_GRID) {

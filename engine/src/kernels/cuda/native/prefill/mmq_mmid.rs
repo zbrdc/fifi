@@ -27,7 +27,7 @@ use std::mem::{offset_of, size_of};
 
 use super::{DeviceFailure, RawRange, RawStream, STAGE_NONE, Span, checked, invalid_argument};
 use crate::kernels::cuda::prefill::mmq_size::{
-    expert_bounds_ints, fixup_floats_max, ids_dst_ints, q8_1_bytes,
+    MmqType, expert_bounds_ints, fixup_floats_max, ids_dst_ints, q8_1_bytes,
 };
 
 /// Mirror of `inference_cuda_mmq_ids_guard_args` in `mmq_mmid.h`, field for field.
@@ -317,11 +317,12 @@ pub(in crate::kernels::cuda) struct MmidLaunchRaw<'a> {
 /// dst, fixup, from the geometry by the rules of `mmq_mmid.h`.
 fn launch_needs(g: &MmidGeometry, nsm: c_int) -> Option<[usize; 6]> {
     let int = |value: i64| usize::try_from(value).ok();
-    let block = match g.type_x {
-        12 => 144,
-        14 => 210,
-        _ => return None,
-    };
+    // The block bytes of the weight type: every [`MmqType`] with a native weight.
+    let block = MmqType::ALL
+        .into_iter()
+        .find(|ty| i64::from(ty.ggml()) == g.type_x)
+        .and_then(MmqType::quant)?
+        .block_bytes();
     let (n, e, ne, m) = (
         int(g.nrows_x)?,
         int(g.nchannels_x)?,

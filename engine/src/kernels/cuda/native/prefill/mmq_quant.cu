@@ -16,6 +16,7 @@
 #pragma GCC diagnostic pop
 
 #include "prefill/mmq_quant.h"
+#include "prefill/mmq_types.h"
 
 namespace {
 
@@ -124,12 +125,19 @@ bool k_ok(int k, int row_stride) {
            row_stride % 4 == 0 && row_stride <= kStrideMax;
 }
 
-/* Only the types the glue serves reach the vendored switch — the wrapper's MmqType is exactly
- * these, and no other int is ever cast to ggml_type. Each one has a q8_1 ds layout
- * (mmq.cuh:61-101), so the vendored default refusal stays dead. */
+/* Only the types the glue serves reach the vendored switch: the list of prefill/mmq_types.h and
+ * NVFP4, which the wrapper's MmqType names exactly, so no other int is ever cast to ggml_type.
+ * Each one has a q8_1 ds layout (mmq.cuh:61-101), so the vendored default refusal stays dead. */
 bool served_type(int type) {
-    return type == 8 /* Q8_0 */ || type == 6 /* Q5_0 */ || type == 12 /* Q4_K */ ||
-           type == 14 /* Q6_K */ || type == 40 /* NVFP4 */;
+    switch (type) {
+#define INFERENCE_CUDA_MMQ_SERVED(T, B) case T:
+        INFERENCE_CUDA_MMQ_TYPES(INFERENCE_CUDA_MMQ_SERVED)
+#undef INFERENCE_CUDA_MMQ_SERVED
+        case GGML_TYPE_NVFP4:
+            return true;
+        default:
+            return false;
+    }
 }
 
 /* The wrapper mirrors every rule here, so the native entry cannot return INVALID_ARGUMENT

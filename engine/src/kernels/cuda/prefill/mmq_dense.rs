@@ -1,5 +1,5 @@
 //! The dense MMQ GEMM wrapper: [`CudaContext::mmq_dense`] queues one launch of
-//! `native/prefill/mmq_dense.cu`, which calls the vendored `mul_mat_q_case<Q8_0|Q4_K|Q6_K>`
+//! `native/prefill/mmq_dense.cu`, which calls the vendored `mul_mat_q_case` of the weight's type
 //! (mmq.cuh) on a Native weight and the q8_1 columns of `mmq_quant`, and writes
 //! `dst[j * ld + col_off + i]` for `i < n`, `j < m`. It allocates nothing, copies nothing and never
 //! synchronizes. The shape rules below are mirrored by the C entry so a native call can never be
@@ -9,9 +9,10 @@
 //! writes and reads back: two launches on different streams must not share one, and the wrapper
 //! requires the device maximum ([`CudaContext::mmq_fixup_bytes`]).
 //!
-//! Every refusal is a `BadRequest` tagged `mmq_dense: <rule>`, in this order: the weight type (Q5_0
-//! has no dense case), the K grid (`K % 256`, before any other k rule so K = 384 reaches this tag
-//! for every type; it also implies `K % qk` for the three cases, so no separate qk rule exists),
+//! Every refusal is a `BadRequest` tagged `mmq_dense: <rule>`, in this order: the weight type
+//! (IQ1_M has no case), the K grid (`K % 256`, before any other k rule so K = 384 reaches this tag
+//! for every type; every block size divides 256, so it implies `K % qk` and no separate qk rule
+//! exists),
 //! the k extent, the column count `M` (the 2,048 chunk cap, `mmq_size`'s `NCOLS_LIMIT`), the row
 //! count, the destination stride, the `2^30` tile-grid limit of the vendored launch (mmq.cuh:1402),
 //! bounded with the smallest tile width J = 8 because the launch picks J, the conversions to the C
@@ -106,11 +107,6 @@ pub(crate) fn check_dense_rules(
     check_dense_mmq_rules(mmq_type_of(ty)?, k, n, m, ld, col_off)
 }
 
-/// Whether the dense GEMM has a case for `ty`: the types whose weights it reads.
-pub(crate) fn has_dense_case(ty: QuantType) -> bool {
-    mmq_type_of(ty).is_ok()
-}
-
 pub(super) fn check_dense_mmq_rules(
     ty: MmqType,
     k: usize,
@@ -119,9 +115,6 @@ pub(super) fn check_dense_mmq_rules(
     ld: usize,
     col_off: usize,
 ) -> Result<DenseInts, EngError> {
-    if ty == MmqType::Q50 {
-        return Err(rule("type", "Q5_0 has no dense case"));
-    }
     if !k.is_multiple_of(K_GRID) {
         return Err(rule(
             "K-grid",
@@ -149,12 +142,7 @@ pub(super) fn check_dense_mmq_rules(
             &format!("ld is {ld}, below col_off {col_off} + n {n}"),
         ));
     }
-    let qk = match ty {
-        MmqType::Q80 | MmqType::Q50 => 32,
-        MmqType::Q4K | MmqType::Q6K => 256,
-        MmqType::Nvfp4 => 64,
-    };
-    check_grid(qk, k, n, m)?;
+    check_grid(ty.block_values(), k, n, m)?;
     let m_int = to_int("m", m)?;
     let cols_hint = match dense_cols_hint() {
         // The C side clamps the same way; keep the mirror in step so checks and launch agree.
@@ -245,35 +233,19 @@ pub(crate) struct MmqDenseInputCall<'b> {
     pub(crate) y: DeviceRange<'b>,
 }
 
-/// Whether the dense product has a case for weights of type `ty`.
+/// Whether a family's projections over weights of type `ty` take the dense product by default:
+/// the types whose products were measured against the exact projections of a served family
+/// (Q8_0, Q4_K and Q6_K). The dense product takes every [`MmqType`] where a caller asks for it;
+/// a type joins this set when the same measurement adds it.
 pub(crate) fn takes(ty: QuantType) -> bool {
-    mmq_type_of(ty).is_ok()
+    matches!(ty, QuantType::Q80 | QuantType::Q4K | QuantType::Q6K)
 }
 
-/// The q8_1 scale layout (D4 or DS4) follows the weight type of the GEMM that reads the
-/// buffer; a mismatch gives wrong values, not a fault. This is the one place the dense path
-/// derives it, from the weight itself.
+/// The q8_1 scale layout follows the weight type of the GEMM that reads the buffer; a mismatch
+/// gives wrong values, not a fault. This is the one place the dense path derives it, from the
+/// weight itself.
 fn mmq_type_of(ty: QuantType) -> Result<MmqType, EngError> {
-    match ty {
-        QuantType::Q80 => Ok(MmqType::Q80),
-        QuantType::Q4K => Ok(MmqType::Q4K),
-        QuantType::Q6K => Ok(MmqType::Q6K),
-        QuantType::Q50 => Err(rule("type", "Q5_0 has no dense case")),
-        QuantType::Q5K => Err(rule("type", "Q5_K has no dense case")),
-        QuantType::Q40 => Err(rule("type", "Q4_0 has no dense case")),
-        QuantType::Q3K => Err(rule("type", "Q3_K has no dense case")),
-        QuantType::Iq4Xs => Err(rule("type", "IQ4_XS has no dense case")),
-        QuantType::Iq4Nl
-        | QuantType::Iq2S
-        | QuantType::Iq3Xxs
-        | QuantType::Iq2Xxs
-        | QuantType::Q20
-        | QuantType::Iq2Xs
-        | QuantType::Iq3S
-        | QuantType::Q2K
-        | QuantType::Iq1S
-        | QuantType::Iq1M => Err(rule("type", "the codebook types have no dense case")),
-    }
+    MmqType::of(ty).ok_or_else(|| rule("type", &format!("{ty:?} has no dense case")))
 }
 
 /// One dense GEMM: `dst[j * ld + col_off + i] = sum_k w[i][k] * x[j][k]` for `i < n`,

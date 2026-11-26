@@ -29,6 +29,7 @@ use super::{MmidArgsRaw, MmidGeometry, launch_needs, mmq_mmid_launch_raw};
 use crate::EngError;
 use crate::kernels::cuda::native::STATUS_INVALID_ARGUMENT;
 use crate::kernels::cuda::prefill::mmq_mmid::tests::device_facts;
+use crate::kernels::cuda::prefill::mmq_size::MmqType;
 use crate::kernels::cuda::testkit;
 use crate::kernels::cuda::{CudaContext, DeviceBuffer, DeviceStream};
 use crate::weights::GgufType;
@@ -456,4 +457,29 @@ fn mmq_mmid_pipe_arm_is_bit_identical() {
             out0.len()
         );
     }
+}
+
+#[test]
+fn the_launch_sizes_take_every_mmq_type_with_a_native_weight() {
+    // The Rust sizing before the C entry must know every weight type the C side serves, or a
+    // served type is refused with an invalid argument that stops the backend. The base
+    // geometry's K of 256 is a whole block of every type.
+    for ty in MmqType::ALL {
+        let g = MmidGeometry {
+            type_x: i64::from(ty.ggml()),
+            ..BASE
+        };
+        let needs = launch_needs(&g, 82);
+        match ty.quant() {
+            Some(quant) => {
+                let blocks = (BASE.nchannels_x - 1) * BASE.stride_channel_x
+                    + BASE.nrows_x * BASE.stride_row_x;
+                let x = usize::try_from(blocks).unwrap() * quant.block_bytes();
+                assert_eq!(needs.map(|n| n[X]), Some(x), "{ty:?}");
+            }
+            None => assert!(needs.is_none(), "{ty:?}"),
+        }
+    }
+    let unknown = MmidGeometry { type_x: -1, ..BASE };
+    assert!(launch_needs(&unknown, 82).is_none());
 }
