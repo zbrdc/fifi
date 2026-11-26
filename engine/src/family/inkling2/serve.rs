@@ -191,7 +191,7 @@ fn cuda_forward(_forward: CpuForward, _host_reserve: u64) -> Result<CpuForward, 
 /// them; the host memory plan admits fewer when the state does not fit.
 const CUDA_PREFILL_ROWS: usize = 512;
 
-fn prefill_rows(backend: TextBackend) -> Result<usize, EngError> {
+pub(super) fn prefill_rows(backend: TextBackend) -> Result<usize, EngError> {
     const NAME: &str = "FIFI_INKLING_CUDA_PREFILL_ROWS";
     if backend != TextBackend::Cuda {
         return Ok(1);

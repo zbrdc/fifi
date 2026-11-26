@@ -22,6 +22,8 @@ mod depth_mix;
 mod prefill;
 #[cfg(all(feature = "native-cuda", target_os = "linux"))]
 mod prompt_streams;
+#[cfg(all(test, feature = "native-cuda", target_os = "linux"))]
+mod quality_run;
 #[cfg(all(feature = "native-cuda", target_os = "linux"))]
 mod resident_visit;
 mod window;

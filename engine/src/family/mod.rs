@@ -170,6 +170,9 @@ pub(in crate::family) mod state_words;
 )]
 pub(in crate::family) mod stored;
 pub(crate) mod switch_table;
+/// Qualification only: the quality legs of every family score a fixed stream through it.
+#[cfg(test)]
+pub(crate) mod teacher_forced;
 pub mod tier_budget;
 pub(crate) mod tiered_classify;
 /// Qualification only: the device harnesses and the offline verdict are tests.
