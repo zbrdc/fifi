@@ -19,8 +19,8 @@ use crate::kernels::cuda::resident::matvec_q::QuantType;
 use std::{marker::PhantomData, rc::Rc, sync::atomic::Ordering};
 
 use super::{
-    BlockReader, CudaContext, DeviceBuffer, DeviceEvent, DeviceStream, PinnedBuf, QuantTensor,
-    host_source,
+    BlockReader, CudaContext, DeviceBuffer, DeviceEvent, DeviceRange, DeviceStream, PinnedBuf,
+    QuantTensor, host_source,
 };
 
 /// Two page-locked staging buffers, a stream and one event per buffer: the file read of the
@@ -399,8 +399,12 @@ pub(crate) trait NativeBlocks {
     fn k(&self) -> usize;
     /// Rows: output values per token.
     fn n_rows(&self) -> usize;
-    /// The device blocks, row after row from the buffer start.
+    /// The buffer of the device blocks, row after row from [`Self::offset`].
     fn buffer(&self) -> &DeviceBuffer;
+    /// The byte offset of the first row in [`Self::buffer`].
+    fn offset(&self) -> usize {
+        0
+    }
 }
 
 impl NativeBlocks for NativeWeight {
@@ -423,30 +427,32 @@ impl NativeBlocks for NativeWeight {
 #[derive(Clone, Copy)]
 pub(crate) struct BorrowedNativeWeight<'a> {
     buffer: &'a DeviceBuffer,
+    offset: usize,
     quant: QuantType,
     k: usize,
     n_rows: usize,
 }
 
 impl<'a> BorrowedNativeWeight<'a> {
-    /// The first `n_rows` rows of `k` values of `quant` at the start of `buffer`, which must
-    /// hold at least their bytes.
+    /// The first `n_rows` rows of `k` values of `quant` at the start of `codes`, which must hold
+    /// at least their bytes.
     pub(crate) fn new(
-        buffer: &'a DeviceBuffer,
+        codes: DeviceRange<'a>,
         quant: QuantType,
         k: usize,
         n_rows: usize,
     ) -> Result<Self, EngError> {
         match quant.weight_bytes(n_rows, k) {
-            Some(want) if want <= buffer.bytes() => Ok(Self {
-                buffer,
+            Some(want) if want <= codes.bytes() => Ok(Self {
+                buffer: codes.buffer(),
+                offset: codes.offset(),
                 quant,
                 k,
                 n_rows,
             }),
             want => Err(EngError::BadRequest(format!(
-                "a native weight of {n_rows} rows of {k} values holds {want:?} bytes, the buffer has {}",
-                buffer.bytes()
+                "a native weight of {n_rows} rows of {k} values holds {want:?} bytes, the range has {}",
+                codes.bytes()
             ))),
         }
     }
@@ -464,6 +470,9 @@ impl NativeBlocks for BorrowedNativeWeight<'_> {
     }
     fn buffer(&self) -> &DeviceBuffer {
         self.buffer
+    }
+    fn offset(&self) -> usize {
+        self.offset
     }
 }
 

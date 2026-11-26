@@ -111,14 +111,16 @@ impl PlaneGemm {
     /// has a case for its type and shape over `m` rows and the rows at `x` are whole 16-byte
     /// copies.
     pub(crate) fn weight<'a>(
-        codes: &'a DeviceBuffer,
+        codes: DeviceRange<'a>,
         ty: GgufType,
         [rows, cols]: [usize; 2],
         (m, x, ld_x): (usize, &DeviceRange<'_>, usize),
         ld_y: usize,
     ) -> Option<BorrowedNativeWeight<'a>> {
         let quant = QuantType::from_gguf(ty).filter(|&quant| takes(quant))?;
-        let aligned = x.offset().is_multiple_of(16) && ld_x.is_multiple_of(4);
+        let aligned = codes.offset().is_multiple_of(16)
+            && x.offset().is_multiple_of(16)
+            && ld_x.is_multiple_of(4);
         if !aligned || check_dense_rules(quant, cols, rows, m, ld_y, 0).is_err() {
             return None;
         }

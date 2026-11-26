@@ -6,7 +6,6 @@ use super::{
 };
 use crate::{
     EngError,
-    family::inkling2::cuda_projection::q8_row_reuse,
     kernels::cuda::{CudaContext, DeviceRange, resident::inkling_controller::Arithmetic},
 };
 
@@ -370,7 +369,7 @@ impl DenseStep {
             ([plan.hidden, 3 * plan.m], eps),
             arithmetic,
         )?;
-        q8_row_reuse::project_group(context, &self.stream, &plan.projections, "controlled_qkv")
+        self.project_prompt_group(context, &plan.projections, Some("controlled_qkv"))
     }
 
     fn capture_first_controller_tile(&self, rows: usize, hidden: usize) -> Result<(), EngError> {
@@ -458,7 +457,7 @@ impl DenseStep {
         let values = self.run_rows(context, &self.stream, &staged, [upload, readback], || {
             context.dense_gemv_group(&self.stream, &control)?;
             context.inkling_controller_norm(&self.stream, workspace, health, (hidden, eps))?;
-            context.dense_gemv_group(&self.stream, &projections)
+            self.project_prompt_group(context, &projections, None)
         })?;
         Ok(Some(split_projections(values.into_iter().skip(3), weights)))
     }

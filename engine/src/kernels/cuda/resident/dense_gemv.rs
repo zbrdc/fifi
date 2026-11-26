@@ -59,6 +59,7 @@ impl DenseGemvShape {
 
 /// One launch: `w` `[rows][cols]` of `dtype` and `x` f32 are read; `y` f32 is written, element
 /// `[t][r]` at `t * ld_y + r`, and no other element of it is touched.
+#[derive(Clone, Copy)]
 pub(crate) struct DenseGemvCall<'b> {
     pub(crate) shape: DenseGemvShape,
     pub(crate) dtype: DenseDtype,

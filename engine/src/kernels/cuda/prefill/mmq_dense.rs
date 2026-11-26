@@ -347,6 +347,7 @@ impl CudaContext {
             .ok_or_else(|| rule("size overflow", "a range size overflows"))?;
         let w_start = w_off
             .checked_mul(row_bytes)
+            .and_then(|start| start.checked_add(call.weight.offset()))
             .ok_or_else(|| rule("size overflow", "a range size overflows"))?;
         let w = call.weight.buffer().range(w_start, need.w)?;
         require_fit("weight", &w, need.w, 16)?;

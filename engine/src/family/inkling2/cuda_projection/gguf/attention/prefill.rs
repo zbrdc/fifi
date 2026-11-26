@@ -950,16 +950,18 @@ impl ResidentAttention {
                     Some(dest) => dest.raw,
                     None => work.device.range(out_at, count * layout.output)?,
                 };
-                q8_row_reuse::project_output(
+                q8_row_reuse::project_prompt(
                     context,
                     &self.stream,
-                    DenseGemvCall {
+                    &self.tensor_core,
+                    &[DenseGemvCall {
                         shape: DenseGemvShape::packed(count, p.rows, layout.attention / 4),
                         dtype: p.dtype,
                         w: p.weight,
                         x: work.device.range(attention_at, count * layout.attention)?,
                         y,
-                    },
+                    }],
+                    q8_row_reuse::Exact::Output,
                 )?;
             }
             if let Some(dest) = destination

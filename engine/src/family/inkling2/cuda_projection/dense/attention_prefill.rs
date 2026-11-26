@@ -6,12 +6,8 @@ use super::{
 };
 use crate::{
     EngError,
-    family::inkling2::{cuda_projection::q8_row_reuse, switches::Switch},
-    kernels::cuda::{
-        CudaContext, DeviceBuffer, DeviceRange, DeviceStream,
-        prefill::dense_chunk_gemm::{PlaneGemm, PlaneProjection},
-        resident::dense_gemv::DenseDtype,
-    },
+    family::inkling2::cuda_projection::q8_row_reuse,
+    kernels::cuda::{CudaContext, DeviceBuffer, DeviceRange, DeviceStream},
 };
 
 fn finish_borrowed<T>(
@@ -224,6 +220,18 @@ impl DenseStep {
         Ok(Some(rows))
     }
 
+    /// Queues a group of prompt projections through [`q8_row_reuse::project_prompt`], the
+    /// exact calls with the Q8 row reuse of `stage` when one is named.
+    pub(super) fn project_prompt_group(
+        &self,
+        context: &CudaContext,
+        calls: &[DenseGemvCall<'_>],
+        stage: Option<&str>,
+    ) -> Result<(), EngError> {
+        let exact = stage.map_or(q8_row_reuse::Exact::Plain, q8_row_reuse::Exact::Reuse);
+        q8_row_reuse::project_prompt(context, &self.stream, &self.tensor_core, calls, exact)
+    }
+
     fn projection_tile_capacity<const N: usize>(
         &self,
         layout: &Layout<N>,
@@ -286,9 +294,7 @@ impl DenseStep {
         let side = (ld_side > 0)
             .then(|| range(side_at, m * ld_side))
             .transpose()?;
-        let tensor_core = Switch::PrefillTensorCoreProjections.on();
         let mut calls = Vec::with_capacity(N);
-        let mut tensor_calls = Vec::new();
         for (i, p) in weights
             .into_iter()
             .enumerate()
@@ -314,51 +320,23 @@ impl DenseStep {
                 Source::Host(_) => range(input_offset, need.x / size_of::<f32>())?,
                 Source::Device(x, _) => x.slice(float_bytes(input_offset)?, need.x)?,
             };
-            let y = range(output_offset, need.y / size_of::<f32>())?;
-            let packed = match p.dtype {
-                DenseDtype::PackedGguf(ty) if tensor_core => Some(ty),
-                _ => None,
-            };
-            match packed.and_then(|ty| {
-                PlaneGemm::weight(&p.weight.codes, ty, [rows, cols], (m, &x, ld_x), ld_y)
-            }) {
-                Some(weight) => tensor_calls.push(PlaneProjection {
-                    weight,
-                    plane: p.input,
-                    x,
-                    y,
-                    ld_x,
-                    ld_y,
-                }),
-                None => calls.push(DenseGemvCall {
-                    shape,
-                    dtype: p.dtype,
-                    w: p.weight.codes.range(0, need.w)?,
-                    x,
-                    y,
-                }),
-            }
+            calls.push(DenseGemvCall {
+                shape,
+                dtype: p.dtype,
+                w: p.weight.codes.range(0, need.w)?,
+                x,
+                y: range(output_offset, need.y / size_of::<f32>())?,
+            });
         }
         let project = || {
-            if !tensor_calls.is_empty() {
-                self.tensor_core
-                    .borrow_mut()
-                    .project(context, &self.stream, &tensor_calls, m)?;
-                static USED: std::sync::Once = std::sync::Once::new();
-                USED.call_once(|| eprintln!("Inkling CUDA used tensor-core prompt projections"));
-            }
-            if calls.is_empty() {
-                Ok(())
-            } else if allow_q8_row_reuse {
-                let stage = if layout.side.iter().any(|&n| n > 0) {
+            let stage = allow_q8_row_reuse.then(|| {
+                if layout.side.iter().any(|&n| n > 0) {
                     "qkv_sidecar"
                 } else {
                     "qkv"
-                };
-                q8_row_reuse::project_group(context, &self.stream, &calls, stage)
-            } else {
-                context.dense_gemv_group(&self.stream, &calls)
-            }
+                }
+            });
+            self.project_prompt_group(context, &calls, stage)
         };
         let values = match (source, scratch) {
             (Source::Device(..), _) => project_and_read(&self.stream, project, output)?,

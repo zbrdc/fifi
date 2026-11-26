@@ -114,6 +114,8 @@ pub(in crate::family::inkling2) struct ResidentAttention {
     prefill: RefCell<Option<prefill::Workspace>>,
     local_aux: RefCell<Option<local::AuxStore>>,
     resident: RefCell<Option<local::ResidentWorkspace>>,
+    /// The MMQ GEMM state of prompt output projections.
+    tensor_core: RefCell<crate::kernels::cuda::prefill::dense_chunk_gemm::PlaneGemm>,
 }
 
 struct Runtime {
@@ -281,6 +283,7 @@ impl Plan {
             prefill: RefCell::default(),
             local_aux: RefCell::default(),
             resident: RefCell::default(),
+            tensor_core: RefCell::default(),
             state: RefCell::new(Runtime {
                 transfer,
                 encoded: Vec::with_capacity(self.scratch_bytes),

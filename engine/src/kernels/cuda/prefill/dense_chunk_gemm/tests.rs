@@ -187,12 +187,13 @@ fn the_plane_gemm_matches_the_chunk_gemm_bit_for_bit() {
             .range(256 * 4, ((m - 1) * ld_x + k) * 4)
             .expect("plane");
         let y = got.range(0, ((m - 1) * ld_y + rows) * 4).expect("y");
-        let weight = PlaneGemm::weight(&codes, gguf, [rows, k], (m, &x_plane, ld_x), ld_y)
+        let whole = codes.range(0, codes.bytes()).expect("codes");
+        let weight = PlaneGemm::weight(whole, gguf, [rows, k], (m, &x_plane, ld_x), ld_y)
             .expect("the gemm takes the weight");
         let off_grid = packed_dev
             .range(4, ((m - 1) * ld_x + k) * 4)
             .expect("off grid");
-        assert!(PlaneGemm::weight(&codes, gguf, [rows, k], (m, &off_grid, ld_x), ld_y).is_none());
+        assert!(PlaneGemm::weight(whole, gguf, [rows, k], (m, &off_grid, ld_x), ld_y).is_none());
         let call = PlaneProjection {
             weight,
             plane: 1,
