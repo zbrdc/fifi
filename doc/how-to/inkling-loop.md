@@ -35,6 +35,8 @@ Both backends map the original packed weights from disk and decode or upload onl
 
 During grouped prompt prefill with `FIFI_INKLING_CUDA_BATCH_ROUTER` and `FIFI_INKLING_CUDA_DEVICE_EXPERT_PREFILL`, `FIFI_INKLING_CUDA_PREFILL_ROUTER_INPUT_REUSE` (on by default; `=0` turns it off) gathers resident expert inputs directly from the batched router's device input. This skips one hidden-row upload per token when the complete batch fits the existing packed expert weight stage. Router tiles write consecutive rows there; each expert window gathers from its corresponding slice. Routing logits still return to the host for the usual selection, observation and expert scheduling. It does not apply to cold layers or speculative execution. The device expert profile reports `router_input_h2d_bytes_saved` per visit; zero means the ordinary input upload ran.
 
+`FIFI_INKLING_CUDA_PREFILL_TENSOR_CORE_PROJECTIONS=1` runs the attention projections of a prompt prefill on the shared tensor-core GEMM: each activation plane is quantized to 8 bits once, then each Q8_0, Q4_K or Q6_K weight runs one GEMM. Other weight types keep the exact kernels. The output is not bit-identical to the default path, so the switch is off until it passes the quality gate.
+
 `FIFI_INKLING_CUDA_ALLOC_CACHE` is on by default. The CUDA backend reuses freed device buffers of the same size, and during a prompt prefill it also keeps the prompt-sized buffers between layer visits, so a visit does not allocate and free them again; they are freed when the prefill ends. `=0` turns it off.
 
 `FIFI_INKLING_CUDA_DIRECT_RESIDENT` is on by default. It keeps original GGUF NVFP4 blocks in VRAM and uses the direct CUDA kernel for those expert banks; `=0` turns it off.

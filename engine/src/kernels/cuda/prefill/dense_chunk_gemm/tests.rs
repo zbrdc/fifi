@@ -118,3 +118,104 @@ fn the_gemm_matches_the_invariant_matvec_at_the_bolt_shapes() {
         }
     }
 }
+
+/// The plane gemm over a weight in another owner's buffer gives the bits of the chunk gemm over
+/// the same native blocks, for a plane at an offset in packed rows and a strided output, and
+/// refuses a plane off the 16-byte grid.
+#[test]
+fn the_plane_gemm_matches_the_chunk_gemm_bit_for_bit() {
+    if !testkit::device_present("the_plane_gemm_matches_the_chunk_gemm_bit_for_bit") {
+        return;
+    }
+    let ctx = CudaContext::new().expect("context");
+    let stream = ctx.stream().expect("stream");
+    let mut rng = testkit::Rng::new(11);
+    let mut planes = PlaneGemm::default();
+    for (ty, gguf, rows, k, m) in [
+        (QuantType::Q80, GgufType::Q80, 3072usize, 2304usize, 64usize),
+        (QuantType::Q6K, GgufType::Q6K, 1024, 2304, 63),
+        (QuantType::Q80, GgufType::Q80, 2304, 3072, 128),
+    ] {
+        let gemm = DenseChunkGemm::new(&ctx, k, m).expect("scratch");
+        let w_bytes = reference::build_weight(ty, rows, k, &mut rng);
+        let owned = ctx
+            .upload_native(
+                QuantTensor {
+                    name: "test",
+                    ty: gguf,
+                    n_rows: rows,
+                    k,
+                    source_len: w_bytes.len(),
+                },
+                1 << 20,
+                &mut |at, part| {
+                    part.copy_from_slice(&w_bytes[at..at + part.len()]);
+                    Ok(())
+                },
+            )
+            .expect("native weight");
+        let codes = testkit::upload_bytes(&ctx, &w_bytes);
+        let x: Vec<f32> = (0..m * k).map(|_| (rng.normal() as f32) * 0.5).collect();
+        // Packed rows: a plane of 256 other values, then the projected plane.
+        let ld_x = k + 256;
+        let packed: Vec<f32> = x
+            .chunks_exact(k)
+            .flat_map(|row| std::iter::repeat_n(9.0, 256).chain(row.iter().copied()))
+            .collect();
+        let x_dev = testkit::upload_f32(&ctx, &x);
+        let packed_dev = testkit::upload_f32(&ctx, &packed);
+        gemm.input(
+            &ctx,
+            &stream,
+            &owned,
+            x_dev.range(0, m * k * 4).expect("x"),
+            m,
+        )
+        .expect("input");
+        let want = testkit::upload_filled(&ctx, 0, m * rows * 4);
+        gemm.project(
+            &ctx,
+            &stream,
+            &owned,
+            m,
+            want.range(0, m * rows * 4).expect("want"),
+        )
+        .expect("project");
+        let ld_y = rows + 5;
+        let got = testkit::upload_filled(&ctx, 0x7f, m * ld_y * 4);
+        let x_plane = packed_dev
+            .range(256 * 4, ((m - 1) * ld_x + k) * 4)
+            .expect("plane");
+        let y = got.range(0, ((m - 1) * ld_y + rows) * 4).expect("y");
+        let weight = PlaneGemm::weight(&codes, gguf, [rows, k], (m, &x_plane, ld_x), ld_y)
+            .expect("the gemm takes the weight");
+        let off_grid = packed_dev
+            .range(4, ((m - 1) * ld_x + k) * 4)
+            .expect("off grid");
+        assert!(PlaneGemm::weight(&codes, gguf, [rows, k], (m, &off_grid, ld_x), ld_y).is_none());
+        let call = PlaneProjection {
+            weight,
+            plane: 1,
+            x: x_plane,
+            y,
+            ld_x,
+            ld_y,
+        };
+        planes
+            .project(&ctx, &stream, &[call], m)
+            .expect("plane project");
+        stream.synchronize().expect("drain");
+        let want = testkit::read_bytes(&ctx, &want, m * rows * 4);
+        let got = testkit::read_bytes(&ctx, &got, m * ld_y * 4);
+        for (j, row) in got.chunks_exact(ld_y * 4).enumerate() {
+            assert!(
+                row[..rows * 4] == want[j * rows * 4..(j + 1) * rows * 4],
+                "{ty:?} rows {rows} k {k} m {m}: row {j} differs"
+            );
+            assert!(
+                row[rows * 4..].iter().all(|&b| b == 0x7f),
+                "row {j} padding"
+            );
+        }
+    }
+}

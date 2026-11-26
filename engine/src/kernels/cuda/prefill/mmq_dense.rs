@@ -23,7 +23,6 @@
 use std::ffi::c_int;
 
 use crate::EngError;
-use crate::kernels::cuda::NativeWeight;
 use crate::kernels::cuda::context::{
     Claim, CudaContext, DeviceRange, DeviceStream, require_apart, require_fit,
 };
@@ -31,6 +30,7 @@ use crate::kernels::cuda::native::prefill::mmq_dense::{MmqDenseRaw, mmq_dense_la
 use crate::kernels::cuda::prefill::mmq_quant::MmqQuantizeCall;
 use crate::kernels::cuda::prefill::mmq_size::{MmqType, NCOLS_LIMIT, q8_1_bytes};
 use crate::kernels::cuda::resident::matvec_q::QuantType;
+use crate::kernels::cuda::{NativeBlocks, NativeWeight};
 
 /// The MMQ k grid: the k loop reads 256 values per iteration with no k clamp (mmq.cuh:856).
 const K_GRID: usize = 256;
@@ -224,9 +224,9 @@ pub(crate) fn dense_needs(
 /// The input of a dense GEMM: `m` activation rows of the weight's `k` values, read from `x`
 /// (f32, `row_stride` floats apart), quantized into the q8_1 columns `y` that
 /// [`MmqDenseCall::q8_1`] takes.
-pub(crate) struct MmqDenseInputCall<'b> {
+pub(crate) struct MmqDenseInputCall<'b, W: ?Sized = NativeWeight> {
     pub(crate) packing: crate::kernels::cuda::prefill::mmq_quant::MmqPacking,
-    pub(crate) weight: &'b NativeWeight,
+    pub(crate) weight: &'b W,
     pub(crate) m: usize,
     pub(crate) row_stride: usize,
     pub(crate) x: DeviceRange<'b>,
@@ -252,8 +252,8 @@ fn mmq_type_of(ty: QuantType) -> Result<MmqType, EngError> {
 /// `j < m`. The weight carries its own type, `k` and row count, so a call can never
 /// disagree with the blocks it reads; `q8_1` holds the `mmq_quantize` columns of the same
 /// type's scale layout, `fixup` the stream-k fixup range.
-pub(crate) struct MmqDenseCall<'b> {
-    pub(crate) weight: &'b NativeWeight,
+pub(crate) struct MmqDenseCall<'b, W: ?Sized = NativeWeight> {
+    pub(crate) weight: &'b W,
     /// An optional `(row_offset, rows)` SEGMENT of `weight` instead of its whole row
     /// extent. Segmented calls exist so a wide fused upload can back several launches of
     /// the exact per-segment shapes: the vendored MMQ picks its stream-k schedule from
@@ -275,10 +275,10 @@ impl CudaContext {
     /// is its own, so the input cannot disagree with the GEMM that consumes it. Every
     /// refusal of `mmq_quantize` applies (the K grid, the chunk cap, the capacity of `y` with
     /// the q8_1 pad, alignment, overlap).
-    pub(crate) fn mmq_dense_input(
+    pub(crate) fn mmq_dense_input<W: NativeBlocks + ?Sized>(
         &self,
         stream: &DeviceStream,
-        call: MmqDenseInputCall<'_>,
+        call: MmqDenseInputCall<'_, W>,
     ) -> Result<(), EngError> {
         self.mmq_quantize(
             stream,
@@ -299,10 +299,10 @@ impl CudaContext {
     /// `m` destination columns from `col_off`. The destination holds valid values after the
     /// stream drained. Every refusal of the module doc (shape, fit, alignment, overlap,
     /// fixup floor, foreign buffer or stream) happens here before any native call.
-    pub(crate) fn mmq_dense(
+    pub(crate) fn mmq_dense<W: NativeBlocks + ?Sized>(
         &self,
         stream: &DeviceStream,
-        call: MmqDenseCall<'_>,
+        call: MmqDenseCall<'_, W>,
     ) -> Result<(), EngError> {
         let fixup_floor = self.mmq_fixup_bytes()?;
         self.launch_dense(stream, call, fixup_floor)
@@ -313,10 +313,10 @@ impl CudaContext {
     /// range below the launch's exact need then meets the C entry's own refusal (an invalid
     /// argument, status -1), not the vendored fixup require (mmq.cuh:1409), which stays as the
     /// backstop behind it.
-    fn launch_dense(
+    fn launch_dense<W: NativeBlocks + ?Sized>(
         &self,
         stream: &DeviceStream,
-        call: MmqDenseCall<'_>,
+        call: MmqDenseCall<'_, W>,
         fixup_floor: usize,
     ) -> Result<(), EngError> {
         self.ensure_usable()?;

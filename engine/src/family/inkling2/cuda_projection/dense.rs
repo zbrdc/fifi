@@ -110,6 +110,7 @@ pub(super) struct DenseStep {
     arena: DeviceArena,
     transfer: RefCell<PinnedBuf>,
     q8_activations: bool,
+    tensor_core: RefCell<crate::kernels::cuda::prefill::dense_chunk_gemm::PlaneGemm>,
 }
 
 fn router_stage_bytes(
@@ -192,6 +193,7 @@ impl DenseStep {
             stream: context.stream()?,
             arena: context.arena(&plan.tensors)?,
             q8_activations: false,
+            tensor_core: RefCell::default(),
             transfer: RefCell::new(
                 context.pinned_buf(
                     plan.tensors[Slot::Input as usize]

@@ -1976,7 +1976,7 @@ pub(crate) use graph::{CapturePlan, GraphExec, is_capture_refusal};
 pub(crate) use launch::{Claim, require_apart, require_fit};
 pub(crate) use launch::{MatmulIo, PackCall, Projection};
 pub(crate) use mailbox::Mailbox;
-pub(crate) use native_weight::NativeWeight;
+pub(crate) use native_weight::{BorrowedNativeWeight, NativeBlocks, NativeWeight};
 pub(crate) use nvfp4_launch::Nvfp4WeightRange;
 /// Writes `bytes` into `buffer` at `offset` from the host, synchronously. No stream orders such
 /// a write, so a cached block that went idle without a device synchronize settles first. Every

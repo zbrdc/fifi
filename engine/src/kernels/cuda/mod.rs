@@ -70,10 +70,10 @@ pub(crate) mod resident;
 mod testkit;
 
 pub(crate) use context::{
-    Admission, CHUNK_LIMIT, CudaContext, DeviceBuffer, Growth, MemoryInfo, NativeWeight,
-    Nvfp4WeightRange, PINNED_STAGE_LIMIT_BYTES, PinnedBuf, QuantTensor, TiledWeight,
-    WorkspaceShape, check_q5_0_scales, check_q6k_scales, check_q8_0_scales, drop_page_cache,
-    host_register, host_unregister, live_device_bytes,
+    Admission, BorrowedNativeWeight, CHUNK_LIMIT, CudaContext, DeviceBuffer, Growth, MemoryInfo,
+    NativeBlocks, NativeWeight, Nvfp4WeightRange, PINNED_STAGE_LIMIT_BYTES, PinnedBuf, QuantTensor,
+    TiledWeight, WorkspaceShape, check_q5_0_scales, check_q6k_scales, check_q8_0_scales,
+    drop_page_cache, host_register, host_unregister, live_device_bytes,
 };
 #[cfg_attr(
     not(test),

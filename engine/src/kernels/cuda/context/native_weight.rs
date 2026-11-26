@@ -392,6 +392,81 @@ impl NativeWeight {
     }
 }
 
+/// A weight held as the file's native blocks: what the native GEMMs read of it.
+pub(crate) trait NativeBlocks {
+    fn quant(&self) -> QuantType;
+    /// Values per row.
+    fn k(&self) -> usize;
+    /// Rows: output values per token.
+    fn n_rows(&self) -> usize;
+    /// The device blocks, row after row from the buffer start.
+    fn buffer(&self) -> &DeviceBuffer;
+}
+
+impl NativeBlocks for NativeWeight {
+    fn quant(&self) -> QuantType {
+        self.quant
+    }
+    fn k(&self) -> usize {
+        self.k
+    }
+    fn n_rows(&self) -> usize {
+        self.n_rows
+    }
+    fn buffer(&self) -> &DeviceBuffer {
+        &self.buffer
+    }
+}
+
+/// Native blocks in a buffer another owner keeps, for a family whose weights rest in its own
+/// device buffers.
+#[derive(Clone, Copy)]
+pub(crate) struct BorrowedNativeWeight<'a> {
+    buffer: &'a DeviceBuffer,
+    quant: QuantType,
+    k: usize,
+    n_rows: usize,
+}
+
+impl<'a> BorrowedNativeWeight<'a> {
+    /// The first `n_rows` rows of `k` values of `quant` at the start of `buffer`, which must
+    /// hold at least their bytes.
+    pub(crate) fn new(
+        buffer: &'a DeviceBuffer,
+        quant: QuantType,
+        k: usize,
+        n_rows: usize,
+    ) -> Result<Self, EngError> {
+        match quant.weight_bytes(n_rows, k) {
+            Some(want) if want <= buffer.bytes() => Ok(Self {
+                buffer,
+                quant,
+                k,
+                n_rows,
+            }),
+            want => Err(EngError::BadRequest(format!(
+                "a native weight of {n_rows} rows of {k} values holds {want:?} bytes, the buffer has {}",
+                buffer.bytes()
+            ))),
+        }
+    }
+}
+
+impl NativeBlocks for BorrowedNativeWeight<'_> {
+    fn quant(&self) -> QuantType {
+        self.quant
+    }
+    fn k(&self) -> usize {
+        self.k
+    }
+    fn n_rows(&self) -> usize {
+        self.n_rows
+    }
+    fn buffer(&self) -> &DeviceBuffer {
+        self.buffer
+    }
+}
+
 /// Checks the tensor of a native upload: the type must be one with a native kernel
 /// (`QuantType::from_gguf`), `k` a positive multiple of the type's block size up to `native::MAX_DIM`, `n_rows` at
 /// least one (any count: no 8-row rule), and the source length exactly the native byte count.
