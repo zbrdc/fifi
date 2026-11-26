@@ -151,6 +151,11 @@ pub(crate) enum GgufGate {
 pub(crate) struct GgufMoeSchedule {
     pub(crate) gate: GgufGate,
     pub(crate) exact_q2_down: bool,
+    /// Both products on the q8_1 window matvec: the expert input and the middle rows are
+    /// quantized to q8_1 first, so the output is not bit-identical to the f32 products. The
+    /// wrapper takes it with device picks over stacks when both matrix types have a window or
+    /// vendored case for their row lengths; the native entry never sees it.
+    pub(crate) q8_window: bool,
 }
 
 impl GgufMoeSchedule {
@@ -158,6 +163,8 @@ impl GgufMoeSchedule {
     const GATE_MASK: c_int = 3;
     const EXACT_Q2_DOWN: c_int = 4;
     const DECODE_SPLIT: c_int = 8;
+    const ACTIVATE_ONLY: c_int = 16;
+    const SUM_ONLY: c_int = 32;
 
     fn bits(self) -> c_int {
         self.gate as c_int
@@ -177,8 +184,31 @@ impl GgufMoeSchedule {
         Self {
             gate,
             exact_q2_down: bits & Self::EXACT_Q2_DOWN != 0,
+            q8_window: false,
         }
     }
+}
+
+/// One stage of the expert sequence, launched alone between products a caller queues itself.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(in crate::kernels::cuda) enum GgufMoePhase {
+    /// The clipped activation of the gate and up products at the start of the scratch.
+    Activate,
+    /// The weighted sum of the down products after the middle rows.
+    Sum,
+}
+
+/// Queues only `phase` of `call`'s expert sequence.
+pub(in crate::kernels::cuda) fn launch_gguf_moe_phase(
+    stream: &RawStream,
+    call: GgufMoeRaw<'_>,
+    phase: GgufMoePhase,
+) -> Result<(), DeviceFailure> {
+    let bits = match phase {
+        GgufMoePhase::Activate => GgufMoeSchedule::ACTIVATE_ONLY,
+        GgufMoePhase::Sum => GgufMoeSchedule::SUM_ONLY,
+    };
+    queue(stream, call, bits).map(|_| ())
 }
 
 pub(in crate::kernels::cuda) fn launch_gguf_moe(
@@ -187,6 +217,21 @@ pub(in crate::kernels::cuda) fn launch_gguf_moe(
     schedule: GgufMoeSchedule,
     decode_split: bool,
 ) -> Result<GgufMoeSchedule, DeviceFailure> {
+    let bits = schedule.bits()
+        | if decode_split {
+            GgufMoeSchedule::DECODE_SPLIT
+        } else {
+            0
+        };
+    queue(stream, call, bits).map(GgufMoeSchedule::from_bits)
+}
+
+/// Queues `call` with the request `bits`; returns the schedule bits the native entry reports.
+fn queue(
+    stream: &RawStream,
+    call: GgufMoeRaw<'_>,
+    mut bits: c_int,
+) -> Result<c_int, DeviceFailure> {
     let mut picks = [GgufMoePick::default(); MAX_GGUF_MOE_PICKS];
     let (count, device_ids, device_weights, [gate_scales, down_scales]) = match call.picks {
         GgufMoeRawPicks::Host(host) => {
@@ -250,12 +295,6 @@ pub(in crate::kernels::cuda) fn launch_gguf_moe(
     let matrices = matrices
         .as_ref()
         .map_or(std::ptr::null(), std::ptr::from_ref);
-    let mut bits = schedule.bits()
-        | if decode_split {
-            GgufMoeSchedule::DECODE_SPLIT
-        } else {
-            0
-        };
     let request = if bits == 0 {
         std::ptr::null_mut()
     } else {
@@ -265,7 +304,7 @@ pub(in crate::kernels::cuda) fn launch_gguf_moe(
         inference_cuda_gguf_moe_launch(&args, matrices, stream.0.as_ptr(), &mut stage, request)
     };
     checked(status, stage)?;
-    Ok(GgufMoeSchedule::from_bits(bits))
+    Ok(bits)
 }
 
 #[cfg(test)]
@@ -278,6 +317,7 @@ mod tests {
             let baseline = GgufMoeSchedule {
                 gate,
                 exact_q2_down: false,
+                q8_window: false,
             };
             let candidate = GgufMoeSchedule {
                 exact_q2_down: true,

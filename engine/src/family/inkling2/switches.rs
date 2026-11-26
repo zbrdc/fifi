@@ -21,6 +21,7 @@ crate::family::switch_table::switch_table! {
         ChainLocalDecode = "FIFI_INKLING_CUDA_CHAIN_LOCAL_DECODE", true;
         ChainMlpExperts = "FIFI_INKLING_CUDA_CHAIN_MLP_EXPERTS", true;
         DecodeExactQ2Down = "FIFI_INKLING_CUDA_DECODE_EXACT_Q2_DOWN", false;
+        DecodeQ8Experts = "FIFI_INKLING_CUDA_DECODE_Q8_EXPERTS", false;
         DecodeSplit = "FIFI_INKLING_CUDA_DECODE_SPLIT", true;
         DenseStream = "FIFI_INKLING_CUDA_DENSE_STREAM", true;
         DeviceExpertPrefill = "FIFI_INKLING_CUDA_DEVICE_EXPERT_PREFILL", true;

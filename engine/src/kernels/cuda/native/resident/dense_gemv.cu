@@ -698,6 +698,18 @@ void launch_moe(const inference_cuda_gguf_moe_args &a, Index gate, Index selecte
     float *middle = a.scratch + size_t(a.count) * 2 * a.middle;
     float *down = middle + size_t(a.count) * a.middle;
     const int request = schedule ? *schedule : 0;
+    constexpr int threads = 256;
+    if (request & (INFERENCE_CUDA_GGUF_MOE_ACTIVATE_ONLY | INFERENCE_CUDA_GGUF_MOE_SUM_ONLY)) {
+        if (request & INFERENCE_CUDA_GGUF_MOE_ACTIVATE_ONLY) {
+            const dim3 grid((a.middle + threads - 1) / threads, a.count);
+            activate_moe<DevicePicks><<<grid, threads, 0, stream>>>(a, middle);
+        } else {
+            sum_moe<DevicePicks><<<(a.hidden + threads - 1) / threads, threads, 0, stream>>>(a, down);
+        }
+        failure.record(cudaGetLastError(), INFERENCE_CUDA_STAGE_LAUNCH);
+        *schedule = 0;
+        return;
+    }
     const int gate_request = request & INFERENCE_CUDA_GGUF_MOE_GATE_MASK;
     const bool split = (request & INFERENCE_CUDA_GGUF_MOE_DECODE_SPLIT) != 0;
     const int flags = split ? INFERENCE_CUDA_DENSE_GEMV_DECODE_SPLIT : 0;
@@ -716,7 +728,6 @@ void launch_moe(const inference_cuda_gguf_moe_args &a, Index gate, Index selecte
     }
     if (!failure.ok()) return;
 
-    constexpr int threads = 256;
     const dim3 grid((a.middle + threads - 1) / threads, a.count);
     activate_moe<DevicePicks><<<grid, threads, 0, stream>>>(a, middle);
     failure.record(cudaGetLastError(), INFERENCE_CUDA_STAGE_LAUNCH);
@@ -1458,6 +1469,8 @@ extern "C" int inference_cuda_gguf_moe_launch(const inference_cuda_gguf_moe_args
         if (!args || !valid_moe(*args, matrices, stream, sizes)) {
             return INFERENCE_CUDA_INVALID_ARGUMENT;
         }
+        constexpr int phases = INFERENCE_CUDA_GGUF_MOE_ACTIVATE_ONLY | INFERENCE_CUDA_GGUF_MOE_SUM_ONLY;
+        if (schedule && (*schedule & phases) == phases) return INFERENCE_CUDA_INVALID_ARGUMENT;
         Failure failure;
         if (matrices) {
             SeparateWeights gate{}, down{};

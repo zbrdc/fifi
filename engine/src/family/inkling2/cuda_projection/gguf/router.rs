@@ -269,8 +269,13 @@ impl GgufCuda {
                 GgufMoeSchedule {
                     gate: gate_schedule(),
                     exact_q2_down: route.decode && self.decode_exact_q2_down,
+                    q8_window: route.decode && Switch::DecodeQ8Experts.on(),
                 },
             )?;
+            if schedule.q8_window {
+                static USED: Once = Once::new();
+                USED.call_once(|| eprintln!("Inkling CUDA used q8_1 decode expert products"));
+            }
             if schedule.exact_q2_down {
                 static USED: Once = Once::new();
                 USED.call_once(|| eprintln!("Inkling CUDA used exact Q2_0 expert down GEMV"));

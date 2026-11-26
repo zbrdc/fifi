@@ -7,7 +7,13 @@ use crate::{
         CudaContext, DeviceRange, DeviceStream,
         context::{Claim, require_apart, require_fit},
         native::resident::dense_gemv::moe::{
-            GgufMoeRaw, GgufMoeRawPicks, GgufMoeRawWeights, GgufMoeSchedule, launch_gguf_moe,
+            GgufMoePhase, GgufMoeRaw, GgufMoeRawPicks, GgufMoeRawWeights, GgufMoeSchedule,
+            launch_gguf_moe, launch_gguf_moe_phase,
+        },
+        resident::{
+            matvec_expert::ExpertMatvecCall,
+            matvec_q::QuantType,
+            quantize_q8_1::{QuantizeCall, q8_1_bytes},
         },
     },
 };
@@ -72,10 +78,120 @@ impl CudaContext {
     ) -> Result<GgufMoeSchedule, EngError> {
         self.ensure_usable()?;
         let raw = self.plan_gguf_moe(&call)?;
+        if schedule.q8_window && self.gguf_moe_q8(stream, &call)? {
+            return Ok(GgufMoeSchedule {
+                q8_window: true,
+                ..GgufMoeSchedule::default()
+            });
+        }
         let split = self.dense_group_policy().decode_split;
         self.launch_on(stream, |stream_raw| {
             launch_gguf_moe(stream_raw, raw, schedule, split)
         })
+    }
+
+    /// The q8_1 schedule of a checked `call`: the expert input quantized into the down rows,
+    /// the gate and up products of every pick into the start of the scratch, the activation,
+    /// the middle rows quantized into the dead products, the down products into the down rows,
+    /// and the weighted sum. Returns false, with nothing queued, unless the picks are on the
+    /// device over stacks and both products have a q8_1 case for their types and row lengths.
+    fn gguf_moe_q8(&self, stream: &DeviceStream, c: &GgufMoeCall<'_>) -> Result<bool, EngError> {
+        let (
+            GgufMoePicks::Device { count, ids, .. },
+            GgufMoeWeights::Stacks([gate, down]),
+            [
+                DenseDtype::PackedGguf(gate_type),
+                DenseDtype::PackedGguf(down_type),
+            ],
+        ) = (&c.picks, &c.weights, c.dtypes)
+        else {
+            return Ok(false);
+        };
+        let (Some(gate_type), Some(down_type)) = (
+            QuantType::from_gguf(gate_type),
+            QuantType::from_gguf(down_type),
+        ) else {
+            return Ok(false);
+        };
+        let (
+            count,
+            GgufMoeShape {
+                hidden,
+                middle,
+                experts,
+            },
+        ) = (*count, c.shape);
+        let word = size_of::<f32>();
+        let products = c.scratch.slice(0, count * 2 * middle * word)?;
+        let middles = c.scratch.slice(products.bytes(), count * middle * word)?;
+        let downs = c
+            .scratch
+            .slice(products.bytes() + middles.bytes(), count * hidden * word)?;
+        let (Some(input_bytes), Some(middle_bytes)) =
+            (q8_1_bytes(hidden, 1), q8_1_bytes(middle, count))
+        else {
+            return Ok(false);
+        };
+        if input_bytes > downs.bytes() || middle_bytes > products.bytes() {
+            return Ok(false);
+        }
+        let input_q8 = downs.slice(0, input_bytes)?;
+        let middle_q8 = products.slice(0, middle_bytes)?;
+        let product = |ty, w_stack, x_q8, x_per_slot, y, [k, rows]: [usize; 2]| ExpertMatvecCall {
+            ty,
+            w_stack,
+            ids: *ids,
+            x_q8,
+            x_per_slot,
+            y,
+            y_slot_stride: rows,
+            k,
+            rows,
+            n_expert: experts,
+            n_used: count,
+            glu_gate: None,
+        };
+        let gate_up = product(
+            gate_type,
+            *gate,
+            input_q8,
+            false,
+            products,
+            [hidden, 2 * middle],
+        );
+        let down = product(down_type, *down, middle_q8, true, downs, [middle, hidden]);
+        if !self.matvec_expert_takes(&gate_up) || !self.matvec_expert_takes(&down) {
+            return Ok(false);
+        }
+        let phase = |phase| {
+            let raw = self.plan_gguf_moe(c)?;
+            self.launch_on(stream, |stream_raw| {
+                launch_gguf_moe_phase(stream_raw, raw, phase)
+            })
+        };
+        self.quantize_q8_1(
+            stream,
+            QuantizeCall {
+                x: c.x,
+                y: input_q8,
+                k: hidden,
+                ncols: 1,
+            },
+        )?;
+        self.matvec_expert(stream, gate_up)?;
+        phase(GgufMoePhase::Activate)?;
+        self.quantize_q8_1(
+            stream,
+            QuantizeCall {
+                x: middles,
+                y: middle_q8,
+                k: middle,
+                ncols: count,
+            },
+        )?;
+        self.matvec_expert(stream, down)?;
+        phase(GgufMoePhase::Sum)?;
+        Ok(true)
     }
 
     fn plan_gguf_moe<'a>(&self, c: &GgufMoeCall<'a>) -> Result<GgufMoeRaw<'a>, EngError> {
@@ -214,3 +330,6 @@ fn validate_weight(
     }
     Ok(())
 }
+
+#[cfg(test)]
+mod tests;

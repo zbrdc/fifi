@@ -126,6 +126,15 @@ impl CudaContext {
         self.launch_on(stream, |stream_raw| matvec_expert_launch(stream_raw, &raw))
     }
 
+    /// Whether [`Self::matvec_expert`] takes `call`: the checks it makes before queuing.
+    pub(crate) fn matvec_expert_takes(&self, call: &ExpertMatvecCall<'_>) -> bool {
+        if call.ty.expert_uses_window() {
+            self.plan_matvec_expert_codebook(call).is_ok()
+        } else {
+            self.plan_matvec_expert(call).is_ok()
+        }
+    }
+
     /// Queue a routed projection in supported per-format chunks. The original
     /// `matvec_expert` keeps its per-launch limits. Full-buffer claims are checked before
     /// any chunk is queued, so an earlier output cannot overwrite a later chunk's input.

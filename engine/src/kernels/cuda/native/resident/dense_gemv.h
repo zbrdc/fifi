@@ -161,7 +161,12 @@ enum {
     INFERENCE_CUDA_GGUF_MOE_GATE_MASK = 3,
     INFERENCE_CUDA_GGUF_MOE_EXACT_Q2_DOWN = 4,
     /* Request only: the gate, down and packed launches take the split kernels. */
-    INFERENCE_CUDA_GGUF_MOE_DECODE_SPLIT = 8
+    INFERENCE_CUDA_GGUF_MOE_DECODE_SPLIT = 8,
+    /* Request only, one of the two: launch only the activation, which reads gate and up
+     * products a caller wrote at the start of the scratch, or only the weighted sum, which
+     * reads down products a caller wrote after the middle rows. */
+    INFERENCE_CUDA_GGUF_MOE_ACTIVATE_ONLY = 16,
+    INFERENCE_CUDA_GGUF_MOE_SUM_ONLY = 32
 };
 int inference_cuda_gguf_moe_launch(const inference_cuda_gguf_moe_args *args,
                                   const inference_cuda_gguf_moe_matrices *matrices,

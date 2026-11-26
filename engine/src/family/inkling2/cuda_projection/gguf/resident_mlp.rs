@@ -13,7 +13,7 @@ use super::{
 };
 use crate::{
     EngError,
-    family::inkling2::cuda_projection::dense::RoutedRows,
+    family::inkling2::{cuda_projection::dense::RoutedRows, switches::Switch},
     kernels::cuda::{
         DeviceRange, DeviceStream,
         resident::{
@@ -258,6 +258,7 @@ impl GgufCuda {
             GgufMoeSchedule {
                 gate: gate_schedule(),
                 exact_q2_down: self.decode_exact_q2_down,
+                q8_window: Switch::DecodeQ8Experts.on(),
             },
         )?;
         static USED: Once = Once::new();
@@ -266,6 +267,8 @@ impl GgufCuda {
                 "Inkling CUDA used resident MLP experts{}",
                 if schedule.exact_q2_down {
                     " with exact Q2_0 expert down GEMV"
+                } else if schedule.q8_window {
+                    " with q8_1 expert products"
                 } else {
                     ""
                 }
