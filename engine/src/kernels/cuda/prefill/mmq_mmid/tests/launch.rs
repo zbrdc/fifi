@@ -16,6 +16,7 @@ use super::rig::{
 use crate::EngError;
 use crate::kernels::cuda::CudaContext;
 use crate::kernels::cuda::prefill::mmq_mmid::MmidShape;
+use crate::kernels::cuda::prefill::mmq_size::{WEIGHT_TAIL_BYTES, weight_tail};
 use crate::kernels::cuda::resident::matvec_q::QuantType;
 use crate::kernels::cuda::testkit;
 
@@ -266,6 +267,66 @@ fn mmq_mmid_q8x_expert_down_stays_within_the_frozen_bound() {
             "{}: NMSE {:.3e} above the frozen {DOWN_NMSE:e}",
             case.name,
             case.err.nmse
+        );
+    }
+}
+
+/// Inkling's expert down rows hold 1,152 values, off the 256-value k tile: the last tile of a
+/// row reads four 32-value blocks past it, into the next row, and past the last row of the stack
+/// into its zeroed tail, while the q8_1 columns hold zeros there. The products stay within the
+/// frozen down bound for a 32-value type with each block size, and a weight range without the
+/// tail is refused before the launch.
+#[test]
+fn mmq_mmid_expert_down_rows_off_the_k_tile_stay_within_the_frozen_bound() {
+    if !testkit::device_present(
+        "mmq_mmid_expert_down_rows_off_the_k_tile_stay_within_the_frozen_bound",
+    ) {
+        return;
+    }
+    let shape = MmidShape {
+        n_experts: 8,
+        m: 24,
+        top_k: 4,
+    };
+    let (k, n, ld) = (1_152, 256, 256);
+    let ne = shape.ne_get_rows();
+    let rows = skewed_rows(&shape, 6, 0x1152);
+    let x = normal_rows(ne, k, 0x1153);
+    for quant in [QuantType::Iq4Nl, QuantType::Q80] {
+        let spec = || LaunchSpec {
+            shape,
+            quant,
+            k,
+            n,
+            ld,
+            rows: &rows,
+            x: &x,
+            gather: true,
+        };
+        let weights = expert_blocks(quant, shape.n_experts, n, k, 0x1154);
+        let tail = weight_tail(quant, k);
+        assert!(tail > 0 && tail <= WEIGHT_TAIL_BYTES, "{quant:?}: {tail}");
+        let mut with_tail = weights.clone();
+        with_tail.resize(weights.len() + WEIGHT_TAIL_BYTES, 0);
+        let launched = run_cases(&with_tail, &[spec()])
+            .unwrap_or_else(|err| panic!("{quant:?}: the launch: {err:?}"));
+        let name = format!("{quant:?} down at K {k}");
+        for case in score(quant, &weights, &[(name.as_str(), spec())], &launched) {
+            assert!(
+                case.err.nmse <= DOWN_NMSE,
+                "{}: NMSE {:.3e} above the frozen {DOWN_NMSE:e}",
+                case.name,
+                case.err.nmse
+            );
+        }
+        // One byte short of the tail the last row reads: refused, nothing launched.
+        let short = &with_tail[..weights.len() + tail - 1];
+        let err = run_cases(short, &[spec()])
+            .err()
+            .unwrap_or_else(|| panic!("{quant:?}: a stack without its tail launched"));
+        assert!(
+            format!("{err:?}").contains("the CUDA weight range"),
+            "{quant:?}: {err:?}"
         );
     }
 }

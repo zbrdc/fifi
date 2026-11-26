@@ -138,6 +138,18 @@ bool valid_build(const inference_cuda_mmq_build_ids_args *a) {
 /* Values per weight block of a grouped weight type, 0 for a type with no case. */
 int64_t block_values(int64_t type) { return mmq_block_shape((int)type).values; }
 
+/* The k values the GEMM reads of each row: K rounded up to its k tile (MMQ_ITER_K, read with no
+ * k clamp); the q8_1 columns hold zeros from K on. */
+int64_t k_read(int64_t k) { return (k + MMQ_ITER_K - 1) / MMQ_ITER_K * MMQ_ITER_K; }
+
+/* The weight blocks a grouped launch reads: every expert stride but the last, every row of the
+ * last expert but its last, and the last row's whole k tiles, which end past the stack. */
+int64_t weight_blocks(const inference_cuda_mmq_mmid_args *a) {
+    const int64_t qk = block_values(a->type_x), kb = a->ncols_x / qk;
+    return (a->nchannels_x - 1) * a->stride_channel_x + (a->nrows_x - 1) * kb +
+           k_read(a->ncols_x) / qk;
+}
+
 /* The grouped mmq_args form of mmq_mmid.h, before any product is formed. */
 bool valid_grouped(const inference_cuda_mmq_mmid_args *a) {
     const int64_t k = a->ncols_x, m = a->ncols_max, ne = a->ncols_dst, e = a->nchannels_x;
@@ -147,7 +159,7 @@ bool valid_grouped(const inference_cuda_mmq_mmid_args *a) {
     const bool picks = tokens && experts && ne / m <= INFERENCE_CUDA_MMQ_MMID_MAX_TOP_K &&
                        ne / m <= e;
     const int64_t qk = block_values(a->type_x);
-    const bool weight = qk != 0 && k % 256 == 0 && k >= 256 && k <= kMaxK &&
+    const bool weight = qk != 0 && k % qk == 0 && k >= MMQ_ITER_K && k <= kMaxK &&
                         a->stride_row_x == k / qk && a->nrows_x >= 1 && a->nrows_x <= INT_MAX;
     const bool flat = a->nsamples_x == 1 && a->nsamples_y == 1 && a->stride_sample_x == 0 &&
                       a->stride_sample_y == 0 && a->stride_sample_dst == 0 &&
@@ -163,7 +175,7 @@ bool valid_limits(const inference_cuda_mmq_mmid_args *a) {
     if (tiles > kTilesLimit || tiles * kb >= kGridLimit || stride < n * kb || stride > INT_MAX) {
         return false;
     }
-    return (e - 1) * stride + n * kb <= INT_MAX &&
+    return weight_blocks(a) <= INT_MAX &&
            (a->ncols_dst - 1) * a->nrows_dst + n <= INT_MAX;
 }
 
@@ -179,11 +191,11 @@ struct Extent {
  * expert_bounds, dst, fixup; dst is apart from all others, fixup from the first four. */
 bool valid_ranges(const inference_cuda_mmq_mmid_args *a, int nsm) {
     const MmqBlockShape shape = mmq_block_shape((int)a->type_x);
-    const int64_t kb = a->ncols_x / shape.values, ne = a->ncols_dst;
-    const int64_t blocks = (a->nchannels_x - 1) * a->stride_channel_x + a->nrows_x * kb;
+    const int64_t ne = a->ncols_dst;
+    const int64_t blocks = weight_blocks(a);
     const Extent r[6] = {
         {a->x, (size_t)(blocks * shape.bytes), a->x_bytes, 16},
-        {a->y, (size_t)(a->ncols_x / 128 * ne * kQ81Block + kQ81Pad), a->y_bytes, 16},
+        {a->y, (size_t)(k_read(a->ncols_x) / 128 * ne * kQ81Block + kQ81Pad), a->y_bytes, 16},
         {a->ids_dst, (size_t)(ne + a->ncols_max + 127) * sizeof(int), a->ids_dst_bytes, 4},
         {a->expert_bounds, (size_t)(a->nchannels_x + 1) * sizeof(int), a->expert_bounds_bytes, 4},
         {a->dst, (size_t)((ne - 1) * a->nrows_dst + a->nrows_x) * sizeof(float), a->dst_bytes, 4},

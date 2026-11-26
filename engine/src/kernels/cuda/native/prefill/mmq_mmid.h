@@ -30,26 +30,30 @@
  * mul_mat_q_case (mmq.cuh:1639-1649) with the ids of an MmidIds. The geometry fields are the
  * vendored mmq_args (mmq.cuh:1326-1340) as the Rust fill_mmid_args fills them (the pin's
  * mmq.cu:255-261), and the entry refuses anything but this grouped form:
- *   type_x                     Q4_K (12) or Q6_K (14); a grouped Q8_0 or Q5_0 has no arm here
- *   ncols_x = K                a multiple of 256, 256..32768 (the K grid: the k loop
- *                              reads whole ITER_K = 256 rows with no k clamp, mmq.cuh:856)
- *   stride_row_x               K / 256, the blocks of one weight row
+ *   type_x                     a type of prefill/mmq_types.h, block qk values
+ *   ncols_x = K                a multiple of qk, 256..32768. The k loop reads whole
+ *                              ITER_K = 256 tiles with no k clamp (mmq.cuh:856), so the last
+ *                              tile of a row reads to kread = K rounded up to 256: into the
+ *                              next row, and past the last row of the stack into its tail;
+ *                              the q8_1 columns hold zeros from K to kread
+ *   stride_row_x               K / qk, the blocks of one weight row
  *   nrows_x = N                the rows of one expert matrix, >= 1
  *   ncols_max = ncols_opt = m  the token count, within the shared shape rules
  *   ncols_dst = ncols_y        m * top_k, the compact columns
  *   nchannels_x = nchannels_y  n_experts: the expert is the channel index of the grid
- *   stride_channel_x           the per-expert stride in weight blocks, >= N * K / 256
+ *   stride_channel_x           the per-expert stride in weight blocks, >= N * K / qk
  *   nrows_dst = ld             the dst row stride in floats, >= N
  *   nsamples_x = nsamples_y = 1; stride_channel_y, stride_channel_dst and the sample strides 0
- * The kernels compute indexes in int: ceil(m / 8) * ceil(N / 128) * n_experts * K / 256 < 2^30
+ * The kernels compute indexes in int: ceil(m / 8) * ceil(N / 128) * n_experts * K / qk < 2^30
  * (the stream-k limit of mmq.cuh:1402, bounded with the smallest tile, J = 8) and, in the same
  * rule, ceil(m / 8) * ceil(N / 128) * n_experts <= 21,474,836 (mmq.cuh:1399 computes
  * 100 * ntiles_dst in int for the tiling decision, and the J = 8 tile count is the largest the
  * launcher can pick), the weight index
- * (n_experts - 1) * stride_channel_x + N * K / 256 <= INT_MAX blocks and the dst index
+ * (n_experts - 1) * stride_channel_x + (N - 1) * K / qk + kread / qk <= INT_MAX blocks (the
+ * last row's last tile included) and the dst index
  * (m * top_k - 1) * ld + N <= INT_MAX floats.
- * Capacities in byte: x >= that weight index in blocks of the type; y >= K / 128 * m * top_k *
- * 144 + 18,432 (the constant pad); ids_dst >= m * top_k + m + 127 ints (the stream-k fixup
+ * Capacities in byte: x >= that weight index in blocks of the type; y >= kread / 128 * m *
+ * top_k * 144 + 18,432 (the constant pad); ids_dst >= m * top_k + m + 127 ints (the stream-k fixup
  * gather of mmq.cuh:1295-1302); expert_bounds >= n_experts + 1 ints; dst >= the dst index in
  * floats; fixup >= nsm * 128 * 128 floats, nsm from the device facts. x, y and fixup are
  * 16-byte aligned, the rest 4. dst shares no byte with another range, and fixup none with x,

@@ -1177,8 +1177,12 @@ fn check_launch_shape_refuses_every_number_rule() {
     let rows: Vec<(&str, MmidLaunchShape)> = vec![
         ("m", with(&|s| s.ids.m = 0)),
         ("type", with(&|s| s.quant = QuantType::Iq1M)),
-        ("K-grid", with(&|s| s.k = 384)),
-        ("K-grid", with(&|s| (s.quant, s.k) = (QuantType::Q6K, 384))),
+        ("K-block", with(&|s| s.k = 384)),
+        ("K-block", with(&|s| (s.quant, s.k) = (QuantType::Q6K, 384))),
+        (
+            "K-block",
+            with(&|s| (s.quant, s.k) = (QuantType::Iq4Nl, 1_160)),
+        ),
         ("K", with(&|s| s.k = 0)),
         ("K", with(&|s| s.k = 32_768 + 256)),
         ("N", with(&|s| s.n = 0)),
@@ -1331,7 +1335,7 @@ fn mmq_mmid_launch_refuses_ranges_that_do_not_fit() {
             ("dst over fixup", vec![(5, (6, 0, 4096))], ids, launch, "the CUDA dst and fixup ranges overlap"),
             ("weight under fixup", vec![(0, (6, 0, 512 * 144))], ids, launch, "the CUDA fixup and weight ranges overlap"),
             ("ids made for another shape", vec![], MmidShape { m: 3, ..ids }, launch, "mmq_mmid: ids shape"),
-            ("K off the grid", vec![], ids, k384, "mmq_mmid: K-grid"),
+            ("K off the Q4_K block", vec![], ids, k384, "mmq_mmid: K-block"),
         ];
         let bufs: Vec<DeviceBuffer> = base
             .iter()

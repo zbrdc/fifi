@@ -1,6 +1,9 @@
 //! Adapt contiguous GGUF expert stacks to the shared expert tier.
 
-use std::{collections::BTreeMap, ops::Range};
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    ops::Range,
+};
 
 use super::super::{PackedBuffers, bad};
 use crate::{
@@ -11,7 +14,7 @@ use crate::{
         place_gpu_layers,
     },
     family::mapped_file::MappedFile,
-    kernels::cuda::{CudaContext, DeviceBuffer, DeviceRange},
+    kernels::cuda::{CudaContext, DeviceBuffer, DeviceRange, prefill::mmq_size::WEIGHT_TAIL_BYTES},
     weights::repack_nvfp4_into,
 };
 
@@ -40,6 +43,11 @@ pub(super) enum Weight<'a> {
 pub(super) struct ResidentExperts {
     placement: Residency,
     banks: BTreeMap<u32, [Option<Bank>; 2]>,
+    /// The layers whose two original stacks were uploaded whole at load, each followed by
+    /// [`WEIGHT_TAIL_BYTES`] zeros: the last k tile of the tensor-core GEMM reads past a row that
+    /// ends off its k grid, into the next expert or, after the last one, the tail. A bank the
+    /// expert cache fills holds unwritten slots, so it has no such layer.
+    whole: BTreeSet<u32>,
 }
 
 fn packed_capacity(ctx: &CudaContext, budget: u64) -> Result<u64, EngError> {
@@ -74,6 +82,7 @@ impl ResidentExperts {
             return Ok(Self {
                 placement: Residency::default(),
                 banks,
+                whole: BTreeSet::new(),
             });
         };
         let bytes = layer_bytes(first);
@@ -102,7 +111,11 @@ impl ResidentExperts {
             &mut store,
             &mut source,
         )?;
-        Ok(Self { placement, banks })
+        Ok(Self {
+            placement,
+            banks,
+            whole: BTreeSet::new(),
+        })
     }
 
     /// Packed tensors can have different sizes in each layer. Allocate both
@@ -117,6 +130,7 @@ impl ResidentExperts {
         let mut residency = Self {
             placement: Residency::default(),
             banks: BTreeMap::new(),
+            whole: BTreeSet::new(),
         };
         let reserve = if budget.cache != Some(0) {
             let capacity = packed_capacity(ctx, budget.total)?;
@@ -135,19 +149,22 @@ impl ResidentExperts {
                 continue;
             }
             let [gate, down] = layer.parts;
-            let w13 = ctx.allocate(gate.bytes.len())?;
-            let w2 = ctx.allocate(down.bytes.len())?;
+            let w13 = ctx.allocate(gate.bytes.len() + WEIGHT_TAIL_BYTES)?;
+            let w2 = ctx.allocate(down.bytes.len() + WEIGHT_TAIL_BYTES)?;
             if (ctx.memory_info()?.free as u64) < VRAM_HEADROOM_BYTES + reserve {
                 continue;
             }
-            ctx.upload_at(&w13, 0, gate.bytes)?;
-            ctx.upload_at(&w2, 0, down.bytes)?;
+            for (bank, part) in [(&w13, gate.bytes), (&w2, down.bytes)] {
+                ctx.upload_at(bank, 0, part)?;
+                ctx.upload_at(bank, part.len(), &[0; WEIGHT_TAIL_BYTES])?;
+            }
             file.drop_cache(gate.file_range)?;
             file.drop_cache(down.file_range)?;
             residency.banks.insert(
                 layer.layer,
                 [Some(Bank::Original(w13)), Some(Bank::Original(w2))],
             );
+            residency.whole.insert(layer.layer);
             for expert in 0..experts {
                 residency
                     .placement
@@ -158,12 +175,38 @@ impl ResidentExperts {
         Ok(residency)
     }
 
+    /// The two original stacks of `layer`, without the tail of a whole layer.
     pub(super) fn original_layer(&self, layer: u32) -> Result<[DeviceRange<'_>; 2], EngError> {
         let Some([Some(Bank::Original(gate)), Some(Bank::Original(down))]) = self.banks.get(&layer)
         else {
             return Err(bad("GGUF resident layer has no original packed stacks"));
         };
-        Ok([gate.range(0, gate.bytes())?, down.range(0, down.bytes())?])
+        let tail = if self.whole.contains(&layer) {
+            WEIGHT_TAIL_BYTES
+        } else {
+            0
+        };
+        Ok([
+            gate.range(0, gate.bytes() - tail)?,
+            down.range(0, down.bytes() - tail)?,
+        ])
+    }
+
+    /// The two original stacks of a layer uploaded whole, each with its zeroed tail of
+    /// [`WEIGHT_TAIL_BYTES`]: the stacks the tensor-core GEMM may read, `None` for any other
+    /// layer.
+    pub(super) fn mmq_layer(&self, layer: u32) -> Option<[DeviceRange<'_>; 2]> {
+        if !self.whole.contains(&layer) {
+            return None;
+        }
+        let Some([Some(Bank::Original(gate)), Some(Bank::Original(down))]) = self.banks.get(&layer)
+        else {
+            return None;
+        };
+        Some([
+            gate.range(0, gate.bytes()).ok()?,
+            down.range(0, down.bytes()).ok()?,
+        ])
     }
 
     pub(super) fn ranges(

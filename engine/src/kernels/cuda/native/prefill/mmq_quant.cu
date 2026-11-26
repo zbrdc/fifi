@@ -98,10 +98,10 @@ int launch_q8k_mmq(Q8kMmqCall a, void *stream, int *out_stage) {
 }
 
 
-/* The K grid of the MMQ GEMM: `MMQ_ITER_K` k values per loop iteration, read with no k clamp,
- * so the quantize refuses to build a buffer the GEMM cannot read safely. The extent bound
- * matches the tree's `MAX_DIM`. */
-constexpr int kKGrid = 256;
+/* The k tile of the MMQ GEMM: `MMQ_ITER_K` k values per loop iteration, read with no k clamp.
+ * A column holds k rounded up to it, zero past k (k_read), so a row's last tile adds exact
+ * zeros. The extent bound matches the tree's `MAX_DIM`. */
+constexpr int kKGrid = MMQ_ITER_K;
 constexpr int kKMax = 32768;
 constexpr long long kStrideMax = 1LL << 30;
 /* The chunk cap (`mmq_size::NCOLS_LIMIT` on the Rust side) and its gathered form
@@ -118,12 +118,32 @@ bool apart(const void *a, long long a_bytes, const void *b, long long b_bytes) {
     return pa + (uintptr_t)a_bytes <= pb || pb + (uintptr_t)b_bytes <= pa;
 }
 
-/* The k and row rules both entries share (the K-grid first, so its refusal row fires for
- * every type; k % 4 is the vendored FIFI_REQUIRE mirror). */
-bool k_ok(int k, int row_stride) {
-    return k > 0 && k <= kKMax && k % kKGrid == 0 && k % 4 == 0 && row_stride >= k &&
+/* Values per weight block of a served type (`ggml_cuda_type_traits<T>::qk`), 0 for any other. */
+int block_values(int type) {
+    switch (type) {
+#define INFERENCE_CUDA_MMQ_QK(T, B) \
+    case T:                         \
+        return ggml_cuda_type_traits<T>::qk;
+        INFERENCE_CUDA_MMQ_TYPES(INFERENCE_CUDA_MMQ_QK)
+#undef INFERENCE_CUDA_MMQ_QK
+        case GGML_TYPE_NVFP4:
+            return ggml_cuda_type_traits<GGML_TYPE_NVFP4>::qk;
+        default:
+            return 0;
+    }
+}
+
+/* The k and row rules both entries share, after served_type: k is a whole number of the type's
+ * blocks (a K-quant's 256-value block is the k grid) inside kKGrid..kKMax; k % 4 is the vendored
+ * FIFI_REQUIRE mirror. */
+bool k_ok(int type, int k, int row_stride) {
+    const int qk = block_values(type);
+    return qk > 0 && k >= kKGrid && k <= kKMax && k % qk == 0 && k % 4 == 0 && row_stride >= k &&
            row_stride % 4 == 0 && row_stride <= kStrideMax;
 }
+
+/* The k values a quantized column holds: k rounded up to the GEMM's k tile. */
+long long k_read(int k) { return ((long long)k + kKGrid - 1) / kKGrid * kKGrid; }
 
 /* Only the types the glue serves reach the vendored switch: the list of prefill/mmq_types.h and
  * NVFP4, which the wrapper's MmqType names exactly, so no other int is ever cast to ggml_type.
@@ -146,13 +166,13 @@ bool valid_quantize(const inference_cuda_mmq_quantize_args *a) {
     if (a == NULL || a->x == NULL || a->y == NULL) return false;
     if (a->ids != NULL && !aligned_to(a->ids, 4)) return false;
     if (!aligned_to(a->x, 16) || !aligned_to(a->y, 16)) return false;
-    if (!served_type(a->type) || !k_ok(a->k, a->row_stride)) return false;
+    if (!served_type(a->type) || !k_ok(a->type, a->k, a->row_stride)) return false;
     if (a->packing != 0 && a->packing != 1) return false;
     /* ids == NULL: the plain dense call, ncols = M. ids != NULL: the gathered down call,
      * ncols = ne_get_rows (the map's values are trusted device indices, guarded by the ids
      * builder). */
     if (a->ncols < 1 || a->ncols > (a->ids == NULL ? kRowLimit : kRowsMax)) return false;
-    const long long blocks_per_col = (a->k + 127) / 128;
+    const long long blocks_per_col = k_read(a->k) / 128;
     const long long y_bytes = blocks_per_col * (long long)a->ncols * 144;
     const long long x_bytes = ((long long)a->ncols - 1) * a->row_stride * 4 + 4LL * a->k;
     if (!apart(a->y, y_bytes, a->x, x_bytes)) return false;
@@ -164,21 +184,18 @@ bool valid_scatter(const inference_cuda_mmq_quantize_scatter_args *a) {
     if (a == NULL || a->x == NULL || a->y == NULL || a->ids_src1_inv == NULL) return false;
     if (!aligned_to(a->x, 16) || !aligned_to(a->y, 16) || !aligned_to(a->ids_src1_inv, 4))
         return false;
-    if (!served_type(a->type) || !k_ok(a->k, a->row_stride)) return false;
+    if (!served_type(a->type) || !k_ok(a->type, a->k, a->row_stride)) return false;
     if (a->packing != 0 && a->packing != 1) return false;
     if (a->m < 1 || a->m > kRowLimit || a->top_k < 1 || a->top_k > kTopKMax) return false;
     const long long nrows = (long long)a->m * a->top_k;
     if (nrows < 1 || nrows > kRowsMax) return false;
-    const long long blocks_per_col = (a->k + 127) / 128;
+    const long long blocks_per_col = k_read(a->k) / 128;
     const long long y_bytes = blocks_per_col * nrows * 144;
     const long long x_bytes = ((long long)a->m - 1) * a->row_stride * 4 + 4LL * a->k;
     if (!apart(a->y, y_bytes, a->x, x_bytes)) return false;
     if (!apart(a->y, y_bytes, a->ids_src1_inv, 4LL * nrows)) return false;
     return true;
 }
-
-/* `k` rounded to the 128-value block grid (the vendored `ne0 % QK8_1_MMQ == 0`). */
-long long k_padded(int k) { return ((long long)k + 127) / 128 * 128; }
 
 }  // namespace
 
@@ -198,7 +215,7 @@ extern "C" int inference_cuda_mmq_quantize(const inference_cuda_mmq_quantize_arg
         failure.record(quantize_mmq_q8_1_cuda_policy(
                            (const float *)a->x, (const int32_t *)a->ids, a->y,
                            (ggml_type)a->type, a->k, (int64_t)a->row_stride, /*s02=*/0,
-                           /*s03=*/0, k_padded(a->k), (int64_t)a->ncols, /*ne2=*/1, /*ne3=*/1,
+                           /*s03=*/0, k_read(a->k), (int64_t)a->ncols, /*ne2=*/1, /*ne3=*/1,
                            (cudaStream_t)stream, a->packing == 1),
                        INFERENCE_CUDA_STAGE_LAUNCH);
         report_stage(out_stage, failure.stage);
@@ -223,7 +240,7 @@ extern "C" int inference_cuda_mmq_quantize_scatter(
         Failure failure;
         failure.record(quantize_scatter_mmq_q8_1_cuda_policy(
                            (const float *)a->x, (const int32_t *)a->ids_src1_inv, a->y,
-                           (ggml_type)a->type, a->k, (int64_t)a->row_stride, k_padded(a->k),
+                           (ggml_type)a->type, a->k, (int64_t)a->row_stride, k_read(a->k),
                            (int64_t)a->m, /*nrows_dst=*/(int64_t)a->m * a->top_k, a->top_k,
                            (cudaStream_t)stream, a->packing == 1),
                        INFERENCE_CUDA_STAGE_LAUNCH);

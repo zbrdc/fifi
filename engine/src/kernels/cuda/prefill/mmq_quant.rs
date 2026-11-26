@@ -32,13 +32,11 @@ use crate::kernels::cuda::native::prefill::mmq_quant::{
 };
 use crate::kernels::cuda::prefill::mmq_size::{MmqType, NCOLS_LIMIT, q8_1_bytes};
 
-/// The k grid of the MMQ GEMM: the k loop reads 256-value strides (`MMQ_ITER_K`) with no k
-/// clamp, so a buffer the GEMM cannot read safely is never built. Checked before every other k
-/// rule, so K = 384 (a multiple of 128 and of every flat qk) reaches this tag for every type.
-///
-/// The one definition of the K rules of the MMQ glue: the mmid wrapper imports this and `K_MAX`
-/// instead of keeping a copy.
-pub(crate) const K_GRID: usize = 256;
+// The one definition of the K rules of the MMQ glue: the mmid wrapper imports these instead of
+// keeping a copy. A quantized column holds `mmq_size::k_read(k)` values, zero past `k`, so any
+// `k` that is a whole number of the weight type's blocks can be quantized (the `K-block` rule);
+// the dense GEMM keeps its own `K-grid` rule.
+pub(crate) use crate::kernels::cuda::prefill::mmq_size::K_GRID;
 /// The k extent bound (the tree's `MAX_DIM`).
 pub(crate) const K_MAX: usize = 32_768;
 /// The row-stride bound: `(ncols - 1) * row_stride + k` floats must stay well inside usize.
@@ -63,6 +61,27 @@ fn to_int(tag: &str, value: usize) -> Result<c_int, EngError> {
     c_int::try_from(value).map_err(|_| rule(tag, &format!("{tag} is {value}, above i32::MAX")))
 }
 
+/// The k rules both entries share, the block rule first so its refusal row fires for every
+/// type: `k` is a whole number of `ty`'s weight blocks (so the GEMM's rows end on a block, and
+/// a K-quant's 256-value rule is the k grid), inside `K_GRID..=K_MAX`. The quantize writes
+/// `mmq_size::k_read(k)` values a column, zero past `k`.
+fn check_k(ty: MmqType, k: usize) -> Result<(), EngError> {
+    let qk = ty.block_values();
+    if !k.is_multiple_of(qk) {
+        return Err(rule(
+            "K-block",
+            &format!("k is {k}, not a multiple of {qk} (the {ty:?} block)"),
+        ));
+    }
+    if !(K_GRID..=K_MAX).contains(&k) {
+        return Err(rule(
+            "K extent",
+            &format!("k is {k}, not {K_GRID}..={K_MAX}"),
+        ));
+    }
+    Ok(())
+}
+
 /// Checks the scalar rules of a quantize call and converts the integers once. `gathered`
 /// switches the column bound between the plain chunk cap and the gathered `ne_get_rows`
 /// bound. Every [`MmqType`] has a q8_1 ds layout, so the "no layout" refusal is the C
@@ -74,18 +93,7 @@ fn check_quantize_rules(
     ncols: usize,
     gathered: bool,
 ) -> Result<QuantInts, EngError> {
-    if !k.is_multiple_of(K_GRID) {
-        return Err(rule(
-            "K-grid",
-            &format!("k is {k}, not a multiple of {K_GRID} (the MMQ k grid)"),
-        ));
-    }
-    if k == 0 || k > K_MAX {
-        return Err(rule(
-            "K extent",
-            &format!("k is {k}, not {K_GRID}..={K_MAX}"),
-        ));
-    }
+    check_k(ty, k)?;
     if row_stride < k || !row_stride.is_multiple_of(4) || row_stride > ROW_STRIDE_MAX {
         return Err(rule(
             "row_stride",
@@ -126,18 +134,7 @@ fn check_scatter_rules(
     m: usize,
     top_k: usize,
 ) -> Result<ScatterInts, EngError> {
-    if !k.is_multiple_of(K_GRID) {
-        return Err(rule(
-            "K-grid",
-            &format!("k is {k}, not a multiple of {K_GRID} (the MMQ k grid)"),
-        ));
-    }
-    if k == 0 || k > K_MAX {
-        return Err(rule(
-            "K extent",
-            &format!("k is {k}, not {K_GRID}..={K_MAX}"),
-        ));
-    }
+    check_k(ty, k)?;
     if row_stride < k || !row_stride.is_multiple_of(4) || row_stride > ROW_STRIDE_MAX {
         return Err(rule(
             "row_stride",

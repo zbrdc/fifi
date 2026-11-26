@@ -20,8 +20,10 @@ use crate::{
                 GroupedDqRows, HostIds, IdsGuardCall, MmidIds, MmidIdsOut, MmidLaunchCall,
                 MmidQuantCall, MmidShape, MmidWeight, SparseDqCall, grouped_dq_serves,
             },
-            mmq_quant::{K_GRID, MmqPacking},
-            mmq_size::{MmqType, fixup_floats_max, ids_dst_ints, q8_1_bytes},
+            mmq_quant::MmqPacking,
+            mmq_size::{
+                MmqType, WEIGHT_TAIL_BYTES, fixup_floats_max, ids_dst_ints, q8_1_bytes, weight_tail,
+            },
             row_ops::{ClippedExpertCall, IndexedRankSumCall, RowGatherCall, RowShape},
         },
         resident::{
@@ -719,12 +721,14 @@ impl GgufCuda {
                 let weights = std::array::from_fn(|stage| {
                     grouped_weight(dtypes[stage], shapes[stage], stacks[stage])
                 });
+                let whole = Switch::PrefillTensorCoreExperts
+                    .on()
+                    .then(|| self.resident.mmq_layer(layer))
+                    .flatten();
                 let mmq = std::array::from_fn(|stage| {
-                    Switch::PrefillTensorCoreExperts
-                        .on()
-                        .then(|| mmq_weight(dtypes[stage], shapes[stage], stacks[stage]))
-                        .flatten()
+                    whole.and_then(|stacks| mmq_weight(dtypes[stage], shapes[stage], stacks[stage]))
                 });
+                // A tensor-core stack also holds its tail, which is shorter than one expert.
                 let experts = |weights: &[Option<MmidWeight<'_>>; 2]| {
                     weights
                         .iter()
@@ -784,8 +788,9 @@ fn grouped_weight(
     })
 }
 
-/// The stack of one stage on the vendored grouped MMQ: a type with a case, a row length on its
-/// K grid, and whole expert matrices.
+/// The stack of one stage on the vendored grouped MMQ: a type with a case, a row of whole
+/// blocks, and whole expert matrices followed by the zeroed tail (`base` is a
+/// `ResidentExperts::mmq_layer` stack) that a row off the k grid reads into.
 fn mmq_weight(
     dtype: DenseDtype,
     [n, k]: [usize; 2],
@@ -795,11 +800,12 @@ fn mmq_weight(
         return None;
     };
     let quant = QuantType::from_gguf(kind).filter(|&quant| MmqType::of(quant).is_some())?;
-    if !k.is_multiple_of(K_GRID) {
+    if !k.is_multiple_of(quant.block_size()) || weight_tail(quant, k) > WEIGHT_TAIL_BYTES {
         return None;
     }
     let stride_bytes = quant.weight_bytes(n, k)?;
-    if stride_bytes == 0 || !base.bytes().is_multiple_of(stride_bytes) {
+    let matrices = base.bytes().checked_sub(WEIGHT_TAIL_BYTES)?;
+    if stride_bytes <= WEIGHT_TAIL_BYTES || !matrices.is_multiple_of(stride_bytes) {
         return None;
     }
     Some(MmidWeight {

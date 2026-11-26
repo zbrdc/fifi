@@ -13,8 +13,9 @@
 //! THIRD_PARTY_NOTICES.md names this file). The cross-check test re-parses both headers, so a
 //! vendor patch that changes a CASE row fails CI without a device.
 //! Not padded, with reasons: x-tile loads (only weight ROWS are clamped and only with fallback
-//! on, mmq-load-tiles.cuh:498-499, :736-737; the k extent never is — the K-grid precondition
-//! the entries own, not a rule here); write-back stores (bounded by `j_max`/`i_max`); the fixup
+//! on, mmq-load-tiles.cuh:498-499, :736-737; the k extent never is — a row's last k tile reads
+//! to `k_read(k)`, the weight stack's tail and the zeroed q8_1 columns past `k` cover it);
+//! write-back stores (bounded by `j_max`/`i_max`); the fixup
 //! range (write-only until the fixup kernel reads it back). NVFP4 plans separately pad
 //! `y_scale` with J_MAX - 1 factors because stream-k writes full temporary tiles.
 #![cfg_attr(
@@ -30,6 +31,30 @@ use crate::kernels::cuda::resident::matvec_q::QuantType;
 
 /// Values per `block_q8_1_mmq` (`QK8_1_MMQ`, mmq.cuh:25) and its bytes (:28-47, :57-58).
 const QK8_1_MMQ: usize = 128;
+/// The k tile of the MMQ GEMM (`MMQ_ITER_K`, mmq.cuh:9; every Ampere and Pascal config reads it):
+/// the k loop reads whole 256-value tiles with no k clamp. A row whose `k` is not a multiple of
+/// it has a last tile that reads past `k`: into the next row's blocks, and past the last row of a
+/// stack into [`WEIGHT_TAIL_BYTES`] the stack's owner zeroes. The q8_1 buffer holds zeros there
+/// ([`k_read`]), so those products add exact zeros (llama.cpp's own rule: zero-padded q8_1
+/// columns and padded weight allocations, `MATRIX_ROW_PADDING`).
+pub(crate) const K_GRID: usize = 256;
+/// The bytes past the last row of a weight stack the GEMM's last k tile may read: at most
+/// `K_GRID / qk - 1` blocks of the widest type with `qk < K_GRID` (Q8_0, 7 x 34 bytes), rounded
+/// up; a type with `qk = K_GRID` never reads past its row. Pinned against every [`MmqType`] by
+/// test.
+pub(crate) const WEIGHT_TAIL_BYTES: usize = 256;
+
+/// The k values the GEMM reads of each row and the q8_1 buffer holds of each column: `k` up to
+/// the next multiple of [`K_GRID`]; the quantize writes zeros past `k`.
+pub(crate) fn k_read(k: usize) -> usize {
+    k.next_multiple_of(K_GRID)
+}
+
+/// The weight bytes past `k` that the last k tile of a row of `quant` reads (0 when `k` is on
+/// the k grid).
+pub(crate) fn weight_tail(quant: QuantType, k: usize) -> usize {
+    (k_read(k) - k) / quant.block_size() * quant.block_bytes()
+}
 pub(crate) const Q8_1_BLOCK_BYTES: usize = 144;
 /// The PAD's rounding granularity, a deliberate over-bound: the y-tile copies' own loop steps
 /// by `nwarps * warp_size = 256` ints, so a copy spans `round_up(144 * J, 1024)` bytes
@@ -519,13 +544,14 @@ pub(crate) fn j_ub(n: usize) -> usize {
     J_MAX.min(8 * n.div_ceil(8))
 }
 
-/// The q8_1 buffer bytes, `blocks_per_col * ncols * 144 + Q8_1_PAD`: the one constant pad on
-/// every q8_1 buffer, dense (`ncols = M`) and grouped (`ncols = ne_get_rows`).
+/// The q8_1 buffer bytes, `blocks_per_col * ncols * 144 + Q8_1_PAD` with `blocks_per_col =
+/// k_read(k) / 128`: the one constant pad on every q8_1 buffer, dense (`ncols = M`) and grouped
+/// (`ncols = ne_get_rows`).
 pub(crate) fn q8_1_bytes(k: usize, ncols: usize) -> Result<usize, EngError> {
     if k == 0 || ncols == 0 {
         return Err(rule("zero extent", "K and ncols must be at least 1"));
     }
-    k.div_ceil(QK8_1_MMQ)
+    (k_read(k) / QK8_1_MMQ)
         .checked_mul(ncols)
         .and_then(|blocks| blocks.checked_mul(Q8_1_BLOCK_BYTES))
         .and_then(|bytes| bytes.checked_add(Q8_1_PAD))

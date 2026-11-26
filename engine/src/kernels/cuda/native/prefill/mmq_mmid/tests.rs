@@ -194,7 +194,7 @@ fn rows(fx: &Fx) -> Vec<Row> {
             (g.nchannels_x, g.nchannels_y) = (1, 1)
         }),
         geo(fx, "g12 type has an arm", |g| g.type_x = 8),
-        geo(fx, "g13 k % 256 == 0", |g| g.ncols_x = 384),
+        geo(fx, "g13 k % qk == 0", |g| g.ncols_x = 384),
         geo(fx, "g14 k >= 256", |g| (g.ncols_x, g.stride_row_x) = (0, 0)),
         geo(fx, "g15 k <= kMaxK", |g| {
             (g.ncols_x, g.stride_row_x, g.stride_channel_x) = (33_024, 129, 128 * 129);

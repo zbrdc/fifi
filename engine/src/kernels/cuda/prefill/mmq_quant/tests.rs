@@ -156,26 +156,33 @@ fn mmq_quant_type_discriminants_match_the_decode_side() {
 }
 
 #[test]
-fn mmq_quant_refuses_the_k_grid_by_tag() {
-    // The K-grid rule: K = 384 is a multiple of 128 and of every flat qk but not of 256, and it
-    // must reach THIS tag for every entry.
+fn mmq_quant_refuses_k_off_the_weight_block_by_tag() {
+    // The K-block rule: K is a whole number of the weight type's blocks, so a 32-value Q8_0
+    // takes K = 384 and Inkling's 1,152-value expert rows (off the 256-value k tile: the
+    // columns hold zeros to the tile), while Q4_K's 256-value block refuses 384. It must reach
+    // THIS tag for every entry.
     let dense = |k| check_quantize_rules(MmqType::Q80, k, 32_768, 8, false);
-    for k in [384usize, 260, 130] {
-        let err = format!("{:?}", dense(k).expect_err("off the k grid"));
-        assert!(err.contains("mmq_quant: K-grid"), "{k}: {err}");
+    for k in [260usize, 130, 1_000] {
+        let err = format!("{:?}", dense(k).expect_err("off the block"));
+        assert!(err.contains("mmq_quant: K-block"), "{k}: {err}");
     }
-    for k in [256usize, 512, 2048, 4096, 32_768] {
-        dense(k).expect("on the k grid");
+    for k in [256usize, 384, 512, 1_152, 2048, 4096, 32_768] {
+        dense(k).expect("whole blocks");
     }
-    for (k, tag) in [(0usize, "K extent"), (33_024, "K extent")] {
-        // on-grid K only: off-grid hits K-grid first
+    for (k, tag) in [
+        (0usize, "K extent"),
+        (224, "K extent"),
+        (33_024, "K extent"),
+    ] {
+        // whole-block K only: any other K hits K-block first
         let err = format!("{:?}", dense(k).expect_err("bad k extent"));
         assert!(err.contains(tag), "{k}: {err}");
     }
     // The scatter entry mirrors the same rules.
     let scatter = |k| check_scatter_rules(MmqType::Q4K, k, 2048, 8, 8);
-    let err = format!("{:?}", scatter(384).expect_err("off the k grid"));
-    assert!(err.contains("mmq_quant: K-grid"), "{err}");
+    let err = format!("{:?}", scatter(384).expect_err("off the Q4_K block"));
+    assert!(err.contains("mmq_quant: K-block"), "{err}");
+    scatter(1_280).expect("whole Q4_K blocks");
     let err = format!("{:?}", scatter(33_024).expect_err("bad k extent"));
     assert!(err.contains("K extent"), "{err}");
 }

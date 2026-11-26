@@ -270,15 +270,16 @@ fn q8_1_pad_contract_is_exact() {
         (2048_usize, 1_usize),
         (512, 1),
         (4096, 1),
-        (600, 1), // Kpad rounds up to 640: 5 blocks, not 4
-        (129, 1), // two blocks
+        (600, 1),   // the column holds k_read = 768 values: 6 blocks
+        (129, 1),   // k_read = 256: two blocks
+        (1_152, 8), // Inkling's expert down rows read to 1,280: 10 blocks a column
         (2048, 2048),
         (2048, 8 * 49),  // grouped, M = 49: the B1 row
         (2048, 8 * 56),  // grouped, M = 56
         (512, 8 * 2048), // the q8_act row at the cap
     ];
     for (k, ncols) in cases {
-        let blocks = k.div_ceil(128);
+        let blocks = k.next_multiple_of(256) / 128;
         assert_eq!(
             q8_1_bytes(k, ncols).unwrap(),
             blocks * ncols * 144 + 18_432,
@@ -706,4 +707,29 @@ fn mmq_types_match_the_native_list_and_the_gguf_ids() {
         }
     }
     assert_eq!(MmqType::of(QuantType::Iq1M), None);
+}
+
+/// The weight tail: no type's last k tile reads past [`WEIGHT_TAIL_BYTES`] of its stack, and a
+/// row on the k grid reads nothing past its end.
+#[test]
+fn the_weight_tail_holds_every_last_k_tile() {
+    for ty in MmqType::ALL {
+        let Some(quant) = ty.quant() else {
+            continue;
+        };
+        let qk = quant.block_size();
+        let worst = (K_GRID / qk - 1) * quant.block_bytes();
+        assert!(worst <= WEIGHT_TAIL_BYTES, "{ty:?}: {worst}");
+        for k in (qk..=4 * K_GRID).step_by(qk) {
+            assert!(weight_tail(quant, k) <= worst, "{ty:?} {k}");
+            assert_eq!(
+                weight_tail(quant, k) == 0,
+                k.is_multiple_of(K_GRID),
+                "{ty:?} {k}"
+            );
+            assert_eq!(k_read(k), k.next_multiple_of(K_GRID));
+        }
+    }
+    // Inkling's expert down rows: 1,152 IQ4_NL values read to 1,280, four blocks of 18 bytes.
+    assert_eq!(weight_tail(QuantType::Iq4Nl, 1_152), 72);
 }

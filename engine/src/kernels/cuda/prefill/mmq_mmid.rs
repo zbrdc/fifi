@@ -55,7 +55,7 @@ use crate::kernels::cuda::prefill::mmq_quant::{
 };
 use crate::kernels::cuda::prefill::mmq_size::{
     MmqType, NCOLS_LIMIT, expert_bounds_ints, fixup_floats_max, ids_dst_ints, ids_src1_ints,
-    q8_1_bytes,
+    k_read, q8_1_bytes,
 };
 use crate::kernels::cuda::resident::matvec_q::QuantType;
 
@@ -423,7 +423,9 @@ fn out_claims<'a>(out: &MmidIdsOut<'a>, shape: &MmidShape) -> Result<[Claim<'a>;
 /// A weight stack: `n_experts` matrices of `n` rows by `k` values in the native GGUF blocks of
 /// `quant`, the first at the start of `base`, each `stride_bytes` after the one before (a
 /// `NativeWeight`'s buffer, or a bank of slots with `n_experts = slots`). `base` is 16-byte
-/// aligned.
+/// aligned. When `k` is off the k grid, `base` also holds the bytes past the last matrix that
+/// its last row's last k tile reads (`mmq_size::weight_tail`), which must decode finite: the
+/// owner zeroes them.
 #[derive(Clone, Copy)]
 pub(crate) struct MmidWeight<'b> {
     pub(crate) base: DeviceRange<'b>,
@@ -474,9 +476,15 @@ impl MmidLaunchShape {
         self.stride_bytes / self.quant.block_bytes()
     }
 
-    /// The weight blocks the launch reads, after [`check_launch_shape`].
+    /// The weight blocks the launch reads, after [`check_launch_shape`]: the last row's last k
+    /// tile reads to [`k_read`], past the stack's last row when `k` is off the k grid (the
+    /// stack's owner holds those bytes, zeroed: [`mmq_size::WEIGHT_TAIL_BYTES`]).
+    ///
+    /// [`mmq_size::WEIGHT_TAIL_BYTES`]: crate::kernels::cuda::prefill::mmq_size::WEIGHT_TAIL_BYTES
     fn weight_blocks(&self) -> usize {
-        (self.ids.n_experts - 1) * self.stride_blocks() + self.n * self.row_blocks()
+        (self.ids.n_experts - 1) * self.stride_blocks()
+            + (self.n - 1) * self.row_blocks()
+            + k_read(self.k) / self.quant.block_size()
     }
 
     /// The dst floats the launch writes, after [`check_launch_shape`].
@@ -486,20 +494,24 @@ impl MmidLaunchShape {
 }
 
 /// Checks every number rule of a grouped launch (`mmq_mmid.h`) in this order: the id shape, the
-/// type (every [`MmqType`] but NVFP4, whose grouped launch is its own), the K grid (before any
-/// per-type rule),
-/// K's range, N, ld, the stream-k grid limit bounded with J = 8, the stride (whole blocks, at least
-/// one matrix, an `int`), and the `int` weight and dst indexes. Each bound keeps every product
-/// below 2^56, so the sums cannot overflow.
+/// type (every [`MmqType`] but NVFP4, whose grouped launch is its own), K a whole number of the
+/// type's blocks (the `K-block` rule, before any other k rule), K's range, N, ld, the stream-k
+/// grid limit bounded with J = 8, the stride (whole blocks, at least one matrix, an `int`), and
+/// the `int` weight and dst indexes. Each bound keeps every product below 2^56, so the sums
+/// cannot overflow.
 pub(crate) fn check_launch_shape(s: &MmidLaunchShape) -> Result<(), EngError> {
     check_ids_shape(&s.ids)?;
     if MmqType::of(s.quant).is_none() {
         let detail = format!("a grouped {:?} launch has no vendored case", s.quant);
         return Err(rule("type", &detail));
     }
-    if !s.k.is_multiple_of(K_GRID) {
-        let detail = format!("K is {}, not a multiple of {K_GRID}", s.k);
-        return Err(rule("K-grid", &detail));
+    let qk = s.quant.block_size();
+    if !s.k.is_multiple_of(qk) {
+        let detail = format!(
+            "K is {}, not a multiple of {qk} (the {:?} block)",
+            s.k, s.quant
+        );
+        return Err(rule("K-block", &detail));
     }
     ranged("K", s.k, K_GRID, K_MAX)?;
     ranged("N", s.n, 1, INT_MAX)?;

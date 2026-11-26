@@ -239,8 +239,8 @@ fn mmq_quantize_ids_wrappers_refuse_ranges_that_do_not_fit() {
                 scatter(call(k, over(x_scatter)?, over(y_need)?)),
             ),
             (
-                "scatter K off the grid",
-                "mmq_quant: K-grid",
+                "scatter K off the Q4_K block",
+                "mmq_quant: K-block",
                 scatter(call(384, x(x_scatter)?, y(y_need)?)),
             ),
             ("gather base", "", gather(call(k, x(x_gather)?, y(y_need)?))),
@@ -260,8 +260,8 @@ fn mmq_quantize_ids_wrappers_refuse_ranges_that_do_not_fit() {
                 gather(call(k, over(x_gather)?, over(y_need)?)),
             ),
             (
-                "gather K off the grid",
-                "mmq_quant: K-grid",
+                "gather K off the Q4_K block",
+                "mmq_quant: K-block",
                 gather(call(384, x(x_gather)?, y(y_need)?)),
             ),
         ];

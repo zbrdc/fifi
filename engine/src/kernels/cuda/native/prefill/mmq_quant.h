@@ -16,15 +16,16 @@
  *     inverse-map slots name (quantize.cu:524-530); the map values are trusted (the ids
  *     builder guards them).
  *
- * Sizing: y holds `q8_1_bytes(k, ncols)` bytes = `(kpad/128)*ncols*144 + 18,432` with the
- * ONE constant pad (the GEMM's y-tile copies read past the last column; quantize never writes
- * the pad); the source holds `(ncols - 1)*row_stride + k` floats, ids `ncols` ints,
+ * Sizing: y holds `q8_1_bytes(k, ncols)` bytes = `(kread/128)*ncols*144 + 18,432`, kread = k
+ * rounded up to the GEMM's 256-value k tile (MMQ_ITER_K: the GEMM reads whole tiles with no k
+ * clamp, and the quantize writes zeros from k to kread, so a row's last tile adds exact zeros),
+ * with the ONE constant pad (the GEMM's y-tile copies read past the last column; quantize never
+ * writes the pad); the source holds `(ncols - 1)*row_stride + k` floats, ids `ncols` ints,
  * ids_src1_inv `m*top_k` ints.
  *
  * Refusals (INFERENCE_CUDA_INVALID_ARGUMENT before any CUDA call; the Rust wrapper mirrors
- * every rule so the native entry cannot latch the backend): k off the 256-value K grid or
- * above 32768 (MMQ_ITER_K: the GEMM reads 256-value k strides with no k clamp, so a buffer it
- * cannot read safely is never built), row_stride not a multiple of 4 or below k or above 2^30
+ * every rule so the native entry cannot latch the backend): k not a whole number of the weight
+ * type's blocks, or outside 256..=32768, row_stride not a multiple of 4 or below k or above 2^30
  * (float4 row alignment), ncols/m/top_k outside the domain (1..=4096 columns plain and
  * tokens, `m*top_k` in 1..=32768 gathered and scattered, top_k in 1..=32), a weight type with
  * no q8_1 ds layout (MMQ_Q8_1_DS_LAYOUT_INVALID), a NULL or misaligned pointer, and an output
@@ -47,7 +48,7 @@ typedef struct inference_cuda_mmq_quantize_args {
     const void *ids; /* NULL, or i32 [ncols] gather map, 4-byte aligned */
     void *y;         /* block_q8_1_mmq, 16-byte aligned */
     int type;        /* ggml_type discriminant of the consuming GEMM's weight */
-    int k;           /* values per row quantized: 256, 512, ..., 32768 */
+    int k;           /* values per row quantized: 256..=32768, a multiple of the type's block */
     int row_stride;  /* floats per source row: multiple of 4, k..=2^30 */
     int ncols;       /* output columns: 1..=4096 (ids == NULL), 1..=32768 (ids != NULL) */
     int packing;     /* 0: vendor, 1: CPU-reference Q8_0/Q4_K packing */
@@ -59,7 +60,7 @@ typedef struct inference_cuda_mmq_quantize_scatter_args {
     const void *ids_src1_inv;   /* i32 [m*top_k] inverse map, 4-byte aligned */
     void *y;                    /* block_q8_1_mmq, 16-byte aligned */
     int type;                   /* ggml_type discriminant of the consuming GEMM's weight */
-    int k;                      /* values per row quantized: 256, 512, ..., 32768 */
+    int k;                      /* values per row: 256..=32768, a multiple of the type's block */
     int row_stride;             /* floats per source row: multiple of 4, k..=2^30 */
     int m;                      /* source rows (tokens): 1..=4096 */
     int top_k;                  /* compact rows per token: 1..=32, m*top_k <= 32768 */
