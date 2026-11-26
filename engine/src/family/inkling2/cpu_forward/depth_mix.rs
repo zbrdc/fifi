@@ -50,9 +50,27 @@ impl Stream {
 
     #[cfg(all(feature = "native-cuda", target_os = "linux"))]
     pub(super) fn append_device_state(&self, bytes: &mut Vec<u8>) {
-        let mut append = |row: &[f32]| bytes.extend(row.iter().flat_map(|v| v.to_ne_bytes()));
-        append(&self.current);
-        self.sealed.iter().for_each(|row| append(row));
+        let at = bytes.len();
+        bytes.resize(at + self.device_state_bytes(), 0);
+        self.write_device_state(&mut bytes[at..]);
+    }
+
+    /// The bytes of the device state: the current row, then the sealed rows in order.
+    #[cfg(all(feature = "native-cuda", target_os = "linux"))]
+    pub(super) fn device_state_bytes(&self) -> usize {
+        (self.current.len() + self.sealed.iter().map(|row| row.len()).sum::<usize>())
+            * size_of::<f32>()
+    }
+
+    /// Writes the device state into `out`, which holds [`Self::device_state_bytes`] bytes.
+    #[cfg(all(feature = "native-cuda", target_os = "linux"))]
+    pub(super) fn write_device_state(&self, out: &mut [u8]) {
+        let values = std::iter::once(&self.current[..])
+            .chain(self.sealed.iter().map(|row| &row[..]))
+            .flatten();
+        for (word, value) in out.as_chunks_mut::<4>().0.iter_mut().zip(values) {
+            *word = value.to_ne_bytes();
+        }
     }
 
     #[cfg(all(feature = "native-cuda", target_os = "linux"))]

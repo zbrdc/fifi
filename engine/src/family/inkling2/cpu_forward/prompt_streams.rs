@@ -66,12 +66,17 @@ impl PromptStreams {
         }
         let stride = (1 + capacity) * width * WORD;
         let states = context.allocate(streams.len() * stride)?;
-        let mut bytes = Vec::with_capacity(streams.len() * stride);
-        for row in streams {
-            row.append_device_state(&mut bytes);
-            bytes.resize(bytes.len().next_multiple_of(stride), 0);
+        // The device zeroes the room for later seals; only each row's rows cross the bus, one
+        // enqueued copy per row from a packed host image.
+        states.zero_at(stream, 0, streams.len() * stride)?;
+        let used = (1 + blocks) * width * WORD;
+        let mut bytes = vec![0; streams.len() * used];
+        for (row, out) in streams.iter().zip(bytes.chunks_exact_mut(used)) {
+            row.write_device_state(out);
         }
-        states.write_at(stream, 0, &bytes)?;
+        for (index, row) in bytes.chunks_exact(used).enumerate() {
+            states.write_at_enqueue(stream, index * stride, row)?;
+        }
         let health = context.allocate(WORD)?;
         health.write_at(stream, 0, &[0; WORD])?;
         Ok(Self {
