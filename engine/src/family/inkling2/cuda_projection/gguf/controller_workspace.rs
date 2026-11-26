@@ -6,21 +6,16 @@ use crate::family::inkling2::switches::Switch;
 pub(super) const TILE_ROWS: usize = 8;
 const MAX_BYTES: usize = 4 << 20;
 
-/// Keep the legacy workspace and shape unless both weight experiments are enabled.
+/// The most rows a prompt tile takes: 256 when both wide weight paths are on (the admission
+/// below steps down to 128, 64 and then 8 rows by the free memory), else the legacy 8. On a
+/// 512-token prompt 256-row tiles measured 12% faster prefill than 64-row ones on the Fast IQ4_NL
+/// model and 8.5% on UD-IQ1_M, with the same text.
 pub(super) fn target_rows() -> usize {
-    static ROWS: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
-    *ROWS.get_or_init(|| {
-        if Switch::PrefillQ8Visit.on() && Switch::PrefillWeightWide.on() {
-            // Larger arena is separately opt-in; unknown settings use 64.
-            match std::env::var("FIFI_INKLING_CUDA_PREFILL_WEIGHT_WINDOW").as_deref() {
-                Ok("128") => 128,
-                Ok("256") => 256,
-                _ => 64,
-            }
-        } else {
-            TILE_ROWS
-        }
-    })
+    if Switch::PrefillQ8Visit.on() && Switch::PrefillWeightWide.on() {
+        256
+    } else {
+        TILE_ROWS
+    }
 }
 
 pub(super) fn enabled() -> bool {
