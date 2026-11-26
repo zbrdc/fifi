@@ -1403,3 +1403,227 @@ fn matvec_expert_wpr_mode_matches_dense_within_reassociation() {
     }
     inference_cuda_test_arm_mvq_wpr(0);
 }
+
+/// Inkling's decode expert shapes on the IQ4_NL stacks (timing only): the shared MoE block's
+/// packed f32 GEMVs against the q8_1 window matvec and its exact f32 twin, 8 of 128 experts,
+/// gate/up k 2304 rows 2304 and down k 1152 rows 2304.
+#[test]
+#[ignore = "timing only, run on the device with --ignored"]
+fn inkling_iq4nl_expert_paths_bench() {
+    use crate::kernels::cuda::resident::dense_gemv::{
+        DenseDtype, GgufMoeCall, GgufMoePicks, GgufMoeShape, GgufMoeWeights,
+    };
+    use crate::kernels::cuda::resident::matvec_gguf_f32::ExpertF32Call;
+    use crate::weights::GgufType;
+    if !testkit::device_present("inkling_iq4nl_expert_paths_bench") {
+        return;
+    }
+    let ctx = CudaContext::new().expect("context");
+    let stream = ctx.stream().expect("stream");
+    let (hidden, middle, experts, used) = (2304_usize, 1152_usize, 128_usize, 8_usize);
+    let ty = QuantType::Iq4Nl;
+    let gate_bytes = ty.weight_bytes(2 * middle * experts, hidden).expect("size");
+    let down_bytes = ty.weight_bytes(hidden * experts, middle).expect("size");
+    let gate = testkit::upload_filled(&ctx, 0x3C, gate_bytes);
+    let down = testkit::upload_filled(&ctx, 0x3C, down_bytes);
+    let ids = ids_buffer(&ctx, &[0, 17, 33, 50, 64, 81, 99, 127]);
+    let ones = |n: usize| testkit::upload_f32(&ctx, &vec![1.0_f32; n]);
+    let (weights, gate_scales, down_scales) = (ones(used), ones(experts), ones(experts));
+    let x = testkit::upload_f32(&ctx, &vec![0.01_f32; hidden]);
+    let shape = GgufMoeShape {
+        hidden,
+        middle,
+        experts,
+    };
+    let scratch_bytes = shape.scratch_bytes(used).expect("scratch");
+    let scratch = testkit::upload_filled(&ctx, 0, scratch_bytes);
+    let y = testkit::upload_filled(&ctx, 0, hidden * 4);
+    let dtype = DenseDtype::PackedGguf(GgufType::Iq4Nl);
+    let read = (ty.weight_bytes(2 * middle, hidden).expect("size")
+        + ty.weight_bytes(hidden, middle).expect("size")) as f64
+        * used as f64;
+
+    let (flush_k, flush_rows) = (1024_usize, 64_000_usize);
+    let flush_w_bytes = QuantType::Q80
+        .weight_bytes(flush_rows, flush_k)
+        .expect("size");
+    let (flush_w, flush_x, flush_y) = (
+        testkit::upload_filled(&ctx, 0x5A, flush_w_bytes),
+        testkit::upload_filled(&ctx, 0x5A, q8_1_bytes(flush_k, 1).expect("size")),
+        testkit::upload_filled(&ctx, 0x5A, flush_rows * 4),
+    );
+    let flush = || {
+        ctx.matvec_q(
+            &stream,
+            MatvecCall {
+                ty: QuantType::Q80,
+                w: flush_w.range(0, flush_w_bytes).expect("flush w"),
+                x_q8: flush_x
+                    .range(0, q8_1_bytes(flush_k, 1).expect("size"))
+                    .expect("x"),
+                y: flush_y.range(0, flush_rows * 4).expect("flush y"),
+                k: flush_k,
+                rows: flush_rows,
+                ncols: 1,
+            },
+        )
+        .expect("flush matvec");
+    };
+    let report = |name: &str, launch: &dyn Fn()| {
+        let warm = bench(&ctx, &stream, 200, launch);
+        let mut cold = Vec::new();
+        for _ in 0..15 {
+            flush();
+            let start = ctx.bench_mark(&stream).expect("start");
+            launch();
+            let end = ctx.bench_mark(&stream).expect("end");
+            stream.synchronize().expect("drain");
+            cold.push(ctx.bench_elapsed_ms(start, end).expect("elapsed") * 1000.0);
+            ctx.bench_destroy(start).expect("destroy");
+            ctx.bench_destroy(end).expect("destroy");
+        }
+        cold.sort_by(|a, b| a.total_cmp(b));
+        let cold = cold[cold.len() / 2];
+        println!(
+            "{name:34} warm {warm:7.1} us {:5.0} GB/s  cold {cold:7.1} us {:5.0} GB/s",
+            read / (f64::from(warm) * 1000.0),
+            read / (f64::from(cold) * 1000.0)
+        );
+    };
+
+    let moe = || {
+        ctx.gguf_moe(
+            &stream,
+            GgufMoeCall {
+                shape,
+                dtypes: [dtype, dtype],
+                caps: [100.0, 100.0],
+                picks: GgufMoePicks::Device {
+                    count: used,
+                    ids: ids.range(0, used * 4).expect("ids"),
+                    weights: weights.range(0, used * 4).expect("w"),
+                    scales: [
+                        gate_scales.range(0, experts * 4).expect("gs"),
+                        down_scales.range(0, experts * 4).expect("ds"),
+                    ],
+                },
+                weights: GgufMoeWeights::Stacks([
+                    gate.range(0, gate_bytes).expect("gate"),
+                    down.range(0, down_bytes).expect("down"),
+                ]),
+                x: x.range(0, hidden * 4).expect("x"),
+                scratch: scratch.range(0, scratch_bytes).expect("scratch"),
+                y: y.range(0, hidden * 4).expect("y"),
+            },
+        )
+        .expect("gguf moe");
+    };
+    report("shared MoE block (packed f32)", &moe);
+
+    let xq_bytes = q8_1_bytes(hidden, 1).expect("size");
+    let mq_bytes = q8_1_bytes(middle, used).expect("size");
+    let xq = testkit::upload_filled(&ctx, 0, xq_bytes);
+    let mq = testkit::upload_filled(&ctx, 0, mq_bytes);
+    let gu = testkit::upload_filled(&ctx, 0, used * 2 * middle * 4);
+    let mid = testkit::upload_f32(&ctx, &vec![0.01_f32; used * middle]);
+    let dn = testkit::upload_filled(&ctx, 0, used * hidden * 4);
+    let q8 = || {
+        ctx.quantize_q8_1(
+            &stream,
+            QuantizeCall {
+                x: x.range(0, hidden * 4).expect("x"),
+                y: xq.range(0, xq_bytes).expect("xq"),
+                k: hidden,
+                ncols: 1,
+            },
+        )
+        .expect("quantize x");
+        ctx.matvec_expert(
+            &stream,
+            ExpertMatvecCall {
+                ty,
+                w_stack: gate.range(0, gate_bytes).expect("gate"),
+                ids: ids.range(0, used * 4).expect("ids"),
+                x_q8: xq.range(0, xq_bytes).expect("xq"),
+                x_per_slot: false,
+                y: gu.range(0, used * 2 * middle * 4).expect("gu"),
+                y_slot_stride: 2 * middle,
+                k: hidden,
+                rows: 2 * middle,
+                n_expert: experts,
+                n_used: used,
+                glu_gate: None,
+            },
+        )
+        .expect("gate up");
+        ctx.quantize_q8_1(
+            &stream,
+            QuantizeCall {
+                x: mid.range(0, used * middle * 4).expect("mid"),
+                y: mq.range(0, mq_bytes).expect("mq"),
+                k: middle,
+                ncols: used,
+            },
+        )
+        .expect("quantize middle");
+        ctx.matvec_expert(
+            &stream,
+            ExpertMatvecCall {
+                ty,
+                w_stack: down.range(0, down_bytes).expect("down"),
+                ids: ids.range(0, used * 4).expect("ids"),
+                x_q8: mq.range(0, mq_bytes).expect("mq"),
+                x_per_slot: true,
+                y: dn.range(0, used * hidden * 4).expect("dn"),
+                y_slot_stride: hidden,
+                k: middle,
+                rows: hidden,
+                n_expert: experts,
+                n_used: used,
+                glu_gate: None,
+            },
+        )
+        .expect("down");
+    };
+    report("q8_1 window: quantize + gu + down", &q8);
+
+    let exact = || {
+        ctx.matvec_gguf_f32_expert(
+            &stream,
+            ExpertF32Call {
+                ty,
+                w_stack: gate.range(0, gate_bytes).expect("gate"),
+                ids: ids.range(0, used * 4).expect("ids"),
+                x: x.range(0, hidden * 4).expect("x"),
+                x_per_slot: false,
+                y: gu.range(0, used * 2 * middle * 4).expect("gu"),
+                y_slot_stride: 2 * middle,
+                k: hidden,
+                rows: 2 * middle,
+                n_expert: experts,
+                n_used: used,
+                glu_gate: None,
+            },
+        )
+        .expect("gate up f32");
+        ctx.matvec_gguf_f32_expert(
+            &stream,
+            ExpertF32Call {
+                ty,
+                w_stack: down.range(0, down_bytes).expect("down"),
+                ids: ids.range(0, used * 4).expect("ids"),
+                x: mid.range(0, used * middle * 4).expect("mid"),
+                x_per_slot: true,
+                y: dn.range(0, used * hidden * 4).expect("dn"),
+                y_slot_stride: hidden,
+                k: middle,
+                rows: hidden,
+                n_expert: experts,
+                n_used: used,
+                glu_gate: None,
+            },
+        )
+        .expect("down f32");
+    };
+    report("f32 window twin: gu + down", &exact);
+}
