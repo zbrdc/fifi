@@ -539,8 +539,9 @@ fn matvec_expert_equals_the_dense_launch_per_slot() {
 
 /// The vendored MMVQ takes every type: for each of the 18 kernel formats, the expert products of
 /// the shared-x (gate/up) view match the f64 product of the host-dequantized weights with the
-/// q8_1 activations, and for the types the window kernel serves by default the two kernels agree
-/// within the same bound. Only the float sums' order separates them from the reference.
+/// q8_1 activations, and the window kernel's match it too for every type it takes. Only the
+/// float sums' order separates them from the reference, and for Q4_0, Q5_0 and IQ1_S the
+/// vendored kernel's per-block shift against the q8_1 block's stored sum.
 #[test]
 fn the_vendored_expert_matvec_takes_every_type() {
     use crate::kernels::cuda::resident::matvec_gguf_f32::tests::{CASES, fixture};
@@ -610,27 +611,78 @@ fn the_vendored_expert_matvec_takes_every_type() {
                 f64::from(d) * f64::from(block[4 + i % 32] as i8)
             })
             .collect();
+        // Q4_0, Q5_0 and IQ1_S take a per-block shift of their weights against the q8_1 block's
+        // f16 sum of the unquantized activations, as upstream's vec_dot does, not against the sum
+        // of the quantized values the dequantized weights meet: Q4_0 and Q5_0 their offset (-8
+        // or -16 times the block's scale), IQ1_S its sub-block's -1 plus or minus IQ1S_DELTA
+        // times its scale. Each 32-value block moves by shift * (that sum - the quantized sum).
+        let shift = |row_blocks: &[u8], b: usize| -> Option<f64> {
+            let f16 = |at: usize| {
+                f64::from(testkit::f16_to_f32(u16::from_le_bytes([
+                    row_blocks[at],
+                    row_blocks[at + 1],
+                ])))
+            };
+            match ty {
+                QuantType::Q40 => Some(-8.0 * f16(b * ty.block_bytes())),
+                QuantType::Q50 => Some(-16.0 * f16(b * ty.block_bytes())),
+                QuantType::Iq1S => {
+                    // block_iq1_s: f16 d, 32 bytes of grid indices, then one u16 per sub-block.
+                    let (block, sub) = (b / 8 * ty.block_bytes(), b % 8);
+                    let qh = u16::from_le_bytes([
+                        row_blocks[block + 34 + 2 * sub],
+                        row_blocks[block + 35 + 2 * sub],
+                    ]);
+                    let scale = f64::from(2 * ((qh >> 12) & 7) + 1);
+                    let delta = if qh & 0x8000 != 0 { -0.125 } else { 0.125 };
+                    Some(f16(block) * scale * (delta - 1.0))
+                }
+                _ => None,
+            }
+        };
+        let block_sums: Vec<(f64, f64)> = (0..k / 32)
+            .map(|b| {
+                let block = &q8[b * 36..];
+                let stored = testkit::f16_to_f32(u16::from_le_bytes([block[2], block[3]]));
+                (xq[b * 32..][..32].iter().sum(), f64::from(stored))
+            })
+            .collect();
+        let row_bytes = k / ty.block_size() * ty.block_bytes();
         let weights = crate::weights::dequantize(gguf, &blocks).expect("dequantize");
         let vendored = run(ExpertKernel::Vendored);
-        let window =
-            (ExpertKernel::of(ty) == ExpertKernel::Window).then(|| run(ExpertKernel::Window));
+        // The window kernel takes every type but the four the vendored MMVQ served first, routed
+        // there or not.
+        let window = (!matches!(
+            ty,
+            QuantType::Q4K | QuantType::Q50 | QuantType::Q6K | QuantType::Q80
+        ))
+        .then(|| run(ExpertKernel::Window));
         for (slot, &id) in IDS.iter().enumerate() {
             for row in 0..rows {
                 let w = &weights[(id as usize * rows + row) * k..][..k];
-                let (sum, abs) = w.iter().zip(&xq).fold((0.0, 0.0), |(s, a), (&w, &x)| {
-                    (s + f64::from(w) * x, a + (f64::from(w) * x).abs())
-                });
+                let (quantized_sum, abs) =
+                    w.iter().zip(&xq).fold((0.0, 0.0), |(s, a), (&w, &x)| {
+                        (s + f64::from(w) * x, a + (f64::from(w) * x).abs())
+                    });
+                let mut sum = quantized_sum;
+                let row_blocks = &blocks[(id as usize * rows + row) * row_bytes..];
+                for (b, (quantized, stored)) in block_sums.iter().enumerate() {
+                    if let Some(shift) = shift(row_blocks, b) {
+                        sum += shift * (stored - quantized);
+                    }
+                }
                 let bound = 1e-4 * abs + 1e-6;
                 let got = f64::from(vendored[slot * rows + row]);
                 assert!(
                     (got - sum).abs() <= bound,
                     "{ty:?} slot {slot} row {row}: vendored {got} vs {sum} (bound {bound})"
                 );
+                // The window kernel takes every offset against the quantized values.
                 if let Some(window) = &window {
                     let other = f64::from(window[slot * rows + row]);
                     assert!(
-                        (got - other).abs() <= bound,
-                        "{ty:?} slot {slot} row {row}: vendored {got} vs window {other}"
+                        (other - quantized_sum).abs() <= bound,
+                        "{ty:?} slot {slot} row {row}: window {other} vs {quantized_sum} (bound {bound})"
                     );
                 }
             }
