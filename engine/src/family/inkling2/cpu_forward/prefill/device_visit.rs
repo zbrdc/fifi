@@ -153,6 +153,19 @@ impl DevicePrompt {
         self.bank = None;
     }
 
+    /// Fails when a launch on the device streams, prelude or bank saw a value that was not
+    /// finite: the checks [`Self::materialize`] makes, without the download.
+    pub(super) fn check(&self) -> Result<(), EngError> {
+        self.streams.check(&self.stream)?;
+        if let Some(prelude) = &self.prelude {
+            prelude.check(&self.stream)?;
+        }
+        if let Some(bank) = &self.bank {
+            bank.streams.check(&self.stream)?;
+        }
+        Ok(())
+    }
+
     /// Writes the device streams, prelude and bank back into the rows.
     pub(super) fn materialize(&self, rows: &mut [PromptRow<'_>]) -> Result<(), EngError> {
         let download = |streams: &PromptStreams| {

@@ -75,6 +75,19 @@ impl DeviceRun {
         }
     }
 
+    /// The prompt's end: writes the device streams into the rows when the caller reads them
+    /// (`keep`), else only checks them, and drops them.
+    fn finish(&mut self, rows: &mut Vec<PromptRow<'_>>, keep: bool) -> Result<(), EngError> {
+        if keep {
+            return self.materialize(rows, true);
+        }
+        if let Some(prompt) = self.prompt.take() {
+            prompt.check()?;
+        }
+        rows.clear();
+        Ok(())
+    }
+
     /// Writes the device streams into the rows; `close` also drops them.
     fn materialize(&mut self, rows: &mut [PromptRow<'_>], close: bool) -> Result<(), EngError> {
         if let Some(prompt) = &self.prompt {
@@ -511,8 +524,9 @@ impl CpuForward {
                 (verify, resident_mlp.as_mut()),
             )?;
         }
+        // A plain prefill reads its rows only for taps; verify reads every row.
         #[cfg(all(feature = "native-cuda", target_os = "linux"))]
-        device.materialize(&mut rows, true)?;
+        device.finish(&mut rows, verify || !self.taps.is_empty())?;
         Ok(rows)
     }
 
