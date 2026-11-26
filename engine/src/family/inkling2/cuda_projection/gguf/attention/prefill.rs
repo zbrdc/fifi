@@ -11,6 +11,9 @@ use crate::{
 };
 
 const ARENA_BYTES: usize = 32 << 20;
+/// The boundary the output projection's input rows start on: the tensor-core prompt GEMM reads
+/// its activation rows from 16-byte boundaries, and the status words before them are 4 bytes a row.
+const PROJECTION_ALIGN: usize = 16;
 
 pub(in crate::family::inkling2) fn enabled() -> bool {
     Switch::BatchRelativeAttention.on()
@@ -404,14 +407,27 @@ impl Layout {
     }
 
     /// Bytes every tile needs besides its rows: query scales, the K/V preparation's history
-    /// and weights, and the readback of the last three raw side rows.
+    /// and weights, the readback of the last three raw side rows, and the pad that puts the
+    /// projection's input rows on [`PROJECTION_ALIGN`].
     fn fixed_bytes(self) -> usize {
         let tail = if self.raw_kv {
             (PrepShape::TAPS - 1) * self.side_stride()
         } else {
             0
         };
-        self.scales + 4 * self.kv_prep_words()[0] + tail
+        let pad = if self.projected { PROJECTION_ALIGN } else { 0 };
+        self.scales + 4 * self.kv_prep_words()[0] + tail + pad
+    }
+
+    /// Where the attention rows of a `count`-row tile start, after its `count` output rows at
+    /// `out_at`: on [`PROJECTION_ALIGN`] when a projection reads them, else at `out_at`, where the
+    /// rows are the output.
+    fn attention_at(self, out_at: usize, count: usize) -> usize {
+        if self.projected {
+            (out_at + self.output * count).next_multiple_of(PROJECTION_ALIGN)
+        } else {
+            out_at
+        }
     }
 
     fn capacity(self, query_tiles: bool) -> usize {
@@ -844,11 +860,7 @@ impl ResidentAttention {
         };
         let status_at = prep_at + 4 * prep_words;
         let out_at = status_at + 4 * count;
-        let attention_at = if layout.projected {
-            out_at + layout.output * count
-        } else {
-            out_at
-        };
+        let attention_at = layout.attention_at(out_at, count);
         debug_assert_eq!(work.encoded.len(), status_at);
         work.encoded.resize(out_at, 0);
         work.transfer.write(0, &work.encoded)?;
@@ -1095,15 +1107,46 @@ mod tests {
                 };
                 let capacity = layout.capacity(tiled);
                 let row_bytes = layout.row_bytes().unwrap();
-                assert!(layout.scales + capacity * row_bytes <= ARENA_BYTES);
+                assert!(layout.fixed_bytes() + capacity * row_bytes <= ARENA_BYTES);
                 assert!(
                     capacity == limit.min(DenseGemvShape::MAX_ACTIVATION_ROWS)
-                        || layout.scales + (capacity + 1) * row_bytes > ARENA_BYTES
+                        || layout.fixed_bytes() + (capacity + 1) * row_bytes > ARENA_BYTES
                 );
             }
         }
         assert!(query.capacity(false) > side.capacity(false));
         assert!(side.capacity(false) > host.capacity(false));
+    }
+
+    #[test]
+    fn projected_attention_rows_start_on_the_gemm_boundary() {
+        let shape = RelativeAttentionShape {
+            query_heads: 24,
+            kv_heads: 8,
+            relative_dims: 16,
+            relative_extent: 1024,
+            capacity: 4096,
+        };
+        let layout = Layout::new(shape, Some(2304), projection_side(true, true)).unwrap();
+        assert!(layout.projected);
+        // A 511-row prompt runs as tiles of 171, 171 and 169 rows: 4 status bytes a row put the
+        // output rows, and the attention rows after them, off a 16-byte boundary.
+        for count in [1usize, 169, 170, 171, 172] {
+            let prep_words = layout.kv_prep_words()[0] + count * layout.kv_prep_words()[1];
+            let status_at = layout.input * count + layout.scales + 4 * prep_words;
+            let out_at = status_at + 4 * count;
+            let at = layout.attention_at(out_at, count);
+            assert!(at.is_multiple_of(PROJECTION_ALIGN), "{count} rows: {at}");
+            assert!(
+                at >= out_at + layout.output * count && at < out_at + layout.output * count + 16
+            );
+            assert!(
+                at + count * layout.attention
+                    <= layout.fixed_bytes() + count * layout.row_bytes().unwrap()
+            );
+        }
+        let plain = Layout::new(shape, None, projection_side(true, true)).unwrap();
+        assert_eq!(plain.attention_at(1234, 171), 1234);
     }
 
     #[test]
@@ -1129,7 +1172,7 @@ mod tests {
             assert_eq!(kv.kv_prep_words(), [2 * 7 * 1024, 2 * 4 * 8]);
             assert_eq!(
                 kv.fixed_bytes(),
-                kv.scales + 4 * 2 * 7 * 1024 + 3 * kv.side_stride()
+                kv.scales + 4 * 2 * 7 * 1024 + 3 * kv.side_stride() + PROJECTION_ALIGN
             );
             for tiled in [false, true] {
                 let capacity = kv.capacity(tiled);
