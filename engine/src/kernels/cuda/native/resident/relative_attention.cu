@@ -78,6 +78,19 @@ __device__ __forceinline__ float row_score(const Args &a, const float (&query)[k
     return kScale * warp_sum(dot) + bias;
 }
 
+// The most query heads of one K/V group a block serves. Each K/V row a warp loads is scored and
+// folded for every head of the block, so the rows cross the cache once per group instead of once
+// per head; four heads bound the block's partials and bias tables in shared memory.
+constexpr int kMaxBlockHeads = 4;
+
+// The heads per block for a group of `group` query heads: its largest divisor up to the bound.
+int block_heads(int group) {
+    for (int heads = kMaxBlockHeads; heads > 1; --heads) {
+        if (group % heads == 0) return heads;
+    }
+    return 1;
+}
+
 // The bias table covers extents up to kBiasRows. Below kBiasMinRows rows the warps sum each bias
 // themselves, which costs less than a fill and a barrier.
 constexpr int kBiasRows = 1024;
@@ -126,20 +139,28 @@ __device__ __forceinline__ void load_columns(const float *row, float (&out)[kCol
 constexpr int kBatch = 4;
 
 // One warp computes the weighted sum over its interleaved subset of newest-first rows: warp w
-// adds the distances w, w + kWarps, ... Only the source addresses vary by reader; the FP32
-// recurrence and order do not.
-template <class ReadKv>
-__device__ void partial(const Args &a, const Rows &r, Partials &p, ReadKv read_kv,
-                        const float *biases) {
+// adds the distances w, w + kWarps, ... for each of the H heads from r.head, which share the
+// K/V head. Each head folds the rows in the order a block of its own would, from its own state,
+// so its result keeps its bits. Only the source addresses vary by reader; the FP32 recurrence and
+// order do not. `biases` holds each head's table, or is null when the warps sum each bias.
+template <int H, class ReadKv>
+__device__ void partial(const Args &a, const Rows &r, Partials (&p)[H], ReadKv read_kv,
+                        const float (*biases)[kBiasRows]) {
     const int lane = threadIdx.x % kWarp, warp = threadIdx.x / kWarp;
-    float query[kColumns];
-    float acc[kColumns] = {};
+    float query[H][kColumns];
+    float acc[H][kColumns] = {};
+    float rel[H], peak[H], sum[H];
 #pragma unroll
-    for (int i = 0; i < kColumns; ++i) {
-        query[i] = a.q[r.head * kHeadDim + lane + i * kWarp];
+    for (int h = 0; h < H; ++h) {
+        const int head = r.head + h;
+#pragma unroll
+        for (int i = 0; i < kColumns; ++i) {
+            query[h][i] = a.q[head * kHeadDim + lane + i * kWarp];
+        }
+        rel[h] = lane < a.relative_dims ? a.relative[head * a.relative_dims + lane] : 0.f;
+        peak[h] = -INFINITY;
+        sum[h] = 0.f;
     }
-    const float rel = lane < a.relative_dims ? a.relative[r.head * a.relative_dims + lane] : 0.f;
-    float peak = -INFINITY, sum = 0.f;
     for (int first = warp; first < r.count; first += kWarps * kBatch) {
         float keys[kBatch][kColumns], values[kBatch][kColumns];
 #pragma unroll
@@ -151,38 +172,47 @@ __device__ void partial(const Args &a, const Rows &r, Partials &p, ReadKv read_k
                 load_columns(value, values[j]);
             }
         }
-        float scores[kBatch];
 #pragma unroll
-        for (int j = 0; j < kBatch; ++j) {
-            const int distance = first + j * kWarps;
-            scores[j] =
-                distance < r.count ? row_score(a, query, rel, distance, keys[j], biases) : -INFINITY;
-        }
+        for (int h = 0; h < H; ++h) {
+            const float *table = biases == nullptr ? nullptr : biases[h];
+            float scores[kBatch];
 #pragma unroll
-        for (int j = 0; j < kBatch; ++j) {
-            const float score = scores[j];
-            if (score == -INFINITY) continue;
-            const float next = fmaxf(peak, score);
-            const float correction = expf(peak - next);
-            const float mass = expf(score - next);
-            sum = fmaf(sum, correction, mass);
-#pragma unroll
-            for (int i = 0; i < kColumns; ++i) {
-                acc[i] = fmaf(mass, values[j][i], acc[i] * correction);
+            for (int j = 0; j < kBatch; ++j) {
+                const int distance = first + j * kWarps;
+                scores[j] = distance < r.count
+                                ? row_score(a, query[h], rel[h], distance, keys[j], table)
+                                : -INFINITY;
             }
-            peak = next;
+#pragma unroll
+            for (int j = 0; j < kBatch; ++j) {
+                const float score = scores[j];
+                if (score == -INFINITY) continue;
+                const float next = fmaxf(peak[h], score);
+                const float correction = expf(peak[h] - next);
+                const float mass = expf(score - next);
+                sum[h] = fmaf(sum[h], correction, mass);
+#pragma unroll
+                for (int i = 0; i < kColumns; ++i) {
+                    acc[h][i] = fmaf(mass, values[j][i], acc[h][i] * correction);
+                }
+                peak[h] = next;
+            }
         }
     }
-    if (lane == 0) {
-        p.stats[warp * 2] = peak;
-        p.stats[warp * 2 + 1] = sum;
-    }
 #pragma unroll
-    for (int i = 0; i < kColumns; ++i) {
-        p.values[warp * kHeadDim + lane + i * kWarp] = acc[i];
+    for (int h = 0; h < H; ++h) {
+        if (lane == 0) {
+            p[h].stats[warp * 2] = peak[h];
+            p[h].stats[warp * 2 + 1] = sum[h];
+        }
+#pragma unroll
+        for (int i = 0; i < kColumns; ++i) {
+            p[h].values[warp * kHeadDim + lane + i * kWarp] = acc[h][i];
+        }
     }
 }
 
+// The caller synchronizes the block between two calls: they share the scratch below.
 __device__ void finish(const Args &a, const Rows &r, const Partials &p) {
     __shared__ float sums[kWarps], masses[kWarps], maxima[kWarps];
     const int d = threadIdx.x;
@@ -208,10 +238,22 @@ __device__ void finish(const Args &a, const Rows &r, const Partials &p) {
     }
 }
 
+// Finishes the H heads from r.head, one after another.
+template <int H>
+__device__ void finish_heads(const Args &a, const Rows &r, const Partials (&p)[H]) {
+#pragma unroll
+    for (int h = 0; h < H; ++h) {
+        finish(a, Rows{r.head + h, r.kv_head, r.slot, r.count}, p[h]);
+        if (h + 1 < H) __syncthreads();
+    }
+}
+
+// Block b serves the H query heads from b * H.
+template <int H>
 __global__ void relative_attention(Args a) {
-    __shared__ Partials p;
-    __shared__ float biases[kBiasRows];
-    const int pos = *a.pos, head = blockIdx.x, d = threadIdx.x;
+    __shared__ Partials p[H];
+    __shared__ float biases[H][kBiasRows];
+    const int pos = *a.pos, head = blockIdx.x * H, d = threadIdx.x;
     if (pos < 0 || pos >= kWordMax) {
         if (head == 0 && d == 0) atomicOr(a.status, INFERENCE_CUDA_STATUS_INVALID_STEP_STATE);
         return;
@@ -228,12 +270,13 @@ __global__ void relative_attention(Args a) {
     }
     const bool table = bias_table(a, r.count);
     if (table) {
-        fill_biases(a, head, r.count, biases);
+#pragma unroll
+        for (int h = 0; h < H; ++h) fill_biases(a, head + h, r.count, biases[h]);
         __syncthreads();
     }
-    partial(a, r, p, SerialKv{}, table ? biases : nullptr);
+    partial<H>(a, r, p, SerialKv{}, table ? biases : nullptr);
     __syncthreads();
-    finish(a, r, p);
+    finish_heads<H>(a, r, p);
 }
 
 __device__ int row_stride(int stride, int width) { return stride == 0 ? width : stride; }
@@ -250,11 +293,13 @@ struct SnapshotKv {
     }
 };
 
+// Block (b, query) serves the H query heads from b * H.
+template <int H>
 __global__ void snapshot_queries(Args a, int first, int input_stride, int query_stride,
                                  int side_stride) {
-    __shared__ Partials p;
-    __shared__ float biases[kBiasRows];
-    const int query = blockIdx.y, head = blockIdx.x, pos = first + query;
+    __shared__ Partials p[H];
+    __shared__ float biases[H][kBiasRows];
+    const int query = blockIdx.y, head = blockIdx.x * H, pos = first + query;
     a.status += query;
     const int channels = a.query_heads * kHeadDim;
     a.out += query * channels;
@@ -262,7 +307,10 @@ __global__ void snapshot_queries(Args a, int first, int input_stride, int query_
         if (head == 0 && threadIdx.x == 0) atomicOr(a.status, INFERENCE_CUDA_STATUS_INVALID_STEP_STATE);
         // Output projection can already be queued. Give it initialized inputs even
         // though the host will discard the whole tile based on status.
-        if (threadIdx.x < kHeadDim) a.out[head * kHeadDim + threadIdx.x] = 0.f;
+        if (threadIdx.x < kHeadDim) {
+#pragma unroll
+            for (int h = 0; h < H; ++h) a.out[(head + h) * kHeadDim + threadIdx.x] = 0.f;
+        }
         return;
     }
     const int group = a.query_heads / a.kv_heads;
@@ -274,13 +322,14 @@ __global__ void snapshot_queries(Args a, int first, int input_stride, int query_
     a.gates += query * row_stride(side_stride, channels);
     const bool table = bias_table(a, r.count);
     if (table) {
-        fill_biases(a, head, r.count, biases);
+#pragma unroll
+        for (int h = 0; h < H; ++h) fill_biases(a, head + h, r.count, biases[h]);
         __syncthreads();
     }
-    partial(a, r, p, SnapshotKv{query, row_stride(input_stride, a.kv_heads * kHeadDim)},
-            table ? biases : nullptr);
+    partial<H>(a, r, p, SnapshotKv{query, row_stride(input_stride, a.kv_heads * kHeadDim)},
+               table ? biases : nullptr);
     __syncthreads();
-    finish(a, r, p);
+    finish_heads<H>(a, r, p);
 }
 
 __global__ void snapshot_commit(Args a, int first, int count, int input_stride) {
@@ -381,7 +430,15 @@ extern "C" int inference_cuda_relative_attention_launch(
         report_stage(out_stage, INFERENCE_CUDA_STAGE_NONE);
         if (in == nullptr || stream == nullptr || !valid(*in)) return INFERENCE_CUDA_INVALID_ARGUMENT;
         Failure failure;
-        relative_attention<<<in->query_heads, kThreads, 0, (cudaStream_t)stream>>>(*in);
+        const auto s = (cudaStream_t)stream;
+        const int heads = block_heads(in->query_heads / in->kv_heads);
+        const int blocks = in->query_heads / heads;
+        switch (heads) {
+            case 4: relative_attention<4><<<blocks, kThreads, 0, s>>>(*in); break;
+            case 3: relative_attention<3><<<blocks, kThreads, 0, s>>>(*in); break;
+            case 2: relative_attention<2><<<blocks, kThreads, 0, s>>>(*in); break;
+            default: relative_attention<1><<<blocks, kThreads, 0, s>>>(*in); break;
+        }
         failure.record(cudaGetLastError(), INFERENCE_CUDA_STAGE_LAUNCH);
         report_stage(out_stage, failure.stage);
         return (int)failure.err;
@@ -409,8 +466,18 @@ extern "C" int inference_cuda_relative_attention_tile_launch(
         }
         Failure failure;
         const auto s = (cudaStream_t)stream;
-        snapshot_queries<<<dim3(in->query_heads, count), kThreads, 0, s>>>(
-            *in, first, input_stride, query_stride, side_stride);
+        const int heads = block_heads(in->query_heads / in->kv_heads);
+        const dim3 grid(in->query_heads / heads, count);
+        switch (heads) {
+            case 4: snapshot_queries<4><<<grid, kThreads, 0, s>>>(
+                        *in, first, input_stride, query_stride, side_stride); break;
+            case 3: snapshot_queries<3><<<grid, kThreads, 0, s>>>(
+                        *in, first, input_stride, query_stride, side_stride); break;
+            case 2: snapshot_queries<2><<<grid, kThreads, 0, s>>>(
+                        *in, first, input_stride, query_stride, side_stride); break;
+            default: snapshot_queries<1><<<grid, kThreads, 0, s>>>(
+                        *in, first, input_stride, query_stride, side_stride); break;
+        }
         failure.record(cudaGetLastError(), INFERENCE_CUDA_STAGE_LAUNCH);
         if (failure.err == cudaSuccess) {
             // The stream, not CTA ordering, separates all snapshot reads from writes.
