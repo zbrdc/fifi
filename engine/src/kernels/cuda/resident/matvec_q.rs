@@ -118,12 +118,28 @@ impl QuantType {
     }
 
     /// True for the types whose routed-expert matvec runs the in-house window kernel
-    /// (`matvec_gguf.cu`) by default: every type but the four the vendored MMVQ served first.
-    /// The vendored MMVQ has a case for every type; [`ExpertKernel::of`] applies the route.
+    /// (`matvec_gguf.cu`). The vendored MMVQ has a case for every type and takes the four it
+    /// served first (Q4_K, Q5_0, Q6_K, Q8_0) and the six of the Inkling 2 Mini GGUFs' experts
+    /// (IQ4_NL, IQ1_S, IQ2_XXS, IQ2_XS, IQ2_S, Q2_0), where it measured faster on the 3090:
+    /// a whole decode token 6% faster on the IQ4_NL model and 5% on the IQ1_M one. The other
+    /// types stay on the window kernel until a measurement moves them; [`ExpertKernel::of`]
+    /// applies the route.
     ///
     /// [`ExpertKernel::of`]: crate::kernels::cuda::resident::matvec_expert::ExpertKernel::of
     pub(crate) fn expert_uses_window(self) -> bool {
-        !matches!(self, Self::Q4K | Self::Q50 | Self::Q6K | Self::Q80)
+        !matches!(
+            self,
+            Self::Q4K
+                | Self::Q50
+                | Self::Q6K
+                | Self::Q80
+                | Self::Iq4Nl
+                | Self::Iq1S
+                | Self::Iq2Xxs
+                | Self::Iq2Xs
+                | Self::Iq2S
+                | Self::Q20
+        )
     }
 
     pub(crate) fn block_size(self) -> usize {

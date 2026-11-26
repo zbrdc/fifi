@@ -20,12 +20,12 @@
 //! every range holds the bytes the call uses and is 4-byte aligned; `y` overlaps none of
 //! `w_stack`, `x_q8`, `ids`. A refused call changes nothing.
 //!
-//! The vendored MMVQ has a case for every [`QuantType`]. [`ExpertKernel::of`] routes a type: the
-//! four it served first (Q4_K, Q5_0, Q6_K, Q8_0) run there, and every other type runs the
-//! in-house window kernel (`native/resident/matvec_gguf.cu`) until a measurement moves it: same
-//! layout and ids contract, but `rows` is any positive count and `n_used` is in `1..=32`
-//! (Flash-Next routes ten experts per token). `FIFI_CUDA_EXPERT_MATVEC=vendored` sends every type
-//! to the vendored kernel, for the comparison.
+//! The vendored MMVQ has a case for every [`QuantType`]. [`ExpertKernel::of`] routes a type
+//! ([`QuantType::expert_uses_window`]): the types measured faster there run there, and every
+//! other type runs the in-house window kernel (`native/resident/matvec_gguf.cu`) until a
+//! measurement moves it: same layout and ids contract, but `rows` is any positive count and
+//! `n_used` is in `1..=32` (Flash-Next routes ten experts per token).
+//! [`CudaContext::matvec_expert_on`] names the kernel, for the comparisons.
 
 use crate::EngError;
 use crate::kernels::cuda::context::{
@@ -53,17 +53,12 @@ pub(crate) enum ExpertKernel {
 }
 
 impl ExpertKernel {
-    /// The route of `ty`: [`QuantType::expert_uses_window`], or the vendored kernel for every type
-    /// when `FIFI_CUDA_EXPERT_MATVEC=vendored`.
+    /// The route of `ty`: [`QuantType::expert_uses_window`].
     pub(crate) fn of(ty: QuantType) -> Self {
-        static ALL_VENDORED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-        let all_vendored = *ALL_VENDORED.get_or_init(|| {
-            std::env::var("FIFI_CUDA_EXPERT_MATVEC").is_ok_and(|v| v.trim() == "vendored")
-        });
-        if all_vendored || !ty.expert_uses_window() {
-            Self::Vendored
-        } else {
+        if ty.expert_uses_window() {
             Self::Window
+        } else {
+            Self::Vendored
         }
     }
 }
