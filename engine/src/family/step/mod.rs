@@ -9,7 +9,7 @@
 //! [`ffn`] holds the gated feed-forward block over those projections, [`moe`] the routed block
 //! of a router, a shared expert and the kept experts, [`experts`] the routed expert projections
 //! of a chunk, and [`site`] the residual sites: the plain add and the routed
-//! two-stream site.
+//! two-stream site. [`depth`] is the depth-attention site, attention residuals over depth.
 //!
 //! [`delta`] and [`attend`] are the mixers of a visit: the gated delta rule and the gated full
 //! attention, each over one row or a chunk.
@@ -24,6 +24,7 @@
 
 pub(crate) mod attend;
 pub(crate) mod delta;
+pub(crate) mod depth;
 pub(crate) mod experts;
 pub(crate) mod ffn;
 pub(crate) mod head;

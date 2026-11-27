@@ -8,6 +8,7 @@
 
 use super::attend::{self, At, AttendRows};
 use super::delta::{self, ChannelRows, DeltaNames, DeltaRows};
+use super::depth::{DepthSite, Mix};
 use super::rows::{Map, Norm, StepIo, q8, raw};
 use super::scratch::Core;
 use super::site::{self, MixWeights};
@@ -204,6 +205,15 @@ impl Layer {
     }
 }
 
+/// The sealed rows the states of `site` hold as visit `visit` starts.
+fn site_blocks(site: &DepthSite<'_>, visit: usize) -> Result<usize, EngError> {
+    site.blocks.get(visit).copied().ok_or_else(|| {
+        EngError::BadRequest(format!(
+            "the depth site has no sealed-row count for visit {visit}"
+        ))
+    })
+}
+
 fn unsupported<T>(family: &str, what: &str) -> Result<T, EngError> {
     Err(EngError::BadRequest(format!(
         "{family}: the recipe names {what}, which this model does not run"
@@ -279,6 +289,9 @@ pub(crate) trait Model {
     fn mixed_site(&self) -> Result<site::Mixed<'_>, EngError> {
         unsupported(self.family(), "a mixed residual site")
     }
+    fn depth_site(&self) -> Result<DepthSite<'_>, EngError> {
+        unsupported(self.family(), "a depth-attention residual site")
+    }
     /// Called after every stage of every half.
     fn tap(&self, _visit: usize, _half: Half, _stage: Stage) -> Result<(), EngError> {
         Ok(())
@@ -314,8 +327,19 @@ impl<M: Model> Visits for Walk<'_, M> {
         self.0.begin(n)
     }
 
+    /// The model's own entry runs first, so it still sees the states a rewind replaces (the
+    /// last pass's, for a model that reads across passes); then a depth site marks or rewinds.
     fn enter(&self, visit: usize, n: usize, p0: usize) -> Result<(), EngError> {
-        self.0.enter(visit, n, p0)
+        self.0.enter(visit, n, p0)?;
+        let Site::DepthAttention { repeat, .. } = self.layer(visit)?.site else {
+            return Ok(());
+        };
+        let io = self.0.io(false);
+        match repeat {
+            Repeat::Mark => self.0.depth_site()?.depth.mark(io.ctx, io.stream, n),
+            Repeat::Rewind => self.0.depth_site()?.depth.rewind(io.ctx, io.stream, n),
+            Repeat::Step | Repeat::Leave => Ok(()),
+        }
     }
 
     /// A plain site reads the residual, and its feed-forward read adds the mixer rows in the
@@ -353,8 +377,26 @@ impl<M: Model> Visits for Walk<'_, M> {
                 mixed.read(&io, weights, cur, n)?;
                 (mixed.input.range(0, n * h * 4)?, None)
             }
-            Site::DepthAttention { .. } => {
-                return unsupported(m.family(), "a depth-attention site on the device walk");
+            Site::DepthAttention { queries, seal, .. } => {
+                let site = m.depth_site()?;
+                let blocks = site_blocks(&site, visit)?;
+                // The forward half reads after the mixer half's seal.
+                let blocks = blocks + usize::from(*seal && half == Half::Forward);
+                let query = match &queries[half as usize] {
+                    // A query may hold several rows (one per input of the model's own mixer):
+                    // the walk mixes under the first, and such a mixer mixes the others itself.
+                    Some(name) => Some(io.raw(name)?.slice(0, h * 4)?),
+                    None => None,
+                };
+                let mix = Mix {
+                    query,
+                    norm: None,
+                    first_block: 0,
+                    out: site.input.range(0, n * h * 4)?,
+                    stride: h,
+                };
+                site.depth.mix(io.ctx, io.stream, mix, blocks, n)?;
+                (site.input.range(0, n * h * 4)?, None)
             }
         };
         if let Some(weight) = &layer.norms[half as usize] {
@@ -449,8 +491,12 @@ impl<M: Model> Visits for Walk<'_, M> {
                 mixed.apply(&io, &core.resid[cur], &core.resid[next], branch, n)?;
                 core.cur.set(next);
             }
-            Site::DepthAttention { .. } => {
-                return unsupported(m.family(), "a depth-attention site on the device walk");
+            Site::DepthAttention { seal, .. } => {
+                let site = m.depth_site()?;
+                let blocks = site_blocks(&site, visit)?;
+                let rows = branch.range(0, n * h * 4)?;
+                site.depth
+                    .apply(io.ctx, io.stream, half, *seal, rows, blocks, n)?;
             }
         }
         m.tap(visit, half, Stage::Apply)

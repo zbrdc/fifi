@@ -2,18 +2,19 @@
 //!
 //! Each row's state is its current row and then its sealed rows (each stored RMS-normalized, as
 //! the host [`Stream`] stores them), `1 + capacity` rows apart. Every row of a prompt crosses the
-//! same visits, so all rows hold the same number of sealed rows. The mix and the seal are the
-//! decode token's kernels, a block per row, so a prompt row's states and mixes have the bits a
-//! decode token's would of the same inputs; both agree with the host's within rounding.
+//! same visits, so all rows hold the same number of sealed rows. The launches are those of the
+//! shared depth site ([`Depth`]), a block per row, so a prompt row's states and mixes have the
+//! bits a decode token's would of the same inputs; both agree with the host's within rounding.
 
 use super::{MIX_EPS, Stream, bad};
 use crate::{
     EngError,
+    family::step::{
+        depth::{Depth, Mix},
+        walk::Half,
+    },
     kernels::cuda::{
-        CudaContext, DeviceBuffer, DeviceRange, DeviceStream,
-        resident::depth_attention::{
-            AddCall, MAX_BLOCKS, MixStatesCall, MixStatesShape, SealCall, States, StreamShape,
-        },
+        CudaContext, DeviceBuffer, DeviceRange, DeviceStream, resident::depth_attention::MAX_BLOCKS,
     },
 };
 
@@ -127,21 +128,16 @@ impl PromptStreams {
         self.blocks < self.capacity
     }
 
-    /// The states through `used` rows of the last one: the exact range a launch takes.
-    fn used(&self, used: usize) -> Result<DeviceRange<'_>, EngError> {
-        let rows = (self.rows - 1) * (1 + self.capacity) + used;
-        self.states.range(0, rows * self.width * WORD)
-    }
-
-    fn states(&self) -> States {
-        States {
-            rows: self.rows,
-            stride: 1 + self.capacity,
+    /// The shared depth site over these states.
+    fn site(&self) -> Depth<'_> {
+        Depth {
+            width: self.width,
+            capacity: self.capacity,
+            eps: MIX_EPS,
+            states: &self.states,
+            mark: None,
+            health: &self.health,
         }
-    }
-
-    fn health(&self) -> Result<DeviceRange<'_>, EngError> {
-        self.health.range(0, WORD)
     }
 
     /// `Stream::mix(first_block, query)` of every row, optionally normalized and scaled.
@@ -151,26 +147,15 @@ impl PromptStreams {
         stream: &DeviceStream,
         target: MixTarget<'_>,
     ) -> Result<(), EngError> {
-        let (gamma, norm_eps) = target.norm.unzip();
-        context.depth_attention_mix_states(
-            stream,
-            MixStatesCall {
-                state: self.used(self.blocks + 1)?,
-                query: target.query,
-                gamma,
-                out: target.out,
-                health: self.health()?,
-            },
-            MixStatesShape {
-                first_block: target.first_block,
-                blocks: self.blocks,
-                width: self.width,
-                out_stride: target.stride,
-                mix_eps: MIX_EPS,
-                norm_eps: norm_eps.unwrap_or(1.0),
-            },
-            self.states(),
-        )
+        let mix = Mix {
+            query: target.query,
+            norm: target.norm,
+            first_block: target.first_block,
+            out: target.out,
+            stride: target.stride,
+        };
+        self.site()
+            .mix(context, stream, mix, self.blocks, self.rows)
     }
 
     /// `Stream::seal(next)` of every row; `next` holds one row per state, packed.
@@ -185,20 +170,9 @@ impl PromptStreams {
                 "the device prompt streams have no room for another block",
             ));
         }
-        context.depth_attention_seal_states(
-            stream,
-            SealCall {
-                state: self.used(self.blocks + 2)?,
-                next,
-                health: self.health()?,
-            },
-            StreamShape {
-                blocks: self.blocks,
-                width: self.width,
-                eps: MIX_EPS,
-            },
-            self.states(),
-        )?;
+        let (blocks, rows) = (self.blocks, self.rows);
+        self.site()
+            .apply(context, stream, Half::Mixer, true, next, blocks, rows)?;
         self.blocks += 1;
         Ok(())
     }
@@ -210,15 +184,15 @@ impl PromptStreams {
         stream: &DeviceStream,
         rows: DeviceRange<'_>,
     ) -> Result<(), EngError> {
-        context.depth_attention_add_states(
+        let site = self.site();
+        site.apply(
+            context,
             stream,
-            AddCall {
-                state: self.used(1)?,
-                row: rows,
-                health: self.health()?,
-            },
-            self.width,
-            self.states(),
+            Half::Forward,
+            false,
+            rows,
+            self.blocks,
+            self.rows,
         )
     }
 

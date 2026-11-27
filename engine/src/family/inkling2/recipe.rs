@@ -2,7 +2,10 @@
 //! with the model's own mixer (relative attention) and feed-forward (routed experts).
 
 use super::TextSpec;
-use crate::family::step::recipe::{Forward, Layer, Mixer, Repeat, Site};
+use crate::family::step::{
+    self,
+    recipe::{Forward, Layer, Mixer, Repeat, Site},
+};
 
 /// The layers of `spec`'s visits, in visit order.
 pub(super) fn layers(spec: &TextSpec) -> Vec<Layer> {
@@ -82,29 +85,25 @@ pub(super) fn peak_blocks<'a>(layers: impl Iterator<Item = &'a Layer>, blocks: u
 /// prelude's count plus one) and which of the two banks is active.
 pub(super) type Visit = (bool, bool, usize, Option<(usize, usize)>, usize);
 
-/// [`Visit`] for every layer, from no sealed blocks.
+/// [`Visit`] for every layer, from no sealed blocks: the counts are the shared depth site's.
 pub(super) fn token_layout(layers: &[Layer]) -> Vec<Visit> {
-    let (mut blocks, mut pre, mut bank, mut active) = (0, 0, None, 0);
+    // `end`: the sealed blocks after the previous visit, which a rewind banks.
+    let (mut end, mut bank, mut active) = (0, None, 0);
     layers
         .iter()
-        .map(|layer| {
-            let (seal, pass) = depth(layer);
-            let save = pass == Repeat::Mark;
-            if save {
-                pre = blocks;
-            }
-            let restart = pass == Repeat::Rewind;
+        .zip(step::depth::blocks(layers))
+        .map(|(layer, blocks)| {
+            let (seal, repeat) = depth(layer);
+            let restart = repeat == Repeat::Rewind;
             if restart {
-                bank = Some((blocks, pre + 1));
-                blocks = pre;
+                bank = Some((end, blocks + 1));
                 active ^= 1;
             }
-            if pass == Repeat::Leave {
+            if repeat == Repeat::Leave {
                 bank = None;
             }
-            let visit = (save, restart, blocks, bank, active);
-            blocks += usize::from(seal);
-            visit
+            end = blocks + usize::from(seal);
+            (repeat == Repeat::Mark, restart, blocks, bank, active)
         })
         .collect()
 }
