@@ -881,63 +881,59 @@ static std::pair<dim3, dim3> calc_launch_params(
     return {block_nums, block_dims};
 }
 
-// FIFI-MVQ72 (warp-per-row): the cc 7.2 (Xavier GV11B) shape for the ncols_dst == 1 Q4_K matvec.
-// The GENERIC shape spends a whole 128-thread block plus a cross-warp shared reduction on ONE
-// row - 1152 weight bytes at k 2048 - and at k 512 (two K-blocks per row) idles three quarters
-// of the block. One warp per row with a shuffle-only reduction measured 85 GB/s vs the generic
-// 58 GB/s at k 2048 and 64 vs 19 GB/s at k 512 on idle silicon at ramped clocks (bench-mvq.cu,
-// every variant exact against a CPU oracle), which reconstructs the serve's 0.455 ms/MoE-group
-// attribution. rows_per_block 2 is optimal-or-tied at both shapes; no GLU fusion (the fused
-// launch keeps the generic kernel), and the ids poison rule of V-MV1 (A1) is replicated.
+// FIFI-MVQ72 (warp-per-row): the cc 7.2 (Xavier GV11B) shape for the Q4_K expert matvec (an ids
+// launch, ncols_dst == 1). The GENERIC shape spends a whole 128-thread block plus a cross-warp
+// shared reduction on ONE row - 1152 weight bytes at k 2048 - and at k 512 (two K-blocks per row)
+// idles three quarters of the block. One warp per row with a shuffle-only reduction measured 85
+// GB/s vs the generic 58 GB/s at k 2048 and 64 vs 19 GB/s at k 512 on idle silicon at ramped
+// clocks (bench-mvq.cu, every variant exact against a CPU oracle), and +8.00% on a whole decode
+// (Xavier, 2026-11-27), which reconstructs the serve's 0.455 ms/MoE-group attribution. It is the
+// launch rule on cc 7.2 for a row of at most 8 K-blocks (k <= 2048): there the lane adds the same
+// blocks in the same order as the generic shape and both end in the same warp reduction, so the
+// result is the generic kernel's bit for bit (the device test
+// matvec_expert_wpr_arm_is_the_generic_bits_on_one_pass_rows). A longer row reassociates and
+// keeps the generic kernel. No GLU fusion (the fused launch needs the generic kernel's two-stack
+// loop); the ids poison rule of V-MV1 (A1) is replicated. rows_per_block 2 is optimal-or-tied at
+// both shapes.
 template<ggml_type type, int rows_per_block>
 __launch_bounds__(rows_per_block*ggml_cuda_get_physical_warp_size(), 1)
 static __global__ void mul_mat_vec_q_wpr(
         const void * vx_ptr, const void * vy_ptr, const int32_t * ids_ptr, float * dst_ptr,
         const uint32_t ncols_x, const uint3 nchannels_y, const uint32_t nchannels_x, const uint32_t stride_row_x,
-        const uint32_t stride_col_y, const uint32_t stride_col_dst, const uint3 channel_ratio,
-        const uint32_t stride_channel_x, const uint32_t stride_channel_y, const uint32_t stride_channel_dst,
-        const uint3 sample_ratio, const uint32_t stride_sample_x, const uint32_t stride_sample_y,
-        const uint32_t stride_sample_dst, const uint32_t ids_stride) {
+        const uint32_t stride_col_dst, const uint32_t stride_channel_x, const uint32_t stride_channel_y,
+        const uint32_t stride_channel_dst, const uint3 sample_ratio, const uint32_t stride_sample_x,
+        const uint32_t stride_sample_y, const uint32_t stride_sample_dst) {
     const void    * GGML_CUDA_RESTRICT vx  = vx_ptr;
     const void    * GGML_CUDA_RESTRICT vy  = vy_ptr;
     const int32_t * GGML_CUDA_RESTRICT ids = ids_ptr;
     float         * GGML_CUDA_RESTRICT dst = dst_ptr;
-    GGML_UNUSED(stride_col_y);
-    GGML_UNUSED(ids_stride);
 
     constexpr int qk  = ggml_cuda_type_traits<type>::qk;
     constexpr int qi  = ggml_cuda_type_traits<type>::qi;
     constexpr int vdr = get_vdr_mmvq(type);
     constexpr int warp_size = ggml_cuda_get_physical_warp_size();
     constexpr vec_dot_q_cuda_t vec_dot_q_cuda = get_vec_dot_q_cuda(type);
-    GGML_UNUSED(stride_col_y);
-    GGML_UNUSED(ids_stride);
 
     const uint32_t channel_dst = blockIdx.y;
-    uint32_t channel_x;
-    uint32_t channel_y;
-    uint32_t sample_dst;
 
     ggml_cuda_pdl_sync();
-    channel_x  = ids ? ids[channel_dst]                     : fastdiv(channel_dst, channel_ratio);
-    channel_y  = ids ? fastmodulo(channel_dst, nchannels_y) : channel_dst;
-    sample_dst = blockIdx.z;
-
-    const uint32_t sample_x = fastdiv(sample_dst, sample_ratio);
-    const uint32_t sample_y = sample_dst;
+    const uint32_t channel_x  = ids[channel_dst];
+    const uint32_t channel_y  = fastmodulo(channel_dst, nchannels_y);
+    const uint32_t sample_dst = blockIdx.z;
+    const uint32_t sample_x   = fastdiv(sample_dst, sample_ratio);
 
     const int row = blockIdx.x*rows_per_block + threadIdx.y;
     dst += sample_dst*stride_sample_dst + channel_dst*stride_channel_dst;
     const bool row_live = uint32_t(row) < stride_col_dst;
 
-    if (ids != nullptr && channel_x >= nchannels_x) {
+    if (channel_x >= nchannels_x) {
         if (threadIdx.x == 0 && row_live) {
             dst[row] = __int_as_float(0x7fc00000);
         }
         return;
     }
 
-    const block_q8_1 * y = ((const block_q8_1 *) vy) + sample_y*stride_sample_y + channel_y*stride_channel_y;
+    const block_q8_1 * y = ((const block_q8_1 *) vy) + sample_dst*stride_sample_y + channel_y*stride_channel_y;
     const int kbx_offset = sample_x*stride_sample_x + channel_x*stride_channel_x + row*stride_row_x;
     const int blocks_per_row_x = ncols_x / qk;
     const int blocks_per_iter  = vdr * warp_size / qi;
@@ -962,32 +958,27 @@ template<ggml_type type>
 static cudaError_t mul_mat_vec_q_wpr_launch(
         const void * vx, const void * vy, const int32_t * ids, float * dst,
         const int ncols_x, const uint3 nchannels_y_fd, const int nchannels_x, const int nrows_x,
-        const int stride_row_x, const int stride_col_dst, const uint3 channel_ratio_fd,
-        const int nchannels_dst, const int stride_channel_x, const int stride_channel_y,
-        const int stride_channel_dst, const int nsamples_dst, const uint3 sample_ratio_fd,
-        const int stride_sample_x, const int stride_sample_y, const int stride_sample_dst,
-        cudaStream_t stream) {
+        const int stride_row_x, const int stride_col_dst, const int nchannels_dst,
+        const int stride_channel_x, const int stride_channel_y, const int stride_channel_dst,
+        const int nsamples_dst, const uint3 sample_ratio_fd, const int stride_sample_x,
+        const int stride_sample_y, const int stride_sample_dst, cudaStream_t stream) {
     constexpr int rows_per_block = 2;
     const int nblocks = (nrows_x + rows_per_block - 1) / rows_per_block;
     const dim3 block_nums(nblocks, nchannels_dst, nsamples_dst);
     const dim3 block_dims(WARP_SIZE, rows_per_block, 1);
     mul_mat_vec_q_wpr<type, rows_per_block><<<block_nums, block_dims, 0, stream>>>(
-        vx, vy, ids, dst, ncols_x, nchannels_y_fd, nchannels_x, stride_row_x, 0, stride_col_dst,
-        channel_ratio_fd, stride_channel_x, stride_channel_y, stride_channel_dst, sample_ratio_fd,
-        stride_sample_x, stride_sample_y, stride_sample_dst, 0);
+        vx, vy, ids, dst, ncols_x, nchannels_y_fd, nchannels_x, stride_row_x, stride_col_dst,
+        stride_channel_x, stride_channel_y, stride_channel_dst, sample_ratio_fd,
+        stride_sample_x, stride_sample_y, stride_sample_dst);
     return cudaGetLastError();
 }
 
-// FIFI-MVQ72: the test-only arm override; the env var stays the operator's control and the
-// dedicated tolerance test (which cannot touch the env: -D unsafe-code) flips this instead.
+// FIFI-MVQ72: the test-only override of the launch rule. The crate's tests cannot set an
+// environment variable (-D unsafe-code), so they set this instead: 0 leaves the rule alone, a
+// positive value forces the warp-per-row kernel and a negative value the generic one, on every
+// device and at every row length.
 static int g_mvq_wpr_test_arm = 0;
-extern "C" void inference_cuda_test_arm_mvq_wpr(const int on) { g_mvq_wpr_test_arm = on; }
-
-// FIFI-MMQ-PIPE: test arm for the pipelined mul_mat_q k-loop (mmq.cuh reads this at launch
-// time next to INFERENCE_CUDA_MMQ_PIPE; defined here because mmq.cuh is included by several
-// template-instance TUs and needs exactly one definition).
-int g_mmq_pipe_test_arm = 0;
-extern "C" void inference_cuda_test_arm_mmq_pipe(const int on) { g_mmq_pipe_test_arm = on; }
+extern "C" void inference_cuda_test_arm_mvq_wpr(const int mode) { g_mvq_wpr_test_arm = mode; }
 
 // V-MV1 (b): returns cudaError_t; the fusion assert is a returned cudaErrorInvalidValue and the
 // ggml_cuda_kernel_launch result is returned, never swallowed.
@@ -1168,34 +1159,20 @@ static cudaError_t mul_mat_vec_q_switch_ncols_dst(
             // static, else MSVC lambda capture breaks the constexpr uses below
             static constexpr int c_ncols_dst = 1;
 
-            // FIFI-MVQ72: the Xavier warp-per-row shape (see mul_mat_vec_q_wpr). cc 7.2 only,
-            // default OFF. The ids arm is INFERENCE_CUDA_MVQ_WPR; the dense ncols-1 arm (the
-            // per-token projections and the head, which dominate the decode step) is
-            // INFERENCE_CUDA_MVQ_WPR_DENSE - separate gates because the dense arm changes the
-            // bits of every dense matvec while the ids arm only touches the expert launches,
-            // so each can be qualified alone. Both arms' reduction order differs from the
-            // generic kernel, so the seam's bit-level contracts (single vs multi-column dense,
-            // ids vs dense per slot) hold only while every path uses the generic kernel;
-            // flag-on the ids path is oracle-exact (2.9e-08) and the dense arm is ULP-bounded
-            // against the integer reference (0.007 of the stated tolerance); dedicated
-            // tolerance tests cover both. No GLU fusion (the fused launch needs the generic
-            // kernel's two-stack loop). The flags are read per call (no static cache) so a
-            // test process can arm them around individual launches; one getenv is noise
-            // against a 100 microsecond launch. The constexpr keeps the kernel Q4_K-only.
+            // FIFI-MVQ72: the warp-per-row kernel is the launch rule for the Q4_K expert matvec on
+            // cc 7.2 when the row has at most 8 K-blocks (see mul_mat_vec_q_wpr); the test override
+            // can force either kernel. Read per call, no static cache.
             if constexpr (type == GGML_TYPE_Q4_K) {
                 const bool fusion_none = fusion.gate == nullptr && fusion.x_bias == nullptr &&
                                          fusion.gate_bias == nullptr && fusion.x_scale == nullptr &&
                                          fusion.gate_scale == nullptr;
-                const bool ids_arm =
-                    ids != nullptr &&
-                    (g_mvq_wpr_test_arm != 0 || std::getenv("INFERENCE_CUDA_MVQ_WPR") != nullptr);
-                const bool dense_arm =
-                    ids == nullptr && (g_mvq_wpr_test_arm != 0 ||
-                                       std::getenv("INFERENCE_CUDA_MVQ_WPR_DENSE") != nullptr);
-                if (fusion_none && cc == 720 && (ids_arm || dense_arm)) {
+                const int  mode     = g_mvq_wpr_test_arm;
+                const bool one_pass = ncols_x <= 8*ggml_cuda_type_traits<type>::qk;
+                const bool wpr      = mode > 0 || (mode == 0 && cc == 720 && one_pass);
+                if (fusion_none && ids != nullptr && wpr) {
                     return mul_mat_vec_q_wpr_launch<type>(
                         vx, vy, ids, dst, ncols_x, nchannels_y_fd, nchannels_x, nrows_x,
-                        stride_row_x, stride_col_dst, channel_ratio_fd, nchannels_dst,
+                        stride_row_x, stride_col_dst, nchannels_dst,
                         stride_channel_x, stride_channel_y, stride_channel_dst, nsamples_dst,
                         sample_ratio_fd, stride_sample_x, stride_sample_y, stride_sample_dst, stream);
                 }

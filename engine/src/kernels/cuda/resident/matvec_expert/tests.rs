@@ -17,8 +17,9 @@ use crate::kernels::cuda::{CapturePlan, CudaContext, DeviceBuffer, DeviceStream}
 
 #[allow(unsafe_code)]
 unsafe extern "C" {
-    /// the vendored mmvq.cu test-only arm override for INFERENCE_CUDA_MVQ_WPR.
-    safe fn inference_cuda_test_arm_mvq_wpr(on: i32);
+    /// the vendored mmvq.cu test-only override of the warp-per-row launch rule: 0 leaves the
+    /// rule alone, a positive value forces the kernel and a negative value the generic shape.
+    safe fn inference_cuda_test_arm_mvq_wpr(mode: i32);
 }
 
 const N_EXPERT: usize = 16;
@@ -1470,11 +1471,11 @@ fn the_expert_matvec_bandwidth_bench() {
     }
 }
 
-/// `INFERENCE_CUDA_MVQ_WPR=1` (cc 7.2, default off) reassociates the Q4_K expert matvec's
-/// reduction - one warp per row - so it cannot equal the dense launch's bits; the flag-on arm
-/// must stay within a handful of ULPs of the dense oracle on every slot and both halves. The
-/// flag is read per call, so the test arms it around its launches only (device tests run with
-/// --test-threads=1, so the process-global env is safe here).
+/// The warp-per-row Q4_K expert matvec (`mul_mat_vec_q_wpr`, the launch rule on cc 7.2 for rows
+/// of at most 8 K-blocks, forced here at every shape) reassociates the reduction on a longer row
+/// - one warp per row - so there it cannot equal the dense launch's bits; it must stay within a
+/// handful of ULPs of the dense oracle on every slot and both halves. The override is read per
+/// call, so the test sets it around its launches only.
 #[test]
 fn matvec_expert_wpr_mode_matches_dense_within_reassociation() {
     const NAME: &str = "matvec_expert_wpr_mode_matches_dense_within_reassociation";
@@ -1555,6 +1556,97 @@ fn matvec_expert_wpr_mode_matches_dense_within_reassociation() {
         }
     }
     inference_cuda_test_arm_mvq_wpr(0);
+}
+
+/// The launch rule of the warp-per-row kernel, and its bits: on a row that the generic shape
+/// covers in one pass, the kernel is the generic shape's bits.
+///
+/// The kernel keeps the generic shape's association on such a row: the generic shape's warp `w`
+/// holds the block `2*w + lane/16` and its warp partials are added in warp order, the kernel's
+/// lane adds the blocks `lane/16 + 2*n` in order, and both end in the same warp reduction. A Q4_K
+/// row of at most 8 K-blocks (k <= 2048) is one pass at 4 warps. A longer row takes a second pass
+/// there and reassociates; the count of differing bytes is printed for the 9-block row.
+///
+/// The rule is checked on the device's capability: cc 7.2 takes the kernel for a one-pass row
+/// and the generic shape for a longer one; any other device always takes the generic shape. The
+/// test override forces each kernel for the comparison (the crate cannot set an environment
+/// variable).
+#[test]
+fn matvec_expert_wpr_arm_is_the_generic_bits_on_one_pass_rows() {
+    use crate::kernels::cuda::native::peer_probe::device_cc;
+
+    const NAME: &str = "matvec_expert_wpr_arm_is_the_generic_bits_on_one_pass_rows";
+    const ONE_PASS_BLOCKS: usize = 8;
+    // The states of the vendored override: 0 leaves the rule alone, 1 forces the kernel, -1 the
+    // generic shape.
+    const RULE: i32 = 0;
+    const KERNEL: i32 = 1;
+    const GENERIC: i32 = -1;
+    if !testkit::device_present(NAME) {
+        return;
+    }
+    let ctx = CudaContext::new().expect("context");
+    let stream = ctx.stream().expect("stream");
+    let (major, minor) = device_cc(ctx.device() as i32).expect("compute capability");
+    let ty = QuantType::Q4K;
+    for (si, shape) in [GATE_UP, DOWN, PADDED].iter().enumerate() {
+        let (k, rows) = *shape;
+        let stride = 2 * rows;
+        let (stack, ids, shared, per_slot) =
+            stack_rig(&ctx, &stream, ty, *shape, 0x8300_0000 + si as u64);
+        let one_pass = k / 256 <= ONE_PASS_BLOCKS;
+        let takes_kernel = major * 100 + minor == 720 && one_pass;
+        for (half, x) in [("gate", &shared), ("up", &per_slot)] {
+            let bytes = stride * N_USED * 4;
+            let mut results = [Vec::new(), Vec::new(), Vec::new()];
+            for (mode, out) in [RULE, KERNEL, GENERIC].into_iter().zip(&mut results) {
+                inference_cuda_test_arm_mvq_wpr(mode);
+                let y = testkit::upload_filled(&ctx, 0xAA, bytes);
+                expert_launch(
+                    &ctx,
+                    &stream,
+                    ty,
+                    &stack,
+                    &ids,
+                    x,
+                    &y,
+                    0,
+                    *shape,
+                    half == "up",
+                    stride,
+                );
+                stream.synchronize().expect("drain");
+                *out = testkit::read_bytes(&ctx, &y, bytes);
+            }
+            inference_cuda_test_arm_mvq_wpr(RULE);
+            let [rule, kernel, generic] = &results;
+            let differing = |a: &[u8], b: &[u8]| a.iter().zip(b).filter(|(x, y)| x != y).count();
+            println!(
+                "{NAME}: {shape:?} {half}: the kernel differs from the generic shape in {} of {} \
+                 bytes; the rule differs from the kernel in {} and from the generic shape in {}",
+                differing(kernel, generic),
+                kernel.len(),
+                differing(rule, kernel),
+                differing(rule, generic),
+            );
+            if takes_kernel {
+                assert!(
+                    rule == kernel,
+                    "{NAME}: {shape:?} {half}: the rule did not take the warp-per-row kernel"
+                );
+                assert!(
+                    kernel == generic,
+                    "{NAME}: {shape:?} {half}: the kernel changed {} bytes",
+                    differing(kernel, generic)
+                );
+            } else {
+                assert!(
+                    rule == generic,
+                    "{NAME}: {shape:?} {half}: the rule took the warp-per-row kernel"
+                );
+            }
+        }
+    }
 }
 
 /// Inkling's decode expert shapes on the IQ4_NL stacks (timing only): the shared MoE block's
