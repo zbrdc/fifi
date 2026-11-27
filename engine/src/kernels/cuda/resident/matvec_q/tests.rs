@@ -353,8 +353,8 @@ fn read_f32(ctx: &CudaContext, buffer: &DeviceBuffer, len: usize) -> Vec<f32> {
 /// activation rows agree bit-for-bit. The vendored MMVQ launcher alone does not promise
 /// this past four columns (its launch geometry changes with the column count — the plain
 /// entry diverged at 5.3e-4 relative, which broke the dense prefill arm), so the invariant
-/// entry routes Q8_0 to the in-house warp-per-row kernel and launches the remaining
-/// vendored arms per column when the batch is wider than four.
+/// entry routes Q8_0, Q4_K and Q5_0 to in-house warp-per-row kernels and launches Q4_K,
+/// Q5_0 and the vendored Q6_K arm per column when the batch is wider than four.
 #[test]
 fn matvec_invariant_columns_match_single_column_launches() {
     if !testkit::device_present("matvec_invariant_columns_match_single_column_launches") {
@@ -1705,9 +1705,9 @@ fn matvec_window_vs_vendored_dense_ab_bench() {
             let label = format!("{ty:?} {name}");
             let (v_cold, _) =
                 ab.report(&label, w_bytes, (&y_v, &y_w, y_bytes), (&vendored, &window));
-            // The invariant entry serves Q4_K and Q8_0 from in-house warp-per-row kernels:
-            // time that route next to the two above.
-            if matches!(ty, QuantType::Q4K | QuantType::Q80) {
+            // The invariant entry serves Q4_K, Q5_0 and Q8_0 from in-house warp-per-row
+            // kernels: time that route next to the two above.
+            if matches!(ty, QuantType::Q4K | QuantType::Q50 | QuantType::Q80) {
                 let y_p = nan_filled(&ctx, y_bytes);
                 let in_house = || {
                     ctx.matvec_q_invariant(
@@ -2722,6 +2722,70 @@ fn matvec_q4k_matches_the_integer_reference() {
         }
     }
     println!("matvec q4k: max tolerance ratio {max_ratio:.3}");
+}
+
+/// The in-house Q5_0 arm against the same host reference machinery as the other in-house
+/// arms, including a row count the vendored matvec would refuse (13: no row groups) and the
+/// padded activation shape. Every shape of the list is already on the 32-value grid.
+#[test]
+fn matvec_q50_matches_the_integer_reference() {
+    if !testkit::device_present("matvec_q50_matches_the_integer_reference") {
+        return;
+    }
+    let ctx = CudaContext::new().expect("context");
+    let stream = ctx.stream().expect("stream");
+    let ncols = 2;
+    let mut max_ratio = 0.0f64;
+    let shapes = SHAPES.into_iter().chain([PADDED_SHAPE, (2048, 13)]);
+    for (k, rows) in shapes {
+        let seed = 0x5eed_5000u64 + k as u64 + rows as u64;
+        let (w, x_q8, row_bytes) = rig(&ctx, &stream, QuantType::Q50, k, rows, ncols, seed);
+        let w_bytes_of = QuantType::Q50.weight_bytes(rows, k).expect("size");
+        let y_bytes = rows * ncols * 4;
+        let y = testkit::upload_filled(&ctx, 0xAA, y_bytes);
+        ctx.matvec_q_invariant(
+            &stream,
+            MatvecCall {
+                ty: QuantType::Q50,
+                w: w.range(0, w_bytes_of).expect("w"),
+                x_q8: x_q8
+                    .range(0, q8_1_bytes(k, ncols).expect("size"))
+                    .expect("x"),
+                y: y.range(0, y_bytes).expect("y"),
+                k,
+                rows,
+                ncols,
+            },
+        )
+        .expect("matvec q50");
+        stream.synchronize().expect("drain");
+        let got = read_f32(&ctx, &y, y_bytes);
+        let w_bytes = testkit::read_bytes(&ctx, &w, w_bytes_of);
+        let x_bytes = testkit::read_bytes(&ctx, &x_q8, row_bytes * ncols);
+        for col in 0..ncols {
+            for row in 0..rows {
+                let (reference, abs) = reference::reference_dot(
+                    QuantType::Q50,
+                    &w_bytes[row * (k / 32) * 22..],
+                    &x_bytes[col * row_bytes..],
+                    k,
+                );
+                let tolerance = 64.0 * 2f64.powi(-24) * abs;
+                let error = (got[col * rows + row] as f64 - reference).abs();
+                let ratio = if tolerance > 0.0 {
+                    error / tolerance
+                } else {
+                    error
+                };
+                max_ratio = max_ratio.max(ratio);
+                assert!(
+                    error <= tolerance,
+                    "Q50 k {k} rows {rows} col {col} row {row}: error {error} over tol {tolerance}"
+                );
+            }
+        }
+    }
+    println!("matvec q50: max tolerance ratio {max_ratio:.3}");
 }
 
 /// The fused arithmetic contract, pinned without a card: the host mirror of the
