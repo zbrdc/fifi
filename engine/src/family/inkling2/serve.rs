@@ -103,6 +103,8 @@ pub(crate) fn start_engine(
         } else {
             1
         };
+        #[cfg(all(feature = "native-cuda", target_os = "linux"))]
+        forward.plan_prompt_chunk(prefill_rows);
         if requested_rows > 1 {
             eprintln!(
                 "Inkling CUDA prefill rows {}",

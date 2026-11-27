@@ -87,6 +87,12 @@ impl GgufTextWeights {
         Ok(Some((source, [gate, down])))
     }
 
+    pub(in crate::family::inkling2) fn plan_prompt_chunk(&self, rows: usize) {
+        if let Some(cuda) = &self.cuda {
+            cuda.plan_prompt_chunk(rows);
+        }
+    }
+
     pub(in crate::family::inkling2) fn supports_grouped_prefill(&self) -> bool {
         self.cuda
             .as_ref()

@@ -256,6 +256,13 @@ struct MlpRow {
 }
 
 impl CpuForward {
+    /// Sizes the device prompt scratch for the server's prompt chunk of `rows` rows.
+    pub(in crate::family::inkling2) fn plan_prompt_chunk(&self, rows: usize) {
+        if let Weights::Gguf(weights) = &self.weights {
+            weights.plan_prompt_chunk(rows);
+        }
+    }
+
     pub(in crate::family::inkling2) fn supports_grouped_prefill(&self) -> bool {
         if self.draft_window_enabled() {
             self.grouped_draft_prefill

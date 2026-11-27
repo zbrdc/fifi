@@ -65,6 +65,19 @@ impl Geometry {
             && self.routed_experts >= shape.routed_experts
             && self.mmq_experts >= shape.mmq_experts
     }
+
+    /// The smallest geometry that serves both, for one tensor shape.
+    fn union(self, shape: Self) -> Self {
+        if (self.hidden, self.middle, self.rank) != (shape.hidden, shape.middle, shape.rank) {
+            return shape;
+        }
+        Self {
+            grouped_experts: self.grouped_experts.max(shape.grouped_experts),
+            routed_experts: self.routed_experts.max(shape.routed_experts),
+            mmq_experts: self.mmq_experts.max(shape.mmq_experts),
+            ..shape
+        }
+    }
 }
 
 /// The host plan fills everything before `flag` and zeroes `flag`; on the host route it also
@@ -218,6 +231,8 @@ pub(super) fn device_workspace_bytes(spec: &super::super::TextSpec, context: usi
 #[derive(Default)]
 pub(super) struct Workspace {
     scratch: Option<Scratch>,
+    /// The rows of the server's prompt chunk ([`GgufCuda::plan_prompt_chunk`]).
+    chunk_rows: usize,
 }
 
 struct Scratch {
@@ -277,15 +292,21 @@ impl Workspace {
             .memory_info()?
             .free
             .saturating_sub(DEVICE_HEADROOM as usize);
-        let Some(rows) = Layout::fit(requested, shape, free) else {
+        // A growing scratch takes the whole prompt chunk and every geometry it has served, so
+        // the served start's warmup sizes it and no later prompt waits on an allocation.
+        let grown = self
+            .scratch
+            .as_ref()
+            .map_or(shape, |buffer| buffer.geometry.union(shape));
+        let Some(rows) = Layout::fit(requested.max(self.chunk_rows), grown, free) else {
             return Ok(self.cached(shape));
         };
         if self.cached(shape).is_some_and(|buffer| buffer.rows >= rows) {
             return Ok(self.cached(shape));
         }
         let layout =
-            Layout::new(rows, shape).ok_or_else(|| bad("expert prefill arena overflows"))?;
-        let Some(scratch) = Scratch::allocate(cuda, rows, shape, &layout)? else {
+            Layout::new(rows, grown).ok_or_else(|| bad("expert prefill arena overflows"))?;
+        let Some(scratch) = Scratch::allocate(cuda, rows, grown, &layout)? else {
             return Ok(self.cached(shape));
         };
         eprintln!(
@@ -407,6 +428,13 @@ impl GgufCuda {
                 .step
                 .uses_q8_activations(DenseDtype::PackedGguf(crate::weights::GgufType::Q80))
             && self.resident.placement().full_layers().len() == layers
+    }
+
+    /// Sizes the device expert prefill scratch for prompt chunks of `rows` rows.
+    pub(in crate::family::inkling2) fn plan_prompt_chunk(&self, rows: usize) {
+        if let Some(workspace) = &self.device_prefill {
+            workspace.borrow_mut().chunk_rows = rows;
+        }
     }
 
     pub(in crate::family::inkling2) fn supports_grouped_prefill(&self) -> bool {
@@ -1645,6 +1673,14 @@ mod tests {
             ..largest
         };
         assert!(!plain.can_serve(largest));
+        let routed = Geometry {
+            routed_experts: 128,
+            mmq_experts: 128,
+            ..plain
+        };
+        let both = largest.union(routed);
+        assert!(both.can_serve(largest) && both.can_serve(routed) && both.can_serve(plain));
+        assert_eq!(largest.union(Geometry { rank: 4, ..plain }).rank, 4);
         assert!(!largest.can_serve(Geometry { rank: 4, ..plain }));
         assert!(!largest.can_serve(Geometry {
             hidden: 1152,
