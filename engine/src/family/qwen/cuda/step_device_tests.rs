@@ -17,10 +17,6 @@
 use std::rc::Rc;
 use std::sync::Arc;
 
-use super::super::step::LoopState;
-use super::super::step::{logits, trunk_traced};
-use super::super::weights::{Layer, LoopWeights, Mixer};
-use super::serve::CardStep;
 use super::step::{Carried, LoopStep, bytes_range, floats, le_f32};
 use crate::EngError;
 use crate::family::math::rms_plain;
@@ -29,6 +25,10 @@ use crate::family::project::cuda::{
     BorrowedLoader, CudaWeight, CudaWeights, LoadOptions, WeightLayout,
 };
 use crate::family::project::gguf::{GgufMatrix, GgufProjector};
+use crate::family::qwen::sensenova::cuda::serve::CardStep;
+use crate::family::qwen::sensenova::step::LoopState;
+use crate::family::qwen::sensenova::step::{logits, trunk_traced};
+use crate::family::qwen::sensenova::weights::{Layer, LoopWeights, Mixer};
 use crate::family::session::TokenStepper;
 use crate::kernels::cuda::prefill::attn_prep_chunk::{
     AttnPrepChunkCall, AttnPrepChunkShape, PrepChunkMode,
@@ -262,10 +262,12 @@ fn both(
 ) -> Result<(Vec<f32>, Vec<f32>, u128, u128), EngError> {
     let t0 = std::time::Instant::now();
     let hidden = match cpu_trace {
-        Some(t) => super::super::step::trunk_traced(projector, weights, state, token, pos, t)?,
-        None => super::super::step::trunk(projector, weights, state, token, pos)?,
+        Some(t) => crate::family::qwen::sensenova::step::trunk_traced(
+            projector, weights, state, token, pos, t,
+        )?,
+        None => crate::family::qwen::sensenova::step::trunk(projector, weights, state, token, pos)?,
     };
-    let reference = super::super::step::logits(projector, weights, &hidden)?;
+    let reference = crate::family::qwen::sensenova::step::logits(projector, weights, &hidden)?;
     let cpu_us = t0.elapsed().as_micros();
     let t1 = std::time::Instant::now();
     let embed = projector.rows(weights.token_embd(), &[token])?;
@@ -564,7 +566,7 @@ fn decode_walk(
         .unwrap();
         assert_eq!(
             cpu_trace.len(),
-            2 * super::super::TRUNK_LAYERS,
+            2 * crate::family::qwen::sensenova::TRUNK_LAYERS,
             "the trace is not whole"
         );
         eprintln!(
@@ -641,7 +643,8 @@ fn head_split(
     cpu_final: &[f32],
     card_final: &[f32],
 ) -> (Vec<f32>, Vec<f32>) {
-    let over_card = super::super::step::logits(projector, weights, card_final).unwrap();
+    let over_card =
+        crate::family::qwen::sensenova::step::logits(projector, weights, card_final).unwrap();
     let normed = |row: &[f32]| {
         crate::family::math::rms_plain(row, weights.output_norm(), weights.shape().eps).unwrap()
     };

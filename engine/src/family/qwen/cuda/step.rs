@@ -2,7 +2,7 @@
 //! visits. The walk and the chunk mixers are in [`prefill`]; this module holds the step, its
 //! state and the one-row mixers a decode step (a chunk of one row) takes.
 //!
-//! The trunk is the CPU reference's (`super::super::step::token`), visit for visit: mHC
+//! The trunk is the CPU reference's (`crate::family::qwen::sensenova::step::token`), visit for visit: mHC
 //! visits keep both streams, route twice (attn, ffn) through the router table, and end with
 //! `cur = 0.5 * (a + b)`; a visit whose physical layer first enters the mHC range resets the
 //! streams from `cur` (a loop revisit of that physical layer resets them again, as the
@@ -38,15 +38,15 @@ use crate::kernels::cuda::resident::step_params::{
 };
 use crate::kernels::cuda::{CudaContext, DeviceBuffer, DeviceRange, DeviceStream, NativeWeight};
 
-use super::super::step::yarn_inv_freq;
-use super::super::weights::LoopShape;
-use super::super::{LoopPlan, RopePlan};
 use crate::family::qwen::recipe::{Blocks, Model};
+use crate::family::qwen::sensenova::step::yarn_inv_freq;
+use crate::family::qwen::sensenova::weights::LoopShape;
+use crate::family::qwen::sensenova::{LoopPlan, RopePlan};
 use crate::family::step::moe;
 
 mod prefill;
 
-pub(super) use prefill::PREFILL_ROWS;
+pub(crate) use prefill::PREFILL_ROWS;
 
 const F32: usize = size_of::<f32>();
 const ATTN_SCALE: f32 = 0.0625; // 1/sqrt(256)

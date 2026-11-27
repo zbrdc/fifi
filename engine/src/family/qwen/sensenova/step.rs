@@ -440,7 +440,7 @@ fn corr_dim(dims: usize, orig: f32, beta: f32, base: f32) -> f32 {
     dims as f32 * (orig / (beta * std::f32::consts::TAU)).ln() / (2.0 * base.ln())
 }
 
-pub(super) fn logits<P: Projector<Weight = TensorRef>>(
+pub(crate) fn logits<P: Projector<Weight = TensorRef>>(
     projector: &mut P,
     weights: &LoopWeights,
     hidden: &[f32],
@@ -451,7 +451,7 @@ pub(super) fn logits<P: Projector<Weight = TensorRef>>(
 
 /// Embeds a token and feeds all 56 logical visits, leaving the head to the caller. Any
 /// projector over the weights: the parameter exists so a test can emulate the quantized model.
-pub(super) fn trunk<P: Projector<Weight = TensorRef>>(
+pub(crate) fn trunk<P: Projector<Weight = TensorRef>>(
     projector: &mut P,
     weights: &LoopWeights,
     state: &mut LoopState,
@@ -466,7 +466,7 @@ pub(super) fn trunk<P: Projector<Weight = TensorRef>>(
     not(all(test, feature = "native-cuda", target_os = "linux")),
     expect(dead_code, reason = "used by the CUDA device parity rig")
 )]
-pub(super) fn trunk_traced<P: Projector<Weight = TensorRef>>(
+pub(crate) fn trunk_traced<P: Projector<Weight = TensorRef>>(
     projector: &mut P,
     weights: &LoopWeights,
     state: &mut LoopState,

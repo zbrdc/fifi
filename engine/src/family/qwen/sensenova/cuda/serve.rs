@@ -22,8 +22,6 @@ use std::{
 
 use super::super::serve::LIMITS;
 use super::super::weights::LoopWeights;
-use super::load;
-use super::step::{LoopStep, PREFILL_ROWS};
 use crate::EngError;
 use crate::family::executor::SerialDecode;
 use crate::family::project::Projector;
@@ -31,6 +29,8 @@ use crate::family::project::cuda::{
     BorrowedLoader, CudaWeights, LoadOptions, WeightLayout, served_admission,
 };
 use crate::family::project::gguf::GgufProjector;
+use crate::family::qwen::cuda::load;
+use crate::family::qwen::cuda::step::{LoopStep, PREFILL_ROWS};
 use crate::family::session::{DecodeSession, TokenStepper};
 use crate::kernels::cuda::CudaContext;
 use crate::sched::worker::{Engine, ReadyNote, spawn_engine_noted};
@@ -85,7 +85,7 @@ pub(crate) fn start(
 
 /// The model side of one session: the card step over the leaked load, the host view of the file
 /// (its embedding table feeds the rows), and the number of rows the card has consumed.
-pub(super) struct CardStep {
+pub(crate) struct CardStep {
     step: LoopStep<'static>,
     host: LoopWeights,
     projector: GgufProjector,
@@ -93,7 +93,7 @@ pub(super) struct CardStep {
 }
 
 impl CardStep {
-    pub(super) fn new(step: LoopStep<'static>, host: LoopWeights) -> Self {
+    pub(crate) fn new(step: LoopStep<'static>, host: LoopWeights) -> Self {
         let projector = host.projector();
         Self {
             step,

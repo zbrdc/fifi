@@ -13,7 +13,7 @@
 //! (≈0.5 GB Q4_K_M) which every step needs.
 
 #[cfg(feature = "native-cuda")]
-use super::super::LoopPlan;
+use crate::family::qwen::sensenova::LoopPlan;
 
 /// Every tensor the device holds, in load order: what the plan's layers name.
 #[cfg(feature = "native-cuda")]

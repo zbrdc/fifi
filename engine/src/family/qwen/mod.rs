@@ -2,6 +2,7 @@
 //! What the children share and the engine does not (name conventions, chat template quirks and
 //! layer kinds unique to the lineage) belongs here.
 
+pub(crate) mod cuda;
 #[allow(
     dead_code,
     reason = "the factory wires the MLX and the opt-in CUDA executors (`cuda_decode`); the allow covers the pieces still reached only by tests until the family is qualified"

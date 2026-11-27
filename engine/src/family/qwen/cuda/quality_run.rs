@@ -9,13 +9,13 @@
 use std::rc::Rc;
 use std::sync::Arc;
 
-use super::super::weights::LoopWeights;
 use super::step::{LoopStep, Routing, looped};
 use crate::EngError;
 use crate::family::project::Projector;
 use crate::family::project::cuda::{BorrowedLoader, LoadOptions, WeightLayout};
 use crate::family::project::gguf::{GgufMatrix, GgufProjector};
 use crate::family::qwen::recipe::{layers, routed_experts, tensors};
+use crate::family::qwen::sensenova::weights::LoopWeights;
 use crate::family::session::TokenStepper;
 use crate::family::teacher_forced::{Run, score_windows};
 use crate::kernels::cuda::CudaContext;

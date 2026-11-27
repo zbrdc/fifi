@@ -17,10 +17,10 @@
 
 pub(crate) mod cuda;
 pub(crate) mod serve;
-mod step;
+pub(crate) mod step;
 #[cfg(test)]
 mod tests;
-mod weights;
+pub(crate) mod weights;
 #[cfg(feature = "native-cuda")]
 pub(crate) use weights::LoopShape;
 
@@ -212,8 +212,8 @@ impl LoopPlan {
 
     /// The routing of the two-stream range, as the step's site takes it.
     #[cfg(feature = "native-cuda")]
-    pub(crate) fn routing(&self) -> cuda::step::Routing {
-        cuda::step::Routing {
+    pub(crate) fn routing(&self) -> crate::family::qwen::cuda::step::Routing {
+        crate::family::qwen::cuda::step::Routing {
             pre_scale: self.mhc_pre_scale,
             iterations: self.mhc_iterations,
             fixed_identity: self.mhc_fixed_identity,
