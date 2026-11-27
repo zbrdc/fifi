@@ -637,9 +637,10 @@ impl Raon1Device {
             sc.head.range(0, HIDDEN * 4)?,
         )?)?;
         let head = head::Head {
-            norm: self.io().raw("output_norm.weight")?,
+            norm: Some(self.io().raw("output_norm.weight")?),
             eps: self.hy.norm_eps,
-            weight: self.io().native("output.weight")?,
+            weight: head::HeadWeight::Native(self.io().native("output.weight")?),
+            softcap: None,
             normed: Rows::both(&sc.core.normed_q8, &sc.core.normed),
             logits: &sc.core.logits,
         };

@@ -147,9 +147,10 @@ impl LoopStep<'_> {
     pub(super) fn head(&self, row: usize, exact: bool) -> Result<(), EngError> {
         let h = self.shape.hidden;
         let head = head::Head {
-            norm: StepIo::whole(self.output_norm)?,
+            norm: Some(StepIo::whole(self.output_norm)?),
             eps: self.shape.eps,
-            weight: self.head,
+            weight: head::HeadWeight::Native(self.head),
+            softcap: None,
             normed: self.rows.core.normed_rows(),
             logits: &self.rows.core.logits,
         };
