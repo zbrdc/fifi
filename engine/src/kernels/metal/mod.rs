@@ -39,6 +39,7 @@ pub(crate) use context::{DeviceBuffer, DeviceRange, MetalContext};
 pub(crate) use resident::dense_gemv::{
     DenseDtype, DenseGemvBytes, DenseGemvCall, DenseGemvShape, dense_gemv_bytes,
 };
+pub(crate) use resident::rms_norm::RmsNormCall;
 pub(crate) use resident::row_add::RowAddCall;
 pub(crate) use resident::swiglu_rows::{SwigluRowsCall, SwigluRowsShape};
 
