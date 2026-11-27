@@ -222,7 +222,7 @@ impl MetalContext {
 impl Frame {
     /// Encodes one dense matvec into the frame. A weight that is not finite marks the frame's
     /// flag and leaves its row unwritten; the frame's drain refuses it.
-    pub(super) fn dense_gemv(&mut self, call: DenseGemvCall<'_>) -> Result<(), EngError> {
+    pub(crate) fn dense_gemv(&mut self, call: DenseGemvCall<'_>) -> Result<(), EngError> {
         let shared = self.shared();
         let plan = plan_dense_gemv(shared, &call)?;
         let kernel = shared.kernel(plan.kernel, SOURCE)?;
