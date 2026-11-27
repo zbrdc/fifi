@@ -205,13 +205,17 @@ impl Layer {
     }
 }
 
-/// The sealed rows the states of `site` hold as visit `visit` starts.
-fn site_blocks(site: &DepthSite<'_>, visit: usize) -> Result<usize, EngError> {
-    site.blocks.get(visit).copied().ok_or_else(|| {
-        EngError::BadRequest(format!(
-            "the depth site has no sealed-row count for visit {visit}"
-        ))
-    })
+/// The plane visit `visit` of `site` runs on, and the sealed rows its states hold as it starts.
+fn site_at(site: &DepthSite<'_>, visit: usize) -> Result<(usize, usize), EngError> {
+    site.planes
+        .get(visit)
+        .copied()
+        .zip(site.blocks.get(visit).copied())
+        .ok_or_else(|| {
+            EngError::BadRequest(format!(
+                "the depth site has no plane or sealed-row count for visit {visit}"
+            ))
+        })
 }
 
 fn unsupported<T>(family: &str, what: &str) -> Result<T, EngError> {
@@ -245,7 +249,9 @@ pub(crate) trait Model {
         Ok(())
     }
     /// The widths of the delta-rule layers and the rows of the per-channel rule.
-    fn delta(&self) -> (delta::Dims, Option<ChannelRows<'_>>);
+    fn delta(&self) -> Result<(delta::Dims, Option<ChannelRows<'_>>), EngError> {
+        unsupported(self.family(), "a delta-rule layer")
+    }
     /// The widths, the rows and the place of an attention visit over `n` rows at `p0`.
     fn attend(
         &self,
@@ -273,7 +279,9 @@ pub(crate) trait Model {
         unsupported(self.family(), "a feed-forward of the model's own")
     }
     /// The activation and the scratch of a dense feed-forward over `n` rows.
-    fn dense(&self, n: usize) -> Result<(ffn::Join, ffn::Scratch<'_>), EngError>;
+    fn dense(&self, _n: usize) -> Result<(ffn::Join, ffn::Scratch<'_>), EngError> {
+        unsupported(self.family(), "a dense feed-forward")
+    }
     /// The widths, the activation, the scratch and the shared expert's scratch of a routed
     /// feed-forward over `n` rows.
     #[allow(clippy::type_complexity)]
@@ -335,9 +343,11 @@ impl<M: Model> Visits for Walk<'_, M> {
             return Ok(());
         };
         let io = self.0.io(false);
+        let site = self.0.depth_site()?;
+        let (plane, _) = site_at(&site, visit)?;
         match repeat {
-            Repeat::Mark => self.0.depth_site()?.depth.mark(io.ctx, io.stream, n),
-            Repeat::Rewind => self.0.depth_site()?.depth.rewind(io.ctx, io.stream, n),
+            Repeat::Mark => site.depth.mark(io.ctx, io.stream, plane, n),
+            Repeat::Rewind => site.depth.rewind(io.ctx, io.stream, plane, n),
             Repeat::Step | Repeat::Leave => Ok(()),
         }
     }
@@ -379,7 +389,7 @@ impl<M: Model> Visits for Walk<'_, M> {
             }
             Site::DepthAttention { queries, seal, .. } => {
                 let site = m.depth_site()?;
-                let blocks = site_blocks(&site, visit)?;
+                let (plane, blocks) = site_at(&site, visit)?;
                 // The forward half reads after the mixer half's seal.
                 let blocks = blocks + usize::from(*seal && half == Half::Forward);
                 let query = match &queries[half as usize] {
@@ -395,7 +405,7 @@ impl<M: Model> Visits for Walk<'_, M> {
                     out: site.input.range(0, n * h * 4)?,
                     stride: h,
                 };
-                site.depth.mix(io.ctx, io.stream, mix, blocks, n)?;
+                site.depth.mix(io.ctx, io.stream, mix, (plane, blocks), n)?;
                 (site.input.range(0, n * h * 4)?, None)
             }
         };
@@ -423,7 +433,7 @@ impl<M: Model> Visits for Walk<'_, M> {
         match half {
             Half::Mixer => match &layer.mixer {
                 Mixer::Delta { names, slot } => {
-                    let (dims, channel) = m.delta();
+                    let (dims, channel) = m.delta()?;
                     let resolved = names.resolve(&io.map(), dims)?;
                     let rows = DeltaRows {
                         channel,
@@ -493,10 +503,10 @@ impl<M: Model> Visits for Walk<'_, M> {
             }
             Site::DepthAttention { seal, .. } => {
                 let site = m.depth_site()?;
-                let blocks = site_blocks(&site, visit)?;
+                let at = site_at(&site, visit)?;
                 let rows = branch.range(0, n * h * 4)?;
                 site.depth
-                    .apply(io.ctx, io.stream, half, *seal, rows, blocks, n)?;
+                    .apply(io.ctx, io.stream, half, *seal, rows, at, n)?;
             }
         }
         m.tap(visit, half, Stage::Apply)

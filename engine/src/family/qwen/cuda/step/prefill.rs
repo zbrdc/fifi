@@ -296,8 +296,8 @@ impl Model for LoopStep<'_> {
         Ok(())
     }
 
-    fn delta(&self) -> (delta::Dims, Option<delta::ChannelRows<'_>>) {
-        (self.delta_dims, None)
+    fn delta(&self) -> Result<(delta::Dims, Option<delta::ChannelRows<'_>>), EngError> {
+        Ok((self.delta_dims, None))
     }
 
     fn attend(

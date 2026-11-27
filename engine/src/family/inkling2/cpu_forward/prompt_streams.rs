@@ -135,6 +135,7 @@ impl PromptStreams {
             capacity: self.capacity,
             eps: MIX_EPS,
             states: &self.states,
+            bank: None,
             mark: None,
             health: &self.health,
         }
@@ -155,7 +156,7 @@ impl PromptStreams {
             stride: target.stride,
         };
         self.site()
-            .mix(context, stream, mix, self.blocks, self.rows)
+            .mix(context, stream, mix, (0, self.blocks), self.rows)
     }
 
     /// `Stream::seal(next)` of every row; `next` holds one row per state, packed.
@@ -172,7 +173,7 @@ impl PromptStreams {
         }
         let (blocks, rows) = (self.blocks, self.rows);
         self.site()
-            .apply(context, stream, Half::Mixer, true, next, blocks, rows)?;
+            .apply(context, stream, Half::Mixer, true, next, (0, blocks), rows)?;
         self.blocks += 1;
         Ok(())
     }
@@ -191,7 +192,7 @@ impl PromptStreams {
             Half::Forward,
             false,
             rows,
-            self.blocks,
+            (0, self.blocks),
             self.rows,
         )
     }

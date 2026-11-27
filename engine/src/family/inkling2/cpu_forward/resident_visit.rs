@@ -607,6 +607,18 @@ struct Shared<'a> {
     depth: DeviceRange<'a>,
     bank: DeviceRange<'a>,
     pos: DeviceRange<'a>,
+    /// The rows of the shared walk, when it drives the visit.
+    walk: Option<WalkRows<'a>>,
+}
+
+/// Where a visit driven by the shared walk reads and writes: both depth mixes land in `input`
+/// (the walk writes them), the attention output in `mix_out` and the convolved MLP output in
+/// `forward_out` (the walk returns both to the depth states).
+#[derive(Clone, Copy)]
+struct WalkRows<'a> {
+    input: DeviceRange<'a>,
+    mix_out: DeviceRange<'a>,
+    forward_out: DeviceRange<'a>,
 }
 
 struct Execution<'a> {
@@ -622,11 +634,19 @@ struct Execution<'a> {
 impl Execution<'_> {
     fn row(&self, span: Region) -> Result<DeviceRange<'_>, EngError> {
         if let Some(s) = self.shared {
-            for (slot, row) in [
-                (self.layout.depth, s.depth),
-                (self.layout.bank, s.bank),
-                (self.layout.pos, s.pos),
-            ] {
+            let l = self.layout;
+            let walk = s.walk.map(|w| {
+                [
+                    (l.attention_input, w.input),
+                    (l.mlp_input, w.input),
+                    (l.attention_out, w.mix_out),
+                    (l.mlp_conv, w.forward_out),
+                ]
+            });
+            for (slot, row) in [(l.depth, s.depth), (l.bank, s.bank), (l.pos, s.pos)]
+                .into_iter()
+                .chain(walk.into_iter().flatten())
+            {
                 if span.start == slot.start {
                     return row.slice(0, span.bytes);
                 }
@@ -636,6 +656,21 @@ impl Execution<'_> {
     }
 
     fn enqueue(&self, cuda: &GgufCuda, position: usize) -> Result<(), EngError> {
+        self.mixer(cuda, position, true)?;
+        let blocks = self.advance_depth()?;
+        self.mix(
+            (self.layout.depth, 0),
+            blocks,
+            self.weights.mlp_query,
+            self.layout.mlp_input,
+        )?;
+        self.forward(cuda, true)
+    }
+
+    /// The mixer half from its depth mixes: the bank queries' messages, the attention query's
+    /// mix when `query` (the shared walk mixes it itself), then the attention, which writes
+    /// `attention_out`. Returns the attention's input.
+    fn mixer(&self, cuda: &GgufCuda, position: usize, query: bool) -> Result<Region, EngError> {
         let l = self.layout;
         let shape = self.plan.shape;
         let width = shape.widths.hidden;
@@ -662,6 +697,7 @@ impl Execution<'_> {
             jobs.push(job(bank, shape.bank_blocks, query, out)?);
         }
         let input = match self.weights.attention_query {
+            _ if !query => l.attention_input,
             Some(query) => {
                 jobs.push(job(depth, shape.blocks, query, l.attention_input)?);
                 l.attention_input
@@ -677,9 +713,7 @@ impl Execution<'_> {
             )?;
         }
         self.attention(cuda, position, input)?;
-        let blocks = self.advance_depth()?;
-        self.mix(depth, blocks, self.weights.mlp_query, l.mlp_input)?;
-        self.mlp(cuda)
+        Ok(input)
     }
 
     fn mix(
@@ -815,7 +849,9 @@ impl Execution<'_> {
         )
     }
 
-    fn mlp(&self, cuda: &GgufCuda) -> Result<(), EngError> {
+    /// The forward half from its mixed input `mlp_input`: the MLP and its convolution into
+    /// `mlp_conv`, added into the depth current row in the same launch when `fused`.
+    fn forward(&self, cuda: &GgufCuda, fused: bool) -> Result<(), EngError> {
         let l = self.layout;
         let [gamma, bias, conv] = self.weights.mlp;
         let controls = &self.plan.controls;
@@ -849,9 +885,11 @@ impl Execution<'_> {
                 kernel: self.weights.row(conv)?,
                 history: self.row(l.histories[3])?,
                 out: self.row(l.mlp_conv)?,
-                // The convolved row is added into the depth stream's current row in the same
-                // launch, the add of the visit's MLP output.
-                state: Some(self.row(l.depth.row(shape.hidden))?),
+                // Fused, the convolved row is added into the depth stream's current row in the
+                // same launch (one rounded add, the bits of the separate add the walk runs).
+                state: fused
+                    .then(|| self.row(l.depth.row(shape.hidden)))
+                    .transpose()?,
                 health: self.row(l.glue_health)?,
             },
             (shape.hidden, shape.taps),

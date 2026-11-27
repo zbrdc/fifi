@@ -591,7 +591,7 @@ impl Model for Raon1Device {
         self.hy.norm_eps
     }
 
-    fn delta(&self) -> (delta::Dims, Option<delta::ChannelRows<'_>>) {
+    fn delta(&self) -> Result<(delta::Dims, Option<delta::ChannelRows<'_>>), EngError> {
         let sc = &self.sc;
         let rows = delta::ChannelRows {
             low: &sc.fa,
@@ -602,7 +602,7 @@ impl Model for Raon1Device {
             delta: &sc.delta,
             strengths: &sc.scan_proj,
         };
-        (DELTA, Some(rows))
+        Ok((DELTA, Some(rows)))
     }
 
     fn latent(

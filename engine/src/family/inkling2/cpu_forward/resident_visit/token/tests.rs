@@ -63,9 +63,13 @@ fn whole_token_logits_agree_after_warm_host_row() {
 #[test]
 #[ignore = "requires leased CUDA and fully resident Inkling Mini GGUF"]
 fn the_token_chain_keeps_the_bits_of_its_logits() {
+    let Some(bytes_path) = std::env::var_os("FIFI_INKLING_CHAIN_BYTES") else {
+        eprintln!(
+            "the_token_chain_keeps_the_bits_of_its_logits: skipped, set FIFI_INKLING_CHAIN_BYTES"
+        );
+        return;
+    };
     let path = std::env::var_os("FIFI_INKLING_MODEL_DIR").unwrap();
-    let bytes_path =
-        std::env::var_os("FIFI_INKLING_CHAIN_BYTES").expect("FIFI_INKLING_CHAIN_BYTES");
     let mut f = CpuForward::open(std::path::Path::new(&path), 768).unwrap();
     f.enable_cuda(0).unwrap();
     let argmax = |xs: &[f32]| {

@@ -12,8 +12,11 @@
 //! sealing visit, becomes the new current row after the old one is sealed ([`Depth::apply`]).
 //! The forward half's branch adds. A range of layers visited more than once marks the states at
 //! its first visit and rewinds them at each later pass's first visit ([`Depth::mark`],
-//! [`Depth::rewind`]). Each state's launches are a block per state, so a chunk row has the bits
-//! of a one-row step of the same inputs.
+//! [`Depth::rewind`]). A model whose later passes read the pass before (its bank) gives a second
+//! plane of states: a rewind then writes the mark into the other plane and the walk continues
+//! there, so the plane it leaves still holds the last pass ([`planes`], [`Depth::bank`]). Each
+//! state's launches are a block per state, so a chunk row has the bits of a one-row step of the
+//! same inputs.
 
 use super::recipe::{Layer, Repeat, Site};
 use super::walk::Half;
@@ -48,6 +51,27 @@ pub(crate) fn blocks(layers: &[Layer]) -> Vec<usize> {
         .collect()
 }
 
+/// The plane of states each visit of `layers` reads and writes, for a site with `count` planes
+/// (1 or 2): with two, every rewind moves to the other plane, so the one it leaves keeps the
+/// pass before. A layer of another site keeps the plane.
+pub(crate) fn planes(layers: &[Layer], count: usize) -> Vec<usize> {
+    let mut plane = 0;
+    layers
+        .iter()
+        .map(|layer| {
+            if count == 2
+                && let Site::DepthAttention {
+                    repeat: Repeat::Rewind,
+                    ..
+                } = layer.site
+            {
+                plane ^= 1;
+            }
+            plane
+        })
+        .collect()
+}
+
 /// The depth site of a model: its states and the rows a read writes.
 pub(crate) struct Depth<'a> {
     pub(crate) width: usize,
@@ -55,8 +79,10 @@ pub(crate) struct Depth<'a> {
     pub(crate) capacity: usize,
     /// The eps of the mix's current-row norm and of a seal's norm.
     pub(crate) eps: f32,
-    /// Every row's state, `1 + capacity` rows apart.
+    /// Every row's state, `1 + capacity` rows apart: plane 0.
     pub(crate) states: &'a DeviceBuffer,
+    /// Plane 1, the same shape, for a model that reads the pass before; `None` for one plane.
+    pub(crate) bank: Option<&'a DeviceBuffer>,
     /// A copy of the states, as the mark left them; `None` for a model with no repeated range.
     pub(crate) mark: Option<&'a DeviceBuffer>,
     /// One float: left alone, or quiet NaN once a launch saw a value that was not finite.
@@ -64,10 +90,12 @@ pub(crate) struct Depth<'a> {
 }
 
 /// The depth site a model gives the walk: the site, the sealed rows at each visit
-/// ([`blocks`] of its layers) and the rows a read writes, `width` floats per chunk row.
+/// ([`blocks`] of its layers), the plane of each visit ([`planes`] for the site's plane count)
+/// and the rows a read writes, `width` floats per chunk row.
 pub(crate) struct DepthSite<'a> {
     pub(crate) depth: Depth<'a>,
     pub(crate) blocks: &'a [usize],
+    pub(crate) planes: &'a [usize],
     pub(crate) input: &'a DeviceBuffer,
 }
 
@@ -84,7 +112,7 @@ pub(crate) struct Mix<'a> {
     pub(crate) stride: usize,
 }
 
-impl Depth<'_> {
+impl<'a> Depth<'a> {
     fn states_of(&self, n: usize) -> States {
         States {
             rows: n,
@@ -92,11 +120,35 @@ impl Depth<'_> {
         }
     }
 
-    /// The states of `n` rows through `used` rows of the last one: the exact range a launch
-    /// takes.
-    fn used(&self, n: usize, used: usize) -> Result<DeviceRange<'_>, EngError> {
+    /// The planes of states this site has: 1, or 2 with a bank.
+    pub(crate) fn plane_count(&self) -> usize {
+        1 + usize::from(self.bank.is_some())
+    }
+
+    /// Plane `plane` of the states.
+    pub(crate) fn plane(&self, plane: usize) -> Result<&'a DeviceBuffer, EngError> {
+        match (plane, self.bank) {
+            (0, _) => Ok(self.states),
+            (1, Some(bank)) => Ok(bank),
+            _ => Err(EngError::BadRequest(format!(
+                "the depth site has {} planes of states and a visit reads plane {plane}",
+                self.plane_count()
+            ))),
+        }
+    }
+
+    /// The plane a visit on `plane` does not write: after a rewind, the pass before.
+    pub(crate) fn bank(&self, plane: usize) -> Result<&'a DeviceBuffer, EngError> {
+        self.bank
+            .ok_or_else(|| EngError::BadRequest("the depth site has no bank plane".into()))?;
+        self.plane(plane ^ 1)
+    }
+
+    /// The states of `n` rows of `plane` through `used` rows of the last one: the exact range a
+    /// launch takes.
+    fn used(&self, plane: usize, n: usize, used: usize) -> Result<DeviceRange<'_>, EngError> {
         let rows = (n - 1) * (1 + self.capacity) + used;
-        self.states.range(0, rows * self.width * F32)
+        self.plane(plane)?.range(0, rows * self.width * F32)
     }
 
     /// The whole states of `n` rows.
@@ -108,20 +160,20 @@ impl Depth<'_> {
         self.health.range(0, F32)
     }
 
-    /// The mix of every one of `n` states holding `blocks` sealed rows.
+    /// The mix of every one of `n` states of `plane` holding `blocks` sealed rows.
     pub(crate) fn mix(
         &self,
         ctx: &CudaContext,
         stream: &DeviceStream,
         mix: Mix<'_>,
-        blocks: usize,
+        (plane, blocks): (usize, usize),
         n: usize,
     ) -> Result<(), EngError> {
         let (gamma, norm_eps) = mix.norm.unzip();
         ctx.depth_attention_mix_states(
             stream,
             MixStatesCall {
-                state: self.used(n, blocks + 1)?,
+                state: self.used(plane, n, blocks + 1)?,
                 query: mix.query,
                 gamma,
                 out: mix.out,
@@ -139,9 +191,9 @@ impl Depth<'_> {
         )
     }
 
-    /// The branch rows `branch` (one row per state, packed) of `half` return to `n` states
-    /// holding `blocks` sealed rows: they add onto the current rows, or at a sealing mixer half
-    /// the current rows are sealed and the branch rows become the current rows.
+    /// The branch rows `branch` (one row per state, packed) of `half` return to `n` states of
+    /// `plane` holding `blocks` sealed rows: they add onto the current rows, or at a sealing
+    /// mixer half the current rows are sealed and the branch rows become the current rows.
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn apply(
         &self,
@@ -150,14 +202,14 @@ impl Depth<'_> {
         half: Half,
         seal: bool,
         branch: DeviceRange<'_>,
-        blocks: usize,
+        (plane, blocks): (usize, usize),
         n: usize,
     ) -> Result<(), EngError> {
         if !(seal && half == Half::Mixer) {
             return ctx.depth_attention_add_states(
                 stream,
                 AddCall {
-                    state: self.used(n, 1)?,
+                    state: self.used(plane, n, 1)?,
                     row: branch,
                     health: self.health()?,
                 },
@@ -174,7 +226,7 @@ impl Depth<'_> {
         ctx.depth_attention_seal_states(
             stream,
             SealCall {
-                state: self.used(n, blocks + 2)?,
+                state: self.used(plane, n, blocks + 2)?,
                 next: branch,
                 health: self.health()?,
             },
@@ -193,26 +245,31 @@ impl Depth<'_> {
         })
     }
 
-    /// The states of `n` rows are copied to the mark.
+    /// The states of `n` rows of `plane` are copied to the mark.
     pub(crate) fn mark(
         &self,
         ctx: &CudaContext,
         stream: &DeviceStream,
+        plane: usize,
         n: usize,
     ) -> Result<(), EngError> {
         let mark = self.marked()?;
-        ctx.copy_device(stream, self.whole(self.states, n)?, self.whole(mark, n)?)
+        let states = self.plane(plane)?;
+        ctx.copy_device(stream, self.whole(states, n)?, self.whole(mark, n)?)
     }
 
-    /// The states of `n` rows go back to the mark.
+    /// The mark of `n` rows is written into `plane`: the states again, or with a bank the
+    /// plane the next pass runs on.
     pub(crate) fn rewind(
         &self,
         ctx: &CudaContext,
         stream: &DeviceStream,
+        plane: usize,
         n: usize,
     ) -> Result<(), EngError> {
         let mark = self.marked()?;
-        ctx.copy_device(stream, self.whole(mark, n)?, self.whole(self.states, n)?)
+        let states = self.plane(plane)?;
+        ctx.copy_device(stream, self.whole(mark, n)?, self.whole(states, n)?)
     }
 }
 
@@ -255,5 +312,20 @@ mod tests {
             blocks(&[layer(true, Step), plain, layer(false, Step)]),
             [0, 1, 1]
         );
+    }
+
+    #[test]
+    fn planes_alternate_at_each_rewind_only_with_a_bank() {
+        use Repeat::{Leave, Mark, Rewind, Step};
+        let layers = [
+            layer(true, Mark),
+            layer(false, Step),
+            layer(true, Rewind),
+            layer(false, Step),
+            layer(true, Rewind),
+            layer(true, Leave),
+        ];
+        assert_eq!(planes(&layers, 2), [0, 0, 1, 1, 0, 0]);
+        assert_eq!(planes(&layers, 1), [0; 6]);
     }
 }
