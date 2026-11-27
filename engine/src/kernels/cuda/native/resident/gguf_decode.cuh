@@ -51,6 +51,8 @@
 #include <cuda_fp16.h>
 #include <cuda_runtime.h>
 
+#include "resident/k4_scales.cuh"
+
 #include <stdio.h>
 
 #include <stdint.h>
@@ -740,18 +742,6 @@ struct Q8_0 {
         o.s1 = r.d;
     }
 };
-
-/* The 6-bit scale and minimum of group g (0..7) of a Q4_K or Q5_K block, packed in 12 bytes. */
-__device__ __forceinline__ void scale_min_k4(const unsigned char *scales, int g, unsigned &sc,
-                                             unsigned &mn) {
-    if (g < 4) {
-        sc = scales[g] & 63u;
-        mn = scales[g + 4] & 63u;
-    } else {
-        sc = (scales[g + 4] & 0x0Fu) | ((unsigned)(scales[g - 4] >> 6) << 4);
-        mn = (scales[g + 4] >> 4) | ((unsigned)(scales[g] >> 6) << 4);
-    }
-}
 
 /* Q4_K: 144-byte super-block: f16 d, f16 dmin, 12 packed scale bytes, 128 code bytes. Window g
  * (0..7) reads the 32 bytes at 32 * (g / 2) and takes their low nibbles for even g, high for odd;

@@ -42,6 +42,7 @@
 #include "device.h"
 #include "resident/embed.h"
 #include "resident/step_params.h"  // INFERENCE_CUDA_STATUS_INVALID_STEP_STATE
+#include "resident/k4_scales.cuh"
 
 namespace {
 
@@ -130,15 +131,12 @@ __device__ __forceinline__ void store_nan16(float *dst) {
     for (int i = 0; i < 16; i += 4) store4(dst + i, nan, nan, nan, nan);
 }
 
-/* ggml get_scale_min_k4 on the 12 scale bytes that follow d and dmin in the head (head bytes 4 .. 15). */
+/* The 6-bit scale and minimum of Q4_K sub-block `j` of `head` (the block's first 16 bytes). */
 __device__ __forceinline__ void scale_min(int j, const uint4 &head, int &sc, int &mn) {
-    if (j < 4) {
-        sc = (int)(byte_of(head, 4 + j) & 63u);
-        mn = (int)(byte_of(head, 8 + j) & 63u);
-    } else {
-        sc = (int)((byte_of(head, 8 + j) & 0xFu) | ((byte_of(head, j) >> 6) << 4));
-        mn = (int)((byte_of(head, 8 + j) >> 4) | ((byte_of(head, 4 + j) >> 6) << 4));
-    }
+    unsigned u, v;
+    scale_min_k4(head, j, u, v);
+    sc = (int)u;
+    mn = (int)v;
 }
 
 __global__ void __launch_bounds__(kQ4Threads)

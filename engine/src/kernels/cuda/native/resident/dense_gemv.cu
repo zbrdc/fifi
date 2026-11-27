@@ -16,6 +16,7 @@
 #include "device.h"
 #include "resident/dense_gemv.h"
 #include "resident/gguf_gemv.cuh"
+#include "resident/k4_scales.cuh"
 
 namespace {
 

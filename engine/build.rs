@@ -275,6 +275,7 @@ const CUDA_HEADERS: &[&str] = &[
     "src/kernels/cuda/native/resident/gdn_delta_partition.cuh",
     "src/kernels/cuda/native/resident/gdn_mutants.h",
     "src/kernels/cuda/native/resident/gguf_decode.cuh",
+    "src/kernels/cuda/native/resident/k4_scales.cuh",
     "src/kernels/cuda/native/resident/graph.h",
     "src/kernels/cuda/native/resident/head_tile.h",
     "src/kernels/cuda/native/resident/kv8_append.h",

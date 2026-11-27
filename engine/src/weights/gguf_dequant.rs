@@ -135,8 +135,12 @@ fn q4_0(b: &[u8], y: &mut [f32]) {
     }
 }
 
-/// Unpacks the 6-bit scale and minimum with index `j` (0..8) of a K-quant block.
-fn scale_min_k4(j: usize, q: &[u8]) -> (u8, u8) {
+/// Unpacks the 6-bit scale and minimum with index `j` (0..8) of a Q4_K or Q5_K block from
+/// its 12 packed scale bytes `q` (the block's bytes 4..16).
+///
+/// The engine's one Rust statement of the layout: the expert CPU kernels and the CUDA tests'
+/// references call it, and `resident/k4_scales.cuh` is its form on the device.
+pub(crate) fn scale_min_k4(j: usize, q: &[u8]) -> (u8, u8) {
     if j < 4 {
         (q[j] & 63, q[j + 4] & 63)
     } else {

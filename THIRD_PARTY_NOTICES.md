@@ -61,12 +61,16 @@ SOFTWARE.
   and the stream-k block and fixup-size rule of `launch_mul_mat_q` (vendored
   mmq.cuh:1395-1412) at the same pin, on top of the vendored config helpers. A test hash-pins both
   passages, and a sweep cross-checks the function against the Rust sizing.
-- Derived, outside the xavier-qwen tree: `scale_min` in `engine/src/kernels/expert_cpu.rs:68`
-  and in `engine/src/kernels/cuda/native/resident/embed.cu:77`, from ggml
-  `get_scale_min_k4` (ggml-quants.c at the pin): the same branch on `j < 4`, masks 63
-  and 0xF, and `>> 6 << 4` shifts, over the 12 scale bytes at Q4_K block offset 4; the
-  embed.cu comment names ggml. The test helper `scale_min_k4` in
-  `engine/src/kernels/cuda/resident/matvec_q/tests.rs:57` re-expresses it again. The Q8_1
+- Derived, outside the xavier-qwen tree: `scale_min_k4` in `engine/src/weights/gguf_dequant.rs`,
+  from ggml `get_scale_min_k4` (ggml-quants.c at the pin): the same branch on `j < 4`, masks 63
+  and 0xF, and `>> 6 << 4` shifts, over the 12 scale bytes at Q4_K block offset 4. It is the
+  engine's one statement of the rule: `scale_min` in `engine/src/kernels/expert_cpu.rs` calls it in
+  production, and the test module of `expert_cpu_any.rs` and the test references in
+  `engine/src/kernels/cuda/resident/matvec_q/tests.rs` and
+  `engine/src/family/qwen/qwen36/cuda/native_device_rig.rs` call it too;
+  and `scale_min_k4` in `engine/src/kernels/cuda/native/resident/k4_scales.cuh` re-expresses
+  it in two forms, for bytes in memory and for a block head held in registers; the device
+  dequant tests compare the kernels with the host's statement. The Q8_1
   quantization rule (`d = amax / 127`, `q = amax == 0 ? 0 : round(x / d)`) in
   `engine/src/kernels/cuda/native/resident/add_rmsnorm_q8.cu:95` and
   `engine/src/kernels/cuda/native/resident/swiglu_q8.cu:65` is from `quantize_q8_1` in the

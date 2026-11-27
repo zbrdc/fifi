@@ -33,6 +33,7 @@
 #include "abi.h"
 #include "device.h"
 #include "resident/matvec_dq.h"
+#include "resident/k4_scales.cuh"
 
 namespace {
 
@@ -88,22 +89,12 @@ __device__ __forceinline__ float run_sum(const Run &r) {
     return (s.x + s.y) + (s.z + s.w);
 }
 
-/* ggml's get_scale_min_k4: the 6-bit multiplier and offset of Q4_K sub-block s (0..7) from the
- * block's first line `head`: f16 d, f16 dmin, then the 12 packed factor bytes as three words
- * a, b, c of four. With t = s mod 4, byte t of a is factor t, of b factor t + 4, of c factor
- * t + 8. */
+/* The 6-bit multiplier and offset of Q4_K sub-block `s` of `head` (the block's first 16 bytes). */
 __device__ __forceinline__ void k4_factors(const uint4 &head, int s, float *mult, float *offs) {
-    const unsigned t = (unsigned)(s & 3);
-    const unsigned a = head.y >> (8 * t);
-    const unsigned b = head.z >> (8 * t);
-    const unsigned c = head.w >> (8 * t);
-    if (s < 4) {
-        *mult = code_f(a & 63u);
-        *offs = code_f(b & 63u);
-    } else {
-        *mult = code_f((c & 0x0Fu) | ((a >> 2) & 0x30u));
-        *offs = code_f(((c >> 4) & 0x0Fu) | ((b >> 2) & 0x30u));
-    }
+    unsigned sc, mn;
+    scale_min_k4(head, s, sc, mn);
+    *mult = code_f(sc);
+    *offs = code_f(mn);
 }
 
 /* Q4_K block, 144 bytes: f16 d at +0, f16 dmin at +2, 12 packed factor bytes at +4, 128 code

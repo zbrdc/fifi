@@ -32,21 +32,15 @@ __device__ __forceinline__ float half_at(const unsigned char *p) {
  * bytes at +16, 128 4-bit code bytes at +48. Group g carries a 6-bit multiplier and 6-bit
  * offset, and value i of the block weighs
  *   (value_scale * mult[g]) * (code_i + 16 * high_i) - offset_scale * offs[g].
- * The factor bytes unpack as: groups 0..3 take the low 6 bits of bytes [g] (multiplier)
- * and [g+4] (offset); groups 4..7 take the low nibble of byte [g+4] spliced with the top
- * 2 bits of byte [g-4] (multiplier), and the high nibble of byte [g+4] spliced with the
- * top 2 bits of byte [g] (offset). */
+ * The factor bytes unpack by scale_min_k4 (resident/k4_scales.cuh). */
 __device__ __forceinline__ void q5k_group_factors(const unsigned char *raw, float *mult,
                                                   float *offs) {
     #pragma unroll
-    for (int g = 0; g < 4; ++g) {
-        mult[g] = (float)(raw[g] & 63);
-        offs[g] = (float)(raw[g + 4] & 63);
-    }
-    #pragma unroll
-    for (int g = 4; g < 8; ++g) {
-        mult[g] = (float)((raw[g + 4] & 0x0f) | ((raw[g - 4] >> 6) << 4));
-        offs[g] = (float)((raw[g + 4] >> 4) | ((raw[g] >> 6) << 4));
+    for (int g = 0; g < 8; ++g) {
+        unsigned sc, mn;
+        scale_min_k4(raw, g, sc, mn);
+        mult[g] = (float)sc;
+        offs[g] = (float)mn;
     }
 }
 

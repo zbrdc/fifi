@@ -104,20 +104,10 @@ pub(super) fn q4k_rows(rows: usize, k: usize, rng: &mut Rng) -> Vec<u8> {
 
 /// The dequantized weight `i` of one Q4_K block (ggml's Q4_K layout).
 pub(super) fn q4k_value(block: &[u8], i: usize) -> f64 {
-    fn scale_min(scales: &[u8], j: usize) -> (i32, i32) {
-        if j < 4 {
-            ((scales[j] & 63) as i32, (scales[j + 4] & 63) as i32)
-        } else {
-            (
-                ((scales[j + 4] & 0xF) as i32) | (((scales[j - 4] >> 6) as i32) << 4),
-                ((scales[j + 4] >> 4) as i32) | (((scales[j] >> 6) as i32) << 4),
-            )
-        }
-    }
     let d = f16(u16::from_le_bytes([block[0], block[1]])) as f64;
     let dmin = f16(u16::from_le_bytes([block[2], block[3]])) as f64;
     let (j, half, nib, l) = (i / 64, (i % 32) / 16, (i % 64) / 32, i % 16);
-    let (sc, m) = scale_min(&block[4..16], i / 32);
+    let (sc, m) = crate::weights::gguf_dequant::scale_min_k4(i / 32, &block[4..16]);
     let q = (block[16 + 32 * j + 16 * half + l] >> (4 * nib)) & 0xF;
     d * sc as f64 * q as f64 - dmin * m as f64
 }

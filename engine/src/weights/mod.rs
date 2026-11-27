@@ -12,7 +12,7 @@ pub mod exl3;
 #[cfg_attr(not(test), allow(dead_code))]
 pub(crate) mod expert_store;
 mod gguf;
-mod gguf_dequant;
+pub(crate) mod gguf_dequant;
 mod gguf_encode;
 pub(crate) mod gguf_experts;
 mod gguf_split;

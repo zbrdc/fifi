@@ -4,7 +4,8 @@
  * resident/matvec_q/tests.rs reads them (an f16 d, an f16 dmin, 12 packed scale bytes, 128
  * code bytes): group g of a block (32 values) takes the low nibbles of the 32 code bytes at
  * 32 * (g / 2) for an even g and the high nibbles for an odd g, and a weight is
- * d * sc * q - dmin * m with the 6-bit scale sc and minimum m of the group. The activation is
+ * d * sc * q - dmin * m with the 6-bit scale sc and minimum m of the group (resident/k4_scales.cuh,
+ * the one home of the rule). The activation is
  * the shared quantize_q8_1 output (36 bytes per 32 values), and the arithmetic is plain f32.
  *
  * One warp owns one weight row, and one lane owns the groups g, g + 32, ... of the row, so
@@ -28,6 +29,7 @@
 
 #include "abi.h"
 #include "device.h"
+#include "resident/k4_scales.cuh"
 #include "resident/matvec_q4k.h"
 
 namespace {
@@ -49,18 +51,6 @@ __device__ __forceinline__ float half_at(const unsigned char *p) {
 __device__ __forceinline__ int word2(const unsigned char *p) {
     const uint16_t *q = (const uint16_t *)p;
     return (int)q[0] | ((int)q[1] << 16);
-}
-
-/* The 6-bit scale and minimum of group g (0..7), from the 12 packed bytes of the block. */
-__device__ __forceinline__ void scale_min_k4(const unsigned char *scales, int g, int &sc,
-                                             int &mn) {
-    if (g < 4) {
-        sc = scales[g] & 63;
-        mn = scales[g + 4] & 63;
-    } else {
-        sc = (scales[g + 4] & 0x0F) | ((int)(scales[g - 4] >> 6) << 4);
-        mn = (scales[g + 4] >> 4) | ((int)(scales[g] >> 6) << 4);
-    }
 }
 
 /* Four 256-thread blocks a streaming processor is the ceiling (1024 threads). The one-column
@@ -87,7 +77,7 @@ __global__ void __launch_bounds__(256, 4) matvec_q4k(const unsigned char *w,
     for (int g = lane; g < groups; g += 32) {
         const unsigned char *blk = wrow + (size_t)(g / kGroups) * kBlockBytes;
         const int grp = g % kGroups;
-        int sc, mn;
+        unsigned sc, mn;
         scale_min_k4(blk + 4, grp, sc, mn);
         const unsigned char *code = blk + 16 + 32 * (grp >> 1);
         int q[8];

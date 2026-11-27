@@ -316,14 +316,8 @@ mod tests {
     }
 
     fn k4_scale_min(j: usize, q: &[u8]) -> (f32, f32) {
-        if j < 4 {
-            (f32::from(q[j] & 63), f32::from(q[j + 4] & 63))
-        } else {
-            (
-                f32::from((q[j + 4] & 0xf) | ((q[j - 4] >> 6) << 4)),
-                f32::from((q[j + 4] >> 4) | ((q[j] >> 6) << 4)),
-            )
-        }
+        let (sc, mn) = crate::weights::gguf_dequant::scale_min_k4(j, q);
+        (f32::from(sc), f32::from(mn))
     }
 
     fn q8_0_block(b: &[u8]) -> Vec<f32> {

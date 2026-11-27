@@ -63,18 +63,8 @@ pub(crate) fn f16_bits_to_f32(bits: u16) -> f32 {
 }
 
 /// Unpacks the 6-bit scale and minimum of sub-block `j` (0..8) of a Q4_K block.
-///
-/// The 12 packed scale bytes live at block offset 4..16 in the ggml layout.
 pub(crate) fn scale_min(j: usize, blk: &[u8; Q4K_BLOCK_BYTES]) -> (u8, u8) {
-    let q = |i: usize| blk[4 + i];
-    if j < 4 {
-        (q(j) & 63, q(j + 4) & 63)
-    } else {
-        (
-            (q(j + 4) & 0x0f) | ((q(j - 4) >> 6) << 4),
-            (q(j + 4) >> 4) | ((q(j) >> 6) << 4),
-        )
-    }
+    crate::weights::gguf_dequant::scale_min_k4(j, &blk[4..16])
 }
 
 /// Sums the 8 lane accumulators as `((l0+l1)+(l2+l3)) + ((l4+l5)+(l6+l7))`; that fixed

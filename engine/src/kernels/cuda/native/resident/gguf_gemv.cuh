@@ -3,6 +3,7 @@
 #pragma once
 
 #include "resident/iq_tables.cuh"
+#include "resident/k4_scales.cuh"
 
 #define FIFI_GGUF_GEMV_TYPES(X)  \
     X(2, 32, 18)                \
@@ -131,9 +132,8 @@ __device__ __forceinline__ float decode(const uint8_t *b, int i) {
         return (half_value(b + 108) * float(sc)) * float(lo - correction);
     } else if constexpr (Type == 12 || Type == 13) {
         const int g = i / 32;
-        const auto *sc = b + 4;
-        const unsigned scale = g < 4 ? sc[g] & 63u : (sc[g + 4] & 15u) | ((sc[g - 4] >> 6) << 4);
-        const unsigned minimum = g < 4 ? sc[g + 4] & 63u : (sc[g + 4] >> 4) | ((sc[g] >> 6) << 4);
+        unsigned scale, minimum;
+        scale_min_k4(b + 4, g, scale, minimum);
         const unsigned high = Type == 13 ? ((b[16 + i % 32] >> g) & 1) << 4 : 0;
         const int start = Type == 12 ? 16 : 48;
         const unsigned code = nibble(b[start + 32 * (i / 64) + i % 32], g % 2) | high;

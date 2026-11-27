@@ -48,18 +48,6 @@ pub(in crate::kernels::cuda) mod reference {
         testkit::f16_to_f32(u16::from_le_bytes([bytes[at], bytes[at + 1]]))
     }
 
-    /// ggml's `get_scale_min_k4`: the 6-bit scale and min of Q4_K/Q5_K group `j`.
-    fn scale_min_k4(scales: &[u8], j: usize) -> (i32, i32) {
-        if j < 4 {
-            ((scales[j] & 63) as i32, (scales[j + 4] & 63) as i32)
-        } else {
-            (
-                ((scales[j + 4] & 0xF) as i32) | (((scales[j - 4] >> 6) as i32) << 4),
-                ((scales[j + 4] >> 4) as i32) | (((scales[j] >> 6) as i32) << 4),
-            )
-        }
-    }
-
     /// Unsigned quant of Q6_K element i (ggml's dequantize_row_q6_K layout).
     fn q6_of(block: &[u8], i: usize) -> i32 {
         let (half, quarter, l) = (i / 128, (i % 128) / 32, i % 32);
@@ -106,7 +94,7 @@ pub(in crate::kernels::cuda) mod reference {
                 // 32 qs bytes carry values [0, 32) and the high nibbles carry [32, 64);
                 // 16 * half + l == i % 32, spelled out to name the quarter.
                 let (j, half, nib, l) = (i / 64, (i % 32) / 16, (i % 64) / 32, i % 16);
-                let (sc, m) = scale_min_k4(&block[4..16], i / 32);
+                let (sc, m) = crate::weights::gguf_dequant::scale_min_k4(i / 32, &block[4..16]);
                 let q = (block[16 + 32 * j + 16 * half + l] >> (4 * nib)) & 0xF;
                 d * sc as f64 * q as f64 - dmin * m as f64
             }
@@ -116,7 +104,8 @@ pub(in crate::kernels::cuda) mod reference {
                 // 64c+64) high nibbles with qh bit 2c+1; the scales of the two halves are the
                 // packed 6-bit pairs of chunk c. Mirrors gguf_dequant.rs::q5_k.
                 let (chunk, half, l) = (i / 64, (i % 64) / 32, i % 32);
-                let (sc, m) = scale_min_k4(&block[4..16], 2 * chunk + half);
+                let (sc, m) =
+                    crate::weights::gguf_dequant::scale_min_k4(2 * chunk + half, &block[4..16]);
                 let hi = if block[16 + l] & (1u8 << (2 * chunk + half)) != 0 {
                     16
                 } else {

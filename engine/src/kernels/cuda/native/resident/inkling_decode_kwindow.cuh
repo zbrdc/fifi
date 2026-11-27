@@ -41,9 +41,8 @@ __device__ __forceinline__ void decode_kw_rows(inference_cuda_dense_gemv_args a,
             } else {
                 win = 2*pair + j;
                 if constexpr (Type == 13) codes |= ((hi >> win) & 0x01010101u) << 4;
-                const auto *sc = b + 4;
-                const unsigned s = win < 4 ? sc[win]&63u : (sc[win+4]&15u)|((sc[win-4]>>6)<<4);
-                const unsigned m = win < 4 ? sc[win+4]&63u : (sc[win+4]>>4)|((sc[win]>>6)<<4);
+                unsigned s, m;
+                scale_min_k4(b + 4, win, s, m);
                 scale = __half2float(*reinterpret_cast<const __half *>(b))*float(s);
                 minimum = __half2float(*reinterpret_cast<const __half *>(b+2))*float(m);
             }
