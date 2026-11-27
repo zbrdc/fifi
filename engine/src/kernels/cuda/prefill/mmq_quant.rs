@@ -322,5 +322,7 @@ impl CudaContext {
     }
 }
 
+#[cfg(test)]
+pub(crate) mod anatomy;
 #[cfg(all(test, feature = "native-cuda"))]
 mod tests;

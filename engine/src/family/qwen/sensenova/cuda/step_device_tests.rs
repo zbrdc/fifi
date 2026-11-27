@@ -33,13 +33,13 @@ use crate::family::session::TokenStepper;
 use crate::kernels::cuda::prefill::attn_prep_chunk::{
     AttnPrepChunkCall, AttnPrepChunkShape, PrepChunkMode,
 };
-use crate::kernels::cuda::prefill::mmq_dense::{MmqDenseCall, MmqDenseInputCall};
 use crate::kernels::cuda::prefill::mmq_quant::MmqPacking;
-use crate::kernels::cuda::prefill::mmq_size::{fixup_floats_max, q8_1_bytes as mmq_q8_1_bytes};
-use crate::kernels::cuda::resident::add_rmsnorm_q8::AddNormQ8Call;
+use crate::kernels::cuda::prefill::mmq_quant::anatomy::{
+    CardQ8, Routes, card_products, card_q8_row, cpu_q8_1, dequant_mmq, dequant_q8_1, layout_of,
+};
+use crate::kernels::cuda::prefill::mmq_size::fixup_floats_max;
 use crate::kernels::cuda::resident::attn_prep::RopeParams;
 use crate::kernels::cuda::resident::matvec_q::QuantType;
-use crate::kernels::cuda::resident::quantize_q8_1::q8_1_bytes;
 use crate::kernels::cuda::{CudaContext, DeviceBuffer, NativeWeight, device_present};
 use crate::weights::{GgufLimits, GgufWeights};
 
@@ -1754,56 +1754,6 @@ fn card_decode_sweep_columns() {
 
 // ---- The q8_1 activation step on the position probe's saved rows ----------------------
 
-/// `v` at binary16 precision, round to nearest with ties to even, as the quantizers keep
-/// their scale; a binary16 subnormal keeps its own spacing.
-fn f16_round(v: f32) -> f32 {
-    if v == 0.0 {
-        return 0.0;
-    }
-    // The binary32 exponent field is floor(log2 |v|) exactly. f32 `log2` can round up to the
-    // next power of two for a value just below it, which picks the coarser grid.
-    let exponent = ((v.abs().to_bits() >> 23) & 0xff) as i32 - 127;
-    let ulp = 2f32.powi(exponent.max(-14) - 10);
-    (v / ulp).round_ties_even() * ulp
-}
-
-/// The activation quantizers' rule, per 32 values, as `store_q8_1_block` applies it: `d = amax / 127`
-/// in f32, `q = round(x / d)` (0 when `amax` is 0), `d` kept in binary16. Returns the row as a
-/// matvec reads it back (the binary16 `d` times `q`) and the kept scales.
-fn cpu_q8_1(row: &[f32]) -> (Vec<f32>, Vec<f32>) {
-    let mut back = vec![0.0; row.len()];
-    let mut scales = Vec::with_capacity(row.len() / 32);
-    // as_chunks drops a tail shorter than a block, and a dropped tail would read as zeros.
-    assert_eq!(
-        row.len() % 32,
-        0,
-        "a q8_1 row is whole 32-value blocks, got {}",
-        row.len()
-    );
-    let (blocks, _) = row.as_chunks::<32>();
-    let (outs, _) = back.as_chunks_mut::<32>();
-    for (values, out) in blocks.iter().zip(outs) {
-        let amax = values.iter().fold(0.0f32, |m, v| m.max(v.abs()));
-        let d = amax / 127.0;
-        let kept = f16_round(d);
-        scales.push(kept);
-        for (v, o) in values.iter().zip(out) {
-            *o = if amax == 0.0 {
-                0.0
-            } else {
-                kept * (v / d).round()
-            };
-            // the f32 rounding of `v / d`, and the binary16 scale the matvec reads back against
-            // the f32 one the codes were rounded with (at most 127 * 2^-11 of `d` at the top code)
-            debug_assert!(
-                (*o - v).abs() <= 0.57 * d + 4e-6,
-                "the model left the rule's bound"
-            );
-        }
-    }
-    (back, scales)
-}
-
 /// The rows of one file the position probe saved: little-endian f32, `width` to a row.
 fn load_rows(dir: &str, name: &str, width: usize) -> Vec<Vec<f32>> {
     le_f32_vec(&std::fs::read(format!("{dir}/{name}.bin")).unwrap())
@@ -1913,44 +1863,6 @@ fn raw<'a>(loaded: &'a CudaWeights, name: &str) -> &'a DeviceBuffer {
     }
 }
 
-/// A q8_1 row as the matvec reads it: per 32 values the binary16 scale and the binary16 sum of
-/// the values first, the codes after (the vendored `block_q8_1`).
-fn dequant_q8_1(bytes: &[u8], k: usize) -> Vec<f32> {
-    bytes[..36 * (k / 32)]
-        .as_chunks::<36>()
-        .0
-        .iter()
-        .flat_map(|b| {
-            let d = le_f16_vec(&b[..2])[0];
-            b[4..36].iter().map(move |q| d * (*q as i8) as f32)
-        })
-        .collect()
-}
-
-/// The MMQ pack's rows as the GEMM reads them: per 128 values a 144-byte block holding four
-/// scales first (f32 under a Q6_K weight, binary16 under a Q4_K one) and the codes after.
-fn dequant_mmq(pack: &[u8], k: usize, ncols: usize, q6: bool) -> Vec<Vec<f32>> {
-    (0..ncols)
-        .map(|col| {
-            (0..k / 128)
-                .flat_map(|kb| {
-                    let b = &pack[144 * (kb * ncols + col)..144 * (kb * ncols + col + 1)];
-                    (0..4).flat_map(|sb| {
-                        let d = if q6 {
-                            f32::from_le_bytes(b[4 * sb..4 * sb + 4].try_into().unwrap())
-                        } else {
-                            le_f16_vec(&b[4 * sb..4 * sb + 2])[0]
-                        };
-                        b[16 + 32 * sb..48 + 32 * sb]
-                            .iter()
-                            .map(move |q| d * (*q as i8) as f32)
-                    })
-                })
-                .collect()
-        })
-        .collect()
-}
-
 /// MMQ's pack against the matvec's bytes for the same f32 row, block by block. If both
 /// quantizers applied one rule every block would match; where they differ, the gap of the two
 /// quantized rows is the quantizers', and the rest is MMQ's arithmetic.
@@ -1987,119 +1899,6 @@ fn pack_against_matvec(
         "  {label}: MMQ's pack against the matvec's bytes per 32-value block: scale differs in {scales}, codes in {codes}; the two quantized rows {:.3e} rms apart{first}",
         relative(dq, pack_dq).0
     );
-}
-
-/// One f32 row as the card quantized it: the normed row and its q8_1 bytes.
-struct CardQ8 {
-    normed: Vec<f32>,
-    bytes: Vec<u8>,
-    /// How many of the row's values the CPU rule reproduces exactly.
-    equal: usize,
-}
-
-/// The card's norm and q8_1 quantize of `row` under `norm`, read back.
-fn card_q8_row(ctx: &CudaContext, row: &[f32], norm: &DeviceBuffer, eps: f32) -> CardQ8 {
-    let h = row.len();
-    let q8_bytes = q8_1_bytes(h, 1).unwrap();
-    let (row_dev, normed_dev, q8) = (
-        ctx.upload(&le_f32(row)).unwrap(),
-        ctx.upload(&vec![0u8; 4 * h]).unwrap(),
-        ctx.upload(&vec![0u8; q8_bytes]).unwrap(),
-    );
-    let stream = ctx.stream().unwrap();
-    ctx.add_rmsnorm_q8_wide(
-        &stream,
-        AddNormQ8Call {
-            n: h,
-            eps,
-            h: floats(&row_dev, 0, h).unwrap(),
-            delta: None,
-            weight: floats(norm, 0, h).unwrap(),
-            norm_out: floats(&normed_dev, 0, h).unwrap(),
-            q8: bytes_range(&q8, q8_bytes).unwrap(),
-            rows: 1,
-        },
-    )
-    .unwrap();
-    stream.synchronize().unwrap();
-    let normed = download_f32(ctx, &normed_dev).unwrap();
-    let mut bytes = vec![0u8; q8_bytes];
-    ctx.download(&q8, &mut bytes).unwrap();
-    let (model, _) = cpu_q8_1(&normed);
-    let dq = dequant_q8_1(&bytes, h);
-    let equal = dq
-        .iter()
-        .zip(&model)
-        .filter(|(a, b)| a.to_bits() == b.to_bits())
-        .count();
-    CardQ8 {
-        normed,
-        bytes,
-        equal,
-    }
-}
-
-/// The card's matvec over a q8_1 row and its MMQ over a fresh pack of the same f32 row, with
-/// the pack's bytes.
-fn card_products(
-    ctx: &CudaContext,
-    fixup: &DeviceBuffer,
-    weight: &NativeWeight,
-    row: &CardQ8,
-    packing: MmqPacking,
-) -> (Vec<f32>, Vec<f32>, Vec<u8>) {
-    let stream = ctx.stream().unwrap();
-    let (k, rows) = (weight.k(), weight.n_rows());
-    let f32_out = || ctx.upload(&vec![0u8; 4 * rows]).unwrap();
-    let (row_dev, q8_dev) = (
-        ctx.upload(&le_f32(&row.normed)).unwrap(),
-        ctx.upload(&row.bytes).unwrap(),
-    );
-    let (y, y_mmq) = (f32_out(), f32_out());
-    ctx.matvec_native(
-        &stream,
-        weight,
-        bytes_range(&q8_dev, row.bytes.len()).unwrap(),
-        floats(&y, 0, rows).unwrap(),
-        1,
-    )
-    .unwrap();
-    let pack_bytes = mmq_q8_1_bytes(k, 1).unwrap();
-    let pack = ctx.upload(&vec![0u8; pack_bytes]).unwrap();
-    ctx.mmq_dense_input(
-        &stream,
-        MmqDenseInputCall {
-            packing,
-            weight,
-            m: 1,
-            row_stride: k,
-            x: floats(&row_dev, 0, k).unwrap(),
-            y: bytes_range(&pack, pack_bytes).unwrap(),
-        },
-    )
-    .unwrap();
-    ctx.mmq_dense(
-        &stream,
-        MmqDenseCall {
-            weight,
-            w_seg: None,
-            m: 1,
-            q8_1: bytes_range(&pack, pack_bytes).unwrap(),
-            dst: floats(&y_mmq, 0, rows).unwrap(),
-            ld: rows,
-            col_off: 0,
-            fixup: bytes_range(fixup, fixup.bytes()).unwrap(),
-        },
-    )
-    .unwrap();
-    stream.synchronize().unwrap();
-    let mut pack_host = vec![0u8; pack_bytes];
-    ctx.download(&pack, &mut pack_host).unwrap();
-    (
-        download_f32(ctx, &y).unwrap(),
-        download_f32(ctx, &y_mmq).unwrap(),
-        pack_host,
-    )
 }
 
 /// Anatomy, not a gate: which products carry the batched route's error. From one carried state
@@ -2187,107 +1986,6 @@ fn card_reports_which_products_carry_the_batched_error() {
     }
 }
 
-/// Anatomy, not a gate: one product at a time on real rows, no CPU step. The normed embedding
-/// rows of a few tokens go through the projections of block 0 four ways: every weight decoded
-/// over the f32 row (the reference), the one-row matvec over the q8_1 row, and the batched
-/// product over each of its two activation packings. Prints each route's relative L2 error.
-#[test]
-fn card_reports_the_error_of_each_product_route() {
-    let Some((ctx, loaded, weights, mut projector)) = open_rig("sensenova product anatomy") else {
-        return;
-    };
-    let shape = *weights.shape();
-    let vocab = shape.vocab as u32;
-    let fixup_bytes = 4 * fixup_floats_max(ctx.sm_count() as usize).unwrap();
-    let fixup = ctx.upload(&vec![0u8; fixup_bytes]).unwrap();
-    let norm =
-        crate::family::step::rows::raw(&loaded, "sensenova", "blk.0.attn_norm.weight").unwrap();
-    let norm_of = |v: &[f32]| v.iter().map(|x| f64::from(*x).powi(2)).sum::<f64>().sqrt();
-    let rel = |a: &[f32], b: &[f32]| {
-        let diff: Vec<f32> = a.iter().zip(b).map(|(x, y)| x - y).collect();
-        norm_of(&diff) / norm_of(b).max(1e-30)
-    };
-    eprintln!(
-        "weight            type   matvec-q8_1  batched-256  batched-32  rounded-32 | rows: q8_1  pack-256  pack-32  rounded-32"
-    );
-    for name in [
-        "attn_qkv_gate",
-        "ssm_beta_alpha",
-        "ssm_out",
-        "ffn_gate",
-        "ffn_up",
-    ] {
-        let weight = crate::family::step::rows::native(
-            &loaded,
-            "sensenova",
-            &format!("blk.0.{name}.weight"),
-        )
-        .unwrap();
-        let mut sums = [0f64; 8];
-        const TOKENS: u32 = 8;
-        for i in 1..=TOKENS {
-            let token = (i.wrapping_mul(2_654_435_761) >> 7) % vocab;
-            let embed = projector.rows(weights.token_embd(), &[token]).unwrap();
-            let row = card_q8_row(&ctx, &embed, norm, shape.eps);
-            let stream = ctx.stream().unwrap();
-            let (x, y) = (
-                ctx.upload(&le_f32(&row.normed)).unwrap(),
-                ctx.upload(&vec![0u8; 4 * weight.n_rows()]).unwrap(),
-            );
-            ctx.matvec_dq_native(
-                &stream,
-                weight,
-                floats(&x, 0, weight.k()).unwrap(),
-                floats(&y, 0, weight.n_rows()).unwrap(),
-            )
-            .unwrap();
-            stream.synchronize().unwrap();
-            let exact = download_f32(&ctx, &y).unwrap();
-            let (matvec, wide, wide_pack) =
-                card_products(&ctx, &fixup, weight, &row, MmqPacking::CpuReference);
-            let (_, narrow, narrow_pack) =
-                card_products(&ctx, &fixup, weight, &row, MmqPacking::Vendor);
-            // The rows each product read, as floats, against the f32 row.
-            let q6 = matches!(weight.quant(), QuantType::Q6K);
-            let k = weight.k();
-            let read = [
-                dequant_q8_1(&row.bytes, k),
-                dequant_mmq(&wide_pack, k, 1, q6).remove(0),
-                dequant_mmq(&narrow_pack, k, 1, q6).remove(0),
-            ];
-            let (_, rounded, rounded_pack) =
-                card_products(&ctx, &fixup, weight, &row, MmqPacking::Rounded);
-            let rounded_read = dequant_mmq(&rounded_pack, k, 1, q6).remove(0);
-            let errors = [
-                rel(&matvec, &exact),
-                rel(&wide, &exact),
-                rel(&narrow, &exact),
-                rel(&rounded, &exact),
-                rel(&read[0], &row.normed),
-                rel(&read[1], &row.normed),
-                rel(&read[2], &row.normed),
-                rel(&rounded_read, &row.normed),
-            ];
-            for (sum, error) in sums.iter_mut().zip(errors) {
-                *sum += error;
-            }
-        }
-        let mean = sums.map(|s| s / f64::from(TOKENS));
-        eprintln!(
-            "{name:<16}  {:?}  {:>10.3e}  {:>10.3e}  {:>10.3e}  {:>10.3e} | {:>9.3e} {:>9.3e} {:>9.3e} {:>9.3e}",
-            weight.quant(),
-            mean[0],
-            mean[1],
-            mean[2],
-            mean[3],
-            mean[4],
-            mean[5],
-            mean[6],
-            mean[7]
-        );
-    }
-}
-
 /// The card's quantize, matvec and MMQ on the rows the position probe saved: each kernel
 /// against the CPU product over the bytes that kernel itself wrote, which needs no model of
 /// the quantizer, and the step each takes from the f32 row. Then the head from the saved final
@@ -2311,11 +2009,14 @@ fn card_projection_kernels_over_their_own_q8_1_bytes() {
     let fixup_bytes = 4 * fixup_floats_max(ctx.sm_count() as usize).unwrap();
     let fixup = ctx.upload(&vec![0u8; fixup_bytes]).unwrap();
     let mut replay = |label: &str, cpu_weight: &GgufMatrix, weight: &NativeWeight, row: &CardQ8| {
-        let (y_card, y_mmq, pack) =
-            card_products(&ctx, &fixup, weight, row, MmqPacking::CpuReference);
+        let Routes {
+            matvec: y_card,
+            mmq: y_mmq,
+            pack,
+        } = card_products(&ctx, &fixup, weight, row, MmqPacking::CpuReference).unwrap();
         let dq = dequant_q8_1(&row.bytes, weight.k());
         let q6 = matches!(weight.quant(), QuantType::Q6K);
-        let pack_dq = dequant_mmq(&pack, weight.k(), 1, q6).remove(0);
+        let pack_dq = dequant_mmq(&pack, weight.k(), 1, layout_of(weight.quant())).remove(0);
         pack_against_matvec(label, &pack, &row.bytes, &dq, &pack_dq, q6);
         let exact = projector.linear(cpu_weight, &row.normed).unwrap();
         let over_dq = projector.linear(cpu_weight, &dq).unwrap();
