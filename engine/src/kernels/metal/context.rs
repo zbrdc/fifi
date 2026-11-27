@@ -8,7 +8,8 @@
 //! Memory is unified, so a buffer is host memory the GPU reads: [`MetalContext::upload`] fills
 //! a new buffer with no copy stage, and a [`DeviceBuffer`] reads and writes through the same
 //! storage. The host may touch a buffer only while no command buffer that uses it is in
-//! flight; every launch here waits for its command buffer.
+//! flight. A launch waits for its command buffer; a frame keeps one command buffer ahead, and
+//! the context waits for it before a host read or write of a buffer it binds.
 //!
 //! A failed free latches the backend terminal. Drop never panics. After a terminal failure no
 //! native call runs, so the remaining buffers are left to the process exit.
@@ -17,17 +18,18 @@
 //! validates its input, then enters the dispatch guard.
 
 use std::{
-    cell::RefCell,
+    cell::{Cell, RefCell},
     collections::HashMap,
-    ffi::CString,
+    ffi::{CString, c_int, c_void},
     rc::Rc,
     sync::atomic::{AtomicUsize, Ordering},
 };
 
 use crate::EngError;
 
+use super::frame::{DISPATCHES_PER_BUFFER, Frame};
 use super::guard::{DispatchGuard, Lease, SLOTS};
-use super::native::{self, Binding, RawBuffer, RawKernel, RawRuntime};
+use super::native::{self, Binding, RawBuffer, RawCommand, RawKernel, RawRuntime};
 use super::{
     ADAPTER_OPERATION, ALLOCATE_OPERATION, COMPILE_OPERATION, INITIALIZE_OPERATION,
     LAUNCH_OPERATION, SYNCHRONIZE_OPERATION, TERMINAL, ensure_usable, terminal_failure,
@@ -54,6 +56,17 @@ pub(super) struct Shared {
     kernels: RefCell<HashMap<(&'static str, &'static str), Rc<RawKernel>>>,
     /// The non-finite weight flag of the dense matvec, made at first use.
     flag: RefCell<Option<RawBuffer>>,
+    /// The command buffers a frame committed and did not wait for, oldest first.
+    in_flight: RefCell<Vec<InFlight>>,
+    /// The GPU time of the command buffers waited before a frame's drain.
+    settled_gpu_ns: Cell<u64>,
+}
+
+/// A command buffer a frame committed and did not wait for, with the handles of the buffers
+/// it binds, each once.
+struct InFlight {
+    command: RawCommand,
+    bound: Vec<*mut c_void>,
 }
 
 pub(crate) struct DeviceBuffer {
@@ -103,6 +116,8 @@ impl MetalContext {
             live_buffers: AtomicUsize::new(0),
             kernels: RefCell::new(HashMap::new()),
             flag: RefCell::new(None),
+            in_flight: RefCell::new(Vec::new()),
+            settled_gpu_ns: Cell::new(0),
         });
         Ok(Self { shared, lease })
     }
@@ -198,17 +213,97 @@ impl MetalContext {
             per_threadgroup,
             repeats,
         )
-        .map_err(|status| {
-            terminal_failure(match status {
-                native::STATUS_INVALID | native::STATUS_EXCEPTION => ADAPTER_OPERATION,
-                native::STATUS_COMMAND_BUFFER => SYNCHRONIZE_OPERATION,
-                _ => LAUNCH_OPERATION,
-            })
-        })
+        .map_err(launch_failure)
+    }
+
+    /// A frame on this context: `DISPATCHES_PER_BUFFER` dispatches a command buffer, one
+    /// command buffer ahead, one wait in [`Frame::drain`].
+    pub(super) fn frame(&self) -> Frame {
+        Frame::new(Rc::clone(&self.shared), DISPATCHES_PER_BUFFER)
+    }
+
+    /// A frame of `per_buffer` dispatches a command buffer, for the tests.
+    #[cfg(test)]
+    pub(super) fn frame_of(&self, per_buffer: usize) -> Frame {
+        Frame::new(Rc::clone(&self.shared), per_buffer)
     }
 }
 
 impl Shared {
+    pub(super) fn runtime(&self) -> &RawRuntime {
+        &self.runtime
+    }
+
+    /// Waits for the oldest command buffer in flight and releases it. Its GPU time in
+    /// nanoseconds is kept for the next [`Self::take_settled`]. Nothing in flight is nothing.
+    pub(super) fn wait_oldest(&self) -> Result<(), EngError> {
+        if self.in_flight.borrow().is_empty() {
+            return Ok(());
+        }
+        let _guard = DispatchGuard::enter(&TERMINAL);
+        let oldest = self.in_flight.borrow_mut().remove(0);
+        let outcome = native::wait(&oldest.command).map_err(launch_failure);
+        native::release(oldest.command.pointer());
+        if let Ok(gpu_ns) = outcome {
+            self.settled_gpu_ns.set(self.settled_gpu_ns.get() + gpu_ns);
+        }
+        outcome.map(|_| ())
+    }
+
+    /// The GPU time of the command buffers waited since the last drain, in nanoseconds.
+    pub(super) fn take_settled(&self) -> u64 {
+        self.settled_gpu_ns.replace(0)
+    }
+
+    /// Commits `command`, which binds `bound`. One command buffer stays ahead: the one in
+    /// flight, if any, is waited for first.
+    pub(super) fn commit_ahead(
+        &self,
+        command: RawCommand,
+        bound: Vec<*mut c_void>,
+    ) -> Result<(), EngError> {
+        ensure_usable(&TERMINAL)?;
+        let _guard = DispatchGuard::enter(&TERMINAL);
+        self.wait_oldest()?;
+        native::commit(&command).map_err(launch_failure)?;
+        self.in_flight
+            .borrow_mut()
+            .push(InFlight { command, bound });
+        Ok(())
+    }
+
+    /// Waits for the command buffers in flight that bind `buffer`, and for those ahead of
+    /// them. The host touches a buffer only after this.
+    pub(super) fn settle(&self, buffer: *mut c_void) -> Result<(), EngError> {
+        let binds = |entry: &InFlight| entry.bound.contains(&buffer);
+        if TERMINAL.load(Ordering::Acquire) || !self.in_flight.borrow().iter().any(binds) {
+            return Ok(());
+        }
+        let _guard = DispatchGuard::enter(&TERMINAL);
+        while self.in_flight.borrow().iter().any(binds) {
+            self.wait_oldest()?;
+        }
+        Ok(())
+    }
+
+    /// Waits for every command buffer in flight.
+    pub(super) fn wait_all(&self) -> Result<(), EngError> {
+        if TERMINAL.load(Ordering::Acquire) {
+            return Ok(());
+        }
+        let _guard = DispatchGuard::enter(&TERMINAL);
+        while !self.in_flight.borrow().is_empty() {
+            self.wait_oldest()?;
+        }
+        Ok(())
+    }
+
+    /// The command buffers in flight, for the tests.
+    #[cfg(test)]
+    pub(super) fn in_flight_count(&self) -> usize {
+        self.in_flight.borrow().len()
+    }
+
     fn note(&self, raw: &RawBuffer) {
         self.live_bytes.fetch_add(raw.bytes(), Ordering::AcqRel);
         self.live_buffers.fetch_add(1, Ordering::AcqRel);
@@ -259,6 +354,15 @@ pub(super) fn adapter_bug(what: &str) -> EngError {
     }
 }
 
+/// The failure of a launch's native call: terminal, named by the call's status.
+pub(super) fn launch_failure(status: c_int) -> EngError {
+    terminal_failure(match status {
+        native::STATUS_INVALID | native::STATUS_EXCEPTION => ADAPTER_OPERATION,
+        native::STATUS_COMMAND_BUFFER => SYNCHRONIZE_OPERATION,
+        _ => LAUNCH_OPERATION,
+    })
+}
+
 impl DeviceBuffer {
     pub(crate) fn bytes(&self) -> usize {
         self.raw.bytes()
@@ -286,6 +390,7 @@ impl DeviceBuffer {
     /// fail.
     pub(crate) fn read(&self, offset: usize, bytes: usize) -> Result<Vec<u8>, EngError> {
         let _ = self.range(offset, bytes)?;
+        self.shared.settle(self.raw.pointer())?;
         native::buffer_read(&self.raw, offset, bytes)
             .map_err(|_| adapter_bug("the host read of a Metal buffer"))
     }
@@ -293,6 +398,7 @@ impl DeviceBuffer {
     /// Copies `data` into the buffer at `offset`.
     pub(crate) fn write(&self, offset: usize, data: &[u8]) -> Result<(), EngError> {
         let _ = self.range(offset, data.len())?;
+        self.shared.settle(self.raw.pointer())?;
         native::buffer_write(&self.raw, offset, data)
             .map_err(|_| adapter_bug("the host write into a Metal buffer"))
     }
@@ -304,6 +410,8 @@ impl Drop for DeviceBuffer {
         if TERMINAL.load(Ordering::Acquire) {
             return;
         }
+        // A command buffer of a frame may still bind it; the handle is released after that wait.
+        let _ = self.shared.settle(self.raw.pointer());
         let _guard = DispatchGuard::enter(&TERMINAL);
         native::release(self.raw.pointer());
         self.shared

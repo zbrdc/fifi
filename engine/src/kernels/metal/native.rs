@@ -194,7 +194,8 @@ pub(super) fn buffer_write(buffer: &RawBuffer, offset: usize, data: &[u8]) -> Re
     }
     if !data.is_empty() {
         // SAFETY: `inside` proved `data.len()` bytes of the buffer start at `offset`, and no
-        // command buffer is in flight: every launch of this module waits.
+        // command buffer in flight binds the buffer: a launch waits for its command buffer,
+        // and a host touch through the context waits for a frame's first.
         unsafe {
             std::ptr::copy_nonoverlapping(
                 data.as_ptr(),

@@ -18,8 +18,8 @@
 //!
 //! Memory is unified: a buffer's storage is the same memory to the host and the GPU, so there
 //! is no copy stage. The host may touch a buffer only while no command buffer that uses it is
-//! in flight. Every launch in this module waits for its command buffer, so a caller that stays
-//! inside it never has one in flight.
+//! in flight. A launch waits for its command buffer. A frame (`frame`) keeps one command buffer
+//! ahead, and the context waits for it before a host read or write of a buffer it binds.
 // The module is staged: no family calls it until the Inkling 2 Mini decode step moves here.
 #![allow(
     dead_code,
@@ -28,6 +28,7 @@
 )]
 
 mod context;
+mod frame;
 mod guard;
 mod native;
 pub(crate) mod resident;
