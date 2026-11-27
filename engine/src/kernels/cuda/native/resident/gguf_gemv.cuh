@@ -2,9 +2,7 @@
 // use the same byte layout as weights/gguf.rs and weights/gguf_dequant.rs.
 #pragma once
 
-#define GGML_COMMON_DECL_CUDA
-#define GGML_COMMON_IMPL_CUDA
-#include "ggml-common.h"
+#include "resident/iq_tables.cuh"
 
 #define FIFI_GGUF_GEMV_TYPES(X)  \
     X(2, 32, 18)                \

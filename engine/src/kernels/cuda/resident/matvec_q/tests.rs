@@ -864,6 +864,100 @@ fn iq4xs_value_table_pins_to_the_cpu_constant() {
     );
 }
 
+/// The native IQ tables (native/resident/iq_tables.cuh) are the CPU constants of
+/// weights/gguf_tables.rs, numerically: each table's integers are parsed from the header's text
+/// and compared, so the device tables cannot drift from the oracle's. `iq1s_grid_gpu` is the
+/// packing of `IQ1S_GRID` for the device lanes. No device needed.
+#[test]
+fn iq_tables_pin_to_the_cpu_constants() {
+    use crate::weights::{
+        IQ1S_GRID, IQ2S_GRID, IQ2XS_GRID, IQ2XXS_GRID, IQ3S_GRID, IQ3XXS_GRID, KSIGNS_IQ2XS,
+        KVALUES_FP4,
+    };
+
+    /// The integers of one `name[N] = { ... };` table of the header. A negative decimal stays
+    /// negative in the two's complement of the wider type.
+    fn header_table(header: &str, name: &str) -> Vec<u128> {
+        let rest = header.split_once(&format!("{name}[")).expect("the table").1;
+        let rest = rest.split_once('{').expect("the body of the table").1;
+        let body = rest.split_once('}').expect("the end of the table").0;
+        body.split(',')
+            .map(str::trim)
+            .filter(|token| !token.is_empty())
+            .map(|token| match token.strip_prefix("0x") {
+                Some(hex) => u128::from_str_radix(hex, 16).expect("a hex literal"),
+                None => token.parse::<i128>().expect("a decimal literal") as u128,
+            })
+            .collect()
+    }
+
+    /// The device word of one CPU grid point: weight `l` is byte `l` of the point, and lane
+    /// `l` of the kernel reads nibble `2*(l % 4) + l/4` of the word. A byte 0xff (-1) is nibble
+    /// 0, 0x00 (0) is 1 and 0x01 (+1) is 2.
+    fn packed_grid_word(point: u64) -> u128 {
+        (0..8).fold(0, |word, lane| {
+            let nibble: u128 = match (point >> (8 * lane)) & 0xff {
+                0xff => 0,
+                0x00 => 1,
+                0x01 => 2,
+                other => panic!("IQ1_S grid byte {other:#x}"),
+            };
+            word | (nibble << (4 * (2 * (lane % 4) + lane / 4)))
+        })
+    }
+
+    let header = std::fs::read_to_string(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/src/kernels/cuda/native/resident/iq_tables.cuh"
+    ))
+    .expect("the native IQ table header exists");
+    let tables: [(&str, Vec<u128>); 8] = [
+        (
+            "ksigns_iq2xs",
+            KSIGNS_IQ2XS.iter().map(|&v| u128::from(v)).collect(),
+        ),
+        (
+            "iq2xxs_grid",
+            IQ2XXS_GRID.iter().map(|&v| u128::from(v)).collect(),
+        ),
+        (
+            "iq2xs_grid",
+            IQ2XS_GRID.iter().map(|&v| u128::from(v)).collect(),
+        ),
+        (
+            "iq2s_grid",
+            IQ2S_GRID.iter().map(|&v| u128::from(v)).collect(),
+        ),
+        (
+            "iq3xxs_grid",
+            IQ3XXS_GRID.iter().map(|&v| u128::from(v)).collect(),
+        ),
+        (
+            "iq3s_grid",
+            IQ3S_GRID.iter().map(|&v| u128::from(v)).collect(),
+        ),
+        (
+            "kvalues_fp4",
+            KVALUES_FP4.iter().map(|&v| v as i128 as u128).collect(),
+        ),
+        (
+            "iq1s_grid_gpu",
+            IQ1S_GRID
+                .iter()
+                .map(|&point| packed_grid_word(point))
+                .collect(),
+        ),
+    ];
+    for (name, want) in tables {
+        let have = header_table(&header, name);
+        assert_eq!(have.len(), want.len(), "{name}: the header's count");
+        assert_eq!(
+            have, want,
+            "the native table {name} must equal the CPU constant"
+        );
+    }
+}
+
 /// The in-house IQ4_XS kernel against the CPU oracle through the same host reference
 /// machinery: k on and off the padded grid, a row count no vendored matvec takes (13), and
 /// ncols 1 and 8.

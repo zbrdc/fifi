@@ -17,8 +17,6 @@ mod gguf_encode;
 pub(crate) mod gguf_experts;
 mod gguf_split;
 mod gguf_tables;
-#[cfg(all(test, feature = "native-cuda"))]
-pub(crate) use gguf_tables::KSIGNS_IQ2XS;
 /// The lookup tables of the lattice and non-linear GGUF types, re-exported for the CUDA
 /// matvec, which passes them to its kernels as launch arguments, and for the table pin test
 /// of the IQ4_NL header (kernels/cuda/resident/matvec_q/tests.rs).
@@ -37,6 +35,8 @@ pub(crate) use gguf_tables::{IQ1S_GRID_U16, inkling_codebook_words};
     not(feature = "native-cuda")
 ))]
 pub(crate) use gguf_tables::{IQ2S_GRID, IQ2XS_GRID, IQ2XXS_GRID};
+#[cfg(all(test, feature = "native-cuda"))]
+pub(crate) use gguf_tables::{KSIGNS_IQ2XS, KVALUES_FP4};
 mod gguf_identity;
 mod gguf_weights;
 mod header;

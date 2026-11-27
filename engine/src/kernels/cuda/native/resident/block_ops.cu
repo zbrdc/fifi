@@ -18,12 +18,7 @@
 #include "mma_f16.cuh"
 #include "resident/block_ops.h"
 
-// The vendored header defines block_q8_1 and keeps static host helpers that are unreferenced in
-// this glue TU (the quantize_q8_1 glue includes it the same way).
-#pragma GCC diagnostic push
-#pragma GCC diagnostic ignored "-Wunused-function"
-#include "quantize.cuh"
-#pragma GCC diagnostic pop
+#include "quant_blocks.h"
 #include "resident/q8_1_store.cuh"
 
 namespace {

@@ -20,7 +20,7 @@
 use super::gguf::GgufType;
 use super::gguf_tables::{
     IQ1S_GRID, IQ2S_GRID, IQ2XS_GRID, IQ2XXS_GRID, IQ3S_GRID, IQ3XXS_GRID, KMASK_IQ2XS,
-    KSIGNS_IQ2XS, KVALUES_IQ4NL,
+    KSIGNS_IQ2XS, KVALUES_FP4, KVALUES_IQ4NL,
 };
 use crate::EngError;
 
@@ -474,7 +474,6 @@ fn iq1_m(b: &[u8], y: &mut [f32]) {
 
 fn mxfp4(b: &[u8], y: &mut [f32]) {
     // The GGML E2M1 table uses doubled integer values, so halve the E8M0 scale.
-    const VALUES: [i8; 16] = [0, 1, 2, 3, 4, 6, 8, 12, 0, -1, -2, -3, -4, -6, -8, -12];
     let exponent = u32::from(b[0]);
     let scale = f32::from_bits(if exponent < 2 {
         0x0020_0000 << exponent
@@ -483,8 +482,8 @@ fn mxfp4(b: &[u8], y: &mut [f32]) {
     });
     let (low, high) = y.split_at_mut(16);
     for ((lo, hi), &packed) in low.iter_mut().zip(high).zip(&b[1..]) {
-        *lo = f32::from(VALUES[usize::from(packed & 15)]) * scale;
-        *hi = f32::from(VALUES[usize::from(packed >> 4)]) * scale;
+        *lo = f32::from(KVALUES_FP4[usize::from(packed & 15)]) * scale;
+        *hi = f32::from(KVALUES_FP4[usize::from(packed >> 4)]) * scale;
     }
 }
 

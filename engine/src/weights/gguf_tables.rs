@@ -4004,6 +4004,10 @@ pub(crate) const KVALUES_IQ4NL: [i8; 16] = [
     -127, -104, -83, -65, -49, -35, -22, -10, 1, 13, 25, 38, 53, 69, 89, 113,
 ];
 
+// The E2M1 values of the GGUF MXFP4 block, in the doubled integers of the GGML table
+// kvalues_fp4.
+pub(crate) const KVALUES_FP4: [i8; 16] = [0, 1, 2, 3, 4, 6, 8, 12, 0, -1, -2, -3, -4, -6, -8, -12];
+
 // The Inkling path reads the llama.cpp IQ1_S grid as u16 words; main's CUDA
 // IQ1S_GRID packs each row into u64, so the two tables keep distinct names.
 #[cfg(all(feature = "native-mlx", target_os = "macos", target_arch = "aarch64"))]
@@ -4298,6 +4302,15 @@ mod tests {
         assert_eq!(
             le_hex!(KVALUES_IQ4NL),
             "61aa47540aa024b5d6ddaa839b84ffe59f3d5a349af5c6c7ffcb5e0474b46163"
+        );
+    }
+
+    #[test]
+    fn kvalues_fp4_matches_pinned_sha256() {
+        assert_eq!(KVALUES_FP4.len(), 16);
+        assert_eq!(
+            le_hex!(KVALUES_FP4),
+            "adf76b672d47eb7fc0afd4db132d548d59d3190aa0ad118fdbf569d5fd478f97"
         );
     }
 }

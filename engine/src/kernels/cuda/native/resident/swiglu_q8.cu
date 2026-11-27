@@ -20,13 +20,7 @@
 #include "device.h"
 #include "resident/swiglu_q8.h"
 
-// The vendored headers keep static host helpers their own objects reference; in this glue TU they
-// are unreferenced, which -Wall reports although nothing here is wrong (the quantize_q8_1 glue
-// includes the same header the same way).
-#pragma GCC diagnostic push
-#pragma GCC diagnostic ignored "-Wunused-function"
-#include "quantize.cuh"
-#pragma GCC diagnostic pop
+#include "quant_blocks.h"
 #include "resident/q8_1_store.cuh"
 
 namespace {

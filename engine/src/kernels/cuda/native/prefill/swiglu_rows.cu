@@ -1,23 +1,17 @@
 /* Argument validation and the one launch of swiglu_rows (contract: prefill/swiglu_rows.h).
  * The entry follows attn_prep_chunk.cu (validate everything before any CUDA call, try/catch,
- * C types only), and the element is the upstream ggml_cuda_op_silu_single, called through the
- * shim. In the MMQ glue group, because it is the silu half of the composed llama.cpp
- * reference. */
+ * C types only), and the element is llama.cpp's silu, x / (1 + expf(-x)) (MIT), inlined below
+ * with the tokens the shim unary.cuh carried. In the MMQ glue group with -use_fast_math,
+ * because it is the silu half of the composed llama.cpp reference. */
 #include "prefill/swiglu_rows.h"
 
 #include <cuda_runtime.h>
 
+#include <math.h>
 #include <stdint.h>
 
 #include "abi.h"
 #include "device.h"
-
-// The shim's vendored common.cuh keeps static host helpers this TU does not reference, which
-// -Wall reports although nothing is wrong (mmq_facts.cu includes it the same way).
-#pragma GCC diagnostic push
-#pragma GCC diagnostic ignored "-Wunused-function"
-#include "unary.cuh"
-#pragma GCC diagnostic pop
 
 namespace {
 
@@ -58,9 +52,9 @@ bool valid_swiglu_rows(const inference_cuda_swiglu_rows_args *a) {
     return apart(a->act, act_bytes(a), a->gu, gu_bytes(a));
 }
 
-// One element: the upstream silu of the gate times the up value.
+// One element: the silu of the gate times the up value.
 __device__ __forceinline__ float swiglu1(float g, float u) {
-    return ggml_cuda_op_silu_single(g) * u;
+    return (g / (1.0f + expf(-g))) * u;
 }
 
 // Block (x, r): thread i handles float4 column c4 = x * kThreads + i of row r, n4 = n_ff / 4.
