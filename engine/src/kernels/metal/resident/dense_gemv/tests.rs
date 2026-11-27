@@ -626,8 +626,8 @@ fn a_second_frame_does_not_carry_the_flag_while_one_frame_has_it() {
 }
 
 /// Prints, for 128 dispatches of the head's row and of a small projection, the wall time and the
-/// GPU time of a frame of 64 dispatches a command buffer against one-dispatch frames, the
-/// waiting launch. Both forms must write the same bits over a sentinel.
+/// GPU time of one-dispatch frames (the waiting launch) and of a frame of 4 to 256 dispatches a
+/// command buffer. Every form must write the same bits over a sentinel.
 #[test]
 #[ignore = "prints the dense matvec's time in a frame against the waiting launch"]
 fn dense_gemv_in_a_frame_is_timed() {
@@ -689,24 +689,28 @@ fn time_in_a_frame(rig: &Rig, rng: &mut Rng, shape: DenseGemvShape) {
             "the results replaced the sentinel"
         );
 
-        let start = Instant::now();
-        let mut frame = rig.ctx.frame();
-        for _ in 0..DISPATCHES {
-            frame
-                .dense_gemv(call(shape, &w, &x, &framed))
-                .expect("a dispatch");
+        // The frame of 64 is the runtime's count; the others set it by measurement. At 256 the
+        // 128 dispatches share one command buffer.
+        for &per_buffer in &[4usize, 8, 16, 32, 64, 128, 256] {
+            let start = Instant::now();
+            let mut frame = rig.ctx.frame_of(per_buffer);
+            for _ in 0..DISPATCHES {
+                frame
+                    .dense_gemv(call(shape, &w, &x, &framed))
+                    .expect("a dispatch");
+            }
+            let gpu_ns = frame.drain().expect("the drain");
+            report(
+                round,
+                &format!("a frame of {per_buffer} dispatches a command buffer"),
+                start.elapsed(),
+                gpu_ns,
+            );
+            assert_eq!(
+                framed.read("y"),
+                waited_bits,
+                "the frame wrote the bits the waiting launch wrote"
+            );
         }
-        let gpu_ns = frame.drain().expect("the drain");
-        report(
-            round,
-            "a frame of 64 dispatches a command buffer",
-            start.elapsed(),
-            gpu_ns,
-        );
-        assert_eq!(
-            framed.read("y"),
-            waited_bits,
-            "the frame wrote the bits the waiting launch wrote"
-        );
     }
 }
