@@ -689,8 +689,9 @@ fn relative_attention_in_a_frame_is_timed() {
 }
 
 /// Prints, for a ring, the GPU time of a step among sixteen in a frame against the step with a
-/// dispatch left out and each dispatch alone, the median of seven frames: what the commit and
-/// the finish cost in place is the difference, their own time and the gap before them.
+/// dispatch left out and each dispatch alone, the median of seven frames. A dispatch alone
+/// among its own kind is pipelined, sixteen overlapping in a frame, so its figure is below its
+/// cost in the step, and the difference is not a gap between dispatches.
 #[test]
 #[ignore = "prints the step's dispatches' time in place and alone on this device"]
 fn relative_attention_dispatches_are_timed() {
