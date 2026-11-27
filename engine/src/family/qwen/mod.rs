@@ -12,4 +12,6 @@ pub(crate) mod flash_next;
     reason = "the Q36 host reference serves later work; until it lands, only tests and the Mac reference run call it"
 )]
 pub mod qwen36;
+#[cfg(feature = "native-cuda")]
+pub(crate) mod recipe;
 pub(crate) mod sensenova;

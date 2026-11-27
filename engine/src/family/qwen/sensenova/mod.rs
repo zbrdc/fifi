@@ -185,6 +185,29 @@ impl LoopPlan {
         }
     }
 
+    /// The trunk as the family builder takes it: one visit per logical layer.
+    #[cfg(feature = "native-cuda")]
+    pub(crate) fn visits(&self) -> Vec<crate::family::qwen::recipe::Visit> {
+        use crate::family::qwen::recipe::{Streams, Visit};
+        (0..TRUNK_LAYERS)
+            .map(|il| {
+                let p = self.physical(il);
+                let block = self.block(p);
+                Visit {
+                    block,
+                    recurrent: self.recurrent[block],
+                    streams: if self.mhc_active(il) {
+                        Streams::Two {
+                            fork: p == self.mhc_start,
+                        }
+                    } else {
+                        Streams::One
+                    },
+                }
+            })
+            .collect()
+    }
+
     /// Whether logical layer `il` routes through mHC streams.
     pub(crate) fn mhc_active(&self, il: usize) -> bool {
         let p = self.physical(il);

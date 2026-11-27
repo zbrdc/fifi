@@ -24,7 +24,9 @@ use std::rc::Rc;
 
 use crate::EngError;
 use crate::family::project::cuda::CudaWeights;
-use crate::family::step::recipe::{Forward, Layer, Mixer, Site};
+use crate::family::step::recipe::Layer;
+#[cfg(test)]
+use crate::family::step::recipe::{Forward, Mixer};
 use crate::family::step::replay::Replay;
 use crate::family::step::rows::Map;
 use crate::family::step::scratch::{OnDevice, Zeroed};
@@ -38,7 +40,7 @@ use crate::kernels::cuda::{CudaContext, DeviceBuffer, DeviceRange, DeviceStream,
 
 use super::super::step::yarn_inv_freq;
 use super::super::weights::LoopShape;
-use super::super::{LoopPlan, RopePlan, TRUNK_LAYERS};
+use super::super::{LoopPlan, RopePlan};
 
 mod prefill;
 
@@ -165,13 +167,9 @@ impl<'a> LoopStep<'a> {
         cache_rows: usize,
     ) -> Result<Self, EngError> {
         let h = shape.hidden;
-        let visits = TRUNK_LAYERS;
         let rec_floats = shape.delta_value_heads * shape.delta_key_dim * shape.delta_value_dim;
         let ring_floats = shape.conv_dim() * (shape.conv_kernel - 1);
         let cache_bytes = cache_rows * shape.heads_kv * shape.head_dim * 2;
-        let attn_slot: Vec<usize> = (0..visits)
-            .filter(|&il| !plan.recurrent[plan.block(plan.physical(il))])
-            .collect();
         // One Phys per PHYSICAL layer (a loop revisit reads the same weights through its
         // own visit state); `recurrent` is block-indexed, so the mixer test goes through
         // `block(p)` exactly as the load template does.
@@ -198,39 +196,7 @@ impl<'a> LoopStep<'a> {
             conv_kernel: shape.conv_kernel,
             conv_dim: shape.conv_dim(),
         };
-        let layers: Vec<Layer> = (0..visits)
-            .map(|il| {
-                let p = plan.physical(il);
-                let stem = format!("blk.{}", plan.block(p));
-                let n = |name: &str| format!("{stem}.{name}");
-                let router =
-                    |part: &str| [n(&format!("{part}.weight")), n(&format!("{part}.bias"))];
-                Layer {
-                    norms: [n("attn_norm.weight"), n("post_attention_norm.weight")],
-                    site: if plan.mhc_active(il) {
-                        Site::Routed {
-                            routers: [router("hc_attn_fn"), router("hc_ffn_fn")],
-                            fork: p == plan.mhc_start,
-                        }
-                    } else {
-                        Site::Plain
-                    },
-                    mixer: match attn_slot.iter().position(|&visit| visit == il) {
-                        Some(slot) => Mixer::Attend {
-                            stem: stem.clone(),
-                            slot,
-                        },
-                        None => Mixer::Delta {
-                            names: Box::new(delta::DeltaNames::fused(&stem)),
-                            slot: il,
-                        },
-                    },
-                    forward: Forward::Dense(
-                        ["gate", "up", "down"].map(|t| n(&format!("ffn_{t}.weight"))),
-                    ),
-                }
-            })
-            .collect();
+        let (layers, slots) = crate::family::qwen::recipe::layers(&plan.visits());
         layers
             .iter()
             .try_for_each(|layer| layer.check(&map, dims, Some(attn_dims)))?;
@@ -244,10 +210,10 @@ impl<'a> LoopStep<'a> {
             state: State::new(
                 &Zeroed(OnDevice(&ctx)),
                 Slots {
-                    delta: visits,
+                    delta: slots.delta,
                     ring: ring_floats,
                     record: rec_floats,
-                    attend: attn_slot.len(),
+                    attend: slots.attend,
                     plane: cache_bytes,
                     rows: cache_rows,
                 },
