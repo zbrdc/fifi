@@ -3,8 +3,8 @@
 //! MMVQ matvec reads as stored, the small F32 tensors (conv, `ssm_a`, `dt.bias`, every
 //! norm, the mHC bias) land as raw F32 copies.
 //!
-//! No [`Inventory`](crate::family::gguf_model::Inventory): the CPU reference owns the same
-//! name template (`weights.rs`), and this list is its device twin. `load_sliced` refuses a
+//! No [`Inventory`](crate::family::gguf_model::Inventory): the list is what the layers of the
+//! family builder name (`family/qwen/recipe.rs`). `load_sliced` refuses a
 //! named tensor the file lacks, which is the whole validation; a file tensor the list does
 //! not name is simply never uploaded.
 //!
@@ -12,77 +12,18 @@
 //! token is gathered on the host, and the card spends its bytes on `output.weight`
 //! (≈0.5 GB Q4_K_M) which every step needs.
 
-// Only `load` calls the name helpers, and only a card build has `load`.
-#![cfg_attr(
-    not(any(test, feature = "native-cuda")),
-    expect(
-        dead_code,
-        reason = "without the card no caller of the name helpers is compiled"
-    )
-)]
+#[cfg(feature = "native-cuda")]
+use super::super::LoopPlan;
 
-use super::super::{LoopPlan, PHYSICAL_LAYERS};
-
-/// Every tensor the device holds, in load order: the root head, then each physical
-/// layer's common tensors, its mixer tensors, its mHC routers when in range.
+/// Every tensor the device holds, in load order: what the plan's layers name.
+#[cfg(feature = "native-cuda")]
 pub(crate) fn tensor_names(plan: &LoopPlan) -> Vec<String> {
-    let mut names = vec!["output.weight".to_owned()];
-    for p in 0..PHYSICAL_LAYERS {
-        let stem = format!("blk.{}", plan.block(p));
-        names.extend(common(&stem));
-        if plan.recurrent[plan.block(p)] {
-            names.extend(delta(&stem));
-        } else {
-            names.extend(attn(&stem));
-        }
-        if (plan.mhc_start..plan.mhc_end).contains(&p) {
-            for part in ["hc_attn_fn", "hc_ffn_fn"] {
-                names.push(format!("{stem}.{part}.weight"));
-                names.push(format!("{stem}.{part}.bias"));
-            }
-        }
-    }
-    names.push("output_norm.weight".to_owned());
-    names
-}
-
-fn common(stem: &str) -> impl Iterator<Item = String> + use<'_> {
-    [
-        "attn_norm.weight",
-        "post_attention_norm.weight",
-        "ffn_gate.weight",
-        "ffn_up.weight",
-        "ffn_down.weight",
-    ]
-    .iter()
-    .map(move |tail| format!("{stem}.{tail}"))
-}
-
-fn delta(stem: &str) -> impl Iterator<Item = String> + use<'_> {
-    [
-        "attn_qkv_gate.weight",
-        "ssm_beta_alpha.weight",
-        "ssm_out.weight",
-        "ssm_conv1d.weight",
-        "ssm_a",
-        "ssm_dt.bias",
-        "ssm_norm.weight",
-    ]
-    .iter()
-    .map(move |tail| format!("{stem}.{tail}"))
-}
-
-fn attn(stem: &str) -> impl Iterator<Item = String> + use<'_> {
-    [
-        "attn_q.weight",
-        "attn_k.weight",
-        "attn_v.weight",
-        "attn_output.weight",
-        "attn_q_norm.weight",
-        "attn_k_norm.weight",
-    ]
-    .iter()
-    .map(move |tail| format!("{stem}.{tail}"))
+    use crate::family::qwen::recipe::{Blocks, layers, tensors};
+    let blocks = Blocks {
+        split_delta_inputs: false,
+        experts: false,
+    };
+    tensors(&layers(&plan.visits(), blocks).0)
 }
 
 /// Uploads every tensor of the template in one all-or-nothing Native load. Admission
@@ -100,7 +41,7 @@ pub(crate) fn load(
     loader.load_sliced(weights, &refs, options, &[], 0)
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "native-cuda"))]
 mod tests {
     use super::*;
 

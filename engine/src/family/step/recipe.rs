@@ -73,6 +73,34 @@ pub(crate) enum Stage {
 }
 
 impl Layer {
+    /// Every tensor the layer names, in the order a load takes them. A mixer or a feed-forward
+    /// of the model's own names none here.
+    pub(crate) fn tensors(&self) -> Vec<String> {
+        let mut names: Vec<String> = self.norms.iter().flatten().cloned().collect();
+        match &self.site {
+            Site::Routed { routers, .. } => names.extend(routers.iter().flatten().cloned()),
+            Site::Mixed { halves } => names.extend(halves.iter().flatten().cloned()),
+            _ => {}
+        }
+        match &self.mixer {
+            Mixer::Delta { names: delta, .. } => {
+                names.extend(delta.tensors().into_iter().map(str::to_owned));
+            }
+            Mixer::Attend { stem, .. } => names.extend(attend::tensors(stem)),
+            Mixer::Own => {}
+        }
+        match &self.forward {
+            Forward::Dense(dense) => names.extend(dense.iter().cloned()),
+            Forward::Routed(routed) => {
+                names.push(routed.router.clone());
+                names.push(routed.rule.side().to_owned());
+                names.extend(routed.stacks.iter().chain(&routed.shared).cloned());
+            }
+            Forward::Own => {}
+        }
+        names
+    }
+
     /// Resolves every tensor the layer names, so a missing one stops a load and not a step.
     pub(crate) fn check(
         &self,

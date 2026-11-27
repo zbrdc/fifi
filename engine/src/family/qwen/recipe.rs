@@ -129,6 +129,20 @@ pub(crate) fn layers(visits: &[Visit], blocks: Blocks) -> (Vec<Layer>, SlotCount
     (layers, slots)
 }
 
+/// Every tensor a card holds for `layers`, in load order: the head, each block's tensors once
+/// (a block walked twice is loaded once), the final norm. The embedding stays on the host.
+pub(crate) fn tensors(layers: &[Layer]) -> Vec<String> {
+    let mut names = vec!["output.weight".to_owned()];
+    let mut seen = std::collections::HashSet::new();
+    for name in layers.iter().flat_map(Layer::tensors) {
+        if seen.insert(name.clone()) {
+            names.push(name);
+        }
+    }
+    names.push("output_norm.weight".to_owned());
+    names
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

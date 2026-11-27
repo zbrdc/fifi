@@ -179,6 +179,29 @@ impl DeltaNames {
         }
     }
 
+    /// Every tensor the layer names.
+    pub(crate) fn tensors(&self) -> Vec<&str> {
+        let mut names: Vec<&str> = match &self.rule {
+            RuleNames::Heads { inputs } => inputs.iter().map(String::as_str).collect(),
+            RuleNames::Channels {
+                inputs,
+                decay_a,
+                decay_b,
+                beta,
+                delta,
+                ..
+            } => inputs
+                .iter()
+                .chain([decay_a, decay_b, beta, delta])
+                .map(String::as_str)
+                .collect(),
+        };
+        names.extend(
+            [&self.out, &self.conv, &self.a, &self.dt_bias, &self.norm].map(String::as_str),
+        );
+        names
+    }
+
     /// The layer over the tensors of `map`.
     pub(crate) fn resolve<'a>(&self, map: &Map<'a>, dims: Dims) -> Result<Delta<'a>, EngError> {
         let rule = match &self.rule {

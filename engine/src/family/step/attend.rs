@@ -73,6 +73,20 @@ pub(crate) struct Dims {
 }
 
 /// The layer of block `stem` over the tensors of `map`, under the names a GGUF gives them.
+/// The tensors of the attention layer of block `stem`, by name.
+pub(crate) fn tensors(stem: &str) -> impl Iterator<Item = String> + '_ {
+    [
+        "attn_q",
+        "attn_k",
+        "attn_v",
+        "attn_output",
+        "attn_q_norm",
+        "attn_k_norm",
+    ]
+    .into_iter()
+    .map(move |name| format!("{stem}.{name}.weight"))
+}
+
 pub(crate) fn resolve<'a>(map: &Map<'a>, stem: &str, dims: Dims) -> Result<Attend<'a>, EngError> {
     let native = |name: &str| map.native(&format!("{stem}.{name}.weight"));
     let raw = |name: &str| map.raw(&format!("{stem}.{name}.weight"));
