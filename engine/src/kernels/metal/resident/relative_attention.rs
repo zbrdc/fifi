@@ -209,6 +209,16 @@ impl Frame {
         &mut self,
         call: RelativeAttentionCall<'_>,
     ) -> Result<(), EngError> {
+        self.relative_attention_parts(call, [true; 3])
+    }
+
+    /// The step's dispatches the mask names, in the step's order. A timing test leaves one
+    /// out to measure what it costs in place.
+    pub(super) fn relative_attention_parts(
+        &mut self,
+        call: RelativeAttentionCall<'_>,
+        parts: [bool; 3],
+    ) -> Result<(), EngError> {
         let shared = self.shared();
         let plan = plan_relative_attention(shared, &call)?;
         let commit = shared.kernel(COMMIT_KERNEL, SOURCE)?;
@@ -223,30 +233,37 @@ impl Frame {
         // threadgroup's width times its threadgroups.
         let simds = plan.kv_heads * MAX_SPLITS * plan.group.div_ceil(SLICE_HEADS);
         let threads = LANES * SIMDS;
-        self.encode(
-            &commit,
-            &bindings,
-            &bytes,
-            [plan.kv_heads * COMMIT_THREADS, 1, 1],
-            [COMMIT_THREADS, 1, 1],
-            1,
-        )?;
-        self.encode(
-            &partials,
-            &bindings,
-            &bytes,
-            [simds.div_ceil(SIMDS) * threads, 1, 1],
-            [threads, 1, 1],
-            1,
-        )?;
-        self.encode(
-            &finish,
-            &bindings,
-            &bytes,
-            [plan.query_heads * HEAD_DIM, 1, 1],
-            [HEAD_DIM, 1, 1],
-            1,
-        )
+        if parts[0] {
+            self.encode(
+                &commit,
+                &bindings,
+                &bytes,
+                [plan.kv_heads * COMMIT_THREADS, 1, 1],
+                [COMMIT_THREADS, 1, 1],
+                1,
+            )?;
+        }
+        if parts[1] {
+            self.encode(
+                &partials,
+                &bindings,
+                &bytes,
+                [simds.div_ceil(SIMDS) * threads, 1, 1],
+                [threads, 1, 1],
+                1,
+            )?;
+        }
+        if parts[2] {
+            self.encode(
+                &finish,
+                &bindings,
+                &bytes,
+                [plan.query_heads * HEAD_DIM, 1, 1],
+                [HEAD_DIM, 1, 1],
+                1,
+            )?;
+        }
+        Ok(())
     }
 }
 

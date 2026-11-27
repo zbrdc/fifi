@@ -687,3 +687,48 @@ fn relative_attention_in_a_frame_is_timed() {
         assert_eq!(fb.out.read("out"), waited_full, "the frame's full step");
     }
 }
+
+/// Prints, for a ring, the GPU time of a step among sixteen in a frame against the step with a
+/// dispatch left out and each dispatch alone, the median of seven frames: what the commit and
+/// the finish cost in place is the difference, their own time and the gap before them.
+#[test]
+#[ignore = "prints the step's dispatches' time in place and alone on this device"]
+fn relative_attention_dispatches_are_timed() {
+    let rig = Rig::new();
+    let mut rng = Rng::new(0x2C_51_7D_19);
+    for (capacity, position) in [(1024usize, 1023i32), (8192, 8191), (65536, 65535)] {
+        let shape = inkling(capacity);
+        let c = Case::new(&mut rng, shape, position);
+        // The step once, for valid partials and rings: the finish alone reads the former.
+        check(&rig, &c, 0);
+        let b = buffers(&rig, &c, 0);
+        let time = |parts: [bool; 3]| {
+            let count = parts.iter().filter(|part| **part).count();
+            let mut frame = rig.ctx.frame_of(16 * count);
+            for _ in 0..16 {
+                frame
+                    .relative_attention_parts(call(&b, shape, None), parts)
+                    .expect("a timed part");
+            }
+            frame.drain().expect("the drain") as f64 / 16e3
+        };
+        for _ in 0..3 {
+            time([true; 3]);
+        }
+        let median = |parts: [bool; 3]| {
+            let mut frames: Vec<f64> = (0..7).map(|_| time(parts)).collect();
+            frames.sort_by(f64::total_cmp);
+            frames[3]
+        };
+        let step = median([true; 3]);
+        let both = median([true, true, false]);
+        let partials = median([false, true, false]);
+        let finish = median([false, false, true]);
+        let commit = median([true, false, false]);
+        println!(
+            "relative attention dispatches, ring {capacity} at position {position}: the step {step:.3} us, commit + partials {both:.3}, partials {partials:.3}, the finish alone {finish:.3}, the commit alone {commit:.3}; in place: the finish {:.3}, the commit {:.3}",
+            step - both,
+            both - partials,
+        );
+    }
+}
