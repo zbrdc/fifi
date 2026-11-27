@@ -67,11 +67,12 @@ pub(crate) struct Delta<'a> {
 /// How a layer forms its decay and its write strength.
 #[derive(Clone, Copy)]
 pub(crate) enum Rule<'a> {
-    /// One decay and one write strength per value head: `qkvz` writes the query, key, value and
-    /// gate inputs, `beta_alpha` the two logits of every head beside them.
+    /// One decay and one write strength per value head. The input projections write one row
+    /// side by side, in this order: the query, key and value inputs, the gate input, the write
+    /// logit and the decay logit of every head. A file stores them as two matrices (the first
+    /// four fused, the two logits fused) or as four.
     Heads {
-        qkvz: &'a NativeWeight,
-        beta_alpha: &'a NativeWeight,
+        inputs: [Option<&'a NativeWeight>; 4],
     },
     /// One decay per key channel.
     Channels(Channels<'a>),
@@ -134,10 +135,8 @@ pub(crate) struct DeltaNames {
 }
 
 pub(crate) enum RuleNames {
-    Heads {
-        qkvz: String,
-        beta_alpha: String,
-    },
+    /// The input projections in row order, two names or four.
+    Heads { inputs: Vec<String> },
     Channels {
         /// The query, key, value and gate projections.
         inputs: [String; 4],
@@ -157,8 +156,20 @@ impl DeltaNames {
         let n = |name: &str| format!("{stem}.{name}");
         Self {
             rule: RuleNames::Heads {
-                qkvz: n("attn_qkv_gate.weight"),
-                beta_alpha: n("ssm_beta_alpha.weight"),
+                inputs: vec![n("attn_qkv_gate.weight"), n("ssm_beta_alpha.weight")],
+            },
+            ..Self::split(stem)
+        }
+    }
+
+    /// The names of a file that stores the four input projections apart.
+    pub(crate) fn split(stem: &str) -> Self {
+        let n = |name: &str| format!("{stem}.{name}");
+        Self {
+            rule: RuleNames::Heads {
+                inputs: ["attn_qkv", "attn_gate", "ssm_beta", "ssm_alpha"]
+                    .map(|name| n(&format!("{name}.weight")))
+                    .to_vec(),
             },
             out: n("ssm_out.weight"),
             conv: n("ssm_conv1d.weight"),
@@ -171,10 +182,28 @@ impl DeltaNames {
     /// The layer over the tensors of `map`.
     pub(crate) fn resolve<'a>(&self, map: &Map<'a>, dims: Dims) -> Result<Delta<'a>, EngError> {
         let rule = match &self.rule {
-            RuleNames::Heads { qkvz, beta_alpha } => Rule::Heads {
-                qkvz: map.native(qkvz)?,
-                beta_alpha: map.native(beta_alpha)?,
-            },
+            RuleNames::Heads { inputs: names } => {
+                let mut inputs = [None; 4];
+                if names.len() > inputs.len() {
+                    return Err(EngError::BadRequest(format!(
+                        "{}: a delta layer names {} input projections",
+                        map.family,
+                        names.len()
+                    )));
+                }
+                for (slot, name) in inputs.iter_mut().zip(names) {
+                    *slot = Some(map.native(name)?);
+                }
+                let rows: usize = inputs.iter().flatten().map(|w| w.n_rows()).sum();
+                let want = dims.conv_dim + dims.value_heads * (dims.value_dim + 2);
+                if rows != want {
+                    return Err(EngError::BadRequest(format!(
+                        "{}: the delta input projections write {rows} columns, the rule reads {want}",
+                        map.family
+                    )));
+                }
+                Rule::Heads { inputs }
+            }
             RuleNames::Channels {
                 inputs: [q, k, v, gate],
                 decay_a,
@@ -220,7 +249,7 @@ impl<'a> Delta<'a> {
     #[cfg(test)]
     pub(crate) fn projections(&self) -> impl Iterator<Item = &'a NativeWeight> {
         let inputs = match self.rule {
-            Rule::Heads { qkvz, beta_alpha } => [Some(qkvz), Some(beta_alpha), None, None],
+            Rule::Heads { inputs } => inputs,
             Rule::Channels(c) => [Some(c.q), Some(c.k), Some(c.v), Some(c.gate)],
         };
         inputs.into_iter().flatten().chain([self.out])
@@ -275,27 +304,19 @@ pub(crate) fn mix(
     let read_f32 = f32_rows(io, rows.read.f32, "what it reads")?;
     // The row the convolution reads: `ld` floats apart, the projections at their columns.
     let (ld, parts) = match layer.rule {
-        Rule::Heads { qkvz, beta_alpha } => (
-            qkvz.n_rows() + beta_alpha.n_rows(),
-            [Some((qkvz, 0)), Some((beta_alpha, qkvz.n_rows())), None],
-        ),
-        Rule::Channels(c) => (
-            conv_dim,
-            [
-                Some((c.q, 0)),
-                Some((c.k, c.q.n_rows())),
-                Some((c.v, c.q.n_rows() + c.k.n_rows())),
-            ],
-        ),
+        Rule::Heads { inputs } => (inputs.iter().flatten().map(|w| w.n_rows()).sum(), inputs),
+        Rule::Channels(c) => (conv_dim, [Some(c.q), Some(c.k), Some(c.v), None]),
     };
     let proj = floats(rows.proj, n * ld)?;
-    for (weight, col_off) in parts.into_iter().flatten() {
+    let mut col_off = 0;
+    for weight in parts.into_iter().flatten() {
         let out = Out {
             dst: proj,
             ld,
             col_off,
         };
         io.project_into(weight, rows.input, n, out)?;
+        col_off += weight.n_rows();
     }
     let conv_call = ConvCall {
         shape: ConvShape {
@@ -334,8 +355,9 @@ pub(crate) fn mix(
         alpha_off,
     };
     match layer.rule {
-        Rule::Heads { qkvz, .. } => {
-            let fused = qkvz.n_rows();
+        Rule::Heads { .. } => {
+            // The two logits follow the convolved columns and the gate input.
+            let fused = conv_dim + read_floats;
             let dt_bias = layer.dt_bias.slice(0, vh * F32)?;
             // A few rows run the one-step rule row after row, so each has the bits of a step
             // of its own.

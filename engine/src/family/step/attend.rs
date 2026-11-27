@@ -16,7 +16,9 @@ use crate::kernels::cuda::prefill::attn_prefill::{
 use crate::kernels::cuda::prefill::attn_prep_chunk::{
     AttnPrepChunkCall, AttnPrepChunkShape, PrepChunkMode,
 };
-use crate::kernels::cuda::resident::attn_decode::AttnSplit;
+use crate::kernels::cuda::resident::attn_decode::{
+    AttnDecodeCall, AttnShape, AttnSpan, AttnSplit, attn_part_bytes,
+};
 use crate::kernels::cuda::resident::attn_decode_loop::{
     AttnDecodeLoopCall, AttnLoopShape, attn_loop_part_bytes,
 };
@@ -215,29 +217,63 @@ pub(crate) fn mix(
                     inv_freq,
                 },
             )?;
-            io.ctx.attn_decode_loop(
-                io.stream,
-                AttnDecodeLoopCall {
-                    shape: AttnLoopShape {
-                        m: n,
-                        n_head: hq,
-                        n_kv_head: hkv,
-                        cache_rows: cache.rows,
-                        ld,
+            // The kernel is chosen by the query heads that share a kv head.
+            match hq / hkv {
+                4 if hd == 256 => io.ctx.attn_decode_loop(
+                    io.stream,
+                    AttnDecodeLoopCall {
+                        shape: AttnLoopShape {
+                            m: n,
+                            n_head: hq,
+                            n_kv_head: hkv,
+                            cache_rows: cache.rows,
+                            ld,
+                        },
+                        split: AttnSplit::STAGE1,
+                        scale: layer.scale,
+                        q: query,
+                        proj: Some(proj),
+                        k_cache,
+                        v_cache,
+                        kv_len,
+                        part: rows
+                            .part
+                            .range(0, attn_loop_part_bytes(n, hkv, layer.row_splits)?)?,
+                        out: attended,
                     },
-                    split: AttnSplit::STAGE1,
-                    scale: layer.scale,
-                    q: query,
-                    proj: Some(proj),
-                    k_cache,
-                    v_cache,
-                    kv_len,
-                    part: rows
-                        .part
-                        .range(0, attn_loop_part_bytes(n, hq / hkv, layer.row_splits)?)?,
-                    out: attended,
-                },
-            )?;
+                )?,
+                8 => io.ctx.attn_decode(
+                    io.stream,
+                    AttnDecodeCall {
+                        shape: AttnShape {
+                            m: n,
+                            n_head: hq,
+                            n_kv_head: hkv,
+                            head_dim: hd,
+                            cache_rows: cache.rows,
+                            ld,
+                        },
+                        span: AttnSpan::FULL,
+                        split: AttnSplit::STAGE1,
+                        scale: layer.scale,
+                        q: query,
+                        proj: Some(proj),
+                        k_cache,
+                        v_cache,
+                        kv_len,
+                        part: rows
+                            .part
+                            .range(0, attn_part_bytes(n, hkv, hd, layer.row_splits)?)?,
+                        out: attended,
+                    },
+                )?,
+                group => {
+                    return Err(EngError::BadRequest(format!(
+                        "{}: no one-row attention for {group} query heads per kv head of {hd} dims",
+                        io.family
+                    )));
+                }
+            }
         }
         At::Chunk { p0, sm_count } => {
             io.ctx.attn_prep_chunk(

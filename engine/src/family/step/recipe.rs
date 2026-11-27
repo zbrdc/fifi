@@ -113,7 +113,7 @@ impl Layer {
             Forward::Dense(names) => names.iter().try_for_each(|n| map.native(n).map(drop)),
             Forward::Routed(names) => {
                 map.raw(&names.router)?;
-                map.raw(&names.bias)?;
+                map.raw(names.rule.side())?;
                 let stacks = names.stacks.iter().chain(&names.shared);
                 stacks.into_iter().try_for_each(|n| map.native(n).map(drop))
             }

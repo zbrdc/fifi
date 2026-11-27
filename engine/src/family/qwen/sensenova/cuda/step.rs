@@ -198,7 +198,13 @@ impl<'a> LoopStep<'a> {
             conv_kernel: shape.conv_kernel,
             conv_dim: shape.conv_dim(),
         };
-        let (layers, slots) = crate::family::qwen::recipe::layers(&plan.visits());
+        let (layers, slots) = crate::family::qwen::recipe::layers(
+            &plan.visits(),
+            crate::family::qwen::recipe::Blocks {
+                split_delta_inputs: false,
+                experts: false,
+            },
+        );
         layers
             .iter()
             .try_for_each(|layer| layer.check(&map, dims, Some(attn_dims)))?;

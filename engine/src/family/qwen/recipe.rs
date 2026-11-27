@@ -6,6 +6,7 @@
 //! streams. Those differences are data here; no model has a walk of its own.
 
 use crate::family::step::delta::DeltaNames;
+use crate::family::step::moe;
 use crate::family::step::recipe::{Forward, Layer, Mixer, Site};
 
 /// One visit of the trunk, in the order the walk takes them.
@@ -42,6 +43,37 @@ pub(crate) fn every_nth_attends(block_count: usize, interval: usize) -> Vec<Visi
         .collect()
 }
 
+/// What a file of the lineage stores in every block, beside the visit order.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct Blocks {
+    /// Whether the delta rule's four input projections are stored apart; otherwise they are
+    /// fused into two matrices.
+    pub(crate) split_delta_inputs: bool,
+    /// Whether the feed-forward is a routed block of experts with a gated shared expert;
+    /// otherwise it is one dense gated feed-forward.
+    pub(crate) experts: bool,
+}
+
+impl Blocks {
+    fn forward(self, stem: &str) -> Forward {
+        let three = |tail: &str| {
+            ["gate", "up", "down"].map(|part| format!("{stem}.ffn_{part}{tail}.weight"))
+        };
+        if self.experts {
+            Forward::Routed(moe::Names {
+                router: format!("{stem}.ffn_gate_inp.weight"),
+                rule: moe::Router::Softmax {
+                    shared_gate: format!("{stem}.ffn_gate_inp_shexp.weight"),
+                },
+                stacks: three("_exps"),
+                shared: three("_shexp"),
+            })
+        } else {
+            Forward::Dense(three(""))
+        }
+    }
+}
+
 /// The slots a layer list needs: one delta state per visit that carries one, one attention
 /// cache per visit that attends.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -52,7 +84,7 @@ pub(crate) struct SlotCount {
 
 /// The layers of `visits`. A delta visit takes the slot of its position in the walk; the
 /// attention visits take cache slots in walk order.
-pub(crate) fn layers(visits: &[Visit]) -> (Vec<Layer>, SlotCount) {
+pub(crate) fn layers(visits: &[Visit], blocks: Blocks) -> (Vec<Layer>, SlotCount) {
     let mut attend = 0;
     let layers = visits
         .iter()
@@ -72,7 +104,11 @@ pub(crate) fn layers(visits: &[Visit]) -> (Vec<Layer>, SlotCount) {
                 },
                 mixer: if visit.recurrent {
                     Mixer::Delta {
-                        names: Box::new(DeltaNames::fused(&stem)),
+                        names: Box::new(if blocks.split_delta_inputs {
+                            DeltaNames::split(&stem)
+                        } else {
+                            DeltaNames::fused(&stem)
+                        }),
                         slot: at,
                     }
                 } else {
@@ -82,9 +118,7 @@ pub(crate) fn layers(visits: &[Visit]) -> (Vec<Layer>, SlotCount) {
                         slot: attend - 1,
                     }
                 },
-                forward: Forward::Dense(
-                    ["gate", "up", "down"].map(|t| n(&format!("ffn_{t}.weight"))),
-                ),
+                forward: blocks.forward(&stem),
             }
         })
         .collect();
@@ -113,7 +147,17 @@ mod tests {
 
     #[test]
     fn attention_visits_take_cache_slots_in_walk_order() {
-        let (layers, slots) = layers(&every_nth_attends(8, 4));
+        let blocks = Blocks {
+            split_delta_inputs: true,
+            experts: true,
+        };
+        let (layers, slots) = layers(&every_nth_attends(8, 4), blocks);
+        let Forward::Routed(names) = &layers[0].forward else {
+            panic!("a block of experts is a routed feed-forward");
+        };
+        assert_eq!(names.stacks[2], "blk.0.ffn_down_exps.weight");
+        assert_eq!(names.shared[0], "blk.0.ffn_gate_shexp.weight");
+        assert_eq!(names.rule.side(), "blk.0.ffn_gate_inp_shexp.weight");
         assert_eq!(
             slots,
             SlotCount {

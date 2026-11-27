@@ -85,6 +85,7 @@ const MOE: moe::Dims = moe::Dims {
     inner: MOE_INTER,
     experts: EXPERTS,
     used: USED,
+    gated_shared: false,
 };
 
 /// The three convolutions of a delta-rule layer in the order of their columns, and the name
@@ -166,7 +167,9 @@ fn layer_recipe(spec: Raon1Spec, hy: &Hyper, layer: usize) -> (Layer, Option<Mla
     let forward = if layer >= spec.leading_dense {
         Forward::Routed(moe::Names {
             router: n("ffn_gate_inp.weight"),
-            bias: n("exp_probs_b.bias"),
+            rule: moe::Router::Sigmoid {
+                bias: n("exp_probs_b.bias"),
+            },
             stacks: three("ffn_", "_exps.weight"),
             shared: three("ffn_", "_shexp.weight"),
         })
