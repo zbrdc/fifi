@@ -308,13 +308,15 @@ pub(crate) fn forward(
             ld: stride,
             col_off: inner,
         },
-        act: if down_grouped {
+        // A swiglu writes its f32 rows first; the grouped down product reads them too.
+        act: if down_grouped || matches!(join, ffn::Join::Swiglu) {
             Rows::both(&sc.act_q8, &sc.act)
         } else {
             Rows::q8(&sc.act_q8)
         },
     };
-    ffn::joined(io, join, (n * used, inner), scratch, true)?;
+    // The grouped down product reads the f32 rows; only the per-token one reads q8_1 rows.
+    ffn::joined(io, join, (n * used, inner), scratch, !down_grouped)?;
     let e_stride = q8(inner, 1);
     if let Some(ids) = ids.as_ref().filter(|_| down_grouped) {
         let rows = experts::slot_rows(

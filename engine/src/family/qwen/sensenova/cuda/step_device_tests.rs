@@ -1028,6 +1028,128 @@ fn card_reports_where_the_quantized_routes_leave_the_exact_one() {
     );
 }
 
+/// The routed-expert model of the lineage on this step, with no code of its own: its header
+/// gives the visits and the widths, its layer list gives the load. Teacher-forces one stream of
+/// `QWEN_EXPERTS_TOKENS` tokens (default 64) in chunks of each row count of `QWEN_EXPERTS_K_ROWS`
+/// (default 1) and writes every position's logits row to `<QWEN_EXPERTS_ROWS_OUT>.k<rows>`. The
+/// stream is `<that path>.ids`, written by a greedy one-row walk from 16 hashed ids when it is
+/// not there. Not a gate: the rows are compared outside, against another engine on the same ids.
+#[test]
+fn card_runs_the_routed_expert_model_of_the_lineage() {
+    use crate::family::qwen::recipe::{layers, routed_experts, tensors};
+    const SEED: usize = 16;
+    let (Ok(path), Ok(out)) = (
+        std::env::var("QWEN_EXPERTS_GGUF"),
+        std::env::var("QWEN_EXPERTS_ROWS_OUT"),
+    ) else {
+        eprintln!("skipped: set QWEN_EXPERTS_GGUF and QWEN_EXPERTS_ROWS_OUT");
+        return;
+    };
+    if !device_present("the routed-expert model") {
+        return;
+    }
+    let count: usize = std::env::var("QWEN_EXPERTS_TOKENS").map_or(64, |v| v.parse().unwrap());
+    let chunk_rows: Vec<usize> = match std::env::var("QWEN_EXPERTS_K_ROWS") {
+        Ok(list) => list.split(',').map(|k| k.parse().unwrap()).collect(),
+        Err(_) => vec![1],
+    };
+    let file = Arc::new(
+        GgufWeights::open_any_type(
+            &std::path::PathBuf::from(path),
+            GgufLimits {
+                max_header_bytes: 32 << 20,
+                max_tensor_bytes: 8 << 30,
+            },
+            None,
+        )
+        .unwrap(),
+    );
+    let model = routed_experts(file.header()).unwrap();
+    let names = tensors(&layers(&model.visits, model.blocks).0);
+    let refs: Vec<&str> = names.iter().map(String::as_str).collect();
+    let ctx = Rc::new(CudaContext::new().unwrap());
+    let loaded = BorrowedLoader::new(&ctx)
+        .unwrap()
+        .load_sliced(
+            &file,
+            &refs,
+            LoadOptions {
+                layout: WeightLayout::Native,
+                ..LoadOptions::default()
+            },
+            &[],
+            0,
+        )
+        .unwrap();
+    let shape = model.shape;
+    let embd = crate::family::project::gguf::GgufMatrix::new(
+        file.header(),
+        "token_embd.weight",
+        shape.vocab,
+        shape.hidden,
+    )
+    .unwrap();
+    let mut projector = GgufProjector::new(file.clone());
+    // The model has one residual stream; the routing of a two-stream range is unused.
+    let routing = super::step::Routing {
+        pre_scale: 1.0,
+        iterations: 1,
+        fixed_identity: true,
+    };
+    let open = || LoopStep::open_model(ctx.clone(), &loaded, &model, routing, count + 1).unwrap();
+    let mut feed = |card: &mut LoopStep<'_>, tokens: &[u32], pos: usize| -> Vec<Vec<f32>> {
+        let embed = projector.rows(&embd, tokens).unwrap();
+        card.prefill(&embed, pos).unwrap();
+        (0..tokens.len())
+            .map(|row| {
+                card.head_of_row(row).unwrap();
+                drain_row(&ctx, card)
+            })
+            .collect()
+    };
+    let ids_path = format!("{out}.ids");
+    let ids: Vec<u32> = match std::fs::read(&ids_path) {
+        Ok(bytes) => bytes
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .map(|c| u32::from_le_bytes(*c))
+            .collect(),
+        Err(_) => {
+            let mut card = open();
+            let mut ids: Vec<u32> = (1..=SEED as u32)
+                .map(|i| (i.wrapping_mul(2_654_435_761) >> 7) % shape.vocab as u32)
+                .collect();
+            for pos in 0..count - 1 {
+                let row = feed(&mut card, &[ids[pos]], pos).remove(0);
+                if pos + 1 >= SEED {
+                    ids.push(argmax(&row));
+                }
+            }
+            let bytes: Vec<u8> = ids.iter().flat_map(|id| id.to_le_bytes()).collect();
+            std::fs::write(&ids_path, bytes).unwrap();
+            ids
+        }
+    };
+    assert_eq!(ids.len(), count, "the token stream has another length");
+    for k in chunk_rows {
+        let mut card = open();
+        let mut bytes = Vec::with_capacity(count * shape.vocab * 4);
+        let t0 = std::time::Instant::now();
+        for (chunk, tokens) in ids.chunks(k).enumerate() {
+            for row in feed(&mut card, tokens, chunk * k) {
+                assert!(worst_abs(&row).is_finite(), "a logits row is not finite");
+                bytes.extend(row.iter().flat_map(|v| v.to_le_bytes()));
+            }
+        }
+        std::fs::write(format!("{out}.k{k}"), bytes).unwrap();
+        eprintln!(
+            "chunks of {k} rows: {count} logits rows written in {:.2} s",
+            t0.elapsed().as_secs_f64()
+        );
+    }
+}
+
 /// Accuracy probe, not a gate. Teacher-forces one stream of 240 tokens from position 0 in chunks
 /// of each row count of `SENSENOVA_K_ROWS` and writes the logits row of every position to
 /// `<SENSENOVA_ROWS_OUT>.k<rows>` as little-endian f32. The stream is `<that path>.ids`: when the

@@ -97,7 +97,8 @@ pub(super) fn open_rows(
             proj: proj_width,
             conv: shape.conv_dim(),
             read: value_width,
-            product: ff,
+            // The widest row a batched product reads.
+            product: ff.max(h).max(value_width).max(q_width),
             vocab: shape.vocab,
             fixup: fixup_floats_max(nsm)? * F32,
         },
@@ -230,7 +231,7 @@ impl LoopStep<'_> {
 
 impl Model for LoopStep<'_> {
     fn family(&self) -> &'static str {
-        "sensenova"
+        self.family
     }
 
     fn layers(&self) -> &[Layer] {
@@ -239,7 +240,7 @@ impl Model for LoopStep<'_> {
 
     fn io(&self, exact: bool) -> StepIo<'_> {
         StepIo {
-            family: "sensenova",
+            family: self.family,
             ctx: &self.ctx,
             stream: &self.stream,
             weights: self.weights,
@@ -332,14 +333,29 @@ impl Model for LoopStep<'_> {
         Ok((ffn::Join::Swiglu, scratch))
     }
 
+    /// The shared expert works in the rows of the dense feed-forward.
+    fn routed(
+        &self,
+        n: usize,
+    ) -> Result<((moe::Dims, ffn::Join), &moe::Scratch, ffn::Scratch<'_>), EngError> {
+        let Some((dims, scratch)) = &self.moe else {
+            return Err(EngError::BadRequest(format!(
+                "{}: this model has no routed feed-forward",
+                self.family
+            )));
+        };
+        let (join, shared) = self.dense(n)?;
+        Ok(((*dims, join), scratch, shared))
+    }
+
     fn routed_site(&self) -> Result<site::Routed<'_>, EngError> {
         let rows = &self.rows;
         Ok(site::Routed {
             hidden: self.shape.hidden,
             eps: self.shape.eps,
-            pre_scale: self.plan.mhc_pre_scale,
-            iterations: self.plan.mhc_iterations,
-            fixed_identity: self.plan.mhc_fixed_identity,
+            pre_scale: self.routing.pre_scale,
+            iterations: self.routing.iterations,
+            fixed_identity: self.routing.fixed_identity,
             ones: &self.ones_router,
             streams: &rows.streams,
             normed: &rows.router_normed,

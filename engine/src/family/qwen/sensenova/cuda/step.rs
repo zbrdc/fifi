@@ -41,13 +41,14 @@ use crate::kernels::cuda::{CudaContext, DeviceBuffer, DeviceRange, DeviceStream,
 use super::super::step::yarn_inv_freq;
 use super::super::weights::LoopShape;
 use super::super::{LoopPlan, RopePlan};
+use crate::family::qwen::recipe::{Blocks, Model};
+use crate::family::step::moe;
 
 mod prefill;
 
 pub(super) use prefill::PREFILL_ROWS;
 
 const F32: usize = size_of::<f32>();
-const GROUP: usize = 4;
 const ATTN_SCALE: f32 = 0.0625; // 1/sqrt(256)
 const MAX_SPLITS: usize = 64;
 
@@ -84,7 +85,10 @@ pub(crate) struct LoopStep<'a> {
     head: &'a NativeWeight,
     output_norm: &'a DeviceBuffer,
     shape: LoopShape,
-    plan: LoopPlan,
+    family: &'static str,
+    routing: Routing,
+    /// The widths and the rows of a routed feed-forward, for a model that has one.
+    moe: Option<(moe::Dims, moe::Scratch)>,
     cache_rows: usize,
     /// The projections' route: the f32 decode matvec over f32 rows, or the matvec over q8_1.
     dq: bool,
@@ -102,13 +106,29 @@ pub(crate) struct LoopStep<'a> {
     rows: prefill::Rows,
 }
 
-fn native<'a>(weights: &'a CudaWeights, name: &str) -> Result<&'a NativeWeight, EngError> {
-    crate::family::step::rows::native(weights, "sensenova", name)
+/// How the two-stream range of a model mixes its streams.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct Routing {
+    pub(crate) pre_scale: f32,
+    pub(crate) iterations: usize,
+    pub(crate) fixed_identity: bool,
+}
+
+fn native<'a>(
+    weights: &'a CudaWeights,
+    family: &'static str,
+    name: &str,
+) -> Result<&'a NativeWeight, EngError> {
+    crate::family::step::rows::native(weights, family, name)
 }
 
 /// An F32 tensor the loader copied as read: the conv, `ssm_a`, the biases and every norm.
-fn side<'a>(weights: &'a CudaWeights, name: &str) -> Result<&'a DeviceBuffer, EngError> {
-    crate::family::step::rows::raw(weights, "sensenova", name)
+fn side<'a>(
+    weights: &'a CudaWeights,
+    family: &'static str,
+    name: &str,
+) -> Result<&'a DeviceBuffer, EngError> {
+    crate::family::step::rows::raw(weights, family, name)
 }
 
 pub(super) fn floats(
@@ -168,6 +188,29 @@ impl<'a> LoopStep<'a> {
         rope: &RopePlan,
         cache_rows: usize,
     ) -> Result<Self, EngError> {
+        let model = Model {
+            family: "sensenova",
+            shape: *shape,
+            visits: plan.visits(),
+            blocks: Blocks {
+                split_delta_inputs: false,
+                experts: false,
+            },
+            experts: None,
+            rope: rope.clone(),
+        };
+        Self::open_model(ctx, weights, &model, plan.routing(), cache_rows)
+    }
+
+    /// The executor of any model of the lineage over a completed device load.
+    pub(crate) fn open_model(
+        ctx: Rc<CudaContext>,
+        weights: &'a CudaWeights,
+        model: &Model,
+        routing: Routing,
+        cache_rows: usize,
+    ) -> Result<Self, EngError> {
+        let (shape, rope, family) = (&model.shape, &model.rope, model.family);
         let h = shape.hidden;
         let rec_floats = shape.delta_value_heads * shape.delta_key_dim * shape.delta_value_dim;
         let ring_floats = shape.conv_dim() * (shape.conv_kernel - 1);
@@ -176,7 +219,7 @@ impl<'a> LoopStep<'a> {
         // own visit state); `recurrent` is block-indexed, so the mixer test goes through
         // `block(p)` exactly as the load template does.
         let map = Map {
-            family: "sensenova",
+            family,
             weights,
             derived: None,
         };
@@ -198,13 +241,22 @@ impl<'a> LoopStep<'a> {
             conv_kernel: shape.conv_kernel,
             conv_dim: shape.conv_dim(),
         };
-        let (layers, slots) = crate::family::qwen::recipe::layers(
-            &plan.visits(),
-            crate::family::qwen::recipe::Blocks {
-                split_delta_inputs: false,
-                experts: false,
-            },
-        );
+        let (layers, slots) = crate::family::qwen::recipe::layers(&model.visits, model.blocks);
+        let moe = match model.experts {
+            Some((experts, used)) => {
+                let dims = moe::Dims {
+                    hidden: h,
+                    inner: shape.feed_forward,
+                    experts,
+                    used,
+                    gated_shared: true,
+                };
+                let scratch =
+                    moe::Scratch::new(&Zeroed(OnDevice(&ctx)), dims, prefill::PREFILL_ROWS)?;
+                Some((dims, scratch))
+            }
+            None => None,
+        };
         layers
             .iter()
             .try_for_each(|layer| layer.check(&map, dims, Some(attn_dims)))?;
@@ -213,8 +265,8 @@ impl<'a> LoopStep<'a> {
             layers,
             delta_dims: dims,
             attn_dims,
-            head: native(weights, "output.weight")?,
-            output_norm: side(weights, "output_norm.weight")?,
+            head: native(weights, family, "output.weight")?,
+            output_norm: side(weights, family, "output_norm.weight")?,
             state: State::new(
                 &Zeroed(OnDevice(&ctx)),
                 Slots {
@@ -232,7 +284,9 @@ impl<'a> LoopStep<'a> {
             replay: Replay::default(),
             rows: prefill::open_rows(&ctx, shape, ctx.sm_count() as usize)?,
             shape: *shape,
-            plan: plan.clone(),
+            family,
+            routing,
+            moe,
             cache_rows,
             dq: decode_dq(),
             exact_chunks: prefill::exact_gemm(),
@@ -255,8 +309,8 @@ impl<'a> LoopStep<'a> {
         if s.head_dim != 256 {
             return refuse("head_dim is not 256");
         }
-        if s.heads_q != GROUP * s.heads_kv {
-            return refuse("the attention is not 4 query heads per kv head");
+        if s.heads_q != 4 * s.heads_kv && s.heads_q != 8 * s.heads_kv {
+            return refuse("the attention is not 4 or 8 query heads per kv head");
         }
         if s.delta_key_dim != 128 || s.delta_value_dim != 128 || s.conv_kernel != 4 {
             return refuse("the GDN geometry is not kd=vd=128, ck=4");
@@ -427,7 +481,7 @@ impl<'a> LoopStep<'a> {
     #[cfg(all(test, feature = "native-cuda"))]
     fn sweep_weights(&self) -> Vec<&'a NativeWeight> {
         let map = Map {
-            family: "sensenova",
+            family: self.family,
             weights: self.weights,
             derived: None,
         };

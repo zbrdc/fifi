@@ -5,9 +5,12 @@
 //! a range of blocks is walked more than once, and in whether a range routes two residual
 //! streams. Those differences are data here; no model has a walk of its own.
 
+use crate::EngError;
+use crate::family::qwen::sensenova::{LoopShape, RopePlan};
 use crate::family::step::delta::DeltaNames;
 use crate::family::step::moe;
 use crate::family::step::recipe::{Forward, Layer, Mixer, Site};
+use crate::weights::{GgufHeader, MetaValue};
 
 /// One visit of the trunk, in the order the walk takes them.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -30,9 +33,14 @@ pub(crate) enum Streams {
 }
 
 /// The visits of a trunk whose every `interval`-th block attends and which has no repeated
-/// range: `block_count` visits, one per block. The first model to take it is the routed-expert
-/// one, once the step has its block.
-#[cfg(test)]
+/// range: `block_count` visits, one per block.
+#[cfg_attr(
+    not(test),
+    expect(
+        dead_code,
+        reason = "read by the device test that runs the routed-expert model on the lineage step; the served start takes it when that model is cut over"
+    )
+)]
 pub(crate) fn every_nth_attends(block_count: usize, interval: usize) -> Vec<Visit> {
     (0..block_count)
         .map(|block| Visit {
@@ -72,6 +80,118 @@ impl Blocks {
             Forward::Dense(three(""))
         }
     }
+}
+
+/// A model of the lineage as its header describes it: what the step is opened with.
+pub(crate) struct Model {
+    pub(crate) family: &'static str,
+    pub(crate) shape: LoopShape,
+    pub(crate) visits: Vec<Visit>,
+    pub(crate) blocks: Blocks,
+    /// The experts of a routed feed-forward and how many a row keeps.
+    pub(crate) experts: Option<(usize, usize)>,
+    pub(crate) rope: RopePlan,
+}
+
+/// The architecture name of the routed-expert models of the lineage.
+#[cfg_attr(
+    not(test),
+    expect(
+        dead_code,
+        reason = "read by the device test that runs the routed-expert model on the lineage step; the served start takes it when that model is cut over"
+    )
+)]
+pub(crate) const ROUTED_EXPERTS: &str = "qwen35moe";
+
+/// The routed-expert model of `header`: every `full_attention_interval`-th block attends, the
+/// delta inputs are stored apart, the feed-forward is a block of experts beside a gated shared
+/// expert, and the rotary table has no scaling. Refuses a header of another architecture.
+#[cfg_attr(
+    not(test),
+    expect(
+        dead_code,
+        reason = "read by the device test that runs the routed-expert model on the lineage step; the served start takes it when that model is cut over"
+    )
+)]
+pub(crate) fn routed_experts(header: &GgufHeader) -> Result<Model, EngError> {
+    let arch = ROUTED_EXPERTS;
+    let reject = |what: String| EngError::Checkpoint(format!("{arch}: {what}"));
+    if header.meta("general.architecture") != Some(&MetaValue::String(arch.to_owned())) {
+        return Err(reject("general.architecture is another model's".to_owned()));
+    }
+    let count = |key: &str| -> Result<usize, EngError> {
+        header
+            .meta_u32(&format!("{arch}.{key}"))
+            .map(|v| v as usize)
+            .filter(|v| *v > 0)
+            .ok_or_else(|| reject(format!("{key} is missing, zero or not a u32")))
+    };
+    let real = |key: &str| -> Result<f32, EngError> {
+        match header.meta(&format!("{arch}.{key}")) {
+            Some(MetaValue::F32(v)) if v.is_finite() && *v > 0.0 => Ok(*v),
+            _ => Err(reject(format!("{key} is missing or not a positive f32"))),
+        }
+    };
+    let (value_heads, inner) = (count("ssm.time_step_rank")?, count("ssm.inner_size")?);
+    let expert_width = count("expert_feed_forward_length")?;
+    if expert_width != count("expert_shared_feed_forward_length")? {
+        return Err(reject(
+            "the shared expert is not as wide as the experts".to_owned(),
+        ));
+    }
+    if !inner.is_multiple_of(value_heads) {
+        return Err(reject(
+            "the delta value heads do not divide its inner width".to_owned(),
+        ));
+    }
+    let head_dim = count("attention.key_length")?;
+    if head_dim != count("attention.value_length")? {
+        return Err(reject("attention key and value lengths differ".to_owned()));
+    }
+    let vocab = match header.meta("tokenizer.ggml.tokens") {
+        Some(MetaValue::Array(meta)) => meta.len as usize,
+        _ => return Err(reject("tokenizer.ggml.tokens is missing".to_owned())),
+    };
+    let context = count("context_length")?;
+    let shape = LoopShape {
+        hidden: count("embedding_length")?,
+        feed_forward: expert_width,
+        heads_q: count("attention.head_count")?,
+        heads_kv: count("attention.head_count_kv")?,
+        head_dim,
+        delta_key_heads: count("ssm.group_count")?,
+        delta_key_dim: count("ssm.state_size")?,
+        delta_value_heads: value_heads,
+        delta_value_dim: inner / value_heads,
+        conv_kernel: count("ssm.conv_kernel")?,
+        vocab,
+        context,
+        eps: real("attention.layer_norm_rms_epsilon")?,
+    };
+    let dims = count("rope.dimension_count")?;
+    if !dims.is_multiple_of(2) || dims > head_dim {
+        return Err(reject(
+            "rope.dimension_count is odd or wider than a head".to_owned(),
+        ));
+    }
+    Ok(Model {
+        family: "qwen",
+        shape,
+        visits: every_nth_attends(count("block_count")?, count("full_attention_interval")?),
+        blocks: Blocks {
+            split_delta_inputs: true,
+            experts: true,
+        },
+        experts: Some((count("expert_count")?, count("expert_used_count")?)),
+        // No scaling: a factor of one leaves every frequency as the base gives it.
+        rope: RopePlan {
+            dims,
+            sections: [dims / 2, 0, 0, 0],
+            freq_base: real("rope.freq_base")?,
+            factor: 1.0,
+            original_context: context,
+        },
+    })
 }
 
 /// The slots a layer list needs: one delta state per visit that carries one, one attention

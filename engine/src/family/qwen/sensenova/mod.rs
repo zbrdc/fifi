@@ -21,6 +21,8 @@ mod step;
 #[cfg(test)]
 mod tests;
 mod weights;
+#[cfg(feature = "native-cuda")]
+pub(crate) use weights::LoopShape;
 
 /// The family name the config and the server registry use.
 pub(crate) const FAMILY: &str = "sensenova";
@@ -206,6 +208,16 @@ impl LoopPlan {
                 }
             })
             .collect()
+    }
+
+    /// The routing of the two-stream range, as the step's site takes it.
+    #[cfg(feature = "native-cuda")]
+    pub(crate) fn routing(&self) -> cuda::step::Routing {
+        cuda::step::Routing {
+            pre_scale: self.mhc_pre_scale,
+            iterations: self.mhc_iterations,
+            fixed_identity: self.mhc_fixed_identity,
+        }
     }
 
     /// Whether logical layer `il` routes through mHC streams.
