@@ -9,6 +9,8 @@
     allow(dead_code, reason = "staged for GGUF decode integration")
 )]
 
+use std::ops::Range;
+
 use super::{
     step::{FlashStep, MoeBlock, refuse},
     step_plan::Slot,
@@ -62,6 +64,19 @@ impl<'a> GgufStep<'a> {
 
     pub(super) fn step(&self) -> &FlashStep<'a> {
         &self.step
+    }
+
+    /// Runs one side of the host PLE boundary with a single provenance-checked binding.
+    pub(super) fn run_layers(
+        &self,
+        owner: &mut GgufMoeOwner<'a>,
+        range: Range<usize>,
+        pos: usize,
+    ) -> Result<(), EngError> {
+        if range.is_empty() {
+            return Ok(()); // PLE may be at layer zero.
+        }
+        self.step.run_layers(range, pos, 1, &mut owner.bind(self)?)
     }
 
     /// The inner step mutably: the serving device (`cuda/staged_device.rs`) installs a saved state

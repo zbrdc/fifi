@@ -517,7 +517,7 @@ impl Raon1Device {
         }
         self.sc.core.resid[0].write_at(&self.stream, 0, &f32_bytes(&resid))?;
         self.rows.set(n);
-        walk::visits(&Walk(&*self), n, pos0, |_, _| Ok(()))
+        walk::visits(&mut Walk(&*self), n, pos0, |_, _| Ok(()))
     }
 
     fn mla_mixer(&self, names: &MlaNames, n: usize, pos0: usize) -> Result<(), EngError> {

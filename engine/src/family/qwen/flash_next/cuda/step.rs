@@ -89,6 +89,8 @@ use crate::{
     weights::GgufType,
 };
 
+mod gguf_walk;
+
 pub(super) const F32: usize = size_of::<f32>();
 
 pub(super) fn refuse(detail: String) -> EngError {
@@ -1599,6 +1601,9 @@ impl<'a> FlashStep<'a> {
         m: usize,
         moe: &mut dyn MoeBlock,
     ) -> Result<(), EngError> {
+        if self.gguf_decode_step() {
+            return self.run_gguf_range(layer..layer + 1, pos, m, moe);
+        }
         self.ensure_usable()?;
         let result = (|| {
             let profile = super::driver::chunk::prof::on();
@@ -1759,6 +1764,9 @@ impl<'a> FlashStep<'a> {
         moe: &mut dyn MoeBlock,
     ) -> Result<(), EngError> {
         self.check_rows(m)?;
+        if self.gguf_decode_step() {
+            return self.run_gguf_range(range, pos, m, moe);
+        }
         for layer in range {
             self.run_layer(layer, pos, m, moe)?;
         }

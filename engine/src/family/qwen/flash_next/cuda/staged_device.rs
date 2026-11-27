@@ -9,11 +9,8 @@
 //! first layer; the stream read-back at the PLE layer and the logits read-back wait for the
 //! queued work.
 //!
-//! The one difference is the MoE seam: the pack's step runs a layer range over one split block,
-//! while here every layer runs with a fresh binding of the owner to the step (the exploratory
-//! probe's form), so the owner's provenance checks run per layer. The step's own range checks
-//! stay in force: each layer goes through `run_layers`, which refuses a layer outside the step's
-//! window and a range that crosses the PLE layer.
+//! Each side of the PLE update is a separate layer walk with one MoE binding. The step refuses
+//! ranges outside its layer window or across the PLE boundary.
 //!
 //! A GGUF trunk has no expert bank and no disk rung, so the bank and rung reports keep the
 //! trait's `None` defaults.
@@ -86,12 +83,7 @@ impl TokenDevice for GgufCardDevice<'_> {
     }
 
     fn layers(&mut self, range: Range<usize>, pos: usize) -> Result<(), EngError> {
-        for layer in range {
-            let step = self.step.step();
-            let mut moe = self.moe.bind(&self.step)?;
-            step.run_layers(layer..layer + 1, pos, 1, &mut moe)?;
-        }
-        Ok(())
+        self.step.run_layers(&mut self.moe, range, pos)
     }
 
     fn read_stream(&mut self) -> Result<Vec<f32>, EngError> {

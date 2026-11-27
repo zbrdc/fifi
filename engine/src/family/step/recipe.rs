@@ -191,18 +191,18 @@ impl<M: Model> Walk<'_, M> {
 }
 
 impl<M: Model> Visits for Walk<'_, M> {
-    fn count(&self) -> usize {
-        self.0.layers().len()
+    fn range(&self) -> std::ops::Range<usize> {
+        0..self.0.layers().len()
     }
 
-    fn begin(&self, n: usize) -> Result<(), EngError> {
+    fn begin(&mut self, n: usize) -> Result<(), EngError> {
         self.0.core().cur.set(0);
         self.0.begin(n)
     }
 
     /// A plain site reads the residual, and its feed-forward read adds the mixer rows in the
     /// same launch; the other sites read the input their mix writes.
-    fn read(&self, visit: usize, half: Half, n: usize) -> Result<(), EngError> {
+    fn read(&mut self, visit: usize, half: Half, n: usize) -> Result<(), EngError> {
         let (m, layer) = (self.0, self.layer(visit)?);
         let (core, io, h) = (m.core(), m.io(false), m.hidden());
         let cur = &core.resid[core.cur.get()];
@@ -252,7 +252,7 @@ impl<M: Model> Visits for Walk<'_, M> {
         m.tap(visit, half, Stage::Read)
     }
 
-    fn branch(&self, visit: usize, half: Half, n: usize, p0: usize) -> Result<(), EngError> {
+    fn branch(&mut self, visit: usize, half: Half, n: usize, p0: usize) -> Result<(), EngError> {
         let (m, layer) = (self.0, self.layer(visit)?);
         let (core, io) = (m.core(), m.io(m.exact(n)));
         match half {
@@ -295,7 +295,7 @@ impl<M: Model> Visits for Walk<'_, M> {
     /// A plain site adds the feed-forward rows into the other residual plane. A routed site
     /// merges each branch into both streams and ends on their mean. A mixed site writes the
     /// other plane after each branch.
-    fn apply(&self, visit: usize, half: Half, n: usize) -> Result<(), EngError> {
+    fn apply(&mut self, visit: usize, half: Half, n: usize) -> Result<(), EngError> {
         let (m, layer) = (self.0, self.layer(visit)?);
         let (core, io, h) = (m.core(), m.io(false), m.hidden());
         let (cur, next) = (core.cur.get(), core.cur.get() ^ 1);

@@ -211,7 +211,7 @@ impl LoopStep<'_> {
         p0: usize,
         mut trace: Option<&mut Vec<Vec<f32>>>,
     ) -> Result<(), EngError> {
-        walk::visits(&Walk(self), m, p0, |_, half| {
+        walk::visits(&mut Walk(self), m, p0, |_, half| {
             let rows = match half {
                 Half::Mixer => &self.rows.core.mix_out,
                 Half::Forward => &self.rows.core.resid[self.rows.core.cur.get()],

@@ -354,54 +354,53 @@ fn run_full_model(trace_window: Option<TraceWindow>) {
                 .unwrap()
         };
         write(&start.stream);
-        for layer in 0..end {
-            eprintln!("full probe position={position} layer={layer} begin");
-            if layer == shape.ple_layer {
-                let mut residual = step.read_f32(state, start.stream.len()).unwrap();
-                let update = feed.ple_update(token, &residual).unwrap();
-                assert_eq!(residual.len(), update.len());
-                for (value, delta) in residual.iter_mut().zip(update) {
-                    *value += delta;
-                }
-                write(&residual);
+        let mut apply_ple = || {
+            let mut residual = step.read_f32(state, start.stream.len()).unwrap();
+            let update = feed.ple_update(token, &residual).unwrap();
+            assert_eq!(residual.len(), update.len());
+            for (value, delta) in residual.iter_mut().zip(update) {
+                *value += delta;
             }
-            if let Some(trace) = &mut trace {
+            write(&residual);
+        };
+        let ple = shape.ple_layer;
+        if trace_window.is_none() {
+            if position == 0 && ple > 0 {
+                let err = bound.run_layers(&mut owner, 0..end, position).unwrap_err();
+                assert!(
+                    matches!(err, EngError::BadRequest(message) if message.contains("apply the PLE update"))
+                );
+                assert!(!step.is_poisoned());
+            }
+            bound.run_layers(&mut owner, 0..ple, position).unwrap();
+            apply_ple();
+            bound.run_layers(&mut owner, ple..end, position).unwrap();
+        } else {
+            for layer in 0..end {
+                eprintln!("full probe position={position} layer={layer} begin");
+                if layer == ple {
+                    apply_ple();
+                }
                 let mut ids = None;
                 {
                     let moe = owner.bind(&bound).unwrap();
                     let mut tap = trace::RouteTap::new(moe, &mut ids);
                     step.run_layer(layer, position, 1, &mut tap).unwrap();
                 }
-                trace.record(
-                    step,
-                    layer,
-                    ids.expect("router input and IDs captured inside MoE"),
-                );
-            } else if let Some(trace) = &mut stateful {
-                let mut ids = None;
-                {
-                    let moe = owner.bind(&bound).unwrap();
-                    let mut tap = trace::RouteTap::new(moe, &mut ids);
-                    step.run_layer(layer, position, 1, &mut tap).unwrap();
+                let routed = ids.expect("router input and IDs captured inside MoE");
+                if let Some(trace) = &mut trace {
+                    trace.record(step, layer, routed);
+                } else if let Some(trace) = &mut stateful {
+                    trace.record(step, position, token, layer, routed);
                 }
-                trace.record(
-                    step,
-                    position,
-                    token,
-                    layer,
-                    ids.expect("router input and IDs captured inside MoE"),
+                let health = step.health().unwrap();
+                eprintln!("full probe position={position} layer={layer} end health={health:?}");
+                assert_eq!(
+                    health,
+                    (0, 0),
+                    "unhealthy position={position} layer={layer}"
                 );
-            } else {
-                step.run_layer(layer, position, 1, &mut owner.bind(&bound).unwrap())
-                    .unwrap();
             }
-            let health = step.health().unwrap();
-            eprintln!("full probe position={position} layer={layer} end health={health:?}");
-            assert_eq!(
-                health,
-                (0, 0),
-                "unhealthy position={position} layer={layer}"
-            );
         }
         if trace_first_token {
             step.finish_token().unwrap();

@@ -7,6 +7,8 @@
 //! ([`Visits`]); the order, and the point after each half where a caller may read rows, are
 //! shared.
 
+use std::ops::Range;
+
 use crate::EngError;
 
 /// Which rows of a fed chunk run through the output head.
@@ -100,28 +102,43 @@ pub(crate) enum Half {
 
 /// The visits of a model over one chunk of rows.
 pub(crate) trait Visits {
-    /// Visits of one walk.
-    fn count(&self) -> usize;
+    /// Absolute visit indices of the whole walk.
+    fn range(&self) -> Range<usize>;
     /// Queued before the first visit of a chunk of `n` rows.
-    fn begin(&self, n: usize) -> Result<(), EngError>;
+    fn begin(&mut self, _n: usize) -> Result<(), EngError> {
+        Ok(())
+    }
     /// The residual read of a half: its input rows, normed.
-    fn read(&self, visit: usize, half: Half, n: usize) -> Result<(), EngError>;
+    fn read(&mut self, visit: usize, half: Half, n: usize) -> Result<(), EngError>;
     /// The branch of a half over the rows the read left; `p0` is the position of row 0.
-    fn branch(&self, visit: usize, half: Half, n: usize, p0: usize) -> Result<(), EngError>;
+    fn branch(&mut self, visit: usize, half: Half, n: usize, p0: usize) -> Result<(), EngError>;
     /// The return of the branch rows to the residual.
-    fn apply(&self, visit: usize, half: Half, n: usize) -> Result<(), EngError>;
+    fn apply(&mut self, visit: usize, half: Half, n: usize) -> Result<(), EngError>;
 }
 
 /// Runs a chunk of `n` rows whose first row sits at `p0` through every visit of `model`. `tap`
 /// runs after each half, behind its launches: a trace or a reader of the rows of that point.
 pub(crate) fn visits<V: Visits + ?Sized>(
-    model: &V,
+    model: &mut V,
+    n: usize,
+    p0: usize,
+    tap: impl FnMut(usize, Half) -> Result<(), EngError>,
+) -> Result<(), EngError> {
+    model.begin(n)?;
+    let range = model.range();
+    visits_in(model, range, n, p0, tap)
+}
+
+/// Runs a caller-validated range of absolute visits on an already started chunk. A caller can
+/// split the walk at an external residual update without running `begin` again.
+pub(crate) fn visits_in<V: Visits + ?Sized>(
+    model: &mut V,
+    range: Range<usize>,
     n: usize,
     p0: usize,
     mut tap: impl FnMut(usize, Half) -> Result<(), EngError>,
 ) -> Result<(), EngError> {
-    model.begin(n)?;
-    for visit in 0..model.count() {
+    for visit in range {
         for half in [Half::Mixer, Half::Forward] {
             model.read(visit, half, n)?;
             model.branch(visit, half, n, p0)?;
@@ -131,3 +148,6 @@ pub(crate) fn visits<V: Visits + ?Sized>(
     }
     Ok(())
 }
+
+#[cfg(test)]
+mod tests;
