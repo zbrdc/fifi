@@ -371,6 +371,75 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "prints the first read of the file's pages: no pass, a GPU pass, a host read"]
+    fn the_first_read_of_the_file_pages_is_timed() {
+        // The vocabulary's projection again, BF16 [200,058, 2304]: 921.9 MB on the pages. One
+        // file a pass: a file mapped before keeps whatever its first launch paid for.
+        const ROWS: usize = 200_058;
+        const COLS: usize = 2304;
+        let bytes = gguf_file(&[
+            ("w", GgufType::Bf16, &[COLS as u64, ROWS as u64]),
+            ("tail", GgufType::F32, &[4096]),
+        ]);
+        let rig = Rig::new();
+        let drawn: Vec<f32> = (0..COLS).map(|i| (i % 997) as f32 * 0.001 - 0.5).collect();
+        let x = rig.ctx.upload(&f32_bytes(&drawn)).expect("the activation");
+        let y = rig
+            .ctx
+            .upload(&vec![0u8; ROWS * 4])
+            .expect("a result buffer");
+        let shape = DenseGemvShape::packed(1, ROWS, COLS);
+        let ms = |from: Instant| from.elapsed().as_secs_f64() * 1e3;
+        let megabytes = 2.0 * ROWS as f64 * COLS as f64 / 1e6;
+
+        for pass in [
+            "no pass",
+            "the GPU's pass",
+            "a host read",
+            "the GPU's pass, again",
+        ] {
+            let file = written(&bytes);
+            let map = WeightMap::open(&rig.ctx, file.path(), 1 << 20).expect("the map");
+            let pages = map.range("w").expect("the weight from the pages");
+            let start = Instant::now();
+            let gpu_ms = match pass {
+                "the GPU's pass" | "the GPU's pass, again" => {
+                    Some(rig.ctx.read_pages(&map.pages).expect("the pass") as f64 / 1e6)
+                }
+                "a host read" => {
+                    // One byte a page of 16 KiB, read by the host.
+                    let storage: &[u8] = map.file.as_ref();
+                    let mut sum = 0u8;
+                    for at in (0..storage.len()).step_by(16_384) {
+                        sum ^= storage[at];
+                    }
+                    std::hint::black_box(sum);
+                    None
+                }
+                _ => None,
+            };
+            let pass_ms = ms(start);
+            let gpu = match gpu_ms {
+                Some(value) => format!("{value:.3} ms"),
+                None => "none".to_owned(),
+            };
+            let first = Instant::now();
+            rig.ctx
+                .dense_gemv(gemv(shape, pages, &x, &y))
+                .expect("the first launch from the pages");
+            let first_ms = ms(first);
+            let second = Instant::now();
+            rig.ctx
+                .dense_gemv(gemv(shape, pages, &x, &y))
+                .expect("the second launch from the pages");
+            let second_ms = ms(second);
+            println!(
+                "page touch {megabytes:.1} MB, {pass}: the pass {pass_ms:.3} ms wall, the GPU {gpu}; the first launch {first_ms:.3} ms wall, the second {second_ms:.3} ms"
+            );
+        }
+    }
+
+    #[test]
     fn a_file_without_a_whole_page_or_without_a_header_is_refused_and_the_backend_lives() {
         let rig = Rig::new();
         // 128 + 1,024 bytes.

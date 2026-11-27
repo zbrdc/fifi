@@ -43,6 +43,16 @@ pub(crate) type Grid = [usize; 3];
 const FLAG_BYTES: usize = 4;
 /// The flag cleared: no weight marked.
 const FLAG_ZERO: [u8; 4] = [0; 4];
+/// The shader of the first read of the pages of a mapped file.
+#[cfg(test)]
+const PAGE_TOUCH_SOURCE: &str = include_str!("native/page_touch.metal");
+#[cfg(test)]
+const PAGE_TOUCH_KERNEL: &str = "page_touch";
+/// The stride of that read: below any page size, so every page is read.
+#[cfg(test)]
+const PAGE_READ_STRIDE: usize = 4096;
+#[cfg(test)]
+const PAGE_TOUCH_THREADGROUP: usize = 256;
 
 pub(crate) struct MetalContext {
     pub(super) shared: Rc<Shared>,
@@ -176,6 +186,40 @@ impl MetalContext {
         let _guard = DispatchGuard::enter(&TERMINAL);
         native::max_buffer_length(&self.shared.runtime)
             .map_err(|_| terminal_failure(ALLOCATE_OPERATION))
+    }
+
+    /// The first read of every page of `buffer`, the whole pages of a mapped file: one word
+    /// every 4 KiB, one thread each, a waited launch. A dispatch that comes after it finds the
+    /// pages mapped for the GPU. The GPU time of the pass in nanoseconds; `BadRequest` for a
+    /// buffer the host can write or an empty one, before any native call.
+    #[cfg(test)]
+    pub(super) fn read_pages(&self, buffer: &DeviceBuffer) -> Result<u64, EngError> {
+        ensure_usable(&TERMINAL)?;
+        if !buffer.read_only {
+            return Err(EngError::BadRequest(
+                "the buffer is not over the pages of a mapped file".to_owned(),
+            ));
+        }
+        let bytes = buffer.raw.bytes();
+        if bytes == 0 {
+            return Err(EngError::BadRequest(
+                "an empty buffer has no page to read".to_owned(),
+            ));
+        }
+        let threads = bytes.div_ceil(PAGE_READ_STRIDE);
+        let kernel = self.kernel(PAGE_TOUCH_KERNEL, PAGE_TOUCH_SOURCE)?;
+        let touched = self.upload(&vec![0u8; 4 * threads])?;
+        self.launch_repeated(
+            &kernel,
+            &[
+                buffer.range(0, bytes)?.binding(),
+                touched.range(0, 4 * threads)?.binding(),
+            ],
+            &(bytes as u64).to_le_bytes(),
+            [threads, 1, 1],
+            [PAGE_TOUCH_THREADGROUP, 1, 1],
+            1,
+        )
     }
 
     /// A buffer with no copy over the whole pages of `storage`, which the caller keeps mapped
