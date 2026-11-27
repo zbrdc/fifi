@@ -464,43 +464,51 @@ fn dense_gemv_is_timed() {
     let shapes = [(3072usize, 2304usize), (1024, 2304), (2304, 64), (64, 4608)];
     for (rows, cols) in shapes {
         for m in [1usize, 8, 32] {
-            let shape = DenseGemvShape::packed(m, rows, cols);
-            let case = Case::new(&mut rng, shape, DenseDtype::Bf16);
-            check(&case, &run(&rig, &case, (0, 0, 0)));
-            let w = Padded::new(&rig.ctx, &code_bytes(&case.codes), 0);
-            let x = Padded::new(&rig.ctx, &f32_bytes(&case.x), 0);
-            let need = dense_gemv_bytes(shape, case.dtype).expect("the bytes of the call");
-            let y = Padded::new(&rig.ctx, &sentinel(need.y), 0);
-            let call = DenseGemvCall {
-                shape,
-                dtype: case.dtype,
-                w: w.all(),
-                x: x.all(),
-                y: y.all(),
-            };
-            let one = || rig.ctx.dense_gemv_timed(call, 1).expect("one timed launch");
-            for _ in 0..5 {
-                one();
-            }
-            let mut singles: Vec<u64> = (0..21).map(|_| one()).collect();
-            singles.sort_unstable();
-            let single = singles[singles.len() / 2];
-            let chain = rig
-                .ctx
-                .dense_gemv_timed(call, 16)
-                .expect("sixteen timed launches")
-                / 16;
-            let mb = need.w as f64 / 1e6;
-            let rate = |ns: u64| need.w as f64 / (ns as f64 / 1e9) / 1e9;
-            println!(
-                "BF16 m {m} [{rows}, {cols}] {mb:.1} MB: one launch {} us at {:.0} GB/s, sixteen back to back {} us a launch at {:.0} GB/s",
-                single as f64 / 1e3,
-                rate(single),
-                chain as f64 / 1e3,
-                rate(chain),
-            );
+            time_shape(&rig, &mut rng, DenseGemvShape::packed(m, rows, cols));
         }
     }
+    // The head: one weight row a token of the vocabulary, read once a token.
+    time_shape(&rig, &mut rng, DenseGemvShape::packed(1, 200058, 2304));
+}
+
+/// Checks one BF16 shape against the reference, then prints its time: the median of 21 single
+/// launches and the mean of 16 launches back to back.
+fn time_shape(rig: &Rig, rng: &mut Rng, shape: DenseGemvShape) {
+    let DenseGemvShape { m, rows, cols, .. } = shape;
+    let case = Case::new(rng, shape, DenseDtype::Bf16);
+    check(&case, &run(rig, &case, (0, 0, 0)));
+    let w = Padded::new(&rig.ctx, &code_bytes(&case.codes), 0);
+    let x = Padded::new(&rig.ctx, &f32_bytes(&case.x), 0);
+    let need = dense_gemv_bytes(shape, case.dtype).expect("the bytes of the call");
+    let y = Padded::new(&rig.ctx, &sentinel(need.y), 0);
+    let call = DenseGemvCall {
+        shape,
+        dtype: case.dtype,
+        w: w.all(),
+        x: x.all(),
+        y: y.all(),
+    };
+    let one = || rig.ctx.dense_gemv_timed(call, 1).expect("one timed launch");
+    for _ in 0..5 {
+        one();
+    }
+    let mut singles: Vec<u64> = (0..21).map(|_| one()).collect();
+    singles.sort_unstable();
+    let single = singles[singles.len() / 2];
+    let chain = rig
+        .ctx
+        .dense_gemv_timed(call, 16)
+        .expect("sixteen timed launches")
+        / 16;
+    let mb = need.w as f64 / 1e6;
+    let rate = |ns: u64| need.w as f64 / (ns as f64 / 1e9) / 1e9;
+    println!(
+        "BF16 m {m} [{rows}, {cols}] {mb:.1} MB: one launch {} us at {:.0} GB/s, sixteen back to back {} us a launch at {:.0} GB/s",
+        single as f64 / 1e3,
+        rate(single),
+        chain as f64 / 1e3,
+        rate(chain),
+    );
 }
 
 /// A BF16 call of one row over buffers built for the shape `[16, 256]`.
