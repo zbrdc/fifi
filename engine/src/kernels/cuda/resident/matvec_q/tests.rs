@@ -353,8 +353,8 @@ fn read_f32(ctx: &CudaContext, buffer: &DeviceBuffer, len: usize) -> Vec<f32> {
 /// activation rows agree bit-for-bit. The vendored MMVQ launcher alone does not promise
 /// this past four columns (its launch geometry changes with the column count — the plain
 /// entry diverged at 5.3e-4 relative, which broke the dense prefill arm), so the invariant
-/// entry routes Q8_0, Q4_K, Q5_0 and Q6_K to in-house warp-per-row kernels and launches
-/// Q4_K, Q5_0 and Q6_K per column when the batch is wider than four.
+/// entry routes Q8_0, Q4_K, Q5_0 and Q6_K to in-house warp-per-row kernels that batch at every
+/// width.
 #[test]
 fn matvec_invariant_columns_match_single_column_launches() {
     if !testkit::device_present("matvec_invariant_columns_match_single_column_launches") {
@@ -1613,6 +1613,102 @@ impl AbRig<'_> {
             gbs(w_cold)
         );
         (v_cold, w_cold)
+    }
+}
+
+/// The invariant entry on a batch of eight columns, the width the Gemma 4 resident matvec
+/// launches in: the cold time of the eight-column launch beside that of a one-column launch on
+/// the same shape, for the four types its in-house arms serve. An ignored bench: it needs an
+/// exclusive timing slot on the device.
+#[test]
+#[ignore = "bench: exclusive timing slot"]
+fn matvec_q_invariant_wide_batch_bench() {
+    if !testkit::device_present("matvec_q_invariant_wide_batch_bench") {
+        return;
+    }
+    let ctx = CudaContext::new().expect("context");
+    let stream = ctx.stream().expect("stream");
+    let flush = flush_rig(&ctx, &stream);
+    let (warm, cold) = if cfg!(debug_assertions) {
+        (5, 3)
+    } else {
+        (200, 20)
+    };
+    let ab = AbRig {
+        ctx: &ctx,
+        stream: &stream,
+        flush: &flush,
+        warm,
+        cold,
+    };
+    let ncols = 8;
+    println!(
+        "invariant entry, one column against {ncols} columns | warm_us cold_us | warm_us cold_us | cold wide over one"
+    );
+    for (ti, ty) in [
+        QuantType::Q4K,
+        QuantType::Q50,
+        QuantType::Q6K,
+        QuantType::Q80,
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        for (name, k, rows) in [("qkv / attn_q", 2048, 8192), ("alpha / beta", 2048, 32)] {
+            let seed = 0x7300_0000 + ti as u64 + rows as u64;
+            let (w, x_q8, row_bytes) = rig(&ctx, &stream, ty, k, rows, ncols, seed);
+            let w_bytes = ty.weight_bytes(rows, k).expect("size");
+            let (w_r, x_one, x_wide) = (
+                w.range(0, w_bytes).expect("w"),
+                x_q8.range(0, row_bytes).expect("x one"),
+                x_q8.range(0, row_bytes * ncols).expect("x wide"),
+            );
+            let (y_one, y_wide) = (
+                nan_filled(&ctx, rows * 4),
+                nan_filled(&ctx, rows * ncols * 4),
+            );
+            let (y_one_r, y_wide_r) = (
+                y_one.range(0, rows * 4).expect("y one"),
+                y_wide.range(0, rows * ncols * 4).expect("y wide"),
+            );
+            let one = || {
+                ctx.matvec_q_invariant(
+                    &stream,
+                    MatvecCall {
+                        ty,
+                        w: w_r,
+                        x_q8: x_one,
+                        y: y_one_r,
+                        k,
+                        rows,
+                        ncols: 1,
+                    },
+                )
+                .expect("one-column matvec");
+            };
+            let wide = || {
+                ctx.matvec_q_invariant(
+                    &stream,
+                    MatvecCall {
+                        ty,
+                        w: w_r,
+                        x_q8: x_wide,
+                        y: y_wide_r,
+                        k,
+                        rows,
+                        ncols,
+                    },
+                )
+                .expect("eight-column matvec");
+            };
+            let (one_warm, one_cold) = ab.times(&one);
+            let (wide_warm, wide_cold) = ab.times(&wide);
+            println!(
+                "{ty:?} {name:22} {:5} MB | {one_warm:9.2} {one_cold:9.2} | {wide_warm:9.2} {wide_cold:9.2} | {:5.2}",
+                w_bytes / 1_000_000,
+                wide_cold / one_cold
+            );
+        }
     }
 }
 

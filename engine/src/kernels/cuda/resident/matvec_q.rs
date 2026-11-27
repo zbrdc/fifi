@@ -269,48 +269,17 @@ impl CudaContext {
     /// The column-invariant contract: column `j` of any launch is bit-identical to a
     /// one-column launch over the same bytes, whatever `ncols` is. The vendored MMVQ
     /// launcher does not promise that past four columns (its launch geometry changes with
-    /// the column count), so Q4_K, Q5_0 and Q6_K launch per
-    /// column when the batch is wider than four, which is the documented mitigation of
-    /// this module. That costs those arms one launch per column past four (an
-    /// eight-column batch pays eight sequential launches instead of one, with no shared
-    /// read of the weight rows across columns); the in-house arms batch at every width.
-    /// Q8_0, Q4_K, Q5_0 and Q6_K under the contract take in-house warp-per-row kernels; Q5_K,
-    /// Q4_0 and Q3_K are in-house and column-invariant at every width. Callers whose
-    /// reuse promise needs a token to compute the same thing whatever batch it rode in
-    /// (a prefill batch vs a decode step) select this entry; the default entry keeps the vendored
+    /// the column count), so it serves none of the four quant arms that take an in-house
+    /// warp-per-row kernel under this contract; those batch at every width. Q5_K, Q4_0
+    /// and Q3_K are in-house and column-invariant at every width. Callers whose reuse
+    /// promise needs a token to compute the same thing whatever batch it rode in (a
+    /// prefill batch vs a decode step) select this entry; the default entry keeps the vendored
     /// numerics, so served defaults do not move.
     pub(crate) fn matvec_q_invariant(
         &self,
         stream: &DeviceStream,
         call: MatvecCall<'_>,
     ) -> Result<(), EngError> {
-        if matches!(call.ty, QuantType::Q4K | QuantType::Q50 | QuantType::Q6K) && call.ncols > 4 {
-            let row_bytes = q8_1_bytes(call.k, 1).ok_or_else(|| {
-                EngError::BadRequest("the CUDA matvec activation size overflows".to_owned())
-            })?;
-            let y_bytes = call.rows.checked_mul(4).ok_or_else(|| {
-                EngError::BadRequest("the CUDA matvec out size overflows".to_owned())
-            })?;
-            for col in 0..call.ncols {
-                let single = MatvecCall {
-                    ty: call.ty,
-                    w: call.w,
-                    x_q8: call
-                        .x_q8
-                        .buffer()
-                        .range(call.x_q8.offset() + col * row_bytes, row_bytes)?,
-                    y: call
-                        .y
-                        .buffer()
-                        .range(call.y.offset() + col * y_bytes, y_bytes)?,
-                    k: call.k,
-                    rows: call.rows,
-                    ncols: 1,
-                };
-                self.matvec_q_impl(stream, single, true)?;
-            }
-            return Ok(());
-        }
         self.matvec_q_impl(stream, call, true)
     }
 
