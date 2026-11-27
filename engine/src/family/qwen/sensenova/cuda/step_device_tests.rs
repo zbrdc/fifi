@@ -923,6 +923,47 @@ fn card_reports_the_cost_of_a_k_row_step() {
     assert!(worst_abs(&row).is_finite(), "the logits row is not finite");
 }
 
+/// A chunk of 2, 3 or 4 rows gives every row the bits a one-row step gives it: one stream of 48
+/// tokens fed row by row on one card and in chunks on another, every position's logits row
+/// compared byte for byte. A round that verifies drafted tokens relies on this.
+#[test]
+fn card_few_row_chunks_have_the_bits_of_one_row_steps() {
+    const TOKENS: usize = 48;
+    let Some((ctx, loaded, weights, mut projector)) = open_rig("sensenova few-row chunk bits")
+    else {
+        return;
+    };
+    let vocab = weights.shape().vocab as u32;
+    let ids: Vec<u32> = (1..=TOKENS as u32)
+        .map(|i| (i.wrapping_mul(2_654_435_761) >> 7) % vocab)
+        .collect();
+    let mut rows_of = |k: usize| -> Vec<Vec<f32>> {
+        let mut card = open_card(&ctx, &loaded, &weights, TOKENS + 1);
+        let mut rows = Vec::with_capacity(TOKENS);
+        for (chunk, tokens) in ids.chunks(k).enumerate() {
+            let embed = projector.rows(weights.token_embd(), tokens).unwrap();
+            card.prefill(&embed, chunk * k).unwrap();
+            for row in 0..tokens.len() {
+                card.head_of_row(row).unwrap();
+                rows.push(drain_row(&ctx, &card));
+            }
+        }
+        rows
+    };
+    let single = rows_of(1);
+    for k in [2, 3, 4] {
+        let chunked = rows_of(k);
+        let differing = single.iter().zip(&chunked).filter(|(a, b)| a != b).count();
+        let worst = single
+            .iter()
+            .zip(&chunked)
+            .map(|(a, b)| max_abs_diff(a, b))
+            .fold(0.0f32, f32::max);
+        eprintln!("chunks of {k}: {differing} of {TOKENS} rows differ, worst |diff| {worst:.6}");
+        assert_eq!(differing, 0, "chunks of {k} rows differ from one-row steps");
+    }
+}
+
 /// Accuracy probe, not a gate. Teacher-forces one stream of 240 tokens from position 0 in chunks
 /// of each row count of `SENSENOVA_K_ROWS` and writes the logits row of every position to
 /// `<SENSENOVA_ROWS_OUT>.k<rows>` as little-endian f32. The stream is `<that path>.ids`: when the

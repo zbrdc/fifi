@@ -12,7 +12,7 @@
 
 use super::*;
 use crate::family::step::recipe::{Layer, Model, Walk};
-use crate::family::step::rows::{Out as StepOut, Rows as StepRows, StepIo};
+use crate::family::step::rows::{FEW_ROWS, Out as StepOut, Rows as StepRows, StepIo};
 use crate::family::step::scratch::{Alloc, Core, OnDevice, Widths, Zeroed};
 use crate::family::step::state::State;
 use crate::family::step::walk::{self, Half};
@@ -194,7 +194,7 @@ impl LoopStep<'_> {
         // Behind the last chunk's kernels: a blocking copy would land at once, and the
         // chunk before would write its final residual over it.
         self.rows.core.resid[0].write_at_enqueue(&self.stream, 0, embed)?;
-        if m == 1 {
+        if m <= FEW_ROWS {
             let params = StepParams::new(0, p0 as i32)?;
             self.params
                 .write_at_enqueue(&self.stream, 0, &params.to_bytes())?;
@@ -270,9 +270,9 @@ impl Model for LoopStep<'_> {
         self.shape.eps
     }
 
-    /// One row reads its position from the step parameters.
+    /// A chunk of a few rows reads its first position from the step parameters.
     fn begin(&self, n: usize) -> Result<(), EngError> {
-        if n == 1 {
+        if n <= FEW_ROWS {
             self.ctx
                 .step_begin(&self.stream, bytes_range(&self.params, STEP_PARAMS_BYTES)?)?;
         }
@@ -289,7 +289,7 @@ impl Model for LoopStep<'_> {
         p0: usize,
     ) -> Result<(attend::Dims, attend::AttendRows<'_>, attend::At<'_>), EngError> {
         let rows = &self.rows;
-        let at = if n == 1 {
+        let at = if n <= FEW_ROWS {
             attend::At::Row {
                 pos: self.params_word(OFFSET_POS)?,
                 kv_len: self.params_word(OFFSET_KV_LEN)?,

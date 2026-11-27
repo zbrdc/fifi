@@ -128,8 +128,10 @@ pub(crate) struct Cache<'a> {
 /// Where the rows of a visit sit in the context.
 #[derive(Clone, Copy)]
 pub(crate) enum At<'a> {
-    /// One row: the kernels read its position and the key count from the device words of the
-    /// step and report into its status word.
+    /// A few rows starting at one position: the kernels read that position and the key count
+    /// from the device words of the step and report into its status word. Row `t` sits at the
+    /// position plus `t` and sees the keys up to itself, so each row has the bits of a one-row
+    /// step.
     Row {
         pos: DeviceRange<'a>,
         kv_len: DeviceRange<'a>,
@@ -186,17 +188,11 @@ pub(crate) fn mix(
             kv_len,
             status,
         } => {
-            if n != 1 {
-                return Err(EngError::BadRequest(format!(
-                    "{}: {n} rows cannot read one position word",
-                    io.family
-                )));
-            }
             io.ctx.attn_prep(
                 io.stream,
                 AttnPrepCall {
                     shape: AttnPrepShape {
-                        m: 1,
+                        m: n,
                         n_head: hq,
                         n_kv_head: hkv,
                         head_dim: hd,
@@ -223,7 +219,7 @@ pub(crate) fn mix(
                 io.stream,
                 AttnDecodeLoopCall {
                     shape: AttnLoopShape {
-                        m: 1,
+                        m: n,
                         n_head: hq,
                         n_kv_head: hkv,
                         cache_rows: cache.rows,
@@ -238,7 +234,7 @@ pub(crate) fn mix(
                     kv_len,
                     part: rows
                         .part
-                        .range(0, attn_loop_part_bytes(1, hq / hkv, layer.row_splits)?)?,
+                        .range(0, attn_loop_part_bytes(n, hq / hkv, layer.row_splits)?)?,
                     out: attended,
                 },
             )?;

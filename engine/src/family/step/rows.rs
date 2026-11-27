@@ -85,7 +85,7 @@ impl<'a> Map<'a> {
 /// and 1.45 at four. Against an exact route (every weight decoded, f32 activations) on
 /// SenseNova-Loop, rows of such chunks then sit as close as a one-row step (mean KL 0.0015),
 /// where the batched product left them at 0.0038.
-const FEW_ROWS: usize = 4;
+pub(crate) const FEW_ROWS: usize = 4;
 /// The most rows the matvec takes for rows that land back to back. From 5 to 8 rows the rows
 /// that land apart take the batched product: the matvec for those too measured slower.
 const MATVEC_ROWS: usize = 8;

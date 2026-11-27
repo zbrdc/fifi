@@ -9,7 +9,7 @@
 //! query, key and value have a projection each, low-rank projections write the decay and the
 //! strengths, and every chunk runs the scan.
 
-use super::rows::{Map, Out, Rows, StepIo, q8};
+use super::rows::{FEW_ROWS, Map, Out, Rows, StepIo, q8};
 use crate::EngError;
 use crate::kernels::cuda::prefill::gdn_scan_seq::{
     GDN_SCAN_EPS, GdnChannelScanCall, GdnForm, GdnGate, GdnKeyHeads, GdnL2, GdnScanSeqCall,
@@ -337,12 +337,14 @@ pub(crate) fn mix(
         Rule::Heads { qkvz, .. } => {
             let fused = qkvz.n_rows();
             let dt_bias = layer.dt_bias.slice(0, vh * F32)?;
-            if n == 1 {
+            // A few rows run the one-step rule row after row, so each has the bits of a step
+            // of its own.
+            if n <= FEW_ROWS {
                 io.ctx.gdn_delta(
                     io.stream,
                     DeltaCall {
                         shape: DeltaShape {
-                            m: 1,
+                            m: n,
                             n_k_heads: layer.key_heads,
                             n_v_heads: vh,
                             conv_ld: conv_dim,
