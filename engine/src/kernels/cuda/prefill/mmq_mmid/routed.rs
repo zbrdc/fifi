@@ -2,7 +2,7 @@
 //! in-house dequantizing GEMM (it reads the f32 activation rows) or the vendored grouped MMQ (it
 //! reads q8_1 columns built from them), so a stage quantizes only for the stacks that need it.
 
-use super::{DqMmidCall, MmidIds, MmidLaunchCall, MmidQuantCall, MmidWeight};
+use super::{DqMmidCall, MmidIds, MmidLaunchCall, MmidQuantCall, MmidWeight, mmq_type_of};
 use crate::EngError;
 use crate::kernels::cuda::prefill::mmq_size::Q8_1Layout;
 use crate::kernels::cuda::resident::matvec_q::QuantType;
@@ -15,7 +15,7 @@ pub(crate) fn routed_weight<'a>(
     stack: &'a NativeWeight,
     k: usize,
     n: usize,
-) -> Result<MmidWeight<'a>, EngError> {
+) -> Result<MmidWeight<'a, QuantType>, EngError> {
     let quant = stack.quant();
     let stride_bytes = quant.weight_bytes(n, k).ok_or_else(|| {
         EngError::BadRequest(format!(
@@ -24,7 +24,7 @@ pub(crate) fn routed_weight<'a>(
     })?;
     Ok(MmidWeight {
         base: stack.buffer().range(0, stack.buffer().bytes())?,
-        quant,
+        ty: quant,
         k,
         n,
         stride_bytes,
@@ -131,7 +131,7 @@ pub(crate) fn routed_gemm(
         x.quant.cursor.ensure(weight.quant(), || {
             let call = MmidQuantCall {
                 packing: x.quant.packing,
-                quant: weight.quant(),
+                ty: mmq_type_of(weight.quant())?,
                 k: weight.k(),
                 row_stride: x.row_stride,
                 x: x.rows,
@@ -147,7 +147,13 @@ pub(crate) fn routed_gemm(
             stream,
             MmidLaunchCall {
                 shape: ids.shape(),
-                weight: routed,
+                weight: MmidWeight {
+                    base: routed.base,
+                    ty: mmq_type_of(routed.ty)?,
+                    k: routed.k,
+                    n: routed.n,
+                    stride_bytes: routed.stride_bytes,
+                },
                 ids,
                 y: x.q8,
                 dst,

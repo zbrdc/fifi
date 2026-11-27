@@ -25,8 +25,8 @@ use crate::EngError;
 use crate::kernels::cuda::prefill::mmq_mmid::{
     MmidIds, MmidIdsOut, MmidLaunchCall, MmidQuantCall, MmidShape, MmidWeight, set_hint_override,
 };
+use crate::kernels::cuda::prefill::mmq_size::MmqType;
 use crate::kernels::cuda::prefill::mmq_size::{fixup_floats_max, q8_1_bytes};
-use crate::kernels::cuda::resident::matvec_q::QuantType;
 use crate::kernels::cuda::testkit::{self, Rng};
 use crate::kernels::cuda::{CudaContext, DeviceBuffer, DeviceRange};
 
@@ -77,7 +77,7 @@ fn launch_call<'b, 'i>(
         shape: spec.shape,
         weight: MmidWeight {
             base: weights.range(0, weights.bytes())?,
-            quant: spec.quant,
+            ty: spec.quant,
             k: spec.k,
             n: spec.n,
             stride_bytes: spec.stride_bytes(),
@@ -112,7 +112,7 @@ fn tight_phase(weights: &[u8], spec: &LaunchSpec<'_>) -> Result<Tight, EngError>
     let y_ample = ctx.upload(&vec![POISON; y_bytes])?;
     let quant = MmidQuantCall {
         packing: crate::kernels::cuda::prefill::mmq_quant::MmqPacking::Vendor,
-        quant: spec.quant,
+        ty: spec.quant,
         k: spec.k,
         row_stride: spec.k,
         x: x_buf.range(0, spec.x.len() * 4)?,
@@ -290,11 +290,11 @@ fn mmq_mmid_tight_buffers_b1_single_token_top_expert_at_m_49() {
     };
     let (k, n) = (2048, 512);
     let rows = rows_with_single(&shape, 15, 15, 0xb1);
-    let weights = expert_blocks(QuantType::Q4K, 16, n, k, 0xb101);
+    let weights = expert_blocks(MmqType::Q4K, 16, n, k, 0xb101);
     let x = normal_rows(shape.m, k, 0xb102);
     let spec = LaunchSpec {
         shape,
-        quant: QuantType::Q4K,
+        quant: MmqType::Q4K,
         k,
         n,
         ld: n,
@@ -302,7 +302,7 @@ fn mmq_mmid_tight_buffers_b1_single_token_top_expert_at_m_49() {
         x: &x,
         gather: false,
     };
-    let mode = launch_mode(QuantType::Q4K, n, &shape, facts());
+    let mode = launch_mode(MmqType::Q4K, n, &shape, facts());
     assert_eq!(mode.j, 64, "M 49 picks J 64: {mode:?}");
     let tight = run_row("B1 (M 49, single-token top expert)", &spec, &weights);
     assert_eq!(
@@ -326,11 +326,11 @@ fn mmq_mmid_tight_buffers_b1_wide_single_token_top_expert_at_m_225() {
     };
     let (k, n) = (256, 128);
     let rows = rows_with_single(&shape, 15, 15, 0xb2);
-    let weights = expert_blocks(QuantType::Q4K, 16, n, k, 0xb201);
+    let weights = expert_blocks(MmqType::Q4K, 16, n, k, 0xb201);
     let x = normal_rows(shape.m, k, 0xb202);
     let spec = LaunchSpec {
         shape,
-        quant: QuantType::Q4K,
+        quant: MmqType::Q4K,
         k,
         n,
         ld: n,
@@ -338,7 +338,7 @@ fn mmq_mmid_tight_buffers_b1_wide_single_token_top_expert_at_m_225() {
         x: &x,
         gather: false,
     };
-    let mode = launch_mode(QuantType::Q4K, n, &shape, facts());
+    let mode = launch_mode(MmqType::Q4K, n, &shape, facts());
     assert_eq!(mode.j, 128, "M 225 picks J 128: {mode:?}");
     let tight = run_row(
         "B1 wide (M 225, J 128, single-token top expert)",
@@ -376,11 +376,11 @@ fn mmq_mmid_tight_buffers_b2_fixup_gathers_an_empty_top_expert() {
     };
     let k = 2048;
     let rows = rows_from_pool(&shape, n_experts - 1, 0xb3);
-    let weights = expert_blocks(QuantType::Q4K, n_experts, n, k, 0xb301);
+    let weights = expert_blocks(MmqType::Q4K, n_experts, n, k, 0xb301);
     let x = normal_rows(shape.m, k, 0xb302);
     let spec = LaunchSpec {
         shape,
-        quant: QuantType::Q4K,
+        quant: MmqType::Q4K,
         k,
         n,
         ld: n,
@@ -388,7 +388,7 @@ fn mmq_mmid_tight_buffers_b2_fixup_gathers_an_empty_top_expert() {
         x: &x,
         gather: false,
     };
-    let mode = launch_mode(QuantType::Q4K, n, &shape, facts);
+    let mode = launch_mode(MmqType::Q4K, n, &shape, facts);
     assert!(
         !mode.tiling && mode.fixup && mode.ntx >= 2,
         "the shape must run stream-k with the fixup over two column tiles: {mode:?}"
@@ -426,11 +426,11 @@ fn mmq_mmid_tight_buffers_cover_expert_tails_with_a_hot_and_an_empty_expert() {
     };
     let (k, n) = (512, 256);
     let rows: Vec<i32> = (0..100).flat_map(|t| [0, 1 + t % 5]).collect();
-    let weights = expert_blocks(QuantType::Q4K, 8, n, k, 0xb4);
+    let weights = expert_blocks(MmqType::Q4K, 8, n, k, 0xb4);
     let x = normal_rows(shape.m, k, 0xb402);
     let spec = LaunchSpec {
         shape,
-        quant: QuantType::Q4K,
+        quant: MmqType::Q4K,
         k,
         n,
         ld: n,
@@ -438,7 +438,7 @@ fn mmq_mmid_tight_buffers_cover_expert_tails_with_a_hot_and_an_empty_expert() {
         x: &x,
         gather: false,
     };
-    let mode = launch_mode(QuantType::Q4K, n, &shape, facts());
+    let mode = launch_mode(MmqType::Q4K, n, &shape, facts());
     assert_eq!(mode.j, 112, "M 100 picks J 112: {mode:?}");
     let tight = run_row(
         "tails (hot expert 0, experts 6 and 7 empty)",
@@ -470,11 +470,11 @@ fn mmq_mmid_tight_buffers_fallback_tail_at_m_24() {
     let rows: Vec<i32> = (0..24)
         .flat_map(|t| if t == 23 { [0, 7] } else { [0, 1 + t % 6] })
         .collect();
-    let weights = expert_blocks(QuantType::Q4K, 8, n, k, 0xb5);
+    let weights = expert_blocks(MmqType::Q4K, 8, n, k, 0xb5);
     let x = normal_rows(shape.m, k, 0xb502);
     let spec = LaunchSpec {
         shape,
-        quant: QuantType::Q4K,
+        quant: MmqType::Q4K,
         k,
         n,
         ld: n,
@@ -482,7 +482,7 @@ fn mmq_mmid_tight_buffers_fallback_tail_at_m_24() {
         x: &x,
         gather: false,
     };
-    let mode = launch_mode(QuantType::Q4K, n, &shape, facts());
+    let mode = launch_mode(MmqType::Q4K, n, &shape, facts());
     assert_eq!(mode.j, 32, "M 24 under fallback picks J 32: {mode:?}");
     let tight = run_row(
         "fallback tail (N 160, M 24, single-token top expert)",

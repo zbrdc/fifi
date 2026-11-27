@@ -1848,7 +1848,7 @@ fn gguf_grouped_prefill_gemm_matches_the_cpu_reference() {
                         shape,
                         weight: MmidWeight {
                             base: w.range(0, w_bytes.len()).expect("w"),
-                            quant: ty,
+                            ty,
                             k,
                             n: case.rows,
                             stride_bytes: expert_bytes,
@@ -2021,7 +2021,7 @@ fn gguf_grouped_prefill_report_layer_ms() {
                         shape,
                         weight: MmidWeight {
                             base: stack.0.range(0, stack.1).expect("w"),
-                            quant: ty,
+                            ty,
                             k,
                             n,
                             stride_bytes: stack.1 / n_experts,

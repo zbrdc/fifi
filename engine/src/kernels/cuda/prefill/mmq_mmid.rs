@@ -212,7 +212,7 @@ pub(crate) fn mmq_type_of(quant: QuantType) -> Result<MmqType, EngError> {
 /// follows `quant`, the type of the weight that will read `y`.
 pub(crate) struct MmidQuantCall<'b> {
     pub(crate) packing: crate::kernels::cuda::prefill::mmq_quant::MmqPacking,
-    pub(crate) quant: QuantType,
+    pub(crate) ty: MmqType,
     pub(crate) k: usize,
     pub(crate) row_stride: usize,
     pub(crate) x: DeviceRange<'b>,
@@ -421,15 +421,17 @@ fn out_claims<'a>(out: &MmidIdsOut<'a>, shape: &MmidShape) -> Result<[Claim<'a>;
 }
 
 /// A weight stack: `n_experts` matrices of `n` rows by `k` values in the native GGUF blocks of
-/// `quant`, the first at the start of `base`, each `stride_bytes` after the one before (a
+/// `ty`, the first at the start of `base`, each `stride_bytes` after the one before (a
 /// `NativeWeight`'s buffer, or a bank of slots with `n_experts = slots`). `base` is 16-byte
 /// aligned. When `k` is off the k grid, `base` also holds the bytes past the last matrix that
 /// its last row's last k tile reads (`mmq_size::weight_tail`), which must decode finite: the
-/// owner zeroes them.
+/// owner zeroes them. `T` is the type list of the GEMM that reads the stack: [`MmqType`] for
+/// the vendored grouped MMQ (NVFP4 included), [`QuantType`] for the dequantizing GEMM (IQ1_M
+/// included), so each path names only the types it runs.
 #[derive(Clone, Copy)]
-pub(crate) struct MmidWeight<'b> {
+pub(crate) struct MmidWeight<'b, T = MmqType> {
     pub(crate) base: DeviceRange<'b>,
-    pub(crate) quant: QuantType,
+    pub(crate) ty: T,
     pub(crate) k: usize,
     pub(crate) n: usize,
     pub(crate) stride_bytes: usize,
@@ -458,7 +460,7 @@ pub(crate) struct MmidLaunchCall<'b, 'i> {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct MmidLaunchShape {
     pub(crate) ids: MmidShape,
-    pub(crate) quant: QuantType,
+    pub(crate) ty: MmqType,
     pub(crate) k: usize,
     pub(crate) n: usize,
     pub(crate) stride_bytes: usize,
@@ -468,12 +470,12 @@ pub(crate) struct MmidLaunchShape {
 impl MmidLaunchShape {
     /// The weight blocks of one row.
     fn row_blocks(&self) -> usize {
-        self.k / self.quant.block_size()
+        self.k / self.ty.block_values()
     }
 
     /// The per-expert stride in weight blocks (upstream `s02`).
     fn stride_blocks(&self) -> usize {
-        self.stride_bytes / self.quant.block_bytes()
+        self.stride_bytes / self.ty.block_bytes()
     }
 
     /// The weight blocks the launch reads, after [`check_launch_shape`]: the last row's last k
@@ -484,7 +486,7 @@ impl MmidLaunchShape {
     fn weight_blocks(&self) -> usize {
         (self.ids.n_experts - 1) * self.stride_blocks()
             + (self.n - 1) * self.row_blocks()
-            + k_read(self.k).expect("check_launch_shape bounds K") / self.quant.block_size()
+            + k_read(self.k).expect("check_launch_shape bounds K") / self.ty.block_values()
     }
 
     /// The dst floats the launch writes, after [`check_launch_shape`].
@@ -493,23 +495,19 @@ impl MmidLaunchShape {
     }
 }
 
-/// Checks every number rule of a grouped launch (`mmq_mmid.h`) in this order: the id shape, the
-/// type (every [`MmqType`] but NVFP4, whose grouped launch is its own), K a whole number of the
-/// type's blocks (the `K-block` rule, before any other k rule), K's range, N, ld, the stream-k
+/// Checks every number rule of a grouped launch (`mmq_mmid.h`) in this order: the id shape, K a
+/// whole number of the type's blocks (the `K-block` rule, before any other k rule), K's range, N,
+/// ld, the stream-k
 /// grid limit bounded with J = 8, the stride (whole blocks, at least one matrix, an `int`), and
 /// the `int` weight and dst indexes. Each bound keeps every product below 2^56, so the sums
 /// cannot overflow.
 pub(crate) fn check_launch_shape(s: &MmidLaunchShape) -> Result<(), EngError> {
     check_ids_shape(&s.ids)?;
-    if MmqType::of(s.quant).is_none() {
-        let detail = format!("a grouped {:?} launch has no vendored case", s.quant);
-        return Err(rule("type", &detail));
-    }
-    let qk = s.quant.block_size();
+    let qk = s.ty.block_values();
     if !s.k.is_multiple_of(qk) {
         let detail = format!(
             "K is {}, not a multiple of {qk} (the {:?} block)",
-            s.k, s.quant
+            s.k, s.ty
         );
         return Err(rule("K-block", &detail));
     }
@@ -528,7 +526,7 @@ pub(crate) fn check_launch_shape(s: &MmidLaunchShape) -> Result<(), EngError> {
         let detail = format!("{tiles} tiles of {} blocks reach 2^30", s.row_blocks());
         return Err(rule("grid limit", &detail));
     }
-    let whole = s.stride_bytes.is_multiple_of(s.quant.block_bytes());
+    let whole = s.stride_bytes.is_multiple_of(s.ty.block_bytes());
     if !whole || s.stride_blocks() < s.n * s.row_blocks() || s.stride_blocks() > INT_MAX {
         let detail = format!("{} bytes is not a stride of whole matrices", s.stride_bytes);
         return Err(rule("stride", &detail));
@@ -578,15 +576,15 @@ fn hint_cols(ne: usize, experts: usize) -> i64 {
 fn mmid_geometry(s: &MmidLaunchShape) -> MmidGeometry {
     let mut g = fill_mmid_args(s);
     if let Some(hint) = cols_hint(s) {
-        g.ncols_opt = clamp_hint(hint, g.ncols_max, s.quant);
+        g.ncols_opt = clamp_hint(hint, g.ncols_max, s.ty);
     }
     g
 }
 
 /// The tile hint a grouped launch may use: the operator value, clamped to a width the vendored
 /// table of `quant` implements (Q4_K's as tiling), and never past the token count.
-fn clamp_hint(hint: i64, ncols_max: i64, quant: QuantType) -> i64 {
-    let widest = if quant == QuantType::Q4K {
+fn clamp_hint(hint: i64, ncols_max: i64, ty: MmqType) -> i64 {
+    let widest = if ty == MmqType::Q4K {
         GROUPED_TILE_MAX
     } else {
         TILE_MAX
@@ -635,7 +633,7 @@ pub(in crate::kernels::cuda) fn fill_mmid_args(s: &MmidLaunchShape) -> MmidGeome
     );
     MmidGeometry {
         // `check_launch_shape` refuses a type without a vendored case first; -1 has no arm.
-        type_x: MmqType::of(s.quant).map_or(-1, |ty| i64::from(ty.ggml())),
+        type_x: i64::from(s.ty.ggml()),
         ncols_x: wide(s.k),
         nrows_x: wide(s.n),
         ncols_dst: ne,
@@ -670,7 +668,7 @@ fn launch_claims<'a>(
         (
             "weight",
             &call.weight.base,
-            s.weight_blocks() * s.quant.block_bytes(),
+            s.weight_blocks() * s.ty.block_bytes(),
             16,
         ),
         ("y", &call.y, q8_1_bytes(s.k, ne)?, 16),
@@ -747,7 +745,7 @@ impl CudaContext {
             stream,
             MmqQuantizeScatterCall {
                 packing: call.packing,
-                ty: mmq_type_of(call.quant)?,
+                ty: call.ty,
                 k: call.k,
                 row_stride: call.row_stride,
                 m,
@@ -772,7 +770,7 @@ impl CudaContext {
             stream,
             MmqQuantizeCall {
                 packing: call.packing,
-                ty: mmq_type_of(call.quant)?,
+                ty: call.ty,
                 k: call.k,
                 row_stride: call.row_stride,
                 ncols: ids.shape.ne_get_rows(),
@@ -852,7 +850,7 @@ impl CudaContext {
         let ids = &call.ids.out;
         let shape = MmidLaunchShape {
             ids: call.shape,
-            quant: call.weight.quant,
+            ty: call.weight.ty,
             k: call.weight.k,
             n: call.weight.n,
             stride_bytes: call.weight.stride_bytes,

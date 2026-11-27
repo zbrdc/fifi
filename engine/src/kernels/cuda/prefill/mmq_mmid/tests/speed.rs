@@ -23,8 +23,8 @@ use crate::EngError;
 use crate::kernels::cuda::prefill::mmq_mmid::{
     MmidLaunchCall, MmidQuantCall, MmidShape, MmidWeight,
 };
+use crate::kernels::cuda::prefill::mmq_size::MmqType;
 use crate::kernels::cuda::prefill::mmq_size::{fixup_floats_max, q8_1_bytes};
-use crate::kernels::cuda::resident::matvec_q::QuantType;
 use crate::kernels::cuda::testkit;
 use crate::kernels::cuda::{CudaContext, DeviceBuffer};
 
@@ -64,7 +64,7 @@ fn quant_call<'b>(
 ) -> Result<MmidQuantCall<'b>, EngError> {
     Ok(MmidQuantCall {
         packing: crate::kernels::cuda::prefill::mmq_quant::MmqPacking::Vendor,
-        quant: QuantType::Q4K,
+        ty: MmqType::Q4K,
         k,
         row_stride: k,
         x: x.range(0, rows * k * 4)?,
@@ -148,7 +148,7 @@ fn time_m(ctx: &CudaContext, w: &Stacks, m: usize, iters: usize) -> Result<Timed
                     shape,
                     weight: MmidWeight {
                         base: stack.range(0, stack.bytes())?,
-                        quant: QuantType::Q4K,
+                        ty: MmqType::Q4K,
                         k,
                         n,
                         stride_bytes: n * (k / 256) * 144,
@@ -222,7 +222,7 @@ fn spot_nmse(
     for &slot in slots {
         let expert = experts[slot];
         let deq = dequantized(
-            QuantType::Q4K,
+            MmqType::Q4K,
             &blocks[expert * stride..(expert + 1) * stride],
         );
         let x = x_row(slot);
@@ -252,9 +252,9 @@ fn mmq_mmid_speed_rows_are_reported_unpaired() {
         (&[64], 1)
     };
     let blocks = (
-        expert_blocks(QuantType::Q4K, 256, 512, 2048, 0x5e1),
-        expert_blocks(QuantType::Q4K, 256, 512, 2048, 0x5e2),
-        expert_blocks(QuantType::Q4K, 256, 2048, 512, 0x5e3),
+        expert_blocks(MmqType::Q4K, 256, 512, 2048, 0x5e1),
+        expert_blocks(MmqType::Q4K, 256, 512, 2048, 0x5e2),
+        expert_blocks(MmqType::Q4K, 256, 2048, 512, 0x5e3),
     );
     let timed = speed_phase(&blocks, ms, iters).expect("the speed launches");
     for t in &timed {

@@ -23,7 +23,7 @@ use crate::EngError;
 use crate::kernels::cuda::CudaContext;
 use crate::kernels::cuda::prefill::mmq_mmid::MmidShape;
 use crate::kernels::cuda::prefill::mmq_mmid::set_hint_override;
-use crate::kernels::cuda::resident::matvec_q::QuantType;
+use crate::kernels::cuda::prefill::mmq_size::MmqType;
 use crate::kernels::cuda::testkit::{self, Rng};
 
 /// `rows` and `x` with token `t` moved to position `sigma[t]`.
@@ -144,11 +144,11 @@ fn mmq_mmid_pg1b_tiling_rows_survive_a_permutation_across_tiles_and_experts() {
         }
         rows.extend(row);
     }
-    let weights = expert_blocks(QuantType::Q4K, 256, n, k, 0x9b1c);
+    let weights = expert_blocks(MmqType::Q4K, 256, n, k, 0x9b1c);
     let x = normal_rows(shape.m, k, 0x9b1d);
     let spec = LaunchSpec {
         shape,
-        quant: QuantType::Q4K,
+        quant: MmqType::Q4K,
         k,
         n,
         ld: n,
@@ -174,7 +174,7 @@ fn mmq_mmid_pg1b_tiling_rows_survive_a_permutation_across_tiles_and_experts() {
     {
         gate_dst(&run.dst, (ne, n, n), name);
     }
-    let mode = launch_mode(QuantType::Q4K, n, &shape, facts);
+    let mode = launch_mode(MmqType::Q4K, n, &shape, facts);
     println!("PG1b tiling: {mode:?}");
     assert!(
         mode.tiling && !mode.fixup,
@@ -239,11 +239,11 @@ fn mmq_mmid_pg1b_stream_k_rows_survive_a_permutation_inside_a_tile() {
     let rows: Vec<i32> = (0..shape.m)
         .flat_map(|t| if t % 2 == 0 { [0, 1] } else { [1, 0] })
         .collect();
-    let weights = expert_blocks(QuantType::Q4K, n_experts, n, k, 0x5ca1);
+    let weights = expert_blocks(MmqType::Q4K, n_experts, n, k, 0x5ca1);
     let x = normal_rows(shape.m, k, 0x5ca2);
     let spec = LaunchSpec {
         shape,
-        quant: QuantType::Q4K,
+        quant: MmqType::Q4K,
         k,
         n,
         ld: n,
@@ -272,7 +272,7 @@ fn mmq_mmid_pg1b_stream_k_rows_survive_a_permutation_inside_a_tile() {
     ] {
         gate_dst(&run.dst, (ne, n, n), name);
     }
-    let mode = launch_mode(QuantType::Q4K, n, &shape, facts);
+    let mode = launch_mode(MmqType::Q4K, n, &shape, facts);
     println!("PG1b stream-k: {mode:?}");
     assert!(
         !mode.tiling && mode.fixup && mode.j == 80,

@@ -399,17 +399,12 @@ fn the_launch_sizes_take_every_mmq_type_with_a_native_weight() {
             ..BASE
         };
         let needs = launch_needs(&g, 82);
-        match ty.quant() {
-            Some(quant) => {
-                let blocks = (BASE.nchannels_x - 1) * BASE.stride_channel_x
-                    + (BASE.nrows_x - 1) * BASE.stride_row_x;
-                let row =
-                    k_read(usize::try_from(BASE.ncols_x).unwrap()).unwrap() / quant.block_size();
-                let x = (usize::try_from(blocks).unwrap() + row) * quant.block_bytes();
-                assert_eq!(needs.map(|n| n[X]), Some(x), "{ty:?}");
-            }
-            None => assert!(needs.is_none(), "{ty:?}"),
-        }
+        // NVFP4 has no `QuantType`; its block shape is the type's own.
+        let blocks =
+            (BASE.nchannels_x - 1) * BASE.stride_channel_x + (BASE.nrows_x - 1) * BASE.stride_row_x;
+        let row = k_read(usize::try_from(BASE.ncols_x).unwrap()).unwrap() / ty.block_values();
+        let x = (usize::try_from(blocks).unwrap() + row) * ty.block_bytes();
+        assert_eq!(needs.map(|n| n[X]), Some(x), "{ty:?}");
     }
     let unknown = MmidGeometry { type_x: -1, ..BASE };
     assert!(launch_needs(&unknown, 82).is_none());

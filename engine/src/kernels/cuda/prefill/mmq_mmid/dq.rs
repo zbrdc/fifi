@@ -26,7 +26,7 @@ use crate::kernels::cuda::resident::matvec_q::QuantType;
 ///   row `t * top_k + r` receives pick `r` of token `t`, like the vendored launch's `dst`.
 pub(crate) struct DqMmidCall<'b, 'i> {
     pub(crate) shape: MmidShape,
-    pub(crate) weight: MmidWeight<'b>,
+    pub(crate) weight: MmidWeight<'b, QuantType>,
     pub(crate) ids: &'i MmidIds<'b>,
     pub(crate) x: DeviceRange<'b>,
     pub(crate) x_row_stride: usize,
@@ -41,7 +41,7 @@ pub(crate) struct DqMmidCall<'b, 'i> {
 /// Replace only selected expert-major rows. `metadata` holds the plan's IDs followed by
 /// its bounds, enqueued earlier on the same stream as part of a checked arena upload.
 pub(crate) struct SparseDqCall<'b, 'p> {
-    pub(crate) weight: MmidWeight<'b>,
+    pub(crate) weight: MmidWeight<'b, QuantType>,
     pub(crate) plan: &'p GroupedDqRows,
     pub(crate) metadata: DeviceRange<'b>,
     pub(crate) x: DeviceRange<'b>,
@@ -49,7 +49,7 @@ pub(crate) struct SparseDqCall<'b, 'p> {
 }
 
 struct DqLaunch<'b> {
-    weight: MmidWeight<'b>,
+    weight: MmidWeight<'b, QuantType>,
     ids_dst: DeviceRange<'b>,
     expert_bounds: DeviceRange<'b>,
     x: DeviceRange<'b>,
@@ -136,7 +136,7 @@ impl CudaContext {
     fn launch_grouped_dq(&self, stream: &DeviceStream, call: DqLaunch<'_>) -> Result<(), EngError> {
         self.ensure_usable()?;
         let weight = &call.weight;
-        let ty = weight.quant;
+        let ty = weight.ty;
         if !gemm_dq_mmid_type(ty) {
             return Err(rule(
                 "type",

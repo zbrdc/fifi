@@ -903,7 +903,7 @@ fn sparse_grouped_dq_writes_only_selected_expert_major_rows() {
                 SparseDqCall {
                     weight: MmidWeight {
                         base: w.range(0, packed.len())?,
-                        quant: QuantType::Q20,
+                        ty: QuantType::Q20,
                         k: 64,
                         n: 4,
                         stride_bytes: 4 * 18,
@@ -1045,7 +1045,7 @@ fn mmid_ids_from_host_refuses_before_any_device_write() {
 fn qwen_gate(m: usize) -> MmidLaunchShape {
     MmidLaunchShape {
         ids: qwen(m),
-        quant: QuantType::Q4K,
+        ty: MmqType::Q4K,
         k: 2048,
         n: 512,
         stride_bytes: 512 * 8 * 144,
@@ -1103,7 +1103,7 @@ fn fill_mmid_args_pins_every_field_of_the_grouped_form() {
             m: 64,
             top_k: 8,
         },
-        quant: QuantType::Q6K,
+        ty: MmqType::Q6K,
         k: 512,
         n: 2048,
         stride_bytes: 4800 * 210,
@@ -1129,7 +1129,7 @@ fn fill_mmid_args_pins_every_field_of_the_grouped_form() {
             m: 64,
             top_k: 8,
         },
-        quant: QuantType::Iq4Nl,
+        ty: MmqType::Iq4Nl,
         k: 1_152,
         n: 2304,
         stride_bytes: 2304 * 36 * 18,
@@ -1139,10 +1139,7 @@ fn fill_mmid_args_pins_every_field_of_the_grouped_form() {
     assert_eq!(fill_mmid_args(&inkling).type_x, 20);
     // Every type with a case fills its own id.
     for ty in MmqType::ALL {
-        let Some(quant) = ty.quant() else {
-            continue;
-        };
-        let shape = MmidLaunchShape { quant, ..inkling };
+        let shape = MmidLaunchShape { ty, ..inkling };
         assert_eq!(
             fill_mmid_args(&shape).type_x,
             i64::from(ty.ggml()),
@@ -1166,7 +1163,7 @@ fn check_launch_shape_refuses_every_number_rule() {
             m: 2048,
             top_k: 8,
         },
-        quant: QuantType::Q4K,
+        ty: MmqType::Q4K,
         k: 32_768,
         n: 32_768,
         stride_bytes: 32_768 * 128 * 144,
@@ -1180,7 +1177,7 @@ fn check_launch_shape_refuses_every_number_rule() {
             m: 2048,
             top_k: 1,
         },
-        quant: QuantType::Q4K,
+        ty: MmqType::Q4K,
         k: 256,
         n: 700_032,
         stride_bytes: 700_032 * 144,
@@ -1195,7 +1192,7 @@ fn check_launch_shape_refuses_every_number_rule() {
             m: 2048,
             top_k: 1,
         },
-        quant: QuantType::Q4K,
+        ty: MmqType::Q4K,
         k: 256,
         n: 128 * row_tiles,
         stride_bytes: 128 * row_tiles * 144,
@@ -1204,13 +1201,9 @@ fn check_launch_shape_refuses_every_number_rule() {
     let int_max = 0x7fff_ffff_usize;
     let rows: Vec<(&str, MmidLaunchShape)> = vec![
         ("m", with(&|s| s.ids.m = 0)),
-        ("type", with(&|s| s.quant = QuantType::Iq1M)),
         ("K-block", with(&|s| s.k = 384)),
-        ("K-block", with(&|s| (s.quant, s.k) = (QuantType::Q6K, 384))),
-        (
-            "K-block",
-            with(&|s| (s.quant, s.k) = (QuantType::Iq4Nl, 1_160)),
-        ),
+        ("K-block", with(&|s| (s.ty, s.k) = (MmqType::Q6K, 384))),
+        ("K-block", with(&|s| (s.ty, s.k) = (MmqType::Iq4Nl, 1_160))),
         ("K", with(&|s| s.k = 0)),
         ("K", with(&|s| s.k = 32_768 + 256)),
         ("N", with(&|s| s.n = 0)),
@@ -1268,7 +1261,7 @@ type LaunchPhase = (Vec<(&'static str, &'static str)>, Vec<Planned>, Planned);
 fn small_launch() -> MmidLaunchShape {
     MmidLaunchShape {
         ids: small(),
-        quant: QuantType::Q4K,
+        ty: MmqType::Q4K,
         k: 256,
         n: 128,
         stride_bytes: 128 * 144,
@@ -1311,7 +1304,7 @@ fn plan_launch(
         shape: launch.ids,
         weight: MmidWeight {
             base: r(0)?,
-            quant: launch.quant,
+            ty: launch.ty,
             k: launch.k,
             n: launch.n,
             stride_bytes: launch.stride_bytes,
@@ -1400,16 +1393,16 @@ fn the_grouped_tile_hint_is_clamped_to_a_tiling_width() {
     assert_eq!(hint_cols(1024, 256), 4);
     // The clamp keeps a Q4_K launch off the stream-k configs, which start above 64; the other
     // types reach the widest tile.
-    let q4k = QuantType::Q4K;
+    let q4k = MmqType::Q4K;
     assert_eq!(clamp_hint(4, 128, q4k), 4);
     assert_eq!(clamp_hint(80, 128, q4k), GROUPED_TILE_MAX);
-    assert_eq!(clamp_hint(80, 128, QuantType::Iq4Nl), 80);
-    assert_eq!(clamp_hint(200, 512, QuantType::Iq4Nl), 128);
+    assert_eq!(clamp_hint(80, 128, MmqType::Iq4Nl), 80);
+    assert_eq!(clamp_hint(200, 512, MmqType::Iq4Nl), 128);
     assert_eq!(clamp_hint(1, 128, q4k), 1);
     assert_eq!(clamp_hint(0, 128, q4k), 1);
     // Never past the token count, and never below one column.
     assert_eq!(clamp_hint(64, 32, q4k), 32);
-    assert_eq!(clamp_hint(i64::MAX, 1, QuantType::Q6K), 1);
+    assert_eq!(clamp_hint(i64::MAX, 1, MmqType::Q6K), 1);
     assert_eq!(hint_cols(0, 0), 1);
     assert_eq!(hint_cols(usize::MAX, 1), i64::MAX);
 }
@@ -1422,7 +1415,7 @@ fn the_tile_hint_reaches_every_type() {
             m: 128,
             top_k: 8,
         },
-        quant,
+        ty: MmqType::of(quant).expect("an mmq type"),
         k: 2048,
         n: 512,
         stride_bytes: 0,
@@ -1447,7 +1440,7 @@ fn extended_rows_match_split_launches_and_sampled_reference() {
     if !testkit::device_present("extended_rows_match_split_launches_and_sampled_reference") {
         return;
     }
-    for quant in [QuantType::Q4K, QuantType::Q6K] {
+    for quant in [MmqType::Q4K, MmqType::Q6K] {
         for m in [4095, 4096] {
             for gather in [false, true] {
                 let shape = MmidShape {

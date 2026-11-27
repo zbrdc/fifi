@@ -27,8 +27,8 @@ use crate::EngError;
 use crate::kernels::cuda::prefill::mmq_mmid::{
     MmidLaunchCall, MmidQuantCall, MmidShape, MmidWeight,
 };
+use crate::kernels::cuda::prefill::mmq_size::MmqType;
 use crate::kernels::cuda::prefill::mmq_size::{fixup_floats_max, q8_1_bytes};
-use crate::kernels::cuda::resident::matvec_q::QuantType;
 use crate::kernels::cuda::testkit;
 use crate::kernels::cuda::{CudaContext, DeviceBuffer, DeviceStream};
 
@@ -58,11 +58,11 @@ fn small_m_cases(m: usize) {
     let toy_rows: Vec<i32> = (0..m)
         .flat_map(|t| if t % 2 == 0 { [0, 1] } else { [1, 2] })
         .collect();
-    let toy_w = expert_blocks(QuantType::Q4K, 4, n, k, 0x5a1 + m as u64);
+    let toy_w = expert_blocks(MmqType::Q4K, 4, n, k, 0x5a1 + m as u64);
     let toy_x = normal_rows(m, k, 0x5a2 + m as u64);
     let toy_spec = LaunchSpec {
         shape: toy,
-        quant: QuantType::Q4K,
+        quant: MmqType::Q4K,
         k,
         n,
         ld,
@@ -78,13 +78,13 @@ fn small_m_cases(m: usize) {
     };
     let rows = skewed_rows(&bank, 12, 0x5b1 + m as u64);
     let ne = bank.ne_get_rows();
-    let gate_w = expert_blocks(QuantType::Q4K, 16, 512, 2048, 0x5b2 + m as u64);
-    let down_w = expert_blocks(QuantType::Q4K, 16, 2048, 512, 0x5b3 + m as u64);
+    let gate_w = expert_blocks(MmqType::Q4K, 16, 512, 2048, 0x5b2 + m as u64);
+    let down_w = expert_blocks(MmqType::Q4K, 16, 2048, 512, 0x5b3 + m as u64);
     let gate_x = normal_rows(m, 2048, 0x5b4 + m as u64);
     let down_x = normal_rows(ne, 512, 0x5b5 + m as u64);
     let gate = LaunchSpec {
         shape: bank,
-        quant: QuantType::Q4K,
+        quant: MmqType::Q4K,
         k: 2048,
         n: 512,
         ld: 1024,
@@ -94,7 +94,7 @@ fn small_m_cases(m: usize) {
     };
     let down = LaunchSpec {
         shape: bank,
-        quant: QuantType::Q4K,
+        quant: MmqType::Q4K,
         k: 512,
         n: 2048,
         ld: 2048,
@@ -141,7 +141,7 @@ fn small_m_cases(m: usize) {
         }
         let err = errors(
             &got.dst,
-            &reference(&dequantized(QuantType::Q4K, weights), spec),
+            &reference(&dequantized(MmqType::Q4K, weights), spec),
             (rows_n, spec.n, spec.ld),
         );
         println!(
@@ -228,7 +228,7 @@ fn quant_call<'b>(
 ) -> Result<MmidQuantCall<'b>, EngError> {
     Ok(MmidQuantCall {
         packing: crate::kernels::cuda::prefill::mmq_quant::MmqPacking::Vendor,
-        quant: QuantType::Q4K,
+        ty: MmqType::Q4K,
         k,
         row_stride: k,
         x: x.range(0, rows * k * 4)?,
@@ -338,7 +338,7 @@ fn measure(
                     shape,
                     weight: MmidWeight {
                         base: stack.range(0, stack.bytes())?,
-                        quant: QuantType::Q4K,
+                        ty: MmqType::Q4K,
                         k,
                         n,
                         stride_bytes: n * (k / 256) * 144,
@@ -381,9 +381,9 @@ fn mmq_mmid_small_m_pass_costs_are_reported_unpaired() {
     };
     let (kg, n_gate, kd, n_down) = dims;
     let blocks = (
-        expert_blocks(QuantType::Q4K, 256, n_gate, kg, 0x7d1),
-        expert_blocks(QuantType::Q4K, 256, n_gate, kg, 0x7d2),
-        expert_blocks(QuantType::Q4K, 256, n_down, kd, 0x7d3),
+        expert_blocks(MmqType::Q4K, 256, n_gate, kg, 0x7d1),
+        expert_blocks(MmqType::Q4K, 256, n_gate, kg, 0x7d2),
+        expert_blocks(MmqType::Q4K, 256, n_down, kd, 0x7d3),
     );
     let phase = || -> Result<Vec<Costs>, EngError> {
         let ctx = CudaContext::new()?;

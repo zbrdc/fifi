@@ -325,7 +325,7 @@ struct Projections<'a> {
     dtypes: [DenseDtype; 2],
     min_wmma_rows: [Option<usize>; 2],
     exact_tile: bool,
-    grouped_weights: [Option<MmidWeight<'a>>; 2],
+    grouped_weights: [Option<MmidWeight<'a, QuantType>>; 2],
     /// The stacks of the stages that run on the vendored grouped MMQ, over every slot.
     mmq_weights: [Option<MmidWeight<'a>>; 2],
     matrices: BTreeMap<ExpertId, [Matrix<'a>; 2]>,
@@ -758,13 +758,13 @@ impl GgufCuda {
                     whole.and_then(|stacks| mmq_weight(dtypes[stage], shapes[stage], stacks[stage]))
                 });
                 // A tensor-core stack also holds its tail, which is shorter than one expert.
-                let experts = |weights: &[Option<MmidWeight<'_>>; 2]| {
+                fn experts<T>(weights: &[Option<MmidWeight<'_, T>>; 2]) -> usize {
                     weights
                         .iter()
                         .flatten()
                         .next()
                         .map_or(0, |w| w.base.bytes() / w.stride_bytes)
-                };
+                }
                 (weights, experts(&weights), mmq, experts(&mmq))
             } else {
                 ([None, None], 0, [None, None], 0)
@@ -793,7 +793,7 @@ fn grouped_weight(
     dtype: DenseDtype,
     [n, k]: [usize; 2],
     base: DeviceRange<'_>,
-) -> Option<MmidWeight<'_>> {
+) -> Option<MmidWeight<'_, QuantType>> {
     let DenseDtype::PackedGguf(kind) = dtype else {
         return None;
     };
@@ -810,38 +810,42 @@ fn grouped_weight(
     }
     Some(MmidWeight {
         base,
-        quant,
+        ty: quant,
         k,
         n,
         stride_bytes,
     })
 }
 
-/// The stack of one stage on the vendored grouped MMQ: a type with a case, a row of whole
-/// blocks, and whole expert matrices followed by the zeroed tail (`base` is a
+/// The stack of one stage on the vendored grouped MMQ: a type with a case (NVFP4 included; its
+/// per-expert global scale is a slot scale, applied after the product like every other type's),
+/// a row of whole blocks, and whole expert matrices followed by the zeroed tail (`base` is a
 /// `ResidentExperts::mmq_layer` stack) that a row off the k grid reads into.
 fn mmq_weight(
     dtype: DenseDtype,
     [n, k]: [usize; 2],
     base: DeviceRange<'_>,
 ) -> Option<MmidWeight<'_>> {
-    let DenseDtype::PackedGguf(kind) = dtype else {
-        return None;
+    let ty = match dtype {
+        DenseDtype::PackedGguf(kind) => MmqType::of(QuantType::from_gguf(kind)?)?,
+        DenseDtype::GgufNvfp4 => MmqType::Nvfp4,
+        _ => return None,
     };
-    let quant = QuantType::from_gguf(kind).filter(|&quant| MmqType::of(quant).is_some())?;
-    if !k.is_multiple_of(quant.block_size())
-        || weight_tail(quant, k).is_none_or(|tail| tail > WEIGHT_TAIL_BYTES)
+    if !k.is_multiple_of(ty.block_values())
+        || weight_tail(ty, k).is_none_or(|tail| tail > WEIGHT_TAIL_BYTES)
     {
         return None;
     }
-    let stride_bytes = quant.weight_bytes(n, k)?;
+    let stride_bytes = (k / ty.block_values())
+        .checked_mul(ty.block_bytes())?
+        .checked_mul(n)?;
     let matrices = base.bytes().checked_sub(WEIGHT_TAIL_BYTES)?;
     if stride_bytes <= WEIGHT_TAIL_BYTES || !matrices.is_multiple_of(stride_bytes) {
         return None;
     }
     Some(MmidWeight {
         base,
-        quant,
+        ty,
         k,
         n,
         stride_bytes,
@@ -1435,7 +1439,7 @@ impl Scratch {
             &ids,
             MmidQuantCall {
                 packing: MmqPacking::Rounded,
-                quant: weight.quant,
+                ty: weight.ty,
                 k: weight.k,
                 row_stride: weight.k,
                 x: range(x_span)?,

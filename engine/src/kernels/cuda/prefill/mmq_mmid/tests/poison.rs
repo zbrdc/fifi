@@ -20,7 +20,7 @@ use super::{BAD_ROW, ROUTER_FAULT, random_rows};
 use crate::EngError;
 use crate::kernels::cuda::CudaContext;
 use crate::kernels::cuda::prefill::mmq_mmid::MmidShape;
-use crate::kernels::cuda::resident::matvec_q::QuantType;
+use crate::kernels::cuda::prefill::mmq_size::MmqType;
 use crate::kernels::cuda::testkit;
 
 /// The frozen NMSE bounds of the gate/up and down classes, as in `launch.rs`.
@@ -65,7 +65,7 @@ fn chain_phase(
     let (gate_buf, down_buf) = (ctx.upload(gate_w)?, ctx.upload(down_w)?);
     let gate_spec = LaunchSpec {
         shape,
-        quant: QuantType::Q4K,
+        quant: MmqType::Q4K,
         k: 512,
         n: 256,
         ld: 256,
@@ -77,7 +77,7 @@ fn chain_phase(
     let act: Vec<f32> = gate.dst[..shape.ne_get_rows() * 256].to_vec();
     let down_spec = LaunchSpec {
         shape,
-        quant: QuantType::Q4K,
+        quant: MmqType::Q4K,
         k: 256,
         n: 512,
         ld: 512,
@@ -104,8 +104,8 @@ fn run_chunk(name: &str, keep: impl Fn(bool) -> bool, want_word: i32) {
         rows[at * 8..(at + 1) * 8].copy_from_slice(&row);
         flagged.push((at, what));
     }
-    let gate_w = expert_blocks(QuantType::Q4K, 16, 256, 512, 0xa1);
-    let down_w = expert_blocks(QuantType::Q4K, 16, 512, 256, 0xa2);
+    let gate_w = expert_blocks(MmqType::Q4K, 16, 256, 512, 0xa1);
+    let down_w = expert_blocks(MmqType::Q4K, 16, 512, 256, 0xa2);
     let x = normal_rows(shape.m, 512, 0xa3);
     let chain = chain_phase(&rows, &x, (&gate_w, &down_w), shape).expect("the chain launches");
     let ne = shape.ne_get_rows();
@@ -130,7 +130,7 @@ fn run_chunk(name: &str, keep: impl Fn(bool) -> bool, want_word: i32) {
     // own gate output as its input (so the two quantization errors do not compound).
     let gate_spec = LaunchSpec {
         shape,
-        quant: QuantType::Q4K,
+        quant: MmqType::Q4K,
         k: 512,
         n: 256,
         ld: 256,
@@ -140,13 +140,13 @@ fn run_chunk(name: &str, keep: impl Fn(bool) -> bool, want_word: i32) {
     };
     let gate_err = errors(
         &chain.gate.dst,
-        &reference(&dequantized(QuantType::Q4K, &gate_w), &gate_spec),
+        &reference(&dequantized(MmqType::Q4K, &gate_w), &gate_spec),
         (ne, 256, 256),
     );
     let act = &chain.gate.dst[..ne * 256];
     let down_spec = LaunchSpec {
         shape,
-        quant: QuantType::Q4K,
+        quant: MmqType::Q4K,
         k: 256,
         n: 512,
         ld: 512,
@@ -156,7 +156,7 @@ fn run_chunk(name: &str, keep: impl Fn(bool) -> bool, want_word: i32) {
     };
     let down_err = errors(
         &chain.down.dst,
-        &reference(&dequantized(QuantType::Q4K, &down_w), &down_spec),
+        &reference(&dequantized(MmqType::Q4K, &down_w), &down_spec),
         (ne, 512, 512),
     );
     println!(

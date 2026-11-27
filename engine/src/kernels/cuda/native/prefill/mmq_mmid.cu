@@ -135,8 +135,26 @@ bool valid_build(const inference_cuda_mmq_build_ids_args *a) {
     return true;
 }
 
+/* The block shape of a grouped weight type: the shared list, and NVFP4, which the grouped entry
+ * serves with no y_scale (its products carry no column factor below Blackwell, and the routed
+ * expert scale is applied by the caller). {0, 0} for a type with no case. */
+MmqBlockShape grouped_shape(int64_t type) {
+    if (type == GGML_TYPE_NVFP4) {
+        return {(int)ggml_cuda_type_traits<GGML_TYPE_NVFP4>::qk, (int)sizeof(block_nvfp4)};
+    }
+    return mmq_block_shape((int)type);
+}
+
+/* The vendored launch of a grouped weight type, over the same cases as grouped_shape. */
+cudaError_t grouped_launch(const mmq_args &args, cudaStream_t stream) {
+    if (args.type_x == GGML_TYPE_NVFP4) {
+        return mul_mat_q_case<GGML_TYPE_NVFP4>(args, stream);
+    }
+    return mmq_launch_case(args, stream);
+}
+
 /* Values per weight block of a grouped weight type, 0 for a type with no case. */
-int64_t block_values(int64_t type) { return mmq_block_shape((int)type).values; }
+int64_t block_values(int64_t type) { return grouped_shape(type).values; }
 
 /* The k values the GEMM reads of each row: K rounded up to its k tile (MMQ_ITER_K, read with no
  * k clamp); the q8_1 columns hold zeros from K on. */
@@ -190,7 +208,7 @@ struct Extent {
 /* Capacities, alignment and disjointness, after valid_limits. Extents: x, y, ids_dst,
  * expert_bounds, dst, fixup; dst is apart from all others, fixup from the first four. */
 bool valid_ranges(const inference_cuda_mmq_mmid_args *a, int nsm) {
-    const MmqBlockShape shape = mmq_block_shape((int)a->type_x);
+    const MmqBlockShape shape = grouped_shape(a->type_x);
     const int64_t ne = a->ncols_dst;
     const int64_t blocks = weight_blocks(a);
     const Extent r[6] = {
@@ -222,7 +240,7 @@ mmq_args to_mmq_args(const inference_cuda_mmq_mmid_args *a, const fifi_device_fa
     m.ids_dst = a->ids_dst;
     m.expert_bounds = a->expert_bounds;
     m.dst = a->dst;
-    m.y_scale = nullptr; /* NVFP4 only */
+    m.y_scale = nullptr; /* no column factor: grouped_shape */
     m.ncols_x = a->ncols_x;
     m.nrows_x = a->nrows_x;
     m.ncols_dst = a->ncols_dst;
@@ -319,7 +337,7 @@ extern "C" int inference_cuda_mmq_mmid_launch(const inference_cuda_mmq_mmid_args
         const mmq_args args = to_mmq_args(a, facts);
         const cudaStream_t s = (cudaStream_t)stream;
         Failure failure;
-        failure.record(mmq_launch_case(args, s), INFERENCE_CUDA_STAGE_LAUNCH);
+        failure.record(grouped_launch(args, s), INFERENCE_CUDA_STAGE_LAUNCH);
         report_stage(out_stage, failure.stage);
         return (int)failure.err;
     } catch (...) {

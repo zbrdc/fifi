@@ -15,10 +15,10 @@ use super::rig::{
 };
 use super::{as_i32, ints, random_rows, read};
 use crate::EngError;
-use crate::kernels::cuda::prefill::mmq_mmid::{MmidQuantCall, MmidShape, mmq_type_of};
+use crate::kernels::cuda::prefill::mmq_mmid::{MmidQuantCall, MmidShape};
 use crate::kernels::cuda::prefill::mmq_quant::MmqQuantizeCall;
+use crate::kernels::cuda::prefill::mmq_size::MmqType;
 use crate::kernels::cuda::prefill::mmq_size::{Q8_1_PAD, q8_1_bytes};
-use crate::kernels::cuda::resident::matvec_q::QuantType;
 use crate::kernels::cuda::testkit;
 use crate::kernels::cuda::{CudaContext, DeviceRange};
 
@@ -35,7 +35,7 @@ fn typed_phase(
     shape: MmidShape,
     rows: &[i32],
     x: &[f32],
-    (quant, k, gather): (QuantType, usize, bool),
+    (quant, k, gather): (MmqType, usize, bool),
 ) -> Result<TypedRun, EngError> {
     let ctx = CudaContext::new()?;
     let stream = ctx.stream()?;
@@ -46,7 +46,7 @@ fn typed_phase(
     let y_buf = ctx.upload(&vec![POISON; y_bytes])?;
     let call = MmidQuantCall {
         packing: crate::kernels::cuda::prefill::mmq_quant::MmqPacking::Vendor,
-        quant,
+        ty: quant,
         k,
         row_stride: k,
         x: x_buf.range(0, x.len() * 4)?,
@@ -66,7 +66,7 @@ fn typed_phase(
 }
 
 /// The plain quantize of `ncols` rows of `x`, the oracle of the typed wrappers.
-fn plain_phase(quant: QuantType, k: usize, x: &[f32]) -> Result<Vec<u8>, EngError> {
+fn plain_phase(quant: MmqType, k: usize, x: &[f32]) -> Result<Vec<u8>, EngError> {
     let ctx = CudaContext::new()?;
     let stream = ctx.stream()?;
     let ncols = x.len() / k;
@@ -77,7 +77,7 @@ fn plain_phase(quant: QuantType, k: usize, x: &[f32]) -> Result<Vec<u8>, EngErro
         &stream,
         MmqQuantizeCall {
             packing: crate::kernels::cuda::prefill::mmq_quant::MmqPacking::Vendor,
-            ty: mmq_type_of(quant).expect("an mmq type"),
+            ty: quant,
             k,
             row_stride: k,
             ncols,
@@ -92,7 +92,7 @@ fn plain_phase(quant: QuantType, k: usize, x: &[f32]) -> Result<Vec<u8>, EngErro
 
 /// The gates both tests share, in order: the maps hold values in `0..ne`, differ from each
 /// other, and the q8_1 scale words are finite where the data sits and still poison in the pad.
-fn gate_typed_run(run: &TypedRun, ne: usize, k: usize, quant: QuantType) {
+fn gate_typed_run(run: &TypedRun, ne: usize, k: usize, quant: MmqType) {
     let n = as_i32(ne);
     assert!(
         run.ids_dst[..ne].iter().all(|v| (0..n).contains(v)),
@@ -109,7 +109,7 @@ fn gate_typed_run(run: &TypedRun, ne: usize, k: usize, quant: QuantType) {
     );
     let blocks = ne * (k / 128);
     assert!(
-        scales_finite(&run.y, blocks, quant != QuantType::Q4K),
+        scales_finite(&run.y, blocks, quant != MmqType::Q4K),
         "HARD GATE: a q8_1 scale word is not finite (an unwritten block)"
     );
     let pad = &run.y[run.y.len() - Q8_1_PAD..];
@@ -127,7 +127,7 @@ fn mmq_quantize_scatter_ids_lays_the_token_rows_out_by_the_builder_map() {
     let (ne, k) = (shape.ne_get_rows(), 512);
     let rows = random_rows(&shape, 0x5ca7);
     let x = normal_rows(shape.m, k, 0x5ca8);
-    for quant in [QuantType::Q4K, QuantType::Q6K] {
+    for quant in [MmqType::Q4K, MmqType::Q6K] {
         let run = typed_phase(shape, &rows, &x, (quant, k, false)).expect("the typed scatter");
         gate_typed_run(&run, ne, k, quant);
         // Compact column c holds token `ids_dst[c] / top_k`'s row.
@@ -156,7 +156,7 @@ fn mmq_quantize_gather_ids_reads_the_rows_the_forward_map_names() {
     let (ne, k) = (shape.ne_get_rows(), 512);
     let rows = random_rows(&shape, 0x6a7e);
     let act = normal_rows(ne, k, 0x6a7f);
-    for quant in [QuantType::Q4K, QuantType::Q6K] {
+    for quant in [MmqType::Q4K, MmqType::Q6K] {
         let run = typed_phase(shape, &rows, &act, (quant, k, true)).expect("the typed gather");
         gate_typed_run(&run, ne, k, quant);
         // Column j holds row `ids_dst[j]` of the token-slot ordered activations.
@@ -180,7 +180,7 @@ fn mmq_quantize_gather_ids_reads_the_rows_the_forward_map_names() {
 fn q4k_call<'b>(k: usize, x: DeviceRange<'b>, y: DeviceRange<'b>) -> MmidQuantCall<'b> {
     MmidQuantCall {
         packing: crate::kernels::cuda::prefill::mmq_quant::MmqPacking::Vendor,
-        quant: QuantType::Q4K,
+        ty: MmqType::Q4K,
         k,
         row_stride: k,
         x,

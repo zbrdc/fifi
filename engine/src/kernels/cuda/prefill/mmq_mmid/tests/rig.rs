@@ -5,17 +5,16 @@
 
 use super::super::{
     IdsGuardCall, MmidIds, MmidIdsOut, MmidLaunchCall, MmidQuantCall, MmidShape, MmidWeight,
-    mmq_type_of,
 };
 use super::{CANARY, SENT, device_facts, host_guard, ints, le, read};
 use crate::EngError;
+use crate::kernels::cuda::prefill::mmq_size::MmqType;
 use crate::kernels::cuda::prefill::mmq_size::{
     Q8_1_BLOCK_BYTES, fixup_floats_max, ids_dst_ints, j_best, q8_1_bytes,
 };
-use crate::kernels::cuda::resident::matvec_q::QuantType;
 use crate::kernels::cuda::testkit::Rng;
 use crate::kernels::cuda::{CudaContext, DeviceBuffer, DeviceStream};
-use crate::weights::dequantize;
+use crate::weights::{GgufType, dequantize};
 
 /// The poison of an unwritten q8_1 byte: as a scale word it is NaN (f32 `0xFFFF_FFFF`, half
 /// `0xFFFF`), so the finiteness gate catches a skipped store before any comparison.
@@ -140,7 +139,7 @@ impl IdBufs {
 /// random bytes with the fp16 scale fields set, so every dequantized value is finite and of
 /// order one (Q4_K: d 2^-6, dmin 2^-7; Q6_K: d 2^-7, its scale bytes random i8).
 pub(super) fn expert_blocks(
-    quant: QuantType,
+    quant: MmqType,
     experts: usize,
     n: usize,
     k: usize,
@@ -148,12 +147,19 @@ pub(super) fn expert_blocks(
 ) -> Vec<u8> {
     let block = quant.block_bytes();
     let mut rng = Rng::new(seed);
-    let mut bytes: Vec<u8> = (0..experts * n * (k / quant.block_size()) * block)
+    let mut bytes: Vec<u8> = (0..experts * n * (k / quant.block_values()) * block)
         .map(|_| (rng.next_u64() >> 32) as u8)
         .collect();
     for chunk in bytes.chunks_exact_mut(block) {
         match quant {
-            QuantType::Q6K => chunk[208..210].copy_from_slice(&0x2000u16.to_le_bytes()),
+            MmqType::Q6K => chunk[208..210].copy_from_slice(&0x2000u16.to_le_bytes()),
+            // NVFP4: four UE4M3 sub-block scales from 0.5 to 1.875 (any E2M1 code is a
+            // value), so no block decodes to a NaN or an overflowing product.
+            MmqType::Nvfp4 => {
+                for scale in &mut chunk[..4] {
+                    *scale = 0x30 | (*scale & 0x0f);
+                }
+            }
             _ => {
                 chunk[0..2].copy_from_slice(&0x2400u16.to_le_bytes());
                 chunk[2..4].copy_from_slice(&0x2000u16.to_le_bytes());
@@ -164,8 +170,12 @@ pub(super) fn expert_blocks(
 }
 
 /// The weights of `blocks` as f32, by the host dequantizer of the checkpoint loader.
-pub(super) fn dequantized(quant: QuantType, blocks: &[u8]) -> Vec<f32> {
-    dequantize(quant.gguf(), blocks).expect("the test weights are whole blocks")
+pub(super) fn dequantized(quant: MmqType, blocks: &[u8]) -> Vec<f32> {
+    dequantize(
+        GgufType::from_id(quant.ggml() as u32).expect("a GGUF type"),
+        blocks,
+    )
+    .expect("the test weights are whole blocks")
 }
 
 /// One grouped GEMM of a test: the router rows, the activations, and the numbers of the launch.
@@ -173,7 +183,7 @@ pub(super) fn dequantized(quant: QuantType, blocks: &[u8]) -> Vec<f32> {
 /// `m * top_k` rows in token-slot order for the gather (the down input, `gather` true).
 pub(super) struct LaunchSpec<'a> {
     pub(super) shape: MmidShape,
-    pub(super) quant: QuantType,
+    pub(super) quant: MmqType,
     pub(super) k: usize,
     pub(super) n: usize,
     pub(super) ld: usize,
@@ -185,7 +195,7 @@ pub(super) struct LaunchSpec<'a> {
 impl LaunchSpec<'_> {
     /// The per-expert stride of the weights, in bytes.
     pub(super) fn stride_bytes(&self) -> usize {
-        self.n * (self.k / self.quant.block_size()) * self.quant.block_bytes()
+        self.n * (self.k / self.quant.block_values()) * self.quant.block_bytes()
     }
 }
 
@@ -215,7 +225,7 @@ pub(super) fn launch_once(
     let y_buf = ctx.upload(&vec![POISON; y_bytes])?;
     let call = MmidQuantCall {
         packing: crate::kernels::cuda::prefill::mmq_quant::MmqPacking::Vendor,
-        quant: spec.quant,
+        ty: spec.quant,
         k: spec.k,
         row_stride: spec.k,
         x: x_buf.range(0, spec.x.len() * 4)?,
@@ -236,7 +246,7 @@ pub(super) fn launch_once(
             shape,
             weight: MmidWeight {
                 base: weights.range(0, weights.bytes())?,
-                quant: spec.quant,
+                ty: spec.quant,
                 k: spec.k,
                 n: spec.n,
                 stride_bytes: spec.stride_bytes(),
@@ -400,21 +410,14 @@ pub(super) struct Mode {
 
 /// The mode of a launch of `shape` over `n` rows per expert; `facts` is `(cc, nsm, smpbo)`.
 pub(super) fn launch_mode(
-    quant: QuantType,
+    quant: MmqType,
     n: usize,
     shape: &MmidShape,
     facts: (i32, usize, usize),
 ) -> Mode {
     let (cc, nsm, smpbo) = facts;
     let fallback = !n.is_multiple_of(128);
-    let j = j_best(
-        mmq_type_of(quant).expect("an mmq type"),
-        fallback,
-        cc,
-        smpbo,
-        shape.m,
-    )
-    .expect("a tile width fits");
+    let j = j_best(quant, fallback, cc, smpbo, shape.m).expect("a tile width fits");
     let ntx = shape.m.div_ceil(j);
     let ntiles = ntx * n.div_ceil(128) * shape.n_experts;
     let waves = ntiles.div_ceil(nsm);
@@ -452,7 +455,7 @@ pub(super) fn stream_k_shape(
             m,
             top_k,
         };
-        let mode = launch_mode(QuantType::Q4K, n, &shape, facts);
+        let mode = launch_mode(MmqType::Q4K, n, &shape, facts);
         if mode.tiling || !mode.fixup || mode.ntx < 2 {
             return false;
         }
@@ -512,7 +515,7 @@ fn stream_k_shape_finds_a_shape_with_the_reach_boundary_on_every_fleet_card() {
             m: 130,
             top_k: 2,
         };
-        let mode = launch_mode(QuantType::Q4K, n, &shape, facts);
+        let mode = launch_mode(MmqType::Q4K, n, &shape, facts);
         assert!(
             !mode.tiling && mode.fixup && mode.ntx >= 2,
             "{name}: (e {e}, n {n}) -> {mode:?}"
@@ -547,7 +550,7 @@ fn launch_mode_matches_the_documented_rule_on_small_mid_and_large_sm_counts() {
             m: 130,
             top_k: 2,
         };
-        launch_mode(QuantType::Q4K, 128 * b, &shape, (860, nsm, 101_376))
+        launch_mode(MmqType::Q4K, 128 * b, &shape, (860, nsm, 101_376))
     };
     for (nsm, b, tiling, fixup) in [
         (8usize, 1usize, true, false),

@@ -16,8 +16,8 @@ use super::rig::{
 use crate::EngError;
 use crate::kernels::cuda::CudaContext;
 use crate::kernels::cuda::prefill::mmq_mmid::MmidShape;
+use crate::kernels::cuda::prefill::mmq_size::MmqType;
 use crate::kernels::cuda::prefill::mmq_size::{WEIGHT_TAIL_BYTES, weight_tail};
-use crate::kernels::cuda::resident::matvec_q::QuantType;
 use crate::kernels::cuda::testkit;
 
 /// The frozen NMSE bound of a Q4_K expert gate/up launch (Q8X class).
@@ -44,11 +44,11 @@ fn mmq_mmid_launch_matches_the_f64_reference_on_the_two_expert_toy() {
     };
     let (k, n, ld) = (512, 128, 136);
     let rows = [0, 1, 0, 1, 1, 0];
-    let weights = expert_blocks(QuantType::Q4K, 2, n, k, 0x70f);
+    let weights = expert_blocks(MmqType::Q4K, 2, n, k, 0x70f);
     let x = normal_rows(shape.m, k, 0x70e);
     let spec = LaunchSpec {
         shape,
-        quant: QuantType::Q4K,
+        quant: MmqType::Q4K,
         k,
         n,
         ld,
@@ -83,7 +83,7 @@ fn mmq_mmid_launch_matches_the_f64_reference_on_the_two_expert_toy() {
             .all(|(a, b)| a.to_bits() == b.to_bits()),
         "toy: two launches of the same inputs differ"
     );
-    let deq = dequantized(QuantType::Q4K, &weights);
+    let deq = dequantized(MmqType::Q4K, &weights);
     let want = reference(&deq, &spec);
     let err = errors(&got.dst, &want, (ne, n, ld));
     println!(
@@ -132,7 +132,7 @@ fn run_cases(weights: &[u8], specs: &[LaunchSpec<'_>]) -> Result<Vec<Launched>, 
 /// Gates, scores and prints every case of one Q8X class; returns the cases. `bound` None means the
 /// class is reported only (Q6_K).
 fn score(
-    quant: QuantType,
+    quant: MmqType,
     weights: &[u8],
     specs: &[(&str, LaunchSpec<'_>)],
     launched: &[Launched],
@@ -192,7 +192,7 @@ fn mmq_mmid_q8x_expert_gate_up_stays_within_the_frozen_bound() {
         top_k: 8,
     };
     let (k, n, ld) = (2048, 512, 1024);
-    let weights = expert_blocks(QuantType::Q4K, 16, n, k, 0x9a7e);
+    let weights = expert_blocks(MmqType::Q4K, 16, n, k, 0x9a7e);
     let (rows_a, rows_b) = (skewed_rows(&shape, 12, 0x51), skewed_rows(&shape, 12, 0x52));
     let (plain, heavy) = (
         normal_rows(shape.m, k, 0x53),
@@ -200,7 +200,7 @@ fn mmq_mmid_q8x_expert_gate_up_stays_within_the_frozen_bound() {
     );
     let spec = |rows, x| LaunchSpec {
         shape,
-        quant: QuantType::Q4K,
+        quant: MmqType::Q4K,
         k,
         n,
         ld,
@@ -214,7 +214,7 @@ fn mmq_mmid_q8x_expert_gate_up_stays_within_the_frozen_bound() {
     ];
     let launched = run_cases(&weights, &[spec(&rows_a, &plain), spec(&rows_b, &heavy)])
         .expect("the Q8X launches");
-    let cases = score(QuantType::Q4K, &weights, &specs, &launched);
+    let cases = score(MmqType::Q4K, &weights, &specs, &launched);
     assert_skewed(&cases, shape.m);
     for case in &cases {
         assert!(
@@ -239,13 +239,13 @@ fn mmq_mmid_q8x_expert_down_stays_within_the_frozen_bound() {
         top_k: 8,
     };
     let (k, n, ld) = (512, 2048, 2048);
-    let weights = expert_blocks(QuantType::Q4K, 16, n, k, 0xd0d0);
+    let weights = expert_blocks(MmqType::Q4K, 16, n, k, 0xd0d0);
     let (rows_a, rows_b) = (skewed_rows(&shape, 12, 0x61), skewed_rows(&shape, 12, 0x62));
     let ne = shape.ne_get_rows();
     let (plain, heavy) = (normal_rows(ne, k, 0x63), heavy_rows(ne, k, 0x64, 10.0));
     let spec = |rows, x| LaunchSpec {
         shape,
-        quant: QuantType::Q4K,
+        quant: MmqType::Q4K,
         k,
         n,
         ld,
@@ -259,7 +259,7 @@ fn mmq_mmid_q8x_expert_down_stays_within_the_frozen_bound() {
     ];
     let launched = run_cases(&weights, &[spec(&rows_a, &plain), spec(&rows_b, &heavy)])
         .expect("the Q8X launches");
-    let cases = score(QuantType::Q4K, &weights, &specs, &launched);
+    let cases = score(MmqType::Q4K, &weights, &specs, &launched);
     assert_skewed(&cases, shape.m);
     for case in &cases {
         assert!(
@@ -272,10 +272,10 @@ fn mmq_mmid_q8x_expert_down_stays_within_the_frozen_bound() {
 }
 
 /// Inkling's expert down rows hold 1,152 values, off the 256-value k tile: the last tile of a
-/// row reads four 32-value blocks past it, into the next row, and past the last row of the stack
-/// into its zeroed tail, while the q8_1 columns hold zeros there. The products stay within the
-/// frozen down bound for a 32-value type with each block size, and a weight range without the
-/// tail is refused before the launch.
+/// row reads 128 values past it, into the next row, and past the last row of the stack into its
+/// zeroed tail, while the q8_1 columns hold zeros there. The products stay within the frozen down
+/// bound for two 32-value types and NVFP4's 64-value blocks (Q4_K_XL's expert stacks), and a
+/// weight range without the tail is refused before the launch.
 #[test]
 fn mmq_mmid_expert_down_rows_off_the_k_tile_stay_within_the_frozen_bound() {
     if !testkit::device_present(
@@ -292,7 +292,7 @@ fn mmq_mmid_expert_down_rows_off_the_k_tile_stay_within_the_frozen_bound() {
     let ne = shape.ne_get_rows();
     let rows = skewed_rows(&shape, 6, 0x1152);
     let x = normal_rows(ne, k, 0x1153);
-    for quant in [QuantType::Iq4Nl, QuantType::Q80] {
+    for quant in [MmqType::Iq4Nl, MmqType::Q80, MmqType::Nvfp4] {
         let spec = || LaunchSpec {
             shape,
             quant,
@@ -346,15 +346,15 @@ fn mmq_mmid_q8x_q6k_expert_launches_report_their_error() {
     };
     let ne = shape.ne_get_rows();
     let rows = skewed_rows(&shape, 12, 0x71);
-    let gate_w = expert_blocks(QuantType::Q6K, 16, 512, 2048, 0x6a);
-    let down_w = expert_blocks(QuantType::Q6K, 16, 2048, 512, 0x6b);
+    let gate_w = expert_blocks(MmqType::Q6K, 16, 512, 2048, 0x6a);
+    let down_w = expert_blocks(MmqType::Q6K, 16, 2048, 512, 0x6b);
     let (x_gate, x_down) = (
         heavy_rows(shape.m, 2048, 0x72, 10.0),
         heavy_rows(ne, 512, 0x73, 10.0),
     );
     let gate = LaunchSpec {
         shape,
-        quant: QuantType::Q6K,
+        quant: MmqType::Q6K,
         k: 2048,
         n: 512,
         ld: 1024,
@@ -364,7 +364,7 @@ fn mmq_mmid_q8x_q6k_expert_launches_report_their_error() {
     };
     let down = LaunchSpec {
         shape,
-        quant: QuantType::Q6K,
+        quant: MmqType::Q6K,
         k: 512,
         n: 2048,
         ld: 2048,
@@ -375,13 +375,13 @@ fn mmq_mmid_q8x_q6k_expert_launches_report_their_error() {
     let first = run_cases(&gate_w, &[LaunchSpec { ..gate }]).expect("the Q6_K gate/up launch");
     let second = run_cases(&down_w, &[LaunchSpec { ..down }]).expect("the Q6_K down launch");
     let gate_cases = score(
-        QuantType::Q6K,
+        MmqType::Q6K,
         &gate_w,
         &[("Q6_K gate/up, outlier channels x10", gate)],
         &first,
     );
     let down_cases = score(
-        QuantType::Q6K,
+        MmqType::Q6K,
         &down_w,
         &[("Q6_K down, outlier channels x10", down)],
         &second,

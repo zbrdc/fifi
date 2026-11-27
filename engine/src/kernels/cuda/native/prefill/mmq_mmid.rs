@@ -317,11 +317,11 @@ pub(in crate::kernels::cuda) struct MmidLaunchRaw<'a> {
 /// dst, fixup, from the geometry by the rules of `mmq_mmid.h`.
 fn launch_needs(g: &MmidGeometry, nsm: c_int) -> Option<[usize; 6]> {
     let int = |value: i64| usize::try_from(value).ok();
-    // The block of the weight type: every [`MmqType`] with a native weight.
-    let quant = MmqType::ALL
+    // The block of the weight type: every [`MmqType`], NVFP4 included, which has no
+    // `QuantType` of its own.
+    let ty = MmqType::ALL
         .into_iter()
-        .find(|ty| i64::from(ty.ggml()) == g.type_x)
-        .and_then(MmqType::quant)?;
+        .find(|ty| i64::from(ty.ggml()) == g.type_x)?;
     let (n, e, ne, m) = (
         int(g.nrows_x)?,
         int(g.nchannels_x)?,
@@ -329,11 +329,11 @@ fn launch_needs(g: &MmidGeometry, nsm: c_int) -> Option<[usize; 6]> {
         int(g.ncols_max)?,
     );
     // The last row's last k tile reads to `k_read(k)`, past the stack's last row.
-    let last_row = k_read(int(g.ncols_x)?)? / quant.block_size();
+    let last_row = k_read(int(g.ncols_x)?)? / ty.block_values();
     let blocks = (e.checked_sub(1)?.checked_mul(int(g.stride_channel_x)?)?)
         .checked_add(n.checked_sub(1)?.checked_mul(int(g.stride_row_x)?)?)?
         .checked_add(last_row)?;
-    let block = quant.block_bytes();
+    let block = ty.block_bytes();
     let dst = (ne.checked_sub(1)?.checked_mul(int(g.nrows_dst)?)?).checked_add(n)?;
     Some([
         blocks.checked_mul(block)?,

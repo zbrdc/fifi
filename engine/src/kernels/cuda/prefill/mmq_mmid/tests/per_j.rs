@@ -11,7 +11,7 @@ use super::rig::{
 use crate::EngError;
 use crate::kernels::cuda::CudaContext;
 use crate::kernels::cuda::prefill::mmq_mmid::{MmidShape, set_hint_override};
-use crate::kernels::cuda::resident::matvec_q::QuantType;
+use crate::kernels::cuda::prefill::mmq_size::MmqType;
 use crate::kernels::cuda::testkit;
 
 /// The widths the vendored Q4_K tiling patch made tiling configs; every one must execute.
@@ -34,11 +34,11 @@ fn every_flipped_tile_width_executes_against_the_reference() {
     };
     let (k, n, ld) = (512usize, 128usize, 136usize);
     let rows: Vec<i32> = (0..shape.ne_get_rows()).map(|i| (i % 8) as i32).collect();
-    let weights = expert_blocks(QuantType::Q4K, 8, n, k, 0x9a01);
+    let weights = expert_blocks(MmqType::Q4K, 8, n, k, 0x9a01);
     let x = normal_rows(shape.m, k, 0x9a02);
     let spec = LaunchSpec {
         shape,
-        quant: QuantType::Q4K,
+        quant: MmqType::Q4K,
         k,
         n,
         ld,
@@ -46,7 +46,7 @@ fn every_flipped_tile_width_executes_against_the_reference() {
         x: &x,
         gather: false,
     };
-    let deq = dequantized(QuantType::Q4K, &weights);
+    let deq = dequantized(MmqType::Q4K, &weights);
     let want = reference(&deq, &spec);
     let ne = shape.ne_get_rows();
     let mut executed = Vec::new();
@@ -92,11 +92,11 @@ fn every_flipped_tile_width_keeps_a_permuted_token_bits() {
     let rows: Vec<i32> = (0..shape.m)
         .flat_map(|t| if t % 2 == 0 { [0, 1] } else { [1, 0] })
         .collect();
-    let weights = expert_blocks(QuantType::Q4K, 8, n, k, 0x9b01);
+    let weights = expert_blocks(MmqType::Q4K, 8, n, k, 0x9b01);
     let x = normal_rows(shape.m, k, 0x9b02);
     let spec = LaunchSpec {
         shape,
-        quant: QuantType::Q4K,
+        quant: MmqType::Q4K,
         k,
         n,
         ld: n,

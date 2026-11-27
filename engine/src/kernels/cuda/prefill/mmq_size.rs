@@ -51,10 +51,10 @@ pub(crate) fn k_read(k: usize) -> Option<usize> {
     k.checked_next_multiple_of(K_GRID)
 }
 
-/// The weight bytes past `k` that the last k tile of a row of `quant` reads (0 when `k` is on
+/// The weight bytes past `k` that the last k tile of a row of `ty` reads (0 when `k` is on
 /// the k grid); `None` when [`k_read`] overflows.
-pub(crate) fn weight_tail(quant: QuantType, k: usize) -> Option<usize> {
-    Some((k_read(k)? - k) / quant.block_size() * quant.block_bytes())
+pub(crate) fn weight_tail(ty: MmqType, k: usize) -> Option<usize> {
+    Some((k_read(k)? - k) / ty.block_values() * ty.block_bytes())
 }
 pub(crate) const Q8_1_BLOCK_BYTES: usize = 144;
 /// The PAD's rounding granularity, a deliberate over-bound: the y-tile copies' own loop steps
@@ -289,6 +289,12 @@ impl MmqType {
     /// Values per weight block (`ggml_cuda_type_traits<T>::qk`).
     pub(crate) fn block_values(self) -> usize {
         self.quant().map_or(64, QuantType::block_size)
+    }
+
+    /// Bytes per weight block (`sizeof` the vendored block): NVFP4 packs 64 values as four
+    /// E4M3 sub-block scales and 32 bytes of E2M1 pairs.
+    pub(crate) fn block_bytes(self) -> usize {
+        self.quant().map_or(36, QuantType::block_bytes)
     }
 
     pub(crate) fn q8_1_layout(self) -> Q8_1Layout {
