@@ -336,7 +336,8 @@ pub(super) fn command_new(runtime: &RawRuntime) -> Result<RawCommand, c_int> {
 }
 
 /// Encodes `repeats` dispatches of `kernel` back to back into the open command buffer, binds
-/// `bindings` and then `bytes` as the parameters, and ends the encoder.
+/// `bindings` and then `bytes` as the parameters, and ends the encoder. `grid` counts threads
+/// along each axis, `per_threadgroup` the threads of one threadgroup.
 pub(super) fn dispatch(
     command: &RawCommand,
     kernel: &RawKernel,

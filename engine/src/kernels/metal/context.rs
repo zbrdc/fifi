@@ -43,6 +43,9 @@ pub(crate) type Grid = [usize; 3];
 const FLAG_BYTES: usize = 4;
 /// The flag cleared: no weight marked.
 const FLAG_ZERO: [u8; 4] = [0; 4];
+/// The partials of the relative-attention step: a peak, a sum and 128 values for each of 64
+/// query heads over each of 64 splits, made at first use.
+pub(super) const PARTIALS_BYTES: usize = 64 * 64 * (2 + 128) * 4;
 /// The shader of the first read of the pages of a mapped file.
 const PAGE_TOUCH_SOURCE: &str = include_str!("native/page_touch.metal");
 const PAGE_TOUCH_KERNEL: &str = "page_touch";
@@ -65,6 +68,8 @@ pub(super) struct Shared {
     kernels: RefCell<HashMap<(&'static str, &'static str), Rc<RawKernel>>>,
     /// The non-finite weight flag of the dense matvec, made at first use.
     flag: RefCell<Option<RawBuffer>>,
+    /// The partials of the relative-attention step, made at first use.
+    partials: RefCell<Option<RawBuffer>>,
     /// The frame that carries the flag, while one does.
     flag_frame: Cell<Option<u64>>,
     /// The id of the next frame.
@@ -132,6 +137,7 @@ impl MetalContext {
             live_buffers: AtomicUsize::new(0),
             kernels: RefCell::new(HashMap::new()),
             flag: RefCell::new(None),
+            partials: RefCell::new(None),
             flag_frame: Cell::new(None),
             next_frame_id: Cell::new(0),
             in_flight: RefCell::new(Vec::new()),
@@ -431,6 +437,32 @@ impl Shared {
         body(flag)
     }
 
+    /// The partials of the relative-attention step, made at first use, for `body`.
+    fn with_partials<T>(
+        &self,
+        body: impl FnOnce(&RawBuffer) -> Result<T, EngError>,
+    ) -> Result<T, EngError> {
+        if self.partials.borrow().is_none() {
+            let raw = {
+                let _guard = DispatchGuard::enter(&TERMINAL);
+                native::buffer_new(&self.runtime, PARTIALS_BYTES)
+                    .map_err(|_| terminal_failure(ALLOCATE_OPERATION))?
+            };
+            self.note(&raw);
+            *self.partials.borrow_mut() = Some(raw);
+        }
+        let held = self.partials.borrow();
+        let partials = held
+            .as_ref()
+            .expect("the partials exist after the check above");
+        body(partials)
+    }
+
+    /// The partials' address, the last binding of a dispatch of the relative-attention step.
+    pub(super) fn partials_pointer(&self) -> Result<*mut c_void, EngError> {
+        self.with_partials(|partials| Ok(partials.pointer()))
+    }
+
     /// The id of a new frame of this context.
     pub(super) fn next_frame_id(&self) -> u64 {
         let id = self.next_frame_id.get();
@@ -497,6 +529,9 @@ impl Drop for Shared {
         let _guard = DispatchGuard::enter(&TERMINAL);
         if let Some(flag) = self.flag.get_mut().take() {
             native::release(flag.pointer());
+        }
+        if let Some(partials) = self.partials.get_mut().take() {
+            native::release(partials.pointer());
         }
         native::release(self.runtime.pointer());
     }
