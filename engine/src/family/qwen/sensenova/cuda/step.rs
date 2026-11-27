@@ -88,6 +88,8 @@ pub(crate) struct LoopStep<'a> {
     cache_rows: usize,
     /// The projections' route: the f32 decode matvec over f32 rows, or the matvec over q8_1.
     dq: bool,
+    /// The same choice for chunks of several rows.
+    exact_chunks: bool,
     /// GDN state and conv rings, one slot per trunk visit (an attention visit's slot is
     /// unused; direct visit indexing keeps the mapping arithmetic-free).
     state: State,
@@ -227,6 +229,7 @@ impl<'a> LoopStep<'a> {
             plan: plan.clone(),
             cache_rows,
             dq: decode_dq(),
+            exact_chunks: prefill::exact_gemm(),
             ctx,
             weights,
         };
@@ -308,6 +311,27 @@ impl<'a> LoopStep<'a> {
     #[cfg(test)]
     pub(crate) fn replayed(&self) -> bool {
         self.replay.recorded()
+    }
+
+    /// Puts every projection of this card on the decoding routes, or back on the quantized
+    /// ones: the anatomy test compares the routes from one carried state.
+    #[cfg(all(test, feature = "native-cuda"))]
+    pub(crate) fn set_exact(&mut self, on: bool) {
+        (self.dq, self.exact_chunks) = (on, on);
+        self.replay = Replay::default();
+    }
+
+    /// One chunk at `p0` with row 0 of every visit's mixer output and residual pushed to `trace`.
+    #[cfg(all(test, feature = "native-cuda"))]
+    pub(crate) fn chunk_traced(
+        &mut self,
+        embed_rows: &[f32],
+        p0: usize,
+        trace: &mut Vec<Vec<f32>>,
+    ) -> Result<(), EngError> {
+        let m = embed_rows.len() / self.shape.hidden;
+        self.replay = Replay::default();
+        self.walk(&le_f32(embed_rows), m, p0, Some(trace))
     }
 
     /// Queues the head on row `row` of the chunk just walked, on the decoding route when the

@@ -32,7 +32,7 @@ const ROW_ADD_MAX: usize = 4_194_304;
 /// (f32 activations, no q8_1 step): 4.8x slower than MMQ at 1024 rows (305 against 1490
 /// tok/s on the 3090), and the accuracy reference until an f16 tensor-core GEMM serves these
 /// blocks. Cached: every projection launch would otherwise take an env lock.
-fn exact_gemm() -> bool {
+pub(super) fn exact_gemm() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| std::env::var("FIFI_SENSENOVA_PREFILL_GEMM").is_ok_and(|v| v == "dq"))
 }
@@ -252,7 +252,7 @@ impl Model for LoopStep<'_> {
 
     /// Each row count has its own switch for the decoding routes.
     fn exact(&self, n: usize) -> bool {
-        if n == 1 { self.dq } else { exact_gemm() }
+        if n == 1 { self.dq } else { self.exact_chunks }
     }
 
     fn core(&self) -> &Core {

@@ -964,6 +964,70 @@ fn card_few_row_chunks_have_the_bits_of_one_row_steps() {
     }
 }
 
+/// Anatomy, not a gate: where the quantized routes leave the exact one inside a step. Four cards
+/// carry the same state (16 tokens on the decoding routes), then take position 16 four ways:
+/// one row exact (the reference), one row quantized, a 16-row chunk quantized (its row 0 is
+/// position 16), and the same chunk exact. Prints, per visit, the relative error of row 0 of the
+/// mixer output and of the residual against the reference.
+#[test]
+fn card_reports_where_the_quantized_routes_leave_the_exact_one() {
+    const PREFIX: usize = 16;
+    const CHUNK: usize = 16;
+    let Some((ctx, loaded, weights, mut projector)) = open_rig("sensenova route anatomy") else {
+        return;
+    };
+    let vocab = weights.shape().vocab as u32;
+    let ids: Vec<u32> = (1..=(PREFIX + CHUNK) as u32)
+        .map(|i| (i.wrapping_mul(2_654_435_761) >> 7) % vocab)
+        .collect();
+    let mut carried = |exact_after: bool, rows: usize| -> Vec<Vec<f32>> {
+        let mut card = open_card(&ctx, &loaded, &weights, PREFIX + CHUNK + 1);
+        card.set_exact(true);
+        for (pos, &token) in ids[..PREFIX].iter().enumerate() {
+            let row = projector.rows(weights.token_embd(), &[token]).unwrap();
+            card.prefill(&row, pos).unwrap();
+        }
+        card.stream().synchronize().unwrap();
+        card.set_exact(exact_after);
+        let embed = projector
+            .rows(weights.token_embd(), &ids[PREFIX..PREFIX + rows])
+            .unwrap();
+        let mut trace = Vec::new();
+        card.chunk_traced(&embed, PREFIX, &mut trace).unwrap();
+        trace
+    };
+    let reference = carried(true, 1);
+    let arms = [
+        ("one row, quantized", carried(false, 1)),
+        ("16 rows, quantized", carried(false, CHUNK)),
+        ("16 rows, exact", carried(true, CHUNK)),
+    ];
+    let norm = |v: &[f32]| v.iter().map(|x| f64::from(*x).powi(2)).sum::<f64>().sqrt();
+    let rel = |a: &[f32], b: &[f32]| {
+        let diff: Vec<f32> = a.iter().zip(b).map(|(x, y)| x - y).collect();
+        norm(&diff) / norm(b).max(1e-30)
+    };
+    eprintln!(
+        "visit  half      one-row-q   16-row-q   16-row-exact   (relative L2 error of row 0)"
+    );
+    for (i, want) in reference.iter().enumerate() {
+        let errors: Vec<f64> = arms.iter().map(|(_, t)| rel(&t[i], want)).collect();
+        let half = if i % 2 == 0 { "mixer" } else { "resid" };
+        eprintln!(
+            "{:>5}  {half}  {:>10.3e} {:>10.3e} {:>10.3e}",
+            i / 2,
+            errors[0],
+            errors[1],
+            errors[2]
+        );
+    }
+    assert_eq!(
+        reference.len(),
+        arms[1].1.len(),
+        "the traces have different lengths"
+    );
+}
+
 /// Accuracy probe, not a gate. Teacher-forces one stream of 240 tokens from position 0 in chunks
 /// of each row count of `SENSENOVA_K_ROWS` and writes the logits row of every position to
 /// `<SENSENOVA_ROWS_OUT>.k<rows>` as little-endian f32. The stream is `<that path>.ids`: when the
