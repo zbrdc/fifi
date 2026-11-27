@@ -44,8 +44,8 @@ const FLAG_BYTES: usize = 4;
 /// The flag cleared: no weight marked.
 const FLAG_ZERO: [u8; 4] = [0; 4];
 /// The partials of the relative-attention step: a peak, a sum and 128 values for each of 64
-/// query heads over each of 64 splits, made at first use.
-pub(super) const PARTIALS_BYTES: usize = 64 * 64 * (2 + 128) * 4;
+/// query heads over each of 512 strips, made at first use.
+pub(super) const PARTIALS_BYTES: usize = 64 * 512 * (2 + 128) * 4;
 /// The shader of the first read of the pages of a mapped file.
 const PAGE_TOUCH_SOURCE: &str = include_str!("native/page_touch.metal");
 const PAGE_TOUCH_KERNEL: &str = "page_touch";

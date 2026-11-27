@@ -36,10 +36,13 @@ const FINISH_KERNEL: &str = "relative_attention_finish";
 pub(crate) const HEAD_DIM: usize = 128;
 const MAX_HEADS: usize = 64;
 const MAX_WORD: usize = (1 << 30) - 1;
-/// The splits the partials are kept for; a step over fewer rows uses fewer.
-pub(crate) const MAX_SPLITS: usize = 64;
-/// The query heads one threadgroup serves; a wider group takes more threadgroups.
-const GROUPS: usize = 8;
+/// The strips the partials are kept for, sixteen rows each up to 8192 rows and longer at a
+/// larger ring; a step over fewer rows uses fewer.
+pub(crate) const MAX_SPLITS: usize = 512;
+/// The query heads one SIMD group scores for its K/V head; a wider group takes more of the grid.
+const SLICE_HEADS: usize = 3;
+/// The SIMD groups of a threadgroup, one a K/V head and a strip.
+const SIMDS: usize = 8;
 /// The lanes of a SIMD group, one a head's group.
 const LANES: usize = 32;
 /// The threads of the commit: one a column, for both planes.
@@ -214,10 +217,12 @@ impl Frame {
         let pointer = shared.partials_pointer()?;
         let bindings = plan.bindings(Binding { pointer, offset: 0 });
         let bytes = plan.params.bytes();
-        // The commit: one threadgroup a K/V head. The partials: one a split, a K/V head and up
-        // to `GROUPS` of the group's query heads. The finish: one a query head. The bridge's grid
-        // counts threads, so the first axis is a threadgroup's width times its threadgroups.
-        let groups = plan.group.min(GROUPS);
+        // The commit: one threadgroup a K/V head. The partials: a SIMD group a strip of a K/V
+        // head for up to `SLICE_HEADS` of its query heads, `SIMDS` of them a threadgroup. The
+        // finish: one a query head. The bridge's grid counts threads, so the first axis is a
+        // threadgroup's width times its threadgroups.
+        let simds = plan.kv_heads * MAX_SPLITS * plan.group.div_ceil(SLICE_HEADS);
+        let threads = LANES * SIMDS;
         self.encode(
             &commit,
             &bindings,
@@ -230,12 +235,8 @@ impl Frame {
             &partials,
             &bindings,
             &bytes,
-            [
-                MAX_SPLITS * LANES * groups,
-                plan.kv_heads,
-                plan.group.div_ceil(GROUPS),
-            ],
-            [LANES * groups, 1, 1],
+            [simds.div_ceil(SIMDS) * threads, 1, 1],
+            [threads, 1, 1],
             1,
         )?;
         self.encode(

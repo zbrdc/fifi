@@ -2,8 +2,9 @@
 //
 // The contract is the CUDA adapter's relative-attention step: twelve ranges in the ABI's order,
 // the first four written. The commit fills the current row's slot of both rings. The partials
-// score the ring's rows a K/V head at a time, the keys and values of a tile staged in threadgroup
-// memory for every query head of the group, and keep each split's peak, sum and weighted value.
+// score the ring's rows a strip at a time, one SIMD group a strip of a K/V head for up to three
+// of its query heads, each row's keys and values loaded once, and keep each strip's peak, sum
+// and weighted value.
 // The finish folds the partials against a peak that includes the sink and applies the gate. A
 // position below zero or at 2^30 marks the status bit and nothing else runs.
 
@@ -11,11 +12,11 @@
 using namespace metal;
 
 constant constexpr int kHeadDim = 128;
-constant constexpr int kLanes = 32;
-constant constexpr int kColumns = kHeadDim / kLanes;
 constant constexpr int kTile = 16;
-// The query heads one threadgroup serves at most; a wider group takes more threadgroups.
-constant constexpr int kGroups = 8;
+// The query heads one SIMD group scores for its K/V head; a wider group takes more of the grid.
+constant constexpr int kSlice = 3;
+// The SIMD groups of a threadgroup, one a K/V head and a strip; eight strips of a head in a row.
+constant constexpr int kSimds = 8;
 constant constexpr int kWordMax = (1 << 30) - 1;
 constant constexpr int kStatusInvalidStepState = 4;
 // The floats of one partial: the peak, the sum, then the weighted value of each column.
@@ -43,6 +44,13 @@ inline int ring_rows(int position, uint capacity) {
 inline int split_chunk(int count, uint max_splits) {
     const int spreads = (count + int(max_splits) - 1) / int(max_splits);
     return (spreads + kTile - 1) / kTile * kTile;
+}
+
+// Four columns at a lane's place, in scalars: a range may start at any multiple of four, and four
+// scalar loads measure the same as a packed one.
+inline float4 load4(const device float *row, uint lane) {
+    const size_t i = size_t(lane) * 4;
+    return float4(row[i], row[i + 1], row[i + 2], row[i + 3]);
 }
 
 // The current row goes into its slot of both rings: one threadgroup a K/V head, 256 threads.
@@ -76,9 +84,10 @@ kernel void relative_attention_commit(
     }
 }
 
-// One threadgroup serves one split of one K/V head for up to `kGroups` of its query heads, one
-// SIMD group a head; a wider group takes the grid's third axis. Every thread stages the split's
-// tiles; a head scores them from threadgroup memory, so the rows cross the memory once a group.
+// One SIMD group serves one strip of one K/V head for up to `kSlice` of its query heads; a wider
+// group takes more of the grid. It loads each row's keys and values once and scores its heads
+// from the same load. The grid counts threadgroups of `kSimds` SIMD groups: a K/V head's
+// strips in a row, then its next slice, then the next head.
 kernel void relative_attention_partials(
     constant Params &p [[buffer(13)]],
     const device float *keys [[buffer(1)]],
@@ -88,8 +97,7 @@ kernel void relative_attention_partials(
     const device float *table [[buffer(8)]],
     const device int *pos [[buffer(11)]],
     device float *part [[buffer(12)]],
-    uint3 gid [[threadgroup_position_in_grid]],
-    uint tid [[thread_index_in_threadgroup]],
+    uint gid [[threadgroup_position_in_grid]],
     uint lane [[thread_index_in_simdgroup]],
     uint simd [[simdgroup_index_in_threadgroup]])
 {
@@ -97,96 +105,85 @@ kernel void relative_attention_partials(
     if (position < 0 || position >= kWordMax) return;
     const int count = ring_rows(position, p.capacity);
     const int chunk = split_chunk(count, p.max_splits);
-    if (int(gid.x) >= (count + chunk - 1) / chunk) return;
+    const int strips = (count + chunk - 1) / chunk;
 
     const uint group = p.query_heads / p.kv_heads;
-    // The threadgroup's size, as the dispatch sets it: a SIMD group a head, at most kGroups.
-    const int threads = kLanes * min(int(group), kGroups);
-    const int kv_head = int(gid.y);
-    const int head = kv_head * int(group) + int(gid.z) * kGroups + int(simd);
-    const bool live = int(gid.z) * kGroups + int(simd) < int(group);
-    const int first = int(gid.x) * chunk;
+    const int slices = (int(group) + kSlice - 1) / kSlice;
+    const int index = int(gid) * kSimds + int(simd);
+    const int per_head = strips * slices;
+    if (index >= int(p.kv_heads) * per_head) return;
+    const int kv_head = index / per_head;
+    const int slice = (index % per_head) / strips;
+    const int strip = index % strips;
+    const int first = strip * chunk;
     const int last = min(count, first + chunk);
+    const int heads = min(int(group) - slice * kSlice, kSlice);
+    const int head0 = kv_head * int(group) + slice * kSlice;
     const int slot = position % int(p.capacity);
 
-    threadgroup float key_tile[kTile][kHeadDim];
-    threadgroup float value_tile[kTile][kHeadDim];
-
-    float query[kColumns] = {0.f, 0.f, 0.f, 0.f};
-    float acc[kColumns] = {0.f, 0.f, 0.f, 0.f};
-    float rel = 0.f;
-    float peak = -INFINITY;
-    float sum = 0.f;
-    if (live) {
-        for (int i = 0; i < kColumns; ++i) {
-            query[i] = q[size_t(head) * kHeadDim + lane + i * kLanes];
-        }
-        if (lane < p.relative_dims) {
-            rel = relative[size_t(head) * p.relative_dims + lane];
-        }
-    }
-
-    for (int base = first; base < last; base += kTile) {
-        const int rows = min(kTile, last - base);
-        // The last tile's reads are over before this tile's rows take their place.
-        threadgroup_barrier(mem_flags::mem_threadgroup);
-        for (int i = int(tid); i < rows * kHeadDim; i += threads) {
-            const int distance = base + (i >> 7);
-            // A modulo, then one addition: a distance of several capacities is the ring's.
-            int cell = (slot - distance) % int(p.capacity);
-            if (cell < 0) cell += int(p.capacity);
-            const size_t src = (size_t(cell) * p.kv_heads + uint(kv_head)) * kHeadDim + uint(i & (kHeadDim - 1));
-            key_tile[i >> 7][i & (kHeadDim - 1)] = keys[src];
-            value_tile[i >> 7][i & (kHeadDim - 1)] = values[src];
-        }
-        threadgroup_barrier(mem_flags::mem_threadgroup);
-        if (!live) continue;
-
-        // The tile's scores, the same in every lane of the head's group.
-        float scores[kTile];
-        float tile_peak = peak;
+    float4 query[kSlice], acc[kSlice];
+    float rel[kSlice], peak[kSlice], sum[kSlice];
  #pragma unroll
-        for (int j = 0; j < kTile; ++j) {
-            if (j >= rows) break;
-            float dot = 0.f;
-            for (int i = 0; i < kColumns; ++i) {
-                dot = fma(query[i], key_tile[j][lane + i * kLanes], dot);
-            }
-            float bias = 0.f;
-            const int distance = base + j;
-            if (distance < int(p.relative_extent)) {
-                const float term = lane < p.relative_dims
-                    ? rel * table[size_t(lane) * p.relative_extent + uint(distance)]
-                    : 0.f;
-                bias = simd_sum(term);
-            }
-            scores[j] = kScale * simd_sum(dot) + bias;
-            tile_peak = fmax(tile_peak, scores[j]);
-        }
-        // One rescaling a tile: the partial moves from its running peak to the tile's.
-        const float correction = exp(peak - tile_peak);
-        sum *= correction;
-        for (int i = 0; i < kColumns; ++i) acc[i] *= correction;
- #pragma unroll
-        for (int j = 0; j < kTile; ++j) {
-            if (j >= rows) break;
-            const float mass = exp(scores[j] - tile_peak);
-            sum += mass;
-            for (int i = 0; i < kColumns; ++i) {
-                acc[i] = fma(mass, value_tile[j][lane + i * kLanes], acc[i]);
+    for (int h = 0; h < kSlice; ++h) {
+        query[h] = 0.f;
+        acc[h] = 0.f;
+        rel[h] = 0.f;
+        peak[h] = -INFINITY;
+        sum[h] = 0.f;
+        if (h < heads) {
+            query[h] = load4(q + size_t(head0 + h) * kHeadDim, lane);
+            if (lane < p.relative_dims) {
+                rel[h] = relative[size_t(head0 + h) * p.relative_dims + lane];
             }
         }
-        peak = tile_peak;
     }
-    if (!live) return;
 
-    const size_t cell = (size_t(head) * p.max_splits + gid.x) * kPartial;
-    if (lane == 0) {
-        part[cell] = peak;
-        part[cell + 1] = sum;
+    for (int distance = first; distance < last; ++distance) {
+        // A modulo, then one addition: a distance of several capacities is the ring's.
+        int cell = (slot - distance) % int(p.capacity);
+        if (cell < 0) cell += int(p.capacity);
+        const size_t src = (size_t(cell) * p.kv_heads + uint(kv_head)) * kHeadDim;
+        const float4 key = load4(keys + src, lane);
+        const float4 value = load4(values + src, lane);
+        // The bias's column at this distance: zero beyond the extent, zero in a lane past the
+        // dimensions; the same in every head.
+        const bool biased = distance < int(p.relative_extent);
+        const float column = biased && lane < p.relative_dims
+            ? table[size_t(lane) * p.relative_extent + uint(distance)]
+            : 0.f;
+ #pragma unroll
+        for (int h = 0; h < kSlice; ++h) {
+            if (h >= heads) continue;
+            const float dot = simd_sum(query[h].x * key.x + query[h].y * key.y
+                                       + query[h].z * key.z + query[h].w * key.w);
+            const float bias = biased ? simd_sum(rel[h] * column) : 0.f;
+            const float score = kScale * dot + bias;
+            // One rescaling a row at the most, when a score raises the partial's peak.
+            if (score > peak[h]) {
+                const float correction = exp(peak[h] - score);
+                sum[h] *= correction;
+                acc[h] *= correction;
+                peak[h] = score;
+            }
+            const float mass = exp(score - peak[h]);
+            sum[h] += mass;
+            acc[h] = fma(mass, value, acc[h]);
+        }
     }
-    for (int i = 0; i < kColumns; ++i) {
-        part[cell + 2 + lane + i * kLanes] = acc[i];
+
+ #pragma unroll
+    for (int h = 0; h < kSlice; ++h) {
+        if (h >= heads) continue;
+        const size_t cell = (size_t(head0 + h) * p.max_splits + uint(strip)) * kPartial;
+        if (lane == 0) {
+            part[cell] = peak[h];
+            part[cell + 1] = sum[h];
+        }
+        // A lane's four components are the four columns after its own.
+        part[cell + 2 + lane * 4] = acc[h].x;
+        part[cell + 2 + lane * 4 + 1] = acc[h].y;
+        part[cell + 2 + lane * 4 + 2] = acc[h].z;
+        part[cell + 2 + lane * 4 + 3] = acc[h].w;
     }
 }
 

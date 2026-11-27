@@ -131,7 +131,8 @@ impl Case {
     }
 
     /// The f64 result of each output and its bound: `SLACK` times the first-order error of the
-    /// f32 step, one rounding a term a row, the score's 136 a row and a rescaling a tile.
+    /// f32 step, one rounding a term a row, the score's 136 a row and a rescaling a row at the
+    /// most.
     fn reference(&self) -> Vec<(f64, f64)> {
         let row = self.shape.kv_heads * HEAD_DIM;
         let count = self.count();
@@ -355,7 +356,7 @@ fn the_other_groups_match_the_f64_reference() {
     let mut rng = Rng::new(0x41_5C_2E_33);
     let shapes = [
         (shape(8, 2, 4, 64, 100), 99),
-        // Sixteen heads over one: two threadgroups on the grid's third axis.
+        // Sixteen heads over one: six slices of the grid.
         (shape(16, 1, 32, 7, 64), 63),
         (shape(5, 1, 1, 1, 3), 40),
         (shape(3, 3, 16, 1024, 2048), 2047),
