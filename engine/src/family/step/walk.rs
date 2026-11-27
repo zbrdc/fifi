@@ -104,6 +104,12 @@ pub(crate) trait Visits {
     fn count(&self) -> usize;
     /// Queued before the first visit of a chunk of `n` rows.
     fn begin(&self, n: usize) -> Result<(), EngError>;
+    /// Queued before the first half of visit `visit`, for a model whose state changes between
+    /// visits outside their halves (a repeated pass that restarts its streams). Device work only:
+    /// a recorded step replays it as recorded.
+    fn enter(&self, _visit: usize, _n: usize, _p0: usize) -> Result<(), EngError> {
+        Ok(())
+    }
     /// The residual read of a half: its input rows, normed.
     fn read(&self, visit: usize, half: Half, n: usize) -> Result<(), EngError>;
     /// The branch of a half over the rows the read left; `p0` is the position of row 0.
@@ -122,6 +128,7 @@ pub(crate) fn visits<V: Visits + ?Sized>(
 ) -> Result<(), EngError> {
     model.begin(n)?;
     for visit in 0..model.count() {
+        model.enter(visit, n, p0)?;
         for half in [Half::Mixer, Half::Forward] {
             model.read(visit, half, n)?;
             model.branch(visit, half, n, p0)?;

@@ -134,6 +134,11 @@ pub(crate) trait Model {
     fn begin(&self, _n: usize) -> Result<(), EngError> {
         Ok(())
     }
+    /// What visit `visit` of a chunk of `n` rows at `p0` needs before its first half (see
+    /// [`Visits::enter`]).
+    fn enter(&self, _visit: usize, _n: usize, _p0: usize) -> Result<(), EngError> {
+        Ok(())
+    }
     /// The widths of the delta-rule layers and the rows of the per-channel rule.
     fn delta(&self) -> (delta::Dims, Option<ChannelRows<'_>>);
     /// The widths, the rows and the place of an attention visit over `n` rows at `p0`.
@@ -198,6 +203,10 @@ impl<M: Model> Visits for Walk<'_, M> {
     fn begin(&self, n: usize) -> Result<(), EngError> {
         self.0.core().cur.set(0);
         self.0.begin(n)
+    }
+
+    fn enter(&self, visit: usize, n: usize, p0: usize) -> Result<(), EngError> {
+        self.0.enter(visit, n, p0)
     }
 
     /// A plain site reads the residual, and its feed-forward read adds the mixer rows in the
