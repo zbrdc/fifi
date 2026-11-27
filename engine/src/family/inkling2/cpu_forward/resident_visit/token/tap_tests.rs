@@ -48,7 +48,7 @@ fn real_effective_tap_kernel_preserves_dynamic_convolution() {
         };
         let (sw, c) = (upload(&w), upload(&coeff));
         let out = ctx.allocate(4 * width * WORD).unwrap();
-        ctx.inkling_effective_taps(
+        ctx.effective_taps(
             &stream,
             [
                 sw.range(0, sw.bytes()).unwrap(),

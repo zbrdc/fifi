@@ -8,7 +8,7 @@ use crate::family::inkling2::switches::Switch;
 use crate::{
     family::inkling2::cuda_projection::{DEVICE_HEADROOM, upload_tensor},
     family::step::conv::{self, Ring, Row as ConvRow, Variant},
-    kernels::cuda::resident::inkling_local_prep::{PrepMath, PrepShape},
+    kernels::cuda::resident::relative_prep::{PrepMath, PrepShape},
 };
 
 use std::borrow::Cow;
@@ -372,7 +372,7 @@ impl ResidentAttention {
             0,
             aux.buffer().range(aux.offset(), aux_uploaded)?,
         )?;
-        context.inkling_local_prep(stream, ranges, layout.prep, count, math)?;
+        context.relative_prep(stream, ranges, layout.prep, count, math)?;
         let attention_out = scratch.range(base + layout.attention_at, q.bytes())?;
         context.relative_attention(
             stream,
@@ -436,7 +436,7 @@ pub(in crate::family::inkling2) struct ResidentParts<'a> {
     pub hidden: usize,
 }
 
-/// Word offsets and sizes inside one slot's aux, the layout `inkling_local_prep` reads:
+/// Word offsets and sizes inside one slot's aux, the layout `relative_prep` reads:
 /// the position word (unused here), four weight rows, then the K and V histories, which
 /// the kernel shifts in place.
 #[derive(Clone, Copy)]
@@ -662,7 +662,7 @@ impl ResidentAttention {
         } else {
             [request.weights.key_kernel, request.weights.value_kernel]
         };
-        context.inkling_local_prep_direct(
+        context.relative_prep_direct(
             stream,
             [
                 qr,

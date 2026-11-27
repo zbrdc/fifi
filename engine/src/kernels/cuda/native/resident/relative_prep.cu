@@ -22,7 +22,7 @@ struct Args {
 
 // One block per head and plane. Use the host's reduction and tap order; these
 // short reductions run once per head, after parallel channel preparation.
-__global__ void inkling_local_prep(Args a) {
+__global__ void relative_prep(Args a) {
     __shared__ float squares[kWidth], scale;
     const int d = threadIdx.x;
     int head = blockIdx.x;
@@ -88,7 +88,7 @@ __global__ void inkling_local_prep(Args a) {
 }
 // Static output convolution. Raw projected rows are immutable and become the
 // next tile's history. Initial history is right-aligned, oldest first.
-__global__ void inkling_output_conv(const float *raw, const float *past, const float *weight,
+__global__ void short_conv_rows(const float *raw, const float *past, const float *weight,
                                     float *result, uint32_t *status, int rows, int width,
                                     int history, float scale) {
     const int channel = blockIdx.x * blockDim.x + threadIdx.x;
@@ -126,7 +126,7 @@ struct KvRowsArgs {
 // visit's raw history (right-aligned, oldest first) feed the causal convolution in the host's
 // tap order; K heads are then L2-clipped and V heads RMS-normalized with the host's sequential
 // sum. Rows write their own slots, so the raw rows are never overwritten.
-__global__ void inkling_kv_prep_rows(KvRowsArgs a) {
+__global__ void relative_prep_rows(KvRowsArgs a) {
     __shared__ float squares[kWidth], scale;
     const int d = threadIdx.x, row = blockIdx.y;
     const int heads = a.kv / kWidth;
@@ -173,7 +173,7 @@ __global__ void inkling_kv_prep_rows(KvRowsArgs a) {
 
 // `output = input * rms_scale(input) * gamma` of one row per block, the scale in the lane order
 // (`lane_sum.cuh`): the bits of the depth stream mix's fused norm of the same row.
-__global__ void inkling_weighted_norm(const float *input, const float *gamma,
+__global__ void weighted_norm_rows(const float *input, const float *gamma,
     float *output, float *status, int width, float eps) {
     __shared__ float scratch[kLaneWarps];
     const int row = blockIdx.x;
@@ -191,9 +191,9 @@ __global__ void inkling_weighted_norm(const float *input, const float *gamma,
 }
 } // namespace
 
-extern "C" int inference_cuda_inkling_weighted_norm(void *const *p, int rows, int width,
+extern "C" int inference_cuda_weighted_norm_rows(void *const *p, int rows, int width,
     float eps, void *stream, int *out_stage) {
-    inkling_weighted_norm<<<rows, kLaneThreads, 0, (cudaStream_t)stream>>>(
+    weighted_norm_rows<<<rows, kLaneThreads, 0, (cudaStream_t)stream>>>(
         static_cast<const float *>(p[0]), static_cast<const float *>(p[1]),
         static_cast<float *>(p[2]), static_cast<float *>(p[3]), width, eps);
     Failure failure;
@@ -202,10 +202,10 @@ extern "C" int inference_cuda_inkling_weighted_norm(void *const *p, int rows, in
     return (int)failure.err;
 }
 
-extern "C" int inference_cuda_inkling_output_conv(void *const *p, int rows, int width,
+extern "C" int inference_cuda_short_conv_rows(void *const *p, int rows, int width,
     int history, float scale, void *stream, int *out_stage) {
     constexpr int block = 128;
-    inkling_output_conv<<<dim3((width + block - 1) / block, rows), block, 0, (cudaStream_t)stream>>>(
+    short_conv_rows<<<dim3((width + block - 1) / block, rows), block, 0, (cudaStream_t)stream>>>(
         static_cast<const float *>(p[0]), static_cast<const float *>(p[1]),
         static_cast<const float *>(p[2]), static_cast<float *>(p[3]),
         static_cast<uint32_t *>(p[4]), rows, width, history, scale);
@@ -218,7 +218,7 @@ extern "C" int inference_cuda_inkling_output_conv(void *const *p, int rows, int 
 // p: raw rows, history, taps (K then V weights, then per-row coefficients when dynamic), out,
 // status. shape: rows, kv, history, dynamic, raw stride, raw K, raw V, out stride, out K, out V
 // (floats).
-extern "C" int inference_cuda_inkling_kv_prep_rows(void *const *p, const int *shape,
+extern "C" int inference_cuda_relative_prep_rows(void *const *p, const int *shape,
     float limit, float eps, void *stream, int *out_stage) {
     const float *taps = static_cast<const float *>(p[2]);
     KvRowsArgs args{static_cast<const float *>(p[0]), static_cast<const float *>(p[1]),
@@ -226,7 +226,7 @@ extern "C" int inference_cuda_inkling_kv_prep_rows(void *const *p, const int *sh
                     static_cast<float *>(p[3]), static_cast<uint32_t *>(p[4]),
                     shape[0], shape[1], shape[2], shape[3], shape[4], shape[5], shape[6],
                     shape[7], shape[8], shape[9], shape[10], shape[11], limit, eps};
-    inkling_kv_prep_rows<<<dim3(2 * (args.kv / kWidth), args.rows), kWidth, 0,
+    relative_prep_rows<<<dim3(2 * (args.kv / kWidth), args.rows), kWidth, 0,
                            (cudaStream_t)stream>>>(args);
     Failure failure;
     failure.record(cudaGetLastError(), INFERENCE_CUDA_STAGE_LAUNCH);
@@ -234,7 +234,7 @@ extern "C" int inference_cuda_inkling_kv_prep_rows(void *const *p, const int *sh
     return (int)failure.err;
 }
 
-extern "C" int inference_cuda_inkling_local_prep(void *const *p, int queries, int kv,
+extern "C" int inference_cuda_relative_prep(void *const *p, int queries, int kv,
     int dims, int history, float qk_limit, float rel_limit, float eps, void *stream,
     int *out_stage) {
     Args args{static_cast<float *>(p[0]), static_cast<float *>(p[1]),
@@ -246,7 +246,7 @@ extern "C" int inference_cuda_inkling_local_prep(void *const *p, int queries, in
               static_cast<float *>(p[12]), static_cast<float *>(p[13]),
               static_cast<uint32_t *>(p[14]),
               queries, kv, dims, history, qk_limit, rel_limit, eps};
-    inkling_local_prep<<<2 * (queries + kv), kWidth, 0, (cudaStream_t)stream>>>(args);
+    relative_prep<<<2 * (queries + kv), kWidth, 0, (cudaStream_t)stream>>>(args);
     Failure failure;
     failure.record(cudaGetLastError(), INFERENCE_CUDA_STAGE_LAUNCH);
     report_stage(out_stage, failure.stage);

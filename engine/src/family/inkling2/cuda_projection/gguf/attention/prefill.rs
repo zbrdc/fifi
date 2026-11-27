@@ -5,8 +5,8 @@ use crate::family::inkling2::switches::Switch;
 use crate::{
     family::inkling2::cuda_projection::{DEVICE_HEADROOM, q8_row_reuse},
     kernels::cuda::resident::{
-        inkling_local_prep::{KvPrepShape, OutputConvShape, PrepShape},
         relative_attention::{QUERY_TILE_LIMIT, RelativeAttentionTile},
+        relative_prep::{KvPrepShape, OutputConvShape, PrepShape},
     },
 };
 
@@ -625,7 +625,7 @@ impl ResidentAttention {
         status
             .buffer()
             .zero_at(&self.stream, status.offset(), health.len())?;
-        context.inkling_output_conv(
+        context.short_conv_rows(
             &self.stream,
             [destination.raw, past, weight, output, status],
             OutputConvShape {
@@ -948,7 +948,7 @@ impl ResidentAttention {
                     return Err(bad("CUDA K/V preparation rows are not evenly spaced"));
                 }
                 let past = 2 * 3 * kv_bytes;
-                context.inkling_kv_prep_rows(
+                context.relative_prep_rows(
                     &self.stream,
                     [
                         side.range,
@@ -1005,7 +1005,7 @@ impl ResidentAttention {
                 && let Some(conv) = dest.convolution
             {
                 let [past, weight, output] = conv.planes;
-                context.inkling_output_conv(
+                context.short_conv_rows(
                     &self.stream,
                     [
                         dest.raw,

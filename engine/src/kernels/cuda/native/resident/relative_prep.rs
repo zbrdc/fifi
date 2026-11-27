@@ -1,18 +1,18 @@
 use std::ffi::{c_int, c_void};
 
 use super::{DeviceFailure, RawRange, RawStream, STAGE_NONE, Span, checked, invalid_argument};
-use crate::kernels::cuda::resident::inkling_local_prep::{
+use crate::kernels::cuda::resident::relative_prep::{
     DepthShape, KvPrepShape, OutputConvShape, PrepMath, PrepShape,
 };
 
 unsafe extern "C" {
-    fn inference_cuda_inkling_effective_taps(
+    fn inference_cuda_effective_taps(
         ranges: *const *mut c_void,
         width: c_int,
         stream: *mut c_void,
         stage: *mut c_int,
     ) -> c_int;
-    fn inference_cuda_inkling_weighted_norm(
+    fn inference_cuda_weighted_norm_rows(
         ranges: *const *mut c_void,
         rows: c_int,
         width: c_int,
@@ -20,7 +20,7 @@ unsafe extern "C" {
         stream: *mut c_void,
         stage: *mut c_int,
     ) -> c_int;
-    fn inference_cuda_inkling_output_conv(
+    fn inference_cuda_short_conv_rows(
         ranges: *const *mut c_void,
         rows: c_int,
         width: c_int,
@@ -29,7 +29,7 @@ unsafe extern "C" {
         stream: *mut c_void,
         stage: *mut c_int,
     ) -> c_int;
-    fn inference_cuda_inkling_kv_prep_rows(
+    fn inference_cuda_relative_prep_rows(
         ranges: *const *mut c_void,
         shape: *const c_int,
         limit: f32,
@@ -37,7 +37,7 @@ unsafe extern "C" {
         stream: *mut c_void,
         stage: *mut c_int,
     ) -> c_int;
-    fn inference_cuda_inkling_local_prep(
+    fn inference_cuda_relative_prep(
         ranges: *const *mut c_void,
         queries: c_int,
         kv: c_int,
@@ -72,7 +72,7 @@ pub(in crate::kernels::cuda) fn weighted_norm(
     let mut stage = STAGE_NONE;
     // SAFETY: validated bounding geometry and disjoint, aligned regions.
     let status = unsafe {
-        inference_cuda_inkling_weighted_norm(
+        inference_cuda_weighted_norm_rows(
             pointers.as_ptr(),
             rows as c_int,
             width as c_int,
@@ -102,7 +102,7 @@ fn validate_f32_ranges<const N: usize>(
     Ok(())
 }
 
-pub(in crate::kernels::cuda) fn output_conv(
+pub(in crate::kernels::cuda) fn short_conv_rows(
     stream: &RawStream,
     ranges: [RawRange<'_>; 5],
     shape: OutputConvShape,
@@ -114,7 +114,7 @@ pub(in crate::kernels::cuda) fn output_conv(
     let mut stage = STAGE_NONE;
     // SAFETY: the spans are aligned, sized for this bounded geometry, and distinct.
     let status = unsafe {
-        inference_cuda_inkling_output_conv(
+        inference_cuda_short_conv_rows(
             pointers.as_ptr(),
             shape.rows as c_int,
             shape.width as c_int,
@@ -127,7 +127,7 @@ pub(in crate::kernels::cuda) fn output_conv(
     checked(status, stage)
 }
 
-pub(in crate::kernels::cuda) fn kv_prep_rows(
+pub(in crate::kernels::cuda) fn relative_prep_rows(
     stream: &RawStream,
     ranges: [RawRange<'_>; 5],
     shape: KvPrepShape,
@@ -141,7 +141,7 @@ pub(in crate::kernels::cuda) fn kv_prep_rows(
     // SAFETY: words() bounds every index the kernel forms for this geometry, and the five
     // spans are exact, aligned and distinct; both arrays outlive the call.
     let status = unsafe {
-        inference_cuda_inkling_kv_prep_rows(
+        inference_cuda_relative_prep_rows(
             pointers.as_ptr(),
             geometry.as_ptr(),
             shape.limit,
@@ -166,12 +166,7 @@ pub(in crate::kernels::cuda) fn effective_taps(
     let mut stage = STAGE_NONE;
     // SAFETY: lengths, alignment and disjointness were checked above; ptrs lives across the call.
     let status = unsafe {
-        inference_cuda_inkling_effective_taps(
-            ptrs.as_ptr(),
-            width as c_int,
-            stream.0.as_ptr(),
-            &mut stage,
-        )
+        inference_cuda_effective_taps(ptrs.as_ptr(), width as c_int, stream.0.as_ptr(), &mut stage)
     };
     checked(status, stage)
 }
@@ -199,7 +194,7 @@ pub(in crate::kernels::cuda) fn launch(
     // SAFETY: the host pointer array lives for the call, and the CUDA spans are
     // aligned, disjoint and large enough for every access by the queued kernel.
     let status = unsafe {
-        inference_cuda_inkling_local_prep(
+        inference_cuda_relative_prep(
             pointers.as_ptr(),
             shape.queries as c_int,
             shape.kv as c_int,

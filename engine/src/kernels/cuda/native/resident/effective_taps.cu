@@ -1,4 +1,4 @@
-// Materialize the global convolution as taps for FiFi's local prep. The host
+// Materialize the global convolution as taps for the relative prep. The host
 // computes (x + sum(w_l * x_l)) / 3 for the 4-tap dynamic case. Local prep
 // adds x and scales by 1/sqrt(5). Scale each global coefficient by sqrt(5)/3
 // and fold the difference in the residual coefficient into lag zero. This is
@@ -7,7 +7,7 @@
 #include "device.h"
 #include "abi.h"
 namespace {
-__global__ void inkling_effective_taps(const float *weights, const float *coeff,
+__global__ void effective_taps(const float *weights, const float *coeff,
                                        float *out, int width) {
     const int channel = blockIdx.x * blockDim.x + threadIdx.x;
     if (channel >= width) return;
@@ -19,9 +19,9 @@ __global__ void inkling_effective_taps(const float *weights, const float *coeff,
     }
 }
 }
-extern "C" int inference_cuda_inkling_effective_taps(void *const *p, int width,
+extern "C" int inference_cuda_effective_taps(void *const *p, int width,
     void *stream, int *out_stage) {
-    inkling_effective_taps<<<(width+127)/128,128,0,(cudaStream_t)stream>>>(
+    effective_taps<<<(width+127)/128,128,0,(cudaStream_t)stream>>>(
         (const float *)p[0],(const float *)p[1],(float *)p[2],width);
     Failure failure;
     failure.record(cudaGetLastError(), INFERENCE_CUDA_STAGE_LAUNCH);

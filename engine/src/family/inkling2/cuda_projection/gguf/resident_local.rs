@@ -20,7 +20,7 @@ use crate::{
     },
     kernels::cuda::{
         Claim, DeviceRange, DeviceStream, require_apart, require_fit,
-        resident::inkling_local_prep::PrepMath,
+        resident::relative_prep::PrepMath,
     },
 };
 

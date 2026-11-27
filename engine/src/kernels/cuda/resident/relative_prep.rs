@@ -1,4 +1,7 @@
-//! Prepare one local Inkling attention row before resident relative attention.
+//! Prepare the rows of a relative attention step: the query and relative-coefficient clips by
+//! head, the key and value short convolutions with their histories, the key clip and the value
+//! norm by head; and the row ops beside it (the weighted norm, the output convolution of many
+//! rows, the effective taps of a convolution with projected deltas).
 
 use std::mem::size_of;
 
@@ -42,7 +45,7 @@ impl PrepShape {
         ]
     }
 
-    /// The words of the fifteen ranges of [`CudaContext::inkling_local_prep_direct`]: the
+    /// The words of the fifteen ranges of [`CudaContext::relative_prep_direct`]: the
     /// eight rows of [`Self::words`], then the caller's `q_scale`, `rel_scale`, key and value
     /// conv kernels and the K and V conv histories (which the kernel shifts in place), then
     /// the status words.
@@ -235,7 +238,7 @@ fn validate_planes<const N: usize>(
         let bytes = words[i] * size_of::<f32>();
         if range.bytes() != bytes {
             return Err(EngError::BadRequest(format!(
-                "wrong CUDA Inkling {name} extent"
+                "wrong CUDA relative prep {name} extent"
             )));
         }
         require_fit(name, range, bytes, align_of::<f32>())?;
@@ -270,14 +273,14 @@ impl CudaContext {
         let [a, b, c, d] = ranges.each_ref().map(|r| self.raw_range(r));
         let raw = [a?, b?, c?, d?];
         self.launch_on(stream, |s| {
-            resident::inkling_local_prep::weighted_norm(s, raw, [1, width], eps)
+            resident::relative_prep::weighted_norm(s, raw, [1, width], eps)
         })
     }
 
     /// Apply ordered static taps on resident projected rows. The input plane is
     /// unchanged and its tail can seed the next tile or the first decode row.
     /// The caller initializes status, which the kernel only ORs into.
-    pub(crate) fn inkling_output_conv(
+    pub(crate) fn short_conv_rows(
         &self,
         stream: &DeviceStream,
         ranges: [DeviceRange<'_>; 5],
@@ -287,14 +290,14 @@ impl CudaContext {
         let [raw, past, weight, result, status] = ranges.each_ref().map(|r| self.raw_range(r));
         let ranges = [raw?, past?, weight?, result?, status?];
         self.launch_on(stream, |stream| {
-            resident::inkling_local_prep::output_conv(stream, ranges, shape)
+            resident::relative_prep::short_conv_rows(stream, ranges, shape)
         })
     }
 
     /// Convolve, clip and normalize the raw K and V of prompt rows, as the host prepares each
     /// row in turn. Ranges: raw rows, raw history, taps, output rows, status. The caller
     /// initializes status, which the kernel only ORs into.
-    pub(crate) fn inkling_kv_prep_rows(
+    pub(crate) fn relative_prep_rows(
         &self,
         stream: &DeviceStream,
         ranges: [DeviceRange<'_>; 5],
@@ -304,11 +307,11 @@ impl CudaContext {
         let [a, b, c, d, e] = ranges.each_ref().map(|r| self.raw_range(r));
         let ranges = [a?, b?, c?, d?, e?];
         self.launch_on(stream, |stream| {
-            resident::inkling_local_prep::kv_prep_rows(stream, ranges, shape)
+            resident::relative_prep::relative_prep_rows(stream, ranges, shape)
         })
     }
 
-    pub(crate) fn inkling_effective_taps(
+    pub(crate) fn effective_taps(
         &self,
         stream: &DeviceStream,
         ranges: [DeviceRange<'_>; 3],
@@ -317,11 +320,11 @@ impl CudaContext {
         let [a, b, c] = ranges.each_ref().map(|r| self.raw_range(r));
         let rows = [a?, b?, c?];
         self.launch_on(stream, |s| {
-            resident::inkling_local_prep::effective_taps(s, rows, width)
+            resident::relative_prep::effective_taps(s, rows, width)
         })
     }
 
-    pub(crate) fn inkling_local_prep(
+    pub(crate) fn relative_prep(
         &self,
         stream: &DeviceStream,
         ranges: [DeviceRange<'_>; 10],
@@ -331,7 +334,7 @@ impl CudaContext {
     ) -> Result<(), EngError> {
         let [a, b, c, d, e, f, g, h, aux, status] = ranges;
         let [qs, rs, kk, kv, pk, pv] = shape.split_aux(aux)?;
-        self.inkling_local_prep_direct(
+        self.relative_prep_direct(
             stream,
             [a, b, c, d, e, f, g, h, qs, rs, kk, kv, pk, pv, status],
             shape,
@@ -340,10 +343,10 @@ impl CudaContext {
         )
     }
 
-    /// [`Self::inkling_local_prep`] over the caller's own weight rows and K/V conv histories:
+    /// [`Self::relative_prep`] over the caller's own weight rows and K/V conv histories:
     /// nothing is staged. The kernel shifts the two history ranges in place (`history` rows
     /// of `kv * 128` words each, newest first).
-    pub(crate) fn inkling_local_prep_direct(
+    pub(crate) fn relative_prep_direct(
         &self,
         stream: &DeviceStream,
         ranges: [DeviceRange<'_>; 15],
@@ -356,7 +359,7 @@ impl CudaContext {
             ranges.each_ref().map(|range| self.raw_range(range));
         let ranges = [a?, b?, c?, d?, e?, f?, g?, h?, i?, j?, k?, l?, m?, n?, o?];
         self.launch_on(stream, |raw| {
-            resident::inkling_local_prep::launch(raw, ranges, shape, history, math)
+            resident::relative_prep::launch(raw, ranges, shape, history, math)
         })
     }
 }
@@ -375,7 +378,7 @@ mod tests {
 
     #[test]
     fn weighted_norm_matches_the_lane_order_bit_for_bit() {
-        if !device_present("Inkling CUDA weighted norm") {
+        if !device_present("CUDA weighted norm rows") {
             return;
         }
         let ctx = CudaContext::new().unwrap();
@@ -461,7 +464,7 @@ mod tests {
     /// strided raw rows into strided output rows, with the bits of the host's row-by-row order.
     #[test]
     fn kv_prep_rows_match_the_host_order_bit_for_bit() {
-        if !device_present("Inkling CUDA K/V preparation") {
+        if !device_present("CUDA relative prep rows") {
             return;
         }
         let ctx = CudaContext::new().unwrap();
@@ -505,7 +508,7 @@ mod tests {
                 let out_rows = ctx.allocate(words[3] * 4).unwrap();
                 let status = up(&vec![0.0; rows]);
                 let [r, h, w] = [&raw_rows, &past, &all_taps].map(|v| up(v));
-                ctx.inkling_kv_prep_rows(
+                ctx.relative_prep_rows(
                     &stream,
                     [
                         r.range(0, words[0] * 4).unwrap(),
@@ -590,7 +593,7 @@ mod tests {
     /// The static output convolution over rows with a history gives the host's bits.
     #[test]
     fn output_conv_matches_the_host_order_bit_for_bit() {
-        if !device_present("Inkling CUDA output convolution") {
+        if !device_present("CUDA short conv rows") {
             return;
         }
         let ctx = CudaContext::new().unwrap();
@@ -612,7 +615,7 @@ mod tests {
             let [r, h, w] = [&raw, &past, &weights].map(|v| up(v));
             let result = ctx.allocate(plane * 4).unwrap();
             let status = up(&vec![0.0; rows]);
-            ctx.inkling_output_conv(
+            ctx.short_conv_rows(
                 &stream,
                 [
                     r.range(0, plane * 4).unwrap(),

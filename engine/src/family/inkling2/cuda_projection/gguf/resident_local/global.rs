@@ -117,7 +117,7 @@ impl GgufCuda {
                     .into_iter()
                     .enumerate()
                 {
-                    self.context.inkling_effective_taps(
+                    self.context.effective_taps(
                         stream,
                         [static_w, coeff[plane], status.effective[plane]],
                         kv,

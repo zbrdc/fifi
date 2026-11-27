@@ -94,7 +94,7 @@ impl GgufCuda {
                         .into_iter()
                         .enumerate()
                     {
-                        self.context.inkling_effective_taps(
+                        self.context.effective_taps(
                             stream,
                             [w, coeff[i], health.effective[i]],
                             kv,

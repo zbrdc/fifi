@@ -12,7 +12,7 @@ use crate::EngError;
 #[cfg(all(feature = "native-cuda", target_os = "linux"))]
 use super::{cpu_weights::Weights, cuda_projection::gguf::attention};
 #[cfg(all(feature = "native-cuda", target_os = "linux"))]
-use crate::kernels::cuda::resident::inkling_local_prep::PrepShape;
+use crate::kernels::cuda::resident::relative_prep::PrepShape;
 
 pub(super) type AttentionProjection = [Vec<f32>; 8];
 
@@ -239,7 +239,7 @@ impl CpuForward {
         state: &'a VisitState,
         read_weights: &'a attention::LocalReadWeights<'a>,
     ) -> attention::LocalPrep<'a> {
-        use crate::kernels::cuda::resident::inkling_local_prep::PrepMath;
+        use crate::kernels::cuda::resident::relative_prep::PrepMath;
         debug_assert_eq!(self.math.sconv_kernel_size, PrepShape::TAPS);
         attention::LocalPrep {
             math: PrepMath {

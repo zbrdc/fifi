@@ -26,7 +26,7 @@ use crate::{
             depth_attention::{
                 AddCall, MAX_BLOCKS, MAX_MIX_JOBS, MixCall, MixJob, MixShape, SealCall, StreamShape,
             },
-            inkling_local_prep::PrepMath,
+            relative_prep::PrepMath,
         },
     },
 };

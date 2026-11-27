@@ -343,7 +343,7 @@ impl ResidentAttention {
 
     /// The taps of every local short convolution, fixed by the prep kernel.
     pub(super) fn local_taps(&self) -> usize {
-        crate::kernels::cuda::resident::inkling_local_prep::PrepShape::TAPS
+        crate::kernels::cuda::resident::relative_prep::PrepShape::TAPS
     }
 
     pub(super) fn projected_rows(&self) -> Option<usize> {
