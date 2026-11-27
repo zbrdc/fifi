@@ -248,12 +248,13 @@ __device__ void finish_heads(const Args &a, const Rows &r, const Partials (&p)[H
     }
 }
 
-// Block b serves the H query heads from b * H.
-template <int H>
+// Block b serves query head b. A decode step scores one row per head, so a block per head keeps
+// the grid as wide as the heads; grouping them (as the prompt tiles do) would leave most of the
+// device idle for the sake of K/V rows that the cache serves to the group's other blocks anyway.
 __global__ void relative_attention(Args a) {
-    __shared__ Partials p[H];
-    __shared__ float biases[H][kBiasRows];
-    const int pos = *a.pos, head = blockIdx.x * H, d = threadIdx.x;
+    __shared__ Partials p[1];
+    __shared__ float biases[1][kBiasRows];
+    const int pos = *a.pos, head = blockIdx.x, d = threadIdx.x;
     if (pos < 0 || pos >= kWordMax) {
         if (head == 0 && d == 0) atomicOr(a.status, INFERENCE_CUDA_STATUS_INVALID_STEP_STATE);
         return;
@@ -270,13 +271,12 @@ __global__ void relative_attention(Args a) {
     }
     const bool table = bias_table(a, r.count);
     if (table) {
-#pragma unroll
-        for (int h = 0; h < H; ++h) fill_biases(a, head + h, r.count, biases[h]);
+        fill_biases(a, head, r.count, biases[0]);
         __syncthreads();
     }
-    partial<H>(a, r, p, SerialKv{}, table ? biases : nullptr);
+    partial<1>(a, r, p, SerialKv{}, table ? biases : nullptr);
     __syncthreads();
-    finish_heads<H>(a, r, p);
+    finish(a, r, p[0]);
 }
 
 __device__ int row_stride(int stride, int width) { return stride == 0 ? width : stride; }
@@ -431,14 +431,7 @@ extern "C" int inference_cuda_relative_attention_launch(
         if (in == nullptr || stream == nullptr || !valid(*in)) return INFERENCE_CUDA_INVALID_ARGUMENT;
         Failure failure;
         const auto s = (cudaStream_t)stream;
-        const int heads = block_heads(in->query_heads / in->kv_heads);
-        const int blocks = in->query_heads / heads;
-        switch (heads) {
-            case 4: relative_attention<4><<<blocks, kThreads, 0, s>>>(*in); break;
-            case 3: relative_attention<3><<<blocks, kThreads, 0, s>>>(*in); break;
-            case 2: relative_attention<2><<<blocks, kThreads, 0, s>>>(*in); break;
-            default: relative_attention<1><<<blocks, kThreads, 0, s>>>(*in); break;
-        }
+        relative_attention<<<in->query_heads, kThreads, 0, s>>>(*in);
         failure.record(cudaGetLastError(), INFERENCE_CUDA_STAGE_LAUNCH);
         report_stage(out_stage, failure.stage);
         return (int)failure.err;
