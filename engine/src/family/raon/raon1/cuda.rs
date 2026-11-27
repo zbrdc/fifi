@@ -174,7 +174,7 @@ fn layer_recipe(spec: Raon1Spec, hy: &Hyper, layer: usize) -> (Layer, Option<Mla
         Forward::Dense(three("ffn_", ".weight"))
     };
     let recipe = Layer {
-        norms: [n("attn_norm.weight"), n("ffn_norm.weight")],
+        norms: [n("attn_norm.weight"), n("ffn_norm.weight")].map(Some),
         site: Site::Mixed {
             halves: [site("attn"), site("ffn")],
         },

@@ -62,7 +62,7 @@ pub(crate) fn layers(visits: &[Visit]) -> (Vec<Layer>, SlotCount) {
             let n = |name: &str| format!("{stem}.{name}");
             let router = |part: &str| [n(&format!("{part}.weight")), n(&format!("{part}.bias"))];
             Layer {
-                norms: [n("attn_norm.weight"), n("post_attention_norm.weight")],
+                norms: [n("attn_norm.weight"), n("post_attention_norm.weight")].map(Some),
                 site: match visit.streams {
                     Streams::One => Site::Plain,
                     Streams::Two { fork } => Site::Routed {
@@ -130,6 +130,9 @@ mod tests {
             .collect();
         assert_eq!(caches, [(0, "blk.3"), (1, "blk.7")]);
         assert!(matches!(&layers[2].mixer, Mixer::Delta { slot: 2, .. }));
-        assert_eq!(layers[5].norms[1], "blk.5.post_attention_norm.weight");
+        assert_eq!(
+            layers[5].norms[1].as_deref(),
+            Some("blk.5.post_attention_norm.weight")
+        );
     }
 }

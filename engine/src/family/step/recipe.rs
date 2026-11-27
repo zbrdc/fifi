@@ -19,8 +19,10 @@ use crate::kernels::cuda::DeviceBuffer;
 
 /// One visit of a model.
 pub(crate) struct Layer {
-    /// The norm weights of the mixer half and of the feed-forward half.
-    pub(crate) norms: [String; 2],
+    /// The norm weights of the mixer half and of the feed-forward half. `None`: the site's read
+    /// writes the normed branch input itself, and the walk launches no norm for that half (a
+    /// plain or routed site always takes one).
+    pub(crate) norms: [Option<String>; 2],
     pub(crate) site: Site,
     pub(crate) mixer: Mixer,
     pub(crate) forward: Forward,
@@ -75,7 +77,14 @@ impl Layer {
         delta: delta::Dims,
         attend: Option<attend::Dims>,
     ) -> Result<(), EngError> {
-        for name in &self.norms {
+        let site_norms = !matches!(self.site, Site::Plain | Site::Routed { .. });
+        if !site_norms && self.norms.iter().any(Option::is_none) {
+            return Err(EngError::BadRequest(format!(
+                "{}: a plain or routed site needs the norm of both halves",
+                map.family
+            )));
+        }
+        for name in self.norms.iter().flatten() {
             map.raw(name)?;
         }
         let raws: Vec<&String> = match &self.site {
@@ -245,19 +254,21 @@ impl<M: Model> Visits for Walk<'_, M> {
                 (mixed.input.range(0, n * h * 4)?, None)
             }
         };
-        let norm = Norm {
-            d: h,
-            eps: m.eps(),
-            x,
-            delta,
-            weight: io.raw(&layer.norms[half as usize])?.slice(0, h * 4)?,
-        };
-        io.norm(
-            n,
-            norm,
-            core.normed.range(0, n * h * 4)?,
-            core.normed_q8.range(0, q8(h, n))?,
-        )?;
+        if let Some(weight) = &layer.norms[half as usize] {
+            let norm = Norm {
+                d: h,
+                eps: m.eps(),
+                x,
+                delta,
+                weight: io.raw(weight)?.slice(0, h * 4)?,
+            };
+            io.norm(
+                n,
+                norm,
+                core.normed.range(0, n * h * 4)?,
+                core.normed_q8.range(0, q8(h, n))?,
+            )?;
+        }
         m.tap(visit, half, Stage::Read)
     }
 
