@@ -1,0 +1,52 @@
+/*
+ * Launch entry of the in-house Q6_K decode matvec: y = x_q8 . W^T over the file's native
+ * 210-byte Q6_K super-blocks (no repack, no vendored code). One warp per weight row, every
+ * column; f32 arithmetic throughout. Launch-only: nothing here allocates, copies or
+ * synchronizes. Per-kernel layout notes in kernels/cuda/resident/matvec_q.rs.
+ *
+ * Every includer is a C++ TU of the native adapter, so the layout is pinned with a C++
+ * static_assert here and with the same numbers by the Rust mirror
+ * (native/resident/matvec_q6k.rs).
+ */
+#ifndef INFERENCE_CUDA_RESIDENT_MATVEC_Q6K_H
+#define INFERENCE_CUDA_RESIDENT_MATVEC_Q6K_H
+
+#include <stddef.h>
+
+#ifdef __cplusplus
+extern "C" {
+#endif
+
+typedef struct inference_cuda_matvec_q6k_args {
+    const void *w;    /* native Q6_K blocks [rows][k / 256], 210 bytes each */
+    const void *x_q8; /* block_q8_1 [ncols][pad(k, 512) / 32], 36 bytes each */
+    float *y;         /* f32 out [ncols][rows], column j at y + j * rows */
+    int k;            /* a positive multiple of 256 */
+    int rows;         /* any positive count (the kernel owns whole rows) */
+    int ncols;        /* 1..8 */
+} inference_cuda_matvec_q6k_args;
+
+/* One launch on stream (must not be NULL). The weights are read in the file's native block
+ * layout; x_q8 is the padded quantize_q8_1 output of ncols activation rows, whose per-row
+ * stride (padded blocks x 36) the caller passes in x_row_bytes. A piece's term is the exact
+ * integer form: the dp4a of the codes less 32 and the activation quants takes its scale and
+ * the activation block's d, and the sum takes the super-block's d. Returns
+ * INFERENCE_CUDA_INVALID_ARGUMENT before any CUDA call for a bad argument, else the launch
+ * status. Column j comes from x_q8 row j alone with lane arithmetics that do not depend on
+ * ncols: column j of an ncols launch is bit-identical to a 1-column launch over the same
+ * bytes. */
+int inference_cuda_matvec_q6k_launch(const inference_cuda_matvec_q6k_args *args,
+                                     size_t x_row_bytes, void *stream, int *out_stage);
+
+#ifdef __cplusplus
+}
+static_assert(sizeof(inference_cuda_matvec_q6k_args) == 40 &&
+                  offsetof(inference_cuda_matvec_q6k_args, w) == 0 &&
+                  offsetof(inference_cuda_matvec_q6k_args, x_q8) == 8 &&
+                  offsetof(inference_cuda_matvec_q6k_args, y) == 16 &&
+                  offsetof(inference_cuda_matvec_q6k_args, k) == 24 &&
+                  offsetof(inference_cuda_matvec_q6k_args, rows) == 28 &&
+                  offsetof(inference_cuda_matvec_q6k_args, ncols) == 32, "");
+#endif
+
+#endif /* INFERENCE_CUDA_RESIDENT_MATVEC_Q6K_H */

@@ -24,6 +24,7 @@ use crate::kernels::cuda::native::resident::matvec_q::{MatvecRaw, matvec_q_launc
 use crate::kernels::cuda::native::resident::matvec_q3k::matvec_q3k_launch;
 use crate::kernels::cuda::native::resident::matvec_q4k::matvec_q4k_launch;
 use crate::kernels::cuda::native::resident::matvec_q5k::matvec_q5k_launch;
+use crate::kernels::cuda::native::resident::matvec_q6k::matvec_q6k_launch;
 use crate::kernels::cuda::native::resident::matvec_q40::matvec_q40_launch;
 use crate::kernels::cuda::native::resident::matvec_q50::matvec_q50_launch;
 use crate::kernels::cuda::native::resident::matvec_q80::matvec_q80_launch;
@@ -273,7 +274,7 @@ impl CudaContext {
     /// this module. That costs those arms one launch per column past four (an
     /// eight-column batch pays eight sequential launches instead of one, with no shared
     /// read of the weight rows across columns); the in-house arms batch at every width.
-    /// Q8_0, Q4_K and Q5_0 under the contract take in-house warp-per-row kernels; Q5_K,
+    /// Q8_0, Q4_K, Q5_0 and Q6_K under the contract take in-house warp-per-row kernels; Q5_K,
     /// Q4_0 and Q3_K are in-house and column-invariant at every width. Callers whose
     /// reuse promise needs a token to compute the same thing whatever batch it rode in
     /// (a prefill batch vs a decode step) select this entry; the default entry keeps the vendored
@@ -428,6 +429,22 @@ impl CudaContext {
                 },
                 row_bytes,
             ),
+            // The in-house Q6_K kernel under the column-invariant contract: its own ABI,
+            // native 210-byte super-blocks, whole rows, lane arithmetics independent of ncols,
+            // the exact integer form. Without the contract the vendored launcher keeps serving
+            // Q6_K, so served defaults do not move.
+            QuantType::Q6K if invariant => matvec_q6k_launch(
+                stream_raw,
+                &crate::kernels::cuda::native::resident::matvec_q6k::MatvecQ6kRaw {
+                    w: raw.w,
+                    x_q8: raw.x_q8,
+                    y: raw.y,
+                    k: raw.k,
+                    rows: raw.rows,
+                    ncols: raw.ncols,
+                },
+                row_bytes,
+            ),
             // The in-house Q8_0 kernel under the column-invariant contract: its own ABI,
             // native 34-byte blocks, whole rows, lane arithmetics independent of ncols.
             // Without the contract the vendored launcher keeps serving Q8_0, so served
@@ -468,8 +485,10 @@ impl CudaContext {
         if call.rows == 0
             || (!(matches!(call.ty, QuantType::Q5K | QuantType::Q40 | QuantType::Q3K)
                 || call.ty.is_codebook()
-                || (matches!(call.ty, QuantType::Q80 | QuantType::Q4K | QuantType::Q50)
-                    && invariant))
+                || (matches!(
+                    call.ty,
+                    QuantType::Q80 | QuantType::Q4K | QuantType::Q50 | QuantType::Q6K
+                ) && invariant))
                 && !call.rows.is_multiple_of(ROWS_MULTIPLE))
         {
             return Err(EngError::BadRequest(format!(

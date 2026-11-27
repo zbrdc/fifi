@@ -86,6 +86,7 @@ pub(in crate::kernels::cuda) mod matvec_q40;
 pub(in crate::kernels::cuda) mod matvec_q4k;
 pub(in crate::kernels::cuda) mod matvec_q50;
 pub(in crate::kernels::cuda) mod matvec_q5k;
+pub(in crate::kernels::cuda) mod matvec_q6k;
 pub(in crate::kernels::cuda) mod matvec_q80;
 pub(in crate::kernels::cuda) mod mhc_route;
 pub(in crate::kernels::cuda) mod moe_combine;
