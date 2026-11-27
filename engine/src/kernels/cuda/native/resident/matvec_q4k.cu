@@ -63,8 +63,11 @@ __device__ __forceinline__ void scale_min_k4(const unsigned char *scales, int g,
     }
 }
 
+/* Four 256-thread blocks a streaming processor is the ceiling (1024 threads). The one-column
+ * kernel takes 48 registers at any bound; the bound of 4 holds the eight-column kernel to 64
+ * registers with no spill (128 at 2), so the multi-column path keeps its four blocks. */
 template <int NCols>
-__global__ void __launch_bounds__(256, 2) matvec_q4k(const unsigned char *w,
+__global__ void __launch_bounds__(256, 4) matvec_q4k(const unsigned char *w,
                                                      const unsigned char *x_q8, float *y, int k,
                                                      int rows, size_t x_row_bytes) {
     const int warp = (int)(threadIdx.x >> 5);
