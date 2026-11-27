@@ -57,6 +57,9 @@ pub(crate) enum Forward {
     /// The gate, up and down matrices of a gated feed-forward.
     Dense([String; 3]),
     Routed(moe::Names),
+    /// A feed-forward of the model's own.
+    #[expect(dead_code, reason = "Inkling's walk is its first reader")]
+    Own,
 }
 
 /// Where a half stands when a model may look at its rows.
@@ -114,6 +117,7 @@ impl Layer {
                 let stacks = names.stacks.iter().chain(&names.shared);
                 stacks.into_iter().try_for_each(|n| map.native(n).map(drop))
             }
+            Forward::Own => Ok(()),
         }
     }
 }
@@ -161,6 +165,11 @@ pub(crate) trait Model {
     /// The mixer of visit `visit`, for a layer whose mixer is the model's own.
     fn own_mixer(&self, _visit: usize, _n: usize, _p0: usize) -> Result<(), EngError> {
         unsupported(self.family(), "a mixer of the model's own")
+    }
+    /// The feed-forward of visit `visit`, for a layer whose feed-forward is the model's own: it
+    /// reads the normed rows and writes the forward rows, as the shared blocks do.
+    fn own_forward(&self, _visit: usize, _n: usize, _p0: usize) -> Result<(), EngError> {
+        unsupported(self.family(), "a feed-forward of the model's own")
     }
     /// The activation and the scratch of a dense feed-forward over `n` rows.
     fn dense(&self, n: usize) -> Result<(ffn::Join, ffn::Scratch<'_>), EngError>;
@@ -307,6 +316,7 @@ impl<M: Model> Visits for Walk<'_, M> {
                     let (x, out) = (core.normed_rows(), &core.forward_out);
                     moe::forward(&io, names, dims, scratch, shared, x, n, out)?;
                 }
+                Forward::Own => m.own_forward(visit, n, p0)?,
             },
         }
         m.tap(visit, half, Stage::Branch)
