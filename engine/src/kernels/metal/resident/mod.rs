@@ -13,6 +13,7 @@ use super::context::{DeviceRange, Shared};
 pub(crate) mod dense_gemv;
 pub(crate) mod rms_norm;
 pub(crate) mod row_add;
+pub(crate) mod softcap;
 pub(crate) mod swiglu_rows;
 
 /// The alignment Metal requires of a bound buffer range.

@@ -41,6 +41,7 @@ pub(crate) use resident::dense_gemv::{
 };
 pub(crate) use resident::rms_norm::RmsNormCall;
 pub(crate) use resident::row_add::RowAddCall;
+pub(crate) use resident::softcap::SoftcapCall;
 pub(crate) use resident::swiglu_rows::{SwigluRowsCall, SwigluRowsShape};
 
 use std::sync::atomic::{AtomicBool, Ordering};
