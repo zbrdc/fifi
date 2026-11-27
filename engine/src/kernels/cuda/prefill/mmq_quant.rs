@@ -224,7 +224,7 @@ pub(crate) enum MmqPacking {
     CpuReference = 1,
     /// For Q4_K, Q5_K and IQ1_S, one scale per 32 values with the stored sum taken from the
     /// rounded codes, so the weight's offset term and its code term read the same rounded row.
-    /// Other types retain vendor packing.
+    /// Other types are packed as under [`Self::CpuReference`].
     Rounded = 2,
 }
 

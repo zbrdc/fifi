@@ -183,6 +183,12 @@ pub(crate) fn forward(
         n_expert: d.experts,
         top_k: used,
     };
+    if names.rule.gates_shared() != d.gated_shared {
+        return Err(EngError::BadRequest(format!(
+            "{}: the routed block's widths and its router rule disagree on the shared expert's gate",
+            io.family
+        )));
+    }
     let gated = match (&names.rule, &sc.gated) {
         (Router::Sigmoid { bias }, _) => {
             io.ctx.router_logits_rows(
@@ -236,7 +242,6 @@ pub(crate) fn forward(
             )));
         }
     };
-    debug_assert_eq!(names.rule.gates_shared(), d.gated_shared);
     // The shared expert first: its output is the base the kept experts are summed onto.
     let [shared_gate, shared_up, shared_down] = &names.shared;
     ffn::gated(

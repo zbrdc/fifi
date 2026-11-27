@@ -251,7 +251,7 @@ extern "C" int inference_cuda_mmq_quantize(const inference_cuda_mmq_quantize_arg
                            (const float *)a->x, (const int32_t *)a->ids, a->y,
                            (ggml_type)a->type, a->k, (int64_t)a->row_stride, /*s02=*/0,
                            /*s03=*/0, k_read(a->k), (int64_t)a->ncols, /*ne2=*/1, /*ne3=*/1,
-                           (cudaStream_t)stream, a->packing == 1),
+                           (cudaStream_t)stream, a->packing >= 1),
                        INFERENCE_CUDA_STAGE_LAUNCH);
         report_stage(out_stage, failure.stage);
         return (int)failure.err;
@@ -282,7 +282,7 @@ extern "C" int inference_cuda_mmq_quantize_scatter(
                            (const float *)a->x, (const int32_t *)a->ids_src1_inv, a->y,
                            (ggml_type)a->type, a->k, (int64_t)a->row_stride, k_read(a->k),
                            (int64_t)a->m, /*nrows_dst=*/(int64_t)a->m * a->top_k, a->top_k,
-                           (cudaStream_t)stream, a->packing == 1),
+                           (cudaStream_t)stream, a->packing >= 1),
                        INFERENCE_CUDA_STAGE_LAUNCH);
         report_stage(out_stage, failure.stage);
         return (int)failure.err;
