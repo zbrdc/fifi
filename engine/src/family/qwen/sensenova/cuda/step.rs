@@ -177,6 +177,22 @@ fn attn_row(shape: &LoopShape) -> usize {
     shape.heads_q * 2 * shape.head_dim + 2 * shape.heads_kv * shape.head_dim
 }
 
+/// The looped model of the lineage: the visits of `plan` over dense blocks with fused delta
+/// inputs.
+pub(crate) fn looped(shape: &LoopShape, plan: &LoopPlan, rope: &RopePlan) -> Model {
+    Model {
+        family: "sensenova",
+        shape: *shape,
+        visits: plan.visits(),
+        blocks: Blocks {
+            split_delta_inputs: false,
+            experts: false,
+        },
+        experts: None,
+        rope: rope.clone(),
+    }
+}
+
 impl<'a> LoopStep<'a> {
     /// Builds the executor over a completed device load. `cache_rows` is the session's
     /// attention cache depth; the GDN state and the conv rings follow the shape.
@@ -188,17 +204,7 @@ impl<'a> LoopStep<'a> {
         rope: &RopePlan,
         cache_rows: usize,
     ) -> Result<Self, EngError> {
-        let model = Model {
-            family: "sensenova",
-            shape: *shape,
-            visits: plan.visits(),
-            blocks: Blocks {
-                split_delta_inputs: false,
-                experts: false,
-            },
-            experts: None,
-            rope: rope.clone(),
-        };
+        let model = looped(shape, plan, rope);
         Self::open_model(ctx, weights, &model, plan.routing(), cache_rows)
     }
 

@@ -9,7 +9,8 @@
 use std::rc::Rc;
 use std::sync::Arc;
 
-use super::step::{LoopStep, Routing};
+use super::super::weights::LoopWeights;
+use super::step::{LoopStep, Routing, looped};
 use crate::EngError;
 use crate::family::project::Projector;
 use crate::family::project::cuda::{BorrowedLoader, LoadOptions, WeightLayout};
@@ -71,7 +72,7 @@ impl TokenStepper for Stepper<'_> {
     }
 }
 
-/// Scores the windows `KVQ_WINDOWS` of the routed-expert model `KVQ_MODEL` on the lineage's step.
+/// Scores the windows `KVQ_WINDOWS` of the lineage's model `KVQ_MODEL` on the lineage's step.
 #[test]
 #[ignore = "a card under fifi-gpu-run: KVQ_MODEL, KVQ_SAMPLER_VOCAB, KVQ_IDS, KVQ_IDS_SHA, KVQ_LAYOUT, KVQ_WINDOWS, KVQ_OUT, optional KVQ_REF and KVQ_EXACT"]
 fn lineage_quality_leg() {
@@ -89,7 +90,25 @@ fn lineage_quality_leg() {
         )
         .expect("model"),
     );
-    let model = routed_experts(file.header()).expect("header");
+    // The routed-expert model has one residual stream: the routing of a two-stream range is
+    // unused there. Any other header is read as the looped model.
+    let (model, routing) = match routed_experts(file.header()) {
+        Ok(model) => (
+            model,
+            Routing {
+                pre_scale: 1.0,
+                iterations: 1,
+                fixed_identity: true,
+            },
+        ),
+        Err(_) => {
+            let weights = LoopWeights::open(file.clone()).expect("looped model");
+            (
+                looped(weights.shape(), weights.plan(), weights.rope()),
+                weights.plan().routing(),
+            )
+        }
+    };
     let names = tensors(&layers(&model.visits, model.blocks).0);
     let refs: Vec<&str> = names.iter().map(String::as_str).collect();
     let ctx = Rc::new(CudaContext::new().expect("context"));
@@ -106,12 +125,6 @@ fn lineage_quality_leg() {
             0,
         )
         .expect("load");
-    // The model has one residual stream; the routing of a two-stream range is unused.
-    let routing = Routing {
-        pre_scale: 1.0,
-        iterations: 1,
-        fixed_identity: true,
-    };
     let mut step =
         LoopStep::open_model(ctx.clone(), &loaded, &model, routing, run.context + 1).expect("step");
     let exact = std::env::var_os("KVQ_EXACT").is_some();
