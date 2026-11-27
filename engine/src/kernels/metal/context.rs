@@ -447,6 +447,11 @@ impl DeviceBuffer {
         self.raw.bytes()
     }
 
+    /// The buffer's raw handle, for the fill a frame encodes.
+    pub(super) fn raw(&self) -> &RawBuffer {
+        &self.raw
+    }
+
     /// The `bytes` bytes of the buffer from `offset` on.
     pub(crate) fn range(&self, offset: usize, bytes: usize) -> Result<DeviceRange<'_>, EngError> {
         let inside = offset
@@ -480,6 +485,19 @@ impl DeviceBuffer {
         self.shared.settle(self.raw.pointer())?;
         native::buffer_write(&self.raw, offset, data)
             .map_err(|_| adapter_bug("the host write into a Metal buffer"))
+    }
+
+    /// Encodes a fill of the `bytes` bytes at `offset` with zero into `frame`, behind the work
+    /// the frame encoded before: the next work of the frame reads the zeros. The device fills;
+    /// the host neither waits nor copies. `BadRequest` for an empty range and for one past
+    /// the buffer; a refused call changes nothing.
+    pub(super) fn zero_at(
+        &self,
+        frame: &mut Frame,
+        offset: usize,
+        bytes: usize,
+    ) -> Result<(), EngError> {
+        frame.zero(&self.range(offset, bytes)?)
     }
 }
 
@@ -526,6 +544,11 @@ impl<'b> DeviceRange<'b> {
 
     pub(super) fn offset(&self) -> usize {
         self.offset
+    }
+
+    /// The buffer of the range.
+    pub(super) fn buffer(&self) -> &DeviceBuffer {
+        self.buffer
     }
 
     /// The identity of the context that owns the buffer.

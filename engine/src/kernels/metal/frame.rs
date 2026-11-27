@@ -11,12 +11,16 @@
 //! first. The dense matvec's non-finite flag is such host-side scratch: a frame keeps one flag,
 //! clears it before its first matvec and reads it in its drain, and one frame of a context
 //! carries the flag at a time.
+//!
+//! A fill with zero bytes ([`Frame::zero`]) is encoded into the same command buffer, between
+//! the dispatches around it: the reset of a state's buffers goes at the beginning of a frame,
+//! and neither waits nor copies through the host.
 
 use std::{ffi::c_void, rc::Rc};
 
 use crate::EngError;
 
-use super::context::{Grid, Shared, launch_failure};
+use super::context::{DeviceRange, Grid, Shared, launch_failure};
 use super::guard::DispatchGuard;
 use super::native::{self, Binding, RawCommand, RawKernel};
 use super::{TERMINAL, ensure_usable};
@@ -74,6 +78,50 @@ impl Frame {
     ) -> Result<(), EngError> {
         ensure_usable(&TERMINAL)?;
         let _guard = DispatchGuard::enter(&TERMINAL);
+        {
+            let open = self.open()?;
+            native::dispatch(
+                &open.command,
+                kernel,
+                bindings,
+                bytes,
+                grid,
+                per_threadgroup,
+                repeats,
+            )
+            .map_err(launch_failure)?;
+        }
+        self.note(bindings.iter().map(|binding| binding.pointer), repeats)
+    }
+
+    /// Encodes a fill of `range` with zero bytes into the frame, behind the work it encoded
+    /// before: the next dispatch reads the zeros. The device fills; the host neither waits
+    /// nor copies. The reset of a state's buffers is this call at the beginning of a frame.
+    pub(super) fn zero(&mut self, range: &DeviceRange<'_>) -> Result<(), EngError> {
+        if range.owner() != self.shared.id() {
+            return Err(EngError::BadRequest(format!(
+                "the fill needs a range in a buffer of its own Metal context; the range holds {} bytes at offset {} of another adapter",
+                range.bytes(),
+                range.offset(),
+            )));
+        }
+        ensure_usable(&TERMINAL)?;
+        let _guard = DispatchGuard::enter(&TERMINAL);
+        {
+            let open = self.open()?;
+            native::fill(
+                &open.command,
+                range.buffer().raw(),
+                range.offset(),
+                range.bytes(),
+            )
+            .map_err(launch_failure)?;
+        }
+        self.note([range.buffer().raw().pointer()], 1)
+    }
+
+    /// The open command buffer of the frame, made when the frame has none.
+    fn open(&mut self) -> Result<&mut Open, EngError> {
         if self.open.is_none() {
             let command = native::command_new(self.shared.runtime()).map_err(launch_failure)?;
             self.open = Some(Open {
@@ -82,24 +130,27 @@ impl Frame {
                 bound: Vec::new(),
             });
         }
-        let open = self.open.as_mut().expect("opened above");
-        native::dispatch(
-            &open.command,
-            kernel,
-            bindings,
-            bytes,
-            grid,
-            per_threadgroup,
-            repeats,
-        )
-        .map_err(launch_failure)?;
-        for pointer in bindings.iter().map(|binding| binding.pointer) {
-            if !open.bound.contains(&pointer) {
-                open.bound.push(pointer);
+        Ok(self.open.as_mut().expect("opened above"))
+    }
+
+    /// Notes `count` encoded operations that bind `pointers`, each once, and commits the
+    /// command buffer when it is full.
+    fn note(
+        &mut self,
+        pointers: impl IntoIterator<Item = *mut c_void>,
+        count: usize,
+    ) -> Result<(), EngError> {
+        let full = {
+            let open = self.open.as_mut().expect("an open command buffer");
+            for pointer in pointers {
+                if !open.bound.contains(&pointer) {
+                    open.bound.push(pointer);
+                }
             }
-        }
-        open.dispatches += repeats;
-        if open.dispatches >= self.per_buffer {
+            open.dispatches += count;
+            open.dispatches >= self.per_buffer
+        };
+        if full {
             let full = self.open.take().expect("open");
             self.shared.commit_ahead(full.command, full.bound)?;
         }

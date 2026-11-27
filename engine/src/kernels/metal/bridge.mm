@@ -285,6 +285,29 @@ int inference_metal_command_dispatch(void *held, void *kernel, void *const *buff
     });
 }
 
+// Encodes a fill of `bytes` bytes with zero at byte `offset` of the buffer, behind the work
+// encoded before it. A blit encoder, between the compute encoders of the dispatches around it.
+int inference_metal_command_fill(void *held, void *buffer, size_t offset, size_t bytes) noexcept {
+    return guarded("command_fill", [&]() -> int {
+        id<MTLCommandBuffer> command = (__bridge id<MTLCommandBuffer>)held;
+        id<MTLBuffer> target = (__bridge id<MTLBuffer>)buffer;
+        if (command == nil || target == nil || bytes == 0) {
+            return kStatusInvalid;
+        }
+        if (offset > target.length || bytes > target.length - offset) {
+            return kStatusInvalid;
+        }
+        if (!is_open(command)) {
+            set_error("command_fill", "the command buffer is committed: it takes no fill");
+            return kStatusInvalid;
+        }
+        id<MTLBlitCommandEncoder> encoder = [command blitCommandEncoder];
+        [encoder fillBuffer:target range:NSMakeRange(offset, bytes) value:0];
+        [encoder endEncoding];
+        return kStatusOk;
+    });
+}
+
 int inference_metal_command_commit(void *held) noexcept {
     return guarded("command_commit", [&]() -> int {
         id<MTLCommandBuffer> command = (__bridge id<MTLCommandBuffer>)held;

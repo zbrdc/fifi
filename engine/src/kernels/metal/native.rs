@@ -122,6 +122,13 @@ unsafe extern "C" {
         per_threadgroup: *const usize,
         repeats: usize,
     ) -> c_int;
+    #[link_name = "inference_metal_command_fill"]
+    fn bridge_command_fill(
+        command: *mut c_void,
+        buffer: *mut c_void,
+        offset: usize,
+        bytes: usize,
+    ) -> c_int;
     #[link_name = "inference_metal_command_commit"]
     fn bridge_command_commit(command: *mut c_void) -> c_int;
     #[link_name = "inference_metal_command_wait"]
@@ -314,6 +321,24 @@ pub(super) fn dispatch(
             repeats,
         )
     };
+    if status != 0 {
+        return Err(status);
+    }
+    Ok(())
+}
+
+/// Encodes a fill of `bytes` bytes with zero at `offset` of `buffer` into the open command
+/// buffer, behind the work encoded before it, and ends the encoder.
+pub(super) fn fill(
+    command: &RawCommand,
+    buffer: &RawBuffer,
+    offset: usize,
+    bytes: usize,
+) -> Result<(), c_int> {
+    if bytes == 0 || !inside(buffer, offset, bytes) {
+        return Err(STATUS_INVALID);
+    }
+    let status = unsafe { bridge_command_fill(command.pointer, buffer.pointer, offset, bytes) };
     if status != 0 {
         return Err(status);
     }
@@ -540,6 +565,31 @@ mod tests {
         assert_eq!(wait(&command), Err(STATUS_INVALID));
         assert_eq!(rig.encode(&command, 1.0, 0), Err(STATUS_INVALID));
         release(command.pointer());
+        rig.close();
+    }
+
+    #[test]
+    fn a_fill_takes_the_whole_buffer_and_no_empty_or_outside_range() {
+        let rig = Rig::new();
+        let _dispatch = DispatchGuard::enter(&TERMINAL);
+        let command = command_new(&rig.runtime).expect("a command buffer");
+        assert_eq!(fill(&command, &rig.data, 0, 0), Err(STATUS_INVALID));
+        assert_eq!(
+            fill(&command, &rig.data, 4 * VALUES - 3, 4),
+            Err(STATUS_INVALID)
+        );
+        assert_eq!(
+            fill(&command, &rig.data, usize::MAX, 4),
+            Err(STATUS_INVALID)
+        );
+        fill(&command, &rig.data, 0, 4 * VALUES).expect("the whole buffer");
+        commit(&command).expect("the commit");
+        assert_eq!(fill(&command, &rig.data, 0, 4), Err(STATUS_INVALID));
+        wait(&command).expect("the wait");
+        release(command.pointer());
+        // 0 * 2 + 3 everywhere: without the fill the uninitialized bytes would show.
+        rig.launch(3.0, 1);
+        assert_eq!(rig.values(), vec![3.0f32; VALUES]);
         rig.close();
     }
 }
