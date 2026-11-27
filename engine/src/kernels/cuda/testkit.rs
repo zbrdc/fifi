@@ -585,7 +585,7 @@ fn warp_fold(warp: &mut [f32]) -> f32 {
     warp[0]
 }
 
-/// `Stream::mix(first_block, query)` in the order of the device mix (`inkling_stream.cu`):
+/// `Stream::mix(first_block, query)` in the order of the device mix (`depth_attention.cu`):
 /// the current row's scale in the lane order, each row scored by 32 lanes that add every 32nd
 /// product `(value * scale) * query` in order from -0.0 and fold by halving, the softmax on one
 /// lane, and each column's weighted sum over the rows in mix order. `sealed` is as stored, oldest

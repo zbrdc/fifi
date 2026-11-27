@@ -8,7 +8,7 @@ use crate::{
     family::inkling2::cpu_forward::MIX_EPS,
     kernels::cuda::{
         Claim, CudaContext, DeviceRange, DeviceStream, require_apart, require_fit,
-        resident::{dense_gemv::DenseGemvCall, inkling_stream::NormCall},
+        resident::{dense_gemv::DenseGemvCall, depth_attention::NormCall},
     },
 };
 
@@ -275,7 +275,7 @@ impl DenseStep {
             dst,
             health: rows.gate_health,
         });
-        context.inkling_stream_norm_rows(stream, &gates, (work.width, MIX_EPS))?;
+        context.depth_attention_norm_rows(stream, &gates, (work.width, MIX_EPS))?;
         // The controller GEMVs write the gain and forget rows into the work block; the norm
         // reads them next to the caller's input, message and gamma rows where they live.
         let [gain, forget] = [3, 4].map(|i| work.norm.slice(i * row, row));

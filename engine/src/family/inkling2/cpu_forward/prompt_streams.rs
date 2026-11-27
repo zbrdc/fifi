@@ -11,7 +11,7 @@ use crate::{
     EngError,
     kernels::cuda::{
         CudaContext, DeviceBuffer, DeviceRange, DeviceStream,
-        resident::inkling_stream::{
+        resident::depth_attention::{
             AddCall, MAX_BLOCKS, MixStatesCall, MixStatesShape, SealCall, States, StreamShape,
         },
     },
@@ -152,7 +152,7 @@ impl PromptStreams {
         target: MixTarget<'_>,
     ) -> Result<(), EngError> {
         let (gamma, norm_eps) = target.norm.unzip();
-        context.inkling_stream_mix_states(
+        context.depth_attention_mix_states(
             stream,
             MixStatesCall {
                 state: self.used(self.blocks + 1)?,
@@ -185,7 +185,7 @@ impl PromptStreams {
                 "the device prompt streams have no room for another block",
             ));
         }
-        context.inkling_stream_seal_states(
+        context.depth_attention_seal_states(
             stream,
             SealCall {
                 state: self.used(self.blocks + 2)?,
@@ -210,7 +210,7 @@ impl PromptStreams {
         stream: &DeviceStream,
         rows: DeviceRange<'_>,
     ) -> Result<(), EngError> {
-        context.inkling_stream_add_states(
+        context.depth_attention_add_states(
             stream,
             AddCall {
                 state: self.used(1)?,

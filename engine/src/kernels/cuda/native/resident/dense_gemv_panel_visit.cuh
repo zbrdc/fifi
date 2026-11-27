@@ -1,7 +1,7 @@
 // Stage a complete group of activations in shared panels. Unlike the 32x8
 // tile this sweeps each packed weight exactly once, even for M=64.
 template<int Codec,int Block,int Bytes,int Rows,int M>
-__global__ void inkling_stream_visit(inference_cuda_dense_gemv_args a){
+__global__ void dense_gemv_panel_visit(inference_cuda_dense_gemv_args a){
     __shared__ float x[M][64];
     int t=threadIdx.x,lane=t%32,warp=t/32,n0=blockIdx.x*(8*Rows)+warp*Rows;
     auto *weights=static_cast<const uint8_t *>(a.w);

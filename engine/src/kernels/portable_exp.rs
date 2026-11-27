@@ -17,7 +17,7 @@ const EXP2_TERMS: [u64; 10] = [
 const INV_LN2: u64 = 0x3ff7_1547_652b_82fe;
 
 /// e^x from IEEE double additions and multiplications only, so every host and the CUDA kernels
-/// that share it (`portable_exp` in inkling_stream.cu) compute the same bits, whatever the
+/// that share it (`portable_exp` in depth_attention.cu) compute the same bits, whatever the
 /// platform's libm. Within one float ulp of e^x.
 pub(crate) fn portable_exp(x: f32) -> f32 {
     // Adding and removing 1.5 * 2^52 rounds a double of magnitude below 2^51 to an integer.

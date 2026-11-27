@@ -845,7 +845,7 @@ namespace {
 #include "resident/inkling_panel_mma.cuh"
 #include "resident/inkling_expert_group.cuh"
 #ifdef FIFI_VISIT_PROBE
-#include "resident/inkling_stream_visit.cuh"
+#include "resident/dense_gemv_panel_visit.cuh"
 #include "resident/inkling_splitn_visit.cuh"
 #include "resident/inkling_grid_split.cuh"
 #include "resident/inkling_warp_visit.cuh"
@@ -1317,7 +1317,7 @@ extern "C" int stream_visit_probe(const inference_cuda_dense_gemv_args *args,cud
 #undef TC
         return int(cudaGetLastError());
     }
-#define STREAM(C,B,S) if(a.m>16){if(variant==1) inkling_stream_visit<C,B,S,1,64><<<a.rows/8,256,0,s>>>(a); else inkling_stream_visit<C,B,S,2,64><<<a.rows/16,256,0,s>>>(a);} else if(a.m>8) inkling_stream_visit<C,B,S,2,16><<<a.rows/16,256,0,s>>>(a); else if(variant==1) inkling_stream_visit<C,B,S,1,8><<<a.rows/8,256,0,s>>>(a); else inkling_stream_visit<C,B,S,2,8><<<a.rows/16,256,0,s>>>(a)
+#define STREAM(C,B,S) if(a.m>16){if(variant==1) dense_gemv_panel_visit<C,B,S,1,64><<<a.rows/8,256,0,s>>>(a); else dense_gemv_panel_visit<C,B,S,2,64><<<a.rows/16,256,0,s>>>(a);} else if(a.m>8) dense_gemv_panel_visit<C,B,S,2,16><<<a.rows/16,256,0,s>>>(a); else if(variant==1) dense_gemv_panel_visit<C,B,S,1,8><<<a.rows/8,256,0,s>>>(a); else dense_gemv_panel_visit<C,B,S,2,8><<<a.rows/16,256,0,s>>>(a)
     if(a.weight_dtype==kQ8){STREAM(8,32,34);} else {STREAM(14,256,210);}
 #undef STREAM
     return int(cudaGetLastError());

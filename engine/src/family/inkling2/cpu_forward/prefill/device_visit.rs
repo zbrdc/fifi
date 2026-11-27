@@ -12,7 +12,7 @@ use super::{
 use crate::family::inkling2::{cuda_projection::gguf::attention::prefill, switches::Switch};
 use crate::kernels::cuda::{
     CudaContext, DeviceBuffer, DeviceRange, DeviceStream,
-    resident::inkling_stream::{MAX_BLOCKS, MAX_STATES},
+    resident::depth_attention::{MAX_BLOCKS, MAX_STATES},
 };
 
 mod banked;

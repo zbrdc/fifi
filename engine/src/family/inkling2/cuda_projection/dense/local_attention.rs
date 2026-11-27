@@ -7,7 +7,7 @@ use crate::{
     EngError,
     family::inkling2::cpu_forward::MIX_EPS,
     kernels::cuda::{
-        CudaContext, DeviceRange, DeviceStream, PinnedBuf, resident::inkling_stream::NormCall,
+        CudaContext, DeviceRange, DeviceStream, PinnedBuf, resident::depth_attention::NormCall,
     },
 };
 
@@ -335,7 +335,7 @@ impl DenseStep {
         context.dense_gemv_group(stream, &calls)
     }
 
-    /// The six gate halves: one `inkling_stream_norm_rows` launch norms the shared input and
+    /// The six gate halves: one `depth_attention_norm_rows` launch norms the shared input and
     /// each message into `[input | message]` rows with eps `MIX_EPS`; health into `gate_health`.
     fn norm_gates(
         &self,
@@ -359,6 +359,6 @@ impl DenseStep {
                 });
             }
         }
-        context.inkling_stream_norm_rows(stream, &rows, (hidden, MIX_EPS))
+        context.depth_attention_norm_rows(stream, &rows, (hidden, MIX_EPS))
     }
 }

@@ -22,11 +22,11 @@ use crate::{
         CudaContext, DeviceBuffer, DeviceRange, DeviceStream, PinnedBuf,
         resident::{
             dense_gemv::DenseDtype,
-            inkling_conv::ConvCall,
-            inkling_local_prep::PrepMath,
-            inkling_stream::{
+            depth_attention::{
                 AddCall, MAX_BLOCKS, MAX_MIX_JOBS, MixCall, MixJob, MixShape, SealCall, StreamShape,
             },
+            inkling_conv::ConvCall,
+            inkling_local_prep::PrepMath,
         },
     },
 };
@@ -669,7 +669,7 @@ impl Execution<'_> {
             None => l.depth.row(width),
         };
         if !jobs.is_empty() {
-            self.context.inkling_stream_mix_jobs(
+            self.context.depth_attention_mix_jobs(
                 self.stream,
                 &jobs,
                 &self.row(l.glue_health)?,
@@ -690,7 +690,7 @@ impl Execution<'_> {
         out: Region,
     ) -> Result<(), EngError> {
         let width = self.plan.shape.widths.hidden;
-        self.context.inkling_stream_mix(
+        self.context.depth_attention_mix(
             self.stream,
             MixCall {
                 state: self.row(state.row((blocks + 1) * width))?,
@@ -786,7 +786,7 @@ impl Execution<'_> {
             self.add(l.attention_out)?;
             return Ok(shape.blocks);
         }
-        self.context.inkling_stream_seal(
+        self.context.depth_attention_seal(
             self.stream,
             SealCall {
                 state: self.row(l.depth)?,
@@ -804,7 +804,7 @@ impl Execution<'_> {
 
     fn add(&self, addend: Region) -> Result<(), EngError> {
         let width = self.plan.shape.widths.hidden;
-        self.context.inkling_stream_add(
+        self.context.depth_attention_add(
             self.stream,
             AddCall {
                 state: self.row(self.layout.depth.row(width))?,

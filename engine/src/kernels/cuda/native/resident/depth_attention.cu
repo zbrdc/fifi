@@ -1,10 +1,10 @@
-// Depth-residual stream of Inkling 2 on the device: mix, seal and add.
-// The contract is resident/inkling_stream.h. Every arithmetic intrinsic is _rn, so no build flag
+// Attention-residual depth stream on the device: mix, seal and add.
+// The contract is resident/depth_attention.h. Every arithmetic intrinsic is _rn, so no build flag
 // can contract a multiply and an add or turn a divide or a square root into an approximation.
 #include <math.h>
 #include <stdint.h>
 
-#include "resident/inkling_stream.h"
+#include "resident/depth_attention.h"
 #include "resident/lane_sum.cuh"
 
 #include "abi.h"
@@ -208,8 +208,8 @@ __device__ __forceinline__ void weighted_mix(const float *state, const float *qu
     }
 }
 
-// One block's mix: the body of `inkling_stream_mix` (a block per state) and of each job of
-// `inkling_stream_mix_jobs` (a block per job), so both give the same bits. Without `query` the
+// One block's mix: the body of `depth_attention_mix` (a block per state) and of each job of
+// `depth_attention_mix_jobs` (a block per job), so both give the same bits. Without `query` the
 // mix is the raw current row; with `gamma` the output is `norm(mix) * gamma`, the norm's scale in
 // the lane order like every other row norm, so a fused norm has the bits of a separate one.
 __device__ __forceinline__ void mix_one(const float *state, const float *query, const float *gamma,
@@ -239,7 +239,7 @@ __device__ __forceinline__ void mix_one(const float *state, const float *query, 
     report(health, invalid);
 }
 
-__global__ void inkling_stream_mix(const float *state, const float *query, const float *gamma,
+__global__ void depth_attention_mix(const float *state, const float *query, const float *gamma,
                                    float *out, float *health, int first_block, int blocks,
                                    int width, float eps, float norm_eps, int stride,
                                    int out_stride) {
@@ -261,13 +261,13 @@ struct MixJobs {
     int blocks[max_mix_jobs];
 };
 
-__global__ void inkling_stream_mix_jobs(MixJobs jobs, float *health, int width, float eps) {
+__global__ void depth_attention_mix_jobs(MixJobs jobs, float *health, int width, float eps) {
     const int j = blockIdx.x;
     mix_one(jobs.state[j], jobs.query[j], nullptr, jobs.out[j], health, jobs.first_block[j],
             jobs.blocks[j], width, eps, 1.0f);
 }
 
-__global__ void inkling_stream_seal(float *state, const float *next, float *health, int blocks,
+__global__ void depth_attention_seal(float *state, const float *next, float *health, int blocks,
                                     int width, float eps, int stride) {
     state += static_cast<size_t>(blockIdx.x) * stride * width;
     next += static_cast<size_t>(blockIdx.x) * width;
@@ -286,7 +286,7 @@ __global__ void inkling_stream_seal(float *state, const float *next, float *heal
     report(health, invalid);
 }
 
-__global__ void inkling_stream_add(float *state, const float *row, float *health, int width,
+__global__ void depth_attention_add(float *state, const float *row, float *health, int width,
                                    int stride) {
     state += static_cast<size_t>(blockIdx.x) * stride * width;
     row += static_cast<size_t>(blockIdx.x) * width;
@@ -302,7 +302,7 @@ __global__ void inkling_stream_add(float *state, const float *row, float *health
 
 bool aligned(const void *pointer) { return reinterpret_cast<uintptr_t>(pointer) % alignof(float) == 0; }
 
-// One block's norm, `dst = src * rms_scale(src)`: a row of `inkling_stream_norm_rows`.
+// One block's norm, `dst = src * rms_scale(src)`: a row of `depth_attention_norm_rows`.
 __device__ __forceinline__ void norm_one(const float *src, float *dst, float *health, int width,
                                          float eps) {
     __shared__ float scratch[kLaneWarps];
@@ -327,7 +327,7 @@ struct NormRows {
     float *health[max_norm_rows];
 };
 
-__global__ void inkling_stream_norm_rows(NormRows rows, int width, float eps) {
+__global__ void depth_attention_norm_rows(NormRows rows, int width, float eps) {
     const int r = blockIdx.x;
     norm_one(rows.src[r], rows.dst[r], rows.health[r], width, eps);
 }
@@ -349,7 +349,7 @@ size_t states_bytes(int rows, int stride, int used, int width) {
 }
 }  // namespace
 
-extern "C" int inference_cuda_inkling_stream_mix(const float *state, const float *query,
+extern "C" int inference_cuda_depth_attention_mix(const float *state, const float *query,
                                                  const float *gamma, float *out, float *health,
                                                  int first_block, int blocks, int width,
                                                  float mix_eps, float norm_eps, int rows,
@@ -375,7 +375,7 @@ extern "C" int inference_cuda_inkling_stream_mix(const float *state, const float
         overlaps(health, sizeof(float), out, out_bytes)) {
         return INFERENCE_CUDA_INVALID_ARGUMENT;
     }
-    inkling_stream_mix<<<rows, threads, 0, static_cast<cudaStream_t>(stream)>>>(
+    depth_attention_mix<<<rows, threads, 0, static_cast<cudaStream_t>(stream)>>>(
         state, query, gamma, out, health, first_block, blocks, width, mix_eps, norm_eps, stride,
         out_stride);
     Failure failure;
@@ -384,7 +384,7 @@ extern "C" int inference_cuda_inkling_stream_mix(const float *state, const float
     return static_cast<int>(failure.err);
 }
 
-extern "C" int inference_cuda_inkling_stream_mix_jobs(const void *const *rows, const int *extents,
+extern "C" int inference_cuda_depth_attention_mix_jobs(const void *const *rows, const int *extents,
                                                       int count, float *health, int width,
                                                       float eps, void *stream, int *out_stage) {
     report_stage(out_stage, INFERENCE_CUDA_STAGE_NONE);
@@ -427,7 +427,7 @@ extern "C" int inference_cuda_inkling_stream_mix_jobs(const void *const *rows, c
             }
         }
     }
-    inkling_stream_mix_jobs<<<count, threads, 0, static_cast<cudaStream_t>(stream)>>>(
+    depth_attention_mix_jobs<<<count, threads, 0, static_cast<cudaStream_t>(stream)>>>(
         jobs, health, width, eps);
     Failure failure;
     failure.record(cudaGetLastError(), INFERENCE_CUDA_STAGE_LAUNCH);
@@ -435,7 +435,7 @@ extern "C" int inference_cuda_inkling_stream_mix_jobs(const void *const *rows, c
     return static_cast<int>(failure.err);
 }
 
-extern "C" int inference_cuda_inkling_stream_seal(float *state, const float *next, float *health,
+extern "C" int inference_cuda_depth_attention_seal(float *state, const float *next, float *health,
                                                   int blocks, int width, float eps, int rows,
                                                   int stride, void *stream, int *out_stage) {
     report_stage(out_stage, INFERENCE_CUDA_STAGE_NONE);
@@ -451,7 +451,7 @@ extern "C" int inference_cuda_inkling_stream_seal(float *state, const float *nex
         overlaps(health, sizeof(float), next, next_bytes)) {
         return INFERENCE_CUDA_INVALID_ARGUMENT;
     }
-    inkling_stream_seal<<<rows, threads, 0, static_cast<cudaStream_t>(stream)>>>(
+    depth_attention_seal<<<rows, threads, 0, static_cast<cudaStream_t>(stream)>>>(
         state, next, health, blocks, width, eps, stride);
     Failure failure;
     failure.record(cudaGetLastError(), INFERENCE_CUDA_STAGE_LAUNCH);
@@ -459,7 +459,7 @@ extern "C" int inference_cuda_inkling_stream_seal(float *state, const float *nex
     return static_cast<int>(failure.err);
 }
 
-extern "C" int inference_cuda_inkling_stream_add(float *state, const float *row, float *health,
+extern "C" int inference_cuda_depth_attention_add(float *state, const float *row, float *health,
                                                  int width, int rows, int stride, void *stream,
                                                  int *out_stage) {
     report_stage(out_stage, INFERENCE_CUDA_STAGE_NONE);
@@ -474,7 +474,7 @@ extern "C" int inference_cuda_inkling_stream_add(float *state, const float *row,
         overlaps(health, sizeof(float), row, row_bytes)) {
         return INFERENCE_CUDA_INVALID_ARGUMENT;
     }
-    inkling_stream_add<<<rows, threads, 0, static_cast<cudaStream_t>(stream)>>>(
+    depth_attention_add<<<rows, threads, 0, static_cast<cudaStream_t>(stream)>>>(
         state, row, health, width, stride);
     Failure failure;
     failure.record(cudaGetLastError(), INFERENCE_CUDA_STAGE_LAUNCH);
@@ -482,7 +482,7 @@ extern "C" int inference_cuda_inkling_stream_add(float *state, const float *row,
     return static_cast<int>(failure.err);
 }
 
-extern "C" int inference_cuda_inkling_stream_norm_rows(const void *const *ranges, int count,
+extern "C" int inference_cuda_depth_attention_norm_rows(const void *const *ranges, int count,
                                                         int width, float eps, void *stream,
                                                         int *out_stage) {
     report_stage(out_stage, INFERENCE_CUDA_STAGE_NONE);
@@ -515,7 +515,7 @@ extern "C" int inference_cuda_inkling_stream_norm_rows(const void *const *ranges
             }
         }
     }
-    inkling_stream_norm_rows<<<count, threads, 0, static_cast<cudaStream_t>(stream)>>>(
+    depth_attention_norm_rows<<<count, threads, 0, static_cast<cudaStream_t>(stream)>>>(
         rows, width, eps);
     Failure failure;
     failure.record(cudaGetLastError(), INFERENCE_CUDA_STAGE_LAUNCH);

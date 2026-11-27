@@ -1,8 +1,8 @@
-//! The resident Inkling depth stream, launch-only: the weighted mix over the sealed blocks,
+//! The resident attention-residual depth stream, launch-only: the weighted mix over the sealed blocks,
 //! the seal of the current row and the add into it.
 //!
 //! A stream state packs the current row and then `blocks` sealed rows, `width` floats each
-//! (`native/resident/inkling_stream.h`). `health` is one float per launch: left alone, or quiet
+//! (`native/resident/depth_attention.h`). `health` is one float per launch: left alone, or quiet
 //! NaN when an input or an output of that launch was not finite.
 
 #[cfg(test)]
@@ -16,8 +16,8 @@ use crate::kernels::cuda::{
     context::{Claim, require_apart, require_fit},
 };
 
-use super::super::native::resident::inkling_stream::{self as native};
-pub(crate) use super::super::native::resident::inkling_stream::{
+use super::super::native::resident::depth_attention::{self as native};
+pub(crate) use super::super::native::resident::depth_attention::{
     MAX_BLOCKS, MAX_MIX_JOBS, MAX_NORM_ROWS, MAX_STATES, States,
 };
 
@@ -31,7 +31,7 @@ pub(crate) struct MixCall<'a> {
     pub(crate) health: DeviceRange<'a>,
 }
 
-/// One mix of [`CudaContext::inkling_stream_mix_jobs`]: a state of `blocks + 1` rows whose
+/// One mix of [`CudaContext::depth_attention_mix_jobs`]: a state of `blocks + 1` rows whose
 /// sealed rows `first_block..blocks` join the mix, its query and its output row.
 pub(crate) struct MixJob<'a> {
     pub(crate) state: DeviceRange<'a>,
@@ -116,7 +116,7 @@ fn check_shape(
         return Ok(());
     }
     Err(EngError::BadRequest(format!(
-        "the CUDA Inkling stream {what} takes first_block <= blocks <= {MAX_BLOCKS}, 1 to \
+        "the CUDA depth stream {what} takes first_block <= blocks <= {MAX_BLOCKS}, 1 to \
          {MAX_WIDTH} columns and a finite positive eps, got first_block {first_block}, blocks \
          {blocks}, width {width}, eps {eps}"
     )))
@@ -125,7 +125,7 @@ fn check_shape(
 fn state_bytes(states: States, used: usize, width: usize) -> Result<usize, EngError> {
     states.bytes(used, width).ok_or_else(|| {
         EngError::BadRequest(format!(
-            "the CUDA Inkling stream takes 1 to {MAX_STATES} states at least {used} rows apart, \
+            "the CUDA depth stream takes 1 to {MAX_STATES} states at least {used} rows apart, \
              got {} states {} rows apart",
             states.rows, states.stride
         ))
@@ -161,13 +161,13 @@ impl CudaContext {
     /// `Stream::mix(first_block, query)` of the host: the softmax-weighted mean of the sealed
     /// rows `first_block..blocks` (newest first) and the normalized current row, each scored by
     /// `dot(row, query) / sqrt(width)`. Agrees with the host within floating-point error.
-    pub(crate) fn inkling_stream_mix(
+    pub(crate) fn depth_attention_mix(
         &self,
         stream: &DeviceStream,
         call: MixCall<'_>,
         shape: MixShape,
     ) -> Result<(), EngError> {
-        self.inkling_stream_mix_states(
+        self.depth_attention_mix_states(
             stream,
             MixStatesCall {
                 state: call.state,
@@ -188,9 +188,9 @@ impl CudaContext {
         )
     }
 
-    /// [`Self::inkling_stream_mix`] of independent jobs in one launch, a block per job: each
+    /// [`Self::depth_attention_mix`] of independent jobs in one launch, a block per job: each
     /// output has the bits of its own mix. The jobs share `health`; several may read one state.
-    pub(crate) fn inkling_stream_mix_jobs(
+    pub(crate) fn depth_attention_mix_jobs(
         &self,
         stream: &DeviceStream,
         jobs: &[MixJob<'_>],
@@ -199,29 +199,29 @@ impl CudaContext {
     ) -> Result<(), EngError> {
         if !(1..=MAX_MIX_JOBS).contains(&jobs.len()) {
             return Err(EngError::BadRequest(format!(
-                "the CUDA Inkling stream mix takes 1 to {MAX_MIX_JOBS} jobs per launch, got {}",
+                "the CUDA depth stream mix takes 1 to {MAX_MIX_JOBS} jobs per launch, got {}",
                 jobs.len()
             )));
         }
         let row = width * size_of::<f32>();
         let health_bytes = size_of::<f32>();
-        check_row("Inkling stream health", health, health_bytes)?;
+        check_row("depth stream health", health, health_bytes)?;
         let mut reads = Vec::with_capacity(2 * jobs.len());
         for job in jobs {
             check_shape("mix", job.first_block, job.blocks, width, eps)?;
             let state = (job.blocks + 1) * row;
-            check_row("Inkling stream state", &job.state, state)?;
-            check_row("Inkling stream query", &job.query, row)?;
-            check_row("Inkling stream mix output", &job.out, row)?;
-            let state = Claim::of("Inkling stream state", &job.state, state);
-            let query = Claim::of("Inkling stream query", &job.query, row);
+            check_row("depth stream state", &job.state, state)?;
+            check_row("depth stream query", &job.query, row)?;
+            check_row("depth stream mix output", &job.out, row)?;
+            let state = Claim::of("depth stream state", &job.state, state);
+            let query = Claim::of("depth stream query", &job.query, row);
             require_apart(&state, &query)?;
             reads.extend([state, query]);
         }
-        let mut writes = vec![Claim::of("Inkling stream health", health, health_bytes)];
+        let mut writes = vec![Claim::of("depth stream health", health, health_bytes)];
         writes.extend(
             jobs.iter()
-                .map(|job| Claim::of("Inkling stream mix output", &job.out, row)),
+                .map(|job| Claim::of("depth stream mix output", &job.out, row)),
         );
         for (at, write) in writes.iter().enumerate() {
             for other in reads.iter().chain(&writes[at + 1..]) {
@@ -247,17 +247,17 @@ impl CudaContext {
 
     /// `Stream::seal(next)` of the host: the current row is RMS-normalized into the new sealed
     /// row, then replaced by `next`. The sealed row agrees with the host within rounding.
-    pub(crate) fn inkling_stream_seal(
+    pub(crate) fn depth_attention_seal(
         &self,
         stream: &DeviceStream,
         call: SealCall<'_>,
         shape: StreamShape,
     ) -> Result<(), EngError> {
-        self.inkling_stream_seal_states(stream, call, shape, States::one(shape.blocks + 2))
+        self.depth_attention_seal_states(stream, call, shape, States::one(shape.blocks + 2))
     }
 
-    /// [`Self::inkling_stream_seal`] of each of `states`, the next rows packed one row apart.
-    pub(crate) fn inkling_stream_seal_states(
+    /// [`Self::depth_attention_seal`] of each of `states`, the next rows packed one row apart.
+    pub(crate) fn depth_attention_seal_states(
         &self,
         stream: &DeviceStream,
         call: SealCall<'_>,
@@ -269,15 +269,15 @@ impl CudaContext {
         let state = state_bytes(states, shape.blocks + 2, shape.width)?;
         let next = states.rows * row;
         let health = size_of::<f32>();
-        check_row("Inkling stream state", &call.state, state)?;
-        check_row("Inkling stream next row", &call.next, next)?;
-        check_row("Inkling stream health", &call.health, health)?;
+        check_row("depth stream state", &call.state, state)?;
+        check_row("depth stream next row", &call.next, next)?;
+        check_row("depth stream health", &call.health, health)?;
         writes_apart(
             [
-                Claim::of("Inkling stream state", &call.state, state),
-                Claim::of("Inkling stream health", &call.health, health),
+                Claim::of("depth stream state", &call.state, state),
+                Claim::of("depth stream health", &call.health, health),
             ],
-            [Claim::of("Inkling stream next row", &call.next, next)],
+            [Claim::of("depth stream next row", &call.next, next)],
         )?;
         self.ensure_usable()?;
         let (state, next, health) = (
@@ -298,10 +298,10 @@ impl CudaContext {
         })
     }
 
-    /// [`Self::inkling_stream_mix`] of each of `states`, with the optional operands of
+    /// [`Self::depth_attention_mix`] of each of `states`, with the optional operands of
     /// [`MixStatesCall`]. Each output row has the bits of the same state mixed on its own, and a
     /// norm fused by `gamma` those of `enqueue_row_weighted_norm` on the mix.
-    pub(crate) fn inkling_stream_mix_states(
+    pub(crate) fn depth_attention_mix_states(
         &self,
         stream: &DeviceStream,
         call: MixStatesCall<'_>,
@@ -325,7 +325,7 @@ impl CudaContext {
         )?;
         if shape.out_stride < shape.width {
             return Err(EngError::BadRequest(format!(
-                "the CUDA Inkling stream mix takes an output stride of at least the width, got {} \
+                "the CUDA depth stream mix takes an output stride of at least the width, got {} \
                  for {} columns",
                 shape.out_stride, shape.width
             )));
@@ -334,21 +334,21 @@ impl CudaContext {
         let state = state_bytes(states, shape.blocks + 1, shape.width)?;
         let out = ((states.rows - 1) * shape.out_stride + shape.width) * size_of::<f32>();
         let health = size_of::<f32>();
-        check_row("Inkling stream state", &call.state, state)?;
+        check_row("depth stream state", &call.state, state)?;
         for (name, range) in [("query", &call.query), ("gamma", &call.gamma)] {
             if let Some(range) = range {
                 check_row(name, range, row)?;
             }
         }
-        check_row("Inkling stream mix output", &call.out, out)?;
-        check_row("Inkling stream health", &call.health, health)?;
-        let mut reads = vec![Claim::of("Inkling stream state", &call.state, state)];
+        check_row("depth stream mix output", &call.out, out)?;
+        check_row("depth stream health", &call.health, health)?;
+        let mut reads = vec![Claim::of("depth stream state", &call.state, state)];
         reads.extend(call.query.iter().map(|q| Claim::of("query", q, row)));
         reads.extend(call.gamma.iter().map(|g| Claim::of("gamma", g, row)));
         writes_apart(
             [
-                Claim::of("Inkling stream mix output", &call.out, out),
-                Claim::of("Inkling stream health", &call.health, health),
+                Claim::of("depth stream mix output", &call.out, out),
+                Claim::of("depth stream health", &call.health, health),
             ],
             reads,
         )?;
@@ -377,18 +377,18 @@ impl CudaContext {
     }
 
     /// `Stream::add_current(row)` of the host: `current = current + row`, bit-identical.
-    pub(crate) fn inkling_stream_add(
+    pub(crate) fn depth_attention_add(
         &self,
         stream: &DeviceStream,
         call: AddCall<'_>,
         width: usize,
     ) -> Result<(), EngError> {
-        self.inkling_stream_add_states(stream, call, width, States::one(1))
+        self.depth_attention_add_states(stream, call, width, States::one(1))
     }
 
-    /// [`Self::inkling_stream_add`] into the current row of each of `states`, the addends packed
+    /// [`Self::depth_attention_add`] into the current row of each of `states`, the addends packed
     /// one row apart.
-    pub(crate) fn inkling_stream_add_states(
+    pub(crate) fn depth_attention_add_states(
         &self,
         stream: &DeviceStream,
         call: AddCall<'_>,
@@ -400,15 +400,15 @@ impl CudaContext {
         let state = state_bytes(states, 1, width)?;
         let rows = states.rows * row;
         let health = size_of::<f32>();
-        check_row("Inkling stream state", &call.state, state)?;
-        check_row("Inkling stream addend row", &call.row, rows)?;
-        check_row("Inkling stream health", &call.health, health)?;
+        check_row("depth stream state", &call.state, state)?;
+        check_row("depth stream addend row", &call.row, rows)?;
+        check_row("depth stream health", &call.health, health)?;
         writes_apart(
             [
-                Claim::of("Inkling stream state", &call.state, state),
-                Claim::of("Inkling stream health", &call.health, health),
+                Claim::of("depth stream state", &call.state, state),
+                Claim::of("depth stream health", &call.health, health),
             ],
-            [Claim::of("Inkling stream addend row", &call.row, rows)],
+            [Claim::of("depth stream addend row", &call.row, rows)],
         )?;
         self.ensure_usable()?;
         let (state, row, health) = (
@@ -424,7 +424,7 @@ impl CudaContext {
     /// The gate halves of the cross-pass controllers: `dst = src * rms_scale(src)` with `eps`
     /// (the host's `rms_norm_with_scale`) for each row in one launch, a block per row. Agrees
     /// with the host within rounding; rows may share one health word.
-    pub(crate) fn inkling_stream_norm_rows(
+    pub(crate) fn depth_attention_norm_rows(
         &self,
         stream: &DeviceStream,
         rows: &[NormCall<'_>],
@@ -432,7 +432,7 @@ impl CudaContext {
     ) -> Result<(), EngError> {
         if !(1..=MAX_NORM_ROWS).contains(&rows.len()) {
             return Err(EngError::BadRequest(format!(
-                "the CUDA Inkling stream norm takes 1 to {MAX_NORM_ROWS} rows per launch, got {}",
+                "the CUDA depth stream norm takes 1 to {MAX_NORM_ROWS} rows per launch, got {}",
                 rows.len()
             )));
         }
@@ -440,16 +440,16 @@ impl CudaContext {
         let row = width * size_of::<f32>();
         let health = size_of::<f32>();
         for call in rows {
-            check_row("Inkling stream norm source", &call.src, row)?;
-            check_row("Inkling stream norm output", &call.dst, row)?;
-            check_row("Inkling stream health", &call.health, health)?;
+            check_row("depth stream norm source", &call.src, row)?;
+            check_row("depth stream norm output", &call.dst, row)?;
+            check_row("depth stream health", &call.health, health)?;
         }
         for (at, call) in rows.iter().enumerate() {
-            let dst = Claim::of("Inkling stream norm output", &call.dst, row);
-            let words = Claim::of("Inkling stream health", &call.health, health);
+            let dst = Claim::of("depth stream norm output", &call.dst, row);
+            let words = Claim::of("depth stream health", &call.health, health);
             for (other_at, other) in rows.iter().enumerate() {
-                let src = Claim::of("Inkling stream norm source", &other.src, row);
-                let other_dst = Claim::of("Inkling stream norm output", &other.dst, row);
+                let src = Claim::of("depth stream norm source", &other.src, row);
+                let other_dst = Claim::of("depth stream norm output", &other.dst, row);
                 require_apart(&dst, &src)?;
                 require_apart(&words, &src)?;
                 require_apart(&words, &other_dst)?;

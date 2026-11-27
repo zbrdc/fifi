@@ -1,5 +1,5 @@
-//! Launch-only FFI for the resident Inkling depth stream
-//! (`native/resident/inkling_stream.cu`, contract in `inkling_stream.h`).
+//! Launch-only FFI for the resident attention-residual depth stream
+//! (`native/resident/depth_attention.cu`, contract in `depth_attention.h`).
 
 use std::ffi::{c_int, c_void};
 use std::mem::size_of;
@@ -11,7 +11,7 @@ pub(crate) const MAX_BLOCKS: usize = 63;
 const MAX_WIDTH: usize = 8192;
 
 unsafe extern "C" {
-    fn inference_cuda_inkling_stream_mix(
+    fn inference_cuda_depth_attention_mix(
         state: *const c_void,
         query: *const c_void,
         gamma: *const c_void,
@@ -29,7 +29,7 @@ unsafe extern "C" {
         out_stage: *mut c_int,
     ) -> c_int;
 
-    fn inference_cuda_inkling_stream_mix_jobs(
+    fn inference_cuda_depth_attention_mix_jobs(
         rows: *const *const c_void,
         extents: *const c_int,
         count: c_int,
@@ -40,7 +40,7 @@ unsafe extern "C" {
         out_stage: *mut c_int,
     ) -> c_int;
 
-    fn inference_cuda_inkling_stream_seal(
+    fn inference_cuda_depth_attention_seal(
         state: *mut c_void,
         next: *const c_void,
         health: *mut c_void,
@@ -53,7 +53,7 @@ unsafe extern "C" {
         out_stage: *mut c_int,
     ) -> c_int;
 
-    fn inference_cuda_inkling_stream_add(
+    fn inference_cuda_depth_attention_add(
         state: *mut c_void,
         row: *const c_void,
         health: *mut c_void,
@@ -64,7 +64,7 @@ unsafe extern "C" {
         out_stage: *mut c_int,
     ) -> c_int;
 
-    fn inference_cuda_inkling_stream_norm_rows(
+    fn inference_cuda_depth_attention_norm_rows(
         ranges: *const *const c_void,
         count: c_int,
         width: c_int,
@@ -185,7 +185,7 @@ pub(in crate::kernels::cuda) fn mix_jobs(
     // health word share no byte with a read row or with each other. The C entry copies both
     // lists into the kernel's parameters before it returns.
     let status = unsafe {
-        inference_cuda_inkling_stream_mix_jobs(
+        inference_cuda_depth_attention_mix_jobs(
             rows.as_ptr(),
             extents.as_ptr(),
             jobs.len() as c_int,
@@ -265,7 +265,7 @@ pub(in crate::kernels::cuda) fn mix(
     // SAFETY: the ranges are aligned, hold the extents above and the outputs share no byte with
     // any other range; absent operands are null, which the entry accepts.
     let status = unsafe {
-        inference_cuda_inkling_stream_mix(
+        inference_cuda_depth_attention_mix(
             call.state.address() as *const c_void,
             address(&call.query),
             address(&call.gamma),
@@ -324,7 +324,7 @@ pub(in crate::kernels::cuda) fn seal(
     let mut stage = STAGE_NONE;
     // SAFETY: the ranges are aligned, hold the extents above and share no byte.
     let status = unsafe {
-        inference_cuda_inkling_stream_seal(
+        inference_cuda_depth_attention_seal(
             state.address(),
             next.address() as *const c_void,
             health.address(),
@@ -373,7 +373,7 @@ pub(in crate::kernels::cuda) fn add(
     let mut stage = STAGE_NONE;
     // SAFETY: the ranges are aligned, hold the extents above and share no byte.
     let status = unsafe {
-        inference_cuda_inkling_stream_add(
+        inference_cuda_depth_attention_add(
             state.address(),
             row.address() as *const c_void,
             health.address(),
@@ -453,7 +453,7 @@ pub(in crate::kernels::cuda) fn norm_rows(
     // byte with a source or an output. The C entry copies the list into the kernel's parameters
     // before it returns.
     let status = unsafe {
-        inference_cuda_inkling_stream_norm_rows(
+        inference_cuda_depth_attention_norm_rows(
             ranges.as_ptr(),
             rows.len() as c_int,
             width as c_int,

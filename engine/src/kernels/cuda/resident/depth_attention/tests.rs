@@ -148,7 +148,7 @@ impl Buffers {
         upload(&self.state, stream, state);
         upload(&self.query, stream, query);
         self.clear_health(stream);
-        ctx.inkling_stream_mix(
+        ctx.depth_attention_mix(
             stream,
             MixCall {
                 state: self
@@ -182,7 +182,7 @@ fn max_error(out: &[f32], expected: &[f32]) -> f32 {
 /// device mix ([`lane_mix`]).
 #[test]
 fn mix_matches_the_host_algorithm_within_rounding_and_the_lane_order_bit_for_bit() {
-    if !device_present("Inkling stream mix") {
+    if !device_present("depth stream mix") {
         return;
     }
     let ctx = CudaContext::new().unwrap();
@@ -227,7 +227,7 @@ fn mix_matches_the_host_algorithm_within_rounding_and_the_lane_order_bit_for_bit
 
 #[test]
 fn seal_stores_the_normalized_row_and_add_is_bit_exact() {
-    if !device_present("Inkling stream seal and add") {
+    if !device_present("depth stream seal and add") {
         return;
     }
     let ctx = CudaContext::new().unwrap();
@@ -247,7 +247,7 @@ fn seal_stores_the_normalized_row_and_add_is_bit_exact() {
         upload(&buffers.state, &stream, &state);
         upload(&buffers.row, &stream, &next);
         buffers.clear_health(&stream);
-        ctx.inkling_stream_seal(
+        ctx.depth_attention_seal(
             &stream,
             SealCall {
                 state: buffers.state.range(0, row * (blocks + 2)).unwrap(),
@@ -278,7 +278,7 @@ fn seal_stores_the_normalized_row_and_add_is_bit_exact() {
     upload(&buffers.state, &stream, &current);
     upload(&buffers.row, &stream, &addend);
     buffers.clear_health(&stream);
-    ctx.inkling_stream_add(
+    ctx.depth_attention_add(
         &stream,
         AddCall {
             state: buffers.state.range(0, row).unwrap(),
@@ -295,7 +295,7 @@ fn seal_stores_the_normalized_row_and_add_is_bit_exact() {
 
 #[test]
 fn non_finite_arithmetic_is_reported_in_the_health_word() {
-    if !device_present("Inkling stream health") {
+    if !device_present("depth stream health") {
         return;
     }
     let ctx = CudaContext::new().unwrap();
@@ -318,7 +318,7 @@ fn non_finite_arithmetic_is_reported_in_the_health_word() {
     upload(&buffers.state, &stream, &current);
     upload(&buffers.row, &stream, &next);
     buffers.clear_health(&stream);
-    ctx.inkling_stream_seal(
+    ctx.depth_attention_seal(
         &stream,
         SealCall {
             state: buffers.state.range(0, row * 2).unwrap(),
@@ -339,7 +339,7 @@ fn non_finite_arithmetic_is_reported_in_the_health_word() {
     upload(&buffers.state, &stream, &current);
     upload(&buffers.row, &stream, &addend);
     buffers.clear_health(&stream);
-    ctx.inkling_stream_add(
+    ctx.depth_attention_add(
         &stream,
         AddCall {
             state: buffers.state.range(0, row).unwrap(),
@@ -354,7 +354,7 @@ fn non_finite_arithmetic_is_reported_in_the_health_word() {
 
 #[test]
 fn wrapper_rejects_bad_shapes_and_shared_bytes_before_launching() {
-    if !device_present("Inkling stream rejections") {
+    if !device_present("depth stream rejections") {
         return;
     }
     let ctx = CudaContext::new().unwrap();
@@ -371,7 +371,7 @@ fn wrapper_rejects_bad_shapes_and_shared_bytes_before_launching() {
     };
     // `mix` names the error of one launch; `state` is an offset and a byte count.
     let mix = |state: (usize, usize), out: usize, health: usize, shape| {
-        ctx.inkling_stream_mix(
+        ctx.depth_attention_mix(
             &stream,
             MixCall {
                 state: buffers.state.range(state.0, state.1).unwrap(),
@@ -383,7 +383,7 @@ fn wrapper_rejects_bad_shapes_and_shared_bytes_before_launching() {
         )
         .map_err(|error| format!("{error:?}"))
     };
-    let takes = "the CUDA Inkling stream mix takes";
+    let takes = "the CUDA depth stream mix takes";
     for bad in [
         shape(1, 0, EPS),
         shape(0, MAX_BLOCKS + 1, EPS),
@@ -401,8 +401,7 @@ fn wrapper_rejects_bad_shapes_and_shared_bytes_before_launching() {
     }
     let error = mix((0, row), 0, 0, shape(0, 1, EPS)).unwrap_err();
     assert!(
-        error
-            .contains("the CUDA Inkling stream state range holds 256 bytes but the call needs 512"),
+        error.contains("the CUDA depth stream state range holds 256 bytes but the call needs 512"),
         "{error}"
     );
     let error = mix((0, row * 2), 0, 0, shape(0, 0, EPS)).unwrap_err();
@@ -413,7 +412,7 @@ fn wrapper_rejects_bad_shapes_and_shared_bytes_before_launching() {
 
     // The output inside the two state rows the launch reads.
     let error = ctx
-        .inkling_stream_mix(
+        .depth_attention_mix(
             &stream,
             MixCall {
                 state: buffers.state.range(0, row * 2).unwrap(),
@@ -426,13 +425,12 @@ fn wrapper_rejects_bad_shapes_and_shared_bytes_before_launching() {
         .map_err(|error| format!("{error:?}"))
         .unwrap_err();
     assert!(
-        error
-            .contains("the CUDA Inkling stream mix output and Inkling stream state ranges overlap"),
+        error.contains("the CUDA depth stream mix output and depth stream state ranges overlap"),
         "{error}"
     );
     // The health word inside the output.
     let error = ctx
-        .inkling_stream_mix(
+        .depth_attention_mix(
             &stream,
             MixCall {
                 state: buffers.state.range(0, row * 2).unwrap(),
@@ -445,13 +443,11 @@ fn wrapper_rejects_bad_shapes_and_shared_bytes_before_launching() {
         .map_err(|error| format!("{error:?}"))
         .unwrap_err();
     assert!(
-        error.contains(
-            "the CUDA Inkling stream mix output and Inkling stream health ranges overlap"
-        ),
+        error.contains("the CUDA depth stream mix output and depth stream health ranges overlap"),
         "{error}"
     );
     // The same allocation, different bytes: accepted, and the context still launches.
-    ctx.inkling_stream_mix(
+    ctx.depth_attention_mix(
         &stream,
         MixCall {
             state: buffers.state.range(0, row * 2).unwrap(),
@@ -464,7 +460,7 @@ fn wrapper_rejects_bad_shapes_and_shared_bytes_before_launching() {
     .unwrap();
 
     let error = ctx
-        .inkling_stream_seal(
+        .depth_attention_seal(
             &stream,
             SealCall {
                 state: buffers.state.range(0, row * 2).unwrap(),
@@ -480,11 +476,11 @@ fn wrapper_rejects_bad_shapes_and_shared_bytes_before_launching() {
         .map_err(|error| format!("{error:?}"))
         .unwrap_err();
     assert!(
-        error.contains("the CUDA Inkling stream state and Inkling stream next row ranges overlap"),
+        error.contains("the CUDA depth stream state and depth stream next row ranges overlap"),
         "{error}"
     );
     let error = ctx
-        .inkling_stream_add(
+        .depth_attention_add(
             &stream,
             AddCall {
                 state: buffers.state.range(0, row).unwrap(),
@@ -496,12 +492,11 @@ fn wrapper_rejects_bad_shapes_and_shared_bytes_before_launching() {
         .map_err(|error| format!("{error:?}"))
         .unwrap_err();
     assert!(
-        error
-            .contains("the CUDA Inkling stream state and Inkling stream addend row ranges overlap"),
+        error.contains("the CUDA depth stream state and depth stream addend row ranges overlap"),
         "{error}"
     );
     let error = ctx
-        .inkling_stream_add(
+        .depth_attention_add(
             &stream,
             AddCall {
                 state: buffers.state.range(0, row).unwrap(),
@@ -512,15 +507,12 @@ fn wrapper_rejects_bad_shapes_and_shared_bytes_before_launching() {
         )
         .map_err(|error| format!("{error:?}"))
         .unwrap_err();
-    assert!(
-        error.contains("the CUDA Inkling stream add takes"),
-        "{error}"
-    );
+    assert!(error.contains("the CUDA depth stream add takes"), "{error}");
 }
 
 #[test]
 fn norm_is_the_lane_order_scale_and_refuses_to_normalize_in_place() {
-    if !device_present("Inkling stream norm") {
+    if !device_present("depth stream norm") {
         return;
     }
     let ctx = CudaContext::new().unwrap();
@@ -532,7 +524,7 @@ fn norm_is_the_lane_order_scale_and_refuses_to_normalize_in_place() {
     let src = normal_row(&mut Rng::new(0x5eed_5730), width);
     upload(&buffers.row, &stream, &src);
     buffers.clear_health(&stream);
-    ctx.inkling_stream_norm_rows(
+    ctx.depth_attention_norm_rows(
         &stream,
         &[NormCall {
             src: buffers.row.range(0, row).unwrap(),
@@ -553,7 +545,7 @@ fn norm_is_the_lane_order_scale_and_refuses_to_normalize_in_place() {
     assert_eq!(buffers.health(&stream).to_bits(), 0);
 
     let error = ctx
-        .inkling_stream_norm_rows(
+        .depth_attention_norm_rows(
             &stream,
             &[NormCall {
                 src: buffers.out.range(0, row).unwrap(),
@@ -566,7 +558,7 @@ fn norm_is_the_lane_order_scale_and_refuses_to_normalize_in_place() {
         .unwrap_err();
     assert!(
         error.contains(
-            "the CUDA Inkling stream norm output and Inkling stream norm source ranges overlap"
+            "the CUDA depth stream norm output and depth stream norm source ranges overlap"
         ),
         "{error}"
     );
@@ -576,7 +568,7 @@ fn norm_is_the_lane_order_scale_and_refuses_to_normalize_in_place() {
 /// the bits of its own single-state launch: mix, then seal, then add.
 #[test]
 fn states_in_one_launch_match_one_launch_each_bit_for_bit() {
-    if !device_present("Inkling stream states") {
+    if !device_present("depth stream states") {
         return;
     }
     let ctx = CudaContext::new().unwrap();
@@ -612,7 +604,7 @@ fn states_in_one_launch_match_one_launch_each_bit_for_bit() {
         width,
         eps: EPS,
     };
-    ctx.inkling_stream_mix_states(
+    ctx.depth_attention_mix_states(
         &stream,
         MixStatesCall {
             state: state.range(0, span(blocks + 1)).unwrap(),
@@ -637,7 +629,7 @@ fn states_in_one_launch_match_one_launch_each_bit_for_bit() {
         width,
         eps: EPS,
     };
-    ctx.inkling_stream_seal_states(
+    ctx.depth_attention_seal_states(
         &stream,
         SealCall {
             state: state.range(0, span(blocks + 2)).unwrap(),
@@ -648,7 +640,7 @@ fn states_in_one_launch_match_one_launch_each_bit_for_bit() {
         many,
     )
     .unwrap();
-    ctx.inkling_stream_add_states(
+    ctx.depth_attention_add_states(
         &stream,
         AddCall {
             state: state.range(0, span(1)).unwrap(),
@@ -664,7 +656,7 @@ fn states_in_one_launch_match_one_launch_each_bit_for_bit() {
     for r in 0..rows {
         let own = &states[r * stride * width..(r + 1) * stride * width];
         upload(&single, &stream, own);
-        ctx.inkling_stream_mix(
+        ctx.depth_attention_mix(
             &stream,
             MixCall {
                 state: single.range(0, (blocks + 1) * row).unwrap(),
@@ -683,7 +675,7 @@ fn states_in_one_launch_match_one_launch_each_bit_for_bit() {
                 .eq(expected.iter().map(|v| v.to_bits())),
             "mix of state {r}"
         );
-        ctx.inkling_stream_seal(
+        ctx.depth_attention_seal(
             &stream,
             SealCall {
                 state: single.range(0, (blocks + 2) * row).unwrap(),
@@ -693,7 +685,7 @@ fn states_in_one_launch_match_one_launch_each_bit_for_bit() {
             seal,
         )
         .unwrap();
-        ctx.inkling_stream_add(
+        ctx.depth_attention_add(
             &stream,
             AddCall {
                 state: single.range(0, row).unwrap(),
@@ -719,7 +711,7 @@ fn states_in_one_launch_match_one_launch_each_bit_for_bit() {
 /// own one-row launch; then the refusals.
 #[test]
 fn norm_rows_match_one_row_each_bit_for_bit() {
-    if !device_present("Inkling stream norm rows") {
+    if !device_present("depth stream norm rows") {
         return;
     }
     let ctx = CudaContext::new().unwrap();
@@ -750,11 +742,11 @@ fn norm_rows_match_one_row_each_bit_for_bit() {
     let rows: Vec<NormCall<'_>> = (0..count)
         .map(|r| call(r, dst.range(r * row, row).unwrap()))
         .collect();
-    ctx.inkling_stream_norm_rows(&stream, &rows, (width, EPS))
+    ctx.depth_attention_norm_rows(&stream, &rows, (width, EPS))
         .unwrap();
     let together = download(&dst, &stream, 0, count * width);
     for r in 0..count {
-        ctx.inkling_stream_norm_rows(
+        ctx.depth_attention_norm_rows(
             &stream,
             &[call(r, one.range(0, row).unwrap())],
             (width, EPS),
@@ -780,7 +772,7 @@ fn norm_rows_match_one_row_each_bit_for_bit() {
             .all(|v| v.to_bits() == 0)
     );
     let refused = |rows: &[NormCall<'_>]| {
-        ctx.inkling_stream_norm_rows(&stream, rows, (width, EPS))
+        ctx.depth_attention_norm_rows(&stream, rows, (width, EPS))
             .is_err()
     };
     assert!(refused(&[]));
@@ -808,7 +800,7 @@ fn norm_rows_match_one_row_each_bit_for_bit() {
 /// (the depth), each output the bits of its own single launch; then the refusals.
 #[test]
 fn mix_jobs_match_one_launch_each_bit_for_bit() {
-    if !device_present("Inkling stream mix jobs") {
+    if !device_present("depth stream mix jobs") {
         return;
     }
     let ctx = CudaContext::new().unwrap();
@@ -865,11 +857,11 @@ fn mix_jobs_match_one_launch_each_bit_for_bit() {
         })
         .collect();
     let health_range = health.range(0, 4).unwrap();
-    ctx.inkling_stream_mix_jobs(&stream, &jobs, &health_range, (width, EPS))
+    ctx.depth_attention_mix_jobs(&stream, &jobs, &health_range, (width, EPS))
         .unwrap();
     let together = download(&out, &stream, 0, extents.len() * width);
     for (j, &(blocks, first_block)) in extents.iter().enumerate() {
-        ctx.inkling_stream_mix(
+        ctx.depth_attention_mix(
             &stream,
             MixCall {
                 state: state_of(j),
@@ -895,7 +887,7 @@ fn mix_jobs_match_one_launch_each_bit_for_bit() {
     assert_eq!(download(&health, &stream, 0, 1)[0].to_bits(), 0);
     // Refusals: no jobs, too many jobs, one output twice, an output on a read state.
     let refused = |jobs: &[MixJob<'_>]| {
-        ctx.inkling_stream_mix_jobs(&stream, jobs, &health_range, (width, EPS))
+        ctx.depth_attention_mix_jobs(&stream, jobs, &health_range, (width, EPS))
             .is_err()
     };
     assert!(refused(&[]));

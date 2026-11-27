@@ -373,7 +373,7 @@ impl TokenWorkspace {
             let shape = last.w.plan.shape;
             let blocks = shape.blocks + usize::from(shape.seal);
             let normed = self.scratch.range(row, row)?;
-            ctx.inkling_stream_mix(
+            ctx.depth_attention_mix(
                 stream,
                 MixCall {
                     state: self.depth[last.active].range(0, row * (blocks + 1))?,

@@ -537,7 +537,7 @@ fn wrapper_rejects_bad_shapes_and_shared_bytes_by_error_text() {
 /// refused before any launch.
 #[test]
 fn a_state_row_takes_the_convolved_row_as_the_add_launch_would() {
-    use crate::kernels::cuda::resident::inkling_stream::AddCall;
+    use crate::kernels::cuda::resident::depth_attention::AddCall;
 
     if !device_present("Inkling conv state add") {
         return;
@@ -575,7 +575,7 @@ fn a_state_row_takes_the_convolved_row_as_the_add_launch_would() {
             &normal_row(&mut Rng::new(900 + step as u64), width),
         );
         upload(&sequence.health, &stream, 0, &[0.0]);
-        ctx.inkling_stream_add(
+        ctx.depth_attention_add(
             &stream,
             AddCall {
                 state: state.range(0, row).unwrap(),
