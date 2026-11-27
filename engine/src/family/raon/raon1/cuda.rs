@@ -272,6 +272,8 @@ pub(crate) struct Raon1Device {
     trace: RefCell<Option<Vec<Stage>>>,
     /// Rows of the chunk being walked, for the trace.
     rows: Cell<usize>,
+    /// Every product on the decoding routes over f32 rows: the reference of an accuracy run.
+    exact: Cell<bool>,
 }
 
 /// One named stage of a traced feed.
@@ -421,6 +423,7 @@ impl Raon1Device {
             vocab,
             trace: RefCell::new(None),
             rows: Cell::new(0),
+            exact: Cell::new(false),
         })
     }
 
@@ -464,7 +467,13 @@ impl Raon1Device {
     }
 
     fn io(&self) -> StepIo<'_> {
-        Model::io(self, false)
+        Model::io(self, self.exact.get())
+    }
+
+    /// Puts every product on the decoding routes over f32 rows, or back on the served ones.
+    #[cfg(test)]
+    pub(crate) fn set_exact(&self, on: bool) {
+        self.exact.set(on);
     }
 
     fn snap(&self, name: &str, buffer: &DeviceBuffer, values: usize) -> Result<(), EngError> {
@@ -527,7 +536,7 @@ impl Raon1Device {
         let sc = &self.sc;
         let mla = names.ordinal;
         self.io().mv(&names.q_a, sc.cur_rows(), &sc.qa, n)?;
-        // The f32 rows go to `proj`, which the mixer has not written yet; only the q8_1 rows are read.
+        // The f32 rows go to `mix_out`, which the mixer writes last; the exact route reads them.
         self.io().norm_rows(
             n,
             Q_LORA,
@@ -537,7 +546,12 @@ impl Raon1Device {
             &sc.core.mix_out,
             &sc.q8_qa,
         )?;
-        self.io().mv(&names.q_b, Rows::q8(&sc.q8_qa), &sc.qb, n)?;
+        self.io().mv(
+            &names.q_b,
+            Rows::both(&sc.q8_qa, &sc.core.mix_out),
+            &sc.qb,
+            n,
+        )?;
         self.io().mv(&names.kv_a, sc.cur_rows(), &sc.kv, n)?;
         let layer_cache = self.cells * MLA_ROW * 2;
         self.io().run(BlockOp::mla_kv_prep(
@@ -663,7 +677,7 @@ impl Model for Raon1Device {
         &self.layers
     }
 
-    fn io(&self, _exact: bool) -> StepIo<'_> {
+    fn io(&self, exact: bool) -> StepIo<'_> {
         StepIo {
             family: "raon1",
             ctx: &self.ctx,
@@ -672,8 +686,12 @@ impl Model for Raon1Device {
             derived: Some(&self.derived),
             mmq_q8: &self.sc.core.product_q8,
             fixup: &self.sc.core.fixup,
-            exact: false,
+            exact,
         }
+    }
+
+    fn exact(&self, _n: usize) -> bool {
+        self.exact.get()
     }
 
     fn core(&self) -> &Core {
@@ -726,7 +744,7 @@ impl Model for Raon1Device {
         n: usize,
     ) -> Result<((moe::Dims, ffn::Join), &moe::Scratch, ffn::Scratch<'_>), EngError> {
         let sc = &self.sc;
-        let shared = sc.ffn_scratch(n, MOE_INTER, Rows::q8(&sc.q8_ffn))?;
+        let shared = sc.ffn_scratch(n, MOE_INTER, Rows::both(&sc.q8_ffn, &sc.act_ffn))?;
         Ok(((MOE, self.situ_join()), &sc.moe, shared))
     }
 

@@ -66,6 +66,8 @@ pub(crate) struct Run {
     range: (usize, usize),
     out: PathBuf,
     reference: Option<PathBuf>,
+    /// The prompt depths of a timing run (`KVQ_TIMING`, comma separated); empty for a scoring run.
+    timing: Vec<usize>,
 }
 
 impl Run {
@@ -89,6 +91,14 @@ impl Run {
         if windows.iter().any(|&(_, _, end)| end > ids.len()) {
             return Err(bad("a window ends past the id stream"));
         }
+        let timing = match std::env::var("KVQ_TIMING") {
+            Ok(text) => text
+                .split(',')
+                .map(|x| x.parse::<usize>())
+                .collect::<Result<Vec<_>, _>>()
+                .map_err(|e| bad(format!("KVQ_TIMING: {e}")))?,
+            Err(_) => Vec::new(),
+        };
         let out = PathBuf::from(env("KVQ_OUT")?);
         std::fs::create_dir_all(&out).map_err(|e| bad(format!("KVQ_OUT: {e}")))?;
         Ok(Self {
@@ -98,6 +108,7 @@ impl Run {
             range: (lo, hi),
             out,
             reference: std::env::var("KVQ_REF").ok().map(PathBuf::from),
+            timing,
         })
     }
 
@@ -145,13 +156,16 @@ impl Run {
 
 /// Scores the pending windows of `run` on `stepper`: a reset, the window's unscored tokens fed in
 /// prompt chunks of `chunk` rows, then one forced token per scored position, each logits row
-/// narrowed to the first `vocab` ids.
+/// narrowed to the first `vocab` ids. A run with `KVQ_TIMING` set times the stepper instead.
 pub(crate) fn score_windows(
     stepper: &mut impl TokenStepper,
     run: &Run,
     chunk: usize,
     vocab: usize,
 ) -> Result<(), EngError> {
+    if !run.timing.is_empty() {
+        return time_depths(stepper, run, chunk);
+    }
     for (w, (lo, score_lo, hi)) in run.pending() {
         let started = Instant::now();
         println!("kvq window {w} start: prefill {} ids", score_lo - 1 - lo);
@@ -172,6 +186,44 @@ pub(crate) fn score_windows(
             sidecar.push(row, run.ids[p])?;
         }
         run.finish(sidecar)?;
+    }
+    Ok(())
+}
+
+/// Forced one-token steps timed after each prompt of a timing run.
+const TIMED_STEPS: usize = 64;
+
+/// Times `stepper` at each prompt depth of the run, twice (the first pass pays one-time setup):
+/// the prompt fed in chunks of `chunk` rows up to the first logits row, which is the time to the
+/// first token, then [`TIMED_STEPS`] forced one-token steps, each with its logits row read back.
+fn time_depths(stepper: &mut impl TokenStepper, run: &Run, chunk: usize) -> Result<(), EngError> {
+    for &depth in &run.timing {
+        if depth < 2 || depth + TIMED_STEPS > run.ids.len() || depth + TIMED_STEPS > run.context {
+            return Err(bad(format!(
+                "a timing depth of {depth} does not fit the stream or the context"
+            )));
+        }
+        for pass in 0..2 {
+            stepper.reset()?;
+            let started = Instant::now();
+            for piece in run.ids[..depth - 1].chunks(chunk.max(1)) {
+                stepper.feed_rows(piece)?;
+            }
+            stepper.logits(run.ids[depth - 1])?;
+            let first = started.elapsed().as_secs_f64();
+            let started = Instant::now();
+            for p in depth..depth + TIMED_STEPS {
+                stepper.logits(run.ids[p])?;
+            }
+            let steps = started.elapsed().as_secs_f64();
+            println!(
+                "kvq timing depth {depth} pass {pass}: first token {:.1} ms ({:.0} prompt tok/s), then {:.2} ms per step ({:.1} tok/s)",
+                first * 1e3,
+                depth as f64 / first,
+                steps * 1e3 / TIMED_STEPS as f64,
+                TIMED_STEPS as f64 / steps
+            );
+        }
     }
     Ok(())
 }

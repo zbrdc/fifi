@@ -777,3 +777,64 @@ fn the_device_writes_the_last_logits_row_of_a_synthetic_prompt() {
     )
     .expect("write the ids");
 }
+
+/// The device as a token stepper of the teacher-forced scorer.
+struct Scored {
+    device: Raon1Device,
+    pos: usize,
+}
+
+impl crate::family::session::TokenStepper for Scored {
+    const OPERATION: &'static str = "raon1_quality_logits";
+
+    fn feed(&mut self, token: u32) -> Result<(), crate::EngError> {
+        self.feed_rows(&[token])
+    }
+
+    fn feed_rows(&mut self, tokens: &[u32]) -> Result<(), crate::EngError> {
+        self.device.feed(tokens, self.pos, HeadRows::None)?;
+        self.pos += tokens.len();
+        Ok(())
+    }
+
+    fn logits(&mut self, token: u32) -> Result<Vec<f32>, crate::EngError> {
+        let mut rows = self.device.feed(&[token], self.pos, HeadRows::Last)?;
+        self.pos += 1;
+        rows.pop()
+            .ok_or_else(|| crate::EngError::BadRequest("raon1: the step returned no row".into()))
+    }
+
+    fn fed(&self) -> usize {
+        self.pos
+    }
+
+    fn reset(&mut self) -> Result<(), crate::EngError> {
+        self.device.reset()?;
+        self.pos = 0;
+        Ok(())
+    }
+}
+
+/// Scores the windows `KVQ_WINDOWS` of the file `KVQ_MODEL` on the device: each window's unscored
+/// tokens through the chunked feed, then one forced token per scored position. With `KVQ_EXACT`
+/// set every product decodes its weights over f32 rows, the reference of the other arms.
+#[test]
+#[ignore = "a card under fifi-gpu-run: KVQ_MODEL, KVQ_SAMPLER_VOCAB, KVQ_IDS, KVQ_IDS_SHA, KVQ_LAYOUT, KVQ_WINDOWS, KVQ_OUT, optional KVQ_REF and KVQ_EXACT"]
+fn the_device_scores_teacher_forced_windows() {
+    use crate::family::teacher_forced::{Run, score_windows};
+    let env = |name: &str| std::env::var(name).unwrap_or_else(|_| panic!("{name} is not set"));
+    let run = Run::from_env().expect("run");
+    let sampler_vocab: usize = env("KVQ_SAMPLER_VOCAB").parse().expect("KVQ_SAMPLER_VOCAB");
+    require_device("the_device_scores_teacher_forced_windows");
+    let device = Raon1Device::load(
+        &PathBuf::from(env("KVQ_MODEL")),
+        Some(run.context + 1),
+        &mut |_| {},
+    )
+    .expect("device load");
+    let exact = std::env::var_os("KVQ_EXACT").is_some();
+    device.set_exact(exact);
+    println!("kvq raon1 leg: exact={exact}");
+    let mut stepper = Scored { device, pos: 0 };
+    score_windows(&mut stepper, &run, 1024, sampler_vocab).expect("score");
+}

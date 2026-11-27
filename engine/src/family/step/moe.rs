@@ -287,12 +287,6 @@ pub(crate) fn forward(
     let [gate, up, down] = &names.stacks;
     let gu_row = used * 2 * inner * 4;
     let stride = 2 * inner;
-    if io.exact && !matches!(join, ffn::Join::Swiglu) {
-        return Err(EngError::BadRequest(format!(
-            "{}: the routed block has no exact route for this activation",
-            io.family
-        )));
-    }
     let grouped = |name: &str| !io.exact && n >= GROUPED_FROM && experts::serves(io, name);
     let gate_up = grouped(gate) && grouped(up);
     let down_grouped = grouped(down);
@@ -349,8 +343,9 @@ pub(crate) fn forward(
             ld: stride,
             col_off: inner,
         },
-        // A swiglu writes its f32 rows first; the grouped down product reads them too.
-        act: if down_grouped || matches!(join, ffn::Join::Swiglu) {
+        // A swiglu writes its f32 rows first; the grouped down product and the exact route
+        // read them too.
+        act: if down_grouped || io.exact || matches!(join, ffn::Join::Swiglu) {
             Rows::both(&sc.act_q8, &sc.act)
         } else {
             Rows::q8(&sc.act_q8)

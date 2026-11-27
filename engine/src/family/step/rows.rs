@@ -292,6 +292,13 @@ impl<'a> StepIo<'a> {
             .dst
             .buffer()
             .range(out.dst.offset() + out.col_off * 4, span)?;
+        // A product that would read rounded rows under the exact switch is no reference.
+        if self.exact && x.f32.is_none() {
+            return Err(EngError::BadRequest(format!(
+                "{}: the exact route has no f32 rows for a product of {k} inputs",
+                self.family
+            )));
+        }
         #[cfg(test)]
         let exact = self.exact || exact_class::holds(weight);
         #[cfg(not(test))]
