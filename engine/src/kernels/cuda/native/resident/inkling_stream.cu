@@ -56,12 +56,15 @@ __device__ void report(float *health, int invalid) {
 }
 
 // Depth mix in one block: the scale, the scores and the weights are block-wide reductions in the
-// lane order (`lane_sum.cuh`), and one block cannot hide a memory latency behind its threads.
-// Each lane therefore issues several loads ahead of its dependent adds (scores 16, mixed
-// channels 9); a lane still adds the same elements in the same order. Scratch timing with one to
-// 63 rows on a RTX 2080 Ti: 7.95 to 12.5 us down to 5.5 to 9.6 us for 2 to 8 rows.
+// lane order (`lane_sum.cuh`), and one block (all of a decode token's mix) cannot hide a memory
+// latency behind other blocks. Each lane therefore keeps many loads in flight ahead of its
+// dependent adds: a warp scores kScoreRows rows at once, kScoreLoads columns of each, and a lane
+// mixes kChannelLoads columns of kMixRows rows at once. Every sum still adds the same elements in
+// the same order, so the loads in flight change the time, not the bits.
 constexpr int kScoreLoads = 16;
+constexpr int kScoreRows = 2;
 constexpr int kChannelLoads = 9;
+constexpr int kMixRows = 4;
 
 // `Stream::mix(first_block, query)` of one state into `out`, in the lane order.
 __device__ __forceinline__ void weighted_mix(const float *state, const float *query, float *out,
@@ -76,34 +79,59 @@ __device__ __forceinline__ void weighted_mix(const float *state, const float *qu
     const int rows = blocks - first_block + 1;
     // Rust rms_norm_with_scale on the current row: scale = (dot(x, x) / len + eps).sqrt().recip().
     const float current_scale = lane_rms_scale(state, width, eps, scratch, invalid);
-    // The host scores dot(row, query) * (len as f32).sqrt().recip().
+    // The host scores dot(row, query) * (len as f32).sqrt().recip(). Warp w scores rows w,
+    // w + warps, ...; each row's sum runs over the lane's columns in order, then the warp folds it.
     const float norm = __frcp_rn(__fsqrt_rn(static_cast<float>(width)));
-    for (int r = warp; r < rows; r += warps) {
-        const float *row = mix_row(state, blocks, rows, r, width);
-        const float scale = r == rows - 1 ? current_scale : 1.0f;
-        float sum = -0.0f;
+    for (int base = warp; base < rows; base += warps * kScoreRows) {
+        const float *row[kScoreRows];
+        float scale[kScoreRows], sum[kScoreRows];
+        bool live[kScoreRows];
+        #pragma unroll
+        for (int j = 0; j < kScoreRows; ++j) {
+            const int r = base + warps * j;
+            live[j] = r < rows;
+            row[j] = live[j] ? mix_row(state, blocks, rows, r, width) : state;
+            scale[j] = r == rows - 1 ? current_scale : 1.0f;
+            sum[j] = -0.0f;
+        }
         int i = sub;
         for (; i + 32 * (kScoreLoads - 1) < width; i += 32 * kScoreLoads) {
-            float value[kScoreLoads], q[kScoreLoads];
+            float q[kScoreLoads], value[kScoreRows][kScoreLoads];
             #pragma unroll
-            for (int u = 0; u < kScoreLoads; ++u) {
-                value[u] = row[i + 32 * u];
-                q[u] = query[i + 32 * u];
+            for (int u = 0; u < kScoreLoads; ++u) q[u] = query[i + 32 * u];
+            #pragma unroll
+            for (int j = 0; j < kScoreRows; ++j) {
+                #pragma unroll
+                for (int u = 0; u < kScoreLoads; ++u) {
+                    value[j][u] = live[j] ? row[j][i + 32 * u] : 0.0f;
+                }
             }
             #pragma unroll
-            for (int u = 0; u < kScoreLoads; ++u) {
-                invalid |= !isfinite(value[u]) || !isfinite(q[u]);
-                sum = __fadd_rn(sum, __fmul_rn(__fmul_rn(value[u], scale), q[u]));
+            for (int j = 0; j < kScoreRows; ++j) {
+                if (!live[j]) continue;
+                #pragma unroll
+                for (int u = 0; u < kScoreLoads; ++u) {
+                    invalid |= !isfinite(value[j][u]) || !isfinite(q[u]);
+                    sum[j] = __fadd_rn(sum[j], __fmul_rn(__fmul_rn(value[j][u], scale[j]), q[u]));
+                }
             }
         }
         for (; i < width; i += 32) {
-            const float value = row[i];
             const float q = query[i];
-            invalid |= !isfinite(value) || !isfinite(q);
-            sum = __fadd_rn(sum, __fmul_rn(__fmul_rn(value, scale), q));
+            #pragma unroll
+            for (int j = 0; j < kScoreRows; ++j) {
+                if (!live[j]) continue;
+                const float value = row[j][i];
+                invalid |= !isfinite(value) || !isfinite(q);
+                sum[j] = __fadd_rn(sum[j], __fmul_rn(__fmul_rn(value, scale[j]), q));
+            }
         }
-        sum = lane_warp_sum(sum);
-        if (sub == 0) scores[r] = __fmul_rn(sum, norm);
+        #pragma unroll
+        for (int j = 0; j < kScoreRows; ++j) {
+            if (!live[j]) continue;
+            const float total = lane_warp_sum(sum[j]);
+            if (sub == 0) scores[base + warps * j] = __fmul_rn(total, norm);
+        }
     }
     __syncthreads();
     if (lane == 0) {
@@ -119,19 +147,36 @@ __device__ __forceinline__ void weighted_mix(const float *state, const float *qu
     }
     __syncthreads();
     const float mass = shared_mass;
+    // Row r's value of column c: the current row (last) scaled, a sealed row as stored.
+    const auto mixed = [&](int r, int c) {
+        const float raw = mix_row(state, blocks, rows, r, width)[c];
+        return r == rows - 1 ? __fmul_rn(raw, current_scale) : raw;
+    };
     int i = lane;
     for (; i + threads * (kChannelLoads - 1) < width; i += threads * kChannelLoads) {
         float value[kChannelLoads];
         #pragma unroll
         for (int u = 0; u < kChannelLoads; ++u) value[u] = 0.0f;
-        for (int r = 0; r < rows; ++r) {
-            const float *row = mix_row(state, blocks, rows, r, width);
+        int r = 0;
+        for (; r + kMixRows <= rows; r += kMixRows) {
+            float x[kMixRows][kChannelLoads];
+            #pragma unroll
+            for (int k = 0; k < kMixRows; ++k) {
+                #pragma unroll
+                for (int u = 0; u < kChannelLoads; ++u) x[k][u] = mixed(r + k, i + threads * u);
+            }
+            #pragma unroll
+            for (int k = 0; k < kMixRows; ++k) {
+                #pragma unroll
+                for (int u = 0; u < kChannelLoads; ++u) {
+                    value[u] = __fadd_rn(value[u], __fmul_rn(weights[r + k], x[k][u]));
+                }
+            }
+        }
+        for (; r < rows; ++r) {
             float x[kChannelLoads];
             #pragma unroll
-            for (int u = 0; u < kChannelLoads; ++u) {
-                const float raw = row[i + threads * u];
-                x[u] = r == rows - 1 ? __fmul_rn(raw, current_scale) : raw;
-            }
+            for (int u = 0; u < kChannelLoads; ++u) x[u] = mixed(r, i + threads * u);
             #pragma unroll
             for (int u = 0; u < kChannelLoads; ++u) {
                 value[u] = __fadd_rn(value[u], __fmul_rn(weights[r], x[u]));
@@ -146,12 +191,17 @@ __device__ __forceinline__ void weighted_mix(const float *state, const float *qu
     }
     for (; i < width; i += threads) {
         float value = 0.0f;
-        for (int r = 0; r < rows; ++r) {
-            const float x = r == rows - 1
-                                ? __fmul_rn(state[i], current_scale)
-                                : mix_row(state, blocks, rows, r, width)[i];
-            value = __fadd_rn(value, __fmul_rn(weights[r], x));
+        int r = 0;
+        for (; r + kMixRows <= rows; r += kMixRows) {
+            float x[kMixRows];
+            #pragma unroll
+            for (int k = 0; k < kMixRows; ++k) x[k] = mixed(r + k, i);
+            #pragma unroll
+            for (int k = 0; k < kMixRows; ++k) {
+                value = __fadd_rn(value, __fmul_rn(weights[r + k], x[k]));
+            }
         }
+        for (; r < rows; ++r) value = __fadd_rn(value, __fmul_rn(weights[r], mixed(r, i)));
         value = __fdiv_rn(value, mass);
         out[i] = value;
         invalid |= !isfinite(value);
