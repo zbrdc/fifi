@@ -1167,7 +1167,8 @@ fn card_runs_the_routed_expert_model_of_the_lineage() {
 /// takes the next position as one row (the reference) and as row 0 of chunks of 2, 5 and 16
 /// rows. Prints, per visit, the relative error of row 0 of the mixer output and of the residual
 /// after the feed-forward: the first visit and half where a chunk departs names the part whose
-/// chunk form computes another value.
+/// chunk form computes another value. The 2-row chunk takes the few-row kernels of a step; the
+/// larger two take the chunk kernels of the delta rule and the products.
 #[test]
 fn card_reports_where_an_exact_chunk_leaves_the_exact_row() {
     use crate::family::qwen::recipe::{layers, routed_experts, tensors};

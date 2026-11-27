@@ -135,11 +135,19 @@ impl LoopStep<'_> {
         }
         // A chunk may regrow the workspace the recorded step holds: the next steps record again.
         self.replay = Replay::default();
+        // On the decoding routes a piece is as many rows as the attention that scores in f32
+        // takes in one launch and its scratch holds.
+        let piece = if self.exact_chunks {
+            let one = self.attn_dims.row_part_bytes(1)?;
+            (self.rows.part.bytes() / one).clamp(1, attend::ROW_ATTENTION_ROWS)
+        } else {
+            PREFILL_ROWS
+        };
         let mut m = 0;
-        for (chunk, rows) in embed_rows.chunks(PREFILL_ROWS * h).enumerate() {
+        for (chunk, rows) in embed_rows.chunks(piece * h).enumerate() {
             m = rows.len() / h;
-            ensure_rows(p0 + chunk * PREFILL_ROWS, m, self.cache_rows)?;
-            self.walk(&le_f32(rows), m, p0 + chunk * PREFILL_ROWS, None)?;
+            ensure_rows(p0 + chunk * piece, m, self.cache_rows)?;
+            self.walk(&le_f32(rows), m, p0 + chunk * piece, None)?;
         }
         self.head(m - 1, false)
     }
@@ -190,13 +198,20 @@ impl LoopStep<'_> {
         self.visits(m, p0, trace.take())
     }
 
+    /// Whether the attention of an `n`-row chunk reads its position from the step parameters
+    /// and scores in f32: a few rows always, and every chunk on the decoding routes, whose
+    /// tensor-core attention would round its queries.
+    fn at_step_position(&self, n: usize) -> bool {
+        n <= FEW_ROWS || self.exact_chunks
+    }
+
     /// The uploads of one chunk: its embedding rows into the residual and, for one row, the
     /// position into the step parameters.
     pub(super) fn feed(&self, embed: &[u8], m: usize, p0: usize) -> Result<(), EngError> {
         // Behind the last chunk's kernels: a blocking copy would land at once, and the
         // chunk before would write its final residual over it.
         self.rows.core.resid[0].write_at_enqueue(&self.stream, 0, embed)?;
-        if m <= FEW_ROWS {
+        if self.at_step_position(m) {
             let params = StepParams::new(0, p0 as i32)?;
             self.params
                 .write_at_enqueue(&self.stream, 0, &params.to_bytes())?;
@@ -274,7 +289,7 @@ impl Model for LoopStep<'_> {
 
     /// A chunk of a few rows reads its first position from the step parameters.
     fn begin(&self, n: usize) -> Result<(), EngError> {
-        if n <= FEW_ROWS {
+        if self.at_step_position(n) {
             self.ctx
                 .step_begin(&self.stream, bytes_range(&self.params, STEP_PARAMS_BYTES)?)?;
         }
@@ -291,7 +306,7 @@ impl Model for LoopStep<'_> {
         p0: usize,
     ) -> Result<(attend::Dims, attend::AttendRows<'_>, attend::At<'_>), EngError> {
         let rows = &self.rows;
-        let at = if n <= FEW_ROWS {
+        let at = if self.at_step_position(n) {
             attend::At::Row {
                 pos: self.params_word(OFFSET_POS)?,
                 kv_len: self.params_word(OFFSET_KV_LEN)?,

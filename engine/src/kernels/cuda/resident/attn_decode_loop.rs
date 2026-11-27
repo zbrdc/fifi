@@ -43,7 +43,8 @@ use crate::kernels::cuda::native::resident::attn_decode_loop::{
 /// Query heads per kv head; the kernel's lane layout needs exactly 4.
 const GROUP: usize = 4;
 const HEAD_DIM: usize = 256;
-const MAX_TOKENS: usize = 16;
+/// The most rows one launch scores.
+pub(crate) const MAX_TOKENS: usize = 16;
 /// The most kv heads (the kernel's grid and the part layout are sized for it).
 const MAX_KV_HEADS: usize = 64;
 /// The most splits (one thread per split in the combine statistics step).

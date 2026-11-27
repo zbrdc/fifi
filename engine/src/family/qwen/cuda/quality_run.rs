@@ -3,8 +3,10 @@
 //! its sidecars with another engine's or with its own exact route.
 //!
 //! The leg prefills each window's unscored tokens through the chunked prefill, then feeds one
-//! forced token per scored position through the decode step. With `KVQ_EXACT` set every product
-//! decodes its weights over f32 rows: that run is the reference the other arms are scored against.
+//! forced token per scored position through the decode step. With `KVQ_EXACT` set the products
+//! decode their weights over f32 rows and the prompt's attention scores in f32: that run is the
+//! reference the other arms are scored against. `KVQ_EXACT=chunks` or `=rows` does so for one
+//! of the two routes only.
 
 use std::rc::Rc;
 use std::sync::Arc;
@@ -127,8 +129,9 @@ fn lineage_quality_leg() {
         .expect("load");
     let mut step =
         LoopStep::open_model(ctx.clone(), &loaded, &model, routing, run.context + 1).expect("step");
-    // `KVQ_EXACT=chunks` or `=rows` puts only the prompt chunks or only the one-row steps on
-    // the decoding routes; any other value puts both.
+    // `KVQ_EXACT=chunks` puts the prompt pieces of two rows or more on the decoding routes,
+    // `=rows` the one-row steps (the scored positions, and a prompt's last piece when it is one
+    // row); any other value puts both.
     let exact = std::env::var("KVQ_EXACT").ok();
     let (rows, chunks) = match exact.as_deref() {
         None => (false, false),

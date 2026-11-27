@@ -1,6 +1,7 @@
 //! The trunk executor of the lineage on the device: a chunk of token rows through the visits of
-//! a model's layer list (the looped model's 56, the routed-expert model's 40). The walk and the chunk mixers are in [`prefill`]; this module holds the step, its
-//! state and the one-row mixers a decode step (a chunk of one row) takes.
+//! a model's layer list (the looped model's 56, the routed-expert model's 40). The walk and the
+//! chunk mixers are in [`prefill`]; this module holds the step, its state and the one-row
+//! mixers a decode step (a chunk of one row) takes.
 //!
 //! For the looped model the trunk is the CPU reference's
 //! (`crate::family::qwen::sensenova::step::token`), visit for visit: mHC

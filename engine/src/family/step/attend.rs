@@ -74,6 +74,27 @@ pub(crate) struct Dims {
     pub(crate) row_splits: usize,
 }
 
+/// The most rows a visit takes on the attention that reads its position from the step's device
+/// words: what either of its kernels scores in one launch.
+pub(crate) const ROW_ATTENTION_ROWS: usize = {
+    let (group, looped) = (
+        crate::kernels::cuda::resident::attn_decode::MAX_TOKENS,
+        crate::kernels::cuda::resident::attn_decode_loop::MAX_TOKENS,
+    );
+    if group < looped { group } else { looped }
+};
+
+impl Dims {
+    /// The bytes of partial rows `n` rows take on the attention that reads its position from
+    /// the step's device words.
+    pub(crate) fn row_part_bytes(&self, n: usize) -> Result<usize, EngError> {
+        match self.heads / self.kv_heads {
+            4 if self.head_dim == 256 => attn_loop_part_bytes(n, self.kv_heads, self.row_splits),
+            _ => attn_part_bytes(n, self.kv_heads, self.head_dim, self.row_splits),
+        }
+    }
+}
+
 /// The layer of block `stem` over the tensors of `map`, under the names a GGUF gives them.
 /// The tensors of the attention layer of block `stem`, by name.
 pub(crate) fn tensors(stem: &str) -> impl Iterator<Item = String> + '_ {
