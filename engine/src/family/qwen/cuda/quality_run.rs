@@ -73,7 +73,7 @@ impl TokenStepper for Stepper<'_> {
 
 /// Scores the windows `KVQ_WINDOWS` of the lineage's model `KVQ_MODEL` on the lineage's step.
 #[test]
-#[ignore = "a card under fifi-gpu-run: KVQ_MODEL, KVQ_SAMPLER_VOCAB, KVQ_IDS, KVQ_IDS_SHA, KVQ_LAYOUT, KVQ_WINDOWS, KVQ_OUT, optional KVQ_REF, KVQ_EXACT and KVQ_FEED_ROWS"]
+#[ignore = "a card under fifi-gpu-run: KVQ_MODEL, KVQ_SAMPLER_VOCAB, KVQ_IDS, KVQ_IDS_SHA, KVQ_LAYOUT, KVQ_WINDOWS, KVQ_OUT, optional KVQ_REF, KVQ_EXACT, KVQ_EXACT_CLASS and KVQ_FEED_ROWS"]
 fn lineage_quality_leg() {
     let env = |name: &str| std::env::var(name).unwrap_or_else(|_| panic!("{name} is not set"));
     let run = Run::from_env().expect("run");
@@ -107,6 +107,34 @@ fn lineage_quality_leg() {
     step.set_exact_routes(rows, chunks);
     println!("kvq lineage leg: {} exact={exact:?}", model.family);
     let shape = model.shape;
+    // `KVQ_EXACT_CLASS` puts one class of products of the looped Q4_K_M file on the decoding
+    // routes in every step and chunk, the others staying on the served ones: the distance from
+    // the reference that goes away is at least that class's share. A class is a (rows, inputs,
+    // type) triple, so it holds only the layers that store the tensor in the named type (the
+    // file mixes types per layer), and `mixer-out` holds the delta rule's and the attention's
+    // output projections alike, which have one shape.
+    if let Ok(name) = std::env::var("KVQ_EXACT_CLASS") {
+        use crate::family::step::rows::exact_class;
+        use crate::kernels::cuda::resident::matvec_q::QuantType::{Q4K, Q6K};
+        let (h, ff) = (shape.hidden, shape.feed_forward);
+        let (q, kv) = (
+            shape.heads_q * 2 * shape.head_dim,
+            shape.heads_kv * shape.head_dim,
+        );
+        let class = match name.as_str() {
+            "delta-inputs" => (shape.qkvz_dim(), h, Q6K),
+            "delta-logits" => (2 * shape.delta_value_heads, h, Q4K),
+            "mixer-out" => (h, shape.delta_inner(), Q4K),
+            "ffn-gate-up" => (ff, h, Q4K),
+            "ffn-down" => (h, ff, Q6K),
+            "attn-q" => (q, h, Q4K),
+            "attn-k" => (kv, h, Q4K),
+            "attn-v" => (kv, h, Q6K),
+            other => panic!("KVQ_EXACT_CLASS: no class named {other}"),
+        };
+        exact_class::set(Some(class));
+        println!("kvq lineage leg: class {name} = {class:?} on the decoding routes");
+    }
     let mut stepper = Stepper {
         step,
         projector: GgufProjector::new(file.clone()),

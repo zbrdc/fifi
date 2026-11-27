@@ -1231,6 +1231,103 @@ fn the_served_stepper_runs_the_routed_expert_model() {
     );
 }
 
+/// Timing, not a gate: the parts of one served decode step of a lineage model
+/// (`LINEAGE_STEP_GGUF`), after a prompt of `LINEAGE_STEP_PROMPT` hashed ids (default 512).
+/// Over 64 steps each: the host gather of the embedding row; the step with its upload, waited
+/// on without reading anything; the read of the logits row and its conversion; an argmax over
+/// the row, the least a host sampler does. What the host pays around the kernels is what a
+/// token tail on the device would save.
+#[test]
+fn card_reports_the_parts_of_a_served_step() {
+    const STEPS: usize = 64;
+    let Ok(path) = std::env::var("LINEAGE_STEP_GGUF") else {
+        eprintln!("skipped: set LINEAGE_STEP_GGUF");
+        return;
+    };
+    if !device_present("the parts of a served step") {
+        return;
+    }
+    let prompt: usize = std::env::var("LINEAGE_STEP_PROMPT").map_or(512, |v| v.parse().unwrap());
+    let file = Arc::new(
+        GgufWeights::open_any_type(
+            &std::path::PathBuf::from(path),
+            GgufLimits {
+                max_header_bytes: 32 << 20,
+                max_tensor_bytes: 8 << 30,
+            },
+            None,
+        )
+        .unwrap(),
+    );
+    let (model, routing) = super::serve::model_of(&file).unwrap();
+    let ctx = Rc::new(CudaContext::new().unwrap());
+    let loaded = super::serve::load_model(&ctx, &file, &model).unwrap();
+    let shape = model.shape;
+    let embd = crate::family::project::gguf::GgufMatrix::new(
+        file.header(),
+        "token_embd.weight",
+        shape.vocab,
+        shape.hidden,
+    )
+    .unwrap();
+    let mut projector = GgufProjector::new(file.clone());
+    let mut card = LoopStep::open_model(
+        ctx.clone(),
+        &loaded,
+        &model,
+        routing,
+        prompt + 2 * STEPS + 8,
+    )
+    .unwrap();
+    let ids: Vec<u32> = (1..=(prompt + 2 * STEPS) as u32)
+        .map(|i| (i.wrapping_mul(2_654_435_761) >> 7) % shape.vocab as u32)
+        .collect();
+    let rows = projector.rows(&embd, &ids[..prompt]).unwrap();
+    card.prefill(&rows, 0).unwrap();
+    card.stream().synchronize().unwrap();
+    let ms = |t: std::time::Instant| t.elapsed().as_secs_f64() * 1e3 / STEPS as f64;
+    // The first steps record the launches; they are not timed.
+    for (i, &token) in ids[prompt..prompt + 4].iter().enumerate() {
+        let row = projector.rows(&embd, &[token]).unwrap();
+        card.decode(&row, prompt + i).unwrap();
+    }
+    card.stream().synchronize().unwrap();
+    let base = prompt + 4;
+    let (mut gather, mut step, mut read, mut pick) = (0.0, 0.0, 0.0, 0.0);
+    let mut bytes = vec![0u8; card.logits_row().bytes()];
+    let mut kept = 0u32;
+    for (i, &token) in ids[base..base + STEPS].iter().enumerate() {
+        let t = std::time::Instant::now();
+        let row = projector.rows(&embd, &[token]).unwrap();
+        gather += ms(t);
+        let t = std::time::Instant::now();
+        card.decode(&row, base + i).unwrap();
+        card.stream().synchronize().unwrap();
+        step += ms(t);
+        let t = std::time::Instant::now();
+        card.logits_row()
+            .read_at(card.stream(), 0, &mut bytes)
+            .unwrap();
+        let logits: Vec<f32> = bytes
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .map(|w| f32::from_le_bytes(*w))
+            .collect();
+        read += ms(t);
+        let t = std::time::Instant::now();
+        kept ^= argmax(&logits);
+        pick += ms(t);
+    }
+    let total = gather + step + read + pick;
+    eprintln!(
+        "{} at {prompt} prompt ids, ms per step: embedding gather {gather:.3} | upload, kernels and wait {step:.3} | logits read and conversion {read:.3} | argmax {pick:.3} | total {total:.3} ({:.1} tok/s); host share {:.1}% (check {kept})",
+        model.family,
+        1e3 / total,
+        100.0 * (gather + read + pick) / total
+    );
+}
+
 /// Anatomy, not a gate: where a chunk leaves a one-row step when both are on the decoding
 /// routes, for the routed-expert model. Every card carries the same state (the first half of
 /// the stream `<QWEN_EXPERTS_ROWS_OUT>.ids`, one row at a time on the decoding routes), then
