@@ -28,6 +28,8 @@ use crate::kernels::cuda::resident::attn_prep::{
 use crate::kernels::cuda::resident::quantize_q8_1::QuantizeCall;
 use crate::kernels::cuda::{DeviceBuffer, DeviceRange, NativeWeight};
 
+pub(crate) mod latent;
+
 const F32: usize = size_of::<f32>();
 
 fn floats(buffer: &DeviceBuffer, len: usize) -> Result<DeviceRange<'_>, EngError> {

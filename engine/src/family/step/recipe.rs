@@ -49,7 +49,17 @@ pub(crate) enum Mixer {
     Delta { names: Box<DeltaNames>, slot: usize },
     /// The gated attention of block `stem`, caching in slot `slot`.
     Attend { stem: String, slot: usize },
+    /// The low-rank attention: one cached latent row per position, the layer's cache and
+    /// factors in slot `slot`.
+    Latent {
+        names: Box<attend::latent::Names>,
+        slot: usize,
+    },
     /// A mixer of the model's own.
+    #[expect(
+        dead_code,
+        reason = "no model on the walk has a mixer the step lacks; a port may hold one for a slice"
+    )]
     Own,
 }
 
@@ -87,6 +97,9 @@ impl Layer {
                 names.extend(delta.tensors().into_iter().map(str::to_owned));
             }
             Mixer::Attend { stem, .. } => names.extend(attend::tensors(stem)),
+            Mixer::Latent { names: latent, .. } => {
+                names.extend(latent.tensors().into_iter().map(str::to_owned));
+            }
             Mixer::Own => {}
         }
         match &self.forward {
@@ -135,6 +148,7 @@ impl Layer {
                     map.family
                 )));
             }
+            (Mixer::Latent { names, .. }, _) => names.check(map)?,
             (Mixer::Own, _) => {}
         }
         match &self.forward {
@@ -189,6 +203,15 @@ pub(crate) trait Model {
         _p0: usize,
     ) -> Result<(attend::Dims, AttendRows<'_>, At<'_>), EngError> {
         unsupported(self.family(), "an attention layer")
+    }
+    /// The widths and the rows of a low-rank attention visit over `n` rows, with the cache and
+    /// the factors of slot `slot`.
+    fn latent(
+        &self,
+        _slot: usize,
+        _n: usize,
+    ) -> Result<(attend::latent::Dims, attend::latent::LatentRows<'_>), EngError> {
+        unsupported(self.family(), "a low-rank attention layer")
     }
     /// The mixer of visit `visit`, for a layer whose mixer is the model's own.
     fn own_mixer(&self, _visit: usize, _n: usize, _p0: usize) -> Result<(), EngError> {
@@ -329,6 +352,10 @@ impl<M: Model> Visits for Walk<'_, M> {
                     let resolved = attend::resolve(&io.map(), stem, dims)?;
                     let cache = m.state().cache(*slot)?;
                     attend::mix(&io, &resolved, &rows, cache, n, at)?;
+                }
+                Mixer::Latent { names, slot } => {
+                    let (dims, rows) = m.latent(*slot, n)?;
+                    attend::latent::mix(&io, names, dims, &rows, n, p0)?;
                 }
                 Mixer::Own => m.own_mixer(visit, n, p0)?,
             },

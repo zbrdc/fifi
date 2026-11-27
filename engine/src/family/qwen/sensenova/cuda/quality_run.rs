@@ -74,7 +74,7 @@ impl TokenStepper for Stepper<'_> {
 
 /// Scores the windows `KVQ_WINDOWS` of the lineage's model `KVQ_MODEL` on the lineage's step.
 #[test]
-#[ignore = "a card under fifi-gpu-run: KVQ_MODEL, KVQ_SAMPLER_VOCAB, KVQ_IDS, KVQ_IDS_SHA, KVQ_LAYOUT, KVQ_WINDOWS, KVQ_OUT, optional KVQ_REF and KVQ_EXACT"]
+#[ignore = "a card under fifi-gpu-run: KVQ_MODEL, KVQ_SAMPLER_VOCAB, KVQ_IDS, KVQ_IDS_SHA, KVQ_LAYOUT, KVQ_WINDOWS, KVQ_OUT, optional KVQ_REF, KVQ_EXACT and KVQ_FEED_ROWS"]
 fn lineage_quality_leg() {
     let env = |name: &str| std::env::var(name).unwrap_or_else(|_| panic!("{name} is not set"));
     let run = Run::from_env().expect("run");
@@ -143,5 +143,12 @@ fn lineage_quality_leg() {
         .expect("embedding"),
         pos: 0,
     };
-    score_windows(&mut stepper, &run, FEED_ROWS, sampler_vocab).expect("score");
+    // `KVQ_FEED_ROWS` feeds the prompt in smaller pieces. Under the exact switch one row at a
+    // time takes the one-row decoding product where a chunk takes the batched one: a second
+    // exact arithmetic to hold the first against.
+    let feed = match std::env::var("KVQ_FEED_ROWS") {
+        Ok(rows) => rows.parse().expect("KVQ_FEED_ROWS"),
+        Err(_) => FEED_ROWS,
+    };
+    score_windows(&mut stepper, &run, feed, sampler_vocab).expect("score");
 }

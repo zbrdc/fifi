@@ -1,0 +1,207 @@
+//! The low-rank attention mixer of a visit: every head reads one cached latent row per position.
+//!
+//! The query takes two projections with a norm between them and ends as a content part and a
+//! rotary part per head. One projection writes the key and value of a row as a single latent
+//! row with its rotary part; the prep norms it, turns the rotary part at the row's position and
+//! stores it in the layer's cache. A per-head factor carries the query's content part into the
+//! latent space, so the score of a head is one dot product over a cached row; a second factor
+//! carries the attended latent back to the head width. A projected gate scales the result
+//! before the output projection.
+
+use super::super::rows::{Rows, StepIo};
+use crate::EngError;
+use crate::kernels::cuda::resident::block_ops::{BlockOp, MLA_GROUP, MlaShape};
+use crate::kernels::cuda::{DeviceBuffer, DeviceRange};
+
+/// The partial rows a visit may launch at most; the scratch is sized for them.
+pub(crate) const PART_ROWS: usize = 320;
+
+/// The tensors of one layer.
+pub(crate) struct Names {
+    /// The two query projections and the norm between them.
+    pub(crate) query_low: String,
+    pub(crate) query_norm: String,
+    pub(crate) query: String,
+    /// The projection of the shared key and value row, and the norm of its latent part.
+    pub(crate) latent: String,
+    pub(crate) latent_norm: String,
+    pub(crate) gate: String,
+    pub(crate) out: String,
+}
+
+impl Names {
+    /// Every tensor of the layer, in the order a load takes them.
+    pub(crate) fn tensors(&self) -> [&str; 7] {
+        [
+            &self.query_low,
+            &self.query_norm,
+            &self.query,
+            &self.latent,
+            &self.latent_norm,
+            &self.gate,
+            &self.out,
+        ]
+    }
+
+    /// Resolves every tensor, so a missing one stops a load and not a step.
+    pub(crate) fn check(&self, map: &super::super::rows::Map<'_>) -> Result<(), EngError> {
+        for name in [&self.query_norm, &self.latent_norm] {
+            map.raw(name)?;
+        }
+        for name in [
+            &self.query_low,
+            &self.query,
+            &self.latent,
+            &self.gate,
+            &self.out,
+        ] {
+            map.native(name)?;
+        }
+        Ok(())
+    }
+}
+
+/// The widths of the layers.
+#[derive(Clone, Copy)]
+pub(crate) struct Dims {
+    pub(crate) heads: usize,
+    pub(crate) head_dim: usize,
+    /// The content part of a head's query.
+    pub(crate) key_dim: usize,
+    /// The latent part and the rotary part of a cached row.
+    pub(crate) rank: usize,
+    pub(crate) rot_dims: usize,
+    /// The width between the two query projections.
+    pub(crate) query_rank: usize,
+    pub(crate) scale: f32,
+    pub(crate) eps: f32,
+}
+
+/// The rows a visit works in, the layer's two factors and its cache.
+pub(crate) struct LatentRows<'a> {
+    /// The normed input rows.
+    pub(crate) input: Rows<'a>,
+    pub(crate) query_low: &'a DeviceBuffer,
+    /// The q8_1 rows of the normed low query; its f32 rows go to [`Self::out`], which the
+    /// visit writes last.
+    pub(crate) query_low_q8: &'a DeviceBuffer,
+    pub(crate) query: &'a DeviceBuffer,
+    pub(crate) latent: &'a DeviceBuffer,
+    /// The queries carried into the latent space.
+    pub(crate) absorbed: &'a DeviceBuffer,
+    pub(crate) part: &'a DeviceBuffer,
+    pub(crate) mixed: &'a DeviceBuffer,
+    /// The attended rows at the head width, their gate, and the gated rows.
+    pub(crate) attended: &'a DeviceBuffer,
+    pub(crate) gate: &'a DeviceBuffer,
+    pub(crate) gated: Rows<'a>,
+    /// The mixer output rows, hidden wide.
+    pub(crate) out: &'a DeviceBuffer,
+    /// The factors that carry a query into the latent space and a latent to the head width.
+    pub(crate) key_factor: DeviceRange<'a>,
+    pub(crate) value_factor: DeviceRange<'a>,
+    /// The layer's cache and the positions it holds.
+    pub(crate) cache: DeviceRange<'a>,
+    pub(crate) cells: usize,
+}
+
+/// One low-rank attention visit over `n` rows whose first row sits at `p0`.
+pub(crate) fn mix(
+    io: &StepIo<'_>,
+    names: &Names,
+    d: Dims,
+    rows: &LatentRows<'_>,
+    n: usize,
+    p0: usize,
+) -> Result<(), EngError> {
+    let (row, query_row, width) = (
+        d.rank + d.rot_dims,
+        d.key_dim + d.rot_dims,
+        d.heads * d.head_dim,
+    );
+    io.mv(&names.query_low, rows.input, rows.query_low, n)?;
+    io.norm_rows(
+        n,
+        d.query_rank,
+        d.eps,
+        rows.query_low,
+        io.raw(&names.query_norm)?,
+        rows.out,
+        rows.query_low_q8,
+    )?;
+    // The served routes read the rounded rows only: f32 rows beside them would move a chunk
+    // onto another product.
+    let normed = if io.exact {
+        Rows::both(rows.query_low_q8, rows.out)
+    } else {
+        Rows::q8(rows.query_low_q8)
+    };
+    io.mv(&names.query, normed, rows.query, n)?;
+    io.mv(&names.latent, rows.input, rows.latent, n)?;
+    io.run(BlockOp::mla_kv_prep(
+        n,
+        d.rank,
+        d.rot_dims,
+        p0,
+        rows.cells,
+        d.eps,
+        rows.latent.range(0, n * row * 4)?,
+        io.raw(&names.latent_norm)?,
+        rows.cache,
+    )?)?;
+    let shape = MlaShape {
+        n,
+        heads: d.heads,
+        nope: d.key_dim,
+        rope: d.rot_dims,
+        rank: d.rank,
+    };
+    io.run(BlockOp::mla_q_absorb(
+        shape,
+        rows.query.range(0, n * d.heads * query_row * 4)?,
+        rows.key_factor,
+        rows.absorbed.range(0, n * d.heads * row * 4)?,
+    )?)?;
+    let keys = p0 + n;
+    let groups = d.heads / MLA_GROUP;
+    let splits = if n >= 64 {
+        1
+    } else {
+        keys.div_ceil(1024)
+            .clamp(1, 32)
+            .min(PART_ROWS / (n * groups))
+            .max(1)
+    };
+    let per_split = keys.div_ceil(splits).div_ceil(32) * 32;
+    let part_bytes = n * groups * splits * MLA_GROUP * (d.rank + 4) * 4;
+    io.run(BlockOp::mla_attn(
+        shape,
+        p0,
+        splits,
+        per_split,
+        d.scale,
+        rows.absorbed.range(0, n * d.heads * row * 4)?,
+        rows.cache,
+        rows.part.range(0, part_bytes)?,
+    )?)?;
+    io.run(BlockOp::mla_reduce(
+        n,
+        d.heads,
+        d.rank,
+        splits,
+        rows.part.range(0, part_bytes)?,
+        rows.mixed.range(0, n * d.heads * d.rank * 4)?,
+    )?)?;
+    io.run(BlockOp::mla_project(
+        n,
+        d.heads,
+        d.rank,
+        d.head_dim,
+        rows.mixed.range(0, n * d.heads * d.rank * 4)?,
+        rows.value_factor,
+        rows.attended.range(0, n * width * 4)?,
+    )?)?;
+    io.mv(&names.gate, rows.input, rows.gate, n)?;
+    io.quantize(n, width, rows.attended, Some(rows.gate), rows.gated)?;
+    io.mv(&names.out, rows.gated, rows.out, n)
+}

@@ -24,13 +24,14 @@ use crate::family::mem::DEVICE;
 use crate::family::project::cuda::{
     BorrowedLoader, CudaWeight, CudaWeights, LoadOptions, Reserve, WeightLayout, served_admission,
 };
+use crate::family::step::attend::latent;
 use crate::family::step::recipe::{Forward, Layer, Mixer, Model, Site, Stage as WalkStage, Walk};
 use crate::family::step::rows::{Map, Rows, StepIo};
 use crate::family::step::scratch::{Alloc, Core, Count, OnDevice, Widths, Zeroed};
 use crate::family::step::state::{Slots, State};
 use crate::family::step::walk::{self, ChunkStep, Half};
 use crate::family::step::{delta, ffn, head, moe, site};
-use crate::kernels::cuda::resident::block_ops::{BlockOp, MLA_GROUP, MlaShape};
+use crate::kernels::cuda::resident::block_ops::{BlockOp, MLA_GROUP};
 use crate::kernels::cuda::{CudaContext, DeviceBuffer, DeviceStream};
 use crate::weights::GgufType;
 use crate::weights::dequantize;
@@ -116,21 +117,8 @@ fn plan_error(message: String) -> EngError {
     EngError::MemoryPlan(format!("raon1: {message}"))
 }
 
-/// The tensor names of one latent-attention layer.
-struct MlaNames {
-    /// Index among the latent-attention layers.
-    ordinal: usize,
-    output: String,
-    gate: String,
-    q_a: String,
-    q_a_norm: String,
-    q_b: String,
-    kv_a: String,
-    kv_a_norm: String,
-}
-
-/// The recipe entry of layer `layer`, and its latent-attention names when that is its mixer.
-fn layer_recipe(spec: Raon1Spec, hy: &Hyper, layer: usize) -> (Layer, Option<MlaNames>) {
+/// The recipe entry of layer `layer`.
+fn layer_recipe(spec: Raon1Spec, hy: &Hyper, layer: usize) -> Layer {
     let latent = spec.mla_layers.contains(&layer);
     let ordinal = (0..layer)
         .filter(|l| spec.mla_layers.contains(l) == latent)
@@ -140,7 +128,18 @@ fn layer_recipe(spec: Raon1Spec, hy: &Hyper, layer: usize) -> (Layer, Option<Mla
         |stem: &str, tail: &str| ["gate", "up", "down"].map(|t| n(&format!("{stem}{t}{tail}")));
     let site = |name: &str| ["fn", "base", "scale"].map(|t| n(&format!("hc_{name}_{t}.weight")));
     let mixer = if latent {
-        Mixer::Own
+        Mixer::Latent {
+            slot: ordinal,
+            names: Box::new(latent::Names {
+                query_low: n("attn_q_a.weight"),
+                query_norm: n("attn_q_a_norm.weight"),
+                query: n("attn_q_b.weight"),
+                latent: n("attn_kv_a_mqa.weight"),
+                latent_norm: n("attn_kv_a_norm.weight"),
+                gate: n("attn_gate.weight"),
+                out: n("attn_output.weight"),
+            }),
+        }
     } else {
         Mixer::Delta {
             slot: ordinal,
@@ -176,25 +175,14 @@ fn layer_recipe(spec: Raon1Spec, hy: &Hyper, layer: usize) -> (Layer, Option<Mla
     } else {
         Forward::Dense(three("ffn_", ".weight"))
     };
-    let recipe = Layer {
+    Layer {
         norms: [n("attn_norm.weight"), n("ffn_norm.weight")].map(Some),
         site: Site::Mixed {
             halves: [site("attn"), site("ffn")],
         },
         mixer,
         forward,
-    };
-    let names = latent.then(|| MlaNames {
-        ordinal,
-        output: n("attn_output.weight"),
-        gate: n("attn_gate.weight"),
-        q_a: n("attn_q_a.weight"),
-        q_a_norm: n("attn_q_a_norm.weight"),
-        q_b: n("attn_q_b.weight"),
-        kv_a: n("attn_kv_a_mqa.weight"),
-        kv_a_norm: n("attn_kv_a_norm.weight"),
-    });
-    (recipe, names)
+    }
 }
 
 /// The per-layer f32 factors of the absorbed attention, dequantized once at load.
@@ -257,8 +245,6 @@ pub(crate) struct Raon1Device {
     spec: Raon1Spec,
     hy: Hyper,
     layers: Vec<Layer>,
-    /// The latent-attention names of every layer that has that mixer.
-    latent: Vec<Option<MlaNames>>,
     mla: Vec<MlaFactors>,
     /// The joined taps of the `[q | k | v]` convolution of every delta-rule layer, by name.
     derived: CudaWeights,
@@ -371,8 +357,9 @@ impl Raon1Device {
             &[],
             0,
         )?;
-        let (layers, latent): (Vec<_>, Vec<_>) =
-            (0..spec.layers).map(|l| layer_recipe(spec, &hy, l)).unzip();
+        let layers: Vec<Layer> = (0..spec.layers)
+            .map(|l| layer_recipe(spec, &hy, l))
+            .collect();
         let mut mla = Vec::new();
         for &layer in spec.mla_layers {
             let upload = |name: &str| -> Result<DeviceBuffer, EngError> {
@@ -413,7 +400,6 @@ impl Raon1Device {
             spec,
             hy,
             layers,
-            latent,
             mla,
             derived,
             sc,
@@ -532,111 +518,6 @@ impl Raon1Device {
         walk::visits(&Walk(&*self), n, pos0, |_, _| Ok(()))
     }
 
-    fn mla_mixer(&self, names: &MlaNames, n: usize, pos0: usize) -> Result<(), EngError> {
-        let sc = &self.sc;
-        let mla = names.ordinal;
-        self.io().mv(&names.q_a, sc.cur_rows(), &sc.qa, n)?;
-        // The f32 rows go to `mix_out`, which the mixer writes last; only the exact route reads them.
-        self.io().norm_rows(
-            n,
-            Q_LORA,
-            self.hy.latent_eps,
-            &sc.qa,
-            self.io().raw(&names.q_a_norm)?,
-            &sc.core.mix_out,
-            &sc.q8_qa,
-        )?;
-        let normed = if self.exact.get() {
-            Rows::both(&sc.q8_qa, &sc.core.mix_out)
-        } else {
-            Rows::q8(&sc.q8_qa)
-        };
-        self.io().mv(&names.q_b, normed, &sc.qb, n)?;
-        self.io().mv(&names.kv_a, sc.cur_rows(), &sc.kv, n)?;
-        let layer_cache = self.cells * MLA_ROW * 2;
-        self.io().run(BlockOp::mla_kv_prep(
-            n,
-            RANK,
-            ROPE,
-            pos0,
-            self.cells,
-            self.hy.latent_eps,
-            sc.kv.range(0, n * MLA_ROW * 4)?,
-            self.io().raw(&names.kv_a_norm)?,
-            self.cache.range(mla * layer_cache, layer_cache)?,
-        )?)?;
-        let shape = MlaShape {
-            n,
-            heads: HEADS,
-            nope: Q_NOPE,
-            rope: ROPE,
-            rank: RANK,
-        };
-        let factors = &self.mla[mla];
-        self.io().run(BlockOp::mla_q_absorb(
-            shape,
-            sc.qb.range(0, n * HEADS * Q_ROW * 4)?,
-            StepIo::whole(&factors.wk_b)?,
-            sc.qeff.range(0, n * HEADS * MLA_ROW * 4)?,
-        )?)?;
-        let keys = pos0 + n;
-        let splits = if n >= 64 {
-            1
-        } else {
-            keys.div_ceil(1024)
-                .clamp(1, 32)
-                .min(320 / (n * HEADS / MLA_GROUP))
-                .max(1)
-        };
-        let per_split = keys.div_ceil(splits).div_ceil(32) * 32;
-        let part_bytes = n * (HEADS / MLA_GROUP) * splits * MLA_GROUP * (RANK + 4) * 4;
-        self.io().run(BlockOp::mla_attn(
-            shape,
-            pos0,
-            splits,
-            per_split,
-            1.0 / (self.spec.key_mla as f32).sqrt(),
-            sc.qeff.range(0, n * HEADS * MLA_ROW * 4)?,
-            self.cache.range(mla * layer_cache, layer_cache)?,
-            sc.part.range(0, part_bytes)?,
-        )?)?;
-        self.io().run(BlockOp::mla_reduce(
-            n,
-            HEADS,
-            RANK,
-            splits,
-            sc.part.range(0, part_bytes)?,
-            sc.mix.range(0, n * HEADS * RANK * 4)?,
-        )?)?;
-        self.io().run(BlockOp::mla_project(
-            n,
-            HEADS,
-            RANK,
-            HEAD_DIM,
-            sc.mix.range(0, n * HEADS * RANK * 4)?,
-            StepIo::whole(&factors.wv_b)?,
-            sc.mla_out.range(0, n * WIDTH * 4)?,
-        )?)?;
-        self.io().mv(&names.gate, sc.cur_rows(), &sc.g2, n)?;
-        if self.trace.borrow().is_some() {
-            self.snap("mla_out", &sc.mla_out, n * WIDTH)?;
-            self.snap("mla_gate", &sc.g2, n * WIDTH)?;
-        }
-        self.io().quantize(
-            n,
-            WIDTH,
-            &sc.mla_out,
-            Some(&sc.g2),
-            Rows::both(&sc.core.read_q8, &sc.mla_gated),
-        )?;
-        self.io().mv(
-            &names.output,
-            Rows::both(&sc.core.read_q8, &sc.mla_gated),
-            &sc.core.mix_out,
-            n,
-        )
-    }
-
     fn situ_join(&self) -> ffn::Join {
         ffn::Join::Situ {
             beta: self.hy.situ_beta,
@@ -724,13 +605,45 @@ impl Model for Raon1Device {
         (DELTA, Some(rows))
     }
 
-    fn own_mixer(&self, visit: usize, n: usize, pos0: usize) -> Result<(), EngError> {
-        match self.latent.get(visit) {
-            Some(Some(names)) => self.mla_mixer(names, n, pos0),
-            _ => Err(EngError::BadRequest(format!(
-                "raon1: layer {visit} has no latent attention"
-            ))),
-        }
+    fn latent(
+        &self,
+        slot: usize,
+        _n: usize,
+    ) -> Result<(latent::Dims, latent::LatentRows<'_>), EngError> {
+        let sc = &self.sc;
+        let factors = self.mla.get(slot).ok_or_else(|| {
+            EngError::BadRequest(format!("raon1: no latent attention in slot {slot}"))
+        })?;
+        let layer_cache = self.cells * MLA_ROW * 2;
+        let dims = latent::Dims {
+            heads: HEADS,
+            head_dim: HEAD_DIM,
+            key_dim: Q_NOPE,
+            rank: RANK,
+            rot_dims: ROPE,
+            query_rank: Q_LORA,
+            scale: 1.0 / (self.spec.key_mla as f32).sqrt(),
+            eps: self.hy.latent_eps,
+        };
+        let rows = latent::LatentRows {
+            input: sc.cur_rows(),
+            query_low: &sc.qa,
+            query_low_q8: &sc.q8_qa,
+            query: &sc.qb,
+            latent: &sc.kv,
+            absorbed: &sc.qeff,
+            part: &sc.part,
+            mixed: &sc.mix,
+            attended: &sc.mla_out,
+            gate: &sc.g2,
+            gated: Rows::both(&sc.core.read_q8, &sc.mla_gated),
+            out: &sc.core.mix_out,
+            key_factor: StepIo::whole(&factors.wk_b)?,
+            value_factor: StepIo::whole(&factors.wv_b)?,
+            cache: self.cache.range(slot * layer_cache, layer_cache)?,
+            cells: self.cells,
+        };
+        Ok((dims, rows))
     }
 
     fn dense(&self, n: usize) -> Result<(ffn::Join, ffn::Scratch<'_>), EngError> {
@@ -782,6 +695,10 @@ impl Model for Raon1Device {
                 self.snap(&name("attn_norm", "ffn_norm"), &sc.core.normed, n * HIDDEN)
             }
             WalkStage::Branch => {
+                if half == Half::Mixer && matches!(self.layers[layer].mixer, Mixer::Latent { .. }) {
+                    self.snap("mla_out", &sc.mla_out, n * WIDTH)?;
+                    self.snap("mla_gate", &sc.g2, n * WIDTH)?;
+                }
                 let routed = matches!(self.layers[layer].forward, Forward::Routed(_));
                 if half == Half::Forward && routed {
                     self.snap_ids(layer, n)?;
@@ -853,7 +770,7 @@ fn scratch<A: Alloc>(a: &A, vocab: usize, fixup: usize) -> Result<Scratch<A::Buf
     let c = CHUNK;
     let f = |count: usize| a.floats(count);
     let q = |width: usize, rows: usize| a.q8(width, rows);
-    let part = (c * (HEADS / MLA_GROUP)).max(320) * MLA_GROUP * (RANK + 4);
+    let part = (c * (HEADS / MLA_GROUP)).max(latent::PART_ROWS) * MLA_GROUP * (RANK + 4);
     let core = Core::new(
         a,
         Widths {
