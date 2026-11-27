@@ -163,6 +163,144 @@ pub(in crate::kernels::cuda) fn embed_launch(
     checked(status, stage)
 }
 
+/// Mirror of `inference_cuda_embed_dense_args` in `embed.h`.
+#[repr(C)]
+struct EmbedDenseArgsRaw {
+    table: *const c_void,
+    ids: *const c_int,
+    x: *mut f32,
+    status: *mut c_int,
+    dtype: c_int,
+    m: c_int,
+    n_rows: c_int,
+    k: c_int,
+}
+
+const _: () = assert!(
+    size_of::<EmbedDenseArgsRaw>() == 48
+        && offset_of!(EmbedDenseArgsRaw, table) == 0
+        && offset_of!(EmbedDenseArgsRaw, ids) == 8
+        && offset_of!(EmbedDenseArgsRaw, x) == 16
+        && offset_of!(EmbedDenseArgsRaw, status) == 24
+        && offset_of!(EmbedDenseArgsRaw, dtype) == 32
+        && offset_of!(EmbedDenseArgsRaw, m) == 36
+        && offset_of!(EmbedDenseArgsRaw, n_rows) == 40
+        && offset_of!(EmbedDenseArgsRaw, k) == 44,
+    "EmbedDenseArgsRaw must equal inference_cuda_embed_dense_args in embed.h"
+);
+
+unsafe extern "C" {
+    #[link_name = "inference_cuda_embed_dense_launch"]
+    fn embed_dense_launch_raw(
+        args: *const EmbedDenseArgsRaw,
+        stream: *mut c_void,
+        out_stage: *mut c_int,
+    ) -> c_int;
+}
+
+/// The value format of a dense table, by the weight code of the dense GEMV.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum DenseEmbedType {
+    F16,
+    Bf16,
+    F32,
+}
+
+impl DenseEmbedType {
+    fn code(self) -> c_int {
+        match self {
+            Self::F16 => 0,
+            Self::Bf16 => 1,
+            Self::F32 => 3,
+        }
+    }
+
+    pub(crate) fn width(self) -> usize {
+        match self {
+            Self::F32 => 4,
+            Self::F16 | Self::Bf16 => 2,
+        }
+    }
+}
+
+/// What one dense gather reads and writes: `table` holds `n_rows` x `k` values of `ty`, row
+/// major; `ids`, `x` and `status` are as for [`EmbedRaw`].
+pub(in crate::kernels::cuda) struct EmbedDenseRaw<'a> {
+    pub(in crate::kernels::cuda) ty: DenseEmbedType,
+    pub(in crate::kernels::cuda) table: RawRange<'a>,
+    pub(in crate::kernels::cuda) ids: RawRange<'a>,
+    pub(in crate::kernels::cuda) x: RawRange<'a>,
+    pub(in crate::kernels::cuda) status: RawRange<'a>,
+    pub(in crate::kernels::cuda) m: c_int,
+    pub(in crate::kernels::cuda) n_rows: c_int,
+    pub(in crate::kernels::cuda) k: c_int,
+}
+
+fn dense_needs(call: &EmbedDenseRaw<'_>) -> Option<Needs> {
+    let m = usize::try_from(call.m).ok()?;
+    let rows = usize::try_from(call.n_rows).ok()?;
+    let k = usize::try_from(call.k).ok()?;
+    let shape_ok = (1..=MAX_ROWS).contains(&rows)
+        && (8..=MAX_K).contains(&k)
+        && k.is_multiple_of(8)
+        && (1..=MAX_TOKENS).contains(&m);
+    if !shape_ok {
+        return None;
+    }
+    Some(Needs {
+        tiles: rows.checked_mul(k)?.checked_mul(call.ty.width())?,
+        ids: m.checked_mul(size_of::<c_int>())?,
+        x: m.checked_mul(k)?.checked_mul(size_of::<f32>())?,
+    })
+}
+
+fn check_dense(call: &EmbedDenseRaw<'_>) -> Result<(), DeviceFailure> {
+    let need = dense_needs(call).ok_or_else(invalid_argument)?;
+    let sized = fits(&call.table, need.tiles, 16)
+        && fits(&call.ids, need.ids, 4)
+        && fits(&call.x, need.x, 16)
+        && fits(&call.status, size_of::<c_int>(), 4);
+    let table = Span::of(&call.table, need.tiles);
+    let ids = Span::of(&call.ids, need.ids);
+    let x = Span::of(&call.x, need.x);
+    let status = Span::of(&call.status, size_of::<c_int>());
+    let apart = x.apart(&ids)
+        && x.apart(&table)
+        && x.apart(&status)
+        && status.apart(&ids)
+        && status.apart(&table);
+    if !(sized && apart) {
+        return Err(invalid_argument());
+    }
+    Ok(())
+}
+
+pub(in crate::kernels::cuda) fn embed_dense_launch(
+    stream: &RawStream,
+    call: &EmbedDenseRaw<'_>,
+) -> Result<(), DeviceFailure> {
+    check_dense(call)?;
+    let args = EmbedDenseArgsRaw {
+        table: call.table.address().cast_const(),
+        ids: call.ids.address().cast::<c_int>().cast_const(),
+        x: call.x.address().cast::<f32>(),
+        status: call.status.address().cast::<c_int>(),
+        dtype: call.ty.code(),
+        m: call.m,
+        n_rows: call.n_rows,
+        k: call.k,
+    };
+    let mut stage = STAGE_NONE;
+    // SAFETY: `check_dense` proved the shape and the table, ids, x and status ranges inside their
+    // live allocations, large enough for the call, aligned, and `x` and `status` disjoint from
+    // every other range; the adapter repeats the checks on the addresses. The allocations stay
+    // valid until the queued launch finishes because `inference_cuda_free` synchronizes the device
+    // first. The kernel reads the ids when it runs and the adapter keeps no pointer. `args` and
+    // `stage` are live for the call, and `stream` is live for the call.
+    let status = unsafe { embed_dense_launch_raw(&args, stream.0.as_ptr(), &mut stage) };
+    checked(status, stage)
+}
+
 #[cfg(test)]
 mod tests {
     use super::super::super::{RawDevice, STATUS_INVALID_ARGUMENT};

@@ -7,10 +7,7 @@
 mod admission;
 mod shadow;
 use super::*;
-use crate::kernels::cuda::{
-    NativeWeight,
-    resident::{embed::EmbedNativeCall, word_rows::MAX_WORD_ROWS},
-};
+use crate::kernels::cuda::resident::word_rows::MAX_WORD_ROWS;
 
 /// Declines the whole-token path; the first decline of each reason is logged once per process.
 fn declined<T>(reason: &'static str) -> Result<Option<T>, EngError> {
@@ -52,7 +49,7 @@ pub(in super::super) struct TokenWorkspace {
     depth: [DeviceBuffer; 2],
     prelude: DeviceBuffer,
     prelude_bytes: usize,
-    embedding: NativeWeight,
+    embedding: crate::kernels::cuda::resident::embed::EmbedTable,
     constants: DeviceBuffer,
     params: DeviceBuffer,
     scratch: DeviceBuffer,
@@ -316,16 +313,8 @@ impl TokenWorkspace {
                 ctx.zero_word_rows(stream, rows)?;
             }
             let raw = self.scratch.range(0, row)?;
-            ctx.embed_native(
-                stream,
-                EmbedNativeCall {
-                    weight: &self.embedding,
-                    ids: params.range(0, WORD)?,
-                    x: raw,
-                    status: head(0)?,
-                    m: 1,
-                },
-            )?;
+            self.embedding
+                .gather(ctx, stream, [params.range(0, WORD)?, raw, head(0)?], 1)?;
             ctx.enqueue_row_weighted_norm(
                 stream,
                 [

@@ -58,6 +58,62 @@ constexpr int kMaskInvalidState = INFERENCE_CUDA_STATUS_INVALID_STEP_STATE;
 
 __device__ __forceinline__ int lane_of(int r, int qp) { return (r & 3) | (qp << 2) | ((r >> 2) << 4); }
 
+constexpr int kDenseThreads = 128;
+constexpr int kDenseF16 = 0;
+constexpr int kDenseBf16 = 1;
+constexpr int kDenseF32 = 3;
+
+/* One value of a dense table widened to f32; every conversion here is exact. */
+template <int D>
+__device__ __forceinline__ float widen(unsigned short bits) {
+    if constexpr (D == kDenseBf16) {
+        return __uint_as_float((unsigned)bits << 16);
+    } else {
+        return __half2float(__ushort_as_half(bits));
+    }
+}
+
+/* The dense gather: block t copies row ids[t] into x[t][0..k), eight values per thread step. */
+template <int D>
+__global__ void __launch_bounds__(kDenseThreads)
+    embed_dense_k(const void *table, const int *ids, float *x, int *status, int n_rows, int k) {
+    const int id = ids[blockIdx.x];
+    float4 *out = reinterpret_cast<float4 *>(x + (size_t)blockIdx.x * (size_t)k);
+    const int groups = k / 8;
+    if (id < 0 || id >= n_rows) {
+        const float nan = __uint_as_float(kNanBits);
+        for (int g = (int)threadIdx.x; g < groups; g += kDenseThreads) {
+            out[2 * g] = make_float4(nan, nan, nan, nan);
+            out[2 * g + 1] = make_float4(nan, nan, nan, nan);
+        }
+        if (threadIdx.x == 0) {
+            atomicOr(status, kMaskInvalidState);
+        }
+        return;
+    }
+    if constexpr (D == kDenseF32) {
+        const float4 *row = reinterpret_cast<const float4 *>(table) + (size_t)id * (size_t)(k / 4);
+        for (int g = (int)threadIdx.x; g < groups; g += kDenseThreads) {
+            out[2 * g] = row[2 * g];
+            out[2 * g + 1] = row[2 * g + 1];
+        }
+    } else {
+        const uint4 *row = reinterpret_cast<const uint4 *>(table) + (size_t)id * (size_t)groups;
+        for (int g = (int)threadIdx.x; g < groups; g += kDenseThreads) {
+            const uint4 v = row[g];
+            const unsigned w[4] = {v.x, v.y, v.z, v.w};
+            float f[8];
+#pragma unroll
+            for (int i = 0; i < 4; ++i) {
+                f[2 * i] = widen<D>((unsigned short)(w[i] & 0xffffu));
+                f[2 * i + 1] = widen<D>((unsigned short)(w[i] >> 16));
+            }
+            out[2 * g] = make_float4(f[0], f[1], f[2], f[3]);
+            out[2 * g + 1] = make_float4(f[4], f[5], f[6], f[7]);
+        }
+    }
+}
+
 __device__ __forceinline__ float half_to_f32(unsigned bits) { return __half2float(__ushort_as_half((unsigned short)bits)); }
 
 __device__ __forceinline__ unsigned byte_of(const uint4 &v, int i) {
@@ -192,6 +248,30 @@ bool valid(const inference_cuda_embed_args *a, void *stream) {
            apart(a->status, 4, a->tiles, tiles_bytes);
 }
 
+/* Every term of this test has a twin in the Rust wrapper of the dense gather. */
+bool valid_dense(const inference_cuda_embed_dense_args *a, void *stream) {
+    if (a == NULL || stream == NULL || a->table == NULL || a->ids == NULL || a->x == NULL ||
+        a->status == NULL) {
+        return false;
+    }
+    const bool dtype_ok = a->dtype == kDenseF16 || a->dtype == kDenseBf16 || a->dtype == kDenseF32;
+    const bool m_ok = a->m >= 1 && a->m <= kMaxTokens;
+    const bool rows_ok = a->n_rows >= 1 && a->n_rows <= kMaxRows;
+    const bool k_ok = a->k >= 8 && a->k <= kMaxK && a->k % 8 == 0;
+    if (!(dtype_ok && m_ok && rows_ok && k_ok)) return false;
+    if (!(aligned_to(a->table, 16) && aligned_to(a->ids, 4) && aligned_to(a->x, 16) &&
+          aligned_to(a->status, 4))) {
+        return false;
+    }
+    const size_t width = a->dtype == kDenseF32 ? 4 : 2;
+    const size_t table_bytes = (size_t)a->n_rows * (size_t)a->k * width;
+    const size_t x_bytes = (size_t)a->m * a->k * 4;
+    return apart(a->x, x_bytes, a->ids, (size_t)a->m * 4) &&
+           apart(a->x, x_bytes, a->table, table_bytes) && apart(a->status, 4, a->x, x_bytes) &&
+           apart(a->status, 4, a->ids, (size_t)a->m * 4) &&
+           apart(a->status, 4, a->table, table_bytes);
+}
+
 }  // namespace
 
 extern "C" int inference_cuda_embed_launch(const inference_cuda_embed_args *a, void *stream, int *out_stage) {
@@ -206,6 +286,33 @@ extern "C" int inference_cuda_embed_launch(const inference_cuda_embed_args *a, v
             embed_q4k_k<<<a->m, kQ4Threads, 0, s>>>(tiles, a->ids, a->x, a->status, a->n_rows, a->k);
         } else {
             embed_q80_k<<<a->m, kQ8Threads, 0, s>>>(tiles, a->ids, a->x, a->status, a->n_rows, a->k);
+        }
+        Failure failure;
+        failure.record(cudaGetLastError(), INFERENCE_CUDA_STAGE_LAUNCH);
+        report_stage(out_stage, failure.stage);
+        return (int)failure.err;
+    } catch (...) {
+        return INFERENCE_CUDA_NATIVE_EXCEPTION;
+    }
+}
+
+extern "C" int inference_cuda_embed_dense_launch(const inference_cuda_embed_dense_args *a,
+                                                 void *stream, int *out_stage) {
+    try {
+        report_stage(out_stage, INFERENCE_CUDA_STAGE_NONE);
+        if (!valid_dense(a, stream)) {
+            return INFERENCE_CUDA_INVALID_ARGUMENT;
+        }
+        const cudaStream_t s = (cudaStream_t)stream;
+        if (a->dtype == kDenseBf16) {
+            embed_dense_k<kDenseBf16><<<a->m, kDenseThreads, 0, s>>>(a->table, a->ids, a->x,
+                                                                     a->status, a->n_rows, a->k);
+        } else if (a->dtype == kDenseF16) {
+            embed_dense_k<kDenseF16><<<a->m, kDenseThreads, 0, s>>>(a->table, a->ids, a->x,
+                                                                    a->status, a->n_rows, a->k);
+        } else {
+            embed_dense_k<kDenseF32><<<a->m, kDenseThreads, 0, s>>>(a->table, a->ids, a->x,
+                                                                    a->status, a->n_rows, a->k);
         }
         Failure failure;
         failure.record(cudaGetLastError(), INFERENCE_CUDA_STAGE_LAUNCH);

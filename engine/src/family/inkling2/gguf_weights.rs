@@ -881,16 +881,13 @@ impl GgufTextWeights {
         Ok((tensor, bytes))
     }
 
-    /// The embedding table and its bytes when the device gather reads it as stored: one plane
-    /// of a quantized type with a native kernel.
+    /// The embedding table and its bytes when a device gather reads it as stored.
     #[cfg(all(feature = "native-cuda", target_os = "linux"))]
     fn gathered_embedding(&self) -> Result<Option<(&Tensor, &[u8])>, EngError> {
-        use crate::kernels::cuda::resident::matvec_q::QuantType;
+        use crate::kernels::cuda::resident::embed::EmbedTable;
         let (t, bytes) = self.tensor("model.llm.embed.weight")?;
-        Ok((t.planes == 1
-            && QuantType::from_gguf(t.kind).is_some()
-            && matches!(t.vector_order, VectorOrder::Stored))
-        .then_some((t, bytes)))
+        let stored = t.planes == 1 && matches!(t.vector_order, VectorOrder::Stored);
+        Ok((stored && EmbedTable::gathers(t.kind)).then_some((t, bytes)))
     }
 
     #[cfg(all(feature = "native-cuda", target_os = "linux"))]
@@ -909,9 +906,8 @@ impl GgufTextWeights {
     pub(super) fn resident_embedding(
         &self,
         ctx: &crate::kernels::cuda::CudaContext,
-    ) -> Result<Option<crate::kernels::cuda::NativeWeight>, EngError> {
-        use crate::kernels::cuda::{CHUNK_LIMIT, QuantTensor};
-        let name = "model.llm.embed.weight";
+    ) -> Result<Option<crate::kernels::cuda::resident::embed::EmbedTable>, EngError> {
+        use crate::kernels::cuda::resident::embed::EmbedTable;
         let Some((t, bytes)) = self.gathered_embedding()? else {
             return Ok(None);
         };
@@ -919,25 +915,8 @@ impl GgufTextWeights {
         if ctx.memory_info()?.free.saturating_sub(bytes.len()) < 256 * 1024 * 1024 {
             return Ok(None);
         }
-        ctx.upload_native(
-            QuantTensor {
-                name,
-                ty: t.kind,
-                n_rows: t.rows,
-                k: t.columns,
-                source_len: bytes.len(),
-            },
-            CHUNK_LIMIT,
-            &mut |at, dst| {
-                dst.copy_from_slice(
-                    bytes
-                        .get(at..at + dst.len())
-                        .ok_or_else(|| bad("embedding chunk escapes tensor"))?,
-                );
-                Ok(())
-            },
-        )
-        .map(Some)
+        let shape = (t.kind, t.rows, t.columns);
+        EmbedTable::upload(ctx, "model.llm.embed.weight", shape, bytes).map(Some)
     }
 
     pub(super) fn vec(&self, name: &str, len: usize) -> Result<Cow<'_, [f32]>, EngError> {

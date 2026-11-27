@@ -69,6 +69,38 @@ int inference_cuda_embed_launch(const inference_cuda_embed_args *args, void *str
 /* The native-block gather of any type with a window decoder is inference_cuda_embed_gguf_launch
  * in matvec_gguf.h. */
 
+/* The dense gather: row ids[t] of a row-major table of n_rows x k values, stored as F16 (dtype 0),
+ * BF16 (1) or F32 (3) -- the weight codes of the dense GEMV -- written to x[t][0..k) as f32. Each
+ * value is widened exactly (a half or bfloat16 widens to f32 without rounding), so the row equals
+ * the host widening bit for bit. A bad id writes a NaN row, reads no weight and ORs status bit 4,
+ * as the tiled gather does. Bounds: m in 1..4096, n_rows in 1..2^28, k in 8..32768 and a multiple
+ * of 8; table at a 16-byte offset, ids and status at 4, x at 16; x and status overlap nothing. */
+typedef struct inference_cuda_embed_dense_args {
+    const void *table;
+    const int *ids;
+    float *x;
+    int *status;
+    int dtype;
+    int m;
+    int n_rows;
+    int k;
+} inference_cuda_embed_dense_args;
+
+#ifdef __cplusplus
+static_assert(sizeof(inference_cuda_embed_dense_args) == 48 &&
+                  offsetof(inference_cuda_embed_dense_args, ids) == 8 &&
+                  offsetof(inference_cuda_embed_dense_args, x) == 16 &&
+                  offsetof(inference_cuda_embed_dense_args, status) == 24 &&
+                  offsetof(inference_cuda_embed_dense_args, dtype) == 32 &&
+                  offsetof(inference_cuda_embed_dense_args, m) == 36 &&
+                  offsetof(inference_cuda_embed_dense_args, n_rows) == 40 &&
+                  offsetof(inference_cuda_embed_dense_args, k) == 44,
+              "inference_cuda_embed_dense_args layout");
+#endif
+
+int inference_cuda_embed_dense_launch(const inference_cuda_embed_dense_args *args, void *stream,
+                                      int *out_stage);
+
 #ifdef __cplusplus
 }
 #endif

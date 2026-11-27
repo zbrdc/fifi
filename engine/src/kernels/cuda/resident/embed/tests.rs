@@ -1249,3 +1249,230 @@ fn embed_inside_a_capture_reads_the_new_id_between_replays() {
         }
     }
 }
+
+/// A finite value bit pattern of a dense format: random sign, exponent and mantissa, with
+/// subnormals and both zeros, never an infinity or a NaN.
+fn dense_bits(rng: &mut Rng, ty: super::DenseEmbed) -> Vec<u8> {
+    use super::DenseEmbed;
+    match ty {
+        DenseEmbed::F32 => {
+            let exponent = u32::try_from(rng.below(255)).expect("small");
+            let mantissa = u32::try_from(rng.below(1 << 23)).expect("small");
+            let sign = u32::try_from(rng.below(2)).expect("small") << 31;
+            (sign | (exponent << 23) | mantissa).to_le_bytes().to_vec()
+        }
+        DenseEmbed::Bf16 | DenseEmbed::F16 => {
+            let (exponent_bits, mantissa_bits) = if ty == DenseEmbed::Bf16 {
+                (8, 7)
+            } else {
+                (5, 10)
+            };
+            let exponent = rng.below((1 << exponent_bits) - 1);
+            let mantissa = rng.below(1 << mantissa_bits);
+            let sign = rng.below(2) << 15;
+            let bits =
+                u16::try_from(sign | (exponent << mantissa_bits) | mantissa).expect("16 bits");
+            bits.to_le_bytes().to_vec()
+        }
+    }
+}
+
+/// The host widening of one stored value: exact for every format.
+fn widen(ty: super::DenseEmbed, bytes: &[u8]) -> f32 {
+    use super::DenseEmbed;
+    match ty {
+        DenseEmbed::F32 => f32::from_le_bytes(bytes.try_into().expect("4 bytes")),
+        DenseEmbed::Bf16 => {
+            f32::from_bits(u32::from(u16::from_le_bytes([bytes[0], bytes[1]])) << 16)
+        }
+        DenseEmbed::F16 => half::f16::from_bits(u16::from_le_bytes([bytes[0], bytes[1]])).to_f32(),
+    }
+}
+
+/// Gathers `ids` from a dense table of `n_rows` x `k`, checking the guards around x and the status
+/// word; returns the rows and the status word.
+fn gather_dense(
+    rig: &Rig,
+    table: &DeviceBuffer,
+    ty: super::DenseEmbed,
+    (n_rows, k): (usize, usize),
+    ids: &[i32],
+    init: i32,
+) -> (Vec<f32>, i32) {
+    let ids_bytes: Vec<u8> = ids.iter().flat_map(|id| id.to_le_bytes()).collect();
+    let ids_buf = testkit::upload_bytes(&rig.ctx, &ids_bytes);
+    let status = testkit::upload_filled(&rig.ctx, 0x55, 12);
+    status
+        .write_at(&rig.stream, 4, &init.to_le_bytes())
+        .expect("preset");
+    let bytes = embed_x_bytes(ids.len(), k).expect("size");
+    let x = rig.x_buffer(ids.len(), k);
+    rig.ctx
+        .embed_dense(
+            &rig.stream,
+            super::EmbedDenseCall {
+                table: table.range(0, n_rows * k * ty.width()).expect("table"),
+                ty,
+                n_rows,
+                k,
+                ids: ids_buf.range(0, ids_bytes.len()).expect("ids"),
+                x: x.range(GUARD_BYTES, bytes).expect("x"),
+                status: status.range(4, 4).expect("status"),
+                m: ids.len(),
+            },
+        )
+        .expect("queue the dense gather");
+    rig.stream.synchronize().expect("drain the dense gather");
+    let all = testkit::read_bytes(&rig.ctx, &x, bytes + 2 * GUARD_BYTES);
+    assert!(
+        all[..GUARD_BYTES]
+            .iter()
+            .chain(&all[GUARD_BYTES + bytes..])
+            .all(|&b| b == 0x55),
+        "a byte outside the rows of x changed"
+    );
+    let word = testkit::read_bytes(&rig.ctx, &status, 12);
+    assert!(
+        word[..4].iter().chain(&word[8..]).all(|&b| b == 0x55),
+        "a status guard changed"
+    );
+    (
+        testkit::floats(&all[GUARD_BYTES..GUARD_BYTES + bytes]),
+        i32::from_le_bytes([word[4], word[5], word[6], word[7]]),
+    )
+}
+
+/// Every value of a dense row widens to the host's f32 bit for bit, for F16, BF16 and F32 tables
+/// whose rows are not a multiple of any tile; a bad id writes a NaN row and ORs bit 4 into the
+/// status word whatever it held, and the rows of valid ids in the same launch stay exact.
+#[test]
+fn embed_dense_widens_every_value_exactly() {
+    use super::DenseEmbed;
+    const NAME: &str = "embed_dense_widens_every_value_exactly";
+    if !testkit::device_present(NAME) {
+        return;
+    }
+    let rig = Rig::new();
+    let mut rng = Rng::new(0x0bf1_6e3b);
+    for ty in [DenseEmbed::Bf16, DenseEmbed::F16, DenseEmbed::F32] {
+        for (n_rows, k) in [(1, 8), (13, 264), (517, 2048), (3, 32768)] {
+            let source: Vec<u8> = (0..n_rows * k)
+                .flat_map(|_| dense_bits(&mut rng, ty))
+                .collect();
+            let table = testkit::upload_bytes(&rig.ctx, &source);
+            let row = |id: usize| -> Vec<f32> {
+                let w = ty.width();
+                source[id * k * w..(id + 1) * k * w]
+                    .chunks_exact(w)
+                    .map(|bytes| widen(ty, bytes))
+                    .collect()
+            };
+            let last = i32::try_from(n_rows - 1).expect("small");
+            let ids: Vec<i32> = [0, last, last / 2, 0].to_vec();
+            let (x, status) = gather_dense(&rig, &table, ty, (n_rows, k), &ids, 0);
+            assert_eq!(
+                status, 0,
+                "{NAME}: {ty:?} valid ids touched the status word"
+            );
+            for (t, &id) in ids.iter().enumerate() {
+                let want = row(usize::try_from(id).expect("valid"));
+                for (i, (&got, &want)) in x[t * k..(t + 1) * k].iter().zip(&want).enumerate() {
+                    assert_eq!(
+                        got.to_bits(),
+                        want.to_bits(),
+                        "{NAME}: {ty:?} {n_rows}x{k} token {t} id {id} element {i}"
+                    );
+                }
+            }
+            let n = i32::try_from(n_rows).expect("small");
+            let probe = [0, -1, n, n + 1, i32::MAX, i32::MIN, last];
+            for init in [0, 1] {
+                let (bad, status) = gather_dense(&rig, &table, ty, (n_rows, k), &probe, init);
+                assert_eq!(status, init | 4, "{NAME}: {ty:?} bad ids must OR bit 4");
+                for (t, &id) in probe.iter().enumerate() {
+                    let got = &bad[t * k..(t + 1) * k];
+                    if (0..n).contains(&id) {
+                        let want = row(usize::try_from(id).expect("valid"));
+                        assert!(
+                            got.iter()
+                                .zip(&want)
+                                .all(|(a, b)| a.to_bits() == b.to_bits()),
+                            "{NAME}: {ty:?} valid id {id} of the probe"
+                        );
+                    } else {
+                        assert!(
+                            got.iter().all(|v| v.to_bits() == NAN_BITS),
+                            "{NAME}: {ty:?} the row of bad id {id} must be NaN"
+                        );
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// The dense gather refuses, before any native call, a k off the 8-value grid, a short or
+/// misaligned table, an empty or oversized token count and an x that overlaps the table.
+#[test]
+fn embed_dense_refuses_bad_calls_before_any_launch() {
+    use super::DenseEmbed;
+    const NAME: &str = "embed_dense_refuses_bad_calls_before_any_launch";
+    if !testkit::device_present(NAME) {
+        return;
+    }
+    let rig = Rig::new();
+    let table = testkit::upload_filled(&rig.ctx, 0, 64 * 1024);
+    let ids = testkit::upload_bytes(&rig.ctx, &[0; 16]);
+    let status = testkit::upload_filled(&rig.ctx, 0, 16);
+    let x = testkit::upload_filled(&rig.ctx, 0, 64 * 1024);
+    let call = |table: DeviceRange<'_>, x: DeviceRange<'_>, n_rows: usize, k: usize, m: usize| {
+        rig.ctx.embed_dense(
+            &rig.stream,
+            super::EmbedDenseCall {
+                table,
+                ty: DenseEmbed::Bf16,
+                n_rows,
+                k,
+                ids: ids.range(0, 16).expect("ids"),
+                x,
+                status: status.range(0, 4).expect("status"),
+                m,
+            },
+        )
+    };
+    let refused = |result: Result<(), EngError>, what: &str| {
+        assert!(
+            matches!(result, Err(EngError::BadRequest(_))),
+            "{NAME}: {what} must be refused, got {result:?}"
+        );
+    };
+    let t = |offset, bytes| table.range(offset, bytes).expect("table");
+    let xr = |offset, bytes| x.range(offset, bytes).expect("x");
+    refused(
+        call(t(0, 4 * 12 * 2), xr(0, 48), 4, 12, 1),
+        "k off the 8-value grid",
+    );
+    refused(
+        call(t(0, 4 * 16 * 2 - 2), xr(0, 64), 4, 16, 1),
+        "a short table",
+    );
+    refused(
+        call(t(2, 4 * 16 * 2), xr(0, 64), 4, 16, 1),
+        "a misaligned table",
+    );
+    refused(call(t(0, 4 * 16 * 2), xr(0, 64), 4, 16, 0), "no tokens");
+    refused(
+        call(t(0, 4 * 16 * 2), xr(0, 64), 4, 16, 4097),
+        "too many tokens",
+    );
+    refused(
+        call(t(0, 4 * 16 * 2), t(0, 64), 4, 16, 1),
+        "x over the table",
+    );
+    call(t(0, 4 * 16 * 2), xr(0, 64), 4, 16, 1).expect("the valid call queues");
+    rig.stream.synchronize().expect("drain");
+    assert!(
+        rig.ctx.ensure_usable().is_ok(),
+        "{NAME}: a refusal latched the backend"
+    );
+}

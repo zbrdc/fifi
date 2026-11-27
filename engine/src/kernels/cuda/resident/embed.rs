@@ -33,11 +33,17 @@ use std::ffi::c_int;
 
 use crate::EngError;
 use crate::kernels::cuda::context::{Claim, require_apart, require_fit};
-use crate::kernels::cuda::native::resident::embed::{EmbedRaw, embed_launch};
+use crate::kernels::cuda::native::resident::embed::{
+    EmbedDenseRaw, EmbedRaw, embed_dense_launch, embed_launch,
+};
 use crate::kernels::cuda::native::resident::matvec_gguf::{EmbedGgufRaw, embed_gguf_launch};
 use crate::kernels::cuda::native::{TileVec, Tiled, TiledType};
 use crate::kernels::cuda::resident::matvec_q::QuantType;
-use crate::kernels::cuda::{CudaContext, DeviceRange, DeviceStream, NativeWeight, TiledWeight};
+use crate::kernels::cuda::{
+    CHUNK_LIMIT, CudaContext, DeviceBuffer, DeviceRange, DeviceStream, NativeWeight, QuantTensor,
+    TiledWeight,
+};
+use crate::weights::GgufType;
 
 pub(crate) const EMBED_MAX_TOKENS: usize = 4096;
 const EMBED_MAX_ROWS: usize = 1 << 28;
@@ -97,6 +103,23 @@ pub(crate) struct EmbedNativeCall<'b> {
     /// `m` rows of `k` floats, written in full (16-byte offset, at least `4 m k` bytes).
     pub(crate) x: DeviceRange<'b>,
     /// The step status word (4-byte offset, at least 4 bytes); a bad id ORs bit 4 into it.
+    pub(crate) status: DeviceRange<'b>,
+    pub(crate) m: usize,
+}
+
+/// The value format of a dense embedding table.
+pub(crate) use crate::kernels::cuda::native::resident::embed::DenseEmbedType as DenseEmbed;
+
+/// One gather from a dense table: `table` holds `n_rows` rows of `k` values of `ty`, row major
+/// (16-byte offset); the ids, the output rows and the status word are as in [`EmbedCall`]. Each
+/// value widens to f32 exactly, so row `t` equals the host widening of row `ids[t]` bit for bit.
+pub(crate) struct EmbedDenseCall<'b> {
+    pub(crate) table: DeviceRange<'b>,
+    pub(crate) ty: DenseEmbed,
+    pub(crate) n_rows: usize,
+    pub(crate) k: usize,
+    pub(crate) ids: DeviceRange<'b>,
+    pub(crate) x: DeviceRange<'b>,
     pub(crate) status: DeviceRange<'b>,
     pub(crate) m: usize,
 }
@@ -210,6 +233,82 @@ impl CudaContext {
         })
     }
 
+    /// Queues the gather of rows `ids[0..m]` of the dense table into `call.x` on `stream`.
+    ///
+    /// Returns `BadRequest` for a stream or buffer of another adapter, for `n_rows` outside
+    /// `1..=2^28`, for `k` that is not a multiple of 8 from 8 up to 32768, for `m` outside
+    /// `1..=4096`, for a `table`, `ids`, `x` or `status` range that is short or misaligned, and
+    /// for an `x` or `status` that overlaps another range of the call. A bad id on the device
+    /// writes a NaN row and sets status bit 4, as in [`Self::embed`].
+    pub(crate) fn embed_dense(
+        &self,
+        stream: &DeviceStream,
+        call: EmbedDenseCall<'_>,
+    ) -> Result<(), EngError> {
+        self.ensure_usable()?;
+        let raw = self.plan_embed_dense(&call)?;
+        self.launch_on(stream, |stream_raw| embed_dense_launch(stream_raw, &raw))
+    }
+
+    fn plan_embed_dense<'b>(
+        &self,
+        call: &EmbedDenseCall<'b>,
+    ) -> Result<EmbedDenseRaw<'b>, EngError> {
+        let (table_raw, ids_raw, x_raw, status_raw) = (
+            self.raw_range(&call.table)?,
+            self.raw_range(&call.ids)?,
+            self.raw_range(&call.x)?,
+            self.raw_range(&call.status)?,
+        );
+        let (n_rows, k) = (call.n_rows, call.k);
+        if !(1..=EMBED_MAX_ROWS).contains(&n_rows)
+            || !(8..=EMBED_MAX_K).contains(&k)
+            || !k.is_multiple_of(8)
+        {
+            return Err(EngError::BadRequest(format!(
+                "the CUDA dense embedding gather needs rows from 1 up to {EMBED_MAX_ROWS} and k \
+                 as a multiple of 8 up to {EMBED_MAX_K}, got {n_rows} rows of {k}"
+            )));
+        }
+        if !(1..=EMBED_MAX_TOKENS).contains(&call.m) {
+            return Err(EngError::BadRequest(format!(
+                "the CUDA embedding gather takes 1 to {EMBED_MAX_TOKENS} tokens, got {}",
+                call.m
+            )));
+        }
+        let table_need = n_rows
+            .checked_mul(k)
+            .and_then(|values| values.checked_mul(call.ty.width()))
+            .ok_or_else(|| {
+                EngError::BadRequest("the CUDA embedding table size overflows".to_owned())
+            })?;
+        let x_need = embed_x_bytes(call.m, k)?;
+        let ids_need = call.m * size_of::<i32>();
+        require_fit("table", &call.table, table_need, 16)?;
+        require_fit("ids", &call.ids, ids_need, size_of::<i32>())?;
+        require_fit("x", &call.x, x_need, 16)?;
+        require_fit("status", &call.status, size_of::<i32>(), size_of::<i32>())?;
+        let table = Claim::of("table", &call.table, table_need);
+        let x = Claim::of("x", &call.x, x_need);
+        let status = Claim::of("status", &call.status, size_of::<i32>());
+        let ids = Claim::of("ids", &call.ids, ids_need);
+        require_apart(&x, &ids)?;
+        require_apart(&x, &table)?;
+        require_apart(&x, &status)?;
+        require_apart(&status, &ids)?;
+        require_apart(&status, &table)?;
+        Ok(EmbedDenseRaw {
+            ty: call.ty,
+            table: table_raw,
+            ids: ids_raw,
+            x: x_raw,
+            status: status_raw,
+            m: c_int_of("m", call.m)?,
+            n_rows: c_int_of("rows", n_rows)?,
+            k: c_int_of("k", k)?,
+        })
+    }
+
     fn plan_embed<'b>(&self, call: &EmbedCall<'b>) -> Result<EmbedRaw<'b>, EngError> {
         let (ids_raw, x_raw, status_raw) = (
             self.raw_range(&call.ids)?,
@@ -279,3 +378,95 @@ fn c_int_of(name: &str, value: usize) -> Result<c_int, EngError> {
 
 #[cfg(test)]
 mod tests;
+
+/// A token embedding on the device as a GGUF file stores it: blocks of a quantized type with a
+/// native kernel, or rows of F16, BF16 or F32 values. [`Self::gather`] reads either form with the
+/// same contract: a bad id writes a NaN row and ORs status bit 4.
+pub(crate) enum EmbedTable {
+    Native(NativeWeight),
+    Dense {
+        table: DeviceBuffer,
+        ty: DenseEmbed,
+        rows: usize,
+        k: usize,
+    },
+}
+
+impl EmbedTable {
+    fn dense(kind: GgufType) -> Option<DenseEmbed> {
+        match kind {
+            GgufType::Bf16 => Some(DenseEmbed::Bf16),
+            GgufType::F16 => Some(DenseEmbed::F16),
+            GgufType::F32 => Some(DenseEmbed::F32),
+            _ => None,
+        }
+    }
+
+    /// Whether a device gather reads a table of `kind` as stored.
+    pub(crate) fn gathers(kind: GgufType) -> bool {
+        QuantType::from_gguf(kind).is_some() || Self::dense(kind).is_some()
+    }
+
+    /// Uploads the `rows` x `k` table of `kind` from its stored `bytes`.
+    pub(crate) fn upload(
+        ctx: &CudaContext,
+        name: &str,
+        (kind, rows, k): (GgufType, usize, usize),
+        bytes: &[u8],
+    ) -> Result<Self, EngError> {
+        if let Some(ty) = Self::dense(kind) {
+            let table = ctx.upload(bytes)?;
+            return Ok(Self::Dense { table, ty, rows, k });
+        }
+        let tensor = QuantTensor {
+            name,
+            ty: kind,
+            n_rows: rows,
+            k,
+            source_len: bytes.len(),
+        };
+        let weight = ctx.upload_native(tensor, CHUNK_LIMIT, &mut |at, dst| {
+            let chunk = bytes.get(at..at + dst.len()).ok_or_else(|| {
+                EngError::BadRequest(format!("a chunk of {name} escapes the tensor"))
+            })?;
+            dst.copy_from_slice(chunk);
+            Ok(())
+        })?;
+        Ok(Self::Native(weight))
+    }
+
+    /// Queues the gather of the `m` rows named by the device `ids` into `x`.
+    pub(crate) fn gather(
+        &self,
+        ctx: &CudaContext,
+        stream: &DeviceStream,
+        [ids, x, status]: [DeviceRange<'_>; 3],
+        m: usize,
+    ) -> Result<(), EngError> {
+        match self {
+            Self::Native(weight) => ctx.embed_native(
+                stream,
+                EmbedNativeCall {
+                    weight,
+                    ids,
+                    x,
+                    status,
+                    m,
+                },
+            ),
+            Self::Dense { table, ty, rows, k } => ctx.embed_dense(
+                stream,
+                EmbedDenseCall {
+                    table: table.range(0, rows * k * ty.width())?,
+                    ty: *ty,
+                    n_rows: *rows,
+                    k: *k,
+                    ids,
+                    x,
+                    status,
+                    m,
+                },
+            ),
+        }
+    }
+}
