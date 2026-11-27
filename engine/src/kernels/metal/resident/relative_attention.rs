@@ -187,7 +187,7 @@ impl MetalContext {
     }
 
     /// The same step `repeats` times in one command buffer of a frame, for a timing test: the
-    /// GPU time of one step in nanoseconds.
+    /// GPU time of the whole frame in nanoseconds, as `dense_gemv_timed` returns it.
     #[cfg(test)]
     pub(crate) fn relative_attention_timed(
         &self,
@@ -198,7 +198,7 @@ impl MetalContext {
         for _ in 0..repeats {
             frame.relative_attention(call)?;
         }
-        frame.drain().map(|ns| ns / repeats as u64)
+        frame.drain()
     }
 }
 
