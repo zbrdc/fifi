@@ -127,9 +127,17 @@ fn lineage_quality_leg() {
         .expect("load");
     let mut step =
         LoopStep::open_model(ctx.clone(), &loaded, &model, routing, run.context + 1).expect("step");
-    let exact = std::env::var_os("KVQ_EXACT").is_some();
-    step.set_exact(exact);
-    println!("kvq lineage leg: {} exact={exact}", model.family);
+    // `KVQ_EXACT=chunks` or `=rows` puts only the prompt chunks or only the one-row steps on
+    // the decoding routes; any other value puts both.
+    let exact = std::env::var("KVQ_EXACT").ok();
+    let (rows, chunks) = match exact.as_deref() {
+        None => (false, false),
+        Some("chunks") => (false, true),
+        Some("rows") => (true, false),
+        Some(_) => (true, true),
+    };
+    step.set_exact_routes(rows, chunks);
+    println!("kvq lineage leg: {} exact={exact:?}", model.family);
     let shape = model.shape;
     let mut stepper = Stepper {
         step,

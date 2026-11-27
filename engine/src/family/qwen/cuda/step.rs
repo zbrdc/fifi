@@ -1,8 +1,9 @@
-//! The trunk executor of SenseNova-Loop on the device: a chunk of token rows through the 56
-//! visits. The walk and the chunk mixers are in [`prefill`]; this module holds the step, its
+//! The trunk executor of the lineage on the device: a chunk of token rows through the visits of
+//! a model's layer list (the looped model's 56, the routed-expert model's 40). The walk and the chunk mixers are in [`prefill`]; this module holds the step, its
 //! state and the one-row mixers a decode step (a chunk of one row) takes.
 //!
-//! The trunk is the CPU reference's (`crate::family::qwen::sensenova::step::token`), visit for visit: mHC
+//! For the looped model the trunk is the CPU reference's
+//! (`crate::family::qwen::sensenova::step::token`), visit for visit: mHC
 //! visits keep both streams, route twice (attn, ffn) through the router table, and end with
 //! `cur = 0.5 * (a + b)`; a visit whose physical layer first enters the mHC range resets the
 //! streams from `cur` (a loop revisit of that physical layer resets them again, as the
@@ -383,7 +384,14 @@ impl<'a> LoopStep<'a> {
     /// ones: the anatomy test compares the routes from one carried state.
     #[cfg(all(test, feature = "native-cuda"))]
     pub(crate) fn set_exact(&mut self, on: bool) {
-        (self.dq, self.exact_chunks) = (on, on);
+        self.set_exact_routes(on, on);
+    }
+
+    /// The decoding routes for one-row steps and for chunks, each on its own: an accuracy run
+    /// tells which of the two a distance from the reference comes from.
+    #[cfg(all(test, feature = "native-cuda"))]
+    pub(crate) fn set_exact_routes(&mut self, rows: bool, chunks: bool) {
+        (self.dq, self.exact_chunks) = (rows, chunks);
         self.replay = Replay::default();
     }
 

@@ -1161,6 +1161,115 @@ fn card_runs_the_routed_expert_model_of_the_lineage() {
     }
 }
 
+/// Anatomy, not a gate: where a chunk leaves a one-row step when both are on the decoding
+/// routes, for the routed-expert model. Every card carries the same state (the first half of
+/// the stream `<QWEN_EXPERTS_ROWS_OUT>.ids`, one row at a time on the decoding routes), then
+/// takes the next position as one row (the reference) and as row 0 of chunks of 2, 5 and 16
+/// rows. Prints, per visit, the relative error of row 0 of the mixer output and of the residual
+/// after the feed-forward: the first visit and half where a chunk departs names the part whose
+/// chunk form computes another value.
+#[test]
+fn card_reports_where_an_exact_chunk_leaves_the_exact_row() {
+    use crate::family::qwen::recipe::{layers, routed_experts, tensors};
+    let (Ok(path), Ok(out)) = (
+        std::env::var("QWEN_EXPERTS_GGUF"),
+        std::env::var("QWEN_EXPERTS_ROWS_OUT"),
+    ) else {
+        eprintln!("skipped: set QWEN_EXPERTS_GGUF and QWEN_EXPERTS_ROWS_OUT");
+        return;
+    };
+    if !device_present("the routed-expert chunk anatomy") {
+        return;
+    }
+    let file = Arc::new(
+        GgufWeights::open_any_type(
+            &std::path::PathBuf::from(path),
+            GgufLimits {
+                max_header_bytes: 32 << 20,
+                max_tensor_bytes: 8 << 30,
+            },
+            None,
+        )
+        .unwrap(),
+    );
+    let model = routed_experts(file.header()).unwrap();
+    let names = tensors(&layers(&model.visits, model.blocks).0);
+    let refs: Vec<&str> = names.iter().map(String::as_str).collect();
+    let ctx = Rc::new(CudaContext::new().unwrap());
+    let loaded = BorrowedLoader::new(&ctx)
+        .unwrap()
+        .load_sliced(
+            &file,
+            &refs,
+            LoadOptions {
+                layout: WeightLayout::Native,
+                ..LoadOptions::default()
+            },
+            &[],
+            0,
+        )
+        .unwrap();
+    let shape = model.shape;
+    let embd = crate::family::project::gguf::GgufMatrix::new(
+        file.header(),
+        "token_embd.weight",
+        shape.vocab,
+        shape.hidden,
+    )
+    .unwrap();
+    let mut projector = GgufProjector::new(file.clone());
+    let routing = super::step::Routing {
+        pre_scale: 1.0,
+        iterations: 1,
+        fixed_identity: true,
+    };
+    let ids: Vec<u32> = std::fs::read(format!("{out}.ids"))
+        .expect("the id stream of the harness run")
+        .as_chunks::<4>()
+        .0
+        .iter()
+        .map(|c| u32::from_le_bytes(*c))
+        .collect();
+    let prefix = ids.len() / 2;
+    let mut carried = |rows: usize| -> Vec<Vec<f32>> {
+        let mut card =
+            LoopStep::open_model(ctx.clone(), &loaded, &model, routing, ids.len() + 1).unwrap();
+        card.set_exact(true);
+        for (pos, &token) in ids[..prefix].iter().enumerate() {
+            let row = projector.rows(&embd, &[token]).unwrap();
+            card.prefill(&row, pos).unwrap();
+        }
+        card.stream().synchronize().unwrap();
+        let embed = projector.rows(&embd, &ids[prefix..prefix + rows]).unwrap();
+        let mut trace = Vec::new();
+        card.chunk_traced(&embed, prefix, &mut trace).unwrap();
+        trace
+    };
+    let reference = carried(1);
+    let again = carried(1);
+    let arms = [carried(2), carried(5), carried(16)];
+    let norm = |v: &[f32]| v.iter().map(|x| f64::from(*x).powi(2)).sum::<f64>().sqrt();
+    let rel = |a: &[f32], b: &[f32]| {
+        let diff: Vec<f32> = a.iter().zip(b).map(|(x, y)| x - y).collect();
+        norm(&diff) / norm(b).max(1e-30)
+    };
+    eprintln!(
+        "visit  half   one-row-again   2-rows     5-rows    16-rows   (relative L2 error of row 0)"
+    );
+    for (i, want) in reference.iter().enumerate() {
+        let half = if i % 2 == 0 { "mixer" } else { "resid" };
+        eprintln!(
+            "{:>5}  {half}  {:>10.3e} {:>10.3e} {:>10.3e} {:>10.3e}",
+            i / 2,
+            rel(&again[i], want),
+            rel(&arms[0][i], want),
+            rel(&arms[1][i], want),
+            rel(&arms[2][i], want)
+        );
+    }
+    assert!(arms.iter().all(|t| t.len() == reference.len()));
+}
+
 /// Accuracy probe, not a gate. Teacher-forces one stream of 240 tokens from position 0 in chunks
 /// of each row count of `SENSENOVA_K_ROWS` and writes the logits row of every position to
 /// `<SENSENOVA_ROWS_OUT>.k<rows>` as little-endian f32. The stream is `<that path>.ids`: when the

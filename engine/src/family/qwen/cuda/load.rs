@@ -1,4 +1,4 @@
-//! The device load of SenseNova-Loop: the trunk name template over the GGUF, uploaded
+//! The device load of the lineage's looped model: the trunk name template over the GGUF, uploaded
 //! whole through the shared loader in Native layout — Q4_K_M stays 5.5 GB of blocks the
 //! MMVQ matvec reads as stored, the small F32 tensors (conv, `ssm_a`, `dt.bias`, every
 //! norm, the mHC bias) land as raw F32 copies.
