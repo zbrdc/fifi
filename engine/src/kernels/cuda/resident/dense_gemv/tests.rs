@@ -91,26 +91,41 @@ impl Padded {
     }
 }
 
+/// The weight codes as little-endian 16-bit words: one per value for the half types, the two
+/// halves of each value for f32.
 fn narrow(dtype: DenseDtype, values: &[f32]) -> Vec<u16> {
     values
         .iter()
-        .map(|&v| match dtype {
-            DenseDtype::F16 => half::f16::from_f32(v).to_bits(),
-            DenseDtype::Bf16 => half::bf16::from_f32(v).to_bits(),
-            _ => unreachable!("half-precision fixture"),
+        .flat_map(|&v| match dtype {
+            DenseDtype::F16 => vec![half::f16::from_f32(v).to_bits()],
+            DenseDtype::Bf16 => vec![half::bf16::from_f32(v).to_bits()],
+            DenseDtype::F32 => {
+                let b = v.to_bits();
+                vec![b as u16, (b >> 16) as u16]
+            }
+            _ => unreachable!("a float fixture"),
         })
         .collect()
 }
 
 fn widen(dtype: DenseDtype, codes: &[u16]) -> Vec<f64> {
-    codes
-        .iter()
-        .map(|&c| match dtype {
-            DenseDtype::F16 => half::f16::from_bits(c).to_f64(),
-            DenseDtype::Bf16 => half::bf16::from_bits(c).to_f64(),
-            _ => unreachable!("half-precision fixture"),
-        })
-        .collect()
+    match dtype {
+        DenseDtype::F16 => codes
+            .iter()
+            .map(|&c| half::f16::from_bits(c).to_f64())
+            .collect(),
+        DenseDtype::Bf16 => codes
+            .iter()
+            .map(|&c| half::bf16::from_bits(c).to_f64())
+            .collect(),
+        DenseDtype::F32 => codes
+            .as_chunks::<2>()
+            .0
+            .iter()
+            .map(|&[lo, hi]| f64::from(f32::from_bits(u32::from(lo) | (u32::from(hi) << 16))))
+            .collect(),
+        _ => unreachable!("a float fixture"),
+    }
 }
 
 fn code_bytes(codes: &[u16]) -> Vec<u8> {
@@ -157,7 +172,8 @@ impl Case {
 /// `(sum, sum of |terms|)` of one result in f64.
 fn reference(c: &Case, t: usize, r: usize) -> (f64, f64) {
     let cols = c.shape.cols;
-    let w = widen(c.dtype, &c.codes[r * cols..(r + 1) * cols]);
+    let words = if c.dtype == DenseDtype::F32 { 2 } else { 1 };
+    let w = widen(c.dtype, &c.codes[r * cols * words..(r + 1) * cols * words]);
     w.iter()
         .zip(&c.x[t * c.shape.ld_x..t * c.shape.ld_x + cols])
         .fold((0.0, 0.0), |(s, a), (w, v)| {
@@ -296,26 +312,28 @@ fn a_result_does_not_depend_on_the_number_of_rows_of_the_call() {
     }
     let rig = Rig::new();
     let mut rng = Rng::new(0xD3_5E_6E_03);
-    let many = Case::new(
-        &mut rng,
-        DenseGemvShape::packed(5, 48, 2560),
-        DenseDtype::F16,
-    );
-    let together = run(&rig, &many, (0, 0, 0));
-    for t in 0..5 {
-        let alone = Case {
-            shape: DenseGemvShape::packed(1, 48, 2560),
-            dtype: many.dtype,
-            codes: many.codes.clone(),
-            x: many.x[t * 2560..(t + 1) * 2560].to_vec(),
-        };
-        let single = run(&rig, &alone, (0, 0, 0));
-        let bits = |v: &[f32]| v.iter().map(|f| f.to_bits()).collect::<Vec<_>>();
-        assert_eq!(
-            bits(&single),
-            bits(&together[t * 48..(t + 1) * 48]),
-            "row {t}"
-        );
+    let bits = |v: &[f32]| v.iter().map(|f| f.to_bits()).collect::<Vec<_>>();
+    // 17 rows span two whole tiles of the row kernel and one partial one; 2563 columns take its
+    // scalar load path. Each row of a many-row call must keep the bits of a one-row call.
+    for dtype in [DenseDtype::F16, DenseDtype::Bf16, DenseDtype::F32] {
+        for (tokens, cols) in [(5, 2560), (17, 2560), (17, 2563)] {
+            let many = Case::new(&mut rng, DenseGemvShape::packed(tokens, 48, cols), dtype);
+            let together = run(&rig, &many, (0, 0, 0));
+            for t in 0..tokens {
+                let alone = Case {
+                    shape: DenseGemvShape::packed(1, 48, cols),
+                    dtype: many.dtype,
+                    codes: many.codes.clone(),
+                    x: many.x[t * cols..(t + 1) * cols].to_vec(),
+                };
+                let single = run(&rig, &alone, (0, 0, 0));
+                assert_eq!(
+                    bits(&single),
+                    bits(&together[t * 48..(t + 1) * 48]),
+                    "{dtype:?}, {tokens} rows of {cols}: row {t}"
+                );
+            }
+        }
     }
 }
 

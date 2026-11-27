@@ -81,6 +81,61 @@ __global__ void dense_gemv_k(const W *__restrict__ w, const float *__restrict__ 
     if (lane == 0) y[(size_t)t * ld_y + r] = acc;
 }
 
+// Rows of x a warp of dense_gemv_rows_k serves with one load of its W row.
+constexpr int kTileTokens = 8;
+
+// dense_gemv_k over a tile of kTileTokens rows of x: each warp loads its row of W once and folds
+// it into every row of the tile, so W crosses the cache once per tile instead of once per row of
+// x. Every output keeps dense_gemv_k's lane split, fma order and warp sum, so its bits are those
+// of dense_gemv_k. grid (ceil(rows / kWarps), ceil(m / kTileTokens)).
+template <typename W, bool kVector>
+__global__ void dense_gemv_rows_k(const W *__restrict__ w, const float *__restrict__ x,
+                                  float *__restrict__ y, int rows, int cols, int m, int ld_x,
+                                  int ld_y) {
+    const int lane = threadIdx.x & 31;
+    const int r = blockIdx.x * kWarps + (threadIdx.x >> 5);
+    if (r >= rows) return;
+    const int t0 = blockIdx.y * kTileTokens;
+    const int count = min(kTileTokens, m - t0);
+    const W *row = w + (size_t)r * cols;
+    const float *in = x + (size_t)t0 * ld_x;
+    float acc[kTileTokens];
+#pragma unroll
+    for (int t = 0; t < kTileTokens; ++t) acc[t] = 0.0f;
+    if (kVector) {
+        constexpr int width = sizeof(uint4) / sizeof(W);
+        const uint4 *wide = reinterpret_cast<const uint4 *>(row);
+        for (int v = lane; v < cols / width; v += 32) {
+            const uint4 raw = wide[v];
+            const W *e = reinterpret_cast<const W *>(&raw);
+#pragma unroll
+            for (int t = 0; t < kTileTokens; ++t) {
+                if (t < count) {
+                    const float *xt = in + (size_t)t * ld_x + v * width;
+#pragma unroll
+                    for (int j = 0; j < width; ++j) acc[t] = fmaf(widen(e[j]), xt[j], acc[t]);
+                }
+            }
+        }
+    } else {
+        for (int c = lane; c < cols; c += 32) {
+            const float wc = widen(row[c]);
+#pragma unroll
+            for (int t = 0; t < kTileTokens; ++t) {
+                if (t < count) acc[t] = fmaf(wc, in[(size_t)t * ld_x + c], acc[t]);
+            }
+        }
+    }
+    // count is the same for the whole warp, so every shuffle of warp_sum runs converged.
+#pragma unroll
+    for (int t = 0; t < kTileTokens; ++t) {
+        if (t < count) {
+            const float sum = warp_sum(acc[t]);
+            if (lane == 0) y[(size_t)(t0 + t) * ld_y + r] = sum;
+        }
+    }
+}
+
 // Each lane reads one packed byte and consumes both nibbles of its GGUF block.
 __device__ float gguf_scale(unsigned code) {
     if (code == 0x7f) return 0.0f;
@@ -543,6 +598,17 @@ void launch(const inference_cuda_dense_gemv_args &a, cudaStream_t s, Failure &fa
         decode_split(a) && vector && aligned(a.x,16)) {
         if constexpr (std::is_same_v<W,float>) decode_controller_down_exact<<<a.rows,256,0,s>>>(a);
         else decode_bf16_exact<<<a.rows,32,0,s>>>(a);
+    } else if (a.m > 1) {
+        const dim3 tiles((a.rows + kWarps - 1) / kWarps, (a.m + kTileTokens - 1) / kTileTokens);
+        if (vector) {
+            dense_gemv_rows_k<W, true><<<tiles, kWarps * 32, 0, s>>>(
+                (const W *)a.w, (const float *)a.x, (float *)a.y, a.rows, a.cols, a.m, a.ld_x,
+                a.ld_y);
+        } else {
+            dense_gemv_rows_k<W, false><<<tiles, kWarps * 32, 0, s>>>(
+                (const W *)a.w, (const float *)a.x, (float *)a.y, a.rows, a.cols, a.m, a.ld_x,
+                a.ld_y);
+        }
     } else if (vector) {
         dense_gemv_k<W, true><<<grid, kWarps * 32, shared, s>>>(
             (const W *)a.w, (const float *)a.x, (float *)a.y, a.rows, a.cols, a.ld_x, a.ld_y);
