@@ -19,6 +19,7 @@
 #include <cstdio>
 #include <cstring>
 #include <exception>
+#include <mach/mach.h>
 
 // One handle that carries the device and the queue every launch is encoded on. Objective-C
 // declarations live at global scope, outside the anonymous namespace below.
@@ -161,6 +162,49 @@ int inference_metal_buffer_new(void *runtime, size_t bytes, void **out) noexcept
             return kStatusFailed;
         }
         std::memset(buffer.contents, 0, buffer.length);
+        *out = (__bridge_retained void *)buffer;
+        return kStatusOk;
+    });
+}
+
+// A buffer with no copy over storage the caller owns and keeps mapped for the buffer's life:
+// the pages of a mapped file. Metal wants an address at a page boundary and a length that is
+// a multiple of the page size: the length is cut down to one, so the bytes of the last partial
+// page are not covered. Nothing here keeps the device from writing; the caller's storage rule
+// is read-only.
+int inference_metal_buffer_wrap(void *runtime, void *storage, size_t bytes, size_t *wrapped,
+                                void **out) noexcept {
+    return guarded("buffer_wrap", [&]() -> int {
+        id<MTLDevice> device = device_of(runtime);
+        if (device == nil || storage == nullptr || out == nullptr || wrapped == nullptr) {
+            return kStatusInvalid;
+        }
+        *out = nullptr;
+        *wrapped = 0;
+        vm_size_t page = 0;
+        if (host_page_size(mach_host_self(), &page) != KERN_SUCCESS || page == 0) {
+            set_error("buffer_wrap", "the page size is unknown");
+            return kStatusFailed;
+        }
+        const uintptr_t address = reinterpret_cast<uintptr_t>(storage);
+        if (address % page != 0) {
+            set_error("buffer_wrap", "the storage does not start at a page boundary");
+            return kStatusInvalid;
+        }
+        const size_t length = bytes - bytes % page;
+        if (length == 0) {
+            set_error("buffer_wrap", "the storage is shorter than a page");
+            return kStatusInvalid;
+        }
+        id<MTLBuffer> buffer = [device newBufferWithBytesNoCopy:storage
+                                                         length:length
+                                                        options:MTLResourceStorageModeShared
+                                                    deallocator:nil];
+        if (buffer == nil) {
+            set_error("buffer_wrap", "the device gave no buffer over the storage");
+            return kStatusFailed;
+        }
+        *wrapped = length;
         *out = (__bridge_retained void *)buffer;
         return kStatusOk;
     });

@@ -8,7 +8,8 @@
 //! A handle is an object the bridge retains for Rust under automatic reference counting, and
 //! each is released once by [`release`] unless the backend went terminal first. Safety
 //! invariants: the pointer of a [`RawBuffer`] is a live buffer of `bytes` bytes whose storage
-//! stays valid and host-visible until it is released; the pointer of a [`RawKernel`] is a live
+//! stays valid and host-visible until it is released (for one that [`buffer_wrap`] made, the
+//! storage is the caller's to keep mapped and read-only); the pointer of a [`RawKernel`] is a live
 //! compute pipeline state of `max_threads` threads a threadgroup at most; the pointer of a
 //! [`RawRuntime`] carries the device and the queue every launch is encoded on; the pointer of a
 //! [`RawCommand`] is a live command buffer of that queue. The host may touch a buffer only
@@ -99,6 +100,14 @@ unsafe extern "C" {
     fn bridge_buffer_new(runtime: *mut c_void, bytes: usize, out: *mut *mut c_void) -> c_int;
     #[link_name = "inference_metal_buffer_contents"]
     fn bridge_buffer_contents(buffer: *mut c_void) -> *mut u8;
+    #[link_name = "inference_metal_buffer_wrap"]
+    fn bridge_buffer_wrap(
+        runtime: *mut c_void,
+        storage: *mut c_void,
+        bytes: usize,
+        wrapped: *mut usize,
+        out: *mut *mut c_void,
+    ) -> c_int;
     #[link_name = "inference_metal_kernel_new"]
     fn bridge_kernel_new(
         runtime: *mut c_void,
@@ -192,6 +201,39 @@ pub(super) fn contents(buffer: &RawBuffer) -> *mut u8 {
     // SAFETY: the pointer is a live buffer, the invariant of this module, and `contents`
     // raises no exception.
     unsafe { bridge_buffer_contents(buffer.pointer) }
+}
+
+/// A buffer with no copy over `storage`, which the caller keeps mapped and read-only until the
+/// buffer is released: the pages of a file `family::MappedFile` maps. Metal wants an address at
+/// a page boundary (any other is [`STATUS_INVALID`]) and a length that is a multiple of the page
+/// size: the buffer covers the whole pages of the storage and not the bytes of its last partial
+/// page. A storage shorter than a page is [`STATUS_INVALID`].
+pub(super) fn buffer_wrap(runtime: &RawRuntime, storage: &[u8]) -> Result<RawBuffer, c_int> {
+    let mut out: *mut c_void = std::ptr::null_mut();
+    let mut wrapped = 0usize;
+    if storage.is_empty() {
+        return Err(STATUS_INVALID);
+    }
+    let status = unsafe {
+        bridge_buffer_wrap(
+            runtime.pointer,
+            storage.as_ptr().cast_mut().cast(),
+            storage.len(),
+            &mut wrapped,
+            &mut out,
+        )
+    };
+    if status != 0 {
+        return Err(status);
+    }
+    if out.is_null() || wrapped == 0 || wrapped > storage.len() {
+        release(out);
+        return Err(STATUS_INVALID);
+    }
+    Ok(RawBuffer {
+        pointer: out,
+        bytes: wrapped,
+    })
 }
 
 /// Copies `data` into the buffer at `offset`.
@@ -405,7 +447,10 @@ mod tests {
     //! them. The shader is `x[i] = x[i] * 2 + by`, whose result tells two orders of two
     //! dispatches apart. Device tests (Mac); the suite runs with `--test-threads=1`.
 
+    use std::io::Write as _;
     use std::rc::Rc;
+
+    use crate::family::mapped_file::MappedFile;
 
     use super::*;
     use crate::kernels::metal::TERMINAL;
@@ -413,6 +458,13 @@ mod tests {
 
     const SOURCE: &CStr = c"#include <metal_stdlib>\nusing namespace metal;\nkernel void affine_step(device float *x [[buffer(0)]], constant float &by [[buffer(1)]],\n                                uint i [[thread_position_in_grid]]) {\n  x[i] = x[i] * 2.0f + by;\n}\n";
     const NAME: &CStr = c"affine_step";
+    /// Copies a page of the mapped file to a Metal-allocated buffer, with `by` added.
+    const COPY_SOURCE: &CStr = c"#include <metal_stdlib>\nusing namespace metal;\nkernel void copy_step(device const float *x [[buffer(0)]], device float *out [[buffer(1)]], constant float &by [[buffer(2)]],\n                               uint i [[thread_position_in_grid]]) {\n  out[i] = x[i] + by;\n}\n";
+    const COPY_NAME: &CStr = c"copy_step";
+    /// The floats of the file a wrap reads: 65,536 bytes, whole pages at 4 KiB and at 16 KiB.
+    const MAPPED_FLOATS: usize = 16384;
+    /// The tail of that file after its whole pages.
+    const TAIL: [u8; 100] = [0xAA; 100];
     /// The values of `x`. The grid has one thread for each.
     const VALUES: usize = 64;
     const GRID: [usize; 3] = [VALUES, 1, 1];
@@ -590,6 +642,93 @@ mod tests {
         // 0 * 2 + 3 everywhere: without the fill the uninitialized bytes would show.
         rig.launch(3.0, 1);
         assert_eq!(rig.values(), vec![3.0f32; VALUES]);
+        rig.close();
+    }
+
+    /// A file of `MAPPED_FLOATS` f32 (a quarter of the index at each) and the tail, written and
+    /// flushed: a temp file of the test run's directory.
+    fn mapped_file() -> (tempfile::NamedTempFile, Vec<u8>) {
+        let bytes: Vec<u8> = (0..MAPPED_FLOATS as u32)
+            .flat_map(|i| (i as f32 * 0.25).to_le_bytes())
+            .chain(TAIL)
+            .collect();
+        let mut file = tempfile::Builder::new()
+            .prefix("metal-wrap-")
+            .tempfile()
+            .expect("a temp file");
+        file.write_all(&bytes).expect("the write");
+        file.flush().expect("the flush");
+        (file, bytes)
+    }
+
+    #[test]
+    fn a_buffer_over_mapped_pages_reads_the_file_at_an_offset() {
+        let (file, bytes) = mapped_file();
+        let mapped = MappedFile::open(file.path(), bytes.len() as u64).expect("the mapping");
+        let rig = Rig::new();
+        let _dispatch = DispatchGuard::enter(&TERMINAL);
+        let wrapped = buffer_wrap(&rig.runtime, mapped.as_ref()).expect("the wrap");
+        // The whole pages, not the tail.
+        assert_eq!(wrapped.bytes(), 4 * MAPPED_FLOATS);
+        // An address inside a page, an empty storage, a storage shorter than a page.
+        assert_eq!(
+            buffer_wrap(&rig.runtime, &mapped.as_ref()[64..]).err(),
+            Some(STATUS_INVALID)
+        );
+        assert_eq!(buffer_wrap(&rig.runtime, &[]).err(), Some(STATUS_INVALID));
+        let mut short = tempfile::Builder::new()
+            .prefix("metal-wrap-short-")
+            .tempfile()
+            .expect("a short temp file");
+        short.write_all(&TAIL).expect("the write");
+        short.flush().expect("the flush");
+        let short = MappedFile::open(short.path(), TAIL.len() as u64).expect("the mapping");
+        assert_eq!(
+            buffer_wrap(&rig.runtime, short.as_ref()).err(),
+            Some(STATUS_INVALID)
+        );
+
+        let copy = kernel_new(&rig.runtime, COPY_SOURCE, COPY_NAME).expect("the shader");
+        // 4,096 floats from byte 16,416: a page and 32 bytes in, where a GGUF tensor's bytes lie.
+        const OFFSET: usize = 16384 + 32;
+        const FLOATS: usize = 4096;
+        let out = buffer_new(&rig.runtime, 4 * FLOATS).expect("the output buffer");
+        let bindings = [
+            Binding {
+                pointer: wrapped.pointer(),
+                offset: OFFSET,
+            },
+            Binding {
+                pointer: out.pointer(),
+                offset: 0,
+            },
+        ];
+        run(
+            &rig.runtime,
+            &copy,
+            &bindings,
+            &0.5f32.to_le_bytes(),
+            [FLOATS, 1, 1],
+            [32, 1, 1],
+            1,
+        )
+        .expect("the launch");
+        let read = buffer_read(&out, 0, 4 * FLOATS).expect("the read");
+        let floats = |data: &[u8], by: f32| -> Vec<f32> {
+            data.as_chunks::<4>()
+                .0
+                .iter()
+                .map(|c| f32::from_le_bytes(*c) + by)
+                .collect()
+        };
+        assert_eq!(
+            floats(&read, 0.0),
+            floats(&bytes[OFFSET..OFFSET + 4 * FLOATS], 0.5)
+        );
+        release(out.pointer());
+        release(wrapped.pointer());
+        release(copy.pointer);
+        drop(mapped);
         rig.close();
     }
 }
