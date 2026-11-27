@@ -40,6 +40,8 @@ pub(crate) type Grid = [usize; 3];
 
 /// The non-finite weight flag of the dense matvec, one `u32`.
 const FLAG_BYTES: usize = 4;
+/// The flag cleared: no weight marked.
+const FLAG_ZERO: [u8; 4] = [0; 4];
 
 pub(crate) struct MetalContext {
     pub(super) shared: Rc<Shared>,
@@ -56,6 +58,10 @@ pub(super) struct Shared {
     kernels: RefCell<HashMap<(&'static str, &'static str), Rc<RawKernel>>>,
     /// The non-finite weight flag of the dense matvec, made at first use.
     flag: RefCell<Option<RawBuffer>>,
+    /// The frame that carries the flag, while one does.
+    flag_frame: Cell<Option<u64>>,
+    /// The id of the next frame.
+    next_frame_id: Cell<u64>,
     /// The command buffers a frame committed and did not wait for, oldest first.
     in_flight: RefCell<Vec<InFlight>>,
     /// The GPU time of the command buffers waited before a frame's drain.
@@ -116,6 +122,8 @@ impl MetalContext {
             live_buffers: AtomicUsize::new(0),
             kernels: RefCell::new(HashMap::new()),
             flag: RefCell::new(None),
+            flag_frame: Cell::new(None),
+            next_frame_id: Cell::new(0),
             in_flight: RefCell::new(Vec::new()),
             settled_gpu_ns: Cell::new(0),
         });
@@ -124,7 +132,7 @@ impl MetalContext {
 
     /// The identity of this context, for the check that a range belongs to it.
     pub(super) fn id(&self) -> usize {
-        Rc::as_ptr(&self.shared) as usize
+        self.shared.id()
     }
 
     pub(crate) fn live_bytes(&self) -> usize {
@@ -163,31 +171,7 @@ impl MetalContext {
         name: &'static str,
         source: &'static str,
     ) -> Result<Rc<RawKernel>, EngError> {
-        ensure_usable(&TERMINAL)?;
-        let key = (name, source);
-        if let Some(kernel) = self.shared.kernels.borrow().get(&key) {
-            return Ok(Rc::clone(kernel));
-        }
-        let name_c = CString::new(name)
-            .map_err(|_| EngError::BadRequest("a shader name holds a null byte".to_owned()))?;
-        let source_c = CString::new(source)
-            .map_err(|_| EngError::BadRequest("a shader source holds a null byte".to_owned()))?;
-        let kernel = {
-            let _guard = DispatchGuard::enter(&TERMINAL);
-            // Another thread may have compiled it while this one waited for the guard.
-            if let Some(kernel) = self.shared.kernels.borrow().get(&key) {
-                return Ok(Rc::clone(kernel));
-            }
-            Rc::new(
-                native::kernel_new(&self.shared.runtime, &source_c, &name_c)
-                    .map_err(|_| terminal_failure(COMPILE_OPERATION))?,
-            )
-        };
-        self.shared
-            .kernels
-            .borrow_mut()
-            .insert(key, Rc::clone(&kernel));
-        Ok(kernel)
+        self.shared.kernel(name, source)
     }
 
     /// Encodes `repeats` dispatches of `kernel` back to back and waits for the command buffer:
@@ -232,6 +216,41 @@ impl MetalContext {
 impl Shared {
     pub(super) fn runtime(&self) -> &RawRuntime {
         &self.runtime
+    }
+
+    /// The identity of this context, for the check that a range belongs to it.
+    pub(super) fn id(&self) -> usize {
+        self as *const Self as usize
+    }
+
+    /// The compiled shader `name` of `source`, compiled once per context.
+    pub(super) fn kernel(
+        &self,
+        name: &'static str,
+        source: &'static str,
+    ) -> Result<Rc<RawKernel>, EngError> {
+        ensure_usable(&TERMINAL)?;
+        let key = (name, source);
+        if let Some(kernel) = self.kernels.borrow().get(&key) {
+            return Ok(Rc::clone(kernel));
+        }
+        let name_c = CString::new(name)
+            .map_err(|_| EngError::BadRequest("a shader name holds a null byte".to_owned()))?;
+        let source_c = CString::new(source)
+            .map_err(|_| EngError::BadRequest("a shader source holds a null byte".to_owned()))?;
+        let kernel = {
+            let _guard = DispatchGuard::enter(&TERMINAL);
+            // Another thread may have compiled it while this one waited for the guard.
+            if let Some(kernel) = self.kernels.borrow().get(&key) {
+                return Ok(Rc::clone(kernel));
+            }
+            Rc::new(
+                native::kernel_new(&self.runtime, &source_c, &name_c)
+                    .map_err(|_| terminal_failure(COMPILE_OPERATION))?,
+            )
+        };
+        self.kernels.borrow_mut().insert(key, Rc::clone(&kernel));
+        Ok(kernel)
     }
 
     /// Waits for the oldest command buffer in flight and releases it. Its GPU time in
@@ -310,7 +329,7 @@ impl Shared {
     }
 
     /// The non-finite weight flag, made at first use, for `body`.
-    pub(super) fn with_flag<T>(
+    fn with_flag<T>(
         &self,
         body: impl FnOnce(&RawBuffer) -> Result<T, EngError>,
     ) -> Result<T, EngError> {
@@ -328,6 +347,62 @@ impl Shared {
             .as_ref()
             .expect("the flag exists after the check above");
         body(flag)
+    }
+
+    /// The id of a new frame of this context.
+    pub(super) fn next_frame_id(&self) -> u64 {
+        let id = self.next_frame_id.get();
+        self.next_frame_id.set(id + 1);
+        id
+    }
+
+    /// Gives the flag to frame `id`. A context's flag is one a frame: a second frame is refused,
+    /// because its clear would erase the marks of the first.
+    pub(super) fn frame_takes_flag(&self, id: u64) -> Result<(), EngError> {
+        if self.flag_frame.get().is_some_and(|holder| holder != id) {
+            return Err(adapter_bug(
+                "two frames of one Metal context carry the non-finite weight flag",
+            ));
+        }
+        self.flag_frame.set(Some(id));
+        Ok(())
+    }
+
+    /// The flag is no longer frame `id`'s.
+    pub(super) fn release_flag(&self, id: u64) {
+        if self.flag_frame.get() == Some(id) {
+            self.flag_frame.set(None);
+        }
+    }
+
+    /// Clears the flag. A host write: the command buffers that bind the flag are waited for
+    /// first, and under the rule above none is in flight.
+    pub(super) fn clear_flag(&self) -> Result<(), EngError> {
+        self.with_flag(|flag| {
+            self.settle(flag.pointer())?;
+            native::buffer_write(flag, 0, &FLAG_ZERO)
+                .map_err(|_| adapter_bug("the write that clears the non-finite weight flag"))
+        })
+    }
+
+    /// The flag's address, the last binding of a dispatch of the dense matvec.
+    pub(super) fn flag_pointer(&self) -> Result<*mut c_void, EngError> {
+        self.with_flag(|flag| Ok(flag.pointer()))
+    }
+
+    /// Reads the flag after the wait of a frame's drain: a mark is a weight that is not finite.
+    pub(super) fn check_flag(&self) -> Result<(), EngError> {
+        let set = self.with_flag(|flag| {
+            self.settle(flag.pointer())?;
+            native::buffer_read(flag, 0, FLAG_ZERO.len())
+                .map_err(|_| adapter_bug("the read of the non-finite weight flag"))
+        })?;
+        if set != FLAG_ZERO {
+            return Err(EngError::BadRequest(
+                "the Metal dense matvec read a weight that is not finite".to_owned(),
+            ));
+        }
+        Ok(())
     }
 }
 

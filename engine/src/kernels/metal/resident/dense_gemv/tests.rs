@@ -12,6 +12,8 @@
 //! Each refusal is checked by its error text and must leave the output untouched. The suite
 //! runs with `--test-threads=1`, because two tests of it hold adapter leases.
 
+use std::time::{Duration, Instant};
+
 use half::{bf16, f16};
 
 use super::{DenseDtype, DenseGemvCall, DenseGemvShape, dense_gemv_bytes};
@@ -579,5 +581,205 @@ fn dense_gemv_is_timed() {
                 rate(chain),
             );
         }
+    }
+}
+
+/// A BF16 call of one row over buffers built for the shape `[16, 256]`.
+fn small_call<'b>(w: &'b Padded, x: &'b Padded, y: &'b Padded) -> DenseGemvCall<'b> {
+    DenseGemvCall {
+        shape: DenseGemvShape::packed(1, 16, 256),
+        dtype: DenseDtype::Bf16,
+        w: w.all(),
+        x: x.all(),
+        y: y.all(),
+    }
+}
+
+#[test]
+fn a_frame_refuses_a_weight_that_is_not_finite_at_its_drain() {
+    let rig = Rig::new();
+    let mut rng = Rng::new(0xF1_A6_05_11);
+    let shape = DenseGemvShape::packed(1, 16, 256);
+    let mut case = Case::new(&mut rng, shape, DenseDtype::Bf16);
+    let want = reference(&case, 0);
+    let w = Padded::new(&rig.ctx, &code_bytes(&case.codes), 0);
+    // One weight that is not finite, in row 5: only the second weight buffer carries it.
+    case.codes[5 * 256 + 100] = bf16::INFINITY.to_bits();
+    let need = dense_gemv_bytes(shape, DenseDtype::Bf16).expect("the bytes of the call");
+    let w_bad = Padded::new(&rig.ctx, &code_bytes(&case.codes), 0);
+    let x = Padded::new(&rig.ctx, &f32_bytes(&case.x), 0);
+    let good = Padded::new(&rig.ctx, &sentinel(need.y), 0);
+    let bad = Padded::new(&rig.ctx, &sentinel(need.y), 0);
+    let check = |got: &[f32], unwritten: Option<usize>| {
+        assert_eq!(got.len(), 16, "one result a row");
+        for (r, (&value, &(want, bound))) in got.iter().zip(&want).enumerate() {
+            if unwritten == Some(r) {
+                assert!(value.to_bits() == SENT_BITS, "row {r} was written");
+                continue;
+            }
+            assert!(
+                (f64::from(value) - want).abs() <= bound,
+                "row {r}: value {value}, f64 reference {want}"
+            );
+        }
+    };
+
+    // Two dispatches a command buffer: the weight that is not finite is in the first.
+    let mut frame = rig.ctx.frame_of(2);
+    frame
+        .dense_gemv(small_call(&w, &x, &good))
+        .expect("the first matvec");
+    frame
+        .dense_gemv(small_call(&w_bad, &x, &bad))
+        .expect("the second is encoded; its refusal is the drain's");
+    assert_eq!(frame.in_flight(), 1, "the first command buffer is ahead");
+    frame
+        .dense_gemv(small_call(&w, &x, &good))
+        .expect("the third matvec");
+    let error = frame
+        .drain()
+        .expect_err("a weight that is not finite refuses the drain");
+    let EngError::BadRequest(text) = error else {
+        panic!("{error:?}")
+    };
+    assert!(text.contains("not finite"), "{text:?}");
+    check(&floats(&good.read("y")), None);
+    check(&floats(&bad.read("y")), Some(5));
+
+    // The flag left the frame with the refusal: the next frame clears it and runs.
+    let mut frame = rig.ctx.frame();
+    frame
+        .dense_gemv(small_call(&w, &x, &good))
+        .expect("the next frame's matvec");
+    frame.drain().expect("the next frame drains");
+    check(&floats(&good.read("y")), None);
+}
+
+#[test]
+fn a_second_frame_does_not_carry_the_flag_while_one_frame_has_it() {
+    let rig = Rig::new();
+    let mut rng = Rng::new(0x5E_C0_D0_11);
+    let shape = DenseGemvShape::packed(1, 16, 256);
+    let case = Case::new(&mut rng, shape, DenseDtype::Bf16);
+    let need = dense_gemv_bytes(shape, DenseDtype::Bf16).expect("the bytes of the call");
+    let w = Padded::new(&rig.ctx, &code_bytes(&case.codes), 0);
+    let x = Padded::new(&rig.ctx, &f32_bytes(&case.x), 0);
+    let first_y = Padded::new(&rig.ctx, &sentinel(need.y), 0);
+    let second_y = Padded::new(&rig.ctx, &sentinel(need.y), 0);
+    let mut first = rig.ctx.frame();
+    first
+        .dense_gemv(small_call(&w, &x, &first_y))
+        .expect("the first frame's matvec");
+    let mut second = rig.ctx.frame();
+    let error = second
+        .dense_gemv(small_call(&w, &x, &second_y))
+        .expect_err("the flag is the first frame's");
+    let EngError::Backend { message, .. } = error else {
+        panic!("{error:?}")
+    };
+    assert!(message.contains("two frames"), "{message:?}");
+    assert!(
+        floats(&second_y.read("y"))
+            .iter()
+            .all(|value| value.to_bits() == SENT_BITS),
+        "the refused dispatch was not encoded"
+    );
+    first
+        .drain()
+        .expect("the first frame drains: the flag is free");
+    second
+        .dense_gemv(small_call(&w, &x, &second_y))
+        .expect("the flag is free after the drain");
+    second.drain().expect("the second frame drains");
+    assert_eq!(
+        first_y.read("y"),
+        second_y.read("y"),
+        "both frames wrote the same bits"
+    );
+}
+
+/// Prints, for 128 dispatches of the head's row and of a small projection, the wall time and the
+/// GPU time of a frame of 64 dispatches a command buffer against one-dispatch frames, the
+/// waiting launch. Both forms must write the same bits over a sentinel.
+#[test]
+#[ignore = "prints the dense matvec's time in a frame against the waiting launch"]
+fn dense_gemv_in_a_frame_is_timed() {
+    let rig = Rig::new();
+    let mut rng = Rng::new(0xF3_A6_E0_11);
+    for (rows, cols) in [(200_058usize, 2304usize), (64, 4608)] {
+        time_in_a_frame(&rig, &mut rng, DenseGemvShape::packed(1, rows, cols));
+    }
+}
+
+fn time_in_a_frame(rig: &Rig, rng: &mut Rng, shape: DenseGemvShape) {
+    const DISPATCHES: usize = 128;
+    let DenseGemvShape { rows, cols, .. } = shape;
+    let case = Case::new(rng, shape, DenseDtype::Bf16);
+    let w = Padded::new(&rig.ctx, &code_bytes(&case.codes), 0);
+    let x = Padded::new(&rig.ctx, &f32_bytes(&case.x), 0);
+    let need = dense_gemv_bytes(shape, DenseDtype::Bf16).expect("the bytes of the call");
+    let waited = Padded::new(&rig.ctx, &sentinel(need.y), 0);
+    let framed = Padded::new(&rig.ctx, &sentinel(need.y), 0);
+    fn call<'b>(
+        shape: DenseGemvShape,
+        w: &'b Padded,
+        x: &'b Padded,
+        y: &'b Padded,
+    ) -> DenseGemvCall<'b> {
+        DenseGemvCall {
+            shape,
+            dtype: DenseDtype::Bf16,
+            w: w.all(),
+            x: x.all(),
+            y: y.all(),
+        }
+    }
+    let mb = need.w as f64 / 1e6;
+    let report = |round: usize, form: &str, wall: Duration, gpu_ns: u64| {
+        let wall_ms = wall.as_secs_f64() * 1e3;
+        let gpu_ms = gpu_ns as f64 / 1e6;
+        let idle = 100.0 * (wall_ms - gpu_ms) / wall_ms;
+        println!(
+            "matvec [{rows}, {cols}] {mb:.1} MB, round {round}, {form}: {DISPATCHES} dispatches, wall {wall_ms:.3} ms, GPU {gpu_ms:.3} ms, the GPU idle {idle:.1} percent of the wall time, {} us a dispatch",
+            gpu_ns as f64 / 1e3 / DISPATCHES as f64
+        );
+    };
+    for round in 1..=2 {
+        let start = Instant::now();
+        let mut gpu_ns = 0;
+        for _ in 0..DISPATCHES {
+            gpu_ns += rig
+                .ctx
+                .dense_gemv_timed(call(shape, &w, &x, &waited), 1)
+                .expect("a waited launch");
+        }
+        let waited_bits = waited.read("y");
+        report(round, "one-dispatch frames", start.elapsed(), gpu_ns);
+        assert!(
+            floats(&waited_bits)
+                .iter()
+                .any(|value| value.to_bits() != SENT_BITS),
+            "the results replaced the sentinel"
+        );
+
+        let start = Instant::now();
+        let mut frame = rig.ctx.frame();
+        for _ in 0..DISPATCHES {
+            frame
+                .dense_gemv(call(shape, &w, &x, &framed))
+                .expect("a dispatch");
+        }
+        let gpu_ns = frame.drain().expect("the drain");
+        report(
+            round,
+            "a frame of 64 dispatches a command buffer",
+            start.elapsed(),
+            gpu_ns,
+        );
+        assert_eq!(
+            framed.read("y"),
+            waited_bits,
+            "the frame wrote the bits the waiting launch wrote"
+        );
     }
 }

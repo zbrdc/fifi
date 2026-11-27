@@ -1,19 +1,20 @@
 //! Shared matrix-vector projection for F16 and BF16 weights, the contract of the CUDA adapter's
 //! dense matvec. Activations and results stay in device buffers between launches.
 //!
-//! [`MetalContext::dense_gemv`] encodes one kernel, commits its command buffer and waits. It
-//! allocates nothing and copies nothing. `ld_y` lets the result land inside a wider row.
+//! [`Frame::dense_gemv`] encodes one kernel into the open command buffer of a frame. The kernel
+//! marks a weight that is not finite in a flag, one a frame: the frame clears it before its
+//! first matvec and reads it in its drain, so that refusal comes there. A call allocates
+//! nothing and copies nothing. `ld_y` lets the result land inside a wider row.
 //!
-//! Every refusal is a `BadRequest` and happens before any native call, because a status from the
-//! native layer other than a missing device latches the backend terminal. A refused call changes
-//! nothing.
-
-use std::rc::Rc;
+//! Every other refusal is a `BadRequest` and happens before any native call, because a status
+//! from the native layer other than a missing device latches the backend terminal. A refused
+//! call changes nothing.
 
 use crate::EngError;
 
-use super::super::context::{Grid, adapter_bug};
-use super::super::native::{self, Binding, RawKernel};
+use super::super::context::{Grid, Shared};
+use super::super::frame::Frame;
+use super::super::native::Binding;
 use super::super::{DeviceRange, MetalContext};
 
 #[cfg(test)]
@@ -39,7 +40,6 @@ const VECTOR_ALIGN: usize = 16;
 const CODE_BYTES: usize = 2;
 /// The activation and result element.
 const VALUE_BYTES: usize = 4;
-const FLAG_ZERO: [u8; 4] = [0; 4];
 
 /// The stored dtype of a dense weight.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -197,122 +197,107 @@ struct DenseGemvPlan {
 
 impl MetalContext {
     /// One dense matvec, `y[t][r] = sum over c of w[r][c] * x[t][c]`, every product one rounded
-    /// multiply and add.
+    /// multiply and add: a frame of one dispatch, drained.
     pub(crate) fn dense_gemv(&self, call: DenseGemvCall<'_>) -> Result<(), EngError> {
-        self.dense_gemv_repeated(call, 1).map(|_| ())
+        let mut frame = self.frame();
+        frame.dense_gemv(call)?;
+        frame.drain().map(|_| ())
     }
 
-    /// The same dispatch `repeats` times in one command buffer, for a timing test: the GPU time
-    /// of the command buffer in nanoseconds.
+    /// The same dispatch `repeats` times in one command buffer of a frame, for a timing test:
+    /// the GPU time of the command buffer in nanoseconds.
     #[cfg(test)]
     pub(crate) fn dense_gemv_timed(
         &self,
         call: DenseGemvCall<'_>,
         repeats: usize,
     ) -> Result<u64, EngError> {
-        self.dense_gemv_repeated(call, repeats)
+        let mut frame = self.frame_of(repeats);
+        for _ in 0..repeats {
+            frame.dense_gemv(call)?;
+        }
+        frame.drain()
     }
+}
 
-    fn dense_gemv_repeated(
-        &self,
-        call: DenseGemvCall<'_>,
-        repeats: usize,
-    ) -> Result<u64, EngError> {
-        let plan = self.plan_dense_gemv(&call)?;
-        let kernel: Rc<RawKernel> = self.kernel(plan.kernel, SOURCE)?;
+impl Frame {
+    /// Encodes one dense matvec into the frame. A weight that is not finite marks the frame's
+    /// flag and leaves its row unwritten; the frame's drain refuses it.
+    pub(super) fn dense_gemv(&mut self, call: DenseGemvCall<'_>) -> Result<(), EngError> {
+        let shared = self.shared();
+        let plan = plan_dense_gemv(shared, &call)?;
+        let kernel = shared.kernel(plan.kernel, SOURCE)?;
         // Eight weight rows a threadgroup of 256 threads, one activation row a grid row.
         let grid: Grid = [
             plan.rows.div_ceil(ROWS_PER_THREADGROUP) * THREADGROUP,
             plan.m,
             1,
         ];
-        self.shared.with_flag(|flag| {
-            native::buffer_write(flag, 0, &FLAG_ZERO)
-                .map_err(|_| adapter_bug("the write that clears the non-finite weight flag"))?;
-            let bindings = [
-                plan.w,
-                plan.x,
-                plan.y,
-                Binding {
-                    pointer: flag.pointer(),
-                    offset: 0,
-                },
-            ];
-            let gpu_ns = self.launch_repeated(
-                &kernel,
-                &bindings,
-                &plan.params.bytes(),
-                grid,
-                [THREADGROUP, 1, 1],
-                repeats,
-            )?;
-            let set = native::buffer_read(flag, 0, FLAG_ZERO.len())
-                .map_err(|_| adapter_bug("the read of the non-finite weight flag"))?;
-            if set != FLAG_ZERO {
-                return Err(EngError::BadRequest(
-                    "the Metal dense matvec read a weight that is not finite".to_owned(),
-                ));
-            }
-            Ok(gpu_ns)
-        })
+        self.encode_flagged(
+            &kernel,
+            &[plan.w, plan.x, plan.y],
+            &plan.params.bytes(),
+            grid,
+            [THREADGROUP, 1, 1],
+        )
     }
+}
 
-    fn plan_dense_gemv(&self, call: &DenseGemvCall<'_>) -> Result<DenseGemvPlan, EngError> {
-        let shape = call.shape;
-        let need = gemv_bytes(shape, call.dtype).ok_or_else(|| invalid_shape(shape))?;
-        let ranges = [
-            ("weight", &call.w, need.w),
-            ("activation", &call.x, need.x),
-            ("result", &call.y, need.y),
-        ];
-        for (what, range, need) in ranges {
-            let same = range.owner() == self.id();
-            let fits = range.bytes() >= need && range.offset() % RANGE_ALIGN == 0;
-            if !same || !fits {
-                let whose = if same { "" } else { " of another adapter" };
-                return Err(EngError::BadRequest(format!(
-                    "the call needs {need} bytes of {what} at a multiple of {RANGE_ALIGN} in a buffer of its own Metal context; the range holds {} bytes at offset {}{whose}",
-                    range.bytes(),
-                    range.offset(),
-                )));
-            }
+fn plan_dense_gemv(shared: &Shared, call: &DenseGemvCall<'_>) -> Result<DenseGemvPlan, EngError> {
+    let shape = call.shape;
+    let need = gemv_bytes(shape, call.dtype).ok_or_else(|| invalid_shape(shape))?;
+    let ranges = [
+        ("weight", &call.w, need.w),
+        ("activation", &call.x, need.x),
+        ("result", &call.y, need.y),
+    ];
+    for (what, range, need) in ranges {
+        let same = range.owner() == shared.id();
+        let fits = range.bytes() >= need && range.offset() % RANGE_ALIGN == 0;
+        if !same || !fits {
+            let whose = if same { "" } else { " of another adapter" };
+            return Err(EngError::BadRequest(format!(
+                "the call needs {need} bytes of {what} at a multiple of {RANGE_ALIGN} in a buffer of its own Metal context; the range holds {} bytes at offset {}{whose}",
+                range.bytes(),
+                range.offset(),
+            )));
         }
-        if overlaps(&call.y, &call.w) || overlaps(&call.y, &call.x) {
-            return Err(EngError::BadRequest(
-                "the result range overlaps the weight or the activation range".to_owned(),
-            ));
-        }
-        let DenseGemvShape {
-            m,
-            rows,
-            cols,
-            ld_x,
-            ld_y,
-        } = shape;
-        let vector = u32::from(
-            call.w.offset().is_multiple_of(VECTOR_ALIGN)
-                && call.x.offset().is_multiple_of(VECTOR_ALIGN)
-                && cols.is_multiple_of(8)
-                && ld_x.is_multiple_of(4),
-        );
-        let params = GemvParams {
-            m: m as u32,
-            rows: rows as u32,
-            cols: cols as u32,
-            ld_x: ld_x as u32,
-            ld_y: ld_y as u32,
-            vector,
-        };
-        Ok(DenseGemvPlan {
-            w: call.w.binding(),
-            x: call.x.binding(),
-            y: call.y.binding(),
-            kernel: call.dtype.kernel(),
-            params,
-            rows,
-            m,
-        })
     }
+    if overlaps(&call.y, &call.w) || overlaps(&call.y, &call.x) {
+        return Err(EngError::BadRequest(
+            "the result range overlaps the weight or the activation range".to_owned(),
+        ));
+    }
+    let DenseGemvShape {
+        m,
+        rows,
+        cols,
+        ld_x,
+        ld_y,
+    } = shape;
+    let vector = u32::from(
+        call.w.offset().is_multiple_of(VECTOR_ALIGN)
+            && call.x.offset().is_multiple_of(VECTOR_ALIGN)
+            && cols.is_multiple_of(8)
+            && ld_x.is_multiple_of(4),
+    );
+    let params = GemvParams {
+        m: m as u32,
+        rows: rows as u32,
+        cols: cols as u32,
+        ld_x: ld_x as u32,
+        ld_y: ld_y as u32,
+        vector,
+    };
+    Ok(DenseGemvPlan {
+        w: call.w.binding(),
+        x: call.x.binding(),
+        y: call.y.binding(),
+        kernel: call.dtype.kernel(),
+        params,
+        rows,
+        m,
+    })
 }
 
 /// Whether two ranges share an address.
