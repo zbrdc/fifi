@@ -50,12 +50,19 @@ struct Run {
 }
 
 /// Feeds a fixture the way serving does: grouped prefill of every prompt row but the last, then
-/// the last prompt token as the first decode step.
+/// the last prompt token as the first decode step. Without `forced` the tokens take the ordinary
+/// path: a final feature tap set after the prefill keeps the chain from admitting, while the
+/// prefill runs as the chain run's does. A tap set before it would send the prompt through the
+/// host visits, whose expert products differ in rounding; on a long prompt that can tip a
+/// near-tied expert choice and part the two runs before any token.
 fn generate(f: &mut CpuForward, fixture: &Fixture, forced: Option<&[u32]>, every: usize) -> Run {
     let chain = forced.is_some();
     if fixture.prompt.len() > 1 {
         f.prefill_grouped(&fixture.prompt[..fixture.prompt.len() - 1])
             .unwrap();
+    }
+    if !chain {
+        f.taps = vec![f.visits.len()];
     }
     let mut run = Run::default();
     let mut id = *fixture.prompt.last().unwrap();
@@ -171,10 +178,8 @@ fn snapshots_after_chain_tokens_match_the_host_path() {
     let path = std::path::PathBuf::from(std::env::var_os("FIFI_INKLING_MODEL_DIR").unwrap());
     for fixture in fixtures() {
         let oracle = {
-            // A final feature tap forces ordinary visit dispatch: the chain never admits.
             let mut f = CpuForward::open(&path, 768).unwrap();
             f.enable_cuda(0).unwrap();
-            f.taps = vec![f.visits.len()];
             generate(&mut f, &fixture, None, 1)
         };
         // A prefill that follows chain tokens reads host rows too; the token after it may chain.
@@ -247,7 +252,6 @@ fn snapshots_after_chain_tokens_match_the_host_path() {
 fn reference_after_prefill(path: &std::path::Path, fixture: &Fixture) -> (Vec<f32>, PrefixState) {
     let mut f = CpuForward::open(path, 768).unwrap();
     f.enable_cuda(0).unwrap();
-    f.taps = vec![f.visits.len()];
     generate(&mut f, fixture, None, 1);
     f.prefill_grouped(&[7, 8]).unwrap();
     let state = f.snapshot().unwrap();
