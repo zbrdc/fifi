@@ -18,6 +18,7 @@ use crate::{
             resident_mlp::ResidentMlpRequest,
         },
     },
+    family::step::conv::{self, Ring, Row as ConvRow, Variant},
     kernels::cuda::{
         CudaContext, DeviceBuffer, DeviceRange, DeviceStream, PinnedBuf,
         resident::{
@@ -25,7 +26,6 @@ use crate::{
             depth_attention::{
                 AddCall, MAX_BLOCKS, MAX_MIX_JOBS, MixCall, MixJob, MixShape, SealCall, StreamShape,
             },
-            inkling_conv::ConvCall,
             inkling_local_prep::PrepMath,
         },
     },
@@ -875,19 +875,20 @@ impl Execution<'_> {
             cuda.enqueue_plain_mlp(self.stream, request)?;
         }
         let shape = self.plan.shape.widths;
-        self.context.inkling_conv(
+        conv::row(
+            self.context,
             self.stream,
-            ConvCall {
+            Variant::Residual,
+            Ring::newest_first(self.row(l.histories[3])?, shape.hidden, shape.taps),
+            ConvRow {
                 input: self.row(l.mlp_raw)?,
-                kernel: self.weights.row(conv)?,
-                history: self.row(l.histories[3])?,
+                taps: self.weights.row(conv)?,
                 out: self.row(l.mlp_conv)?,
                 // The convolved row is added into the depth stream's current row in the same
                 // launch, the add of the visit's MLP output.
-                state: Some(self.row(l.depth.row(shape.hidden))?),
+                add: Some(self.row(l.depth.row(shape.hidden))?),
                 health: self.row(l.glue_health)?,
             },
-            (shape.hidden, shape.taps),
         )
     }
 }

@@ -23,6 +23,7 @@
 //! model supplies that list, its widths, the rows it works in and the mixers nobody else has.
 
 pub(crate) mod attend;
+pub(crate) mod conv;
 pub(crate) mod delta;
 pub(crate) mod depth;
 pub(crate) mod experts;

@@ -41,8 +41,8 @@ fn normal_row(rng: &mut Rng, width: usize) -> Vec<f32> {
     (0..width).map(|_| rng.normal() as f32).collect()
 }
 
-/// `CausalConv::apply` of `family/inkling2/cpu_attention.rs` without dynamic taps, in f32 and
-/// in its order. `history` is the host's (newest row first) and is updated like the host's.
+/// The host causal convolution without dynamic taps, in f32 and in its order. `history` is the
+/// host's (newest row first) and is updated like the host's.
 mod host {
     pub fn apply(
         input: &[f32],
@@ -166,7 +166,7 @@ impl Sequence {
             Output::Disjoint => self.out.range(0, row_bytes(self.width)).unwrap(),
             Output::InPlace => input_range,
         };
-        ctx.inkling_conv(
+        ctx.short_conv(
             stream,
             ConvCall {
                 input: input_range,
@@ -205,7 +205,7 @@ fn assert_within_relative(actual: &[f32], expected: &[f32], what: &str) {
 /// tolerance of 1e-6 relative. The history is the device's own, carried across the calls.
 #[test]
 fn conv_matches_the_host_across_a_sequence_within_rounding() {
-    if !device_present("Inkling conv sequence") {
+    if !device_present("short conv sequence") {
         return;
     }
     let ctx = CudaContext::new().unwrap();
@@ -243,7 +243,7 @@ fn conv_matches_the_host_across_a_sequence_within_rounding() {
 /// bit for bit.
 #[test]
 fn a_zero_padded_short_history_is_bit_identical_to_the_host_with_fewer_rows() {
-    if !device_present("Inkling conv short history") {
+    if !device_present("short conv short history") {
         return;
     }
     let ctx = CudaContext::new().unwrap();
@@ -272,7 +272,7 @@ fn a_zero_padded_short_history_is_bit_identical_to_the_host_with_fewer_rows() {
 /// result equals the one of a disjoint output bit for bit at every step of a sequence.
 #[test]
 fn an_output_aliasing_the_input_equals_a_disjoint_output() {
-    if !device_present("Inkling conv in place") {
+    if !device_present("short conv in place") {
         return;
     }
     let ctx = CudaContext::new().unwrap();
@@ -301,7 +301,7 @@ fn an_output_aliasing_the_input_equals_a_disjoint_output() {
 /// NaN into the health word; the launch itself succeeds.
 #[test]
 fn non_finite_values_are_reported_in_the_health_word() {
-    if !device_present("Inkling conv health") {
+    if !device_present("short conv health") {
         return;
     }
     let ctx = CudaContext::new().unwrap();
@@ -392,7 +392,7 @@ fn non_finite_values_are_reported_in_the_health_word() {
 /// exact), alignment, and `out` or `history` sharing bytes with the input.
 #[test]
 fn wrapper_rejects_bad_shapes_and_shared_bytes_by_error_text() {
-    if !device_present("Inkling conv rejections") {
+    if !device_present("short conv rejections") {
         return;
     }
     let ctx = CudaContext::new().unwrap();
@@ -411,7 +411,7 @@ fn wrapper_rejects_bad_shapes_and_shared_bytes_by_error_text() {
                 history: DeviceRange<'_>,
                 out: DeviceRange<'_>,
                 shape: (usize, usize)| {
-        ctx.inkling_conv(
+        ctx.short_conv(
             &stream,
             ConvCall {
                 input,
@@ -425,9 +425,8 @@ fn wrapper_rejects_bad_shapes_and_shared_bytes_by_error_text() {
         )
         .map_err(|error| format!("{error:?}"))
     };
-    let takes = format!(
-        "the CUDA Inkling conv takes 1 to {MAX_WIDTH} columns and 2 to {MAX_TAPS} taps, got"
-    );
+    let takes =
+        format!("the CUDA short conv takes 1 to {MAX_WIDTH} columns and 2 to {MAX_TAPS} taps, got");
     for (name, shape) in [
         ("one tap", (width, 1)),
         ("nine taps", (width, 9)),
@@ -451,8 +450,7 @@ fn wrapper_rejects_bad_shapes_and_shared_bytes_by_error_text() {
     )
     .unwrap_err();
     assert!(
-        error
-            .contains("the CUDA Inkling conv history range holds 512 bytes but the call needs 768"),
+        error.contains("the CUDA short conv history range holds 512 bytes but the call needs 768"),
         "{error}"
     );
     let error = call(
@@ -464,7 +462,7 @@ fn wrapper_rejects_bad_shapes_and_shared_bytes_by_error_text() {
     .unwrap_err();
     assert!(
         error.contains(
-            "the CUDA Inkling conv input range holds 1024 bytes but the call needs exactly 256"
+            "the CUDA short conv input range holds 1024 bytes but the call needs exactly 256"
         ),
         "{error}"
     );
@@ -477,7 +475,7 @@ fn wrapper_rejects_bad_shapes_and_shared_bytes_by_error_text() {
     .unwrap_err();
     assert!(
         error.contains(
-            "the CUDA Inkling conv output range holds 512 bytes but the call needs exactly 256"
+            "the CUDA short conv output range holds 512 bytes but the call needs exactly 256"
         ),
         "{error}"
     );
@@ -491,7 +489,7 @@ fn wrapper_rejects_bad_shapes_and_shared_bytes_by_error_text() {
     )
     .unwrap_err();
     assert!(
-        error.contains("the CUDA Inkling conv input range starts at offset"),
+        error.contains("the CUDA short conv input range starts at offset"),
         "{error}"
     );
 
@@ -507,7 +505,7 @@ fn wrapper_rejects_bad_shapes_and_shared_bytes_by_error_text() {
     )
     .unwrap_err();
     assert!(
-        error.contains("the CUDA Inkling conv output and Inkling conv input ranges overlap"),
+        error.contains("the CUDA short conv output and short conv input ranges overlap"),
         "{error}"
     );
 
@@ -523,7 +521,7 @@ fn wrapper_rejects_bad_shapes_and_shared_bytes_by_error_text() {
     )
     .unwrap_err();
     assert!(
-        error.contains("the CUDA Inkling conv input and Inkling conv history ranges overlap"),
+        error.contains("the CUDA short conv input and short conv history ranges overlap"),
         "{error}"
     );
 
@@ -539,7 +537,7 @@ fn wrapper_rejects_bad_shapes_and_shared_bytes_by_error_text() {
 fn a_state_row_takes_the_convolved_row_as_the_add_launch_would() {
     use crate::kernels::cuda::resident::depth_attention::AddCall;
 
-    if !device_present("Inkling conv state add") {
+    if !device_present("short conv state add") {
         return;
     }
     let ctx = CudaContext::new().unwrap();
@@ -600,7 +598,7 @@ fn a_state_row_takes_the_convolved_row_as_the_add_launch_would() {
             &history_before,
         );
         upload(&sequence.health, &stream, 0, &[0.0]);
-        ctx.inkling_conv(
+        ctx.short_conv(
             &stream,
             ConvCall {
                 input: state.range(row, row).unwrap(),
@@ -623,7 +621,7 @@ fn a_state_row_takes_the_convolved_row_as_the_add_launch_would() {
     let input = normal_row(&mut Rng::new(7), width);
     upload(&sequence.rows, &stream, 0, &input);
     let error = ctx
-        .inkling_conv(
+        .short_conv(
             &stream,
             ConvCall {
                 input: sequence.input(0),
@@ -637,7 +635,7 @@ fn a_state_row_takes_the_convolved_row_as_the_add_launch_would() {
         )
         .unwrap_err();
     assert!(
-        format!("{error:?}").contains("Inkling conv state"),
+        format!("{error:?}").contains("short conv state"),
         "{error:?}"
     );
 }

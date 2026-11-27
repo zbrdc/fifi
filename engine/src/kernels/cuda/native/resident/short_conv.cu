@@ -1,10 +1,10 @@
-// Causal short convolution of Inkling 2 on the device: the resident history of one CausalConv.
-// The contract is resident/inkling_conv.h. Every arithmetic intrinsic is _rn: the file compiles
+// Causal short convolution on the device, with its history resident.
+// The contract is resident/short_conv.h. Every arithmetic intrinsic is _rn: the file compiles
 // under --use_fast_math, which must not turn a divide or a square root into an approximation.
 #include <math.h>
 #include <stdint.h>
 
-#include "resident/inkling_conv.h"
+#include "resident/short_conv.h"
 
 #include "abi.h"
 #include "device.h"
@@ -36,7 +36,7 @@ __device__ void report(float *health, int invalid) {
     if (__syncthreads_or(invalid) != 0 && threadIdx.x == 0) health[0] = __int_as_float(0x7fc00000);
 }
 
-// Channel c of the host's `CausalConv::apply`, in its summation order: the accumulator starts
+// Channel c of the host causal convolution, in its summation order: the accumulator starts
 // at 0 and each lag adds its rounded product, then the input is added and the norm applied.
 __device__ void convolve(const float *input, const float *kernel, float *history, float *out,
                          float *state, int c, int width, int taps, float norm, int &invalid) {
@@ -68,7 +68,7 @@ __device__ void convolve(const float *input, const float *kernel, float *history
     }
 }
 
-__global__ void inkling_conv_kernel(const float *input, const float *kernel, float *history,
+__global__ void short_conv_kernel(const float *input, const float *kernel, float *history,
                                     float *out, float *state, float *health, int width, int taps) {
     // The host norm, (taps + 1) as f32 then sqrt then recip, each step rounded to nearest even.
     const float norm = __frcp_rn(__fsqrt_rn(__fadd_rn(static_cast<float>(taps), 1.0f)));
@@ -83,7 +83,7 @@ __global__ void inkling_conv_kernel(const float *input, const float *kernel, flo
 }
 }  // namespace
 
-extern "C" int inference_cuda_inkling_conv(const float *input, const float *kernel,
+extern "C" int inference_cuda_short_conv(const float *input, const float *kernel,
                                            float *history, float *out, float *state,
                                            float *health, int width, int taps, void *stream,
                                            int *out_stage) {
@@ -123,7 +123,7 @@ extern "C" int inference_cuda_inkling_conv(const float *input, const float *kern
     // walk serialized its loads. A channel's accumulation order does not depend on the block
     // that owns it. Every block that saw a non-finite value writes the same NaN.
     const int blocks = (width + threads - 1) / threads;
-    inkling_conv_kernel<<<blocks, threads, 0, static_cast<cudaStream_t>(stream)>>>(
+    short_conv_kernel<<<blocks, threads, 0, static_cast<cudaStream_t>(stream)>>>(
         input, kernel, history, out, state, health, width, taps);
     Failure failure;
     failure.record(cudaGetLastError(), INFERENCE_CUDA_STAGE_LAUNCH);

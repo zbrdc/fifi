@@ -7,10 +7,8 @@ use super::{
 use crate::family::inkling2::switches::Switch;
 use crate::{
     family::inkling2::cuda_projection::{DEVICE_HEADROOM, upload_tensor},
-    kernels::cuda::{
-        resident::inkling_conv::ConvCall,
-        resident::inkling_local_prep::{PrepMath, PrepShape},
-    },
+    family::step::conv::{self, Ring, Row as ConvRow, Variant},
+    kernels::cuda::resident::inkling_local_prep::{PrepMath, PrepShape},
 };
 
 use std::borrow::Cow;
@@ -753,17 +751,22 @@ impl ResidentAttention {
         )?;
         let status = local_status(shape, request.messages.is_some());
         let health = Health::split(request.status, status)?;
-        context.inkling_conv(
+        conv::row(
+            context,
             stream,
-            ConvCall {
+            Variant::Residual,
+            Ring::newest_first(
+                request.attn_conv.history,
+                request.out.bytes() / WORD,
+                PrepShape::TAPS,
+            ),
+            ConvRow {
                 input: projected,
-                kernel: request.attn_conv.kernel,
-                history: request.attn_conv.history,
+                taps: request.attn_conv.kernel,
                 out: request.out,
-                state: None,
+                add: None,
                 health: health.conv,
             },
-            (request.out.bytes() / WORD, PrepShape::TAPS),
         )
     }
 }

@@ -149,7 +149,7 @@ const CUDA_SOURCES: &[&str] = &[
     "src/kernels/cuda/native/resident/correct_draft_logits_bf16.cu",
     "src/kernels/cuda/native/resident/depth_attention.cu",
     "src/kernels/cuda/native/resident/word_rows.cu",
-    "src/kernels/cuda/native/resident/inkling_conv.cu",
+    "src/kernels/cuda/native/resident/short_conv.cu",
     "src/kernels/cuda/native/resident/head_tile.cu",
     "src/kernels/cuda/native/resident/q6_f32.cu",
 ];
@@ -353,7 +353,7 @@ const CUDA_HEADERS: &[&str] = &[
     "src/kernels/cuda/native/resident/inkling_panel_wide.cuh",
     "src/kernels/cuda/native/resident/inkling_weight_panel.cuh",
     "src/kernels/cuda/native/resident/gguf_gemv.cuh",
-    "src/kernels/cuda/native/resident/inkling_conv.h",
+    "src/kernels/cuda/native/resident/short_conv.h",
     "src/kernels/cuda/native/resident/inkling_decode_experts.cuh",
     "src/kernels/cuda/native/resident/inkling_decode_control_pair.cuh",
     "src/kernels/cuda/native/resident/inkling_decode_attention_group.cuh",

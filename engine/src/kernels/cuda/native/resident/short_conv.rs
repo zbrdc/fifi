@@ -1,5 +1,5 @@
-//! Raw FFI to `inference_cuda_inkling_conv` of `native/resident/inkling_conv.cu` (declared in
-//! `native/resident/inkling_conv.h`). Child module of `native::resident`, so it inherits the
+//! Raw FFI to `inference_cuda_short_conv` of `native/resident/short_conv.cu` (declared in
+//! `native/resident/short_conv.h`). Child module of `native::resident`, so it inherits the
 //! `allow(unsafe_code)` of `native.rs`.
 //!
 //! Safety invariants this module relies on:
@@ -25,7 +25,7 @@ pub(crate) const MAX_TAPS: usize = 8;
 const MAX_WIDTH: usize = 8192;
 
 unsafe extern "C" {
-    fn inference_cuda_inkling_conv(
+    fn inference_cuda_short_conv(
         input: *const c_void,
         kernel: *const c_void,
         history: *mut c_void,
@@ -65,7 +65,7 @@ fn out_is_input_or_apart(out: &Span<'_>, input: &Span<'_>) -> bool {
 }
 
 /// `out[c] = (acc + input[c]) * (1 / sqrt(taps + 1))` with `acc` the host's ordered tap sum of
-/// `input[c]` and the `taps - 1` history rows (`CausalConv::apply`); with a `state`, then
+/// `input[c]` and the `taps - 1` history rows (the host causal convolution); with a `state`, then
 /// `state[c] += out[c]`.
 pub(in crate::kernels::cuda) fn launch(
     stream: &RawStream,
@@ -121,7 +121,7 @@ pub(in crate::kernels::cuda) fn launch(
     // SAFETY: the ranges are aligned, hold the extents above and share no byte except that
     // `out` may be exactly `input`; the entry repeats the checks on the addresses.
     let status = unsafe {
-        inference_cuda_inkling_conv(
+        inference_cuda_short_conv(
             call.input.address() as *const c_void,
             call.kernel.address() as *const c_void,
             call.history.address(),
