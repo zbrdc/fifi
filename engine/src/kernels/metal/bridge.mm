@@ -1,5 +1,6 @@
-// inference_metal bridge: the device and its queue, buffers, compute pipelines and one waited
-// command buffer a call. Objective-C++, compiled by build.rs under the feature native-metal.
+// inference_metal bridge: the device and its queue, buffers, compute pipelines and command
+// buffers, which Rust opens, fills a dispatch at a time, commits and waits for. Objective-C++,
+// compiled by build.rs under the feature native-metal.
 //
 // Handles. Every handle Rust holds is an object the bridge retains for it: a +1 under automatic
 // reference counting, released once by inference_metal_object_free. Rust never retains or
@@ -98,6 +99,11 @@ bool valid_grid(const size_t *grid, const size_t *per_threadgroup) {
         }
     }
     return true;
+}
+
+bool is_open(id<MTLCommandBuffer> command) {
+    const MTLCommandBufferStatus status = command.status;
+    return status == MTLCommandBufferStatusNotEnqueued || status == MTLCommandBufferStatusEnqueued;
 }
 
 }  // namespace
@@ -208,17 +214,36 @@ int inference_metal_kernel_new(void *runtime, const char *source, const char *na
     });
 }
 
-int inference_metal_run(void *runtime, void *kernel, void *const *buffers, const size_t *offsets,
-                        size_t count, const void *bytes, size_t bytes_len, const size_t *grid,
-                        const size_t *per_threadgroup, size_t repeats, uint64_t *gpu_ns) noexcept {
-    return guarded("run", [&]() -> int {
+int inference_metal_command_new(void *runtime, void **out) noexcept {
+    return guarded("command_new", [&]() -> int {
         FifiMetalRuntime *holder = (__bridge FifiMetalRuntime *)runtime;
+        if (holder == nil || holder.queue == nil || out == nullptr) {
+            return kStatusInvalid;
+        }
+        *out = nullptr;
+        id<MTLCommandBuffer> command = [holder.queue commandBuffer];
+        if (command == nil) {
+            set_error("command_new", "the queue gave no command buffer");
+            return kStatusFailed;
+        }
+        *out = (__bridge_retained void *)command;
+        return kStatusOk;
+    });
+}
+
+// One dispatch ends its own compute encoder, so a blit encoder can go between any two. A
+// command buffer takes no dispatch after its commit.
+int inference_metal_command_dispatch(void *held, void *kernel, void *const *buffers,
+                                     const size_t *offsets, size_t count, const void *bytes,
+                                     size_t bytes_len, const size_t *grid,
+                                     const size_t *per_threadgroup, size_t repeats) noexcept {
+    return guarded("command_dispatch", [&]() -> int {
+        id<MTLCommandBuffer> command = (__bridge id<MTLCommandBuffer>)held;
         id<MTLComputePipelineState> pipeline = (__bridge id<MTLComputePipelineState>)kernel;
-        if (holder == nil || holder.queue == nil || pipeline == nil || buffers == nullptr ||
-            offsets == nullptr || count == 0 || count > 30 || bytes == nullptr ||
-            bytes_len == 0 || bytes_len > 4096 || grid == nullptr ||
-            per_threadgroup == nullptr || repeats == 0 || repeats > (1u << 20) ||
-            gpu_ns == nullptr || !valid_grid(grid, per_threadgroup)) {
+        if (command == nil || pipeline == nil || buffers == nullptr || offsets == nullptr ||
+            count == 0 || count > 30 || bytes == nullptr || bytes_len == 0 || bytes_len > 4096 ||
+            grid == nullptr || per_threadgroup == nullptr || repeats == 0 ||
+            repeats > (1u << 20) || !valid_grid(grid, per_threadgroup)) {
             return kStatusInvalid;
         }
         const size_t group = per_threadgroup[0] * per_threadgroup[1] * per_threadgroup[2];
@@ -230,10 +255,9 @@ int inference_metal_run(void *runtime, void *kernel, void *const *buffers, const
                 return kStatusInvalid;
             }
         }
-        id<MTLCommandBuffer> command = [holder.queue commandBuffer];
-        if (command == nil) {
-            set_error("run", "the queue gave no command buffer");
-            return kStatusFailed;
+        if (!is_open(command)) {
+            set_error("command_dispatch", "the command buffer is committed: it takes no dispatch");
+            return kStatusInvalid;
         }
         id<MTLComputeCommandEncoder> encoder = [command computeCommandEncoder];
         [encoder setComputePipelineState:pipeline];
@@ -248,10 +272,39 @@ int inference_metal_run(void *runtime, void *kernel, void *const *buffers, const
             [encoder dispatchThreads:threads threadsPerThreadgroup:per_group];
         }
         [encoder endEncoding];
+        return kStatusOk;
+    });
+}
+
+int inference_metal_command_commit(void *held) noexcept {
+    return guarded("command_commit", [&]() -> int {
+        id<MTLCommandBuffer> command = (__bridge id<MTLCommandBuffer>)held;
+        if (command == nil) {
+            return kStatusInvalid;
+        }
+        if (!is_open(command)) {
+            set_error("command_commit", "the command buffer is committed already");
+            return kStatusInvalid;
+        }
         [command commit];
+        return kStatusOk;
+    });
+}
+
+// Returns the GPU time of the command buffer in nanoseconds, 0 when the device reports none.
+int inference_metal_command_wait(void *held, uint64_t *gpu_ns) noexcept {
+    return guarded("command_wait", [&]() -> int {
+        id<MTLCommandBuffer> command = (__bridge id<MTLCommandBuffer>)held;
+        if (command == nil || gpu_ns == nullptr) {
+            return kStatusInvalid;
+        }
+        if (is_open(command)) {
+            set_error("command_wait", "the command buffer is not committed");
+            return kStatusInvalid;
+        }
         [command waitUntilCompleted];
         if (command.status != MTLCommandBufferStatusCompleted) {
-            set_error_ns("run: the command buffer did not complete",
+            set_error_ns("command_wait: the command buffer did not complete",
                          command.error.localizedDescription);
             return kStatusCommandBuffer;
         }
